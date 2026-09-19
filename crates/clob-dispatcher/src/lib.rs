@@ -115,6 +115,8 @@ pub enum DispatchError {
     /// `modify` returns it, because there `Ok` would claim a resting
     /// order had been repriced when it had not.
     ///
+    /// (`Unroutable` continues below.)
+    ///
     /// `modify` tests only the price/size half of that list, and that
     /// is sufficient rather than lazy: the identity check runs first,
     /// so the replacement's venue and `kind` are already pinned equal
@@ -134,6 +136,14 @@ pub enum DispatchError {
     /// back one of two identical quotes and reporting success leaves
     /// the caller believing both are gone.
     AmbiguousOrder,
+    /// **E6: the risk gate refused it.** The request exceeded a clamp
+    /// the OPERATOR set in `exec.toml`, checked before dispatch and
+    /// independently of whatever the member believes about its own
+    /// caps.
+    ///
+    /// Not an error condition; a refusal, like `SlotDisabled`. The
+    /// order never left the process.
+    RiskRefused,
 }
 
 /// Convert a `DispatchError` to the cross-crate
@@ -192,7 +202,8 @@ impl From<DispatchError> for core_net::NetworkErr {
             | DispatchError::NoSuchOrder
             | DispatchError::IdentityMismatch
             | DispatchError::Unroutable
-            | DispatchError::AmbiguousOrder => {
+            | DispatchError::AmbiguousOrder
+            | DispatchError::RiskRefused => {
                 NetworkErr::new(NetworkSource::Clob, NetworkErrKind::Malformed)
             }
         }
@@ -354,7 +365,13 @@ impl DispatchStats {
                     self.rejected_malformed = self.rejected_malformed.wrapping_add(1);
                 }
             }
-            DispatchError::SlotDisabled | DispatchError::NoLiveRoute => {
+            // E6's risk refusal joins the ROUTING bucket rather than
+            // the lifecycle one: like `SlotDisabled`, it is a local
+            // decision about whether this request may be dispatched at
+            // all, taken before anything left.
+            DispatchError::SlotDisabled
+            | DispatchError::NoLiveRoute
+            | DispatchError::RiskRefused => {
                 self.rejected_routing = self.rejected_routing.wrapping_add(1);
             }
             // E5 lifecycle refusals. Listed one by one rather than
@@ -575,6 +592,11 @@ pub struct ExecCounters {
     /// Refused because a live slot named a venue it has no route to
     /// (LAW E-1 — refused, never downgraded to paper).
     pub refused_no_route: u64,
+    /// **E6: refused by the risk gate** — the request's notional
+    /// exceeded the slot's operator-set `max_order_usd`. A second
+    /// opinion over the member's own caps; a non-zero value means the
+    /// two disagreed.
+    pub refused_risk: u64,
     /// Per-slot live submits.
     pub live_submits_by_slot: [u64; EXEC_COUNTER_SLOTS],
     /// Per-slot refusals (off + no-route).

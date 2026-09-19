@@ -2425,3 +2425,69 @@ the durable handle and an oid captured at placement is not.
 Run under the standing engine's own laws: `cargo build --release -p
 cli` first (G0), the launchd instance booted out for the window and
 bootstrapped back after, nothing left resting.
+
+## E6 — the risk gate and the kill switches
+
+### E6 commit 1 — the per-order clamp (2026-09-19)
+
+`exec.toml`'s `max_order_usd_1e6` has been parsed, carried into
+`ExecRoute` and printed at boot since E1, and **read by nothing**. The
+risk-reviewer called the E1 caps "declared-not-enforced". They are
+enforced now, in `RoutedDispatcher`, before dispatch.
+
+#### It is a SECOND OPINION, not a copy
+
+bin15 has its own `cap_instance`/`cap_day` ledger and sizes every order
+against it. This clamp is the operator's number, checked on the
+dispatch path rather than the sizing path, computed from the request in
+front of it rather than from anything the member believes. **A non-zero
+`refused_risk` means the two disagreed** — a member asked for something
+its own caps should already have stopped — and that disagreement is the
+alarm, which is why it is a counter and a `/metrics` row
+(`engine_exec_refused_risk_total`) rather than a silent clamp.
+
+#### Both verbs, because a modify can RAISE size
+
+A clamp on `submit` alone leaves the cap reachable by repricing upward.
+The E5 commit-4b review named that hole while the modify path was being
+built; it is closed here, and the replacement is measured exactly as a
+fresh order is.
+
+#### The live arm only
+
+A paper slot is modelling, and the offline harness replays the same
+intents through no such gate. Refusing a paper order here would make
+the engine and the harness disagree for a reason that has nothing to do
+with the strategy. The clamp exists to stop real money leaving.
+
+#### `i128`, and why it is not fussiness
+
+`px × qty` leaves `i64` at about 9.2e18 — a $4 m price and three
+contracts reaches it, which is inside the range a fat-fingered
+`exec.toml` could ask for. A wrapped product is NEGATIVE and sails
+straight past a `>` test; a saturating one is positive but is a number
+nobody computed. The multiply is done in `i128`, and the wrap case is
+pinned by a test that asserts its own premise (`checked_mul` really
+does return `None` for those inputs).
+
+The boundary is `>`, not `>=`: an order exactly AT the cap is what an
+operator who wrote that number asked for.
+
+#### NOT in this commit: `max_open_orders`
+
+It is in the same `exec.toml` block and equally unenforced, but it
+cannot be done honestly yet. The router sees submits, cancels and
+modifies — it does not see FILLS or TTL expiries, so a count kept from
+dispatches alone drifts upward and would eventually refuse everything
+for ever. The paper arm can answer exactly (its open table now carries
+`strategy_id`); the live arm cannot answer per-submit, because a
+partial fill does not retire a resting order and only
+`frontendOpenOrders` knows the truth — which is the reconciler's
+cadence, not the dispatch path's.
+
+So `max_open_orders` lands with the venue-fill ledger, where there is
+something real to count. A clamp that refuses everything after the
+sixty-fourth order of a boot would be worse than no clamp: it would be
+a check whose name says "too many open" while its condition says
+"sixty-four have been sent", which is the defect shape this lane keeps
+finding.

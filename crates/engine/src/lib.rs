@@ -1100,7 +1100,8 @@ fn submit_err_of(e: DispatchError) -> SubmitErr {
         | DispatchError::NoLiveRoute
         | DispatchError::IdentityMismatch
         | DispatchError::Unroutable
-        | DispatchError::AmbiguousOrder => SubmitErr::Refused,
+        | DispatchError::AmbiguousOrder
+        | DispatchError::RiskRefused => SubmitErr::Refused,
     }
 }
 

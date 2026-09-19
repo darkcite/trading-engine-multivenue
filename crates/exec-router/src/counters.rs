@@ -36,9 +36,25 @@ pub struct RouteCounters {
     ///
     /// E5: any verb, as with `refused_off`.
     pub refused_no_route: u64,
+    /// **E6: refused by the RISK GATE** — the request's notional
+    /// exceeded the slot's `max_order_usd`.
+    ///
+    /// Defence in depth OVER the member's own caps, and deliberately
+    /// a second opinion rather than a copy: bin15 sizes against its
+    /// own `cap_instance`/`cap_day` ledger, and this one is computed
+    /// from the request in front of it. **If the two ever disagree,
+    /// that disagreement is the alarm** — a non-zero value here means
+    /// a member asked for something its own caps should already have
+    /// stopped.
+    pub refused_risk: u64,
     /// Per-slot live submits. Index = `strategy_id`.
     pub live_submits_by_slot: [u64; EXEC_SLOTS],
-    /// Per-slot refusals (off + no-route). Index = `strategy_id`.
+    /// Per-slot refusals — EVERY reason (off, no-route, and E6's risk
+    /// gate). Index = `strategy_id`.
+    ///
+    /// The total rather than a breakdown, because what an operator
+    /// reads it for is "which slot is being refused"; the aggregate
+    /// fields above say why.
     pub refused_by_slot: [u64; EXEC_SLOTS],
 }
 
@@ -52,6 +68,7 @@ impl RouteCounters {
             paper_submits: 0,
             refused_off: 0,
             refused_no_route: 0,
+            refused_risk: 0,
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
         }
@@ -95,6 +112,13 @@ impl RouteCounters {
     #[inline(always)]
     pub fn on_refused_no_route(&mut self, strategy_id: u8) {
         self.refused_no_route = self.refused_no_route.saturating_add(1);
+        Self::bump_slot(&mut self.refused_by_slot, strategy_id);
+    }
+
+    /// E6: record a refusal by the risk gate.
+    #[inline(always)]
+    pub fn on_refused_risk(&mut self, strategy_id: u8) {
+        self.refused_risk = self.refused_risk.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);
     }
 

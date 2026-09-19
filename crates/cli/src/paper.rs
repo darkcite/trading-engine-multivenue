@@ -3675,6 +3675,13 @@ pub struct ExecMetricIds {
     pub paper_submits: core_metrics::CounterId,
     /// `engine_exec_refused_off_total`
     pub refused_off: core_metrics::CounterId,
+    /// `engine_exec_refused_risk_total` (E6) — requests the RISK GATE
+    /// refused: the notional exceeded the slot's operator-set
+    /// `max_order_usd`. **Should stay 0** — bin15 sizes against its
+    /// own caps, so a non-zero value means the member's ledger and
+    /// the operator's number disagreed, which is the alarm this gate
+    /// exists to raise.
+    pub refused_risk: core_metrics::CounterId,
     /// `engine_exec_refused_no_route_total` — **the LAW E-1 counter.**
     /// A live slot's order that named a venue with no route. Must stay
     /// 0; anything else is a routing bug, and the order was refused
@@ -4370,6 +4377,7 @@ fn register_exec_metrics(
     let paper_submits = one("engine_exec_paper_submits_total")?;
     let refused_off = one("engine_exec_refused_off_total")?;
     let refused_no_route = one("engine_exec_refused_no_route_total")?;
+    let refused_risk = one("engine_exec_refused_risk_total")?;
 
     let mut slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS] =
         [None; clob_dispatcher::EXEC_COUNTER_SLOTS];
@@ -4396,6 +4404,7 @@ fn register_exec_metrics(
         paper_submits,
         refused_off,
         refused_no_route,
+        refused_risk,
         slots,
     })
 }
@@ -4417,6 +4426,8 @@ fn mirror_exec_metrics(
         .inc(cur.refused_off.saturating_sub(last.refused_off));
     reg.counter(ids.refused_no_route)
         .inc(cur.refused_no_route.saturating_sub(last.refused_no_route));
+    reg.counter(ids.refused_risk)
+        .inc(cur.refused_risk.saturating_sub(last.refused_risk));
     for (s, slot) in ids.slots.iter().enumerate() {
         let Some(slot) = slot else { continue };
         reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
@@ -9494,6 +9505,7 @@ mod tests {
             "engine_exec_paper_submits_total",
             "engine_exec_refused_off_total",
             "engine_exec_refused_no_route_total",
+            "engine_exec_refused_risk_total",
             "engine_exec_slot3_mode",
             "engine_exec_slot3_live_submits_total",
             "engine_exec_slot3_refused_total",
@@ -9529,6 +9541,7 @@ mod tests {
             "engine_exec_paper_submits_total",
             "engine_exec_refused_off_total",
             "engine_exec_refused_no_route_total",
+            "engine_exec_refused_risk_total",
         ] {
             assert!(n.len() <= core_metrics::NAME_MAX);
         }

@@ -100,8 +100,68 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     }
 }
 
+impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
+    /// **E6 — the risk gate's per-order clamp.**
+    ///
+    /// `Err(RiskRefused)` when the request's notional exceeds the
+    /// slot's `max_order_usd`, from `exec.toml`.
+    ///
+    /// ## Why here and not in the member
+    ///
+    /// bin15 has its own `cap_instance`/`cap_day` ledger and sizes
+    /// every order against it. This is a SECOND OPINION, not a copy:
+    /// it is the operator's number, it is checked on the dispatch
+    /// path rather than the sizing path, and it is computed from the
+    /// request in front of it rather than from anything the member
+    /// believes. **A non-zero `refused_risk` means the two
+    /// disagreed** — a member asked for something its own caps should
+    /// already have stopped — and that disagreement is the alarm.
+    ///
+    /// ## Notional
+    ///
+    /// `px` and `qty` are both ×1e6, so their product over 1e6 is USD
+    /// ×1e6, the same scale `max_order_usd_1e6` is stated in. Done in
+    /// `i128` because the product overflows `i64` at ~9.2e12 — a
+    /// $92 000 order of a $1 contract reaches it, which is inside the
+    /// range a fat-fingered `exec.toml` could ask for, and a
+    /// saturating product would clamp to a POSITIVE `i64::MAX` and
+    /// sail past a cap rather than into it.
+    ///
+    /// ## A cap of 0
+    ///
+    /// Refuses everything. `ExecRoute::default()` leaves the field 0,
+    /// but a default route is all-paper and never reaches this — a
+    /// slot only gets here after `set_slot` named a number. An
+    /// operator who writes `max_order_usd_1e6 = 0` has asked for a
+    /// slot that cannot trade, and gets one.
+    #[inline]
+    fn risk_check(&mut self, strategy_id: u8, px: i64, qty: i64) -> Result<(), DispatchError> {
+        let Some(cap_1e6) = self.route.max_order_usd_1e6_at(strategy_id as usize) else {
+            // No such slot. The caller's own `mode()` lookup masks the
+            // id into range, so this is unreachable — and it refuses
+            // rather than passing, because a clamp that cannot find
+            // its number must not wave the order through.
+            self.counters.on_refused_risk(strategy_id);
+            return Err(DispatchError::RiskRefused);
+        };
+        let notional_1e6 = ((px as i128).saturating_mul(qty as i128) / 1_000_000) as i64;
+        if notional_1e6 > cap_1e6 {
+            self.counters.on_refused_risk(strategy_id);
+            return Err(DispatchError::RiskRefused);
+        }
+        Ok(())
+    }
+}
+
 impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L> {
     /// Route one order. **Hot path.**
+    ///
+    /// E6: the risk clamp runs on the LIVE arm only. A paper slot is
+    /// modelling, and refusing its orders would make the model
+    /// disagree with the harness — which replays the same intents
+    /// through no such gate — for a reason that has nothing to do
+    /// with the strategy. The clamp exists to stop real money
+    /// leaving.
     #[inline]
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
         match self.route.mode(order.strategy_id) {
@@ -119,6 +179,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                     self.counters.on_refused_no_route(order.strategy_id);
                     return Err(DispatchError::NoLiveRoute);
                 }
+                self.risk_check(order.strategy_id, order.px.raw(), order.qty.raw())?;
                 self.counters.on_live_submit(order.strategy_id);
                 self.live.submit(order)
             }
@@ -174,6 +235,15 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                     self.counters.on_refused_no_route(req.order().strategy_id);
                     return Err(DispatchError::NoLiveRoute);
                 }
+                // **A modify can RAISE size**, so a clamp on `submit`
+                // alone leaves the cap reachable by repricing upward
+                // — the hole the E5 commit-4b review named. The
+                // replacement is measured exactly as a fresh order is.
+                self.risk_check(
+                    req.order().strategy_id,
+                    req.order().px.raw(),
+                    req.order().qty.raw(),
+                )?;
                 self.live.modify(req)
             }
         }
@@ -265,6 +335,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             paper_submits: c.paper_submits,
             refused_off: c.refused_off,
             refused_no_route: c.refused_no_route,
+            refused_risk: c.refused_risk,
             live_submits_by_slot: c.live_submits_by_slot,
             refused_by_slot: c.refused_by_slot,
         }
@@ -329,6 +400,23 @@ mod tests {
             0,
             Price::from_raw(500_000),
             Qty::from_raw(1_000_000),
+            oid,
+        );
+        o.strategy_id = slot;
+        o
+    }
+
+    /// The same, at an explicit price and size — the risk gate's
+    /// whole input.
+    fn order_px_qty(slot: u8, oid: u64, px: i64, qty: i64) -> Order {
+        let mut o = Order::new(
+            1_000,
+            VenueId::Hyperliquid,
+            42,
+            Side::Bid,
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
             oid,
         );
         o.strategy_id = slot;
@@ -600,6 +688,116 @@ mod tests {
         assert_eq!(d.modify(&ModifyReq::new(1, o)), Err(DispatchError::NoLiveRoute));
         assert_eq!(d.live().refused(), 2);
         assert_eq!(d.paper().open_paper_orders(), 0);
+    }
+
+    // ---------------- E6: the risk gate's per-order clamp ----------
+
+    /// **The clamp, and the thing it is for.** `bin15_live_table` sets
+    /// `max_order_usd = $100`; an order for more is refused BEFORE the
+    /// live arm sees it, so nothing reaches the venue.
+    ///
+    /// bin15 sizes against its own caps, so this should never fire —
+    /// which is exactly why it is counted. A non-zero `refused_risk`
+    /// means the member's ledger and the operator's number disagreed.
+    #[test]
+    fn an_order_over_the_slots_cap_never_reaches_the_live_arm() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        // $100.50: 201 contracts at 0.50.
+        let over = order_px_qty(3, 1, 500_000, 201_000_000);
+        assert_eq!(d.submit(&over), Err(DispatchError::RiskRefused));
+        assert!(d.live().seen.is_empty(), "the venue must never see it");
+        assert_eq!(
+            d.paper().open_paper_orders(),
+            0,
+            "and LAW E-1 still holds — a refused live order is not modelled"
+        );
+        assert_eq!(d.counters().refused_risk, 1);
+        assert_eq!(d.counters().refused_at(3), Some(1));
+        assert_eq!(d.counters().live_submits, 0);
+    }
+
+    /// The boundary is `>`, not `>=`: an order exactly AT the cap is
+    /// what an operator who wrote that number asked for.
+    #[test]
+    fn an_order_exactly_at_the_cap_is_allowed() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        // Exactly $100.00.
+        assert_eq!(d.submit(&order_px_qty(3, 7, 500_000, 200_000_000)), Ok(()));
+        assert_eq!(d.live().seen, vec![7]);
+        assert_eq!(d.counters().refused_risk, 0);
+    }
+
+    /// **A modify can RAISE size**, so a clamp on `submit` alone
+    /// leaves the cap reachable by repricing upward — the hole the E5
+    /// commit-4b review named. The replacement is measured exactly as
+    /// a fresh order is.
+    #[test]
+    fn a_modify_that_raises_the_order_past_the_cap_is_refused() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        // A legal order first, so the modify is the only thing on
+        // trial.
+        assert_eq!(d.submit(&order_px_qty(3, 1, 500_000, 100_000_000)), Ok(()));
+        let bigger = order_px_qty(3, 2, 500_000, 400_000_000); // $200
+        assert_eq!(
+            d.modify(&ModifyReq::new(1, bigger)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert!(
+            d.live().modified.is_empty(),
+            "the venue must never be asked to grow it past the cap"
+        );
+        assert_eq!(d.counters().refused_risk, 1);
+    }
+
+    /// A PAPER slot is modelling, and the offline harness replays the
+    /// same intents through no such gate. Refusing them here would
+    /// make the two disagree for a reason that has nothing to do with
+    /// the strategy.
+    #[test]
+    fn the_clamp_does_not_touch_a_paper_slot() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        // Slot 0 is paper; the same size that slot 3 was refused for.
+        assert_eq!(d.submit(&order_px_qty(0, 1, 500_000, 201_000_000)), Ok(()));
+        assert_eq!(d.counters().refused_risk, 0);
+        assert_eq!(d.counters().paper_submits, 1);
+    }
+
+    /// **The overflow the `i128` is for.** `px × qty` leaves `i64`
+    /// at about 9.2e18 — a $4 m price and three contracts reaches it
+    /// — and a wrapped product is NEGATIVE, which sails straight past
+    /// a `>` test. Saturating to `i64::MAX` would be no better: it is
+    /// positive, but it is a number nobody computed.
+    #[test]
+    fn a_notional_that_would_overflow_i64_is_refused_not_wrapped() {
+        let mut d = RoutedDispatcher::new(
+            bin15_live_table(),
+            PaperDispatcher::new(),
+            SpyLive::default(),
+        );
+        // 4e12 x 3e6: the i64 product wraps negative.
+        let absurd = order_px_qty(3, 1, 4_000_000_000_000, 3_000_000);
+        assert!(
+            (4_000_000_000_000i64).checked_mul(3_000_000).is_none(),
+            "the premise: this product does not fit i64"
+        );
+        assert_eq!(d.submit(&absurd), Err(DispatchError::RiskRefused));
+        assert!(d.live().seen.is_empty());
     }
 
     #[test]
