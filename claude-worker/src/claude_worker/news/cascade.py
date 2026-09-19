@@ -207,12 +207,9 @@ def typed_triage(
     the source is not class B, or when it does not speak for a venue — in
     every one of those the item goes to Haiku like any prose.
 
-    NOTE (spec §9.1, deviation D1): the hint is derived by the parser and
-    is IN MEMORY ONLY — the `items` DDL has no column for it — so the
-    cascade cannot re-derive it when it reads an item back out of the
-    store. Until that is ruled on, this function is called only where a
-    hint is in hand, and every class-B item otherwise costs a Haiku call.
-    Correctness is unaffected; money is.
+    The hint is the parser's, derived from the venue's own `annType` or
+    `type.key` and stored on the item since the D25 ruling — so this is
+    decided from what the venue published, never from prose about it.
     """
     if source.class_ != "B" or not source.venue or hint not in TYPED_EVENT_TYPES:
         return None
@@ -1000,6 +997,15 @@ class NewsQueueWatcher:
             self._store.counter_inc(COUNTER_TRIAGE_MALFORMED)
         return result
 
+    def _typed(self, row: dict[str, object]) -> claude_worker.labeling.TriageV2 | None:
+        """The class-B shortcut (spec §9.1): a venue announcing its own
+        business has already said what it is, and a model guessing at it
+        would be strictly worse evidence as well as a wasted call."""
+        source = self._registry.by_name(str(row["source"]))
+        if source is None:
+            return None
+        return typed_triage(source, str(row["title"]), str(row.get("hint", "")), self._vocab)
+
     def _run_triage(self, poll: claude_worker.feeds.PollStats, now_ts: int) -> list[str]:
         """Tier 1 over the oldest pending survivors. Returns the ids of the
         items that reached a clusterable impact."""
@@ -1009,13 +1015,18 @@ class NewsQueueWatcher:
             row = rows[i]
             source = str(row["source"])
             guid = str(row["guid"])
-            result = self._triage_one(row, poll, now_ts)
+            typed = self._typed(row)
+            model = self._models.tier1
+            if typed is not None:
+                model = MODEL_TYPED
+                self.stats.typed += 1
+            result = typed if typed is not None else self._triage_one(row, poll, now_ts)
             if result is None:
                 self._store.set_triage_state(
                     source, guid, claude_worker.news.store.STATE_SKIPPED
                 )
                 continue
-            self._store.put_triage(triage_row(source, guid, self._models.tier1, result, now_ts))
+            self._store.put_triage(triage_row(source, guid, model, result, now_ts))
             if result.impact in ESCALATE_IMPACTS:
                 self._store.set_triage_state(
                     source, guid, claude_worker.news.store.STATE_ESCALATED

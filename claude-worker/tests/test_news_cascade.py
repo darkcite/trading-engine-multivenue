@@ -165,11 +165,62 @@ def test_typed_class_b_skips_model() -> None:
     assert typed.assets == ("BTC",)
     # An untyped announcement, a class-C item and a venueless source all go
     # to the model instead.
+    assert claude_worker.news.cascade.typed_triage(source, "t", "", ASSETS) is None
     assert claude_worker.news.cascade.typed_triage(source, "t", "other", ASSETS) is None
     prose = dataclasses.replace(source, class_="C")
     assert claude_worker.news.cascade.typed_triage(prose, "t", "delisting", ASSETS) is None
     anon = dataclasses.replace(source, venue="")
     assert claude_worker.news.cascade.typed_triage(anon, "t", "delisting", ASSETS) is None
+
+
+def test_a_typed_item_costs_no_model_call(tmp_path: pathlib.Path) -> None:
+    """End to end for the D25 ruling: an OKX announcement carrying its own
+    `annType` is triaged from the stored hint, recorded under model
+    `typed`, and the model is never called."""
+    fake = _Fake(_triage_json())
+    registry = claude_worker.news.sources.Registry(
+        settings=claude_worker.news.sources.NewsSettings(),
+        keywords=(),
+        calendar=claude_worker.news.sources.Calendar(),
+        sources=(
+            claude_worker.news.sources.Source(
+                name="okx-ann", kind="json-okx-ann", url="https://www.okx.com/x",
+                origin="www.okx.com", class_="B", venue="okx",
+            ),
+        ),
+    )
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        store.upsert_item(
+            source="okx-ann", guid="g1", ts=NOW, fetched_ts=NOW,
+            title="OKX will delist BTC-FOO-SWAP", link="l", text="body",
+            origin="www.okx.com", class_="B", weight=1.0, venue="okx",
+            hint="delisting",
+        )
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store, registry=registry, symbol_map={"BTC-UP": 7},
+            vocab=ASSETS, complete_fn=fake, now_fn=lambda: NOW,
+        )
+        poll = watcher.poll_once()
+        assert watcher.stats.typed == 1
+        # Tier 1 was skipped — the venue already said what it was doing.
+        # The story it opened still earns a tier-2 label, which is the
+        # only call made: the shortcut saves the triage, not the label.
+        models_asked = [call[0] for call in fake.calls]
+        assert models_asked == [claude_worker.config.MODEL_REASONING]
+        assert store.budget_today(claude_worker.news.cascade.TIER1, NOW)["calls"] == 0
+        assert store.budget_today(claude_worker.news.cascade.TIER2, NOW)["calls"] == 1
+        triage = store._rows("SELECT * FROM triage", ())
+        assert len(triage) == 1
+        assert triage[0]["model"] == claude_worker.news.cascade.MODEL_TYPED
+        assert triage[0]["event_type"] == "delisting"
+        assert triage[0]["impact"] == "high"
+        # High impact clusters, so a story opened for it.
+        stories = store.stories_open(0)
+        assert len(stories) == 1 and stories[0]["origins"] == 1
+        assert stories[0]["venue_origin"] == 1
+        assert poll.escalated == 1
+        state.close()
 
 
 # ---- §9.2 clustering ------------------------------------------------------

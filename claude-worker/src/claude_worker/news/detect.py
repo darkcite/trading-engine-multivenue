@@ -893,6 +893,41 @@ def write_universe_proposals(
     return len(additions)
 
 
+def proposal_from_descriptor(descriptor: str, at_ts: int = 0) -> Event | None:
+    """The `universe.toml` coordinates a descriptor names, or ``None``.
+
+    The structural detectors carry section and value on the event because
+    they read them off the venue's own row; an ANALYST only ever names a
+    descriptor, so this recovers the rest from its shape. A prefix with no
+    ingress (coinbase, anything unknown) is ``None`` — a proposal nobody
+    could apply is worse than none.
+    """
+    prefix, _, value = descriptor.partition(":")
+    if not prefix or not value:
+        return None
+    if prefix == "binance-usdm":
+        venue = "binance"
+        # A dated USDM contract is `<base>_<yymmdd>`; the underscore is
+        # exactly what separates the class from a perpetual.
+        section = _BN_SECTION_DATED if "_" in value else _BN_SECTION_PERP
+    elif prefix in ("okx", "deribit"):
+        venue = prefix
+        section = _SECTION_INSTRUMENTS
+    else:
+        return None
+    return Event(
+        kind=EVENT_LISTING_LIVE,
+        venue=venue,
+        at_ts=at_ts,
+        source="assessment",
+        detail=f"proposed: {descriptor}",
+        instrument=value,
+        descriptor=descriptor,
+        section=section,
+        value=value,
+    )
+
+
 def xsd_table_descriptors(path: pathlib.Path) -> frozenset[str]:
     """Targets and partners of ``~/multivenue/xsd-table.tsv``.
 

@@ -45,6 +45,51 @@ def _item(store: claude_worker.news.store.Store, **over: object) -> bool:
     return store.upsert_item(**fields)  # type: ignore[arg-type]
 
 
+def test_a_store_written_before_the_hint_column_gains_it(tmp_path: pathlib.Path) -> None:
+    """Operator ruling 2026-09-20 (D25). `news.db` was already live and
+    populated when the class-B hint had to become readable by the cascade,
+    so the column arrives by the one migration SQLite does as metadata
+    alone: ADD COLUMN with a constant DEFAULT touches no row and is O(1)
+    whatever the table holds. This test builds the OLD shape by hand and
+    proves the open path upgrades it without losing a row."""
+    path = tmp_path / "worker" / "news" / "news.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = sqlite3.connect(str(path))
+    old.execute("PRAGMA journal_mode = WAL")
+    old.execute(
+        """
+        CREATE TABLE items (
+            source TEXT NOT NULL, guid TEXT NOT NULL, ts INTEGER NOT NULL,
+            fetched_ts INTEGER NOT NULL, title TEXT NOT NULL, link TEXT NOT NULL,
+            text TEXT NOT NULL, origin TEXT NOT NULL, class TEXT NOT NULL,
+            weight REAL NOT NULL, venue TEXT NOT NULL DEFAULT '', tier0 TEXT NOT NULL,
+            dup_of TEXT NOT NULL DEFAULT '', vocab_hits INTEGER NOT NULL DEFAULT 0,
+            triage_state TEXT NOT NULL DEFAULT 'new', story_id TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (source, guid))
+        """
+    )
+    old.execute(
+        "INSERT INTO items (source, guid, ts, fetched_ts, title, link, text, origin,"
+        " class, weight, tier0) VALUES ('okx-ann','old',1,1,'t','l','x','o','B',1.0,'pass')"
+    )
+    old.commit()
+    old.close()
+
+    with claude_worker.news.store.Store(path) as store:
+        rows = store.items_since(0)
+        assert len(rows) == 1, "the pre-existing row survived"
+        assert rows[0]["hint"] == "", "and gained the column at its default"
+        assert store.upsert_item(
+            source="okx-ann", guid="new", ts=2, fetched_ts=2, title="t", link="l",
+            text="x", origin="o", class_="B", weight=1.0, hint="delisting",
+        )
+        fresh = store.item("okx-ann", "new")
+        assert fresh is not None and fresh["hint"] == "delisting"
+    # Idempotent: opening again must not try to add it twice.
+    with claude_worker.news.store.Store(path) as store:
+        assert len(store.items_since(0)) == 2
+
+
 def test_the_schema_is_created_in_wal_and_carries_every_table(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "worker" / "news" / "news.db"
     store = claude_worker.news.store.Store(path)

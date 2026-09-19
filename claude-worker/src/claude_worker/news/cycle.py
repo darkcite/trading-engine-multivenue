@@ -191,6 +191,10 @@ def _store_item(
         venue=item.venue,
         tier0=verdict.kind,
         vocab_hits=max(0, verdict.hits),
+        # The venue's own word for what it announced (spec §5.2). In
+        # memory until now (D1); stored since the D25 ruling, because the
+        # cascade reads items back out and cannot re-derive it.
+        hint=item.hint,
     )
     if inserted and verdict.kind == claude_worker.news.filter.TIER0_DROP_DUP:
         store.mark_tier0(item.source, item.guid, verdict.kind, verdict.dup_of)

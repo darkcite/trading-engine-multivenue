@@ -66,6 +66,7 @@ _SCHEMA: tuple[str, ...] = (
         vocab_hits   INTEGER NOT NULL DEFAULT 0,
         triage_state TEXT NOT NULL DEFAULT 'new',
         story_id     TEXT NOT NULL DEFAULT '',
+        hint         TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (source, guid)
     )
     """,
@@ -264,6 +265,19 @@ STATE_LABELED: str = "labeled"
 STATE_ASSESSED: str = "assessed"
 STATE_SKIPPED: str = "skipped"
 
+#: Columns added after a store already existed in the wild. SQLite adds a
+#: column with a constant DEFAULT as METADATA only — no table rewrite, no
+#: row touched, O(1) whatever the row count — so this stays inside the
+#: spirit of the §4.3 "additive only" rule while letting a live `news.db`
+#: gain a field. Each entry is ``(table, column, DDL)`` and is applied only
+#: when the column is absent; the DDL must never drop or rewrite anything.
+#: Operator ruling 2026-09-20 (D25): the class-B `hint` is stored, so the
+#: cascade can read a venue's own word for what it announced instead of
+#: paying a model to guess at it.
+_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("items", "hint", "ALTER TABLE items ADD COLUMN hint TEXT NOT NULL DEFAULT ''"),
+)
+
 #: ``stories.state`` vocabulary (spec §9.2).
 STORY_OPEN: str = "open"
 STORY_LABELED: str = "labeled"
@@ -320,6 +334,26 @@ class Store:
         with self._conn:
             for i in range(len(_SCHEMA)):
                 self._conn.execute(_SCHEMA[i])
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Apply the additive column migrations this store has outgrown.
+
+        Idempotent and cheap: a column already present is skipped, and the
+        ones listed are metadata-only ``ADD COLUMN``s with constant
+        defaults. A store that has never been opened by an older build
+        does nothing here at all.
+        """
+        for i in range(len(_MIGRATIONS)):
+            table, column, ddl = _MIGRATIONS[i]
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+            names: set[str] = set()
+            for j in range(len(rows)):
+                names.add(str(rows[j][1]))
+            if column in names:
+                continue
+            with self._conn:
+                self._conn.execute(ddl)
 
     def close(self) -> None:
         """Flush and close. Idempotent."""
@@ -408,6 +442,7 @@ class Store:
         venue: str = "",
         tier0: str = TIER0_PASS,
         vocab_hits: int = 0,
+        hint: str = "",
     ) -> bool:
         """Insert a first sighting. Returns False when ``(source, guid)`` was
         already stored — the dedupe that keeps a re-polled feed from paying
@@ -417,8 +452,8 @@ class Store:
                 """
                 INSERT OR IGNORE INTO items
                     (source, guid, ts, fetched_ts, title, link, text, origin, class,
-                     weight, venue, tier0, vocab_hits)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     weight, venue, tier0, vocab_hits, hint)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     source,
@@ -434,6 +469,7 @@ class Store:
                     venue,
                     tier0,
                     vocab_hits,
+                    hint,
                 ),
             )
         return cursor.rowcount > 0
@@ -497,6 +533,7 @@ class Store:
             """
             SELECT i.source AS source, i.guid AS guid, i.ts AS ts, i.title AS title,
                    i.text AS text, i.origin AS origin, i.weight AS weight, i.venue AS venue,
+                   i.hint AS hint,
                    t.family AS family, t.event_type AS event_type, t.impact AS impact,
                    t.venues AS venues, t.assets AS assets
             FROM items AS i JOIN triage AS t ON t.source = i.source AND t.guid = i.guid
@@ -696,6 +733,14 @@ class Store:
 
     def record_action(self, row: typing.Mapping[str, object]) -> int:
         return self._insert_mapping("actions", row, replace=False)
+
+    def update_action(self, action_id: int, *, seq: int, detail: str = "") -> None:
+        """Close the record-then-send loop: the row exists before the frame
+        goes out, and this is what says whether it did."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE actions SET seq = ?, detail = ? WHERE id = ?", (seq, detail, action_id)
+            )
 
     def actions_since(self, since_ts: int) -> list[dict[str, object]]:
         return self._rows("SELECT * FROM actions WHERE ts >= ? ORDER BY id", (since_ts,))
