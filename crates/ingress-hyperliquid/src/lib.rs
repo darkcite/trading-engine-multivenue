@@ -7,9 +7,15 @@
 //! `docs/phase-8-plan.md` §4.3/§4.4 (venue facts verified 2026-08-14):
 //!
 //! * `bbo {coin}`     — pushed **only on BBO change** → [`core_types::Tick`]
-//! * `l2Book {coin}`  — **full snapshot every block, ≥ 0.5 s cadence,
-//!   ≤ 20 levels/side — no diffs, no seq**; consumed for capture +
-//!   integrity (§4.5)
+//! * `l2Book {coin}`  — **full snapshot on a venue TIMER, ~5.3 s per
+//!   coin (measured on mainnet 2026-09-19: median 5.33 s, p10 5.04,
+//!   p90 5.48, the same for perps and outcome legs, ~41 % of pushes
+//!   move the outcome touch), ≤ 20 levels/side — no diffs, no seq**;
+//!   consumed for capture + integrity (§4.5), and, for HIP-4 outcome
+//!   legs, the top-K depth capture (WS10-B, 2026-09-19) and the only
+//!   two-sided touch (BIN15 O8: their `bbo` still carries `null` for
+//!   the ask — 35 of 35 pushes on 2026-09-19 — while its bid side is
+//!   pushed on change within ~0.1 s)
 //! * `trades {coin}`  — batched rows per push
 //! * `activeAssetCtx {coin}` — funding / oracle / mark / OI (perp coins
 //!   only — see *coin gating* below)
@@ -113,7 +119,7 @@ pub use run_loop::{
 
 use core_net::SubId;
 use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte, skip_ws};
-use core_types::{NsTs, SymbolId};
+use core_types::{DepthLevel, DepthTopK, NsTs, SymbolId, VenueId, DEPTH_K};
 
 // ---------------------------------------------------------------
 // Constants
@@ -452,7 +458,16 @@ fn scan_level_obj(buf: &[u8], pos: usize) -> Option<(i64, i64, usize)> {
 /// side yields `(0, 0, 0, end)`. Every level is validated — ≤ 20 on
 /// this venue, so the strict walk stays cheap.
 #[inline]
-fn scan_side_levels(buf: &[u8], pos: usize) -> Option<(u16, i64, i64, usize)> {
+/// Walk one side's `[{px,sz,n},…]` array: returns `(count, best_px,
+/// best_sz, end)` and fills `out` with the first `out.len()` levels in
+/// venue order (best-first) on the way past — the same walk serves the
+/// header (`out` empty) and the WS10-B depth snapshot (`out` = the
+/// top-K), so there is one level scanner and not two.
+fn scan_side_levels(
+    buf: &[u8],
+    pos: usize,
+    out: &mut [DepthLevel],
+) -> Option<(u16, i64, i64, usize)> {
     if *buf.get(pos)? != b'[' {
         return None;
     }
@@ -460,11 +475,23 @@ fn scan_side_levels(buf: &[u8], pos: usize) -> Option<(u16, i64, i64, usize)> {
         return Some((0, 0, 0, pos + 2));
     }
     let (best_px, best_sz, mut at) = scan_level_obj(buf, pos + 1)?;
+    if let Some(slot) = out.first_mut() {
+        *slot = DepthLevel {
+            px_1e6: best_px,
+            qty_1e6: best_sz,
+        };
+    }
     let mut n: u16 = 1;
     loop {
         match *buf.get(at)? {
             b',' => {
-                let (_px, _sz, e) = scan_level_obj(buf, at + 1)?;
+                let (px, sz, e) = scan_level_obj(buf, at + 1)?;
+                if let Some(slot) = out.get_mut(usize::from(n)) {
+                    *slot = DepthLevel {
+                        px_1e6: px,
+                        qty_1e6: sz,
+                    };
+                }
                 n = n.saturating_add(1);
                 at = e;
             }
@@ -520,16 +547,37 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<HlBboFrame> {
 /// same second had six asks, best `0.69`.
 #[inline]
 pub fn parse_l2book_header(payload: &[u8], sym: SymbolId) -> Option<HlL2BookFrame> {
+    parse_l2book(payload, sym, &mut [], &mut [])
+}
+
+/// [`parse_l2book_header`] that also lifts the first `bids.len()` /
+/// `asks.len()` levels of each side into the caller's arrays, in venue
+/// (best-first) order; levels beyond the book's real depth are left as
+/// the caller set them (`DepthLevel::EMPTY`). The WS10-B depth capture
+/// for a HIP-4 outcome leg is this call with two `[DepthLevel; DEPTH_K]`
+/// on the stack — one walk of the snapshot serves the touch, the level
+/// counts and the top-K (2026-09-19; the venue pushes `l2Book` on a
+/// 5.3 s timer per coin, measured on mainnet, so the snapshot IS the
+/// only full view of an outcome book and the capture keeps every
+/// change of its top five levels).
+#[inline]
+pub fn parse_l2book(
+    payload: &[u8],
+    sym: SymbolId,
+    bids: &mut [DepthLevel],
+    asks: &mut [DepthLevel],
+) -> Option<HlL2BookFrame> {
     let pos = find_field(payload, b"\"levels\":")?;
     if *payload.get(pos)? != b'[' {
         return None;
     }
-    let (n_bids, best_bid_px_1e6, best_bid_sz_1e6, bids_end) = scan_side_levels(payload, pos + 1)?;
+    let (n_bids, best_bid_px_1e6, best_bid_sz_1e6, bids_end) =
+        scan_side_levels(payload, pos + 1, bids)?;
     if *payload.get(bids_end)? != b',' {
         return None;
     }
     let (n_asks, best_ask_px_1e6, best_ask_sz_1e6, _asks_end) =
-        scan_side_levels(payload, bids_end + 1)?;
+        scan_side_levels(payload, bids_end + 1, asks)?;
     let ts_ns = scan_bare_ms_to_ns(payload, b"\"time\":")?;
     Some(HlL2BookFrame {
         ts_ns,
@@ -542,6 +590,18 @@ pub fn parse_l2book_header(payload: &[u8], sym: SymbolId) -> Option<HlL2BookFram
         best_ask_sz_1e6,
         _pad: [0; 16],
     })
+}
+
+/// The WS10-B depth snapshot of a HIP-4 outcome leg from one `l2Book`
+/// push: the top [`DEPTH_K`] of each side, best-first, `EMPTY` beyond
+/// the book's depth. `None` on a malformed frame (the caller counts
+/// it, exactly as for the header).
+#[inline]
+pub fn parse_l2book_depth(payload: &[u8], sym: SymbolId, now_ns: NsTs) -> Option<DepthTopK> {
+    let mut bids = [DepthLevel::EMPTY; DEPTH_K];
+    let mut asks = [DepthLevel::EMPTY; DEPTH_K];
+    parse_l2book(payload, sym, &mut bids, &mut asks)?;
+    Some(DepthTopK::new(now_ns, VenueId::Hyperliquid, sym, 0, bids, asks))
 }
 
 /// Parse one `trades` row into an [`HlTradeFrame`]. Hyperliquid
@@ -1052,9 +1112,12 @@ pub fn expected_mask(coins: &HlCoinTable) -> (MaskBits, GlobalBits) {
 /// (14-sub connection, coins BTC/ETH/SOL): `l2Book` pushes are
 /// **timer-paced per subscription at ~1 push / 3.3 s per coin** —
 /// uniform across coins regardless of book activity, so the 2 s
-/// budget tripped every session by construction. 10 s ≈ 3× the
-/// observed period; still fast enough that a dead subscription is
-/// caught well inside the venue's own 60 s idle cutoff.
+/// budget tripped every session by construction. Re-measured
+/// 2026-09-19 on mainnet (7 subscriptions, BTC + two outcome legs):
+/// **5.33 s median, 4.4–6.0 s range**, again uniform across coins.
+/// 10 s is ~2× that period; still fast enough that a dead
+/// subscription is caught well inside the venue's own 60 s idle
+/// cutoff.
 pub const HL_STALENESS_BUDGET_NS: u64 = 10_000_000_000;
 
 /// Per-coin staleness monitor over `l2Book` snapshots. Stateless
@@ -1761,6 +1824,48 @@ mod tests {
         assert!(is_outcome_coin(b"#330"));
         assert!(!is_outcome_coin(b"BTC"));
         assert!(!is_outcome_coin(b"@1"), "a spot pair is not an outcome leg");
+    }
+
+    /// WS10-B for outcome legs (2026-09-19): the same walk lifts the
+    /// top-K levels, best-first, `EMPTY` past the book's depth — and
+    /// a book deeper than K keeps only the first K.
+    #[test]
+    fn l2book_depth_lifts_the_top_k_levels_in_venue_order() {
+        let p = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1}]]}}"##;
+        let d = parse_l2book_depth(p, 7, 123).expect("depth");
+        assert_eq!(d.ts_ns, 123);
+        assert_eq!(d.sym, 7);
+        assert_eq!(d.venue, VenueId::Hyperliquid as u8);
+        assert_eq!(d.k, DEPTH_K as u8);
+        assert_eq!(d.bids[0], DepthLevel { px_1e6: 500_000, qty_1e6: 64_000_000 });
+        assert_eq!(d.bids[1], DepthLevel { px_1e6: 490_000, qty_1e6: 64_000_000 });
+        assert_eq!(d.bids[2], DepthLevel::EMPTY);
+        assert_eq!(d.asks[0], DepthLevel { px_1e6: 690_000, qty_1e6: 69_000_000 });
+        assert_eq!(d.asks[1], DepthLevel::EMPTY);
+        // The header read of the same frame is unchanged by the arrays.
+        let f = parse_l2book_header(p, 7).expect("header");
+        assert_eq!((f.n_bids, f.n_asks, f.best_ask_px_1e6), (2, 1, 690_000));
+
+        // Seven bids, three asks: the top five bids, all three asks.
+        let mut buf = String::with_capacity(1024);
+        use std::fmt::Write;
+        write!(&mut buf, r##"{{"channel":"l2Book","data":{{"coin":"#330","time":1,"levels":[["##).unwrap();
+        for i in 0..7 {
+            write!(&mut buf, r#"{}{{"px":"0.{}","sz":"{}.0","n":1}}"#, if i == 0 { "" } else { "," }, 90 - i, 10 + i).unwrap();
+        }
+        write!(&mut buf, r#"],["#).unwrap();
+        for i in 0..3 {
+            write!(&mut buf, r#"{}{{"px":"0.{}","sz":"{}.0","n":1}}"#, if i == 0 { "" } else { "," }, 91 + i, 20 + i).unwrap();
+        }
+        write!(&mut buf, r#"]]}}}}"#).unwrap();
+        let d = parse_l2book_depth(buf.as_bytes(), 7, 1).expect("depth");
+        assert_eq!(d.bids[4], DepthLevel { px_1e6: 860_000, qty_1e6: 14_000_000 }, "fifth-best bid");
+        assert_eq!(d.asks[2], DepthLevel { px_1e6: 930_000, qty_1e6: 22_000_000 });
+        assert_eq!(d.asks[3], DepthLevel::EMPTY);
+        let f = parse_l2book_header(buf.as_bytes(), 7).expect("header");
+        assert_eq!((f.n_bids, f.n_asks), (7, 3), "the count still walks the whole side");
+        // A truncated frame is refused, not half-filled into a snapshot.
+        assert!(parse_l2book_depth(&buf.as_bytes()[..buf.len() - 8], 7, 1).is_none());
     }
 
     #[test]

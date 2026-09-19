@@ -6,6 +6,33 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — `hl-depth.pmlr` carries the HIP-4 outcome legs' top-5 (WS10-B for Hyperliquid, outcome coins only)
+
+**No wire-format change, no file-layout change, no config change.**
+`hl-depth.pmlr` (kind 7, 192 B `DepthTopK` slots, present in every
+capture set since WS10-B and header-only for Hyperliquid until now)
+receives one snapshot per `l2Book` push of an outcome coin whose top
+five levels on either side changed (`ingress_hyperliquid::parse_l2book_depth`,
+change-gated per coin slot in the run loop). Perps and spot write
+nothing; there is no HL depth ring; `bbo`/tick/event capture is
+untouched. Readers (`core_io::PmlrReader<DepthTopK>`,
+`claude_worker.pmlr.DepthReader`, `depth_digest`) need no change.
+
+Why: the intraday study (vault doc 25) could see only the touch of a
+book the venue re-sends every 5.3 s — measured on mainnet the same day:
+`l2Book` is a venue timer, 5.33 s median for perps and outcome legs
+alike, 41 % of pushes moving the outcome touch; the outcome legs' `bbo`
+is pushed on change (sub-second) but still carries `null` for the ask.
+The full snapshot is therefore the only view of an outcome book, and
+its top five levels are now kept whenever they move (~0.2 rows/s per
+leg at today's activity, 192 B each).
+
+Ripple: a capture set from this build on carries kind-7 rows for the
+outcome legs; the retention/archive lanes treat the file as they
+already do for OKX/Deribit (size-gated). `ingress_hyperliquid::scan_side_levels`
+takes an output slice (empty for the header read) — the header parser's
+behaviour and every existing tick is bit-identical.
+
 ## 2026-09-19 — `fees.toml` gains `<class>_settle` → `--fee-bps <venue>.<class>.settle:<m>:<t>` (the HIP-4 settlement fee, measured)
 
 **No wire-format change, no file-layout change.** One config key and

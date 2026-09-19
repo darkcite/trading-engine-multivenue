@@ -60,7 +60,8 @@ use core_net::{
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, WallAnchor};
 use core_types::{
-    Capture, ChannelEvent, ChannelId, EVENT_RING_SIZE, Price, Qty, Tick, VenueId, TICK_FLAG_STALE,
+    Capture, ChannelEvent, ChannelId, DepthLevel, DepthTopK, EVENT_RING_SIZE, Price, Qty, Tick,
+    VenueId, DEPTH_K, TICK_FLAG_STALE,
 };
 
 use crate::discovery::{parse_outcome_spec, HlOutcomeSpec};
@@ -70,7 +71,8 @@ use crate::family::{
 };
 use crate::{
     bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, outcome_meta_description,
-    is_outcome_coin, parse_active_asset_ctx, parse_all_mids, parse_bbo, parse_l2book_header,
+    is_outcome_coin, parse_active_asset_ctx, parse_all_mids, parse_bbo, parse_l2book_depth,
+    parse_l2book_header,
     parse_outcome_meta, parse_sub_response, parse_trade, sub_id_of, write_subscribe,
     write_unsubscribe, GlobalBits,
     HlChannel, HlCoinTable, HlMsgKind, HlStaleness, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN,
@@ -257,6 +259,13 @@ pub struct Driver {
     /// BIN15 O2 / E7 R0: the boot-bound families have been announced
     /// (see [`emit_boot_rolls`]). Once per process, never on reconnect.
     boot_rolls_emitted: bool,
+    /// WS10-B for outcome legs (2026-09-19): the last top-K snapshot
+    /// captured per coin slot, so a `l2Book` push whose top five levels
+    /// did not move (the venue re-sends the whole book on a 5.3 s
+    /// timer; 59 % of pushes change nothing) writes nothing. Boot-owned,
+    /// one 192 B row per [`HL_MAX_COINS`] slot; only outcome coins ever
+    /// touch theirs.
+    depth_last: Box<[DepthTopK]>,
     /// Set once the post-upgrade subscribe frames have been queued.
     subscribed: bool,
     /// Set once `found == expected` (staleness armed at that edge).
@@ -308,6 +317,8 @@ impl Driver {
             sub_ack_budget_ns,
             steady_since_ns: 0,
             boot_rolls_emitted: false,
+            depth_last: vec![DepthTopK::new(0, VenueId::Hyperliquid, 0, 0, [DepthLevel::EMPTY; DEPTH_K], [DepthLevel::EMPTY; DEPTH_K]); HL_MAX_COINS]
+                .into_boxed_slice(),
             subscribed: false,
             verified: false,
             feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
@@ -1399,15 +1410,43 @@ fn handle_data_frame<C: Capture>(
                                         f.n_bids as i64,
                                         f.n_asks as i64,
                                     ));
+                                    let outcome = drv
+                                        .coins
+                                        .get(coin_idx)
+                                        .is_some_and(|(c, _)| is_outcome_coin(c));
+                                    // WS10-B for outcome legs
+                                    // (2026-09-19): the top-K of both
+                                    // sides into `hl-depth.pmlr`,
+                                    // change-gated like OKX/Deribit's
+                                    // ladders — the venue re-sends the
+                                    // whole book every 5.3 s whether
+                                    // or not it moved. The header
+                                    // above already walked every level
+                                    // row, so the second walk cannot
+                                    // fail where the first passed.
+                                    if outcome {
+                                        if let Some(snap) = parse_l2book_depth(payload, sym, now_ns()) {
+                                            let last = &mut drv.depth_last[coin_idx];
+                                            if snap.bids != last.bids || snap.asks != last.asks {
+                                                capture.depth(&snap);
+                                                // COPY: one 192 B POD into the
+                                                // per-coin last-snapshot slot,
+                                                // once per CHANGED 5.3 s push —
+                                                // the gate needs the previous
+                                                // levels to compare against —
+                                                // rejected: a borrowed index
+                                                // into the rx buffer, which the
+                                                // next frame overwrites.
+                                                *last = snap;
+                                            }
+                                        }
+                                    }
                                     // BIN15 O8: for a HIP-4 outcome
                                     // leg this snapshot is the only
                                     // two-sided touch the venue
                                     // publishes. Same stamp + staleness
                                     // judgement the bbo arm applies.
-                                    let touch = if drv
-                                        .coins
-                                        .get(coin_idx)
-                                        .is_some_and(|(c, _)| is_outcome_coin(c))
+                                    let touch = if outcome
                                         && f.best_bid_px_1e6 > 0
                                         && f.best_ask_px_1e6 > f.best_bid_px_1e6
                                     {
@@ -2291,6 +2330,64 @@ mod tests {
         assert_eq!(after.venue_time_ms, t0 - 60_000);
     }
 
+    /// WS10-B for outcome legs (2026-09-19): an outcome coin's `l2Book`
+    /// push writes its top-K into the depth capture ONLY when the top-K
+    /// changed (the venue re-sends the book on a 5.3 s timer); a perp's
+    /// `l2Book` writes no depth (its ladder is not this crate's, and no
+    /// existing venue number moves); a malformed level row behind a
+    /// valid header is counted and not half-captured.
+    #[test]
+    fn hip4_l2book_depth_is_captured_on_change_only() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver();
+        let status = IngressStatus::new();
+        let (mut prod, mut cons) = ring_pair();
+        let mut cap = CountingCapture::default();
+        const SNAP_A: &[u8] = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1},{"px":"0.7","sz":"69.0","n":1}]]}}"##;
+        const SNAP_A2: &[u8] = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252946400,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1},{"px":"0.7","sz":"69.0","n":1}]]}}"##;
+        const SNAP_B: &[u8] = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252951700,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.48","sz":"10.0","n":1}],[{"px":"0.69","sz":"69.0","n":1},{"px":"0.7","sz":"69.0","n":1}]]}}"##;
+        const PERP: &[u8] = br#"{"channel":"l2Book","data":{"coin":"BTC","time":1789252941097,"levels":[[{"px":"1.0","sz":"1.0","n":1}],[{"px":"2.0","sz":"1.0","n":1}]]}}"#;
+
+        inject_text(&mut t, SNAP_A);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.depths, 1, "the first snapshot is a change from nothing");
+        let snap = cap.last_depth.expect("captured");
+        assert_eq!(snap.sym, SYM_HIP4);
+        assert_eq!(snap.venue, VenueId::Hyperliquid as u8);
+        assert_eq!(snap.bids[1], DepthLevel { px_1e6: 490_000, qty_1e6: 64_000_000 });
+        assert_eq!(snap.asks[1], DepthLevel { px_1e6: 700_000, qty_1e6: 69_000_000 });
+        assert_eq!(snap.bids[2], DepthLevel::EMPTY);
+        assert!(cons.try_pop().is_some(), "the touch tick still flows");
+
+        // The same book 5.3 s later: a new venue time, nothing moved —
+        // no depth row.
+        inject_text(&mut t, SNAP_A2);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.depths, 1, "an unchanged top-K writes nothing");
+
+        // The second bid level moved: one more row.
+        inject_text(&mut t, SNAP_B);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.depths, 2);
+        assert_eq!(
+            cap.last_depth.expect("captured").bids[1],
+            DepthLevel { px_1e6: 480_000, qty_1e6: 10_000_000 }
+        );
+
+        // A perp's l2Book: header event as before, no depth.
+        inject_text(&mut t, PERP);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.depths, 2, "perps carry no depth from this crate");
+
+        // Back to book A: a change again, and the gate is per coin —
+        // the perp in between did not disturb the outcome slot.
+        inject_text(&mut t, SNAP_A);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.depths, 3);
+        assert_eq!(status.parse_errors_total(), 0);
+        while cons.try_pop().is_some() {}
+    }
+
     #[test]
     fn hip4_coin_bbo_roundtrips_to_tick() {
         let mut t = TestTransport::with_capacity(8192);
@@ -2455,6 +2552,8 @@ mod tests {
         raw_frames: u32,
         rejects: u32,
         flushes: u32,
+        depths: u32,
+        last_depth: Option<DepthTopK>,
         last_event_channel: u8,
         last_event_sym: u32,
     }
@@ -2462,6 +2561,10 @@ mod tests {
     impl core_types::Capture for CountingCapture {
         fn tick(&mut self, _t: &Tick) {
             self.ticks += 1;
+        }
+        fn depth(&mut self, d: &DepthTopK) {
+            self.depths += 1;
+            self.last_depth = Some(*d);
         }
         fn event(&mut self, e: &ChannelEvent) {
             self.events += 1;

@@ -222,7 +222,11 @@ Deribit `book.100ms`; `book_builder::ladder`, cap 64 levels/side)
 emits one on every book update whose top-K actually CHANGED
 (byte-compare gate — levels + flags, not timestamps), onto the
 per-venue depth ring (`Ring<DepthTopK, 4096>`, engine `on_depth`) AND
-into `<venue>-depth.pmlr`. **First non-64-byte PMLR kind: slot size
+into `<venue>-depth.pmlr`. **Hyperliquid (2026-09-19): HIP-4 outcome
+legs only** — the top-K of each `l2Book` snapshot (a full book the
+venue pushes on a ~5.3 s timer per coin; no ladder, no diffs) lands in
+`hl-depth.pmlr` under the same change gate; there is no HL depth ring
+and perps write nothing here (their touch stays `bbo`-sourced). **First non-64-byte PMLR kind: slot size
 is KIND-determined since WS10-B — kinds 0–6 stay 64 B, kind 7 is
 192 B (three cache lines; still a 64-multiple, so mmap'd access
 stays aligned).** On a venue seq-chain break the ladder clears and a
@@ -235,7 +239,7 @@ ascending; slots past the book's real depth are all-zero.
 | -----: | ----: | ----- | ------------------- | ------------------------------------ |
 |      0 |     8 | ts_ns | `u64` NsTs          | ingress apply-complete time          |
 |      8 |     4 | sym   | `u32` SymbolId      |                                      |
-|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1                  |
+|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1; Hyperliquid (outcome legs) since 2026-09-19 |
 |     13 |     1 | k     | `u8`                | always 5 (`DEPTH_K`)                 |
 |     14 |     1 | flags | `u8`                | bit0 = STALE (book resyncing)        |
 |     15 |     1 | _pad0 | `u8`                | explicit, zeroed                     |
