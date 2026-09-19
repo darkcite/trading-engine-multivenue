@@ -269,6 +269,25 @@ pub struct HlExecCounters {
     /// no gauge until `stats()` is wired (risk-policy pre-arming item
     /// 5), so it is visible to a test and not to an operator.
     pub rolls_refused: u64,
+    /// **E6 commit 3a** — sweep calls that stopped early because they
+    /// had spent [`SWEEP_CANCELS_PER_IDLE`], or could not see the end
+    /// of the selection, and will continue on the next idle moment.
+    /// NOT a failure and NOT a spent retry; a steady stream of these
+    /// is one big sweep in progress, which is what keeping the engine
+    /// thread responsive looks like.
+    ///
+    /// **Appended, not inserted.** Placing it beside `sweeps_run`
+    /// would have shifted the offset of every field after it, and a
+    /// `#[repr(C)]` counter block is the kind of thing something
+    /// reads positionally one day.
+    pub sweep_deferred: u64,
+    /// **E6 commit 3a** — sweep entries that hit
+    /// [`SWEEP_MAX_DEFERS`]: the selection stopped shrinking between
+    /// calls, so the entry fell back to spending retries. Unreachable
+    /// while the venue's `frontendOpenOrders` view reflects our own
+    /// cancels; non-zero means it does not, and that the sweep is
+    /// making no progress.
+    pub sweep_stalled: u64,
 }
 
 /// Which budget rule an action answers to.
@@ -312,7 +331,10 @@ struct PendingSweep {
     /// counted as `sweep_left`.
     tries: u8,
     coin_len: u8,
-    _pad: [u8; 2],
+    /// **E6 commit 3a — how many times this entry has deferred.**
+    ///
+    /// The runaway guard. See [`SWEEP_MAX_DEFERS`].
+    defers: u16,
     coin: [u8; crate::asset::COIN_MAX],
     _pad2: [u8; 8],
 }
@@ -322,7 +344,7 @@ impl PendingSweep {
         asset: 0,
         tries: 0,
         coin_len: 0,
-        _pad: [0; 2],
+        defers: 0,
         coin: [0; crate::asset::COIN_MAX],
         _pad2: [0; 8],
     };
@@ -344,6 +366,130 @@ const MAX_PENDING_SWEEPS: usize = 16;
 /// entry becomes `sweep_left`, which is precisely the number E6 arms
 /// on.
 const SWEEP_TRIES: u8 = 8;
+
+/// **Cancels one [`HlExchange::sweep_one_pending`] may send per idle
+/// moment.**
+///
+/// `crate::recon::ours_on_leg` can select up to
+/// [`crate::recon::MAX_OPEN_ORDERS`] (256) oids and each cancel is its
+/// own HTTPS round trip bounded by [`crate::http::REQ_DEADLINE`]
+/// (5 s). E6 commit 3a put `on_idle` on the ENGINE THREAD for the
+/// `--exec` path, so cancelling a whole selection in one call is up
+/// to ~21 minutes of engine stall in the pathological case and ~13 s
+/// at a realistic 50 ms a round trip — during which no ring drains,
+/// `shutdown_requested()` is never reached, and E6's halt machine
+/// cannot run on the very thread a dead venue is blocking.
+///
+/// 8 holds the worst case per call to ~40 s of deadline and ~0.4 s in
+/// practice. The remainder is not dropped: the sweep entry stays
+/// pending and the next idle moment continues it, through the retry
+/// machinery this function already had — and idle moments come round
+/// every 2 ms.
+const SWEEP_CANCELS_PER_IDLE: usize = 8;
+
+/// How many times one sweep entry may defer before it stops deferring
+/// and starts spending retries.
+///
+/// **The invariant deferral rests on, and the guard for when it does
+/// not hold.** `sweep_one_pending` re-asks the VENUE on every call —
+/// it POSTs `frontendOpenOrders` and re-runs
+/// `crate::recon::ours_on_leg` over the fresh answer — so an order
+/// cancelled last call is no longer listed and the selection shrinks
+/// by what was cancelled. That is what makes 8-at-a-time terminate,
+/// and it is a property of re-fetching rather than of this file.
+///
+/// If it ever stops holding — a venue that keeps listing a cancelled
+/// order AND accepts the re-cancel, so nothing fails and nothing
+/// completes — deferral would never spend a retry and the entry would
+/// sit there issuing 8 HTTPS round trips every 2 ms for the life of
+/// the boot, on the engine thread. Past this many deferrals the entry
+/// falls back to spending retries, so it terminates either way.
+///
+/// **A TOTAL count, and the size is the whole argument.** The
+/// obvious alternative — count only CONSECUTIVE calls where the
+/// selection failed to shrink — does not work, because the selection
+/// cannot reveal progress while the leg is larger than the buffer: a
+/// 312-order leg reports 256 selected on every call for the first
+/// seven, even though eight orders really are being cancelled each
+/// time. That reading fires the guard on a sweep that is working.
+///
+/// So the bound is sized against the largest leg a VALID
+/// configuration can produce. `core_config::exec` refuses a live slot
+/// above `MAX_OPEN_ORDERS_PER_SLOT` (64) and there are 8 slots, so no
+/// leg can legitimately carry more than 512 of our orders — 64
+/// deferrals at [`SWEEP_CANCELS_PER_IDLE`] a call. 256 is four times
+/// that: it cannot fire on a sweep that is merely long, and it still
+/// terminates an entry that is making no progress at all within
+/// about half a second of idle moments.
+const SWEEP_MAX_DEFERS: u16 = 256;
+
+/// What one [`HlExchange::sweep_one_pending`] call should do with a
+/// selection of `selected` oids: `(send now, defer to the next idle)`.
+///
+/// A free function so the budget is TESTABLE. Inline, it sits inside a
+/// method that needs a scripted TLS endpoint and a live `HlExchange`
+/// to reach, and break-and-watch confirmed the obvious: removing the
+/// cap failed nothing.
+#[inline]
+#[must_use]
+const fn sweep_plan(selected: usize) -> (usize, u32) {
+    let now = if selected < SWEEP_CANCELS_PER_IDLE {
+        selected
+    } else {
+        SWEEP_CANCELS_PER_IDLE
+    };
+    (now, (selected - now) as u32)
+}
+
+/// What a sweep call learned about the entry it was working on.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum SweepOutcome {
+    /// Every selected order is cancelled and the venue's answer was
+    /// complete. Drop the entry.
+    Done,
+    /// Nothing failed; the call simply spent its budget. Keep the
+    /// entry and continue on the next idle moment — **without
+    /// spending a retry**, because stopping early was the plan.
+    Deferred,
+    /// Something failed, or the selection was truncated. Keep the
+    /// entry and burn one of [`SWEEP_TRIES`].
+    Retry,
+}
+
+/// Classify a sweep call. `deferred` is budget, `failed` is failure,
+/// and conflating them is what would abandon a 256-order sweep after
+/// 64 with the rest reported as `sweep_left` — quotes left resting on
+/// a retired instance, which is the one thing LAW E-8 exists to
+/// prevent.
+///
+/// **`truncated` is MORE WORK, not failure**, and the first cut of
+/// this function got that wrong in a way the budget itself made
+/// dangerous. `truncated` means the selection filled the buffer —
+/// `k == MAX_OPEN_ORDERS`. Before the budget, one call cancelled all
+/// 256, so a leg of N orders was truncated for about `N / 256` calls.
+/// After it, progress is 8 a call, so the selection sits AT the
+/// ceiling for roughly `(N − 256) / 8` calls — and returning `Retry`
+/// for each of them spends one of [`SWEEP_TRIES`] (8) every time.
+/// Past **N > 312** the retries run out and the entry is dropped with
+/// the remainder reported as `sweep_left`. Commit 2's boot rule
+/// allows 64 open orders on each of 8 slots, so a leg of 512 is a
+/// valid configuration and that abandonment is reachable.
+///
+/// So truncation with a clean budget defers like any other
+/// incomplete call. It is still never `Done` — we could not see the
+/// end of the selection — and a real `failed` still wins, because
+/// then there IS something to retry rather than merely continue.
+#[inline]
+#[must_use]
+const fn classify_sweep(failed: u32, deferred: u32, truncated: bool) -> SweepOutcome {
+    if failed > 0 {
+        return SweepOutcome::Retry;
+    }
+    if deferred > 0 || truncated {
+        return SweepOutcome::Deferred;
+    }
+    SweepOutcome::Done
+}
 
 /// The live Hyperliquid dispatcher.
 pub struct HlExchange<const FILL_N: usize> {
@@ -1008,7 +1154,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             asset,
             tries: SWEEP_TRIES,
             coin_len,
-            _pad: [0; 2],
+            defers: 0,
             coin,
             _pad2: [0; 8],
         };
@@ -1093,9 +1239,24 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let truncated = k == oids.len();
 
         // ---- cancel them, by oid ------------------------------------
-        let mut left = 0u32;
+        //
+        // **BUDGETED PER CALL** — see [`SWEEP_CANCELS_PER_IDLE`]. The
+        // leftovers are counted into `left`, which keeps the entry
+        // pending, so the next idle moment continues the sweep
+        // instead of this one stalling the engine thread through 256
+        // round trips.
+        // `failed` and `deferred` are counted SEPARATELY, and the
+        // difference decides whether a retry is burned. Running out of
+        // budget is planned continuation, not a failure — folding it
+        // into `left` would spend one of [`SWEEP_TRIES`] (8) per idle
+        // moment, so a sweep of 256 orders at 8 a call would be
+        // abandoned after 64 with the rest reported as `sweep_left`:
+        // quotes left resting on a retired instance, which is the one
+        // thing LAW E-8 exists to prevent.
+        let mut failed = 0u32;
+        let (budget, deferred) = sweep_plan(k);
         let mut j = 0usize;
-        while j < k {
+        while j < budget {
             let oid = oids[j];
             j += 1;
             let c = [crate::action::CancelWire { asset: e.asset, oid }];
@@ -1106,7 +1267,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
                 crate::request::cancel_json(&mut aj, &c),
             ) else {
                 self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                left += 1;
+                failed += 1;
                 continue;
             };
             if self
@@ -1115,15 +1276,33 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             {
                 self.counters.sweep_cancelled = self.counters.sweep_cancelled.wrapping_add(1);
             } else {
-                left += 1;
+                failed += 1;
             }
         }
-        if left == 0 && !truncated {
-            self.drop_sweep(0);
-        } else {
+        match classify_sweep(failed, deferred, truncated) {
+            SweepOutcome::Done => self.drop_sweep(0),
+            // The entry stays pending and the NEXT idle moment
+            // continues it, with its retries untouched — this call did
+            // exactly what it set out to do.
+            SweepOutcome::Deferred => {
+                self.counters.sweep_deferred = self.counters.sweep_deferred.wrapping_add(1);
+                if self.sweeps[0].defers >= SWEEP_MAX_DEFERS {
+                    // Far past any leg a valid configuration can
+                    // produce, so the selection has stopped
+                    // shrinking. Stop deferring and start spending
+                    // retries, so the entry terminates whether or not
+                    // the venue's view reflects our own cancels.
+                    self.counters.sweep_stalled =
+                        self.counters.sweep_stalled.wrapping_add(1);
+                    self.sweeps[0].defers = 0;
+                    self.spend_try(0);
+                } else {
+                    self.sweeps[0].defers = self.sweeps[0].defers.saturating_add(1);
+                }
+            }
             // Retried on the next idle, bounded. `spend_try` counts
             // them as `sweep_left` when the retries run out.
-            self.spend_try(0);
+            SweepOutcome::Retry => self.spend_try(0),
         }
     }
 
@@ -1875,7 +2054,10 @@ mod tests {
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
             320,
-            "HlExecCounters changed size — 40 u64 in five 64-byte lines"
+            "HlExecCounters changed size — 34 eight-byte counters (272 B) \
+             rounded up to five 64-byte lines, with room for six more \
+             before it grows. The message used to say 40 u64, which is \
+             why adding one looked like it would cross a line and did not."
         );
     }
 
@@ -2433,6 +2615,170 @@ mod tests {
             Some(0),
             "carrying the old quantity forward would have the reconciler \
              comparing a settled position against a fresh balance forever"
+        );
+    }
+
+    /// **The sweep must not cancel its whole selection in one
+    /// call.** E6 commit 3a put `on_idle` on the engine thread.
+    #[test]
+    fn the_sweep_budget_bounds_one_call_and_defers_the_rest() {
+        // `ours_on_leg` can select up to `MAX_OPEN_ORDERS` (256) and
+        // every cancel is an HTTPS round trip bounded by
+        // `REQ_DEADLINE` (5 s). E6 commit 3a put `on_idle` on the
+        // ENGINE THREAD, so an unbudgeted loop here is up to ~21
+        // minutes of stall in one call — no ring drained, no
+        // `shutdown_requested()`, and E6's halt machine unable to run
+        // on the thread a dead venue is blocking.
+        assert_eq!(sweep_plan(0), (0, 0));
+        assert_eq!(sweep_plan(1), (1, 0));
+        assert_eq!(
+            sweep_plan(SWEEP_CANCELS_PER_IDLE),
+            (SWEEP_CANCELS_PER_IDLE, 0),
+            "a selection exactly at the budget is not deferred"
+        );
+        assert_eq!(
+            sweep_plan(SWEEP_CANCELS_PER_IDLE + 1),
+            (SWEEP_CANCELS_PER_IDLE, 1)
+        );
+        assert_eq!(
+            sweep_plan(crate::recon::MAX_OPEN_ORDERS),
+            (
+                SWEEP_CANCELS_PER_IDLE,
+                (crate::recon::MAX_OPEN_ORDERS - SWEEP_CANCELS_PER_IDLE) as u32
+            ),
+            "the worst case the venue can hand us is still one budget"
+        );
+        // Nothing is lost: send + defer is always the whole selection.
+        let mut k = 0usize;
+        while k <= crate::recon::MAX_OPEN_ORDERS {
+            let (now, deferred) = sweep_plan(k);
+            assert_eq!(now + deferred as usize, k, "the sweep dropped {k}");
+            assert!(now <= SWEEP_CANCELS_PER_IDLE);
+            k += 1;
+        }
+    }
+
+    #[test]
+    fn budget_exhaustion_is_not_a_failure_and_does_not_burn_a_retry() {
+        // `SWEEP_TRIES` is 8. Folding deferral into the failure path
+        // spends one per idle moment, so a 256-order sweep at 8 a call
+        // would be abandoned after 64 with the rest reported as
+        // `sweep_left` — quotes left resting on a retired instance,
+        // which is exactly what LAW E-8 exists to prevent.
+        assert_eq!(classify_sweep(0, 0, false), SweepOutcome::Done);
+        assert_eq!(classify_sweep(0, 248, false), SweepOutcome::Deferred);
+        assert_eq!(classify_sweep(1, 0, false), SweepOutcome::Retry);
+        // A FAILURE wins over a deferral: the call has something to
+        // retry, and reporting it as "went to plan" would spend no
+        // retry on an order that really did not cancel.
+        assert_eq!(classify_sweep(1, 248, false), SweepOutcome::Retry);
+        // **TRUNCATION IS MORE WORK, NOT FAILURE.** The budget makes
+        // the selection sit AT the ceiling for `(N - 256) / 8` calls,
+        // so `Retry` here spends one of 8 tries every one of them and
+        // a leg above ~312 orders is abandoned with the rest reported
+        // as `sweep_left`. Still never `Done` — we could not see the
+        // end of the selection — but deferral is what continues it.
+        assert_eq!(classify_sweep(0, 0, true), SweepOutcome::Deferred);
+        assert_eq!(classify_sweep(0, 248, true), SweepOutcome::Deferred);
+    }
+
+    /// One sweep entry driven to completion the way
+    /// `sweep_one_pending` drives it, for a leg carrying `total`
+    /// orders of ours. Returns `(idle moments, retries spent,
+    /// stalls)`, or `None` if the entry was abandoned with orders
+    /// still resting.
+    ///
+    /// **`truncated` is computed the way production computes it** —
+    /// `k == oids.len()`, i.e. the selection filled the buffer — and
+    /// `selected` is capped at `MAX_OPEN_ORDERS` because that is what
+    /// the buffer can hold. An earlier version of this passed
+    /// `truncated = false` unconditionally, including on the first
+    /// call where production computes `true`, which is exactly why it
+    /// could not see that truncation was burning a retry per call.
+    fn run_sweep_to_completion(total: usize, shrinks: bool) -> Option<(usize, u8, u64)> {
+        let mut left = total;
+        let mut tries = SWEEP_TRIES;
+        let mut defers: u16 = 0;
+        let mut stalls = 0u64;
+        let mut idles = 0usize;
+        while left > 0 {
+            let selected = left.min(crate::recon::MAX_OPEN_ORDERS);
+            let truncated = selected == crate::recon::MAX_OPEN_ORDERS;
+            let (now, deferred) = sweep_plan(selected);
+            assert!(now > 0, "no progress with {left} left");
+            idles += 1;
+            assert!(idles < 100_000, "runaway");
+            match classify_sweep(0, deferred, truncated) {
+                SweepOutcome::Done => {}
+                SweepOutcome::Deferred => {
+                    if defers >= SWEEP_MAX_DEFERS {
+                        stalls += 1;
+                        defers = 0;
+                        tries = tries.checked_sub(1)?;
+                    } else {
+                        defers = defers.saturating_add(1);
+                    }
+                }
+                SweepOutcome::Retry => {
+                    tries = tries.checked_sub(1)?;
+                }
+            }
+            if shrinks {
+                left -= now;
+            }
+        }
+        Some((idles, tries, stalls))
+    }
+
+    #[test]
+    fn a_full_selection_finishes_within_the_retries_it_has() {
+        // A 256-order leg: exactly one buffer, truncated on the first
+        // call and shrinking from there.
+        let (idles, tries, stalls) =
+            run_sweep_to_completion(crate::recon::MAX_OPEN_ORDERS, true)
+                .expect("a 256-order sweep must not be abandoned");
+        assert_eq!(idles, 32, "256 orders at 8 a call");
+        assert_eq!(tries, SWEEP_TRIES, "deferral spent no retries");
+        assert_eq!(stalls, 0);
+    }
+
+    /// **The regression the budget introduced, and the reason
+    /// `truncated` had to stop meaning failure.**
+    ///
+    /// Commit 2's boot rule allows 64 open orders on each of 8 slots,
+    /// so a leg of 512 is a valid configuration. With truncation
+    /// classed as `Retry`, the selection sits at the 256 ceiling for
+    /// `(512 - 256) / 8 = 32` calls, each spending one of 8 tries —
+    /// abandoned long before the end, with the remainder reported as
+    /// `sweep_left`: quotes resting on a retired instance.
+    #[test]
+    fn a_leg_larger_than_one_buffer_is_not_abandoned() {
+        for total in [312usize, 313, 512, 1024] {
+            let (idles, tries, stalls) = run_sweep_to_completion(total, true)
+                .unwrap_or_else(|| panic!("a {total}-order sweep was abandoned"));
+            assert_eq!(idles, total.div_ceil(SWEEP_CANCELS_PER_IDLE));
+            assert_eq!(tries, SWEEP_TRIES, "{total}: deferral spent no retries");
+            assert_eq!(stalls, 0, "{total}: nothing stalled");
+        }
+    }
+
+    /// **The invariant deferral rests on, and what happens without
+    /// it.**
+    ///
+    /// Deferral spends no retry, which is safe only while the venue's
+    /// `frontendOpenOrders` view shrinks by what we cancelled. If it
+    /// ever does not — a venue that keeps listing a cancelled order
+    /// and accepts the re-cancel — an unguarded entry would issue 8
+    /// HTTPS round trips every 2 ms for the life of the boot, on the
+    /// engine thread. `SWEEP_MAX_DEFERS` makes it terminate anyway,
+    /// and is sized so a sweep that is merely long is never mistaken
+    /// for one that is stuck
+    /// (`a_leg_larger_than_one_buffer_is_not_abandoned`).
+    #[test]
+    fn a_selection_that_never_shrinks_terminates_instead_of_spinning() {
+        assert!(
+            run_sweep_to_completion(crate::recon::MAX_OPEN_ORDERS, false).is_none(),
+            "a non-shrinking selection must be abandoned, not looped on for ever"
         );
     }
 

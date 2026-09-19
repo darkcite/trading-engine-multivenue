@@ -168,6 +168,272 @@ const RPC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
 /// iteration. Bounded so a backed-up ring can't starve the others.
 const DRAIN_BATCH: usize = 256;
 
+/// **E6 — the longest the dispatcher may go without an idle moment.**
+///
+/// The loop gives the dispatcher its idle moment after a tick that
+/// drained nothing, which is the right default: the venue work is
+/// blocking and the market data is not.
+///
+/// But "when the rings are empty" ALONE would starve it. `tick`
+/// drains up to [`DRAIN_BATCH`] per ring per lane, and a busy market
+/// across six venues can keep every tick non-empty indefinitely — so
+/// the one path that pumps the venue's user-event socket, runs the
+/// reconciler and persists the budget would stop running exactly when
+/// there is most trading to reconcile. A ceiling on the gap costs one
+/// clock read per iteration and removes that failure entirely.
+///
+/// 2 ms: far below the reconciler's own 60 s cadence and the WS
+/// backoff, so in practice this changes nothing but the worst case.
+const DISPATCHER_IDLE_MAX_GAP_NS: u64 = 2_000_000;
+
+/// Should the dispatcher get its idle moment this iteration?
+///
+/// Extracted from the loop so the starvation property is TESTABLE.
+/// Inline, the condition sits inside a two-thousand-line function
+/// that no test constructs, and "the socket still gets pumped in a
+/// busy market" would be a claim in a comment rather than a fact —
+/// which is the defect shape this lane keeps finding.
+#[inline]
+#[must_use]
+pub const fn should_drive_idle(drained: usize, now_ns: u64, last_idle_ns: u64) -> bool {
+    drained == 0 || now_ns.saturating_sub(last_idle_ns) >= DISPATCHER_IDLE_MAX_GAP_NS
+}
+
+/// **Paces the dispatcher's idle moment, and owns the stamping.**
+///
+/// `should_drive_idle` alone was not enough to hold the property. The
+/// first cut stamped `last_idle_ns` with the clock read taken BEFORE
+/// the blocking call, which collapses the ceiling in exactly the case
+/// it exists for — one HTTPS round trip always exceeds 2 ms, so the
+/// next iteration's clock is already past the gap and the gate fires
+/// again immediately. Break-and-watch reinstated that bug and NOT ONE
+/// TEST FAILED: the test modelled the stamping itself, so it was
+/// asserting its own simulation rather than the loop.
+///
+/// Taking the clock and the call as arguments is what fixes that. The
+/// loop hands it the real ones; a test hands it a fake clock that
+/// advances by the call's cost, and the assertion is then about
+/// behaviour rather than arithmetic.
+#[derive(Debug, Default)]
+pub struct IdlePacer {
+    /// When the last idle moment FINISHED. `0` = never, so the first
+    /// iteration drives it.
+    last_ns: u64,
+}
+
+impl IdlePacer {
+    /// A pacer that has never driven.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { last_ns: 0 }
+    }
+
+    /// Drive the dispatcher if it is due, and return the current
+    /// clock — **re-read after the call when one happened**.
+    ///
+    /// The returned value is what the caller must use for everything
+    /// downstream. A stale `now` would have the 1 s `/state` publish
+    /// and the 5 s report compute staleness against a reading from
+    /// before the stall, under-reporting it by exactly the stall's
+    /// duration and hiding the pause that caused it.
+    #[inline]
+    pub fn drive_if_due<C, F>(&mut self, drained: usize, now_ns: u64, mut clock: C, mut drive: F) -> u64
+    where
+        C: FnMut() -> u64,
+        F: FnMut(),
+    {
+        if !should_drive_idle(drained, now_ns, self.last_ns) {
+            return now_ns;
+        }
+        drive();
+        let finished = clock();
+        self.last_ns = finished;
+        finished
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_idle_tests {
+    use super::{should_drive_idle, DISPATCHER_IDLE_MAX_GAP_NS};
+
+    /// The pacer must hand back the POST-call clock, or every cadence
+    /// downstream measures staleness from before the stall and
+    /// under-reports it by exactly the stall's length.
+    #[test]
+    fn the_pacer_returns_the_clock_from_after_the_call() {
+        use std::cell::Cell;
+        let clock = Cell::new(1_000u64);
+        let mut pacer = super::IdlePacer::new();
+        let after = pacer.drive_if_due(
+            0,
+            clock.get(),
+            || clock.get(),
+            || clock.set(clock.get() + 50_000_000),
+        );
+        assert_eq!(after, 50_001_000, "the caller was handed a stale clock");
+    }
+
+    #[test]
+    fn the_pacer_does_not_read_the_clock_when_it_does_not_drive() {
+        use std::cell::Cell;
+        let reads = Cell::new(0usize);
+        let mut pacer = super::IdlePacer::new();
+        // Drive once so `last_ns` is set, then a busy iteration a
+        // microsecond later must not be due.
+        let _ = pacer.drive_if_due(0, 1_000, || 1_000, || {});
+        let n = pacer.drive_if_due(
+            256,
+            1_001,
+            || {
+                reads.set(reads.get() + 1);
+                1_001
+            },
+            || panic!("drove when it was not due"),
+        );
+        assert_eq!(n, 1_001, "a non-driving call must pass the clock through");
+        assert_eq!(reads.get(), 0, "and must not pay for a clock read");
+    }
+
+    /// The default: the venue work blocks, so market data must not
+    /// queue behind it.
+    #[test]
+    fn a_quiet_tick_drives_the_dispatcher() {
+        assert!(should_drive_idle(0, 1_000, 1_000));
+    }
+
+    /// **The starvation property.** `tick` drains up to `DRAIN_BATCH`
+    /// per ring per lane, and a busy market across six venues can keep
+    /// every tick non-empty indefinitely. Gated on emptiness ALONE,
+    /// the only path that pumps the venue's user-event socket, runs
+    /// the reconciler and persists the budget would stop running
+    /// exactly when there is most trading to reconcile.
+    /// One simulated second of the REAL loop, driven through
+    /// [`IdlePacer`] with a fake clock that advances by `call_ns`
+    /// whenever the dispatcher is driven.
+    ///
+    /// The point is that the pacer under test is the one the loop
+    /// uses, stamping included. An earlier version of this helper
+    /// re-implemented the stamping inline, so it asserted its own
+    /// simulation — and a break-and-watch run that reinstated the
+    /// pre-call stamp failed nothing at all.
+    fn simulate_second(drained: usize, call_ns: u64) -> (usize, usize) {
+        use std::cell::Cell;
+        const ITER_NS: u64 = 1_000; // 1 us of tick work an iteration
+        const START: u64 = 1_000;
+
+        let clock = Cell::new(START);
+        let mut pacer = super::IdlePacer::new();
+        let mut drove = 0usize;
+        let mut iters = 0usize;
+
+        while clock.get() - START < 1_000_000_000 {
+            clock.set(clock.get() + ITER_NS);
+            iters += 1;
+            let now = clock.get();
+            let after = pacer.drive_if_due(
+                drained,
+                now,
+                || clock.get(),
+                || {
+                    // The blocking call, as the wall clock sees it.
+                    clock.set(clock.get() + call_ns);
+                    drove += 1;
+                },
+            );
+            assert!(after >= now, "the pacer handed back a clock from the past");
+        }
+        (drove, iters)
+    }
+
+    #[test]
+    fn a_permanently_busy_market_still_gets_an_idle_moment() {
+        let (drove, _) = simulate_second(256, 0);
+        assert!(
+            drove > 0,
+            "a busy market never let the dispatcher near its socket"
+        );
+        assert!(
+            (400..=600).contains(&drove),
+            "drove {drove} times in a second"
+        );
+    }
+
+    /// **The degeneration the first cut shipped.**
+    ///
+    /// The loop stamped `last_idle_ns` with a clock read taken BEFORE
+    /// the blocking call. One HTTPS round trip always exceeds 2 ms,
+    /// so the next iteration's clock was already past the gap and the
+    /// gate fired again immediately — in exactly the regime the
+    /// ceiling exists for, it meant "every iteration", and the engine
+    /// thread sat inside `on_idle` continuously.
+    ///
+    /// Stamping from the POST-call clock is what bounds it, and this
+    /// asserts the bound rather than the arithmetic: with a 50 ms
+    /// call, one second admits about twenty of them and no more.
+    /// **The degeneration the first cut shipped, measured the only
+    /// way that can see it.**
+    ///
+    /// Counting DRIVES PER SECOND cannot: when the blocking call
+    /// dominates the clock, "fires every iteration" and "fires every
+    /// 2 ms" both give about twenty a second, and a break-and-watch
+    /// run that reinstated the pre-call stamp passed this test
+    /// happily at 20.
+    ///
+    /// What actually differs is how much TICK WORK the engine got to
+    /// do between venue calls. Correct: ~2 ms of it, which at 1 µs an
+    /// iteration is ~2000 iterations. Broken: one.
+    #[test]
+    fn a_blocking_call_leaves_the_engine_time_to_work_between_calls() {
+        let (drove, iters) = simulate_second(256, 50_000_000); // 50 ms a call
+        assert!(drove > 0, "never drove at all");
+        let per_drive = iters / drove;
+        assert!(
+            per_drive >= 1_000,
+            "only {per_drive} iterations of engine work between venue calls \
+             ({drove} calls over {iters} iterations) — the ceiling collapsed \
+             and the loop is a synchronous HTTP loop with the engine attached"
+        );
+    }
+
+    #[test]
+    fn a_very_slow_call_runs_at_its_own_pace_and_not_faster() {
+        // A 5 s call — `http::REQ_DEADLINE`, the worst one round trip
+        // can cost — cannot be entered twice inside one second.
+        assert!(simulate_second(256, 5_000_000_000).0 <= 1);
+    }
+
+    #[test]
+    fn the_gap_ceiling_is_a_ceiling_not_a_period() {
+        assert!(!should_drive_idle(
+            1,
+            1_000 + DISPATCHER_IDLE_MAX_GAP_NS - 1,
+            1_000
+        ));
+        // `>=`, because a ceiling that must be EXCEEDED is a ceiling
+        // one iteration higher than it says.
+        assert!(should_drive_idle(1, 1_000 + DISPATCHER_IDLE_MAX_GAP_NS, 1_000));
+    }
+
+    #[test]
+    fn a_clock_that_goes_backwards_does_not_starve_it_forever() {
+        // `saturating_sub` floors at 0, so a backward step reads as
+        // "no time has passed" rather than as an enormous gap — which
+        // would drive it every iteration. The quiet-tick path still
+        // runs, so nothing is stuck.
+        assert!(!should_drive_idle(1, 500, 1_000));
+        assert!(should_drive_idle(0, 500, 1_000));
+    }
+
+    #[test]
+    fn the_first_iteration_drives_it() {
+        // `last_idle_ns` starts at 0, so even a busy first tick gets
+        // the dispatcher onto its socket immediately rather than after
+        // the first quiet moment.
+        assert!(should_drive_idle(256, 1_789_776_001_000_000_000, 0));
+    }
+}
+
 // ---------------------------------------------------------------
 // Endpoint config — boot-time strings; never touched on hot path
 // ---------------------------------------------------------------
@@ -6121,10 +6387,41 @@ where
         None => u64::MAX,
     };
 
-    while !shutdown_requested() {
-        eng.tick(DRAIN_BATCH);
+    // E6: paces the dispatcher's idle moment. See `IdlePacer`.
+    let mut idle_pacer = IdlePacer::new();
 
-        let now = now_ns();
+    while !shutdown_requested() {
+        let drained = eng.tick(DRAIN_BATCH);
+
+        let mut now = now_ns();
+
+        // E6 commit 3a — THE LIVE ARM'S ONLY THREAD.
+        //
+        // `RoutedDispatcher` is handed straight to this loop on the
+        // `--exec` path, with no `DispatcherWorker` behind it, so
+        // until now nothing called `on_idle` on the one path that can
+        // arm Hyperliquid: the user-event socket never pumped, the
+        // reconciler never ran, the budget never persisted, and E6's
+        // halt triggers had no source of truth.
+        //
+        // Driven when the tick drained NOTHING — the venue work blocks
+        // and market data must not queue behind it — or when the gap
+        // has reached `DISPATCHER_IDLE_MAX_GAP_NS`, because "only when
+        // idle" starves it in exactly the busy market that most needs
+        // reconciling.
+        //
+        // A PAPER boot reaches this too, and its dispatcher's
+        // `on_idle` is the trait's default: a `false` return and
+        // nothing else. No syscall, no branch an operator can see.
+        // The pacer owns the "is it due" test, the call, and the
+        // stamping — all three, because the stamping is where the
+        // first cut went wrong and a test that only covered the test
+        // could not see it. `now` is replaced by the post-call
+        // reading, so every cadence below measures from a clock taken
+        // AFTER any stall rather than before it.
+        now = idle_pacer.drive_if_due(drained, now, now_ns, || {
+            eng.drive_dispatcher_idle();
+        });
         if now >= next_state {
             // T1(c): per-venue last-tick stamps, refreshed on the 1 s
             // cadence (the 5 s block below reads them for the age

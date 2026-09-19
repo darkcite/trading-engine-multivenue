@@ -274,6 +274,8 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative options records dispatched to `on_opt_summary`
     /// (VM2 V2, all opt lanes combined).
     pub opts_dispatched: u64,
+    /// Ruleset-table slots popped and handed to the member (8g §6).
+    pub tables_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
     //
@@ -358,6 +360,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             events_dispatched: 0,
             depths_dispatched: 0,
             opts_dispatched: 0,
+            tables_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
             decide_lat: LatencyTracker::new(),
             ack_lat: LatencyTracker::new(),
@@ -399,8 +402,25 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// `decide_lat` tracker via [`EngineCtx::submit`]. Both record
     /// paths are zero-alloc.
     #[inline]
-    pub fn tick(&mut self, max_per_ring: usize) {
+    pub fn tick(&mut self, max_per_ring: usize) -> usize {
         self.iterations = self.iterations.wrapping_add(1);
+        // **CONSUMED, not dispatched.** The cli's loop reads this as
+        // "did this iteration do work" and gates the live arm's
+        // blocking venue work on the answer, so it has to count every
+        // item taken off a ring — not only the ones that reached a
+        // member. An AI command that expired or failed its shape
+        // check, a fill the dispatcher pump produced, a ruleset table
+        // slot: all of them are work, and a producer flooding
+        // malformed commands would otherwise read as a silent engine
+        // and drive an HTTPS round trip every time round the loop.
+        //
+        // Counted locally rather than differenced from the
+        // `*_dispatched` counters, which was the first cut: those
+        // count what reached a MEMBER, three of the eight lanes had
+        // no counter at all, and two AI outcomes have none by
+        // construction. One `usize` on the stack answers the question
+        // that is actually being asked.
+        let mut consumed = 0usize;
 
         // --- tick lanes, fixed VenueId order ---
         // E-2: per-item clock sample. Capturing `now` once per batch
@@ -412,6 +432,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             while i < max_per_ring {
                 match self.tick_lanes[lane].try_pop() {
                     Some(t) => {
+                        consumed += 1;
                         let now = now_ns();
                         self.ingest_lat.record(now.saturating_sub(t.ts_ns));
                         self.touch_sym_bucket(t.sym, now);
@@ -454,6 +475,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while i < max_per_ring {
             match self.sig_cons.try_pop() {
                 Some(s) => {
+                    consumed += 1;
                     let now = now_ns();
                     self.ingest_lat.record(now.saturating_sub(s.ts_ns));
                     let mut ctx = EngineCtx {
@@ -479,6 +501,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             while i < max_per_ring {
                 match self.fill_lanes[lane].try_pop() {
                     Some(f) => {
+                        consumed += 1;
                         let now = now_ns();
                         self.ack_lat.record(now.saturating_sub(f.ts_ns));
                         // Phase 8f: stage the fill to
@@ -529,6 +552,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while i < max_per_ring {
             match self.disp.try_next_fill() {
                 Some(f) => {
+                    consumed += 1;
                     let now = now_ns();
                     self.ack_lat.record(now.saturating_sub(f.ts_ns));
                     // Phase 8f: paper/queued fills are captured on
@@ -573,6 +597,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             while i < max_per_ring {
                 match self.event_lanes[lane].try_pop() {
                     Some(e) => {
+                        consumed += 1;
                         let now = now_ns();
                         // THE DISPATCHER FIRST, and the order is
                         // load-bearing. A roll tells the live arm how
@@ -613,6 +638,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             while i < max_per_ring {
                 match self.depth_lanes[lane].try_pop() {
                     Some(d) => {
+                        consumed += 1;
                         let now = now_ns();
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
@@ -643,6 +669,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             while i < max_per_ring {
                 match self.opt_lanes[lane].try_pop() {
                     Some(o) => {
+                        consumed += 1;
                         let now = now_ns();
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
@@ -677,7 +704,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         // that is documented copy #2 (§6), operator cadence, bytes
         // not heap.
         while let Some(t) = self.table_cons.try_pop() {
+            consumed += 1;
             self.strat.on_ruleset_table(&t);
+            // E6 commit 3a: the one drained lane that had no counter
+            // of its own. The loop's "did we do work" answer is
+            // `consumed` above; this is the operator-facing number,
+            // beside every other lane's.
+            self.tables_dispatched = self.tables_dispatched.wrapping_add(1);
         }
 
         // --- AI command lane (Phase 8f §4.3) ---
@@ -689,6 +722,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while i < AI_DRAIN_BUDGET {
             match self.ai_cons.try_pop() {
                 Some(cmd) => {
+                    consumed += 1;
                     // Per-item clock sample (E-2 pattern): TTL
                     // arithmetic needs the pop-time clock, and a
                     // batch-captured `now` would misclassify
@@ -746,6 +780,36 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 self.strat.on_timer(now, &mut ctx);
             }
         }
+
+        consumed
+    }
+
+    /// **E6 — give the dispatcher the idle moment it owns sockets for.**
+    ///
+    /// A LIVE dispatcher owns the venue relationship — the user-event
+    /// socket, the reconciliation timer, the budget's state file — and
+    /// none of it has a thread of its own on the `--exec` path.
+    /// `DispatcherWorker::run` calls `OrderDispatch::on_idle` for the
+    /// legacy Polymarket `--live` path; the `--exec` path hands its
+    /// `RoutedDispatcher` straight to this loop, so until this commit
+    /// **nothing called the hook on the one path that can arm
+    /// Hyperliquid**. The WS never pumped, the reconciler never ran,
+    /// the budget never persisted, and E6's halt triggers had no
+    /// source of truth to read.
+    ///
+    /// **It BLOCKS, and that is the accepted cost.** The socket work
+    /// is non-blocking (mio, edge-triggered, drained to `WouldBlock`),
+    /// but the reconciler is one HTTPS round trip a minute and a
+    /// pending LAW E-8 sweep is another, on this thread, stalling
+    /// every slot including the paper ones. The alternative was moving
+    /// the live arm behind a queue, which takes the HTTP response off
+    /// the calling thread — and the HTTP response being the ACK is
+    /// LAW E-5.
+    ///
+    /// Returns whether the dispatcher reported doing any work.
+    #[inline]
+    pub fn drive_dispatcher_idle(&mut self) -> bool {
+        self.disp.on_idle()
     }
 
     /// p50 ingest→strategy latency (ns). 0 if no samples.
@@ -1467,6 +1531,252 @@ mod tests {
         assert_eq!(eng.ticks_dispatched, 6);
         eng.tick(16);
         assert_eq!(eng.ticks_dispatched, 20);
+    }
+
+    /// A dispatcher that counts its idle moments and reports work
+    /// the way a live arm does.
+    #[derive(Debug, Default)]
+    struct IdleCounter {
+        idles: usize,
+        busy: bool,
+    }
+    impl OrderDispatch for IdleCounter {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+        fn on_idle(&mut self) -> bool {
+            self.idles += 1;
+            self.busy
+        }
+    }
+
+    fn engine_with<D: OrderDispatch>(
+        disp: D,
+    ) -> (
+        Engine<Counter, D>,
+        [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
+        [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
+    ) {
+        let (tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let eng = Engine::new(
+            Counter::default(),
+            disp,
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        (eng, tp, fp)
+    }
+
+    /// **E6 commit 3a — the number the `--exec` loop gates its idle
+    /// driver on.**
+    ///
+    /// `tick` returned `()` and the loop had no way to tell a quiet
+    /// iteration from a busy one, so the live arm's socket work had
+    /// nothing to hang off.
+    #[test]
+    fn tick_reports_how_much_it_dispatched() {
+        let (mut eng, mut tp, mut fp) = engine_with(IdleCounter::default());
+        eng.start().unwrap();
+        assert_eq!(eng.tick(16), 0, "an empty engine dispatched nothing");
+
+        tp[VenueId::Polymarket as usize]
+            .try_push(Tick::new(
+                1,
+                VenueId::Polymarket,
+                7,
+                0,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+            ))
+            .unwrap();
+        let f = Fill::new(10, 7, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
+        fp[0].try_push(f).unwrap();
+        fp[3].try_push(f).unwrap();
+        assert_eq!(eng.tick(16), 3, "one tick and two fills");
+        assert_eq!(eng.tick(16), 0, "and the rings are empty again");
+    }
+
+    /// **Every lane the loop drains must count as work.**
+    ///
+    /// The first cut differenced the `*_dispatched` counters, which
+    /// count what reached a MEMBER: it summed five of the eight
+    /// lanes, three had no counter at all, and two AI outcomes
+    /// (expired, malformed) have none by construction. The cli gates
+    /// its blocking venue work on this reading zero, so a market busy
+    /// on a missed lane — or a producer flooding malformed commands —
+    /// would have read as idle and driven an HTTPS round trip every
+    /// time round the loop.
+    ///
+    /// It counts CONSUMPTION now. This pushes one item into every
+    /// lane `tick` drains and asserts the count matches what was
+    /// pushed, so a new lane that forgets to count fails here.
+    #[test]
+    fn tick_reports_every_lane_it_drains() {
+        let (tp, tc) = split_tick_lanes();
+        let (mut ep, ec) = split_event_lanes();
+        let (mut dp, dc) = split_depth_lanes();
+        let (mut op, oc) = split_opt_lanes();
+        let (sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (mut fp, fc) = split_fill_lanes();
+        let (ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (mut tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            Counter::default(),
+            IdleCounter::default(),
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let mut tp = tp;
+        let mut sp = sp;
+        let mut ap = ap;
+
+        // One item into every lane `tick` drains, counted as we go so
+        // the expectation cannot silently drift from what was pushed.
+        let mut pushed = 0usize;
+
+        tp[VenueId::Polymarket as usize]
+            .try_push(Tick::new(
+                1,
+                VenueId::Polymarket,
+                7,
+                0,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+            ))
+            .unwrap();
+        pushed += 1;
+
+        sp.try_push(Signal::new(2, 7, core_types::LatencyClass::Hot, 0, [0u8; 40]))
+            .unwrap();
+        pushed += 1;
+
+        fp[0]
+            .try_push(Fill::new(
+                10,
+                7,
+                Side::Bid,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                99,
+            ))
+            .unwrap();
+        pushed += 1;
+
+        ep[tick_lane_of(VenueId::Hyperliquid).unwrap()]
+            .try_push(mk_funding_event(VenueId::Hyperliquid, 9, 10))
+            .unwrap();
+        pushed += 1;
+
+        dp[depth_lane_of(VenueId::Okx).unwrap()]
+            .try_push(DepthTopK::EMPTY)
+            .unwrap();
+        pushed += 1;
+
+        op[opt_lane_of(VenueId::Okx).unwrap()]
+            .try_push(OptSummary::new(
+                3,
+                VenueId::Okx,
+                7,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        pushed += 1;
+
+        assert!(tblp.try_push(mk_table(1)).is_ok());
+        pushed += 1;
+
+        ap.try_push(AiCmd::new(
+            4,
+            1,
+            7,
+            1,
+            1,
+            0,
+            core_types::AiCmdKind::Heartbeat,
+            VenueId::Polymarket,
+            0,
+            0,
+            0,
+            0,
+        ))
+        .unwrap();
+        pushed += 1;
+
+        assert_eq!(
+            eng.tick(16),
+            pushed,
+            "a lane the loop drains is not counted as work"
+        );
+        assert_eq!(eng.tick(16), 0, "and everything is drained");
+    }
+
+    /// **The live arm's only thread, on the `--exec` path.**
+    ///
+    /// `DispatcherWorker::run` drives `on_idle` for the legacy
+    /// Polymarket `--live` path. The `--exec` path has no worker, so
+    /// without this forward the venue's user-event socket never
+    /// pumps, the reconciler never runs and the budget never
+    /// persists — on the one path that can arm Hyperliquid.
+    #[test]
+    fn the_engine_can_drive_the_dispatchers_idle_moment() {
+        let (mut eng, _tp, _fp) = engine_with(IdleCounter::default());
+        eng.start().unwrap();
+        assert!(!eng.drive_dispatcher_idle(), "it reported no work");
+        assert!(!eng.drive_dispatcher_idle());
+        assert_eq!(eng.dispatcher().idles, 2);
+    }
+
+    #[test]
+    fn the_dispatchers_own_answer_about_having_worked_is_forwarded() {
+        // The loop uses it to decide whether to sleep in the legacy
+        // path; a forward that swallowed it would throttle a busy
+        // user-event stream to one message per backoff.
+        let (mut eng, _tp, _fp) = engine_with(IdleCounter {
+            idles: 0,
+            busy: true,
+        });
+        eng.start().unwrap();
+        assert!(eng.drive_dispatcher_idle());
     }
 
     #[test]

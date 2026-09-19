@@ -181,14 +181,56 @@ fn scrape_hammer_all_succeed_without_conn_errors() {
             errs_clone.fetch_add(1, Ordering::Relaxed);
         });
     });
+    // **THE READINESS PROBE MUST NOT ABORT ITS CONNECTION.**
+    //
+    // A bare `connect` that is then dropped without sending anything
+    // is accepted by the server, read to EOF, and reported to the
+    // sink as a connection event — which this test asserts is zero.
+    // Whether that event lands before or after the final assertion is
+    // a pure race, which is why this passed alone and failed under a
+    // full-workspace run.
+    //
+    // Compensating for it (zero the counter after the probe) trades
+    // one race for another: the event is not guaranteed to arrive at
+    // all, so waiting for it hangs and zeroing without waiting can
+    // still be overtaken. The cause is removed instead — the probe
+    // sends a COMPLETE request and reads the reply, so it is an
+    // ordinary served scrape and produces no event to race with.
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_ok() {
-            break;
+        if let Ok(mut probe) = TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            let _ = probe.set_read_timeout(Some(Duration::from_secs(2)));
+            if probe
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .is_ok()
+            {
+                // **`read_to_end` must return Ok.** If the server ever
+                // stops honouring `Connection: close`, this hits the
+                // read timeout, returns `Err`, and dropping the socket
+                // with the server still holding the connection is the
+                // aborted connection all over again — the original
+                // race back, slower and rarer. Checked, so "the server
+                // closes first" is a fact rather than an assumption.
+                let mut sink = Vec::new();
+                if probe.read_to_end(&mut sink).is_ok() {
+                    break;
+                }
+            }
         }
         assert!(Instant::now() <= deadline, "metrics server did not come up");
         thread::sleep(Duration::from_millis(20));
     }
+
+    // The probe above is a SERVED SCRAPE, so nothing it did is in
+    // this count. Asserted rather than assumed: if the probe ever
+    // goes back to aborting its connection, this fires here instead
+    // of intermittently at the end.
+    assert_eq!(
+        errors.load(Ordering::Relaxed),
+        0,
+        "the readiness probe produced a connection event — it must send a \
+         complete request, not abort"
+    );
 
     for i in 0..50 {
         let (status, body) = http_get(addr.port(), "/metrics");

@@ -3090,3 +3090,316 @@ per-slot refusal with venue-wide cancel). Commit 4 — the `exec.HALT`
 file switch polled in `HlExchange::on_idle`, the
 `engine_exec_halted{slot}` gauge, the `/state` field and the loud boot
 tell.
+
+### E6 commit 3a — the live arm finally has a thread (2026-09-19)
+
+Commit 2 built a risk gate fed by venue fills. Commit 3 is meant to
+build a halt machine fed by the venue relationship. Both assume
+something is driving the live arm. **Nothing was.**
+
+`OrderDispatch::on_idle` is what a live dispatcher uses to pump the
+venue's user-event socket, run the reconciliation timer and persist
+the budget's state file. `DispatcherWorker::run` calls it — and
+`DispatcherWorker` is constructed in exactly one production place, the
+legacy Polymarket `--live` path. The `--exec` path hands its
+`RoutedDispatcher` straight to the engine loop with no worker behind
+it, so on **the one path that can arm Hyperliquid** the hook was never
+called. `exec-hyperliquid`'s own module docs say so in as many words,
+and the trait's do too; the plan filed the wiring under E7 as "an
+arming-path change".
+
+Three consequences, all of which commit 3 would have inherited:
+
+* the user-event socket never pumps, so **no venue fill ever reaches
+  fill lane 3** — and the exposure ledger commit 2 built is fed by
+  exactly that;
+* the reconciler never runs, so nothing can call `mark_ledger_seeded`
+  and a live slot refuses every order for ever;
+* three of E6's six halt triggers — budget floor, reconciliation
+  drift, WS user-stream gap — have no source of truth at all.
+
+A halt machine wired to sensors nothing reads is the
+declared-not-enforced shape this phase exists to remove, so the
+wiring comes first, as its own commit, reviewable on its own.
+
+#### Which loop, and how many drivers
+
+`run_engine_loop` is the one loop every `engine_loop_*` entry point
+shares, so the driver lands there and reaches the `--exec` path
+(`engine_loop_set_full` → `run_engine_loop`). `RoutedDispatcher`
+already forwards `on_idle` to BOTH arms, so the live arm is reached.
+
+The legacy Polymarket `--live` path goes through the same loop, and it
+is worth being explicit that this does not double-drive anything: it
+holds a `QueuedDispatcher`, which does **not** override `on_idle` — it
+takes the trait's no-op default. The real `LiveDispatcher` sits behind
+`DispatcherWorker` on its own thread, and that worker is still its
+only driver. One driver per boot mode, verified rather than assumed.
+
+#### It runs on the engine thread, and that is a real cost
+
+`Engine::drive_dispatcher_idle` forwards to the dispatcher; the cli
+loop calls it. **It blocks.** The socket work does not — mio,
+edge-triggered, drained to `WouldBlock` — but the reconciler is one
+HTTPS round trip a minute and a pending LAW E-8 sweep is another, on
+the thread that also runs every member's callbacks, stalling the
+paper slots along with the live one.
+
+The alternative was moving the live arm behind `QueuedDispatcher` and
+a worker thread, which is the design the codebase already has for
+this. It was rejected because it takes the HTTP response off the
+calling thread, and **the HTTP response being the ACK is LAW E-5** —
+along with E5's whole synchronous cancel/modify contract.
+
+**"A bounded stall" needs a number, and the first draft of this
+section did not have one.** The bounds, measured from the code rather
+than asserted:
+
+| step | bound | why |
+|---|---|---|
+| `pump_user_events` | none needed | mio, edge-triggered, drained to `WouldBlock`; `PUMP_BUDGET` 20 ms |
+| a WS reconnect | **blocking DNS — `std::net::ToSocketAddrs`, no timeout parameter; ~40 s on glibc defaults (5 s × 2 attempts × 3 nameservers) and potentially worse on macOS** — then a non-blocking connect | `WS_BACKOFF` bounds the FREQUENCY, not the duration |
+| `persist_budget` | a file write + rename | guarded by `PERSIST_EVERY` (5 s) |
+| one HTTPS request | **5 s** — `http::REQ_DEADLINE`, enforced by a mio poll loop with a 50 ms poll timeout over a NON-BLOCKING `mio::net::TcpStream::connect` | a blackholed host cannot cost the ~75 s a blocking connect would |
+| `reconcile` | 1–2 requests, guarded by `RECON_EVERY` (60 s) | ≤ 10 s an hour |
+| `sweep_one_pending` | **this was the unbounded one** | see below |
+
+`ours_on_leg` can select up to `MAX_OPEN_ORDERS` (256) oids and the
+sweep cancelled every one of them in a single call — up to ~21
+minutes of deadline in the pathological case and ~13 s at a realistic
+50 ms a round trip. On the engine thread that means no ring drains,
+`shutdown_requested()` is never reached, and **E6's halt machine
+cannot run on the very thread a dead venue is blocking** — a dead
+venue disabling the machine built for a dead venue.
+
+`SWEEP_CANCELS_PER_IDLE` caps it at 8 a call: ~40 s of deadline and
+~0.4 s in practice. The remainder is not dropped — the entry stays
+pending and the next idle moment continues it, and idle moments come
+round every 2 ms, so a 256-order sweep finishes in 32 of them rather
+than one.
+
+**The rows bound each step; the engine thread pays whatever
+co-occurs in one call.** Worst case for a single `on_idle`: a DNS
+stall (~40 s) plus 8 sweep cancels at their deadline (40 s) plus a
+reconcile (10 s) ≈ **90 seconds**, and that is the number that
+belongs beside "`shutdown_requested()` is never reached". The DNS row
+is the one term still bounded by the platform rather than by this
+code; resolving at boot and caching would remove it, and is not in
+this commit.
+
+Budget exhaustion is counted as `sweep_deferred` and does **not**
+spend a retry. Folding it into the failure path would have burned one
+of `SWEEP_TRIES` (8) per idle moment, so a 256-order sweep at 8 a call
+would be abandoned after 64 with the rest reported as `sweep_left`:
+quotes left resting on a retired instance, which is the one thing LAW
+E-8 exists to prevent.
+
+**And `truncated` had to stop meaning failure for the same reason** —
+a regression the budget itself created, caught only in review.
+`truncated` is `k == MAX_OPEN_ORDERS`, the selection filling the
+buffer. Before the budget one call cancelled all 256, so a leg of N
+orders was truncated for about `N / 256` calls. After it, progress is
+8 a call, so the selection sits AT the ceiling for roughly
+`(N − 256) / 8` calls — and classing each as `Retry` spends one of
+eight tries every time. **Past N > 312 the entry is abandoned with the
+remainder reported as `sweep_left`**, and commit 2's boot rule allows
+64 open orders on each of 8 slots, so a 512-order leg is a valid
+configuration. Truncation now defers: still never `Done`, because we
+could not see the end of the selection, but continued rather than
+counted against.
+
+**The invariant deferral rests on, named because nothing here
+enforces it.** `sweep_one_pending` re-asks the VENUE every call — it
+POSTs `frontendOpenOrders` and re-runs `ours_on_leg` over the fresh
+answer — so an order cancelled last call is no longer listed and the
+selection shrinks. That is a property of re-fetching, not of this
+file. If it ever failed (a venue that keeps listing a cancelled order
+AND accepts the re-cancel, so nothing fails and nothing completes),
+deferral would never spend a retry and the entry would issue 8 HTTPS
+round trips every 2 ms for the life of the boot. `SWEEP_MAX_DEFERS`
+is the guard, and its SIZE is the argument: counting only consecutive
+non-shrinking calls does not work, because the selection cannot
+reveal progress while the leg exceeds the buffer — a 312-order leg
+reports 256 selected on each of its first seven calls while eight
+orders really are being cancelled each time. So it is a total count,
+sized at 256: four times the 64 deferrals the largest valid
+configuration can need, and still terminating a genuinely stuck entry
+inside about half a second of idle moments. `sweep_stalled` counts it.
+
+A PAPER boot reaches the same call and gets the trait's default: a
+`false` return and nothing else. No syscall, nothing measurable.
+
+**What it does to the paper slots is more than a delay.** VT3/VT4's
+stale law judges a tick against `core_time::FeedClock` per connection;
+a multi-second engine-thread stall makes every tick drained afterwards
+stale by venue time, so paper members stop marking and quoting across
+the backlog, `engine_ingress_<venue>_stale_ticks_total` spikes, and
+the effect outlasts the stall. That is a live/backtest divergence the
+harness cannot reproduce — which is the strongest reason the sweep
+budget above is not optional.
+
+#### "When the rings are empty" would have starved it
+
+The natural gate is a tick that drained nothing, and that is the
+right default — the venue work blocks and market data must not queue
+behind it. But `tick` drains up to `DRAIN_BATCH` (256) per ring per
+lane, and a busy market across six venues can keep every tick
+non-empty indefinitely. Gated on emptiness ALONE, the only path that
+pumps the socket, reconciles and persists the budget would stop
+running **exactly when there is most trading to reconcile**.
+
+So the condition is "drained nothing, OR the gap has reached 2 ms".
+
+**And the gap must be stamped from a clock read taken AFTER the
+call.** The first cut stamped the pre-call reading, which collapses
+the ceiling in exactly the case it exists for: one HTTPS round trip
+always exceeds 2 ms, so the next iteration's clock is already past the
+gap, the gate fires again immediately, and the engine thread sits
+inside `on_idle` continuously. That is not a 2 ms cadence; it is a
+synchronous HTTP loop with the engine attached.
+`a_blocking_call_does_not_turn_the_ceiling_into_every_iteration`
+simulates a second of 50 ms calls and asserts about twenty of them,
+not thousands.
+
+`now` is re-read at the same point, because everything downstream —
+the 1 s `/state` publish, the 5 s report, the per-venue tick ages —
+would otherwise compute staleness against a clock read before the
+stall and **under-report it by exactly the stall's duration**, hiding
+the pause that caused it.
+
+The decision, the call and the stamping all live in `IdlePacer`,
+because the loop is a two-thousand-line function no test constructs
+and the stamping is where the first cut went wrong. Extracting only
+the predicate was not enough: the test then re-implemented the
+stamping itself, so it asserted its own simulation, and a
+break-and-watch run that reinstated the pre-call stamp **passed**.
+
+Measuring it took a third attempt too. Counting DRIVES PER SECOND
+cannot see the defect — when a 50 ms call dominates the clock,
+"fires every iteration" and "fires every 2 ms" both give about twenty
+a second. What differs is how much TICK WORK the engine gets between
+venue calls: ~2000 loop iterations when the ceiling holds, one when
+it does not. `a_blocking_call_leaves_the_engine_time_to_work_between_calls`
+asserts that ratio, and it is the only assertion in the set that
+fails when the stamp goes back.
+
+`Engine::tick` now returns how many items it CONSUMED. It returned
+`()`, so the loop had no way to tell a quiet iteration from a busy
+one. Every existing call site ignores the value and is unaffected.
+
+Consumed, not dispatched, and the difference is the whole point. The
+first cut differenced the `*_dispatched` counters — what reached a
+MEMBER. That summed five of the eight lanes, missed depth, opt and
+the ruleset table entirely, and could not see the two AI outcomes
+(expired, malformed) that have no counter by construction. Any of
+those reading zero on a busy iteration drives the blocking venue work
+every time round the loop, which is the same degeneration the 2 ms
+ceiling exists to prevent, reached from the other side. One `usize`
+on the stack, incremented at each ring pop, answers the question that
+is actually being asked; `tick_reports_every_lane_it_drains` pushes
+one item into every lane and holds it complete.
+
+#### What this commit newly puts on the wire
+
+It cannot cause a live submit or modify that would not have been
+sent: `risk_check` is untouched and the seeding interlock still
+refuses everything, because nothing calls `mark_ledger_seeded` yet.
+But it is not read-only. An `--exec` boot now emits **LAW E-8 cancel
+traffic** from `sweep_one_pending` and the reconciler's `info`
+requests, neither of which it has ever sent before. The direction is
+safe — cancels reduce risk and are not risk-checked — but "what this
+commit changes about arming" is the question the E6-versus-E7
+decision turned on, and the answer is not "nothing".
+
+#### A third flaky gate, and this one was a real test defect
+
+`core_metrics`'s `scrape_hammer_all_succeed_without_conn_errors`
+asserts the metrics server's error sink stays silent under 50 rapid
+scrapes. It failed once in a full-workspace run and passed four times
+alone — the signature of load sensitivity, which is what I first took
+it for.
+
+It is not. The test's own **readiness probe** connected and dropped
+the socket without sending a request:
+
+```rust
+if TcpStream::connect_timeout(&addr, …).is_ok() { break; }
+```
+
+The server accepts that connection, reads EOF, and reports a
+connection event — which the sink counts. Whether it lands before or
+after the final assertion is a pure race, and under load it lands.
+The probe poisons the counter it is about to assert is zero.
+
+**The first fix was wrong and the break-and-watch run said so.**
+Zeroing the counter after the probe compensates for the effect rather
+than removing the cause, and removing it only brings a *race* back —
+so nothing failed when it was deliberately broken. Synchronising
+instead (wait for the probe's event, then zero) was worse: the event
+is not guaranteed to arrive at all, and two of three runs then hung
+to the timeout.
+
+The cause is removed instead. The probe now sends a complete request
+and reads the reply, so it is an ordinary served scrape that produces
+no event to race with, and the test asserts the count is zero
+**immediately after the probe** rather than only at the end — if the
+probe ever goes back to aborting, that fires where the defect is
+rather than intermittently three seconds later. 5/5 clean since.
+
+#### Gates (3a), and what the `cli` number is worth
+
+`cargo test --workspace --exclude bench --no-fail-fast`: 2452 passed,
+0 failed. 61/61 alloc assertions. Clippy clean under `-D warnings`.
+Licence OK (391 files).
+
+**That number is not evidence for the `cli` crate.** See below: its
+test binary aborts about one run in three without naming a test, so a
+green run cannot be distinguished from a run that died before
+reaching what would have failed. Every assertion this commit adds to
+`cli` — `should_drive_idle`, `IdlePacer`, the whole
+`dispatcher_idle_tests` module — sits in that crate, and those were
+also exercised individually and through break-and-watch, which is the
+evidence that does hold.
+
+#### And a FOURTH, which is a crash and is NOT fixed here
+
+`cargo test -p cli --lib` aborts mid-run with **exit status 75** and
+no failing test named, roughly one run in three. All 268 tests report
+`ok` and the process then dies partway through the listing.
+
+Measured, not guessed:
+
+* **It predates this lane.** With every one of this commit's files
+  stashed, HEAD fails **2 runs out of 6**.
+* **It does not reproduce running the test binary directly** — 8
+  consecutive clean runs of `target/debug/deps/cli-*`. It happens only
+  under `cargo test`.
+
+So it is not an assertion that races; it is the harness process
+terminating abnormally, which makes the whole `cli` suite an
+unreliable gate. Every full-workspace run reported in this document
+is a run where it did not fire, and that is luck rather than
+evidence.
+
+**A concrete lead for whoever picks it up.** Exit 75 is
+`EX_TEMPFAIL` in `sysexits.h`. This host already has an fd-exhaustion
+incident on record — a launchd agent born with a 256-descriptor soft
+limit, fixed by adding `ulimit -S -n 8192` to `engine-wrapper.sh`.
+`cargo test` holds extra pipes per test binary that a direct run does
+not, and `cli` is the largest suite, which fits both "only under
+`cargo test`" and "only sometimes". Comparing `ulimit -n` between the
+two environments is a cheap next step and turns this from "flaky"
+into something falsifiable.
+
+**Left open deliberately.** Diagnosing a mid-run abort in a 268-test
+binary is its own investigation, and three flaky gates have already
+been absorbed into this lane. Recorded here so the next person does
+not spend an hour discovering it from scratch, and so that a green
+`cli` run is not read as stronger evidence than it is.
+
+**Three flaky gates in two commits**, none of them this lane's doing,
+all surfaced because a growing suite keeps changing the schedule.
+That is worth naming as a pattern rather than fixing three times in
+silence: this repository has tests that assert properties which only
+hold on a quiet machine, and each one that survives teaches an
+operator to re-run until green.
