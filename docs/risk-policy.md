@@ -4382,6 +4382,23 @@ The first hour, as it happened:
 * 13:17:19Z — the next entry, BUY 2 @ 0.75 `#42700` (Yes, 13:15
   instance), $1.50. USDC 8.517312 = 9.8 − 1.78 + 2.00 − 0.002688 − 1.50
   to the cent.
+* **15:32:22Z — sticky halt `recon-drift` in the SAME SECOND as an
+  entry fill** (BUY 2 @ 0.70 `#42810`, venue time 15:32:22.543Z,
+  booked from `userFills` and later settled at 1.0 — the position was
+  never wrong). The reconciler's 60 s cycle came due during the
+  submit's round trip; the venue's `spotClearinghouseState` already
+  carried the leg, the `userFills` push had not reached the arm, and
+  2 contracts against 0 booked is $2 at the outcome ceiling — exactly
+  `halt_on_recon_drift_usd_1e6` — so `recon_drift_max_qty_1e6`, a
+  high-water mark, latched it for good. The 16:05Z daily restart then
+  came up STARTED HALTED from `exec.HALT`; nothing traded from 15:32Z
+  until the operator's next restart. **E7-F3**: a disagreement reaches
+  the high-water mark only when the NEXT reconciliation sees one too
+  (`HlExchange::note_drift`, the minimum of two consecutive worsts);
+  `recon_drift_legs` stays the instantaneous level, so the race is
+  still visible. A lost fill survives 60 s; a race does not. The halt's
+  sensitivity to a genuine drift is delayed by one cycle, which the
+  per-order cap bounds.
 
 The interlock, the caps, the seeding, the sweep on a real roll, the fill
 on the stream, the reconciliation and the settlement booking all did
@@ -4389,6 +4406,52 @@ what E1–E7 said they would; the two findings are both in the arm's
 bookkeeping, and both are fixed above. R0's bar (≥ 96 entries, ≥ 1
 fill, recon agreeing, `unknown_fills = 0`) is being measured on
 mainnet; R1/R2 remain operator rulings.
+
+### E7 — the SESSION BOUND (operator ruling 2026-09-19: "run until it either earns +15 USDC or loses 5 USDC")
+
+The operator's stopping rule for the mainnet ramp, as a control the
+engine enforces rather than a number a human watches: two OPTIONAL
+`exec.toml` keys on the live slot, `halt_on_gain_usd_1e6` and
+`halt_on_loss_usd_1e6` (USD ×1e6; `0` or absent = no bound on that
+side; the five fault halts stay REQUIRED whatever these say), judged by
+the same sticky halt machine as every kill switch — reasons
+`pnl-gain` (8) and `pnl-loss` (9), cancel-all on the edge, `exec.HALT`
+written, refused submits until an operator restart. A gain halt is a
+halt: "run until" means until.
+
+**What is measured, and from where.** The account's SPOT USDC as the
+reconciler already reads it (`spotClearinghouseState`, every 60 s on the
+idle path), against an ANCHOR: the balance at the first reconciliation
+of the session that found the account FLAT — no outcome leg with a
+non-zero holding (`recon::account_view`). The anchor is written once to
+`exec-pnl-anchor.state` beside the budget file (`<master>\t<usdc ×1e6>\t<unix s>`,
+another address's line is not an anchor) and restored on every boot, so
+the SESSION outlives the process: the launchd `KeepAlive` relaunches the
+engine within a minute of any exit, and a bound that re-anchored per
+boot would be a bound on nothing. An operator starts a new session by
+deleting the file before a restart — the manual step every sticky halt
+already requires, not an auto-resume.
+
+**Judged only while flat.** An outcome leg is worth anything from 0 to
+1 USDC until the venue settles it, so an account holding one has no
+P&L to read: the premium it paid is not a loss, the payout it may get
+is not a gain. `HaltSignal::pnl_flat` (anchored AND no leg held AND a
+balance read this process) gates the comparison; `pnl_delta_usd_1e6`
+is spot USDC minus the anchor. Fees are in the balance, so the bound is
+on the venue's own net figure — nothing the ledger believes enters it.
+The bound is checked LAST in `trigger_for`: when a fault and the bound
+coincide, the fault is the reason recorded.
+
+**Tells.** ARMED: `pnl_anchor_usd_1e6=<n>` (0 = not anchored yet) and
+`pnl_anchor_state=<path>`; HALTS: `session_bound=+$15/-$5`; `/state`
+`exec.arm_pnl_anchor_usd_1e6` / `exec.arm_session_pnl_usd_1e6`;
+`/metrics` `engine_exec_hl_pnl_anchor_usd_1e6` /
+`engine_exec_hl_session_pnl_usd_1e6` (gauges); a failed anchor write
+counts `HlExecCounters::anchor_persist_failed` (in-memory anchor stands
+for the process, the next boot re-anchors). Cadence: the halt can lag
+the crossing by up to one reconciliation (60 s) plus one halt poll;
+that lag is bounded by the per-order cap, which is exactly the point of
+having both.
 
 ### Gates run at the close of the pass (2026-09-19, Mac)
 

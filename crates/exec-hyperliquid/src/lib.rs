@@ -95,6 +95,7 @@
 #![deny(clippy::missing_safety_doc, clippy::undocumented_unsafe_blocks)]
 
 pub mod action;
+pub mod anchor;
 pub mod asset;
 pub mod budget;
 pub mod cloid;

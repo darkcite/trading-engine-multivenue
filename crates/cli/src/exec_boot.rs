@@ -350,7 +350,10 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     s.halt_on_ws_gap_ms,
                     u32::try_from(s.halt_on_asset_refusal_streak).unwrap_or(u32::MAX),
                     s.halt_on_recon_stale_ms,
-                ),
+                )
+                // E7: the operator's session bound ("run until it
+                // either earns +X or loses Y"); 0/0 = off.
+                .with_pnl_bound(s.halt_on_gain_usd_1e6, s.halt_on_loss_usd_1e6),
             )
             .map_err(|e| format!("exec: slot {slot}: {e}"))?;
         // Keep every parsed number, not just the EIGHT the hot table
@@ -445,9 +448,11 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
             boot.route.max_order_usd_1e6_at(slot).unwrap_or(0) / 1_000_000,
             boot.route.max_open_orders_at(slot).unwrap_or(0),
         ));
+        let gain = s.map_or(0, |s| s.halt_on_gain_usd_1e6) / 1_000_000;
+        let loss = s.map_or(0, |s| s.halt_on_loss_usd_1e6) / 1_000_000;
         lines.push(format!(
             "exec: slot {slot} HALTS reject_streak={} asset_refusals={} recon_drift=${drift} \
-             recon_stale_ms={} ws_gap_ms={} budget_floor={} halt_file={}",
+             recon_stale_ms={} ws_gap_ms={} budget_floor={} session_bound=+${gain}/-${loss} halt_file={}",
             s.map_or(0, |s| s.halt_on_reject_streak),
             s.map_or(0, |s| s.halt_on_asset_refusal_streak),
             s.map_or(0, |s| s.halt_on_recon_stale_ms),
@@ -506,6 +511,18 @@ mod tests {
         ] {
             assert!(v > 0, "template leaves `{key}` unset — the boot refuses");
         }
+        // E7: the session bound ships COMMENTED OUT — it is a ruling
+        // the operator makes per session, not a default — and the
+        // template's own text is the recipe for turning it on.
+        assert_eq!((s3.halt_on_gain_usd_1e6, s3.halt_on_loss_usd_1e6), (0, 0));
+        let bounded = live
+            .replacen("# halt_on_gain_usd_1e6 = 15000000", "halt_on_gain_usd_1e6 = 15000000", 1)
+            .replacen("# halt_on_loss_usd_1e6 = 5000000", "halt_on_loss_usd_1e6 = 5000000", 1);
+        let b = core_config::exec::parse(&bounded).expect("the template's recipe parses");
+        assert_eq!(
+            (b.slot(3).halt_on_gain_usd_1e6, b.slot(3).halt_on_loss_usd_1e6),
+            (15_000_000, 5_000_000)
+        );
     }
 
     #[test]
@@ -712,6 +729,8 @@ mod tests {
             R::AssetRefusals,
             R::Operator,
             R::ReconStale,
+            R::PnlGain,
+            R::PnlLoss,
         ];
         assert_eq!(
             all.len(),
@@ -798,7 +817,8 @@ mod tests {
         assert_eq!(
             lines[2],
             "exec: slot 3 HALTS reject_streak=5 asset_refusals=3 recon_drift=$5 \
-             recon_stale_ms=300000 ws_gap_ms=30000 budget_floor=2000 halt_file=/tmp/exec.HALT"
+             recon_stale_ms=300000 ws_gap_ms=30000 budget_floor=2000 session_bound=+$0/-$0 \
+             halt_file=/tmp/exec.HALT"
         );
         // The stale E1 wording must never come back: it described a
         // clamp that did not exist, and after E6 it described one

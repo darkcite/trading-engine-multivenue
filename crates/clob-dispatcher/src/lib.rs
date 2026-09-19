@@ -749,6 +749,16 @@ pub struct LiveArmCounters {
     /// The address request budget's remaining headroom, per the
     /// governor. Negative = past the venue's cliff.
     pub budget_remaining: i64,
+    /// **E7 session bound** — the spot USDC (USD ×1e6) the session's
+    /// P&L is measured from: the balance at the first FLAT
+    /// reconciliation, persisted across restarts. `0` = not anchored
+    /// yet.
+    pub pnl_anchor_usd_1e6: i64,
+    /// **E7 session bound** — spot USDC minus the anchor at the last
+    /// reconciliation, USD ×1e6, signed. A LEVEL; `0` while not
+    /// anchored. The number `halt_on_gain_usd_1e6` /
+    /// `halt_on_loss_usd_1e6` are judged against while flat.
+    pub session_pnl_usd_1e6: i64,
 }
 
 /// **What the venue has told us about a requested cancel-all.**
@@ -823,8 +833,14 @@ pub struct HaltSignal {
     /// and it rides here because it is the same question ("what does
     /// the arm know about the venue?") answered by the same poll.
     pub reconciled: u8,
+    /// `1` when the E7 session bound may be judged: the arm has an
+    /// anchor (the spot USDC at its first flat reconciliation) AND the
+    /// account holds no outcome leg right now. `0` otherwise — an open
+    /// position's premium is not a loss, an unsettled win is not a
+    /// gain.
+    pub pnl_flat: u8,
     /// Explicit padding.
-    _pad: [u8; 6],
+    _pad: [u8; 5],
     /// Nanoseconds since the last reconciliation that AGREED. `0` =
     /// never (the seeding interlock already refuses that case). Once
     /// an arm has agreed with the venue, a reconciler that stops
@@ -834,10 +850,15 @@ pub struct HaltSignal {
     /// silently disabled while the arm kept trading (E7 review,
     /// 2026-09-19). Compared against `halt_on_recon_stale_ms`.
     pub recon_age_ns: u64,
+    /// E7 session bound: the account's spot USDC minus the anchor,
+    /// USD ×1e6, as of the last reconciliation. Meaningful only while
+    /// [`Self::pnl_flat`] is set; `0` otherwise.
+    pub pnl_delta_usd_1e6: i64,
 }
 
 impl HaltSignal {
-    /// Build a signal. The arm is the only caller.
+    /// Build a signal with the session bound unobserved (`pnl_flat`
+    /// 0). The arm is the only caller; see [`Self::with_pnl`].
     #[inline]
     #[must_use]
     pub const fn new(
@@ -856,13 +877,25 @@ impl HaltSignal {
             asset_refusal_streak,
             budget_floor_breached: budget_floor_breached as u8,
             reconciled: reconciled as u8,
-            _pad: [0; 6],
+            pnl_flat: 0,
+            _pad: [0; 5],
             recon_age_ns,
+            pnl_delta_usd_1e6: 0,
         }
+    }
+
+    /// E7: attach the session-bound reading — `flat` says the bound
+    /// may be judged, `delta` is spot USDC minus the anchor.
+    #[inline]
+    #[must_use]
+    pub const fn with_pnl(mut self, flat: bool, delta_usd_1e6: i64) -> Self {
+        self.pnl_flat = flat as u8;
+        self.pnl_delta_usd_1e6 = delta_usd_1e6;
+        self
     }
 }
 
-const _: () = assert!(core::mem::size_of::<HaltSignal>() == 40);
+const _: () = assert!(core::mem::size_of::<HaltSignal>() == 48);
 
 /// Strategy slots [`ExecCounters`] reports on. Mirrors
 /// `exec_router::EXEC_SLOTS`; the two are asserted equal in

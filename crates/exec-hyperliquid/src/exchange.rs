@@ -311,6 +311,12 @@ pub struct HlExecCounters {
     /// means a halted arm still has orders the engine has not asked
     /// the venue to remove.
     pub cancel_all_unqueued: u64,
+    /// **E7 session bound** — the anchor was set in memory and the
+    /// durable write of `exec-pnl-anchor.state` FAILED. This process
+    /// still judges the bound; the next boot re-anchors from its own
+    /// first flat balance, which is the thing the file exists to
+    /// prevent. Appended, like `sweep_deferred`, for the same reason.
+    pub anchor_persist_failed: u64,
 }
 
 /// Which budget rule an action answers to.
@@ -542,6 +548,22 @@ pub struct HlExchange<const FILL_N: usize> {
     counters: HlExecCounters,
     budget_path: PathBuf,
     last_persist: Instant,
+    /// **E7 session bound** — the account's spot USDC (×1e6) at the
+    /// first FLAT reconciliation of the session, restored from
+    /// `pnl_path` at boot or set by [`Self::note_account`]. `0` =
+    /// not anchored yet. Never moved once set: a session's bound is
+    /// judged from where it started (see [`crate::anchor`]).
+    pnl_anchor_1e6: i64,
+    /// Spot USDC (×1e6) at the last reconciliation that parsed.
+    usdc_1e6: i64,
+    /// Outcome legs the venue held at that reconciliation. Non-zero
+    /// means the bound is not judged — an open position has no P&L.
+    legs_held: u32,
+    /// Explicit padding after the one `u32` in this run of fields.
+    _pad_legs: u32,
+    /// Where the anchor lives — beside the budget file
+    /// (`exec-pnl-anchor.state`).
+    pnl_path: PathBuf,
     /// Consecutive connect failures, indexing [`WS_BACKOFF`].
     ws_fail_streak: u32,
     /// **E6 commit 3** — when the user-event stream was last known
@@ -572,6 +594,17 @@ pub struct HlExchange<const FILL_N: usize> {
     ws_retry_at: Instant,
     /// When reconciliation last ran.
     last_recon: Instant,
+    /// **E7-F3** — the worst single-leg disagreement of the PREVIOUS
+    /// reconciliation, contracts ×1e6. A disagreement reaches the
+    /// high-water mark the halt reads only when the next cycle sees
+    /// one too: the venue's sheet is updated before its `userFills`
+    /// push reaches this arm, and a reconciliation that lands in that
+    /// gap sees a leg we have not booked yet. Mainnet 2026-09-19
+    /// 15:32:22Z: the reconcile ran in the same second as an entry
+    /// fill, read 2 contracts against 0 booked, and the $2 threshold
+    /// latched `recon-drift` for good over a fill that was booked
+    /// milliseconds later. A lost fill survives 60 s; a race does not.
+    recon_prev_worst: i64,
     /// The MASTER account reconciliation asks about — the agent signs
     /// on its behalf and the venue reports balances under it.
     master_addr: [u8; 20],
@@ -648,6 +681,15 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         } else {
             BudgetSource::File
         };
+        // E7 session bound: the anchor lives beside the budget file
+        // and, like it, is restored only for THIS master address.
+        let pnl_path = budget_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default()
+            .join(crate::anchor::DEFAULT_STATE_PATH);
+        let pnl_anchor_1e6 =
+            crate::anchor::load(&pnl_path, cfg.master_addr).map_or(0, |a| a.usdc_1e6);
         Ok(Self {
             http,
             ws,
@@ -662,6 +704,11 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             counters: HlExecCounters::default(),
             budget_path,
             last_persist: Instant::now(),
+            pnl_anchor_1e6,
+            usdc_1e6: 0,
+            legs_held: 0,
+            _pad_legs: 0,
+            pnl_path,
             ws_fail_streak: 0,
             last_ws_ok: None,
             reject_streak: 0,
@@ -670,6 +717,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             ws_retry_at: Instant::now(),
             scratch: vec![UserFill::default(); SNAPSHOT_RING].into_boxed_slice(),
             last_recon: Instant::now(),
+            recon_prev_worst: 0,
             master_addr: cfg.master_addr,
             sweeps: [PendingSweep::EMPTY; MAX_PENDING_SWEEPS],
             sweeps_n: 0,
@@ -714,6 +762,76 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     #[must_use]
     pub fn budget_remaining(&self) -> i64 {
         self.budget.remaining()
+    }
+
+    /// **E7 session bound** — the anchor the bound is judged from,
+    /// USD ×1e6; `0` until the first flat reconciliation sets it
+    /// (or the file restored it). For the boot tell and `/state`.
+    #[inline]
+    #[must_use]
+    pub const fn pnl_anchor_usd_1e6(&self) -> i64 {
+        self.pnl_anchor_1e6
+    }
+
+    /// **E7 session bound** — spot USDC minus the anchor as of the
+    /// last reconciliation, USD ×1e6; `0` while not anchored or
+    /// while nothing has been reconciled since boot. A LEVEL, signed:
+    /// what `/state` shows and what the router halts on when flat.
+    #[inline]
+    #[must_use]
+    pub const fn session_pnl_usd_1e6(&self) -> i64 {
+        if self.pnl_anchor_1e6 == 0 || self.usdc_1e6 == 0 {
+            0
+        } else {
+            self.usdc_1e6 - self.pnl_anchor_1e6
+        }
+    }
+
+    /// Where the session anchor is persisted — for the boot tell.
+    #[inline]
+    #[must_use]
+    pub fn pnl_state_path(&self) -> &std::path::Path {
+        &self.pnl_path
+    }
+
+    /// **E7 session bound** — record one reconciliation's account
+    /// reading and, on the FIRST flat one, set the session anchor.
+    /// Split from [`Self::reconcile`] so it can be tested without a
+    /// venue.
+    ///
+    /// Returns `true` when this call SET the anchor — the caller
+    /// persists it. The anchor is never moved afterwards, and never
+    /// set while a leg is held (the balance then is not the account's
+    /// worth) or at zero USDC (nothing to bound).
+    fn note_account(&mut self, usdc_1e6: i64, legs_held: u32) -> bool {
+        self.usdc_1e6 = usdc_1e6;
+        self.legs_held = legs_held;
+        if self.pnl_anchor_1e6 != 0 || legs_held != 0 || usdc_1e6 <= 0 {
+            return false;
+        }
+        self.pnl_anchor_1e6 = usdc_1e6;
+        true
+    }
+
+    /// **E7-F3** — admit one reconciliation's worst disagreement to
+    /// the high-water mark the halt reads, but only the part of it
+    /// the PREVIOUS cycle also saw. A disagreement that survives a
+    /// reconciliation interval is drift (a lost or double-counted
+    /// fill stays wrong); one that the next cycle no longer sees was
+    /// the venue's sheet running ahead of its `userFills` push — see
+    /// [`Self::recon_prev_worst`]. `recon_drift_legs` stays the
+    /// instantaneous level, so an operator still sees the race.
+    ///
+    /// The minimum of two consecutive worsts, not a per-leg memory:
+    /// two different legs racing 60 s apart would confirm as the
+    /// smaller of the two, which errs toward halting, and is two
+    /// races in a row against a window of milliseconds.
+    fn note_drift(&mut self, worst: i64) {
+        let confirmed = worst.min(self.recon_prev_worst);
+        self.recon_prev_worst = worst;
+        if confirmed > self.counters.recon_drift_max_qty_1e6 {
+            self.counters.recon_drift_max_qty_1e6 = confirmed;
+        }
     }
 
     /// Where the boot budget came from (E7-F1) — for the boot tell.
@@ -1118,12 +1236,30 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return;
         };
         self.counters.recon_ok = self.counters.recon_ok.wrapping_add(1);
+        // E7 session bound: the same sheet, read for the account's
+        // worth (recorded below, once `body`'s borrow of the response
+        // buffer has ended).
+        let (usdc_1e6, legs_held) = crate::recon::account_view(&self.bal[..rows], body);
         let (legs, worst) = Self::compare(&self.assets, &self.bal[..rows], body);
         let unseen = crate::recon::unreconciled_venue_legs(&self.assets, &self.bal[..rows], body);
         self.counters.recon_drift_legs = legs;
         self.counters.recon_unseen_legs = unseen;
-        if worst > self.counters.recon_drift_max_qty_1e6 {
-            self.counters.recon_drift_max_qty_1e6 = worst;
+        self.note_drift(worst);
+        // E7 session bound: the anchor is written ONCE per session,
+        // from here — the idle path, on the 60 s cadence — never from
+        // a tick.
+        if self.note_account(usdc_1e6, legs_held) {
+            let a = crate::anchor::PnlAnchor {
+                address: self.master_addr,
+                usdc_1e6,
+                set_unix_s: crate::nonce::now_ms() / 1000,
+            };
+            if crate::anchor::store(&self.pnl_path, a).is_err() {
+                // The in-memory anchor stands for this process; the
+                // next boot re-anchors. Counted so it is not silent.
+                self.counters.anchor_persist_failed =
+                    self.counters.anchor_persist_failed.wrapping_add(1);
+            }
         }
         // E6 commit 3: the arm has compared itself against the venue.
         // The router reads this to stop refusing every live place —
@@ -1940,6 +2076,8 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             rolls_refused: c.rolls_refused,
             owner_contested: c.owner_contested,
             budget_remaining: self.budget.remaining(),
+            pnl_anchor_usd_1e6: self.pnl_anchor_1e6,
+            session_pnl_usd_1e6: self.session_pnl_usd_1e6(),
         }
     }
 
@@ -2118,6 +2256,14 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             // `halt_on_recon_stale_ms`.
             self.last_recon_ok
                 .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+        )
+        // E7 session bound: judged only while anchored AND flat, and
+        // only from a balance this process has actually read — a
+        // restored anchor with no reconciliation yet reports "not
+        // flat" rather than a $-anchor delta.
+        .with_pnl(
+            self.pnl_anchor_1e6 != 0 && self.usdc_1e6 != 0 && self.legs_held == 0,
+            self.session_pnl_usd_1e6(),
         )
     }
 
@@ -2634,10 +2780,11 @@ mod tests {
         assert_eq!(
             core::mem::size_of::<HlExecCounters>(),
             320,
-            "HlExecCounters changed size — 35 eight-byte counters (280 B) \
-             rounded up to five 64-byte lines, with room for five more \
-             before it grows. The message used to say 40 u64, which is \
-             why adding one looked like it would cross a line and did not."
+            "HlExecCounters changed size — 39 eight-byte slots (312 B: 38 \
+             u64/i64 + the u32 pair) rounded up to five 64-byte lines, \
+             with room for ONE more before it grows to six. Earlier \
+             messages under-counted (35, then 40 u64), which is why adding \
+             one looked like it would cross a line and did not."
         );
     }
 
@@ -2804,6 +2951,87 @@ mod tests {
         assert_eq!(x.seed_budget_from_venue(), BudgetSource::Cold);
         assert_eq!(x.budget, before, "no answer, no change");
         assert!(x.budget_remaining() <= 0, "and cold still refuses");
+    }
+
+    /// **E7 session bound — the anchor is set ONCE, at the first FLAT
+    /// reading, and the signal is judged only from there.** A boot
+    /// with no anchor file starts unanchored; a reading with a leg
+    /// held does not anchor (the balance then is not the account's
+    /// worth); the first flat reading does, and persists; later
+    /// readings move the delta and never the anchor; a leg held
+    /// later withdraws the bound from judgement without losing the
+    /// anchor; and a second `new` on the same directory restores it.
+    #[test]
+    fn the_session_anchor_is_the_first_flat_balance_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("mv-hlx-anchor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let budget_path = dir.join(budget::DEFAULT_STATE_PATH);
+        let build = || {
+            let (p, _c) = Ring::<Fill, 64>::new().split();
+            HlExchange::<64>::new(
+                &HlConfig::new(Scope::Testnet, "127.0.0.1", 'b', KEY, ADDR).expect("cfg"),
+                core_net::TlsTransport::default_client_config(),
+                p,
+                budget_path.clone(),
+                100,
+            )
+            .expect("build")
+        };
+        let mut x = build();
+        assert_eq!(x.pnl_anchor_usd_1e6(), 0, "no file, no anchor");
+        assert_eq!(x.pnl_state_path(), dir.join(crate::anchor::DEFAULT_STATE_PATH));
+        let sig = x.halt_signal();
+        assert_eq!((sig.pnl_flat, sig.pnl_delta_usd_1e6), (0, 0), "unanchored: not judged");
+
+        // A leg held: the balance is not the account's worth.
+        assert!(!x.note_account(7_800_000, 1));
+        assert_eq!(x.pnl_anchor_usd_1e6(), 0);
+        assert_eq!(x.halt_signal().pnl_flat, 0);
+
+        // Zero USDC: nothing to bound.
+        assert!(!x.note_account(0, 0));
+        assert_eq!(x.pnl_anchor_usd_1e6(), 0);
+
+        // The first FLAT reading anchors.
+        assert!(x.note_account(8_630_000, 0), "the first flat balance is the anchor");
+        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000);
+        assert_eq!(x.session_pnl_usd_1e6(), 0);
+        let sig = x.halt_signal();
+        assert_eq!((sig.pnl_flat, sig.pnl_delta_usd_1e6), (1, 0));
+
+        // Later flat readings move the delta, never the anchor.
+        assert!(!x.note_account(23_630_000, 0));
+        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000);
+        assert_eq!(x.session_pnl_usd_1e6(), 15_000_000);
+        assert_eq!(x.halt_signal().pnl_delta_usd_1e6, 15_000_000);
+        assert!(!x.note_account(3_630_000, 0));
+        assert_eq!(x.session_pnl_usd_1e6(), -5_000_000);
+
+        // A leg held later: the delta is reported but not judged.
+        assert!(!x.note_account(1_630_000, 2));
+        let sig = x.halt_signal();
+        assert_eq!(sig.pnl_flat, 0, "an open leg withdraws the bound from judgement");
+        assert_eq!(x.pnl_anchor_usd_1e6(), 8_630_000, "and keeps the anchor");
+
+        // `reconcile` is what persists (it needs a venue); the module
+        // it calls is pinned here so the restart half is real.
+        let a = crate::anchor::PnlAnchor {
+            address: ADDR,
+            usdc_1e6: x.pnl_anchor_usd_1e6(),
+            set_unix_s: 1,
+        };
+        crate::anchor::store(x.pnl_state_path(), a).expect("persists");
+        let y = build();
+        assert_eq!(y.pnl_anchor_usd_1e6(), 8_630_000, "a restart restores the anchor");
+        let sig = y.halt_signal();
+        assert_eq!(
+            (sig.pnl_flat, sig.pnl_delta_usd_1e6),
+            (0, 0),
+            "restored but nothing reconciled yet: not judged, no $-anchor delta"
+        );
+        assert_eq!(y.arm_counters().pnl_anchor_usd_1e6, 8_630_000);
+        assert_eq!(y.arm_counters().session_pnl_usd_1e6, 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// E7-F2: the venue's IoC miss is neither an acceptance nor a
@@ -3231,6 +3459,38 @@ mod tests {
         const NOW: &[u8] = br##"{"channel":"userFills","data":{"fills":[{"coin":"#194190","px":"0.68","sz":"3.0","side":"B","time":1757942400000,"oid":2,"tid":2,"cloid":"0x4d560300000000000000000000000001"}]}}"##;
         assert_eq!(x.route_fills(NOW), 1);
         assert_eq!(x.assets().booked_qty(4096), Some(3_000_000));
+    }
+
+    /// **E7-F3.** A disagreement reaches the halt's high-water mark
+    /// only when two consecutive reconciliations see one. The first
+    /// sighting is a level (the operator sees it), not a mark; the
+    /// second confirms the smaller of the two; a sighting that clears
+    /// before the next cycle leaves nothing. Mainnet 2026-09-19
+    /// 15:32:22Z is the case: 2 contracts read against 0 booked in the
+    /// same second as the fill, latched `recon-drift` over a fill
+    /// booked milliseconds later.
+    #[test]
+    fn a_drift_must_survive_a_reconciliation_interval_before_it_can_halt() {
+        let mut x = exchange();
+        x.note_drift(2_000_000);
+        assert_eq!(x.counters().recon_drift_max_qty_1e6, 0, "one sighting is not drift");
+        assert_eq!(x.halt_signal().recon_drift_usd_1e6, 0, "and halts nothing");
+        x.note_drift(0);
+        assert_eq!(x.counters().recon_drift_max_qty_1e6, 0, "cleared: it was the race");
+
+        x.note_drift(3_000_000);
+        x.note_drift(2_000_000);
+        assert_eq!(
+            x.counters().recon_drift_max_qty_1e6,
+            2_000_000,
+            "two consecutive sightings confirm the smaller"
+        );
+        assert_eq!(x.halt_signal().recon_drift_usd_1e6, 2_000_000, "and the halt reads it");
+        x.note_drift(0);
+        x.note_drift(5_000_000);
+        assert_eq!(x.counters().recon_drift_max_qty_1e6, 2_000_000, "a high-water mark never clears");
+        x.note_drift(5_000_000);
+        assert_eq!(x.counters().recon_drift_max_qty_1e6, 5_000_000);
     }
 
     /// A leg the venue does not mention reads as ZERO — and that is a

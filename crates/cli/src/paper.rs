@@ -3997,6 +3997,14 @@ pub struct ExecMetricIds {
     /// refuses every submit and the halt machine latches
     /// `budget-floor`.
     pub budget_remaining: GaugeId,
+    /// `engine_exec_hl_pnl_anchor_usd_1e6` (gauge) — E7 session bound:
+    /// the spot-USDC anchor, 0 until the first flat reconciliation.
+    pub pnl_anchor: GaugeId,
+    /// `engine_exec_hl_session_pnl_usd_1e6` (gauge, signed) — E7
+    /// session bound: spot USDC minus the anchor at the last
+    /// reconciliation; what `halt_on_gain_usd_1e6` /
+    /// `halt_on_loss_usd_1e6` latch `pnl-gain` / `pnl-loss` on.
+    pub session_pnl: GaugeId,
     /// Index = slot. `Some` only for LIVE slots — a paper or off slot
     /// costs no metric names at all (plan §3.5).
     ///
@@ -4798,6 +4806,12 @@ fn register_exec_metrics(
     let budget_remaining = reg
         .register_gauge("engine_exec_hl_budget_remaining")
         .map_err(|_| "register engine_exec_hl_budget_remaining")?;
+    let pnl_anchor = reg
+        .register_gauge("engine_exec_hl_pnl_anchor_usd_1e6")
+        .map_err(|_| "register engine_exec_hl_pnl_anchor_usd_1e6")?;
+    let session_pnl = reg
+        .register_gauge("engine_exec_hl_session_pnl_usd_1e6")
+        .map_err(|_| "register engine_exec_hl_session_pnl_usd_1e6")?;
 
     let mut slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS] =
         [None; clob_dispatcher::EXEC_COUNTER_SLOTS];
@@ -4838,6 +4852,8 @@ fn register_exec_metrics(
         arm,
         seeded,
         budget_remaining,
+        pnl_anchor,
+        session_pnl,
         slots,
     })
 }
@@ -4898,6 +4914,8 @@ fn mirror_exec_metrics(
         reg.counter(ids.arm[i]).inc(arm_cur[i].saturating_sub(arm_last[i]));
     }
     reg.gauge(ids.budget_remaining).set(cur.arm.budget_remaining);
+    reg.gauge(ids.pnl_anchor).set(cur.arm.pnl_anchor_usd_1e6);
+    reg.gauge(ids.session_pnl).set(cur.arm.session_pnl_usd_1e6);
     reg.gauge(ids.seeded).set(i64::from(cur.seeded));
     for (s, slot) in ids.slots.iter().enumerate() {
         let Some(slot) = slot else { continue };
@@ -6140,6 +6158,8 @@ fn fill_snapshot<S, D>(
     ex.arm_recon_unseen_legs = ec.arm.recon_unseen_legs;
     ex.arm_sweep_left = ec.arm.sweep_left;
     ex.arm_budget_remaining = ec.arm.budget_remaining;
+    ex.arm_pnl_anchor_usd_1e6 = ec.arm.pnl_anchor_usd_1e6;
+    ex.arm_session_pnl_usd_1e6 = ec.arm.session_pnl_usd_1e6;
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -10055,6 +10075,9 @@ mod tests {
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",
             "engine_exec_seeded",
+            // E7 session bound — the two gauges the operator watches.
+            "engine_exec_hl_pnl_anchor_usd_1e6",
+            "engine_exec_hl_session_pnl_usd_1e6",
             "engine_exec_slot3_mode",
             "engine_exec_slot3_live_submits_total",
             "engine_exec_slot3_refused_total",
@@ -10100,6 +10123,8 @@ mod tests {
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",
             "engine_exec_seeded",
+            "engine_exec_hl_pnl_anchor_usd_1e6",
+            "engine_exec_hl_session_pnl_usd_1e6",
         ] {
             assert!(n.len() <= core_metrics::NAME_MAX);
         }

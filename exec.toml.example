@@ -257,6 +257,29 @@ halt_on_asset_refusal_streak = 3
 # 300000 = 5 min tolerates a hiccup and halts an outage.
 halt_on_recon_stale_ms = 300000
 
+# ---- the SESSION BOUND (E7, OPTIONAL) ---------------------------------
+#
+# The operator's stopping rule — "run until it either earns +N or loses
+# M" — as a sticky halt (`pnl-gain` / `pnl-loss`), NOT a fault
+# detector: both keys are optional even on a live slot, `0` (or absent)
+# is "no bound on that side", and the five kill switches above stay
+# required whatever these say.
+#
+# Measured from the account's SPOT USDC as the reconciler reads it
+# every 60 s, against an ANCHOR: the balance at the first reconciliation
+# that found the account FLAT (no outcome leg held). The anchor is
+# written once to `exec-pnl-anchor.state` beside this file and restored
+# on every restart, so the session outlives the process (KeepAlive
+# relaunches it) — delete that file before a restart to start a new
+# session. The bound is judged ONLY while flat: an open leg's premium
+# is not a loss and its payout is not a gain until the venue settles.
+# `/state` shows `arm_pnl_anchor_usd_1e6` and `arm_session_pnl_usd_1e6`;
+# `/metrics` the same two as gauges.
+#
+# USD x1e6. 15000000 = +$15 halts; 5000000 = -$5 halts.
+# halt_on_gain_usd_1e6 = 15000000
+# halt_on_loss_usd_1e6 = 5000000
+
 
 # Slot 1 — vrp. Explicit is better than default: writing it down means
 # a reader of this file knows the slot was considered, not forgotten.

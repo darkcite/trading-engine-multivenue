@@ -6,7 +6,50 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
-## 2026-09-19 — `hl-depth.pmlr` carries the HIP-4 outcome legs' top-5 (WS10-B for Hyperliquid, outcome coins only)
+## 2026-09-20 — E7 session bound: `exec.toml` gains OPTIONAL `halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6`, `HaltReason` 8/9 (`pnl-gain`/`pnl-loss`), `HaltSignal` 40 → 48 B, `exec-pnl-anchor.state`
+
+**No wire-format change.** One state file, two config keys, two halt
+reasons, two gauges and two `/state` fields are NEW; every existing
+file and key reads as before.
+
+* `exec.toml` `[exec.slot.<n>]`: `halt_on_gain_usd_1e6`,
+  `halt_on_loss_usd_1e6` (USD ×1e6, `>= 0`, OPTIONAL even on a live
+  slot; `0`/absent = no bound on that side). `SLOT_KEYS` 13 → 15. The
+  template documents both commented out.
+* `exec_router::HaltReason`: `PnlGain = 8` (`pnl-gain`), `PnlLoss = 9`
+  (`pnl-loss`); `engine_snapshot::HALT_REASON_WORDS` 8 → 10 (pinned
+  against the enum by `cli::exec_boot`). `exec.HALT` may now carry
+  `reason=pnl-gain` / `reason=pnl-loss`.
+* `clob_dispatcher::HaltSignal`: `pnl_flat: u8` at the former padding
+  and `pnl_delta_usd_1e6: i64` appended — 40 → 48 B (size-asserted).
+  `HaltLimits` gains `pnl_gain_usd_1e6` / `pnl_loss_usd_1e6`
+  (`with_pnl_bound`), 32 → 48 B; `ExecRoute` 512 → 640 B (the halt
+  table, lines 5–10; the hot arrays and the offset-256 halt table
+  start are unchanged).
+* `clob_dispatcher::LiveArmCounters`: `pnl_anchor_usd_1e6`,
+  `session_pnl_usd_1e6` (i64, appended). `HlExecCounters`:
+  `anchor_persist_failed` (appended; the block stays five lines).
+* `/state` `exec` object (additive, `"v": 1` untouched):
+  `arm_pnl_anchor_usd_1e6`, `arm_session_pnl_usd_1e6`. `/metrics`
+  gauges `engine_exec_hl_pnl_anchor_usd_1e6`,
+  `engine_exec_hl_session_pnl_usd_1e6`.
+* New state file `exec-pnl-anchor.state` beside `exec-budget.state`
+  (one line `<0x master>\t<usdc ×1e6>\t<unix s>`), written once at the
+  first FLAT reconciliation of a session, read at boot for the same
+  master only. **Delete it to start a new session**; it is not touched
+  by any restart.
+* Boot tells: ARMED gains `pnl_anchor_usd_1e6=… pnl_anchor_state=…`;
+  HALTS gains `session_bound=+$<gain>/-$<loss>` (pinned).
+
+Why and how it is judged: `docs/risk-policy.md` "E7 — the SESSION
+BOUND".
+
+**Behavioural, same build (E7-F3):** `recon-drift` now needs the
+disagreement to be seen by TWO consecutive reconciliations (60 s
+apart) before it reaches `recon_drift_max_qty_1e6` and the halt; the
+`/state` level `arm_recon_drift_legs` is unchanged and still shows a
+single sighting. Record: risk-policy "E7 — MAINNET R0", 15:32:22Z.
+
 
 **No wire-format change, no file-layout change, no config change.**
 `hl-depth.pmlr` (kind 7, 192 B `DepthTopK` slots, present in every

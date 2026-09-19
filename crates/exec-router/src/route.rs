@@ -29,11 +29,13 @@
 //!
 //! ## Layout
 //!
-//! `#[repr(C, align(64))]`, 512 bytes = eight cache lines, with
+//! `#[repr(C, align(64))]`, 640 bytes = ten cache lines, with
 //! **both hot arrays in the first 16 bytes** so the per-submit lookup
 //! touches one line and never pointer-chases; the E6 clamps sit on
-//! lines 2–4 and the halt thresholds on lines 5–8, none of which a
-//! paper submit ever reads.
+//! lines 2–4 and the halt thresholds on lines 5–10, none of which a
+//! paper submit ever reads. (512 B until E7's session bound grew
+//! `HaltLimits` 32 → 48 B; the halt table is read on the halt poll,
+//! never per submit, so the two extra lines cost nothing hot.)
 
 use crate::mode::ExecMode;
 
@@ -184,6 +186,12 @@ pub struct HaltLimits {
     /// Consecutive LAW E-4 refusals (an order naming a rolled
     /// instance).
     pub asset_refusal_streak: u32,
+    /// E7 session bound: spot-USDC gain over the anchor, USD ×1e6, at
+    /// which the slot halts (judged flat only). `0` = no bound.
+    pub pnl_gain_usd_1e6: i64,
+    /// E7 session bound: spot-USDC loss under the anchor, USD ×1e6,
+    /// at which the slot halts (judged flat only). `0` = no bound.
+    pub pnl_loss_usd_1e6: i64,
 }
 
 impl HaltLimits {
@@ -197,10 +205,13 @@ impl HaltLimits {
             recon_stale_ms: 0,
             reject_streak: 0,
             asset_refusal_streak: 0,
+            pnl_gain_usd_1e6: 0,
+            pnl_loss_usd_1e6: 0,
         }
     }
 
-    /// Build a set of thresholds.
+    /// Build a set of fault thresholds; the session bound stays off
+    /// (see [`Self::with_pnl_bound`]).
     #[inline]
     #[must_use]
     pub const fn new(
@@ -216,7 +227,19 @@ impl HaltLimits {
             recon_stale_ms,
             reject_streak,
             asset_refusal_streak,
+            pnl_gain_usd_1e6: 0,
+            pnl_loss_usd_1e6: 0,
         }
+    }
+
+    /// E7: the operator's session bound — halt at `gain` over or
+    /// `loss` under the spot-USDC anchor, each `0` = that side off.
+    #[inline]
+    #[must_use]
+    pub const fn with_pnl_bound(mut self, gain_usd_1e6: i64, loss_usd_1e6: i64) -> Self {
+        self.pnl_gain_usd_1e6 = gain_usd_1e6;
+        self.pnl_loss_usd_1e6 = loss_usd_1e6;
+        self
     }
 }
 
@@ -256,8 +279,8 @@ pub struct ExecRoute {
     /// mode branch has already resolved — sit on lines 2 and 3 where
     /// a paper boot never touches them.
     _pad: [u8; 16],
-    /// **E6 commit 3** — per-slot halt thresholds. 32 B each, eight
-    /// of them: lines 5–8.
+    /// **E6 commit 3** — per-slot halt thresholds. 48 B each (32 B
+    /// before E7's session bound), eight of them: lines 5–10.
     halts: [HaltLimits; EXEC_SLOTS],
 }
 
@@ -519,9 +542,9 @@ mod tests {
     use core_types::{STRATEGY_ID_NONE, STRATEGY_SLOT_BIN15};
 
     #[test]
-    fn layout_is_eight_cache_lines_with_the_hot_arrays_first() {
-        assert_eq!(core::mem::size_of::<ExecRoute>(), 512, "eight cache lines");
-        assert_eq!(core::mem::size_of::<HaltLimits>(), 32, "HaltLimits is 32 B");
+    fn layout_is_ten_cache_lines_with_the_hot_arrays_first() {
+        assert_eq!(core::mem::size_of::<ExecRoute>(), 640, "ten cache lines");
+        assert_eq!(core::mem::size_of::<HaltLimits>(), 48, "HaltLimits is 48 B (E7)");
         assert_eq!(core::mem::size_of::<SlotCaps>(), 32, "SlotCaps is 32 B");
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
         assert_eq!(

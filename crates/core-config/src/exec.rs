@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 13] = [
+const SLOT_KEYS: [&str; 15] = [
     "mode",
     "name",
     "venues",
@@ -92,6 +92,8 @@ const SLOT_KEYS: [&str; 13] = [
     "halt_on_ws_gap_ms",
     "halt_on_asset_refusal_streak",
     "halt_on_recon_stale_ms",
+    "halt_on_gain_usd_1e6",
+    "halt_on_loss_usd_1e6",
 ];
 
 /// Venue spellings the `venues` array accepts, and the `VenueId` byte
@@ -202,6 +204,20 @@ pub struct ExecSlot {
     /// so a value of a few minutes tolerates a hiccup and halts an
     /// outage.
     pub halt_on_recon_stale_ms: i64,
+    /// **E7 (operator ruling 2026-09-19: "run until it either earns
+    /// +15 USDC or loses 5 USDC")** — the SESSION BOUND. USD ×1e6 of
+    /// spot-USDC gain over the anchor (the balance at the first flat
+    /// reconciliation, persisted beside this file) at which the slot
+    /// halts sticky. `0` = no bound. OPTIONAL even on a live slot: it
+    /// is the operator's stopping rule, not a fault detector, and the
+    /// five fault halts above stay required whatever this says.
+    pub halt_on_gain_usd_1e6: i64,
+    /// The loss side of the same bound: USD ×1e6 of spot-USDC loss
+    /// under the anchor at which the slot halts sticky. `0` = no
+    /// bound. Both are judged only when the account is FLAT (no
+    /// outcome leg held), so an open position's premium never reads
+    /// as a loss.
+    pub halt_on_loss_usd_1e6: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
 }
@@ -225,6 +241,8 @@ impl ExecSlot {
             halt_on_ws_gap_ms: 0,
             halt_on_asset_refusal_streak: 0,
             halt_on_recon_stale_ms: 0,
+            halt_on_gain_usd_1e6: 0,
+            halt_on_loss_usd_1e6: 0,
             line: 0,
         }
     }
@@ -427,6 +445,8 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         halt_on_asset_refusal_streak: opt_int(kv, "halt_on_asset_refusal_streak", 0)?,
         halt_on_recon_drift_usd_1e6: opt_int(kv, "halt_on_recon_drift_usd_1e6", 0)?,
         halt_on_recon_stale_ms: opt_int(kv, "halt_on_recon_stale_ms", 0)?,
+        halt_on_gain_usd_1e6: opt_int(kv, "halt_on_gain_usd_1e6", 0)?,
+        halt_on_loss_usd_1e6: opt_int(kv, "halt_on_loss_usd_1e6", 0)?,
         line,
     };
 
@@ -672,6 +692,8 @@ halt_on_recon_drift_usd_1e6 = 5000000
 halt_on_ws_gap_ms = 30000
 halt_on_asset_refusal_streak = 3
 halt_on_recon_stale_ms = 300000
+halt_on_gain_usd_1e6 = 15000000
+halt_on_loss_usd_1e6 = 5000000
 
 [exec.slot.1]
 mode = "paper"
@@ -716,8 +738,27 @@ mode = "paper"
         assert_eq!(s3.halt_on_ws_gap_ms, 30_000);
         assert_eq!(s3.halt_on_asset_refusal_streak, 3);
         assert_eq!(s3.halt_on_recon_stale_ms, 300_000);
+        assert_eq!(s3.halt_on_gain_usd_1e6, 15_000_000, "the session bound, E7");
+        assert_eq!(s3.halt_on_loss_usd_1e6, 5_000_000);
         assert_eq!(f.slot(1).mode, "paper");
         assert_eq!(f.live_mask(), 0b0000_1000);
+    }
+
+    /// E7: the session bound is OPTIONAL on a live slot (a stopping
+    /// rule, not a fault detector) and defaults to off; a negative
+    /// bound is refused like every other number.
+    #[test]
+    fn the_session_bound_is_optional_and_never_negative() {
+        let without = EXAMPLE
+            .replace("halt_on_gain_usd_1e6 = 15000000\n", "")
+            .replace("halt_on_loss_usd_1e6 = 5000000\n", "");
+        let f = parse(&without).expect("a live slot without a bound parses");
+        assert_eq!(f.slot(3).halt_on_gain_usd_1e6, 0);
+        assert_eq!(f.slot(3).halt_on_loss_usd_1e6, 0);
+        expect_err(
+            &EXAMPLE.replace("halt_on_loss_usd_1e6 = 5000000", "halt_on_loss_usd_1e6 = -5000000"),
+            "must be >= 0",
+        );
     }
 
     #[test]

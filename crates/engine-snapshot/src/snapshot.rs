@@ -444,7 +444,7 @@ impl<T: Copy, const N: usize> RecentRing<T, N> {
 /// `cli` sees both and pins them together — a silent divergence here
 /// would make `/state` name the wrong reason for a halt, which is the
 /// one field an operator reads it for.
-pub const HALT_REASON_WORDS: [&str; 8] = [
+pub const HALT_REASON_WORDS: [&str; 10] = [
     "none",
     "reject-streak",
     "budget-floor",
@@ -453,6 +453,8 @@ pub const HALT_REASON_WORDS: [&str; 8] = [
     "asset-refusals",
     "operator",
     "recon-stale",
+    "pnl-gain",
+    "pnl-loss",
 ];
 
 /// The word for a `HaltReason` byte, or `"unknown"` for one this
@@ -537,6 +539,12 @@ pub struct ExecSnapshot {
     /// The address budget's remaining headroom (negative = past the
     /// venue's cliff).
     pub arm_budget_remaining: i64,
+    /// E7 session bound: the spot-USDC anchor (USD ×1e6; 0 = not
+    /// anchored yet).
+    pub arm_pnl_anchor_usd_1e6: i64,
+    /// E7 session bound: spot USDC minus the anchor at the last
+    /// reconciliation (USD ×1e6, signed; 0 while not anchored).
+    pub arm_session_pnl_usd_1e6: i64,
 }
 
 /// The whole snapshot — see the module docs and plan §6.1.

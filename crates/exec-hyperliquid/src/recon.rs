@@ -286,6 +286,40 @@ pub fn unreconciled_venue_legs(
     n
 }
 
+/// **E7 session bound** — the two numbers the bound is judged from,
+/// read off one scanned balance sheet: the account's spot USDC (×1e6)
+/// and how many outcome legs it holds.
+///
+/// `USDC` is the venue's quote row and the only balance whose change
+/// IS realised P&L once no leg is held — fees and settlements
+/// included, from the one source this arm already trusts over its
+/// own ledger. A `+` row with a non-zero total is a position worth
+/// anything from 0 to 1 USDC until the venue settles it, and the bound
+/// is not judged while one exists (`exec_router::halt::trigger_for`
+/// reads `pnl_flat`). Held-against-orders USDC is still USDC: `total`,
+/// not `free`, so a resting bid does not read as a loss.
+///
+/// A sheet without a `USDC` row reports `0`, which the arm treats as
+/// "nothing to anchor" — never as a $-anchor loss.
+#[must_use]
+pub fn account_view(bal: &[SpotBalance], body: &[u8]) -> (i64, u32) {
+    let mut usdc_1e6 = 0i64;
+    let mut legs = 0u32;
+    let mut i = 0usize;
+    while i < bal.len() {
+        let coin = bal[i].coin.of(body);
+        if coin == b"USDC" {
+            // The scanner is ×1e8; the bound, like every USD figure
+            // the router compares, is ×1e6.
+            usdc_1e6 = bal[i].total_1e8 / 100;
+        } else if matches!(coin.first(), Some(b'+')) && bal[i].total_1e8 != 0 {
+            legs = legs.saturating_add(1);
+        }
+        i += 1;
+    }
+    (usdc_1e6, legs)
+}
+
 /// The most one HIP-4 outcome contract can ever be worth, 1e6.
 ///
 /// A leg settles to **exactly 0 or 1 USDC** — that is what a binary
@@ -787,6 +821,33 @@ mod tests {
         let n2 = scan_spot_state(only_quote, &mut b2).expect("scans");
         let empty = crate::asset::AssetTable::new();
         assert_eq!(unreconciled_venue_legs(&empty, &b2[..n2], only_quote), 0);
+    }
+
+    /// **E7 session bound.** The account view is the USDC row (×1e6,
+    /// total not free) and a count of legs with a non-zero holding —
+    /// the venue's zero husks do not count, and a sheet without USDC
+    /// reads zero rather than inventing a balance.
+    #[test]
+    fn the_account_view_is_the_usdc_row_and_the_held_legs() {
+        let body = br#"{"balances":[
+            {"coin":"USDC","token":0,"total":"997.64","hold":"2.0"},
+            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0"},
+            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
+        ]}"#;
+        let mut bal = [SpotBalance::default(); MAX_SPOT_BALANCES];
+        let n = scan_spot_state(body, &mut bal).expect("scans");
+        assert_eq!(account_view(&bal[..n], body), (997_640_000, 1));
+
+        let flat = br#"{"balances":[
+            {"coin":"USDC","token":0,"total":"8.63","hold":"0.0"},
+            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
+        ]}"#;
+        let n2 = scan_spot_state(flat, &mut bal).expect("scans");
+        assert_eq!(account_view(&bal[..n2], flat), (8_630_000, 0), "a husk is not a leg");
+
+        let no_quote = br#"{"balances":[{"coin":"+195720","token":3,"total":"1.0","hold":"0.0"}]}"#;
+        let n3 = scan_spot_state(no_quote, &mut bal).expect("scans");
+        assert_eq!(account_view(&bal[..n3], no_quote), (0, 1), "no USDC row reads zero");
     }
 
     /// The shape a sweep reads. `frontendOpenOrders` is a TOP-LEVEL

@@ -80,6 +80,14 @@ pub enum HaltReason {
     /// No reconciliation has AGREED with the venue for
     /// `halt_on_recon_stale_ms`.
     ReconStale = 7,
+    /// E7 session bound: the account's spot USDC reached the anchor
+    /// plus `halt_on_gain_usd_1e6` while flat. The operator's
+    /// stopping rule, not a fault — but sticky like every halt, so
+    /// "run until" means until.
+    PnlGain = 8,
+    /// E7 session bound: the account's spot USDC fell to the anchor
+    /// minus `halt_on_loss_usd_1e6` while flat.
+    PnlLoss = 9,
 }
 
 impl HaltReason {
@@ -95,6 +103,8 @@ impl HaltReason {
             HaltReason::AssetRefusals => "asset-refusals",
             HaltReason::Operator => "operator",
             HaltReason::ReconStale => "recon-stale",
+            HaltReason::PnlGain => "pnl-gain",
+            HaltReason::PnlLoss => "pnl-loss",
         }
     }
 
@@ -116,6 +126,8 @@ impl HaltReason {
             "ws-gap" => HaltReason::WsGap,
             "asset-refusals" => HaltReason::AssetRefusals,
             "recon-stale" => HaltReason::ReconStale,
+            "pnl-gain" => HaltReason::PnlGain,
+            "pnl-loss" => HaltReason::PnlLoss,
             _ => HaltReason::Operator,
         }
     }
@@ -278,6 +290,20 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
         let gap_ms = (sig.ws_gap_ns / 1_000_000) as i64;
         if gap_ms >= lim.ws_gap_ms {
             return HaltReason::WsGap;
+        }
+    }
+    // E7 session bound — last, because it is the operator's stopping
+    // rule and not a fault: when a fault and the bound coincide the
+    // fault is the thing to read. Judged only while FLAT (the arm
+    // reports `pnl_flat` = anchor set AND no outcome leg held), so a
+    // position's premium never reads as a loss and a payout not yet
+    // settled never reads as a gain.
+    if sig.pnl_flat != 0 {
+        if lim.pnl_gain_usd_1e6 > 0 && sig.pnl_delta_usd_1e6 >= lim.pnl_gain_usd_1e6 {
+            return HaltReason::PnlGain;
+        }
+        if lim.pnl_loss_usd_1e6 > 0 && sig.pnl_delta_usd_1e6 <= -lim.pnl_loss_usd_1e6 {
+            return HaltReason::PnlLoss;
         }
     }
     HaltReason::None
@@ -598,6 +624,52 @@ mod tests {
         assert_eq!(trigger_for(&s, &lim()), HaltReason::None);
         s.asset_refusal_streak = 3;
         assert_eq!(trigger_for(&s, &lim()), HaltReason::AssetRefusals);
+    }
+
+    /// **E7 session bound.** Judged only while the arm reports FLAT;
+    /// the gain side at `>=`, the loss side at `<=`; a zero limit is
+    /// no bound; and a fault outranks the bound when both hold.
+    #[test]
+    fn the_session_bound_halts_only_when_flat_and_only_where_the_operator_wrote() {
+        let bound = lim().with_pnl_bound(15_000_000, 5_000_000);
+        let mut s = healthy().with_pnl(true, 14_999_999);
+        assert_eq!(trigger_for(&s, &bound), HaltReason::None, "$14.999999 is not $15");
+        s.pnl_delta_usd_1e6 = 15_000_000;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::PnlGain);
+        s.pnl_delta_usd_1e6 = -4_999_999;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::None);
+        s.pnl_delta_usd_1e6 = -5_000_000;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::PnlLoss);
+
+        // Not flat: the same delta is an open position's premium, not
+        // a loss, and no bound is judged.
+        s.pnl_flat = 0;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::None, "an open leg has no P&L");
+        s.pnl_delta_usd_1e6 = 40_000_000;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::None);
+
+        // No bound written: never fires, at any delta.
+        let unbounded = lim();
+        let big = healthy().with_pnl(true, i64::MAX / 2);
+        assert_eq!(trigger_for(&big, &unbounded), HaltReason::None);
+        let neg = healthy().with_pnl(true, i64::MIN / 2);
+        assert_eq!(trigger_for(&neg, &unbounded), HaltReason::None);
+
+        // One side written: only that side exists.
+        let gain_only = lim().with_pnl_bound(15_000_000, 0);
+        assert_eq!(trigger_for(&neg, &gain_only), HaltReason::None);
+        assert_eq!(trigger_for(&big, &gain_only), HaltReason::PnlGain);
+
+        // A fault and the bound at once: the fault is what is read.
+        let mut both = healthy().with_pnl(true, 15_000_000);
+        both.reject_streak = 5;
+        assert_eq!(trigger_for(&both, &bound), HaltReason::RejectStreak);
+
+        // The words round-trip like every other reason's.
+        assert_eq!(HaltReason::from_word("pnl-gain"), HaltReason::PnlGain);
+        assert_eq!(HaltReason::from_word("pnl-loss"), HaltReason::PnlLoss);
+        assert_eq!(HaltReason::PnlGain.as_str(), "pnl-gain");
+        assert_eq!(HaltReason::PnlLoss.as_str(), "pnl-loss");
     }
 
     // -----------------------------------------------------------------

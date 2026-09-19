@@ -315,6 +315,10 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(ex.arm_sweep_left);
     c.key("arm_budget_remaining");
     c.i64(ex.arm_budget_remaining);
+    c.key("arm_pnl_anchor_usd_1e6");
+    c.i64(ex.arm_pnl_anchor_usd_1e6);
+    c.key("arm_session_pnl_usd_1e6");
+    c.i64(ex.arm_session_pnl_usd_1e6);
     c.key("halted");
     c.put(b"[");
     let mut i = 0usize;

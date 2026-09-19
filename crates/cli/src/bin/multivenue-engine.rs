@@ -3855,6 +3855,11 @@ fn run(args: RunArgs) -> ExitCode {
                             budget_source = ?arm.budget_source(),
                             budget_remaining = arm.budget_remaining(),
                             budget_state = %budget_path.display(),
+                            // E7 session bound: 0 = not anchored yet —
+                            // the first FLAT reconciliation sets it and
+                            // writes the file; a restart restores it.
+                            pnl_anchor_usd_1e6 = arm.pnl_anchor_usd_1e6(),
+                            pnl_anchor_state = %arm.pnl_state_path().display(),
                             "exec: hyperliquid arm ARMED"
                         );
                         let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
