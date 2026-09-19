@@ -172,6 +172,12 @@ KNOBS: tuple[tuple[str, int], ...] = (
     # and the exit-leg fee. Distinct from `e_take_1e6` (3 c), which is
     # the opportunistic taker's edge hunt.
     ("e_entry_1e6", 20_000),
+    # BIN15 R0 (2026-09-19): the coverage entry's price FLOOR, x1e6.
+    # 0 = no floor = the 2026-09-13 law bit for bit. A preferred-side
+    # ask far under the belief is the venue disagreeing with the
+    # model, and on the paper tape the venue won those; the testnet
+    # research artifact sets 500000 (0.50) or 700000 (0.70) by hand.
+    ("entry_min_px_1e6", 0),
     ("maker_enabled", 1),
     ("null_arm", 1),
 )

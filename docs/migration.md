@@ -6,6 +6,38 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-19 — `bin15.toml` gains an OPTIONAL `entry_min_px_1e6` (the coverage entry's price floor); `BIN15_KEYS` 24 → 25 (BIN15 R0)
+
+**No wire change, no artifact re-cut required.** A `bin15.toml` without
+the key parses and boots bit for bit as before: absent = 0 = no floor.
+Present, the value must be in `[0, 1000000)` (a floor at or over 1.0
+could never be cleared and would switch the entry arm off in silence —
+refused at parse with its line). The member refuses a coverage entry
+whose preferred-side ask is under the floor on the existing
+`skipped_entry_price` counter, without burning the instance (the next
+reprice asks again), exactly as the price bound does.
+
+Why: the 2026-09-13→18 paper tape (vault doc 21) shows the entry's losses
+concentrate where the venue disagrees with the model — preferred-side
+asks under 0.50 hit 39 % against a 47.6 c price — and its wins where the
+two agree on a favourite (0.70+, 85 % against 79.6 c). The testnet
+research artifact sets `500000` (0.50) or `700000` (0.70); the shipped
+example carries `0`.
+
+Surfaces: `core_config::bin15::Bin15File.entry_min_px_1e6`,
+`strategy_bin15::Bin15Params.entry_min_px_1e6`, the boot tell's entry
+law (`entry=every-15m@$12<=p_hat-2c&ask>=50c`; unchanged at 0),
+`claude_worker.bin15_fit.KNOBS` (the fitter writes the key; the example
+was re-rendered — one added line). `bin15_ref` / the parity fixture are
+untouched: the pricer did not change.
+
+Also recorded here because it bites at R0: `entry_usd_1e6 = 10000000`
+($10) would submit almost nothing — `emit_take` floors the size to whole
+contracts and `on_grid` then requires notional ≥ $10, so at every ask
+that does not divide $10 exactly the floored order is under the venue
+minimum and is `skipped_grid`. The smallest entry that survives the
+floor at every price is $11; the R0 artifact uses $12.
+
 ## 2026-09-19 — Real-execution lane E5–E7: `Order.verb`@42 + `prev_client_oid`@56, `Fill.flags`@15, `HaltSignal` 32 → 40 B, `ExecCounters` grows, `/state` `exec` gains `ledger_*`/`arm_*`, `exec.toml` gains a REQUIRED `halt_on_recon_stale_ms`, `core-metrics::MAX_COUNTERS` 256 → 512
 
 Recorded at the E7 review (2026-09-19); the E5/E6 phases landed the wire

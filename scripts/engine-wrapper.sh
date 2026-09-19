@@ -176,4 +176,26 @@ esac
 ulimit -S -n 8192 ||
   echo "engine-wrapper: ulimit -n 8192 refused (hard=$(ulimit -Hn)) — booting with $(ulimit -Sn)" >&2
 echo "engine-wrapper: fd soft limit $(ulimit -Sn) (hard $(ulimit -Hn))" >&2
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY"
+# E7 R0 (2026-09-19): the THIRD edit `exec.toml.example` names. A slot is
+# armed only when ~/multivenue/strategy.conf carries BOTH
+# `EXEC_TOML=$HOME/multivenue/exec.toml` and `ARM_LIVE=3` (the slots the
+# artifact marks live, comma-separated). Both absent ⇒ the run line
+# below is byte-identical to the paper fleet's. One of the two set alone
+# is a misconfiguration and REFUSES the boot (exit 78, like a bad
+# STRATEGY) rather than arming or silently ignoring it — the engine's
+# own interlock (artifact ⇄ --arm-live must agree exactly) still has the
+# last word once both reach it. `--paper` stays: it is the default and
+# only the per-slot route table can move a slot off it.
+EXEC_ARGS=()
+if [ -n "${EXEC_TOML:-}" ] && [ -n "${ARM_LIVE:-}" ]; then
+  if [ ! -f "$EXEC_TOML" ]; then
+    echo "engine-wrapper: refusing to arm — EXEC_TOML=$EXEC_TOML is not a file" >&2
+    exit 78
+  fi
+  EXEC_ARGS=(--exec "$EXEC_TOML" --arm-live "$ARM_LIVE")
+  echo "engine-wrapper: ARMING slot(s) $ARM_LIVE via $EXEC_TOML — real orders will be submitted" >&2
+elif [ -n "${EXEC_TOML:-}${ARM_LIVE:-}" ]; then
+  echo "engine-wrapper: refusing — EXEC_TOML and ARM_LIVE must BOTH be set to arm (got EXEC_TOML='${EXEC_TOML:-}' ARM_LIVE='${ARM_LIVE:-}')" >&2
+  exit 78
+fi
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}"

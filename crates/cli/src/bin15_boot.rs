@@ -272,6 +272,9 @@ pub fn load_bin15_boot(
     // CHANGE for such an artifact, deliberately: the old behaviour was
     // paying whatever the book asked.
     params.e_entry_1e6 = file.e_entry_1e6;
+    // BIN15 R0 (2026-09-19): absent = 0 = no floor, the old law bit for
+    // bit; the parser has already bounded a present value to [0, 1e6).
+    params.entry_min_px_1e6 = file.entry_min_px_1e6;
     params.maker_enabled = file.maker_enabled;
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
@@ -392,8 +395,16 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
         // on the line beside the size. "$50 on every instance" and
         // "$50 on every instance whose ask clears the model by 2 c"
         // are different strategies.
+        // BIN15 R0 (2026-09-19): a FLOOR is part of the entry law too,
+        // so it is on the line whenever it is set; at 0 the line is
+        // exactly what it was before the key existed.
+        let floor = if boot.params.entry_min_px_1e6 > 0 {
+            format!("&ask>={}c", boot.params.entry_min_px_1e6 / 10_000)
+        } else {
+            String::new()
+        };
         format!(
-            "every-15m@${}<=p_hat-{}c",
+            "every-15m@${}<=p_hat-{}c{floor}",
             boot.params.entry_usd_1e6 / 1_000_000,
             boot.params.e_entry_1e6 / 10_000
         )

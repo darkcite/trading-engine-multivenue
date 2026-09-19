@@ -60,7 +60,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 24] = [
+const BIN15_KEYS: [&str; 25] = [
     "families",
     "underlying",
     "tau_ns",
@@ -102,6 +102,9 @@ const BIN15_KEYS: [&str; 24] = [
     // key existed drove an arm that paid ANY ask, so the default has to
     // be the bound and not "off".
     "e_entry_1e6",
+    // BIN15 R0 (2026-09-19): the coverage entry's price FLOOR. Optional;
+    // absent = 0 = no floor, which is the 2026-09-13 law bit for bit.
+    "entry_min_px_1e6",
 ];
 
 /// `bin15.toml` as parsed. The strings stay descriptors: resolving them
@@ -155,6 +158,9 @@ pub struct Bin15File {
     /// BIN15 P3 (F6): the coverage entry's margin over its own belief
     /// ×1e6. Absent = [`E_ENTRY_1E6_DEFAULT`].
     pub e_entry_1e6: i64,
+    /// BIN15 R0 (2026-09-19): the lowest preferred-side ask the coverage
+    /// entry will pay ×1e6. Absent = 0 = no floor.
+    pub entry_min_px_1e6: i64,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -393,6 +399,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         entry_usd_1e6: opt_int(&kv, "entry_usd_1e6", 0)?,
         mark_stale_ns: opt_pos_u64(&kv, "mark_stale_ns", MARK_STALE_NS_DEFAULT)?,
         e_entry_1e6: opt_int(&kv, "e_entry_1e6", E_ENTRY_1E6_DEFAULT)?,
+        entry_min_px_1e6: opt_int(&kv, "entry_min_px_1e6", 0)?,
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -520,6 +527,15 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
              preferred side can ever clear it, so the entry arm would never fire \
              and every instance would read as a quiet book",
             file.e_entry_1e6
+        )));
+    }
+    // Inside the price interval, floor included: 0 is "no floor" and a
+    // floor at or over 1.0 could never be cleared by any ask, so the
+    // entry arm would be silently off.
+    if file.entry_min_px_1e6 < 0 || file.entry_min_px_1e6 >= 1_000_000 {
+        return Err(err(format!(
+            "`entry_min_px_1e6` must be in [0, 1000000) (got {}); absent means 0 = no floor",
+            file.entry_min_px_1e6
         )));
     }
     if file.scale_1e9 <= 0 {
@@ -733,6 +749,28 @@ mod tests {
         // ABSENT OPTIONALS ARE THE STATED DEFAULT, bit for bit.
         assert_eq!(f.hour_ln_off_1e9, [0i64; HOURS], "no hour table = no offset");
         assert_eq!(f.scale_1e9, 1_000_000_000, "no scale = no scaling");
+        assert_eq!(f.entry_min_px_1e6, 0, "no floor = the 2026-09-13 entry law");
+    }
+
+    /// BIN15 R0 (2026-09-19): the coverage entry's price floor is a
+    /// KNOWN optional key (O4b's lesson), it round-trips, and it is
+    /// bounded to the open interval below 1.0 — a floor of 1.0 could
+    /// never be cleared and would switch the entry arm off in silence.
+    #[test]
+    fn the_entry_floor_is_a_known_key_that_round_trips_and_is_bounded() {
+        let src = format!("{}entry_min_px_1e6 = 700000\n", artifact());
+        let f = parse(&src).expect("entry_min_px_1e6 is a known key");
+        assert_eq!(f.entry_min_px_1e6, 700_000);
+        let zero = format!("{}entry_min_px_1e6 = 0\n", artifact());
+        assert_eq!(parse(&zero).expect("an explicit 0").entry_min_px_1e6, 0);
+        let bad: [&str; 2] = ["entry_min_px_1e6 = 1000000", "entry_min_px_1e6 = -1"];
+        let mut i = 0usize;
+        while i < bad.len() {
+            let src = format!("{}{}\n", artifact(), bad[i]);
+            let e = parse(&src).expect_err(bad[i]);
+            assert!(e.0.contains("[0, 1000000)"), "{}: got {}", bad[i], e.0);
+            i += 1;
+        }
     }
 
     /// O4b: the ONE artifact `claude_worker.bin15_fit` writes carries

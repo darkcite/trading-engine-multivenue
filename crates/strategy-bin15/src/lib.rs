@@ -495,6 +495,19 @@ pub struct Bin15Params {
     /// of an arm that trades EVERY instance, so it carries only model
     /// error and the exit-leg fee.
     pub e_entry_1e6: i64,
+    /// BIN15 R0 (2026-09-19): the lowest preferred-side ask the coverage
+    /// entry will pay ×1e6. `0` = no floor, the 2026-09-13 law bit for
+    /// bit.
+    ///
+    /// The entry buys the side `p̂` prefers, so an ask far BELOW the
+    /// belief is not a bargain: it is the venue disagreeing with the
+    /// model, and on the 2026-09-13→18 paper tape the venue won those
+    /// (entries at an ask under 0.50 hit 39 % against a 47.6 c price;
+    /// at 0.70 and over, 85 % against 79.6 c). The floor keeps the
+    /// entry where model and market agree on a favourite. Measured on
+    /// 428 settled submitted entries, t ≈ 1.5 at 0.70 — a research
+    /// setting, not a proven edge.
+    pub entry_min_px_1e6: i64,
     /// BIN15 P0 (F4): the oldest an underlying mark may be and still
     /// price a binary, ns.
     ///
@@ -540,6 +553,7 @@ impl Default for Bin15Params {
             cap_day_usd_1e6: 5_000_000_000,
             entry_usd_1e6: 0,
             e_entry_1e6: 20_000,
+            entry_min_px_1e6: 0,
             // 5 s = ~2-5 missed HL mark prints. Long enough that an
             // ordinary jitter does not hold the member, short enough
             // that a dead feed cannot price a 15-minute binary.
@@ -652,6 +666,11 @@ impl Bin15Strategy {
         }
         if params.e_take_1e6 < GRID_TICK_1E6 {
             return Err(StrategyError::Config("bin15: e_take under one tick"));
+        }
+        if params.entry_min_px_1e6 < 0 || params.entry_min_px_1e6 >= ONE_1E6 {
+            return Err(StrategyError::Config(
+                "bin15: entry_min_px_1e6 outside [0, 1e6) — a floor of 1.0 or more refuses every ask",
+            ));
         }
         if params.requote_ttl_ns == 0 {
             return Err(StrategyError::Config("bin15: requote_ttl_ns is zero"));
@@ -1444,6 +1463,16 @@ impl Bin15Strategy {
             // The belief is `p̂` on the side we are buying: `p̂` for Yes,
             // `1 − p̂` for No.
             let belief = if want_yes { p_hat } else { ONE_1E6 - p_hat };
+            // BIN15 R0 (2026-09-19) — THE PRICE FLOOR, judged before the
+            // bound. An ask under the floor is refused on the same
+            // counter and with the same non-burn as a bound miss: the
+            // flag stays down and the next reprice asks again. `0` is
+            // no floor and this branch is dead, which is the old law.
+            if px < self.params.entry_min_px_1e6 {
+                self.counters.skipped_entry_price =
+                    self.counters.skipped_entry_price.wrapping_add(1);
+                return;
+            }
             if px > belief.saturating_sub(self.params.e_entry_1e6) {
                 // Not an attempt and not a spray: nothing is emitted,
                 // the flag stays down, and the next reprice re-asks the
@@ -4129,6 +4158,46 @@ mod tests {
         assert_eq!(m.family(0).expect("f").covered, 1, "and NOW it is taken");
     }
 
+    /// BIN15 R0 (2026-09-19) — THE PRICE FLOOR. A preferred-side ask
+    /// far under the belief clears the bound (`ask ≤ p̂ − 2 c`) with
+    /// room to spare and is exactly the trade the tape says loses: the
+    /// venue disagreeing with the model. With `entry_min_px_1e6` set
+    /// the entry refuses it on the price counter, keeps the flag down,
+    /// and fires the moment the book comes back over the floor. With
+    /// the floor at 0 the branch is dead and every other test in this
+    /// module is the proof that the old law is untouched.
+    #[test]
+    fn the_entry_refuses_an_ask_under_its_floor_and_keeps_the_instance() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        m.params.entry_usd_1e6 = 50_000_000; // $50
+        m.params.entry_min_px_1e6 = 700_000; // no entry under 0.70
+        m.params.maker_enabled = 0; // the taker alone, so IoCs are its own
+        m.marks[0].sig2_min_1e18[0] = 266_700_000_000;
+        m.on_venue_event(&roll_event(0, 2650, 0, 79_000_000_000, expiry(600), false), &mut c);
+        m.on_venue_event(&mark_event(79_500_000_000, at(62)), &mut c);
+        // A deep YES belief against a Yes ask of 0.60: the bound is
+        // cleared by a mile, the floor is not.
+        m.on_tick(&tick(yes_sym(0), 590_000, 600_000, 1_000_000_000, at(63), false), &mut c);
+        m.on_tick(&tick(no_sym(0), 400_000, 410_000, 1_000_000_000, at(63), false), &mut c);
+        m.on_venue_event(&mark_event(79_500_000_000, at(64)), &mut c);
+        let p_hat = m.family(0).expect("f").p_hat_1e6;
+        assert!(p_hat > 700_000, "the fixture must be a belief over the floor: {p_hat}");
+        assert!(c.orders.is_empty(), "nothing is bought under the floor");
+        assert_eq!(m.counters().takes_submitted, 0);
+        assert!(m.counters().skipped_entry_price > 0, "and the refusal is counted");
+        assert_eq!(m.family(0).expect("f").covered, 0, "the instance is NOT burned");
+
+        // The same instance, one tick later, offered at 0.75: over the
+        // floor and still under the belief, so the entry fires.
+        m.on_tick(&tick(yes_sym(0), 740_000, 750_000, 1_000_000_000, at(65), false), &mut c);
+        m.on_venue_event(&mark_event(79_500_000_000, at(66)), &mut c);
+        let t: Vec<core_types::Order> =
+            c.orders.iter().filter(|o| o.kind == ORDER_KIND_IOC).copied().collect();
+        assert_eq!(t.len(), 1, "one coverage entry over the floor");
+        assert_eq!(t[0].px.raw(), 750_000);
+        assert_eq!(m.family(0).expect("f").covered, 1);
+    }
     /// BIN15 P3 (F6) — RETRY ON REFUSAL.
     ///
     /// A cap, grid or ring refusal used to burn the instance's only

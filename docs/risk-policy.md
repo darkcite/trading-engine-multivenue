@@ -4298,7 +4298,17 @@ testnet outcome 20182, so the family existed there on 2026-09-19).
 Bars — the same shape as §9, on testnet:
 
 * **R0 (plumbing)** — `maker_enabled = 0`, `e_take_1e6 = 900000`,
-  `entry_usd_1e6 = 10000000`. Bar: ≥ 96 submitted entries, ≥ 1 venue
+  `entry_usd_1e6 = 12000000` (NOT $10: the grid floors the size to
+  whole contracts and then refuses notional under $10, so a $10 entry
+  is `skipped_grid` at almost every ask — vault doc 21 §2.2), and, per
+  the operator's 2026-09-19 ruling for the testnet account (1,000 USDC,
+  trade within 500, as many winning bids as possible even if small):
+  `cap_day_usd_1e6 = 500000000`, `cap_instance_usd_1e6 = 20000000`,
+  `entry_min_px_1e6 = 500000` (the new optional price floor;
+  `700000` is the higher-win-rate alternative), mirrored in
+  `exec.toml` (`max_order_usd_1e6 = 20000000`, `max_open_orders = 4`,
+  the same two caps). O-E4's "caps stay as paper" is superseded for the
+  TESTNET ramp by that ruling; the mainnet caps are a later ruling. Bar: ≥ 96 submitted entries, ≥ 1 venue
   fill, `engine_exec_hl_recon_ok_total` climbing with
   `recon_drift_legs = 0` and `recon_unseen_legs = 0`,
   `unknown_fills = 0`, `refused_no_route = 0`, `fills_unowned = 0`,
