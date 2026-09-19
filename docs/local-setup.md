@@ -333,8 +333,11 @@ Operational laws:
   boot so the seed reaches the boot minute — the fast profile no longer
   spends its first hour UNKNOWN after a restart.
 - **NEWS lane** (NEWS spec §12; `claude_worker.news` MODULE — never a
-  verb; 60-second `com.multivenue.news` agent via
-  `scripts/news-cycle.sh`, installed by the same installer): honest
+  verb; 120-second `com.multivenue.news` agent via
+  `scripts/news-cycle.sh`, which execs `scripts/news-cycle-run.py`
+  through the aliased venv so a cycle trips NO other lane's overlap
+  guard — it yields to every lane and blocks none; installed by the
+  same installer): honest
   no-op until `~/multivenue/news.toml` exists (copy
   `news.toml.example`, set `[news] user_agent` to something carrying a
   real contact — the SEC refuses a browser UA — and fill

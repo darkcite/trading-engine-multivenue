@@ -1,12 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- NEWS aggregation cycle (TEMPLATE — rendered by install-launchd.sh;
-     NEWS spec §12): every 60 s the worker fetches every DUE source,
+     NEWS spec §12): every 120 s the worker fetches every DUE source,
      parses it, runs tier 0 and stores the result under
      ~/multivenue/worker/news/. Per-source due times mean most slots
      fetch only a handful. No model is reached here. Absent
      ~/multivenue/news.toml = no-op; any live worker invocation
-     (including serve) makes the slot skip. -->
+     (including serve) makes the slot skip — but a cycle is INVISIBLE
+     to every other lane's guard (scripts/news-cycle-run.py), so it
+     never makes regime or candles skip. 120 s, not 60: a cycle is
+     network-bound at 25-31 s and per-source poll_s still governs
+     when each source is actually due. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.multivenue.news</string>
@@ -15,7 +19,7 @@
     <string>@REPO@/scripts/news-cycle.sh</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>60</integer>
+  <key>StartInterval</key><integer>120</integer>
   <key>StandardOutPath</key><string>@HOME@/multivenue/logs/launchd/news.log</string>
   <key>StandardErrorPath</key><string>@HOME@/multivenue/logs/launchd/news.log</string>
 </dict>

@@ -375,7 +375,7 @@ def test_the_shipped_policy_example_parses_and_keeps_every_mode_conservative() -
 def test_the_launchd_job_is_wired_into_the_installer_and_the_cycle_script() -> None:
     plist = (REPO_ROOT / "launchd" / "com.multivenue.news.plist").read_text(encoding="utf-8")
     assert "<string>com.multivenue.news</string>" in plist
-    assert "<key>StartInterval</key><integer>60</integer>" in plist
+    assert "<key>StartInterval</key><integer>120</integer>" in plist
     assert "@REPO@/scripts/news-cycle.sh" in plist
 
     installer = (REPO_ROOT / "scripts" / "install-launchd.sh").read_text(encoding="utf-8")
@@ -383,8 +383,58 @@ def test_the_launchd_job_is_wired_into_the_installer_and_the_cycle_script() -> N
 
     script = (REPO_ROOT / "scripts" / "news-cycle.sh").read_text(encoding="utf-8")
     assert "multivenue/news.toml" in script          # absent artifact = no-op
-    assert "pgrep -f 'claude[-_]worke[r]'" in script  # the serialization guard
-    assert "claude_worker.news cycle" in script
+    assert "pgrep -f 'claude[-_]worke[r]'" in script  # it yields to every lane
+    assert "pgrep -f 'news-cycle-ru[n]" in script     # and to itself
+
+
+def test_a_cycle_is_invisible_to_every_other_lanes_overlap_guard() -> None:
+    """The CMDLINE LAW, inverted for this one lane.
+
+    A cycle is network-bound and runs 25-31 s of its slot (40-50 sources
+    fetched in series), so an argv carrying `claude_worker` would make the
+    5-minute regime cycle skip about half its slots and the hourly candles
+    cycle skip whenever the two met. It therefore runs
+    `scripts/news-cycle-run.py` through the venv ALIASED at
+    ~/multivenue/venv — `dashboard.sh`'s precedent — and the resulting
+    argv, measured on the Mac 2026-09-19, is
+    `~/multivenue/venv/bin/python3 <repo>/scripts/news-cycle-run.py`,
+    which matches no guard.
+
+    That is safe ONLY because this lane shares no writer with any other:
+    the law exists to protect `state.db`'s single seq namespace, and the
+    last assertion here is what keeps that premise true — if a later step
+    opens a second database from this package, this test fails and the
+    invisibility has to be reconsidered before it becomes a corruption.
+    """
+    script = (REPO_ROOT / "scripts" / "news-cycle.sh").read_text(encoding="utf-8")
+    lines = script.splitlines()
+    code: list[str] = []
+    for i in range(len(lines)):
+        stripped = lines[i].strip()
+        if stripped and not stripped.startswith("#"):
+            code.append(stripped)
+    body = "\n".join(code)
+    # The comments may name the module freely; what matters is what RUNS.
+    assert '"$ALIAS/bin/python3" "$REPO/scripts/news-cycle-run.py"' in body
+    assert "claude_worker" not in body, "the module name is back in the argv"
+    # The real venv path DOES carry `claude-worker`, which is the whole
+    # reason for the alias — so it may appear where the symlink is
+    # resolved, and nowhere else.
+    carriers: list[str] = []
+    for i in range(len(code)):
+        if "claude-worker" in code[i]:
+            carriers.append(code[i])
+    assert carriers == ['VENV="$REPO/claude-worker/.venv"'], carriers
+    runner = REPO_ROOT / "scripts" / "news-cycle-run.py"
+    assert runner.is_file()
+    assert "SPDX-License-Identifier: Apache-2.0" in runner.read_text(encoding="utf-8")
+
+    package = REPO_ROOT / "claude-worker" / "src" / "claude_worker" / "news"
+    holders: list[str] = []
+    for path in sorted(package.glob("*.py")):
+        if "sqlite3.connect" in path.read_text(encoding="utf-8"):
+            holders.append(path.name)
+    assert holders == ["store.py"], "the news lane opened a second database"
 
 
 def test_no_lane_can_reach_a_model(
