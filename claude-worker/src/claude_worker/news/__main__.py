@@ -35,6 +35,7 @@ import httpx
 
 import claude_worker.news
 import claude_worker.news.cycle
+import claude_worker.news.detect
 import claude_worker.news.filter
 import claude_worker.news.sources
 import claude_worker.news.store
@@ -133,6 +134,7 @@ def _cycle(args: argparse.Namespace) -> int:
     vocab = claude_worker.news.filter.vocabulary_from(
         paths.market_map_path, paths.replay_dir, registry.keywords
     )
+    ctx = claude_worker.news.detect.context_from(paths)
     with claude_worker.news.store.Store(paths.db_path) as store:
         claude_worker.news.cycle.register_sources(store, registry)
         recent, used = claude_worker.news.cycle.load_recent(store, registry, now_ts)
@@ -152,6 +154,7 @@ def _cycle(args: argparse.Namespace) -> int:
                 now_ns=now_ns,
                 now_ts=now_ts,
                 take_until_ns=take_until,
+                ctx=ctx,
             )
         pruned = store.prune(
             now_ts,

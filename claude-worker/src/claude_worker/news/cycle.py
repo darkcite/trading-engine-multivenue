@@ -23,6 +23,7 @@ import dataclasses
 import time
 import typing
 
+import claude_worker.news.detect
 import claude_worker.news.filter
 import claude_worker.news.sources
 import claude_worker.news.store
@@ -54,6 +55,11 @@ class CycleStats:
     snapshots: int = 0
     series: int = 0
     events: int = 0
+    closed: int = 0
+    proposals: int = 0
+    xsd_rows: int = 0
+    alerts: int = 0
+    calendar: int = 0
     resolved: int = 0
     parse_empty: int = 0
     refused_origin: int = 0
@@ -77,7 +83,9 @@ class CycleStats:
             f"  parse_empty={self.parse_empty} refused_origin={self.refused_origin} "
             f"budget={self.budget} paced={self.paced} http={self.http} "
             f"transport={self.transport} skipped_deadline={self.deadline_skipped} "
-            f"snapshots={self.snapshots} series={self.series} dup_items={self.items_dup}"
+            f"snapshots={self.snapshots} series={self.series} dup_items={self.items_dup} "
+            f"closed={self.closed} proposals={self.proposals} xsd_rows={self.xsd_rows} "
+            f"alerts={self.alerts} calendar={self.calendar}"
         )
 
 
@@ -191,17 +199,36 @@ def _store_item(
     return inserted
 
 
+def _fold(
+    stats: CycleStats,
+    outcome: claude_worker.news.detect.Outcome,
+    alerts: list[claude_worker.news.detect.Alert],
+) -> None:
+    """One class-A observation's effect on the pass. A snapshot whose body
+    did not move is NOT counted as stored, because it was not stored (spec
+    §8.1)."""
+    if outcome.snapshot_stored:
+        stats.snapshots += 1
+    stats.events += outcome.events
+    stats.closed += outcome.closed
+    stats.proposals += outcome.proposals
+    stats.xsd_rows += outcome.xsd_rows
+    alerts.extend(outcome.alerts)
+
+
 def _ingest(  # noqa: PLR0913 — the whole tier-0 pipeline for one source
     store: claude_worker.news.store.Store,
     parsed: claude_worker.news.sources.Parsed,
     *,
-    source_name: str,
+    source: claude_worker.news.sources.Source,
     settings: claude_worker.news.sources.NewsSettings,
     vocab: claude_worker.news.filter.Vocabulary,
     recent: claude_worker.news.filter.RecentTitles,
     caps: claude_worker.news.filter.Caps,
     stats: CycleStats,
     now_ts: int,
+    alerts: list[claude_worker.news.detect.Alert],
+    ctx: claude_worker.news.detect.Context | None,
 ) -> None:
     for i in range(len(parsed.items)):
         item = parsed.items[i]
@@ -227,11 +254,11 @@ def _ingest(  # noqa: PLR0913 — the whole tier-0 pipeline for one source
                 claude_worker.news.filter.tokens(item.title),
             )
     if parsed.snapshot is not None:
-        store.insert_snapshot(*parsed.snapshot)
-        stats.snapshots += 1
+        outcome = claude_worker.news.detect.observe(store, source, parsed.snapshot, now_ts, ctx)
+        _fold(stats, outcome, alerts)
     for i in range(len(parsed.series)):
         key, ts, value = parsed.series[i]
-        store.insert_series(source_name, key, ts, value)
+        store.insert_series(source.name, key, ts, value)
 
 
 def aggregate_once(  # noqa: PLR0913 — the composition root of one pass
@@ -246,6 +273,7 @@ def aggregate_once(  # noqa: PLR0913 — the composition root of one pass
     now_ts: int,
     clock_ns: typing.Callable[[], int] = time.monotonic_ns,
     take_until_ns: int | None = None,
+    ctx: claude_worker.news.detect.Context | None = None,
 ) -> CycleStats:
     """Fetch every due source once, parse it, tier-0 its items, store the lot.
 
@@ -254,6 +282,7 @@ def aggregate_once(  # noqa: PLR0913 — the composition root of one pass
     must not stop the other thirty-two.
     """
     stats = CycleStats()
+    alerts: list[claude_worker.news.detect.Alert] = []
     started = clock_ns()
     due = fetcher.due(now_ns)
     stats.sources = len(due)
@@ -293,14 +322,19 @@ def aggregate_once(  # noqa: PLR0913 — the composition root of one pass
         _ingest(
             store,
             parsed,
-            source_name=source.name,
+            source=source,
             settings=registry.settings,
             vocab=vocab,
             recent=recent,
             caps=caps,
             stats=stats,
             now_ts=now_ts,
+            alerts=alerts,
+            ctx=ctx,
         )
         store.add_items_total(source.name, stats.items_new - before)
+    final = claude_worker.news.detect.finalize(store, registry, now_ts, alerts, ctx)
+    stats.calendar = final.calendar_events
+    stats.alerts = final.alerts
     stats.elapsed_ms = max(0, (clock_ns() - started) // 1_000_000)
     return stats

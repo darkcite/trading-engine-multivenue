@@ -547,6 +547,48 @@ class Store:
     def events_since(self, since_ts: int) -> list[dict[str, object]]:
         return self._rows("SELECT * FROM events WHERE at_ts >= ? ORDER BY at_ts", (since_ts,))
 
+    def open_events(
+        self, kind: str, venue: str, instrument: str = ""
+    ) -> list[dict[str, object]]:
+        """Rows of ``kind`` on ``venue`` that carry NO end yet.
+
+        The detectors' one case the dedupe key cannot cover: an outage a
+        venue publishes as a flag has no ``begin`` to key on, so it is
+        opened once and closed by an update (spec §8.2, "never a second
+        row"). This is both the guard against that second row and the
+        lookup that finds the row to close.
+        """
+        return self._rows(
+            """
+            SELECT * FROM events
+            WHERE kind = ? AND venue = ? AND instrument = ? AND until_ts = 0
+            ORDER BY id
+            """,
+            (kind, venue, instrument),
+        )
+
+    def close_event(self, event_id: int, until_ts: int) -> bool:
+        """End an open event. False when it was already closed — closing is
+        idempotent, so a venue reporting clear twice writes once."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE events SET until_ts = ? WHERE id = ? AND until_ts = 0",
+                (until_ts, event_id),
+            )
+        return cursor.rowcount > 0
+
+    def events_in_force(self, kind: str, now_ts: int) -> list[dict[str, object]]:
+        """Rows of ``kind`` whose window covers ``now_ts``: begun, and
+        either open-ended or not yet ended."""
+        return self._rows(
+            """
+            SELECT * FROM events
+            WHERE kind = ? AND at_ts <= ? AND (until_ts = 0 OR until_ts > ?)
+            ORDER BY id
+            """,
+            (kind, now_ts, now_ts),
+        )
+
     # ---- cascade -------------------------------------------------------
 
     def put_triage(self, row: typing.Mapping[str, object]) -> None:
