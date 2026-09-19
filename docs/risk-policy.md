@@ -2395,3 +2395,33 @@ name says. `exec-smoke --requote` requires both.
 would also hold for a readback that found nothing at all — the
 "agreement over an empty set" this lane shipped once already in E4's
 reconciliation, and the loopback now pins it with an empty book.
+
+#### MEASURED, testnet, 2026-09-19 02:12Z — §7.1 is met
+
+`exec-smoke --requote --asset 100201820 --px 30000000 --px2 31000000
+--sz 4000000000`. A post-only BUY of 40 contracts at 0.30 on the Yes
+leg of outcome 20182, moved to 0.31, in a book quoting 0.499 / 0.539 —
+far enough away that a post-only order rests rather than being refused
+for crossing.
+
+```
+old 0xe35c000000000000000001a0b76f96ee
+new 0xe35c000000000000000001a0b76f96ef
+placed 60483073670 -> modified 60483074057
+old_cancel_refused true   new_cancel_succeeded true
+new_resting true   old_resting false   readback_failed false
+unswept_old false   unswept_new false
+```
+
+**The venue's own book confirmed it**, which is the half §7.1 asked for
+and the half the two cancel outcomes could only infer:
+`frontendOpenOrders`, read between the modify and the cancels, showed
+exactly one order resting and it carried the NEW cloid.
+
+The modify issued a NEW oid again (`…3670` → `…4057`), as it did at
+commit 1 — the third independent observation that cancel-by-cloid is
+the durable handle and an oid captured at placement is not.
+
+Run under the standing engine's own laws: `cargo build --release -p
+cli` first (G0), the launchd instance booted out for the window and
+bootstrapped back after, nothing left resting.
