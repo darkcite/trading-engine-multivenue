@@ -59,6 +59,7 @@
 #![deny(clippy::missing_safety_doc, clippy::undocumented_unsafe_blocks)]
 
 pub mod counters;
+pub mod halt;
 pub mod ledger;
 pub mod mode;
 pub mod null;
@@ -66,8 +67,9 @@ pub mod route;
 pub mod routed;
 
 pub use counters::{RiskRefusal, RouteCounters};
+pub use halt::{HaltReason, HaltState};
 pub use ledger::{Ledger, LedgerCounters, LEDGER_RESTING, LEDGER_ROWS};
 pub use mode::ExecMode;
 pub use null::NullLiveDispatcher;
-pub use route::{ExecRoute, ExecRouteErr, SlotCaps, EXEC_SLOTS, EXEC_VENUES};
+pub use route::{ExecRoute, ExecRouteErr, HaltLimits, SlotCaps, EXEC_SLOTS, EXEC_VENUES};
 pub use routed::RoutedDispatcher;

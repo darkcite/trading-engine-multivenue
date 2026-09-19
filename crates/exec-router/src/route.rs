@@ -150,6 +150,67 @@ impl SlotCaps {
     }
 }
 
+/// **E6 — one slot's halt thresholds.**
+///
+/// A struct beside [`SlotCaps`], for the same reason: four numbers,
+/// three of them the same type, read out of a parsed table.
+///
+/// `0` means UNSET for every field, and `core_config::exec` refuses a
+/// live slot that leaves any of them at zero — a halt trigger with no
+/// threshold is a sensor wired to nothing, which an operator would
+/// only discover by the halt never firing.
+///
+/// **The sensors are VENUE-WIDE; the thresholds are PER-SLOT.** A
+/// reject streak, a WS gap and a reconciliation drift are properties
+/// of the arm, not of any one member. Each live slot compares the
+/// arm's signal against its own numbers, so a slot with a tighter
+/// threshold halts first and a slot on a different venue is
+/// untouched.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HaltLimits {
+    /// Reconciliation drift, USD ×1e6, that trips a halt.
+    pub recon_drift_usd_1e6: i64,
+    /// Milliseconds without the venue's user-event stream.
+    pub ws_gap_ms: i64,
+    /// Consecutive venue rejections.
+    pub reject_streak: u32,
+    /// Consecutive LAW E-4 refusals (an order naming a rolled
+    /// instance).
+    pub asset_refusal_streak: u32,
+}
+
+impl HaltLimits {
+    /// Every threshold unset. Usable in `const`.
+    #[inline]
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            recon_drift_usd_1e6: 0,
+            ws_gap_ms: 0,
+            reject_streak: 0,
+            asset_refusal_streak: 0,
+        }
+    }
+
+    /// Build a set of thresholds.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        reject_streak: u32,
+        recon_drift_usd_1e6: i64,
+        ws_gap_ms: i64,
+        asset_refusal_streak: u32,
+    ) -> Self {
+        Self {
+            recon_drift_usd_1e6,
+            ws_gap_ms,
+            reject_streak,
+            asset_refusal_streak,
+        }
+    }
+}
+
 /// The per-slot routing decision, fixed at boot and never mutated
 /// afterwards (E6's kill switches flip counters and a halt flag, not
 /// this table — a halted slot refuses, it does not silently re-route).
@@ -173,7 +234,11 @@ pub struct ExecRoute {
     cap_instance_usd_1e6: [i64; EXEC_SLOTS],
     /// **E6** — per-slot day clamp, USD x1e6, filled buy turnover.
     cap_day_usd_1e6: [i64; EXEC_SLOTS],
-    /// Pad to exactly FOUR cache lines (256 B). E1 reserved 16 B here
+    /// **E6 commit 3** — per-slot halt thresholds.
+    halts: [HaltLimits; EXEC_SLOTS],
+    /// Pad the pre-E6-commit-3 fields to a whole number of lines
+    /// (256 B, four of them), so the halt table that follows starts
+    /// on a line boundary. E1 reserved 16 B here
     /// "for E6's clamps"; E6 needs 128 B, so the struct grew by two
     /// lines. What the reservation actually bought is what it was for:
     /// the hot arrays did not move. `modes` and `venue_mask` are still
@@ -205,6 +270,7 @@ impl ExecRoute {
             max_open_orders: [0u32; EXEC_SLOTS],
             cap_instance_usd_1e6: [0i64; EXEC_SLOTS],
             cap_day_usd_1e6: [0i64; EXEC_SLOTS],
+            halts: [HaltLimits::none(); EXEC_SLOTS],
             _pad: [0u8; 16],
         }
     }
@@ -223,6 +289,7 @@ impl ExecRoute {
         mode: ExecMode,
         venues: &[u8],
         caps: SlotCaps,
+        halts: HaltLimits,
     ) -> Result<(), ExecRouteErr> {
         if slot >= EXEC_SLOTS {
             return Err(ExecRouteErr::SlotOutOfRange(slot));
@@ -243,6 +310,7 @@ impl ExecRoute {
         self.max_open_orders[slot] = caps.max_open_orders;
         self.cap_instance_usd_1e6[slot] = caps.cap_instance_usd_1e6;
         self.cap_day_usd_1e6[slot] = caps.cap_day_usd_1e6;
+        self.halts[slot] = halts;
         Ok(())
     }
 
@@ -396,6 +464,16 @@ impl ExecRoute {
         })
     }
 
+    /// **E6 commit 3** — the slot's halt thresholds. Cold.
+    #[inline]
+    #[must_use]
+    pub fn halts_at(&self, slot: usize) -> Option<HaltLimits> {
+        if slot >= EXEC_SLOTS {
+            return None;
+        }
+        Some(self.halts[slot])
+    }
+
     /// Is any slot live? Cold; decides whether the engine needs a live
     /// arm at all.
     #[inline]
@@ -411,8 +489,9 @@ mod tests {
     use core_types::{STRATEGY_ID_NONE, STRATEGY_SLOT_BIN15};
 
     #[test]
-    fn layout_is_four_cache_lines_with_the_hot_arrays_first() {
-        assert_eq!(core::mem::size_of::<ExecRoute>(), 256, "four cache lines");
+    fn layout_is_seven_cache_lines_with_the_hot_arrays_first() {
+        assert_eq!(core::mem::size_of::<ExecRoute>(), 448, "seven cache lines");
+        assert_eq!(core::mem::size_of::<HaltLimits>(), 24, "HaltLimits is 24 B");
         assert_eq!(core::mem::size_of::<SlotCaps>(), 32, "SlotCaps is 32 B");
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
         // The hot arrays must sit inside the FIRST cache line, or the
@@ -442,7 +521,7 @@ mod tests {
         // un-stamped order would inherit slot 7's mode — this is the
         // exact aliasing the `in_range` multiply exists to kill.
         let mut r = ExecRoute::all_paper();
-        r.set_slot(7, ExecMode::Live, &[4], SlotCaps::none()).unwrap();
+        r.set_slot(7, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
         assert_eq!(r.mode(7), ExecMode::Live);
         assert_eq!(r.mode(STRATEGY_ID_NONE), ExecMode::Paper);
         assert!(!r.venue_allowed(STRATEGY_ID_NONE, 4));
@@ -457,6 +536,7 @@ mod tests {
                 ExecMode::Live,
                 &[0, 1, 2, 3, 4, 5, 6],
                 SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, u32::MAX),
+                HaltLimits::none(),
             )
                 .unwrap();
         }
@@ -480,6 +560,7 @@ mod tests {
             ExecMode::Live,
             &[4],
             SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+            HaltLimits::none(),
         )
         .unwrap();
 
@@ -503,7 +584,7 @@ mod tests {
     #[test]
     fn a_wild_venue_byte_never_panics_and_never_allows() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(3, ExecMode::Live, &[4], SlotCaps::none()).unwrap();
+        r.set_slot(3, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
         // Bit 4 is set; without the `venue_ok` term, venue 12
         // (12 & 7 == 4) would alias onto it.
         for v in EXEC_VENUES..=255 {
@@ -514,7 +595,7 @@ mod tests {
     #[test]
     fn off_is_distinct_from_paper() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none()).unwrap();
+        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none(), HaltLimits::none()).unwrap();
         assert_eq!(r.mode(6), ExecMode::Off);
         assert_eq!(r.off_mask(), 0b0100_0000);
         assert_eq!(r.live_mask(), 0);
@@ -525,11 +606,11 @@ mod tests {
     fn out_of_range_writes_are_refused_not_wrapped() {
         let mut r = ExecRoute::all_paper();
         assert_eq!(
-            r.set_slot(EXEC_SLOTS, ExecMode::Live, &[4], SlotCaps::none()),
+            r.set_slot(EXEC_SLOTS, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()),
             Err(ExecRouteErr::SlotOutOfRange(EXEC_SLOTS))
         );
         assert_eq!(
-            r.set_slot(3, ExecMode::Live, &[EXEC_VENUES], SlotCaps::none()),
+            r.set_slot(3, ExecMode::Live, &[EXEC_VENUES], SlotCaps::none(), HaltLimits::none()),
             Err(ExecRouteErr::VenueOutOfRange(EXEC_VENUES))
         );
         // A refused write leaves the table untouched.
@@ -544,6 +625,7 @@ mod tests {
             ExecMode::Live,
             &[4, 6],
             SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+            HaltLimits::none(),
         )
         .unwrap();
         assert_eq!(r.mode_at(3), Some(ExecMode::Live));

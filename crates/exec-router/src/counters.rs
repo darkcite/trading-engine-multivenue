@@ -30,6 +30,8 @@ pub enum RiskRefusal {
     /// The ledger has never been reconciled against the venue, so
     /// none of the three ledger-fed numbers can be trusted.
     Unseeded,
+    /// The slot is halted. See `crate::halt`.
+    Halted,
 }
 
 /// Router counters. `Copy` POD; every field saturates rather than
@@ -107,6 +109,11 @@ pub struct RouteCounters {
     /// their orders are being refused, which is the same defect as
     /// `refused_risk`'s changed meaning above, made twice.
     pub refused_unseeded: u64,
+    /// **E6 commit 3** — the slot is HALTED. Sticky, never
+    /// self-clearing, and cleared only by an operator. A cancel never
+    /// contributes: it does not go through the risk gate at all, so a
+    /// halted slot can always get flat.
+    pub refused_halted: u64,
     /// Per-slot live submits. Index = `strategy_id`.
     pub live_submits_by_slot: [u64; EXEC_SLOTS],
     /// Per-slot refusals — EVERY reason (off, no-route, and E6's risk
@@ -134,6 +141,7 @@ impl RouteCounters {
             refused_cap_day: 0,
             refused_open_orders: 0,
             refused_unseeded: 0,
+            refused_halted: 0,
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
         }
@@ -194,6 +202,7 @@ impl RouteCounters {
             RiskRefusal::CapDay => &mut self.refused_cap_day,
             RiskRefusal::OpenOrders => &mut self.refused_open_orders,
             RiskRefusal::Unseeded => &mut self.refused_unseeded,
+            RiskRefusal::Halted => &mut self.refused_halted,
         };
         *field = field.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);

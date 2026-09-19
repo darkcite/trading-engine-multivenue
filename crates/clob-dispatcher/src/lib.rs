@@ -585,6 +585,76 @@ pub trait OrderDispatch {
     #[inline]
     fn on_fill_booked(&mut self, _fill: &Fill) {}
 
+    /// **E6 commit 3 — what the venue relationship looks like from
+    /// inside the arm.**
+    ///
+    /// Defaulted to an all-zero signal, which trips nothing: a
+    /// dispatcher that models rather than trades has no venue to be
+    /// unhappy about. The one implementor is the Hyperliquid arm.
+    ///
+    /// Three of E6's halt triggers — the request-budget floor,
+    /// reconciliation drift and the user-event stream gap — are
+    /// visible ONLY inside the arm, which owns the sockets. The
+    /// component that has to REFUSE is the router. This is how the
+    /// first reaches the second: a `Copy` POD the router polls, on
+    /// the same thread, with no lock and no cross-arm reach — the
+    /// same shape [`Self::exec_counters`] and
+    /// [`Self::matcher_counters`] already have.
+    ///
+    /// Polled, not pushed, because a push would mean the arm deciding
+    /// policy. The arm reports what it saw; the router owns the
+    /// thresholds and the latch.
+    #[inline]
+    fn halt_signal(&self) -> HaltSignal {
+        HaltSignal::default()
+    }
+
+    /// **E6 commit 3 — REQUEST that every order come off the venue.**
+    ///
+    /// This is a request, not a confirmation. [`Self::cancel_all_state`]
+    /// is the confirmation, and the two are separate methods because
+    /// on a real venue they are separated by minutes: this arm queues
+    /// a sweep per live leg, and the sweep drains over many idle
+    /// moments, asking the venue what is resting and cancelling by
+    /// oid.
+    ///
+    /// Collapsing the two — reading `Ok(())` as "the venue is clear"
+    /// — is a fail-OPEN error, and one this lane made: the caller
+    /// stops retrying and zeroes its resting count while the orders
+    /// are still working.
+    ///
+    /// Defaulted to `Ok(())` — a paper matcher's orders are not on
+    /// any venue, so there is nothing to take back and reporting
+    /// failure would halt a boot that has nothing at risk.
+    ///
+    /// `Err` means the request itself did not land. The caller halts
+    /// anyway — waiting for a successful cancel before refusing would
+    /// keep submitting into the condition that tripped the halt — and
+    /// asks again from the idle path.
+    ///
+    /// # Errors
+    /// Whatever stopped the arm accepting the request.
+    #[inline]
+    fn cancel_all(&mut self) -> Result<(), DispatchError> {
+        Ok(())
+    }
+
+    /// **Is the venue actually clear of this arm's orders?**
+    ///
+    /// Polled after [`Self::cancel_all`] until it answers
+    /// [`CancelAllState::Clear`]. Three-valued rather than a `bool`
+    /// for the same reason the ledger's lookup is: the caller's
+    /// response to "still working" and to "gave up" are opposite —
+    /// wait, versus ask again — and a `bool` would force one of them
+    /// to be guessed.
+    ///
+    /// Defaulted to `Clear`: an arm that cancels synchronously really
+    /// is clear by the time `cancel_all` has returned.
+    #[inline]
+    fn cancel_all_state(&self) -> CancelAllState {
+        CancelAllState::Clear
+    }
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly
@@ -598,6 +668,107 @@ pub trait OrderDispatch {
         ExecCounters::default()
     }
 }
+
+/// **What the venue has told us about a requested cancel-all.**
+///
+/// `OrderDispatch::cancel_all` asks; this answers. The distinction is
+/// not pedantry: on Hyperliquid a cancel-all becomes one queued sweep
+/// per live leg, each of which asks the venue what is resting and
+/// cancels by oid, over many idle moments. There is a long interval
+/// during which the request has been accepted and the orders are
+/// still working.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum CancelAllState {
+    /// **The venue said nothing of ours is resting.** The only value
+    /// that entitles a caller to act as though its orders are gone.
+    #[default]
+    Clear = 0,
+    /// A sweep is in flight. The arm is still working on it, so the
+    /// caller waits rather than asking again — the sweep already
+    /// running IS the retry.
+    Working = 1,
+    /// **The arm has stopped, and the venue was never confirmed
+    /// clear.** A sweep spent its retries and was abandoned, or a leg
+    /// could not be queued at all. The caller must ask again; a fresh
+    /// request gives the leg fresh retries.
+    ///
+    /// Never `Clear` by omission: a leg nobody swept and nobody
+    /// confirmed is exactly the stranded quote LAW E-8 exists to
+    /// prevent, and reporting it as clear is how it would become
+    /// invisible.
+    Stranded = 2,
+}
+
+/// **E6 commit 3 — the venue relationship, as the arm sees it.**
+///
+/// Every field is a RAW OBSERVATION, never a decision: the arm
+/// reports, the router owns the thresholds. That split is what lets
+/// two slots with different `halt_on_*` numbers reach different
+/// conclusions from one signal.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HaltSignal {
+    /// Nanoseconds since the venue's user-event stream was last known
+    /// alive. `0` means "no observation" — a boot that has not
+    /// connected yet, or an arm with no stream — and trips nothing,
+    /// because an arm that has never been up is not an arm that has
+    /// gone quiet.
+    ///
+    /// **LAW E-5: the WS stream is the FILL.** A gap is not a quiet
+    /// market; it is the arm trading with no idea what has filled.
+    pub ws_gap_ns: u64,
+    /// Worst reconciliation drift observed, USD ×1e6, as
+    /// `exec_hyperliquid::recon::drift_qty_to_usd_1e6` measures it.
+    /// Not a running total: the worst single disagreement.
+    pub recon_drift_usd_1e6: i64,
+    /// CONSECUTIVE orders the venue understood and refused. Reset by
+    /// an acceptance. Distinct from a total: a venue refusing every
+    /// order is a different fact from a venue that has refused a few
+    /// over a long boot.
+    pub reject_streak: u32,
+    /// CONSECUTIVE submits refused locally because the order named an
+    /// instance that has rolled (LAW E-4). Reset by an acceptance.
+    pub asset_refusal_streak: u32,
+    /// `1` when the address request budget is at or below its floor.
+    pub budget_floor_breached: u8,
+    /// `1` once the arm has reconciled against the venue at least
+    /// once since boot.
+    ///
+    /// Not a halt trigger — the opposite. It is what lets the router
+    /// call `Ledger::mark_seeded` and stop refusing every live place,
+    /// and it rides here because it is the same question ("what does
+    /// the arm know about the venue?") answered by the same poll.
+    pub reconciled: u8,
+    /// Explicit tail padding.
+    _pad: [u8; 6],
+}
+
+impl HaltSignal {
+    /// Build a signal. The arm is the only caller.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        ws_gap_ns: u64,
+        recon_drift_usd_1e6: i64,
+        reject_streak: u32,
+        asset_refusal_streak: u32,
+        budget_floor_breached: bool,
+        reconciled: bool,
+    ) -> Self {
+        Self {
+            ws_gap_ns,
+            recon_drift_usd_1e6,
+            reject_streak,
+            asset_refusal_streak,
+            budget_floor_breached: budget_floor_breached as u8,
+            reconciled: reconciled as u8,
+            _pad: [0; 6],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<HaltSignal>() == 32);
 
 /// Strategy slots [`ExecCounters`] reports on. Mirrors
 /// `exec_router::EXEC_SLOTS`; the two are asserted equal in

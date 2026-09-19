@@ -288,6 +288,14 @@ pub struct HlExecCounters {
     /// cancels; non-zero means it does not, and that the sweep is
     /// making no progress.
     pub sweep_stalled: u64,
+    /// **E6 commit 3** — `cancel_all` calls. One per halt edge, plus
+    /// one per retry while the venue is not yet clear.
+    pub cancel_all_runs: u64,
+    /// **E6 commit 3** — live legs `cancel_all` could not queue a
+    /// sweep for, because the pending-sweep table was full. Non-zero
+    /// means a halted arm still has orders the engine has not asked
+    /// the venue to remove.
+    pub cancel_all_unqueued: u64,
 }
 
 /// Which budget rule an action answers to.
@@ -507,6 +515,30 @@ pub struct HlExchange<const FILL_N: usize> {
     last_persist: Instant,
     /// Consecutive connect failures, indexing [`WS_BACKOFF`].
     ws_fail_streak: u32,
+    /// **E6 commit 3** — when the user-event stream was last known
+    /// ALIVE: a pump that returned without error, whether or not it
+    /// carried messages. A quiet socket is alive; a socket that
+    /// cannot be read is not.
+    ///
+    /// `None` = never up, which reports as "no observation" rather
+    /// than as an infinite gap — an arm that has not connected yet is
+    /// not an arm that has gone quiet, and halting a boot before its
+    /// first connect would make the engine unstartable.
+    ///
+    /// `Instant`, not a `core_time` stamp, because every other timer
+    /// in this file is one and a second clock here would be a second
+    /// thing to get wrong.
+    last_ws_ok: Option<Instant>,
+    /// **E6 commit 3** — CONSECUTIVE orders the venue understood and
+    /// refused. An acceptance resets it.
+    reject_streak: u32,
+    /// **E6 commit 3** — CONSECUTIVE submits refused locally for
+    /// naming a rolled instance (LAW E-4). An acceptance resets it.
+    asset_refusal_streak: u32,
+    /// **E6 commit 3** — `true` once `reconcile` has completed a
+    /// comparison against the venue since boot. What lets the router
+    /// stop refusing every live place.
+    reconciled: bool,
     /// Earliest instant a reconnect may be attempted.
     ws_retry_at: Instant,
     /// When reconciliation last ran.
@@ -523,6 +555,13 @@ pub struct HlExchange<const FILL_N: usize> {
     sweeps: [PendingSweep; MAX_PENDING_SWEEPS],
     /// How many of `sweeps` are live.
     sweeps_n: usize,
+    /// `sweep_left` as it stood when the last cancel-all was
+    /// REQUESTED. A sweep that terminates by abandonment bumps that
+    /// counter, so `sweep_left != cancel_all_mark` is exactly "a leg
+    /// was given up on since we were asked" — which is what makes
+    /// `cancel_all_state` able to say `Stranded` instead of quietly
+    /// reporting an empty table as a clear venue.
+    cancel_all_mark: u64,
     /// Scratch for one sweep's `frontendOpenOrders` answer.
     open: Box<[crate::recon::OpenOrder]>,
     bal: Box<[crate::recon::SpotBalance]>,
@@ -565,12 +604,17 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             budget_path,
             last_persist: Instant::now(),
             ws_fail_streak: 0,
+            last_ws_ok: None,
+            reject_streak: 0,
+            asset_refusal_streak: 0,
+            reconciled: false,
             ws_retry_at: Instant::now(),
             scratch: vec![UserFill::default(); SNAPSHOT_RING].into_boxed_slice(),
             last_recon: Instant::now(),
             master_addr: cfg.master_addr,
             sweeps: [PendingSweep::EMPTY; MAX_PENDING_SWEEPS],
             sweeps_n: 0,
+            cancel_all_mark: 0,
             open: vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS]
                 .into_boxed_slice(),
             bal: vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES]
@@ -899,7 +943,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             );
         });
         match r {
-            Ok(n) => n > 0,
+            Ok(n) => {
+                // The socket answered, so the stream is alive — even
+                // with nothing on it. A quiet market is not a gap.
+                self.last_ws_ok = Some(Instant::now());
+                n > 0
+            }
             Err(_) => {
                 // Any socket failure drops the connection; the next
                 // idle redials, after the backoff. The tid ring
@@ -958,6 +1007,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         };
         self.counters.recon_ok = self.counters.recon_ok.wrapping_add(1);
         let (legs, worst) = Self::compare(&self.assets, &self.bal[..rows], body);
+        // E6 commit 3: the arm has compared itself against the venue.
+        // The router reads this to stop refusing every live place —
+        // see the seeding interlock, which exists because a ledger
+        // that has never been reconciled reads zero exposure after a
+        // restart and would fail every clamp OPEN.
+        self.reconciled = true;
         self.counters.recon_drift_legs = legs;
         if worst > self.counters.recon_drift_max_qty_1e6 {
             self.counters.recon_drift_max_qty_1e6 = worst;
@@ -1115,7 +1170,15 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let resp = self.http.resp();
         let slice = &resp[range];
         match scan(slice) {
-            Ok(HlResponse::Ok(ok)) if ok.accepted() => Ok(ok),
+            Ok(HlResponse::Ok(ok)) if ok.accepted() => {
+                // An acceptance ends both streaks. They are
+                // CONSECUTIVE counts: a venue refusing every order is
+                // a different fact from one that has refused a few
+                // over a long boot, and only the first is a halt.
+                self.reject_streak = 0;
+                self.asset_refusal_streak = 0;
+                Ok(ok)
+            }
             // The venue understood us and said NO. Distinct from an
             // answer we could not read: E6's `halt_on_reject_streak`
             // counts this one, and conflating the two would have it
@@ -1123,10 +1186,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // order.
             Ok(_) => {
                 self.counters.rejected = self.counters.rejected.wrapping_add(1);
+                self.reject_streak = self.reject_streak.saturating_add(1);
                 Err(DispatchError::Http(200))
             }
             Err(_) => {
                 self.counters.rejected = self.counters.rejected.wrapping_add(1);
+                self.reject_streak = self.reject_streak.saturating_add(1);
                 Err(DispatchError::JsonMalformed)
             }
         }
@@ -1306,6 +1371,20 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
+    /// Is a sweep already pending for this asset? `queue_sweep` is
+    /// idempotent per asset, so a leg already queued is already
+    /// covered and must not read as a failure to queue.
+    fn sweep_pending_for(&self, asset: u32) -> bool {
+        let mut i = 0usize;
+        while i < self.sweeps_n {
+            if self.sweeps[i].asset == asset {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Burn one retry on a pending sweep, counting it as `sweep_left`
     /// and dropping it when they are spent.
     fn spend_try(&mut self, i: usize) {
@@ -1340,6 +1419,11 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             .map_err(|e| {
                 if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
                     self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                    // E6 commit 3: CONSECUTIVE. One is a race with a
+                    // roll; a streak is a member quoting an instance
+                    // that no longer exists.
+                    self.asset_refusal_streak =
+                        self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
@@ -1394,6 +1478,11 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             .map_err(|e| {
                 if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
                     self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                    // E6 commit 3: CONSECUTIVE. One is a race with a
+                    // roll; a streak is a member quoting an instance
+                    // that no longer exists.
+                    self.asset_refusal_streak =
+                        self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
@@ -1497,6 +1586,11 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                 // it reachable for the first time.
                 if matches!(e, crate::asset::AssetError::StaleInstance { .. }) {
                     self.counters.refused_stale = self.counters.refused_stale.wrapping_add(1);
+                    // E6 commit 3: CONSECUTIVE. One is a race with a
+                    // roll; a streak is a member quoting an instance
+                    // that no longer exists.
+                    self.asset_refusal_streak =
+                        self.asset_refusal_streak.saturating_add(1);
                 }
                 self.counters.refused_local = self.counters.refused_local.wrapping_add(1);
                 DispatchError::NoLiveRoute
@@ -1720,6 +1814,133 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
             }
         }
         self.counters.rolls_bound = self.counters.rolls_bound.wrapping_add(1);
+    }
+
+    /// **E6 commit 3 — what this arm can see of the venue.**
+    ///
+    /// Raw observations only. The router owns every threshold, so two
+    /// slots with different `halt_on_*` numbers reach different
+    /// conclusions from one signal, and this file states no policy.
+    fn halt_signal(&self) -> clob_dispatcher::HaltSignal {
+        clob_dispatcher::HaltSignal::new(
+            // `None` reports 0 — "no observation" — rather than an
+            // infinite gap. An arm that has never connected is not an
+            // arm that has gone quiet, and reporting u64::MAX here
+            // would halt every boot before its first connect.
+            self.last_ws_ok
+                .map_or(0, |t| t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64),
+            // The reconciler measures a CONTRACT QUANTITY; the
+            // threshold is money. Converted here, once, through the
+            // function `recon` owns — the two numbers share a name
+            // and not a unit, which `recon.rs` warns about in those
+            // words.
+            crate::recon::drift_qty_to_usd_1e6(self.counters.recon_drift_max_qty_1e6),
+            self.reject_streak,
+            self.asset_refusal_streak,
+            self.budget.may_submit().is_err(),
+            self.reconciled,
+        )
+    }
+
+    /// **E6 commit 3 — take every order of ours off the venue.**
+    ///
+    /// Queues a LAW E-8 sweep for every leg the asset table holds.
+    /// The sweep machinery then does the work from the idle path:
+    /// ask the venue what is resting, select the rows carrying our
+    /// cloid (LAW E-9), cancel them 8 at a time, and keep the entry
+    /// pending until the leg comes back clean.
+    ///
+    /// **Queued rather than cancelled inline, and the reasoning
+    /// changed with commit 3a.** The operator's ruling was that a
+    /// kill switch which queues work for an idle loop is not a kill
+    /// switch — which was correct when nothing on the `--exec` path
+    /// called `on_idle` at all. It does now, every 2 ms at worst, so
+    /// the queue IS the synchronous path with a bound on it: this
+    /// call returns immediately, the refusal latches immediately, and
+    /// the venue is cleared by machinery that is already budgeted,
+    /// already retried and already tested. Cancelling inline would
+    /// put up to `MAX_OPEN_ORDERS` round trips on the engine thread
+    /// at the exact moment something has gone wrong — see
+    /// [`SWEEP_CANCELS_PER_IDLE`].
+    ///
+    /// # Errors
+    /// [`DispatchError::QueueFull`] when the pending-sweep table
+    /// could not hold every live leg. The caller halts anyway and
+    /// retries, which is what drains the table.
+    fn cancel_all(&mut self) -> Result<(), DispatchError> {
+        self.counters.cancel_all_runs = self.counters.cancel_all_runs.wrapping_add(1);
+        // Everything `cancel_all_state` reports is relative to THIS
+        // request, so the mark moves with it. A leg abandoned before
+        // we were asked is not this cancel-all's business; one
+        // abandoned after it is the whole point.
+        self.cancel_all_mark = self.counters.sweep_left;
+
+        // Collected first: `queue_sweep` borrows `self` mutably and
+        // `for_each_live` borrows it immutably.
+        let mut syms = [0u32; crate::asset::ASSET_SLOTS];
+        let mut n = 0usize;
+        self.assets.for_each_live(|sym, _coin, _booked| {
+            if n < syms.len() {
+                syms[n] = sym;
+                n += 1;
+            }
+        });
+
+        let mut queued = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let sym = syms[i];
+            i += 1;
+            let Some((asset, coin, coin_len)) = self.assets.bound(sym) else {
+                continue;
+            };
+            // A leg already pending is already covered.
+            if self.sweep_pending_for(asset) {
+                queued += 1;
+                continue;
+            }
+            // **Checked BEFORE queueing, not after.** `queue_sweep`
+            // answers a full table by bumping `sweep_left`, which is
+            // the roll path's honest accounting for a stranded leg —
+            // but this path is retried from every idle moment, so
+            // going through it would add ~500 phantom strandings a
+            // second to the one counter LAW E-8 arms an operator on.
+            // Unqueued legs are counted once per run below instead.
+            if self.sweeps_n >= MAX_PENDING_SWEEPS {
+                continue;
+            }
+            self.queue_sweep(asset, coin, coin_len);
+            queued += 1;
+        }
+
+        if queued == n {
+            Ok(())
+        } else {
+            self.counters.cancel_all_unqueued = self
+                .counters
+                .cancel_all_unqueued
+                .wrapping_add((n - queued) as u64);
+            Err(DispatchError::QueueFull)
+        }
+    }
+
+    /// **LAW E-8's confirmation.** See
+    /// [`clob_dispatcher::CancelAllState`].
+    ///
+    /// A sweep terminates two ways, and only one of them is a
+    /// confirmation: `sweep_one_pending` drops the entry when the
+    /// venue reports nothing of ours resting on that leg (`k == 0`),
+    /// and `spend_try` drops it — bumping `sweep_left` — when the
+    /// retries run out. An empty table therefore means "clear" only
+    /// when `sweep_left` has not moved since we were asked.
+    fn cancel_all_state(&self) -> clob_dispatcher::CancelAllState {
+        if self.sweeps_n > 0 {
+            return clob_dispatcher::CancelAllState::Working;
+        }
+        if self.counters.sweep_left != self.cancel_all_mark {
+            return clob_dispatcher::CancelAllState::Stranded;
+        }
+        clob_dispatcher::CancelAllState::Clear
     }
 
     fn on_idle(&mut self) -> bool {
@@ -2031,6 +2252,82 @@ mod tests {
         let o = order(1, ORDER_KIND_MAKER);
         assert_eq!(o.px.raw() * ENGINE_TO_WIRE, 47_000_000, "0.47");
         assert_eq!(o.qty.raw() * ENGINE_TO_WIRE, 2_500_000_000, "25 contracts");
+    }
+
+    /// **LAW E-8's confirmation: an empty sweep table is not a clear
+    /// venue.**
+    ///
+    /// A sweep entry is dropped two ways and only one of them is a
+    /// confirmation. If `cancel_all_state` read the empty table alone
+    /// it would report `Clear` over orders the arm gave up on — and
+    /// the router would stop retrying and zero its resting count. The
+    /// two breaks this test exists for are exactly those readings.
+    #[test]
+    fn an_abandoned_sweep_is_stranded_not_clear() {
+        use clob_dispatcher::CancelAllState;
+        let mut x = exchange_at("127.0.0.1");
+
+        // Nothing asked, nothing pending: there is nothing of ours to
+        // be resting.
+        assert_eq!(x.cancel_all_state(), CancelAllState::Clear);
+
+        // Asked, and a leg queued.
+        x.cancel_all_mark = x.counters.sweep_left;
+        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0);
+        assert_eq!(
+            x.cancel_all_state(),
+            CancelAllState::Working,
+            "queued is not cancelled"
+        );
+
+        // The sweep is dropped having CONFIRMED the leg is clean —
+        // the `k == 0` path, which does not touch `sweep_left`.
+        x.drop_sweep(0);
+        assert_eq!(x.cancel_all_state(), CancelAllState::Clear);
+
+        // Now the other ending: queued again, and abandoned with its
+        // retries spent.
+        x.cancel_all_mark = x.counters.sweep_left;
+        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0);
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        assert_eq!(x.sweeps_n, 0, "the table is empty either way");
+        assert_ne!(x.counters.sweep_left, x.cancel_all_mark);
+        assert_eq!(
+            x.cancel_all_state(),
+            CancelAllState::Stranded,
+            "an empty table over orders we never cancelled is NOT clear"
+        );
+
+        // A fresh request re-marks, so the next sweep is judged on
+        // its own outcome rather than the last one's.
+        x.cancel_all_mark = x.counters.sweep_left;
+        assert_eq!(x.cancel_all_state(), CancelAllState::Clear);
+    }
+
+    /// A cancel-all retried from every idle moment must not inflate
+    /// `sweep_left` — that counter is what an operator arms on for a
+    /// stranded quote, and a full table answered through `queue_sweep`
+    /// would add one phantom stranding per leg per poll.
+    #[test]
+    fn a_retried_cancel_all_does_not_manufacture_stranded_legs() {
+        let mut x = exchange_at("127.0.0.1");
+        // Fill the pending table with legs the cancel-all did not put
+        // there.
+        for a in 0..MAX_PENDING_SWEEPS as u32 {
+            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0);
+        }
+        assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
+        let before = x.counters.sweep_left;
+
+        // An unqueueable leg, asked for a hundred times.
+        for _ in 0..100 {
+            let _ = x.cancel_all();
+        }
+        assert_eq!(
+            x.counters.sweep_left, before,
+            "a retry is not a stranding"
+        );
     }
 
     /// Counters exist so an operator can tell a refusal from a

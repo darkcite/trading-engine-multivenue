@@ -15,3 +15,7 @@ core-types      = { workspace = true }
 # the engine stamps orders with `CLOCK_MONOTONIC_RAW`; this is the same
 # conversion `strategy_bin15` uses, not a second one.
 core-time       = { workspace = true }
+# E6 commit 3: the ONE durable write (temp -> sync_all -> rename), for
+# `exec.HALT`. An auto-halt that did not survive the scheduled daily
+# restart would resume trading into whatever tripped it, unattended.
+core-io         = { workspace = true }

@@ -207,12 +207,35 @@ cap_instance_usd_1e6 = 1000000000
 # Consumed by the budget governor in E4.
 request_budget_floor = 2000
 
-# Consecutive venue rejections that trip a STICKY halt (E6).
+# ---- the kill switches (E6) -----------------------------------------
+#
+# All four are REQUIRED NON-ZERO on a live slot and the boot refuses
+# without them, naming the key. `0` means UNSET here, never
+# "unlimited": a halt trigger with no threshold never fires, so a
+# missing key would be a kill switch that silently does not exist.
+#
+# A halt is STICKY. Nothing in the process clears it — not a recovered
+# stream, not a successful reconciliation. It cancels everything this
+# arm has working at the venue, refuses every further submit and
+# modify (cancels still pass, so a member can always get out), and
+# writes `exec.HALT` beside this file so it survives the restart.
+
+# Consecutive venue rejections that trip a halt.
 halt_on_reject_streak = 5
 
 # Divergence between our position and the venue's, USD x1e6, that trips
-# a sticky halt (E6). 5000000 = $5.
+# a halt. 5000000 = $5.
 halt_on_recon_drift_usd_1e6 = 5000000
+
+# Milliseconds of silence on the venue's user-event stream that trip a
+# halt. The stream is how fills arrive (LAW E-5), so a quiet stream
+# means we are placing orders blind. 30000 = 30s.
+halt_on_ws_gap_ms = 30000
+
+# Consecutive orders refused locally because their asset id was not
+# bound by a roll event (LAW E-4). A streak means our view of the
+# instrument has diverged from the venue's.
+halt_on_asset_refusal_streak = 3
 
 
 # Slot 1 — vrp. Explicit is better than default: writing it down means

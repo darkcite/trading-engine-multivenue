@@ -3403,3 +3403,416 @@ That is worth naming as a pattern rather than fixing three times in
 silence: this repository has tests that assert properties which only
 hold on a quiet machine, and each one that survives teaches an
 operator to re-run until green.
+
+### E6 commit 3 — the sticky halt state machine (2026-09-19)
+
+E6 commit 1 gave the router a clamp that refuses **one order**. This
+commit gives it the thing that refuses **every future order**: five
+triggers, one latch per slot, a venue-wide cancel on the edge, and a
+file on disk so a halt is not forgotten by the next restart.
+
+The distinction matters more than it sounds. A clamp answers "is this
+order too big?" A halt answers "is this arm still trustworthy?" — and
+once the answer is no, the size of the next order is beside the point.
+
+#### The five triggers, and what each one actually observes
+
+| trigger | fires when | threshold key |
+|---|---|---|
+| `RejectStreak` | consecutive venue rejects ≥ N | `halt_on_reject_streak` |
+| `AssetRefusals` | consecutive asset-id refusals ≥ N | `halt_on_asset_refusal_streak` |
+| `BudgetFloor` | the arm reports its allowance spent | *(none — see below)* |
+| `ReconDrift` | reconciler disagreement ≥ $X | `halt_on_recon_drift_usd_1e6` |
+| `WsGap` | user stream silent ≥ N ms | `halt_on_ws_gap_ms` |
+
+`trigger_for` evaluates them in that order and returns the FIRST one
+that fires.
+
+**The order only breaks ties inside one poll.** `on_idle` runs every
+2 ms and the latch is sticky, so whichever condition crosses its
+threshold first *in time* is the one recorded, whatever the order
+says. Within a single poll the order puts symptoms
+(`RejectStreak`, `AssetRefusals`) ahead of causes (`BudgetFloor`,
+`WsGap`) — a dead socket that has also produced a reject streak
+reports as `reject-streak`. That is a real wart and it is recorded
+here rather than dressed up: an earlier draft of this section claimed
+the order reported "the one an operator most needs to see", which the
+code does not do and was never written to do.
+
+**The arm reports observations; the router owns the thresholds.**
+`HaltSignal` carries raw numbers — a gap in nanoseconds, a streak
+count, a drift in dollars — and no opinion about whether any of them
+is too much. That split is deliberate: the thresholds are per SLOT and
+live in the operator's artifact, and an arm that compared against them
+itself could not serve two slots with different appetites. The test
+`two_slots_with_different_thresholds_reach_different_conclusions` pins
+exactly that.
+
+**`0` means UNSET, never "unlimited".** A threshold left at zero
+disables its trigger, which is why every one of the four is now
+*required non-zero* on a live slot — see below. The alternative
+reading, where `0` means "halt on the first reject", would make a
+missing key the most aggressive possible setting; the reading where it
+means "never halt" makes a missing key the most dangerous one. Neither
+is acceptable as a silent default, so the boot refuses instead.
+
+**`ws_gap_ns == 0` is "no observation", not "no gap".** An arm that
+has never connected has no last-good timestamp to subtract from. If
+zero were read as a gap of zero the trigger would never fire before
+the first connect (harmless); if it were read as an infinite gap the
+engine would be unstartable (not harmless). The check requires
+`sig.ws_gap_ns > 0` before comparing, and says so in a comment,
+because this is the third time in this lane a sentinel has been the
+whole bug.
+
+#### The budget floor has no per-slot threshold, on purpose
+
+It is the one trigger a slot cannot tune, because it is not about the
+slot. `request_budget_floor` is a property of the ADDRESS: an account
+with no allowance left cannot place for anybody, and a slot permitted
+to set its own floor could keep submitting into an arm that has
+already stopped being able to sign. The arm compares and reports a
+flag; the router latches it unconditionally. Pinned by
+`the_budget_floor_fires_even_with_every_threshold_unset`.
+
+#### It runs on the IDLE path, and that is the entire point
+
+A halt evaluated on the dispatch path would fire last or never. The
+condition that trips these triggers — a dead venue, a silent stream,
+an address out of allowance — is *exactly* the condition under which
+the member stops submitting, so waiting for the next order to
+re-evaluate means waiting for an order that is not coming.
+
+Commit 3a gave this hook a driver: `on_idle` runs on the engine thread
+every 2 ms whether or not anything is trading.
+`a_dead_venue_halts_with_no_order_flow_at_all` asserts the whole
+sequence with `live().seen` empty — nothing was ever submitted, and
+the slot halted anyway.
+
+#### Cancel-only: the halt refuses submit and modify, and allows cancel
+
+A halted slot must be able to GET OUT. Refusing its cancels would
+leave the member holding orders it has decided it does not want, with
+no path to give them back, which is a worse state than the one that
+tripped the halt.
+
+So `submit` and `modify` are refused with `RiskRefusal::Halted`, and
+`cancel` is not refused because **it never reaches the risk gate at
+all** — `RoutedDispatcher::cancel` does not call `risk_check`. There
+is no "cancel" verb to exempt: `RiskVerb` is `{Place, Replace}`. The
+escape hatch is structural rather than a permission, which is the
+stronger form.
+
+A modify is refused rather than allowed-if-smaller because LAW E-7
+makes a live requote a MODIFY: permitting it would let a halted slot
+keep quoting indefinitely at ever-smaller sizes, which is trading.
+
+#### The venue-wide cancel: a REQUEST and a CONFIRMATION, not one call
+
+On the halt edge every working order for the arm is taken back —
+venue-wide, not per instance, because a halt is not a statement about
+one market.
+
+**This is where the commit's worst defect lived, and it is worth
+setting out in full**, because it is the fourth appearance of this
+lane's recurring shape: *a name that describes a stronger property
+than the thing it is attached to tests.*
+
+`OrderDispatch::cancel_all` looks like it cancels. On Hyperliquid it
+does not. It walks the live legs and calls `queue_sweep` for each,
+and **returns `Ok(())` as soon as every leg is queued.** Nothing has
+been sent to the venue at that point. The sweep drains later, one
+entry per idle moment, asking the venue what is resting and cancelling
+by oid, eight at a time.
+
+The first version of this commit read that `Ok(())` as confirmation:
+
+* `cancel_cleared()` zeroed the pending flags, so **the retry the
+  section promised never ran again.** If the sweep then burned its
+  eight tries and was dropped, the orders stayed working at the venue
+  and nothing re-queued them.
+* `ledger.clear_resting()` zeroed the resting count for **every**
+  slot while none of those orders had been touched — handing the
+  HEALTHY slots a permissive `max_open_orders` at the exact moment a
+  sibling slot had halted, and letting them stack a second full book
+  on top of the one still resting. A clamp that gets weaker when the
+  venue is misbehaving is precisely backwards, and this is the second
+  time in this commit that exact hole was opened.
+
+The fix is to stop pretending one call answers two questions.
+
+| method | asks | answers |
+|---|---|---|
+| `cancel_all` | *take everything back* | the request was accepted |
+| `cancel_all_state` | *is the venue clear?* | `Clear` / `Working` / `Stranded` |
+
+`CancelAllState` is three-valued rather than a `bool` for the same
+reason the ledger's lookup is `Found::{One,None,Many}`: the caller's
+response to "still working" and to "gave up" are opposite — wait,
+versus ask again — and a `bool` would force one of them to be
+guessed.
+
+The arm can answer honestly because it already knows the difference. A
+sweep entry is dropped two ways: `sweep_one_pending` drops it when the
+venue reports **nothing of ours resting on that leg**, and `spend_try`
+drops it — bumping `sweep_left` — when the retries run out. So an
+empty sweep table means "clear" only when `sweep_left` has not moved
+since the request. That is the whole of `cancel_all_state`.
+
+**One request and one confirmation per poll, and confirming can never
+loop back into asking** — the re-request lives in `try_cancel_all`
+rather than inside the `Stranded` arm, so the shape is flat by
+construction rather than by a comment saying it does not recurse.
+
+`latch` marks the slot `WANTED`; the first poll asks and moves it to
+`ASKED`; later polls confirm. `WANTED` beats `ASKED` across slots, so
+a slot that halts while another slot's sweep is draining gets its own
+request — its legs were not in that sweep. And two slots halting on
+the *same* poll share one request, because cancel-all is venue-wide.
+
+#### A failed cancel halts anyway, and nothing is cleared until the venue says so
+
+Waiting for a successful cancel before refusing would keep submitting
+into the condition that tripped the halt. So the latch is immediate
+and unconditional; only the *clearing* waits.
+
+Two counters, because they are two different facts and an earlier
+draft had them as one:
+
+* **`cancel_all_failures`** — requests the arm would not accept.
+* **`cancel_all_stranded`** — polls on which the arm reported it had
+  given up with the venue unconfirmed, and the router asked again.
+  This is the number an operator wants after an incident: requests
+  that *landed* and still left orders working.
+
+#### How long "clear" actually takes
+
+The refusal latches in microseconds. The venue being clear is minutes
+away, and the section should say so rather than leave "retries until
+it lands" to imply otherwise.
+
+From `SWEEP_CANCELS_PER_IDLE = 8`, one entry drained per `on_idle`,
+`REQ_DEADLINE` 5 s per round trip, `SWEEP_TRIES = 8`:
+
+* one leg of 256 resting orders — 32 idle moments, so **≈14 s** at a
+  50 ms round trip, and **up to ≈24 min** if every request runs to
+  the deadline;
+* 16 queued legs drained serially — up to 512 calls, so **≈4 min**
+  realistically and **hours** at the deadline.
+
+That gap is exactly why the request and the confirmation had to be
+separated: for minutes at a time the honest answer to "are we clear?"
+is *no, still working*, and the old contract had no way to say it.
+
+#### Sticky, and nothing in the process clears it
+
+`latch` keeps the FIRST reason a slot halted for. Later triggers
+describe the same incident, and the first one is what an operator
+needs. Nothing — not a recovered stream, not a successful
+reconciliation, not a hundred idle polls — un-halts a slot;
+`nothing_clears_a_halt` asserts it directly. Clearing a halt is an
+operator action, by restart, and commit 4 makes even that deliberate.
+
+#### `exec.HALT`, so a halt survives the daily restart
+
+Without a file, a halt lives only in this process — and the scheduled
+restart at 00:10Z would clear it and resume trading into whatever
+tripped it, unattended, at an hour when nobody is watching. So the
+edge writes `exec.HALT` with the slot and the reason.
+
+**Wired at the `--exec` boot**, beside the artifact that armed the
+slots: `halt_file_path` puts it in the artifact's own directory, so an
+operator running two engines from two artifacts gets two halt files
+rather than one they share. A first draft of this section described
+the writer as delivered while `set_halt_path` had no caller outside
+its own tests — the file was never written on any real boot, and the
+restart hole the section exists to close was still wide open.
+
+Best effort, deliberately: the write happens AFTER the latch, and a
+failed write does not un-halt the slot. Refusing to halt because a
+file could not be written would be the wrong direction, and
+`no_halt_path_means_no_file_and_no_refusal_to_halt` pins that a router
+with no configured path still halts.
+
+The writer uses a fixed 64-byte buffer and no `format!` — it runs on
+the engine thread — and renders two digits rather than one. With
+`EXEC_SLOTS == 8` one digit is correct today and would silently
+mod-10 wrap the moment the table grew, in the one file an operator
+reads after an incident.
+
+#### `--halt-slot`, the operator's switch
+
+`halt_slot` needed a caller that was not a test, and this is it:
+`--halt-slot 3` (or `3,5`) boots with those slots already halted.
+
+Deliberately NOT half of a two-switch interlock, unlike `--arm-live`.
+Arming needs two agreeing edits because it reaches real money;
+halting needs one, because it is the direction that cannot. For the
+same reason it does not require `--exec` — but naming slots without an
+artifact logs a warning saying plainly that the flag halted nothing,
+rather than refusing a boot because someone asked for more safety, or
+staying silent and letting them believe a switch fired.
+
+#### The day cap refuses; it does not halt
+
+`cap_day` reaching its limit is the system working as designed, not a
+fault: the slot has spent what it was given. It refuses further buys
+and keeps running — sells still pass, so the member can still reduce.
+`spending_the_day_cap_refuses_but_does_not_halt` asserts the
+distinction, which is worth pinning precisely because the other four
+money-adjacent conditions all do halt.
+
+#### Two new required keys, and a boot that refuses without them
+
+`halt_on_ws_gap_ms` and `halt_on_asset_refusal_streak` join
+`halt_on_reject_streak` and `halt_on_recon_drift_usd_1e6` as keys a
+live slot MUST set non-zero. All four are now enforced at parse time
+with an error that says what `0` means, so an operator who omits one
+gets a refused boot naming the key rather than a trigger that silently
+never fires.
+
+`request_budget_floor` joins them. It is not a threshold the router
+compares against — the arm owns it and reports a flag — but at `0` the
+budget trigger fires only at TOTAL exhaustion, which is a kill switch
+that waits until the address is already bricked.
+
+This broke ten existing fixture tests, which is the correct outcome: a
+fixture that armed a live slot without a kill switch was describing a
+configuration the engine should never have accepted.
+
+**And it broke the shipped template, which nothing caught.**
+`exec.toml.example` tells the operator to change `mode` to `"live"`,
+and after this change that edit produced a refused boot naming a key
+the operator had never heard of. The fixtures were updated; the file
+the operator actually starts from was missed, and the only sign would
+have been the refusal itself. There is now a test that parses
+`exec.toml.example` with that one edit applied and asserts every
+required key is present and non-zero — the thing that would have said
+so.
+
+#### The restart interlock is now switched off by a real reconciliation
+
+Commit 2 left the ledger UNSEEDED at boot, so every live PLACE was
+refused until something proved the ledger's numbers described the
+venue rather than an empty world. Commit 3 supplies that something:
+`on_idle` reads `halt_signal().reconciled` and calls `mark_seeded`
+the first time the arm reports a completed reconciliation.
+
+This is the most safety-relevant behaviour change in the commit — it
+is the line that lets a live slot trade at all — and the first draft
+of this section did not mention it anywhere. The gate itself is
+sound: `reconciled` is set only after the arm's `scan_spot_state`
+succeeded and `compare` ran, so it cannot be reported by an arm that
+merely connected.
+
+#### A FIFTH flaky gate, and this one was ours
+
+`exec_boot::tests::an_all_paper_artifact_resolves_to_an_all_paper_table`
+failed roughly one run in six with `resolve()` reporting "no such
+file".
+
+The cause: `tmp()` built its directory name from the pid and the WALL
+CLOCK in nanoseconds. `cargo test` runs these in parallel, two threads
+landing in the same clock tick got the same directory, and whichever
+finished first removed the other's artifact out from under it. Every
+other temp-dir helper in the repository disambiguates with a per-test
+tag; this one did not.
+
+Fixed by counting instead of clocking — a process-wide
+`AtomicU64` cannot tie. Eight consecutive clean runs of `cli --lib`
+after the change, where the flake reproduced within three before it.
+
+That is **four flaky gates fixed** across this lane and one
+(the exit-75 abort, §E6 3a) still open. The pattern named there holds:
+this repository has tests that assert properties which only hold on a
+quiet machine.
+
+#### Break-and-watch
+
+Ten deliberate breaks, each restored by file copy, each caught by a
+test whose name describes what was broken:
+
+| broken | caught by |
+|---|---|
+| each of the five `trigger_for` conditions | its own `*_halts_*` test, 5/5 |
+| `latch` stickiness | `a_halt_keeps_its_first_reason`, `nothing_clears_a_halt` |
+| `latch` marking the cancel pending | 10 tests |
+| `try_cancel_all`'s outstanding guard | `a_halt_edge_fires_cancel_all_once_not_once_per_poll` |
+| clearing resting on a FAILED cancel | `a_failed_cancel_all_leaves_the_resting_count_alone` |
+| the operator halt's immediate cancel | `an_operator_halt_is_exactly_as_sticky_as_a_triggered_one` |
+| a required key missing from the template | `the_shipped_template_arms_a_live_slot_without_further_edits` |
+
+One honourable mention: the first attempt at the tenth break inserted
+a dead `if false { … }` and left the live call below it, so the suite
+passed and it looked for a moment like a test gap. The break script
+was the bug. Worth recording because a break-and-watch that does not
+actually break anything reports the same "ok" as a missing test.
+
+**And the thing break-and-watch did NOT find.** Every break above was
+caught, and the suite was green, while `cancel_all` still reported a
+queued sweep as a cleared venue. Break-and-watch tests that the
+guards fire; it cannot tell you that a guard is reading a value which
+does not mean what its name says. That took a reviewer reading
+`HlExchange::cancel_all` against the prose — which is the argument for
+running the review agents on the DOC and the code together, not the
+code alone.
+
+#### What the review round changed
+
+Both agents ran against the working tree with the risk-policy section
+already written, which is what made the prose auditable.
+
+The alloc audit passed: no forbidden pattern, no `dyn`, every size
+assertion recomputed and correct (`HaltLimits` 24 B, `HaltSignal`
+32 B, `ExecRoute` 448 B), 61/61 at 0 B/op, clippy clean. It flagged
+four borderline items, of which two were taken here — `HaltState` had
+no size assertion (it is one cache line; now asserted) and the halt
+file rendered one digit for the slot — and two are recorded for
+commit 4: there is no alloc gate driving `on_idle` itself, and
+`write_halt_file`'s `core_io::write_atomic` allocates on the engine
+thread on the halt edge.
+
+The risk review returned `BLOCK`, correctly, and found:
+
+1. **The cancel contract** (above) — the real one.
+2. **`set_halt_path` had no production caller**, so `exec.HALT` was
+   never written on any real boot while this section said it was.
+3. **`halt_slot` had no production caller**, so the "operator halt"
+   the section described did not exist.
+4. **`exec.toml.example` was left unbootable** by the new required
+   keys.
+5. Six further prose-vs-code mismatches, all corrected above: the
+   claim that the trigger order ranks by operator value, a
+   `RiskVerb::Cancel` that does not exist, "taken back" for a queued
+   sweep, and the entirely unmentioned auto-seed.
+
+Also taken from it: `HaltState::refused_halted` was a second field of
+the same name and the same value as `RouteCounters::refused_halted`
+that nothing ever read — deleted, because two counters for one fact
+is how they drift — and `request_budget_floor` joined the required
+keys.
+
+Left for commit 4, deliberately: `refused_halted` and the halt state
+are still not exported through `ExecCounters`, so `/metrics` sees a
+halt only folded into `refused_risk`. That is commit 4's subject.
+`exec.HALT` also records only the LAST slot to halt, which matters
+once the read-back lands and not before.
+
+#### Gates
+
+* `cargo test --workspace --exclude bench --no-fail-fast` — **2493
+  passed, 0 failed**
+* `cargo test --release --test alloc_assertions -- --test-threads=1` —
+  **61/61**
+* `cargo clippy --workspace --all-targets -- -D warnings` — clean
+* `make license-check` — OK, 391 source files
+
+#### Still ahead in E6
+
+Commit 4: the operator-written `exec.HALT` read back at boot and
+polled at runtime, an `engine_exec_halted{slot}` gauge, `refused_halted`
+and the halt state exported through `ExecCounters`, the halt state and
+`is_seeded` in `/state`, and a loud boot tell when the engine starts
+with a halt file already present. With the read-back comes the fix for
+`exec.HALT` recording only the last slot to halt, and an alloc gate
+that drives `on_idle` under `AllocGuard`.

@@ -5753,7 +5753,7 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
 fn routed_dispatch_steady_state() {
     use clob_dispatcher::{DispatchError, OrderDispatch, PaperDispatcher};
     use core_types::{Price, Qty, Side, Tick, VenueId, STRATEGY_ID_NONE};
-    use exec_router::{ExecMode, ExecRoute, NullLiveDispatcher, RoutedDispatcher, SlotCaps};
+    use exec_router::{ExecMode, ExecRoute, HaltLimits, NullLiveDispatcher, RoutedDispatcher, SlotCaps};
 
     const SYM: core_types::SymbolId = 42;
 
@@ -5769,10 +5769,11 @@ fn routed_dispatch_steady_state() {
             // zero cap, and a gate whose submits were all refused
             // would measure the refusal path, not the dispatch path.
             SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+            HaltLimits::none(),
         )
         .expect("boot: slot 3 live");
     route
-        .set_slot(6, ExecMode::Off, &[], SlotCaps::none())
+        .set_slot(6, ExecMode::Off, &[], SlotCaps::none(), HaltLimits::none())
         .expect("boot: slot 6 off");
 
     let mut d = RoutedDispatcher::new(
@@ -6783,7 +6784,7 @@ fn routed_ledger_steady_state() {
         CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, Order, Price, Qty, Side, VenueId,
         FILL_ORIGIN_PAPER, FILL_ORIGIN_VENUE,
     };
-    use exec_router::{ExecMode, ExecRoute, RoutedDispatcher, SlotCaps};
+    use exec_router::{ExecMode, ExecRoute, HaltLimits, RoutedDispatcher, SlotCaps};
 
     const SLOT: u8 = 3;
     /// Hyperliquid namespace. Yes legs are even ordinals, No odd.
@@ -6839,6 +6840,7 @@ fn routed_ledger_steady_state() {
             // Tight enough that the refusal paths really fire, loose
             // enough that the accepting paths do too.
             SlotCaps::new(100_000_000, 40_000_000, 200_000_000, 32),
+            HaltLimits::none(),
         )
         .expect("boot: slot 3 live");
     // The identity anchor: this gate stamps orders and fills from one

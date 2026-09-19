@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 10] = [
+const SLOT_KEYS: [&str; 12] = [
     "mode",
     "name",
     "venues",
@@ -89,6 +89,8 @@ const SLOT_KEYS: [&str; 10] = [
     "request_budget_floor",
     "halt_on_reject_streak",
     "halt_on_recon_drift_usd_1e6",
+    "halt_on_ws_gap_ms",
+    "halt_on_asset_refusal_streak",
 ];
 
 /// Venue spellings the `venues` array accepts, and the `VenueId` byte
@@ -173,8 +175,22 @@ pub struct ExecSlot {
     /// Carried for E6.
     pub halt_on_reject_streak: i64,
     /// Reconciliation drift, USD x1e6, that trips a sticky halt.
-    /// 0 = unset. Carried for E6.
+    /// 0 = unset.
     pub halt_on_recon_drift_usd_1e6: i64,
+    /// **E6** — milliseconds without the venue's user-event stream
+    /// before a sticky halt. `0` = unset.
+    ///
+    /// The stream is how a live fill reaches the engine at all
+    /// (LAW E-5: the WS is the FILL). A gap is not a quiet market; it
+    /// is the arm trading with no idea what has filled.
+    pub halt_on_ws_gap_ms: i64,
+    /// **E6** — consecutive submits refused because the order named an
+    /// instance that has rolled, before a sticky halt. `0` = unset.
+    ///
+    /// LAW E-4 refuses such an order rather than sending it to
+    /// someone else's market, and one is a race with a roll. A STREAK
+    /// is a member quoting an instance that no longer exists.
+    pub halt_on_asset_refusal_streak: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
 }
@@ -195,6 +211,8 @@ impl ExecSlot {
             request_budget_floor: 0,
             halt_on_reject_streak: 0,
             halt_on_recon_drift_usd_1e6: 0,
+            halt_on_ws_gap_ms: 0,
+            halt_on_asset_refusal_streak: 0,
             line: 0,
         }
     }
@@ -393,6 +411,8 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         cap_instance_usd_1e6: opt_int(kv, "cap_instance_usd_1e6", 0)?,
         request_budget_floor: opt_int(kv, "request_budget_floor", 0)?,
         halt_on_reject_streak: opt_int(kv, "halt_on_reject_streak", 0)?,
+        halt_on_ws_gap_ms: opt_int(kv, "halt_on_ws_gap_ms", 0)?,
+        halt_on_asset_refusal_streak: opt_int(kv, "halt_on_asset_refusal_streak", 0)?,
         halt_on_recon_drift_usd_1e6: opt_int(kv, "halt_on_recon_drift_usd_1e6", 0)?,
         line,
     };
@@ -457,6 +477,38 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
              `max_open_orders` — `0` means UNSET here, never \"unlimited\""
         )));
     }
+    // E6 commit 3: the four halt triggers an operator sets. A live
+    // slot with any of them unset is a slot whose halt machine has a
+    // sensor wired to nothing — the declared-not-enforced shape this
+    // phase exists to remove, and one an operator would only discover
+    // by the halt never firing.
+    //
+    // The two money caps and `max_order_usd` joined this rule when
+    // they became clamps; these join it now for the same reason.
+    if s.is_live() {
+        for (name, v) in [
+            ("halt_on_reject_streak", s.halt_on_reject_streak),
+            ("halt_on_recon_drift_usd_1e6", s.halt_on_recon_drift_usd_1e6),
+            ("halt_on_ws_gap_ms", s.halt_on_ws_gap_ms),
+            ("halt_on_asset_refusal_streak", s.halt_on_asset_refusal_streak),
+            // Not a threshold the router compares against — the ARM
+            // owns this one, and reports a flag. It is required for
+            // the same reason all the same: at `0` the budget trigger
+            // fires only at TOTAL exhaustion, which is a kill switch
+            // that waits until the address is already bricked. `0`
+            // would be a floor with no room under it.
+            ("request_budget_floor", s.request_budget_floor),
+        ] {
+            if v == 0 {
+                return Err(err(format!(
+                    "slot {slot} at line {line}: `mode = \"live\"` needs a non-zero \
+                     `{name}` — `0` means UNSET here, never \"unlimited\", and a \
+                     halt trigger with no headroom never fires in time"
+                )));
+            }
+        }
+    }
+
     // E6: and it must fit the table the clamp is counted in.
     //
     // `exec_router::LEDGER_RESTING` holds every live slot's resting
@@ -603,20 +655,24 @@ max_open_orders      = 64
 request_budget_floor = 2000
 halt_on_reject_streak = 5
 halt_on_recon_drift_usd_1e6 = 5000000
+halt_on_ws_gap_ms = 30000
+halt_on_asset_refusal_streak = 3
 
 [exec.slot.1]
 mode = "paper"
 "#;
 
-    /// The smallest artifact that legally arms slot 3.
-    /// The smallest artifact that arms a live slot. **Every clamp is
-    /// here because every clamp is required** — E6 made the last two
-    /// enforceable, and `0` has always meant UNSET rather than
-    /// "unlimited".
+    /// The smallest artifact that legally arms slot 3. **Every clamp
+    /// and every halt threshold is here because every one of them is
+    /// required** — E6 made the last four enforceable, and `0` has
+    /// always meant UNSET rather than "unlimited".
     const MINIMAL_LIVE: &str = "[exec]\n[exec.slot.3]\nmode = \"live\"\nname = \"bin15\"\n\
          venues = [\"hyperliquid\"]\nmax_order_usd_1e6 = 100000000\n\
          cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
-         max_open_orders = 64\n";
+         max_open_orders = 64\nrequest_budget_floor = 2000\n\
+         halt_on_reject_streak = 5\n\
+         halt_on_recon_drift_usd_1e6 = 5000000\nhalt_on_ws_gap_ms = 30000\n\
+         halt_on_asset_refusal_streak = 3\n";
 
     fn expect_err(src: &str, needle: &str) {
         let e = parse(src).expect_err("must refuse");
@@ -642,6 +698,8 @@ mode = "paper"
         assert_eq!(s3.request_budget_floor, 2000);
         assert_eq!(s3.halt_on_reject_streak, 5);
         assert_eq!(s3.halt_on_recon_drift_usd_1e6, 5_000_000);
+        assert_eq!(s3.halt_on_ws_gap_ms, 30_000);
+        assert_eq!(s3.halt_on_asset_refusal_streak, 3);
         assert_eq!(f.slot(1).mode, "paper");
         assert_eq!(f.live_mask(), 0b0000_1000);
     }

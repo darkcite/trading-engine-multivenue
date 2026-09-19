@@ -1029,6 +1029,21 @@ impl Ledger {
         self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
     }
 
+    /// **E6 commit 3 — every slot's orders were cancelled at the
+    /// venue.**
+    ///
+    /// A halt's cancel-all is venue-wide, so the resting count is
+    /// stale for EVERY slot — including the healthy ones that keep
+    /// running and will simply re-quote. Leaving them counted would
+    /// have `max_open_orders` refuse a slot holding nothing.
+    ///
+    /// The exposure and turnover ledgers are untouched: a cancel
+    /// removes an order, not a position.
+    pub fn clear_resting(&mut self) {
+        self.resting = [RestingOrder::free(); LEDGER_RESTING];
+        self.resting_by_slot = [0; EXEC_SLOTS];
+    }
+
     /// A live cancel was accepted by the arm. Stops tracking it.
     ///
     /// A key that matches nothing is silent: the arm returns

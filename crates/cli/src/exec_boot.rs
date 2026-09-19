@@ -41,7 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
-use exec_router::{ExecMode, ExecRoute, SlotCaps, EXEC_SLOTS};
+use exec_router::{ExecMode, ExecRoute, HaltLimits, SlotCaps, EXEC_SLOTS};
 
 /// **E6 — the mirrored constants, held in agreement.**
 ///
@@ -183,6 +183,58 @@ pub fn parse_arm_live(spec: &str) -> Result<u8, String> {
     Ok(mask)
 }
 
+/// **Where `exec.HALT` lives: beside the artifact that armed the
+/// slots.**
+///
+/// Not a fixed path and not the cwd: an operator who runs two engines
+/// from two artifacts must get two halt files, and the artifact
+/// directory is the only place that is already per-engine. `path` is
+/// a file the boot has read, so it has a parent; a bare filename
+/// falls back to the cwd, which is where a bare filename was read
+/// from.
+#[must_use]
+pub fn halt_file_path(artifact: &Path) -> PathBuf {
+    artifact
+        .parent()
+        .map_or_else(|| PathBuf::from(HALT_FILE), |d| d.join(HALT_FILE))
+}
+
+/// The name of the file a halt writes, beside the exec artifact.
+pub const HALT_FILE: &str = "exec.HALT";
+
+/// Parse `--halt-slot 3` / `--halt-slot 3,5` into a slot mask.
+///
+/// Deliberately NOT gated on `--arm-live`: halting a slot is the safe
+/// direction, so it must be the one thing an operator can always ask
+/// for, including on a boot that arms nothing.
+///
+/// # Errors
+/// A part that is not a slot number, a slot outside `0..EXEC_SLOTS`,
+/// or a slot named twice.
+pub fn parse_halt_slots(spec: &str) -> Result<u8, String> {
+    let mut mask = 0u8;
+    for part in spec.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let slot: usize = p
+            .parse()
+            .map_err(|_| format!("--halt-slot: `{p}` is not a slot number"))?;
+        if slot >= EXEC_SLOTS {
+            return Err(format!(
+                "--halt-slot: slot {slot} is out of range (0..{EXEC_SLOTS})"
+            ));
+        }
+        let bit = 1u8 << slot;
+        if mask & bit != 0 {
+            return Err(format!("--halt-slot: slot {slot} named twice"));
+        }
+        mask |= bit;
+    }
+    Ok(mask)
+}
+
 /// Render a slot bitmask as `[3]` / `[0,1,2]` / `[]`.
 #[must_use]
 pub fn render_slot_mask(mask: u8) -> String {
@@ -298,11 +350,20 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     s.cap_day_usd_1e6,
                     s.max_open_orders,
                 ),
+                // E6 commit 3: the operator's halt thresholds. These
+                // were parsed and carried nowhere until the halt
+                // machine existed to read them.
+                HaltLimits::new(
+                    u32::try_from(s.halt_on_reject_streak).unwrap_or(u32::MAX),
+                    s.halt_on_recon_drift_usd_1e6,
+                    s.halt_on_ws_gap_ms,
+                    u32::try_from(s.halt_on_asset_refusal_streak).unwrap_or(u32::MAX),
+                ),
             )
             .map_err(|e| format!("exec: slot {slot}: {e}"))?;
-        // Keep every parsed number, not just the FOUR the hot table
-        // holds — the boot tell publishes all of them, and E4's budget
-        // governor and E6's halt machine read the rest from here.
+        // Keep every parsed number, not just the EIGHT the hot table
+        // holds — the boot tell publishes all of them, and E4's
+        // budget governor reads `request_budget_floor` from here.
         slots.push(s);
     }
 
@@ -425,22 +486,83 @@ mod tests {
         p
     }
 
+    /// **The shipped template must be a bootable live artifact.**
+    ///
+    /// `exec.toml.example` tells the operator to change `mode` to
+    /// `"live"`, so every key a live slot requires has to be in it.
+    /// E6 added two and the template was missed — the only sign was a
+    /// boot refusal naming a key the operator had never heard of.
+    /// This test is the thing that would have said so.
+    #[test]
+    fn the_shipped_template_arms_a_live_slot_without_further_edits() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exec.toml.example"),
+        )
+        .expect("exec.toml.example must ship with the repo");
+        // The one edit the file's own comments ask for.
+        let live = src.replacen("mode = \"paper\"", "mode = \"live\"", 1);
+        let f = core_config::exec::parse(&live).expect("the template must parse as live");
+        let s3 = f.slot(3);
+        assert!(s3.is_live(), "slot 3 is the one the template arms");
+        for (key, v) in [
+            ("halt_on_reject_streak", s3.halt_on_reject_streak),
+            ("halt_on_recon_drift_usd_1e6", s3.halt_on_recon_drift_usd_1e6),
+            ("halt_on_ws_gap_ms", s3.halt_on_ws_gap_ms),
+            ("halt_on_asset_refusal_streak", s3.halt_on_asset_refusal_streak),
+        ] {
+            assert!(v > 0, "template leaves `{key}` unset — the boot refuses");
+        }
+    }
+
+    #[test]
+    fn the_halt_file_lands_beside_the_artifact_that_armed_the_slots() {
+        assert_eq!(
+            halt_file_path(Path::new("/srv/bin15/exec.toml")),
+            PathBuf::from("/srv/bin15/exec.HALT")
+        );
+        // Two engines from two artifacts get two halt files.
+        assert_ne!(
+            halt_file_path(Path::new("/srv/a/exec.toml")),
+            halt_file_path(Path::new("/srv/b/exec.toml"))
+        );
+        // A bare filename was read from the cwd; the halt goes there.
+        assert_eq!(
+            halt_file_path(Path::new("exec.toml")),
+            PathBuf::from("exec.HALT")
+        );
+    }
+
+    #[test]
+    fn halt_slots_parse_the_same_shapes_arm_live_does() {
+        assert_eq!(parse_halt_slots("3").unwrap(), 0b0000_1000);
+        assert_eq!(parse_halt_slots("3,5").unwrap(), 0b0010_1000);
+        assert_eq!(parse_halt_slots("").unwrap(), 0);
+        assert!(parse_halt_slots("x").unwrap_err().contains("not a slot"));
+        assert!(parse_halt_slots("9").unwrap_err().contains("out of range"));
+        assert!(parse_halt_slots("3,3").unwrap_err().contains("twice"));
+    }
+
     /// The smallest artifact that legally arms slot 3.
     const MINIMAL_LIVE: &str = "[exec]\n[exec.slot.3]\nmode = \"live\"\nname = \"bin15\"\n\
          venues = [\"hyperliquid\"]\nmax_order_usd_1e6 = 100000000\n\
          cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
          max_open_orders = 64\nrequest_budget_floor = 2000\n\
-         halt_on_reject_streak = 5\nhalt_on_recon_drift_usd_1e6 = 5000000\n";
+         halt_on_reject_streak = 5\nhalt_on_recon_drift_usd_1e6 = 5000000\n\
+         halt_on_ws_gap_ms = 30000\nhalt_on_asset_refusal_streak = 3\n";
 
+    /// A directory of this test's own.
+    ///
+    /// **Counted, not clocked.** Keying this on the wall clock made it
+    /// a flaky gate: `cargo test` runs these in parallel, two threads
+    /// landing in the same clock tick got the SAME directory, and the
+    /// first to finish removed the other's artifact out from under it
+    /// — surfacing as `resolve()` reporting "no such file" in whatever
+    /// test lost the race, roughly one run in six. A counter cannot
+    /// tie.
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "exec-boot-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("exec-boot-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -608,6 +730,7 @@ mod tests {
                 ExecMode::Live,
                 &[4],
                 SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+                HaltLimits::none(),
             )
             .unwrap();
         let mut slot = core_config::exec::ExecSlot::paper_default(3);

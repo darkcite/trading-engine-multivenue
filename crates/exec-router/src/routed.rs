@@ -40,11 +40,12 @@
 //! the **paper arm only**.
 
 use crate::counters::{RiskRefusal, RouteCounters};
+use crate::halt::{trigger_for, CancelPhase, HaltReason, HaltState};
 use crate::ledger::Ledger;
 use crate::mode::ExecMode;
-use crate::route::ExecRoute;
+use crate::route::{ExecRoute, EXEC_SLOTS};
 use clob_dispatcher::{
-    DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
+    CancelAllState, DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
 };
 use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, Tick};
 
@@ -60,6 +61,16 @@ pub struct RoutedDispatcher<P: OrderDispatch, L: OrderDispatch> {
     paper: P,
     live: L,
     counters: RouteCounters,
+    /// **E6 commit 3** — the per-slot sticky halt.
+    halt: HaltState,
+    /// **E6 commit 3** — where to write `exec.HALT` so an auto-halt
+    /// survives a restart. `None` = do not persist (tests, and a boot
+    /// with no exec artifact).
+    ///
+    /// The scheduled daily restart would otherwise clear an auto-halt
+    /// at 00:10Z and resume trading into whatever tripped it,
+    /// unattended.
+    halt_path: Option<std::path::PathBuf>,
     /// **E6** — what the venue has actually done, as the router sees
     /// it. Boxed because it is ~14 KiB of tables and `RoutedDispatcher`
     /// is moved by value into the engine at boot; the engine's own
@@ -83,7 +94,158 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             paper,
             live,
             counters: RouteCounters::new(),
+            halt: HaltState::new(),
+            halt_path: None,
             ledger: Box::new(Ledger::new(anchor)),
+        }
+    }
+
+    /// **E6 commit 3** — the per-slot halt state. Cold; `/state`,
+    /// `/metrics` and tests.
+    #[inline]
+    #[must_use]
+    pub const fn halt(&self) -> &HaltState {
+        &self.halt
+    }
+
+    /// **E6 commit 3** — persist an auto-halt to this path.
+    ///
+    /// Boot-only. Without it a halt lives only in this process, and
+    /// the scheduled daily restart clears it at 00:10Z and resumes
+    /// trading into whatever tripped it, unattended.
+    #[inline]
+    pub fn set_halt_path(&mut self, path: std::path::PathBuf) {
+        self.halt_path = Some(path);
+    }
+
+    /// **E6 commit 3** — halt a slot on the operator's say-so.
+    ///
+    /// The same latch every trigger uses, so an operator halt is
+    /// exactly as sticky and cancels exactly as hard.
+    pub fn halt_slot(&mut self, slot: usize, why: HaltReason) {
+        if self.halt.latch(slot, why) {
+            self.on_halt_edge(slot, why);
+            // An operator halt does not wait for the next idle poll.
+            // It is usually a human reacting to something, and this
+            // path is also reachable at boot — from a halt file the
+            // last run left behind — where the idle driver has not
+            // started and might never, depending on the boot mode.
+            self.try_cancel_all();
+        }
+    }
+
+    /// One slot has just halted: clear what the ledger thinks is
+    /// resting, and write the file that makes the halt survive a
+    /// restart.
+    fn on_halt_edge(&mut self, slot: usize, why: HaltReason) {
+        // **The venue-wide cancel is not fired here.** `latch` marked
+        // it pending and the caller performs it through
+        // `try_cancel_all` — the single place that ever calls the
+        // arm's `cancel_all` — so the edge is not delayed by a tick,
+        // but it also cannot be attempted twice back to back with
+        // nothing changing at the venue in between.
+        //
+        // The same holds when two slots halt on one poll: cancel-all
+        // is venue-wide, so one call answers both edges.
+        self.write_halt_file(slot, why);
+    }
+
+    /// **The only place that calls the live arm's `cancel_all`.**
+    ///
+    /// One step per poll, and which step depends on where the cycle
+    /// is. `cancel_all` REQUESTS; `cancel_all_state` CONFIRMS. They
+    /// are separate because on a real venue they are separated by
+    /// minutes — the arm turns one cancel-all into a queued sweep per
+    /// live leg, and each sweep asks the venue what is resting and
+    /// cancels by oid over many idle moments.
+    ///
+    /// **Reading the request's `Ok(())` as the confirmation is a
+    /// fail-OPEN bug, and this lane shipped it for a day.** It made
+    /// the router stop retrying the moment the sweep was *queued*,
+    /// and — worse — zero the ledger's resting count for every slot
+    /// while those orders were still working, handing the HEALTHY
+    /// slots a permissive `max_open_orders` at the exact moment a
+    /// sibling slot had halted.
+    fn try_cancel_all(&mut self) {
+        match self.halt.cancel_phase() {
+            CancelPhase::None => return,
+            // Latched but never asked. Ask, below.
+            CancelPhase::Wanted => self.halt.cancel_requested(),
+            CancelPhase::Asked => match self.live.cancel_all_state() {
+                // The venue said it holds nothing of ours, so every
+                // slot's resting count is now TRUTHFULLY zero —
+                // including the healthy slots, which were cancelled
+                // too and will simply re-quote.
+                CancelAllState::Clear => {
+                    self.halt.cancel_cleared();
+                    self.ledger.clear_resting();
+                    return;
+                }
+                // A sweep is draining. It IS the retry; asking again
+                // every 2 ms would queue nothing and count everything.
+                CancelAllState::Working => return,
+                // The arm gave up on a leg, or never queued one. Ask
+                // again, below — a fresh request gives it fresh
+                // retries, and a halted slot with orders still
+                // working at the venue is the state LAW E-8 exists
+                // to avoid.
+                CancelAllState::Stranded => self.halt.cancel_stranded(),
+            },
+        }
+
+        // One request per poll, reached two ways. The re-request
+        // lives HERE rather than inside the `Stranded` arm so that
+        // confirming can never loop back into asking.
+        if self.live.cancel_all().is_err() {
+            self.halt.cancel_failed();
+            return;
+        }
+        // Confirm in the SAME poll. An arm that cancels synchronously
+        // is already clear; one that sweeps answers `Working`, so
+        // asking now costs nothing and keeps the halt edge crisp.
+        if matches!(self.live.cancel_all_state(), CancelAllState::Clear) {
+            self.halt.cancel_cleared();
+            self.ledger.clear_resting();
+        }
+    }
+
+    /// Write `exec.HALT`, once per halt edge. Best effort: a halt
+    /// that could not be persisted is still a halt, and refusing to
+    /// halt because a file write failed would be the wrong direction.
+    fn write_halt_file(&mut self, slot: usize, why: HaltReason) {
+        let Some(path) = self.halt_path.as_ref() else {
+            return;
+        };
+        // Fixed buffer, no `format!`: this runs on the engine
+        // thread. `write_atomic` takes `&str`, and every byte written
+        // here is ASCII by construction — the digits, the two
+        // literals and `HaltReason::as_str` — so the conversion
+        // cannot fail and is refused rather than unwrapped if it ever
+        // could.
+        let mut buf = [0u8; 64];
+        let mut n = 0usize;
+        {
+            let mut put = |bytes: &[u8]| {
+                let room = buf.len().saturating_sub(n);
+                let take = bytes.len().min(room);
+                buf[n..n + take].copy_from_slice(&bytes[..take]);
+                n += take;
+            };
+            put(b"slot=");
+            // Two digits, not one. `EXEC_SLOTS` is 8 today, so a
+            // single digit is correct today — and would silently
+            // mod-10 wrap the slot number in the one file an operator
+            // reads after an incident the moment the table grew.
+            if slot >= 10 {
+                put(&[b'0' + (slot / 10) as u8]);
+            }
+            put(&[b'0' + (slot % 10) as u8]);
+            put(b" reason=");
+            put(why.as_str().as_bytes());
+            put(b"\n");
+        }
+        if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+            let _ = core_io::write_atomic(path, text);
         }
     }
 
@@ -138,6 +300,16 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     #[inline]
     pub fn live(&self) -> &L {
         &self.live
+    }
+
+    /// The live arm, mutably. **Tests only.** Production never reaches
+    /// the arm this way — it goes through the `OrderDispatch` trait,
+    /// which is what the router is written against. A test uses it to
+    /// set the spy's `halt_signal()` payload before an idle poll.
+    #[cfg(test)]
+    #[inline]
+    pub fn live_mut(&mut self) -> &mut L {
+        &mut self.live
     }
 }
 
@@ -235,7 +407,25 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             return Err(DispatchError::RiskRefused);
         };
 
-        // ---- 0. does this ledger know what the venue holds? --------
+        // ---- 0a. is this slot halted? -------------------------------
+        //
+        // Before every clamp, because a halted slot's numbers are the
+        // least trustworthy thing in the process — a reconciliation
+        // drift halt means the ledger and the venue disagree, which
+        // is exactly what the clamps below are computed from.
+        //
+        // A CANCEL never reaches here (`cancel` does not call
+        // `risk_check`), which is the whole escape hatch: a halted
+        // slot can always get flat.
+        if self.halt.is_halted(slot) {
+            // Counted ONCE, in `RouteCounters`, alongside every other
+            // refusal reason. `HaltState` used to keep a second field
+            // of the same name and the same value that nothing ever
+            // read — two counters for one fact is how they drift.
+            return self.refuse(order.strategy_id, RiskRefusal::Halted);
+        }
+
+        // ---- 0b. does this ledger know what the venue holds? --------
         //
         // A ledger that has not been reconciled reads zero exposure,
         // zero turnover and zero resting orders — which after a
@@ -531,6 +721,45 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     fn on_idle(&mut self) -> bool {
         let a = self.paper.on_idle();
         let b = self.live.on_idle();
+
+        // **E6 commit 3 — the halt machine runs HERE, not on the
+        // dispatch path.**
+        //
+        // A dead venue is exactly the condition under which a member
+        // stops submitting, so a halt evaluated only on submit would
+        // fire last or never. Commit 3a gave this hook a thread on
+        // the `--exec` path, so the triggers are polled every 2 ms
+        // whether or not anything is trading.
+        let sig = self.live.halt_signal();
+
+        // The reconciler has compared this arm against the venue, so
+        // the ledger's numbers mean something. Until this, every live
+        // PLACE is refused — see `Ledger::mark_seeded`.
+        if sig.reconciled != 0 && !self.ledger.is_seeded() {
+            self.ledger.mark_seeded();
+        }
+
+        let mut slot = 0usize;
+        while slot < EXEC_SLOTS {
+            let here = slot;
+            slot += 1;
+            if !matches!(self.route.mode_at(here), Some(ExecMode::Live)) {
+                continue;
+            }
+            let Some(lim) = self.route.halts_at(here) else {
+                continue;
+            };
+            let why = trigger_for(&sig, &lim);
+            if self.halt.latch(here, why) {
+                self.on_halt_edge(here, why);
+            }
+        }
+
+        // The venue was not cleared on the edge. Retried here rather
+        // than once, because a halted slot with live orders is the
+        // state LAW E-8's machinery exists to avoid, and one failed
+        // attempt during a blip would leave it there for ever.
+        self.try_cancel_all();
         a | b
     }
 
@@ -619,7 +848,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
 
 #[cfg(test)]
 mod tests {
-    use crate::route::SlotCaps;
+    use crate::route::{HaltLimits, SlotCaps};
     use super::*;
 
     /// The two crates each name their own slot count (the dependency
@@ -724,6 +953,7 @@ mod tests {
             // before it reached whatever the test is about — and `0`
             // means UNSET, which `core_config::exec` refuses at boot.
             SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+            HaltLimits::none(),
         )
         .unwrap();
         r
@@ -775,7 +1005,7 @@ mod tests {
     #[test]
     fn an_off_slot_is_refused_by_both_arms() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none()).unwrap();
+        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none(), HaltLimits::none()).unwrap();
         let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default(), test_anchor());
         d.mark_ledger_seeded();
         assert_eq!(
@@ -798,6 +1028,7 @@ mod tests {
             ExecMode::Live,
             &[VenueId::Hyperliquid.to_u8()],
             SlotCaps::none(),
+            HaltLimits::none(),
         )
             .unwrap();
         let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default(), test_anchor());
@@ -965,7 +1196,7 @@ mod tests {
     #[test]
     fn an_off_slots_cancel_and_modify_are_refused_by_both_arms() {
         let mut r = ExecRoute::all_paper();
-        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none()).unwrap();
+        r.set_slot(6, ExecMode::Off, &[], SlotCaps::none(), HaltLimits::none()).unwrap();
         let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyLive::default(), test_anchor());
         d.mark_ledger_seeded();
         let o = order(6, VenueId::Hyperliquid, 5);
@@ -1232,6 +1463,7 @@ mod tests {
             ExecMode::Live,
             &[VenueId::Hyperliquid.to_u8()],
             caps,
+            HaltLimits::none(),
         )
         .unwrap();
         r
@@ -1620,5 +1852,591 @@ mod tests {
         over.client_oid = 3;
         assert!(d.submit(&over).is_ok(), "a new day, and no fill rolled it");
         assert_eq!(d.ledger().counters().day_rollovers, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // E6 commit 3 — the sticky halt, end to end
+    // -----------------------------------------------------------------
+
+    /// A live arm whose halt signal the test drives, and which
+    /// records every `cancel_all`.
+    #[derive(Debug, Default)]
+    struct SpyHalt {
+        seen: Vec<u64>,
+        cancelled: Vec<u64>,
+        modified: Vec<(u64, u64)>,
+        sig: core_types_halt::HaltSignal,
+        cancel_all_calls: usize,
+        /// The next N requests are refused.
+        cancel_all_fails: usize,
+        /// **How many idle moments a sweep takes before the venue
+        /// confirms.** `0` models a synchronous arm; anything higher
+        /// models the real one, which queues a sweep and drains it.
+        sweep_polls: usize,
+        /// Counts down in `on_idle`, exactly as the real arm's sweep
+        /// table drains there.
+        sweeping: usize,
+        /// The last request did not land, so the arm has stopped and
+        /// the venue was never confirmed clear.
+        stranded: bool,
+    }
+
+    /// `clob_dispatcher::HaltSignal` under a short name, so the test
+    /// fixtures read as what they are.
+    mod core_types_halt {
+        pub use clob_dispatcher::HaltSignal;
+    }
+
+    impl OrderDispatch for SpyHalt {
+        fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+            self.seen.push(order.client_oid);
+            Ok(())
+        }
+        fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+            self.cancelled.push(req.client_oid);
+            Ok(())
+        }
+        fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+            self.modified
+                .push((req.prev_client_oid(), req.order().client_oid));
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> DispatchStats {
+            DispatchStats::default()
+        }
+        fn halt_signal(&self) -> clob_dispatcher::HaltSignal {
+            self.sig
+        }
+        fn cancel_all(&mut self) -> Result<(), DispatchError> {
+            self.cancel_all_calls += 1;
+            if self.cancel_all_fails > 0 {
+                self.cancel_all_fails -= 1;
+                // A refused request leaves the arm stopped, not
+                // clear. Answering `Clear` here is exactly the
+                // fail-open the split exists to prevent.
+                self.stranded = true;
+                return Err(DispatchError::Disconnected);
+            }
+            self.stranded = false;
+            self.sweeping = self.sweep_polls;
+            Ok(())
+        }
+        fn cancel_all_state(&self) -> clob_dispatcher::CancelAllState {
+            if self.sweeping > 0 {
+                clob_dispatcher::CancelAllState::Working
+            } else if self.stranded {
+                clob_dispatcher::CancelAllState::Stranded
+            } else {
+                clob_dispatcher::CancelAllState::Clear
+            }
+        }
+        fn on_idle(&mut self) -> bool {
+            // The real arm drains its sweep table here too.
+            if self.sweeping > 0 {
+                self.sweeping -= 1;
+            }
+            false
+        }
+    }
+
+    /// The thresholds every halt test uses.
+    fn halt_limits() -> crate::route::HaltLimits {
+        crate::route::HaltLimits::new(5, 5_000_000, 30_000, 3)
+    }
+
+    /// A live slot 3 with real caps AND real halt thresholds, plus a
+    /// spy arm whose signal the test drives.
+    fn haltable() -> RoutedDispatcher<PaperDispatcher, SpyHalt> {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d = RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            SpyHalt::default(),
+            test_anchor(),
+        );
+        // A healthy, reconciled arm to start from.
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true);
+        d.on_idle();
+        d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
+        d
+    }
+
+    /// Drive one trigger and assert the whole contract: it halts, it
+    /// cancels the venue, it refuses a submit AND a modify, and it
+    /// still lets a cancel through.
+    fn assert_trigger(
+        set: impl FnOnce(&mut clob_dispatcher::HaltSignal),
+        expect: crate::halt::HaltReason,
+    ) {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        assert!(!d.halt().is_halted(slot), "healthy to start");
+        assert!(d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000)).is_ok());
+        let cancels_before = d.live().cancel_all_calls;
+
+        set(&mut d.live_mut().sig);
+        d.on_idle();
+
+        assert!(d.halt().is_halted(slot), "{expect:?} did not halt");
+        assert_eq!(d.halt().reason(slot), expect);
+        assert_eq!(
+            d.live().cancel_all_calls,
+            cancels_before + 1,
+            "{expect:?} halted without clearing the venue"
+        );
+        // The ledger's resting count went with it — those orders were
+        // cancelled, and leaving them counted would have
+        // `max_open_orders` refuse a slot holding nothing.
+        assert_eq!(d.ledger().slot_resting(slot), 0);
+
+        // Refused: a submit and a modify.
+        assert_eq!(
+            d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        let m = core_types::ModifyReq::new(1, leg_order(3, SYM_YES, true, 510_000, 1_000_000));
+        assert_eq!(d.modify(&m), Err(DispatchError::RiskRefused));
+        assert!(d.counters().refused_halted >= 2);
+
+        // Allowed: a cancel. The only way to get flat, and it never
+        // goes through the risk gate at all.
+        let c = core_types::CancelReq::of(&leg_order(1, SYM_YES, true, 500_000, 1_000_000), T0);
+        assert!(d.cancel(&c).is_ok(), "a halted slot must be able to flatten");
+    }
+
+    #[test]
+    fn a_reject_streak_halts_cancels_and_refuses() {
+        assert_trigger(|s| s.reject_streak = 5, crate::halt::HaltReason::RejectStreak);
+    }
+
+    #[test]
+    fn a_breached_budget_floor_halts_cancels_and_refuses() {
+        assert_trigger(
+            |s| s.budget_floor_breached = 1,
+            crate::halt::HaltReason::BudgetFloor,
+        );
+    }
+
+    #[test]
+    fn reconciliation_drift_halts_cancels_and_refuses() {
+        assert_trigger(
+            |s| s.recon_drift_usd_1e6 = 5_000_000,
+            crate::halt::HaltReason::ReconDrift,
+        );
+    }
+
+    #[test]
+    fn a_user_stream_gap_halts_cancels_and_refuses() {
+        assert_trigger(
+            |s| s.ws_gap_ns = 30_000_000_000,
+            crate::halt::HaltReason::WsGap,
+        );
+    }
+
+    #[test]
+    fn an_asset_refusal_streak_halts_cancels_and_refuses() {
+        assert_trigger(
+            |s| s.asset_refusal_streak = 3,
+            crate::halt::HaltReason::AssetRefusals,
+        );
+    }
+
+    /// **The day cap is NOT a halt trigger**, and the plan listed it
+    /// as one. Reaching it is the clamp working, and it clears itself
+    /// at 00:00Z — halting would stop the engine for good every day
+    /// it traded to its cap.
+    #[test]
+    fn spending_the_day_cap_refuses_but_does_not_halt() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, 1_000_000, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d = RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            SpyHalt::default(),
+            test_anchor(),
+        );
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true);
+        d.on_idle();
+        d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
+
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.on_fill_booked(&venue_fill(SYM_YES, true, 900_000, 9_000_000, 1));
+        assert!(d.ledger().slot_day_turnover_1e6(slot) > 1_000_000);
+        assert_eq!(
+            d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_cap_day, 1);
+        d.on_idle();
+        assert!(!d.halt().is_halted(slot), "a spent day cap is not a halt");
+    }
+
+    /// The halt machine runs on the IDLE path, so a dead venue halts
+    /// even when the member has stopped submitting — which is exactly
+    /// what a member does when the venue is dead.
+    #[test]
+    fn a_dead_venue_halts_with_no_order_flow_at_all() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_halted(slot));
+        assert!(d.live().seen.is_empty(), "nothing was ever submitted");
+    }
+
+    #[test]
+    fn a_failed_cancel_all_halts_anyway_and_is_retried() {
+        // Waiting for a successful cancel before refusing would keep
+        // submitting into the condition that tripped the halt.
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.live_mut().cancel_all_fails = 2;
+        d.live_mut().sig.reject_streak = 5;
+
+        d.on_idle();
+        assert!(d.halt().is_halted(slot), "halted despite the failed cancel");
+        assert!(d.halt().cancel_outstanding(), "the venue still holds them");
+        assert_eq!(d.halt().cancel_all_failures, 1);
+
+        // Retried from the idle path until it lands.
+        d.on_idle();
+        assert!(d.halt().cancel_outstanding());
+        assert_eq!(d.halt().cancel_all_failures, 2);
+        d.on_idle();
+        assert!(!d.halt().cancel_outstanding(), "and it landed");
+        assert_eq!(d.live().cancel_all_calls, 3);
+    }
+
+    #[test]
+    fn a_halt_edge_fires_cancel_all_once_not_once_per_poll() {
+        let mut d = haltable();
+        d.live_mut().sig.reject_streak = 5;
+        d.on_idle();
+        let after_edge = d.live().cancel_all_calls;
+        for _ in 0..50 {
+            d.on_idle();
+        }
+        assert_eq!(
+            d.live().cancel_all_calls,
+            after_edge,
+            "the venue was cleared, so nothing should be retried"
+        );
+        assert_eq!(d.halt().halts, 1, "one incident, one edge");
+    }
+
+    #[test]
+    fn a_paper_slot_is_untouched_by_a_live_slots_halt() {
+        let mut d = haltable();
+        d.live_mut().sig.reject_streak = 5;
+        d.on_idle();
+        assert!(d.halt().is_halted(STRATEGY_SLOT_BIN15 as usize));
+        // Slot 0 is paper and keeps trading.
+        assert!(!d.halt().is_halted(0));
+        assert!(d.submit(&order(0, VenueId::Polymarket, 99)).is_ok());
+    }
+
+    #[test]
+    fn the_reconciler_seeds_the_ledger_through_the_same_poll() {
+        // The deferred half of commit 2: nothing called
+        // `mark_ledger_seeded`, so a live slot refused every order for
+        // ever. The arm reports having reconciled on the same signal
+        // the halt triggers ride.
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d = RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            SpyHalt::default(),
+            test_anchor(),
+        );
+        d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
+
+        // An arm that has not reconciled: every live place refused.
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, false);
+        d.on_idle();
+        assert!(!d.ledger().is_seeded());
+        assert_eq!(
+            d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_unseeded, 1);
+
+        // It reconciles, and the gate opens.
+        d.live_mut().sig.reconciled = 1;
+        d.on_idle();
+        assert!(d.ledger().is_seeded());
+        assert!(d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)).is_ok());
+    }
+
+    #[test]
+    fn an_operator_halt_is_exactly_as_sticky_as_a_triggered_one() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.halt_slot(slot, crate::halt::HaltReason::Operator);
+        assert!(d.halt().is_halted(slot));
+        assert_eq!(d.halt().reason(slot), crate::halt::HaltReason::Operator);
+        assert_eq!(d.live().cancel_all_calls, 1, "it cancels just as hard");
+        for _ in 0..100 {
+            d.on_idle();
+        }
+        assert!(d.halt().is_halted(slot), "and nothing clears it");
+    }
+
+    #[test]
+    fn a_halt_writes_the_file_that_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "e6c3-halt-{}-{}",
+            std::process::id(),
+            core_types::fnv1a_64(b"a_halt_writes_the_file")
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("exec.HALT");
+
+        let mut d = haltable();
+        d.set_halt_path(path.clone());
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.on_idle();
+
+        let text = std::fs::read_to_string(&path).expect("exec.HALT must exist");
+        assert!(text.contains("reason=ws-gap"), "{text}");
+        assert!(
+            text.contains(&format!("slot={STRATEGY_SLOT_BIN15}")),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_halt_path_means_no_file_and_no_refusal_to_halt() {
+        // Best effort: a halt that could not be persisted is still a
+        // halt. Refusing to halt because a file write failed would be
+        // the wrong direction entirely.
+        let mut d = haltable();
+        d.live_mut().sig.ws_gap_ns = 30_000_000_000;
+        d.on_idle();
+        assert!(d.halt().is_halted(STRATEGY_SLOT_BIN15 as usize));
+    }
+
+    /// `cancel_all` is VENUE-WIDE. Two slots tripping on one poll is
+    /// one incident at one venue, so it is one call — not one per
+    /// halted slot, and not one per slot plus a retry.
+    #[test]
+    fn two_slots_halting_on_one_poll_share_one_cancel_all() {
+        let mut r = ExecRoute::all_paper();
+        let caps = SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64);
+        let a = STRATEGY_SLOT_BIN15 as usize;
+        let b = a + 1;
+        r.set_slot(
+            a,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            caps,
+            halt_limits(),
+        )
+        .unwrap();
+        r.set_slot(
+            b,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            caps,
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d = RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            SpyHalt::default(),
+            test_anchor(),
+        );
+
+        // One signal, read by both slots on the same poll.
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(30_000_000_000, 0, 0, 0, false, true);
+        d.on_idle();
+
+        assert!(d.halt().is_halted(a));
+        assert!(d.halt().is_halted(b));
+        assert_eq!(d.halt().halts, 2, "two slots, two halt edges");
+        assert_eq!(
+            d.live().cancel_all_calls,
+            1,
+            "but one venue, so one cancel-all"
+        );
+        assert!(!d.halt().cancel_outstanding());
+    }
+
+    /// **A queued sweep is not a cleared venue.**
+    ///
+    /// This is the defect the request/confirm split exists to
+    /// prevent. `cancel_all` returning `Ok` means the arm accepted
+    /// the request; the orders are still working until the venue says
+    /// otherwise, and the router must not act as though they are gone.
+    #[test]
+    fn a_queued_sweep_is_not_a_cleared_venue() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000))
+            .unwrap();
+        assert_eq!(d.ledger().slot_resting(slot), 1);
+
+        // An arm whose sweep takes three idle moments to drain.
+        d.live_mut().sweep_polls = 3;
+        d.live_mut().sig.reject_streak = 5;
+
+        d.on_idle();
+        assert!(d.halt().is_halted(slot), "halted on the edge");
+        assert_eq!(d.live().cancel_all_calls, 1, "and asked, once");
+        assert!(d.halt().cancel_outstanding());
+        assert_eq!(
+            d.ledger().slot_resting(slot),
+            1,
+            "the sweep is only QUEUED — the orders are still working"
+        );
+
+        // Draining. Still not clear, and not re-asked either: the
+        // sweep already running is the retry.
+        d.on_idle();
+        assert!(d.halt().cancel_outstanding());
+        assert_eq!(d.ledger().slot_resting(slot), 1);
+        assert_eq!(d.live().cancel_all_calls, 1, "not asked again");
+
+        d.on_idle();
+        assert!(d.halt().cancel_outstanding());
+
+        // The venue confirms.
+        d.on_idle();
+        assert!(!d.halt().cancel_outstanding(), "now it is clear");
+        assert_eq!(d.ledger().slot_resting(slot), 0);
+        assert_eq!(d.halt().cancel_all_failures, 0, "nothing ever failed");
+        assert_eq!(d.halt().cancel_all_stranded, 0);
+    }
+
+    /// An abandoned sweep is asked again. Left alone it would be a
+    /// stranded quote on a halted slot — the one state LAW E-8 exists
+    /// to prevent.
+    #[test]
+    fn an_abandoned_sweep_is_asked_again_rather_than_read_as_clear() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000))
+            .unwrap();
+        // The first request lands and the arm starts sweeping.
+        d.live_mut().sweep_polls = 4;
+        d.live_mut().sig.reject_streak = 5;
+        d.on_idle();
+        assert_eq!(d.live().cancel_all_calls, 1);
+        assert!(d.halt().cancel_outstanding(), "still sweeping");
+
+        // The sweep then burns its retries and is dropped with orders
+        // it never managed to cancel — `sweep_left` moves, the table
+        // empties, and the arm reports `Stranded` rather than reading
+        // its own empty table as a clear venue.
+        d.live_mut().sweeping = 0;
+        d.live_mut().stranded = true;
+        // The retry, modelled as landing cleanly.
+        d.live_mut().sweep_polls = 0;
+
+        d.on_idle();
+        assert_eq!(d.halt().cancel_all_stranded, 1, "counted as stranded");
+        assert_eq!(
+            d.halt().cancel_all_failures,
+            0,
+            "the request landed — that is a different number"
+        );
+        assert_eq!(d.live().cancel_all_calls, 2, "and asked again");
+        assert!(!d.halt().cancel_outstanding(), "the fresh ask confirmed");
+        assert_eq!(d.ledger().slot_resting(slot), 0);
+    }
+
+    /// A slot that halts while ANOTHER slot's sweep is draining gets
+    /// its own request — its legs were not in that sweep.
+    #[test]
+    fn a_slot_halting_during_anothers_sweep_gets_its_own_request() {
+        let mut r = ExecRoute::all_paper();
+        let caps = SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64);
+        let a = STRATEGY_SLOT_BIN15 as usize;
+        let b = a + 1;
+        for slot in [a, b] {
+            r.set_slot(
+                slot,
+                ExecMode::Live,
+                &[VenueId::Hyperliquid.to_u8()],
+                caps,
+                halt_limits(),
+            )
+            .unwrap();
+        }
+        let mut d = RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            SpyHalt::default(),
+            test_anchor(),
+        );
+        d.live_mut().sweep_polls = 8;
+
+        d.halt_slot(a, crate::halt::HaltReason::Operator);
+        assert_eq!(d.live().cancel_all_calls, 1);
+        d.on_idle();
+        assert_eq!(d.live().cancel_all_calls, 1, "a's sweep is draining");
+
+        d.halt_slot(b, crate::halt::HaltReason::Operator);
+        assert_eq!(
+            d.live().cancel_all_calls,
+            2,
+            "b's legs were not in a's sweep"
+        );
+    }
+
+    /// The resting count is only zeroed when the venue CONFIRMED it
+    /// holds nothing. Zeroing it on a failed attempt would tell
+    /// `max_open_orders` that a book still working at the venue is
+    /// gone, and let a healthy slot stack a second one on top of it.
+    #[test]
+    fn a_failed_cancel_all_leaves_the_resting_count_alone() {
+        let mut d = haltable();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        d.submit(&leg_order(1, SYM_YES, true, 500_000, 1_000_000))
+            .unwrap();
+        assert_eq!(d.ledger().slot_resting(slot), 1);
+
+        d.live_mut().cancel_all_fails = 1;
+        d.live_mut().sig.reject_streak = 5;
+        d.on_idle();
+
+        assert!(d.halt().is_halted(slot));
+        assert_eq!(d.halt().cancel_all_failures, 1);
+        assert_eq!(
+            d.ledger().slot_resting(slot),
+            1,
+            "the venue never said it let them go"
+        );
+
+        d.on_idle();
+        assert!(!d.halt().cancel_outstanding());
+        assert_eq!(d.ledger().slot_resting(slot), 0, "now it did");
     }
 }

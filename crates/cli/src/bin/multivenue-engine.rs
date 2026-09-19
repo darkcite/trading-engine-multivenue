@@ -574,6 +574,19 @@ struct RunArgs {
     /// point: no single edit reaches real money.
     #[arg(long, requires = "exec")]
     arm_live: Option<String>,
+    /// E6: boot with these slots already HALTED, e.g. `--halt-slot 3`
+    /// or `--halt-slot 3,5`.
+    ///
+    /// The operator's kill switch, applied before the first tick: a
+    /// halted slot refuses every submit and modify, cancels whatever
+    /// the arm is holding, and nothing in the process clears it.
+    ///
+    /// Unlike `--arm-live` this does NOT require `--exec`, and it is
+    /// deliberately not half of a two-switch interlock. Arming needs
+    /// two deliberate edits because it reaches real money; halting
+    /// needs one, because it is the direction that cannot.
+    #[arg(long)]
+    halt_slot: Option<String>,
     /// Universe config file (M1; TOML subset — see
     /// `universe.toml.example`). Explicit path must exist. Absent:
     /// `~/multivenue/universe.toml` is used IF present, else the
@@ -2529,6 +2542,35 @@ fn run(args: RunArgs) -> ExitCode {
     // between the two arming switches, or a live slot with no compiled
     // arm, should abort before the engine has done anything at all,
     // not after it is already streaming six venues.
+    // E6: parsed HERE, beside the artifact, for the same reason — a
+    // malformed kill switch must abort the boot, not be discovered at
+    // the moment someone reaches for it.
+    let halt_mask = match args
+        .halt_slot
+        .as_deref()
+        .map_or(Ok(0u8), cli::exec_boot::parse_halt_slots)
+    {
+        Ok(m) => m,
+        Err(reason) => {
+            error!(reason, "exec: --halt-slot refused — boot aborted");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
+    // Said out loud rather than refused. An operator reaching for the
+    // kill switch on a boot that has no route table has asked for
+    // something that is already true — every slot is paper and
+    // nothing can reach a venue — and refusing to start would be
+    // punishing them for asking for MORE safety. Staying silent would
+    // be worse: it would let them believe a switch fired that did not.
+    if halt_mask != 0 && args.exec.is_none() {
+        warn!(
+            halted = %cli::exec_boot::render_slot_mask(halt_mask),
+            "--halt-slot named slots but there is no --exec artifact: \
+             every slot is already paper and no order can reach a venue, \
+             so this flag halted nothing"
+        );
+    }
     let exec_boot = match cli::exec_boot::resolve(args.exec.as_deref(), args.arm_live.as_deref()) {
         Ok(e) => e,
         Err(reason) => {
@@ -3631,6 +3673,35 @@ fn run(args: RunArgs) -> ExitCode {
                 // rather than by care.
                 Some(eb) => {
                     cli::exec_boot::log_boot_tell(&eb);
+                    // **E6 commit 3 — the halt machine, wired.**
+                    //
+                    // `set_halt_path` before any halt can fire: the
+                    // writer is a no-op without it, and a halt that
+                    // leaves no file is cleared by the 00:10Z restart
+                    // and resumes trading into whatever tripped it,
+                    // unattended.
+                    let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
+                        eb.route,
+                        clob_dispatcher::PaperDispatcher::new(),
+                        exec_router::NullLiveDispatcher::new(),
+                        core_time::WallAnchor::now(),
+                    );
+                    exec_dispatcher
+                        .set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
+                    if halt_mask != 0 {
+                        warn!(
+                            halted = %cli::exec_boot::render_slot_mask(halt_mask),
+                            "--halt-slot: booting with slots already HALTED \
+                             — they will refuse every order until restarted \
+                             without the flag"
+                        );
+                        for slot in 0..exec_router::EXEC_SLOTS {
+                            if halt_mask & (1u8 << slot) != 0 {
+                                exec_dispatcher
+                                    .halt_slot(slot, exec_router::HaltReason::Operator);
+                            }
+                        }
+                    }
                     if eb.any_live() {
                         info!(
                             live = %cli::exec_boot::render_slot_mask(eb.live_mask),
@@ -3653,19 +3724,14 @@ fn run(args: RunArgs) -> ExitCode {
                         //
                         // The ledger is deliberately left UNSEEDED: it
                         // has not been reconciled against the venue, so
-                        // every live PLACE is refused until E6 commit 3
-                        // wires the reconciler to
-                        // `mark_ledger_seeded`. An `--exec` boot with a
-                        // live slot therefore trades nothing yet, and
-                        // says so on the first order rather than
-                        // clamping against a position it has never
-                        // seen.
-                        exec_router::RoutedDispatcher::new(
-                            eb.route,
-                            clob_dispatcher::PaperDispatcher::new(),
-                            exec_router::NullLiveDispatcher::new(),
-                            core_time::WallAnchor::now(),
-                        ),
+                        // every live PLACE is refused until the arm's
+                        // reconciler reports success, which E6 commit 3
+                        // reads from `halt_signal().reconciled` on the
+                        // idle path. An `--exec` boot with a live slot
+                        // therefore trades nothing until it has seen
+                        // the venue, rather than clamping against a
+                        // position it has never seen.
+                        exec_dispatcher,
                         obs,
                         requested,
                         vrp_boot.as_ref(),
