@@ -32,6 +32,13 @@ MODEL_REASONING: str = "claude-sonnet-5"  # news labeling, rule parsing
 # number — a name the SDK does not know fails at the first keyed `serve` cycle,
 # which is itself the Stage-3 entry gate, so nothing earlier would catch it.
 MODEL_STRATEGIST: str = "claude-fable-5-1"  # ruleset proposals (serve only)
+# NEWS §9.4 / ruling Q9: tier 3 reads ONE clustered story plus the engine's
+# context and returns a structured assessment, which is the only place in
+# this repo where a model's answer can become an order intent. Verified
+# against the installed SDK's `anthropic/types/model.py` Literal on
+# 2026-09-20 (`Model` is `Union[Literal[...], str]`, so the names are one
+# level inside `typing.get_args` — check the file, not the first tuple).
+MODEL_ANALYST: str = "claude-opus-5"  # tier-3 news analyst (serve only)
 
 _HMAC_KEY_HEX_LEN: int = 64  # 64 hex chars -> 32-byte key (design §4.1)
 _HMAC_KEY_BYTES: int = 32

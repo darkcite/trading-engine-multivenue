@@ -370,7 +370,8 @@ raises the launchd fd soft limit to 8192). After a restart run
 - Bulk artifact generation: `MODEL_BULK = "claude-haiku-4-5"`. Reasoning:
   `MODEL_REASONING = "claude-sonnet-5"`. Strategy proposals (`serve`
   strategist): `MODEL_STRATEGIST = "claude-fable-5-1"` (needs `anthropic >=
-  1.4.0`). Hard work — reviews, architecture, the three review agents:
+  1.4.0`). NEWS tier-3 event analyst (`serve` only): `MODEL_ANALYST =
+  "claude-opus-5"`. Hard work — reviews, architecture, the three review agents:
   Opus 5 (`claude-opus-5`).
 - These are constants in `claude-worker/src/claude_worker/config.py`, pinned
   by `tests/test_config.py` — change the doc and the constant together, and

@@ -66,6 +66,11 @@ class Commander:
         self._last_heartbeat_ns: int | None = None
         self.emitted_total: int = 0
         self.refused_low_confidence_total: int = 0
+        #: NEWS §9.3: a v2 label may answer `direction = "none"` — the
+        #: story moves vol or liquidity without a sign. A bias frame with
+        #: no sign is not a bias, so it is refused here rather than
+        #: silently emitted as `down`. v1 labels never carry it.
+        self.refused_no_direction_total: int = 0
 
     def maybe_heartbeat(self, now_ns: int) -> bool:
         """Send a Heartbeat when the 5 s cadence is due (first call is
@@ -86,6 +91,9 @@ class Commander:
         """One label -> one SetBias frame, or a counted refusal when the
         label is below the policy's confidence floor. Returns the seq
         used, None when refused."""
+        if label.direction == "none":
+            self.refused_no_direction_total += 1
+            return None
         if label.confidence < self._policy.min_confidence:
             self.refused_low_confidence_total += 1
             return None

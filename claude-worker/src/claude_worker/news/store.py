@@ -264,6 +264,12 @@ STATE_LABELED: str = "labeled"
 STATE_ASSESSED: str = "assessed"
 STATE_SKIPPED: str = "skipped"
 
+#: ``stories.state`` vocabulary (spec §9.2).
+STORY_OPEN: str = "open"
+STORY_LABELED: str = "labeled"
+STORY_ASSESSED: str = "assessed"
+STORY_CLOSED: str = "closed"
+
 #: ``prune`` drops only items that fed nothing (spec §6).
 _PRUNABLE_STATES: tuple[str, ...] = (STATE_SKIPPED, STATE_TRIAGED)
 
@@ -463,6 +469,83 @@ class Store:
                 (since_ts, tier0),
             )
         return self._rows("SELECT * FROM items WHERE ts >= ? ORDER BY ts", (since_ts,))
+
+    def items_pending_triage(self, limit: int) -> list[dict[str, object]]:
+        """Tier-0 survivors no model has seen yet, OLDEST first.
+
+        Oldest first on purpose: a backlog drains in the order the world
+        happened, so a burst never starves the item that started it.
+        """
+        return self._rows(
+            """
+            SELECT * FROM items
+            WHERE triage_state = ? AND tier0 = ?
+            ORDER BY ts LIMIT ?
+            """,
+            (STATE_NEW, TIER0_PASS, limit),
+        )
+
+    def items_to_cluster(self, limit: int) -> list[dict[str, object]]:
+        """Triaged items that reached a clusterable impact and have not
+        been attached to a story yet, with their triage joined on.
+
+        One query, and self-healing: an item whose pass ended before
+        clustering (a spent budget, a crash) is picked up by the next one
+        rather than stranded between two tables.
+        """
+        return self._rows(
+            """
+            SELECT i.source AS source, i.guid AS guid, i.ts AS ts, i.title AS title,
+                   i.text AS text, i.origin AS origin, i.weight AS weight, i.venue AS venue,
+                   t.family AS family, t.event_type AS event_type, t.impact AS impact,
+                   t.venues AS venues, t.assets AS assets
+            FROM items AS i JOIN triage AS t ON t.source = i.source AND t.guid = i.guid
+            WHERE i.triage_state = ? AND i.story_id = ''
+            ORDER BY i.ts LIMIT ?
+            """,
+            (STATE_ESCALATED, limit),
+        )
+
+    def story_items(self, story_id: str, limit: int = 0) -> list[dict[str, object]]:
+        """Every item attached to a story, newest first."""
+        if limit > 0:
+            return self._rows(
+                "SELECT * FROM items WHERE story_id = ? ORDER BY ts DESC LIMIT ?",
+                (story_id, limit),
+            )
+        return self._rows(
+            "SELECT * FROM items WHERE story_id = ? ORDER BY ts DESC", (story_id,)
+        )
+
+    def stories_open(self, since_ts: int) -> list[dict[str, object]]:
+        """Stories still gathering items, oldest first. The clustering
+        window bounds the scan, so this never grows with the table."""
+        return self._rows(
+            "SELECT * FROM stories WHERE state != ? AND last_ts >= ? ORDER BY first_ts",
+            (STORY_CLOSED, since_ts),
+        )
+
+    def stories_unlabeled(self, since_ts: int) -> list[dict[str, object]]:
+        """Open stories that have no label yet — tier 2's queue."""
+        return self._rows(
+            """
+            SELECT s.* FROM stories AS s
+            LEFT JOIN labels AS l ON l.story_id = s.story_id
+            WHERE l.story_id IS NULL AND s.state = ? AND s.last_ts >= ?
+            ORDER BY s.first_ts
+            """,
+            (STORY_OPEN, since_ts),
+        )
+
+    def close_stale_stories(self, before_ts: int) -> int:
+        """A story with no item for a whole window is finished (spec §9.2).
+        Returns how many closed."""
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE stories SET state = ? WHERE state != ? AND last_ts < ?",
+                (STORY_CLOSED, STORY_CLOSED, before_ts),
+            )
+        return max(0, cursor.rowcount)
 
     # ---- snapshots / series --------------------------------------------
 
