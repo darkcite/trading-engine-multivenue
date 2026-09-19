@@ -17,6 +17,7 @@ import threading
 import pytest
 
 import claude_worker.dashboard
+import claude_worker.news.store
 import claude_worker.pnl_report
 import claude_worker.state
 
@@ -159,6 +160,7 @@ def _worker_dir(tmp_path: pathlib.Path) -> claude_worker.dashboard.Inputs:
         candidates_dir=candidates,
         replay_dir=replay,
         multivenue_dir=mv,
+        news_dir=worker / "news",
         engine_url="http://127.0.0.1:1",  # nothing listens here — the proxy must 502
     )
 
@@ -227,6 +229,7 @@ def test_worker_payload_without_a_db_is_empty_not_an_error(tmp_path: pathlib.Pat
         candidates_dir=tmp_path / "candidates",
         replay_dir=tmp_path / "logs",
         multivenue_dir=tmp_path / "mv",
+        news_dir=tmp_path / "news",
         engine_url="http://127.0.0.1:1",
     )
     doc = claude_worker.dashboard.worker_payload(inputs, now_ms=0)
@@ -295,3 +298,127 @@ def test_main_once_prints_the_document(
     assert doc["v"] == 1 and doc["db"]["path"] == str(inputs.db_path)
     assert doc["config"]["strategy_conf"] == "STRATEGY=ai+icdp\n"
     assert doc["pnl"]["latest"]["day"] == "2026-09-04"
+
+
+# ---- the NEWS panel (NEWS spec §15) ----
+
+_NEWS_NOW_MS: int = 1_758_290_000_000
+
+
+def _seed_news(inputs: claude_worker.dashboard.Inputs) -> None:
+    """A news.db with one healthy source, one failing one, a full tier-0
+    funnel and an event — everything the panel reads."""
+    now = _NEWS_NOW_MS // 1000
+    db = inputs.news_dir / claude_worker.news.DB_FILENAME
+    with claude_worker.news.store.Store(db) as store:
+        store.upsert_source("okx-ann", "json-okx-ann", "B", "www.okx.com", 1)
+        store.upsert_source("mill", "rss", "C", "mill.example", 1)
+        store.record_poll("okx-ann", now, claude_worker.news.store.PollOutcome(ok=True))
+        for i in range(12):
+            store.record_poll(
+                "mill", now, claude_worker.news.store.PollOutcome(error="http 503")
+            )
+        store.record_poll(
+            "mill", now, claude_worker.news.store.PollOutcome(refused_origin=True)
+        )
+        verdicts = (
+            claude_worker.news.store.TIER0_PASS,
+            claude_worker.news.store.TIER0_DROP_DUP,
+            claude_worker.news.store.TIER0_DROP_VOCAB,
+            claude_worker.news.store.TIER0_DROP_VOCAB,
+        )
+        for i in range(len(verdicts)):
+            store.upsert_item(
+                source="okx-ann",
+                guid=f"g{i}",
+                ts=now - i,
+                fetched_ts=now,
+                title=f"headline {i}",
+                link="https://www.okx.com/a",
+                text="body",
+                origin="www.okx.com",
+                class_="B",
+                weight=1.0,
+                venue="okx",
+                tier0=verdicts[i],
+            )
+        store.add_items_total("okx-ann", len(verdicts))
+        store.insert_event(
+            kind="delisting",
+            venue="okx",
+            at_ts=now - 10,
+            source="okx-inst",
+            detail="FOO-USDT-SWAP left the set",
+            created_ts=now,
+            instrument="FOO-USDT-SWAP",
+        )
+        store.counter_inc(claude_worker.news.store.COUNTER_PARSE_EMPTY, 3)
+
+
+def test_the_news_panel_renders_without_a_store(tmp_path: pathlib.Path) -> None:
+    """The lane is optional: a worker that never installed news.toml must
+    still serve a page, not a 500."""
+    inputs = _worker_dir(tmp_path)
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=_NEWS_NOW_MS)
+    news = doc["news"]
+    assert isinstance(news, dict)
+    assert news["db"]["present"] is False
+    assert news["sources"] == [] and news["events"] == []
+    assert news["funnel_24h"] == {} and news["items_24h"] == 0
+    assert news["alert"] is None and news["calendar"] is None and news["scorecard"] is None
+
+
+def test_the_news_panel_reports_the_funnel_health_and_events(tmp_path: pathlib.Path) -> None:
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=_NEWS_NOW_MS)
+    news = doc["news"]
+    assert isinstance(news, dict)
+    assert news["db"]["present"] is True
+    assert news["items_24h"] == 4
+    assert news["funnel_24h"] == {"pass": 1, "drop_dup": 1, "drop_vocab": 2}
+    by_name = {str(r["name"]): r for r in news["sources"]}
+    assert by_name["okx-ann"]["polls_ok"] == 1
+    assert by_name["okx-ann"]["items_total"] == 4
+    # The failing source is visibly failing — this is what `health` alerts on.
+    assert by_name["mill"]["err_streak"] == 13
+    assert by_name["mill"]["refused_origin_total"] == 1
+    assert len(news["events"]) == 1
+    assert news["events"][0]["instrument"] == "FOO-USDT-SWAP"
+    assert news["counters"][claude_worker.news.store.COUNTER_PARSE_EMPTY] == 3
+
+
+def test_the_news_panel_surfaces_a_red_alert_and_the_calendar(tmp_path: pathlib.Path) -> None:
+    inputs = _worker_dir(tmp_path)
+    _seed_news(inputs)
+    inputs.news_dir.mkdir(parents=True, exist_ok=True)
+    (inputs.news_dir / claude_worker.news.ALERT_FILE).write_text(
+        "2026-09-19T14:00:00Z venue_risk OKX withdrawals halted\n", encoding="utf-8"
+    )
+    (inputs.news_dir / claude_worker.news.CALENDAR_FILE).write_text(
+        '{"v": 1, "generated_ts": 1758290000, "events": []}', encoding="utf-8"
+    )
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=_NEWS_NOW_MS)
+    news = doc["news"]
+    assert isinstance(news, dict)
+    assert "withdrawals halted" in str(news["alert"])
+    assert news["calendar"]["v"] == 1
+
+
+def test_an_unreadable_news_store_is_still_a_page(tmp_path: pathlib.Path) -> None:
+    """A truncated or foreign file where news.db belongs renders empty."""
+    inputs = _worker_dir(tmp_path)
+    inputs.news_dir.mkdir(parents=True, exist_ok=True)
+    (inputs.news_dir / claude_worker.news.DB_FILENAME).write_bytes(b"not a database")
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=_NEWS_NOW_MS)
+    news = doc["news"]
+    assert isinstance(news, dict)
+    assert news["db"]["present"] is True
+    assert news["sources"] == []
+
+
+def test_the_news_panel_is_wired_into_the_page() -> None:
+    html = claude_worker.dashboard.HTML_PATH.read_text(encoding="utf-8")
+    assert 'id="s-news"' in html and 'id="news"' in html
+    assert "function renderNews()" in html
+    assert "renderNews();" in html

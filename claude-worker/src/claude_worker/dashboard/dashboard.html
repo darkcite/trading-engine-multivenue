@@ -67,6 +67,7 @@
   <section id="s-latency"><h2>Latency &amp; loop</h2><div id="latency"></div></section>
   <section id="s-ai"><h2>AI plane <small id="ai-sub"></small></h2><div id="ai"></div></section>
   <section id="s-positions"><h2>Positions <small id="positions-sub"></small></h2><div id="positions"></div></section>
+  <section id="s-news" class="wide"><h2>News &amp; events <small id="news-sub"></small></h2><div id="news"></div></section>
   <section id="s-config" class="wide"><h2>Configs <small>read-only</small></h2><div id="config"></div></section>
 </main>
 <script>
@@ -279,6 +280,60 @@ function renderLibrary() {
   set('library', html);
 }
 
+// ---- news & events ----
+function renderNews() {
+  if (!W || !W.news) { set('news', '<span class="muted">n/a</span>'); return; }
+  const N = W.news;
+  if (!N.db.present) {
+    set('news-sub', 'not installed');
+    set('news', `<span class="muted">no store at ${esc(N.db.path)} — copy news.toml.example to ~/multivenue/news.toml and run the cycle</span>`);
+    return;
+  }
+  const S = N.sources || [];
+  const enabled = S.filter(r => r.enabled);
+  const sick = enabled.filter(r => r.err_streak >= 10).length;
+  const refused = S.reduce((a, r) => a + (r.refused_origin_total || 0), 0);
+  set('news-sub', `${enabled.length}/${S.length} enabled · ${n(N.items_24h, 0)} items/24h · ${sick ? `<span class="bad">${sick} failing</span>` : '<span class="ok">all polling</span>'} · refused ${refused ? `<span class="bad">${refused}</span>` : '0'}`);
+
+  let html = '';
+  if (N.alert) html += `<div class="bad" style="margin-bottom:6px">ALERT ${esc(N.alert)}</div>`;
+
+  const F = N.funnel_24h || {};
+  const order = ['pass', 'drop_dup', 'drop_vocab', 'drop_weight', 'drop_cap'];
+  const total = order.reduce((a, k) => a + (F[k] || 0), 0);
+  const pct = k => total ? `${(100 * (F[k] || 0) / total).toFixed(0)}%` : '—';
+  html += '<div class="muted">tier 0, last 24 h</div>' + table(
+    ['pass', 'near-dup', 'no vocab', 'low weight', 'capped', 'total'],
+    [order.map(k => `${n(F[k] || 0, 0)} <span class="dim">${pct(k)}</span>`).concat([n(total, 0)])],
+    [0, 1, 2, 3, 4, 5]);
+
+  const rows = S.map(r => {
+    const ratio = r.polls_total ? r.polls_ok / r.polls_total : null;
+    const cls = !r.enabled ? 'dim' : r.err_streak >= 10 ? 'bad' : r.err_streak > 0 ? 'warn' : 'ok';
+    return [esc(r.name), esc(r.kind), esc(r.class), r.enabled ? '1' : '<span class="dim">0</span>',
+            `<span class="${cls}">${ratio === null ? '—' : (100 * ratio).toFixed(0) + '%'}</span>`,
+            n(r.polls_total, 0), n(r.items_total, 0), n(r.err_streak, 0),
+            r.refused_origin_total ? `<span class="bad">${n(r.refused_origin_total, 0)}</span>` : '0',
+            n(r.budget_skips_total, 0), esc(String(r.last_error || '').slice(0, 48))];
+  });
+  html += '<div class="muted" style="margin-top:6px">sources</div>' + table(
+    ['source', 'kind', 'cls', 'en', 'ok%', 'polls', 'items', 'streak', 'refused', 'budget', 'last error'],
+    rows, [5, 6, 7, 8, 9]);
+
+  const EV = N.events || [];
+  if (EV.length) {
+    html += '<div class="muted" style="margin-top:6px">events</div>' + table(
+      ['at', 'kind', 'venue', 'instrument', 'source', 'detail'],
+      EV.slice().reverse().map(e => [tsLocal(Number(e.at_ts) * 1000), esc(e.kind), esc(e.venue),
+                                     esc(e.instrument), esc(e.source), esc(String(e.detail).slice(0, 80))]));
+  }
+  const C = N.counters || {};
+  const keys = Object.keys(C).sort();
+  if (keys.length) html += `<div class="muted" style="margin-top:6px">counters: ${keys.map(k => `${esc(k)}=${n(C[k], 0)}`).join(' · ')}</div>`;
+  if (N.scorecard) html += `<div class="muted" style="margin-top:6px">scorecard generated ${tsLocal(Number(N.scorecard.generated_ts) * 1000)}</div>`;
+  set('news', html);
+}
+
 // ---- recent trades ----
 function renderRecent() {
   if (!E) { set('recent', '<span class="muted">n/a</span>'); return; }
@@ -337,7 +392,7 @@ function renderConfig() {
 }
 
 function renderAll() {
-  renderBar(); renderRegime(); renderStrategies(); renderPnl(); renderRuleset(); renderLibrary(); renderRecent(); renderIngress(); renderLatency(); renderAi(); renderPositions(); renderConfig();
+  renderBar(); renderRegime(); renderStrategies(); renderPnl(); renderRuleset(); renderLibrary(); renderRecent(); renderIngress(); renderLatency(); renderAi(); renderPositions(); renderNews(); renderConfig();
 }
 async function pollEngine() {
   try { const r = await fetch('/api/engine/state', {cache: 'no-store'}); if (!r.ok) throw new Error(`engine ${r.status}`); E = await r.json(); engineErr = null; }

@@ -51,6 +51,8 @@ import urllib.request
 import claude_worker.features
 import claude_worker.frames
 import claude_worker.library
+import claude_worker.news
+import claude_worker.news.store
 import claude_worker.pnl_report
 import claude_worker.regime
 import claude_worker.state
@@ -93,6 +95,7 @@ class Inputs:
     candidates_dir: pathlib.Path
     replay_dir: pathlib.Path
     multivenue_dir: pathlib.Path
+    news_dir: pathlib.Path
     engine_url: str
 
 
@@ -112,6 +115,7 @@ def inputs_from_env(env: typing.Mapping[str, str] | None = None) -> Inputs:
         multivenue_dir=pathlib.Path(
             e.get(MULTIVENUE_DIR_ENV, "") or MULTIVENUE_DIR_DEFAULT
         ).expanduser(),
+        news_dir=claude_worker.news.paths_from_env(e).news_dir,
         engine_url=(e.get(ENGINE_URL_ENV, "") or ENGINE_URL_DEFAULT).rstrip("/"),
     )
 
@@ -221,6 +225,74 @@ def regime_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
         "dims": claude_worker.frames.REGIME_DIMS,
         "values": claude_worker.frames.REGIME_VALUES,
     }
+
+
+#: How far back the NEWS funnel counts (the page shows one day).
+NEWS_WINDOW_S: int = 86_400
+#: Rows the NEWS panel shows at most.
+NEWS_EVENTS_MAX: int = 20
+
+
+def _news_funnel(
+    store: claude_worker.news.store.Store, since_ts: int
+) -> tuple[dict[str, int], int]:
+    """Items by tier-0 verdict over the window, and the total."""
+    by_verdict: dict[str, int] = {}
+    rows = store.items_since(since_ts)
+    for i in range(len(rows)):
+        verdict = str(rows[i]["tier0"])
+        by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
+    return by_verdict, len(rows)
+
+
+def news_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
+    """The NEWS lane panel (NEWS spec §15).
+
+    Read-only and fail-soft like every other section: an absent ``news.db``
+    (the lane was never installed) renders as ``present: false`` with empty
+    tables, and an unreadable one renders the same way. The page never 500s
+    because a lane the operator has not set up is missing.
+    """
+    db_path = inputs.news_dir / claude_worker.news.DB_FILENAME
+    payload: dict[str, object] = {
+        "dir": str(inputs.news_dir),
+        "db": {"path": str(db_path), "present": db_path.is_file()},
+        "sources": [],
+        "funnel_24h": {},
+        "items_24h": 0,
+        "events": [],
+        "counters": {},
+        "alert": None,
+        "calendar": None,
+        "scorecard": None,
+    }
+    alert = inputs.news_dir / claude_worker.news.ALERT_FILE
+    if alert.is_file():
+        try:
+            payload["alert"] = alert.read_text(encoding="utf-8").strip()[:CONFIG_TEXT_MAX]
+        except OSError:
+            payload["alert"] = None
+    payload["calendar"] = _load_json(inputs.news_dir / claude_worker.news.CALENDAR_FILE)
+    payload["scorecard"] = _load_json(inputs.news_dir / claude_worker.news.SCORECARD_FILE)
+    if not db_path.is_file():
+        return payload
+    since = now_ms // 1000 - NEWS_WINDOW_S
+    try:
+        store = claude_worker.news.store.Store(db_path)
+    except (OSError, claude_worker.news.store.StoreError, sqlite3.Error):
+        return payload
+    try:
+        payload["sources"] = store.source_rows()
+        by_verdict, total = _news_funnel(store, since)
+        payload["funnel_24h"] = by_verdict
+        payload["items_24h"] = total
+        payload["events"] = store.events_since(since)[-NEWS_EVENTS_MAX:]
+        payload["counters"] = store.counters()
+    except sqlite3.Error:
+        pass
+    finally:
+        store.close()
+    return payload
 
 
 def pnl_section(reports_dir: pathlib.Path) -> dict[str, object]:
@@ -387,6 +459,7 @@ def worker_payload(
         "positions": positions_section(inputs.replay_dir) if positions is None else positions,
         "config": config_section(inputs),
         "disk": disk_section(inputs.replay_dir),
+        "news": news_section(inputs, ts),
     }
 
 
