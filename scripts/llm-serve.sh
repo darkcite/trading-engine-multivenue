@@ -22,10 +22,24 @@ set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$REPO/claude-worker/.venv"
 ALIAS="${CLAUDE_WORKER_VENV_ALIAS:-$HOME/multivenue/venv}"
-LLAMA="${LLAMA_SERVER_BIN:-llama-server}"
 
 [ -f "$HOME/multivenue/llm.toml" ] || exit 0
-command -v "$LLAMA" >/dev/null 2>&1 || exit 0
+
+# launchd gives a job the minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
+# does NOT contain a Homebrew prefix — so resolving the binary by name works in
+# an interactive shell and silently exits 0 under launchd. Resolve it here, and
+# say where it was looked for if it is genuinely absent.
+LLAMA="${LLAMA_SERVER_BIN:-}"
+if [ -z "$LLAMA" ]; then
+  for candidate in /opt/homebrew/bin/llama-server /usr/local/bin/llama-server; do
+    [ -x "$candidate" ] && LLAMA="$candidate" && break
+  done
+fi
+[ -z "$LLAMA" ] && LLAMA="$(command -v llama-server 2>/dev/null || true)"
+if [ -z "$LLAMA" ]; then
+  echo "llm-serve: no llama-server (looked in /opt/homebrew/bin, /usr/local/bin, PATH)" >&2
+  exit 0
+fi
 
 # The alias keeps `claude-worker` out of the argv of the process that renders
 # the args, the way news-cycle.sh does for the cycle itself.
@@ -33,8 +47,15 @@ PY="$ALIAS/bin/python3"
 [ -x "$PY" ] || PY="$VENV/bin/python3"
 [ -x "$PY" ] || exit 0
 
-ARGS="$("$PY" -m claude_worker.news llm-args --skip-sha 2>/dev/null)" || exit 0
+ARGS="$("$PY" -m claude_worker.news llm-args --skip-sha 2>&1)" || {
+  echo "llm-serve: llm-args refused: $ARGS" >&2
+  exit 0
+}
 [ -n "$ARGS" ] || exit 0
+
+# `llm-args` prints the argv starting with the bare name; swap in the resolved
+# path so the exec does not depend on PATH either.
+ARGS="$LLAMA${ARGS#llama-server}"
 
 # shellcheck disable=SC2086 -- the argv is rendered, deliberately word-split
 exec nice -n 10 taskpolicy -c utility $ARGS
