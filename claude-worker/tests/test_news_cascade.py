@@ -812,6 +812,7 @@ def test_an_empty_completion_is_counted_and_never_cached(
         assert len(empty.calls) == 2, "the second pass asked again"
         counters = store.counters()
         assert counters.get(claude_worker.news.cascade.COUNTER_EMPTY_COMPLETION) == 2
+
         # ...and a real answer still caches, so the fix is narrow.
         good = _Fake(_triage_json())
         first = claude_worker.news.cascade.complete_cached(
@@ -881,3 +882,96 @@ def test_the_entity_rule_is_counted_and_switchable(tmp_path: pathlib.Path) -> No
             )
             assert counted == want_stories, "the rule reports what it bought"
             state.close()
+
+
+# ---- §9.2 the story key is resolved, the gate is not ----------------------
+
+
+def test_the_story_key_takes_the_venue_from_the_source_not_the_tagger(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The measured change (gold set, 2026-09-20): the key's entities come
+    from the title and the registry, not from the tagger's `entities`.
+
+    The tagger here names NOTHING — which is the common case for a venue
+    announcement whose title never says the venue's name — and the row still
+    keys on `bybit` and `BTC`. Key match against the adjudicated gold set:
+    0.660, against 0.500 for the tagger's own answer.
+    """
+    fake = _Fake(_triage_json(impact="med", entities={"venues": [], "assets": []}))
+    registry = claude_worker.news.sources.Registry(
+        settings=claude_worker.news.sources.NewsSettings(),
+        keywords=(),
+        calendar=claude_worker.news.sources.Calendar(),
+        sources=(
+            claude_worker.news.sources.Source(
+                name="bybit-ann", kind="json-bybit-ann", url="https://api.bybit.com/x",
+                origin="api.bybit.com", class_="B", venue="bybit",
+            ),
+        ),
+    )
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        store.upsert_item(
+            source="bybit-ann", guid="g1", ts=NOW, fetched_ts=NOW,
+            title="New listing: BTCUSDT Perpetual Contract, with up to 25x leverage",
+            link="l", text="body", origin="api.bybit.com", class_="B", weight=1.0,
+            venue="bybit", hint="",
+        )
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store, registry=registry, symbol_map={"BTC-UP": 7},
+            vocab=ASSETS, complete_fn=fake, now_fn=lambda: NOW,
+        )
+        watcher.poll_once()
+        triage = store._rows("SELECT * FROM triage", ())
+        assert len(triage) == 1
+        # The tagger said nothing; the key says what the story is about.
+        assert json.loads(str(triage[0]["venues"])) == ["bybit"]
+        assert json.loads(str(triage[0]["assets"])) == ["BTC"]
+        state.close()
+
+
+def test_the_escalation_gate_still_reads_the_taggers_own_answer(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The gate was measured at recall 0.930 over what the TAGGER named, and
+    the deterministic key must not silently re-aim it.
+
+    A `low` item from a venue-origin source would escalate on the entity rule
+    if the gate read the resolved key — the source venue is always there. It
+    must not: the gate asks whether the tagger noticed something, and here it
+    did not.
+    """
+    fake = _Fake(_triage_json(impact="low", entities={"venues": [], "assets": []}))
+    registry = claude_worker.news.sources.Registry(
+        settings=claude_worker.news.sources.NewsSettings(),
+        keywords=(),
+        calendar=claude_worker.news.sources.Calendar(),
+        sources=(
+            claude_worker.news.sources.Source(
+                name="deribit-insights", kind="rss", url="https://insights.deribit.com/f",
+                origin="insights.deribit.com", class_="C", venue="deribit",
+            ),
+        ),
+    )
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        store.upsert_item(
+            source="deribit-insights", guid="g1", ts=NOW, fetched_ts=NOW,
+            title="Crypto Derivatives: Analytics Report - Week 35", link="l",
+            text="body", origin="insights.deribit.com", class_="C", weight=1.0,
+            venue="deribit", hint="",
+        )
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store, registry=registry, symbol_map={"BTC-UP": 7},
+            vocab=ASSETS, complete_fn=fake, now_fn=lambda: NOW,
+        )
+        poll = watcher.poll_once()
+        assert poll.escalated == 0
+        assert store.counters().get(
+            claude_worker.news.cascade.COUNTER_ESCALATED_ON_ENTITY, 0
+        ) == 0
+        # ...while the key it stored DID resolve the venue.
+        triage = store._rows("SELECT * FROM triage", ())
+        assert json.loads(str(triage[0]["venues"])) == ["deribit"]
+        state.close()

@@ -44,6 +44,7 @@ import claude_worker.feeds
 import claude_worker.labeling
 import claude_worker.news
 import claude_worker.news.detect
+import claude_worker.news.entities
 import claude_worker.news.resolve
 import claude_worker.news.sources
 import claude_worker.news.store
@@ -231,27 +232,61 @@ def typed_triage(
     if source.class_ != "B" or not source.venue or hint not in TYPED_EVENT_TYPES:
         return None
     impact = "high" if hint in TYPED_HIGH_IMPACTS else "med"
-    named: list[str] = []
-    upper = title.upper()
-    for i in range(len(assets)):
-        if assets[i].upper() in upper:
-            named.append(assets[i])
-    venue = source.venue if source.venue in claude_worker.labeling.VENUE_NAMES else "other"
+    # The assets used to be a naive substring scan of the upper-cased title,
+    # with no word boundary: "Bybit Reaches a Major MILESTONE: ... GRAPE and
+    # THOUSAND Tokens" named APE, ONE and SAND. `news.entities` does the same
+    # job with boundaries, an alias table and instrument names, and its venue
+    # resolution folds in this source's own — which is the authoritative part
+    # and the reason this shortcut exists.
+    venues, named = claude_worker.news.entities.resolve(
+        title, assets, source.venue, claude_worker.labeling.VENUE_NAMES
+    )
     return claude_worker.labeling.TriageV2(
         family="crypto",
         impact=impact,
         reason=f"{source.venue} announcement typed as {hint}",
         event_type=hint,
-        venues=(venue,),
-        assets=tuple(sorted(set(named))),
+        venues=venues,
+        assets=named,
     )
+
+
+def for_story_key(
+    result: claude_worker.labeling.TriageV2,
+    source: claude_worker.news.sources.Source | None,
+    title: str,
+    vocab: typing.Sequence[str],
+) -> claude_worker.labeling.TriageV2:
+    """``result`` with the entities the STORY KEY is built from (§9.2).
+
+    Deterministic: assets from the title against our own closed vocabulary,
+    venue from the source's registry entry. See `news.entities` for why and
+    for the gold-set numbers — key match 0.660 against the tagger's 0.500.
+
+    Returned as a re-keyed `TriageV2` rather than a bare pair so the tagger's
+    own answer survives alongside it: `should_escalate` still reads that one,
+    and the caller holding both makes the difference impossible to miss.
+
+    A row whose source has vanished from the registry between the fetch and
+    now keeps what the tagger said — with no `Source` there is no venue to
+    resolve, and a half-deterministic key is worse than either.
+    """
+    if source is None:
+        return result
+    venues, assets = claude_worker.news.entities.resolve(
+        title, vocab, source.venue, claude_worker.labeling.VENUE_NAMES
+    )
+    return result._replace(venues=venues, assets=assets)
 
 
 def triage_row(
     source: str, guid: str, model: str, result: claude_worker.labeling.TriageV2, now_ts: int
 ) -> dict[str, object]:
     """One `triage` row. ``venues``/``assets`` are JSON arrays, already
-    sorted by the parser, so a story key hashes the same every time."""
+    sorted by the parser, so a story key hashes the same every time.
+
+    ``result`` is the KEY result, not necessarily the tagger's answer:
+    `_run_triage` passes it through `for_story_key` first."""
     return {
         "source": source,
         "guid": guid,
@@ -1080,14 +1115,26 @@ class NewsQueueWatcher:
             self._store.counter_inc(COUNTER_TRIAGE_MALFORMED)
         return result
 
-    def _typed(self, row: dict[str, object]) -> claude_worker.labeling.TriageV2 | None:
+    def _typed(
+        self, row: dict[str, object]
+    ) -> tuple[
+        claude_worker.news.sources.Source | None,
+        claude_worker.labeling.TriageV2 | None,
+    ]:
         """The class-B shortcut (spec §9.1): a venue announcing its own
         business has already said what it is, and a model guessing at it
-        would be strictly worse evidence as well as a wasted call."""
+        would be strictly worse evidence as well as a wasted call.
+
+        The `Source` comes back with it: `_run_triage` needs it for the
+        deterministic entity resolution and looking it up twice would be two
+        registry walks per item."""
         source = self._registry.by_name(str(row["source"]))
         if source is None:
-            return None
-        return typed_triage(source, str(row["title"]), str(row.get("hint", "")), self._vocab)
+            return None, None
+        typed = typed_triage(
+            source, str(row["title"]), str(row.get("hint", "")), self._vocab
+        )
+        return source, typed
 
     def _run_triage(self, poll: claude_worker.feeds.PollStats, now_ts: int) -> list[str]:
         """Tier 1 over the oldest pending survivors. Returns the ids of the
@@ -1109,7 +1156,7 @@ class NewsQueueWatcher:
             row = rows[i]
             source = str(row["source"])
             guid = str(row["guid"])
-            typed = self._typed(row)
+            src, typed = self._typed(row)
             model = self._models.tier1
             if typed is not None:
                 model = MODEL_TYPED
@@ -1120,7 +1167,17 @@ class NewsQueueWatcher:
                     source, guid, claude_worker.news.store.STATE_SKIPPED
                 )
                 continue
-            self._store.put_triage(triage_row(source, guid, model, result, now_ts))
+            # The KEY is resolved deterministically; the GATE below still
+            # reads the tagger's own answer. Different questions: the key asks
+            # what the story is about, the gate asks whether the tagger
+            # noticed anything, and it is the latter that was measured at
+            # recall 0.930. See `for_story_key` and `should_escalate`.
+            # `typed_triage` already resolved its own entities through the
+            # same module, so re-keying it would be a second identical call.
+            keyed = result if typed is not None else for_story_key(
+                result, src, str(row["title"]), self._vocab
+            )
+            self._store.put_triage(triage_row(source, guid, model, keyed, now_ts))
             escalate = should_escalate(
                 result, bool(self._registry.settings.escalate_on_named_entity)
             )
