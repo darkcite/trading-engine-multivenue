@@ -537,7 +537,7 @@ def test_the_session_tag_separates_the_prompt_cache(tmp_path: pathlib.Path) -> N
         prompt = watcher.triage_prompt(typing.cast(dict[str, object], row))
         cached, hit = state.cached_complete(
             claude_worker.news.cascade.MODEL_SESSION,
-            claude_worker.labeling.TRIAGE_PROMPT_VERSION_V2,
+            claude_worker.labeling.TRIAGE_PROMPT_VERSION_V3,
             prompt,
             lambda model, text: "never called",
         )
@@ -550,7 +550,7 @@ def test_the_session_tag_separates_the_prompt_cache(tmp_path: pathlib.Path) -> N
 
         other, other_hit = state.cached_complete(
             claude_worker.config.MODEL_BULK,
-            claude_worker.labeling.TRIAGE_PROMPT_VERSION_V2,
+            claude_worker.labeling.TRIAGE_PROMPT_VERSION_V3,
             prompt,
             bulk,
         )

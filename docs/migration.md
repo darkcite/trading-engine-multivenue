@@ -167,6 +167,37 @@ window before quoting one). Every existing root still
 replays byte for byte — the capture is untouched; only the scorer's
 refusal threshold moved.
 
+## 2026-09-20 — tier-1 triage prompt `triage-v2` → `triage-v3` (impact rubric only)
+
+**No schema change, no parser change, no config change.** `build_triage_prompt_v3`
+keeps v2's JSON shape, closed vocabularies and item fencing byte for byte;
+`parse_triage_v2` reads a v3 answer unchanged. Only the impact rubric differs, and
+`TRIAGE_PROMPT_VERSION_V3` is what keeps the two apart in the prompt cache — a v2
+answer was given under a different definition of `high` and must never be replayed
+for a v3 question. Both builders and both version constants remain exported; the
+cascade asks v3.
+
+Why (operator ruling 2026-09-20, on 150 Opus-adjudicated items): v2 defined `high`
+by a list of event KINDS including "maintenance" and "regulatory action". The gold
+set says `regulatory` is med 22 times against high 3, `maintenance` med 10 against
+high 2, and `fomc` — 5 of 5 high — was not in v2's list at all. **94 % of the local
+model's med→high errors were items v2 itself declares high**, and a frontier model
+erred in the same place; mechanically adopting v2's rule into the gold set made
+agreement worse for both (0.627 → 0.580 and 0.630 → 0.521). So `high` now names the
+ACTION it earns — "this one report alone justifies interrupting an analyst NOW" —
+with event kinds as illustrations rather than as the test.
+
+Second change, same ruling: the med/low line is the one that actually gates the
+lane (`ESCALATE_IMPACTS = ("med", "high")`), so the prompt now states the tiebreak
+— when the call is close, answer `med`, because a missed event costs more than a
+wasted look. A tagger given no tiebreak picks its own, and this lane's is not
+symmetric.
+
+Ripple: every tier-1 `prompt_cache` entry is cold on the first v3 pass — by design,
+and the calls are re-paid once. `triage` rows written from here carry
+`prompt_version = "triage-v3"`; any comparison spanning the boundary must split on
+that column rather than pooling. Record: `docs/research/feeds/04-gold-set-and-gates-2026-09-20.md`.
+
 ## 2026-09-19 — Deribit spot rows subscribe `quote` + `book` only (no `trades`); capture carries no Trade rows for `BTC_USDC`
 
 **No wire-format change, no file-layout change, no config change.** The

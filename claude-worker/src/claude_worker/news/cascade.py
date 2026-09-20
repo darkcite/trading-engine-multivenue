@@ -251,7 +251,7 @@ def triage_row(
         "source": source,
         "guid": guid,
         "model": model,
-        "prompt_version": claude_worker.labeling.TRIAGE_PROMPT_VERSION_V2,
+        "prompt_version": claude_worker.labeling.TRIAGE_PROMPT_VERSION_V3,
         "cache_hit": 0,
         "family": result.family,
         "impact": result.impact,
@@ -1020,7 +1020,7 @@ class NewsQueueWatcher:
         different questions — a duplicated f-string here would be a silent
         cache miss and a wasted human pass.
         """
-        return claude_worker.labeling.build_triage_prompt_v2(
+        return claude_worker.labeling.build_triage_prompt_v3(
             str(row["title"]), str(row["text"]), self._vocab
         )
 
@@ -1034,7 +1034,7 @@ class NewsQueueWatcher:
             self._ceilings,
             self.budget_tier(TIER1),
             self._models.tier1,
-            claude_worker.labeling.TRIAGE_PROMPT_VERSION_V2,
+            claude_worker.labeling.TRIAGE_PROMPT_VERSION_V3,
             prompt,
             self._complete_fn,
             now_ts=now_ts,
