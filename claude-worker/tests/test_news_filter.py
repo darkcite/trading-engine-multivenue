@@ -351,3 +351,82 @@ def test_the_asset_list_is_tickers_only_and_drops_quote_duplicates() -> None:
     # Sorted and unique, so the prompt text is deterministic and the cache
     # key for one item does not move between cycles.
     assert list(vocab.assets) == sorted(set(vocab.assets))
+
+
+# ---- the tier-2 menu (doc 03 finding 3, 2026-09-20) -----------------------
+
+
+#: One of the 27 Polymarket CLOB token ids the live map carries as a NAME.
+RAW_ID: str = "71423091995281421569049483578795165916750772181249002772963926241618543567909"
+
+
+def test_a_raw_venue_id_is_not_a_market_name() -> None:
+    assert claude_worker.news.filter.is_raw_market_id(RAW_ID)
+    assert claude_worker.news.filter.is_raw_market_id(" 113671852401471742541 ")
+    # A real name is never a long run of digits, and a short number is a
+    # name a venue could plausibly use.
+    assert not claude_worker.news.filter.is_raw_market_id("BTC-UP")
+    assert not claude_worker.news.filter.is_raw_market_id("1000PEPE")
+    assert not claude_worker.news.filter.is_raw_market_id("42")
+
+
+def test_the_menu_offers_only_what_the_run_still_agrees_with() -> None:
+    """The live shape, 2026-09-20: a perp whose name IS its descriptor, a
+    token id, and four Polymarket names sharing two slots that now carry
+    something else entirely — including a Fed-rates market on the same sym
+    as the Bitcoin dailies. Naming one of those does not name a settled
+    market, it names a DIFFERENT UNDERLYING, so none of them is offered and
+    no "canonical" one is invented."""
+    markets = {
+        "binance-usdm:solusdt": 16_777_731,
+        RAW_ID: 42,
+        "Bitcoin Up or Down on August 22?": 42,
+        "bitcoin-up-or-down-on-september-1-2026": 42,
+        "Will the Fed decrease interest rates by 25 bps at the next meeting?": 42,
+        "Ethereum Up or Down on September 1?": 3,
+    }
+    descriptors = {
+        16_777_731: "binance-usdm:solusdt",
+        42: "77000913001596421533092826130547686125108595735288460407310406855818448852926",
+        3: "54917514915978021107540776117639596739424210253104427531373723820109308652540",
+    }
+    menu = claude_worker.news.filter.tradeable_markets(markets, descriptors)
+    assert menu == {"binance-usdm:solusdt": 16_777_731}
+    # A name returns to the menu the moment the run agrees with it again.
+    agreed = dict(descriptors)
+    agreed[3] = "Ethereum Up or Down on September 1?"
+    assert claude_worker.news.filter.tradeable_markets(markets, agreed) == {
+        "binance-usdm:solusdt": 16_777_731,
+        "Ethereum Up or Down on September 1?": 3,
+    }
+    assert list(menu) == sorted(menu), "deterministic on any machine"
+
+
+def test_a_raw_id_is_refused_even_when_the_run_agrees_with_it() -> None:
+    """A token id that IS the live descriptor still buys nothing: no model
+    can match 70 digits to a headline, and 27 of them cost 2165 tokens."""
+    menu = claude_worker.news.filter.tradeable_markets({RAW_ID: 42}, {42: RAW_ID})
+    assert menu == {}
+
+
+def test_an_unreadable_manifest_narrows_the_menu_but_never_empties_it() -> None:
+    """`None` means "no manifest", not "nothing agrees". Failing every name
+    would make each tier-2 answer a null — a silent, total outage."""
+    markets = {"binance-usdm:solusdt": 16_777_731, RAW_ID: 42,
+               "Bitcoin Up or Down on August 22?": 42}
+    menu = claude_worker.news.filter.tradeable_markets(markets, None)
+    assert menu == {
+        "binance-usdm:solusdt": 16_777_731,
+        "Bitcoin Up or Down on August 22?": 42,
+    }
+    assert claude_worker.news.filter.tradeable_markets({}, None) == {}
+
+
+def test_the_menu_from_a_missing_map_is_empty_not_an_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    menu = claude_worker.news.filter.tradeable_markets_from(
+        tmp_path / "absent.json", tmp_path / "no-runs"
+    )
+    assert menu == {}
+    assert claude_worker.news.filter.descriptors_from(tmp_path / "no-runs") is None

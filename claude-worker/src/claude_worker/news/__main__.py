@@ -238,12 +238,20 @@ def _policy(paths: claude_worker.news.NewsPaths) -> claude_worker.news.actions.N
 
 
 def _markets(paths: claude_worker.news.NewsPaths) -> dict[str, int]:
-    """The market map, or an empty one. A missing file narrows what a tier
-    may name; it never stops a lane (`filter.vocabulary_from`'s contract)."""
-    try:
-        return dict(claude_worker.cli.load_market_map(paths.market_map_path).markets)
-    except (OSError, ValueError):
-        return {}
+    """The market MENU — the map filtered to what can actually be traded and
+    named (`filter.tradeable_markets`). A missing file narrows what a tier
+    may name; it never stops a lane (`filter.vocabulary_from`'s contract).
+
+    Every consumer of a market NAME goes through here — the tier-2 prompt,
+    the strict parse that validates its answer, the analyst context and the
+    emitter's name→sym resolution — so a market that has settled cannot be
+    offered, named, or acted on. Tier 0's vocabulary deliberately does NOT
+    come through here: a wider net costs nothing there, and its job is to
+    keep items, not to price them.
+    """
+    return claude_worker.news.filter.tradeable_markets_from(
+        paths.market_map_path, paths.replay_dir
+    )
 
 
 def _vocab(

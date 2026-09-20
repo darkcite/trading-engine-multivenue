@@ -591,3 +591,158 @@ def test_canonical_json_round_trips_a_null_market_and_venue() -> None:
     assert second == first, "the stored body is not the parsed one"
     # ...and it is a FIXED POINT, so a re-store cannot drift either.
     assert claude_worker.news.cascade.canonical_json(second) == body
+
+
+# ---- the 2026-09-20 "0 labels, ever" fixes ---------------------------------
+
+
+class _ByTier:
+    """One `complete_fn` that answers whichever tier asked: the tier-2
+    prompt is the only one that offers a market list."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, model: str, prompt: str) -> str:
+        self.calls.append((model, prompt))
+        if "Markets:" in prompt:
+            return json.dumps({
+                "market": "BTC-UP", "direction": "up", "confidence": 0.6,
+                "half_life_s": 3600, "vol": "up", "liquidity": "none",
+            })
+        return _triage_json()
+
+
+def _plain_registry(**over: object) -> claude_worker.news.sources.Registry:
+    settings = claude_worker.news.sources.NewsSettings(**over)  # type: ignore[arg-type]
+    return claude_worker.news.sources.Registry(
+        settings=settings,
+        keywords=(),
+        calendar=claude_worker.news.sources.Calendar(),
+        sources=(
+            claude_worker.news.sources.Source(
+                name="press", kind="rss", url="https://example.invalid/f",
+                origin="example.invalid", class_="C", venue="",
+            ),
+        ),
+    )
+
+
+def test_a_story_built_from_an_old_item_still_reaches_tier_2(
+    tmp_path: pathlib.Path,
+) -> None:
+    """THE regression for "219 stories, 0 labels" (doc 03 finding 4).
+
+    Clustering closes a story whose newest item is older than one window,
+    and it does so at the END of the same call that opened it — so a story
+    born from an item older than the window was born closed. Tier 2's queue
+    used to ask for `state = 'open' AND last_ts >= now - window`: both
+    predicates exclude exactly that story, and it could never be labeled.
+    Here the item is 8 h old against a 6 h window, which is the shape that
+    produced zero labels on the live store, and the label must still happen.
+    """
+    fake = _ByTier()
+    registry = _plain_registry()
+    old_ts = NOW - 8 * 3600
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        store.upsert_item(
+            source="press", guid="g-old", ts=old_ts, fetched_ts=NOW,
+            title="Exchange halts BTC withdrawals", link="l", text="body",
+            origin="example.invalid", class_="C", weight=1.0, venue="",
+        )
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store, registry=registry, symbol_map={"BTC-UP": 7},
+            vocab=ASSETS, complete_fn=fake, now_fn=lambda: NOW,
+        )
+        watcher.poll_once()
+        stories = store._rows("SELECT * FROM stories", ())
+        assert len(stories) == 1, "the item escalated and opened its story"
+        labels = store._rows("SELECT * FROM labels", ())
+        assert len(labels) == 1, "a closed story is FINISHED, so it gets its label"
+        assert str(stories[0]["last_ts"]) == str(old_ts), (
+            "the story is dated from its ITEM, which is what put it outside the "
+            "old window"
+        )
+        # The pre-fix queue — `state = 'open' AND last_ts >= now - window` —
+        # over the same row, to show the two predicates really were
+        # complementary and this story could never have been labeled.
+        window = registry.settings.story_window_s
+        assert store._rows(
+            "SELECT * FROM stories WHERE state = ? AND last_ts >= ?",
+            (claude_worker.news.store.STORY_OPEN, NOW - window),
+        ) == [], "the old queue saw nothing, whatever the story's state now is"
+        state.close()
+
+
+def test_the_triage_queue_retires_items_older_than_the_ceiling(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The oldest-first queue must not let a backlog starve today's news:
+    an item past `triage_max_age_s` is retired without a model call, and
+    counted."""
+    fake = _Fake(_triage_json())
+    registry = _plain_registry(triage_max_age_s=3600)
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        store.upsert_item(
+            source="press", guid="stale", ts=NOW - 7200, fetched_ts=NOW,
+            title="Yesterday's halt", link="l", text="body",
+            origin="example.invalid", class_="C", weight=1.0, venue="",
+        )
+        store.upsert_item(
+            source="press", guid="fresh", ts=NOW - 60, fetched_ts=NOW,
+            title="Exchange halts BTC withdrawals", link="l", text="body",
+            origin="example.invalid", class_="C", weight=1.0, venue="",
+        )
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store, registry=registry, symbol_map={"BTC-UP": 7},
+            vocab=ASSETS, complete_fn=fake, now_fn=lambda: NOW,
+        )
+        watcher.poll_once()
+        rows = {str(r["guid"]): str(r["triage_state"]) for r in store._rows(
+            "SELECT guid, triage_state FROM items", ()
+        )}
+        assert rows["stale"] == claude_worker.news.store.STATE_SKIPPED
+        assert rows["fresh"] != claude_worker.news.store.STATE_NEW, "the fresh one ran"
+        counters = store.counters()
+        assert counters.get(claude_worker.news.cascade.COUNTER_TRIAGE_EXPIRED) == 1
+        triaged_titles = [c[1] for c in fake.calls]
+        assert not any("Yesterday" in prompt for prompt in triaged_titles), (
+            "a retired item costs no model call"
+        )
+        state.close()
+
+
+def test_an_empty_completion_is_counted_and_never_cached(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A context overflow or a dead socket returns "". Caching it makes the
+    outage permanent (79 rows had to be deleted by hand on 2026-09-20), so
+    the cache refuses it and the next pass asks again."""
+    empty = _Fake("")
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        for _ in range(2):
+            answer = claude_worker.news.cascade.complete_cached(
+                state, store, {"tier1": 10}, claude_worker.news.cascade.TIER1,
+                "local:test", "v1", "the prompt", empty, now_ts=NOW,
+            )
+            assert answer == ("", False), "never a cache HIT on a non-answer"
+        assert len(empty.calls) == 2, "the second pass asked again"
+        counters = store.counters()
+        assert counters.get(claude_worker.news.cascade.COUNTER_EMPTY_COMPLETION) == 2
+        # ...and a real answer still caches, so the fix is narrow.
+        good = _Fake(_triage_json())
+        first = claude_worker.news.cascade.complete_cached(
+            state, store, {"tier1": 10}, claude_worker.news.cascade.TIER1,
+            "local:test", "v1", "another prompt", good, now_ts=NOW,
+        )
+        second = claude_worker.news.cascade.complete_cached(
+            state, store, {"tier1": 10}, claude_worker.news.cascade.TIER1,
+            "local:test", "v1", "another prompt", good, now_ts=NOW,
+        )
+        assert first is not None and second is not None
+        assert first[1] is False and second[1] is True
+        assert len(good.calls) == 1
+        state.close()

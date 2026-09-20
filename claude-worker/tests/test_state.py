@@ -190,3 +190,37 @@ def test_ruleset_stage_bad_author_mode_raises(tmp_path: pathlib.Path) -> None:
     with pytest.raises(claude_worker.state.StateError):
         st.stage_ruleset("ee" * 32, "rs.json", "r.json", "operator")
     st.close()
+
+
+def test_cached_complete_never_stores_an_empty_answer(tmp_path: pathlib.Path) -> None:
+    """A falsy completion is a FAILURE — a context overflow, a dead socket,
+    a refused call — and caching one makes the outage permanent: on
+    2026-09-20 the local sidecar's 79 context-overflow refusals were stored
+    under its model key and every re-run replayed them from cache, so the
+    rows had to be deleted by hand before the comparison could be repeated.
+    A real answer must still cache, or every question is paid for twice."""
+    st = claude_worker.state.State(tmp_path / "state.db")
+    calls: list[str] = []
+
+    def empty(model: str, prompt: str) -> str:
+        calls.append(prompt)
+        return ""
+
+    def whitespace(model: str, prompt: str) -> str:
+        calls.append(prompt)
+        return "  \n "
+
+    def good(model: str, prompt: str) -> str:
+        calls.append(prompt)
+        return '{"ok": true}'
+
+    assert st.cached_complete("m", "v1", "p", empty) == ("", False)
+    assert st.cached_complete("m", "v1", "p", empty) == ("", False)
+    assert len(calls) == 2, "the second pass asked again rather than replaying ''"
+    assert st.cached_complete("m", "v1", "w", whitespace)[1] is False
+    assert st.cached_complete("m", "v1", "w", whitespace)[1] is False
+    assert len(calls) == 4, "whitespace is not an answer either"
+    assert st.cached_complete("m", "v1", "q", good) == ('{"ok": true}', False)
+    assert st.cached_complete("m", "v1", "q", good) == ('{"ok": true}', True)
+    assert len(calls) == 5, "a real answer is cached exactly once"
+    st.close()

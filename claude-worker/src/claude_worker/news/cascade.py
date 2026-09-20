@@ -94,6 +94,15 @@ ESCALATE_IMPACTS: tuple[str, ...] = ("med", "high")
 COUNTER_TRIAGE_MALFORMED: str = "triage_malformed"
 COUNTER_LABEL_MALFORMED: str = "label_malformed"
 COUNTER_ASSESSMENT_MALFORMED: str = "assessment_malformed"
+#: A model answered with nothing at all. Distinct from `*_malformed`, which
+#: is an answer this lane could not parse: this one is the brain failing to
+#: speak — a context overflow, a dead socket, a refused call — and it is NOT
+#: cached (`state.cached_complete`), so a climbing counter means the next
+#: pass is paying to ask the same question again.
+COUNTER_EMPTY_COMPLETION: str = "empty_completion"
+#: Items retired without a model call because they were older than
+#: `[news] triage_max_age_s` when the queue reached them (§9.1).
+COUNTER_TRIAGE_EXPIRED: str = "triage_expired"
 
 _STORY_ID_CHARS: int = 16
 _WEIGHT_ORIGIN_MIN: float = 1.0
@@ -167,6 +176,8 @@ def complete_cached(  # noqa: PLR0913, PLR0917 — the single gate: every collab
     answer, cache_hit = state.cached_complete(model, prompt_version, prompt, complete_fn)
     if not cache_hit:
         store.budget_add(day, tier, calls=1)
+    if not answer.strip():
+        store.counter_inc(COUNTER_EMPTY_COMPLETION)
     return answer, cache_hit
 
 
@@ -1053,6 +1064,14 @@ class NewsQueueWatcher:
         """Tier 1 over the oldest pending survivors. Returns the ids of the
         items that reached a clusterable impact."""
         if self._ids is None:
+            # Retire what is too old to be worth a call BEFORE reading the
+            # batch: the queue is oldest-first, so anything left in front of
+            # today's news is what today's news is waiting behind.
+            max_age = self._registry.settings.triage_max_age_s
+            if max_age > 0:
+                expired = self._store.expire_pending_triage(now_ts - max_age)
+                if expired > 0:
+                    self._store.counter_inc(COUNTER_TRIAGE_EXPIRED, expired)
             rows = self._store.items_pending_triage(TRIAGE_BATCH)
         else:
             rows = self._store.items_pending_ids(sorted(self._ids))
@@ -1308,8 +1327,7 @@ class NewsQueueWatcher:
             self._run_cluster(now_ts)
         if TIER2 not in tiers:
             return poll
-        window = self._registry.settings.story_window_s
-        stories = self._store.stories_unlabeled(now_ts - window)
+        stories = self._store.stories_unlabeled(now_ts - self._label_horizon())
         for i in range(len(stories)):
             if self._ids is not None and str(stories[i]["story_id"]) not in self._ids:
                 continue
@@ -1317,6 +1335,24 @@ class NewsQueueWatcher:
         return poll
 
     # ---- §9.4 tier 3: prompts out, answers back ------------------------
+
+    def _label_horizon(self) -> int:
+        """How far back tier 2 will reach for an unlabeled story.
+
+        NOT the clustering window, which is the bound that CLOSES a story:
+        `_run_cluster` closes everything whose newest item is older than one
+        window, so a queue bounded by the same number asks for exactly the
+        stories clustering has just excluded — complementary predicates, and
+        between them the reason the live store held 219 stories and zero
+        labels (2026-09-20).
+
+        A story the lane was willing to TRIAGE is a story it is willing to
+        label, so the horizon is the triage ceiling when that is the longer
+        of the two. Both are operator settings, so an operator who shortens
+        one can never silently starve the other.
+        """
+        settings = self._registry.settings
+        return max(settings.story_window_s, settings.triage_max_age_s, 0)
 
     def _analyst_context(self) -> AnalystContext:
         return AnalystContext() if self._context_fn is None else self._context_fn()

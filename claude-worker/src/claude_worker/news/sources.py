@@ -218,6 +218,15 @@ class NewsSettings:
     story_window_s: int = 21_600
     near_dup_jaccard: float = 0.6
     near_dup_window_s: int = 21_600
+    #: An item still untriaged this long after it was published is retired
+    #: without a model call (§9.1). The queue is OLDEST first by law, so a
+    #: backlog the lane can never afford to triage starves every fresh item
+    #: behind it: on 2026-09-20 the live store held 844 untriaged items, the
+    #: newest TRIAGED one was 37.8 h old, and 214 items younger than 6 h had
+    #: never been looked at. A day-old headline cannot move a position, so
+    #: paying for it twice over — once in calls, once in the delay it
+    #: imposes on today's news — buys nothing. 0 disables the ceiling.
+    triage_max_age_s: int = 86_400
     user_agent: str = DEFAULT_USER_AGENT
     items_retention_days: int = 14
     snapshots_retention_days: int = 30
@@ -356,6 +365,7 @@ _NEWS_KEYS: frozenset[str] = frozenset(
         "story_window_s",
         "near_dup_jaccard",
         "near_dup_window_s",
+        "triage_max_age_s",
         "user_agent",
         "items_retention_days",
         "snapshots_retention_days",
@@ -508,6 +518,9 @@ def _settings_from(table: typing.Mapping[str, object]) -> NewsSettings:
         ),
         near_dup_window_s=int(
             typing.cast(int, table.get("near_dup_window_s", base.near_dup_window_s))
+        ),
+        triage_max_age_s=int(
+            typing.cast(int, table.get("triage_max_age_s", base.triage_max_age_s))
         ),
         user_agent=str(table.get("user_agent", base.user_agent)),
         items_retention_days=int(

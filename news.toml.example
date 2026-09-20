@@ -13,6 +13,10 @@ text_cap         = 2000    # chars of item text kept and shown to a model
 story_window_s   = 21600   # 6 h clustering window
 near_dup_jaccard = 0.6     # tier-0 title-token Jaccard threshold
 near_dup_window_s = 21600
+triage_max_age_s = 86400   # an item still untriaged a day after publication is
+                           # retired WITHOUT a model call: the queue is oldest
+                           # first, so a backlog nobody can afford to triage
+                           # starves every fresh item behind it. 0 disables.
 user_agent       = "multivenue-news/1 (+contact: operator@example.invalid)"
 items_retention_days     = 14
 snapshots_retention_days = 30

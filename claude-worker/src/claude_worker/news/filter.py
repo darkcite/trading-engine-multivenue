@@ -309,6 +309,103 @@ def vocabulary_from(
     return build_vocabulary(market_names, descriptors, keywords)
 
 
+# ------------------------------------------------------------ the tier-2 menu
+
+
+#: Digits at which a market-map NAME is read as a bare venue identifier
+#: rather than something a model could recognise. Polymarket CLOB token ids
+#: are 70+ digit decimals; no real market name is a long run of digits.
+MARKET_ID_MIN_DIGITS: int = 12
+
+
+def is_raw_market_id(name: str) -> bool:
+    """Whether a market-map name is a raw venue identifier.
+
+    27 of the live map's 211 names are Polymarket token ids. A model cannot
+    match one to a headline and cannot reason about it, and offering them
+    cost **2165 tokens — 48.7 % of the tier-2 prompt for 12.8 % of the
+    markets**; dropping them alone cut a local call's latency 32 %
+    (measured 2026-09-20, sidecar comparison L3).
+    """
+    text = name.strip()
+    return len(text) >= MARKET_ID_MIN_DIGITS and text.isdigit()
+
+
+def tradeable_markets(
+    markets: typing.Mapping[str, int],
+    descriptors: typing.Mapping[int, str] | None,
+) -> dict[str, int]:
+    """The MENU a model may be offered: every market-map name the CURRENT
+    run still agrees with.
+
+    The map is append-only by law (`fetchers.refresh_market_map`: "new names
+    only… operator entries survive byte-for-byte"), which is right for a
+    mapping the operator owns and fatal for a menu, because a ``SymbolId``
+    is a SLOT and a slot is re-bound. Measured on the live map, 2026-09-20:
+
+    * 211 names, of which **162 still match what their sym is** — every
+      perp and spot, and not one collision among them;
+    * **49 do not**, and every one of those is a Polymarket slot whose live
+      descriptor is a raw CLOB token id. Seven names share sym 42 alone —
+      three Bitcoin dailies, their three slugs, and *"Will the Fed decrease
+      interest rates by 25 bps"* — so naming one of them does not merely
+      name a settled market, it names a DIFFERENT UNDERLYING. Two such
+      labels are on the live store, written 03:32Z that morning.
+
+    So the test is not "is this sym live" (all 49 are: the slot is busy —
+    with something else) and not "which of these names is canonical" (none
+    of them is: the map cannot say which occupant it meant). It is
+    **agreement**: the manifest names what each sym is RIGHT NOW, and a
+    market-map name that says the same thing is a name the lane can still
+    honour. Everything else is withheld until the map can say which
+    instance it means — a prediction market returns to the menu the moment
+    its entry carries the token id the run is actually carrying.
+
+    A raw token id is refused even when it agrees ([`is_raw_market_id`]):
+    27 of them cost 2165 tokens of the tier-2 prompt and no model can match
+    one to a headline.
+
+    ``descriptors`` of ``None`` means no manifest was readable, and the
+    agreement test is then SKIPPED rather than failed for every name: a
+    missing run directory must narrow this menu, never empty it — the
+    best-effort law [`vocabulary_from`] already follows.
+    """
+    out: dict[str, int] = {}
+    for name in sorted(markets):
+        if is_raw_market_id(name):
+            continue
+        sym = int(markets[name])
+        if descriptors is not None and descriptors.get(sym) != name:
+            continue
+        out[name] = sym
+    return out
+
+
+def descriptors_from(replay_dir: pathlib.Path) -> dict[int, str] | None:
+    """What each ``SymbolId`` means in the newest run — ``None`` when no
+    manifest is readable. The manifest is keyed ``(venue, sym)``; the market
+    map names a sym alone, and the namespace byte is already inside it."""
+    run_dir = claude_worker.features.latest_run_dir(replay_dir)
+    if run_dir is None:
+        return None
+    manifest = claude_worker.iv_digest.read_manifest(run_dir)
+    if manifest is None:
+        return None
+    return {int(sym): descriptor for (_venue, sym), descriptor in manifest[0].items()}
+
+
+def tradeable_markets_from(
+    paths_market_map: pathlib.Path, replay_dir: pathlib.Path
+) -> dict[str, int]:
+    """[`tradeable_markets`] over the operator's real inputs. Best-effort on
+    both reads, for [`vocabulary_from`]'s reason."""
+    try:
+        markets = dict(claude_worker.cli.load_market_map(paths_market_map).markets)
+    except (OSError, ValueError):
+        return {}
+    return tradeable_markets(markets, descriptors_from(replay_dir))
+
+
 class RecentTitles:
     """The near-dup ring: the tokenized titles of recent tier-0 survivors.
 

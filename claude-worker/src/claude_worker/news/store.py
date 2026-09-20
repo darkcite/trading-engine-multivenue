@@ -551,6 +551,25 @@ class Store:
             )
         return out
 
+    def expire_pending_triage(self, before_ts: int) -> int:
+        """Retire every untriaged tier-0 survivor published before
+        ``before_ts``, without a model call. Returns how many.
+
+        One statement rather than a skip inside the batch loop: the queue is
+        oldest-first, so a backlog only stops blocking today's items once it
+        is GONE, and draining 844 rows fifty at a time would take the rest of
+        the day to do what a bounded UPDATE does at once. The rows keep their
+        tier-0 verdict and gain no triage row — the lane never looked at
+        them, and the store says so.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "UPDATE items SET triage_state = ? "
+                "WHERE triage_state = ? AND tier0 = ? AND ts < ?",
+                (STATE_SKIPPED, STATE_NEW, TIER0_PASS, before_ts),
+            )
+        return max(0, cursor.rowcount)
+
     def items_to_cluster(self, limit: int) -> list[dict[str, object]]:
         """Triaged items that reached a clusterable impact and have not
         been attached to a story yet, with their triage joined on.
@@ -593,15 +612,27 @@ class Store:
         )
 
     def stories_unlabeled(self, since_ts: int) -> list[dict[str, object]]:
-        """Open stories that have no label yet — tier 2's queue."""
+        """Stories inside the window that have no label yet — tier 2's queue.
+
+        **Not restricted to OPEN stories.** Clustering closes a story once a
+        whole window has passed without a new item, and `_run_cluster` does
+        that at the END of the same call that opened it — so a story built
+        from items older than the window was born closed, and a queue that
+        asked for ``state = 'open'`` could never see it. That is the exact
+        mechanism behind "0 labels, ever" on the live store (2026-09-20):
+        219 stories, all closed, none labeled. A closed story is FINISHED,
+        which makes it the best possible moment to label it, not a reason to
+        skip it; ``since_ts`` still bounds the queue so a stale backlog is
+        never re-read.
+        """
         return self._rows(
             """
             SELECT s.* FROM stories AS s
             LEFT JOIN labels AS l ON l.story_id = s.story_id
-            WHERE l.story_id IS NULL AND s.state = ? AND s.last_ts >= ?
+            WHERE l.story_id IS NULL AND s.last_ts >= ?
             ORDER BY s.first_ts
             """,
-            (STORY_OPEN, since_ts),
+            (since_ts,),
         )
 
     def close_stale_stories(self, before_ts: int) -> int:

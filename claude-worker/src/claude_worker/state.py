@@ -325,7 +325,17 @@ class State:
         if cached is not None:
             return cached, True
         response = complete_fn(model, prompt)
-        self.cache_put(model, version_hash, content_hash, response)
+        # An EMPTY completion is a failure, never an answer: a context
+        # overflow, a transport error and a refused call all return "".
+        # Caching one makes the failure PERMANENT — the 2026-09-20 sidecar
+        # comparison cached 79 context-overflow refusals under the local
+        # model's key and every re-run replayed them, so the rows had to be
+        # deleted by hand before the measurement could be repeated. The call
+        # is still SPENT (the caller has already counted it against the
+        # tier's ceiling); only the cache refuses to remember a non-answer,
+        # so the next pass asks again instead of inheriting the outage.
+        if response.strip():
+            self.cache_put(model, version_hash, content_hash, response)
         return response, False
 
     # ---- ruleset registry (§5.3; consumers arrive with item 12) ----
