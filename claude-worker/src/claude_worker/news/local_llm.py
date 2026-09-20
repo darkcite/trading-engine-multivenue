@@ -734,8 +734,8 @@ def _local_label(  # noqa: PLR0913, PLR0917 — one pass, every collaborator it 
     now_ts: int,
     local: LocalClient,
 ) -> int:
-    window = registry.settings.story_window_s
-    stories = store.stories_unlabeled(now_ts - window)
+    horizon = claude_worker.news.cascade.label_horizon(registry.settings)
+    stories = store.stories_unlabeled(now_ts - horizon)
     if not stories:
         return 0
     ids: set[str] = set()

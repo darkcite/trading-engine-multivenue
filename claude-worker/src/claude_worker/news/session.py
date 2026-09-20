@@ -275,8 +275,8 @@ def tier2_prompts(
 ) -> list[PromptLine]:
     """One line per open story with no label yet — tier 2's own queue."""
     out: list[PromptLine] = []
-    window = registry.settings.story_window_s
-    stories = store.stories_unlabeled(now_ts - window)
+    horizon = claude_worker.news.cascade.label_horizon(registry.settings)
+    stories = store.stories_unlabeled(now_ts - horizon)
     for i in range(min(limit, len(stories))):
         prompt = watcher.label_prompt(stories[i])
         if not prompt:
@@ -348,8 +348,8 @@ def _tier2_map(
     """The same, over the stories tier 2's restricted pass will read."""
     mapping: dict[str, str] = {}
     matched: list[str] = []
-    window = registry.settings.story_window_s
-    stories = store.stories_unlabeled(now_ts - window)
+    horizon = claude_worker.news.cascade.label_horizon(registry.settings)
+    stories = store.stories_unlabeled(now_ts - horizon)
     for i in range(len(stories)):
         story_id = str(stories[i]["story_id"])
         response = answers.get(story_id)

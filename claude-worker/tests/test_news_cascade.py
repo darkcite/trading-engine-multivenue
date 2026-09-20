@@ -1065,3 +1065,126 @@ def test_the_analyst_delay_of_a_med_story_is_counted(tmp_path: pathlib.Path) -> 
         assert counters.get(claude_worker.news.cascade.COUNTER_ANALYST_DELAYED) == 1
         assert counters.get(claude_worker.news.cascade.COUNTER_ANALYST_DELAY_S) == 900
         state.close()
+
+
+# ---- live-cycle findings, 2026-09-20 --------------------------------------
+
+
+def test_an_empty_sidecar_answer_is_not_a_malformed_one(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A sidecar that is DOWN is not a model that is WRONG.
+
+    `complete_cached` already counts an empty answer as `empty_completion`.
+    Counting it a second time as malformed made one outage increment two
+    counters and made the malformed rate unreadable: the live store showed
+    `label_malformed = 191` for a model the gold set measured at ZERO
+    off-menu answers, and replaying six live stories through the real schema
+    path on 2026-09-20 produced 2 labels, 4 nulls and 0 malformed.
+    """
+    empty = _Fake("")
+    registry = claude_worker.news.sources.Registry(
+        settings=claude_worker.news.sources.NewsSettings(),
+        keywords=(), calendar=claude_worker.news.sources.Calendar(),
+        sources=(
+            claude_worker.news.sources.Source(
+                name="press", kind="rss", url="https://a.example/f",
+                origin="a.example", class_="C",
+            ),
+        ),
+    )
+    with _store(tmp_path) as store:
+        state = _state(tmp_path)
+        store.upsert_item(
+            source="press", guid="g1", ts=NOW, fetched_ts=NOW,
+            title="Something happened", link="l", text="body",
+            origin="a.example", class_="C", weight=1.0, venue="", hint="",
+        )
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store, registry=registry, symbol_map={"BTC-UP": 7},
+            vocab=ASSETS, complete_fn=empty, now_fn=lambda: NOW,
+        )
+        watcher.poll_once()
+        counters = store.counters()
+        assert counters.get(claude_worker.news.cascade.COUNTER_EMPTY_COMPLETION) == 1
+        assert counters.get(
+            claude_worker.news.cascade.COUNTER_TRIAGE_MALFORMED
+        ) is None, "an outage is counted once, as an outage"
+        state.close()
+
+
+def test_a_high_story_reaches_the_analyst_on_a_low_weight_origin(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`_origin_counts` excludes low-weight origins so noise cannot pass as
+    corroboration -- but that left a story built only from one at
+    `origins = 0`, where `origins > assessments` is false even for its FIRST
+    look. Live store 2026-09-20: 11 such stories, several called `high`,
+    none of them ever assessable. Operator ruling: a high-impact story gets
+    one look whatever its origin is worth.
+    """
+    with _store(tmp_path) as store:
+        for impact, story_id in (("high", "s-high"), ("med", "s-med")):
+            store.upsert_story({
+                "story_id": story_id, "family": "crypto", "event_type": "exploit",
+                "venues": "[]", "assets": '["BTC"]', "first_ts": NOW - 60,
+                "last_ts": NOW, "item_count": 1, "origins": 0, "venue_origin": 0,
+                "max_impact": impact,
+                "state": claude_worker.news.store.STORY_OPEN, "assessments": 0,
+            })
+            store.upsert_item(
+                source="lowweight", guid=story_id, ts=NOW - 60, fetched_ts=NOW - 60,
+                title="t", link="l", text="body", origin="low.example", class_="C",
+                weight=0.3, venue="", hint="",
+            )
+            store.set_triage_state(
+                "lowweight", story_id,
+                claude_worker.news.store.STATE_ESCALATED, story_id,
+            )
+        state = _state(tmp_path)
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store,
+            registry=claude_worker.news.sources.Registry(
+                settings=claude_worker.news.sources.NewsSettings(),
+                keywords=(), calendar=claude_worker.news.sources.Calendar(),
+                sources=(),
+            ),
+            symbol_map={"BTC-UP": 7}, vocab=ASSETS, complete_fn=_Fake(),
+            now_fn=lambda: NOW,
+        )
+        got = [sid for sid, _ in watcher.pending_assessments()]
+        assert got == ["s-high"], "high gets its look; med still needs an origin"
+
+        # ...and the SECOND look still needs corroboration, so a low-weight
+        # source can never talk the analyst into a re-read on its own.
+        watcher.accept_assessment("s-high", "not json", None, NOW)
+        assert watcher.pending_assessments() == []
+        state.close()
+
+
+def test_every_tier_2_queue_uses_the_same_label_horizon() -> None:
+    """`05ac5e7` fixed the label horizon inside the watcher. Three other call
+    sites -- `local_llm._local_label`, which is the LIVE local pass, and both
+    `session` queues -- each computed their own `now_ts - story_window_s`, so
+    the fix reached one of four. `label_horizon` is now the one rule.
+    """
+    settings = claude_worker.news.sources.NewsSettings
+    # The ceiling turned OFF means no horizon, not the clustering window.
+    off = settings(story_window_s=7200, triage_max_age_s=0)
+    assert claude_worker.news.cascade.label_horizon(off) == (
+        claude_worker.news.cascade.NO_LABEL_HORIZON
+    )
+    # Otherwise it is the longer of the two: a story the lane was willing to
+    # triage is a story it is willing to label.
+    assert claude_worker.news.cascade.label_horizon(
+        settings(story_window_s=7200, triage_max_age_s=86_400)
+    ) == 86_400
+    assert claude_worker.news.cascade.label_horizon(
+        settings(story_window_s=172_800, triage_max_age_s=86_400)
+    ) == 172_800
+
+    # ...and no queue computes its own any more.
+    root = pathlib.Path(claude_worker.news.cascade.__file__).parent
+    for name in ("local_llm.py", "session.py", "cascade.py"):
+        body = (root / name).read_text(encoding="utf-8")
+        assert "stories_unlabeled(now_ts - window)" not in body, name

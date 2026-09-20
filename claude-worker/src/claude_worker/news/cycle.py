@@ -176,11 +176,23 @@ def _store_item(
     fetched_ts: int,
 ) -> bool:
     """Insert a first sighting with its verdict. ``False`` = already stored,
-    which is tier 0 step 1 and is NOT a verdict."""
+    which is tier 0 step 1 and is NOT a verdict.
+
+    ``ts`` is clamped to ``fetched_ts``: an item cannot be newer than the
+    moment we saw it. Some venue feeds publish the SCHEDULED date of what
+    they are announcing as the entry's timestamp -- `kraken-status-rss` gave
+    "Rain (RAIN) Delisting" a date five days in the future (observed
+    2026-09-20). A future-dated item never ages out (`triage_max_age_s`
+    compares against ``now - max_age``) and its story never closes
+    (`close_stale_stories` needs ``last_ts < now - window``), so it sits in
+    the open set forever. The scheduled date is still in the title and text,
+    where the analyst reads it; it just stops standing in for when this
+    arrived.
+    """
     inserted = store.upsert_item(
         source=item.source,
         guid=item.guid,
-        ts=item.ts or fetched_ts,
+        ts=min(item.ts, fetched_ts) if item.ts else fetched_ts,
         fetched_ts=fetched_ts,
         title=item.title,
         link=item.link,

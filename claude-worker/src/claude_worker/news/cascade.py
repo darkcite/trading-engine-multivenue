@@ -346,6 +346,35 @@ def should_escalate(
     return on_named_entity and bool(result.venues or result.assets)
 
 
+def label_horizon(settings: "claude_worker.news.sources.NewsSettings") -> int:
+    """How far back tier 2 will reach for an unlabeled story.
+
+    NOT the clustering window, which is the bound that CLOSES a story:
+    `_run_cluster` closes everything whose newest item is older than one
+    window, so a queue bounded by the same number asks for exactly the stories
+    clustering has just excluded -- complementary predicates, and between them
+    the reason the live store held 219 stories and zero labels (2026-09-20).
+
+    A story the lane was willing to TRIAGE is a story it is willing to label,
+    so the horizon is the triage ceiling when that is the longer of the two.
+
+    ``triage_max_age_s = 0`` DISABLES the triage ceiling (`sources`), so it is
+    not a shorter horizon -- it is no horizon at all. Reading it as
+    `max(window, 0)` re-armed the exact starvation this exists to prevent, at
+    the one setting documented as "off". `NO_LABEL_HORIZON` says "reach as far
+    back as there are stories", which is what turning the ceiling off asked
+    for.
+
+    Module-level, not a method, because the watcher is not the only caller:
+    `local_llm._local_label` (the LIVE local tier-2 pass) and both `session`
+    queues each picked their own `now_ts - story_window_s`, so the horizon
+    fix reached one of four call sites. One rule, one place.
+    """
+    if settings.triage_max_age_s <= 0:
+        return NO_LABEL_HORIZON
+    return max(settings.story_window_s, settings.triage_max_age_s)
+
+
 def story_key(row: typing.Mapping[str, object]) -> tuple[str, str, str, str]:
     """The identity of a story: what KIND of thing happened, to which
     assets, on which venues, in which family.
@@ -1125,6 +1154,10 @@ class NewsQueueWatcher:
         raw, cache_hit = answer
         if cache_hit:
             poll.cache_hits += 1
+        # Same rule as `_label_one`: an empty answer is the sidecar, already
+        # counted as `empty_completion`, and not a malformed model answer.
+        if not raw.strip():
+            return None
         result = claude_worker.labeling.parse_triage_v2(raw, self._vocab)
         if result is None:
             poll.triage_malformed += 1
@@ -1331,6 +1364,16 @@ class NewsQueueWatcher:
         raw, cache_hit = answer
         if cache_hit:
             poll.cache_hits += 1
+        # An EMPTY answer is the sidecar being down, not the model being
+        # wrong, and `complete_cached` has already counted it as
+        # `empty_completion`. Counting it again as `label_malformed` made one
+        # outage increment two counters and made the malformed rate unreadable
+        # -- 191 on the live store against a model the gold set measured at
+        # zero off-menu answers. Replayed against six live stories on
+        # 2026-09-20 the path produced 2 labels, 4 nulls and 0 malformed, so
+        # the 191 was very largely this.
+        if not raw.strip():
+            return
         label, malformed = claude_worker.labeling.parse_label_v2(raw, self._symbol_map)
         if malformed:
             poll.label_malformed += 1
@@ -1444,33 +1487,8 @@ class NewsQueueWatcher:
     # ---- §9.4 tier 3: prompts out, answers back ------------------------
 
     def _label_horizon(self) -> int:
-        """How far back tier 2 will reach for an unlabeled story.
+        return label_horizon(self._registry.settings)
 
-        NOT the clustering window, which is the bound that CLOSES a story:
-        `_run_cluster` closes everything whose newest item is older than one
-        window, so a queue bounded by the same number asks for exactly the
-        stories clustering has just excluded — complementary predicates, and
-        between them the reason the live store held 219 stories and zero
-        labels (2026-09-20).
-
-        A story the lane was willing to TRIAGE is a story it is willing to
-        label, so the horizon is the triage ceiling when that is the longer
-        of the two. Both are operator settings, so an operator who shortens
-        one can never silently starve the other.
-
-        ``triage_max_age_s = 0`` DISABLES the triage ceiling (`sources`), so
-        it is not a shorter horizon — it is no horizon at all. Reading it as
-        `max(window, 0)` re-armed the exact starvation this function exists
-        to prevent, at the one setting documented as "off": a story built
-        from items older than one window was born outside the label queue
-        again. `NO_LABEL_HORIZON` says "reach as far back as there are
-        stories", which is what an operator who turned the ceiling off asked
-        for.
-        """
-        settings = self._registry.settings
-        if settings.triage_max_age_s <= 0:
-            return NO_LABEL_HORIZON
-        return max(settings.story_window_s, settings.triage_max_age_s)
 
     def _analyst_context(self) -> AnalystContext:
         return AnalystContext() if self._context_fn is None else self._context_fn()
@@ -1488,9 +1506,21 @@ class NewsQueueWatcher:
         if assessments >= self._max_assessments:
             return False
         origins = int(typing.cast(int, story["origins"]))
+        impact = str(story["max_impact"])
+        # `_origin_counts` excludes low-weight origins so noise cannot pass as
+        # corroboration, which is right -- but it leaves a story built ONLY
+        # from such a source at `origins = 0`, and `origins > assessments` is
+        # then false even for its FIRST look. Measured on the live store
+        # 2026-09-20: 11 stories at origins 0, all single u.today items
+        # (weight 0.3), several called `high`, none of them ever assessable.
+        # A high-impact story gets one analyst look whatever its origin is
+        # worth (operator ruling 2026-09-20); it stays uncorroborated for
+        # every other purpose, including the SECOND look, which still needs
+        # origins to grow.
+        if impact == "high" and assessments == 0:
+            return True
         if origins <= assessments:
             return False
-        impact = str(story["max_impact"])
         if impact == "high":
             return True
         corroborated = origins >= self._min_origins or int(

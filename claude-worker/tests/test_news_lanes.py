@@ -594,3 +594,40 @@ def test_actions_dry_run_forces_shadow(
     assert dry.limits == loaded.limits and dry.ceilings == loaded.ceilings
     assert claude_worker.news.__main__.main(["actions", "--dry-run"]) == 0
     assert "(dry-run)" in capsys.readouterr().out
+
+
+def test_an_item_can_never_be_newer_than_the_moment_we_saw_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Some venue feeds stamp an entry with the SCHEDULED date of what they
+    are announcing. `kraken-status-rss` gave "Rain (RAIN) Delisting" a date
+    five days ahead (live store, 2026-09-20).
+
+    A future-dated item never ages out -- `triage_max_age_s` compares against
+    ``now - max_age`` -- and its story never closes, because
+    `close_stale_stories` needs ``last_ts < now - window``. Both were true of
+    the two live items, which sat in the open set indefinitely. The scheduled
+    date stays in the title and text where the analyst reads it.
+    """
+    fetched = 1_789_891_000
+    ahead = fetched + 5 * 24 * 3600
+
+    def _item(guid: str, ts: int) -> claude_worker.news.sources.Item:
+        return claude_worker.news.sources.Item(
+            source="kraken-status-rss", guid=guid, ts=ts,
+            title="Rain (RAIN) Delisting", link="l", text="body",
+            class_="C", weight=1.0, origin="status.kraken.com",
+            venue="kraken", hint="",
+        )
+
+    verdict = claude_worker.news.filter.Tier0Verdict(
+        kind=claude_worker.news.filter.TIER0_PASS, hits=1
+    )
+    with claude_worker.news.store.Store(tmp_path / "news.db") as store:
+        for guid, ts in (("future", ahead), ("past", fetched - 600), ("absent", 0)):
+            claude_worker.news.cycle._store_item(store, _item(guid, ts), verdict, fetched)
+        got = {str(r["guid"]): int(typing.cast(int, r["ts"])) for r in store.items_since(0)}
+
+    assert got["future"] == fetched, "clamped to when we saw it"
+    assert got["past"] == fetched - 600, "a real publication time is kept"
+    assert got["absent"] == fetched, "no timestamp at all still falls back"
