@@ -25,6 +25,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 """
 
 import dataclasses
+import hashlib
 import json
 import pathlib
 import typing
@@ -813,6 +814,24 @@ def test_an_empty_completion_is_counted_and_never_cached(
         counters = store.counters()
         assert counters.get(claude_worker.news.cascade.COUNTER_EMPTY_COMPLETION) == 2
 
+        # An empty answer served from the CACHE is not counted: only a paid
+        # call can mean "the next pass is paying to ask this again", which is
+        # what the counter's name promises. Rows like this exist only from
+        # before the cache guard landed, and counting them overstated it.
+        state.cache_put(
+            "local:test",
+            hashlib.sha256(b"v1").hexdigest(),
+            hashlib.sha256(b"poisoned").hexdigest(),
+            "",
+        )
+        assert claude_worker.news.cascade.complete_cached(
+            state, store, {"tier1": 10}, claude_worker.news.cascade.TIER1,
+            "local:test", "v1", "poisoned", _Fake("unused"), now_ts=NOW,
+        ) == ("", True)
+        assert store.counters().get(
+            claude_worker.news.cascade.COUNTER_EMPTY_COMPLETION
+        ) == 2, "a cached empty answer is not a new one"
+
         # ...and a real answer still caches, so the fix is narrow.
         good = _Fake(_triage_json())
         first = claude_worker.news.cascade.complete_cached(
@@ -974,4 +993,75 @@ def test_the_escalation_gate_still_reads_the_taggers_own_answer(
         # ...while the key it stored DID resolve the venue.
         triage = store._rows("SELECT * FROM triage", ())
         assert json.loads(str(triage[0]["venues"])) == ["deribit"]
+        state.close()
+
+
+def test_the_analyst_delay_of_a_med_story_is_counted(tmp_path: pathlib.Path) -> None:
+    """The operator accepted that a `high` called `med` delays rather than
+    loses (2026-09-20). These counters make the delay a number.
+
+    Counted when the assessment is RECORDED, never when a prompt is handed
+    out: `pending_assessments` is a pure read, `session` calls it twice per
+    cycle, and a story waits there across many cycles. Counting on that path
+    made the number climb on every poll — a counter whose whole job is to
+    size a known regression cannot be the thing that inflates it. This test
+    polls three times before assessing anything, which is what a real cycle
+    looks like and what the first version of this code got wrong.
+
+    A `high` story is not counted: it fires on the origin that created it, so
+    its wait is zero by construction and counting it would dilute the mean.
+    """
+    with _store(tmp_path) as store:
+        for impact, story_id, first_ts in (
+            ("med", "s-med", NOW - 900),
+            ("high", "s-high", NOW - 900),
+        ):
+            store.upsert_story({
+                "story_id": story_id, "family": "crypto", "event_type": "listing",
+                "venues": '["okx"]', "assets": '["BTC"]', "first_ts": first_ts,
+                "last_ts": NOW, "item_count": 2, "origins": 2, "venue_origin": 0,
+                "max_impact": impact,
+                "state": claude_worker.news.store.STORY_OPEN, "assessments": 0,
+            })
+            store.upsert_item(
+                source="press", guid=story_id, ts=first_ts, fetched_ts=first_ts,
+                title="t", link="l", text="body", origin="a.example", class_="C",
+                weight=1.0, venue="", hint="",
+            )
+            store.set_triage_state(
+                "press", story_id,
+                claude_worker.news.store.STATE_ESCALATED, story_id,
+            )
+
+        state = _state(tmp_path)
+        watcher = claude_worker.news.cascade.NewsQueueWatcher(
+            state=state, store=store,
+            registry=claude_worker.news.sources.Registry(
+                settings=claude_worker.news.sources.NewsSettings(),
+                keywords=(), calendar=claude_worker.news.sources.Calendar(),
+                sources=(),
+            ),
+            symbol_map={"BTC-UP": 7}, vocab=ASSETS, complete_fn=_Fake(),
+            now_fn=lambda: NOW,
+        )
+
+        # Three cycles of handing the prompts out, assessing nothing.
+        for _ in range(3):
+            assert len(watcher.pending_assessments()) == 2
+        assert store.counters() == {}
+
+        # Now record an answer for each. Malformed is fine: the delay is
+        # about WHEN the analyst was reached, not what it said.
+        for story_id in ("s-med", "s-high"):
+            watcher.accept_assessment(story_id, "not json", None, NOW)
+
+        counters = store.counters()
+        assert counters.get(claude_worker.news.cascade.COUNTER_ANALYST_DELAYED) == 1
+        assert counters.get(claude_worker.news.cascade.COUNTER_ANALYST_DELAY_S) == 900
+
+        # A second assessment of the same story does not count a second time.
+        watcher.accept_assessment("s-med", "not json", None, NOW + 600)
+        counters = store.counters()
+        assert counters.get(claude_worker.news.cascade.COUNTER_ANALYST_DELAYED) == 1
+        assert counters.get(claude_worker.news.cascade.COUNTER_ANALYST_DELAY_S) == 900
         state.close()

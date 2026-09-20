@@ -109,6 +109,18 @@ COUNTER_TRIAGE_EXPIRED: str = "triage_expired"
 #: against total escalations is what says whether the rule earns its
 #: precision cost on live copy rather than on 149 adjudicated items.
 COUNTER_ESCALATED_ON_ENTITY: str = "escalated_on_named_entity"
+#: Stories the analyst reached LATE because tier 1 called them `med`: a
+#: `high` fires on one origin, a `med` waits for corroboration. The operator
+#: ruled that trade acceptable (2026-09-20, "it delays, it doesn't lose") --
+#: these two make the size of the delay a number instead of a belief.
+#: `analyst_delay_s` is the summed wait, so the mean is delay_s / delayed.
+#: The label horizon when the operator has turned the triage ceiling off:
+#: far enough back that `now - horizon` is before any story could exist,
+#: without being large enough to overflow a timestamp subtraction.
+NO_LABEL_HORIZON: int = 100 * 365 * 24 * 3600
+
+COUNTER_ANALYST_DELAYED: str = "analyst_delayed_med"
+COUNTER_ANALYST_DELAY_S: str = "analyst_delay_s"
 
 _STORY_ID_CHARS: int = 16
 _WEIGHT_ORIGIN_MIN: float = 1.0
@@ -182,8 +194,12 @@ def complete_cached(  # noqa: PLR0913, PLR0917 — the single gate: every collab
     answer, cache_hit = state.cached_complete(model, prompt_version, prompt, complete_fn)
     if not cache_hit:
         store.budget_add(day, tier, calls=1)
-    if not answer.strip():
-        store.counter_inc(COUNTER_EMPTY_COMPLETION)
+        # Only a PAID call can be an empty completion worth counting. A cache
+        # hit that returns empty is a row written before the `cached_complete`
+        # guard landed, and counting it made the counter say "the next pass is
+        # paying to ask this again" about a question nobody is paying for.
+        if not answer.strip():
+            store.counter_inc(COUNTER_EMPTY_COMPLETION)
     return answer, cache_hit
 
 
@@ -1441,9 +1457,20 @@ class NewsQueueWatcher:
         label, so the horizon is the triage ceiling when that is the longer
         of the two. Both are operator settings, so an operator who shortens
         one can never silently starve the other.
+
+        ``triage_max_age_s = 0`` DISABLES the triage ceiling (`sources`), so
+        it is not a shorter horizon — it is no horizon at all. Reading it as
+        `max(window, 0)` re-armed the exact starvation this function exists
+        to prevent, at the one setting documented as "off": a story built
+        from items older than one window was born outside the label queue
+        again. `NO_LABEL_HORIZON` says "reach as far back as there are
+        stories", which is what an operator who turned the ceiling off asked
+        for.
         """
         settings = self._registry.settings
-        return max(settings.story_window_s, settings.triage_max_age_s, 0)
+        if settings.triage_max_age_s <= 0:
+            return NO_LABEL_HORIZON
+        return max(settings.story_window_s, settings.triage_max_age_s)
 
     def _analyst_context(self) -> AnalystContext:
         return AnalystContext() if self._context_fn is None else self._context_fn()
@@ -1513,7 +1540,7 @@ class NewsQueueWatcher:
         for i in range(len(items)):
             ids.append(item_id(items[i]))
         assessment = parse_assessment(raw, ctx.markets, ctx.descriptors, ids)
-        self._bump_assessments(story, assessment is not None)
+        self._bump_assessments(story, assessment is not None, now_ts)
         if assessment is None:
             self._store.counter_inc(COUNTER_ASSESSMENT_MALFORMED)
             return None
@@ -1534,7 +1561,39 @@ class NewsQueueWatcher:
         self.stats.assessments += 1
         return assessment
 
-    def _bump_assessments(self, story: dict[str, object], accepted: bool) -> None:
+    def _count_delay(self, story: typing.Mapping[str, object], now_ts: int) -> None:
+        """Record what calling a story `med` instead of `high` cost it.
+
+        Counted from `_bump_assessments`, NOT from `pending_assessments`:
+        that one is a pure read, the caller may call it more than once per
+        cycle (`session.tier3_prompts` and `session.tier3_ingest` both do),
+        and it hands out prompts for stories a `limit` may then drop. Counting
+        there made the number climb on every poll of a story nobody had
+        assessed yet, which is the one failure a counter like this cannot
+        have. `_bump_assessments` happens exactly once per assessment.
+
+        Only the FIRST assessment is measured, and only for a `med` story: a
+        `high` one fires on the origin that created it, so its wait is zero by
+        construction and counting it would dilute the mean. The wait is
+        `now - first_ts` — from the story's first item to the assessment,
+        which is the interval a `high` verdict would have collapsed.
+
+        This is a measurement, not a gate: nothing here changes which stories
+        the analyst sees.
+        """
+        if int(typing.cast(int, story["assessments"])) != 0:
+            return
+        if str(story["max_impact"]) != "med":
+            return
+        waited = now_ts - int(typing.cast(int, story["first_ts"]))
+        self._store.counter_inc(COUNTER_ANALYST_DELAYED)
+        if waited > 0:
+            self._store.counter_inc(COUNTER_ANALYST_DELAY_S, waited)
+
+    def _bump_assessments(
+        self, story: dict[str, object], accepted: bool, now_ts: int
+    ) -> None:
+        self._count_delay(story, now_ts)
         merged = dict(story)
         merged["assessments"] = int(typing.cast(int, story["assessments"])) + 1
         if accepted:
