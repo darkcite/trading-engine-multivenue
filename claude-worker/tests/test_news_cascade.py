@@ -826,3 +826,58 @@ def test_an_empty_completion_is_counted_and_never_cached(
         assert first[1] is False and second[1] is True
         assert len(good.calls) == 1
         state.close()
+
+
+def test_a_low_item_that_named_something_escalates_anyway() -> None:
+    """The recall-first gate (operator ruling 2026-09-20).
+
+    `low` alone gives escalation recall 0.830 on 149 adjudicated items;
+    `low` AND nothing named gives 0.930 — better than a frontier model
+    triaging alone (0.818), because ten of the seventeen events the tagger
+    dropped were ones it had already found an entity in. The rule reads the
+    rest of the tagger's own answer rather than second-guessing it.
+    """
+    low_named = claude_worker.labeling.parse_triage_v2(
+        _triage_json(impact="low", entities={"venues": ["okx"], "assets": []}), ASSETS
+    )
+    low_bare = claude_worker.labeling.parse_triage_v2(
+        _triage_json(impact="low", entities={"venues": [], "assets": []}), ASSETS
+    )
+    med = claude_worker.labeling.parse_triage_v2(_triage_json(impact="med"), ASSETS)
+    assert low_named is not None and low_bare is not None and med is not None
+    assert claude_worker.news.cascade.should_escalate(low_named, True) is True
+    assert claude_worker.news.cascade.should_escalate(low_bare, True) is False
+    # med and high never depended on the rule.
+    assert claude_worker.news.cascade.should_escalate(med, True) is True
+    assert claude_worker.news.cascade.should_escalate(med, False) is True
+    # ...and the whole rule is one setting away from off, byte for byte.
+    assert claude_worker.news.cascade.should_escalate(low_named, False) is False
+
+
+def test_the_entity_rule_is_counted_and_switchable(tmp_path: pathlib.Path) -> None:
+    """It changes what the lane spends tier 2 on, so it is visible: a
+    counter says how many escalations the rule bought, and `[news]
+    escalate_on_named_entity = 0` restores the old gate exactly."""
+    answer = _triage_json(impact="low", entities={"venues": ["okx"], "assets": []})
+    for on, want_stories in ((1, 1), (0, 0)):
+        with _store(tmp_path / f"case{on}") as store:
+            state = _state(tmp_path / f"case{on}")
+            store.upsert_item(
+                source="press", guid="g1", ts=NOW, fetched_ts=NOW,
+                title="OKX says something mild", link="l", text="body",
+                origin="example.invalid", class_="C", weight=1.0, venue="",
+            )
+            watcher = claude_worker.news.cascade.NewsQueueWatcher(
+                state=state, store=store,
+                registry=_plain_registry(escalate_on_named_entity=on),
+                symbol_map={"BTC-UP": 7}, vocab=ASSETS,
+                complete_fn=_Fake(answer), now_fn=lambda: NOW,
+            )
+            watcher.poll_once()
+            stories = store._rows("SELECT * FROM stories", ())
+            assert len(stories) == want_stories, f"escalate_on_named_entity={on}"
+            counted = store.counters().get(
+                claude_worker.news.cascade.COUNTER_ESCALATED_ON_ENTITY, 0
+            )
+            assert counted == want_stories, "the rule reports what it bought"
+            state.close()

@@ -227,6 +227,17 @@ class NewsSettings:
     #: paying for it twice over — once in calls, once in the delay it
     #: imposes on today's news — buys nothing. 0 disables the ceiling.
     triage_max_age_s: int = 86_400
+    #: Escalate an item the tagger called `low` when it nonetheless NAMED an
+    #: asset or a venue (§9.1, operator ruling 2026-09-20: recall first).
+    #:
+    #: Measured on 149 adjudicated items: the tagger's own `low` alone gives
+    #: escalation recall 0.830; `low` AND it named nothing gives **0.930** —
+    #: better than a frontier model triaging alone (0.818). Ten of the
+    #: seventeen events the tagger dropped were items it had already
+    #: identified an entity in, so the evidence was already on the row it
+    #: wrote. Precision falls 0.847 -> 0.732, which is the trade the ruling
+    #: asks for: a missed event costs this desk more than a wasted look.
+    escalate_on_named_entity: int = 1
     user_agent: str = DEFAULT_USER_AGENT
     items_retention_days: int = 14
     snapshots_retention_days: int = 30
@@ -366,6 +377,7 @@ _NEWS_KEYS: frozenset[str] = frozenset(
         "near_dup_jaccard",
         "near_dup_window_s",
         "triage_max_age_s",
+        "escalate_on_named_entity",
         "user_agent",
         "items_retention_days",
         "snapshots_retention_days",
@@ -521,6 +533,10 @@ def _settings_from(table: typing.Mapping[str, object]) -> NewsSettings:
         ),
         triage_max_age_s=int(
             typing.cast(int, table.get("triage_max_age_s", base.triage_max_age_s))
+        ),
+        escalate_on_named_entity=int(
+            typing.cast(int, table.get(
+                "escalate_on_named_entity", base.escalate_on_named_entity))
         ),
         user_agent=str(table.get("user_agent", base.user_agent)),
         items_retention_days=int(

@@ -103,6 +103,11 @@ COUNTER_EMPTY_COMPLETION: str = "empty_completion"
 #: Items retired without a model call because they were older than
 #: `[news] triage_max_age_s` when the queue reached them (§9.1).
 COUNTER_TRIAGE_EXPIRED: str = "triage_expired"
+#: Items the tagger called `low` that escalated anyway because the same
+#: answer named an asset or a venue — the recall-first rule. Watching it
+#: against total escalations is what says whether the rule earns its
+#: precision cost on live copy rather than on 149 adjudicated items.
+COUNTER_ESCALATED_ON_ENTITY: str = "escalated_on_named_entity"
 
 _STORY_ID_CHARS: int = 16
 _WEIGHT_ORIGIN_MIN: float = 1.0
@@ -264,6 +269,30 @@ def triage_row(
 
 
 # ---------------------------------------------------- §9.2 story clustering
+
+
+def should_escalate(
+    result: claude_worker.labeling.TriageV2, on_named_entity: bool
+) -> bool:
+    """Whether a triaged item enters clustering — THE gate of this lane.
+
+    `ESCALATE_IMPACTS` is `("med", "high")`, so this is the med/low line and
+    not the high/med one: `low` is where an item stops being looked at, and
+    `high` only decides whether the analyst fires on a single origin.
+
+    ``on_named_entity`` adds the operator's recall-first rule (2026-09-20): an
+    item the tagger called `low` while NAMING an asset or a venue escalates
+    anyway. It is not second-guessing the tagger — it is reading the rest of
+    the same answer. Measured over 149 adjudicated items: `low` alone gives
+    recall 0.830, `low` AND nothing named gives **0.930**, against 0.818 for a
+    frontier model triaging alone. Ten of the seventeen events the tagger
+    dropped were ones it had already found an entity in. Precision 0.847 ->
+    0.732 is the price, and the ruling named it: a missed event costs this
+    desk more than a wasted look.
+    """
+    if result.impact in ESCALATE_IMPACTS:
+        return True
+    return on_named_entity and bool(result.venues or result.assets)
 
 
 def story_key(row: typing.Mapping[str, object]) -> tuple[str, str, str, str]:
@@ -1092,7 +1121,12 @@ class NewsQueueWatcher:
                 )
                 continue
             self._store.put_triage(triage_row(source, guid, model, result, now_ts))
-            if result.impact in ESCALATE_IMPACTS:
+            escalate = should_escalate(
+                result, bool(self._registry.settings.escalate_on_named_entity)
+            )
+            if escalate and result.impact not in ESCALATE_IMPACTS:
+                self._store.counter_inc(COUNTER_ESCALATED_ON_ENTITY)
+            if escalate:
                 self._store.set_triage_state(
                     source, guid, claude_worker.news.store.STATE_ESCALATED
                 )
