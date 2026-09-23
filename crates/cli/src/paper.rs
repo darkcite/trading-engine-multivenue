@@ -913,18 +913,18 @@ pub struct BinanceConnSpec {
     /// WS host (spot: `BINANCE_WS_HOST`; USDS-M: `BINANCE_FUT_WS_HOST`;
     /// eapi options: `BINANCE_EAPI_WS_HOST`).
     pub host: String,
-    /// Stream path (`/ws/<symbol>@bookTicker`, or the M2.4 eapi
-    /// combined `/stream?streams=…`).
+    /// Stream path (`/ws/<symbol>@bookTicker`, `/market/ws/<symbol>@markPrice`
+    /// — [`bn_usdm_specs`] — or the options combined path
+    /// [`bn_options_path`]).
     pub path: String,
     /// Pinned SymbolId (the M1 allocation law; 0 sentinel on an eapi
     /// slot — its syms live in the lane table).
     pub sym: core_types::SymbolId,
-    /// M2.4: present ⇒ this slot is the eapi combined options stream
-    /// — the boot-built symbol table + the configured underlyings
-    /// (stream-lowercased inside the lane).
-    pub eapi: Option<(ingress_binance::eapi::EapiSymbolTable, Vec<String>)>,
-    /// WS5: true ⇒ this slot is a `/ws/<sym>@markPrice` stream (the
-    /// capture-only mark/index/funding lane; `sym` pinned like
+    /// M2.4 / BX0-F2: present ⇒ this slot is the options combined
+    /// stream, carrying the boot-built table of the selected chain.
+    pub eapi: Option<ingress_binance::eapi::EapiSymbolTable>,
+    /// WS5: true ⇒ this slot is a `/market/ws/<sym>@markPrice` stream
+    /// (the capture-only mark/index/funding lane; `sym` pinned like
     /// bookTicker). Mutually exclusive with `eapi`.
     pub mark_price: bool,
     /// VT2: true ⇒ a SPOT bookTicker slot that also subscribes
@@ -939,6 +939,73 @@ pub struct BinanceConnSpec {
 /// path (`None` for any other shape) — the sentinel's `<symbol>@aggTrade`.
 pub fn spot_stream_symbol(path: &str) -> Option<&str> {
     path.strip_prefix("/ws/")?.strip_suffix("@bookTicker")
+}
+
+/// BX0-F1: the USDⓈ-M `bookTicker` stream prefix — fstream's legacy
+/// `/ws/` form, which still carries the `/public` streams (measured
+/// 2026-09-23: 2 428 frames in 3 s). It moves to `/public/ws/` on a
+/// measurement (K7), never on a guess.
+pub const BN_USDM_BOOK_TICKER_PREFIX: &str = "/ws/";
+
+/// BX0-F1: the USDⓈ-M `markPrice` stream prefix — fstream's ROUTED
+/// `/market` path. The legacy `/ws/<sym>@markPrice` URL stopped
+/// carrying `/market` streams on 2026-04-23, and it fails SILENTLY:
+/// the upgrade still answers 101 and the socket then carries nothing
+/// (measured 2026-09-23: 0 frames in 7 s against one per 3 s on
+/// `/market/ws/`). No handshake or error tells the two apart — only
+/// a frame count does, which is why the live smoke asserts one.
+pub const BN_USDM_MARK_PRICE_PREFIX: &str = "/market/ws/";
+
+/// BX0-F1: the two USDⓈ-M slots one instrument gets on `host`
+/// (`BINANCE_FUT_WS_HOST`): `bookTicker` (the tick lane) and
+/// `markPrice` (the capture-only mark / index / funding lane). One
+/// builder for the engine boot and the live smoke, so the path the
+/// smoke proves is the path the engine dials. Boot-only.
+#[must_use]
+pub fn bn_usdm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [BinanceConnSpec; 2] {
+    [
+        BinanceConnSpec {
+            host: host.to_owned(),
+            path: format!("{BN_USDM_BOOK_TICKER_PREFIX}{name}@bookTicker"),
+            sym,
+            eapi: None,
+            mark_price: false,
+            // USDS-M bookTicker stamps itself (T/E) — no sentinel.
+            spot_sentinel: false,
+        },
+        BinanceConnSpec {
+            host: host.to_owned(),
+            path: format!("{BN_USDM_MARK_PRICE_PREFIX}{name}@markPrice"),
+            sym,
+            eapi: None,
+            mark_price: true,
+            spot_sentinel: false,
+        },
+    ]
+}
+
+/// BX0-F2: the options lane's combined path on fstream's routed
+/// `/market` path — one `<underlying>@optionMarkPrice` stream per
+/// configured underlying (lowercase). Each push is ONE array holding
+/// every listed option on that underlying (mark, IV, greeks, best
+/// bid/ask and the index), about once a second; the lane keeps the
+/// boot-selected chain and skips the rest by table lookup
+/// (`ingress_binance::eapi`). The retired nbstream `/eoptions/…`
+/// `@ticker`/`@index` streams answer HTTP 404. Boot-only.
+#[must_use]
+pub fn bn_options_path(underlyings: &[String]) -> String {
+    const HEAD: &str = "/market/stream?streams=";
+    const STREAM: &str = "@optionMarkPrice";
+    let mut p = String::with_capacity(HEAD.len() + underlyings.len() * (16 + STREAM.len() + 1));
+    p.push_str(HEAD);
+    for (i, uly) in underlyings.iter().enumerate() {
+        if i > 0 {
+            p.push('/');
+        }
+        p.push_str(&uly.to_ascii_lowercase());
+        p.push_str(STREAM);
+    }
+    p
 }
 
 /// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
@@ -1009,17 +1076,11 @@ pub fn spawn_binance_multi(
             };
             let mut conns: Vec<bwl::MultiConn<TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
-                // M2.4: an eapi spec builds the combined-stream lane
-                // driver; WS5: a markPrice spec builds the mark lane;
-                // bookTicker slots stay byte-identical.
+                // M2.4/BX0-F2: an options spec builds the mark-array
+                // lane driver; WS5: a markPrice spec builds the mark
+                // lane; bookTicker slots stay byte-identical.
                 let drv = match spec.eapi {
-                    Some((table, ulys)) => {
-                        let uly_refs: Vec<&[u8]> = ulys.iter().map(|s| s.as_bytes()).collect();
-                        bwl::Driver::new_eapi(
-                            now_ns().wrapping_add(i as u64),
-                            ingress_binance::eapi::EapiLane::new(table, &uly_refs),
-                        )
-                    }
+                    Some(table) => bwl::Driver::new_eapi(now_ns().wrapping_add(i as u64), table),
                     None if spec.mark_price => {
                         bwl::Driver::new_mark_price(now_ns().wrapping_add(i as u64), spec.sym)
                     }
@@ -7576,10 +7637,11 @@ pub mod boot_discovery {
         /// zero-REST Binance behavior — config boots audit).
         pub bn: Option<VenueCoverage>,
         /// M2.4: the selected Binance eapi options chain — `(symbol,
-        /// sym, uly_idx)` in deterministic allocation order (base
-        /// [`BN_OPT_ORDINAL_BASE`]). The bin builds the eapi lane
-        /// table from these. Empty when the policy is disabled.
-        pub bn_options: Vec<(String, SymbolId, u8)>,
+        /// sym)` in deterministic allocation order (base
+        /// [`BN_OPT_ORDINAL_BASE`]), the OKX shape. The bin builds the
+        /// options lane table from these. Empty when the policy is
+        /// disabled.
+        pub bn_options: Vec<(String, SymbolId)>,
         /// WS9: Bybit coverage (instruments-info audit, spot + linear
         /// pages); `None` when the `[bybit]` section is empty.
         pub bybit: Option<VenueCoverage>,
@@ -8411,15 +8473,16 @@ pub mod boot_discovery {
     /// from [`BN_OPT_ORDINAL_BASE`] (the venue's 512-block belongs to
     /// usdm). Fetch/parse failures FATAL; an EMPTY per-underlying
     /// selection is MISSING semantics (reason `no_chain`). Returns
-    /// `(symbol, sym, uly_idx)` — the lane table needs the underlying
-    /// index for its per-family index-price cache.
+    /// `(symbol, sym)` — the lane needs nothing per underlying since
+    /// BX0-F2: every element of the `<uly>@optionMarkPrice` array
+    /// carries its own index price.
     fn run_bn_options(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
         policy: &OptionsPolicy,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
-    ) -> Result<Vec<(String, SymbolId, u8)>, &'static str> {
+    ) -> Result<Vec<(String, SymbolId)>, &'static str> {
         let (host, port) = split_host_port(&cfg.binance_eapi_rest_host, 443)?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8436,9 +8499,9 @@ pub mod boot_discovery {
             "bn: eapi exchangeInfo parse failed"
         })?;
 
-        let mut out: Vec<(String, SymbolId, u8)> = Vec::new();
+        let mut out: Vec<(String, SymbolId)> = Vec::new();
         let mut k = 0u32;
-        for (uly_idx, uly) in policy.underlyings.iter().enumerate() {
+        for uly in &policy.underlyings {
             std::thread::sleep(Duration::from_millis(150));
             let idx_path = format!("/eapi/v1/index?underlying={uly}");
             let range = get(tls, host, port, &idx_path, buf).map_err(|e| {
@@ -8474,7 +8537,7 @@ pub mod boot_discovery {
                     .map_err(|_| "bn: non-utf8 eapi option symbol")?;
                 let sym = make_symbol_id(VenueId::Binance, BN_OPT_ORDINAL_BASE + k + 1);
                 k += 1;
-                out.push((symbol.to_string(), sym, uly_idx as u8));
+                out.push((symbol.to_string(), sym));
             }
             tracing::info!(
                 venue = "bn",
@@ -9091,6 +9154,43 @@ pub mod boot_discovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BX0-F1: the markPrice slot dials fstream's ROUTED `/market`
+    /// path — the legacy `/ws/` form answers 101 and then stays silent
+    /// — while bookTicker keeps the legacy path that still delivers.
+    /// One builder feeds the boot and the live smoke, so this pins
+    /// both.
+    #[test]
+    fn usdm_specs_route_mark_price_via_market_and_keep_book_ticker_legacy() {
+        let [book, mark] = bn_usdm_specs("fstream.binance.com", "btcusdt_260925", 7);
+        assert_eq!(book.host, "fstream.binance.com");
+        assert_eq!(book.path, "/ws/btcusdt_260925@bookTicker");
+        assert!(!book.mark_price && !book.spot_sentinel && book.eapi.is_none());
+        assert_eq!(book.sym, 7);
+        assert_eq!(mark.host, "fstream.binance.com");
+        assert_eq!(mark.path, "/market/ws/btcusdt_260925@markPrice");
+        assert!(mark.mark_price && !mark.spot_sentinel && mark.eapi.is_none());
+        assert_eq!(mark.sym, 7);
+        // The spot sentinel reads its symbol off the LEGACY bookTicker
+        // shape; the USDⓈ-M book path must keep matching it.
+        assert_eq!(spot_stream_symbol(&book.path), Some("btcusdt_260925"));
+    }
+
+    /// BX0-F2: one `<uly>@optionMarkPrice` stream per underlying,
+    /// lowercased, on the routed `/market` combined path — never the
+    /// retired `/eoptions/` form or the per-option `@ticker`/`@index`
+    /// streams (HTTP 404 since the 2025-12 options migration).
+    #[test]
+    fn options_path_is_the_routed_mark_array_stream() {
+        assert_eq!(
+            bn_options_path(&["BTCUSDT".to_string(), "ETHUSDT".to_string()]),
+            "/market/stream?streams=btcusdt@optionMarkPrice/ethusdt@optionMarkPrice"
+        );
+        assert_eq!(
+            bn_options_path(&["BTCUSDT".to_string()]),
+            "/market/stream?streams=btcusdt@optionMarkPrice"
+        );
+    }
 
     /// T1(b) (outage 2026-08-27 §5.3): the predicate that replaces
     /// the msgs-based reset. Happy path: data moved ⇒ reset. Failure

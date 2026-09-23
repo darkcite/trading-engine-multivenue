@@ -50,7 +50,7 @@ pub const INSTRUMENT_MANIFEST_FILE: &str = "instrument-manifest.tsv";
 pub fn render(
     deribit: &[crate::paper::DiscoveredOption],
     okx: &[(String, SymbolId)],
-    bn: &[(String, SymbolId, u8)],
+    bn: &[(String, SymbolId)],
 ) -> String {
     let mut out = String::new();
     for (name, sym, ..) in deribit {
@@ -59,7 +59,7 @@ pub fn render(
     for (name, sym) in okx {
         push_row(&mut out, "okx", *sym, name);
     }
-    for (name, sym, _uly_idx) in bn {
+    for (name, sym) in bn {
         push_row(&mut out, "bn", *sym, name);
     }
     out
@@ -73,7 +73,7 @@ pub fn render_instruments(
     allocated: &AllocatedUniverse,
     deribit_opts: &[crate::paper::DiscoveredOption],
     okx_opts: &[(String, SymbolId)],
-    bn_opts: &[(String, SymbolId, u8)],
+    bn_opts: &[(String, SymbolId)],
 ) -> String {
     let mut out = String::new();
     for t in &allocated.pm_tokens {
@@ -126,7 +126,7 @@ pub fn render_instruments(
         let desc = format!("okx:{name}");
         push_desc_row(&mut out, *sym, &desc);
     }
-    for (name, sym, _uly_idx) in bn_opts {
+    for (name, sym) in bn_opts {
         let desc = format!("binance-opt:{name}");
         push_desc_row(&mut out, *sym, &desc);
     }
@@ -145,7 +145,7 @@ pub fn build_descriptor_entries(
     allocated: &AllocatedUniverse,
     deribit_opts: &[crate::paper::DiscoveredOption],
     okx_opts: &[(String, SymbolId)],
-    bn_opts: &[(String, SymbolId, u8)],
+    bn_opts: &[(String, SymbolId)],
     okx_depth: bool,
     deribit_depth: bool,
 ) -> Vec<(String, SymbolId, u8)> {
@@ -185,7 +185,7 @@ pub fn build_descriptor_entries(
     for (name, sym) in okx_opts {
         push(format!("okx:{name}"), *sym);
     }
-    for (name, sym, _uly_idx) in bn_opts {
+    for (name, sym) in bn_opts {
         push(format!("binance-opt:{name}"), *sym);
     }
     out
@@ -235,7 +235,7 @@ mod tests {
             ),
         ];
         let okx = vec![("BTC-USD-260327-100000-C".to_string(), 0x0200_0201u32)];
-        let bn = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
+        let bn = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32)];
         let body = render(&deribit, &okx, &bn);
         let want = format!(
             "deribit\t{}\tBTC-27MAR26-100000-C\n\
@@ -311,7 +311,7 @@ mod tests {
             1_774_598_400_000i64,
             opt_registry::RIGHT_CALL,
         )];
-        let bn_opts = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32, 0u8)];
+        let bn_opts = vec![("BTC-260327-100000-C".to_string(), 0x0100_0401u32)];
         let body = render_instruments(&alloc, &deribit_opts, &[], &bn_opts);
         let want = format!(
             "42\t2875608808\n\

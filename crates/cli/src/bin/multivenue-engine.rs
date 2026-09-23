@@ -2869,73 +2869,48 @@ fn run(args: RunArgs) -> ExitCode {
             .iter()
             .chain(boot.allocated.bn_dated.iter())
         {
-            specs.push(cli::BinanceConnSpec {
-                host: cfg.binance_fut_ws_host.clone(),
-                path: format!("/ws/{}@bookTicker", inst.name),
-                sym: inst.sym,
-                eapi: None,
-                mark_price: false,
-                // USDS-M bookTicker stamps itself (T/E) — no sentinel.
-                spot_sentinel: false,
-            });
-            specs.push(cli::BinanceConnSpec {
-                host: cfg.binance_fut_ws_host.clone(),
-                path: format!("/ws/{}@markPrice", inst.name),
-                sym: inst.sym,
-                eapi: None,
-                mark_price: true,
-                spot_sentinel: false,
-            });
+            // BX0-F1: bookTicker on the legacy `/ws/` path (still
+            // delivering), markPrice on the routed `/market/ws/` path —
+            // one builder shared with the live smoke.
+            let [book, mark] = cli::bn_usdm_specs(&cfg.binance_fut_ws_host, &inst.name, inst.sym);
+            specs.push(book);
+            specs.push(mark);
         }
         if bn_eapi_on {
-            // M2.4: one combined-stream slot carries every selected
-            // option ticker + one index stream per underlying (all
-            // stream names lowercased; no subscribe frames — the
-            // house direct-URL pattern).
+            // M2.4 / BX0-F2: ONE combined slot, one
+            // `<uly>@optionMarkPrice` stream per underlying on
+            // fstream's routed `/market` path; each push is the whole
+            // chain of that underlying and the table keeps the
+            // selected rows (no subscribe frames — the house
+            // direct-URL pattern).
             let mut table = ingress_binance::eapi::EapiSymbolTable::new();
-            let mut streams = String::new();
-            for (symbol, sym, uly_idx) in &discovery.bn_options {
-                if let Err(e) = table.insert(symbol.as_bytes(), *sym, *uly_idx) {
-                    error!(?e, symbol = %symbol, "binance: eapi table build failed");
+            for (symbol, sym) in &discovery.bn_options {
+                if let Err(e) = table.insert(symbol.as_bytes(), *sym) {
+                    error!(?e, symbol = %symbol, "binance: options table build failed");
                     join_reverse(handles);
                     return ExitCode::from(1);
                 }
-                if !streams.is_empty() {
-                    streams.push('/');
-                }
-                streams.push_str(&symbol.to_ascii_lowercase());
-                streams.push_str("@ticker");
             }
-            for uly in &boot.bn_options.underlyings {
-                streams.push('/');
-                streams.push_str(&uly.to_ascii_lowercase());
-                streams.push_str("@index");
-            }
+            let path = cli::bn_options_path(&boot.bn_options.underlyings);
+            // Loud endpoint provenance — the options WS base has
+            // churned (nbstream `/eoptions` retired, fstream `/market`
+            // since the 2025-12 migration); a host pinned in `.env`
+            // shows here, and so does its 404.
+            info!(
+                host = %cfg.binance_eapi_ws_host,
+                path = %path,
+                underlyings = boot.bn_options.underlyings.len(),
+                selected = discovery.bn_options.len(),
+                "binance: options mark-array slot (override via BINANCE_EAPI_WS_HOST)"
+            );
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_eapi_ws_host.clone(),
-                // The documented eapi combined base (legacy docs +
-                // the live nbstream ALB). TEMPORARILY UNREACHABLE
-                // from this network as of 2026-08-22 (404/403 on
-                // every candidate route while eapi REST serves —
-                // forensics in docs/m2-progress.md); the slot retries
-                // harmlessly and BINANCE_EAPI_WS_HOST is the
-                // override once an endpoint is confirmed.
-                path: format!("/eoptions/stream?streams={streams}"),
+                path,
                 sym: 0,
-                eapi: Some((table, boot.bn_options.underlyings.clone())),
+                eapi: Some(table),
                 mark_price: false,
                 spot_sentinel: false,
             });
-        }
-        if bn_eapi_on {
-            // Loud endpoint provenance — the options WS base has
-            // churned (nbstream/fstream/vstream history) and can be
-            // geo-gated; the operator override is the escape hatch.
-            info!(
-                host = %cfg.binance_eapi_ws_host,
-                streams = discovery.bn_options.len() + boot.bn_options.underlyings.len(),
-                "binance: eapi options combined-stream slot (override via BINANCE_EAPI_WS_HOST)"
-            );
         }
         info!(
             conns = specs.len(),

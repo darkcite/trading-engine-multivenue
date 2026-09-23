@@ -56,10 +56,22 @@ use crate::{parse_book_ticker, parse_trade};
 /// each; 64 KiB accommodates huge bursts without ever reallocating.
 pub const RX_BUF_SIZE: usize = 64 * 1024;
 
-/// Rx sizing for the M2.4 eapi combined slot: 64 option tickers
-/// (~1 KiB each) + index pushes can burst together; 512 KiB gives
-/// ≥8× margin over a full-chain simultaneous burst (boot alloc).
-pub const EAPI_RX_BUF_SIZE: usize = 512 * 1024;
+/// Rx sizing for the options slot (BX0-F2): every push is ONE frame
+/// holding a whole underlying's listed chain — measured 2026-09-23 at
+/// 245.6 KB for BTC (752 options) and 194 KB for ETH (600), one each
+/// per ~1 s, landing back to back. A frame only parses once it is
+/// whole and contiguous in this buffer, and one larger than the
+/// buffer would stall the slot until the idle timeout, so 2 MiB is
+/// 8× the largest push with room for the chain to keep growing (boot
+/// alloc, one slot).
+pub const EAPI_RX_BUF_SIZE: usize = 2 * 1024 * 1024;
+
+/// Longest reject record the options slot taps (BX0-F2): enough bytes
+/// at the fault to identify it, not the ~246 KB push that held it — a
+/// whole push would cost a quarter-megabyte copy on the thread that
+/// also serves every bookTicker, and could spend the tap's budget in
+/// one record.
+pub const EAPI_REJECT_TAP_MAX: usize = 512;
 
 /// Size of the tx byte buffer. Only used for the opening handshake + pong
 /// replies, so 4 KiB is generous.
@@ -111,6 +123,18 @@ impl IoBuf {
     #[inline]
     fn free_mut(&mut self) -> &mut [u8] {
         if self.tail == self.data.len() && self.head > 0 {
+            // Runs only when the tail reaches the end with bytes unread:
+            // a slot drained to empty resets to 0 without copying, which
+            // the options pushes' idle gaps usually allow. Alternatives
+            // weighed: a split-slice ring (a second path in every
+            // scanner), a double-mapped mirror ring (platform VM calls),
+            // compacting at header time (a second header parse per
+            // partial read on every slot, to shrink a rare copy).
+            // COPY: the unread bytes, < the slot's buffer (64 KiB; 2 MiB
+            // on the options slot — most of a ~246 KB push at worst) —
+            // the scanners borrow ONE contiguous frame, and one
+            // straddling the end cannot be borrowed from two places —
+            // rejected: the three alternatives above.
             self.data.copy_within(self.head..self.tail, 0);
             self.tail -= self.head;
             self.head = 0;
@@ -191,15 +215,20 @@ pub enum StreamLane {
     /// `/ws/<symbol>@bookTicker` — the M1c spot/usdm lane (`sym`
     /// pinned on the driver).
     BookTicker,
-    /// WS5: `/ws/<symbol>@markPrice` — USDS-M mark/index/funding
-    /// stream (`sym` pinned on the driver, the bookTicker shape).
+    /// WS5: `/market/ws/<symbol>@markPrice` — USDS-M mark/index/
+    /// funding stream on fstream's ROUTED `/market` path (BX0-F1: the
+    /// legacy `/ws/` URL stopped carrying `/market` streams on
+    /// 2026-04-23 and upgrades to a silent socket). `sym` pinned on the
+    /// driver, the bookTicker shape.
     /// Capture-only: `ChannelId::Mark` + (perps) `ChannelId::Funding`
     /// events; nothing reaches the engine ring until the WS10
     /// funding carrier lands.
     MarkPrice,
-    /// M2.4 eapi combined options stream (`<sym>@ticker` × N +
-    /// `<uly>@index`): BBO → `Tick`, mark/IV/greeks → `OptSummary`.
-    Eapi(crate::eapi::EapiLane),
+    /// M2.4 / BX0-F2 options combined stream (`<uly>@optionMarkPrice`
+    /// per underlying on fstream `/market`): each push is one array of
+    /// the whole chain; the table's rows yield BBO → `Tick` and
+    /// mark/IV/greeks/index → `OptSummary`.
+    Eapi(crate::eapi::EapiSymbolTable),
 }
 
 /// Mutable per-connection state owned by the run-loop. Preallocated at
@@ -334,12 +363,17 @@ impl Driver {
         d
     }
 
-    /// M2.4: an eapi combined-stream slot (options tickers + index
-    /// pushes). RX is sized up: one combined frame is small (~1 KiB)
-    /// but 64 ticker streams burst together.
-    pub fn new_eapi(nonce_seed: u64, lane: crate::eapi::EapiLane) -> Self {
+    /// M2.4 / BX0-F2: an options combined-stream slot carrying the
+    /// selected chain's table. RX is sized for the push — a whole
+    /// underlying's chain per frame ([`EAPI_RX_BUF_SIZE`]).
+    pub fn new_eapi(nonce_seed: u64, table: crate::eapi::EapiSymbolTable) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        // COPY: the ≤ 2.4 KiB boot table moves into the slot's lane,
+        // once, at boot (and moved through the spec before it) — the
+        // lane holds it INLINE so every per-element lookup walks
+        // contiguous rows with no pointer to chase — rejected: a `Box`
+        // (a heap hop on every lookup, and the crate's no-`Box` rule).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(EAPI_RX_BUF_SIZE),
@@ -349,7 +383,7 @@ impl Driver {
             last_activity_ns: 0,
             mask_counter: 0,
             sym: 0,
-            lane: StreamLane::Eapi(lane),
+            lane: StreamLane::Eapi(table),
             // Options tickers are never judged (no bookTicker on this
             // slot); the estimator sits idle.
             feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
@@ -695,26 +729,22 @@ fn drain_ws_frames<C: Capture>(
     }
 }
 
-/// Phase-1 outcome of one eapi combined frame (M2.4; `Copy` — the
-/// two-phase pattern lets the index write mutate the lane after the
-/// rx borrow ends).
-#[derive(Copy, Clone)]
-enum EapiAction {
-    /// Unknown stream / malformed data — one rejection.
-    Reject,
-    /// Option ticker: the summary is always captured; the tick only
-    /// when a side exists (quiet far options carry empty quotes).
-    Ticker {
-        tick: Option<Tick>,
-        summary: OptSummary,
-    },
-    /// Index push for the per-underlying cache.
-    Index { uly_idx: u8, px_1e9: i64 },
-}
-
-/// M2.4: handle one eapi combined-stream frame. Phase 1 borrows rx +
-/// lane immutably (index READS during summary assembly are fine);
-/// phase 2 applies the one mutable effect (the index-cache write).
+/// M2.4 / BX0-F2: handle one options frame —
+/// `{"stream":"<uly>@optionMarkPrice","data":[{…},…]}`, the whole
+/// listed chain of one underlying (752 BTC elements, ~246 KB, about
+/// once a second). One pass over the array IN PLACE: each element
+/// whose `"s"` is in the boot table yields an `OptSummary` (always)
+/// and a `Tick` (when a side is quoted); every other element costs one
+/// symbol compare. The only bytes that leave rx are the PODs.
+///
+/// A frame that is not this stream, or not an array, is ONE rejection;
+/// a selected element that fails its fields is one rejection of that
+/// element; a walk that turns malformed mid-array keeps the rows it
+/// already emitted — each was parsed from its own complete element —
+/// and counts one rejection. A reject taps the element, or at most
+/// [`EAPI_REJECT_TAP_MAX`] bytes from where the walk stopped — never
+/// the quarter-megabyte push (`--raw-tap bn` in All mode still holds
+/// every whole frame).
 fn handle_eapi_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -723,107 +753,111 @@ fn handle_eapi_frame<C: Capture>(
     status: &core_metrics::IngressStatus,
     capture: &mut C,
 ) {
-    let action: EapiAction = {
-        let payload = &drv.rx.filled()[payload_range.clone()];
-        capture.raw_frame(now_ns(), payload);
-        let StreamLane::Eapi(lane) = &drv.lane else {
-            debug_assert!(false, "eapi handler on a bookTicker slot");
-            return;
-        };
-        match crate::eapi::split_combined(payload) {
-            Some((stream, data)) if stream.ends_with(b"@ticker") => {
-                let sym_part = &stream[..stream.len() - b"@ticker".len()];
-                match lane.table.lookup(sym_part) {
-                    Some((sym, uly_idx)) => match crate::eapi::parse_eapi_ticker(data) {
-                        Some(f) => {
-                            let ts_ns = now_ns();
-                            let tick = if f.bid_px_1e6 != 0 || f.ask_px_1e6 != 0 {
-                                Some(Tick::new(
-                                    ts_ns,
-                                    core_types::VenueId::Binance,
-                                    sym,
-                                    // eapi tickers carry no venue seq.
-                                    0,
-                                    Price::from_raw(f.bid_px_1e6),
-                                    Qty::from_raw(f.bid_qty_1e6),
-                                    Price::from_raw(f.ask_px_1e6),
-                                    Qty::from_raw(f.ask_qty_1e6),
-                                ))
-                            } else {
-                                None
-                            };
-                            let summary = OptSummary::new(
-                                ts_ns,
-                                core_types::VenueId::Binance,
-                                sym,
-                                // eapi has no OI stream — MARK_PX only
-                                // (docs/wire-format.md flags law).
-                                core_types::OPT_SUMMARY_FLAG_MARK_PX,
-                                f.mark_px_1e9,
-                                f.mark_iv_1e9,
-                                lane.index_px(uly_idx),
-                                0,
-                                f.delta_1e9,
-                                f.gamma_1e9,
-                                f.vega_1e6,
-                                f.theta_1e6,
-                            );
-                            EapiAction::Ticker { tick, summary }
-                        }
-                        None => EapiAction::Reject,
-                    },
-                    None => EapiAction::Reject,
-                }
-            }
-            Some((stream, data)) if stream.ends_with(b"@index") => {
-                let uly_part = &stream[..stream.len() - b"@index".len()];
-                match lane.uly_lookup(uly_part) {
-                    Some(uly_idx) => match crate::eapi::parse_eapi_index(data) {
-                        Some(px_1e9) => EapiAction::Index { uly_idx, px_1e9 },
-                        None => EapiAction::Reject,
-                    },
-                    None => EapiAction::Reject,
-                }
-            }
-            _ => EapiAction::Reject,
-        }
+    // Disjoint field borrows: the frame is a view into `rx`, the table
+    // is read-only; nothing on the driver is written.
+    let Driver { rx, lane, .. } = drv;
+    let payload = &rx.filled()[payload_range];
+    capture.raw_frame(now_ns(), payload);
+    let StreamLane::Eapi(table) = lane else {
+        debug_assert!(false, "options handler on a non-options slot");
+        return;
     };
-    match action {
-        EapiAction::Reject => {
+    let array = match crate::eapi::split_combined(payload) {
+        Some((stream, data)) if stream.ends_with(crate::eapi::EAPI_MARK_STREAM.as_bytes()) => {
+            crate::eapi::EapiArrayCursor::new(data)
+        }
+        _ => None,
+    };
+    let Some(mut cur) = array else {
+        status.inc_parse_errors();
+        capture.parse_reject(now_ns(), &payload[..payload.len().min(EAPI_REJECT_TAP_MAX)]);
+        return;
+    };
+    let ts_ns = now_ns();
+    let mut rows = 0u64;
+    // One parse target for the whole walk (88 B — filled in place,
+    // never returned by value).
+    let mut f = crate::eapi::EapiMarkFrame::ZERO;
+    loop {
+        let elem = match cur.next_elem() {
+            crate::eapi::ArrayStep::Elem(e) => e,
+            crate::eapi::ArrayStep::End => break,
+            crate::eapi::ArrayStep::Malformed => {
+                status.inc_parse_errors();
+                let at = cur.rest();
+                capture.parse_reject(now_ns(), &at[..at.len().min(EAPI_REJECT_TAP_MAX)]);
+                break;
+            }
+        };
+        let sym = match crate::eapi::eapi_elem_symbol(elem) {
+            Some(s) => match table.lookup(s) {
+                Some(sym) => sym,
+                // Not in the selected chain — the common case.
+                None => continue,
+            },
+            None => {
+                status.inc_parse_errors();
+                capture.parse_reject(now_ns(), elem);
+                continue;
+            }
+        };
+        if !crate::eapi::parse_eapi_mark(elem, &mut f) {
             status.inc_parse_errors();
-            capture.parse_reject(now_ns(), &drv.rx.filled()[payload_range]);
+            capture.parse_reject(now_ns(), elem);
+            continue;
         }
-        EapiAction::Ticker { tick, summary } => {
-            // §6.5: capture first. VM2 V2: the summary now ALSO rides
-            // the opt lane (the kind-6 channel's engine entry).
-            capture.opt_summary(&summary);
-            if opt_tx.try_push(summary).is_err() {
-                status.inc_opt_ring_drops();
-            }
-            if let Some(t) = tick {
-                capture.tick(&t);
-                if producer.try_push(t).is_err() {
-                    status.inc_ring_drops();
-                }
-            }
-            status.add_msgs(1);
-            status.add_ticks(1);
+        let summary = OptSummary::new(
+            ts_ns,
+            core_types::VenueId::Binance,
+            sym,
+            // No open interest on this stream — MARK_PX only
+            // (docs/wire-format.md flags law).
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            f.mark_px_1e9,
+            f.mark_iv_1e9,
+            f.index_px_1e9,
+            0,
+            f.delta_1e9,
+            f.gamma_1e9,
+            f.vega_1e6,
+            f.theta_1e6,
+        );
+        // §6.5: capture first. VM2 V2: the summary also rides the opt
+        // lane (the kind-6 channel's engine entry).
+        capture.opt_summary(&summary);
+        if opt_tx.try_push(summary).is_err() {
+            status.inc_opt_ring_drops();
         }
-        EapiAction::Index { uly_idx, px_1e9 } => {
-            if let StreamLane::Eapi(lane) = &mut drv.lane {
-                lane.set_index_px(uly_idx, px_1e9);
+        if f.bid_px_1e6 != 0 || f.ask_px_1e6 != 0 {
+            let tick = Tick::new(
+                ts_ns,
+                core_types::VenueId::Binance,
+                sym,
+                // The mark array carries no venue sequence.
+                0,
+                Price::from_raw(f.bid_px_1e6),
+                Qty::from_raw(f.bid_qty_1e6),
+                Price::from_raw(f.ask_px_1e6),
+                Qty::from_raw(f.ask_qty_1e6),
+            );
+            capture.tick(&tick);
+            if producer.try_push(tick).is_err() {
+                status.inc_ring_drops();
             }
-            status.add_msgs(1);
-            status.add_ticks(1);
         }
+        rows += 1;
     }
+    status.add_msgs(1);
+    status.add_ticks(rows);
 }
 
 /// WS5: handle one `@markPrice` frame — capture-only events, the
 /// OKX Mark/Funding conventions (`Mark` v0 = mark ×1e6; on this
 /// venue v1 = index ×1e6, where OKX leaves 0; `Funding` v0 = rate
 /// ×1e9, v1 = next-funding ms — gated on wire truth, the WS3
-/// `has_funding` split: dated futures push `"r":""`).
+/// `has_funding` split: a dated contract pushes `"r":""` (WS5-era) or
+/// `"r":"0.00000000","T":0` (live since at least 2026-09-23) and
+/// writes no Funding row).
 fn handle_mark_price_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -1834,16 +1868,19 @@ mod tests {
     }
 
     fn ws_text_frame(payload: &[u8]) -> Vec<u8> {
-        // 7-bit and 16-bit length forms (M2.4 eapi combined payloads
-        // exceed 125 bytes).
-        let mut f = Vec::with_capacity(4 + payload.len());
+        // All three length forms: 7-bit, 16-bit (combined payloads
+        // exceed 125 bytes) and 64-bit (a whole-chain options push is
+        // ~250 KB — BX0-F2).
+        let mut f = Vec::with_capacity(10 + payload.len());
         f.push(0x81);
         if payload.len() <= 125 {
             f.push(payload.len() as u8);
-        } else {
-            assert!(payload.len() <= u16::MAX as usize);
+        } else if payload.len() <= u16::MAX as usize {
             f.push(126);
             f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            f.push(127);
+            f.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         }
         f.extend_from_slice(payload);
         f
@@ -1971,82 +2008,177 @@ mod tests {
         assert!(conns[1].next_attempt_ns > 0, "slot 1 got scheduled");
     }
 
-    /// M2.4 eapi lane: index push fills the cache; a ticker push
-    /// yields a Tick (ring) + an OptSummary (capture) with the cached
-    /// underlying px; empty quotes yield the summary alone; unknown
-    /// streams reject.
-    #[test]
-    fn eapi_slot_routes_ticker_index_and_rejects() {
-        struct RecCap {
-            summaries: Vec<OptSummary>,
-            rejects: u32,
-        }
-        impl Capture for RecCap {
-            fn opt_summary(&mut self, o: &OptSummary) {
-                self.summaries.push(*o);
-            }
-            fn parse_reject(&mut self, _ts: NsTs, _p: &[u8]) {
-                self.rejects += 1;
-            }
-        }
+    /// The K6 BTC push (2026-09-23), trimmed to three of its 752
+    /// elements: the push's first row and the ATM pair, verbatim.
+    const LIVE_BTC_MARKS: &[u8] = br#"{"stream":"btcusdt@optionMarkPrice","data":[{"s":"BTC-261225-92000-C","mp":"4696.169","E":1790161477975,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"4670.000","ao":"4760.000","bq":"3.52","aq":"3.52","b":"0.38545907","a":"0.39075673","hl":"8450.000","ll":"940.000","vo":"0.387","rf":"0.0529","d":"0.42618971","t":"-35.49083602","g":"0.00002332","v":"169.85468453"},{"s":"BTC-260925-86000-P","mp":"905.351","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"905.000","ao":"920.000","bq":"4.43","aq":"12.00","b":"0.34885705","a":"0.35497367","hl":"1625.000","ll":"185.000","vo":"0.349","rf":"0.0558","d":"-0.51276574","t":"-230.5222729","g":"0.00018424","v":"24.52223767"},{"s":"BTC-260925-86000-C","mp":"809.784","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"800.000","ao":"810.000","bq":"5.08","aq":"1.10","b":"0.34500957","a":"0.34908772","hl":"1455.000","ll":"165.000","vo":"0.349","rf":"0.0558","d":"0.48723426","t":"-227.33432684","g":"0.00018682","v":"24.52223767"}]}"#;
 
+    /// Records the options lane's capture calls.
+    #[derive(Default)]
+    struct OptCap {
+        summaries: Vec<OptSummary>,
+        ticks: u32,
+        rejects: Vec<usize>,
+    }
+    impl Capture for OptCap {
+        fn opt_summary(&mut self, o: &OptSummary) {
+            self.summaries.push(*o);
+        }
+        fn tick(&mut self, _t: &Tick) {
+            self.ticks += 1;
+        }
+        fn parse_reject(&mut self, _ts: NsTs, p: &[u8]) {
+            self.rejects.push(p.len());
+        }
+    }
+
+    /// BX0-F2: the options slot walks the live mark array — the two
+    /// selected rows become a `Tick` + an `OptSummary` each (index from
+    /// the element itself), the unselected row costs nothing; a push
+    /// of other underlyings' rows is a clean frame with no output; an
+    /// empty book yields the summary alone; a foreign stream and a
+    /// selected row missing its mark are one rejection each.
+    #[test]
+    fn options_slot_walks_the_mark_array() {
         let mut table = crate::eapi::EapiSymbolTable::new();
-        let sym: SymbolId = (1 << 24) | 1025; // venue 1, ordinal 1025 (base-1024 block)
-        table.insert(b"BTC-260327-100000-C", sym, 0).unwrap();
-        let lane = crate::eapi::EapiLane::new(table, &[b"BTCUSDT"]);
-        let mut d = Driver::new_eapi(7, lane);
+        let call: SymbolId = (1 << 24) | 1025;
+        let put: SymbolId = (1 << 24) | 1026;
+        table.insert(b"BTC-260925-86000-C", call).unwrap();
+        table.insert(b"BTC-260925-86000-P", put).unwrap();
+        let mut d = Driver::new_eapi(7, table);
         d.set_state(State::Steady);
 
         let mut t = TestTransport::with_capacity(64 * 1024);
-        // 1. index push (fills the cache) …
+        // 1. the live push: two selected rows, one skipped.
+        t.inject_incoming(&ws_text_frame(LIVE_BTC_MARKS));
+        // 2. a push with no selected row: clean, silent.
         t.inject_incoming(&ws_text_frame(
-            br#"{"stream":"btcusdt@index","data":{"e":"index","E":1,"s":"BTCUSDT","p":"77000.5"}}"#,
+            br#"{"stream":"ethusdt@optionMarkPrice","data":[{"s":"ETH-260925-2750-C","mp":"30.442","i":"2735.23837209","bo":"29.6000","ao":"30.2000","bq":"619.93","aq":"233.24","vo":"0.4661","d":"0.4507823","t":"-9.51030442","g":"0.00440247","v":"0.77546924"}]}"#,
         ));
-        // 2. … a full ticker (tick + summary with underlying px) …
+        // 3. the call again, book empty (`"0.000"` both sides).
         t.inject_incoming(&ws_text_frame(
-            br#"{"stream":"btc-260327-100000-c@ticker","data":{"e":"24hrTicker","s":"BTC-260327-100000-C","bo":"2040.5","ao":"2060.1","bq":"1.25","aq":"0.75","b":"0.62","a":"0.68","d":"0.512","t":"-85.3","g":"0.0000123","v":"152.3","vo":"0.6543","mp":"2051.2"}}"#,
+            br#"{"stream":"btcusdt@optionMarkPrice","data":[{"s":"BTC-260925-86000-C","mp":"810.0","i":"85900.5","bo":"0.000","ao":"0.000","bq":"0.00","aq":"0.00","vo":"0.35","d":"0.49","t":"-228.0","g":"0.0002","v":"24.6"}]}"#,
         ));
-        // 3. … a quiet-quotes ticker (summary only) …
+        // 4. a foreign stream: one rejection, the whole frame.
+        let foreign: &[u8] =
+            br#"{"stream":"btcusdt@index","data":{"e":"index","s":"BTCUSDT","p":"77000.5"}}"#;
+        t.inject_incoming(&ws_text_frame(foreign));
+        // 5. the put without its mark: one rejection, that element.
         t.inject_incoming(&ws_text_frame(
-            br#"{"stream":"btc-260327-100000-c@ticker","data":{"s":"BTC-260327-100000-C","bo":"","ao":"","bq":"","aq":"","d":"0.5","t":"-80.0","g":"0.00001","v":"150.0","vo":"0.65","mp":"2050.0"}}"#,
-        ));
-        // 4. … an unsubscribed stream (reject).
-        t.inject_incoming(&ws_text_frame(
-            br#"{"stream":"eth-1-c@ticker","data":{"mp":"1","vo":"1","d":"0","g":"0","v":"0","t":"0"}}"#,
+            br#"{"stream":"btcusdt@optionMarkPrice","data":[{"s":"BTC-260925-86000-P","i":"85900.5","bo":"905.000","ao":"920.000","bq":"1.00","aq":"1.00","vo":"0.35","d":"-0.51","t":"-230.0","g":"0.0002","v":"24.6"}]}"#,
         ));
 
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();
+        let (mut otx, mut orx) = opt_ring_pair();
+        let (mut etx, _erx) = event_ring_pair();
         let status = core_metrics::IngressStatus::new();
-        let mut cap = RecCap {
-            summaries: Vec::new(),
-            rejects: 0,
-        };
-        drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
+        let mut cap = OptCap::default();
+        super::drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            &mut otx,
+            &status,
+            &mut cap,
+        )
+        .unwrap();
 
-        // Exactly ONE tick (the full ticker), sym + BBO from bo/ao.
-        let tick = cons.try_pop().expect("tick from the full ticker");
-        assert_eq!(tick.sym, sym);
-        assert_eq!(tick.bid_px.raw(), 2_040_500_000);
-        assert_eq!(tick.ask_px.raw(), 2_060_100_000);
+        // Ticks: the put and the call from the live push, in wire
+        // order; nothing for the empty book.
+        let tp = cons.try_pop().expect("put tick");
+        assert_eq!(tp.sym, put);
+        assert_eq!((tp.bid_px.raw(), tp.ask_px.raw()), (905_000_000, 920_000_000));
+        let tc = cons.try_pop().expect("call tick");
+        assert_eq!(tc.sym, call);
+        assert_eq!((tc.bid_px.raw(), tc.ask_px.raw()), (800_000_000, 810_000_000));
+        assert_eq!((tc.bid_qty.raw(), tc.ask_qty.raw()), (5_080_000, 1_100_000));
+        assert!(cons.try_pop().is_none(), "the empty book yields no tick");
+        assert_eq!(cap.ticks, 2);
+
+        // Summaries: put, call, call (empty book) — captured AND laned.
+        assert_eq!(cap.summaries.len(), 3);
+        let s = &cap.summaries[1];
+        assert_eq!(s.sym, call);
+        assert_eq!(s.venue, core_types::VenueId::Binance as u8);
+        assert_eq!(s.flags, core_types::OPT_SUMMARY_FLAG_MARK_PX);
+        assert_eq!(s.mark_px_1e9, 809_784_000_000);
+        assert_eq!(s.mark_iv_1e9, 349_000_000, "vo, not the bid/ask IVs");
+        assert_eq!(s.underlying_px_1e9, 85_879_828_260_870, "the element's own index");
+        assert_eq!(s.open_interest_1e6, 0);
+        assert_eq!(s.theta_1e6, -227_334_326);
+        assert_eq!(cap.summaries[0].sym, put);
+        assert_eq!(cap.summaries[2].underlying_px_1e9, 85_900_500_000_000);
+        let mut laned = 0;
+        while orx.try_pop().is_some() {
+            laned += 1;
+        }
+        assert_eq!(laned, 3, "every summary rides the opt lane too");
+
+        // Rejections: the foreign frame whole, then the one element.
+        assert_eq!(cap.rejects.len(), 2);
+        assert_eq!(cap.rejects[0], foreign.len(), "the foreign frame, tapped whole");
+        assert!(cap.rejects[1] < 200, "the bad element alone, not its frame");
+        assert_eq!(status.parse_errors_total(), 2);
+        assert_eq!(status.msgs_total(), 4, "four clean frames (the foreign one is not)");
+        assert_eq!(status.ticks_total(), 3, "one per emitted row");
+    }
+
+    /// BX0-F2 at the measured size: a 752-element push (~250 KB, the
+    /// venue's 64-bit-length frame) parses whole through the real
+    /// rx buffer and yields exactly its selected rows.
+    #[test]
+    fn options_slot_takes_a_full_size_push() {
+        let mut table = crate::eapi::EapiSymbolTable::new();
+        table.insert(b"BTC-260925-10100-C", 11).unwrap();
+        table.insert(b"BTC-260925-10701-P", 12).unwrap();
+        let mut d = Driver::new_eapi(9, table);
+        d.set_state(State::Steady);
+        let mut body = String::from(r#"{"stream":"btcusdt@optionMarkPrice","data":["#);
+        for k in 0..752u32 {
+            if k > 0 {
+                body.push(',');
+            }
+            let side = if k % 2 == 0 { 'C' } else { 'P' };
+            body.push_str(&format!(
+                r#"{{"s":"BTC-260925-{}-{side}","mp":"809.784","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"800.000","ao":"810.000","bq":"5.08","aq":"1.10","b":"0.34500957","a":"0.34908772","hl":"1455.000","ll":"165.000","vo":"0.349","rf":"0.0558","d":"0.48723426","t":"-227.33432684","g":"0.00018682","v":"24.52223767"}}"#,
+                10_000 + k
+            ));
+        }
+        body.push_str("]}");
+        assert!(body.len() > u16::MAX as usize, "must take the 64-bit length form");
+        assert!(body.len() < EAPI_RX_BUF_SIZE / 4);
+
+        let mut t = TestTransport::with_capacity(1024 * 1024);
+        t.inject_incoming(&ws_text_frame(body.as_bytes()));
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let (mut otx, _orx) = opt_ring_pair();
+        let (mut etx, _erx) = event_ring_pair();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = OptCap::default();
+        super::drive_one(
+            &mut t,
+            &mut d,
+            b"host",
+            b"/",
+            &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            &mut otx,
+            &status,
+            &mut cap,
+        )
+        .unwrap();
+        assert_eq!(cons.try_pop().map(|t| t.sym), Some(11));
+        assert_eq!(cons.try_pop().map(|t| t.sym), Some(12));
         assert!(cons.try_pop().is_none());
-
-        // TWO summaries; the first carries the cached underlying px,
-        // MARK_PX-only flags, vo (not b/a) as the IV.
         assert_eq!(cap.summaries.len(), 2);
-        let s0 = &cap.summaries[0];
-        assert_eq!(s0.sym, sym);
-        assert_eq!(s0.venue, core_types::VenueId::Binance as u8);
-        assert_eq!(s0.flags, core_types::OPT_SUMMARY_FLAG_MARK_PX);
-        assert_eq!(s0.underlying_px_1e9, 77_000_500_000_000);
-        assert_eq!(s0.mark_px_1e9, 2_051_200_000_000);
-        assert_eq!(s0.mark_iv_1e9, 654_300_000);
-        assert_eq!(s0.open_interest_1e6, 0);
-        assert_eq!(s0.theta_1e6, -85_300_000);
-        assert_eq!(cap.summaries[1].mark_px_1e9, 2_050_000_000_000);
-
-        // One reject (the unsubscribed stream).
-        assert_eq!(cap.rejects, 1);
+        assert!(cap.rejects.is_empty());
+        assert_eq!((status.msgs_total(), status.ticks_total()), (1, 2));
     }
 
     #[test]
@@ -2466,7 +2598,8 @@ mod tests {
 
     /// WS10-A: the perp markPrice Funding event reaches the venue-
     /// event lane; the Mark event stays capture-only (mask gates per
-    /// channel); a DATED frame (`"r":""`) puts NOTHING on the lane.
+    /// channel); a DATED frame (either wire shape) puts NOTHING on the
+    /// lane.
     #[test]
     fn funding_event_reaches_the_event_lane_dated_stays_off() {
         let mut t = TestTransport::with_capacity(8192);
@@ -2504,9 +2637,13 @@ mod tests {
         );
         assert_eq!(status.event_ring_drops_total(), 0);
 
-        // Dated frame: has_funding = 0 ⇒ nothing new on the lane.
+        // Dated frames, both wire generations: has_funding = 0 ⇒
+        // nothing new on the lane (the live 2026-09-23 shape carries a
+        // ZERO rate and `T` = 0 rather than an empty rate — BX0 K6).
         let dated = br#"{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT_260327","p":"65000.1","i":"64999.9","P":"65000.0","r":"","T":0}"#;
         t.inject_incoming(&ws_text_frame(dated));
+        let dated_live = br#"{"e":"markPriceUpdate","E":1790161545000,"s":"BTCUSDT_260925","p":"85901.84762319","ap":"85901.84762319","P":"85864.31580990","i":"85884.08695652","r":"0.00000000","T":0,"st":1}"#;
+        t.inject_incoming(&ws_text_frame(dated_live));
         super::drive_one(
             &mut t,
             &mut d,
@@ -2525,8 +2662,9 @@ mod tests {
 
     #[test]
     fn mark_price_slot_dated_future_emits_mark_only() {
-        // WS5/WS3 convention: `"r":""` (delivery contract) ⇒ no
-        // Funding event, Mark still captured.
+        // WS5/WS3 convention: a delivery contract ⇒ no Funding event,
+        // Mark still captured — in the WS5-era empty-rate shape AND the
+        // live zero-rate/`T`=0 shape (BX0 K6, 2026-09-23).
         let mut t = TestTransport::with_capacity(8192);
         let mut d = Driver::new_mark_price(7, 77);
         d.set_state(State::Steady);
@@ -2537,9 +2675,13 @@ mod tests {
 
         let dated = br#"{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT_260327","p":"65000.1","i":"64999.9","P":"65000.0","r":"","T":0}"#;
         t.inject_incoming(&ws_text_frame(dated));
+        let dated_live = br#"{"e":"markPriceUpdate","E":1790161545000,"s":"BTCUSDT_260925","p":"85901.84762319","ap":"85901.84762319","P":"85864.31580990","i":"85884.08695652","r":"0.00000000","T":0,"st":1}"#;
+        t.inject_incoming(&ws_text_frame(dated_live));
         drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &status, &mut cap).unwrap();
-        assert_eq!(cap.events.len(), 1, "Mark only");
+        assert_eq!(cap.events.len(), 2, "one Mark per frame, no Funding");
         assert_eq!(cap.events[0].channel, core_types::ChannelId::Mark as u8);
+        assert_eq!(cap.events[1].channel, core_types::ChannelId::Mark as u8);
+        assert_eq!(cap.events[1].v0, 85_901_847_623, "live dated mark ×1e6");
         assert_eq!(status.parse_errors_total(), 0);
     }
 

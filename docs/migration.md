@@ -6,6 +6,138 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — Binance options on fstream's routed `/market` path (`<uly>@optionMarkPrice`); `BINANCE_EAPI_WS_HOST` default `nbstream.binance.com` → `fstream.binance.com` (BX0-F2)
+
+**What changed**
+
+- The options slot dials `/market/stream?streams=<uly>@optionMarkPrice/…`
+  — one stream per `options_underlyings` entry, lowercase
+  (`cli::bn_options_path`) — instead of the per-option
+  `/eoptions/stream?streams=<opt>@ticker/…/<uly>@index`. Each push is ONE
+  array holding the underlying's whole listed chain; the lane keeps the
+  boot-selected rows by table lookup
+  (`ingress_binance::eapi::{EapiArrayCursor, eapi_elem_symbol,
+  parse_eapi_mark}`). `parse_eapi_ticker`, `parse_eapi_index` and the
+  per-underlying index cache (`EapiLane`) are gone: every element carries
+  the underlying's index (`i`) itself.
+- `BINANCE_EAPI_WS_HOST` default `fstream.binance.com` (was
+  `nbstream.binance.com`); `.env.example` updated. The boot provenance
+  line (`binance: options mark-array slot …`) names host, path,
+  underlyings and the selected count.
+- The options slot's rx buffer 512 KiB → 2 MiB (a BTC push measured
+  245.6 KB).
+- `boot_discovery::Outcome::bn_options` is `(symbol, sym)` — the OKX
+  shape; the underlying index had no reader left — and
+  `EapiSymbolTable::insert(symbol, sym)` keys the venue-case symbol.
+- New fuzz target `binance_eapi_mark_array`; `binance_eapi` drops the two
+  retired parsers.
+
+**Why**
+
+- BX0-F2 (`docs/binance-exec-plan.md` §2, §5): the venue's 2025-12
+  options migration moved these streams onto fstream. nbstream
+  `/eoptions/…` answers HTTP 404 — the 2026-08-22 "unreachable from this
+  network" diagnosis was that, and a host override alone could not cure
+  it: the path and the stream names changed too. Measured 2026-09-23
+  (K6): 101 and one push per underlying per ~1 s on `/market`; a wrong
+  route (`/stream?…`, `/public/stream?…@optionMarkPrice`) upgrades and
+  then carries nothing.
+
+**Impact**
+
+- Captures: `bn-opt-summary.pmlr` stops being header-only — one 64 B
+  record per selected option per push (~1/s each; 64 options ≈ 4 KB/s),
+  `underlying_px_1e9` = the element's index, flags = mark_px only — and
+  `bn-ticks.pmlr` gains the options' BBO ticks (`venue_seq` 0). Additive
+  rows; no layout change.
+- Engine: Binance opt lane 2 carries summaries again →
+  `Strategy::on_opt_summary` (the vm feature engine's mark/IV features on
+  `binance-opt:` descriptors). The VRP member's configured underlying is
+  Deribit (`vrp.toml`), so its chain is untouched.
+- Offline: pools that include post-BX0 windows gain Binance option rows;
+  existing pools — and the three standing guards (backtest schema-1
+  `188d18e3…`, detail sidecar `e3f6b8ef…`, audit-pnl `725d1d27…`) — do
+  not move.
+
+**Migration steps**
+
+1. **Operator, before the restart:** if the repo `.env` sets
+   `BINANCE_EAPI_WS_HOST=nbstream.binance.com`, change it to
+   `fstream.binance.com` or delete the line — an explicit `.env` value
+   wins over the new default, and nbstream keeps the lane dark. Sessions
+   never edit `.env`; on the Mac that one line was switched on 2026-09-23
+   by a session at the operator's explicit ask (plan O-BX12b).
+2. The routine restart of a binary built from this change. Verify: the
+   boot line shows `host=fstream.binance.com`; the new run dir's
+   `bn-opt-summary.pmlr` grows past its 64 B header within seconds;
+   `engine_ingress_binance_parse_errors_total` stays flat.
+
+**Rollback**
+
+- Safe: an older binary dials its old path again (404 on nbstream,
+  silence on fstream) and the lane goes dark; nothing else changes.
+
+## 2026-09-23 — Binance USDⓈ-M `markPrice` on fstream's routed `/market` path: `Mark`/`Funding` rows return; a dated contract's zero rate is not funding (BX0-F1)
+
+**What changed**
+
+- The USDⓈ-M markPrice slots dial `/market/ws/<sym>@markPrice` (was
+  `/ws/<sym>@markPrice`) through `cli::bn_usdm_specs` — one builder for
+  the engine boot and the live smoke. The bookTicker slots stay on
+  `/ws/<sym>@bookTicker`, which still delivers.
+- `ingress_binance::parse_mark_price`: `has_funding` needs a parseable
+  rate AND a next settlement `T` > 0 — the live dated shape is
+  `"r":"0.00000000","T":0`, where the WS5-era wire sent `"r":""`; rate
+  and next-funding read 0 otherwise. The `ap` / `st` keys the frame
+  gained are skipped.
+- New standalone `#[ignore]` live smoke
+  `crates/cli/tests/binance_md_live_smoke.rs` (F1 + F2; own
+  `CARGO_TARGET_DIR`, never stops the engine).
+- No layout, version or config change.
+
+**Why**
+
+- BX0-F1: Binance stopped serving `/market` streams on the legacy `/ws/`
+  URLs on 2026-04-23; the upgrade still answers 101 and the socket stays
+  silent (measured 2026-09-23: 0 frames in 7 s, against one per 3 s on
+  `/market/ws/`). The 2026-08-29 "venue-side partial fault" on
+  markPrice / aggTrade / kline / forceOrder was this routing: exactly the
+  `/market` streams went quiet while the `/public` ones flowed.
+
+**Impact**
+
+- Captures: from the first boot on this build, `bn-events.pmlr` carries a
+  `Mark` row (`v0` mark ×1e6, `v1` index ×1e6) per USDⓈ-M perp and dated
+  contract about every 3 s, and a `Funding` row (rate ×1e9, next-funding
+  ms) per perp. No capture made before that boot holds a Binance Mark or
+  Funding row.
+- Engine: Binance `Funding` events reach the venue-event lane again →
+  the strategy set → the regime detector's FUND reference
+  (`regime.toml [refs] fund = "binance-usdm:btcusdt"`), which has had NO
+  live funding print (its boot seed is price-only): FUND_SIGN /
+  FUND_LEVEL start reading live prints, so the regime word can change
+  after the restart. The vm feature engine's Binance funding law gets its
+  prints too.
+- Offline: `backtest` / `audit-pnl` replay `Funding` rows, so a pool that
+  includes post-BX0 windows feeds the regime FUND input the live engine
+  now has; existing pools and the three standing guards do not move.
+- Metrics: a mark frame counts once in `engine_ingress_binance_msgs_total`
+  AND `…_ticks_total`, exactly like a bookTicker frame, so the Binance
+  tick rate rises by about (perps + dated) / 3 per second — ≈ 41/s at the
+  current 124 perps. (Plan v2's "msgs − ticks" tell was wrong: the two
+  counters move together.)
+
+**Migration steps**
+
+1. None: the routine restart of a binary built from this change. Verify:
+   the new run dir's `bn-events.pmlr` grows by ≈ 5 KB/s (≈ 83 rows/s of
+   64 B), and `vm_rows_active ≥ 1` on `/state` as after any restart.
+
+**Rollback**
+
+- Safe: an older binary dials the silent legacy path again and the lane
+  goes dark — its Mark and Funding rows stop, nothing else changes.
+
 ## 2026-09-23 — VenueId 7 = MEXC + tick lane 6 (MX2–MX9, the seventh venue)
 
 **What changed**

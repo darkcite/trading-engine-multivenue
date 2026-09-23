@@ -53,7 +53,8 @@ pub mod vrp_boot;
 pub mod xsd_boot;
 
 pub use paper::{
-    boot_discovery, boot_info, build_ai_universe, build_deribit_symbol_table,
+    bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
+    build_deribit_symbol_table,
     build_hl_coin_table, build_hl_families, build_okx_symbol_table, drain_and_count_loop,
     engine_loop,
     engine_loop_ev_full, engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full,

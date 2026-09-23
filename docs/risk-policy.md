@@ -2355,8 +2355,9 @@ four cache lines to five to carry it.
 
 #### The alloc gate: `hl_exchange_requote_path_is_zero_alloc`
 
-Gate 60 drives `HlExchange::modify` — the arm's own verb, not the raw
-encoders — with the budget floor at `u64::MAX`, so `send_action`
+Gate 60 drives the arm's own requote verb (`HlExchange::modify_by_cloid`,
+since BX0-F3 through the `OrderDispatch::modify` the router calls), not
+the raw encoders — with the budget floor at `u64::MAX`, so `send_action`
 refuses at its barrier before any network work and only the encode
 half runs. `seal` (the nonce/signature/envelope half of `send_action`,
 split out for this) is driven beside it. Between them that is every
@@ -2425,6 +2426,74 @@ the durable handle and an oid captured at placement is not.
 Run under the standing engine's own laws: `cargo build --release -p
 cli` first (G0), the launchd instance booted out for the window and
 bootstrapped back after, nothing left resting.
+
+### BX0-F3 — the router's cancel and modify reach the arm (2026-09-23)
+
+**The defect.** `HlExchange` implemented both lifecycle verbs as
+INHERENT methods — `cancel_by_cloid` and `modify(prev, &Order)` — but
+its `impl OrderDispatch` overrode `submit` alone. `RoutedDispatcher` is
+generic over its live arm (`L: OrderDispatch`), and generic code can
+call only trait methods, so every live slot's cancel and modify that
+reached the router got the trait default, `Err(Unsupported)`, and never
+left the host. Phase F's §7.1 measurement (above) drove the inherent
+verbs from `exec-smoke`, not through the router, so it could not see
+this: E5's "the engine learns two verbs" was true of the arm and of the
+router separately, never of the pair. It stayed invisible because
+bin15 has run with `maker_enabled = 0` — IoC entries only, nothing to
+requote or pull. Had the maker gone live, a member could neither
+requote nor take back its own quote; only the E6 halt's sweep could.
+
+**The repair.** The inherent `modify` is renamed `modify_by_cloid`, so
+no inherent method shares a name with a trait method (the shadowing
+that hid the gap). The trait's `cancel` / `modify` delegate to
+`cancel_by_cloid(req.sym, req.strategy_id, req.client_oid)` /
+`modify_by_cloid(req.prev_client_oid(), req.order())`. Spend classes
+unchanged: a cancel is an exit that no budget floor bars, a modify a
+submit (the router has already risk-checked it as a `Replace`).
+
+**The proof.** `exchange::tests::the_trait_cancel_and_modify_reach_the_cloid_verbs`
+(the arm's own LAW E-4 refusal comes back through the trait and its
+counters move) and
+`…::the_trait_modify_names_the_resting_order_and_carries_the_replacement`
+(the rendered action addresses the resting order by its cloid as `oid`
+and carries the replacement's as `c` — a transposed pair fails it).
+Break-and-watch: without the overrides both read `Unsupported`. Gate 60
+now drives the TRAIT modify, the path the router calls, at 0 B/op. The
+router→ledger half (`Ok` → `on_cancel` / `on_modify`) was already pinned
+with a spy arm. The operator accepted this split (2026-09-23) in place of
+the planned composed test — `RoutedDispatcher<Paper, HlExchange>` against
+a loopback venue — which moves to BX3.
+
+**Not re-measured on a venue.** The wire — cancel-by-cloid, and a
+`batchModify` addressing the resting order by cloid — is Phase F's,
+unchanged; BX0 changed only which caller reaches it. The bar before
+bin15's maker is switched on live: `exec-smoke --requote` plus a
+router-driven cancel/modify on testnet (plan §5 BX0 F3) — and, since a
+happy-path run exercises none of them, a ruling or a test on each of
+these paths, which the router could not reach before BX0 and now can
+(risk-reviewer, 2026-09-23; UNVERIFIED until then):
+
+1. **An uncertain modify.** The router renames the ledger row on `Ok`
+   and keeps the old one on `Err`; a modify whose reply timed out or
+   could not be read, but which the venue applied, leaves the
+   replacement unbooked and the caps under-counting. It needs the
+   E-5 "sent, unanswered" treatment: resolved by a readback, booked
+   conservatively meanwhile.
+2. **A modify the venue turns into a cancel** (a post-only replacement
+   that would cross): the old row stays in the ledger for an order that
+   no longer rests, and its later cancel returns `Err`.
+3. **A modify across an instance roll** (`instance_of(prev)` ≠
+   `instance_of(order.client_oid)`) is not refused by `stage_modify`,
+   which looks up the replacement's instance only.
+4. **Ledger edges:** a late partial fill of the old id after
+   `on_modify`; `on_modify` for an old id the ledger does not hold; a
+   modify that flips side (the HIP-4 ledger has no shorts).
+5. **A refused requote** (risk gate or budget floor) leaves the old
+   quote resting at the old price — the member must pull it.
+6. **Two members quoting one leg from one address** (`note_owner`
+   counts the contest and nothing more): self-trade prevention by the
+   venue would cancel without a fill, which a fill-fed ledger never
+   sees.
 
 ## E6 — the risk gate and the kill switches
 
@@ -4171,7 +4240,7 @@ it; there is no workspace `libc`); `gen_vectors.py` now drives the SDK's
 own `order_request_to_order_wire` / `order_wires_to_order_action` and
 records the SDK version; `selftest` pins the vector count (25);
 `MAX_ORDERS` enforced in all four batch encoders; `BudgetGauge` removed;
-`cancel_by_cloid` / `modify` render into the boot-owned `mp` / `req`
+`cancel_by_cloid` / `modify_by_cloid` render into the boot-owned `mp` / `req`
 buffers (no 16 KiB stack arrays on the engine thread); `POLL_SLICE`
 removed from the steady-state pump (it parked the single-writer thread
 50 ms out of every 52); `Order.verb` doc corrected (`paper.rs` said the

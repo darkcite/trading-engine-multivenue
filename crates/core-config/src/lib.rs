@@ -101,14 +101,15 @@ pub struct Config {
     /// `GET /eapi/v1/exchangeInfo`, `GET /eapi/v1/index`). Env:
     /// `BINANCE_EAPI_REST_HOST`. Default: `eapi.binance.com`.
     pub binance_eapi_rest_host: String,
-    /// Binance European-options WS host (M2.4 combined stream at
-    /// `/eoptions/stream?streams=…` — the documented base on the live
-    /// nbstream ALB). TEMPORARILY UNREACHABLE from this network as of
-    /// 2026-08-22 (every candidate route 404/403s while eapi REST
-    /// serves fine — forensics in docs/m2-progress.md); the lane
-    /// retries harmlessly until an endpoint is confirmed, then this
-    /// override activates it without a code change. Env:
-    /// `BINANCE_EAPI_WS_HOST`. Default: `nbstream.binance.com`.
+    /// Binance European-options WS host: the options lane's combined
+    /// `/market/stream?streams=<uly>@optionMarkPrice/…` path (BX0-F2).
+    /// The 2025-12 options migration moved these streams onto fstream's
+    /// routed paths; the old nbstream `/eoptions/…` base answers HTTP
+    /// 404 — which was never this network, and which a host override
+    /// alone could not cure, since the path and stream names changed
+    /// too. Env: `BINANCE_EAPI_WS_HOST` (an `.env` still pinning
+    /// `nbstream.binance.com` keeps the lane dark — the boot's options
+    /// provenance line names the host). Default: `fstream.binance.com`.
     pub binance_eapi_ws_host: String,
     /// Alchemy RPC host.
     pub alchemy_host: String,
@@ -207,7 +208,7 @@ impl Config {
             binance_eapi_rest_host: env_opt("BINANCE_EAPI_REST_HOST")
                 .unwrap_or_else(|| "eapi.binance.com".into()),
             binance_eapi_ws_host: env_opt("BINANCE_EAPI_WS_HOST")
-                .unwrap_or_else(|| "nbstream.binance.com".into()),
+                .unwrap_or_else(|| "fstream.binance.com".into()),
             alchemy_host: env_req("ALCHEMY_HOST")?,
             paper_mode: env_opt("MULTIVENUE_MODE").as_deref() == Some("paper"),
             metrics_bind: env_opt("METRICS_BIND").unwrap_or_else(|| "127.0.0.1:9191".into()),

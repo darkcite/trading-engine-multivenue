@@ -1,6 +1,6 @@
 # Binance Execution Plan (BX0–BX14): fix-now pass first; then spot, USDⓈ-M + COIN-M futures (incl. TradFi stock perps), European options (long + short BTC/ETH), bStocks, Binance Stocks
 
-**Status: DRAFT v2, 2026-09-23.** Uncommitted, unscheduled, nothing built. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**.
+**Status: v2, 2026-09-23 — BX0 BUILT and COMMITTED.** The fix-now pass (F1–F4) is implemented, gated and committed in the main checkout; it goes live at the 16:05Z routine restart (§5 BX0, §12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
 
 **What this adds.** A second live arm, `VenueId::Binance = 1`, next to Hyperliquid. It sits behind the same two-switch interlock (`--exec` + `--arm-live`), the same risk gate and the same E-laws.
 
@@ -17,9 +17,9 @@
 - HYPARB for the worktree setup.
 
 **What has already happened:**
-- The probes in §1.2 ran on the operator's Mac, against public endpoints only, with no keys. The script has been deleted.
-- **This file is the only repo file touched**, at `docs/binance-exec-plan.md`. It is untracked.
-- No git operation was performed. The engine was not stopped.
+- The probes in §1.2 and BX0's K6 ran on the operator's Mac, against public endpoints only, with no keys. The scripts live outside the repo.
+- The operator committed this plan (`022710a`). BX0 then changed the files its §12 entry lists and committed them on the operator's word (O-BX12d).
+- The session's only git write operations are those BX0 commits. The engine was never stopped.
 
 ---
 
@@ -43,6 +43,9 @@
 | **O-BX11** | **TradFi perps trade 24/7.** There is no session gate on new orders. | the session is observed, not gated (D4) |
 | **O-BX12** | **The four live-engine problems are fixed FIRST (BX0).** They ship through the gates, then a **release build**, then **go live at the next routine daily restart**. | BX0 |
 | **O-BX12a** | `TCP_NODELAY` goes on **every** TLS socket: one line in `TlsTransport::connect`. | BX0 F4 |
+| **O-BX12b** | After the BX0 build: **the session edits the live `.env`**, one line only, to `BINANCE_EAPI_WS_HOST=fstream.binance.com`. No other line is read or changed; the secrets law otherwise stands. | BX0 F2 goes live at the restart |
+| **O-BX12c** | **F3's test substitution is accepted**: the arm-level trait tests plus the router's spy-arm tests stand in for the router-level loopback test, which moves to BX3. | BX0 F3; BX3 |
+| **O-BX12d** | **Commit BX0.** **Fix every pre-existing zero-copy finding in `ingress-binance`**, and put the crate in `make copy-audit`'s scope. | BX0, a second commit |
 | **O-BX14** | The merge order against HYPARB is decided **when BX3 (router) starts**. | BX3 |
 | **O-BX15** | BX1 onward is built in a **separate worktree and branch**, following HYPARB: `~/trading-engine-multivenue-binance` on branch `binance`, merged at a quiet point the operator names. | process |
 | **O-BX16** | The Binance Stocks arm is a **full arm with a lifecycle battery, and no member uses it**. | BX10 |
@@ -298,28 +301,30 @@ Each finding below was verified by a direct read or a live measurement, not infe
 
 **F1–F4 are fixed by BX0, the fix-now pass (O-BX12).**
 
-**F1 — The USDⓈ-M markPrice lane is dark.** → **BX0**
+**F1 — The USDⓈ-M markPrice lane is dark.** → **BX0 — FIXED 2026-09-23**
 - `crates/cli/src/bin/multivenue-engine.rs:2881-2888` subscribes `/ws/{sym}@markPrice`.
 - Binance retired the legacy URLs for `/market` streams on **2026-04-23**, announced 2026-03-06. Unmigrated connections receive only `/public` streams.
 - Measured: the legacy path delivered 0 frames in 7 s; `/market/ws/…@markPrice` delivered 2.
-- The running engine agrees. At ~09:35Z, `msgs_total 10 345 460` against `ticks_total 10 345 455`: **five** non-tick frames since the 08:48Z boot, where 124 perps at 1 per 3 s would give about 120 000.
+- ~~The running engine agrees: `msgs_total` − `ticks_total` = 5 since the 08:48Z boot.~~ **Corrected at BX0:** a mark frame counts once in `msgs_total` AND in `ticks_total` (the WS5 handler), so the two counters move together and their gap says nothing about this lane. The direct probe is the evidence, re-measured at K6 (§5 BX0).
 - **So no Binance USDⓈ-M Mark, index or Funding events have reached a capture since the cut-over.**
 - The perp exposure law (§3.5) needs this mark.
+- **F1b (found at BX0's K6):** the live DATED frame is `"r":"0.00000000","T":0`, not the `"r":""` WS5 was written against. The WS5 parser would have read every dated contract as a perpetual paying 0 %: a `Funding` row per push per contract, on the event lane. Fixed with F1: funding needs a rate AND `T` > 0.
 
-**F2 — The Binance options WS lane points at a retired endpoint.** It is not blocked by the network. → **BX0**
+**F2 — The Binance options WS lane points at a retired endpoint.** It is not blocked by the network. → **BX0 — FIXED 2026-09-23**
 - `multivenue-engine.rs:2923` hard-codes `/eoptions/stream?streams=…@ticker/…@index` on nbstream. Measured: **HTTP 404**.
 - The options docs now list only fstream `/public` (quotes) and `/market` (`<uly>@optionMarkPrice`, `!index@arr`).
 - No official page states that `/eoptions` was retired. The evidence is this 404 and Tardis, a third-party data vendor.
 - So CLAUDE.md's "BN eapi-WS is unreachable from this network" is a misdiagnosis, and **an `.env` host change cannot fix it**: the path and the channel names are in code.
 - Short-option exposure (§3.5) needs the mark and index this lane carries.
+- K6 (BX0): every `<uly>@optionMarkPrice` element also carries the underlying's index `i`, so this lane needs no `!index@arr`; the real-time per-option `<symbol>@bookTicker` exists on `/public` (a BX2 input).
 
-**F3 — The Hyperliquid arm never overrides the trait's `cancel` or `modify`.** → **BX0**
+**F3 — The Hyperliquid arm never overrides the trait's `cancel` or `modify`.** → **BX0 — FIXED 2026-09-23**
 - `cancel_by_cloid` (`exec-hyperliquid/src/exchange.rs:1743`) and `modify(prev, &Order)` (`:1891`) are **inherent** methods.
 - `impl OrderDispatch for HlExchange` (`:1924` onward) overrides neither.
 - So `RoutedDispatcher::cancel` and `::modify` (`exec-router/src/routed.rs:964`, `:1013`) reach the trait default, `Err(DispatchError::Unsupported)` (`clob-dispatcher/src/lib.rs:446-460`).
 - It is invisible while bin15 runs with the maker off.
 
-**F4 — `TCP_NODELAY` is never set on a TLS transport.** → **BX0**
+**F4 — `TCP_NODELAY` is never set on a TLS transport.** → **BX0 — FIXED 2026-09-23**
 - `core-net/src/transport.rs:140-152` never calls `set_nodelay`. The only non-test call is `boot_http.rs:171`.
 - With Nagle on, a **pipelined** order socket holds each small write until the previous segment is ACKed: about one 110 ms RTT from here.
 - O-BX12a: set it on every TLS socket.
@@ -845,7 +850,7 @@ Every account mutation lives in the operator tool `exec-smoke --binance setup`.
 - **Docs:**
   - `docs/wire-format.md`: Binance Mark and Funding are live again.
   - `docs/migration.md`: captures regain the Mark and Funding events from the first post-restart boot, additively. The three standing pool guards (backtest schema-1 `188d18e3…`, detail sidecar `e3f6b8ef…`, audit-pnl `725d1d27…`) are computed over existing pools and do not move.
-- **Post-restart tell:** `engine_ingress_binance_msgs_total − ticks_total` grows at about (perps + dated) / 3 per second.
+- **Post-restart tell** (corrected at BX0 — the `msgs − ticks` form was wrong, a mark frame counts in both): the new run dir's `bn-events.pmlr` grows ≈ 5 KB/s (a Mark row per USDⓈ-M instrument and a Funding row per perp every ~3 s), and the Binance tick rate rises ≈ (perps + dated) / 3 per second.
 
 **F2: options WS moved to fstream.**
 - **Step 0**, public, run from the Mac like MX0: **K6**. Confirm the documented `/public` option channels (`@bookTicker`, `@optionTicker…`) on an at-the-money strike, and the `/market` `<uly>@optionMarkPrice` and `!index@arr` shapes. Keep the frames as fixtures.
@@ -860,7 +865,7 @@ Every account mutation lives in the operator tool `exec-smoke --binance setup`.
 - **Operator note:** if the live `.env` pins `BINANCE_EAPI_WS_HOST` to nbstream, the operator edits it. Sessions never touch `.env`.
 - **Live smoke:** the same `binance_md_live_smoke.rs`. Selected options yield `OptSummary` records carrying mark and index, with zero parse errors.
 - **Docs:** the options channel map in `docs/wire-format.md`. CLAUDE.md's "BN eapi-WS is unreachable from this network" line is corrected; O-BX12 is the operator's ask for it.
-- **Post-restart tell:** `engine_ingress_binance_options_selected` > 0, and the Binance opt lane is live in `/state`.
+- **Post-restart tell:** the boot line `binance: options mark-array slot … host=fstream.binance.com`; the new run dir's `bn-opt-summary.pmlr` grows past its 64 B header within seconds; `engine_ingress_binance_options_selected` > 0.
 
 **F3: HL trait `cancel` / `modify` wired.**
 - **Change** (`exec-hyperliquid/src/exchange.rs`):
@@ -889,6 +894,53 @@ Every account mutation lives in the operator tool `exec-smoke --binance setup`.
 - Agents: `risk-reviewer` (F3), `zero-copy-auditor` (F2), `parser-property-tester` (F2).
 
 **Size:** about 410 src + 670 test.
+
+**BX0 status: BUILT and COMMITTED 2026-09-23, main checkout.** The release binary was built at 12:29Z; it goes live at the 16:05Z routine restart. The changed files are listed in §12.
+
+**K6, step 0: measured 2026-09-23 ~11:04Z** from the Mac, public endpoints, no keys. The trimmed frames are the test fixtures and the fuzz seeds.
+- **Options mark array.** `/market/stream?streams=btcusdt@optionMarkPrice/ethusdt@optionMarkPrice` pushes one unfragmented text frame per underlying about every 1 s: BTC 245.6 KB with 752 elements, ETH about 194 KB with 600.
+  - An element is at most 336 B and carries all 20 keys (`s mp E e i P bo ao bq aq b a hl ll vo rf d t g v`), none empty.
+  - Every element of a frame carries the same underlying index `i`. `s` is in the venue's case.
+- **Mis-routing is silent.** The same streams on `/stream?…` or `/public/stream?…` upgrade (101) and then deliver nothing. No error arrives.
+- **Per-option book.** `/public` `<symbol>@bookTicker` on at-the-money strikes: 8–28 frames per 15 s.
+- **USDⓈ-M.** `/market/ws/btcusdt@markPrice` every 3 s, with two new keys, `ap` and `st`. Legacy `/ws/`: 0 frames. The dated `btcusdt_260925@markPrice` carries `"r":"0.00000000","T":0` (→ F1b).
+
+**What landed, and where it departs from the text above:**
+- **F1**, as written. `cli::bn_usdm_specs(host, name, sym)` returns both specs: bookTicker on `BN_USDM_BOOK_TICKER_PREFIX = "/ws/"`, markPrice on `BN_USDM_MARK_PRICE_PREFIX = "/market/ws/"` (`crates/cli/src/paper.rs`). The boot uses it.
+- **F1b**, new, found at K6. `parse_mark_price` (`ingress-binance/src/lib.rs`) reports funding only for a parsed rate AND `T` ≠ 0. The round-trip proptest pins `has_funding == (T ≠ 0)`.
+- **F2**, with five departures:
+  1. **No `!index@arr`.** Every mark element carries `i`; it becomes `OptSummary.underlying`.
+  2. **No `/public` bookTicker slot.** The array's `bo` / `ao` / `bq` / `aq` quote at the 1 s cadence the retired `@ticker` had. The real-time per-option book is a BX2 input.
+  3. **Parser shape** (`ingress-binance/src/eapi.rs`; the WS half is rebuilt, the REST discovery half is byte-identical):
+     - `EapiArrayCursor` walks the array one borrowed element at a time.
+     - `eapi_elem_symbol` borrows the symbol. It is escape-aware: an escaped symbol is refused.
+     - `EapiSymbolTable` (64 rows, filled at boot in the venue's case) resolves it. An unselected element is skipped on a table miss.
+     - `parse_eapi_mark(elem, &mut EapiMarkFrame)` fills an 88 B frame in place. It is an out-param because a by-value return above 64 B is a hidden copy.
+     - `EapiLane`, `parse_eapi_ticker`, `parse_eapi_index` and `EapiTickerFrame` are deleted.
+  4. **Run loop** (`run_loop.rs`): one pass per frame (split, stream-suffix check, walk). Each selected element yields one `OptSummary`, plus a Tick when it has a bid or an ask. The options slot's receive buffer is 2 MiB (BTC measured 245.6 KB). The reject tap copies at most 512 B of a bad frame.
+  5. **Fuzz target name:** `binance_eapi_mark_array`, not `bn_eapi_mark_array`, beside the rewritten `binance_eapi`.
+  - `BINANCE_EAPI_WS_HOST` defaults to `fstream.binance.com`, as written.
+- **F3**, as written except for the test. **The router-level test was replaced** by three arm-level trait tests plus the router's existing spy-arm tests. `RoutedDispatcher<P, L: OrderDispatch>` is generic, so its `self.live.cancel` / `.modify` are exactly the trait methods the arm tests call. The composed `RoutedDispatcher<Paper, HlExchange>` on a loopback venue is carried to BX3, where `LiveSet` rewires the router anyway. **The operator accepted this substitution** (O-BX12c). Break-and-watch: without the overrides, the tests read `Unsupported`. Gate 60 now drives the trait `modify`.
+- **F4**, as written. `every_connect_turns_nagle_off` asserts `nodelay()` on a plain and a TLS transport. Break-and-watch: each assert failed without its line.
+- **Alloc gates**, count unchanged at 64: the Binance run-loop gate gained an options phase (1 000 live-shaped pushes, 0 allocations); the option-analytics gate walks the live array.
+- **Live smoke** `crates/cli/tests/binance_md_live_smoke.rs`, as planned. It also asserts that dated futures emit no Funding and that nothing reconnects.
+
+**Gates on the final tree (2026-09-23, 12:24–12:29Z):**
+- `cargo nextest run --workspace`: 2 738 run, 2 738 passed, 3 skipped (the `#[ignore]`d live smokes among them).
+- Alloc: 64 of 64 at 0 B/op, from a fresh `Compiling bench`.
+- `make lint` clean. `make license-check`: 436 files OK. `make copy-audit`: hits 33, baselined 33, new 0; the baseline did not grow.
+- Fuzz: `binance_eapi_mark_array` 300 s, 11 854 732 runs; `binance_eapi` 120 s, 3 565 426 runs. No crash.
+- Live smoke (public, no keys): three runs green — 60 s, 90 s, and 60 s on the final tree. The 90 s run: each perp 30 Mark and 30 Funding rows; the dated `BTCUSDT_260925` 29 Mark and 0 Funding; 16 options with 89–90 `OptSummary` rows each, plus BBO ticks; 0 parse errors, 0 reconnects, 0 drops.
+- Agents: `risk-reviewer` on F3 named six paths the router can reach only since BX0. They stay UNVERIFIED until the maker goes live (`docs/risk-policy.md`, "BX0-F3"). `zero-copy-auditor` and `parser-property-tester` on F2: every finding was fixed (the out-param parse, the bounded reject tap, the escape-aware symbol, the `// COPY:` placement).
+- **Not run:** `exec-smoke` and the testnet lifecycle battery (F3). This pass made no keyed venue call. They are the bar before bin15's maker goes live.
+
+**Operator actions** (updated after O-BX12b–d):
+1. **`.env`: done (O-BX12b).** It pinned `BINANCE_EAPI_WS_HOST=nbstream.binance.com`, which would have kept F2 dark. The session rewrote that one line to `fstream.binance.com` in place: mode 600 kept, the other 141 lines untouched, nothing read out. A project-wide IDE search at BX0 had returned that line.
+2. **Commit: done (O-BX12d)**, staging the §12 paths explicitly.
+3. **F3 test substitution: accepted (O-BX12c).**
+4. **The regime word may move after the restart.** `regime.toml [refs] fund = "binance-usdm:btcusdt"`: FUND_SIGN and FUND_LEVEL get live funding prints for the first time since 2026-04-23. The boot seed carries price only.
+5. **Before the maker goes live:** `exec-smoke --requote` and the six risk-reviewer paths.
+6. **Zero-copy follow-ups: ordered (O-BX12d).** Pre-existing: `parse_mark_price` returns `Option<BnMarkPriceFrame>` by value — a 64 B `align(64)` frame, 128 B inside the `Option`; `ingress-binance` sits outside `make copy-audit`'s scope, and six of its boot-time copies are unmarked. All of them are fixed, and the crate joins the scope, in a second BX0 commit.
 
 ### BX1: Probes. The worktree opens here (O-BX15)
 
@@ -960,6 +1012,8 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
 **New alloc gates:** `liveset_route_steady_state`, `routed_retired_drain_steady_state`, `ledger_instrument_rows_steady_state`, `ledger_price_feed_steady_state`.
 
 **Size:** about 2 100 src + 2 800 test.
+
+**Carried from BX0 (risk-reviewer, 2026-09-23).** `LiveSet` must forward `cancel` and `modify` to the arm that owns the order — F3 was exactly a forgotten override hidden behind a trait default of `Unsupported`. BX3 either makes `OrderDispatch::cancel`/`modify` REQUIRED methods (no default, so a forgotten override stops compiling) or adds the router + real-arm composition test BX0 substituted: `RoutedDispatcher<Paper, LiveSet<…>>` against scripted venues, with the ledger's retire and rename asserted.
 
 ### BX4: Signing and keys
 
@@ -1319,3 +1373,11 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - The work moves to a worktree from BX1.
   - Phases renumbered BX0–BX14. Laws BX-17…BX-20 added. Derivations D1–D6 stated.
   - Nothing built, no git operation, engine untouched.
+- **2026-09-23, BX0 built and committed** (main checkout).
+  - K6 measured the routed shapes (§5 BX0). F1b was found there and fixed with F1.
+  - F1–F4 fixed. F2 departs from the plan text in five places; F3's router-level test was substituted, pending the operator's acceptance (§5 BX0).
+  - Every gate green on the final tree; fuzz and three live smokes green. The release binary was built at 12:29Z.
+  - Docs: `docs/wire-format.md`, `docs/migration.md` (two entries), `docs/risk-policy.md` ("BX0-F3"), CLAUDE.md, `.env.example`, this plan.
+  - **Changed files (22):** `.env.example`, `CLAUDE.md`, `crates/bench/tests/alloc_assertions.rs`, `crates/cli/src/bin/multivenue-engine.rs`, `crates/cli/src/lib.rs`, `crates/cli/src/options_manifest.rs`, `crates/cli/src/paper.rs`, `crates/cli/tests/binance_md_live_smoke.rs` (new), `crates/core-config/src/lib.rs`, `crates/core-net/src/transport.rs`, `crates/engine/src/lib.rs`, `crates/exec-hyperliquid/src/exchange.rs`, `crates/ingress-binance/src/eapi.rs`, `crates/ingress-binance/src/lib.rs`, `crates/ingress-binance/src/run_loop.rs`, `docs/binance-exec-plan.md`, `docs/migration.md`, `docs/risk-policy.md`, `docs/wire-format.md`, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/binance_eapi.rs`, `fuzz/fuzz_targets/binance_eapi_mark_array.rs` (new). The fuzz corpus seeds are git-ignored.
+  - Operator rulings after the build (§0): the session switched the live `.env` line to fstream (O-BX12b); F3's test substitution accepted (O-BX12c); commit BX0, and fix the zero-copy follow-ups (O-BX12d).
+  - Git: before the operator's word, one read-only `git status` / `git log`; then the BX0 commit, explicit paths. The engine was never stopped.

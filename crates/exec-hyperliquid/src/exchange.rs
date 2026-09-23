@@ -43,7 +43,9 @@ use std::time::{Duration, Instant};
 use clob_dispatcher::{DispatchError, DispatchStats, OrderDispatch};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::Producer;
-use core_types::{ChannelEvent, ChannelId, Fill, NsTs, Order, Side, Tick, VenueId};
+use core_types::{
+    CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, NsTs, Order, Side, Tick, VenueId,
+};
 
 use crate::action::{encode_order, OrderWire, Tif, MAX_ACTION};
 use crate::asset::AssetTable;
@@ -1791,7 +1793,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// The ENCODE half of [`Self::modify`]: asset lookup, the scale
+    /// The ENCODE half of [`Self::modify_by_cloid`]: asset lookup, the scale
     /// guards, the cloid builder, the wire structs, msgpack into
     /// `self.mp` and the action JSON in place behind the envelope head
     /// in `self.req`. Returns `(mp_n, action_end)` for
@@ -1803,7 +1805,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// buffers, without a venue — and without a staging copy of them.
     ///
     /// # Errors
-    /// As [`Self::modify`]'s local refusals. Every one is counted here
+    /// As [`Self::modify_by_cloid`]'s local refusals. Every one is counted here
     /// (`refused_local` / `modifies_refused` / `encode_failures`), so
     /// the caller adds nothing on `Err`.
     pub fn stage_modify(
@@ -1885,10 +1887,20 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// venue does not have to accept a modify that changes the id, and
     /// nothing in this repo could say that it did until it was asked.
     ///
+    /// Named `_by_cloid`, like its cancel sibling, so that no inherent
+    /// method shares a name with an [`OrderDispatch`] one: with both
+    /// called `modify`, the inherent method shadowed the trait's at
+    /// every call site that could see it, which is how the trait's own
+    /// `modify` went unimplemented without anything noticing (BX0-F3).
+    ///
     /// # Errors
     /// As [`Self::cancel_by_cloid`], plus a price or size that will not
     /// scale and an order kind with no TIF.
-    pub fn modify(&mut self, prev_client_oid: u64, order: &Order) -> Result<(), DispatchError> {
+    pub fn modify_by_cloid(
+        &mut self,
+        prev_client_oid: u64,
+        order: &Order,
+    ) -> Result<(), DispatchError> {
         let (mp_n, action_end) = self.stage_modify(prev_client_oid, order)?;
         // A modify can MOVE exposure, so it answers to the submit rule
         // rather than the exit one — LAW E-7 makes it the requote path,
@@ -2022,6 +2034,33 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         }
         Ok(())
     }
+
+    /// **E5 — the router's cancel reaches the venue (BX0-F3).**
+    ///
+    /// `RoutedDispatcher` drives every live verb through this trait,
+    /// and until BX0 this impl overrode `submit` alone: a live cancel
+    /// fell through to the trait default, `Unsupported`, and never
+    /// left the host — invisible while bin15 ran with its maker off.
+    /// The three fields that name the order are forwarded unchanged:
+    /// its market, its slot (LAW E-9 carries it in the cloid) and its
+    /// client id. Spent as an exit, so the budget floor never blocks
+    /// it.
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        self.cancel_by_cloid(req.sym, req.strategy_id, req.client_oid)
+    }
+
+    /// **E5, LAW E-7 — the router's requote reaches the venue
+    /// (BX0-F3).** Same defect as `cancel`, same repair: the resting
+    /// order is named by the client id it was sent with, and the
+    /// replacement goes as the router stamped it. Spent as a submit —
+    /// a requote can move exposure, and the router has already put it
+    /// through the risk gate as a `Replace`.
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        self.modify_by_cloid(req.prev_client_oid(), req.order())
+    }
+
     /// **Always `None`, deliberately.**
     ///
     /// Fills reach the engine through fill lane 3, written by
@@ -3921,5 +3960,100 @@ mod tests {
         // Replaying the same tid books nothing more (LAW E-5).
         assert_eq!(x.route_fills(frame), 0, "a replayed tid double-booked");
         assert_eq!(x.counters().fills_booked, 1);
+    }
+
+    /// The LAW E-9 cloid of `(slot, client_oid)` as the action JSON
+    /// renders it: magic `MV`, the slot byte, five reserved zeros,
+    /// then the big-endian client id.
+    fn cloid_json(slot: u8, client_oid: u64) -> String {
+        format!("\"0x4d56{slot:02x}0000000000{client_oid:016x}\"")
+    }
+
+    /// **BX0-F3 — the trait's lifecycle verbs reach this arm.** The
+    /// router drives every live verb through `OrderDispatch`; until
+    /// BX0 this impl overrode `submit` only, so a live cancel or
+    /// modify fell to the trait default, `Unsupported`, and never
+    /// reached the venue. An unbound symbol makes the arm answer with
+    /// its OWN refusal (LAW E-4) before anything is signed or sent, so
+    /// no venue is needed. Break-and-watch: delete either override and
+    /// its assert reads `Unsupported` with the arm's counters untouched.
+    #[test]
+    fn the_trait_cancel_and_modify_reach_the_cloid_verbs() {
+        let mut x = exchange_at("127.0.0.1");
+        let resting = order(42, ORDER_KIND_MAKER);
+        assert_eq!(
+            OrderDispatch::cancel(&mut x, &CancelReq::of(&resting, 2)),
+            Err(DispatchError::NoLiveRoute),
+            "the trait cancel never reached cancel_by_cloid"
+        );
+        assert_eq!(x.counters().cancels_refused, 1);
+
+        let mut repl = order(42, ORDER_KIND_MAKER);
+        repl.client_oid = (1 << 32) | 7;
+        assert_eq!(
+            OrderDispatch::modify(&mut x, &ModifyReq::new(resting.client_oid, repl)),
+            Err(DispatchError::NoLiveRoute),
+            "the trait modify never reached modify_by_cloid"
+        );
+        assert_eq!(x.counters().modifies_refused, 1);
+        assert_eq!(x.counters().refused_local, 2, "one LAW E-4 refusal per verb");
+        assert_eq!(x.counters().cancels_sent + x.counters().modifies_sent, 0);
+    }
+
+    /// **BX0-F3 — the trait modify forwards the two ids the right way
+    /// round.** A transposed pair would compile, address the
+    /// REPLACEMENT's id as the resting order and fail at the venue as
+    /// "no such order" — or worse, replace some other quote. With the
+    /// leg bound and the cold budget at its floor, the requote encodes
+    /// in full and stops at the submit barrier (never a socket — the
+    /// bench gate 60 posture), leaving the rendered action in `req`:
+    /// the resting order must be the `oid` and the replacement the
+    /// order's own `c`.
+    #[test]
+    fn the_trait_modify_names_the_resting_order_and_carries_the_replacement() {
+        let mut x = exchange_at("127.0.0.1");
+        x.assets_mut().bind(42, 3, 7, b"#42").expect("bind");
+        let prev: u64 = (1 << 32) | 7;
+        let mut repl = order(42, ORDER_KIND_MAKER);
+        repl.client_oid = (2 << 32) | 7;
+        assert_eq!(
+            OrderDispatch::modify(&mut x, &ModifyReq::new(prev, repl)),
+            Err(DispatchError::SlotDisabled),
+            "a cold budget refuses a requote at the submit barrier"
+        );
+        assert_eq!(x.counters().modifies_refused, 1);
+        assert_eq!(x.counters().encode_failures, 0, "the encode half ran to the end");
+        let body = String::from_utf8_lossy(&x.req);
+        let resting = format!("\"oid\":{}", cloid_json(3, prev));
+        let replacement = format!("\"c\":{}", cloid_json(3, repl.client_oid));
+        assert!(body.contains(&resting), "resting order not addressed by its cloid");
+        assert!(body.contains(&replacement), "replacement does not carry its own cloid");
+        // The stamping `ModifyReq::new` does (verb, prev id) must not
+        // reach the wire: the action is byte-for-byte the one an
+        // unstamped replacement encodes.
+        let (_mp, end) = x.stage_modify(prev, &repl).expect("unstamped encode");
+        let unstamped = x.req[..end].to_vec();
+        let _ = OrderDispatch::modify(&mut x, &ModifyReq::new(prev, repl));
+        assert_eq!(&x.req[..end], &unstamped[..], "the stamp leaked into the action");
+    }
+
+    /// **BX0-F3 — the trait cancel forwards the three fields that name
+    /// the order.** A bound leg takes the cancel through the encode to
+    /// the socket (a cancel is an exit: no budget bars it); nothing
+    /// listens on loopback:443, so the send fails — but the action it
+    /// rendered names this order's asset and cloid, not a neighbour's.
+    #[test]
+    fn the_trait_cancel_names_the_asset_and_the_cloid_it_was_given() {
+        let mut x = exchange_at("127.0.0.1");
+        x.assets_mut().bind(42, 3, 7, b"#42").expect("bind");
+        let resting = order(42, ORDER_KIND_MAKER);
+        let r = OrderDispatch::cancel(&mut x, &CancelReq::of(&resting, 2));
+        assert!(
+            !matches!(r, Err(DispatchError::Unsupported | DispatchError::SlotDisabled | DispatchError::NoLiveRoute)),
+            "the cancel stopped before the socket: {r:?}"
+        );
+        let body = String::from_utf8_lossy(&x.req);
+        let named = format!("\"asset\":3,\"cloid\":{}", cloid_json(3, resting.client_oid));
+        assert!(body.contains(&named), "the cancel did not name this order: {named}");
     }
 }

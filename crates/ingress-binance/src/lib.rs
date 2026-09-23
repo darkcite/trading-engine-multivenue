@@ -233,10 +233,10 @@ pub fn parse_book_ticker(buf: &[u8], sym: SymbolId) -> Option<BookTickerFrame> {
 // ---------------------------------------------------------------
 
 /// A parsed USDS-M `<sym>@markPrice` frame (WS5): mark, index,
-/// funding rate and next-funding time in one push. Dated futures'
-/// frames carry an EMPTY `"r"` (no funding on delivery contracts) —
-/// `has_funding` records wire truth, the WS3 Deribit convention.
-/// 64-byte POD; one cache line.
+/// funding rate and next-funding time in one push. Delivery contracts
+/// carry no funding — `has_funding` records wire truth, the WS3
+/// Deribit convention (see [`parse_mark_price`] for the two dated
+/// shapes). 64-byte POD; one cache line.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
 pub struct BnMarkPriceFrame {
@@ -252,8 +252,8 @@ pub struct BnMarkPriceFrame {
     pub next_funding_ms: u64,
     /// Resolved symbol id (connection-pinned, like bookTicker).
     pub sym: SymbolId,
-    /// 1 when the wire carried a parseable funding rate — perps do;
-    /// dated futures send `"r":""`.
+    /// 1 when the wire carried a parseable funding rate AND a next
+    /// funding time — perps do; dated futures send neither.
     pub has_funding: u8,
     /// Reserved for layout stability (keeps struct at 64 bytes).
     _pad: [u8; 19],
@@ -262,19 +262,27 @@ pub struct BnMarkPriceFrame {
 /// Parse a USDS-M `@markPrice` frame (WS5). Zero-alloc byte scan;
 /// `None` on malformed input (caller counts + taps).
 ///
-/// # Expected shape
+/// # Expected shape (live, fstream `/market/ws/`, 2026-09-23)
 ///
 /// ```text
-/// {"e":"markPriceUpdate","E":1562305380000,"s":"BTCUSDT",
-///  "p":"11794.15000000","i":"11784.62659091","P":"11784.25",
-///  "r":"0.00038167","T":1562306400000}
+/// {"e":"markPriceUpdate","E":1790161527002,"s":"BTCUSDT",
+///  "p":"85840.40234633","ap":"85840.40234633","P":"85863.42568007",
+///  "i":"85882.44043478","r":"0.00005016","T":1790179200000,"st":1}
 /// ```
 ///
-/// Key-matched (field order never assumed); the `"e"` tag is
-/// REQUIRED — a foreign frame on a markPrice connection is a reject,
-/// not a guess. `"r"`/`"T"` are optional-by-value: an empty or
-/// unparseable rate ⇒ `has_funding` = 0 (dated futures), a missing
-/// `"T"` ⇒ 0.
+/// Key-matched (field order never assumed; the `ap`/`st` keys the
+/// venue added since WS5 are skipped like any other); the `"e"` tag
+/// is REQUIRED — a foreign frame on a markPrice connection is a
+/// reject, not a guess. `"r"`/`"T"` are optional-by-value.
+///
+/// **A dated future has no funding, in either of its two shapes.**
+/// The WS5-era wire sent an EMPTY rate (`"r":""`); the live wire of
+/// 2026-09-23 sends a ZERO rate with no next-funding time
+/// (`"r":"0.00000000","T":0`, BX0 K6). A parseable rate alone would
+/// read the second shape as a perpetual paying 0 % every 1970-01-01
+/// — a `Funding` event per mark push for every dated contract — so
+/// `has_funding` needs BOTH a parseable rate and `"T"` > 0; anything
+/// else reports rate 0 and next-funding 0.
 #[inline]
 pub fn parse_mark_price(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
     memchr::memmem::find(buf, b"\"e\":\"markPriceUpdate\"")?;
@@ -286,19 +294,18 @@ pub fn parse_mark_price(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
     let pos = find_field(buf, b"\"i\":")?;
     let pos = skip_byte(buf, pos, b'"');
     let (index_px_1e6, _) = scan_price_1e6(buf, pos)?;
-    let (funding_rate_1e9, has_funding) = match find_field(buf, b"\"r\":") {
-        Some(pos) => {
-            let pos = skip_byte(buf, pos, b'"');
-            match scan_price_1e9(buf, pos) {
-                Some((v, _)) => (v, 1u8),
-                None => (0, 0u8), // `"r":""` — the dated-future shape
-            }
-        }
-        None => (0, 0u8),
+    let rate_1e9 = match find_field(buf, b"\"r\":") {
+        Some(pos) => scan_price_1e9(buf, skip_byte(buf, pos, b'"')).map(|(v, _)| v),
+        None => None,
     };
-    let next_funding_ms = match find_field(buf, b"\"T\":") {
-        Some(pos) => scan_u64(buf, pos).map(|(v, _)| v).unwrap_or(0),
+    let next_ms = match find_field(buf, b"\"T\":") {
+        Some(pos) => scan_u64(buf, pos).map_or(0, |(v, _)| v),
         None => 0,
+    };
+    // Funding needs a rate AND a next settlement — see the doc above.
+    let (funding_rate_1e9, next_funding_ms, has_funding) = match rate_1e9 {
+        Some(r) if next_ms != 0 => (r, next_ms, 1u8),
+        _ => (0, 0, 0u8),
     };
     Some(BnMarkPriceFrame {
         ts_ns: ts_ms.saturating_mul(1_000_000),
@@ -393,6 +400,37 @@ mod tests {
         assert_eq!(f.funding_rate_1e9, 0);
         assert_eq!(f.mark_px_1e6, 65_000_100_000);
         assert_eq!(f.next_funding_ms, 0);
+    }
+
+    /// BX0-F1: the two frames fstream's `/market/ws/` path delivered
+    /// on 2026-09-23 (K6, verbatim). The perp carries the `ap`/`st`
+    /// keys the venue added since WS5 — skipped, not misread (`"ap":`
+    /// must not satisfy the `"p":` anchor). The dated contract carries
+    /// a ZERO rate with no next-funding time — no funding, exactly
+    /// like the older empty-rate shape above.
+    #[test]
+    fn parse_mark_price_live_shapes_2026_09_23() {
+        let perp = br#"{"e":"markPriceUpdate","E":1790161527002,"s":"BTCUSDT","p":"85840.40234633","ap":"85840.40234633","P":"85863.42568007","i":"85882.44043478","r":"0.00005016","T":1790179200000,"st":1}"#;
+        let f = parse_mark_price(perp, 11).unwrap();
+        assert_eq!(f.ts_ns, 1_790_161_527_002 * 1_000_000);
+        assert_eq!(f.mark_px_1e6, 85_840_402_346);
+        assert_eq!(f.index_px_1e6, 85_882_440_434);
+        assert_eq!(f.funding_rate_1e9, 50_160);
+        assert_eq!(f.next_funding_ms, 1_790_179_200_000);
+        assert_eq!(f.has_funding, 1);
+
+        let dated = br#"{"e":"markPriceUpdate","E":1790161545000,"s":"BTCUSDT_260925","p":"85901.84762319","ap":"85901.84762319","P":"85864.31580990","i":"85884.08695652","r":"0.00000000","T":0,"st":1}"#;
+        let f = parse_mark_price(dated, 12).unwrap();
+        assert_eq!(f.mark_px_1e6, 85_901_847_623);
+        assert_eq!(f.index_px_1e6, 85_884_086_956);
+        assert_eq!(f.has_funding, 0, "a dated contract pays no funding");
+        assert_eq!((f.funding_rate_1e9, f.next_funding_ms), (0, 0));
+
+        // A perp whose rate is genuinely zero still funds: the next
+        // settlement is what separates it from a delivery contract.
+        let flat = br#"{"e":"markPriceUpdate","E":1,"s":"X","p":"1.0","i":"1.0","r":"0.00000000","T":1790179200000}"#;
+        let f = parse_mark_price(flat, 0).unwrap();
+        assert_eq!((f.has_funding, f.funding_rate_1e9), (1, 0));
     }
 
     #[test]
@@ -523,8 +561,11 @@ mod proptests {
             prop_assert_eq!(f.ts_ns, ts * 1_000_000);
             prop_assert_eq!(f.mark_px_1e6, mp as i64);
             prop_assert_eq!(f.index_px_1e6, ip as i64);
-            prop_assert_eq!(f.funding_rate_1e9, r_num);
-            prop_assert_eq!(f.has_funding, 1);
+            // BX0-F1: funding needs a next settlement; `T` = 0 is the
+            // live dated-contract shape and reports none at all.
+            let funds = t_next != 0;
+            prop_assert_eq!(f.has_funding, u8::from(funds));
+            prop_assert_eq!(f.funding_rate_1e9, if funds { r_num } else { 0 });
             prop_assert_eq!(f.next_funding_ms, t_next);
         }
 

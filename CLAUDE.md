@@ -110,12 +110,37 @@ in the script; `ai` = 48 is the floor every name includes).
   BBO CHANGE — plan D11) and futures closes a busy socket 60 s after the
   last CLIENT ping (D12, pitfall 16). Wire law: `docs/wire-format.md`
   "Capture files"; rulings Q-MX1…Q-MX7: plan §0.
-- **Gates at HEAD (the MEXC lane, 2026-09-23):** nextest 2722 (2 skipped —
-  one is the `#[ignore]`d `mexc_live_smoke`) · alloc 64/64 at 0 B/op ·
+- **BX0 — the Binance fix-now pass, BUILT + COMMITTED 2026-09-23 (live
+  from the 16:05Z routine restart)** — `docs/binance-exec-plan.md` §2/§5 BX0. F1: USDⓈ-M markPrice
+  on fstream's ROUTED `/market/ws/` path (the legacy `/ws/` URL answers
+  101 and stays silent since 2026-04-23 — the old "partial venue fault"),
+  plus F1b: a dated contract's live `"r":"0.00000000","T":0` is not
+  funding. F2: Binance options on `/market/stream?streams=<uly>@optionMarkPrice`
+  (the nbstream `/eoptions` route 404s since the 2025-12 options
+  migration — it was never this network); one push = one underlying's
+  whole chain, the lane keeps its table's rows; `BINANCE_EAPI_WS_HOST`
+  defaults to `fstream.binance.com`. F3: `HlExchange` finally overrides
+  the trait's `cancel`/`modify` (the router got `Unsupported` before);
+  inherent `modify` → `modify_by_cloid`. F4: `TCP_NODELAY` on every
+  socket core-net opens. After the restart the regime FUND reference
+  (`binance-usdm:btcusdt`) gets live funding prints for the first time
+  (`docs/migration.md`). Live smoke WITHOUT stopping the engine:
+  `CARGO_TARGET_DIR=/tmp/bx0-target cargo test --release -p cli --test
+  binance_md_live_smoke -- --ignored --nocapture` (`BN_SMOKE_SECS` ≤ 900).
+  The live `.env`'s `BINANCE_EAPI_WS_HOST` line was switched to
+  `fstream.binance.com` BY A SESSION on the operator's explicit ask
+  (2026-09-23; that one line, rewritten in place, nothing read out) — the
+  one sanctioned exception, the secrets law stands. F3's arm-level test
+  split is operator-accepted (the composed router test moves to BX3).
+  Remaining BX0 items: plan §5 BX0 "Operator actions".
+- **Gates at HEAD (BX0, 2026-09-23):** nextest 2738 (3 skipped — the
+  `#[ignore]`d `mexc_live_smoke` and `binance_md_live_smoke` among them) ·
+  alloc 64/64 at 0 B/op ·
   clippy clean · `make license-check` OK · `make copy-audit` new=0 ·
   worker pytest 1510 (3 skipped; `test_news_lanes::test_report_prints_the_funnel`
   is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
-  `hl_*` 3 × 300 s, `pb_scan`, `mexc_ws_frame`, `mexc_instruments` clean. Known
+  `hl_*` 3 × 300 s, `pb_scan`, `mexc_ws_frame`, `mexc_instruments`,
+  `binance_eapi_mark_array` 300 s, `binance_eapi` 120 s clean. Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
@@ -128,8 +153,7 @@ in the script; `ai` = 48 is the floor every name includes).
   once pasted in chat — rotate; disk headroom on the Data volume is the
   operator's lever (writers do not retry after ENOSPC — restart is the
   recovery); whole-root `audit-pnl`/`backtest` OOMs above ~27 GB — use
-  bounded ≤ 2 h window roots; BN eapi-WS is unreachable from this network
-  (`BINANCE_EAPI_WS_HOST` in `.env` + restart activates it); `regime.toml
+  bounded ≤ 2 h window roots; `regime.toml
   [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
   names `claude-opus-4-6` as the session model (the three review agents are
   pinned to `claude-opus-5`).
