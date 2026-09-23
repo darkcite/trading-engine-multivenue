@@ -1,0 +1,107 @@
+# hyparb.toml - the HYPARB member's artifact (slot 0, plan §9).
+#
+# The engine hashes these BYTES: the boot tell `hyparb: artifact
+# configured hash=...` names this exact file, so an edit is a new
+# artifact. Read from ~/multivenue/hyparb.toml (or --hyparb <path>) ONLY
+# when the requested mask carries slot 0 (`hyparb`, `ai+hyparb`,
+# `ai+vrp+xsd+bin15+hyparb`); absent with the bit requested REFUSES the
+# boot - booting `ai+hyparb` silently as `ai` is how an operator comes to
+# watch a member that was never there.
+#
+# GRAMMAR (core_config::hyparb). Integers only - a float anywhere refuses.
+# Strings are quoted, with no escapes. Flags are 0 or 1. An unknown key,
+# an unknown section, a duplicate key and a second [hyparb] each refuse,
+# naming the line: a typo'd knob that silently took a default is a member
+# trading an edge nobody chose. There are no arrays in this file (the
+# shared grammar reads an array off ONE line; here any array is a type
+# error). Units ride in the names: _ns nanoseconds, _usd_1e6 micro-USD,
+# _bps_1e6 basis points x 1e6 (1 bp = 1000000; 100 % = 10000000000).
+#
+# The values below are ILLUSTRATIVE - the grammar's contract, not a fit.
+
+[hyparb]
+# The pools are read at a pinned block, which only an archive-honest
+# endpoint answers (O-H4; the ingress probes it every snapshot and goes
+# dark on a dishonest one - O-H15). The only value is "archive".
+endpoint_kind = "archive"
+# "paper": the engine's paper matcher fills the AMM leg by the AMM fill
+# law (plan §6). "testnet": the EVM write path, chain 998 ONLY (O-H5) -
+# refused unless the engine is also started with --evm-testnet, and
+# refused outright until that path is linked. There is no mainnet mode.
+mode = "paper"
+# Gas is charged per ATTEMPT from the MEASURED distribution (a reverted
+# swap pays too), never the base fee. The only value is "measured".
+gas_model = "measured"
+# Latency: a hedge IoC lives this long after the AMM leg fills; a book
+# that moved inside it is a miss (counted), and the residue is unhedged
+# inventory. Set it from the measured order round trip of THIS box
+# (docs/venue-latency.md), not from a guess.
+lag_ns = 500000000
+# Basis: each pool is de-meaned against its own pool-vs-hedge deviation,
+# a time-weighted EMA over this horizon. A persistent one-sided flow in
+# live paper means basis control is off or wrong - that is the tell.
+basis_window_ns = 300000000000
+basis_enabled = 1
+# Depth cap: an arb is never larger than the hedge books' live touch in
+# the direction that can clear - the single largest correction in the
+# model (plan §8.4.1). 0 only for an A/B measurement.
+depth_cap_enabled = 1
+# Gas per attempt, USD x 1e6: p50 is charged on every swap submitted;
+# p99 is the G2 bid cap the EVM write path carries (never exceeded).
+gas_p50_usd_1e6 = 9800
+gas_p99_usd_1e6 = 3910000
+# Caps, USD x 1e6: one arb; one pool (the default a [[pool]] may lower
+# or raise with its own max_notional_usd_1e6); one UTC day of AMM
+# notional; unhedged inventory across coins (a breach halts new arbs
+# until it is back under half the cap).
+max_order_usd_1e6 = 100000000
+cap_instance_usd_1e6 = 100000000
+cap_day_usd_1e6 = 2000000000
+inventory_cap_usd_1e6 = 300000000
+# The least net edge worth an attempt, AFTER the pool fee, both hedge
+# taker fees and gas.
+min_net_bps_1e6 = 10000000
+# Hedge venue: "auto" takes the cheaper book per coin and side (half
+# spread + taker + depth penalty, and for the perp its basis to spot
+# minus the funding our side earns over funding_window_ns), keeping the
+# last choice unless the other is cheaper by more than the hysteresis.
+# "perp" / "spot" force one - both must run (the A/B legs).
+hedge_venue = "auto"
+hedge_switch_hysteresis_bps_1e6 = 1000000
+funding_window_ns = 3600000000000
+# Hedge taker fees, bps x 1e6. The venue's published tier-0 schedule is
+# a starting point only: fees are MEASURED from userFills.fee, and this
+# file is updated from the measurement.
+perp_taker_bps_1e6 = 4500000
+spot_taker_bps_1e6 = 7000000
+# The least time between two arbs on one pool.
+cooldown_ns = 1000000000
+
+# One block per hedge coin (at most 8). `name` is what pools refer to
+# (1-16 letters/digits; "USD" is reserved for the numeraire). `perp` and
+# `spot` are Hyperliquid DESCRIPTORS resolved against the boot universe -
+# at least one; an absent one means that book is never used. The spot
+# books join the universe at go-live (plan §16.10), so the spot line is
+# commented out until then.
+[[coin]]
+name = "HYPE"
+perp = "hyperliquid:HYPE"
+# spot = "hyperliquid:@107"
+# Order-size step in coin x 1e6 (the venue's szDecimals: HYPE = 2 ->
+# 0.01 coin = 10000) and the venue's minimum order notional.
+lot_1e6 = 10000
+min_notional_usd_1e6 = 10000000
+
+# One block per pool (at most 128). `address` must be one of
+# universe.toml's [hyperevm] pools, spelled the same way (0x + 40
+# lowercase hex): the universe allocates the symbol and carries the
+# family and decimals; this file only says how the member treats it.
+# coin0 / coin1 name each token's hedge coin, or "USD" for the numeraire
+# (both USD refuses - nothing to hedge). trade = 0 tracks a pool without
+# ever trading it. max_notional_usd_1e6 is OPTIONAL (absent = the
+# [hyparb] cap_instance_usd_1e6).
+[[pool]]
+address = "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285"
+coin0 = "HYPE"
+coin1 = "USD"
+trade = 1

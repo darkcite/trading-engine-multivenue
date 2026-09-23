@@ -739,6 +739,19 @@ struct RunArgs {
     /// boot must be — and the member holds until its HAR window warms.
     #[arg(long)]
     bin15_seed_dir: Option<PathBuf>,
+    /// HYPARB H5: the slot-0 parameter artifact
+    /// (`~/multivenue/hyparb.toml` by default). Read only when the
+    /// requested mask carries slot 0 (`--strategy hyparb` / `ai+hyparb`
+    /// / … / `all`); absent or unresolvable with the bit set REFUSES the
+    /// boot — never a silent no-op. The member also needs its pools:
+    /// `--hyperevm-path` and a non-empty `[hyperevm] pools`.
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// HYPARB O-H5: the second switch of the EVM write path, TESTNET
+    /// ONLY (chain 998; the crate refuses 999 regardless). Must agree
+    /// with the artifact's `mode = "testnet"` — both or neither.
+    #[arg(long, default_value_t = false)]
+    evm_testnet: bool,
     /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
     /// by default). Read only when the requested mask carries the icdp
     /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
@@ -3407,6 +3420,11 @@ fn run(args: RunArgs) -> ExitCode {
     // Both switches or nothing: the path flag AND a `[hyperevm] pools`
     // list. Anything else drops the producer, so the engine's pool lane
     // is a permanently-empty ring (the unspawned-venue shape, §3.3).
+    // HYPARB H5: whether the operator CONFIGURED the ingress — slot 0
+    // refuses a boot without it (a member that can never see a pool);
+    // a runtime failure (DNS, a dishonest archive) only darkens the
+    // member (O-H15), it never refuses the boot.
+    let hyperevm_configured = args.hyperevm_path.is_some() && !boot.allocated.hyperevm.is_empty();
     match (
         args.hyperevm_path.as_deref(),
         boot.allocated.hyperevm.is_empty(),
@@ -3718,7 +3736,7 @@ fn run(args: RunArgs) -> ExitCode {
         (name, _live) if STRATEGY_SET_NAMES.contains(&name) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // hyparb never before H5 (lands DARK — O-H8), bin15 only
+            // hyparb only when `hyparb.toml` resolves (H5), bin15 only
             // when its artifact resolves, vrp only when
             // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
             // artifact resolves (slot 2 is vacant — XSD-S),
@@ -3911,6 +3929,49 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // HYPARB H5: slot 0's artifact. Coins resolve against the
+            // same descriptor table; pools against the universe's
+            // `[hyperevm]` list (the universe allocates their symbols).
+            let hyparb_boot = if cli::hyparb_boot::hyparb_wanted(requested) {
+                match cli::hyparb_boot::load_hyparb_boot(
+                    args.hyparb.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &boot.allocated.hyperevm,
+                    args.evm_testnet,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hyparb: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                if args.evm_testnet {
+                    error!("--evm-testnet without slot 0 in --strategy — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                None
+            };
+            // F19 / the icdp law: requested-but-absent REFUSES.
+            if cli::hyparb_boot::hyparb_wanted(requested) && hyparb_boot.is_none() {
+                error!(
+                    "hyparb: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hyparb.toml or --hyparb) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            if hyparb_boot.is_some() && !hyperevm_configured {
+                error!(
+                    "hyparb: the member needs the HyperEVM pool ingress — \
+                     --hyperevm-path and a non-empty universe.toml `[hyperevm] pools` \
+                     — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
@@ -3932,6 +3993,7 @@ fn run(args: RunArgs) -> ExitCode {
                         bin15_boot.as_ref(),
                         icdp_params.as_ref(),
                         regime_boot.as_ref(),
+                        hyparb_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -4072,6 +4134,7 @@ fn run(args: RunArgs) -> ExitCode {
                             bin15_boot.as_ref(),
                             icdp_params.as_ref(),
                             regime_boot.as_ref(),
+                            hyparb_boot.as_ref(),
                         )
                     } else {
                         // Nothing armed: the refusing stub, so a live
@@ -4115,6 +4178,7 @@ fn run(args: RunArgs) -> ExitCode {
                             bin15_boot.as_ref(),
                             icdp_params.as_ref(),
                             regime_boot.as_ref(),
+                            hyparb_boot.as_ref(),
                         )
                     }
                 }

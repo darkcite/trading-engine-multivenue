@@ -3102,10 +3102,10 @@ fn configure_rule_tree<const N: usize>(
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
 /// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / icdp
-/// when their artifacts resolve, **never slot 0 before HYPARB H5**
-/// (the hyparb member lands DARK — O-H8: it is configured only by its
-/// own boot artifact, so `--strategy hyparb` refuses until then rather
-/// than booting an inert member under a healthy-looking name),
+/// when their artifacts resolve, slot 0 when `hyparb.toml` resolves
+/// (HYPARB H5 — the member is configured only by its own boot
+/// artifact; unconfigured it refuses `on_start`, so it never boots
+/// inert under a healthy-looking name),
 /// **ai-exec and vm unconditionally** (neither has
 /// boot config: ai-exec's universe arrives over UDS at runtime and
 /// its `on_start` validates parameters only; vm boots inert until a
@@ -3128,8 +3128,12 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
+    hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
 ) -> EngineLoopResult {
     let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
+    if hyparb.is_some() {
+        configured |= strategy_set::BIT_HYPARB;
+    }
     if vrp.is_some() {
         configured |= strategy_set::BIT_VRP;
     }
@@ -3356,6 +3360,17 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         let dormant = set.bin15_mut().counters().families_dormant as usize;
         tracing::info!("{}", crate::bin15_boot::render_boot_tell(boot, dormant));
+    }
+    if let Some(boot) = hyparb {
+        // HYPARB H5. The wall anchor is taken HERE, once — the member's
+        // day cap is UTC-aligned from this instant on (the icdp law).
+        // The params are cloned out of the boot struct (a few KiB, once).
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.hyparb_mut().configure(boot.params.clone(), anchor) {
+            tracing::error!(error = %e, "hyparb: configure failed");
+            return EngineLoopResult::Failed("engine_loop_set: hyparb configure rejected");
+        }
+        tracing::info!("{}", crate::hyparb_boot::render_boot_tell(boot));
     }
     if let Some(params) = icdp {
         // ICDP I2/I4: the wall anchor is taken HERE, once, right

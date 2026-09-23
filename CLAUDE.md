@@ -19,7 +19,8 @@ researcher** — never in the hot path.
 
 Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
 0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
-O-H8; `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
+O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
+`latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
 2 xsd · 3 bin15 · 4 ai-exec (AI door 1, intents) · 5 ruleset VM (AI door 2,
 tables) · 6 icdp · 7 open. The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list

@@ -6,6 +6,47 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — `hyparb.toml`, `--hyparb`, `--evm-testnet`, wrapper `HYPARB_TOML` / `EVM_TESTNET` / `HYPEREVM_PATH` (HYPARB H5)
+
+**What changed**
+
+- New artifact `~/multivenue/hyparb.toml` (grammar: `hyparb.toml.example`
+  + `core_config::hyparb`): one `[hyparb]` section, 1–8 `[[coin]]` blocks
+  (Hyperliquid perp / spot DESCRIPTORS, lot, venue minimum), 1–128
+  `[[pool]]` blocks (an address that must be in `universe.toml
+  [hyperevm] pools`, each token's hedge coin or `"USD"`, `trade`, an
+  optional per-pool cap). Integers only; unknown / duplicate keys refuse.
+- New boot flags `--hyparb <path>` (default the path above) and
+  `--evm-testnet` (O-H5: the second switch; must agree with the
+  artifact's `mode = "testnet"`, and refused while the EVM write path is
+  not linked). Slot 0 enters the configured mask ONLY when the artifact
+  resolves; requested-but-absent refuses the boot, and so does slot 0
+  without the pool ingress (`--hyperevm-path` + a non-empty
+  `[hyperevm] pools`). A runtime ingress failure darkens the member,
+  never the engine (O-H15).
+- `scripts/engine-wrapper.sh`: a STRATEGY carrying `hyparb` also passes
+  `--hyperevm-path "${HYPEREVM_PATH:-/}"`; `HYPEREVM_PATH` alone passes the
+  path for capture without the member. `HYPARB_TOML` + `EVM_TESTNET=1`
+  (both or neither — exit 78, the `EXEC_TOML` / `ARM_LIVE` shape) pass
+  `--hyparb <file> --evm-testnet`. A STRATEGY without `hyparb` and without
+  those variables produces the exact pre-H5 command line.
+
+**Impact**
+
+- Config keys: one new artifact, three new optional `strategy.conf`
+  variables. Nothing changes for a STRATEGY without `hyparb`.
+- On-disk formats: none.
+
+**Migration steps**
+
+1. None for the live engine (O-H8: `strategy.conf` is not edited; slot 0
+   joins the live mask only at go-live, after `[hyperevm]` and the
+   artifact are in place on a binary built from `main`).
+
+**Rollback**
+
+- Revert the H5 commit.
+
 ## 2026-09-23 — `[hyperevm] pools`, the `hyperevm` capture label, `/state` venue 9 (HYPARB H3b)
 
 **What changed**

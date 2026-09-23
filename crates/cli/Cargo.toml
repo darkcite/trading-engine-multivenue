@@ -40,6 +40,8 @@ ingress-hyperevm     = { workspace = true }
 core-amm             = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-bin15       = { workspace = true }
+# HYPARB H5: the slot-0 member's params, built by `hyparb_boot`.
+strategy-hyparb      = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-icdp        = { workspace = true }
 strategy-set         = { workspace = true }

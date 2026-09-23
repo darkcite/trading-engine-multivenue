@@ -31,6 +31,8 @@ use zeroize::Zeroize;
 
 pub mod bin15;
 pub mod exec;
+/// HYPARB H5: the slot-0 member's parameter artifact (`hyparb.toml`).
+pub mod hyparb;
 pub mod icdp;
 /// XSD-F: the descriptor law — an instrument's fee class from its §9.4
 /// descriptor (mirrored in `claude_worker.instrument_class`).

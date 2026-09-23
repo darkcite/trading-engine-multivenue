@@ -161,8 +161,9 @@ fi
 # `ai+hyparb`, `ai+vrp+xsd+bin15+hyparb`); `latency-arb` was never in
 # this list and is now gone from the engine too (O-H1). The names are
 # here so they CAN be set later — the member lands DARK (O-H8): nothing
-# edits strategy.conf until HZ and H8 are green, and until H5 lands its
-# artifact the engine refuses a mask whose only request is slot 0.
+# edits strategy.conf until HZ and H8 are green. Since H5 the engine
+# boots slot 0 only with its artifact (~/multivenue/hyparb.toml) and the
+# pool ingress — see the HYPARB block at the end.
 case "$STRATEGY" in
   ai|ai+icdp|icdp|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
   bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
@@ -206,4 +207,39 @@ elif [ -n "${EXEC_TOML:-}${ARM_LIVE:-}" ]; then
   echo "engine-wrapper: refusing — EXEC_TOML and ARM_LIVE must BOTH be set to arm (got EXEC_TOML='${EXEC_TOML:-}' ARM_LIVE='${ARM_LIVE:-}')" >&2
   exit 78
 fi
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}"
+# HYPARB H5 (2026-09-23): slot 0. Its artifact is ~/multivenue/hyparb.toml
+# whenever STRATEGY carries hyparb (absent => the ENGINE refuses the boot,
+# the F19 law), and the member needs its pools: the HyperEVM pool ingress
+# starts with --hyperevm-path "$HYPEREVM_PATH" (default "/", the archive
+# endpoint's WebSocket path) whenever STRATEGY carries hyparb, or whenever
+# HYPEREVM_PATH is set (capture without the member). The EVM write path
+# (O-H5, TESTNET ONLY, chain 998) takes BOTH HYPARB_TOML=<an artifact with
+# mode = "testnet"> AND EVM_TESTNET=1 - one of the two alone REFUSES
+# (exit 78), the EXEC_TOML/ARM_LIVE shape; the engine's own interlock
+# (artifact mode <=> --evm-testnet) has the last word. Per O-H8 nothing
+# here edits strategy.conf.
+HYPARB_ARGS=()
+case "$STRATEGY" in
+  *hyparb*) HYPARB_ARGS=(--hyperevm-path "${HYPEREVM_PATH:-/}") ;;
+  *) if [ -n "${HYPEREVM_PATH:-}" ]; then HYPARB_ARGS=(--hyperevm-path "$HYPEREVM_PATH"); fi ;;
+esac
+if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
+  if [ "$EVM_TESTNET" != "1" ]; then
+    echo "engine-wrapper: refusing — EVM_TESTNET must be 1 (got '$EVM_TESTNET')" >&2
+    exit 78
+  fi
+  if [ ! -f "$HYPARB_TOML" ]; then
+    echo "engine-wrapper: refusing — HYPARB_TOML=$HYPARB_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY" in
+    *hyparb*) ;;
+    *) echo "engine-wrapper: refusing — EVM_TESTNET without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  HYPARB_ARGS+=(--hyparb "$HYPARB_TOML" --evm-testnet)
+  echo "engine-wrapper: hyparb EVM write path via $HYPARB_TOML — TESTNET (chain 998) only" >&2
+elif [ -n "${HYPARB_TOML:-}${EVM_TESTNET:-}" ]; then
+  echo "engine-wrapper: refusing — HYPARB_TOML and EVM_TESTNET must BOTH be set for the EVM write path (got HYPARB_TOML='${HYPARB_TOML:-}' EVM_TESTNET='${EVM_TESTNET:-}')" >&2
+  exit 78
+fi
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}"

@@ -41,6 +41,8 @@ pub mod backtest;
 pub mod bin15_boot;
 pub mod capture_catalog;
 pub mod exec_boot;
+/// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
+pub mod hyparb_boot;
 pub mod options_manifest;
 pub mod paper;
 pub mod pinning;

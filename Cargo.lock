@@ -360,6 +360,7 @@ dependencies = [
  "strategy-bin15",
  "strategy-core",
  "strategy-ev",
+ "strategy-hyparb",
  "strategy-icdp",
  "strategy-rule-tree",
  "strategy-set",

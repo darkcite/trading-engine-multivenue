@@ -1723,3 +1723,42 @@ As §6 says, with these decisions recorded:
   validates; alloc gate **68** — the member driven through pool events, a
   funding event, BBOs, the AMM fill, the hedge fill and the timer, 10,000
   cycles at 0 B/op.
+
+### 16.12 H5 — config + boot — LANDED (dark: `strategy.conf` untouched, O-H8)
+
+* **`core_config::hyparb`** — `[hyparb]` once, `[[coin]]` 1..=8,
+  `[[pool]]` 1..=128, on the shared `strip_comment` / `parse_value`
+  primitives; every error names `hyparb.toml` and the line. Keys as §9.1
+  plus what the member needs and §9.1 did not list: `perp_taker_bps_1e6`,
+  `spot_taker_bps_1e6`, `cooldown_ns`, and the `[[coin]]` blocks (name,
+  perp / spot descriptors, `lot_1e6`, `min_notional_usd_1e6`). Pools are
+  named by ADDRESS and must be in `universe.toml [hyperevm] pools` (the
+  universe allocates the symbol; family and decimals live there, verified
+  on chain). `cap_instance_usd_1e6` is the per-pool default a `[[pool]]`
+  may override. Deviations, stated: `tick_cap` is refused with a pointer
+  (the map's node cap is the ingress's 1,024, not a knob); `endpoint_kind`
+  accepts only `"archive"` and `gas_model` only `"measured"` — the file
+  states its assumptions.
+* **`cli::hyparb_boot`** — resolves coins through the AI descriptor table,
+  pools through the allocated `[hyperevm]` list, runs
+  `HyparbParams::validate`, and refuses a forced hedge venue some coin
+  lacks. O-H5 two switches: `mode = "testnet"` ⇔ `--evm-testnet`, and
+  testnet refuses while `EVM_WRITE_PATH_LINKED` is false (H8 flips it
+  with the arm). **No boot-time archive probe and no boot-time maps**
+  (deviation from §9.3): the ingress probes every snapshot and a
+  dishonest endpoint darkens the member, not the engine (O-H15); the maps
+  come from the tape.
+* **Bin** — `--hyparb`, `--evm-testnet`; the bin15 block's shape (refuse
+  on a bad artifact, F19 on requested-but-absent) plus one more law: slot
+  0 without the pool ingress CONFIGURED refuses (a member that can never
+  see a pool); a runtime ingress failure never does.
+  `engine_loop_set_full(…, hyparb)` sets `BIT_HYPARB` in the configured
+  mask only when the artifact resolved, configures the member with a
+  boot `WallAnchor` and logs the tell (`hyparb: artifact configured
+  hash=… mode=… coins= pools= traded= hedge= depth_cap= basis= lag_ns= …`).
+* **Wrapper** — `hyparb` in STRATEGY passes `--hyperevm-path
+  "${HYPEREVM_PATH:-/}"`; `HYPARB_TOML` + `EVM_TESTNET=1` both-or-neither
+  (exit 78). Exercised under zsh against a stub binary: both set, each
+  alone, a non-`1` flag, a missing file, `EVM_TESTNET` without `hyparb`,
+  and the live `ai+vrp+xsd+bin15` + `EXEC_TOML`/`ARM_LIVE` line
+  (byte-identical to pre-H5).
