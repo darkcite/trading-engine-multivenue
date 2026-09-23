@@ -42,6 +42,8 @@ core-config        = { path = "../crates/core-config" }
 # amm_tick_walk / amm_map_payload: the HYPARB H1 AMM walk + arb solve, the
 # O-H19 tick-map maintenance and the pool-event payload codec.
 core-amm           = { path = "../crates/core-amm" }
+# hyperevm_decode: the HYPARB H3 log/envelope decoders + pool snapshot machine.
+ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -333,6 +335,13 @@ bench  = false
 [[bin]]
 name   = "amm_map_payload"
 path   = "fuzz_targets/amm_map_payload.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hyperevm_decode"
+path   = "fuzz_targets/hyperevm_decode.rs"
 test   = false
 doc    = false
 bench  = false

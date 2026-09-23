@@ -1443,3 +1443,49 @@ Deviations from §11.2:
   loops to each other (same end state, amounts within one wei per step);
   alloc gate **65** (Algebra walk + map mutation + payload codec, 0 B/op);
   fuzz `amm_tick_walk` (now both loops) and new `amm_map_payload`.
+
+### 16.6 H3a `ingress-hyperevm` — LANDED (not wired)
+
+Deviations from §7, each deliberate:
+
+* **The ingress snapshots the pools, not the boot loader** (§7.4 / §8.2 /
+  §9.3). A tick map must be rebuilt after every stream break at a block
+  the stream continues from without a gap, AND it must be on the capture
+  tape so a replay rebuilds the maps the live member walked (X1 parity —
+  §6.5 already requires pool state to come from the tape). So the session
+  subscribes `newHeads` + pool logs first, pins the next head as block
+  `B`, reads every pool at `B` over the same WebSocket (pipelined
+  `eth_call`s, up to 256 in flight), and publishes `SNAPSHOT` · `TICK`… ·
+  `STATE` before any event after `B`. Events that stream in meanwhile are
+  held (boot-allocated, 4,096) and flushed in order; those at or before
+  `B` are dropped as covered. Consequences for H4/H5: `configure()` takes
+  no maps (the member owns its boxed maps and fills them from signals);
+  `HyparbBoot` loses `maps`; the cli does no HTTPS pool discovery.
+* **The O-H4 archive probe runs inside every snapshot** — each pool's price
+  is also read at `B − 1000`; if no pool differs, the snapshot is refused
+  and the run ends with `RunResult::ArchiveDishonest` (O-H15: the caller
+  disables the member, not the engine).
+* **Three families** (O-H19): V3 (7-word `slot0`, bitmap + `ticks`),
+  Slipstream (6-word `slot0`, 10-word `ticks`), Algebra (`globalState`,
+  `prevTickGlobal`/`nextTickGlobal`, the linked list walked both ways;
+  the `MIN/MAX_TICK` markers bound the coverage). Coverage: ±`radius`
+  ticks (default 4,000), never more than 1,024 initialised ticks (narrowed
+  around the price) or 64 bitmap words. A reply with the wrong ABI shape
+  fails that pool, never guesses.
+* **Resync without reconnect**: a ring drop in Live (the member lost an
+  event it cannot recover) or a `removed: true` log → `GAP` and a fresh
+  snapshot on the same connection; an event of one pool the payload
+  cannot carry (an amount beyond `int128`) → `GAP` on THAT pool's symbol
+  only. A reconnect announces the break with `GAP(last delivered block)`.
+* **128-bit subscription ids** are folded (`hi ^ lo`) into `core_net`'s
+  `SubId`; a fold collision between two live ids is refused.
+* Decoders check each event's SHAPE (topic count, data-word count —
+  measured on chain for all families) and decode signed words from all
+  256 bits.
+* `SIGNAL_SOURCE_HYPEREVM = 5` is named in the crate; the
+  `SignalSource::HyperEvm` variant is H0's (after MX2).
+* Gates: 26 unit/lifecycle tests (a model node answers the driver's own
+  frames — snapshot, held events, Live, every resync path, the probe) + a
+  400-case random-book property; alloc gate **66** (the whole session after
+  the handshake — subscribes, snapshot, 1,000 live swaps — 0 B/op); fuzz
+  `hyperevm_decode`.

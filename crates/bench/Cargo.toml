@@ -56,6 +56,8 @@ signer-eip712        = { workspace = true }
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.
 signer-evm           = { workspace = true }
+# HYPARB H3 gate 66: the HyperEVM ingress session after the handshake.
+ingress-hyperevm     = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

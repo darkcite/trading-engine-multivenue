@@ -1,0 +1,27 @@
+[package]
+name         = "ingress-hyperevm"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "HYPARB H3: HyperEVM pool-event ingress over JSON-RPC WSS — Uniswap V3, Slipstream and Algebra Integral pools. Subscribes newHeads + pool logs, snapshots every pool at a pinned block over the same session (archive probe included), and publishes pool events and snapshots as 40-byte core-amm payloads. Zero-alloc after boot."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-amm     = { workspace = true }
+core-metrics = { path = "../core-metrics" }
+core-net     = { workspace = true }
+core-parse   = { workspace = true }
+core-ring    = { workspace = true }
+core-time    = { workspace = true }
+core-types   = { workspace = true }
+ingress-rpc  = { workspace = true }
+memchr       = { workspace = true }
+mio          = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

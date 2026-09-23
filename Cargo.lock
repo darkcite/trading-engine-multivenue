@@ -149,6 +149,7 @@ dependencies = [
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-okx",
  "ingress-polymarket",
@@ -957,6 +958,23 @@ dependencies = [
  "proptest",
  "rcgen",
  "rustls",
+]
+
+[[package]]
+name = "ingress-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "ingress-rpc",
+ "memchr",
+ "mio 0.8.11",
+ "proptest",
 ]
 
 [[package]]

@@ -7416,3 +7416,213 @@ fn amm_algebra_walk_map_mutation_and_payload_are_zero_alloc() {
         "core-amm algebra/map/payload hot bytes should be zero: saw {bytes}"
     );
 }
+/// **HYPARB H3 gate 66 — the HyperEVM ingress after the handshake.**
+///
+/// Everything the session does once upgraded, inside the guard: both
+/// subscriptions (the `logs` frame renders every pool address and topic),
+/// the pinned pool snapshot (reads issued, replies scanned, the archive
+/// probe, the snapshot emitted onto the ring), then 1 000 live `Swap`
+/// pushes decoded into `SWAP` + `STATE` payloads and pushed. The reply
+/// frames are rendered before the guard; the driver was sized at boot.
+#[test]
+fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
+    use ingress_hyperevm::{run_loop as hwl, PoolEntry, PoolFamily, PoolTable};
+
+    fn frame(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x81u8];
+        if body.len() <= 125 {
+            out.push(body.len() as u8);
+        } else {
+            out.push(126);
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(body);
+        out
+    }
+    fn word_i(v: i64) -> String {
+        if v < 0 {
+            format!("{}{:016x}", "f".repeat(48), v as u64)
+        } else {
+            format!("{:064x}", v as u64)
+        }
+    }
+    fn reply(id: u64, words: &str) -> Vec<u8> {
+        frame(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":"0x{words}"}}"#).as_bytes())
+    }
+
+    const B: u64 = 46_650_000;
+    let addr = [0x30u8; 20];
+    let pools = PoolTable::new(&[PoolEntry {
+        address: addr,
+        sym: 900,
+        family: PoolFamily::Algebra,
+    }])
+    .expect("gate 66 pools");
+    let mut transport = TestTransport::with_capacity(1 << 20);
+    let mut driver = hwl::Driver::new(0xBEEF, pools, 4_000);
+    hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    let status = core_metrics::IngressStatus::new();
+    let ring: std::sync::Arc<Ring<core_types::Signal, { hwl::DEFAULT_POOL_RING_CAP }>> =
+        Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let mut capture = core_types::NullCapture;
+
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let mut sink = vec![0u8; 1 << 20];
+    let _ = transport.drain_outgoing(&mut sink);
+    let accept = core_net::expected_accept(&core_net::sec_websocket_key_from_seed(0xBEEF));
+    let mut resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ".to_vec();
+    resp.extend_from_slice(&accept);
+    resp.extend_from_slice(b"\r\n\r\n");
+
+    // Everything the node will say, rendered now. Ids are the driver's:
+    // 1 newHeads, 2 logs, 3.. the Algebra header reads in issue order
+    // (globalState, liquidity, tickSpacing, prev, next, probe), then the
+    // two list reads (both markers: an empty book).
+    let (sqrt, _) = core_amm::sqrt_at_tick(-297_448);
+    let gs = |s: u128| {
+        format!(
+            "{:064x}{}{:064x}{}",
+            s,
+            word_i(-297_448),
+            500u64,
+            "0".repeat(192)
+        )
+    };
+    let marker = format!(
+        "{}{}{}{}{}",
+        "0".repeat(128),
+        word_i(-887_272),
+        word_i(887_272),
+        "0".repeat(64),
+        "0".repeat(64)
+    );
+    let mut session = Vec::new();
+    session.extend_from_slice(&resp);
+    let mut setup = Vec::new();
+    setup.extend_from_slice(&frame(
+        br#"{"jsonrpc":"2.0","id":1,"result":"0x9cef478923ff08bf67fde6c64013158d"}"#,
+    ));
+    setup.extend_from_slice(&frame(
+        br#"{"jsonrpc":"2.0","id":2,"result":"0x1111478923ff08bf67fde6c640131500"}"#,
+    ));
+    setup.extend_from_slice(&frame(format!(r#"{{"jsonrpc":"2.0","method":"eth_subscription","params":{{"subscription":"0x9cef478923ff08bf67fde6c64013158d","result":{{"number":"0x{B:x}","timestamp":"0x68d2a1f3","baseFeePerGas":"0x5f5e100"}}}}}}"#).as_bytes()));
+    let headers = [
+        reply(3, &gs(sqrt)),
+        reply(4, &format!("{:064x}", 77_000u64)),
+        reply(5, &word_i(1)),
+        reply(6, &word_i(-887_272)),
+        reply(7, &word_i(887_272)),
+        reply(8, &gs(sqrt + 1)),
+    ];
+    let links = [reply(9, &marker), reply(10, &marker)];
+    let a: String = addr.iter().map(|b| format!("{b:02x}")).collect();
+    let swap = frame(format!(
+        r#"{{"jsonrpc":"2.0","method":"eth_subscription","params":{{"subscription":"0x1111478923ff08bf67fde6c640131500","result":{{"address":"0x{a}","topics":["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67","0x{z}","0x{z}"],"data":"0x{d0}{d1}{d2:064x}{d3:064x}{d4}","blockNumber":"0x{b:x}","logIndex":"0x1","removed":false}}}}}}"#,
+        z = "0".repeat(64), d0 = word_i(12_345), d1 = word_i(-6_789), d2 = sqrt, d3 = 77_000u64, d4 = word_i(-297_448), b = B + 1
+    ).as_bytes());
+
+    transport.inject_incoming(&session);
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let _ = transport.drain_outgoing(&mut sink);
+    transport.inject_incoming(&setup);
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let _ = transport.drain_outgoing(&mut sink);
+    let mut k = 0;
+    while k < headers.len() {
+        transport.inject_incoming(&headers[k]);
+        k += 1;
+    }
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let _ = transport.drain_outgoing(&mut sink);
+    transport.inject_incoming(&links[0]);
+    transport.inject_incoming(&links[1]);
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let live = driver.phase() == hwl::Phase::Live;
+    let mut acc: u64 = 0;
+    while let Some(s) = cons.try_pop() {
+        acc = acc.wrapping_add(s.payload[0] as u64);
+    }
+    let mut n = 0u32;
+    while n < 1_000 {
+        transport.inject_incoming(&swap);
+        hwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
+        while let Some(s) = cons.try_pop() {
+            acc = acc.wrapping_add(s.payload[0] as u64);
+        }
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(live, "the session must reach Live inside the window");
+    assert_eq!(
+        acc,
+        0x27 + 0x11 + 1000 * (0x02 + 0x01),
+        "one snapshot (Algebra SNAPSHOT + snapshot STATE), then SWAP + STATE per push"
+    );
+    assert_eq!(driver.snapshot_counters().pools_ok, 1);
+    assert_eq!(
+        allocs, 0,
+        "hyperevm session allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hyperevm hot bytes should be zero: saw {bytes}");
+}
