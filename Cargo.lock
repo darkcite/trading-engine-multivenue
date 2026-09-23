@@ -1305,6 +1305,14 @@ name = "pine-ir"
 version = "0.1.0"
 
 [[package]]
+name = "pine-vm"
+version = "0.1.0"
+dependencies = [
+ "pine-ir",
+ "pine-vm",
+]
+
+[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

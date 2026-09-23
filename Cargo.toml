@@ -54,6 +54,7 @@ members = [
 
     # --- pine execution (PVM lane) ---
     "crates/pine-ir",
+    "crates/pine-vm",
 
     # --- execution ---
     "crates/clob-dispatcher",
@@ -190,6 +191,7 @@ strategy-xsd          = { path = "crates/strategy-xsd" }
 
 # --- pine execution (PVM lane) ---
 pine-ir = { path = "crates/pine-ir" }
+pine-vm = { path = "crates/pine-vm" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }

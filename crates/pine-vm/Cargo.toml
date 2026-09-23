@@ -1,0 +1,25 @@
+[package]
+name         = "pine-vm"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PVM-3: the verifier, the per-evaluation Frame with the D16 byte-range journal, the bytecode interpreter and the builtin ABI (contract v4 section 3.7-3.11). Depends on pine-ir only; zero allocation after VmInstance::new."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# The hand-assembly builder, an aligned arena, a null BarCtx and a stub builtin table,
+# for pine-vm's own tests and crates/bench. Off by default; no host enables it.
+testkit = []
+
+[dependencies]
+# pine-ir only, by contract (00-INDEX v4 section 2): the builtin table reaches the VM at verify().
+pine-ir = { workspace = true }
+
+[dev-dependencies]
+# Integration tests need the testkit feature of this very crate.
+pine-vm = { path = ".", features = ["testkit"] }

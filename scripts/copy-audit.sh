@@ -58,7 +58,7 @@ fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
            crates/clob-dispatcher crates/core-net \
-           crates/pine-ir
+           crates/pine-ir crates/pine-vm
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its
