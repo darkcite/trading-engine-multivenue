@@ -3,8 +3,9 @@
 """bin15.toml's lookup tables — the BIN15 pricer's fitted data (O4b).
 
 ``crates/strategy-bin15/src/price.rs`` is pure integer arithmetic over
-three tables it never computes: ``phi_lut`` (the standard normal CDF)
-and ``recal_early`` / ``recal_mid`` / ``recal_late`` (the walk-forward
+three tables it never computes: ``phi_lut`` (the price map ``p(d)``:
+the standard normal CDF, or a Student-t on request) and
+``recal_early`` / ``recal_mid`` / ``recal_late`` (the walk-forward
 recalibration of the raw lognormal price, one table per time-to-expiry
 phase). The tables are DATA, so they live in the artifact the operator
 re-cuts without a rebuild, and this module is what cuts them.
@@ -21,6 +22,17 @@ to be: the spec states every number the tables require.
   touches it, so the table is bit-identical on every host — which
   matters, because the engine hashes these BYTES and the boot tell names
   the hash.
+* **A Student-t map (DISTX, 2026-09-23)** replaces Φ on request:
+  ``--phi student-t --phi-nu NU --phi-s S`` cuts ``p(d) = T_nu(k d)``
+  with ``k = s sqrt(nu / (nu - 2))`` — unit variance at ``s = 1``, so
+  ``s`` is the map's scale against Φ's. ``T_nu`` is computed in
+  :mod:`decimal` too (the regularised incomplete beta by Lentz's
+  continued fraction, ``ln Gamma`` by Stirling's series with exact
+  Bernoulli fractions), so its table is as bit-identical as Φ's. ``nu``
+  and ``s`` ARE a fit: they arrive as ARGUMENTS (decimal strings, never
+  floats) and no fitted value is a default in this module — research
+  never enters git. A fat-tailed map ends well short of Φ's 999_979 at
+  the clamp; the grammar's floor is :data:`PHI_LAST_MIN_1E6`.
 * The recalibration is the fitted part, and the fit is three numbers:
   the slopes (early / mid / late). The table is that slope through the
   middle of the unit interval, with the ENDPOINTS pinned and every
@@ -35,16 +47,21 @@ to be: the spec states every number the tables require.
   re-fit off the accumulated calibration ledger exists. See
   :data:`SLOPE_EARLY_MILLI`.
 * ``scale_1e9`` is the stated variance-ratio scale, **0.98**.
-* ``hour_ln_off_1e9`` is OMITTED. The parser's law is "absent optional =
-  bit-identical to the stated default", and the stated default is zero,
-  so an artifact that carries 24 zeros and one that carries nothing are
-  the same member — but only the second one is honest about not having
-  an hour-of-day fit yet.
+* ``hour_ln_off_1e9`` is OMITTED unless ``--hour-ln-off-1e9`` gives
+  one. The parser's law is "absent optional = bit-identical to the
+  stated default", and the stated default is zero, so an artifact that
+  carries 24 zeros and one that carries nothing are the same member —
+  but only the second one is honest about not having an hour-of-day
+  fit. A table that IS given is a fit like ``nu`` and ``s``: 24
+  integers, one per UTC hour, each an offset on ``ln sigma-hat`` x1e9
+  within ln 2 (:data:`HOUR_LN_OFF_ABS_MAX_1E9`), rendered on the line
+  after ``scale_1e9``.
 
 Re-fitting later is an artifact edit and a restart, never a code
 change: pass ``--slope-early`` / ``--slope-mid`` / ``--slope-late``
-(milli-units, so 1020 is 1.020; the bound is 1032) and
-``--scale-1e9``.
+(milli-units, so 1020 is 1.020; the bound is 1032), ``--scale-1e9``,
+``--phi student-t --phi-nu NU --phi-s S`` and
+``--hour-ln-off-1e9 H0,...,H23`` — to either lane.
 
 **The one-line law.** ``core_config::icdp::parse_value`` — which
 ``core_config::bin15`` reuses — reads an array by stripping ``[`` and
@@ -67,6 +84,9 @@ Convention: full ``import x`` only. No ``from x import y``.
 
 import argparse
 import decimal
+import fractions
+import functools
+import math
 import pathlib
 import sys
 import typing
@@ -126,6 +146,61 @@ PI_STR: str = "3.14159265358979323846264338327950288419716939937510582097494"
 #: converges by ~60 terms at the widest ``d``; the cap only exists so a
 #: mis-edit cannot spin.
 _MAX_TERMS: int = 400
+
+#: The smallest ``phi_lut[4096]`` the grammar admits, x1e6: the price
+#: map's value at the clamp ``|d| = 4.096``. Mirrors
+#: ``core_config::bin15::PHI_LAST_MIN_1E6`` — a test reads the Rust
+#: source to keep the two equal. The floor refuses a table that is not a
+#: CDF running out to near-certainty (a truncated cut, a slipped scale);
+#: it is not a statement about the tail.
+PHI_LAST_MIN_1E6: int = 980_000
+
+#: ``phi_lut[0]``: every map is symmetric about ``d = 0``, so the grammar
+#: pins its first point at exactly one half, x1e6.
+_PHI_FIRST_1E6: int = 500_000
+
+#: One, x1e6 — the ceiling of every probability table.
+_UNIT_1E6: int = 1_000_000
+
+#: The ``--phi`` kinds. ``normal`` is Φ and the default.
+PHI_NORMAL: str = "normal"
+PHI_STUDENT_T: str = "student-t"
+PHI_KINDS: tuple[str, ...] = (PHI_NORMAL, PHI_STUDENT_T)
+
+#: A t's variance exists only above two degrees of freedom, and ``k``
+#: normalises by it, so a table needs ``nu`` over this.
+_T_NU_MIN: int = 2
+
+#: ``ln Gamma`` runs Stirling's series at arguments of at least this; a
+#: smaller one is shifted up by ``Gamma(z + 1) = z Gamma(z)`` first. At 50
+#: the first omitted term of the 30-term series is under 1e-70.
+_STIRLING_MIN: int = 50
+
+#: Terms of Stirling's series: ``B_2`` through ``B_60``.
+_STIRLING_TERMS: int = 30
+
+#: Iterations of the incomplete-beta continued fraction to allow. It
+#: needs about 50 at the DISTX shape and about 600 at ``nu = 1e7``; the
+#: cap only exists so a mis-edit cannot spin.
+_MAX_CF_ITERS: int = 50_000
+
+#: The continued fraction's convergence bar, and the floor Lentz's method
+#: lifts a vanishing denominator to.
+_CF_EPS: decimal.Decimal = decimal.Decimal(10) ** -(PRECISION - 10)
+_CF_TINY: decimal.Decimal = decimal.Decimal(10) ** -(4 * PRECISION)
+
+#: Hours in ``hour_ln_off_1e9``. Mirrors ``core_config::bin15::HOURS``.
+HOURS: int = 24
+
+#: The fitter's own bound on one hour offset, x1e9: ln 2. An offset past
+#: it halves or doubles sigma-hat for its hour, which is a different
+#: forecast, not an hour-of-day correction to this one. (The grammar
+#: reads any 24 integers; this guard is the fitter's.)
+HOUR_LN_OFF_ABS_MAX_1E9: int = 693_147_181
+
+#: A fit parameter: a decimal string, an exact ``Decimal`` or an int —
+#: never a float, which has already rounded the number the fit made.
+DecimalLike: typing.TypeAlias = decimal.Decimal | str | int
 
 #: The spec's stated operator knobs (§6.3). Order is the order the
 #: artifact is written in, which is the order the spec lists them.
@@ -262,7 +337,8 @@ def phi_table_1e6() -> tuple[int, ...]:
 
     Monotone non-decreasing by construction (Φ is strictly increasing
     and the rounding is monotone), ``[0] == 500_000`` exactly, and
-    ``[4096] == 999_979`` — comfortably over the parser's 999_900 floor.
+    ``[4096] == 999_979`` — comfortably over the grammar's floor,
+    :data:`PHI_LAST_MIN_1E6`.
     """
     with decimal.localcontext() as ctx:
         ctx.prec = PRECISION
@@ -282,6 +358,274 @@ def phi_table_1e6() -> tuple[int, ...]:
             out.append(whole + 1 if frac >= half else whole)
             i += 1
     return tuple(out)
+
+
+@functools.lru_cache(maxsize=1)
+def _bernoulli_even() -> tuple[fractions.Fraction, ...]:
+    """``B_2, B_4, ..., B_60`` as exact fractions, for Stirling's series.
+
+    From the defining recurrence ``sum_{j=0..m} C(m+1, j) B_j = 0``, in
+    :class:`fractions.Fraction`, so not one digit of a coefficient is
+    transcribed by hand.
+    """
+    top = 2 * _STIRLING_TERMS
+    b: list[fractions.Fraction] = [fractions.Fraction(1)]
+    m = 1
+    while m <= top:
+        acc = fractions.Fraction(0)
+        j = 0
+        while j < m:
+            acc += math.comb(m + 1, j) * b[j]
+            j += 1
+        b.append(-acc / (m + 1))
+        m += 1
+    return tuple(b[2 * k] for k in range(1, _STIRLING_TERMS + 1))
+
+
+def _ln_gamma(z: decimal.Decimal) -> decimal.Decimal:
+    """``ln Gamma(z)`` for ``z > 0``, in the CALLER's :mod:`decimal` context.
+
+    Stirling's series ``(w - 1/2) ln w - w + ln(2 pi) / 2 + sum_k B_2k /
+    (2k (2k - 1) w^(2k-1))`` at ``w = z + n >=`` :data:`_STIRLING_MIN`,
+    brought back down the recurrence: ``ln Gamma(z) = ln Gamma(w) -
+    ln(z (z + 1) ... (w - 1))``.
+    """
+    if z <= 0:
+        raise ValueError(f"ln_gamma here is for z > 0, got {z}")
+    w = z
+    shift = decimal.Decimal(1)
+    while w < _STIRLING_MIN:
+        shift *= w
+        w += 1
+    half = decimal.Decimal(1) / 2
+    total = (w - half) * w.ln() - w + half * (2 * decimal.Decimal(PI_STR)).ln()
+    w2 = w * w
+    power = w
+    coeffs = _bernoulli_even()
+    k = 1
+    while k <= _STIRLING_TERMS:
+        b = coeffs[k - 1]
+        total += decimal.Decimal(b.numerator) / (
+            decimal.Decimal(b.denominator) * (2 * k) * (2 * k - 1) * power
+        )
+        power *= w2
+        k += 1
+    return total - shift.ln()
+
+
+def _beta_cf(a: decimal.Decimal, b: decimal.Decimal, x: decimal.Decimal) -> decimal.Decimal:
+    """The continued fraction of ``I_x(a, b)``, by the modified Lentz method.
+
+    It converges fast for ``x < (a + 1) / (a + b + 2)``, and
+    :func:`_inc_beta` swaps to the other side past that, so this never
+    sees a slow ``x``.
+    """
+    one = decimal.Decimal(1)
+    qab = a + b
+    qap = a + one
+    qam = a - one
+    c = one
+    d = one - qab * x / qap
+    if abs(d) < _CF_TINY:
+        d = _CF_TINY
+    d = one / d
+    h = d
+    m = 1
+    while m <= _MAX_CF_ITERS:
+        m2 = 2 * m
+        # The even step of the fraction ...
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = one + aa * d
+        if abs(d) < _CF_TINY:
+            d = _CF_TINY
+        c = one + aa / c
+        if abs(c) < _CF_TINY:
+            c = _CF_TINY
+        d = one / d
+        h *= d * c
+        # ... and the odd one.
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = one + aa * d
+        if abs(d) < _CF_TINY:
+            d = _CF_TINY
+        c = one + aa / c
+        if abs(c) < _CF_TINY:
+            c = _CF_TINY
+        d = one / d
+        delta = d * c
+        h *= delta
+        if abs(delta - one) < _CF_EPS:
+            return h
+        m += 1
+    raise ArithmeticError(  # pragma: no cover - the cap is a guard, not a path
+        f"I_x(a, b) did not converge in {_MAX_CF_ITERS} iterations (a={a} b={b} x={x})"
+    )
+
+
+def _inc_beta(
+    a: decimal.Decimal,
+    b: decimal.Decimal,
+    x: decimal.Decimal,
+    y: decimal.Decimal,
+    ln_beta: decimal.Decimal,
+) -> decimal.Decimal:
+    """The regularised incomplete beta ``I_x(a, b)``.
+
+    ``y = 1 - x`` arrives EXACT rather than recomputed — near ``x = 1`` it
+    is the small one, and ``1 - x`` would cancel its digits away — and
+    ``ln_beta = ln B(a, b)`` arrives precomputed. Past the continued
+    fraction's fast region the symmetry ``I_x(a, b) = 1 - I_y(b, a)``
+    takes over.
+    """
+    if x <= 0:
+        return decimal.Decimal(0)
+    if y <= 0:
+        return decimal.Decimal(1)
+    front = (a * x.ln() + b * y.ln() - ln_beta).exp()
+    if x < (a + 1) / (a + b + 2):
+        return front * _beta_cf(a, b, x) / a
+    return 1 - front * _beta_cf(b, a, y) / b
+
+
+@functools.lru_cache(maxsize=8)
+def _ln_beta_half(nu: decimal.Decimal) -> decimal.Decimal:
+    """``ln B(nu / 2, 1 / 2)`` at :data:`PRECISION`.
+
+    Every point of one table shares it, so it is computed once per
+    ``nu`` — in its own context, so the cache can never hand back a value
+    cut at a different precision.
+    """
+    with decimal.localcontext() as ctx:
+        ctx.prec = PRECISION
+        ctx.rounding = decimal.ROUND_HALF_EVEN
+        half = decimal.Decimal(1) / 2
+        a = nu / 2
+        return _ln_gamma(a) + _ln_gamma(half) - _ln_gamma(a + half)
+
+
+def _t_cdf(nu: decimal.Decimal, x: decimal.Decimal, ln_beta: decimal.Decimal) -> decimal.Decimal:
+    """``T_nu(x) = 1 - I_z(nu / 2, 1 / 2) / 2`` with ``z = nu / (nu + x^2)``, ``x >= 0``."""
+    half = decimal.Decimal(1) / 2
+    if x == 0:
+        return half
+    x2 = x * x
+    den = nu + x2
+    return 1 - _inc_beta(nu / 2, half, nu / den, x2 / den, ln_beta) * half
+
+
+def _decimal_param(name: str, value: DecimalLike) -> decimal.Decimal:
+    """A fit parameter as an exact :class:`decimal.Decimal`.
+
+    A float is REFUSED rather than converted: it has already rounded the
+    number the fit produced, and a table must not depend on which binary
+    neighbour that rounding picked.
+    """
+    if isinstance(value, bool) or not isinstance(value, decimal.Decimal | str | int):
+        raise TypeError(
+            f"{name} must be a decimal string, a decimal.Decimal or an int, "
+            f"never {type(value).__name__}"
+        )
+    try:
+        out = decimal.Decimal(value)
+    except decimal.InvalidOperation as exc:
+        raise ValueError(f"{name} is not a decimal number: {value!r}") from exc
+    if not out.is_finite():
+        raise ValueError(f"{name} must be finite, got {out}")
+    return out
+
+
+def student_t_cdf(nu: DecimalLike, x: DecimalLike) -> decimal.Decimal:
+    """Student's t CDF ``T_nu(x)``, for ``x >= 0`` and any ``nu > 0``.
+
+    In :mod:`decimal` at :data:`PRECISION`, like Φ. Exposed so the tests
+    can hold the function itself to closed forms — ``T_2(x) = 1/2 +
+    x / (2 sqrt(2 + x^2))`` — at a ``nu`` the table builder refuses.
+    """
+    nu_d = _decimal_param("nu", nu)
+    x_d = _decimal_param("x", x)
+    if nu_d <= 0:
+        raise ValueError(f"nu must be positive, got {nu_d}")
+    if x_d < 0:
+        raise ValueError("T_nu here is the non-negative half only")
+    with decimal.localcontext() as ctx:
+        ctx.prec = PRECISION
+        ctx.rounding = decimal.ROUND_HALF_EVEN
+        return _t_cdf(nu_d, x_d, _ln_beta_half(nu_d))
+
+
+def validate_phi_lut(table: typing.Sequence[int], what: str = "phi_lut") -> None:
+    """Refuse, HERE, a ``phi_lut`` the grammar would refuse at boot.
+
+    ``core_config::bin15`` wants exactly :data:`PHI_POINTS` values in
+    ``0..=1_000_000``, ``[0] == 500_000``, a monotone table (a dip makes
+    the fair value non-monotone in the mark) and ``[4096] >=``
+    :data:`PHI_LAST_MIN_1E6`. An artifact that fails any of them is a
+    boot refusal in the engine's KeepAlive loop; the fitter says so first.
+    """
+    n = len(table)
+    if n != PHI_POINTS:
+        raise ValueError(f"{what}: {n} points, the grammar wants {PHI_POINTS}")
+    if table[0] != _PHI_FIRST_1E6:
+        raise ValueError(f"{what}: [0] = {table[0]}, the grammar wants {_PHI_FIRST_1E6}")
+    i = 0
+    while i < n:
+        v = table[i]
+        if not 0 <= v <= _UNIT_1E6:
+            raise ValueError(f"{what}: [{i}] = {v} is outside 0..={_UNIT_1E6}")
+        if i > 0 and v < table[i - 1]:
+            raise ValueError(f"{what}: not monotone at [{i}]: {table[i - 1]} then {v}")
+        i += 1
+    if table[-1] < PHI_LAST_MIN_1E6:
+        raise ValueError(
+            f"{what}: [{n - 1}] = {table[-1]} is under the grammar's floor "
+            f"{PHI_LAST_MIN_1E6} (core_config::bin15::PHI_LAST_MIN_1E6) - the "
+            "engine would refuse this artifact at boot"
+        )
+
+
+def student_t_table_1e6(nu: DecimalLike, s: DecimalLike) -> tuple[int, ...]:
+    """``T_nu(k d) x1e6`` for ``d = 0, 0.001, ..., 4.096``, ``k = s sqrt(nu / (nu - 2))``.
+
+    Rounded EXACTLY as :func:`phi_table_1e6` rounds: the integral part,
+    and one more when the remainder is at least one half. Refused: ``nu``
+    at or under 2 (``k`` normalises by the variance, which exists only
+    above it), ``s`` at or under 0, a float for either, and a table the
+    grammar would refuse (:func:`validate_phi_lut`).
+    """
+    nu_d = _decimal_param("nu", nu)
+    s_d = _decimal_param("s", s)
+    if nu_d <= _T_NU_MIN:
+        raise ValueError(
+            f"nu must be over {_T_NU_MIN}, got {nu_d}: k = s sqrt(nu/(nu-2)) needs "
+            "the t's variance, which exists only above two degrees of freedom"
+        )
+    if s_d <= 0:
+        raise ValueError(f"s must be positive, got {s_d}")
+    return _student_t_table(nu_d, s_d)
+
+
+@functools.lru_cache(maxsize=8)
+def _student_t_table(nu: decimal.Decimal, s: decimal.Decimal) -> tuple[int, ...]:
+    """The table itself — cached, because a CLI run renders it and then
+    reports its endpoints."""
+    with decimal.localcontext() as ctx:
+        ctx.prec = PRECISION
+        ctx.rounding = decimal.ROUND_HALF_EVEN
+        half = decimal.Decimal(1) / 2
+        ln_beta = _ln_beta_half(nu)
+        k = s * (nu / (nu - 2)).sqrt()
+        out: list[int] = []
+        i = 0
+        while i < PHI_POINTS:
+            d = decimal.Decimal(i * PHI_STEP_1E6) / 1_000_000
+            scaled = _t_cdf(nu, k * d, ln_beta) * 1_000_000
+            whole = int(scaled)
+            frac = scaled - whole
+            out.append(whole + 1 if frac >= half else whole)
+            i += 1
+    table = tuple(out)
+    validate_phi_lut(table, f"student-t nu={nu} s={s}")
+    return table
 
 
 def recal_table_1e6(slope_milli: int) -> tuple[int, ...]:
@@ -344,21 +688,76 @@ def _strs(key: str, values: typing.Sequence[str]) -> str:
     return f"{key} = [{', '.join(chr(34) + v + chr(34) for v in values)}]\n"
 
 
-def render_tables(
+def hour_table_1e9(values: typing.Sequence[int]) -> tuple[int, ...]:
+    """An ``hour_ln_off_1e9`` table, checked: exactly :data:`HOURS` ints,
+    each within :data:`HOUR_LN_OFF_ABS_MAX_1E9` of zero."""
+    out = tuple(values)
+    if len(out) != HOURS:
+        raise ValueError(f"hour_ln_off_1e9 must carry exactly {HOURS} integers (got {len(out)})")
+    h = 0
+    while h < HOURS:
+        v = out[h]
+        if type(v) is not int:
+            raise TypeError(f"hour_ln_off_1e9[{h}] must be an int, got {type(v).__name__}")
+        if abs(v) > HOUR_LN_OFF_ABS_MAX_1E9:
+            raise ValueError(
+                f"hour_ln_off_1e9[{h}] = {v} is past ln 2 x1e9 ({HOUR_LN_OFF_ABS_MAX_1E9}): "
+                "an offset that halves or doubles sigma-hat is a different forecast, not "
+                "an hour-of-day correction"
+            )
+        h += 1
+    return out
+
+
+def phi_lut_1e6(
+    phi: str = PHI_NORMAL,
+    phi_nu: DecimalLike | None = None,
+    phi_s: DecimalLike | None = None,
+) -> tuple[int, ...]:
+    """The ``phi_lut`` of the asked-for price map.
+
+    ``normal`` is Φ and takes no parameters: a ``nu`` or ``s`` that would
+    be silently ignored is a fit nobody gets, so it is refused.
+    ``student-t`` needs both.
+    """
+    if phi == PHI_NORMAL:
+        if phi_nu is not None or phi_s is not None:
+            raise ValueError("phi 'normal' takes no nu or s: Phi has no parameters")
+        return phi_table_1e6()
+    if phi == PHI_STUDENT_T:
+        if phi_nu is None or phi_s is None:
+            raise ValueError("phi 'student-t' needs both nu and s")
+        return student_t_table_1e6(phi_nu, phi_s)
+    raise ValueError(f"phi must be one of {', '.join(PHI_KINDS)}, got {phi!r}")
+
+
+def render_tables(  # noqa: PLR0913 — the four knobs, then the four fit arguments
     slope_early: int = SLOPE_EARLY_MILLI,
     slope_mid: int = SLOPE_MID_MILLI,
     slope_late: int = SLOPE_LATE_MILLI,
     scale_1e9: int = SCALE_1E9_DEFAULT,
+    *,
+    phi: str = PHI_NORMAL,
+    phi_nu: DecimalLike | None = None,
+    phi_s: DecimalLike | None = None,
+    hour_ln_off_1e9: typing.Sequence[int] | None = None,
 ) -> str:
-    """The generated key lines only, in artifact order."""
-    phi = phi_table_1e6()
-    return (
-        _line("phi_lut", phi)
+    """The generated key lines only, in artifact order.
+
+    With the defaults these are today's bytes (Φ, no hour table). An hour
+    table, when given, is the LAST line: the one after ``scale_1e9``.
+    """
+    hours = None if hour_ln_off_1e9 is None else hour_table_1e9(hour_ln_off_1e9)
+    text = (
+        _line("phi_lut", phi_lut_1e6(phi, phi_nu, phi_s))
         + _line("recal_early", recal_table_1e6(slope_early))
         + _line("recal_mid", recal_table_1e6(slope_mid))
         + _line("recal_late", recal_table_1e6(slope_late))
         + f"scale_1e9       = {scale_1e9}\n"
     )
+    if hours is not None:
+        text += _line("hour_ln_off_1e9", hours)
+    return text
 
 
 def render_artifact(
@@ -368,13 +767,54 @@ def render_artifact(
     slope_mid: int = SLOPE_MID_MILLI,
     slope_late: int = SLOPE_LATE_MILLI,
     scale_1e9: int = SCALE_1E9_DEFAULT,
+    *,
+    phi: str = PHI_NORMAL,
+    phi_nu: DecimalLike | None = None,
+    phi_s: DecimalLike | None = None,
+    hour_ln_off_1e9: typing.Sequence[int] | None = None,
 ) -> str:
     """A complete ``bin15.toml``.
 
     Every key the grammar requires, the operator knobs at the spec's
     stated values, and the generated tables. What this writes parses:
-    ``core_config::bin15::parse`` accepts it and every bound holds.
+    ``core_config::bin15::parse`` accepts it and every bound holds. The
+    header moves only where a fit flag was given — the hour paragraph
+    with an hour table, the Φ line with a t — so the defaults write
+    today's bytes.
     """
+    tables = render_tables(
+        slope_early,
+        slope_mid,
+        slope_late,
+        scale_1e9,
+        phi=phi,
+        phi_nu=phi_nu,
+        phi_s=phi_s,
+        hour_ln_off_1e9=hour_ln_off_1e9,
+    )
+    if hour_ln_off_1e9 is None:
+        hour_note = (
+            "# `hour_ln_off_1e9` is ABSENT on purpose: absent means zero, which is\n"
+            "# bit-identical to no hour-of-day correction, and there is no fit for one\n"
+            "# yet. 24 zeros would say the same thing less honestly.\n"
+        )
+    else:
+        hour_note = (
+            "# `hour_ln_off_1e9` is an hour-of-day table: per UTC hour, an offset on\n"
+            "# ln(sigma-hat), x1e9. Its 24 values are a FIT, passed to the fitter as\n"
+            "# an argument (`--hour-ln-off-1e9`); the fitter keeps none of them.\n"
+        )
+    if phi == PHI_NORMAL:
+        phi_note = "# Phi is computed exactly in `decimal`, not fitted.\n"
+    else:
+        nu = _decimal_param("nu", typing.cast(DecimalLike, phi_nu))
+        s = _decimal_param("s", typing.cast(DecimalLike, phi_s))
+        phi_note = (
+            "# phi_lut is the Student-t map p(d) = T_nu(k d), k = s sqrt(nu/(nu-2)),\n"
+            f"# nu = {nu}, s = {s}. Both are a FIT, passed to the fitter as\n"
+            "# arguments (`--phi-nu`, `--phi-s`); T_nu itself is computed exactly\n"
+            "# in `decimal`.\n"
+        )
     head = (
         "# bin15.toml - the BIN15 member's artifact (slot 3).\n"
         "#\n"
@@ -393,19 +833,36 @@ def render_artifact(
         "# indexes families by the ingress's own index and a permuted list would\n"
         "# price one family's book against another's forecast.\n"
         "#\n"
-        "# `hour_ln_off_1e9` is ABSENT on purpose: absent means zero, which is\n"
-        "# bit-identical to no hour-of-day correction, and there is no fit for one\n"
-        "# yet. 24 zeros would say the same thing less honestly.\n"
-        "#\n"
-        f"# Recalibration slopes (milli-units): early {slope_early} mid {slope_mid}"
+        + hour_note
+        + "#\n"
+        + f"# Recalibration slopes (milli-units): early {slope_early} mid {slope_mid}"
         f" late {slope_late}.\n"
-        "# Phi is computed exactly in `decimal`, not fitted.\n"
-        "[bin15]\n"
+        + phi_note
+        + "[bin15]\n"
     )
     body = _strs("families", families) + _strs("underlying", underlying)
     for key, value in KNOBS:
         body += f"{key:<15} = {value}\n"
-    return head + body + render_tables(slope_early, slope_mid, slope_late, scale_1e9)
+    return head + body + tables
+
+
+def _decimal_arg(text: str) -> decimal.Decimal:
+    """``--phi-nu`` / ``--phi-s``: a decimal STRING, parsed exactly."""
+    try:
+        value = decimal.Decimal(text)
+    except decimal.InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"not a decimal number: {text!r}") from exc
+    if not value.is_finite():
+        raise argparse.ArgumentTypeError(f"not a finite number: {text!r}")
+    return value
+
+
+def _hour_arg(text: str) -> tuple[int, ...]:
+    """``--hour-ln-off-1e9``: 24 comma-separated integers, checked."""
+    try:
+        return hour_table_1e9(tuple(int(part) for part in text.split(",")))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _add_fit_args(ap: argparse.ArgumentParser) -> None:
@@ -413,6 +870,32 @@ def _add_fit_args(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--slope-mid", type=int, default=SLOPE_MID_MILLI)
     ap.add_argument("--slope-late", type=int, default=SLOPE_LATE_MILLI)
     ap.add_argument("--scale-1e9", type=int, default=SCALE_1E9_DEFAULT, dest="scale_1e9")
+    ap.add_argument(
+        "--phi",
+        choices=PHI_KINDS,
+        default=PHI_NORMAL,
+        help="the price map: Phi (the default) or a Student-t T_nu(k d)",
+    )
+    ap.add_argument(
+        "--phi-nu",
+        type=_decimal_arg,
+        default=None,
+        help="the t's degrees of freedom (over 2), as a decimal string",
+    )
+    ap.add_argument(
+        "--phi-s",
+        type=_decimal_arg,
+        default=None,
+        help="the t's scale against unit variance (over 0), as a decimal string",
+    )
+    ap.add_argument(
+        "--hour-ln-off-1e9",
+        type=_hour_arg,
+        default=None,
+        dest="hour_ln_off_1e9",
+        help="24 comma-separated ln(sigma-hat) offsets x1e9, one per UTC hour; "
+        "write --hour-ln-off-1e9=... when the first one is negative",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -431,8 +914,22 @@ def main(argv: list[str] | None = None) -> int:
     _add_fit_args(art)
 
     args = ap.parse_args(argv)
+    lane = tab if args.lane == "tables" else art
+    if args.phi == PHI_STUDENT_T and (args.phi_nu is None or args.phi_s is None):
+        lane.error("--phi student-t needs both --phi-nu and --phi-s")
+    if args.phi == PHI_NORMAL and (args.phi_nu is not None or args.phi_s is not None):
+        lane.error("--phi-nu and --phi-s shape a Student-t map: pass --phi student-t")
     if args.lane == "tables":
-        text = render_tables(args.slope_early, args.slope_mid, args.slope_late, args.scale_1e9)
+        text = render_tables(
+            args.slope_early,
+            args.slope_mid,
+            args.slope_late,
+            args.scale_1e9,
+            phi=args.phi,
+            phi_nu=args.phi_nu,
+            phi_s=args.phi_s,
+            hour_ln_off_1e9=args.hour_ln_off_1e9,
+        )
     else:
         text = render_artifact(
             args.families,
@@ -441,6 +938,10 @@ def main(argv: list[str] | None = None) -> int:
             args.slope_mid,
             args.slope_late,
             args.scale_1e9,
+            phi=args.phi,
+            phi_nu=args.phi_nu,
+            phi_s=args.phi_s,
+            hour_ln_off_1e9=args.hour_ln_off_1e9,
         )
     if getattr(args, "out", None) is None:
         sys.stdout.write(text)
@@ -449,10 +950,13 @@ def main(argv: list[str] | None = None) -> int:
     tmp = out.with_suffix(out.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(out)
-    phi = phi_table_1e6()
+    phi = phi_lut_1e6(args.phi, args.phi_nu, args.phi_s)
+    kind = args.phi if args.phi == PHI_NORMAL else f"{args.phi} nu {args.phi_nu} s {args.phi_s}"
+    hours = "none" if args.hour_ln_off_1e9 is None else str(HOURS)
     print(
-        f"bin15-fit: {args.lane} -> {out} (phi {len(phi)} pts "
-        f"[{phi[0]}..{phi[-1]}] recal 3 x {RECAL_POINTS} scale {args.scale_1e9})",
+        f"bin15-fit: {args.lane} -> {out} (phi {kind} {len(phi)} pts "
+        f"[{phi[0]}..{phi[-1]}] recal 3 x {RECAL_POINTS} scale {args.scale_1e9} "
+        f"hours {hours})",
         file=sys.stderr,
     )
     return 0

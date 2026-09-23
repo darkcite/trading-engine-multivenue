@@ -13,7 +13,9 @@ reproduce the artifact the engine hashes.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import decimal
 import pathlib
+import re
 
 import pytest
 
@@ -45,7 +47,7 @@ def test_phi_is_monotone_and_inside_the_parsers_bounds() -> None:
     assert min(phi) >= 0 and max(phi) <= 1_000_000
     # `core_config::bin15::table` demands exactly these two.
     assert phi[0] == 500_000
-    assert phi[-1] >= 999_900
+    assert phi[-1] >= claude_worker.bin15_fit.PHI_LAST_MIN_1E6
 
 
 def test_phi_is_strictly_increasing_where_the_cdf_still_moves() -> None:
@@ -214,3 +216,280 @@ def test_the_cli_writes_an_artifact_atomically(tmp_path: pathlib.Path) -> None:
     text = out.read_text(encoding="utf-8")
     assert "scale_1e9       = 1000000000" in text
     assert text != claude_worker.bin15_fit.render_artifact()
+
+
+# --- DISTX (2026-09-23): the Student-t price map and the hour table ------
+#
+# Every number below is a NON-research value (nu 2 / 3 / 4 / 1e7, s 1 or
+# 0.3, round hour offsets). The fitted DISTX parameters are research, and
+# research never enters git; the acceptance against the operator's draft
+# is a vault one-shot.
+
+#: 24 round offsets of both signs, the first and the last ON the fitter's
+#: ln 2 bound (so the bound is inclusive, and the CLI spelling for a table
+#: that starts negative is exercised).
+_HOURS: tuple[int, ...] = (
+    -claude_worker.bin15_fit.HOUR_LN_OFF_ABS_MAX_1E9,
+    *(h * 10_000_000 for h in range(-11, 11)),
+    claude_worker.bin15_fit.HOUR_LN_OFF_ABS_MAX_1E9,
+)
+_HOURS_ARG: str = ",".join(str(v) for v in _HOURS)
+
+
+def test_the_floor_mirrors_the_grammar() -> None:
+    """``PHI_LAST_MIN_1E6`` is ``core_config::bin15``'s, read off the Rust
+    source. A fitter that let through a table the engine then refuses at
+    boot would hand the operator a KeepAlive refusal loop."""
+    src = (_ROOT / "crates" / "core-config" / "src" / "bin15.rs").read_text(encoding="utf-8")
+    assert "PHI_LAST_MIN_1E6: u32 = 980_000" in src
+    found = re.search(r"pub const PHI_LAST_MIN_1E6: u32 = ([0-9_]+);", src)
+    assert found is not None
+    assert int(found.group(1).replace("_", "")) == claude_worker.bin15_fit.PHI_LAST_MIN_1E6
+
+
+def test_the_t_cdf_is_the_closed_form_at_two_degrees_of_freedom() -> None:
+    """``T_2(x) = 1/2 + x / (2 sqrt(2 + x^2))`` at EVERY grid point.
+
+    nu = 2 is the one the table builder refuses (its ``k`` needs a
+    variance), so this holds the CDF function itself to the closed form.
+    The grid straddles the continued fraction's swap at ``x = sqrt 1.5``.
+    """
+    two = decimal.Decimal(2)
+    worst = decimal.Decimal(0)
+    with decimal.localcontext() as ctx:
+        ctx.prec = claude_worker.bin15_fit.PRECISION
+        for i in range(claude_worker.bin15_fit.PHI_POINTS):
+            x = decimal.Decimal(i) / 1_000
+            want = decimal.Decimal(1) / 2 + x / (2 * (2 + x * x).sqrt())
+            worst = max(worst, abs(claude_worker.bin15_fit.student_t_cdf(two, x) - want))
+    assert worst < decimal.Decimal(10) ** -45, f"worst |T_2 - closed form| = {worst}"
+
+
+def test_the_nu_4_table_is_its_closed_form_through_k() -> None:
+    """At nu = 4 the CDF is ``1/2 + t (t^2 + 6) / (2 (t^2 + 4)^(3/2))``, so
+    the TABLE is checked end to end on a stride of the grid: ``k =
+    sqrt(nu / (nu - 2)) = sqrt 2`` at s = 1, then Phi's own rounding."""
+    table = claude_worker.bin15_fit.student_t_table_1e6("4", "1")
+    with decimal.localcontext() as ctx:
+        ctx.prec = claude_worker.bin15_fit.PRECISION
+        half = decimal.Decimal(1) / 2
+        k = decimal.Decimal(2).sqrt()
+        for i in range(0, claude_worker.bin15_fit.PHI_POINTS, 64):
+            t = k * decimal.Decimal(i) / 1_000
+            t2 = t * t
+            scaled = (half + t * (t2 + 6) / (2 * (t2 + 4) * (t2 + 4).sqrt())) * 1_000_000
+            whole = int(scaled)
+            want = whole + 1 if scaled - whole >= half else whole
+            assert table[i] == want, f"d = {i / 1000}: table {table[i]}, closed form {want}"
+
+
+def test_a_fat_tailed_table_is_monotone_and_over_the_floor() -> None:
+    table = claude_worker.bin15_fit.student_t_table_1e6("4", "1")
+    assert len(table) == claude_worker.bin15_fit.PHI_POINTS
+    assert table[0] == 500_000
+    assert all(table[i + 1] >= table[i] for i in range(len(table) - 1))
+    assert table[-1] >= claude_worker.bin15_fit.PHI_LAST_MIN_1E6
+    # Fatter than Phi: less certain at the clamp than the Gaussian's 999_979.
+    assert table[-1] < claude_worker.bin15_fit.phi_table_1e6()[-1]
+
+
+def test_a_huge_nu_is_phi_to_one_unit_everywhere() -> None:
+    """As nu grows the t becomes the normal: at nu = 1e7 (s = 1, so ``k``
+    is 1 + 1e-7) every point is within one 1e-6 unit of Phi's table."""
+    table = claude_worker.bin15_fit.student_t_table_1e6(10**7, 1)
+    phi = claude_worker.bin15_fit.phi_table_1e6()
+    worst = max(abs(a - b) for a, b in zip(table, phi, strict=True))
+    assert worst <= 1, f"max |t - Phi| = {worst}"
+
+
+@pytest.mark.parametrize(
+    ("nu", "s"),
+    [("2", "1"), ("1.5", "1"), ("0", "1"), ("4", "0"), ("4", "-1")],
+)
+def test_a_t_table_without_a_variance_or_a_scale_is_refused(nu: str, s: str) -> None:
+    with pytest.raises(ValueError, match="must be"):
+        claude_worker.bin15_fit.student_t_table_1e6(nu, s)
+
+
+def test_a_float_parameter_is_refused_not_rounded() -> None:
+    """A float has already rounded the fit; the table must not depend on
+    which binary neighbour it picked."""
+    with pytest.raises(TypeError):
+        claude_worker.bin15_fit.student_t_table_1e6(4.0, "1")
+    with pytest.raises(TypeError):
+        claude_worker.bin15_fit.student_t_table_1e6("4", 1.0)
+    with pytest.raises(ValueError, match="finite"):
+        claude_worker.bin15_fit.student_t_table_1e6("NaN", "1")
+
+
+def test_a_t_table_under_the_grammar_floor_is_refused() -> None:
+    """nu = 3 at 0.3 of the scale ends near 0.94 at the clamp: a table the
+    engine would refuse at boot is refused here first."""
+    with pytest.raises(ValueError, match="under the grammar's floor"):
+        claude_worker.bin15_fit.student_t_table_1e6("3", "0.3")
+
+
+def test_validate_refuses_every_table_the_grammar_refuses() -> None:
+    phi = claude_worker.bin15_fit.phi_table_1e6()
+    claude_worker.bin15_fit.validate_phi_lut(phi)
+    dip = list(phi)
+    dip[100] = dip[99] - 1
+    with pytest.raises(ValueError, match=r"not monotone at \[100\]"):
+        claude_worker.bin15_fit.validate_phi_lut(dip)
+    with pytest.raises(ValueError, match="points"):
+        claude_worker.bin15_fit.validate_phi_lut(phi[:-1])
+    with pytest.raises(ValueError, match=r"\[0\] = 499999"):
+        claude_worker.bin15_fit.validate_phi_lut((499_999, *phi[1:]))
+    with pytest.raises(ValueError, match="outside"):
+        claude_worker.bin15_fit.validate_phi_lut((*phi[:-1], 1_000_001))
+    with pytest.raises(ValueError, match="under the grammar's floor"):
+        claude_worker.bin15_fit.validate_phi_lut(tuple(min(v, 979_999) for v in phi))
+
+
+def test_phi_lut_refuses_a_parameter_it_would_ignore() -> None:
+    with pytest.raises(ValueError, match="no nu or s"):
+        claude_worker.bin15_fit.phi_lut_1e6("normal", phi_nu="4")
+    with pytest.raises(ValueError, match="needs both"):
+        claude_worker.bin15_fit.phi_lut_1e6("student-t", phi_nu="4")
+    with pytest.raises(ValueError, match="one of"):
+        claude_worker.bin15_fit.phi_lut_1e6("laplace")
+    assert claude_worker.bin15_fit.phi_lut_1e6() == claude_worker.bin15_fit.phi_table_1e6()
+
+
+def test_the_hour_table_is_one_line_right_after_the_scale() -> None:
+    text = claude_worker.bin15_fit.render_artifact(hour_ln_off_1e9=_HOURS)
+    lines = text.splitlines()
+    at = lines.index(f"scale_1e9       = {claude_worker.bin15_fit.SCALE_1E9_DEFAULT}")
+    assert lines[at + 1] == "hour_ln_off_1e9 = [" + ", ".join(str(v) for v in _HOURS) + "]"
+    assert at + 2 == len(lines), "the hour line is the artifact's last line"
+    keys = [ln.split("=", 1)[0].strip() for ln in lines if "=" in ln and ln[:1] != "#"]
+    assert keys.count("hour_ln_off_1e9") == 1
+    # The header stops saying there is no hour table, and says what it is.
+    assert "is ABSENT on purpose" not in text
+    assert "is an hour-of-day table" in text
+    # Of the key lines, only the hour line is new.
+    moved = set(lines) ^ set(claude_worker.bin15_fit.render_artifact().splitlines())
+    assert {ln for ln in moved if ln[:1] != "#"} == {lines[at + 1]}
+
+
+@pytest.mark.parametrize(
+    "hours",
+    [
+        _HOURS[:-1],
+        (*_HOURS, 0),
+        (claude_worker.bin15_fit.HOUR_LN_OFF_ABS_MAX_1E9 + 1, *_HOURS[1:]),
+        (*_HOURS[:-1], -claude_worker.bin15_fit.HOUR_LN_OFF_ABS_MAX_1E9 - 1),
+    ],
+)
+def test_a_malformed_hour_table_is_refused(hours: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="hour_ln_off_1e9"):
+        claude_worker.bin15_fit.hour_table_1e9(hours)
+    with pytest.raises(ValueError, match="hour_ln_off_1e9"):
+        claude_worker.bin15_fit.render_tables(hour_ln_off_1e9=hours)
+
+
+def test_an_hour_offset_is_an_integer_or_nothing() -> None:
+    with pytest.raises(TypeError):
+        claude_worker.bin15_fit.hour_table_1e9((1.5, *_HOURS[1:]))
+    with pytest.raises(TypeError):
+        claude_worker.bin15_fit.hour_table_1e9((True, *_HOURS[1:]))
+
+
+def test_the_hour_bound_is_ln_2() -> None:
+    with decimal.localcontext() as ctx:
+        ctx.prec = 40
+        ln2_1e9 = decimal.Decimal(2).ln() * 1_000_000_000
+    assert claude_worker.bin15_fit.HOUR_LN_OFF_ABS_MAX_1E9 == int(
+        ln2_1e9.to_integral_value(rounding=decimal.ROUND_HALF_UP)
+    )
+
+
+def test_the_tables_lane_with_the_fit_flags_emits_exactly_the_expected_lines(
+    tmp_path: pathlib.Path,
+) -> None:
+    out = tmp_path / "tables.toml"
+    argv = ["tables", "--out", str(out), "--phi", "student-t", "--phi-nu", "4", "--phi-s", "1"]
+    assert claude_worker.bin15_fit.main([*argv, f"--hour-ln-off-1e9={_HOURS_ARG}"]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert text == claude_worker.bin15_fit.render_tables(
+        phi="student-t", phi_nu="4", phi_s="1", hour_ln_off_1e9=_HOURS
+    )
+    lines = text.splitlines()
+    assert [ln.split("=", 1)[0].strip() for ln in lines] == [
+        "phi_lut",
+        "recal_early",
+        "recal_mid",
+        "recal_late",
+        "scale_1e9",
+        "hour_ln_off_1e9",
+    ]
+    table = claude_worker.bin15_fit.student_t_table_1e6("4", "1")
+    assert lines[0] == "phi_lut = [" + ", ".join(str(v) for v in table) + "]"
+    assert not list(tmp_path.glob("*.tmp")), "the temp file must be renamed away"
+
+
+def test_the_tables_lane_prints_an_hour_table_under_phi(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    hours = tuple(abs(v) for v in _HOURS)
+    arg = ",".join(str(v) for v in hours)
+    assert claude_worker.bin15_fit.main(["tables", "--hour-ln-off-1e9", arg]) == 0
+    printed = capsys.readouterr().out
+    assert printed == claude_worker.bin15_fit.render_tables(hour_ln_off_1e9=hours)
+    assert printed.startswith(claude_worker.bin15_fit.render_tables())
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--phi", "student-t"],
+        ["--phi", "student-t", "--phi-nu", "4"],
+        ["--phi-nu", "4", "--phi-s", "1"],
+        ["--phi", "student-t", "--phi-nu", "four", "--phi-s", "1"],
+        ["--phi", "student-t", "--phi-nu", "NaN", "--phi-s", "1"],
+        ["--phi", "laplace"],
+        ["--hour-ln-off-1e9", "1,2,3"],
+        ["--hour-ln-off-1e9", ",".join(["693147182"] * 24)],
+        ["--hour-ln-off-1e9", ",".join(["x"] * 24)],
+    ],
+)
+def test_the_cli_refuses_a_malformed_fit(extra: list[str], tmp_path: pathlib.Path) -> None:
+    """Each is an argparse refusal (exit 2) on both lanes, and a refused
+    fit writes nothing."""
+    for lane in (["tables"], ["artifact", "--out", str(tmp_path / "bin15.toml")]):
+        with pytest.raises(SystemExit) as exc:
+            claude_worker.bin15_fit.main([*lane, *extra])
+        assert exc.value.code == 2
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_artifact_lane_writes_a_t_artifact_atomically(tmp_path: pathlib.Path) -> None:
+    out = tmp_path / "bin15.toml"
+    argv = ["artifact", "--out", str(out), "--phi", "student-t", "--phi-nu", "4", "--phi-s", "1"]
+    assert claude_worker.bin15_fit.main([*argv, f"--hour-ln-off-1e9={_HOURS_ARG}"]) == 0
+    text = out.read_text(encoding="utf-8")
+    assert text == claude_worker.bin15_fit.render_artifact(
+        phi="student-t", phi_nu="4", phi_s="1", hour_ln_off_1e9=_HOURS
+    )
+    assert not list(tmp_path.glob("*.tmp")), "the temp file must be renamed away"
+    assert "# nu = 4, s = 1." in text
+    assert "# Phi is computed exactly" not in text
+    # Of the KEY lines, only the price map and the hour table moved.
+    moved = set(text.splitlines()) ^ set(claude_worker.bin15_fit.render_artifact().splitlines())
+    assert {ln.split("=", 1)[0].strip() for ln in moved if ln[:1] != "#"} == {
+        "phi_lut",
+        "hour_ln_off_1e9",
+    }
+
+
+def test_the_summary_names_the_map_and_its_ends(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "tables.toml"
+    argv = ["tables", "--out", str(out), "--phi", "student-t", "--phi-nu", "4", "--phi-s", "1"]
+    assert claude_worker.bin15_fit.main(argv) == 0
+    err = capsys.readouterr().err
+    table = claude_worker.bin15_fit.student_t_table_1e6("4", "1")
+    assert "(phi student-t nu 4 s 1 4097 pts" in err
+    assert f"[{table[0]}..{table[-1]}]" in err
+    assert "hours none" in err

@@ -28,6 +28,19 @@ pub const PHI_POINTS: usize = 4097;
 /// `strategy_bin15::price::RECAL_POINTS`.
 pub const RECAL_POINTS: usize = 65;
 
+/// The smallest `phi_lut[4096]` — the table's value at the clamp
+/// `|d| = 4.096`, ×1e6 — the grammar admits.
+///
+/// The floor refuses a table that is not a CDF running out to
+/// near-certainty: a truncated cut, a table on the wrong grid, a scale
+/// slipped by an order. It is NOT a statement about the tail. A
+/// fat-tailed map ends well short of the Gaussian's 999_979 — a
+/// Student-t with a few degrees of freedom ends somewhere between 0.99
+/// and 0.999 — and the old floor of 999_900, which only the Gaussian
+/// clears, refused every one of them at boot. 0.98 at 4.1 σ-units is the
+/// least any honest price map claims.
+pub const PHI_LAST_MIN_1E6: u32 = 980_000;
+
 /// Recalibration phases (early / mid / late).
 pub const PHASES: usize = 3;
 
@@ -388,7 +401,7 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         cap_day_usd_1e6: int(&kv, "cap_day_usd_1e6")?,
         maker_enabled: flag(&kv, "maker_enabled")?,
         null_arm: flag(&kv, "null_arm")?,
-        phi_lut: table(&kv, "phi_lut", PHI_POINTS, Some(500_000), Some(999_900), false)?,
+        phi_lut: table(&kv, "phi_lut", PHI_POINTS, Some(500_000), Some(PHI_LAST_MIN_1E6), false)?,
         recal: [
             table(&kv, "recal_early", RECAL_POINTS, Some(0), Some(1_000_000), true)?,
             table(&kv, "recal_mid", RECAL_POINTS, Some(0), Some(1_000_000), true)?,
@@ -689,6 +702,34 @@ mod tests {
             k += 1;
         }
         t.join(", ")
+    }
+
+    /// DISTX (2026-09-23). A FAT-TAILED `phi_lut` is a belief, not a
+    /// defect: a Student-t map ends short of the Gaussian's 999_979 at
+    /// the clamp. The floor is [`PHI_LAST_MIN_1E6`]; the table
+    /// that sits ON it parses, the one a unit under it is refused with
+    /// the grammar's own words.
+    #[test]
+    fn a_fat_tailed_phi_table_parses_and_a_truncated_one_is_refused() {
+        let with_last = |last: i64| {
+            let mut phi: Vec<String> = Vec::with_capacity(PHI_POINTS);
+            let mut i = 0usize;
+            while i < PHI_POINTS {
+                let v = 500_000 + (i as i64 * (last - 500_000)) / (PHI_POINTS as i64 - 1);
+                phi.push(v.to_string());
+                i += 1;
+            }
+            let src = artifact();
+            let start = src.find("phi_lut = [").expect("the phi line");
+            let end = start + src[start..].find('\n').expect("its end");
+            format!("{}phi_lut = [{}]{}", &src[..start], phi.join(", "), &src[end..])
+        };
+        let f = parse(&with_last(990_000)).expect("a t-shaped end parses");
+        assert_eq!(f.phi_lut[PHI_POINTS - 1], 990_000);
+        let floor = i64::from(PHI_LAST_MIN_1E6);
+        assert!(parse(&with_last(floor)).is_ok(), "the floor itself parses");
+        let e = parse(&with_last(floor - 1)).expect_err("one unit under the floor");
+        assert!(e.0.contains("must be at least 980000"), "{}", e.0);
     }
 
     /// BIN15 P1a (F1). The artifact that was LIVE on 2026-09-12 carried
