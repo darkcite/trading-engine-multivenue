@@ -45,6 +45,8 @@ signer-evm         = { path = "../crates/signer-evm" }
 core-amm           = { path = "../crates/core-amm" }
 # hyperevm_decode: the HYPARB H3 log/envelope decoders + pool snapshot machine.
 ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
+# amm_book: the HYPARB H2 AMM fill law (pool book + judge).
+core-fill          = { path = "../crates/core-fill" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -371,6 +373,13 @@ bench  = false
 [[bin]]
 name   = "evm_rlp"
 path   = "fuzz_targets/evm_rlp.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_book"
+path   = "fuzz_targets/amm_book.rs"
 test   = false
 doc    = false
 bench  = false

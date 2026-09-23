@@ -51,6 +51,7 @@
 )]
 
 mod arb;
+mod fill;
 pub mod payload;
 mod price;
 mod sqrt_price_math;
@@ -60,6 +61,10 @@ mod types;
 mod u256;
 
 pub use arb::solve_arb;
+pub use fill::{
+    fill_in_range, observed_fee_pips, RangeFill, RFILL_EDGE, RFILL_LIMIT, RFILL_MATH, RFILL_NONE,
+    RFILL_NOT_LIVE, RFILL_PARTIAL,
+};
 pub use price::{price_1e18_from_sqrt, range_bounds, sqrt_from_price_1e18};
 pub use swap::{swap_exact, swap_exact_in_range, swap_in_range, swap_to_target, MAX_STEPS};
 pub use tick_math::{

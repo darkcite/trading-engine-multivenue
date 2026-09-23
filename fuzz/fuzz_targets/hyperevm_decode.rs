@@ -64,11 +64,15 @@ fuzz_target!(|d: &[u8]| {
                     address: [1; 20],
                     sym: 1,
                     family: PoolFamily::UniswapV3,
+                    dec0: 18,
+                    dec1: 6,
                 },
                 PoolEntry {
                     address: [2; 20],
                     sym: 2,
                     family: PoolFamily::Algebra,
+                    dec0: 18,
+                    dec1: 6,
                 },
             ])
             .expect("fuzz pools");

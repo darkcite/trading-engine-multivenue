@@ -84,6 +84,7 @@ version = "0.1.0"
 name = "core-fill"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-types",
 ]
 
@@ -425,6 +426,7 @@ dependencies = [
  "core-amm",
  "core-config",
  "core-crypto",
+ "core-fill",
  "core-net",
  "core-parse",
  "core-types",

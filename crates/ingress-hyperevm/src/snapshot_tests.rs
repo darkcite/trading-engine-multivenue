@@ -20,6 +20,8 @@ fn table(pools: &[FakePool]) -> PoolTable {
             address: p.address,
             sym: 100 + i as u32,
             family: p.family,
+            dec0: 18,
+            dec1: 6,
         });
     }
     PoolTable::new(&e).unwrap()
@@ -75,6 +77,8 @@ fn check(out: &[(u32, PoolEvent)], pools: &[FakePool], t: &PoolTable) -> usize {
             nodes,
             fee,
             spacing,
+            dec0,
+            dec1,
         } = ev
         else {
             panic!("expected SNAPSHOT, got {ev:?}")
@@ -83,6 +87,11 @@ fn check(out: &[(u32, PoolEvent)], pools: &[FakePool], t: &PoolTable) -> usize {
         let m = pools.iter().find(|p| p.address == entry.address).unwrap();
         assert_eq!(block, B);
         assert_eq!(family, entry.family as u8);
+        assert_eq!(
+            (dec0, dec1),
+            (entry.dec0, entry.dec1),
+            "decimals ride the snapshot"
+        );
         assert_eq!(fee, m.fee);
         assert_eq!(spacing, m.spacing);
         assert!(
@@ -303,6 +312,8 @@ fn a_wrong_family_is_a_shape_failure_not_a_guess() {
         address: v3.address,
         sym: 7,
         family: PoolFamily::Slipstream,
+        dec0: 18,
+        dec1: 6,
     }])
     .unwrap();
     v3.family = PoolFamily::UniswapV3;

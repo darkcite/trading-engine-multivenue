@@ -25,6 +25,8 @@ mio           = { workspace = true }
 rustls        = { workspace = true }
 
 [dev-dependencies]
+# HYPARB H2: the matcher's AMM tests encode pool-event payloads.
+core-amm     = { workspace = true }
 rcgen        = { workspace = true }
 proptest     = { workspace = true }
 webpki-roots = { workspace = true }

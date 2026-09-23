@@ -23,7 +23,7 @@
 //! | 4 | [`EV_LIQUIDITY`] | bit0 [`LIQ_BURN`] | `block u56 @1 · tickLower i24 @8 · tickUpper i24 @11 · amount u128 @16` |
 //! | 5 | [`EV_HEAD`] | 0 | `block u56 @1 · timestamp u64 @8 · baseFeePerGas u128 @16` |
 //! | 6 | [`EV_GAP`] | 0 | `block u56 @1` — the last block delivered before the stream broke |
-//! | 7 | [`EV_SNAPSHOT`] | family ([`FAMILY_V3`] / [`FAMILY_SLIPSTREAM`] / [`FAMILY_ALGEBRA`]) | `block u56 @1 · lo i24 @8 · hi i24 @11 · nodes u16 @14 · fee u32 @16 · spacing i24 @20` |
+//! | 7 | [`EV_SNAPSHOT`] | family ([`FAMILY_V3`] / [`FAMILY_SLIPSTREAM`] / [`FAMILY_ALGEBRA`]) | `block u56 @1 · lo i24 @8 · hi i24 @11 · nodes u16 @14 · fee u32 @16 · spacing i24 @20 · dec0 u8 @23 · dec1 u8 @24` |
 //! | 8 | [`EV_TICK`] | 0 | `tick i24 @1 · liquidityNet i128 @8 · liquidityGross u128 @24` |
 //!
 //! **One swap is two signals, in this order:** `SWAP` (block and the
@@ -38,8 +38,9 @@
 //!
 //! **A pool snapshot is `2 + nodes` signals, contiguous:** `SNAPSHOT`
 //! (the block it was read at, the map's coverage `[lo, hi]`, the node
-//! count, the fee in force — `fee()`, or Algebra's `lastFee` — and the
-//! pool's `tickSpacing`), then `nodes` × `TICK` in ascending tick order,
+//! count, the fee in force — `fee()`, or Algebra's `lastFee` — the
+//! pool's `tickSpacing`, and both tokens' `decimals()` so a replay prices
+//! the pool from the tape alone), then `nodes` × `TICK` in ascending tick order,
 //! then `STATE` with [`STATE_SNAPSHOT`]. The member rebuilds the pool from
 //! exactly these; a count that does not match leaves the pool stale.
 //! Snapshots travel on the ring (and so on the capture tape) so that a
@@ -92,6 +93,12 @@ pub const FEE_SRC_ALGEBRA_V12: u8 = 2;
 
 /// Largest block number a payload carries (`u56`).
 pub const MAX_PAYLOAD_BLOCK: u64 = (1u64 << 56) - 1;
+/// Largest token `decimals()` a `SNAPSHOT` carries. 10^36 still fits
+/// `u128`; a token claiming more is refused, never truncated.
+pub const MAX_TOKEN_DECIMALS: u8 = 36;
+/// A fee in pips is strictly below this (100 %). A `SNAPSHOT` fee at or
+/// above it is refused both ways.
+pub const FEE_PIPS_BOUND: u32 = 1_000_000;
 const TICK_BOUND: i32 = crate::tick_math::MAX_TICK;
 
 /// One decoded pool event.
@@ -173,6 +180,10 @@ pub enum PoolEvent {
         fee: u32,
         /// The pool's `tickSpacing`.
         spacing: i32,
+        /// token0 `decimals()`.
+        dec0: u8,
+        /// token1 `decimals()`.
+        dec1: u8,
     },
     /// One initialised tick of a snapshot.
     Tick {
@@ -360,8 +371,10 @@ pub const fn encode_gap(block: u64) -> Option<Payload> {
 }
 
 /// `SNAPSHOT`. `None` for an unknown family, `lo > hi`, a tick or
-/// spacing out of range, or a block out of range.
+/// spacing out of range, a block out of range, a fee at or above 100 %
+/// or decimals above [`MAX_TOKEN_DECIMALS`].
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub const fn encode_snapshot(
     block: u64,
     family: u8,
@@ -370,6 +383,8 @@ pub const fn encode_snapshot(
     nodes: u16,
     fee: u32,
     spacing: i32,
+    dec0: u8,
+    dec1: u8,
 ) -> Option<Payload> {
     if block > MAX_PAYLOAD_BLOCK
         || family > FAMILY_ALGEBRA
@@ -378,6 +393,9 @@ pub const fn encode_snapshot(
         || lo > hi
         || spacing <= 0
         || spacing > TICK_BOUND
+        || fee >= FEE_PIPS_BOUND
+        || dec0 > MAX_TOKEN_DECIMALS
+        || dec1 > MAX_TOKEN_DECIMALS
     {
         return None;
     }
@@ -389,6 +407,8 @@ pub const fn encode_snapshot(
     put_n(&mut p, 14, nodes.to_le_bytes());
     put_n(&mut p, 16, fee.to_le_bytes());
     put_i24(&mut p, 20, spacing);
+    p[23] = dec0;
+    p[24] = dec1;
     Some(p)
 }
 
@@ -492,13 +512,19 @@ pub const fn decode(p: &Payload) -> Option<PoolEvent> {
             let lo = get_i24(p, 8);
             let hi = get_i24(p, 11);
             let spacing = get_i24(p, 20);
+            let fee = u32::from_le_bytes(get_n(p, 16));
+            let dec0 = p[23];
+            let dec1 = p[24];
             if sub > FAMILY_ALGEBRA
-                || !zero(p, 23, PAYLOAD_LEN)
+                || !zero(p, 25, PAYLOAD_LEN)
                 || !tick_ok(lo)
                 || !tick_ok(hi)
                 || lo > hi
                 || spacing <= 0
                 || spacing > TICK_BOUND
+                || fee >= FEE_PIPS_BOUND
+                || dec0 > MAX_TOKEN_DECIMALS
+                || dec1 > MAX_TOKEN_DECIMALS
             {
                 return None;
             }
@@ -508,8 +534,10 @@ pub const fn decode(p: &Payload) -> Option<PoolEvent> {
                 lo,
                 hi,
                 nodes: u16::from_le_bytes(get_n(p, 14)),
-                fee: u32::from_le_bytes(get_n(p, 16)),
+                fee,
                 spacing,
+                dec0,
+                dec1,
             })
         }
         EV_TICK => {
@@ -560,8 +588,46 @@ mod tests {
         p[7] = 7;
         p[22] = 39;
         assert_eq!(decode(&p), None);
-        assert_eq!(encode_snapshot(1, FAMILY_V3, 0, 0, 0, 0, 887_273), None);
-        assert!(encode_snapshot(1, FAMILY_V3, 0, 0, 0, 0, 887_272).is_some());
+        assert_eq!(
+            encode_snapshot(1, FAMILY_V3, 0, 0, 0, 0, 887_273, 18, 6),
+            None
+        );
+        assert!(encode_snapshot(1, FAMILY_V3, 0, 0, 0, 0, 887_272, 18, 6).is_some());
+    }
+
+    #[test]
+    fn a_snapshot_carries_decimals_and_refuses_a_fee_or_decimals_out_of_domain() {
+        let p = encode_snapshot(9, FAMILY_ALGEBRA, -60, 60, 3, 500, 60, 18, 6).unwrap();
+        assert_eq!((p[23], p[24]), (18, 6));
+        match decode(&p) {
+            Some(PoolEvent::Snapshot {
+                dec0, dec1, fee, ..
+            }) => {
+                assert_eq!((dec0, dec1, fee), (18, 6, 500));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            encode_snapshot(9, FAMILY_V3, 0, 0, 0, FEE_PIPS_BOUND, 1, 18, 6),
+            None
+        );
+        assert_eq!(
+            encode_snapshot(9, FAMILY_V3, 0, 0, 0, 0, 1, MAX_TOKEN_DECIMALS + 1, 6),
+            None
+        );
+        let mut q = p;
+        q[24] = MAX_TOKEN_DECIMALS + 1;
+        assert_eq!(
+            decode(&q),
+            None,
+            "decimals past the bound are refused on decode too"
+        );
+        let mut q = p;
+        q[16..20].copy_from_slice(&FEE_PIPS_BOUND.to_le_bytes());
+        assert_eq!(decode(&q), None, "a 100 % fee is refused on decode too");
+        let mut q = p;
+        q[25] = 1;
+        assert_eq!(decode(&q), None, "a byte past dec1 is foreign");
     }
 
     #[test]

@@ -130,6 +130,7 @@ dependencies = [
  "core-alloc",
  "core-amm",
  "core-crypto",
+ "core-fill",
  "core-io",
  "core-latency",
  "core-metrics",
@@ -321,6 +322,7 @@ dependencies = [
  "book-builder",
  "clap",
  "clob-dispatcher",
+ "core-amm",
  "core-config",
  "core-crypto",
  "core-fill",
@@ -371,6 +373,7 @@ dependencies = [
 name = "clob-dispatcher"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-fill",
  "core-net",
  "core-parse",
@@ -438,6 +441,7 @@ version = "0.1.0"
 name = "core-fill"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-types",
 ]
 

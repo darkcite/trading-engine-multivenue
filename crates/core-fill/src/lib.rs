@@ -49,10 +49,19 @@
 //! * **The activation table is a MEASUREMENT** ([`ACTIVATION_NS_DEFAULT`]),
 //!   not an assumption, and it is per deployment and per location.
 //! * This crate knows nothing about fees, marks, P&L or settlement.
-//!   Those are the harness's ledger and stay there.
+//!   Those are the harness's ledger and stay there. (The one exception
+//!   is the AMM pool fee, which is part of a swap's execution PRICE on
+//!   chain and so rides in the fill price — module [`amm`].)
+//! * **AMM swaps (HYPARB H2)** are judged against pool state rebuilt
+//!   from the pool-event tape, by [`AmmBook`] — module [`amm`] states
+//!   that law.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod amm;
+
+pub use amm::{amm_pool_index, AmmBook, AmmBookCounters, AmmObs, AmmVerdict, AMM_MAX_POOLS};
 
 use core_types::{Side, Tick};
 
@@ -61,6 +70,9 @@ pub const ORDER_KIND_MAKER: u8 = 0;
 /// `Order.kind` of an immediate-or-cancel taker (I1; ICDP's, XSD's and
 /// the VRP member's primitive).
 pub const ORDER_KIND_IOC: u8 = 1;
+/// `Order.kind` of an AMM swap against a pool (HYPARB H2): judged once
+/// against pool state, never rests — the law is module [`amm`]'s.
+pub const ORDER_KIND_AMM_SWAP: u8 = 2;
 
 /// Open orders one sym may hold at once.
 pub const MAX_OPEN_PER_SYM: usize = 8;

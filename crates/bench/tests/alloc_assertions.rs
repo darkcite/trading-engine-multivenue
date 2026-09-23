@@ -7755,6 +7755,8 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
         address: addr,
         sym: 900,
         family: PoolFamily::Algebra,
+        dec0: 18,
+        dec1: 6,
     }])
     .expect("gate 66 pools");
     let mut transport = TestTransport::with_capacity(1 << 20);
@@ -7924,4 +7926,119 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
         "hyperevm session allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "hyperevm hot bytes should be zero: saw {bytes}");
+}
+
+/// **HYPARB gate 67 — the AMM fill law on the engine's paper matcher.**
+///
+/// `PaperDispatcher::observe_amm` in steady state: pool events rebuild
+/// the book (swap + state with the fee observation, a position change),
+/// a new AMM order per cycle is submitted, and every HEAD judges it —
+/// a fill (the walk, the impact carried, the fill pushed) or a cancel —
+/// and the fill is pumped. Boot (the first snapshot) is outside the
+/// window. 0 B/op.
+#[test]
+fn amm_paper_matcher_observe_judge_and_fill_are_zero_alloc() {
+    use clob_dispatcher::{OrderDispatch, PaperDispatcher};
+    use core_amm::payload::{
+        encode_head, encode_liquidity, encode_snapshot, encode_state, encode_swap, FAMILY_V3,
+    };
+    use core_amm::{price_1e18_from_sqrt, sqrt_at_tick, PoolMeta, PoolState, SwapSpec};
+    use core_types::{make_symbol_id, Order, Side, SYMBOL_ID_NONE};
+
+    const S: u64 = 1_000_000_000;
+    let pool = make_symbol_id(VenueId::HyperEvm, 1);
+    let tick = -230_543;
+    let liq: u128 = 50_000_000_000_000_000_000;
+    let (lo, hi) = sqrt_at_tick(tick);
+    let mid = (price_1e18_from_sqrt(lo, hi, 18, 6) / 1_000_000_000_000) as i64;
+
+    // Boot (allocation allowed): the snapshot, and the payloads the
+    // loop replays — a real 0.3 %-paying swap and its state, a mint.
+    let mut d = PaperDispatcher::new();
+    d.observe_amm(
+        pool,
+        &encode_snapshot(10, FAMILY_V3, -240_000, -220_000, 0, 500, 10, 18, 6)
+            .expect("gate 67 snap"),
+        0,
+    );
+    let reset = encode_state(tick, lo, hi, liq, true).expect("gate 67 state");
+    d.observe_amm(pool, &reset, 0);
+    let mut meta = PoolMeta::ZERO;
+    meta.fee_pips = 3_000;
+    meta.tick_spacing = 10;
+    let r = core_amm::swap_exact_in_range(
+        &PoolState::new(lo, hi, tick, liq),
+        &meta,
+        &SwapSpec {
+            amount: 1_000_000_000_000_000_000,
+            limit_lo: core_amm::MIN_SQRT_LO + 1,
+            limit_hi: 0,
+            fee_pips: 3_000,
+            zero_for_one: true,
+            exact_in: true,
+        },
+    );
+    let swap = encode_swap(11, r.amount_in as i128, -(r.amount_out as i128)).expect("gate 67 swap");
+    let a = r.after;
+    let post = encode_state(a.tick, a.sqrt_price_lo, a.sqrt_price_hi, a.liquidity, false)
+        .expect("gate 67 post");
+    let mint = encode_liquidity(11, false, -230_600, -230_500, 7).expect("gate 67 mint");
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut fills = 0u64;
+    let mut n = 0u64;
+    while n < CYCLES {
+        let now = (n + 1) * 2 * S;
+        // Chain activity: a snapshot-state reset (so the pool is live
+        // again whatever our last impact did), a swap + its state, a mint.
+        d.observe_amm(pool, &reset, now);
+        d.observe_amm(pool, &swap, now);
+        d.observe_amm(pool, &post, now);
+        d.observe_amm(pool, &mint, now);
+        // One order: a sell that fills on even cycles, a buy limited
+        // to half the mid (cannot fill) on odd ones.
+        let (side, px) = if n % 2 == 0 {
+            (Side::Ask, mid * 99 / 100)
+        } else {
+            (Side::Bid, mid / 2)
+        };
+        let mut o = Order::new(
+            now,
+            VenueId::HyperEvm,
+            pool,
+            side,
+            core_fill::ORDER_KIND_AMM_SWAP,
+            Price::from_raw(px),
+            Qty::from_raw(1_000_000),
+            n + 1,
+        );
+        o.strategy_id = 0;
+        d.submit(&o).expect("paper submit");
+        let head = encode_head(12 + n, now + S, 1).expect("gate 67 head");
+        d.observe_amm(SYMBOL_ID_NONE, &head, now + S);
+        while let Some(f) = d.try_next_fill() {
+            fills += 1;
+            std::hint::black_box(f);
+        }
+        n += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = d.matcher_counters();
+    assert_eq!(
+        fills,
+        CYCLES / 2,
+        "every sell fills, no buy at half the mid does"
+    );
+    assert_eq!(c.amm_fills, CYCLES / 2);
+    assert_eq!(c.amm_canceled, CYCLES / 2);
+    assert!(d.open_orders() == 0, "judged once, gone either way");
+    assert_eq!(
+        allocs, 0,
+        "AMM paper matcher allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "AMM paper matcher hot bytes should be zero: saw {bytes}"
+    );
 }

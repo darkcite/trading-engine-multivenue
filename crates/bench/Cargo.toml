@@ -60,6 +60,8 @@ core-amm             = { workspace = true }
 signer-evm           = { workspace = true }
 # HYPARB H3 gate 66: the HyperEVM ingress session after the handshake.
 ingress-hyperevm     = { workspace = true }
+# HYPARB H2 gate 67: the AMM fill law on the paper matcher.
+core-fill            = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

@@ -1549,3 +1549,55 @@ Done as §4 says, with these decisions recorded:
   `regime.toml [labels.hyparb]` (`[labels.latency_arb]` refused at the
   grammar), gauge `engine_strategy_hyparb_active`. `docs/migration.md`
   carries the two entries (slot 0; VenueId 8).
+
+### 16.9 H2 — the AMM fill law — LANDED
+
+As §6 says, with these decisions recorded:
+
+* **The pool state lives in a book, not in a `PoolTouch` the engine
+  decodes.** `core_fill::AmmBook` (128 pools × 128 B, const-constructed)
+  takes the raw pool-event signals — `observe(sym, payload)` — and holds
+  what the judge needs: price / tick / liquidity, the fee in force, the
+  last fee a swap was SEEN to pay, spacing, family, decimals. The engine
+  forwards every `SignalSource::HyperEvm` signal to
+  `OrderDispatch::observe_amm` (defaulted no-op; `PaperDispatcher` and
+  `RoutedDispatcher`'s paper arm override) BEFORE `on_signal` — pinned by
+  `a_pool_event_reaches_the_dispatcher_before_the_strategy`. The harness
+  feeds its own `AmmBook` the same signals (`FillEngine::on_amm_signal`).
+  `Pending` is unchanged: the pool index is the sym's ordinal.
+* **`SNAPSHOT` carries both tokens' decimals** (`dec0 @23 · dec1 @24`,
+  ≤ 36; the fee must be < 100 %), so a replay prices a pool from the tape
+  alone. `ingress_hyperevm::PoolEntry` gains `dec0/dec1` (boot-supplied;
+  H3b verifies them against `decimals()` on chain).
+* **When a swap is judged:** once, at the first `HEAD` at or after
+  `emit + one block`, against the pool as the tape left it — i.e. after
+  every swap of the block it raced; we fill as if LAST in that block. A
+  chain-wide `GAP` cancels every open swap.
+* **How:** `core_amm::fill_in_range` (new, beside the walk) — exact fee
+  arithmetic, ACTIVE RANGE only, the limit placed on the MARGINAL price
+  with the fee folded in (so the average cannot breach it), quantity
+  floored, price rounded against us against the reported quantity, a
+  breaching dust result refused. Our impact is carried until the chain's
+  next `STATE` for that pool.
+* **Fee:** the worse of the fee in force and the last one OBSERVED —
+  `core_amm::observed_fee_pips` solves it in range from `SWAP` + `STATE`
+  (findings 15/20), and an Algebra v1.2 `SwapFee` reports
+  `(override ≠ 0 ? override : lastFee) + pluginFee` directly. The member
+  (H4) can call the same function.
+* **Venue law:** HyperEVM (venue 8) takes `ORDER_KIND_AMM_SWAP = 2` on a
+  pool slot and nothing else; no other venue takes a swap — in the
+  matcher and in the harness (`tradeable_venue_byte` += 8,
+  `TRADEABLE_VENUES` 7). An AMM fill books at 0 bps (the fee is in the
+  price). **Gas is not charged by the harness yet** — H6 adds the gas
+  ledger (every attempt, filled or reverted).
+* Counters: `MatcherCounters.amm_{fills,canceled,partial,not_live}`;
+  harness `AmmReplay` (NOT in the frozen schema-1 line, like
+  `LifecycleReplay`). `/metrics` mirrors them in H6.
+* Gates: `core_amm::fill` 8 unit tests; `core_fill::amm` 10; matcher 8;
+  the X1 AMM parity gate `cli/tests/amm_parity.rs` (engine vs harness,
+  fills byte-identical + a non-vacuity pin); `paper_replay_parity`'s
+  pre-E5 hash unchanged (H2 is additive for every CLOB order); alloc gate
+  **67** (the matcher's observe → submit → HEAD judge → pump, 0 B/op);
+  fuzz `amm_book` (new — no panic, never `Wait`, a fill within size and
+  limit, never on a pool that is not live) and the two codec targets
+  re-run after the `SNAPSHOT` change.

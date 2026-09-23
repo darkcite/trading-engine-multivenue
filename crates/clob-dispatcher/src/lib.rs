@@ -47,7 +47,7 @@ pub use queued::{DispatcherWorker, QueuedDispatcher, ORDER_RING_CAP};
 pub use response::{parse_clob_response, ClobResponse, ResponseScanErr};
 
 use core_types::{
-    CancelReq, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, Tick,
+    CancelReq, Fill, ModifyReq, NsTs, Order, OrderIdentity, Price, Qty, Side, SymbolId, Tick,
 };
 
 /// Dispatcher error modes.
@@ -473,6 +473,17 @@ pub trait OrderDispatch {
     /// book. Only [`PaperDispatcher`] overrides it.
     #[inline]
     fn observe_tick(&mut self, _tick: &Tick, _now_ns: NsTs) {}
+
+    /// HYPARB H2: show the dispatcher one pool-event signal (the HyperEVM
+    /// ingress's `Signal`: `sym` = the pool or `SYMBOL_ID_NONE`, the
+    /// 40-byte `core_amm::payload`), so a PAPER one can keep pool state
+    /// and judge its open AMM swaps on each new head.
+    ///
+    /// Defaulted to nothing for the same reason as [`Self::observe_tick`]:
+    /// a live dispatcher learns about fills from the chain, never from a
+    /// curve. Only [`PaperDispatcher`] overrides it.
+    #[inline]
+    fn observe_amm(&mut self, _sym: SymbolId, _payload: &[u8; 40], _now_ns: NsTs) {}
 
     /// X1: what the paper matcher has done. All zeros for a dispatcher
     /// that does not model fills, which is how `/metrics` reads for a
@@ -1049,6 +1060,17 @@ pub struct MatcherCounters {
     /// still resting, and until it does the slot cannot name its own
     /// orders.
     pub ambiguous_order: u64,
+    /// HYPARB H2: AMM swaps that filled (also counted in `fills`).
+    pub amm_fills: u64,
+    /// HYPARB H2: AMM swaps judged and not filled, or dropped by a
+    /// chain-wide stream break — a swap never rests.
+    pub amm_canceled: u64,
+    /// HYPARB H2: AMM fills smaller than the order (the active range's
+    /// boundary or the price limit stopped the walk).
+    pub amm_partial: u64,
+    /// HYPARB H2: AMM swaps canceled because their pool was not
+    /// judgeable (never snapshotted, stale after a gap, edge-bound).
+    pub amm_not_live: u64,
 }
 
 /// One order the paper matcher is holding.
@@ -1147,6 +1169,10 @@ pub struct PaperMatcher {
     /// before it can index anything).
     activation_ns: [u64; core_types::VENUE_COUNT],
     seq: u64,
+    /// HYPARB H2: pool state for AMM swaps, rebuilt from the pool-event
+    /// signals ([`Self::observe_amm`]) — `core_fill::AmmBook`, the same
+    /// book the harness replays.
+    amm: core_fill::AmmBook,
     /// What the matcher did.
     pub counters: MatcherCounters,
 }
@@ -1171,6 +1197,7 @@ impl PaperMatcher {
             out_len: 0,
             activation_ns: d,
             seq: 0,
+            amm: core_fill::AmmBook::new(),
             counters: MatcherCounters {
                 intake: 0,
                 rejected_open_cap: 0,
@@ -1184,6 +1211,10 @@ impl PaperMatcher {
                 no_such_order: 0,
                 identity_mismatch: 0,
                 ambiguous_order: 0,
+                amm_fills: 0,
+                amm_canceled: 0,
+                amm_partial: 0,
+                amm_not_live: 0,
             },
         }
     }
@@ -1213,12 +1244,21 @@ impl PaperMatcher {
         // `tradeable_venue_byte` refuses it. Before MX2 the byte sat past
         // the table's end and was refused by the length check; this
         // keeps that behaviour bit for bit.
+        //
+        // HYPARB H2: HyperEVM (venue byte 8) takes AMM swaps on a known
+        // pool slot and nothing else; every other venue takes makers and
+        // IoCs and never a swap.
+        let kind_ok = if venue == core_types::VenueId::HyperEvm.to_u8() {
+            order.kind == core_fill::ORDER_KIND_AMM_SWAP
+                && core_fill::amm_pool_index(order.sym).is_some()
+        } else {
+            order.kind == core_fill::ORDER_KIND_MAKER || order.kind == core_fill::ORDER_KIND_IOC
+        };
         if venue as usize >= core_fill::ACTIVATION_NS_DEFAULT.len()
             || venue == core_types::VenueId::Mexc.to_u8()
             || px <= 0
             || qty <= 0
-            || (order.kind != core_fill::ORDER_KIND_MAKER
-                && order.kind != core_fill::ORDER_KIND_IOC)
+            || !kind_ok
         {
             self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
             return;
@@ -1472,6 +1512,78 @@ impl PaperMatcher {
         }
     }
 
+    /// HYPARB H2: apply one pool-event signal and, on a new HEAD, judge
+    /// every activated AMM swap in emit order against its pool
+    /// (`core_fill::amm` states the law). A chain-wide GAP cancels every
+    /// open swap: across a stream break a transaction's fate is unknown.
+    pub fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        match self.amm.observe(sym, payload) {
+            core_fill::AmmObs::Head { .. } => self.judge_amm_orders(now_ns),
+            core_fill::AmmObs::Gap => {
+                let mut i = 0usize;
+                while i < self.open_len {
+                    if self.open[i].ident.kind == core_fill::ORDER_KIND_AMM_SWAP {
+                        self.counters.amm_canceled = self.counters.amm_canceled.wrapping_add(1);
+                        self.remove_open(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The HEAD pass: TTL first (a clock fact), then each activated swap
+    /// is judged ONCE and leaves the table either way.
+    fn judge_amm_orders(&mut self, now_ns: NsTs) {
+        let mut i = 0usize;
+        while i < self.open_len {
+            let o = self.open[i];
+            if o.ident.kind != core_fill::ORDER_KIND_AMM_SWAP {
+                i += 1;
+                continue;
+            }
+            if core_fill::expired_at(now_ns, o.expiry_ns) {
+                self.counters.ttl_expired = self.counters.ttl_expired.wrapping_add(1);
+                self.remove_open(i);
+                continue;
+            }
+            if now_ns < o.t_active_ns {
+                i += 1;
+                continue;
+            }
+            let v = match core_fill::amm_pool_index(o.ident.sym) {
+                Some(idx) => self.amm.judge(idx, o.ident.side, o.px_1e6, o.remaining_1e6),
+                // Unreachable: `submit` admits only pool slots.
+                None => core_fill::AmmVerdict::NOT_LIVE,
+            };
+            match v.verdict {
+                core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                    self.push_fill(&o, px_1e6, qty_1e6, now_ns);
+                    self.counters.amm_fills = self.counters.amm_fills.wrapping_add(1);
+                    if qty_1e6 < o.remaining_1e6 {
+                        self.counters.amm_partial = self.counters.amm_partial.wrapping_add(1);
+                    }
+                }
+                _ => {
+                    self.counters.amm_canceled = self.counters.amm_canceled.wrapping_add(1);
+                    if v.pool_not_live() {
+                        self.counters.amm_not_live = self.counters.amm_not_live.wrapping_add(1);
+                    }
+                }
+            }
+            self.remove_open(i);
+        }
+    }
+
+    /// HYPARB H2: the AMM book's own counters.
+    #[inline]
+    #[must_use]
+    pub const fn amm_book_counters(&self) -> core_fill::AmmBookCounters {
+        self.amm.counters
+    }
+
     /// Pop the next modelled fill, FIFO.
     pub fn try_next_fill(&mut self) -> Option<Fill> {
         if self.out_len == 0 {
@@ -1643,6 +1755,11 @@ impl OrderDispatch for PaperDispatcher {
     #[inline]
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         self.matcher.observe_tick(tick, now_ns);
+    }
+
+    #[inline]
+    fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        self.matcher.observe_amm(sym, payload, now_ns);
     }
 
     #[inline]
@@ -2385,5 +2502,162 @@ mod tests {
         );
         b.side = Side::Ask;
         assert_ne!(OrderIdentity::of(&a), OrderIdentity::of(&b));
+    }
+
+    // ---------------- HYPARB H2: the AMM arm ----------------
+
+    mod amm {
+        use super::*;
+        use core_amm::payload::{
+            encode_gap, encode_head, encode_snapshot, encode_state, FAMILY_V3,
+        };
+        use core_amm::{price_1e18_from_sqrt, sqrt_at_tick};
+        use core_types::{make_symbol_id, SYMBOL_ID_NONE};
+
+        const POOL: SymbolId = make_symbol_id(VenueId::HyperEvm, 1);
+        const TICK: i32 = -230_543;
+        const L: u128 = 50_000_000_000_000_000_000;
+        const BLOCK_NS: u64 = 1_000_000_000;
+
+        fn swap(side: Side, px: i64, qty: i64, oid: u64) -> Order {
+            let mut o = Order::new(
+                1_000,
+                VenueId::HyperEvm,
+                POOL,
+                side,
+                core_fill::ORDER_KIND_AMM_SWAP,
+                Price::from_raw(px),
+                Qty::from_raw(qty),
+                oid,
+            );
+            o.strategy_id = 0;
+            o
+        }
+
+        fn live(m: &mut PaperMatcher) -> i64 {
+            let (lo, hi) = sqrt_at_tick(TICK);
+            let snap = encode_snapshot(7, FAMILY_V3, -240_000, -220_000, 0, 500, 10, 18, 6);
+            m.observe_amm(POOL, &snap.unwrap(), 0);
+            m.observe_amm(POOL, &encode_state(TICK, lo, hi, L, true).unwrap(), 0);
+            (price_1e18_from_sqrt(lo, hi, 18, 6) / 1_000_000_000_000) as i64
+        }
+
+        fn head(m: &mut PaperMatcher, block: u64, now: u64) {
+            m.observe_amm(SYMBOL_ID_NONE, &encode_head(block, 1, 1).unwrap(), now);
+        }
+
+        #[test]
+        fn a_swap_is_judged_once_at_the_first_head_after_one_block() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Ask, mid * 99 / 100, 1_000_000, 9), 0);
+            assert_eq!(m.open_len(), 1);
+            head(&mut m, 8, BLOCK_NS - 1);
+            assert_eq!(m.open_len(), 1, "not before the block it could land in");
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.open_len(), 0, "judged once, gone either way");
+            let f = m.try_next_fill().expect("a fill");
+            assert_eq!(f.sym, POOL);
+            assert_eq!(f.qty.raw(), 1_000_000);
+            assert!(f.px.raw() < mid, "the fee and the impact are in the price");
+            assert_eq!(f.strategy_id, 0);
+            assert_eq!(m.counters.amm_fills, 1);
+            assert_eq!(m.counters.fills, 1);
+        }
+
+        #[test]
+        fn a_swap_that_cannot_meet_its_limit_cancels_and_never_rests() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Bid, mid, 1_000_000, 1), 0);
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.open_len(), 0);
+            assert!(m.try_next_fill().is_none());
+            assert_eq!(m.counters.amm_canceled, 1);
+            assert_eq!(
+                m.counters.amm_not_live, 0,
+                "the price refused it, not the pool"
+            );
+        }
+
+        #[test]
+        fn a_pool_never_snapshotted_cancels_as_not_live() {
+            let mut m = PaperMatcher::new();
+            m.submit(&swap(Side::Ask, 1, 1_000_000, 1), 0);
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.counters.amm_canceled, 1);
+            assert_eq!(m.counters.amm_not_live, 1);
+        }
+
+        #[test]
+        fn a_chain_gap_cancels_every_open_swap() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Ask, mid / 2, 1_000_000, 1), 0);
+            m.submit(&swap(Side::Bid, mid * 2, 1_000_000, 2), 0);
+            m.observe_amm(SYMBOL_ID_NONE, &encode_gap(8).unwrap(), 10);
+            assert_eq!(m.open_len(), 0);
+            assert_eq!(m.counters.amm_canceled, 2);
+            assert!(m.try_next_fill().is_none());
+        }
+
+        #[test]
+        fn two_swaps_on_one_pool_see_each_others_impact_in_emit_order() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            m.submit(&swap(Side::Bid, mid * 101 / 100, 1_000_000, 1), 0);
+            m.submit(&swap(Side::Bid, mid * 101 / 100, 1_000_000, 2), 0);
+            head(&mut m, 9, BLOCK_NS);
+            let a = m.try_next_fill().unwrap();
+            let b = m.try_next_fill().unwrap();
+            assert_eq!((a.order_id, b.order_id), (1, 2));
+            assert!(
+                b.px.raw() > a.px.raw(),
+                "the second buy pays for the first's impact"
+            );
+        }
+
+        #[test]
+        fn the_ttl_cancels_a_swap_before_its_head() {
+            let mut m = PaperMatcher::new();
+            let mid = live(&mut m);
+            let mut o = swap(Side::Ask, mid / 2, 1_000_000, 1);
+            o.ttl_ns = 500_000_000;
+            m.submit(&o, 0);
+            head(&mut m, 9, BLOCK_NS);
+            assert_eq!(m.counters.ttl_expired, 1);
+            assert_eq!(m.counters.amm_fills, 0);
+        }
+
+        #[test]
+        fn hyperevm_takes_swaps_only_and_swaps_go_nowhere_else() {
+            let mut m = PaperMatcher::new();
+            let mut ioc = swap(Side::Ask, 1, 1, 1);
+            ioc.kind = core_fill::ORDER_KIND_IOC;
+            m.submit(&ioc, 0);
+            let mut off = swap(Side::Ask, 1, 1, 2);
+            off.sym = make_symbol_id(VenueId::HyperEvm, 200);
+            m.submit(&off, 0);
+            let mut elsewhere = mk_order(Side::Bid, core_fill::ORDER_KIND_AMM_SWAP, 1, 1, 3, 0);
+            elsewhere.kind = core_fill::ORDER_KIND_AMM_SWAP;
+            m.submit(&elsewhere, 0);
+            assert_eq!(m.open_len(), 0);
+            assert_eq!(m.counters.unroutable, 3);
+        }
+
+        #[test]
+        fn the_paper_dispatcher_forwards_pool_events_to_its_matcher() {
+            let mut d = PaperDispatcher::new();
+            let (lo, hi) = sqrt_at_tick(TICK);
+            let snap = encode_snapshot(7, FAMILY_V3, -240_000, -220_000, 0, 500, 10, 18, 6);
+            OrderDispatch::observe_amm(&mut d, POOL, &snap.unwrap(), 0);
+            OrderDispatch::observe_amm(
+                &mut d,
+                POOL,
+                &encode_state(TICK, lo, hi, L, true).unwrap(),
+                0,
+            );
+            assert_eq!(d.matcher.amm_book_counters().snapshots, 1);
+        }
     }
 }

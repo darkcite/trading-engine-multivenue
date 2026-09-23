@@ -6,6 +6,43 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — `Order.kind` 2 = AMM swap; the AMM fill law; `SNAPSHOT` carries decimals (HYPARB H2)
+
+**What changed**
+
+- `core_fill::ORDER_KIND_AMM_SWAP = 2`: a swap against a HyperEVM pool
+  (`sym` = the pool, `qty` token0 × 1e6, `px` the worst average price,
+  token1 per token0 × 1e6; Ask sells token0, Bid buys it). HyperEVM
+  (venue 8) takes this kind on a pool slot and nothing else; no other
+  venue takes it. Kind 2 was never emitted before (a reserved byte).
+- The engine's paper matcher and the harness judge swaps with
+  `core_fill::AmmBook` (law: `core_fill::amm` module doc). New
+  `OrderDispatch::observe_amm(sym, &payload, now)` (defaulted no-op);
+  the engine calls it for every `SignalSource::HyperEvm` signal before
+  the member's `on_signal`.
+- `core_amm::payload` `SNAPSHOT`: `dec0 u8 @23 · dec1 u8 @24` (≤ 36) and a
+  fee < 100 % are now part of the layout; the decoder refuses anything
+  else. No capture carries a HyperEVM label yet (H3b), so no tape exists
+  in the old form.
+- Harness: `tradeable_venue_byte` accepts 8 (swaps only),
+  `TRADEABLE_VENUES` 6 → 7; an AMM fill books at 0 bps (the pool fee is
+  in the fill price). `MatcherCounters` gains
+  `amm_{fills,canceled,partial,not_live}`.
+
+**Impact**
+
+- Wire formats: none on disk (`Order.kind` 2 was unused; the payload
+  has no tape yet). Schema-1: unchanged (AMM fills are ordinary fills;
+  the AMM counters live outside `ModelOutcome`).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the H2 commit.
+
 ## 2026-09-23 — Strategy slot 0 = `hyparb`; `latency-arb` unlinked (HYPARB H0)
 
 **What changed**

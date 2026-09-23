@@ -58,6 +58,8 @@ fn driver(ps: &[FakePool]) -> Driver {
             address: p.address,
             sym: 100 + i as u32,
             family: p.family,
+            dec0: 18,
+            dec1: 6,
         });
     }
     Driver::new(42, PoolTable::new(&e).unwrap(), 4_000)

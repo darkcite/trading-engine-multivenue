@@ -34,8 +34,8 @@ use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
     AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, OptSummary, Order, RuleTableSlot,
-    Signal, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE,
-    RULE_TABLE_RING_SLOTS,
+    Signal, SignalSource, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE,
+    OPT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use engine_snapshot::{RecentRing, RECENT_FILLS, RECENT_ORDERS};
 use ingress_ai::AiIngressStatus;
@@ -491,6 +491,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     consumed += 1;
                     let now = now_ns();
                     self.ingest_lat.record(now.saturating_sub(s.ts_ns));
+                    // HYPARB H2: a pool event reaches the dispatcher
+                    // FIRST, exactly as a tick does — a PAPER one keeps
+                    // pool state and judges its AMM swaps on each head
+                    // (`core_fill::amm`); a live one does nothing.
+                    if s.source == SignalSource::HyperEvm as u8 {
+                        self.disp.observe_amm(s.sym, &s.payload, now);
+                    }
                     let mut ctx = EngineCtx {
                         disp: &mut self.disp,
                         decide_lat: &self.decide_lat,
@@ -2362,6 +2369,88 @@ mod tests {
         fn on_fill_booked(&mut self, _f: &Fill) {
             self.log.borrow_mut().push("dispatcher");
         }
+        fn observe_amm(&mut self, _sym: core_types::SymbolId, _p: &[u8; 40], _now: NsTs) {
+            self.log.borrow_mut().push("dispatcher-amm");
+        }
+    }
+
+    /// A member that only logs the signals it is handed.
+    struct LogsSignals {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+    impl strategy_core::StrategyCounters for LogsSignals {}
+    impl Strategy for LogsSignals {
+        fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
+            Ok(())
+        }
+        fn on_tick<C: Ctx>(&mut self, _t: &Tick, _ctx: &mut C) {}
+        fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {
+            self.log.borrow_mut().push("strategy");
+        }
+        fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {}
+        fn on_timer<C: Ctx>(&mut self, _now: NsTs, _ctx: &mut C) {}
+        fn timer_period_ns(&self) -> u64 {
+            0
+        }
+        fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+    }
+
+    /// **HYPARB H2 — a pool event reaches the dispatcher BEFORE the
+    /// member**, exactly as a tick does: the paper matcher's pool state
+    /// must already include the event the member is about to size
+    /// against. Only HyperEVM-source signals take the hook.
+    #[test]
+    fn a_pool_event_reaches_the_dispatcher_before_the_strategy() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (mut sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            LogsSignals {
+                log: std::rc::Rc::clone(&log),
+            },
+            OrderWitness {
+                log: std::rc::Rc::clone(&log),
+            },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let pool = core_types::make_symbol_id(VenueId::HyperEvm, 1);
+        let amm = Signal::new(
+            1,
+            pool,
+            core_types::LatencyClass::Warm,
+            SignalSource::HyperEvm as u8,
+            [0; 40],
+        );
+        let rpc = Signal::new(
+            2,
+            7,
+            core_types::LatencyClass::Warm,
+            SignalSource::Rpc as u8,
+            [0; 40],
+        );
+        sp.try_push(amm).unwrap();
+        sp.try_push(rpc).unwrap();
+        eng.tick(16);
+        assert_eq!(
+            *log.borrow(),
+            vec!["dispatcher-amm", "strategy", "strategy"],
+            "the pool event is booked first; a foreign source never takes the hook"
+        );
     }
 
     /// A member that SUBMITS on a roll — the case the ordering exists

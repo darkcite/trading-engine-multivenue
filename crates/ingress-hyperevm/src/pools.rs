@@ -42,7 +42,7 @@ pub enum PoolTableErr {
     Empty,
 }
 
-/// One pool at boot: address, symbol, family.
+/// One pool at boot: address, symbol, family, token decimals.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PoolEntry {
     /// Pool contract address.
@@ -51,6 +51,11 @@ pub struct PoolEntry {
     pub sym: SymbolId,
     /// Contract family.
     pub family: PoolFamily,
+    /// token0 `decimals()` — carried on every `SNAPSHOT` so the tape
+    /// prices the pool without the boot config (HYPARB H2).
+    pub dec0: u8,
+    /// token1 `decimals()`.
+    pub dec1: u8,
 }
 
 /// Sorted, fixed-capacity pool table.
@@ -73,6 +78,8 @@ impl PoolTable {
             address: [0; 20],
             sym: 0,
             family: PoolFamily::UniswapV3,
+            dec0: 0,
+            dec1: 0,
         };
         let mut t = Self {
             n: pools.len(),
@@ -145,6 +152,8 @@ mod tests {
             address: [b; 20],
             sym,
             family: PoolFamily::UniswapV3,
+            dec0: 18,
+            dec1: 6,
         }
     }
 

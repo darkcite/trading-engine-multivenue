@@ -312,6 +312,8 @@ pub struct Snapshotter {
     n: usize,
     family: [PoolFamily; HYPEREVM_MAX_POOLS],
     sym: [SymbolId; HYPEREVM_MAX_POOLS],
+    /// `(dec0, dec1)` per pool, carried on each `SNAPSHOT`.
+    dec: [(u8, u8); HYPEREVM_MAX_POOLS],
     radius: i32,
     block: u64,
     gen: u32,
@@ -337,17 +339,20 @@ impl Snapshotter {
         let n = pools.len();
         let mut family = [PoolFamily::UniswapV3; HYPEREVM_MAX_POOLS];
         let mut sym = [0 as SymbolId; HYPEREVM_MAX_POOLS];
+        let mut dec = [(0u8, 0u8); HYPEREVM_MAX_POOLS];
         let e = pools.entries();
         let mut i = 0;
         while i < n {
             family[i] = e[i].family;
             sym[i] = e[i].sym;
+            dec[i] = (e[i].dec0, e[i].dec1);
             i += 1;
         }
         Self {
             n,
             family,
             sym,
+            dec,
             radius: radius.clamp(1, MAX_TICK),
             block: 0,
             gen: 0,
@@ -1008,7 +1013,18 @@ impl Snapshotter {
                     PoolFamily::Slipstream => FAMILY_SLIPSTREAM,
                     PoolFamily::Algebra => FAMILY_ALGEBRA,
                 };
-                encode_snapshot(self.block, fam, s.lo, s.hi, nodes as u16, s.fee, s.spacing)
+                let (d0, d1) = self.dec[p];
+                encode_snapshot(
+                    self.block,
+                    fam,
+                    s.lo,
+                    s.hi,
+                    nodes as u16,
+                    s.fee,
+                    s.spacing,
+                    d0,
+                    d1,
+                )
             } else if step <= nodes {
                 let nd = self.node(p, step - 1);
                 encode_tick(nd.tick, nd.liquidity_net, nd.liquidity_gross())

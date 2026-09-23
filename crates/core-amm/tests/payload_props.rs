@@ -9,8 +9,8 @@
 
 use core_amm::payload::{
     decode, encode_fee, encode_gap, encode_head, encode_liquidity, encode_snapshot, encode_state,
-    encode_swap, encode_tick, Payload, PoolEvent, FAMILY_ALGEBRA, FEE_SRC_ALGEBRA_V10,
-    FEE_SRC_ALGEBRA_V12, MAX_PAYLOAD_BLOCK, PAYLOAD_LEN,
+    encode_swap, encode_tick, Payload, PoolEvent, FAMILY_ALGEBRA, FEE_PIPS_BOUND,
+    FEE_SRC_ALGEBRA_V10, FEE_SRC_ALGEBRA_V12, MAX_PAYLOAD_BLOCK, MAX_TOKEN_DECIMALS, PAYLOAD_LEN,
 };
 use core_amm::MAX_TICK;
 use proptest::prelude::*;
@@ -56,7 +56,9 @@ fn encode(ev: &PoolEvent) -> Option<Payload> {
             nodes,
             fee,
             spacing,
-        } => encode_snapshot(block, family, lo, hi, nodes, fee, spacing),
+            dec0,
+            dec1,
+        } => encode_snapshot(block, family, lo, hi, nodes, fee, spacing, dec0, dec1),
         PoolEvent::Tick { tick, net, gross } => encode_tick(tick, net, gross),
     }
 }
@@ -134,20 +136,23 @@ fn event() -> impl Strategy<Value = PoolEvent> {
             tick(),
             tick(),
             any::<u16>(),
-            any::<u32>(),
-            1i32..=MAX_TICK
+            0u32..FEE_PIPS_BOUND,
+            1i32..=MAX_TICK,
+            (0u8..=MAX_TOKEN_DECIMALS, 0u8..=MAX_TOKEN_DECIMALS)
         )
-            .prop_map(
-                |(block, family, x, y, nodes, fee, spacing)| PoolEvent::Snapshot {
+            .prop_map(|(block, family, x, y, nodes, fee, spacing, (dec0, dec1))| {
+                PoolEvent::Snapshot {
                     block,
                     family,
                     lo: x.min(y),
                     hi: x.max(y),
                     nodes,
                     fee,
-                    spacing
+                    spacing,
+                    dec0,
+                    dec1,
                 }
-            ),
+            }),
         (tick(), any::<i128>(), any::<u128>()).prop_map(|(tick, net, gross)| PoolEvent::Tick {
             tick,
             net,

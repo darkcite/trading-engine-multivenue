@@ -88,7 +88,9 @@ fuzz_target!(|d: &[u8]| {
                 nodes,
                 fee,
                 spacing,
-            } => encode_snapshot(block, family, lo, hi, nodes, fee, spacing),
+                dec0,
+                dec1,
+            } => encode_snapshot(block, family, lo, hi, nodes, fee, spacing, dec0, dec1),
             PoolEvent::Tick { tick, net, gross } => encode_tick(tick, net, gross),
         };
         assert_eq!(back, Some(p), "decode accepted a non-canonical payload");
