@@ -10,6 +10,8 @@ import pathlib
 import sqlite3
 import typing
 
+import httpx
+
 import tests.craft
 
 import claude_worker.candles
@@ -287,6 +289,182 @@ def test_bybit_lanes_read_from_universe(tmp_path: pathlib.Path) -> None:
     assert by_name["bybit"].targets[0].instrument == "BTCUSDT"
     assert by_name["bybit-linear"].targets[0].descriptor == "bybit-linear:ETHUSDT"
     assert not by_name["bybit"].backward
+
+
+# ---- MX7: MEXC klines (bodies measured live 2026-09-23) ------------------
+
+#: `GET api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=3`.
+MEXC_SPOT_KLINES = (
+    '[[1790143860000,"86530.79","86557.74","86528.73","86557.74","6.69925626",'
+    '1790143920000,"579740.7"],[1790143920000,"86557.74","86582.82","86557.73",'
+    '"86582.82","1.81826441",1790143980000,"157410.77"],[1790143980000,"86582.82",'
+    '"86590.88","86582.81","86590.87","0.63741487",1790144040000,"55192.85"]]'
+)
+#: `GET contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min1&start=
+#: 1790143800&end=1790143980` — a 180 s window answers FOUR bars (the end is
+#: inclusive), columnar, in seconds.
+MEXC_PERP_KLINES = (
+    '{"success":true,"code":0,"data":{"time":[1790143800,1790143860,1790143920,'
+    '1790143980],"open":[86510.2,86494.2,86522.8,86548.2],"close":[86494.2,86522.8,'
+    '86548.2,86565.5],"high":[86510.2,86522.8,86548.2,86566.0],"low":[86487.8,86480.0,'
+    '86522.8,86546.9],"vol":[120845.0,152449.0,159339.0,235167.0],"amount":[1045231.10673,'
+    '1318866.5105,1378821.67158,2035546.86766],"realOpen":[86510.2,86494.2,86526.7,'
+    '86548.2],"realClose":[86494.2,86522.8,86548.2,86565.5],"realHigh":[86510.2,'
+    '86522.8,86548.2,86566.0],"realLow":[86487.8,86480.0,86526.7,86546.9]}}'
+)
+MEXC_PERP_BARS = [1_790_143_800_000, 1_790_143_860_000, 1_790_143_920_000, 1_790_143_980_000]
+
+
+def mexc_http(body: str, calls: list[str]) -> claude_worker.candles.Http:
+    def get(url: str) -> str | None:
+        calls.append(url)
+        return body
+
+    return claude_worker.candles.Http(
+        get=get, post=lambda url, body: None, hosts={"mexc": "mx.test", "mexc-perp": "mxf.test"}
+    )
+
+
+def test_parse_mexc_kline_spot_rows_are_the_binance_shape() -> None:
+    parsed = claude_worker.candles.parse_mexc_kline(MEXC_SPOT_KLINES)
+    assert parsed is not None
+    candles, malformed = parsed
+    assert malformed == 0
+    assert [c.ts_ms for c in candles] == [1_790_143_860_000, 1_790_143_920_000, 1_790_143_980_000]
+    assert (candles[0].open, candles[0].high, candles[0].low, candles[0].close) == (
+        86530.79, 86557.74, 86528.73, 86557.74
+    )
+    assert candles[2].volume == 0.63741487  # column 5: base volume
+
+
+def test_parse_mexc_kline_perp_columns_are_seconds_and_contracts() -> None:
+    parsed = claude_worker.candles.parse_mexc_kline(MEXC_PERP_KLINES)
+    assert parsed is not None
+    candles, malformed = parsed
+    assert malformed == 0
+    assert [c.ts_ms for c in candles] == MEXC_PERP_BARS
+    first = candles[0]
+    assert (first.open, first.high, first.low, first.close) == (86510.2, 86510.2, 86487.8, 86494.2)
+    assert first.volume == 120845.0  # `vol` (contracts), never `amount`
+
+
+def test_parse_mexc_kline_failure_modes() -> None:
+    parse = claude_worker.candles.parse_mexc_kline
+    # Both venues' error envelopes, as measured.
+    assert parse('{"msg":"Invalid interval.","code":-1121,"_extend":null}') is None
+    assert parse('{"success":false,"code":1001,"message":"Contract does not exist"}') is None
+    assert parse("junk") is None
+    assert parse("[junk") is None
+    # A window before the listing: every column empty — an empty PAGE.
+    empty = json.loads(MEXC_PERP_KLINES)
+    empty["data"] = {k: [] for k in empty["data"]}
+    assert parse(json.dumps(empty)) == ([], 0)
+    # Columns align by index: a short one leaves no row identity.
+    short = json.loads(MEXC_PERP_KLINES)
+    short["data"]["close"].pop()
+    assert parse(json.dumps(short)) is None
+    gone = json.loads(MEXC_PERP_KLINES)
+    del gone["data"]["vol"]
+    assert parse(json.dumps(gone)) is None
+    loose = json.loads(MEXC_PERP_KLINES)
+    loose["success"] = "true"
+    assert parse(json.dumps(loose)) is None
+    # A malformed CELL skips its own bar only.
+    bad = json.loads(MEXC_PERP_KLINES)
+    bad["data"]["high"][1] = None
+    bad["data"]["time"][2] = True
+    parsed = parse(json.dumps(bad))
+    assert parsed is not None
+    candles, malformed = parsed
+    assert malformed == 2
+    assert [c.ts_ms for c in candles] == [MEXC_PERP_BARS[0], MEXC_PERP_BARS[3]]
+
+
+def test_mexc_url_per_class_host_endpoint_and_window() -> None:
+    start = 1_790_000_000_000
+    assert claude_worker.candles._mexc_url("mx.test", "mexc", "BTCUSDT", "1h", start) == (
+        "https://mx.test/api/v3/klines?symbol=BTCUSDT&interval=60m"
+        f"&startTime={start}&endTime={start + 500 * MS_1H}&limit=500"
+    )
+    assert claude_worker.candles._mexc_url(
+        "mxf.test", "mexc-perp", "BTC_USDT", "1m", 1_790_000_040_000
+    ) == (
+        "https://mxf.test/api/v1/contract/kline/BTC_USDT?interval=Min1"
+        "&start=1790000040&end=1790060040"
+    )
+    assert claude_worker.candles._mexc_url("mxf.test", "mexc-perp", "XAU_USDT", "1d", start).count(
+        "interval=Day1"
+    ) == 1
+
+
+def test_mexc_lanes_read_from_universe(tmp_path: pathlib.Path) -> None:
+    # MX7: [mexc] spot/perp become two forward lanes; xStocks and TradFi
+    # perps are ordinary rows.
+    p = tmp_path / "universe.toml"
+    p.write_text(
+        '[mexc]\nspot=["BTCUSDT","AAPLXUSDT"]\nperp=["BTC_USDT","XAU_USDT"]\n', encoding="utf-8"
+    )
+    lanes = claude_worker.candles.read_universe_lanes(p)
+    assert lanes is not None
+    by_name = {lane.name: lane for lane in lanes}
+    assert [t.descriptor for t in by_name["mexc"].targets] == ["mexc:BTCUSDT", "mexc:AAPLXUSDT"]
+    assert [t.descriptor for t in by_name["mexc-perp"].targets] == [
+        "mexc-perp:BTC_USDT",
+        "mexc-perp:XAU_USDT",
+    ]
+    assert by_name["mexc-perp"].targets[1].instrument == "XAU_USDT"
+    for lane in lanes:
+        assert lane.venue == claude_worker.frames.VENUE_MEXC and not lane.backward
+
+
+def test_mexc_forward_fill_rides_each_class_host(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    now = MEXC_PERP_BARS[-1] + 30_000  # mid-life of the last (open) bar
+    for lane_name, desc, sym, body, host in (
+        ("mexc-perp", "mexc-perp:BTC_USDT", "BTC_USDT", MEXC_PERP_KLINES, "mxf.test"),
+        ("mexc", "mexc:BTCUSDT", "BTCUSDT", MEXC_SPOT_KLINES, "mx.test"),
+    ):
+        target = claude_worker.candles.LaneTarget(claude_worker.frames.VENUE_MEXC, desc, sym)
+        lane = claude_worker.candles.Lane(
+            lane_name, claude_worker.frames.VENUE_MEXC, [target], backward=False
+        )
+        calls: list[str] = []
+        st = claude_worker.candles.fill_forward(
+            conn, mexc_http(body, calls), lane, target, "1m", now, budget(10), {}
+        )
+        assert calls[0].startswith(f"https://{host}/")
+        assert st.pages == 1 and not st.failed and not st.budget_out
+        assert claude_worker.candles.max_open_ts(
+            conn, claude_worker.frames.VENUE_MEXC, desc, "1m"
+        ) == MEXC_PERP_BARS[-1]
+    # A venue error envelope is a FAILED fill, never a crash.
+    target = claude_worker.candles.LaneTarget(claude_worker.frames.VENUE_MEXC, "mexc:X", "X")
+    lane = claude_worker.candles.Lane(
+        "mexc", claude_worker.frames.VENUE_MEXC, [target], backward=False
+    )
+    refused = mexc_http('{"msg":"Invalid symbol.","code":-1121}', [])
+    st = claude_worker.candles.fill_forward(conn, refused, lane, target, "1m", now, budget(10), {})
+    assert st.failed
+
+
+def test_mexc_1d_backfill_is_bounded_to_one_page() -> None:
+    """MX7: a pre-listing window answers an EMPTY page on both classes and
+    an empty page ends a forward walk, so 1d is bounded (not floored)."""
+    bound = claude_worker.candles.MEXC_1D_BOUND_D
+    for lane in ("mexc", "mexc-perp"):
+        assert claude_worker.candles.backfill_start_ms("1d", NOW, lane, {}) == NOW - bound * MS_1D
+        assert claude_worker.candles.backfill_start_ms("1m", NOW, lane, {}) == NOW - 48 * MS_1H
+    assert bound <= claude_worker.candles.MEXC_SPOT_PAGE_BARS
+    assert bound <= claude_worker.candles.MEXC_PERP_PAGE_BARS
+
+
+def test_make_http_names_both_mexc_hosts() -> None:
+    with httpx.Client() as client:
+        hosts = claude_worker.candles.make_http(client, {}).hosts
+        assert (hosts["mexc"], hosts["mexc-perp"]) == ("api.mexc.com", "contract.mexc.com")
+        env = {"MEXC_REST_HOST": "a.test", "MEXC_FUT_REST_HOST": "b.test"}
+        over = claude_worker.candles.make_http(client, env).hosts
+        assert (over["mexc"], over["mexc-perp"]) == ("a.test", "b.test")
 
 
 # ---- universe lanes ------------------------------------------------------
@@ -574,12 +752,14 @@ def test_okx_backward_resumes_from_frontier(tmp_path: pathlib.Path) -> None:
 
 def test_budget_key_is_per_host():
     """VM2 V6: budgets pool per REST host — only the two bybit
-    categories share one."""
+    categories share one; MEXC's two classes are two hosts (MX7)."""
     assert claude_worker.candles.budget_key("binance") == "binance"
     assert claude_worker.candles.budget_key("binance-usdm") == "binance-usdm"
     assert claude_worker.candles.budget_key("bybit") == "bybit"
     assert claude_worker.candles.budget_key("bybit-linear") == "bybit"
     assert claude_worker.candles.budget_key("okx") == "okx"
+    assert claude_worker.candles.budget_key("mexc") == "mexc"
+    assert claude_worker.candles.budget_key("mexc-perp") == "mexc-perp"
 
 
 def test_run_cycle_budgets_per_host_and_demand_sized(tmp_path: pathlib.Path) -> None:

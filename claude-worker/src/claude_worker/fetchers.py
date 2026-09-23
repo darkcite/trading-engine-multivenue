@@ -121,6 +121,9 @@ BN_DATED_ORDINAL_BASE: int = 2048
 # WS9: `[bybit] linear` block (mirrors core-config
 # BYBIT_LINEAR_ORDINAL_BASE; spot ordinals are file-order from 1).
 BYBIT_LINEAR_ORDINAL_BASE: int = 512
+# MX7: `[mexc] perp` block (mirrors core-config MEXC_PERP_ORDINAL_BASE;
+# spot ordinals are file-order from 1 — the Binance spot/usdm split).
+MEXC_PERP_ORDINAL_BASE: int = 512
 
 _SLUG_RE: typing.Pattern[str] = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -884,6 +887,17 @@ def universe_file_proposals(
         claude_worker.frames.VENUE_BYBIT,
         "bybit-linear:",
         BYBIT_LINEAR_ORDINAL_BASE,
+        None,
+    )
+    # MX7: MEXC — spot from ordinal 1, perp from base 512 (mirrors
+    # core-config MEXC_PERP_ORDINAL_BASE).
+    _propose_list("mexc", "spot", claude_worker.frames.VENUE_MEXC, "mexc:", 0, None)
+    _propose_list(
+        "mexc",
+        "perp",
+        claude_worker.frames.VENUE_MEXC,
+        "mexc-perp:",
+        MEXC_PERP_ORDINAL_BASE,
         None,
     )
 

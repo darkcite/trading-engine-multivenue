@@ -28,7 +28,9 @@ for the requested minutes and measures, concurrently:
 - **feed delay** per venue stream: `(t_recv_host + clock_offset) − venue_timestamp`
   for every stamped message — Binance USDM `bookTicker` `E`/`T`, Binance
   `aggTrade` `E`/`T`, OKX `bbo-tbt` `ts`, Bybit `orderbook.1` `ts`/`cts`,
-  Deribit `quote` `timestamp`, Hyperliquid `l2Book` `time`. Binance SPOT
+  Deribit `quote` `timestamp`, Hyperliquid `l2Book` `time`, MEXC spot
+  `aggre.bookTicker` `sendTime` (protobuf, the probe's one binary
+  parser) and MEXC futures `depth.full` `ts`/`cts`. Binance SPOT
   `bookTicker` carries no timestamp; it is recorded for lead-lag only and
   its delivery is read off the USDM stream (the two share the delay
   pattern — receive-time cross-correlation is symmetric between them).
@@ -93,6 +95,52 @@ binance-usdm 8.9 % of messages, 38 episodes in 26 min (median 0.4 s, max
 socket never exceeded 0.95 s, so the staleness is upstream (Binance's
 publish pipeline / CDN edge), not this host's socket: the stream keeps
 flowing while its content is seconds old.
+
+### 2026-09-23 — MacBook Pro M4, operator's home network, 10 min from ~07:24Z (MX9)
+
+`python -m claude_worker.latency_probe --minutes 10`, taken to measure
+MEXC (the seventh venue, `docs/mexc-ingress-plan.md` MX9); every venue
+ran. Venue offsets (venue − host): binance +96.1, binance-usdm +98.3,
+okx +107.3, bybit +99.9, deribit +102.6, mexc +108.3, mexc-perp +105.1
+ms (hyperliquid: no time endpoint) — **+96…+108 ms this run vs +59…+63
+on 2026-09-03**; every venue moved together, i.e. the host clock, and
+the feed delays below are on each venue's own clock, as the §1 law
+requires.
+
+| venue | REST edge | TCP ms | TLS ms | req RTT p50 / p90 ms | stream | feed delay p50 / p90 / p99 ms | n | **Δ = feed p50 + RTT/2** |
+|---|---|---|---|---|---|---|---|---|
+| binance (spot) | api.binance.com | 20.4 | 29.7 | 121.1 / 133.7 | aggTrade | 64.1 / 248.6 / 446.5 | 5 388 | 124.7 → 130 |
+| binance-usdm | fapi.binance.com | 46.9 | 74.5 | 133.8 / 149.1 | bookTicker | 79.6 / 293.3 / 565.7 | 156 797 | (same lane) |
+| okx | www.okx.com | 10.8 | 20.1 | 127.5 / 140.6 | bbo-tbt ts (trades 67.5 / 71.7 / 76.5, n 1 788) | 66.4 / 69.7 / 76.4 | 4 756 | 130.2 → 140 |
+| bybit | api.bybit.com | 12.4 | 21.4 | 54.7 / 244.5 | orderbook.1 ts (cts 23.9 / 102.8 / 386.7; publicTrade 47.6 / 235.3 / 486.7, n 4 889) | 19.8 / 101.4 / 385.7 | 6 895 | 47.2 → 50 |
+| deribit | www.deribit.com | 13.8 | 17.8 | 200.2 / 220.3 | quote timestamp (trades 328.5 / 650.0 / 914.3, n 1 232) | 103.1 / 234.4 / 606.1 | 3 795 | 203.2 → 210 |
+| hyperliquid | api.hyperliquid.xyz | 16.2 | 30.2 | 139.3 / 221.4 | l2Book time (block-paced) | 273.9 / 423.3 / 569.4 | 113 | 343.6 → 350 |
+| **mexc (spot)** | **api.mexc.com** | **8.3** | **21.0** | **131.4 / 164.3** | **aggre.bookTicker sendTime** | **81.9 / 94.4 / 338.0** | **60 024** | **147.6 → 150** |
+| **mexc-perp** | **contract.mexc.com** | **14.2** | **22.7** | **134.2 / 232.0** | **depth.full ts (cts 65.3 / 92.3 / 354.9)** | **59.6 / 85.2 / 348.9** | **1 933** | **126.7 → 130** |
+| polymarket | clob.polymarket.com | 8.0 | 22.2 | 218.6 / 268.9 | — (CLOB socket needs an asset id) | unmeasured | — | 200 kept |
+
+**MEXC.** Spot 81.9 + 131.4/2 = 147.6 → 150 ms; futures 59.6 + 134.2/2
+= 126.7 → 130 ms. One venue byte carries both classes, so the slower
+binds: **Δ = 150 ms**. Stress (p90 feed + p90 RTT/2): spot 94.4 +
+164.3/2 = 176.6 → 180, futures 85.2 + 232.0/2 = 201.2 → **210 ms**. The
+stale default is the measured feed p99 rounded up, the per-venue
+doctrine: 338 / 349 → **400 ms** (`VenueId::default_stale_after_ms`).
+**Finding:** MEXC's kept-alive REST RTT is 131–134 ms from this location
+— 2.4× Bybit's this run (54.7 ms), 3× its 2026-09-03 value (43.5 ms) —
+and reproduces the Cowork-VM path. **MEXC is a research/capture venue
+from here; nothing latency-sensitive belongs on it** (plan §1.6, R4).
+
+Applied to `ModelParams::default()` / `core_fill::ACTIVATION_NS_DEFAULT`
+the same day, **MEXC only**: `[pm 200, bn 130, okx 130, deribit 220,
+hl 340, ai 0, bybit 60, mexc 150]` ms (slot 7 new). Stress for
+`--latency-ns-venue`: mexc 210 ms.
+
+**The other venues re-derived from this run are OBSERVED, NOT APPLIED**
+— bn 124.7 → 130 (unchanged), okx 130.2 → 140 (applied 130), bybit
+47.2 → 50 (applied 60), deribit 203.2 → 210 (applied 220), hl 343.6 →
+350 (applied 340). Re-calibrating them is outside the MEXC lane and is
+the operator's decision; the 2026-09-03 row stays the applied table for
+them.
 
 ## 4. Findings that this measurement settled (2026-09-03)
 
@@ -168,3 +216,41 @@ is part of the engine's delay and is exactly what the harness must
 replay; (4) Binance had no staleness episode in this window (the 8.9 %
 of §3 was measured at 17:07Z) — thresholds stay per §2 doctrine 4 until
 a longer v3 record says otherwise.
+
+### 2026-09-23 09:00:58–09:01:58Z — MEXC's first engine boot (60 s, live engine)
+
+The live paper engine (`run-1790153299745387000`, booted 08:48:19Z on the
+MEXC go-live binary `bbc8553`, `[mexc]` = the Q-MX5 twelve). This is a single
+QUIET minute, measured on request, so it is a first reading and not a
+calibration. Stale % is the engine's own verdict over the ticks it EMITTED.
+MEXC emits only BBO changes (plan D11), plus a re-emit when the stale
+verdict flips. MEXC relative delay follows this section's law: offset
+learned over the whole run, 1 ms/min decay.
+
+| venue | ticks in the minute | stale % @ default | MEXC relative p50 / p90 / p99 ms |
+|---|---|---|---|
+| binance | 256 781 | 0.00 @ 1000 | |
+| okx | 9 238 | 0.11 @ 400 | |
+| deribit | 6 719 | 0.01 @ 600 | |
+| hyperliquid | 3 386 | 0.00 @ 700 | |
+| bybit | 9 699 | 0.07 @ 500 | |
+| polymarket | 2 498 | 0.00 @ 1000 | |
+| **mexc** (spot `aggre.bookTicker` + futures `depth.full`) | **1 429** | **0.35 @ 400** | spot **8 / 147 / 366** (n 1 043) · futures **8 / 41 / 163** (n 386) |
+
+Findings:
+1. The 400 ms MEXC default holds. Spot p99 relative is 366 ms, just under
+   it, and futures has ample margin. Keep 400 until a longer quiet record
+   says otherwise (§2 doctrine 4).
+2. HOST I/O STALLS EVERY INGRESS AT ONCE. In the first 4 minutes after this
+   boot, stale bursts hit bn/bybit/deribit/hl/mexc in the same 30 s buckets
+   at 30–90 s and at 180 s: bybit 38 %, deribit 30 %, mexc 20 %. OKX alone
+   stayed clean. The bursts coincided with heavy worker disk work on the
+   same Mac: two `claude-worker fetch` runs and a manual candles cycle.
+   Once that stopped, every venue fell back to ≈ 0 % (the table). The
+   likely cause is capture writes on the ingress threads stalling behind
+   disk contention. This is not venue feed delay, so never calibrate a
+   threshold from a window that overlaps a worker cycle.
+3. MEXC in its first 13.5 min: 424 k msgs → 43.7 k ticks (the D11
+   dedupe), 0 reconnects (the D12 heartbeat holds), 0 parse errors,
+   0 sub-drops.
+

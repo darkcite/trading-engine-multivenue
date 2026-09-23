@@ -110,6 +110,14 @@ pub fn render_instruments(
     for i in &allocated.bybit_linear {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
+    // MX2: the seventh venue's two blocks (empty without `[mexc]`, so
+    // a pre-MX2 boot's manifest is byte-identical).
+    for i in &allocated.mexc_spot {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    for i in &allocated.mexc_perp {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
     for (name, sym, ..) in deribit_opts {
         let desc = format!("deribit:{name}");
         push_desc_row(&mut out, *sym, &desc);
@@ -166,6 +174,8 @@ pub fn build_descriptor_entries(
         .chain(allocated.hl.iter())
         .chain(allocated.bybit_spot.iter())
         .chain(allocated.bybit_linear.iter())
+        .chain(allocated.mexc_spot.iter())
+        .chain(allocated.mexc_perp.iter())
     {
         push(i.descriptor.clone(), i.sym);
     }
@@ -283,6 +293,17 @@ mod tests {
             name: "ADAUSDT".to_string(),
             descriptor: "bybit-linear:ADAUSDT".to_string(),
         });
+        // MX2: both MEXC blocks, spot from ordinal 1, perp from 512.
+        alloc.mexc_spot.push(core_config::universe::Instrument {
+            sym: 0x0700_0001,
+            name: "AAPLXUSDT".to_string(),
+            descriptor: "mexc:AAPLXUSDT".to_string(),
+        });
+        alloc.mexc_perp.push(core_config::universe::Instrument {
+            sym: 0x0700_0201,
+            name: "XAU_USDT".to_string(),
+            descriptor: "mexc-perp:XAU_USDT".to_string(),
+        });
         let deribit_opts = vec![(
             "BTC-27MAR26-100000-C".to_string(),
             0x0300_0201u32,
@@ -300,6 +321,8 @@ mod tests {
              {}\tderibit:BTC-FS-27MAR26_PERP\n\
              {}\tbybit:BTCUSDT\n\
              {}\tbybit-linear:ADAUSDT\n\
+             {}\tmexc:AAPLXUSDT\n\
+             {}\tmexc-perp:XAU_USDT\n\
              {}\tderibit:BTC-27MAR26-100000-C\n\
              {}\tbinance-opt:BTC-260327-100000-C\n",
             0x0100_0007u32,
@@ -308,9 +331,23 @@ mod tests {
             0x0300_0101u32,
             0x0600_0001u32,
             0x0600_0201u32,
+            0x0700_0001u32,
+            0x0700_0201u32,
             0x0300_0201u32,
             0x0100_0401u32
         );
         assert_eq!(body, want);
+        // The live resolver iterates the same blocks, and the perp
+        // block carries FUNDING (the string law, MX2).
+        let entries = build_descriptor_entries(&alloc, &deribit_opts, &[], &bn_opts, false, false);
+        let mx = entries
+            .iter()
+            .find(|(d, ..)| d == "mexc-perp:XAU_USDT")
+            .expect("mexc perp entry");
+        assert_eq!(mx.1, 0x0700_0201);
+        assert_eq!(mx.2, ingress_ai::CAP_PRICE | ingress_ai::CAP_FUNDING);
+        assert!(entries.iter().any(|(d, s, c)| d == "mexc:AAPLXUSDT"
+            && *s == 0x0700_0001
+            && *c == ingress_ai::CAP_PRICE));
     }
 }

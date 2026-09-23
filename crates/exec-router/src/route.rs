@@ -55,8 +55,9 @@ const _: () = assert!(EXEC_SLOTS.is_power_of_two());
 const _: () = assert!(EXEC_SLOTS <= u8::MAX as usize + 1);
 
 /// Venues a `venue_mask` byte can express — `core_types::VenueId` is
-/// 0..=6 today (Polymarket · Binance · Okx · Deribit · Hyperliquid ·
-/// Ai · Bybit), so one `u8` covers the domain with a bit to spare.
+/// 0..=7 since MX2 (Polymarket · Binance · Okx · Deribit · Hyperliquid ·
+/// Ai · Bybit · Mexc), so one `u8` covers the domain EXACTLY: a ninth
+/// venue (byte 8) needs this, and the mask type, widened first.
 /// A `venue` byte at or above this fails closed (not allowed).
 pub const EXEC_VENUES: u8 = 8;
 

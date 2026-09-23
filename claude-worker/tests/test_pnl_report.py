@@ -462,6 +462,25 @@ def test_load_fee_flags_v2_class_tables(tmp_path: pathlib.Path) -> None:
             claude_worker.pnl_report.load_fee_flags(fees)
 
 
+def test_load_fee_flags_accepts_the_mexc_venue_table(tmp_path: pathlib.Path) -> None:
+    """MX7 (Q-MX4): MEXC's published rates, UNVERIFIED — spot 0:5, perp
+    1:4 (the dearest configured plate). An unknown venue table is fatal,
+    so without `mexc` in FEE_VENUES this file would refuse the report."""
+    assert "mexc" in claude_worker.pnl_report.FEE_VENUES
+    fees = tmp_path / "fees.toml"
+    fees.write_text(
+        '[fees.mexc]\nspot = "0:5"   # published, UNVERIFIED\nperp = "1:4"\n', encoding="utf-8"
+    )
+    assert claude_worker.pnl_report.load_fee_flags(fees) == [
+        "--fee-bps", "mexc.spot:0:5",
+        "--fee-bps", "mexc.perp:1:4",
+    ]
+    # The class grammar still binds inside the new table.
+    fees.write_text('[fees.mexc]\ndated = "0:5"\nxstock = "0:5"\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        claude_worker.pnl_report.load_fee_flags(fees)
+
+
 def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
     """BIN15 O1: `<class>_open` becomes the harness's
     `--fee-bps <venue>.<class>.open` pair; the ordinary class line is

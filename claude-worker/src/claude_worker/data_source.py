@@ -93,15 +93,9 @@ def _manifest_sizes(
 
 
 def _venues_from_catalog(manifest: dict[str, typing.Any]) -> tuple[str, ...]:
-    catalog = manifest.get("catalog")
-    if not isinstance(catalog, dict):
-        return ()
-    totals = catalog.get("venue_totals")
-    if not isinstance(totals, dict):
-        return ()
-    # venue_totals, not the per-day venue_ticks array: the latter iterates 6 of
-    # a 7-wide venue list and silently omits bybit (capture_catalog.rs).
-    return tuple(sorted(k for k, v in totals.items() if isinstance(v, dict) and v.get("ticks")))
+    # venue_totals (every venue, bybit and mexc included), never the per-day
+    # venue_ticks array — see `archive.catalog_venues`.
+    return claude_worker.archive.catalog_venues(manifest.get("catalog"))
 
 
 class DataSource:

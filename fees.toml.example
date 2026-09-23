@@ -42,6 +42,8 @@
 #   hl       icdp BTC perp                   0.015 % / 0.045 %             2:5
 #   bybit    icdp bybit-linear BTCUSDT       0.0200 % / 0.0550 %           2:6  <- binds
 #            (bybit SPOT is capture-only)    0.1000 % / 0.1000 %          10:10
+#   mexc     (none — data-only, O-MX1)       perp FX plate 0.01 % / 0.04 % 1:4  <- UNVERIFIED
+#            (spot incl. xStocks)            0 % / 0.05 %                  0:5     (REST, 2026-09-20)
 #
 # pm CAVEAT — the one line that does not fit the model. Polymarket's taker fee
 # is `C x 0.07 x p x (1-p)`, i.e. 0.07·(1-p) OF NOTIONAL: price-dependent, and
@@ -87,7 +89,8 @@
 # in `claude_worker.instrument_class`, one shared fixture): `binance:` spot,
 # `binance-usdm:` perp (`_yymmdd` dated), `binance-opt:` option, `okx:` by instId
 # shape, `deribit:` by name, `hyperliquid:` perp, `bybit:` spot, `bybit-linear:`
-# perp (`-DDMMMYY` dated), a bare token id prediction. A sym whose class the law
+# perp (`-DDMMMYY` dated), `mexc:` spot (xStocks included), `mexc-perp:` perp
+# (always — MEXC lists no dated futures), a bare token id prediction. A sym whose class the law
 # does not know is charged the venue's DEAREST class and counted
 # (`fee_class_unknown`) — never silently the cheapest.
 #
@@ -126,6 +129,11 @@
 #   bybit    dated        futures 0.0200 % / 0.0550 % non-VIP        2:6   help "Trading-Fee-Structure"
 #   bybit    option_cap   0.02 % / 0.03 % of index, cap 7 %         3:700  help "Bybit-Option-Fees-Explained" (taker under
 #                         of option price; delivery 0.015 %                 L3; delivery not modelled)
+#   mexc     spot         0 % / 0.05 % (crypto AND xStocks)          0:5   exchangeInfo makerCommission/takerCommission
+#                                                                           (2026-09-20) — UNVERIFIED, see [fees.mexc]
+#   mexc     perp         dearest plate: FX 0.01 % / 0.04 %          1:4   contract/detail makerFeeRate/takerFeeRate
+#                         (crypto 0:2, TradFi 0fees 0:0, XAU 0:2,           (2026-09-20) — UNVERIFIED, see [fees.mexc]
+#                         USOIL 0:1, FX 1:4)
 #
 # The bare `[fees]` lines are the D2-AMEND values UNCHANGED (the dearest TRADED
 # class per venue, L2) — they are what a pre-XSD-F reader still charges every
@@ -140,6 +148,7 @@ okx = "8:10"
 deribit = "2:5"
 hl = "2:5"
 bybit = "2:6"
+mexc = "1:4"
 
 [fees.pm]
 prediction = "0:350"
@@ -202,3 +211,15 @@ spot = "10:10"
 perp = "2:6"
 dated = "2:6"
 option_cap = "3:700"
+
+# MEXC (MX2/MX5): 2026-09-20, the venue's published per-symbol REST rates
+# (exchangeInfo makerCommission/takerCommission; contract/detail
+# makerFeeRate/takerFeeRate) — UNVERIFIED: no measured fill exists (O-MX1);
+# the fees law is satisfied only if MEXC is ever armed. perp = the dearest
+# configured perp plate (FX, EUR_USDT 1:4); per-plate: crypto perps 0:2,
+# TradFi `mc-trade-zone-0fees` 0:0, XAU 0:2, USOIL 0:1, FX 1:4; spot incl.
+# xStocks 0:5. The bare `mexc` line (1:4) reaches only the classes MEXC does
+# not list (dated/option/prediction) — both listed classes are named here.
+[fees.mexc]
+spot = "0:5"
+perp = "1:4"

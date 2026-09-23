@@ -127,6 +127,41 @@ impl Keepalive {
         }
         KeepaliveAction::None
     }
+
+    /// [`Self::poll`] for a venue that requires a CLIENT heartbeat no
+    /// matter how busy the feed is: the ping is due `ping_interval_ns`
+    /// after the last ping WE sent, inbound traffic notwithstanding.
+    /// Measured live 2026-09-23 (MX9): MEXC futures closes a socket
+    /// that is flooding it with `push.depth.full` after 60 s without a
+    /// client `ping` (`rs.error: "more than 60 seconds no response,
+    /// close the channel"`), which [`Self::poll`] — quiet-time pings
+    /// only — never sends on a busy connection. Reconnect semantics
+    /// are unchanged (no inbound byte for `idle_timeout_ns`). Before
+    /// the first ping of a session the anchor is `session_start_ns`
+    /// (the session's connect instant) — NEVER `last_activity_ns`: a
+    /// busy feed keeps that at "now" forever, so a first ping anchored
+    /// on it would never come due and the venue would still close the
+    /// socket at 60 s (MX review finding).
+    #[inline]
+    pub fn poll_client_heartbeat(
+        &mut self,
+        now_ns: u64,
+        last_activity_ns: u64,
+        session_start_ns: u64,
+    ) -> KeepaliveAction {
+        if now_ns.saturating_sub(last_activity_ns) >= self.cfg.idle_timeout_ns {
+            return KeepaliveAction::Reconnect;
+        }
+        let anchor = if self.last_ping_ns == 0 {
+            session_start_ns
+        } else {
+            self.last_ping_ns
+        };
+        if now_ns.saturating_sub(anchor) >= self.cfg.ping_interval_ns {
+            return KeepaliveAction::SendPing;
+        }
+        KeepaliveAction::None
+    }
 }
 
 #[cfg(test)]
@@ -210,5 +245,70 @@ mod tests {
         // Failure mode: now < session_start (monotonic source swap in
         // tests) must not underflow into a giant elapsed value.
         assert!(!establishment_expired(5, 10, 0, 30_000_000_000));
+    }
+
+    #[test]
+    fn client_heartbeat_pings_a_busy_connection_on_schedule() {
+        let mut k = Keepalive::new(CFG);
+        let t0 = 1_000_000_000u64;
+        // Inbound bytes every instant — `poll` would never ping.
+        assert_eq!(k.poll(t0 + 30_000_000_000, t0 + 30_000_000_000), KeepaliveAction::None);
+        // The FIRST heartbeat is due 25 s after the SESSION START even
+        // though inbound bytes arrive every instant (a first ping
+        // anchored on activity never came due on a busy feed — the
+        // venue then closed the socket at 60 s)…
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 24_000_000_000, t0 + 24_000_000_000, t0),
+            KeepaliveAction::None
+        );
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 25_000_000_000, t0 + 25_000_000_000, t0),
+            KeepaliveAction::SendPing,
+            "a busy feed still gets its first ping at session start + interval"
+        );
+        k.mark_ping_sent(t0 + 25_000_000_000);
+        // …then every 25 s after the last ping, however busy the feed.
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 49_000_000_000, t0 + 49_000_000_000, t0),
+            KeepaliveAction::None
+        );
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 50_000_000_000, t0 + 50_000_000_000, t0),
+            KeepaliveAction::SendPing
+        );
+        // No storm: once sent, the next ping waits a full interval.
+        k.mark_ping_sent(t0 + 50_000_000_000);
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 50_050_000_000, t0 + 50_050_000_000, t0),
+            KeepaliveAction::None
+        );
+        // A reconnect re-anchors on the NEW session's start.
+        k.reset();
+        let t1 = t0 + 100_000_000_000;
+        assert_eq!(
+            k.poll_client_heartbeat(t1 + 24_000_000_000, t1 + 24_000_000_000, t1),
+            KeepaliveAction::None
+        );
+        assert_eq!(
+            k.poll_client_heartbeat(t1 + 25_000_000_000, t1 + 25_000_000_000, t1),
+            KeepaliveAction::SendPing
+        );
+    }
+
+    #[test]
+    fn client_heartbeat_still_reconnects_on_inbound_silence() {
+        let mut k = Keepalive::new(CFG);
+        let t0 = 1_000_000_000u64;
+        k.mark_ping_sent(t0 + 39_000_000_000);
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 40_000_000_000, t0, t0),
+            KeepaliveAction::Reconnect
+        );
+        // Reconnect dominates a due first ping too.
+        let mut k = Keepalive::new(CFG);
+        assert_eq!(
+            k.poll_client_heartbeat(t0 + 41_000_000_000, t0, t0),
+            KeepaliveAction::Reconnect
+        );
     }
 }

@@ -82,7 +82,7 @@ struct LaneClock {
 /// One run's re-judge state: a [`LaneClock`] per (lane, sym) plus the
 /// per-lane accounting.
 pub struct StaleJudge {
-    thresholds: [u32; 7],
+    thresholds: [u32; 8],
     clocks: BTreeMap<(u8, u32), LaneClock>,
     /// Per-lane accounting, [`VENUE_LABELS`] order.
     pub stats: [StaleStats; VENUE_LABELS.len()],
@@ -90,7 +90,7 @@ pub struct StaleJudge {
 
 impl StaleJudge {
     /// Thresholds indexed by the VENUE BYTE (`ModelParams::stale_after_ms`).
-    pub fn new(thresholds: [u32; 7]) -> Self {
+    pub fn new(thresholds: [u32; 8]) -> Self {
         Self {
             thresholds,
             clocks: BTreeMap::new(),
@@ -274,10 +274,43 @@ mod tests {
 
     #[test]
     fn stale_time_bps_is_zero_for_empty_and_single_tick_lanes() {
-        let mut j = StaleJudge::new([400; 7]);
+        let mut j = StaleJudge::new([400; 8]);
         assert_eq!(j.stats[0].stale_time_bps(), 0);
         let mut a = t(1_000, 1_000_000, 0);
         j.judge(0, &mut a, true);
         assert_eq!(j.stats[0].stale_time_bps(), 0);
+    }
+
+    /// MX2/MX9: the MEXC lane (label index 7, venue byte 7) is judged
+    /// against its own 400 ms threshold (the measured feed-delay p99,
+    /// rounded up) — a 0.3 s-behind push is fresh, 0.6 s is stale.
+    #[test]
+    fn mexc_lane_is_judged_on_its_own_threshold() {
+        assert_eq!(VENUE_LABELS[7], "mexc");
+        let mexc = |ts_ms: u64, venue_ms: u64| {
+            Tick::new_stamped(
+                ts_ms * 1_000_000,
+                VenueId::Mexc,
+                (7 << 24) | 513,
+                1,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                Price::from_raw(2),
+                Qty::from_raw(1),
+                venue_ms,
+                0,
+            )
+        };
+        let mut j = StaleJudge::new(VenueId::stale_after_ms_defaults());
+        let mut a = mexc(1_000, 1_000_000); // sets the offset
+        let mut b = mexc(2_300, 1_001_000); // 0.3 s behind: fresh
+        let mut c = mexc(3_600, 1_002_000); // 0.6 s behind: stale
+        j.judge(7, &mut a, true);
+        j.judge(7, &mut b, true);
+        j.judge(7, &mut c, true);
+        assert_eq!(a.flags, 0);
+        assert_eq!(b.flags, 0);
+        assert_eq!(c.flags, TICK_FLAG_STALE);
+        assert_eq!(j.stats[7].stale_ticks, 1);
     }
 }

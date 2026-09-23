@@ -299,6 +299,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-mexc"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+]
+
+[[package]]
 name = "ingress-okx"
 version = "0.1.0"
 dependencies = [
@@ -421,6 +435,7 @@ dependencies = [
  "ingress-deribit",
  "ingress-hyperevm",
  "ingress-hyperliquid",
+ "ingress-mexc",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",

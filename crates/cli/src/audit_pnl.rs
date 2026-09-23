@@ -480,7 +480,7 @@ fn load_run_events(
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
     bin_out: &mut AuditBinOut,
-    stale_after_ms: [u32; 7],
+    stale_after_ms: [u32; 8],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
         epoch_ns: run.epoch_ns,
@@ -1000,7 +1000,7 @@ fn load_and_merge_events(
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
     bin_out: &mut AuditBinOut,
-    stale_after_ms: [u32; 7],
+    stale_after_ms: [u32; 8],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedEv> = Vec::new();

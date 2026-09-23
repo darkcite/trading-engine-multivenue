@@ -46,6 +46,61 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
 | **Deribit** | Perps + **USDC linear alt perps** (7 CVFC coins) + spot + options (E2×K8) + combos (config-in) | quote, book.100ms → **L2 depth**, trades, ticker+funding (hourly interest_8h), **DVOL** index, option ticker → opt-summary | The CVFC edge venue |
 | **Hyperliquid** | Perp coins (7: BTC/ETH/SOL/XRP/DOGE/ADA/LTC; spot @idx + HIP-4 config-in) | bbo, l2Book, ctx (premium/funding hourly), allMids, outcomeMeta | Hourly funding = fastest funding signal |
 | **Bybit** | Spot + linear perps (14: majors + CVFC coins + S1 pilot alts) | orderbook.1 ticks, publicTrade, tickers (mark/funding/OI) | Data-only sixth venue; intent-addressable since the 2026-08-29 unfreeze |
+| **MEXC** | Spot (crypto + **xStocks** tokenized equities) + USDT perps (crypto + **TradFi**: equities, indices, metals, energy, FX); first universe 5 spot + 7 perp (config-in) | spot aggre.bookTicker ticks + deals (protobuf); futures depth.full ticks, deal, ticker (mark/index/funding/OI) | Data-only seventh venue (2026-09-23) — capture only, §2.1 |
+
+### 2.1 MEXC — the seventh venue (landed 2026-09-23, `docs/mexc-ingress-plan.md`)
+
+Product facts only; the plan's §1 / §1.7 carry the measurements.
+
+- **Four classes on two keys.** `[mexc] spot` holds crypto spot AND the
+  xStocks tokenized equities (`AAPLXUSDT` "Apple xStock", `SPYXUSDT`) —
+  ordinary `mexc:` Spot rows. `[mexc] perp` holds crypto perps AND the
+  TradFi plane — single-name equities (`AAPLSTOCK_USDT`), indices
+  (`SPY_USDT`), metals (`XAU_USDT`), energy (`USOIL_USDT`), FX
+  (`EUR_USDT`) — ordinary `mexc-perp:` Perp rows. No new instrument
+  class, no equity branch (the BST ruling).
+- **Size.** 2026-09-20 (plan §1.3): 1 966 spot symbols (79 xStocks), 1 174
+  perps (431 on the TradFi plate: 400 single-name, 66 index, 60 ETF,
+  commodities / metals / oil / FX). 2026-09-23 discovery: 1 954 spot rows
+  (all live), 1 185 perp rows (1 134 live). MEXC lists and delists
+  aggressively; the news lane watches its delistings section.
+- **First universe (ruling Q-MX5):** spot `BTCUSDT ETHUSDT SOLUSDT
+  AAPLXUSDT SPYXUSDT`, perp `BTC_USDT ETH_USDT XAU_USDT USOIL_USDT
+  EUR_USDT SPY_USDT AAPLSTOCK_USDT`. It is captured only once `[mexc]`
+  is in `~/multivenue/universe.toml` and the engine has restarted — the
+  run's `instrument-manifest.tsv` is the truth.
+- **Channels.** Spot: BBO + prints only — incremental depth is `Blocked!`
+  on the public tier, so there is no MEXC book and no depth feature.
+  Futures: BBO = the top of `depth.full` (limit 5; ~270 ms on BTC, 4–5 s
+  between pushes on a quiet perp — it pushes on change), prints, and
+  `push.ticker` (~2.75 s) → Mark (`fairPrice` / `indexPrice`), Funding,
+  open interest. Ticks are BBO CHANGES (MEXC republishes unchanged
+  quotes; the ingress drops them). **Futures sizes are CONTRACTS**
+  (`contractSize`: BTC_USDT 0.0001, XAU_USDT 0.001, EUR_USDT 1, …).
+- **Funding cycle is per symbol:** 8 h on BTC / ETH / SPY / AAPLSTOCK,
+  **4 h on XAU, USOIL and EUR**. The worker funding lane (`mexc-perp`)
+  stores each settled print at its own settle time; the live `Funding`
+  event's next-settle `v1` rides a boot REST seed. Funding on gold, oil
+  and FX exists nowhere else in the universe (equity-perp funding also
+  exists on Binance's TradFi perps).
+- **Fees are UNVERIFIED** (the venue's published per-symbol REST rates,
+  2026-09-20; no fill has ever measured them): spot 0 / 5 bps (xStocks
+  included); perps crypto 0 / 2, the TradFi `0fees` plate 0 / 0, XAU 0 / 2,
+  USOIL 0 / 1, FX 1 / 4. `fees.toml` charges MEXC perps the dearest
+  configured plate (1:4).
+- **`indexOrigin` caveat.** MEXC's equity-perp index derives partly from
+  Binance's TradFi perp (`AAPLSTOCK_USDT` lists `BINANCE_FUTURE,
+  BITGET_FUTURE, BINANCETICKER, PYTH, KAIKO`), which this engine already
+  ingests. A MEXC↔Binance equity pair is therefore INDEX-LINKED, not
+  independent — what looks like a basis is a lead/lag on a shared
+  reference — and the `xv` authoring laws apply to it (entry at ≥ ~4.5σ
+  of the pair's deviation; the family's standing verdict is in §4).
+- **Capture only.** MEXC is data-only (ruling O-MX1): no exec arm, no fill
+  lane, and the harness fill model counts an order on venue byte 7
+  unroutable. Rulesets may NAME its descriptors (ruling Q-MX6; channel
+  caps `mexc:` price, `mexc-perp:` price + funding) as signal or
+  reference legs. From this host its REST RTT is 131–134 ms (Δ 150 ms,
+  `docs/venue-latency.md` §3): nothing latency-sensitive belongs on it.
 
 ## 3. Derived/offline data (what research actually reads)
 
@@ -74,8 +129,9 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
   legacy tarballs and pulls back the same way.
 - **candles.db**: 1m/1h/1d candles keyed venue+descriptor (all
   configured instruments incl. equities via klines) · `funding` table
-  (5 venues, per-print rates — cadence law: deribit rows are hourly
-  samples of interest_8h, ÷8 on daily sums) · `iv_digest` (per-sym
+  (6 venues incl. `mexc-perp`, per-print rates — cadence law: deribit
+  rows are hourly samples of interest_8h, ÷8 on daily sums; MEXC prints
+  at each symbol's own 4 h / 8 h cycle) · `iv_digest` (per-sym
   1m/1h IV from opt-summary) · `depth_digest` (VM2 V6: hourly
   imbalance-OHLC / spread-bps / near-notional per depth-capable
   descriptor).

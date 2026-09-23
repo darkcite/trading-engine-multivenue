@@ -977,6 +977,11 @@ mod tests {
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
         assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"latency-arb\""));
         assert!(body.contains("\"venue\":\"rpc\""));
+        // MX2: MEXC is appended after rpc — the array order is the
+        // `/state` contract, so it must render LAST.
+        let rpc = body.find("\"venue\":\"rpc\"").unwrap();
+        let mexc = body.find("\"venue\":\"mexc\"").expect("mexc ingress row");
+        assert!(rpc < mexc, "mexc must follow rpc (append, never reorder)");
         assert!(body.contains("\"heartbeat_age_s\":-1"));
     }
 

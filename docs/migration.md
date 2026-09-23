@@ -6,6 +6,104 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — VenueId 7 = MEXC + tick lane 6 (MX2–MX9, the seventh venue)
+
+**What changed**
+
+- `VenueId` gains `Mexc = 7` (append-only; the first unassigned byte is
+  now 8). MEXC rides TICK and EVENT LANE 6 (`engine::tick_lane_of`);
+  `NUM_TICK_LANES` 6 → 7; no depth, options or fill lane.
+- Every venue-indexed table widens 7 → 8:
+  `VenueId::stale_after_ms_defaults`, `core_fill::ACTIVATION_NS_DEFAULT`,
+  `ModelParams` (`fee_bps`, `fee_open_bps`, `fee_settle_bps`,
+  `latency_ns`, `stale_after_ms`, `opt_fee`), `parse_stale_after_ms`;
+  `engine_snapshot::SNAPSHOT_VENUES` 7 → 8 (`mexc` appended AFTER
+  `rpc` — the `/state` array position). `TRADEABLE_VENUES` stays 6:
+  MEXC has model columns but is NOT tradeable (ruling O-MX1).
+- New capture label `mexc` — the uniform set `mexc-ticks.pmlr`,
+  `mexc-events.pmlr`, and header-only `-signals` / `-opt-summary` /
+  `-depth`; `mexc-raw.tap` under `--raw-tap mexc`. `mexc` appended to
+  `VENUE_LABELS` in `backtest`, `audit-replay` and `capture-catalog`.
+  Per-venue capture law (ticks are BBO changes, `venue_seq` without the
+  chain law, the event mapping): `docs/wire-format.md` "Capture files".
+- `[mexc]` universe section: `spot` (UPPERCASE `BTCUSDT`; xStocks
+  `AAPLXUSDT` are ordinary rows) → `make_symbol_id(Mexc, i+1)`; `perp`
+  (`BTC_USDT`; TradFi rows ordinary) → ordinals from
+  `MEXC_PERP_ORDINAL_BASE = 512`. Descriptors `mexc:<SYM>` (Spot) and
+  `mexc-perp:<SYM>` (Perp), mirrored in `core-config::instrument_class`,
+  `claude_worker.instrument_class` and the shared TSV fixture.
+- Config hosts (optional; defaults in `.env.example`): `MEXC_WS_HOST`
+  (`wbs-api.mexc.com`), `MEXC_FUT_WS_HOST` (`contract.mexc.com`),
+  `MEXC_REST_HOST` (`api.mexc.com`), `MEXC_FUT_REST_HOST`
+  (`contract.mexc.com`) — MEXC splits spot and futures on both planes.
+- Metrics: the `engine_ingress_mexc_*` family (counters, `_state`,
+  `_last_tick_age_seconds`, `_feed_delay_ema_ms`, capture and coverage
+  gauges) and a NEW counter on EVERY venue,
+  `engine_ingress_<venue>_seq_regressions_total` (ruling Q-MX1 — only
+  MEXC increments it; every other venue reads 0).
+- `/state`: the `ingress` array gains a `mexc` row after `rpc`; the TUI
+  shows it as the eighth venue row.
+- Harness / audit / engine flags: `mexc` is a model label —
+  `--fee-bps mexc[.<class>]:<m>:<t>`, `--latency-ns-venue mexc:<ns>`,
+  `--stale-after-ms mexc:<ms>` (engine `run`, `backtest`, `audit-pnl`),
+  `--raw-tap mexc`. Defaults: stale **400 ms**, Δ **150 ms** (measured
+  2026-09-23, `docs/venue-latency.md` §3). The `backtest` summary line
+  and the detail sidecar's `stale_after_ms` object gain a `mexc` key
+  (additive; `detail_version` stays 7).
+- `cli::build_ai_universe` takes a sixth argument `mexc_syms:
+  &[SymbolId]`: every MEXC instrument the boot allocated joins the
+  ruleset validator's boot universe (ruling Q-MX6; Bybit stays out).
+  Caps: `mexc:` → `CAP_PRICE`, `mexc-perp:` → `CAP_PRICE | CAP_FUNDING`,
+  on both sides of the Rust↔Python mirror.
+- `core-config::exec::VENUE_NAMES` reserves `mexc` = 7 — an `exec.toml`
+  may NAME it; nothing arms it (no `ExecMode` arm, no dispatcher).
+- `capture-catalog` JSON: the per-day `venue_ticks` array carries EVERY
+  venue in `VENUE_LABELS` order (8 entries; it was the first 6 of 7 and
+  silently omitted Bybit).
+- `fees.toml`: `[fees] mexc = "1:4"`, `[fees.mexc] spot = "0:5"`,
+  `perp = "1:4"` — the published rates, UNVERIFIED (ruling Q-MX4).
+  `news.toml`: source kinds `json-mexc-ann` and `ping-mexc`, five
+  example rows (`venue = "mexc"`).
+- Worker: `VENUE_MEXC = 7`; candle lanes `mexc` / `mexc-perp`; funding
+  lane `mexc-perp`; `latency_probe` rows `mexc` / `mexc-perp`.
+
+**Why**
+
+- `docs/mexc-ingress-plan.md` MX0–MX9 — the seventh venue; rulings
+  O-MX1…O-MX3 (2026-09-20) and Q-MX1…Q-MX7 (2026-09-23).
+
+**Impact**
+
+- On-disk formats: new per-venue capture files under the existing
+  container version (PMLR v3 — no bump, no slot-layout change); ticks
+  and events may carry venue byte 7. Pre-MX2 `audit-replay` /
+  `backtest` binaries skip the `mexc` label's files and treat venue
+  byte 7 as corruption — decode with a post-MX2 binary.
+- Config keys: `[mexc] spot/perp` (additive); four optional env hosts;
+  the `fees.toml` and `news.toml` MEXC entries.
+- Wire formats: append-only enum growth on `VenueId`.
+- Operator surfaces: one new counter per venue, the `mexc` metrics
+  family and `/state` row, a longer `venue_ticks` array.
+
+**Migration steps**
+
+1. None until a `[mexc]` section is configured; the venue is entirely
+   opt-in. **A boot with no `[mexc]` behaves as before**: no MEXC
+   discovery, thread, socket or capture file — lane 6 idles, and the
+   new metrics and `/state` row read zero.
+2. To enable: append `[mexc]` to `~/multivenue/universe.toml` (append,
+   never reorder) and restart the engine. The `www.mexc.co`
+   announcement origin needs the operator's trust approval before its
+   `news.toml` rows are enabled.
+
+**Rollback**
+
+- Safe while `[mexc]` stays empty (old binaries reject the section as
+  an unknown-section parse error — remove it before rolling back).
+  Remove the `mexc` lines from `fees.toml` too (an older `pnl_report`
+  refuses an unknown fee venue) and the MEXC rows from `news.toml` (an
+  older worker refuses the unknown kinds).
+
 ## 2026-09-20 — E7 session bound: `exec.toml` gains OPTIONAL `halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6`, `HaltReason` 8/9 (`pnl-gain`/`pnl-loss`), `HaltSignal` 40 → 48 B, `exec-pnl-anchor.state`
 
 **No wire-format change.** One state file, two config keys, two halt

@@ -150,6 +150,21 @@ pub struct Config {
     /// (`GET /v5/market/instruments-info`). Env: `BYBIT_REST_HOST`.
     /// Default: `api.bybit.com`.
     pub bybit_rest_host: String,
+    /// MX2/MX5: MEXC spot public WS host (path `/ws`, protobuf
+    /// pushes). Env: `MEXC_WS_HOST`. Default: `wbs-api.mexc.com`.
+    pub mexc_ws_host: String,
+    /// MX2/MX5: MEXC futures public WS host (path `/edge`, JSON).
+    /// Env: `MEXC_FUT_WS_HOST`. Default: `contract.mexc.com`.
+    pub mexc_fut_ws_host: String,
+    /// MX2/MX5: MEXC spot REST host for boot discovery
+    /// (`GET /api/v3/exchangeInfo`). Env: `MEXC_REST_HOST`.
+    /// Default: `api.mexc.com`.
+    pub mexc_rest_host: String,
+    /// MX2/MX5: MEXC futures REST host for boot discovery + the funding
+    /// seed (`GET /api/v1/contract/detail`, `…/funding_rate/{sym}`).
+    /// Env: `MEXC_FUT_REST_HOST`. Default: `contract.mexc.com`. Four
+    /// hosts because MEXC splits spot and futures on both planes.
+    pub mexc_fut_rest_host: String,
     /// AI-command UDS path (Phase 8f §4.2). Env: `AI_INGRESS_SOCK`.
     /// Default: `~/multivenue/run/ai.sock` (tilde expanded at load,
     /// like `log_dir`). The companion secret `AI_INGRESS_HMAC_KEY` is
@@ -210,6 +225,12 @@ impl Config {
                 .unwrap_or_else(|| "api.hyperliquid.xyz".into()),
             bybit_ws_host: env_opt("BYBIT_WS_HOST").unwrap_or_else(|| "stream.bybit.com".into()),
             bybit_rest_host: env_opt("BYBIT_REST_HOST").unwrap_or_else(|| "api.bybit.com".into()),
+            mexc_ws_host: env_opt("MEXC_WS_HOST").unwrap_or_else(|| "wbs-api.mexc.com".into()),
+            mexc_fut_ws_host: env_opt("MEXC_FUT_WS_HOST")
+                .unwrap_or_else(|| "contract.mexc.com".into()),
+            mexc_rest_host: env_opt("MEXC_REST_HOST").unwrap_or_else(|| "api.mexc.com".into()),
+            mexc_fut_rest_host: env_opt("MEXC_FUT_REST_HOST")
+                .unwrap_or_else(|| "contract.mexc.com".into()),
             ai_ingress_sock: expand_tilde(
                 &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
             )?,
@@ -638,6 +659,49 @@ mod tests {
             std::env::remove_var("OKX_REST_HOST");
             std::env::remove_var("DERIBIT_WS_HOST");
             std::env::remove_var("HYPERLIQUID_API_HOST");
+        }
+    }
+
+    /// MX2/MX5: the four MEXC hosts default to the measured endpoints
+    /// and each honours its own env override.
+    #[test]
+    fn mexc_host_fields_default_and_override() {
+        let _env = env_guard();
+        set_required_env();
+        const KEYS: [&str; 4] = [
+            "MEXC_WS_HOST",
+            "MEXC_FUT_WS_HOST",
+            "MEXC_REST_HOST",
+            "MEXC_FUT_REST_HOST",
+        ];
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.mexc_ws_host, "wbs-api.mexc.com");
+        assert_eq!(cfg.mexc_fut_ws_host, "contract.mexc.com");
+        assert_eq!(cfg.mexc_rest_host, "api.mexc.com");
+        assert_eq!(cfg.mexc_fut_rest_host, "contract.mexc.com");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("MEXC_WS_HOST", "spot-ws.example");
+            std::env::set_var("MEXC_FUT_WS_HOST", "fut-ws.example");
+            std::env::set_var("MEXC_REST_HOST", "spot-rest.example");
+            std::env::set_var("MEXC_FUT_REST_HOST", "fut-rest.example");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.mexc_ws_host, "spot-ws.example");
+        assert_eq!(cfg.mexc_fut_ws_host, "fut-ws.example");
+        assert_eq!(cfg.mexc_rest_host, "spot-rest.example");
+        assert_eq!(cfg.mexc_fut_rest_host, "fut-rest.example");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
         }
     }
 }

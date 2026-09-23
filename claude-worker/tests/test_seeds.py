@@ -150,6 +150,30 @@ def test_funding_frames_raw_rate_law_and_caps_filter(tmp_path):
     assert f.side == claude_worker.frames.SIDE_NONE
 
 
+def test_mexc_perp_rows_seed_and_mexc_spot_never_does(tmp_path):
+    """MX7: `mexc-perp:` descriptors carry CAP_FUNDING and join the seed
+    lane under venue 7; a `mexc:` spot descriptor never seeds."""
+    now_ms = EPOCH_MS
+    mexc = claude_worker.frames.VENUE_MEXC
+    _db, conn = _funding_db(
+        tmp_path,
+        [
+            (mexc, "mexc-perp:XAU_USDT", now_ms - MS_1H, 0.000041),
+            (mexc, "mexc:BTCUSDT", now_ms - MS_1H, 0.1),  # spot: never seeded
+        ],
+    )
+    perp_sym = (mexc << 24) | 513
+    manifest = {
+        (mexc, perp_sym): "mexc-perp:XAU_USDT",
+        (mexc, (mexc << 24) | 1): "mexc:BTCUSDT",
+    }
+    frames, stats = claude_worker.seeds.funding_seed_frames(conn, manifest, now_ms)
+    conn.close()
+    assert stats == claude_worker.seeds.FundingStats(1, 1, 0)
+    assert frames[0].sym == perp_sym
+    assert frames[0].px == 41_000  # 0.000041 x 1e9, raw
+
+
 def test_funding_seed_rows_and_tsv_carry_the_harness_shape(tmp_path):
     """The harness seed file (``funding-seed.tsv``) is the SAME law as
     the boot frames: descriptor / venue ms / rate ×1e9 RAW, oldest

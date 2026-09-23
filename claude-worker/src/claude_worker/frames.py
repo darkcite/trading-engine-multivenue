@@ -174,6 +174,8 @@ VENUE_HYPERLIQUID: int = 4
 VENUE_AI: int = 5
 # WS9: the sixth market-data venue.
 VENUE_BYBIT: int = 6
+# MX7: the seventh (docs/mexc-ingress-plan.md; data-only, O-MX1).
+VENUE_MEXC: int = 7
 FLAG_EXPIRE_ON_SILENCE: int = 1
 
 # len u16 + AiCmd head (50 B); the 16 pad bytes are zeroed separately.

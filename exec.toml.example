@@ -150,7 +150,11 @@ name = "bin15"
 # own orders, so it is a parse error rather than a puzzle at runtime).
 #
 # Known spellings — the same ones universe.toml uses:
-#   polymarket  binance  okx  deribit  hyperliquid  ai  bybit
+#   polymarket  binance  okx  deribit  hyperliquid  ai  bybit  mexc
+#
+# `mexc` (byte 7) is reserved so an artifact can NAME the venue; MEXC is
+# DATA-ONLY (docs/mexc-ingress-plan.md, ruling O-MX1) — no execution arm,
+# so a live slot naming it refuses the boot like any venue without one.
 #
 # A LIVE SLOT NEVER FALLS BACK TO PAPER (law E-1). An order naming a
 # venue not listed here is refused and counted, never modelled — a

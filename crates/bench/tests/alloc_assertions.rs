@@ -1229,9 +1229,10 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
     // The lane arrays below are written out for the lane geometry
-    // (six tick lanes since WS9 added Bybit at lane 5; four fill
-    // lanes); break the build loudly if that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 6 && NUM_FILL_LANES == 4);
+    // (seven tick lanes since MX2 added MEXC at lane 6, after WS9's
+    // Bybit at lane 5; four fill lanes); break the build loudly if
+    // that drifts.
+    const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 4);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1252,8 +1253,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // unused inside this test fixture.
     let _ = std::marker::PhantomData::<SubmitErr>;
 
-    // Lane arrays: six tick lanes (Polymarket, Binance, OKX,
-    // Deribit, Hyperliquid, Bybit — WS9) + four fill lanes. Only
+    // Lane arrays: seven tick lanes (Polymarket, Binance, OKX,
+    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2) + four fill lanes. Only
     // lane 0 (Polymarket) gets a live producer here; the unused
     // producer halves stay alive until end of scope, and their lanes
     // simply read empty every iteration.
@@ -1263,11 +1264,12 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-    // WS10-A: six venue-event lanes ride in every engine. Lane 2
+    let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // WS10-A: seven venue-event lanes ride in every engine. Lane 2
     // (OKX) gets a live producer — the measured window below pushes
     // one funding ChannelEvent per iteration and the engine drains
     // it through `on_venue_event`, proving lane push + drain are
-    // 0 B/op; the other five read empty (two atomic loads each).
+    // 0 B/op; the other six read empty (two atomic loads each).
     let (mut ev2_p, e2) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e0p, e0) =
@@ -1279,6 +1281,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_e4p, e4) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e5p, e5) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e6p, e6) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
     // window pushes one DepthTopK per iteration and the engine
@@ -1311,8 +1315,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5],
-        [e0, e1, e2, e3, e4, e5],
+        [t0, t1, t2, t3, t4, t5, t6],
+        [e0, e1, e2, e3, e4, e5, e6],
         [d0, d1],
         [o0, o1, o2],
         sc,
@@ -7188,6 +7192,302 @@ fn routed_halt_idle_steady_state() {
     );
     assert_eq!(bytes, 0, "halted idle-poll bytes should be zero: saw {bytes}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------
+// MX8: MEXC ingress hot-path assertions (spot protobuf + futures JSON)
+// ---------------------------------------------------------------
+
+/// Test-only protobuf encoder for the MEXC fixtures (boot side — every
+/// call happens outside the measured windows).
+fn mexc_pb_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn mexc_pb_len(out: &mut Vec<u8>, field_no: u32, payload: &[u8]) {
+    mexc_pb_varint(out, ((field_no as u64) << 3) | 2);
+    mexc_pb_varint(out, payload.len() as u64);
+    out.extend_from_slice(payload);
+}
+
+fn mexc_pb_u64(out: &mut Vec<u8>, field_no: u32, v: u64) {
+    mexc_pb_varint(out, (field_no as u64) << 3);
+    mexc_pb_varint(out, v);
+}
+
+/// The plan §1.1 spot bookTicker push for BTCUSDT at `bid_qty`.
+fn mexc_spot_book(bid_qty: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    mexc_pb_len(&mut body, 1, b"80535.88");
+    mexc_pb_len(&mut body, 2, bid_qty);
+    mexc_pb_len(&mut body, 3, b"80535.89");
+    mexc_pb_len(&mut body, 4, b"0.33336356");
+    mexc_pb_len(&mut body, 5, b"81721676217");
+    let mut book = Vec::new();
+    mexc_pb_len(&mut book, 1, b"spot@public.aggre.bookTicker.v3.api.pb@10ms@BTCUSDT");
+    mexc_pb_len(&mut book, 3, b"BTCUSDT");
+    mexc_pb_u64(&mut book, 6, 1_789_897_517_479);
+    mexc_pb_len(&mut book, 315, &body);
+    book
+}
+
+/// The plan §1.1 spot pushes for BTCUSDT: (bookTicker, deals × 2).
+fn mexc_spot_pushes() -> (Vec<u8>, Vec<u8>) {
+    let book = mexc_spot_book(b"0.380497");
+
+    let mut items = Vec::new();
+    for (px, qty, side, id) in [
+        (&b"80535.88"[..], &b"0.01362099"[..], 2u64, &b"730292425431437318X0_730292425431437319X0"[..]),
+        (&b"80535.89"[..], &b"0.0012345"[..], 1u64, &b"730292425431437320X0_730292425431437320X0"[..]),
+    ] {
+        let mut it = Vec::new();
+        mexc_pb_len(&mut it, 1, px);
+        mexc_pb_len(&mut it, 2, qty);
+        mexc_pb_u64(&mut it, 3, side);
+        mexc_pb_u64(&mut it, 4, 1_789_897_518_262);
+        mexc_pb_len(&mut it, 5, id);
+        mexc_pb_len(&mut items, 1, &it);
+    }
+    mexc_pb_len(&mut items, 2, b"spot@public.aggre.deals.v3.api.pb@10ms");
+    let mut deals = Vec::new();
+    mexc_pb_len(&mut deals, 1, b"spot@public.aggre.deals.v3.api.pb@10ms@BTCUSDT");
+    mexc_pb_len(&mut deals, 3, b"BTCUSDT");
+    mexc_pb_u64(&mut deals, 6, 1_789_897_518_300);
+    mexc_pb_len(&mut deals, 314, &items);
+    (book, deals)
+}
+
+const MEXC_FUT_DEPTH: &[u8] = br#"{"symbol":"BTC_USDT","data":{"cts":1789897581009,"asks":[[80468.7,3446,2],[80469.1,1239,1]],"bids":[[80468.6,31288,7]],"version":41925002140},"channel":"push.depth.full","ts":1789897581013}"#;
+/// [`MEXC_FUT_DEPTH`] with the best-bid size moved (a BBO change).
+const MEXC_FUT_DEPTH_ALT: &[u8] = br#"{"symbol":"BTC_USDT","data":{"cts":1789897581009,"asks":[[80468.7,3446,2],[80469.1,1239,1]],"bids":[[80468.6,31289,7]],"version":41925002140},"channel":"push.depth.full","ts":1789897581013}"#;
+const MEXC_FUT_DEAL: &[u8] = br#"{"symbol":"BTC_USDT","data":[{"p":80489,"v":11,"T":1,"O":3,"M":1,"t":1789897547210,"i":"16270106116","cts":"1789897547210"},{"p":80488.5,"v":2,"T":2,"O":3,"M":2,"t":1789897547211,"i":"16270106117"}],"channel":"push.deal","ts":1789897547215}"#;
+const MEXC_FUT_TICKER: &[u8] = br#"{"symbol":"BTC_USDT","data":{"symbol":"BTC_USDT","lastPrice":80489,"indexPrice":80490.1,"fairPrice":80489.5,"fundingRate":0.0001,"holdVol":92415393,"timestamp":1789897545754},"channel":"push.ticker","ts":1789897545760}"#;
+
+/// Classify + every MEXC parser of both classes (the spot wrapper walk,
+/// both bodies, the deals walk, the ack + its failed-param walker; the
+/// futures depth.full / deal walk / ticker + the extract helpers + the
+/// funding clock) over the plan's measured shapes, 10 000 iterations —
+/// must be zero-alloc.
+#[test]
+fn mexc_parsers_are_zero_alloc() {
+    let (book, deals) = mexc_spot_pushes();
+    let ack: &[u8] = "{\"id\":0,\"code\":0,\"msg\":\"Subscribed successful! [spot@public.aggre.bookTicker.v3.api.pb@10ms@BTCUSDT]. Not Subscribed successfully! [spot@public.increase.depth.v3.api.pb@BTCUSDT,spot@public.aggre.deals.v3.api.pb@10ms@ETHUSDT].  Reason\u{ff1a} Blocked! \"}".as_bytes();
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for i in 0..10_000u64 {
+        std::hint::black_box(ingress_mexc::classify_spot(&book, true));
+        std::hint::black_box(ingress_mexc::classify_spot(ack, false));
+        std::hint::black_box(ingress_mexc::classify_futures(MEXC_FUT_DEPTH));
+        std::hint::black_box(ingress_mexc::classify_futures(MEXC_FUT_DEAL));
+        std::hint::black_box(ingress_mexc::classify_futures(MEXC_FUT_TICKER));
+        let w = ingress_mexc::parse_spot_wrapper(&book).unwrap();
+        acc = acc.wrapping_add(w.symbol(&book).len() as i64);
+        let b = ingress_mexc::parse_book_ticker_body(w.body(&book)).unwrap();
+        acc = acc.wrapping_add(b.bid_px_1e6);
+        let w = ingress_mexc::parse_spot_wrapper(&deals).unwrap();
+        let mut dw = ingress_mexc::MexcDealsWalk::new(w.body(&deals));
+        while let Some(item) = dw.next_item() {
+            acc = acc.wrapping_add(ingress_mexc::parse_deal_item(item).unwrap().signed_qty_1e6());
+        }
+        let a = ingress_mexc::parse_sub_ack(ack).unwrap();
+        let mut p = a.failed_params(ack);
+        while let Some(param) = p.next_param() {
+            acc = acc.wrapping_add(ingress_mexc::extract_param_symbol(param).map_or(0, |s| s.len() as i64));
+            acc = acc.wrapping_add(ingress_mexc::extract_param_channel(param).map_or(-1, |c| c.discriminant()));
+        }
+        acc = acc.wrapping_add(ingress_mexc::extract_fut_symbol(MEXC_FUT_DEPTH).unwrap().len() as i64);
+        acc = acc.wrapping_add(ingress_mexc::extract_fut_ts_ms(MEXC_FUT_DEAL) as i64);
+        let d = ingress_mexc::parse_depth_full(MEXC_FUT_DEPTH).unwrap();
+        acc = acc.wrapping_add(d.bid_px_1e6);
+        let mut fw = ingress_mexc::MexcFutDealsWalk::new(MEXC_FUT_DEAL);
+        while let Some(item) = fw.next_item() {
+            acc = acc.wrapping_add(ingress_mexc::parse_fut_deal_item(item).unwrap().px_1e6);
+        }
+        let t = ingress_mexc::parse_ticker(MEXC_FUT_TICKER).unwrap();
+        acc = acc.wrapping_add(t.funding_rate_1e9);
+        acc = acc.wrapping_add(ingress_mexc::funding_next_settle_ms(
+            1_789_920_000_000,
+            8 * ingress_mexc::MS_PER_HOUR,
+            1_789_920_000_000 + i,
+        ) as i64);
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(allocs, 0, "mexc parsers allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "mexc parser bytes should be zero: saw {bytes}");
+}
+
+/// Drive BOTH MEXC connection classes through their real handshakes,
+/// then through a pre-injected steady-state stream (spot: the per-param
+/// ack + CYCLES × [PB bookTicker, its unchanged republication, PB
+/// deals]; futures: CYCLES × [depth.full, its unchanged republication,
+/// deal, ticker] with the Funding event on the lane) with a REAL
+/// `PmlrCapture` (raw tap `All`). The BBO alternates between two
+/// touches every cycle, so BOTH the emit path (a change) and the
+/// dedupe path (the republication) are measured. Every `drive_one`
+/// must allocate zero bytes.
+#[test]
+fn mexc_run_loop_steady_state_is_zero_alloc() {
+    use ingress_mexc::run_loop as mwl;
+    use ingress_mexc::{MexcClass, MexcSymbolTable};
+
+    // ---- boot (NOT measured) ----
+    const CYCLES: usize = 300;
+    let sym_spot: SymbolId = (7 << 24) | 1;
+    let sym_perp: SymbolId = (7 << 24) | 513;
+    let mut st = MexcSymbolTable::new();
+    st.insert(b"BTCUSDT", sym_spot).unwrap();
+    let mut ft = MexcSymbolTable::new();
+    ft.insert(b"BTC_USDT", sym_perp).unwrap();
+    let mut spot = mwl::Driver::new(0x5107, MexcClass::Spot, st);
+    let mut fut = mwl::Driver::new(0x0F07, MexcClass::Futures, ft);
+    assert!(fut.set_funding_seed(sym_perp, 1_789_920_000_000, 8));
+    // The fixtures carry FIXED venue stamps: disable the stale judgement
+    // so a slow (debug) run cannot flip a verdict mid-stream and add a
+    // tick (a flipped verdict is a tick by the dedupe law).
+    spot.set_stale_after_ms(0);
+    fut.set_stale_after_ms(0);
+    let mut ts = TestTransport::with_capacity(512 * 1024);
+    let mut tf = TestTransport::with_capacity(512 * 1024);
+
+    let status = core_metrics::IngressStatus::new();
+    let ring: std::sync::Arc<Ring<Tick, { mwl::TICK_RING_CAP }>> = Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let event_ring: std::sync::Arc<
+        Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
+    > = Ring::new();
+    let (mut etx, mut erx) = event_ring.split();
+
+    let cap_dir = std::env::temp_dir().join(format!("mexc_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "mexc",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
+    // Real handshake per class (GET → 101 → subscribe set queued).
+    for (t, d, seed, path) in [
+        (&mut ts, &mut spot, 0x5107u64, &b"/ws"[..]),
+        (&mut tf, &mut fut, 0x0F07u64, &b"/edge"[..]),
+    ] {
+        mwl::note_transport_ready(d, core_net::Status::Ready);
+        mwl::drive_one(t, d, b"h", path, &mut prod, &mut etx, core_types::EVENT_LANE_FUNDING, &status, &mut capture).unwrap();
+        let mut scratch = [0u8; 8192];
+        let _ = t.drain_outgoing(&mut scratch);
+        let accept = core_net::expected_accept(&core_net::sec_websocket_key_from_seed(seed));
+        let mut resp = Vec::new();
+        resp.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+        resp.extend_from_slice(&accept);
+        resp.extend_from_slice(b"\r\n\r\n");
+        t.inject_incoming(&resp);
+        mwl::drive_one(t, d, b"h", path, &mut prod, &mut etx, core_types::EVENT_LANE_FUNDING, &status, &mut capture).unwrap();
+        assert_eq!(d.state(), mwl::State::Steady);
+        let _ = t.drain_outgoing(&mut scratch); // the subscribe set
+    }
+
+    /// Unmasked server→client frame (`first` = 0x81 text / 0x82 binary).
+    fn push_frame(stream: &mut Vec<u8>, first: u8, body: &[u8]) {
+        stream.push(first);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+
+    let (book, deals) = mexc_spot_pushes();
+    let book_alt = mexc_spot_book(b"0.380498");
+    let mut spot_stream = Vec::with_capacity(256 * 1024);
+    push_frame(
+        &mut spot_stream,
+        0x81,
+        br#"{"id":0,"code":0,"msg":"spot@public.aggre.bookTicker.v3.api.pb@10ms@BTCUSDT,spot@public.aggre.deals.v3.api.pb@10ms@BTCUSDT"}"#,
+    );
+    let mut fut_stream = Vec::with_capacity(512 * 1024);
+    for cycle in 0..CYCLES {
+        let (b, depth) = if cycle % 2 == 0 {
+            (&book, MEXC_FUT_DEPTH)
+        } else {
+            (&book_alt, MEXC_FUT_DEPTH_ALT)
+        };
+        push_frame(&mut spot_stream, 0x82, b);
+        push_frame(&mut spot_stream, 0x82, b); // republication: no tick
+        push_frame(&mut spot_stream, 0x82, &deals);
+        push_frame(&mut fut_stream, 0x81, depth);
+        push_frame(&mut fut_stream, 0x81, depth); // republication: no tick
+        push_frame(&mut fut_stream, 0x81, MEXC_FUT_DEAL);
+        push_frame(&mut fut_stream, 0x81, MEXC_FUT_TICKER);
+    }
+    assert_eq!(ts.inject_incoming(&spot_stream), spot_stream.len());
+    assert_eq!(tf.inject_incoming(&fut_stream), fut_stream.len());
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    let mut drives = 0u32;
+    for (t, d) in [(&mut ts, &mut spot), (&mut tf, &mut fut)] {
+        while t.incoming_len() > 0 {
+            mwl::drive_one(t, d, b"h", b"/", &mut prod, &mut etx, core_types::EVENT_LANE_FUNDING, &status, &mut capture).unwrap();
+            drives += 1;
+            assert!(drives <= 4_096, "scripted stream failed to drain");
+        }
+    }
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
+    let mut acc: i64 = 0;
+    let mut ticks = 0usize;
+    while let Some(t) = cons.try_pop() {
+        acc = acc.wrapping_add(t.bid_px.raw());
+        ticks += 1;
+    }
+    let mut funding = 0usize;
+    while let Some(e) = erx.try_pop() {
+        acc = acc.wrapping_add(e.v1);
+        funding += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    // One tick per BBO CHANGE of either class (never per republication),
+    // one lane event per ticker, every frame counted, nothing lost, no
+    // regressions.
+    assert_eq!(ticks, 2 * CYCLES);
+    assert_eq!(funding, CYCLES);
+    assert_eq!(status.msgs_total(), (1 + CYCLES * 4 + CYCLES * 5) as u64);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.ring_drops_total(), 0);
+    assert_eq!(status.event_ring_drops_total(), 0);
+    assert_eq!(status.seq_regressions_total(), 0);
+    assert_eq!(status.sub_drops_total(), 0);
+    assert_eq!(spot.sub_count(), 2);
+    assert_eq!(fut.sub_count(), 3);
+    assert_eq!(allocs, 0, "mexc run-loop allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "mexc run-loop bytes should be zero: saw {bytes}");
+
+    // Capture accounting: a tick per BBO, an event per print (2 + 2 per
+    // cycle) + three per ticker (Mark, Funding, OI), a tap record per
+    // data payload (the ack + 7 per cycle), no I/O errors.
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.ticks_written(), (2 * CYCLES) as u64);
+    assert_eq!(capture.events_written(), (7 * CYCLES) as u64);
+    assert_eq!(capture.tap_records(), (1 + 7 * CYCLES) as u64);
+    assert_eq!(capture.tap_dropped(), 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
 }
 
 /// **HYPARB H1 gate 63 — the AMM walk and the arb solve.**

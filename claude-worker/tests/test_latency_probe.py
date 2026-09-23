@@ -8,6 +8,7 @@ is the documented per-location calibration step)."""
 import json
 import os
 import pathlib
+import typing
 
 import pytest
 
@@ -117,12 +118,89 @@ def test_parse_deribit_and_hyperliquid() -> None:
     assert lp.parse_hyperliquid(json.dumps({"channel": "pong"})) == []
 
 
+#: MX7, captured LIVE 2026-09-23 from wss://wbs-api.mexc.com/ws: one BINARY
+#: `PushDataV3ApiWrapper` for `spot@public.aggre.bookTicker.v3.api.pb@10ms@
+#: BTCUSDT` — f1 channel, f3 symbol, f6 sendTime, f315 the bookTicker body
+#: (f1 bid, f2 bidQty, f3 ask, f4 askQty, f5 version, f6 varint).
+MEXC_SPOT_FRAME = bytes.fromhex(
+    "0a3373706f74407075626c69632e61676772652e626f6f6b5469636b65722e76332e6170"
+    "692e70624031306d7340425443555344541a074254435553445430c78aefe78c34da133f"
+    "0a0838363530332e3932120b31342e39313333353330381a0838363530332e3933220830"
+    "2e3030343936352a0b383139393932373534343530c18aefe78c34"
+)
+#: ...and one JSON `push.depth.full` from wss://contract.mexc.com/edge (the
+#: same minute; levels trimmed to two).
+MEXC_PERP_FRAME = (
+    '{"symbol":"BTC_USDT","data":{"cts":1790145447834,"asks":[[86469.5,398,1],'
+    '[86469.6,143995,1]],"bids":[[86469.4,48926,6],[86468.2,14455,4]],'
+    '"version":42029847745},"channel":"push.depth.full","ts":1790145447838}'
+)
+
+
+def test_parse_mexc_spot_protobuf_bookticker() -> None:
+    r = lp.parse_mexc(MEXC_SPOT_FRAME)[0]
+    assert (r["stream"], r["venue_ts_ms"], r["venue_ts2_ms"], r["bid"], r["ask"], r["seq"]) == (
+        "aggre.bookTicker", 1790145447239.0, None, 86503.92, 86503.93, 81999275445)
+
+
+def test_parse_mexc_futures_depth_full_json() -> None:
+    r = lp.parse_mexc(MEXC_PERP_FRAME)[0]
+    assert (r["stream"], r["venue_ts_ms"], r["venue_ts2_ms"], r["bid"], r["ask"], r["seq"]) == (
+        "depth.full", 1790145447838.0, 1790145447834.0, 86469.4, 86469.5, 42029847745)
+
+
+def test_parse_mexc_yields_nothing_for_acks_pongs_and_other_bodies() -> None:
+    for text in ('{"id":0,"code":0,"msg":"spot@public.aggre.bookTicker.v3.api.pb@10ms@BTCUSDT"}',
+                 '{"id":0,"code":0,"msg":"PONG"}',
+                 '{"channel":"rs.sub.depth.full","data":"success","ts":1790145447754}',
+                 '{"channel":"pong","data":1790145447754,"ts":1790145447754}',
+                 "[]"):
+        assert lp.parse_mexc(text) == [], text
+    # A binary wrapper with no f315 body (another channel) is not a quote.
+    assert lp.parse_mexc(MEXC_SPOT_FRAME[: MEXC_SPOT_FRAME.index(b"\xda\x13")]) == []
+
+
+def test_pb_fields_is_an_order_agnostic_walk_with_hard_failures() -> None:
+    # f6 varint 300, f3 "ab", a fixed64 and a fixed32 to skip — in that order.
+    msg = b"\x30\xac\x02" + b"\x1a\x02ab" + b"\x09" + bytes(8) + b"\x15" + bytes(4)
+    assert lp.pb_fields(msg) == {6: 300, 3: b"ab"}
+    assert lp.pb_fields(b"\x1a\x02ab\x30\xac\x02") == {3: b"ab", 6: 300}
+    for bad in (
+        b"\x1a\x05ab",  # length runs past the buffer
+        b"\x30\xac",  # truncated varint
+        b"\x30" + b"\xff" * 10 + b"\x01",  # an 11-byte varint
+        b"\x0b",  # wire type 3: a group, refused
+        b"\x02\x00",  # field number 0
+        b"\x09" + bytes(7),  # truncated fixed64
+    ):
+        with pytest.raises(ValueError):
+            lp.pb_fields(bad)
+    with pytest.raises(ValueError):
+        lp.parse_mexc(MEXC_SPOT_FRAME[:-3])  # a torn frame never parses
+
+
+def test_recv_message_keeps_binary_messages_raw() -> None:
+    ws = lp.WsClient("wss://probe.example/ws")
+    ws.sock = typing.cast(typing.Any, object())  # buffered frames only: never read
+    body = b"\x0a\x01\xff\xfe"  # not UTF-8: a decode would destroy it
+    ws.buf = (b"\x82\x04" + body  # FIN | binary
+              + b"\x02\x02" + body[:2] + b"\x80\x02" + body[2:]  # binary, then continuation
+              + b"\x81\x04pong")  # FIN | text
+    assert ws.recv_message() == body
+    assert ws.recv_message() == body
+    assert ws.recv_message() == "pong"
+
+
 def test_time_extractors() -> None:
     assert lp._t_binance(b'{"serverTime": 1700000000000}') == 1700000000000.0
     assert lp._t_okx(b'{"code":"0","data":[{"ts":"1700000000001"}]}') == 1700000000001.0
     bybit_body = b'{"result":{"timeSecond":"1700000000","timeNano":"1700000000002000000"}}'
     assert lp._t_bybit(bybit_body) == 1700000000002.0
     assert lp._t_deribit(b'{"jsonrpc":"2.0","result":1700000000003}') == 1700000000003.0
+    # MX7, live bodies 2026-09-23: futures /api/v1/contract/ping; the spot
+    # host's /api/v3/time is the Binance body.
+    assert lp._t_mexc(b'{"success":true,"code":0,"data":1790145267966}') == 1790145267966.0
+    assert lp._t_binance(b'{"serverTime":1790145267773}') == 1790145267773.0
     assert lp._t_none(b"1700000000") is None
 
 
@@ -154,10 +232,15 @@ def test_percentiles_and_feed_delay_stats(tmp_path: pathlib.Path) -> None:
 def test_venue_table_is_the_engines_edge() -> None:
     names = [v.name for v in lp.VENUES]
     assert names == ["binance", "binance-usdm", "okx", "bybit", "deribit", "hyperliquid",
-                     "polymarket"]
+                     "mexc", "mexc-perp", "polymarket"]
     hosts = {v.name: v.ws_url for v in lp.VENUES}
     assert "stream.binance.com" in hosts["binance"]
     assert "ws.okx.com" in hosts["okx"]
     assert "stream.bybit.com" in hosts["bybit"]
+    # MX7: two classes, two hosts on BOTH planes -> two rows.
+    assert hosts["mexc"] == "wss://wbs-api.mexc.com/ws"
+    assert hosts["mexc-perp"] == "wss://contract.mexc.com/edge"
+    rest = {v.name: v.rest_host for v in lp.VENUES}
+    assert (rest["mexc"], rest["mexc-perp"]) == ("api.mexc.com", "contract.mexc.com")
     assert hosts["polymarket"] == ""  # REST RTT only: the CLOB WS needs an asset id
     assert os.path.basename(lp.__file__) == "latency_probe.py"

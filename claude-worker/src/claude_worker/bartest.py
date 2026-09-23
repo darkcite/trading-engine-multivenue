@@ -72,6 +72,8 @@ VENUE_OF_PREFIX: dict[str, str] = {
     "bybit-linear": "bybit",
     "deribit": "deribit",
     "hyperliquid": "hl",
+    "mexc": "mexc",
+    "mexc-perp": "mexc",
     "okx": "okx",
     "polymarket": "pm",
 }

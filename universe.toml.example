@@ -120,6 +120,19 @@ rolling = []
 spot = []                  # e.g. ["BTCUSDT"]
 linear = []                # e.g. ["BTCUSDT", "ETHUSDT"]
 
+[mexc]
+# MX5. Spot symbols are UPPERCASE, no separator (BTCUSDT, AAPLXUSDT);
+# tokenized xStocks equities are ORDINARY spot rows — no separate key.
+# spot[i] -> make_symbol_id(Mexc, i+1); perp ordinals from base 512.
+# Spot rides ONE connection per 30 subscriptions (venue cap, measured);
+# 2 channels per symbol => 15 symbols per spot connection.
+spot = []   # e.g. ["BTCUSDT", "ETHUSDT", "AAPLXUSDT", "SPYXUSDT"]
+
+# Perp symbols are BASE_QUOTE (BTC_USDT, XAU_USDT, AAPLSTOCK_USDT).
+# TradFi/commodity/FX/index perps are ORDINARY rows — no separate key.
+# BBO comes from depth.full(limit 5) at ~270 ms, NOT push.ticker (~2.75 s).
+perp = []   # e.g. ["BTC_USDT", "XAU_USDT", "USOIL_USDT", "EUR_USDT", "SPY_USDT"]
+
 [pairs]
 # Latency-arb pairs: "P:B" = polymarket.markets[P] × binance.spot[B]
 # (0-based file order; a YES/NO market entry resolves to its YES token).

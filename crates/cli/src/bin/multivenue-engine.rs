@@ -2237,6 +2237,26 @@ fn run(args: RunArgs) -> ExitCode {
         } else {
             None
         };
+    // MX6: the MEXC audit + funding seeds run whenever `[mexc]` is
+    // configured (config-file only, like Bybit).
+    let mexc_spot_names: Vec<String> = boot
+        .allocated
+        .mexc_spot
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let mexc_perp_names: Vec<String> = boot
+        .allocated
+        .mexc_perp
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let mexc_discovery_arg: Option<(&[String], &[String])> =
+        if !mexc_spot_names.is_empty() || !mexc_perp_names.is_empty() {
+            Some((&mexc_spot_names, &mexc_perp_names))
+        } else {
+            None
+        };
     let discovery = match cli::boot_discovery::run_all(
         &cfg,
         &tls_config,
@@ -2248,6 +2268,7 @@ fn run(args: RunArgs) -> ExitCode {
         bn_discovery_arg,
         &boot.bn_options,
         bybit_discovery_arg,
+        mexc_discovery_arg,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -2504,12 +2525,22 @@ fn run(args: RunArgs) -> ExitCode {
         .chain(boot.allocated.bn_dated.iter())
         .map(|i| i.sym)
         .collect();
+    // MX6 (ruling Q-MX6): every MEXC instrument this boot allocates
+    // is addressable by AI rulesets (spot + perp).
+    let mexc_syms: Vec<core_types::SymbolId> = boot
+        .allocated
+        .mexc_spot
+        .iter()
+        .chain(boot.allocated.mexc_perp.iter())
+        .map(|i| i.sym)
+        .collect();
     let ai_universe = cli::build_ai_universe(
         &pm_syms,
         &bn_syms,
         okx_boot.as_ref().map(|(t, _)| t),
         deribit_boot.as_ref().map(|(t, _)| t),
         hl_boot.as_ref().map(|(t, _f, _e)| t),
+        &mexc_syms,
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
     // grammar's stage-time resolution — same allocation truth as the
@@ -2550,6 +2581,8 @@ fn run(args: RunArgs) -> ExitCode {
     // WS9: lane 5 = Bybit (VenueId 6 — lane≠venue past Ai, see
     // engine::tick_lane_of).
     let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
+    // MX2: lane 6 = MEXC (VenueId 7, engine::tick_lane_of).
+    let (mexc_prod, mexc_lane_cons) = rings.tick[6].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -2559,6 +2592,7 @@ fn run(args: RunArgs) -> ExitCode {
     let (okx_event_prod, okx_event_cons) = rings.event[2].clone().split();
     let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
     let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
+    let (mexc_event_prod, mexc_event_cons) = rings.event[6].clone().split();
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
     // VM2 V2: HL gained its event lane — funding rides AssetCtx.
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
@@ -2569,6 +2603,7 @@ fn run(args: RunArgs) -> ExitCode {
         deribit_event_cons,
         hl_event_cons,
         bybit_event_cons,
+        mexc_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
@@ -2734,6 +2769,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.bn.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_bybit)
             .set(discovery.bybit.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_mexc)
+            .set(discovery.mexc.map(|c| c.configured).unwrap_or(0) as i64);
         // M2.1/M2.2/M2.4: capped options chain sizes this boot
         // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
@@ -3229,6 +3266,99 @@ fn run(args: RunArgs) -> ExitCode {
         drop(bybit_event_prod);
     }
 
+    // MX6: MEXC — spot (protobuf, `/ws`) + futures (JSON, `/edge`)
+    // connection slots on ONE thread (core 9, the §9 core-map
+    // extension past Bybit's 8). Config-file only. Each class is
+    // chunked to its MEASURED per-socket cap (plan §4 D1: spot 30 subs
+    // = 15 symbols × 2 channels, futures 13 symbols × 3 channels);
+    // futures conns carry the boot REST funding seeds (Q-MX3).
+    if !boot.allocated.mexc_spot.is_empty() || !boot.allocated.mexc_perp.is_empty() {
+        let mut specs: Vec<cli::MexcConnSpec> = Vec::new();
+        for (class, insts, host) in [
+            (
+                ingress_mexc::MexcClass::Spot,
+                &boot.allocated.mexc_spot,
+                &cfg.mexc_ws_host,
+            ),
+            (
+                ingress_mexc::MexcClass::Futures,
+                &boot.allocated.mexc_perp,
+                &cfg.mexc_fut_ws_host,
+            ),
+        ] {
+            let Ok(path) = std::str::from_utf8(class.ws_path()) else {
+                error!(class = class.label(), "mexc: non-utf8 ws path");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            };
+            for chunk in insts.chunks(class.symbols_per_conn()) {
+                let mut table = ingress_mexc::MexcSymbolTable::new();
+                let mut funding_seeds = Vec::new();
+                for inst in chunk {
+                    if let Err(e) = table.insert(inst.name.as_bytes(), inst.sym) {
+                        error!(?e, symbol = %inst.name, class = class.label(), "mexc: table build failed");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                    if class == ingress_mexc::MexcClass::Futures {
+                        match discovery.mexc_funding.iter().find(|(n, _)| *n == inst.name) {
+                            Some((_, seed)) => funding_seeds.push((
+                                inst.sym,
+                                seed.next_settle_ms,
+                                seed.collect_cycle_h,
+                            )),
+                            // Missing from the venue (discovery already
+                            // flagged it): no seed, Funding v1 stays 0.
+                            None => warn!(symbol = %inst.name, "mexc: no funding seed — Funding v1 = 0"),
+                        }
+                    }
+                }
+                specs.push(cli::MexcConnSpec {
+                    class,
+                    host: host.clone(),
+                    path: path.to_string(),
+                    table,
+                    funding_seeds,
+                });
+            }
+        }
+        info!(
+            spot = boot.allocated.mexc_spot.len(),
+            perp = boot.allocated.mexc_perp.len(),
+            conns = specs.len(),
+            seeds = discovery.mexc_funding.len(),
+            stale_after_ms = stale_after_ms[core_types::VenueId::Mexc as usize],
+            "mexc: starting ingress thread"
+        );
+        let mexc_handle = match cli::spawn_mexc(
+            specs,
+            tls_config.clone(),
+            stale_after_ms[core_types::VenueId::Mexc as usize],
+            mexc_prod,
+            mexc_event_prod,
+            statuses.mexc.clone(),
+            9,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.mexc,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_mexc)),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = ?e, "mexc: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        };
+        handles.push(mexc_handle);
+    } else {
+        // Drop the producer sides so the lanes stay permanently-
+        // empty rings (the unspawned-venue shape, §3.3) — a boot with
+        // no `[mexc]` section is the pre-MEXC boot, bit for bit.
+        drop(mexc_prod);
+        drop(mexc_event_prod);
+    }
+
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
@@ -3347,6 +3477,7 @@ fn run(args: RunArgs) -> ExitCode {
             deribit_lane_cons,
             hl_lane_cons,
             bybit_lane_cons,
+            mexc_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,

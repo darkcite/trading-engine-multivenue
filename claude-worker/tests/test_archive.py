@@ -507,6 +507,38 @@ def test_catalog_absent_is_null_not_a_failure(
     assert manifest["catalog_error"] == "absent"
 
 
+#: The `venue_totals` block exactly as `capture_catalog.rs` renders it: an
+#: ARRAY in `VENUE_LABELS` order (bybit and mexc included, MX9).
+CATALOG_VENUE_TOTALS: typing.Final[dict[str, object]] = {
+    "catalog_version": 1,
+    "venue_totals": [
+        {"venue": "pm", "runs_present": 1, "ticks": 10, "bytes": 640},
+        {"venue": "bn", "runs_present": 1, "ticks": 0, "bytes": 64},
+        {"venue": "rpc", "runs_present": 0, "ticks": 0, "bytes": 0},
+        {"venue": "bybit", "runs_present": 1, "ticks": 7, "bytes": 512},
+        {"venue": "mexc", "runs_present": 1, "ticks": 3, "bytes": 256},
+    ],
+}
+
+
+def test_catalog_venues_reads_the_engines_array_and_counts_bybit_and_mexc() -> None:
+    venues = claude_worker.archive.catalog_venues(CATALOG_VENUE_TOTALS)
+    assert venues == ("bybit", "mexc", "pm")  # a venue with 0 ticks is absent
+    manifest = {
+        "run": f"run-{EPOCH_NS}",
+        "epoch_ns": EPOCH_NS,
+        "host_id": "h",
+        "totals": {"size_bytes": 1, "stored_bytes": 1},
+        "catalog": CATALOG_VENUE_TOTALS,
+    }
+    assert claude_worker.archive._list_row(manifest)["venues"] == ["bybit", "mexc", "pm"]
+    # No catalog (binary absent), a label-keyed object, junk rows: nothing.
+    assert claude_worker.archive.catalog_venues(None) == ()
+    assert claude_worker.archive.catalog_venues({"venue_totals": {"pm": {"ticks": 1}}}) == ()
+    junk = {"venue_totals": [1, {"venue": "", "ticks": 5}, {"venue": "okx", "ticks": True}]}
+    assert claude_worker.archive.catalog_venues(junk) == ()
+
+
 def test_disabled_gating_lanes_exit_3_and_do_zero_http(tmp_path: pathlib.Path) -> None:
     cfg = claude_worker.archive_config.load(env={}, env_file=tmp_path / "absent.env")
     assert not cfg.enabled

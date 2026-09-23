@@ -84,6 +84,19 @@ def _dash_ddmmmyy(name: str) -> bool:
     return bool(sep) and bool(base) and _is_ddmmmyy(tail)
 
 
+#: Namespaces whose every descriptor is ONE class, whatever the name.
+#: MX7: MEXC xStocks (`AAPLXUSDT`) are ordinary spot rows and its TradFi /
+#: equity / FX / metal perps (`XAU_USDT`, `AAPLSTOCK_USDT`) ordinary perps
+#: (plan D6: no new class); MEXC lists no dated futures.
+_FIXED_CLASS_OF_NS: dict[str, str] = {
+    "binance": "spot",
+    "binance-opt": "option",
+    "bybit": "spot",
+    "mexc": "spot",
+    "mexc-perp": "perp",
+}
+
+
 def class_of_descriptor(descriptor: str) -> str | None:
     """Fee class of a §9.4 descriptor, ``None`` for an unknown shape."""
     if not descriptor:
@@ -93,20 +106,17 @@ def class_of_descriptor(descriptor: str) -> str | None:
         return "prediction" if descriptor.isascii() and descriptor.isdigit() else None
     if not name:
         return None
-    if ns == "binance":
-        return "spot"
+    fixed = _FIXED_CLASS_OF_NS.get(ns)
+    if fixed is not None:
+        return fixed
     if ns == "binance-usdm":
         return "dated" if _bn_delivery_suffix(name) else "perp"
-    if ns == "binance-opt":
-        return "option"
     if ns == "okx":
         return _okx(name)
     if ns == "deribit":
         return _deribit(name)
     if ns == "hyperliquid":
         return _hyperliquid(name)
-    if ns == "bybit":
-        return "spot"
     if ns == "bybit-linear":
         return "dated" if _dash_ddmmmyy(name) else "perp"
     return None

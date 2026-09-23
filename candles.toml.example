@@ -28,7 +28,7 @@
 #     widen a fetch back to §9.5, never silently narrow another lane.
 #
 # Lane names = the candles lane names: binance · binance-usdm · okx · deribit ·
-# hyperliquid · bybit · bybit-linear.
+# hyperliquid · bybit · bybit-linear · mexc · mexc-perp.
 #
 # Consumers that READ 1m from candles.db today (keep their instruments at the
 # full law): the regime seed (`regime.toml [breadth] members`), the ICDP

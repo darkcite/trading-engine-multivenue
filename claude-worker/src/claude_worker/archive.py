@@ -329,6 +329,36 @@ def capture_catalog(run_dir: pathlib.Path) -> tuple[typing.Any, str]:
         return None, "unparseable stdout"
 
 
+def catalog_venues(catalog: object) -> tuple[str, ...]:
+    """The venue labels a capture catalog saw ticks from, sorted.
+
+    ``venue_totals`` is what ``capture_catalog.rs`` actually emits: an ARRAY
+    of ``{"venue": <label>, "runs_present", "ticks", "bytes"}`` in the fixed
+    ``VENUE_LABELS`` order — every venue, bybit and mexc included. (The
+    readers used to expect a label-keyed object, which the engine never
+    wrote, so every manifest listed NO venues.) The per-day ``venue_ticks``
+    array is not read: an engine older than the MX9 fix made it 6 wide and
+    silently dropped bybit, and archived manifests keep that shape forever.
+    """
+    if not isinstance(catalog, dict):
+        return ()
+    totals = typing.cast(dict[str, object], catalog).get("venue_totals")
+    if not isinstance(totals, list):
+        return ()
+    out: set[str] = set()
+    for row in typing.cast(list[object], totals):
+        if not isinstance(row, dict):
+            continue
+        entry = typing.cast(dict[str, object], row)
+        label = entry.get("venue")
+        ticks = entry.get("ticks")
+        if isinstance(ticks, bool) or not isinstance(ticks, int):
+            continue
+        if isinstance(label, str) and label and ticks > 0:
+            out.add(label)
+    return tuple(sorted(out))
+
+
 # --------------------------------------------------------------------------
 # manifest
 # --------------------------------------------------------------------------
@@ -367,8 +397,9 @@ def build_manifest(  # noqa: PLR0913 — one parameter per manifest input, delib
         "windows_2h_complete": len(complete),
         "catalog": catalog,
         "catalog_note": (
-            "venue_totals is authoritative for per-venue ticks; the per-day "
-            "venue_ticks array omits bybit (capture_catalog.rs)"
+            "venue_totals is authoritative for per-venue ticks; a per-day "
+            "venue_ticks array from an engine older than the MX9 "
+            "capture_catalog.rs fix is 6 wide and omits bybit"
         ),
     }
     if catalog_error:
@@ -1125,11 +1156,6 @@ def _run_id(raw: str) -> str:
 
 
 def _list_row(manifest: dict[str, typing.Any]) -> dict[str, typing.Any]:
-    catalog = manifest.get("catalog") or {}
-    venues: list[str] = []
-    totals = catalog.get("venue_totals") if isinstance(catalog, dict) else None
-    if isinstance(totals, dict):
-        venues = sorted(k for k, v in totals.items() if isinstance(v, dict) and v.get("ticks"))
     return {
         "run": manifest["run"],
         "epoch_ns": manifest["epoch_ns"],
@@ -1140,7 +1166,7 @@ def _list_row(manifest: dict[str, typing.Any]) -> dict[str, typing.Any]:
         "stored_bytes": manifest["totals"]["stored_bytes"],
         "pmlr_version": manifest.get("pmlr_version"),
         "windows_2h_complete": manifest.get("windows_2h_complete"),
-        "venues": venues,
+        "venues": list(catalog_venues(manifest.get("catalog"))),
         "local_path": None,
         "uploaded_at_ns": manifest.get("uploaded_at_ns"),
     }

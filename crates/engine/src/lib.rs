@@ -73,12 +73,13 @@ pub const SIGNAL_RING_SIZE: usize = 1_024;
 pub const FILL_RING_SIZE: usize = 1_024;
 
 /// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
-/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9). Lane indices are
-/// BOOT-WIRED and NO LONGER equal `VenueId as usize` past lane 4:
+/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2).
+/// Lane indices are BOOT-WIRED and NO LONGER equal `VenueId as usize`
+/// past lane 4:
 /// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
-/// ring, 8f), so `VenueId::Bybit = 6` occupies lane 5 — see
-/// [`tick_lane_of`].
-pub const NUM_TICK_LANES: usize = 6;
+/// ring, 8f), so `VenueId::Bybit = 6` occupies lane 5 and
+/// `VenueId::Mexc = 7` lane 6 — see [`tick_lane_of`].
+pub const NUM_TICK_LANES: usize = 7;
 
 /// Tick-lane index for a market-data venue (WS9 — the lane↔venue
 /// identity broke when Bybit's discriminant landed past `Ai`).
@@ -93,6 +94,7 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Deribit => Some(3),
         VenueId::Hyperliquid => Some(4),
         VenueId::Bybit => Some(5),
+        VenueId::Mexc => Some(6),
         VenueId::Ai => None,
     }
 }
@@ -123,7 +125,10 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Binance
         | VenueId::Hyperliquid
         | VenueId::Ai
-        | VenueId::Bybit => None,
+        | VenueId::Bybit
+        // MX2: MEXC spot incremental depth is `Blocked!` on the public
+        // tier and futures BBO rides `depth.full` top-5 — no L2 lane.
+        | VenueId::Mexc => None,
     }
 }
 
@@ -143,7 +148,11 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Okx => Some(0),
         VenueId::Deribit => Some(1),
         VenueId::Binance => Some(2),
-        VenueId::Polymarket | VenueId::Hyperliquid | VenueId::Ai | VenueId::Bybit => None,
+        VenueId::Polymarket
+        | VenueId::Hyperliquid
+        | VenueId::Ai
+        | VenueId::Bybit
+        | VenueId::Mexc => None,
     }
 }
 
@@ -174,7 +183,9 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Hyperliquid => Some(3),
         // WS9: Bybit is market-data-only in Stage 2 (order
         // submission is Stage-3, gaps-doc §7) — no fill lane yet.
-        VenueId::Binance | VenueId::Ai | VenueId::Bybit => None,
+        // MX2: MEXC is data-only by operator ruling O-MX1 — no exec
+        // arm, no fill lane.
+        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc => None,
     }
 }
 
@@ -1384,7 +1395,8 @@ mod tests {
         let (p3, c3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
         let (p4, c4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
         let (p5, c5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4, p5], [c0, c1, c2, c3, c4, c5])
+        let (p6, c6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3, p4, p5, p6], [c0, c1, c2, c3, c4, c5, c6])
     }
 
     fn split_event_lanes() -> (
@@ -1397,7 +1409,8 @@ mod tests {
         let (p3, c3) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
         let (p4, c4) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
         let (p5, c5) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4, p5], [c0, c1, c2, c3, c4, c5])
+        let (p6, c6) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3, p4, p5, p6], [c0, c1, c2, c3, c4, c5, c6])
     }
 
     fn split_depth_lanes() -> (
@@ -1805,7 +1818,7 @@ mod tests {
         let (mut eng, _tp, mut ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         // One funding event per producing venue (lane indices per
-        // tick_lane_of: okx 2, deribit 3, bn 1, bybit 5).
+        // tick_lane_of: okx 2, deribit 3, bn 1, bybit 5, mexc 6).
         ep[2]
             .try_push(mk_funding_event(VenueId::Okx, 7, 125))
             .unwrap();
@@ -1818,12 +1831,15 @@ mod tests {
         ep[5]
             .try_push(mk_funding_event(VenueId::Bybit, 10, 99))
             .unwrap();
+        ep[tick_lane_of(VenueId::Mexc).unwrap()]
+            .try_push(mk_funding_event(VenueId::Mexc, 11, 77))
+            .unwrap();
         eng.tick(16);
-        assert_eq!(eng.events_dispatched, 4, "one event per producing lane");
-        assert_eq!(eng.strategy().events, 4);
+        assert_eq!(eng.events_dispatched, 5, "one event per producing lane");
+        assert_eq!(eng.strategy().events, 5);
         // Lanes drain in fixed index order → the last delivered is
-        // lane 5 (bybit); payload passes through untouched.
-        assert_eq!(eng.strategy().last_event_v0, 99);
+        // lane 6 (mexc); payload passes through untouched.
+        assert_eq!(eng.strategy().last_event_v0, 77);
         // Ticks/fills untouched by the event path.
         assert_eq!(eng.ticks_dispatched, 0);
         assert_eq!(eng.fills_dispatched, 0);
@@ -1918,6 +1934,7 @@ mod tests {
         assert_eq!(depth_lane_of(VenueId::Binance), None);
         assert_eq!(depth_lane_of(VenueId::Hyperliquid), None);
         assert_eq!(depth_lane_of(VenueId::Bybit), None);
+        assert_eq!(depth_lane_of(VenueId::Mexc), None);
         assert_eq!(depth_lane_of(VenueId::Ai), None);
     }
 
@@ -2011,6 +2028,7 @@ mod tests {
         assert_eq!(opt_lane_of(VenueId::Polymarket), None);
         assert_eq!(opt_lane_of(VenueId::Hyperliquid), None);
         assert_eq!(opt_lane_of(VenueId::Bybit), None);
+        assert_eq!(opt_lane_of(VenueId::Mexc), None);
         assert_eq!(opt_lane_of(VenueId::Ai), None);
     }
 
@@ -2084,6 +2102,24 @@ mod tests {
         assert_eq!(fill_lane_of(VenueId::Hyperliquid), Some(3));
         assert_eq!(fill_lane_of(VenueId::Binance), None);
         assert_eq!(fill_lane_of(VenueId::Ai), None);
+        assert_eq!(fill_lane_of(VenueId::Bybit), None);
+        // MX2 / O-MX1: MEXC is data-only — never a fill lane.
+        assert_eq!(fill_lane_of(VenueId::Mexc), None);
+    }
+
+    #[test]
+    fn tick_lane_map_matches_layout() {
+        assert_eq!(tick_lane_of(VenueId::Polymarket), Some(0));
+        assert_eq!(tick_lane_of(VenueId::Binance), Some(1));
+        assert_eq!(tick_lane_of(VenueId::Okx), Some(2));
+        assert_eq!(tick_lane_of(VenueId::Deribit), Some(3));
+        assert_eq!(tick_lane_of(VenueId::Hyperliquid), Some(4));
+        assert_eq!(tick_lane_of(VenueId::Bybit), Some(5));
+        assert_eq!(tick_lane_of(VenueId::Mexc), Some(6));
+        assert_eq!(tick_lane_of(VenueId::Ai), None);
+        // The last market venue occupies the last lane — no gaps.
+        assert_eq!(NUM_TICK_LANES, 7);
+        assert_eq!(NUM_EVENT_LANES, NUM_TICK_LANES);
     }
 
     #[test]

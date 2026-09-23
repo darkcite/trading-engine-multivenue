@@ -169,10 +169,11 @@ impl IngressState {
 
 /// Cache-aligned, single-writer status slot for one ingress thread.
 ///
-/// Layout note: state + activity + 8 counters + the T1(a) diag
-/// triple = 79 bytes → the slot spans two cache lines. That is
-/// fine: there is exactly one writer and readers poll at human
-/// cadence, so cross-line traffic is nil.
+/// Layout note: state + activity + the counters + the T1(a) diag
+/// triple = 136 bytes → the slot spans three cache lines (192 B with
+/// the alignment tail; MX3 `seq_regressions_total` crossed the second
+/// line). That is fine: there is exactly one writer and readers poll
+/// at human cadence, so cross-line traffic is nil.
 #[repr(C, align(64))]
 pub struct IngressStatus {
     /// [`IngressState`] as raw byte.
@@ -187,6 +188,12 @@ pub struct IngressStatus {
     parse_errors_total: AtomicU64,
     /// Venue sequence-chain breaks observed (§6.2 policy per venue).
     gaps_total: AtomicU64,
+    /// MX3 (ruling Q-MX1): venue seq REGRESSIONS on sampled/snapshot
+    /// streams where the §6.2 chain law does not apply (MEXC) — a
+    /// value strictly below the last-seen one for the same symbol ×
+    /// stream. Never folded into `gaps_total` (a skipped version is
+    /// normal there; only a step BACK is news).
+    seq_regressions_total: AtomicU64,
     /// Channel resubscribes triggered by integrity monitors.
     resubscribes_total: AtomicU64,
     /// Transport reconnects.
@@ -231,8 +238,7 @@ pub struct IngressStatus {
     last_err_venue_code: AtomicU32,
     /// VT2: ticks the ingress judged STALE against the venue's
     /// `stale_after_ms` (`TICK_FLAG_STALE` set; captured, never a
-    /// signal). A subset of `ticks_total`. Fills the slot's last
-    /// 8 bytes exactly (128 B).
+    /// signal). A subset of `ticks_total`.
     stale_ticks_total: AtomicU64,
 }
 
@@ -246,6 +252,7 @@ impl IngressStatus {
             bytes_total: AtomicU64::new(0),
             parse_errors_total: AtomicU64::new(0),
             gaps_total: AtomicU64::new(0),
+            seq_regressions_total: AtomicU64::new(0),
             resubscribes_total: AtomicU64::new(0),
             reconnects_total: AtomicU64::new(0),
             ring_drops_total: AtomicU64::new(0),
@@ -298,6 +305,13 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_gaps(&self) {
         self.gaps_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one venue seq regression (MX3 — see
+    /// `seq_regressions_total` field docs).
+    #[inline(always)]
+    pub fn inc_seq_regressions(&self) {
+        self.seq_regressions_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one integrity-driven resubscribe.
@@ -426,6 +440,12 @@ impl IngressStatus {
         self.gaps_total.load(Ordering::Relaxed)
     }
 
+    /// Total venue seq regressions (MX3).
+    #[inline]
+    pub fn seq_regressions_total(&self) -> u64 {
+        self.seq_regressions_total.load(Ordering::Relaxed)
+    }
+
     /// Total resubscribes.
     #[inline]
     pub fn resubscribes_total(&self) -> u64 {
@@ -552,6 +572,7 @@ mod tests {
         s.add_bytes(1024);
         s.inc_parse_errors();
         s.inc_gaps();
+        s.inc_seq_regressions();
         s.inc_resubscribes();
         s.inc_reconnects();
         s.inc_ring_drops();
@@ -561,6 +582,7 @@ mod tests {
         assert_eq!(s.bytes_total(), 1024);
         assert_eq!(s.parse_errors_total(), 1);
         assert_eq!(s.gaps_total(), 1);
+        assert_eq!(s.seq_regressions_total(), 1);
         assert_eq!(s.resubscribes_total(), 1);
         assert_eq!(s.reconnects_total(), 1);
         assert_eq!(s.ring_drops_total(), 2);
@@ -570,11 +592,11 @@ mod tests {
     #[test]
     fn slot_is_cache_aligned() {
         assert_eq!(::core::mem::align_of::<IngressStatus>(), 64);
-        // 1(+7 pad) + 8 + 12×8 + (1+1+2+4) + 8 = 128 B — exactly two
-        // cache lines with ZERO slack left (VT2 spent the last 8 B on
-        // stale_ticks and the diag triple's pad on the delay gauge);
-        // the next counter must reuse a field or grow to 192.
-        assert_eq!(::core::mem::size_of::<IngressStatus>(), 128);
+        // 1(+7 pad) + 8 + 13×8 + (1+1+2+4) + 8 = 136 B → 192 B with
+        // the alignment tail: three cache lines (MX3's
+        // seq_regressions_total crossed the second; 56 B of slack now
+        // remain for the next counters before 256).
+        assert_eq!(::core::mem::size_of::<IngressStatus>(), 192);
     }
 
     #[test]
@@ -657,6 +679,21 @@ mod tests {
         assert_eq!(s.depth_ring_drops_total(), 1);
         assert_eq!(s.event_ring_drops_total(), 0);
         assert_eq!(s.ring_drops_total(), 0);
+    }
+
+    #[test]
+    fn seq_regressions_counter_accumulates_independently() {
+        // MX3: a regression advances seq_regressions ONLY — never the
+        // §6.2 gaps (a sampled stream skipping versions is not a gap)
+        // nor parse_errors (the frame parsed fine).
+        let s = IngressStatus::new();
+        assert_eq!(s.seq_regressions_total(), 0);
+        s.inc_seq_regressions();
+        s.inc_seq_regressions();
+        assert_eq!(s.seq_regressions_total(), 2);
+        assert_eq!(s.gaps_total(), 0);
+        assert_eq!(s.parse_errors_total(), 0);
+        assert_eq!(s.msgs_total(), 0);
     }
 
     #[test]
