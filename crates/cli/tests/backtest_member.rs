@@ -903,7 +903,35 @@ fn bin15_seed_text() -> String {
 /// `(replay root, bin15.toml)`. `family` is the byte the roll carries —
 /// 0 for the happy path, anything else for the mismatch test.
 fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf, PathBuf) {
-    let run = root.join(format!("run-{BIN15_EPOCH_NS}"));
+    build_bin15_capture_clocked(root, family, families_toml, None)
+}
+
+/// BIN15 S2: the capture's clock. `None` = the identity fixture (every
+/// stamp IS the wall instant, no venue stamps — the old anchor law).
+/// `Some(early_ns)` = a v3 capture as the engine really writes one:
+/// MONOTONIC stamps, Hyperliquid ticks carrying the venue's own time,
+/// and a run directory named `early_ns` BEFORE the first record (the
+/// boot names the directory; the first tick lands seconds later).
+fn build_bin15_capture_clocked(
+    root: &Path,
+    family: u8,
+    families_toml: &str,
+    early_ns: Option<u64>,
+) -> (PathBuf, PathBuf) {
+    // Mono stamp of the venue instant `BIN15_EPOCH_NS` on the v3 path.
+    const MONO0: u64 = 7_000_000_000_000;
+    let dir_epoch = match early_ns {
+        Some(e) => BIN15_EPOCH_NS - e,
+        None => BIN15_EPOCH_NS,
+    };
+    // venue instant → capture stamp
+    let stamp = |venue_ns: u64| -> u64 {
+        match early_ns {
+            Some(_) => venue_ns - BIN15_EPOCH_NS + MONO0,
+            None => venue_ns,
+        }
+    };
+    let run = root.join(format!("run-{dir_epoch}"));
     std::fs::create_dir_all(&run).expect("mkdir run");
     std::fs::write(
         run.join("instrument-manifest.tsv"),
@@ -926,10 +954,12 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
     for at in (540u64..=600).step_by(5) {
         events.push(bin15_mark(at));
     }
-    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, BIN15_EPOCH_NS)
+    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, dir_epoch)
         .expect("open events");
     for e in &events {
-        w.append(e).expect("append event");
+        let mut e = *e;
+        e.ts_ns = stamp(e.ts_ns);
+        w.append(&e).expect("append event");
     }
     w.flush().expect("flush events");
 
@@ -951,10 +981,26 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
         // Past the settlement instant, so the window HOLDS the payout.
         bin15_tick(bin15_yes_sym(), 661_000, 300_000, 400_000, 5),
     ];
-    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, BIN15_EPOCH_NS)
+    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, dir_epoch)
         .expect("open ticks");
     for t in &ticks {
-        w.append(t).expect("append tick");
+        let mut t = *t;
+        if early_ns.is_some() {
+            // The venue's own clock rides the tick; the stamp is ours.
+            t = Tick::new_stamped(
+                stamp(t.ts_ns),
+                VenueId::Hyperliquid,
+                t.sym,
+                t.venue_seq,
+                t.bid_px,
+                t.bid_qty,
+                t.ask_px,
+                t.ask_qty,
+                t.ts_ns / 1_000_000,
+                0,
+            );
+        }
+        w.append(&t).expect("append tick");
     }
     w.flush().expect("flush ticks");
 
@@ -1064,9 +1110,68 @@ fn member_bin15_prices_takes_and_settles_on_a_synthetic_root() {
     // `y` is the payout the fill model actually used, not a second
     // derivation of it — this instance settled in the money.
     assert!(detail.contains("\"y\":1000000"), "ledger y: {detail}");
+    // BIN15 S2: an anchor-law run's sidecar carries no clock key at all.
+    assert!(!detail.contains("\"wall\":"), "{detail}");
     // A priced row carries a fair value nowhere near a coin flip: the
     // strike is 11 % below the mark, so Φ saturates its clamp.
     assert!(detail.contains("\"p_raw_1e6\":999979"), "ledger p_raw: {detail}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// BIN15 S2: a v3 capture is replayed on the VENUE's clock. The run
+/// directory is named 23 s before its first record (as a boot names it),
+/// so the old anchor law put every instant 23 s early — a different
+/// minute against a settlement window that ENDS at the expiry. On the
+/// venue's clock every sidecar stamp is an instant the venue put a record
+/// at, and the summary says which clock it used.
+#[test]
+fn member_bin15_replays_a_v3_capture_on_the_venue_clock() {
+    const EARLY: u64 = 23_000_000_000;
+    let root = unique_root("bin15-venue-clock");
+    let (replay, toml) = build_bin15_capture_clocked(&root, 0, "[\"out:BTC:15m\"]", Some(EARLY));
+    let mut cfg = bin15_cfg(&replay, &toml);
+    cfg.emit_detail = Some(root.join("detail.json"));
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+    assert!(
+        out.summary.contains("wall=venue offset_ns=") && out.summary.contains("(the anchor law ran 23.000 s early)"),
+        "{}",
+        out.summary
+    );
+    // The same trade and the same settlement as the identity fixture.
+    assert!(out.summary.contains(" takes_submitted=1 takes_filled=1 "), "{}", out.summary);
+    let key = "\"net_pnl_usd\":";
+    let i = out.schema1.find(key).expect("net field") + key.len();
+    let j = out.schema1[i..].find(',').expect("comma") + i;
+    let net: f64 = out.schema1[i..j].parse().expect("json number");
+    assert!((59.0..=61.0).contains(&net), "net {net}: {}", out.schema1);
+    // Every ledger stamp is a VENUE instant the capture holds a record at
+    // (on the old law each would sit 23 s earlier — none of them).
+    let detail = std::fs::read_to_string(root.join("detail.json")).expect("detail");
+    let block = &detail[detail.find("\"bin15_ledger\":[").expect("ledger")..];
+    // The ledger's own rows only (flat objects: its array ends at the
+    // first `]`).
+    let block = &block[..block.find(']').expect("ledger end")];
+    let mut instants: Vec<u64> = vec![bin15_at(0), bin15_at(1), bin15_at(61)];
+    for ms in [62_000u64, 63_000, 63_300, 500_000, 661_000] {
+        instants.push(bin15_at_ms(ms));
+    }
+    for s in (540u64..=600).step_by(5) {
+        instants.push(bin15_at(s));
+    }
+    let mut rows = 0usize;
+    let mut rest = block;
+    while let Some(k) = rest.find("\"ts_ns\":") {
+        let from = k + "\"ts_ns\":".len();
+        let to = from + rest[from..].find(',').expect("comma");
+        let ts: u64 = rest[from..to].parse().expect("ts");
+        assert!(instants.contains(&ts), "ledger ts {ts} is not a venue instant of the capture");
+        rows += 1;
+        rest = &rest[to..];
+    }
+    assert!(rows > 0, "the ledger wrote rows: {detail}");
+    assert!(detail.contains("\"y\":1000000"), "settled on the venue clock: {detail}");
+    // The sidecar says which clock the run is on (the accrual reads it).
+    assert!(detail.contains("\"wall\":\"venue\""), "{detail}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

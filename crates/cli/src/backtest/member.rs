@@ -1524,6 +1524,12 @@ fn render_member_summary(
     for r in runs {
         s.push_str(&format!("  run-{}: ", r.epoch_ns));
         s.push_str(&super::render_stale_line(&r.stale));
+        // BIN15 S2: which clock this run's wall instants are on.
+        if r.wall_tell != super::clock::ClockTell::Silent {
+            use std::fmt::Write as _;
+            // Writing into a `String` cannot fail.
+            let _ = write!(s, " {}", r.wall_tell);
+        }
         s.push('\n');
     }
     s.push_str(&format!(

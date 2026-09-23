@@ -6,6 +6,98 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the harness WALL clock is the venue's for v3 captures with a Hyperliquid lane (`backtest`, `--member`, `audit-pnl`) (BIN15 S2)
+
+**What changed**
+- New `cli::backtest::clock`: `VenueOffsetFit` (a fixed `[i64; 64]`) takes
+  the first 64 Hyperliquid ticks whose `venue_time_ms > 0` in file order
+  and its median of `venue_time_ms·1e6 − ts_ns` is the run's offset;
+  `RunClock::wall_of` maps a capture stamp to its WALL instant —
+  `ts + offset` on such a run, the old `epoch + (ts − ts_first)` (clamped
+  at the anchor) otherwise, bit for bit. A fit that would put the run's
+  first record more than `EPOCH_SKEW_TOLERANCE_NS` (2 s) BEFORE the run
+  directory's epoch — impossible for a true clock, since the directory is
+  named at boot — is dominated by stale snapshots and is REFUSED: the run
+  keeps the anchor law and says `wall=anchor VENUE-FIT-REFUSED …`. The
+  refusal is judged on the FIRST SAMPLED HL stamp, so `backtest` and
+  `audit-pnl` (which pin different first records) cannot disagree about
+  it.
+- Detail sidecar, ADDITIVE: each `runs[]` entry gains `"wall":"venue"` or
+  `"wall":"refused"`; the key is absent on the anchor law, so an anchor
+  root's sidecar is byte-identical.
+- `backtest` / `backtest --member`: every merged record's `wall_ns` comes
+  from the run's `RunClock`; `audit-pnl`: the same clock for its merge,
+  the option settlement index stamps, the capped-fee index book and the
+  HIP-4 schedule (one mapping, where it used to restate
+  `epoch + (raw − ts_first)` four times). The VIRTUAL clock (replay
+  order) is untouched.
+- Stderr: `run[i] … wall=venue offset_ns=<n> (the anchor law ran <s> s
+  early)` (backtest), the same tell on the member summary's
+  `run-<epoch>:` line and as `audit-pnl: run-<epoch>: wall=venue …`.
+  SILENCE means the anchor law (no venue stamp), so a capture without
+  one reports byte for byte as before.
+- Worker: `claude_worker.hip4.venue_offset_first_n` mirrors the harness's
+  FIT exactly (integer median of the first 64 stamped pairs; the refusal
+  below is the harness's own);
+  `hip4.venue_offset_from_samples` is `venue_wall_offset_ns`'s own law,
+  now a pure function. Shared fixture `tests/fixtures/bin15/clock-1.*`
+  (the expected offset written by `crates/cli` under
+  `BIN15_CLOCK_WRITE=1`, generator `gen_clock_input.py`).
+
+**Why**
+- The run directory is named at boot and its first tick lands 10–25 s
+  later, so the old law ran 23–42 s EARLY against the venue on this host
+  (vault doc 27 §4; median 24.75 s). LAW E-11's window `[T − 60 s, T]` on
+  that clock is a different minute. On the 2026-09-13→23 captures the
+  first-64 median agrees with the worker's 4 000-sample law within
+  0.34 s on every run.
+
+**Impact**
+- Every WALL instant on a v3 root with an `hl-ticks.pmlr` lane moves
+  later by that run's error: HIP-4 settlement windows, a member's `now`
+  (it reads wall instants), UTC-day binning near midnight, and — on
+  roots that also carry Deribit — the option settlement and fee-index
+  instants. Roots without HL venue stamps (v2, or no HL lane) are
+  byte-identical.
+- The regime replay anchors its minute grid on the FIRST record's wall
+  instant and walks the virtual clock from there (`RegimeReplay::build`),
+  so on a multi-run venue-clock root a later run's regime grid is off
+  its own wall instants by the difference between the two runs' anchor
+  errors (seconds; one run, one window: exact). A window's seed files
+  are still cut at the old-law instant (`window_root`'s cut epoch), which
+  now sits up to ~40 s before the replay's first wall instant — no
+  look-ahead, at most a minute's seam.
+- **The standing 8-window VM pool guard MOVES, by design.** The pool
+  (`~/multivenue/worker/windows/`, 2026-09-05) is v3 with an HL lane, and
+  its anchor law ran 24.4–24.6 s early on every window. Re-run on the
+  same command (`backtest --ruleset …/fde6f733….json --replay-dir
+  ~/multivenue/worker/windows/ --split 0/100 --emit-detail …`): schema-1
+  `188d18e3b1ded762…` → `23bb8e843c08ce1d5c2d18b6382f86b4d9491cfbe35f4e718563a829e34dfe9b`,
+  detail sidecar `5868f723dacb0c2e…` → `3b986d43d2dc462b…`. The whole
+  difference is the regime replay: its seed rows and minute grid follow
+  the wall clock (seed rows 10 745 → 10 738, minutes 1 171 → 1 170), the
+  fast profile's labels shift and the vm fires 98 times instead of 97
+  (the P&L consequence is in the vault, BIN15 session log 29). The live
+  detector runs on true wall minutes, which is what the replay now reads;
+  the new hashes are the pool's reference from here on.
+- **The accrual stores and the cutover.** Rows a S2 binary accrues from
+  a window whose sidecar says `"wall":"venue"` are on the venue clock
+  already; rows accrued before S2, or from a window that is anchor-clocked
+  (no HL venue stamp) or `"wall":"refused"`, are on the anchor clock. `bin15_accrue relabel` (BIN15 S4) converts only rows that do
+  not yet carry its columns, so it may be re-run after any accrual; do
+  NOT re-accrue a pre-S2 day with an S2 binary into the same store — the
+  ledger dedupes on `(ts_ns, family, outcome)` and the re-clocked stamp
+  is a new key (the entries store dedupes on the outcome and is safe).
+- On-disk formats, config keys, wire formats: none.
+
+**Migration steps**
+1. Rebuild the release binary before trusting any replay (G0).
+2. The accrual stores are reclocked in place by
+   `claude_worker.bin15_accrue relabel` (BIN15 S4).
+
+**Rollback**
+- Revert the commit.
+
 ## 2026-09-24 — HIP-4 settlement: the TWAP window ENDING at the expiry, time-weighted; the venue-published cross-check; `bin15_ledger`/`bin15_entries` gain `y_next_strike` (+ `settle_px_1e6`) (BIN15 S1)
 
 **What changed**

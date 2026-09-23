@@ -69,10 +69,11 @@
 use std::collections::BTreeMap;
 use std::io;
 
-/// VX-A: one underlying observation awaiting a wall stamp. The rebase
-/// `wall = run.epoch_ns + (raw_ts − ts_first)` needs the run's first
-/// tick, which is only known once the run's events are sorted, so the
-/// observations are collected first and resolved after.
+/// VX-A: one underlying observation awaiting a wall stamp. The run's
+/// wall clock (`backtest::clock::RunClock`, BIN15 S2) needs the run's
+/// first tick and its venue offset, which are only known once the run's
+/// events are loaded and sorted, so the observations are collected first
+/// and resolved after.
 #[derive(Copy, Clone, Debug)]
 struct OptSettleCand {
     sym: u32,
@@ -477,6 +478,12 @@ struct RunLoad {
     funding_events: u64,
     regime_cmds: u64,
     regime_cmds_dropped: u64,
+    /// BIN15 S2: `(venue_time − ts, first sampled stamp)` over the run's
+    /// first Hyperliquid stamps — the SAME fit and law as `backtest`
+    /// (`backtest::clock`); `None` = the old anchor law (or a refused fit).
+    venue_fit: Option<(i64, u64)>,
+    /// BIN15 S2: the clock tell (silent on the anchor law).
+    wall_tell: crate::backtest::clock::ClockTell,
 }
 
 /// Load one run: every §9.9 input, syms rewritten to root-dense ids,
@@ -545,6 +552,8 @@ fn load_run_events(
         };
 
     let mut evs: Vec<Ev> = Vec::new();
+    // BIN15 S2: the run's venue clock, from its first Hyperliquid stamps.
+    let mut venue_fit = crate::backtest::clock::VenueOffsetFit::new();
 
     // Ticks (per-venue files, harness acceptance law).
     for (lord, label) in VENUE_LABELS.iter().enumerate() {
@@ -553,7 +562,11 @@ fn load_run_events(
             continue;
         };
         let has_venue_time = reader.has_venue_time();
+        let fit_here = has_venue_time && *label == "hl";
         for (i, t) in reader.records().iter().enumerate() {
+            if fit_here {
+                venue_fit.observe(t);
+            }
             if t.sym == SYMBOL_ID_NONE {
                 continue;
             }
@@ -848,21 +861,36 @@ fn load_run_events(
     // §3.2 total order, extended: (ts, class, lord, idx) — unique by
     // construction, so sort_unstable stays deterministic.
     evs.sort_unstable_by_key(|e| (e.ts_ns, e.class, e.lord, e.idx));
+    // BIN15 S2: the run's WALL clock — the venue's when its HL ticks
+    // carry it, else the old anchor law bit for bit. ONE mapping for the
+    // merge below, the option settlement index, the fee book and the
+    // HIP-4 schedule (`backtest::clock`, shared with `backtest`).
+    load.venue_fit = venue_fit.fit();
+    let (run_clock, tell) = crate::backtest::clock::RunClock::choose(
+        run.epoch_ns,
+        evs.first().map_or(0, |e| e.ts_ns),
+        load.venue_fit,
+    );
+    load.wall_tell = tell;
+    // The merge re-derives the clock from the fit; a refused fit must not
+    // come back there as the venue law.
+    if matches!(tell, crate::backtest::clock::ClockTell::Refused { .. }) {
+        load.venue_fit = None;
+    }
     // VX-A: stamp every settlement candidate with its WALL instant and
     // keep, per contract, the latest one at or before its own expiry.
-    // `wall = run.epoch_ns + (raw_ts − ts_first)` is the same rebase
-    // the merge applies, so the two clocks agree by construction rather
-    // than by coincidence. Deribit keeps printing an expired instrument
-    // for 9–19 min after settlement, and on a $79k index the drift over
-    // that lag is worth more than the option's whole premium — so the
-    // cut-off is the point of the rung, not a nicety.
+    // `run_clock` is the same rebase the merge applies, so the two
+    // clocks agree by construction rather than by coincidence. Deribit
+    // keeps printing an expired instrument for 9–19 min after
+    // settlement, and on a $79k index the drift over that lag is worth
+    // more than the option's whole premium — so the cut-off is the point
+    // of the rung, not a nicety.
     if !evs.is_empty() {
-        let ts_first = evs[0].ts_ns;
         for c in &settle_cand {
             let Some(r) = opt_out.settle_ref.get_mut(&c.sym) else {
                 continue;
             };
-            let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
+            let wall = run_clock.wall_of(c.raw_ts_ns);
             if wall <= r.expiry_ns && wall >= r.index_wall_ns {
                 r.index_1e6 = c.index_1e6;
                 r.index_wall_ns = wall;
@@ -873,7 +901,7 @@ fn load_run_events(
         // fee reads back, so the number the fee sees is exactly the
         // number the summary carried.
         for c in &fee_cand {
-            let wall = run.epoch_ns + c.raw_ts_ns.saturating_sub(ts_first);
+            let wall = run_clock.wall_of(c.raw_ts_ns);
             opt_out.index_book.observe(
                 c.sym,
                 wall,
@@ -894,8 +922,7 @@ fn load_run_events(
     // also OKX's mark-price channel, which every historical root
     // carries in bulk.
     if !evs.is_empty() {
-        let ts_first = evs[0].ts_ns;
-        let wall_of = |raw: u64| run.epoch_ns + raw.saturating_sub(ts_first);
+        let wall_of = |raw: u64| run_clock.wall_of(raw);
         // The underlyings this run's manifest actually names, by
         // descriptor — built from the manifest, which is read at the
         // top of this function, so the filter never needs a sym it has
@@ -1030,6 +1057,10 @@ fn load_and_merge_events(
         }
         debug_assert!(matches!(evs[0].payload, Payload::Tick(_)));
         let ts_first = evs[0].ts_ns;
+        // BIN15 S2: the same clock `load_run_events` stamped the option
+        // and HIP-4 schedules with (`backtest::clock`).
+        let (run_clock, _) =
+            crate::backtest::clock::RunClock::choose(run.epoch_ns, ts_first, load.venue_fit);
         merged.reserve(evs.len());
         for e in &evs {
             // Defensive: an order/fill logged before the first tick
@@ -1048,7 +1079,7 @@ fn load_and_merge_events(
             }
             merged.push(MergedEv {
                 virt_ns: base + delta,
-                wall_ns: run.epoch_ns + delta,
+                wall_ns: run_clock.wall_of(e.ts_ns),
                 payload,
             });
         }
@@ -1160,6 +1191,11 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
                 String::new()
             },
         ));
+        // BIN15 S2: silent on the anchor law, so a root without venue
+        // stamps reports exactly as before.
+        if l.wall_tell != crate::backtest::clock::ClockTell::Silent {
+            report(&format!("audit-pnl: run-{}: {}", l.epoch_ns, l.wall_tell));
+        }
         if l.opt_synth_ticks > 0 {
             report(&format!(
                 "audit-pnl: run-{}: opt-synth-ticks={} (D-7 mark books)",

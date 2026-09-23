@@ -879,6 +879,84 @@ fn a_binary_held_through_expiry_settles_at_the_payout_not_the_last_book() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// BIN15 S2: the same instance on a v3 root whose run directory was
+/// named 23 s before its first tick (as a boot names it) and whose HL
+/// ticks carry the venue's own clock. On the old anchor law every wall
+/// instant would sit 23 s early and the minute before the expiry would
+/// hold none of the settlement marks; on the venue clock the audit
+/// settles it exactly as the identity fixture above does — and says
+/// which clock it used.
+#[test]
+fn a_v3_root_settles_on_the_venue_clock_in_the_audit_too() {
+    const EARLY: u64 = 23_000_000_000;
+    let root = tmp_root("bin15-venue-clock");
+    let epoch = EPOCH_1 - EARLY;
+    let dir = run_dir(&root, epoch);
+    bin_manifest(&dir, true);
+    write_events(
+        &dir,
+        epoch,
+        &[
+            bin_roll(1_000, HL_YES, false),
+            bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 7_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 4_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 1_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
+        ],
+    );
+    // The venue's clock: the first tick (ts 1 000) IS `EPOCH_1`.
+    let stamp = |t: Tick| -> Tick {
+        Tick::new_stamped(
+            t.ts_ns,
+            VenueId::Hyperliquid,
+            t.sym,
+            t.venue_seq,
+            t.bid_px,
+            t.bid_qty,
+            t.ask_px,
+            t.ask_qty,
+            (EPOCH_1 + t.ts_ns - 1_000) / 1_000_000,
+            0,
+        )
+    };
+    write_ticks(
+        &dir,
+        "hl",
+        epoch,
+        &[
+            stamp(hl_tick(1_000, HL_YES, 390_000, 410_000)),
+            stamp(hl_tick(2_000 + HL_DELTA + 10, HL_YES, 380_000, 390_000)),
+            stamp(hl_tick(BIN_EXPIRY_OFF + 12_000_000_000, HL_YES, 200_000, 220_000)),
+        ],
+    );
+    write_orders(
+        &dir,
+        epoch,
+        &[hl_order(2_000, HL_YES, Side::Bid, 400_000, 100_000_000, 11)],
+    );
+    let (json, lines) = run_report(&root);
+    let tell = lines
+        .iter()
+        .find(|l| l.contains("wall=venue"))
+        .unwrap_or_else(|| panic!("no clock tell: {lines:#?}"));
+    // The stamps are whole milliseconds, so the fitted offset is off the
+    // exact 23 s by under a millisecond.
+    assert!(
+        tell.contains("(the anchor law ran 22.999 s early)")
+            || tell.contains("(the anchor law ran 23.000 s early)"),
+        "{tell}"
+    );
+    let sched = lines
+        .iter()
+        .find(|l| l.contains("bin15 settlement table"))
+        .unwrap_or_else(|| panic!("no schedule line: {lines:#?}"));
+    assert!(sched.contains("1 of 1 instance(s) settleable"), "{sched}");
+    assert!(json.contains("\"net_usd\":\"60.0\""), "json: {json}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_roll_whose_underlying_is_not_in_the_manifest_is_counted_not_guessed() {
     // Without the underlying's own row there is no mark series to

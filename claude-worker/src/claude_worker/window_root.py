@@ -15,9 +15,11 @@ as runs of their own:
 * the 64-byte header is copied with ``epoch_ns`` advanced by the
   window's offset from the run's first tick, and the window directory is
   named ``run-<advanced epoch>`` — the harness's directory/epoch check
-  holds and its wall rebase (``wall = epoch + (ts - ts_first)``) lands
-  on the true wall clock, so consecutive windows are disjoint runs on
-  its virtual timeline;
+  holds and consecutive windows are disjoint runs on its virtual
+  timeline. (Its WALL clock is the venue's since BIN15 S2 when the cut
+  carries Hyperliquid venue stamps — ``cli::backtest::clock`` — and the
+  old ``wall = epoch + (ts - ts_first)`` otherwise; the cut's epoch
+  names the directory and seeds a window, it no longer clocks one.)
 * the manifests are copied;
 * RG3: ``ai-cmds.pmlr`` is cut by ``ts_ns`` like every file (the
   events-file lesson — an uncut file drags out-of-window rows into the

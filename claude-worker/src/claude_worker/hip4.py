@@ -36,6 +36,10 @@ import claude_worker.pmlr
 #: Ticks sampled when fitting the venue-wall offset (BIN15 O10).
 _OFFSET_SAMPLES: int = 4000
 
+#: The HARNESS's sample: the first N stamped Hyperliquid ticks
+#: (``cli::backtest::clock::VENUE_OFFSET_SAMPLES``, BIN15 S2).
+HARNESS_OFFSET_SAMPLES: int = 64
+
 #: Grammar of a parsed description -- mirrors ``HlOutcomeGrammar``.
 GRAMMAR_UNKNOWN: int = 0
 GRAMMAR_OUT_BINARY_PRICE: int = 1
@@ -266,20 +270,57 @@ def venue_wall_offset_ns(run_dir: pathlib.Path) -> int | None:
     f = run_dir / "hl-ticks.pmlr"
     if not f.is_file():
         return None
-    offs: list[int] = []
     try:
         with claude_worker.pmlr.Reader(f) as reader:
             if not reader.has_venue_time or len(reader) == 0:
                 return None
             n = len(reader)
             step = max(1, n // _OFFSET_SAMPLES)
-            for i in range(0, n, step):
-                tick = reader.tick(i)
-                if tick.venue_time_ms:
-                    offs.append(tick.venue_time_ms * 1_000_000 - tick.ts_ns)
+            return venue_offset_from_samples(
+                (t.venue_time_ms, t.ts_ns)
+                for t in (reader.tick(i) for i in range(0, n, step))
+            )
     except (claude_worker.pmlr.PmlrError, OSError, ValueError):
         return None
+
+
+def venue_offset_from_samples(pairs: typing.Iterable[tuple[int, int]]) -> int | None:
+    """``int(median(venue_time_ms·1e6 − ts_ns))`` over ``(venue_time_ms,
+    ts_ns)`` pairs, unstamped ones (``venue_time_ms == 0``) skipped;
+    ``None`` with none -- the law :func:`venue_wall_offset_ns` applies to
+    its 4 000-tick sample of a file."""
+    offs = [v * 1_000_000 - ts for v, ts in pairs if v]
     return int(statistics.median(offs)) if offs else None
+
+
+def venue_offset_first_n(
+    pairs: typing.Iterable[tuple[int, int]], n: int = HARNESS_OFFSET_SAMPLES
+) -> int | None:
+    """The HARNESS's law (``cli::backtest::clock::VenueOffsetFit``, BIN15
+    S2), mirrored exactly: the median of the FIRST ``n`` stamped pairs in
+    file order -- on an even count the mean of the two middle ones,
+    truncated toward zero as Rust's integer division does. Integer
+    throughout (a float median of 1.8e18-sized numbers is off by up to
+    ~100 ns)."""
+    offs: list[int] = []
+    for v, ts in pairs:
+        if not v:
+            continue
+        d = v * 1_000_000 - ts
+        # Rust drops a difference that leaves i64 rather than wrapping it.
+        if d < -(2**63) or d > 2**63 - 1:
+            continue
+        offs.append(d)
+        if len(offs) == n:
+            break
+    if not offs:
+        return None
+    offs.sort()
+    mid = len(offs) // 2
+    if len(offs) % 2 == 1:
+        return offs[mid]
+    s = offs[mid - 1] + offs[mid]
+    return s // 2 if s >= 0 else -((-s) // 2)
 
 
 def open_at_end(run_dir: pathlib.Path) -> list[Roll]:

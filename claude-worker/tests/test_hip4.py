@@ -197,3 +197,52 @@ def test_the_mirror_refuses_what_the_engine_refuses() -> None:
     # Total on any string, including junk and the empty one.
     for junk in ("", "|", "::", "a:b|c", "perp:", "\x00\xff", "x" * 4096):
         assert claude_worker.hip4.parse_outcome_spec(4, junk).outcome == 4
+
+
+CLOCK_DIR = pathlib.Path(__file__).parent / "fixtures" / "bin15"
+
+
+def _clock_pairs() -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for line in (CLOCK_DIR / "clock-1.input.tsv").read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        ts, vms = line.split("\t")
+        out.append((int(vms), int(ts)))
+    return out
+
+
+def test_the_harness_clock_law_is_mirrored_bit_for_bit() -> None:
+    """BIN15 S2: the harness's venue offset (median of the first 64
+    stamped HL ticks) is WRITTEN by crates/cli (``BIN15_CLOCK_WRITE=1``);
+    the Python mirror of that law must equal it exactly, and the
+    file-wide law every offline consumer uses
+    (``venue_wall_offset_ns``'s) must sit within one second of it — the
+    plan's parity bar between the harness's stamps and the worker's."""
+    pairs = _clock_pairs()
+    assert len(pairs) > 1_000
+    want = None
+    for line in (CLOCK_DIR / "clock-1.expected.tsv").read_text(encoding="utf-8").splitlines():
+        if line.startswith("first64_offset_ns\t"):
+            want = int(line.split("\t")[1])
+    assert want is not None, "run BIN15_CLOCK_WRITE=1 on the cli test first"
+    assert claude_worker.hip4.venue_offset_first_n(pairs) == want
+    # The file-wide law, on the same 4 000-sample stride the reader takes.
+    step = max(1, len(pairs) // 4000)
+    wide = claude_worker.hip4.venue_offset_from_samples(pairs[::step])
+    assert wide is not None and abs(wide - want) <= 1_000_000_000, (wide, want)
+
+
+def test_the_first_n_law_ignores_unstamped_ticks_and_survives_a_stale_head() -> None:
+    # 20 stale snapshots (a minute behind), then fresh prints 150 ms late.
+    pairs = [(40_000, 100_000_000_000 + k) for k in range(20)]
+    pairs += [(0, 150_000_000_000)]  # unstamped: ignored
+    for k in range(200):
+        ts = 200_000_000_000 + k * 1_000_000
+        pairs.append(((ts + 150_000_000) // 1_000_000, ts))
+    assert claude_worker.hip4.venue_offset_first_n(pairs) == 150_000_000
+    assert claude_worker.hip4.venue_offset_first_n([]) is None
+    assert claude_worker.hip4.venue_offset_first_n([(0, 5)]) is None
+    # Even count: the mean of the two middles, integer.
+    assert claude_worker.hip4.venue_offset_first_n([(1_010, 1_000_000_000), (2_030, 2_000_000_000)]) == 20_000_000
+

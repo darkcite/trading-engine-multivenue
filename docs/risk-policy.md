@@ -4850,6 +4850,23 @@ hh:29–30, hh:44–45 and hh:59–00 (ruling O-6), and the routine 00:10 /
 family at its first Steady, so the member binds the live instance as
 soon as the boot completes.)
 
+### The harness clock is the venue's (S2, 2026-09-24)
+
+LAW E-11 is only as good as the clock the window is read on. The
+harness used to pin a run's first record to its directory's epoch — the
+boot's instant, 10–25 s before the first tick — so every replayed
+instant ran 23–42 s early and `[T − 60 s, T]` was a different minute.
+`backtest::clock::RunClock` maps a v3 run with a Hyperliquid lane onto
+the VENUE's clock (the median of the first 64 `venue_time_ms − ts`), one
+function for `backtest`, `--member` and `audit-pnl`; runs without venue
+stamps keep the old law bit for bit, and a fit that would put a run's
+first record before its directory's epoch (a stale-dominated fit) is
+refused back to the old law, loudly. The stderr names the clock of
+every venue-clock or refused run; silence means the anchor law. Replay
+ORDER (the virtual clock) is untouched, and
+no fill law moved with it: `requote_ttl_ns` and the IoC activation
+reference are the doc-11 law, not a clock (plan 28, refusal 5).
+
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 
 Slot 0 is `hyparb`, the HyperEVM AMM ↔ Hyperliquid Core arb

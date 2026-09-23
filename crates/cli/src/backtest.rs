@@ -44,6 +44,8 @@
 //! Nothing here is reachable from a hot path.
 
 pub mod binary;
+/// BIN15 S2: the per-run wall clock — the venue's when the capture says.
+pub mod clock;
 pub mod fill;
 pub mod funding;
 /// XSD-F/Tier 3: `--member <name>` — the harness drives a coded member.
@@ -824,8 +826,11 @@ fn order_run(recs: &mut [MergeKeyed]) {
 }
 
 /// One record of the merged, rebased timeline. `tick.ts_ns` has been
-/// rewritten to the virtual clock; `wall_ns` is the §3.3 wall mapping
-/// (`epoch_ns_0 + (virt − VIRT_T0)`), kept for UTC-day reporting.
+/// rewritten to the virtual clock; `wall_ns` is the run's WALL clock
+/// ([`clock::RunClock`], BIN15 S2): on the anchor law it is the §3.3
+/// mapping `epoch_ns_0 + (virt − VIRT_T0)`; on the venue law it is the
+/// venue's instant, which sits off that mapping by the run's anchor
+/// error (so `wall − virt` is constant within a run, not across runs).
 #[derive(Copy, Clone, Debug)]
 pub struct MergedRec {
     pub(crate) payload: RecPayload,
@@ -884,6 +889,14 @@ struct RunSummary {
     regime_cmds_dropped: u64,
     /// HYPARB H6: pool-event signals loaded (0 unless requested).
     pool_signals: u64,
+    /// BIN15 S2: `(venue_time − ts, first sampled stamp)` over the run's
+    /// first Hyperliquid stamps ([`clock::VenueOffsetFit::fit`]); `None`
+    /// = the old anchor law.
+    venue_fit: Option<(i64, u64)>,
+    /// BIN15 S2: the clock tell for the summary (silent on the anchor
+    /// law, so a capture without venue stamps reports byte for byte as
+    /// before).
+    wall_tell: clock::ClockTell,
 }
 
 /// Open every present per-venue capture file of `run` (ticks +
@@ -950,6 +963,8 @@ fn load_run(
         }
     };
     let mut tick_syms: BTreeSet<u32> = BTreeSet::new();
+    // BIN15 S2: the run's venue clock, from its first Hyperliquid stamps.
+    let mut hl_clock_fit = clock::VenueOffsetFit::new();
     for (vi, label) in VENUE_LABELS.iter().enumerate() {
         let path = run.path.join(format!("{label}-ticks.pmlr"));
         if !path.is_file() {
@@ -987,7 +1002,11 @@ fn load_run(
         venue_records[vi] = records.len() as u64;
         recs.reserve(records.len());
         let has_venue_time = reader.has_venue_time();
+        let fit_here = has_venue_time && *label == "hl";
         for (i, t) in records.iter().enumerate() {
+            if fit_here {
+                hl_clock_fit.observe(t);
+            }
             let mut tick = *t;
             // Judged in FILE order on the RAW sym (the estimator is
             // per connection; the remap below is a naming concern).
@@ -1350,6 +1369,8 @@ fn load_run(
             regime_cmds,
             regime_cmds_dropped,
             pool_signals: pool_signal_count,
+            venue_fit: hl_clock_fit.fit(),
+            wall_tell: clock::ClockTell::Silent,
         },
     ))
 }
@@ -1436,10 +1457,17 @@ fn load_and_merge(
             pool_signals,
         )?;
         summary.opt_registry_refused = registry_refused;
-        summaries.push(summary);
         if recs.is_empty() {
+            summaries.push(summary);
             continue; // header-only files everywhere: run holds no records
         }
+        let ts_first = recs[0].ts_ns; // §3.2 order ⇒ min ts of the run
+        // BIN15 S2: the WALL instant of every record — the venue's clock
+        // when the run's HL ticks carry it, else the old anchor law bit
+        // for bit. The virtual clock (replay ORDER) is untouched.
+        let (wall, tell) = clock::RunClock::choose(run.epoch_ns, ts_first, summary.venue_fit);
+        summary.wall_tell = tell;
+        summaries.push(summary);
         let base = VIRT_T0 + (run.epoch_ns - epoch_0);
         if base < prev_last_virt {
             return Err(HarnessError::Capture(format!(
@@ -1448,11 +1476,10 @@ fn load_and_merge(
                 run.epoch_ns, base, prev_last_virt
             )));
         }
-        let ts_first = recs[0].ts_ns; // §3.2 order ⇒ min ts of the run
         merged.reserve(recs.len());
         for r in &recs {
             let virt_ns = base + (r.ts_ns - ts_first);
-            let wall_ns = run.epoch_ns + (r.ts_ns - ts_first);
+            let wall_ns = wall.wall_of(r.ts_ns);
             let mut payload = r.payload;
             match &mut payload {
                 RecPayload::Tick(t) => t.ts_ns = virt_ns,
@@ -2759,7 +2786,17 @@ fn render_stale_runs_json(runs: &[RunSummary]) -> String {
                 st.stale_blind
             ));
         }
-        s.push_str("}}");
+        s.push('}');
+        // BIN15 S2: which clock the run's wall instants are on — ADDITIVE
+        // and absent on the anchor law, so an anchor root's sidecar is
+        // byte-identical. The worker's accrual reads it to know whether a
+        // window's rows are already on the venue clock.
+        if let Some(tag) = r.wall_tell.json_tag() {
+            s.push_str(",\"wall\":\"");
+            s.push_str(tag);
+            s.push('"');
+        }
+        s.push('}');
     }
     s
 }
@@ -2964,6 +3001,11 @@ fn render_summary(
         }
         if r.dropped_foreign > 0 {
             s.push_str(&format!(" dropped_foreign={}", r.dropped_foreign));
+        }
+        if r.wall_tell != clock::ClockTell::Silent {
+            use std::fmt::Write as _;
+            // Writing into a `String` cannot fail.
+            let _ = write!(s, " {}", r.wall_tell);
         }
         s.push('\n');
         s.push_str("   ");
