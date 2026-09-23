@@ -3468,8 +3468,9 @@ pub const fn binary_settle_open_ns(expiry_ns: u64, twap_ns: u64) -> u64 {
 /// The one arithmetic every consumer of the law shares: the harness
 /// and the audit fold a captured mark series through it
 /// (`cli::backtest::binary::settle_reference_1e6`), and the member's
-/// running TWAP (BIN15 S3) is to fold its live marks through the same
-/// piece to know how much of the average is already decided. A TWAP is
+/// running TWAP (BIN15 S3, `strategy_bin15`'s `fold_twap`) folds its live
+/// marks through the same piece to know how much of the average is
+/// already decided. A TWAP is
 /// TIME-weighted — each mark counts for as long as it was the mark —
 /// with the last mark carried forward, so a burst of prints in one
 /// second weighs one second and a quiet stretch keeps the price that
@@ -3495,6 +3496,19 @@ pub const fn binary_twap_segment(
     let dt = hi - lo;
     (px_1e6 as i128 * dt as i128, dt)
 }
+
+/// BIN15 S3 (LAW E-11): the longest one mark may stand for the venue's
+/// series across a settlement window, ns — the evidence bound every
+/// consumer of the law judges a window by.
+///
+/// Hyperliquid prints a mark every 1–3 s, so a longer hole between two
+/// marks we saw is a gap in OUR series — a restart, a stalled channel —
+/// and carrying the last mark across it would decide the minute on a
+/// number nobody saw. The harness refuses to settle such a window
+/// (`cli::backtest::binary::settle_reference_1e6`) and the member holds
+/// inside one (`strategy_bin15`'s `twap_gap`). Measured over the whole
+/// piece: the part carried in from before the open counts.
+pub const BINARY_SETTLE_MARK_GAP_MAX_NS: u64 = 10_000_000_000;
 
 /// HIP-4 exposure for one outcome: `|yes − no|`.
 ///

@@ -43,19 +43,27 @@
 //! | `R phase p_1e6` | `recal_1e6` | `R v` |
 //! | `H tau_ns` | `phase_of` | `H phase` |
 //! | `G px_1e6 tick_1e6` | the grid rounders | `G floor ceil` |
+//! | `T to_expiry twap` | `pricing_horizon_ns` (S3) | `T horizon` |
+//! | `M a mark strike to_expiry twap` | `twap_moneyness_1e9` (S3) | `M m_1e9` or `M -` |
+//! | `W mark strike to_expiry twap a sig2` | `fair_value_twap` (S3) | `W p_hat p_raw d den horizon` or `W - - - - -` |
+//! | `S px from to open close` | `core_types::binary_twap_segment` (S3) | `S area dt` |
+//!
+//! `parity-1` is the O4b tape and is pinned as it was; the BIN15 S3
+//! records (the venue's settlement law in the pricer, ruling O-2) travel
+//! in `parity-2`, which adds lanes rather than rewriting a pinned one.
 //!
 //! Test-only code: allocation and `unwrap` are fine here.
 
 use strategy_bin15::price::{
-    ceil_grid_1e6, fair_value, floor_grid_1e6, log_moneyness_1e9, phase_of, Bin15Luts, PHASES,
-    PHI_POINTS, RECAL_POINTS,
+    ceil_grid_1e6, fair_value, fair_value_twap, floor_grid_1e6, log_moneyness_1e9, phase_of,
+    pricing_horizon_ns, twap_moneyness_1e9, Bin15Luts, PHASES, PHI_POINTS, RECAL_POINTS,
 };
 
 const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../claude-worker/tests/fixtures/bin15/"
 );
-const FIXTURES: [&str; 1] = ["parity-1"];
+const FIXTURES: [&str; 2] = ["parity-1", "parity-2"];
 
 /// Replay one fixture, returning the emitted rows.
 fn run(name: &str) -> Vec<String> {
@@ -127,6 +135,51 @@ fn run(name: &str) -> Vec<String> {
                     ceil_grid_1e6(px, tick)
                 ));
             }
+            "T" => out.push(format!(
+                "T\t{}",
+                pricing_horizon_ns(f[1].parse().unwrap(), f[2].parse().unwrap())
+            )),
+            "M" => {
+                let m = twap_moneyness_1e9(
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                    f[5].parse().unwrap(),
+                );
+                out.push(match m {
+                    Some(v) => format!("M\t{v}"),
+                    None => "M\t-".to_owned(),
+                });
+            }
+            "W" => {
+                let row = match fair_value_twap(
+                    &luts,
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                    f[5].parse().unwrap(),
+                    f[6].parse().unwrap(),
+                ) {
+                    Some(v) => format!(
+                        "W\t{}\t{}\t{}\t{}\t{}",
+                        v.p_hat_1e6, v.p_raw_1e6, v.d_1e6, v.den_1e9, v.horizon_ns
+                    ),
+                    None => "W\t-\t-\t-\t-\t-".to_owned(),
+                };
+                out.push(row);
+            }
+            "S" => {
+                let (area, dt) = core_types::binary_twap_segment(
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                    f[5].parse().unwrap(),
+                );
+                out.push(format!("S\t{area}\t{dt}"));
+            }
             other => panic!("unknown fixture record `{other}`"),
         }
     }
@@ -147,7 +200,8 @@ fn check(name: &str) {
             "# {name}.expected.tsv — WRITTEN by crates/strategy-bin15/tests/parity.rs \
              (BIN15_PARITY_WRITE={name}).\n\
              # F p_hat_1e6 p_raw_1e6 d_1e6   (`-` = the pricer refused the inputs)\n\
-             # X x_1e9 · P phi_1e6 · R recal_1e6 · H phase · G floor ceil\n"
+             # X x_1e9 · P phi_1e6 · R recal_1e6 · H phase · G floor ceil\n\
+             # T horizon · M m_1e9 · W p_hat p_raw d den horizon · S area dt   (BIN15 S3)\n"
         );
         for l in &got {
             text.push_str(l);

@@ -1226,13 +1226,18 @@ pub struct Bin15Counters {
     pub skipped_tau: u64,
     /// Re-prices held: inside `tail_refuse_ns`.
     pub skipped_tail: u64,
-    /// Re-prices held: the underlying mark or a touch is stale.
+    /// Re-prices held: no underlying mark, a cold forecast or a price
+    /// the pricer refused — and (BIN15 S3) inside a settlement window
+    /// whose running average has a hole (`twap_gap`: an open the
+    /// instance never saw a mark in force at, or a mark piece longer
+    /// than `core_types::BINARY_SETTLE_MARK_GAP_MAX_NS`).
     pub skipped_stale: u64,
     /// BIN15 P0 (F4): re-prices held because the underlying mark is
     /// OLDER than `mark_stale_ns`. Distinct from `skipped_stale`: that
-    /// one means no mark at all, this one means a mark the tape has
-    /// left behind, which is the failure that prices four families off
-    /// a frozen number while their books track reality.
+    /// one means an input that does not exist (no mark, no forecast, no
+    /// whole average), this one means a mark the tape has left behind,
+    /// which is the failure that prices four families off a frozen
+    /// number while their books track reality.
     pub skipped_mark_stale: u64,
     /// Re-prices held: the binary book is one-sided or empty.
     pub skipped_book: u64,
@@ -1354,9 +1359,11 @@ pub const BIN15_VIEW_FAMILIES: usize = 8;
 pub struct Bin15FamilyView {
     /// The venue's own id for the live instance; `0` = dormant.
     pub live_outcome: u32,
-    /// Whole seconds of pricing horizon at the last reprice (time to
-    /// expiry plus a third of the settlement TWAP window). `0` when
-    /// the family has never priced.
+    /// Whole seconds of pricing horizon at the last reprice, rounded UP
+    /// — the variance-time left in the venue's settlement TWAP
+    /// (`strategy_bin15::price::pricing_horizon_ns`, BIN15 S3: `τ − 2W/3`
+    /// with the window ahead, `τ³/(3W²)` inside it, sub-second for the
+    /// last ~22 s). `0` when the family has never priced.
     pub tau_s: u32,
     /// Last fair value ×1e6.
     pub p_hat_1e6: i64,

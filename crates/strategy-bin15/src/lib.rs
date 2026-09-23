@@ -321,7 +321,9 @@ pub struct FamilyState {
     pub den_1e9: i64,
     /// BIN15 O6: the mark the last reprice used ×1e6.
     pub mark_1e6: i64,
-    /// BIN15 O6: the pricing horizon the last reprice used, ns.
+    /// BIN15 O6: the pricing horizon the last reprice used, ns (BIN15 S3:
+    /// `price::pricing_horizon_ns` — the variance-time left in the
+    /// settlement TWAP, not the time to expiry).
     pub last_tau_ns: u64,
     /// BIN15 O9: `1` once this instance's COVERAGE ENTRY has been
     /// emitted. Its own flag rather than a test on
@@ -329,7 +331,32 @@ pub struct FamilyState {
     /// too — a resting quote would otherwise read as "already
     /// entered" and the coverage entry would never fire.
     pub covered: u8,
+    /// BIN15 S3 (ruling O-2): `∫ mark du` over `[T − W, twap_last_ts]`
+    /// (mark ×1e6 · wall ns) — the part of the venue's settlement average
+    /// already behind, integrated from the underlying's marks with the
+    /// last mark carried forward (`core_types::binary_twap_segment`, the
+    /// arithmetic the harness settles with).
+    ///
+    /// The three S3 fields cost the struct one cache line (448 → 512 B)
+    /// and sit together in it, so a fold writes one line per family.
+    pub twap_sum: i128,
+    /// BIN15 S3: the wall instant `twap_sum` is integrated up to; `0` =
+    /// nothing yet.
+    pub twap_last_ts: u64,
+    /// BIN15 S3: `1` once this instance's settlement window has a hole
+    /// the member cannot fill — its open was not covered by a mark this
+    /// family saw in force, or a piece spanning it outlasted
+    /// `core_types::BINARY_SETTLE_MARK_GAP_MAX_NS`. The evidence law the
+    /// harness settles with (LAW E-11); a running average with a hole in
+    /// it is not the venue's, so the family HOLDS for the rest of the
+    /// window.
+    pub twap_gap: u8,
 }
+
+// Eight cache lines: the three S3 fields took the eighth (see
+// `twap_sum`). A field added here that crosses into a ninth is a
+// decision, not an accident.
+const _: () = assert!(::core::mem::size_of::<FamilyState>() == 512);
 
 impl Default for FamilyState {
     fn default() -> Self {
@@ -357,6 +384,9 @@ impl Default for FamilyState {
             mark_1e6: 0,
             last_tau_ns: 0,
             covered: 0,
+            twap_sum: 0,
+            twap_last_ts: 0,
+            twap_gap: 0,
         }
     }
 }
@@ -397,6 +427,10 @@ impl FamilyState {
         // BIN15 O9: the successor is its own instance and gets its own
         // coverage entry.
         self.covered = 0;
+        // BIN15 S3: and its own settlement average.
+        self.twap_sum = 0;
+        self.twap_last_ts = 0;
+        self.twap_gap = 0;
     }
 }
 
@@ -467,9 +501,10 @@ pub struct Bin15Params {
     pub e_take_1e6: i64,
     /// Arm B half-spread ×1e6.
     pub h_quote_1e6: i64,
-    /// τ floor for a take, ns (per family kind).
+    /// τ floor for a take, ns (per family kind) — judged on the TIME TO
+    /// EXPIRY (BIN15 S3), not the pricer's horizon.
     pub tau_min_take_ns: [u64; 2],
-    /// τ floor for a quote, ns (per family kind).
+    /// τ floor for a quote, ns (per family kind) — the time to expiry.
     pub tau_min_quote_ns: [u64; 2],
     /// The last window before expiry in which NOTHING is taken, ns.
     pub tail_refuse_ns: u64,
@@ -1078,8 +1113,16 @@ impl Bin15Strategy {
         if mark_1e6 <= 0 {
             return;
         }
-        let minute = self.bar.bar_id(now);
         let prev_mark = self.marks[u].mark_1e6;
+        let wall_now = self.bar.anchor.wall_of(now);
+        // BIN15 S3: the mark being replaced has been the mark since its
+        // own stamp; fold that interval into every live window on this
+        // underlying before it is gone.
+        if prev_mark > 0 {
+            let since = self.bar.anchor.wall_of(self.marks[u].ts_ns);
+            self.fold_twap(u, prev_mark, since, wall_now);
+        }
+        let minute = self.bar.bar_id(now);
         let prev_minute = self.marks[u].minute_id;
         if prev_minute == 0 {
             self.marks[u].minute_id = minute;
@@ -1094,10 +1137,54 @@ impl Bin15Strategy {
             // Transcendentals ONCE per minute per underlying. This is
             // the crate's whole reason for a per-minute variance
             // instead of a per-tick one.
-            self.refresh_sigma(u, self.bar.anchor.wall_of(now));
+            self.refresh_sigma(u, wall_now);
         }
         self.marks[u].mark_1e6 = mark_1e6;
         self.marks[u].ts_ns = now;
+    }
+
+    /// BIN15 S3: fold `px_1e6`, the mark in force over `[since_wall,
+    /// to_wall)`, into the running settlement average of every live
+    /// TWAP-settled family on underlying `u` whose window `[T − W, T]` the
+    /// piece reaches. Integer, no allocation: one
+    /// `core_types::binary_twap_segment` per family — the arithmetic the
+    /// harness settles with — and the interval already integrated
+    /// (`twap_last_ts`) is never counted twice.
+    ///
+    /// The evidence is judged as the harness judges it
+    /// (`cli::backtest::binary::settle_reference_1e6`): the first piece
+    /// into a window must start AT or before its open (a mark this family
+    /// saw in force when the minute began), and no piece spanning the
+    /// window may be longer than `core_types::BINARY_SETTLE_MARK_GAP_MAX_NS`
+    /// — measured over the WHOLE piece, the part before the open included.
+    /// A breach sets `twap_gap` for the rest of the instance.
+    #[inline]
+    fn fold_twap(&mut self, u: usize, px_1e6: i64, since_wall: u64, to_wall: u64) {
+        // `configure` already refuses more than `BIN15_MAX_FAMILIES`; the
+        // `min` states it where the compiler can see it (no bounds check).
+        let n = self.params.n_families.min(BIN15_MAX_FAMILIES);
+        let mut f = 0usize;
+        while f < n {
+            let fam = &mut self.fam[f];
+            f += 1;
+            if fam.underlying as usize != u || !fam.is_live() || fam.live.twap_ns == 0 {
+                continue;
+            }
+            let close = fam.live.expiry_ns;
+            let open = core_types::binary_settle_open_ns(close, fam.live.twap_ns);
+            if to_wall <= open || since_wall >= close || to_wall <= since_wall {
+                continue;
+            }
+            let upto = if to_wall < close { to_wall } else { close };
+            let head_unseen = fam.twap_last_ts == 0 && since_wall > open;
+            let too_long = upto - since_wall > core_types::BINARY_SETTLE_MARK_GAP_MAX_NS;
+            fam.twap_gap |= u8::from(head_unseen | too_long);
+            let from = if fam.twap_last_ts > since_wall { fam.twap_last_ts } else { since_wall };
+            fam.twap_sum += core_types::binary_twap_segment(px_1e6, from, to_wall, open, close).0;
+            if upto > fam.twap_last_ts {
+                fam.twap_last_ts = upto;
+            }
+        }
     }
 
     /// Recompute one underlying's per-minute variance, both tenors.
@@ -1196,7 +1283,8 @@ enum Hold {
     Dormant,
     /// Inside `tail_refuse_ns`, or past expiry.
     Tail,
-    /// The underlying mark or the forecast is absent.
+    /// The underlying mark or the forecast is absent — or, inside a
+    /// settlement window, the running average is (BIN15 S3: `twap_gap`).
     Stale,
     /// BIN15 P0 (F4): the underlying mark exists but is older than
     /// `mark_stale_ns`. Its own variant, not `Stale`, because "we never
@@ -1258,16 +1346,39 @@ impl Bin15Strategy {
         if now.saturating_sub(self.marks[u].ts_ns) > self.params.mark_stale_ns {
             return Err(Hold::MarkStale);
         }
-        // τ is time to expiry PLUS a third of the settlement TWAP
-        // window: a TWAP-settled binary is not decided at `T` but
-        // averaged over `[T, T + twap]`, and a Brownian average over a
-        // window carries a third of that window's variance.
-        let tau_ns = (expiry - wall).saturating_add(self.fam[idx].live.twap_ns / 3);
-        let Some(fair) = price::fair_value(
+        // BIN15 S3 (ruling O-2): the venue settles on the mark's TWAP
+        // over `[T − W, T]` (LAW E-11). While that window lies ahead the
+        // pricer's horizon is `τ − 2W/3`; inside it the part of the
+        // average already behind (`twap_sum`, plus the current mark
+        // carried from its stamp to now) moves the MEAN and only
+        // `τ³/(3W²)` of variance is left (`price::fair_value_twap`).
+        // A window with a hole in its evidence — `twap_gap`, an open this
+        // family never saw a mark in force at, or the current mark carried
+        // past the gap bound — has no known average: ABSENT DATA HOLDS.
+        let to_expiry = expiry - wall;
+        let twap = self.fam[idx].live.twap_ns;
+        let a_known: i128 = if twap > 0 && to_expiry < twap {
+            let open = core_types::binary_settle_open_ns(expiry, twap);
+            let mark_wall = self.bar.anchor.wall_of(self.marks[u].ts_ns);
+            let fam = &self.fam[idx];
+            if fam.twap_gap != 0
+                || (fam.twap_last_ts == 0 && mark_wall > open)
+                || wall.saturating_sub(mark_wall) > core_types::BINARY_SETTLE_MARK_GAP_MAX_NS
+            {
+                return Err(Hold::Stale);
+            }
+            let from = if fam.twap_last_ts > mark_wall { fam.twap_last_ts } else { mark_wall };
+            fam.twap_sum + core_types::binary_twap_segment(mark, from, wall, open, expiry).0
+        } else {
+            0
+        };
+        let Some(fair) = price::fair_value_twap(
             &self.lut,
             mark,
             self.fam[idx].live.strike_1e6,
-            tau_ns,
+            to_expiry,
+            twap,
+            a_known,
             sig2,
         ) else {
             return Err(Hold::Stale);
@@ -1281,11 +1392,15 @@ impl Bin15Strategy {
         self.fam[idx].d_1e6 = fair.d_1e6;
         self.fam[idx].den_1e9 = fair.den_1e9;
         self.fam[idx].mark_1e6 = mark;
-        self.fam[idx].last_tau_ns = tau_ns;
+        self.fam[idx].last_tau_ns = fair.horizon_ns;
         self.counters.reprices = self.counters.reprices.wrapping_add(1);
-        self.arm_take(ctx, idx, tau_ns, now);
+        // The arms' τ floors are judged on the TIME TO EXPIRY (BIN15 S3):
+        // "no take in the last `tau_min_take_ns`" is a clock statement,
+        // and the pricer's horizon is a variance-time that moves with the
+        // settlement law.
+        self.arm_take(ctx, idx, to_expiry, now);
         if self.params.maker_enabled == 1 {
-            self.arm_quote(ctx, idx, tau_ns, now);
+            self.arm_quote(ctx, idx, to_expiry, now);
         }
         Ok(())
     }
@@ -1389,9 +1504,9 @@ impl Bin15Strategy {
     /// the No side is the vehicle); and CLOSE inventory when the bid on
     /// a side we hold is RICH by the edge. The close is the only sell
     /// this member ever emits.
-    fn arm_take<C: Ctx>(&mut self, ctx: &mut C, idx: usize, tau_ns: u64, now: NsTs) {
+    fn arm_take<C: Ctx>(&mut self, ctx: &mut C, idx: usize, to_expiry_ns: u64, now: NsTs) {
         let kind = self.fam[idx].kind as usize;
-        if tau_ns < self.params.tau_min_take_ns[kind] {
+        if to_expiry_ns < self.params.tau_min_take_ns[kind] {
             self.counters.skipped_tau = self.counters.skipped_tau.wrapping_add(1);
             return;
         }
@@ -1540,9 +1655,9 @@ impl Bin15Strategy {
     /// happily fill. That asymmetry is why Arm B's paper P&L is a LOWER
     /// BOUND of a real two-sided maker's, and it is stated in the
     /// module header for the same reason.
-    fn arm_quote<C: Ctx>(&mut self, ctx: &mut C, idx: usize, tau_ns: u64, now: NsTs) {
+    fn arm_quote<C: Ctx>(&mut self, ctx: &mut C, idx: usize, to_expiry_ns: u64, now: NsTs) {
         let kind = self.fam[idx].kind as usize;
-        if tau_ns < self.params.tau_min_quote_ns[kind] {
+        if to_expiry_ns < self.params.tau_min_quote_ns[kind] {
             self.counters.skipped_tau = self.counters.skipped_tau.wrapping_add(1);
             return;
         }
@@ -2322,7 +2437,10 @@ impl StrategyCounters for Bin15Strategy {
         while i < n {
             out[i] = strategy_core::Bin15FamilyView {
                 live_outcome: self.fam[i].live.outcome,
-                tau_s: u32::try_from(self.fam[i].last_tau_ns / 1_000_000_000)
+                // Rounded UP: inside the settlement window the horizon is
+                // under a second for the last ~22 s (BIN15 S3), and `0`
+                // is the view's "never priced".
+                tau_s: u32::try_from(self.fam[i].last_tau_ns.div_ceil(1_000_000_000))
                     .unwrap_or(u32::MAX),
                 p_hat_1e6: self.fam[i].p_hat_1e6,
                 pos_yes_1e6: self.fam[i].pos_yes_1e6,
@@ -4028,7 +4146,8 @@ mod tests {
         assert_eq!(v.live_outcome, 2650);
         assert_eq!(v.strike_1e6, 79_000_000_000, "the instance's threshold");
         assert_eq!(v.mark_1e6, 79_197_500_000, "the mark the reprice used");
-        // τ = 600 s expiry − the 62 s mark, plus a third of a zero TWAP.
+        // τ = 600 s expiry − the 62 s mark; a family with no TWAP window
+        // settles AT `T`, so its horizon is τ itself (BIN15 S3).
         assert_eq!(v.tau_s, 538);
         assert!(v.den_1e9 > 0, "σ√τ must be readable, not inferred");
         assert!(v.d_1e6 > 0, "a mark above the strike is a positive d");
@@ -4051,6 +4170,193 @@ mod tests {
         assert_eq!(view[0].strike_1e6, 0);
         assert_eq!(view[0].d_1e6, 0);
         assert_eq!(view[0].tau_s, 0);
+    }
+
+    /// BIN15 S3 (ruling O-2): inside the settlement window the member
+    /// prices on the venue's RUNNING average — the part of `[T − W, T]`
+    /// already behind, folded from its own marks with the last mark
+    /// carried forward — and what it publishes is exactly
+    /// `price::fair_value_twap` of the integral a reader redoes by hand.
+    #[test]
+    fn inside_the_window_the_member_prices_on_the_running_average() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        let k = 79_000_000_000i64;
+        // Window [540 s, 600 s].
+        m.on_venue_event(&roll_event(0, 2651, 60, k, expiry(600), false), &mut c);
+        let above = k + k / 200; // +0.5 %
+        let below = k - k / 1_000; // −0.1 %
+        // A mark every 2 s from 530 s: one lands AT the open (in force
+        // there), then 30 s of the window at +0.5 %.
+        let mut s = 530u64;
+        while s <= 568 {
+            m.on_venue_event(&mark_event(above, at(s)), &mut c);
+            s += 2;
+        }
+        // The mark dips under the strike at 570 s and is re-read at 571 s.
+        m.on_venue_event(&mark_event(below, at(570)), &mut c);
+        m.on_venue_event(&mark_event(below, at(571)), &mut c);
+
+        let fam = m.family(0).expect("f");
+        let a = i128::from(above) * 30_000_000_000 + i128::from(below) * 1_000_000_000;
+        assert_eq!(fam.twap_sum, a, "∫ mark du over [540 s, 571 s], carried forward");
+        assert_eq!(fam.twap_last_ts, expiry(571));
+        assert_eq!(fam.twap_gap, 0, "a 2 s cadence is whole evidence");
+        let sig2 = m.marks[0].sig2_min_1e18[FAMILY_OUT_15M as usize];
+        let want = price::fair_value_twap(&m.lut, below, k, 29_000_000_000, 60_000_000_000, a, sig2)
+            .expect("priced");
+        assert_eq!(fam.p_ts_ns, at(571), "the last mark re-priced it");
+        assert_eq!(fam.p_hat_1e6, want.p_hat_1e6);
+        assert_eq!(fam.d_1e6, want.d_1e6);
+        assert_eq!(fam.den_1e9, want.den_1e9);
+        assert_eq!(fam.last_tau_ns, price::pricing_horizon_ns(29_000_000_000, 60_000_000_000));
+        assert_eq!(fam.last_tau_ns, want.horizon_ns, "the member records the pricer's horizon");
+        // The known half-minute above the strike outweighs the dip: the
+        // same mark with nothing behind it is a belief BELOW one half.
+        assert!(fam.d_1e6 > 0, "the average already behind decides: d {}", fam.d_1e6);
+        let blind = price::fair_value(&m.lut, below, k, fam.last_tau_ns, sig2).expect("blind");
+        assert!(blind.d_1e6 < 0, "without it the dip would read as a loss");
+    }
+
+    /// BIN15 S3: a hole in the member's own mark series across the window
+    /// is a hole in the average. The harness refuses to settle on one
+    /// (`SETTLE_MARK_GAP_MAX_NS`, the whole piece counted), and the member
+    /// HOLDS on one — for the rest of the window, since the hole does not
+    /// close — rather than price a number nobody saw. The successor starts
+    /// clean.
+    #[test]
+    fn a_hole_in_the_window_holds_the_family_until_the_successor() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        let k = 79_000_000_000i64;
+        m.on_venue_event(&roll_event(0, 2652, 60, k, expiry(600), false), &mut c);
+        m.on_venue_event(&mark_event(k, at(530)), &mut c);
+        let priced_at = m.family(0).expect("f").p_ts_ns;
+        let held = m.counters().skipped_stale;
+        // 530 s → 545 s: one 15 s piece across the open.
+        m.on_venue_event(&mark_event(k, at(545)), &mut c);
+        assert_eq!(m.family(0).expect("f").twap_gap, 1, "15 s outlasts the bound");
+        assert!(
+            m.marks[0].sig2_min_1e18[FAMILY_OUT_15M as usize] > 0,
+            "the forecast is warm: every hold below is the window's"
+        );
+        let mut s = 547u64;
+        while s <= 559 {
+            m.on_venue_event(&mark_event(k, at(s)), &mut c);
+            s += 2;
+        }
+        assert_eq!(m.counters().skipped_stale, held + 8, "every in-window reprice held");
+        assert_eq!(m.family(0).expect("f").p_ts_ns, priced_at, "and none of them priced");
+
+        // The successor is its own instance: its average starts empty.
+        m.on_venue_event(&roll_event(0, 2652, 0, 0, 0, true), &mut c);
+        m.on_venue_event(&roll_event(0, 2653, 60, k, expiry(1_500), false), &mut c);
+        let fam = m.family(0).expect("f");
+        assert_eq!((fam.twap_gap, fam.twap_sum, fam.twap_last_ts), (0, 0, 0));
+    }
+
+    /// BIN15 S3: an instance bound after its window opened — a boot or a
+    /// late roll inside the minute — never saw the mark in force at the
+    /// open, so the head of its average is unknown and it HOLDS there.
+    #[test]
+    fn an_instance_bound_inside_its_window_holds_there() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        let k = 79_000_000_000i64;
+        m.on_mark(0, k, at(0));
+        m.on_venue_event(&mark_event(k, at(61)), &mut c);
+        // Bound with its window [40 s, 100 s] already open at 61 s.
+        m.on_venue_event(&roll_event(0, 2655, 60, k, expiry(100), false), &mut c);
+        let priced_at = m.family(0).expect("f").p_ts_ns;
+        let held = m.counters().skipped_stale;
+        m.on_venue_event(&mark_event(k, at(63)), &mut c);
+        let fam = m.family(0).expect("f");
+        assert_eq!(fam.twap_gap, 1, "the open was never seen by this instance");
+        assert!(
+            m.marks[0].sig2_min_1e18[FAMILY_OUT_15M as usize] > 0,
+            "the forecast is warm: the hold is the window's"
+        );
+        assert_eq!(m.counters().skipped_stale, held + 1);
+        assert_eq!(fam.p_ts_ns, priced_at, "nothing priced on half an average");
+    }
+
+    /// BIN15 S3: the arms' τ floors are CLOCK statements — "no take in
+    /// the last minute" — so they are judged on the time to expiry, not
+    /// on the pricer's horizon (a variance-time: `τ − 2W/3` for a
+    /// TWAP-settled family, which would close the take arm 40 s early).
+    #[test]
+    fn the_take_floor_is_the_time_to_expiry_not_the_pricing_horizon() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        // 70 s to expiry at 62 s: past the 60 s take floor on the clock,
+        // while the horizon (70 − 40 = 30 s) is under it.
+        m.on_venue_event(&roll_event(0, 2654, 60, 79_000_000_000, expiry(132), false), &mut c);
+        m.on_mark(0, 79_000_000_000, at(0));
+        m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
+        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
+        m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(62), false), &mut c);
+        assert_eq!(m.family(0).expect("f").last_tau_ns, 30_000_000_000, "the horizon");
+        assert_eq!(m.counters().takes_submitted, 1, "the clock says 70 s: the arm is open");
+    }
+
+    /// BIN15 S3: the other side of the same law. 50 s to expiry is inside
+    /// the 60 s take floor on the clock, although the old horizon
+    /// (`τ + W/3` = 70 s) cleared it — and the window's evidence is whole,
+    /// so the member DID price there: the hold is the floor's.
+    #[test]
+    fn inside_the_take_floor_on_the_clock_nothing_is_taken() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        warm(&mut m, 0);
+        let k = 79_000_000_000i64;
+        // Window [52 s, 112 s]; marks at most 6 s apart across its open.
+        m.on_venue_event(&roll_event(0, 2656, 60, k, expiry(112), false), &mut c);
+        m.on_mark(0, k, at(0));
+        let mut s = 45u64;
+        while s <= 55 {
+            m.on_venue_event(&mark_event(k, at(s)), &mut c);
+            s += 5;
+        }
+        m.on_venue_event(&mark_event(k, at(61)), &mut c);
+        let tau_held = m.counters().skipped_tau;
+        m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
+        m.on_tick(&tick(yes_sym(0), 390_000, 400_000, 1_000_000_000, at(62), false), &mut c);
+        let fam = m.family(0).expect("f");
+        assert_eq!(fam.twap_gap, 0, "whole evidence");
+        assert_eq!(fam.p_ts_ns, at(62), "it priced, inside the window");
+        assert_eq!(m.counters().takes_submitted, 0, "50 s on the clock is inside the floor");
+        assert!(m.counters().skipped_tau > tau_held);
+    }
+
+    /// BIN15 S3: the quote floor is on the clock too — 110 s to expiry is
+    /// inside the 120 s floor (the old horizon read 130 s and quoted),
+    /// and 121 s is outside it.
+    #[test]
+    fn the_quote_floor_is_the_time_to_expiry() {
+        for (expiry_s, quotes) in [(172u64, false), (183u64, true)] {
+            let mut m = member(FAMILY_OUT_15M);
+            let mut c = ctx();
+            warm(&mut m, 0);
+            m.on_venue_event(
+                &roll_event(0, 2657, 60, 79_000_000_000, expiry(expiry_s), false),
+                &mut c,
+            );
+            m.on_mark(0, 79_000_000_000, at(0));
+            m.on_venue_event(&mark_event(79_000_000_000, at(61)), &mut c);
+            m.on_tick(&tick(no_sym(0), 400_000, 600_000, 1_000_000_000, at(62), false), &mut c);
+            m.on_tick(&tick(yes_sym(0), 490_000, 510_000, 1_000_000_000, at(62), false), &mut c);
+            assert!(m.counters().reprices > 0, "the pricer ran");
+            assert_eq!(
+                m.counters().quotes_submitted > 0,
+                quotes,
+                "{} s to expiry",
+                expiry_s - 62
+            );
+        }
     }
 
     /// BIN15 O9: the coverage entry takes EVERY 15 m instance at the

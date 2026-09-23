@@ -1159,16 +1159,32 @@ fn member_bin15_replays_a_v3_capture_on_the_venue_clock() {
         instants.push(bin15_at(s));
     }
     let mut rows = 0usize;
+    let mut inside = 0usize;
+    let twap_ns = u64::from(BIN15_TWAP_S) * 1_000_000_000;
     let mut rest = block;
     while let Some(k) = rest.find("\"ts_ns\":") {
         let from = k + "\"ts_ns\":".len();
         let to = from + rest[from..].find(',').expect("comma");
         let ts: u64 = rest[from..to].parse().expect("ts");
         assert!(instants.contains(&ts), "ledger ts {ts} is not a venue instant of the capture");
+        // BIN15 S3: the row's τ is the horizon the member priced at — the
+        // variance-time of the venue's window `[T − W, T]` seen from this
+        // venue instant, on both sides of the window's open.
+        let t0 = to + rest[to..].find("\"tau_ns\":").expect("tau") + "\"tau_ns\":".len();
+        let t1 = t0 + rest[t0..].find(',').expect("comma");
+        let tau: u64 = rest[t0..t1].parse().expect("tau");
+        let to_expiry = BIN15_EXPIRY_NS - ts;
+        assert_eq!(
+            tau,
+            strategy_bin15::price::pricing_horizon_ns(to_expiry, twap_ns),
+            "row at {ts}: the sidecar τ must be the member's horizon"
+        );
+        inside += usize::from(to_expiry < twap_ns);
         rows += 1;
-        rest = &rest[to..];
+        rest = &rest[t1..];
     }
     assert!(rows > 0, "the ledger wrote rows: {detail}");
+    assert!(inside > 0, "the member priced inside the window on its running average: {detail}");
     assert!(detail.contains("\"y\":1000000"), "settled on the venue clock: {detail}");
     // The sidecar says which clock the run is on (the accrual reads it).
     assert!(detail.contains("\"wall\":\"venue\""), "{detail}");

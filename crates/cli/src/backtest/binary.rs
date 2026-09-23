@@ -177,7 +177,8 @@ pub struct BinaryRegistration {
 pub const SETTLE_MIN_MARKS: usize = 3;
 
 /// The longest one mark may stand for the venue's series across the
-/// settlement window, ns.
+/// settlement window, ns — `core_types::BINARY_SETTLE_MARK_GAP_MAX_NS`,
+/// the one bound the member's running average (BIN15 S3) holds on too.
 ///
 /// Hyperliquid prints a mark every 1–3 s, so a longer hole between two
 /// captured marks is a CAPTURE gap — a restart, a stalled channel — and
@@ -185,7 +186,7 @@ pub const SETTLE_MIN_MARKS: usize = 3;
 /// nobody saw. Every piece that spans part of the window (including the
 /// one carried in from before its open, and the last one carried to the
 /// expiry) must be at most this long, or the instance is unsettleable.
-pub const SETTLE_MARK_GAP_MAX_NS: u64 = 10_000_000_000;
+pub const SETTLE_MARK_GAP_MAX_NS: u64 = core_types::BINARY_SETTLE_MARK_GAP_MAX_NS;
 
 /// How long after its predecessor's expiry a created roll may arrive
 /// and still be read as the SUCCESSOR: the venue creates it at the

@@ -4791,9 +4791,10 @@ having both.
 
 > **A HIP-4 binary settles on the window the venue's rules text names —
 > today the 60-second TWAP of the underlying's perp MARK ENDING at the
-> expiry, `TWAP[T − 60 s, T] ≥ strike`. The harness, the audit and (from
-> BIN15 S3) the member share ONE implementation of that window; none
-> restates it.**
+> expiry, `TWAP[T − 60 s, T] ≥ strike`. The harness and the audit settle
+> through ONE implementation of that window, and the member (from BIN15
+> S3) folds its live marks through the same window, piece arithmetic and
+> evidence bound; none restates them.**
 
 The outcome.xyz rules text for the rolling BTC 15-minute market:
 *"Settlement is according to the 60-second TWAP of BTC-USDC perp mark
@@ -4825,10 +4826,13 @@ What shares the law (E-10 is reserved for the doc-24 bankroll law):
   the expiry and the successor trades from `T`; an order still resting
   on the slot is cancelled at that instant (the venue clears the book at
   `T`) and counted in `settled_sym_orders_canceled`.
-* **The live member does not share it YET.** Until BIN15 S3 lands, the
-  member's pricer still builds its horizon for a window AFTER the expiry
-  (`τ + twap/3`); S3 moves it onto this window. A harness number scored
-  on E-11 is therefore scoring a member that priced the old window.
+* **The live member prices this window (BIN15 S3).** Its horizon is the
+  variance-time of `TWAP[T − W, T]` (`price::pricing_horizon_ns`), and
+  inside the window it folds its own marks through
+  `binary_twap_segment` into the running average and prices on it
+  (below). Until S3 the member priced a window AFTER the expiry
+  (`τ + twap/3`); a harness number from a binary before S3 scores a
+  member that priced the old window.
 
 **The venue-published cross-check.** The venue prints each settlement
 price as the SUCCESSOR's strike (rounded to the strike grid, ~9.5 s after
@@ -4866,6 +4870,47 @@ every venue-clock or refused run; silence means the anchor law. Replay
 ORDER (the virtual clock) is untouched, and
 no fill law moved with it: `requote_ttl_ns` and the IoC activation
 reference are the doc-11 law, not a clock (plan 28, refusal 5).
+
+### The member prices the venue's window (S3, 2026-09-24)
+
+The pricer's horizon is the variance the settlement is still exposed
+to, and E-11 fixes which average that is. For a Brownian log-price seen
+from `τ = T − t`:
+
+* **the window ahead** (`τ ≥ W`): `σ²·(τ − 2W/3)` — the price at `T − W`
+  plus the average of `W` more of the path. The horizon was `τ + W/3`
+  (a window after `T`), 60 s too long at `W = 60 s`, so a lead's `d`
+  was too small by `√((τ + 20 s)/(τ − 40 s))` — ×1.32 at `τ = 120 s`;
+* **inside it** (`τ < W`): part of the average is DECIDED. The member
+  keeps `twap_sum = ∫_{T−W}^{t} mark du` per family (last mark carried
+  forward, the harness's own arithmetic) and prices the excess
+  `X = A_known + τ·S − W·K` against `S·σ·√(τ³/3)`
+  (`price::fair_value_twap`, ruling O-2); as `τ → 0` the known average
+  IS the answer and `d` goes to the clamp on its side (`>=` is ITM);
+* **`W = 0`** (a family that settles AT `T`): `τ` itself.
+
+**Absent data holds inside the window too.** The running average is
+judged by the harness's evidence rule: an instance whose window opened
+before it saw a mark in force (a boot or a late bind inside the minute),
+or whose mark series has a piece longer than
+`core_types::BINARY_SETTLE_MARK_GAP_MAX_NS` (10 s, the constant the
+harness settles by) across the window, sets `twap_gap` and HOLDS
+(`skipped_stale`) for the rest of that instance — it never prices on
+half an average. The harness's third rule (at least `SETTLE_MIN_MARKS`
+inside the window) decides whether a settled LABEL exists, not what the
+average is, so the member does not mirror it. The member's marks are
+stamped on receipt, not by the venue: its window sits one feed latency
+(milliseconds) late against the venue's, which a 60 s average does not
+see.
+
+**The τ floors are clock statements.** `tau_min_take_ns` /
+`tau_min_quote_ns` are judged on the TIME TO EXPIRY, not on the horizon:
+"no take in the last minute" is a clock statement, and judging it on a
+variance-time that moves with the settlement law would have closed the
+take arm 40 s early. The ledger's `tau_ns` is the horizon the price was
+computed at (the member's own `last_tau_ns`), so a row priced inside
+the window reads `tau_ns < W/3` — the horizon is monotone in the time
+left and is `W/3` at the open — and needs no flag of its own.
 
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 

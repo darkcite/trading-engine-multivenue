@@ -2,10 +2,11 @@
 # Copyright 2026 Anton (darkcite)
 """bin15_ref.py -- the BIN15 pricer mirror (O4b).
 
-Two jobs. The first is the shared fixture: replay
-``tests/fixtures/bin15/parity-1.input.tsv`` and assert every row against
-``parity-1.expected.tsv``, which ``crates/strategy-bin15/tests/parity.rs``
-writes. **Tolerance is zero** -- the pricer is all-integer, so a
+Two jobs. The first is the shared fixtures: replay
+``tests/fixtures/bin15/parity-<n>.input.tsv`` and assert every row against
+``parity-<n>.expected.tsv``, which ``crates/strategy-bin15/tests/parity.rs``
+writes (``parity-2`` carries the BIN15 S3 lanes: the venue's settlement
+law in the pricer). **Tolerance is zero** -- the pricer is all-integer, so a
 one-unit disagreement is a different model, and the fair value is what
 decides whether the member crosses a book.
 
@@ -44,16 +45,17 @@ def _shipped_luts() -> claude_worker.bin15_ref.Bin15Luts:
     )
 
 
-def test_the_shared_fixture_matches_the_engine_bit_for_bit() -> None:
+@pytest.mark.parametrize("name", ["parity-1", "parity-2"])
+def test_the_shared_fixture_matches_the_engine_bit_for_bit(name: str) -> None:
     """The parity gate. Regenerate with
-    ``BIN15_PARITY_WRITE=parity-1 cargo nextest run -p strategy-bin15 --test parity``
+    ``BIN15_PARITY_WRITE=<name> cargo nextest run -p strategy-bin15 --test parity``
     -- never by editing the expected file."""
     got = claude_worker.bin15_ref.replay(
-        (_FIXTURES / "parity-1.input.tsv").read_text(encoding="utf-8").splitlines()
+        (_FIXTURES / f"{name}.input.tsv").read_text(encoding="utf-8").splitlines()
     )
     want = [
         line.strip()
-        for line in (_FIXTURES / "parity-1.expected.tsv").read_text(encoding="utf-8").splitlines()
+        for line in (_FIXTURES / f"{name}.expected.tsv").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
     assert len(got) > 1_000, f"the fixture produced almost nothing ({len(got)} rows)"
@@ -73,6 +75,87 @@ def test_the_fixture_covers_every_record_the_grammar_has() -> None:
     # And it exercises the refusal path, not just the happy one.
     assert any(row == "F\t-\t-\t-" for row in got), "no refused re-price in the tape"
     assert any(row == "X\t-" for row in got), "no refused moneyness in the tape"
+
+
+def test_parity_2_covers_every_s3_record_and_its_refusals() -> None:
+    """The S3 tape exercises all four new records and both sides of every
+    branch the running-TWAP law has."""
+    got = claude_worker.bin15_ref.replay(
+        (_FIXTURES / "parity-2.input.tsv").read_text(encoding="utf-8").splitlines()
+    )
+    tags = {row.split("\t")[0] for row in got}
+    assert tags == {"T", "S", "M", "W"}
+    assert any(row == "W\t-\t-\t-\t-\t-" for row in got), "no refused re-price in the tape"
+    assert any(row == "M\t-" for row in got), "no refused moneyness in the tape"
+    assert any(row == "S\t0\t0" for row in got), "no empty piece in the tape"
+    d_clamp = claude_worker.bin15_ref.D_CLAMP_1E6
+    ws = [row.split("\t") for row in got if row.startswith("W\t") and "-" not in row.split("\t")[1]]
+    assert any(int(w[3]) == d_clamp and int(w[4]) == 0 for w in ws), "nothing-left: + clamp"
+    assert any(int(w[3]) == -d_clamp and int(w[4]) == 0 for w in ws), "nothing-left: - clamp"
+
+
+# --- BIN15 S3: the venue's settlement law in the pricer ----------------
+
+_S: int = 1_000_000_000
+_W: int = 60 * _S
+
+
+def test_the_horizon_is_the_variance_time_of_a_twap_ending_at_expiry() -> None:
+    h = claude_worker.bin15_ref.pricing_horizon_ns
+    assert h(900 * _S, _W) == 860 * _S, "tau - 2W/3 with the window ahead"
+    assert h(_W, _W) == 20 * _S, "W/3 at the open"
+    assert h(30 * _S, _W) == 2_500_000_000, "30^3 / (3 * 60^2) = 2.5 s inside"
+    assert abs(h(_W - 1, _W) - 20 * _S) < 2, "continuous at the open"
+    assert h(0, _W) == 0
+    assert h(123_456, 0) == 123_456, "a family settling AT T keeps tau"
+    w_max = 65_535 * _S
+    assert h(2**64 - 1, w_max) == 2**64 - 1 - (2 * w_max) // 3
+    # Monotone in the time left, both branches.
+    prev = -1
+    t = 0
+    while t <= 2 * _W:
+        cur = h(t, _W)
+        assert cur >= prev
+        prev = cur
+        t += 997_000_003
+
+
+def test_the_segment_is_clipped_to_the_window_and_time_weighted() -> None:
+    seg = claude_worker.bin15_ref.binary_twap_segment
+    o, c = 100 * _S, 160 * _S
+    assert seg(7, 90 * _S, 110 * _S, o, c) == (7 * 10 * _S, 10 * _S), "clipped at the open"
+    assert seg(7, 150 * _S, 170 * _S, o, c) == (7 * 10 * _S, 10 * _S), "clipped at the close"
+    assert seg(7, 80 * _S, 90 * _S, o, c) == (0, 0), "before the window"
+    assert seg(7, 120 * _S, 120 * _S, o, c) == (0, 0), "no length"
+    assert claude_worker.bin15_ref.binary_settle_open_ns(c, 60 * _S) == o
+    assert claude_worker.bin15_ref.binary_settle_open_ns(5, 60 * _S) == 0, "saturating"
+
+
+def test_inside_the_window_the_known_average_decides() -> None:
+    lut = _shipped_luts()
+    fv = claude_worker.bin15_ref.fair_value_twap
+    k = _STRIKE
+    above = (k + k // 200) * 40 * _S
+    below = (k - k // 200) * 40 * _S
+    win = fv(lut, k - k // 1_000, k, 20 * _S, _W, above, _SIG2)
+    lose = fv(lut, k + k // 1_000, k, 20 * _S, _W, below, _SIG2)
+    assert win is not None and lose is not None
+    assert win.p_hat_1e6 > 990_000, "40 s known above outweighs a 0.1 % dip"
+    assert lose.p_hat_1e6 < 10_000
+    # Nothing left: the known average IS the settlement, `>=` is ITM.
+    tie = fv(lut, k, k, 0, _W, k * _W, _SIG2)
+    under = fv(lut, k, k, 0, _W, k * _W - 1, _SIG2)
+    assert tie is not None and under is not None
+    assert tie.d_1e6 == claude_worker.bin15_ref.D_CLAMP_1E6 and tie.den_1e9 == 0
+    assert under.d_1e6 == -claude_worker.bin15_ref.D_CLAMP_1E6
+    # Outside the window it IS fair_value at the horizon.
+    out = fv(lut, k + 50_000_000, k, 120 * _S, _W, 0, _SIG2)
+    ref = claude_worker.bin15_ref.fair_value(lut, k + 50_000_000, k, 80 * _S, _SIG2)
+    assert out == ref
+    # Absent data holds on both sides of the window.
+    assert fv(lut, k, k, 20 * _S, _W, above, 0) is None
+    assert fv(lut, 0, k, 20 * _S, _W, above, _SIG2) is None
+    assert fv(lut, k, k, 20 * _S, _W, 2**127 - 1, _SIG2) is None, "overflow refuses"
 
 
 def test_the_identity_tables_are_the_identity() -> None:

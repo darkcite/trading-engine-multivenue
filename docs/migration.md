@@ -6,6 +6,96 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the BIN15 pricer prices the venue's settlement window: horizon `τ − 2W/3`, the running TWAP inside the window, τ floors on the clock (BIN15 S3)
+
+**What changed**
+- `strategy_bin15::price::pricing_horizon_ns(to_expiry, twap)` — the
+  variance-time of the TWAP over `[T − W, T]` (LAW E-11) seen `τ` before
+  the expiry: `τ − ⌊2W/3⌋` while the window lies ahead, `⌊⌊τ²/W⌋·τ/3W⌋`
+  inside it, `τ` for `W = 0`. The member priced `τ + W/3` (a window
+  AFTER `T`). `twap_moneyness_1e9` and `fair_value_twap` (ruling O-2):
+  inside the window the member prices `X = A_known + τ·S − W·K` against
+  `S·σ·√(τ³/3)`; outside it `fair_value_twap` IS `fair_value` at the
+  horizon. `fair_value` is arithmetically unchanged (its Φ →
+  recalibration tail is now the shared `fair_of_d`).
+- The member: `FamilyState` gains `twap_sum: i128`, `twap_last_ts: u64`
+  and `twap_gap: u8`, zeroed at every roll — one more cache line (448 →
+  512 B, now const-asserted).
+  `on_mark` folds the mark being replaced into every live window it
+  reaches through `core_types::binary_twap_segment` (the harness's own
+  arithmetic); `try_reprice` prices through `fair_value_twap` and HOLDS
+  (`skipped_stale`) inside a window whose evidence has a hole — an open
+  this instance never saw a mark in force at, or a piece longer than
+  `core_types::BINARY_SETTLE_MARK_GAP_MAX_NS` (10 s; the harness's
+  `binary::SETTLE_MARK_GAP_MAX_NS` now re-exports it).
+- `tau_min_take_ns` / `tau_min_quote_ns` are judged on the TIME TO
+  EXPIRY. They were judged on the pricing horizon, so at `W = 60 s` the
+  take arm closed at 40 s to expiry, not the configured 60 s.
+- `price::Fair` gains `horizon_ns` (the horizon the price was computed
+  at); the member stores it as `last_tau_ns` instead of re-deriving it.
+  The view's `tau_s` (`engine_bin15_f<i>_tau_s`) is that horizon ROUNDED
+  UP to whole seconds (it floored): inside the window the horizon is
+  sub-second for the last ~22 s, and `0` is "never priced". `backtest
+  --member`: the sidecar ledger row's `tau_ns` is the member's own
+  `last_tau_ns` (it was re-derived as `expiry − wall + twap/3`).
+- Python mirror `claude_worker.bin15_ref`: `pricing_horizon_ns`,
+  `twap_moneyness_1e9`, `fair_value_twap`, `binary_twap_segment`,
+  `binary_settle_open_ns`; `Fair` gains `den_1e9`. New parity fixture
+  `parity-2` (records `T` / `S` / `M` / `W`, 1 224 ops), bit for bit on
+  both sides. `parity-1` is untouched: nothing it pins moved, so ruling
+  O-5's regeneration was not needed. The alloc gate for the member
+  (`bin15_member_roll_tick_reprice_take_is_zero_alloc`) gains an
+  in-window phase, so the running-TWAP branch is measured at 0 B too.
+
+**Why**
+- The venue settles on the TWAP ENDING at `T` (LAW E-11). With the
+  window after `T` the horizon was 60 s too long at `W = 60 s` — a lead's
+  `d` too small by `√((τ + 20 s)/(τ − 40 s))`, ×1.32 at `τ = 120 s` — and
+  the member was blind inside the last minute, where the average is
+  partly decided (plan 28 S3, ruling O-2).
+
+**Impact**
+- Every `p̂` of a TWAP-settled family moves, most at small `τ`; inside
+  the last minute `p̂` follows the running average. At the shipped
+  floors (take 60 s = `W`) nothing fires inside the window: the
+  in-window price is the ledger's and `/state`'s.
+- Takes between 40 s and 60 s to expiry, which the horizon-judged floor
+  allowed at `W = 60 s`, no longer fire.
+- Recalibration phases are keyed on the horizon, so each phase boundary
+  now falls 60 s EARLIER in an instance's life: EARLY → MID at 640 s to
+  expiry (was 580 s), MID → LATE at 280 s (was 220 s). The recal tables
+  shipped and installed today are the identity, so they correct nothing
+  twice — but every table FITTED on `d` (the installed Student-t
+  `phi_lut`, `scale_1e9`) was fitted on `d` at the old horizon, which S3
+  rescales by `√((τ + 20 s)/(τ − 40 s))` (×1.03 at 900 s … ×1.32 at
+  120 s). Those fits must be redone on rows an S3 binary priced — an
+  operator action, and a precondition before slot 3 is re-armed live on
+  S3 prices; the DISTX re-proof checks the integer price map
+  (`p_raw = Φ̂(d)`), not calibration.
+- On-disk formats: the ledger's `tau_ns` keeps its meaning — the horizon
+  the price was computed at. Rows from an S3 binary carry the new
+  horizon; rows before it carry `τ + W/3`. A row priced inside the
+  window reads `tau_ns < W/3` (20 s at `W = 60 s`; a row before S3 never
+  does, since its `τ + W/3 ≥ W/3`). Config keys, wire formats: none.
+  Metrics: none renamed; `skipped_stale` also counts the in-window
+  evidence hold, and `tau_s` rounds up (above).
+
+**Migration steps**
+1. Rebuild and restart at a safe minute (O-6). The live member prices on
+   the new law from the boot.
+2. A calibration or DISTX re-proof that predicts the engine's `p̂` from a
+   ledger row must price through `bin15_ref.fair_value_twap`, and must
+   drop rows priced inside the window (`tau_ns < W/3`): their known
+   average is not a ledger column.
+3. Until BIN15 S4's readers land, `bin15_ledger.calibration` files rows
+   priced inside the window in LATE (their `p̂` carries a partly decided
+   average and flatters it); S4 gives them their own phase, outside
+   G6.1. Read no G6.1 verdict over S3 rows before S4.
+
+**Rollback**
+- Revert the commit and restart. Rows accrued in between keep the new
+  horizon in `tau_ns`.
+
 ## 2026-09-24 — the harness WALL clock is the venue's for v3 captures with a Hyperliquid lane (`backtest`, `--member`, `audit-pnl`) (BIN15 S2)
 
 **What changed**

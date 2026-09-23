@@ -5874,12 +5874,44 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         }
         roll += 1;
     }
+    // BIN15 S3: the last minute of an instance, under the same guard —
+    // `fold_twap` on every mark, `fair_value_twap`'s running-TWAP branch,
+    // the cubic horizon. Every instance above settles 100 s before its
+    // window opens, so without this phase none of it would be measured.
+    // Family 0 settles its last instance (roll 96) and binds one whose
+    // window `[T − 60 s, T]` opens 10 s in; underlying 0 marks every
+    // second until the tail holds.
+    let t0 = 1 + ROLLS as u64 * MARKS_PER_ROLL;
+    ctx.now = at(t0);
+    m.on_venue_event(&roll_ev(0, 2_600 + 96, 0, 0, true), &mut ctx);
+    m.on_venue_event(
+        &roll_ev(0, 9_000, 79_000_000_000, WALL0 + (t0 + 70) * 1_000_000_000, false),
+        &mut ctx,
+    );
+    let mut priced_inside = 0u64;
+    let mut k = 0u64;
+    while k < 62 {
+        let ts = at(t0 + k);
+        ctx.now = ts;
+        let px = 79_000_000_000 + (next() % 20_000_001) as i64 - 10_000_000;
+        m.on_venue_event(&mark_ev(0, px, ts), &mut ctx);
+        if let Some(f0) = m.family(0) {
+            priced_inside += u64::from(
+                f0.p_ts_ns == ts && f0.twap_last_ts > 0 && f0.last_tau_ns < 20_000_000_000,
+            );
+        }
+        k += 1;
+    }
     let counters = m.bin15_counters();
     std::hint::black_box((ctx.n, counters));
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(marks_seen, ROLLS as u64 * MARKS_PER_ROLL, "10 000 marks");
-    assert_eq!(counters.rolls, ROLLS as u64, "every roll bound an instance");
+    assert!(
+        priced_inside > 40,
+        "the running-TWAP branch ran under the guard: {priced_inside} in-window reprices"
+    );
+    assert_eq!(counters.rolls, ROLLS as u64 + 1, "every roll bound an instance (+ S3's)");
     assert!(counters.rolls_settled > 0, "and the predecessors settled");
     assert!(
         counters.reprices > 10_000,

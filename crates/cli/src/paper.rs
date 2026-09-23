@@ -6416,7 +6416,9 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         // BIN15 O6: the inputs. `d_1e6` and `den_1e9` are the pair that
         // separates "the move was real" from "the forecast was
         // overconfident"; `mark`/`strike`/`tau_s` let the reader
-        // recompute `d` by hand and check the member's arithmetic.
+        // recompute `d` by hand and check the member's arithmetic —
+        // outside the settlement window (BIN15 S3: inside it `d` also
+        // carries the running average, which is not exported).
         reg.gauge(ids.families[f][4]).set(v.p_raw_1e6);
         reg.gauge(ids.families[f][5]).set(v.strike_1e6);
         reg.gauge(ids.families[f][6]).set(v.mark_1e6);

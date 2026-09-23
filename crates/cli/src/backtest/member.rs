@@ -1093,12 +1093,13 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                                     // recalibration phase applied, and a
                                     // calibration table keyed on
                                     // anything else is keyed on the
-                                    // wrong thing.
-                                    tau_ns: fam
-                                        .live
-                                        .expiry_ns
-                                        .saturating_sub(rec.wall_ns)
-                                        .saturating_add(fam.live.twap_ns / 3),
+                                    // wrong thing. The member's own
+                                    // (`last_tau_ns`, BIN15 S3 —
+                                    // `price::pricing_horizon_ns`), READ
+                                    // rather than re-derived here, so
+                                    // the row can never disagree with
+                                    // the price it records.
+                                    tau_ns: fam.last_tau_ns,
                                     p_hat_1e6: fam.p_hat_1e6,
                                     p_raw_1e6: fam.p_raw_1e6,
                                     arm: fam.arm,

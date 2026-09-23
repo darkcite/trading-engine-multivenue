@@ -135,9 +135,10 @@ pub struct Bin15File {
     pub e_take_1e6: i64,
     /// Arm B half-spread ×1e6.
     pub h_quote_1e6: i64,
-    /// τ floor for a take, ns.
+    /// τ floor for a take, ns — judged on the TIME TO EXPIRY, not the
+    /// pricer's horizon (BIN15 S3).
     pub tau_min_take_ns: u64,
-    /// τ floor for a quote, ns.
+    /// τ floor for a quote, ns — the time to expiry, as the take's.
     pub tau_min_quote_ns: u64,
     /// The last window before expiry in which nothing is taken, ns.
     pub tail_refuse_ns: u64,
