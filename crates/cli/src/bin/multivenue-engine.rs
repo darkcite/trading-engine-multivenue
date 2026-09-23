@@ -132,6 +132,60 @@ enum Cmd {
     /// TESTNET ONLY, by construction. There is no flag that points
     /// this at production.
     ExecSmoke(ExecSmokeArgs),
+    /// HYPARB H8: the HyperEVM write path's operator verbs, TESTNET
+    /// (chain 998) ONLY by construction — `status`, `fund` (derived
+    /// wallets from wallet 0), `deploy` (the O-H18 executor), `mint` (a
+    /// testnet token's public faucet, to the executor), `battery`
+    /// (DONE(H8): a swap lands and reconciles; three wallets without a
+    /// nonce collision; an underbid observed losing). Reads the wallet
+    /// key from the environment and never opens `.env` —
+    /// `scripts/evm-testnet.sh` sources it. Report on stdout.
+    EvmTestnet(EvmTestnetArgs),
+}
+
+/// `evm-testnet` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EvmVerb {
+    /// Chain check; every wallet's address, nonces and balance.
+    Status,
+    /// Top every derived wallet up to `--amount-wei` from wallet 0.
+    Fund,
+    /// Deploy the executor from wallet 0 (its owner).
+    Deploy,
+    /// `--token`'s public `mint(executor, --amount-raw)`.
+    Mint,
+    /// The DONE(H8) battery.
+    Battery,
+    /// The engine's shadow (boot, hybrid chain checks, ring, thread) end
+    /// to end on synthetic decisions — without stopping the live engine.
+    ShadowSmoke,
+}
+
+#[derive(Debug, Parser)]
+struct EvmTestnetArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: EvmVerb,
+    /// The artifact whose `[testnet]` block to use (default
+    /// `~/multivenue/hyparb.toml`).
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// `fund`: each derived wallet's target balance, wei.
+    #[arg(long)]
+    amount_wei: Option<u128>,
+    /// `mint`: the testnet token (0x + 40 hex).
+    #[arg(long)]
+    token: Option<String>,
+    /// `mint`: raw units to mint to the executor.
+    #[arg(long)]
+    amount_raw: Option<u128>,
+    /// `shadow-smoke`: synthetic decisions to shadow.
+    #[arg(long, default_value_t = 3)]
+    decisions: u64,
+    /// `shadow-smoke`: the READ endpoint (the pool ingress's) — default
+    /// `https://$HYPEREVM_WS_HOST/`, else the O-H15 archive endpoint.
+    #[arg(long)]
+    read_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -762,6 +816,11 @@ struct RunArgs {
     /// with the artifact's `mode = "testnet"` — both or neither.
     #[arg(long, default_value_t = false)]
     evm_testnet: bool,
+    /// HYPARB O-H12: the third switch — the pool ingress may read chain
+    /// 999 (mainnet signal) while the write path writes chain 998. Only
+    /// with `--evm-testnet`; never the inverse. Shouted in the ARMED tell.
+    #[arg(long, default_value_t = false, requires = "evm_testnet")]
+    evm_hybrid: bool,
     /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
     /// by default). Read only when the requested mask carries the icdp
     /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
@@ -907,6 +966,73 @@ fn main() -> ExitCode {
             // human report on stderr.
             init_tracing_stderr();
             exec_smoke(args)
+        }
+        Cmd::EvmTestnet(args) => {
+            init_tracing_stderr();
+            evm_testnet(args)
+        }
+    }
+}
+
+/// HYPARB H8: the `evm-testnet` verbs. Exit 0 only when the verb did
+/// what it says (the battery: only when DONE(H8) held).
+fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
+    use cli::evm_testnet as et;
+    let path = match args.hyparb.clone() {
+        Some(p) => p,
+        None => match core_config::hyparb::default_hyparb_path() {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                eprintln!("evm-testnet: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let file = match core_config::hyparb::load(&path) {
+        Ok((f, _)) => f,
+        Err(e) => {
+            eprintln!("evm-testnet: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(t) = file.testnet.as_ref() else {
+        eprintln!("evm-testnet: {} has no [testnet] block", path.display());
+        return ExitCode::from(2);
+    };
+    let tls = TlsTransport::default_client_config();
+    let out = match args.verb {
+        EvmVerb::Status => et::verb_status(t, tls).map(|r| (r, true)),
+        EvmVerb::Fund => match args.amount_wei {
+            Some(a) => et::verb_fund(t, a, tls).map(|r| (r, true)),
+            None => Err("fund needs --amount-wei".to_owned()),
+        },
+        EvmVerb::Deploy => et::verb_deploy(t, tls).map(|r| (r, true)),
+        EvmVerb::Mint => match (args.token.as_deref(), args.amount_raw) {
+            (Some(tok), Some(a)) => et::verb_mint(t, tok, a, tls).map(|r| (r, true)),
+            _ => Err("mint needs --token and --amount-raw".to_owned()),
+        },
+        EvmVerb::Battery => et::verb_battery(t, tls),
+        EvmVerb::ShadowSmoke => {
+            let read_url = args.read_url.clone().unwrap_or_else(|| {
+                let host = std::env::var("HYPEREVM_WS_HOST")
+                    .unwrap_or_else(|_| "rpc.purroofgroup.com".to_owned());
+                format!("https://{host}/")
+            });
+            et::verb_shadow_smoke(t, file.gas_p99_usd_1e6, &read_url, args.decisions, tls)
+        }
+    };
+    match out {
+        Ok((report, ok)) => {
+            print!("{report}");
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("evm-testnet: {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -4000,6 +4126,56 @@ fn run(args: RunArgs) -> ExitCode {
             if let Some(rb) = regime_boot.as_ref() {
                 obs.boot.regime_hash = rb.hash;
                 obs.boot.regime_configured = 1;
+            }
+            // HYPARB H8: the EVM write path, TESTNET ONLY (O-H5) — the
+            // shadow of each paper AMM decision (O-H12). The chain checks
+            // need the wire, so they run here; any failure refuses: an
+            // interlock that cannot be verified is not passed.
+            match hyparb_boot
+                .as_ref()
+                .filter(|b| b.mode == core_config::hyparb::HyparbMode::Testnet)
+            {
+                Some(hb) => {
+                    let Some(t) = hb.testnet.as_ref() else {
+                        error!("hyparb: testnet mode without [testnet] — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    };
+                    let read_url = format!(
+                        "https://{}{}",
+                        cfg.hyperevm_ws_host,
+                        args.hyperevm_path.as_deref().unwrap_or("/")
+                    );
+                    let booted = cli::evm_testnet::wallet_keys_from_env(t.wallets).and_then(|k| {
+                        cli::evm_testnet::boot_shadow(
+                            t,
+                            &k.keys,
+                            k.source,
+                            hb.params.gas_p99_usd_1e6,
+                            &read_url,
+                            args.evm_hybrid,
+                            tls_config.clone(),
+                        )
+                    });
+                    match booted {
+                        Ok(b) => {
+                            warn!("{}", b.tell);
+                            obs.hyparb_shadow = Some(b.tap);
+                            handles.push(b.handle);
+                        }
+                        Err(reason) => {
+                            error!(reason, "hyparb: the EVM write path refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                None if args.evm_hybrid => {
+                    error!("--evm-hybrid without a testnet hyparb artifact — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                None => {}
             }
             match exec_boot {
                 // NO `--exec`: the pre-E1 path, untouched. Same

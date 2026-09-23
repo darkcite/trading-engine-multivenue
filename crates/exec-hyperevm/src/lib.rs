@@ -58,6 +58,8 @@ pub mod calldata;
 pub mod gas;
 pub mod nonce;
 pub mod rpc;
+#[cfg(feature = "testnode")]
+pub mod testnode;
 
 /// HyperEVM mainnet.
 pub const HYPEREVM_MAINNET_CHAIN_ID: u64 = 999;

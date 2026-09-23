@@ -11,9 +11,10 @@
 //! buffer allocated at construction, one synchronous request/response
 //! cycle per call on the caller's own worker thread (never the engine
 //! loop — a cycle may block up to [`REQ_DEADLINE`]). `Content-Length`
-//! framing lets the reader stop at the declared length, so the
+//! and `chunked` framing let the reader stop at the body's end, so the
 //! connection survives for the next request and the TCP+TLS handshake
-//! is paid once. **`HlHttp` itself is deliberately NOT migrated onto
+//! is paid once (a chunked body is decoded in place — `HlHttp` refuses
+//! chunked; this client's endpoints include one that sends it). **`HlHttp` itself is deliberately NOT migrated onto
 //! this type in the HYPARB lane**: it is the armed-live E-lane arm, and
 //! changing it is that lane's decision under its own review.
 //!
@@ -36,7 +37,9 @@ use mio::{Events, Poll, Token};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 
-use crate::http1::{fmt_u64_ascii, read_response, BodyFraming, HttpResult};
+use crate::http1::{
+    dechunk_in_place, fmt_u64_ascii, read_response, BodyFraming, DechunkResult, HttpResult,
+};
 use crate::transport::{Status, TlsTransport, Transport};
 
 /// Request-header buffer: the literals + host + path + length digits.
@@ -65,8 +68,8 @@ pub enum PostErrKind {
     Disconnected,
     /// The request or the response did not fit its buffer.
     Overflow,
-    /// The response was not framed HTTP/1.1 this client can bound
-    /// (malformed, or chunked).
+    /// The response was not well-framed HTTP/1.1 (malformed headers
+    /// or chunk framing).
     BadHttp,
     /// The whole cycle exceeded [`REQ_DEADLINE`].
     Timeout,
@@ -420,7 +423,24 @@ impl HttpsPost {
                             return Ok((status, body_start..self.resp_len));
                         }
                     }
-                    BodyFraming::Chunked => return Err(PostErrKind::BadHttp),
+                    // Decoded in place once the terminating chunk has
+                    // arrived (`dechunk_in_place` leaves an incomplete
+                    // body untouched, so every read can retry it). The
+                    // archive endpoint (purroof) answers chunked.
+                    BodyFraming::Chunked => {
+                        let end = self.resp_len;
+                        match dechunk_in_place(&mut self.resp_buf[body_start..end]) {
+                            DechunkResult::Complete { length } => {
+                                return Ok((status, body_start..body_start + length))
+                            }
+                            DechunkResult::Incomplete => {
+                                if peer_closed {
+                                    return Err(PostErrKind::Disconnected);
+                                }
+                            }
+                            DechunkResult::Malformed => return Err(PostErrKind::BadHttp),
+                        }
+                    }
                 },
                 HttpResult::Incomplete => {
                     if peer_closed {

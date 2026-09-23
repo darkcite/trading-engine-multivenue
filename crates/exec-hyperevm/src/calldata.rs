@@ -21,6 +21,15 @@ pub const SWAP_SELECTOR: [u8; 4] = [0x46, 0x09, 0x85, 0xe8];
 /// Selector + five 32-byte words.
 pub const SWAP_CALLDATA_LEN: usize = 4 + 5 * 32;
 
+/// `mint(address,uint256)` — the public faucet the testnet tokens expose
+/// (measured 2026-09-23: `leUSDT0` mints to any caller); the operator
+/// tool funds the executor with it.
+pub const MINT_SIGNATURE: &str = "mint(address,uint256)";
+/// `keccak256(MINT_SIGNATURE)[..4]`.
+pub const MINT_SELECTOR: [u8; 4] = [0x40, 0xc1, 0x0f, 0x19];
+/// Selector + an address word + an amount word.
+pub const ADDR_AMOUNT_CALLDATA_LEN: usize = 4 + 2 * 32;
+
 /// One executor swap. POD, passed by value across the arm's ring.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -110,6 +119,38 @@ pub fn encode_swap(c: &SwapCall, dst: &mut [u8; SWAP_CALLDATA_LEN]) {
     put_u128(dst, w4, c.min_out);
 }
 
+/// Render `selector(address to, uint256 amount)` into `dst` (every byte
+/// written).
+#[inline]
+pub fn encode_addr_amount(
+    selector: [u8; 4],
+    to: &[u8; 20],
+    amount: u128,
+    dst: &mut [u8; ADDR_AMOUNT_CALLDATA_LEN],
+) {
+    let mut i = 0;
+    while i < 4 {
+        dst[i] = selector[i];
+        i += 1;
+    }
+    i = 0;
+    while i < 12 {
+        dst[4 + i] = 0;
+        i += 1;
+    }
+    i = 0;
+    while i < 20 {
+        dst[16 + i] = to[i];
+        i += 1;
+    }
+    i = 0;
+    while i < 16 {
+        dst[36 + i] = 0;
+        dst[52 + i] = (amount >> (8 * (15 - i))) as u8;
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +193,23 @@ mod tests {
         assert_eq!(
             hex(&dst),
             "460985e80000000000000000000000006c9a33e3b592c0d65b3ba59355d5be0d38259285000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000014d1120d7b160000000000000000000000000000000012340102030405060708090a0b0c0d0e0f10000000000000000000000000000000000000000000000000000000003ade68b1"
+        );
+    }
+
+    #[test]
+    fn mint_matches_eth_abi_and_its_selector_is_the_keccak() {
+        let h = signer_eip712::keccak256(MINT_SIGNATURE.as_bytes());
+        assert_eq!(h[..4], MINT_SELECTOR);
+        let mut dst = [0xa5u8; ADDR_AMOUNT_CALLDATA_LEN];
+        encode_addr_amount(
+            MINT_SELECTOR,
+            &pool(),
+            1_000_000_000_000_000_000_000_005,
+            &mut dst,
+        );
+        assert_eq!(
+            hex(&dst),
+            "40c10f190000000000000000000000006c9a33e3b592c0d65b3ba59355d5be0d3825928500000000000000000000000000000000000000000000d3c21bcecceda1000005"
         );
     }
 

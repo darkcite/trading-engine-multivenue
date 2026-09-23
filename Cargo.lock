@@ -339,6 +339,7 @@ dependencies = [
  "core-vol",
  "engine",
  "engine-snapshot",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
@@ -358,6 +359,7 @@ dependencies = [
  "research-artifacts",
  "rustls",
  "rustls-pki-types",
+ "signer-eip712",
  "strategy-bin15",
  "strategy-core",
  "strategy-ev",
@@ -371,6 +373,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui",
+ "zeroize",
 ]
 
 [[package]]
@@ -739,6 +742,7 @@ dependencies = [
  "core-config",
  "core-net",
  "core-parse",
+ "exec-hyperevm",
  "ingress-hyperevm",
  "ingress-rpc",
  "proptest",

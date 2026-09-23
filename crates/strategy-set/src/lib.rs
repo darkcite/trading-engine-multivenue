@@ -814,6 +814,9 @@ impl StrategyCounters for StrategySet {
     fn hyparb_coins_view(&self, out: &mut [strategy_core::HyparbCoinView]) -> u32 {
         self.hyparb.hyparb_coins_view(out)
     }
+    fn hyparb_decisions(&self, after: u64, out: &mut [strategy_core::HyparbDecision]) -> u32 {
+        self.hyparb.hyparb_decisions(after, out)
+    }
     /// BIN15 O4b: slot 3's observables.
     #[inline]
     fn bin15_counters(&self) -> strategy_core::Bin15Counters {

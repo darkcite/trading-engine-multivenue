@@ -23,8 +23,9 @@
 //!   the manifest does not know.
 //! * **Two switches for the EVM write path** (O-H5): `mode = "testnet"`
 //!   in the artifact AND `--evm-testnet` on the command line, both or
-//!   neither — and refused while the path is not linked
-//!   ([`EVM_WRITE_PATH_LINKED`]).
+//!   neither. The path is linked since H8 (`cli::evm_testnet`); a
+//!   testnet artifact must also configure the gas coin ([`GAS_COIN_NAME`])
+//!   — the G2 bid is a fraction of an edge in USD, paid in HYPE.
 //!
 //! Deviation from plan §9.3, stated: the archive probe is NOT run here.
 //! The ingress probes the endpoint in-session at every snapshot, and a
@@ -35,17 +36,14 @@
 
 use std::path::{Path, PathBuf};
 
-use core_config::hyparb::{HyparbFile, HyparbHedgeVenue, HyparbMode, COIN_USD_NAME};
+use core_config::hyparb::{HyparbFile, HyparbHedgeVenue, HyparbMode, HyparbTestnet, COIN_USD_NAME};
 use core_config::universe::Instrument;
 use core_types::SymbolId;
 use strategy_hyparb::{CoinParams, HedgeMode, HyparbParams, PoolParams, COIN_USD};
 use tracing::info;
 
-/// Whether the EVM write path (plan §11, H7/H8) is linked into this
-/// build. Until it is, `mode = "testnet"` refuses even with both
-/// switches set: a boot that silently ran paper while its artifact said
-/// testnet would be a member nobody chose.
-pub const EVM_WRITE_PATH_LINKED: bool = false;
+/// The `[[coin]]` whose mid prices gas: HyperEVM gas is paid in HYPE.
+pub const GAS_COIN_NAME: &str = "HYPE";
 
 const _: () = assert!(core_config::hyparb::HYPARB_MAX_COINS == strategy_hyparb::HYPARB_MAX_COINS);
 const _: () = assert!(core_config::hyparb::HYPARB_MAX_POOLS == strategy_hyparb::HYPARB_MAX_POOLS);
@@ -65,6 +63,9 @@ pub struct HyparbBoot {
     pub mode: HyparbMode,
     /// Pools configured to trade (the rest are observed only).
     pub traded: usize,
+    /// `[testnet]`, if the artifact has one (required — and complete —
+    /// in testnet mode; the parser enforces it).
+    pub testnet: Option<HyparbTestnet>,
 }
 
 /// Whether the operator asked for the member.
@@ -105,6 +106,12 @@ pub fn load_hyparb_boot(
     let hash = core_crypto::sha256(&bytes);
     check_switches(file.mode, evm_testnet)?;
     let params = build_params(&file, resolve, universe_pools)?;
+    if file.mode == HyparbMode::Testnet && params.gas_coin == COIN_USD {
+        return Err(format!(
+            "hyparb.toml: `mode = \"testnet\"` needs a `[[coin]]` named \"{GAS_COIN_NAME}\" — \
+             the gas bid is a fraction of a USD edge, paid in {GAS_COIN_NAME}"
+        ));
+    }
     let traded = file.pools.iter().filter(|p| p.trade).count();
     Ok(Some(HyparbBoot {
         params,
@@ -112,26 +119,20 @@ pub fn load_hyparb_boot(
         path,
         mode: file.mode,
         traded,
+        testnet: file.testnet,
     }))
 }
 
-/// O-H5: the artifact's mode and `--evm-testnet` agree, and testnet is
-/// linked.
+/// O-H5: the artifact's mode and `--evm-testnet` agree.
 fn check_switches(mode: HyparbMode, evm_testnet: bool) -> Result<(), String> {
     match (mode, evm_testnet) {
-        (HyparbMode::Paper, false) => Ok(()),
+        (HyparbMode::Paper, false) | (HyparbMode::Testnet, true) => Ok(()),
         (HyparbMode::Paper, true) => Err("hyparb: --evm-testnet with `mode = \"paper\"` — the \
              two switches of the EVM write path must agree (O-H5)"
             .to_owned()),
         (HyparbMode::Testnet, false) => Err("hyparb: `mode = \"testnet\"` without \
              --evm-testnet — the EVM write path needs BOTH switches (O-H5)"
             .to_owned()),
-        (HyparbMode::Testnet, true) if !EVM_WRITE_PATH_LINKED => Err(
-            "hyparb: `mode = \"testnet\"` — the EVM write path is not linked into \
-                 this build; refusing rather than running paper under a testnet artifact"
-                .to_owned(),
-        ),
-        (HyparbMode::Testnet, true) => Ok(()),
     }
 }
 
@@ -222,6 +223,11 @@ fn build_params(
     p.spot_taker_bps_1e6 = file.spot_taker_bps_1e6;
     p.funding_window_ns = file.funding_window_ns;
     p.cooldown_ns = file.cooldown_ns;
+    p.gas_coin = file
+        .coins
+        .iter()
+        .position(|k| k.name == GAS_COIN_NAME)
+        .map_or(COIN_USD, |i| i as u8);
     // A forced venue with no such book on some coin could never hedge it.
     let mut k = 0usize;
     while k < p.n_coins {
@@ -398,18 +404,59 @@ mod tests {
         assert_eq!(b.params.hedge_mode, HedgeMode::Spot);
     }
 
+    /// A testnet artifact: the example's `[testnet]` with every target set.
+    fn testnet_example() -> String {
+        EXAMPLE
+            .replace("mode = \"paper\"", "mode = \"testnet\"")
+            .replace(
+                "# executor = \"0x...\"\n# pool = \"0x...\"\n# amount_raw = 1000000000000000000",
+                &format!("executor = \"{A}\"\npool = \"{A}\"\namount_raw = 1000000"),
+            )
+    }
+
     #[test]
-    fn the_two_evm_switches_must_agree_and_testnet_is_not_linked_yet() {
+    fn the_two_evm_switches_must_agree_and_testnet_carries_its_targets() {
         let paper = write("p.toml", EXAMPLE);
         let e = load_hyparb_boot(Some(&paper), &resolve, &universe(), true).unwrap_err();
         assert!(e.contains("must agree"), "{e}");
-        let testnet = write(
-            "t.toml",
-            &EXAMPLE.replace("mode = \"paper\"", "mode = \"testnet\""),
+        let b = load_hyparb_boot(Some(&paper), &resolve, &universe(), false)
+            .unwrap()
+            .unwrap();
+        let t = b.testnet.expect("the example's [testnet]");
+        assert_eq!(
+            (t.wallets, t.executor),
+            (3, None),
+            "paper: targets optional"
         );
+        assert_eq!(b.params.gas_coin, 0, "HYPE is coin 0");
+        let testnet = write("t.toml", &testnet_example());
         let e = load_hyparb_boot(Some(&testnet), &resolve, &universe(), false).unwrap_err();
         assert!(e.contains("BOTH switches"), "{e}");
-        let e = load_hyparb_boot(Some(&testnet), &resolve, &universe(), true).unwrap_err();
-        assert!(e.contains("not linked"), "{e}");
+        let b = load_hyparb_boot(Some(&testnet), &resolve, &universe(), true)
+            .unwrap()
+            .expect("linked since H8");
+        assert_eq!(b.mode, HyparbMode::Testnet);
+        let t = b.testnet.unwrap();
+        assert_eq!(t.executor.as_deref(), Some(A));
+        assert_eq!(t.amount_raw, Some(1_000_000));
+    }
+
+    #[test]
+    fn testnet_needs_the_gas_coin() {
+        let no_hype = testnet_example()
+            .replace("name = \"HYPE\"", "name = \"WHYPE\"")
+            .replace("coin0 = \"HYPE\"", "coin0 = \"WHYPE\"");
+        let p = write("nohype.toml", &no_hype);
+        let e = load_hyparb_boot(Some(&p), &resolve, &universe(), true).unwrap_err();
+        assert!(e.contains("named \"HYPE\""), "{e}");
+        // Paper does not need it: no gas is bid.
+        let p = write(
+            "nohype-paper.toml",
+            &no_hype.replace("mode = \"testnet\"", "mode = \"paper\""),
+        );
+        let b = load_hyparb_boot(Some(&p), &resolve, &universe(), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.params.gas_coin, COIN_USD);
     }
 }

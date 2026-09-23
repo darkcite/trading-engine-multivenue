@@ -441,6 +441,9 @@ pub struct Receipt {
     pub block: u64,
     /// `gasUsed`.
     pub gas_used: u64,
+    /// `transactionIndex` — the position inside the block (what a tip
+    /// buys, where it buys anything).
+    pub tx_index: u64,
     /// `transactionHash`.
     pub tx_hash: [u8; 32],
     /// `from`.
@@ -463,7 +466,8 @@ const R_FROM: u16 = 16;
 const R_TO: u16 = 32;
 const R_HASH: u16 = 64;
 const R_CONTRACT: u16 = 128;
-const R_REQUIRED: u16 = R_STATUS | R_BLOCK | R_GAS | R_PRICE | R_FROM | R_TO | R_HASH;
+const R_INDEX: u16 = 256;
+const R_REQUIRED: u16 = R_STATUS | R_BLOCK | R_GAS | R_PRICE | R_FROM | R_TO | R_HASH | R_INDEX;
 
 /// `eth_getTransactionReceipt`: `Ok(None)` while pending (`result:
 /// null`), the receipt once mined. Every required member must appear
@@ -478,6 +482,7 @@ pub fn scan_receipt(buf: &[u8], id: u64) -> Result<Option<Receipt>, ScanErr> {
         effective_gas_price: 0,
         block: 0,
         gas_used: 0,
+        tx_index: 0,
         tx_hash: [0; 32],
         from: [0; 20],
         to: [0; 20],
@@ -507,6 +512,10 @@ pub fn scan_receipt(buf: &[u8], id: u64) -> Result<Option<Receipt>, ScanErr> {
             let g = qty(buf, m.v).ok_or(ScanErr::Malformed)?;
             rc.gas_used = u64::try_from(g).map_err(|_| ScanErr::Malformed)?;
             R_GAS
+        } else if key_is(buf, &m, b"transactionIndex") {
+            let x = qty(buf, m.v).ok_or(ScanErr::Malformed)?;
+            rc.tx_index = u64::try_from(x).map_err(|_| ScanErr::Malformed)?;
+            R_INDEX
         } else if key_is(buf, &m, b"effectiveGasPrice") {
             rc.effective_gas_price = qty(buf, m.v).ok_or(ScanErr::Malformed)?;
             R_PRICE
@@ -564,8 +573,12 @@ pub enum SendRefusal {
     InsufficientFunds = 4,
     /// Signed for another chain (impossible after the boot check).
     WrongChain = 5,
+    /// The endpoint throttled the request before processing it (the
+    /// public testnet endpoint answers `-32005 rate limited`, measured
+    /// 2026-09-23): the nonce was NOT taken.
+    RateLimited = 6,
     /// Anything else: the arm cannot tell whether the nonce was taken.
-    Other = 6,
+    Other = 7,
 }
 
 /// ASCII case-insensitive substring test; `needle` is lower-case.
@@ -604,6 +617,8 @@ pub fn classify_send_refusal(msg: &[u8]) -> SendRefusal {
         SendRefusal::InsufficientFunds
     } else if contains_ci(msg, b"chain id") {
         SendRefusal::WrongChain
+    } else if contains_ci(msg, b"rate limit") {
+        SendRefusal::RateLimited
     } else {
         SendRefusal::Other
     }
@@ -709,6 +724,7 @@ mod tests {
         assert_eq!(r.status, 1);
         assert_eq!(r.block, 0x3e05ee7);
         assert_eq!(r.gas_used, 0x70a5);
+        assert_eq!(r.tx_index, 0);
         assert_eq!(r.effective_gas_price, 100_000_000);
         assert_eq!(r.from[0], 0xee);
         assert_eq!(r.to[0], 0xd3);
@@ -832,6 +848,10 @@ mod tests {
             SendRefusal::FeeTooLow
         );
         assert_eq!(classify_send_refusal(b"nonce too high"), SendRefusal::Other);
+        assert_eq!(
+            classify_send_refusal(b"rate limited"),
+            SendRefusal::RateLimited
+        );
         let both = br#"{"jsonrpc":"2.0","id":3,"result":"0x1","error":{"code":1,"message":"x"}}"#;
         assert_eq!(scan_quantity(both, 3), Err(ScanErr::Malformed));
     }

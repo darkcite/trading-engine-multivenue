@@ -14,7 +14,12 @@
 //! * `[[pool]]` — 1..=128 pools: the address (which must be in
 //!   `universe.toml [hyperevm] pools` — the universe is where symbols are
 //!   allocated), each token's hedge coin (a `[[coin]]` name or `"USD"`),
-//!   whether it trades, and an optional per-pool cap.
+//!   whether it trades, and an optional per-pool cap;
+//! * `[testnet]` — at most once (HYPARB H8): the EVM write path's
+//!   endpoint, wallet count and TESTNET targets (the executor, the pool
+//!   the shadow swaps, the swap size). Optional in `mode = "paper"` (the
+//!   `evm-testnet` operator tool reads it); `mode = "testnet"` requires
+//!   it with every target set.
 //!
 //! **Laws** (inherited, all FATAL, all naming `hyparb.toml` and the line):
 //! integers only — a float anywhere refuses · an unknown key or section
@@ -107,6 +112,15 @@ const COIN_KEYS: [&str; 5] = ["name", "perp", "spot", "lot_1e6", "min_notional_u
 /// `cap_instance_usd_1e6` of `[hyparb]`).
 const POOL_KEYS: [&str; 5] = ["address", "coin0", "coin1", "trade", "max_notional_usd_1e6"];
 
+/// `[testnet]` keys (`executor`, `pool`, `amount_raw` OPTIONAL in the
+/// grammar — the operator tool deploys the executor before it exists —
+/// and REQUIRED by `mode = "testnet"`).
+const TESTNET_KEYS: [&str; 5] = ["endpoint", "wallets", "executor", "pool", "amount_raw"];
+
+/// Wallets the write path may drive (mirrors
+/// `exec_hyperevm::nonce::MAX_WALLETS`, const-asserted in the cli).
+pub const HYPARB_MAX_WALLETS: i64 = 8;
+
 /// The member's mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HyparbMode {
@@ -158,6 +172,22 @@ pub struct HyparbPool {
     pub max_notional_usd_1e6: Option<i64>,
 }
 
+/// `[testnet]` — the EVM write path's endpoint and testnet targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyparbTestnet {
+    /// The chain-998 JSON-RPC endpoint, `https://…` (the cli parses it).
+    pub endpoint: String,
+    /// Wallets to drive, 1..=8 (wallet 0 is the key; the rest are
+    /// derived from it — `cli::evm_testnet`).
+    pub wallets: u8,
+    /// The deployed O-H18 executor on chain 998, if deployed yet.
+    pub executor: Option<String>,
+    /// The chain-998 pool every shadow swap trades, if chosen yet.
+    pub pool: Option<String>,
+    /// Exact-input amount per shadow swap, token-in raw units (> 0).
+    pub amount_raw: Option<i64>,
+}
+
 /// `hyparb.toml` as parsed and bound-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HyparbFile {
@@ -201,6 +231,8 @@ pub struct HyparbFile {
     pub coins: Vec<HyparbCoin>,
     /// Pools, in file order.
     pub pools: Vec<HyparbPool>,
+    /// `[testnet]`, if present.
+    pub testnet: Option<HyparbTestnet>,
 }
 
 /// Read + parse. Returns the bytes too so the caller hashes the EXACT
@@ -402,6 +434,7 @@ fn finish_hyparb(kv: &Kv) -> Result<HyparbFile, HyparbError> {
         cooldown_ns: non_negative(kv, "cooldown_ns", B)? as u64,
         coins: Vec::new(),
         pools: Vec::new(),
+        testnet: None,
     })
 }
 
@@ -466,6 +499,46 @@ fn finish_pool(kv: &Kv, ln: usize) -> Result<HyparbPool, HyparbError> {
     })
 }
 
+fn finish_testnet(kv: &Kv) -> Result<HyparbTestnet, HyparbError> {
+    const B: &str = "[testnet]";
+    check_keys(kv, &TESTNET_KEYS, B)?;
+    let endpoint = string(kv, "endpoint", B)?;
+    if !endpoint.starts_with("https://") {
+        return Err(err(format!(
+            "`endpoint` must be an https:// URL (got \"{endpoint}\")"
+        )));
+    }
+    let wallets = int(kv, "wallets", B)?;
+    if !(1..=HYPARB_MAX_WALLETS).contains(&wallets) {
+        return Err(err(format!(
+            "`wallets` must be 1..={HYPARB_MAX_WALLETS} (got {wallets})"
+        )));
+    }
+    let addr = |key: &str| -> Result<Option<String>, HyparbError> {
+        match opt_string(kv, key)? {
+            Some(a) if !valid_address(&a) => Err(err(format!(
+                "{B}: `{key}` must be 0x + 40 lowercase hex (got \"{a}\")"
+            ))),
+            v => Ok(v),
+        }
+    };
+    let executor = addr("executor")?;
+    let pool = addr("pool")?;
+    let amount_raw = opt_int(kv, "amount_raw")?;
+    if let Some(v) = amount_raw {
+        if v <= 0 {
+            return Err(err(format!("{B}: `amount_raw` must be > 0 (got {v})")));
+        }
+    }
+    Ok(HyparbTestnet {
+        endpoint,
+        wallets: wallets as u8,
+        executor,
+        pool,
+        amount_raw,
+    })
+}
+
 /// Parse the artifact text.
 pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
     #[derive(Copy, Clone, PartialEq, Eq)]
@@ -474,9 +547,11 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
         Hyparb,
         Coin(usize),
         Pool(usize),
+        Testnet,
     }
     let mut sec = Sec::None;
     let mut head: Option<Kv> = None;
+    let mut testnet: Option<Kv> = None;
     let mut cur: Kv = Vec::new();
     let mut coins: Vec<HyparbCoin> = Vec::new();
     let mut pools: Vec<HyparbPool> = Vec::new();
@@ -484,12 +559,14 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
     let close = |sec: Sec,
                  cur: &mut Kv,
                  head: &mut Option<Kv>,
+                 testnet: &mut Option<Kv>,
                  coins: &mut Vec<HyparbCoin>,
                  pools: &mut Vec<HyparbPool>|
      -> Result<(), HyparbError> {
         match sec {
             Sec::None => {}
             Sec::Hyparb => *head = Some(std::mem::take(cur)),
+            Sec::Testnet => *testnet = Some(std::mem::take(cur)),
             Sec::Coin(l) => coins.push(finish_coin(cur, l)?),
             Sec::Pool(l) => pools.push(finish_pool(cur, l)?),
         }
@@ -504,13 +581,26 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
             continue;
         }
         if line.starts_with('[') {
-            close(sec, &mut cur, &mut head, &mut coins, &mut pools)?;
+            close(
+                sec,
+                &mut cur,
+                &mut head,
+                &mut testnet,
+                &mut coins,
+                &mut pools,
+            )?;
             sec = match line {
                 "[hyparb]" => {
                     if head.is_some() {
                         return Err(err(format!("line {ln}: duplicate `[hyparb]`")));
                     }
                     Sec::Hyparb
+                }
+                "[testnet]" => {
+                    if testnet.is_some() || sec == Sec::Testnet {
+                        return Err(err(format!("line {ln}: duplicate `[testnet]`")));
+                    }
+                    Sec::Testnet
                 }
                 "[[coin]]" => {
                     if coins.len() >= HYPARB_MAX_COINS {
@@ -547,10 +637,34 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
         }
         cur.push((k.to_owned(), parse_value(v, ln)?, ln));
     }
-    close(sec, &mut cur, &mut head, &mut coins, &mut pools)?;
+    close(
+        sec,
+        &mut cur,
+        &mut head,
+        &mut testnet,
+        &mut coins,
+        &mut pools,
+    )?;
 
     let head = head.ok_or_else(|| err("missing `[hyparb]` section"))?;
     let mut file = finish_hyparb(&head)?;
+    file.testnet = match testnet {
+        Some(kv) => Some(finish_testnet(&kv)?),
+        None => None,
+    };
+    if file.mode == HyparbMode::Testnet {
+        let complete = file
+            .testnet
+            .as_ref()
+            .is_some_and(|t| t.executor.is_some() && t.pool.is_some() && t.amount_raw.is_some());
+        if !complete {
+            return Err(err(
+                "`mode = \"testnet\"` requires a `[testnet]` block with `executor`, `pool` \
+                 and `amount_raw` set (deploy the executor with `multivenue-engine \
+                 evm-testnet deploy`)",
+            ));
+        }
+    }
     if coins.is_empty() {
         return Err(err("at least one `[[coin]]` is required"));
     }
@@ -687,6 +801,46 @@ mod tests {
         assert!(e.contains("line 6: unterminated array"), "{e}");
         let e = refused(&good().replace("lag_ns = 500000000", "lag_ns = [1, 2]"));
         assert!(e.contains("`lag_ns` must be an integer"), "{e}");
+    }
+
+    const TESTNET: &str = "\n[testnet]\nendpoint = \"https://rpc.hyperliquid-testnet.xyz/evm\"\n\
+                           wallets = 3\n";
+
+    #[test]
+    fn the_testnet_block_is_optional_in_paper_and_complete_in_testnet_mode() {
+        let t = parse(&(good() + TESTNET))
+            .expect("paper + [testnet]")
+            .testnet
+            .unwrap();
+        assert_eq!(t.wallets, 3);
+        assert_eq!((t.executor, t.pool, t.amount_raw), (None, None, None));
+        assert!(parse(&good()).unwrap().testnet.is_none());
+        let testnet_mode = good().replace("mode = \"paper\"", "mode = \"testnet\"");
+        assert!(refused(&testnet_mode).contains("requires a `[testnet]` block"));
+        assert!(refused(&(testnet_mode.clone() + TESTNET)).contains("`executor`, `pool`"));
+        let full = format!(
+            "{testnet_mode}{TESTNET}executor = \"{A}\"\npool = \"{A}\"\namount_raw = 1000\n"
+        );
+        let t = parse(&full).expect("complete").testnet.unwrap();
+        assert_eq!(t.executor.as_deref(), Some(A));
+        assert_eq!(t.amount_raw, Some(1000));
+    }
+
+    #[test]
+    fn testnet_values_out_of_their_domain_refuse() {
+        let base = good() + TESTNET;
+        let e = refused(&base.replace("https://rpc", "http://rpc"));
+        assert!(e.contains("https:// URL"), "{e}");
+        let e = refused(&base.replace("wallets = 3", "wallets = 9"));
+        assert!(e.contains("`wallets` must be 1..=8"), "{e}");
+        let e = refused(&(base.clone() + "executor = \"0xABC\"\n"));
+        assert!(e.contains("`executor` must be 0x + 40"), "{e}");
+        let e = refused(&(base.clone() + "amount_raw = 0\n"));
+        assert!(e.contains("`amount_raw` must be > 0"), "{e}");
+        let e = refused(&(base.clone() + "chain_id = 999\n"));
+        assert!(e.contains("unknown [testnet] key `chain_id`"), "{e}");
+        let e = refused(&(base.clone() + "[testnet]\n"));
+        assert!(e.contains("duplicate `[testnet]`"), "{e}");
     }
 
     #[test]

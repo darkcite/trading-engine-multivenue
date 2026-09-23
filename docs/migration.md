@@ -6,6 +6,56 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — the EVM write path linked: `[testnet]`, `--evm-hybrid`, `evm-testnet`, `engine_hyparb_evm_*` (HYPARB H8)
+
+**What changed**
+
+- **`hyparb.toml` gains `[testnet]`** (at most once): `endpoint`
+  (https, chain 998), `wallets` (1..=8), and the OPTIONAL targets
+  `executor`, `pool`, `amount_raw`. Optional in `mode = "paper"`;
+  `mode = "testnet"` now requires it with every target set and a
+  `[[coin]]` named `"HYPE"` (the gas coin). `mode = "testnet"` +
+  `--evm-testnet` no longer refuses as "not linked".
+- **`run --evm-hybrid`** (O-H12, requires `--evm-testnet`): the pool
+  ingress may read chain 999 while the write path writes chain 998. At
+  boot the engine asks the READ endpoint (`https://$HYPEREVM_WS_HOST` +
+  `--hyperevm-path`) and the WRITE endpoint for `eth_chainId`; anything
+  but same-chain, or exactly 999 → 998 with the switch, refuses the
+  boot. The ARMED tell is logged at WARN.
+- **Testnet mode shadows every paper AMM decision** with one swap on the
+  `[testnet] pool` through the executor (thread `evm-shadow`); the paper
+  book stays the P&L source.
+- **Keys:** `HYPEREVM_TESTNET_KEY` in the operator's `.env`, else — by
+  the 2026-09-23 ruling — `HYPERLIQUID_TESTNET_AGENT_KEY`. Wallets 1..
+  are derived from it; `evm-testnet fund` funds them from wallet 0.
+- **`multivenue-engine evm-testnet status|fund|deploy|mint|battery|shadow-smoke`**
+  and `scripts/evm-testnet.sh` (sources the `.env` like
+  `exec-smoke.sh`). Chain 998 only.
+- **Metrics, registered unconditionally:** `engine_hyparb_evm_*` — 18
+  counters (decisions, lost, dropped, no_wallet, bid_refused, sends,
+  accepted, maybe_sent, refused_{fee,rate,nonce,funds,other}, not_sent,
+  mined_ok, mined_reverted, timeouts, syncs) and 4 gauges
+  (wallets_ready, halted, gas_paid_gwei, last_block). Zero on every
+  paper boot.
+- **Wrapper:** `EVM_HYBRID=1` adds `--evm-hybrid` on top of
+  `HYPARB_TOML` + `EVM_TESTNET=1`; alone it refuses (exit 78). The live
+  `ai+vrp+xsd+bin15` + `EXEC_TOML`/`ARM_LIVE` line is unchanged.
+
+**Impact**
+
+- `/metrics`: additive series only. A paper boot is otherwise unchanged.
+- `hyparb.toml`: additive section; an existing paper artifact parses as
+  before.
+
+**Migration steps**
+
+1. None for paper. For the testnet smoke: fund wallet 0 on HyperEVM
+   testnet, `evm-testnet fund`, `deploy`, set `[testnet]`, `mint`.
+
+**Rollback**
+
+- Revert the H8 commit.
+
 ## 2026-09-23 — `/state` `hyparb` object, `engine_hyparb_*`, `engine_paper_matcher_amm_*`, `backtest --member hyparb`, `pnl_report --hyparb-ladder` (HYPARB H6)
 
 **What changed**

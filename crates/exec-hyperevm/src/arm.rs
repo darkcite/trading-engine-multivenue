@@ -260,6 +260,8 @@ pub struct EvmArmCounters {
     pub refused_nonce: u64,
     /// Refused: insufficient funds.
     pub refused_funds: u64,
+    /// Refused: the endpoint throttled it (nonce not taken).
+    pub refused_rate: u64,
     /// Refused: anything else.
     pub refused_other: u64,
     /// Failed before the request left the host.
@@ -702,6 +704,10 @@ impl EvmArm {
                     SendRefusal::FeeTooLow => {
                         self.nonces.unused(w);
                         self.counters.refused_fee += 1;
+                    }
+                    SendRefusal::RateLimited => {
+                        self.nonces.unused(w);
+                        self.counters.refused_rate += 1;
                     }
                     SendRefusal::InsufficientFunds => {
                         self.nonces.unfunded(w);

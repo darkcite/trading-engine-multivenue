@@ -309,21 +309,7 @@ impl Secrets {
     /// Load secrets from the (already-loaded) env. Call AFTER
     /// `Config::load`.
     pub fn load() -> Result<Self, ConfigError> {
-        let hex = env_req("POLYMARKET_EIP712_KEY")?;
-        // Strip optional "0x" prefix.
-        let hex_bytes = hex.trim_start_matches("0x").as_bytes();
-        if hex_bytes.len() != 64 {
-            return Err(ConfigError::Invalid("POLYMARKET_EIP712_KEY"));
-        }
-        let mut raw = [0u8; 32];
-        for i in 0..32 {
-            let hi = decode_hex_nibble(hex_bytes[i * 2])
-                .ok_or(ConfigError::Invalid("POLYMARKET_EIP712_KEY"))?;
-            let lo = decode_hex_nibble(hex_bytes[i * 2 + 1])
-                .ok_or(ConfigError::Invalid("POLYMARKET_EIP712_KEY"))?;
-            raw[i] = (hi << 4) | lo;
-        }
-        let key = SecretKeyBytes::new_locked(raw)?;
+        let key = SecretKeyBytes::from_hex_env("POLYMARKET_EIP712_KEY")?;
         let anthropic_api_key = env_req("ANTHROPIC_API_KEY")?;
         Ok(Self {
             key,
@@ -399,6 +385,39 @@ impl SecretKeyBytes {
         let mlocked = false;
 
         Ok(Self { inner: b, mlocked })
+    }
+
+    /// Read a 32-byte key from the environment variable `var` (64 hex
+    /// digits, optional `0x`) into an mlock'd page. The env string and
+    /// the stack copy are zeroized before return, on every path —
+    /// including a refusal. `Missing(var)` when unset, `Invalid(var)`
+    /// when not 32 bytes of hex; the VALUE is never in an error.
+    pub fn from_hex_env(var: &'static str) -> Result<Self, ConfigError> {
+        let mut s = env_req(var)?;
+        let mut raw = [0u8; 32];
+        let ok = {
+            let h = s.trim().trim_start_matches("0x").as_bytes();
+            let mut ok = h.len() == 64;
+            let mut i = 0;
+            while ok && i < 32 {
+                match (decode_hex_nibble(h[2 * i]), decode_hex_nibble(h[2 * i + 1])) {
+                    (Some(hi), Some(lo)) => raw[i] = (hi << 4) | lo,
+                    _ => ok = false,
+                }
+                i += 1;
+            }
+            ok
+        };
+        s.zeroize();
+        if !ok {
+            raw.zeroize();
+            return Err(ConfigError::Invalid(var));
+        }
+        // `raw` is `Copy`: `new_locked` zeroizes ITS copy; this one is
+        // zeroized here.
+        let key = Self::new_locked(raw);
+        raw.zeroize();
+        key
     }
 
     /// Read-only view of the 32 bytes. Callers must not copy them into
@@ -624,6 +643,48 @@ mod tests {
             std::env::set_var("BINANCE_WS_HOST", "bn.example");
             std::env::set_var("ALCHEMY_HOST", "alchemy.example");
             std::env::set_var("HOME", "/Users/testhome");
+        }
+    }
+
+    /// HYPARB H8: a key from the environment — with or without `0x`,
+    /// and named (never shown) when missing or malformed.
+    #[test]
+    fn a_hex_key_loads_from_the_environment_and_a_bad_one_is_named() {
+        let _env = env_guard();
+        const V: &str = "CORE_CONFIG_TEST_HEX_KEY";
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var(V);
+        }
+        assert!(matches!(
+            SecretKeyBytes::from_hex_env(V),
+            Err(ConfigError::Missing(V))
+        ));
+        let hex = "11".repeat(32);
+        for v in [hex.clone(), format!("0x{hex}"), format!(" 0x{hex}\n")] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(V, &v);
+            }
+            let k = SecretKeyBytes::from_hex_env(V).expect("a good key");
+            assert_eq!(k.bytes(), &[0x11; 32]);
+        }
+        for bad in [
+            "11".repeat(31),
+            format!("{}zz", "11".repeat(31)),
+            "11".repeat(33),
+        ] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(V, &bad);
+            }
+            let e = SecretKeyBytes::from_hex_env(V).err().expect("refused");
+            assert!(matches!(e, ConfigError::Invalid(V)), "{e:?}");
+            assert!(!e.to_string().contains(&bad), "the value is never echoed");
+        }
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(V);
         }
     }
 

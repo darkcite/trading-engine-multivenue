@@ -216,8 +216,10 @@ fi
 # (O-H5, TESTNET ONLY, chain 998) takes BOTH HYPARB_TOML=<an artifact with
 # mode = "testnet"> AND EVM_TESTNET=1 - one of the two alone REFUSES
 # (exit 78), the EXEC_TOML/ARM_LIVE shape; the engine's own interlock
-# (artifact mode <=> --evm-testnet) has the last word. Per O-H8 nothing
-# here edits strategy.conf.
+# (artifact mode <=> --evm-testnet) has the last word. HYPARB H8: the
+# O-H12 third switch EVM_HYBRID=1 (--evm-hybrid: mainnet pool reads,
+# testnet writes) is valid only on top of the pair - alone it REFUSES.
+# Per O-H8 nothing here edits strategy.conf.
 HYPARB_ARGS=()
 case "$STRATEGY" in
   *hyparb*) HYPARB_ARGS=(--hyperevm-path "${HYPEREVM_PATH:-/}") ;;
@@ -238,6 +240,17 @@ if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
   esac
   HYPARB_ARGS+=(--hyparb "$HYPARB_TOML" --evm-testnet)
   echo "engine-wrapper: hyparb EVM write path via $HYPARB_TOML — TESTNET (chain 998) only" >&2
+  if [ -n "${EVM_HYBRID:-}" ]; then
+    if [ "$EVM_HYBRID" != "1" ]; then
+      echo "engine-wrapper: refusing — EVM_HYBRID must be 1 (got '$EVM_HYBRID')" >&2
+      exit 78
+    fi
+    HYPARB_ARGS+=(--evm-hybrid)
+    echo "engine-wrapper: HYBRID — mainnet (999) pool reads, TESTNET (998) writes (O-H12)" >&2
+  fi
+elif [ -n "${EVM_HYBRID:-}" ]; then
+  echo "engine-wrapper: refusing — EVM_HYBRID needs HYPARB_TOML and EVM_TESTNET=1" >&2
+  exit 78
 elif [ -n "${HYPARB_TOML:-}${EVM_TESTNET:-}" ]; then
   echo "engine-wrapper: refusing — HYPARB_TOML and EVM_TESTNET must BOTH be set for the EVM write path (got HYPARB_TOML='${HYPARB_TOML:-}' EVM_TESTNET='${EVM_TESTNET:-}')" >&2
   exit 78

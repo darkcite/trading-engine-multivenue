@@ -24,8 +24,16 @@ core-parse       = { workspace = true }
 # pool ingress already uses — one implementation of each.
 ingress-hyperevm = { workspace = true }
 ingress-rpc      = { workspace = true }
+# `testnode` only: the scripted rustls JSON-RPC node (never in a build
+# that ships — the cli takes it as a dev-dependency).
+rcgen            = { workspace = true, optional = true }
+rustls           = { workspace = true, optional = true }
+
+[features]
+testnode = ["dep:rcgen", "dep:rustls"]
 
 [dev-dependencies]
-proptest = { workspace = true }
-rcgen    = { workspace = true }
-rustls   = { workspace = true }
+proptest      = { workspace = true }
+rustls        = { workspace = true }
+# The integration tests drive the arm against `testnode`.
+exec-hyperevm = { path = ".", features = ["testnode"] }

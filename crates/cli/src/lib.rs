@@ -40,6 +40,7 @@ pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
 pub mod capture_catalog;
+pub mod evm_testnet;
 pub mod exec_boot;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;

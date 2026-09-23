@@ -25,9 +25,11 @@
 # dark on a dishonest one - O-H15). The only value is "archive".
 endpoint_kind = "archive"
 # "paper": the engine's paper matcher fills the AMM leg by the AMM fill
-# law (plan §6). "testnet": the EVM write path, chain 998 ONLY (O-H5) -
-# refused unless the engine is also started with --evm-testnet, and
-# refused outright until that path is linked. There is no mainnet mode.
+# law (plan §6). "testnet": the same paper member, with every AMM
+# decision SHADOWED by one swap on chain 998 (O-H5, O-H12) - refused
+# unless the engine is also started with --evm-testnet, and it needs the
+# [testnet] block at the end of this file and a [[coin]] named "HYPE"
+# (gas is bid in USD, paid in HYPE). There is no mainnet mode.
 mode = "paper"
 # Gas is charged per ATTEMPT from the MEASURED distribution (a reverted
 # swap pays too), never the base fee. The only value is "measured".
@@ -105,3 +107,27 @@ address = "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285"
 coin0 = "HYPE"
 coin1 = "USD"
 trade = 1
+
+# The EVM write path (plan §12, O-H5 / O-H12), at most once. Optional in
+# mode = "paper" (the `multivenue-engine evm-testnet` operator tool reads
+# it); mode = "testnet" requires it with executor, pool and amount_raw
+# set. TESTNET ONLY: the engine signs for chain 998 and nothing else, and
+# refuses an endpoint that answers another chain id. In testnet mode each
+# paper AMM decision is SHADOWED by one swap on the testnet pool below -
+# the paper book stays the P&L source; testnet is an exec battery, not a
+# market, so no number it produces is a mainnet result.
+[testnet]
+endpoint = "https://rpc.hyperliquid-testnet.xyz/evm"
+# Wallets driven, 1-8: wallet 0 is the key the engine reads from the
+# environment (HYPEREVM_TESTNET_KEY, else the Hyperliquid TESTNET agent
+# key); the others are derived from it. One transaction in flight per
+# wallet - the wallets are the parallelism.
+wallets = 3
+# Set by the operator after `multivenue-engine evm-testnet deploy` and
+# choosing a pool: the O-H18 executor deployed on chain 998 (owned by
+# wallet 0), the chain-998 pool every shadow swap trades, and the
+# exact-input amount per shadow swap in raw units of whichever token
+# goes in.
+# executor = "0x..."
+# pool = "0x..."
+# amount_raw = 1000000000000000000

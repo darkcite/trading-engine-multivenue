@@ -1870,3 +1870,73 @@ As §6 says, with these decisions recorded:
   nonce claim, sign, hash, body render and every scanner at 0 B/op.
   Fuzz target `evm_exec_response`. `crates/exec-hyperevm` joins
   `scripts/copy-audit.sh`'s default list (new=0).
+
+### 16.15 H8 — the write path wired (live smoke: §16.16)
+
+* **The shadow, as O-H12 rules it.** `mode = "testnet"` runs the SAME
+  paper member; each AMM decision it submits is recorded in a 64-deep
+  decision log (`strategy_core::HyparbDecision`: seq, time, the solver's
+  net edge, notional, the gas coin's mid, pool, side; read through
+  `StrategyCounters::hyparb_decisions`). `cli::evm_testnet::ShadowTap`
+  drains it on the engine thread once per report period into an SPSC
+  ring (a gap is counted `lost`, a full ring `dropped`); the `evm-shadow`
+  thread sends ONE swap per decision through the executor on the
+  `[testnet] pool` — the decision's direction, `amount_raw` exact input,
+  no price limit, `minOut = 1` — bidding G2 on the decision's own edge
+  priced at its gas-coin mid (`[[coin]] name = "HYPE"` is required in
+  testnet mode). Receipts are polled at 1 s, quarantined wallets resync
+  at 15 s; every outcome is a log line and an `engine_hyparb_evm_*`
+  series. The paper book stays the P&L source.
+* **Deviation from §12's "hybrid" as one engine:** the O-H12 checks are
+  done on the WIRE at boot — the read endpoint (`https://$HYPEREVM_WS_HOST`
+  + `--hyperevm-path`) and the write endpoint each answer `eth_chainId`,
+  and `exec_hyperevm::check_chains(read, write, --evm-hybrid)` decides;
+  an unverifiable interlock refuses the boot (unlike an ingress outage,
+  which only darkens the member — O-H15). `EVM_WRITE_PATH_LINKED` is
+  gone: the path is linked.
+* **Keys (operator ruling 2026-09-23, "reuse the one we used for HL"):**
+  `HYPEREVM_TESTNET_KEY`, else `HYPERLIQUID_TESTNET_AGENT_KEY` — never
+  the mainnet agent key (pinned). Wallet 0 is that key; wallets 1..7 are
+  `keccak256("hyparb/evm-wallet/v1" ‖ seed ‖ i)`, mlock'd like the seed,
+  and funded from wallet 0 (`evm-testnet fund`) — one funding action
+  covers them all. `core_config::SecretKeyBytes::from_hex_env` is the one
+  env-hex-key reader (the Polymarket key now goes through it too, and its
+  env string is zeroized).
+* **Operator verbs:** `multivenue-engine evm-testnet
+  status|fund|deploy|mint|battery|shadow-smoke` via `scripts/evm-testnet.sh`.
+  `deploy` creates the executor from wallet 0 (its owner) with the
+  committed creation bytecode; `mint` calls a testnet token's public
+  `mint(executor, amount)` (measured: `leUSDT0` at
+  `0x87d7…6851` mints to anyone; `leLIQD` is owner-only); `battery` is
+  DONE(H8): (a) a swap lands and reconciles, (b) three wallets in flight
+  at once with no nonce collision, (c) a fee cap below the base fee is
+  refused by the node and its nonce returned — plus the ordering probe
+  (a zero tip sent first, a 50 × base-fee tip right after: where did the
+  tip put each). `shadow-smoke` boots the ENGINE's shadow exactly as
+  `run --evm-testnet --evm-hybrid` does (read endpoint 999, write 998)
+  and feeds it synthetic decisions through a real `ShadowTap` — the
+  O-H12 path end to end without stopping the armed live engine
+  (CLAUDE.md pitfall 7's shape). Every report line is headed as an exec
+  battery, never a market result.
+* **Testnet facts measured 2026-09-23 (for the smoke):** the only live
+  V3 family is factory `0x22b0…3826` (223 swaps / 3,000 blocks on
+  `0x7d03…3d29`, leLIQD/leUSDT0, fee 3000, L ≈ 2.1e24); no WHYPE pool
+  exists there; the public endpoint rate-limits bursts with `-32005
+  rate limited` (a new `SendRefusal::RateLimited`: the nonce is NOT
+  taken); refusal wording: "transaction underpriced", "insufficient
+  funds for gas * price + value", "invalid chain ID". Receipts now carry
+  `transactionIndex` (read from the top level, like every member).
+* **`HttpsPost` reads chunked bodies** — the archive endpoint (purroof)
+  answers `Transfer-Encoding: chunked` (measured 09-23; the testnet RPC
+  answers `Content-Length`), so the O-H12 read-chain probe would have
+  refused as `BadHttp`. `core_net::http1::dechunk_in_place` now walks the
+  framing read-only first and decodes only a WHOLE body, so an
+  incremental reader can retry it on every read (the first cut shifted
+  chunks before finding the tail missing).
+* **Tests:** `evm_shadow_loopback` (5) against two scripted nodes (a read
+  node on 999 answering chunked, a write node on 998, one identity —
+  `exec_hyperevm::testnode`, feature `testnode`, dev-only); the member's
+  decision log (2); `[testnet]` grammar (2); boot switches + gas coin
+  (2); the key reader (1); the metrics family (1). Wrapper exercised
+  under zsh against a stub binary (hybrid, testnet, EVM_HYBRID alone →
+  78, EVM_HYBRID=yes → 78, the live line byte-identical).

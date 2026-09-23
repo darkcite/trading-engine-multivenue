@@ -58,8 +58,8 @@ use core_types::{
     Tick, VenueId, SYMBOL_ID_NONE,
 };
 use strategy_core::{
-    CooldownGate, Ctx, HyparbCoinView, HyparbCounters, HyparbPoolView, Strategy, StrategyCounters,
-    StrategyError, SubmitErr,
+    CooldownGate, Ctx, HyparbCoinView, HyparbCounters, HyparbDecision, HyparbPoolView, Strategy,
+    StrategyCounters, StrategyError, SubmitErr, HYPARB_DECISION_LOG,
 };
 
 pub use hedge::{choose_venue, CoinTouch, HedgeMode, HedgeVenue, VenueCost};
@@ -183,6 +183,10 @@ pub struct HyparbParams {
     pub funding_window_ns: u64,
     /// Least time between two arbs on one pool, ns.
     pub cooldown_ns: u64,
+    /// The coin gas is paid in (HYPE on HyperEVM), or [`COIN_USD`] when
+    /// no configured coin is it: each decision records its USD mid so a
+    /// gas bid in USD can be priced in wei (H8).
+    pub gas_coin: u8,
 }
 
 impl HyparbParams {
@@ -208,6 +212,7 @@ impl HyparbParams {
         spot_taker_bps_1e6: 0,
         funding_window_ns: 0,
         cooldown_ns: 0,
+        gas_coin: COIN_USD,
     };
 
     /// The shape law: refuses what the member could not run honestly.
@@ -217,6 +222,9 @@ impl HyparbParams {
         }
         if self.n_coins > HYPARB_MAX_COINS {
             return Err("hyparb: at most 8 coins");
+        }
+        if self.gas_coin != COIN_USD && self.gas_coin as usize >= self.n_coins {
+            return Err("hyparb: the gas coin is not a configured coin");
         }
         let mut c = 0usize;
         while c < self.n_coins {
@@ -381,6 +389,11 @@ pub struct HyparbStrategy {
     orders_emitted: u64,
     /// When funding was last accrued (0 = never).
     last_funding_ns: u64,
+    /// The last [`HYPARB_DECISION_LOG`] AMM decisions, a ring indexed by
+    /// `seq % HYPARB_DECISION_LOG`.
+    decisions: [HyparbDecision; HYPARB_DECISION_LOG],
+    /// The last decision's `seq` (0 = none yet).
+    decision_seq: u64,
 }
 
 impl Default for HyparbStrategy {
@@ -465,6 +478,17 @@ impl HyparbStrategy {
             },
             orders_emitted: 0,
             last_funding_ns: 0,
+            decisions: [HyparbDecision {
+                seq: 0,
+                ts_ns: 0,
+                edge_usd_1e6: 0,
+                notional_usd_1e6: 0,
+                gas_px_usd_1e6: 0,
+                pool_sym: 0,
+                buy: 0,
+                _pad: [0; 3],
+            }; HYPARB_DECISION_LOG],
+            decision_seq: 0,
         }
     }
 
@@ -836,6 +860,29 @@ impl HyparbStrategy {
             c.size_capped = c.size_capped.wrapping_add(1);
         }
         self.day_notional_usd_1e6 = self.day_notional_usd_1e6.saturating_add(q.notional_usd_1e6);
+        self.record_decision(now, sym, buy, q);
+    }
+
+    /// Log one submitted AMM decision for the write path's shadow (H8).
+    #[inline]
+    fn record_decision(&mut self, now: NsTs, sym: SymbolId, buy: bool, q: &ArbQuote) {
+        self.decision_seq += 1;
+        let gas_px_usd_1e6 = if self.params.gas_coin == COIN_USD {
+            0
+        } else {
+            self.usd_mid_1e6(self.params.gas_coin).unwrap_or(0)
+        };
+        self.decisions[(self.decision_seq % HYPARB_DECISION_LOG as u64) as usize] =
+            HyparbDecision {
+                seq: self.decision_seq,
+                ts_ns: now,
+                edge_usd_1e6: q.pnl_usd_1e6,
+                notional_usd_1e6: q.notional_usd_1e6,
+                gas_px_usd_1e6,
+                pool_sym: sym,
+                buy: u8::from(buy),
+                _pad: [0; 3],
+            };
     }
 }
 
@@ -1085,6 +1132,22 @@ impl StrategyCounters for HyparbStrategy {
         } else {
             0
         }
+    }
+
+    fn hyparb_decisions(&self, after: u64, out: &mut [HyparbDecision]) -> u32 {
+        let oldest = self
+            .decision_seq
+            .saturating_sub(HYPARB_DECISION_LOG as u64 - 1)
+            .max(1);
+        let first = after.saturating_add(1);
+        let mut seq = if first > oldest { first } else { oldest };
+        let mut n = 0usize;
+        while seq <= self.decision_seq && n < out.len() {
+            out[n] = self.decisions[(seq % HYPARB_DECISION_LOG as u64) as usize];
+            n += 1;
+            seq += 1;
+        }
+        n as u32
     }
 
     fn hyparb_coins_view(&self, out: &mut [HyparbCoinView]) -> u32 {

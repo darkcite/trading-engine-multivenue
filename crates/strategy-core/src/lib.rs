@@ -403,6 +403,18 @@ pub trait StrategyCounters {
         0
     }
 
+    /// HYPARB H8: copy the member's AMM decisions with `seq > after`,
+    /// oldest first, into `out` (at most `out.len()`), returning how
+    /// many were copied. The member keeps the last
+    /// [`HYPARB_DECISION_LOG`]; a reader further behind than that finds
+    /// a `seq` gap (it counts the loss — nothing blocks). What the EVM
+    /// write path shadows (O-H12). Never allocates.
+    #[inline]
+    fn hyparb_decisions(&self, after: u64, out: &mut [HyparbDecision]) -> u32 {
+        let _ = (after, out);
+        0
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -1136,6 +1148,36 @@ pub struct HyparbCoinView {
     /// The perp's hourly funding rate × 1e9.
     pub funding_1e9: i64,
 }
+
+/// Decisions the HYPARB member remembers for
+/// [`StrategyCounters::hyparb_decisions`].
+pub const HYPARB_DECISION_LOG: usize = 64;
+
+/// HYPARB H8: one AMM decision exactly as the member made it — the input
+/// the EVM write path shadows (O-H12: one testnet swap per paper
+/// decision, its G2 bid a fraction of THIS edge). Never persisted.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbDecision {
+    /// Per-member sequence, from 1.
+    pub seq: u64,
+    /// Decision time, ns.
+    pub ts_ns: u64,
+    /// The solver's net P&L (after the pool fee, both hedge fees and
+    /// p50 gas), USD × 1e6 — the edge a gas bid is a fraction of.
+    pub edge_usd_1e6: i64,
+    /// The AMM leg's token0 notional, USD × 1e6.
+    pub notional_usd_1e6: i64,
+    /// The gas coin's USD mid at the decision (0 = no gas coin priced).
+    pub gas_px_usd_1e6: i64,
+    /// The pool's symbol.
+    pub pool_sym: u32,
+    /// 1 = bought token0 from the pool, 0 = sold it.
+    pub buy: u8,
+    /// Padding.
+    pub _pad: [u8; 3],
+}
+const _: () = assert!(core::mem::size_of::<HyparbDecision>() == 48);
 
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
 /// block. Defined HERE for the reason [`IcdpCounters`] is.

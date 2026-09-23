@@ -225,6 +225,9 @@ fn validate_refuses_every_malformed_shape() {
     cases.push(p.clone());
     let mut p = params();
     p.basis_window_ns = 0;
+    cases.push(p.clone());
+    let mut p = params();
+    p.gas_coin = 1; // one coin configured
     cases.push(p);
     let mut i = 0;
     while i < cases.len() {
@@ -447,6 +450,65 @@ fn a_cheap_pool_is_bought_at_the_quotes_own_average_price() {
     // The member carried its own impact: the gap is not harvested twice.
     assert!(m.book().mid_1e6(0).unwrap() > mid);
     assert_eq!(m.orders_emitted(), 1);
+}
+
+/// H8: every submitted decision is logged with the solver's edge and
+/// the gas coin's mid — what the write path's shadow bids against.
+#[test]
+fn a_submitted_decision_is_logged_for_the_write_path() {
+    let mut p = params();
+    p.gas_coin = 0;
+    let mut m = member_with(p);
+    let mut c = ctx();
+    let mut out = [strategy_core::HyparbDecision::default(); 4];
+    assert_eq!(m.hyparb_decisions(0, &mut out), 0, "nothing decided yet");
+    perp_at(&mut m, &mut c, 100);
+    snapshot(&mut m, &mut c, POOL, 2, 2);
+    assert_eq!(c.orders.len(), 1);
+    assert_eq!(m.hyparb_decisions(0, &mut out), 1);
+    let d = out[0];
+    assert_eq!((d.seq, d.pool_sym, d.buy), (1, POOL, 1));
+    assert_eq!(d.edge_usd_1e6, m.counters().pnl_predicted_usd_1e6);
+    assert!(d.edge_usd_1e6 > 0 && d.notional_usd_1e6 > 0);
+    let perp_mid = pool_mid() * 10_100 / 10_000;
+    assert!((d.gas_px_usd_1e6 - perp_mid).abs() <= 1, "{d:?}");
+    assert_eq!(
+        m.hyparb_decisions(1, &mut out),
+        0,
+        "a reader past it sees nothing"
+    );
+    // Without a gas coin the mid is unknown, never guessed.
+    let (m2, _) = armed();
+    let mut one = [strategy_core::HyparbDecision::default(); 1];
+    assert_eq!(m2.hyparb_decisions(0, &mut one), 1);
+    assert_eq!(one[0].gas_px_usd_1e6, 0);
+}
+
+/// The log is a ring of `HYPARB_DECISION_LOG`: a reader that fell
+/// behind resumes at the oldest kept decision (the seq gap is its count
+/// of the lost ones), and `out` bounds every copy.
+#[test]
+fn the_decision_log_keeps_the_last_64_and_a_late_reader_sees_the_gap() {
+    let mut m = member();
+    let mut q = core_amm::ArbQuote::none(&core_amm::PoolState::ZERO, 0, 0);
+    let mut k = 0i64;
+    while k < 70 {
+        q.pnl_usd_1e6 = k + 1;
+        m.record_decision(T0 + k as u64, POOL, k % 2 == 0, &q);
+        k += 1;
+    }
+    let mut out = [strategy_core::HyparbDecision::default(); 80];
+    assert_eq!(m.hyparb_decisions(0, &mut out), 64);
+    assert_eq!(
+        (out[0].seq, out[63].seq),
+        (7, 70),
+        "the oldest six are gone"
+    );
+    assert_eq!(out[63].edge_usd_1e6, 70);
+    assert_eq!(m.hyparb_decisions(68, &mut out), 2);
+    assert_eq!(m.hyparb_decisions(68, &mut out[..1]), 1, "bounded by out");
+    assert_eq!(out[0].seq, 69);
+    assert_eq!(m.hyparb_decisions(u64::MAX, &mut out), 0);
 }
 
 #[test]

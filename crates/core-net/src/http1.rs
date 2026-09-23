@@ -440,7 +440,23 @@ pub enum DechunkResult {
 /// In-place decode of `Transfer-Encoding: chunked`. Writes the decoded
 /// body over the top of `buf` (so `buf[..length]` is the payload). Zero
 /// alloc.
+///
+/// **`buf` is untouched unless the result is `Complete`** (HYPARB H8):
+/// the framing is walked once read-only and decoded only when it is
+/// whole, so a caller that is still filling its buffer can call this on
+/// every read and retry on `Incomplete` — the first cut shifted chunks
+/// left before discovering the tail was missing, which is harmless to a
+/// read-to-EOF caller and corrupting to an incremental one.
 pub fn dechunk_in_place(buf: &mut [u8]) -> DechunkResult {
+    match walk_chunks(buf, false) {
+        DechunkResult::Complete { .. } => walk_chunks(buf, true),
+        other => other,
+    }
+}
+
+/// The chunk walker behind [`dechunk_in_place`]: validates the framing
+/// and, with `copy`, shifts each chunk body left over the framing.
+fn walk_chunks(buf: &mut [u8], copy: bool) -> DechunkResult {
     let mut read: usize = 0;
     let mut write: usize = 0;
     loop {
@@ -480,7 +496,7 @@ pub fn dechunk_in_place(buf: &mut [u8]) -> DechunkResult {
             return DechunkResult::Malformed;
         }
         // Copy chunk body left, skipping headers.
-        if chunk_data != write {
+        if copy && chunk_data != write {
             buf.copy_within(chunk_data..chunk_end, write);
         }
         write += size;
@@ -650,6 +666,20 @@ mod tests {
     fn read_response_rejects_3xx_redirect() {
         let r = read_response(b"HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\n");
         assert_eq!(r, HttpResult::Malformed);
+    }
+
+    #[test]
+    fn dechunk_in_place_leaves_an_incomplete_buffer_untouched() {
+        let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n";
+        let mut buf = raw.to_vec();
+        assert_eq!(dechunk_in_place(&mut buf), DechunkResult::Incomplete);
+        assert_eq!(&buf[..], &raw[..], "no chunk was shifted");
+        buf.extend_from_slice(b"\r\n");
+        assert_eq!(
+            dechunk_in_place(&mut buf),
+            DechunkResult::Complete { length: 11 }
+        );
+        assert_eq!(&buf[..11], b"hello world");
     }
 
     #[test]

@@ -3843,6 +3843,7 @@ impl Observability {
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
             let hyparb = register_hyparb_metrics(&mut reg)?;
+            let hyparb_evm = register_hyparb_evm_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             // E1: only when a router is actually in force. A boot with
@@ -3943,6 +3944,7 @@ impl Observability {
                 xsd,
                 bin15,
                 hyparb,
+                hyparb_evm,
                 regime,
                 paper_matcher,
                 exec,
@@ -4083,6 +4085,10 @@ pub struct Observability {
     /// XSD-3: where and how the xsd member's positions are persisted.
     /// `None` = no xsd member is configured. Set by the set builder.
     pub xsd_state: Option<XsdStateSink>,
+    /// HYPARB H8: the testnet write path's tap (`mode = "testnet"`
+    /// only) — **taken** by the engine loop, drained once per report
+    /// period (O-H12: each paper AMM decision is shadowed on chain 998).
+    pub hyparb_shadow: Option<crate::evm_testnet::ShadowTap>,
 }
 
 /// XSD-3: the state writer's identity — the path, the table hash the
@@ -4308,6 +4314,8 @@ pub struct EngineCounters {
     pub bin15: Bin15MetricIds,
     /// HYPARB H6: the `engine_hyparb_*` family (slot 0).
     pub hyparb: HyparbMetricIds,
+    /// HYPARB H8: the `engine_hyparb_evm_*` family (the testnet shadow).
+    pub hyparb_evm: HyparbEvmMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
     /// X1: the `engine_paper_matcher_*` family + the set's
@@ -5764,6 +5772,66 @@ pub struct HyparbMetricIds {
     /// `engine_hyparb_p<k>_<suffix>` for the first
     /// [`HYPARB_METRIC_POOLS`] pools.
     pub pools: [[core_metrics::GaugeId; 3]; HYPARB_METRIC_POOLS],
+}
+
+/// HYPARB H8: the testnet write path's shadow — the tap's and the
+/// `evm-shadow` thread's counters and levels (`cli::evm_testnet`).
+#[derive(Copy, Clone, Debug)]
+pub struct HyparbEvmMetricIds {
+    /// In [`crate::evm_testnet::SHADOW_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()],
+    /// In [`crate::evm_testnet::SHADOW_GAUGE_NAMES`] order.
+    pub gauges: [core_metrics::GaugeId; crate::evm_testnet::SHADOW_GAUGE_NAMES.len()],
+}
+
+/// Register the shadow family: 18 counters, 4 gauges. UNCONDITIONAL — a
+/// paper boot exposes the rows at zero.
+fn register_hyparb_evm_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HyparbEvmMetricIds, &'static str> {
+    use crate::evm_testnet::{SHADOW_COUNTER_NAMES, SHADOW_GAUGE_NAMES};
+    let mut counters = [core_metrics::CounterId::default(); SHADOW_COUNTER_NAMES.len()];
+    let mut i = 0usize;
+    while i < SHADOW_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(SHADOW_COUNTER_NAMES[i])
+            .map_err(|_| "register hyparb evm counter")?;
+        i += 1;
+    }
+    let mut gauges = [core_metrics::GaugeId::default(); SHADOW_GAUGE_NAMES.len()];
+    let mut g = 0usize;
+    while g < SHADOW_GAUGE_NAMES.len() {
+        gauges[g] = reg
+            .register_gauge(SHADOW_GAUGE_NAMES[g])
+            .map_err(|_| "register hyparb evm gauge")?;
+        g += 1;
+    }
+    Ok(HyparbEvmMetricIds { counters, gauges })
+}
+
+/// Mirror the shadow's status (counters as deltas, gauges as levels).
+/// No shadow ⇒ nothing moves.
+fn mirror_hyparb_evm_metrics(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HyparbEvmMetricIds,
+    status: Option<&crate::evm_testnet::ShadowStatus>,
+    last: &mut [u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()],
+) {
+    let Some(st) = status else { return };
+    let mut i = 0usize;
+    while i < last.len() {
+        let now = st.counter(i);
+        reg.counter(ids.counters[i])
+            .inc(now.saturating_sub(last[i]));
+        last[i] = now;
+        i += 1;
+    }
+    let mut g = 0usize;
+    while g < ids.gauges.len() {
+        reg.gauge(ids.gauges[g])
+            .set(i64::try_from(st.gauge(g)).unwrap_or(i64::MAX));
+        g += 1;
+    }
 }
 
 /// Register the hyparb family: 27 counters, 3 + 4×5 + 4×3 = 35 gauges.
@@ -7230,6 +7298,9 @@ where
     // could carry across a restart that the next roll does not rebind.
     let mut bin15_last = strategy_core::Bin15Counters::default();
     let mut hyparb_last = strategy_core::HyparbCounters::default();
+    // HYPARB H8: the testnet shadow's tap, owned by this thread from here.
+    let mut hyparb_shadow = obs.hyparb_shadow.take();
+    let mut hyparb_evm_last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
     let mut xsd_state_buf = String::new();
@@ -7344,6 +7415,12 @@ where
             // were hoisted out of that gate deliberately; these belong
             // beside them.
             flush_member_state!();
+            // HYPARB H8: hand the period's AMM decisions to the testnet
+            // shadow (a ring push each; nothing blocks, nothing is sent
+            // from this thread).
+            if let Some(tap) = hyparb_shadow.as_mut() {
+                tap.drain(eng.strategy());
+            }
 
             let ticks = eng.ticks_dispatched;
             let signals = eng.signals_dispatched;
@@ -7407,6 +7484,14 @@ where
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
                 mirror_hyparb_metrics(reg, &ids.hyparb, eng.strategy(), &mut hyparb_last);
+                mirror_hyparb_evm_metrics(
+                    reg,
+                    &ids.hyparb_evm,
+                    hyparb_shadow
+                        .as_ref()
+                        .map(crate::evm_testnet::ShadowTap::status),
+                    &mut hyparb_evm_last,
+                );
                 // X1: what the paper matcher did. `ioc_canceled` is the
                 // F7 counter — a mid-priced IoC on a real spread never
                 // fills, and the member used to call that a position.
@@ -9913,6 +9998,40 @@ mod tests {
             );
             assert!(seen.insert(n), "duplicate {n}");
         }
+    }
+
+    /// HYPARB H8: the shadow family's size is pinned too, and its mirror
+    /// publishes deltas and levels — and nothing at all with no shadow.
+    #[test]
+    fn the_hyparb_evm_family_is_18_counters_and_4_gauges_and_mirrors_deltas() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_hyparb_evm_metrics(&mut reg).expect("register");
+        assert_eq!(reg.counters_len() - c0, 18);
+        assert_eq!(reg.gauges_len() - g0, 4);
+        assert!(
+            register_hyparb_evm_metrics(&mut reg).is_err(),
+            "names are unique"
+        );
+        let mut last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
+        mirror_hyparb_evm_metrics(&reg, &ids, None, &mut last);
+        assert_eq!(
+            reg.counter(ids.counters[0]).get(),
+            0,
+            "no shadow: nothing moves"
+        );
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let st = crate::evm_testnet::ShadowStatus {
+            counters: std::array::from_fn(|_| AtomicU64::new(0)),
+            gauges: std::array::from_fn(|_| AtomicU64::new(0)),
+        };
+        st.counters[5].store(3, Ordering::Relaxed);
+        st.gauges[3].store(65_000_000, Ordering::Relaxed);
+        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), &mut last);
+        st.counters[5].store(5, Ordering::Relaxed);
+        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), &mut last);
+        assert_eq!(reg.counter(ids.counters[5]).get(), 5, "3 then +2");
+        assert_eq!(reg.gauge(ids.gauges[3]).get(), 65_000_000);
     }
 
     /// The hyparb mirror publishes counter DELTAS in name order (the
