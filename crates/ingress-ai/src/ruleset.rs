@@ -268,10 +268,12 @@ impl DescriptorTable {
 /// * `binance-opt:*` → OPT|PRICE (eapi tickers carry BBO).
 /// * `deribit:`/`okx:` names ending `-C`/`-P` → OPT|PRICE.
 /// * `deribit:*-PERPETUAL`, `okx:*-SWAP`, `binance-usdm:*`,
-///   `bybit-linear:*`, `hyperliquid:<coin>` (no `#` prefix) →
-///   PRICE|FUNDING (+DEPTH on okx/deribit).
+///   `bybit-linear:*`, `mexc-perp:*` (MX2 — funding on every MEXC
+///   contract, TradFi included), `hyperliquid:<coin>` (no `#` prefix)
+///   → PRICE|FUNDING (+DEPTH on okx/deribit).
 /// * everything else (PM tokens, spot, dated futures, `#` outcome
-///   coins) → PRICE (+DEPTH on okx/deribit non-options).
+///   coins, `mexc:*` spot incl. xStocks) → PRICE (+DEPTH on
+///   okx/deribit non-options).
 pub fn caps_of_descriptor(desc: &str) -> u8 {
     let (venue, name) = match desc.split_once(':') {
         Some((v, n)) => (v, n),
@@ -300,6 +302,7 @@ pub fn caps_of_descriptor(desc: &str) -> u8 {
         }
         "binance-usdm" => CAP_PRICE | CAP_FUNDING,
         "bybit-linear" => CAP_PRICE | CAP_FUNDING,
+        "mexc-perp" => CAP_PRICE | CAP_FUNDING,
         "hyperliquid" => {
             if name.starts_with('#') {
                 CAP_PRICE
@@ -3469,7 +3472,7 @@ mod v2_grammar_tests {
         const F: u8 = CAP_FUNDING;
         const D: u8 = CAP_DEPTH;
         const O: u8 = CAP_OPT;
-        let law: [(&str, u8); 14] = [
+        let law: [(&str, u8); 17] = [
             ("123456789", P), // bare PM token id
             ("binance:btcusdt", P),
             ("binance-usdm:btcusdt", P | F),
@@ -3484,6 +3487,9 @@ mod v2_grammar_tests {
             ("hyperliquid:#NVDA", P),
             ("bybit:BTCUSDT", P),
             ("bybit-linear:BTCUSDT", P | F),
+            ("mexc:BTCUSDT", P),
+            ("mexc-perp:BTC_USDT", P | F),
+            ("mexc-perp:XAU_USDT", P | F),
         ];
         let mut i = 0;
         while i < law.len() {

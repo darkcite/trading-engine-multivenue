@@ -26,6 +26,7 @@ core-crypto        = { path = "../crates/core-crypto" }
 ingress-polymarket = { path = "../crates/ingress-polymarket" }
 ingress-binance    = { path = "../crates/ingress-binance" }
 ingress-bybit      = { path = "../crates/ingress-bybit" }
+ingress-mexc       = { path = "../crates/ingress-mexc" }
 ingress-rpc        = { path = "../crates/ingress-rpc" }
 ingress-okx        = { path = "../crates/ingress-okx" }
 book-builder    = { path = "../crates/book-builder" }
@@ -314,6 +315,27 @@ bench  = false
 [[bin]]
 name   = "hl_user_events"
 path   = "fuzz_targets/hl_user_events.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "pb_scan"
+path   = "fuzz_targets/pb_scan.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "mexc_ws_frame"
+path   = "fuzz_targets/mexc_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "mexc_instruments"
+path   = "fuzz_targets/mexc_instruments.rs"
 test   = false
 doc    = false
 bench  = false

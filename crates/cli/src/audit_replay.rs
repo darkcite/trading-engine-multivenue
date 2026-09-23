@@ -36,8 +36,10 @@ use core_types::{AiCmd, AiCmdKind, ChannelEvent, ChannelId, Signal, Tick};
 use ingress_ai::AI_CMDS_FILE;
 
 /// Venue labels in capture-file order (`<label>-ticks.pmlr`, …).
-/// Mirrors the cli spawn labels exactly (`bybit` appended at WS9).
-const VENUE_LABELS: [&str; 7] = ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit"];
+/// Mirrors the cli spawn labels exactly (`bybit` appended at WS9,
+/// `mexc` at MX2 — MEXC carries `venue_seq` but no §6.2 chain law
+/// (Q-MX1): it emits no `TradeGap`/`BookGap`, so no derivation arm).
+const VENUE_LABELS: [&str; 8] = ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc"];
 
 /// Inter-arrival histogram bucket upper bounds (ns, exclusive). The
 /// last bucket is open-ended. Bounds chosen so every §6.2 cadence band

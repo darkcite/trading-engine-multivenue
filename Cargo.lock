@@ -149,6 +149,7 @@ dependencies = [
  "ingress-binance",
  "ingress-deribit",
  "ingress-hyperliquid",
+ "ingress-mexc",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
@@ -338,6 +339,7 @@ dependencies = [
  "ingress-bybit",
  "ingress-deribit",
  "ingress-hyperliquid",
+ "ingress-mexc",
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
@@ -952,6 +954,23 @@ dependencies = [
 
 [[package]]
 name = "ingress-hyperliquid"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-mexc"
 version = "0.1.0"
 dependencies = [
  "core-metrics",

@@ -175,6 +175,59 @@ fn short_partial_day_is_gapped_and_monitor_skips() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// MX2 (the pre-existing off-by-one, plan §3 MX9.6 / R6): the per-day
+/// `venue_ticks` array covers EVERY `VENUE_LABELS` slot in label
+/// order — pm, bn, okx, rpc, deribit, hl, bybit, mexc. It used to
+/// render six fixed placeholders and silently drop bybit's count.
+#[test]
+fn per_day_venue_ticks_cover_every_label_incl_bybit_and_mexc() {
+    let root = unique_root("allvenues");
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    let epoch = D0 * NS_PER_DAY + 3_600 * G;
+    let run = root.join(format!("run-{epoch}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    write_ticks(
+        &run,
+        "pm",
+        epoch,
+        &[mk_tick(500, VenueId::Polymarket, 42, 1)],
+    );
+    write_ticks(
+        &run,
+        "bybit",
+        epoch,
+        &[
+            mk_tick(600, VenueId::Bybit, (6 << 24) | 1, 1),
+            mk_tick(700, VenueId::Bybit, (6 << 24) | 1, 2),
+        ],
+    );
+    write_ticks(
+        &run,
+        "mexc",
+        epoch,
+        &[
+            mk_tick(800, VenueId::Mexc, (7 << 24) | 1, 1),
+            mk_tick(900, VenueId::Mexc, (7 << 24) | 513, 2),
+            mk_tick(1_000, VenueId::Mexc, (7 << 24) | 513, 3),
+        ],
+    );
+
+    let out = catalog(&root);
+    assert_eq!(out.facts.ticks, 6);
+    assert!(out.facts.whole_root_backtestable);
+    assert!(
+        out.json.contains("\"venue_ticks\":[1,0,0,0,0,0,2,3]}"),
+        "{}",
+        out.json
+    );
+    assert!(out.json.contains(
+        "{\"venue\":\"mexc\",\"runs_present\":1,\"ticks\":3,"
+    ));
+    assert!(out.summary.contains(" bybit=2"), "{}", out.summary);
+    assert!(out.summary.contains(" mexc=3"), "{}", out.summary);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn harness_rejections_are_reported_per_file() {
     let root = unique_root("reject");

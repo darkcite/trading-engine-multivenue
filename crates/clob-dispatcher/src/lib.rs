@@ -1142,8 +1142,9 @@ pub struct PaperMatcher {
     out: [Fill; core_fill::MAX_OPEN_TOTAL],
     out_head: usize,
     out_len: usize,
-    /// Activation Δ by model venue byte (index 7 is unused padding so
-    /// a garbage byte cannot index out of bounds).
+    /// Activation Δ by model venue byte ([`core_fill::ACTIVATION_NS_DEFAULT`]
+    /// verbatim; a byte past its end is refused in [`Self::submit`]
+    /// before it can index anything).
     activation_ns: [u64; 8],
     seq: u64,
     /// What the matcher did.
@@ -1168,7 +1169,7 @@ impl PaperMatcher {
             out: [EMPTY_FILL; core_fill::MAX_OPEN_TOTAL],
             out_head: 0,
             out_len: 0,
-            activation_ns: [d[0], d[1], d[2], d[3], d[4], d[5], d[6], 0],
+            activation_ns: d,
             seq: 0,
             counters: MatcherCounters {
                 intake: 0,
@@ -1206,7 +1207,14 @@ impl PaperMatcher {
         let venue = core_types::symbol_venue_byte(order.sym);
         let px = order.px.raw();
         let qty = order.qty.raw();
+        // MX2 / O-MX1: MEXC (venue byte 7) is data-only — its activation
+        // slot exists because the table is venue-byte indexed, but no
+        // order on it is ever modelled, exactly as the harness's
+        // `tradeable_venue_byte` refuses it. Before MX2 the byte sat past
+        // the table's end and was refused by the length check; this
+        // keeps that behaviour bit for bit.
         if venue as usize >= core_fill::ACTIVATION_NS_DEFAULT.len()
+            || venue == core_types::VenueId::Mexc.to_u8()
             || px <= 0
             || qty <= 0
             || (order.kind != core_fill::ORDER_KIND_MAKER
@@ -1823,6 +1831,28 @@ mod tests {
         assert_eq!(m.counters.unroutable, 3);
         assert_eq!(m.open_len(), 0);
         assert_eq!(m.counters.intake, 0);
+    }
+
+    /// MX2 / O-MX1: MEXC has an activation slot but is data-only — a
+    /// MEXC order is refused as `unroutable`, never modelled.
+    #[test]
+    fn a_mexc_order_is_unroutable_data_only() {
+        let mut m = PaperMatcher::new();
+        let sym = core_types::make_symbol_id(VenueId::Mexc, 1);
+        let o = Order::new(
+            1_000,
+            VenueId::Mexc,
+            sym,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            1,
+        );
+        m.submit(&o, 1_000);
+        assert_eq!(m.counters.unroutable, 1);
+        assert_eq!(m.counters.intake, 0);
+        assert_eq!(m.open_len(), 0);
     }
 
     /// One tick's displayed size cannot fill two orders twice, and the

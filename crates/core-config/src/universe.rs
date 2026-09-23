@@ -89,6 +89,21 @@ pub const DERIBIT_COMBOS_MAX: usize = 64;
 /// are file-order from 1).
 pub const BYBIT_LINEAR_ORDINAL_BASE: u32 = 512;
 
+/// MX2/MX5 (plan §4 D9): ordinal base for `[mexc] perp` ids:
+/// `make_symbol_id(Mexc, MEXC_PERP_ORDINAL_BASE + j + 1)`; spot ids
+/// are file-order from 1. [`VENUE_LIST_MAX`] = 500 < 512 keeps the two
+/// blocks disjoint by construction (the Binance spot/usdm split,
+/// reused verbatim). Append, never reorder: `SymbolId`s are file-order
+/// ordinals, and a reordered `[mexc]` list silently re-keys history.
+pub const MEXC_PERP_ORDINAL_BASE: u32 = 512;
+
+/// MX2/MX5: cap on each `[mexc]` list (spot, perp). The venue forces
+/// the connection count, not the engine: spot rides 15 symbols per
+/// socket at the measured 30-subscription cap (2 channels/symbol),
+/// futures ~13 per socket (plan §4 D1) — 128 per list is ≤ 9 spot +
+/// ≤ 10 futures sockets.
+pub const MEXC_LIST_MAX: usize = 128;
+
 /// Default E — nearest expiries per options underlying (mvp-plan §8
 /// proposal, adopted in the M2 design entry).
 pub const OPT_EXPIRIES_DEFAULT: u32 = 2;
@@ -311,6 +326,15 @@ pub struct Universe {
     /// WS9: `[bybit] linear` — UPPERCASE linear-perp symbols in file
     /// order (own ordinal block, [`BYBIT_LINEAR_ORDINAL_BASE`]).
     pub bybit_linear: Vec<String>,
+    /// MX2/MX5: `[mexc] spot` — UPPERCASE spot symbols (`BTCUSDT`,
+    /// tokenized xStocks such as `AAPLXUSDT` are ordinary rows) in file
+    /// order.
+    pub mexc_spot: Vec<String>,
+    /// MX2/MX5: `[mexc] perp` — `BASE_QUOTE` contract symbols
+    /// (`BTC_USDT`, TradFi `XAU_USDT` / `AAPLSTOCK_USDT` are ordinary
+    /// rows) in file order (own ordinal block,
+    /// [`MEXC_PERP_ORDINAL_BASE`]).
+    pub mexc_perp: Vec<String>,
     /// `[pairs] map` — latency-arb pairs as
     /// `(pm market index, binance spot index)`, both 0-based file
     /// order. Empty = the default pair (0,0) is injected at
@@ -375,6 +399,11 @@ pub struct AllocatedUniverse {
     pub bybit_spot: Vec<Instrument>,
     /// WS9: Bybit linear-perp instruments (`bybit-linear:<sym>`).
     pub bybit_linear: Vec<Instrument>,
+    /// MX2/MX5: MEXC spot instruments (`mexc:<SYM>` descriptors).
+    pub mexc_spot: Vec<Instrument>,
+    /// MX2/MX5: MEXC perp instruments (`mexc-perp:<SYM>` — MEXC lists
+    /// no dated futures, so this prefix is always `Perp`).
+    pub mexc_perp: Vec<Instrument>,
     /// Latency-arb pairs as `(pm YES-token sym, bn spot sym)`.
     pub pairs: Vec<(SymbolId, SymbolId)>,
 }
@@ -411,6 +440,7 @@ enum Section {
     Deribit,
     Hyperliquid,
     Bybit,
+    Mexc,
     Pairs,
 }
 
@@ -439,6 +469,8 @@ enum Slot {
     HlRolling,
     BybitSpot,
     BybitLinear,
+    MexcSpot,
+    MexcPerp,
     PairsMap,
 }
 
@@ -452,6 +484,11 @@ enum ElemKind {
     BnDatedSymbol,
     /// WS9: Bybit venue symbols (`BTCUSDT` — uppercase [A-Z0-9]).
     BybitSymbol,
+    /// MX2/MX5: MEXC spot symbols (`BTCUSDT` — uppercase [A-Z0-9]).
+    MexcSpotSymbol,
+    /// MX2/MX5: MEXC contract symbols (`BTC_USDT` — uppercase
+    /// [A-Z0-9_], at least one `_`).
+    MexcPerpSymbol,
     Instrument,
     HlCoin,
     /// BIN15 O2: a rolling-family key, `<out|native>:<COIN>:<15m|1d>`.
@@ -495,6 +532,8 @@ struct Builder {
     hl_rolling: Option<Vec<String>>,
     bybit_spot: Option<Vec<String>>,
     bybit_linear: Option<Vec<String>>,
+    mexc_spot: Option<Vec<String>>,
+    mexc_perp: Option<Vec<String>>,
     pairs_map: Option<Vec<String>>,
 }
 
@@ -536,6 +575,7 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 "deribit" => Section::Deribit,
                 "hyperliquid" => Section::Hyperliquid,
                 "bybit" => Section::Bybit,
+                "mexc" => Section::Mexc,
                 "pairs" => Section::Pairs,
                 other => {
                     return Err(err(line_no, format!("unknown section `[{other}]`")));
@@ -655,6 +695,8 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Hyperliquid, "rolling") => Some(Slot::HlRolling),
         (Section::Bybit, "spot") => Some(Slot::BybitSpot),
         (Section::Bybit, "linear") => Some(Slot::BybitLinear),
+        (Section::Mexc, "spot") => Some(Slot::MexcSpot),
+        (Section::Mexc, "perp") => Some(Slot::MexcPerp),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
         _ => None,
     }
@@ -673,6 +715,8 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
         Slot::BnUsdmDated => ElemKind::BnDatedSymbol,
         Slot::BybitSpot | Slot::BybitLinear => ElemKind::BybitSymbol,
+        Slot::MexcSpot => ElemKind::MexcSpotSymbol,
+        Slot::MexcPerp => ElemKind::MexcPerpSymbol,
         Slot::OkxInstr | Slot::DeribitInstr | Slot::DeribitCombos => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
         Slot::HlRolling => ElemKind::HlRolling,
@@ -793,6 +837,8 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::BnSymbol => validate_bn_symbol(s, line_no),
         ElemKind::BnDatedSymbol => validate_bn_dated_symbol(s, line_no),
         ElemKind::BybitSymbol => validate_bybit_symbol(s, line_no),
+        ElemKind::MexcSpotSymbol => validate_mexc_spot_symbol(s, line_no),
+        ElemKind::MexcPerpSymbol => validate_mexc_perp_symbol(s, line_no),
         ElemKind::Instrument => validate_name(s, INSTRUMENT_LEN_MAX, "instrument", line_no),
         ElemKind::HlCoin => validate_name(s, HL_COIN_LEN_MAX, "coin", line_no),
         ElemKind::HlRolling => validate_hl_rolling(s, line_no),
@@ -876,6 +922,47 @@ fn validate_bybit_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
         Err(err(
             line_no,
             format!("bad Bybit symbol `{s}` (want UPPERCASE [A-Z0-9], 1..={BN_SYMBOL_LEN_MAX})"),
+        ))
+    }
+}
+
+/// MX2/MX5: MEXC spot symbols are UPPERCASE `[A-Z0-9]`, no separator
+/// (`BTCUSDT`, xStocks `AAPLXUSDT`) — the venue's `exchangeInfo` and
+/// the PB channel suffix carry them verbatim.
+fn validate_mexc_spot_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= BN_SYMBOL_LEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!("bad MEXC spot symbol `{s}` (want UPPERCASE [A-Z0-9], 1..={BN_SYMBOL_LEN_MAX})"),
+        ))
+    }
+}
+
+/// MX2/MX5: MEXC contract symbols are `BASE_QUOTE` — UPPERCASE
+/// `[A-Z0-9_]` with at least one `_` (`BTC_USDT`, `XAU_USDT`,
+/// `AAPLSTOCK_USDT`). The underscore is REQUIRED: a separator-less
+/// name here is almost certainly a misfiled `spot` entry.
+fn validate_mexc_perp_symbol(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= BN_SYMBOL_LEN_MAX
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && s.contains('_');
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!(
+                "bad MEXC perp symbol `{s}` (want UPPERCASE [A-Z0-9_] with a `_`, \
+                 1..={BN_SYMBOL_LEN_MAX})"
+            ),
         ))
     }
 }
@@ -1061,6 +1148,16 @@ fn store_array(
                 return Err(dup("linear"));
             }
         }
+        Slot::MexcSpot => {
+            if b.mexc_spot.replace(items).is_some() {
+                return Err(dup("spot"));
+            }
+        }
+        Slot::MexcPerp => {
+            if b.mexc_perp.replace(items).is_some() {
+                return Err(dup("perp"));
+            }
+        }
         Slot::PairsMap => {
             if b.pairs_map.replace(items).is_some() {
                 return Err(dup("map"));
@@ -1199,6 +1296,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let hl_rolling = b.hl_rolling.unwrap_or_default();
     let bybit_spot = b.bybit_spot.unwrap_or_default();
     let bybit_linear = b.bybit_linear.unwrap_or_default();
+    let mexc_spot = b.mexc_spot.unwrap_or_default();
+    let mexc_perp = b.mexc_perp.unwrap_or_default();
 
     // Caps.
     check_cap(pm_markets.len(), PM_MARKETS_MAX, "PM markets")?;
@@ -1226,6 +1325,10 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // list max (crates/ingress-bybit BYBIT_MAX_SYMBOLS = 64).
     check_cap(bybit_spot.len(), 64, "Bybit spot symbols")?;
     check_cap(bybit_linear.len(), 64, "Bybit linear symbols")?;
+    // MX2/MX5: see [`MEXC_LIST_MAX`] (spot 15 symbols/socket at the
+    // measured 30-sub cap, futures ~13/socket — plan §4 D1).
+    check_cap(mexc_spot.len(), MEXC_LIST_MAX, "MEXC spot symbols")?;
+    check_cap(mexc_perp.len(), MEXC_LIST_MAX, "MEXC perp symbols")?;
 
     // Within-list duplicates (a duplicate = double subscribe + two
     // ids for one stream — always a config mistake).
@@ -1260,6 +1363,10 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&hl_rolling, "Hyperliquid rolling family")?;
     check_unique(&bybit_spot, "Bybit spot symbol")?;
     check_unique(&bybit_linear, "Bybit linear symbol")?;
+    check_unique(&mexc_spot, "MEXC spot symbol")?;
+    check_unique(&mexc_perp, "MEXC perp symbol")?;
+    // MX2: `spot` and `perp` cannot overlap BY ALPHABET — spot rejects
+    // `_`, perp requires one — so no cross-list check is needed.
     // WS5 note: `usdm` and `usdm_dated` cannot overlap BY ALPHABET —
     // plain usdm symbols reject `_`, dated symbols require exactly
     // one — so no cross-list check is needed here.
@@ -1330,6 +1437,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         hl_rolling,
         bybit_spot,
         bybit_linear,
+        mexc_spot,
+        mexc_perp,
         pairs,
     })
 }
@@ -1556,6 +1665,25 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // MX2/MX5 (plan §4 D9): MEXC — spot from ordinal 1, perp from its
+    // own block (venue byte 7). `mexc-perp:` is always Perp: MEXC lists
+    // no dated futures.
+    for i in 0..u.mexc_spot.len() {
+        let name = u.mexc_spot[i].clone();
+        out.mexc_spot.push(Instrument {
+            sym: make_symbol_id(VenueId::Mexc, i as u32 + 1),
+            descriptor: format!("mexc:{name}"),
+            name,
+        });
+    }
+    for j in 0..u.mexc_perp.len() {
+        let name = u.mexc_perp[j].clone();
+        out.mexc_perp.push(Instrument {
+            sym: make_symbol_id(VenueId::Mexc, MEXC_PERP_ORDINAL_BASE + j as u32 + 1),
+            descriptor: format!("mexc-perp:{name}"),
+            name,
+        });
+    }
 
     // Universe-wide duplicate-id check (fail fast, name both sides).
     let mut all: Vec<(SymbolId, &str)> = Vec::new();
@@ -1572,6 +1700,8 @@ pub fn allocate_with_anchors(
         &out.hl,
         &out.bybit_spot,
         &out.bybit_linear,
+        &out.mexc_spot,
+        &out.mexc_perp,
     ] {
         for inst in group {
             all.push((inst.sym, inst.descriptor.as_str()));
@@ -1854,6 +1984,94 @@ map = ["0:0", "1:1"]
         // Unknown key law holds for the new section.
         let unk = "[bybit]\nusdm=[\"BTCUSDT\"]\n";
         assert!(parse(unk).unwrap_err().msg.contains("unknown key"));
+    }
+
+    #[test]
+    fn mexc_section_parses_allocates_and_validates() {
+        // MX2/MX5: the seventh venue's grammar + the venue-byte-7
+        // blocks. xStocks and TradFi perps are ordinary rows.
+        let src = "[binance]\nspot=[\"btcusdt\"]\n[mexc]\nspot=[\"BTCUSDT\",\"AAPLXUSDT\"]\n\
+                   perp=[\"BTC_USDT\",\"XAU_USDT\",\"AAPLSTOCK_USDT\"]\n";
+        let u = parse(src).unwrap();
+        assert_eq!(u.mexc_spot, vec!["BTCUSDT", "AAPLXUSDT"]);
+        assert_eq!(u.mexc_perp, vec!["BTC_USDT", "XAU_USDT", "AAPLSTOCK_USDT"]);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.mexc_spot[0].sym, make_symbol_id(VenueId::Mexc, 1));
+        assert_eq!(a.mexc_spot[0].descriptor, "mexc:BTCUSDT");
+        assert_eq!(a.mexc_spot[1].sym, make_symbol_id(VenueId::Mexc, 2));
+        assert_eq!(a.mexc_spot[1].descriptor, "mexc:AAPLXUSDT");
+        assert_eq!(
+            a.mexc_perp[0].sym,
+            make_symbol_id(VenueId::Mexc, MEXC_PERP_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.mexc_perp[0].descriptor, "mexc-perp:BTC_USDT");
+        assert_eq!(a.mexc_perp[2].name, "AAPLSTOCK_USDT");
+        assert_eq!(
+            a.mexc_perp[2].sym,
+            make_symbol_id(VenueId::Mexc, MEXC_PERP_ORDINAL_BASE + 3)
+        );
+        // Venue namespacing: MEXC `BTCUSDT` never collides with
+        // Bybit's or Binance's (plan §6 R9).
+        let both = "[bybit]\nspot=[\"BTCUSDT\"]\n[mexc]\nspot=[\"BTCUSDT\"]\n";
+        let a2 = allocate(&parse(both).unwrap()).unwrap();
+        assert_ne!(a2.bybit_spot[0].sym, a2.mexc_spot[0].sym);
+        // Lowercase rejects on both keys (the venue takes the wire form).
+        let bad = "[mexc]\nspot=[\"btcusdt\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC spot symbol"));
+        let bad = "[mexc]\nperp=[\"btc_usdt\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC perp symbol"));
+        // Spot rejects the separator; perp REQUIRES one (a misfiled
+        // spot row is caught by alphabet, so the lists cannot overlap).
+        let bad = "[mexc]\nspot=[\"BTC_USDT\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC spot symbol"));
+        let bad = "[mexc]\nperp=[\"BTCUSDT\"]\n";
+        assert!(parse(bad).unwrap_err().msg.contains("bad MEXC perp symbol"));
+        // Unknown key law holds for the new section (`linear` is Bybit's).
+        let unk = "[mexc]\nlinear=[\"BTC_USDT\"]\n";
+        assert!(parse(unk).unwrap_err().msg.contains("unknown key"));
+        // Duplicate key is fatal, per key.
+        let dup = "[mexc]\nspot=[\"BTCUSDT\"]\nspot=[\"ETHUSDT\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate key `spot`"));
+        let dup = "[mexc]\nperp=[\"BTC_USDT\"]\nperp=[\"ETH_USDT\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate key `perp`"));
+        // Duplicate symbol within a list is fatal.
+        let dup = "[mexc]\nperp=[\"BTC_USDT\",\"BTC_USDT\"]\n";
+        assert!(parse(dup).unwrap_err().msg.contains("duplicate MEXC perp symbol"));
+        // An empty section is the pre-MX2 universe, bit for bit.
+        let empty = parse("[mexc]\nspot = []\nperp = []\n").unwrap();
+        assert_eq!(empty, Universe::default());
+        assert_eq!(allocate(&empty).unwrap(), AllocatedUniverse::default());
+    }
+
+    #[test]
+    fn mexc_lists_cap_at_128_and_blocks_stay_disjoint() {
+        let mut spot = String::from("[mexc]\nspot=[");
+        let mut perp = String::from("perp=[");
+        for i in 0..MEXC_LIST_MAX {
+            if i > 0 {
+                spot.push(',');
+                perp.push(',');
+            }
+            spot.push_str(&format!("\"S{i}USDT\""));
+            perp.push_str(&format!("\"P{i}_USDT\""));
+        }
+        let at_cap = format!("{spot}]\n{perp}]\n");
+        let a = allocate(&parse(&at_cap).expect("at cap parses")).unwrap();
+        // The last spot ordinal stays below the perp block's first.
+        assert!(a.mexc_spot[MEXC_LIST_MAX - 1].sym < a.mexc_perp[0].sym);
+        assert_eq!(
+            a.mexc_spot[MEXC_LIST_MAX - 1].sym,
+            make_symbol_id(VenueId::Mexc, MEXC_LIST_MAX as u32)
+        );
+        let over_spot = format!("{spot},\"EXTRAUSDT\"]\n");
+        let e = parse(&over_spot).unwrap_err();
+        assert!(e.msg.contains("too many MEXC spot symbols"), "{e}");
+        let over_perp = format!("[mexc]\n{perp},\"EXTRA_USDT\"]\n");
+        let e = parse(&over_perp).unwrap_err();
+        assert!(e.msg.contains("too many MEXC perp symbols"), "{e}");
+        // The D9 law: any list is ≤ VENUE_LIST_MAX < the perp base.
+        const { assert!(VENUE_LIST_MAX < MEXC_PERP_ORDINAL_BASE as usize) };
+        const { assert!(MEXC_LIST_MAX <= VENUE_LIST_MAX) };
     }
 
     #[test]

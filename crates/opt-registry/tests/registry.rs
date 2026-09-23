@@ -108,7 +108,8 @@ fn another_venues_identical_ordinal_does_not_resolve() {
     }
     for row in &chain {
         let ord = symbol_ordinal(row.sym);
-        for v in [VenueId::Okx, VenueId::Binance, VenueId::Bybit] {
+        // MX2: MEXC's perp block also starts at ordinal 512.
+        for v in [VenueId::Okx, VenueId::Binance, VenueId::Bybit, VenueId::Mexc] {
             let foreign = make_symbol_id(v, ord);
             assert!(
                 r.get(foreign).is_none(),

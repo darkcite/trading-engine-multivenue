@@ -115,7 +115,9 @@ fn render_frame(f: &mut ratatui::Frame<'_>, s: &EngineSnapshot) {
             Constraint::Length(7),  // header
             Constraint::Length(11), // strategies + recent orders
             Constraint::Min(6),     // ruleset rows
-            Constraint::Length(10), // latency + ingress
+            // latency + ingress: two borders + the header + one row per
+            // venue — derived, so MX2's eighth row (mexc) is not clipped.
+            Constraint::Length(VENUE_NAMES.len() as u16 + 3),
         ])
         .split(size);
 

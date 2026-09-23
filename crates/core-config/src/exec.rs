@@ -103,7 +103,12 @@ const SLOT_KEYS: [&str; 15] = [
 /// `--fee-bps` labels (`pm` / `bn` / `hl`): an operator editing an
 /// execution artifact is editing the same vocabulary they use to add
 /// an instrument, and ONE spelling per concept is the grammar law.
-const VENUE_NAMES: [(&str, u8); 7] = [
+///
+/// MX2 (plan §4 D10): `mexc` is RESERVED so an artifact can NAME the
+/// venue — naming arms nothing. MEXC is data-only (O-MX1): no
+/// `ExecMode` arm, no dispatcher, no fill lane; arming it needs its
+/// own plan, E-law record and operator ruling.
+const VENUE_NAMES: [(&str, u8); 8] = [
     ("polymarket", 0),
     ("binance", 1),
     ("okx", 2),
@@ -111,6 +116,7 @@ const VENUE_NAMES: [(&str, u8); 7] = [
     ("hyperliquid", 4),
     ("ai", 5),
     ("bybit", 6),
+    ("mexc", 7),
 ];
 
 /// Resolve a venue spelling to its `VenueId` byte.
@@ -399,7 +405,7 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
                 let id = venue_id_from_name(name).ok_or_else(|| {
                     err(format!(
                         "line {ln}: unknown venue `{name}` \
-                         (known: polymarket, binance, okx, deribit, hyperliquid, ai, bybit)"
+                         (known: polymarket, binance, okx, deribit, hyperliquid, ai, bybit, mexc)"
                     ))
                 })?;
                 if venues.contains(&id) {
@@ -880,7 +886,7 @@ mode = "paper"
         );
         expect_err(
             "[exec]\n[exec.slot.3]\nmode = \"live\"\nvenues = [\"hl\"]\n",
-            "known: polymarket, binance, okx, deribit, hyperliquid, ai, bybit",
+            "known: polymarket, binance, okx, deribit, hyperliquid, ai, bybit, mexc",
         );
     }
 
@@ -960,7 +966,14 @@ mode = "paper"
             assert_eq!(venue_name_from_id(id), Some(name));
         }
         assert_eq!(venue_id_from_name("nope"), None);
-        assert_eq!(venue_name_from_id(7), None);
+        // MX2: `mexc` is byte 7; the first unassigned byte is now 8.
+        assert_eq!(venue_id_from_name("mexc"), Some(7));
+        assert_eq!(venue_name_from_id(7), Some("mexc"));
+        assert_eq!(venue_name_from_id(8), None);
+        // Every name is the byte `core_types::VenueId` decodes it to.
+        for (_, id) in VENUE_NAMES {
+            assert!(core_types::VenueId::from_u8(id).is_some(), "byte {id}");
+        }
     }
 
     #[test]

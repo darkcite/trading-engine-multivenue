@@ -30,6 +30,8 @@ ingress-polymarket   = { workspace = true }
 ingress-binance      = { workspace = true }
 ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
+# MX8: the MEXC spot-PB + futures-JSON parsers and run loop.
+ingress-mexc         = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 core-net             = { workspace = true }

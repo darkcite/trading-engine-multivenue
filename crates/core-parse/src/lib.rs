@@ -27,6 +27,13 @@
 /// Position type — byte offset into a `&[u8]` slice.
 pub type Pos = usize;
 
+pub mod pb;
+
+pub use pb::{
+    scan_pb_field, scan_pb_len, scan_pb_tag, scan_varint, PbField, PB_FIELD_NO_MAX,
+    PB_VARINT_MAX_LEN, PB_WT_I32, PB_WT_I64, PB_WT_LEN, PB_WT_VARINT,
+};
+
 // ---------------------------------------------------------------
 // Integer parsing
 // ---------------------------------------------------------------

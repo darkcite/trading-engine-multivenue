@@ -68,6 +68,7 @@ use ingress_binance::run_loop as bwl;
 use ingress_bybit::run_loop as ywl;
 use ingress_deribit::run_loop as dwl;
 use ingress_hyperliquid::run_loop as hwl;
+use ingress_mexc::run_loop as mxl;
 use ingress_okx::run_loop as owl;
 use ingress_polymarket::run_loop as pwl;
 use ingress_rpc::run_loop as rwl;
@@ -156,6 +157,16 @@ const HL_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
 const BYBIT_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 15_000_000_000,
     idle_timeout_ns: 30_000_000_000,
+};
+/// MX6: MEXC spot reaps a connection idle 60 s with a live
+/// subscription and futures after ~1 min without a ping (plan §1.1
+/// / §1.2, venue-documented). Both classes get their class-literal
+/// probe (`{"method":"PING"}` / `{"method":"ping"}`) at 15 s; the
+/// answer is inbound activity, so anything quieter than 40 s is a
+/// dead session.
+const MEXC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 15_000_000_000,
+    idle_timeout_ns: 40_000_000_000,
 };
 /// Polygon RPC: newHeads every ~2 s + our own 2 s poll → anything
 /// quieter than 30 s is a dead session.
@@ -515,15 +526,18 @@ const _: () = {
     assert!(owl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(dwl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(hwl::TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(ywl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(mxl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
 /// All preallocated rings the engine + cli touch.
 pub struct Rings {
-    /// One tick ring per venue lane, indexed by `VenueId as usize`
+    /// One tick ring per venue lane, indexed by `engine::tick_lane_of`
     /// (0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
-    /// 4 = Hyperliquid). Lanes without a spawned ingress simply
-    /// never see a producer push — the engine drains them empty.
+    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC). Lanes without a spawned
+    /// ingress simply never see a producer push — the engine drains
+    /// them empty.
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
     /// Signal ring for Polygon newHeads — feeds the engine.
     pub rpc_signal: Arc<Ring<Signal, SIGNAL_RING_SIZE>>,
@@ -573,12 +587,14 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
+                Ring::new(),
             ],
             rpc_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
             event: [
+                Ring::new(),
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
@@ -620,6 +636,10 @@ pub struct IngressStatusSet {
     pub bybit: Arc<IngressStatus>,
     /// Polygon RPC WSS thread.
     pub rpc: Arc<IngressStatus>,
+    /// MX2: MEXC WSS thread (spot PB + futures JSON conns, one thread).
+    /// Never spawned before MX6 — stays Down (the unspawned-venue
+    /// shape), and stays Down after it when `[mexc]` is empty.
+    pub mexc: Arc<IngressStatus>,
     /// BIN15 O2: the Hyperliquid ROLL counters. Venue-specific, so
     /// they could not live in the size-locked generic
     /// [`IngressStatus`] slot; they ride here so the metrics
@@ -628,7 +648,7 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all seven slots + the HL roll counters (boot only).
+    /// Allocate all eight slots + the HL roll counters (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -638,6 +658,7 @@ impl IngressStatusSet {
             hyperliquid: Arc::new(IngressStatus::new()),
             bybit: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
+            mexc: Arc::new(IngressStatus::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
         }
     }
@@ -1170,6 +1191,145 @@ pub fn spawn_bybit(
                 io_kind = core_metrics::io_kind_name(err.io_kind),
                 venue_code = err.venue_code as i32,
                 "bybit: multi run-loop returned"
+            );
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    ))
+}
+
+/// MX6: one resolved MEXC connection spec for [`spawn_mexc`] — one
+/// class (spot protobuf / futures JSON) on one socket, with its own
+/// symbol table chunked to the class's measured per-socket cap
+/// ([`ingress_mexc::MexcClass::symbols_per_conn`], plan §4 D1).
+pub struct MexcConnSpec {
+    /// Connection class — selects parser, subscribe, ping, acks.
+    pub class: ingress_mexc::MexcClass,
+    /// WS host (`MEXC_WS_HOST` for spot, `MEXC_FUT_WS_HOST` for
+    /// futures).
+    pub host: String,
+    /// WS path (`/ws` spot, `/edge` futures).
+    pub path: String,
+    /// This connection's `SYMBOL → SymbolId` table.
+    pub table: ingress_mexc::MexcSymbolTable,
+    /// Futures only (ruling Q-MX3): `(sym, nextSettleTime ms,
+    /// collectCycle h)` from the boot REST `funding_rate/{SYM}` calls;
+    /// empty on spot.
+    pub funding_seeds: Vec<(SymbolId, u64, u32)>,
+}
+
+/// MX6: spawn the MEXC ingress thread — N single-class connections
+/// (spot PB + futures JSON, on two different hosts) on ONE thread, ONE
+/// tick producer, ONE event producer (single-writer law), one
+/// `"mexc"` capture. `ingress_mexc::run_multi` owns the in-thread
+/// reconnect pacing + the WS2 establishment budget; the bybit shape
+/// otherwise (see [`spawn_bybit`]).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_mexc(
+    specs: Vec<MexcConnSpec>,
+    tls_config: RustlsConfig,
+    stale_after_ms: u32,
+    mut producer: Producer<Tick, TICK_RING_SIZE>,
+    mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "mexc", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "mexc", VenueId::Mexc.to_u8())?;
+    }
+    Ok(spawn_or_die(
+        thread::Builder::new().name(format!("ingress-mexc-x{}", specs.len())),
+        "ingress-mexc",
+        move || {
+            log_pin_outcome("mexc", core_id);
+            let mut eps: Vec<WssEndpoint> = Vec::with_capacity(specs.len());
+            let mut names: Vec<ServerName> = Vec::with_capacity(specs.len());
+            for spec in &specs {
+                let ep = match WssEndpoint::resolve(&spec.host, 443, &spec.path) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!(error = ?e, host = %spec.host, "mexc: DNS failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                let name = match TlsTransport::server_name_from_host(&ep.host) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "mexc: bad server name");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                eps.push(ep);
+                names.push(name);
+            }
+            let (mut poll, mut events, _token) = match new_poll() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, "mexc: mio init failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut conns: Vec<mxl::MexcConn<TlsTransport>> = Vec::with_capacity(specs.len());
+            for (i, spec) in specs.into_iter().enumerate() {
+                let mut drv =
+                    mxl::Driver::new(now_ns().wrapping_add(i as u64), spec.class, spec.table);
+                // VT2: one estimator per CONNECTION, same threshold.
+                drv.set_stale_after_ms(stale_after_ms);
+                for &(sym, next_ms, cycle_h) in &spec.funding_seeds {
+                    // The bin builds seeds only for syms it put in this
+                    // futures table — a refusal is a wiring defect.
+                    if !drv.set_funding_seed(sym, next_ms, cycle_h) {
+                        tracing::error!(sym, slot = i, "mexc: funding seed refused by its driver");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                }
+                conns.push(mxl::MexcConn::new(
+                    drv,
+                    eps[i].host.as_bytes(),
+                    eps[i].path.as_bytes(),
+                    Keepalive::new(MEXC_KEEPALIVE),
+                    Backoff::default_for_ingress(core_id as u64 + 1 + i as u64),
+                ));
+            }
+            status.set_state(IngressState::Connecting);
+            let res = mxl::run_multi(
+                &mut conns,
+                &mut producer,
+                &mut event_tx,
+                EVENT_LANE_FUNDING,
+                &mut poll,
+                &mut events,
+                &SHUTDOWN,
+                &status,
+                &mut capture,
+                |i| match connect_tls(&eps[i], &names[i], &tls_config) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, host = %eps[i].host, slot = i, "mexc: connect failed");
+                        None
+                    }
+                },
+            );
+            // T1(a): name any recorded session error on the exit line.
+            let err = status.take_last_err();
+            tracing::info!(
+                ?res,
+                err_site = core_metrics::err_site_name(err.site),
+                io_kind = core_metrics::io_kind_name(err.io_kind),
+                venue_code = err.venue_code as i32,
+                "mexc: multi run-loop returned"
             );
             capture.mirror_now();
             status.set_state(IngressState::Down);
@@ -2131,7 +2291,9 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 
 /// Build the §4.3 boot-universe snapshot for the ruleset validator:
 /// every SymbolId the boot wired into a venue ingress — the PM/BN
-/// pair flags plus each discovery-gated venue table — **sorted
+/// pair flags plus each discovery-gated venue table, plus (MX6,
+/// operator ruling Q-MX6) every MEXC instrument the boot allocated
+/// (spot + perp; Bybit stays out by its own WS9 precedent) — **sorted
 /// strict-ascending and deduped** (binary-searched per §4.2 rule-6
 /// check; `RulesetSidePath::new` debug-asserts the ordering).
 ///
@@ -2146,16 +2308,19 @@ pub fn build_ai_universe(
     okx: Option<&ingress_okx::OkxSymbolTable>,
     deribit: Option<&ingress_deribit::DeribitSymbolTable>,
     hl: Option<&ingress_hyperliquid::HlCoinTable>,
+    mexc_syms: &[SymbolId],
 ) -> Arc<[u32]> {
     let mut v: Vec<u32> = Vec::with_capacity(
         polymarket_syms.len()
             + binance_syms.len()
             + okx.map_or(0, |t| t.len())
             + deribit.map_or(0, |t| t.len())
-            + hl.map_or(0, |t| t.len()),
+            + hl.map_or(0, |t| t.len())
+            + mexc_syms.len(),
     );
     v.extend_from_slice(polymarket_syms);
     v.extend_from_slice(binance_syms);
+    v.extend_from_slice(mexc_syms);
     if let Some(t) = okx {
         let mut i = 0usize;
         while let Some((_, sym, _)) = t.get(i) {
@@ -2289,6 +2454,9 @@ pub struct RawTapConfig {
     pub hl: TapCfg,
     /// WS9: tap config for the Bybit ingress.
     pub bybit: TapCfg,
+    /// MX6: tap config for the MEXC ingress (spot PB frames are
+    /// tapped as the raw BINARY payload bytes).
+    pub mexc: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -2296,7 +2464,7 @@ pub struct RawTapConfig {
 /// absent/empty ⇒ every venue gets [`TapCfg::off`] (default: none).
 /// `raw_tap` equal (after trim) to the literal `all` enables every
 /// venue; otherwise it's a comma-separated list of venue labels
-/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`), trimmed, non-empty, no
+/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`), trimmed, non-empty, no
 /// duplicates. Every enabled venue shares the same `mode` +
 /// `budget_mb` (×1 MiB → `TapCfg::budget_bytes`). Unknown venue
 /// labels and a bad `--raw-tap-mode` value both fail fast at parse —
@@ -2325,6 +2493,7 @@ pub fn parse_raw_tap_flags(
         deribit: TapCfg::off(),
         hl: TapCfg::off(),
         bybit: TapCfg::off(),
+        mexc: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2340,10 +2509,11 @@ pub fn parse_raw_tap_flags(
         cfg.deribit = enabled_cfg;
         cfg.hl = enabled_cfg;
         cfg.bybit = enabled_cfg;
+        cfg.mexc = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 7] = [""; 7];
+    let mut seen: [&str; 8] = [""; 8];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -2364,6 +2534,7 @@ pub fn parse_raw_tap_flags(
             "deribit" => cfg.deribit = enabled_cfg,
             "hl" => cfg.hl = enabled_cfg,
             "bybit" => cfg.bybit = enabled_cfg,
+            "mexc" => cfg.mexc = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -3352,14 +3523,20 @@ impl Observability {
             let ingress_rpc_state = reg
                 .register_gauge("engine_ingress_rpc_state")
                 .map_err(|_| "register engine_ingress_rpc_state")?;
+            let ingress_mexc_state = reg
+                .register_gauge("engine_ingress_mexc_state")
+                .map_err(|_| "register engine_ingress_mexc_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
             // `last_activity` advances on the venue's own rejection
             // bytes — only "when did MARKET DATA last arrive" names a
             // dead lane. -1 = no tick since boot. Order matches the
-            // derivation loop: pm, bn, okx, deribit, hl, bybit, rpc.
-            let ingress_last_tick_age: [core_metrics::GaugeId; 7] = [
+            // derivation loop: pm, bn, okx, deribit, hl, bybit, rpc,
+            // mexc. The mexc gauge follows the unspawned-venue
+            // convention (okx/deribit/hl/bybit with an empty section) —
+            // registered, and -1 until the MEXC ingress ever ticks.
+            let ingress_last_tick_age: [core_metrics::GaugeId; SNAPSHOT_VENUES] = [
                 reg.register_gauge("engine_ingress_polymarket_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_polymarket_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_binance_last_tick_age_seconds")
@@ -3374,6 +3551,8 @@ impl Observability {
                     .map_err(|_| "register engine_ingress_bybit_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_rpc_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_rpc_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_mexc_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_mexc_last_tick_age_seconds")?,
             ];
             // T1(c) / F12: age of the newest launchd restart-lane
             // slot stamp — the restart lane failing silently for 28 h
@@ -3419,6 +3598,7 @@ impl Observability {
             let ingress_hyperliquid = register_ingress_counters(&mut reg, "hyperliquid")?;
             let ingress_bybit = register_ingress_counters(&mut reg, "bybit")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
+            let ingress_mexc = register_ingress_counters(&mut reg, "mexc")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -3434,6 +3614,7 @@ impl Observability {
             let capture_hyperliquid = register_capture_gauges(&mut reg, "hl")?;
             let capture_bybit = register_capture_gauges(&mut reg, "bybit")?;
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
+            let capture_mexc = register_capture_gauges(&mut reg, "mexc")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -3444,6 +3625,7 @@ impl Observability {
             let coverage_hyperliquid = register_coverage_gauge(&mut reg, "hl")?;
             let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
             let coverage_bybit = register_coverage_gauge(&mut reg, "bybit")?;
+            let coverage_mexc = register_coverage_gauge(&mut reg, "mexc")?;
             // M2.1/M2.2: how many capped-chain option instruments
             // this boot selected + subscribed (0 = options lane off).
             let deribit_options_selected = reg
@@ -3528,6 +3710,7 @@ impl Observability {
                 ingress_hl_families_dormant,
                 ingress_bybit_state,
                 ingress_rpc_state,
+                ingress_mexc_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -3539,6 +3722,7 @@ impl Observability {
                 ingress_hyperliquid,
                 ingress_bybit,
                 ingress_rpc,
+                ingress_mexc,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -3546,12 +3730,14 @@ impl Observability {
                 capture_hyperliquid,
                 capture_bybit,
                 capture_rpc,
+                capture_mexc,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
                 coverage_hyperliquid,
                 coverage_binance,
                 coverage_bybit,
+                coverage_mexc,
                 deribit_options_selected,
                 okx_options_selected,
                 binance_options_selected,
@@ -3584,9 +3770,9 @@ impl Observability {
 /// byte — the venue defaults (`VenueId::default_stale_after_ms`,
 /// docs/venue-time-capture-plan.md §2 doctrine 4) overridden by
 /// repeatable `--stale-after-ms <venue>:<ms>` specs (labels as the
-/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`). A zero
-/// disables the judgement for that venue (nothing is ever stale).
-pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; 7], String> {
+/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`). A
+/// zero disables the judgement for that venue (nothing is ever stale).
+pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; 8], String> {
     let mut table = VenueId::stale_after_ms_defaults();
     for spec in specs {
         let (label, ms) = spec
@@ -3625,6 +3811,7 @@ fn register_ingress_counters(
         event_ring_drops: one("event_ring_drops")?,
         depth_ring_drops: one("depth_ring_drops")?,
         stale_ticks: one("stale_ticks")?,
+        seq_regressions: one("seq_regressions")?,
         feed_delay_ema_ms: reg
             .register_gauge(&format!("engine_ingress_{venue}_feed_delay_ema_ms"))
             .map_err(|_| "register ingress gauge")?,
@@ -3812,10 +3999,13 @@ pub struct EngineCounters {
     pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
     pub ingress_rpc_state: core_metrics::GaugeId,
+    /// MX6: per-ingress state gauge, MEXC (spot PB + futures JSON).
+    pub ingress_mexc_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
-    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc.
-    pub ingress_last_tick_age: [core_metrics::GaugeId; 7],
+    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc
+    /// (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
+    pub ingress_last_tick_age: [core_metrics::GaugeId; SNAPSHOT_VENUES],
     /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
     /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
     pub restart_stamp_age: core_metrics::GaugeId,
@@ -3841,6 +4031,8 @@ pub struct EngineCounters {
     pub ingress_bybit: IngressCounterIds,
     /// §6.4 loss-accounting counters, RPC thread.
     pub ingress_rpc: IngressCounterIds,
+    /// MX6: §6.4 loss-accounting counters, MEXC thread.
+    pub ingress_mexc: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -3855,6 +4047,8 @@ pub struct EngineCounters {
     pub capture_bybit: CaptureGaugeIds,
     /// §6.5 capture-health gauges, RPC thread.
     pub capture_rpc: CaptureGaugeIds,
+    /// MX6: §6.5 capture-health gauges, MEXC thread.
+    pub capture_mexc: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -3879,6 +4073,9 @@ pub struct EngineCounters {
     /// WS9: boot-discovery coverage gauge, Bybit instruments-info
     /// audit (0 when the `[bybit]` section is empty).
     pub coverage_bybit: GaugeId,
+    /// MX6: boot-discovery coverage gauge, MEXC exchangeInfo +
+    /// contract/detail audit (0 when the `[mexc]` section is empty).
+    pub coverage_mexc: GaugeId,
     /// Phase-8f AI ingress family (`engine_ingress_ai_*` + the engine
     /// drain-site counter + heartbeat-age gauge).
     pub ingress_ai: AiIngressCounterIds,
@@ -4075,6 +4272,12 @@ pub struct IngressCounterIds {
     /// VT2: ticks the ingress judged stale
     /// (`engine_ingress_<venue>_stale_ticks_total`).
     pub stale_ticks: core_metrics::CounterId,
+    /// MX6 (ruling Q-MX1): venue sequence values seen BELOW the last
+    /// full-width value of the same symbol × stream
+    /// (`engine_ingress_<venue>_seq_regressions_total`) — the check a
+    /// venue whose streams skip versions by design gets instead of the
+    /// §6.2 chain law. 0 on every venue that never increments it.
+    pub seq_regressions: core_metrics::CounterId,
     /// VT2 gauge: the connection's smoothed feed delay
     /// (`engine_ingress_<venue>_feed_delay_ema_ms`).
     pub feed_delay_ema_ms: GaugeId,
@@ -6019,7 +6222,7 @@ pub fn state_writer(
 }
 
 /// The ingress status slots in the T1(c) / `VENUE_NAMES` order:
-/// pm, bn, okx, deribit, hl, bybit, rpc.
+/// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended).
 #[inline]
 fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
     [
@@ -6030,6 +6233,7 @@ fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
         &ing.hyperliquid,
         &ing.bybit,
         &ing.rpc,
+        &ing.mexc,
     ]
 }
 
@@ -6411,6 +6615,7 @@ struct IngressCountersSnapshot {
     event_ring_drops: u64,
     depth_ring_drops: u64,
     stale_ticks: u64,
+    seq_regressions: u64,
 }
 
 /// Mirror one ingress status slot into its registry counters as
@@ -6435,6 +6640,7 @@ fn mirror_ingress_counters(
         event_ring_drops: st.event_ring_drops_total(),
         depth_ring_drops: st.depth_ring_drops_total(),
         stale_ticks: st.stale_ticks_total(),
+        seq_regressions: st.seq_regressions_total(),
     };
     reg.counter(ids.msgs)
         .inc(cur.msgs.saturating_sub(last.msgs));
@@ -6460,6 +6666,8 @@ fn mirror_ingress_counters(
         .inc(cur.depth_ring_drops.saturating_sub(last.depth_ring_drops));
     reg.counter(ids.stale_ticks)
         .inc(cur.stale_ticks.saturating_sub(last.stale_ticks));
+    reg.counter(ids.seq_regressions)
+        .inc(cur.seq_regressions.saturating_sub(last.seq_regressions));
     reg.gauge(ids.feed_delay_ema_ms)
         .set(st.feed_delay_ema_ms() as i64);
     *last = cur;
@@ -6565,17 +6773,17 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc, deribit, hyperliquid) so registry counters
-    // get monotonic deltas. Append-only: existing indices are
+    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc) so registry
+    // counters get monotonic deltas. Append-only: existing indices are
     // load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 7];
+    let mut ingress_last = [IngressCountersSnapshot::default(); 8];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
     // `ids.ingress_last_tick_age`: pm, bn, okx, deribit, hl, bybit,
-    // rpc (NOT the ingress_last order — that array predates this and
-    // its indices are load-bearing).
-    let mut tick_age_track = [(0u64, 0u64); 7];
+    // rpc, mexc (NOT the ingress_last order — that array predates this
+    // and its indices are load-bearing).
+    let mut tick_age_track = [(0u64, 0u64); SNAPSHOT_VENUES];
     // Phase-8f AI-family delta snapshot (same bookkeeping).
     let mut ai_last = AiCountersSnapshot::default();
     // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
@@ -6827,6 +7035,8 @@ where
                     reg.gauge(ids.ingress_bybit_state)
                         .set(ing.bybit.state() as i64);
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
+                    reg.gauge(ids.ingress_mexc_state)
+                        .set(ing.mexc.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
                     // monotonic deltas (D4: ring_drops included).
@@ -6861,6 +7071,12 @@ where
                         &ids.ingress_bybit,
                         &ing.bybit,
                         &mut ingress_last[6],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_mexc,
+                        &ing.mexc,
+                        &mut ingress_last[7],
                     );
 
                     // T1(c): per-venue last-tick age from the stamps
@@ -7367,6 +7583,13 @@ pub mod boot_discovery {
         /// WS9: Bybit coverage (instruments-info audit, spot + linear
         /// pages); `None` when the `[bybit]` section is empty.
         pub bybit: Option<VenueCoverage>,
+        /// MX6: MEXC coverage (spot `exchangeInfo` + futures
+        /// `contract/detail` audit); `None` when `[mexc]` is empty.
+        pub mexc: Option<VenueCoverage>,
+        /// MX6 (ruling Q-MX3): one boot REST `funding_rate/{SYM}` seed
+        /// per LIVE configured perp, in `[mexc] perp` order — the
+        /// Funding events' `v1` clock. Empty when no perp is live.
+        pub mexc_funding: Vec<(String, ingress_mexc::discovery::MexcFundingSeed)>,
     }
 
     // -----------------------------------------------------------
@@ -8299,6 +8522,7 @@ pub mod boot_discovery {
         binance: Option<(&[String], &[String], &[String])>,
         bn_options_policy: &OptionsPolicy,
         bybit: Option<(&[String], &[String])>,
+        mexc: Option<(&[String], &[String])>,
         polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
@@ -8418,6 +8642,18 @@ pub mod boot_discovery {
             _ => None,
         };
 
+        // MX6: the MEXC audit (spot exchangeInfo + futures
+        // contract/detail, only the configured classes) + the Q-MX3
+        // funding seeds for every live configured perp.
+        let (mexc_cov, mexc_funding) = match mexc {
+            Some((spot, perp)) if !spot.is_empty() || !perp.is_empty() => {
+                let (cov, seeds) =
+                    run_mexc(cfg, tls_config, spot, perp, &mut buf, &mut any_missing)?;
+                (Some(cov), seeds)
+            }
+            _ => (None, Vec::new()),
+        };
+
         let pm = run_pm(
             cfg,
             tls_config,
@@ -8439,7 +8675,174 @@ pub mod boot_discovery {
             bn,
             bn_options,
             bybit: bybit_cov,
+            mexc: mexc_cov,
+            mexc_funding,
         })
+    }
+
+    /// MX6: the MEXC boot audit. Spot: ONE `GET /api/v3/exchangeInfo`
+    /// (the whole ~1.6 MB list — boot-only buffer, the Binance
+    /// exchangeInfo precedent; a row is live when `status == "1"` and
+    /// `permissions` carries `SPOT`). Futures: ONE `GET
+    /// /api/v1/contract/detail` (live = `state == 0` and `apiAllowed`),
+    /// then one `GET /api/v1/contract/funding_rate/{SYM}` per LIVE
+    /// configured perp, paced 110 ms (the venue's 20 req / 2 s limit),
+    /// whose `nextSettleTime` + `collectCycle` seed the Funding `v1`
+    /// clock (ruling Q-MX3). xStocks and TradFi perps are ordinary
+    /// rows — no equity branch (plan §1.3). A discovery fetch/parse
+    /// failure is fatal (the discovery contract); a SEED failure is not
+    /// (operator ruling 2026-09-23 — that perp boots with Funding
+    /// v1 = 0); a missing symbol flags `any_missing` and gets no seed.
+    fn run_mexc(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        spot: &[String],
+        perp: &[String],
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<(VenueCoverage, Vec<(String, ingress_mexc::discovery::MexcFundingSeed)>), &'static str>
+    {
+        use ingress_mexc::discovery as mxd;
+        let mut matched = 0u32;
+        let mut universe = 0u32;
+        let mut seeds = Vec::with_capacity(perp.len());
+
+        if !spot.is_empty() {
+            let (host, port) = split_host_port(&cfg.mexc_rest_host, 443)?;
+            let range = get(tls, host, port, mxd::SPOT_EXCHANGE_INFO_PATH, buf).map_err(|e| {
+                tracing::error!(venue = "mexc", class = "spot", error = ?e, "discovery: fetch failed");
+                "mexc: spot discovery fetch failed"
+            })?;
+            let mut d = mxd::MexcSpotDiscovery::new();
+            d.ingest_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "mexc", class = "spot", error = ?e, "discovery: parse failed");
+                "mexc: spot discovery parse failed"
+            })?;
+            universe += d.universe_trading();
+            for symbol in spot {
+                let reason = match d.find(symbol.as_bytes()) {
+                    Some(row) if row.trading => {
+                        matched += 1;
+                        tracing::debug!(
+                            venue = "mexc",
+                            class = "spot",
+                            symbol = symbol.as_str(),
+                            tick_size_1e9 = row.tick_size_1e9,
+                            lot_step_1e9 = row.lot_step_1e9,
+                            maker_fee_1e9 = row.maker_fee_1e9,
+                            taker_fee_1e9 = row.taker_fee_1e9,
+                            "discovery: mexc instrument resolved"
+                        );
+                        continue;
+                    }
+                    Some(_) => "not_trading",
+                    None => "not_found",
+                };
+                *any_missing = true;
+                tracing::error!(
+                    venue = "mexc",
+                    class = "spot",
+                    symbol = symbol.as_str(),
+                    reason,
+                    "discovery: configured symbol missing from venue universe"
+                );
+            }
+        }
+
+        if !perp.is_empty() {
+            let (host, port) = split_host_port(&cfg.mexc_fut_rest_host, 443)?;
+            let range = get(tls, host, port, mxd::FUT_CONTRACT_DETAIL_PATH, buf).map_err(|e| {
+                tracing::error!(venue = "mexc", class = "perp", error = ?e, "discovery: fetch failed");
+                "mexc: perp discovery fetch failed"
+            })?;
+            let mut d = mxd::MexcPerpDiscovery::new();
+            d.ingest_body(&buf[range]).map_err(|e| {
+                tracing::error!(venue = "mexc", class = "perp", error = ?e, "discovery: parse failed");
+                "mexc: perp discovery parse failed"
+            })?;
+            universe += d.universe_trading();
+            for symbol in perp {
+                let reason = match d.find(symbol.as_bytes()) {
+                    Some(row) if row.trading => {
+                        matched += 1;
+                        tracing::debug!(
+                            venue = "mexc",
+                            class = "perp",
+                            symbol = symbol.as_str(),
+                            contract_size_1e9 = row.contract_size_1e9,
+                            price_unit_1e9 = row.price_unit_1e9,
+                            vol_unit_1e9 = row.vol_unit_1e9,
+                            maker_fee_1e9 = row.maker_fee_1e9,
+                            taker_fee_1e9 = row.taker_fee_1e9,
+                            "discovery: mexc instrument resolved"
+                        );
+                        None
+                    }
+                    Some(_) => Some("not_trading"),
+                    None => Some("not_found"),
+                };
+                if let Some(reason) = reason {
+                    *any_missing = true;
+                    tracing::error!(
+                        venue = "mexc",
+                        class = "perp",
+                        symbol = symbol.as_str(),
+                        reason,
+                        "discovery: configured symbol missing from venue universe"
+                    );
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(110));
+                // Operator ruling 2026-09-23: a funding SEED is an
+                // enrichment, not the venue's instrument truth — a
+                // failed fetch/parse never refuses the (all-venue)
+                // boot. The perp boots unseeded (Funding v1 = 0 until
+                // the next restart); rates still flow and the worker's
+                // funding history lane is the authority.
+                let path = format!("{}{}", mxd::FUT_FUNDING_RATE_PATH, symbol);
+                let range = match get(tls, host, port, &path, buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(venue = "mexc", symbol = symbol.as_str(), error = ?e, "discovery: funding seed fetch failed — booting unseeded (v1 = 0)");
+                        continue;
+                    }
+                };
+                let seed = match mxd::parse_funding_rate(&buf[range]) {
+                    Ok(seed) => seed,
+                    Err(e) => {
+                        tracing::error!(venue = "mexc", symbol = symbol.as_str(), error = ?e, "discovery: funding seed parse failed — booting unseeded (v1 = 0)");
+                        continue;
+                    }
+                };
+                tracing::debug!(
+                    venue = "mexc",
+                    symbol = symbol.as_str(),
+                    next_settle_ms = seed.next_settle_ms,
+                    collect_cycle_h = seed.collect_cycle_h,
+                    rate_1e9 = seed.rate_1e9,
+                    "discovery: mexc funding seed"
+                );
+                seeds.push((symbol.clone(), seed));
+            }
+        }
+
+        let configured = (spot.len() + perp.len()) as u32;
+        tracing::info!(
+            venue = "mexc",
+            configured,
+            matched,
+            universe,
+            seeds = seeds.len(),
+            "discovery: coverage"
+        );
+        Ok((
+            VenueCoverage {
+                configured,
+                matched,
+                universe,
+            },
+            seeds,
+        ))
     }
 
     /// WS9: the Bybit boot audit — one PAGED `instruments-info` walk
@@ -8813,6 +9216,7 @@ mod tests {
                 it.next().unwrap(),
                 it.next().unwrap(),
                 it.next().unwrap(),
+                it.next().unwrap(),
             ]
         };
         let fill_lanes = {
@@ -8827,6 +9231,7 @@ mod tests {
         let event_lanes = {
             let mut it = rings.event.iter().map(|r| r.clone().split().1);
             [
+                it.next().unwrap(),
                 it.next().unwrap(),
                 it.next().unwrap(),
                 it.next().unwrap(),
@@ -8926,11 +9331,14 @@ mod tests {
         let deribit = build_deribit_symbol_table("BTC-PERPETUAL").unwrap();
         let hl = build_hl_coin_table("BTC,ETH").unwrap();
 
-        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl));
+        let mexc = [make_symbol_id(VenueId::Mexc, 1), make_symbol_id(VenueId::Mexc, 513)];
+        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc);
         let expect: Vec<u32> = {
             let mut v = vec![
                 42,
                 7,
+                make_symbol_id(VenueId::Mexc, 1),
+                make_symbol_id(VenueId::Mexc, 513),
                 make_symbol_id(VenueId::Okx, 1),
                 make_symbol_id(VenueId::Okx, 2),
                 make_symbol_id(VenueId::Deribit, 1),
@@ -8955,15 +9363,15 @@ mod tests {
     #[test]
     fn ai_universe_dedups_and_handles_absent_venues() {
         // PM and BN misconfigured to the same id: one survivor.
-        let u = build_ai_universe(&[7], &[7], None, None, None);
+        let u = build_ai_universe(&[7], &[7], None, None, None, &[]);
         assert_eq!(&u[..], &[7]);
 
         // No optional venues: exactly the sorted pair.
-        let u = build_ai_universe(&[42], &[7], None, None, None);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[]);
         assert_eq!(&u[..], &[7, 42]);
 
         // M1 multi-market: every PM token + every BN sym flows in.
-        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None);
+        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[]);
         assert_eq!(&u[..], &[2, 3, 7, 42, 16_777_218]);
     }
 
@@ -9646,6 +10054,7 @@ mod tests {
         assert_eq!(t[VenueId::Hyperliquid as usize], 700);
         assert_eq!(t[VenueId::Ai as usize], 0);
         assert_eq!(t[VenueId::Bybit as usize], 500);
+        assert_eq!(t[VenueId::Mexc as usize], 400, "MX9 measured p99, rounded up");
     }
 
     /// VT2: overrides replace only the named venue; the last spec for
@@ -9656,10 +10065,14 @@ mod tests {
             "okx:250".to_owned(),
             "bn:0".to_owned(),
             "okx:300".to_owned(),
+            "mexc:400".to_owned(),
         ];
         let t = parse_stale_after_ms(&specs).unwrap();
         assert_eq!(t[VenueId::Okx as usize], 300);
         assert_eq!(t[VenueId::Binance as usize], 0);
+        // MX2: the D8 lever — a too-coarse MEXC default is overridden
+        // here, not by a per-class table.
+        assert_eq!(t[VenueId::Mexc as usize], 400);
         assert_eq!(
             t[VenueId::Bybit as usize],
             500,
@@ -9702,7 +10115,7 @@ mod tests {
     fn raw_tap_flags_all_enables_every_venue() {
         let cfg = parse_raw_tap_flags(Some("all"), "all", 8).unwrap();
         let want_bytes = 8 * 1024 * 1024;
-        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl] {
+        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
         }
@@ -9718,7 +10131,7 @@ mod tests {
         assert_eq!(cfg.pm.budget_bytes, want_bytes);
         assert_eq!(cfg.okx.mode, TapMode::Rejects);
         assert_eq!(cfg.okx.budget_bytes, want_bytes);
-        for c in [cfg.bn, cfg.rpc, cfg.deribit, cfg.hl] {
+        for c in [cfg.bn, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
         }
@@ -9727,8 +10140,9 @@ mod tests {
     /// Every known capture-venue label is accepted in one CSV.
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
-        let cfg = parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl"), "all", 1).unwrap();
-        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl] {
+        let cfg =
+            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc"), "all", 1).unwrap();
+        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
             assert_eq!(c.mode, TapMode::All);
         }
     }
@@ -9767,14 +10181,15 @@ mod tests {
         );
     }
 
-    /// More than seven comma-separated labels trips the defensive
-    /// capacity guard — there are only seven known venues (WS9 added
-    /// bybit), so this branch is a pure defense-in-depth backstop
-    /// reached here by listing all seven plus an eighth item.
+    /// More than eight comma-separated labels trips the defensive
+    /// capacity guard — there are only eight capture labels (WS9 added
+    /// bybit, MX6 mexc), so this branch is a pure defense-in-depth
+    /// backstop reached here by listing all eight plus a ninth item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
-            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,pm2"), "rejects", 64).err(),
+            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,pm2"), "rejects", 64)
+                .err(),
             Some("--raw-tap: more venue labels than known venues")
         );
     }

@@ -106,11 +106,15 @@ pub use core_fill::{MAX_OPEN_PER_SYM, MAX_OPEN_TOTAL};
 /// WS9: number of TRADEABLE venues (pm, bn, okx, deribit, hl,
 /// bybit). NOT a venue-byte bound any more — `Ai = 5` sits inside
 /// the byte range while `Bybit = 6` trades; use
-/// [`tradeable_venue_byte`] for the per-order gate.
+/// [`tradeable_venue_byte`] for the per-order gate. MX2: `Mexc = 7`
+/// has model columns but is NOT tradeable (O-MX1, data-only), so the
+/// count stays 6.
 pub const TRADEABLE_VENUES: usize = 6;
 
 /// WS9: the per-order venue gate — venue bytes 0..=4 plus Bybit (6)
-/// can execute; the Ai feed (5) and corrupt bytes cannot.
+/// can execute; the Ai feed (5), MEXC (7 — data-only by operator
+/// ruling O-MX1; arming it needs its own plan) and corrupt bytes
+/// cannot.
 #[inline]
 pub const fn tradeable_venue_byte(venue: usize) -> bool {
     venue <= 4 || venue == 6
@@ -1077,7 +1081,7 @@ impl FillEngine {
         // book + cap guards). Fail closed on hand-built inputs:
         // count as unroutable, drop. WS9: the gate is the explicit
         // predicate — Ai (5) sits inside the byte range, Bybit (6)
-        // trades.
+        // trades, MEXC (7) is data-only (MX2 / O-MX1).
         debug_assert!(px > 0 && qty > 0, "vm emits positive px/qty only");
         // I1: only the two modeled kinds execute; a reserved/garbage
         // kind (2 = Market, rsv.) cannot be scored honestly — count it
@@ -2228,8 +2232,8 @@ mod tests {
     #[test]
     fn fee_rate_is_per_class_with_a_dearest_fallback() {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2306,8 +2310,8 @@ mod tests {
 
     fn pred_params(open_pair: Option<(u32, u32)>) -> ModelParams {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2352,13 +2356,13 @@ mod tests {
         // both directions, and the unknown-class counter is untouched
         // by the new path.
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
         let mut v = 0usize;
-        while v < 7 {
+        while v < 8 {
             let mut c = 0usize;
             while c < 5 {
                 p.fee_bps[v][c] = ((v * 5 + c) as u32, (v * 5 + c + 1) as u32);
@@ -2382,6 +2386,7 @@ mod tests {
             VenueId::Deribit,
             VenueId::Hyperliquid,
             VenueId::Bybit,
+            VenueId::Mexc,
         ] {
             for class in classes {
                 ord += 1;
@@ -2437,8 +2442,8 @@ mod tests {
 
     fn binary_engine() -> FillEngine {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2823,8 +2828,8 @@ mod tests {
     /// Zero latency, zero flat fee, the venue's option schedule live.
     fn opt_engine() -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2918,8 +2923,8 @@ mod tests {
         // NOT a mark-fill sym: after F9 every real Deribit option is
         // priced by its own quote lane, which is pass (b).
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3262,7 +3267,7 @@ mod tests {
 
         let round_trip = |frac: u32| -> (i64, i64) {
             let mut params = ModelParams {
-                latency_ns: [0; 7],
+                latency_ns: [0; 8],
                 opt_spread_frac_1e6: frac,
                 ..ModelParams::default()
             };
@@ -3359,8 +3364,8 @@ mod tests {
     /// (still never fills on it — the pass precedes the emit).
     fn engine_zero_delta(boundary: u64) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(0, 0); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3468,8 +3473,8 @@ mod tests {
 
     fn engine_fees(boundary: u64, maker: u32, taker: u32) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(maker, taker); 5]; 7],
-            latency_ns: [0; 7],
+            fee_bps: [[(maker, taker); 5]; 8],
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3808,13 +3813,36 @@ mod tests {
         assert_eq!(o.unroutable, 1);
     }
 
+    /// MX2 / O-MX1: MEXC is data-only — a MEXC order (spot or perp
+    /// ordinal block, maker or IoC) is refused as unroutable even
+    /// though its venue byte has every model column, and a crossing
+    /// tick afterwards fills nothing.
+    #[test]
+    fn mexc_order_is_refused_data_only() {
+        assert!(!tradeable_venue_byte(VenueId::Mexc as usize));
+        assert!(tradeable_venue_byte(VenueId::Bybit as usize));
+        let mut e = engine(u64::MAX);
+        let spot = make_symbol_id(VenueId::Mexc, 1);
+        let perp = make_symbol_id(VenueId::Mexc, core_config::universe::MEXC_PERP_ORDINAL_BASE + 1);
+        e.intake(&order(spot, Side::Bid, 100_000, 1_000_000, 1), 0);
+        let mut ioc = order(perp, Side::Bid, 100_000, 1_000_000, 2);
+        ioc.kind = ORDER_KIND_IOC;
+        e.intake(&ioc, 0);
+        assert!(e.open_orders().is_empty());
+        let mut out = Vec::new();
+        e.on_record(&tick(spot, 50_000, 5_000_000, 90_000, 5_000_000), 10, 10, &mut out);
+        assert!(out.is_empty(), "a refused MEXC order never fills");
+        let o = e.finish();
+        assert_eq!(o.unroutable, 2);
+    }
+
     // -------------- fees (§4.3) --------------
 
     #[test]
     fn maker_fee_charges_on_fill_notional() {
         let p = ModelParams {
-            fee_bps: [[(50, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]], // PM maker 50 bps
-            latency_ns: [0; 7],
+            fee_bps: [[(50, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]], // PM maker 50 bps
+            latency_ns: [0; 8],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3852,8 +3880,8 @@ mod tests {
         assert_eq!(model_venue_byte(BN_SYM), 1);
         let p = ModelParams {
             // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
-            fee_bps: [[(50, 0); 5], [(10, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]],
-            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0],
+            fee_bps: [[(50, 0); 5], [(10, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]],
+            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0, 0],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -4144,8 +4172,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(maker_bps, 0); 5]; 7],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
+                fee_bps: [[(maker_bps, 0); 5]; 8],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4215,8 +4243,8 @@ mod tests {
             taker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(0, taker_bps); 5]; 7],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000],
+                fee_bps: [[(0, taker_bps); 5]; 8],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4297,8 +4325,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(maker_bps, 0); 5]; 7],
-                latency_ns: [0; 7],
+                fee_bps: [[(maker_bps, 0); 5]; 8],
+                latency_ns: [0; 8],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };

@@ -81,12 +81,17 @@ const MS: u64 = 1_000_000;
 /// deribit 108 + 208/2 → 220 ms · hl 272 + 124/2 → 340 ms ·
 /// bybit 29 + 44/2 → 60 ms. Polymarket's CLOB feed is UNMEASURED (the
 /// socket needs an asset id), so the §4.4 assumption of 200 ms stands
-/// there. Index 5 is `Ai`, a dead slot.
+/// there. Index 5 is `Ai`, a dead slot. Index 7 is MEXC, MEASURED
+/// 2026-09-23 07:24–07:34Z (MX9) on the same Mac / network: spot
+/// `aggre.bookTicker` 82 + 131/2 → 150 ms, futures `depth.full`
+/// 60 + 134/2 → 130 ms; one venue byte carries both classes, so the
+/// slower one binds (150). MEXC is data-only (O-MX1) — no fill model
+/// ever executes an order on it.
 ///
 /// **RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.** One table, both
 /// consumers — the harness's `ModelParams::default()` reads it from
 /// here so a re-measurement cannot land in one and not the other.
-pub const ACTIVATION_NS_DEFAULT: [u64; 7] = [
+pub const ACTIVATION_NS_DEFAULT: [u64; 8] = [
     200 * MS, // pm
     130 * MS, // bn
     130 * MS, // okx
@@ -94,6 +99,7 @@ pub const ACTIVATION_NS_DEFAULT: [u64; 7] = [
     340 * MS, // hl
     0,        // ai (dead)
     60 * MS,  // bybit
+    150 * MS, // mexc (spot binds; futures 130)
 ];
 
 /// The two sides of a book at one instant, ×1e6.
@@ -491,8 +497,11 @@ mod tests {
         // can never drift apart.
         assert_eq!(
             ACTIVATION_NS_DEFAULT,
-            [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS]
+            [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS, 150 * MS]
         );
         assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Ai as usize], 0, "a dead slot");
+        // MX9: MEXC measured on the Mac 2026-09-23 — the slower class
+        // (spot 150) binds over futures (130).
+        assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Mexc as usize], 150 * MS);
     }
 }

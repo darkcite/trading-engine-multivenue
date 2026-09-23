@@ -35,10 +35,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use strategy_set::{StrategySet, BIT_VM};
 
-// The lane arrays below are written out for the lane geometry (six
-// tick lanes since WS9 added Bybit); break the build loudly if that
-// drifts.
-const _: () = assert!(NUM_TICK_LANES == 6 && NUM_FILL_LANES == 4);
+// The lane arrays below are written out for the lane geometry (seven
+// tick lanes since MX2 added MEXC after WS9's Bybit); break the build
+// loudly if that drifts.
+const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 4);
 
 /// Raw Polymarket SymbolId (venue byte 0) — the boot-universe shape
 /// `build_ai_universe` produces for `--polymarket-sym-id`.
@@ -144,6 +144,7 @@ fn harness(tag: &str) -> Harness {
     let (_t3p, t3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     // WS10-A: venue-event lanes ride in every engine (producers
     // dropped — the lanes read empty; this harness exercises the
     // ruleset plumbing, not funding).
@@ -158,6 +159,8 @@ fn harness(tag: &str) -> Harness {
     let (_e4p, e4) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e5p, e5) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e6p, e6) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: depth lanes ride in every engine (producers dropped).
     let (_d0p, d0) = Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
@@ -176,8 +179,8 @@ fn harness(tag: &str) -> Harness {
     let mut eng = Engine::new(
         StrategySet::new(BIT_VM),
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5],
-        [e0, e1, e2, e3, e4, e5],
+        [t0, t1, t2, t3, t4, t5, t6],
+        [e0, e1, e2, e3, e4, e5, e6],
         [d0, d1],
         [o0, o1, o2],
         sc,

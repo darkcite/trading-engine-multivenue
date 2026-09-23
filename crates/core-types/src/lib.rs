@@ -67,6 +67,9 @@ pub enum VenueId {
     Ai = 5,
     /// WS9: Bybit v5 public WS (spot + linear perps).
     Bybit = 6,
+    /// MX2: MEXC — spot protobuf WS + futures JSON WS (data-only,
+    /// O-MX1: never tradeable, no exec arm).
+    Mexc = 7,
 }
 
 impl VenueId {
@@ -88,6 +91,7 @@ impl VenueId {
             4 => Some(Self::Hyperliquid),
             5 => Some(Self::Ai),
             6 => Some(Self::Bybit),
+            7 => Some(Self::Mexc),
             _ => None,
         }
     }
@@ -108,13 +112,21 @@ impl VenueId {
             Self::Hyperliquid => 700,
             Self::Ai => 0,
             Self::Bybit => 500,
+            // MX9 (plan §4 D8 revised): the measured feed-delay p99
+            // rounded up, like every other venue — docs/venue-latency.md
+            // 2026-09-23: spot `aggre.bookTicker` 338 ms, futures
+            // `depth.full` 349 ms → 400. (The plan's provisional 1 500
+            // sized the threshold to the futures push CADENCE; the
+            // FeedClock judges feed DELAY, and a quiet book simply
+            // pushes nothing.) Override: `--stale-after-ms mexc:<ms>`.
+            Self::Mexc => 400,
         }
     }
 
     /// VT2/VT4: the whole default threshold table indexed by the venue
     /// byte — the ONE table the engine flag parser and the harness
     /// `ModelParams` share.
-    pub const fn stale_after_ms_defaults() -> [u32; 7] {
+    pub const fn stale_after_ms_defaults() -> [u32; 8] {
         [
             Self::Polymarket.default_stale_after_ms(),
             Self::Binance.default_stale_after_ms(),
@@ -123,6 +135,7 @@ impl VenueId {
             Self::Hyperliquid.default_stale_after_ms(),
             Self::Ai.default_stale_after_ms(),
             Self::Bybit.default_stale_after_ms(),
+            Self::Mexc.default_stale_after_ms(),
         ]
     }
 }
@@ -3104,13 +3117,16 @@ pub const fn funding_print_divisor(venue: VenueId) -> i64 {
 /// [`FeatId::ClockToFunding`] fallback when the venue's funding
 /// channel supplies no explicit next-funding time (OKX and Binance
 /// supply one; Bybit's per-symbol interval can differ from the 8 h
-/// default, so the venue-supplied time wins whenever present).
+/// default, so the venue-supplied time wins whenever present; MEXC's
+/// `collectCycle` is per symbol too — 8 h on BTC/SPY, 4 h on XAU/EUR,
+/// measured 2026-09-23 — and its Funding events carry the per-symbol
+/// v1 seeded from REST, so 8 h is the nominal fallback only).
 /// 0 = continuous funding (Deribit — no discrete print; the clock
 /// feature is ABSENT) or no funding at all (PM, AI).
 #[inline(always)]
 pub const fn funding_period_s(venue: VenueId) -> u32 {
     match venue {
-        VenueId::Binance | VenueId::Okx | VenueId::Bybit => 28_800,
+        VenueId::Binance | VenueId::Okx | VenueId::Bybit | VenueId::Mexc => 28_800,
         VenueId::Hyperliquid => 3_600,
         VenueId::Polymarket | VenueId::Deribit | VenueId::Ai => 0,
     }
@@ -3608,18 +3624,21 @@ mod tests {
             VenueId::Hyperliquid,
             VenueId::Ai,
             VenueId::Bybit,
+            VenueId::Mexc,
         ];
         let mut i = 0;
         while i < all.len() {
             assert_eq!(VenueId::from_u8(all[i].to_u8()), Some(all[i]));
             i += 1;
         }
+        assert_eq!(VenueId::Mexc.to_u8(), 7);
     }
 
     #[test]
     fn venue_id_rejects_unknown_bytes() {
-        // 6 became Bybit at WS9 — the first unassigned byte is now 7.
-        assert_eq!(VenueId::from_u8(7), None);
+        // 6 became Bybit at WS9 and 7 MEXC at MX2 — the first
+        // unassigned byte is now 8.
+        assert_eq!(VenueId::from_u8(8), None);
         assert_eq!(VenueId::from_u8(254), None);
         // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
         assert_eq!(VenueId::from_u8(255), None);
@@ -3822,11 +3841,15 @@ mod tests {
         assert_eq!(VenueId::Hyperliquid.default_stale_after_ms(), 700);
         assert_eq!(VenueId::Polymarket.default_stale_after_ms(), 1_000);
         assert_eq!(VenueId::Ai.default_stale_after_ms(), 0);
+        // MX9: the measured feed-delay p99 (338 / 349 ms) rounded up.
+        assert_eq!(VenueId::Mexc.default_stale_after_ms(), 400);
     }
 
     #[test]
     fn stale_after_ms_defaults_is_indexed_by_the_venue_byte() {
         let table = VenueId::stale_after_ms_defaults();
+        assert_eq!(table.len(), 8);
+        assert_eq!(table[VenueId::Mexc as usize], 400);
         let mut b = 0u8;
         while (b as usize) < table.len() {
             let venue = VenueId::from_u8(b).expect("every index is a venue");
@@ -5395,6 +5418,7 @@ mod vm2_v1_tests {
         assert_eq!(funding_print_divisor(VenueId::Hyperliquid), 1);
         assert_eq!(funding_print_divisor(VenueId::Ai), 1);
         assert_eq!(funding_print_divisor(VenueId::Bybit), 1);
+        assert_eq!(funding_print_divisor(VenueId::Mexc), 1);
     }
 
     #[test]
@@ -5402,6 +5426,10 @@ mod vm2_v1_tests {
         assert_eq!(funding_period_s(VenueId::Binance), 28_800);
         assert_eq!(funding_period_s(VenueId::Okx), 28_800);
         assert_eq!(funding_period_s(VenueId::Bybit), 28_800);
+        // MEXC: the NOMINAL fallback only — `collectCycle` is per symbol
+        // (8 h on BTC/SPY, 4 h on XAU/EUR, measured 2026-09-23) and the
+        // Funding events carry the seeded per-symbol v1.
+        assert_eq!(funding_period_s(VenueId::Mexc), 28_800);
         assert_eq!(funding_period_s(VenueId::Hyperliquid), 3_600);
         // Continuous funding / no funding: the clock feature is ABSENT.
         assert_eq!(funding_period_s(VenueId::Deribit), 0);

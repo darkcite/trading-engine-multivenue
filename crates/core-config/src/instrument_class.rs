@@ -47,7 +47,11 @@ use core_types::InstrumentClass;
 ///   perp universe). `@<idx>` spot coins read as `Perp` — a KNOWN
 ///   mis-class, see [`hl_class`];
 /// * `bybit:<sym>` → `Spot`; `bybit-linear:<sym>` → `Dated` when the
-///   symbol carries `-DDMMMYY`, else `Perp`.
+///   symbol carries `-DDMMMYY`, else `Perp`;
+/// * `mexc:<SYM>` → `Spot` (tokenized xStocks such as `AAPLXUSDT` are
+///   ordinary spot rows — no new class, plan §4 D6); `mexc-perp:<SYM>`
+///   → `Perp` ALWAYS: MEXC lists no dated futures, and its TradFi /
+///   equity / FX / metal contracts are ordinary perps.
 #[must_use]
 pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
     if descriptor.is_empty() {
@@ -80,6 +84,8 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
         } else {
             InstrumentClass::Perp
         }),
+        "mexc" => Some(InstrumentClass::Spot),
+        "mexc-perp" => Some(InstrumentClass::Perp),
         _ => None,
     }
 }
@@ -239,6 +245,13 @@ mod tests {
         assert_eq!(class_of_descriptor("bybit:BTCUSDT"), Some(Spot));
         assert_eq!(class_of_descriptor("bybit-linear:BTCUSDT"), Some(Perp));
         assert_eq!(class_of_descriptor("bybit-linear:BTCUSDT-26SEP25"), Some(Dated));
+        // MX2: the MEXC namespaces — equities and TradFi ride the
+        // ordinary Spot / Perp classes (D6).
+        assert_eq!(class_of_descriptor("mexc:BTCUSDT"), Some(Spot));
+        assert_eq!(class_of_descriptor("mexc:AAPLXUSDT"), Some(Spot));
+        assert_eq!(class_of_descriptor("mexc-perp:BTC_USDT"), Some(Perp));
+        assert_eq!(class_of_descriptor("mexc-perp:XAU_USDT"), Some(Perp));
+        assert_eq!(class_of_descriptor("mexc-perp:AAPLSTOCK_USDT"), Some(Perp));
         assert_eq!(
             class_of_descriptor(
                 "105554486916384658090975601083014063097607795931086109853984637938068004048895"
@@ -253,6 +266,9 @@ mod tests {
         assert_eq!(class_of_descriptor("run-1789187999444152000/sym-0x0200000a"), None);
         assert_eq!(class_of_descriptor("kraken:XBTUSD"), None);
         assert_eq!(class_of_descriptor("binance:"), None);
+        assert_eq!(class_of_descriptor("mexc:"), None);
+        assert_eq!(class_of_descriptor("mexc-perp:"), None);
+        assert_eq!(class_of_descriptor("mexc-spot:BTCUSDT"), None);
         assert_eq!(class_of_descriptor("okx:BTC-USD-FOO-77000-C"), None);
         assert_eq!(class_of_descriptor("okx:BTC"), None);
         assert_eq!(class_of_descriptor("deribit:BTC-FS-26SEP26_PERP"), None);

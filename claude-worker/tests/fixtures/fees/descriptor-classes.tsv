@@ -49,3 +49,8 @@ okx:BTC-USD-FOO-77000-C	none
 deribit:BTC	none
 deribit:BTC-FS-26SEP26_PERP	none
 12ab	none
+mexc:BTCUSDT	spot
+mexc:AAPLXUSDT	spot
+mexc-perp:BTC_USDT	perp
+mexc-perp:XAU_USDT	perp
+mexc-perp:AAPLSTOCK_USDT	perp
