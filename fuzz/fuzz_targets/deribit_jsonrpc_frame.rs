@@ -25,6 +25,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
     // --- Classifier -------------------------------------------------
     let kind = ingress_deribit::classify(data);
@@ -42,23 +45,41 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // --- quote ------------------------------------------------------
-    if let Some(f) = ingress_deribit::parse_quote(data, 0) {
+    let mut f: ingress_deribit::DeribitQuoteFrame = poison::poisoned();
+    let ok = ingress_deribit::parse_quote(data, 0, &mut f);
+    if !ok {
+        assert_eq!(f, poison::poisoned::<ingress_deribit::DeribitQuoteFrame>(), "a failed parse wrote the frame");
+    }
+    if ok {
         // A frame with both sides empty carries no information — the
         // parser must have rejected it before returning `Some`.
         assert!(!(f.bid_px_1e6 == 0 && f.ask_px_1e6 == 0));
     }
 
     // --- ticker -----------------------------------------------------
-    let _ = ingress_deribit::parse_ticker(data, 0);
+    let mut f: ingress_deribit::DeribitTickerFrame = poison::poisoned();
+    if !ingress_deribit::parse_ticker(data, 0, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_deribit::DeribitTickerFrame>(), "a failed parse wrote the frame");
+    }
 
     // --- trades -----------------------------------------------------
-    if let Some(t) = ingress_deribit::parse_trade(data, 0) {
+    let mut t: ingress_deribit::DeribitTradeFrame = poison::poisoned();
+    let ok = ingress_deribit::parse_trade(data, 0, &mut t);
+    if !ok {
+        assert_eq!(t, poison::poisoned::<ingress_deribit::DeribitTradeFrame>(), "a failed parse wrote the frame");
+    }
+    if ok {
         // Taker direction is 0 (buy) or 1 (sell) — nothing else.
         assert!(t.side <= 1);
     }
 
     // --- book header ------------------------------------------------
-    if let Some(b) = ingress_deribit::parse_book_header(data, 0) {
+    let mut b: ingress_deribit::DeribitBookFrame = poison::poisoned();
+    let ok = ingress_deribit::parse_book_header(data, 0, &mut b);
+    if !ok {
+        assert_eq!(b, poison::poisoned::<ingress_deribit::DeribitBookFrame>(), "a failed parse wrote the frame");
+    }
+    if ok {
         assert!(
             b.action == ingress_deribit::BOOK_ACTION_SNAPSHOT
                 || b.action == ingress_deribit::BOOK_ACTION_CHANGE

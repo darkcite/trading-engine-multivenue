@@ -11,9 +11,15 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
     let _ = ingress_rpc::classify_rpc(data);
     let _ = ingress_rpc::parse_block_number_result(data);
-    let _ = ingress_rpc::parse_new_head_notification(data);
+    let mut f: ingress_rpc::NewHead = poison::poisoned();
+    if !ingress_rpc::parse_new_head_notification(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_rpc::NewHead>(), "a failed parse wrote the frame");
+    }
     let _ = ingress_rpc::parse_rpc_error(data);
 });

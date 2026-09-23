@@ -26,6 +26,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
     // --- Classifier -------------------------------------------------
     let kind = ingress_rpc::classify_rpc(data);
@@ -40,7 +43,12 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // --- Notification parser ---------------------------------------
-    if let Some(head) = ingress_rpc::parse_new_head_notification(data) {
+    let mut head: ingress_rpc::NewHead = poison::poisoned();
+    let ok = ingress_rpc::parse_new_head_notification(data, &mut head);
+    if !ok {
+        assert_eq!(head, poison::poisoned::<ingress_rpc::NewHead>(), "a failed parse wrote the frame");
+    }
+    if ok {
         // Fields are u64 — no bounds to assert, but ts_sec/gas_used
         // may be 0 if absent.
         std::hint::black_box(head);
@@ -76,7 +84,9 @@ fuzz_target!(|data: &[u8]| {
                     ingress_rpc::RpcFrameKind::Subscription
                 );
                 assert!(ingress_rpc::parse_rpc_error(frame).is_none());
-                assert!(ingress_rpc::parse_new_head_notification(frame).is_none());
+                let mut head: ingress_rpc::NewHead = poison::poisoned();
+                assert!(!ingress_rpc::parse_new_head_notification(frame, &mut head));
+                assert_eq!(head, poison::poisoned::<ingress_rpc::NewHead>(), "a failed parse wrote the frame");
             }
             Err(ingress_rpc::RpcWriteErr::BufferTooSmall) => {}
         }

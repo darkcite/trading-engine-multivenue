@@ -57,7 +57,9 @@
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the
 //! rx buffer in place; subscribe payloads render into stack scratch;
-//! the only copy is the 64-byte `Tick` moved into the ring.
+//! the ring copies are the 64-byte `Tick` and, per changed book top-K,
+//! the 192-byte `DepthTopK` (core-ring pushes by value — marked at the
+//! push).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
@@ -244,8 +246,9 @@ pub struct Driver {
     /// branch per book frame then). Boot-allocated; steady state
     /// only indexes.
     ladders: Vec<book_builder::ladder::DepthLadder>,
-    /// WS10-B: last EMITTED top-K per instrument — the change gate.
-    last_depth: Vec<core_types::DepthTopK>,
+    /// WS10-B: the change gate per instrument — the last EMITTED top-K
+    /// and the row the next snapshot is written into, in place.
+    depth: Vec<core_types::DepthPair>,
     /// Acknowledged subscriptions.
     subs: SubTable<OkxSubKind, SUB_CAP>,
     /// Books `seqId`/`prevSeqId` chains, indexed by symbol-table row.
@@ -308,10 +311,10 @@ impl Driver {
         // boot-allocated once (empty when depth is off — the ladder
         // path is a single is_empty branch per book frame then).
         let n_syms = symbols.len();
-        let (ladders, last_depth) = if depth_enabled {
+        let (ladders, depth) = if depth_enabled {
             (
                 vec![book_builder::ladder::DepthLadder::new(); n_syms],
-                vec![core_types::DepthTopK::EMPTY; n_syms],
+                vec![core_types::DepthPair::new(core_types::DepthTopK::EMPTY); n_syms],
             )
         } else {
             (Vec::new(), Vec::new())
@@ -345,7 +348,7 @@ impl Driver {
             symbols,
             depth_enabled,
             ladders,
-            last_depth,
+            depth,
             subs: SubTable::new(),
             book_chains: [OkxSeqChain::new(); OKX_MAX_SYMBOLS],
             trade_seqs: [TradeSeqMonitor::new(); OKX_MAX_SYMBOLS],
@@ -712,13 +715,16 @@ fn queue_books_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
 // Frame drain + dispatch
 // ---------------------------------------------------------------
 
-/// Per-push `trades` scan result (phase-1 output; `Copy`).
+/// Per-push `trades` scan result (phase-1 output; `Copy`, 12 B). The
+/// seq monitor is applied during the walk itself — it is a driver field
+/// disjoint from the rx borrow — so no seq id is staged for phase 2.
 #[derive(Copy, Clone)]
 struct TradeScan {
     rows_parsed: u32,
     rows_rejected: u32,
-    seq_ids: [i64; MAX_TRADE_ROWS],
-    n_seq: u8,
+    /// Seq regressions among the push's first [`MAX_TRADE_ROWS`]
+    /// parsed rows (phase 2 counts each as a gap).
+    regressions: u32,
 }
 
 /// Phase-1 dispatch outcome — everything pre-parsed while the rx
@@ -736,10 +742,10 @@ enum Dispatch {
     /// msg names, resolved against the table (`SYMBOL_ID_NONE` when
     /// the error names none).
     VenueError { code: u32, sym: u32 },
-    /// `bbo-tbt` push became a Tick.
-    Bbo { tick: Tick },
-    /// `trades` push scanned.
-    Trades { sym_idx: u8, scan: TradeScan },
+    /// `bbo-tbt` push became the phase-1 tick.
+    Bbo,
+    /// `trades` push scanned (its seqs already chain-checked).
+    Trades { scan: TradeScan },
     /// M2.3: family-wide `opt-summary` push walked + captured in
     /// phase 1 (capture-only; nothing reaches the engine ring).
     OptSummaries { scan: OptScan },
@@ -750,6 +756,10 @@ enum Dispatch {
     /// resync when `gapped`.
     Book { sym_idx: u8, gapped: bool },
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 #[allow(clippy::too_many_arguments)]
 fn drain_ws_frames<C: Capture>(
@@ -836,12 +846,6 @@ fn drain_ws_frames<C: Capture>(
     }
 }
 
-/// Walk the `trades` rows of one push. Rows are sliced at successive
-/// `"tradeId":"` markers; each slice parses independently (`px`/`sz`/
-/// `side`/`ts`/`seqId` all follow `tradeId` within a row). Each parsed
-/// row is captured as a `ChannelId::Trade` event (§6.5): `venue_seq` =
-/// trade `seqId`, `venue_time_ms` from the venue ts, `v0` = px ×1e6,
-/// `v1` = qty ×1e6 negated for sell-side prints.
 /// M2.3 `opt-summary` phase-1 scan result (`Copy`).
 #[derive(Copy, Clone)]
 struct OptScan {
@@ -915,45 +919,56 @@ fn scan_opt_summaries<C: Capture>(
     scan
 }
 
-fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
+/// Walk the `trades` rows of one push. Rows are sliced at successive
+/// `"tradeId":"` markers; each slice parses independently (`px`/`sz`/
+/// `side`/`ts`/`seqId` all follow `tradeId` within a row). Each parsed
+/// row is captured as a `ChannelId::Trade` event (§6.5): `venue_seq` =
+/// trade `seqId`, `venue_time_ms` from the venue ts, `v0` = px ×1e6,
+/// `v1` = qty ×1e6 negated for sell-side prints. The first
+/// [`MAX_TRADE_ROWS`] parsed seq ids are chain-checked against the
+/// instrument's `seqs` monitor as they are read.
+fn scan_trades<C: Capture>(
+    payload: &[u8],
+    sym: u32,
+    seqs: &mut TradeSeqMonitor,
+    capture: &mut C,
+) -> TradeScan {
     const MARKER: &[u8] = b"\"tradeId\":\"";
     let mut scan = TradeScan {
         rows_parsed: 0,
         rows_rejected: 0,
-        seq_ids: [0; MAX_TRADE_ROWS],
-        n_seq: 0,
+        regressions: 0,
     };
+    let mut n_seq = 0usize;
     let mut at = 0usize;
     while let Some(off) = memchr::memmem::find(&payload[at..], MARKER) {
         let row_start = at + off;
         let next = memchr::memmem::find(&payload[row_start + MARKER.len()..], MARKER)
             .map(|o| row_start + MARKER.len() + o);
         let row_end = next.unwrap_or(payload.len());
-        match parse_trade(&payload[row_start..row_end], sym) {
-            Some(t) => {
-                scan.rows_parsed += 1;
-                if (scan.n_seq as usize) < MAX_TRADE_ROWS {
-                    scan.seq_ids[scan.n_seq as usize] = t.seq_id;
-                    scan.n_seq += 1;
-                }
-                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
-                capture.event(&ChannelEvent::new(
-                    now_ns(),
-                    VenueId::Okx,
-                    ChannelId::Trade,
-                    sym,
-                    t.seq_id as u64,
-                    t.ts_ns / 1_000_000,
-                    t.px_1e6,
-                    signed_qty,
-                ));
+        let mut t = crate::OkxTradeFrame::ZERO;
+        if parse_trade(&payload[row_start..row_end], sym, &mut t) {
+            scan.rows_parsed += 1;
+            if n_seq < MAX_TRADE_ROWS {
+                n_seq += 1;
+                scan.regressions += u32::from(seqs.apply(t.seq_id) == TradeSeqOutcome::Regression);
             }
-            None => {
-                scan.rows_rejected += 1;
-                // Tap the exact rejected row slice — the §6.5 raw-tap
-                // differential audit consumes these.
-                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
-            }
+            let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Okx,
+                ChannelId::Trade,
+                sym,
+                t.seq_id as u64,
+                t.ts_ns / 1_000_000,
+                t.px_1e6,
+                signed_qty,
+            ));
+        } else {
+            scan.rows_rejected += 1;
+            // Tap the exact rejected row slice — the §6.5 raw-tap
+            // differential audit consumes these.
+            capture.parse_reject(now_ns(), &payload[row_start..row_end]);
         }
         at = row_end;
     }
@@ -974,6 +989,10 @@ fn handle_data_frame<C: Capture>(
 ) -> io::Result<()> {
     // Retained for the phase-2 reject re-borrow (Range is not Copy).
     let reject_range = payload_range.clone();
+    // Phase 1's tick, built in place: riding inside the dispatch value
+    // it would widen every dispatch past the 64 B bound and cross phase
+    // 1 → phase 2 by value. `Dispatch::Bbo` says it was written.
+    let mut tick = Tick::ZERO;
     // Phase 1: immutable borrow of rx (+ symbols) — classify, resolve
     // the instrument, pre-parse into a Copy dispatch value. Capture
     // hooks that need parsed values fire here (events); the raw tap
@@ -1024,8 +1043,9 @@ fn handle_data_frame<C: Capture>(
                         .map(|sym| (sym, drv.symbols.index_of(sym)))
                 }) {
                     Some((sym, Some(sym_idx))) => match channel {
-                        OkxChannel::BboTbt => match parse_bbo(payload, sym) {
-                            Some(f) => {
+                        OkxChannel::BboTbt => {
+                            let mut f = crate::OkxBboFrame::ZERO;
+                            if parse_bbo(payload, sym, &mut f) {
                                 // VT2: one parse-complete stamp serves
                                 // the tick AND the staleness judgement
                                 // (no second syscall); `ts` is the venue
@@ -1033,26 +1053,25 @@ fn handle_data_frame<C: Capture>(
                                 let now = now_ns();
                                 let venue_time_ms = f.ts_ns / 1_000_000;
                                 let judged = drv.feed_clock.judge(venue_time_ms, now);
-                                Dispatch::Bbo {
-                                    tick: Tick::new_stamped(
-                                        now,
-                                        VenueId::Okx,
-                                        sym,
-                                        f.seq_id as u32,
-                                        Price::from_raw(f.bid_px_1e6),
-                                        Qty::from_raw(f.bid_qty_1e6),
-                                        Price::from_raw(f.ask_px_1e6),
-                                        Qty::from_raw(f.ask_qty_1e6),
-                                        venue_time_ms,
-                                        (judged.stale as u8) * TICK_FLAG_STALE,
-                                    ),
-                                }
+                                tick = Tick::new_stamped(
+                                    now,
+                                    VenueId::Okx,
+                                    sym,
+                                    f.seq_id as u32,
+                                    Price::from_raw(f.bid_px_1e6),
+                                    Qty::from_raw(f.bid_qty_1e6),
+                                    Price::from_raw(f.ask_px_1e6),
+                                    Qty::from_raw(f.ask_qty_1e6),
+                                    venue_time_ms,
+                                    (judged.stale as u8) * TICK_FLAG_STALE,
+                                );
+                                Dispatch::Bbo
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                         OkxChannel::Trades => Dispatch::Trades {
-                            sym_idx: sym_idx as u8,
-                            scan: scan_trades(payload, sym, capture),
+                            scan: scan_trades(payload, sym, &mut drv.trade_seqs[sym_idx], capture),
                         },
                         OkxChannel::OptSummary => {
                             // Handled by the dedicated family-keyed
@@ -1060,8 +1079,9 @@ fn handle_data_frame<C: Capture>(
                             debug_assert!(false, "opt-summary reached the instId path");
                             Dispatch::Nothing
                         }
-                        OkxChannel::MarkPrice => match crate::parse_mark_price(payload, sym) {
-                            Some(m) => {
+                        OkxChannel::MarkPrice => {
+                            let mut m = crate::OkxMarkPriceFrame::ZERO;
+                            if crate::parse_mark_price(payload, sym, &mut m) {
                                 // §6.5 capture: v0 = mark px ×1e6.
                                 capture.event(&ChannelEvent::new(
                                     now_ns(),
@@ -1074,41 +1094,43 @@ fn handle_data_frame<C: Capture>(
                                     0,
                                 ));
                                 Dispatch::Slow
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                         OkxChannel::FundingRate => {
-                            match crate::parse_funding_rate(payload, sym) {
-                                Some(fr) => {
-                                    // §6.5 capture: v0 = rate ×1e9,
-                                    // v1 = next funding time (ms).
-                                    let ev = ChannelEvent::new(
-                                        now_ns(),
-                                        VenueId::Okx,
-                                        ChannelId::Funding,
-                                        sym,
-                                        0,
-                                        fr.ts_ns / 1_000_000,
-                                        fr.funding_rate_1e9,
-                                        (fr.funding_time_ns / 1_000_000) as i64,
-                                    );
-                                    capture.event(&ev);
-                                    // WS10-A: onto the venue-event
-                                    // lane (capture stays first —
-                                    // §6.5 capture-before-push law).
-                                    if event_mask & core_types::event_lane_bit(ChannelId::Funding)
-                                        != 0
-                                        && event_tx.try_push(ev).is_err()
-                                    {
-                                        status.inc_event_ring_drops();
-                                    }
-                                    Dispatch::Slow
+                            let mut fr = crate::OkxFundingFrame::ZERO;
+                            if crate::parse_funding_rate(payload, sym, &mut fr) {
+                                // §6.5 capture: v0 = rate ×1e9,
+                                // v1 = next funding time (ms).
+                                let ev = ChannelEvent::new(
+                                    now_ns(),
+                                    VenueId::Okx,
+                                    ChannelId::Funding,
+                                    sym,
+                                    0,
+                                    fr.ts_ns / 1_000_000,
+                                    fr.funding_rate_1e9,
+                                    (fr.funding_time_ns / 1_000_000) as i64,
+                                );
+                                capture.event(&ev);
+                                // WS10-A: onto the venue-event
+                                // lane (capture stays first —
+                                // §6.5 capture-before-push law).
+                                if event_mask & core_types::event_lane_bit(ChannelId::Funding)
+                                    != 0
+                                    && event_tx.try_push(ev).is_err()
+                                {
+                                    status.inc_event_ring_drops();
                                 }
-                                None => Dispatch::Nothing,
+                                Dispatch::Slow
+                            } else {
+                                Dispatch::Nothing
                             }
                         }
-                        OkxChannel::Books => match parse_book_header(payload, sym) {
-                            Some(b) => {
+                        OkxChannel::Books => {
+                            let mut b = crate::OkxBookFrame::ZERO;
+                            if parse_book_header(payload, sym, &mut b) {
                                 // §6.5 capture: venue_seq = seqId,
                                 // v0 = prevSeqId — the offline audit
                                 // re-derives chain breaks from these.
@@ -1133,7 +1155,7 @@ fn handle_data_frame<C: Capture>(
                                 if !drv.ladders.is_empty() {
                                     okx_depth_step(
                                         &mut drv.ladders[sym_idx],
-                                        &mut drv.last_depth[sym_idx],
+                                        &mut drv.depth[sym_idx],
                                         payload,
                                         sym,
                                         gapped,
@@ -1147,8 +1169,9 @@ fn handle_data_frame<C: Capture>(
                                     sym_idx: sym_idx as u8,
                                     gapped,
                                 }
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                     },
                     // Data for an instrument we never configured —
@@ -1227,7 +1250,7 @@ fn handle_data_frame<C: Capture>(
             ));
             log_sub_drop_rate_limited(drv, sym, code);
         }
-        Dispatch::Bbo { tick } => {
+        Dispatch::Bbo => {
             status.add_msgs(1);
             status.add_ticks(1);
             // VT2: stale ticks are captured and pushed like any other
@@ -1247,7 +1270,7 @@ fn handle_data_frame<C: Capture>(
                 status.inc_ring_drops();
             }
         }
-        Dispatch::Trades { sym_idx, scan } => {
+        Dispatch::Trades { scan } => {
             status.add_msgs(scan.rows_parsed as u64);
             status.add_ticks(scan.rows_parsed as u64);
             let mut r = 0;
@@ -1255,14 +1278,10 @@ fn handle_data_frame<C: Capture>(
                 status.inc_parse_errors();
                 r += 1;
             }
-            let mut i = 0;
-            while i < scan.n_seq as usize {
-                if drv.trade_seqs[sym_idx as usize].apply(scan.seq_ids[i])
-                    == TradeSeqOutcome::Regression
-                {
-                    status.inc_gaps();
-                }
-                i += 1;
+            let mut g = 0;
+            while g < scan.regressions {
+                status.inc_gaps();
+                g += 1;
             }
         }
         Dispatch::OptSummaries { scan } => {
@@ -1300,11 +1319,13 @@ fn handle_data_frame<C: Capture>(
 /// change-gated emission (capture first, then the depth-lane push;
 /// full-ring pushes count `depth_ring_drops`). On a chain gap the
 /// ladder clears and a `DEPTH_FLAG_STALE` snapshot ALWAYS emits so a
-/// strategy never trades a known-broken book.
+/// strategy never trades a known-broken book. Snapshots are written in
+/// place into `pair`'s spare row; an emitted one becomes the last by
+/// [`core_types::DepthPair::commit`], never by a copy.
 #[allow(clippy::too_many_arguments)]
 fn okx_depth_step<C: Capture>(
     ladder: &mut book_builder::ladder::DepthLadder,
-    last: &mut core_types::DepthTopK,
+    pair: &mut core_types::DepthPair,
     payload: &[u8],
     sym: u32,
     gapped: bool,
@@ -1315,12 +1336,17 @@ fn okx_depth_step<C: Capture>(
 ) {
     if gapped {
         ladder.clear();
-        let stale = ladder.snapshot(now_ns(), VenueId::Okx, sym, core_types::DEPTH_FLAG_STALE);
-        capture.depth(&stale);
-        if depth_tx.try_push(stale).is_err() {
+        let stale = pair.spare_mut();
+        ladder.snapshot_into(now_ns(), VenueId::Okx, sym, core_types::DEPTH_FLAG_STALE, stale);
+        capture.depth(stale);
+        // COPY: one 192 B `DepthTopK` into the depth ring's slot, per
+        // emitted snapshot — the ring is what hands it to the strategy
+        // thread — rejected: none today (core-ring pushes by value; an
+        // in-slot claim/commit push is the follow-up).
+        if depth_tx.try_push(*stale).is_err() {
             status.inc_depth_ring_drops();
         }
-        *last = stale;
+        pair.commit();
         return;
     }
     if is_snapshot {
@@ -1328,13 +1354,18 @@ fn okx_depth_step<C: Capture>(
     }
     match crate::walk_book_levels(payload, ladder) {
         Some(_) => {
-            let snap = ladder.snapshot(now_ns(), VenueId::Okx, sym, 0);
-            if !book_builder::ladder::levels_equal(&snap, last) {
-                capture.depth(&snap);
-                if depth_tx.try_push(snap).is_err() {
+            ladder.snapshot_into(now_ns(), VenueId::Okx, sym, 0, pair.spare_mut());
+            let (snap, last) = pair.spare_and_last();
+            if !book_builder::ladder::levels_equal(snap, last) {
+                capture.depth(snap);
+                // COPY: one 192 B `DepthTopK` into the depth ring's slot,
+                // per CHANGED snapshot — the ring is what hands it to the
+                // strategy thread — rejected: none today (core-ring pushes
+                // by value; an in-slot claim/commit push is the follow-up).
+                if depth_tx.try_push(*snap).is_err() {
                     status.inc_depth_ring_drops();
                 }
-                *last = snap;
+                pair.commit();
             }
         }
         None => {

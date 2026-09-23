@@ -93,8 +93,9 @@
 //! livelocking (fail-fast doctrine).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the rx
-//! buffer in place; requests render into stack scratch; the only copy
-//! is the 64-byte `Tick` moved into the ring.
+//! buffer in place; requests render into stack scratch; the ring copies
+//! are the 64-byte `Tick` and, per changed book top-K, the 192-byte
+//! `DepthTopK` (core-ring pushes by value — marked at the push).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
@@ -109,7 +110,7 @@ use core_net::{
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
 use core_types::{
-    Capture, ChannelEvent, ChannelId, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
+    Capture, ChannelEvent, ChannelId, DepthPair, DepthTopK, OptSummary, Price, Qty, Tick, VenueId,
     DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, SYMBOL_ID_NONE, TICK_FLAG_STALE,
 };
 
@@ -317,8 +318,9 @@ pub struct Driver {
     /// empty when depth is off). Boot-allocated; steady state only
     /// indexes.
     ladders: Vec<book_builder::ladder::DepthLadder>,
-    /// WS10-B: last EMITTED top-K per instrument — the change gate.
-    last_depth: Vec<DepthTopK>,
+    /// WS10-B: the change gate per instrument — the last EMITTED top-K
+    /// and the row the next snapshot is written into, in place.
+    depth: Vec<DepthPair>,
     /// WS6: configured DVOL index names (`n_dvol` valid). Boot-set,
     /// connection-independent; ordinal = position here (the capture
     /// event's `v1` identity).
@@ -415,10 +417,10 @@ impl Driver {
         // WS10-B: per-instrument ladders + last-emitted snapshots,
         // boot-allocated once (empty when depth is off).
         let n_syms = symbols.len();
-        let (ladders, last_depth) = if depth_enabled {
+        let (ladders, depth) = if depth_enabled {
             (
                 vec![book_builder::ladder::DepthLadder::new(); n_syms],
-                vec![DepthTopK::EMPTY; n_syms],
+                vec![DepthPair::new(DepthTopK::EMPTY); n_syms],
             )
         } else {
             (Vec::new(), Vec::new())
@@ -434,7 +436,7 @@ impl Driver {
             symbols,
             depth_enabled,
             ladders,
-            last_depth,
+            depth,
             dvol,
             n_dvol,
             subs: SubTable::new(),
@@ -939,6 +941,24 @@ struct TradeScan {
     intra_last_observed: i64,
 }
 
+// [`scan_trades`] returns a scan by value: pinned within the 64 B bound.
+const _: () = assert!(core::mem::size_of::<TradeScan>() <= 64);
+
+impl TradeScan {
+    /// Nothing walked yet.
+    const EMPTY: Self = Self {
+        rows_parsed: 0,
+        rows_rejected: 0,
+        n_seq: 0,
+        first_seq: 0,
+        last_seq: 0,
+        first_ts_ms: 0,
+        intra_breaks: 0,
+        intra_last_expected: 0,
+        intra_last_observed: 0,
+    };
+}
+
 /// Phase-1 dispatch outcome — everything pre-parsed while the rx
 /// borrow is live, applied after it ends (template pattern).
 #[derive(Copy, Clone)]
@@ -968,20 +988,17 @@ enum Dispatch {
         vol_1e9: i64,
         ordinal: i64,
     },
-    /// `quote` push became a Tick.
-    Quote { tick: Tick },
+    /// `quote` push became the phase-1 tick.
+    Quote,
     /// `ticker` push validated (slow lane; captured as a §6.5 event).
     Ticker,
     /// M2.3: an OPTION row's ticker parsed → `OptSummary` captured in
     /// phase 1 (capture-only; nothing reaches the engine ring).
     OptSummary,
-    /// `trades` push scanned (`sym` rides along for phase-2 gap
-    /// events — resolving it again would re-borrow `drv.symbols`).
-    Trades {
-        sym: u32,
-        sym_idx: u8,
-        scan: TradeScan,
-    },
+    /// `trades` push scanned into the phase-1 scan (`sym` rides along
+    /// for phase-2 gap events — resolving it again would re-borrow
+    /// `drv.symbols`).
+    Trades { sym: u32, sym_idx: u8 },
     /// `book` push — chain applied AND (WS10-B) ladder walked in
     /// phase 1 (payload in scope there; the `BookGap` pairing event
     /// moved with the apply). Phase 2 counts, rate-limit-logs and
@@ -994,6 +1011,10 @@ enum Dispatch {
         prev: i64,
     },
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
@@ -1099,17 +1120,7 @@ fn drain_ws_frames<C: Capture>(
 /// `v1` = amount ×1e6 negated for sell-side prints (Deribit amounts
 /// are USD notionals for perps/futures).
 fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
-    let mut scan = TradeScan {
-        rows_parsed: 0,
-        rows_rejected: 0,
-        n_seq: 0,
-        first_seq: 0,
-        last_seq: 0,
-        first_ts_ms: 0,
-        intra_breaks: 0,
-        intra_last_expected: 0,
-        intra_last_observed: 0,
-    };
+    let mut scan = TradeScan::EMPTY;
     // Rows are the OBJECTS of the `"data":[...]` array, sliced by JSON
     // object extent. The 8c implementation sliced at `"trade_seq":`
     // markers instead and broke live on 2026-08-15: Deribit's starbase
@@ -1154,53 +1165,51 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
             }
         };
         i = row_end;
-        match parse_trade(&payload[row_start..row_end], sym) {
-            Some(t) => {
-                scan.rows_parsed += 1;
-                if scan.n_seq == 0 {
-                    scan.first_seq = t.trade_seq;
-                    scan.first_ts_ms = t.ts_ns / 1_000_000;
-                } else if t.trade_seq != scan.last_seq.wrapping_add(1) {
-                    // Within-frame discontinuity. §6.6 pairing: the
-                    // increment this row will cause in phase 2 gets
-                    // its ChannelEvent HERE, where expected/observed
-                    // are both at hand (v0 = expected, v1 = observed).
-                    scan.intra_breaks += 1;
-                    scan.intra_last_expected = scan.last_seq.wrapping_add(1);
-                    scan.intra_last_observed = t.trade_seq;
-                    capture.event(&ChannelEvent::new(
-                        now_ns(),
-                        VenueId::Deribit,
-                        ChannelId::TradeGap,
-                        sym,
-                        t.trade_seq as u64,
-                        t.ts_ns / 1_000_000,
-                        scan.last_seq.wrapping_add(1),
-                        t.trade_seq,
-                    ));
-                }
-                scan.last_seq = t.trade_seq;
-                scan.n_seq += 1;
-                // §6.5 capture: v0 = px ×1e6, v1 = amount ×1e6 (USD
-                // notional), negated when `direction` is sell.
-                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+        let mut t = crate::DeribitTradeFrame::ZERO;
+        if parse_trade(&payload[row_start..row_end], sym, &mut t) {
+            scan.rows_parsed += 1;
+            if scan.n_seq == 0 {
+                scan.first_seq = t.trade_seq;
+                scan.first_ts_ms = t.ts_ns / 1_000_000;
+            } else if t.trade_seq != scan.last_seq.wrapping_add(1) {
+                // Within-frame discontinuity. §6.6 pairing: the
+                // increment this row will cause in phase 2 gets
+                // its ChannelEvent HERE, where expected/observed
+                // are both at hand (v0 = expected, v1 = observed).
+                scan.intra_breaks += 1;
+                scan.intra_last_expected = scan.last_seq.wrapping_add(1);
+                scan.intra_last_observed = t.trade_seq;
                 capture.event(&ChannelEvent::new(
                     now_ns(),
                     VenueId::Deribit,
-                    ChannelId::Trade,
+                    ChannelId::TradeGap,
                     sym,
                     t.trade_seq as u64,
                     t.ts_ns / 1_000_000,
-                    t.px_1e6,
-                    signed_qty,
+                    scan.last_seq.wrapping_add(1),
+                    t.trade_seq,
                 ));
             }
-            None => {
-                scan.rows_rejected += 1;
-                // Tap the exact rejected row slice — the §6.5 raw-tap
-                // differential audit consumes these.
-                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
-            }
+            scan.last_seq = t.trade_seq;
+            scan.n_seq += 1;
+            // §6.5 capture: v0 = px ×1e6, v1 = amount ×1e6 (USD
+            // notional), negated when `direction` is sell.
+            let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Deribit,
+                ChannelId::Trade,
+                sym,
+                t.trade_seq as u64,
+                t.ts_ns / 1_000_000,
+                t.px_1e6,
+                signed_qty,
+            ));
+        } else {
+            scan.rows_rejected += 1;
+            // Tap the exact rejected row slice — the §6.5 raw-tap
+            // differential audit consumes these.
+            capture.parse_reject(now_ns(), &payload[row_start..row_end]);
         }
     }
     scan
@@ -1220,6 +1229,12 @@ fn handle_data_frame<C: Capture>(
 ) -> io::Result<()> {
     // Retained for the phase-2 reject re-borrow (Range is not Copy).
     let reject_range = payload_range.clone();
+    // Phase 1's tick and trades scan, built in place: riding inside the
+    // dispatch value they would widen every dispatch past the 64 B bound
+    // and cross phase 1 → phase 2 by value. `Dispatch::Quote` /
+    // `Dispatch::Trades` say which one was written.
+    let mut tick = Tick::ZERO;
+    let mut trades = TradeScan::EMPTY;
     // Phase 1: immutable borrow of rx (+ symbols) — classify, resolve
     // the instrument, pre-parse into a Copy dispatch value. Capture
     // hooks that need parsed values fire here (events); the raw tap
@@ -1234,8 +1249,9 @@ fn handle_data_frame<C: Capture>(
             DeribitMsgKind::RpcError { id, code } => Dispatch::VenueError { id, code },
             // WS6: DVOL — venue-global; identity = ordinal into the
             // boot-configured index list (never the symbol table).
-            DeribitMsgKind::VolIndexPush => match parse_vol_index(payload) {
-                Some(f) => {
+            DeribitMsgKind::VolIndexPush => {
+                let mut f = crate::DeribitVolIndexFrame::ZERO;
+                if parse_vol_index(payload, &mut f) {
                     let name = &f.index_name[..f.index_name_len as usize];
                     let mut ordinal: i64 = -1;
                     let mut d = 0;
@@ -1258,8 +1274,9 @@ fn handle_data_frame<C: Capture>(
                             ordinal,
                         }
                     }
+                } else {
+                    Dispatch::Nothing
                 }
-                None => Dispatch::Nothing,
             },
             DeribitMsgKind::RpcResult(id) => {
                 if id == drv.subscribe_req_id {
@@ -1282,31 +1299,32 @@ fn handle_data_frame<C: Capture>(
                         // §6.5: no ChannelEvent for quotes — BBO flows
                         // as `Tick` into the per-venue tick log (see
                         // the `ChannelId` doc in core-types).
-                        DeribitChannel::Quote => match parse_quote(payload, sym) {
-                            Some(f) => {
+                        DeribitChannel::Quote => {
+                            let mut f = crate::DeribitQuoteFrame::ZERO;
+                            if parse_quote(payload, sym, &mut f) {
                                 // VT2: one parse-complete stamp serves
                                 // the tick AND the staleness judgement;
                                 // `timestamp` is the venue quote time.
                                 let now = now_ns();
                                 let judged = drv.feed_clock.judge(f.ts_ms, now);
-                                Dispatch::Quote {
-                                    tick: Tick::new_stamped(
-                                        now,
-                                        VenueId::Deribit,
-                                        sym,
-                                        // No seq on quotes: venue ms
-                                        // timestamp, truncated (crate doc).
-                                        f.ts_ms as u32,
-                                        Price::from_raw(f.bid_px_1e6),
-                                        Qty::from_raw(f.bid_qty_1e6),
-                                        Price::from_raw(f.ask_px_1e6),
-                                        Qty::from_raw(f.ask_qty_1e6),
-                                        f.ts_ms,
-                                        (judged.stale as u8) * TICK_FLAG_STALE,
-                                    ),
-                                }
+                                tick = Tick::new_stamped(
+                                    now,
+                                    VenueId::Deribit,
+                                    sym,
+                                    // No seq on quotes: venue ms
+                                    // timestamp, truncated (crate doc).
+                                    f.ts_ms as u32,
+                                    Price::from_raw(f.bid_px_1e6),
+                                    Qty::from_raw(f.bid_qty_1e6),
+                                    Price::from_raw(f.ask_px_1e6),
+                                    Qty::from_raw(f.ask_qty_1e6),
+                                    f.ts_ms,
+                                    (judged.stale as u8) * TICK_FLAG_STALE,
+                                );
+                                Dispatch::Quote
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                         // M2.3: OPTION rows' ticker carries the
                         // mark/IV/greeks/OI surface → OptSummary
@@ -1314,37 +1332,38 @@ fn handle_data_frame<C: Capture>(
                         // futures parser would reject it (no
                         // current_funding on option tickers).
                         DeribitChannel::Ticker if drv.symbols.is_option_row(sym_idx) => {
-                            match parse_option_ticker(payload) {
-                                Some(f) => {
-                                    let o = OptSummary::new(
-                                        now_ns(),
-                                        VenueId::Deribit,
-                                        sym,
-                                        core_types::OPT_SUMMARY_FLAG_MARK_PX
-                                            | core_types::OPT_SUMMARY_FLAG_OI,
-                                        f.mark_px_1e9,
-                                        f.mark_iv_1e9,
-                                        f.underlying_px_1e9,
-                                        f.open_interest_1e6,
-                                        f.delta_1e9,
-                                        f.gamma_1e9,
-                                        f.vega_1e6,
-                                        f.theta_1e6,
-                                    );
-                                    capture.opt_summary(&o);
-                                    // VM2 V2: onto the opt lane
-                                    // (capture stays first — §6.5
-                                    // capture-before-push law).
-                                    if opt_tx.try_push(o).is_err() {
-                                        status.inc_opt_ring_drops();
-                                    }
-                                    Dispatch::OptSummary
+                            let mut f = crate::DeribitOptTickerFrame::ZERO;
+                            if parse_option_ticker(payload, &mut f) {
+                                let o = OptSummary::new(
+                                    now_ns(),
+                                    VenueId::Deribit,
+                                    sym,
+                                    core_types::OPT_SUMMARY_FLAG_MARK_PX
+                                        | core_types::OPT_SUMMARY_FLAG_OI,
+                                    f.mark_px_1e9,
+                                    f.mark_iv_1e9,
+                                    f.underlying_px_1e9,
+                                    f.open_interest_1e6,
+                                    f.delta_1e9,
+                                    f.gamma_1e9,
+                                    f.vega_1e6,
+                                    f.theta_1e6,
+                                );
+                                capture.opt_summary(&o);
+                                // VM2 V2: onto the opt lane
+                                // (capture stays first — §6.5
+                                // capture-before-push law).
+                                if opt_tx.try_push(o).is_err() {
+                                    status.inc_opt_ring_drops();
                                 }
-                                None => Dispatch::Nothing,
+                                Dispatch::OptSummary
+                            } else {
+                                Dispatch::Nothing
                             }
                         }
-                        DeribitChannel::Ticker => match parse_ticker(payload, sym) {
-                            Some(tk) => {
+                        DeribitChannel::Ticker => {
+                            let mut tk = crate::DeribitTickerFrame::ZERO;
+                            if parse_ticker(payload, sym, &mut tk) {
                                 // §6.5 capture: v0 = mark px ×1e6
                                 // (`mark_px_1e6`), v1 = open interest
                                 // ×1e6 as stored in the parsed POD
@@ -1399,16 +1418,20 @@ fn handle_data_frame<C: Capture>(
                                     }
                                 }
                                 Dispatch::Ticker
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
-                        DeribitChannel::Trades => Dispatch::Trades {
-                            sym,
-                            sym_idx: sym_idx as u8,
-                            scan: scan_trades(payload, sym, capture),
+                        DeribitChannel::Trades => {
+                            trades = scan_trades(payload, sym, capture);
+                            Dispatch::Trades {
+                                sym,
+                                sym_idx: sym_idx as u8,
+                            }
                         },
-                        DeribitChannel::Book => match parse_book_header(payload, sym) {
-                            Some(b) => {
+                        DeribitChannel::Book => {
+                            let mut b = crate::DeribitBookFrame::ZERO;
+                            if parse_book_header(payload, sym, &mut b) {
                                 // §6.5 capture: venue_seq = change_id,
                                 // v0 = prev_change_id (−1 on snapshots
                                 // — the crate's convention for the
@@ -1461,7 +1484,7 @@ fn handle_data_frame<C: Capture>(
                                 if !drv.ladders.is_empty() {
                                     deribit_depth_step(
                                         &mut drv.ladders[sym_idx],
-                                        &mut drv.last_depth[sym_idx],
+                                        &mut drv.depth[sym_idx],
                                         payload,
                                         sym,
                                         gapped,
@@ -1478,8 +1501,9 @@ fn handle_data_frame<C: Capture>(
                                     expected_prev,
                                     prev: b.prev_change_id,
                                 }
+                            } else {
+                                Dispatch::Nothing
                             }
-                            None => Dispatch::Nothing,
                         },
                     },
                     // Data for an instrument we never configured —
@@ -1634,7 +1658,7 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             status.add_ticks(1);
         }
-        Dispatch::Quote { tick } => {
+        Dispatch::Quote => {
             status.add_msgs(1);
             status.add_ticks(1);
             // VT2: stale quotes are captured and pushed like any other
@@ -1661,7 +1685,8 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             status.add_ticks(1);
         }
-        Dispatch::Trades { sym, sym_idx, scan } => {
+        Dispatch::Trades { sym, sym_idx } => {
+            let scan = &trades;
             status.add_msgs(scan.rows_parsed as u64);
             status.add_ticks(scan.rows_parsed as u64);
             let mut r = 0;
@@ -1741,11 +1766,13 @@ fn handle_data_frame<C: Capture>(
 /// change-gated emission (capture first, then the depth-lane push;
 /// full-ring pushes count `depth_ring_drops`). On a chain gap the
 /// ladder clears and a `DEPTH_FLAG_STALE` snapshot ALWAYS emits so a
-/// strategy never trades a known-broken book.
+/// strategy never trades a known-broken book. Snapshots are written in
+/// place into `pair`'s spare row; an emitted one becomes the last by
+/// [`DepthPair::commit`], never by a copy.
 #[allow(clippy::too_many_arguments)]
 fn deribit_depth_step<C: Capture>(
     ladder: &mut book_builder::ladder::DepthLadder,
-    last: &mut DepthTopK,
+    pair: &mut DepthPair,
     payload: &[u8],
     sym: u32,
     gapped: bool,
@@ -1756,17 +1783,17 @@ fn deribit_depth_step<C: Capture>(
 ) {
     if gapped {
         ladder.clear();
-        let stale = ladder.snapshot(
-            now_ns(),
-            VenueId::Deribit,
-            sym,
-            core_types::DEPTH_FLAG_STALE,
-        );
-        capture.depth(&stale);
-        if depth_tx.try_push(stale).is_err() {
+        let stale = pair.spare_mut();
+        ladder.snapshot_into(now_ns(), VenueId::Deribit, sym, core_types::DEPTH_FLAG_STALE, stale);
+        capture.depth(stale);
+        // COPY: one 192 B `DepthTopK` into the depth ring's slot, per
+        // emitted snapshot — the ring is what hands it to the strategy
+        // thread — rejected: none today (core-ring pushes by value; an
+        // in-slot claim/commit push is the follow-up).
+        if depth_tx.try_push(*stale).is_err() {
             status.inc_depth_ring_drops();
         }
-        *last = stale;
+        pair.commit();
         return;
     }
     if is_snapshot {
@@ -1774,13 +1801,18 @@ fn deribit_depth_step<C: Capture>(
     }
     match crate::walk_book_levels(payload, ladder) {
         Some(_) => {
-            let snap = ladder.snapshot(now_ns(), VenueId::Deribit, sym, 0);
-            if !book_builder::ladder::levels_equal(&snap, last) {
-                capture.depth(&snap);
-                if depth_tx.try_push(snap).is_err() {
+            ladder.snapshot_into(now_ns(), VenueId::Deribit, sym, 0, pair.spare_mut());
+            let (snap, last) = pair.spare_and_last();
+            if !book_builder::ladder::levels_equal(snap, last) {
+                capture.depth(snap);
+                // COPY: one 192 B `DepthTopK` into the depth ring's slot,
+                // per CHANGED snapshot — the ring is what hands it to the
+                // strategy thread — rejected: none today (core-ring pushes
+                // by value; an in-slot claim/commit push is the follow-up).
+                if depth_tx.try_push(*snap).is_err() {
                     status.inc_depth_ring_drops();
                 }
-                *last = snap;
+                pair.commit();
             }
         }
         None => {

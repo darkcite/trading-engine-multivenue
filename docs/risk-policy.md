@@ -2589,6 +2589,95 @@ lane, `core-net` and `ingress-binance`. The baseline shrank by one (the
 old single-payload copy in `ws_frame.rs`, now the marked parts write)
 and did not grow.
 
+### BX0 — the other ingress crates parse in place too (2026-09-23)
+
+On the operator's word ("the okx, deribit, hyperliquid and mexc parsers
+return frames by value too — fix it as far as you've found it"): the
+pattern the BX0 pass removed from `ingress-binance` was measured across
+every other ingress crate and removed there as well — `ingress-okx`,
+`-deribit`, `-hyperliquid`, `-mexc`, `-bybit`, `-polymarket` and `-rpc`.
+
+**What the pass removed** (copies gone, not commented):
+
+* **30 parsers** returned a 64 B `align(64)` frame inside an `Option` —
+  128 B by value (192 B for `DeribitTickerFrame`, 256 B for HL's
+  `DepthTopK`) on every push they parse. Each now fills the caller's
+  frame in place (`&mut Frame` → `bool`, `#[must_use]`) and writes it
+  once, only after every field has parsed, so a failed parse leaves it
+  untouched. The one exception is `parse_l2book_depth`, whose level
+  carrier fills as the walk goes and is never read on `false` (its
+  header obeys the rule).
+* **Frames inside the dispatch value.** The two-phase run loops carried
+  the parsed `Tick` / frame / head inside `Dispatch` from phase 1 to
+  phase 2 — every dispatch value ≥ 128 B (a 64 B `align(64)` payload
+  plus its tag), and mexc's crossed two function returns by value. The frame now lives in a phase-1 scratch the arm
+  writes in place; the variant only says it was written. Each run
+  loop's `Dispatch` is const-asserted ≤ 64 B (HL's 64 B roll spec is
+  parked in the driver to fit).
+* **OKX's 144 B `TradeScan`** staged sixteen seq ids for phase 2. The
+  seq monitor is a driver field disjoint from the rx borrow, so the walk
+  chain-checks the same first 16 rows as it reads them; the scan is
+  12 B.
+* **The top-K change gate** kept the last snapshot by copying the new
+  one over it (192 B per changed push, OKX / Deribit / HL). The new
+  `core_types::DepthPair` holds two rows: the snapshot is written in
+  place into the spare one and becomes the last by an index flip.
+  `DepthLadder::snapshot_into` / `top_k_into` replace the 192 B / 80 B
+  by-value `snapshot` / `top_k`.
+* **HL walked an outcome leg's `l2Book` twice** (header, then depth):
+  `parse_l2book_depth` now yields the header from the same walk.
+
+**What the pass commented** (designed copies, each with its `// COPY:`):
+the 192 B `DepthTopK` pushed into the depth ring (OKX, Deribit) —
+core-ring has only a by-value `try_push`; the boot-time discovery rows
+(Deribit, MEXC ×2, HL, Polymarket ×2, OKX; 80–264 B, once per row);
+`DepthPair::new` at boot; the HL test recorder; and one marker per test
+view (the views are now one `#[cfg(test)] mod views` per file). Two
+by-value returns at the bound are pinned by compile-time asserts:
+`Option<MexcSpotFrame>` (64 B only through `MexcChannel`'s niche) and
+Deribit's 56 B `TradeScan`.
+
+**The fuzz contract is checked against non-zero bytes.** Starting a
+target from `ZERO` could not tell "untouched" from "zeroed on the way
+out". Thirteen targets now start from a `0xA5`-filled frame
+(`fuzz/fuzz_targets/common/poison.rs`; `poisoned::<T>()` is bounded on
+the `unsafe trait AnyBits`, implemented only for the 28 frames checked
+field by field as integer-only `repr(C)`). `parse_price_change_row` and
+`parse_l2book_depth` are now fuzzed and alloc-gated; `hl_l2book` —
+broken since `HlStaleness::arm` took the coin table — compiles again
+and runs a header-vs-depth differential.
+
+**The auditor on the pass** (`zero-copy-auditor`): PASS — no hot hidden
+copy left on these lanes; RX = 4 against the target of 3, the extra one
+core-net's rustls copy (above). Its findings were acted on: the poison
+helper's first soundness argument (a niche check) was not a proof, so
+the proof moved into the `AnyBits` contract and the niche check stayed
+as a tripwire; three more cold discovery returns got markers; two
+at-bound returns got size pins; stale docs were corrected.
+
+**Open, not in this pass:**
+
+1. **core-ring moves by value.** `try_push(T)` and `try_pop() ->
+   Option<T>` — every consumer pops a 128 B `Option<Tick>` per tick and
+   a 256 B `Option<DepthTopK>` per snapshot. An in-slot claim/commit
+   push and a `pop_into(&mut T) -> bool` is its own change, across
+   every consumer.
+2. **These seven crates are not in `make copy-audit`.** A sweep with
+   the script's own reader finds 51 unmarked copy verbs, all older than
+   this pass. The hot one is the WS Ping echo through a 125 B stack
+   scratch in OKX, Deribit, HL, Bybit, RPC and Polymarket (BX0 removed
+   it from Binance; MEXC marks it); the rest are cold (subscribe,
+   resync and log renders, boot symbol copies, Bybit's boot `to_vec`).
+   Whether they join the gate is the operator's call.
+
+Gates after the pass: clippy clean; nextest 2743 passed (3 skipped; one
+earlier run hit the known parallel-load flake
+`hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`,
+green alone and on the rerun); alloc 64/64 at 0 B/op; `make copy-audit`
+new=0; license-check OK; fourteen fuzz targets 60 s each, no crash
+(1.1 M–31 M runs); live smokes 60 s — MEXC 31 002 messages, Binance
+59 819 — both with 0 parse errors and 0 reconnects.
+
 ## E6 — the risk gate and the kill switches
 
 ### E6 commit 1 — the per-order clamp (2026-09-19)

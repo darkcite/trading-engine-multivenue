@@ -379,6 +379,18 @@ pub struct MexcDeal {
 }
 
 impl MexcDeal {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        px_1e6: 0,
+        qty_1e6: 0,
+        time_ms: 0,
+        trade_seq: 0,
+        side: 0,
+        _pad: [0; 31],
+    };
+}
+
+impl MexcDeal {
     #[inline]
     pub(crate) const fn new(px_1e6: i64, qty_1e6: i64, time_ms: u64, trade_seq: u64, side: u8) -> Self {
         Self {

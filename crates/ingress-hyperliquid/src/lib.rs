@@ -119,7 +119,7 @@ pub use run_loop::{
 
 use core_net::SubId;
 use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte, skip_ws};
-use core_types::{DepthLevel, DepthTopK, NsTs, SymbolId, VenueId, DEPTH_K};
+use core_types::{DepthLevel, DepthTopK, NsTs, SymbolId, VenueId};
 
 // ---------------------------------------------------------------
 // Constants
@@ -303,6 +303,19 @@ pub struct HlBboFrame {
     _pad: [u8; 20],
 }
 
+impl HlBboFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        sym: 0,
+        _pad: [0; 20],
+    };
+}
+
 /// Parsed `l2Book` snapshot **header** — §4.5: depth is consumed for
 /// capture + integrity, so only the event time, level counts and the
 /// touch are lifted; levels stay in the rx buffer.
@@ -330,6 +343,21 @@ pub struct HlL2BookFrame {
     _pad: [u8; 16],
 }
 
+impl HlL2BookFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        best_bid_px_1e6: 0,
+        best_ask_px_1e6: 0,
+        sym: 0,
+        n_bids: 0,
+        n_asks: 0,
+        best_bid_sz_1e6: 0,
+        best_ask_sz_1e6: 0,
+        _pad: [0; 16],
+    };
+}
+
 /// Parsed `trades` row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
@@ -348,6 +376,19 @@ pub struct HlTradeFrame {
     pub side: u8,
     // Explicit tail padding.
     _pad: [u8; 27],
+}
+
+impl HlTradeFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        tid: 0,
+        ts_ns: 0,
+        px_1e6: 0,
+        qty_1e6: 0,
+        sym: 0,
+        side: 0,
+        _pad: [0; 27],
+    };
 }
 
 /// Parsed `activeAssetCtx` push (funding/oracle/mark/OI). The ctx
@@ -373,6 +414,19 @@ pub struct HlAssetCtxFrame {
     pub sym: SymbolId,
     // Explicit tail padding.
     _pad: [u8; 20],
+}
+
+impl HlAssetCtxFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        funding_1e9: 0,
+        mark_px_1e6: 0,
+        oracle_px_1e6: 0,
+        oi_1e6: 0,
+        premium_1e9: 0,
+        sym: 0,
+        _pad: [0; 20],
+    };
 }
 
 /// HIP-4 lifecycle event kinds (`outcomeMetaUpdates`).
@@ -408,6 +462,16 @@ pub struct HlOutcomeMetaFrame {
     pub kind: u8,
     // Explicit tail padding.
     _pad: [u8; 51],
+}
+
+impl HlOutcomeMetaFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        enc: 0,
+        kind: 0,
+        _pad: [0; 51],
+    };
 }
 
 const _SIZE_CHECKS: () = {
@@ -507,9 +571,21 @@ fn scan_side_levels(
 
 /// Parse a `bbo` push into an [`HlBboFrame`]. `sym` is the
 /// caller-resolved symbol (from [`extract_coin`] + [`HlCoinTable`]).
-/// Returns `None` on malformed input — caller counts it.
+/// Returns `false` on malformed input — caller counts it.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<HlBboFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_bbo(payload: &[u8], sym: SymbolId, out: &mut HlBboFrame) -> bool {
+    parse_bbo_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_bbo`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_bbo_fill(payload: &[u8], sym: SymbolId, out: &mut HlBboFrame) -> Option<()> {
     let pos = find_field(payload, b"\"bbo\":")?;
     if *payload.get(pos)? != b'[' {
         return None;
@@ -524,7 +600,7 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<HlBboFrame> {
     if bid_px_1e6 == 0 && ask_px_1e6 == 0 {
         return None;
     }
-    Some(HlBboFrame {
+    *out = HlBboFrame {
         ts_ns,
         bid_px_1e6,
         bid_qty_1e6,
@@ -532,7 +608,8 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<HlBboFrame> {
         ask_qty_1e6,
         sym,
         _pad: [0; 20],
-    })
+    };
+    Some(())
 }
 
 /// Parse an `l2Book` snapshot into its [`HlL2BookFrame`] header.
@@ -545,28 +622,52 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<HlBboFrame> {
 /// `null`. Probed live 2026-09-12 on `#27760`: `bbo` gave
 /// `[{"px":"0.5",...}, null]` while `l2Book` on the same coin in the
 /// same second had six asks, best `0.69`.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_l2book_header(payload: &[u8], sym: SymbolId) -> Option<HlL2BookFrame> {
-    parse_l2book(payload, sym, &mut [], &mut [])
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_l2book_header(payload: &[u8], sym: SymbolId, out: &mut HlL2BookFrame) -> bool {
+    parse_l2book(payload, sym, &mut [], &mut [], out)
 }
 
 /// [`parse_l2book_header`] that also lifts the first `bids.len()` /
-/// `asks.len()` levels of each side into the caller's arrays, in venue
+/// `asks.len()` levels of each side into the caller's slices, in venue
 /// (best-first) order; levels beyond the book's real depth are left as
 /// the caller set them (`DepthLevel::EMPTY`). The WS10-B depth capture
-/// for a HIP-4 outcome leg is this call with two `[DepthLevel; DEPTH_K]`
-/// on the stack — one walk of the snapshot serves the touch, the level
-/// counts and the top-K (2026-09-19; the venue pushes `l2Book` on a
-/// 5.3 s timer per coin, measured on mainnet, so the snapshot IS the
-/// only full view of an outcome book and the capture keeps every
-/// change of its top five levels).
+/// for a HIP-4 outcome leg ([`parse_l2book_depth`]) hands it its
+/// carrier's own level arrays — one walk of the snapshot serves the
+/// touch, the level counts and the top-K (2026-09-19; the venue pushes
+/// `l2Book` on a 5.3 s timer per coin, measured on mainnet, so the
+/// snapshot IS the only full view of an outcome book and the capture
+/// keeps every change of its top five levels).
+///
+/// The header is written IN PLACE into `out`, once, after the whole
+/// snapshot has parsed; the level slices fill as the walk goes, so a
+/// `false` can leave some of them written.
 #[inline]
-pub fn parse_l2book(
+#[must_use = "on `false` the frame was not written"]
+fn parse_l2book(
     payload: &[u8],
     sym: SymbolId,
     bids: &mut [DepthLevel],
     asks: &mut [DepthLevel],
-) -> Option<HlL2BookFrame> {
+    out: &mut HlL2BookFrame,
+) -> bool {
+    parse_l2book_fill(payload, sym, bids, asks, out).is_some()
+}
+
+/// [`parse_l2book`]'s body: `?` short-circuits, and `out` is written once,
+/// at the end, only after every field has parsed.
+#[inline(always)]
+fn parse_l2book_fill(
+    payload: &[u8],
+    sym: SymbolId,
+    bids: &mut [DepthLevel],
+    asks: &mut [DepthLevel],
+    out: &mut HlL2BookFrame,
+) -> Option<()> {
     let pos = find_field(payload, b"\"levels\":")?;
     if *payload.get(pos)? != b'[' {
         return None;
@@ -579,7 +680,7 @@ pub fn parse_l2book(
     let (n_asks, best_ask_px_1e6, best_ask_sz_1e6, _asks_end) =
         scan_side_levels(payload, bids_end + 1, asks)?;
     let ts_ns = scan_bare_ms_to_ns(payload, b"\"time\":")?;
-    Some(HlL2BookFrame {
+    *out = HlL2BookFrame {
         ts_ns,
         best_bid_px_1e6,
         best_ask_px_1e6,
@@ -589,26 +690,58 @@ pub fn parse_l2book(
         best_bid_sz_1e6,
         best_ask_sz_1e6,
         _pad: [0; 16],
-    })
+    };
+    Some(())
 }
 
 /// The WS10-B depth snapshot of a HIP-4 outcome leg from one `l2Book`
-/// push: the top [`DEPTH_K`] of each side, best-first, `EMPTY` beyond
-/// the book's depth. `None` on a malformed frame (the caller counts
-/// it, exactly as for the header).
+/// push: the top [`core_types::DEPTH_K`] of each side, best-first, `EMPTY` beyond
+/// the book's depth, plus the snapshot's [`HlL2BookFrame`] header from
+/// the same walk — an outcome leg needs both, and one walk yields both.
+/// `false` on a malformed frame (the caller counts it, exactly as for
+/// [`parse_l2book_header`]).
+///
+/// Parsed IN PLACE (`out` is 192 B; its `Option` was 256 B by value):
+/// the top-K levels are lifted straight into `out.bids` / `out.asks`,
+/// never staged on the stack. `header` follows the fixed-size frames'
+/// rule — written once, untouched on `false`. `out` does NOT: the walk
+/// may have filled some levels, so it is never read on `false`.
 #[inline]
-pub fn parse_l2book_depth(payload: &[u8], sym: SymbolId, now_ns: NsTs) -> Option<DepthTopK> {
-    let mut bids = [DepthLevel::EMPTY; DEPTH_K];
-    let mut asks = [DepthLevel::EMPTY; DEPTH_K];
-    parse_l2book(payload, sym, &mut bids, &mut asks)?;
-    Some(DepthTopK::new(now_ns, VenueId::Hyperliquid, sym, 0, bids, asks))
+#[must_use = "on `false` the frame is not a snapshot"]
+pub fn parse_l2book_depth(
+    payload: &[u8],
+    sym: SymbolId,
+    now_ns: NsTs,
+    out: &mut DepthTopK,
+    header: &mut HlL2BookFrame,
+) -> bool {
+    *out = DepthTopK::EMPTY;
+    if !parse_l2book(payload, sym, &mut out.bids, &mut out.asks, header) {
+        return false;
+    }
+    out.ts_ns = now_ns;
+    out.venue = VenueId::Hyperliquid as u8;
+    out.sym = sym;
+    true
 }
 
 /// Parse one `trades` row into an [`HlTradeFrame`]. Hyperliquid
 /// batches rows per push; the run loop walks rows by re-slicing the
 /// payload at successive `"coin":"` markers.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<HlTradeFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_trade(payload: &[u8], sym: SymbolId, out: &mut HlTradeFrame) -> bool {
+    parse_trade_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_trade`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_trade_fill(payload: &[u8], sym: SymbolId, out: &mut HlTradeFrame) -> Option<()> {
     // side: "side":"B" (buy) | "side":"A" (sell) — closing quote in
     // the pattern so a coin named B/A can never alias.
     let side = if memchr::memmem::find(payload, b"\"side\":\"B\"").is_some() {
@@ -628,7 +761,7 @@ pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<HlTradeFrame> {
     // tid: unquoted decimal.
     let pos = find_field(payload, b"\"tid\":")?;
     let (tid, _) = scan_u64(payload, pos)?;
-    Some(HlTradeFrame {
+    *out = HlTradeFrame {
         tid,
         ts_ns,
         px_1e6,
@@ -636,15 +769,28 @@ pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<HlTradeFrame> {
         sym,
         side,
         _pad: [0; 27],
-    })
+    };
+    Some(())
 }
 
 /// Parse an `activeAssetCtx` push into an [`HlAssetCtxFrame`]. The
 /// four original fields are required — a ctx without them is
 /// malformed for the perp coins we subscribe. `premium` (WS3) is
 /// optional: absent ⇒ 0.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_active_asset_ctx(payload: &[u8], sym: SymbolId) -> Option<HlAssetCtxFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_active_asset_ctx(payload: &[u8], sym: SymbolId, out: &mut HlAssetCtxFrame) -> bool {
+    parse_active_asset_ctx_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_active_asset_ctx`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_active_asset_ctx_fill(payload: &[u8], sym: SymbolId, out: &mut HlAssetCtxFrame) -> Option<()> {
     let pos = find_field(payload, b"\"funding\":")?;
     let pos = skip_byte(payload, pos, b'"');
     let (funding_1e9, _) = scan_price_1e9(payload, pos)?;
@@ -666,7 +812,7 @@ pub fn parse_active_asset_ctx(payload: &[u8], sym: SymbolId) -> Option<HlAssetCt
         }
         None => 0,
     };
-    Some(HlAssetCtxFrame {
+    *out = HlAssetCtxFrame {
         funding_1e9,
         mark_px_1e6,
         oracle_px_1e6,
@@ -674,7 +820,8 @@ pub fn parse_active_asset_ctx(payload: &[u8], sym: SymbolId) -> Option<HlAssetCt
         premium_1e9,
         sym,
         _pad: [0; 20],
-    })
+    };
+    Some(())
 }
 
 /// Parse an `allMids` push: returns the number of mid entries (each
@@ -694,8 +841,20 @@ pub fn parse_all_mids(payload: &[u8]) -> Option<u32> {
 /// Parse an `outcomeMetaUpdates` push into an
 /// [`HlOutcomeMetaFrame`]. Kind is required; `#<enc>` coin and time
 /// are optional (see the frame doc).
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_outcome_meta(payload: &[u8]) -> Option<HlOutcomeMetaFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_outcome_meta(payload: &[u8], out: &mut HlOutcomeMetaFrame) -> bool {
+    parse_outcome_meta_fill(payload, out).is_some()
+}
+
+/// [`parse_outcome_meta`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_outcome_meta_fill(payload: &[u8], out: &mut HlOutcomeMetaFrame) -> Option<()> {
     let kind = if memchr::memmem::find(payload, b"\"outcomeCreated\"").is_some() {
         OUTCOME_CREATED
     } else if memchr::memmem::find(payload, b"\"outcomeSettled\"").is_some() {
@@ -709,12 +868,13 @@ pub fn parse_outcome_meta(payload: &[u8]) -> Option<HlOutcomeMetaFrame> {
     };
     let enc = outcome_enc(payload, kind);
     let ts_ns = scan_bare_ms_to_ns(payload, b"\"time\":").unwrap_or(0);
-    Some(HlOutcomeMetaFrame {
+    *out = HlOutcomeMetaFrame {
         ts_ns,
         enc,
         kind,
         _pad: [0; 51],
-    })
+    };
+    Some(())
 }
 
 /// The outcome id an `outcomeMetaUpdates` element names.
@@ -1367,9 +1527,66 @@ pub fn sub_id_of(channel: HlChannel, coin: &[u8]) -> SubId {
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<HlBboFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_bbo_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::HlBboFrame> {
+        let mut f = crate::HlBboFrame::ZERO;
+        crate::parse_bbo(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<HlTradeFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_trade_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::HlTradeFrame> {
+        let mut f = crate::HlTradeFrame::ZERO;
+        crate::parse_trade(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<HlAssetCtxFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_active_asset_ctx_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::HlAssetCtxFrame> {
+        let mut f = crate::HlAssetCtxFrame::ZERO;
+        crate::parse_active_asset_ctx(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<HlOutcomeMetaFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_outcome_meta_view(payload: &[u8]) -> Option<crate::HlOutcomeMetaFrame> {
+        let mut f = crate::HlOutcomeMetaFrame::ZERO;
+        crate::parse_outcome_meta(payload, &mut f).then_some(f)
+    }
+    // COPY: `Option<HlL2BookFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_l2book_header_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::HlL2BookFrame> {
+        let mut f = crate::HlL2BookFrame::ZERO;
+        crate::parse_l2book_header(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<DepthTopK>` 256 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_l2book_depth_view(
+        payload: &[u8],
+        sym: core_types::SymbolId,
+        now_ns: core_types::NsTs,
+    ) -> Option<core_types::DepthTopK> {
+        let mut d = core_types::DepthTopK::EMPTY;
+        let mut header = crate::HlL2BookFrame::ZERO;
+        crate::parse_l2book_depth(payload, sym, now_ns, &mut d, &mut header).then_some(d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_types::DEPTH_K;
+    use super::views::*;
 
     const BBO: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#;
     const BBO_ONE_SIDED: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398624,"bbo":[null,{"px":"64438.0","sz":"0.541","n":3}]}}"#;
@@ -1442,7 +1659,7 @@ mod tests {
 
     #[test]
     fn parse_bbo_extracts_both_sides() {
-        let f = parse_bbo(BBO, 7).unwrap();
+        let f = parse_bbo_view(BBO, 7).unwrap();
         assert_eq!(f.sym, 7);
         assert_eq!(f.bid_px_1e6, 64_437_000_000);
         assert_eq!(f.bid_qty_1e6, 1_449_100);
@@ -1453,7 +1670,7 @@ mod tests {
 
     #[test]
     fn parse_bbo_null_side_yields_zeroes() {
-        let f = parse_bbo(BBO_ONE_SIDED, 1).unwrap();
+        let f = parse_bbo_view(BBO_ONE_SIDED, 1).unwrap();
         assert_eq!(f.bid_px_1e6, 0);
         assert_eq!(f.bid_qty_1e6, 0);
         assert_eq!(f.ask_px_1e6, 64_438_000_000);
@@ -1462,16 +1679,16 @@ mod tests {
     #[test]
     fn parse_bbo_rejects_missing_time_and_double_null() {
         let no_time = br#"{"bbo":[{"px":"1.0","sz":"1.0","n":1},{"px":"2.0","sz":"1.0","n":1}]}"#;
-        assert!(parse_bbo(no_time, 0).is_none());
+        assert!(parse_bbo_view(no_time, 0).is_none());
         let both_null = br#"{"time":1000,"bbo":[null,null]}"#;
-        assert!(parse_bbo(both_null, 0).is_none());
+        assert!(parse_bbo_view(both_null, 0).is_none());
     }
 
     // ---- parse_l2book_header -------------------------------------
 
     #[test]
     fn parse_l2book_counts_levels_and_lifts_touch() {
-        let f = parse_l2book_header(L2BOOK, 3).unwrap();
+        let f = parse_l2book_header_view(L2BOOK, 3).unwrap();
         assert_eq!(f.sym, 3);
         assert_eq!(f.n_bids, 2);
         assert_eq!(f.n_asks, 1);
@@ -1483,20 +1700,20 @@ mod tests {
     #[test]
     fn parse_l2book_empty_side_and_rejects() {
         let empty_asks = br#"{"time":1000,"levels":[[{"px":"1.0","sz":"1.0","n":1}],[]]}"#;
-        let f = parse_l2book_header(empty_asks, 0).unwrap();
+        let f = parse_l2book_header_view(empty_asks, 0).unwrap();
         assert_eq!(f.n_bids, 1);
         assert_eq!(f.n_asks, 0);
         assert_eq!(f.best_ask_px_1e6, 0);
-        assert!(parse_l2book_header(b"{}", 0).is_none());
+        assert!(parse_l2book_header_view(b"{}", 0).is_none());
         let bad_level = br#"{"time":1000,"levels":[[{"sz":"1.0"}],[]]}"#;
-        assert!(parse_l2book_header(bad_level, 0).is_none());
+        assert!(parse_l2book_header_view(bad_level, 0).is_none());
     }
 
     // ---- parse_trade ---------------------------------------------
 
     #[test]
     fn parse_trade_extracts_fields() {
-        let t = parse_trade(TRADES, 5).unwrap();
+        let t = parse_trade_view(TRADES, 5).unwrap();
         assert_eq!(t.sym, 5);
         assert_eq!(t.tid, 118_906_512_037_719);
         assert_eq!(t.px_1e6, 19_900_500_000);
@@ -1508,16 +1725,16 @@ mod tests {
     #[test]
     fn parse_trade_sell_side_and_missing_side() {
         let sell = br#"{"coin":"X","side":"A","px":"1.0","sz":"1.0","time":1000,"tid":7}"#;
-        assert_eq!(parse_trade(sell, 0).unwrap().side, 1);
+        assert_eq!(parse_trade_view(sell, 0).unwrap().side, 1);
         let bad = br#"{"coin":"X","px":"1.0","sz":"1.0","time":1000,"tid":7}"#;
-        assert!(parse_trade(bad, 0).is_none());
+        assert!(parse_trade_view(bad, 0).is_none());
     }
 
     // ---- parse_active_asset_ctx ----------------------------------
 
     #[test]
     fn parse_ctx_keeps_1e9_funding_precision() {
-        let f = parse_active_asset_ctx(CTX, 9).unwrap();
+        let f = parse_active_asset_ctx_view(CTX, 9).unwrap();
         assert_eq!(f.sym, 9);
         assert_eq!(f.funding_1e9, 12_500);
         assert_eq!(f.mark_px_1e6, 14_316_100);
@@ -1530,11 +1747,11 @@ mod tests {
     #[test]
     fn parse_ctx_negative_funding_and_rejects_missing() {
         let neg = br#"{"ctx":{"funding":"-0.0000125","markPx":"1.0","oraclePx":"1.0","openInterest":"2.0"}}"#;
-        let f = parse_active_asset_ctx(neg, 0).unwrap();
+        let f = parse_active_asset_ctx_view(neg, 0).unwrap();
         assert_eq!(f.funding_1e9, -12_500);
         assert_eq!(f.premium_1e9, 0, "absent premium parses as 0 (optional)");
         let missing = br#"{"ctx":{"funding":"0.0000125","markPx":"1.0"}}"#;
-        assert!(parse_active_asset_ctx(missing, 0).is_none());
+        assert!(parse_active_asset_ctx_view(missing, 0).is_none());
     }
 
     #[test]
@@ -1542,7 +1759,7 @@ mod tests {
         // WS3: a discount (mark below oracle) is a signed premium.
         let neg = br#"{"ctx":{"funding":"0.0000125","markPx":"1.0","oraclePx":"1.0","openInterest":"2.0","premium":"-0.00031774"}}"#;
         assert_eq!(
-            parse_active_asset_ctx(neg, 0).unwrap().premium_1e9,
+            parse_active_asset_ctx_view(neg, 0).unwrap().premium_1e9,
             -317_740
         );
     }
@@ -1563,12 +1780,12 @@ mod tests {
 
     #[test]
     fn parse_outcome_meta_kinds_and_enc() {
-        let f = parse_outcome_meta(OUTCOME).unwrap();
+        let f = parse_outcome_meta_view(OUTCOME).unwrap();
         assert_eq!(f.kind, OUTCOME_CREATED);
         assert_eq!(f.enc, 330);
         assert_eq!(f.ts_ns, 1_723_600_000_000 * 1_000_000);
         let settled = br#"{"channel":"outcomeMetaUpdates","data":[{"kind":"questionSettled"}]}"#;
-        let f = parse_outcome_meta(settled).unwrap();
+        let f = parse_outcome_meta_view(settled).unwrap();
         assert_eq!(f.kind, QUESTION_SETTLED);
         assert_eq!(f.enc, OUTCOME_ENC_NONE);
         assert_eq!(f.ts_ns, 0);
@@ -1576,7 +1793,7 @@ mod tests {
 
     #[test]
     fn parse_outcome_meta_rejects_unknown_kind() {
-        assert!(parse_outcome_meta(
+        assert!(parse_outcome_meta_view(
             br#"{"channel":"outcomeMetaUpdates","data":[{"kind":"other"}]}"#
         )
         .is_none());
@@ -1586,19 +1803,19 @@ mod tests {
     fn parse_outcome_meta_reads_the_live_shape() {
         // The live created push: the id lives INSIDE the created
         // object and `enc` is its Yes side, `10 * 2649`.
-        let f = parse_outcome_meta(OUTCOME_LIVE_CREATED).unwrap();
+        let f = parse_outcome_meta_view(OUTCOME_LIVE_CREATED).unwrap();
         assert_eq!(f.kind, OUTCOME_CREATED);
         assert_eq!(f.enc, 26_490);
         // The live shape carries no top-level `time`.
         assert_eq!(f.ts_ns, 0);
 
-        let f = parse_outcome_meta(OUTCOME_LIVE_SETTLED).unwrap();
+        let f = parse_outcome_meta_view(OUTCOME_LIVE_SETTLED).unwrap();
         assert_eq!(f.kind, OUTCOME_SETTLED);
         assert_eq!(f.enc, 26_380);
         assert_eq!(f.ts_ns, 0);
 
         // A settled push that wraps the id in an object still reads.
-        let f = parse_outcome_meta(
+        let f = parse_outcome_meta_view(
             br#"{"channel":"outcomeMetaUpdates","data":[{"outcomeSettled":{"outcome":2638}}]}"#,
         )
         .unwrap();
@@ -1814,7 +2031,7 @@ mod tests {
     #[test]
     fn l2book_header_carries_both_sides_price_and_size() {
         let p = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1}]]}}"##;
-        let f = parse_l2book_header(p, 7).expect("header");
+        let f = parse_l2book_header_view(p, 7).expect("header");
         assert_eq!(f.best_bid_px_1e6, 500_000);
         assert_eq!(f.best_bid_sz_1e6, 64_000_000);
         assert_eq!(f.best_ask_px_1e6, 690_000);
@@ -1832,7 +2049,7 @@ mod tests {
     #[test]
     fn l2book_depth_lifts_the_top_k_levels_in_venue_order() {
         let p = br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1}]]}}"##;
-        let d = parse_l2book_depth(p, 7, 123).expect("depth");
+        let d = parse_l2book_depth_view(p, 7, 123).expect("depth");
         assert_eq!(d.ts_ns, 123);
         assert_eq!(d.sym, 7);
         assert_eq!(d.venue, VenueId::Hyperliquid as u8);
@@ -1843,8 +2060,13 @@ mod tests {
         assert_eq!(d.asks[0], DepthLevel { px_1e6: 690_000, qty_1e6: 69_000_000 });
         assert_eq!(d.asks[1], DepthLevel::EMPTY);
         // The header read of the same frame is unchanged by the arrays.
-        let f = parse_l2book_header(p, 7).expect("header");
+        let f = parse_l2book_header_view(p, 7).expect("header");
         assert_eq!((f.n_bids, f.n_asks, f.best_ask_px_1e6), (2, 1, 690_000));
+        // One walk yields both: the depth walk's header is the header walk's.
+        let mut snap = DepthTopK::EMPTY;
+        let mut header = HlL2BookFrame::ZERO;
+        assert!(parse_l2book_depth(p, 7, 123, &mut snap, &mut header));
+        assert_eq!(header, f, "the depth walk's header differs from the header walk's");
 
         // Seven bids, three asks: the top five bids, all three asks.
         let mut buf = String::with_capacity(1024);
@@ -1858,14 +2080,14 @@ mod tests {
             write!(&mut buf, r#"{}{{"px":"0.{}","sz":"{}.0","n":1}}"#, if i == 0 { "" } else { "," }, 91 + i, 20 + i).unwrap();
         }
         write!(&mut buf, r#"]]}}}}"#).unwrap();
-        let d = parse_l2book_depth(buf.as_bytes(), 7, 1).expect("depth");
+        let d = parse_l2book_depth_view(buf.as_bytes(), 7, 1).expect("depth");
         assert_eq!(d.bids[4], DepthLevel { px_1e6: 860_000, qty_1e6: 14_000_000 }, "fifth-best bid");
         assert_eq!(d.asks[2], DepthLevel { px_1e6: 930_000, qty_1e6: 22_000_000 });
         assert_eq!(d.asks[3], DepthLevel::EMPTY);
-        let f = parse_l2book_header(buf.as_bytes(), 7).expect("header");
+        let f = parse_l2book_header_view(buf.as_bytes(), 7).expect("header");
         assert_eq!((f.n_bids, f.n_asks), (7, 3), "the count still walks the whole side");
         // A truncated frame is refused, not half-filled into a snapshot.
-        assert!(parse_l2book_depth(&buf.as_bytes()[..buf.len() - 8], 7, 1).is_none());
+        assert!(parse_l2book_depth_view(&buf.as_bytes()[..buf.len() - 8], 7, 1).is_none());
     }
 
     #[test]
@@ -2038,6 +2260,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
@@ -2054,7 +2277,7 @@ mod proptests {
                 &mut buf,
                 r#"{{"channel":"bbo","data":{{"coin":"X","time":{ts},"bbo":[{{"px":"0.{bp:06}","sz":"0.{bq:06}","n":1}},{{"px":"0.{ap:06}","sz":"0.{aq:06}","n":1}}]}}}}"#,
             ).unwrap();
-            let f = parse_bbo(buf.as_bytes(), 5).unwrap();
+            let f = parse_bbo_view(buf.as_bytes(), 5).unwrap();
             prop_assert_eq!(f.sym, 5);
             prop_assert_eq!(f.bid_px_1e6, bp as i64);
             prop_assert_eq!(f.bid_qty_1e6, bq as i64);
@@ -2086,7 +2309,7 @@ mod proptests {
                 i += 1;
             }
             buf.push_str("]]}}");
-            let f = parse_l2book_header(buf.as_bytes(), 1).unwrap();
+            let f = parse_l2book_header_view(buf.as_bytes(), 1).unwrap();
             prop_assert_eq!(f.n_bids as usize, n_bids);
             prop_assert_eq!(f.n_asks as usize, n_asks);
             prop_assert_eq!(f.ts_ns, ts * 1_000_000);
@@ -2122,12 +2345,12 @@ mod proptests {
         ) {
             let _ = classify(&buf);
             let _ = extract_coin(&buf);
-            let _ = parse_bbo(&buf, 0);
-            let _ = parse_l2book_header(&buf, 0);
-            let _ = parse_trade(&buf, 0);
-            let _ = parse_active_asset_ctx(&buf, 0);
+            let _ = parse_bbo_view(&buf, 0);
+            let _ = parse_l2book_header_view(&buf, 0);
+            let _ = parse_trade_view(&buf, 0);
+            let _ = parse_active_asset_ctx_view(&buf, 0);
             let _ = parse_all_mids(&buf);
-            let _ = parse_outcome_meta(&buf);
+            let _ = parse_outcome_meta_view(&buf);
             let _ = parse_sub_response(&buf);
         }
     }

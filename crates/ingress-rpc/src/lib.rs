@@ -202,6 +202,16 @@ pub struct NewHead {
 }
 
 impl NewHead {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        number: 0,
+        ts_sec: 0,
+        gas_used: 0,
+        _pad: [0; 40],
+    };
+}
+
+impl NewHead {
     /// Field-free constructor. `pub(crate)` so the run-loop and tests
     /// can synthesise heads without exposing the private `_pad`.
     #[inline(always)]
@@ -231,8 +241,20 @@ impl NewHead {
 ///    "result":{"number":"0x1a","timestamp":"0x65a...","gasUsed":"0x7a12","hash":"0x...", ...}
 /// }}
 /// ```
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_new_head_notification(buf: &[u8]) -> Option<NewHead> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_new_head_notification(buf: &[u8], out: &mut NewHead) -> bool {
+    parse_new_head_notification_fill(buf, out).is_some()
+}
+
+/// [`parse_new_head_notification`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_new_head_notification_fill(buf: &[u8], out: &mut NewHead) -> Option<()> {
     let pos = find_field(buf, b"\"number\":")?;
     let pos = skip_byte(buf, pos, b'"');
     let (number, _) = parse_hex_u64(buf, pos)?;
@@ -250,7 +272,8 @@ pub fn parse_new_head_notification(buf: &[u8]) -> Option<NewHead> {
         .map(|(v, _)| v)
         .unwrap_or(0);
 
-    Some(NewHead::new(number, ts_sec, gas_used))
+    *out = NewHead::new(number, ts_sec, gas_used);
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -399,9 +422,25 @@ fn format_u64(buf: &mut [u8], mut v: u64) -> usize {
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<NewHead>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_new_head_notification_view(buf: &[u8]) -> Option<crate::NewHead> {
+        let mut f = crate::NewHead::ZERO;
+        crate::parse_new_head_notification(buf, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
 
     #[test]
     fn request_ids_are_monotonic() {
@@ -491,7 +530,7 @@ mod tests {
     fn parse_new_head_happy() {
         let b = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab",
             "result":{"number":"0x1a","timestamp":"0x65a1","gasUsed":"0x7a12","hash":"0xdeadbeef"}}}"#;
-        let h = parse_new_head_notification(b).unwrap();
+        let h = parse_new_head_notification_view(b).unwrap();
         assert_eq!(h.number, 0x1A);
         assert_eq!(h.ts_sec, 0x65A1);
         assert_eq!(h.gas_used, 0x7A12);
@@ -501,7 +540,7 @@ mod tests {
     fn parse_new_head_tolerates_missing_optional_fields() {
         // No timestamp or gasUsed.
         let b = br#"{"params":{"result":{"number":"0x2a","hash":"0xabc"}}}"#;
-        let h = parse_new_head_notification(b).unwrap();
+        let h = parse_new_head_notification_view(b).unwrap();
         assert_eq!(h.number, 0x2A);
         assert_eq!(h.ts_sec, 0);
         assert_eq!(h.gas_used, 0);
@@ -510,7 +549,7 @@ mod tests {
     #[test]
     fn parse_new_head_requires_number() {
         let b = br#"{"params":{"result":{"hash":"0xabc"}}}"#;
-        assert!(parse_new_head_notification(b).is_none());
+        assert!(parse_new_head_notification_view(b).is_none());
     }
 
     #[test]
@@ -600,6 +639,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
@@ -623,7 +663,7 @@ mod proptests {
                 &mut buf,
                 r#"{{"params":{{"result":{{"number":"0x{number:x}","timestamp":"0x{ts:x}"}}}}}}"#,
             ).unwrap();
-            let h = parse_new_head_notification(buf.as_bytes()).unwrap();
+            let h = parse_new_head_notification_view(buf.as_bytes()).unwrap();
             prop_assert_eq!(h.number, number);
             prop_assert_eq!(h.ts_sec, ts);
         }
@@ -633,7 +673,7 @@ mod proptests {
             let _ = classify_rpc(&buf);
             let _ = parse_hex_u64(&buf, 0);
             let _ = parse_block_number_result(&buf);
-            let _ = parse_new_head_notification(&buf);
+            let _ = parse_new_head_notification_view(&buf);
             let _ = parse_rpc_error(&buf);
         }
 

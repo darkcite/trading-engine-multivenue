@@ -141,16 +141,29 @@ in the script; `ai` = 48 is the floor every name includes).
   `core_net::ws_write_text_frame_parts` writes a frame from payload
   parts. Open: core-net's rustls RX copy and a possible per-record
   allocation in rustls' buffered API (`docs/risk-policy.md`, UNVERIFIED).
-- **Gates at HEAD (BX0 zero-copy pass, 2026-09-23):** nextest 2742 (3
+  In-place pass over the other seven ingress crates (okx, deribit,
+  hyperliquid, mexc, bybit, polymarket, rpc; `docs/risk-policy.md` "the
+  other ingress crates parse in place too"): 30 parsers fill in place,
+  frames left the dispatch values, `DepthPair` replaced the top-K
+  copies, the fuzz targets start from a poisoned frame. Open: core-ring's
+  by-value push/pop, and these seven crates are not in `make copy-audit`
+  (51 older unmarked copy verbs; the hot one, the WS Ping echo scratch,
+  in six of them).
+- **Gates at HEAD (BX0 in-place pass over the other ingress crates,
+  2026-09-23):** nextest 2743 (3
   skipped — the `#[ignore]`d `mexc_live_smoke` and `binance_md_live_smoke`
   among them) · alloc 64/64 at 0 B/op ·
   clippy clean · `make license-check` OK · `make copy-audit` new=0
   (self-test OK; 32 baselined over the exec lane, core-net, ingress-binance) ·
   worker pytest 1510 (3 skipped; `test_news_lanes::test_report_prints_the_funnel`
   is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
-  `hl_*` 3 × 300 s, `pb_scan`, `mexc_ws_frame`, `mexc_instruments`,
-  `binance_eapi_mark_array` 300 s, `binance_eapi`, `binance_book_ticker`,
-  `binance_mark_price`, `binance_exchange_info` 120 s clean. Known
+  (poisoned start) `okx_frame`, `deribit_{jsonrpc_frame,option_ticker,vol_index}`,
+  `hl_{ws_frame,l2book,outcome_spec}`, `mexc_ws_frame`, `bybit_ws_frame`,
+  `polymarket_clob_frame`, `rpc_{response,subscribe_envelope}`,
+  `binance_{book_ticker,mark_price}` 60 s each clean; earlier: `hl_*` 3 × 300 s,
+  `pb_scan`, `mexc_instruments`, `binance_eapi_mark_array` 300 s,
+  `binance_eapi`, `binance_exchange_info` 120 s clean · live smokes 60 s:
+  MEXC and Binance, 0 parse errors, 0 reconnects. Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
@@ -292,7 +305,11 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   `// COPY: <what> <bound> — <why unavoidable> — <alternative rejected>` —
   the way `unsafe` carries `// SAFETY:`. Designed copies: kernel↔user,
   rustls' plaintext window, rx-tail compaction, the ring-slot publish,
-  ≤ 64 B PODs by value. Enforced by `make copy-audit` (the exec lane,
+  ≤ 64 B PODs by value. Every ingress parser fills the caller's frame IN
+  PLACE (`&mut Frame` → `bool`, written once, untouched on `false`); no
+  frame rides a run loop's `Dispatch` (each const-asserted ≤ 64 B); a
+  top-K change gate flips a `core_types::DepthPair`, never copies.
+  Enforced by `make copy-audit` (the exec lane,
   core-net and ingress-binance; a RATCHET against
   `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
   `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)

@@ -14,11 +14,14 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
-    let mut f = ingress_binance::BookTickerFrame::ZERO;
+    let mut f: ingress_binance::BookTickerFrame = poison::poisoned();
     if ingress_binance::parse_book_ticker(data, 7, &mut f) {
         assert_eq!(f.sym, 7);
     } else {
-        assert_eq!(f, ingress_binance::BookTickerFrame::ZERO, "a failed parse wrote the frame");
+        assert_eq!(f, poison::poisoned::<ingress_binance::BookTickerFrame>(), "a failed parse wrote the frame");
     }
 });

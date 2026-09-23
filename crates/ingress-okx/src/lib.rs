@@ -385,6 +385,20 @@ pub struct OkxBboFrame {
     _pad: [u8; 12],
 }
 
+impl OkxBboFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        seq_id: 0,
+        ts_ns: 0,
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        sym: 0,
+        _pad: [0; 12],
+    };
+}
+
 /// Parsed `trades` row.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
@@ -407,6 +421,20 @@ pub struct OkxTradeFrame {
     _pad: [u8; 15],
 }
 
+impl OkxTradeFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        trade_id: 0,
+        ts_ns: 0,
+        px_1e6: 0,
+        qty_1e6: 0,
+        seq_id: 0,
+        sym: 0,
+        side: 0,
+        _pad: [0; 15],
+    };
+}
+
 /// Parsed `mark-price` push.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
@@ -419,6 +447,16 @@ pub struct OkxMarkPriceFrame {
     pub sym: SymbolId,
     // Explicit tail padding.
     _pad: [u8; 44],
+}
+
+impl OkxMarkPriceFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        mark_px_1e6: 0,
+        sym: 0,
+        _pad: [0; 44],
+    };
 }
 
 /// Parsed `funding-rate` push. Rates are stored ×1e9 — funding
@@ -436,6 +474,17 @@ pub struct OkxFundingFrame {
     pub sym: SymbolId,
     // Explicit tail padding.
     _pad: [u8; 36],
+}
+
+impl OkxFundingFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        funding_rate_1e9: 0,
+        funding_time_ns: 0,
+        sym: 0,
+        _pad: [0; 36],
+    };
 }
 
 /// Parsed `books` push **header** — §4.5: depth is consumed for
@@ -456,6 +505,18 @@ pub struct OkxBookFrame {
     pub action: u8,
     // Explicit tail padding.
     _pad: [u8; 35],
+}
+
+impl OkxBookFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        seq_id: 0,
+        prev_seq_id: 0,
+        ts_ns: 0,
+        sym: 0,
+        action: 0,
+        _pad: [0; 35],
+    };
 }
 
 /// `action` value for a books snapshot.
@@ -595,14 +656,16 @@ mod book_walk_tests {
         assert_eq!(walk_book_levels(snap, &mut l), Some(4));
         assert_eq!(l.asks.len(), 2);
         assert_eq!(l.bids.len(), 2);
-        let s = l.snapshot(1, VenueId::Okx, 7, 0);
+        let mut s = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(1, VenueId::Okx, 7, 0, &mut s);
         assert_eq!(s.asks[0].px_1e6, 8_476_980_000);
         assert_eq!(s.bids[0].px_1e6, 8_476_970_000);
         // Delta: delete the best ask (sz 0), add a better bid.
         let delta = br#"{"action":"update","data":[{"asks":[["8476.98","0","0","0"]],"bids":[["8476.99","5","0","1"]],"ts":"1597026383086","seqId":123457,"prevSeqId":123456}]}"#;
         assert_eq!(walk_book_levels(delta, &mut l), Some(2));
         assert_eq!(l.asks.len(), 1);
-        let s = l.snapshot(2, VenueId::Okx, 7, 0);
+        let mut s = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(2, VenueId::Okx, 7, 0, &mut s);
         assert_eq!(s.asks[0].px_1e6, 8_477_000_000);
         assert_eq!(s.bids[0].px_1e6, 8_476_990_000, "new best bid");
     }
@@ -634,9 +697,21 @@ mod book_walk_tests {
 
 /// Parse a `bbo-tbt` push into an [`OkxBboFrame`]. `sym` is the
 /// caller-resolved symbol (from [`extract_inst_id`] + the symbol
-/// table). Returns `None` on malformed input — caller counts it.
+/// table). Returns `false` on malformed input — caller counts it.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<OkxBboFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_bbo(payload: &[u8], sym: SymbolId, out: &mut OkxBboFrame) -> bool {
+    parse_bbo_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_bbo`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_bbo_fill(payload: &[u8], sym: SymbolId, out: &mut OkxBboFrame) -> Option<()> {
     let asks_pos = find_field(payload, b"\"asks\":")?;
     let (ask_px_1e6, ask_qty_1e6) = scan_bbo_side(payload, asks_pos)?;
     let bids_pos = find_field(payload, b"\"bids\":")?;
@@ -647,7 +722,7 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<OkxBboFrame> {
     if ask_px_1e6 == 0 && bid_px_1e6 == 0 {
         return None;
     }
-    Some(OkxBboFrame {
+    *out = OkxBboFrame {
         seq_id,
         ts_ns,
         bid_px_1e6,
@@ -656,14 +731,27 @@ pub fn parse_bbo(payload: &[u8], sym: SymbolId) -> Option<OkxBboFrame> {
         ask_qty_1e6,
         sym,
         _pad: [0; 12],
-    })
+    };
+    Some(())
 }
 
 /// Parse the **first** `trades` row of a push into an
 /// [`OkxTradeFrame`]. OKX batches rows per push; the run loop walks
 /// subsequent rows by re-slicing the payload (see `run_loop`).
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<OkxTradeFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_trade(payload: &[u8], sym: SymbolId, out: &mut OkxTradeFrame) -> bool {
+    parse_trade_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_trade`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_trade_fill(payload: &[u8], sym: SymbolId, out: &mut OkxTradeFrame) -> Option<()> {
     // px: "px":"42219.9"
     let pos = find_field(payload, b"\"px\":")?;
     let pos = skip_byte(payload, pos, b'"');
@@ -686,7 +774,7 @@ pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<OkxTradeFrame> {
     let (trade_id, _) = scan_u64(payload, pos)?;
     let ts_ns = scan_quoted_ms_to_ns(payload, b"\"ts\":")?;
     let seq_id = scan_seq_field(payload, b"\"seqId\":").unwrap_or(0);
-    Some(OkxTradeFrame {
+    *out = OkxTradeFrame {
         trade_id,
         ts_ns,
         px_1e6,
@@ -695,28 +783,54 @@ pub fn parse_trade(payload: &[u8], sym: SymbolId) -> Option<OkxTradeFrame> {
         sym,
         side,
         _pad: [0; 15],
-    })
+    };
+    Some(())
 }
 
 /// Parse a `mark-price` push into an [`OkxMarkPriceFrame`].
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_mark_price(payload: &[u8], sym: SymbolId) -> Option<OkxMarkPriceFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_mark_price(payload: &[u8], sym: SymbolId, out: &mut OkxMarkPriceFrame) -> bool {
+    parse_mark_price_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_mark_price`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_mark_price_fill(payload: &[u8], sym: SymbolId, out: &mut OkxMarkPriceFrame) -> Option<()> {
     let pos = find_field(payload, b"\"markPx\":")?;
     let pos = skip_byte(payload, pos, b'"');
     let (mark_px_1e6, _) = scan_price_1e6(payload, pos)?;
     let ts_ns = scan_quoted_ms_to_ns(payload, b"\"ts\":")?;
-    Some(OkxMarkPriceFrame {
+    *out = OkxMarkPriceFrame {
         ts_ns,
         mark_px_1e6,
         sym,
         _pad: [0; 44],
-    })
+    };
+    Some(())
 }
 
 /// Parse a `funding-rate` push into an [`OkxFundingFrame`]. The rate
 /// is scaled ×1e9 (see the struct doc).
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_funding_rate(payload: &[u8], sym: SymbolId) -> Option<OkxFundingFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_funding_rate(payload: &[u8], sym: SymbolId, out: &mut OkxFundingFrame) -> bool {
+    parse_funding_rate_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_funding_rate`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_funding_rate_fill(payload: &[u8], sym: SymbolId, out: &mut OkxFundingFrame) -> Option<()> {
     let pos = find_field(payload, b"\"fundingRate\":")?;
     let pos = skip_byte(payload, pos, b'"');
     let (funding_rate_1e9, _) = scan_price_1e9(payload, pos)?;
@@ -724,19 +838,32 @@ pub fn parse_funding_rate(payload: &[u8], sym: SymbolId) -> Option<OkxFundingFra
     // `ts` is optional on some funding pushes — fall back to
     // fundingTime so the frame always carries an event time.
     let ts_ns = scan_quoted_ms_to_ns(payload, b"\"ts\":").unwrap_or(funding_time_ns);
-    Some(OkxFundingFrame {
+    *out = OkxFundingFrame {
         ts_ns,
         funding_rate_1e9,
         funding_time_ns,
         sym,
         _pad: [0; 36],
-    })
+    };
+    Some(())
 }
 
 /// Parse a `books` push **header** (chain fields + action). Levels
 /// are deliberately not lifted (§4.5).
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_book_header(payload: &[u8], sym: SymbolId) -> Option<OkxBookFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_book_header(payload: &[u8], sym: SymbolId, out: &mut OkxBookFrame) -> bool {
+    parse_book_header_fill(payload, sym, out).is_some()
+}
+
+/// [`parse_book_header`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_book_header_fill(payload: &[u8], sym: SymbolId, out: &mut OkxBookFrame) -> Option<()> {
     let action = if memchr::memmem::find(payload, b"\"action\":\"snapshot\"").is_some() {
         BOOK_ACTION_SNAPSHOT
     } else if memchr::memmem::find(payload, b"\"action\":\"update\"").is_some() {
@@ -747,14 +874,15 @@ pub fn parse_book_header(payload: &[u8], sym: SymbolId) -> Option<OkxBookFrame> 
     let seq_id = scan_seq_field(payload, b"\"seqId\":")?;
     let prev_seq_id = scan_seq_field(payload, b"\"prevSeqId\":")?;
     let ts_ns = scan_quoted_ms_to_ns(payload, b"\"ts\":")?;
-    Some(OkxBookFrame {
+    *out = OkxBookFrame {
         seq_id,
         prev_seq_id,
         ts_ns,
         sym,
         action,
         _pad: [0; 35],
-    })
+    };
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -1097,9 +1225,53 @@ pub fn sub_id_of(channel: OkxChannel, inst_id: &[u8]) -> SubId {
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<OkxBboFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_bbo_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::OkxBboFrame> {
+        let mut f = crate::OkxBboFrame::ZERO;
+        crate::parse_bbo(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<OkxTradeFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_trade_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::OkxTradeFrame> {
+        let mut f = crate::OkxTradeFrame::ZERO;
+        crate::parse_trade(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<OkxMarkPriceFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_mark_price_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::OkxMarkPriceFrame> {
+        let mut f = crate::OkxMarkPriceFrame::ZERO;
+        crate::parse_mark_price(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<OkxFundingFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_funding_rate_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::OkxFundingFrame> {
+        let mut f = crate::OkxFundingFrame::ZERO;
+        crate::parse_funding_rate(payload, sym, &mut f).then_some(f)
+    }
+    // COPY: `Option<OkxBookFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_book_header_view(payload: &[u8], sym: core_types::SymbolId) -> Option<crate::OkxBookFrame> {
+        let mut f = crate::OkxBookFrame::ZERO;
+        crate::parse_book_header(payload, sym, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
 
     const BBO: &[u8] = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","55154","0","2"]],"bids":[["111.05","57745","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
     const TRADE_BUY: &[u8] = br#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"130639474","px":"42219.9","sz":"0.12060306","side":"buy","ts":"1630048897897","count":"3","seqId":123456}]}"#;
@@ -1180,7 +1352,7 @@ mod tests {
 
     #[test]
     fn parse_bbo_extracts_both_sides() {
-        let f = parse_bbo(BBO, 7).unwrap();
+        let f = parse_bbo_view(BBO, 7).unwrap();
         assert_eq!(f.sym, 7);
         assert_eq!(f.ask_px_1e6, 111_060_000);
         assert_eq!(f.ask_qty_1e6, 55_154_000_000);
@@ -1193,7 +1365,7 @@ mod tests {
     #[test]
     fn parse_bbo_handles_empty_ask_side() {
         let b = br#"{"arg":{"channel":"bbo-tbt","instId":"X"},"data":[{"asks":[],"bids":[["1.5","2","0","1"]],"ts":"1000","seqId":9}]}"#;
-        let f = parse_bbo(b, 1).unwrap();
+        let f = parse_bbo_view(b, 1).unwrap();
         assert_eq!(f.ask_px_1e6, 0);
         assert_eq!(f.ask_qty_1e6, 0);
         assert_eq!(f.bid_px_1e6, 1_500_000);
@@ -1202,22 +1374,22 @@ mod tests {
     #[test]
     fn parse_bbo_rejects_missing_ts_and_double_empty() {
         let no_ts = br#"{"asks":[["1","1","0","1"]],"bids":[["1","1","0","1"]],"seqId":1}"#;
-        assert!(parse_bbo(no_ts, 0).is_none());
+        assert!(parse_bbo_view(no_ts, 0).is_none());
         let both_empty = br#"{"asks":[],"bids":[],"ts":"1000","seqId":1}"#;
-        assert!(parse_bbo(both_empty, 0).is_none());
+        assert!(parse_bbo_view(both_empty, 0).is_none());
     }
 
     #[test]
     fn parse_bbo_defaults_seq_to_zero_when_absent() {
         let b = br#"{"asks":[["2","1","0","1"]],"bids":[["1","1","0","1"]],"ts":"1000"}"#;
-        assert_eq!(parse_bbo(b, 0).unwrap().seq_id, 0);
+        assert_eq!(parse_bbo_view(b, 0).unwrap().seq_id, 0);
     }
 
     // ---- parse_trade ---------------------------------------------
 
     #[test]
     fn parse_trade_extracts_fields() {
-        let t = parse_trade(TRADE_BUY, 3).unwrap();
+        let t = parse_trade_view(TRADE_BUY, 3).unwrap();
         assert_eq!(t.sym, 3);
         assert_eq!(t.trade_id, 130_639_474);
         assert_eq!(t.px_1e6, 42_219_900_000);
@@ -1230,16 +1402,16 @@ mod tests {
     #[test]
     fn parse_trade_sell_side_and_missing_side() {
         let sell = br#"{"tradeId":"1","px":"1.0","sz":"1.0","side":"sell","ts":"1000"}"#;
-        assert_eq!(parse_trade(sell, 0).unwrap().side, 1);
+        assert_eq!(parse_trade_view(sell, 0).unwrap().side, 1);
         let bad = br#"{"tradeId":"1","px":"1.0","sz":"1.0","ts":"1000"}"#;
-        assert!(parse_trade(bad, 0).is_none());
+        assert!(parse_trade_view(bad, 0).is_none());
     }
 
     // ---- parse_mark_price ----------------------------------------
 
     #[test]
     fn parse_mark_price_extracts_fields() {
-        let m = parse_mark_price(MARK, 9).unwrap();
+        let m = parse_mark_price_view(MARK, 9).unwrap();
         assert_eq!(m.sym, 9);
         assert_eq!(m.mark_px_1e6, 42_310_600_000);
         assert_eq!(m.ts_ns, 1_630_049_455_539 * 1_000_000);
@@ -1247,14 +1419,14 @@ mod tests {
 
     #[test]
     fn parse_mark_price_rejects_garbage() {
-        assert!(parse_mark_price(b"{}", 0).is_none());
+        assert!(parse_mark_price_view(b"{}", 0).is_none());
     }
 
     // ---- parse_funding_rate --------------------------------------
 
     #[test]
     fn parse_funding_rate_keeps_1e9_precision() {
-        let f = parse_funding_rate(FUNDING, 4).unwrap();
+        let f = parse_funding_rate_view(FUNDING, 4).unwrap();
         assert_eq!(f.funding_rate_1e9, 59_300);
         assert_eq!(f.funding_time_ns, 1_630_051_200_000 * 1_000_000);
         assert_eq!(f.ts_ns, 1_630_048_897_897 * 1_000_000);
@@ -1263,7 +1435,7 @@ mod tests {
     #[test]
     fn parse_funding_rate_negative_and_ts_fallback() {
         let b = br#"{"fundingRate":"-0.000375","fundingTime":"2000"}"#;
-        let f = parse_funding_rate(b, 0).unwrap();
+        let f = parse_funding_rate_view(b, 0).unwrap();
         assert_eq!(f.funding_rate_1e9, -375_000);
         // No ts → falls back to fundingTime.
         assert_eq!(f.ts_ns, 2_000 * 1_000_000);
@@ -1272,18 +1444,18 @@ mod tests {
 
     #[test]
     fn parse_funding_rate_rejects_missing_funding_time() {
-        assert!(parse_funding_rate(br#"{"fundingRate":"0.0001"}"#, 0).is_none());
+        assert!(parse_funding_rate_view(br#"{"fundingRate":"0.0001"}"#, 0).is_none());
     }
 
     // ---- parse_book_header ---------------------------------------
 
     #[test]
     fn parse_book_header_snapshot_and_update() {
-        let s = parse_book_header(BOOK_SNAP, 2).unwrap();
+        let s = parse_book_header_view(BOOK_SNAP, 2).unwrap();
         assert_eq!(s.action, BOOK_ACTION_SNAPSHOT);
         assert_eq!(s.prev_seq_id, -1);
         assert_eq!(s.seq_id, 123_456);
-        let u = parse_book_header(BOOK_UPD, 2).unwrap();
+        let u = parse_book_header_view(BOOK_UPD, 2).unwrap();
         assert_eq!(u.action, BOOK_ACTION_UPDATE);
         assert_eq!(u.prev_seq_id, 123_456);
         assert_eq!(u.seq_id, 123_457);
@@ -1292,7 +1464,7 @@ mod tests {
     #[test]
     fn parse_book_header_rejects_missing_action() {
         let b = br#"{"data":[{"prevSeqId":1,"seqId":2,"ts":"1000"}]}"#;
-        assert!(parse_book_header(b, 0).is_none());
+        assert!(parse_book_header_view(b, 0).is_none());
     }
 
     // ---- symbol table --------------------------------------------
@@ -1531,6 +1703,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
@@ -1548,7 +1721,7 @@ mod proptests {
                 &mut buf,
                 r#"{{"arg":{{"channel":"bbo-tbt","instId":"X"}},"data":[{{"asks":[["0.{ap:06}","0.{aq:06}","0","1"]],"bids":[["0.{bp:06}","0.{bq:06}","0","1"]],"ts":"{ts}","seqId":{seq}}}]}}"#,
             ).unwrap();
-            let f = parse_bbo(buf.as_bytes(), 5).unwrap();
+            let f = parse_bbo_view(buf.as_bytes(), 5).unwrap();
             prop_assert_eq!(f.sym, 5);
             prop_assert_eq!(f.ask_px_1e6, ap as i64);
             prop_assert_eq!(f.ask_qty_1e6, aq as i64);
@@ -1603,7 +1776,7 @@ mod proptests {
                 r#"{{"fundingRate":"{sign}0.{:09}","fundingTime":"{ft}"}}"#,
                 rate_nano.unsigned_abs(),
             ).unwrap();
-            let f = parse_funding_rate(buf.as_bytes(), 1).unwrap();
+            let f = parse_funding_rate_view(buf.as_bytes(), 1).unwrap();
             prop_assert_eq!(f.funding_rate_1e9, rate_nano);
             prop_assert_eq!(f.funding_time_ns, ft * 1_000_000);
         }
@@ -1614,11 +1787,11 @@ mod proptests {
         ) {
             let _ = classify(&buf);
             let _ = extract_inst_id(&buf);
-            let _ = parse_bbo(&buf, 0);
-            let _ = parse_trade(&buf, 0);
-            let _ = parse_mark_price(&buf, 0);
-            let _ = parse_funding_rate(&buf, 0);
-            let _ = parse_book_header(&buf, 0);
+            let _ = parse_bbo_view(&buf, 0);
+            let _ = parse_trade_view(&buf, 0);
+            let _ = parse_mark_price_view(&buf, 0);
+            let _ = parse_funding_rate_view(&buf, 0);
+            let _ = parse_book_header_view(&buf, 0);
         }
     }
 }

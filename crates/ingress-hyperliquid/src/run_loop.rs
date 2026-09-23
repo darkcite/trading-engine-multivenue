@@ -60,7 +60,8 @@ use core_net::{
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, WallAnchor};
 use core_types::{
-    Capture, ChannelEvent, ChannelId, DepthLevel, DepthTopK, EVENT_RING_SIZE, Price, Qty, Tick,
+    Capture, ChannelEvent, ChannelId, DepthLevel, DepthPair, DepthTopK, EVENT_RING_SIZE, Price, Qty,
+    Tick,
     VenueId, DEPTH_K, TICK_FLAG_STALE,
 };
 
@@ -259,13 +260,19 @@ pub struct Driver {
     /// BIN15 O2 / E7 R0: the boot-bound families have been announced
     /// (see [`emit_boot_rolls`]). Once per process, never on reconnect.
     boot_rolls_emitted: bool,
-    /// WS10-B for outcome legs (2026-09-19): the last top-K snapshot
-    /// captured per coin slot, so a `l2Book` push whose top five levels
-    /// did not move (the venue re-sends the whole book on a 5.3 s
-    /// timer; 59 % of pushes change nothing) writes nothing. Boot-owned,
-    /// one 192 B row per [`HL_MAX_COINS`] slot; only outcome coins ever
-    /// touch theirs.
-    depth_last: Box<[DepthTopK]>,
+    /// BIN15 O2: the spec of the roll phase 1 decided on, read by phase
+    /// 2 when the dispatch is `Roll` — parked here because inside the
+    /// dispatch value it would widen it past the 64 B bound.
+    roll_spec: HlOutcomeSpec,
+    /// WS10-B for outcome legs (2026-09-19): the change gate per coin
+    /// slot — the last top-K snapshot captured, and the row the next
+    /// `l2Book` walk lifts its levels into, in place. A push whose top
+    /// five levels did not move (the venue re-sends the whole book on
+    /// a 5.3 s timer; 59 % of pushes change nothing) writes nothing; a
+    /// changed one becomes the last snapshot by a row flip, never a
+    /// 192 B copy. Boot-owned, one pair per [`HL_MAX_COINS`] slot; only
+    /// outcome coins ever touch theirs.
+    depth: Box<[DepthPair]>,
     /// Set once the post-upgrade subscribe frames have been queued.
     subscribed: bool,
     /// Set once `found == expected` (staleness armed at that edge).
@@ -317,7 +324,8 @@ impl Driver {
             sub_ack_budget_ns,
             steady_since_ns: 0,
             boot_rolls_emitted: false,
-            depth_last: vec![DepthTopK::new(0, VenueId::Hyperliquid, 0, 0, [DepthLevel::EMPTY; DEPTH_K], [DepthLevel::EMPTY; DEPTH_K]); HL_MAX_COINS]
+            roll_spec: HlOutcomeSpec::empty(0),
+            depth: vec![DepthPair::new(DepthTopK::new(0, VenueId::Hyperliquid, 0, 0, [DepthLevel::EMPTY; DEPTH_K], [DepthLevel::EMPTY; DEPTH_K])); HL_MAX_COINS]
                 .into_boxed_slice(),
             subscribed: false,
             verified: false,
@@ -991,16 +999,17 @@ enum Dispatch {
     },
     /// Venue `error` frame — fatal (fail-fast).
     VenueError,
-    /// `bbo` push became a Tick.
-    Bbo { tick: Tick },
+    /// `bbo` push became the phase-1 tick.
+    Bbo,
     /// `l2Book` snapshot header (staleness food), plus — BIN15 O8 —
     /// the touch it yields for a HIP-4 outcome leg, whose `bbo` the
-    /// venue publishes one-sided. `None` for every other coin, which
-    /// keeps `bbo` the sole tick source for perps.
+    /// venue publishes one-sided: `touch` says the phase-1 tick holds
+    /// it. `false` for every other coin, which keeps `bbo` the sole
+    /// tick source for perps.
     L2Book {
         coin_idx: u8,
         venue_ts_ns: u64,
-        tick: Option<Tick>,
+        touch: bool,
     },
     /// `trades` push scanned.
     Trades { scan: TradeScan },
@@ -1010,17 +1019,18 @@ enum Dispatch {
     /// BIN15 O2: a rolling family's instance changed — rebind its two
     /// coins, re-subscribe, and record the roll. Decided under the rx
     /// borrow (phase 1), performed after it ends (phase 2), like every
-    /// other dispatch here.
-    Roll {
-        family: u8,
-        spec: HlOutcomeSpec,
-        settled: bool,
-    },
+    /// other dispatch here. The new spec is parked in
+    /// `Driver::roll_spec` (64 B — here it would widen the dispatch).
+    Roll { family: u8, settled: bool },
     /// An `outcomeCreated` push that belongs to no configured family.
     /// The steady state, not an error: the venue publishes every
     /// deployer's markets on one channel.
     RollUnmatched,
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
@@ -1132,27 +1142,25 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
         let next = memchr::memmem::find(&payload[row_start + MARKER.len()..], MARKER)
             .map(|o| row_start + MARKER.len() + o);
         let row_end = next.unwrap_or(payload.len());
-        match parse_trade(&payload[row_start..row_end], sym) {
-            Some(t) => {
-                scan.rows_parsed += 1;
-                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
-                capture.event(&ChannelEvent::new(
-                    now_ns(),
-                    VenueId::Hyperliquid,
-                    ChannelId::Trade,
-                    sym,
-                    t.tid,
-                    t.ts_ns / 1_000_000,
-                    t.px_1e6,
-                    signed_qty,
-                ));
-            }
-            None => {
-                scan.rows_rejected += 1;
-                // Tap the exact rejected row slice — the §6.5 raw-tap
-                // differential audit consumes these.
-                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
-            }
+        let mut t = crate::HlTradeFrame::ZERO;
+        if parse_trade(&payload[row_start..row_end], sym, &mut t) {
+            scan.rows_parsed += 1;
+            let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Hyperliquid,
+                ChannelId::Trade,
+                sym,
+                t.tid,
+                t.ts_ns / 1_000_000,
+                t.px_1e6,
+                signed_qty,
+            ));
+        } else {
+            scan.rows_rejected += 1;
+            // Tap the exact rejected row slice — the §6.5 raw-tap
+            // differential audit consumes these.
+            capture.parse_reject(now_ns(), &payload[row_start..row_end]);
         }
         at = row_end;
     }
@@ -1204,6 +1212,11 @@ fn handle_data_frame<C: Capture>(
 ) -> io::Result<()> {
     // Retained for the phase-2 reject re-borrow (Range is not Copy).
     let reject_range = payload_range.clone();
+    // Phase 1's tick, built in place: riding inside the dispatch value
+    // it would widen every dispatch past the 64 B bound and cross phase
+    // 1 → phase 2 by value. `Dispatch::Bbo` and `Dispatch::L2Book {
+    // touch: true }` say it was written.
+    let mut tick = Tick::ZERO;
     // Phase 1: immutable borrow of rx (+ coins) — classify, resolve
     // the coin, pre-parse into a Copy dispatch value. Capture hooks
     // that need parsed values fire here (events); the raw tap sees
@@ -1247,8 +1260,9 @@ fn handle_data_frame<C: Capture>(
                     }
                     None => Dispatch::Nothing,
                 },
-                HlChannel::OutcomeMetaUpdates => match parse_outcome_meta(payload) {
-                    Some(f) => {
+                HlChannel::OutcomeMetaUpdates => {
+                    let mut f = crate::HlOutcomeMetaFrame::ZERO;
+                    if parse_outcome_meta(payload, &mut f) {
                         // §6.5 capture: v0 = lifecycle kind byte
                         // (HlOutcomeMetaFrame::kind — OUTCOME_* /
                         // QUESTION_* consts); venue_time_ms from the
@@ -1286,19 +1300,21 @@ fn handle_data_frame<C: Capture>(
                                 OUTCOME_CREATED => {
                                     match outcome_meta_description(payload) {
                                         Some((id, desc)) => {
-                                            let spec = parse_outcome_spec(id, desc);
+                                            // Parsed straight into the
+                                            // roll slot phase 2 reads.
+                                            drv.roll_spec = parse_outcome_spec(id, desc);
                                             // WALL, not monotonic: the
                                             // expiry in the
                                             // description is an epoch
                                             // instant.
                                             let now = drv.wall.wall_of(now_ns());
-                                            match drv.families.match_spec(&spec, now) {
+                                            match drv.families.match_spec(&drv.roll_spec, now) {
                                                 Some(fam) => {
                                                     let live = drv
                                                         .families
                                                         .get(fam)
                                                         .map_or(0, |r| r.live.outcome);
-                                                    if live == spec.outcome {
+                                                    if live == drv.roll_spec.outcome {
                                                         // Idempotent: the venue
                                                         // repeats pushes on a
                                                         // reconnect.
@@ -1306,7 +1322,6 @@ fn handle_data_frame<C: Capture>(
                                                     } else {
                                                         Dispatch::Roll {
                                                             family: fam as u8,
-                                                            spec,
                                                             settled: false,
                                                         }
                                                     }
@@ -1322,22 +1337,25 @@ fn handle_data_frame<C: Capture>(
                                     // recoverable without re-parsing.
                                     let id = f.enc / 10;
                                     match drv.families.index_of_outcome(id) {
-                                        Some(fam) => Dispatch::Roll {
-                                            family: fam as u8,
-                                            spec: drv
+                                        Some(fam) => {
+                                            drv.roll_spec = drv
                                                 .families
                                                 .get(fam)
-                                                .map_or(HlOutcomeSpec::empty(id), |r| r.live),
-                                            settled: true,
-                                        },
+                                                .map_or(HlOutcomeSpec::empty(id), |r| r.live);
+                                            Dispatch::Roll {
+                                                family: fam as u8,
+                                                settled: true,
+                                            }
+                                        }
                                         None => Dispatch::Slow,
                                     }
                                 }
                                 _ => Dispatch::Slow,
                             }
                         }
+                    } else {
+                        Dispatch::Nothing
                     }
-                    None => Dispatch::Nothing,
                 },
                 _ => {
                     match extract_coin(payload).and_then(|coin| {
@@ -1346,37 +1364,38 @@ fn handle_data_frame<C: Capture>(
                             .map(|sym| (sym, drv.coins.index_of(sym)))
                     }) {
                         Some((sym, Some(coin_idx))) => match channel {
-                            HlChannel::Bbo => match parse_bbo(payload, sym) {
-                                // BIN15 O8: the venue sends a HIP-4
-                                // outcome leg's ask as `null`, so a
-                                // bbo touch here would pin `ask = 0`
-                                // and no arm could ever read the book
-                                // as actionable. The l2Book arm below
-                                // carries the real two-sided touch.
-                                // Kept as a CONDITION rather than a
-                                // blanket skip so the moment the venue
-                                // publishes both sides, bbo resumes
-                                // being the faster source.
-                                Some(f)
-                                    if f.ask_px_1e6 == 0
-                                        && drv
-                                            .coins
-                                            .get(coin_idx)
-                                            .is_some_and(|(c, _)| is_outcome_coin(c)) =>
-                                {
-                                    Dispatch::Nothing
-                                }
-                                Some(f) => {
-                                    // VT2: one parse-complete stamp
-                                    // serves the tick AND the judgement;
-                                    // `time` is the venue block time.
-                                    let now = now_ns();
-                                    let venue_time_ms = f.ts_ns / 1_000_000;
-                                    let judged = drv.feed_clock.judge(venue_time_ms, now);
-                                    Dispatch::Bbo {
+                            HlChannel::Bbo => {
+                                let mut bbo = crate::HlBboFrame::ZERO;
+                                match parse_bbo(payload, sym, &mut bbo).then_some(&bbo) {
+                                    // BIN15 O8: the venue sends a HIP-4
+                                    // outcome leg's ask as `null`, so a
+                                    // bbo touch here would pin `ask = 0`
+                                    // and no arm could ever read the book
+                                    // as actionable. The l2Book arm below
+                                    // carries the real two-sided touch.
+                                    // Kept as a CONDITION rather than a
+                                    // blanket skip so the moment the venue
+                                    // publishes both sides, bbo resumes
+                                    // being the faster source.
+                                    Some(f)
+                                        if f.ask_px_1e6 == 0
+                                            && drv
+                                                .coins
+                                                .get(coin_idx)
+                                                .is_some_and(|(c, _)| is_outcome_coin(c)) =>
+                                    {
+                                        Dispatch::Nothing
+                                    }
+                                    Some(f) => {
+                                        // VT2: one parse-complete stamp
+                                        // serves the tick AND the judgement;
+                                        // `time` is the venue block time.
+                                        let now = now_ns();
+                                        let venue_time_ms = f.ts_ns / 1_000_000;
+                                        let judged = drv.feed_clock.judge(venue_time_ms, now);
                                         // venue_seq = time (ms) as u32 —
                                         // crate-header policy.
-                                        tick: Tick::new_stamped(
+                                        tick = Tick::new_stamped(
                                             now,
                                             VenueId::Hyperliquid,
                                             sym,
@@ -1387,13 +1406,30 @@ fn handle_data_frame<C: Capture>(
                                             Qty::from_raw(f.ask_qty_1e6),
                                             venue_time_ms,
                                             (judged.stale as u8) * TICK_FLAG_STALE,
-                                        ),
+                                        );
+                                        Dispatch::Bbo
                                     }
+                                    None => Dispatch::Nothing,
                                 }
-                                None => Dispatch::Nothing,
                             },
-                            HlChannel::L2Book => match parse_l2book_header(payload, sym) {
-                                Some(f) => {
+                            HlChannel::L2Book => {
+                                let outcome = drv
+                                    .coins
+                                    .get(coin_idx)
+                                    .is_some_and(|(c, _)| is_outcome_coin(c));
+                                // WS10-B for outcome legs (2026-09-19): one
+                                // walk yields the header AND lifts the top-K
+                                // of both sides straight into the slot's
+                                // spare depth row; every other coin needs
+                                // only the header.
+                                let mut f = crate::HlL2BookFrame::ZERO;
+                                let parsed = if outcome {
+                                    let spare = drv.depth[coin_idx].spare_mut();
+                                    parse_l2book_depth(payload, sym, now_ns(), spare, &mut f)
+                                } else {
+                                    parse_l2book_header(payload, sym, &mut f)
+                                };
+                                if parsed {
                                     // §6.5 capture: stateless
                                     // snapshots carry no seq →
                                     // venue_seq = 0; venue_time_ms =
@@ -1410,35 +1446,18 @@ fn handle_data_frame<C: Capture>(
                                         f.n_bids as i64,
                                         f.n_asks as i64,
                                     ));
-                                    let outcome = drv
-                                        .coins
-                                        .get(coin_idx)
-                                        .is_some_and(|(c, _)| is_outcome_coin(c));
-                                    // WS10-B for outcome legs
-                                    // (2026-09-19): the top-K of both
-                                    // sides into `hl-depth.pmlr`,
+                                    // The top-K into `hl-depth.pmlr`,
                                     // change-gated like OKX/Deribit's
                                     // ladders — the venue re-sends the
-                                    // whole book every 5.3 s whether
-                                    // or not it moved. The header
-                                    // above already walked every level
-                                    // row, so the second walk cannot
-                                    // fail where the first passed.
+                                    // whole book every 5.3 s whether or
+                                    // not it moved. A changed walk becomes
+                                    // the last snapshot by the row flip.
                                     if outcome {
-                                        if let Some(snap) = parse_l2book_depth(payload, sym, now_ns()) {
-                                            let last = &mut drv.depth_last[coin_idx];
-                                            if snap.bids != last.bids || snap.asks != last.asks {
-                                                capture.depth(&snap);
-                                                // COPY: one 192 B POD into the
-                                                // per-coin last-snapshot slot,
-                                                // once per CHANGED 5.3 s push —
-                                                // the gate needs the previous
-                                                // levels to compare against —
-                                                // rejected: a borrowed index
-                                                // into the rx buffer, which the
-                                                // next frame overwrites.
-                                                *last = snap;
-                                            }
+                                        let pair = &mut drv.depth[coin_idx];
+                                        let (snap, last) = pair.spare_and_last();
+                                        if snap.bids != last.bids || snap.asks != last.asks {
+                                            capture.depth(snap);
+                                            pair.commit();
                                         }
                                     }
                                     // BIN15 O8: for a HIP-4 outcome
@@ -1446,15 +1465,15 @@ fn handle_data_frame<C: Capture>(
                                     // two-sided touch the venue
                                     // publishes. Same stamp + staleness
                                     // judgement the bbo arm applies.
-                                    let touch = if outcome
+                                    let touch = outcome
                                         && f.best_bid_px_1e6 > 0
-                                        && f.best_ask_px_1e6 > f.best_bid_px_1e6
-                                    {
+                                        && f.best_ask_px_1e6 > f.best_bid_px_1e6;
+                                    if touch {
                                         let now = now_ns();
                                         let venue_time_ms = f.ts_ns / 1_000_000;
                                         let judged =
                                             drv.feed_clock.judge(venue_time_ms, now);
-                                        Some(Tick::new_stamped(
+                                        tick = Tick::new_stamped(
                                             now,
                                             VenueId::Hyperliquid,
                                             sym,
@@ -1465,94 +1484,93 @@ fn handle_data_frame<C: Capture>(
                                             Qty::from_raw(f.best_ask_sz_1e6),
                                             venue_time_ms,
                                             (judged.stale as u8) * TICK_FLAG_STALE,
-                                        ))
-                                    } else {
-                                        None
-                                    };
+                                        );
+                                    }
                                     Dispatch::L2Book {
                                         coin_idx: coin_idx as u8,
                                         venue_ts_ns: f.ts_ns,
-                                        tick: touch,
+                                        touch,
                                     }
+                                } else {
+                                    Dispatch::Nothing
                                 }
-                                None => Dispatch::Nothing,
                             },
                             HlChannel::Trades => Dispatch::Trades {
                                 scan: scan_trades(payload, sym, capture),
                             },
                             HlChannel::ActiveAssetCtx => {
-                                match parse_active_asset_ctx(payload, sym) {
-                                    Some(f) => {
-                                        // §6.5 capture: v0 =
-                                        // funding_1e9 (rate ×1e9),
-                                        // v1 = oi_1e6 (open interest
-                                        // as stored — base-coin
-                                        // units ×1e6). The ctx
-                                        // carries no venue timestamp
-                                        // → venue_time_ms = 0.
-                                        // WS3 (gaps §2.5): venue_seq
-                                        // carries `premium` ×1e9
-                                        // BIT-CAST i64→u64 (the slot
-                                        // was a constant 0 here; the
-                                        // ctx has no venue seq — the
-                                        // M4 hash128-in-px/qty
-                                        // packing precedent).
-                                        let ev = ChannelEvent::new(
-                                            now_ns(),
-                                            VenueId::Hyperliquid,
+                                let mut f = crate::HlAssetCtxFrame::ZERO;
+                                if parse_active_asset_ctx(payload, sym, &mut f) {
+                                    // §6.5 capture: v0 =
+                                    // funding_1e9 (rate ×1e9),
+                                    // v1 = oi_1e6 (open interest
+                                    // as stored — base-coin
+                                    // units ×1e6). The ctx
+                                    // carries no venue timestamp
+                                    // → venue_time_ms = 0.
+                                    // WS3 (gaps §2.5): venue_seq
+                                    // carries `premium` ×1e9
+                                    // BIT-CAST i64→u64 (the slot
+                                    // was a constant 0 here; the
+                                    // ctx has no venue seq — the
+                                    // M4 hash128-in-px/qty
+                                    // packing precedent).
+                                    let ev = ChannelEvent::new(
+                                        now_ns(),
+                                        VenueId::Hyperliquid,
+                                        ChannelId::AssetCtx,
+                                        sym,
+                                        f.premium_1e9 as u64,
+                                        0,
+                                        f.funding_1e9,
+                                        f.oi_1e6,
+                                    );
+                                    capture.event(&ev);
+                                    // VM2 V2: HL funding rides
+                                    // the ctx — onto the venue-
+                                    // event lane when the spawn
+                                    // mask carries the AssetCtx
+                                    // bit (capture stays first,
+                                    // §6.5 law).
+                                    if event_mask
+                                        & core_types::event_lane_bit(
                                             ChannelId::AssetCtx,
-                                            sym,
-                                            f.premium_1e9 as u64,
-                                            0,
-                                            f.funding_1e9,
-                                            f.oi_1e6,
-                                        );
-                                        capture.event(&ev);
-                                        // VM2 V2: HL funding rides
-                                        // the ctx — onto the venue-
-                                        // event lane when the spawn
-                                        // mask carries the AssetCtx
-                                        // bit (capture stays first,
-                                        // §6.5 law).
-                                        if event_mask
-                                            & core_types::event_lane_bit(
-                                                ChannelId::AssetCtx,
-                                            )
-                                            != 0
-                                            && event_tx.try_push(ev).is_err()
-                                        {
-                                            status.inc_event_ring_drops();
-                                        }
-                                        // BIN15 O2: the MARK, which
-                                        // the ctx parser has always
-                                        // lifted and capture has never
-                                        // carried. A HIP-4 strike is
-                                        // the perp mark at creation
-                                        // and its settlement is a mark
-                                        // TWAP, so without this row
-                                        // neither can be reconstructed
-                                        // offline from our own tape.
-                                        let mk = ChannelEvent::new(
-                                            now_ns(),
-                                            VenueId::Hyperliquid,
-                                            ChannelId::Mark,
-                                            sym,
-                                            0,
-                                            0,
-                                            f.mark_px_1e6,
-                                            f.oracle_px_1e6,
-                                        );
-                                        capture.event(&mk);
-                                        if event_mask
-                                            & core_types::event_lane_bit(ChannelId::Mark)
-                                            != 0
-                                            && event_tx.try_push(mk).is_err()
-                                        {
-                                            status.inc_event_ring_drops();
-                                        }
-                                        Dispatch::Slow
+                                        )
+                                        != 0
+                                        && event_tx.try_push(ev).is_err()
+                                    {
+                                        status.inc_event_ring_drops();
                                     }
-                                    None => Dispatch::Nothing,
+                                    // BIN15 O2: the MARK, which
+                                    // the ctx parser has always
+                                    // lifted and capture has never
+                                    // carried. A HIP-4 strike is
+                                    // the perp mark at creation
+                                    // and its settlement is a mark
+                                    // TWAP, so without this row
+                                    // neither can be reconstructed
+                                    // offline from our own tape.
+                                    let mk = ChannelEvent::new(
+                                        now_ns(),
+                                        VenueId::Hyperliquid,
+                                        ChannelId::Mark,
+                                        sym,
+                                        0,
+                                        0,
+                                        f.mark_px_1e6,
+                                        f.oracle_px_1e6,
+                                    );
+                                    capture.event(&mk);
+                                    if event_mask
+                                        & core_types::event_lane_bit(ChannelId::Mark)
+                                        != 0
+                                        && event_tx.try_push(mk).is_err()
+                                    {
+                                        status.inc_event_ring_drops();
+                                    }
+                                    Dispatch::Slow
+                                } else {
+                                    Dispatch::Nothing
                                 }
                             }
                             // Handled above.
@@ -1613,12 +1631,11 @@ fn handle_data_frame<C: Capture>(
             status.add_msgs(1);
             drv.roll_status.inc_ignored();
         }
-        Dispatch::Roll {
-            family,
-            spec,
-            settled,
-        } => {
+        Dispatch::Roll { family, settled } => {
             status.add_msgs(1);
+            // Out of the driver (64 B, at the by-value bound):
+            // `perform_roll` takes the whole driver mutably.
+            let spec = drv.roll_spec;
             perform_roll(
                 drv,
                 family as usize,
@@ -1641,7 +1658,7 @@ fn handle_data_frame<C: Capture>(
                 "hl venue error frame",
             ));
         }
-        Dispatch::Bbo { tick } => {
+        Dispatch::Bbo => {
             status.add_msgs(1);
             status.add_ticks(1);
             // VT2: stale ticks are captured and pushed like any other
@@ -1663,7 +1680,7 @@ fn handle_data_frame<C: Capture>(
         Dispatch::L2Book {
             coin_idx,
             venue_ts_ns,
-            tick,
+            touch,
         } => {
             status.add_msgs(1);
             status.add_ticks(1);
@@ -1672,13 +1689,13 @@ fn handle_data_frame<C: Capture>(
             // BIN15 O8: the outcome leg's touch travels the same road
             // as a bbo tick — capture BEFORE the push, ring drops
             // counted, never blocking.
-            if let Some(t) = tick {
-                if t.is_stale() {
+            if touch {
+                if tick.is_stale() {
                     status.inc_stale_ticks();
                 }
                 status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
-                capture.tick(&t);
-                if producer.try_push(t).is_err() {
+                capture.tick(&tick);
+                if producer.try_push(tick).is_err() {
                     status.inc_ring_drops();
                 }
             }
@@ -2351,7 +2368,7 @@ mod tests {
         inject_text(&mut t, SNAP_A);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(cap.depths, 1, "the first snapshot is a change from nothing");
-        let snap = cap.last_depth.expect("captured");
+        let snap = cap.last_depth.as_ref().expect("captured");
         assert_eq!(snap.sym, SYM_HIP4);
         assert_eq!(snap.venue, VenueId::Hyperliquid as u8);
         assert_eq!(snap.bids[1], DepthLevel { px_1e6: 490_000, qty_1e6: 64_000_000 });
@@ -2370,7 +2387,7 @@ mod tests {
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(cap.depths, 2);
         assert_eq!(
-            cap.last_depth.expect("captured").bids[1],
+            cap.last_depth.as_ref().expect("captured").bids[1],
             DepthLevel { px_1e6: 480_000, qty_1e6: 10_000_000 }
         );
 
@@ -2564,6 +2581,9 @@ mod tests {
         }
         fn depth(&mut self, d: &DepthTopK) {
             self.depths += 1;
+            // COPY: one 192 B `DepthTopK` into the recorder's slot — a
+            // test double keeps what it was handed for the assertions —
+            // rejected: a borrow, which cannot outlive this call.
             self.last_depth = Some(*d);
         }
         fn event(&mut self, e: &ChannelEvent) {

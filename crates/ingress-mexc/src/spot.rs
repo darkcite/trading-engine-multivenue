@@ -165,6 +165,11 @@ impl MexcSpotFrame {
     }
 }
 
+// [`parse_spot_wrapper`] returns its frame's `Option` by value on every
+// spot push: pinned within the 64 B bound (it fits only because
+// `MexcChannel` gives the `Option` a niche).
+const _: () = assert!(core::mem::size_of::<Option<MexcSpotFrame>>() <= 64);
+
 /// Walk one `PushDataV3ApiWrapper` order-agnostically. Requires a
 /// non-empty symbol and EXACTLY ONE known body (f314 or f315); every
 /// other field number is skipped. `None` on malformed PB, a known field
@@ -286,6 +291,18 @@ pub struct MexcBookTicker {
     _pad: [u8; 24],
 }
 
+impl MexcBookTicker {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        version: 0,
+        _pad: [0; 24],
+    };
+}
+
 /// Parse one bookTicker body (the f315 span). A SIDE is its price +
 /// quantity pair: each side must be complete (both strings) or wholly
 /// absent — proto3 omits an empty string, so an emptied book side (a
@@ -295,8 +312,20 @@ pub struct MexcBookTicker {
 /// be present — a body with neither is structural drift (plan R1) and
 /// is rejected. `version` is optional but, when present, must be all
 /// digits; every other field is skipped.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_book_ticker_body(body: &[u8]) -> Option<MexcBookTicker> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_book_ticker_body(body: &[u8], out: &mut MexcBookTicker) -> bool {
+    parse_book_ticker_body_fill(body, out).is_some()
+}
+
+/// [`parse_book_ticker_body`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_book_ticker_body_fill(body: &[u8], out: &mut MexcBookTicker) -> Option<()> {
     let mut vals = [0i64; 4];
     let mut have = 0u8;
     let mut version = 0u64;
@@ -334,14 +363,15 @@ pub fn parse_book_ticker_body(body: &[u8]) -> Option<MexcBookTicker> {
     if (bid != 0 && bid != 0b0011) || (ask != 0 && ask != 0b1100) || have == 0 {
         return None;
     }
-    Some(MexcBookTicker {
+    *out = MexcBookTicker {
         bid_px_1e6: vals[0],
         bid_qty_1e6: vals[1],
         ask_px_1e6: vals[2],
         ask_qty_1e6: vals[3],
         version,
         _pad: [0; 24],
-    })
+    };
+    Some(())
 }
 
 /// Forward walk over a `PublicAggreDealsV3Api` body yielding each
@@ -398,8 +428,20 @@ impl<'a> MexcDealsWalk<'a> {
 /// Parse one deals ITEM. Price, quantity and `tradeType` (1 buy / 2
 /// sell — anything else rejects the item) are required; `time` and
 /// `tradeId` are optional (0 = absent).
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_deal_item(item: &[u8]) -> Option<MexcDeal> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_deal_item(item: &[u8], out: &mut MexcDeal) -> bool {
+    parse_deal_item_fill(item, out).is_some()
+}
+
+/// [`parse_deal_item`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_deal_item_fill(item: &[u8], out: &mut MexcDeal) -> Option<()> {
     let mut px: Option<i64> = None;
     let mut qty: Option<i64> = None;
     let mut side: Option<u8> = None;
@@ -446,7 +488,8 @@ pub fn parse_deal_item(item: &[u8]) -> Option<MexcDeal> {
         }
         pos = f.end;
     }
-    Some(MexcDeal::new(px?, qty?, time_ms, seq, side?))
+    *out = MexcDeal::new(px?, qty?, time_ms, seq, side?);
+    Some(())
 }
 
 const _POD_SIZES: () = {
@@ -483,6 +526,16 @@ pub struct MexcSpotAck {
 }
 
 impl MexcSpotAck {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        code: 0,
+        failed_start: 0,
+        failed_end: 0,
+        _pad: [0; 40],
+    };
+}
+
+impl MexcSpotAck {
     /// True when the ack lists at least one refused param.
     #[inline]
     pub fn has_failures(&self, payload: &[u8]) -> bool {
@@ -500,11 +553,23 @@ impl MexcSpotAck {
     }
 }
 
-/// Parse one spot ack. `None` when `code` or a string `msg` is missing,
+/// Parse one spot ack. `false` when `code` or a string `msg` is missing,
 /// or when the failed list is opened but never closed (a truncated
 /// ack must not read as "nothing failed").
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_sub_ack(payload: &[u8]) -> Option<MexcSpotAck> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_sub_ack(payload: &[u8], out: &mut MexcSpotAck) -> bool {
+    parse_sub_ack_fill(payload, out).is_some()
+}
+
+/// [`parse_sub_ack`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_sub_ack_fill(payload: &[u8], out: &mut MexcSpotAck) -> Option<()> {
     let cpos = skip_ws(payload, find_field(payload, b"\"code\":")?);
     let (code, _) = scan_i64(payload, cpos)?;
     let mpos = skip_ws(payload, find_field(payload, b"\"msg\":")?);
@@ -526,12 +591,13 @@ pub fn parse_sub_ack(payload: &[u8]) -> Option<MexcSpotAck> {
             (msg_start + list_start, msg_start + list_start + close)
         }
     };
-    Some(MexcSpotAck {
+    *out = MexcSpotAck {
         code,
         failed_start,
         failed_end,
         _pad: [0; 40],
-    })
+    };
+    Some(())
 }
 
 /// Zero-alloc walker over an ack's comma-separated failed-param list
@@ -721,10 +787,40 @@ pub(crate) mod enc {
     }
 }
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<MexcBookTicker>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_book_ticker_body_view(body: &[u8]) -> Option<crate::spot::MexcBookTicker> {
+        let mut f = crate::spot::MexcBookTicker::ZERO;
+        crate::spot::parse_book_ticker_body(body, &mut f).then_some(f)
+    }
+    // COPY: `Option<MexcDeal>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_deal_item_view(item: &[u8]) -> Option<crate::MexcDeal> {
+        let mut f = crate::MexcDeal::ZERO;
+        crate::spot::parse_deal_item(item, &mut f).then_some(f)
+    }
+    // COPY: `Option<MexcSpotAck>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_sub_ack_view(payload: &[u8]) -> Option<crate::spot::MexcSpotAck> {
+        let mut f = crate::spot::MexcSpotAck::ZERO;
+        crate::spot::parse_sub_ack(payload, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::enc;
     use super::*;
+    use super::views::*;
 
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         memchr::memmem::find(hay, needle).is_some()
@@ -776,7 +872,7 @@ mod tests {
         assert_eq!(w.create_time_ms, 0, "createTime absent on the live wire");
         assert_eq!(w.send_time_ms, enc::SEND_TIME);
         assert_eq!(w.venue_time_ms(), enc::SEND_TIME);
-        let b = parse_book_ticker_body(w.body(&frame)).expect("golden body");
+        let b = parse_book_ticker_body_view(w.body(&frame)).expect("golden body");
         assert_eq!(b.bid_px_1e6, 80_535_880_000);
         assert_eq!(b.bid_qty_1e6, 380_497);
         assert_eq!(b.ask_px_1e6, 80_535_890_000);
@@ -808,8 +904,8 @@ mod tests {
         assert_eq!(q.symbol(&p), g.symbol(&golden));
         assert_eq!(q.venue_time_ms(), g.venue_time_ms());
         assert_eq!(
-            parse_book_ticker_body(q.body(&p)),
-            parse_book_ticker_body(g.body(&golden)),
+            parse_book_ticker_body_view(q.body(&p)),
+            parse_book_ticker_body_view(g.body(&golden)),
             "identical decode"
         );
         // createTime wins over sendTime when present.
@@ -823,7 +919,7 @@ mod tests {
         enc::len_field(&mut b2, 3, b"80535.89");
         enc::len_field(&mut b2, 2, b"0.380497");
         enc::len_field(&mut b2, 1, b"80535.88");
-        assert_eq!(parse_book_ticker_body(&b2), parse_book_ticker_body(&body));
+        assert_eq!(parse_book_ticker_body_view(&b2), parse_book_ticker_body_view(&body));
     }
 
     #[test]
@@ -877,7 +973,7 @@ mod tests {
         enc::len_field(&mut ask_only, 3, b"80535.89");
         enc::len_field(&mut ask_only, 4, b"0.5");
         enc::len_field(&mut ask_only, 5, b"7");
-        let t = parse_book_ticker_body(&ask_only).expect("a one-sided book parses");
+        let t = parse_book_ticker_body_view(&ask_only).expect("a one-sided book parses");
         assert_eq!((t.bid_px_1e6, t.bid_qty_1e6), (0, 0));
         assert_eq!((t.ask_px_1e6, t.ask_qty_1e6, t.version), (80_535_890_000, 500_000, 7));
         let mut bid_empty_strings = Vec::new();
@@ -885,12 +981,12 @@ mod tests {
         enc::len_field(&mut bid_empty_strings, 2, b"");
         enc::len_field(&mut bid_empty_strings, 3, b"2");
         enc::len_field(&mut bid_empty_strings, 4, b"1");
-        let t = parse_book_ticker_body(&bid_empty_strings).expect("explicit empties = absent");
+        let t = parse_book_ticker_body_view(&bid_empty_strings).expect("explicit empties = absent");
         assert_eq!((t.bid_px_1e6, t.ask_px_1e6), (0, 2_000_000));
         let mut none = Vec::new();
         enc::len_field(&mut none, 5, b"7");
-        assert!(parse_book_ticker_body(&none).is_none(), "no side at all is drift");
-        assert!(parse_book_ticker_body(&[]).is_none());
+        assert!(parse_book_ticker_body_view(&none).is_none(), "no side at all is drift");
+        assert!(parse_book_ticker_body_view(&[]).is_none());
     }
 
     #[test]
@@ -900,7 +996,7 @@ mod tests {
         enc::len_field(&mut b, 1, b"1.0");
         enc::len_field(&mut b, 2, b"1.0");
         enc::len_field(&mut b, 3, b"1.0");
-        assert!(parse_book_ticker_body(&b).is_none());
+        assert!(parse_book_ticker_body_view(&b).is_none());
         // Partial scans reject (exponent, junk, negative, bare dot).
         for bad in [&b"1e5"[..], b"1.0x", b"-1.0", b".5", b"5.", b""] {
             let mut b = Vec::new();
@@ -908,7 +1004,7 @@ mod tests {
             enc::len_field(&mut b, 2, b"1");
             enc::len_field(&mut b, 3, b"1");
             enc::len_field(&mut b, 4, b"1");
-            assert!(parse_book_ticker_body(&b).is_none(), "{:?}", core::str::from_utf8(bad));
+            assert!(parse_book_ticker_body_view(&b).is_none(), "{:?}", core::str::from_utf8(bad));
         }
         // version present but not digits.
         let mut b = Vec::new();
@@ -918,12 +1014,12 @@ mod tests {
         enc::len_field(&mut b, 4, b"1");
         let mut ok = b.clone();
         enc::len_field(&mut b, 5, b"12a");
-        assert!(parse_book_ticker_body(&b).is_none());
+        assert!(parse_book_ticker_body_view(&b).is_none());
         // version absent is fine (0).
-        assert_eq!(parse_book_ticker_body(&ok).unwrap().version, 0);
+        assert_eq!(parse_book_ticker_body_view(&ok).unwrap().version, 0);
         // A price as a varint is malformed.
         enc::varint_field(&mut ok, 1, 5);
-        assert!(parse_book_ticker_body(&ok).is_none());
+        assert!(parse_book_ticker_body_view(&ok).is_none());
     }
 
     #[test]
@@ -932,14 +1028,14 @@ mod tests {
         let w = parse_spot_wrapper(&frame).unwrap();
         assert_eq!(w.channel, MexcChannel::SpotDeals);
         let mut walk = MexcDealsWalk::new(w.body(&frame));
-        let d0 = parse_deal_item(walk.next_item().unwrap()).unwrap();
+        let d0 = parse_deal_item_view(walk.next_item().unwrap()).unwrap();
         assert_eq!(d0.px_1e6, 80_535_880_000);
         assert_eq!(d0.qty_1e6, 13_620, "0.01362099 truncates at 1e-6");
         assert_eq!(d0.side, DEAL_SIDE_SELL);
         assert_eq!(d0.signed_qty_1e6(), -13_620);
         assert_eq!(d0.time_ms, enc::DEAL_TIME);
         assert_eq!(d0.trade_seq, 730_292_425_431_437_318, "Q-MX1 leading digits");
-        let d1 = parse_deal_item(walk.next_item().unwrap()).unwrap();
+        let d1 = parse_deal_item_view(walk.next_item().unwrap()).unwrap();
         assert_eq!(d1.side, DEAL_SIDE_BUY);
         assert_eq!(d1.qty_1e6, 1_234);
         assert_eq!(d1.trade_seq, 730_292_425_431_437_320);
@@ -968,21 +1064,21 @@ mod tests {
         assert!(w.next_item().is_none());
         assert!(!w.is_malformed());
         // Items: bad tradeType, missing tradeType, missing qty.
-        assert!(parse_deal_item(&enc::deal_item(b"1", b"1", 3, 1, b"1")).is_none());
+        assert!(parse_deal_item_view(&enc::deal_item(b"1", b"1", 3, 1, b"1")).is_none());
         let mut it = Vec::new();
         enc::len_field(&mut it, 1, b"1");
         enc::len_field(&mut it, 2, b"1");
-        assert!(parse_deal_item(&it).is_none(), "tradeType required");
+        assert!(parse_deal_item_view(&it).is_none(), "tradeType required");
         let mut it = Vec::new();
         enc::len_field(&mut it, 1, b"1");
         enc::varint_field(&mut it, 3, 1);
-        assert!(parse_deal_item(&it).is_none(), "quantity required");
+        assert!(parse_deal_item_view(&it).is_none(), "quantity required");
         // Optional fields absent → 0.
         let mut it = Vec::new();
         enc::len_field(&mut it, 1, b"2.5");
         enc::len_field(&mut it, 2, b"3");
         enc::varint_field(&mut it, 3, 1);
-        let d = parse_deal_item(&it).unwrap();
+        let d = parse_deal_item_view(&it).unwrap();
         assert_eq!((d.time_ms, d.trade_seq), (0, 0));
     }
 
@@ -1000,16 +1096,16 @@ mod tests {
 
     #[test]
     fn sub_ack_success_only_lists_nothing() {
-        let a = parse_sub_ack(ACK_OK_ECHO).unwrap();
+        let a = parse_sub_ack_view(ACK_OK_ECHO).unwrap();
         assert_eq!(a.code, 0);
         assert!(!a.has_failures(ACK_OK_ECHO));
         let b = br#"{"id":0,"code":0,"msg":"Subscribed successful! [spot@public.aggre.deals.v3.api.pb@10ms@BTCUSDT]"}"#;
-        assert!(!parse_sub_ack(b).unwrap().has_failures(b));
+        assert!(!parse_sub_ack_view(b).unwrap().has_failures(b));
     }
 
     #[test]
     fn sub_ack_walks_the_failed_params() {
-        let a = parse_sub_ack(ACK_MIXED).unwrap();
+        let a = parse_sub_ack_view(ACK_MIXED).unwrap();
         assert_eq!(a.code, 0);
         assert!(a.has_failures(ACK_MIXED));
         let mut w = a.failed_params(ACK_MIXED);
@@ -1035,7 +1131,7 @@ mod tests {
     fn sub_ack_parses_the_live_refusal_text() {
         let live = "{\"id\":0,\"code\":0,\"msg\":\"Not Subscribed successfully! [spot@public.aggre.bookTicker.v3.api.pb@10ms@NOPEUSDT,spot@public.aggre.deals.v3.api.pb@10ms@NOPEUSDT].  Reason\u{ff1a} Blocked! \"}".as_bytes();
         assert_eq!(classify_spot(live, false), MexcSpotKind::SubAck);
-        let a = parse_sub_ack(live).unwrap();
+        let a = parse_sub_ack_view(live).unwrap();
         assert_eq!(a.code, 0);
         let mut w = a.failed_params(live);
         let p0 = w.next_param().unwrap();
@@ -1051,17 +1147,17 @@ mod tests {
     fn sub_ack_failure_modes() {
         // Whole-request refusal keeps its code.
         let e = br#"{"id":0,"code":30001,"msg":"invalid params"}"#;
-        assert_eq!(parse_sub_ack(e).unwrap().code, 30001);
-        assert!(parse_sub_ack(br#"{"id":0,"msg":"x"}"#).is_none(), "code required");
-        assert!(parse_sub_ack(br#"{"id":0,"code":0}"#).is_none(), "msg required");
-        assert!(parse_sub_ack(br#"{"id":0,"code":0,"msg":7}"#).is_none(), "msg is a string");
-        assert!(parse_sub_ack(br#"{"id":0,"code":0,"msg":"x"#).is_none(), "unterminated");
+        assert_eq!(parse_sub_ack_view(e).unwrap().code, 30001);
+        assert!(parse_sub_ack_view(br#"{"id":0,"msg":"x"}"#).is_none(), "code required");
+        assert!(parse_sub_ack_view(br#"{"id":0,"code":0}"#).is_none(), "msg required");
+        assert!(parse_sub_ack_view(br#"{"id":0,"code":0,"msg":7}"#).is_none(), "msg is a string");
+        assert!(parse_sub_ack_view(br#"{"id":0,"code":0,"msg":"x"#).is_none(), "unterminated");
         // The failed list opened but never closed / never opened.
-        assert!(parse_sub_ack(br#"{"code":0,"msg":"Not Subscribed successfully! [a,b"}"#).is_none());
-        assert!(parse_sub_ack(br#"{"code":0,"msg":"Not Subscribed successfully! a"}"#).is_none());
+        assert!(parse_sub_ack_view(br#"{"code":0,"msg":"Not Subscribed successfully! [a,b"}"#).is_none());
+        assert!(parse_sub_ack_view(br#"{"code":0,"msg":"Not Subscribed successfully! a"}"#).is_none());
         // Empty entries skipped.
         let s = br#"{"code":0,"msg":"Not Subscribed successfully! [ , ,x@Y,]"}"#;
-        let a = parse_sub_ack(s).unwrap();
+        let a = parse_sub_ack_view(s).unwrap();
         let mut w = a.failed_params(s);
         assert_eq!(w.next_param(), Some(&b"x@Y"[..]));
         assert_eq!(w.next_param(), None);
@@ -1090,6 +1186,7 @@ mod proptests {
     use super::enc;
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     fn dec(v: u64) -> String {
         format!("{}.{:06}", v / 1_000_000, v % 1_000_000)
@@ -1106,7 +1203,7 @@ mod proptests {
 
         #[test]
         fn book_body_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_book_ticker_body(&buf);
+            let _ = parse_book_ticker_body_view(&buf);
         }
 
         #[test]
@@ -1114,7 +1211,7 @@ mod proptests {
             let mut w = MexcDealsWalk::new(&buf);
             let mut n = 0;
             while let Some(item) = w.next_item() {
-                let _ = parse_deal_item(item);
+                let _ = parse_deal_item_view(item);
                 n += 1;
                 prop_assert!(n <= buf.len(), "the walk always progresses");
             }
@@ -1123,7 +1220,7 @@ mod proptests {
         #[test]
         fn ack_and_classify_never_panic(buf in proptest::collection::vec(any::<u8>(), 0..=300), binary in any::<bool>()) {
             let _ = classify_spot(&buf, binary);
-            if let Some(a) = parse_sub_ack(&buf) {
+            if let Some(a) = parse_sub_ack_view(&buf) {
                 let mut w = a.failed_params(&buf);
                 while let Some(p) = w.next_param() {
                     prop_assert!(!p.is_empty());
@@ -1176,7 +1273,7 @@ mod proptests {
             prop_assert_eq!(w.channel, MexcChannel::SpotBookTicker);
             prop_assert_eq!(w.symbol(&frame), b"BTCUSDT");
             prop_assert_eq!(w.venue_time_ms(), send);
-            let b = parse_book_ticker_body(w.body(&frame)).unwrap();
+            let b = parse_book_ticker_body_view(w.body(&frame)).unwrap();
             prop_assert_eq!(b.bid_px_1e6, bp as i64);
             prop_assert_eq!(b.bid_qty_1e6, bq as i64);
             prop_assert_eq!(b.ask_px_1e6, ap as i64);

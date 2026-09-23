@@ -703,14 +703,12 @@ fn handle_text_frame<C: Capture>(
                 // ours, and not tapped (§6.5): the venue groups by
                 // market, not by subscribed token.
                 if let Some(sym) = extract_asset_id(ev).and_then(|id| symbol_map.lookup(id)) {
-                    match parse_book_update(ev, sym, ts_ns) {
-                        Some(tick) => {
-                            judge_and_push_tick(feed_clock, tick, producer, status, capture)
-                        }
-                        None => {
-                            status.inc_parse_errors();
-                            capture.parse_reject(now_ns(), ev);
-                        }
+                    let mut tick = core_types::Tick::ZERO;
+                    if parse_book_update(ev, sym, ts_ns, &mut tick) {
+                        judge_and_push_tick(feed_clock, tick, producer, status, capture)
+                    } else {
+                        status.inc_parse_errors();
+                        capture.parse_reject(now_ns(), ev);
                     }
                 }
                 at = ev_end;
@@ -740,14 +738,12 @@ fn handle_text_frame<C: Capture>(
                 // Lookup miss = sibling-asset row — not ours, not
                 // tapped (§6.5).
                 if let Some(sym) = extract_asset_id(row).and_then(|id| symbol_map.lookup(id)) {
-                    match parse_price_change_row(row, sym, ts_ns, venue_time_ms) {
-                        Some(tick) => {
-                            judge_and_push_tick(feed_clock, tick, producer, status, capture)
-                        }
-                        None => {
-                            status.inc_parse_errors();
-                            capture.parse_reject(now_ns(), row);
-                        }
+                    let mut tick = core_types::Tick::ZERO;
+                    if parse_price_change_row(row, sym, ts_ns, venue_time_ms, &mut tick) {
+                        judge_and_push_tick(feed_clock, tick, producer, status, capture)
+                    } else {
+                        status.inc_parse_errors();
+                        capture.parse_reject(now_ns(), row);
                     }
                 }
                 at = row_end;

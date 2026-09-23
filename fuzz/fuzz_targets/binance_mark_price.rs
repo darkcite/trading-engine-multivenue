@@ -16,12 +16,15 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
-    let mut f = ingress_binance::BnMarkPriceFrame::ZERO;
+    let mut f: ingress_binance::BnMarkPriceFrame = poison::poisoned();
     if ingress_binance::parse_mark_price(data, 7, &mut f) {
         assert_eq!(f.sym, 7);
         assert!(f.has_funding == 0 || f.next_funding_ms != 0, "funding without a next settlement");
     } else {
-        assert_eq!(f, ingress_binance::BnMarkPriceFrame::ZERO, "a failed parse wrote the frame");
+        assert_eq!(f, poison::poisoned::<ingress_binance::BnMarkPriceFrame>(), "a failed parse wrote the frame");
     }
 });

@@ -91,13 +91,19 @@ fn price_scanner_is_zero_alloc() {
     );
 }
 
-/// Parsing a sample Polymarket book frame 1000x must not allocate.
+/// Parsing a sample Polymarket book frame and `price_change` row 1000x
+/// must not allocate.
 #[test]
 fn book_parser_is_zero_alloc() {
     let buf: &[u8] = br#"[{"market":"0x60c2","asset_id":"0xabc","timestamp":"1713000000000","hash":"deadbeef","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+    let row: &[u8] = br#"{"asset_id":"0xabc","price":"0.518","size":"642.77","side":"BUY","hash":"d0c1","best_bid":"0.518","best_ask":"0.520"}"#;
     let g = AllocGuard::new();
     for _ in 0..1_000u32 {
-        let t = ingress_polymarket::parse_book_update(buf, 1, 0);
+        let mut t = core_types::Tick::ZERO;
+        assert!(ingress_polymarket::parse_book_update(buf, 1, 0, &mut t));
+        std::hint::black_box(t);
+        let mut t = core_types::Tick::ZERO;
+        assert!(ingress_polymarket::parse_price_change_row(row, 1, 0, 1_713_000_000_123, &mut t));
         std::hint::black_box(t);
     }
     let (allocs, bytes, _deallocs) = g.delta();
@@ -217,7 +223,8 @@ fn rpc_block_number_is_zero_alloc() {
         acc = acc.wrapping_add(n as u64);
         let (id, block) = parse_block_number_result(resp).unwrap();
         acc = acc.wrapping_add(id).wrapping_add(block);
-        let head = parse_new_head_notification(notif).unwrap();
+        let mut head = ingress_rpc::NewHead::ZERO;
+        assert!(parse_new_head_notification(notif, &mut head));
         acc = acc.wrapping_add(head.number);
     }
     std::hint::black_box(acc);
@@ -1580,15 +1587,20 @@ fn okx_parsers_are_zero_alloc() {
         std::hint::black_box(ingress_okx::classify(mark));
         std::hint::black_box(ingress_okx::classify(funding));
         std::hint::black_box(ingress_okx::classify(book));
-        let b = ingress_okx::parse_bbo(bbo, sym).unwrap();
+        let mut b = ingress_okx::OkxBboFrame::ZERO;
+        assert!(ingress_okx::parse_bbo(bbo, sym, &mut b));
         acc = acc.wrapping_add(b.bid_px_1e6);
-        let t = ingress_okx::parse_trade(trade, sym).unwrap();
+        let mut t = ingress_okx::OkxTradeFrame::ZERO;
+        assert!(ingress_okx::parse_trade(trade, sym, &mut t));
         acc = acc.wrapping_add(t.px_1e6);
-        let m = ingress_okx::parse_mark_price(mark, sym).unwrap();
+        let mut m = ingress_okx::OkxMarkPriceFrame::ZERO;
+        assert!(ingress_okx::parse_mark_price(mark, sym, &mut m));
         acc = acc.wrapping_add(m.mark_px_1e6);
-        let f = ingress_okx::parse_funding_rate(funding, sym).unwrap();
+        let mut f = ingress_okx::OkxFundingFrame::ZERO;
+        assert!(ingress_okx::parse_funding_rate(funding, sym, &mut f));
         acc = acc.wrapping_add(f.funding_rate_1e9);
-        let h = ingress_okx::parse_book_header(book, sym).unwrap();
+        let mut h = ingress_okx::OkxBookFrame::ZERO;
+        assert!(ingress_okx::parse_book_header(book, sym, &mut h));
         acc = acc.wrapping_add(h.seq_id);
     }
     std::hint::black_box(acc);
@@ -1854,13 +1866,17 @@ fn deribit_parsers_are_zero_alloc() {
             quote,
             ingress_deribit::DeribitChannel::Quote,
         ));
-        let q = ingress_deribit::parse_quote(quote, sym).unwrap();
+        let mut q = ingress_deribit::DeribitQuoteFrame::ZERO;
+        assert!(ingress_deribit::parse_quote(quote, sym, &mut q));
         acc = acc.wrapping_add(q.bid_px_1e6);
-        let k = ingress_deribit::parse_ticker(ticker, sym).unwrap();
+        let mut k = ingress_deribit::DeribitTickerFrame::ZERO;
+        assert!(ingress_deribit::parse_ticker(ticker, sym, &mut k));
         acc = acc.wrapping_add(k.mark_px_1e6);
-        let t = ingress_deribit::parse_trade(trade_row, sym).unwrap();
+        let mut t = ingress_deribit::DeribitTradeFrame::ZERO;
+        assert!(ingress_deribit::parse_trade(trade_row, sym, &mut t));
         acc = acc.wrapping_add(t.px_1e6);
-        let b = ingress_deribit::parse_book_header(book, sym).unwrap();
+        let mut b = ingress_deribit::DeribitBookFrame::ZERO;
+        assert!(ingress_deribit::parse_book_header(book, sym, &mut b));
         acc = acc.wrapping_add(b.change_id);
     }
     std::hint::black_box(acc);
@@ -1900,7 +1916,8 @@ fn option_analytics_parsers_are_zero_alloc() {
     let mut acc: i64 = 0;
     let mut bn_rows = 0u32;
     for _ in 0..10_000u32 {
-        let f = ingress_deribit::parse_option_ticker(deribit_opt).unwrap();
+        let mut f = ingress_deribit::DeribitOptTickerFrame::ZERO;
+        assert!(ingress_deribit::parse_option_ticker(deribit_opt, &mut f));
         acc = acc.wrapping_add(f.mark_iv_1e9);
         let o = core_types::OptSummary::new(
             1,
@@ -2240,17 +2257,26 @@ fn hl_parsers_are_zero_alloc() {
         std::hint::black_box(ingress_hyperliquid::classify(outcome));
         std::hint::black_box(ingress_hyperliquid::classify(subresp));
         std::hint::black_box(ingress_hyperliquid::extract_coin(bbo));
-        let b = ingress_hyperliquid::parse_bbo(bbo, sym).unwrap();
+        let mut b = ingress_hyperliquid::HlBboFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_bbo(bbo, sym, &mut b));
         acc = acc.wrapping_add(b.bid_px_1e6);
-        let l = ingress_hyperliquid::parse_l2book_header(l2book, sym).unwrap();
+        let mut l = ingress_hyperliquid::HlL2BookFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_l2book_header(l2book, sym, &mut l));
         acc = acc.wrapping_add(l.best_bid_px_1e6 + l.n_bids as i64);
-        let t = ingress_hyperliquid::parse_trade(trade, sym).unwrap();
+        let mut d = core_types::DepthTopK::EMPTY;
+        let mut h = ingress_hyperliquid::HlL2BookFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_l2book_depth(l2book, sym, 1, &mut d, &mut h));
+        acc = acc.wrapping_add(d.bids[1].px_1e6 + d.asks[0].qty_1e6 + h.n_asks as i64);
+        let mut t = ingress_hyperliquid::HlTradeFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_trade(trade, sym, &mut t));
         acc = acc.wrapping_add(t.px_1e6);
-        let c = ingress_hyperliquid::parse_active_asset_ctx(ctx, sym).unwrap();
+        let mut c = ingress_hyperliquid::HlAssetCtxFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_active_asset_ctx(ctx, sym, &mut c));
         acc = acc.wrapping_add(c.funding_1e9);
         let m = ingress_hyperliquid::parse_all_mids(mids).unwrap();
         acc = acc.wrapping_add(m as i64);
-        let o = ingress_hyperliquid::parse_outcome_meta(outcome).unwrap();
+        let mut o = ingress_hyperliquid::HlOutcomeMetaFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_outcome_meta(outcome, &mut o));
         acc = acc.wrapping_add(o.enc as i64);
         std::hint::black_box(ingress_hyperliquid::parse_sub_response(subresp));
     }
@@ -2457,9 +2483,11 @@ fn hl_outcome_meta_parsers_are_zero_alloc() {
     let g = AllocGuard::new();
     let mut acc: i64 = 0;
     for _ in 0..10_000u32 {
-        let c = ingress_hyperliquid::parse_outcome_meta(created).unwrap();
+        let mut c = ingress_hyperliquid::HlOutcomeMetaFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_outcome_meta(created, &mut c));
         acc = acc.wrapping_add(c.enc as i64);
-        let s = ingress_hyperliquid::parse_outcome_meta(settled).unwrap();
+        let mut s = ingress_hyperliquid::HlOutcomeMetaFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_outcome_meta(settled, &mut s));
         acc = acc.wrapping_add(s.enc as i64);
         let (id, desc) = ingress_hyperliquid::outcome_meta_description(created).unwrap();
         acc = acc.wrapping_add(id as i64 + desc.len() as i64);
@@ -7402,14 +7430,18 @@ fn mexc_parsers_are_zero_alloc() {
         std::hint::black_box(ingress_mexc::classify_futures(MEXC_FUT_TICKER));
         let w = ingress_mexc::parse_spot_wrapper(&book).unwrap();
         acc = acc.wrapping_add(w.symbol(&book).len() as i64);
-        let b = ingress_mexc::parse_book_ticker_body(w.body(&book)).unwrap();
+        let mut b = ingress_mexc::spot::MexcBookTicker::ZERO;
+        assert!(ingress_mexc::parse_book_ticker_body(w.body(&book), &mut b));
         acc = acc.wrapping_add(b.bid_px_1e6);
         let w = ingress_mexc::parse_spot_wrapper(&deals).unwrap();
         let mut dw = ingress_mexc::MexcDealsWalk::new(w.body(&deals));
         while let Some(item) = dw.next_item() {
-            acc = acc.wrapping_add(ingress_mexc::parse_deal_item(item).unwrap().signed_qty_1e6());
+            let mut deal = ingress_mexc::MexcDeal::ZERO;
+            assert!(ingress_mexc::parse_deal_item(item, &mut deal));
+            acc = acc.wrapping_add(deal.signed_qty_1e6());
         }
-        let a = ingress_mexc::parse_sub_ack(ack).unwrap();
+        let mut a = ingress_mexc::spot::MexcSpotAck::ZERO;
+        assert!(ingress_mexc::parse_sub_ack(ack, &mut a));
         let mut p = a.failed_params(ack);
         while let Some(param) = p.next_param() {
             acc = acc.wrapping_add(ingress_mexc::extract_param_symbol(param).map_or(0, |s| s.len() as i64));
@@ -7417,13 +7449,17 @@ fn mexc_parsers_are_zero_alloc() {
         }
         acc = acc.wrapping_add(ingress_mexc::extract_fut_symbol(MEXC_FUT_DEPTH).unwrap().len() as i64);
         acc = acc.wrapping_add(ingress_mexc::extract_fut_ts_ms(MEXC_FUT_DEAL) as i64);
-        let d = ingress_mexc::parse_depth_full(MEXC_FUT_DEPTH).unwrap();
+        let mut d = ingress_mexc::futures::MexcDepthFrame::ZERO;
+        assert!(ingress_mexc::parse_depth_full(MEXC_FUT_DEPTH, &mut d));
         acc = acc.wrapping_add(d.bid_px_1e6);
         let mut fw = ingress_mexc::MexcFutDealsWalk::new(MEXC_FUT_DEAL);
         while let Some(item) = fw.next_item() {
-            acc = acc.wrapping_add(ingress_mexc::parse_fut_deal_item(item).unwrap().px_1e6);
+            let mut deal = ingress_mexc::MexcDeal::ZERO;
+            assert!(ingress_mexc::parse_fut_deal_item(item, &mut deal));
+            acc = acc.wrapping_add(deal.px_1e6);
         }
-        let t = ingress_mexc::parse_ticker(MEXC_FUT_TICKER).unwrap();
+        let mut t = ingress_mexc::futures::MexcTickerFrame::ZERO;
+        assert!(ingress_mexc::parse_ticker(MEXC_FUT_TICKER, &mut t));
         acc = acc.wrapping_add(t.funding_rate_1e9);
         acc = acc.wrapping_add(ingress_mexc::funding_next_settle_ms(
             1_789_920_000_000,

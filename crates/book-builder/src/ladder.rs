@@ -160,11 +160,11 @@ impl LadderSide {
         self.len += 1;
     }
 
-    /// Copy the best `DEPTH_K` levels into a carrier half; slots past
-    /// the held depth are [`DepthLevel::EMPTY`].
+    /// Write the best `DEPTH_K` levels into a carrier half, in place
+    /// (the 80 B half is never built on the stack and returned by
+    /// value); slots past the held depth become [`DepthLevel::EMPTY`].
     #[inline]
-    pub fn top_k(&self) -> [DepthLevel; DEPTH_K] {
-        let mut out = [DepthLevel::EMPTY; DEPTH_K];
+    pub fn top_k_into(&self, out: &mut [DepthLevel; DEPTH_K]) {
         let n = (self.len as usize).min(DEPTH_K);
         let mut i = 0;
         while i < n {
@@ -174,7 +174,10 @@ impl LadderSide {
             };
             i += 1;
         }
-        out
+        while i < DEPTH_K {
+            out[i] = DepthLevel::EMPTY;
+            i += 1;
+        }
     }
 }
 
@@ -205,17 +208,26 @@ impl DepthLadder {
         self.asks.clear();
     }
 
-    /// Snapshot the current top-K into the carrier.
+    /// Snapshot the current top-K into the carrier `out`, in place —
+    /// the 192 B carrier is never built on the stack and returned by
+    /// value. Every public field is written; the private padding keeps
+    /// the zeros every carrier is born with ([`DepthTopK::new`]).
     #[inline]
-    pub fn snapshot(&self, ts_ns: NsTs, venue: VenueId, sym: SymbolId, flags: u8) -> DepthTopK {
-        DepthTopK::new(
-            ts_ns,
-            venue,
-            sym,
-            flags,
-            self.bids.top_k(),
-            self.asks.top_k(),
-        )
+    pub fn snapshot_into(
+        &self,
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        flags: u8,
+        out: &mut DepthTopK,
+    ) {
+        out.ts_ns = ts_ns;
+        out.sym = sym;
+        out.venue = venue as u8;
+        out.k = DEPTH_K as u8;
+        out.flags = flags;
+        self.bids.top_k_into(&mut out.bids);
+        self.asks.top_k_into(&mut out.asks);
     }
 }
 
@@ -243,7 +255,8 @@ mod tests {
         s.set(300, 3);
         s.set(200, 2);
         assert_eq!(s.len(), 3);
-        let k = s.top_k();
+        let mut k = [DepthLevel::EMPTY; DEPTH_K];
+        s.top_k_into(&mut k);
         assert_eq!(
             k[0],
             DepthLevel {
@@ -274,7 +287,8 @@ mod tests {
         s.set(300, 3);
         s.set(100, 1);
         s.set(200, 2);
-        let k = s.top_k();
+        let mut k = [DepthLevel::EMPTY; DEPTH_K];
+        s.top_k_into(&mut k);
         assert_eq!(k[0].px_1e6, 100);
         assert_eq!(k[1].px_1e6, 200);
         assert_eq!(k[2].px_1e6, 300);
@@ -286,7 +300,9 @@ mod tests {
         s.set(100, 1);
         s.set(100, 9);
         assert_eq!(s.len(), 1);
-        assert_eq!(s.top_k()[0].qty_1e6, 9);
+        let mut k = [DepthLevel::EMPTY; DEPTH_K];
+        s.top_k_into(&mut k);
+        assert_eq!(k[0].qty_1e6, 9);
         s.set(100, 0);
         assert_eq!(s.len(), 0);
         // Delete of a never-held level is a venue-legal no-op.
@@ -310,7 +326,9 @@ mod tests {
         // Better than the best → evicts the worst (937).
         s.set(2_000, 5);
         assert_eq!(s.len(), DEPTH_LADDER_CAP);
-        assert_eq!(s.top_k()[0].px_1e6, 2_000);
+        let mut k = [DepthLevel::EMPTY; DEPTH_K];
+        s.top_k_into(&mut k);
+        assert_eq!(k[0].px_1e6, 2_000);
         let worst = s.px_1e6[DEPTH_LADDER_CAP - 1];
         assert_eq!(worst, 938, "old worst evicted");
     }
@@ -333,16 +351,20 @@ mod tests {
         let mut l = DepthLadder::new();
         l.bids.set(100, 1);
         l.asks.set(110, 2);
-        let a = l.snapshot(1, VenueId::Okx, 7, 0);
+        let mut a = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(1, VenueId::Okx, 7, 0, &mut a);
         // Same book, later clock → equal by the emission gate.
-        let b = l.snapshot(2, VenueId::Okx, 7, 0);
+        let mut b = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(2, VenueId::Okx, 7, 0, &mut b);
         assert!(levels_equal(&a, &b));
         // Any level change breaks equality.
         l.bids.set(100, 3);
-        let c = l.snapshot(3, VenueId::Okx, 7, 0);
+        let mut c = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(3, VenueId::Okx, 7, 0, &mut c);
         assert!(!levels_equal(&a, &c));
         // Flag change breaks equality too (STALE must always emit).
-        let d = l.snapshot(3, VenueId::Okx, 7, core_types::DEPTH_FLAG_STALE);
+        let mut d = core_types::DepthTopK::EMPTY;
+        l.snapshot_into(3, VenueId::Okx, 7, core_types::DEPTH_FLAG_STALE, &mut d);
         assert!(!levels_equal(&c, &d));
     }
 }
@@ -405,7 +427,8 @@ mod proptests {
                 model_apply(&mut m, px, qty, is_bid);
                 prop_assert_eq!(s.len(), m.len());
             }
-            let got = s.top_k();
+            let mut got = [DepthLevel::EMPTY; DEPTH_K];
+            s.top_k_into(&mut got);
             let want = model_top_k(&m, is_bid);
             for (i, (px, qty)) in want.iter().enumerate() {
                 prop_assert_eq!(got[i].px_1e6, *px);
@@ -429,7 +452,8 @@ mod proptests {
                 prop_assert!(l.bids.len() <= DEPTH_LADDER_CAP);
                 prop_assert!(l.asks.len() <= DEPTH_LADDER_CAP);
             }
-            let snap = l.snapshot(1, VenueId::Deribit, 9, 0);
+            let mut snap = core_types::DepthTopK::EMPTY;
+            l.snapshot_into(1, VenueId::Deribit, 9, 0, &mut snap);
             prop_assert_eq!(snap.k as usize, DEPTH_K);
         }
     }

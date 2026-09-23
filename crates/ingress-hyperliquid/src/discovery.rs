@@ -1110,6 +1110,10 @@ fn parse_dex_row(
 
 /// Parse one `outcomeMeta.outcomes` row starting at `pos` (must point
 /// at `{`). Returns `((outcome_id, n_sides), end)`.
+// COPY: `Result<((u32, u8, HlOutcomeSpec), usize), _>` ≥ 80 B by value,
+// once per row of the boot-time `outcomeMeta` discovery (cold; the row
+// is pushed into the discovery table next) — rejected: an out-param
+// into the table's next slot, bookkeeping a boot-once path does not earn.
 fn parse_outcome_row(
     body: &[u8],
     pos: usize,

@@ -578,7 +578,8 @@ fn drain_ws_frames<C: Capture>(
 #[derive(Copy, Clone)]
 enum Dispatch {
     Nothing,
-    EmitNewHead(NewHead),
+    /// A `newHeads` notification parsed into the phase-1 head.
+    EmitNewHead,
     Response {
         id: u64,
         block: Option<u64>,
@@ -589,6 +590,10 @@ enum Dispatch {
     },
 }
 
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
+
 fn handle_json_frame<C: Capture>(
     drv: &mut Driver,
     payload_range: core::ops::Range<usize>,
@@ -598,6 +603,10 @@ fn handle_json_frame<C: Capture>(
 ) {
     // Retained for the phase-2 reject re-borrow (Range is not Copy).
     let reject_range = payload_range.clone();
+    // Phase 1's head, parsed in place: riding inside the dispatch value
+    // it would widen every dispatch past the 64 B bound and cross phase
+    // 1 → phase 2 by value. `Dispatch::EmitNewHead` says it was written.
+    let mut head = crate::NewHead::ZERO;
     // Phase 1: immutable-borrow phase — classify and pre-parse
     // everything we might need. Zero-alloc scanners over `&[u8]`.
     // The §6.5 raw tap sees every data payload pre-classify.
@@ -605,9 +614,13 @@ fn handle_json_frame<C: Capture>(
         let payload = &drv.rx.filled()[payload_range];
         capture.raw_frame(now_ns(), payload);
         match classify_rpc(payload) {
-            RpcFrameKind::Subscription => parse_new_head_notification(payload)
-                .map(Dispatch::EmitNewHead)
-                .unwrap_or(Dispatch::Nothing),
+            RpcFrameKind::Subscription => {
+                if parse_new_head_notification(payload, &mut head) {
+                    Dispatch::EmitNewHead
+                } else {
+                    Dispatch::Nothing
+                }
+            }
             RpcFrameKind::Response => match extract_id_decimal(payload) {
                 Some((id, _)) => Dispatch::Response {
                     id,
@@ -647,7 +660,7 @@ fn handle_json_frame<C: Capture>(
             // §6.5 raw-tap differential audit consumes these.
             capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
         }
-        Dispatch::EmitNewHead(head) => {
+        Dispatch::EmitNewHead => {
             status.add_msgs(1);
             status.add_ticks(1);
             emit_new_head_signal(producer, status, head, capture);

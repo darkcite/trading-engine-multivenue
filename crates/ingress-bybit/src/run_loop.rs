@@ -445,17 +445,18 @@ enum Dispatch {
     Quiet,
     /// The whole-request subscribe ack.
     SubAck { success: bool },
-    /// `orderbook.1` push pre-parsed (BBO state applied in phase 2).
-    Book {
-        sym: u32,
-        sym_idx: u8,
-        frame: crate::BybitBookFrame,
-    },
+    /// `orderbook.1` push pre-parsed into the phase-1 frame (BBO state
+    /// applied in phase 2).
+    Book { sym: u32, sym_idx: u8 },
     /// `publicTrade` push scanned (+ events captured in phase 1).
     Trades { scan: TradeScan },
     /// LINEAR `tickers` push — events captured in phase 1.
     Tickers,
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
@@ -562,25 +563,23 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
         let next = memchr::memmem::find(&payload[row_start + MARKER.len()..], MARKER)
             .map(|o| row_start + MARKER.len() + o);
         let row_end = next.unwrap_or(payload.len());
-        match parse_trade_row(&payload[row_start..row_end]) {
-            Some(t) => {
-                scan.rows_parsed += 1;
-                let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
-                capture.event(&ChannelEvent::new(
-                    now_ns(),
-                    VenueId::Bybit,
-                    ChannelId::Trade,
-                    sym,
-                    0,
-                    t.ts_ns / 1_000_000,
-                    t.px_1e6,
-                    signed_qty,
-                ));
-            }
-            None => {
-                scan.rows_rejected += 1;
-                capture.parse_reject(now_ns(), &payload[row_start..row_end]);
-            }
+        let mut t = crate::BybitTradeFrame::ZERO;
+        if parse_trade_row(&payload[row_start..row_end], &mut t) {
+            scan.rows_parsed += 1;
+            let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            capture.event(&ChannelEvent::new(
+                now_ns(),
+                VenueId::Bybit,
+                ChannelId::Trade,
+                sym,
+                0,
+                t.ts_ns / 1_000_000,
+                t.px_1e6,
+                signed_qty,
+            ));
+        } else {
+            scan.rows_rejected += 1;
+            capture.parse_reject(now_ns(), &payload[row_start..row_end]);
         }
         at = row_end;
     }
@@ -597,6 +596,10 @@ fn handle_data_frame<C: Capture>(
     capture: &mut C,
 ) -> io::Result<()> {
     let reject_range = payload_range.clone();
+    // Phase 1's book frame, parsed in place: riding inside the dispatch
+    // value it would widen every dispatch past the 64 B bound and cross
+    // phase 1 → phase 2 by value. `Dispatch::Book` says it was written.
+    let mut frame = crate::BybitBookFrame::ZERO;
     // Phase 1: immutable borrows — classify, resolve, pre-parse into
     // a Copy dispatch; capture hooks needing parsed values fire here.
     let dispatch: Dispatch = {
@@ -611,13 +614,15 @@ fn handle_data_frame<C: Capture>(
                         .lookup(s)
                         .map(|sym| (sym, drv.symbols.index_of(sym)))
                 }) {
-                    Some((sym, Some(sym_idx))) => match parse_orderbook1(payload) {
-                        Some(frame) => Dispatch::Book {
-                            sym,
-                            sym_idx: sym_idx as u8,
-                            frame,
-                        },
-                        None => Dispatch::Nothing,
+                    Some((sym, Some(sym_idx))) => {
+                        if parse_orderbook1(payload, &mut frame) {
+                            Dispatch::Book {
+                                sym,
+                                sym_idx: sym_idx as u8,
+                            }
+                        } else {
+                            Dispatch::Nothing
+                        }
                     },
                     _ => Dispatch::Nothing,
                 }
@@ -636,8 +641,9 @@ fn handle_data_frame<C: Capture>(
                 match extract_topic_symbol(payload, BybitChannel::Tickers)
                     .and_then(|s| drv.symbols.lookup(s))
                 {
-                    Some(sym) => match parse_tickers(payload) {
-                        Some(f) => {
+                    Some(sym) => {
+                        let mut f = crate::BybitTickerFrame::ZERO;
+                        if parse_tickers(payload, &mut f) {
                             // §6.5 capture (crate-doc conventions):
                             // presence-gated per delta field group.
                             let ts_ms = f.ts_ns / 1_000_000;
@@ -687,8 +693,9 @@ fn handle_data_frame<C: Capture>(
                                 ));
                             }
                             Dispatch::Tickers
+                        } else {
+                            Dispatch::Nothing
                         }
-                        None => Dispatch::Nothing,
                     },
                     None => Dispatch::Nothing,
                 }
@@ -740,11 +747,7 @@ fn handle_data_frame<C: Capture>(
                 log_sub_drop_rate_limited(drv);
             }
         }
-        Dispatch::Book {
-            sym,
-            sym_idx,
-            frame,
-        } => {
+        Dispatch::Book { sym, sym_idx } => {
             status.add_msgs(1);
             status.add_ticks(1);
             // VT2: judge EVERY stamped push (the offset learns from
