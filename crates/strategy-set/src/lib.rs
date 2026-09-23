@@ -801,6 +801,15 @@ impl StrategyCounters for StrategySet {
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
     }
+    /// HYPARB H4: slot 0's observables.
+    #[inline]
+    fn hyparb_counters(&self) -> strategy_core::HyparbCounters {
+        self.hyparb.hyparb_counters()
+    }
+    #[inline]
+    fn hyparb_pools_view(&self, out: &mut [strategy_core::HyparbPoolView]) -> u32 {
+        self.hyparb.hyparb_pools_view(out)
+    }
     /// BIN15 O4b: slot 3's observables.
     #[inline]
     fn bin15_counters(&self) -> strategy_core::Bin15Counters {
@@ -1522,6 +1531,38 @@ mod tests {
         StrategySet::new(0).timer_period_ns()
     }
 
+    /// A set with slot 0 enabled and its member configured: one
+    /// observe-only pool, one perp hedge coin. Tests that need "some
+    /// enabled member" use slot 0 — since H4 it validates in `on_start`.
+    fn hyparb_set() -> StrategySet {
+        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut p = strategy_hyparb::HyparbParams::EMPTY;
+        p.coins[0] = strategy_hyparb::CoinParams {
+            perp_sym: make_symbol_id(VenueId::Hyperliquid, 5),
+            spot_sym: core_types::SYMBOL_ID_NONE,
+            lot_1e6: 10_000,
+            min_notional_usd_1e6: 10_000_000,
+        };
+        p.n_coins = 1;
+        p.pools[0] = strategy_hyparb::PoolParams {
+            sym: make_symbol_id(VenueId::HyperEvm, 1),
+            coin0: 0,
+            coin1: strategy_hyparb::COIN_USD,
+            trade: false,
+            max_notional_usd_1e6: 1_000_000,
+        };
+        p.n_pools = 1;
+        p.lag_ns = 1;
+        p.basis_window_ns = 1;
+        p.max_order_usd_1e6 = 1;
+        p.cap_day_usd_1e6 = 1;
+        p.inventory_cap_usd_1e6 = 1;
+        s.hyparb_mut()
+            .configure(p, core_time::WallAnchor::new(0, 0))
+            .expect("hyparb params");
+        s
+    }
+
     #[test]
     fn initial_mask_from_names() {
         // HYPARB H0 (O-H1): slot 0 is the hyparb member and
@@ -1622,19 +1663,36 @@ mod tests {
         assert!(s.on_start(&mut ctx()).is_ok());
     }
 
-    /// HYPARB H0: slot 0 lands DARK (O-H8) — the hyparb member starts
-    /// clean, emits nothing on any tick and arms no timer until H4
-    /// gives it a book of pools.
+    /// HYPARB H4: slot 0 is a REAL member — unconfigured it refuses the
+    /// boot (fail-fast, like vrp/bin15; the cli never puts it in the
+    /// configured mask without its artifact, O-H8), configured it is
+    /// inert on anything but its own pools and hedge books, and its
+    /// 1 s timer joins the set's minimum.
     #[test]
-    fn hyparb_slot_is_dark_and_inert_at_h0() {
+    fn hyparb_slot_refuses_unconfigured_and_is_inert_configured() {
         let mut s = StrategySet::new(BIT_HYPARB);
+        assert!(matches!(
+            s.on_start(&mut ctx()),
+            Err(StrategyError::Config(_))
+        ));
+        let mut s = hyparb_set();
         let mut c = ctx();
         assert!(s.on_start(&mut c).is_ok());
         s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut c);
         s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut c);
         assert_eq!(c.submitted, 0);
         assert_eq!(s.orders_emitted(), 0);
-        assert_eq!(s.timer_period_ns(), s_timer_without_xsd());
+        assert_eq!(
+            s.timer_period_ns(),
+            s_timer_without_xsd().min(1_000_000_000)
+        );
+        assert_eq!(
+            s.hyparb_counters(),
+            strategy_core::HyparbCounters::default()
+        );
+        let mut rows = [strategy_core::HyparbPoolView::default(); 2];
+        assert_eq!(s.hyparb_pools_view(&mut rows), 1);
+        assert_eq!(rows[0].live, 0, "no snapshot yet");
     }
 
     #[test]
@@ -1676,7 +1734,7 @@ mod tests {
         };
 
         // A fill for a DISABLED slot is counted, never delivered.
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_fill(&fill_for(SLOT_VRP), &mut c);
         assert_eq!(s.fills_unrouted(), 1, "slot 1 is not enabled here");
@@ -1790,7 +1848,7 @@ mod tests {
 
     #[test]
     fn enable_while_halted_refused_and_counted() {
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::HaltRequest, STRATEGY_SLOT_NONE), &mut c);
@@ -1861,7 +1919,7 @@ mod tests {
     fn non_set_kinds_fan_out_without_side_effects() {
         // Heartbeat / SetFairValue reach members' default no-op
         // on_ai; the set itself must not change state.
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         let hb = ai_cmd(AiCmdKind::Heartbeat, STRATEGY_SLOT_NONE);
@@ -1958,7 +2016,7 @@ mod tests {
     #[test]
     fn disabled_ai_exec_receives_nothing() {
         let pm = make_symbol_id(VenueId::Polymarket, 3);
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&fair_cmd(c.now - 100, pm, 500_000), &mut c);
@@ -1992,7 +2050,7 @@ mod tests {
             Err(StrategyError::Config(_))
         ));
         // Outside the initial mask the invalid member is skipped.
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         s.ai_exec_mut().set_edge_1e6(0);
         assert!(s.on_start(&mut ctx()).is_ok());
     }
@@ -2119,7 +2177,7 @@ mod tests {
     /// frame — the Commit neither applies nor counts as dropped.
     #[test]
     fn disabled_vm_never_sees_commit() {
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         let mut c = vm_ctx();
         s.on_start(&mut c).unwrap();
         s.vm_mut().receive_table_v2(&vm_table(VM_HASH_A));
@@ -2214,7 +2272,7 @@ mod tests {
     /// must work without restaging.
     #[test]
     fn on_ruleset_table_stages_even_when_vm_disabled() {
-        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut s = hyparb_set();
         let mut c = vm_ctx();
         s.on_start(&mut c).unwrap();
 

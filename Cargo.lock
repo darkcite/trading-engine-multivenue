@@ -165,6 +165,7 @@ dependencies = [
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
@@ -1920,6 +1921,9 @@ dependencies = [
 name = "strategy-hyparb"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
+ "core-fill",
+ "core-time",
  "core-types",
  "strategy-core",
 ]

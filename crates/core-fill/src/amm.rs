@@ -299,6 +299,44 @@ impl AmmBook {
         }
     }
 
+    /// The static facts of pool `index` as a walk reads them, charging
+    /// the fee the judge would ([`Self::judged_fee`]). `None` unless the
+    /// pool is judgeable. The member builds its sizing walk from this, so
+    /// the member and the judge price one pool with one fee.
+    #[inline]
+    #[must_use]
+    pub fn pool_meta(&self, index: usize) -> Option<PoolMeta> {
+        if !self.is_live(index) {
+            return None;
+        }
+        let p = &self.pools[index];
+        Some(p.meta(p.judged_fee()))
+    }
+
+    /// Carry our OWN swap's impact into pool `index` (the member's
+    /// `ArbQuote::after`), so a standing gap is not harvested twice before
+    /// the chain's next `STATE` overwrites it — the law [`Self::judge`]
+    /// applies to its own fills. Ignored unless the pool is judgeable.
+    #[inline]
+    pub fn carry(&mut self, index: usize, after: PoolState) {
+        if self.is_live(index) {
+            let pool = self.pools[index].state.pool;
+            self.pools[index].state = after;
+            self.pools[index].state.pool = pool;
+        }
+    }
+
+    /// Mark pool `index` stale until its next completed snapshot — the
+    /// member's own evidence that its view of the pool disagrees with the
+    /// chain (a position its tick map refused).
+    #[inline]
+    pub fn mark_stale(&mut self, index: usize) {
+        if index < AMM_MAX_POOLS && self.pools[index].phase != PHASE_EMPTY {
+            self.pools[index].stale();
+            self.counters.stale_marks = self.counters.stale_marks.wrapping_add(1);
+        }
+    }
+
     /// The fee the judge would charge pool `index`, pips.
     #[inline]
     #[must_use]
@@ -754,6 +792,26 @@ mod tests {
             AmmObs::Refused
         );
         assert_eq!(b.counters.refused, 2);
+    }
+
+    #[test]
+    fn the_member_helpers_carry_impact_expose_meta_and_stale_a_pool() {
+        let mut b = live_book();
+        let m = b.pool_meta(2).expect("live");
+        assert_eq!(
+            (m.fee_pips, m.tick_spacing, m.dec0, m.dec1),
+            (500, 10, 18, 6)
+        );
+        let mut after = b.state(2).unwrap();
+        after.sqrt_price_lo -= 1;
+        b.carry(2, after);
+        assert_eq!(b.state(2).unwrap().sqrt_price_lo, after.sqrt_price_lo);
+        b.mark_stale(2);
+        assert!(!b.is_live(2));
+        assert_eq!(b.pool_meta(2), None);
+        let before = b.state(2).unwrap();
+        b.carry(2, PoolState::ZERO);
+        assert_eq!(b.state(2).unwrap(), before, "a stale pool takes no impact");
     }
 
     #[test]

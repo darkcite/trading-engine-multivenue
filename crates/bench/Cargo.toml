@@ -62,6 +62,8 @@ signer-evm           = { workspace = true }
 ingress-hyperevm     = { workspace = true }
 # HYPARB H2 gate 67: the AMM fill law on the paper matcher.
 core-fill            = { workspace = true }
+# HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
+strategy-hyparb      = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

@@ -12,5 +12,8 @@ description  = "HYPARB slot-0 member: HyperEVM concentrated-liquidity pools vs H
 path = "src/lib.rs"
 
 [dependencies]
+core-amm      = { workspace = true }
+core-fill     = { workspace = true }
+core-time     = { workspace = true }
 core-types    = { workspace = true }
 strategy-core = { workspace = true }

@@ -379,6 +379,22 @@ pub trait StrategyCounters {
         0
     }
 
+    /// HYPARB H4: the slot-0 member's observables (`engine_hyparb_*`),
+    /// mirrored by the cli's generic 5 s block like [`Self::bin15_counters`].
+    #[inline]
+    fn hyparb_counters(&self) -> HyparbCounters {
+        HyparbCounters::default()
+    }
+
+    /// HYPARB H4: copy the per-pool view into `out` (a caller-owned
+    /// slice, `min(out.len())` rows), returning how many pools are
+    /// CONFIGURED. Cold path; never allocates.
+    #[inline]
+    fn hyparb_pools_view(&self, out: &mut [HyparbPoolView]) -> u32 {
+        let _ = out;
+        0
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -952,6 +968,123 @@ pub struct XsdCounters {
     pub seed_rows: u64,
     /// Seed rows dropped (unknown sym, duplicate hour, older than the ring).
     pub seed_dropped: u64,
+}
+
+/// HYPARB H4 counters (`engine_hyparb_*`), mirrored by the cli's generic
+/// 5 s block. Defined HERE for the reason [`IcdpCounters`] is. Every
+/// `skipped_*` is a REASON (the bin15 law): which gate held a pool is the
+/// observation, and "no hedge book" and "the day cap is full" call for
+/// opposite actions.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbCounters {
+    /// Pool-event signals applied.
+    pub pool_events: u64,
+    /// Pool-event signals refused (undecodable, not a configured pool).
+    pub pool_refused: u64,
+    /// Tick maps loaded from a completed snapshot.
+    pub maps_loaded: u64,
+    /// Tick maps refused (a snapshot that does not load, a position the
+    /// map refuses) — the pool is stale until its next snapshot.
+    pub maps_refused: u64,
+    /// Pool evaluations run (the solve reached).
+    pub evaluations: u64,
+    /// Arb decisions: an AMM swap submitted.
+    pub arbs_submitted: u64,
+    /// Solves whose net edge was under `min_net_bps` (or not positive).
+    pub skipped_below_min: u64,
+    /// Held: the pool is not judgeable (never snapshotted, stale, edge).
+    pub skipped_not_live: u64,
+    /// Held: a hedge book is absent, stale or one-sided.
+    pub skipped_no_hedge: u64,
+    /// Held: the pool's previous swap is still in flight.
+    pub skipped_inflight: u64,
+    /// Held: the pool's cooldown.
+    pub skipped_cooldown: u64,
+    /// Held: the member is halted (inventory cap) or the day cap is full.
+    pub skipped_halted: u64,
+    /// Decisions whose size a cap cut (depth, order, pool, day).
+    pub size_capped: u64,
+    /// AMM-leg fills.
+    pub amm_fills: u64,
+    /// Hedge IoCs submitted after an AMM fill.
+    pub hedges_submitted: u64,
+    /// Hedge IoCs routed to the perp book.
+    pub hedges_perp: u64,
+    /// Hedge IoCs routed to the spot book.
+    pub hedges_spot: u64,
+    /// Hedge fills (any quantity).
+    pub hedge_fills: u64,
+    /// Hedge IoCs that reached their deadline unfilled — the latency
+    /// correction made visible (the book moved inside Δ).
+    pub hedges_missed: u64,
+    /// Inventory-flattening IoCs (the timer's TWAP of unhedged residue).
+    pub flattens_submitted: u64,
+    /// Times the unhedged-inventory cap was breached (the member halts).
+    pub inventory_breaches: u64,
+    /// Orders the context refused (ring full, unsupported, refused).
+    pub orders_dropped: u64,
+    /// Gas charged per ATTEMPT (every AMM swap submitted), USD × 1e6.
+    pub gas_charged_usd_1e6: i64,
+    /// Sum of the solver's predicted net P&L over submitted arbs, USD ×
+    /// 1e6 (after pool fee, hedge fees and gas) — the model's claim, for
+    /// the harness to hold it to.
+    pub pnl_predicted_usd_1e6: i64,
+    /// Sum of AMM-leg fill notional, USD × 1e6.
+    pub amm_notional_usd_1e6: i64,
+}
+
+/// HYPARB H4: one pool's row (`/state`, the dashboard).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbPoolView {
+    /// The pool's symbol.
+    pub sym: u32,
+    /// 1 when judgeable (snapshotted, not stale, not edge-bound).
+    pub live: u8,
+    /// 1 when the tick map is loaded and consistent.
+    pub map_ok: u8,
+    /// Last hedge venue chosen for token0 (0 perp, 1 spot, 255 none).
+    pub hedge_venue: u8,
+    _pad: u8,
+    /// Fee the member prices with, pips.
+    pub fee_pips: u32,
+    _pad2: u32,
+    /// Pool mid, token1 per token0 × 1e6 (0 = unknown).
+    pub mid_1e6: i64,
+    /// Basis EMA (pool vs hedge), bps × 1e6.
+    pub basis_bps_1e6: i64,
+    /// Arbs submitted on this pool.
+    pub arbs: u64,
+}
+
+impl HyparbPoolView {
+    /// A row (the padding stays private and zero).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        sym: u32,
+        live: u8,
+        map_ok: u8,
+        hedge_venue: u8,
+        fee_pips: u32,
+        mid_1e6: i64,
+        basis_bps_1e6: i64,
+        arbs: u64,
+    ) -> Self {
+        Self {
+            sym,
+            live,
+            map_ok,
+            hedge_venue,
+            _pad: 0,
+            fee_pips,
+            _pad2: 0,
+            mid_1e6,
+            basis_bps_1e6,
+            arbs,
+        }
+    }
 }
 
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s

@@ -1656,3 +1656,70 @@ As §6 says, with these decisions recorded:
   its HL subscription set at the next daily restart; that edit is made
   with its verification (spotMeta indices, the 32-subscription budget,
   `claude-worker fetch` `unresolved=0`) when hyparb enters the live mask.
+
+### 16.11 H4 — the slot-0 member — LANDED (dark: never in a configured mask before H5)
+
+* **`strategy-hyparb` is the real member** (`lib.rs` decision + lifecycle,
+  `pools.rs` pool side, `hedge.rs` hedge side). Deps exactly §8.1 (no
+  `core-config`: the cli parses `hyparb.toml` in H5 and passes
+  `HyparbParams`, which `validate()` re-checks). `#![forbid(unsafe_code)]`.
+  Unconfigured, `on_start` refuses (`StrategyError::Config`) — fail-fast
+  like vrp/bin15; the cli never puts bit 0 in the configured mask before
+  its artifact resolves (§9), so `--strategy hyparb` still refuses the
+  boot rather than running an inert member.
+* **The book is the judge's.** Every pool signal goes through
+  `core_fill::AmmBook::observe` — the same state machine the paper matcher
+  fills with — so member and judge price one pool with one fee (the worse
+  of in-force and observed) and one staleness. The member adds what the
+  book does not keep: the per-pool **tick map** (`TickMap<1024>` × 128 in
+  one boot box). `SNAPSHOT` opens staging, `TICK`s append, the snapshot
+  `STATE` loads (Algebra maps with spacing 1); `LIQUIDITY` maintains it;
+  a short snapshot, a refused node / load / position, or a `GAP` leaves
+  the pool untraded (and stale in the member's own book) until the next
+  snapshot. New `AmmBook` helpers: `pool_meta` (the walk's meta at the
+  judged fee), `carry` (our own impact until the chain's next `STATE`),
+  `mark_stale`.
+* **The decision** (a pool event, or a hedge BBO of one of its coins):
+  four hedge legs (sell/buy × coin0/coin1) → fee-folded token1-per-token0
+  bounds at ×1e18 (`ratio_1e18`, the basis applied before the scaling) →
+  `core_amm::solve_arb` over the real map → gates: net ≥
+  `min_net_bps_1e6` after pool fee, hedge fees and gas; size capped by
+  pool cap, order cap, the day's remaining budget and — `depth_cap_enabled`
+  — the touch of the direction that can clear (a pool above the hedge
+  midpoint can only be sold into). A remaining day budget or a capped size
+  below the pool's hedge minimum (the larger venue minimum of its coins)
+  is not an arb. The AMM order is one `ORDER_KIND_AMM_SWAP` at the quote's
+  own average price (`core_amm::avg_px_1e6`, rounded against us), `ttl`
+  3 s; the quote's `after` is carried into the member's book.
+* **The four corrections** are the knobs of §8.4: depth cap, latency (the
+  hedge IoC lives `lag_ns`, a miss is counted after `lag + 1 s`), basis
+  (a time-weighted EMA over `basis_window_ns` of pool-vs-hedge, sampled
+  on pool events, skipped while our own swap is in flight, clamped ±50 %),
+  gas (`gas_p50_usd_1e6` charged per ATTEMPT).
+* **Hedge selector (§8.5)**, per coin and side, bps × 1e6 vs the venue mid:
+  `spot = ½spread + taker_spot + depth_penalty`, `perp = ½spread +
+  taker_perp + depth_penalty + |perp − spot| − funding(side)`. The
+  half-spread term is an addition to §8.5's formula (an IoC at the touch
+  pays it and the two books' spreads differ); `depth_penalty` charges the
+  notional beyond the touch one more full spread; funding is the
+  `activeAssetCtx` hourly rate over `funding_window_ns`, earned by a
+  short. `hedge_venue = auto | perp | spot`; `auto` keeps the last choice
+  unless the other is cheaper by more than the hysteresis. A touch that
+  is stale (VT4) or older than 10 s is never traded against.
+* **Inventory is first-class:** an AMM fill books both tokens' coin
+  inventory and sends one IoC per non-USD coin (lot-rounded down; below
+  the venue minimum nothing is sent); hedge fills close it; the 1 s timer
+  counts misses and flattens the residue at the preferred touch; unhedged
+  notional above `inventory_cap_usd_1e6` halts new arbs until it is back
+  under half the cap.
+* **Observables:** `HyparbCounters` (25 fields: events, maps, evaluations,
+  every skip reason, arbs, fills, hedges by venue, misses, flattens,
+  breaches, drops, gas charged, predicted P&L, AMM notional) and
+  `hyparb_pools_view` rows (live, map_ok, venue, fee, mid, basis, arbs)
+  through `StrategyCounters`, forwarded by the set (H6 mirrors them).
+* **Gates:** 29 member tests (every public fn a happy path and a failure
+  mode; the decision against a real V3 pool; both forced hedge venues
+  run); the set's tests configure slot 0 through a helper since it now
+  validates; alloc gate **68** — the member driven through pool events, a
+  funding event, BBOs, the AMM fill, the hedge fill and the timer, 10,000
+  cycles at 0 B/op.

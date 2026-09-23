@@ -240,6 +240,47 @@ pub fn fill_in_range(
     }
 }
 
+/// A raw token amount as human units × 1e6, floored: `raw / 10^(dec − 6)`.
+/// `None` when it does not fit `i64`.
+#[must_use]
+pub fn qty_1e6_from_raw(raw: u128, dec: u8) -> Option<i64> {
+    match scale10(U256::from_u128(raw), 6 - dec as i32, false) {
+        Some(v) => to_i64(v),
+        None => None,
+    }
+}
+
+/// The average price of a swap, token1 per token0 (human) × 1e6:
+/// `token1_raw · 10^(dec0 − dec1 + 6) / token0_raw`, rounded as asked
+/// (a buy's limit rounds UP, a sell's DOWN — the side that accepts the
+/// quote). `None` for a zero leg or a price beyond `i64`.
+#[must_use]
+pub fn avg_px_1e6(
+    token0_raw: u128,
+    token1_raw: u128,
+    dec0: u8,
+    dec1: u8,
+    round_up: bool,
+) -> Option<i64> {
+    if token0_raw == 0 || token1_raw == 0 {
+        return None;
+    }
+    let num = scale10(
+        U256::from_u128(token1_raw),
+        dec0 as i32 - dec1 as i32 + 6,
+        round_up,
+    )?;
+    let px = if round_up {
+        mul_div_rounding_up(num, U256::ONE, U256::from_u128(token0_raw))
+    } else {
+        mul_div(num, U256::ONE, U256::from_u128(token0_raw))
+    }?;
+    match to_i64(px) {
+        Some(x) if x > 0 => Some(x),
+        _ => None,
+    }
+}
+
 /// The fee, in pips, a swap observed on the tape ACTUALLY paid: the
 /// event's input minus the pre-fee input that moves `pre` to the
 /// post-swap price, over the event's input, rounded UP.
@@ -396,6 +437,27 @@ mod tests {
         let mut bad = m;
         bad.fee_pips = 1_000_000;
         assert!(fill_in_range(&st, &bad, true, 1, 1).flags & RFILL_NOT_LIVE != 0);
+    }
+
+    #[test]
+    fn human_unit_helpers_floor_and_round_as_asked() {
+        assert_eq!(
+            qty_1e6_from_raw(1_500_000_000_000_000_000, 18),
+            Some(1_500_000)
+        );
+        assert_eq!(
+            qty_1e6_from_raw(999_999_999_999, 18),
+            Some(0),
+            "dust floors to zero"
+        );
+        assert_eq!(qty_1e6_from_raw(123, 2), Some(1_230_000));
+        // 2 WHYPE for 195.4 USDC ⇒ 97.7 USDC per WHYPE.
+        let t0 = 2_000_000_000_000_000_000u128;
+        let t1 = 195_400_000u128;
+        assert_eq!(avg_px_1e6(t0, t1, 18, 6, false), Some(97_700_000));
+        assert_eq!(avg_px_1e6(t0 + 1, t1, 18, 6, false), Some(97_699_999));
+        assert_eq!(avg_px_1e6(t0 + 1, t1, 18, 6, true), Some(97_700_000));
+        assert_eq!(avg_px_1e6(0, t1, 18, 6, true), None);
     }
 
     #[test]

@@ -2725,11 +2725,38 @@ fn strategy_set_fanout_is_zero_alloc() {
         }
     }
 
-    // Boot (allocation allowed): slot 0 (hyparb, dark at H0) rides
-    // the fan-out, and a one-row vm table is committed on the
+    // Boot (allocation allowed): slot 0 (hyparb — configured since H4
+    // validates in `on_start`: one observe-only pool, one perp coin)
+    // rides the fan-out, and a one-row vm table is committed on the
     // (PM=11, BN=22) pair. Clock is production-like (G3 lesson: fresh
     // cooldown stamps arm only once `now ≥ horizon_ns`).
     let mut set = StrategySet::new(BIT_HYPARB | BIT_VM);
+    {
+        let mut hp = strategy_hyparb::HyparbParams::EMPTY;
+        hp.coins[0] = strategy_hyparb::CoinParams {
+            perp_sym: core_types::make_symbol_id(VenueId::Hyperliquid, 5),
+            spot_sym: SYMBOL_ID_NONE,
+            lot_1e6: 10_000,
+            min_notional_usd_1e6: 10_000_000,
+        };
+        hp.n_coins = 1;
+        hp.pools[0] = strategy_hyparb::PoolParams {
+            sym: core_types::make_symbol_id(VenueId::HyperEvm, 1),
+            coin0: 0,
+            coin1: strategy_hyparb::COIN_USD,
+            trade: false,
+            max_notional_usd_1e6: 1_000_000,
+        };
+        hp.n_pools = 1;
+        hp.lag_ns = 1;
+        hp.basis_window_ns = 1;
+        hp.max_order_usd_1e6 = 1;
+        hp.cap_day_usd_1e6 = 1;
+        hp.inventory_cap_usd_1e6 = 1;
+        set.hyparb_mut()
+            .configure(hp, core_time::WallAnchor::new(0, 0))
+            .expect("gate hyparb params");
+    }
     let mut ctx = CountCtx {
         submitted: 0,
         now: 100_000_000_000_000_000,
@@ -8050,5 +8077,216 @@ fn amm_paper_matcher_observe_judge_and_fill_are_zero_alloc() {
     assert_eq!(
         bytes, 0,
         "AMM paper matcher hot bytes should be zero: saw {bytes}"
+    );
+}
+
+/// **HYPARB H4 gate 68 — the slot-0 member in steady state.**
+///
+/// `HyparbStrategy` driven the way the engine drives it: every cycle the
+/// chain resets the pool (a snapshot `STATE` — our carried impact
+/// erased), a swap + its state and a mint arrive, a head, a funding
+/// event, a perp BBO 1 % off the pool; the member decides (the real
+/// `solve_arb` walk over its tick map), submits the AMM swap, carries
+/// its impact, is filled, sends the hedge IoC, is filled on the hedge,
+/// and its timer runs. Boot (params, the first snapshot and map load) is
+/// outside the window. 0 B/op on `on_tick` / `on_signal` / `on_fill` /
+/// `on_timer` / `on_venue_event`.
+#[test]
+fn hyparb_member_decision_hedge_and_timer_are_zero_alloc() {
+    use core_amm::payload::{
+        encode_head, encode_liquidity, encode_snapshot, encode_state, encode_swap, encode_tick,
+        FAMILY_V3,
+    };
+    use core_amm::{price_1e18_from_sqrt, sqrt_at_tick};
+    use core_types::{
+        make_symbol_id, ChannelEvent, ChannelId, Fill, LatencyClass, Order, Signal, SignalSource,
+        SYMBOL_ID_NONE,
+    };
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_hyparb::{CoinParams, HyparbParams, HyparbStrategy, PoolParams, COIN_USD};
+
+    /// Keeps the last AMM order and the last hedge order — no storage
+    /// that grows.
+    struct LastCtx {
+        amm: Option<Order>,
+        hedge: Option<Order>,
+        now: u64,
+    }
+    impl Ctx for LastCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            if o.venue == VenueId::HyperEvm as u8 {
+                self.amm = Some(o);
+            } else {
+                self.hedge = Some(o);
+            }
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
+    const T0: u64 = 1_000 * S;
+    let pool = make_symbol_id(VenueId::HyperEvm, 1);
+    let perp = make_symbol_id(VenueId::Hyperliquid, 5);
+    let tick = -230_543;
+    let liq: u128 = 50_000_000_000_000_000_000;
+    let (lo, hi) = sqrt_at_tick(tick);
+    let mid = (price_1e18_from_sqrt(lo, hi, 18, 6) / 1_000_000_000_000) as i64;
+    let sig = |sym, payload| {
+        Signal::new(
+            T0,
+            sym,
+            LatencyClass::Warm,
+            SignalSource::HyperEvm as u8,
+            payload,
+        )
+    };
+
+    // Boot (allocation allowed).
+    let mut p = HyparbParams::EMPTY;
+    p.coins[0] = CoinParams {
+        perp_sym: perp,
+        spot_sym: SYMBOL_ID_NONE,
+        lot_1e6: 10_000,
+        min_notional_usd_1e6: 10_000_000,
+    };
+    p.n_coins = 1;
+    p.pools[0] = PoolParams {
+        sym: pool,
+        coin0: 0,
+        coin1: COIN_USD,
+        trade: true,
+        max_notional_usd_1e6: 1_000_000_000,
+    };
+    p.n_pools = 1;
+    p.lag_ns = S / 2;
+    p.basis_window_ns = 60 * S;
+    p.depth_cap_enabled = true;
+    p.gas_p50_usd_1e6 = 10_000;
+    p.gas_p99_usd_1e6 = 3_910_000;
+    p.max_order_usd_1e6 = 1_000_000_000;
+    p.cap_day_usd_1e6 = 1_000_000_000_000_000;
+    p.min_net_bps_1e6 = 5_000_000;
+    p.inventory_cap_usd_1e6 = 1_000_000_000_000;
+    p.perp_taker_bps_1e6 = 4_500_000;
+    p.spot_taker_bps_1e6 = 7_000_000;
+    p.funding_window_ns = 3_600 * S;
+    p.cooldown_ns = S;
+    let mut m = HyparbStrategy::new();
+    m.configure(p, core_time::WallAnchor::new(0, 1_789_192_800 * S))
+        .expect("gate 68 params");
+    let mut c = LastCtx {
+        amm: None,
+        hedge: None,
+        now: T0,
+    };
+    m.on_start(&mut c).expect("gate 68 start");
+    m.on_signal(
+        &sig(
+            pool,
+            encode_snapshot(10, FAMILY_V3, -240_000, -220_000, 2, 500, 10, 18, 6)
+                .expect("gate 68 snap"),
+        ),
+        &mut c,
+    );
+    m.on_signal(
+        &sig(
+            pool,
+            encode_tick(-240_000, liq as i128, liq).expect("gate 68 t"),
+        ),
+        &mut c,
+    );
+    m.on_signal(
+        &sig(
+            pool,
+            encode_tick(-220_000, -(liq as i128), liq).expect("gate 68 t"),
+        ),
+        &mut c,
+    );
+    let reset = encode_state(tick, lo, hi, liq, true).expect("gate 68 state");
+    m.on_signal(&sig(pool, reset), &mut c);
+    assert_eq!(m.counters().maps_loaded, 1);
+    let swap = encode_swap(11, 1_000_000_000_000, -97_000).expect("gate 68 swap");
+    let post = encode_state(tick, lo, hi, liq, false).expect("gate 68 post");
+    let mint = encode_liquidity(11, false, -230_600, -230_500, 7).expect("gate 68 mint");
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut n = 0u64;
+    while n < CYCLES {
+        let now = T0 + (n + 1) * 4 * S;
+        c.now = now;
+        m.on_signal(&sig(pool, reset), &mut c);
+        m.on_signal(&sig(pool, swap), &mut c);
+        m.on_signal(&sig(pool, post), &mut c);
+        m.on_signal(&sig(pool, mint), &mut c);
+        m.on_signal(
+            &sig(
+                SYMBOL_ID_NONE,
+                encode_head(12 + n, now / S, 1).expect("head"),
+            ),
+            &mut c,
+        );
+        m.on_venue_event(
+            &ChannelEvent::new(
+                now,
+                VenueId::Hyperliquid,
+                ChannelId::AssetCtx,
+                perp,
+                0,
+                0,
+                12_500,
+                0,
+            ),
+            &mut c,
+        );
+        // A perp 1 % above the pool, its size alternating so every tick
+        // is a change: the member buys the pool.
+        let px = mid * 101 / 100;
+        let q = 100_000_000 + (n % 2) as i64;
+        m.on_tick(
+            &Tick::new(
+                now,
+                VenueId::Hyperliquid,
+                perp,
+                1,
+                Price::from_raw(px - 500),
+                Qty::from_raw(q),
+                Price::from_raw(px + 500),
+                Qty::from_raw(q),
+            ),
+            &mut c,
+        );
+        if let Some(o) = c.amm.take() {
+            m.on_fill(
+                &Fill::new(now, pool, o.side, o.px, o.qty, o.client_oid),
+                &mut c,
+            );
+        }
+        if let Some(h) = c.hedge.take() {
+            m.on_fill(
+                &Fill::new(now, perp, h.side, h.px, h.qty, h.client_oid),
+                &mut c,
+            );
+        }
+        m.on_timer(now + 2 * S, &mut c);
+        n += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    let k = m.counters();
+    assert!(k.arbs_submitted >= CYCLES, "one arb per cycle: {k:?}");
+    assert_eq!(k.amm_fills, k.arbs_submitted);
+    assert_eq!(k.hedge_fills, k.hedges_submitted);
+    assert!(k.hedges_submitted >= CYCLES);
+    assert_eq!(k.maps_refused, 0);
+    assert_eq!(
+        allocs, 0,
+        "hyparb member allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "hyparb member hot bytes should be zero: saw {bytes}"
     );
 }
