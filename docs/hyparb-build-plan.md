@@ -1801,3 +1801,72 @@ As §6 says, with these decisions recorded:
   grammar), r0 naive → r1 depth cap → r2 latency → r3 the artifact; a
   rung that fails in a unit is marked, never summed as a smaller number.
   "Renders against a day of paper" waits for the lane to run live (O-H8).
+
+### 16.14 H7c — `exec-hyperevm`, the write path — LANDED (unwired: H8 wires it)
+
+* **The interlock, layer 4 + 5.** `EVM_ARM_CHAIN_IDS = [998]` behind a
+  compile-time assertion; `Network` has no mainnet variant (an arm for
+  999 is not expressible); `arm_network(999)` refuses in a unit test,
+  naming HYPEREVM MAINNET. `check_chains(read, write, hybrid)` is layer 5
+  with the O-H12 hybrid: same chain without the switch, or exactly reads
+  999 + writes 998 WITH it — the switch set on a same-chain
+  configuration refuses too, and the inverse never passes. The arm
+  re-checks at the wire: an endpoint whose `eth_chainId` is not 998
+  HALTS it.
+* **Calldata** (`calldata.rs`): the executor's `swap(address,bool,int256,
+  uint160,uint256)`, selector `0x460985e8` pinned against its keccak,
+  two vectors byte-equal to eth-abi (a 160-bit limit; an exact-output
+  amount sign-extended over all 256 bits), rendered into a stack
+  `[u8; 164]` the transaction borrows.
+* **G2** (`gas.rs`): tip = a fixed quarter of the expected net edge
+  (`BID_EDGE_FRACTION_1E6`) spread over `SWAP_GAS_LIMIT` (400k); fee cap
+  = 2 × next base fee + tip; the attempt's WORST case (`max_fee ×
+  gas_limit`) never above `gas_p99_usd_1e6`, and a base fee that alone
+  exceeds it refuses the attempt. Priority fees are burned on HyperEVM
+  (§16.3 #22): the tip buys ordering — H8 measures what a losing bid
+  looks like.
+* **Nonces** (`nonce.rs`): one transaction in flight PER WALLET — the
+  wallets are the parallelism, so a refused, dropped or stuck
+  transaction can never strand others behind a gap. A wallet is `Ready`
+  only when `latest == pending` at a sync; a timeout, a nonce refusal or
+  an unclassifiable one quarantines it until a settled sync;
+  insufficient funds (or a zero balance at sync) parks it `Unfunded`.
+* **Reconciliation** (`arm.rs`): the transaction hash is computed
+  LOCALLY before the node answers — the node's `eth_sendRawTransaction`
+  hash must equal it (else HALT: the node decoded other bytes than were
+  signed); a request that left the host without an answer (or met a
+  proxy's non-200) is tracked by the local hash as MAYBE SENT, and the
+  receipt — or its absence past 30 s — decides; a receipt must name the
+  hash, the wallet as `from` and the expected `to` (a creation: `to`
+  null and `create_address(from, nonce)`), else HALT. Refusals are keyed
+  on a classified `SendRefusal` (wording measured against the testnet
+  node 2026-09-23: "transaction underpriced", "insufficient funds …",
+  "invalid chain ID"), never on text.
+* **Scanners** (`rpc.rs`) WALK the envelope and the result's top-level
+  members instead of searching keys: a receipt's `logs` repeat
+  `blockNumber` / `transactionHash` one level down (the loopback node
+  gives them different values to prove it). Duplicate, missing or
+  mis-shaped members refuse; an answer to another id refuses.
+* **Transport:** `core_net::HttpsPost` — `HlHttp`'s keep-alive shape with
+  the path taken from the boot URL (`parse_https_url`). `HlHttp` is NOT
+  migrated onto it in this lane (it is the armed-live E arm; that is
+  its lane's call). The pool ingress's JSON-RPC cursor is now public
+  (`ingress_hyperevm::rpc::RpcOut`) and shared, as are its hex scanners.
+* **`signer-evm` gains contract creation** (for the H8 testnet deployer
+  of the O-H18 executor — its owner is the deploying EOA, so a factory
+  cannot deploy it): `Eip1559Create` is a separate type (a zeroed `to`
+  can never turn a call into a creation — pinned), sharing one
+  digest/hash/render core with calls; `create_address`. Vectors: the
+  executor's own 2,335-byte creation and a small one, byte-equal to
+  eth-account 0.14; the deployed address against the Yellow Paper's
+  example and eth-utils.
+* **Tests:** 22 unit (incl. proptest: every scanner total on arbitrary
+  bytes; no prefix of a real receipt scans as mined) + 12 against a
+  scripted rustls JSON-RPC node that answers `keccak256` of the raw
+  bytes it received (round trip, three concurrent wallets, the losing
+  bid returning its nonce, wrong hash, lost answer, timeout → quarantine
+  → settled sync, foreign receipt, wrong chain, creation reconciled and
+  mismatched, nonce / funds refusals). Alloc gate 71: calldata, bid,
+  nonce claim, sign, hash, body render and every scanner at 0 B/op.
+  Fuzz target `evm_exec_response`. `crates/exec-hyperevm` joins
+  `scripts/copy-audit.sh`'s default list (new=0).

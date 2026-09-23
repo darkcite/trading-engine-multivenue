@@ -67,6 +67,8 @@ members = [
     "crates/signer-eip712",
     # HYPARB H7 (O-H7): chain-agnostic EIP-1559 render + sign
     "crates/signer-evm",
+    # HYPARB H7c: the HyperEVM write path, testnet only (O-H5)
+    "crates/exec-hyperevm",
 
     # --- engine + UI ---
     "crates/engine",
@@ -204,6 +206,7 @@ exec-router     = { path = "crates/exec-router" }
 exec-hyperliquid = { path = "crates/exec-hyperliquid" }
 signer-eip712   = { path = "crates/signer-eip712" }
 signer-evm      = { path = "crates/signer-evm" }
+exec-hyperevm   = { path = "crates/exec-hyperevm" }
 
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }

@@ -163,6 +163,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "exec-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-net",
+ "core-parse",
+ "ingress-hyperevm",
+ "ingress-rpc",
+ "signer-eip712",
+ "signer-evm",
+]
+
+[[package]]
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
@@ -430,6 +443,7 @@ dependencies = [
  "core-net",
  "core-parse",
  "core-types",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "ingress-ai",
  "ingress-binance",

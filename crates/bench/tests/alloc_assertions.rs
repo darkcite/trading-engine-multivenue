@@ -8290,3 +8290,122 @@ fn hyparb_member_decision_hedge_and_timer_are_zero_alloc() {
         "hyparb member hot bytes should be zero: saw {bytes}"
     );
 }
+
+/// **HYPARB gate 71 (H7c) — the EVM write path either side of the
+/// socket.**
+///
+/// Per testnet send the arm thread encodes the executor calldata into a
+/// stack array, bids gas, claims a nonce, signs, hashes, renders the
+/// `eth_sendRawTransaction` body in place, and scans the node's answer;
+/// per poll it renders the receipt request and scans the receipt (whose
+/// logs are walked, not searched); per block it scans the fee history.
+/// `HttpsPost::post` itself cannot run here (a loopback server thread
+/// would allocate under the process-global counter); the TLS loopback
+/// test covers it, as gate 58 does for `HlHttp`. All of this must be
+/// 0 B/op — the body buffer is allocated once at boot, outside the guard.
+#[test]
+fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
+    use exec_hyperevm::calldata::{encode_swap, SwapCall, SWAP_CALLDATA_LEN};
+    use exec_hyperevm::gas::{bid, SWAP_GAS_LIMIT};
+    use exec_hyperevm::nonce::NonceTable;
+    use exec_hyperevm::rpc::{
+        classify_send_refusal, scan_hash, scan_next_base_fee, scan_receipt, write_receipt,
+        write_send_raw,
+    };
+    use signer_evm::{tx_hash, tx_sign, Eip1559Tx};
+
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 71 key");
+    let mut body = vec![0u8; exec_hyperevm::arm::MAX_BODY];
+    let receipt = br#"{"jsonrpc":"2.0","id":7,"result":{"type":"0x2","status":"0x1","logs":[{"address":"0xd3303d83422e93b840cceed9d5671f2427fae726","topics":["0xe5451a8402e365c27dd14a967e40e72c37559b904cb33b29b9c2ee04a10d3d94"],"data":"0x01","blockNumber":"0x3e05ee7","transactionHash":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7","logIndex":"0x0","removed":false}],"transactionHash":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7","blockNumber":"0x3e05ee7","gasUsed":"0x70a5","effectiveGasPrice":"0x5f5e100","from":"0xeec1f3fcca6b05a7c9f05521f8dd9080e5edac14","to":"0xd3303d83422e93b840cceed9d5671f2427fae726","contractAddress":null}}"#;
+    let fees = br#"{"jsonrpc":"2.0","id":8,"result":{"baseFeePerGas":["0x5f5e100","0x54f2d51"],"gasUsedRatio":[0.08],"oldestBlock":"0x3e05ed3"}}"#;
+    let refused =
+        br#"{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"transaction underpriced"}}"#;
+    let answer = br#"{"jsonrpc":"2.0","id":9,"result":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7"}"#;
+    // Boot: the first signature builds signer-eip712's process-wide
+    // secp256k1 context (gate 64's note).
+    let warm = Eip1559Tx {
+        chain_id: 998,
+        nonce: 0,
+        max_priority_fee_per_gas: 0,
+        max_fee_per_gas: 0,
+        gas_limit: 21_000,
+        to: [0; 20],
+        value: 0,
+        data: &[],
+    };
+    tx_sign(&warm, &sk).expect("gate 71 warm-up");
+    let mut nonces = NonceTable::new(3);
+    let mut w = 0;
+    while w < 3 {
+        nonces.sync(w, 10 * w as u64, 10 * w as u64);
+        w += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 2_000 {
+        let call = SwapCall {
+            amount_specified: 1_000_000 + n as i128,
+            sqrt_limit_lo: 4_295_128_740 + n as u128,
+            min_out: n as u128,
+            sqrt_limit_hi: 0,
+            pool: [0x77; 20],
+            zero_for_one: n & 1 == 0,
+        };
+        let mut cd = [0u8; SWAP_CALLDATA_LEN];
+        encode_swap(&call, &mut cd);
+        let b = bid(
+            1_000_000 + n as i64,
+            100_000_000,
+            SWAP_GAS_LIMIT,
+            40_000_000,
+            3_910_000,
+        )
+        .expect("gate 71 bid");
+        let wallet = nonces.pick().expect("gate 71 wallet");
+        let nonce = nonces.take(wallet).expect("gate 71 nonce");
+        let tx = Eip1559Tx {
+            chain_id: 998,
+            nonce,
+            max_priority_fee_per_gas: b.max_priority_fee_per_gas,
+            max_fee_per_gas: b.max_fee_per_gas,
+            gas_limit: SWAP_GAS_LIMIT,
+            to: [0xe7; 20],
+            value: 0,
+            data: &cd,
+        };
+        let sig = tx_sign(&tx, &sk).expect("gate 71 sign");
+        let h = tx_hash(&tx, &sig).expect("gate 71 hash");
+        let k = write_send_raw(&mut body, 9, &tx, &sig).expect("gate 71 render");
+        let got = scan_hash(answer, 9).expect("gate 71 answer");
+        if let Err(exec_hyperevm::rpc::ScanErr::Rpc(e)) = scan_hash(refused, 9) {
+            let why =
+                classify_send_refusal(&refused[e.message_start as usize..e.message_end as usize]);
+            acc = acc.wrapping_add(why as u64);
+        }
+        let r = write_receipt(&mut body, 7, &h).expect("gate 71 receipt req");
+        let rc = scan_receipt(receipt, 7)
+            .expect("gate 71 receipt")
+            .expect("mined");
+        let fee = scan_next_base_fee(fees, 8).expect("gate 71 fees");
+        nonces.mined(wallet);
+        acc = acc
+            .wrapping_add(k as u64 + r as u64)
+            .wrapping_add(got[0] as u64 + rc.gas_used + fee as u64);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(nonces.next(0), 667, "round-robin over the three wallets");
+    assert_eq!(
+        allocs, 0,
+        "exec-hyperevm send/scan allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "exec-hyperevm hot bytes should be zero: saw {bytes}"
+    );
+}

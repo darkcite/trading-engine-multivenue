@@ -325,6 +325,9 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   the seqlock `/state` snapshot; `crates/tui`.
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
+  `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
+  path, TESTNET ONLY (`EVM_ARM_CHAIN_IDS = [998]`, compile-time asserted;
+  `docs/hyparb-build-plan.md` §11, §16.14).
 - `crates/cli` — `multivenue-engine` (run / audit-replay / capture-catalog /
   backtest / audit-pnl / exec-smoke …); `paper.rs` = the boot + metrics
   assembly; `exec_boot.rs` = the arming interlock.

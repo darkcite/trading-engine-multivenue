@@ -37,6 +37,7 @@ pub mod backoff;
 pub mod boot_http;
 pub mod error;
 pub mod http1;
+pub mod https_post;
 pub mod iobuf;
 pub mod keepalive;
 pub mod subs;
@@ -59,6 +60,7 @@ pub use http1::{
     dechunk_in_place, read_response, write_get_request, BodyFraming, DechunkResult, HttpErr,
     HttpResult,
 };
+pub use https_post::{parse_https_url, HttpsPost, PostErr, PostErrKind};
 pub use transport::{
     PlainTcpTransport, Status, TestBuffer, TestTransport, TlsTransport, Transport,
 };

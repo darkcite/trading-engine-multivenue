@@ -15,15 +15,38 @@ use ingress_rpc::RpcWriteErr;
 
 use crate::hex::{hex_quantity_u128, hex_quantity_u64, render_hex, render_quantity};
 
-/// A cursor writer over the caller's buffer.
-struct Out<'a> {
+/// A cursor writer over the caller's buffer — every JSON-RPC request
+/// writer here and in `exec-hyperevm` renders through it. Each `put*`
+/// refuses (never truncates) when the rest of the buffer is too small.
+pub struct RpcOut<'a> {
     dst: &'a mut [u8],
     n: usize,
 }
 
-impl Out<'_> {
+impl<'a> RpcOut<'a> {
+    /// A writer at the start of `dst`.
     #[inline(always)]
-    fn put(&mut self, s: &[u8]) -> Result<(), RpcWriteErr> {
+    pub fn new(dst: &'a mut [u8]) -> Self {
+        Self { dst, n: 0 }
+    }
+
+    /// Bytes written so far.
+    #[inline(always)]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.n
+    }
+
+    /// `true` before the first byte.
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// Append `s`.
+    #[inline(always)]
+    pub fn put(&mut self, s: &[u8]) -> Result<(), RpcWriteErr> {
         let end = self.n + s.len();
         if end > self.dst.len() {
             return Err(RpcWriteErr::BufferTooSmall);
@@ -34,8 +57,9 @@ impl Out<'_> {
         Ok(())
     }
 
+    /// Append `v` in decimal (JSON-RPC ids).
     #[inline(always)]
-    fn put_u64(&mut self, v: u64) -> Result<(), RpcWriteErr> {
+    pub fn put_u64(&mut self, v: u64) -> Result<(), RpcWriteErr> {
         let mut tmp = [0u8; 20];
         let mut i = tmp.len();
         let mut x = v;
@@ -50,8 +74,9 @@ impl Out<'_> {
         self.put(&tmp[i..])
     }
 
+    /// Append `v` as a `QUANTITY` (`0x` + minimal hex).
     #[inline(always)]
-    fn put_quantity(&mut self, v: u64) -> Result<(), RpcWriteErr> {
+    pub fn put_quantity(&mut self, v: u64) -> Result<(), RpcWriteErr> {
         let end = self.dst.len();
         let n =
             render_quantity(&mut self.dst[self.n..end], v).ok_or(RpcWriteErr::BufferTooSmall)?;
@@ -59,12 +84,28 @@ impl Out<'_> {
         Ok(())
     }
 
+    /// Append `bytes` as `0x` + lowercase hex (DATA).
     #[inline(always)]
-    fn put_hex(&mut self, bytes: &[u8]) -> Result<(), RpcWriteErr> {
+    pub fn put_hex(&mut self, bytes: &[u8]) -> Result<(), RpcWriteErr> {
         let end = self.dst.len();
         let n = render_hex(&mut self.dst[self.n..end], bytes).ok_or(RpcWriteErr::BufferTooSmall)?;
         self.n += n;
         Ok(())
+    }
+
+    /// The unwritten rest of the buffer, for a renderer that writes in
+    /// place (a signed transaction's hex); follow with [`Self::advance`].
+    #[inline(always)]
+    pub fn tail(&mut self) -> &mut [u8] {
+        let end = self.dst.len();
+        &mut self.dst[self.n..end]
+    }
+
+    /// Account for `k` bytes a renderer wrote into [`Self::tail`].
+    #[inline(always)]
+    pub fn advance(&mut self, k: usize) {
+        debug_assert!(self.n + k <= self.dst.len());
+        self.n += k;
     }
 }
 
@@ -83,7 +124,7 @@ pub fn write_request_subscribe_logs(
     addresses: &[[u8; 42]],
     topics: &[[u8; 32]],
 ) -> Result<usize, RpcWriteErr> {
-    let mut o = Out { dst, n: 0 };
+    let mut o = RpcOut::new(dst);
     o.put(br#"{"jsonrpc":"2.0","id":"#)?;
     o.put_u64(id)?;
     o.put(br#","method":"eth_subscribe","params":["logs",{"address":["#)?;
@@ -109,7 +150,7 @@ pub fn write_request_subscribe_logs(
         k += 1;
     }
     o.put(b"]]}]}")?;
-    Ok(o.n)
+    Ok(o.len())
 }
 
 /// One `eth_call` pinned to block `block`:
@@ -122,7 +163,7 @@ pub fn write_eth_call(
     data: &[u8],
     block: u64,
 ) -> Result<usize, RpcWriteErr> {
-    let mut o = Out { dst, n: 0 };
+    let mut o = RpcOut::new(dst);
     o.put(br#"{"jsonrpc":"2.0","id":"#)?;
     o.put_u64(id)?;
     o.put(br#","method":"eth_call","params":[{"to":""#)?;
@@ -132,7 +173,7 @@ pub fn write_eth_call(
     o.put(br#""},""#)?;
     o.put_quantity(block)?;
     o.put(b"\"]}")?;
-    Ok(o.n)
+    Ok(o.len())
 }
 
 /// Fold a subscription id of up to 128 bits into the `u64` the

@@ -196,7 +196,7 @@ pub fn write_post_request(
 /// Render `v` as decimal ASCII into the tail of `scratch`, returning the
 /// written subslice. Zero-alloc; `scratch` must be ≥ 20 bytes (max u64).
 #[inline]
-fn fmt_u64_ascii(mut v: u64, scratch: &mut [u8; 20]) -> &[u8] {
+pub(crate) fn fmt_u64_ascii(mut v: u64, scratch: &mut [u8; 20]) -> &[u8] {
     let mut i = scratch.len();
     loop {
         i -= 1;

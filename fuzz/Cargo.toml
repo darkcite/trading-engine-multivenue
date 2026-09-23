@@ -47,6 +47,8 @@ core-amm           = { path = "../crates/core-amm" }
 ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
 # amm_book: the HYPARB H2 AMM fill law (pool book + judge).
 core-fill          = { path = "../crates/core-fill" }
+# evm_exec_response: the HYPARB H7c write-path response scanners.
+exec-hyperevm      = { path = "../crates/exec-hyperevm" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -380,6 +382,13 @@ bench  = false
 [[bin]]
 name   = "amm_book"
 path   = "fuzz_targets/amm_book.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "evm_exec_response"
+path   = "fuzz_targets/evm_exec_response.rs"
 test   = false
 doc    = false
 bench  = false
