@@ -18,6 +18,8 @@
 //! | malformed body | a non-JSON 200 body refuses, never accepts |
 //! | mid-body disconnect | a truncated body is `Disconnected`, not a short read treated as complete |
 //! | slow loris | a server that stalls is bounded by `REQ_DEADLINE`, not hung forever |
+//! | idle close | the venue closed the kept-alive connection while idle: the next order dials fresh and SUCCEEDS — it is never written into the dead socket and reported "left the host" |
+//! | `Connection: close` | an announced close retires the connection with the answer; the next order does not reuse it |
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
@@ -85,43 +87,8 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, Arc<AtomicBool>) {
         };
         let mut conn = ServerConnection::new(server_cfg).expect("conn");
         let mut stream = Stream::new(&mut conn, &mut sock);
-
-        // Read headers.
-        let mut buf = [0u8; 32 * 1024];
-        let mut total = 0usize;
-        let header_end = loop {
-            let Ok(n) = stream.read(&mut buf[total..]) else {
-                return;
-            };
-            if n == 0 {
-                return;
-            }
-            total += n;
-            if let Some(i) = (0..total.saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n") {
-                break i + 4;
-            }
-            if total == buf.len() {
-                return;
-            }
-        };
-        // Drain the declared body.
-        let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-        let clen: usize = head
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-            .and_then(|l| l.split(':').nth(1))
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        let mut remaining = clen.saturating_sub(total - header_end);
-        while remaining > 0 {
-            let need = remaining.min(buf.len());
-            let Ok(n) = stream.read(&mut buf[..need]) else {
-                return;
-            };
-            if n == 0 {
-                break;
-            }
-            remaining -= n;
+        if !read_one_request(&mut stream) {
+            return;
         }
 
         match script {
@@ -168,6 +135,101 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, Arc<AtomicBool>) {
     });
 
     (port, client_cfg, done)
+}
+
+/// Read one request — the head and its declared body — off `stream`.
+/// `false` at EOF or on a read error.
+fn read_one_request<S: Read>(stream: &mut S) -> bool {
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0usize;
+    let header_end = loop {
+        let Ok(n) = stream.read(&mut buf[total..]) else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        total += n;
+        if let Some(i) = (0..total.saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if total == buf.len() {
+            return false;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let clen: usize = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let mut remaining = clen.saturating_sub(total - header_end);
+    while remaining > 0 {
+        let need = remaining.min(buf.len());
+        let Ok(n) = stream.read(&mut buf[..need]) else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        remaining -= n;
+    }
+    true
+}
+
+/// A venue that answers ONE request per connection and then closes it:
+/// after `close_delay` (the idle close — the client has already read the
+/// answer when the FIN arrives), announcing it with `Connection: close`
+/// when `announce`. Serves any number of connections; counts them.
+fn boot_closing(
+    announce: bool,
+    close_delay: Duration,
+) -> (u16, Arc<ClientConfig>, Arc<std::sync::atomic::AtomicUsize>) {
+    let cert = make_cert();
+    let server_cfg = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.cert_der.clone()], cert.key_der.clone_key())
+            .expect("server cfg"),
+    );
+    let mut roots = RootCertStore::empty();
+    roots.add(cert.cert_der.clone()).expect("anchor");
+    let client_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepts_srv = accepts.clone();
+    thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(mut sock) = incoming else { return };
+            accepts_srv.fetch_add(1, Ordering::AcqRel);
+            let mut conn = ServerConnection::new(server_cfg.clone()).expect("conn");
+            {
+                let mut stream = Stream::new(&mut conn, &mut sock);
+                if !read_one_request(&mut stream) {
+                    continue;
+                }
+                let h = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                    OK_RESTING.len(),
+                    if announce { "close" } else { "keep-alive" }
+                );
+                let _ = stream.write_all(h.as_bytes());
+                let _ = stream.write_all(OK_RESTING);
+                let _ = stream.flush();
+            }
+            thread::sleep(close_delay);
+            conn.send_close_notify();
+            let _ = conn.write_tls(&mut sock);
+            let _ = sock.shutdown(Shutdown::Both);
+        }
+    });
+    (port, client_cfg, accepts)
 }
 
 const TEST_KEY: [u8; 32] = [0x2b; 32];
@@ -367,41 +429,10 @@ fn the_connection_is_reused_across_requests() {
         accepts_srv.fetch_add(1, Ordering::Release);
         let mut conn = ServerConnection::new(server_cfg).expect("conn");
         let mut stream = Stream::new(&mut conn, &mut sock);
-        let mut buf = [0u8; 32 * 1024];
         // Answer two requests on the same connection.
         for _ in 0..2 {
-            let mut total = 0usize;
-            let header_end = loop {
-                let Ok(n) = stream.read(&mut buf[total..]) else {
-                    return;
-                };
-                if n == 0 {
-                    return;
-                }
-                total += n;
-                if let Some(i) =
-                    (0..total.saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
-                {
-                    break i + 4;
-                }
-            };
-            let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-            let clen: usize = head
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-                .and_then(|l| l.split(':').nth(1))
-                .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0);
-            let mut remaining = clen.saturating_sub(total - header_end);
-            while remaining > 0 {
-                let need = remaining.min(buf.len());
-                let Ok(n) = stream.read(&mut buf[..need]) else {
-                    return;
-                };
-                if n == 0 {
-                    break;
-                }
-                remaining -= n;
+            if !read_one_request(&mut stream) {
+                return;
             }
             let h = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
@@ -432,4 +463,59 @@ fn the_connection_is_reused_across_requests() {
         1,
         "two orders must share ONE TLS session"
     );
+    assert_eq!(c.dials(), 1);
+}
+
+/// The venue closed the kept-alive connection while we were idle. The
+/// next order must dial fresh and SUCCEED — before the fix it was
+/// written into the dead socket, read EOF, and came back `Disconnected`
+/// with `left_host == true`: an order lost to reconciliation that never
+/// reached the venue (operator ask, 2026-09-24).
+#[test]
+fn an_idle_close_is_noticed_before_the_next_order_is_written() {
+    let (port, cfg, accepts) = boot_closing(false, Duration::from_millis(50));
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let mut i = 0;
+    while i < 3 {
+        // Idle long enough for the venue's close to land.
+        thread::sleep(Duration::from_millis(250));
+        let (status, range) = c
+            .post(&body)
+            .unwrap_or_else(|e| panic!("order {i}: {e} — a closed keep-alive was reused"));
+        assert_eq!(status, 200);
+        let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("scan") else {
+            panic!("order {i}")
+        };
+        assert_eq!(o.oid, 424_242);
+        i += 1;
+    }
+    assert_eq!(
+        accepts.load(Ordering::Acquire),
+        3,
+        "one connection per answer"
+    );
+    assert_eq!(c.dials(), 3, "the dial counter shows the venue's closes");
+}
+
+/// `Connection: close` on an answer retires the connection WITH the
+/// answer (kept intact) — the next order, sent at once, before the venue
+/// has actually closed, must not reuse it.
+#[test]
+fn an_announced_close_retires_the_connection_with_the_answer() {
+    let (port, cfg, accepts) = boot_closing(true, Duration::from_millis(300));
+    let mut c = client(port, cfg);
+    let mut body = Vec::new();
+    signed_body(&mut body);
+    let (status, range) = c.post(&body).expect("first");
+    assert_eq!(status, 200);
+    assert!(!c.is_connected(), "`Connection: close` retires it at once");
+    let HlResponse::Ok(o) = scan(&c.resp()[range]).expect("the answer survives") else {
+        panic!("first")
+    };
+    assert_eq!(o.oid, 424_242);
+    let (status, _) = c.post(&body).expect("second, immediately");
+    assert_eq!(status, 200);
+    assert_eq!(accepts.load(Ordering::Acquire), 2);
 }

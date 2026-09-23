@@ -2097,12 +2097,14 @@ The review's findings, fixed in this order (critical first):
   boot (1), exec-router (1), rpc (`write_call`/`scan_word`), hex (1);
   fuzz: `http1_response` checks `chunked_body` against the dechunker,
   `evm_exec_response` covers `scan_word`.
-* **Findings for OTHER lanes (reported, not changed):** `HlHttp` — the
-  armed E-lane's exchange client — has the same stale-keep-alive shape
-  (after an idle close its next `/exchange` post fails `left_host`,
-  counted `sent_unanswered`, the order lost to reconciliation) and
-  writes head and body as two TLS records; the `HttpsPost` fixes port
-  directly, under the E-lane's own review.
+* **Findings for OTHER lanes:** `HlHttp` — the armed E-lane's exchange
+  client — had the same stale-keep-alive shape (after an idle close its
+  next `/exchange` post failed `left_host`, counted `sent_unanswered`,
+  the order lost to reconciliation). **Fixed by operator ask in H9c
+  (2026-09-24)** — the `HttpsPost` probe and retire-on-close ported
+  (risk-policy "The live arm's stale keep-alive"). It still writes head
+  and body as two TLS records (one extra rustls allocation per order);
+  not changed.
 
 **Mask flip (O-H8) — the operator's runbook, only after HZ, H8 live and
 H9 are green:** (1) the pre-flip gates at HEAD (§13); (2) `hyparb.toml`

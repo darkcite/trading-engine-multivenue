@@ -2330,6 +2330,31 @@ stronger property than its condition tests. So it is recorded inside
 the HTTP cycle at the moment the write is attempted, and returned in a
 struct every one of the fifteen call sites must destructure.
 
+#### The live arm's stale keep-alive (H9c, operator ask, 2026-09-24)
+
+Found by the HYPARB H9 review on `core_net::HttpsPost`, which copied
+`HlHttp`'s shape. The venue closes an idle keep-alive connection on its
+own schedule (and may announce `Connection: close`). `HlHttp` reused
+such a connection: the next ORDER's bytes went into a socket the peer
+had already closed, the local write succeeded, the read found EOF, and
+the order came back `Disconnected` with `left_host == true` — counted
+`sent_unanswered`, charged to the address budget, left to
+reconciliation, although no byte of it reached the venue. An entry lost
+exactly when the book was worth entering.
+
+Now an answer that announces `Connection: close` (or arrives with the
+FIN) retires the connection WITH the answer (the answer is kept), and a
+one-byte non-blocking read before each reuse retires a connection the
+venue closed while idle; the order dials fresh with `left_host ==
+false`. Cost: one `read(2)` per order on a healthy connection, a TLS
+handshake (50–150 ms) only when the venue had closed it — which the
+order would otherwise have lost. `HlHttp::dials()` counts handshakes.
+Pinned by `hl_exchange_tls_loopback::an_idle_close_is_noticed_before_the_next_order_is_written`
+and `…::an_announced_close_retires_the_connection_with_the_answer`
+(both RED with the fix disabled). It reaches the armed engine only
+through a merge to `main`, a release build and an
+`exec-smoke`-gated restart.
+
 #### A torn write COUNTS
 
 `left_host` is set before the write is attempted rather than after it
@@ -4641,6 +4666,7 @@ exactly as `exec-smoke.sh` does.
   one `Vec` per TLS record sealed and one per application-data record
   decrypted — on every TLS socket, the E-lane's `HlHttp` included (it
   writes head and body as two records: two allocations where one would
-  do). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
+  do; its stale-keep-alive shape WAS fixed — H9c, "The live arm's stale
+  keep-alive"). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
   is rustls' unbuffered API (`UnbufferedClientConnection`) — a core-net
   transport decision for the operator, not a HYPARB-lane change.
