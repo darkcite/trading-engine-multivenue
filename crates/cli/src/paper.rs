@@ -62,11 +62,11 @@ use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
 // through `cli::` like every other paper-mode surface.
 pub use ingress_ai::AiIngressStatus;
 use rustls_pki_types::ServerName;
-use strategy_latency_arb::LatencyArb;
 
 use ingress_binance::run_loop as bwl;
 use ingress_bybit::run_loop as ywl;
 use ingress_deribit::run_loop as dwl;
+use ingress_hyperevm::run_loop as hel;
 use ingress_hyperliquid::run_loop as hwl;
 use ingress_mexc::run_loop as mxl;
 use ingress_okx::run_loop as owl;
@@ -174,6 +174,16 @@ const RPC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 10_000_000_000,
     idle_timeout_ns: 30_000_000_000,
 };
+
+/// HYPARB H3b: HyperEVM — a head every ~1 s plus our own polls; a
+/// session quiet for 30 s is dead (the RPC law, one block faster).
+const HYPEREVM_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 10_000_000_000,
+    idle_timeout_ns: 30_000_000_000,
+};
+
+// The engine's pool lane and the ingress's default ring are one size.
+const _: () = assert!(engine::POOL_RING_SIZE == hel::DEFAULT_POOL_RING_CAP);
 
 /// Maximum number of items the main thread drains per ring per
 /// iteration. Bounded so a backed-up ring can't starve the others.
@@ -541,6 +551,10 @@ pub struct Rings {
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
     /// Signal ring for Polygon newHeads — feeds the engine.
     pub rpc_signal: Arc<Ring<Signal, SIGNAL_RING_SIZE>>,
+    /// HYPARB H3b: the HyperEVM pool-event ring — feeds the engine's
+    /// pool lane (`Engine::set_pool_lane`). Permanently empty when the
+    /// ingress is not spawned.
+    pub hyperevm_signal: Arc<Ring<Signal, { engine::POOL_RING_SIZE }>>,
     /// One fill ring per execution lane (`engine::fill_lane_of`).
     /// Live dispatchers gain producers in Phase 8j; until then the
     /// engine's dispatcher fill pump (D3) is the only fill source.
@@ -590,6 +604,7 @@ impl Rings {
                 Ring::new(),
             ],
             rpc_signal: Ring::new(),
+            hyperevm_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
@@ -640,6 +655,10 @@ pub struct IngressStatusSet {
     /// Never spawned before MX6 — stays Down (the unspawned-venue
     /// shape), and stays Down after it when `[mexc]` is empty.
     pub mexc: Arc<IngressStatus>,
+    /// HYPARB H3b: the HyperEVM pool-event thread (newHeads + pool
+    /// logs + in-session snapshots). Down unless `--hyperevm-path` and
+    /// `[hyperevm] pools` are both given.
+    pub hyperevm: Arc<IngressStatus>,
     /// BIN15 O2: the Hyperliquid ROLL counters. Venue-specific, so
     /// they could not live in the size-locked generic
     /// [`IngressStatus`] slot; they ride here so the metrics
@@ -648,7 +667,7 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all eight slots + the HL roll counters (boot only).
+    /// Allocate all nine slots + the HL roll counters (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -659,6 +678,7 @@ impl IngressStatusSet {
             bybit: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
             mexc: Arc::new(IngressStatus::new()),
+            hyperevm: Arc::new(IngressStatus::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
         }
     }
@@ -2293,6 +2313,155 @@ pub fn spawn_rpc(
     ))
 }
 
+// HYPARB H3b: one pool bound, one decimals bound, everywhere.
+const _: () = assert!(
+    core_config::universe::HYPEREVM_POOLS_MAX == ingress_hyperevm::HYPEREVM_MAX_POOLS
+        && ingress_hyperevm::HYPEREVM_MAX_POOLS == core_fill::AMM_MAX_POOLS
+);
+const _: () =
+    assert!(core_config::universe::HYPEREVM_DECIMALS_MAX == core_amm::payload::MAX_TOKEN_DECIMALS);
+
+/// HYPARB H3b: the ingress's pool table from the resolved universe —
+/// `[hyperevm] pools` in file order, each at its allocated symbol.
+/// Boot-only (allocates).
+pub fn hyperevm_pool_table(
+    alloc: &core_config::universe::AllocatedUniverse,
+) -> Result<ingress_hyperevm::PoolTable, ingress_hyperevm::PoolTableErr> {
+    use core_config::universe::HyperEvmFamily;
+    let mut entries = Vec::with_capacity(alloc.hyperevm_pools.len());
+    let mut i = 0usize;
+    while i < alloc.hyperevm_pools.len() {
+        let p = alloc.hyperevm_pools[i];
+        entries.push(ingress_hyperevm::PoolEntry {
+            address: p.address,
+            sym: alloc.hyperevm[i].sym,
+            family: match p.family {
+                HyperEvmFamily::V3 => ingress_hyperevm::PoolFamily::UniswapV3,
+                HyperEvmFamily::Slipstream => ingress_hyperevm::PoolFamily::Slipstream,
+                HyperEvmFamily::Algebra => ingress_hyperevm::PoolFamily::Algebra,
+            },
+            dec0: p.dec0,
+            dec1: p.dec1,
+        });
+        i += 1;
+    }
+    ingress_hyperevm::PoolTable::new(&entries)
+}
+
+/// HYPARB H3b: spawn the HyperEVM pool-event thread — `spawn_rpc`'s
+/// shape, plus a tap venue byte (this source HAS a `VenueId`), its own
+/// pool table and snapshot radius, and one extra exit: an endpoint that
+/// fails the archive probe (O-H4) is not reconnected to. Per O-H15 that
+/// disables the pool member (no pool is ever judgeable), never the
+/// engine.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_hyperevm(
+    ep: WssEndpoint,
+    tls_config: RustlsConfig,
+    mut producer: Producer<Signal, { engine::POOL_RING_SIZE }>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+    pools: ingress_hyperevm::PoolTable,
+    radius: i32,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "hyperevm", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "hyperevm", VenueId::HyperEvm.to_u8())?;
+    }
+    Ok(spawn_or_die(
+        thread::Builder::new().name("ingress-hyperevm".into()),
+        "ingress-hyperevm",
+        move || {
+            log_pin_outcome("hyperevm", core_id);
+            let server_name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hyperevm: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut driver = hel::Driver::new(now_ns(), pools, radius);
+            let mut keepalive = Keepalive::new(HYPEREVM_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
+                let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "hyperevm: connect failed");
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
+                        continue;
+                    }
+                };
+                let (mut poll, mut events, token) = match new_poll() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "hyperevm: mio init failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                driver.reset_for_reconnect(now_ns());
+                let ticks_before = status.ticks_total();
+                let res = hel::run(
+                    &mut transport,
+                    &mut driver,
+                    ep.host.as_bytes(),
+                    ep.path.as_bytes(),
+                    &mut producer,
+                    &mut poll,
+                    &mut events,
+                    token,
+                    &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
+                    &mut capture,
+                );
+                tracing::info!(?res, "hyperevm: run-loop returned");
+                capture.mirror_now();
+                match res {
+                    hel::RunResult::Stopped => {
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                    hel::RunResult::ArchiveDishonest => {
+                        tracing::error!(
+                            host = %ep.host,
+                            "hyperevm: the endpoint answers historical eth_call with LATEST \
+                             state (O-H4 archive probe) — ingress stopped; the pool member \
+                             stays dark (O-H15), the engine runs on"
+                        );
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                    _ => {}
+                }
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, hel::RunResult::IdleTimeout),
+                ) {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
+            }
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    ))
+}
+
 /// Open the Phase-8f engine-thread fills capture
 /// (`<run_dir>/engine-fills.pmlr`, `SlotKind::Fill`). Boot-only; the
 /// bin hands the result to [`Observability::with_fills_capture`] and
@@ -2518,6 +2687,8 @@ pub struct RawTapConfig {
     /// MX6: tap config for the MEXC ingress (spot PB frames are
     /// tapped as the raw BINARY payload bytes).
     pub mexc: TapCfg,
+    /// HYPARB H3b: tap config for the HyperEVM ingress.
+    pub hyperevm: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -2525,7 +2696,7 @@ pub struct RawTapConfig {
 /// absent/empty ⇒ every venue gets [`TapCfg::off`] (default: none).
 /// `raw_tap` equal (after trim) to the literal `all` enables every
 /// venue; otherwise it's a comma-separated list of venue labels
-/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`), trimmed, non-empty, no
+/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`), trimmed, non-empty, no
 /// duplicates. Every enabled venue shares the same `mode` +
 /// `budget_mb` (×1 MiB → `TapCfg::budget_bytes`). Unknown venue
 /// labels and a bad `--raw-tap-mode` value both fail fast at parse —
@@ -2555,6 +2726,7 @@ pub fn parse_raw_tap_flags(
         hl: TapCfg::off(),
         bybit: TapCfg::off(),
         mexc: TapCfg::off(),
+        hyperevm: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2571,10 +2743,11 @@ pub fn parse_raw_tap_flags(
         cfg.hl = enabled_cfg;
         cfg.bybit = enabled_cfg;
         cfg.mexc = enabled_cfg;
+        cfg.hyperevm = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 8] = [""; 8];
+    let mut seen: [&str; 9] = [""; 9];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -2596,6 +2769,7 @@ pub fn parse_raw_tap_flags(
             "hl" => cfg.hl = enabled_cfg,
             "bybit" => cfg.bybit = enabled_cfg,
             "mexc" => cfg.mexc = enabled_cfg,
+            "hyperevm" => cfg.hyperevm = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -2618,6 +2792,8 @@ pub struct DrainCounters {
     pub other_venue_ticks: u64,
     /// RPC signals observed.
     pub rpc_signals: u64,
+    /// HYPARB H3b: HyperEVM pool-event signals observed.
+    pub hyperevm_signals: u64,
     /// WS10-A: venue events observed (all event lanes combined).
     pub venue_events: u64,
     /// WS10-B: depth snapshots observed (both depth lanes combined).
@@ -2634,6 +2810,7 @@ impl DrainCounters {
         self.binance_ticks += other.binance_ticks;
         self.other_venue_ticks += other.other_venue_ticks;
         self.rpc_signals += other.rpc_signals;
+        self.hyperevm_signals += other.hyperevm_signals;
         self.venue_events += other.venue_events;
         self.depth_snaps += other.depth_snaps;
         self.opt_records += other.opt_records;
@@ -2655,6 +2832,8 @@ pub struct Consumers {
     pub opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; engine::NUM_OPT_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
+    /// HYPARB H3b: HyperEVM pool-event consumer (the engine's pool lane).
+    pub hyperevm_signal: Consumer<Signal, { engine::POOL_RING_SIZE }>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
     /// arrive with the venue dispatchers in Phase 8j; paper-mode
     /// fills flow through the engine's dispatcher pump (D3).
@@ -2753,6 +2932,13 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 break;
             }
         }
+        for _ in 0..DRAIN_BATCH {
+            if cons.hyperevm_signal.try_pop().is_some() {
+                period.hyperevm_signals += 1;
+            } else {
+                break;
+            }
+        }
 
         let now = now_ns();
         if now >= next_report {
@@ -2762,6 +2948,7 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 bn_ticks = period.binance_ticks,
                 other_ticks = period.other_venue_ticks,
                 rpc_sigs = period.rpc_signals,
+                hyperevm_sigs = period.hyperevm_signals,
                 venue_events = period.venue_events,
                 depth_snaps = period.depth_snaps,
                 "5s ring summary"
@@ -2783,13 +2970,13 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
 // Engine loop — real strategy wired to the dispatcher
 // ---------------------------------------------------------------
 
-/// Slot capacity for the Phase 2 strategy table. Holds at most `N`
-/// symbol pairs (one Polymarket book + one Binance reference per
-/// pair). `8` is plenty for v1; bump and recompile when we widen
-/// coverage.
+/// Slot capacity for the standalone strategy tables (ev, rule-tree).
+/// Holds at most `N` symbol pairs (one Polymarket book + one Binance
+/// reference per pair). `8` is plenty for v1; bump and recompile when
+/// we widen coverage.
 pub const STRATEGY_SLOTS: usize = 8;
 
-/// A symbol pair to register with [`LatencyArb`] at boot.
+/// A symbol pair registered with the standalone members at boot.
 #[derive(Copy, Clone, Debug)]
 pub struct StrategyPair {
     /// Polymarket SymbolId (must match the run-loop's SymbolMap).
@@ -2812,22 +2999,24 @@ pub struct EngineConfig {
     pub cooldown_ns: u64,
 }
 
+/// Default trigger threshold (1e6 fixed-point) — the value the
+/// unlinked latency-arb member exported (HYPARB H0, O-H1: its numbers
+/// stay, its crate leaves the cli graph).
+const DEFAULT_THRESHOLD_1E6: i64 = 20_000;
+/// Default per-order quantity (1e6 fixed-point) — 10 units.
+const DEFAULT_QTY_1E6: i64 = 10_000_000;
+/// Default per-market cooldown between emits (ns) — 250 ms.
+const DEFAULT_COOLDOWN_NS: u64 = 250_000_000;
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             pairs: Vec::new(),
-            threshold_1e6: strategy_latency_arb::DEFAULT_THRESHOLD_1E6,
-            qty_1e6: strategy_latency_arb::DEFAULT_QTY.raw(),
-            cooldown_ns: strategy_latency_arb::DEFAULT_COOLDOWN_NS,
+            threshold_1e6: DEFAULT_THRESHOLD_1E6,
+            qty_1e6: DEFAULT_QTY_1E6,
+            cooldown_ns: DEFAULT_COOLDOWN_NS,
         }
     }
-}
-
-/// Run the real engine loop with a [`PaperDispatcher`]. Default
-/// `--paper` entry point — builds a `LatencyArb` strategy.
-pub fn engine_loop(cons: Consumers, cfg: EngineConfig) -> EngineLoopResult {
-    let disp = PaperDispatcher::new();
-    engine_loop_with(cons, cfg, disp)
 }
 
 /// Run the EV strategy (Strategy A) over the paper dispatcher.
@@ -2842,25 +3031,6 @@ pub fn engine_loop_ev_paper(
 ) -> EngineLoopResult {
     let disp = PaperDispatcher::new();
     engine_loop_ev_full(cons, cfg, disp, Observability::default(), artifact_path)
-}
-
-/// Configure a latency-arb instance from [`EngineConfig`] (threshold,
-/// qty, cooldown, pairs). Shared by the standalone path and the
-/// Phase-8f [`engine_loop_set_full`] builder — do not duplicate.
-fn configure_latency_arb<const N: usize>(
-    strat: &mut LatencyArb<N>,
-    cfg: &EngineConfig,
-) -> Result<(), &'static str> {
-    strat.set_threshold(cfg.threshold_1e6);
-    strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
-    strat.set_cooldown_ns(cfg.cooldown_ns);
-    for p in &cfg.pairs {
-        if let Err(e) = strat.add_pair(p.polymarket, p.binance) {
-            tracing::error!(error = ?e, pm = p.polymarket, bn = p.binance, "add_pair failed");
-            return Err("engine_loop: add_pair rejected");
-        }
-    }
-    Ok(())
 }
 
 /// Load + configure an EV instance (artifact table, params, symbol
@@ -2992,9 +3162,12 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — latency-arb always (pairs are mandatory), vrp when
-/// `vrp.toml` resolves, rule-tree with `--rules-path`, icdp when its
-/// artifact resolves, **ai-exec and vm unconditionally** (neither has
+/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / icdp
+/// when their artifacts resolve, slot 0 when `hyparb.toml` resolves
+/// (HYPARB H5 — the member is configured only by its own boot
+/// artifact; unconfigured it refuses `on_start`, so it never boots
+/// inert under a healthy-looking name),
+/// **ai-exec and vm unconditionally** (neither has
 /// boot config: ai-exec's universe arrives over UDS at runtime and
 /// its `on_start` validates parameters only; vm boots inert until a
 /// ruleset table is staged + committed — 8g §7.3, normal, not an
@@ -3008,7 +3181,6 @@ fn configure_rule_tree<const N: usize>(
 #[allow(clippy::too_many_arguments)]
 pub fn engine_loop_set_full<D: OrderDispatch>(
     cons: Consumers,
-    cfg: EngineConfig,
     disp: D,
     obs: Observability,
     requested_mask: u8,
@@ -3017,12 +3189,12 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
+    hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
 ) -> EngineLoopResult {
-    if cfg.pairs.is_empty() {
-        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
+    let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
+    if hyparb.is_some() {
+        configured |= strategy_set::BIT_HYPARB;
     }
-    let mut configured =
-        strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if vrp.is_some() {
         configured |= strategy_set::BIT_VRP;
     }
@@ -3045,9 +3217,6 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     obs.boot.configured_mask = configured;
 
     let mut set = strategy_set::StrategySet::new(mask);
-    if let Err(reason) = configure_latency_arb(set.latency_arb_mut(), &cfg) {
-        return EngineLoopResult::Failed(reason);
-    }
     if let Some(boot) = vrp {
         // VRP V7: the wall anchor is taken HERE, once, right before the
         // engine loop starts — the member maps every tick's monotonic
@@ -3253,6 +3422,17 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         let dormant = set.bin15_mut().counters().families_dormant as usize;
         tracing::info!("{}", crate::bin15_boot::render_boot_tell(boot, dormant));
     }
+    if let Some(boot) = hyparb {
+        // HYPARB H5. The wall anchor is taken HERE, once — the member's
+        // day cap is UTC-aligned from this instant on (the icdp law).
+        // The params are cloned out of the boot struct (a few KiB, once).
+        let anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.hyparb_mut().configure(boot.params.clone(), anchor) {
+            tracing::error!(error = %e, "hyparb: configure failed");
+            return EngineLoopResult::Failed("engine_loop_set: hyparb configure rejected");
+        }
+        tracing::info!("{}", crate::hyparb_boot::render_boot_tell(boot));
+    }
     if let Some(params) = icdp {
         // ICDP I2/I4: the wall anchor is taken HERE, once, right
         // before the engine loop starts — the bar grid is UTC-aligned
@@ -3402,7 +3582,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
     tracing::info!(
         mask,
-        latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
+        hyparb = mask & strategy_set::BIT_HYPARB != 0,
         vrp = mask & strategy_set::BIT_VRP != 0,
         xsd = mask & strategy_set::BIT_XSD != 0,
         bin15 = mask & strategy_set::BIT_BIN15 != 0,
@@ -3453,7 +3633,7 @@ pub struct RegimeBoot {
 /// held to the law upstream — every row of a staged table must be
 /// labelled (the worker's RG8 gates), never at boot.
 const REQUIRE_LABEL_SLOTS: [u8; 5] = [
-    strategy_set::SLOT_LATENCY_ARB,
+    strategy_set::SLOT_HYPARB,
     strategy_set::SLOT_VRP,
     strategy_set::SLOT_XSD,
     strategy_set::SLOT_BIN15,
@@ -3535,9 +3715,9 @@ impl Observability {
             let ack_p99_ns = reg
                 .register_gauge("engine_latency_ack_p99_ns")
                 .map_err(|_| "register engine_latency_ack_p99_ns")?;
-            let strategy_latency_arb = reg
-                .register_gauge("engine_strategy_latency_arb_active")
-                .map_err(|_| "register engine_strategy_latency_arb_active")?;
+            let strategy_hyparb = reg
+                .register_gauge("engine_strategy_hyparb_active")
+                .map_err(|_| "register engine_strategy_hyparb_active")?;
             let strategy_vrp = reg
                 .register_gauge("engine_strategy_vrp_active")
                 .map_err(|_| "register engine_strategy_vrp_active")?;
@@ -3587,6 +3767,9 @@ impl Observability {
             let ingress_mexc_state = reg
                 .register_gauge("engine_ingress_mexc_state")
                 .map_err(|_| "register engine_ingress_mexc_state")?;
+            let ingress_hyperevm_state = reg
+                .register_gauge("engine_ingress_hyperevm_state")
+                .map_err(|_| "register engine_ingress_hyperevm_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
@@ -3614,6 +3797,8 @@ impl Observability {
                     .map_err(|_| "register engine_ingress_rpc_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_mexc_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_mexc_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_hyperevm_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_hyperevm_last_tick_age_seconds")?,
             ];
             // T1(c) / F12: age of the newest launchd restart-lane
             // slot stamp — the restart lane failing silently for 28 h
@@ -3660,6 +3845,7 @@ impl Observability {
             let ingress_bybit = register_ingress_counters(&mut reg, "bybit")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
             let ingress_mexc = register_ingress_counters(&mut reg, "mexc")?;
+            let ingress_hyperevm = register_ingress_counters(&mut reg, "hyperevm")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -3676,6 +3862,7 @@ impl Observability {
             let capture_bybit = register_capture_gauges(&mut reg, "bybit")?;
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
             let capture_mexc = register_capture_gauges(&mut reg, "mexc")?;
+            let capture_hyperevm = register_capture_gauges(&mut reg, "hyperevm")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -3716,6 +3903,8 @@ impl Observability {
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
+            let hyparb = register_hyparb_metrics(&mut reg)?;
+            let hyparb_evm = register_hyparb_evm_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             // E1: only when a router is actually in force. A boot with
@@ -3756,7 +3945,7 @@ impl Observability {
                 decide_p99_ns,
                 ack_p50_ns,
                 ack_p99_ns,
-                strategy_latency_arb,
+                strategy_hyparb,
                 strategy_vrp,
                 strategy_rule_tree,
                 strategy_set,
@@ -3772,6 +3961,7 @@ impl Observability {
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_mexc_state,
+                ingress_hyperevm_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -3784,6 +3974,7 @@ impl Observability {
                 ingress_bybit,
                 ingress_rpc,
                 ingress_mexc,
+                ingress_hyperevm,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -3792,6 +3983,7 @@ impl Observability {
                 capture_bybit,
                 capture_rpc,
                 capture_mexc,
+                capture_hyperevm,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
@@ -3812,6 +4004,8 @@ impl Observability {
                 vrp,
                 xsd,
                 bin15,
+                hyparb,
+                hyparb_evm,
                 regime,
                 paper_matcher,
                 exec,
@@ -3831,9 +4025,9 @@ impl Observability {
 /// byte — the venue defaults (`VenueId::default_stale_after_ms`,
 /// docs/venue-time-capture-plan.md §2 doctrine 4) overridden by
 /// repeatable `--stale-after-ms <venue>:<ms>` specs (labels as the
-/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`). A
+/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`). A
 /// zero disables the judgement for that venue (nothing is ever stale).
-pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; 8], String> {
+pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; core_types::VENUE_COUNT], String> {
     let mut table = VenueId::stale_after_ms_defaults();
     for spec in specs {
         let (label, ms) = spec
@@ -3912,7 +4106,7 @@ impl LatencyDump {
 
 /// Optional observability surfaces wired around the engine loop.
 /// Build once at boot via [`Observability::build`] and hand the
-/// owned `Arc`s into [`engine_loop_full`] — the loop publishes
+/// owned `Arc`s into [`engine_loop_set_full`] — the loop publishes
 /// counters + dashboard snapshots into them.
 #[derive(Default)]
 pub struct Observability {
@@ -3952,6 +4146,14 @@ pub struct Observability {
     /// XSD-3: where and how the xsd member's positions are persisted.
     /// `None` = no xsd member is configured. Set by the set builder.
     pub xsd_state: Option<XsdStateSink>,
+    /// HYPARB H8: the testnet write path's tap (`mode = "testnet"`
+    /// only) — **taken** by the engine loop, drained once per report
+    /// period (O-H12: each paper AMM decision is shadowed on chain 998).
+    pub hyparb_shadow: Option<crate::evm_testnet::ShadowTap>,
+    /// HYPARB H9: `mode = "testnet"` booted with the shadow DARK
+    /// (`evm_testnet::ShadowBootErr::Dark`) — published as
+    /// `engine_hyparb_evm_dark`.
+    pub hyparb_shadow_dark: bool,
 }
 
 /// XSD-3: the state writer's identity — the path, the table hash the
@@ -4030,8 +4232,9 @@ pub struct EngineCounters {
     pub ack_p50_ns: core_metrics::GaugeId,
     /// p99 submit→ack latency (ns).
     pub ack_p99_ns: core_metrics::GaugeId,
-    /// Active-strategy indicator — latency-arb (B).
-    pub strategy_latency_arb: core_metrics::GaugeId,
+    /// Active-strategy indicator — hyparb (slot 0; was latency-arb
+    /// before HYPARB H0).
+    pub strategy_hyparb: core_metrics::GaugeId,
     /// Active-strategy indicator — ev (A).
     pub strategy_vrp: core_metrics::GaugeId,
     /// Active-strategy indicator — rule-tree (D).
@@ -4062,10 +4265,12 @@ pub struct EngineCounters {
     pub ingress_rpc_state: core_metrics::GaugeId,
     /// MX6: per-ingress state gauge, MEXC (spot PB + futures JSON).
     pub ingress_mexc_state: core_metrics::GaugeId,
+    /// HYPARB H3b: per-ingress state gauge, HyperEVM pool events.
+    pub ingress_hyperevm_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
-    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc
-    /// (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
+    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc,
+    /// hyperevm (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
     pub ingress_last_tick_age: [core_metrics::GaugeId; SNAPSHOT_VENUES],
     /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
     /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
@@ -4094,6 +4299,8 @@ pub struct EngineCounters {
     pub ingress_rpc: IngressCounterIds,
     /// MX6: §6.4 loss-accounting counters, MEXC thread.
     pub ingress_mexc: IngressCounterIds,
+    /// HYPARB H3b: §6.4 counters, HyperEVM pool events.
+    pub ingress_hyperevm: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -4110,6 +4317,8 @@ pub struct EngineCounters {
     pub capture_rpc: CaptureGaugeIds,
     /// MX6: §6.5 capture-health gauges, MEXC thread.
     pub capture_mexc: CaptureGaugeIds,
+    /// HYPARB H3b: capture-health gauges, HyperEVM.
+    pub capture_hyperevm: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -4168,6 +4377,10 @@ pub struct EngineCounters {
     pub xsd: XsdMetricIds,
     /// BIN15 O4b: the `engine_bin15_*` family (slot 3).
     pub bin15: Bin15MetricIds,
+    /// HYPARB H6: the `engine_hyparb_*` family (slot 0).
+    pub hyparb: HyparbMetricIds,
+    /// HYPARB H8: the `engine_hyparb_evm_*` family (the testnet shadow).
+    pub hyparb_evm: HyparbEvmMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
     /// X1: the `engine_paper_matcher_*` family + the set's
@@ -4894,6 +5107,9 @@ pub struct PaperMatcherMetricIds {
     pub lifecycle_modifies_ok: core_metrics::CounterId,
     /// `engine_lifecycle_modifies_err_total` (E5).
     pub lifecycle_modifies_err: core_metrics::CounterId,
+    /// HYPARB H6: `engine_paper_matcher_amm_{fills,canceled,partial,
+    /// not_live}_total` — the AMM fill law's verdicts (H2), in that order.
+    pub amm: [core_metrics::CounterId; 4],
 }
 
 /// Register the paper-matcher family. Boot-only.
@@ -4921,7 +5137,14 @@ fn register_paper_matcher_metrics(
     let lifecycle_cancels_err = one("engine_lifecycle_cancels_err_total")?;
     let lifecycle_modifies_ok = one("engine_lifecycle_modifies_ok_total")?;
     let lifecycle_modifies_err = one("engine_lifecycle_modifies_err_total")?;
+    let amm = [
+        one("engine_paper_matcher_amm_fills_total")?,
+        one("engine_paper_matcher_amm_canceled_total")?,
+        one("engine_paper_matcher_amm_partial_total")?,
+        one("engine_paper_matcher_amm_not_live_total")?,
+    ];
     Ok(PaperMatcherMetricIds {
+        amm,
         intake,
         fills,
         ioc_canceled,
@@ -5232,6 +5455,15 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.identity_mismatch.saturating_sub(last.identity_mismatch));
     reg.counter(ids.ambiguous_order)
         .inc(cur.ambiguous_order.saturating_sub(last.ambiguous_order));
+    // HYPARB H6: the AMM fill law's verdicts.
+    reg.counter(ids.amm[0])
+        .inc(cur.amm_fills.saturating_sub(last.amm_fills));
+    reg.counter(ids.amm[1])
+        .inc(cur.amm_canceled.saturating_sub(last.amm_canceled));
+    reg.counter(ids.amm[2])
+        .inc(cur.amm_partial.saturating_sub(last.amm_partial));
+    reg.counter(ids.amm[3])
+        .inc(cur.amm_not_live.saturating_sub(last.amm_not_live));
     // E5: the engine-level tally, which counts verbs on BOTH arms —
     // the matcher family above sees only the paper one, so a live
     // slot's cancels would otherwise be invisible here.
@@ -5492,6 +5724,306 @@ fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
     reg.counter(ids.regime_exits)
         .inc(cur.regime_exits.saturating_sub(last.regime_exits));
     *last = cur;
+}
+
+/// HYPARB H6: coins carried by the per-coin gauges (the first N configured;
+/// `/state` carries all eight).
+pub const HYPARB_METRIC_COINS: usize = 4;
+/// HYPARB H6: pools carried by the per-pool gauges (the first N
+/// configured; `/state` carries 64, the capture every pool).
+pub const HYPARB_METRIC_POOLS: usize = 4;
+
+/// The counter rows of the hyparb family, in [`hyparb_counter_values`]
+/// order — which is what pins the two together.
+const HYPARB_COUNTER_NAMES: [&str; 27] = [
+    "engine_hyparb_pool_events_total",
+    "engine_hyparb_pool_refused_total",
+    "engine_hyparb_maps_loaded_total",
+    "engine_hyparb_maps_refused_total",
+    "engine_hyparb_evaluations_total",
+    "engine_hyparb_arbs_submitted_total",
+    "engine_hyparb_side_buy_total",
+    "engine_hyparb_side_sell_total",
+    "engine_hyparb_skipped_below_min_total",
+    "engine_hyparb_skipped_not_live_total",
+    "engine_hyparb_skipped_no_hedge_total",
+    "engine_hyparb_skipped_inflight_total",
+    "engine_hyparb_skipped_cooldown_total",
+    "engine_hyparb_skipped_halted_total",
+    "engine_hyparb_size_capped_total",
+    "engine_hyparb_amm_fills_total",
+    "engine_hyparb_hedges_submitted_total",
+    "engine_hyparb_hedge_venue_perp_total",
+    "engine_hyparb_hedge_venue_spot_total",
+    "engine_hyparb_hedge_fills_total",
+    "engine_hyparb_hedges_missed_total",
+    "engine_hyparb_flattens_submitted_total",
+    "engine_hyparb_inventory_breaches_total",
+    "engine_hyparb_orders_dropped_total",
+    "engine_hyparb_gas_charged_usd_1e6_total",
+    "engine_hyparb_pnl_predicted_usd_1e6_total",
+    "engine_hyparb_amm_notional_usd_1e6_total",
+];
+
+/// `HyparbCounters`' cumulative fields in [`HYPARB_COUNTER_NAMES`] order.
+/// The three money sums are non-negative by construction (gas and
+/// notional are charged, the prediction only ever adds a positive
+/// quote), so they mirror as counters; the two LEVELS
+/// (`funding_earned_usd_1e6`, signed, and `halted`) are gauges.
+// COPY: [u64; 27] (216 B) returned by value — cold, the 5 s /metrics
+// mirror; the fields are visited once in the name order — a borrowed
+// view would need the struct to be an array, which the POD is not.
+fn hyparb_counter_values(c: &strategy_core::HyparbCounters) -> [u64; 27] {
+    [
+        c.pool_events,
+        c.pool_refused,
+        c.maps_loaded,
+        c.maps_refused,
+        c.evaluations,
+        c.arbs_submitted,
+        c.arbs_buy,
+        c.arbs_sell,
+        c.skipped_below_min,
+        c.skipped_not_live,
+        c.skipped_no_hedge,
+        c.skipped_inflight,
+        c.skipped_cooldown,
+        c.skipped_halted,
+        c.size_capped,
+        c.amm_fills,
+        c.hedges_submitted,
+        c.hedges_perp,
+        c.hedges_spot,
+        c.hedge_fills,
+        c.hedges_missed,
+        c.flattens_submitted,
+        c.inventory_breaches,
+        c.orders_dropped,
+        c.gas_charged_usd_1e6.max(0) as u64,
+        c.pnl_predicted_usd_1e6.max(0) as u64,
+        c.amm_notional_usd_1e6.max(0) as u64,
+    ]
+}
+
+/// Per-coin gauge suffixes, in [`mirror_hyparb_metrics`]' write order.
+const HYPARB_COIN_GAUGES: [&str; 5] = [
+    "perp_depth_usd_1e6",
+    "spot_depth_usd_1e6",
+    "perp_cost_bps_1e6",
+    "spot_cost_bps_1e6",
+    "inventory_1e6",
+];
+/// Per-pool gauge suffixes, in [`mirror_hyparb_metrics`]' write order.
+const HYPARB_POOL_GAUGES: [&str; 3] = ["basis_bps_1e6", "pnl_predicted_usd_1e6", "live"];
+
+/// HYPARB H6: the `engine_hyparb_*` family (slot 0) — plan §10's six
+/// disputed quantities as series: the depth the hedge books showed and
+/// how often a cap cut the size (#1), the basis per pool and the side
+/// balance (#2), the prediction per pool (#4), and each venue's hedge
+/// count, quoted cost and the funding the perp earned (#6).
+#[derive(Copy, Clone, Debug)]
+pub struct HyparbMetricIds {
+    /// The counters, in [`HYPARB_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 27],
+    /// `engine_hyparb_funding_earned_usd_1e6` (signed level).
+    pub funding_earned: core_metrics::GaugeId,
+    /// `engine_hyparb_halted` (0/1).
+    pub halted: core_metrics::GaugeId,
+    /// `engine_hyparb_pools_live` — pools judgeable right now.
+    pub pools_live: core_metrics::GaugeId,
+    /// `engine_hyparb_c<k>_<suffix>` for the first
+    /// [`HYPARB_METRIC_COINS`] coins.
+    pub coins: [[core_metrics::GaugeId; 5]; HYPARB_METRIC_COINS],
+    /// `engine_hyparb_p<k>_<suffix>` for the first
+    /// [`HYPARB_METRIC_POOLS`] pools.
+    pub pools: [[core_metrics::GaugeId; 3]; HYPARB_METRIC_POOLS],
+}
+
+/// HYPARB H8: the testnet write path's shadow — the tap's and the
+/// `evm-shadow` thread's counters and levels (`cli::evm_testnet`).
+#[derive(Copy, Clone, Debug)]
+pub struct HyparbEvmMetricIds {
+    /// In [`crate::evm_testnet::SHADOW_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()],
+    /// In [`crate::evm_testnet::SHADOW_GAUGE_NAMES`] order.
+    pub gauges: [core_metrics::GaugeId; crate::evm_testnet::SHADOW_GAUGE_NAMES.len()],
+    /// `engine_hyparb_evm_dark`: 1 when `mode = "testnet"` booted with the
+    /// shadow DARK (H9: the reason is the boot's ERROR line) — the one
+    /// level that exists without a shadow.
+    pub dark: core_metrics::GaugeId,
+}
+
+/// Register the shadow family: 18 counters, 5 gauges (the shadow's 4 +
+/// `dark`). UNCONDITIONAL — a paper boot exposes the rows at zero.
+fn register_hyparb_evm_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HyparbEvmMetricIds, &'static str> {
+    use crate::evm_testnet::{SHADOW_COUNTER_NAMES, SHADOW_GAUGE_NAMES};
+    let mut counters = [core_metrics::CounterId::default(); SHADOW_COUNTER_NAMES.len()];
+    let mut i = 0usize;
+    while i < SHADOW_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(SHADOW_COUNTER_NAMES[i])
+            .map_err(|_| "register hyparb evm counter")?;
+        i += 1;
+    }
+    let mut gauges = [core_metrics::GaugeId::default(); SHADOW_GAUGE_NAMES.len()];
+    let mut g = 0usize;
+    while g < SHADOW_GAUGE_NAMES.len() {
+        gauges[g] = reg
+            .register_gauge(SHADOW_GAUGE_NAMES[g])
+            .map_err(|_| "register hyparb evm gauge")?;
+        g += 1;
+    }
+    let dark = reg
+        .register_gauge("engine_hyparb_evm_dark")
+        .map_err(|_| "register hyparb evm dark gauge")?;
+    Ok(HyparbEvmMetricIds {
+        counters,
+        gauges,
+        dark,
+    })
+}
+
+/// Mirror the shadow's status (counters as deltas, gauges as levels) and
+/// the dark flag. No shadow ⇒ only `dark` moves.
+fn mirror_hyparb_evm_metrics(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HyparbEvmMetricIds,
+    status: Option<&crate::evm_testnet::ShadowStatus>,
+    dark: bool,
+    last: &mut [u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()],
+) {
+    reg.gauge(ids.dark).set(i64::from(dark));
+    let Some(st) = status else { return };
+    let mut i = 0usize;
+    while i < last.len() {
+        let now = st.counter(i);
+        reg.counter(ids.counters[i])
+            .inc(now.saturating_sub(last[i]));
+        last[i] = now;
+        i += 1;
+    }
+    let mut g = 0usize;
+    while g < ids.gauges.len() {
+        reg.gauge(ids.gauges[g])
+            .set(i64::try_from(st.gauge(g)).unwrap_or(i64::MAX));
+        g += 1;
+    }
+}
+
+/// Register the hyparb family: 27 counters, 3 + 4×5 + 4×3 = 35 gauges.
+/// UNCONDITIONAL like every family — a mask without slot 0 exposes the
+/// rows at zero, which is how an operator tells "off" from "broken".
+fn register_hyparb_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HyparbMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 27];
+    let mut i = 0usize;
+    while i < HYPARB_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(HYPARB_COUNTER_NAMES[i])
+            .map_err(|_| "register hyparb counter")?;
+        i += 1;
+    }
+    let mut gauge = |name: &str| -> Result<core_metrics::GaugeId, &'static str> {
+        reg.register_gauge(name)
+            .map_err(|_| "register hyparb gauge")
+    };
+    let funding_earned = gauge("engine_hyparb_funding_earned_usd_1e6")?;
+    let halted = gauge("engine_hyparb_halted")?;
+    let pools_live = gauge("engine_hyparb_pools_live")?;
+    let mut coins = [[core_metrics::GaugeId::default(); 5]; HYPARB_METRIC_COINS];
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_COINS {
+        let mut g = 0usize;
+        while g < HYPARB_COIN_GAUGES.len() {
+            coins[k][g] = gauge(&format!("engine_hyparb_c{k}_{}", HYPARB_COIN_GAUGES[g]))?;
+            g += 1;
+        }
+        k += 1;
+    }
+    let mut pools = [[core_metrics::GaugeId::default(); 3]; HYPARB_METRIC_POOLS];
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_POOLS {
+        let mut g = 0usize;
+        while g < HYPARB_POOL_GAUGES.len() {
+            pools[k][g] = gauge(&format!("engine_hyparb_p{k}_{}", HYPARB_POOL_GAUGES[g]))?;
+            g += 1;
+        }
+        k += 1;
+    }
+    Ok(HyparbMetricIds {
+        counters,
+        funding_earned,
+        halted,
+        pools_live,
+        coins,
+        pools,
+    })
+}
+
+/// Mirror the hyparb family: counters as deltas of the cumulative
+/// member counters, levels as sets. 5 s cadence — cold path.
+fn mirror_hyparb_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HyparbMetricIds,
+    strat: &S,
+    last: &mut strategy_core::HyparbCounters,
+) {
+    let cur = strat.hyparb_counters();
+    let now = hyparb_counter_values(&cur);
+    let was = hyparb_counter_values(last);
+    let mut i = 0usize;
+    while i < now.len() {
+        reg.counter(ids.counters[i])
+            .inc(now[i].saturating_sub(was[i]));
+        i += 1;
+    }
+    *last = cur;
+    reg.gauge(ids.funding_earned)
+        .set(cur.funding_earned_usd_1e6);
+    reg.gauge(ids.halted).set(cur.halted as i64);
+    // Levels: a coin or pool the member does not configure keeps its row
+    // at zero rather than vanishing.
+    let mut coins = [strategy_core::HyparbCoinView::default(); HYPARB_METRIC_COINS];
+    strat.hyparb_coins_view(&mut coins);
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_COINS {
+        let c = &coins[k];
+        let v = [
+            c.perp_depth_usd_1e6,
+            c.spot_depth_usd_1e6,
+            c.perp_cost_bps_1e6,
+            c.spot_cost_bps_1e6,
+            c.inventory_1e6,
+        ];
+        let mut g = 0usize;
+        while g < v.len() {
+            reg.gauge(ids.coins[k][g]).set(v[g]);
+            g += 1;
+        }
+        k += 1;
+    }
+    // Every pool's liveness (the view is read in full once), the first
+    // N pools' rows.
+    let mut pools = [strategy_core::HyparbPoolView::default(); strategy_hyparb::HYPARB_MAX_POOLS];
+    let n = (strat.hyparb_pools_view(&mut pools) as usize).min(pools.len());
+    let mut live = 0i64;
+    let mut p = 0usize;
+    while p < n {
+        live += i64::from(pools[p].live);
+        p += 1;
+    }
+    reg.gauge(ids.pools_live).set(live);
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_POOLS {
+        let r = &pools[k];
+        reg.gauge(ids.pools[k][0]).set(r.basis_bps_1e6);
+        reg.gauge(ids.pools[k][1]).set(r.pnl_predicted_usd_1e6);
+        reg.gauge(ids.pools[k][2]).set(i64::from(r.live));
+        k += 1;
+    }
 }
 
 /// BIN15 O4b: the `engine_bin15_*` family (slot 3). Counters mirror the
@@ -6283,7 +6815,8 @@ pub fn state_writer(
 }
 
 /// The ingress status slots in the T1(c) / `VENUE_NAMES` order:
-/// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended).
+/// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended),
+/// hyperevm (HYPARB H3b, appended).
 #[inline]
 fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
     [
@@ -6295,6 +6828,7 @@ fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
         &ing.bybit,
         &ing.rpc,
         &ing.mexc,
+        &ing.hyperevm,
     ]
 }
 
@@ -6391,6 +6925,13 @@ fn fill_snapshot<S, D>(
     // strike and the position held against it can never disagree.
     out.vrp.counters = Sc::vrp_counters(strat);
     out.vrp.view = Sc::vrp_snapshot_view(strat);
+
+    // HYPARB H6: slot 0 — counters, pool rows and coin rows from ONE
+    // publish instant (the rows are copied into the snapshot's own
+    // arrays; a configured count beyond them is still reported).
+    out.hyparb.counters = Sc::hyparb_counters(strat);
+    out.hyparb.n_pools = Sc::hyparb_pools_view(strat, &mut out.hyparb.pools);
+    out.hyparb.n_coins = Sc::hyparb_coins_view(strat, &mut out.hyparb.coins);
 
     // E6 c4: the router's kill switches. Read through the trait, from
     // the same publish instant as everything else, so a halted slot
@@ -6734,43 +7275,6 @@ fn mirror_ingress_counters(
     *last = cur;
 }
 
-/// Generic engine loop: pass in any `OrderDispatch`. The `--live`
-/// path constructs a [`LiveDispatcher`] and forwards to this fn.
-pub fn engine_loop_with<D: OrderDispatch>(
-    cons: Consumers,
-    cfg: EngineConfig,
-    disp: D,
-) -> EngineLoopResult {
-    engine_loop_full(cons, cfg, disp, Observability::default())
-}
-
-/// Full engine loop with observability plumbed in. Used by the
-/// `--metrics`/`--tui` paths.
-pub fn engine_loop_full<D: OrderDispatch>(
-    cons: Consumers,
-    cfg: EngineConfig,
-    disp: D,
-    obs: Observability,
-) -> EngineLoopResult {
-    if cfg.pairs.is_empty() {
-        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
-    }
-
-    // Build the strategy.
-    let mut strat: LatencyArb<STRATEGY_SLOTS> = LatencyArb::new();
-    strat.set_threshold(cfg.threshold_1e6);
-    strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
-    strat.set_cooldown_ns(cfg.cooldown_ns);
-    for p in &cfg.pairs {
-        if let Err(e) = strat.add_pair(p.polymarket, p.binance) {
-            tracing::error!(error = ?e, pm = p.polymarket, bn = p.binance, "add_pair failed");
-            return EngineLoopResult::Failed("engine_loop: add_pair rejected");
-        }
-    }
-
-    run_engine_loop(cons, disp, strat, obs)
-}
-
 fn run_engine_loop<S, D>(cons: Consumers, disp: D, strat: S, obs: Observability) -> EngineLoopResult
 where
     S: strategy_core::Strategy,
@@ -6787,6 +7291,7 @@ where
         depth_lanes,
         opt_lanes,
         rpc_signal,
+        hyperevm_signal,
         fill_lanes,
         ai_cmds,
         ai_status,
@@ -6806,6 +7311,9 @@ where
         ai_status,
         ruleset_tables,
     );
+    // HYPARB H3b: the pool-event lane (empty forever when the HyperEVM
+    // ingress is not spawned).
+    eng.set_pool_lane(hyperevm_signal);
     // Phase 8f: the fills capture is opened by the bin (per-run
     // capture directory) and rides in via Observability; the engine
     // thread owns it from here.
@@ -6834,10 +7342,10 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc) so registry
-    // counters get monotonic deltas. Append-only: existing indices are
-    // load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 8];
+    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm) so
+    // registry counters get monotonic deltas. Append-only: existing
+    // indices are load-bearing, new venues go at the end.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 9];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
@@ -6867,6 +7375,11 @@ where
     // instance dies at its own expiry, so there is nothing an epoch
     // could carry across a restart that the next roll does not rebind.
     let mut bin15_last = strategy_core::Bin15Counters::default();
+    let mut hyparb_last = strategy_core::HyparbCounters::default();
+    // HYPARB H8: the testnet shadow's tap, owned by this thread from here.
+    let mut hyparb_shadow = obs.hyparb_shadow.take();
+    let hyparb_shadow_dark = obs.hyparb_shadow_dark;
+    let mut hyparb_evm_last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
     let mut xsd_state_buf = String::new();
@@ -6981,6 +7494,12 @@ where
             // were hoisted out of that gate deliberately; these belong
             // beside them.
             flush_member_state!();
+            // HYPARB H8: hand the period's AMM decisions to the testnet
+            // shadow (a ring push each; nothing blocks, nothing is sent
+            // from this thread).
+            if let Some(tap) = hyparb_shadow.as_mut() {
+                tap.drain(eng.strategy());
+            }
 
             let ticks = eng.ticks_dispatched;
             let signals = eng.signals_dispatched;
@@ -7014,11 +7533,9 @@ where
                 // Active-strategy gauges — flip exactly one to 1.
                 let kind = strategy_core::StrategyCounters::strategy_kind(eng.strategy());
                 let live_mask = strategy_core::StrategyCounters::enabled_mask(eng.strategy());
-                reg.gauge(ids.strategy_latency_arb)
-                    .set(i64::from(
-                        kind == "latency-arb"
-                            || live_mask & u64::from(strategy_set::BIT_LATENCY_ARB) != 0,
-                    ));
+                reg.gauge(ids.strategy_hyparb).set(i64::from(
+                    kind == "hyparb" || live_mask & u64::from(strategy_set::BIT_HYPARB) != 0,
+                ));
                 // F29: the live engine runs the SET, so `kind` is
                 // "set" and this gauge read 0 for the whole life of the
                 // member — an alert on "is the VRP member running"
@@ -7045,6 +7562,16 @@ where
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
+                mirror_hyparb_metrics(reg, &ids.hyparb, eng.strategy(), &mut hyparb_last);
+                mirror_hyparb_evm_metrics(
+                    reg,
+                    &ids.hyparb_evm,
+                    hyparb_shadow
+                        .as_ref()
+                        .map(crate::evm_testnet::ShadowTap::status),
+                    hyparb_shadow_dark,
+                    &mut hyparb_evm_last,
+                );
                 // X1: what the paper matcher did. `ioc_canceled` is the
                 // F7 counter — a mid-priced IoC on a real spread never
                 // fills, and the member used to call that a position.
@@ -7098,6 +7625,8 @@ where
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
                     reg.gauge(ids.ingress_mexc_state)
                         .set(ing.mexc.state() as i64);
+                    reg.gauge(ids.ingress_hyperevm_state)
+                        .set(ing.hyperevm.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
                     // monotonic deltas (D4: ring_drops included).
@@ -7138,6 +7667,12 @@ where
                         &ids.ingress_mexc,
                         &ing.mexc,
                         &mut ingress_last[7],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_hyperevm,
+                        &ing.hyperevm,
+                        &mut ingress_last[8],
                     );
 
                     // T1(c): per-venue last-tick age from the stamps
@@ -7277,7 +7812,8 @@ pub struct EngineLoopStats {
     pub dispatcher_accepted: u64,
 }
 
-/// Outcome of [`engine_loop`].
+/// Outcome of an engine loop ([`engine_loop_set_full`] and the
+/// standalone ev / rule-tree arms).
 #[derive(Debug)]
 pub enum EngineLoopResult {
     /// Clean shutdown via SIGINT; carries cumulative stats.
@@ -9354,6 +9890,7 @@ mod tests {
             depth_lanes,
             opt_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
+            hyperevm_signal: rings.hyperevm_signal.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
             ai_status: Arc::new(AiIngressStatus::new()),
@@ -9551,6 +10088,144 @@ mod tests {
     /// `the_exec_family_size_is_pinned` test in `exec_boot` counts
     /// that family; the registry-wide number is re-measured on the
     /// host at every ramp step.
+    /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
+    /// refused boot, and the registry is shared by every family.
+    #[test]
+    fn the_hyparb_family_is_27_counters_and_35_gauges() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let before_c = reg.counters_len();
+        let before_g = reg.gauges_len();
+        let ids = register_hyparb_metrics(&mut reg).expect("register hyparb");
+        assert_eq!(reg.counters_len() - before_c, 27, "the counter block");
+        assert_eq!(
+            reg.gauges_len() - before_g,
+            35,
+            "3 + 4 coins x 5 + 4 pools x 3"
+        );
+        // A second registration collides on every name — nothing reused
+        // a name silently.
+        assert!(register_hyparb_metrics(&mut reg).is_err());
+        reg.gauge(ids.coins[3][4]).set(-5);
+        assert_eq!(reg.gauge(ids.coins[3][4]).get(), -5);
+        assert_eq!(reg.gauge(ids.pools[0][0]).get(), 0);
+        // Every counter name is distinct and a counter.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for n in HYPARB_COUNTER_NAMES {
+            assert!(
+                n.starts_with("engine_hyparb_") && n.ends_with("_total"),
+                "{n}"
+            );
+            assert!(seen.insert(n), "duplicate {n}");
+        }
+    }
+
+    /// HYPARB H8: the shadow family's size is pinned too, and its mirror
+    /// publishes deltas and levels — and nothing at all with no shadow.
+    #[test]
+    fn the_hyparb_evm_family_is_18_counters_and_5_gauges_and_mirrors_deltas() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_hyparb_evm_metrics(&mut reg).expect("register");
+        assert_eq!(reg.counters_len() - c0, 18);
+        assert_eq!(reg.gauges_len() - g0, 5);
+        assert!(
+            register_hyparb_evm_metrics(&mut reg).is_err(),
+            "names are unique"
+        );
+        let mut last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
+        mirror_hyparb_evm_metrics(&reg, &ids, None, false, &mut last);
+        assert_eq!(
+            reg.counter(ids.counters[0]).get(),
+            0,
+            "no shadow: nothing moves"
+        );
+        assert_eq!(reg.gauge(ids.dark).get(), 0);
+        mirror_hyparb_evm_metrics(&reg, &ids, None, true, &mut last);
+        assert_eq!(reg.gauge(ids.dark).get(), 1, "a dark shadow is a level");
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let st = crate::evm_testnet::ShadowStatus {
+            counters: std::array::from_fn(|_| AtomicU64::new(0)),
+            gauges: std::array::from_fn(|_| AtomicU64::new(0)),
+        };
+        st.counters[5].store(3, Ordering::Relaxed);
+        st.gauges[3].store(65_000_000, Ordering::Relaxed);
+        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), false, &mut last);
+        st.counters[5].store(5, Ordering::Relaxed);
+        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), false, &mut last);
+        assert_eq!(reg.counter(ids.counters[5]).get(), 5, "3 then +2");
+        assert_eq!(reg.gauge(ids.gauges[3]).get(), 65_000_000);
+    }
+
+    /// The hyparb mirror publishes counter DELTAS in name order (the
+    /// value fn and the names are pinned together here), levels as sets,
+    /// and holds unconfigured rows at zero.
+    #[test]
+    fn the_hyparb_mirror_publishes_deltas_levels_and_pool_liveness() {
+        struct Fake {
+            c: strategy_core::HyparbCounters,
+            pool: strategy_core::HyparbPoolView,
+            coin: strategy_core::HyparbCoinView,
+        }
+        impl strategy_core::StrategyCounters for Fake {
+            fn orders_emitted(&self) -> u64 {
+                0
+            }
+            fn orders_dropped(&self) -> u64 {
+                0
+            }
+            fn strategy_kind(&self) -> &'static str {
+                "fake"
+            }
+            fn hyparb_counters(&self) -> strategy_core::HyparbCounters {
+                self.c
+            }
+            fn hyparb_pools_view(&self, out: &mut [strategy_core::HyparbPoolView]) -> u32 {
+                out[0] = self.pool;
+                1
+            }
+            fn hyparb_coins_view(&self, out: &mut [strategy_core::HyparbCoinView]) -> u32 {
+                out[0] = self.coin;
+                1
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let ids = register_hyparb_metrics(&mut reg).expect("register");
+        let mut last = strategy_core::HyparbCounters::default();
+        let mut f = Fake {
+            c: strategy_core::HyparbCounters::default(),
+            pool: strategy_core::HyparbPoolView::new(1, 1, 1, 0, 500, 97, -1_000, 3, 42),
+            coin: strategy_core::HyparbCoinView::default(),
+        };
+        f.c.arbs_buy = 3;
+        f.c.arbs_sell = 1;
+        f.c.gas_charged_usd_1e6 = 30_000;
+        f.c.funding_earned_usd_1e6 = -12;
+        f.c.halted = 1;
+        f.coin.perp_depth_usd_1e6 = 900_000_000;
+        mirror_hyparb_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[6]).get(), 3, "side_buy");
+        assert_eq!(reg.counter(ids.counters[7]).get(), 1, "side_sell");
+        assert_eq!(reg.counter(ids.counters[24]).get(), 30_000, "gas");
+        assert_eq!(reg.gauge(ids.funding_earned).get(), -12);
+        assert_eq!(reg.gauge(ids.halted).get(), 1);
+        assert_eq!(reg.gauge(ids.pools_live).get(), 1);
+        assert_eq!(reg.gauge(ids.pools[0][0]).get(), -1_000);
+        assert_eq!(reg.gauge(ids.pools[0][1]).get(), 42);
+        assert_eq!(reg.gauge(ids.pools[1][2]).get(), 0, "unconfigured pool row");
+        assert_eq!(reg.gauge(ids.coins[0][0]).get(), 900_000_000);
+        // The second pass publishes only the delta.
+        f.c.arbs_buy = 5;
+        mirror_hyparb_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[6]).get(), 5);
+        assert_eq!(reg.counter(ids.counters[7]).get(), 1);
+        // The value order IS the name order.
+        assert_eq!(HYPARB_COUNTER_NAMES[6], "engine_hyparb_side_buy_total");
+        assert_eq!(
+            HYPARB_COUNTER_NAMES[24],
+            "engine_hyparb_gas_charged_usd_1e6_total"
+        );
+    }
+
     #[test]
     fn the_bin15_family_is_31_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
@@ -9667,6 +10342,7 @@ mod tests {
             binance_ticks: 2,
             other_venue_ticks: 0,
             rpc_signals: 3,
+            hyperevm_signals: 7,
             venue_events: 4,
             depth_snaps: 5,
             opt_records: 6,
@@ -9676,6 +10352,7 @@ mod tests {
             binance_ticks: 20,
             other_venue_ticks: 5,
             rpc_signals: 30,
+            hyperevm_signals: 70,
             venue_events: 40,
             depth_snaps: 50,
             opt_records: 60,
@@ -9685,6 +10362,7 @@ mod tests {
         assert_eq!(a.binance_ticks, 22);
         assert_eq!(a.other_venue_ticks, 5);
         assert_eq!(a.rpc_signals, 33);
+        assert_eq!(a.hyperevm_signals, 77);
         assert_eq!(a.venue_events, 44);
         assert_eq!(a.depth_snaps, 55);
         assert_eq!(a.opt_records, 66);
@@ -10215,7 +10893,17 @@ mod tests {
     fn raw_tap_flags_all_enables_every_venue() {
         let cfg = parse_raw_tap_flags(Some("all"), "all", 8).unwrap();
         let want_bytes = 8 * 1024 * 1024;
-        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
+        for c in [
+            cfg.pm,
+            cfg.bn,
+            cfg.okx,
+            cfg.rpc,
+            cfg.deribit,
+            cfg.hl,
+            cfg.bybit,
+            cfg.mexc,
+            cfg.hyperevm,
+        ] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
         }
@@ -10231,7 +10919,15 @@ mod tests {
         assert_eq!(cfg.pm.budget_bytes, want_bytes);
         assert_eq!(cfg.okx.mode, TapMode::Rejects);
         assert_eq!(cfg.okx.budget_bytes, want_bytes);
-        for c in [cfg.bn, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
+        for c in [
+            cfg.bn,
+            cfg.rpc,
+            cfg.deribit,
+            cfg.hl,
+            cfg.bybit,
+            cfg.mexc,
+            cfg.hyperevm,
+        ] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
         }
@@ -10240,9 +10936,23 @@ mod tests {
     /// Every known capture-venue label is accepted in one CSV.
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
-        let cfg =
-            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc"), "all", 1).unwrap();
-        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
+        let cfg = parse_raw_tap_flags(
+            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm"),
+            "all",
+            1,
+        )
+        .unwrap();
+        for c in [
+            cfg.pm,
+            cfg.bn,
+            cfg.okx,
+            cfg.rpc,
+            cfg.deribit,
+            cfg.hl,
+            cfg.bybit,
+            cfg.mexc,
+            cfg.hyperevm,
+        ] {
             assert_eq!(c.mode, TapMode::All);
         }
     }
@@ -10281,15 +10991,20 @@ mod tests {
         );
     }
 
-    /// More than eight comma-separated labels trips the defensive
-    /// capacity guard — there are only eight capture labels (WS9 added
-    /// bybit, MX6 mexc), so this branch is a pure defense-in-depth
-    /// backstop reached here by listing all eight plus a ninth item.
+    /// More than nine comma-separated labels trips the defensive
+    /// capacity guard — there are only nine capture labels (WS9 added
+    /// bybit, MX6 mexc, HYPARB H3b hyperevm), so this branch is a pure
+    /// defense-in-depth backstop reached here by listing all nine plus a
+    /// tenth item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
-            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,pm2"), "rejects", 64)
-                .err(),
+            parse_raw_tap_flags(
+                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,pm2"),
+                "rejects",
+                64
+            )
+            .err(),
             Some("--raw-tap: more venue labels than known venues")
         );
     }
@@ -10501,7 +11216,7 @@ mod tests {
         // On, every coded member ANY: the first enabled required slot names the refusal.
         assert_eq!(
             unlabelled_required_slot(&set, strategy_set::BUILT_MASK, true),
-            Some(strategy_set::SLOT_LATENCY_ARB)
+            Some(strategy_set::SLOT_HYPARB)
         );
         // The AI-only mask (ai-exec + vm) is exempt — nothing to label at boot.
         let ai = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;

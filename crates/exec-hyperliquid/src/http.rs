@@ -15,6 +15,29 @@
 //! the next order: the 50–150 ms TCP+TLS handshake is paid once, not
 //! per order.
 //!
+//! ## A kept-alive connection the venue has closed is never reused
+//!
+//! (Operator ask, 2026-09-24 — the finding the HYPARB H9 review made on
+//! `core_net::HttpsPost`, which has the same shape.) The venue closes an
+//! idle keep-alive connection on its own schedule, and it can announce
+//! `Connection: close` on an answer. Reusing such a connection wrote
+//! the next ORDER into a socket the peer had already closed: the write
+//! succeeds locally, the read then finds EOF, and the order comes back
+//! `Disconnected` with `left_host == true` — lost to reconciliation,
+//! counted `sent_unanswered`, charged to the address budget, although
+//! no byte of it ever reached the venue. Now:
+//!
+//! * an answer that says `Connection: close` (or arrives with the
+//!   peer's FIN) retires the connection WITH that answer — the answer
+//!   is kept, only the transport is dropped;
+//! * before a connection is reused, one non-blocking one-byte read
+//!   (a single `read(2)` through rustls) asks whether the peer closed it
+//!   while idle — EOF, `close_notify`, an unsolicited byte or an error
+//!   retires it — and the request dials fresh with `left_host == false`.
+//!
+//! [`HlHttp::dials`] counts handshakes, so an endpoint that closes after
+//! every answer shows as dials ≈ posts.
+//!
 //! ## What this layer does NOT decide
 //!
 //! Whether the venue accepted anything. It returns the HTTP status and
@@ -28,7 +51,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use core_net::{read_response, HttpResult, TlsTransport, Transport};
+use core_net::{head_says_close, read_response, HttpResult, TlsTransport, Transport};
 use mio::{Events, Poll, Token};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -181,6 +204,8 @@ pub struct HlHttp {
     /// would report every order as `Disconnected` until a restart
     /// (E7 review, 2026-09-19).
     connect_fail_streak: u32,
+    /// Successful dials (TCP + TLS handshakes) over the client's life.
+    dials: u64,
     server_name: ServerName<'static>,
     tls_config: Arc<ClientConfig>,
 
@@ -213,6 +238,7 @@ impl HlHttp {
             port,
             addr,
             connect_fail_streak: 0,
+            dials: 0,
             server_name,
             tls_config,
             transport: None,
@@ -243,6 +269,14 @@ impl HlHttp {
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.transport.is_some()
+    }
+
+    /// Successful dials over the client's life: 1 on a healthy
+    /// keep-alive venue; ≈ posts on one that closes after every answer.
+    #[inline]
+    #[must_use]
+    pub const fn dials(&self) -> u64 {
+        self.dials
     }
 
     /// One request/response cycle.
@@ -276,7 +310,15 @@ impl HlHttp {
             .map_err(PostErr::before_send)?;
         let mut left_host = false;
         match self.cycle(path, body, deadline, &mut left_host) {
-            Ok(v) => Ok(v),
+            Ok((status, range, retire)) => {
+                if retire {
+                    // The venue closed, or said it will: the answer is
+                    // whole, the connection is not reusable. Keep the
+                    // answer; drop only the transport (module doc).
+                    self.transport = None;
+                }
+                Ok((status, range))
+            }
             Err(err) => {
                 // Any failure closes the connection. A half-read
                 // response left in the buffer would be read as the
@@ -304,7 +346,7 @@ impl HlHttp {
         body: &[u8],
         deadline: Instant,
         left_host: &mut bool,
-    ) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
+    ) -> Result<(u16, core::ops::Range<usize>, bool), HttpErr> {
         let header_len = self.write_header(path, body.len())?;
         {
             let t = self.transport.as_mut().ok_or(HttpErr::Disconnected)?;
@@ -365,6 +407,9 @@ impl HlHttp {
     }
 
     fn ensure_connected(&mut self, deadline: Instant) -> Result<(), HttpErr> {
+        if self.transport.is_some() && !self.still_open() {
+            self.transport = None;
+        }
         if self.transport.is_some() {
             return Ok(());
         }
@@ -390,6 +435,18 @@ impl HlHttp {
                 Err(e)
             }
         }
+    }
+
+    /// Before reusing a kept-alive connection: one non-blocking read.
+    /// No request is outstanding, so anything but `WouldBlock` — EOF,
+    /// `close_notify`, an unsolicited byte, an error — means the venue
+    /// is gone or out of step, and the request must dial fresh.
+    fn still_open(&mut self) -> bool {
+        let Some(t) = self.transport.as_mut() else {
+            return false;
+        };
+        let mut probe = [0u8; 1];
+        matches!(t.read(&mut probe), Err(ref e) if e.kind() == io::ErrorKind::WouldBlock)
     }
 
     fn dial(&mut self, deadline: Instant) -> Result<(), HttpErr> {
@@ -421,13 +478,16 @@ impl HlHttp {
             }
         }
         self.transport = Some(t);
+        self.dials += 1;
         Ok(())
     }
 
+    /// Read one whole answer: `(status, body_range, retire)` — `retire`
+    /// when the venue closed with it or announced `Connection: close`.
     fn read_response(
         &mut self,
         deadline: Instant,
-    ) -> Result<(u16, core::ops::Range<usize>), HttpErr> {
+    ) -> Result<(u16, core::ops::Range<usize>, bool), HttpErr> {
         self.resp_len = 0;
         let mut peer_closed = false;
         loop {
@@ -468,11 +528,12 @@ impl HlHttp {
             match read_response(&self.resp_buf[..self.resp_len]) {
                 HttpResult::Complete {
                     status,
+                    header_end,
                     body_start,
                     body_end,
                     framing,
-                    ..
                 } => {
+                    let retire = peer_closed || head_says_close(&self.resp_buf[..header_end]);
                     // This client knows ONE framing. The venue answers
                     // `Content-Length`; a chunked body would need
                     // de-chunking before the scanner could read it and
@@ -487,7 +548,7 @@ impl HlHttp {
                     match framing {
                         core_net::BodyFraming::ContentLength(_) => {
                             if self.resp_len >= body_end {
-                                return Ok((status, body_start..body_end));
+                                return Ok((status, body_start..body_end, retire));
                             }
                             // Declared more body than has arrived. If
                             // the peer is gone it never will — a
@@ -499,7 +560,7 @@ impl HlHttp {
                         }
                         core_net::BodyFraming::CloseDelimited => {
                             if peer_closed {
-                                return Ok((status, body_start..self.resp_len));
+                                return Ok((status, body_start..self.resp_len, true));
                             }
                         }
                         core_net::BodyFraming::Chunked => return Err(HttpErr::BadHttp),

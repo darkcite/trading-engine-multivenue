@@ -46,7 +46,10 @@ pub struct ResolvedRegime {
 /// Map a `[labels.<member>]` name to its strategy-set slot.
 fn coded_member_slot(name: &str) -> Option<u8> {
     Some(match name {
-        "latency_arb" => strategy_set::SLOT_LATENCY_ARB,
+        // HYPARB H0 (2026-09-23): slot 0 is hyparb. `latency_arb` is
+        // GONE as a label name for the same reason `ev` is — a label
+        // evidenced for the old member must not gate the new one.
+        "hyparb" => strategy_set::SLOT_HYPARB,
         // VRP V7: slot 1 is the VRP member. `ev` is deliberately GONE:
         // a label evidenced for the EV member must not silently gate a
         // different strategy, so an old `regime.toml` carrying

@@ -12,7 +12,7 @@
 //!   OKX when `--okx-symbols` is set, Deribit when
 //!   `--deribit-symbols` is set, Hyperliquid when `--hl-coins` is
 //!   set, Polygon RPC), boot the
-//!   real `Engine` with the latency-arb strategy + paper dispatcher,
+//!   real `Engine` with the composed strategy set + paper dispatcher,
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
 //!   (non-secret) config.
@@ -29,11 +29,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use cli::{
-    boot_info, engine_loop_ev_full, engine_loop_full, engine_loop_rule_tree_full,
-    engine_loop_set_full, install_sigint_handler, join_reverse,
-    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
-    state_writer, Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher,
-    Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
+    boot_info, engine_loop_ev_full, engine_loop_rule_tree_full, engine_loop_set_full,
+    install_sigint_handler, join_reverse, spawn_binance, spawn_deribit, spawn_hyperliquid,
+    spawn_okx, spawn_polymarket, spawn_rpc, state_writer, Consumers, EngineConfig,
+    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint,
+    SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -42,9 +42,9 @@ use tracing_subscriber::EnvFilter;
 
 /// BIN15 O5 (2026-09-12): the composed-set names this binary will boot.
 ///
-/// This list MUST mirror `strategy_set::mask_for_name`, minus
-/// `latency-arb`, which has its own paper arm above and no set arm.
-/// It lives here as a named const rather than as match literals so the
+/// This list MUST mirror `strategy_set::mask_for_name` exactly (HYPARB
+/// H0 retired the one exemption: `latency-arb` and its standalone arm
+/// left with the member, O-H1). It lives here as a named const rather than as match literals so the
 /// `strategy_name_pin` tests below can read it: the arm and the mask
 /// table DID drift once. The five bin15 names reached `mask_for_name`
 /// and the wrapper allow-list but never the match arm, so
@@ -68,6 +68,12 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "ai+vrp+bin15",
     "ai+xsd+bin15",
     "ai+vrp+xsd+bin15",
+    // HYPARB H0: slot 0. Resolves, but refuses the boot as "no
+    // requested member is configured" until H5 lands its artifact
+    // (lands DARK — O-H8).
+    "hyparb",
+    "ai+hyparb",
+    "ai+vrp+xsd+bin15+hyparb",
 ];
 
 /// Top-level CLI.
@@ -126,6 +132,60 @@ enum Cmd {
     /// TESTNET ONLY, by construction. There is no flag that points
     /// this at production.
     ExecSmoke(ExecSmokeArgs),
+    /// HYPARB H8: the HyperEVM write path's operator verbs, TESTNET
+    /// (chain 998) ONLY by construction — `status`, `fund` (derived
+    /// wallets from wallet 0), `deploy` (the O-H18 executor), `mint` (a
+    /// testnet token's public faucet, to the executor), `battery`
+    /// (DONE(H8): a swap lands and reconciles; three wallets without a
+    /// nonce collision; an underbid observed losing). Reads the wallet
+    /// key from the environment and never opens `.env` —
+    /// `scripts/evm-testnet.sh` sources it. Report on stdout.
+    EvmTestnet(EvmTestnetArgs),
+}
+
+/// `evm-testnet` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum EvmVerb {
+    /// Chain check; every wallet's address, nonces and balance.
+    Status,
+    /// Top every derived wallet up to `--amount-wei` from wallet 0.
+    Fund,
+    /// Deploy the executor from wallet 0 (its owner).
+    Deploy,
+    /// `--token`'s public `mint(executor, --amount-raw)`.
+    Mint,
+    /// The DONE(H8) battery.
+    Battery,
+    /// The engine's shadow (boot, hybrid chain checks, ring, thread) end
+    /// to end on synthetic decisions — without stopping the live engine.
+    ShadowSmoke,
+}
+
+#[derive(Debug, Parser)]
+struct EvmTestnetArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: EvmVerb,
+    /// The artifact whose `[testnet]` block to use (default
+    /// `~/multivenue/hyparb.toml`).
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// `fund`: each derived wallet's target balance, wei.
+    #[arg(long)]
+    amount_wei: Option<u128>,
+    /// `mint`: the testnet token (0x + 40 hex).
+    #[arg(long)]
+    token: Option<String>,
+    /// `mint`: raw units to mint to the executor.
+    #[arg(long)]
+    amount_raw: Option<u128>,
+    /// `shadow-smoke`: synthetic decisions to shadow.
+    #[arg(long, default_value_t = 3)]
+    decisions: u64,
+    /// `shadow-smoke`: the READ endpoint (the pool ingress's) — default
+    /// `https://$HYPEREVM_WS_HOST/`, else the O-H15 archive endpoint.
+    #[arg(long)]
+    read_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -459,6 +519,16 @@ struct BacktestArgs {
     /// `~/multivenue` to fold the live cut in deliberately.
     #[arg(long, requires = "member")]
     bin15_seed_dir: Option<PathBuf>,
+    /// `--member hyparb`: the parameter artifact (`hyparb.toml`; default
+    /// `~/multivenue/hyparb.toml`).
+    #[arg(long, requires = "member")]
+    hyparb: Option<PathBuf>,
+    /// `--member hyparb`: the `universe.toml` whose `[hyperevm] pools`
+    /// names the pools (default `~/multivenue/universe.toml` — the list
+    /// is append-only, so the live file names every pool an older
+    /// capture carries).
+    #[arg(long, requires = "member")]
+    hyparb_universe: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     #[arg(long)]
@@ -676,6 +746,12 @@ struct RunArgs {
     /// thread is not started.
     #[arg(long)]
     polygon_path: Option<String>,
+    /// HYPARB H3b: HyperEVM JSON-RPC WebSocket path on
+    /// `HYPEREVM_WS_HOST` (e.g. `/`). Absent ⇒ the pool-event ingress is
+    /// not started; present with an empty `[hyperevm] pools` ⇒ warned and
+    /// not started.
+    #[arg(long)]
+    hyperevm_path: Option<String>,
     /// Bind `127.0.0.1:9191` and expose `/metrics` (Prometheus text),
     /// `/healthz` and `/state` (RG6: the 1 s engine snapshot as
     /// JSON — boot identity, regime words, slots, vm rows, recent
@@ -686,8 +762,9 @@ struct RunArgs {
     /// `/state` serves. Implies `--metrics`.
     #[arg(long, default_value_t = false)]
     tui: bool,
-    /// Strategy selector. `latency-arb` (default) uses Binance →
-    /// Polymarket cross-venue arbitrage. `ev` uses Strategy A:
+    /// Strategy selector. `ai` (default since HYPARB H0 retired the
+    /// standalone `latency-arb` arm) composes ai-exec + vm through the
+    /// set path. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
     /// `ai-exec` (Phase 8f item 8) runs the AI-driven fair-value/
     /// intent strategy alone via the set path (no boot symbol
@@ -699,7 +776,7 @@ struct RunArgs {
     /// composed StrategySet: every built member whose config flags
     /// are present (ai-exec and vm need none and are always
     /// included), AI-toggleable at runtime; paper-only until 8i.
-    #[arg(long, default_value = "latency-arb")]
+    #[arg(long, default_value = "ai")]
     strategy: String,
     /// Path to claude-worker NDJSON tag artifacts. Required when
     /// `--strategy ev`.
@@ -726,6 +803,24 @@ struct RunArgs {
     /// boot must be — and the member holds until its HAR window warms.
     #[arg(long)]
     bin15_seed_dir: Option<PathBuf>,
+    /// HYPARB H5: the slot-0 parameter artifact
+    /// (`~/multivenue/hyparb.toml` by default). Read only when the
+    /// requested mask carries slot 0 (`--strategy hyparb` / `ai+hyparb`
+    /// / … / `all`); absent or unresolvable with the bit set REFUSES the
+    /// boot — never a silent no-op. The member also needs its pools:
+    /// `--hyperevm-path` and a non-empty `[hyperevm] pools`.
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// HYPARB O-H5: the second switch of the EVM write path, TESTNET
+    /// ONLY (chain 998; the crate refuses 999 regardless). Must agree
+    /// with the artifact's `mode = "testnet"` — both or neither.
+    #[arg(long, default_value_t = false)]
+    evm_testnet: bool,
+    /// HYPARB O-H12: the third switch — the pool ingress may read chain
+    /// 999 (mainnet signal) while the write path writes chain 998. Only
+    /// with `--evm-testnet`; never the inverse. Shouted in the ARMED tell.
+    #[arg(long, default_value_t = false, requires = "evm_testnet")]
+    evm_hybrid: bool,
     /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
     /// by default). Read only when the requested mask carries the icdp
     /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
@@ -871,6 +966,73 @@ fn main() -> ExitCode {
             // human report on stderr.
             init_tracing_stderr();
             exec_smoke(args)
+        }
+        Cmd::EvmTestnet(args) => {
+            init_tracing_stderr();
+            evm_testnet(args)
+        }
+    }
+}
+
+/// HYPARB H8: the `evm-testnet` verbs. Exit 0 only when the verb did
+/// what it says (the battery: only when DONE(H8) held).
+fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
+    use cli::evm_testnet as et;
+    let path = match args.hyparb.clone() {
+        Some(p) => p,
+        None => match core_config::hyparb::default_hyparb_path() {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                eprintln!("evm-testnet: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let file = match core_config::hyparb::load(&path) {
+        Ok((f, _)) => f,
+        Err(e) => {
+            eprintln!("evm-testnet: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(t) = file.testnet.as_ref() else {
+        eprintln!("evm-testnet: {} has no [testnet] block", path.display());
+        return ExitCode::from(2);
+    };
+    let tls = TlsTransport::default_client_config();
+    let out = match args.verb {
+        EvmVerb::Status => et::verb_status(t, tls).map(|r| (r, true)),
+        EvmVerb::Fund => match args.amount_wei {
+            Some(a) => et::verb_fund(t, a, tls).map(|r| (r, true)),
+            None => Err("fund needs --amount-wei".to_owned()),
+        },
+        EvmVerb::Deploy => et::verb_deploy(t, tls).map(|r| (r, true)),
+        EvmVerb::Mint => match (args.token.as_deref(), args.amount_raw) {
+            (Some(tok), Some(a)) => et::verb_mint(t, tok, a, tls).map(|r| (r, true)),
+            _ => Err("mint needs --token and --amount-raw".to_owned()),
+        },
+        EvmVerb::Battery => et::verb_battery(t, tls),
+        EvmVerb::ShadowSmoke => {
+            let read_url = args.read_url.clone().unwrap_or_else(|| {
+                let host = std::env::var("HYPEREVM_WS_HOST")
+                    .unwrap_or_else(|_| "rpc.purroofgroup.com".to_owned());
+                format!("https://{host}/")
+            });
+            et::verb_shadow_smoke(t, file.gas_p99_usd_1e6, &read_url, args.decisions, tls)
+        }
+    };
+    match out {
+        Ok((report, ok)) => {
+            print!("{report}");
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("evm-testnet: {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -1768,7 +1930,9 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         None => None,
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
-                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15)");
+                eprintln!(
+                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb)"
+                );
                 return ExitCode::from(1);
             };
             let params = match kind {
@@ -1812,6 +1976,16 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         }
                     },
                 },
+                cli::backtest::member::MemberKind::Hyparb => match args.hyparb.clone() {
+                    Some(p) => p,
+                    None => match core_config::hyparb::default_hyparb_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member hyparb needs --hyparb <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
             };
             Some(cli::backtest::member::MemberSpec {
                 kind,
@@ -1820,6 +1994,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                 seed: args.xsd_seed.clone(),
                 vrp_seed: args.vrp_seed.clone(),
                 bin15_seed_dir: args.bin15_seed_dir.clone(),
+                hyparb_universe: args.hyparb_universe.clone(),
             })
         }
     };
@@ -2618,6 +2793,7 @@ fn run(args: RunArgs) -> ExitCode {
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
     let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
+    let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
     // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
@@ -3364,6 +3540,68 @@ fn run(args: RunArgs) -> ExitCode {
         warn!("--polygon-path not provided; RPC ingress thread not started");
     }
 
+    // -- HYPARB H3b: the HyperEVM pool-event ingress --
+    // Both switches or nothing: the path flag AND a `[hyperevm] pools`
+    // list. Anything else drops the producer, so the engine's pool lane
+    // is a permanently-empty ring (the unspawned-venue shape, §3.3).
+    // HYPARB H5: whether the operator CONFIGURED the ingress — slot 0
+    // refuses a boot without it (a member that can never see a pool);
+    // a runtime failure (DNS, a dishonest archive) only darkens the
+    // member (O-H15), it never refuses the boot.
+    let hyperevm_configured = args.hyperevm_path.is_some() && !boot.allocated.hyperevm.is_empty();
+    match (
+        args.hyperevm_path.as_deref(),
+        boot.allocated.hyperevm.is_empty(),
+    ) {
+        (Some(path), false) => {
+            let table = match cli::hyperevm_pool_table(&boot.allocated) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = ?e, "hyperevm: pool table refused");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            match WssEndpoint::resolve(&cfg.hyperevm_ws_host, 443, path) {
+                Ok(ep) => {
+                    info!(
+                        host = %cfg.hyperevm_ws_host,
+                        pools = boot.allocated.hyperevm.len(),
+                        "hyperevm: starting pool-event ingress"
+                    );
+                    match cli::spawn_hyperevm(
+                        ep,
+                        tls_config.clone(),
+                        hyperevm_prod,
+                        statuses.hyperevm.clone(),
+                        10,
+                        &run_dir,
+                        epoch_ns,
+                        raw_tap_cfg.hyperevm,
+                        capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperevm)),
+                        table,
+                        ingress_hyperevm::run_loop::DEFAULT_SNAPSHOT_RADIUS,
+                    ) {
+                        Ok(h) => handles.push(h),
+                        Err(e) => {
+                            error!(error = ?e, "hyperevm: capture open failed");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = ?e, "HyperEVM DNS failed; skipping the pool-event ingress");
+                }
+            }
+        }
+        (Some(_), true) => {
+            warn!("--hyperevm-path given but [hyperevm] pools is empty; pool ingress not started");
+            drop(hyperevm_prod);
+        }
+        (None, _) => drop(hyperevm_prod),
+    }
+
     // -- AI-command ingress (Phase 8f; opt-in via AI_INGRESS_HMAC_KEY
     // in .env) --
     // Key semantics: ABSENT/empty ⇒ thread not started (back-compat
@@ -3458,6 +3696,7 @@ fn run(args: RunArgs) -> ExitCode {
         depth_lanes: depth_lane_cons,
         opt_lanes: opt_lane_cons,
         rpc_signal: rpc_cons,
+        hyperevm_signal: hyperevm_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,
@@ -3544,7 +3783,7 @@ fn run(args: RunArgs) -> ExitCode {
 
     // `--exec` is honoured ONLY by the composed strategy-set arm — it
     // is the only arm that builds a `RoutedDispatcher`. Accepting the
-    // flag for `latency-arb` / `rule-tree` / `ev` and then routing
+    // flag for `rule-tree` / `ev` and then routing
     // nothing would be the worst kind of silent no-op: the operator
     // passed an arming artifact and the engine ignored it.
     if args.exec.is_some() && !STRATEGY_SET_NAMES.contains(&args.strategy.as_str()) {
@@ -3558,23 +3797,9 @@ fn run(args: RunArgs) -> ExitCode {
     }
     let strategy_choice = args.strategy.as_str();
     let result = match (strategy_choice, args.live) {
-        ("latency-arb", true) => match boot_queued_live(&cfg, tls_config.clone()) {
-            Ok((queued, worker_handle)) => {
-                info!("running latency-arb LIVE — orders queued to dispatcher thread");
-                obs_handles.push(worker_handle);
-                engine_loop_full(cons, engine_cfg, queued, obs)
-            }
-            Err(reason) => EngineLoopResult::Failed(reason),
-        },
-        ("latency-arb", false) => {
-            info!("running latency-arb PAPER — no orders will be submitted");
-            engine_loop_full(
-                cons,
-                engine_cfg,
-                clob_dispatcher::PaperDispatcher::new(),
-                obs,
-            )
-        }
+        // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
+        // is the hyparb set member and the old name falls through to
+        // the "unknown --strategy" refusal below, on purpose.
         // XSD-S (2026-09-12): `cross-arb` has no arm any more — slot 2 is
         // vacant until `strategy-xsd` lands (XSD-3) and the name falls
         // through to the "unknown --strategy" refusal below, on purpose.
@@ -3635,7 +3860,7 @@ fn run(args: RunArgs) -> ExitCode {
         (name, _live) if STRATEGY_SET_NAMES.contains(&name) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // latency-arb from the mandatory pair flags, bin15 only
+            // hyparb only when `hyparb.toml` resolves (H5), bin15 only
             // when its artifact resolves, vrp only when
             // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
             // artifact resolves (slot 2 is vacant — XSD-S),
@@ -3828,11 +4053,119 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // HYPARB H5: slot 0's artifact. Coins resolve against the
+            // same descriptor table; pools against the universe's
+            // `[hyperevm]` list (the universe allocates their symbols).
+            let hyparb_boot = if cli::hyparb_boot::hyparb_wanted(requested) {
+                match cli::hyparb_boot::load_hyparb_boot(
+                    args.hyparb.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &boot.allocated.hyperevm,
+                    args.evm_testnet,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hyparb: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                if args.evm_testnet {
+                    error!("--evm-testnet without slot 0 in --strategy — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                None
+            };
+            // F19 / the icdp law: requested-but-absent REFUSES.
+            if cli::hyparb_boot::hyparb_wanted(requested) && hyparb_boot.is_none() {
+                error!(
+                    "hyparb: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hyparb.toml or --hyparb) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            if hyparb_boot.is_some() && !hyperevm_configured {
+                error!(
+                    "hyparb: the member needs the HyperEVM pool ingress — \
+                     --hyperevm-path and a non-empty universe.toml `[hyperevm] pools` \
+                     — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
                 obs.boot.regime_hash = rb.hash;
                 obs.boot.regime_configured = 1;
+            }
+            // HYPARB H8: the EVM write path, TESTNET ONLY (O-H5) — the
+            // shadow of each paper AMM decision (O-H12). The chain checks
+            // need the wire, so they run here. H9 R3: a misconfiguration
+            // or a VERIFIED interlock failure refuses the boot; an
+            // endpoint that cannot be reached (transport, rate limit) or
+            // an unfunded wallet 0 leaves the shadow DARK — nothing is
+            // sent, so an interlock that could not be verified is still
+            // not passed, and the paper member (the P&L source) runs.
+            match hyparb_boot
+                .as_ref()
+                .filter(|b| b.mode == core_config::hyparb::HyparbMode::Testnet)
+            {
+                Some(hb) => {
+                    let Some(t) = hb.testnet.as_ref() else {
+                        error!("hyparb: testnet mode without [testnet] — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    };
+                    let read_url = format!(
+                        "https://{}{}",
+                        cfg.hyperevm_ws_host,
+                        args.hyperevm_path.as_deref().unwrap_or("/")
+                    );
+                    let booted = cli::evm_testnet::wallet_keys_from_env(t.wallets)
+                        .map_err(cli::evm_testnet::ShadowBootErr::Refuse)
+                        .and_then(|k| {
+                            cli::evm_testnet::boot_shadow(
+                                t,
+                                &k.keys,
+                                k.source,
+                                hb.params.gas_p99_usd_1e6,
+                                &read_url,
+                                args.evm_hybrid,
+                                tls_config.clone(),
+                            )
+                        });
+                    match booted {
+                        Ok(b) => {
+                            warn!("{}", b.tell);
+                            obs.hyparb_shadow = Some(b.tap);
+                            handles.push(b.handle);
+                        }
+                        Err(cli::evm_testnet::ShadowBootErr::Dark(reason)) => {
+                            obs.hyparb_shadow_dark = true;
+                            error!(
+                                reason,
+                                "hyparb: the EVM write path is DARK — no testnet shadow swap \
+                                 will be sent this run; the paper member runs (fix the reason \
+                                 and restart to arm it)"
+                            );
+                        }
+                        Err(cli::evm_testnet::ShadowBootErr::Refuse(reason)) => {
+                            error!(reason, "hyparb: the EVM write path refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                None if args.evm_hybrid => {
+                    error!("--evm-hybrid without a testnet hyparb artifact — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+                None => {}
             }
             match exec_boot {
                 // NO `--exec`: the pre-E1 path, untouched. Same
@@ -3841,7 +4174,6 @@ fn run(args: RunArgs) -> ExitCode {
                     info!("running strategy-set PAPER — no orders will be submitted");
                     engine_loop_set_full(
                         cons,
-                        engine_cfg,
                         clob_dispatcher::PaperDispatcher::new(),
                         obs,
                         requested,
@@ -3850,6 +4182,7 @@ fn run(args: RunArgs) -> ExitCode {
                         bin15_boot.as_ref(),
                         icdp_params.as_ref(),
                         regime_boot.as_ref(),
+                        hyparb_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -3982,7 +4315,6 @@ fn run(args: RunArgs) -> ExitCode {
                         );
                         engine_loop_set_full(
                             cons,
-                            engine_cfg,
                             exec_dispatcher,
                             obs,
                             requested,
@@ -3991,6 +4323,7 @@ fn run(args: RunArgs) -> ExitCode {
                             bin15_boot.as_ref(),
                             icdp_params.as_ref(),
                             regime_boot.as_ref(),
+                            hyparb_boot.as_ref(),
                         )
                     } else {
                         // Nothing armed: the refusing stub, so a live
@@ -4026,7 +4359,6 @@ fn run(args: RunArgs) -> ExitCode {
                         // position it has never seen. (Both arms.)
                         engine_loop_set_full(
                             cons,
-                            engine_cfg,
                             exec_dispatcher,
                             obs,
                             requested,
@@ -4035,6 +4367,7 @@ fn run(args: RunArgs) -> ExitCode {
                             bin15_boot.as_ref(),
                             icdp_params.as_ref(),
                             regime_boot.as_ref(),
+                            hyparb_boot.as_ref(),
                         )
                     }
                 }
@@ -4124,10 +4457,6 @@ mod strategy_name_pin {
     //! passes the name, the process starts, capture runs, and only the
     //! mask gauge says the strategies never composed.
 
-    /// The one deliberate asymmetry: `latency-arb` is a mask name but
-    /// has its own `("latency-arb", false)` paper arm, never a set arm.
-    const EXEMPT: &[&str] = &["latency-arb"];
-
     /// Every bootable name must be a name the mask table can resolve —
     /// the arm body `expect`s exactly this.
     #[test]
@@ -4139,25 +4468,55 @@ mod strategy_name_pin {
                 strategy_set::mask_for_name(name).is_some(),
                 "{name} is bootable but mask_for_name does not know it"
             );
+            i += 1;
+        }
+    }
+
+    /// Every name the mask table accepts must be bootable. This is the
+    /// direction that failed on 2026-09-12. (HYPARB H0 retired the one
+    /// exemption, `latency-arb`, with its standalone arm — O-H1.)
+    #[test]
+    fn every_mask_name_is_bootable() {
+        let mut i = 0;
+        while i < strategy_set::MASK_TABLE.len() {
+            let (name, _mask) = strategy_set::MASK_TABLE[i];
             assert!(
-                !EXEMPT.contains(&name),
-                "{name} is exempt and must not also be bootable"
+                super::STRATEGY_SET_NAMES.contains(&name),
+                "mask_for_name accepts {name} but the boot arm refuses it"
             );
             i += 1;
         }
     }
 
-    /// Every name the mask table accepts must be bootable or exempt.
-    /// This is the direction that failed on 2026-09-12.
+    /// HYPARB H0 (O-H1): `latency-arb` is gone as a name — neither the
+    /// mask table nor the boot arm knows it, so the old wrapper line
+    /// refuses the boot instead of composing a different member — and
+    /// the three slot-0 names resolve to bit 0.
     #[test]
-    fn every_mask_name_is_bootable_or_exempt() {
+    fn latency_arb_is_refused_and_the_hyparb_names_resolve() {
+        assert_eq!(strategy_set::mask_for_name("latency-arb"), None);
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"latency-arb"));
+        let want = [
+            ("hyparb", strategy_set::BIT_HYPARB),
+            (
+                "ai+hyparb",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HYPARB,
+            ),
+            (
+                "ai+vrp+xsd+bin15+hyparb",
+                strategy_set::BIT_AI_EXEC
+                    | strategy_set::BIT_VM
+                    | strategy_set::BIT_VRP
+                    | strategy_set::BIT_XSD
+                    | strategy_set::BIT_BIN15
+                    | strategy_set::BIT_HYPARB,
+            ),
+        ];
         let mut i = 0;
-        while i < strategy_set::MASK_TABLE.len() {
-            let (name, _mask) = strategy_set::MASK_TABLE[i];
-            assert!(
-                super::STRATEGY_SET_NAMES.contains(&name) || EXEMPT.contains(&name),
-                "mask_for_name accepts {name} but the boot arm refuses it"
-            );
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
             i += 1;
         }
     }

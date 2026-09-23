@@ -70,6 +70,12 @@ pub enum VenueId {
     /// MX2: MEXC — spot protobuf WS + futures JSON WS (data-only,
     /// O-MX1: never tradeable, no exec arm).
     Mexc = 7,
+    /// HYPARB (O-H11): HyperEVM — concentrated-liquidity pools, read over
+    /// JSON-RPC WS (`ingress-hyperevm`). Carries no ticks: pool events
+    /// travel as `Signal`s (`SignalSource::HyperEvm`). Its orders are
+    /// AMM swaps judged by `core-fill` (paper) and, behind the O-H5/O-H12
+    /// interlock, sent to TESTNET only.
+    HyperEvm = 8,
 }
 
 impl VenueId {
@@ -92,6 +98,7 @@ impl VenueId {
             5 => Some(Self::Ai),
             6 => Some(Self::Bybit),
             7 => Some(Self::Mexc),
+            8 => Some(Self::HyperEvm),
             _ => None,
         }
     }
@@ -120,13 +127,18 @@ impl VenueId {
             // FeedClock judges feed DELAY, and a quiet book simply
             // pushes nothing.) Override: `--stale-after-ms mexc:<ms>`.
             Self::Mexc => 400,
+            // HZ part A (2026-09-23, the Mac): newHeads inter-arrival p99
+            // 2 281 ms — a pool state is not stale before the next block
+            // could have changed it; rounded up. Override:
+            // `--stale-after-ms hyperevm:<ms>`.
+            Self::HyperEvm => 2_500,
         }
     }
 
     /// VT2/VT4: the whole default threshold table indexed by the venue
     /// byte — the ONE table the engine flag parser and the harness
     /// `ModelParams` share.
-    pub const fn stale_after_ms_defaults() -> [u32; 8] {
+    pub const fn stale_after_ms_defaults() -> [u32; VENUE_COUNT] {
         [
             Self::Polymarket.default_stale_after_ms(),
             Self::Binance.default_stale_after_ms(),
@@ -136,9 +148,21 @@ impl VenueId {
             Self::Ai.default_stale_after_ms(),
             Self::Bybit.default_stale_after_ms(),
             Self::Mexc.default_stale_after_ms(),
+            Self::HyperEvm.default_stale_after_ms(),
         ]
     }
 }
+
+/// Number of [`VenueId`] values — the length of every table indexed by
+/// the venue byte (stale thresholds, the fill model's fee / Δ / activation
+/// columns, the matcher's activation table). HYPARB (O-H11) introduced it
+/// when HyperEVM took byte 8: the next venue is ONE edit here plus its
+/// arms, not a sweep of literal `8`s.
+pub const VENUE_COUNT: usize = 9;
+const _: () = assert!(
+    VenueId::from_u8(VENUE_COUNT as u8 - 1).is_some()
+        && VenueId::from_u8(VENUE_COUNT as u8).is_none()
+);
 
 /// Dense u32 identifier for a trading symbol, namespaced by venue:
 /// bits 31..24 = [`VenueId`] byte, bits 23..0 = per-venue ordinal
@@ -607,6 +631,9 @@ pub enum SignalSource {
     ClaudeWorker = 3,
     /// Internal heartbeat / liveness ticker.
     Heartbeat = 4,
+    /// HYPARB: HyperEVM pool events and snapshots (`ingress-hyperevm`);
+    /// the payload is `core_amm::payload`, `sym` the pool.
+    HyperEvm = 5,
 }
 
 /// A fill report coming back from the CLOB. Pushed onto the fill ring
@@ -3195,7 +3222,7 @@ pub const fn funding_period_s(venue: VenueId) -> u32 {
     match venue {
         VenueId::Binance | VenueId::Okx | VenueId::Bybit | VenueId::Mexc => 28_800,
         VenueId::Hyperliquid => 3_600,
-        VenueId::Polymarket | VenueId::Deribit | VenueId::Ai => 0,
+        VenueId::Polymarket | VenueId::Deribit | VenueId::Ai | VenueId::HyperEvm => 0,
     }
 }
 
@@ -3692,20 +3719,23 @@ mod tests {
             VenueId::Ai,
             VenueId::Bybit,
             VenueId::Mexc,
+            VenueId::HyperEvm,
         ];
+        assert_eq!(all.len(), VENUE_COUNT);
         let mut i = 0;
         while i < all.len() {
             assert_eq!(VenueId::from_u8(all[i].to_u8()), Some(all[i]));
             i += 1;
         }
         assert_eq!(VenueId::Mexc.to_u8(), 7);
+        assert_eq!(VenueId::HyperEvm.to_u8(), 8);
     }
 
     #[test]
     fn venue_id_rejects_unknown_bytes() {
-        // 6 became Bybit at WS9 and 7 MEXC at MX2 — the first
-        // unassigned byte is now 8.
-        assert_eq!(VenueId::from_u8(8), None);
+        // 6 became Bybit at WS9, 7 MEXC at MX2 and 8 HyperEvm at
+        // HYPARB — the first unassigned byte is now 9.
+        assert_eq!(VenueId::from_u8(9), None);
         assert_eq!(VenueId::from_u8(254), None);
         // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
         assert_eq!(VenueId::from_u8(255), None);
@@ -3910,12 +3940,14 @@ mod tests {
         assert_eq!(VenueId::Ai.default_stale_after_ms(), 0);
         // MX9: the measured feed-delay p99 (338 / 349 ms) rounded up.
         assert_eq!(VenueId::Mexc.default_stale_after_ms(), 400);
+        // HYPARB: HZ head inter-arrival p99 2 281 ms rounded up.
+        assert_eq!(VenueId::HyperEvm.default_stale_after_ms(), 2_500);
     }
 
     #[test]
     fn stale_after_ms_defaults_is_indexed_by_the_venue_byte() {
         let table = VenueId::stale_after_ms_defaults();
-        assert_eq!(table.len(), 8);
+        assert_eq!(table.len(), VENUE_COUNT);
         assert_eq!(table[VenueId::Mexc as usize], 400);
         let mut b = 0u8;
         while (b as usize) < table.len() {

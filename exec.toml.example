@@ -49,7 +49,7 @@
 #
 # THE SLOT MAP (must match `strategy-set`)
 # ----------------------------------------
-#   0  latency-arb      4  ai-exec
+#   0  hyparb           4  ai-exec
 #   1  vrp              5  vm
 #   2  xsd              6  icdp
 #   3  bin15            7  (reserved)

@@ -379,6 +379,43 @@ pub trait StrategyCounters {
         0
     }
 
+    /// HYPARB H4: the slot-0 member's observables (`engine_hyparb_*`),
+    /// mirrored by the cli's generic 5 s block like [`Self::bin15_counters`].
+    #[inline]
+    fn hyparb_counters(&self) -> HyparbCounters {
+        HyparbCounters::default()
+    }
+
+    /// HYPARB H4: copy the per-pool view into `out` (a caller-owned
+    /// slice, `min(out.len())` rows), returning how many pools are
+    /// CONFIGURED. Cold path; never allocates.
+    #[inline]
+    fn hyparb_pools_view(&self, out: &mut [HyparbPoolView]) -> u32 {
+        let _ = out;
+        0
+    }
+
+    /// HYPARB H6: copy the per-coin view into `out` (`min(out.len())`
+    /// rows), returning how many coins are CONFIGURED. Cold path.
+    #[inline]
+    fn hyparb_coins_view(&self, out: &mut [HyparbCoinView]) -> u32 {
+        let _ = out;
+        0
+    }
+
+    /// HYPARB H8/H9: the member's AMM decision log, BORROWED — a ring of
+    /// [`HYPARB_DECISION_LOG`] entries indexed by `seq %
+    /// HYPARB_DECISION_LOG` (an entry whose `seq` is not the one its slot
+    /// is read for was never written, or has been overwritten) — and the
+    /// newest `seq` (0 = none yet). The reader (the EVM shadow's tap, on
+    /// the engine thread) walks it in place and moves each new decision
+    /// straight into its own ring: no staging copy (H9). What the write
+    /// path shadows (O-H12). Never allocates.
+    #[inline]
+    fn hyparb_decision_log(&self) -> (&[HyparbDecision], u64) {
+        (&[], 0)
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -953,6 +990,195 @@ pub struct XsdCounters {
     /// Seed rows dropped (unknown sym, duplicate hour, older than the ring).
     pub seed_dropped: u64,
 }
+
+/// HYPARB H4 counters (`engine_hyparb_*`), mirrored by the cli's generic
+/// 5 s block. Defined HERE for the reason [`IcdpCounters`] is. Every
+/// `skipped_*` is a REASON (the bin15 law): which gate held a pool is the
+/// observation, and "no hedge book" and "the day cap is full" call for
+/// opposite actions.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbCounters {
+    /// Pool-event signals applied.
+    pub pool_events: u64,
+    /// Pool-event signals refused (undecodable, not a configured pool).
+    pub pool_refused: u64,
+    /// Tick maps loaded from a completed snapshot.
+    pub maps_loaded: u64,
+    /// Tick maps refused (a snapshot that does not load, a position the
+    /// map refuses) — the pool is stale until its next snapshot.
+    pub maps_refused: u64,
+    /// Pool evaluations run (the solve reached).
+    pub evaluations: u64,
+    /// Arb decisions: an AMM swap submitted.
+    pub arbs_submitted: u64,
+    /// Solves whose net edge was under `min_net_bps` (or not positive).
+    pub skipped_below_min: u64,
+    /// Held: the pool is not judgeable (never snapshotted, stale, edge).
+    pub skipped_not_live: u64,
+    /// Held: a hedge book is absent, stale or one-sided.
+    pub skipped_no_hedge: u64,
+    /// Held: the pool's previous swap is still in flight.
+    pub skipped_inflight: u64,
+    /// Held: the pool's cooldown.
+    pub skipped_cooldown: u64,
+    /// Held: the member is halted (inventory cap) or the day cap is full.
+    pub skipped_halted: u64,
+    /// Decisions whose size a cap cut (depth, order, pool, day).
+    pub size_capped: u64,
+    /// AMM-leg fills.
+    pub amm_fills: u64,
+    /// Hedge IoCs submitted after an AMM fill.
+    pub hedges_submitted: u64,
+    /// Hedge IoCs routed to the perp book.
+    pub hedges_perp: u64,
+    /// Hedge IoCs routed to the spot book.
+    pub hedges_spot: u64,
+    /// Hedge fills (any quantity).
+    pub hedge_fills: u64,
+    /// Hedge IoCs that reached their deadline unfilled — the latency
+    /// correction made visible (the book moved inside Δ).
+    pub hedges_missed: u64,
+    /// Inventory-flattening IoCs (the timer's TWAP of unhedged residue).
+    pub flattens_submitted: u64,
+    /// Times the unhedged-inventory cap was breached (the member halts).
+    pub inventory_breaches: u64,
+    /// Orders the context refused (ring full, unsupported, refused).
+    pub orders_dropped: u64,
+    /// Gas charged per ATTEMPT (every AMM swap submitted), USD × 1e6.
+    pub gas_charged_usd_1e6: i64,
+    /// Sum of the solver's predicted net P&L over submitted arbs, USD ×
+    /// 1e6 (after pool fee, hedge fees and gas) — the model's claim, for
+    /// the harness to hold it to.
+    pub pnl_predicted_usd_1e6: i64,
+    /// Sum of AMM-leg fill notional, USD × 1e6.
+    pub amm_notional_usd_1e6: i64,
+    /// HYPARB H6: arbs that BOUGHT token0 from the pool. With
+    /// [`Self::arbs_sell`] the side balance — a persistent skew in live
+    /// paper means basis control is off or wrong (plan §10 #2).
+    pub arbs_buy: u64,
+    /// HYPARB H6: arbs that SOLD token0 into the pool.
+    pub arbs_sell: u64,
+    /// HYPARB H6 LEVEL (not cumulative-monotonic): funding the perp
+    /// hedges have earned so far, USD × 1e6, signed (a short earns a
+    /// positive rate) — plan §10 #6.
+    pub funding_earned_usd_1e6: i64,
+    /// HYPARB H6 LEVEL: 1 while the inventory cap halts new arbs.
+    pub halted: u64,
+}
+
+/// HYPARB H4: one pool's row (`/state`, the dashboard).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbPoolView {
+    /// The pool's symbol.
+    pub sym: u32,
+    /// 1 when judgeable (snapshotted, not stale, not edge-bound).
+    pub live: u8,
+    /// 1 when the tick map is loaded and consistent.
+    pub map_ok: u8,
+    /// Last hedge venue chosen for token0 (0 perp, 1 spot, 255 none).
+    pub hedge_venue: u8,
+    _pad: u8,
+    /// Fee the member prices with, pips.
+    pub fee_pips: u32,
+    _pad2: u32,
+    /// Pool mid, token1 per token0 × 1e6 (0 = unknown).
+    pub mid_1e6: i64,
+    /// Basis EMA (pool vs hedge), bps × 1e6.
+    pub basis_bps_1e6: i64,
+    /// Arbs submitted on this pool.
+    pub arbs: u64,
+    /// HYPARB H6: the solver's predicted net P&L summed over this pool's
+    /// arbs, USD × 1e6 — where the edge concentrates (plan §10 #4).
+    pub pnl_predicted_usd_1e6: i64,
+}
+
+impl HyparbPoolView {
+    /// A row (the padding stays private and zero).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        sym: u32,
+        live: u8,
+        map_ok: u8,
+        hedge_venue: u8,
+        fee_pips: u32,
+        mid_1e6: i64,
+        basis_bps_1e6: i64,
+        arbs: u64,
+        pnl_predicted_usd_1e6: i64,
+    ) -> Self {
+        Self {
+            sym,
+            live,
+            map_ok,
+            hedge_venue,
+            _pad: 0,
+            fee_pips,
+            _pad2: 0,
+            mid_1e6,
+            basis_bps_1e6,
+            arbs,
+            pnl_predicted_usd_1e6,
+        }
+    }
+}
+
+/// HYPARB H6: one hedge coin's row — the books the selector reads and
+/// what the member holds (plan §10 #1 and #6).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbCoinView {
+    /// The perp's symbol (0 = none).
+    pub perp_sym: u32,
+    /// The spot pair's symbol (0 = none).
+    pub spot_sym: u32,
+    /// The perp's displayed touch, the thinner side, USD × 1e6.
+    pub perp_depth_usd_1e6: i64,
+    /// The spot pair's displayed touch, the thinner side, USD × 1e6.
+    pub spot_depth_usd_1e6: i64,
+    /// The selector's last total cost on the perp, bps × 1e6 (signed).
+    pub perp_cost_bps_1e6: i64,
+    /// The selector's last total cost on spot, bps × 1e6.
+    pub spot_cost_bps_1e6: i64,
+    /// Unhedged inventory, coin × 1e6, signed.
+    pub inventory_1e6: i64,
+    /// Net perp position the hedges built, coin × 1e6, signed.
+    pub perp_pos_1e6: i64,
+    /// The perp's hourly funding rate × 1e9.
+    pub funding_1e9: i64,
+}
+
+/// Decisions the HYPARB member remembers for
+/// [`StrategyCounters::hyparb_decision_log`].
+pub const HYPARB_DECISION_LOG: usize = 64;
+
+/// HYPARB H8: one AMM decision exactly as the member made it — the input
+/// the EVM write path shadows (O-H12: one testnet swap per paper
+/// decision, its G2 bid a fraction of THIS edge). Never persisted.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbDecision {
+    /// Per-member sequence, from 1.
+    pub seq: u64,
+    /// Decision time, ns.
+    pub ts_ns: u64,
+    /// The solver's net P&L (after the pool fee, both hedge fees and
+    /// p50 gas), USD × 1e6 — the edge a gas bid is a fraction of.
+    pub edge_usd_1e6: i64,
+    /// The AMM leg's token0 notional, USD × 1e6.
+    pub notional_usd_1e6: i64,
+    /// The gas coin's USD mid at the decision (0 = no gas coin priced).
+    pub gas_px_usd_1e6: i64,
+    /// The pool's symbol.
+    pub pool_sym: u32,
+    /// 1 = bought token0 from the pool, 0 = sold it.
+    pub buy: u8,
+    /// Padding.
+    pub _pad: [u8; 3],
+}
+const _: () = assert!(core::mem::size_of::<HyparbDecision>() == 48);
 
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
 /// block. Defined HERE for the reason [`IcdpCounters`] is.

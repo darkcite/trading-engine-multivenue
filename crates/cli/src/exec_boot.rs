@@ -98,17 +98,18 @@ pub const LIVE_ARM_VENUES: &[u8] = &[core_types::VenueId::Hyperliquid as u8];
 const _: () = assert!(core_config::exec::EXEC_SLOTS == EXEC_SLOTS);
 const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 
+/// Slots that may NEVER be armed live by this binary, whatever the two
+/// switches say (HYPARB H9). Slot 0 is `hyparb`: its AMM leg has no
+/// live arm (the only EVM write path is the TESTNET shadow, O-H5) while
+/// its hedge legs name Hyperliquid, which DOES — arming it would send
+/// real hedges against paper swaps: a one-legged arb that builds real
+/// inventory. The lane is paper-first (O-H8).
+pub const NEVER_LIVE_SLOTS: u8 = 1 << 0;
+
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
-    "latency-arb",
-    "vrp",
-    "xsd",
-    "bin15",
-    "ai-exec",
-    "vm",
-    "icdp",
-    "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
 ];
 
 /// A resolved execution configuration.
@@ -312,6 +313,16 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             ));
         }
 
+        if mode == ExecMode::Live && NEVER_LIVE_SLOTS & (1u8 << slot) != 0 {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live, and this binary never arms it: \
+                 its AMM leg has no live arm (HyperEVM writes are TESTNET-only, O-H5) while its \
+                 hedges would go to Hyperliquid for real — a one-legged arb. HYPARB is \
+                 paper-first (O-H8); its write path is `--evm-testnet`. Mark slot {slot} \
+                 \"paper\" or \"off\"."
+            ));
+        }
+
         // A live slot needs a compiled arm for EVERY venue it names.
         // Refuse loudly and name the phase that supplies it — never
         // boot inert, never downgrade to paper.
@@ -428,8 +439,8 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         }
         let vmask = boot.route.venue_mask_at(slot).unwrap_or(0);
         let mut venues = String::new();
-        for v in 0..8u8 {
-            if vmask & (1u8 << v) != 0 {
+        for v in 0..core_types::VENUE_COUNT as u8 {
+            if vmask & (1u16 << v) != 0 {
                 if !venues.is_empty() {
                     venues.push(',');
                 }
@@ -762,6 +773,28 @@ mod tests {
         assert!(e.contains("marked live as `rule-tree`"), "{e}");
         assert!(e.contains("slot 3 is `bin15`"), "{e}");
         assert!(e.contains("reassigned"), "{e}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// HYPARB H9: slot 0 is never armed live, even with both switches
+    /// agreeing and a venue that has an arm.
+    #[test]
+    fn slot_0_hyparb_is_never_armed_live() {
+        let d = tmp();
+        let hyparb = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.0]")
+            .replace("name = \"bin15\"", "name = \"hyparb\"");
+        let p = write(&d, "exec.toml", &hyparb);
+        let e = resolve(Some(&p), Some("0")).unwrap_err();
+        assert!(
+            e.contains("slot 0 (hyparb)") && e.contains("never arms it"),
+            "{e}"
+        );
+        assert!(e.contains("one-legged"), "{e}");
+        // Paper is fine.
+        let paper = hyparb.replace("mode = \"live\"", "mode = \"paper\"");
+        let p = write(&d, "exec-paper.toml", &paper);
+        assert!(!resolve(Some(&p), None).unwrap().unwrap().any_live());
         std::fs::remove_dir_all(&d).ok();
     }
 

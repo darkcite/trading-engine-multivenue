@@ -43,3 +43,10 @@ def test_mexc_namespaces_carry_one_class_each() -> None:
         assert f(f"mexc-perp:{name}") == "perp"
     assert f("mexc:") is None
     assert f("mexc-perp:") is None
+
+
+def test_hyperevm_pools_are_spot() -> None:
+    """HYPARB H3b: an AMM pool trades token0 against token1 outright."""
+    f = claude_worker.instrument_class.class_of_descriptor
+    assert f("hyperevm:0x6c9a33e3b592c0d65b3ba59355d5be0d38259285") == "spot"
+    assert f("hyperevm:") is None

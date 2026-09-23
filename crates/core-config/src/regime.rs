@@ -62,7 +62,7 @@ impl From<IcdpError> for RegimeConfigError {
 /// One `[labels.<member>]` override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelOverride {
-    /// The coded member's name (`latency_arb`, `vrp`, `xsd`, `rule_tree`,
+    /// The coded member's name (`hyparb`, `vrp`, `xsd`, `rule_tree`,
     /// `ai_exec`, `icdp`).
     pub member: String,
     /// The parsed label set.
@@ -147,14 +147,10 @@ const PROFILE_KEYS: [&str; 22] = [
 ///
 /// **XSD-S/XSD-3 (2026-09-12): `cross_arb` is GONE the same way and
 /// slot 2 is `xsd`.**
-const MEMBER_NAMES: [&str; 6] = [
-    "latency_arb",
-    "vrp",
-    "xsd",
-    "rule_tree",
-    "ai_exec",
-    "icdp",
-];
+///
+/// **HYPARB H0 (2026-09-23): `latency_arb` is GONE the same way and
+/// slot 0 is `hyparb`.**
+const MEMBER_NAMES: [&str; 6] = ["hyparb", "vrp", "xsd", "rule_tree", "ai_exec", "icdp"];
 
 type Kv = Vec<(String, Value, usize)>;
 
@@ -627,7 +623,7 @@ mod tests {
 
     fn with_labels() -> String {
         format!(
-            "{EXAMPLE}\n[labels.icdp]\noff = \"hard\"\nterm1 = [\"fast:shape:trend\", \"slow:trend:bull|neutral\"]\nterm2 = [\"fast:shape:trend\", \"slow:trend:bear\"]\n[labels.latency_arb]\noff = \"soft\"\nterm1 = [\"fast:vol:!high\"]\n"
+            "{EXAMPLE}\n[labels.icdp]\noff = \"hard\"\nterm1 = [\"fast:shape:trend\", \"slow:trend:bull|neutral\"]\nterm2 = [\"fast:shape:trend\", \"slow:trend:bear\"]\n[labels.hyparb]\noff = \"soft\"\nterm1 = [\"fast:vol:!high\"]\n"
         )
     }
 
@@ -719,6 +715,23 @@ mod tests {
         assert_eq!(ok.labels.len(), 1);
         assert_eq!(ok.labels[0].member, "xsd");
         let err = parse(&with("cross_arb")).expect_err("[labels.cross_arb] must be refused");
+        assert!(err.0.contains("unknown coded member"), "{}", err.0);
+    }
+
+    /// HYPARB H0 (2026-09-23): slot 0 is `hyparb` — `[labels.hyparb]`
+    /// parses and `[labels.latency_arb]` is refused at the grammar for
+    /// the same reason `[labels.ev]` is.
+    #[test]
+    fn slot_zero_is_labelled_hyparb_and_latency_arb_is_refused() {
+        let with = |member: &str| {
+            format!(
+                "{EXAMPLE}\n[labels.{member}]\noff = \"soft\"\nterm1 = [\"fast:shape:trend\"]\n"
+            )
+        };
+        let ok = parse(&with("hyparb")).expect("[labels.hyparb] must parse");
+        assert_eq!(ok.labels.len(), 1);
+        assert_eq!(ok.labels[0].member, "hyparb");
+        let err = parse(&with("latency_arb")).expect_err("[labels.latency_arb] must be refused");
         assert!(err.0.contains("unknown coded member"), "{}", err.0);
     }
 

@@ -40,7 +40,11 @@ pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
 pub mod capture_catalog;
+pub mod evm_shadow;
+pub mod evm_testnet;
 pub mod exec_boot;
+/// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
+pub mod hyparb_boot;
 pub mod options_manifest;
 pub mod paper;
 pub mod pinning;
@@ -54,23 +58,18 @@ pub mod xsd_boot;
 
 pub use paper::{
     bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
-    build_deribit_symbol_table,
-    build_hl_coin_table, build_hl_families, build_okx_symbol_table, drain_and_count_loop,
-    engine_loop,
-    engine_loop_ev_full, engine_loop_ev_paper, engine_loop_full, engine_loop_rule_tree_full,
-    engine_loop_set_full, engine_loop_with, extend_deribit_table_with_combos,
-    extend_deribit_table_with_options, extend_okx_table_with_options, join_reverse,
-    new_capture_run_dir, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
-    parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
-    spawn_binance_multi,
-    spawn_bybit, spawn_deribit, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket,
-    spawn_rpc,
-    split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec, BybitConnSpec,
-    MexcConnSpec,
-    CaptureGaugeIds, CaptureMetrics, Consumers, DrainCounters, EngineConfig, EngineCounters,
-    EngineLoopResult, EngineLoopStats, IngressCounterIds, IngressStatusSet, LatencyDump,
-    LiveDispatcher, LiveDispatcherErr, Observability, RawTapConfig, Rings, StrategyPair,
-    WssEndpoint, STRATEGY_SLOTS,
+    build_deribit_symbol_table, build_hl_coin_table, build_hl_families, build_okx_symbol_table,
+    drain_and_count_loop, engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full,
+    engine_loop_set_full, extend_deribit_table_with_combos, extend_deribit_table_with_options,
+    extend_okx_table_with_options, hyperevm_pool_table, join_reverse, new_capture_run_dir,
+    open_fills_capture, open_orders_capture, parse_ai_hmac_key, parse_raw_tap_flags,
+    parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance, spawn_binance_multi,
+    spawn_bybit, spawn_deribit, spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx,
+    spawn_polymarket, spawn_rpc, split_host_port, state_writer, AiIngressCounterIds,
+    AiIngressStatus, BinanceConnSpec, BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers,
+    DrainCounters, EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats,
+    IngressCounterIds, IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr,
+    MexcConnSpec, Observability, RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };
 pub use pinning::{pin_current_thread_to_core, PinError};
 pub use sigint::{install_sigint_handler, shutdown_requested, SHUTDOWN};

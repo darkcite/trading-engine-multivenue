@@ -38,6 +38,17 @@ signer-eip712      = { path = "../crates/signer-eip712" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
 # universe_toml: the M1 boot-universe config parser (core-config).
 core-config        = { path = "../crates/core-config" }
+# evm_rlp: the HYPARB H7 EIP-1559 renderer.
+signer-evm         = { path = "../crates/signer-evm" }
+# amm_tick_walk / amm_map_payload: the HYPARB H1 AMM walk + arb solve, the
+# O-H19 tick-map maintenance and the pool-event payload codec.
+core-amm           = { path = "../crates/core-amm" }
+# hyperevm_decode: the HYPARB H3 log/envelope decoders + pool snapshot machine.
+ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
+# amm_book: the HYPARB H2 AMM fill law (pool book + judge).
+core-fill          = { path = "../crates/core-fill" }
+# evm_exec_response: the HYPARB H7c write-path response scanners.
+exec-hyperevm      = { path = "../crates/exec-hyperevm" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -343,6 +354,48 @@ bench  = false
 [[bin]]
 name   = "mexc_instruments"
 path   = "fuzz_targets/mexc_instruments.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_tick_walk"
+path   = "fuzz_targets/amm_tick_walk.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_map_payload"
+path   = "fuzz_targets/amm_map_payload.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hyperevm_decode"
+path   = "fuzz_targets/hyperevm_decode.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "evm_rlp"
+path   = "fuzz_targets/evm_rlp.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_book"
+path   = "fuzz_targets/amm_book.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "evm_exec_response"
+path   = "fuzz_targets/evm_exec_response.rs"
 test   = false
 doc    = false
 bench  = false

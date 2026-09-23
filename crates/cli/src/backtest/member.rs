@@ -88,6 +88,10 @@ pub enum MemberKind {
     /// `bin15.toml`, the per-underlying forecast seeds from
     /// `bin15-seed-<COIN>[-1d].tsv` (BIN15 O4b).
     Bin15,
+    /// Slot 0, `crates/strategy-hyparb` — params from `hyparb.toml`, the
+    /// pools from the universe's `[hyperevm]` list, the pool events from
+    /// the capture's `hyperevm-signals.pmlr` (HYPARB H6).
+    Hyparb,
 }
 
 impl MemberKind {
@@ -98,6 +102,7 @@ impl MemberKind {
             "xsd" => Some(Self::Xsd),
             "vrp" => Some(Self::Vrp),
             "bin15" => Some(Self::Bin15),
+            "hyparb" => Some(Self::Hyparb),
             _ => None,
         }
     }
@@ -109,6 +114,7 @@ impl MemberKind {
             Self::Xsd => "xsd",
             Self::Vrp => "vrp",
             Self::Bin15 => "bin15",
+            Self::Hyparb => "hyparb",
         }
     }
 }
@@ -143,6 +149,11 @@ pub struct MemberSpec {
     /// forecast that had not been fitted yet comes to price it. Pass
     /// `--bin15-seed-dir ~/multivenue` to use the live cut deliberately.
     pub bin15_seed_dir: Option<PathBuf>,
+    /// hyparb only: `--hyparb-universe <path>` — the `universe.toml`
+    /// whose `[hyperevm] pools` list names the pools (default
+    /// `~/multivenue/universe.toml`). The list is append-only, so the
+    /// live file names every pool any older capture carries.
+    pub hyparb_universe: Option<PathBuf>,
 }
 
 /// Round-trip counter over synthesized fills, member-agnostic: a
@@ -266,6 +277,21 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
             RecPayload::Regime(_) => {
                 // v1: no regime replay for members (module docs).
                 fills_scratch.clear();
+            }
+            RecPayload::Signal(g) => {
+                // HYPARB H6 — the engine's order: the paper matcher
+                // observes (a HEAD judges the open swaps, their fills
+                // land in the scratch), then the member's `on_signal`.
+                let mut sig = *g;
+                sig.ts_ns = rec.wall_ns;
+                engine.on_amm_signal(
+                    sig.sym,
+                    &sig.payload,
+                    rec.virt_ns,
+                    rec.wall_ns,
+                    &mut fills_scratch,
+                );
+                strat.on_signal(&sig, ctx);
             }
         }
         while consumed < ctx.orders().len() {
@@ -531,6 +557,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
         &mut opt_out,
         &mut sym_class,
         &mut binary_underlying,
+        spec.kind == MemberKind::Hyparb,
     )?;
     let universe = derive_universe(&merged);
     let descriptors = manifest_descriptor_table(&runs);
@@ -593,6 +620,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     // empty for every other member.
     let mut bin15_ledger: Vec<Bin15LedgerRow> = Vec::new();
     let mut bin15_entries: Vec<Bin15EntryRow> = Vec::new();
+    // HYPARB H6: the gas ledger. The fill model has no gas lane, so the
+    // member's per-ATTEMPT charge is the ledger; the OOS share comes
+    // off the reported OOS net (0 for every other member).
+    let mut gas_oos_usd_1e6: i64 = 0;
     let (hash_hex, member_line, drive_out, member_counters): (String, String, DriveOutcome, String) =
         match spec.kind {
             MemberKind::Icdp => {
@@ -1102,36 +1133,148 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                      skipped_entry_price={} families_dormant={} \
                      fills={} unknown_fills={} ledger_rows={} orders_emitted={} \
                      regime=not-replayed(v1)",
-                    c.reprices,
-                    c.rolls,
-                    c.rolls_settled,
-                    c.spec_overrides,
-                    c.spec_refused,
-                    c.takes_submitted,
-                    c.takes_filled,
-                    c.takes_unfilled,
-                    c.quotes_submitted,
-                    c.quotes_filled,
-                    c.quotes_expired,
-                    c.closes_submitted,
-                    c.skipped_tau,
-                    c.skipped_tail,
-                    c.skipped_stale,
-                    c.skipped_mark_stale,
-                    c.skipped_book,
-                    c.skipped_inventory,
-                    c.skipped_cap,
-                    c.skipped_grid,
-                    c.skipped_entry_price,
-                    c.families_dormant,
-                    c.fills,
-                    c.unknown_fills,
-                    bin15_ledger.len(),
-                    out.orders_emitted,
-                );
-                (hash_hex, line, out, counters)
-            }
-        };
+                c.reprices,
+                c.rolls,
+                c.rolls_settled,
+                c.spec_overrides,
+                c.spec_refused,
+                c.takes_submitted,
+                c.takes_filled,
+                c.takes_unfilled,
+                c.quotes_submitted,
+                c.quotes_filled,
+                c.quotes_expired,
+                c.closes_submitted,
+                c.skipped_tau,
+                c.skipped_tail,
+                c.skipped_stale,
+                c.skipped_mark_stale,
+                c.skipped_book,
+                c.skipped_inventory,
+                c.skipped_cap,
+                c.skipped_grid,
+                c.skipped_entry_price,
+                c.families_dormant,
+                c.fills,
+                c.unknown_fills,
+                bin15_ledger.len(),
+                out.orders_emitted,
+            );
+            (hash_hex, line, out, counters)
+        }
+        MemberKind::Hyparb => {
+            // Pools resolve against the universe's `[hyperevm]` list
+            // (append-only: the live file names every pool an older
+            // capture carries), coins against the capture's newest
+            // manifest — the boot's own resolver, offline.
+            let upath: PathBuf = match &spec.hyparb_universe {
+                Some(p) => p.clone(),
+                None => PathBuf::from(
+                    core_config::universe::default_universe_path()
+                        .map_err(|e| HarnessError::Usage(e.to_string()))?,
+                ),
+            };
+            let uni = core_config::universe::load(&upath)
+                .and_then(|u| core_config::universe::allocate(&u))
+                .map_err(|e| HarnessError::Usage(format!("hyparb: {}: {e}", upath.display())))?;
+            let boot = crate::hyparb_boot::load_hyparb_boot(
+                Some(&spec.params),
+                &|d: &str| descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                &uni.hyperevm,
+                false,
+            )
+            .map_err(HarnessError::Usage)?
+            .ok_or_else(|| HarnessError::Usage("hyparb: artifact absent".to_owned()))?;
+            let hash_hex = hex_lower(&boot.hash);
+            let mut strat = Box::new(strategy_hyparb::HyparbStrategy::new());
+            strat
+                .configure(boot.params.clone(), WallAnchor::new(0, 0))
+                .map_err(|e| HarnessError::Usage(format!("hyparb: configure refused: {e}")))?;
+            strat
+                .on_start(&mut ctx)
+                .map_err(|e| HarnessError::Internal(format!("hyparb on_start failed: {e}")))?;
+            let pool_signals: u64 = run_summaries.iter().map(|r| r.pool_signals).sum();
+            let line = format!(
+                "member: hyparb params={} hash={} universe={} pools={} traded={} coins={} \
+                     pool_signals={} anchor=wall (identity)",
+                spec.params.display(),
+                hash_hex,
+                upath.display(),
+                boot.params.n_pools,
+                boot.traded,
+                boot.params.n_coins,
+                pool_signals,
+            );
+            // The gas charged BEFORE the first OOS record: the
+            // observer runs after each record, so the value it saw
+            // on the previous record is the IS total.
+            let mut gas_prev: i64 = 0;
+            let mut gas_is: Option<i64> = None;
+            let out = {
+                let mut observe = |rec: &MergedRec, st: &strategy_hyparb::HyparbStrategy| {
+                    if gas_is.is_none() && rec.virt_ns >= boundary_virt {
+                        gas_is = Some(gas_prev);
+                    }
+                    gas_prev = st.counters().gas_charged_usd_1e6;
+                };
+                drive_with(
+                    &mut *strat,
+                    &mut ctx,
+                    &mut engine,
+                    &merged,
+                    boundary_virt,
+                    &mut observe,
+                )
+            };
+            let c = strat.counters();
+            gas_oos_usd_1e6 = c.gas_charged_usd_1e6 - gas_is.unwrap_or(c.gas_charged_usd_1e6);
+            let amm = engine.amm_replay();
+            let counters = format!(
+                "member: hyparb pool_events={} pool_refused={} maps_loaded={} maps_refused={} \
+                     evaluations={} arbs={} side_buy={} side_sell={} skipped_below_min={} \
+                     skipped_not_live={} skipped_no_hedge={} skipped_inflight={} \
+                     skipped_cooldown={} skipped_halted={} size_capped={} amm_fills={} \
+                     hedges={} hedges_perp={} hedges_spot={} hedge_fills={} hedges_missed={} \
+                     flattens={} inventory_breaches={} amm_judged_fills={} amm_canceled={} \
+                     amm_partial={} amm_not_live={} gas_usd={} gas_oos_usd={} \
+                     pnl_predicted_usd={} funding_earned_usd={} orders_emitted={} \
+                     regime=not-replayed(v1)",
+                c.pool_events,
+                c.pool_refused,
+                c.maps_loaded,
+                c.maps_refused,
+                c.evaluations,
+                c.arbs_submitted,
+                c.arbs_buy,
+                c.arbs_sell,
+                c.skipped_below_min,
+                c.skipped_not_live,
+                c.skipped_no_hedge,
+                c.skipped_inflight,
+                c.skipped_cooldown,
+                c.skipped_halted,
+                c.size_capped,
+                c.amm_fills,
+                c.hedges_submitted,
+                c.hedges_perp,
+                c.hedges_spot,
+                c.hedge_fills,
+                c.hedges_missed,
+                c.flattens_submitted,
+                c.inventory_breaches,
+                amm.fills,
+                amm.canceled,
+                amm.partial,
+                amm.not_live,
+                super::fmt_usd_1e6(c.gas_charged_usd_1e6),
+                super::fmt_usd_1e6(gas_oos_usd_1e6),
+                super::fmt_usd_1e6(c.pnl_predicted_usd_1e6),
+                super::fmt_usd_1e6(c.funding_earned_usd_1e6),
+                out.orders_emitted,
+            );
+            (hash_hex, line, out, counters)
+        }
+    };
     let outcome: ModelOutcome = engine.finish();
     // BIN15 P4a + P5 (F3, F7): the post-run binary numbers, on the same
     // stderr the pre-run census already went to.
@@ -1143,7 +1286,8 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     let oos_round_trips = drive_out.round_trips - drive_out.rt_at_boundary;
 
     let vals = ReportValues {
-        oos_net_pnl_1e6: usd_1e12_to_1e6_floor(outcome.oos_net_1e12),
+        // HYPARB H6: after the OOS gas ledger (0 for every other member).
+        oos_net_pnl_1e6: usd_1e12_to_1e6_floor(outcome.oos_net_1e12) - gas_oos_usd_1e6,
         oos_trades: outcome.oos_trades,
         oos_trading_days: outcome.oos_trading_days,
         oos_max_drawdown_1e6: usd_1e12_to_1e6_ceil(outcome.oos_max_dd_1e12),

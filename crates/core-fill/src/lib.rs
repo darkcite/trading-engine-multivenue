@@ -49,10 +49,19 @@
 //! * **The activation table is a MEASUREMENT** ([`ACTIVATION_NS_DEFAULT`]),
 //!   not an assumption, and it is per deployment and per location.
 //! * This crate knows nothing about fees, marks, P&L or settlement.
-//!   Those are the harness's ledger and stay there.
+//!   Those are the harness's ledger and stay there. (The one exception
+//!   is the AMM pool fee, which is part of a swap's execution PRICE on
+//!   chain and so rides in the fill price — module [`amm`].)
+//! * **AMM swaps (HYPARB H2)** are judged against pool state rebuilt
+//!   from the pool-event tape, by [`AmmBook`] — module [`amm`] states
+//!   that law.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+
+pub mod amm;
+
+pub use amm::{amm_pool_index, AmmBook, AmmBookCounters, AmmObs, AmmVerdict, AMM_MAX_POOLS};
 
 use core_types::{Side, Tick};
 
@@ -61,6 +70,9 @@ pub const ORDER_KIND_MAKER: u8 = 0;
 /// `Order.kind` of an immediate-or-cancel taker (I1; ICDP's, XSD's and
 /// the VRP member's primitive).
 pub const ORDER_KIND_IOC: u8 = 1;
+/// `Order.kind` of an AMM swap against a pool (HYPARB H2): judged once
+/// against pool state, never rests — the law is module [`amm`]'s.
+pub const ORDER_KIND_AMM_SWAP: u8 = 2;
 
 /// Open orders one sym may hold at once.
 pub const MAX_OPEN_PER_SYM: usize = 8;
@@ -86,12 +98,15 @@ const MS: u64 = 1_000_000;
 /// `aggre.bookTicker` 82 + 131/2 → 150 ms, futures `depth.full`
 /// 60 + 134/2 → 130 ms; one venue byte carries both classes, so the
 /// slower one binds (150). MEXC is data-only (O-MX1) — no fill model
-/// ever executes an order on it.
+/// ever executes an order on it. Index 8 is HyperEVM (HYPARB, plan
+/// §6.3): **one block, not a network RTT** — a swap cannot land before
+/// the next block however fast the wire is (0.983 s measured, rounded
+/// up); modelling it as an RTT is the easiest way to invent edge.
 ///
 /// **RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.** One table, both
 /// consumers — the harness's `ModelParams::default()` reads it from
 /// here so a re-measurement cannot land in one and not the other.
-pub const ACTIVATION_NS_DEFAULT: [u64; 8] = [
+pub const ACTIVATION_NS_DEFAULT: [u64; core_types::VENUE_COUNT] = [
     200 * MS, // pm
     130 * MS, // bn
     130 * MS, // okx
@@ -100,6 +115,7 @@ pub const ACTIVATION_NS_DEFAULT: [u64; 8] = [
     0,        // ai (dead)
     60 * MS,  // bybit
     150 * MS, // mexc (spot binds; futures 130)
+    1_000 * MS, // hyperevm — ONE BLOCK (0.983 s measured, rounded up)
 ];
 
 /// The two sides of a book at one instant, ×1e6.
@@ -497,11 +513,30 @@ mod tests {
         // can never drift apart.
         assert_eq!(
             ACTIVATION_NS_DEFAULT,
-            [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS, 150 * MS]
+            [
+                200 * MS,
+                130 * MS,
+                130 * MS,
+                220 * MS,
+                340 * MS,
+                0,
+                60 * MS,
+                150 * MS,
+                1_000 * MS
+            ]
         );
-        assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Ai as usize], 0, "a dead slot");
+        assert_eq!(
+            ACTIVATION_NS_DEFAULT[VenueId::Ai as usize],
+            0,
+            "a dead slot"
+        );
         // MX9: MEXC measured on the Mac 2026-09-23 — the slower class
         // (spot 150) binds over futures (130).
         assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Mexc as usize], 150 * MS);
+        // HYPARB: one block, never an RTT.
+        assert_eq!(
+            ACTIVATION_NS_DEFAULT[VenueId::HyperEvm as usize],
+            1_000 * MS
+        );
     }
 }

@@ -104,6 +104,103 @@ pub const MEXC_PERP_ORDINAL_BASE: u32 = 512;
 /// ≤ 10 futures sockets.
 pub const MEXC_LIST_MAX: usize = 128;
 
+/// HYPARB H3b: cap on `[hyperevm] pools` — the HyperEVM ingress's pool
+/// table (`ingress_hyperevm::HYPEREVM_MAX_POOLS`) and the AMM book
+/// (`core_fill::AMM_MAX_POOLS`); the cli const-asserts all three agree.
+pub const HYPEREVM_POOLS_MAX: usize = 128;
+
+/// HYPARB H3b: largest token `decimals()` a pool entry may carry —
+/// `core_amm::payload::MAX_TOKEN_DECIMALS` (10^36 fits `u128`).
+pub const HYPEREVM_DECIMALS_MAX: u8 = 36;
+
+/// HYPARB H3b: a HyperEVM pool's contract family — decides its
+/// discovery reads, its log decoders and its swap loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HyperEvmFamily {
+    /// Uniswap V3 ABI (`v3`) — Hyperswap V3 included: the same reads,
+    /// events and word counts; only its swap callback is renamed (the
+    /// executor answers it, H9d).
+    V3 = 0,
+    /// Aerodrome Slipstream fork (`slipstream`).
+    Slipstream = 1,
+    /// Algebra Integral v1.0 / v1.2 (`algebra`).
+    Algebra = 2,
+}
+
+/// HYPARB H3b: one `[hyperevm] pools` entry,
+/// `"0x<40 lowercase hex>:<v3|slipstream|algebra>:<dec0>:<dec1>"`.
+///
+/// The decimals are the operator's claim; the ingress checks them
+/// against `decimals()` on chain before a pool's first snapshot, so a
+/// typo is a refused pool, never a price off by 10^12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HyperEvmPool {
+    /// Pool contract address.
+    pub address: [u8; 20],
+    /// Contract family.
+    pub family: HyperEvmFamily,
+    /// token0 decimals.
+    pub dec0: u8,
+    /// token1 decimals.
+    pub dec1: u8,
+}
+
+/// Parse one `[hyperevm] pools` entry (grammar on [`HyperEvmPool`]).
+/// `None` for anything else — including UPPERCASE hex: the address is
+/// the pool's identity (and its descriptor), so it has one spelling.
+#[must_use]
+pub fn parse_hyperevm_pool(s: &str) -> Option<HyperEvmPool> {
+    let mut parts = s.split(':');
+    let addr = parts.next()?;
+    let fam = parts.next()?;
+    let d0 = parts.next()?;
+    let d1 = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let hex = addr.strip_prefix("0x")?;
+    let hb = hex.as_bytes();
+    if hb.len() != 40 {
+        return None;
+    }
+    let mut address = [0u8; 20];
+    let mut i = 0usize;
+    while i < 20 {
+        let hi = lower_hex_nibble(hb[2 * i])?;
+        let lo = lower_hex_nibble(hb[2 * i + 1])?;
+        address[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    let family = match fam {
+        "v3" => HyperEvmFamily::V3,
+        "slipstream" => HyperEvmFamily::Slipstream,
+        "algebra" => HyperEvmFamily::Algebra,
+        _ => return None,
+    };
+    let dec = |t: &str| -> Option<u8> {
+        if t.is_empty() || t.len() > 2 || !t.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let v: u8 = t.parse().ok()?;
+        (v <= HYPEREVM_DECIMALS_MAX).then_some(v)
+    };
+    Some(HyperEvmPool {
+        address,
+        family,
+        dec0: dec(d0)?,
+        dec1: dec(d1)?,
+    })
+}
+
+const fn lower_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
+}
+
 /// Default E — nearest expiries per options underlying (mvp-plan §8
 /// proposal, adopted in the M2 design entry).
 pub const OPT_EXPIRIES_DEFAULT: u32 = 2;
@@ -335,6 +432,9 @@ pub struct Universe {
     /// rows) in file order (own ordinal block,
     /// [`MEXC_PERP_ORDINAL_BASE`]).
     pub mexc_perp: Vec<String>,
+    /// HYPARB H3b: `[hyperevm] pools` — pool entries in file order
+    /// (grammar on [`HyperEvmPool`]); ordinal `i + 1` of venue byte 8.
+    pub hyperevm_pools: Vec<String>,
     /// `[pairs] map` — latency-arb pairs as
     /// `(pm market index, binance spot index)`, both 0-based file
     /// order. Empty = the default pair (0,0) is injected at
@@ -404,6 +504,12 @@ pub struct AllocatedUniverse {
     /// MX2/MX5: MEXC perp instruments (`mexc-perp:<SYM>` — MEXC lists
     /// no dated futures, so this prefix is always `Perp`).
     pub mexc_perp: Vec<Instrument>,
+    /// HYPARB H3b: HyperEVM pools (`hyperevm:0x<address>` descriptors,
+    /// `Spot` class), file order.
+    pub hyperevm: Vec<Instrument>,
+    /// HYPARB H3b: the parsed pool entries, index-parallel to
+    /// [`Self::hyperevm`].
+    pub hyperevm_pools: Vec<HyperEvmPool>,
     /// Latency-arb pairs as `(pm YES-token sym, bn spot sym)`.
     pub pairs: Vec<(SymbolId, SymbolId)>,
 }
@@ -441,6 +547,7 @@ enum Section {
     Hyperliquid,
     Bybit,
     Mexc,
+    HyperEvm,
     Pairs,
 }
 
@@ -471,6 +578,7 @@ enum Slot {
     BybitLinear,
     MexcSpot,
     MexcPerp,
+    HyperEvmPools,
     PairsMap,
 }
 
@@ -489,6 +597,8 @@ enum ElemKind {
     /// MX2/MX5: MEXC contract symbols (`BTC_USDT` — uppercase
     /// [A-Z0-9_], at least one `_`).
     MexcPerpSymbol,
+    /// HYPARB H3b: `"0x<addr>:<family>:<dec0>:<dec1>"`.
+    HyperEvmPool,
     Instrument,
     HlCoin,
     /// BIN15 O2: a rolling-family key, `<out|native>:<COIN>:<15m|1d>`.
@@ -534,6 +644,7 @@ struct Builder {
     bybit_linear: Option<Vec<String>>,
     mexc_spot: Option<Vec<String>>,
     mexc_perp: Option<Vec<String>>,
+    hyperevm_pools: Option<Vec<String>>,
     pairs_map: Option<Vec<String>>,
 }
 
@@ -576,6 +687,7 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 "hyperliquid" => Section::Hyperliquid,
                 "bybit" => Section::Bybit,
                 "mexc" => Section::Mexc,
+                "hyperevm" => Section::HyperEvm,
                 "pairs" => Section::Pairs,
                 other => {
                     return Err(err(line_no, format!("unknown section `[{other}]`")));
@@ -697,6 +809,7 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Bybit, "linear") => Some(Slot::BybitLinear),
         (Section::Mexc, "spot") => Some(Slot::MexcSpot),
         (Section::Mexc, "perp") => Some(Slot::MexcPerp),
+        (Section::HyperEvm, "pools") => Some(Slot::HyperEvmPools),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
         _ => None,
     }
@@ -717,6 +830,7 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::BybitSpot | Slot::BybitLinear => ElemKind::BybitSymbol,
         Slot::MexcSpot => ElemKind::MexcSpotSymbol,
         Slot::MexcPerp => ElemKind::MexcPerpSymbol,
+        Slot::HyperEvmPools => ElemKind::HyperEvmPool,
         Slot::OkxInstr | Slot::DeribitInstr | Slot::DeribitCombos => ElemKind::Instrument,
         Slot::HlCoins => ElemKind::HlCoin,
         Slot::HlRolling => ElemKind::HlRolling,
@@ -839,6 +953,19 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::BybitSymbol => validate_bybit_symbol(s, line_no),
         ElemKind::MexcSpotSymbol => validate_mexc_spot_symbol(s, line_no),
         ElemKind::MexcPerpSymbol => validate_mexc_perp_symbol(s, line_no),
+        ElemKind::HyperEvmPool => {
+            if parse_hyperevm_pool(s).is_some() {
+                Ok(())
+            } else {
+                Err(err(
+                    line_no,
+                    format!(
+                        "bad HyperEVM pool `{s}` (want \"0x<40 lowercase hex>:\
+                         <v3|slipstream|algebra>:<dec0>:<dec1>\", decimals 0..={HYPEREVM_DECIMALS_MAX})"
+                    ),
+                ))
+            }
+        }
         ElemKind::Instrument => validate_name(s, INSTRUMENT_LEN_MAX, "instrument", line_no),
         ElemKind::HlCoin => validate_name(s, HL_COIN_LEN_MAX, "coin", line_no),
         ElemKind::HlRolling => validate_hl_rolling(s, line_no),
@@ -1158,6 +1285,11 @@ fn store_array(
                 return Err(dup("perp"));
             }
         }
+        Slot::HyperEvmPools => {
+            if b.hyperevm_pools.replace(items).is_some() {
+                return Err(dup("pools"));
+            }
+        }
         Slot::PairsMap => {
             if b.pairs_map.replace(items).is_some() {
                 return Err(dup("map"));
@@ -1298,6 +1430,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let bybit_linear = b.bybit_linear.unwrap_or_default();
     let mexc_spot = b.mexc_spot.unwrap_or_default();
     let mexc_perp = b.mexc_perp.unwrap_or_default();
+    let hyperevm_pools = b.hyperevm_pools.unwrap_or_default();
 
     // Caps.
     check_cap(pm_markets.len(), PM_MARKETS_MAX, "PM markets")?;
@@ -1329,6 +1462,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // measured 30-sub cap, futures ~13/socket — plan §4 D1).
     check_cap(mexc_spot.len(), MEXC_LIST_MAX, "MEXC spot symbols")?;
     check_cap(mexc_perp.len(), MEXC_LIST_MAX, "MEXC perp symbols")?;
+    check_cap(hyperevm_pools.len(), HYPEREVM_POOLS_MAX, "HyperEVM pools")?;
 
     // Within-list duplicates (a duplicate = double subscribe + two
     // ids for one stream — always a config mistake).
@@ -1365,6 +1499,13 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&bybit_linear, "Bybit linear symbol")?;
     check_unique(&mexc_spot, "MEXC spot symbol")?;
     check_unique(&mexc_perp, "MEXC perp symbol")?;
+    // HYPARB H3b: one pool, one entry — keyed on the ADDRESS, so the
+    // same pool listed twice with different decimals is still refused.
+    let pool_addrs: Vec<String> = hyperevm_pools
+        .iter()
+        .map(|p| p.split(':').next().unwrap_or_default().to_owned())
+        .collect();
+    check_unique(&pool_addrs, "HyperEVM pool address")?;
     // MX2: `spot` and `perp` cannot overlap BY ALPHABET — spot rejects
     // `_`, perp requires one — so no cross-list check is needed.
     // WS5 note: `usdm` and `usdm_dated` cannot overlap BY ALPHABET —
@@ -1439,6 +1580,7 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         bybit_linear,
         mexc_spot,
         mexc_perp,
+        hyperevm_pools,
         pairs,
     })
 }
@@ -1684,6 +1826,22 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // HYPARB H3b: HyperEVM pools — ordinal i + 1 of venue byte 8, the
+    // pool's book slot (`core_fill::amm_pool_index`). Append, never
+    // reorder: a reordered list re-keys every pool on the tape.
+    for i in 0..u.hyperevm_pools.len() {
+        let entry = &u.hyperevm_pools[i];
+        let Some(pool) = parse_hyperevm_pool(entry) else {
+            return Err(err(0, format!("bad HyperEVM pool `{entry}`")));
+        };
+        let name = entry.split(':').next().unwrap_or_default().to_owned();
+        out.hyperevm.push(Instrument {
+            sym: make_symbol_id(VenueId::HyperEvm, i as u32 + 1),
+            descriptor: format!("hyperevm:{name}"),
+            name,
+        });
+        out.hyperevm_pools.push(pool);
+    }
 
     // Universe-wide duplicate-id check (fail fast, name both sides).
     let mut all: Vec<(SymbolId, &str)> = Vec::new();
@@ -1702,6 +1860,7 @@ pub fn allocate_with_anchors(
         &out.bybit_linear,
         &out.mexc_spot,
         &out.mexc_perp,
+        &out.hyperevm,
     ] {
         for inst in group {
             all.push((inst.sym, inst.descriptor.as_str()));
@@ -1984,6 +2143,56 @@ map = ["0:0", "1:1"]
         // Unknown key law holds for the new section.
         let unk = "[bybit]\nusdm=[\"BTCUSDT\"]\n";
         assert!(parse(unk).unwrap_err().msg.contains("unknown key"));
+    }
+
+    #[test]
+    fn hyperevm_section_parses_allocates_and_validates() {
+        // HYPARB H3b: pools are ordinals of venue byte 8 in file order;
+        // the address is the descriptor and the identity.
+        const A: &str = "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285";
+        const B: &str = "0x3e8b6fcdbc5f23b1b35a8c6b6ab0c5f8f2d1e4a7";
+        let src = format!("[hyperevm]\npools=[\"{A}:v3:18:6\",\"{B}:algebra:6:18\"]\n");
+        let u = parse(&src).unwrap();
+        assert_eq!(u.hyperevm_pools.len(), 2);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.hyperevm[0].sym, make_symbol_id(VenueId::HyperEvm, 1));
+        assert_eq!(a.hyperevm[0].descriptor, format!("hyperevm:{A}"));
+        assert_eq!(a.hyperevm[1].sym, make_symbol_id(VenueId::HyperEvm, 2));
+        assert_eq!(a.hyperevm_pools[0].family, HyperEvmFamily::V3);
+        assert_eq!(
+            (a.hyperevm_pools[0].dec0, a.hyperevm_pools[0].dec1),
+            (18, 6)
+        );
+        assert_eq!(a.hyperevm_pools[1].family, HyperEvmFamily::Algebra);
+        assert_eq!(a.hyperevm_pools[0].address[0], 0x6c);
+        assert_eq!(a.hyperevm_pools[0].address[19], 0x85);
+        // The same pool twice — even with other decimals — is refused.
+        let dup = format!("[hyperevm]\npools=[\"{A}:v3:18:6\",\"{A}:v3:6:6\"]\n");
+        assert!(parse(&dup)
+            .unwrap_err()
+            .msg
+            .contains("HyperEVM pool address"));
+        // One spelling: uppercase hex, a short address, an unknown family,
+        // decimals past 36, a missing field — each refused at the grammar.
+        for bad in [
+            "0x6C9A33E3B592C0D65B3BA59355D5BE0D38259285:v3:18:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d3825928:v3:18:6",
+            "6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v2:18:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:37:6",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18",
+            "0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18:6:1",
+        ] {
+            let src = format!("[hyperevm]\npools=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("bad HyperEVM pool"),
+                "{bad}"
+            );
+        }
+        assert!(parse("[hyperevm]\ncoins=[\"x\"]\n")
+            .unwrap_err()
+            .msg
+            .contains("unknown key"));
     }
 
     #[test]

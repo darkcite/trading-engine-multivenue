@@ -6,6 +6,403 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the HYPARB executor's bytecode: `hyperswapV3SwapCallback` (HYPARB H9d)
+
+**What changed**
+
+- `contracts/hyparb-executor/HyparbExecutor.{bin,runtime.bin}` are
+  regenerated: the contract answers `hyperswapV3SwapCallback` (Hyperswap
+  V3 pools) besides `uniswapV3SwapCallback` and `algebraSwapCallback`.
+  Creation bytecode 2,335 → 2,346 B; `evm-testnet deploy` sends the new
+  bytes (the binary embeds them).
+
+**Impact**
+
+- An executor deployed from the H7b bytes reverts every swap against a
+  Hyperswap V3 pool (the testnet battery pool is one). Paper is
+  unaffected; nothing on mainnet was ever deployed.
+
+**Migration steps**
+
+1. `evm-testnet deploy` from a binary built at or after H9d, then set
+   `[testnet] executor` to the new address and `mint` its inventory.
+   The old executor keeps its minted testnet tokens (there is no sweep
+   verb; the contract's owner-only `sweep` would move them).
+
+**Rollback**
+
+- Revert the H9d commit (the deployed contract stays where it is; point
+  `[testnet] executor` back at the old address).
+
+## 2026-09-23 — `engine_hyparb_evm_no_wallet_total` → `_superseded_total`, `engine_hyparb_evm_dark`; the shadow boots DARK instead of refusing; slot 0 can never be armed live (HYPARB H9)
+
+**What changed**
+
+- **Metric renamed:** `engine_hyparb_evm_no_wallet_total` is now
+  `engine_hyparb_evm_superseded_total` — decisions replaced by a newer
+  one while the shadow's single swap was in flight (wallet 0 only; the
+  executor accepts its owner alone). Same position in the family; the
+  series never left a testnet boot.
+- **Boot:** in `mode = "testnet"`, an unreachable endpoint (transport,
+  DNS, a non-200 such as a rate limit) or an unfunded wallet 0 no longer
+  aborts the engine — the shadow stays DARK (ERROR log, nothing sent) and
+  the paper member runs. A verified wrong chain, a 999 read without
+  `--evm-hybrid`, a bad key/URL, or an executor wallet 0 does not own
+  (boot reads `owner()`) still refuses.
+- **`exec.toml`:** a live slot 0 (`hyparb`) refuses the boot
+  (`exec_boot::NEVER_LIVE_SLOTS`).
+- **`evm-testnet battery`:** (b) and (c2) are self-transfers from
+  wallets 0..2; a new line (0) prints the executor-owner check.
+- **`scripts/copy-audit.sh`** also audits `ingress-hyperevm`,
+  `core-amm` and `strategy-hyparb` by default; the baseline lost one
+  paid entry (`http1.rs`'s `copy_within`, now marked).
+- `.env.example` documents `HYPEREVM_TESTNET_KEY` (and that the E3
+  gate's testnet agent key is its fallback).
+- **New gauge `engine_hyparb_evm_dark`** (registered unconditionally,
+  0 on every paper boot): 1 when `mode = "testnet"` booted with the
+  shadow dark. The family is 18 counters + 5 gauges.
+- **Internal API:** `StrategyCounters::hyparb_decisions(after, out)` is
+  replaced by `hyparb_decision_log() -> (&[HyparbDecision], u64)` (the
+  log borrowed in place); the shadow's steady state moved to
+  `cli::evm_shadow` (`cli::evm_testnet` re-exports it).
+
+**Impact**
+
+- `/metrics`: one series renamed and one gauge added (0 on paper
+  boots). No wire format, capture or state file changed.
+
+**Migration steps**
+
+1. None. A dashboard or alert keyed on `_no_wallet_total` (none exists)
+   would move to `_superseded_total`.
+
+**Rollback**
+
+- Revert the H9 commit.
+
+## 2026-09-23 — the EVM write path linked: `[testnet]`, `--evm-hybrid`, `evm-testnet`, `engine_hyparb_evm_*` (HYPARB H8)
+
+**What changed**
+
+- **`hyparb.toml` gains `[testnet]`** (at most once): `endpoint`
+  (https, chain 998), `wallets` (1..=8), and the OPTIONAL targets
+  `executor`, `pool`, `amount_raw`. Optional in `mode = "paper"`;
+  `mode = "testnet"` now requires it with every target set and a
+  `[[coin]]` named `"HYPE"` (the gas coin). `mode = "testnet"` +
+  `--evm-testnet` no longer refuses as "not linked".
+- **`run --evm-hybrid`** (O-H12, requires `--evm-testnet`): the pool
+  ingress may read chain 999 while the write path writes chain 998. At
+  boot the engine asks the READ endpoint (`https://$HYPEREVM_WS_HOST` +
+  `--hyperevm-path`) and the WRITE endpoint for `eth_chainId`; anything
+  but same-chain, or exactly 999 → 998 with the switch, refuses the
+  boot. The ARMED tell is logged at WARN.
+- **Testnet mode shadows every paper AMM decision** with one swap on the
+  `[testnet] pool` through the executor (thread `evm-shadow`); the paper
+  book stays the P&L source.
+- **Keys:** `HYPEREVM_TESTNET_KEY` in the operator's `.env`, else — by
+  the 2026-09-23 ruling — `HYPERLIQUID_TESTNET_AGENT_KEY`. Wallets 1..
+  are derived from it; `evm-testnet fund` funds them from wallet 0.
+- **`multivenue-engine evm-testnet status|fund|deploy|mint|battery|shadow-smoke`**
+  and `scripts/evm-testnet.sh` (sources the `.env` like
+  `exec-smoke.sh`). Chain 998 only.
+- **Metrics, registered unconditionally:** `engine_hyparb_evm_*` — 18
+  counters (decisions, lost, dropped, no_wallet, bid_refused, sends,
+  accepted, maybe_sent, refused_{fee,rate,nonce,funds,other}, not_sent,
+  mined_ok, mined_reverted, timeouts, syncs) and 4 gauges
+  (wallets_ready, halted, gas_paid_gwei, last_block). Zero on every
+  paper boot.
+- **Wrapper:** `EVM_HYBRID=1` adds `--evm-hybrid` on top of
+  `HYPARB_TOML` + `EVM_TESTNET=1`; alone it refuses (exit 78). The live
+  `ai+vrp+xsd+bin15` + `EXEC_TOML`/`ARM_LIVE` line is unchanged.
+
+**Impact**
+
+- `/metrics`: additive series only. A paper boot is otherwise unchanged.
+- `hyparb.toml`: additive section; an existing paper artifact parses as
+  before.
+
+**Migration steps**
+
+1. None for paper. For the testnet smoke: fund wallet 0 on HyperEVM
+   testnet, `evm-testnet fund`, `deploy`, set `[testnet]`, `mint`.
+
+**Rollback**
+
+- Revert the H8 commit.
+
+## 2026-09-23 — `/state` `hyparb` object, `engine_hyparb_*`, `engine_paper_matcher_amm_*`, `backtest --member hyparb`, `pnl_report --hyparb-ladder` (HYPARB H6)
+
+**What changed**
+
+- **`/state` gains a `"hyparb"` object.** ADDITIVE — `"v": 1` stays:
+  `configured`, `n_pools`, `n_coins`, `halted`, the member's counters
+  (flat: `pool_events` … `arbs_buy` / `arbs_sell` … `gas_charged_usd_1e6`,
+  `pnl_predicted_usd_1e6`, `amm_notional_usd_1e6`,
+  `funding_earned_usd_1e6`), `pools` (the first 64: `sym`, `live`,
+  `map_ok`, `hedge_venue`, `fee_pips`, `mid_1e6`, `basis_bps_1e6`,
+  `arbs`, `pnl_predicted_usd_1e6`) and `coins` (≤ 8: `perp_sym`,
+  `spot_sym`, both depths, both quoted costs, `inventory_1e6`,
+  `perp_pos_1e6`, `funding_1e9`). `EngineSnapshot` grows by ≈ 3.8 KiB
+  (still under its 32 KiB pin).
+- **Metrics, registered unconditionally:** `engine_hyparb_*` — 27
+  counters (the member's counters as deltas, incl. `side_buy` /
+  `side_sell` and the three money sums) and 35 gauges
+  (`engine_hyparb_funding_earned_usd_1e6`, `_halted`, `_pools_live`,
+  `engine_hyparb_c<0..3>_{perp,spot}_depth_usd_1e6`,
+  `_{perp,spot}_cost_bps_1e6`, `_inventory_1e6`,
+  `engine_hyparb_p<0..3>_{basis_bps_1e6,pnl_predicted_usd_1e6,live}`);
+  `engine_paper_matcher_amm_{fills,canceled,partial,not_live}_total`.
+- **`backtest --member hyparb --hyparb <toml> [--hyparb-universe <toml>]`**:
+  the harness loads `hyperevm-signals.pmlr` (a lane ONLY this member
+  reads — every other replay merges byte for byte as before), drives the
+  paper matcher's AMM judge and the member in the engine's order, and
+  subtracts the member's OOS gas from the OOS net.
+- **`python -m claude_worker.pnl_report --closed-day --hyparb-ladder
+  [path]`**: each unit is also replayed through the member's correction
+  ladder (r0 naive → r1 depth cap → r2 latency → r3 the artifact); the
+  day report gains an additive `hyparb` key (slot 0's paper rows + the
+  ladder) and summary lines. Off by default.
+- The AMM order's limit is its quote's LAST-unit price
+  (`core_amm::limit_px_1e6`, replacing `avg_px_1e6`): the judge and the
+  chain both bound the marginal price, so an average-price limit filled
+  about half the quote.
+
+**Impact**
+
+- `/state` and `/metrics`: additive keys and series only.
+- Worker: no frozen surface touched (the ladder is a module flag; the
+  `pnl` verb reads the same files).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the H6 commit.
+
+## 2026-09-23 — `hyparb.toml`, `--hyparb`, `--evm-testnet`, wrapper `HYPARB_TOML` / `EVM_TESTNET` / `HYPEREVM_PATH` (HYPARB H5)
+
+**What changed**
+
+- New artifact `~/multivenue/hyparb.toml` (grammar: `hyparb.toml.example`
+  + `core_config::hyparb`): one `[hyparb]` section, 1–8 `[[coin]]` blocks
+  (Hyperliquid perp / spot DESCRIPTORS, lot, venue minimum), 1–128
+  `[[pool]]` blocks (an address that must be in `universe.toml
+  [hyperevm] pools`, each token's hedge coin or `"USD"`, `trade`, an
+  optional per-pool cap). Integers only; unknown / duplicate keys refuse.
+- New boot flags `--hyparb <path>` (default the path above) and
+  `--evm-testnet` (O-H5: the second switch; must agree with the
+  artifact's `mode = "testnet"`, and refused while the EVM write path is
+  not linked). Slot 0 enters the configured mask ONLY when the artifact
+  resolves; requested-but-absent refuses the boot, and so does slot 0
+  without the pool ingress (`--hyperevm-path` + a non-empty
+  `[hyperevm] pools`). A runtime ingress failure darkens the member,
+  never the engine (O-H15).
+- `scripts/engine-wrapper.sh`: a STRATEGY carrying `hyparb` also passes
+  `--hyperevm-path "${HYPEREVM_PATH:-/}"`; `HYPEREVM_PATH` alone passes the
+  path for capture without the member. `HYPARB_TOML` + `EVM_TESTNET=1`
+  (both or neither — exit 78, the `EXEC_TOML` / `ARM_LIVE` shape) pass
+  `--hyparb <file> --evm-testnet`. A STRATEGY without `hyparb` and without
+  those variables produces the exact pre-H5 command line.
+
+**Impact**
+
+- Config keys: one new artifact, three new optional `strategy.conf`
+  variables. Nothing changes for a STRATEGY without `hyparb`.
+- On-disk formats: none.
+
+**Migration steps**
+
+1. None for the live engine (O-H8: `strategy.conf` is not edited; slot 0
+   joins the live mask only at go-live, after `[hyperevm]` and the
+   artifact are in place on a binary built from `main`).
+
+**Rollback**
+
+- Revert the H5 commit.
+
+## 2026-09-23 — `[hyperevm] pools`, the `hyperevm` capture label, `/state` venue 9 (HYPARB H3b)
+
+**What changed**
+
+- `universe.toml` gains an OPTIONAL `[hyperevm]` section:
+  `pools = ["0x<40 lowercase hex>:<v3|slipstream|algebra>:<dec0>:<dec1>", …]`
+  (≤ 128, append-only; `pools[i]` → `make_symbol_id(HyperEvm, i+1)`,
+  descriptor `hyperevm:0x<address>`, class `Spot` in the descriptor law —
+  Rust, Python mirror and the shared fixture). Absent = the pre-H3b boot.
+- New boot flag `--hyperevm-path <path>` and env `HYPEREVM_WS_HOST`
+  (default `rpc.purroofgroup.com`, O-H15). The HyperEVM ingress runs only
+  with BOTH the flag and a non-empty `[hyperevm] pools`; its signals feed
+  the engine's new pool lane (`engine::POOL_RING_SIZE` = 4,096).
+- Every snapshot now also reads `token0()` / `token1()` and both tokens'
+  `decimals()`; a value that differs from the configured decimals fails
+  that pool (`dec_mismatch`).
+- Capture label `hyperevm` (`hyperevm-signals.pmlr`; ticks/events/depth
+  header-only) — appended to `VENUE_LABELS` in backtest / audit-replay /
+  capture-catalog (the catalog's `venue_ticks` array gains a 9th, zero
+  entry) and to `--raw-tap` (`hyperevm`).
+- `/state`: `SNAPSHOT_VENUES` 8 → 9 (`hyperevm` appended after `mexc`).
+  Metrics: `engine_ingress_hyperevm_state`,
+  `engine_ingress_hyperevm_last_tick_age_seconds`, the
+  `engine_ingress_hyperevm_*` counter family and the `hyperevm` capture
+  gauges (registered unconditionally, like every venue's).
+
+**Impact**
+
+- Config keys: new optional `[hyperevm]` section and `HYPEREVM_WS_HOST`.
+  **The live `main` binary does not know `[hyperevm]` — never add it to
+  the live `~/multivenue/universe.toml` before this lane merges to `main`**
+  (a hyparb smoke boots with `--universe <copy>`).
+- On-disk formats: one new capture label; no layout change.
+
+**Migration steps**
+
+1. None for the live engine.
+
+**Rollback**
+
+- Revert the H3b commit.
+
+## 2026-09-23 — `Order.kind` 2 = AMM swap; the AMM fill law; `SNAPSHOT` carries decimals (HYPARB H2)
+
+**What changed**
+
+- `core_fill::ORDER_KIND_AMM_SWAP = 2`: a swap against a HyperEVM pool
+  (`sym` = the pool, `qty` token0 × 1e6, `px` the worst average price,
+  token1 per token0 × 1e6; Ask sells token0, Bid buys it). HyperEVM
+  (venue 8) takes this kind on a pool slot and nothing else; no other
+  venue takes it. Kind 2 was never emitted before (a reserved byte).
+- The engine's paper matcher and the harness judge swaps with
+  `core_fill::AmmBook` (law: `core_fill::amm` module doc). New
+  `OrderDispatch::observe_amm(sym, &payload, now)` (defaulted no-op);
+  the engine calls it for every `SignalSource::HyperEvm` signal before
+  the member's `on_signal`.
+- `core_amm::payload` `SNAPSHOT`: `dec0 u8 @23 · dec1 u8 @24` (≤ 36) and a
+  fee < 100 % are now part of the layout; the decoder refuses anything
+  else. No capture carries a HyperEVM label yet (H3b), so no tape exists
+  in the old form.
+- Harness: `tradeable_venue_byte` accepts 8 (swaps only),
+  `TRADEABLE_VENUES` 6 → 7; an AMM fill books at 0 bps (the pool fee is
+  in the fill price). `MatcherCounters` gains
+  `amm_{fills,canceled,partial,not_live}`.
+
+**Impact**
+
+- Wire formats: none on disk (`Order.kind` 2 was unused; the payload
+  has no tape yet). Schema-1: unchanged (AMM fills are ordinary fills;
+  the AMM counters live outside `ModelOutcome`).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the H2 commit.
+
+## 2026-09-23 — Strategy slot 0 = `hyparb`; `latency-arb` unlinked (HYPARB H0)
+
+**What changed**
+
+- Slot 0 of `crates/strategy-set` is the `strategy-hyparb` member
+  (`SLOT_HYPARB` / `BIT_HYPARB`, still bit 1 = 1). `strategy-latency-arb`
+  is UNLINKED, not deleted (ruling O-H1): it stays in the workspace, its
+  own tests and the `bench` alloc gate / `core-io` replay test still
+  build it, but no engine path composes it.
+- Mask names: `hyparb` (1), `ai+hyparb` (49), `ai+vrp+xsd+bin15+hyparb`
+  (63) are new; `latency-arb` is GONE as a name — `--strategy
+  latency-arb` refuses the boot ("unknown --strategy value"). Its
+  standalone paper/`--live` arm is deleted with it, so
+  `STRATEGY_SET_NAMES` now equals `MASK_TABLE` exactly (no exemption).
+- `run --strategy` defaults to `ai` (was `latency-arb`).
+- The hyparb member lands DARK (O-H8): at H0 it is a stub and is never
+  in the boot's configured mask, so `--strategy hyparb` refuses as "no
+  requested member is configured" and the composite names boot with
+  bit 0 cleared until HYPARB H5 lands its boot artifact.
+- Slot-0 labels: `/state` `slots[0].name`, `audit-pnl` `strategies[].label`
+  for `strategy_id 0`, `exec_boot::SLOT_NAMES[0]` and the dashboard read
+  `hyparb`. Gauge `engine_strategy_latency_arb_active` →
+  `engine_strategy_hyparb_active` (same F29 semantics: bare kind
+  `hyparb` or slot 0 enabled in the set).
+- `regime.toml`: `[labels.hyparb]` is the slot-0 section;
+  `[labels.latency_arb]` is refused at the grammar ("unknown coded
+  member"), exactly as `[labels.ev]` / `[labels.cross_arb]` are.
+- `scripts/engine-wrapper.sh` allow-list gains the three names.
+
+**Why**
+
+- HYPARB (HyperEVM ↔ HL Core arbitrage) takes slot 0 (O-H2). A label,
+  mask or audit row evidenced for latency-arb must never silently apply
+  to a different member.
+
+**Impact**
+
+- On-disk formats: none. The slot NUMBER is wire-stable: rows under
+  `strategy_id 0` in a capture taken BEFORE 2026-09-23 are latency-arb
+  rows wearing the `hyparb` label (latency-arb was OFF in every wrapper
+  mask, so a live capture carries none).
+- Config keys: `regime.toml [labels.latency_arb]` refuses the boot.
+- Metrics: `engine_strategy_latency_arb_active` is renamed.
+
+**Migration steps**
+
+1. None for the live engine: `strategy.conf` names no slot-0 mask and is
+   not edited (O-H8).
+2. A `regime.toml` carrying `[labels.latency_arb]` renames the section
+   to `[labels.hyparb]` or drops it.
+
+**Rollback**
+
+- Revert the H0 commit; no data or config migration to undo.
+
+## 2026-09-23 — VenueId 8 = HyperEvm; venue tables sized by `VENUE_COUNT`; exec venue mask u16 (HYPARB H0)
+
+**What changed**
+
+- `VenueId` gains `HyperEvm = 8` (append-only; the first unassigned byte
+  is now 9) and `SignalSource::HyperEvm = 5` (the HyperEVM ingress
+  publishes `Signal`s — H3). HyperEvm rides NO tick, depth, option or
+  fill lane (`engine::*_lane_of` → `None`); its AMM fills are judged in
+  process (H2).
+- `core_types::VENUE_COUNT = 9` is now the single size of every
+  venue-indexed table: `VenueId::stale_after_ms_defaults` (HyperEvm
+  2 500 ms — the HZ head p99 was 2 281 ms), `core_fill::ACTIVATION_NS_DEFAULT`
+  (HyperEvm 1 000 ms = one block), `ModelParams` (`fee_bps`,
+  `fee_open_bps`, `fee_settle_bps`, `latency_ns`, `stale_after_ms`,
+  `opt_fee`), `parse_stale_after_ms`, `clob-dispatcher` activation,
+  `core-config::exec::VENUE_NAMES` (`hyperevm` = 8).
+- Harness labels: `hyperevm` joins the backtest model labels
+  (`--fee-bps hyperevm:…`, `--latency-ns-venue hyperevm:…`,
+  `--stale-after-ms hyperevm:…`); the rendered fee table gains a
+  trailing `hyperevm` entry (text ` hyperevm=0:0`, JSON `"hyperevm":{…}`
+  after `"mexc"`).
+- `exec-router`: `EXEC_VENUES` 8 → 16 and the per-slot venue mask
+  `u8` → `u16` (`venue_mask_at -> Option<u16>`); the route table keeps
+  its 64-byte-bounded layout (pad 8).
+- Not yet: `SNAPSHOT_VENUES` / capture `VENUE_LABELS` gain `hyperevm`
+  with the ingress wiring (H3b), `TRADEABLE_VENUES` with the AMM fill
+  law (H2).
+
+**Why**
+
+- HYPARB's DEX leg (O-H11): HyperEVM is a venue of its own, and a ninth
+  venue does not fit an 8-bit venue mask.
+
+**Impact**
+
+- On-disk formats: none (no capture label yet).
+- Config keys: `exec.toml` venue names accept `hyperevm`; nothing arms
+  it (no exec arm until H7c/H8, testnet only — O-H5).
+- Wire formats: `VenueId` byte 8 and `SignalSource` byte 5 are assigned.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the H0 commit.
 ## 2026-09-23 — Binance options on fstream's routed `/market` path (`<uly>@optionMarkPrice`); `BINANCE_EAPI_WS_HOST` default `nbstream.binance.com` → `fstream.binance.com` (BX0-F2)
 
 **What changed**

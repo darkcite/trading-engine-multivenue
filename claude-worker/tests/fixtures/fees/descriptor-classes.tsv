@@ -54,3 +54,5 @@ mexc:AAPLXUSDT	spot
 mexc-perp:BTC_USDT	perp
 mexc-perp:XAU_USDT	perp
 mexc-perp:AAPLSTOCK_USDT	perp
+hyperevm:0x6c9a33e3b592c0d65b3ba59355d5be0d38259285	spot
+hyperevm:	none

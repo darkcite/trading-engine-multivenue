@@ -128,7 +128,9 @@ dependencies = [
  "book-builder",
  "clob-dispatcher",
  "core-alloc",
+ "core-amm",
  "core-crypto",
+ "core-fill",
  "core-io",
  "core-latency",
  "core-metrics",
@@ -143,11 +145,13 @@ dependencies = [
  "dhat",
  "engine",
  "engine-snapshot",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
  "ingress-okx",
@@ -155,12 +159,15 @@ dependencies = [
  "ingress-rpc",
  "opt-registry",
  "research-artifacts",
+ "rustls",
  "signer-eip712",
+ "signer-evm",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
  "strategy-rule-tree",
@@ -318,6 +325,7 @@ dependencies = [
  "book-builder",
  "clap",
  "clob-dispatcher",
+ "core-amm",
  "core-config",
  "core-crypto",
  "core-fill",
@@ -332,12 +340,14 @@ dependencies = [
  "core-vol",
  "engine",
  "engine-snapshot",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
  "ingress-okx",
@@ -350,11 +360,12 @@ dependencies = [
  "research-artifacts",
  "rustls",
  "rustls-pki-types",
+ "signer-eip712",
  "strategy-bin15",
  "strategy-core",
  "strategy-ev",
+ "strategy-hyparb",
  "strategy-icdp",
- "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -363,12 +374,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui",
+ "zeroize",
 ]
 
 [[package]]
 name = "clob-dispatcher"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-fill",
  "core-net",
  "core-parse",
@@ -409,6 +422,13 @@ name = "core-alloc"
 version = "0.1.0"
 
 [[package]]
+name = "core-amm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "core-config"
 version = "0.1.0"
 dependencies = [
@@ -429,6 +449,7 @@ version = "0.1.0"
 name = "core-fill"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-types",
 ]
 
@@ -716,6 +737,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "exec-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-net",
+ "core-parse",
+ "exec-hyperevm",
+ "ingress-hyperevm",
+ "ingress-rpc",
+ "proptest",
+ "rcgen",
+ "rustls",
+ "signer-eip712",
+ "signer-evm",
+]
+
+[[package]]
 name = "exec-hyperliquid"
 version = "0.1.0"
 dependencies = [
@@ -950,6 +988,23 @@ dependencies = [
  "proptest",
  "rcgen",
  "rustls",
+]
+
+[[package]]
+name = "ingress-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "ingress-rpc",
+ "memchr",
+ "mio 0.8.11",
+ "proptest",
 ]
 
 [[package]]
@@ -1815,6 +1870,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "signer-evm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "signer-eip712",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1878,6 +1941,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-hyparb"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-fill",
+ "core-time",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-icdp"
 version = "0.1.0"
 dependencies = [
@@ -1921,8 +1995,8 @@ dependencies = [
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
+ "strategy-hyparb",
  "strategy-icdp",
- "strategy-latency-arb",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xsd",

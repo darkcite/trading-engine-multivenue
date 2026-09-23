@@ -2836,8 +2836,9 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
 }
 
 /// Phase 8f item 7: StrategySet fan-out steady state — mask-gated
-/// member dispatch (ticks through a configured latency-arb member,
-/// AI heartbeat fan-out, an Enable/Disable round trip) must allocate
+/// member dispatch (ticks through the slot-0 member — the hyparb stub
+/// since HYPARB H0, latency-arb before it — AI heartbeat fan-out, an
+/// Enable/Disable round trip of slot 0) must allocate
 /// nothing after boot. 8g item 6: the vm member joins the set it
 /// measures — a committed one-row table fires + re-arms on every PM
 /// tick through the set's fan-out, and a per-cycle `RulesetCommit`
@@ -2850,7 +2851,7 @@ fn strategy_set_fanout_is_zero_alloc() {
         STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
     };
     use strategy_core::{Ctx, Strategy, SubmitErr};
-    use strategy_set::{StrategySet, BIT_LATENCY_ARB, BIT_VM, SLOT_LATENCY_ARB};
+    use strategy_set::{StrategySet, BIT_HYPARB, BIT_VM, SLOT_HYPARB};
 
     struct CountCtx {
         submitted: u64,
@@ -2866,13 +2867,38 @@ fn strategy_set_fanout_is_zero_alloc() {
         }
     }
 
-    // Boot (allocation allowed): configure the latency-arb member
-    // and commit a one-row vm table on the same (PM=11, BN=22) pair.
-    // Clock is production-like (G3 lesson: fresh cooldown stamps arm
-    // only once `now ≥ horizon_ns`).
-    let mut set = StrategySet::new(BIT_LATENCY_ARB | BIT_VM);
-    set.latency_arb_mut().add_pair(11, 22).unwrap();
-    set.latency_arb_mut().set_cooldown_ns(0);
+    // Boot (allocation allowed): slot 0 (hyparb — configured since H4
+    // validates in `on_start`: one observe-only pool, one perp coin)
+    // rides the fan-out, and a one-row vm table is committed on the
+    // (PM=11, BN=22) pair. Clock is production-like (G3 lesson: fresh
+    // cooldown stamps arm only once `now ≥ horizon_ns`).
+    let mut set = StrategySet::new(BIT_HYPARB | BIT_VM);
+    {
+        let mut hp = strategy_hyparb::HyparbParams::EMPTY;
+        hp.coins[0] = strategy_hyparb::CoinParams {
+            perp_sym: core_types::make_symbol_id(VenueId::Hyperliquid, 5),
+            spot_sym: SYMBOL_ID_NONE,
+            lot_1e6: 10_000,
+            min_notional_usd_1e6: 10_000_000,
+        };
+        hp.n_coins = 1;
+        hp.pools[0] = strategy_hyparb::PoolParams {
+            sym: core_types::make_symbol_id(VenueId::HyperEvm, 1),
+            coin0: 0,
+            coin1: strategy_hyparb::COIN_USD,
+            trade: false,
+            max_notional_usd_1e6: 1_000_000,
+        };
+        hp.n_pools = 1;
+        hp.lag_ns = 1;
+        hp.basis_window_ns = 1;
+        hp.max_order_usd_1e6 = 1;
+        hp.cap_day_usd_1e6 = 1;
+        hp.inventory_cap_usd_1e6 = 1;
+        set.hyparb_mut()
+            .configure(hp, core_time::WallAnchor::new(0, 0))
+            .expect("gate hyparb params");
+    }
     let mut ctx = CountCtx {
         submitted: 0,
         now: 100_000_000_000_000_000,
@@ -2961,7 +2987,7 @@ fn strategy_set_fanout_is_zero_alloc() {
         0,
         AiCmdKind::DisableStrategy,
         VenueId::Ai,
-        SLOT_LATENCY_ARB,
+        SLOT_HYPARB,
         AI_SIDE_NONE,
         0,
         0,
@@ -2975,7 +3001,7 @@ fn strategy_set_fanout_is_zero_alloc() {
         0,
         AiCmdKind::EnableStrategy,
         VenueId::Ai,
-        SLOT_LATENCY_ARB,
+        SLOT_HYPARB,
         AI_SIDE_NONE,
         0,
         0,
@@ -2999,10 +3025,10 @@ fn strategy_set_fanout_is_zero_alloc() {
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert!(
-        ctx.submitted >= 2 * u64::from(CYCLES),
-        "latency-arb and the vm row must both fire every cycle"
+        ctx.submitted >= u64::from(CYCLES),
+        "the vm row must fire every cycle"
     );
-    assert_eq!(set.enabled_mask(), BIT_LATENCY_ARB | BIT_VM);
+    assert_eq!(set.enabled_mask(), BIT_HYPARB | BIT_VM);
     assert_eq!(set.enable_refused_total(), 0);
     assert_eq!(set.vm().commits_applied, 1, "no further flip in-loop");
     assert_eq!(set.vm().commits_dropped, u64::from(CYCLES));
@@ -7639,4 +7665,1024 @@ fn mexc_run_loop_steady_state_is_zero_alloc() {
     assert_eq!(capture.tap_dropped(), 0);
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
+}
+
+/// **HYPARB H1 gate 63 — the AMM walk and the arb solve.**
+///
+/// `solve_arb` runs on every pool update the member re-evaluates (one
+/// per on-chain swap, ~1/s across the universe) and walks the pool's
+/// real tick map through the contract's 256-bit arithmetic; the paper
+/// matcher's `swap_exact_in_range` judges every AMM order. Both live on
+/// the engine thread. Everything here is `Copy` PODs, fixed arrays and
+/// a caller-owned map, so the whole path must be 0 B/op. The map is
+/// boxed at boot (32 KiB) — that one allocation is outside the guard.
+#[test]
+fn amm_walk_and_arb_solve_are_zero_alloc() {
+    use core_amm::{
+        price_1e18_from_sqrt, solve_arb, sqrt_at_tick, swap_exact, swap_exact_in_range, tick_at_sqrt, ArbParams,
+        ArbSide, PoolMeta, PoolState, SwapSpec, TickMap, TickNode,
+    };
+    const SPACING: i32 = 10;
+    let mut nodes = [TickNode::ZERO; 64];
+    let mut k = 0usize;
+    while k < 32 {
+        // Nested positions around -230,540: lower edges add, upper edges remove.
+        let w = (k as i32 + 1) * 40 * SPACING;
+        nodes[31 - k] = TickNode::new(-230_540 - w, 1_000_000_000_000_000);
+        nodes[32 + k] = TickNode::new(-230_540 + w, -1_000_000_000_000_000);
+        k += 1;
+    }
+    let mut map = Box::new(TickMap::<1024>::EMPTY);
+    map.load(&nodes, -250_000, -210_000, SPACING).expect("gate 63 map");
+    let (lo, hi) = sqrt_at_tick(-230_543);
+    let state = PoolState::new(lo, hi, -230_543, 32_000_000_000_000_000);
+    let mut meta = PoolMeta::ZERO;
+    meta.tick_spacing = SPACING;
+    meta.fee_pips = 500;
+    meta.dec0 = 18;
+    meta.dec1 = 6;
+    let mid = price_1e18_from_sqrt(lo, hi, 18, 6);
+
+    let g = AllocGuard::new();
+    let mut traded = 0u64;
+    let mut acc: u128 = 0;
+    let mut n = 0u64;
+    while n < 5_000 {
+        // Hedge bid swings ±150 bps around the pool mid.
+        let bps = (n % 301) as u128;
+        let bid = mid - mid * 150 / 10_000 + mid * bps / 10_000;
+        let q = solve_arb(&state, &meta, &map, &ArbParams {
+            eff_bid_1e18: bid,
+            eff_ask_1e18: bid + bid / 5_000,
+            px0_usd_1e6: (mid / 1_000_000_000_000) as i64,
+            max_notional_usd_1e6: 20_000_000_000,
+            gas_usd_1e6: 10_000,
+        });
+        if q.side != ArbSide::None {
+            traded += 1;
+            acc = acc.wrapping_add(q.token0_raw);
+        }
+        let (tl, th) = sqrt_at_tick(-230_543 + (n % 400) as i32 - 200);
+        let spec = SwapSpec {
+            amount: 1_000_000_000_000_000_000,
+            limit_lo: tl,
+            limit_hi: th,
+            fee_pips: 500,
+            zero_for_one: n % 400 < 200,
+            exact_in: n % 2 == 0,
+        };
+        let r = swap_exact(&state, &meta, &map, &spec);
+        let m = swap_exact_in_range(&state, &meta, &spec);
+        acc = acc.wrapping_add(r.amount_out).wrapping_add(m.amount_out);
+        acc = acc.wrapping_add(tick_at_sqrt(r.after.sqrt_price_lo, r.after.sqrt_price_hi) as u128);
+        n += 1;
+    }
+    std::hint::black_box((traded, acc));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(traded > 0 && acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "core-amm walk/solve allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "core-amm hot bytes should be zero: saw {bytes}");
+}
+
+/// **HYPARB H7 gate 64 — the EVM sign + hash + hex-render path.**
+///
+/// Every testnet send (and, after a later ruling, every mainnet one)
+/// goes digest → secp256k1 sign → tx hash → hex render into the request
+/// body. The digest and the hash are `keccak256_parts` over stack
+/// encodings and the BORROWED calldata; the render writes into the
+/// caller's buffer. The whole path must be 0 B/op — the body buffer is
+/// allocated once at boot, outside the guard.
+#[test]
+fn evm_sign_hash_and_render_are_zero_alloc() {
+    use signer_evm::{tx_encode_signed_hex, tx_hash, tx_sign, Eip1559Tx};
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 64 key");
+    let calldata = [0xa5u8; 228]; // a V3 swap's worth of calldata
+    let mut body = vec![0u8; 4096];
+    // Boot: the first signature builds signer-eip712's process-wide
+    // secp256k1 context (one 208 B allocation, `OnceLock`). The arm does
+    // this at boot too; the guard measures the steady state after it.
+    let warm = Eip1559Tx { chain_id: 998, nonce: 0, max_priority_fee_per_gas: 0, max_fee_per_gas: 0, gas_limit: 21_000, to: [0; 20], value: 0, data: &[] };
+    tx_sign(&warm, &sk).expect("gate 64 warm-up");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 2_000 {
+        let tx = Eip1559Tx {
+            chain_id: 998,
+            nonce: n,
+            max_priority_fee_per_gas: 1_000_000_000 + n as u128,
+            max_fee_per_gas: 3_000_000_000,
+            gas_limit: 350_000,
+            to: [0x55; 20],
+            value: 0,
+            data: &calldata,
+        };
+        let sig = tx_sign(&tx, &sk).expect("gate 64 sign");
+        let h = tx_hash(&tx, &sig).expect("gate 64 hash");
+        let w = tx_encode_signed_hex(&tx, &sig, &mut body).expect("gate 64 render");
+        acc = acc.wrapping_add(w as u64).wrapping_add(h[0] as u64);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "signer-evm sign/hash/render allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "signer-evm hot bytes should be zero: saw {bytes}");
+}
+
+/// **HYPARB gate 65 — the Algebra walk, tick-map maintenance, and the
+/// pool-event payload codec.**
+///
+/// Every on-chain swap reaches the member as two 40-byte payloads the
+/// ingress encodes and the member decodes; every `Mint`/`Burn` mutates a
+/// pool's tick map in place; an Algebra pool is walked in its own loop.
+/// All of it runs on the ingress or the engine thread per event, so all
+/// of it must be 0 B/op. The map is boxed at boot, outside the guard.
+#[test]
+fn amm_algebra_walk_map_mutation_and_payload_are_zero_alloc() {
+    use core_amm::payload::{decode, encode_liquidity, encode_state, encode_swap, PoolEvent};
+    use core_amm::{
+        sqrt_at_tick, swap_exact, PoolMeta, PoolState, SwapSpec, TickMap, AMM_KIND_ALGEBRA,
+    };
+    let mut map = Box::new(TickMap::<1024>::EMPTY);
+    map.load(&[], -250_000, -210_000, 1).expect("gate 65 map");
+    let mut state = PoolState::new(0, 0, -230_543, 0);
+    let (lo, hi) = sqrt_at_tick(-230_543);
+    state.sqrt_price_lo = lo;
+    state.sqrt_price_hi = hi;
+    let mut meta = PoolMeta::ZERO;
+    meta.kind = AMM_KIND_ALGEBRA;
+    meta.tick_spacing = 10;
+    meta.fee_pips = 500;
+    // Seed nested positions through the mutation path itself.
+    let mut k = 0i32;
+    while k < 32 {
+        let w = (k + 1) * 400;
+        map.apply_position(-230_540 - w, -230_540 + w, 1_000_000_000_000_000)
+            .expect("gate 65 seed");
+        state
+            .apply_position(-230_540 - w, -230_540 + w, 1_000_000_000_000_000)
+            .expect("gate 65 seed");
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc: u128 = 0;
+    let mut n = 0u64;
+    while n < 5_000 {
+        // A mint and its burn: an insert and a remove on the fixed array.
+        let t = -230_000 + (n % 97) as i32 * 10;
+        map.apply_position(t - 50, t + 50, 7_777)
+            .expect("gate 65 mint");
+        map.apply_position(t - 50, t + 50, -7_777)
+            .expect("gate 65 burn");
+        let (tl, th) = sqrt_at_tick(-230_543 + (n % 4_000) as i32 - 2_000);
+        let spec = SwapSpec {
+            amount: 1_000_000_000_000_000_000,
+            limit_lo: tl,
+            limit_hi: th,
+            fee_pips: 500,
+            zero_for_one: n % 4_000 < 2_000,
+            exact_in: n % 2 == 0,
+        };
+        let r = swap_exact(&state, &meta, &map, &spec);
+        // Ingress → member, both payloads of the swap and a Mint.
+        let s = encode_swap(46_650_000 + n, r.amount_in as i128, -(r.amount_out as i128))
+            .expect("gate 65 swap");
+        let p = encode_state(
+            r.after.tick,
+            r.after.sqrt_price_lo,
+            r.after.sqrt_price_hi,
+            r.after.liquidity,
+            false,
+        )
+        .expect("gate 65 state");
+        let l = encode_liquidity(46_650_000 + n, n % 3 == 0, t - 50, t + 50, 7_777)
+            .expect("gate 65 liq");
+        if let Some(PoolEvent::Swap { amount0, .. }) = decode(&s) {
+            acc = acc.wrapping_add(amount0 as u128);
+        }
+        if let Some(PoolEvent::State {
+            liquidity, tick, ..
+        }) = decode(&p)
+        {
+            acc = acc.wrapping_add(liquidity).wrapping_add(tick as u128);
+        }
+        if let Some(PoolEvent::Liquidity { amount, .. }) = decode(&l) {
+            acc = acc.wrapping_add(amount);
+        }
+        acc = acc.wrapping_add(r.amount_out);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(
+        acc != 0 && map.len() == 64,
+        "the gate must measure real work"
+    );
+    assert_eq!(
+        allocs, 0,
+        "core-amm algebra/map/payload allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "core-amm algebra/map/payload hot bytes should be zero: saw {bytes}"
+    );
+}
+/// **HYPARB H3 gate 66 — the HyperEVM ingress after the handshake.**
+///
+/// Everything the session does once upgraded, inside the guard: both
+/// subscriptions (the `logs` frame renders every pool address and topic),
+/// the pinned pool snapshot (reads issued, replies scanned, the archive
+/// probe, the snapshot emitted onto the ring), then 1 000 live `Swap`
+/// pushes decoded into `SWAP` + `STATE` payloads and pushed. The reply
+/// frames are rendered before the guard; the driver was sized at boot.
+#[test]
+fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
+    use ingress_hyperevm::{run_loop as hwl, PoolEntry, PoolFamily, PoolTable};
+
+    fn frame(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x81u8];
+        if body.len() <= 125 {
+            out.push(body.len() as u8);
+        } else {
+            out.push(126);
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(body);
+        out
+    }
+    fn word_i(v: i64) -> String {
+        if v < 0 {
+            format!("{}{:016x}", "f".repeat(48), v as u64)
+        } else {
+            format!("{:064x}", v as u64)
+        }
+    }
+    fn reply(id: u64, words: &str) -> Vec<u8> {
+        frame(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":"0x{words}"}}"#).as_bytes())
+    }
+
+    const B: u64 = 46_650_000;
+    let addr = [0x30u8; 20];
+    let pools = PoolTable::new(&[PoolEntry {
+        address: addr,
+        sym: 900,
+        family: PoolFamily::Algebra,
+        dec0: 18,
+        dec1: 6,
+    }])
+    .expect("gate 66 pools");
+    let mut transport = TestTransport::with_capacity(1 << 20);
+    let mut driver = hwl::Driver::new(0xBEEF, pools, 4_000);
+    hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    let status = core_metrics::IngressStatus::new();
+    let ring: std::sync::Arc<Ring<core_types::Signal, { hwl::DEFAULT_POOL_RING_CAP }>> =
+        Ring::new();
+    let (mut prod, mut cons) = ring.split();
+    let mut capture = core_types::NullCapture;
+
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let mut sink = vec![0u8; 1 << 20];
+    let _ = transport.drain_outgoing(&mut sink);
+    let accept = core_net::expected_accept(&core_net::sec_websocket_key_from_seed(0xBEEF));
+    let mut resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ".to_vec();
+    resp.extend_from_slice(&accept);
+    resp.extend_from_slice(b"\r\n\r\n");
+
+    // Everything the node will say, rendered now. Ids are the driver's:
+    // 1 newHeads, 2 logs, 3.. the Algebra header reads in issue order
+    // (globalState, liquidity, tickSpacing, prev, next, token0, token1,
+    // probe), then the two `decimals()` reads (HYPARB H3b: 18 / 6, the
+    // configured values) and the two list reads (both markers: an empty
+    // book).
+    let (sqrt, _) = core_amm::sqrt_at_tick(-297_448);
+    let gs = |s: u128| {
+        format!(
+            "{:064x}{}{:064x}{}",
+            s,
+            word_i(-297_448),
+            500u64,
+            "0".repeat(192)
+        )
+    };
+    let marker = format!(
+        "{}{}{}{}{}",
+        "0".repeat(128),
+        word_i(-887_272),
+        word_i(887_272),
+        "0".repeat(64),
+        "0".repeat(64)
+    );
+    let mut session = Vec::new();
+    session.extend_from_slice(&resp);
+    let mut setup = Vec::new();
+    setup.extend_from_slice(&frame(
+        br#"{"jsonrpc":"2.0","id":1,"result":"0x9cef478923ff08bf67fde6c64013158d"}"#,
+    ));
+    setup.extend_from_slice(&frame(
+        br#"{"jsonrpc":"2.0","id":2,"result":"0x1111478923ff08bf67fde6c640131500"}"#,
+    ));
+    setup.extend_from_slice(&frame(format!(r#"{{"jsonrpc":"2.0","method":"eth_subscription","params":{{"subscription":"0x9cef478923ff08bf67fde6c64013158d","result":{{"number":"0x{B:x}","timestamp":"0x68d2a1f3","baseFeePerGas":"0x5f5e100"}}}}}}"#).as_bytes()));
+    let headers = [
+        reply(3, &gs(sqrt)),
+        reply(4, &format!("{:064x}", 77_000u64)),
+        reply(5, &word_i(1)),
+        reply(6, &word_i(-887_272)),
+        reply(7, &word_i(887_272)),
+        reply(8, &format!("{}{}", "0".repeat(24), "11".repeat(20))),
+        reply(9, &format!("{}{}", "0".repeat(24), "22".repeat(20))),
+        reply(10, &gs(sqrt + 1)),
+    ];
+    let decimals = [
+        reply(11, &format!("{:064x}", 18u64)),
+        reply(12, &format!("{:064x}", 6u64)),
+    ];
+    let links = [reply(13, &marker), reply(14, &marker)];
+    let a: String = addr.iter().map(|b| format!("{b:02x}")).collect();
+    let swap = frame(format!(
+        r#"{{"jsonrpc":"2.0","method":"eth_subscription","params":{{"subscription":"0x1111478923ff08bf67fde6c640131500","result":{{"address":"0x{a}","topics":["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67","0x{z}","0x{z}"],"data":"0x{d0}{d1}{d2:064x}{d3:064x}{d4}","blockNumber":"0x{b:x}","logIndex":"0x1","removed":false}}}}}}"#,
+        z = "0".repeat(64), d0 = word_i(12_345), d1 = word_i(-6_789), d2 = sqrt, d3 = 77_000u64, d4 = word_i(-297_448), b = B + 1
+    ).as_bytes());
+
+    transport.inject_incoming(&session);
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let _ = transport.drain_outgoing(&mut sink);
+    transport.inject_incoming(&setup);
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let _ = transport.drain_outgoing(&mut sink);
+    let mut k = 0;
+    while k < headers.len() {
+        transport.inject_incoming(&headers[k]);
+        k += 1;
+    }
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let _ = transport.drain_outgoing(&mut sink);
+    transport.inject_incoming(&decimals[0]);
+    transport.inject_incoming(&decimals[1]);
+    transport.inject_incoming(&links[0]);
+    transport.inject_incoming(&links[1]);
+    hwl::drive_one(
+        &mut transport,
+        &mut driver,
+        b"h",
+        b"/",
+        &mut prod,
+        &status,
+        &mut capture,
+    )
+    .unwrap();
+    let live = driver.phase() == hwl::Phase::Live;
+    let mut acc: u64 = 0;
+    while let Some(s) = cons.try_pop() {
+        acc = acc.wrapping_add(s.payload[0] as u64);
+    }
+    let mut n = 0u32;
+    while n < 1_000 {
+        transport.inject_incoming(&swap);
+        hwl::drive_one(
+            &mut transport,
+            &mut driver,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
+        while let Some(s) = cons.try_pop() {
+            acc = acc.wrapping_add(s.payload[0] as u64);
+        }
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(live, "the session must reach Live inside the window");
+    assert_eq!(
+        acc,
+        0x27 + 0x11 + 1000 * (0x02 + 0x01),
+        "one snapshot (Algebra SNAPSHOT + snapshot STATE), then SWAP + STATE per push"
+    );
+    assert_eq!(driver.snapshot_counters().pools_ok, 1);
+    assert_eq!(
+        allocs, 0,
+        "hyperevm session allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "hyperevm hot bytes should be zero: saw {bytes}");
+}
+
+/// **HYPARB gate 67 — the AMM fill law on the engine's paper matcher.**
+///
+/// `PaperDispatcher::observe_amm` in steady state: pool events rebuild
+/// the book (swap + state with the fee observation, a position change),
+/// a new AMM order per cycle is submitted, and every HEAD judges it —
+/// a fill (the walk, the impact carried, the fill pushed) or a cancel —
+/// and the fill is pumped. Boot (the first snapshot) is outside the
+/// window. 0 B/op.
+#[test]
+fn amm_paper_matcher_observe_judge_and_fill_are_zero_alloc() {
+    use clob_dispatcher::{OrderDispatch, PaperDispatcher};
+    use core_amm::payload::{
+        encode_head, encode_liquidity, encode_snapshot, encode_state, encode_swap, FAMILY_V3,
+    };
+    use core_amm::{price_1e18_from_sqrt, sqrt_at_tick, PoolMeta, PoolState, SwapSpec};
+    use core_types::{make_symbol_id, Order, Side, SYMBOL_ID_NONE};
+
+    const S: u64 = 1_000_000_000;
+    let pool = make_symbol_id(VenueId::HyperEvm, 1);
+    let tick = -230_543;
+    let liq: u128 = 50_000_000_000_000_000_000;
+    let (lo, hi) = sqrt_at_tick(tick);
+    let mid = (price_1e18_from_sqrt(lo, hi, 18, 6) / 1_000_000_000_000) as i64;
+
+    // Boot (allocation allowed): the snapshot, and the payloads the
+    // loop replays — a real 0.3 %-paying swap and its state, a mint.
+    let mut d = PaperDispatcher::new();
+    d.observe_amm(
+        pool,
+        &encode_snapshot(10, FAMILY_V3, -240_000, -220_000, 0, 500, 10, 18, 6)
+            .expect("gate 67 snap"),
+        0,
+    );
+    let reset = encode_state(tick, lo, hi, liq, true).expect("gate 67 state");
+    d.observe_amm(pool, &reset, 0);
+    let mut meta = PoolMeta::ZERO;
+    meta.fee_pips = 3_000;
+    meta.tick_spacing = 10;
+    let r = core_amm::swap_exact_in_range(
+        &PoolState::new(lo, hi, tick, liq),
+        &meta,
+        &SwapSpec {
+            amount: 1_000_000_000_000_000_000,
+            limit_lo: core_amm::MIN_SQRT_LO + 1,
+            limit_hi: 0,
+            fee_pips: 3_000,
+            zero_for_one: true,
+            exact_in: true,
+        },
+    );
+    let swap = encode_swap(11, r.amount_in as i128, -(r.amount_out as i128)).expect("gate 67 swap");
+    let a = r.after;
+    let post = encode_state(a.tick, a.sqrt_price_lo, a.sqrt_price_hi, a.liquidity, false)
+        .expect("gate 67 post");
+    let mint = encode_liquidity(11, false, -230_600, -230_500, 7).expect("gate 67 mint");
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut fills = 0u64;
+    let mut n = 0u64;
+    while n < CYCLES {
+        let now = (n + 1) * 2 * S;
+        // Chain activity: a snapshot-state reset (so the pool is live
+        // again whatever our last impact did), a swap + its state, a mint.
+        d.observe_amm(pool, &reset, now);
+        d.observe_amm(pool, &swap, now);
+        d.observe_amm(pool, &post, now);
+        d.observe_amm(pool, &mint, now);
+        // One order: a sell that fills on even cycles, a buy limited
+        // to half the mid (cannot fill) on odd ones.
+        let (side, px) = if n % 2 == 0 {
+            (Side::Ask, mid * 99 / 100)
+        } else {
+            (Side::Bid, mid / 2)
+        };
+        let mut o = Order::new(
+            now,
+            VenueId::HyperEvm,
+            pool,
+            side,
+            core_fill::ORDER_KIND_AMM_SWAP,
+            Price::from_raw(px),
+            Qty::from_raw(1_000_000),
+            n + 1,
+        );
+        o.strategy_id = 0;
+        d.submit(&o).expect("paper submit");
+        let head = encode_head(12 + n, now + S, 1).expect("gate 67 head");
+        d.observe_amm(SYMBOL_ID_NONE, &head, now + S);
+        while let Some(f) = d.try_next_fill() {
+            fills += 1;
+            std::hint::black_box(f);
+        }
+        n += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = d.matcher_counters();
+    assert_eq!(
+        fills,
+        CYCLES / 2,
+        "every sell fills, no buy at half the mid does"
+    );
+    assert_eq!(c.amm_fills, CYCLES / 2);
+    assert_eq!(c.amm_canceled, CYCLES / 2);
+    assert!(d.open_orders() == 0, "judged once, gone either way");
+    assert_eq!(
+        allocs, 0,
+        "AMM paper matcher allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "AMM paper matcher hot bytes should be zero: saw {bytes}"
+    );
+}
+
+/// **HYPARB H4 gate 68 — the slot-0 member in steady state.**
+///
+/// `HyparbStrategy` driven the way the engine drives it: every cycle the
+/// chain resets the pool (a snapshot `STATE` — our carried impact
+/// erased), a swap + its state and a mint arrive, a head, a funding
+/// event, a perp BBO 1 % off the pool; the member decides (the real
+/// `solve_arb` walk over its tick map), submits the AMM swap, carries
+/// its impact, is filled, sends the hedge IoC, is filled on the hedge,
+/// and its timer runs. Boot (params, the first snapshot and map load) is
+/// outside the window. 0 B/op on `on_tick` / `on_signal` / `on_fill` /
+/// `on_timer` / `on_venue_event`.
+#[test]
+fn hyparb_member_decision_hedge_and_timer_are_zero_alloc() {
+    use core_amm::payload::{
+        encode_head, encode_liquidity, encode_snapshot, encode_state, encode_swap, encode_tick,
+        FAMILY_V3,
+    };
+    use core_amm::{price_1e18_from_sqrt, sqrt_at_tick};
+    use core_types::{
+        make_symbol_id, ChannelEvent, ChannelId, Fill, LatencyClass, Order, Signal, SignalSource,
+        SYMBOL_ID_NONE,
+    };
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_hyparb::{CoinParams, HyparbParams, HyparbStrategy, PoolParams, COIN_USD};
+
+    /// Keeps the last AMM order and the last hedge order — no storage
+    /// that grows.
+    struct LastCtx {
+        amm: Option<Order>,
+        hedge: Option<Order>,
+        now: u64,
+    }
+    impl Ctx for LastCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            if o.venue == VenueId::HyperEvm as u8 {
+                self.amm = Some(o);
+            } else {
+                self.hedge = Some(o);
+            }
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const S: u64 = 1_000_000_000;
+    const T0: u64 = 1_000 * S;
+    let pool = make_symbol_id(VenueId::HyperEvm, 1);
+    let perp = make_symbol_id(VenueId::Hyperliquid, 5);
+    let tick = -230_543;
+    let liq: u128 = 50_000_000_000_000_000_000;
+    let (lo, hi) = sqrt_at_tick(tick);
+    let mid = (price_1e18_from_sqrt(lo, hi, 18, 6) / 1_000_000_000_000) as i64;
+    let sig = |sym, payload| {
+        Signal::new(
+            T0,
+            sym,
+            LatencyClass::Warm,
+            SignalSource::HyperEvm as u8,
+            payload,
+        )
+    };
+
+    // Boot (allocation allowed).
+    let mut p = HyparbParams::EMPTY;
+    p.coins[0] = CoinParams {
+        perp_sym: perp,
+        spot_sym: SYMBOL_ID_NONE,
+        lot_1e6: 10_000,
+        min_notional_usd_1e6: 10_000_000,
+    };
+    p.n_coins = 1;
+    p.pools[0] = PoolParams {
+        sym: pool,
+        coin0: 0,
+        coin1: COIN_USD,
+        trade: true,
+        max_notional_usd_1e6: 1_000_000_000,
+    };
+    p.n_pools = 1;
+    p.lag_ns = S / 2;
+    p.basis_window_ns = 60 * S;
+    p.depth_cap_enabled = true;
+    p.gas_p50_usd_1e6 = 10_000;
+    p.gas_p99_usd_1e6 = 3_910_000;
+    p.max_order_usd_1e6 = 1_000_000_000;
+    p.cap_day_usd_1e6 = 1_000_000_000_000_000;
+    p.min_net_bps_1e6 = 5_000_000;
+    p.inventory_cap_usd_1e6 = 1_000_000_000_000;
+    p.perp_taker_bps_1e6 = 4_500_000;
+    p.spot_taker_bps_1e6 = 7_000_000;
+    p.funding_window_ns = 3_600 * S;
+    p.cooldown_ns = S;
+    let mut m = HyparbStrategy::new();
+    m.configure(p, core_time::WallAnchor::new(0, 1_789_192_800 * S))
+        .expect("gate 68 params");
+    let mut c = LastCtx {
+        amm: None,
+        hedge: None,
+        now: T0,
+    };
+    m.on_start(&mut c).expect("gate 68 start");
+    m.on_signal(
+        &sig(
+            pool,
+            encode_snapshot(10, FAMILY_V3, -240_000, -220_000, 2, 500, 10, 18, 6)
+                .expect("gate 68 snap"),
+        ),
+        &mut c,
+    );
+    m.on_signal(
+        &sig(
+            pool,
+            encode_tick(-240_000, liq as i128, liq).expect("gate 68 t"),
+        ),
+        &mut c,
+    );
+    m.on_signal(
+        &sig(
+            pool,
+            encode_tick(-220_000, -(liq as i128), liq).expect("gate 68 t"),
+        ),
+        &mut c,
+    );
+    let reset = encode_state(tick, lo, hi, liq, true).expect("gate 68 state");
+    m.on_signal(&sig(pool, reset), &mut c);
+    assert_eq!(m.counters().maps_loaded, 1);
+    let swap = encode_swap(11, 1_000_000_000_000, -97_000).expect("gate 68 swap");
+    let post = encode_state(tick, lo, hi, liq, false).expect("gate 68 post");
+    let mint = encode_liquidity(11, false, -230_600, -230_500, 7).expect("gate 68 mint");
+
+    const CYCLES: u64 = 10_000;
+    let g = AllocGuard::new();
+    let mut n = 0u64;
+    while n < CYCLES {
+        let now = T0 + (n + 1) * 4 * S;
+        c.now = now;
+        m.on_signal(&sig(pool, reset), &mut c);
+        m.on_signal(&sig(pool, swap), &mut c);
+        m.on_signal(&sig(pool, post), &mut c);
+        m.on_signal(&sig(pool, mint), &mut c);
+        m.on_signal(
+            &sig(
+                SYMBOL_ID_NONE,
+                encode_head(12 + n, now / S, 1).expect("head"),
+            ),
+            &mut c,
+        );
+        m.on_venue_event(
+            &ChannelEvent::new(
+                now,
+                VenueId::Hyperliquid,
+                ChannelId::AssetCtx,
+                perp,
+                0,
+                0,
+                12_500,
+                0,
+            ),
+            &mut c,
+        );
+        // A perp 1 % above the pool, its size alternating so every tick
+        // is a change: the member buys the pool.
+        let px = mid * 101 / 100;
+        let q = 100_000_000 + (n % 2) as i64;
+        m.on_tick(
+            &Tick::new(
+                now,
+                VenueId::Hyperliquid,
+                perp,
+                1,
+                Price::from_raw(px - 500),
+                Qty::from_raw(q),
+                Price::from_raw(px + 500),
+                Qty::from_raw(q),
+            ),
+            &mut c,
+        );
+        if let Some(o) = c.amm.take() {
+            m.on_fill(
+                &Fill::new(now, pool, o.side, o.px, o.qty, o.client_oid),
+                &mut c,
+            );
+        }
+        if let Some(h) = c.hedge.take() {
+            m.on_fill(
+                &Fill::new(now, perp, h.side, h.px, h.qty, h.client_oid),
+                &mut c,
+            );
+        }
+        m.on_timer(now + 2 * S, &mut c);
+        n += 1;
+    }
+    let (allocs, bytes, _deallocs) = g.delta();
+    let k = m.counters();
+    assert!(k.arbs_submitted >= CYCLES, "one arb per cycle: {k:?}");
+    assert_eq!(k.amm_fills, k.arbs_submitted);
+    assert_eq!(k.hedge_fills, k.hedges_submitted);
+    assert!(k.hedges_submitted >= CYCLES);
+    assert_eq!(k.maps_refused, 0);
+    assert_eq!(
+        allocs, 0,
+        "hyparb member allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "hyparb member hot bytes should be zero: saw {bytes}"
+    );
+}
+
+/// **HYPARB gate 71 (H7c) — the EVM write path either side of the
+/// socket.**
+///
+/// Per testnet send the arm thread encodes the executor calldata into a
+/// stack array, bids gas, claims a nonce, signs, hashes, renders the
+/// `eth_sendRawTransaction` body in place, and scans the node's answer;
+/// per poll it renders the receipt request and scans the receipt into
+/// caller storage (its logs walked, not searched); per block it scans
+/// the fee history. The transaction is encoded ONCE (`PreparedTx`) and
+/// signed, hashed and rendered from that encoding. `HttpsPost::post`
+/// itself is gate 72 (its server in a child process). All of this must
+/// be 0 B/op — the body buffer is allocated once at boot, outside the
+/// guard.
+#[test]
+fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
+    use exec_hyperevm::calldata::{encode_swap, SwapCall, SWAP_CALLDATA_LEN};
+    use exec_hyperevm::gas::{bid, SWAP_GAS_LIMIT};
+    use exec_hyperevm::nonce::NonceTable;
+    use exec_hyperevm::rpc::{
+        classify_send_refusal, scan_hash, scan_next_base_fee, scan_receipt, write_receipt,
+        write_send_raw,
+    };
+    use signer_evm::{tx_sign, Eip1559Tx, PreparedTx};
+
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 71 key");
+    let mut rc = exec_hyperevm::rpc::Receipt::ZERO;
+    let mut body = vec![0u8; exec_hyperevm::arm::MAX_BODY];
+    let receipt = br#"{"jsonrpc":"2.0","id":7,"result":{"type":"0x2","status":"0x1","logs":[{"address":"0xd3303d83422e93b840cceed9d5671f2427fae726","topics":["0xe5451a8402e365c27dd14a967e40e72c37559b904cb33b29b9c2ee04a10d3d94"],"data":"0x01","blockNumber":"0x3e05ee7","transactionHash":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7","logIndex":"0x0","removed":false}],"transactionHash":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7","transactionIndex":"0x0","blockNumber":"0x3e05ee7","gasUsed":"0x70a5","effectiveGasPrice":"0x5f5e100","from":"0xeec1f3fcca6b05a7c9f05521f8dd9080e5edac14","to":"0xd3303d83422e93b840cceed9d5671f2427fae726","contractAddress":null}}"#;
+    let fees = br#"{"jsonrpc":"2.0","id":8,"result":{"baseFeePerGas":["0x5f5e100","0x54f2d51"],"gasUsedRatio":[0.08],"oldestBlock":"0x3e05ed3"}}"#;
+    let refused =
+        br#"{"jsonrpc":"2.0","id":9,"error":{"code":-32000,"message":"transaction underpriced"}}"#;
+    let answer = br#"{"jsonrpc":"2.0","id":9,"result":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7"}"#;
+    // Boot: the first signature builds signer-eip712's process-wide
+    // secp256k1 context (gate 64's note).
+    let warm = Eip1559Tx {
+        chain_id: 998,
+        nonce: 0,
+        max_priority_fee_per_gas: 0,
+        max_fee_per_gas: 0,
+        gas_limit: 21_000,
+        to: [0; 20],
+        value: 0,
+        data: &[],
+    };
+    tx_sign(&warm, &sk).expect("gate 71 warm-up");
+    let mut nonces = NonceTable::new(3);
+    let mut w = 0;
+    while w < 3 {
+        nonces.sync(w, 10 * w as u64, 10 * w as u64);
+        w += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 2_000 {
+        let call = SwapCall {
+            amount_specified: 1_000_000 + n as i128,
+            sqrt_limit_lo: 4_295_128_740 + n as u128,
+            min_out: n as u128,
+            sqrt_limit_hi: 0,
+            pool: [0x77; 20],
+            zero_for_one: n & 1 == 0,
+        };
+        let mut cd = [0u8; SWAP_CALLDATA_LEN];
+        encode_swap(&call, &mut cd);
+        let b = bid(
+            1_000_000 + n as i64,
+            100_000_000,
+            SWAP_GAS_LIMIT,
+            40_000_000,
+            3_910_000,
+        )
+        .expect("gate 71 bid");
+        let wallet = nonces.pick().expect("gate 71 wallet");
+        let nonce = nonces.take(wallet).expect("gate 71 nonce");
+        let tx = Eip1559Tx {
+            chain_id: 998,
+            nonce,
+            max_priority_fee_per_gas: b.max_priority_fee_per_gas,
+            max_fee_per_gas: b.max_fee_per_gas,
+            gas_limit: SWAP_GAS_LIMIT,
+            to: [0xe7; 20],
+            value: 0,
+            data: &cd,
+        };
+        let prepared = PreparedTx::call(&tx);
+        let sig = prepared.sign(&sk).expect("gate 71 sign");
+        let st = prepared.signed(&sig).expect("gate 71 attach");
+        let h = st.hash();
+        let k = write_send_raw(&mut body, 9, &st).expect("gate 71 render");
+        let got = scan_hash(answer, 9).expect("gate 71 answer");
+        if let Err(exec_hyperevm::rpc::ScanErr::Rpc(e)) = scan_hash(refused, 9) {
+            let why =
+                classify_send_refusal(&refused[e.message_start as usize..e.message_end as usize]);
+            acc = acc.wrapping_add(why as u64);
+        }
+        let r = write_receipt(&mut body, 7, &h).expect("gate 71 receipt req");
+        assert!(
+            scan_receipt(receipt, 7, &mut rc).expect("gate 71 receipt"),
+            "mined"
+        );
+        let fee = scan_next_base_fee(fees, 8).expect("gate 71 fees");
+        nonces.mined(wallet);
+        acc = acc
+            .wrapping_add(k as u64 + r as u64)
+            .wrapping_add(got[0] as u64 + rc.gas_used + fee as u64);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(nonces.next(0), 667, "round-robin over the three wallets");
+    assert_eq!(
+        allocs, 0,
+        "exec-hyperevm send/scan allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "exec-hyperevm hot bytes should be zero: saw {bytes}"
+    );
+}
+
+/// Gate 72's server half: runs ONLY in the child process gate 72 spawns
+/// (it is `#[ignore]`d, and a no-op without `GATE72_NODE_DIR`). Boots
+/// the rustls `testnode`, writes its port and certificate for the
+/// parent, and serves until the parent kills it (or 120 s pass).
+#[test]
+#[ignore = "gate 72's child process; never run on its own"]
+fn gate72_node_helper() {
+    let Some(dir) = std::env::var_os("GATE72_NODE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let certs = exec_hyperevm::testnode::certs();
+    let n = exec_hyperevm::testnode::boot_with(
+        exec_hyperevm::testnode::Node {
+            chain_id: 998,
+            ..exec_hyperevm::testnode::Node::default()
+        },
+        &certs,
+    );
+    std::fs::write(dir.join("cert.der"), certs.cert_der()).expect("gate 72 cert");
+    // The port last: its presence says the rest is written.
+    std::fs::write(dir.join("port.tmp"), n.port.to_string()).expect("gate 72 port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 72 port");
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+
+/// **HYPARB gate 72 (H9) — the write arm's HTTPS keep-alive cycle, as
+/// allocations per request.**
+///
+/// Not 0 B/op, and pinned anyway: rustls 0.23's BUFFERED API allocates
+/// one `Vec` per TLS record it seals (each `write` call) and one per
+/// application-data record it decrypts — measured 2026-09-23. What this
+/// gate owns is everything ELSE: `HttpsPost` renders the request as ONE
+/// contiguous slice written ONCE (one record), reads in place, and the
+/// transport's `WouldBlock` is `io::Error::from(kind)` (it was
+/// `Error::new(kind, "…")`: three allocations on EVERY drain loop's last
+/// read, in every TLS ingress thread). Measured before H9: 6
+/// allocations/post; after: exactly 2 — rustls' residue. A regression in
+/// our code shows as a third. Removing the residue needs rustls'
+/// unbuffered API (`UnbufferedClientConnection`) — a core-net transport
+/// decision, recorded, not taken here.
+///
+/// The server runs in a CHILD process (this binary's
+/// [`gate72_node_helper`]): the counting allocator is process-global, so
+/// a server thread here would count its own allocations.
+#[test]
+fn https_post_keep_alive_cycle_allocates_only_rustls_record_buffers() {
+    const POSTS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_POST: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate72-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 72 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 72 exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 72 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 72 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 72: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 72 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 72 anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let mut h = core_net::HttpsPost::new("localhost", port, "/evm", cfg, 8192, 16 * 1024)
+        .expect("gate 72 client");
+    let n = exec_hyperevm::rpc::write_chain_id(h.body_mut(), 1).expect("gate 72 body");
+    let mut i = 0;
+    while i < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        let (status, _) = h.post(n).expect("gate 72 warm-up");
+        assert_eq!(status, 200);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < POSTS {
+        let (status, r) = h.post(n).expect("gate 72 post");
+        acc = acc.wrapping_add(u64::from(status) + (r.end - r.start) as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(h.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(h.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_POST * POSTS,
+        "HttpsPost cycle: {allocs} allocations ({bytes} B) over {POSTS} posts — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_POST}/post (one sealed record \
+         out, one decrypted record in); anything above is ours"
+    );
 }

@@ -40,7 +40,7 @@
 use crate::mode::ExecMode;
 
 /// Strategy slots the table covers. Matches `strategy_set`'s slot
-/// count (0 latency-arb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
+/// count (0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
 /// 5 vm · 6 icdp · 7 reserved) and is a power of two so the
 /// range mask is a single `&`.
 pub const EXEC_SLOTS: usize = 8;
@@ -54,12 +54,16 @@ pub const EXEC_SLOTS: usize = 8;
 const _: () = assert!(EXEC_SLOTS.is_power_of_two());
 const _: () = assert!(EXEC_SLOTS <= u8::MAX as usize + 1);
 
-/// Venues a `venue_mask` byte can express — `core_types::VenueId` is
-/// 0..=7 since MX2 (Polymarket · Binance · Okx · Deribit · Hyperliquid ·
-/// Ai · Bybit · Mexc), so one `u8` covers the domain EXACTLY: a ninth
-/// venue (byte 8) needs this, and the mask type, widened first.
-/// A `venue` byte at or above this fails closed (not allowed).
-pub const EXEC_VENUES: u8 = 8;
+/// Venues a `venue_mask` word can express. `core_types::VenueId` is
+/// 0..=8 since HYPARB (O-H11: … · Bybit · Mexc · HyperEvm), which
+/// overflowed the original `u8` mask — `mask >> (venue & 7)` would have
+/// aliased venue 8 onto 0 (Polymarket). The mask is a `u16` and this is
+/// 16: a power of two, so the masked shift below stays a single `&`,
+/// with seven venues of headroom. A `venue` byte at or above this fails
+/// closed (not allowed).
+pub const EXEC_VENUES: u8 = 16;
+const _: () = assert!((EXEC_VENUES as u32).is_power_of_two() && EXEC_VENUES as u32 <= u16::BITS);
+const _: () = assert!(core_types::VENUE_COUNT <= EXEC_VENUES as usize);
 
 /// Why a slot could not be written into the table. Boot-time only.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -255,7 +259,7 @@ pub struct ExecRoute {
     /// Index = `strategy_id`. Bit `i` set = the slot may trade
     /// `VenueId(i)`. **Hot.** Only consulted on the `Live` arm: a
     /// paper slot's venue is the paper matcher's business.
-    venue_mask: [u8; EXEC_SLOTS],
+    venue_mask: [u16; EXEC_SLOTS],
     /// Per-slot single-order notional clamp, USD x1e6. Carried by E1
     /// for the boot tell and `/state`; **enforced in E6** (the risk
     /// gate), which is the phase that owns clamping.
@@ -267,7 +271,8 @@ pub struct ExecRoute {
     cap_instance_usd_1e6: [i64; EXEC_SLOTS],
     /// **E6** — per-slot day clamp, USD x1e6, filled buy turnover.
     cap_day_usd_1e6: [i64; EXEC_SLOTS],
-    /// Pad the clamp fields (240 B) to a whole number of lines
+    /// Pad the hot arrays + clamp fields (248 B since HYPARB widened
+    /// `venue_mask` to `u16`; 240 B before) to a whole number of lines
     /// (256 B, four of them), so the halt table that follows starts
     /// on a line boundary — which this field only achieves by sitting
     /// BEFORE `halts`; an earlier layout declared it after and the
@@ -279,7 +284,7 @@ pub struct ExecRoute {
     /// line, and the E6 clamps — read only on the live arm, after the
     /// mode branch has already resolved — sit on lines 2 and 3 where
     /// a paper boot never touches them.
-    _pad: [u8; 16],
+    _pad: [u8; 8],
     /// **E6 commit 3** — per-slot halt thresholds. 48 B each (32 B
     /// before E7's session bound), eight of them: lines 5–10.
     halts: [HaltLimits; EXEC_SLOTS],
@@ -301,13 +306,13 @@ impl ExecRoute {
     pub const fn all_paper() -> Self {
         Self {
             modes: [ExecMode::Paper as u8; EXEC_SLOTS],
-            venue_mask: [0u8; EXEC_SLOTS],
+            venue_mask: [0u16; EXEC_SLOTS],
             max_order_usd_1e6: [0i64; EXEC_SLOTS],
             max_open_orders: [0u32; EXEC_SLOTS],
             cap_instance_usd_1e6: [0i64; EXEC_SLOTS],
             cap_day_usd_1e6: [0i64; EXEC_SLOTS],
             halts: [HaltLimits::none(); EXEC_SLOTS],
-            _pad: [0u8; 16],
+            _pad: [0u8; 8],
         }
     }
 
@@ -330,14 +335,14 @@ impl ExecRoute {
         if slot >= EXEC_SLOTS {
             return Err(ExecRouteErr::SlotOutOfRange(slot));
         }
-        let mut mask = 0u8;
+        let mut mask = 0u16;
         let mut i = 0usize;
         while i < venues.len() {
             let v = venues[i];
             if v >= EXEC_VENUES {
                 return Err(ExecRouteErr::VenueOutOfRange(v));
             }
-            mask |= 1u8 << v;
+            mask |= 1u16 << v;
             i += 1;
         }
         self.modes[slot] = mode.as_u8();
@@ -386,9 +391,9 @@ impl ExecRoute {
         let venue_ok = (venue < EXEC_VENUES) as u8;
         // SAFETY: as in `mode` — `idx` is masked into range.
         let mask = unsafe { *self.venue_mask.get_unchecked(idx) };
-        // Masked shift: `venue & 7` is always a legal shift distance
-        // for u8, so no UB and no debug panic on a wild venue byte.
-        let bit = (mask >> (venue & (EXEC_VENUES - 1))) & 1;
+        // Masked shift: `venue & 15` is always a legal shift distance
+        // for u16, so no UB and no debug panic on a wild venue byte.
+        let bit = ((mask >> (venue & (EXEC_VENUES - 1))) & 1) as u8;
         (bit & slot_ok & venue_ok) == 1
     }
 
@@ -441,7 +446,7 @@ impl ExecRoute {
         }
         let mut i = 0usize;
         while i < EXEC_SLOTS {
-            if self.modes[i] == ExecMode::Live as u8 && self.venue_mask[i] & (1u8 << venue) != 0 {
+            if self.modes[i] == ExecMode::Live as u8 && self.venue_mask[i] & (1u16 << venue) != 0 {
                 return true;
             }
             i += 1;
@@ -452,7 +457,7 @@ impl ExecRoute {
     /// The slot's venue bitmask. Cold; boot tell + `/state`.
     #[inline]
     #[must_use]
-    pub fn venue_mask_at(&self, slot: usize) -> Option<u8> {
+    pub fn venue_mask_at(&self, slot: usize) -> Option<u16> {
         if slot >= EXEC_SLOTS {
             return None;
         }
@@ -560,7 +565,10 @@ mod tests {
         let modes = core::ptr::addr_of!(r.modes) as usize - base;
         let venues = core::ptr::addr_of!(r.venue_mask) as usize - base;
         assert!(modes + EXEC_SLOTS <= 64, "modes at {modes} spills line 0");
-        assert!(venues + EXEC_SLOTS <= 64, "venue_mask at {venues} spills line 0");
+        assert!(
+            venues + 2 * EXEC_SLOTS <= 64,
+            "venue_mask at {venues} spills line 0"
+        );
     }
 
     #[test]
@@ -644,11 +652,50 @@ mod tests {
     fn a_wild_venue_byte_never_panics_and_never_allows() {
         let mut r = ExecRoute::all_paper();
         r.set_slot(3, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
-        // Bit 4 is set; without the `venue_ok` term, venue 12
-        // (12 & 7 == 4) would alias onto it.
+        // Bit 4 is set; without the `venue_ok` term, venue 20
+        // (20 & 15 == 4) would alias onto it.
         for v in EXEC_VENUES..=255 {
             assert!(!r.venue_allowed(3, v), "venue byte {v} must fail closed");
         }
+    }
+
+    /// HYPARB H9 pin: venue 8 (`HyperEvm`, O-H11) is its OWN bit. Under
+    /// the old `u8` mask `mask >> (8 & 7)` read bit 0 — Polymarket's —
+    /// so a slot live on Polymarket would have "allowed" HyperEVM and a
+    /// slot live on HyperEVM would have allowed Polymarket.
+    #[test]
+    fn venue_8_is_its_own_bit_and_never_aliases_onto_venue_0() {
+        let hyperevm = core_types::VenueId::HyperEvm as u8;
+        assert_eq!(hyperevm, 8);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[0],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert!(r.venue_allowed(3, 0));
+        assert!(
+            !r.venue_allowed(3, hyperevm),
+            "venue 0 live does not allow venue 8"
+        );
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[hyperevm],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert!(r.venue_allowed(3, hyperevm));
+        assert!(
+            !r.venue_allowed(3, 0),
+            "venue 8 live does not allow venue 0"
+        );
+        assert_eq!(r.venue_mask_at(3), Some(1 << 8));
     }
 
     #[test]

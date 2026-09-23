@@ -1,0 +1,15 @@
+# HYPARB executor (O-H18) — tests only. The DEPLOYED bytes are the committed
+# HyparbExecutor.bin, reproduced by scripts/hyparb-executor-repro.sh with the
+# same settings as below (keep them in step; forge's output equals it).
+[profile.default]
+src = "src"
+test = "test"
+# Build output under the repo's git-ignored target/.
+out = "../../target/hyparb-executor/out"
+cache_path = "../../target/hyparb-executor/cache"
+solc_version = "0.8.28"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 10000
+bytecode_hash = "none"
+cbor_metadata = false

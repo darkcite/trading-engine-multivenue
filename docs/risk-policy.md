@@ -412,6 +412,9 @@ hard-coded `--paper`, not the flag's own design.
   zeroize-on-drop — rather than a second implementation. Two
   implementations of a key's memory handling is one more than can be
   audited, and E4 puts a MAINNET key in that struct.
+- **HYPARB (H8) adds the HyperEVM testnet wallets** — the same
+  `SecretKeyBytes`, read through `from_hex_env`; see "HYPARB — slot 0"
+  below for which variable and why it may be the E3 testnet key.
 - The intermediate hex `String` the environment hands us is zeroized
   after parsing. Without that, the key sits in freed heap for the life
   of the process.
@@ -2327,6 +2330,31 @@ stronger property than its condition tests. So it is recorded inside
 the HTTP cycle at the moment the write is attempted, and returned in a
 struct every one of the fifteen call sites must destructure.
 
+#### The live arm's stale keep-alive (H9c, operator ask, 2026-09-24)
+
+Found by the HYPARB H9 review on `core_net::HttpsPost`, which copied
+`HlHttp`'s shape. The venue closes an idle keep-alive connection on its
+own schedule (and may announce `Connection: close`). `HlHttp` reused
+such a connection: the next ORDER's bytes went into a socket the peer
+had already closed, the local write succeeded, the read found EOF, and
+the order came back `Disconnected` with `left_host == true` — counted
+`sent_unanswered`, charged to the address budget, left to
+reconciliation, although no byte of it reached the venue. An entry lost
+exactly when the book was worth entering.
+
+Now an answer that announces `Connection: close` (or arrives with the
+FIN) retires the connection WITH the answer (the answer is kept), and a
+one-byte non-blocking read before each reuse retires a connection the
+venue closed while idle; the order dials fresh with `left_host ==
+false`. Cost: one `read(2)` per order on a healthy connection, a TLS
+handshake (50–150 ms) only when the venue had closed it — which the
+order would otherwise have lost. `HlHttp::dials()` counts handshakes.
+Pinned by `hl_exchange_tls_loopback::an_idle_close_is_noticed_before_the_next_order_is_written`
+and `…::an_announced_close_retires_the_connection_with_the_answer`
+(both RED with the fix disabled). It reaches the armed engine only
+through a merge to `main`, a release build and an
+`exec-smoke`-gated restart.
+
 #### A torn write COUNTS
 
 `left_host` is set before the write is attempted rather than after it
@@ -2583,6 +2611,15 @@ plaintext through a heap `Vec` — an allocation per record that the
 alloc gate cannot see, because it drives a test transport. UNVERIFIED:
 it needs an allocation count over a real TLS loopback before anyone
 moves the engine's TLS reader.
+
+**Measured since the HYPARB merge (2026-09-23).** HYPARB H9's bench
+gate 72 is that count: `HttpsPost` against a rustls loopback node, in a
+child process, allocates EXACTLY 2 per request — one per record sealed,
+one per application-data record decrypted (rustls 0.23's buffered API)
+— once `TlsTransport::read`'s `WouldBlock` stopped allocating (3 more
+per drain loop until then). Record: "HYPARB — slot 0" → "What H9 fixed
+on the write path". The move to the unbuffered API stays the
+operator's transport decision.
 
 Gate after the pass: `hits=32 baselined=32 new=0 paid=0` over the exec
 lane, `core-net` and `ingress-binance`. The baseline shrank by one (the
@@ -4744,3 +4781,171 @@ having both.
 * `.claude/settings.json` still names `claude-opus-4-6` as the SESSION
   model; only the three review agents were pinned to `claude-opus-5`
   (the ruling was about the agents). Operator's call.
+
+## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
+
+Slot 0 is `hyparb`, the HyperEVM AMM ↔ Hyperliquid Core arb
+(`crates/strategy-hyparb`). It trades **PAPER**; the mask flip that puts
+it in `strategy.conf` is an operator action after H9 (O-H8). Its only
+real submission path is the HyperEVM **TESTNET** shadow (chain 998).
+Build record: `docs/hyparb-build-plan.md` §16.
+
+### Slot 0 is never armed live (H9)
+
+`exec_boot::NEVER_LIVE_SLOTS` holds slot 0: a `mode = "live"` slot 0
+refuses the boot even when both arming switches agree and the venue it
+names has a live arm. The reason is structural, not cautious: the
+member's AMM leg has NO live arm (HyperEVM writes are testnet-only),
+while its hedge legs name Hyperliquid, which DOES — arming slot 0 would
+send real hedges against paper swaps, a one-legged arb building real
+inventory. Pinned by `exec_boot::tests::slot_0_hyparb_is_never_armed_live`.
+
+### The member's caps (`hyparb.toml`, paper)
+
+| cap | key | shipped value |
+|---|---|---|
+| one arb | `max_order_usd_1e6` | $100 |
+| one pool (a `[[pool]]` may set its own) | `cap_instance_usd_1e6` | $100 |
+| one UTC day of AMM notional | `cap_day_usd_1e6` | $2,000 |
+| unhedged inventory, all coins | `inventory_cap_usd_1e6` | $300 |
+
+The inventory cap is an **entry gate**: a breach halts NEW arbs; hedges
+and the flattening timer keep running (they are how the exposure comes
+down), and the halt lifts only under half the cap. H9 closed a hole in
+it: a coin whose hedge books had gone unusable was valued at **$0**, so
+a dead book could lift the halt with the exposure still on. Now a coin
+is valued at its last usable mid; inventory in a coin that never had a
+mid cannot be valued at all, and unvalued inventory both SETS the halt
+and never lifts it — an exposure of unknown size is under no cap.
+
+### The EVM write path's interlock
+
+1. **Compiled:** `exec_hyperevm::EVM_ARM_CHAIN_IDS = [998]`,
+   compile-time asserted; `Network` has no mainnet variant, so an arm
+   for chain 999 cannot be constructed.
+2. **Signed:** every transaction is EIP-155 — chain id 998 inside the
+   signed payload, so no signature this engine makes is valid on 999
+   (the node answers "invalid chain ID"; the arm HALTS on that refusal).
+3. **At the wire, at boot:** the write endpoint's `eth_chainId` must be
+   998 (the arm halts otherwise), and `check_chains(read, write,
+   --evm-hybrid)` allows same-chain, or exactly 999 reads → 998 writes
+   with the O-H12 switch — never the inverse.
+4. **Switches:** `mode = "testnet"` in `hyparb.toml` AND `--evm-testnet`
+   (+ `--evm-hybrid` for mainnet reads); either alone refuses.
+5. **Per-process halt:** a node that answers a different hash than the
+   one signed, a receipt from another sender or to another target, or a
+   node refusing the chain HALTS the arm for the life of the process —
+   nothing more is sent; only a restart re-arms it.
+
+**Refuse vs dark (H9).** A misconfiguration or a VERIFIED interlock
+failure refuses the boot: a wrong chain, a 999 read without the switch,
+a missing or malformed key or URL, an executor wallet 0 does not own or
+an executor address with no contract. An endpoint that cannot be used
+right now — DNS, transport, a non-200, the public endpoint's `-32005`
+throttle (a JSON-RPC error inside an HTTP 200, so it is classified by
+its message: `ArmErr::RateLimited`), an unreadable answer to a routine
+read — or an unfunded wallet 0 leaves the shadow **DARK**: logged at
+ERROR, `engine_hyparb_evm_dark = 1`, nothing sent, the paper member
+running. Dark bypasses no interlock: an interlock that could not be
+verified is still not passed, because nothing is sent. (A mistyped HOST
+is a DNS failure and therefore dark — it looks like an outage from
+here; the ERROR line names it.)
+
+### The shadow is a submission path OUTSIDE the risk gate
+
+The E6 risk gate sits in `RoutedDispatcher`, on `Order`s. The shadow
+does not go through it: the `evm-shadow` thread sends testnet swaps
+straight from the member's decision log. Its bounds are therefore its
+own, and they are these:
+
+* **Testnet only** (the interlock above) — no swap it sends can move
+  mainnet value.
+* **One swap in flight**, from **wallet 0 only**: the executor accepts
+  its immutable owner alone (`NotOwner`), boot reads `owner()` and
+  refuses an executor wallet 0 does not own. While a swap is in flight
+  a burst of decisions collapses to its newest (`superseded`, counted).
+  Wallets 1..7 carry the battery's nonce and ordering probes (0-value
+  self-transfers), never a swap.
+* **Fixed size:** every swap is `[testnet] amount_raw` exact input,
+  whatever the decision's notional.
+* **Gas:** G2 — a quarter of the decision's net edge over the swap's gas
+  limit, never above `gas_p99_usd_1e6` — so a shadow swap never bids
+  more than the artifact's p99 gas.
+* **Nonces:** one transaction in flight per wallet, `Ready` only when
+  `latest == pending`; a refusal that proves the nonce was not taken
+  returns it, anything else quarantines the wallet until a settled sync.
+
+A MAINNET write path would need an executor allow-list or one executor
+per wallet (a contract change under its own review) and a place inside
+the risk gate — neither exists, and the chain allow-list keeps it so.
+
+### The executor answers three callback names (H9d, 2026-09-24)
+
+Found live by the H8 battery: its first swap reverted on chain because
+the testnet pool is Hyperswap V3, whose pools call
+`hyperswapV3SwapCallback` — a name the executor did not have (mainnet
+Hyperswap runs the same pool code). The contract now answers it; it
+routes to the same `_pay` as `uniswapV3SwapCallback` and
+`algebraSwapCallback`, which pays only the pool the current call is
+swapping and only inside that swap (transient storage), so a third name
+adds no trust. An executor deployed before H9d must be redeployed
+(`evm-testnet deploy`, then `[testnet] executor`); boot's `owner()` check
+does not tell the two apart, the first swap's revert does. The cost of
+the miss was gas only — `BelowMinOut` and a callback revert both move no
+inventory.
+
+### Signing keys
+
+`HYPEREVM_TESTNET_KEY`, else — by the 2026-09-23 operator ruling ("reuse
+the one we used for HL") — `HYPERLIQUID_TESTNET_AGENT_KEY`, which makes
+this lane a NEW reader of the E3 gate's testnet key; never the mainnet
+agent key (pinned by a test). Read through
+`core_config::SecretKeyBytes::from_hex_env` (the one env-hex-key reader:
+mlock'd page, the env string zeroized, errors name the variable, never
+the value). Wallets 1..7 are derived from it, each in its own mlock'd
+page. The engine never opens `.env`; `scripts/evm-testnet.sh` sources it
+exactly as `exec-smoke.sh` does.
+
+### What H9 fixed on the write path (review, 2026-09-23)
+
+* **R4 (critical)** — the shadow picked wallets round-robin; the
+  executor accepts its owner (wallet 0) only, so every swap from wallets
+  1.. would have reverted and burnt gas. Fixed as above.
+* **R3** — every boot failure refused the engine; transport, throttle
+  and funding failures now leave the shadow dark (the second review
+  caught the throttle: it arrives as an HTTP 200 and first scanned as
+  "unreadable" — a refusal).
+* **A false "may have left the host"** — a kept-alive connection the
+  server had since closed took the next request's bytes into a dead
+  socket, and the arm booked a `MaybeSent` (a wallet lost to the receipt
+  timeout). `HttpsPost` now retires a connection the answer closes or
+  announces closing, and probes one before reusing it.
+* **Allocations on every TLS ingress thread** — `TlsTransport::read`
+  built its `WouldBlock` with `io::Error::new(kind, "…")`: three heap
+  allocations at the end of EVERY drain loop, on every TLS socket in the
+  engine, since 2026-08-14. Now `io::Error::from(kind)`. Found by a
+  measurement the alloc gates could not make (they drive
+  `TestTransport`); bench gate 72 now pins the HTTPS cycle.
+* **A chunked answer could abort the engine** (found by the H9 fuzz
+  run, `http1_response`; present since the initial commit): a chunk
+  size near `usize::MAX` wrapped the chunk's end below its start, the
+  framing check read the size line's own CRLF and passed, and the copy
+  pass panicked on the inverted range — `panic = "abort"` in release,
+  so one malformed chunked answer ended the process. Reachable from
+  `boot_http` (every venue's boot REST) and `HttpsPost`. The walk now
+  uses checked arithmetic: such a size is `Malformed`.
+* **The shadow's steady state left the opt-out.** `evm_testnet.rs`
+  carries a file-level `COPY-DOCTRINE:` header, which the copy audit
+  honours for the whole file — and the engine thread's `drain` lived
+  there. The tap and the worker are now `crates/cli/src/evm_shadow.rs`
+  (no opt-out, in the audit's default sweep), and `drain` walks the
+  member's decision log in place instead of staging 64 × 48 B per
+  report.
+* **Residue, recorded not fixed:** rustls 0.23's buffered API allocates
+  one `Vec` per TLS record sealed and one per application-data record
+  decrypted — on every TLS socket, the E-lane's `HlHttp` included (it
+  writes head and body as two records: two allocations where one would
+  do; its stale-keep-alive shape WAS fixed — H9c, "The live arm's stale
+  keep-alive"). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
+  is rustls' unbuffered API (`UnbufferedClientConnection`) — a core-net
+  transport decision for the operator, not a HYPARB-lane change.

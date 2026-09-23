@@ -17,7 +17,7 @@ core-time            = { workspace = true }
 core-types           = { workspace = true }
 strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }
-strategy-latency-arb = { workspace = true }
+strategy-hyparb      = { workspace = true }
 strategy-icdp        = { workspace = true }
 strategy-bin15       = { workspace = true }
 strategy-vm          = { workspace = true }

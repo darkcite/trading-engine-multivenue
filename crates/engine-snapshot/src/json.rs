@@ -511,6 +511,143 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(cp.orders_io_errors);
     c.put(b"}");
 
+    // --- hyparb (HYPARB H6) ---
+    //
+    // Additive: `"v":1` stays. The side balance, the basis per pool and
+    // the hedge books per coin are read together because the disputed
+    // quantities are relationships between them (plan §10).
+    let hy = &s.hyparb;
+    let hc = &hy.counters;
+    c.key("hyparb");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(hy.n_pools > 0));
+    c.key("n_pools");
+    c.u64(u64::from(hy.n_pools));
+    c.key("n_coins");
+    c.u64(u64::from(hy.n_coins));
+    c.key("halted");
+    c.u64(hc.halted);
+    // The counters sit flat in the object (a nested `counters` key would
+    // shadow the top-level section of that name).
+    c.key("pool_events");
+    c.u64(hc.pool_events);
+    c.key("pool_refused");
+    c.u64(hc.pool_refused);
+    c.key("maps_loaded");
+    c.u64(hc.maps_loaded);
+    c.key("maps_refused");
+    c.u64(hc.maps_refused);
+    c.key("evaluations");
+    c.u64(hc.evaluations);
+    c.key("arbs_submitted");
+    c.u64(hc.arbs_submitted);
+    c.key("arbs_buy");
+    c.u64(hc.arbs_buy);
+    c.key("arbs_sell");
+    c.u64(hc.arbs_sell);
+    c.key("skipped_below_min");
+    c.u64(hc.skipped_below_min);
+    c.key("skipped_not_live");
+    c.u64(hc.skipped_not_live);
+    c.key("skipped_no_hedge");
+    c.u64(hc.skipped_no_hedge);
+    c.key("skipped_inflight");
+    c.u64(hc.skipped_inflight);
+    c.key("skipped_cooldown");
+    c.u64(hc.skipped_cooldown);
+    c.key("skipped_halted");
+    c.u64(hc.skipped_halted);
+    c.key("size_capped");
+    c.u64(hc.size_capped);
+    c.key("amm_fills");
+    c.u64(hc.amm_fills);
+    c.key("hedges_submitted");
+    c.u64(hc.hedges_submitted);
+    c.key("hedges_perp");
+    c.u64(hc.hedges_perp);
+    c.key("hedges_spot");
+    c.u64(hc.hedges_spot);
+    c.key("hedge_fills");
+    c.u64(hc.hedge_fills);
+    c.key("hedges_missed");
+    c.u64(hc.hedges_missed);
+    c.key("flattens_submitted");
+    c.u64(hc.flattens_submitted);
+    c.key("inventory_breaches");
+    c.u64(hc.inventory_breaches);
+    c.key("orders_dropped");
+    c.u64(hc.orders_dropped);
+    c.key("gas_charged_usd_1e6");
+    c.i64(hc.gas_charged_usd_1e6);
+    c.key("pnl_predicted_usd_1e6");
+    c.i64(hc.pnl_predicted_usd_1e6);
+    c.key("amm_notional_usd_1e6");
+    c.i64(hc.amm_notional_usd_1e6);
+    c.key("funding_earned_usd_1e6");
+    c.i64(hc.funding_earned_usd_1e6);
+    c.key("pools");
+    c.put(b"[");
+    let np = (hy.n_pools as usize).min(crate::SNAPSHOT_HYPARB_POOLS);
+    let mut i = 0usize;
+    while i < np {
+        let r = &hy.pools[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"sym\":");
+        c.u64(u64::from(r.sym));
+        c.key("live");
+        c.u64(u64::from(r.live));
+        c.key("map_ok");
+        c.u64(u64::from(r.map_ok));
+        c.key("hedge_venue");
+        c.u64(u64::from(r.hedge_venue));
+        c.key("fee_pips");
+        c.u64(u64::from(r.fee_pips));
+        c.key("mid_1e6");
+        c.i64(r.mid_1e6);
+        c.key("basis_bps_1e6");
+        c.i64(r.basis_bps_1e6);
+        c.key("arbs");
+        c.u64(r.arbs);
+        c.key("pnl_predicted_usd_1e6");
+        c.i64(r.pnl_predicted_usd_1e6);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]");
+    c.key("coins");
+    c.put(b"[");
+    let nc = (hy.n_coins as usize).min(crate::SNAPSHOT_HYPARB_COINS);
+    let mut i = 0usize;
+    while i < nc {
+        let r = &hy.coins[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"perp_sym\":");
+        c.u64(u64::from(r.perp_sym));
+        c.key("spot_sym");
+        c.u64(u64::from(r.spot_sym));
+        c.key("perp_depth_usd_1e6");
+        c.i64(r.perp_depth_usd_1e6);
+        c.key("spot_depth_usd_1e6");
+        c.i64(r.spot_depth_usd_1e6);
+        c.key("perp_cost_bps_1e6");
+        c.i64(r.perp_cost_bps_1e6);
+        c.key("spot_cost_bps_1e6");
+        c.i64(r.spot_cost_bps_1e6);
+        c.key("inventory_1e6");
+        c.i64(r.inventory_1e6);
+        c.key("perp_pos_1e6");
+        c.i64(r.perp_pos_1e6);
+        c.key("funding_1e9");
+        c.i64(r.funding_1e9);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]}");
+
     // --- recent ---
     c.key("recent");
     c.put(b"{\"orders_total\":");
@@ -975,13 +1112,20 @@ mod tests {
         let body = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(body.starts_with("{\"v\":1,\"seq\":0,"), "{body}");
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
-        assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"latency-arb\""));
+        assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
         assert!(body.contains("\"venue\":\"rpc\""));
         // MX2: MEXC is appended after rpc — the array order is the
         // `/state` contract, so it must render LAST.
         let rpc = body.find("\"venue\":\"rpc\"").unwrap();
         let mexc = body.find("\"venue\":\"mexc\"").expect("mexc ingress row");
         assert!(rpc < mexc, "mexc must follow rpc (append, never reorder)");
+        let hev = body
+            .find("\"venue\":\"hyperevm\"")
+            .expect("hyperevm ingress row");
+        assert!(
+            mexc < hev,
+            "hyperevm must follow mexc (append, never reorder)"
+        );
         assert!(body.contains("\"heartbeat_age_s\":-1"));
     }
 

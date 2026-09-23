@@ -16,7 +16,7 @@
 //!
 //! | slot | member | status |
 //! |---|---|---|
-//! | 0 | `strategy-latency-arb` | built |
+//! | 0 | `strategy-hyparb` | built (HYPARB H0, 2026-09-23 — **was `strategy-latency-arb`**, unlinked the same day; lands DARK — O-H8) |
 //! | 1 | `strategy-vrp` | built (VRP V7, 2026-09-10 — **was `strategy-ev`**) |
 //! | 2 | `strategy-xsd` | built (XSD-3, 2026-09-12 — **was `strategy-cross-arb`**, unlinked at XSD-S the same day) — configured only when `~/multivenue/xsd.toml` + `xsd-table.tsv` resolve |
 //! | 3 | `strategy-bin15` | built (BIN15 O4b, 2026-09-12 — **was `strategy-rule-tree`**, unlinked the same day) — configured only when `~/multivenue/bin15.toml` + its seeds resolve |
@@ -99,19 +99,22 @@ use strategy_core::{
 // RG6: `regime_rel_view` copies the detector's view arrays straight
 // into the trait's POD — the two capacities must agree.
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
+use strategy_bin15::Bin15Strategy;
+use strategy_hyparb::HyparbStrategy;
+use strategy_icdp::IcdpStrategy;
+use strategy_vm::VmStrategy;
 use strategy_vrp::VrpStrategy;
 use strategy_xsd::XsdStrategy;
-use strategy_icdp::IcdpStrategy;
-use strategy_latency_arb::LatencyArb;
-use strategy_bin15::Bin15Strategy;
-use strategy_vm::VmStrategy;
 
 // ---------------------------------------------------------------
 // Slot / mask constants
 // ---------------------------------------------------------------
 
-/// Slot index of the latency-arb member.
-pub const SLOT_LATENCY_ARB: u8 = 0;
+/// Slot index of the hyparb member (HYPARB O-H2, 2026-09-23 — **was
+/// `strategy-latency-arb`**, unlinked by O-H1: the crate stays in the
+/// workspace, nothing links it). The number is wire-stable: a capture
+/// taken before H0 carries latency-arb rows under slot 0.
+pub const SLOT_HYPARB: u8 = 0;
 /// Slot index of the VRP member.
 ///
 /// **The swap boundary.** Slot 1 was `strategy-ev` until 2026-09-10
@@ -157,8 +160,8 @@ pub const SLOT_VM: u8 = STRATEGY_SLOT_VM;
 /// `Order.strategy_id` 6 = icdp).
 pub const SLOT_ICDP: u8 = 6;
 
-/// Enable-mask bit for the latency-arb member.
-pub const BIT_LATENCY_ARB: u8 = 1 << SLOT_LATENCY_ARB;
+/// Enable-mask bit for the hyparb member (slot 0 — see [`SLOT_HYPARB`]).
+pub const BIT_HYPARB: u8 = 1 << SLOT_HYPARB;
 /// Enable-mask bit for the VRP member (slot 1 — see [`SLOT_VRP`]).
 pub const BIT_VRP: u8 = 1 << SLOT_VRP;
 /// Slot 1's bit under its pre-2026-09-10 name. Identical value.
@@ -176,10 +179,8 @@ pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
 
 /// Every built member's bit (slots 0–6).
 pub const BUILT_MASK: u8 =
-    BIT_LATENCY_ARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
 
-/// Latency-arb slot capacity inside the set (design §7 sketch).
-pub const SET_LATENCY_ARB_SLOTS: usize = 64;
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
 pub const SET_AI_EXEC_SLOTS: usize = 64;
@@ -195,7 +196,17 @@ pub const SET_AI_EXEC_SLOTS: usize = 64;
 /// it, so a name can never again resolve here while refusing to boot.
 /// Boot-only — a linear scan over a handful of entries, never hot.
 pub const MASK_TABLE: &[(&str, u8)] = &[
-    ("latency-arb", BIT_LATENCY_ARB),
+    // HYPARB H0 (2026-09-23): slot 0 is the hyparb member;
+    // `latency-arb` is GONE as a name (O-H1) — an operator who types
+    // the old one gets a boot refusal, not a different strategy than
+    // the one asked for. Lands DARK (O-H8): the live strategy.conf
+    // names none of these until HZ and H8 are green.
+    ("hyparb", BIT_HYPARB),
+    ("ai+hyparb", BIT_AI_EXEC | BIT_VM | BIT_HYPARB),
+    (
+        "ai+vrp+xsd+bin15+hyparb",
+        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB,
+    ),
     // XSD-S/XSD-3 (2026-09-12): slot 2 is the xsd member; `cross-arb`
     // is GONE as a name — an operator who types the old one gets a
     // boot refusal, not a different strategy than the one asked for.
@@ -263,7 +274,7 @@ pub fn mask_for_name(name: &str) -> Option<u8> {
 /// Statically-composed strategy set. See the module docs for slot
 /// map, routing and boot semantics.
 pub struct StrategySet {
-    latency_arb: LatencyArb<SET_LATENCY_ARB_SLOTS>,
+    hyparb: HyparbStrategy,
     vrp: VrpStrategy,
     xsd: XsdStrategy,
     bin15: Bin15Strategy,
@@ -314,7 +325,7 @@ impl StrategySet {
     pub fn new(initial_mask: u8) -> Self {
         let m = initial_mask & BUILT_MASK;
         Self {
-            latency_arb: LatencyArb::new(),
+            hyparb: HyparbStrategy::new(),
             vrp: VrpStrategy::new(),
             xsd: XsdStrategy::new(),
             bin15: Bin15Strategy::new(),
@@ -370,7 +381,7 @@ impl StrategySet {
     /// coded member or the member cannot be relabelled.
     pub fn set_regime_label(&mut self, slot: u8, set: RegimeLabelSet) -> bool {
         let ok = match slot {
-            SLOT_LATENCY_ARB => self.latency_arb.set_regime_label(set),
+            SLOT_HYPARB => self.hyparb.set_regime_label(set),
             SLOT_VRP => self.vrp.set_regime_label(set),
             SLOT_XSD => self.xsd.set_regime_label(set),
             SLOT_BIN15 => self.bin15.set_regime_label(set),
@@ -411,7 +422,7 @@ impl StrategySet {
     }
 
     fn pull_regime_labels(&mut self) {
-        self.regime_labels[SLOT_LATENCY_ARB as usize] = self.latency_arb.regime_label();
+        self.regime_labels[SLOT_HYPARB as usize] = self.hyparb.regime_label();
         self.regime_labels[SLOT_VRP as usize] = self.vrp.regime_label();
         self.regime_labels[SLOT_XSD as usize] = self.xsd.regime_label();
         self.regime_labels[SLOT_BIN15 as usize] = self.bin15.regime_label();
@@ -481,9 +492,9 @@ impl StrategySet {
 
     fn deliver_gate<C: Ctx>(&mut self, slot: u8, gate: RegimeGate, ctx: &mut C) {
         match slot {
-            SLOT_LATENCY_ARB => self
-                .latency_arb
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB)),
+            SLOT_HYPARB => self
+                .hyparb
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
             SLOT_VRP => self
                 .vrp
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
@@ -525,19 +536,19 @@ impl StrategySet {
         self.enable_refused
     }
 
-    /// Configure the latency-arb member (boot-only).
+    /// Configure the hyparb member (boot-only).
     #[inline]
-    pub fn latency_arb_mut(&mut self) -> &mut LatencyArb<SET_LATENCY_ARB_SLOTS> {
-        &mut self.latency_arb
+    pub fn hyparb_mut(&mut self) -> &mut HyparbStrategy {
+        &mut self.hyparb
     }
 
     /// X1: deliver an attributed fill to exactly one enabled slot.
     #[inline(always)]
     fn route_fill_to_slot<C: Ctx>(&mut self, slot: u8, fill: &Fill, ctx: &mut C) {
         match slot {
-            SLOT_LATENCY_ARB => self
-                .latency_arb
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB)),
+            SLOT_HYPARB => self
+                .hyparb
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
             SLOT_VRP => self
                 .vrp
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
@@ -642,7 +653,7 @@ impl StrategySet {
             return;
         }
         let bit = match slot {
-            SLOT_LATENCY_ARB => BIT_LATENCY_ARB,
+            SLOT_HYPARB => BIT_HYPARB,
             SLOT_VRP => BIT_VRP,
             SLOT_XSD => BIT_XSD,
             SLOT_BIN15 => BIT_BIN15,
@@ -683,7 +694,7 @@ impl StrategySet {
 impl StrategyCounters for StrategySet {
     #[inline]
     fn orders_emitted(&self) -> u64 {
-        self.latency_arb.orders_emitted()
+        self.hyparb.orders_emitted()
             + self.vrp.orders_emitted()
             + self.xsd.orders_emitted()
             + self.bin15.orders_emitted()
@@ -693,7 +704,7 @@ impl StrategyCounters for StrategySet {
     }
     #[inline]
     fn orders_dropped(&self) -> u64 {
-        self.latency_arb.orders_dropped()
+        self.hyparb.orders_dropped()
             + self.vrp.orders_dropped()
             + self.xsd.orders_dropped()
             + self.bin15.orders_dropped()
@@ -790,6 +801,23 @@ impl StrategyCounters for StrategySet {
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
     }
+    /// HYPARB H4: slot 0's observables.
+    #[inline]
+    fn hyparb_counters(&self) -> strategy_core::HyparbCounters {
+        self.hyparb.hyparb_counters()
+    }
+    #[inline]
+    fn hyparb_pools_view(&self, out: &mut [strategy_core::HyparbPoolView]) -> u32 {
+        self.hyparb.hyparb_pools_view(out)
+    }
+    #[inline]
+    fn hyparb_coins_view(&self, out: &mut [strategy_core::HyparbCoinView]) -> u32 {
+        self.hyparb.hyparb_coins_view(out)
+    }
+    #[inline]
+    fn hyparb_decision_log(&self) -> (&[strategy_core::HyparbDecision], u64) {
+        self.hyparb.hyparb_decision_log()
+    }
     /// BIN15 O4b: slot 3's observables.
     #[inline]
     fn bin15_counters(&self) -> strategy_core::Bin15Counters {
@@ -864,20 +892,11 @@ impl StrategyCounters for StrategySet {
     /// `regime_counters().gates`).
     fn slot_counters(&self, slot: u8) -> SlotCounters {
         let (emitted, dropped) = match slot {
-            SLOT_LATENCY_ARB => (
-                self.latency_arb.orders_emitted(),
-                self.latency_arb.orders_dropped(),
-            ),
+            SLOT_HYPARB => (self.hyparb.orders_emitted(), self.hyparb.orders_dropped()),
             SLOT_VRP => (self.vrp.orders_emitted(), self.vrp.orders_dropped()),
             SLOT_XSD => (self.xsd.orders_emitted(), self.xsd.orders_dropped()),
-            SLOT_BIN15 => (
-                self.bin15.orders_emitted(),
-                self.bin15.orders_dropped(),
-            ),
-            SLOT_AI_EXEC => (
-                self.ai_exec.orders_emitted(),
-                self.ai_exec.orders_dropped(),
-            ),
+            SLOT_BIN15 => (self.bin15.orders_emitted(), self.bin15.orders_dropped()),
+            SLOT_AI_EXEC => (self.ai_exec.orders_emitted(), self.ai_exec.orders_dropped()),
             SLOT_VM => (self.vm.orders_emitted(), self.vm.orders_dropped()),
             SLOT_ICDP => (self.icdp.orders_emitted(), self.icdp.orders_dropped()),
             _ => return SlotCounters::default(),
@@ -975,9 +994,9 @@ impl Strategy for StrategySet {
     /// Every member callback in this impl goes through [`StampCtx`]
     /// (M4.1 M-c) so any submit carries its member's slot.
     fn on_start<C: Ctx>(&mut self, ctx: &mut C) -> Result<(), StrategyError> {
-        if self.initial & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB))?;
+        if self.initial & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_HYPARB))?;
         }
         if self.initial & BIT_VRP != 0 {
             self.vrp.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VRP))?;
@@ -1008,9 +1027,9 @@ impl Strategy for StrategySet {
         // RG2: the detector sees every fresh tick first (one probe +
         // one store for members, one probe for everything else).
         self.regime.on_tick(tick);
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1040,9 +1059,9 @@ impl Strategy for StrategySet {
 
     #[inline(always)]
     fn on_signal<C: Ctx>(&mut self, signal: &Signal, ctx: &mut C) {
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1085,9 +1104,9 @@ impl Strategy for StrategySet {
         {
             self.regime.on_funding(event.v0, event.venue_time_ms);
         }
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1119,9 +1138,9 @@ impl Strategy for StrategySet {
     /// like ticks/events — same mask gate, same slot stamping.
     #[inline(always)]
     fn on_depth<C: Ctx>(&mut self, depth: &core_types::DepthTopK, ctx: &mut C) {
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1153,9 +1172,9 @@ impl Strategy for StrategySet {
     /// like depth — same mask gate, same slot stamping.
     #[inline(always)]
     fn on_opt_summary<C: Ctx>(&mut self, opt: &core_types::OptSummary, ctx: &mut C) {
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1210,9 +1229,9 @@ impl Strategy for StrategySet {
             self.route_fill_to_slot(slot, fill, ctx);
             return;
         }
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1288,9 +1307,9 @@ impl Strategy for StrategySet {
             // shape checks), and every remaining kind fans out.
             _ => {}
         }
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
@@ -1340,9 +1359,9 @@ impl Strategy for StrategySet {
         } else if self.regime.minutes_judged() != minutes_before {
             self.push_regime_views();
         }
-        if self.enabled & BIT_LATENCY_ARB != 0 {
-            self.latency_arb
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
         if self.enabled & BIT_VRP != 0 {
             self.vrp
@@ -1381,7 +1400,7 @@ impl Strategy for StrategySet {
         } else {
             u64::MAX
         };
-        let v = self.latency_arb.timer_period_ns();
+        let v = self.hyparb.timer_period_ns();
         if v < min {
             min = v;
         }
@@ -1416,8 +1435,8 @@ impl Strategy for StrategySet {
         // Stop is unconditional — even disabled members get the
         // teardown callback (they may hold capture-worthy state some
         // day; today all six are no-ops).
-        self.latency_arb
-            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_LATENCY_ARB));
+        self.hyparb
+            .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         self.vrp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VRP));
         self.xsd.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XSD));
         self.bin15
@@ -1469,14 +1488,13 @@ mod tests {
     const PM: SymbolId = 11;
     const BN: SymbolId = 22;
 
-    /// Set with the latency-arb member configured on (PM, BN) and
-    /// cooldown 0 so every trigger emits.
-    fn set_with_latency_arb(initial_mask: u8) -> StrategySet {
-        let mut s = StrategySet::new(initial_mask);
-        s.latency_arb_mut().add_pair(PM, BN).unwrap();
-        s.latency_arb_mut().set_cooldown_ns(0);
-        s
-    }
+    /// The set-level PROBE member (HYPARB H0): the latency-arb trigger
+    /// pair left with its member (O-H1), so the fan-out / mask / halt
+    /// laws are pinned through the ai-exec member instead — a
+    /// Heartbeat then one OrderIntent emits exactly one order when
+    /// slot 4 is live and nothing when it is not.
+    const PROBE_BIT: u8 = BIT_AI_EXEC;
+    const PROBE_SLOT: u8 = SLOT_AI_EXEC;
 
     fn tick(venue: VenueId, sym: SymbolId, bid_1e6: i64, ask_1e6: i64) -> Tick {
         Tick::new(
@@ -1491,13 +1509,12 @@ mod tests {
         )
     }
 
-    /// Feed a Binance reference then a diverged Polymarket book —
-    /// emits exactly one latency-arb order when the member is live.
-    fn feed_trigger(s: &mut StrategySet, c: &mut CountCtx) {
-        // BN mid = 500_000.
-        s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), c);
-        // PM mid = 400_000 → |delta| = 100_000 ≥ threshold 20_000.
-        s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), c);
+    /// Feed the probe: Heartbeat (restores ai-exec liveness, §5.4)
+    /// then one OrderIntent for slot 4.
+    fn feed_probe<C: Ctx>(s: &mut StrategySet, c: &mut C) {
+        s.on_ai(&ai_cmd(AiCmdKind::Heartbeat, STRATEGY_SLOT_NONE), c);
+        let pm = make_symbol_id(VenueId::Polymarket, 3);
+        s.on_ai(&intent_cmd(2, pm, 430_000, 2_000_000), c);
     }
 
     fn ai_cmd(kind: AiCmdKind, slot: u8) -> AiCmd {
@@ -1522,9 +1539,52 @@ mod tests {
         StrategySet::new(0).timer_period_ns()
     }
 
+    /// A set with slot 0 enabled and its member configured: one
+    /// observe-only pool, one perp hedge coin. Tests that need "some
+    /// enabled member" use slot 0 — since H4 it validates in `on_start`.
+    fn hyparb_set() -> StrategySet {
+        let mut s = StrategySet::new(BIT_HYPARB);
+        let mut p = strategy_hyparb::HyparbParams::EMPTY;
+        p.coins[0] = strategy_hyparb::CoinParams {
+            perp_sym: make_symbol_id(VenueId::Hyperliquid, 5),
+            spot_sym: core_types::SYMBOL_ID_NONE,
+            lot_1e6: 10_000,
+            min_notional_usd_1e6: 10_000_000,
+        };
+        p.n_coins = 1;
+        p.pools[0] = strategy_hyparb::PoolParams {
+            sym: make_symbol_id(VenueId::HyperEvm, 1),
+            coin0: 0,
+            coin1: strategy_hyparb::COIN_USD,
+            trade: false,
+            max_notional_usd_1e6: 1_000_000,
+        };
+        p.n_pools = 1;
+        p.lag_ns = 1;
+        p.basis_window_ns = 1;
+        p.max_order_usd_1e6 = 1;
+        p.cap_day_usd_1e6 = 1;
+        p.inventory_cap_usd_1e6 = 1;
+        s.hyparb_mut()
+            .configure(p, core_time::WallAnchor::new(0, 0))
+            .expect("hyparb params");
+        s
+    }
+
     #[test]
     fn initial_mask_from_names() {
-        assert_eq!(mask_for_name("latency-arb"), Some(BIT_LATENCY_ARB));
+        // HYPARB H0 (O-H1): slot 0 is the hyparb member and
+        // `latency-arb` is gone as a NAME — the old name refuses the
+        // boot rather than composing a different member.
+        assert_eq!(mask_for_name("latency-arb"), None);
+        assert_eq!(mask_for_name("hyparb"), Some(BIT_HYPARB));
+        assert_eq!(
+            mask_for_name("hyparb"),
+            Some(1),
+            "slot 0's bit is wire-stable across the swap"
+        );
+        assert_eq!(mask_for_name("ai+hyparb"), Some(49));
+        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb"), Some(63));
         // VRP V7: slot 1 is the VRP member and `ev` is gone as a NAME.
         // An operator who types the old one gets a boot refusal rather
         // than a different strategy than the one they asked for.
@@ -1562,8 +1622,8 @@ mod tests {
         // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
         // (operator ruling 2026-09-02).
         const _: () = assert!(
-            (BIT_AI_EXEC | BIT_VM) & BIT_LATENCY_ARB == 0,
-            "`ai` excludes latency-arb"
+            (BIT_AI_EXEC | BIT_VM) & BIT_HYPARB == 0,
+            "`ai` excludes hyparb"
         );
         // Const pins — checked at compile time (clippy: a runtime
         // `assert!` on consts folds away; this makes the pin official).
@@ -1592,13 +1652,14 @@ mod tests {
 
     #[test]
     fn on_start_validates_initially_enabled_members_only() {
-        // bit0 enabled + configured → ok.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        // Probe enabled + valid → ok.
+        let mut s = StrategySet::new(PROBE_BIT);
         assert!(s.on_start(&mut ctx()).is_ok());
 
-        // bit0 enabled + NOT configured → the member's own
-        // validation error propagates (fail-fast preserved).
-        let mut s = StrategySet::new(BIT_LATENCY_ARB);
+        // Probe enabled + INVALID → the member's own validation error
+        // propagates (fail-fast preserved).
+        let mut s = StrategySet::new(PROBE_BIT);
+        s.ai_exec_mut().set_edge_1e6(0);
         assert!(matches!(
             s.on_start(&mut ctx()),
             Err(StrategyError::Config(_))
@@ -1606,25 +1667,57 @@ mod tests {
 
         // Unconfigured members outside the initial mask are skipped —
         // vrp/bin15 would all fail validation here.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = StrategySet::new(PROBE_BIT);
         assert!(s.on_start(&mut ctx()).is_ok());
+    }
+
+    /// HYPARB H4: slot 0 is a REAL member — unconfigured it refuses the
+    /// boot (fail-fast, like vrp/bin15; the cli never puts it in the
+    /// configured mask without its artifact, O-H8), configured it is
+    /// inert on anything but its own pools and hedge books, and its
+    /// 1 s timer joins the set's minimum.
+    #[test]
+    fn hyparb_slot_refuses_unconfigured_and_is_inert_configured() {
+        let mut s = StrategySet::new(BIT_HYPARB);
+        assert!(matches!(
+            s.on_start(&mut ctx()),
+            Err(StrategyError::Config(_))
+        ));
+        let mut s = hyparb_set();
+        let mut c = ctx();
+        assert!(s.on_start(&mut c).is_ok());
+        s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut c);
+        s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut c);
+        assert_eq!(c.submitted, 0);
+        assert_eq!(s.orders_emitted(), 0);
+        assert_eq!(
+            s.timer_period_ns(),
+            s_timer_without_xsd().min(1_000_000_000)
+        );
+        assert_eq!(
+            s.hyparb_counters(),
+            strategy_core::HyparbCounters::default()
+        );
+        let mut rows = [strategy_core::HyparbPoolView::default(); 2];
+        assert_eq!(s.hyparb_pools_view(&mut rows), 1);
+        assert_eq!(rows[0].live, 0, "no snapshot yet");
     }
 
     #[test]
     fn mask_fan_out_gates_member_callbacks() {
-        // Enabled: the trigger pair emits exactly one order.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        // Enabled: the probe pair emits exactly one order.
+        let mut s = StrategySet::new(PROBE_BIT);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        feed_trigger(&mut s, &mut c);
+        feed_probe(&mut s, &mut c);
         assert_eq!(c.submitted, 1);
         assert_eq!(s.orders_emitted(), 1);
 
         // Same feed with the bit off: nothing reaches the member.
-        let mut s = set_with_latency_arb(0);
+        let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        feed_trigger(&mut s, &mut c);
+        feed_probe(&mut s, &mut c);
         assert_eq!(c.submitted, 0);
         assert_eq!(s.orders_emitted(), 0);
     }
@@ -1649,7 +1742,7 @@ mod tests {
         };
 
         // A fill for a DISABLED slot is counted, never delivered.
-        let mut s = StrategySet::new(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_fill(&fill_for(SLOT_VRP), &mut c);
         assert_eq!(s.fills_unrouted(), 1, "slot 1 is not enabled here");
@@ -1710,72 +1803,64 @@ mod tests {
         assert_eq!(rec.orders[0].strategy_id, SLOT_VM);
         assert_eq!(rec.orders[0].client_oid, 9, "everything else untouched");
 
-        // Through the SET: the latency-arb trigger pair emits ONE
-        // order stamped slot 0 by the dispatch wrapper (M-c) — the
-        // member itself never saw the field.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        // Through the SET: the probe pair emits ONE order stamped
+        // with the probe's slot by the dispatch wrapper (M-c).
+        let mut s = StrategySet::new(PROBE_BIT);
         let mut rec = RecordCtx { orders: Vec::new() };
         s.on_start(&mut rec).unwrap();
-        s.on_tick(&tick(VenueId::Binance, BN, 490_000, 510_000), &mut rec);
-        s.on_tick(&tick(VenueId::Polymarket, PM, 390_000, 410_000), &mut rec);
+        feed_probe(&mut s, &mut rec);
         assert_eq!(rec.orders.len(), 1);
-        assert_eq!(rec.orders[0].strategy_id, SLOT_LATENCY_ARB);
+        assert_eq!(rec.orders[0].strategy_id, PROBE_SLOT);
     }
 
     #[test]
     fn enable_via_ai_activates_member() {
-        let mut s = set_with_latency_arb(0);
+        let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_LATENCY_ARB), &mut c);
-        assert_eq!(s.enabled_mask(), BIT_LATENCY_ARB);
-        feed_trigger(&mut s, &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, PROBE_SLOT), &mut c);
+        assert_eq!(s.enabled_mask(), PROBE_BIT);
+        feed_probe(&mut s, &mut c);
         assert_eq!(c.submitted, 1, "enabled-at-runtime member must fire");
     }
 
     #[test]
     fn disable_always_honored() {
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = StrategySet::new(PROBE_BIT);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        s.on_ai(
-            &ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB),
-            &mut c,
-        );
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, PROBE_SLOT), &mut c);
         assert_eq!(s.enabled_mask(), 0);
-        feed_trigger(&mut s, &mut c);
+        feed_probe(&mut s, &mut c);
         assert_eq!(c.submitted, 0);
 
         // Disable also works while halted.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = StrategySet::new(PROBE_BIT);
         s.on_ai(&ai_cmd(AiCmdKind::HaltRequest, STRATEGY_SLOT_NONE), &mut c);
-        s.on_ai(
-            &ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB),
-            &mut c,
-        );
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, PROBE_SLOT), &mut c);
         assert_eq!(s.enabled_mask(), 0);
         assert!(s.is_halted());
     }
 
     #[test]
     fn halt_clears_mask_and_sticks() {
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = StrategySet::new(PROBE_BIT);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::HaltRequest, STRATEGY_SLOT_NONE), &mut c);
         assert!(s.is_halted());
         assert_eq!(s.enabled_mask(), 0, "halt is a kill-switch: mask cleared");
-        feed_trigger(&mut s, &mut c);
+        feed_probe(&mut s, &mut c);
         assert_eq!(c.submitted, 0);
     }
 
     #[test]
     fn enable_while_halted_refused_and_counted() {
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::HaltRequest, STRATEGY_SLOT_NONE), &mut c);
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_LATENCY_ARB), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_HYPARB), &mut c);
         assert_eq!(s.enabled_mask(), 0, "enable refused while halted");
         assert_eq!(s.enable_refused_total(), 1);
         assert_eq!(StrategyCounters::ai_enable_refused(&s), 1);
@@ -1788,7 +1873,7 @@ mod tests {
     /// out-of-range id).
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
-        let mut s = set_with_latency_arb(0);
+        let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 7), &mut c);
@@ -1809,7 +1894,7 @@ mod tests {
 
     #[test]
     fn enable_ai_exec_slot_is_honored() {
-        let mut s = set_with_latency_arb(0);
+        let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(
@@ -1824,7 +1909,7 @@ mod tests {
     /// SUCCEEDS (§8 semantics change) — and Disable round-trips it.
     #[test]
     fn enable_vm_slot_round_trips() {
-        let mut s = set_with_latency_arb(0);
+        let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, STRATEGY_SLOT_VM), &mut c);
@@ -1842,7 +1927,7 @@ mod tests {
     fn non_set_kinds_fan_out_without_side_effects() {
         // Heartbeat / SetFairValue reach members' default no-op
         // on_ai; the set itself must not change state.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         let hb = ai_cmd(AiCmdKind::Heartbeat, STRATEGY_SLOT_NONE);
@@ -1862,7 +1947,7 @@ mod tests {
             0,
         );
         s.on_ai(&fv, &mut c);
-        assert_eq!(s.enabled_mask(), BIT_LATENCY_ARB);
+        assert_eq!(s.enabled_mask(), BIT_HYPARB);
         assert!(!s.is_halted());
         assert_eq!(s.enable_refused_total(), 0);
         assert_eq!(c.submitted, 0);
@@ -1870,10 +1955,10 @@ mod tests {
 
     #[test]
     fn counters_aggregate_members_and_kind_is_set() {
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = StrategySet::new(PROBE_BIT);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        feed_trigger(&mut s, &mut c);
+        feed_probe(&mut s, &mut c);
         assert_eq!(s.orders_emitted(), 1);
         assert_eq!(s.orders_dropped(), 0);
         assert_eq!(s.strategy_kind(), "set");
@@ -1939,7 +2024,7 @@ mod tests {
     #[test]
     fn disabled_ai_exec_receives_nothing() {
         let pm = make_symbol_id(VenueId::Polymarket, 3);
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
         s.on_ai(&fair_cmd(c.now - 100, pm, 500_000), &mut c);
@@ -1973,7 +2058,7 @@ mod tests {
             Err(StrategyError::Config(_))
         ));
         // Outside the initial mask the invalid member is skipped.
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         s.ai_exec_mut().set_edge_1e6(0);
         assert!(s.on_start(&mut ctx()).is_ok());
     }
@@ -1997,8 +2082,8 @@ mod tests {
         }
     }
 
-    /// One cross_deviation row on the (PM, BN) pair the latency-arb
-    /// fixtures already use; horizon 0 keeps every eval armed.
+    /// One cross_deviation row on the (PM, BN) test pair; horizon 0
+    /// keeps every eval armed.
     fn vm_table(hash128: [u8; 16]) -> Box<RuleTableV2> {
         let mut t = Box::new(RuleTableV2::EMPTY);
         t.rows[0] = RuleRowV2::from_v1(&RuleRow::new(
@@ -2100,7 +2185,7 @@ mod tests {
     /// frame — the Commit neither applies nor counts as dropped.
     #[test]
     fn disabled_vm_never_sees_commit() {
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         let mut c = vm_ctx();
         s.on_start(&mut c).unwrap();
         s.vm_mut().receive_table_v2(&vm_table(VM_HASH_A));
@@ -2126,15 +2211,12 @@ mod tests {
 
         // Mask reads move with enable/disable (the G0 demo gap: the
         // flip becomes directly observable, not order-flow-inferred).
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_LATENCY_ARB), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_HYPARB), &mut c);
         assert_eq!(
             StrategyCounters::enabled_mask(&s),
-            u64::from(BIT_VM | BIT_LATENCY_ARB)
+            u64::from(BIT_VM | BIT_HYPARB)
         );
-        s.on_ai(
-            &ai_cmd(AiCmdKind::DisableStrategy, SLOT_LATENCY_ARB),
-            &mut c,
-        );
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_HYPARB), &mut c);
         assert_eq!(StrategyCounters::enabled_mask(&s), u64::from(BIT_VM));
 
         // Mismatched Commit → vm_commit_dropped through the trait.
@@ -2198,7 +2280,7 @@ mod tests {
     /// must work without restaging.
     #[test]
     fn on_ruleset_table_stages_even_when_vm_disabled() {
-        let mut s = set_with_latency_arb(BIT_LATENCY_ARB);
+        let mut s = hyparb_set();
         let mut c = vm_ctx();
         s.on_start(&mut c).unwrap();
 

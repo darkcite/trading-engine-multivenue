@@ -1,0 +1,39 @@
+[package]
+name         = "exec-hyperevm"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "HYPARB H7c: the HyperEVM write path, TESTNET ONLY (O-H5) — the chain interlock (EVM_ARM_CHAIN_IDS = [998], compile-time asserted), the executor's swap calldata, the G2 gas bid, a multi-wallet single-writer nonce table, JSON-RPC writers/scanners, and the keep-alive HTTPS send arm with receipt reconciliation. Zero-alloc after boot."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The chain-agnostic EIP-1559 envelope (O-H7) and the secp256k1 key type.
+signer-evm       = { workspace = true }
+signer-eip712    = { workspace = true }
+# The one mlock'd key representation after boot.
+core-config      = { workspace = true }
+# HttpsPost (the keep-alive arm) — shared with nothing on the E lane yet.
+core-net         = { workspace = true }
+core-parse       = { workspace = true }
+# JSON-RPC: the request cursor, the hex scanners and the error parser the
+# pool ingress already uses — one implementation of each.
+ingress-hyperevm = { workspace = true }
+ingress-rpc      = { workspace = true }
+# `testnode` only: the scripted rustls JSON-RPC node (never in a build
+# that ships — the cli takes it as a dev-dependency).
+rcgen            = { workspace = true, optional = true }
+rustls           = { workspace = true, optional = true }
+
+[features]
+testnode = ["dep:rcgen", "dep:rustls"]
+
+[dev-dependencies]
+proptest      = { workspace = true }
+rustls        = { workspace = true }
+# The integration tests drive the arm against `testnode`.
+exec-hyperevm = { path = ".", features = ["testnode"] }

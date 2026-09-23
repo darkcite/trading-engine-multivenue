@@ -108,16 +108,17 @@ pub use core_fill::{MAX_OPEN_PER_SYM, MAX_OPEN_TOTAL};
 /// the byte range while `Bybit = 6` trades; use
 /// [`tradeable_venue_byte`] for the per-order gate. MX2: `Mexc = 7`
 /// has model columns but is NOT tradeable (O-MX1, data-only), so the
-/// count stays 6.
-pub const TRADEABLE_VENUES: usize = 6;
+/// count stayed 6; HYPARB H2 adds `HyperEvm = 8` (AMM swaps only).
+pub const TRADEABLE_VENUES: usize = 7;
 
 /// WS9: the per-order venue gate — venue bytes 0..=4 plus Bybit (6)
 /// can execute; the Ai feed (5), MEXC (7 — data-only by operator
 /// ruling O-MX1; arming it needs its own plan) and corrupt bytes
-/// cannot.
+/// cannot. HYPARB H2: HyperEVM (8) executes AMM swaps — and only
+/// those (`FillEngine::intake` holds the kind to the venue).
 #[inline]
 pub const fn tradeable_venue_byte(venue: usize) -> bool {
-    venue <= 4 || venue == 6
+    venue <= 4 || venue == 6 || venue == 8
 }
 
 /// The venue whose Δ / fee column the MODEL applies to `sym`.
@@ -846,6 +847,32 @@ pub struct FillEngine {
     ttl_expired: u64,
     /// E5 lifecycle replay — see [`FillEngine::lifecycle`].
     lifecycle: LifecycleReplay,
+    /// HYPARB H2: pool state for AMM swaps, rebuilt from the tape's
+    /// pool-event signals — the SAME `core_fill::AmmBook` the engine's
+    /// paper matcher keeps. Boxed: 16 KiB of fixed arrays.
+    amm: Box<core_fill::AmmBook>,
+    /// HYPARB H2 — see [`FillEngine::amm_replay`].
+    amm_replay: AmmReplay,
+}
+
+/// HYPARB H2: what the AMM arm did in this replay.
+///
+/// Deliberately NOT in [`ModelOutcome`] (the frozen schema-1 line), for
+/// the reason [`LifecycleReplay`] is not: these describe the tape and
+/// the model's reach, and the schema is a contract with the worker.
+/// AMM fills themselves ARE in the outcome — they are ordinary fills.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AmmReplay {
+    /// Swaps filled (whole or partial).
+    pub fills: u64,
+    /// Swaps judged and not filled, or dropped by a chain-wide gap.
+    pub canceled: u64,
+    /// Fills smaller than the order (range boundary or limit).
+    pub partial: u64,
+    /// Cancels because the pool was not judgeable.
+    pub not_live: u64,
+    /// Pool-event signals the book refused (undecodable, foreign sym).
+    pub refused: u64,
 }
 
 /// E5: what replaying the capture's lifecycle verbs did to this
@@ -937,6 +964,8 @@ impl FillEngine {
             ioc_fills: 0,
             ioc_canceled: 0,
             ttl_expired: 0,
+            amm: Box::new(core_fill::AmmBook::new()),
+            amm_replay: AmmReplay::default(),
         }
     }
 
@@ -944,6 +973,106 @@ impl FillEngine {
     #[must_use]
     pub const fn lifecycle(&self) -> LifecycleReplay {
         self.lifecycle
+    }
+
+    /// HYPARB H2: what the AMM arm did here.
+    #[must_use]
+    pub fn amm_replay(&self) -> AmmReplay {
+        let mut r = self.amm_replay;
+        r.refused = self.amm.counters.refused;
+        r
+    }
+
+    /// HYPARB H2: one pool-event signal from the tape (`sym` = the pool
+    /// or `SYMBOL_ID_NONE`, the 40-byte `core_amm::payload`).
+    ///
+    /// The engine's paper matcher runs this exact sequence
+    /// (`clob_dispatcher::PaperMatcher::observe_amm`) through the same
+    /// `core_fill::AmmBook`: a pool event refreshes the pool's mark; a
+    /// HEAD judges every activated swap ONCE, in emit order, TTL first;
+    /// a chain-wide GAP cancels every open swap. The pool fee is in the
+    /// fill price, so the fill is booked at 0 bps.
+    pub fn on_amm_signal(
+        &mut self,
+        sym: u32,
+        payload: &[u8; 40],
+        virt_ns: u64,
+        wall_ns: u64,
+        out: &mut Vec<SynthFill>,
+    ) {
+        out.clear();
+        self.last_wall_ns = wall_ns;
+        match self.amm.observe(sym, payload) {
+            core_fill::AmmObs::Pool { index } => {
+                if let Some(mid) = self.amm.mid_1e6(index) {
+                    let old = self.marks_1e6.insert(sym, mid).unwrap_or(mid);
+                    if self.full.on_mark(sym, old, mid) {
+                        self.bounds_refresh(sym, mid);
+                    }
+                    if self.oos.on_mark(sym, old, mid) {
+                        self.dd.sample(self.oos.equity_1e12());
+                    }
+                }
+            }
+            core_fill::AmmObs::Head { .. } => self.judge_amm_orders(virt_ns, wall_ns, out),
+            core_fill::AmmObs::Gap => {
+                let mut i = 0usize;
+                while i < self.open_len {
+                    if self.open[i].kind == core_fill::ORDER_KIND_AMM_SWAP {
+                        self.amm_replay.canceled += 1;
+                        self.remove_open(i);
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The HEAD pass — `PaperMatcher::judge_amm_orders`, restated
+    /// against this table.
+    fn judge_amm_orders(&mut self, virt_ns: u64, wall_ns: u64, out: &mut Vec<SynthFill>) {
+        let mut i = 0usize;
+        while i < self.open_len {
+            let o = self.open[i];
+            if o.kind != core_fill::ORDER_KIND_AMM_SWAP {
+                i += 1;
+                continue;
+            }
+            if core_fill::expired_at(virt_ns, o.expiry_ns) {
+                self.ttl_expired += 1;
+                self.remove_open(i);
+                continue;
+            }
+            if virt_ns < o.t_active_ns {
+                i += 1;
+                continue;
+            }
+            let v = match core_fill::amm_pool_index(o.sym) {
+                Some(idx) => self.amm.judge(idx, o.side, o.px_1e6, o.remaining_1e6),
+                None => core_fill::AmmVerdict::NOT_LIVE,
+            };
+            match v.verdict {
+                core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                    // Marked at the pool BEFORE our own impact (the
+                    // mark the last pool event set).
+                    let mark = self.marks_1e6.get(&o.sym).copied().unwrap_or(px_1e6);
+                    self.book_fill(&o, px_1e6, qty_1e6, 0, mark, wall_ns, out);
+                    self.amm_replay.fills += 1;
+                    if qty_1e6 < o.remaining_1e6 {
+                        self.amm_replay.partial += 1;
+                    }
+                }
+                _ => {
+                    self.amm_replay.canceled += 1;
+                    if v.pool_not_live() {
+                        self.amm_replay.not_live += 1;
+                    }
+                }
+            }
+            self.remove_open(i);
+        }
     }
 
     /// Open orders currently resting (test/inspection surface).
@@ -1083,18 +1212,21 @@ impl FillEngine {
         // predicate — Ai (5) sits inside the byte range, Bybit (6)
         // trades, MEXC (7) is data-only (MX2 / O-MX1).
         debug_assert!(px > 0 && qty > 0, "vm emits positive px/qty only");
-        // I1: only the two modeled kinds execute; a reserved/garbage
-        // kind (2 = Market, rsv.) cannot be scored honestly — count it
-        // unroutable, never guess a law for it.
+        // I1: only the modeled kinds execute; a reserved/garbage kind
+        // cannot be scored honestly — count it unroutable, never guess
+        // a law for it. HYPARB H2: HyperEVM takes AMM swaps on a pool
+        // slot and nothing else; no other venue takes a swap.
+        let kind_ok = if venue_byte == core_types::VenueId::HyperEvm as u8 {
+            order.kind == core_fill::ORDER_KIND_AMM_SWAP
+                && core_fill::amm_pool_index(order.sym).is_some()
+        } else {
+            order.kind == ORDER_KIND_MAKER || order.kind == ORDER_KIND_IOC
+        };
         debug_assert!(
-            order.kind == ORDER_KIND_MAKER || order.kind == ORDER_KIND_IOC,
-            "strategies emit maker (0) or IoC (1) only"
+            kind_ok,
+            "strategies emit maker (0) or IoC (1) on a book venue, an AMM swap (2) on a pool only"
         );
-        if !tradeable_venue_byte(venue)
-            || px <= 0
-            || qty <= 0
-            || (order.kind != ORDER_KIND_MAKER && order.kind != ORDER_KIND_IOC)
-        {
+        if !tradeable_venue_byte(venue) || px <= 0 || qty <= 0 || !kind_ok {
             self.unroutable += 1;
             return;
         }
@@ -2232,8 +2364,8 @@ mod tests {
     #[test]
     fn fee_rate_is_per_class_with_a_dearest_fallback() {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2310,8 +2442,8 @@ mod tests {
 
     fn pred_params(open_pair: Option<(u32, u32)>) -> ModelParams {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2356,8 +2488,8 @@ mod tests {
         // both directions, and the unknown-class counter is untouched
         // by the new path.
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2442,8 +2574,8 @@ mod tests {
 
     fn binary_engine() -> FillEngine {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2828,8 +2960,8 @@ mod tests {
     /// Zero latency, zero flat fee, the venue's option schedule live.
     fn opt_engine() -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2923,8 +3055,8 @@ mod tests {
         // NOT a mark-fill sym: after F9 every real Deribit option is
         // priced by its own quote lane, which is pass (b).
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3267,7 +3399,7 @@ mod tests {
 
         let round_trip = |frac: u32| -> (i64, i64) {
             let mut params = ModelParams {
-                latency_ns: [0; 8],
+                latency_ns: [0; core_types::VENUE_COUNT],
                 opt_spread_frac_1e6: frac,
                 ..ModelParams::default()
             };
@@ -3364,8 +3496,8 @@ mod tests {
     /// (still never fills on it — the pass precedes the emit).
     fn engine_zero_delta(boundary: u64) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3473,8 +3605,8 @@ mod tests {
 
     fn engine_fees(boundary: u64, maker: u32, taker: u32) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(maker, taker); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(maker, taker); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3649,6 +3781,8 @@ mod tests {
         assert_eq!(o.canceled_end, 0);
     }
 
+    /// Kind 2 on a BOOK venue: since HYPARB H2 that byte is the AMM
+    /// swap, which only a HyperEVM pool takes — still unmodellable here.
     fn market_order() -> Order {
         let venue = core_types::VenueId::from_u8(symbol_venue_byte(PM_SYM)).expect("venue");
         Order::new(
@@ -3841,8 +3975,18 @@ mod tests {
     #[test]
     fn maker_fee_charges_on_fill_notional() {
         let p = ModelParams {
-            fee_bps: [[(50, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]], // PM maker 50 bps
-            latency_ns: [0; 8],
+            fee_bps: [
+                [(50, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+            ], // PM maker 50 bps
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3880,8 +4024,18 @@ mod tests {
         assert_eq!(model_venue_byte(BN_SYM), 1);
         let p = ModelParams {
             // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
-            fee_bps: [[(50, 0); 5], [(10, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]],
-            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0, 0],
+            fee_bps: [
+                [(50, 0); 5],
+                [(10, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+            ],
+            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0, 0, 0],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -4172,8 +4326,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(maker_bps, 0); 5]; 8],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000],
+                fee_bps: [[(maker_bps, 0); 5]; core_types::VENUE_COUNT],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4243,8 +4397,8 @@ mod tests {
             taker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(0, taker_bps); 5]; 8],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000],
+                fee_bps: [[(0, taker_bps); 5]; core_types::VENUE_COUNT],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4325,8 +4479,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(maker_bps, 0); 5]; 8],
-                latency_ns: [0; 8],
+                fee_bps: [[(maker_bps, 0); 5]; core_types::VENUE_COUNT],
+                latency_ns: [0; core_types::VENUE_COUNT],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };

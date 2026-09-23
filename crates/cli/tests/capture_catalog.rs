@@ -216,7 +216,7 @@ fn per_day_venue_ticks_cover_every_label_incl_bybit_and_mexc() {
     assert_eq!(out.facts.ticks, 6);
     assert!(out.facts.whole_root_backtestable);
     assert!(
-        out.json.contains("\"venue_ticks\":[1,0,0,0,0,0,2,3]}"),
+        out.json.contains("\"venue_ticks\":[1,0,0,0,0,0,2,3,0]}"),
         "{}",
         out.json
     );

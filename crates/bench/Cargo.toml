@@ -54,6 +54,21 @@ exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
 exec-hyperliquid     = { workspace = true }
 signer-eip712        = { workspace = true }
+# HYPARB H1 gate 63: the AMM walk + arb solve.
+core-amm             = { workspace = true }
+# HYPARB H7 gate 64: the EVM sign + hash + hex render.
+signer-evm           = { workspace = true }
+# HYPARB H3 gate 66: the HyperEVM ingress session after the handshake.
+ingress-hyperevm     = { workspace = true }
+# HYPARB H2 gate 67: the AMM fill law on the paper matcher.
+core-fill            = { workspace = true }
+# HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
+strategy-hyparb      = { workspace = true }
+# HYPARB H7c gate 71: the EVM write path either side of the socket.
+# H9 gate 72: its `testnode` serves the HttpsPost cycle from a CHILD
+# process (a server thread here would allocate under the global count).
+exec-hyperevm        = { workspace = true, features = ["testnode"] }
+rustls               = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

@@ -87,13 +87,16 @@ def _dash_ddmmmyy(name: str) -> bool:
 #: Namespaces whose every descriptor is ONE class, whatever the name.
 #: MX7: MEXC xStocks (`AAPLXUSDT`) are ordinary spot rows and its TradFi /
 #: equity / FX / metal perps (`XAU_USDT`, `AAPLSTOCK_USDT`) ordinary perps
-#: (plan D6: no new class); MEXC lists no dated futures.
+#: (plan D6: no new class); MEXC lists no dated futures. HYPARB H3b: a
+#: HyperEVM pool (`hyperevm:0x<address>`) trades token0 against token1
+#: outright — spot.
 _FIXED_CLASS_OF_NS: dict[str, str] = {
     "binance": "spot",
     "binance-opt": "option",
     "bybit": "spot",
     "mexc": "spot",
     "mexc-perp": "perp",
+    "hyperevm": "spot",
 }
 
 

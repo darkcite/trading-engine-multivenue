@@ -61,6 +61,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-amm"
+version = "0.1.0"
+
+[[package]]
 name = "core-config"
 version = "0.1.0"
 dependencies = [
@@ -80,6 +84,7 @@ version = "0.1.0"
 name = "core-fill"
 version = "0.1.0"
 dependencies = [
+ "core-amm",
  "core-types",
 ]
 
@@ -156,6 +161,19 @@ name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
+name = "exec-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-net",
+ "core-parse",
+ "ingress-hyperevm",
+ "ingress-rpc",
+ "signer-eip712",
+ "signer-evm",
+]
 
 [[package]]
 name = "exec-hyperliquid"
@@ -262,6 +280,22 @@ dependencies = [
  "memchr",
  "mio",
  "options-select",
+]
+
+[[package]]
+name = "ingress-hyperevm"
+version = "0.1.0"
+dependencies = [
+ "core-amm",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "ingress-rpc",
+ "memchr",
+ "mio",
 ]
 
 [[package]]
@@ -402,16 +436,20 @@ version = "0.0.0"
 dependencies = [
  "book-builder",
  "clob-dispatcher",
+ "core-amm",
  "core-config",
  "core-crypto",
+ "core-fill",
  "core-net",
  "core-parse",
  "core-types",
+ "exec-hyperevm",
  "exec-hyperliquid",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
  "ingress-okx",
@@ -419,6 +457,7 @@ dependencies = [
  "ingress-rpc",
  "libfuzzer-sys",
  "signer-eip712",
+ "signer-evm",
 ]
 
 [[package]]
@@ -526,6 +565,13 @@ dependencies = [
  "secp256k1",
  "tiny-keccak",
  "zeroize",
+]
+
+[[package]]
+name = "signer-evm"
+version = "0.1.0"
+dependencies = [
+ "signer-eip712",
 ]
 
 [[package]]

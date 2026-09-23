@@ -1,0 +1,19 @@
+[package]
+name         = "strategy-hyparb"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "HYPARB slot-0 member: HyperEVM concentrated-liquidity pools vs Hyperliquid spot/perp — the single-block CEX-DEX arb, paper-first (O-H1/O-H2)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-amm      = { workspace = true }
+core-fill     = { workspace = true }
+core-time     = { workspace = true }
+core-types    = { workspace = true }
+strategy-core = { workspace = true }

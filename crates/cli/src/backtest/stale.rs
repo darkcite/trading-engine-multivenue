@@ -82,7 +82,7 @@ struct LaneClock {
 /// One run's re-judge state: a [`LaneClock`] per (lane, sym) plus the
 /// per-lane accounting.
 pub struct StaleJudge {
-    thresholds: [u32; 8],
+    thresholds: [u32; core_types::VENUE_COUNT],
     clocks: BTreeMap<(u8, u32), LaneClock>,
     /// Per-lane accounting, [`VENUE_LABELS`] order.
     pub stats: [StaleStats; VENUE_LABELS.len()],
@@ -90,7 +90,7 @@ pub struct StaleJudge {
 
 impl StaleJudge {
     /// Thresholds indexed by the VENUE BYTE (`ModelParams::stale_after_ms`).
-    pub fn new(thresholds: [u32; 8]) -> Self {
+    pub fn new(thresholds: [u32; core_types::VENUE_COUNT]) -> Self {
         Self {
             thresholds,
             clocks: BTreeMap::new(),
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn stale_time_bps_is_zero_for_empty_and_single_tick_lanes() {
-        let mut j = StaleJudge::new([400; 8]);
+        let mut j = StaleJudge::new([400; core_types::VENUE_COUNT]);
         assert_eq!(j.stats[0].stale_time_bps(), 0);
         let mut a = t(1_000, 1_000_000, 0);
         j.judge(0, &mut a, true);

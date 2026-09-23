@@ -47,7 +47,7 @@ use crate::route::{ExecRoute, EXEC_SLOTS};
 use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
 };
-use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, Tick};
+use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
 
 /// How often `exec.HALT` is checked on the idle path. One second: an
 /// operator reaching for a kill switch waits a second, and the engine
@@ -1064,6 +1064,13 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     #[inline]
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         self.paper.observe_tick(tick, now_ns);
+    }
+
+    /// HYPARB H2: every pool event reaches the paper matcher, ungated,
+    /// for the same reason every tick does.
+    #[inline]
+    fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        self.paper.observe_amm(sym, payload, now_ns);
     }
 
     /// LAW E-2 — the paper arm's numbers, never the live arm's.

@@ -113,6 +113,7 @@ fn member_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
             seed: None,
             vrp_seed: None,
             bin15_seed_dir: None,
+            hyparb_universe: None,
         }),
     }
 }
@@ -371,6 +372,7 @@ fn xsd_member_enters_and_reverts_on_the_wall_hour_grid() {
         seed: Some(seed),
         vrp_seed: None,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
     let hash = core_crypto::sha256(XSD_TOML.as_bytes());
@@ -418,6 +420,7 @@ fn xsd_member_without_a_table_is_refused_with_a_reason() {
         seed: Some(seed),
         vrp_seed: None,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
         Ok(_) => panic!("an explicit absent table must refuse the run"),
@@ -681,6 +684,7 @@ fn vrp_cfg(replay: &Path, toml: &Path, seed: Option<PathBuf>) -> BacktestConfig 
         seed: None,
         vrp_seed: seed,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     cfg
 }
@@ -984,6 +988,7 @@ fn bin15_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
         seed: None,
         vrp_seed: None,
         bin15_seed_dir: None,
+        hyparb_universe: None,
     });
     cfg
 }

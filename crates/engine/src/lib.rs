@@ -34,8 +34,8 @@ use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
     AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, OptSummary, Order, RuleTableSlot,
-    Signal, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE,
-    RULE_TABLE_RING_SLOTS,
+    Signal, SignalSource, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE,
+    OPT_RING_SIZE, RULE_TABLE_RING_SLOTS,
 };
 use engine_snapshot::{RecentRing, RECENT_FILLS, RECENT_ORDERS};
 use ingress_ai::AiIngressStatus;
@@ -69,6 +69,13 @@ pub const TICK_RING_SIZE: usize = 16_384;
 /// `ingress_rpc::run_loop::DEFAULT_SIGNAL_RING_CAP` so the
 /// consumer type lines up without a re-allocate.
 pub const SIGNAL_RING_SIZE: usize = 1_024;
+/// HYPARB H3b: the pool-event lane (the HyperEVM ingress's
+/// `Signal`s). Larger than the RPC lane because a pool snapshot is a
+/// burst — `SNAPSHOT` + up to 1,024 `TICK`s + `STATE` per pool — which
+/// the ingress flow-controls against this ring rather than dropping.
+/// `ingress_hyperevm::run_loop::DEFAULT_POOL_RING_CAP` must equal this
+/// — the cli const-asserts it.
+pub const POOL_RING_SIZE: usize = 4_096;
 /// Fill ring capacity (per lane).
 pub const FILL_RING_SIZE: usize = 1_024;
 
@@ -95,7 +102,8 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Hyperliquid => Some(4),
         VenueId::Bybit => Some(5),
         VenueId::Mexc => Some(6),
-        VenueId::Ai => None,
+        // HYPARB: HyperEVM pool events ride the signal lane — no ticks.
+        VenueId::Ai | VenueId::HyperEvm => None,
     }
 }
 
@@ -128,7 +136,8 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Bybit
         // MX2: MEXC spot incremental depth is `Blocked!` on the public
         // tier and futures BBO rides `depth.full` top-5 — no L2 lane.
-        | VenueId::Mexc => None,
+        | VenueId::Mexc
+        | VenueId::HyperEvm => None,
     }
 }
 
@@ -152,7 +161,8 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Hyperliquid
         | VenueId::Ai
         | VenueId::Bybit
-        | VenueId::Mexc => None,
+        | VenueId::Mexc
+        | VenueId::HyperEvm => None,
     }
 }
 
@@ -185,7 +195,9 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         // submission is Stage-3, gaps-doc §7) — no fill lane yet.
         // MX2: MEXC is data-only by operator ruling O-MX1 — no exec
         // arm, no fill lane.
-        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc => None,
+        // HYPARB: AMM fills are PAPER fills (the matcher's judge); the
+        // O-H12 testnet sends are a shadow and never reach the book.
+        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc | VenueId::HyperEvm => None,
     }
 }
 
@@ -209,6 +221,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Unspawned venues hand a producer-dropped ring (§3.3 pattern).
     opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
+    /// HYPARB H3b: the pool-event lane, attached by
+    /// [`Self::set_pool_lane`] (boot-only). `None` = no HyperEVM source.
+    pool_cons: Option<Consumer<Signal, POOL_RING_SIZE>>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     /// AI command lane (Phase 8f §4.3). Sole consumer of the
@@ -350,6 +365,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             depth_lanes,
             opt_lanes,
             sig_cons,
+            pool_cons: None,
             fill_lanes,
             ai_cons,
             ai_status,
@@ -484,22 +500,29 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             match self.sig_cons.try_pop() {
                 Some(s) => {
                     consumed += 1;
-                    let now = now_ns();
-                    self.ingest_lat.record(now.saturating_sub(s.ts_ns));
-                    let mut ctx = EngineCtx {
-                        disp: &mut self.disp,
-                        decide_lat: &self.decide_lat,
-                        order_capture: self.order_capture.as_mut(),
-                        recent_orders: &mut self.recent_orders,
-                        lifecycle: &mut self.lifecycle,
-                        now,
-                    };
-                    self.strat.on_signal(&s, &mut ctx);
-                    self.signals_dispatched = self.signals_dispatched.wrapping_add(1);
+                    self.dispatch_signal(&s);
                 }
                 None => break,
             }
             i += 1;
+        }
+        // --- pool events (HYPARB H3b) ---
+        if self.pool_cons.is_some() {
+            let mut i = 0;
+            while i < max_per_ring {
+                let popped = match self.pool_cons.as_mut() {
+                    Some(c) => c.try_pop(),
+                    None => None,
+                };
+                match popped {
+                    Some(s) => {
+                        consumed += 1;
+                        self.dispatch_signal(&s);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
         }
 
         // --- fill lanes ---
@@ -930,6 +953,37 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             .write_hgrm(out, "engine.strategy_to_submit")?;
         self.ack_lat.write_hgrm(out, "engine.submit_to_ack")?;
         Ok(())
+    }
+
+    /// One signal, from either signal lane: latency sample, the
+    /// dispatcher's pool hook (HYPARB H2 — a pool event reaches the
+    /// dispatcher FIRST, exactly as a tick does: a PAPER one keeps pool
+    /// state and judges its AMM swaps on each head, a live one does
+    /// nothing), then the member.
+    #[inline(always)]
+    fn dispatch_signal(&mut self, s: &Signal) {
+        let now = now_ns();
+        self.ingest_lat.record(now.saturating_sub(s.ts_ns));
+        if s.source == SignalSource::HyperEvm as u8 {
+            self.disp.observe_amm(s.sym, &s.payload, now);
+        }
+        let mut ctx = EngineCtx {
+            disp: &mut self.disp,
+            decide_lat: &self.decide_lat,
+            order_capture: self.order_capture.as_mut(),
+            recent_orders: &mut self.recent_orders,
+            lifecycle: &mut self.lifecycle,
+            now,
+        };
+        self.strat.on_signal(s, &mut ctx);
+        self.signals_dispatched = self.signals_dispatched.wrapping_add(1);
+    }
+
+    /// HYPARB H3b: attach the pool-event lane (boot-only, before
+    /// [`Self::start`]). Drained every iteration right after the RPC
+    /// signal lane, through the same per-signal path.
+    pub fn set_pool_lane(&mut self, cons: Consumer<Signal, POOL_RING_SIZE>) {
+        self.pool_cons = Some(cons);
     }
 
     /// Attach the engine-thread fills capture (boot-only, before
@@ -2357,6 +2411,98 @@ mod tests {
         fn on_fill_booked(&mut self, _f: &Fill) {
             self.log.borrow_mut().push("dispatcher");
         }
+        fn observe_amm(&mut self, _sym: core_types::SymbolId, _p: &[u8; 40], _now: NsTs) {
+            self.log.borrow_mut().push("dispatcher-amm");
+        }
+    }
+
+    /// A member that only logs the signals it is handed.
+    struct LogsSignals {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+    impl strategy_core::StrategyCounters for LogsSignals {}
+    impl Strategy for LogsSignals {
+        fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
+            Ok(())
+        }
+        fn on_tick<C: Ctx>(&mut self, _t: &Tick, _ctx: &mut C) {}
+        fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {
+            self.log.borrow_mut().push("strategy");
+        }
+        fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {}
+        fn on_timer<C: Ctx>(&mut self, _now: NsTs, _ctx: &mut C) {}
+        fn timer_period_ns(&self) -> u64 {
+            0
+        }
+        fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+    }
+
+    /// **HYPARB H2 — a pool event reaches the dispatcher BEFORE the
+    /// member**, exactly as a tick does: the paper matcher's pool state
+    /// must already include the event the member is about to size
+    /// against. Only HyperEVM-source signals take the hook.
+    #[test]
+    fn a_pool_event_reaches_the_dispatcher_before_the_strategy() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (mut sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            LogsSignals {
+                log: std::rc::Rc::clone(&log),
+            },
+            OrderWitness {
+                log: std::rc::Rc::clone(&log),
+            },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let pool = core_types::make_symbol_id(VenueId::HyperEvm, 1);
+        let amm = Signal::new(
+            1,
+            pool,
+            core_types::LatencyClass::Warm,
+            SignalSource::HyperEvm as u8,
+            [0; 40],
+        );
+        let rpc = Signal::new(
+            2,
+            7,
+            core_types::LatencyClass::Warm,
+            SignalSource::Rpc as u8,
+            [0; 40],
+        );
+        sp.try_push(amm).unwrap();
+        sp.try_push(rpc).unwrap();
+        eng.tick(16);
+        assert_eq!(
+            *log.borrow(),
+            vec!["dispatcher-amm", "strategy", "strategy"],
+            "the pool event is booked first; a foreign source never takes the hook"
+        );
+
+        // HYPARB H3b: the dedicated pool lane takes the same path.
+        log.borrow_mut().clear();
+        let (mut pp, pc) = Ring::<Signal, POOL_RING_SIZE>::new().split();
+        eng.set_pool_lane(pc);
+        let n0 = eng.signals_dispatched;
+        pp.try_push(amm).unwrap();
+        eng.tick(16);
+        assert_eq!(*log.borrow(), vec!["dispatcher-amm", "strategy"]);
+        assert_eq!(eng.signals_dispatched, n0 + 1, "counted as a signal");
     }
 
     /// A member that SUBMITS on a roll — the case the ordering exists

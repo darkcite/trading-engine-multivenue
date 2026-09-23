@@ -23,9 +23,10 @@ bottom of that file pins every struct at exactly 64 bytes.
 ### Venue identity (Phase 8, PMLR v2)
 
 `VenueId` (`#[repr(u8)]`, wire-stable, never renumbered):
-`Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4, Ai=5, Bybit=6, Mexc=7`
-(Bybit WS9 2026-08-29, MEXC MX2 2026-09-23). Append-only; the first
-unassigned byte is 8.
+`Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4, Ai=5, Bybit=6, Mexc=7,
+HyperEvm=8` (Bybit WS9 2026-08-29, MEXC MX2 2026-09-23, HyperEVM HYPARB H0
+2026-09-23). Append-only; the first unassigned byte is 9;
+`core_types::VENUE_COUNT` (9) sizes every venue-indexed table.
 `255` is reserved (venue byte of `SYMBOL_ID_NONE`).
 
 `SymbolId` is venue-namespaced: bits 31..24 = venue byte, bits 23..0 =
@@ -66,7 +67,7 @@ a v2 file replays under the v2 law — never stale.
 |      0 |     8 | ts_ns    | `u64` NsTs     | monotonic ns                           |
 |      8 |     4 | sym      | `u32` SymbolId |                                        |
 |     12 |     1 | class    | `u8`           | `LatencyClass` (Hot=0, Warm=1, Slow=2) |
-|     13 |     1 | source   | `u8`           | `SignalSource` (Rss=1 retired, reserved) |
+|     13 |     1 | source   | `u8`           | `SignalSource` (Rss=1 retired, reserved; HyperEvm=5 — HYPARB) |
 |     14 |     2 | _pad0    | `[u8; 2]`      | explicit, zeroed                       |
 |     16 |    40 | payload  | `[u8; 40]`     | opaque; interpretation by source       |
 |     56 |     8 | _pad1    | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)  |
@@ -630,6 +631,23 @@ Records, back-to-back, variable length:
 parser rejected the payload. The file is budget-bounded at capture
 time; a torn final record (crash mid-write) is detected by readers and
 terminates iteration.
+
+### HyperEVM pool events (HYPARB H3b)
+
+Label `hyperevm` (VenueId 8), appended after `mexc`. The venue writes NO
+tick rows: everything it observes is a `Signal` (kind 1) in
+`hyperevm-signals.pmlr` with `source = SignalSource::HyperEvm` (5), `sym`
+= the pool (`make_symbol_id(HyperEvm, i+1)` for `[hyperevm] pools[i]`) or
+`SYMBOL_ID_NONE` for the chain-wide `HEAD` / `GAP`, and the 40-byte
+payload of `core_amm::payload` — ONE codec for the ring, the tape and the
+replay (its module doc is the byte-level contract). One swap is `SWAP`
+then `STATE`; a pool snapshot is `SNAPSHOT` (block, family, coverage,
+node count, fee in force, `tickSpacing`, token decimals — checked against
+`decimals()` on chain) · `nodes` × `TICK` · `STATE(snapshot)`, published
+before any later event, so a replay rebuilds the maps the live member
+walked. A capture is therefore self-describing: the harness prices and
+judges a pool from the tape alone (`core_fill::AmmBook`). Volume: one
+signal per event (≈ 2 per swap), never per block per pool.
 
 ## Replay log
 
