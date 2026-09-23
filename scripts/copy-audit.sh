@@ -57,7 +57,7 @@ if [ "${1:-}" = "--update-baseline" ]; then
 fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
-           crates/clob-dispatcher crates/core-net
+           crates/signer-evm crates/clob-dispatcher crates/core-net
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its

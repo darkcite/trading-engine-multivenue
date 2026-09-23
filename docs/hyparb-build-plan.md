@@ -1,7 +1,7 @@
 # HYPARB Build Plan (HZ–H9) — slot 0, paper, dual-book hedge, testnet EVM writes
 
 **Status: IN PROGRESS — branch `hyparb` (worktree `~/trading-engine-multivenue-hyparb`,
-O-H17). HZ part A done; H1 `core-amm` landed — see §16.** Adds a NINTH venue (`VenueId::HyperEvm = 8` per O-H11 — MEXC
+O-H17). HZ part A done; H1 `core-amm` and H7a `signer-evm` landed — see §16.** Adds a NINTH venue (`VenueId::HyperEvm = 8` per O-H11 — MEXC
 takes 7; the first non-orderbook one), a reusable AMM math crate, an AMM fill law, and a
 testnet-only EVM write path. Slot 0 changes hands from `strategy-latency-arb`
 to `strategy-hyparb`.
@@ -1374,3 +1374,24 @@ data only. Built by the git-excluded fixture tools under
 19. The top pool shows a recurring same-size liquidity change INSIDE
     blocks (a position managed intra-block) — the 0.7 % of rows a
     first-swap-of-block fixture cannot reproduce.
+
+### 16.4 H7a `signer-evm` — LANDED (standalone; `exec-hyperevm` pending)
+
+Deviations from §11.2:
+
+* **No binary encoder and no scratch pre-image.** The signing digest and
+  the transaction hash are `keccak256_parts` over stack encodings and the
+  BORROWED calldata; the signed envelope is rendered as `0x`-hex straight
+  into the JSON-RPC body (`tx_encode_signed_hex`) — JSON-RPC is the only
+  transport, so a binary transaction buffer would exist only to be copied.
+* API: `tx_signing_digest(tx)`, `tx_sign(tx, sk)`, `tx_hash(tx, sig)`,
+  `signed_hex_len(tx, sig)`, `tx_encode_signed_hex(tx, sig, dst)`,
+  `y_parity_from_v`. `EvmTxErr { BufferTooSmall, BadSignature, Sign }` — a
+  `v` outside {27, 28} is refused, never masked; `AccessListUnsupported`
+  is gone because the struct cannot express an access list.
+* Known-answer vectors from an INDEPENDENT implementation (eth-account
+  0.14): five transactions covering zero fields, a one-byte calldata below
+  0x80, a 55-byte short-string edge, a 300-byte calldata (two-byte length)
+  and 101/127-bit integers — digest, `r`, `s`, `y_parity`, raw hex and hash
+  all byte-equal.
+* Added to `scripts/copy-audit.sh`'s default crate list (exec lane).

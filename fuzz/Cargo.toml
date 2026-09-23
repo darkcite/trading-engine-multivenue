@@ -34,6 +34,8 @@ ingress-hyperliquid = { path = "../crates/ingress-hyperliquid" }
 core-net           = { path = "../crates/core-net" }
 core-parse         = { path = "../crates/core-parse" }
 signer-eip712      = { path = "../crates/signer-eip712" }
+# evm_rlp: the HYPARB H7 EIP-1559 renderer.
+signer-evm         = { path = "../crates/signer-evm" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
 # universe_toml: the M1 boot-universe config parser (core-config).
 core-config        = { path = "../crates/core-config" }
@@ -323,6 +325,13 @@ bench  = false
 [[bin]]
 name   = "amm_tick_walk"
 path   = "fuzz_targets/amm_tick_walk.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "evm_rlp"
+path   = "fuzz_targets/evm_rlp.rs"
 test   = false
 doc    = false
 bench  = false

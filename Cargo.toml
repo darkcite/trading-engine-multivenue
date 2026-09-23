@@ -60,6 +60,8 @@ members = [
     "crates/exec-router",
     "crates/exec-hyperliquid",
     "crates/signer-eip712",
+    # HYPARB H7 (O-H7): chain-agnostic EIP-1559 render + sign
+    "crates/signer-evm",
 
     # --- engine + UI ---
     "crates/engine",
@@ -193,6 +195,7 @@ clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }
 exec-hyperliquid = { path = "crates/exec-hyperliquid" }
 signer-eip712   = { path = "crates/signer-eip712" }
+signer-evm      = { path = "crates/signer-evm" }
 
 engine          = { path = "crates/engine" }
 engine-snapshot = { path = "crates/engine-snapshot" }

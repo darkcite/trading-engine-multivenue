@@ -409,6 +409,7 @@ dependencies = [
  "ingress-rpc",
  "libfuzzer-sys",
  "signer-eip712",
+ "signer-evm",
 ]
 
 [[package]]
@@ -516,6 +517,13 @@ dependencies = [
  "secp256k1",
  "tiny-keccak",
  "zeroize",
+]
+
+[[package]]
+name = "signer-evm"
+version = "0.1.0"
+dependencies = [
+ "signer-eip712",
 ]
 
 [[package]]

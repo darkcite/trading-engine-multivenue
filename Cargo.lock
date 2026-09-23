@@ -156,6 +156,7 @@ dependencies = [
  "opt-registry",
  "research-artifacts",
  "signer-eip712",
+ "signer-evm",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
@@ -1801,6 +1802,14 @@ dependencies = [
  "secp256k1",
  "tiny-keccak",
  "zeroize",
+]
+
+[[package]]
+name = "signer-evm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "signer-eip712",
 ]
 
 [[package]]

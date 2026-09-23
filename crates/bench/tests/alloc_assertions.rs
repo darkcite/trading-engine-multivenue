@@ -7267,3 +7267,51 @@ fn amm_walk_and_arb_solve_are_zero_alloc() {
     assert_eq!(allocs, 0, "core-amm walk/solve allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "core-amm hot bytes should be zero: saw {bytes}");
 }
+
+/// **HYPARB H7 gate 64 — the EVM sign + hash + hex-render path.**
+///
+/// Every testnet send (and, after a later ruling, every mainnet one)
+/// goes digest → secp256k1 sign → tx hash → hex render into the request
+/// body. The digest and the hash are `keccak256_parts` over stack
+/// encodings and the BORROWED calldata; the render writes into the
+/// caller's buffer. The whole path must be 0 B/op — the body buffer is
+/// allocated once at boot, outside the guard.
+#[test]
+fn evm_sign_hash_and_render_are_zero_alloc() {
+    use signer_evm::{tx_encode_signed_hex, tx_hash, tx_sign, Eip1559Tx};
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 64 key");
+    let calldata = [0xa5u8; 228]; // a V3 swap's worth of calldata
+    let mut body = vec![0u8; 4096];
+    // Boot: the first signature builds signer-eip712's process-wide
+    // secp256k1 context (one 208 B allocation, `OnceLock`). The arm does
+    // this at boot too; the guard measures the steady state after it.
+    let warm = Eip1559Tx { chain_id: 998, nonce: 0, max_priority_fee_per_gas: 0, max_fee_per_gas: 0, gas_limit: 21_000, to: [0; 20], value: 0, data: &[] };
+    tx_sign(&warm, &sk).expect("gate 64 warm-up");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 2_000 {
+        let tx = Eip1559Tx {
+            chain_id: 998,
+            nonce: n,
+            max_priority_fee_per_gas: 1_000_000_000 + n as u128,
+            max_fee_per_gas: 3_000_000_000,
+            gas_limit: 350_000,
+            to: [0x55; 20],
+            value: 0,
+            data: &calldata,
+        };
+        let sig = tx_sign(&tx, &sk).expect("gate 64 sign");
+        let h = tx_hash(&tx, &sig).expect("gate 64 hash");
+        let w = tx_encode_signed_hex(&tx, &sig, &mut body).expect("gate 64 render");
+        acc = acc.wrapping_add(w as u64).wrapping_add(h[0] as u64);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "signer-evm sign/hash/render allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "signer-evm hot bytes should be zero: saw {bytes}");
+}

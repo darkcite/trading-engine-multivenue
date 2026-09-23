@@ -54,6 +54,8 @@ exec-hyperliquid     = { workspace = true }
 signer-eip712        = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }
+# HYPARB H7 gate 64: the EVM sign + hash + hex render.
+signer-evm           = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }
