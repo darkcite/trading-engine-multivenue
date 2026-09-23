@@ -112,12 +112,60 @@ in the script; `ai` = 48 is the floor every name includes).
   BBO CHANGE — plan D11) and futures closes a busy socket 60 s after the
   last CLIENT ping (D12, pitfall 16). Wire law: `docs/wire-format.md`
   "Capture files"; rulings Q-MX1…Q-MX7: plan §0.
-- **Gates at HEAD (the MEXC lane, 2026-09-23):** nextest 2722 (2 skipped —
-  one is the `#[ignore]`d `mexc_live_smoke`) · alloc 64/64 at 0 B/op ·
-  clippy clean · `make license-check` OK · `make copy-audit` new=0 ·
+- **BX0 — the Binance fix-now pass, LIVE since the 16:05Z restart of
+  2026-09-23 (`0a1f6ff`, verified)** — `docs/binance-exec-plan.md` §2/§5 BX0. F1: USDⓈ-M markPrice
+  on fstream's ROUTED `/market/ws/` path (the legacy `/ws/` URL answers
+  101 and stays silent since 2026-04-23 — the old "partial venue fault"),
+  plus F1b: a dated contract's live `"r":"0.00000000","T":0` is not
+  funding. F2: Binance options on `/market/stream?streams=<uly>@optionMarkPrice`
+  (the nbstream `/eoptions` route 404s since the 2025-12 options
+  migration — it was never this network); one push = one underlying's
+  whole chain, the lane keeps its table's rows; `BINANCE_EAPI_WS_HOST`
+  defaults to `fstream.binance.com`. F3: `HlExchange` finally overrides
+  the trait's `cancel`/`modify` (the router got `Unsupported` before);
+  inherent `modify` → `modify_by_cloid`. F4: `TCP_NODELAY` on every
+  socket core-net opens. After the restart the regime FUND reference
+  (`binance-usdm:btcusdt`) gets live funding prints for the first time
+  (`docs/migration.md`). Live smoke WITHOUT stopping the engine:
+  `CARGO_TARGET_DIR=/tmp/bx0-target cargo test --release -p cli --test
+  binance_md_live_smoke -- --ignored --nocapture` (`BN_SMOKE_SECS` ≤ 900).
+  The live `.env`'s `BINANCE_EAPI_WS_HOST` line was switched to
+  `fstream.binance.com` BY A SESSION on the operator's explicit ask
+  (2026-09-23; that one line, rewritten in place, nothing read out) — the
+  one sanctioned exception, the secrets law stands. F3's arm-level test
+  split is operator-accepted (the composed router test moves to BX3).
+  Remaining BX0 items: plan §5 BX0 "Operator actions". Zero-copy pass
+  (O-BX12d, the second BX0 commit, live from the 00:10Z restart):
+  `ingress-binance` joined `make copy-audit`, which had been blind past
+  any mid-file test-only method (routed.rs / exchange.rs / run_loop.rs)
+  — fixed, and `scripts/copy-audit-selftest.sh` proves the reading
+  first; bookTicker / markPrice parse IN PLACE (`&mut Frame` → `bool`);
+  `core_net::ws_write_text_frame_parts` writes a frame from payload
+  parts. Open: core-net's rustls RX copy and a possible per-record
+  allocation in rustls' buffered API (`docs/risk-policy.md`, UNVERIFIED).
+  In-place pass over the other seven ingress crates (okx, deribit,
+  hyperliquid, mexc, bybit, polymarket, rpc; `docs/risk-policy.md` "the
+  other ingress crates parse in place too"): 30 parsers fill in place,
+  frames left the dispatch values, `DepthPair` replaced the top-K
+  copies, the fuzz targets start from a poisoned frame. Open: core-ring's
+  by-value push/pop, and these seven crates are not in `make copy-audit`
+  (51 older unmarked copy verbs; the hot one, the WS Ping echo scratch,
+  in six of them).
+- **Gates at HEAD (BX0 in-place pass over the other ingress crates,
+  2026-09-23):** nextest 2743 (3
+  skipped — the `#[ignore]`d `mexc_live_smoke` and `binance_md_live_smoke`
+  among them) · alloc 64/64 at 0 B/op ·
+  clippy clean · `make license-check` OK · `make copy-audit` new=0
+  (self-test OK; 32 baselined over the exec lane, core-net, ingress-binance) ·
   worker pytest 1510 (3 skipped; `test_news_lanes::test_report_prints_the_funnel`
   is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
-  `hl_*` 3 × 300 s, `pb_scan`, `mexc_ws_frame`, `mexc_instruments` clean. Known
+  (poisoned start) `okx_frame`, `deribit_{jsonrpc_frame,option_ticker,vol_index}`,
+  `hl_{ws_frame,l2book,outcome_spec}`, `mexc_ws_frame`, `bybit_ws_frame`,
+  `polymarket_clob_frame`, `rpc_{response,subscribe_envelope}`,
+  `binance_{book_ticker,mark_price}` 60 s each clean; earlier: `hl_*` 3 × 300 s,
+  `pb_scan`, `mexc_instruments`, `binance_eapi_mark_array` 300 s,
+  `binance_eapi`, `binance_exchange_info` 120 s clean · live smokes 60 s:
+  MEXC and Binance, 0 parse errors, 0 reconnects. Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
@@ -130,8 +178,7 @@ in the script; `ai` = 48 is the floor every name includes).
   once pasted in chat — rotate; disk headroom on the Data volume is the
   operator's lever (writers do not retry after ENOSPC — restart is the
   recovery); whole-root `audit-pnl`/`backtest` OOMs above ~27 GB — use
-  bounded ≤ 2 h window roots; BN eapi-WS is unreachable from this network
-  (`BINANCE_EAPI_WS_HOST` in `.env` + restart activates it); `regime.toml
+  bounded ≤ 2 h window roots; `regime.toml
   [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
   names `claude-opus-4-6` as the session model (the three review agents are
   pinned to `claude-opus-5`).
@@ -260,8 +307,14 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   `// COPY: <what> <bound> — <why unavoidable> — <alternative rejected>` —
   the way `unsafe` carries `// SAFETY:`. Designed copies: kernel↔user,
   rustls' plaintext window, rx-tail compaction, the ring-slot publish,
-  ≤ 64 B PODs by value. Enforced by `make copy-audit` (a RATCHET against
-  `scripts/copy-audit-baseline.txt`; only the operator grows the baseline)
+  ≤ 64 B PODs by value. Every ingress parser fills the caller's frame IN
+  PLACE (`&mut Frame` → `bool`, written once, untouched on `false`); no
+  frame rides a run loop's `Dispatch` (each const-asserted ≤ 64 B); a
+  top-K change gate flips a `core_types::DepthPair`, never copies.
+  Enforced by `make copy-audit` (the exec lane,
+  core-net and ingress-binance; a RATCHET against
+  `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
+  `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)
   and the `zero-copy-auditor` agent. A cold operator module may opt out with
   a `//! COPY-DOCTRINE:` header — never anything the engine loop reaches.
 - **No `dyn Trait` in hot paths.** `Engine<S: Strategy, D: OrderDispatch>` is

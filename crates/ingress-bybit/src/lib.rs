@@ -217,6 +217,23 @@ pub struct BybitBookFrame {
     _pad: [u8; 8],
 }
 
+impl BybitBookFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        update_id: 0,
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        has_bid: 0,
+        has_ask: 0,
+        is_snapshot: 0,
+        _pad0: [0; 5],
+        venue_time_ms: 0,
+        _pad: [0; 8],
+    };
+}
+
 /// VT2: the `orderbook.1` venue stamp — `"cts":` (matching engine)
 /// preferred, `"ts":` (envelope send time) as the fallback, 0 when
 /// absent. Both are bare integers on the wire. `"ts":` cannot
@@ -236,9 +253,21 @@ fn book_venue_time_ms(payload: &[u8]) -> u64 {
     0
 }
 
-/// Parse one `orderbook.1` push. `None` on malformed input.
+/// Parse one `orderbook.1` push. `false` on malformed input.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_orderbook1(payload: &[u8]) -> Option<BybitBookFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_orderbook1(payload: &[u8], out: &mut BybitBookFrame) -> bool {
+    parse_orderbook1_fill(payload, out).is_some()
+}
+
+/// [`parse_orderbook1`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_orderbook1_fill(payload: &[u8], out: &mut BybitBookFrame) -> Option<()> {
     let pos = find_field(payload, b"\"u\":")?;
     let (update_id, _) = scan_u64(payload, pos)?;
     let is_snapshot = u8::from(memchr::memmem::find(payload, b"\"type\":\"snapshot\"").is_some());
@@ -269,7 +298,7 @@ pub fn parse_orderbook1(payload: &[u8]) -> Option<BybitBookFrame> {
 
     let (has_bid, bid_px_1e6, bid_qty_1e6) = side(payload, b"\"b\":")?;
     let (has_ask, ask_px_1e6, ask_qty_1e6) = side(payload, b"\"a\":")?;
-    Some(BybitBookFrame {
+    *out = BybitBookFrame {
         update_id,
         bid_px_1e6,
         bid_qty_1e6,
@@ -281,7 +310,8 @@ pub fn parse_orderbook1(payload: &[u8]) -> Option<BybitBookFrame> {
         _pad0: [0; 5],
         venue_time_ms,
         _pad: [0; 8],
-    })
+    };
+    Some(())
 }
 
 /// One parsed `publicTrade` ROW slice.
@@ -300,11 +330,34 @@ pub struct BybitTradeFrame {
     _pad: [u8; 39],
 }
 
+impl BybitTradeFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        px_1e6: 0,
+        qty_1e6: 0,
+        side: 0,
+        _pad: [0; 39],
+    };
+}
+
 /// Parse one `publicTrade` row slice (the run loop cuts rows at
 /// successive `"T":` markers; every key here is matched inside the
-/// row slice only). `None` on malformed input.
+/// row slice only). `false` on malformed input.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_trade_row(row: &[u8]) -> Option<BybitTradeFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_trade_row(row: &[u8], out: &mut BybitTradeFrame) -> bool {
+    parse_trade_row_fill(row, out).is_some()
+}
+
+/// [`parse_trade_row`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_trade_row_fill(row: &[u8], out: &mut BybitTradeFrame) -> Option<()> {
     let pos = find_field(row, b"\"T\":")?;
     let (ts_ms, _) = scan_u64(row, pos)?;
     let pos = find_field(row, b"\"p\":")?;
@@ -320,13 +373,14 @@ pub fn parse_trade_row(row: &[u8]) -> Option<BybitTradeFrame> {
     } else {
         return None;
     };
-    Some(BybitTradeFrame {
+    *out = BybitTradeFrame {
         ts_ns: ts_ms.saturating_mul(1_000_000),
         px_1e6,
         qty_1e6,
         side,
         _pad: [0; 39],
-    })
+    };
+    Some(())
 }
 
 /// One parsed LINEAR `tickers` push — every field PRESENCE-FLAGGED
@@ -359,10 +413,39 @@ pub struct BybitTickerFrame {
     _pad: [u8; 12],
 }
 
-/// Parse one LINEAR `tickers` push. `None` only when the envelope is
+impl BybitTickerFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        mark_px_1e6: 0,
+        index_px_1e6: 0,
+        funding_rate_1e9: 0,
+        next_funding_ms: 0,
+        open_interest_1e6: 0,
+        has_mark: 0,
+        has_index: 0,
+        has_funding: 0,
+        has_oi: 0,
+        _pad: [0; 12],
+    };
+}
+
+/// Parse one LINEAR `tickers` push. `false` only when the envelope is
 /// unusable (no `ts`); an all-absent delta parses with every flag 0.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_tickers(payload: &[u8]) -> Option<BybitTickerFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_tickers(payload: &[u8], out: &mut BybitTickerFrame) -> bool {
+    parse_tickers_fill(payload, out).is_some()
+}
+
+/// [`parse_tickers`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_tickers_fill(payload: &[u8], out: &mut BybitTickerFrame) -> Option<()> {
     let pos = find_field(payload, b"\"ts\":")?;
     let (ts_ms, _) = scan_u64(payload, pos)?;
     let mut f = BybitTickerFrame {
@@ -412,7 +495,8 @@ pub fn parse_tickers(payload: &[u8]) -> Option<BybitTickerFrame> {
             f.has_oi = 1;
         }
     }
-    Some(f)
+    *out = f;
+    Some(())
 }
 
 const _SIZE_CHECKS: () = {
@@ -585,9 +669,39 @@ pub fn write_subscribe(
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<BybitBookFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_orderbook1_view(payload: &[u8]) -> Option<crate::BybitBookFrame> {
+        let mut f = crate::BybitBookFrame::ZERO;
+        crate::parse_orderbook1(payload, &mut f).then_some(f)
+    }
+    // COPY: `Option<BybitTradeFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_trade_row_view(row: &[u8]) -> Option<crate::BybitTradeFrame> {
+        let mut f = crate::BybitTradeFrame::ZERO;
+        crate::parse_trade_row(row, &mut f).then_some(f)
+    }
+    // COPY: `Option<BybitTickerFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_tickers_view(payload: &[u8]) -> Option<crate::BybitTickerFrame> {
+        let mut f = crate::BybitTickerFrame::ZERO;
+        crate::parse_tickers(payload, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
 
     const BOOK_SNAP: &[u8] = br#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1687940967466,"data":{"s":"BTCUSDT","b":[["50005.12","403.24"]],"a":[["50006.34","0.2297"]],"u":18521288,"seq":7961638724},"cts":1687940967464}"#;
     const BOOK_DELTA_BID_ONLY: &[u8] = br#"{"topic":"orderbook.1.BTCUSDT","type":"delta","ts":1687940967470,"data":{"s":"BTCUSDT","b":[["50006.00","1.5"]],"a":[],"u":18521289,"seq":7961638725}}"#;
@@ -644,7 +758,7 @@ mod tests {
 
     #[test]
     fn parse_orderbook1_snapshot_and_one_sided_delta() {
-        let f = parse_orderbook1(BOOK_SNAP).unwrap();
+        let f = parse_orderbook1_view(BOOK_SNAP).unwrap();
         assert_eq!(f.is_snapshot, 1);
         assert_eq!((f.has_bid, f.has_ask), (1, 1));
         assert_eq!(f.bid_px_1e6, 50_005_120_000);
@@ -653,7 +767,7 @@ mod tests {
         assert_eq!(f.ask_qty_1e6, 229_700);
         assert_eq!(f.update_id, 18_521_288);
 
-        let d = parse_orderbook1(BOOK_DELTA_BID_ONLY).unwrap();
+        let d = parse_orderbook1_view(BOOK_DELTA_BID_ONLY).unwrap();
         assert_eq!(d.is_snapshot, 0);
         assert_eq!(
             (d.has_bid, d.has_ask),
@@ -662,29 +776,29 @@ mod tests {
         );
         assert_eq!(d.bid_px_1e6, 50_006_000_000);
 
-        assert!(parse_orderbook1(b"{}").is_none());
+        assert!(parse_orderbook1_view(b"{}").is_none());
     }
 
     #[test]
     fn parse_orderbook1_venue_time_prefers_cts_then_ts_then_zero() {
         // VT2: BOOK_SNAP carries ts 1687940967466 AND cts 1687940967464
         // → the matching-engine time wins; the delta carries ts only.
-        assert_eq!(parse_orderbook1(BOOK_SNAP).unwrap().venue_time_ms, 1_687_940_967_464);
+        assert_eq!(parse_orderbook1_view(BOOK_SNAP).unwrap().venue_time_ms, 1_687_940_967_464);
         assert_eq!(
-            parse_orderbook1(BOOK_DELTA_BID_ONLY).unwrap().venue_time_ms,
+            parse_orderbook1_view(BOOK_DELTA_BID_ONLY).unwrap().venue_time_ms,
             1_687_940_967_470
         );
         let none = br#"{"topic":"orderbook.1.X","type":"delta","data":{"s":"X","b":[["1","1"]],"a":[],"u":2}}"#;
-        assert_eq!(parse_orderbook1(none).unwrap().venue_time_ms, 0);
+        assert_eq!(parse_orderbook1_view(none).unwrap().venue_time_ms, 0);
         // a garbage stamp is "unknown", never a parse failure
         let bad = br#"{"topic":"orderbook.1.X","type":"delta","ts":"x","data":{"s":"X","b":[["1","1"]],"a":[],"u":2}}"#;
-        assert_eq!(parse_orderbook1(bad).unwrap().venue_time_ms, 0);
+        assert_eq!(parse_orderbook1_view(bad).unwrap().venue_time_ms, 0);
     }
 
     #[test]
     fn parse_orderbook1_zero_size_clears_a_side() {
         let z = br#"{"topic":"orderbook.1.X","type":"delta","data":{"s":"X","b":[["50005.12","0"]],"a":[],"u":2}}"#;
-        let f = parse_orderbook1(z).unwrap();
+        let f = parse_orderbook1_view(z).unwrap();
         assert_eq!(f.has_bid, 1);
         assert_eq!(f.bid_qty_1e6, 0, "explicit zero size = side cleared");
     }
@@ -697,20 +811,20 @@ mod tests {
             first_t + 4 + memchr::memmem::find(&TRADES[first_t + 4..], b"\"T\":").unwrap();
         let row1 = &TRADES[first_t..second_t];
         let row2 = &TRADES[second_t..];
-        let t1 = parse_trade_row(row1).unwrap();
+        let t1 = parse_trade_row_view(row1).unwrap();
         assert_eq!(t1.side, 0);
         assert_eq!(t1.px_1e6, 16_578_500_000);
         assert_eq!(t1.qty_1e6, 1_000);
         assert_eq!(t1.ts_ns, 1_672_304_486_865 * 1_000_000);
-        let t2 = parse_trade_row(row2).unwrap();
+        let t2 = parse_trade_row_view(row2).unwrap();
         assert_eq!(t2.side, 1);
         assert_eq!(t2.qty_1e6, 500_000);
-        assert!(parse_trade_row(b"{\"T\":1}").is_none(), "price required");
+        assert!(parse_trade_row_view(b"{\"T\":1}").is_none(), "price required");
     }
 
     #[test]
     fn parse_tickers_snapshot_delta_and_flags() {
-        let s = parse_tickers(TICKERS_SNAP).unwrap();
+        let s = parse_tickers_view(TICKERS_SNAP).unwrap();
         assert_eq!(
             (s.has_mark, s.has_index, s.has_funding, s.has_oi),
             (1, 1, 1, 1)
@@ -722,13 +836,13 @@ mod tests {
         assert_eq!(s.open_interest_1e6, 68_744_761_000);
         assert_eq!(s.ts_ns, 1_673_272_861_686 * 1_000_000);
 
-        let d = parse_tickers(TICKERS_DELTA).unwrap();
+        let d = parse_tickers_view(TICKERS_DELTA).unwrap();
         assert_eq!(
             (d.has_mark, d.has_index, d.has_funding, d.has_oi),
             (1, 0, 0, 0)
         );
         assert_eq!(d.mark_px_1e6, 17_218_010_000);
-        assert!(parse_tickers(b"{}").is_none(), "envelope ts required");
+        assert!(parse_tickers_view(b"{}").is_none(), "envelope ts required");
     }
 
     #[test]
@@ -783,23 +897,23 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
-    use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
         fn orderbook1_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_orderbook1(&buf);
+            let _ = parse_orderbook1_view(&buf);
         }
 
         #[test]
         fn trade_row_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_trade_row(&buf);
+            let _ = parse_trade_row_view(&buf);
         }
 
         #[test]
         fn tickers_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_tickers(&buf);
+            let _ = parse_tickers_view(&buf);
         }
 
         #[test]
@@ -823,7 +937,7 @@ mod proptests {
                 write!(&mut buf, r#","cts":{cts}"#).unwrap();
             }
             buf.push('}');
-            let f = parse_orderbook1(buf.as_bytes()).unwrap();
+            let f = parse_orderbook1_view(buf.as_bytes()).unwrap();
             prop_assert_eq!(f.update_id, u);
             prop_assert_eq!(f.bid_px_1e6, bp as i64);
             prop_assert_eq!(f.bid_qty_1e6, bq as i64);

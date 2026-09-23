@@ -131,11 +131,23 @@ def first_last_ts(path: pathlib.Path) -> tuple[int, int] | None:
 
 def run_span(run_dir: pathlib.Path) -> tuple[int, int] | None:
     """(min first ts over TICK files, max last ts over every file) — the
-    harness's anchor law for the first; None when the run has no tick."""
+    harness's anchor law for the first; None when the run has no tick.
+
+    A file whose header cannot be read holds no slot, so it is SKIPPED — the
+    law ``run_pmlr_version`` already applies. A boot that dies between creating
+    a capture file and writing its 64 bytes leaves 0 B behind, and raising here
+    let that one file stop every SWEEP that asks a run for its span: the
+    archive push (the 2026-09-22 cycle aborted on a 0-byte ``okx-events.pmlr``
+    and stranded every run behind it — and so retention), the window pools and
+    the pnl-report windowing. Cutting stays strict (``_cut_file``): a cut is
+    replayed by the harness, and a file it cannot read is an error there."""
     first = None
     last = None
     for p in sorted(run_dir.glob("*.pmlr")):
-        fl = first_last_ts(p)
+        try:
+            fl = first_last_ts(p)
+        except WindowError:
+            continue
         if fl is None:
             continue
         if p.name.endswith("-ticks.pmlr"):

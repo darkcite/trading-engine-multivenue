@@ -57,10 +57,10 @@ pub mod vrp_boot;
 pub mod xsd_boot;
 
 pub use paper::{
-    boot_discovery, boot_info, build_ai_universe, build_deribit_symbol_table, build_hl_coin_table,
-    build_hl_families, build_okx_symbol_table, drain_and_count_loop, engine_loop_ev_full,
-    engine_loop_ev_paper, engine_loop_rule_tree_full, engine_loop_set_full,
-    extend_deribit_table_with_combos, extend_deribit_table_with_options,
+    bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
+    build_deribit_symbol_table, build_hl_coin_table, build_hl_families, build_okx_symbol_table,
+    drain_and_count_loop, engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full,
+    engine_loop_set_full, extend_deribit_table_with_combos, extend_deribit_table_with_options,
     extend_okx_table_with_options, hyperevm_pool_table, join_reverse, new_capture_run_dir,
     open_fills_capture, open_orders_capture, parse_ai_hmac_key, parse_raw_tap_flags,
     parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance, spawn_binance_multi,

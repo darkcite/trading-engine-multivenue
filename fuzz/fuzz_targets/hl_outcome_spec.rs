@@ -33,6 +33,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
     use ingress_hyperliquid::discovery;
 
@@ -54,7 +57,10 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // The lifecycle pair, on the buffer as a WS frame.
-    let _ = ingress_hyperliquid::parse_outcome_meta(data);
+    let mut f: ingress_hyperliquid::HlOutcomeMetaFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_outcome_meta(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlOutcomeMetaFrame>(), "a failed parse wrote the frame");
+    }
     if let Some((id, desc)) = ingress_hyperliquid::outcome_meta_description(data) {
         // Zero copy: the description borrows from the input.
         let base = data.as_ptr() as usize;

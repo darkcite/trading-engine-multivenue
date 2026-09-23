@@ -186,14 +186,18 @@ push, appended by the owning ingress thread to its per-venue
 `<venue>-opt-summary.pmlr`. Capture-only through M5; **VM2 V2: the
 record now ALSO rides a per-venue options-summary SPSC lane into the
 engine** (`Ring<OptSummary, OPT_RING_SIZE = 4096>`,
-`engine::opt_lane_of`: OKX 0, Deribit 1, Binance-eapi 2 — the BN lane
-exists venue-dark so the `.env` heal activates it with no engine
-change) → `Strategy::on_opt_summary` → the vm feature engine's
+`engine::opt_lane_of`: OKX 0, Deribit 1, Binance 2 — the BN lane was
+dark from the venue's 2025-12 options migration until BX0-F2 moved it
+to fstream `/market`, 2026-09-23) → `Strategy::on_opt_summary` → the
+vm feature engine's
 mark/IV features. Capture stays FIRST at every emit site (§6.5
 capture-before-push law); full-ring pushes count
 `opt_ring_drops_total`. Offline consumers unchanged.
-Fed by Deribit option `ticker.{instr}.100ms` and OKX `opt-summary`
-(BN eapi joins at M2.4). Values are RAW VENUE UNITS fixed-point
+Fed by Deribit option `ticker.{instr}.100ms`, OKX `opt-summary` and
+(BX0-F2) Binance `<uly>@optionMarkPrice` — one record per SELECTED
+option per push, `underlying_px_1e9` = the element's `i` (the
+underlying's index, one value per push), flags = mark_px only (the
+stream carries no open interest). Values are RAW VENUE UNITS fixed-point
 (Deribit option mark px is coin-denominated); IV is a FRACTION ×1e9
 (Deribit's percent wire value normalized /100); greeks are
 Black-Scholes-style (Deribit `greeks.*`, OKX `*BS`) with SATURATING
@@ -211,7 +215,7 @@ M2.3 — both 0 with flags 0; its `fwdPx` fills `underlying_px_1e9`).
 |     14 |     2 | _pad0             | `[u8; 2]`      | explicit, zeroed                         |
 |     16 |     8 | mark_px_1e9       | `i64`          | raw venue units ×1e9; 0 if flag absent   |
 |     24 |     8 | mark_iv_1e9       | `i64`          | IV fraction ×1e9                         |
-|     32 |     8 | underlying_px_1e9 | `i64`          | Deribit `underlying_price`; OKX `fwdPx`  |
+|     32 |     8 | underlying_px_1e9 | `i64`          | Deribit `underlying_price`; OKX `fwdPx`; Binance `i` (index) |
 |     40 |     8 | open_interest_1e6 | `i64`          | raw venue units ×1e6; 0 if flag absent   |
 |     48 |     4 | delta_1e9         | `i32`          | BS delta ×1e9 (exact; \|δ\| ≤ 1)         |
 |     52 |     4 | gamma_1e9         | `i32`          | BS gamma ×1e9, saturating                |
@@ -544,6 +548,37 @@ dispatched to `Strategy::on_fill`, venue lanes + dispatcher pump),
 `engine-orders.pmlr` (kind 3, M4.1 — every order ACCEPTED by the
 dispatcher via `ctx.submit`; refusals are counters only), and
 `ai-cmds.pmlr` (kind 4, written by `ingress-ai`).
+
+BX0, appended 2026-09-23 — **Binance (`bn`) market data re-lit; no
+layout change.** Both lanes had gone dark venue-side without a single
+error: fstream answers the upgrade (101) on a route that no longer
+carries the stream and then sends nothing.
+
+- **USDⓈ-M `Mark` (2) / `Funding` (3) rows** (BX0-F1): the markPrice
+  slots dial fstream's ROUTED `/market/ws/<sym>@markPrice`. Binance
+  stopped serving `/market` streams on the legacy `/ws/` URLs on
+  2026-04-23 — before the WS5 lane existed (its 2026-08-29 "partial
+  venue fault" diagnosis was this routing) — so **no capture made
+  before the first post-BX0 boot holds a Binance Mark or Funding
+  row**; they appear from that boot on, additively (the bookTicker
+  `Tick` rows never stopped — `/ws/` still carries the `/public`
+  streams). The live frame gained `ap` and `st`
+  keys (skipped). A delivery contract writes `Mark` only: the WS5-era
+  wire sent `"r":""`, the live one sends `"r":"0.00000000","T":0`,
+  and `Funding` is written only for a parseable rate WITH a next
+  settlement (`T` > 0).
+- **Binance options** (BX0-F2): one combined slot,
+  `/market/stream?streams=<uly>@optionMarkPrice/…` on fstream (the
+  nbstream `/eoptions/` `@ticker`/`@index` routes answer 404 since the
+  2025-12 options migration — `bn-opt-summary.pmlr` is header-only
+  in every capture since then). Each push is ONE array holding the
+  underlying's whole listed chain (752 BTC options ≈ 246 KB, about
+  once a second); the lane keeps the boot-selected rows and skips the
+  rest by table lookup. Per selected row per push: one `OptSummary`
+  (above) and one `Tick` when a side is quoted (`bo`/`bq`, `ao`/`aq`;
+  `venue_seq` 0, no venue stamp — the stream carries neither per
+  row). Instrument names and syms resolve through
+  `options-manifest.tsv` / `instrument-manifest.tsv` as before.
 
 ### Options manifest — `options-manifest.tsv` (M2 close)
 

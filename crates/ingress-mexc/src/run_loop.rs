@@ -588,6 +588,19 @@ struct BookScan {
     two_sided: bool,
 }
 
+impl BookScan {
+    /// No candidate yet — the phase-1 scratch's starting value.
+    const EMPTY: Self = Self {
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        seq: 0,
+        venue_time_ms: 0,
+        two_sided: false,
+    };
+}
+
 /// Per-push trade walk result (events already captured in phase 1).
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -647,12 +660,11 @@ enum Dispatch {
     /// An `rs.error` that refuses nothing (e.g. the 60 s heartbeat
     /// notice) — a venue session error, not a subscribe drop.
     FutVenueNotice,
-    /// A BBO push for row `row`.
+    /// A BBO push for row `row`, walked into the phase-1 book scratch.
     Book {
         row: usize,
         sym: SymbolId,
         channel: MexcChannel,
-        scan: BookScan,
     },
     /// A trade push for row `row` (events captured in phase 1).
     Trades {
@@ -660,14 +672,15 @@ enum Dispatch {
         channel: MexcChannel,
         scan: TradeScan,
     },
-    /// A futures ticker push for row `row` (events emitted in phase 2 —
-    /// the funding clock is mutable row state).
-    Ticker {
-        row: usize,
-        sym: SymbolId,
-        frame: MexcTickerFrame,
-    },
+    /// A futures ticker push for row `row`, parsed into the phase-1
+    /// ticker scratch (events emitted in phase 2 — the funding clock is
+    /// mutable row state).
+    Ticker { row: usize, sym: SymbolId },
 }
+
+// The dispatch value crosses phase 1 → phase 2 by value: pinned
+// within the 64 B by-value bound (frames ride in phase-1 scratch).
+const _: () = assert!(core::mem::size_of::<Dispatch>() <= 64);
 
 fn drain_ws_frames<C: Capture>(
     drv: &mut Driver,
@@ -773,7 +786,7 @@ fn drain_ws_frames<C: Capture>(
 /// item's time or the push's own stamp when the item carries none).
 #[inline]
 fn record_deal<C: Capture>(
-    deal: Option<MexcDeal>,
+    deal: Option<&MexcDeal>,
     item: &[u8],
     sym: SymbolId,
     fallback_ms: u64,
@@ -874,7 +887,8 @@ fn scan_spot_ack<C: Capture>(
     scan
 }
 
-/// Phase 1 for a SPOT frame.
+/// Phase 1 for a SPOT frame. A BBO candidate lands in `book`
+/// ([`Dispatch::Book`] says so).
 fn spot_dispatch<C: Capture>(
     payload: &[u8],
     binary: bool,
@@ -882,19 +896,24 @@ fn spot_dispatch<C: Capture>(
     ever_confirmed: bool,
     status: &IngressStatus,
     capture: &mut C,
+    book: &mut BookScan,
 ) -> Dispatch {
     match classify_spot(payload, binary) {
         MexcSpotKind::Pong => Dispatch::Quiet,
-        MexcSpotKind::SubAck => match parse_sub_ack(payload) {
-            Some(ack) => Dispatch::SpotAck(scan_spot_ack(
-                payload,
-                &ack,
-                symbols,
-                ever_confirmed,
-                status,
-                capture,
-            )),
-            None => Dispatch::Nothing,
+        MexcSpotKind::SubAck => {
+            let mut ack = crate::spot::MexcSpotAck::ZERO;
+            if parse_sub_ack(payload, &mut ack) {
+                Dispatch::SpotAck(scan_spot_ack(
+                    payload,
+                    &ack,
+                    symbols,
+                    ever_confirmed,
+                    status,
+                    capture,
+                ))
+            } else {
+                Dispatch::Nothing
+            }
         },
         MexcSpotKind::Push => {
             let Some(frame) = parse_spot_wrapper(payload) else {
@@ -905,12 +924,10 @@ fn spot_dispatch<C: Capture>(
             };
             let body = frame.body(payload);
             match frame.channel {
-                MexcChannel::SpotBookTicker => match parse_book_ticker_body(body) {
-                    Some(b) => Dispatch::Book {
-                        row,
-                        sym,
-                        channel: MexcChannel::SpotBookTicker,
-                        scan: BookScan {
+                MexcChannel::SpotBookTicker => {
+                    let mut b = crate::spot::MexcBookTicker::ZERO;
+                    if parse_book_ticker_body(body, &mut b) {
+                        *book = BookScan {
                             bid_px_1e6: b.bid_px_1e6,
                             bid_qty_1e6: b.bid_qty_1e6,
                             ask_px_1e6: b.ask_px_1e6,
@@ -920,16 +937,24 @@ fn spot_dispatch<C: Capture>(
                             // An emptied side parses as 0/0 (see
                             // `parse_book_ticker_body`): no quote.
                             two_sided: b.bid_px_1e6 > 0 && b.ask_px_1e6 > 0,
-                        },
-                    },
-                    None => Dispatch::Nothing,
+                        };
+                        Dispatch::Book {
+                            row,
+                            sym,
+                            channel: MexcChannel::SpotBookTicker,
+                        }
+                    } else {
+                        Dispatch::Nothing
+                    }
                 },
                 MexcChannel::SpotDeals => {
                     let fallback_ms = frame.venue_time_ms();
                     let mut walk = MexcDealsWalk::new(body);
                     let mut scan = TradeScan::EMPTY;
+                    let mut deal = crate::MexcDeal::ZERO;
                     while let Some(item) = walk.next_item() {
-                        record_deal(parse_deal_item(item), item, sym, fallback_ms, &mut scan, capture);
+                        let parsed = parse_deal_item(item, &mut deal);
+                        record_deal(parsed.then_some(&deal), item, sym, fallback_ms, &mut scan, capture);
                     }
                     scan.malformed = walk.is_malformed();
                     Dispatch::Trades {
@@ -945,12 +970,16 @@ fn spot_dispatch<C: Capture>(
     }
 }
 
-/// Phase 1 for a FUTURES frame.
+/// Phase 1 for a FUTURES frame. A BBO candidate lands in `book`, a
+/// ticker in `ticker` ([`Dispatch::Book`] / [`Dispatch::Ticker`] say
+/// which).
 fn fut_dispatch<C: Capture>(
     payload: &[u8],
     binary: bool,
     symbols: &MexcSymbolTable,
     capture: &mut C,
+    book: &mut BookScan,
+    ticker: &mut MexcTickerFrame,
 ) -> Dispatch {
     if binary {
         // Compression is never requested; a binary push is foreign.
@@ -987,12 +1016,10 @@ fn fut_dispatch<C: Capture>(
                 return Dispatch::Nothing;
             };
             match channel {
-                MexcChannel::FutDepthFull => match parse_depth_full(payload) {
-                    Some(d) => Dispatch::Book {
-                        row,
-                        sym,
-                        channel,
-                        scan: BookScan {
+                MexcChannel::FutDepthFull => {
+                    let mut d = crate::futures::MexcDepthFrame::ZERO;
+                    if parse_depth_full(payload, &mut d) {
+                        *book = BookScan {
                             bid_px_1e6: d.bid_px_1e6,
                             bid_qty_1e6: d.bid_qty_1e6,
                             ask_px_1e6: d.ask_px_1e6,
@@ -1000,23 +1027,30 @@ fn fut_dispatch<C: Capture>(
                             seq: d.version,
                             venue_time_ms: d.venue_time_ms,
                             two_sided: d.has_bid == 1 && d.has_ask == 1,
-                        },
-                    },
-                    None => Dispatch::Nothing,
+                        };
+                        Dispatch::Book { row, sym, channel }
+                    } else {
+                        Dispatch::Nothing
+                    }
                 },
                 MexcChannel::FutDeal => {
                     let fallback_ms = extract_fut_ts_ms(payload);
                     let mut walk = MexcFutDealsWalk::new(payload);
                     let mut scan = TradeScan::EMPTY;
+                    let mut deal = crate::MexcDeal::ZERO;
                     while let Some(item) = walk.next_item() {
-                        record_deal(parse_fut_deal_item(item), item, sym, fallback_ms, &mut scan, capture);
+                        let parsed = parse_fut_deal_item(item, &mut deal);
+                        record_deal(parsed.then_some(&deal), item, sym, fallback_ms, &mut scan, capture);
                     }
                     scan.malformed = walk.is_malformed();
                     Dispatch::Trades { row, channel, scan }
                 }
-                MexcChannel::FutTicker => match parse_ticker(payload) {
-                    Some(frame) => Dispatch::Ticker { row, sym, frame },
-                    None => Dispatch::Nothing,
+                MexcChannel::FutTicker => {
+                    if parse_ticker(payload, ticker) {
+                        Dispatch::Ticker { row, sym }
+                    } else {
+                        Dispatch::Nothing
+                    }
                 },
                 _ => Dispatch::Nothing,
             }
@@ -1076,6 +1110,12 @@ fn handle_data_frame<C: Capture>(
     capture: &mut C,
 ) -> io::Result<()> {
     let reject_range = payload_range.clone();
+    // Phase 1's BBO candidate and futures ticker, built in place: riding
+    // inside the dispatch value they would widen it past the 64 B bound
+    // and cross each phase-1 call → phase 2 by value. `Dispatch::Book` /
+    // `Dispatch::Ticker` say which one was written.
+    let mut book = BookScan::EMPTY;
+    let mut ticker = MexcTickerFrame::ZERO;
     // Phase 1: immutable borrows — classify, resolve, pre-parse into a
     // Copy dispatch; capture hooks needing the payload fire here.
     let dispatch: Dispatch = {
@@ -1089,8 +1129,11 @@ fn handle_data_frame<C: Capture>(
                 drv.ever_confirmed,
                 status,
                 capture,
+                &mut book,
             ),
-            MexcClass::Futures => fut_dispatch(payload, binary, &drv.symbols, capture),
+            MexcClass::Futures => {
+                fut_dispatch(payload, binary, &drv.symbols, capture, &mut book, &mut ticker)
+            }
         }
     };
 
@@ -1181,12 +1224,8 @@ fn handle_data_frame<C: Capture>(
                 core_metrics::io_kind_code(io::ErrorKind::ConnectionAborted),
             );
         }
-        Dispatch::Book {
-            row,
-            sym,
-            channel,
-            scan,
-        } => {
+        Dispatch::Book { row, sym, channel } => {
+            let scan = &book;
             status.add_msgs(1);
             note_confirmed(drv, row, channel);
             // VT2: judge EVERY stamped push — a republished quote still
@@ -1287,7 +1326,8 @@ fn handle_data_frame<C: Capture>(
                 note_seq(&mut rs.last_trade_seq, scan.max_seq, status);
             }
         }
-        Dispatch::Ticker { row, sym, frame } => {
+        Dispatch::Ticker { row, sym } => {
+            let frame = &ticker;
             status.add_msgs(1);
             status.add_ticks(1);
             note_confirmed(drv, row, MexcChannel::FutTicker);

@@ -345,6 +345,20 @@ pub fn ws_write_text_frame(
     ws_write_frame(dst, WsOpcode::Text, payload, mask)
 }
 
+/// Serialize a single-fragment client text frame whose payload is the
+/// concatenation of `parts`, each written straight into `dst` — a
+/// caller never assembles the payload anywhere first (BX0: the Binance
+/// spot sentinel's SUBSCRIBE). Same contract as
+/// [`ws_write_text_frame`]: `FIN=1`, masked, zero-alloc.
+#[inline]
+pub fn ws_write_text_frame_parts(
+    dst: &mut [u8],
+    parts: &[&[u8]],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    ws_write_frame_parts(dst, WsOpcode::Text, parts, mask)
+}
+
 /// Binary counterpart of [`ws_write_text_frame`].
 #[inline]
 pub fn ws_write_binary_frame(
@@ -377,7 +391,24 @@ fn ws_write_frame(
     payload: &[u8],
     mask: [u8; 4],
 ) -> Result<usize, WsWriteErr> {
-    let plen = payload.len();
+    ws_write_frame_parts(dst, opcode, &[payload], mask)
+}
+
+/// The one frame serialiser: the payload is the concatenation of
+/// `parts`, each written straight into place.
+#[inline]
+fn ws_write_frame_parts(
+    dst: &mut [u8],
+    opcode: WsOpcode,
+    parts: &[&[u8]],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    let mut plen = 0usize;
+    let mut k = 0usize;
+    while k < parts.len() {
+        plen += parts[k].len();
+        k += 1;
+    }
     let hdr_len: usize = if plen <= 125 {
         2 + 4
     } else if plen <= u16::MAX as usize {
@@ -416,13 +447,23 @@ fn ws_write_frame(
     dst[cursor..cursor + 4].copy_from_slice(&mask);
     cursor += 4;
 
-    // Copy payload, then XOR-mask it in place. We do copy-then-mask
-    // (rather than streaming through a scratch) because `dst` is the
-    // caller's preallocated tx buffer and we want the final write to
-    // go out masked. The copy is necessary — WebSocket masks the
-    // payload on the wire, and the caller's `payload` slice is not
-    // mutable.
-    dst[cursor..cursor + plen].copy_from_slice(payload);
+    // Copy the payload parts, then XOR-mask them in place in one pass.
+    // Copy-then-mask (rather than streaming through a scratch) because
+    // `dst` is the caller's preallocated tx buffer and the final write
+    // must go out masked.
+    let mut at = cursor;
+    let mut k = 0usize;
+    while k < parts.len() {
+        let p = parts[k];
+        // COPY: each payload part into the final wire buffer, the frame's
+        // payload in all — the serialiser's own write: WebSocket masks
+        // the payload on the wire and the caller's bytes are not ours to
+        // mutate — rejected: masking the caller's buffer in place (not
+        // ours) or staging the parts in a scratch first (a second copy).
+        dst[at..at + p.len()].copy_from_slice(p);
+        at += p.len();
+        k += 1;
+    }
     ws_unmask_in_place(&mut dst[cursor..cursor + plen], mask);
 
     Ok(total)
@@ -609,6 +650,30 @@ mod tests {
             }
             other => panic!("expected Frame, got {other:?}"),
         }
+    }
+
+    /// BX0: a frame written from parts is byte-identical to the frame
+    /// written from their concatenation, in every length class.
+    #[test]
+    fn parts_frame_matches_the_concatenated_frame() {
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        for total in [0usize, 3, 125, 126, 1_000, 70_000] {
+            let whole: Vec<u8> = (0..total).map(|i| (i * 7 + 3) as u8).collect();
+            let (a, rest) = whole.split_at(total / 3);
+            let (b, c) = rest.split_at(rest.len() / 2);
+            let mut one = vec![0u8; total + 14];
+            let mut three = vec![0u8; total + 14];
+            let n1 = ws_write_text_frame(&mut one, &whole, mask).unwrap();
+            let n3 = ws_write_text_frame_parts(&mut three, &[a, b, c], mask).unwrap();
+            assert_eq!(n1, n3, "length class {total}");
+            assert_eq!(one[..n1], three[..n3], "length class {total}");
+        }
+        // Too small a destination is refused, never truncated.
+        let mut tiny = [0u8; 9];
+        assert_eq!(
+            ws_write_text_frame_parts(&mut tiny, &[b"abc", b"defg"], mask),
+            Err(WsWriteErr::BufferTooSmall)
+        );
     }
 
     #[test]

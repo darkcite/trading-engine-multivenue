@@ -137,12 +137,26 @@ impl TlsTransport {
     /// Open a new TLS transport to `addr` for the given SNI `server_name`.
     /// `config` is a shared rustls configuration (typically from
     /// [`Self::default_client_config`]).
+    ///
+    /// Nagle is switched OFF here, on every socket this crate opens —
+    /// the one choke point every ingress, the exchange arm's
+    /// request/response client and its user-event WS go through
+    /// (BX0-F4, operator ruling O-BX12a). A pipelined order socket
+    /// with Nagle on holds each small write until the previous
+    /// segment is ACKed — one ~110 ms Tokyo RTT from here — and a
+    /// streaming reader loses nothing by sending its few bytes
+    /// (pongs, subscribes) at once.
+    ///
+    /// # Errors
+    /// The connect could not be started, the socket refused the
+    /// option, or rustls refused the configuration.
     pub fn connect(
         addr: SocketAddr,
         server_name: ServerName<'static>,
         config: Arc<ClientConfig>,
     ) -> io::Result<Self> {
         let sock = TcpStream::connect(addr)?;
+        sock.set_nodelay(true)?;
         let conn = ClientConnection::new(config, server_name).map_err(io::Error::other)?;
         Ok(Self {
             sock,
@@ -578,9 +592,14 @@ pub struct PlainTcpTransport {
 impl PlainTcpTransport {
     /// Open a new plain TCP connection to `addr`. Non-blocking; the
     /// caller is expected to drive the connect-completion event via
-    /// mio.
+    /// mio. Nagle off, exactly as [`TlsTransport::connect`] (BX0-F4).
+    ///
+    /// # Errors
+    /// The connect could not be started, or the socket refused the
+    /// option.
     pub fn connect(addr: SocketAddr) -> io::Result<Self> {
         let sock = TcpStream::connect(addr)?;
+        sock.set_nodelay(true)?;
         Ok(Self {
             sock,
             tcp_connected: false,
@@ -749,5 +768,29 @@ mod tests {
     fn server_name_from_host_rejects_garbage() {
         let err = TlsTransport::server_name_from_host("not a valid host!").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// BX0-F4: Nagle is off on a socket the moment either transport
+    /// hands it back — while the non-blocking connect may still be in
+    /// flight, which is exactly the state every production caller
+    /// registers it with mio in. Break-and-watch: without the
+    /// `set_nodelay` line in each `connect`, both asserts read the
+    /// kernel default (`false`).
+    #[test]
+    fn every_connect_turns_nagle_off() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+
+        let plain = PlainTcpTransport::connect(addr).expect("plain connect");
+        assert!(plain.sock.nodelay().expect("getsockopt"), "plain TCP left Nagle on");
+
+        let tls = TlsTransport::connect(
+            addr,
+            TlsTransport::server_name_from_host("localhost").expect("name"),
+            TlsTransport::default_client_config(),
+        )
+        .expect("tls connect");
+        assert!(tls.sock.nodelay().expect("getsockopt"), "TLS transport left Nagle on");
+        drop(listener);
     }
 }

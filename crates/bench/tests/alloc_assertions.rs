@@ -91,13 +91,19 @@ fn price_scanner_is_zero_alloc() {
     );
 }
 
-/// Parsing a sample Polymarket book frame 1000x must not allocate.
+/// Parsing a sample Polymarket book frame and `price_change` row 1000x
+/// must not allocate.
 #[test]
 fn book_parser_is_zero_alloc() {
     let buf: &[u8] = br#"[{"market":"0x60c2","asset_id":"0xabc","timestamp":"1713000000000","hash":"deadbeef","bids":[{"price":"0.517","size":"200.0"},{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.521","size":"150.0"},{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
+    let row: &[u8] = br#"{"asset_id":"0xabc","price":"0.518","size":"642.77","side":"BUY","hash":"d0c1","best_bid":"0.518","best_ask":"0.520"}"#;
     let g = AllocGuard::new();
     for _ in 0..1_000u32 {
-        let t = ingress_polymarket::parse_book_update(buf, 1, 0);
+        let mut t = core_types::Tick::ZERO;
+        assert!(ingress_polymarket::parse_book_update(buf, 1, 0, &mut t));
+        std::hint::black_box(t);
+        let mut t = core_types::Tick::ZERO;
+        assert!(ingress_polymarket::parse_price_change_row(row, 1, 0, 1_713_000_000_123, &mut t));
         std::hint::black_box(t);
     }
     let (allocs, bytes, _deallocs) = g.delta();
@@ -170,25 +176,32 @@ fn ws_frame_roundtrip_is_zero_alloc() {
     );
 }
 
-/// Parse a Binance `@bookTicker` frame 10_000x — must be zero-alloc.
+/// Parse a Binance `@bookTicker` frame and a USDⓈ-M `@markPrice` frame
+/// 10_000x each, in place into one reused frame apiece (BX0) — must be
+/// zero-alloc.
 #[test]
 fn binance_book_ticker_is_zero_alloc() {
     let buf: &[u8] =
         br#"{"u":400900217,"s":"BTCUSDT","b":"65000.01","B":"1.234","a":"65000.55","A":"0.987"}"#;
+    let mark: &[u8] = br#"{"e":"markPriceUpdate","E":1790161527002,"s":"BTCUSDT","p":"85840.40234633","ap":"85840.40234633","P":"85863.42568007","i":"85882.44043478","r":"0.00005016","T":1790179200000,"st":1}"#;
     let sym: SymbolId = 7;
+    let mut t = ingress_binance::BookTickerFrame::ZERO;
+    let mut m = ingress_binance::BnMarkPriceFrame::ZERO;
 
     let g = AllocGuard::new();
     let mut acc: i64 = 0;
     for _ in 0..10_000u32 {
-        let t = parse_book_ticker(buf, sym).unwrap();
+        assert!(parse_book_ticker(buf, sym, &mut t));
         acc = acc.wrapping_add(t.bid_px_1e6);
+        assert!(ingress_binance::parse_mark_price(mark, sym, &mut m));
+        acc = acc.wrapping_add(m.funding_rate_1e9);
     }
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
         allocs, 0,
-        "parse_book_ticker allocated {allocs} times ({bytes} B)"
+        "parse_book_ticker / parse_mark_price allocated {allocs} times ({bytes} B)"
     );
 }
 
@@ -210,7 +223,8 @@ fn rpc_block_number_is_zero_alloc() {
         acc = acc.wrapping_add(n as u64);
         let (id, block) = parse_block_number_result(resp).unwrap();
         acc = acc.wrapping_add(id).wrapping_add(block);
-        let head = parse_new_head_notification(notif).unwrap();
+        let mut head = ingress_rpc::NewHead::ZERO;
+        assert!(parse_new_head_notification(notif, &mut head));
         acc = acc.wrapping_add(head.number);
     }
     std::hint::black_box(acc);
@@ -379,9 +393,36 @@ fn placeholder_producer() -> core_ring::Producer<Tick, DEFAULT_TICK_RING_CAP> {
 // Phase 1c: run-loop steady-state zero-alloc assertions (3 new)
 // ---------------------------------------------------------------
 
+/// BX0-F2: the live Binance options push (fstream `/market`, K6
+/// 2026-09-23) — three of its 752 elements, verbatim: the push's first
+/// row and the ATM pair.
+const BN_LIVE_MARK_ARRAY: &[u8] = br#"{"stream":"btcusdt@optionMarkPrice","data":[{"s":"BTC-261225-92000-C","mp":"4696.169","E":1790161477975,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"4670.000","ao":"4760.000","bq":"3.52","aq":"3.52","b":"0.38545907","a":"0.39075673","hl":"8450.000","ll":"940.000","vo":"0.387","rf":"0.0529","d":"0.42618971","t":"-35.49083602","g":"0.00002332","v":"169.85468453"},{"s":"BTC-260925-86000-P","mp":"905.351","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"905.000","ao":"920.000","bq":"4.43","aq":"12.00","b":"0.34885705","a":"0.35497367","hl":"1625.000","ll":"185.000","vo":"0.349","rf":"0.0558","d":"-0.51276574","t":"-230.5222729","g":"0.00018424","v":"24.52223767"},{"s":"BTC-260925-86000-C","mp":"809.784","E":1790161477974,"e":"markPrice","i":"85879.82826087","P":"0.000","bo":"800.000","ao":"810.000","bq":"5.08","aq":"1.10","b":"0.34500957","a":"0.34908772","hl":"1455.000","ll":"165.000","vo":"0.349","rf":"0.0558","d":"0.48723426","t":"-227.33432684","g":"0.00018682","v":"24.52223767"}]}"#;
+
+/// The server's `101` reply to a client handshake seeded with `seed`
+/// (boot side of the Binance run-loop gate, outside any window).
+fn bn_upgrade_reply(seed: u64, resp: &mut [u8; 256]) -> usize {
+    let key = core_net::sec_websocket_key_from_seed(seed);
+    let accept = core_net::expected_accept(&key);
+    let mut n = 0;
+    for src in [
+        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
+        &b"Upgrade: websocket\r\n"[..],
+        &b"Connection: Upgrade\r\n"[..],
+        &b"Sec-WebSocket-Accept: "[..],
+        &accept[..],
+        &b"\r\n\r\n"[..],
+    ] {
+        resp[n..n + src.len()].copy_from_slice(src);
+        n += src.len();
+    }
+    n
+}
+
 /// Drive the Binance ingress run-loop through 1 000 steady-state
-/// frames via a `TestTransport`. The only non-zero-alloc work happens
-/// at construction; every `drive_one` call must allocate zero bytes.
+/// frames via a `TestTransport` — bookTicker slot first, then (BX0-F2)
+/// the options slot through 1 000 live mark-array pushes. The only
+/// non-zero-alloc work happens at construction; every `drive_one`
+/// call must allocate zero bytes.
 #[test]
 fn binance_run_loop_steady_state_is_zero_alloc() {
     use ingress_binance::run_loop as bwl;
@@ -396,7 +437,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     // the measurement window.
     // VM2 V2: hoisted throwaway opt lane — created OUTSIDE the
     // AllocGuard window (Ring::new allocates).
-    let (mut otx, _orx) =
+    let (mut otx, mut orx) =
         Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let status = core_metrics::IngressStatus::new();
 
@@ -447,21 +488,8 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let _ = transport.drain_outgoing(&mut scratch);
 
     // Inject the 101 reply matching the seed.
-    let key = core_net::sec_websocket_key_from_seed(0xBA07u64);
-    let accept = core_net::expected_accept(&key);
     let mut resp = [0u8; 256];
-    let mut n = 0;
-    for src in [
-        &b"HTTP/1.1 101 Switching Protocols\r\n"[..],
-        &b"Upgrade: websocket\r\n"[..],
-        &b"Connection: Upgrade\r\n"[..],
-        &b"Sec-WebSocket-Accept: "[..],
-        &accept[..],
-        &b"\r\n\r\n"[..],
-    ] {
-        resp[n..n + src.len()].copy_from_slice(src);
-        n += src.len();
-    }
+    let n = bn_upgrade_reply(0xBA07u64, &mut resp);
     transport.inject_incoming(&resp[..n]);
     bwl::drive_one(
         &mut transport,
@@ -525,6 +553,84 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
         bytes, 0,
         "binance run-loop bytes should be zero: saw {bytes}"
     );
+
+    // ---- BX0-F2: the options slot (boot NOT measured) ----
+    let mut table = ingress_binance::eapi::EapiSymbolTable::new();
+    table.insert(b"BTC-260925-86000-C", (1 << 24) | 1025).unwrap();
+    table.insert(b"BTC-260925-86000-P", (1 << 24) | 1026).unwrap();
+    let mut odriver = bwl::Driver::new_eapi(0xBA08u64, table);
+    bwl::note_transport_ready(&mut odriver, core_net::Status::Ready);
+    let mut otransport = TestTransport::with_capacity(128 * 1024);
+    for step in 0..2 {
+        if step == 1 {
+            let _ = otransport.drain_outgoing(&mut scratch);
+            let n = bn_upgrade_reply(0xBA08u64, &mut resp);
+            otransport.inject_incoming(&resp[..n]);
+        }
+        bwl::drive_one(
+            &mut otransport,
+            &mut odriver,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            &mut otx,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
+    }
+    assert_eq!(odriver.state(), bwl::State::Steady);
+    // The live push as one unmasked Text frame (16-bit length form).
+    let mut mframe = [0u8; 2048];
+    let plen = BN_LIVE_MARK_ARRAY.len();
+    assert!(plen > 125 && plen + 4 <= mframe.len());
+    mframe[0] = 0x81;
+    mframe[1] = 126;
+    mframe[2..4].copy_from_slice(&(plen as u16).to_be_bytes());
+    mframe[4..4 + plen].copy_from_slice(BN_LIVE_MARK_ARRAY);
+    let mlen = 4 + plen;
+
+    // ---- measurement window: split, walk, look up, parse, publish ----
+    let g2 = AllocGuard::new();
+    let mut rows = 0u64;
+    let mut summaries = 0u64;
+    for _ in 0..1_000u32 {
+        let written = otransport.inject_incoming(&mframe[..mlen]);
+        assert_eq!(written, mlen);
+        bwl::drive_one(
+            &mut otransport,
+            &mut odriver,
+            b"h",
+            b"/",
+            &mut prod,
+            &mut etx,
+            core_types::EVENT_LANE_FUNDING,
+            &mut otx,
+            &status,
+            &mut capture,
+        )
+        .unwrap();
+        while cons.try_pop().is_some() {
+            rows += 1;
+        }
+        while orx.try_pop().is_some() {
+            summaries += 1;
+        }
+    }
+    core_types::Capture::maybe_flush(&mut capture, 2 * core_io::CAPTURE_FLUSH_INTERVAL_NS + 2);
+    let (allocs, bytes, _deallocs) = g2.delta();
+    assert_eq!(
+        allocs, 0,
+        "binance options slot allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "binance options slot bytes should be zero: saw {bytes}");
+    // Premises: both selected rows came out of every push, and the
+    // unselected one never did.
+    assert_eq!(rows, 2_000, "a tick per selected row per push");
+    assert_eq!(summaries, 2_000, "a summary per selected row per push");
+    assert_eq!(status.parse_errors_total(), 0);
     assert!(!capture.is_disabled());
     assert_eq!(capture.io_errors(), 0);
     assert_eq!(capture.tap_dropped(), 0);
@@ -1481,15 +1587,20 @@ fn okx_parsers_are_zero_alloc() {
         std::hint::black_box(ingress_okx::classify(mark));
         std::hint::black_box(ingress_okx::classify(funding));
         std::hint::black_box(ingress_okx::classify(book));
-        let b = ingress_okx::parse_bbo(bbo, sym).unwrap();
+        let mut b = ingress_okx::OkxBboFrame::ZERO;
+        assert!(ingress_okx::parse_bbo(bbo, sym, &mut b));
         acc = acc.wrapping_add(b.bid_px_1e6);
-        let t = ingress_okx::parse_trade(trade, sym).unwrap();
+        let mut t = ingress_okx::OkxTradeFrame::ZERO;
+        assert!(ingress_okx::parse_trade(trade, sym, &mut t));
         acc = acc.wrapping_add(t.px_1e6);
-        let m = ingress_okx::parse_mark_price(mark, sym).unwrap();
+        let mut m = ingress_okx::OkxMarkPriceFrame::ZERO;
+        assert!(ingress_okx::parse_mark_price(mark, sym, &mut m));
         acc = acc.wrapping_add(m.mark_px_1e6);
-        let f = ingress_okx::parse_funding_rate(funding, sym).unwrap();
+        let mut f = ingress_okx::OkxFundingFrame::ZERO;
+        assert!(ingress_okx::parse_funding_rate(funding, sym, &mut f));
         acc = acc.wrapping_add(f.funding_rate_1e9);
-        let h = ingress_okx::parse_book_header(book, sym).unwrap();
+        let mut h = ingress_okx::OkxBookFrame::ZERO;
+        assert!(ingress_okx::parse_book_header(book, sym, &mut h));
         acc = acc.wrapping_add(h.seq_id);
     }
     std::hint::black_box(acc);
@@ -1755,13 +1866,17 @@ fn deribit_parsers_are_zero_alloc() {
             quote,
             ingress_deribit::DeribitChannel::Quote,
         ));
-        let q = ingress_deribit::parse_quote(quote, sym).unwrap();
+        let mut q = ingress_deribit::DeribitQuoteFrame::ZERO;
+        assert!(ingress_deribit::parse_quote(quote, sym, &mut q));
         acc = acc.wrapping_add(q.bid_px_1e6);
-        let k = ingress_deribit::parse_ticker(ticker, sym).unwrap();
+        let mut k = ingress_deribit::DeribitTickerFrame::ZERO;
+        assert!(ingress_deribit::parse_ticker(ticker, sym, &mut k));
         acc = acc.wrapping_add(k.mark_px_1e6);
-        let t = ingress_deribit::parse_trade(trade_row, sym).unwrap();
+        let mut t = ingress_deribit::DeribitTradeFrame::ZERO;
+        assert!(ingress_deribit::parse_trade(trade_row, sym, &mut t));
         acc = acc.wrapping_add(t.px_1e6);
-        let b = ingress_deribit::parse_book_header(book, sym).unwrap();
+        let mut b = ingress_deribit::DeribitBookFrame::ZERO;
+        assert!(ingress_deribit::parse_book_header(book, sym, &mut b));
         acc = acc.wrapping_add(b.change_id);
     }
     std::hint::black_box(acc);
@@ -1781,22 +1896,28 @@ fn deribit_parsers_are_zero_alloc() {
 /// `TestTransport`. Steady state is reached over the real handshake +
 /// set_heartbeat + batched-subscribe + subscribe-result path; the
 /// M2.3 options-analytics parsers (Deribit option `ticker`, OKX
-/// `opt-summary` row) + the `OptSummary` record construction —
+/// `opt-summary` row, and since BX0-F2 the Binance `optionMarkPrice`
+/// array walk) + the `OptSummary` record construction —
 /// live-shaped payloads for 10_000 iterations each, zero-alloc (the
 /// hot ingress threads run these per push).
 #[test]
 fn option_analytics_parsers_are_zero_alloc() {
     let deribit_opt: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-27MAR26-100000-C.100ms","data":{"timestamp":1774000000123,"instrument_name":"BTC-27MAR26-100000-C","state":"open","mark_price":0.0523,"mark_iv":65.43,"greeks":{"delta":0.512,"gamma":1.234e-5,"vega":152.3,"theta":-85.3,"rho":12.1},"open_interest":1234.5,"index_price":77216.94,"underlying_price":77300.12}}}"#;
     let okx_row: &[u8] = br#"{"instType":"OPTION","instId":"BTC-USD-260327-100000-C","uly":"BTC-USD","deltaBS":"0.512","gammaBS":"1.234e-5","thetaBS":"-85.3","vegaBS":"152.3","markVol":"0.6543","fwdPx":"77300.12","ts":"1774598400123"}"#;
-    let bn_combined: &[u8] = br#"{"stream":"btc-260327-100000-c@ticker","data":{"s":"BTC-260327-100000-C","bo":"2040.5","ao":"2060.1","bq":"1.25","aq":"0.75","d":"0.512","t":"-85.3","g":"0.0000123","v":"152.3","vo":"0.6543","mp":"2051.2"}}"#;
-    let bn_index: &[u8] =
-        br#"{"stream":"btcusdt@index","data":{"e":"index","s":"BTCUSDT","p":"77000.5"}}"#;
     let sym: SymbolId = (3 << 24) | 513;
+    // BX0-F2: the options lane's boot table (built outside the window).
+    let mut bn_table = ingress_binance::eapi::EapiSymbolTable::new();
+    bn_table.insert(b"BTC-260925-86000-C", (1 << 24) | 1025).unwrap();
+    bn_table.insert(b"BTC-260925-86000-P", (1 << 24) | 1026).unwrap();
+
+    let mut bn_frame = ingress_binance::eapi::EapiMarkFrame::ZERO;
 
     let g = AllocGuard::new();
     let mut acc: i64 = 0;
+    let mut bn_rows = 0u32;
     for _ in 0..10_000u32 {
-        let f = ingress_deribit::parse_option_ticker(deribit_opt).unwrap();
+        let mut f = ingress_deribit::DeribitOptTickerFrame::ZERO;
+        assert!(ingress_deribit::parse_option_ticker(deribit_opt, &mut f));
         acc = acc.wrapping_add(f.mark_iv_1e9);
         let o = core_types::OptSummary::new(
             1,
@@ -1816,14 +1937,24 @@ fn option_analytics_parsers_are_zero_alloc() {
         let r = ingress_okx::parse_opt_summary_row(okx_row).unwrap();
         acc = acc.wrapping_add(r.fwd_px_1e9);
         std::hint::black_box(ingress_okx::extract_inst_family(okx_row));
-        // M2.4: the eapi combined splitter + ticker/index parsers.
-        let (_, tail) = ingress_binance::eapi::split_combined(bn_combined).unwrap();
-        let e = ingress_binance::eapi::parse_eapi_ticker(tail).unwrap();
-        acc = acc.wrapping_add(e.mark_px_1e9);
-        let (_, itail) = ingress_binance::eapi::split_combined(bn_index).unwrap();
-        acc = acc.wrapping_add(ingress_binance::eapi::parse_eapi_index(itail).unwrap());
+        // BX0-F2: the options push — envelope split, array walk,
+        // symbol lookup, element parse (the whole per-push path).
+        let (_, tail) = ingress_binance::eapi::split_combined(BN_LIVE_MARK_ARRAY).unwrap();
+        let mut cur = ingress_binance::eapi::EapiArrayCursor::new(tail).unwrap();
+        while let ingress_binance::eapi::ArrayStep::Elem(e) = cur.next_elem() {
+            let s = ingress_binance::eapi::eapi_elem_symbol(e).unwrap();
+            if bn_table.lookup(s).is_some()
+                && ingress_binance::eapi::parse_eapi_mark(e, &mut bn_frame)
+            {
+                acc = acc
+                    .wrapping_add(bn_frame.mark_px_1e9)
+                    .wrapping_add(bn_frame.index_px_1e9);
+                bn_rows += 1;
+            }
+        }
     }
     std::hint::black_box(acc);
+    assert_eq!(bn_rows, 20_000, "both selected rows of every push parsed");
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
@@ -2126,17 +2257,26 @@ fn hl_parsers_are_zero_alloc() {
         std::hint::black_box(ingress_hyperliquid::classify(outcome));
         std::hint::black_box(ingress_hyperliquid::classify(subresp));
         std::hint::black_box(ingress_hyperliquid::extract_coin(bbo));
-        let b = ingress_hyperliquid::parse_bbo(bbo, sym).unwrap();
+        let mut b = ingress_hyperliquid::HlBboFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_bbo(bbo, sym, &mut b));
         acc = acc.wrapping_add(b.bid_px_1e6);
-        let l = ingress_hyperliquid::parse_l2book_header(l2book, sym).unwrap();
+        let mut l = ingress_hyperliquid::HlL2BookFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_l2book_header(l2book, sym, &mut l));
         acc = acc.wrapping_add(l.best_bid_px_1e6 + l.n_bids as i64);
-        let t = ingress_hyperliquid::parse_trade(trade, sym).unwrap();
+        let mut d = core_types::DepthTopK::EMPTY;
+        let mut h = ingress_hyperliquid::HlL2BookFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_l2book_depth(l2book, sym, 1, &mut d, &mut h));
+        acc = acc.wrapping_add(d.bids[1].px_1e6 + d.asks[0].qty_1e6 + h.n_asks as i64);
+        let mut t = ingress_hyperliquid::HlTradeFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_trade(trade, sym, &mut t));
         acc = acc.wrapping_add(t.px_1e6);
-        let c = ingress_hyperliquid::parse_active_asset_ctx(ctx, sym).unwrap();
+        let mut c = ingress_hyperliquid::HlAssetCtxFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_active_asset_ctx(ctx, sym, &mut c));
         acc = acc.wrapping_add(c.funding_1e9);
         let m = ingress_hyperliquid::parse_all_mids(mids).unwrap();
         acc = acc.wrapping_add(m as i64);
-        let o = ingress_hyperliquid::parse_outcome_meta(outcome).unwrap();
+        let mut o = ingress_hyperliquid::HlOutcomeMetaFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_outcome_meta(outcome, &mut o));
         acc = acc.wrapping_add(o.enc as i64);
         std::hint::black_box(ingress_hyperliquid::parse_sub_response(subresp));
     }
@@ -2343,9 +2483,11 @@ fn hl_outcome_meta_parsers_are_zero_alloc() {
     let g = AllocGuard::new();
     let mut acc: i64 = 0;
     for _ in 0..10_000u32 {
-        let c = ingress_hyperliquid::parse_outcome_meta(created).unwrap();
+        let mut c = ingress_hyperliquid::HlOutcomeMetaFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_outcome_meta(created, &mut c));
         acc = acc.wrapping_add(c.enc as i64);
-        let s = ingress_hyperliquid::parse_outcome_meta(settled).unwrap();
+        let mut s = ingress_hyperliquid::HlOutcomeMetaFrame::ZERO;
+        assert!(ingress_hyperliquid::parse_outcome_meta(settled, &mut s));
         acc = acc.wrapping_add(s.enc as i64);
         let (id, desc) = ingress_hyperliquid::outcome_meta_description(created).unwrap();
         acc = acc.wrapping_add(id as i64 + desc.len() as i64);
@@ -6566,7 +6708,7 @@ fn hl_exchange_roll_hook_is_zero_alloc() {
 fn hl_exchange_requote_path_is_zero_alloc() {
     use clob_dispatcher::OrderDispatch;
     use core_ring::Ring;
-    use core_types::{ChannelEvent, ChannelId, Fill, Order, Price, Qty, Side, VenueId};
+    use core_types::{ChannelEvent, ChannelId, Fill, ModifyReq, Order, Price, Qty, Side, VenueId};
     use exec_hyperliquid::config::{HlConfig, Scope};
     use exec_hyperliquid::exchange::HlExchange;
 
@@ -6630,7 +6772,7 @@ fn hl_exchange_requote_path_is_zero_alloc() {
 
     // Prime: the first pass through the signing context and the
     // EIP-712 domain separator is boot, not the hot path.
-    let _ = x.modify(1 << 32 | u64::from(OUTCOME), &quote(470_000, 1));
+    let _ = x.modify(&ModifyReq::new(1 << 32 | u64::from(OUTCOME), quote(470_000, 1)));
     {
         let (mp_n, end) = x
             .stage_modify(1 << 32 | u64::from(OUTCOME), &quote(470_000, 1))
@@ -6644,9 +6786,10 @@ fn hl_exchange_requote_path_is_zero_alloc() {
     while i <= 2_000 {
         let prev = (i << 32) | u64::from(OUTCOME);
         let q = quote(470_000 + (i as i64 % 50) * 100, i + 1);
-        // LAW E-7: the requote itself, through the arm's own verb —
-        // refused at the budget barrier, after the encode half.
-        let _ = x.modify(prev, &q);
+        // LAW E-7: the requote itself, through the TRAIT verb the
+        // router calls (BX0-F3) — refused at the budget barrier, after
+        // the encode half.
+        let _ = x.modify(&ModifyReq::new(prev, q));
         // And the half `send_action` does after the barrier, before
         // the post: sign the bytes the encode half just rendered.
         let (mp_n, end) = x.stage_modify(prev, &q).expect("stage");
@@ -7313,14 +7456,18 @@ fn mexc_parsers_are_zero_alloc() {
         std::hint::black_box(ingress_mexc::classify_futures(MEXC_FUT_TICKER));
         let w = ingress_mexc::parse_spot_wrapper(&book).unwrap();
         acc = acc.wrapping_add(w.symbol(&book).len() as i64);
-        let b = ingress_mexc::parse_book_ticker_body(w.body(&book)).unwrap();
+        let mut b = ingress_mexc::spot::MexcBookTicker::ZERO;
+        assert!(ingress_mexc::parse_book_ticker_body(w.body(&book), &mut b));
         acc = acc.wrapping_add(b.bid_px_1e6);
         let w = ingress_mexc::parse_spot_wrapper(&deals).unwrap();
         let mut dw = ingress_mexc::MexcDealsWalk::new(w.body(&deals));
         while let Some(item) = dw.next_item() {
-            acc = acc.wrapping_add(ingress_mexc::parse_deal_item(item).unwrap().signed_qty_1e6());
+            let mut deal = ingress_mexc::MexcDeal::ZERO;
+            assert!(ingress_mexc::parse_deal_item(item, &mut deal));
+            acc = acc.wrapping_add(deal.signed_qty_1e6());
         }
-        let a = ingress_mexc::parse_sub_ack(ack).unwrap();
+        let mut a = ingress_mexc::spot::MexcSpotAck::ZERO;
+        assert!(ingress_mexc::parse_sub_ack(ack, &mut a));
         let mut p = a.failed_params(ack);
         while let Some(param) = p.next_param() {
             acc = acc.wrapping_add(ingress_mexc::extract_param_symbol(param).map_or(0, |s| s.len() as i64));
@@ -7328,13 +7475,17 @@ fn mexc_parsers_are_zero_alloc() {
         }
         acc = acc.wrapping_add(ingress_mexc::extract_fut_symbol(MEXC_FUT_DEPTH).unwrap().len() as i64);
         acc = acc.wrapping_add(ingress_mexc::extract_fut_ts_ms(MEXC_FUT_DEAL) as i64);
-        let d = ingress_mexc::parse_depth_full(MEXC_FUT_DEPTH).unwrap();
+        let mut d = ingress_mexc::futures::MexcDepthFrame::ZERO;
+        assert!(ingress_mexc::parse_depth_full(MEXC_FUT_DEPTH, &mut d));
         acc = acc.wrapping_add(d.bid_px_1e6);
         let mut fw = ingress_mexc::MexcFutDealsWalk::new(MEXC_FUT_DEAL);
         while let Some(item) = fw.next_item() {
-            acc = acc.wrapping_add(ingress_mexc::parse_fut_deal_item(item).unwrap().px_1e6);
+            let mut deal = ingress_mexc::MexcDeal::ZERO;
+            assert!(ingress_mexc::parse_fut_deal_item(item, &mut deal));
+            acc = acc.wrapping_add(deal.px_1e6);
         }
-        let t = ingress_mexc::parse_ticker(MEXC_FUT_TICKER).unwrap();
+        let mut t = ingress_mexc::futures::MexcTickerFrame::ZERO;
+        assert!(ingress_mexc::parse_ticker(MEXC_FUT_TICKER, &mut t));
         acc = acc.wrapping_add(t.funding_rate_1e9);
         acc = acc.wrapping_add(ingress_mexc::funding_next_settle_ms(
             1_789_920_000_000,

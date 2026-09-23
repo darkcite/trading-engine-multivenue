@@ -5,7 +5,7 @@
 //! (WS6 — the DVOL push scanner).
 //!
 //! The byte scanner is expected to tolerate any input — returning
-//! `None` on malformed frames and never panicking or reading past the
+//! `false` on malformed frames and never panicking or reading past the
 //! end of the slice. This target exercises that contract with random
 //! and coverage-guided inputs from libFuzzer.
 
@@ -13,6 +13,12 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
-    let _ = ingress_deribit::parse_vol_index(data);
+    let mut f: ingress_deribit::DeribitVolIndexFrame = poison::poisoned();
+    if !ingress_deribit::parse_vol_index(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_deribit::DeribitVolIndexFrame>(), "a failed parse wrote the frame");
+    }
 });

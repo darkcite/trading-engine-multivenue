@@ -112,7 +112,7 @@ pub const fn venue_seq_of(venue_time_ms: u64) -> u32 {
 
 /// Parse one `book` event into a `Tick`.
 ///
-/// Zero-alloc. Returns `None` if any required field is missing or
+/// Zero-alloc. Returns `false` if any required field is missing or
 /// malformed; the caller counts and drops the frame.
 ///
 /// # Wire shape (live-verified 2026-08-14 — the Phase-1 shape was
@@ -129,8 +129,20 @@ pub const fn venue_seq_of(venue_time_ms: u64) -> u32 {
 /// Levels are objects sorted **worst→best**: top-of-book is the
 /// **last** element of each side. The caller slices one event out of
 /// the array wrapper (see the run loop's event walk).
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_book_update(buf: &[u8], sym: SymbolId, ts_ns: NsTs) -> Option<Tick> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_book_update(buf: &[u8], sym: SymbolId, ts_ns: NsTs, out: &mut Tick) -> bool {
+    parse_book_update_fill(buf, sym, ts_ns, out).is_some()
+}
+
+/// [`parse_book_update`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_book_update_fill(buf: &[u8], sym: SymbolId, ts_ns: NsTs, out: &mut Tick) -> Option<()> {
     let venue_time_ms = scan_venue_time_ms(buf)?;
     let (bid_px, bid_qty) = scan_best_level(buf, b"\"bids\":[")?;
     let (ask_px, ask_qty) = scan_best_level(buf, b"\"asks\":[")?;
@@ -140,7 +152,7 @@ pub fn parse_book_update(buf: &[u8], sym: SymbolId, ts_ns: NsTs) -> Option<Tick>
     }
     // VT2: the stamp rides the slot; the run loop judges staleness
     // (the parser has no per-connection estimator) and sets `flags`.
-    Some(Tick::new_stamped(
+    *out = Tick::new_stamped(
         ts_ns,
         core_types::VenueId::Polymarket,
         sym,
@@ -151,7 +163,8 @@ pub fn parse_book_update(buf: &[u8], sym: SymbolId, ts_ns: NsTs) -> Option<Tick>
         Qty::from_raw(ask_qty),
         venue_time_ms,
         0,
-    ))
+    );
+    Some(())
 }
 
 /// Walk one side's level array (`marker` = `"bids":[` / `"asks":[`)
@@ -203,13 +216,32 @@ fn scan_best_level(buf: &[u8], marker: &[u8]) -> Option<(i64, i64)> {
 /// none) — the caller extracts it once per frame via
 /// [`scan_venue_time_ms`]; `venue_seq` derives from it
 /// ([`venue_seq_of`]). `flags` are left 0 for the run loop's judge.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
+#[must_use = "on `false` the frame was not written"]
 pub fn parse_price_change_row(
     row: &[u8],
     sym: SymbolId,
     ts_ns: NsTs,
     venue_time_ms: u64,
-) -> Option<Tick> {
+    out: &mut Tick,
+) -> bool {
+    parse_price_change_row_fill(row, sym, ts_ns, venue_time_ms, out).is_some()
+}
+
+/// [`parse_price_change_row`]'s body: `?` short-circuits, and `out` is
+/// written once, at the end, only after every field has parsed.
+#[inline(always)]
+fn parse_price_change_row_fill(
+    row: &[u8],
+    sym: SymbolId,
+    ts_ns: NsTs,
+    venue_time_ms: u64,
+    out: &mut Tick,
+) -> Option<()> {
     let p = find_field(row, b"\"best_bid\":")?;
     let p = skip_byte(row, p, b'"');
     let (bid_px, _) = scan_price_1e6(row, p)?;
@@ -239,7 +271,7 @@ pub fn parse_price_change_row(
     } else {
         0
     };
-    Some(Tick::new_stamped(
+    *out = Tick::new_stamped(
         ts_ns,
         core_types::VenueId::Polymarket,
         sym,
@@ -250,7 +282,8 @@ pub fn parse_price_change_row(
         Qty::from_raw(ask_qty),
         venue_time_ms,
         0,
-    ))
+    );
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -342,9 +375,37 @@ pub struct ParseError(pub &'static str);
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<Tick>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_book_update_view(buf: &[u8], sym: core_types::SymbolId, ts_ns: core_types::NsTs) -> Option<core_types::Tick> {
+        let mut f = core_types::Tick::ZERO;
+        crate::parse_book_update(buf, sym, ts_ns, &mut f).then_some(f)
+    }
+    // COPY: `Option<Tick>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_price_change_row_view(
+        row: &[u8],
+        sym: core_types::SymbolId,
+        ts_ns: core_types::NsTs,
+        venue_time_ms: u64,
+    ) -> Option<core_types::Tick> {
+        let mut f = core_types::Tick::ZERO;
+        crate::parse_price_change_row(row, sym, ts_ns, venue_time_ms, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
 
     /// Live wire shape (2026-08-14): array-wrapped event, object
     /// levels, both sides sorted **worst→best**.
@@ -427,7 +488,7 @@ mod tests {
 
     #[test]
     fn parse_book_update_takes_last_level_as_top_of_book() {
-        let t = parse_book_update(SAMPLE_BOOK, 7, 42).unwrap();
+        let t = parse_book_update_view(SAMPLE_BOOK, 7, 42).unwrap();
         assert_eq!(t.sym, 7);
         assert_eq!(t.ts_ns, 42);
         // Sides are worst→best: top is the LAST level of each array.
@@ -445,16 +506,16 @@ mod tests {
     #[test]
     fn parse_book_update_empty_side_and_rejects() {
         let empty_bids = br#"{"timestamp":"1","bids":[],"asks":[{"price":"0.5","size":"1.0"}]}"#;
-        let t = parse_book_update(empty_bids, 1, 0).unwrap();
+        let t = parse_book_update_view(empty_bids, 1, 0).unwrap();
         assert_eq!(t.bid_px.raw(), 0);
         assert_eq!(t.ask_px.raw(), 500_000);
         // Missing bids array entirely is malformed.
         let b = br#"{"timestamp":"1","asks":[{"price":"0.5","size":"1.0"}]}"#;
-        assert!(parse_book_update(b, 1, 0).is_none());
-        assert!(parse_book_update(b"not json at all", 1, 0).is_none());
+        assert!(parse_book_update_view(b, 1, 0).is_none());
+        assert!(parse_book_update_view(b"not json at all", 1, 0).is_none());
         // Both sides empty carries no information.
         let both = br#"{"timestamp":"1","bids":[],"asks":[]}"#;
-        assert!(parse_book_update(both, 1, 0).is_none());
+        assert!(parse_book_update_view(both, 1, 0).is_none());
     }
 
     #[test]
@@ -468,7 +529,7 @@ mod tests {
         assert_eq!(venue_time_ms, 1_713_000_000_123);
         let seq = venue_seq_of(venue_time_ms);
         assert_eq!(seq, (1_713_000_000_123u64 & 0xFFFF_FFFF) as u32);
-        let t = parse_price_change_row(SAMPLE_PC, 3, 99, venue_time_ms).unwrap();
+        let t = parse_price_change_row_view(SAMPLE_PC, 3, 99, venue_time_ms).unwrap();
         assert_eq!(t.sym, 3);
         assert_eq!(t.ts_ns, 99);
         assert_eq!(t.venue_seq, seq);
@@ -486,12 +547,12 @@ mod tests {
     fn parse_price_change_row_rejects_missing_fields() {
         let no_side =
             br#"{"asset_id":"1","price":"0.5","size":"1","best_bid":"0.5","best_ask":"0.6"}"#;
-        assert!(parse_price_change_row(no_side, 1, 0, 0).is_none());
+        assert!(parse_price_change_row_view(no_side, 1, 0, 0).is_none());
         let no_touch = br#"{"asset_id":"1","price":"0.5","size":"1","side":"BUY"}"#;
-        assert!(parse_price_change_row(no_touch, 1, 0, 0).is_none());
+        assert!(parse_price_change_row_view(no_touch, 1, 0, 0).is_none());
         // SELL row away from the ask: prices known, sizes unknown.
         let away = br#"{"asset_id":"1","price":"0.4","size":"7","side":"SELL","best_bid":"0.5","best_ask":"0.6"}"#;
-        let t = parse_price_change_row(away, 1, 0, 0).unwrap();
+        let t = parse_price_change_row_view(away, 1, 0, 0).unwrap();
         assert_eq!(t.bid_qty.raw(), 0);
         assert_eq!(t.ask_qty.raw(), 0);
     }
@@ -514,6 +575,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
@@ -533,7 +595,7 @@ mod proptests {
                 &mut buf,
                 r#"{{"event_type":"book","timestamp":"{ts}","bids":[{{"price":"0.000001","size":"1.0"}},{{"price":"0.{bp:06}","size":"0.{bq:06}"}}],"asks":[{{"price":"0.999999","size":"1.0"}},{{"price":"0.{ap:06}","size":"0.{aq:06}"}}]}}"#,
             ).unwrap();
-            let t = parse_book_update(buf.as_bytes(), 0, 0).unwrap();
+            let t = parse_book_update_view(buf.as_bytes(), 0, 0).unwrap();
             prop_assert_eq!(t.bid_px.raw(), bp as i64);
             prop_assert_eq!(t.bid_qty.raw(), bq as i64);
             prop_assert_eq!(t.ask_px.raw(), ap as i64);

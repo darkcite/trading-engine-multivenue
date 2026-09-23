@@ -22,6 +22,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
     // ---- spot (protobuf + the text ack) ----
     let _ = ingress_mexc::classify_spot(data, true);
@@ -30,23 +33,45 @@ fuzz_target!(|data: &[u8]| {
         assert!(!f.symbol(data).is_empty());
         let _ = f.venue_time_ms();
         let body = f.body(data);
-        let _ = ingress_mexc::parse_book_ticker_body(body);
+        let mut f: ingress_mexc::spot::MexcBookTicker = poison::poisoned();
+        if !ingress_mexc::parse_book_ticker_body(body, &mut f) {
+            assert_eq!(f, poison::poisoned::<ingress_mexc::spot::MexcBookTicker>(), "a failed parse wrote the frame");
+        }
         let mut w = ingress_mexc::MexcDealsWalk::new(body);
         while let Some(item) = w.next_item() {
-            let _ = ingress_mexc::parse_deal_item(item);
+            let mut f: ingress_mexc::MexcDeal = poison::poisoned();
+            if !ingress_mexc::parse_deal_item(item, &mut f) {
+                assert_eq!(f, poison::poisoned::<ingress_mexc::MexcDeal>(), "a failed parse wrote the frame");
+            }
         }
     }
-    let _ = ingress_mexc::parse_book_ticker_body(data);
+    let mut f: ingress_mexc::spot::MexcBookTicker = poison::poisoned();
+    if !ingress_mexc::parse_book_ticker_body(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_mexc::spot::MexcBookTicker>(), "a failed parse wrote the frame");
+    }
     let mut w = ingress_mexc::MexcDealsWalk::new(data);
     while let Some(item) = w.next_item() {
-        if let Some(d) = ingress_mexc::parse_deal_item(item) {
+        let mut d: ingress_mexc::MexcDeal = poison::poisoned();
+        let ok = ingress_mexc::parse_deal_item(item, &mut d);
+        if !ok {
+            assert_eq!(d, poison::poisoned::<ingress_mexc::MexcDeal>(), "a failed parse wrote the frame");
+        }
+        if ok {
             let _ = d.signed_qty_1e6();
         }
     }
     let _ = w.is_malformed();
-    let _ = ingress_mexc::parse_deal_item(data);
+    let mut f: ingress_mexc::MexcDeal = poison::poisoned();
+    if !ingress_mexc::parse_deal_item(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_mexc::MexcDeal>(), "a failed parse wrote the frame");
+    }
     let _ = ingress_mexc::trade_id_seq(data);
-    if let Some(ack) = ingress_mexc::parse_sub_ack(data) {
+    let mut ack: ingress_mexc::spot::MexcSpotAck = poison::poisoned();
+    let ok = ingress_mexc::parse_sub_ack(data, &mut ack);
+    if !ok {
+        assert_eq!(ack, poison::poisoned::<ingress_mexc::spot::MexcSpotAck>(), "a failed parse wrote the frame");
+    }
+    if ok {
         let _ = ack.has_failures(data);
         let mut p = ack.failed_params(data);
         while let Some(param) = p.next_param() {
@@ -63,14 +88,26 @@ fuzz_target!(|data: &[u8]| {
     let _ = ingress_mexc::extract_fut_symbol(data);
     let _ = ingress_mexc::extract_fut_ts_ms(data);
     let _ = ingress_mexc::extract_refused_contract(data);
-    let _ = ingress_mexc::parse_depth_full(data);
+    let mut f: ingress_mexc::futures::MexcDepthFrame = poison::poisoned();
+    if !ingress_mexc::parse_depth_full(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_mexc::futures::MexcDepthFrame>(), "a failed parse wrote the frame");
+    }
     let mut fw = ingress_mexc::MexcFutDealsWalk::new(data);
     while let Some(item) = fw.next_item() {
-        let _ = ingress_mexc::parse_fut_deal_item(item);
+        let mut f: ingress_mexc::MexcDeal = poison::poisoned();
+        if !ingress_mexc::parse_fut_deal_item(item, &mut f) {
+            assert_eq!(f, poison::poisoned::<ingress_mexc::MexcDeal>(), "a failed parse wrote the frame");
+        }
     }
     let _ = fw.is_malformed();
-    let _ = ingress_mexc::parse_fut_deal_item(data);
-    let _ = ingress_mexc::parse_ticker(data);
+    let mut f: ingress_mexc::MexcDeal = poison::poisoned();
+    if !ingress_mexc::parse_fut_deal_item(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_mexc::MexcDeal>(), "a failed parse wrote the frame");
+    }
+    let mut f: ingress_mexc::futures::MexcTickerFrame = poison::poisoned();
+    if !ingress_mexc::parse_ticker(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_mexc::futures::MexcTickerFrame>(), "a failed parse wrote the frame");
+    }
 
     // ---- the funding clock (arithmetic, never a loop) ----
     if let Some(n) = data.get(..24) {

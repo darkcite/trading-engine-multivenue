@@ -337,6 +337,10 @@ impl MexcSpotRow {
 }
 
 /// Parse one exchangeInfo row at `pos`.
+// COPY: `Result<(MexcSpotRow, usize), E>` ≥ 96 B by value, once per row
+// of the boot-time REST discovery (cold; the row is pushed into the
+// discovery table next) — rejected: an out-param into the table's next
+// slot, bookkeeping a boot-once path does not earn.
 fn parse_spot_row(body: &[u8], pos: usize) -> Result<(MexcSpotRow, usize), E> {
     let mut sym: Option<&[u8]> = None;
     let mut status: Option<bool> = None;
@@ -525,6 +529,10 @@ impl MexcPerpRow {
 }
 
 /// Parse one contract-detail row at `pos`.
+// COPY: `Result<(MexcPerpRow, usize), E>` ≥ 104 B by value, once per row
+// of the boot-time REST discovery (cold; the row is pushed into the
+// discovery table next) — rejected: an out-param into the table's next
+// slot, bookkeeping a boot-once path does not earn.
 fn parse_perp_row(body: &[u8], pos: usize) -> Result<(MexcPerpRow, usize), E> {
     let mut sym: Option<&[u8]> = None;
     let mut state: Option<Option<u64>> = None;

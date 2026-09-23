@@ -250,6 +250,21 @@ pub struct MexcDepthFrame {
     _pad: [u8; 14],
 }
 
+impl MexcDepthFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        version: 0,
+        bid_px_1e6: 0,
+        bid_qty_1e6: 0,
+        ask_px_1e6: 0,
+        ask_qty_1e6: 0,
+        venue_time_ms: 0,
+        has_bid: 0,
+        has_ask: 0,
+        _pad: [0; 14],
+    };
+}
+
 /// The best level of one side: `"<key>":[[px,vol,count],…]` → `(1, px,
 /// vol)`, `[]` → `(0, 0, 0)`.
 #[inline]
@@ -282,13 +297,25 @@ fn side_top(payload: &[u8], key: &[u8]) -> Option<(u8, i64, i64)> {
 
 /// Parse one `push.depth.full`. Both side arrays must be present
 /// (either may be empty); `version` is optional.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_depth_full(payload: &[u8]) -> Option<MexcDepthFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_depth_full(payload: &[u8], out: &mut MexcDepthFrame) -> bool {
+    parse_depth_full_fill(payload, out).is_some()
+}
+
+/// [`parse_depth_full`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_depth_full_fill(payload: &[u8], out: &mut MexcDepthFrame) -> Option<()> {
     let (has_ask, ask_px_1e6, ask_qty_1e6) = side_top(payload, b"\"asks\":")?;
     let (has_bid, bid_px_1e6, bid_qty_1e6) = side_top(payload, b"\"bids\":")?;
     let cts = field_u64(payload, b"\"cts\":");
     let venue_time_ms = if cts > 0 { cts } else { extract_fut_ts_ms(payload) };
-    Some(MexcDepthFrame {
+    *out = MexcDepthFrame {
         version: field_u64(payload, b"\"version\":"),
         bid_px_1e6,
         bid_qty_1e6,
@@ -298,7 +325,8 @@ pub fn parse_depth_full(payload: &[u8]) -> Option<MexcDepthFrame> {
         has_bid,
         has_ask,
         _pad: [0; 14],
-    })
+    };
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -399,8 +427,20 @@ impl<'a> MexcFutDealsWalk<'a> {
 /// sell — anything else rejects) are required; `t` (ms) and `i` (the
 /// numeric trade id, quoted on the wire) are optional — 0 when absent
 /// or unreadable.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_fut_deal_item(item: &[u8]) -> Option<MexcDeal> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_fut_deal_item(item: &[u8], out: &mut MexcDeal) -> bool {
+    parse_fut_deal_item_fill(item, out).is_some()
+}
+
+/// [`parse_fut_deal_item`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_fut_deal_item_fill(item: &[u8], out: &mut MexcDeal) -> Option<()> {
     let (px, _) = json_num_1e6(item, find_field(item, b"\"p\":")?)?;
     let (qty, _) = json_num_1e6(item, find_field(item, b"\"v\":")?)?;
     if px < 0 || qty < 0 {
@@ -412,13 +452,14 @@ pub fn parse_fut_deal_item(item: &[u8]) -> Option<MexcDeal> {
         2 => DEAL_SIDE_SELL,
         _ => return None,
     };
-    Some(MexcDeal::new(
+    *out = MexcDeal::new(
         px,
         qty,
         field_u64(item, b"\"t\":"),
         field_u64(item, b"\"i\":"),
         side,
-    ))
+    );
+    Some(())
 }
 
 // ---------------------------------------------------------------
@@ -453,10 +494,38 @@ pub struct MexcTickerFrame {
     _pad: [u8; 20],
 }
 
-/// Parse one `push.ticker`. `None` only when `"data"` is not an object;
+impl MexcTickerFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        venue_time_ms: 0,
+        fair_px_1e6: 0,
+        index_px_1e6: 0,
+        funding_rate_1e9: 0,
+        hold_vol_1e6: 0,
+        has_fair: 0,
+        has_index: 0,
+        has_funding: 0,
+        has_hold_vol: 0,
+        _pad: [0; 20],
+    };
+}
+
+/// Parse one `push.ticker`. `false` only when `"data"` is not an object;
 /// keys are matched INSIDE the data object only.
+///
+/// Parsed IN PLACE into `out`: the frame inside an `Option` would cross
+/// the call by value, past the 64 B bound. `out` is written once, only
+/// after every field has parsed; on `false` it is untouched.
 #[inline]
-pub fn parse_ticker(payload: &[u8]) -> Option<MexcTickerFrame> {
+#[must_use = "on `false` the frame was not written"]
+pub fn parse_ticker(payload: &[u8], out: &mut MexcTickerFrame) -> bool {
+    parse_ticker_fill(payload, out).is_some()
+}
+
+/// [`parse_ticker`]'s body: `?` short-circuits, and `out` is written once, at
+/// the end, only after every field has parsed.
+#[inline(always)]
+fn parse_ticker_fill(payload: &[u8], out: &mut MexcTickerFrame) -> Option<()> {
     let dpos = skip_ws(payload, find_field(payload, b"\"data\":")?);
     if payload.get(dpos) != Some(&b'{') {
         return None;
@@ -493,7 +562,8 @@ pub fn parse_ticker(payload: &[u8]) -> Option<MexcTickerFrame> {
     }
     let ts = field_u64(data, b"\"timestamp\":");
     f.venue_time_ms = if ts > 0 { ts } else { extract_fut_ts_ms(payload) };
-    Some(f)
+    *out = f;
+    Some(())
 }
 
 const _POD_SIZES: () = {
@@ -536,9 +606,39 @@ pub const FUT_SUB_PAYLOAD_MAX: usize = br#"{"method":"sub.depth.full","param":{"
 // Tests
 // ---------------------------------------------------------------
 
+/// Test views in the old by-value shape, shared by the unit and the
+/// property tests: each wraps one in-place parser and hands back its
+/// frame's `Option`, so assertions read naturally. Cold — production
+/// callers parse in place.
+#[cfg(test)]
+mod views {
+    // COPY: `Option<MexcDepthFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_depth_full_view(payload: &[u8]) -> Option<crate::futures::MexcDepthFrame> {
+        let mut f = crate::futures::MexcDepthFrame::ZERO;
+        crate::futures::parse_depth_full(payload, &mut f).then_some(f)
+    }
+    // COPY: `Option<MexcDeal>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_fut_deal_item_view(item: &[u8]) -> Option<crate::MexcDeal> {
+        let mut f = crate::MexcDeal::ZERO;
+        crate::futures::parse_fut_deal_item(item, &mut f).then_some(f)
+    }
+    // COPY: `Option<MexcTickerFrame>` 128 B by value — a cold test
+    // view, so assertions read as `Option` — rejected: a scratch
+    // frame and a `bool` check at every assertion site.
+    pub(super) fn parse_ticker_view(payload: &[u8]) -> Option<crate::futures::MexcTickerFrame> {
+        let mut f = crate::futures::MexcTickerFrame::ZERO;
+        crate::futures::parse_ticker(payload, &mut f).then_some(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::views::*;
 
     // Plan §1.2, verbatim shapes.
     const DEPTH: &[u8] = br#"{"symbol":"BTC_USDT","data":{"cts":1789897581009,"asks":[[80468.7,3446,2],[80469.1,1239,1]],"bids":[[80468.6,31288,7],[80468.5,10,1]],"version":41925002140},"channel":"push.depth.full","ts":1789897581013}"#;
@@ -604,7 +704,7 @@ mod tests {
 
     #[test]
     fn golden_depth_full_decodes_exactly() {
-        let d = parse_depth_full(DEPTH).unwrap();
+        let d = parse_depth_full_view(DEPTH).unwrap();
         assert_eq!((d.has_bid, d.has_ask), (1, 1));
         assert_eq!(d.bid_px_1e6, 80_468_600_000);
         assert_eq!(d.bid_qty_1e6, 31_288_000_000);
@@ -618,36 +718,36 @@ mod tests {
     fn depth_full_edges_and_failure_modes() {
         // One side empty: not an error, no BBO.
         let one = br#"{"symbol":"X","data":{"asks":[],"bids":[[1.5,2,1]],"version":3},"channel":"push.depth.full","ts":9}"#;
-        let d = parse_depth_full(one).unwrap();
+        let d = parse_depth_full_view(one).unwrap();
         assert_eq!((d.has_bid, d.has_ask), (1, 0));
         assert_eq!(d.venue_time_ms, 9, "no cts: envelope ts");
         // Exponent + quoted numbers tolerated; version absent = 0.
         let sci = br#"{"data":{"asks":[[1e2, "3" ,1]],"bids":[[9.5e1,2]]},"channel":"push.depth.full"}"#;
-        let d = parse_depth_full(sci).unwrap();
+        let d = parse_depth_full_view(sci).unwrap();
         assert_eq!(d.ask_px_1e6, 100_000_000);
         assert_eq!(d.ask_qty_1e6, 3_000_000);
         assert_eq!(d.bid_px_1e6, 95_000_000);
         assert_eq!((d.version, d.venue_time_ms), (0, 0));
         // Failures.
-        assert!(parse_depth_full(br#"{"data":{"bids":[]}}"#).is_none(), "asks required");
-        assert!(parse_depth_full(br#"{"data":{"asks":[],"bids":{}}}"#).is_none());
-        assert!(parse_depth_full(br#"{"data":{"asks":[[1]],"bids":[]}}"#).is_none(), "vol required");
-        assert!(parse_depth_full(br#"{"data":{"asks":[[1,2x]],"bids":[]}}"#).is_none());
-        assert!(parse_depth_full(br#"{"data":{"asks":[[-1,2]],"bids":[]}}"#).is_none());
-        assert!(parse_depth_full(br#"{"data":{"asks":[["1,2]],"bids":[]}}"#).is_none());
-        assert!(parse_depth_full(b"").is_none());
+        assert!(parse_depth_full_view(br#"{"data":{"bids":[]}}"#).is_none(), "asks required");
+        assert!(parse_depth_full_view(br#"{"data":{"asks":[],"bids":{}}}"#).is_none());
+        assert!(parse_depth_full_view(br#"{"data":{"asks":[[1]],"bids":[]}}"#).is_none(), "vol required");
+        assert!(parse_depth_full_view(br#"{"data":{"asks":[[1,2x]],"bids":[]}}"#).is_none());
+        assert!(parse_depth_full_view(br#"{"data":{"asks":[[-1,2]],"bids":[]}}"#).is_none());
+        assert!(parse_depth_full_view(br#"{"data":{"asks":[["1,2]],"bids":[]}}"#).is_none());
+        assert!(parse_depth_full_view(b"").is_none());
     }
 
     #[test]
     fn golden_deals_decode_exactly_array_and_single() {
         let mut w = MexcFutDealsWalk::new(DEAL);
-        let d0 = parse_fut_deal_item(w.next_item().unwrap()).unwrap();
+        let d0 = parse_fut_deal_item_view(w.next_item().unwrap()).unwrap();
         assert_eq!(d0.px_1e6, 80_489_000_000, "integer price");
         assert_eq!(d0.qty_1e6, 11_000_000);
         assert_eq!(d0.side, DEAL_SIDE_BUY);
         assert_eq!(d0.time_ms, 1_789_897_547_210);
         assert_eq!(d0.trade_seq, 16_270_106_116);
-        let d1 = parse_fut_deal_item(w.next_item().unwrap()).unwrap();
+        let d1 = parse_fut_deal_item_view(w.next_item().unwrap()).unwrap();
         assert_eq!(d1.px_1e6, 80_488_500_000);
         assert_eq!(d1.signed_qty_1e6(), -2_000_000);
         assert_eq!(d1.trade_seq, 16_270_106_117);
@@ -656,7 +756,7 @@ mod tests {
         // The single-object shape.
         let one = br#"{"symbol":"BTC_USDT","data":{"p":1.5,"v":2,"T":2,"t":7,"i":"9"},"channel":"push.deal","ts":8}"#;
         let mut w = MexcFutDealsWalk::new(one);
-        let d = parse_fut_deal_item(w.next_item().unwrap()).unwrap();
+        let d = parse_fut_deal_item_view(w.next_item().unwrap()).unwrap();
         assert_eq!((d.px_1e6, d.qty_1e6, d.side, d.time_ms, d.trade_seq), (1_500_000, 2_000_000, DEAL_SIDE_SELL, 7, 9));
         assert!(w.next_item().is_none());
     }
@@ -679,19 +779,19 @@ mod tests {
         let mut w = MexcFutDealsWalk::new(br#"{"data":[]}"#);
         assert!(w.next_item().is_none());
         assert!(!w.is_malformed(), "empty is clean");
-        assert!(parse_fut_deal_item(br#"{"p":1,"v":1,"T":3}"#).is_none(), "T must be 1|2");
-        assert!(parse_fut_deal_item(br#"{"p":1,"T":1}"#).is_none(), "v required");
-        assert!(parse_fut_deal_item(br#"{"v":1,"T":1}"#).is_none(), "p required");
-        assert!(parse_fut_deal_item(br#"{"p":-1,"v":1,"T":1}"#).is_none());
-        assert!(parse_fut_deal_item(br#"{"p":1,"v":1,"T":1.5}"#).is_none());
+        assert!(parse_fut_deal_item_view(br#"{"p":1,"v":1,"T":3}"#).is_none(), "T must be 1|2");
+        assert!(parse_fut_deal_item_view(br#"{"p":1,"T":1}"#).is_none(), "v required");
+        assert!(parse_fut_deal_item_view(br#"{"v":1,"T":1}"#).is_none(), "p required");
+        assert!(parse_fut_deal_item_view(br#"{"p":-1,"v":1,"T":1}"#).is_none());
+        assert!(parse_fut_deal_item_view(br#"{"p":1,"v":1,"T":1.5}"#).is_none());
         // Optional t / i absent or garbage → 0.
-        let d = parse_fut_deal_item(br#"{"p":1,"v":1,"T":1,"i":"abc"}"#).unwrap();
+        let d = parse_fut_deal_item_view(br#"{"p":1,"v":1,"T":1,"i":"abc"}"#).unwrap();
         assert_eq!((d.time_ms, d.trade_seq), (0, 0));
     }
 
     #[test]
     fn golden_ticker_decodes_exactly() {
-        let f = parse_ticker(TICKER).unwrap();
+        let f = parse_ticker_view(TICKER).unwrap();
         assert_eq!((f.has_fair, f.has_index, f.has_funding, f.has_hold_vol), (1, 1, 1, 1));
         assert_eq!(f.fair_px_1e6, 4_377_210_000);
         assert_eq!(f.index_px_1e6, 4_377_630_000);
@@ -703,16 +803,16 @@ mod tests {
     #[test]
     fn ticker_presence_flags_and_failure_modes() {
         let partial = br#"{"symbol":"BTC_USDT","data":{"fundingRate":-0.000125},"channel":"push.ticker","ts":77}"#;
-        let f = parse_ticker(partial).unwrap();
+        let f = parse_ticker_view(partial).unwrap();
         assert_eq!((f.has_fair, f.has_index, f.has_funding, f.has_hold_vol), (0, 0, 1, 0));
         assert_eq!(f.funding_rate_1e9, -125_000);
         assert_eq!(f.venue_time_ms, 77, "no timestamp: envelope ts");
         // Keys OUTSIDE data are not read.
         let outside = br#"{"fairPrice":5,"data":{},"channel":"push.ticker"}"#;
-        assert_eq!(parse_ticker(outside).unwrap().has_fair, 0);
-        assert!(parse_ticker(br#"{"data":[1]}"#).is_none());
-        assert!(parse_ticker(br#"{"data":{"fairPrice":1"#).is_none(), "unterminated data");
-        assert!(parse_ticker(br#"{"channel":"push.ticker"}"#).is_none());
+        assert_eq!(parse_ticker_view(outside).unwrap().has_fair, 0);
+        assert!(parse_ticker_view(br#"{"data":[1]}"#).is_none());
+        assert!(parse_ticker_view(br#"{"data":{"fairPrice":1"#).is_none(), "unterminated data");
+        assert!(parse_ticker_view(br#"{"channel":"push.ticker"}"#).is_none());
     }
 
     /// The live 2026-09-23 ticker shape: `riseFallRates` carries `null`s
@@ -723,7 +823,7 @@ mod tests {
         let live = br#"{"symbol":"EUR_USDT","data":{"contractId":1,"symbol":"EUR_USDT","lastPrice":1.1743,"bid1":1.1743,"ask1":1.1744,"volume24":1,"amount24":2.5,"holdVol":1234,"lower24Price":1.17,"high24Price":1.18,"riseFallRate":0.0001,"riseFallValue":0.0001,"indexPrice":1.17435,"fairPrice":1.1743,"fundingRate":-0.00002,"maxBidPrice":1.2,"minAskPrice":1.1,"timestamp":1789897545754,"riseFallRates":{"zone":"UTC+8","r":0.0001,"v":0.0001,"r7":null,"r30":null,"r90":null,"r180":null,"r365":null},"riseFallRatesOfTimezone":[0.0001,null,0.0002]},"channel":"push.ticker","ts":1789897545760}"#;
         assert_eq!(classify_futures(live), MexcFutKind::Data(MexcChannel::FutTicker));
         assert_eq!(extract_fut_symbol(live), Some(&b"EUR_USDT"[..]));
-        let f = parse_ticker(live).unwrap();
+        let f = parse_ticker_view(live).unwrap();
         assert_eq!((f.has_fair, f.has_index, f.has_funding, f.has_hold_vol), (1, 1, 1, 1));
         assert_eq!(f.fair_px_1e6, 1_174_300);
         assert_eq!(f.index_px_1e6, 1_174_350);
@@ -767,6 +867,7 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+    use super::views::*;
 
     proptest! {
         #[test]
@@ -778,7 +879,7 @@ mod proptests {
 
         #[test]
         fn depth_full_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_depth_full(&buf);
+            let _ = parse_depth_full_view(&buf);
         }
 
         #[test]
@@ -786,16 +887,16 @@ mod proptests {
             let mut w = MexcFutDealsWalk::new(&buf);
             let mut n = 0;
             while let Some(item) = w.next_item() {
-                let _ = parse_fut_deal_item(item);
+                let _ = parse_fut_deal_item_view(item);
                 n += 1;
                 prop_assert!(n <= buf.len());
             }
-            let _ = parse_fut_deal_item(&buf);
+            let _ = parse_fut_deal_item_view(&buf);
         }
 
         #[test]
         fn ticker_never_panics(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_ticker(&buf);
+            let _ = parse_ticker_view(&buf);
         }
 
         /// Structured fuzz: the JSON grammar with random bytes spliced
@@ -803,7 +904,7 @@ mod proptests {
         #[test]
         fn depth_full_spliced_never_panics(a in "[0-9eE.+\\-\"]{0,12}", b in "[0-9eE.+\\-\"]{0,12}") {
             let s = format!(r#"{{"data":{{"asks":[[{a},{b},1]],"bids":[[{b},{a}]],"version":{a}}},"ts":{b}}}"#);
-            let _ = parse_depth_full(s.as_bytes());
+            let _ = parse_depth_full_view(s.as_bytes());
         }
 
         /// depth.full round-trips: integer and fractional prices,
@@ -827,7 +928,7 @@ mod proptests {
                 r#"{{"symbol":"BTC_USDT","data":{{{cts_part}"asks":[[{},{},2],[1,1,1]],"bids":[[{},{},7]],"version":{version}}},"channel":"push.depth.full","ts":{ts}}}"#,
                 px(ap), bq, px(bp), aq,
             );
-            let d = parse_depth_full(s.as_bytes()).unwrap();
+            let d = parse_depth_full_view(s.as_bytes()).unwrap();
             prop_assert_eq!(d.ask_px_1e6, want(ap));
             prop_assert_eq!(d.ask_qty_1e6, (bq * 1_000_000) as i64);
             prop_assert_eq!(d.bid_px_1e6, want(bp));

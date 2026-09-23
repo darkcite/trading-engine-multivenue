@@ -339,7 +339,7 @@ pub const TICK_FLAG_VENUE_TIME_SENTINEL: u8 = 2;
 /// are zero in every v2 capture — "venue time unknown, never stale" —
 /// so v2 files keep replaying under the v2 law unchanged. Venue time
 /// is DATA, not a clock: `ts_ns` stays the ordering key everywhere.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(C, align(64))]
 pub struct Tick {
     /// When the ingress thread finished parsing the frame.
@@ -369,6 +369,23 @@ pub struct Tick {
     /// Venue timestamp of the quote in ms (venue clock); 0 = unknown
     /// (v2 captures, and venues whose stream carries no stamp).
     pub venue_time_ms: u64,
+}
+
+impl Tick {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        sym: 0,
+        venue_seq: 0,
+        bid_px: Price::from_raw(0),
+        bid_qty: Qty::from_raw(0),
+        ask_px: Price::from_raw(0),
+        ask_qty: Qty::from_raw(0),
+        venue: 0,
+        flags: 0,
+        _pad: [0; 6],
+        venue_time_ms: 0,
+    };
 }
 
 impl Tick {
@@ -1585,6 +1602,56 @@ impl DepthTopK {
         [DepthLevel::EMPTY; DEPTH_K],
         [DepthLevel::EMPTY; DEPTH_K],
     );
+}
+
+/// One instrument's change-gated top-K state, double-buffered: one
+/// [`DepthTopK`] row holds the last snapshot emitted, the other takes
+/// the next snapshot IN PLACE, and a changed snapshot becomes the last
+/// one by [`Self::commit`] — an index flip, never a 192 B copy.
+///
+/// Rows are only ever written field by field or by a whole-row store
+/// of a [`DepthTopK::new`]-built value, so their padding stays zero.
+#[derive(Copy, Clone, Debug)]
+#[repr(C, align(64))]
+pub struct DepthPair {
+    rows: [DepthTopK; 2],
+    /// Which row holds the last snapshot (0 or 1).
+    last: u8,
+}
+
+impl DepthPair {
+    /// Both rows `init`; row 0 is the last snapshot.
+    // COPY: 192 B `init` in and the 448 B pair out, by value — boot-time
+    // construction only (a `vec![pair; n]` then clones it per slot) —
+    // rejected: an in-place initializer, for a once-per-process path.
+    #[inline]
+    pub const fn new(init: DepthTopK) -> Self {
+        Self {
+            rows: [init, init],
+            last: 0,
+        }
+    }
+
+    /// The row the next snapshot is written into.
+    #[inline(always)]
+    pub fn spare_mut(&mut self) -> &mut DepthTopK {
+        &mut self.rows[usize::from((self.last ^ 1) & 1)]
+    }
+
+    /// `(spare, last)` — the change gate's two sides.
+    #[inline(always)]
+    pub fn spare_and_last(&self) -> (&DepthTopK, &DepthTopK) {
+        (
+            &self.rows[usize::from((self.last ^ 1) & 1)],
+            &self.rows[usize::from(self.last & 1)],
+        )
+    }
+
+    /// The spare row becomes the last snapshot.
+    #[inline(always)]
+    pub fn commit(&mut self) {
+        self.last ^= 1;
+    }
 }
 
 // ---------------------------------------------------------------
@@ -3976,6 +4043,22 @@ mod channel_event_tests {
         assert_eq!(::core::mem::size_of::<DepthTopK>(), 192);
         assert_eq!(::core::mem::align_of::<DepthTopK>(), 64);
         assert_eq!(::core::mem::size_of::<DepthLevel>(), 16);
+    }
+
+    /// The double buffer: the spare row is written in place, `commit`
+    /// makes it the last snapshot, and the next spare is the other row.
+    #[test]
+    fn depth_pair_flips_rows_instead_of_copying() {
+        let mut pair = DepthPair::new(DepthTopK::EMPTY);
+        pair.spare_mut().ts_ns = 7;
+        {
+            let (spare, last) = pair.spare_and_last();
+            assert_eq!((spare.ts_ns, last.ts_ns), (7, 0));
+        }
+        pair.commit();
+        let (spare, last) = pair.spare_and_last();
+        assert_eq!((spare.ts_ns, last.ts_ns), (0, 7), "the written row is now the last one");
+        assert!(::core::ptr::eq(spare, &pair.rows[0]) && ::core::ptr::eq(last, &pair.rows[1]));
     }
 
     #[test]

@@ -2383,8 +2383,9 @@ four cache lines to five to carry it.
 
 #### The alloc gate: `hl_exchange_requote_path_is_zero_alloc`
 
-Gate 60 drives `HlExchange::modify` — the arm's own verb, not the raw
-encoders — with the budget floor at `u64::MAX`, so `send_action`
+Gate 60 drives the arm's own requote verb (`HlExchange::modify_by_cloid`,
+since BX0-F3 through the `OrderDispatch::modify` the router calls), not
+the raw encoders — with the budget floor at `u64::MAX`, so `send_action`
 refuses at its barrier before any network work and only the encode
 half runs. `seal` (the nonce/signature/envelope half of `send_action`,
 split out for this) is driven beside it. Between them that is every
@@ -2453,6 +2454,257 @@ the durable handle and an oid captured at placement is not.
 Run under the standing engine's own laws: `cargo build --release -p
 cli` first (G0), the launchd instance booted out for the window and
 bootstrapped back after, nothing left resting.
+
+### BX0-F3 — the router's cancel and modify reach the arm (2026-09-23)
+
+**The defect.** `HlExchange` implemented both lifecycle verbs as
+INHERENT methods — `cancel_by_cloid` and `modify(prev, &Order)` — but
+its `impl OrderDispatch` overrode `submit` alone. `RoutedDispatcher` is
+generic over its live arm (`L: OrderDispatch`), and generic code can
+call only trait methods, so every live slot's cancel and modify that
+reached the router got the trait default, `Err(Unsupported)`, and never
+left the host. Phase F's §7.1 measurement (above) drove the inherent
+verbs from `exec-smoke`, not through the router, so it could not see
+this: E5's "the engine learns two verbs" was true of the arm and of the
+router separately, never of the pair. It stayed invisible because
+bin15 has run with `maker_enabled = 0` — IoC entries only, nothing to
+requote or pull. Had the maker gone live, a member could neither
+requote nor take back its own quote; only the E6 halt's sweep could.
+
+**The repair.** The inherent `modify` is renamed `modify_by_cloid`, so
+no inherent method shares a name with a trait method (the shadowing
+that hid the gap). The trait's `cancel` / `modify` delegate to
+`cancel_by_cloid(req.sym, req.strategy_id, req.client_oid)` /
+`modify_by_cloid(req.prev_client_oid(), req.order())`. Spend classes
+unchanged: a cancel is an exit that no budget floor bars, a modify a
+submit (the router has already risk-checked it as a `Replace`).
+
+**The proof.** `exchange::tests::the_trait_cancel_and_modify_reach_the_cloid_verbs`
+(the arm's own LAW E-4 refusal comes back through the trait and its
+counters move) and
+`…::the_trait_modify_names_the_resting_order_and_carries_the_replacement`
+(the rendered action addresses the resting order by its cloid as `oid`
+and carries the replacement's as `c` — a transposed pair fails it).
+Break-and-watch: without the overrides both read `Unsupported`. Gate 60
+now drives the TRAIT modify, the path the router calls, at 0 B/op. The
+router→ledger half (`Ok` → `on_cancel` / `on_modify`) was already pinned
+with a spy arm. The operator accepted this split (2026-09-23) in place of
+the planned composed test — `RoutedDispatcher<Paper, HlExchange>` against
+a loopback venue — which moves to BX3.
+
+**Not re-measured on a venue.** The wire — cancel-by-cloid, and a
+`batchModify` addressing the resting order by cloid — is Phase F's,
+unchanged; BX0 changed only which caller reaches it. The bar before
+bin15's maker is switched on live: `exec-smoke --requote` plus a
+router-driven cancel/modify on testnet (plan §5 BX0 F3) — and, since a
+happy-path run exercises none of them, a ruling or a test on each of
+these paths, which the router could not reach before BX0 and now can
+(risk-reviewer, 2026-09-23; UNVERIFIED until then):
+
+1. **An uncertain modify.** The router renames the ledger row on `Ok`
+   and keeps the old one on `Err`; a modify whose reply timed out or
+   could not be read, but which the venue applied, leaves the
+   replacement unbooked and the caps under-counting. It needs the
+   E-5 "sent, unanswered" treatment: resolved by a readback, booked
+   conservatively meanwhile.
+2. **A modify the venue turns into a cancel** (a post-only replacement
+   that would cross): the old row stays in the ledger for an order that
+   no longer rests, and its later cancel returns `Err`.
+3. **A modify across an instance roll** (`instance_of(prev)` ≠
+   `instance_of(order.client_oid)`) is not refused by `stage_modify`,
+   which looks up the replacement's instance only.
+4. **Ledger edges:** a late partial fill of the old id after
+   `on_modify`; `on_modify` for an old id the ledger does not hold; a
+   modify that flips side (the HIP-4 ledger has no shorts).
+5. **A refused requote** (risk gate or budget floor) leaves the old
+   quote resting at the old price — the member must pull it.
+6. **Two members quoting one leg from one address** (`note_owner`
+   counts the contest and nothing more): self-trade prevention by the
+   venue would cancel without a fill, which a fill-fed ledger never
+   sees.
+
+### BX0 — `ingress-binance` joins the zero-copy gate (2026-09-23)
+
+On the operator's word (plan O-BX12d): every pre-existing zero-copy
+finding in `ingress-binance` fixed, and the crate put in
+`make copy-audit`'s scope.
+
+**The gate had a blind spot.** `scripts/copy-audit.sh` stopped reading a
+file at its first `#[cfg(test)]` line, on the convention that test
+modules sit at the end. Three files break the convention with a
+test-only METHOD mid-file, so everything after it went unaudited:
+`exec-router/src/routed.rs` from line 358 (≈ 920 lines of non-test
+code), `exec-hyperliquid/src/exchange.rs` from line 898 (≈ 1 570) and
+`ingress-binance/src/run_loop.rs` from line 436 (≈ 1 010). The sweep now
+skips a `#[cfg(test)]` ITEM to its own end and resumes: a brace-less
+line's `;`, a braced one-liner, or a block's closing brace at the
+attribute's indentation. It refuses to guess: `#[cfg(test)]` on a field,
+a variant, an arm or a multi-line expression, or an item that never
+closes, fails the sweep (exit 3). A `COPY:` marker inside a test item no
+longer covers the live copy below it. `scripts/copy-audit-selftest.sh`
+proves all of that on fixtures (14 live copies found and none inside a
+test item; 6 undelimitable constructs refused), and `make copy-audit`
+runs it first. A probe copy injected at the end of each formerly blind
+region was flagged in all three files. The exec lane's formerly blind
+code is clean: no new hit.
+
+**What the pass removed** (copies gone, not commented):
+
+* `parse_book_ticker` / `parse_mark_price` returned a 64 B `align(64)`
+  frame inside an `Option` — 128 B by value, on every bookTicker and
+  markPrice push. Both now fill the caller's frame in place
+  (`&mut Frame` → `bool`) and write it only once every field has
+  parsed: a failed parse leaves it untouched (a unit test, and both
+  fuzz targets assert it on every input). `parse_trade` keeps its
+  `Option` — under 64 B, asserted at compile time.
+* The spot sentinel's SUBSCRIBE was re-assembled through a stack
+  scratch on every (re)connect. Its stream symbol is now read from the
+  slot's own endpoint path, and the request's four parts go straight
+  into the masked frame through the new
+  `core_net::ws_write_text_frame_parts` (core-net's one frame
+  serialiser now writes a payload from parts; the single-payload
+  writers call it with one). Nothing is composed or stored: the
+  Driver's 32 B sentinel stream buffer is gone.
+* The Ping echo went rx → stack scratch → tx; it goes rx → tx.
+* `MultiConn` copied its host and path into two `Vec`s per connection;
+  it borrows them from the boot's endpoint list.
+* `parse_filters` copied each `filterType` into a 32 B buffer to
+  compare it; it compares the borrowed span, so an over-long
+  `filterType` no longer rejects its row (tested).
+* The discovery rows (`BnSymbolRow`; `EapiOptionRow`, 72 B) crossed a
+  return by value together with their end offset; they are parsed in
+  place into their table slot.
+* `options-select` sizes its output once (`with_capacity`), so a
+  selected row is copied in exactly once, never again by a growing Vec.
+
+**What the pass commented** (designed copies, each with its `// COPY:`):
+the ≤ 32 B symbol and ≤ 16 B underlying copied into each discovery row
+at boot (the row outlives the REST body it was scanned from, and the
+fetch buffer is reused by the next request); the options selection
+law's by-value rows (72 B, ≤ 64, once at boot — references into the
+table would change the three-venue law for ≤ 4.6 KB); the ≈ 2.9 KB
+Driver moving into its slot 2–4 times per connection at boot (every
+slot's `StreamLane` is sized for the 2 568 B options table it carries
+inline); the transport moving into its slot once per reconnect; and the
+test views that return a frame's `Option` by value.
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus): PASS — no hot
+copy left in `ingress-binance`; RX = 4 copies against the target of 3
+on every Binance lane, the extra one in core-net (below). Its cold
+findings were all acted on. The first sentinel fix carried a `// COPY:`
+whose reason was false ("the driver cannot borrow the boot strings" —
+the symbol is in the slot's own path), so that copy was removed rather
+than re-worded; the Driver, transport and test-view moves got honest
+markers; the options table's marker now states its real size and its
+second move. Its review of the first version of the new skip logic
+found shapes that would still have swallowed live code silently (a
+braced `use`, an empty-bodied method, a field or a variant, a struct
+literal, a multi-line array); the reader above delimits or refuses
+each, and the self-test pins them.
+
+**Escalated, not changed:** core-net's RX path keeps a fourth copy —
+rustls' plaintext into the caller's rx buffer — and its `// COPY:`
+rejection ("rustls has no in-place plaintext borrow") is out of date for
+the `unbuffered` API of rustls 0.23 (the pinned 0.23.38). The auditor
+also flagged that the buffered API may stage each received record's
+plaintext through a heap `Vec` — an allocation per record that the
+alloc gate cannot see, because it drives a test transport. UNVERIFIED:
+it needs an allocation count over a real TLS loopback before anyone
+moves the engine's TLS reader.
+
+Gate after the pass: `hits=32 baselined=32 new=0 paid=0` over the exec
+lane, `core-net` and `ingress-binance`. The baseline shrank by one (the
+old single-payload copy in `ws_frame.rs`, now the marked parts write)
+and did not grow.
+
+### BX0 — the other ingress crates parse in place too (2026-09-23)
+
+On the operator's word ("the okx, deribit, hyperliquid and mexc parsers
+return frames by value too — fix it as far as you've found it"): the
+pattern the BX0 pass removed from `ingress-binance` was measured across
+every other ingress crate and removed there as well — `ingress-okx`,
+`-deribit`, `-hyperliquid`, `-mexc`, `-bybit`, `-polymarket` and `-rpc`.
+
+**What the pass removed** (copies gone, not commented):
+
+* **30 parsers** returned a 64 B `align(64)` frame inside an `Option` —
+  128 B by value (192 B for `DeribitTickerFrame`, 256 B for HL's
+  `DepthTopK`) on every push they parse. Each now fills the caller's
+  frame in place (`&mut Frame` → `bool`, `#[must_use]`) and writes it
+  once, only after every field has parsed, so a failed parse leaves it
+  untouched. The one exception is `parse_l2book_depth`, whose level
+  carrier fills as the walk goes and is never read on `false` (its
+  header obeys the rule).
+* **Frames inside the dispatch value.** The two-phase run loops carried
+  the parsed `Tick` / frame / head inside `Dispatch` from phase 1 to
+  phase 2 — every dispatch value ≥ 128 B (a 64 B `align(64)` payload
+  plus its tag), and mexc's crossed two function returns by value. The frame now lives in a phase-1 scratch the arm
+  writes in place; the variant only says it was written. Each run
+  loop's `Dispatch` is const-asserted ≤ 64 B (HL's 64 B roll spec is
+  parked in the driver to fit).
+* **OKX's 144 B `TradeScan`** staged sixteen seq ids for phase 2. The
+  seq monitor is a driver field disjoint from the rx borrow, so the walk
+  chain-checks the same first 16 rows as it reads them; the scan is
+  12 B.
+* **The top-K change gate** kept the last snapshot by copying the new
+  one over it (192 B per changed push, OKX / Deribit / HL). The new
+  `core_types::DepthPair` holds two rows: the snapshot is written in
+  place into the spare one and becomes the last by an index flip.
+  `DepthLadder::snapshot_into` / `top_k_into` replace the 192 B / 80 B
+  by-value `snapshot` / `top_k`.
+* **HL walked an outcome leg's `l2Book` twice** (header, then depth):
+  `parse_l2book_depth` now yields the header from the same walk.
+
+**What the pass commented** (designed copies, each with its `// COPY:`):
+the 192 B `DepthTopK` pushed into the depth ring (OKX, Deribit) —
+core-ring has only a by-value `try_push`; the boot-time discovery rows
+(Deribit, MEXC ×2, HL, Polymarket ×2, OKX; 80–264 B, once per row);
+`DepthPair::new` at boot; the HL test recorder; and one marker per test
+view (the views are now one `#[cfg(test)] mod views` per file). Two
+by-value returns at the bound are pinned by compile-time asserts:
+`Option<MexcSpotFrame>` (64 B only through `MexcChannel`'s niche) and
+Deribit's 56 B `TradeScan`.
+
+**The fuzz contract is checked against non-zero bytes.** Starting a
+target from `ZERO` could not tell "untouched" from "zeroed on the way
+out". Thirteen targets now start from a `0xA5`-filled frame
+(`fuzz/fuzz_targets/common/poison.rs`; `poisoned::<T>()` is bounded on
+the `unsafe trait AnyBits`, implemented only for the 28 frames checked
+field by field as integer-only `repr(C)`). `parse_price_change_row` and
+`parse_l2book_depth` are now fuzzed and alloc-gated; `hl_l2book` —
+broken since `HlStaleness::arm` took the coin table — compiles again
+and runs a header-vs-depth differential.
+
+**The auditor on the pass** (`zero-copy-auditor`): PASS — no hot hidden
+copy left on these lanes; RX = 4 against the target of 3, the extra one
+core-net's rustls copy (above). Its findings were acted on: the poison
+helper's first soundness argument (a niche check) was not a proof, so
+the proof moved into the `AnyBits` contract and the niche check stayed
+as a tripwire; three more cold discovery returns got markers; two
+at-bound returns got size pins; stale docs were corrected.
+
+**Open, not in this pass:**
+
+1. **core-ring moves by value.** `try_push(T)` and `try_pop() ->
+   Option<T>` — every consumer pops a 128 B `Option<Tick>` per tick and
+   a 256 B `Option<DepthTopK>` per snapshot. An in-slot claim/commit
+   push and a `pop_into(&mut T) -> bool` is its own change, across
+   every consumer.
+2. **These seven crates are not in `make copy-audit`.** A sweep with
+   the script's own reader finds 51 unmarked copy verbs, all older than
+   this pass. The hot one is the WS Ping echo through a 125 B stack
+   scratch in OKX, Deribit, HL, Bybit, RPC and Polymarket (BX0 removed
+   it from Binance; MEXC marks it); the rest are cold (subscribe,
+   resync and log renders, boot symbol copies, Bybit's boot `to_vec`).
+   Whether they join the gate is the operator's call.
+
+Gates after the pass: clippy clean; nextest 2743 passed (3 skipped; one
+earlier run hit the known parallel-load flake
+`hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`,
+green alone and on the rerun); alloc 64/64 at 0 B/op; `make copy-audit`
+new=0; license-check OK; fourteen fuzz targets 60 s each, no crash
+(1.1 M–31 M runs); live smokes 60 s — MEXC 31 002 messages, Binance
+59 819 — both with 0 parse errors and 0 reconnects.
 
 ## E6 — the risk gate and the kill switches
 
@@ -4199,7 +4451,7 @@ it; there is no workspace `libc`); `gen_vectors.py` now drives the SDK's
 own `order_request_to_order_wire` / `order_wires_to_order_action` and
 records the SDK version; `selftest` pins the vector count (25);
 `MAX_ORDERS` enforced in all four batch encoders; `BudgetGauge` removed;
-`cancel_by_cloid` / `modify` render into the boot-owned `mp` / `req`
+`cancel_by_cloid` / `modify_by_cloid` render into the boot-owned `mp` / `req`
 buffers (no 16 KiB stack arrays on the engine thread); `POLL_SLICE`
 removed from the steady-state pump (it parked the single-writer thread
 50 ms out of every 52); `Order.verb` doc corrected (`paper.rs` said the
@@ -4255,6 +4507,9 @@ EIP-712 assembly, the PM dispatcher, `core-net`), listed in
 unmarked copy fails, a paid entry is dropped with `--update-baseline`,
 and only the operator grows it. Gate at the close: `hits=33 baselined=33
 new=0 paid=0` on the exec lane + core-net.
+Since BX0 the gate also covers `ingress-binance`, and a `#[cfg(test)]`
+ITEM no longer ends the scan of its file ("BX0 — `ingress-binance` joins
+the zero-copy gate", above).
 
 ### The auditor's own verdict on the pass
 

@@ -320,6 +320,10 @@ enum RowMode {
 
 /// Parse one instrument object starting at `pos` (must point at `{`).
 /// Returns the row and the position after the closing `}`.
+// COPY: `Result<(Option<OkxInstrumentRow>, usize), _>` ≥ 88 B by value,
+// once per row of a boot-time REST discovery page (cold; the row is
+// pushed into the discovery table next) — rejected: an out-param into
+// the table's next slot, bookkeeping a boot-once path does not earn.
 fn parse_row(
     body: &[u8],
     pos: usize,

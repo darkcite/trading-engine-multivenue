@@ -4,14 +4,24 @@
 //! Fuzz target: arbitrary bytes → `ingress_binance::parse_book_ticker`.
 //!
 //! The byte scanner is expected to tolerate any input — returning
-//! `None` on malformed frames and never panicking or reading past the
+//! `false` on malformed frames and never panicking or reading past the
 //! end of the slice. This target exercises that contract with random
-//! and coverage-guided inputs from libFuzzer.
+//! and coverage-guided inputs from libFuzzer, plus the in-place one
+//! (BX0): a frame that fails to parse leaves `out` untouched, and one
+//! that parses carries the pinned symbol.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
-    let _ = ingress_binance::parse_book_ticker(data, 0);
+    let mut f: ingress_binance::BookTickerFrame = poison::poisoned();
+    if ingress_binance::parse_book_ticker(data, 7, &mut f) {
+        assert_eq!(f.sym, 7);
+    } else {
+        assert_eq!(f, poison::poisoned::<ingress_binance::BookTickerFrame>(), "a failed parse wrote the frame");
+    }
 });

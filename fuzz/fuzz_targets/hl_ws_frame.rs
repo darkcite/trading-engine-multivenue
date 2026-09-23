@@ -23,6 +23,9 @@
 
 use libfuzzer_sys::fuzz_target;
 
+#[path = "common/poison.rs"]
+mod poison;
+
 fuzz_target!(|data: &[u8]| {
     // --- Classifier -------------------------------------------------
     std::hint::black_box(ingress_hyperliquid::classify(data));
@@ -31,12 +34,41 @@ fuzz_target!(|data: &[u8]| {
     std::hint::black_box(ingress_hyperliquid::extract_coin(data));
 
     // --- channel parsers --------------------------------------------
-    std::hint::black_box(ingress_hyperliquid::parse_bbo(data, 0));
-    std::hint::black_box(ingress_hyperliquid::parse_l2book_header(data, 0));
-    std::hint::black_box(ingress_hyperliquid::parse_trade(data, 0));
-    std::hint::black_box(ingress_hyperliquid::parse_active_asset_ctx(data, 0));
+    let mut f: ingress_hyperliquid::HlBboFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_bbo(data, 0, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlBboFrame>(), "a failed parse wrote the frame");
+    }
+    std::hint::black_box(f);
+    let mut f: ingress_hyperliquid::HlL2BookFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_l2book_header(data, 0, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlL2BookFrame>(), "a failed parse wrote the frame");
+    }
+    std::hint::black_box(f);
+    // The one-walk depth parse: its header obeys the same untouched-on-
+    // false rule; its level carrier may be partly filled then (by design).
+    let mut depth = core_types::DepthTopK::EMPTY;
+    let mut f: ingress_hyperliquid::HlL2BookFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_l2book_depth(data, 0, 0, &mut depth, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlL2BookFrame>(), "a failed parse wrote the header");
+    }
+    std::hint::black_box(f);
+    std::hint::black_box(depth.bids[0].px_1e6);
+    let mut f: ingress_hyperliquid::HlTradeFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_trade(data, 0, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlTradeFrame>(), "a failed parse wrote the frame");
+    }
+    std::hint::black_box(f);
+    let mut f: ingress_hyperliquid::HlAssetCtxFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_active_asset_ctx(data, 0, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlAssetCtxFrame>(), "a failed parse wrote the frame");
+    }
+    std::hint::black_box(f);
     std::hint::black_box(ingress_hyperliquid::parse_all_mids(data));
-    std::hint::black_box(ingress_hyperliquid::parse_outcome_meta(data));
+    let mut f: ingress_hyperliquid::HlOutcomeMetaFrame = poison::poisoned();
+    if !ingress_hyperliquid::parse_outcome_meta(data, &mut f) {
+        assert_eq!(f, poison::poisoned::<ingress_hyperliquid::HlOutcomeMetaFrame>(), "a failed parse wrote the frame");
+    }
+    std::hint::black_box(f);
 
     // --- subscribe acks ---------------------------------------------
     std::hint::black_box(ingress_hyperliquid::parse_sub_response(data));

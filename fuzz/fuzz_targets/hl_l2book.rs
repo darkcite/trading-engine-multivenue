@@ -14,6 +14,11 @@
 //!   asserts `parse_l2book_header` accepts it, counts exactly the
 //!   generated levels per side, and converts `time` (ms) to ns with
 //!   the documented saturating multiply.
+//! * **Depth parse (differential).** `parse_l2book_depth` walks the
+//!   same snapshot once for the header AND the top-K levels: its
+//!   header must equal the header walk's, and each side must carry
+//!   exactly the first `min(n, DEPTH_K)` rendered levels, best-first,
+//!   `EMPTY` beyond them.
 //! * **Staleness monitor (differential).** The remaining bytes drive
 //!   `HlStaleness` for one coin as (venue-time delta, local-time
 //!   delta) steps — venue time walks both directions, the local
@@ -28,9 +33,14 @@
 
 use libfuzzer_sys::fuzz_target;
 
+/// Level `i`'s price (whole units) on the side salted by `salt`: kept
+/// in `1..=999_999` (> 0, ≤ 6 digits) so every level is wire-legal.
+fn level_px(seed: u32, salt: u32, i: u32) -> u32 {
+    seed.wrapping_add((salt + i).wrapping_mul(0x9e37_79b9)) % 999_999 + 1
+}
+
 /// Render one side's level array `[{"px":"..","sz":"1.0","n":1},..]`
-/// into `out`. Prices are derived from `seed`/`salt` and kept in
-/// `1..=999_999` (> 0, ≤ 6 digits) so every level is wire-legal.
+/// into `out`, prices from [`level_px`].
 fn render_side(out: &mut String, n_levels: u16, seed: u32, salt: u32) {
     out.push('[');
     let mut i: u32 = 0;
@@ -38,11 +48,27 @@ fn render_side(out: &mut String, n_levels: u16, seed: u32, salt: u32) {
         if i > 0 {
             out.push(',');
         }
-        let px = seed.wrapping_add((salt + i).wrapping_mul(0x9e37_79b9)) % 999_999 + 1;
+        let px = level_px(seed, salt, i);
         out.push_str(&format!("{{\"px\":\"{px}.0\",\"sz\":\"1.0\",\"n\":1}}"));
         i += 1;
     }
     out.push(']');
+}
+
+/// Assert one depth side carries exactly the first `min(n, DEPTH_K)`
+/// rendered levels (size 1.0 each), `EMPTY` beyond them.
+fn check_side(levels: &[core_types::DepthLevel], n_levels: u16, seed: u32, salt: u32) {
+    let mut i: u32 = 0;
+    while (i as usize) < levels.len() {
+        let level = levels[i as usize];
+        if i < u32::from(n_levels) {
+            assert_eq!(level.px_1e6, i64::from(level_px(seed, salt, i)) * 1_000_000);
+            assert_eq!(level.qty_1e6, 1_000_000);
+        } else {
+            assert_eq!((level.px_1e6, level.qty_1e6), (0, 0), "a level past the book's depth");
+        }
+        i += 1;
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -78,12 +104,27 @@ fuzz_target!(|data: &[u8]| {
     render_side(&mut payload, n_asks, px_seed, 100);
     payload.push_str("]}}");
 
-    let f = ingress_hyperliquid::parse_l2book_header(payload.as_bytes(), 1)
-        .expect("well-formed l2Book snapshot must parse");
+    let mut f = ingress_hyperliquid::HlL2BookFrame::ZERO;
+    assert!(
+        ingress_hyperliquid::parse_l2book_header(payload.as_bytes(), 1, &mut f),
+        "well-formed l2Book snapshot must parse"
+    );
     assert_eq!(f.sym, 1);
     assert_eq!(f.n_bids, n_bids);
     assert_eq!(f.n_asks, n_asks);
     assert_eq!(f.ts_ns, time_ms.saturating_mul(1_000_000));
+
+    // --- l2Book depth: one walk, header + top-K ---------------------
+    let mut depth = core_types::DepthTopK::EMPTY;
+    let mut header = ingress_hyperliquid::HlL2BookFrame::ZERO;
+    assert!(
+        ingress_hyperliquid::parse_l2book_depth(payload.as_bytes(), 1, 7, &mut depth, &mut header),
+        "well-formed l2Book snapshot must fill the depth"
+    );
+    assert_eq!(header, f, "the depth walk's header differs from the header walk's");
+    assert_eq!((depth.ts_ns, depth.sym), (7, 1));
+    check_side(&depth.bids, n_bids, px_seed, 0);
+    check_side(&depth.asks, n_asks, px_seed, 100);
 
     // --- staleness monitor vs. shadow model -------------------------
     let mut b2 = [0u8; 2];
@@ -97,7 +138,11 @@ fuzz_target!(|data: &[u8]| {
     assert!(!mon.is_armed());
     assert_eq!(mon.first_stale(now0), None, "disarmed is never stale");
 
-    mon.arm(now0, 1);
+    // One named coin: `arm` watches exactly the rows that name a venue
+    // instrument (a reserved row is never on the wire).
+    let mut coins = ingress_hyperliquid::HlCoinTable::new();
+    assert!(coins.insert(b"X", 1).is_ok(), "one coin fits an empty table");
+    mon.arm(now0, &coins);
     assert!(mon.is_armed());
 
     // Shadow model for coin 0, mirroring arm()'s baseline: venue

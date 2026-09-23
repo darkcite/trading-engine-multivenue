@@ -143,10 +143,10 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
 
 /// Number of options-summary lanes (VM2 V2): the venues with an
 /// options analytics channel — 0 = OKX (`opt-summary`), 1 = Deribit
-/// (option `ticker.100ms`), 2 = Binance (eapi WS — venue-dark today;
-/// the lane exists so the `.env` heal activates it with NO engine
-/// change, the M2 lever law). [`OptSummary`] slots,
-/// [`OPT_RING_SIZE`] capacity, mapped by [`opt_lane_of`].
+/// (option `ticker.100ms`), 2 = Binance (`<uly>@optionMarkPrice` on
+/// fstream `/market`, BX0-F2 — dark from the venue's 2025-12 options
+/// migration until then). [`OptSummary`] slots, [`OPT_RING_SIZE`]
+/// capacity, mapped by [`opt_lane_of`].
 pub const NUM_OPT_LANES: usize = 3;
 
 /// Options-summary lane index for a venue with an options channel;
