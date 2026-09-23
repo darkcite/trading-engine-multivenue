@@ -170,6 +170,33 @@ pub fn word_u160(w: &[u8]) -> Option<(u128, u32)> {
     Some((fold_u128(&w[32..])?, hi))
 }
 
+/// A word as an ADDRESS, rendered `0x` + 40 lowercase digits into `dst`
+/// straight from the word's own digits (H9: `token0()` used to parse
+/// the word to integers, copy them into a byte array and render that
+/// back to hex). The upper 96 bits must be zero and the address not
+/// zero; `false` otherwise, `dst` then unspecified.
+#[inline]
+pub fn word_addr_hex(w: &[u8], dst: &mut [u8; 42]) -> bool {
+    if w.len() != WORD_HEX || !all_digit(&w[..24], b'0') {
+        return false;
+    }
+    dst[0] = b'0';
+    dst[1] = b'x';
+    let mut any = false;
+    let mut i = 0;
+    while i < 40 {
+        let c = w[24 + i];
+        if nib(c) == 0xff {
+            return false;
+        }
+        any |= c != b'0';
+        // ASCII case fold: `A`-`F` → `a`-`f`; digits and `a`-`f` keep.
+        dst[2 + i] = if c.is_ascii_uppercase() { c | 0x20 } else { c };
+        i += 1;
+    }
+    any
+}
+
 /// A word as `uint32` (fees): the upper 224 bits must be zero.
 #[inline]
 pub fn word_u32(w: &[u8]) -> Option<u32> {
@@ -262,6 +289,21 @@ mod tests {
     fn w(s: &str) -> Vec<u8> {
         assert_eq!(s.len(), 64);
         s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn an_address_word_renders_lowercase_from_its_own_digits() {
+        let mut d = [0u8; 42];
+        let a = w("000000000000000000000000AbCdEf0123456789abcdef0123456789ABCDEF01");
+        assert!(word_addr_hex(&a, &mut d));
+        assert_eq!(&d[..], b"0xabcdef0123456789abcdef0123456789abcdef01");
+        let high = w("000000000000000000000001abcdef0123456789abcdef0123456789abcdef01");
+        assert!(!word_addr_hex(&high, &mut d), "a set bit above 160");
+        let zero = w("0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(!word_addr_hex(&zero, &mut d), "the zero address");
+        let junk = w("000000000000000000000000abcdef0123456789abcdef0123456789abcdefzz");
+        assert!(!word_addr_hex(&junk, &mut d), "a non-hex digit");
+        assert!(!word_addr_hex(&a[..63], &mut d), "not a whole word");
     }
 
     #[test]

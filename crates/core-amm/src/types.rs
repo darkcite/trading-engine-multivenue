@@ -327,6 +327,22 @@ pub struct TickMap<const N: usize> {
     pub hi_tick: i32,
 }
 
+/// A coverage `[lo_tick, hi_tick]` a map may adopt: ordered, inside the
+/// tick domain, aligned to a positive spacing.
+#[inline]
+fn check_coverage(lo_tick: i32, hi_tick: i32, tick_spacing: i32) -> Result<(), AmmError> {
+    if tick_spacing <= 0
+        || lo_tick > hi_tick
+        || lo_tick < MIN_TICK
+        || hi_tick > MAX_TICK
+        || lo_tick % tick_spacing != 0
+        || hi_tick % tick_spacing != 0
+    {
+        return Err(AmmError::BadState);
+    }
+    Ok(())
+}
+
 impl<const N: usize> TickMap<N> {
     const CAP_OK: () = assert!(N <= u16::MAX as usize, "TickMap capacity must fit u16");
 
@@ -399,45 +415,90 @@ impl<const N: usize> TickMap<N> {
         tick_spacing: i32,
     ) -> Result<(), AmmError> {
         self.clear();
-        if tick_spacing <= 0
-            || lo_tick > hi_tick
-            || lo_tick < MIN_TICK
-            || hi_tick > MAX_TICK
-            || lo_tick % tick_spacing != 0
-            || hi_tick % tick_spacing != 0
-        {
-            return Err(AmmError::BadState);
-        }
+        check_coverage(lo_tick, hi_tick, tick_spacing)?;
         if nodes.len() > N {
             return Err(AmmError::TickMapFull);
         }
+        // COPY: ≤ N × 32 B nodes, the caller's slice → the map (cold:
+        // tests and offline tools) — rejected: none for a slice caller;
+        // a streaming caller stages in place ([`Self::begin_stage`]).
+        self.nodes[..nodes.len()].copy_from_slice(nodes);
+        self.commit_nodes(nodes.len(), lo_tick, hi_tick, tick_spacing)
+    }
+
+    /// Start staging a snapshot IN PLACE — the streaming caller's
+    /// [`Self::load`] (HYPARB H9: the member used to stage into its own
+    /// box and copy it here): clear the map, write node `i` through
+    /// [`Self::stage_slot`], then [`Self::commit_stage`]. The map is
+    /// empty — every walk refuses — until the commit succeeds.
+    #[inline]
+    pub fn begin_stage(&mut self) {
+        self.clear();
+    }
+
+    /// Slot `i` of a snapshot being staged (`None` past capacity).
+    #[inline]
+    pub fn stage_slot(&mut self, i: usize) -> Option<&mut TickNode> {
+        if i < N {
+            Some(&mut self.nodes[i])
+        } else {
+            None
+        }
+    }
+
+    /// Validate the first `n` staged nodes exactly as [`Self::load`]
+    /// validates its slice, and adopt them over `[lo_tick, hi_tick]`.
+    /// Refuses with `load`'s errors and leaves the map CLEARED.
+    pub fn commit_stage(
+        &mut self,
+        n: usize,
+        lo_tick: i32,
+        hi_tick: i32,
+        tick_spacing: i32,
+    ) -> Result<(), AmmError> {
+        self.clear();
+        check_coverage(lo_tick, hi_tick, tick_spacing)?;
+        if n > N {
+            return Err(AmmError::TickMapFull);
+        }
+        self.commit_nodes(n, lo_tick, hi_tick, tick_spacing)
+    }
+
+    /// Validate `nodes[..n]` (already in place) and set the map's length
+    /// and coverage; the map stays cleared on a refusal.
+    fn commit_nodes(
+        &mut self,
+        n: usize,
+        lo_tick: i32,
+        hi_tick: i32,
+        tick_spacing: i32,
+    ) -> Result<(), AmmError> {
         let cap = max_liquidity_per_tick(tick_spacing);
         let mut i = 0;
-        while i < nodes.len() {
-            let n = nodes[i];
+        while i < n {
+            let node = self.nodes[i];
             if i > 0 {
-                let prev = nodes[i - 1].tick;
-                if n.tick == prev {
+                let prev = self.nodes[i - 1].tick;
+                if node.tick == prev {
                     return Err(AmmError::TickMapDuplicate);
                 }
-                if n.tick < prev {
+                if node.tick < prev {
                     return Err(AmmError::TickMapUnsorted);
                 }
             }
-            if n.tick < lo_tick || n.tick > hi_tick || n.tick % tick_spacing != 0 {
+            if node.tick < lo_tick || node.tick > hi_tick || node.tick % tick_spacing != 0 {
                 return Err(AmmError::BadState);
             }
-            if n.liquidity_net.unsigned_abs() > cap {
+            if node.liquidity_net.unsigned_abs() > cap {
                 return Err(AmmError::LiquidityNetOverflow);
             }
-            let g = n.liquidity_gross();
-            if g != 0 && g < n.liquidity_net.unsigned_abs() {
+            let g = node.liquidity_gross();
+            if g != 0 && g < node.liquidity_net.unsigned_abs() {
                 return Err(AmmError::TickMapInconsistent);
             }
-            self.nodes[i] = n;
             i += 1;
         }
-        self.len = nodes.len() as u16;
+        self.len = n as u16;
         self.lo_tick = lo_tick;
         self.hi_tick = hi_tick;
         Ok(())

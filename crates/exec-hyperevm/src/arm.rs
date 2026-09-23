@@ -32,17 +32,15 @@
 
 use core_net::{HttpsPost, PostErr};
 use signer_eip712::SecretKey;
-use signer_evm::{
-    create_address, create_hash, create_sign, tx_hash, tx_sign, Eip1559Create, Eip1559Tx, EvmTxErr,
-};
+use signer_evm::{create_address, Eip1559Create, Eip1559Tx, EvmTxErr, PreparedTx};
 
 use crate::calldata::{encode_swap, SwapCall, SWAP_CALLDATA_LEN};
 use crate::gas::{fee_paid_wei, GasBid, SWAP_GAS_LIMIT};
 use crate::nonce::{NonceTable, WalletState, MAX_WALLETS};
 use crate::rpc::{
-    classify_send_refusal, scan_hash, scan_next_base_fee, scan_quantity, scan_receipt,
-    write_balance, write_chain_id, write_fee_history, write_receipt, write_send_raw,
-    write_send_raw_create, write_tx_count, BlockTag, Receipt, ScanErr, SendRefusal,
+    classify_send_refusal, scan_hash, scan_next_base_fee, scan_quantity, scan_receipt, scan_word,
+    write_balance, write_call, write_chain_id, write_fee_history, write_receipt, write_send_raw,
+    write_tx_count, BlockTag, Receipt, ScanErr, SendRefusal,
 };
 use crate::Network;
 
@@ -64,6 +62,8 @@ pub enum ArmBootErr {
     BadKey,
     /// Two keys for one address.
     DuplicateWallet,
+    /// The HTTPS client's body window is under [`MAX_BODY`].
+    BodyWindow,
 }
 
 impl core::fmt::Display for ArmBootErr {
@@ -72,6 +72,7 @@ impl core::fmt::Display for ArmBootErr {
             Self::WalletCount => "evm arm: 1..=8 wallet keys are required",
             Self::BadKey => "evm arm: a wallet key is not a valid secp256k1 secret",
             Self::DuplicateWallet => "evm arm: two keys resolve to one address",
+            Self::BodyWindow => "evm arm: the https client's body window is under MAX_BODY",
         })
     }
 }
@@ -87,6 +88,10 @@ pub enum ArmErr {
     Status(u16),
     /// The answer did not scan (or the node returned an RPC error).
     Scan(ScanErr),
+    /// The node answered with a THROTTLE (`-32005 rate limited` on the
+    /// public testnet endpoint): the endpoint said no, not the request —
+    /// retry later (H9: boot reads this as "dark", never a refusal).
+    RateLimited,
     /// Signing or rendering failed.
     Render(EvmTxErr),
     /// The endpoint serves another chain.
@@ -107,6 +112,7 @@ impl core::fmt::Display for ArmErr {
             Self::Post(e) => write!(f, "evm arm: {e}"),
             Self::Status(s) => write!(f, "evm arm: http status {s}"),
             Self::Scan(e) => write!(f, "evm arm: unreadable answer ({e:?})"),
+            Self::RateLimited => f.write_str("evm arm: the endpoint rate-limited the request"),
             Self::Render(e) => write!(f, "evm arm: {e}"),
             Self::ChainMismatch { got } => write!(
                 f,
@@ -206,7 +212,9 @@ pub enum PollOutcome {
     Idle,
     /// Not mined yet.
     Pending,
-    /// Mined and reconciled (success or revert: `receipt.status`).
+    /// Mined and reconciled (success or revert) — the receipt is
+    /// [`EvmArm::last_receipt`] until the next poll (it is scanned into
+    /// the arm's own storage, never moved).
     Mined {
         /// Wallet index.
         wallet: usize,
@@ -214,8 +222,6 @@ pub enum PollOutcome {
         tag: u64,
         /// The nonce it consumed.
         nonce: u64,
-        /// The reconciled receipt.
-        receipt: Receipt,
     },
     /// No receipt within [`RECEIPT_TIMEOUT_NS`]: the wallet is
     /// quarantined until a sync.
@@ -322,10 +328,11 @@ pub struct EvmArm {
     wallets: Box<[Wallet]>,
     nonces: NonceTable,
     inflight: [InFlight; MAX_WALLETS],
-    body: Box<[u8]>,
     next_id: u64,
     halted: Option<HaltCause>,
     counters: EvmArmCounters,
+    /// The last receipt a poll scanned (read after `Mined`).
+    last_receipt: Receipt,
 }
 
 impl EvmArm {
@@ -339,6 +346,10 @@ impl EvmArm {
     ) -> Result<Self, ArmBootErr> {
         if keys.is_empty() || keys.len() > MAX_WALLETS {
             return Err(ArmBootErr::WalletCount);
+        }
+        // Requests are rendered straight into the client's wire buffer.
+        if http.body_cap() < MAX_BODY {
+            return Err(ArmBootErr::BodyWindow);
         }
         let mut wallets: Vec<Wallet> = Vec::with_capacity(keys.len());
         let mut i = 0;
@@ -357,17 +368,29 @@ impl EvmArm {
             wallets.push(Wallet { sk, addr });
             i += 1;
         }
+        // Build the signer's process-wide secp256k1 context NOW (a
+        // one-time allocation behind a `OnceLock`), not on the first
+        // steady-state send.
+        signer_eip712::sign_digest_with_key(&wallets[0].sk, &[1u8; 32])
+            .map_err(|_| ArmBootErr::BadKey)?;
         Ok(Self {
             http,
             network,
             nonces: NonceTable::new(keys.len()),
             wallets: wallets.into_boxed_slice(),
             inflight: [InFlight::NONE; MAX_WALLETS],
-            body: vec![0u8; MAX_BODY].into_boxed_slice(),
             next_id: 0,
             halted: None,
             counters: EvmArmCounters::default(),
+            last_receipt: Receipt::ZERO,
         })
+    }
+
+    /// The receipt the last `Mined` poll reconciled.
+    #[inline]
+    #[must_use]
+    pub const fn last_receipt(&self) -> &Receipt {
+        &self.last_receipt
     }
 
     /// The armed network.
@@ -435,9 +458,10 @@ impl EvmArm {
         }
     }
 
-    /// Post the first `n` body bytes; the answer's body range.
+    /// Post the first `n` bytes of the client's body window (every
+    /// writer renders there, in place); the answer's body range.
     fn exchange(&mut self, n: usize) -> Result<core::ops::Range<usize>, ArmErr> {
-        let (status, range) = self.http.post(&self.body[..n]).map_err(ArmErr::Post)?;
+        let (status, range) = self.http.post(n).map_err(ArmErr::Post)?;
         if status != 200 {
             return Err(ArmErr::Status(status));
         }
@@ -447,14 +471,30 @@ impl EvmArm {
     /// One read whose answer is a QUANTITY.
     fn read_quantity(&mut self, n: usize, id: u64) -> Result<u128, ArmErr> {
         let r = self.exchange(n)?;
-        scan_quantity(&self.http.resp()[r], id).map_err(ArmErr::Scan)
+        scan_quantity(&self.http.resp()[r.clone()], id).map_err(|e| self.scan_err(e, r))
+    }
+
+    /// A scanner's refusal of the answer at `body` in the response: a
+    /// node error whose message is a throttle is [`ArmErr::RateLimited`],
+    /// anything else [`ArmErr::Scan`]. (The error's message offsets are
+    /// relative to `body`, the slice the scanner saw.)
+    fn scan_err(&self, e: ScanErr, body: core::ops::Range<usize>) -> ArmErr {
+        if let ScanErr::Rpc(rpc) = e {
+            let b = &self.http.resp()[body];
+            let (s, t) = (rpc.message_start as usize, rpc.message_end as usize);
+            if s <= t && t <= b.len() && classify_send_refusal(&b[s..t]) == SendRefusal::RateLimited
+            {
+                return ArmErr::RateLimited;
+            }
+        }
+        ArmErr::Scan(e)
     }
 
     /// Layer 4 at the wire: the endpoint must serve the armed chain. A
     /// mismatch HALTS the arm.
     pub fn verify_chain(&mut self) -> Result<(), ArmErr> {
         let id = self.id();
-        let n = write_chain_id(&mut self.body, id).map_err(too_small)?;
+        let n = write_chain_id(self.http.body_mut(), id).map_err(too_small)?;
         let got = self.read_quantity(n, id)?;
         let want = self.network.chain_id();
         if got != want as u128 {
@@ -474,13 +514,15 @@ impl EvmArm {
         }
         let addr = self.wallets[w].addr;
         let id = self.id();
-        let n = write_tx_count(&mut self.body, id, &addr, BlockTag::Latest).map_err(too_small)?;
+        let n =
+            write_tx_count(self.http.body_mut(), id, &addr, BlockTag::Latest).map_err(too_small)?;
         let latest = self.read_quantity(n, id)?;
         let id = self.id();
-        let n = write_tx_count(&mut self.body, id, &addr, BlockTag::Pending).map_err(too_small)?;
+        let n = write_tx_count(self.http.body_mut(), id, &addr, BlockTag::Pending)
+            .map_err(too_small)?;
         let pending = self.read_quantity(n, id)?;
         let id = self.id();
-        let n = write_balance(&mut self.body, id, &addr).map_err(too_small)?;
+        let n = write_balance(self.http.body_mut(), id, &addr).map_err(too_small)?;
         let balance_wei = self.read_quantity(n, id)?;
         let latest = u64::try_from(latest).map_err(|_| ArmErr::Scan(ScanErr::Malformed))?;
         let pending = u64::try_from(pending).map_err(|_| ArmErr::Scan(ScanErr::Malformed))?;
@@ -497,12 +539,41 @@ impl EvmArm {
         })
     }
 
+    /// `owner()` of `contract` (cold — boot and the battery): the one
+    /// sender the executor's `swap` accepts. A contract that does not
+    /// answer one address-shaped word refuses (`Scan`).
+    pub fn owner_of(&mut self, contract: &[u8; 20]) -> Result<[u8; 20], ArmErr> {
+        let id = self.id();
+        let n = write_call(
+            self.http.body_mut(),
+            id,
+            contract,
+            &crate::calldata::OWNER_SELECTOR,
+        )
+        .map_err(too_small)?;
+        let r = self.exchange(n)?;
+        let w = scan_word(&self.http.resp()[r.clone()], id).map_err(|e| self.scan_err(e, r))?;
+        let mut hi = 0usize;
+        while hi < 12 {
+            if w[hi] != 0 {
+                return Err(ArmErr::Scan(ScanErr::Malformed));
+            }
+            hi += 1;
+        }
+        let mut a = [0u8; 20];
+        // COPY: the 20 B address out of its 32 B ABI word, cold (boot /
+        // battery) — a ≤ 64 B POD returned by value — rejected: handing
+        // back the word (every caller wants the address).
+        a.copy_from_slice(&w[12..]);
+        Ok(a)
+    }
+
     /// The next block's base fee (`eth_feeHistory`).
     pub fn next_base_fee(&mut self) -> Result<u128, ArmErr> {
         let id = self.id();
-        let n = write_fee_history(&mut self.body, id).map_err(too_small)?;
+        let n = write_fee_history(self.http.body_mut(), id).map_err(too_small)?;
         let r = self.exchange(n)?;
-        scan_next_base_fee(&self.http.resp()[r], id).map_err(ArmErr::Scan)
+        scan_next_base_fee(&self.http.resp()[r.clone()], id).map_err(|e| self.scan_err(e, r))
     }
 
     /// Send one executor swap from wallet `w` (from [`Self::pick`]).
@@ -553,28 +624,7 @@ impl EvmArm {
             value,
             data,
         };
-        let id = self.id();
-        let sig = match tx_sign(&tx, &self.wallets[w].sk) {
-            Ok(s) => s,
-            Err(e) => return self.not_sent(w, ArmErr::Render(e)),
-        };
-        let hash = match tx_hash(&tx, &sig) {
-            Ok(h) => h,
-            Err(e) => return self.not_sent(w, ArmErr::Render(e)),
-        };
-        let n = match write_send_raw(&mut self.body, id, &tx, &sig) {
-            Ok(n) => n,
-            Err(e) => return self.not_sent(w, ArmErr::Render(e)),
-        };
-        let f = InFlight {
-            hash,
-            expect_to: *to,
-            sent_ns: now_ns,
-            nonce,
-            tag,
-            create: false,
-        };
-        self.post_send(w, id, n, f)
+        self.sign_and_post(w, &PreparedTx::call(&tx), *to, false, nonce, tag, now_ns)
     }
 
     /// Deploy `init_code` from wallet `w` (cold path — the executor's
@@ -610,28 +660,52 @@ impl EvmArm {
             value,
             init_code,
         };
+        let deployed = create_address(&self.wallets[w].addr, nonce);
+        self.sign_and_post(
+            w,
+            &PreparedTx::create(&tx),
+            deployed,
+            true,
+            nonce,
+            tag,
+            now_ns,
+        )
+    }
+
+    /// Sign the ONE encoding, hash it, render it into the body, record
+    /// the in-flight slot in place, post.
+    #[allow(clippy::too_many_arguments)]
+    fn sign_and_post(
+        &mut self,
+        w: usize,
+        p: &PreparedTx<'_>,
+        expect_to: [u8; 20],
+        create: bool,
+        nonce: u64,
+        tag: u64,
+        now_ns: u64,
+    ) -> SendOutcome {
         let id = self.id();
-        let sig = match create_sign(&tx, &self.wallets[w].sk) {
+        let sig = match p.sign(&self.wallets[w].sk) {
             Ok(s) => s,
             Err(e) => return self.not_sent(w, ArmErr::Render(e)),
         };
-        let hash = match create_hash(&tx, &sig) {
-            Ok(h) => h,
+        let st = match p.signed(&sig) {
+            Ok(st) => st,
             Err(e) => return self.not_sent(w, ArmErr::Render(e)),
         };
-        let n = match write_send_raw_create(&mut self.body, id, &tx, &sig) {
+        let n = match write_send_raw(self.http.body_mut(), id, &st) {
             Ok(n) => n,
             Err(e) => return self.not_sent(w, ArmErr::Render(e)),
         };
-        let f = InFlight {
-            hash,
-            expect_to: create_address(&self.wallets[w].addr, nonce),
-            sent_ns: now_ns,
-            nonce,
-            tag,
-            create: true,
-        };
-        self.post_send(w, id, n, f)
+        let f = &mut self.inflight[w];
+        f.hash = st.hash();
+        f.expect_to = expect_to;
+        f.sent_ns = now_ns;
+        f.nonce = nonce;
+        f.tag = tag;
+        f.create = create;
+        self.post_send(w, id, n)
     }
 
     fn not_sent(&mut self, w: usize, err: ArmErr) -> SendOutcome {
@@ -640,13 +714,11 @@ impl EvmArm {
         SendOutcome::NotSent { wallet: w, err }
     }
 
-    fn track(&mut self, w: usize, f: InFlight) {
-        self.inflight[w] = f;
-    }
-
-    /// Post a rendered send and act on the answer (module doc).
-    fn post_send(&mut self, w: usize, id: u64, n: usize, f: InFlight) -> SendOutcome {
+    /// Post a rendered send (its in-flight slot already recorded) and
+    /// act on the answer (module doc).
+    fn post_send(&mut self, w: usize, id: u64, n: usize) -> SendOutcome {
         self.counters.sends += 1;
+        let (hash, nonce) = (self.inflight[w].hash, self.inflight[w].nonce);
         let range = match self.exchange(n) {
             Ok(r) => r,
             Err(ArmErr::Post(p)) if !p.left_host => {
@@ -655,19 +727,18 @@ impl EvmArm {
             Err(_) => {
                 // Left the host (or a proxy answered non-200): the node
                 // may hold it. The local hash tracks it either way.
-                self.track(w, f);
                 self.counters.maybe_sent += 1;
                 return SendOutcome::MaybeSent {
                     wallet: w,
-                    nonce: f.nonce,
-                    hash: f.hash,
+                    nonce,
+                    hash,
                 };
             }
         };
         let verdict = {
             let resp = &self.http.resp()[range];
             match scan_hash(resp, id) {
-                Ok(h) if h == f.hash => Verdict::Accepted,
+                Ok(h) if h == hash => Verdict::Accepted,
                 Ok(_) => Verdict::Mismatch,
                 Err(ScanErr::Rpc(e)) => Verdict::Refused(classify_send_refusal(
                     &resp[e.message_start as usize..e.message_end as usize],
@@ -677,21 +748,19 @@ impl EvmArm {
         };
         match verdict {
             Verdict::Accepted | Verdict::Refused(SendRefusal::AlreadyKnown) => {
-                self.track(w, f);
                 self.counters.accepted += 1;
                 SendOutcome::Sent {
                     wallet: w,
-                    nonce: f.nonce,
-                    hash: f.hash,
+                    nonce,
+                    hash,
                 }
             }
             Verdict::Unreadable => {
-                self.track(w, f);
                 self.counters.maybe_sent += 1;
                 SendOutcome::MaybeSent {
                     wallet: w,
-                    nonce: f.nonce,
-                    hash: f.hash,
+                    nonce,
+                    hash,
                 }
             }
             Verdict::Mismatch => {
@@ -733,62 +802,66 @@ impl EvmArm {
         }
     }
 
-    /// Poll wallet `w`'s in-flight transaction for its receipt.
+    /// Poll wallet `w`'s in-flight transaction for its receipt. On
+    /// `Mined` the reconciled receipt is [`Self::last_receipt`].
     pub fn poll(&mut self, w: usize, now_ns: u64) -> PollOutcome {
         if w >= self.wallets.len() || self.nonces.state(w) != WalletState::InFlight {
             return PollOutcome::Idle;
         }
-        let f = self.inflight[w];
         let id = self.id();
-        let n = match write_receipt(&mut self.body, id, &f.hash) {
+        let n = match write_receipt(self.http.body_mut(), id, &self.inflight[w].hash) {
             Ok(n) => n,
             Err(e) => return PollOutcome::Err(too_small(e)),
         };
+        let f = &self.inflight[w];
+        let (tag, nonce) = (f.tag, f.nonce);
         let timed_out = now_ns.saturating_sub(f.sent_ns) > RECEIPT_TIMEOUT_NS;
         let got = match self.exchange(n) {
-            Ok(r) => scan_receipt(&self.http.resp()[r], id).map_err(ArmErr::Scan),
+            Ok(r) => scan_receipt(&self.http.resp()[r.clone()], id, &mut self.last_receipt)
+                .map_err(|e| self.scan_err(e, r)),
             Err(e) => Err(e),
         };
         match got {
-            Ok(Some(r)) => {
-                let from = self.wallets[w].addr;
+            Ok(true) => {
+                let f = &self.inflight[w];
+                let r = &self.last_receipt;
                 let to_ok = if f.create {
                     r.is_create && r.contract == f.expect_to
                 } else {
                     !r.is_create && r.to == f.expect_to
                 };
-                if r.tx_hash != f.hash || r.from != from || !to_ok {
+                if r.tx_hash != f.hash || r.from != self.wallets[w].addr || !to_ok {
                     self.nonces.quarantine(w);
                     self.halt(HaltCause::ReceiptMismatch);
                     return PollOutcome::Err(ArmErr::ReceiptMismatch);
                 }
+                let (ok, paid) = (
+                    r.status == 1,
+                    fee_paid_wei(r.gas_used, r.effective_gas_price),
+                );
                 self.nonces.mined(w);
-                if r.status == 1 {
+                if ok {
                     self.counters.mined_ok += 1;
                 } else {
                     self.counters.mined_reverted += 1;
                 }
-                self.counters.gas_paid_wei = self
-                    .counters
-                    .gas_paid_wei
-                    .saturating_add(fee_paid_wei(r.gas_used, r.effective_gas_price));
+                self.counters.gas_paid_wei = self.counters.gas_paid_wei.saturating_add(paid);
                 PollOutcome::Mined {
                     wallet: w,
-                    tag: f.tag,
-                    nonce: f.nonce,
-                    receipt: r,
+                    tag,
+                    nonce,
                 }
             }
-            Ok(None) | Err(_) if timed_out => {
+            Ok(false) | Err(_) if timed_out => {
                 self.nonces.quarantine(w);
                 self.counters.timeouts += 1;
                 PollOutcome::TimedOut {
                     wallet: w,
-                    tag: f.tag,
-                    nonce: f.nonce,
+                    tag,
+                    nonce,
                 }
             }
-            Ok(None) => PollOutcome::Pending,
+            Ok(false) => PollOutcome::Pending,
             Err(e) => PollOutcome::Err(e),
         }
     }

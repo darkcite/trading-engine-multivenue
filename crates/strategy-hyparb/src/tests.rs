@@ -460,33 +460,28 @@ fn a_submitted_decision_is_logged_for_the_write_path() {
     p.gas_coin = 0;
     let mut m = member_with(p);
     let mut c = ctx();
-    let mut out = [strategy_core::HyparbDecision::default(); 4];
-    assert_eq!(m.hyparb_decisions(0, &mut out), 0, "nothing decided yet");
+    assert_eq!(m.hyparb_decision_log().1, 0, "nothing decided yet");
     perp_at(&mut m, &mut c, 100);
     snapshot(&mut m, &mut c, POOL, 2, 2);
     assert_eq!(c.orders.len(), 1);
-    assert_eq!(m.hyparb_decisions(0, &mut out), 1);
-    let d = out[0];
+    let (log, newest) = m.hyparb_decision_log();
+    assert_eq!((log.len(), newest), (strategy_core::HYPARB_DECISION_LOG, 1));
+    let d = log[1];
     assert_eq!((d.seq, d.pool_sym, d.buy), (1, POOL, 1));
     assert_eq!(d.edge_usd_1e6, m.counters().pnl_predicted_usd_1e6);
     assert!(d.edge_usd_1e6 > 0 && d.notional_usd_1e6 > 0);
     let perp_mid = pool_mid() * 10_100 / 10_000;
     assert!((d.gas_px_usd_1e6 - perp_mid).abs() <= 1, "{d:?}");
-    assert_eq!(
-        m.hyparb_decisions(1, &mut out),
-        0,
-        "a reader past it sees nothing"
-    );
     // Without a gas coin the mid is unknown, never guessed.
     let (m2, _) = armed();
-    let mut one = [strategy_core::HyparbDecision::default(); 1];
-    assert_eq!(m2.hyparb_decisions(0, &mut one), 1);
-    assert_eq!(one[0].gas_px_usd_1e6, 0);
+    let (log2, newest2) = m2.hyparb_decision_log();
+    assert_eq!(newest2, 1);
+    assert_eq!(log2[1].gas_px_usd_1e6, 0);
 }
 
-/// The log is a ring of `HYPARB_DECISION_LOG`: a reader that fell
-/// behind resumes at the oldest kept decision (the seq gap is its count
-/// of the lost ones), and `out` bounds every copy.
+/// The log is a ring of `HYPARB_DECISION_LOG`, borrowed in place: the
+/// newest 64 are kept, each at `seq % 64`; an overwritten slot carries a
+/// newer `seq` — which is how a late reader tells the lost ones.
 #[test]
 fn the_decision_log_keeps_the_last_64_and_a_late_reader_sees_the_gap() {
     let mut m = member();
@@ -497,18 +492,20 @@ fn the_decision_log_keeps_the_last_64_and_a_late_reader_sees_the_gap() {
         m.record_decision(T0 + k as u64, POOL, k % 2 == 0, &q);
         k += 1;
     }
-    let mut out = [strategy_core::HyparbDecision::default(); 80];
-    assert_eq!(m.hyparb_decisions(0, &mut out), 64);
-    assert_eq!(
-        (out[0].seq, out[63].seq),
-        (7, 70),
-        "the oldest six are gone"
-    );
-    assert_eq!(out[63].edge_usd_1e6, 70);
-    assert_eq!(m.hyparb_decisions(68, &mut out), 2);
-    assert_eq!(m.hyparb_decisions(68, &mut out[..1]), 1, "bounded by out");
-    assert_eq!(out[0].seq, 69);
-    assert_eq!(m.hyparb_decisions(u64::MAX, &mut out), 0);
+    let (log, newest) = m.hyparb_decision_log();
+    assert_eq!((log.len(), newest), (64, 70));
+    assert_eq!((log[7].seq, log[6].seq), (7, 70), "slot 6 now holds 70");
+    assert_eq!(log[6].edge_usd_1e6, 70);
+    let mut s = 1u64;
+    while s <= 6 {
+        assert_ne!(log[(s % 64) as usize].seq, s, "seq {s} is gone");
+        s += 1;
+    }
+    let mut s = 7u64;
+    while s <= 70 {
+        assert_eq!(log[(s % 64) as usize].seq, s, "seq {s} is kept");
+        s += 1;
+    }
 }
 
 #[test]
@@ -1021,6 +1018,55 @@ fn funding_accrues_nothing_on_the_first_pass_or_a_backward_clock() {
     assert_eq!(m.counters().funding_earned_usd_1e6, 0);
     m.accrue_funding(T0 - 1);
     assert_eq!(m.counters().funding_earned_usd_1e6, 0);
+}
+
+#[test]
+fn a_hedge_book_that_dies_never_lifts_the_inventory_halt() {
+    let mut p = params();
+    p.inventory_cap_usd_1e6 = 100_000_000;
+    let mut m = member_with(p);
+    let mut c = ctx();
+    perp_at(&mut m, &mut c, 100);
+    snapshot(&mut m, &mut c, POOL, 2, 2);
+    let o = c.orders[0];
+    m.on_fill(
+        &Fill::new(c.now, POOL, Side::Bid, o.px, o.qty, o.client_oid),
+        &mut c,
+    );
+    assert!(m.is_halted());
+    let inv = m.inventory_1e6(0).expect("coin 0");
+    assert_ne!(inv, 0);
+    // The perp book goes stale: the coin has no usable mid. The
+    // exposure is valued at its last mid — still over half the cap —
+    // so the halt holds (it used to value it at $0 and lift).
+    let mid = pool_mid() * 101 / 100;
+    let mut t = bbo(PERP, mid - 1_000, mid + 1_000, 100_000_000, c.now);
+    t.flags = TICK_FLAG_STALE;
+    m.on_tick(&t, &mut c);
+    c.now += 1_000_000_000;
+    m.on_timer(c.now, &mut c);
+    assert!(
+        m.is_halted(),
+        "an unusable book does not make the exposure $0"
+    );
+}
+
+#[test]
+fn inventory_that_was_never_valued_halts_and_never_lifts_a_halt() {
+    let mut p = params();
+    p.inventory_cap_usd_1e6 = 100_000_000;
+    let mut m = member_with(p.clone());
+    m.halted = true;
+    m.coins[0].inventory_1e6 = 5_000_000;
+    m.coins[0].last_mid_1e6 = 0;
+    m.check_inventory();
+    assert!(m.is_halted(), "no mid ever: unvalued, the halt holds");
+    // …and sets it: an exposure of unknown size is under no cap.
+    let mut m = member_with(p);
+    m.coins[0].inventory_1e6 = 5_000_000;
+    m.check_inventory();
+    assert!(m.is_halted(), "unvalued inventory halts new arbs");
+    assert_eq!(m.counters().inventory_breaches, 1);
 }
 
 #[test]

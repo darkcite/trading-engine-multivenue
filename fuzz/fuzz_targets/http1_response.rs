@@ -2,7 +2,8 @@
 // Copyright 2026 Anton (darkcite)
 
 //! Fuzz target: arbitrary bytes → `core_net::http1::read_response` +
-//! `dechunk_in_place` + `write_get_request`.
+//! `dechunk_in_place` + `chunked_body` + `head_says_close` +
+//! `write_get_request`.
 //!
 //! Validates the HTTP/1.1 response scanner never panics, never reads
 //! past the end of `buf`, and yields offsets that are always in-bounds
@@ -73,6 +74,31 @@ fuzz_target!(|data: &[u8]| {
     let mut scratch = [0u8; 4096];
     scratch[..cap].copy_from_slice(&data[..cap]);
     let _ = core_net::dechunk_in_place(&mut scratch[..cap]);
+    // HYPARB H9: the span locator agrees with the dechunker on every
+    // input — same verdict, same payload — and stays in bounds.
+    let mut a = [0u8; 4096];
+    a[..cap].copy_from_slice(&data[..cap]);
+    let mut b = [0u8; 4096];
+    b[..cap].copy_from_slice(&data[..cap]);
+    match (
+        core_net::dechunk_in_place(&mut a[..cap]),
+        core_net::chunked_body(&mut b[..cap]),
+    ) {
+        (
+            core_net::DechunkResult::Complete { length },
+            core_net::ChunkedBody::Span { start, len },
+        ) => {
+            assert_eq!(length, len);
+            assert!(start + len <= cap);
+            assert_eq!(&a[..length], &b[start..start + len]);
+        }
+        (core_net::DechunkResult::Incomplete, core_net::ChunkedBody::Incomplete)
+        | (core_net::DechunkResult::Malformed, core_net::ChunkedBody::Malformed) => {}
+        (x, y) => panic!("dechunk {x:?} vs span {y:?}"),
+    }
+    if let core_net::HttpResult::Complete { header_end, .. } = core_net::read_response(data) {
+        let _ = core_net::head_says_close(&data[..header_end]);
+    }
 
     // --- Request serializer -------------------------------------
     // Splits the input into (host, path, user-agent) as a cheap way

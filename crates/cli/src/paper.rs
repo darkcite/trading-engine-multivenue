@@ -4089,6 +4089,10 @@ pub struct Observability {
     /// only) — **taken** by the engine loop, drained once per report
     /// period (O-H12: each paper AMM decision is shadowed on chain 998).
     pub hyparb_shadow: Option<crate::evm_testnet::ShadowTap>,
+    /// HYPARB H9: `mode = "testnet"` booted with the shadow DARK
+    /// (`evm_testnet::ShadowBootErr::Dark`) — published as
+    /// `engine_hyparb_evm_dark`.
+    pub hyparb_shadow_dark: bool,
 }
 
 /// XSD-3: the state writer's identity — the path, the table hash the
@@ -5782,10 +5786,14 @@ pub struct HyparbEvmMetricIds {
     pub counters: [core_metrics::CounterId; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()],
     /// In [`crate::evm_testnet::SHADOW_GAUGE_NAMES`] order.
     pub gauges: [core_metrics::GaugeId; crate::evm_testnet::SHADOW_GAUGE_NAMES.len()],
+    /// `engine_hyparb_evm_dark`: 1 when `mode = "testnet"` booted with the
+    /// shadow DARK (H9: the reason is the boot's ERROR line) — the one
+    /// level that exists without a shadow.
+    pub dark: core_metrics::GaugeId,
 }
 
-/// Register the shadow family: 18 counters, 4 gauges. UNCONDITIONAL — a
-/// paper boot exposes the rows at zero.
+/// Register the shadow family: 18 counters, 5 gauges (the shadow's 4 +
+/// `dark`). UNCONDITIONAL — a paper boot exposes the rows at zero.
 fn register_hyparb_evm_metrics(
     reg: &mut core_metrics::MetricsRegistry,
 ) -> Result<HyparbEvmMetricIds, &'static str> {
@@ -5806,17 +5814,26 @@ fn register_hyparb_evm_metrics(
             .map_err(|_| "register hyparb evm gauge")?;
         g += 1;
     }
-    Ok(HyparbEvmMetricIds { counters, gauges })
+    let dark = reg
+        .register_gauge("engine_hyparb_evm_dark")
+        .map_err(|_| "register hyparb evm dark gauge")?;
+    Ok(HyparbEvmMetricIds {
+        counters,
+        gauges,
+        dark,
+    })
 }
 
-/// Mirror the shadow's status (counters as deltas, gauges as levels).
-/// No shadow ⇒ nothing moves.
+/// Mirror the shadow's status (counters as deltas, gauges as levels) and
+/// the dark flag. No shadow ⇒ only `dark` moves.
 fn mirror_hyparb_evm_metrics(
     reg: &core_metrics::MetricsRegistry,
     ids: &HyparbEvmMetricIds,
     status: Option<&crate::evm_testnet::ShadowStatus>,
+    dark: bool,
     last: &mut [u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()],
 ) {
+    reg.gauge(ids.dark).set(i64::from(dark));
     let Some(st) = status else { return };
     let mut i = 0usize;
     while i < last.len() {
@@ -7300,6 +7317,7 @@ where
     let mut hyparb_last = strategy_core::HyparbCounters::default();
     // HYPARB H8: the testnet shadow's tap, owned by this thread from here.
     let mut hyparb_shadow = obs.hyparb_shadow.take();
+    let hyparb_shadow_dark = obs.hyparb_shadow_dark;
     let mut hyparb_evm_last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
@@ -7490,6 +7508,7 @@ where
                     hyparb_shadow
                         .as_ref()
                         .map(crate::evm_testnet::ShadowTap::status),
+                    hyparb_shadow_dark,
                     &mut hyparb_evm_last,
                 );
                 // X1: what the paper matcher did. `ioc_canceled` is the
@@ -10003,23 +10022,26 @@ mod tests {
     /// HYPARB H8: the shadow family's size is pinned too, and its mirror
     /// publishes deltas and levels — and nothing at all with no shadow.
     #[test]
-    fn the_hyparb_evm_family_is_18_counters_and_4_gauges_and_mirrors_deltas() {
+    fn the_hyparb_evm_family_is_18_counters_and_5_gauges_and_mirrors_deltas() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let (c0, g0) = (reg.counters_len(), reg.gauges_len());
         let ids = register_hyparb_evm_metrics(&mut reg).expect("register");
         assert_eq!(reg.counters_len() - c0, 18);
-        assert_eq!(reg.gauges_len() - g0, 4);
+        assert_eq!(reg.gauges_len() - g0, 5);
         assert!(
             register_hyparb_evm_metrics(&mut reg).is_err(),
             "names are unique"
         );
         let mut last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
-        mirror_hyparb_evm_metrics(&reg, &ids, None, &mut last);
+        mirror_hyparb_evm_metrics(&reg, &ids, None, false, &mut last);
         assert_eq!(
             reg.counter(ids.counters[0]).get(),
             0,
             "no shadow: nothing moves"
         );
+        assert_eq!(reg.gauge(ids.dark).get(), 0);
+        mirror_hyparb_evm_metrics(&reg, &ids, None, true, &mut last);
+        assert_eq!(reg.gauge(ids.dark).get(), 1, "a dark shadow is a level");
         use std::sync::atomic::{AtomicU64, Ordering};
         let st = crate::evm_testnet::ShadowStatus {
             counters: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -10027,9 +10049,9 @@ mod tests {
         };
         st.counters[5].store(3, Ordering::Relaxed);
         st.gauges[3].store(65_000_000, Ordering::Relaxed);
-        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), &mut last);
+        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), false, &mut last);
         st.counters[5].store(5, Ordering::Relaxed);
-        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), &mut last);
+        mirror_hyparb_evm_metrics(&reg, &ids, Some(&st), false, &mut last);
         assert_eq!(reg.counter(ids.counters[5]).get(), 5, "3 then +2");
         assert_eq!(reg.gauge(ids.gauges[3]).get(), 65_000_000);
     }

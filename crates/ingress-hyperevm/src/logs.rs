@@ -82,17 +82,19 @@ pub const SUBSCRIBED_TOPICS: [[u8; 32]; 5] = [
 ];
 
 /// Where a log sits on chain.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LogMeta {
-    /// Emitting contract.
-    pub address: [u8; 20],
     /// Block number.
     pub block: u64,
     /// Log index within the block.
     pub log_index: u64,
+    /// Emitting contract.
+    pub address: [u8; 20],
     /// `removed: true` — the node retracted the log (a reorg).
     pub removed: bool,
 }
+const _: () = assert!(core::mem::size_of::<LogMeta>() == 40);
 
 /// One decoded pool event.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -1880,7 +1880,8 @@ As §6 says, with these decisions recorded:
   `StrategyCounters::hyparb_decisions`). `cli::evm_testnet::ShadowTap`
   drains it on the engine thread once per report period into an SPSC
   ring (a gap is counted `lost`, a full ring `dropped`); the `evm-shadow`
-  thread sends ONE swap per decision through the executor on the
+  thread sends ONE swap per decision (H9: from wallet 0 only, one in
+  flight, a burst collapsing to its newest — §16.17) through the executor on the
   `[testnet] pool` — the decision's direction, `amount_raw` exact input,
   no price limit, `minOut = 1` — bidding G2 on the decision's own edge
   priced at its gas-coin mid (`[[coin]] name = "HYPE"` is required in
@@ -1893,7 +1894,9 @@ As §6 says, with these decisions recorded:
   and `exec_hyperevm::check_chains(read, write, --evm-hybrid)` decides;
   an unverifiable interlock refuses the boot (unlike an ingress outage,
   which only darkens the member — O-H15). `EVM_WRITE_PATH_LINKED` is
-  gone: the path is linked.
+  gone: the path is linked. **H9 R3 amends this (§16.17):** a VERIFIED
+  failure or a misconfiguration refuses; an unreachable endpoint or an
+  unfunded wallet 0 leaves the shadow DARK, which sends nothing.
 * **Keys (operator ruling 2026-09-23, "reuse the one we used for HL"):**
   `HYPEREVM_TESTNET_KEY`, else `HYPERLIQUID_TESTNET_AGENT_KEY` — never
   the mainnet agent key (pinned). Wallet 0 is that key; wallets 1..7 are
@@ -1940,3 +1943,175 @@ As §6 says, with these decisions recorded:
   (2); the key reader (1); the metrics family (1). Wrapper exercised
   under zsh against a stub binary (hybrid, testnet, EVM_HYBRID alone →
   78, EVM_HYBRID=yes → 78, the live line byte-identical).
+
+### 16.16 H8 live — the testnet battery (PENDING: wallet 0 unfunded)
+
+The code is gated; the live run waits on ONE operator action: testnet
+HYPE on HyperEVM (chain 998) for wallet 0 — the `HYPERLIQUID_TESTNET_AGENT_KEY`
+address, `0x4fae176f2961bfab3e3a71465b48c113efa0bfcd` (≈ 0.2 HYPE covers
+the deploy, the funding of wallets 1–2 and the battery). `status` on
+2026-09-23: chain 998 OK, every wallet `Unfunded`. Then, on the Mac,
+without stopping the armed engine (standalone verbs, pitfall 7):
+
+```sh
+H=target/hyparb-stage/hyparb-h8.toml          # a copy of the example, mode = "testnet", wallets = 3
+scripts/evm-testnet.sh status  --hyparb $H
+scripts/evm-testnet.sh fund    --hyparb $H --amount-wei 20000000000000000
+scripts/evm-testnet.sh deploy  --hyparb $H    # → set [testnet] executor
+scripts/evm-testnet.sh mint    --hyparb $H --token 0x87d7e58c6ebc80a2b61d3336972f5c909aff6851 \
+                               --amount-raw 1000000000000000000000000
+#   [testnet] pool = "0x7d03bc2f8b30b9ebe5ac3d473768af502ec43d29", amount_raw = 1000000000000000000
+scripts/evm-testnet.sh battery      --hyparb $H   # DONE(H8): (0) owner (a) (b) (c) (c2)
+scripts/evm-testnet.sh shadow-smoke --hyparb $H   # the engine's O-H12 path, read 999 / write 998
+```
+
+Record the battery and smoke lines here (headed as an exec battery,
+never a market result) in a follow-up commit.
+
+### 16.17 H9 — review fixes, gates (2026-09-23)
+
+The review's findings, fixed in this order (critical first):
+
+* **R4 — the executor is owner-only (CRITICAL).** `HyparbExecutor.swap`
+  reverts `NotOwner` for anyone but its deployer — wallet 0 — and the
+  shadow picked wallets round-robin: every swap from wallets 1.. would
+  have reverted, gas burnt. Now `SWAP_WALLET = 0` sends every swap; ONE
+  swap in flight; while it is, a burst of decisions collapses to its
+  newest (`engine_hyparb_evm_superseded_total`, which REPLACES H8's
+  `_no_wallet_total`). Boot reads `owner()` (`OWNER_SELECTOR`
+  `0x8da5cb5b`, `eth_call` via `rpc::write_call` / `scan_word`,
+  `EvmArm::owner_of`) and REFUSES an executor wallet 0 does not own or an
+  address with no code. The battery's (b) three-wallet and (c2)
+  ordering probes are now 0-value self-transfers (the nonce and fee
+  mechanics are the wallet's, not the call's); (a) and (c) stay swaps
+  from wallet 0, and a new line (0) prints the owner check. **For
+  mainnet** this is a contract decision: an allow-list or one executor
+  per wallet — under its own review.
+* **R3 — refuse vs dark.** `boot_shadow` returns
+  `ShadowBootErr::{Refuse, Dark}`; the bin aborts only on `Refuse`
+  (wrong chain verified, the O-H12 switch missing, a missing or
+  malformed key/URL, the owner check — incl. no contract at the
+  executor address) and on `Dark` (DNS, transport, a non-200, the
+  `-32005` throttle, an unreadable answer to a routine read, wallet 0
+  not `Ready`) logs at ERROR, sets `engine_hyparb_evm_dark = 1` and
+  boots with the shadow off.
+* **Slot 0 is never armed live** — `exec_boot::NEVER_LIVE_SLOTS`
+  (risk-policy "HYPARB — slot 0").
+* **`HttpsPost`, reworked** (`core-net`):
+  * ONE contiguous request written ONCE — `[pad | prefix | digits |
+    CRLFCRLF | body]`; the prefix (method, path, host, fixed headers) is
+    rendered at boot, the caller renders the body in place
+    (`body_mut()`, then `post(len)`), the only per-post render is the
+    length digits; the prefix moves (≤ 605 B `copy_within`) when the
+    body's digit count differs from the last request's (the arm: ~2 per
+    2 s while a swap is in flight — fixed-width `Content-Length` and
+    whitespace-padded bodies weighed and rejected in the module doc).
+    Measured: rustls seals every `write` into its own record and
+    allocates for it, so the old head + body pair cost two records per
+    request. `HttpsPost::dials()` counts handshakes.
+  * **A false `left_host`, closed:** a connection the answer closes
+    (`Connection: close`, `http1::head_says_close`, or the FIN with it)
+    is retired with the answer; one the server closed while idle is
+    caught by a one-byte non-blocking read before reuse, and the request
+    dials fresh with `left_host == false` (it used to be written into
+    the dead socket and booked `MaybeSent` — a wallet lost to the
+    receipt timeout). Both proven red-then-green on the loopback.
+  * A chunked body is assembled where its FIRST chunk lies
+    (`http1::chunked_body` → `ChunkedBody::Span`): a one-chunk body
+    moves nothing, a multi-chunk one moves only chunks 2.. (the
+    `copy_within`, now `COPY:`-marked — its baseline entry dropped).
+  * `EvmArm` renders every request into the client's window (its own
+    body buffer is gone; `ArmBootErr::BodyWindow` refuses a client
+    under `MAX_BODY`).
+* **`TlsTransport::read`'s `WouldBlock` allocated** — `io::Error::new(kind,
+  "no plaintext yet")`: 3 allocations at the end of EVERY drain loop on
+  every TLS socket in the engine since 2026-08-14 (every alloc gate
+  drives `TestTransport`, so none saw it). Now `io::Error::from(kind)`.
+  **Bench gate 72** runs `HttpsPost` against the testnode in a CHILD
+  process (the counting allocator is process-global) and pins the cycle
+  at EXACTLY 2 allocations/request — rustls' buffered API, one record
+  each way: measured 6 before H9, 8 with the old `WouldBlock` alone
+  reverted. Removing the residue is rustls' unbuffered API — a core-net
+  decision, recorded in risk-policy, not taken here.
+* **`signer-evm`: ONE encoding.** `PreparedTx::{call, create}` encodes
+  the fields once; `digest`, `sign`, `signed → SignedTx::{hash,
+  render_hex}` all read it (the free functions are wrappers).
+  `rpc::write_send_raw(&SignedTx)`; `scan_receipt` writes into caller
+  storage; `EvmArm::last_receipt()` after `PollOutcome::Mined`; the
+  in-flight slot is filled in place; the secp256k1 context is built at
+  `EvmArm::new`.
+* **`strategy-hyparb`:** unvalued inventory never lifts the entry halt
+  (a coin is valued at its last usable mid — `CoinRun::last_mid_1e6`);
+  `repr(C)` on `PoolRun`, `CoinRun`, `HedgeLeg`, `CoinTouch`; a snapshot
+  stages IN PLACE in its pool's map (`TickMap::{begin_stage, stage_slot,
+  commit_stage}` in `core-amm`, validating exactly as `load`) — the
+  32 KiB staging box and its copy per snapshot are gone. The optional
+  cap bound against `CAPS_BASE` is NOT done (deferred: the member's caps
+  are paper and pinned by the example's grammar).
+* **`ingress-hyperevm`:** `repr(C)` + size asserts on `Head` (32),
+  `LogMeta` (40, reordered), `Held` (56), `Call` (24, reordered),
+  `PoolSnap` (160, reordered), `PoolEntry` (28). The `#[cfg(test)]`
+  modules and test hooks moved to the files' ends — the copy audit stops
+  at the first `#[cfg(test)]`, so most of `run_loop.rs` and `snapshot.rs`
+  had never been audited. Then: the calldata renders straight into the
+  `eth_call` request (`write_eth_call` takes a renderer), the `to`
+  address and the ping payload are BORROWED (disjoint fields of the
+  driver; the stack copies were never needed), `token0()`/`token1()`
+  render lowercase straight from the word's digits
+  (`hex::word_addr_hex`). `logs.rs`' by-value returns (> 64 B) stay:
+  the ABI returns them through a hidden pointer the callee writes in
+  place — an out-param would change the spelling, not the bytes moved.
+* **`copy-audit.sh`** now covers `ingress-hyperevm`, `core-amm`,
+  `strategy-hyparb` and the FILE `crates/cli/src/evm_shadow.rs` by
+  default (all at 0 hits; the script now takes `.rs` files as well as
+  directories).
+* **The shadow's steady state is its own module** (second review):
+  `evm_testnet.rs`'s file-level `COPY-DOCTRINE:` opt-out covered the
+  engine thread's `ShadowTap::drain`; the tap, the worker, the counters
+  and `Hex` moved to `crates/cli/src/evm_shadow.rs` (no opt-out;
+  `evm_testnet` re-exports them). `drain` walks the member's log IN
+  PLACE — `StrategyCounters::hyparb_decision_log() -> (&[HyparbDecision],
+  newest_seq)` replaces the copying `hyparb_decisions(after, out)` —
+  moving each new decision straight into the ring; an overwritten slot
+  is counted lost.
+* **Fuzz finding (pre-existing, core-net):** `http1_response` (240 s,
+  Mac) crashed in `walk_chunks` — `chunk_data + size` overflowed on a
+  size near `usize::MAX`; in release it wrapped, passed the framing
+  check and aborted the process in the copy pass. Checked arithmetic
+  now: `Malformed` (`a_chunk_size_that_wraps_is_malformed_not_an_abort`).
+  Every chunked reader was exposed (`boot_http` since the first commit).
+* **Second review, the rest:** a throttle is `ArmErr::RateLimited`
+  (classified from the node error's message; `testnode.rate_limit`
+  scripts it) and boot reads it as dark; unvalued inventory now SETS
+  the entry halt as well as holding it; `engine_hyparb_evm_dark` (the
+  family is 18 counters + 5 gauges); doc bounds corrected (prefix
+  ≤ 605 B; "one TLS record" while ≤ 16 KiB; the reuse probe is one
+  `read(2)`).
+* **`exec-router`:** a pin that venue 8 (`HyperEvm`) is its own bit and
+  never aliases onto 0; the stale `12 & 7` comment fixed.
+* **Tests added:** `https_post_loopback` (6), `evm_shadow_loopback` (5 →
+  9: owner, dark ×2, throttle, burst), arm loopback (owner, throttle,
+  `BodyWindow`), `evm_shadow` (the tap in place + a full ring), `http1`
+  (`chunked_body` ×3 + a proptest against `dechunk_in_place`,
+  `head_says_close`), `core-amm` staging ≡ `load`, the member (2), exec
+  boot (1), exec-router (1), rpc (`write_call`/`scan_word`), hex (1);
+  fuzz: `http1_response` checks `chunked_body` against the dechunker,
+  `evm_exec_response` covers `scan_word`.
+* **Findings for OTHER lanes (reported, not changed):** `HlHttp` — the
+  armed E-lane's exchange client — has the same stale-keep-alive shape
+  (after an idle close its next `/exchange` post fails `left_host`,
+  counted `sent_unanswered`, the order lost to reconciliation) and
+  writes head and body as two TLS records; the `HttpsPost` fixes port
+  directly, under the E-lane's own review.
+
+**Mask flip (O-H8) — the operator's runbook, only after HZ, H8 live and
+H9 are green:** (1) the pre-flip gates at HEAD (§13); (2) `hyparb.toml`
+in `~/multivenue` with `mode = "paper"` and pools present in
+`universe.toml [hyperevm]` (the section is added ONLY after the lane
+merges to main); (3) `strategy.conf` → `STRATEGY=ai+vrp+xsd+bin15+hyparb`,
+nothing else changed (slot 0 stays paper — `exec.toml` never marks it
+live; the boot would refuse); (4) `scripts/exec-smoke.sh`, then restart
+through launchd; (5) verify `vm_rows_active ≥ 1` and the `hyparb`
+object on `/state` (`pools_live`, `halted = 0`) and that the live arm's
+tell (slot 3) is unchanged; (6) rollback = the previous `STRATEGY` line
+and a restart.

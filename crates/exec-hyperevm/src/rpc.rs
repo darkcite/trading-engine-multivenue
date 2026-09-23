@@ -21,9 +21,7 @@ use core_parse::{scan_i64, scan_u64, skip_json_value, skip_string, skip_ws, Pos}
 use ingress_hyperevm::hex::{hex_fixed, hex_quantity_u128};
 use ingress_hyperevm::rpc::RpcOut;
 use ingress_rpc::{RpcError, RpcWriteErr};
-use signer_evm::{
-    create_encode_signed_hex, tx_encode_signed_hex, Eip1559Create, Eip1559Tx, EvmTxErr,
-};
+use signer_evm::{EvmTxErr, SignedTx};
 
 /// Which state `eth_getTransactionCount` reads.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -102,39 +100,37 @@ pub fn write_receipt(dst: &mut [u8], id: u64, hash: &[u8; 32]) -> Result<usize, 
     Ok(o.len())
 }
 
+/// `eth_call({to, data}, "latest")` — a view read (cold: the boot's
+/// executor-owner check). `data` is binary, rendered as hex in place.
+pub fn write_call(
+    dst: &mut [u8],
+    id: u64,
+    to: &[u8; 20],
+    data: &[u8],
+) -> Result<usize, RpcWriteErr> {
+    let mut o = RpcOut::new(dst);
+    head(&mut o, id, b"eth_call")?;
+    o.put(br#"{"to":""#)?;
+    o.put_hex(to)?;
+    o.put(br#"","data":""#)?;
+    o.put_hex(data)?;
+    o.put(br#""},"latest"]}"#)?;
+    Ok(o.len())
+}
+
 #[inline(always)]
 fn too_small(_: RpcWriteErr) -> EvmTxErr {
     EvmTxErr::BufferTooSmall
 }
 
-/// `eth_sendRawTransaction` of a signed call, its hex rendered by the
-/// signer straight into the body.
-pub fn write_send_raw(
-    dst: &mut [u8],
-    id: u64,
-    tx: &Eip1559Tx<'_>,
-    sig: &[u8; 65],
-) -> Result<usize, EvmTxErr> {
+/// `eth_sendRawTransaction` of a signed transaction (call or creation),
+/// its hex rendered by the signer straight into the body — from the
+/// SAME encoding the digest and the hash were computed from.
+pub fn write_send_raw(dst: &mut [u8], id: u64, tx: &SignedTx<'_, '_>) -> Result<usize, EvmTxErr> {
     let mut o = RpcOut::new(dst);
     head(&mut o, id, b"eth_sendRawTransaction").map_err(too_small)?;
     o.put(b"\"").map_err(too_small)?;
-    let k = tx_encode_signed_hex(tx, sig, o.tail())?;
-    o.advance(k);
-    o.put(b"\"]}").map_err(too_small)?;
-    Ok(o.len())
-}
-
-/// [`write_send_raw`] of a signed contract creation.
-pub fn write_send_raw_create(
-    dst: &mut [u8],
-    id: u64,
-    tx: &Eip1559Create<'_>,
-    sig: &[u8; 65],
-) -> Result<usize, EvmTxErr> {
-    let mut o = RpcOut::new(dst);
-    head(&mut o, id, b"eth_sendRawTransaction").map_err(too_small)?;
-    o.put(b"\"").map_err(too_small)?;
-    let k = create_encode_signed_hex(tx, sig, o.tail())?;
+    let k = tx.render_hex(o.tail())?;
     o.advance(k);
     o.put(b"\"]}").map_err(too_small)?;
     Ok(o.len())
@@ -399,6 +395,12 @@ pub fn scan_hash(buf: &[u8], id: u64) -> Result<[u8; 32], ScanErr> {
     fixed::<32>(buf, result_of(buf, id)?).ok_or(ScanErr::Malformed)
 }
 
+/// ONE 32-byte ABI word (`eth_call` of a single-word view). Anything
+/// else — `"0x"` (no code at the address), a longer return — refuses.
+pub fn scan_word(buf: &[u8], id: u64) -> Result<[u8; 32], ScanErr> {
+    scan_hash(buf, id)
+}
+
 /// The next block's base fee: the LAST entry of `eth_feeHistory`'s
 /// `baseFeePerGas` (an empty or absent array refuses).
 pub fn scan_next_base_fee(buf: &[u8], id: u64) -> Result<u128, ScanErr> {
@@ -469,16 +471,9 @@ const R_CONTRACT: u16 = 128;
 const R_INDEX: u16 = 256;
 const R_REQUIRED: u16 = R_STATUS | R_BLOCK | R_GAS | R_PRICE | R_FROM | R_TO | R_HASH | R_INDEX;
 
-/// `eth_getTransactionReceipt`: `Ok(None)` while pending (`result:
-/// null`), the receipt once mined. Every required member must appear
-/// exactly once with its exact shape; `status` must be `0x0` or `0x1`.
-pub fn scan_receipt(buf: &[u8], id: u64) -> Result<Option<Receipt>, ScanErr> {
-    let r = result_of(buf, id)?;
-    if is_null(buf, r) {
-        return Ok(None);
-    }
-    let mut o = Obj::open(buf, r.0).ok_or(ScanErr::Malformed)?;
-    let mut rc = Receipt {
+impl Receipt {
+    /// All zero.
+    pub const ZERO: Self = Self {
         effective_gas_price: 0,
         block: 0,
         gas_used: 0,
@@ -490,6 +485,20 @@ pub fn scan_receipt(buf: &[u8], id: u64) -> Result<Option<Receipt>, ScanErr> {
         status: 0,
         is_create: false,
     };
+}
+
+/// `eth_getTransactionReceipt` into the caller's `rc`: `Ok(false)` while
+/// pending (`result: null`), `Ok(true)` once mined. Every required
+/// member must appear exactly once with its exact shape; `status` must
+/// be `0x0` or `0x1`. On anything but `Ok(true)` `rc` is unspecified —
+/// read it only after a `true`.
+pub fn scan_receipt(buf: &[u8], id: u64, rc: &mut Receipt) -> Result<bool, ScanErr> {
+    let r = result_of(buf, id)?;
+    if is_null(buf, r) {
+        return Ok(false);
+    }
+    let mut o = Obj::open(buf, r.0).ok_or(ScanErr::Malformed)?;
+    *rc = Receipt::ZERO;
     let mut seen: u16 = 0;
     loop {
         let m = match o.next() {
@@ -548,7 +557,7 @@ pub fn scan_receipt(buf: &[u8], id: u64) -> Result<Option<Receipt>, ScanErr> {
     if seen & R_REQUIRED != R_REQUIRED {
         return Err(ScanErr::Malformed);
     }
-    Ok(Some(rc))
+    Ok(true)
 }
 
 // ---------------------------------------------------------------
@@ -670,7 +679,41 @@ mod tests {
     }
 
     #[test]
+    fn a_view_call_renders_and_its_word_scans() {
+        let mut b = [0u8; 256];
+        let n = write_call(&mut b, 5, &[0xe7; 20], &[0x8d, 0xa5, 0xcb, 0x5b]).unwrap();
+        assert_eq!(
+            s(&b[..n]),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":5,"method":"eth_call","params":[{{"to":"0x{}","data":"0x8da5cb5b"}},"latest"]}}"#,
+                "e7".repeat(20)
+            )
+        );
+        assert!(write_call(&mut b[..n - 1], 5, &[0xe7; 20], &[0x8d, 0xa5, 0xcb, 0x5b]).is_err());
+        let word = format!(
+            r#"{{"jsonrpc":"2.0","id":5,"result":"0x{}{}"}}"#,
+            "00".repeat(12),
+            "4f".repeat(20)
+        );
+        let w = scan_word(word.as_bytes(), 5).unwrap();
+        assert_eq!((&w[..12], &w[12..]), (&[0u8; 12][..], &[0x4f; 20][..]));
+        assert_eq!(
+            scan_word(br#"{"jsonrpc":"2.0","id":5,"result":"0x"}"#, 5),
+            Err(ScanErr::Malformed),
+            "no code at the address"
+        );
+        assert!(matches!(
+            scan_word(
+                br#"{"jsonrpc":"2.0","id":5,"error":{"code":3,"message":"execution reverted"}}"#,
+                5
+            ),
+            Err(ScanErr::Rpc(_))
+        ));
+    }
+
+    #[test]
     fn a_signed_send_renders_the_signers_hex_in_place() {
+        use signer_evm::Eip1559Tx;
         let sk = signer_eip712::parse_secret_key(&[0x42; 32]).unwrap();
         let data = [0xa5u8; 164];
         let tx = Eip1559Tx {
@@ -686,8 +729,16 @@ mod tests {
         let sig = signer_evm::tx_sign(&tx, &sk).unwrap();
         let mut hexbuf = [0u8; 1024];
         let k = signer_evm::tx_encode_signed_hex(&tx, &sig, &mut hexbuf).unwrap();
+        let p = signer_evm::PreparedTx::call(&tx);
+        assert_eq!(
+            p.sign(&sk).unwrap(),
+            sig,
+            "one encoding, the same signature"
+        );
+        let st = p.signed(&sig).unwrap();
+        assert_eq!(st.hash(), signer_evm::tx_hash(&tx, &sig).unwrap());
         let mut b = [0u8; 1024];
-        let n = write_send_raw(&mut b, 9, &tx, &sig).unwrap();
+        let n = write_send_raw(&mut b, 9, &st).unwrap();
         assert_eq!(
             s(&b[..n]),
             format!(
@@ -696,15 +747,15 @@ mod tests {
             )
         );
         assert_eq!(
-            write_send_raw(&mut b[..n - 1], 9, &tx, &sig),
+            write_send_raw(&mut b[..n - 1], 9, &st),
             Err(EvmTxErr::BufferTooSmall)
         );
         assert_eq!(
-            write_send_raw(&mut b[..70], 9, &tx, &sig),
+            write_send_raw(&mut b[..70], 9, &st),
             Err(EvmTxErr::BufferTooSmall)
         );
         let init = [0x60u8, 0x00];
-        let c = Eip1559Create {
+        let c = signer_evm::Eip1559Create {
             chain_id: 998,
             nonce: 0,
             max_priority_fee_per_gas: 0,
@@ -713,14 +764,16 @@ mod tests {
             value: 0,
             init_code: &init,
         };
-        let cs = signer_evm::create_sign(&c, &sk).unwrap();
-        let n = write_send_raw_create(&mut b, 10, &c, &cs).unwrap();
+        let pc = signer_evm::PreparedTx::create(&c);
+        let cs = pc.sign(&sk).unwrap();
+        let n = write_send_raw(&mut b, 10, &pc.signed(&cs).unwrap()).unwrap();
         assert!(s(&b[..n]).contains(r#""params":["0x02"#));
     }
 
     #[test]
     fn a_real_receipt_is_read_from_its_top_level_only() {
-        let r = scan_receipt(RECEIPT, 1).unwrap().unwrap();
+        let mut r = Receipt::ZERO;
+        assert_eq!(scan_receipt(RECEIPT, 1, &mut r), Ok(true));
         assert_eq!(r.status, 1);
         assert_eq!(r.block, 0x3e05ee7);
         assert_eq!(r.gas_used, 0x70a5);
@@ -731,29 +784,33 @@ mod tests {
         assert_eq!(r.tx_hash[0], 0xa0);
         assert!(!r.is_create && r.contract == [0; 20]);
         assert_eq!(
-            scan_receipt(RECEIPT, 2),
+            scan_receipt(RECEIPT, 2, &mut r),
             Err(ScanErr::IdMismatch { got: 1 })
         );
         let pending = br#"{"jsonrpc":"2.0","id":8,"result":null}"#;
-        assert_eq!(scan_receipt(pending, 8), Ok(None));
+        assert_eq!(scan_receipt(pending, 8, &mut r), Ok(false));
     }
 
     #[test]
     fn a_receipt_missing_or_repeating_a_member_refuses() {
         let text = s(RECEIPT);
+        let mut r = Receipt::ZERO;
         let no_status = text.replace(r#""status":"0x1","#, "");
         assert_eq!(
-            scan_receipt(no_status.as_bytes(), 1),
+            scan_receipt(no_status.as_bytes(), 1, &mut r),
             Err(ScanErr::Malformed)
         );
         let twice = text.replace(
             r#""gasUsed":"0x70a5","#,
             r#""gasUsed":"0x70a5","gasUsed":"0x1","#,
         );
-        assert_eq!(scan_receipt(twice.as_bytes(), 1), Err(ScanErr::Malformed));
+        assert_eq!(
+            scan_receipt(twice.as_bytes(), 1, &mut r),
+            Err(ScanErr::Malformed)
+        );
         let bad_status = text.replace(r#""status":"0x1""#, r#""status":"0x2""#);
         assert_eq!(
-            scan_receipt(bad_status.as_bytes(), 1),
+            scan_receipt(bad_status.as_bytes(), 1, &mut r),
             Err(ScanErr::Malformed)
         );
         let short_from = text.replace(
@@ -761,15 +818,15 @@ mod tests {
             "0xeec1\",\"to",
         );
         assert_eq!(
-            scan_receipt(short_from.as_bytes(), 1),
+            scan_receipt(short_from.as_bytes(), 1, &mut r),
             Err(ScanErr::Malformed)
         );
         let create = text.replace(
             r#""to":"0xd3303d83422e93b840cceed9d5671f2427fae726","contractAddress":null"#,
             r#""to":null,"contractAddress":"0x1111111111111111111111111111111111111111""#,
         );
-        let c = scan_receipt(create.as_bytes(), 1).unwrap().unwrap();
-        assert!(c.is_create && c.contract == [0x11; 20] && c.to == [0; 20]);
+        assert_eq!(scan_receipt(create.as_bytes(), 1, &mut r), Ok(true));
+        assert!(r.is_create && r.contract == [0x11; 20] && r.to == [0; 20]);
     }
 
     #[test]
@@ -863,7 +920,8 @@ mod tests {
         /// prefix of a real one.
         #[test]
         fn scanners_are_total(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)) {
-            let _ = scan_receipt(&bytes, 1);
+            let mut rc = Receipt::ZERO;
+            let _ = scan_receipt(&bytes, 1, &mut rc);
             let _ = scan_quantity(&bytes, 1);
             let _ = scan_hash(&bytes, 1);
             let _ = scan_next_base_fee(&bytes, 1);
@@ -873,7 +931,8 @@ mod tests {
         #[test]
         fn a_truncated_receipt_never_scans_as_mined(cut in 0usize..1700) {
             let end = cut.min(RECEIPT.len() - 1);
-            proptest::prop_assert!(!matches!(scan_receipt(&RECEIPT[..end], 1), Ok(Some(_))));
+            let mut rc = Receipt::ZERO;
+            proptest::prop_assert!(scan_receipt(&RECEIPT[..end], 1, &mut rc) != Ok(true));
         }
     }
 }

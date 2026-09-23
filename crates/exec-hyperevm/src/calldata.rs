@@ -30,6 +30,13 @@ pub const MINT_SELECTOR: [u8; 4] = [0x40, 0xc1, 0x0f, 0x19];
 /// Selector + an address word + an amount word.
 pub const ADDR_AMOUNT_CALLDATA_LEN: usize = 4 + 2 * 32;
 
+/// `owner()` — the executor's immutable owner, the ONLY sender its
+/// `swap` accepts (`NotOwner` otherwise). Read at boot: an executor
+/// whose owner is not wallet 0 would revert every shadow swap (H9 R4).
+pub const OWNER_SIGNATURE: &str = "owner()";
+/// `keccak256(OWNER_SIGNATURE)[..4]`.
+pub const OWNER_SELECTOR: [u8; 4] = [0x8d, 0xa5, 0xcb, 0x5b];
+
 /// One executor swap. POD, passed by value across the arm's ring.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -194,6 +201,12 @@ mod tests {
             hex(&dst),
             "460985e80000000000000000000000006c9a33e3b592c0d65b3ba59355d5be0d38259285000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000014d1120d7b160000000000000000000000000000000012340102030405060708090a0b0c0d0e0f10000000000000000000000000000000000000000000000000000000003ade68b1"
         );
+    }
+
+    #[test]
+    fn the_owner_selector_is_its_signatures_keccak() {
+        let h = signer_eip712::keccak256(OWNER_SIGNATURE.as_bytes());
+        assert_eq!(h[..4], OWNER_SELECTOR);
     }
 
     #[test]

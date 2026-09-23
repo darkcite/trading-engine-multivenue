@@ -33,6 +33,7 @@ pub(crate) const TOUCH_MAX_AGE_NS: u64 = 10_000_000_000;
 const HOUR_NS: i128 = 3_600_000_000_000;
 
 /// One Hyperliquid book's top of book as the member keeps it.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CoinTouch {
     /// Best bid, USD × 1e6.

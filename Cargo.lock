@@ -159,6 +159,7 @@ dependencies = [
  "ingress-rpc",
  "opt-registry",
  "research-artifacts",
+ "rustls",
  "signer-eip712",
  "signer-evm",
  "strategy-ai-exec",

@@ -4129,8 +4129,12 @@ fn run(args: RunArgs) -> ExitCode {
             }
             // HYPARB H8: the EVM write path, TESTNET ONLY (O-H5) — the
             // shadow of each paper AMM decision (O-H12). The chain checks
-            // need the wire, so they run here; any failure refuses: an
-            // interlock that cannot be verified is not passed.
+            // need the wire, so they run here. H9 R3: a misconfiguration
+            // or a VERIFIED interlock failure refuses the boot; an
+            // endpoint that cannot be reached (transport, rate limit) or
+            // an unfunded wallet 0 leaves the shadow DARK — nothing is
+            // sent, so an interlock that could not be verified is still
+            // not passed, and the paper member (the P&L source) runs.
             match hyparb_boot
                 .as_ref()
                 .filter(|b| b.mode == core_config::hyparb::HyparbMode::Testnet)
@@ -4146,24 +4150,35 @@ fn run(args: RunArgs) -> ExitCode {
                         cfg.hyperevm_ws_host,
                         args.hyperevm_path.as_deref().unwrap_or("/")
                     );
-                    let booted = cli::evm_testnet::wallet_keys_from_env(t.wallets).and_then(|k| {
-                        cli::evm_testnet::boot_shadow(
-                            t,
-                            &k.keys,
-                            k.source,
-                            hb.params.gas_p99_usd_1e6,
-                            &read_url,
-                            args.evm_hybrid,
-                            tls_config.clone(),
-                        )
-                    });
+                    let booted = cli::evm_testnet::wallet_keys_from_env(t.wallets)
+                        .map_err(cli::evm_testnet::ShadowBootErr::Refuse)
+                        .and_then(|k| {
+                            cli::evm_testnet::boot_shadow(
+                                t,
+                                &k.keys,
+                                k.source,
+                                hb.params.gas_p99_usd_1e6,
+                                &read_url,
+                                args.evm_hybrid,
+                                tls_config.clone(),
+                            )
+                        });
                     match booted {
                         Ok(b) => {
                             warn!("{}", b.tell);
                             obs.hyparb_shadow = Some(b.tap);
                             handles.push(b.handle);
                         }
-                        Err(reason) => {
+                        Err(cli::evm_testnet::ShadowBootErr::Dark(reason)) => {
+                            obs.hyparb_shadow_dark = true;
+                            error!(
+                                reason,
+                                "hyparb: the EVM write path is DARK — no testnet shadow swap \
+                                 will be sent this run; the paper member runs (fix the reason \
+                                 and restart to arm it)"
+                            );
+                        }
+                        Err(cli::evm_testnet::ShadowBootErr::Refuse(reason)) => {
                             error!(reason, "hyparb: the EVM write path refused — boot aborted");
                             join_reverse(handles);
                             return ExitCode::from(1);

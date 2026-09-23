@@ -73,12 +73,27 @@ pub struct Node {
     pub default_accept: Option<([u8; 20], [u8; 20])>,
     /// Serve every accepted transaction's receipt at once.
     pub auto_mine: bool,
-    /// Answer with `Transfer-Encoding: chunked` (two chunks), as the
-    /// archive endpoint does.
-    pub chunked: bool,
+    /// Answer with `Transfer-Encoding: chunked` in this many chunks
+    /// (0 = `Content-Length`); the archive endpoint answers chunked.
+    pub chunked: u8,
+    /// contract → the address its `owner()` returns (`eth_call`).
+    pub owners: HashMap<[u8; 20], [u8; 20]>,
+    /// Hang up after this many answers on one connection (0 = never),
+    /// as an endpoint's idle or request-count limit does.
+    pub close_after: u32,
+    /// …after sleeping this long first (the idle close: the client has
+    /// already read the answer when the FIN arrives).
+    pub close_delay_ms: u64,
+    /// …and say so on the last answer (`Connection: close`).
+    pub announce_close: bool,
     pub txs: HashMap<[u8; 32], Tx>,
     /// Methods seen, in order.
     pub seen: Vec<String>,
+    /// Connections accepted.
+    pub conns: u32,
+    /// Answer the next `n` calls of `method` with the public endpoint's
+    /// throttle (`-32005 rate limited`), as it answers bursts.
+    pub rate_limit: Option<(&'static str, u32)>,
 }
 
 impl Node {
@@ -139,6 +154,14 @@ fn handle(node: &mut Node, req: &str) -> Reply {
     let id = field(req, "id").to_string();
     let method = field(req, "method").to_string();
     node.seen.push(method.clone());
+    if let Some((m, n)) = node.rate_limit {
+        if m == method && n > 0 {
+            node.rate_limit = Some((m, n - 1));
+            return Reply::Body(format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32005,"message":"rate limited"}}}}"#
+            ));
+        }
+    }
     let p = params(req);
     let result = |r: String| Reply::Body(format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{r}}}"#));
     let error = |m: &str| {
@@ -216,6 +239,15 @@ fn handle(node: &mut Node, req: &str) -> Reply {
                 }
             }
         }
+        "eth_call" => {
+            let to: [u8; 20] = unhex(field(req, "to")).try_into().unwrap();
+            assert_eq!(field(req, "data"), "0x8da5cb5b", "only owner() is scripted");
+            match node.owners.get(&to) {
+                Some(o) => result(format!("\"0x{}{}\"", "00".repeat(12), hex(o))),
+                // No code at the address: a call returns empty.
+                None => result("\"0x\"".to_string()),
+            }
+        }
         "eth_getTransactionReceipt" => {
             let h: [u8; 32] = unhex(&p[0]).try_into().unwrap();
             match node.txs.get(&h) {
@@ -280,6 +312,14 @@ pub struct Certs {
     key: PrivateKeyDer<'static>,
 }
 
+impl Certs {
+    /// The certificate, DER — what a client in ANOTHER process needs to
+    /// trust this identity (bench gate 72 runs the node in a child).
+    pub fn cert_der(&self) -> &[u8] {
+        self.cert.as_ref()
+    }
+}
+
 /// A fresh identity.
 pub fn certs() -> Certs {
     let c = generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
@@ -316,34 +356,65 @@ pub fn boot_with(node: Node, certs: &Certs) -> TestNode {
     thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(mut sock) = conn else { return };
+            shared.lock().unwrap().conns += 1;
             let mut tls = ServerConnection::new(server_cfg.clone()).expect("conn");
-            let mut stream = Stream::new(&mut tls, &mut sock);
-            while let Some(req) = read_request(&mut stream) {
-                let (reply, chunked) = {
+            let mut answered = 0u32;
+            loop {
+                let Some(req) = read_request(&mut Stream::new(&mut tls, &mut sock)) else {
+                    break;
+                };
+                let (reply, chunks, close_after, delay_ms, announce) = {
                     let mut n = shared.lock().unwrap();
-                    (handle(&mut n, &req), n.chunked)
+                    (
+                        handle(&mut n, &req),
+                        n.chunked,
+                        n.close_after,
+                        n.close_delay_ms,
+                        n.announce_close,
+                    )
+                };
+                answered += 1;
+                let last = close_after != 0 && answered >= close_after;
+                let conn_hdr = if last && announce {
+                    "close"
+                } else {
+                    "keep-alive"
                 };
                 match reply {
                     Reply::Body(body) => {
-                        let wire = if chunked {
-                            let (a, b) = body.split_at(body.len() / 2);
-                            format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n{:x}\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\n\r\n",
-                                a.len(),
-                                b.len()
-                            )
+                        let wire = if chunks > 0 {
+                            let mut w = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: {conn_hdr}\r\n\r\n"
+                            );
+                            let step = body.len().div_ceil(chunks as usize).max(1);
+                            let mut at = 0usize;
+                            while at < body.len() {
+                                let end = (at + step).min(body.len());
+                                w.push_str(&format!("{:x}\r\n{}\r\n", end - at, &body[at..end]));
+                                at = end;
+                            }
+                            w.push_str("0\r\n\r\n");
+                            w
                         } else {
                             format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {conn_hdr}\r\n\r\n{body}",
                                 body.len()
                             )
                         };
+                        let mut stream = Stream::new(&mut tls, &mut sock);
                         if stream.write_all(wire.as_bytes()).is_err() {
                             break;
                         }
                         let _ = stream.flush();
                     }
                     Reply::Hangup => break,
+                }
+                if last {
+                    thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    tls.send_close_notify();
+                    let _ = tls.write_tls(&mut sock);
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                    break;
                 }
             }
         }

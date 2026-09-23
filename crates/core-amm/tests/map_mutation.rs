@@ -242,3 +242,63 @@ fn pool_liquidity_moves_only_in_range() {
     );
     assert_eq!(s.liquidity, 150);
 }
+
+/// HYPARB H9: a snapshot staged IN PLACE (`begin_stage` / `stage_slot` /
+/// `commit_stage`) is the map `load` builds from the same nodes, and
+/// every refusal is `load`'s, leaving the map cleared.
+#[test]
+fn staging_in_place_is_load_without_the_copy() {
+    let nodes = [
+        TickNode::with_gross(-20, 7, 7).unwrap(),
+        TickNode::with_gross(0, 3, 9).unwrap(),
+        TickNode::with_gross(30, -10, 10).unwrap(),
+    ];
+    let mut loaded = TickMap::<4>::EMPTY;
+    loaded.load(&nodes, -100, 100, 10).unwrap();
+    let mut staged = TickMap::<4>::EMPTY;
+    staged.begin_stage();
+    let mut i = 0;
+    while i < nodes.len() {
+        *staged.stage_slot(i).expect("slot") = nodes[i];
+        i += 1;
+    }
+    assert!(
+        staged.is_empty() && !staged.has_coverage(),
+        "nothing adopted before the commit"
+    );
+    staged.commit_stage(nodes.len(), -100, 100, 10).unwrap();
+    assert_eq!(
+        (staged.nodes(), staged.lo_tick, staged.hi_tick),
+        (loaded.nodes(), loaded.lo_tick, loaded.hi_tick)
+    );
+    assert!(staged.stage_slot(4).is_none(), "past capacity");
+
+    // Each refusal matches load's and leaves the map cleared.
+    let cases: [(&[TickNode], i32, i32, i32); 5] = [
+        (&[nodes[1], nodes[0]], -100, 100, 10),
+        (&[nodes[0], nodes[0]], -100, 100, 10),
+        (&[nodes[2]], -100, 20, 10),
+        (&[nodes[0]], -105, 100, 10),
+        (&[nodes[0]], -100, 100, 0),
+    ];
+    let mut k = 0;
+    while k < cases.len() {
+        let (ns, lo, hi, sp) = cases[k];
+        let mut a = TickMap::<4>::EMPTY;
+        let want = a.load(ns, lo, hi, sp);
+        assert!(want.is_err(), "case {k}");
+        let mut b = TickMap::<4>::EMPTY;
+        b.load(&nodes, -100, 100, 10).unwrap();
+        b.begin_stage();
+        let mut j = 0;
+        while j < ns.len() {
+            *b.stage_slot(j).unwrap() = ns[j];
+            j += 1;
+        }
+        assert_eq!(b.commit_stage(ns.len(), lo, hi, sp), want, "case {k}");
+        assert!(b.is_empty() && !b.has_coverage(), "case {k}: cleared");
+        k += 1;
+    }
+    let mut c = TickMap::<4>::EMPTY;
+    assert_eq!(c.commit_stage(5, -100, 100, 10), Err(AmmError::TickMapFull));
+}

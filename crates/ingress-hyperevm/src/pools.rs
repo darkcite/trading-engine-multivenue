@@ -43,6 +43,7 @@ pub enum PoolTableErr {
 }
 
 /// One pool at boot: address, symbol, family, token decimals.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PoolEntry {
     /// Pool contract address.
@@ -57,6 +58,7 @@ pub struct PoolEntry {
     /// token1 `decimals()`.
     pub dec1: u8,
 }
+const _: () = assert!(core::mem::size_of::<PoolEntry>() == 28);
 
 /// Sorted, fixed-capacity pool table.
 pub struct PoolTable {

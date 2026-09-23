@@ -652,11 +652,50 @@ mod tests {
     fn a_wild_venue_byte_never_panics_and_never_allows() {
         let mut r = ExecRoute::all_paper();
         r.set_slot(3, ExecMode::Live, &[4], SlotCaps::none(), HaltLimits::none()).unwrap();
-        // Bit 4 is set; without the `venue_ok` term, venue 12
-        // (12 & 7 == 4) would alias onto it.
+        // Bit 4 is set; without the `venue_ok` term, venue 20
+        // (20 & 15 == 4) would alias onto it.
         for v in EXEC_VENUES..=255 {
             assert!(!r.venue_allowed(3, v), "venue byte {v} must fail closed");
         }
+    }
+
+    /// HYPARB H9 pin: venue 8 (`HyperEvm`, O-H11) is its OWN bit. Under
+    /// the old `u8` mask `mask >> (8 & 7)` read bit 0 — Polymarket's —
+    /// so a slot live on Polymarket would have "allowed" HyperEVM and a
+    /// slot live on HyperEVM would have allowed Polymarket.
+    #[test]
+    fn venue_8_is_its_own_bit_and_never_aliases_onto_venue_0() {
+        let hyperevm = core_types::VenueId::HyperEvm as u8;
+        assert_eq!(hyperevm, 8);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[0],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert!(r.venue_allowed(3, 0));
+        assert!(
+            !r.venue_allowed(3, hyperevm),
+            "venue 0 live does not allow venue 8"
+        );
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            3,
+            ExecMode::Live,
+            &[hyperevm],
+            SlotCaps::none(),
+            HaltLimits::none(),
+        )
+        .unwrap();
+        assert!(r.venue_allowed(3, hyperevm));
+        assert!(
+            !r.venue_allowed(3, 0),
+            "venue 8 live does not allow venue 0"
+        );
+        assert_eq!(r.venue_mask_at(3), Some(1 << 8));
     }
 
     #[test]

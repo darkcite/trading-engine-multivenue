@@ -308,11 +308,11 @@ impl Transport for TlsTransport {
                 // exactly like the pre-fix fill path.
                 Ok(0) => return Ok(0),
                 Ok(_) => pulled = true,
+                // `Error::from(kind)` — never `Error::new(kind, "…")`,
+                // which boxes a String and a Custom (3 allocations on
+                // EVERY drain loop's last read; HYPARB H9 finding).
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "no plaintext yet",
-                    ));
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
                 }
                 // Backpressure guard (buffer-full signal): nothing
                 // read this call, but the deframer may still hold
@@ -338,10 +338,7 @@ impl Transport for TlsTransport {
             // TLS record is in flight — wait for more bytes rather
             // than spinning.
             if !pulled {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "no plaintext yet",
-                ));
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
             }
         }
     }

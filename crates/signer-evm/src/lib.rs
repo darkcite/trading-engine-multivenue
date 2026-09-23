@@ -37,7 +37,7 @@ mod tx;
 pub use tx::{
     create_address, create_encode_signed_hex, create_hash, create_sign, create_signing_digest,
     signed_hex_len, tx_encode_signed_hex, tx_hash, tx_sign, tx_signing_digest, Eip1559Create,
-    Eip1559Tx, EvmTxErr,
+    Eip1559Tx, EvmTxErr, PreparedTx, SignedTx,
 };
 
 /// `v = recid + 27` (EIP-712 / legacy) → `y_parity ∈ {0, 1}` (EIP-1559).

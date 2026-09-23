@@ -43,8 +43,6 @@ pub mod pools;
 pub mod rpc;
 pub mod run_loop;
 pub mod snapshot;
-#[cfg(test)]
-mod testnode;
 
 pub use logs::{parse_log, payloads, LogErr, LogMeta, PoolLog, SUBSCRIBED_TOPICS};
 pub use pools::{PoolEntry, PoolFamily, PoolTable, PoolTableErr, HYPEREVM_MAX_POOLS};
@@ -54,6 +52,9 @@ pub use run_loop::{
     PENDING_CAP, RPC_POLL_NS, RX_BUF_SIZE, SIGNAL_SOURCE_HYPEREVM, SUB_CAP, TX_BUF_SIZE,
 };
 pub use snapshot::{
-    Call, ReadKind, SnapCounters, SnapErr, SnapState, Snapshotter, MAP_NODES, MAX_BITMAP_WORDS,
-    PROBE_DEPTH,
+    Call, ReadKind, SnapCounters, SnapErr, SnapState, Snapshotter, CALLDATA_MAX, MAP_NODES,
+    MAX_BITMAP_WORDS, PROBE_DEPTH,
 };
+
+#[cfg(test)]
+mod testnode;

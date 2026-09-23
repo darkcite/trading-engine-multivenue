@@ -8297,12 +8297,13 @@ fn hyparb_member_decision_hedge_and_timer_are_zero_alloc() {
 /// Per testnet send the arm thread encodes the executor calldata into a
 /// stack array, bids gas, claims a nonce, signs, hashes, renders the
 /// `eth_sendRawTransaction` body in place, and scans the node's answer;
-/// per poll it renders the receipt request and scans the receipt (whose
-/// logs are walked, not searched); per block it scans the fee history.
-/// `HttpsPost::post` itself cannot run here (a loopback server thread
-/// would allocate under the process-global counter); the TLS loopback
-/// test covers it, as gate 58 does for `HlHttp`. All of this must be
-/// 0 B/op — the body buffer is allocated once at boot, outside the guard.
+/// per poll it renders the receipt request and scans the receipt into
+/// caller storage (its logs walked, not searched); per block it scans
+/// the fee history. The transaction is encoded ONCE (`PreparedTx`) and
+/// signed, hashed and rendered from that encoding. `HttpsPost::post`
+/// itself is gate 72 (its server in a child process). All of this must
+/// be 0 B/op — the body buffer is allocated once at boot, outside the
+/// guard.
 #[test]
 fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
     use exec_hyperevm::calldata::{encode_swap, SwapCall, SWAP_CALLDATA_LEN};
@@ -8312,9 +8313,10 @@ fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
         classify_send_refusal, scan_hash, scan_next_base_fee, scan_receipt, write_receipt,
         write_send_raw,
     };
-    use signer_evm::{tx_hash, tx_sign, Eip1559Tx};
+    use signer_evm::{tx_sign, Eip1559Tx, PreparedTx};
 
     let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 71 key");
+    let mut rc = exec_hyperevm::rpc::Receipt::ZERO;
     let mut body = vec![0u8; exec_hyperevm::arm::MAX_BODY];
     let receipt = br#"{"jsonrpc":"2.0","id":7,"result":{"type":"0x2","status":"0x1","logs":[{"address":"0xd3303d83422e93b840cceed9d5671f2427fae726","topics":["0xe5451a8402e365c27dd14a967e40e72c37559b904cb33b29b9c2ee04a10d3d94"],"data":"0x01","blockNumber":"0x3e05ee7","transactionHash":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7","logIndex":"0x0","removed":false}],"transactionHash":"0xa0f288ad8674b31c431269cdfa13cc2db0a448d751e46c4cd4f729730f9a8cf7","transactionIndex":"0x0","blockNumber":"0x3e05ee7","gasUsed":"0x70a5","effectiveGasPrice":"0x5f5e100","from":"0xeec1f3fcca6b05a7c9f05521f8dd9080e5edac14","to":"0xd3303d83422e93b840cceed9d5671f2427fae726","contractAddress":null}}"#;
     let fees = br#"{"jsonrpc":"2.0","id":8,"result":{"baseFeePerGas":["0x5f5e100","0x54f2d51"],"gasUsedRatio":[0.08],"oldestBlock":"0x3e05ed3"}}"#;
@@ -8375,9 +8377,11 @@ fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
             value: 0,
             data: &cd,
         };
-        let sig = tx_sign(&tx, &sk).expect("gate 71 sign");
-        let h = tx_hash(&tx, &sig).expect("gate 71 hash");
-        let k = write_send_raw(&mut body, 9, &tx, &sig).expect("gate 71 render");
+        let prepared = PreparedTx::call(&tx);
+        let sig = prepared.sign(&sk).expect("gate 71 sign");
+        let st = prepared.signed(&sig).expect("gate 71 attach");
+        let h = st.hash();
+        let k = write_send_raw(&mut body, 9, &st).expect("gate 71 render");
         let got = scan_hash(answer, 9).expect("gate 71 answer");
         if let Err(exec_hyperevm::rpc::ScanErr::Rpc(e)) = scan_hash(refused, 9) {
             let why =
@@ -8385,9 +8389,10 @@ fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
             acc = acc.wrapping_add(why as u64);
         }
         let r = write_receipt(&mut body, 7, &h).expect("gate 71 receipt req");
-        let rc = scan_receipt(receipt, 7)
-            .expect("gate 71 receipt")
-            .expect("mined");
+        assert!(
+            scan_receipt(receipt, 7, &mut rc).expect("gate 71 receipt"),
+            "mined"
+        );
         let fee = scan_next_base_fee(fees, 8).expect("gate 71 fees");
         nonces.mined(wallet);
         acc = acc
@@ -8407,5 +8412,126 @@ fn evm_arm_encode_bid_nonce_render_and_scan_are_zero_alloc() {
     assert_eq!(
         bytes, 0,
         "exec-hyperevm hot bytes should be zero: saw {bytes}"
+    );
+}
+
+/// Gate 72's server half: runs ONLY in the child process gate 72 spawns
+/// (it is `#[ignore]`d, and a no-op without `GATE72_NODE_DIR`). Boots
+/// the rustls `testnode`, writes its port and certificate for the
+/// parent, and serves until the parent kills it (or 120 s pass).
+#[test]
+#[ignore = "gate 72's child process; never run on its own"]
+fn gate72_node_helper() {
+    let Some(dir) = std::env::var_os("GATE72_NODE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let certs = exec_hyperevm::testnode::certs();
+    let n = exec_hyperevm::testnode::boot_with(
+        exec_hyperevm::testnode::Node {
+            chain_id: 998,
+            ..exec_hyperevm::testnode::Node::default()
+        },
+        &certs,
+    );
+    std::fs::write(dir.join("cert.der"), certs.cert_der()).expect("gate 72 cert");
+    // The port last: its presence says the rest is written.
+    std::fs::write(dir.join("port.tmp"), n.port.to_string()).expect("gate 72 port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 72 port");
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+
+/// **HYPARB gate 72 (H9) — the write arm's HTTPS keep-alive cycle, as
+/// allocations per request.**
+///
+/// Not 0 B/op, and pinned anyway: rustls 0.23's BUFFERED API allocates
+/// one `Vec` per TLS record it seals (each `write` call) and one per
+/// application-data record it decrypts — measured 2026-09-23. What this
+/// gate owns is everything ELSE: `HttpsPost` renders the request as ONE
+/// contiguous slice written ONCE (one record), reads in place, and the
+/// transport's `WouldBlock` is `io::Error::from(kind)` (it was
+/// `Error::new(kind, "…")`: three allocations on EVERY drain loop's last
+/// read, in every TLS ingress thread). Measured before H9: 6
+/// allocations/post; after: exactly 2 — rustls' residue. A regression in
+/// our code shows as a third. Removing the residue needs rustls'
+/// unbuffered API (`UnbufferedClientConnection`) — a core-net transport
+/// decision, recorded, not taken here.
+///
+/// The server runs in a CHILD process (this binary's
+/// [`gate72_node_helper`]): the counting allocator is process-global, so
+/// a server thread here would count its own allocations.
+#[test]
+fn https_post_keep_alive_cycle_allocates_only_rustls_record_buffers() {
+    const POSTS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_POST: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate72-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 72 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 72 exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 72 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 72 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 72: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 72 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 72 anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let mut h = core_net::HttpsPost::new("localhost", port, "/evm", cfg, 8192, 16 * 1024)
+        .expect("gate 72 client");
+    let n = exec_hyperevm::rpc::write_chain_id(h.body_mut(), 1).expect("gate 72 body");
+    let mut i = 0;
+    while i < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        let (status, _) = h.post(n).expect("gate 72 warm-up");
+        assert_eq!(status, 200);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < POSTS {
+        let (status, r) = h.post(n).expect("gate 72 post");
+        acc = acc.wrapping_add(u64::from(status) + (r.end - r.start) as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(h.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(h.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_POST * POSTS,
+        "HttpsPost cycle: {allocs} allocations ({bytes} B) over {POSTS} posts — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_POST}/post (one sealed record \
+         out, one decrypted record in); anything above is ours"
     );
 }

@@ -42,8 +42,8 @@
 //!
 //! ## Doctrine
 //!
-//! Boot allocates the tick maps (one box, ~4 MiB) and the snapshot
-//! staging buffer; no callback allocates. No floats. No `unsafe`.
+//! Boot allocates the tick maps (one box, ~4 MiB; a snapshot stages in
+//! place in its pool's map); no callback allocates. No floats. No `unsafe`.
 //! Every callback opens with the configured check (the bin15 convention).
 
 #![forbid(unsafe_code)]
@@ -52,7 +52,7 @@
 mod hedge;
 mod pools;
 
-use core_amm::{ArbParams, ArbQuote, ArbSide, TickMap, TickNode, ARB_FLAG_SIZE_CAPPED};
+use core_amm::{ArbParams, ArbQuote, ArbSide, TickMap, ARB_FLAG_SIZE_CAPPED};
 use core_types::{
     ChannelEvent, ChannelId, Fill, NsTs, Order, Price, Qty, Side, Signal, SignalSource, SymbolId,
     Tick, VenueId, SYMBOL_ID_NONE,
@@ -282,6 +282,7 @@ impl HyparbParams {
 }
 
 /// Per-pool member state beside the book.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct PoolRun {
     /// Book slot of this pool (`amm_pool_index(sym)`).
@@ -322,6 +323,7 @@ const POOL_RUN_NONE: PoolRun = PoolRun {
 };
 
 /// Per-coin member state.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct CoinRun {
     perp: CoinTouch,
@@ -340,6 +342,9 @@ struct CoinRun {
     last_cost_bps_1e6: [i64; 2],
     /// Net perp position the hedge fills built, coin × 1e6, signed.
     perp_pos_1e6: i64,
+    /// The last usable USD mid, ×1e6 (0 = never had one): what the
+    /// inventory check values this coin at while its books are unusable.
+    last_mid_1e6: i64,
 }
 
 const COIN_RUN_NONE: CoinRun = CoinRun {
@@ -352,12 +357,14 @@ const COIN_RUN_NONE: CoinRun = CoinRun {
     last_venue: [HedgeVenue::None; 2],
     last_cost_bps_1e6: [0; 2],
     perp_pos_1e6: 0,
+    last_mid_1e6: 0,
 };
 
 /// The snapshot being staged (one pool at a time — the ingress emits each
-/// pool's `SNAPSHOT · TICK… · STATE` contiguously).
+/// pool's `SNAPSHOT · TICK… · STATE` contiguously). The nodes are staged
+/// IN PLACE in the pool's own map (`TickMap::begin_stage`, H9 — no
+/// staging box, no copy); this holds only the bookkeeping.
 struct Staging {
-    nodes: Box<[TickNode; MAP_NODES]>,
     n: usize,
     expect: usize,
     /// Member pool index, `usize::MAX` = none.
@@ -415,7 +422,7 @@ impl core::fmt::Debug for HyparbStrategy {
 
 impl HyparbStrategy {
     /// An unconfigured member. Boot only: allocates the tick maps (one
-    /// box) and the staging buffer.
+    /// box).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -424,10 +431,6 @@ impl HyparbStrategy {
             book: core_fill::AmmBook::new(),
             maps: vec![TickMap::<MAP_NODES>::EMPTY; HYPARB_MAX_POOLS].into_boxed_slice(),
             staging: Staging {
-                nodes: vec![TickNode::ZERO; MAP_NODES]
-                    .into_boxed_slice()
-                    .try_into()
-                    .expect("MAP_NODES nodes"),
                 n: 0,
                 expect: 0,
                 pool: usize::MAX,
@@ -889,6 +892,7 @@ impl HyparbStrategy {
 /// One side of the hedge a decision assumes: the fee-folded price, the raw
 /// touch price the IoC will be limited to, the venue, and the book's depth
 /// on that side in USD.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HedgeLeg {
     /// Fee-folded USD price ×1e6 (a sell's is lowered, a buy's raised).
@@ -1026,23 +1030,33 @@ impl HyparbStrategy {
     }
 
     /// Unhedged notional across coins vs the cap; a breach halts new arbs
-    /// until it is back under half the cap.
+    /// until it is back under half the cap. A coin whose books are
+    /// unusable is valued at its last usable mid; inventory in a coin
+    /// that never had a mid cannot be valued, and unvalued inventory
+    /// HALTS and never releases a halt — an exposure of unknown size is
+    /// not under any cap (H9: it used to count as $0, so a dead hedge
+    /// book could lift the entry gate with the exposure still on).
     fn check_inventory(&mut self) {
         let mut total = 0i64;
+        let mut unvalued = false;
         let mut c = 0usize;
         while c < self.params.n_coins {
+            if let Some(m) = self.usd_mid_1e6(c as u8) {
+                self.coins[c].last_mid_1e6 = m;
+            }
             let inv = self.coins[c].inventory_1e6;
             if inv != 0 {
-                let px = self.usd_mid_1e6(c as u8).unwrap_or(0);
+                let px = self.coins[c].last_mid_1e6;
+                unvalued |= px <= 0;
                 total = total.saturating_add(mul_div_i64(inv.unsigned_abs() as i64, px, E6));
             }
             c += 1;
         }
         let cap = self.params.inventory_cap_usd_1e6;
-        if !self.halted && total > cap {
+        if !self.halted && (total > cap || unvalued) {
             self.halted = true;
             self.counters.inventory_breaches = self.counters.inventory_breaches.wrapping_add(1);
-        } else if self.halted && total <= cap / 2 {
+        } else if self.halted && total <= cap / 2 && !unvalued {
             self.halted = false;
         }
         self.counters.halted = u64::from(self.halted);
@@ -1134,20 +1148,9 @@ impl StrategyCounters for HyparbStrategy {
         }
     }
 
-    fn hyparb_decisions(&self, after: u64, out: &mut [HyparbDecision]) -> u32 {
-        let oldest = self
-            .decision_seq
-            .saturating_sub(HYPARB_DECISION_LOG as u64 - 1)
-            .max(1);
-        let first = after.saturating_add(1);
-        let mut seq = if first > oldest { first } else { oldest };
-        let mut n = 0usize;
-        while seq <= self.decision_seq && n < out.len() {
-            out[n] = self.decisions[(seq % HYPARB_DECISION_LOG as u64) as usize];
-            n += 1;
-            seq += 1;
-        }
-        n as u32
+    #[inline]
+    fn hyparb_decision_log(&self) -> (&[HyparbDecision], u64) {
+        (&self.decisions[..], self.decision_seq)
     }
 
     fn hyparb_coins_view(&self, out: &mut [HyparbCoinView]) -> u32 {

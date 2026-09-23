@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use exec_hyperevm::arm::{EvmArm, HaltCause, PollOutcome, SendOutcome, MAX_RESP};
+use exec_hyperevm::arm::{EvmArm, HaltCause, PollOutcome, SendOutcome, MAX_BODY, MAX_RESP};
 use exec_hyperevm::calldata::SwapCall;
 use exec_hyperevm::gas::GasBid;
 use exec_hyperevm::nonce::WalletState;
@@ -73,7 +73,8 @@ fn node(n_wallets: u8) -> Node {
 }
 
 fn arm(port: u16, cfg: Arc<ClientConfig>, n_wallets: u8) -> EvmArm {
-    let http = core_net::HttpsPost::new("localhost", port, "/evm", cfg, MAX_RESP).expect("http");
+    let http =
+        core_net::HttpsPost::new("localhost", port, "/evm", cfg, MAX_BODY, MAX_RESP).expect("http");
     let keys: Vec<_> = (0..n_wallets).map(key).collect();
     EvmArm::new(http, Network::Testnet, &keys).expect("arm")
 }
@@ -125,15 +126,10 @@ fn a_swap_is_signed_sent_reconciled_and_mined() {
     assert_eq!(a.poll(0, 6 * S), PollOutcome::Pending);
     assert_eq!(a.pick(), None, "one in flight per wallet");
     node.lock().unwrap().mine_all();
-    let PollOutcome::Mined {
-        tag,
-        nonce,
-        receipt,
-        ..
-    } = a.poll(0, 7 * S)
-    else {
+    let PollOutcome::Mined { tag, nonce, .. } = a.poll(0, 7 * S) else {
         panic!("mined");
     };
+    let receipt = *a.last_receipt();
     assert_eq!((tag, nonce), (42, 0));
     assert_eq!(
         receipt.block, 1000,
@@ -364,9 +360,10 @@ fn a_creation_reconciles_its_deployed_address() {
     let out = a.send_create(0, 0, &init, 100_000, BID, 7, S);
     assert!(matches!(out, SendOutcome::Sent { nonce: 0, .. }), "{out:?}");
     node.lock().unwrap().mine_all();
-    let PollOutcome::Mined { receipt, .. } = a.poll(0, 2 * S) else {
+    let PollOutcome::Mined { .. } = a.poll(0, 2 * S) else {
         panic!("mined");
     };
+    let receipt = *a.last_receipt();
     assert!(receipt.is_create);
     assert_eq!(receipt.contract, deployed);
 }
@@ -434,7 +431,7 @@ fn nonce_and_funds_refusals_park_the_wallet_until_a_sync() {
 #[test]
 fn boot_refuses_no_keys_too_many_and_duplicates() {
     let cfg = core_net::TlsTransport::default_client_config();
-    let mk = || core_net::HttpsPost::new("127.0.0.1", 1, "/", cfg.clone(), 64).unwrap();
+    let mk = || core_net::HttpsPost::new("127.0.0.1", 1, "/", cfg.clone(), MAX_BODY, 64).unwrap();
     let e = |r: Result<EvmArm, exec_hyperevm::arm::ArmBootErr>| r.err().unwrap();
     use exec_hyperevm::arm::ArmBootErr;
     assert_eq!(
@@ -455,4 +452,41 @@ fn boot_refuses_no_keys_too_many_and_duplicates() {
         e(EvmArm::new(mk(), Network::Testnet, &[zero])),
         ArmBootErr::BadKey
     );
+    let small =
+        core_net::HttpsPost::new("127.0.0.1", 1, "/", cfg.clone(), MAX_BODY - 1, 64).unwrap();
+    assert_eq!(
+        e(EvmArm::new(small, Network::Testnet, &[key(1)])),
+        ArmBootErr::BodyWindow,
+        "a creation's body must fit the client's window"
+    );
+}
+
+#[test]
+fn the_executor_owner_is_read_and_a_contractless_address_refuses() {
+    let mut n = node(1);
+    n.owners.insert(EXECUTOR, addr(0));
+    let (port, cfg, _node) = boot_node(n);
+    let mut a = arm(port, cfg, 1);
+    assert_eq!(a.owner_of(&EXECUTOR).expect("owner()"), addr(0));
+    assert!(
+        matches!(
+            a.owner_of(&[0x99; 20]),
+            Err(exec_hyperevm::arm::ArmErr::Scan(_))
+        ),
+        "no code at the address: `0x` is not an owner"
+    );
+}
+
+#[test]
+fn a_throttle_is_rate_limited_not_an_unreadable_answer() {
+    let mut n = node(1);
+    n.owners.insert(EXECUTOR, addr(0));
+    n.rate_limit = Some(("eth_call", 1));
+    let (port, cfg, _node) = boot_node(n);
+    let mut a = arm(port, cfg, 1);
+    assert_eq!(
+        a.owner_of(&EXECUTOR),
+        Err(exec_hyperevm::arm::ArmErr::RateLimited)
+    );
+    assert_eq!(a.owner_of(&EXECUTOR).expect("the retry"), addr(0));
 }

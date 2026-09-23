@@ -6,6 +6,52 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — `engine_hyparb_evm_no_wallet_total` → `_superseded_total`, `engine_hyparb_evm_dark`; the shadow boots DARK instead of refusing; slot 0 can never be armed live (HYPARB H9)
+
+**What changed**
+
+- **Metric renamed:** `engine_hyparb_evm_no_wallet_total` is now
+  `engine_hyparb_evm_superseded_total` — decisions replaced by a newer
+  one while the shadow's single swap was in flight (wallet 0 only; the
+  executor accepts its owner alone). Same position in the family; the
+  series never left a testnet boot.
+- **Boot:** in `mode = "testnet"`, an unreachable endpoint (transport,
+  DNS, a non-200 such as a rate limit) or an unfunded wallet 0 no longer
+  aborts the engine — the shadow stays DARK (ERROR log, nothing sent) and
+  the paper member runs. A verified wrong chain, a 999 read without
+  `--evm-hybrid`, a bad key/URL, or an executor wallet 0 does not own
+  (boot reads `owner()`) still refuses.
+- **`exec.toml`:** a live slot 0 (`hyparb`) refuses the boot
+  (`exec_boot::NEVER_LIVE_SLOTS`).
+- **`evm-testnet battery`:** (b) and (c2) are self-transfers from
+  wallets 0..2; a new line (0) prints the executor-owner check.
+- **`scripts/copy-audit.sh`** also audits `ingress-hyperevm`,
+  `core-amm` and `strategy-hyparb` by default; the baseline lost one
+  paid entry (`http1.rs`'s `copy_within`, now marked).
+- `.env.example` documents `HYPEREVM_TESTNET_KEY` (and that the E3
+  gate's testnet agent key is its fallback).
+- **New gauge `engine_hyparb_evm_dark`** (registered unconditionally,
+  0 on every paper boot): 1 when `mode = "testnet"` booted with the
+  shadow dark. The family is 18 counters + 5 gauges.
+- **Internal API:** `StrategyCounters::hyparb_decisions(after, out)` is
+  replaced by `hyparb_decision_log() -> (&[HyparbDecision], u64)` (the
+  log borrowed in place); the shadow's steady state moved to
+  `cli::evm_shadow` (`cli::evm_testnet` re-exports it).
+
+**Impact**
+
+- `/metrics`: one series renamed and one gauge added (0 on paper
+  boots). No wire format, capture or state file changed.
+
+**Migration steps**
+
+1. None. A dashboard or alert keyed on `_no_wallet_total` (none exists)
+   would move to `_superseded_total`.
+
+**Rollback**
+
+- Revert the H9 commit.
+
 ## 2026-09-23 — the EVM write path linked: `[testnet]`, `--evm-hybrid`, `evm-testnet`, `engine_hyparb_evm_*` (HYPARB H8)
 
 **What changed**

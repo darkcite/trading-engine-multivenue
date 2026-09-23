@@ -180,56 +180,143 @@ fn sig_fields(sig: &[u8; 65]) -> Result<[Enc; 3], EvmTxErr> {
     Ok([uint(crate::y_parity_from_v(v) as u128), word(r), word(s)])
 }
 
-/// keccak256 of a signing pre-image, hashed in place.
-#[inline]
-fn digest_of(f: &Fields, data: &[u8]) -> [u8; 32] {
-    let lh = list_header(f.unsigned_payload);
-    keccak256_parts(&[
-        &[TX_TYPE],
-        lh.as_slice(),
-        f.head[0].as_slice(),
-        f.head[1].as_slice(),
-        f.head[2].as_slice(),
-        f.head[3].as_slice(),
-        f.head[4].as_slice(),
-        f.head[5].as_slice(),
-        f.value.as_slice(),
-        f.data_hdr.as_slice(),
-        data,
-        &EMPTY_LIST,
-    ])
+/// A transaction's RLP fields, encoded ONCE on the stack and borrowed by
+/// every later step — the per-send path signs, hashes and renders from
+/// the same encoding instead of re-encoding the list three times.
+pub struct PreparedTx<'a> {
+    f: Fields,
+    data: &'a [u8],
 }
 
-/// keccak256 of a signed envelope, hashed in place.
-#[inline]
-fn hash_of(f: &Fields, data: &[u8], sig: &[u8; 65]) -> Result<[u8; 32], EvmTxErr> {
-    let s = sig_fields(sig)?;
-    let lh = list_header(f.unsigned_payload + s[0].len() + s[1].len() + s[2].len());
-    Ok(keccak256_parts(&[
-        &[TX_TYPE],
-        lh.as_slice(),
-        f.head[0].as_slice(),
-        f.head[1].as_slice(),
-        f.head[2].as_slice(),
-        f.head[3].as_slice(),
-        f.head[4].as_slice(),
-        f.head[5].as_slice(),
-        f.value.as_slice(),
-        f.data_hdr.as_slice(),
-        data,
-        &EMPTY_LIST,
-        s[0].as_slice(),
-        s[1].as_slice(),
-        s[2].as_slice(),
-    ]))
+impl<'a> PreparedTx<'a> {
+    /// Encode a call.
+    #[inline]
+    #[must_use]
+    pub fn call(tx: &Eip1559Tx<'a>) -> Self {
+        Self {
+            f: fields(tx),
+            data: tx.data,
+        }
+    }
+
+    /// Encode a contract creation.
+    #[inline]
+    #[must_use]
+    pub fn create(tx: &Eip1559Create<'a>) -> Self {
+        Self {
+            f: create_fields(tx),
+            data: tx.init_code,
+        }
+    }
+
+    /// keccak256 of the signing pre-image, hashed in place.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let f = &self.f;
+        let lh = list_header(f.unsigned_payload);
+        keccak256_parts(&[
+            &[TX_TYPE],
+            lh.as_slice(),
+            f.head[0].as_slice(),
+            f.head[1].as_slice(),
+            f.head[2].as_slice(),
+            f.head[3].as_slice(),
+            f.head[4].as_slice(),
+            f.head[5].as_slice(),
+            f.value.as_slice(),
+            f.data_hdr.as_slice(),
+            self.data,
+            &EMPTY_LIST,
+        ])
+    }
+
+    /// Sign with a pre-parsed key: `r ‖ s ‖ v`, `v = recid + 27`.
+    pub fn sign(&self, sk: &SecretKey) -> Result<[u8; 65], EvmTxErr> {
+        sign_digest_with_key(sk, &self.digest()).map_err(|_| EvmTxErr::Sign)
+    }
+
+    /// Attach a signature (its `(y_parity, r, s)` encoded once). A `v`
+    /// that is not 27/28 is refused, never masked.
+    pub fn signed(&self, sig: &[u8; 65]) -> Result<SignedTx<'_, 'a>, EvmTxErr> {
+        let s = sig_fields(sig)?;
+        let payload = self.f.unsigned_payload + s[0].len() + s[1].len() + s[2].len();
+        Ok(SignedTx {
+            p: self,
+            s,
+            lh: list_header(payload),
+            payload,
+        })
+    }
 }
 
-/// Length of the `0x`-hex render of a signed envelope.
-#[inline]
-fn hex_len_of(f: &Fields, sig: &[u8; 65]) -> Result<usize, EvmTxErr> {
-    let s = sig_fields(sig)?;
-    let payload = f.unsigned_payload + s[0].len() + s[1].len() + s[2].len();
-    Ok(2 + 2 * (1 + list_header(payload).len() + payload))
+/// A [`PreparedTx`] with its signature — hash and render read the same
+/// encodings.
+pub struct SignedTx<'p, 'a> {
+    p: &'p PreparedTx<'a>,
+    s: [Enc; 3],
+    lh: Enc,
+    payload: usize,
+}
+
+impl SignedTx<'_, '_> {
+    /// The transaction hash (`keccak256` of the signed envelope), hashed
+    /// in place — what the node answers and the receipt is keyed by.
+    #[must_use]
+    pub fn hash(&self) -> [u8; 32] {
+        let f = &self.p.f;
+        keccak256_parts(&[
+            &[TX_TYPE],
+            self.lh.as_slice(),
+            f.head[0].as_slice(),
+            f.head[1].as_slice(),
+            f.head[2].as_slice(),
+            f.head[3].as_slice(),
+            f.head[4].as_slice(),
+            f.head[5].as_slice(),
+            f.value.as_slice(),
+            f.data_hdr.as_slice(),
+            self.p.data,
+            &EMPTY_LIST,
+            self.s[0].as_slice(),
+            self.s[1].as_slice(),
+            self.s[2].as_slice(),
+        ])
+    }
+
+    /// Length of the `0x`-hex render.
+    #[must_use]
+    pub fn hex_len(&self) -> usize {
+        2 + 2 * (1 + self.lh.len() + self.payload)
+    }
+
+    /// Render as `0x`-hex straight into `dst` (the FINAL wire buffer);
+    /// nothing is written unless all of it fits.
+    pub fn render_hex(&self, dst: &mut [u8]) -> Result<usize, EvmTxErr> {
+        let total = self.hex_len();
+        if dst.len() < total {
+            return Err(EvmTxErr::BufferTooSmall);
+        }
+        let f = &self.p.f;
+        dst[0] = b'0';
+        dst[1] = b'x';
+        let mut w = HexOut { dst, n: 2 };
+        w.put(&[TX_TYPE]);
+        w.put(self.lh.as_slice());
+        let mut i = 0;
+        while i < f.head.len() {
+            w.put(f.head[i].as_slice());
+            i += 1;
+        }
+        w.put(f.value.as_slice());
+        w.put(f.data_hdr.as_slice());
+        w.put(self.p.data);
+        w.put(&EMPTY_LIST);
+        w.put(self.s[0].as_slice());
+        w.put(self.s[1].as_slice());
+        w.put(self.s[2].as_slice());
+        debug_assert_eq!(w.n, total);
+        Ok(total)
+    }
 }
 
 /// Writes `0x`-prefixed lowercase hex into a caller buffer.
@@ -252,61 +339,29 @@ impl HexOut<'_> {
     }
 }
 
-/// Render a signed envelope as `0x`-hex into `dst`; nothing is written
-/// unless all of it fits.
-#[inline]
-fn render_of(f: &Fields, data: &[u8], sig: &[u8; 65], dst: &mut [u8]) -> Result<usize, EvmTxErr> {
-    let s = sig_fields(sig)?;
-    let payload = f.unsigned_payload + s[0].len() + s[1].len() + s[2].len();
-    let lh = list_header(payload);
-    let total = 2 + 2 * (1 + lh.len() + payload);
-    if dst.len() < total {
-        return Err(EvmTxErr::BufferTooSmall);
-    }
-    dst[0] = b'0';
-    dst[1] = b'x';
-    let mut w = HexOut { dst, n: 2 };
-    w.put(&[TX_TYPE]);
-    w.put(lh.as_slice());
-    let mut i = 0;
-    while i < f.head.len() {
-        w.put(f.head[i].as_slice());
-        i += 1;
-    }
-    w.put(f.value.as_slice());
-    w.put(f.data_hdr.as_slice());
-    w.put(data);
-    w.put(&EMPTY_LIST);
-    w.put(s[0].as_slice());
-    w.put(s[1].as_slice());
-    w.put(s[2].as_slice());
-    debug_assert_eq!(w.n, total);
-    Ok(total)
-}
-
 /// keccak256 of the signing pre-image — hashed IN PLACE from stack
 /// encodings and the borrowed calldata. No pre-image buffer exists.
 #[must_use]
 pub fn tx_signing_digest(tx: &Eip1559Tx<'_>) -> [u8; 32] {
-    digest_of(&fields(tx), tx.data)
+    PreparedTx::call(tx).digest()
 }
 
 /// Sign the transaction with a pre-parsed key: `r ‖ s ‖ v`, `v = recid + 27`
 /// (feed it to [`tx_encode_signed_hex`] / [`tx_hash`], which convert `v`).
 pub fn tx_sign(tx: &Eip1559Tx<'_>, sk: &SecretKey) -> Result<[u8; 65], EvmTxErr> {
-    sign_digest_with_key(sk, &tx_signing_digest(tx)).map_err(|_| EvmTxErr::Sign)
+    PreparedTx::call(tx).sign(sk)
 }
 
 /// The transaction hash (`keccak256` of the signed envelope) — what a
 /// node returns from `eth_sendRawTransaction` and what the receipt is
 /// looked up by. Hashed in place, like the digest.
 pub fn tx_hash(tx: &Eip1559Tx<'_>, sig: &[u8; 65]) -> Result<[u8; 32], EvmTxErr> {
-    hash_of(&fields(tx), tx.data, sig)
+    Ok(PreparedTx::call(tx).signed(sig)?.hash())
 }
 
 /// Length in bytes of the `0x`-hex render of the signed transaction.
 pub fn signed_hex_len(tx: &Eip1559Tx<'_>, sig: &[u8; 65]) -> Result<usize, EvmTxErr> {
-    hex_len_of(&fields(tx), sig)
+    Ok(PreparedTx::call(tx).signed(sig)?.hex_len())
 }
 
 /// Render the SIGNED transaction as `0x`-prefixed lowercase hex straight
@@ -322,23 +377,23 @@ pub fn tx_encode_signed_hex(
     sig: &[u8; 65],
     dst: &mut [u8],
 ) -> Result<usize, EvmTxErr> {
-    render_of(&fields(tx), tx.data, sig, dst)
+    PreparedTx::call(tx).signed(sig)?.render_hex(dst)
 }
 
 /// [`tx_signing_digest`] of a contract creation.
 #[must_use]
 pub fn create_signing_digest(tx: &Eip1559Create<'_>) -> [u8; 32] {
-    digest_of(&create_fields(tx), tx.init_code)
+    PreparedTx::create(tx).digest()
 }
 
 /// [`tx_sign`] of a contract creation.
 pub fn create_sign(tx: &Eip1559Create<'_>, sk: &SecretKey) -> Result<[u8; 65], EvmTxErr> {
-    sign_digest_with_key(sk, &create_signing_digest(tx)).map_err(|_| EvmTxErr::Sign)
+    PreparedTx::create(tx).sign(sk)
 }
 
 /// [`tx_hash`] of a contract creation.
 pub fn create_hash(tx: &Eip1559Create<'_>, sig: &[u8; 65]) -> Result<[u8; 32], EvmTxErr> {
-    hash_of(&create_fields(tx), tx.init_code, sig)
+    Ok(PreparedTx::create(tx).signed(sig)?.hash())
 }
 
 /// [`tx_encode_signed_hex`] of a contract creation.
@@ -347,7 +402,7 @@ pub fn create_encode_signed_hex(
     sig: &[u8; 65],
     dst: &mut [u8],
 ) -> Result<usize, EvmTxErr> {
-    render_of(&create_fields(tx), tx.init_code, sig, dst)
+    PreparedTx::create(tx).signed(sig)?.render_hex(dst)
 }
 
 /// The address a creation from `sender` at `nonce` deploys to:

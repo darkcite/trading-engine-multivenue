@@ -57,10 +57,10 @@ pub use subs::{
 };
 
 pub use http1::{
-    dechunk_in_place, read_response, write_get_request, BodyFraming, DechunkResult, HttpErr,
-    HttpResult,
+    chunked_body, dechunk_in_place, head_says_close, read_response, write_get_request, BodyFraming,
+    ChunkedBody, DechunkResult, HttpErr, HttpResult,
 };
-pub use https_post::{parse_https_url, HttpsPost, PostErr, PostErrKind};
+pub use https_post::{parse_https_url, HttpsPost, PostErr, PostErrKind, MAX_BODY_CAP};
 pub use transport::{
     PlainTcpTransport, Status, TestBuffer, TestTransport, TlsTransport, Transport,
 };

@@ -403,16 +403,17 @@ pub trait StrategyCounters {
         0
     }
 
-    /// HYPARB H8: copy the member's AMM decisions with `seq > after`,
-    /// oldest first, into `out` (at most `out.len()`), returning how
-    /// many were copied. The member keeps the last
-    /// [`HYPARB_DECISION_LOG`]; a reader further behind than that finds
-    /// a `seq` gap (it counts the loss — nothing blocks). What the EVM
-    /// write path shadows (O-H12). Never allocates.
+    /// HYPARB H8/H9: the member's AMM decision log, BORROWED — a ring of
+    /// [`HYPARB_DECISION_LOG`] entries indexed by `seq %
+    /// HYPARB_DECISION_LOG` (an entry whose `seq` is not the one its slot
+    /// is read for was never written, or has been overwritten) — and the
+    /// newest `seq` (0 = none yet). The reader (the EVM shadow's tap, on
+    /// the engine thread) walks it in place and moves each new decision
+    /// straight into its own ring: no staging copy (H9). What the write
+    /// path shadows (O-H12). Never allocates.
     #[inline]
-    fn hyparb_decisions(&self, after: u64, out: &mut [HyparbDecision]) -> u32 {
-        let _ = (after, out);
-        0
+    fn hyparb_decision_log(&self) -> (&[HyparbDecision], u64) {
+        (&[], 0)
     }
 
     /// RG2: the regime detector's observables (`engine_regime_*`),
@@ -1150,7 +1151,7 @@ pub struct HyparbCoinView {
 }
 
 /// Decisions the HYPARB member remembers for
-/// [`StrategyCounters::hyparb_decisions`].
+/// [`StrategyCounters::hyparb_decision_log`].
 pub const HYPARB_DECISION_LOG: usize = 64;
 
 /// HYPARB H8: one AMM decision exactly as the member made it — the input

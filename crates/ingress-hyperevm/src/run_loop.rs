@@ -68,10 +68,6 @@ use crate::rpc::{
 };
 use crate::snapshot::{Call, SnapErr, SnapState, Snapshotter};
 
-#[cfg(test)]
-#[path = "run_loop_tests.rs"]
-mod tests;
-
 // ---------------------------------------------------------------
 // Sizing
 // ---------------------------------------------------------------
@@ -237,12 +233,15 @@ pub struct HyperEvmCounters {
 }
 
 /// One event held during a snapshot.
+#[repr(C)]
 #[derive(Copy, Clone)]
 struct Held {
     sym: SymbolId,
     block: u64,
     payload: Payload,
 }
+
+const _: () = assert!(core::mem::size_of::<Held>() == 56);
 
 const HELD_NONE: Held = Held {
     sym: SYMBOL_ID_NONE,
@@ -389,16 +388,6 @@ impl Driver {
         self.hold_len = 0;
         self.hold_pos = 0;
         self.resync = false;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_state(&mut self, s: State) {
-        self.state = s;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn suppress_polling_for_test(&mut self) {
-        self.next_poll_at_ns = u64::MAX;
     }
 }
 
@@ -599,18 +588,23 @@ fn issue_reads(drv: &mut Driver) -> io::Result<()> {
         drv.reads_in_flight += 1;
         drv.calls[(id as usize) & (PENDING_CAP - 1)] = call;
         let p = call.pool as usize;
-        let mut data = [0u8; 74];
-        let dl = call.calldata(drv.snap.family(p), &mut data);
-        // COPY: one 42 B `0x…` address onto the stack — the pool's, or a
-        // token's for `decimals()` — because `write_eth_call` borrows the
-        // scratch buffer mutably while both tables live in `drv` —
-        // borrowing the table entry across that call is refused by borrowck.
+        let family = drv.snap.family(p);
+        // The address is borrowed from its table in place (the pool's,
+        // or a token's for `decimals()`): `snap`/`pools` and `scratch`
+        // are disjoint fields of `drv`. The calldata renders straight
+        // into the request (H9 — both used to be staged and copied).
         let to = match drv.snap.read_target(p, call.kind) {
-            Some(t) => *t,
-            None => drv.pools.addresses_hex()[p],
+            Some(t) => t,
+            None => &drv.pools.addresses_hex()[p],
         };
-        let n = write_eth_call(&mut drv.scratch[..], id, &to, &data[..dl], call.block)
-            .map_err(|_| io::Error::other("eth_call request buffer too small"))?;
+        let n = write_eth_call(
+            &mut drv.scratch[..],
+            id,
+            to,
+            |d: &mut [u8]| call.calldata(family, d),
+            call.block,
+        )
+        .map_err(|_| io::Error::other("eth_call request buffer too small"))?;
         queue_frame(drv, n)?;
     }
     Ok(())
@@ -853,13 +847,14 @@ fn drain_ws_frames<C: Capture, const CAP: usize>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let plen = payload.end - payload.start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        // COPY: ≤ 125 B ping payload → pong (RFC 6455 control frame) — rx and tx are one borrow of `drv`; same as ingress-rpc.
-                        scratch[..plen]
-                            .copy_from_slice(&drv.rx.filled()[payload.start..payload.end]);
-                        if let Ok(n) = ws_write_pong(drv.tx.free_mut(), &scratch[..plen], mask) {
+                        // The ping payload goes from rx straight into the pong
+                        // frame in tx — disjoint fields of `drv` (H9: it
+                        // used to be staged on the stack first).
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -1208,3 +1203,20 @@ pub fn run<T: Transport, C: Capture, const CAP: usize>(
     }
     RunResult::Stopped
 }
+
+// Test hooks — at the file's end with the tests, so the copy audit
+// (which stops at the first `#[cfg(test)]`) reads the whole module.
+#[cfg(test)]
+impl Driver {
+    pub(crate) fn set_state(&mut self, s: State) {
+        self.state = s;
+    }
+
+    pub(crate) fn suppress_polling_for_test(&mut self) {
+        self.next_poll_at_ns = u64::MAX;
+    }
+}
+
+#[cfg(test)]
+#[path = "run_loop_tests.rs"]
+mod tests;

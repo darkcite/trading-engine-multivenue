@@ -73,6 +73,7 @@ impl HyparbStrategy {
                 ..
             } => {
                 self.abandon_staging();
+                self.maps[p].begin_stage();
                 let st = &mut self.staging;
                 st.pool = p;
                 st.n = 0;
@@ -93,12 +94,15 @@ impl HyparbStrategy {
                     st.broken = true;
                     return None;
                 }
-                match TickNode::with_gross(tick, net, gross) {
-                    Some(node) => {
-                        st.nodes[st.n] = node;
+                match (
+                    TickNode::with_gross(tick, net, gross),
+                    self.maps[p].stage_slot(st.n),
+                ) {
+                    (Some(node), Some(slot)) => {
+                        *slot = node;
                         st.n += 1;
                     }
-                    None => st.broken = true,
+                    _ => st.broken = true,
                 }
                 None
             }
@@ -171,7 +175,7 @@ impl HyparbStrategy {
         let ok = !st.broken
             && st.n == st.expect
             && self.maps[p]
-                .load(&st.nodes[..st.n], st.lo, st.hi, st.spacing)
+                .commit_stage(st.n, st.lo, st.hi, st.spacing)
                 .is_ok();
         if ok {
             self.pools[p].map_ok = true;

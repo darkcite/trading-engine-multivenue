@@ -51,10 +51,6 @@ use core_types::SymbolId;
 use crate::hex::{data_words, word, word_i128, word_i24, word_u128, word_u160, word_u32, WORD_HEX};
 use crate::pools::{PoolFamily, PoolTable, HYPEREVM_MAX_POOLS};
 
-#[cfg(test)]
-#[path = "snapshot_tests.rs"]
-mod tests;
-
 /// Most initialised ticks one pool's snapshot carries (the member's
 /// `TickMap<1024>`).
 pub const MAP_NODES: usize = 1024;
@@ -99,23 +95,28 @@ pub enum ReadKind {
     Dec1 = 14,
 }
 
+/// The longest calldata a read renders: `0x` + selector + one word.
+pub const CALLDATA_MAX: usize = 2 + 8 + 64;
+
 /// One `eth_call` the snapshotter wants sent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct Call {
-    /// Index into the pool table.
-    pub pool: u16,
-    /// What is read.
-    pub kind: ReadKind,
-    /// V3 candidate index (for `Tick`).
-    pub idx: u16,
-    /// Word or tick argument.
-    pub arg: i32,
     /// Block the read is pinned to.
     pub block: u64,
+    /// Word or tick argument.
+    pub arg: i32,
     /// Snapshot generation: a reply to a read of an abandoned snapshot
     /// is ignored.
     pub gen: u32,
+    /// Index into the pool table.
+    pub pool: u16,
+    /// V3 candidate index (for `Tick`).
+    pub idx: u16,
+    /// What is read.
+    pub kind: ReadKind,
 }
+const _: () = assert!(core::mem::size_of::<Call>() == 24);
 
 impl Call {
     /// An unused slot.
@@ -128,9 +129,10 @@ impl Call {
         gen: 0,
     };
 
-    /// Render the calldata (`0x` + selector [+ one int word]) into `dst`;
-    /// returns its length.
-    pub fn calldata(&self, family: PoolFamily, dst: &mut [u8; 74]) -> usize {
+    /// Render the calldata (`0x` + selector [+ one int word]) into `dst`
+    /// — the request's own buffer (H9: it used to go through a stack
+    /// array and be copied in); its length, `None` if `dst` is short.
+    pub fn calldata(&self, family: PoolFamily, dst: &mut [u8]) -> Option<usize> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let sel: [u8; 4] = match self.kind {
             ReadKind::Head | ReadKind::ProbeHead => {
@@ -151,6 +153,13 @@ impl Call {
             ReadKind::Token1 => [0xd2, 0x12, 0x20, 0xa7],
             ReadKind::Dec0 | ReadKind::Dec1 => [0x31, 0x3c, 0xe5, 0x67],
         };
+        let with_arg = matches!(
+            self.kind,
+            ReadKind::Bitmap | ReadKind::Tick | ReadKind::LinkDown | ReadKind::LinkUp
+        );
+        if dst.len() < if with_arg { CALLDATA_MAX } else { 10 } {
+            return None;
+        }
         dst[0] = b'0';
         dst[1] = b'x';
         let mut i = 0;
@@ -159,12 +168,8 @@ impl Call {
             dst[3 + 2 * i] = HEX[(sel[i] & 15) as usize];
             i += 1;
         }
-        let with_arg = matches!(
-            self.kind,
-            ReadKind::Bitmap | ReadKind::Tick | ReadKind::LinkDown | ReadKind::LinkUp
-        );
         if !with_arg {
-            return 10;
+            return Some(10);
         }
         // int256 two's complement of the argument.
         let v = self.arg as i64 as u64;
@@ -179,7 +184,7 @@ impl Call {
             dst[58 + k] = HEX[((v >> (60 - 4 * k)) & 15) as usize];
             k += 1;
         }
-        74
+        Some(CALLDATA_MAX)
     }
 }
 
@@ -227,8 +232,38 @@ const DIR_READY: u8 = 0;
 const DIR_INFLIGHT: u8 = 1;
 const DIR_DONE: u8 = 2;
 
+/// Per-pool snapshot progress. Wide fields first (no interior padding);
+/// the tuples are `(low 128 bits, high 32 bits)` of a `uint160`.
+#[repr(C)]
 #[derive(Copy, Clone)]
 struct PoolSnap {
+    sqrt: (u128, u32),
+    probe: (u128, u32),
+    liq: u128,
+    tick: i32,
+    fee: u32,
+    spacing: i32,
+    prev: i32,
+    next: i32,
+    lo: i32,
+    hi: i32,
+    // V3
+    w_lo: i32,
+    // Algebra
+    down_next: i32,
+    up_next: i32,
+    // V3
+    w_n: u16,
+    w_issued: u16,
+    w_got: u16,
+    cand_n: u16,
+    t_issued: u16,
+    t_got: u16,
+    // Algebra
+    n_down: u16,
+    n_up: u16,
+    down_state: u8,
+    up_state: u8,
     failed: bool,
     done: bool,
     /// The map half is complete (the pool is `done` once the decimals
@@ -238,32 +273,8 @@ struct PoolSnap {
     dec_got: u8,
     hdr_next: u8,
     hdr_got: u8,
-    sqrt: (u128, u32),
-    probe: (u128, u32),
-    tick: i32,
-    liq: u128,
-    fee: u32,
-    spacing: i32,
-    prev: i32,
-    next: i32,
-    lo: i32,
-    hi: i32,
-    // V3
-    w_lo: i32,
-    w_n: u16,
-    w_issued: u16,
-    w_got: u16,
-    cand_n: u16,
-    t_issued: u16,
-    t_got: u16,
-    // Algebra
-    down_next: i32,
-    up_next: i32,
-    down_state: u8,
-    up_state: u8,
-    n_down: u16,
-    n_up: u16,
 }
+const _: () = assert!(core::mem::size_of::<PoolSnap>() == 160);
 
 impl PoolSnap {
     const ZERO: Self = Self {
@@ -1019,19 +1030,10 @@ impl Snapshotter {
         if dn != 1 {
             return false;
         }
-        // An address word is a u160 (the top 96 bits zero — checked by
-        // `word_u160`), big-endian: 4 bytes of `hi`, then 16 of `lo`.
-        let Some((lo, hi)) = word_u160(word(r, ds, 0)) else {
-            return false;
-        };
-        let mut addr = [0u8; 20];
-        addr[..4].copy_from_slice(&hi.to_be_bytes());
-        addr[4..].copy_from_slice(&lo.to_be_bytes());
-        if addr == [0u8; 20] {
-            return false;
-        }
+        // An address word: the top 96 bits zero, a non-zero address,
+        // rendered lowercase straight from the word's digits.
         let k = usize::from(second);
-        if crate::hex::render_hex(&mut self.tokens[p][k], &addr) != Some(42) {
+        if !crate::hex::word_addr_hex(word(r, ds, 0), &mut self.tokens[p][k]) {
             return false;
         }
         let f = self.family[p];
@@ -1177,3 +1179,7 @@ impl Snapshotter {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "snapshot_tests.rs"]
+mod tests;

@@ -155,12 +155,14 @@ pub fn write_request_subscribe_logs(
 
 /// One `eth_call` pinned to block `block`:
 /// `{"jsonrpc":"2.0","id":N,"method":"eth_call","params":[{"to":…,"data":…},"0x…"]}`.
-/// `to` arrives pre-rendered; `data` is the calldata as `0x`-hex ASCII.
-pub fn write_eth_call(
+/// `to` arrives pre-rendered; `data` renders the calldata (`0x`-hex
+/// ASCII) straight into the request's tail and returns its length —
+/// `None` when it does not fit (H9: no stack staging, no copy).
+pub fn write_eth_call<F: FnOnce(&mut [u8]) -> Option<usize>>(
     dst: &mut [u8],
     id: u64,
     to: &[u8; 42],
-    data: &[u8],
+    data: F,
     block: u64,
 ) -> Result<usize, RpcWriteErr> {
     let mut o = RpcOut::new(dst);
@@ -169,7 +171,8 @@ pub fn write_eth_call(
     o.put(br#","method":"eth_call","params":[{"to":""#)?;
     o.put(to)?;
     o.put(br#"","data":""#)?;
-    o.put(data)?;
+    let k = data(o.tail()).ok_or(RpcWriteErr::BufferTooSmall)?;
+    o.advance(k);
     o.put(br#""},""#)?;
     o.put_quantity(block)?;
     o.put(b"\"]}")?;
@@ -214,6 +217,7 @@ pub fn response_id(buf: &[u8]) -> Option<u64> {
 }
 
 /// A `newHeads` push: number, timestamp and `baseFeePerGas`.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Head {
     /// Block number.
@@ -223,6 +227,7 @@ pub struct Head {
     /// `baseFeePerGas`, wei (0 if absent — pre-London shape).
     pub base_fee: u128,
 }
+const _: () = assert!(core::mem::size_of::<Head>() == 32);
 
 /// Parse a `newHeads` push. `None` without a `number`.
 #[inline]
@@ -283,7 +288,15 @@ mod tests {
     fn eth_call_is_pinned_to_its_block() {
         let to = *b"0x1111111111111111111111111111111111111111";
         let mut dst = [0u8; 256];
-        let n = write_eth_call(&mut dst, 10, &to, b"0x3850c7bd", 0x2c7e1a0).unwrap();
+        let slot0 = |d: &mut [u8]| {
+            let c = b"0x3850c7bd";
+            if d.len() < c.len() {
+                return None;
+            }
+            d[..c.len()].copy_from_slice(c);
+            Some(c.len())
+        };
+        let n = write_eth_call(&mut dst, 10, &to, slot0, 0x2c7e1a0).unwrap();
         assert_eq!(
             core::str::from_utf8(&dst[..n]).unwrap(),
             format!(
@@ -292,7 +305,7 @@ mod tests {
             )
         );
         assert_eq!(
-            write_eth_call(&mut dst[..n - 1], 10, &to, b"0x3850c7bd", 0x2c7e1a0),
+            write_eth_call(&mut dst[..n - 1], 10, &to, slot0, 0x2c7e1a0),
             Err(RpcWriteErr::BufferTooSmall)
         );
     }

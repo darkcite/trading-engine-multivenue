@@ -33,11 +33,15 @@
 //!
 //! ## Doctrine
 //!
-//! Zero allocation after boot: the request body, the response buffer
-//! and the TLS state are allocated when the arm is built; the calldata
-//! is a stack array; the signed transaction is rendered as hex straight
-//! into the request body (`signer_evm::tx_encode_signed_hex`); every
-//! scanner walks the response bytes in place. The arm is BLOCKING (one
+//! Zero allocation after boot: the request and response buffers and the
+//! TLS state are allocated when the arm is built; every request is
+//! rendered straight into the HTTPS client's wire buffer
+//! ([`core_net::HttpsPost::body_mut`]) and goes out as ONE write; the
+//! calldata is a stack array; the transaction is encoded ONCE
+//! (`signer_evm::PreparedTx`) and signed, hashed and rendered as hex from
+//! that encoding; every scanner walks the response bytes in place. (The
+//! one residue is rustls' own: one allocation per TLS record each way —
+//! bench gate 72.) The arm is BLOCKING (one
 //! request/response cycle per call, bounded by
 //! [`core_net::https_post::REQ_DEADLINE`]) and therefore lives on its
 //! own thread, never the engine loop. Fail-fast: a node that answers a

@@ -14,9 +14,53 @@
 //! and `chunked` framing let the reader stop at the body's end, so the
 //! connection survives for the next request and the TCP+TLS handshake
 //! is paid once (a chunked body is decoded in place — `HlHttp` refuses
-//! chunked; this client's endpoints include one that sends it). **`HlHttp` itself is deliberately NOT migrated onto
-//! this type in the HYPARB lane**: it is the armed-live E-lane arm, and
-//! changing it is that lane's decision under its own review.
+//! chunked; this client's endpoints include one that sends it).
+//! **`HlHttp` itself is deliberately NOT migrated onto this type in the
+//! HYPARB lane**: it is the armed-live E-lane arm, and changing it is
+//! that lane's decision under its own review.
+//!
+//! ## One request, one write, one TLS record (HYPARB H9)
+//!
+//! rustls' buffered API seals every `write` call into its own record and
+//! allocates that record's `Vec` (measured: 1 allocation per write, per
+//! post, on top of 1 per received record). So the request is ONE
+//! contiguous slice written ONCE — one record while it is ≤ 16 KiB
+//! (the write arm's are ≤ 8 KiB; a larger one is split by rustls, still
+//! from one write):
+//!
+//! ```text
+//! [ pad | POST <path> HTTP/1.1 … Content-Length: | digits | \r\n\r\n | body … ]
+//!         ^ prefix, rendered once at boot           ^ per post   ^ fixed   ^ body_at
+//! ```
+//!
+//! The caller renders the body in place through [`HttpsPost::body_mut`]
+//! (the doctrine's "encoders render into the FINAL wire buffer"); the
+//! only per-post render is the length digits. The prefix sits flush
+//! against the digits, so it moves (a ≤ 605 B `copy_within` inside one
+//! cache-resident buffer) whenever the body's DIGIT COUNT differs from
+//! the last request's — for the write arm, a 2-digit `eth_feeHistory`
+//! between 3-digit sends and receipt polls: about twice per 2 s while a
+//! swap is in flight. Two ways to never move it were weighed and
+//! rejected: a fixed-width `Content-Length` — space-padded (OWS inside
+//! the value) or zero-padded (valid `1*DIGIT` per RFC 9110) — is a
+//! parser corner neither live endpoint (CloudFront, purroof) was shown
+//! to accept, and a request that one of them refuses is a lost send;
+//! padding short JSON bodies with whitespace puts bytes on the wire on
+//! every small request. Both cost more than the move.
+//!
+//! ## Keep-alive that does not lie about `left_host`
+//!
+//! A kept-alive connection the server has since closed (its idle
+//! timeout; `Connection: close`) would take the next request's bytes
+//! into a dead socket and the read would then report "maybe sent" — a
+//! false [`PostErr::left_host`] that costs the send arm a wallet for a
+//! receipt timeout. So the connection is retired when the answer says
+//! `Connection: close` or the peer closes with it, and a one-byte
+//! non-blocking read before each reuse (one `read(2)` through rustls)
+//! retires one the peer closed while idle: the request then dials fresh
+//! with `left_host == false`. Every dial is counted ([`HttpsPost::dials`]):
+//! an endpoint that closes after every answer shows as dials ≈ posts —
+//! a full TLS handshake, and its allocations, per request.
 //!
 //! ## What this layer does NOT decide
 //!
@@ -38,14 +82,21 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 
 use crate::http1::{
-    dechunk_in_place, fmt_u64_ascii, read_response, BodyFraming, DechunkResult, HttpResult,
+    chunked_body, head_says_close, read_response, BodyFraming, ChunkedBody, HttpResult,
 };
 use crate::transport::{Status, TlsTransport, Transport};
 
-/// Request-header buffer: the literals + host + path + length digits.
-const REQ_HEADER_BUF: usize = 1024;
 /// The longest path a boot URL may carry.
 pub const MAX_PATH: usize = 256;
+/// The longest host (DNS's own bound).
+pub const MAX_HOST: usize = 253;
+/// The largest body a client may be built for (7 length digits).
+pub const MAX_BODY_CAP: usize = 9_999_999;
+const PREFIX_A: &[u8] = b"POST ";
+const PREFIX_B: &[u8] = b" HTTP/1.1\r\nHost: ";
+const PREFIX_C: &[u8] =
+    b"\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ";
+const HEAD_END: &[u8] = b"\r\n\r\n";
 const MIO_TOKEN: Token = Token(0);
 const POLL_TIMEOUT: Duration = Duration::from_millis(50);
 /// Consecutive connect failures between DNS re-resolutions (a
@@ -139,33 +190,70 @@ pub fn parse_https_url(url: &str) -> Option<(&str, u16, &str)> {
 
 /// A keep-alive HTTPS connection to one endpoint.
 pub struct HttpsPost {
-    host: String,
     port: u16,
-    path: String,
     addr: SocketAddr,
     connect_fail_streak: u32,
+    /// Successful dials (TCP + TLS handshakes) over the client's life.
+    dials: u64,
     server_name: ServerName<'static>,
     tls_config: Arc<ClientConfig>,
     /// `None` until the first request; reopened after a disconnect.
     transport: Option<TlsTransport>,
     poll: Poll,
     events: Events,
-    req_header: Box<[u8]>,
+    /// `[pad | prefix | digits | CRLFCRLF | body]` — module doc.
+    req: Box<[u8]>,
+    /// Where the prefix currently starts (it moves only when the
+    /// body's digit count changes).
+    head_at: usize,
+    /// Prefix length; the path is `prefix[5..5 + path_len]`, the host
+    /// `prefix[host_off..host_off + host_len]`.
+    prefix_len: usize,
+    path_len: usize,
+    host_off: usize,
+    host_len: usize,
+    /// Digits of the largest body (`body_cap`); the pad is sized for it.
+    max_digits: usize,
+    /// First body byte in `req`.
+    body_at: usize,
     resp_buf: Box<[u8]>,
     resp_len: usize,
 }
 
+/// Decimal digits of `v` (≥ 1).
+#[inline]
+const fn dec_digits(mut v: usize) -> usize {
+    let mut d = 1;
+    while v >= 10 {
+        v /= 10;
+        d += 1;
+    }
+    d
+}
+
 impl HttpsPost {
-    /// Resolve and prepare. **Boot-only** — the allocations live here.
-    /// No socket is opened until the first request.
+    /// Resolve and prepare: the request prefix is rendered here, once,
+    /// and the body window ([`Self::body_mut`]) is `body_cap` bytes.
+    /// **Boot-only** — the allocations live here. No socket is opened
+    /// until the first request.
     pub fn new(
         host: &str,
         port: u16,
         path: &str,
         tls_config: Arc<ClientConfig>,
+        body_cap: usize,
         resp_cap: usize,
     ) -> Result<Self, PostErrKind> {
-        if !path.starts_with('/') || path.len() > MAX_PATH {
+        // The request target is sent verbatim: visible ASCII only.
+        if !path.starts_with('/')
+            || path.len() > MAX_PATH
+            || !path.bytes().all(|b| b.is_ascii_graphic())
+            || host.is_empty()
+            || host.len() > MAX_HOST
+            || !host.bytes().all(|b| b.is_ascii_graphic())
+            || body_cap == 0
+            || body_cap > MAX_BODY_CAP
+        {
             return Err(PostErrKind::BadEndpoint);
         }
         let addr = (host, port)
@@ -175,44 +263,105 @@ impl HttpsPost {
             .ok_or(PostErrKind::Dns)?;
         let server_name =
             TlsTransport::server_name_from_host(host).map_err(|_| PostErrKind::BadEndpoint)?;
+        let prefix_len = PREFIX_A.len() + path.len() + PREFIX_B.len() + host.len() + PREFIX_C.len();
+        let max_digits = dec_digits(body_cap);
+        let body_at = prefix_len + max_digits + HEAD_END.len();
+        let mut req = vec![0u8; body_at + body_cap].into_boxed_slice();
+        let parts: [&[u8]; 5] = [
+            PREFIX_A,
+            path.as_bytes(),
+            PREFIX_B,
+            host.as_bytes(),
+            PREFIX_C,
+        ];
+        let mut at = 0usize;
+        let mut i = 0usize;
+        while i < parts.len() {
+            let end = at + parts[i].len();
+            // COPY: the request prefix (≤ 5 + MAX_PATH + 17 + MAX_HOST +
+            // 74 = 605 B) rendered ONCE at boot into the wire buffer it is
+            // sent from — no request ever re-renders it — rejected:
+            // borrowing the boot URL would pin the config for life.
+            req[at..end].copy_from_slice(parts[i]);
+            at = end;
+            i += 1;
+        }
+        // COPY: 4 B `\r\n\r\n`, once at boot, at its fixed place before
+        // the body — rejected: rendering it per post.
+        req[body_at - HEAD_END.len()..body_at].copy_from_slice(HEAD_END);
+        let host_off = PREFIX_A.len() + path.len() + PREFIX_B.len();
         Ok(Self {
-            // COPY: ≤ 64 B host + ≤ 256 B path, ONCE at boot — the Host
-            // header, the request line and the re-resolve need them for
-            // the client's life; borrowing would pin the boot config.
-            host: host.to_owned(),
             port,
-            path: path.to_owned(),
             addr,
             connect_fail_streak: 0,
+            dials: 0,
             server_name,
             tls_config,
             transport: None,
             poll: Poll::new().map_err(|_| PostErrKind::Disconnected)?,
             events: Events::with_capacity(8),
-            req_header: vec![0u8; REQ_HEADER_BUF].into_boxed_slice(),
+            req,
+            // Rendered for the widest length; `stage` moves it right.
+            head_at: 0,
+            prefix_len,
+            path_len: path.len(),
+            host_off,
+            host_len: host.len(),
+            max_digits,
+            body_at,
             resp_buf: vec![0u8; resp_cap].into_boxed_slice(),
             resp_len: 0,
         })
+    }
+
+    /// The prefix bytes `[off, off + len)` as text (ASCII by
+    /// construction — [`Self::new`] refuses anything else).
+    fn prefix_str(&self, off: usize, len: usize) -> &str {
+        let at = self.head_at + off;
+        core::str::from_utf8(&self.req[at..at + len]).unwrap_or("")
     }
 
     /// The host this client talks to (boot tells).
     #[inline]
     #[must_use]
     pub fn host(&self) -> &str {
-        &self.host
+        self.prefix_str(self.host_off, self.host_len)
     }
 
     /// The fixed request path.
     #[inline]
     #[must_use]
     pub fn path(&self) -> &str {
-        &self.path
+        self.prefix_str(PREFIX_A.len(), self.path_len)
+    }
+
+    /// The body window's size (`body_cap` at construction).
+    #[inline]
+    #[must_use]
+    pub fn body_cap(&self) -> usize {
+        self.req.len() - self.body_at
+    }
+
+    /// The body window: render the request body here, then
+    /// [`Self::post`] its length. Its contents survive a post.
+    #[inline]
+    pub fn body_mut(&mut self) -> &mut [u8] {
+        &mut self.req[self.body_at..]
     }
 
     /// Drop the connection. The next request redials.
     pub fn close(&mut self) {
         self.transport = None;
         self.resp_len = 0;
+    }
+
+    /// Successful dials over the client's life: 1 on a healthy
+    /// keep-alive endpoint; ≈ posts on one that closes after every
+    /// answer (a handshake per request).
+    #[inline]
+    #[must_use]
+    pub const fn dials(&self) -> u64 {
+        self.dials
     }
 
     /// Whether a connection is currently open.
@@ -229,17 +378,59 @@ impl HttpsPost {
         &self.resp_buf[..self.resp_len]
     }
 
-    /// One request/response cycle: `(http_status, body_range)` into
+    /// Place the head flush against a `body_len`-byte body and render its
+    /// length: the range of `req` to write. Moves the prefix only when
+    /// the digit count differs from the last request's.
+    fn stage(&mut self, body_len: usize) -> Result<core::ops::Range<usize>, PostErrKind> {
+        if body_len > self.req.len() - self.body_at {
+            return Err(PostErrKind::Overflow);
+        }
+        let d = dec_digits(body_len);
+        let want = self.max_digits - d;
+        if want != self.head_at {
+            // COPY: the ≤ 605 B prefix, shifted within the wire buffer
+            // when the body's digit COUNT differs from the last request's
+            // (never between two bodies of one order of magnitude) —
+            // rejected: a fixed-width Content-Length (space- or zero-
+            // padded: unproven against the live endpoints' parsers) and
+            // whitespace-padded bodies (wire bytes on every request).
+            self.req
+                .copy_within(self.head_at..self.head_at + self.prefix_len, want);
+            self.head_at = want;
+        }
+        let digits_end = self.body_at - HEAD_END.len();
+        let mut v = body_len;
+        let mut k = digits_end;
+        while k > digits_end - d {
+            k -= 1;
+            self.req[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        Ok(self.head_at..self.body_at + body_len)
+    }
+
+    /// One request/response cycle for the first `body_len` bytes of
+    /// [`Self::body_mut`]: `(http_status, body_range)` into
     /// [`Self::resp`]. **The status is not a verdict.**
-    pub fn post(&mut self, body: &[u8]) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+    pub fn post(&mut self, body_len: usize) -> Result<(u16, core::ops::Range<usize>), PostErr> {
         let deadline = Instant::now() + REQ_DEADLINE;
-        self.ensure_connected(deadline).map_err(|err| PostErr {
+        let not_left = |err| PostErr {
             err,
             left_host: false,
-        })?;
+        };
+        let wire = self.stage(body_len).map_err(not_left)?;
+        self.ensure_connected(deadline).map_err(not_left)?;
         let mut left_host = false;
-        match self.cycle(body, deadline, &mut left_host) {
-            Ok(v) => Ok(v),
+        match self.cycle(wire, deadline, &mut left_host) {
+            Ok((status, range, retire)) => {
+                if retire {
+                    // The peer closed, or said it will: the answer is
+                    // whole, the connection is not reusable. Keep the
+                    // response; drop only the transport.
+                    self.transport = None;
+                }
+                Ok((status, range))
+            }
             Err(err) => {
                 // Any failure closes the connection: a half-read answer
                 // left in the buffer would be read as the NEXT request's.
@@ -251,16 +442,14 @@ impl HttpsPost {
 
     fn cycle(
         &mut self,
-        body: &[u8],
+        wire: core::ops::Range<usize>,
         deadline: Instant,
         left_host: &mut bool,
-    ) -> Result<(u16, core::ops::Range<usize>), PostErrKind> {
-        let header_len = self.write_header(body.len())?;
+    ) -> Result<(u16, core::ops::Range<usize>, bool), PostErrKind> {
         {
             let t = self.transport.as_mut().ok_or(PostErrKind::Disconnected)?;
-            let segments: [&[u8]; 2] = [&self.req_header[..header_len], body];
             *left_host = true;
-            write_segments(t, &segments, deadline)?;
+            write_all(t, &self.req[wire], deadline)?;
             // `write` only queues into rustls; flush now (no writable
             // edge is armed after the handshake — without this the first
             // poll sleeps a full POLL_TIMEOUT: HlHttp's E7 finding).
@@ -271,43 +460,10 @@ impl HttpsPost {
         self.read_response(deadline)
     }
 
-    fn write_header(&mut self, body_len: usize) -> Result<usize, PostErrKind> {
-        let mut len_buf = [0u8; 20];
-        let len_str = fmt_u64_ascii(body_len as u64, &mut len_buf);
-        let parts: [&[u8]; 11] = [
-            b"POST ",
-            self.path.as_bytes(),
-            b" HTTP/1.1\r\n",
-            b"Host: ",
-            self.host.as_bytes(),
-            b"\r\n",
-            b"Content-Type: application/json\r\n",
-            b"Content-Length: ",
-            len_str,
-            b"\r\n",
-            b"Connection: keep-alive\r\n\r\n",
-        ];
-        let buf = &mut *self.req_header;
-        let mut pos = 0usize;
-        let mut i = 0usize;
-        while i < parts.len() {
-            let p = parts[i];
-            let end = pos + p.len();
-            if end > buf.len() {
-                return Err(PostErrKind::Overflow);
-            }
-            // COPY: ≤ 512 B of header literals + host + path + length
-            // digits into the boot-owned header buffer — the RENDER of
-            // the request head, sent as its own segment ahead of the
-            // body (no body byte is staged).
-            buf[pos..end].copy_from_slice(p);
-            pos = end;
-            i += 1;
-        }
-        Ok(pos)
-    }
-
     fn ensure_connected(&mut self, deadline: Instant) -> Result<(), PostErrKind> {
+        if self.transport.is_some() && !self.still_open() {
+            self.transport = None;
+        }
         if self.transport.is_some() {
             return Ok(());
         }
@@ -320,7 +476,8 @@ impl HttpsPost {
                 self.connect_fail_streak = self.connect_fail_streak.saturating_add(1);
                 if self.connect_fail_streak % RERESOLVE_AFTER == 0 {
                     // Blocking DNS on the failure path only; best effort.
-                    if let Some(a) = (self.host.as_str(), self.port)
+                    let port = self.port;
+                    if let Some(a) = (self.host(), port)
                         .to_socket_addrs()
                         .ok()
                         .and_then(|mut it| it.next())
@@ -331,6 +488,18 @@ impl HttpsPost {
                 Err(e)
             }
         }
+    }
+
+    /// Before reusing a kept-alive connection: one non-blocking read.
+    /// No request is outstanding, so anything but `WouldBlock` — EOF,
+    /// `close_notify`, an unsolicited byte, an error — means the peer
+    /// is gone or out of step, and the request must dial fresh.
+    fn still_open(&mut self) -> bool {
+        let Some(t) = self.transport.as_mut() else {
+            return false;
+        };
+        let mut probe = [0u8; 1];
+        matches!(t.read(&mut probe), Err(ref e) if e.kind() == io::ErrorKind::WouldBlock)
     }
 
     fn dial(&mut self, deadline: Instant) -> Result<(), PostErrKind> {
@@ -361,13 +530,16 @@ impl HttpsPost {
             }
         }
         self.transport = Some(t);
+        self.dials += 1;
         Ok(())
     }
 
+    /// Read one whole answer: `(status, body_range, retire)` — `retire`
+    /// when the peer closed with it or announced `Connection: close`.
     fn read_response(
         &mut self,
         deadline: Instant,
-    ) -> Result<(u16, core::ops::Range<usize>), PostErrKind> {
+    ) -> Result<(u16, core::ops::Range<usize>, bool), PostErrKind> {
         self.resp_len = 0;
         let mut peer_closed = false;
         loop {
@@ -403,45 +575,50 @@ impl HttpsPost {
             match read_response(&self.resp_buf[..self.resp_len]) {
                 HttpResult::Complete {
                     status,
+                    header_end,
                     body_start,
                     body_end,
                     framing,
-                    ..
-                } => match framing {
-                    // One framing this client can bound. A truncated
-                    // body must never be handed on as the whole answer.
-                    BodyFraming::ContentLength(_) => {
-                        if self.resp_len >= body_end {
-                            return Ok((status, body_start..body_end));
-                        }
-                        if peer_closed {
-                            return Err(PostErrKind::Disconnected);
-                        }
-                    }
-                    BodyFraming::CloseDelimited => {
-                        if peer_closed {
-                            return Ok((status, body_start..self.resp_len));
-                        }
-                    }
-                    // Decoded in place once the terminating chunk has
-                    // arrived (`dechunk_in_place` leaves an incomplete
-                    // body untouched, so every read can retry it). The
-                    // archive endpoint (purroof) answers chunked.
-                    BodyFraming::Chunked => {
-                        let end = self.resp_len;
-                        match dechunk_in_place(&mut self.resp_buf[body_start..end]) {
-                            DechunkResult::Complete { length } => {
-                                return Ok((status, body_start..body_start + length))
+                } => {
+                    let retire = peer_closed || head_says_close(&self.resp_buf[..header_end]);
+                    match framing {
+                        // One framing this client can bound. A truncated
+                        // body must never be handed on as the whole answer.
+                        BodyFraming::ContentLength(_) => {
+                            if self.resp_len >= body_end {
+                                return Ok((status, body_start..body_end, retire));
                             }
-                            DechunkResult::Incomplete => {
-                                if peer_closed {
-                                    return Err(PostErrKind::Disconnected);
+                            if peer_closed {
+                                return Err(PostErrKind::Disconnected);
+                            }
+                        }
+                        BodyFraming::CloseDelimited => {
+                            if peer_closed {
+                                return Ok((status, body_start..self.resp_len, true));
+                            }
+                        }
+                        // Located once the terminating chunk has arrived
+                        // (`chunked_body` leaves an incomplete body
+                        // untouched, so every read can retry it); a
+                        // one-chunk body is not moved. The archive
+                        // endpoint (purroof) answers chunked.
+                        BodyFraming::Chunked => {
+                            let end = self.resp_len;
+                            match chunked_body(&mut self.resp_buf[body_start..end]) {
+                                ChunkedBody::Span { start, len } => {
+                                    let a = body_start + start;
+                                    return Ok((status, a..a + len, retire));
                                 }
+                                ChunkedBody::Incomplete => {
+                                    if peer_closed {
+                                        return Err(PostErrKind::Disconnected);
+                                    }
+                                }
+                                ChunkedBody::Malformed => return Err(PostErrKind::BadHttp),
                             }
-                            DechunkResult::Malformed => return Err(PostErrKind::BadHttp),
                         }
                     }
-                },
+                }
                 HttpResult::Incomplete => {
                     if peer_closed {
                         return Err(PostErrKind::Disconnected);
@@ -459,27 +636,16 @@ impl HttpsPost {
     }
 }
 
-/// Write every segment in order, resuming across partial writes.
-/// Bounded by `deadline`; a TLS transport never blocks on `write`, so
-/// `WouldBlock` is a buffer the request did not fit.
-fn write_segments<T: Transport>(
-    t: &mut T,
-    segments: &[&[u8]],
-    deadline: Instant,
-) -> Result<(), PostErrKind> {
-    let mut seg = 0usize;
+/// Write all of `src`, resuming across partial writes. Bounded by
+/// `deadline`; a TLS transport never blocks on `write`, so `WouldBlock`
+/// is a buffer the request did not fit.
+fn write_all<T: Transport>(t: &mut T, src: &[u8], deadline: Instant) -> Result<(), PostErrKind> {
     let mut off = 0usize;
-    while seg < segments.len() {
-        let s = segments[seg];
-        if off >= s.len() {
-            seg += 1;
-            off = 0;
-            continue;
-        }
+    while off < src.len() {
         if Instant::now() >= deadline {
             return Err(PostErrKind::Timeout);
         }
-        match t.write(&s[off..]) {
+        match t.write(&src[off..]) {
             Ok(0) => return Err(PostErrKind::Overflow),
             Ok(n) => off += n,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -513,31 +679,93 @@ mod tests {
         assert_eq!(parse_https_url("https://u@x/"), None, "no userinfo");
     }
 
+    fn wire(h: &mut HttpsPost, body: &[u8]) -> String {
+        h.body_mut()[..body.len()].copy_from_slice(body);
+        let r = h.stage(body.len()).expect("fits");
+        String::from_utf8_lossy(&h.req[r]).to_string()
+    }
+
     #[test]
-    fn the_header_carries_the_boot_path() {
+    fn the_request_is_one_contiguous_slice_with_the_boot_path() {
         let cfg = TlsTransport::default_client_config();
-        let mut h = HttpsPost::new("127.0.0.1", 1, "/evm", cfg, 64).expect("loopback");
-        let n = h.write_header(42).expect("fits");
-        let s = String::from_utf8_lossy(&h.req_header[..n]).to_string();
+        let mut h = HttpsPost::new("127.0.0.1", 1, "/evm", cfg, 4096, 64).expect("loopback");
+        let s = wire(&mut h, &[b'x'; 42]);
         assert!(s.starts_with("POST /evm HTTP/1.1\r\n"), "{s}");
         assert!(s.contains("Host: 127.0.0.1\r\n"), "{s}");
-        assert!(s.contains("Content-Length: 42\r\n"), "{s}");
-        assert!(s.ends_with("Connection: keep-alive\r\n\r\n"), "{s}");
+        assert!(s.contains("Connection: keep-alive\r\n"), "{s}");
+        assert!(
+            s.ends_with(&format!("Content-Length: 42\r\n\r\n{}", "x".repeat(42))),
+            "{s}"
+        );
+        assert_eq!((h.host(), h.path()), ("127.0.0.1", "/evm"));
         assert!(!h.is_connected(), "no socket is opened at construction");
-        h.req_header = vec![0u8; 8].into_boxed_slice();
-        assert_eq!(h.write_header(1), Err(PostErrKind::Overflow));
+    }
+
+    #[test]
+    fn the_head_follows_the_digit_count_and_the_body_never_moves() {
+        let cfg = TlsTransport::default_client_config();
+        let mut h = HttpsPost::new("127.0.0.1", 1, "/p", cfg, 1000, 64).expect("loopback");
+        let body_at = h.body_at;
+        let mut n = 0usize;
+        while n < 4 {
+            let len = [7usize, 10, 999, 1000][n];
+            let body = vec![b'a' + n as u8; len];
+            let s = wire(&mut h, &body);
+            assert!(s.starts_with("POST /p HTTP/1.1\r\n"), "{len}: {s}");
+            assert!(
+                s.ends_with(&format!(
+                    "Content-Length: {len}\r\n\r\n{}",
+                    String::from_utf8_lossy(&body)
+                )),
+                "{len}"
+            );
+            assert_eq!(h.body_at, body_at, "the body window is fixed");
+            assert_eq!((h.host(), h.path()), ("127.0.0.1", "/p"), "{len}");
+            n += 1;
+        }
+        // Back to one digit: the prefix moves right again.
+        let s = wire(&mut h, b"z");
+        assert!(
+            s.starts_with("POST /p ") && s.ends_with("Content-Length: 1\r\n\r\nz"),
+            "{s}"
+        );
+        assert_eq!(
+            h.stage(1001),
+            Err(PostErrKind::Overflow),
+            "over the body cap"
+        );
+        assert_eq!(
+            h.post(1001).err(),
+            Some(PostErr {
+                err: PostErrKind::Overflow,
+                left_host: false
+            }),
+            "refused before any byte is written"
+        );
     }
 
     #[test]
     fn a_bad_endpoint_is_refused_at_construction() {
         let cfg = TlsTransport::default_client_config();
-        let e = HttpsPost::new("no-such-host.invalid.example", 443, "/", cfg.clone(), 64);
-        assert!(matches!(e, Err(PostErrKind::Dns)));
-        let e = HttpsPost::new("127.0.0.1", 1, "evm", cfg, 64);
-        assert!(
-            matches!(e, Err(PostErrKind::BadEndpoint)),
-            "a path must be absolute"
+        let e = HttpsPost::new(
+            "no-such-host.invalid.example",
+            443,
+            "/",
+            cfg.clone(),
+            64,
+            64,
         );
+        assert!(matches!(e, Err(PostErrKind::Dns)));
+        let bad = |path: &str, body_cap: usize| {
+            matches!(
+                HttpsPost::new("127.0.0.1", 1, path, cfg.clone(), body_cap, 64),
+                Err(PostErrKind::BadEndpoint)
+            )
+        };
+        assert!(bad("evm", 64), "a path must be absolute");
+        assert!(bad("/é", 64), "a path must be visible ASCII");
+        assert!(bad("/", 0), "a body window is required");
+        assert!(bad("/", MAX_BODY_CAP + 1), "seven length digits at most");
     }
 
     #[test]

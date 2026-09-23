@@ -402,14 +402,20 @@ fn calldata_encodes_negative_arguments_as_int256() {
     };
     let mut d = [0u8; 74];
     let n = c.calldata(PoolFamily::UniswapV3, &mut d);
-    assert_eq!(n, 74);
+    assert_eq!(n, Some(74));
+    assert_eq!(
+        c.calldata(PoolFamily::UniswapV3, &mut d[..73]),
+        None,
+        "short"
+    );
     assert_eq!(&d[..10], b"0xf30dba93");
     assert_eq!(&d[10..], format!("{}fffb7618", "f".repeat(56)).as_bytes());
     let c = Call {
         kind: ReadKind::Head,
         ..c
     };
-    assert_eq!(c.calldata(PoolFamily::Algebra, &mut d), 10);
+    assert_eq!(c.calldata(PoolFamily::Algebra, &mut d), Some(10));
+    assert_eq!(c.calldata(PoolFamily::Algebra, &mut d[..10]), Some(10));
     assert_eq!(&d[..10], b"0xe76c01e4");
 }
 
