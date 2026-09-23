@@ -52,6 +52,8 @@ exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
 exec-hyperliquid     = { workspace = true }
 signer-eip712        = { workspace = true }
+# HYPARB H1 gate 63: the AMM walk + arb solve.
+core-amm             = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

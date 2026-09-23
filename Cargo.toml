@@ -35,6 +35,9 @@ members = [
     # VRP X1: the ONE modelled fill law, shared by the offline harness
     # and the engine's paper dispatcher
     "crates/core-fill",
+    # HYPARB H1: bit-exact concentrated/constant-product AMM math and the
+    # single-block arb solve — the reusable CEX-DEX engine
+    "crates/core-amm",
 
     # --- book + strategies ---
     "crates/book-builder",
@@ -158,6 +161,7 @@ core-time    = { path = "crates/core-time" }
 core-types   = { path = "crates/core-types" }
 core-vol     = { path = "crates/core-vol" }
 core-fill    = { path = "crates/core-fill" }
+core-amm     = { path = "crates/core-amm" }
 
 ingress-ai         = { path = "crates/ingress-ai" }
 ingress-binance    = { path = "crates/ingress-binance" }

@@ -37,6 +37,8 @@ signer-eip712      = { path = "../crates/signer-eip712" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
 # universe_toml: the M1 boot-universe config parser (core-config).
 core-config        = { path = "../crates/core-config" }
+# amm_tick_walk: the HYPARB H1 AMM walk + arb solve.
+core-amm           = { path = "../crates/core-amm" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -314,6 +316,13 @@ bench  = false
 [[bin]]
 name   = "hl_user_events"
 path   = "fuzz_targets/hl_user_events.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_tick_walk"
+path   = "fuzz_targets/amm_tick_walk.rs"
 test   = false
 doc    = false
 bench  = false

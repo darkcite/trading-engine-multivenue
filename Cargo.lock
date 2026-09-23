@@ -128,6 +128,7 @@ dependencies = [
  "book-builder",
  "clob-dispatcher",
  "core-alloc",
+ "core-amm",
  "core-crypto",
  "core-io",
  "core-latency",
@@ -405,6 +406,13 @@ dependencies = [
 [[package]]
 name = "core-alloc"
 version = "0.1.0"
+
+[[package]]
+name = "core-amm"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "core-config"

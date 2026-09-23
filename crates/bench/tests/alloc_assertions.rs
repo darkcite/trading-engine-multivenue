@@ -7189,3 +7189,81 @@ fn routed_halt_idle_steady_state() {
     assert_eq!(bytes, 0, "halted idle-poll bytes should be zero: saw {bytes}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **HYPARB H1 gate 63 — the AMM walk and the arb solve.**
+///
+/// `solve_arb` runs on every pool update the member re-evaluates (one
+/// per on-chain swap, ~1/s across the universe) and walks the pool's
+/// real tick map through the contract's 256-bit arithmetic; the paper
+/// matcher's `swap_exact_in_range` judges every AMM order. Both live on
+/// the engine thread. Everything here is `Copy` PODs, fixed arrays and
+/// a caller-owned map, so the whole path must be 0 B/op. The map is
+/// boxed at boot (32 KiB) — that one allocation is outside the guard.
+#[test]
+fn amm_walk_and_arb_solve_are_zero_alloc() {
+    use core_amm::{
+        price_1e18_from_sqrt, solve_arb, sqrt_at_tick, swap_exact, swap_exact_in_range, tick_at_sqrt, ArbParams,
+        ArbSide, PoolMeta, PoolState, SwapSpec, TickMap, TickNode,
+    };
+    const SPACING: i32 = 10;
+    let mut nodes = [TickNode::ZERO; 64];
+    let mut k = 0usize;
+    while k < 32 {
+        // Nested positions around -230,540: lower edges add, upper edges remove.
+        let w = (k as i32 + 1) * 40 * SPACING;
+        nodes[31 - k] = TickNode::new(-230_540 - w, 1_000_000_000_000_000);
+        nodes[32 + k] = TickNode::new(-230_540 + w, -1_000_000_000_000_000);
+        k += 1;
+    }
+    let mut map = Box::new(TickMap::<1024>::EMPTY);
+    map.load(&nodes, -250_000, -210_000, SPACING).expect("gate 63 map");
+    let (lo, hi) = sqrt_at_tick(-230_543);
+    let state = PoolState::new(lo, hi, -230_543, 32_000_000_000_000_000);
+    let mut meta = PoolMeta::ZERO;
+    meta.tick_spacing = SPACING;
+    meta.fee_pips = 500;
+    meta.dec0 = 18;
+    meta.dec1 = 6;
+    let mid = price_1e18_from_sqrt(lo, hi, 18, 6);
+
+    let g = AllocGuard::new();
+    let mut traded = 0u64;
+    let mut acc: u128 = 0;
+    let mut n = 0u64;
+    while n < 5_000 {
+        // Hedge bid swings ±150 bps around the pool mid.
+        let bps = (n % 301) as u128;
+        let bid = mid - mid * 150 / 10_000 + mid * bps / 10_000;
+        let q = solve_arb(&state, &meta, &map, &ArbParams {
+            eff_bid_1e18: bid,
+            eff_ask_1e18: bid + bid / 5_000,
+            px0_usd_1e6: (mid / 1_000_000_000_000) as i64,
+            max_notional_usd_1e6: 20_000_000_000,
+            gas_usd_1e6: 10_000,
+        });
+        if q.side != ArbSide::None {
+            traded += 1;
+            acc = acc.wrapping_add(q.token0_raw);
+        }
+        let (tl, th) = sqrt_at_tick(-230_543 + (n % 400) as i32 - 200);
+        let spec = SwapSpec {
+            amount: 1_000_000_000_000_000_000,
+            limit_lo: tl,
+            limit_hi: th,
+            fee_pips: 500,
+            zero_for_one: n % 400 < 200,
+            exact_in: n % 2 == 0,
+        };
+        let r = swap_exact(&state, &meta, &map, &spec);
+        let m = swap_exact_in_range(&state, &meta, &spec);
+        acc = acc.wrapping_add(r.amount_out).wrapping_add(m.amount_out);
+        acc = acc.wrapping_add(tick_at_sqrt(r.after.sqrt_price_lo, r.after.sqrt_price_hi) as u128);
+        n += 1;
+    }
+    std::hint::black_box((traded, acc));
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(traded > 0 && acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "core-amm walk/solve allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "core-amm hot bytes should be zero: saw {bytes}");
+}

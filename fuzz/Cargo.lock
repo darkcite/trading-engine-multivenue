@@ -61,6 +61,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-amm"
+version = "0.1.0"
+
+[[package]]
 name = "core-config"
 version = "0.1.0"
 dependencies = [
@@ -388,6 +392,7 @@ version = "0.0.0"
 dependencies = [
  "book-builder",
  "clob-dispatcher",
+ "core-amm",
  "core-config",
  "core-crypto",
  "core-net",
