@@ -51,7 +51,9 @@ use core_types::InstrumentClass;
 /// * `mexc:<SYM>` → `Spot` (tokenized xStocks such as `AAPLXUSDT` are
 ///   ordinary spot rows — no new class, plan §4 D6); `mexc-perp:<SYM>`
 ///   → `Perp` ALWAYS: MEXC lists no dated futures, and its TradFi /
-///   equity / FX / metal contracts are ordinary perps.
+///   equity / FX / metal contracts are ordinary perps;
+/// * `hyperevm:<0x address>` → `Spot` (HYPARB H3b: an AMM pool trades
+///   token0 against token1 outright — a spot exchange with a curve).
 #[must_use]
 pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
     if descriptor.is_empty() {
@@ -86,6 +88,7 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
         }),
         "mexc" => Some(InstrumentClass::Spot),
         "mexc-perp" => Some(InstrumentClass::Perp),
+        "hyperevm" => Some(InstrumentClass::Spot),
         _ => None,
     }
 }
@@ -252,6 +255,11 @@ mod tests {
         assert_eq!(class_of_descriptor("mexc-perp:BTC_USDT"), Some(Perp));
         assert_eq!(class_of_descriptor("mexc-perp:XAU_USDT"), Some(Perp));
         assert_eq!(class_of_descriptor("mexc-perp:AAPLSTOCK_USDT"), Some(Perp));
+        // HYPARB H3b: a HyperEVM pool is spot.
+        assert_eq!(
+            class_of_descriptor("hyperevm:0x6c9a33e3b592c0d65b3ba59355d5be0d38259285"),
+            Some(Spot)
+        );
         assert_eq!(
             class_of_descriptor(
                 "105554486916384658090975601083014063097607795931086109853984637938068004048895"
@@ -269,6 +277,7 @@ mod tests {
         assert_eq!(class_of_descriptor("mexc:"), None);
         assert_eq!(class_of_descriptor("mexc-perp:"), None);
         assert_eq!(class_of_descriptor("mexc-spot:BTCUSDT"), None);
+        assert_eq!(class_of_descriptor("hyperevm:"), None);
         assert_eq!(class_of_descriptor("okx:BTC-USD-FOO-77000-C"), None);
         assert_eq!(class_of_descriptor("okx:BTC"), None);
         assert_eq!(class_of_descriptor("deribit:BTC-FS-26SEP26_PERP"), None);

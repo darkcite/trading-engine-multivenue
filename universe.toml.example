@@ -133,6 +133,19 @@ spot = []   # e.g. ["BTCUSDT", "ETHUSDT", "AAPLXUSDT", "SPYXUSDT"]
 # BBO comes from depth.full(limit 5) at ~270 ms, NOT push.ticker (~2.75 s).
 perp = []   # e.g. ["BTC_USDT", "XAU_USDT", "USOIL_USDT", "EUR_USDT", "SPY_USDT"]
 
+[hyperevm]
+# HYPARB H3b. One entry per AMM pool, "0x<address>:<family>:<dec0>:<dec1>":
+#   address — the POOL contract, 40 LOWERCASE hex (the descriptor is
+#             hyperevm:0x<address>; one spelling, so one identity);
+#   family  — v3 (Uniswap V3 ABI) | slipstream (Aerodrome fork) |
+#             algebra (Algebra Integral v1.0 / v1.2);
+#   dec0/1  — token0 / token1 decimals() (0..=36). CHECKED on chain before
+#             every snapshot: a mismatch refuses that pool, never misprices it.
+# pools[i] -> make_symbol_id(HyperEvm, i+1); at most 128. APPEND, never
+# reorder — a reordered list re-keys every pool on the tape. Ingested only
+# with --hyperevm-path on HYPEREVM_WS_HOST (an archive-honest endpoint).
+pools = []  # e.g. ["0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18:6"]
+
 [pairs]
 # Latency-arb pairs: "P:B" = polymarket.markets[P] × binance.spot[B]
 # (0-based file order; a YES/NO market entry resolves to its YES token).

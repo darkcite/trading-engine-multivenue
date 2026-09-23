@@ -132,11 +132,26 @@ fn answer_all(bodies: &[String], ps: &[FakePool], snap_block: u64) -> Vec<u8> {
             let to = field(body, "\"to\":\"");
             let data = field(body, "\"data\":\"");
             let block = u64::from_str_radix(&field(body, "},\"")[2..], 16).unwrap();
-            let p = ps
-                .iter()
-                .find(|p| crate::hex::hex_fixed::<20>(to.as_bytes(), 0).unwrap().0 == p.address)
-                .unwrap();
+            let to_addr = crate::hex::hex_fixed::<20>(to.as_bytes(), 0).unwrap().0;
+            // The two `decimals()` reads are addressed to a TOKEN.
+            let (p, token) = match ps.iter().find(|p| p.address == to_addr) {
+                Some(p) => (p, None),
+                None => {
+                    let p = ps
+                        .iter()
+                        .find(|p| p.tokens().0 == to_addr || p.tokens().1 == to_addr)
+                        .unwrap();
+                    (p, Some(p.tokens().1 == to_addr))
+                }
+            };
             let kind = match &data[2..10] {
+                "313ce567" => match token {
+                    Some(true) => ReadKind::Dec1,
+                    Some(false) => ReadKind::Dec0,
+                    None => panic!("decimals() sent to a pool"),
+                },
+                "0dfe1681" => ReadKind::Token0,
+                "d21220a7" => ReadKind::Token1,
                 "3850c7bd" | "e76c01e4" => ReadKind::Head,
                 "1a686502" => ReadKind::Liquidity,
                 "ddca3f43" => ReadKind::Fee,
@@ -473,4 +488,111 @@ fn a_reconnect_announces_the_break() {
         vec![(SYMBOL_ID_NONE, PoolEvent::Gap { block: B + 9 })]
     );
     assert_eq!(r.d.phase(), Phase::Subscribing);
+}
+
+/// A pool with 300 initialised ticks around its price (the live WHYPE /
+/// USDC shape: nearly every tick of a 10-spaced grid initialised).
+fn dense_pool() -> Vec<FakePool> {
+    let mut pos = Vec::new();
+    let mut k = 1i32;
+    while k <= 150 {
+        pos.push((-230_550 - 10 * k, -230_530 + 10 * k, 1_000 + k as u128));
+        k += 1;
+    }
+    vec![FakePool::from_positions(
+        PoolFamily::UniswapV3,
+        [0x10; 20],
+        -230_543,
+        10,
+        500,
+        &pos,
+    )]
+}
+
+/// HYPARB H3b live-smoke finding: the archive endpoint answers a deep
+/// burst of reads OUT OF ORDER, and a read can stay unanswered while
+/// hundreds of later ids complete. The driver keeps at most
+/// `MAX_READS_IN_FLIGHT` reads out, skips the pending slot a straggler
+/// still holds instead of colliding with it (the old behaviour ended the
+/// session), and completes the snapshot once the straggler is answered.
+#[test]
+fn a_dense_snapshot_is_read_in_a_bounded_window_around_a_straggler() {
+    let ps = dense_pool();
+    let ring = Ring::<Signal, CAP>::new();
+    let (mut prod, mut cons) = ring.split();
+    let mut r = to_await_head(&ps, &mut prod);
+    r.t.inject_incoming(&head_push(B));
+    r.step(&mut prod).unwrap();
+    assert_eq!(r.d.phase(), Phase::Reading);
+
+    let mut held: Option<(u64, String)> = None;
+    let mut released = false;
+    let mut max_id = 0u64;
+    let mut rounds = 0;
+    while r.d.phase() != Phase::Live {
+        rounds += 1;
+        assert!(rounds < 1_000, "stuck in {:?}", r.d.phase());
+        assert!(r.d.reads_in_flight() <= MAX_READS_IN_FLIGHT);
+        let mut bodies = client_bodies(&mut r.t);
+        let calls = bodies.iter().filter(|b| b.contains("eth_call")).count();
+        assert!(calls <= MAX_READS_IN_FLIGHT, "{calls} reads in one round");
+        for b in &bodies {
+            max_id = max_id.max(field(b, "\"id\":").parse().unwrap());
+        }
+        // Hold back the first `ticks()` read until it is the only read
+        // left; answer the rest newest-first.
+        if held.is_none() {
+            if let Some(i) = bodies.iter().position(|b| b.contains("f30dba93")) {
+                let b = bodies.remove(i);
+                held = Some((field(&b, "\"id\":").parse().unwrap(), b));
+            }
+        }
+        if !released && r.d.reads_in_flight() == 1 && bodies.is_empty() {
+            if let Some((_, b)) = &held {
+                bodies.push(b.clone());
+                released = true;
+            }
+        }
+        bodies.reverse();
+        r.t.inject_incoming(&answer_all(&bodies, &ps, B));
+        r.step(&mut prod).unwrap();
+    }
+    let (straggler, _) = held.expect("a read was held");
+    assert!(released, "the straggler was answered last");
+    assert!(
+        max_id > straggler + PENDING_CAP as u64,
+        "later ids wrapped onto the straggler's slot ({straggler} → {max_id})"
+    );
+    let sig = drain(&mut cons);
+    let ticks = sig
+        .iter()
+        .filter(|x| matches!(x.1, PoolEvent::Tick { .. }))
+        .count();
+    assert_eq!(ticks, 300, "every initialised tick emitted");
+    assert_eq!(r.d.snapshot_counters().pools_ok, 1);
+}
+
+#[test]
+fn alloc_id_skips_a_slot_a_straggler_still_holds() {
+    let ps = pools();
+    let mut d = driver(&ps);
+    record_pending(&mut d, 5, RpcKind::EthCall).unwrap();
+    d.next_id = 5 + PENDING_CAP as u64;
+    assert_eq!(alloc_id(&mut d), 6 + PENDING_CAP as u64, "261 folds onto 5");
+    assert_eq!(alloc_id(&mut d), 7 + PENDING_CAP as u64);
+    // Id 0 is reserved: the counter never hands it out.
+    d.next_id = u64::MAX;
+    assert_eq!(alloc_id(&mut d), u64::MAX);
+    assert_eq!(d.next_id, 1);
+}
+
+#[test]
+fn a_snapshot_stalls_only_with_reads_out_and_no_answer() {
+    assert!(!snapshot_stalled(0, 0, SNAP_STALL_NS * 10));
+    assert!(!snapshot_stalled(3, 1_000, 1_000 + SNAP_STALL_NS));
+    assert!(snapshot_stalled(3, 1_000, 1_001 + SNAP_STALL_NS));
+    assert!(
+        !snapshot_stalled(3, 5_000, 1_000),
+        "a clock behind progress is not a stall"
+    );
 }

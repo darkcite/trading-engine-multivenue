@@ -7787,8 +7787,10 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
 
     // Everything the node will say, rendered now. Ids are the driver's:
     // 1 newHeads, 2 logs, 3.. the Algebra header reads in issue order
-    // (globalState, liquidity, tickSpacing, prev, next, probe), then the
-    // two list reads (both markers: an empty book).
+    // (globalState, liquidity, tickSpacing, prev, next, token0, token1,
+    // probe), then the two `decimals()` reads (HYPARB H3b: 18 / 6, the
+    // configured values) and the two list reads (both markers: an empty
+    // book).
     let (sqrt, _) = core_amm::sqrt_at_tick(-297_448);
     let gs = |s: u128| {
         format!(
@@ -7823,9 +7825,15 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
         reply(5, &word_i(1)),
         reply(6, &word_i(-887_272)),
         reply(7, &word_i(887_272)),
-        reply(8, &gs(sqrt + 1)),
+        reply(8, &format!("{}{}", "0".repeat(24), "11".repeat(20))),
+        reply(9, &format!("{}{}", "0".repeat(24), "22".repeat(20))),
+        reply(10, &gs(sqrt + 1)),
     ];
-    let links = [reply(9, &marker), reply(10, &marker)];
+    let decimals = [
+        reply(11, &format!("{:064x}", 18u64)),
+        reply(12, &format!("{:064x}", 6u64)),
+    ];
+    let links = [reply(13, &marker), reply(14, &marker)];
     let a: String = addr.iter().map(|b| format!("{b:02x}")).collect();
     let swap = frame(format!(
         r#"{{"jsonrpc":"2.0","method":"eth_subscription","params":{{"subscription":"0x1111478923ff08bf67fde6c640131500","result":{{"address":"0x{a}","topics":["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67","0x{z}","0x{z}"],"data":"0x{d0}{d1}{d2:064x}{d3:064x}{d4}","blockNumber":"0x{b:x}","logIndex":"0x1","removed":false}}}}}}"#,
@@ -7876,6 +7884,8 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
     )
     .unwrap();
     let _ = transport.drain_outgoing(&mut sink);
+    transport.inject_incoming(&decimals[0]);
+    transport.inject_incoming(&decimals[1]);
     transport.inject_incoming(&links[0]);
     transport.inject_incoming(&links[1]);
     hwl::drive_one(

@@ -165,6 +165,14 @@ pub struct Config {
     /// Env: `MEXC_FUT_REST_HOST`. Default: `contract.mexc.com`. Four
     /// hosts because MEXC splits spot and futures on both planes.
     pub mexc_fut_rest_host: String,
+    /// HYPARB H3b: HyperEVM JSON-RPC WebSocket host (`newHeads`, pool
+    /// logs, the in-session snapshots and their archive probe). Env:
+    /// `HYPEREVM_WS_HOST`. Default: `rpc.purroofgroup.com` — the only
+    /// endpoint measured to answer historical `eth_call` honestly and to
+    /// upgrade a WebSocket (O-H15); the official one and hypurrscan
+    /// return LATEST state for a past block. The path is the boot flag
+    /// `--hyperevm-path`.
+    pub hyperevm_ws_host: String,
     /// AI-command UDS path (Phase 8f §4.2). Env: `AI_INGRESS_SOCK`.
     /// Default: `~/multivenue/run/ai.sock` (tilde expanded at load,
     /// like `log_dir`). The companion secret `AI_INGRESS_HMAC_KEY` is
@@ -231,6 +239,8 @@ impl Config {
             mexc_rest_host: env_opt("MEXC_REST_HOST").unwrap_or_else(|| "api.mexc.com".into()),
             mexc_fut_rest_host: env_opt("MEXC_FUT_REST_HOST")
                 .unwrap_or_else(|| "contract.mexc.com".into()),
+            hyperevm_ws_host: env_opt("HYPEREVM_WS_HOST")
+                .unwrap_or_else(|| "rpc.purroofgroup.com".into()),
             ai_ingress_sock: expand_tilde(
                 &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
             )?,
@@ -685,6 +695,10 @@ mod tests {
         assert_eq!(cfg.mexc_fut_ws_host, "contract.mexc.com");
         assert_eq!(cfg.mexc_rest_host, "api.mexc.com");
         assert_eq!(cfg.mexc_fut_rest_host, "contract.mexc.com");
+        assert_eq!(
+            cfg.hyperevm_ws_host, "rpc.purroofgroup.com",
+            "HYPARB H3b default"
+        );
         // SAFETY: test-only env mutation; see module note above.
         unsafe {
             std::env::set_var("MEXC_WS_HOST", "spot-ws.example");

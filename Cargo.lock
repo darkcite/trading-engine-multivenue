@@ -343,6 +343,7 @@ dependencies = [
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
  "ingress-okx",

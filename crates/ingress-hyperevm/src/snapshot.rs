@@ -15,8 +15,16 @@
 //!
 //! | family | header reads | map reads |
 //! |---|---|---|
-//! | V3 / Slipstream | `slot0`, `liquidity`, `fee`, `tickSpacing`, `slot0`@`B−1000` | `tickBitmap` words over the coverage, then `ticks(t)` per set bit |
-//! | Algebra | `globalState`, `liquidity`, `tickSpacing`, `prevTickGlobal`, `nextTickGlobal`, `globalState`@`B−1000` | `ticks(t)` walked down and up the linked list |
+//! | V3 / Slipstream | `slot0`, `liquidity`, `fee`, `tickSpacing`, `token0`, `token1`, `slot0`@`B−1000` | `tickBitmap` words over the coverage, then `ticks(t)` per set bit |
+//! | Algebra | `globalState`, `liquidity`, `tickSpacing`, `prevTickGlobal`, `nextTickGlobal`, `token0`, `token1`, `globalState`@`B−1000` | `ticks(t)` walked down and up the linked list |
+//!
+//! **Decimals are verified, not trusted (HYPARB H3b).** The pool table
+//! carries each token's decimals from the operator's config — they ride
+//! every `SNAPSHOT` so a replay prices the pool from the tape alone. Once
+//! a pool's headers are in, `decimals()` is read on BOTH tokens (the two
+//! reads that are not addressed to the pool); a value that differs from
+//! the config fails the pool (`SnapCounters::dec_mismatch`) — a typo is a
+//! refused pool, never a price off by 10^12.
 //!
 //! **O-H4 — the archive probe is part of every snapshot.** The price at
 //! `B − 1000` must differ from the price at `B` for at least one pool;
@@ -81,6 +89,14 @@ pub enum ReadKind {
     LinkDown = 9,
     /// `ticks(int24 arg)` walking the Algebra list up.
     LinkUp = 10,
+    /// `token0()`.
+    Token0 = 11,
+    /// `token1()`.
+    Token1 = 12,
+    /// `decimals()` on token0 (addressed to the TOKEN).
+    Dec0 = 13,
+    /// `decimals()` on token1 (addressed to the TOKEN).
+    Dec1 = 14,
 }
 
 /// One `eth_call` the snapshotter wants sent.
@@ -131,6 +147,9 @@ impl Call {
             ReadKind::Next => [0xd5, 0xc3, 0x5a, 0x7e],
             ReadKind::Bitmap => [0x53, 0x39, 0xc2, 0x96],
             ReadKind::Tick | ReadKind::LinkDown | ReadKind::LinkUp => [0xf3, 0x0d, 0xba, 0x93],
+            ReadKind::Token0 => [0x0d, 0xfe, 0x16, 0x81],
+            ReadKind::Token1 => [0xd2, 0x12, 0x20, 0xa7],
+            ReadKind::Dec0 | ReadKind::Dec1 => [0x31, 0x3c, 0xe5, 0x67],
         };
         dst[0] = b'0';
         dst[1] = b'x';
@@ -199,6 +218,9 @@ pub struct SnapCounters {
     pub nodes: u32,
     /// Pools whose coverage was narrowed to fit the node / word caps.
     pub narrowed: u32,
+    /// Pools refused because a token's `decimals()` differs from the
+    /// configured value (HYPARB H3b).
+    pub dec_mismatch: u32,
 }
 
 const DIR_READY: u8 = 0;
@@ -209,6 +231,11 @@ const DIR_DONE: u8 = 2;
 struct PoolSnap {
     failed: bool,
     done: bool,
+    /// The map half is complete (the pool is `done` once the decimals
+    /// are verified too).
+    map_done: bool,
+    dec_issued: u8,
+    dec_got: u8,
     hdr_next: u8,
     hdr_got: u8,
     sqrt: (u128, u32),
@@ -242,6 +269,9 @@ impl PoolSnap {
     const ZERO: Self = Self {
         failed: false,
         done: false,
+        map_done: false,
+        dec_issued: 0,
+        dec_got: 0,
         hdr_next: 0,
         hdr_got: 0,
         sqrt: (0, 0),
@@ -271,19 +301,23 @@ impl PoolSnap {
 }
 
 /// Header reads, in issue order, per family.
-const HDR_V3: [ReadKind; 5] = [
+const HDR_V3: [ReadKind; 7] = [
     ReadKind::Head,
     ReadKind::Liquidity,
     ReadKind::Fee,
     ReadKind::Spacing,
+    ReadKind::Token0,
+    ReadKind::Token1,
     ReadKind::ProbeHead,
 ];
-const HDR_ALGEBRA: [ReadKind; 6] = [
+const HDR_ALGEBRA: [ReadKind; 8] = [
     ReadKind::Head,
     ReadKind::Liquidity,
     ReadKind::Spacing,
     ReadKind::Prev,
     ReadKind::Next,
+    ReadKind::Token0,
+    ReadKind::Token1,
     ReadKind::ProbeHead,
 ];
 
@@ -312,8 +346,13 @@ pub struct Snapshotter {
     n: usize,
     family: [PoolFamily; HYPEREVM_MAX_POOLS],
     sym: [SymbolId; HYPEREVM_MAX_POOLS],
-    /// `(dec0, dec1)` per pool, carried on each `SNAPSHOT`.
+    /// `(dec0, dec1)` per pool, carried on each `SNAPSHOT` — and checked
+    /// against `decimals()` on chain before it is.
     dec: [(u8, u8); HYPEREVM_MAX_POOLS],
+    /// `0x…` ASCII of each pool's `(token0, token1)`, from this
+    /// snapshot's `token0()` / `token1()` reads — the `to` of the two
+    /// `decimals()` reads.
+    tokens: Vec<[[u8; 42]; 2]>,
     radius: i32,
     block: u64,
     gen: u32,
@@ -359,6 +398,7 @@ impl Snapshotter {
             state: SnapState::Idle,
             rr: 0,
             snaps: vec![PoolSnap::ZERO; n],
+            tokens: vec![[[0u8; 42]; 2]; n],
             words: vec![[[0u64; 4]; MAX_BITMAP_WORDS]; n],
             down: vec![[TickNode::ZERO; MAP_NODES]; n],
             up: vec![[TickNode::ZERO; MAP_NODES / 2]; n],
@@ -409,6 +449,17 @@ impl Snapshotter {
         self.family[i]
     }
 
+    /// The `0x…` address a read of pool `p` is sent TO: the token for the
+    /// two `decimals()` reads, `None` (= the pool itself) for every other.
+    #[inline]
+    pub fn read_target(&self, p: usize, kind: ReadKind) -> Option<&[u8; 42]> {
+        match kind {
+            ReadKind::Dec0 => Some(&self.tokens[p][0]),
+            ReadKind::Dec1 => Some(&self.tokens[p][1]),
+            _ => None,
+        }
+    }
+
     /// The next read to send, if any is ready (reads within a pool
     /// depend on earlier ones; pools proceed independently).
     pub fn next_call(&mut self) -> Option<Call> {
@@ -455,6 +506,22 @@ impl Snapshotter {
         }
         if (s.hdr_got as usize) < hdr.len() {
             return None;
+        }
+        if s.dec_issued < 2 {
+            let kind = if s.dec_issued == 0 {
+                ReadKind::Dec0
+            } else {
+                ReadKind::Dec1
+            };
+            s.dec_issued += 1;
+            return Some(Call {
+                pool: p as u16,
+                kind,
+                idx: 0,
+                arg: 0,
+                block: b,
+                gen: self.gen,
+            });
         }
         if f == PoolFamily::Algebra {
             if s.down_state == DIR_READY {
@@ -558,6 +625,12 @@ impl Snapshotter {
             ReadKind::Tick => self.on_tick(p, call.idx as usize, call.arg, r, ds, dn),
             ReadKind::LinkDown | ReadKind::LinkUp => {
                 self.on_link(p, call.kind == ReadKind::LinkDown, call.arg, r, ds, dn)
+            }
+            ReadKind::Token0 | ReadKind::Token1 => {
+                self.on_token(p, call.kind == ReadKind::Token1, r, ds, dn)
+            }
+            ReadKind::Dec0 | ReadKind::Dec1 => {
+                self.on_decimals(p, call.kind == ReadKind::Dec1, r, ds, dn)
             }
         };
         if !ok {
@@ -799,9 +872,8 @@ impl Snapshotter {
         s.t_issued = 0;
         s.t_got = 0;
         if n == 0 {
-            s.done = true;
-            self.counters.pools_ok += 1;
-            self.check_complete();
+            s.map_done = true;
+            self.maybe_done(p);
         }
         true
     }
@@ -834,9 +906,8 @@ impl Snapshotter {
         let s = &mut self.snaps[p];
         s.t_got += 1;
         if s.t_got == s.cand_n {
-            s.done = true;
-            self.counters.pools_ok += 1;
-            self.check_complete();
+            s.map_done = true;
+            self.maybe_done(p);
         }
         true
     }
@@ -927,10 +998,67 @@ impl Snapshotter {
     fn link_progress(&mut self, p: usize) -> bool {
         let s = &mut self.snaps[p];
         if s.down_state == DIR_DONE && s.up_state == DIR_DONE {
+            s.map_done = true;
+            self.maybe_done(p);
+        }
+        true
+    }
+
+    /// A pool is done when its map is AND both decimals are verified.
+    fn maybe_done(&mut self, p: usize) {
+        let s = &mut self.snaps[p];
+        if s.map_done && s.dec_got == 2 && !s.done && !s.failed {
             s.done = true;
             self.counters.pools_ok += 1;
             self.check_complete();
         }
+    }
+
+    /// `token0()` / `token1()`: one address word (12 zero bytes, then 20).
+    fn on_token(&mut self, p: usize, second: bool, r: &[u8], ds: usize, dn: usize) -> bool {
+        if dn != 1 {
+            return false;
+        }
+        // An address word is a u160 (the top 96 bits zero — checked by
+        // `word_u160`), big-endian: 4 bytes of `hi`, then 16 of `lo`.
+        let Some((lo, hi)) = word_u160(word(r, ds, 0)) else {
+            return false;
+        };
+        let mut addr = [0u8; 20];
+        addr[..4].copy_from_slice(&hi.to_be_bytes());
+        addr[4..].copy_from_slice(&lo.to_be_bytes());
+        if addr == [0u8; 20] {
+            return false;
+        }
+        let k = usize::from(second);
+        if crate::hex::render_hex(&mut self.tokens[p][k], &addr) != Some(42) {
+            return false;
+        }
+        let f = self.family[p];
+        let s = &mut self.snaps[p];
+        s.hdr_got += 1;
+        if s.hdr_got as usize == hdr_reads(f).len() {
+            return self.headers_done(p);
+        }
+        true
+    }
+
+    /// `decimals()` of token0 / token1 must equal the configured value.
+    fn on_decimals(&mut self, p: usize, second: bool, r: &[u8], ds: usize, dn: usize) -> bool {
+        let Some(v) = (if dn == 1 {
+            word_u32(word(r, ds, 0))
+        } else {
+            None
+        }) else {
+            return false;
+        };
+        let want = if second { self.dec[p].1 } else { self.dec[p].0 };
+        if v != u32::from(want) {
+            self.counters.dec_mismatch += 1;
+            return false;
+        }
+        self.snaps[p].dec_got += 1;
+        self.maybe_done(p);
         true
     }
 

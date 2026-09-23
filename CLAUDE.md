@@ -313,7 +313,7 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   `Keepalive`), parse (byte scanners + the `pb` protobuf walker), simd,
   crypto (SHA-256/HMAC/base64), types (wire PODs, `SymbolId`, `VenueId`),
   regime, vol, fill, latency, metrics (fixed registry, 512 counters).
-- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc}` —
+- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
 - `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed

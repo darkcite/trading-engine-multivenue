@@ -105,10 +105,12 @@ pub(crate) const fn pmlr_version_accepted(version: u16) -> bool {
 
 /// Per-venue tick-capture file labels, in file-ordinal order (mirrors
 /// `audit_replay::VENUE_LABELS` — the cli spawn labels exactly;
-/// `bybit` appended at WS9, `mexc` at MX2 — append, never reorder).
+/// `bybit` appended at WS9, `mexc` at MX2, `hyperevm` at HYPARB H3b —
+/// append, never reorder).
 /// `pub(crate)`: `capture_catalog` reports in this fixed order.
-pub(crate) const VENUE_LABELS: [&str; 8] =
-    ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc"];
+pub(crate) const VENUE_LABELS: [&str; 9] = [
+    "pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc", "hyperevm",
+];
 
 /// Venue labels accepted by the §4.3/§4.4 model flags, mapped to the
 /// wire-stable [`VenueId`] byte. `rpc` is absent by design: it is not

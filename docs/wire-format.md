@@ -597,6 +597,23 @@ parser rejected the payload. The file is budget-bounded at capture
 time; a torn final record (crash mid-write) is detected by readers and
 terminates iteration.
 
+### HyperEVM pool events (HYPARB H3b)
+
+Label `hyperevm` (VenueId 8), appended after `mexc`. The venue writes NO
+tick rows: everything it observes is a `Signal` (kind 1) in
+`hyperevm-signals.pmlr` with `source = SignalSource::HyperEvm` (5), `sym`
+= the pool (`make_symbol_id(HyperEvm, i+1)` for `[hyperevm] pools[i]`) or
+`SYMBOL_ID_NONE` for the chain-wide `HEAD` / `GAP`, and the 40-byte
+payload of `core_amm::payload` — ONE codec for the ring, the tape and the
+replay (its module doc is the byte-level contract). One swap is `SWAP`
+then `STATE`; a pool snapshot is `SNAPSHOT` (block, family, coverage,
+node count, fee in force, `tickSpacing`, token decimals — checked against
+`decimals()` on chain) · `nodes` × `TICK` · `STATE(snapshot)`, published
+before any later event, so a replay rebuilds the maps the live member
+walked. A capture is therefore self-describing: the harness prices and
+judges a pool from the tape alone (`core_fill::AmmBook`). Volume: one
+signal per event (≈ 2 per swap), never per block per pool.
+
 ## Replay log
 
 **TODO** — pinned here in Phase 1. Provisional shape:

@@ -69,6 +69,13 @@ pub const TICK_RING_SIZE: usize = 16_384;
 /// `ingress_rpc::run_loop::DEFAULT_SIGNAL_RING_CAP` so the
 /// consumer type lines up without a re-allocate.
 pub const SIGNAL_RING_SIZE: usize = 1_024;
+/// HYPARB H3b: the pool-event lane (the HyperEVM ingress's
+/// `Signal`s). Larger than the RPC lane because a pool snapshot is a
+/// burst — `SNAPSHOT` + up to 1,024 `TICK`s + `STATE` per pool — which
+/// the ingress flow-controls against this ring rather than dropping.
+/// `ingress_hyperevm::run_loop::DEFAULT_POOL_RING_CAP` must equal this
+/// — the cli const-asserts it.
+pub const POOL_RING_SIZE: usize = 4_096;
 /// Fill ring capacity (per lane).
 pub const FILL_RING_SIZE: usize = 1_024;
 
@@ -214,6 +221,9 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Unspawned venues hand a producer-dropped ring (§3.3 pattern).
     opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
     sig_cons: Consumer<Signal, SIGNAL_RING_SIZE>,
+    /// HYPARB H3b: the pool-event lane, attached by
+    /// [`Self::set_pool_lane`] (boot-only). `None` = no HyperEVM source.
+    pool_cons: Option<Consumer<Signal, POOL_RING_SIZE>>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     /// AI command lane (Phase 8f §4.3). Sole consumer of the
@@ -355,6 +365,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             depth_lanes,
             opt_lanes,
             sig_cons,
+            pool_cons: None,
             fill_lanes,
             ai_cons,
             ai_status,
@@ -489,29 +500,29 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             match self.sig_cons.try_pop() {
                 Some(s) => {
                     consumed += 1;
-                    let now = now_ns();
-                    self.ingest_lat.record(now.saturating_sub(s.ts_ns));
-                    // HYPARB H2: a pool event reaches the dispatcher
-                    // FIRST, exactly as a tick does — a PAPER one keeps
-                    // pool state and judges its AMM swaps on each head
-                    // (`core_fill::amm`); a live one does nothing.
-                    if s.source == SignalSource::HyperEvm as u8 {
-                        self.disp.observe_amm(s.sym, &s.payload, now);
-                    }
-                    let mut ctx = EngineCtx {
-                        disp: &mut self.disp,
-                        decide_lat: &self.decide_lat,
-                        order_capture: self.order_capture.as_mut(),
-                        recent_orders: &mut self.recent_orders,
-                        lifecycle: &mut self.lifecycle,
-                        now,
-                    };
-                    self.strat.on_signal(&s, &mut ctx);
-                    self.signals_dispatched = self.signals_dispatched.wrapping_add(1);
+                    self.dispatch_signal(&s);
                 }
                 None => break,
             }
             i += 1;
+        }
+        // --- pool events (HYPARB H3b) ---
+        if self.pool_cons.is_some() {
+            let mut i = 0;
+            while i < max_per_ring {
+                let popped = match self.pool_cons.as_mut() {
+                    Some(c) => c.try_pop(),
+                    None => None,
+                };
+                match popped {
+                    Some(s) => {
+                        consumed += 1;
+                        self.dispatch_signal(&s);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
         }
 
         // --- fill lanes ---
@@ -942,6 +953,37 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             .write_hgrm(out, "engine.strategy_to_submit")?;
         self.ack_lat.write_hgrm(out, "engine.submit_to_ack")?;
         Ok(())
+    }
+
+    /// One signal, from either signal lane: latency sample, the
+    /// dispatcher's pool hook (HYPARB H2 — a pool event reaches the
+    /// dispatcher FIRST, exactly as a tick does: a PAPER one keeps pool
+    /// state and judges its AMM swaps on each head, a live one does
+    /// nothing), then the member.
+    #[inline(always)]
+    fn dispatch_signal(&mut self, s: &Signal) {
+        let now = now_ns();
+        self.ingest_lat.record(now.saturating_sub(s.ts_ns));
+        if s.source == SignalSource::HyperEvm as u8 {
+            self.disp.observe_amm(s.sym, &s.payload, now);
+        }
+        let mut ctx = EngineCtx {
+            disp: &mut self.disp,
+            decide_lat: &self.decide_lat,
+            order_capture: self.order_capture.as_mut(),
+            recent_orders: &mut self.recent_orders,
+            lifecycle: &mut self.lifecycle,
+            now,
+        };
+        self.strat.on_signal(s, &mut ctx);
+        self.signals_dispatched = self.signals_dispatched.wrapping_add(1);
+    }
+
+    /// HYPARB H3b: attach the pool-event lane (boot-only, before
+    /// [`Self::start`]). Drained every iteration right after the RPC
+    /// signal lane, through the same per-signal path.
+    pub fn set_pool_lane(&mut self, cons: Consumer<Signal, POOL_RING_SIZE>) {
+        self.pool_cons = Some(cons);
     }
 
     /// Attach the engine-thread fills capture (boot-only, before
@@ -2451,6 +2493,16 @@ mod tests {
             vec!["dispatcher-amm", "strategy", "strategy"],
             "the pool event is booked first; a foreign source never takes the hook"
         );
+
+        // HYPARB H3b: the dedicated pool lane takes the same path.
+        log.borrow_mut().clear();
+        let (mut pp, pc) = Ring::<Signal, POOL_RING_SIZE>::new().split();
+        eng.set_pool_lane(pc);
+        let n0 = eng.signals_dispatched;
+        pp.try_push(amm).unwrap();
+        eng.tick(16);
+        assert_eq!(*log.borrow(), vec!["dispatcher-amm", "strategy"]);
+        assert_eq!(eng.signals_dispatched, n0 + 1, "counted as a signal");
     }
 
     /// A member that SUBMITS on a roll — the case the ordering exists

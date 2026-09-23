@@ -1601,3 +1601,58 @@ As §6 says, with these decisions recorded:
   fuzz `amm_book` (new — no panic, never `Wait`, a fill within size and
   limit, never on a pool that is not live) and the two codec targets
   re-run after the `SNAPSHOT` change.
+
+### 16.10 H3b — the HyperEVM ingress wired — LANDED
+
+* **Where the pools come from:** `universe.toml [hyperevm] pools =
+  ["0x<addr>:<v3|slipstream|algebra>:<dec0>:<dec1>", …]` (≤ 128, append
+  only; `pools[i]` = `make_symbol_id(HyperEvm, i+1)` = the `AmmBook`
+  slot; descriptor `hyperevm:0x<addr>`, class `Spot` in the Rust + Python
+  descriptor law). The universe is the one place symbols are allocated,
+  and the ingress captures whether or not the member runs. **The live
+  `main` binary refuses an unknown section — `[hyperevm]` never enters the
+  live `universe.toml` before the merge; hyparb smokes boot with
+  `--universe <copy>`.**
+* **Decimals are verified on chain** (the §16.9 promise): every snapshot
+  reads `token0()` / `token1()` with the headers and then `decimals()` on
+  each TOKEN (the only reads not addressed to the pool); a mismatch fails
+  that pool (`SnapCounters::dec_mismatch`). A pool is done when its map is
+  AND both decimals agree.
+* **Engine:** a dedicated pool lane (`engine::POOL_RING_SIZE` 4,096 —
+  snapshots are bursts the ingress flow-controls against it), attached by
+  `Engine::set_pool_lane` and drained through the same per-signal path as
+  the RPC lane (`dispatch_signal`: latency sample → `observe_amm` for
+  HyperEvm sources → `on_signal`).
+* **cli:** `spawn_hyperevm` (`spawn_rpc`'s shape + a tap venue byte + an
+  `ArchiveDishonest` exit that does not reconnect — O-H15: the member goes
+  dark, the engine runs on), `hyperevm_pool_table`, `--hyperevm-path` +
+  `HYPEREVM_WS_HOST` (default `rpc.purroofgroup.com`), both-or-nothing
+  (else the producer is dropped — the unspawned-venue shape). Capture label
+  `hyperevm`; `/state` venue 9; the `engine_ingress_hyperevm_*` family;
+  `--raw-tap hyperevm`. Bounds const-asserted across crates (pools 128,
+  decimals 36).
+* **Live smoke without the engine:** `cli/tests/hyperevm_live_smoke.rs`
+  (`#[ignore]`, the MX9 shape — never stops launchd, separate target dir):
+  `spawn_hyperevm` against the real chain, the ring drained into an
+  `AmmBook`; asserts heads arrive, the book refuses nothing, and every
+  pool completes a snapshot (archive probe + decimals).
+* **What the first live smoke caught (2026-09-23):** the WHYPE/USDC pool
+  has nearly every tick of its 10-grid initialised (~700 `ticks()` reads
+  per snapshot). The driver queued up to 248 reads at once; the archive
+  endpoint answered them OUT OF ORDER in ~20–36-reply rounds, and the
+  first new id that folded onto a still-unanswered id's pending slot
+  ended the session ("pending-request slot collision") — 29 reconnects in
+  90 s, no snapshot ever completed, nothing published. Fix: at most
+  `MAX_READS_IN_FLIGHT` = 20 reads out (the measured batch cap); request
+  ids skip a slot a straggler still holds (`alloc_id`, via the new
+  `core_net::PendingTable::is_free`) — the straggler completes whenever it
+  is answered; a snapshot whose reads go unanswered for `SNAP_STALL_NS`
+  (20 s) ends the session. Pinned by a model-node test that answers
+  newest-first around a held straggler past a full id wrap. Re-smoke,
+  120 s: 0 reconnects, the snapshot live at 12.4 s, 120 heads, 799
+  signals, 21 fees observed, the book refused nothing.
+* **HL spot appends (§7.7) are DEFERRED to the go-live step**: the live
+  engine is armed on mainnet (slot 3, HL) and the appended coins change
+  its HL subscription set at the next daily restart; that edit is made
+  with its verification (spotMeta indices, the 32-subscription budget,
+  `claude-worker fetch` `unresolved=0`) when hyparb enters the live mask.

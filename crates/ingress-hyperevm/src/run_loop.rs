@@ -58,7 +58,7 @@ use core_time::now_ns;
 use core_types::{Capture, LatencyClass, NsTs, Signal, SymbolId, SYMBOL_ID_NONE};
 use ingress_rpc::{
     classify_rpc, parse_rpc_error, write_request_eth_block_number,
-    write_request_subscribe_new_heads, RequestIds, RpcFrameKind,
+    write_request_subscribe_new_heads, RpcFrameKind,
 };
 
 use crate::logs::{parse_log, payloads, LogErr, LogMeta, PoolLog, SUBSCRIBED_TOPICS};
@@ -79,7 +79,7 @@ mod tests;
 /// rx buffer: a snapshot's replies arrive pipelined, and a `logs` push
 /// is ~1 KiB.
 pub const RX_BUF_SIZE: usize = 256 * 1024;
-/// tx buffer: up to [`PENDING_CAP`] queued `eth_call`s (~200 B each) or
+/// tx buffer: up to [`MAX_READS_IN_FLIGHT`] queued `eth_call`s (~200 B each) or
 /// the `logs` subscribe frame (~6 KiB for 128 pools).
 pub const TX_BUF_SIZE: usize = 64 * 1024;
 /// Signal-ring capacity the engine allocates for this source.
@@ -98,14 +98,26 @@ pub const DEFAULT_SNAPSHOT_RADIUS: i32 = 4_000;
 /// (appended by HYPARB H0).
 pub const SIGNAL_SOURCE_HYPEREVM: u8 = core_types::SignalSource::HyperEvm as u8;
 
+/// Snapshot `eth_call`s in flight at once — the endpoint's measured
+/// JSON-RPC batch cap (plan §7.4). The H3b live smoke caught the
+/// archive endpoint answering a 248-deep burst out of order and in
+/// ~20–36-reply rounds; a window this size is paced by the replies
+/// instead of queueing hundreds behind the endpoint's own limit.
+pub const MAX_READS_IN_FLIGHT: usize = 20;
+/// A snapshot whose reads stop being answered for this long ends the
+/// session (the caller reconnects and re-reads): an endpoint that
+/// dropped a request never answers it.
+pub const SNAP_STALL_NS: u64 = 20_000_000_000;
+
 /// Scratch for one outgoing request body before it is masked into tx.
 const SCRATCH: usize = 8 * 1024;
 /// Stop issuing reads when tx has less free space than this.
 const TX_HEADROOM: usize = 2 * 1024;
-/// Requests kept free in the pending table for polls and subscribes.
-const PENDING_HEADROOM: usize = 8;
 
 const _: () = assert!(PENDING_CAP.is_power_of_two());
+// Reads, the liveness poll and both subscriptions fit the pending table
+// with room to skip every slot a straggler still holds.
+const _: () = assert!(MAX_READS_IN_FLIGHT + 4 < PENDING_CAP / 2);
 
 // ---------------------------------------------------------------
 // Kinds and states
@@ -253,8 +265,13 @@ pub struct Driver {
     expected_accept_val: [u8; 28],
     last_activity_ns: NsTs,
     mask_counter: u64,
-    ids: RequestIds,
+    /// Next JSON-RPC id (≥ 1; see [`alloc_id`]).
+    next_id: u64,
     pending: PendingTable<RpcKind, PENDING_CAP>,
+    /// Snapshot `eth_call`s issued and not yet answered.
+    reads_in_flight: usize,
+    /// When the snapshot last made progress (began, or a read answered).
+    read_progress_ns: NsTs,
     calls: Box<[Call; PENDING_CAP]>,
     subs: SubTable<SubKind, SUB_CAP>,
     next_poll_at_ns: u64,
@@ -288,8 +305,10 @@ impl Driver {
             expected_accept_val: accept,
             last_activity_ns: 0,
             mask_counter: 0,
-            ids: RequestIds::new(),
+            next_id: 1,
             pending: PendingTable::new(),
+            reads_in_flight: 0,
+            read_progress_ns: 0,
             calls: Box::new([Call::NONE; PENDING_CAP]),
             subs: SubTable::new(),
             next_poll_at_ns: 0,
@@ -337,6 +356,12 @@ impl Driver {
         self.pending.count()
     }
 
+    /// Snapshot reads in flight.
+    #[inline]
+    pub fn reads_in_flight(&self) -> usize {
+        self.reads_in_flight
+    }
+
     /// Live subscriptions.
     #[inline]
     pub fn sub_count(&self) -> usize {
@@ -355,8 +380,10 @@ impl Driver {
         self.expected_accept_val = expected_accept(&self.sec_key);
         self.last_activity_ns = 0;
         self.mask_counter = 0;
-        self.ids = RequestIds::new();
+        self.next_id = 1;
         self.pending.clear();
+        self.reads_in_flight = 0;
+        self.read_progress_ns = 0;
         self.subs.clear();
         self.next_poll_at_ns = 0;
         self.hold_len = 0;
@@ -450,12 +477,12 @@ fn on_session_start<C: Capture, const CAP: usize>(
         }
     }
     drv.phase = Phase::Subscribing;
-    let id = drv.ids.allocate();
+    let id = alloc_id(drv);
     record_pending(drv, id, RpcKind::SubscribeNewHeads)?;
     let n = write_request_subscribe_new_heads(&mut drv.scratch[..], id)
         .map_err(|_| io::Error::other("subscribe request buffer too small"))?;
     queue_frame(drv, n)?;
-    let id = drv.ids.allocate();
+    let id = alloc_id(drv);
     record_pending(drv, id, RpcKind::SubscribeLogs)?;
     let n = crate::rpc::write_request_subscribe_logs(
         &mut drv.scratch[..],
@@ -496,7 +523,14 @@ fn advance_phase<C: Capture, const CAP: usize>(
                 SnapState::Failed(SnapErr::NoPools) => {
                     return Err(io::Error::other("snapshot: every pool failed"))
                 }
-                SnapState::Reading | SnapState::Idle => return issue_reads(drv),
+                SnapState::Reading | SnapState::Idle => {
+                    if snapshot_stalled(drv.reads_in_flight, drv.read_progress_ns, now_ns()) {
+                        return Err(io::Error::other(
+                            "snapshot stalled: the endpoint stopped answering reads",
+                        ));
+                    }
+                    return issue_reads(drv);
+                }
             }
             advance_phase(drv, producer, status, capture)
         }
@@ -554,21 +588,27 @@ fn advance_phase<C: Capture, const CAP: usize>(
     }
 }
 
-/// Queue as many snapshot reads as the pending table and tx allow.
+/// Queue snapshot reads up to [`MAX_READS_IN_FLIGHT`] (and tx room).
 fn issue_reads(drv: &mut Driver) -> io::Result<()> {
-    while drv.pending.count() + PENDING_HEADROOM < PENDING_CAP
-        && drv.tx.free_mut().len() >= TX_HEADROOM
-    {
+    while drv.reads_in_flight < MAX_READS_IN_FLIGHT && drv.tx.free_mut().len() >= TX_HEADROOM {
         let Some(call) = drv.snap.next_call() else {
             return Ok(());
         };
-        let id = drv.ids.allocate();
+        let id = alloc_id(drv);
         record_pending(drv, id, RpcKind::EthCall)?;
+        drv.reads_in_flight += 1;
         drv.calls[(id as usize) & (PENDING_CAP - 1)] = call;
         let p = call.pool as usize;
         let mut data = [0u8; 74];
         let dl = call.calldata(drv.snap.family(p), &mut data);
-        let to = drv.pools.addresses_hex()[p];
+        // COPY: one 42 B `0x…` address onto the stack — the pool's, or a
+        // token's for `decimals()` — because `write_eth_call` borrows the
+        // scratch buffer mutably while both tables live in `drv` —
+        // borrowing the table entry across that call is refused by borrowck.
+        let to = match drv.snap.read_target(p, call.kind) {
+            Some(t) => *t,
+            None => drv.pools.addresses_hex()[p],
+        };
         let n = write_eth_call(&mut drv.scratch[..], id, &to, &data[..dl], call.block)
             .map_err(|_| io::Error::other("eth_call request buffer too small"))?;
         queue_frame(drv, n)?;
@@ -729,11 +769,38 @@ fn maybe_queue_block_number_poll(drv: &mut Driver) -> io::Result<()> {
         return Ok(());
     }
     drv.next_poll_at_ns = now.saturating_add(RPC_POLL_NS);
-    let id = drv.ids.allocate();
+    let id = alloc_id(drv);
     record_pending(drv, id, RpcKind::BlockNumber)?;
     let n = write_request_eth_block_number(&mut drv.scratch[..], id)
         .map_err(|_| io::Error::other("blockNumber request buffer too small"))?;
     queue_frame(drv, n)
+}
+
+/// The next request id whose pending slot is free. Ids fold onto
+/// `id & (PENDING_CAP − 1)`, and the archive endpoint answers out of
+/// order (the H3b live smoke: a read left behind while hundreds of later
+/// ids completed), so an old unanswered id can still hold the slot a new
+/// id folds onto. Its id is skipped, never collided with — the straggler
+/// completes normally whenever it is answered. Bounded: fewer than half
+/// the slots are ever held (const-asserted), so a free one is always
+/// within reach; past `PENDING_CAP` probes the busy id is returned and
+/// [`record_pending`] fails the session (a driver bug, fail-fast).
+fn alloc_id(drv: &mut Driver) -> u64 {
+    let mut probes = 0usize;
+    loop {
+        let id = drv.next_id;
+        drv.next_id = drv.next_id.wrapping_add(1).max(1);
+        if drv.pending.is_free(id) || probes >= PENDING_CAP {
+            return id;
+        }
+        probes += 1;
+    }
+}
+
+/// A snapshot with reads out and no answer for [`SNAP_STALL_NS`].
+#[inline]
+fn snapshot_stalled(reads_in_flight: usize, progress_ns: NsTs, now: NsTs) -> bool {
+    reads_in_flight > 0 && now.saturating_sub(progress_ns) > SNAP_STALL_NS
 }
 
 fn record_pending(drv: &mut Driver, id: u64, kind: RpcKind) -> io::Result<()> {
@@ -946,6 +1013,8 @@ fn handle_json_frame<C: Capture, const CAP: usize>(
                 Some(RpcKind::SubscribeNewHeads) => register(drv, sub, SubKind::NewHeads),
                 Some(RpcKind::SubscribeLogs) => register(drv, sub, SubKind::Logs),
                 Some(RpcKind::EthCall) => {
+                    drv.reads_in_flight = drv.reads_in_flight.saturating_sub(1);
+                    drv.read_progress_ns = now_ns();
                     let call = drv.calls[(id as usize) & (PENDING_CAP - 1)];
                     match result {
                         Some((s, e)) => drv.snap.on_result(call, Some(&drv.rx.filled()[s..e])),
@@ -959,6 +1028,8 @@ fn handle_json_frame<C: Capture, const CAP: usize>(
             status.add_msgs(1);
             if let Some(id) = id {
                 if let Some(RpcKind::EthCall) = drv.pending.complete(id).map(|r| r.kind) {
+                    drv.reads_in_flight = drv.reads_in_flight.saturating_sub(1);
+                    drv.read_progress_ns = now_ns();
                     let call = drv.calls[(id as usize) & (PENDING_CAP - 1)];
                     drv.snap.on_result(call, None);
                 }
@@ -993,6 +1064,7 @@ fn on_head<C: Capture, const CAP: usize>(
     if drv.phase == Phase::AwaitHead && h.number > crate::snapshot::PROBE_DEPTH {
         drv.snap.begin(h.number);
         drv.phase = Phase::Reading;
+        drv.read_progress_ns = now_ns();
         return; // this head is the snapshot block — covered by it
     }
     if let Some(p) = encode_head(h.number, h.timestamp, h.base_fee) {

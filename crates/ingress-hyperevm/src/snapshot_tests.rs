@@ -283,6 +283,72 @@ fn a_failed_pool_is_left_out_and_the_rest_are_emitted() {
     );
 }
 
+/// HYPARB H3b: a token whose `decimals()` differs from the configured
+/// value fails THAT pool (counted), and the others are emitted with the
+/// configured — now verified — decimals.
+#[test]
+fn a_decimals_mismatch_fails_the_pool_and_is_counted() {
+    let mut pools = three_pools();
+    pools[1].dec = (18, 18); // config says 18 / 6
+    let t = table(&pools);
+    let mut s = Snapshotter::new(&t, 4_000);
+    let out = run(&mut s, &t, &pools, None);
+    assert_eq!(s.counters().dec_mismatch, 1);
+    assert_eq!(s.counters().pools_failed, 1);
+    assert_eq!(s.counters().pools_ok, 2);
+    let bad_sym = t
+        .entries()
+        .iter()
+        .find(|e| e.address == pools[1].address)
+        .unwrap()
+        .sym;
+    assert!(
+        out.iter().all(|(sym, _)| *sym != bad_sym),
+        "the refused pool emits nothing"
+    );
+}
+
+/// The two `decimals()` reads go to the TOKENS the pool reported, every
+/// other read to the pool.
+#[test]
+fn decimals_reads_are_addressed_to_the_tokens() {
+    let pools = three_pools();
+    let t = table(&pools);
+    let mut s = Snapshotter::new(&t, 4_000);
+    s.begin(B);
+    let mut dec_reads = 0;
+    loop {
+        let mut round = Vec::new();
+        while let Some(c) = s.next_call() {
+            round.push(c);
+        }
+        if round.is_empty() {
+            break;
+        }
+        for c in round {
+            let addr = t.entries()[c.pool as usize].address;
+            let model = pools.iter().find(|p| p.address == addr).unwrap();
+            match c.kind {
+                ReadKind::Dec0 | ReadKind::Dec1 => {
+                    let (t0, t1) = model.tokens();
+                    let want = if c.kind == ReadKind::Dec0 { t0 } else { t1 };
+                    let hex: String = want.iter().map(|b| format!("{b:02x}")).collect();
+                    let got = s
+                        .read_target(c.pool as usize, c.kind)
+                        .expect("a token target");
+                    assert_eq!(&got[2..], hex.as_bytes());
+                    dec_reads += 1;
+                }
+                k => assert!(s.read_target(c.pool as usize, k).is_none()),
+            }
+            let r = model.answer(c.kind, c.arg, c.block != B);
+            s.on_result(c, Some(r.as_bytes()));
+        }
+    }
+    assert_eq!(dec_reads, 2 * pools.len());
+    assert_eq!(s.counters().pools_ok as usize, pools.len());
+}
+
 #[test]
 fn replies_to_an_abandoned_snapshot_are_ignored() {
     let pools = three_pools();

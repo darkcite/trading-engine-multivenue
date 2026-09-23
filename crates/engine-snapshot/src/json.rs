@@ -982,6 +982,13 @@ mod tests {
         let rpc = body.find("\"venue\":\"rpc\"").unwrap();
         let mexc = body.find("\"venue\":\"mexc\"").expect("mexc ingress row");
         assert!(rpc < mexc, "mexc must follow rpc (append, never reorder)");
+        let hev = body
+            .find("\"venue\":\"hyperevm\"")
+            .expect("hyperevm ingress row");
+        assert!(
+            mexc < hev,
+            "hyperevm must follow mexc (append, never reorder)"
+        );
         assert!(body.contains("\"heartbeat_age_s\":-1"));
     }
 

@@ -6,6 +6,48 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — `[hyperevm] pools`, the `hyperevm` capture label, `/state` venue 9 (HYPARB H3b)
+
+**What changed**
+
+- `universe.toml` gains an OPTIONAL `[hyperevm]` section:
+  `pools = ["0x<40 lowercase hex>:<v3|slipstream|algebra>:<dec0>:<dec1>", …]`
+  (≤ 128, append-only; `pools[i]` → `make_symbol_id(HyperEvm, i+1)`,
+  descriptor `hyperevm:0x<address>`, class `Spot` in the descriptor law —
+  Rust, Python mirror and the shared fixture). Absent = the pre-H3b boot.
+- New boot flag `--hyperevm-path <path>` and env `HYPEREVM_WS_HOST`
+  (default `rpc.purroofgroup.com`, O-H15). The HyperEVM ingress runs only
+  with BOTH the flag and a non-empty `[hyperevm] pools`; its signals feed
+  the engine's new pool lane (`engine::POOL_RING_SIZE` = 4,096).
+- Every snapshot now also reads `token0()` / `token1()` and both tokens'
+  `decimals()`; a value that differs from the configured decimals fails
+  that pool (`dec_mismatch`).
+- Capture label `hyperevm` (`hyperevm-signals.pmlr`; ticks/events/depth
+  header-only) — appended to `VENUE_LABELS` in backtest / audit-replay /
+  capture-catalog (the catalog's `venue_ticks` array gains a 9th, zero
+  entry) and to `--raw-tap` (`hyperevm`).
+- `/state`: `SNAPSHOT_VENUES` 8 → 9 (`hyperevm` appended after `mexc`).
+  Metrics: `engine_ingress_hyperevm_state`,
+  `engine_ingress_hyperevm_last_tick_age_seconds`, the
+  `engine_ingress_hyperevm_*` counter family and the `hyperevm` capture
+  gauges (registered unconditionally, like every venue's).
+
+**Impact**
+
+- Config keys: new optional `[hyperevm]` section and `HYPEREVM_WS_HOST`.
+  **The live `main` binary does not know `[hyperevm]` — never add it to
+  the live `~/multivenue/universe.toml` before this lane merges to `main`**
+  (a hyparb smoke boots with `--universe <copy>`).
+- On-disk formats: one new capture label; no layout change.
+
+**Migration steps**
+
+1. None for the live engine.
+
+**Rollback**
+
+- Revert the H3b commit.
+
 ## 2026-09-23 — `Order.kind` 2 = AMM swap; the AMM fill law; `SNAPSHOT` carries decimals (HYPARB H2)
 
 **What changed**

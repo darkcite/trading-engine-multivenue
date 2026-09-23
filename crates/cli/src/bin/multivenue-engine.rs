@@ -682,6 +682,12 @@ struct RunArgs {
     /// thread is not started.
     #[arg(long)]
     polygon_path: Option<String>,
+    /// HYPARB H3b: HyperEVM JSON-RPC WebSocket path on
+    /// `HYPEREVM_WS_HOST` (e.g. `/`). Absent ⇒ the pool-event ingress is
+    /// not started; present with an empty `[hyperevm] pools` ⇒ warned and
+    /// not started.
+    #[arg(long)]
+    hyperevm_path: Option<String>,
     /// Bind `127.0.0.1:9191` and expose `/metrics` (Prometheus text),
     /// `/healthz` and `/state` (RG6: the 1 s engine snapshot as
     /// JSON — boot identity, regime words, slots, vm rows, recent
@@ -2625,6 +2631,7 @@ fn run(args: RunArgs) -> ExitCode {
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
     let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
+    let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
     // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
@@ -3396,6 +3403,63 @@ fn run(args: RunArgs) -> ExitCode {
         warn!("--polygon-path not provided; RPC ingress thread not started");
     }
 
+    // -- HYPARB H3b: the HyperEVM pool-event ingress --
+    // Both switches or nothing: the path flag AND a `[hyperevm] pools`
+    // list. Anything else drops the producer, so the engine's pool lane
+    // is a permanently-empty ring (the unspawned-venue shape, §3.3).
+    match (
+        args.hyperevm_path.as_deref(),
+        boot.allocated.hyperevm.is_empty(),
+    ) {
+        (Some(path), false) => {
+            let table = match cli::hyperevm_pool_table(&boot.allocated) {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = ?e, "hyperevm: pool table refused");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            match WssEndpoint::resolve(&cfg.hyperevm_ws_host, 443, path) {
+                Ok(ep) => {
+                    info!(
+                        host = %cfg.hyperevm_ws_host,
+                        pools = boot.allocated.hyperevm.len(),
+                        "hyperevm: starting pool-event ingress"
+                    );
+                    match cli::spawn_hyperevm(
+                        ep,
+                        tls_config.clone(),
+                        hyperevm_prod,
+                        statuses.hyperevm.clone(),
+                        10,
+                        &run_dir,
+                        epoch_ns,
+                        raw_tap_cfg.hyperevm,
+                        capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hyperevm)),
+                        table,
+                        ingress_hyperevm::run_loop::DEFAULT_SNAPSHOT_RADIUS,
+                    ) {
+                        Ok(h) => handles.push(h),
+                        Err(e) => {
+                            error!(error = ?e, "hyperevm: capture open failed");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = ?e, "HyperEVM DNS failed; skipping the pool-event ingress");
+                }
+            }
+        }
+        (Some(_), true) => {
+            warn!("--hyperevm-path given but [hyperevm] pools is empty; pool ingress not started");
+            drop(hyperevm_prod);
+        }
+        (None, _) => drop(hyperevm_prod),
+    }
+
     // -- AI-command ingress (Phase 8f; opt-in via AI_INGRESS_HMAC_KEY
     // in .env) --
     // Key semantics: ABSENT/empty ⇒ thread not started (back-compat
@@ -3490,6 +3554,7 @@ fn run(args: RunArgs) -> ExitCode {
         depth_lanes: depth_lane_cons,
         opt_lanes: opt_lane_cons,
         rpc_signal: rpc_cons,
+        hyperevm_signal: hyperevm_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,

@@ -39,7 +39,11 @@ use ingress_ai::AI_CMDS_FILE;
 /// Mirrors the cli spawn labels exactly (`bybit` appended at WS9,
 /// `mexc` at MX2 — MEXC carries `venue_seq` but no §6.2 chain law
 /// (Q-MX1): it emits no `TradeGap`/`BookGap`, so no derivation arm).
-const VENUE_LABELS: [&str; 8] = ["pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc"];
+/// HYPARB H3b: `hyperevm` appended — its tape is `hyperevm-signals.pmlr`
+/// (pool events); its tick file is header-only.
+const VENUE_LABELS: [&str; 9] = [
+    "pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc", "hyperevm",
+];
 
 /// Inter-arrival histogram bucket upper bounds (ns, exclusive). The
 /// last bucket is open-ended. Bounds chosen so every §6.2 cadence band

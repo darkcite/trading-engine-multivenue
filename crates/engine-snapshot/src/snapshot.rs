@@ -28,8 +28,9 @@ pub const RECENT_FILLS: usize = 64;
 pub const SNAPSHOT_SLOTS: usize = 8;
 /// Ingress lanes mirrored, in the cli's T1(c) order:
 /// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2 — appended, never
-/// reordered: the index is the `/state` array position).
-pub const SNAPSHOT_VENUES: usize = 8;
+/// reordered: the index is the `/state` array position), hyperevm
+/// (HYPARB H3b — appended after mexc).
+pub const SNAPSHOT_VENUES: usize = 9;
 /// Capacity of the fixed text fields (`git_sha` — 40 hex — and the
 /// strategy names).
 pub const BOOT_TEXT_MAX: usize = 48;
@@ -64,6 +65,7 @@ pub const VENUE_NAMES: [&str; SNAPSHOT_VENUES] = [
     "bybit",
     "rpc",
     "mexc",
+    "hyperevm",
 ];
 
 /// Boot identity — filled once by the bin and the set builder, then

@@ -66,6 +66,7 @@ use rustls_pki_types::ServerName;
 use ingress_binance::run_loop as bwl;
 use ingress_bybit::run_loop as ywl;
 use ingress_deribit::run_loop as dwl;
+use ingress_hyperevm::run_loop as hel;
 use ingress_hyperliquid::run_loop as hwl;
 use ingress_mexc::run_loop as mxl;
 use ingress_okx::run_loop as owl;
@@ -173,6 +174,16 @@ const RPC_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
     ping_interval_ns: 10_000_000_000,
     idle_timeout_ns: 30_000_000_000,
 };
+
+/// HYPARB H3b: HyperEVM — a head every ~1 s plus our own polls; a
+/// session quiet for 30 s is dead (the RPC law, one block faster).
+const HYPEREVM_KEEPALIVE: KeepaliveCfg = KeepaliveCfg {
+    ping_interval_ns: 10_000_000_000,
+    idle_timeout_ns: 30_000_000_000,
+};
+
+// The engine's pool lane and the ingress's default ring are one size.
+const _: () = assert!(engine::POOL_RING_SIZE == hel::DEFAULT_POOL_RING_CAP);
 
 /// Maximum number of items the main thread drains per ring per
 /// iteration. Bounded so a backed-up ring can't starve the others.
@@ -540,6 +551,10 @@ pub struct Rings {
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
     /// Signal ring for Polygon newHeads — feeds the engine.
     pub rpc_signal: Arc<Ring<Signal, SIGNAL_RING_SIZE>>,
+    /// HYPARB H3b: the HyperEVM pool-event ring — feeds the engine's
+    /// pool lane (`Engine::set_pool_lane`). Permanently empty when the
+    /// ingress is not spawned.
+    pub hyperevm_signal: Arc<Ring<Signal, { engine::POOL_RING_SIZE }>>,
     /// One fill ring per execution lane (`engine::fill_lane_of`).
     /// Live dispatchers gain producers in Phase 8j; until then the
     /// engine's dispatcher fill pump (D3) is the only fill source.
@@ -589,6 +604,7 @@ impl Rings {
                 Ring::new(),
             ],
             rpc_signal: Ring::new(),
+            hyperevm_signal: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
@@ -639,6 +655,10 @@ pub struct IngressStatusSet {
     /// Never spawned before MX6 — stays Down (the unspawned-venue
     /// shape), and stays Down after it when `[mexc]` is empty.
     pub mexc: Arc<IngressStatus>,
+    /// HYPARB H3b: the HyperEVM pool-event thread (newHeads + pool
+    /// logs + in-session snapshots). Down unless `--hyperevm-path` and
+    /// `[hyperevm] pools` are both given.
+    pub hyperevm: Arc<IngressStatus>,
     /// BIN15 O2: the Hyperliquid ROLL counters. Venue-specific, so
     /// they could not live in the size-locked generic
     /// [`IngressStatus`] slot; they ride here so the metrics
@@ -647,7 +667,7 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all eight slots + the HL roll counters (boot only).
+    /// Allocate all nine slots + the HL roll counters (boot only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -658,6 +678,7 @@ impl IngressStatusSet {
             bybit: Arc::new(IngressStatus::new()),
             rpc: Arc::new(IngressStatus::new()),
             mexc: Arc::new(IngressStatus::new()),
+            hyperevm: Arc::new(IngressStatus::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
         }
     }
@@ -2231,6 +2252,155 @@ pub fn spawn_rpc(
     ))
 }
 
+// HYPARB H3b: one pool bound, one decimals bound, everywhere.
+const _: () = assert!(
+    core_config::universe::HYPEREVM_POOLS_MAX == ingress_hyperevm::HYPEREVM_MAX_POOLS
+        && ingress_hyperevm::HYPEREVM_MAX_POOLS == core_fill::AMM_MAX_POOLS
+);
+const _: () =
+    assert!(core_config::universe::HYPEREVM_DECIMALS_MAX == core_amm::payload::MAX_TOKEN_DECIMALS);
+
+/// HYPARB H3b: the ingress's pool table from the resolved universe —
+/// `[hyperevm] pools` in file order, each at its allocated symbol.
+/// Boot-only (allocates).
+pub fn hyperevm_pool_table(
+    alloc: &core_config::universe::AllocatedUniverse,
+) -> Result<ingress_hyperevm::PoolTable, ingress_hyperevm::PoolTableErr> {
+    use core_config::universe::HyperEvmFamily;
+    let mut entries = Vec::with_capacity(alloc.hyperevm_pools.len());
+    let mut i = 0usize;
+    while i < alloc.hyperevm_pools.len() {
+        let p = alloc.hyperevm_pools[i];
+        entries.push(ingress_hyperevm::PoolEntry {
+            address: p.address,
+            sym: alloc.hyperevm[i].sym,
+            family: match p.family {
+                HyperEvmFamily::V3 => ingress_hyperevm::PoolFamily::UniswapV3,
+                HyperEvmFamily::Slipstream => ingress_hyperevm::PoolFamily::Slipstream,
+                HyperEvmFamily::Algebra => ingress_hyperevm::PoolFamily::Algebra,
+            },
+            dec0: p.dec0,
+            dec1: p.dec1,
+        });
+        i += 1;
+    }
+    ingress_hyperevm::PoolTable::new(&entries)
+}
+
+/// HYPARB H3b: spawn the HyperEVM pool-event thread — `spawn_rpc`'s
+/// shape, plus a tap venue byte (this source HAS a `VenueId`), its own
+/// pool table and snapshot radius, and one extra exit: an endpoint that
+/// fails the archive probe (O-H4) is not reconnected to. Per O-H15 that
+/// disables the pool member (no pool is ever judgeable), never the
+/// engine.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_hyperevm(
+    ep: WssEndpoint,
+    tls_config: RustlsConfig,
+    mut producer: Producer<Signal, { engine::POOL_RING_SIZE }>,
+    status: Arc<IngressStatus>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+    pools: ingress_hyperevm::PoolTable,
+    radius: i32,
+) -> io::Result<JoinHandle<()>> {
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "hyperevm", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "hyperevm", VenueId::HyperEvm.to_u8())?;
+    }
+    Ok(spawn_or_die(
+        thread::Builder::new().name("ingress-hyperevm".into()),
+        "ingress-hyperevm",
+        move || {
+            log_pin_outcome("hyperevm", core_id);
+            let server_name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hyperevm: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut driver = hel::Driver::new(now_ns(), pools, radius);
+            let mut keepalive = Keepalive::new(HYPEREVM_KEEPALIVE);
+            let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            while !shutdown_requested() {
+                status.set_state(IngressState::Connecting);
+                let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "hyperevm: connect failed");
+                        status.set_state(IngressState::Backoff);
+                        sleep_backoff(&mut backoff);
+                        continue;
+                    }
+                };
+                let (mut poll, mut events, token) = match new_poll() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "hyperevm: mio init failed");
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                };
+                driver.reset_for_reconnect(now_ns());
+                let ticks_before = status.ticks_total();
+                let res = hel::run(
+                    &mut transport,
+                    &mut driver,
+                    ep.host.as_bytes(),
+                    ep.path.as_bytes(),
+                    &mut producer,
+                    &mut poll,
+                    &mut events,
+                    token,
+                    &SHUTDOWN,
+                    &status,
+                    &mut keepalive,
+                    &mut capture,
+                );
+                tracing::info!(?res, "hyperevm: run-loop returned");
+                capture.mirror_now();
+                match res {
+                    hel::RunResult::Stopped => {
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                    hel::RunResult::ArchiveDishonest => {
+                        tracing::error!(
+                            host = %ep.host,
+                            "hyperevm: the endpoint answers historical eth_call with LATEST \
+                             state (O-H4 archive probe) — ingress stopped; the pool member \
+                             stays dark (O-H15), the engine runs on"
+                        );
+                        status.set_state(IngressState::Down);
+                        return;
+                    }
+                    _ => {}
+                }
+                if should_reset_backoff(
+                    status.ticks_total(),
+                    ticks_before,
+                    matches!(res, hel::RunResult::IdleTimeout),
+                ) {
+                    backoff.reset();
+                }
+                status.inc_reconnects();
+                status.set_state(IngressState::Backoff);
+                sleep_backoff(&mut backoff);
+            }
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    ))
+}
+
 /// Open the Phase-8f engine-thread fills capture
 /// (`<run_dir>/engine-fills.pmlr`, `SlotKind::Fill`). Boot-only; the
 /// bin hands the result to [`Observability::with_fills_capture`] and
@@ -2456,6 +2626,8 @@ pub struct RawTapConfig {
     /// MX6: tap config for the MEXC ingress (spot PB frames are
     /// tapped as the raw BINARY payload bytes).
     pub mexc: TapCfg,
+    /// HYPARB H3b: tap config for the HyperEVM ingress.
+    pub hyperevm: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -2463,7 +2635,7 @@ pub struct RawTapConfig {
 /// absent/empty ⇒ every venue gets [`TapCfg::off`] (default: none).
 /// `raw_tap` equal (after trim) to the literal `all` enables every
 /// venue; otherwise it's a comma-separated list of venue labels
-/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`), trimmed, non-empty, no
+/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`), trimmed, non-empty, no
 /// duplicates. Every enabled venue shares the same `mode` +
 /// `budget_mb` (×1 MiB → `TapCfg::budget_bytes`). Unknown venue
 /// labels and a bad `--raw-tap-mode` value both fail fast at parse —
@@ -2493,6 +2665,7 @@ pub fn parse_raw_tap_flags(
         hl: TapCfg::off(),
         bybit: TapCfg::off(),
         mexc: TapCfg::off(),
+        hyperevm: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2509,10 +2682,11 @@ pub fn parse_raw_tap_flags(
         cfg.hl = enabled_cfg;
         cfg.bybit = enabled_cfg;
         cfg.mexc = enabled_cfg;
+        cfg.hyperevm = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 8] = [""; 8];
+    let mut seen: [&str; 9] = [""; 9];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -2534,6 +2708,7 @@ pub fn parse_raw_tap_flags(
             "hl" => cfg.hl = enabled_cfg,
             "bybit" => cfg.bybit = enabled_cfg,
             "mexc" => cfg.mexc = enabled_cfg,
+            "hyperevm" => cfg.hyperevm = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -2556,6 +2731,8 @@ pub struct DrainCounters {
     pub other_venue_ticks: u64,
     /// RPC signals observed.
     pub rpc_signals: u64,
+    /// HYPARB H3b: HyperEVM pool-event signals observed.
+    pub hyperevm_signals: u64,
     /// WS10-A: venue events observed (all event lanes combined).
     pub venue_events: u64,
     /// WS10-B: depth snapshots observed (both depth lanes combined).
@@ -2572,6 +2749,7 @@ impl DrainCounters {
         self.binance_ticks += other.binance_ticks;
         self.other_venue_ticks += other.other_venue_ticks;
         self.rpc_signals += other.rpc_signals;
+        self.hyperevm_signals += other.hyperevm_signals;
         self.venue_events += other.venue_events;
         self.depth_snaps += other.depth_snaps;
         self.opt_records += other.opt_records;
@@ -2593,6 +2771,8 @@ pub struct Consumers {
     pub opt_lanes: [Consumer<OptSummary, OPT_RING_SIZE>; engine::NUM_OPT_LANES],
     /// RPC signal consumer.
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
+    /// HYPARB H3b: HyperEVM pool-event consumer (the engine's pool lane).
+    pub hyperevm_signal: Consumer<Signal, { engine::POOL_RING_SIZE }>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
     /// arrive with the venue dispatchers in Phase 8j; paper-mode
     /// fills flow through the engine's dispatcher pump (D3).
@@ -2691,6 +2871,13 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 break;
             }
         }
+        for _ in 0..DRAIN_BATCH {
+            if cons.hyperevm_signal.try_pop().is_some() {
+                period.hyperevm_signals += 1;
+            } else {
+                break;
+            }
+        }
 
         let now = now_ns();
         if now >= next_report {
@@ -2700,6 +2887,7 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
                 bn_ticks = period.binance_ticks,
                 other_ticks = period.other_venue_ticks,
                 rpc_sigs = period.rpc_signals,
+                hyperevm_sigs = period.hyperevm_signals,
                 venue_events = period.venue_events,
                 depth_snaps = period.depth_snaps,
                 "5s ring summary"
@@ -3503,6 +3691,9 @@ impl Observability {
             let ingress_mexc_state = reg
                 .register_gauge("engine_ingress_mexc_state")
                 .map_err(|_| "register engine_ingress_mexc_state")?;
+            let ingress_hyperevm_state = reg
+                .register_gauge("engine_ingress_hyperevm_state")
+                .map_err(|_| "register engine_ingress_hyperevm_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
@@ -3530,6 +3721,8 @@ impl Observability {
                     .map_err(|_| "register engine_ingress_rpc_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_mexc_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_mexc_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_hyperevm_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_hyperevm_last_tick_age_seconds")?,
             ];
             // T1(c) / F12: age of the newest launchd restart-lane
             // slot stamp — the restart lane failing silently for 28 h
@@ -3576,6 +3769,7 @@ impl Observability {
             let ingress_bybit = register_ingress_counters(&mut reg, "bybit")?;
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
             let ingress_mexc = register_ingress_counters(&mut reg, "mexc")?;
+            let ingress_hyperevm = register_ingress_counters(&mut reg, "hyperevm")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -3592,6 +3786,7 @@ impl Observability {
             let capture_bybit = register_capture_gauges(&mut reg, "bybit")?;
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
             let capture_mexc = register_capture_gauges(&mut reg, "mexc")?;
+            let capture_hyperevm = register_capture_gauges(&mut reg, "hyperevm")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -3688,6 +3883,7 @@ impl Observability {
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_mexc_state,
+                ingress_hyperevm_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -3700,6 +3896,7 @@ impl Observability {
                 ingress_bybit,
                 ingress_rpc,
                 ingress_mexc,
+                ingress_hyperevm,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -3708,6 +3905,7 @@ impl Observability {
                 capture_bybit,
                 capture_rpc,
                 capture_mexc,
+                capture_hyperevm,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
@@ -3979,10 +4177,12 @@ pub struct EngineCounters {
     pub ingress_rpc_state: core_metrics::GaugeId,
     /// MX6: per-ingress state gauge, MEXC (spot PB + futures JSON).
     pub ingress_mexc_state: core_metrics::GaugeId,
+    /// HYPARB H3b: per-ingress state gauge, HyperEVM pool events.
+    pub ingress_hyperevm_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
-    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc
-    /// (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
+    /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc,
+    /// hyperevm (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
     pub ingress_last_tick_age: [core_metrics::GaugeId; SNAPSHOT_VENUES],
     /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
     /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
@@ -4011,6 +4211,8 @@ pub struct EngineCounters {
     pub ingress_rpc: IngressCounterIds,
     /// MX6: §6.4 loss-accounting counters, MEXC thread.
     pub ingress_mexc: IngressCounterIds,
+    /// HYPARB H3b: §6.4 counters, HyperEVM pool events.
+    pub ingress_hyperevm: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -4027,6 +4229,8 @@ pub struct EngineCounters {
     pub capture_rpc: CaptureGaugeIds,
     /// MX6: §6.5 capture-health gauges, MEXC thread.
     pub capture_mexc: CaptureGaugeIds,
+    /// HYPARB H3b: capture-health gauges, HyperEVM.
+    pub capture_hyperevm: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -6200,7 +6404,8 @@ pub fn state_writer(
 }
 
 /// The ingress status slots in the T1(c) / `VENUE_NAMES` order:
-/// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended).
+/// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended),
+/// hyperevm (HYPARB H3b, appended).
 #[inline]
 fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
     [
@@ -6212,6 +6417,7 @@ fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
         &ing.bybit,
         &ing.rpc,
         &ing.mexc,
+        &ing.hyperevm,
     ]
 }
 
@@ -6667,6 +6873,7 @@ where
         depth_lanes,
         opt_lanes,
         rpc_signal,
+        hyperevm_signal,
         fill_lanes,
         ai_cmds,
         ai_status,
@@ -6686,6 +6893,9 @@ where
         ai_status,
         ruleset_tables,
     );
+    // HYPARB H3b: the pool-event lane (empty forever when the HyperEVM
+    // ingress is not spawned).
+    eng.set_pool_lane(hyperevm_signal);
     // Phase 8f: the fills capture is opened by the bin (per-run
     // capture directory) and rides in via Observability; the engine
     // thread owns it from here.
@@ -6714,10 +6924,10 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc) so registry
-    // counters get monotonic deltas. Append-only: existing indices are
-    // load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 8];
+    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm) so
+    // registry counters get monotonic deltas. Append-only: existing
+    // indices are load-bearing, new venues go at the end.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 9];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
@@ -6976,6 +7186,8 @@ where
                     reg.gauge(ids.ingress_rpc_state).set(ing.rpc.state() as i64);
                     reg.gauge(ids.ingress_mexc_state)
                         .set(ing.mexc.state() as i64);
+                    reg.gauge(ids.ingress_hyperevm_state)
+                        .set(ing.hyperevm.state() as i64);
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
                     // monotonic deltas (D4: ring_drops included).
@@ -7016,6 +7228,12 @@ where
                         &ids.ingress_mexc,
                         &ing.mexc,
                         &mut ingress_last[7],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_hyperevm,
+                        &ing.hyperevm,
+                        &mut ingress_last[8],
                     );
 
                     // T1(c): per-venue last-tick age from the stamps
@@ -9194,6 +9412,7 @@ mod tests {
             depth_lanes,
             opt_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
+            hyperevm_signal: rings.hyperevm_signal.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
             ai_status: Arc::new(AiIngressStatus::new()),
@@ -9507,6 +9726,7 @@ mod tests {
             binance_ticks: 2,
             other_venue_ticks: 0,
             rpc_signals: 3,
+            hyperevm_signals: 7,
             venue_events: 4,
             depth_snaps: 5,
             opt_records: 6,
@@ -9516,6 +9736,7 @@ mod tests {
             binance_ticks: 20,
             other_venue_ticks: 5,
             rpc_signals: 30,
+            hyperevm_signals: 70,
             venue_events: 40,
             depth_snaps: 50,
             opt_records: 60,
@@ -9525,6 +9746,7 @@ mod tests {
         assert_eq!(a.binance_ticks, 22);
         assert_eq!(a.other_venue_ticks, 5);
         assert_eq!(a.rpc_signals, 33);
+        assert_eq!(a.hyperevm_signals, 77);
         assert_eq!(a.venue_events, 44);
         assert_eq!(a.depth_snaps, 55);
         assert_eq!(a.opt_records, 66);
@@ -10055,7 +10277,17 @@ mod tests {
     fn raw_tap_flags_all_enables_every_venue() {
         let cfg = parse_raw_tap_flags(Some("all"), "all", 8).unwrap();
         let want_bytes = 8 * 1024 * 1024;
-        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
+        for c in [
+            cfg.pm,
+            cfg.bn,
+            cfg.okx,
+            cfg.rpc,
+            cfg.deribit,
+            cfg.hl,
+            cfg.bybit,
+            cfg.mexc,
+            cfg.hyperevm,
+        ] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
         }
@@ -10071,7 +10303,15 @@ mod tests {
         assert_eq!(cfg.pm.budget_bytes, want_bytes);
         assert_eq!(cfg.okx.mode, TapMode::Rejects);
         assert_eq!(cfg.okx.budget_bytes, want_bytes);
-        for c in [cfg.bn, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
+        for c in [
+            cfg.bn,
+            cfg.rpc,
+            cfg.deribit,
+            cfg.hl,
+            cfg.bybit,
+            cfg.mexc,
+            cfg.hyperevm,
+        ] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
         }
@@ -10080,9 +10320,23 @@ mod tests {
     /// Every known capture-venue label is accepted in one CSV.
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
-        let cfg =
-            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc"), "all", 1).unwrap();
-        for c in [cfg.pm, cfg.bn, cfg.okx, cfg.rpc, cfg.deribit, cfg.hl, cfg.bybit, cfg.mexc] {
+        let cfg = parse_raw_tap_flags(
+            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm"),
+            "all",
+            1,
+        )
+        .unwrap();
+        for c in [
+            cfg.pm,
+            cfg.bn,
+            cfg.okx,
+            cfg.rpc,
+            cfg.deribit,
+            cfg.hl,
+            cfg.bybit,
+            cfg.mexc,
+            cfg.hyperevm,
+        ] {
             assert_eq!(c.mode, TapMode::All);
         }
     }
@@ -10121,15 +10375,20 @@ mod tests {
         );
     }
 
-    /// More than eight comma-separated labels trips the defensive
-    /// capacity guard — there are only eight capture labels (WS9 added
-    /// bybit, MX6 mexc), so this branch is a pure defense-in-depth
-    /// backstop reached here by listing all eight plus a ninth item.
+    /// More than nine comma-separated labels trips the defensive
+    /// capacity guard — there are only nine capture labels (WS9 added
+    /// bybit, MX6 mexc, HYPARB H3b hyperevm), so this branch is a pure
+    /// defense-in-depth backstop reached here by listing all nine plus a
+    /// tenth item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
-            parse_raw_tap_flags(Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,pm2"), "rejects", 64)
-                .err(),
+            parse_raw_tap_flags(
+                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,pm2"),
+                "rejects",
+                64
+            )
+            .err(),
             Some("--raw-tap: more venue labels than known venues")
         );
     }

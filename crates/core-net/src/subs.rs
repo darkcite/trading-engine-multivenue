@@ -124,6 +124,14 @@ impl<K: ReqKind, const N: usize> PendingTable<K, N> {
         Ok(())
     }
 
+    /// Whether `id` can be recorded now: non-zero and its
+    /// `id & (N-1)` slot free. An allocator facing an endpoint that
+    /// answers out of order skips a busy slot's id instead of colliding.
+    #[inline]
+    pub fn is_free(&self, id: u64) -> bool {
+        id != 0 && !self.slots[(id as usize) & (N - 1)].is_used()
+    }
+
     /// Take the request matching `id`, freeing its slot. `None` when
     /// the id is unknown (late/duplicate response — count, don't
     /// crash: venues do redeliver).

@@ -24,6 +24,9 @@ pub(crate) struct FakePool {
     pub(crate) spacing: i32,
     /// Initialised ticks, ascending: `(tick, gross, net)`.
     pub(crate) ticks: Vec<(i32, u128, i128)>,
+    /// `decimals()` of `(token0, token1)` (HYPARB H3b). The tests' pool
+    /// tables configure 18 / 6, which `from_positions` models.
+    pub(crate) dec: (u8, u8),
 }
 
 fn w_u(v: u128) -> String {
@@ -39,6 +42,16 @@ fn w_i(v: i128) -> String {
 }
 
 impl FakePool {
+    /// The model's `(token0, token1)` addresses — derived from the pool's
+    /// so every pool's pair is distinct.
+    pub(crate) fn tokens(&self) -> ([u8; 20], [u8; 20]) {
+        let mut t0 = self.address;
+        let mut t1 = self.address;
+        t0[19] ^= 0xA0;
+        t1[19] ^= 0xB0;
+        (t0, t1)
+    }
+
     fn prev_node(&self, t: i32) -> i32 {
         let mut r = MIN_TICK;
         for &(k, _, _) in &self.ticks {
@@ -88,6 +101,14 @@ impl FakePool {
                 ),
             },
             ReadKind::Liquidity => w_u(self.liq),
+            ReadKind::Token0 | ReadKind::Token1 => {
+                let (t0, t1) = self.tokens();
+                let t = if kind == ReadKind::Token0 { t0 } else { t1 };
+                let hex: String = t.iter().map(|b| format!("{b:02x}")).collect();
+                format!("{}{hex}", "0".repeat(24))
+            }
+            ReadKind::Dec0 => w_u(u128::from(self.dec.0)),
+            ReadKind::Dec1 => w_u(u128::from(self.dec.1)),
             ReadKind::Fee => w_u(self.fee as u128),
             ReadKind::Spacing => w_i(self.spacing as i128),
             ReadKind::Prev => w_i(self.prev_node(self.tick) as i128),
@@ -181,6 +202,7 @@ impl FakePool {
             fee,
             spacing,
             ticks: map.into_iter().map(|(t, (g, n))| (t, g, n)).collect(),
+            dec: (18, 6),
         }
     }
 }
