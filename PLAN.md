@@ -17,7 +17,8 @@ Its **status, edge thesis and roadmap are historical**: §3, §4, §7–§8 and
 §15 describe the April-2026 Polymarket-centric v1 (RSS, rule-tree, the
 latency-arb primary edge) which was built, measured and then displaced. The
 engine is now a multivenue slot set (Binance, OKX, Deribit, Hyperliquid incl.
-HIP-4, Bybit, Polymarket, Polygon RPC) with an eight-slot strategy set and a
+HIP-4, Bybit, MEXC (data-only), Polymarket, Polygon RPC) with an eight-slot
+strategy set and a
 per-slot live-execution lane. **The current picture is:** `CLAUDE.md`
 (state + laws), `docs/risk-policy.md` (execution laws and record), and the
 three sheets `docs/phase-8-architecture-v2.svg`, `docs/engine-memory-cpu.svg`,

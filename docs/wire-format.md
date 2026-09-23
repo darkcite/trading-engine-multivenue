@@ -23,7 +23,9 @@ bottom of that file pins every struct at exactly 64 bytes.
 ### Venue identity (Phase 8, PMLR v2)
 
 `VenueId` (`#[repr(u8)]`, wire-stable, never renumbered):
-`Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4, Ai=5`.
+`Polymarket=0, Binance=1, Okx=2, Deribit=3, Hyperliquid=4, Ai=5, Bybit=6, Mexc=7`
+(Bybit WS9 2026-08-29, MEXC MX2 2026-09-23). Append-only; the first
+unassigned byte is 8.
 `255` is reserved (venue byte of `SYMBOL_ID_NONE`).
 
 `SymbolId` is venue-namespaced: bits 31..24 = venue byte, bits 23..0 =
@@ -484,6 +486,56 @@ spot + usdm; Bybit trades carry `venue_seq` 0 — UUID trade ids, no
 venue sequence, so the §6.2 chain law does not apply to this venue).
 Bybit `Ticker` event rows carry `v0` = 0, `v1` = open interest ×1e6
 (venue base/contract units) — unlike Deribit's mark+OI pairing.
+
+MX2, appended 2026-09-23 — `mexc` (VenueId 7; spot + futures share
+one label; data-only, ruling O-MX1). The per-venue law
+(`crates/ingress-mexc/src/lib.rs`, `docs/mexc-ingress-plan.md` §4):
+
+- **Ticks are BBO CHANGES** (D11). MEXC republishes unchanged quotes
+  (spot `aggre.bookTicker@10ms` every 10 ms per symbol); a push whose
+  `(bid px, bid qty, ask px, ask qty)` equals the last one EMITTED for
+  its symbol writes no tick row (it still counts in `msgs_total`); the
+  first quote of every session is written, and so is an unchanged quote
+  whose stale verdict flipped or whose previous emission the ring
+  dropped. Tick source: spot
+  `aggre.bookTicker`, futures `depth.full` (limit 5) top level;
+  quantities in venue units ×1e6 — **futures in CONTRACTS** (×
+  `contractSize` for base units). `venue_time_ms`: spot `createTime`
+  else `sendTime`; futures `cts` else the envelope `ts`.
+- **`venue_seq`** (ruling Q-MX1): spot book `version`, spot trade =
+  the LEADING DIGITS of the `tradeId` string (0 when it has none or
+  the run overflows `u64`), futures book `version`, futures deal `i`.
+  `Tick.venue_seq` = the low 32 bits, `ChannelEvent.venue_seq` the
+  full `u64`. The §6.2 chain law does NOT apply — these are
+  sampled/snapshot streams that skip versions by design — so MEXC
+  emits no `TradeGap`/`BookGap` and `gaps_total` stays 0. A seq
+  strictly below the last-seen one of the same symbol × stream (book /
+  trade) increments `engine_ingress_mexc_seq_regressions_total` (a
+  counter, no event row).
+- `Trade` (0): `v0` = px ×1e6, `v1` = qty ×1e6 (spot base units,
+  futures contracts) NEGATED when the aggressor sold (spot
+  `tradeType == 2`, futures `T == 2`); `venue_time_ms` = the print's
+  own time, else the push's.
+- `Mark` (2), `Funding` (3), `Ticker` (4) — one futures `push.ticker`
+  frame, one row per field group present, `venue_time_ms` = its
+  `timestamp` else `ts`: `Mark` `v0` = `fairPrice` ×1e6, `v1` =
+  `indexPrice` ×1e6 (the Binance `@markPrice` shape); `Funding` `v0` =
+  rate ×1e9, `v1` = next-settle ms, seeded per perp at boot from REST
+  `funding_rate/{SYM}` (`nextSettleTime`) and advanced by THAT symbol's
+  `collectCycle` — 8 h or 4 h (ruling Q-MX3) — **0 when unseeded**;
+  `Ticker` `v0` = 0, `v1` = `holdVol` ×1e6 in contracts (the Bybit
+  shape).
+- `SubDrop` (11): `v0` = 1 (`SUB_DROP_REFUSED` — MEXC names no numeric
+  code: a param refused in the spot per-param echo, a futures
+  `rs.error` `"Contract [X] not exists"`, or a futures `rs.sub.*`
+  non-success) or the spot ack's non-zero `code` (a whole-request
+  refusal); `v1` = the venue-local channel — 0 spot bookTicker · 1 spot
+  deals · 2 futures depth.full · 3 futures deal · 4 futures ticker · −1
+  unknown (`rs.error` names no channel); `sym` = the refused instrument
+  when the echo or the `rs.error` names it, else `SYMBOL_ID_NONE`. Any
+  other `rs.error` (the 60 s heartbeat notice) is NOT a drop. A refused
+  symbol never blinds its socket: only a spot ack refusing EVERY pair,
+  or an `rs.sub.*` non-success, on a never-confirmed driver is fatal.
 
 Engine-side single-file sinks (`core_io::SlotCapture`) in the same
 run dir: `engine-fills.pmlr` (kind 2, Phase 8f — every fill

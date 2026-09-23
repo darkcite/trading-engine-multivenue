@@ -6,8 +6,8 @@
 
 Pure-Rust, zero-allocation, zero-copy, single-writer, lock-free HFT engine
 that executes systematic strategies across a multivenue universe — Binance
-spot/USDM, OKX, Deribit, Hyperliquid, Bybit, Polymarket's CLOB and Polygon
-RPC, plus a boot-selected options ladder.
+spot/USDM, OKX, Deribit, Hyperliquid, Bybit, MEXC (data-only), Polymarket's
+CLOB and Polygon RPC, plus a boot-selected options ladder.
 
 Strategies are composed at boot from a slot set (AI-executed intents, the
 ruleset VM, the intrabar candle member) and are free to trade any subset of
@@ -33,6 +33,7 @@ through an HMAC'd UDS command plane. It is never in the hot path.
 | Real execution E1–E6 (per-slot routing, HL signer + arm, risk gate, kill switches) | **LANDED, reviewed + re-tested in E7 (2026-09-19)** |
 | E7 — the ramp | **TESTNET first** (operator-gated R0); mainnet is a later ruling |
 | Stage 3 — AI-promoted members live | **GATED** on the Stage-3 entry gate (waived for BIN15 only) |
+| MEXC — the seventh market-data venue (MX0–MX9, `docs/mexc-ingress-plan.md`) | **LANDED 2026-09-23, data-only** — captured once `[mexc]` is in the boot universe |
 
 Gates at HEAD: **2585** nextest · **62/62** alloc assertions at 0 B/op ·
 clippy clean · `make copy-audit` new=0 · **1153** worker pytest.
@@ -111,7 +112,7 @@ symbols through the manifest, never a bare `SymbolId` across runs.
 Tick v3 carries `venue_time_ms` + `flags`; every ingress judges each tick
 against the venue's own fastest message (`core_time::FeedClock`) and
 flags it STALE past the per-venue `stale_after_ms` (pm 1000 / bn 1000 /
-okx 400 / deribit 600 / hl 700 / bybit 500; `run --stale-after-ms
+okx 400 / deribit 600 / hl 700 / bybit 500 / mexc 400; `run --stale-after-ms
 <venue>:<ms>` overrides, `:0` = measure only). A stale tick is captured
 but never a signal (`Mid/Bid/Ask` ABSENT in the VM), never a fill and
 never a mark. `backtest` and `audit-pnl` RE-JUDGE v3 captures from the

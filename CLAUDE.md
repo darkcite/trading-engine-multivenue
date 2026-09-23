@@ -10,12 +10,12 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
 spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
-Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder. Strategies
-are composed at boot from an 8-slot set and may trade **any subset** of that
-universe; **Polymarket is one venue among several, not the target**. v1 runs
-on a MacBook Pro M4 on free-tier APIs. Claude (via the `claude-worker` Python
-process, and in-session) is an **offline strategy researcher** — never in the
-hot path.
+MEXC (data-only), Polymarket CLOB, Polygon RPC, plus a boot-selected options
+ladder. Strategies are composed at boot from an 8-slot set and may trade
+**any subset** of that universe; **Polymarket is one venue among several, not
+the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
+`claude-worker` Python process, and in-session) is an **offline strategy
+researcher** — never in the hot path.
 
 Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
 0 latency-arb (the original PM strategy, OFF in every wrapper mask) · 1 vrp ·
@@ -86,9 +86,36 @@ in the script; `ai` = 48 is the floor every name includes).
   E7-F2 IoC-miss classification): `docs/risk-policy.md` "E7 — MAINNET
   R0". Bars R0–R3: risk-policy "E7". Every restart of an armed engine
   passes `scripts/exec-smoke.sh` first (daily-restart does it itself).
-- **Gates at HEAD:** nextest 2585 (1 skipped) · alloc 62/62 at 0 B/op ·
+- **MEXC, the seventh market-data venue — LANDED 2026-09-23, DATA-ONLY**
+  (`docs/mexc-ingress-plan.md` MX0–MX9; ruling O-MX1: no exec arm, no
+  fill lane, not tradeable). `VenueId::Mexc = 7`, tick/event lane 6,
+  `crates/ingress-mexc` (spot = protobuf over WS BINARY, walked by
+  `core_parse::pb`; futures = JSON; one thread, 15 spot / 13 perp
+  symbols per socket), capture label `mexc`, descriptors `mexc:` /
+  `mexc-perp:` (xStocks and TradFi perps are ordinary rows), in the AI
+  boot universe (Q-MX6). Stale default 400 ms, Δ 150 ms, both measured;
+  REST RTT 131–134 ms from here — a capture/research venue, nothing
+  latency-sensitive on it. **LIVE since 2026-09-23 08:48Z** in the
+  paper engine (plan §0 GO-LIVE): `[mexc]` = the Q-MX5 twelve in
+  `~/multivenue/universe.toml`, `[fees.mexc]` (UNVERIFIED published
+  rates) in the live `fees.toml`, and the five MEXC news sources enabled
+  (operator trusted the `www.mexc.co` origin). A boot funding-SEED
+  failure is an error log, never a boot refusal (that perp runs with
+  Funding `v1 = 0`). Live smoke WITHOUT stopping the engine (ruling
+  MX9-EXEC): `CARGO_TARGET_DIR=/tmp/mx9-target cargo test
+  --release -p cli --test mexc_live_smoke -- --ignored --nocapture`
+  (`MEXC_SMOKE_SECS` ≤ 900; the separate target dir leaves the
+  wrapper's `target/release/multivenue-engine` untouched). Its two live
+  catches: spot republishes an unchanged BBO every 10 ms (a tick is a
+  BBO CHANGE — plan D11) and futures closes a busy socket 60 s after the
+  last CLIENT ping (D12, pitfall 16). Wire law: `docs/wire-format.md`
+  "Capture files"; rulings Q-MX1…Q-MX7: plan §0.
+- **Gates at HEAD (the MEXC lane, 2026-09-23):** nextest 2722 (2 skipped —
+  one is the `#[ignore]`d `mexc_live_smoke`) · alloc 64/64 at 0 B/op ·
   clippy clean · `make license-check` OK · `make copy-audit` new=0 ·
-  worker pytest 1153 (3 skipped) · fuzz `hl_*` 3 × 300 s clean. Known
+  worker pytest 1510 (3 skipped; `test_news_lanes::test_report_prints_the_funnel`
+  is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
+  `hl_*` 3 × 300 s, `pb_scan`, `mexc_ws_frame`, `mexc_instruments` clean. Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
@@ -213,8 +240,9 @@ ordinals; the worker map keeps the OLD sym for a reordered name by design.
 Polymarket: `clobTokenIds` from the Gamma lane, `"<yes>:<no>"` pairs, ≤ 6
 tokens (token 7 collides with anchor id 7). Binance: lowercase stream
 symbols, one socket per symbol (254 at the current universe — the wrapper
-raises the launchd fd soft limit to 8192). After a restart run
-`claude-worker fetch` once; `unresolved=0` is the done-tell.
+raises the launchd fd soft limit to 8192). MEXC: spot UPPERCASE
+(`BTCUSDT`), perp `BASE_QUOTE` (`BTC_USDT`), perp ordinals from 512. After
+a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 
 ## Hard architectural rules (do not violate — the gates will fail)
 
@@ -281,10 +309,10 @@ raises the launchd fd soft limit to 8192). After a restart run
 - `crates/core-*` — primitives: ring (SPSC only), time, config (every
   `*.toml` parser), alloc, io (PMLR writer/reader, `PmlrCapture`, atomic
   state files), net (mio + rustls transport, WS framing, `IoBuf`,
-  `Keepalive`), parse (byte scanners), simd, crypto (SHA-256/HMAC/base64),
-  types (wire PODs, `SymbolId`, `VenueId`), regime, vol, fill, latency,
-  metrics (fixed registry, 512 counters).
-- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,rpc}` —
+  `Keepalive`), parse (byte scanners + the `pb` protobuf walker), simd,
+  crypto (SHA-256/HMAC/base64), types (wire PODs, `SymbolId`, `VenueId`),
+  regime, vol, fill, latency, metrics (fixed registry, 512 counters).
+- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
 - `crates/strategy-{set,core,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed
@@ -325,7 +353,9 @@ raises the launchd fd soft limit to 8192). After a restart run
    impossible unresolved-import errors right after edits = stale rmeta —
    `cargo clean -p <crate>` and retry.
 7. Trusting probe fixtures over live boots — venue wire drifts were only ever
-   caught LIVE; new parsers get a live smoke (`--raw-tap`).
+   caught LIVE; new parsers get a live smoke (`--raw-tap`, or — while the
+   engine is armed live — a standalone `#[ignore]` smoke that never stops
+   it, the `crates/cli/tests/mexc_live_smoke.rs` shape).
 8. Long commands through the RustRover terminal — it is ~45 s regardless of
    the timeout; `nohup … > <log> 2>&1 &` then poll. A REUSED terminal can
    return stale mixed output; use `reuseExistingTerminalWindow=false` for
@@ -351,6 +381,12 @@ raises the launchd fd soft limit to 8192). After a restart run
     carry the bytes in a base64 python script.
 15. `pkill -f <pattern>` can match your own polling shell — bracket one letter
     (`multivenue-engin[e]`).
+16. **Assuming inbound traffic keeps a socket alive.** A venue can require a
+    CLIENT heartbeat however busy its feed: MEXC futures closes the socket
+    60 s after the last client `ping` while streaming (caught only live).
+    `Keepalive::poll` pings only after inbound silence; such a venue needs
+    `Keepalive::poll_client_heartbeat` (the ping is due N s after the last
+    ping SENT).
 
 ## macOS session facts
 

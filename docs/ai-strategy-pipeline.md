@@ -93,7 +93,8 @@ Every offline consumer joins by **descriptor string** (`okx:BTC-USDT`, `binance-
 `deribit:BTC-30AUG26-77500-C`, a bare PM token id) and resolves through the run's own manifest.
 Skipping this is what produced a phantom $248.8M per-symbol bound in V7.
 
-Venue labels, in venue-byte order: `pm bn okx rpc deribit hl bybit`.
+Venue labels, in capture-file order: `pm bn okx rpc deribit hl bybit mexc` (`mexc` = VenueId 7,
+data-only, appended 2026-09-23).
 
 ---
 
@@ -110,7 +111,7 @@ namespace).
 | module | table |
 |---|---|
 | `claude_worker.candles` | `candles`, `candle_conflicts` |
-| `claude_worker.funding` | `funding` (per-print rates, 5 venues) |
+| `claude_worker.funding` | `funding` (per-print rates, 6 venues — `mexc-perp` since 2026-09-23) |
 | `claude_worker.iv_digest` | `iv_digest` (1m/1h IV from kind-6 slots) |
 | `claude_worker.depth_digest` | `depth_digest` (hourly imbalance-OHLC, spread bps, near notional) |
 | `claude_worker.refdata` | `refdata` (24 h quote volume, open interest) |
@@ -262,8 +263,9 @@ and parses schema-1 JSON off stdout. **The harness conforms to the worker, never
    - **Strict-cross maker.** A resting BID at `P` fills only when `ask_px < P` — strictly through,
      never a touch. Fill price is always `P`. Displayed opposite size is a **shared budget** across all
      our resting orders on that sym, consumed FIFO. Zero RNG.
-   - **Activation latency** `t_emit + Δ`: PM 200 ms, BN/OKX/Deribit/Bybit 100 ms, **HL 600 ms**. An
-     order can never fill on its own emitting tick.
+   - **Activation latency** `t_emit + Δ`, the MEASURED per-venue table (`docs/venue-latency.md` §3):
+     PM 200, BN 130, OKX 130, Deribit 220, **HL 340**, Bybit 60, MEXC 150 ms. An order can never
+     fill on its own emitting tick; an order on MEXC (venue byte 7, data-only) is unroutable.
    - **Open-order caps** 8 per sym, 64 total; beyond-cap emits are counted and dropped.
    - **D-7 options mark-fill:** option syms have no book, so they fill in full at
      `mark ± max(0.5% of mark, 1 tick)` with **taker** fees — and any report that used it must print
@@ -368,6 +370,14 @@ the post-boot re-commit (§8) is what makes options tradeable across ordinal res
 
 On success the table is stamped `epoch = self.epoch + 1` and pushed by value (copy #1, 32,832 B) onto
 a 2-slot ring. A successful Stage sets `committed = None` — **a new Stage supersedes an old Commit.**
+
+**The boot universe** rule 6 checks symbols against is `cli::build_ai_universe`: the PM and BN pair
+syms, the OKX / Deribit / Hyperliquid discovery tables and — since 2026-09-23 (ruling Q-MX6) — every
+MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Rule 10
+reads the per-descriptor channel caps, mirrored Rust↔Python (`caps_of_descriptor`): `mexc:<SYM>`
+(spot, xStocks included) → `CAP_PRICE`; `mexc-perp:<SYM>` (every MEXC perp, TradFi included) →
+`CAP_PRICE | CAP_FUNDING`. MEXC has no depth or options lane, so no depth or option feature validates
+on it.
 
 ### 6.6 Engine side — staged, then the flip
 
