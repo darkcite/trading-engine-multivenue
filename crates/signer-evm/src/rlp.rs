@@ -14,7 +14,10 @@ pub(crate) struct Enc {
 }
 
 impl Enc {
-    const EMPTY: Self = Self { buf: [0; 33], len: 0 };
+    const EMPTY: Self = Self {
+        buf: [0; 33],
+        len: 0,
+    };
 
     #[inline(always)]
     pub(crate) fn as_slice(&self) -> &[u8] {
@@ -167,7 +170,10 @@ mod tests {
         assert_eq!(list_header(0).as_slice(), &[0xc0]);
         let lorem = b"Lorem ipsum dolor sit amet, consectetur adipisicing elit";
         assert_eq!(lorem.len(), 56);
-        assert_eq!(string_header(lorem.len(), lorem[0]).as_slice(), &[0xb8, 0x38]);
+        assert_eq!(
+            string_header(lorem.len(), lorem[0]).as_slice(),
+            &[0xb8, 0x38]
+        );
         assert_eq!(string_header(1, 0x7f).len(), 0);
         assert_eq!(string_header(1, 0x80).as_slice(), &[0x81]);
         assert_eq!(string_header(0, 0).as_slice(), &[0x80]);

@@ -75,14 +75,22 @@ fuzz_target!(|d: &[u8]| {
         Ok(n) => {
             assert!(cap >= need && n == need);
             assert_eq!(&buf[..4], b"0x02");
-            assert!(buf[2..n].iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c)));
-            assert!(buf[n..].iter().all(|&b| b == 0x55), "wrote past the reported length");
+            assert!(buf[2..n]
+                .iter()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c)));
+            assert!(
+                buf[n..].iter().all(|&b| b == 0x55),
+                "wrote past the reported length"
+            );
             assert!(tx_hash(&tx, &sig).is_ok());
         }
         Err(e) => {
             assert_eq!(e, EvmTxErr::BufferTooSmall);
             assert!(cap < need);
-            assert!(buf.iter().all(|&b| b == 0x55), "a refused render touched the buffer");
+            assert!(
+                buf.iter().all(|&b| b == 0x55),
+                "a refused render touched the buffer"
+            );
         }
     }
 });

@@ -16,14 +16,24 @@ fn item(b: &[u8], i: usize) -> (usize, usize, bool, usize) {
     let be = |s: usize, n: usize| (0..n).fold(0usize, |a, k| (a << 8) | b[s + k] as usize);
     match p {
         0x00..=0x7f => (i, 1, false, i + 1),
-        0x80..=0xb7 => (i + 1, (p - 0x80) as usize, false, i + 1 + (p - 0x80) as usize),
+        0x80..=0xb7 => (
+            i + 1,
+            (p - 0x80) as usize,
+            false,
+            i + 1 + (p - 0x80) as usize,
+        ),
         0xb8..=0xbf => {
             let n = (p - 0xb7) as usize;
             let l = be(i + 1, n);
             assert!(l > 55, "non-canonical long string");
             (i + 1 + n, l, false, i + 1 + n + l)
         }
-        0xc0..=0xf7 => (i + 1, (p - 0xc0) as usize, true, i + 1 + (p - 0xc0) as usize),
+        0xc0..=0xf7 => (
+            i + 1,
+            (p - 0xc0) as usize,
+            true,
+            i + 1 + (p - 0xc0) as usize,
+        ),
         _ => {
             let n = (p - 0xf7) as usize;
             let l = be(i + 1, n);
@@ -33,7 +43,10 @@ fn item(b: &[u8], i: usize) -> (usize, usize, bool, usize) {
 }
 
 fn as_uint(b: &[u8]) -> u128 {
-    assert!(b.is_empty() || b[0] != 0, "non-canonical integer (leading zero)");
+    assert!(
+        b.is_empty() || b[0] != 0,
+        "non-canonical integer (leading zero)"
+    );
     b.iter().fold(0u128, |a, &x| (a << 8) | x as u128)
 }
 

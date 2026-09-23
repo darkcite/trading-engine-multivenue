@@ -1381,6 +1381,9 @@ data only. Built by the git-excluded fixture tools under
 21. Kittenswap (Algebra v1.2) emits an extra per-`Burn` event
     (`0x1a25098b…`, 2 topics, 1 word); it carries no state the member needs
     and is not subscribed.
+22. **HyperEVM burns priority fees** (Cancun without blobs, HyperBFT): the
+    G2 gas bid buys ordering, not a proposer tip — H7c's gas policy must be
+    re-measured on testnet (HZ part B).
 
 ### 16.4 H7a `signer-evm` — LANDED (standalone; `exec-hyperevm` pending)
 
@@ -1489,3 +1492,19 @@ Deviations from §7, each deliberate:
   400-case random-book property; alloc gate **66** (the whole session after
   the handshake — subscribes, snapshot, 1,000 live swaps — 0 B/op); fuzz
   `hyperevm_decode`.
+
+### 16.7 H7b executor contract (O-H18) — LANDED (not deployed)
+
+`contracts/hyparb-executor/`: `HyparbExecutor.sol` (solc 0.8.28, cancun —
+HyperEVM runs Cancun without blobs), the committed creation / runtime
+bytecode, and `scripts/hyparb-executor-repro.sh`, which fetches the pinned
+solc (sha256-checked) and proves the committed bytes are what the source
+compiles to. Owner-only `swap(pool, zeroForOne, amountSpecified,
+sqrtPriceLimitX96, minOut)`; the pool is held in transient storage for the
+call, so `uniswapV3SwapCallback` / `algebraSwapCallback` pay only that pool
+and only inside the swap; `BelowMinOut` reverts an unprofitable race;
+`sweep` is owner-only. Foundry tests: 9 unit (mock pools, both callbacks,
+impostor callbacks, USDT-style and false-returning tokens) + 4 on a
+HyperEVM MAINNET FORK — a real Uniswap-ABI, Slipstream, Algebra v1.0 and
+Algebra v1.2 pool each swapped exactly (local fork only; nothing sent).
+Deployment is H8, testnet only (O-H5).

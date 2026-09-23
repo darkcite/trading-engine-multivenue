@@ -93,7 +93,12 @@ fn fields(tx: &Eip1559Tx<'_>) -> Fields {
         i += 1;
     }
     payload += value.len() + data_hdr.len() + tx.data.len() + EMPTY_LIST.len();
-    Fields { head, value, data_hdr, unsigned_payload: payload }
+    Fields {
+        head,
+        value,
+        data_hdr,
+        unsigned_payload: payload,
+    }
 }
 
 /// `(y_parity, r, s)` encoded, from a `r ‖ s ‖ v` signature.
@@ -198,7 +203,11 @@ impl HexOut<'_> {
 /// This is the render into the FINAL wire buffer: the calldata is read
 /// once from the caller's slice and hex-encoded in place; no binary
 /// transaction buffer exists to copy from.
-pub fn tx_encode_signed_hex(tx: &Eip1559Tx<'_>, sig: &[u8; 65], dst: &mut [u8]) -> Result<usize, EvmTxErr> {
+pub fn tx_encode_signed_hex(
+    tx: &Eip1559Tx<'_>,
+    sig: &[u8; 65],
+    dst: &mut [u8],
+) -> Result<usize, EvmTxErr> {
     let f = fields(tx);
     let s = sig_fields(sig)?;
     let payload = f.unsigned_payload + s[0].len() + s[1].len() + s[2].len();
