@@ -18,7 +18,12 @@ const PIPS: u128 = 1_000_000;
 
 /// `SqrtPriceMath.getAmount0Delta(a, b, L, roundUp)`: the token0 needed
 /// to move between two prices at constant liquidity.
-pub(crate) const fn amount0_delta(sa: U256, sb: U256, liquidity: u128, round_up: bool) -> Option<U256> {
+pub(crate) const fn amount0_delta(
+    sa: U256,
+    sb: U256,
+    liquidity: u128,
+    round_up: bool,
+) -> Option<U256> {
     let (lo, hi) = if sa.le(sb) { (sa, sb) } else { (sb, sa) };
     if lo.is_zero() {
         return None;
@@ -46,7 +51,12 @@ pub(crate) const fn amount0_delta(sa: U256, sb: U256, liquidity: u128, round_up:
 
 /// `SqrtPriceMath.getAmount1Delta(a, b, L, roundUp)`: the token1 needed
 /// to move between two prices at constant liquidity.
-pub(crate) const fn amount1_delta(sa: U256, sb: U256, liquidity: u128, round_up: bool) -> Option<U256> {
+pub(crate) const fn amount1_delta(
+    sa: U256,
+    sb: U256,
+    liquidity: u128,
+    round_up: bool,
+) -> Option<U256> {
     let (lo, hi) = if sa.le(sb) { (sa, sb) } else { (sb, sa) };
     let d = match hi.checked_sub(lo) {
         Some(v) => v,
@@ -110,7 +120,12 @@ const fn next_from_amount0_up(sp: U256, liquidity: u128, amount: U256, add: bool
 /// `getNextSqrtPriceFromAmount1RoundingDown`. The contract's two
 /// branches (`amount <= type(uint160).max` shift vs `mulDiv`) compute the
 /// same exact quotient, so both collapse into `mul_div` here.
-const fn next_from_amount1_down(sp: U256, liquidity: u128, amount: U256, add: bool) -> Option<U256> {
+const fn next_from_amount1_down(
+    sp: U256,
+    liquidity: u128,
+    amount: U256,
+    add: bool,
+) -> Option<U256> {
     let l = U256::from_u128(liquidity);
     if add {
         let q = match mul_div(amount, Q96, l) {
@@ -140,7 +155,12 @@ const fn next_from_amount1_down(sp: U256, liquidity: u128, amount: U256, add: bo
 }
 
 /// `getNextSqrtPriceFromInput`.
-const fn next_from_input(sp: U256, liquidity: u128, amount_in: U256, zero_for_one: bool) -> Option<U256> {
+const fn next_from_input(
+    sp: U256,
+    liquidity: u128,
+    amount_in: U256,
+    zero_for_one: bool,
+) -> Option<U256> {
     if sp.is_zero() || liquidity == 0 {
         return None;
     }
@@ -152,7 +172,12 @@ const fn next_from_input(sp: U256, liquidity: u128, amount_in: U256, zero_for_on
 }
 
 /// `getNextSqrtPriceFromOutput`.
-const fn next_from_output(sp: U256, liquidity: u128, amount_out: U256, zero_for_one: bool) -> Option<U256> {
+const fn next_from_output(
+    sp: U256,
+    liquidity: u128,
+    amount_out: U256,
+    zero_for_one: bool,
+) -> Option<U256> {
     if sp.is_zero() || liquidity == 0 {
         return None;
     }
@@ -273,7 +298,12 @@ pub(crate) const fn compute_swap_step(
             None => return None,
         }
     };
-    Some(Step { sqrt_next, amount_in, amount_out, fee })
+    Some(Step {
+        sqrt_next,
+        amount_in,
+        amount_out,
+        fee,
+    })
 }
 
 #[cfg(test)]

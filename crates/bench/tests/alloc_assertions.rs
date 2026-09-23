@@ -7315,3 +7315,104 @@ fn evm_sign_hash_and_render_are_zero_alloc() {
     assert_eq!(allocs, 0, "signer-evm sign/hash/render allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "signer-evm hot bytes should be zero: saw {bytes}");
 }
+
+/// **HYPARB gate 65 — the Algebra walk, tick-map maintenance, and the
+/// pool-event payload codec.**
+///
+/// Every on-chain swap reaches the member as two 40-byte payloads the
+/// ingress encodes and the member decodes; every `Mint`/`Burn` mutates a
+/// pool's tick map in place; an Algebra pool is walked in its own loop.
+/// All of it runs on the ingress or the engine thread per event, so all
+/// of it must be 0 B/op. The map is boxed at boot, outside the guard.
+#[test]
+fn amm_algebra_walk_map_mutation_and_payload_are_zero_alloc() {
+    use core_amm::payload::{decode, encode_liquidity, encode_state, encode_swap, PoolEvent};
+    use core_amm::{
+        sqrt_at_tick, swap_exact, PoolMeta, PoolState, SwapSpec, TickMap, AMM_KIND_ALGEBRA,
+    };
+    let mut map = Box::new(TickMap::<1024>::EMPTY);
+    map.load(&[], -250_000, -210_000, 1).expect("gate 65 map");
+    let mut state = PoolState::new(0, 0, -230_543, 0);
+    let (lo, hi) = sqrt_at_tick(-230_543);
+    state.sqrt_price_lo = lo;
+    state.sqrt_price_hi = hi;
+    let mut meta = PoolMeta::ZERO;
+    meta.kind = AMM_KIND_ALGEBRA;
+    meta.tick_spacing = 10;
+    meta.fee_pips = 500;
+    // Seed nested positions through the mutation path itself.
+    let mut k = 0i32;
+    while k < 32 {
+        let w = (k + 1) * 400;
+        map.apply_position(-230_540 - w, -230_540 + w, 1_000_000_000_000_000)
+            .expect("gate 65 seed");
+        state
+            .apply_position(-230_540 - w, -230_540 + w, 1_000_000_000_000_000)
+            .expect("gate 65 seed");
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc: u128 = 0;
+    let mut n = 0u64;
+    while n < 5_000 {
+        // A mint and its burn: an insert and a remove on the fixed array.
+        let t = -230_000 + (n % 97) as i32 * 10;
+        map.apply_position(t - 50, t + 50, 7_777)
+            .expect("gate 65 mint");
+        map.apply_position(t - 50, t + 50, -7_777)
+            .expect("gate 65 burn");
+        let (tl, th) = sqrt_at_tick(-230_543 + (n % 4_000) as i32 - 2_000);
+        let spec = SwapSpec {
+            amount: 1_000_000_000_000_000_000,
+            limit_lo: tl,
+            limit_hi: th,
+            fee_pips: 500,
+            zero_for_one: n % 4_000 < 2_000,
+            exact_in: n % 2 == 0,
+        };
+        let r = swap_exact(&state, &meta, &map, &spec);
+        // Ingress → member, both payloads of the swap and a Mint.
+        let s = encode_swap(46_650_000 + n, r.amount_in as i128, -(r.amount_out as i128))
+            .expect("gate 65 swap");
+        let p = encode_state(
+            r.after.tick,
+            r.after.sqrt_price_lo,
+            r.after.sqrt_price_hi,
+            r.after.liquidity,
+            false,
+        )
+        .expect("gate 65 state");
+        let l = encode_liquidity(46_650_000 + n, n % 3 == 0, t - 50, t + 50, 7_777)
+            .expect("gate 65 liq");
+        if let Some(PoolEvent::Swap { amount0, .. }) = decode(&s) {
+            acc = acc.wrapping_add(amount0 as u128);
+        }
+        if let Some(PoolEvent::State {
+            liquidity, tick, ..
+        }) = decode(&p)
+        {
+            acc = acc.wrapping_add(liquidity).wrapping_add(tick as u128);
+        }
+        if let Some(PoolEvent::Liquidity { amount, .. }) = decode(&l) {
+            acc = acc.wrapping_add(amount);
+        }
+        acc = acc.wrapping_add(r.amount_out);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(
+        acc != 0 && map.len() == 64,
+        "the gate must measure real work"
+    );
+    assert_eq!(
+        allocs, 0,
+        "core-amm algebra/map/payload allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "core-amm algebra/map/payload hot bytes should be zero: saw {bytes}"
+    );
+}

@@ -10,7 +10,7 @@
 //! * buy token0 (price up) while `P / (1 − f) < eff_bid` ⇒ `P* = eff_bid · (1 − f)`
 //! * sell token0 (price down) while `P · (1 − f) > eff_ask` ⇒ `P* = eff_ask / (1 − f)`
 //!
-//! The swap to `P*` is the contract's own exact arithmetic ([`walk`] with
+//! The swap to `P*` is the contract's own exact arithmetic ([`walk_kind`] with
 //! the pool fee), walking the REAL tick map and stopping at its edge; the
 //! caller's notional cap — already clamped to the hedge venue's live
 //! top-of-book, the largest single correction in the model — bounds the
@@ -18,11 +18,11 @@
 //! full on every quote: a quote that does not clear it is `None`.
 
 use crate::price::{price_1e18_u, scale10, sqrt_from_price_u};
-use crate::swap::walk;
+use crate::swap::walk_kind;
 use crate::types::{
-    ArbParams, ArbQuote, ArbSide, PoolMeta, PoolState, SwapSpec, TickMap, ARB_FLAG_BELOW_GAS, ARB_FLAG_MAP_EDGE,
-    ARB_FLAG_MATH, ARB_FLAG_NOT_LIVE, ARB_FLAG_SIZE_CAPPED, SWAP_FLAG_EDGE, SWAP_FLAG_MATH, SWAP_FLAG_REFUSED,
-    SWAP_FLAG_SATURATED,
+    ArbParams, ArbQuote, ArbSide, PoolMeta, PoolState, SwapSpec, TickMap, ARB_FLAG_BELOW_GAS,
+    ARB_FLAG_MAP_EDGE, ARB_FLAG_MATH, ARB_FLAG_NOT_LIVE, ARB_FLAG_SIZE_CAPPED, SWAP_FLAG_EDGE,
+    SWAP_FLAG_MATH, SWAP_FLAG_REFUSED, SWAP_FLAG_SATURATED,
 };
 use crate::u256::{mul_div, mul_div_rounding_up, U256};
 
@@ -30,14 +30,26 @@ const PIPS: u128 = 1_000_000;
 
 /// `amount0` raw token0 → raw token1 at `px_1e18` (token1 per token0,
 /// human, ×1e18): `a0 · px · 10^dec1 / (10^dec0 · 1e18)`.
-const fn t0_to_t1_raw(amount0: u128, px_1e18: u128, dec0: u8, dec1: u8, round_up: bool) -> Option<U256> {
+const fn t0_to_t1_raw(
+    amount0: u128,
+    px_1e18: u128,
+    dec0: u8,
+    dec1: u8,
+    round_up: bool,
+) -> Option<U256> {
     let x = U256::mul_u128(amount0, px_1e18);
     scale10(x, dec1 as i32 - dec0 as i32 - 18, round_up)
 }
 
 /// A signed token1 raw amount → USD × 1e6, valuing token1 through
 /// token0: `raw / 10^dec1 · px0_usd_1e6 · 1e18 / P_1e18`. Saturates.
-const fn t1_raw_to_usd_1e6(mag: U256, negative: bool, px0_usd_1e6: i64, p_1e18: U256, dec1: u8) -> i64 {
+const fn t1_raw_to_usd_1e6(
+    mag: U256,
+    negative: bool,
+    px0_usd_1e6: i64,
+    p_1e18: U256,
+    dec1: u8,
+) -> i64 {
     let num = match scale10(mag, 18 - dec1 as i32, false) {
         Some(v) => v,
         None => U256::MAX,
@@ -46,7 +58,11 @@ const fn t1_raw_to_usd_1e6(mag: U256, negative: bool, px0_usd_1e6: i64, p_1e18: 
         Some(v) => v.saturating_u128(),
         None => u128::MAX,
     };
-    let v = if v > i64::MAX as u128 { i64::MAX } else { v as i64 };
+    let v = if v > i64::MAX as u128 {
+        i64::MAX
+    } else {
+        v as i64
+    };
     if negative {
         -v
     } else {
@@ -64,8 +80,14 @@ const fn t1_raw_to_usd_1e6(mag: U256, negative: bool, px0_usd_1e6: i64, p_1e18: 
 /// Never returns positive P&L with `side == None`. A `None` quote leaves
 /// `after` equal to `state` (no impact to carry).
 #[must_use]
-pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickMap<N>, p: &ArbParams) -> ArbQuote {
-    if !state.is_live() || !map.has_coverage() || p.px0_usd_1e6 <= 0 || p.max_notional_usd_1e6 <= 0 {
+pub fn solve_arb<const N: usize>(
+    state: &PoolState,
+    meta: &PoolMeta,
+    map: &TickMap<N>,
+    p: &ArbParams,
+) -> ArbQuote {
+    if !state.is_live() || !map.has_coverage() || p.px0_usd_1e6 <= 0 || p.max_notional_usd_1e6 <= 0
+    {
         return ArbQuote::none(state, ARB_FLAG_NOT_LIVE, 0);
     }
     let f = meta.fee_pips as u128;
@@ -102,7 +124,11 @@ pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickM
         return ArbQuote::none(state, 0, 0);
     }
     // Edge at the pre-trade price, bps × 1e6 = (num − den) · 1e10 / den.
-    let (num, den) = if buy { (bid_net, mid_x) } else { (mid_net, ask_x) };
+    let (num, den) = if buy {
+        (bid_net, mid_x)
+    } else {
+        (mid_net, ask_x)
+    };
     let gross = match num.checked_sub(den) {
         Some(d) => match mul_div(d, U256::from_u128(10_000_000_000), den) {
             Some(v) => {
@@ -129,7 +155,11 @@ pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickM
     };
     let target = sqrt_from_price_u(target_px, meta.dec0, meta.dec1);
     // token0 cap from the notional cap.
-    let max_t0 = match scale10(U256::from_u128(p.max_notional_usd_1e6 as u128), meta.dec0 as i32, false) {
+    let max_t0 = match scale10(
+        U256::from_u128(p.max_notional_usd_1e6 as u128),
+        meta.dec0 as i32,
+        false,
+    ) {
         Some(v) => match mul_div(v, U256::ONE, U256::from_u128(p.px0_usd_1e6 as u128)) {
             Some(q) => q.saturating_u128(),
             None => 0,
@@ -148,7 +178,15 @@ pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickM
         // Buying token0: exact OUTPUT of token0 (capped). Selling: exact INPUT.
         exact_in: sell,
     };
-    let r = walk(state, meta.tick_spacing, map.nodes(), map.lo_tick, map.hi_tick, true, &spec);
+    let r = walk_kind(
+        meta,
+        state,
+        map.nodes(),
+        map.lo_tick,
+        map.hi_tick,
+        true,
+        &spec,
+    );
     if r.flags & (SWAP_FLAG_REFUSED | SWAP_FLAG_MATH | SWAP_FLAG_SATURATED) != 0 {
         return ArbQuote::none(state, ARB_FLAG_MATH, 0);
     }
@@ -160,7 +198,11 @@ pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickM
     if !reached && r.flags & SWAP_FLAG_EDGE == 0 {
         flags |= ARB_FLAG_SIZE_CAPPED;
     }
-    let (token0, token1) = if buy { (r.amount_out, r.amount_in) } else { (r.amount_in, r.amount_out) };
+    let (token0, token1) = if buy {
+        (r.amount_out, r.amount_in)
+    } else {
+        (r.amount_in, r.amount_out)
+    };
     if token0 == 0 || token1 == 0 {
         return ArbQuote::none(state, flags, 0);
     }
@@ -184,10 +226,18 @@ pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickM
     let pnl_pre_gas = t1_raw_to_usd_1e6(mag, negative, p.px0_usd_1e6, p_mid, meta.dec1);
     let pnl = pnl_pre_gas.saturating_sub(if p.gas_usd_1e6 > 0 { p.gas_usd_1e6 } else { 0 });
     if pnl <= 0 {
-        let fl = if pnl_pre_gas > 0 { flags | ARB_FLAG_BELOW_GAS } else { flags };
+        let fl = if pnl_pre_gas > 0 {
+            flags | ARB_FLAG_BELOW_GAS
+        } else {
+            flags
+        };
         return ArbQuote::none(state, fl, pnl);
     }
-    let notional = match scale10(U256::mul_u128(token0, p.px0_usd_1e6 as u128), -(meta.dec0 as i32), false) {
+    let notional = match scale10(
+        U256::mul_u128(token0, p.px0_usd_1e6 as u128),
+        -(meta.dec0 as i32),
+        false,
+    ) {
         Some(v) => {
             let v = v.saturating_u128();
             if v > i64::MAX as u128 {
@@ -199,7 +249,11 @@ pub fn solve_arb<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickM
         None => i64::MAX,
     };
     ArbQuote {
-        side: if buy { ArbSide::BuyToken0 } else { ArbSide::SellToken0 },
+        side: if buy {
+            ArbSide::BuyToken0
+        } else {
+            ArbSide::SellToken0
+        },
         flags,
         _pad: [0; 2],
         gross_bps_1e6: gross,

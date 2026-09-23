@@ -39,7 +39,8 @@ signer-evm         = { path = "../crates/signer-evm" }
 clob-dispatcher    = { path = "../crates/clob-dispatcher" }
 # universe_toml: the M1 boot-universe config parser (core-config).
 core-config        = { path = "../crates/core-config" }
-# amm_tick_walk: the HYPARB H1 AMM walk + arb solve.
+# amm_tick_walk / amm_map_payload: the HYPARB H1 AMM walk + arb solve, the
+# O-H19 tick-map maintenance and the pool-event payload codec.
 core-amm           = { path = "../crates/core-amm" }
 
 [[bin]]
@@ -325,6 +326,13 @@ bench  = false
 [[bin]]
 name   = "amm_tick_walk"
 path   = "fuzz_targets/amm_tick_walk.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "amm_map_payload"
+path   = "fuzz_targets/amm_map_payload.rs"
 test   = false
 doc    = false
 bench  = false

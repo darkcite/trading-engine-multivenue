@@ -11,6 +11,17 @@ pub const AMM_KIND_V3: u8 = 0;
 /// `PoolMeta::kind` of a constant-product (Uniswap V2 ABI) pool, modelled
 /// as ONE full-range position (`L = sqrt(r0·r1)`, no initialised ticks).
 pub const AMM_KIND_V2: u8 = 1;
+/// `PoolMeta::kind` of an Algebra Integral pool (v1.0 and v1.2.x). Same
+/// step arithmetic as V3, a DIFFERENT loop: every step targets the next
+/// INITIALISED tick of the pool's linked list — no bitmap-word stops, no
+/// `MIN/MAX_TICK` clamp — and the loop ends after a step that moved the
+/// price without reaching its target. The fee in force is carried per
+/// swap (`Fee` / `SwapFee` events); `PoolMeta::fee_pips` is only a default.
+/// Its maps load with spacing 1 (positions minted under an older
+/// `tickSpacing` stay where they were), and `PoolMeta::tick_spacing` must
+/// be an alignment EVERY initialised tick obeys for the in-range judge to
+/// stay conservative — 1 when in doubt.
+pub const AMM_KIND_ALGEBRA: u8 = 2;
 
 /// `PoolState::flags`: the state is older than the member trusts.
 /// Recorded, never traded against.
@@ -75,6 +86,37 @@ impl PoolState {
         s
     }
 
+    /// The in-range half of a `Mint` (`delta > 0`) / `Burn` (`delta < 0`)
+    /// over `[tick_lower, tick_upper)`: the pool's liquidity moves by
+    /// `delta` iff `tick_lower <= tick < tick_upper` — the contract's own
+    /// condition, against the contract's own tick. The map half is
+    /// [`TickMap::apply_position`]. `Err` leaves the state unchanged.
+    pub fn apply_position(
+        &mut self,
+        tick_lower: i32,
+        tick_upper: i32,
+        delta: i128,
+    ) -> Result<(), AmmError> {
+        if tick_lower >= tick_upper || delta == i128::MIN {
+            return Err(AmmError::BadState);
+        }
+        if self.tick < tick_lower || self.tick >= tick_upper {
+            return Ok(());
+        }
+        let l = if delta >= 0 {
+            self.liquidity.checked_add(delta as u128)
+        } else {
+            self.liquidity.checked_sub(delta.unsigned_abs())
+        };
+        match l {
+            Some(v) => {
+                self.liquidity = v;
+                Ok(())
+            }
+            None => Err(AmmError::LiquidityOverflow),
+        }
+    }
+
     /// `true` when priced, liquid, and neither stale nor edge-limited.
     #[inline]
     #[must_use]
@@ -113,7 +155,7 @@ pub struct PoolMeta {
     pub sym0: u16,
     /// HL symbol table index of token1's hedge, `u16::MAX` = USD stable.
     pub sym1: u16,
-    /// `AMM_KIND_V3` | `AMM_KIND_V2`.
+    /// `AMM_KIND_V3` | `AMM_KIND_V2` | `AMM_KIND_ALGEBRA`.
     pub kind: u8,
     _pad: [u8; 3],
 }
@@ -141,13 +183,26 @@ impl Default for PoolMeta {
     }
 }
 
-/// One INITIALISED tick and its signed `liquidityNet`.
+/// Largest `liquidityGross` a [`TickNode`] carries: 2⁹⁶ − 1 (≈ 7.9e28,
+/// millions of times the deepest pool measured). A larger value is
+/// refused — the pool is resynced or excluded, never truncated.
+pub const MAX_TICK_GROSS: u128 = (1u128 << 96) - 1;
+
+/// One INITIALISED tick: its signed `liquidityNet` and its
+/// `liquidityGross` (Algebra: `liquidityDelta` / `liquidityTotal`).
+///
+/// The gross is what decides when a `Burn` DE-initialises the tick — a
+/// tick whose net is zero can still be initialised, and an initialised
+/// tick is a step boundary with its own rounding. It rides in the bytes
+/// that would otherwise pad `liquidity_net` to its 16-byte alignment, so
+/// the node stays 32 bytes. `0` means UNKNOWN (a map built from net
+/// values only): such a map walks exactly but refuses mutation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct TickNode {
     /// The tick (a multiple of the pool's spacing).
     pub tick: i32,
-    _pad: [u8; 12],
+    gross: [u32; 3],
     /// Liquidity added when the price crosses this tick UPWARD.
     pub liquidity_net: i128,
 }
@@ -155,12 +210,43 @@ const _: () = assert!(core::mem::size_of::<TickNode>() == 32);
 
 impl TickNode {
     /// The empty node.
-    pub const ZERO: Self = Self { tick: 0, _pad: [0; 12], liquidity_net: 0 };
+    pub const ZERO: Self = Self {
+        tick: 0,
+        gross: [0; 3],
+        liquidity_net: 0,
+    };
 
-    /// A node from its tick and `liquidityNet`.
+    /// A node from its tick and `liquidityNet`; gross UNKNOWN.
     #[must_use]
     pub const fn new(tick: i32, liquidity_net: i128) -> Self {
-        Self { tick, _pad: [0; 12], liquidity_net }
+        Self {
+            tick,
+            gross: [0; 3],
+            liquidity_net,
+        }
+    }
+
+    /// A node with its `liquidityGross`; `None` above [`MAX_TICK_GROSS`].
+    #[must_use]
+    pub const fn with_gross(tick: i32, liquidity_net: i128, liquidity_gross: u128) -> Option<Self> {
+        if liquidity_gross > MAX_TICK_GROSS {
+            return None;
+        }
+        let mut n = Self::new(tick, liquidity_net);
+        n.set_gross(liquidity_gross);
+        Some(n)
+    }
+
+    /// `liquidityGross`; `0` = unknown.
+    #[inline(always)]
+    #[must_use]
+    pub const fn liquidity_gross(&self) -> u128 {
+        (self.gross[0] as u128) | ((self.gross[1] as u128) << 32) | ((self.gross[2] as u128) << 64)
+    }
+
+    #[inline(always)]
+    const fn set_gross(&mut self, g: u128) {
+        self.gross = [g as u32, (g >> 32) as u32, (g >> 64) as u32];
     }
 }
 
@@ -178,6 +264,17 @@ pub enum AmmError {
     LiquidityNetOverflow,
     /// Spacing, alignment, coverage or range out of domain.
     BadState,
+    /// A position change the map cannot account for: a burn of a tick
+    /// the map does not hold, a gross that would go negative, or a gross
+    /// below `|liquidityNet|` — the map has drifted from the chain.
+    TickMapInconsistent,
+    /// A mutation touched a node whose `liquidityGross` is unknown.
+    GrossUnknown,
+    /// A `liquidityGross` above [`MAX_TICK_GROSS`].
+    LiquidityGrossOverflow,
+    /// A position change would take the pool's liquidity below zero or
+    /// past `u128`.
+    LiquidityOverflow,
 }
 
 impl core::fmt::Display for AmmError {
@@ -186,8 +283,14 @@ impl core::fmt::Display for AmmError {
             Self::TickMapFull => "tick map full",
             Self::TickMapUnsorted => "tick map not ascending",
             Self::TickMapDuplicate => "duplicate tick in map",
-            Self::LiquidityNetOverflow => "liquidityNet beyond the per-tick maximum (sign-extension?)",
+            Self::LiquidityNetOverflow => {
+                "liquidityNet beyond the per-tick maximum (sign-extension?)"
+            }
             Self::BadState => "bad pool state or map coverage",
+            Self::TickMapInconsistent => "position change inconsistent with the tick map",
+            Self::GrossUnknown => "liquidityGross unknown for a mutated tick",
+            Self::LiquidityGrossOverflow => "liquidityGross beyond 2^96 - 1",
+            Self::LiquidityOverflow => "pool liquidity out of range after a position change",
         };
         f.write_str(s)
     }
@@ -231,7 +334,12 @@ impl<const N: usize> TickMap<N> {
     /// it is refused until `load` sets a coverage.
     pub const EMPTY: Self = {
         let () = Self::CAP_OK;
-        Self { nodes: [TickNode::ZERO; N], len: 0, lo_tick: 1, hi_tick: 0 }
+        Self {
+            nodes: [TickNode::ZERO; N],
+            len: 0,
+            lo_tick: 1,
+            hi_tick: 0,
+        }
     };
 
     /// Number of initialised ticks held.
@@ -259,7 +367,11 @@ impl<const N: usize> TickMap<N> {
     #[inline]
     #[must_use]
     pub fn nodes(&self) -> &[TickNode] {
-        let n = if (self.len as usize) <= N { self.len as usize } else { N };
+        let n = if (self.len as usize) <= N {
+            self.len as usize
+        } else {
+            N
+        };
         &self.nodes[..n]
     }
 
@@ -276,10 +388,16 @@ impl<const N: usize> TickMap<N> {
     /// Refuses (and leaves the map CLEARED) on: more than `N` nodes, a
     /// non-ascending or duplicate tick, a tick outside the coverage or
     /// not a multiple of `tick_spacing`, a coverage not aligned to the
-    /// spacing, and any `|liquidity_net|` beyond
-    /// [`max_liquidity_per_tick`] — the fingerprint of an `int128`
-    /// decoded with the wrong sign extension.
-    pub fn load(&mut self, nodes: &[TickNode], lo_tick: i32, hi_tick: i32, tick_spacing: i32) -> Result<(), AmmError> {
+    /// spacing, any `|liquidity_net|` beyond [`max_liquidity_per_tick`] —
+    /// the fingerprint of an `int128` decoded with the wrong sign
+    /// extension — and a known gross below `|liquidity_net|`.
+    pub fn load(
+        &mut self,
+        nodes: &[TickNode],
+        lo_tick: i32,
+        hi_tick: i32,
+        tick_spacing: i32,
+    ) -> Result<(), AmmError> {
         self.clear();
         if tick_spacing <= 0
             || lo_tick > hi_tick
@@ -312,12 +430,152 @@ impl<const N: usize> TickMap<N> {
             if n.liquidity_net.unsigned_abs() > cap {
                 return Err(AmmError::LiquidityNetOverflow);
             }
+            let g = n.liquidity_gross();
+            if g != 0 && g < n.liquidity_net.unsigned_abs() {
+                return Err(AmmError::TickMapInconsistent);
+            }
             self.nodes[i] = n;
             i += 1;
         }
         self.len = nodes.len() as u16;
         self.lo_tick = lo_tick;
         self.hi_tick = hi_tick;
+        Ok(())
+    }
+
+    /// First index whose tick is `>= tick`.
+    #[inline]
+    fn lower_bound(&self, tick: i32) -> usize {
+        let nodes = self.nodes();
+        let mut lo = 0usize;
+        let mut hi = nodes.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if nodes[mid].tick < tick {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// The node change one end of a position makes, validated but not
+    /// applied: `(index, present, new_gross, new_net)`, or `None` when the
+    /// tick lies outside the coverage (the map ignores it — a walk never
+    /// goes there).
+    #[inline]
+    fn plan_end(
+        &self,
+        tick: i32,
+        delta: i128,
+        net_delta: i128,
+    ) -> Result<Option<(usize, bool, u128, i128)>, AmmError> {
+        if tick < self.lo_tick || tick > self.hi_tick {
+            return Ok(None);
+        }
+        let i = self.lower_bound(tick);
+        let present = i < self.len() && self.nodes[i].tick == tick;
+        let (gross, net) = if present {
+            let g = self.nodes[i].liquidity_gross();
+            if g == 0 {
+                return Err(AmmError::GrossUnknown);
+            }
+            (g, self.nodes[i].liquidity_net)
+        } else {
+            (0, 0)
+        };
+        let new_gross = if delta >= 0 {
+            match gross.checked_add(delta as u128) {
+                Some(v) if v <= MAX_TICK_GROSS => v,
+                _ => return Err(AmmError::LiquidityGrossOverflow),
+            }
+        } else {
+            match gross.checked_sub(delta.unsigned_abs()) {
+                Some(v) => v,
+                None => return Err(AmmError::TickMapInconsistent),
+            }
+        };
+        let new_net = match net.checked_add(net_delta) {
+            Some(v) => v,
+            None => return Err(AmmError::LiquidityNetOverflow),
+        };
+        if new_gross < new_net.unsigned_abs() {
+            return Err(AmmError::TickMapInconsistent);
+        }
+        Ok(Some((i, present, new_gross, new_net)))
+    }
+
+    /// Apply the plan of one end. Never fails: capacity was checked.
+    #[inline]
+    fn commit_end(&mut self, tick: i32, plan: (usize, bool, u128, i128)) {
+        let (i, present, gross, net) = plan;
+        let len = self.len();
+        if present {
+            if gross == 0 {
+                // De-initialised: the node leaves the map.
+                // COPY: in-place shift of ≤ N × 32 B — a sorted remove, once per Burn (never per swap) — a linked list instead would chase pointers on every walk step.
+                self.nodes.copy_within(i + 1..len, i);
+                self.nodes[len - 1] = TickNode::ZERO;
+                self.len -= 1;
+            } else {
+                self.nodes[i].set_gross(gross);
+                self.nodes[i].liquidity_net = net;
+            }
+        } else {
+            // COPY: in-place shift of ≤ N × 32 B — a sorted insert, once per Mint (never per swap) — same trade as the remove above.
+            self.nodes.copy_within(i..len, i + 1);
+            let mut n = TickNode::new(tick, net);
+            n.set_gross(gross);
+            self.nodes[i] = n;
+            self.len += 1;
+        }
+    }
+
+    /// Apply a position change — a `Mint` (`delta > 0`) or a `Burn`
+    /// (`delta < 0`) of `|delta|` liquidity over `[tick_lower,
+    /// tick_upper)` — exactly as the pool's `ticks.update` does: both ends'
+    /// gross by `delta`, the lower end's net by `+delta`, the upper's by
+    /// `−delta`; a tick whose gross reaches zero is de-initialised and
+    /// leaves the map, a new one is inserted in order. Ends outside the
+    /// coverage are ignored. The pool's in-range liquidity is NOT touched
+    /// here — see [`PoolState::apply_position`].
+    ///
+    /// **All or nothing:** both ends are validated before either is
+    /// written. On `Err` the map is unchanged — and no longer trusted by
+    /// the caller, who must resync it: an error means the map and the
+    /// chain disagree. Zero-alloc (in-place shifts of the fixed array).
+    pub fn apply_position(
+        &mut self,
+        tick_lower: i32,
+        tick_upper: i32,
+        delta: i128,
+    ) -> Result<(), AmmError> {
+        if tick_lower >= tick_upper
+            || tick_lower < MIN_TICK
+            || tick_upper > MAX_TICK
+            || delta == i128::MIN
+        {
+            return Err(AmmError::BadState);
+        }
+        if delta == 0 || !self.has_coverage() {
+            return Ok(());
+        }
+        let lower = self.plan_end(tick_lower, delta, delta)?;
+        let upper = self.plan_end(tick_upper, delta, -delta)?;
+        let inserts = (matches!(lower, Some((_, false, _, _))) as usize)
+            + (matches!(upper, Some((_, false, _, _))) as usize);
+        if self.len() + inserts > N {
+            return Err(AmmError::TickMapFull);
+        }
+        // Upper first: its index is at or above the lower's, so shifting
+        // there leaves the lower's planned index valid.
+        if let Some(p) = upper {
+            self.commit_end(tick_upper, p);
+        }
+        if let Some(p) = lower {
+            self.commit_end(tick_lower, p);
+        }
         Ok(())
     }
 }
@@ -444,8 +702,23 @@ impl SwapResult {
         }
     }
 
-    pub(crate) const fn new(amount_in: u128, amount_out: u128, fee: u128, steps: u16, flags: u8, after: PoolState) -> Self {
-        Self { amount_in, amount_out, fee, steps, flags, _pad: [0; 13], after }
+    pub(crate) const fn new(
+        amount_in: u128,
+        amount_out: u128,
+        fee: u128,
+        steps: u16,
+        flags: u8,
+        after: PoolState,
+    ) -> Self {
+        Self {
+            amount_in,
+            amount_out,
+            fee,
+            steps,
+            flags,
+            _pad: [0; 13],
+            after,
+        }
     }
 }
 

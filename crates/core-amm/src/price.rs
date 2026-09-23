@@ -169,7 +169,10 @@ mod tests {
         // A live WHYPE(18)/USDC(6) state: tick -230543 ⇒ ~ $97.7.
         let (lo, hi) = sqrt_at_tick(-230_543);
         let px = price_1e18_from_sqrt(lo, hi, 18, 6);
-        assert!(px > 90 * 1_000_000_000_000_000_000 && px < 110 * 1_000_000_000_000_000_000, "px {px}");
+        assert!(
+            px > 90 * 1_000_000_000_000_000_000 && px < 110 * 1_000_000_000_000_000_000,
+            "px {px}"
+        );
         let (slo, shi) = sqrt_from_price_1e18(px, 18, 6);
         let back = price_1e18_from_sqrt(slo, shi, 18, 6);
         // floor(sqrt) then square: within a few 1e-18 relative.

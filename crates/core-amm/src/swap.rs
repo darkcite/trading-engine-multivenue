@@ -1,24 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! The tick walk — `UniswapV3Pool.swap`'s loop, over a local tick map.
+//! The tick walk — the pool contract's swap loop, over a local tick map.
 //!
 //! The walk reproduces the contract's STEP DECOMPOSITION, not just its
-//! price path: `nextInitializedTickWithinOneWord` stops at every 256-tick
-//! bitmap-word boundary even when no tick there is initialised, and each
-//! step rounds its own amounts. Emulating those boundaries from the
-//! sorted node list is what makes a replayed swap agree with the chain
-//! to the wei rather than to within the pool fee.
+//! price path, because each step rounds its own amounts:
+//!
+//! * **V3 (`LINKED = false`)** — `UniswapV3Pool.swap` (and its Slipstream
+//!   fork): `nextInitializedTickWithinOneWord` stops at every 256-tick
+//!   bitmap-word boundary even when no tick there is initialised, and the
+//!   target is clamped to `MIN/MAX_TICK`. Emulated from the sorted node
+//!   list.
+//! * **Algebra Integral (`LINKED = true`)** — `SwapCalculation`: every
+//!   step targets the next INITIALISED tick of the linked list (the list
+//!   is terminated by `MIN/MAX_TICK` markers, so there is no clamp and no
+//!   word stop), and the loop ends after a step that moved the price
+//!   without reaching its target.
+//!
+//! The per-step arithmetic (`movePriceTowardsTarget` ≡ `computeSwapStep`)
+//! and the crossing rule are identical in both.
 //!
 //! Laws: no iterators (`while` + index); no floats; never extrapolate
 //! past the coverage; clamp liquidity at zero on an inconsistent map
 //! (and say so); bounded step count.
 
 use crate::sqrt_price_math::compute_swap_step;
-use crate::tick_math::{sqrt_ratio_at_tick, tick_at_sqrt_ratio, MAX_SQRT, MAX_TICK, MIN_SQRT, MIN_TICK};
+use crate::tick_math::{
+    sqrt_ratio_at_tick, tick_at_sqrt_ratio, MAX_SQRT, MAX_TICK, MIN_SQRT, MIN_TICK,
+};
 use crate::types::{
-    PoolMeta, PoolState, SwapResult, SwapSpec, TickMap, TickNode, POOL_FLAG_EDGE, SWAP_FLAG_EDGE,
-    SWAP_FLAG_LIMIT, SWAP_FLAG_LIQ_CLAMP, SWAP_FLAG_MATH, SWAP_FLAG_SATURATED, SWAP_FLAG_STEP_CAP,
+    PoolMeta, PoolState, SwapResult, SwapSpec, TickMap, TickNode, AMM_KIND_ALGEBRA, POOL_FLAG_EDGE,
+    SWAP_FLAG_EDGE, SWAP_FLAG_LIMIT, SWAP_FLAG_LIQ_CLAMP, SWAP_FLAG_MATH, SWAP_FLAG_SATURATED,
+    SWAP_FLAG_STEP_CAP,
 };
 use crate::u256::U256;
 
@@ -68,6 +81,30 @@ fn next_tick(tick: i32, spacing: i32, lte: bool, nodes: &[TickNode], cursor: usi
     }
 }
 
+/// Algebra's step target: the neighbouring INITIALISED tick of the list
+/// (same cursor convention as [`next_tick`]); past the map's last node,
+/// the coverage edge, uninitialised (the limit is already clamped to it).
+#[inline(always)]
+fn next_tick_linked(
+    lte: bool,
+    nodes: &[TickNode],
+    cursor: usize,
+    lo_edge: i32,
+    hi_edge: i32,
+) -> (i64, bool) {
+    if lte {
+        if cursor > 0 && cursor <= nodes.len() {
+            return (nodes[cursor - 1].tick as i64, true);
+        }
+        (lo_edge as i64, false)
+    } else {
+        if cursor < nodes.len() {
+            return (nodes[cursor].tick as i64, true);
+        }
+        (hi_edge as i64, false)
+    }
+}
+
 /// First index whose tick is `> tick` (binary search, no iterator).
 #[inline]
 fn upper_bound(nodes: &[TickNode], tick: i32) -> usize {
@@ -106,7 +143,9 @@ const fn max_u(a: U256, b: U256) -> U256 {
 /// `[lo_edge, hi_edge]` INCLUSIVE (a fetched map), so ending exactly on
 /// an edge is an ordinary cross; `false` (the in-range judge) marks such
 /// an ending `POOL_FLAG_EDGE`, because the liquidity beyond is unknown.
-pub(crate) fn walk(
+/// `LINKED` selects the Algebra loop (module docs); monomorphised, so
+/// neither loop pays for the other's branches.
+pub(crate) fn walk<const LINKED: bool>(
     state: &PoolState,
     spacing: i32,
     nodes: &[TickNode],
@@ -127,9 +166,21 @@ pub(crate) fn walk(
         return SwapResult::refused(state);
     }
     let zero_for_one = spec.zero_for_one;
-    let lo_e = if lo_edge < MIN_TICK { MIN_TICK } else { lo_edge };
-    let hi_e = if hi_edge > MAX_TICK { MAX_TICK } else { hi_edge };
-    let edge_sqrt = if zero_for_one { sqrt_ratio_at_tick(lo_e) } else { sqrt_ratio_at_tick(hi_e) };
+    let lo_e = if lo_edge < MIN_TICK {
+        MIN_TICK
+    } else {
+        lo_edge
+    };
+    let hi_e = if hi_edge > MAX_TICK {
+        MAX_TICK
+    } else {
+        hi_edge
+    };
+    let edge_sqrt = if zero_for_one {
+        sqrt_ratio_at_tick(lo_e)
+    } else {
+        sqrt_ratio_at_tick(hi_e)
+    };
     let req_limit = U256::from_u160(spec.limit_lo, spec.limit_hi);
     // The requested limit must lie on the trading side of the price.
     if (zero_for_one && req_limit >= start_sqrt) || (!zero_for_one && req_limit <= start_sqrt) {
@@ -163,7 +214,11 @@ pub(crate) fn walk(
         }
         steps += 1;
         let step_start = sqrt;
-        let (nt, initialised) = next_tick(tick, spacing, zero_for_one, nodes, cursor);
+        let (nt, initialised) = if LINKED {
+            next_tick_linked(zero_for_one, nodes, cursor, lo_e, hi_e)
+        } else {
+            next_tick(tick, spacing, zero_for_one, nodes, cursor)
+        };
         let nt = if nt < MIN_TICK as i64 {
             MIN_TICK
         } else if nt > MAX_TICK as i64 {
@@ -172,8 +227,13 @@ pub(crate) fn walk(
             nt as i32
         };
         let sqrt_next = sqrt_ratio_at_tick(nt);
-        let target = if zero_for_one { max_u(sqrt_next, limit) } else { min_u(sqrt_next, limit) };
-        let st = match compute_swap_step(sqrt, target, liq, remaining, spec.exact_in, spec.fee_pips) {
+        let target = if zero_for_one {
+            max_u(sqrt_next, limit)
+        } else {
+            min_u(sqrt_next, limit)
+        };
+        let st = match compute_swap_step(sqrt, target, liq, remaining, spec.exact_in, spec.fee_pips)
+        {
             Some(s) => s,
             None => {
                 flags |= SWAP_FLAG_MATH;
@@ -202,7 +262,11 @@ pub(crate) fn walk(
                 // Up: cross nodes[cursor]; down: cross nodes[cursor - 1].
                 let idx = if zero_for_one { cursor - 1 } else { cursor };
                 let net = nodes[idx].liquidity_net;
-                let net = if zero_for_one { net.wrapping_neg() } else { net };
+                let net = if zero_for_one {
+                    net.wrapping_neg()
+                } else {
+                    net
+                };
                 if net >= 0 {
                     liq = liq.saturating_add(net as u128);
                 } else {
@@ -219,10 +283,19 @@ pub(crate) fn walk(
             tick = if zero_for_one { nt - 1 } else { nt };
         } else if sqrt != step_start {
             tick = tick_at_sqrt_ratio(sqrt);
+            if LINKED {
+                // Algebra: a step that stopped short of its target ends
+                // the swap (the remainder was absorbed by the step).
+                break;
+            }
         }
     }
     if sqrt == limit && !remaining.is_zero() {
-        flags |= if edge_binds { SWAP_FLAG_EDGE } else { SWAP_FLAG_LIMIT };
+        flags |= if edge_binds {
+            SWAP_FLAG_EDGE
+        } else {
+            SWAP_FLAG_LIMIT
+        };
     }
     if !edges_known && sqrt == edge_sqrt {
         // Landed on an edge whose far side is unknown: this state's
@@ -252,16 +325,63 @@ pub(crate) fn walk(
     )
 }
 
+/// [`walk`] in the loop `meta.kind` selects.
+#[inline(always)]
+pub(crate) fn walk_kind(
+    meta: &PoolMeta,
+    state: &PoolState,
+    nodes: &[TickNode],
+    lo_edge: i32,
+    hi_edge: i32,
+    edges_known: bool,
+    spec: &SwapSpec,
+) -> SwapResult {
+    if meta.kind == AMM_KIND_ALGEBRA {
+        walk::<true>(
+            state,
+            meta.tick_spacing,
+            nodes,
+            lo_edge,
+            hi_edge,
+            edges_known,
+            spec,
+        )
+    } else {
+        walk::<false>(
+            state,
+            meta.tick_spacing,
+            nodes,
+            lo_edge,
+            hi_edge,
+            edges_known,
+            spec,
+        )
+    }
+}
+
 /// One swap exactly as the pool contract would execute it, walking the
-/// map's initialised ticks (and its bitmap-word boundaries) with the
-/// contract's rounding. `spec.fee_pips` is the pool fee (a dynamic-fee
-/// pool passes the fee in force at that block).
+/// map's initialised ticks (and, for V3, its bitmap-word boundaries) with
+/// the contract's rounding, in the loop of `meta.kind`. `spec.fee_pips`
+/// is the fee in force (a dynamic-fee pool passes the fee of that swap).
 #[must_use]
-pub fn swap_exact<const N: usize>(state: &PoolState, meta: &PoolMeta, map: &TickMap<N>, spec: &SwapSpec) -> SwapResult {
+pub fn swap_exact<const N: usize>(
+    state: &PoolState,
+    meta: &PoolMeta,
+    map: &TickMap<N>,
+    spec: &SwapSpec,
+) -> SwapResult {
     if !map.has_coverage() {
         return SwapResult::refused(state);
     }
-    walk(state, meta.tick_spacing, map.nodes(), map.lo_tick, map.hi_tick, true, spec)
+    walk_kind(
+        meta,
+        state,
+        map.nodes(),
+        map.lo_tick,
+        map.hi_tick,
+        true,
+        spec,
+    )
 }
 
 /// Walk the tick map from `state` toward the target price, exact-input,
@@ -294,7 +414,15 @@ pub fn swap_to_target<const N: usize>(
         zero_for_one: !up,
         exact_in: !up,
     };
-    let r = walk(state, meta.tick_spacing, map.nodes(), map.lo_tick, map.hi_tick, true, &spec);
+    let r = walk_kind(
+        meta,
+        state,
+        map.nodes(),
+        map.lo_tick,
+        map.hi_tick,
+        true,
+        &spec,
+    );
     if up {
         (r.amount_out, r.amount_in, r.after)
     } else {
@@ -332,7 +460,7 @@ pub fn swap_in_range(
         zero_for_one: !up,
         exact_in: !up,
     };
-    let r = walk(state, meta.tick_spacing, &[], lo, hi, false, &spec);
+    let r = walk_kind(meta, state, &[], lo, hi, false, &spec);
     if up {
         (r.amount_out, r.amount_in, r.after)
     } else {
@@ -346,7 +474,7 @@ pub fn swap_in_range(
 #[must_use]
 pub fn swap_exact_in_range(state: &PoolState, meta: &PoolMeta, spec: &SwapSpec) -> SwapResult {
     let (lo, hi) = crate::price::range_bounds(state.tick, meta.tick_spacing);
-    walk(state, meta.tick_spacing, &[], lo, hi, false, spec)
+    walk_kind(meta, state, &[], lo, hi, false, spec)
 }
 
 #[cfg(test)]
@@ -357,7 +485,11 @@ mod tests {
     #[test]
     fn next_tick_matches_bitmap_semantics() {
         // spacing 10, nodes at -100, 0, 50
-        let nodes = [TickNode::new(-100, 5), TickNode::new(0, 7), TickNode::new(50, -12)];
+        let nodes = [
+            TickNode::new(-100, 5),
+            TickNode::new(0, 7),
+            TickNode::new(50, -12),
+        ];
         // up from 5: next initialised 50 (same word)
         let c = upper_bound(&nodes, 5);
         assert_eq!(next_tick(5, 10, false, &nodes, c), (50, true));
@@ -383,11 +515,27 @@ mod tests {
         let mut meta = PoolMeta::ZERO;
         meta.tick_spacing = 60;
         let (llo, lhi) = sqrt_at_tick(10);
-        let spec = SwapSpec { amount: 1_000, limit_lo: llo, limit_hi: lhi, fee_pips: 500, zero_for_one: true, exact_in: true };
-        assert_eq!(swap_exact(&s, &meta, &m, &spec).flags, crate::SWAP_FLAG_REFUSED);
+        let spec = SwapSpec {
+            amount: 1_000,
+            limit_lo: llo,
+            limit_hi: lhi,
+            fee_pips: 500,
+            zero_for_one: true,
+            exact_in: true,
+        };
+        assert_eq!(
+            swap_exact(&s, &meta, &m, &spec).flags,
+            crate::SWAP_FLAG_REFUSED
+        );
         let far = PoolState::new(lo, hi, 900, 1);
-        let spec = SwapSpec { zero_for_one: false, ..spec };
-        assert_eq!(swap_exact(&far, &meta, &m, &spec).flags, crate::SWAP_FLAG_REFUSED);
+        let spec = SwapSpec {
+            zero_for_one: false,
+            ..spec
+        };
+        assert_eq!(
+            swap_exact(&far, &meta, &m, &spec).flags,
+            crate::SWAP_FLAG_REFUSED
+        );
     }
 
     #[test]
@@ -399,10 +547,20 @@ mod tests {
         let mut meta = PoolMeta::ZERO;
         meta.tick_spacing = 60;
         let (llo, lhi) = sqrt_at_tick(6000);
-        let spec = SwapSpec { amount: u128::MAX >> 1, limit_lo: llo, limit_hi: lhi, fee_pips: 3_000, zero_for_one: false, exact_in: true };
+        let spec = SwapSpec {
+            amount: u128::MAX >> 1,
+            limit_lo: llo,
+            limit_hi: lhi,
+            fee_pips: 3_000,
+            zero_for_one: false,
+            exact_in: true,
+        };
         let r = swap_exact(&s, &meta, &m, &spec);
         assert_eq!(r.flags & SWAP_FLAG_EDGE, SWAP_FLAG_EDGE);
         assert_eq!(r.after.tick, 60);
-        assert_eq!((r.after.sqrt_price_lo, r.after.sqrt_price_hi), sqrt_at_tick(60));
+        assert_eq!(
+            (r.after.sqrt_price_lo, r.after.sqrt_price_hi),
+            sqrt_at_tick(60)
+        );
     }
 }

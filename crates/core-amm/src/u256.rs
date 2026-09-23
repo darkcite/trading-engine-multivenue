@@ -28,7 +28,10 @@ const RADIX: u128 = 1 << 64;
 impl U256 {
     pub(crate) const ZERO: Self = Self { hi: 0, lo: 0 };
     pub(crate) const ONE: Self = Self { hi: 0, lo: 1 };
-    pub(crate) const MAX: Self = Self { hi: u128::MAX, lo: u128::MAX };
+    pub(crate) const MAX: Self = Self {
+        hi: u128::MAX,
+        lo: u128::MAX,
+    };
 
     #[inline(always)]
     pub(crate) const fn from_u128(x: u128) -> Self {
@@ -40,9 +43,15 @@ impl U256 {
     pub(crate) const fn pow2(n: u32) -> Self {
         debug_assert!(n < 256);
         if n < 128 {
-            Self { hi: 0, lo: 1u128 << n }
+            Self {
+                hi: 0,
+                lo: 1u128 << n,
+            }
         } else {
-            Self { hi: 1u128 << (n - 128), lo: 0 }
+            Self {
+                hi: 1u128 << (n - 128),
+                lo: 0,
+            }
         }
     }
 
@@ -172,9 +181,15 @@ impl U256 {
         } else if n >= 256 {
             Self::ZERO
         } else if n >= 128 {
-            Self { hi: self.lo << (n - 128), lo: 0 }
+            Self {
+                hi: self.lo << (n - 128),
+                lo: 0,
+            }
         } else {
-            Self { hi: (self.hi << n) | (self.lo >> (128 - n)), lo: self.lo << n }
+            Self {
+                hi: (self.hi << n) | (self.lo >> (128 - n)),
+                lo: self.lo << n,
+            }
         }
     }
 
@@ -186,15 +201,26 @@ impl U256 {
         } else if n >= 256 {
             Self::ZERO
         } else if n >= 128 {
-            Self { hi: 0, lo: self.hi >> (n - 128) }
+            Self {
+                hi: 0,
+                lo: self.hi >> (n - 128),
+            }
         } else {
-            Self { hi: self.hi >> n, lo: (self.lo >> n) | (self.hi << (128 - n)) }
+            Self {
+                hi: self.hi >> n,
+                lo: (self.lo >> n) | (self.hi << (128 - n)),
+            }
         }
     }
 
     #[inline(always)]
     const fn limbs(self) -> [u64; 4] {
-        [self.lo as u64, (self.lo >> 64) as u64, self.hi as u64, (self.hi >> 64) as u64]
+        [
+            self.lo as u64,
+            (self.lo >> 64) as u64,
+            self.hi as u64,
+            (self.hi >> 64) as u64,
+        ]
     }
 
     #[inline(always)]
@@ -243,7 +269,10 @@ impl U256 {
         let l = self.limbs();
         let u = [l[0], l[1], l[2], l[3], 0, 0, 0, 0];
         let (q, r) = divmod_512_by_256(u, d.limbs());
-        Some((Self::from_limbs(q[0], q[1], q[2], q[3]), Self::from_limbs(r[0], r[1], r[2], r[3])))
+        Some((
+            Self::from_limbs(q[0], q[1], q[2], q[3]),
+            Self::from_limbs(r[0], r[1], r[2], r[3]),
+        ))
     }
 
     /// Floor square root (Newton, monotone from above).
@@ -261,7 +290,11 @@ impl U256 {
             };
             let (s, o) = x.overflowing_add(q);
             // (x + q) / 2 with the carry bit folded back in
-            let y = if o { s.shr(1).wrapping_add(Self::pow2(255)) } else { s.shr(1) };
+            let y = if o {
+                s.shr(1).wrapping_add(Self::pow2(255))
+            } else {
+                s.shr(1)
+            };
             if x.le(y) {
                 return x;
             }
@@ -321,7 +354,10 @@ const fn mul_div_rem(a: U256, b: U256, d: U256) -> Option<(U256, U256)> {
     if q[4] | q[5] | q[6] | q[7] != 0 {
         return None;
     }
-    Some((U256::from_limbs(q[0], q[1], q[2], q[3]), U256::from_limbs(r[0], r[1], r[2], r[3])))
+    Some((
+        U256::from_limbs(q[0], q[1], q[2], q[3]),
+        U256::from_limbs(r[0], r[1], r[2], r[3]),
+    ))
 }
 
 /// Schoolbook 4×4-limb product. Each partial `a·b + r + carry` is at
@@ -386,7 +422,11 @@ const fn divmod_512_by_256(u: [u64; 8], v: [u64; 4]) -> ([u64; 8], [u64; 4]) {
     let mut vn = [0u64; 4];
     let mut i = n - 1;
     while i > 0 {
-        vn[i] = if s == 0 { v[i] } else { (v[i] << s) | (v[i - 1] >> (64 - s)) };
+        vn[i] = if s == 0 {
+            v[i]
+        } else {
+            (v[i] << s) | (v[i - 1] >> (64 - s))
+        };
         i -= 1;
     }
     vn[0] = v[0] << s;
@@ -394,7 +434,11 @@ const fn divmod_512_by_256(u: [u64; 8], v: [u64; 4]) -> ([u64; 8], [u64; 4]) {
     un[m] = if s == 0 { 0 } else { u[m - 1] >> (64 - s) };
     let mut i = m - 1;
     while i > 0 {
-        un[i] = if s == 0 { u[i] } else { (u[i] << s) | (u[i - 1] >> (64 - s)) };
+        un[i] = if s == 0 {
+            u[i]
+        } else {
+            (u[i] << s) | (u[i - 1] >> (64 - s))
+        };
         i -= 1;
     }
     un[0] = u[0] << s;
@@ -447,7 +491,11 @@ const fn divmod_512_by_256(u: [u64; 8], v: [u64; 4]) -> ([u64; 8], [u64; 4]) {
     let mut r = [0u64; 4];
     let mut k = 0;
     while k < n {
-        r[k] = if s == 0 { un[k] } else { (un[k] >> s) | (un[k + 1] << (64 - s)) };
+        r[k] = if s == 0 {
+            un[k]
+        } else {
+            (un[k] >> s) | (un[k + 1] << (64 - s))
+        };
         k += 1;
     }
     (q, r)
@@ -482,7 +530,8 @@ mod tests {
             any::<u128>().prop_map(U256::from_u128),
             (any::<u64>(), any::<u128>()).prop_map(|(h, l)| u(h as u128, l)),
             (0u32..256).prop_map(U256::pow2),
-            (0u32..256, any::<u128>()).prop_map(|(n, x)| U256::pow2(n).wrapping_sub(U256::from_u128(x % 7))),
+            (0u32..256, any::<u128>())
+                .prop_map(|(n, x)| U256::pow2(n).wrapping_sub(U256::from_u128(x % 7))),
         ]
     }
 
@@ -491,20 +540,43 @@ mod tests {
         let a = u128::MAX;
         let p = U256::mul_u128(a, a);
         // (2^128-1)^2 = 2^256 - 2^129 + 1
-        assert_eq!(p, U256::MAX.wrapping_sub(U256::pow2(129)).wrapping_add(U256::from_u128(2)));
+        assert_eq!(
+            p,
+            U256::MAX
+                .wrapping_sub(U256::pow2(129))
+                .wrapping_add(U256::from_u128(2))
+        );
     }
 
     #[test]
     fn division_edge_cases() {
-        assert_eq!(U256::MAX.checked_div_rem(U256::ONE), Some((U256::MAX, U256::ZERO)));
-        assert_eq!(U256::MAX.checked_div_rem(U256::MAX), Some((U256::ONE, U256::ZERO)));
+        assert_eq!(
+            U256::MAX.checked_div_rem(U256::ONE),
+            Some((U256::MAX, U256::ZERO))
+        );
+        assert_eq!(
+            U256::MAX.checked_div_rem(U256::MAX),
+            Some((U256::ONE, U256::ZERO))
+        );
         assert_eq!(U256::ONE.checked_div_rem(U256::ZERO), None);
         assert_eq!(mul_div(U256::MAX, U256::MAX, U256::MAX), Some(U256::MAX));
         assert_eq!(mul_div(U256::MAX, U256::from_u128(2), U256::ONE), None);
-        assert_eq!(mul_div_rounding_up(U256::from_u128(7), U256::from_u128(3), U256::from_u128(2)), Some(U256::from_u128(11)));
-        assert_eq!(mul_div_rounding_up(U256::MAX, U256::ONE, U256::ONE), Some(U256::MAX));
-        assert_eq!(mul_div_rounding_up(U256::MAX, U256::from_u128(2), U256::from_u128(2)), Some(U256::MAX));
-        assert_eq!(div_rounding_up(U256::from_u128(10), U256::from_u128(4)), Some(U256::from_u128(3)));
+        assert_eq!(
+            mul_div_rounding_up(U256::from_u128(7), U256::from_u128(3), U256::from_u128(2)),
+            Some(U256::from_u128(11))
+        );
+        assert_eq!(
+            mul_div_rounding_up(U256::MAX, U256::ONE, U256::ONE),
+            Some(U256::MAX)
+        );
+        assert_eq!(
+            mul_div_rounding_up(U256::MAX, U256::from_u128(2), U256::from_u128(2)),
+            Some(U256::MAX)
+        );
+        assert_eq!(
+            div_rounding_up(U256::from_u128(10), U256::from_u128(4)),
+            Some(U256::from_u128(3))
+        );
     }
 
     #[test]

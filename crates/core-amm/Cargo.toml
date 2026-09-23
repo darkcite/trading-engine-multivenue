@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
-description  = "HYPARB H1: concentrated- and constant-product AMM swap simulation, bit-exact with the Uniswap V3 contracts (tick math, bitmap-word step walk, exact fee arithmetic), and the single-block arb sizing solve. Zero-alloc, no dyn, no floats, no unsafe."
+description  = "HYPARB H1/O-H19: concentrated- and constant-product AMM swap simulation, bit-exact with the Uniswap V3 / Slipstream and Algebra Integral contracts (tick math, each family's step walk, exact fee arithmetic), tick-map maintenance from Mint/Burn, the 40-byte pool-event payload, and the single-block arb sizing solve. Zero-alloc, no dyn, no floats, no unsafe."
 
 [lib]
 path = "src/lib.rs"

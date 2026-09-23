@@ -5,7 +5,8 @@
 //!
 //! Arbitrary bytes become a pool state, a tick map (possibly
 //! INCONSISTENT — nets that do not sum, liquidity that underflows on a
-//! cross), a swap request and hedge bounds. The walk's failure mode is
+//! cross), a swap request and hedge bounds, walked in either loop — V3
+//! or Algebra (the flags byte's top bit). The walk's failure mode is
 //! not only a crash: an amount that exceeds what was asked, or a quote
 //! with positive P&L and no side, would be booked as edge.
 //!
@@ -24,8 +25,9 @@
 use libfuzzer_sys::fuzz_target;
 
 use core_amm::{
-    solve_arb, sqrt_at_tick, swap_exact, swap_exact_in_range, ArbParams, ArbSide, PoolMeta, PoolState, SwapSpec, TickMap,
-    TickNode, MAX_TICK, MIN_TICK, SWAP_FLAG_REFUSED,
+    solve_arb, sqrt_at_tick, swap_exact, swap_exact_in_range, ArbParams, ArbSide, PoolMeta,
+    PoolState, SwapSpec, TickMap, TickNode, AMM_KIND_ALGEBRA, AMM_KIND_V3, MAX_TICK, MIN_TICK,
+    SWAP_FLAG_REFUSED,
 };
 
 fn take<const K: usize>(d: &[u8], i: &mut usize) -> [u8; K] {
@@ -44,11 +46,17 @@ fuzz_target!(|d: &[u8]| {
     let spacing = (u16::from_le_bytes(take::<2>(d, &mut i)) % 400) as i32 + 1;
     let tick = i32::from_le_bytes(take::<4>(d, &mut i)) % (MAX_TICK - 1);
     let liq = u128::from_le_bytes(take::<16>(d, &mut i)) >> (take::<1>(d, &mut i)[0] % 128);
-    let flags = take::<1>(d, &mut i)[0] & 3;
+    let fb = take::<1>(d, &mut i)[0];
+    let flags = fb & 3;
     let (lo, hi) = sqrt_at_tick(tick);
     let mut state = PoolState::new(lo, hi, tick, liq);
     state.flags = flags;
     let mut meta = PoolMeta::ZERO;
+    meta.kind = if fb & 0x80 != 0 {
+        AMM_KIND_ALGEBRA
+    } else {
+        AMM_KIND_V3
+    };
     meta.tick_spacing = spacing;
     meta.fee_pips = u32::from_le_bytes(take::<4>(d, &mut i)) % 1_000_001;
     meta.dec0 = take::<1>(d, &mut i)[0] % 25;
@@ -69,7 +77,8 @@ fuzz_target!(|d: &[u8]| {
     let lo_t = ((base - spacing * 200) / spacing) * spacing;
     let hi_t = ((base + spacing * 200) / spacing) * spacing;
     let mut map = TickMap::<32>::EMPTY;
-    let loaded = lo_t > MIN_TICK && hi_t < MAX_TICK && map.load(&nodes[..n], lo_t, hi_t, spacing).is_ok();
+    let loaded =
+        lo_t > MIN_TICK && hi_t < MAX_TICK && map.load(&nodes[..n], lo_t, hi_t, spacing).is_ok();
 
     let amount = u128::from_le_bytes(take::<16>(d, &mut i)) >> (take::<1>(d, &mut i)[0] % 128);
     let dt = i32::from_le_bytes(take::<4>(d, &mut i)) % 20_000;
@@ -83,11 +92,25 @@ fuzz_target!(|d: &[u8]| {
         zero_for_one: dt < 0,
         exact_in: take::<1>(d, &mut i)[0] & 1 == 0,
     };
-    let r = if loaded { swap_exact(&state, &meta, &map, &spec) } else { swap_exact_in_range(&state, &meta, &spec) };
-    if spec.exact_in {
-        assert!(r.amount_in <= amount, "exact-in spent {} of {}", r.amount_in, amount);
+    let r = if loaded {
+        swap_exact(&state, &meta, &map, &spec)
     } else {
-        assert!(r.amount_out <= amount, "exact-out delivered {} of {}", r.amount_out, amount);
+        swap_exact_in_range(&state, &meta, &spec)
+    };
+    if spec.exact_in {
+        assert!(
+            r.amount_in <= amount,
+            "exact-in spent {} of {}",
+            r.amount_in,
+            amount
+        );
+    } else {
+        assert!(
+            r.amount_out <= amount,
+            "exact-out delivered {} of {}",
+            r.amount_out,
+            amount
+        );
     }
     assert!(r.fee <= r.amount_in);
     if r.flags & SWAP_FLAG_REFUSED != 0 {

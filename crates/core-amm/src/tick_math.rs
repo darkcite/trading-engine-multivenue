@@ -77,7 +77,11 @@ pub(crate) const fn sqrt_ratio_at_tick(tick: i32) -> U256 {
     step!(0x20000, 0x5d_6af8_dedb_8119_6699_c329_225e_e604);
     step!(0x40000, 0x2216_e584_f5fa_1ea9_2604_1bed_fe98);
     step!(0x80000, 0x48a_1703_91f7_dc42_444e_8fa2);
-    let ratio = if one { U256::pow2(128) } else { U256::from_u128(r) };
+    let ratio = if one {
+        U256::pow2(128)
+    } else {
+        U256::from_u128(r)
+    };
     let ratio = if t > 0 {
         match U256::MAX.checked_div_rem(ratio) {
             Some((q, _)) => q,
@@ -115,7 +119,11 @@ pub(crate) const fn tick_at_sqrt_ratio(sqrt_price: U256) -> i32 {
     let ratio = sqrt_price.shl(32);
     let msb = ratio.msb();
     // Normalise r into [2^127, 2^128).
-    let r0 = if msb >= 128 { ratio.shr(msb - 127) } else { ratio.shl(127 - msb) };
+    let r0 = if msb >= 128 {
+        ratio.shr(msb - 127)
+    } else {
+        ratio.shl(127 - msb)
+    };
     let mut r: u128 = r0.lo;
     let mut log_2: i128 = ((msb as i128) - 128) << 64;
     let mut bit: u32 = 63;
@@ -178,7 +186,10 @@ mod tests {
         assert_eq!(sqrt_ratio_at_tick(MAX_TICK), MAX_SQRT);
         assert_eq!(sqrt_ratio_at_tick(0), U256::pow2(96));
         assert_eq!(tick_at_sqrt_ratio(MIN_SQRT), MIN_TICK);
-        assert_eq!(tick_at_sqrt_ratio(MAX_SQRT.wrapping_sub(U256::ONE)), MAX_TICK - 1);
+        assert_eq!(
+            tick_at_sqrt_ratio(MAX_SQRT.wrapping_sub(U256::ONE)),
+            MAX_TICK - 1
+        );
         assert_eq!(tick_at_sqrt_ratio(U256::pow2(96)), 0);
     }
 
@@ -186,7 +197,10 @@ mod tests {
     /// true value 4295343489.19… rounded UP, as the contract promises.
     #[test]
     fn published_vector_min_plus_one() {
-        assert_eq!(sqrt_ratio_at_tick(MIN_TICK + 1), U256::from_u128(4_295_343_490));
+        assert_eq!(
+            sqrt_ratio_at_tick(MIN_TICK + 1),
+            U256::from_u128(4_295_343_490)
+        );
     }
 
     proptest! {

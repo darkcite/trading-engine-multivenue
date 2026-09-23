@@ -60,10 +60,11 @@ mechanics.
 | **O-H15** | **Endpoint:** `rpc.purroofgroup.com` is the sole WS (`eth_subscribe` newHeads + logs) AND archive source for v1, on the free tier. Measured 09-23: it is the only candidate answering a WS upgrade (101); `rpc.hyperliquid.xyz/evm`, `rpc.hypurrscan.io` and the testnet endpoint all return 405. **A probe failure or outage disables the hyparb MEMBER only** (unconfigured, loud tell, counter) and never takes down the rest of the set. This is a deliberate exception to the F19 requested-but-absent law, for this member. | 09-23 |
 | **O-H16** | **Ops hands:** the implementing session stops and restarts the launchd engine via `launchctl` for the H3 raw-tap and H8 smokes, announced before and after, verifying `vm_rows_active ≥ 1`. It writes `~/multivenue/universe.toml` / `hyparb.toml` with `.bak` copies. It **never** touches `.env` or `strategy.conf`. | 09-23 |
 | **O-H17** | **Isolation from the parallel MEXC lane.** HYPARB is built in a separate worktree `~/trading-engine-multivenue-hyparb` on branch `hyparb` (cut from `90c9c39`), with its own `target/` — never in the main checkout, never touching its index. **Sequencing:** phases disjoint from MEXC's files run first (HZ, H1 `core-amm`, H7 `signer-evm` + `exec-hyperevm` unwired); H0 and H2–H6 start only after MX2 has landed on `main` and been merged into `hyparb`. Conflicts are resolved on `hyparb`, never on `main`. Before any launchd stop/restart for a smoke, check that MEXC is not mid-smoke; in `~/multivenue/universe.toml` touch only `[hyperliquid]`. | 09-23 |
+| **O-H18** | **Executor contract.** H7/H8 transactions call a minimal executor contract of OUR OWN, not a pool (an EOA cannot satisfy the V3 swap callback) and not a DEX router: owner-only `swap(pool, zeroForOne, amountSpecified, sqrtPriceLimitX96, minOut)`, the pool callbacks (`uniswapV3SwapCallback`, plus `algebraSwapCallback` per O-H19) paying from the contract's own balance and accepting calls only from the pool it invoked, and a revert when the output is below `minOut` — an unprofitable race costs gas, never inventory. Source + compiled bytecode live in the repo with a reproducibility check; deployment is H8, TESTNET ONLY (O-H5 binds the deployer too). Supersedes spec-gap default G1. | 09-23 |
+| **O-H19** | **The 20 pools without a Uniswap `slot0()` are SUPPORTED in H3**, each family behind its own decoder AND its own replay gate like H1's. Measured 09-23: **8 pools** (one factory, `0x32b9…24c2`) answer a **6-word `slot0`** (Slipstream-style: no `feeProtocol`; the price/tick words are Uniswap's); **12 pools** (two factories, `0xf77b…b1f3` ×7, `0x5f95…61a7` ×5) are **Algebra-Integral-style** — `globalState()` (6 words), `plugin()`, `safelyGetStateOfAMM()`, no `slot0`. Algebra walks its tick TREE (no bitmap-word boundaries) and its plugin can set the fee per swap, so `core-amm` gains an Algebra step mode, proven by that family's own bit-exact replay before any of its pools is traded. | 09-23 |
 
-**Spec-gap defaults (09-23, proposed and not objected to):** (G1) the H7/H8
-transaction is a direct V3 pool `swap()` against one of the existing testnet
-pools — Hyperswap's factory is absent there; (G2) `gas.rs` bids a priority fee
+**Spec-gap defaults (09-23, proposed and not objected to):** (G1) SUPERSEDED by
+O-H18 — an EOA cannot call a pool's `swap()`; (G2) `gas.rs` bids a priority fee
 equal to a fixed fraction of the expected net edge, capped by a p99 key in
 `hyparb.toml`; (G3) each pool is registered as a `SymbolId`, so `Order.sym`
 carries the pool and audit/per-sym P&L stay sound — `sym` is never overloaded
@@ -1374,6 +1375,12 @@ data only. Built by the git-excluded fixture tools under
 19. The top pool shows a recurring same-size liquidity change INSIDE
     blocks (a position managed intra-block) — the 0.7 % of rows a
     first-swap-of-block fixture cannot reproduce.
+20. **Slipstream's `fee()` is not always the fee charged**: 203 of 1,580
+    swaps (13 %) needed the solved fee. Same law as finding 15 — the member
+    estimates each pool's effective fee from its swaps.
+21. Kittenswap (Algebra v1.2) emits an extra per-`Burn` event
+    (`0x1a25098b…`, 2 topics, 1 word); it carries no state the member needs
+    and is not subscribed.
 
 ### 16.4 H7a `signer-evm` — LANDED (standalone; `exec-hyperevm` pending)
 
@@ -1395,3 +1402,44 @@ Deviations from §11.2:
   and 101/127-bit integers — digest, `r`, `s`, `y_parity`, raw hex and hash
   all byte-equal.
 * Added to `scripts/copy-audit.sh`'s default crate list (exec lane).
+
+### 16.5 O-H19 `core-amm` families — LANDED
+
+* **Algebra Integral loop** (`AMM_KIND_ALGEBRA = 2`): same step arithmetic
+  as V3 (`movePriceTowardsTarget` ≡ `computeSwapStep`), a different loop —
+  every step targets the next INITIALISED tick of the linked list (no
+  bitmap-word stops, no `MIN/MAX_TICK` clamp), and a step that moves the
+  price without reaching its target ends the swap. Monomorphised
+  (`walk::<LINKED>`), selected by `PoolMeta::kind`; Algebra maps load with
+  spacing 1.
+* **Replay gates, one per family, all against real HyperEVM swaps from
+  three disjoint ≤ 2 h windows:**
+
+  | family | rows | pools | bit-exact | note |
+  |---|---|---|---|---|
+  | Uniswap V3 ABI | 6,000 | 35 | 99.38 % | unchanged from H1 |
+  | Slipstream (Hybra CL) | 1,580 | 8 | **100.00 %** | 203 rows needed the solved fee |
+  | Algebra v1.0 + v1.2 (NEST, Kittenswap) | 5,538 | 12 | **100.00 %** | fee in force from `Fee` / `SwapFee`, never solved |
+
+  The same Algebra rows walked with the V3 loop are 99.11 % exact — the 49
+  misses are exactly the step-decomposition difference the Algebra loop
+  removes.
+* **Tick-map maintenance** — `TickMap::apply_position` (Mint/Burn:
+  gross ± amount at both ends, net ± at lower/upper, de-initialise at
+  gross 0, sorted insert) and `PoolState::apply_position` (in-range
+  liquidity, the contract's `lower ≤ tick < upper`). All-or-nothing; an
+  error means the map disagrees with the chain and must be resynced.
+  `TickNode` now carries `liquidityGross` (u96, in what was padding — the
+  node stays 32 B; above 2⁹⁶ is refused, never truncated).
+* **`core_amm::payload`** — the 40-byte pool-event payload, one codec for
+  both ends of the ring. Byte 0 = kind (low nibble) | sub (high nibble);
+  the pool is the `Signal`'s `sym` (G3). Kinds: `STATE` (tick i24,
+  sqrtPriceX96 **u160**, liquidity **u128** — full width, so §7.5's
+  `liquidity_truncated` refusal is gone), `SWAP` (block u56, amounts
+  i128), `FEE` (Algebra v1.0 / v1.2), `LIQUIDITY` (Mint/Burn), `HEAD`
+  (block, timestamp, baseFeePerGas), `GAP`, `SNAPSHOT`, `TICK`. The
+  decoder is canonical (anything it accepts re-encodes to the same bytes).
+* Gates: property tests run every walk property in BOTH loops and pin the
+  loops to each other (same end state, amounts within one wei per step);
+  alloc gate **65** (Algebra walk + map mutation + payload codec, 0 B/op);
+  fuzz `amm_tick_walk` (now both loops) and new `amm_map_payload`.
