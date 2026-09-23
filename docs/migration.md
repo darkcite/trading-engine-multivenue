@@ -6,6 +6,57 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — `/state` `hyparb` object, `engine_hyparb_*`, `engine_paper_matcher_amm_*`, `backtest --member hyparb`, `pnl_report --hyparb-ladder` (HYPARB H6)
+
+**What changed**
+
+- **`/state` gains a `"hyparb"` object.** ADDITIVE — `"v": 1` stays:
+  `configured`, `n_pools`, `n_coins`, `halted`, the member's counters
+  (flat: `pool_events` … `arbs_buy` / `arbs_sell` … `gas_charged_usd_1e6`,
+  `pnl_predicted_usd_1e6`, `amm_notional_usd_1e6`,
+  `funding_earned_usd_1e6`), `pools` (the first 64: `sym`, `live`,
+  `map_ok`, `hedge_venue`, `fee_pips`, `mid_1e6`, `basis_bps_1e6`,
+  `arbs`, `pnl_predicted_usd_1e6`) and `coins` (≤ 8: `perp_sym`,
+  `spot_sym`, both depths, both quoted costs, `inventory_1e6`,
+  `perp_pos_1e6`, `funding_1e9`). `EngineSnapshot` grows by ≈ 3.8 KiB
+  (still under its 32 KiB pin).
+- **Metrics, registered unconditionally:** `engine_hyparb_*` — 27
+  counters (the member's counters as deltas, incl. `side_buy` /
+  `side_sell` and the three money sums) and 35 gauges
+  (`engine_hyparb_funding_earned_usd_1e6`, `_halted`, `_pools_live`,
+  `engine_hyparb_c<0..3>_{perp,spot}_depth_usd_1e6`,
+  `_{perp,spot}_cost_bps_1e6`, `_inventory_1e6`,
+  `engine_hyparb_p<0..3>_{basis_bps_1e6,pnl_predicted_usd_1e6,live}`);
+  `engine_paper_matcher_amm_{fills,canceled,partial,not_live}_total`.
+- **`backtest --member hyparb --hyparb <toml> [--hyparb-universe <toml>]`**:
+  the harness loads `hyperevm-signals.pmlr` (a lane ONLY this member
+  reads — every other replay merges byte for byte as before), drives the
+  paper matcher's AMM judge and the member in the engine's order, and
+  subtracts the member's OOS gas from the OOS net.
+- **`python -m claude_worker.pnl_report --closed-day --hyparb-ladder
+  [path]`**: each unit is also replayed through the member's correction
+  ladder (r0 naive → r1 depth cap → r2 latency → r3 the artifact); the
+  day report gains an additive `hyparb` key (slot 0's paper rows + the
+  ladder) and summary lines. Off by default.
+- The AMM order's limit is its quote's LAST-unit price
+  (`core_amm::limit_px_1e6`, replacing `avg_px_1e6`): the judge and the
+  chain both bound the marginal price, so an average-price limit filled
+  about half the quote.
+
+**Impact**
+
+- `/state` and `/metrics`: additive keys and series only.
+- Worker: no frozen surface touched (the ladder is a module flag; the
+  `pnl` verb reads the same files).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the H6 commit.
+
 ## 2026-09-23 — `hyparb.toml`, `--hyparb`, `--evm-testnet`, wrapper `HYPARB_TOML` / `EVM_TESTNET` / `HYPEREVM_PATH` (HYPARB H5)
 
 **What changed**

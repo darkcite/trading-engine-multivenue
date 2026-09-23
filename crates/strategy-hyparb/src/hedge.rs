@@ -104,6 +104,24 @@ impl CoinTouch {
         self.is_sound() && now.saturating_sub(self.ts_ns) <= TOUCH_MAX_AGE_NS
     }
 
+    /// The thinner side of the touch, USD × 1e6 (0 unless sound) — the
+    /// depth the depth cap and the metrics read.
+    #[inline]
+    #[must_use]
+    pub const fn depth_usd_1e6(&self) -> i64 {
+        if !self.is_sound() {
+            return 0;
+        }
+        let b = (self.bid_qty_1e6 as i128) * (self.bid_px_1e6 as i128) / 1_000_000;
+        let a = (self.ask_qty_1e6 as i128) * (self.ask_px_1e6 as i128) / 1_000_000;
+        let m = if b < a { b } else { a };
+        if m > i64::MAX as i128 {
+            i64::MAX
+        } else {
+            m as i64
+        }
+    }
+
     /// Mid, USD × 1e6 — `None` unless [`Self::is_sound`].
     #[inline]
     #[must_use]
@@ -345,6 +363,13 @@ impl HyparbStrategy {
             venue: HedgeVenue::Spot,
             cost_bps_1e6: cost,
         });
+        // The metrics read the last cost each venue was quoted at.
+        if let Some((_, cost)) = perp {
+            self.coins[c].last_cost_bps_1e6[0] = cost;
+        }
+        if let Some((_, cost)) = spot {
+            self.coins[c].last_cost_bps_1e6[1] = cost;
+        }
         let side = usize::from(!sell);
         let pick = choose_venue(
             self.params.hedge_mode,
@@ -361,5 +386,35 @@ impl HyparbStrategy {
         };
         leg.venue = pick.venue;
         Some(leg)
+    }
+}
+
+impl HyparbStrategy {
+    /// Accrue the funding the perp hedges earned since the last pass:
+    /// `−position × mid × rate × dt / 1 h` per coin (longs pay a positive
+    /// rate). A gap longer than an hour accrues one hour — the replay
+    /// and a stalled loop must not book a day of funding at one rate.
+    pub(crate) fn accrue_funding(&mut self, now: NsTs) {
+        let last = self.last_funding_ns;
+        self.last_funding_ns = now;
+        if last == 0 || now <= last {
+            return;
+        }
+        let dt = (now - last).min(HOUR_NS as u64) as i128;
+        let mut earned = 0i128;
+        let mut c = 0usize;
+        while c < self.params.n_coins {
+            let r = &self.coins[c];
+            if r.perp_pos_1e6 != 0 && r.funding_1e9 != 0 {
+                if let Some(mid) = r.perp.mid_1e6() {
+                    let notional = (r.perp_pos_1e6 as i128) * (mid as i128) / 1_000_000;
+                    earned -= notional * (r.funding_1e9 as i128) * dt / (1_000_000_000 * HOUR_NS);
+                }
+            }
+            c += 1;
+        }
+        let e = earned.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        self.counters.funding_earned_usd_1e6 =
+            self.counters.funding_earned_usd_1e6.saturating_add(e);
     }
 }

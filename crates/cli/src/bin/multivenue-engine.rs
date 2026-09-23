@@ -465,6 +465,16 @@ struct BacktestArgs {
     /// `~/multivenue` to fold the live cut in deliberately.
     #[arg(long, requires = "member")]
     bin15_seed_dir: Option<PathBuf>,
+    /// `--member hyparb`: the parameter artifact (`hyparb.toml`; default
+    /// `~/multivenue/hyparb.toml`).
+    #[arg(long, requires = "member")]
+    hyparb: Option<PathBuf>,
+    /// `--member hyparb`: the `universe.toml` whose `[hyperevm] pools`
+    /// names the pools (default `~/multivenue/universe.toml` — the list
+    /// is append-only, so the live file names every pool an older
+    /// capture carries).
+    #[arg(long, requires = "member")]
+    hyparb_universe: Option<PathBuf>,
     /// Capture source: a single `run-<epoch_ns>` directory or a log
     /// root (`MULTIVENUE_LOG_DIR`) containing `run-*` children.
     #[arg(long)]
@@ -1794,7 +1804,9 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         None => None,
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
-                eprintln!("backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15)");
+                eprintln!(
+                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb)"
+                );
                 return ExitCode::from(1);
             };
             let params = match kind {
@@ -1838,6 +1850,16 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         }
                     },
                 },
+                cli::backtest::member::MemberKind::Hyparb => match args.hyparb.clone() {
+                    Some(p) => p,
+                    None => match core_config::hyparb::default_hyparb_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member hyparb needs --hyparb <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
             };
             Some(cli::backtest::member::MemberSpec {
                 kind,
@@ -1846,6 +1868,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                 seed: args.xsd_seed.clone(),
                 vrp_seed: args.vrp_seed.clone(),
                 bin15_seed_dir: args.bin15_seed_dir.clone(),
+                hyparb_universe: args.hyparb_universe.clone(),
             })
         }
     };

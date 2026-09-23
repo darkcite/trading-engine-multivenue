@@ -23,8 +23,9 @@
 //!    bounds with the hedge taker fees folded in, the pool's own basis
 //!    de-meaned, the size capped by the hedge's live top-of-book, the gas
 //!    of the attempt charged — submitted as one AMM swap
-//!    (`ORDER_KIND_AMM_SWAP`) at the quote's own average price. Our own
-//!    impact is carried into the book until the chain overwrites it.
+//!    (`ORDER_KIND_AMM_SWAP`) limited at the quote's last-unit price (the
+//!    marginal bound the judge and the chain enforce). Our own impact is
+//!    carried into the book until the chain overwrites it.
 //! 4. **The hedge** is sent when the AMM leg FILLS — an IoC per non-USD
 //!    coin, on the venue the selector chose, at the price the decision
 //!    assumed. It lives `lag_ns`: a book that moved inside the latency is
@@ -57,8 +58,8 @@ use core_types::{
     Tick, VenueId, SYMBOL_ID_NONE,
 };
 use strategy_core::{
-    CooldownGate, Ctx, HyparbCounters, HyparbPoolView, Strategy, StrategyCounters, StrategyError,
-    SubmitErr,
+    CooldownGate, Ctx, HyparbCoinView, HyparbCounters, HyparbPoolView, Strategy, StrategyCounters,
+    StrategyError, SubmitErr,
 };
 
 pub use hedge::{choose_venue, CoinTouch, HedgeMode, HedgeVenue, VenueCost};
@@ -294,6 +295,8 @@ struct PoolRun {
     hedge_venue: [HedgeVenue; 2],
     /// Arbs submitted.
     arbs: u64,
+    /// The solver's predicted net P&L over this pool's arbs, USD × 1e6.
+    pnl_predicted_usd_1e6: i64,
 }
 
 const POOL_RUN_NONE: PoolRun = PoolRun {
@@ -307,6 +310,7 @@ const POOL_RUN_NONE: PoolRun = PoolRun {
     hedge_px_1e6: [0; 2],
     hedge_venue: [HedgeVenue::None; 2],
     arbs: 0,
+    pnl_predicted_usd_1e6: 0,
 };
 
 /// Per-coin member state.
@@ -324,6 +328,10 @@ struct CoinRun {
     pending_until: u64,
     /// The selector's last choice per side (0 = we sell, 1 = we buy).
     last_venue: [HedgeVenue; 2],
+    /// The selector's last total cost per venue (perp, spot), bps × 1e6.
+    last_cost_bps_1e6: [i64; 2],
+    /// Net perp position the hedge fills built, coin × 1e6, signed.
+    perp_pos_1e6: i64,
 }
 
 const COIN_RUN_NONE: CoinRun = CoinRun {
@@ -334,6 +342,8 @@ const COIN_RUN_NONE: CoinRun = CoinRun {
     pending_1e6: 0,
     pending_until: 0,
     last_venue: [HedgeVenue::None; 2],
+    last_cost_bps_1e6: [0; 2],
+    perp_pos_1e6: 0,
 };
 
 /// The snapshot being staged (one pool at a time — the ingress emits each
@@ -369,6 +379,8 @@ pub struct HyparbStrategy {
     oid_seq: u64,
     counters: HyparbCounters,
     orders_emitted: u64,
+    /// When funding was last accrued (0 = never).
+    last_funding_ns: u64,
 }
 
 impl Default for HyparbStrategy {
@@ -446,8 +458,13 @@ impl HyparbStrategy {
                 gas_charged_usd_1e6: 0,
                 pnl_predicted_usd_1e6: 0,
                 amm_notional_usd_1e6: 0,
+                arbs_buy: 0,
+                arbs_sell: 0,
+                funding_earned_usd_1e6: 0,
+                halted: 0,
             },
             orders_emitted: 0,
+            last_funding_ns: 0,
         }
     }
 
@@ -750,10 +767,14 @@ impl HyparbStrategy {
         }
         let buy = q.side == ArbSide::BuyToken0;
         let (h0, h1) = if buy { (s0, b1) } else { (b0, s1) };
-        self.submit_arb(p, &q, buy, [h0, h1], meta.dec0, meta.dec1, now, ctx);
+        self.submit_arb(p, &q, buy, [h0, h1], &meta, now, ctx);
     }
 
-    /// The AMM leg of a decision.
+    /// The AMM leg of a decision: the quote's token0 quantity, limited at
+    /// its LAST unit's price (`core_amm::limit_px_1e6` at the quote's
+    /// `after`, the fee folded) — the marginal bound the judge and the
+    /// chain's `sqrtPriceLimitX96` both enforce, so the quote completes
+    /// on an unchanged pool and a pool that moved against it fills less.
     #[allow(clippy::too_many_arguments)]
     fn submit_arb<C: Ctx>(
         &mut self,
@@ -761,14 +782,13 @@ impl HyparbStrategy {
         q: &ArbQuote,
         buy: bool,
         hedges: [HedgeLeg; 2],
-        dec0: u8,
-        dec1: u8,
+        meta: &core_amm::PoolMeta,
         now: NsTs,
         ctx: &mut C,
     ) {
         let (Some(qty_1e6), Some(px_1e6)) = (
-            core_amm::qty_1e6_from_raw(q.token0_raw, dec0),
-            core_amm::avg_px_1e6(q.token0_raw, q.token1_raw, dec0, dec1, buy),
+            core_amm::qty_1e6_from_raw(q.token0_raw, meta.dec0),
+            core_amm::limit_px_1e6(&q.after, meta, buy),
         ) else {
             self.counters.skipped_below_min = self.counters.skipped_below_min.wrapping_add(1);
             return;
@@ -800,8 +820,14 @@ impl HyparbStrategy {
         run.hedge_px_1e6 = [hedges[0].px_1e6, hedges[1].px_1e6];
         run.hedge_venue = [hedges[0].venue, hedges[1].venue];
         run.arbs = run.arbs.wrapping_add(1);
+        run.pnl_predicted_usd_1e6 = run.pnl_predicted_usd_1e6.saturating_add(q.pnl_usd_1e6);
         let c = &mut self.counters;
         c.arbs_submitted = c.arbs_submitted.wrapping_add(1);
+        if buy {
+            c.arbs_buy = c.arbs_buy.wrapping_add(1);
+        } else {
+            c.arbs_sell = c.arbs_sell.wrapping_add(1);
+        }
         c.gas_charged_usd_1e6 = c
             .gas_charged_usd_1e6
             .saturating_add(self.params.gas_p50_usd_1e6);
@@ -929,12 +955,16 @@ impl HyparbStrategy {
         }
     }
 
-    /// A hedge-book fill: the inventory it closes.
-    fn on_hedge_fill(&mut self, c: usize, fill: &Fill) {
+    /// A hedge-book fill: the inventory it closes (and, on the perp, the
+    /// position that earns or pays funding).
+    fn on_hedge_fill(&mut self, c: usize, spot: bool, fill: &Fill) {
         let q = fill.qty.raw();
         let signed = if fill.side == Side::Bid { q } else { -q };
         let run = &mut self.coins[c];
         run.inventory_1e6 = run.inventory_1e6.saturating_add(signed);
+        if !spot {
+            run.perp_pos_1e6 = run.perp_pos_1e6.saturating_add(signed);
+        }
         // The pending hedge shrinks toward zero by what filled.
         if (run.pending_1e6 > 0 && signed > 0) || (run.pending_1e6 < 0 && signed < 0) {
             let left = run.pending_1e6 - signed;
@@ -968,11 +998,14 @@ impl HyparbStrategy {
         } else if self.halted && total <= cap / 2 {
             self.halted = false;
         }
+        self.counters.halted = u64::from(self.halted);
     }
 
-    /// The 1 s pass: day roll, in-flight and hedge deadlines, flattening.
+    /// The 1 s pass: day roll, funding, in-flight and hedge deadlines,
+    /// flattening.
     fn timer_pass<C: Ctx>(&mut self, now: NsTs, ctx: &mut C) {
         self.roll_day(now);
+        self.accrue_funding(now);
         let mut p = 0usize;
         while p < self.params.n_pools {
             if self.pools[p].inflight_until != 0 && self.pools[p].inflight_until <= now {
@@ -1043,11 +1076,38 @@ impl StrategyCounters for HyparbStrategy {
                 self.book.mid_1e6(b).unwrap_or(0),
                 run.basis_bps_1e6,
                 run.arbs,
+                run.pnl_predicted_usd_1e6,
             );
             p += 1;
         }
         if self.configured {
             self.params.n_pools as u32
+        } else {
+            0
+        }
+    }
+
+    fn hyparb_coins_view(&self, out: &mut [HyparbCoinView]) -> u32 {
+        let n = self.params.n_coins.min(out.len());
+        let mut c = 0usize;
+        while c < n {
+            let k = self.params.coins[c];
+            let r = &self.coins[c];
+            out[c] = HyparbCoinView {
+                perp_sym: k.perp_sym,
+                spot_sym: k.spot_sym,
+                perp_depth_usd_1e6: r.perp.depth_usd_1e6(),
+                spot_depth_usd_1e6: r.spot.depth_usd_1e6(),
+                perp_cost_bps_1e6: r.last_cost_bps_1e6[0],
+                spot_cost_bps_1e6: r.last_cost_bps_1e6[1],
+                inventory_1e6: r.inventory_1e6,
+                perp_pos_1e6: r.perp_pos_1e6,
+                funding_1e9: r.funding_1e9,
+            };
+            c += 1;
+        }
+        if self.configured {
+            self.params.n_coins as u32
         } else {
             0
         }
@@ -1114,8 +1174,8 @@ impl Strategy for HyparbStrategy {
         let now = ctx.now_ns();
         if let Some(p) = self.pool_of(fill.sym) {
             self.on_amm_fill(p, fill, now, ctx);
-        } else if let Some((c, _)) = self.coin_of(fill.sym) {
-            self.on_hedge_fill(c, fill);
+        } else if let Some((c, spot)) = self.coin_of(fill.sym) {
+            self.on_hedge_fill(c, spot, fill);
         }
     }
 

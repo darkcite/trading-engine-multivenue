@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, InstrumentClass,
-    OptSummary, Order, Price, Qty, RegimeTerm, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
+    OptSummary, Order, Price, Qty, RegimeTerm, RuleTableV2, Signal, Tick, VenueId, AI_SIDE_NONE,
     INSTRUMENT_CLASSES, REGIME_OFF_SOFT, STRATEGY_SLOT_VM, SYMBOL_ID_NONE, VENUE_COUNT,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
@@ -791,7 +791,20 @@ pub enum RecPayload {
     Opt(OptSummary),
     /// RG3: a captured `SetRegime` frame (`ai-cmds.pmlr`, kind 12 only).
     Regime(AiCmd),
+    /// HYPARB H6: a HyperEVM pool-event signal (`hyperevm-signals.pmlr`)
+    /// — merged ONLY for `--member hyparb` (see [`POOL_SIGNAL_LORD`]).
+    Signal(Signal),
 }
+
+/// HYPARB H6: lane ordinal of the pool-event signals — after every
+/// market lane and the regime lane at equal ts, as the engine drains its
+/// pool lane after its market pumps. Loaded ONLY when the caller asks
+/// (`--member hyparb`): every other replay merges byte for byte as it
+/// always did, which is what keeps `merged_records`, the IS/OOS
+/// boundary and every pooled VM number where they were.
+const POOL_SIGNAL_LORD: u8 = 56;
+/// The capture label whose signal file carries the pool events.
+const POOL_SIGNAL_LABEL: &str = "hyperevm";
 
 #[derive(Copy, Clone, Debug)]
 struct MergeKeyed {
@@ -869,6 +882,8 @@ struct RunSummary {
     /// frames clamped) and frames dropped as already expired.
     regime_cmds: u64,
     regime_cmds_dropped: u64,
+    /// HYPARB H6: pool-event signals loaded (0 unless requested).
+    pool_signals: u64,
 }
 
 /// Open every present per-venue capture file of `run` (ticks +
@@ -895,6 +910,7 @@ fn load_run(
     opt_out: &mut opt::OptLoadOut,
     stale_after_ms: [u32; VENUE_COUNT],
     binary_underlyings: &BTreeSet<u32>,
+    pool_signals: bool,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
@@ -1014,6 +1030,38 @@ fn load_run(
             idx: i as u64,
             payload: RecPayload::Regime(c),
         });
+    }
+    // HYPARB H6: the pool-event tape, when asked. Pool symbols are the
+    // universe's `[hyperevm]` ordinals — append-only, so identity across
+    // runs (they carry no manifest row to remap through).
+    let mut pool_signal_count = 0u64;
+    if pool_signals {
+        let path = run.path.join(format!("{POOL_SIGNAL_LABEL}-signals.pmlr"));
+        if path.is_file() {
+            let reader = PmlrReader::<Signal>::open(&path).map_err(|e: io::Error| {
+                HarnessError::Capture(format!("{}: {e}", path.display()))
+            })?;
+            if reader.slot_kind() != SlotKind::Signal {
+                return Err(HarnessError::Capture(format!(
+                    "{}: slot_kind {:?} is not Signal",
+                    path.display(),
+                    reader.slot_kind()
+                )));
+            }
+            for (i, sig) in reader.records().iter().enumerate() {
+                if sig.source != core_types::SignalSource::HyperEvm as u8 {
+                    continue;
+                }
+                recs.push(MergeKeyed {
+                    ts_ns: sig.ts_ns,
+                    venue: VenueId::HyperEvm as u8,
+                    lord: POOL_SIGNAL_LORD,
+                    idx: i as u64,
+                    payload: RecPayload::Signal(*sig),
+                });
+                pool_signal_count += 1;
+            }
+        }
     }
     // VM2 V5: non-tick channels — absent files are normal (older
     // captures, unspawned lanes); headers cross-check like ticks.
@@ -1301,6 +1349,7 @@ fn load_run(
             stale: judge.stats,
             regime_cmds,
             regime_cmds_dropped,
+            pool_signals: pool_signal_count,
         },
     ))
 }
@@ -1317,6 +1366,7 @@ fn load_and_merge(
     opt_out: &mut opt::OptLoadOut,
     sym_class: &mut BTreeMap<u32, InstrumentClass>,
     binary_underlying: &mut BTreeMap<u32, u32>,
+    pool_signals: bool,
 ) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
     // manifest join — each run's `<sym>\t<descriptor>` rows joined
@@ -1383,6 +1433,7 @@ fn load_and_merge(
             opt_out,
             stale_after_ms,
             &binary_underlyings,
+            pool_signals,
         )?;
         summary.opt_registry_refused = registry_refused;
         summaries.push(summary);
@@ -1409,6 +1460,7 @@ fn load_and_merge(
                 RecPayload::Depth(d) => d.ts_ns = virt_ns,
                 RecPayload::Opt(o) => o.ts_ns = virt_ns,
                 RecPayload::Regime(c) => c.ts_ns = virt_ns,
+                RecPayload::Signal(g) => g.ts_ns = virt_ns,
             }
             merged.push(MergedRec {
                 payload,
@@ -1992,6 +2044,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &mut opt_out,
         &mut sym_class,
         &mut binary_underlying,
+        false,
     )?;
     let universe = derive_universe(&merged);
 
@@ -2298,6 +2351,9 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
                 }
                 fills_scratch.clear();
             }
+            // The VM path never loads the pool lane (`load_and_merge`'s
+            // `pool_signals` is false here).
+            RecPayload::Signal(_) => fills_scratch.clear(),
         }
         while consumed < ctx.orders().len() {
             let order = ctx.orders()[consumed];

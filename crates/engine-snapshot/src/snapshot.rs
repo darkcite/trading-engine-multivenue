@@ -13,8 +13,8 @@
 
 use core_types::{Fill, Order};
 use strategy_core::{
-    IcdpCounters, RegimeCounters, RegimeRelView, SlotCounters, VmRowView, VrpCounters,
-    VrpSnapshotView,
+    HyparbCoinView, HyparbCounters, HyparbPoolView, IcdpCounters, RegimeCounters, RegimeRelView,
+    SlotCounters, VmRowView, VrpCounters, VrpSnapshotView,
 };
 
 /// JSON schema version of `/state` (`"v"`). Bump on any field removal
@@ -296,6 +296,43 @@ pub struct VrpSnapshot {
     /// The artifact, the campaign, the legs in flight and the gauges —
     /// all read at ONE instant.
     pub view: VrpSnapshotView,
+}
+
+/// Pool rows `/state` carries (the first N configured; `n_pools` says how
+/// many exist — the metrics and the capture carry every pool).
+pub const SNAPSHOT_HYPARB_POOLS: usize = 64;
+/// Coin rows `/state` carries (the member's own bound).
+pub const SNAPSHOT_HYPARB_COINS: usize = 8;
+
+/// HYPARB H6: the slot-0 member — its counters, pools and coins, read
+/// at ONE instant (a pool's basis and the side balance it produced can
+/// never disagree).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct HyparbSnapshot {
+    /// The member's counters (and the two levels they carry).
+    pub counters: HyparbCounters,
+    /// Pools configured (0 = unconfigured); rows beyond
+    /// [`SNAPSHOT_HYPARB_POOLS`] are not carried here.
+    pub n_pools: u32,
+    /// Coins configured.
+    pub n_coins: u32,
+    /// Pool rows, `[..min(n_pools, SNAPSHOT_HYPARB_POOLS)]` live.
+    pub pools: [HyparbPoolView; SNAPSHOT_HYPARB_POOLS],
+    /// Coin rows, `[..n_coins]` live.
+    pub coins: [HyparbCoinView; SNAPSHOT_HYPARB_COINS],
+}
+
+impl Default for HyparbSnapshot {
+    fn default() -> Self {
+        Self {
+            counters: HyparbCounters::default(),
+            n_pools: 0,
+            n_coins: 0,
+            pools: [HyparbPoolView::default(); SNAPSHOT_HYPARB_POOLS],
+            coins: [HyparbCoinView::default(); SNAPSHOT_HYPARB_COINS],
+        }
+    }
 }
 
 /// The AI command plane (`AiIngressStatus` cumulative counters + the
@@ -588,6 +625,8 @@ pub struct EngineSnapshot {
     pub icdp: IcdpSnapshot,
     /// The VRP member.
     pub vrp: VrpSnapshot,
+    /// HYPARB H6: the slot-0 member.
+    pub hyparb: HyparbSnapshot,
     /// **E6: the execution router's kill switches.**
     pub exec: ExecSnapshot,
     /// The AI plane.
@@ -626,6 +665,7 @@ impl EngineSnapshot {
             vm: VmSnapshot::empty(),
             icdp: IcdpSnapshot::default(),
             vrp: VrpSnapshot::default(),
+            hyparb: HyparbSnapshot::default(),
             exec: ExecSnapshot::default(),
             ai: AiSnapshot::default(),
             ingress: [IngressSnapshot::default(); SNAPSHOT_VENUES],

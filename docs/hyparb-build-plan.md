@@ -1762,3 +1762,42 @@ As §6 says, with these decisions recorded:
   alone, a non-`1` flag, a missing file, `EVM_TESTNET` without `hyparb`,
   and the live `ai+vrp+xsd+bin15` + `EXEC_TOML`/`ARM_LIVE` line
   (byte-identical to pre-H5).
+
+### 16.13 H6 — metrics and verdict instrumentation — LANDED
+
+* **The six disputed quantities as series** (plan §10): the member now
+  counts the side balance (`arbs_buy` / `arbs_sell` — #2), the solver's
+  prediction per pool (#4), each venue's hedge count and last quoted
+  cost per coin, the funding the perp hedges earned (accrued on the 1 s
+  timer from the net perp position and the `activeAssetCtx` rate, ≤ 1 h
+  per pass — #6), and the touch depth per venue beside `size_capped`
+  (#1). Surfaces: `StrategyCounters::hyparb_{counters,pools_view,
+  coins_view}` → `/state` `hyparb` (64 pool rows, 8 coins) and the
+  `engine_hyparb_*` family (27 counters, 35 gauges; the first 4 coins and
+  4 pools get per-row gauges — the registry is shared and fixed; the
+  family-size pin test guards it). The paper matcher's AMM verdicts
+  (H2) are mirrored as `engine_paper_matcher_amm_*_total`. #3 (HL maker
+  vs taker) is NOT built: the member hedges taker-only; a maker mode is a
+  member feature for after go-live.
+* **The AMM limit is the last unit's price.** H4 limited the swap at the
+  quote's AVERAGE price; the judge (like the chain's
+  `sqrtPriceLimitX96`) bounds the MARGINAL price, so the swap filled
+  about half its quote — and a small quote not at all (caught by the
+  harness test below). `core_amm::limit_px_1e6(after, meta, buy)` (the
+  quote's end price, fee folded, rounded to let it complete) replaces
+  `avg_px_1e6`; pinned by a test that the whole quote fills at its limit
+  and stops short at its average.
+* **Harness:** `backtest --member hyparb` — `RecPayload::Signal` on lane
+  56, loaded only for this member (the VM and every other member merge
+  byte for byte as before); `drive_with` feeds the FillEngine's AMM judge
+  then `on_signal`, as the engine does; pools resolve against a
+  `universe.toml` (`--hyparb-universe`), coins against the capture's
+  manifest; the OOS net is AFTER the member's OOS gas (the ledger — the
+  fill model has no gas lane). The OOS net marks each leg at its own
+  venue's mid, so a captured basis is profit only on convergence; the
+  model's claim is `pnl_predicted_usd` on the counters line.
+* **Nightly:** `claude_worker.hyparb_ladder` + `pnl_report
+  --hyparb-ladder` — rungs are rewrites of the operator's artifact (one
+  grammar), r0 naive → r1 depth cap → r2 latency → r3 the artifact; a
+  rung that fails in a unit is marked, never summed as a smaller number.
+  "Renders against a day of paper" waits for the lane to run live (O-H8).

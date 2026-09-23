@@ -395,6 +395,14 @@ pub trait StrategyCounters {
         0
     }
 
+    /// HYPARB H6: copy the per-coin view into `out` (`min(out.len())`
+    /// rows), returning how many coins are CONFIGURED. Cold path.
+    #[inline]
+    fn hyparb_coins_view(&self, out: &mut [HyparbCoinView]) -> u32 {
+        let _ = out;
+        0
+    }
+
     /// RG2: the regime detector's observables (`engine_regime_*`),
     /// mirrored by the cli's generic 5 s block. The default (no
     /// detector) reports UNKNOWN words, open gates and zero counters —
@@ -1032,6 +1040,18 @@ pub struct HyparbCounters {
     pub pnl_predicted_usd_1e6: i64,
     /// Sum of AMM-leg fill notional, USD × 1e6.
     pub amm_notional_usd_1e6: i64,
+    /// HYPARB H6: arbs that BOUGHT token0 from the pool. With
+    /// [`Self::arbs_sell`] the side balance — a persistent skew in live
+    /// paper means basis control is off or wrong (plan §10 #2).
+    pub arbs_buy: u64,
+    /// HYPARB H6: arbs that SOLD token0 into the pool.
+    pub arbs_sell: u64,
+    /// HYPARB H6 LEVEL (not cumulative-monotonic): funding the perp
+    /// hedges have earned so far, USD × 1e6, signed (a short earns a
+    /// positive rate) — plan §10 #6.
+    pub funding_earned_usd_1e6: i64,
+    /// HYPARB H6 LEVEL: 1 while the inventory cap halts new arbs.
+    pub halted: u64,
 }
 
 /// HYPARB H4: one pool's row (`/state`, the dashboard).
@@ -1056,6 +1076,9 @@ pub struct HyparbPoolView {
     pub basis_bps_1e6: i64,
     /// Arbs submitted on this pool.
     pub arbs: u64,
+    /// HYPARB H6: the solver's predicted net P&L summed over this pool's
+    /// arbs, USD × 1e6 — where the edge concentrates (plan §10 #4).
+    pub pnl_predicted_usd_1e6: i64,
 }
 
 impl HyparbPoolView {
@@ -1071,6 +1094,7 @@ impl HyparbPoolView {
         mid_1e6: i64,
         basis_bps_1e6: i64,
         arbs: u64,
+        pnl_predicted_usd_1e6: i64,
     ) -> Self {
         Self {
             sym,
@@ -1083,8 +1107,34 @@ impl HyparbPoolView {
             mid_1e6,
             basis_bps_1e6,
             arbs,
+            pnl_predicted_usd_1e6,
         }
     }
+}
+
+/// HYPARB H6: one hedge coin's row — the books the selector reads and
+/// what the member holds (plan §10 #1 and #6).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HyparbCoinView {
+    /// The perp's symbol (0 = none).
+    pub perp_sym: u32,
+    /// The spot pair's symbol (0 = none).
+    pub spot_sym: u32,
+    /// The perp's displayed touch, the thinner side, USD × 1e6.
+    pub perp_depth_usd_1e6: i64,
+    /// The spot pair's displayed touch, the thinner side, USD × 1e6.
+    pub spot_depth_usd_1e6: i64,
+    /// The selector's last total cost on the perp, bps × 1e6 (signed).
+    pub perp_cost_bps_1e6: i64,
+    /// The selector's last total cost on spot, bps × 1e6.
+    pub spot_cost_bps_1e6: i64,
+    /// Unhedged inventory, coin × 1e6, signed.
+    pub inventory_1e6: i64,
+    /// Net perp position the hedges built, coin × 1e6, signed.
+    pub perp_pos_1e6: i64,
+    /// The perp's hourly funding rate × 1e9.
+    pub funding_1e9: i64,
 }
 
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s

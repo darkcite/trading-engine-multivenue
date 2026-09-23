@@ -250,31 +250,39 @@ pub fn qty_1e6_from_raw(raw: u128, dec: u8) -> Option<i64> {
     }
 }
 
-/// The average price of a swap, token1 per token0 (human) × 1e6:
-/// `token1_raw · 10^(dec0 − dec1 + 6) / token0_raw`, rounded as asked
-/// (a buy's limit rounds UP, a sell's DOWN — the side that accepts the
-/// quote). `None` for a zero leg or a price beyond `i64`.
+/// The limit price of a swap that ends at `after`: the price its LAST
+/// unit paid (a buy) or earned (a sell), token1 per token0 (human) ×
+/// 1e6, with `meta.fee_pips` folded in — `P / (1 − f)` rounded UP for a
+/// buy, `P · (1 − f)` rounded DOWN for a sell.
+///
+/// This is the limit an AMM order carries (HYPARB H6): the judge
+/// ([`fill_in_range`]) and the chain (`sqrtPriceLimitX96`) both bound the
+/// MARGINAL price, so an order limited at its quote's average would stop
+/// about half-way (the average of a walk lies inside it). Rounded
+/// toward the side that lets the quoted quantity complete on an
+/// unchanged pool; the quantity itself is the order's cap. `None` for an
+/// unpriced state, a fee of 100 % or a price beyond `i64`.
 #[must_use]
-pub fn avg_px_1e6(
-    token0_raw: u128,
-    token1_raw: u128,
-    dec0: u8,
-    dec1: u8,
-    round_up: bool,
-) -> Option<i64> {
-    if token0_raw == 0 || token1_raw == 0 {
+pub fn limit_px_1e6(after: &PoolState, meta: &PoolMeta, buy: bool) -> Option<i64> {
+    if meta.fee_pips as u128 >= PIPS {
         return None;
     }
-    let num = scale10(
-        U256::from_u128(token1_raw),
-        dec0 as i32 - dec1 as i32 + 6,
-        round_up,
-    )?;
-    let px = if round_up {
-        mul_div_rounding_up(num, U256::ONE, U256::from_u128(token0_raw))
+    let p = crate::price::price_1e18_u(
+        U256::from_u160(after.sqrt_price_lo, after.sqrt_price_hi),
+        meta.dec0,
+        meta.dec1,
+    );
+    let keep = U256::from_u128(PIPS - meta.fee_pips as u128);
+    let px_1e18 = if buy {
+        mul_div_rounding_up(p, U256::from_u128(PIPS), keep)?
     } else {
-        mul_div(num, U256::ONE, U256::from_u128(token0_raw))
-    }?;
+        mul_div(p, keep, U256::from_u128(PIPS))?
+    };
+    let px = if buy {
+        mul_div_rounding_up(px_1e18, U256::ONE, U256::from_u128(E12))?
+    } else {
+        mul_div(px_1e18, U256::ONE, U256::from_u128(E12))?
+    };
     match to_i64(px) {
         Some(x) if x > 0 => Some(x),
         _ => None,
@@ -451,13 +459,39 @@ mod tests {
             "dust floors to zero"
         );
         assert_eq!(qty_1e6_from_raw(123, 2), Some(1_230_000));
-        // 2 WHYPE for 195.4 USDC ⇒ 97.7 USDC per WHYPE.
-        let t0 = 2_000_000_000_000_000_000u128;
-        let t1 = 195_400_000u128;
-        assert_eq!(avg_px_1e6(t0, t1, 18, 6, false), Some(97_700_000));
-        assert_eq!(avg_px_1e6(t0 + 1, t1, 18, 6, false), Some(97_699_999));
-        assert_eq!(avg_px_1e6(t0 + 1, t1, 18, 6, true), Some(97_700_000));
-        assert_eq!(avg_px_1e6(0, t1, 18, 6, true), None);
+    }
+
+    /// The limit an order carries is its LAST unit's price: the judge,
+    /// bounding the marginal price, fills the whole quoted quantity at
+    /// it on an unchanged pool — and at the quote's average it would not.
+    #[test]
+    fn the_limit_price_is_the_last_units_and_lets_the_quote_complete() {
+        let (st, m) = pool();
+        let qty = 10_000_000i64; // 10 token0
+        for buy in [true, false] {
+            // The quote's end state: the same walk with no price bound.
+            let bound = if buy { i64::MAX } else { 1 };
+            let quote = fill_in_range(&st, &m, !buy, qty, bound);
+            assert_eq!(quote.qty_1e6, qty);
+            let lim = limit_px_1e6(&quote.after, &m, buy).expect("priced");
+            let f = fill_in_range(&st, &m, !buy, qty, lim);
+            assert_eq!(
+                f.qty_1e6, qty,
+                "buy={buy}: the whole quote fills at its limit"
+            );
+            // At the quote's AVERAGE the marginal bound stops it early.
+            let short = fill_in_range(&st, &m, !buy, qty, quote.px_1e6);
+            assert!(short.qty_1e6 < qty, "buy={buy}: {short:?}");
+            if buy {
+                assert!(f.px_1e6 <= lim && lim > quote.px_1e6);
+            } else {
+                assert!(f.px_1e6 >= lim && lim < quote.px_1e6);
+            }
+        }
+        let mut dead = m;
+        dead.fee_pips = PIPS as u32;
+        assert_eq!(limit_px_1e6(&st, &dead, true), None);
+        assert_eq!(limit_px_1e6(&PoolState::ZERO, &m, true), None);
     }
 
     #[test]

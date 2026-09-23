@@ -3842,6 +3842,7 @@ impl Observability {
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
+            let hyparb = register_hyparb_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             // E1: only when a router is actually in force. A boot with
@@ -3941,6 +3942,7 @@ impl Observability {
                 vrp,
                 xsd,
                 bin15,
+                hyparb,
                 regime,
                 paper_matcher,
                 exec,
@@ -4304,6 +4306,8 @@ pub struct EngineCounters {
     pub xsd: XsdMetricIds,
     /// BIN15 O4b: the `engine_bin15_*` family (slot 3).
     pub bin15: Bin15MetricIds,
+    /// HYPARB H6: the `engine_hyparb_*` family (slot 0).
+    pub hyparb: HyparbMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
     /// X1: the `engine_paper_matcher_*` family + the set's
@@ -5030,6 +5034,9 @@ pub struct PaperMatcherMetricIds {
     pub lifecycle_modifies_ok: core_metrics::CounterId,
     /// `engine_lifecycle_modifies_err_total` (E5).
     pub lifecycle_modifies_err: core_metrics::CounterId,
+    /// HYPARB H6: `engine_paper_matcher_amm_{fills,canceled,partial,
+    /// not_live}_total` — the AMM fill law's verdicts (H2), in that order.
+    pub amm: [core_metrics::CounterId; 4],
 }
 
 /// Register the paper-matcher family. Boot-only.
@@ -5057,7 +5064,14 @@ fn register_paper_matcher_metrics(
     let lifecycle_cancels_err = one("engine_lifecycle_cancels_err_total")?;
     let lifecycle_modifies_ok = one("engine_lifecycle_modifies_ok_total")?;
     let lifecycle_modifies_err = one("engine_lifecycle_modifies_err_total")?;
+    let amm = [
+        one("engine_paper_matcher_amm_fills_total")?,
+        one("engine_paper_matcher_amm_canceled_total")?,
+        one("engine_paper_matcher_amm_partial_total")?,
+        one("engine_paper_matcher_amm_not_live_total")?,
+    ];
     Ok(PaperMatcherMetricIds {
+        amm,
         intake,
         fills,
         ioc_canceled,
@@ -5368,6 +5382,15 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.identity_mismatch.saturating_sub(last.identity_mismatch));
     reg.counter(ids.ambiguous_order)
         .inc(cur.ambiguous_order.saturating_sub(last.ambiguous_order));
+    // HYPARB H6: the AMM fill law's verdicts.
+    reg.counter(ids.amm[0])
+        .inc(cur.amm_fills.saturating_sub(last.amm_fills));
+    reg.counter(ids.amm[1])
+        .inc(cur.amm_canceled.saturating_sub(last.amm_canceled));
+    reg.counter(ids.amm[2])
+        .inc(cur.amm_partial.saturating_sub(last.amm_partial));
+    reg.counter(ids.amm[3])
+        .inc(cur.amm_not_live.saturating_sub(last.amm_not_live));
     // E5: the engine-level tally, which counts verbs on BOTH arms —
     // the matcher family above sees only the paper one, so a live
     // slot's cancels would otherwise be invisible here.
@@ -5628,6 +5651,233 @@ fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
     reg.counter(ids.regime_exits)
         .inc(cur.regime_exits.saturating_sub(last.regime_exits));
     *last = cur;
+}
+
+/// HYPARB H6: coins carried by the per-coin gauges (the first N configured;
+/// `/state` carries all eight).
+pub const HYPARB_METRIC_COINS: usize = 4;
+/// HYPARB H6: pools carried by the per-pool gauges (the first N
+/// configured; `/state` carries 64, the capture every pool).
+pub const HYPARB_METRIC_POOLS: usize = 4;
+
+/// The counter rows of the hyparb family, in [`hyparb_counter_values`]
+/// order — which is what pins the two together.
+const HYPARB_COUNTER_NAMES: [&str; 27] = [
+    "engine_hyparb_pool_events_total",
+    "engine_hyparb_pool_refused_total",
+    "engine_hyparb_maps_loaded_total",
+    "engine_hyparb_maps_refused_total",
+    "engine_hyparb_evaluations_total",
+    "engine_hyparb_arbs_submitted_total",
+    "engine_hyparb_side_buy_total",
+    "engine_hyparb_side_sell_total",
+    "engine_hyparb_skipped_below_min_total",
+    "engine_hyparb_skipped_not_live_total",
+    "engine_hyparb_skipped_no_hedge_total",
+    "engine_hyparb_skipped_inflight_total",
+    "engine_hyparb_skipped_cooldown_total",
+    "engine_hyparb_skipped_halted_total",
+    "engine_hyparb_size_capped_total",
+    "engine_hyparb_amm_fills_total",
+    "engine_hyparb_hedges_submitted_total",
+    "engine_hyparb_hedge_venue_perp_total",
+    "engine_hyparb_hedge_venue_spot_total",
+    "engine_hyparb_hedge_fills_total",
+    "engine_hyparb_hedges_missed_total",
+    "engine_hyparb_flattens_submitted_total",
+    "engine_hyparb_inventory_breaches_total",
+    "engine_hyparb_orders_dropped_total",
+    "engine_hyparb_gas_charged_usd_1e6_total",
+    "engine_hyparb_pnl_predicted_usd_1e6_total",
+    "engine_hyparb_amm_notional_usd_1e6_total",
+];
+
+/// `HyparbCounters`' cumulative fields in [`HYPARB_COUNTER_NAMES`] order.
+/// The three money sums are non-negative by construction (gas and
+/// notional are charged, the prediction only ever adds a positive
+/// quote), so they mirror as counters; the two LEVELS
+/// (`funding_earned_usd_1e6`, signed, and `halted`) are gauges.
+// COPY: [u64; 27] (216 B) returned by value — cold, the 5 s /metrics
+// mirror; the fields are visited once in the name order — a borrowed
+// view would need the struct to be an array, which the POD is not.
+fn hyparb_counter_values(c: &strategy_core::HyparbCounters) -> [u64; 27] {
+    [
+        c.pool_events,
+        c.pool_refused,
+        c.maps_loaded,
+        c.maps_refused,
+        c.evaluations,
+        c.arbs_submitted,
+        c.arbs_buy,
+        c.arbs_sell,
+        c.skipped_below_min,
+        c.skipped_not_live,
+        c.skipped_no_hedge,
+        c.skipped_inflight,
+        c.skipped_cooldown,
+        c.skipped_halted,
+        c.size_capped,
+        c.amm_fills,
+        c.hedges_submitted,
+        c.hedges_perp,
+        c.hedges_spot,
+        c.hedge_fills,
+        c.hedges_missed,
+        c.flattens_submitted,
+        c.inventory_breaches,
+        c.orders_dropped,
+        c.gas_charged_usd_1e6.max(0) as u64,
+        c.pnl_predicted_usd_1e6.max(0) as u64,
+        c.amm_notional_usd_1e6.max(0) as u64,
+    ]
+}
+
+/// Per-coin gauge suffixes, in [`mirror_hyparb_metrics`]' write order.
+const HYPARB_COIN_GAUGES: [&str; 5] = [
+    "perp_depth_usd_1e6",
+    "spot_depth_usd_1e6",
+    "perp_cost_bps_1e6",
+    "spot_cost_bps_1e6",
+    "inventory_1e6",
+];
+/// Per-pool gauge suffixes, in [`mirror_hyparb_metrics`]' write order.
+const HYPARB_POOL_GAUGES: [&str; 3] = ["basis_bps_1e6", "pnl_predicted_usd_1e6", "live"];
+
+/// HYPARB H6: the `engine_hyparb_*` family (slot 0) — plan §10's six
+/// disputed quantities as series: the depth the hedge books showed and
+/// how often a cap cut the size (#1), the basis per pool and the side
+/// balance (#2), the prediction per pool (#4), and each venue's hedge
+/// count, quoted cost and the funding the perp earned (#6).
+#[derive(Copy, Clone, Debug)]
+pub struct HyparbMetricIds {
+    /// The counters, in [`HYPARB_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 27],
+    /// `engine_hyparb_funding_earned_usd_1e6` (signed level).
+    pub funding_earned: core_metrics::GaugeId,
+    /// `engine_hyparb_halted` (0/1).
+    pub halted: core_metrics::GaugeId,
+    /// `engine_hyparb_pools_live` — pools judgeable right now.
+    pub pools_live: core_metrics::GaugeId,
+    /// `engine_hyparb_c<k>_<suffix>` for the first
+    /// [`HYPARB_METRIC_COINS`] coins.
+    pub coins: [[core_metrics::GaugeId; 5]; HYPARB_METRIC_COINS],
+    /// `engine_hyparb_p<k>_<suffix>` for the first
+    /// [`HYPARB_METRIC_POOLS`] pools.
+    pub pools: [[core_metrics::GaugeId; 3]; HYPARB_METRIC_POOLS],
+}
+
+/// Register the hyparb family: 27 counters, 3 + 4×5 + 4×3 = 35 gauges.
+/// UNCONDITIONAL like every family — a mask without slot 0 exposes the
+/// rows at zero, which is how an operator tells "off" from "broken".
+fn register_hyparb_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HyparbMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 27];
+    let mut i = 0usize;
+    while i < HYPARB_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(HYPARB_COUNTER_NAMES[i])
+            .map_err(|_| "register hyparb counter")?;
+        i += 1;
+    }
+    let mut gauge = |name: &str| -> Result<core_metrics::GaugeId, &'static str> {
+        reg.register_gauge(name)
+            .map_err(|_| "register hyparb gauge")
+    };
+    let funding_earned = gauge("engine_hyparb_funding_earned_usd_1e6")?;
+    let halted = gauge("engine_hyparb_halted")?;
+    let pools_live = gauge("engine_hyparb_pools_live")?;
+    let mut coins = [[core_metrics::GaugeId::default(); 5]; HYPARB_METRIC_COINS];
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_COINS {
+        let mut g = 0usize;
+        while g < HYPARB_COIN_GAUGES.len() {
+            coins[k][g] = gauge(&format!("engine_hyparb_c{k}_{}", HYPARB_COIN_GAUGES[g]))?;
+            g += 1;
+        }
+        k += 1;
+    }
+    let mut pools = [[core_metrics::GaugeId::default(); 3]; HYPARB_METRIC_POOLS];
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_POOLS {
+        let mut g = 0usize;
+        while g < HYPARB_POOL_GAUGES.len() {
+            pools[k][g] = gauge(&format!("engine_hyparb_p{k}_{}", HYPARB_POOL_GAUGES[g]))?;
+            g += 1;
+        }
+        k += 1;
+    }
+    Ok(HyparbMetricIds {
+        counters,
+        funding_earned,
+        halted,
+        pools_live,
+        coins,
+        pools,
+    })
+}
+
+/// Mirror the hyparb family: counters as deltas of the cumulative
+/// member counters, levels as sets. 5 s cadence — cold path.
+fn mirror_hyparb_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HyparbMetricIds,
+    strat: &S,
+    last: &mut strategy_core::HyparbCounters,
+) {
+    let cur = strat.hyparb_counters();
+    let now = hyparb_counter_values(&cur);
+    let was = hyparb_counter_values(last);
+    let mut i = 0usize;
+    while i < now.len() {
+        reg.counter(ids.counters[i])
+            .inc(now[i].saturating_sub(was[i]));
+        i += 1;
+    }
+    *last = cur;
+    reg.gauge(ids.funding_earned)
+        .set(cur.funding_earned_usd_1e6);
+    reg.gauge(ids.halted).set(cur.halted as i64);
+    // Levels: a coin or pool the member does not configure keeps its row
+    // at zero rather than vanishing.
+    let mut coins = [strategy_core::HyparbCoinView::default(); HYPARB_METRIC_COINS];
+    strat.hyparb_coins_view(&mut coins);
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_COINS {
+        let c = &coins[k];
+        let v = [
+            c.perp_depth_usd_1e6,
+            c.spot_depth_usd_1e6,
+            c.perp_cost_bps_1e6,
+            c.spot_cost_bps_1e6,
+            c.inventory_1e6,
+        ];
+        let mut g = 0usize;
+        while g < v.len() {
+            reg.gauge(ids.coins[k][g]).set(v[g]);
+            g += 1;
+        }
+        k += 1;
+    }
+    // Every pool's liveness (the view is read in full once), the first
+    // N pools' rows.
+    let mut pools = [strategy_core::HyparbPoolView::default(); strategy_hyparb::HYPARB_MAX_POOLS];
+    let n = (strat.hyparb_pools_view(&mut pools) as usize).min(pools.len());
+    let mut live = 0i64;
+    let mut p = 0usize;
+    while p < n {
+        live += i64::from(pools[p].live);
+        p += 1;
+    }
+    reg.gauge(ids.pools_live).set(live);
+    let mut k = 0usize;
+    while k < HYPARB_METRIC_POOLS {
+        let r = &pools[k];
+        reg.gauge(ids.pools[k][0]).set(r.basis_bps_1e6);
+        reg.gauge(ids.pools[k][1]).set(r.pnl_predicted_usd_1e6);
+        reg.gauge(ids.pools[k][2]).set(i64::from(r.live));
+        k += 1;
+    }
 }
 
 /// BIN15 O4b: the `engine_bin15_*` family (slot 3). Counters mirror the
@@ -6530,6 +6780,13 @@ fn fill_snapshot<S, D>(
     out.vrp.counters = Sc::vrp_counters(strat);
     out.vrp.view = Sc::vrp_snapshot_view(strat);
 
+    // HYPARB H6: slot 0 — counters, pool rows and coin rows from ONE
+    // publish instant (the rows are copied into the snapshot's own
+    // arrays; a configured count beyond them is still reported).
+    out.hyparb.counters = Sc::hyparb_counters(strat);
+    out.hyparb.n_pools = Sc::hyparb_pools_view(strat, &mut out.hyparb.pools);
+    out.hyparb.n_coins = Sc::hyparb_coins_view(strat, &mut out.hyparb.coins);
+
     // E6 c4: the router's kill switches. Read through the trait, from
     // the same publish instant as everything else, so a halted slot
     // and the refusals it produced can never disagree.
@@ -6972,6 +7229,7 @@ where
     // instance dies at its own expiry, so there is nothing an epoch
     // could carry across a restart that the next roll does not rebind.
     let mut bin15_last = strategy_core::Bin15Counters::default();
+    let mut hyparb_last = strategy_core::HyparbCounters::default();
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
     let mut xsd_state_buf = String::new();
@@ -7148,6 +7406,7 @@ where
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
+                mirror_hyparb_metrics(reg, &ids.hyparb, eng.strategy(), &mut hyparb_last);
                 // X1: what the paper matcher did. `ioc_canceled` is the
                 // F7 counter — a mid-priced IoC on a real spread never
                 // fills, and the member used to call that a position.
@@ -9625,6 +9884,107 @@ mod tests {
     /// `the_exec_family_size_is_pinned` test in `exec_boot` counts
     /// that family; the registry-wide number is re-measured on the
     /// host at every ramp step.
+    /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
+    /// refused boot, and the registry is shared by every family.
+    #[test]
+    fn the_hyparb_family_is_27_counters_and_35_gauges() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let before_c = reg.counters_len();
+        let before_g = reg.gauges_len();
+        let ids = register_hyparb_metrics(&mut reg).expect("register hyparb");
+        assert_eq!(reg.counters_len() - before_c, 27, "the counter block");
+        assert_eq!(
+            reg.gauges_len() - before_g,
+            35,
+            "3 + 4 coins x 5 + 4 pools x 3"
+        );
+        // A second registration collides on every name — nothing reused
+        // a name silently.
+        assert!(register_hyparb_metrics(&mut reg).is_err());
+        reg.gauge(ids.coins[3][4]).set(-5);
+        assert_eq!(reg.gauge(ids.coins[3][4]).get(), -5);
+        assert_eq!(reg.gauge(ids.pools[0][0]).get(), 0);
+        // Every counter name is distinct and a counter.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for n in HYPARB_COUNTER_NAMES {
+            assert!(
+                n.starts_with("engine_hyparb_") && n.ends_with("_total"),
+                "{n}"
+            );
+            assert!(seen.insert(n), "duplicate {n}");
+        }
+    }
+
+    /// The hyparb mirror publishes counter DELTAS in name order (the
+    /// value fn and the names are pinned together here), levels as sets,
+    /// and holds unconfigured rows at zero.
+    #[test]
+    fn the_hyparb_mirror_publishes_deltas_levels_and_pool_liveness() {
+        struct Fake {
+            c: strategy_core::HyparbCounters,
+            pool: strategy_core::HyparbPoolView,
+            coin: strategy_core::HyparbCoinView,
+        }
+        impl strategy_core::StrategyCounters for Fake {
+            fn orders_emitted(&self) -> u64 {
+                0
+            }
+            fn orders_dropped(&self) -> u64 {
+                0
+            }
+            fn strategy_kind(&self) -> &'static str {
+                "fake"
+            }
+            fn hyparb_counters(&self) -> strategy_core::HyparbCounters {
+                self.c
+            }
+            fn hyparb_pools_view(&self, out: &mut [strategy_core::HyparbPoolView]) -> u32 {
+                out[0] = self.pool;
+                1
+            }
+            fn hyparb_coins_view(&self, out: &mut [strategy_core::HyparbCoinView]) -> u32 {
+                out[0] = self.coin;
+                1
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let ids = register_hyparb_metrics(&mut reg).expect("register");
+        let mut last = strategy_core::HyparbCounters::default();
+        let mut f = Fake {
+            c: strategy_core::HyparbCounters::default(),
+            pool: strategy_core::HyparbPoolView::new(1, 1, 1, 0, 500, 97, -1_000, 3, 42),
+            coin: strategy_core::HyparbCoinView::default(),
+        };
+        f.c.arbs_buy = 3;
+        f.c.arbs_sell = 1;
+        f.c.gas_charged_usd_1e6 = 30_000;
+        f.c.funding_earned_usd_1e6 = -12;
+        f.c.halted = 1;
+        f.coin.perp_depth_usd_1e6 = 900_000_000;
+        mirror_hyparb_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[6]).get(), 3, "side_buy");
+        assert_eq!(reg.counter(ids.counters[7]).get(), 1, "side_sell");
+        assert_eq!(reg.counter(ids.counters[24]).get(), 30_000, "gas");
+        assert_eq!(reg.gauge(ids.funding_earned).get(), -12);
+        assert_eq!(reg.gauge(ids.halted).get(), 1);
+        assert_eq!(reg.gauge(ids.pools_live).get(), 1);
+        assert_eq!(reg.gauge(ids.pools[0][0]).get(), -1_000);
+        assert_eq!(reg.gauge(ids.pools[0][1]).get(), 42);
+        assert_eq!(reg.gauge(ids.pools[1][2]).get(), 0, "unconfigured pool row");
+        assert_eq!(reg.gauge(ids.coins[0][0]).get(), 900_000_000);
+        // The second pass publishes only the delta.
+        f.c.arbs_buy = 5;
+        mirror_hyparb_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[6]).get(), 5);
+        assert_eq!(reg.counter(ids.counters[7]).get(), 1);
+        // The value order IS the name order.
+        assert_eq!(HYPARB_COUNTER_NAMES[6], "engine_hyparb_side_buy_total");
+        assert_eq!(
+            HYPARB_COUNTER_NAMES[24],
+            "engine_hyparb_gas_charged_usd_1e6_total"
+        );
+    }
+
     #[test]
     fn the_bin15_family_is_31_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();

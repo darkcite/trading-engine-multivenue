@@ -873,3 +873,112 @@ fn ratio_and_mul_div_round_and_refuse_as_documented() {
     assert_eq!(mul_div_i64(7, 3, 0), 0);
     assert_eq!(mul_div_i64(i64::MAX, i64::MAX, 1), i64::MAX);
 }
+
+// ---------------------------------------------------------------
+// H6 observables
+// ---------------------------------------------------------------
+
+#[test]
+fn the_side_balance_and_per_pool_prediction_are_counted() {
+    let (m, _c) = armed();
+    let k = m.counters();
+    assert_eq!((k.arbs_buy, k.arbs_sell), (1, 0));
+    let mut out = [HyparbPoolView::default(); 1];
+    m.hyparb_pools_view(&mut out);
+    assert_eq!(out[0].pnl_predicted_usd_1e6, k.pnl_predicted_usd_1e6);
+    assert!(out[0].pnl_predicted_usd_1e6 > 0);
+    let mut m = member();
+    let mut c = ctx();
+    perp_at(&mut m, &mut c, -100);
+    snapshot(&mut m, &mut c, POOL, 2, 2);
+    let k = m.counters();
+    assert_eq!((k.arbs_buy, k.arbs_sell), (0, 1));
+}
+
+#[test]
+fn the_coin_view_carries_depth_costs_positions_and_funding() {
+    let (mut m, mut c) = armed();
+    let mut out = [HyparbCoinView::default(); 2];
+    assert_eq!(m.hyparb_coins_view(&mut out), 1);
+    assert_eq!((out[0].perp_sym, out[0].spot_sym), (PERP, SPOT));
+    assert!(
+        out[0].perp_depth_usd_1e6 > 1_000_000_000,
+        "100 coins at ~$98"
+    );
+    assert_eq!(out[0].spot_depth_usd_1e6, 0, "no spot book");
+    assert!(out[0].perp_cost_bps_1e6 > 4_500_000, "taker + half spread");
+    // The AMM fill, then the perp hedge fill: a short perp position.
+    let o = c.orders[0];
+    m.on_fill(
+        &Fill::new(c.now, POOL, Side::Bid, o.px, o.qty, o.client_oid),
+        &mut c,
+    );
+    let h = c.orders[1];
+    m.on_fill(
+        &Fill::new(c.now, PERP, Side::Ask, h.px, h.qty, h.client_oid),
+        &mut c,
+    );
+    m.hyparb_coins_view(&mut out);
+    assert_eq!(out[0].perp_pos_1e6, -h.qty.raw());
+    // 0.05 %/h for one hour on a short earns ≈ notional × 5 bps.
+    m.on_venue_event(
+        &ChannelEvent::new(
+            c.now,
+            VenueId::Hyperliquid,
+            ChannelId::AssetCtx,
+            PERP,
+            0,
+            0,
+            500_000,
+            0,
+        ),
+        &mut c,
+    );
+    m.on_timer(c.now, &mut c);
+    // Keep the book fresh across the hour (a stale touch has no mid).
+    c.now += 3_600_000_000_000;
+    perp_at(&mut m, &mut c, 100);
+    m.on_timer(c.now, &mut c);
+    let earned = m.counters().funding_earned_usd_1e6;
+    let mid = pool_mid() * 10_100 / 10_000;
+    let want = (h.qty.raw() as i128 * mid as i128 / 1_000_000 * 5 / 10_000) as i64;
+    assert!(
+        (earned - want).abs() <= want / 100 + 1,
+        "earned {earned} want {want}"
+    );
+    m.hyparb_coins_view(&mut out);
+    assert_eq!(out[0].funding_1e9, 500_000);
+    // An unconfigured member reports no coins.
+    assert_eq!(HyparbStrategy::new().hyparb_coins_view(&mut out), 0);
+}
+
+#[test]
+fn funding_accrues_nothing_on_the_first_pass_or_a_backward_clock() {
+    let mut m = member();
+    m.accrue_funding(T0);
+    assert_eq!(m.counters().funding_earned_usd_1e6, 0);
+    m.accrue_funding(T0 - 1);
+    assert_eq!(m.counters().funding_earned_usd_1e6, 0);
+}
+
+#[test]
+fn the_halted_level_follows_the_inventory_cap() {
+    let mut p = params();
+    p.inventory_cap_usd_1e6 = 100_000_000;
+    let mut m = member_with(p);
+    let mut c = ctx();
+    perp_at(&mut m, &mut c, 100);
+    snapshot(&mut m, &mut c, POOL, 2, 2);
+    let o = c.orders[0];
+    m.on_fill(
+        &Fill::new(c.now, POOL, Side::Bid, o.px, o.qty, o.client_oid),
+        &mut c,
+    );
+    assert_eq!(m.counters().halted, 1);
+    let h = c.orders[1];
+    m.on_fill(
+        &Fill::new(c.now, PERP, Side::Ask, h.px, h.qty, h.client_oid),
+        &mut c,
+    );
+    assert_eq!(m.counters().halted, 0);
+}

@@ -55,6 +55,7 @@ import typing
 
 import claude_worker.backtest
 import claude_worker.fill_origin
+import claude_worker.hyparb_ladder
 import claude_worker.regime
 import claude_worker.window_root
 
@@ -620,6 +621,8 @@ def regime_head_lines(merged: dict) -> list[str]:
 
 
 WINDOW_ROOT_DEFAULT: str = "~/multivenue/backtest-roots/nightly"
+#: HYPARB H6: the slot-0 artifact the ladder replays by default.
+HYPARB_ARTIFACT_DEFAULT: str = "~/multivenue/hyparb.toml"
 
 
 def regime_seed_inputs(
@@ -733,12 +736,19 @@ def run_day(
     fee_flags: list[str] | None = None,
     window_root: pathlib.Path | None = None,
     source: typing.Any = None,
+    hyparb_artifact: pathlib.Path | None = None,
 ) -> int:
     """Day mode: one bounded audit-pnl per ≤ 2 h window of every run of
     ``day`` (``window_root`` = where the cuts are materialised, deleted
     after their audit; None = audit each run whole), merged. Nonzero
     when nothing audited cleanly (a failed unit is listed in the report
-    and on stderr; the merge still lands for the others)."""
+    and on stderr; the merge still lands for the others).
+
+    HYPARB H6: with ``hyparb_artifact`` the same units are ALSO replayed
+    through the member's correction ladder (``hyparb_ladder``) before
+    they are deleted, and the report gains an additive ``hyparb`` key —
+    slot 0's live paper row(s) beside the ladder. Absent = the report is
+    byte-identical to a pre-H6 one."""
     fn = _default_run_fn if run_fn is None else run_fn
     flags = list(fee_flags or [])
     if source is not None:
@@ -754,9 +764,22 @@ def run_day(
     for i, run_dir in enumerate(runs):
         nxt = runs[i + 1] if i + 1 < len(runs) else None
         units.extend(_audit_units(run_dir, window_root, report, next_run=nxt))
+    ladder_text: str | None = None
+    if hyparb_artifact is not None:
+        try:
+            ladder_text = hyparb_artifact.read_text(encoding="utf-8")
+        except OSError as exc:
+            report(f"pnl-report: hyparb ladder skipped — {hyparb_artifact}: {exc}")
+    ladder_units: list[list[dict[str, object]]] = []
     for label, unit_dir, temporary in units:
         argv = [claude_worker.backtest.ENGINE_BINARY, "audit-pnl", "--dir", str(unit_dir)] + flags
         code, out, err = fn(argv)
+        if ladder_text is not None:
+            scratch = (window_root or reports_dir) / f"hyparb-ladder-{pathlib.Path(label).name}"
+            ladder_units.append(
+                claude_worker.hyparb_ladder.run_ladder(unit_dir, ladder_text, scratch, flags, fn)
+            )
+            shutil.rmtree(scratch, ignore_errors=True)
         if temporary:
             shutil.rmtree(unit_dir, ignore_errors=True)
         run_dir = pathlib.Path(label)
@@ -784,6 +807,12 @@ def run_day(
     # report built without an archive is byte-identical to a pre-S6 one.
     if source is not None:
         merged["data_source"] = source.provenance([p.name for p in runs])
+    if ladder_text is not None:
+        merged["hyparb"] = {
+            "artifact": str(hyparb_artifact),
+            "paper": [r for r in merged["strategies"] if r["strategy_id"] == 0],
+            "ladder": claude_worker.hyparb_ladder.merge_ladder(ladder_units),
+        }
     json_path.write_text(json.dumps(merged, separators=(",", ":")) + "\n", encoding="utf-8")
     head = [
         f"pnl-report: day {day}: runs audited {len(ok)} failed {len(failed)}",
@@ -821,6 +850,8 @@ def run_day(
             f"duplicates={bf['duplicates']}{note}"
         )
     head.extend(regime_head_lines(merged))
+    if "hyparb" in merged:
+        head.extend(claude_worker.hyparb_ladder.summary_lines(merged["hyparb"]))
     summary_path.write_text("\n".join(head) + "\n\n" + "\n".join(summaries), encoding="utf-8")
     report(f"pnl-report: {day}: strategies={len(merged['strategies'])} runs={len(ok)} failed={len(failed)} -> {json_path} (+ summary)")
     return 0 if ok else 1
@@ -841,6 +872,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="day mode: audit each run whole (tests / tiny runs only — the 2 h law)")
     parser.add_argument("--fees", default=None,
                         help=f"fees.toml with the operator's tier (default {FEES_PATH_DEFAULT} in day mode when present)")
+    parser.add_argument("--hyparb-ladder", default=None, nargs="?", const=HYPARB_ARTIFACT_DEFAULT,
+                        help="day mode: also replay each unit through the slot-0 correction ladder "
+                             f"(the artifact; default {HYPARB_ARTIFACT_DEFAULT})")
     args = parser.parse_args(argv)
     replay_dir = (
         pathlib.Path(args.replay_dir).expanduser()
@@ -878,6 +912,9 @@ def main(argv: list[str] | None = None) -> int:
             fee_flags=fee_flags,
             window_root=window_root,
             source=_archive_source(replay_dir),
+            hyparb_artifact=(
+                pathlib.Path(args.hyparb_ladder).expanduser() if args.hyparb_ladder else None
+            ),
         )
     return run_once(replay_dir, reports_dir, now_ms, report)
 

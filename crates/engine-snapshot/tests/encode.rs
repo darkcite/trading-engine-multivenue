@@ -104,6 +104,38 @@ fn full_snapshot() -> Box<EngineSnapshot> {
     for _ in 0..RECENT_FILLS + 3 {
         s.recent_fills.push(f);
     }
+    // HYPARB H6: every pool and coin row at its widest render.
+    s.hyparb.n_pools = u32::MAX;
+    s.hyparb.n_coins = u32::MAX;
+    s.hyparb.counters.pool_events = u64::MAX;
+    s.hyparb.counters.gas_charged_usd_1e6 = i64::MIN;
+    s.hyparb.counters.funding_earned_usd_1e6 = i64::MIN;
+    for r in s.hyparb.pools.iter_mut() {
+        *r = strategy_core::HyparbPoolView::new(
+            u32::MAX,
+            u8::MAX,
+            u8::MAX,
+            u8::MAX,
+            u32::MAX,
+            i64::MIN,
+            i64::MIN,
+            u64::MAX,
+            i64::MIN,
+        );
+    }
+    for r in s.hyparb.coins.iter_mut() {
+        *r = strategy_core::HyparbCoinView {
+            perp_sym: u32::MAX,
+            spot_sym: u32::MAX,
+            perp_depth_usd_1e6: i64::MIN,
+            spot_depth_usd_1e6: i64::MIN,
+            perp_cost_bps_1e6: i64::MIN,
+            spot_cost_bps_1e6: i64::MIN,
+            inventory_1e6: i64::MIN,
+            perp_pos_1e6: i64::MIN,
+            funding_1e9: i64::MIN,
+        };
+    }
     s
 }
 
@@ -158,11 +190,21 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
         "\"ingress\":",
         "\"capture\":",
         "\"recent\":",
+        "\"hyparb\":",
     ] {
         assert_eq!(body.matches(key).count(), 1, "{key} must appear once");
     }
     // 256 rows + 64 orders + 64 fills rendered.
     assert_eq!(body.matches("\"name_h\":").count(), RULE_TABLE_ROWS);
+    // HYPARB H6: the pool and coin rows are capped at the snapshot's own.
+    assert_eq!(
+        body.matches("\"map_ok\":").count(),
+        engine_snapshot::SNAPSHOT_HYPARB_POOLS
+    );
+    assert_eq!(
+        body.matches("\"perp_depth_usd_1e6\":").count(),
+        engine_snapshot::SNAPSHOT_HYPARB_COINS
+    );
     assert_eq!(body.matches("\"ttl_ns\":").count(), RECENT_ORDERS);
     assert_eq!(body.matches("\"oid\":").count(), RECENT_ORDERS + RECENT_FILLS);
     // The run_dir made of quotes escaped every byte.
@@ -338,4 +380,36 @@ fn recent_rings_render_oldest_first_with_ages() {
         \"fills_total\":1,\"fills\":[{\"ts_ns\":\"97000000000\",\"age_s\":3,\"sym\":7,\"side\":1,\
         \"px_1e6\":1,\"qty_1e6\":2,\"oid\":\"95\"}]}}";
     assert!(body.ends_with(want), "got tail: {}", &body[body.len() - want.len().min(body.len())..]);
+}
+
+/// HYPARB H6: the `hyparb` object — additive, so a `contains` pin. The
+/// side balance and the per-pool basis render beside each other because
+/// the disputed quantities are relationships between them.
+#[test]
+fn the_hyparb_section_renders_counters_pools_and_coins() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains("\"hyparb\":{\"configured\":0,\"n_pools\":0,\"n_coins\":0,"));
+    assert!(body.contains("\"pools\":[],\"coins\":[]}"));
+    s.hyparb.n_pools = 1;
+    s.hyparb.n_coins = 1;
+    s.hyparb.counters.arbs_buy = 3;
+    s.hyparb.counters.arbs_sell = 2;
+    s.hyparb.counters.funding_earned_usd_1e6 = -7;
+    s.hyparb.pools[0] =
+        strategy_core::HyparbPoolView::new(0x0800_0001, 1, 1, 0, 500, 97_600_000, -1_000, 5, 42);
+    s.hyparb.coins[0].perp_sym = 0x0500_0005;
+    s.hyparb.coins[0].perp_pos_1e6 = -1_000_000;
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains("\"arbs_buy\":3,\"arbs_sell\":2"), "{body}");
+    assert!(body.contains("\"funding_earned_usd_1e6\":-7"));
+    assert!(body.contains(
+        "{\"sym\":134217729,\"live\":1,\"map_ok\":1,\"hedge_venue\":0,\"fee_pips\":500,\
+         \"mid_1e6\":97600000,\"basis_bps_1e6\":-1000,\"arbs\":5,\"pnl_predicted_usd_1e6\":42}"
+    ));
+    assert!(body.contains("\"perp_sym\":83886085"));
+    assert!(body.contains("\"perp_pos_1e6\":-1000000"));
 }
