@@ -6,6 +6,34 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the HYPARB executor's bytecode: `hyperswapV3SwapCallback` (HYPARB H9d)
+
+**What changed**
+
+- `contracts/hyparb-executor/HyparbExecutor.{bin,runtime.bin}` are
+  regenerated: the contract answers `hyperswapV3SwapCallback` (Hyperswap
+  V3 pools) besides `uniswapV3SwapCallback` and `algebraSwapCallback`.
+  Creation bytecode 2,335 → 2,346 B; `evm-testnet deploy` sends the new
+  bytes (the binary embeds them).
+
+**Impact**
+
+- An executor deployed from the H7b bytes reverts every swap against a
+  Hyperswap V3 pool (the testnet battery pool is one). Paper is
+  unaffected; nothing on mainnet was ever deployed.
+
+**Migration steps**
+
+1. `evm-testnet deploy` from a binary built at or after H9d, then set
+   `[testnet] executor` to the new address and `mint` its inventory.
+   The old executor keeps its minted testnet tokens (there is no sweep
+   verb; the contract's owner-only `sweep` would move them).
+
+**Rollback**
+
+- Revert the H9d commit (the deployed contract stays where it is; point
+  `[testnet] executor` back at the old address).
+
 ## 2026-09-23 — `engine_hyparb_evm_no_wallet_total` → `_superseded_total`, `engine_hyparb_evm_dark`; the shadow boots DARK instead of refusing; slot 0 can never be armed live (HYPARB H9)
 
 **What changed**

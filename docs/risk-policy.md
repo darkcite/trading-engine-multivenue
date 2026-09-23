@@ -4615,6 +4615,21 @@ A MAINNET write path would need an executor allow-list or one executor
 per wallet (a contract change under its own review) and a place inside
 the risk gate — neither exists, and the chain allow-list keeps it so.
 
+### The executor answers three callback names (H9d, 2026-09-24)
+
+Found live by the H8 battery: its first swap reverted on chain because
+the testnet pool is Hyperswap V3, whose pools call
+`hyperswapV3SwapCallback` — a name the executor did not have (mainnet
+Hyperswap runs the same pool code). The contract now answers it; it
+routes to the same `_pay` as `uniswapV3SwapCallback` and
+`algebraSwapCallback`, which pays only the pool the current call is
+swapping and only inside that swap (transient storage), so a third name
+adds no trust. An executor deployed before H9d must be redeployed
+(`evm-testnet deploy`, then `[testnet] executor`); boot's `owner()` check
+does not tell the two apart, the first swap's revert does. The cost of
+the miss was gas only — `BelowMinOut` and a callback revert both move no
+inventory.
+
 ### Signing keys
 
 `HYPEREVM_TESTNET_KEY`, else — by the 2026-09-23 operator ruling ("reuse

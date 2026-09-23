@@ -7,7 +7,8 @@
 //! 2026-09-23). RFC 6979 makes the signature deterministic, so `r`, `s`,
 //! `y_parity`, the transaction hash (which binds every envelope byte)
 //! and the raw hex must all agree. C0 is the committed executor's own
-//! creation bytecode (2,335 B — a three-byte string length); C1 is a
+//! creation bytecode (2,346 B since H9d's third callback — a three-byte
+//! string length; re-signed by eth-account 0.14 on 2026-09-24); C1 is a
 //! two-byte init code with a 81-bit fee cap and a non-zero endowment.
 //!
 //! The deployed address, `keccak256(rlp([sender, nonce]))[12..]`, is
@@ -76,7 +77,7 @@ fn a_small_creation_is_byte_equal_to_eth_account() {
 #[test]
 fn the_executor_creation_is_byte_equal_to_eth_account() {
     let init = unhex(EXECUTOR_BIN);
-    assert_eq!(init.len(), 2335, "the committed creation bytecode");
+    assert_eq!(init.len(), 2346, "the committed creation bytecode");
     let tx = Eip1559Create {
         chain_id: 998,
         nonce: 0,
@@ -87,22 +88,22 @@ fn the_executor_creation_is_byte_equal_to_eth_account() {
         init_code: &init,
     };
     let (sig, raw) = render(&tx);
-    assert_eq!(raw.len(), 2 + 4852);
+    assert_eq!(raw.len(), 2 + 4874);
     assert!(raw.starts_with(
-        "0x02f909768203e680808405f5e1008316e3608080b9091f60a0604052348015600e575f5ffd5b50336080"
+        "0x02f909818203e680808405f5e1008316e3608080b9092a60a0604052348015600e575f5ffd5b50336080"
     ));
     assert_eq!(
         hex(&sig[..32]),
-        "78f5cc24ab34b1bd8811f23882f40f5ceed7c4be44ab418113a74ae62089b2a2"
+        "157fbe4f00e9d8e8f15129e4d5c93eed50b85a3ee2b630bf1a354da70c1a8524"
     );
     assert_eq!(
         hex(&sig[32..64]),
-        "10aa560ee53f81e6ef0882c7e511417ec6faf8bf65c794faf5a05377930a0086"
+        "17c1e253274b680bcd0095ae89e3c4448ab9b470072acf9d3e744ddfccbf2bdb"
     );
-    assert_eq!(sig[64], 27, "y_parity 0");
+    assert_eq!(sig[64], 28, "y_parity 1");
     assert_eq!(
         hex(&create_hash(&tx, &sig).unwrap()),
-        "f51e0c99c5a4fd62c882a3c4fbbb8614afc6551b8bed8bc204560b02e229a6ca"
+        "2f7e008c758058cbf0b6fc4ca7d957bd4dde9aaeec57f38880b0f38d763c256d"
     );
 }
 

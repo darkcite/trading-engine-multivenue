@@ -118,7 +118,9 @@ pub const HYPEREVM_DECIMALS_MAX: u8 = 36;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HyperEvmFamily {
-    /// Uniswap V3 ABI (`v3`).
+    /// Uniswap V3 ABI (`v3`) — Hyperswap V3 included: the same reads,
+    /// events and word counts; only its swap callback is renamed (the
+    /// executor answers it, H9d).
     V3 = 0,
     /// Aerodrome Slipstream fork (`slipstream`).
     Slipstream = 1,

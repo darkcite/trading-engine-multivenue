@@ -35,6 +35,9 @@ contract HyparbExecutorForkTest {
     address constant ALGEBRA_POOL = 0x20e6E73C91a29d21BdE672562a4B16649D66623E;
     /// Algebra Integral v1.2 (Kittenswap, plugin fees).
     address constant ALGEBRA_V12_POOL = 0x12Df9913E9E08453440e3C4B1aE73819160b513E;
+    /// Hyperswap V3 (WHYPE/USDT0, 0.05 %; factory 0xB1c0…02E3) — calls
+    /// `hyperswapV3SwapCallback`.
+    address constant HYPERSWAP_POOL = 0x337b56d87A6185cD46AF3Ac2cDF03CBC37070C30;
 
     receive() external payable {}
 
@@ -83,5 +86,9 @@ contract HyparbExecutorForkTest {
 
     function test_fork_algebra_v12() public {
         _sell_whype(ALGEBRA_V12_POOL);
+    }
+
+    function test_fork_hyperswap_v3() public {
+        _sell_whype(HYPERSWAP_POOL);
     }
 }

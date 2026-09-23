@@ -1159,7 +1159,12 @@ time **0.984 s**, gas limit **3,000,000** — identical to mainnet — with
 **21 AMM pools and ≈450 Swap events per 3,000 blocks**. WHYPE exists at the
 same address (`0x5555…5555`). **Hyperswap's factory does NOT exist there**
 (`eth_getCode` = `0x`), so there is no like-for-like pool and no competing
-arb flow.
+arb flow. *Correction (2026-09-24):* not at its MAINNET address — but a
+byte-identical Hyperswap V3 factory (24,351 B) is deployed on testnet at
+`0x22b0768972bb7f1f5ea7a8740bb8f94b32483826`, and the battery pool
+`0x7d03…3d29` is one of its pools (21,797 B, the same code as mainnet
+Hyperswap's). Hyperswap renames the swap callback, which the first
+executor did not answer — §16.7's H9d amendment.
 
 Same shape as the E7 R0 finding ("testnet has no 15-minute family, so R0 ran
 there only as the exec battery"). **Testnet is an exec battery, not a
@@ -1508,6 +1513,30 @@ impostor callbacks, USDT-style and false-returning tokens) + 4 on a
 HyperEVM MAINNET FORK — a real Uniswap-ABI, Slipstream, Algebra v1.0 and
 Algebra v1.2 pool each swapped exactly (local fork only; nothing sent).
 Deployment is H8, testnet only (O-H5).
+
+**H9d amendment (2026-09-24) — a third callback name.** The H8 battery's
+first swap (a) reverted on chain (block 65056219, 90,828 gas): the testnet
+pool is **Hyperswap V3**, a Uniswap V3 fork whose pools call
+`hyperswapV3SwapCallback(int256,int256,bytes)` (`0xfa85398b`) instead of
+`uniswapV3SwapCallback` (`0xfa461e33`) — the executor had no such
+function, so the pool's callback hit no selector and reverted. Mainnet
+Hyperswap V3 (factory `0xb1c0fa0b789320044a6f623cfe5ebda9562602e3`) runs
+the same pool code, so every mainnet Hyperswap pool would have reverted
+the same way. Everything else about those pools is the `v3` family
+(measured on `0x337b…0c30`: 7-word `slot0`, 8-word `ticks`, the shared
+Swap / Mint / Burn topics) — the ingress, the AMM engine and the
+universe grammar need nothing; only the contract did. Fix:
+`hyperswapV3SwapCallback` routes to the same guarded `_pay` (only the
+pool this call is swapping, only inside the swap — no new trust).
+Creation bytecode 2,335 → 2,346 B (repro script and `forge build`
+byte-identical; `signer-evm`'s C0 vector re-signed by eth-account 0.14).
+Foundry: 11 unit (+ the Hyperswap family through the mock pool, its
+outside-a-swap and impostor refusals, and a pin of the three selectors)
++ 5 fork (+ Hyperswap V3 WHYPE/USDT0 0.05 % `0x337b…0c30`, which is RED
+against the H7b bytecode — a revert that is not `BelowMinOut` — and
+green now). Forge is not installed on the Mac: the Foundry suites run in
+the session sandbox (forge 1.5.1, the pinned solc); the repro script is
+the Mac-side gate.
 
 ### 16.8 H0 — slot 0 is hyparb, HyperEvm = 8 — LANDED (dark)
 

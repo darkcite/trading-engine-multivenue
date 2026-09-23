@@ -137,8 +137,9 @@ perp = []   # e.g. ["BTC_USDT", "XAU_USDT", "USOIL_USDT", "EUR_USDT", "SPY_USDT"
 # HYPARB H3b. One entry per AMM pool, "0x<address>:<family>:<dec0>:<dec1>":
 #   address — the POOL contract, 40 LOWERCASE hex (the descriptor is
 #             hyperevm:0x<address>; one spelling, so one identity);
-#   family  — v3 (Uniswap V3 ABI) | slipstream (Aerodrome fork) |
-#             algebra (Algebra Integral v1.0 / v1.2);
+#   family  — v3 (Uniswap V3 ABI, Hyperswap V3 included) |
+#             slipstream (Aerodrome fork) | algebra (Algebra Integral
+#             v1.0 / v1.2);
 #   dec0/1  — token0 / token1 decimals() (0..=36). CHECKED on chain before
 #             every snapshot: a mismatch refuses that pool, never misprices it.
 # pools[i] -> make_symbol_id(HyperEvm, i+1); at most 128. APPEND, never

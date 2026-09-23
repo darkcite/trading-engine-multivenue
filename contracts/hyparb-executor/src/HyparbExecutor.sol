@@ -3,8 +3,8 @@
 pragma solidity 0.8.28;
 
 /// Every concentrated-liquidity family HYPARB trades shares this entry
-/// point: Uniswap V3 and its forks (Slipstream / Hybra CL) and Algebra
-/// Integral all expose `swap(address,bool,int256,uint160,bytes)`
+/// point: Uniswap V3 and its forks (Slipstream / Hybra CL, Hyperswap V3)
+/// and Algebra Integral all expose `swap(address,bool,int256,uint160,bytes)`
 /// (selector 0x128acb08) and immutable `token0()` / `token1()`.
 interface IClPool {
     function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
@@ -29,9 +29,10 @@ interface IClPool {
 /// The pool being swapped is held in TRANSIENT storage (EIP-1153 —
 /// HyperEVM runs Cancun) for the duration of the call only: a callback
 /// from any other address, or from any address outside a swap, reverts.
-/// Both callback names route to the same payment:
-/// `uniswapV3SwapCallback` (V3, Slipstream) and `algebraSwapCallback`
-/// (Algebra Integral, O-H19).
+/// Every callback name a family uses routes to the same payment:
+/// `uniswapV3SwapCallback` (V3, Slipstream), `algebraSwapCallback`
+/// (Algebra Integral, O-H19) and `hyperswapV3SwapCallback` (Hyperswap
+/// V3 — a V3 fork that renamed it; same pool ABI and events otherwise).
 contract HyparbExecutor {
     /// The deployer: the only address that may swap or sweep.
     address public immutable owner;
@@ -76,6 +77,11 @@ contract HyparbExecutor {
 
     /// @notice Algebra Integral swap callback.
     function algebraSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        _pay(amount0Delta, amount1Delta);
+    }
+
+    /// @notice Hyperswap V3 swap callback (selector 0xfa85398b).
+    function hyperswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
         _pay(amount0Delta, amount1Delta);
     }
 

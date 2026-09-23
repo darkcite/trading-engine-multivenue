@@ -45,20 +45,40 @@ interface IAlgebraCallback {
     function algebraSwapCallback(int256, int256, bytes calldata) external;
 }
 
+interface IHyperswapCallback {
+    function hyperswapV3SwapCallback(int256, int256, bytes calldata) external;
+}
+
+// The callback name a pool family calls.
+uint8 constant V3 = 0;
+uint8 constant ALGEBRA = 1;
+uint8 constant HYPERSWAP = 2;
+
+/// Call `exec`'s callback under `family`'s name.
+function callBack(address exec, uint8 family, int256 a0, int256 a1, bytes memory data) {
+    if (family == ALGEBRA) {
+        IAlgebraCallback(exec).algebraSwapCallback(a0, a1, data);
+    } else if (family == HYPERSWAP) {
+        IHyperswapCallback(exec).hyperswapV3SwapCallback(a0, a1, data);
+    } else {
+        IV3Callback(exec).uniswapV3SwapCallback(a0, a1, data);
+    }
+}
+
 /// A pool that behaves like the contracts: pay out first, call back,
 /// then insist its input balance grew. Price: 1 token0 = 2 token1.
-/// `algebra` selects the callback name; `evil` makes it call back into
-/// the executor from a DIFFERENT contract (an impostor) instead.
+/// `family` selects the callback name; an impostor makes it call back
+/// into the executor from a DIFFERENT contract instead.
 contract MockPool {
     MockToken public immutable token0;
     MockToken public immutable token1;
-    bool public immutable algebra;
+    uint8 public immutable family;
     Impostor public impostor;
 
-    constructor(MockToken t0, MockToken t1, bool alg) {
+    constructor(MockToken t0, MockToken t1, uint8 fam) {
         token0 = t0;
         token1 = t1;
-        algebra = alg;
+        family = fam;
     }
 
     function setImpostor(Impostor i) external {
@@ -78,11 +98,9 @@ contract MockPool {
         tout.transfer(recipient, outAmt);
         uint256 before = tin.balanceOf(address(this));
         if (address(impostor) != address(0)) {
-            impostor.poke(msg.sender, amount0, amount1, algebra);
-        } else if (algebra) {
-            IAlgebraCallback(msg.sender).algebraSwapCallback(amount0, amount1, data);
+            impostor.poke(msg.sender, amount0, amount1, family);
         } else {
-            IV3Callback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+            callBack(msg.sender, family, amount0, amount1, data);
         }
         require(tin.balanceOf(address(this)) >= before + inAmt, "IIA");
     }
@@ -90,12 +108,8 @@ contract MockPool {
 
 /// Calls the executor's callback while pretending to be owed.
 contract Impostor {
-    function poke(address exec, int256 a0, int256 a1, bool alg) external {
-        if (alg) {
-            IAlgebraCallback(exec).algebraSwapCallback(a0, a1, "");
-        } else {
-            IV3Callback(exec).uniswapV3SwapCallback(a0, a1, "");
-        }
+    function poke(address exec, int256 a0, int256 a1, uint8 family) external {
+        callBack(exec, family, a0, a1, "");
     }
 }
 
@@ -116,19 +130,23 @@ contract HyparbExecutorTest {
     MockToken t1;
     MockPool v3;
     MockPool alg;
+    MockPool hs;
 
     function setUp() public {
         x = new HyparbExecutor();
         t0 = new MockToken();
         t1 = new MockToken();
-        v3 = new MockPool(t0, t1, false);
-        alg = new MockPool(t0, t1, true);
+        v3 = new MockPool(t0, t1, V3);
+        alg = new MockPool(t0, t1, ALGEBRA);
+        hs = new MockPool(t0, t1, HYPERSWAP);
         t0.mint(address(x), 1_000);
         t1.mint(address(x), 1_000);
         t0.mint(address(v3), 1_000_000);
         t1.mint(address(v3), 1_000_000);
         t0.mint(address(alg), 1_000_000);
         t1.mint(address(alg), 1_000_000);
+        t0.mint(address(hs), 1_000_000);
+        t1.mint(address(hs), 1_000_000);
     }
 
     function _revertSelector(bytes memory ret) private pure returns (bytes4 s) {
@@ -153,6 +171,15 @@ contract HyparbExecutorTest {
         require(t0.balanceOf(address(x)) == 1_050 && t1.balanceOf(address(x)) == 900, "inventory");
     }
 
+    function test_hyperswap_swap_uses_its_own_callback() public {
+        // The pool the H8 battery's first swap reverted on (2026-09-24):
+        // a Hyperswap V3 pool calls `hyperswapV3SwapCallback`, which the
+        // first executor did not answer.
+        (int256 a0, int256 a1) = x.swap(address(hs), true, 100, 0, 200);
+        require(a0 == 100 && a1 == -200, "deltas");
+        require(t0.balanceOf(address(x)) == 900 && t1.balanceOf(address(x)) == 1_200, "inventory");
+    }
+
     function test_below_min_out_reverts_and_moves_nothing() public {
         (bool ok, bytes memory ret) = address(x).call(abi.encodeCall(HyparbExecutor.swap, (address(v3), true, 100, 0, 201)));
         require(!ok, "must revert");
@@ -173,13 +200,26 @@ contract HyparbExecutorTest {
         require(!ok && _revertSelector(ret) == HyparbExecutor.NotPool.selector, "NotPool outside");
         (ok, ret) = address(x).call(abi.encodeCall(HyparbExecutor.algebraSwapCallback, (int256(1), int256(0), bytes(""))));
         require(!ok && _revertSelector(ret) == HyparbExecutor.NotPool.selector, "NotPool outside (algebra)");
+        (ok, ret) = address(x).call(abi.encodeCall(HyparbExecutor.hyperswapV3SwapCallback, (int256(1), int256(0), bytes(""))));
+        require(!ok && _revertSelector(ret) == HyparbExecutor.NotPool.selector, "NotPool outside (hyperswap)");
     }
 
     function test_a_callback_from_another_address_during_a_swap_is_refused() public {
-        v3.setImpostor(new Impostor());
-        (bool ok,) = address(x).call(abi.encodeCall(HyparbExecutor.swap, (address(v3), true, 100, 0, 0)));
-        require(!ok, "an impostor was paid");
+        MockPool[3] memory pools = [v3, alg, hs];
+        for (uint256 i = 0; i < 3; i++) {
+            pools[i].setImpostor(new Impostor());
+            (bool ok,) = address(x).call(abi.encodeCall(HyparbExecutor.swap, (address(pools[i]), true, 100, 0, 0)));
+            require(!ok, "an impostor was paid");
+        }
         require(t0.balanceOf(address(x)) == 1_000, "nothing paid");
+    }
+
+    function test_the_callback_selectors_are_the_families() public pure {
+        // Measured in the pools' bytecode: Uniswap V3 / Slipstream,
+        // Algebra Integral, Hyperswap V3 (mainnet factory 0xb1c0…02e3).
+        require(HyparbExecutor.uniswapV3SwapCallback.selector == bytes4(0xfa461e33), "v3");
+        require(HyparbExecutor.algebraSwapCallback.selector == bytes4(0x2c8958f6), "algebra");
+        require(HyparbExecutor.hyperswapV3SwapCallback.selector == bytes4(0xfa85398b), "hyperswap");
     }
 
     function test_usdt_style_tokens_pay_and_false_returning_tokens_revert() public {
