@@ -2612,6 +2612,15 @@ alloc gate cannot see, because it drives a test transport. UNVERIFIED:
 it needs an allocation count over a real TLS loopback before anyone
 moves the engine's TLS reader.
 
+**Measured since the HYPARB merge (2026-09-23).** HYPARB H9's bench
+gate 72 is that count: `HttpsPost` against a rustls loopback node, in a
+child process, allocates EXACTLY 2 per request — one per record sealed,
+one per application-data record decrypted (rustls 0.23's buffered API)
+— once `TlsTransport::read`'s `WouldBlock` stopped allocating (3 more
+per drain loop until then). Record: "HYPARB — slot 0" → "What H9 fixed
+on the write path". The move to the unbuffered API stays the
+operator's transport decision.
+
 Gate after the pass: `hits=32 baselined=32 new=0 paid=0` over the exec
 lane, `core-net` and `ingress-binance`. The baseline shrank by one (the
 old single-payload copy in `ws_frame.rs`, now the marked parts write)

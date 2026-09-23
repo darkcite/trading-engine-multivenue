@@ -60,8 +60,9 @@ alloc-assert:
 copy-audit:
 	# Offline, ~1 s. The zero-COPY gate beside the zero-ALLOCATION one
 	# (operator ruling 2026-09-19): every byte-copy verb in the exec lane,
-	# core-net and (since BX0) ingress-binance either carries a `// COPY:`
-	# justification within the eight lines above it, or is in
+	# core-net, (since BX0) ingress-binance and (since the HYPARB merge)
+	# the HYPARB crates either carries a `// COPY:` justification within
+	# the eight lines above it, or is in
 	# scripts/copy-audit-baseline.txt
 	# (pre-E1 legacy debt, may only shrink). A NEW unmarked copy fails.
 	# Judged by the `zero-copy-auditor` agent; this is the mechanical half.

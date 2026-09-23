@@ -141,8 +141,9 @@ in the script; `ai` = 48 is the floor every name includes).
   — fixed, and `scripts/copy-audit-selftest.sh` proves the reading
   first; bookTicker / markPrice parse IN PLACE (`&mut Frame` → `bool`);
   `core_net::ws_write_text_frame_parts` writes a frame from payload
-  parts. Open: core-net's rustls RX copy and a possible per-record
-  allocation in rustls' buffered API (`docs/risk-policy.md`, UNVERIFIED).
+  parts. Open: core-net's rustls RX copy and rustls' buffered-API
+  allocation per record (MEASURED since the HYPARB merge — bench gate
+  72, one per record each way; `docs/risk-policy.md`).
   In-place pass over the other seven ingress crates (okx, deribit,
   hyperliquid, mexc, bybit, polymarket, rpc; `docs/risk-policy.md` "the
   other ingress crates parse in place too"): 30 parsers fill in place,
@@ -151,25 +152,56 @@ in the script; `ai` = 48 is the floor every name includes).
   by-value push/pop, and these seven crates are not in `make copy-audit`
   (51 older unmarked copy verbs; the hot one, the WS Ping echo scratch,
   in six of them).
-- **Gates at HEAD (BX0 in-place pass over the other ingress crates,
-  2026-09-23):** nextest 2743 (3
-  skipped — the `#[ignore]`d `mexc_live_smoke` and `binance_md_live_smoke`
-  among them) · alloc 64/64 at 0 B/op ·
-  clippy clean · `make license-check` OK · `make copy-audit` new=0
-  (self-test OK; 32 baselined over the exec lane, core-net, ingress-binance) ·
-  worker pytest 1510 (3 skipped; `test_news_lanes::test_report_prints_the_funnel`
+- **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
+  (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
+  HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
+  `ingress-hyperevm`, `signer-evm`, `exec-hyperevm` and
+  `contracts/hyparb-executor/` (bytecode committed, reproduced by
+  `scripts/hyparb-executor-repro.sh`). PAPER only and in NO configured mask:
+  `strategy.conf` is untouched (O-H8), and the member boots only with
+  `--hyparb ~/multivenue/hyparb.toml` plus the pool ingress (`[hyperevm]
+  pools` in universe.toml, `--hyperevm-path` on `HYPEREVM_WS_HOST`) —
+  neither is in the live config; turning it on is the operator's mask
+  flip (plan §16.17, end). Slot 0 can NEVER be armed live
+  (`exec_boot::NEVER_LIVE_SLOTS`). Its one real write path is the
+  HyperEVM TESTNET shadow — chain 998 only, compile-time; `mode =
+  "testnet"` + `--evm-testnet` (+ `--evm-hybrid` for mainnet reads).
+  **DONE(H8) live** 2026-09-23 17:37Z (plan §16.16): the executor
+  `0x6c16…9cc5` on 998 is owned by wallet 0 (the HL TESTNET agent key's
+  address). Operator verbs: `scripts/evm-testnet.sh` (zsh — never `sh`)
+  `status|fund|deploy|mint|battery|shadow-smoke`, standalone, never
+  stopping the engine. Shared-code fixes it carries, live at the next
+  release build + restart: slot 3's `HlHttp` never reuses a keep-alive
+  the venue closed (H9c); `TlsTransport::read`'s `WouldBlock` stopped
+  allocating (3 per drain loop, every TLS socket); a wrapping chunk size
+  in `http1::walk_chunks` no longer aborts the process (every venue's
+  boot REST).
+- **Gates at HEAD (the HYPARB merge, 2026-09-23):** nextest 3014 (5
+  skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
+  and `hyperevm_live_smoke` among them) · alloc 72/72 at the gates' pins
+  (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
+  child helper) · clippy clean · `make license-check` OK · `make
+  copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
+  core-net, ingress-binance and the HYPARB crates) · Foundry 11 unit +
+  5 mainnet-fork (session sandbox; forge is not on this Mac) ·
+  worker pytest 1513 (5 skipped; `test_news_lanes::test_report_prints_the_funnel`
   is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
   (poisoned start) `okx_frame`, `deribit_{jsonrpc_frame,option_ticker,vol_index}`,
   `hl_{ws_frame,l2book,outcome_spec}`, `mexc_ws_frame`, `bybit_ws_frame`,
   `polymarket_clob_frame`, `rpc_{response,subscribe_envelope}`,
   `binance_{book_ticker,mark_price}` 60 s each clean; earlier: `hl_*` 3 × 300 s,
   `pb_scan`, `mexc_instruments`, `binance_eapi_mark_array` 300 s,
-  `binance_eapi`, `binance_exchange_info` 120 s clean · live smokes 60 s:
+  `binance_eapi`, `binance_exchange_info` 120 s clean; HYPARB (pre-merge)
+  `amm_tick_walk`, `amm_map_payload`, `hyperevm_decode`, `evm_rlp` 240 s,
+  `evm_exec_response` 540 s, `http1_response` 300 s clean; every fuzz bin
+  checks at the merge · live smokes 60 s:
   MEXC and Binance, 0 parse errors, 0 reconnects. Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
-  (red under parallel load, green alone), the worker's UDS-fixture
+  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`
+  and `guard_reports_zero_when_nothing_allocates` (bench, debug profile,
+  under full-workspace nextest load), the worker's UDS-fixture
   family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file`)
   — rerun in isolation before believing a red. `make py-lint` (ruff) is
   RED at HEAD and has been for weeks; `make lint` means clippy.
