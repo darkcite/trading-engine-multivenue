@@ -401,3 +401,20 @@ def test_pulled_run_records_the_manifest_it_was_verified_against(
     assert source._verified_sha(run_id) == expected
     block = source.provenance([run_id])
     assert block["runs"][0]["verified_sha256"] == expected
+
+
+def test_listed_venues_come_from_venue_totals_bybit_and_mexc_included() -> None:
+    """MX9: `venue_totals` is the engine's per-venue ARRAY; the per-day
+    `venue_ticks` of an older engine omits bybit and is never read."""
+    manifest = {
+        "catalog": {
+            "venue_totals": [
+                {"venue": "okx", "runs_present": 1, "ticks": 0, "bytes": 64},
+                {"venue": "bybit", "runs_present": 1, "ticks": 2, "bytes": 128},
+                {"venue": "mexc", "runs_present": 1, "ticks": 1, "bytes": 128},
+            ],
+            "days": [{"venue_ticks": [0, 0, 0, 0, 0, 0]}],
+        }
+    }
+    assert claude_worker.data_source._venues_from_catalog(manifest) == ("bybit", "mexc")
+    assert claude_worker.data_source._venues_from_catalog({"catalog": None}) == ()

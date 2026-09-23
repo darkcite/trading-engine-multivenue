@@ -8,9 +8,10 @@ and never in any engine path. It measures, from the host it runs on:
 * **feed delay** per venue stream: ``t_recv_local - venue_timestamp -
   clock_offset`` for every market-data message the venue stamps (Binance
   USDM bookTicker ``E``/``T``, Binance aggTrade ``E``/``T``, OKX ``ts``,
-  Bybit ``ts``/``cts``, Deribit ``timestamp``, Hyperliquid ``time``;
-  Binance SPOT bookTicker carries no timestamp and is recorded for
-  lead-lag only);
+  Bybit ``ts``/``cts``, Deribit ``timestamp``, Hyperliquid ``time``, MEXC
+  spot ``sendTime`` (inside a BINARY protobuf frame) and MEXC futures
+  ``ts``/``cts``; Binance SPOT bookTicker carries no timestamp and is
+  recorded for lead-lag only);
 * **order-path RTT** proxy per venue: TCP connect, TLS handshake and the
   steady-state request round trip on a kept-alive HTTPS connection to the
   venue's REST edge (the same edge an order would take);
@@ -75,7 +76,21 @@ _SOCKET_TIMEOUT_S = 30.0
 _PERCENTILES = (0.5, 0.9, 0.99)
 _FRAME_HEAD_BYTES = 2
 _STATUS_LINE_MIN_PARTS = 2
-
+# Protocol Buffers wire types (MEXC spot, the first binary feed here).
+_PB_VARINT = 0
+_PB_I64 = 1
+_PB_LEN = 2
+_PB_I32 = 5
+_PB_VARINT_MAX_BYTES = 10
+_PB_I64_BYTES = 8
+_PB_I32_BYTES = 4
+# MEXC spot `PushDataV3ApiWrapper` / `PublicAggreBookTickerV3Api` field
+# numbers (docs/mexc-ingress-plan.md §1.1; re-measured live 2026-09-23).
+_MEXC_PB_SEND_TIME = 6
+_MEXC_PB_BOOK_TICKER = 315
+_MEXC_PB_BID = 1
+_MEXC_PB_ASK = 3
+_MEXC_PB_VERSION = 5
 
 
 def _mono_raw_ns() -> int:
@@ -86,7 +101,7 @@ def _mono_raw_ns() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Minimal RFC 6455 client (text frames; ping/pong; continuation)
+# Minimal RFC 6455 client (text + binary messages; ping/pong; continuation)
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +154,7 @@ def decode_frame(buf: bytes) -> tuple[int, bool, bytes, int] | None:
 
 
 class WsClient:
-    """One TLS WebSocket connection. ``recv_text`` answers pings itself."""
+    """One TLS WebSocket connection. ``recv_message`` answers pings itself."""
 
     def __init__(self, url: str, timeout_s: float = _SOCKET_TIMEOUT_S) -> None:
         u = urllib.parse.urlsplit(url)
@@ -150,6 +165,9 @@ class WsClient:
         self.sock: ssl.SSLSocket | None = None
         self.buf = b""
         self.fragments: list[bytes] = []
+        # The opcode of the message being reassembled (continuation
+        # frames carry 0; the FIRST frame says text or binary).
+        self.msg_opcode = _OP_TEXT
         self.connect_ms = 0.0
         self.tls_ms = 0.0
 
@@ -189,8 +207,10 @@ class WsClient:
         assert self.sock is not None
         self.sock.sendall(encode_frame(opcode, payload, os.urandom(4)))
 
-    def recv_text(self) -> str | None:
-        """Next complete text message, or None on close."""
+    def recv_message(self) -> str | bytes | None:
+        """Next complete message — ``str`` for a text message, the raw
+        ``bytes`` of a binary one (MEXC spot pushes Protocol Buffers, which
+        a UTF-8 decode would destroy) — or None on close."""
         assert self.sock is not None
         while True:
             frame = decode_frame(self.buf)
@@ -207,10 +227,14 @@ class WsClient:
             elif opcode == _OP_CLOSE:
                 return None
             elif opcode in (_OP_TEXT, _OP_BIN, _OP_CONT):
+                if opcode != _OP_CONT:
+                    self.msg_opcode = opcode
                 self.fragments.append(payload)
                 if fin:
                     msg = b"".join(self.fragments)
                     self.fragments = []
+                    if self.msg_opcode == _OP_BIN:
+                        return msg
                     return msg.decode("utf-8", errors="replace")
 
     def close(self) -> None:
@@ -312,6 +336,95 @@ def parse_hyperliquid(text: str) -> list[dict]:
     return [_rec("l2Book", _f(d.get("time")), bid=bid, ask=ask)]
 
 
+def _pb_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    """One base-128 varint at ``pos`` -> (value, next pos). ValueError on
+    a truncated varint or one longer than protobuf's 10 bytes."""
+    value = 0
+    for i in range(_PB_VARINT_MAX_BYTES):
+        if pos + i >= len(buf):
+            raise ValueError("pb: truncated varint")
+        byte = buf[pos + i]
+        value |= (byte & 0x7F) << (7 * i)
+        if not byte & 0x80:  # no continuation bit: the last byte
+            return value, pos + i + 1
+    raise ValueError("pb: varint longer than 10 bytes")
+
+
+def pb_fields(buf: bytes) -> dict[int, int | bytes]:
+    """Order-agnostic forward walk of ONE protobuf message: field number
+    -> its last value (varint as ``int``, length-delimited as ``bytes``;
+    fixed 32/64-bit fields are skipped). proto3 permits any field order and
+    omits defaults, so nothing here is positional. ValueError on a
+    truncated field, field number 0, or a group (wire types 3/4)."""
+    out: dict[int, int | bytes] = {}
+    pos = 0
+    while pos < len(buf):
+        key, pos = _pb_varint(buf, pos)
+        field, wire = key >> 3, key & 0x7
+        if field == 0:
+            raise ValueError("pb: field number 0")
+        if wire == _PB_VARINT:
+            out[field], pos = _pb_varint(buf, pos)
+            continue
+        if wire == _PB_LEN:
+            size, pos = _pb_varint(buf, pos)
+            end = pos + size
+        elif wire == _PB_I64:
+            end = pos + _PB_I64_BYTES
+        elif wire == _PB_I32:
+            end = pos + _PB_I32_BYTES
+        else:
+            raise ValueError(f"pb: wire type {wire} refused")
+        if end > len(buf):
+            raise ValueError("pb: truncated field")
+        if wire == _PB_LEN:
+            out[field] = buf[pos:end]
+        pos = end
+    return out
+
+
+def _pb_ascii(value: int | bytes | None) -> str | None:
+    """A length-delimited field carrying an ASCII decimal (MEXC ships every
+    price as a string inside the protobuf)."""
+    return value.decode("ascii") if isinstance(value, bytes) else None
+
+
+def parse_mexc(msg: str | bytes) -> list[dict]:
+    """MEXC, both classes (MX7) — the probe's first BINARY parser.
+
+    Spot (``wbs-api.mexc.com/ws``) pushes protobuf in BINARY frames: the
+    ``PushDataV3ApiWrapper`` field 6 is ``sendTime`` (varint ms) and field
+    315 the aggregated bookTicker body, whose fields 1/3 are bid/ask as
+    ASCII decimals and 5 the book ``version``. Futures
+    (``contract.mexc.com/edge``) push JSON: ``push.depth.full`` carries the
+    envelope ``ts`` (send) and ``data.cts`` (the book's stamp) — the Bybit
+    ``ts``/``cts`` pair — with ``[price, volume, orderCount]`` rows. Both
+    shapes measured live 2026-09-23. Text frames that are neither (the spot
+    subscription ack, either pong, the futures ``rs.sub.*`` ack) yield
+    nothing."""
+    if isinstance(msg, bytes):
+        wrapper = pb_fields(msg)
+        body = wrapper.get(_MEXC_PB_BOOK_TICKER)
+        if not isinstance(body, bytes):
+            return []
+        send = wrapper.get(_MEXC_PB_SEND_TIME)
+        tick = pb_fields(body)
+        version = _pb_ascii(tick.get(_MEXC_PB_VERSION))
+        return [_rec("aggre.bookTicker", _f(send) if isinstance(send, int) else None,
+                     bid=_f(_pb_ascii(tick.get(_MEXC_PB_BID))),
+                     ask=_f(_pb_ascii(tick.get(_MEXC_PB_ASK))),
+                     seq=int(version) if version and version.isdigit() else None)]
+    m = json.loads(msg)
+    if not isinstance(m, dict) or m.get("channel") != "push.depth.full":
+        return []
+    d = m.get("data") or {}
+    bids = d.get("bids") or []
+    asks = d.get("asks") or []
+    return [_rec("depth.full", _f(m.get("ts")), _f(d.get("cts")),
+                 bid=_f(bids[0][0]) if bids else None, ask=_f(asks[0][0]) if asks else None,
+                 seq=d.get("version"))]
+
+
 # ---------------------------------------------------------------------------
 # Venue table (WS endpoints = the engine's; REST = the venue's public edge)
 # ---------------------------------------------------------------------------
@@ -323,7 +436,8 @@ class VenueSpec(typing.NamedTuple):
     subscribe: str | None
     keepalive: str | None
     keepalive_s: float
-    parse: typing.Callable[[str], list[dict]]
+    # A text message arrives as ``str``, a binary one as ``bytes`` (MEXC spot).
+    parse: typing.Callable[[str | bytes], list[dict]]
     rest_host: str
     rest_path: str
     rest_method: str
@@ -351,6 +465,13 @@ def _t_bybit(body: bytes) -> float | None:
 
 def _t_deribit(body: bytes) -> float | None:
     return _f(json.loads(body).get("result"))
+
+
+def _t_mexc(body: bytes) -> float | None:
+    """MEXC futures ``/api/v1/contract/ping`` -> ``{"success": true, "code":
+    0, "data": <ms>}`` (the spot host's ``/api/v3/time`` is the Binance
+    body and rides ``_t_binance``)."""
+    return _f(json.loads(body).get("data"))
 
 
 def _t_none(_body: bytes) -> float | None:
@@ -389,6 +510,18 @@ VENUES: tuple[VenueSpec, ...] = (
                           "subscription": {"type": "l2Book", "coin": "BTC"}}),
               json.dumps({"method": "ping"}), 45.0, parse_hyperliquid,
               "api.hyperliquid.xyz", "/info", "POST", json.dumps({"type": "meta"}), _t_none),
+    # MX7: MEXC splits spot and futures across different hosts on BOTH
+    # planes, so each class is its own row (one WS + one REST edge each).
+    VenueSpec("mexc", "wss://wbs-api.mexc.com/ws",
+              json.dumps({"method": "SUBSCRIPTION",
+                          "params": ["spot@public.aggre.bookTicker.v3.api.pb@10ms@BTCUSDT"]}),
+              json.dumps({"method": "PING"}), 20.0, parse_mexc,
+              "api.mexc.com", "/api/v3/time", "GET", None, _t_binance),
+    VenueSpec("mexc-perp", "wss://contract.mexc.com/edge",
+              json.dumps({"method": "sub.depth.full",
+                          "param": {"symbol": "BTC_USDT", "limit": 5}}),
+              json.dumps({"method": "ping"}), 20.0, parse_mexc,
+              "contract.mexc.com", "/api/v1/contract/ping", "GET", None, _t_mexc),
     VenueSpec("polymarket", "", None, None, 0.0, parse_hyperliquid,
               "clob.polymarket.com", "/time", "GET", None, _t_none),
 )
@@ -541,7 +674,7 @@ class Collector(threading.Thread):
         with open(self.path, "a", encoding="ascii") as f:
             while not self.stop.is_set():
                 try:
-                    text = ws.recv_text()
+                    text = ws.recv_message()
                 except TimeoutError:
                     text = ""
                 if text is None:

@@ -63,6 +63,9 @@ sources = [
   { name = "bybit-status", kind = "status-bybit", url = "https://api.bybit.com/v5/system/status", origin = "api.bybit.com", class = "A", venue = "bybit", poll_s = 60, weight = 1.0, enabled = 1 },
   { name = "kraken-status", kind = "status-kraken", url = "https://api.kraken.com/0/public/SystemStatus", origin = "api.kraken.com", class = "A", venue = "kraken", poll_s = 60, weight = 1.0, enabled = 1 },
   { name = "binance-ping", kind = "ping-binance", url = "https://api.binance.com/api/v3/ping", origin = "api.binance.com", class = "A", venue = "binance", poll_s = 60, weight = 1.0, enabled = 1 },
+  # MEXC (MX7) splits spot and futures across two hosts — one liveness source each.
+  { name = "mexc-ping", kind = "ping-mexc", url = "https://api.mexc.com/api/v3/ping", origin = "api.mexc.com", class = "A", venue = "mexc", poll_s = 60, weight = 1.0, enabled = 1 },
+  { name = "mexc-futures-ping", kind = "ping-mexc", url = "https://contract.mexc.com/api/v1/contract/ping", origin = "contract.mexc.com", class = "A", venue = "mexc", poll_s = 60, weight = 1.0, enabled = 1 },
 
   # ---- class A: calendars ----
   { name = "fed-calendar", kind = "calendar-fed", url = "https://www.federalreserve.gov/json/calendar.json", origin = "www.federalreserve.gov", class = "A", poll_s = 3600, weight = 1.0, enabled = 1 },
@@ -72,6 +75,13 @@ sources = [
   { name = "deribit-announcements", kind = "json-deribit-ann", url = "https://www.deribit.com/api/v2/public/get_announcements", origin = "www.deribit.com", class = "B", venue = "deribit", poll_s = 60, weight = 1.0, enabled = 1 },
   { name = "bybit-announcements", kind = "json-bybit-ann", url = "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=20", origin = "api.bybit.com", class = "B", venue = "bybit", poll_s = 60, weight = 1.0, enabled = 1 },
   { name = "binance-cms-listings", kind = "json-binance-cms", url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&catalogId=48&pageNo=1&pageSize=20", origin = "www.binance.com", class = "B", venue = "binance", poll_s = 120, weight = 1.0, enabled = 1 },
+  # MEXC (MX7, Q-MX7 — it lists and delists aggressively): the site's own keyless
+  # announcement backend, one section each. www.mexc.com answered 403 to every
+  # path from this network on 2026-09-23; www.mexc.co is MEXC's own domain (the
+  # .com pages name it) and answers the same API — resolved by hand that day.
+  { name = "mexc-delistings", kind = "json-mexc-ann", url = "https://www.mexc.co/help/announce/api/en-US/section/15425930840822/articles?page=1&perPage=20", origin = "www.mexc.co", class = "B", venue = "mexc", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "mexc-listings", kind = "json-mexc-ann", url = "https://www.mexc.co/help/announce/api/en-US/section/15425930840821/articles?page=1&perPage=20", origin = "www.mexc.co", class = "B", venue = "mexc", poll_s = 120, weight = 1.0, enabled = 1 },
+  { name = "mexc-maintenance", kind = "json-mexc-ann", url = "https://www.mexc.co/help/announce/api/en-US/section/15425930840826/articles?page=1&perPage=20", origin = "www.mexc.co", class = "B", venue = "mexc", poll_s = 300, weight = 1.0, enabled = 1 },
 
   # ---- class C: venue-origin blogs and status feeds (pass tier 0 unconditionally) ----
   { name = "deribit-insights", kind = "rss", url = "https://insights.deribit.com/feed/", origin = "insights.deribit.com", class = "C", venue = "deribit", poll_s = 300, weight = 1.0, enabled = 1 },

@@ -157,6 +157,13 @@ def test_frame_geometry_constants() -> None:
     )
 
 
+def test_venue_bytes_mirror_core_types_venue_id() -> None:
+    """The wire-stable `VenueId` bytes (core-types); MEXC is 7 (MX2/MX7)."""
+    f = claude_worker.frames
+    assert (f.VENUE_POLYMARKET, f.VENUE_BINANCE, f.VENUE_OKX, f.VENUE_DERIBIT) == (0, 1, 2, 3)
+    assert (f.VENUE_HYPERLIQUID, f.VENUE_AI, f.VENUE_BYBIT, f.VENUE_MEXC) == (4, 5, 6, 7)
+
+
 # ---- RG0: regime word helpers (core-types regime.rs mirror) ----
 
 

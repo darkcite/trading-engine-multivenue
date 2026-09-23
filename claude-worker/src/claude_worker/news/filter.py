@@ -65,6 +65,7 @@ VENUE_WORDS: tuple[str, ...] = (
     "deribit",
     "hyperliquid",
     "bybit",
+    "mexc",
     "polymarket",
     "kraken",
     "coinbase",

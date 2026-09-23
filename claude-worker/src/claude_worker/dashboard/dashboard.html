@@ -522,7 +522,7 @@ function renderRecent() {
   const R = E.recent;
   set('recent-sub', `${R.orders_total} orders · ${R.fills_total} fills since boot`);
   const oids = new Map(R.orders.map(o => [o.oid, o]));
-  const orders = R.orders.slice().reverse().slice(0, 20).map(o => [age(o.age_s), `<span style="color:${['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6'][o.slot] || 'inherit'}">${SLOT_NAMES[o.slot] || o.slot}</span>`, ['pm','bn','okx','deribit','hl','ai','bybit'][o.venue] || o.venue, o.sym, o.side ? 'ASK' : 'BID', px(o.px_1e6), px(o.qty_1e6), o.kind, o.ttl_ns !== '0' ? 'IoC' : '']);
+  const orders = R.orders.slice().reverse().slice(0, 20).map(o => [age(o.age_s), `<span style="color:${['#e2b13c','#8a93a6','#5b9cf5','#39c26c','#e25b4c','#c78cf5','#4cc3e2','#8a93a6'][o.slot] || 'inherit'}">${SLOT_NAMES[o.slot] || o.slot}</span>`, ['pm','bn','okx','deribit','hl','ai','bybit','mexc'][o.venue] || o.venue, o.sym, o.side ? 'ASK' : 'BID', px(o.px_1e6), px(o.qty_1e6), o.kind, o.ttl_ns !== '0' ? 'IoC' : '']);
   const fills = R.fills.slice().reverse().slice(0, 20).map(f => { const o = oids.get(f.oid); return [age(f.age_s), o ? (SLOT_NAMES[o.slot] || o.slot) : '<span class="dim">?</span>', f.sym, f.side ? 'ASK' : 'BID', px(f.px_1e6), px(f.qty_1e6), esc(f.oid)]; });
   set('recent', `<div class="muted">orders</div>` + table(['age','slot','venue','sym','side','px','qty','kind',''], orders, [3,5,6]) + `<div class="muted" style="margin-top:6px">fills</div>` + table(['age','slot','sym','side','px','qty','oid'], fills, [2,4,5]));
 }

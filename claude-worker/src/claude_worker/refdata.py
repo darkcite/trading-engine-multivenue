@@ -45,6 +45,12 @@ added Hyperliquid):
   ``GET /v5/market/tickers?category=…&symbol=S`` per target →
   ``turnover24h`` → ``vol24h_quote`` (quote units); linear bodies
   also carry ``openInterest`` → ``oi`` (base/contract units).
+- ``mexc`` (MX7): ``GET /api/v3/ticker/24hr?symbol=S`` on the spot
+  host — the Binance body (``quoteVolume``, quoted), measured
+  2026-09-23 — → ``vol24h_quote``.
+- ``mexc-perp`` (MX7): ONE ``GET /api/v1/contract/ticker?symbol=S`` on
+  the futures host → ``amount24`` → ``vol24h_quote`` (quote units) and
+  ``holdVol`` → ``oi`` (venue CONTRACTS).
 
 Values are stored in RAW VENUE UNITS — the consumer resolves
 semantics via ``(venue, descriptor, kind)`` exactly like the candle
@@ -257,6 +263,38 @@ def parse_bybit_ticker(raw: str) -> tuple[float | None, float | None] | None:
     return _float_field(row, "turnover24h"), _float_field(row, "openInterest")
 
 
+def parse_mexc_ticker(raw: str) -> tuple[float | None, float | None] | None:
+    """MX7: MEXC ``/api/v1/contract/ticker?symbol=S`` → ``(amount24,
+    holdVol)`` = (24 h quote turnover, open interest in contracts).
+    Shape measured live 2026-09-23 on ``XAU_USDT``: ``{"success": true,
+    "code": 0, "data": {"symbol", "lastPrice", "bid1", "ask1",
+    "volume24", "amount24", "holdVol", "fundingRate", "timestamp", …}}``
+    with BARE numbers (unlike every quoted venue above); ``data`` is an
+    object when ``symbol`` is given. ``None`` = unusable body (error
+    envelope ``{"success": false, "code": 1001, …}`` included)."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    body = typing.cast(dict[str, object], obj)
+    if body.get("success") is not True or body.get("code") != 0:
+        return None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return None
+    row = typing.cast(dict[str, object], data)
+
+    def num(key: str) -> float | None:
+        v = row.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v)
+
+    return num("amount24"), num("holdVol")
+
+
 def parse_deribit_book_summary(raw: str) -> tuple[float | None, float | None] | None:
     """``get_book_summary_by_instrument`` → ``(volume_usd,
     open_interest)`` from ``result[0]``. Either element may be absent
@@ -389,6 +427,36 @@ def _fetch_target(
             f"?category={category}&symbol={target.instrument}"
         )
         parsed = parse_bybit_ticker(raw) if raw is not None else None
+        if parsed is None:
+            return 0, True, False
+        vol, oi = parsed
+        if vol is not None:
+            upsert_snapshot(conn, target.venue, target.descriptor, KIND_VOL24H, now_ms, vol)
+            rows += 1
+        if oi is not None:
+            upsert_snapshot(conn, target.venue, target.descriptor, KIND_OI, now_ms, oi)
+            rows += 1
+        return rows, rows == 0, False
+    if lane.name == "mexc":
+        # MX7: the spot 24 h ticker is the Binance body on MEXC's host.
+        if not budget.try_acquire():
+            return 0, False, True
+        raw = http.get(
+            f"https://{http.hosts['mexc']}/api/v3/ticker/24hr?symbol={target.instrument}"
+        )
+        vol = parse_bn_ticker24h(raw) if raw is not None else None
+        if vol is None:
+            return 0, True, False
+        upsert_snapshot(conn, target.venue, target.descriptor, KIND_VOL24H, now_ms, vol)
+        return 1, False, False
+    if lane.name == "mexc-perp":
+        # MX7: one contract-ticker body carries vol AND OI.
+        if not budget.try_acquire():
+            return 0, False, True
+        raw = http.get(
+            f"https://{http.hosts['mexc-perp']}/api/v1/contract/ticker?symbol={target.instrument}"
+        )
+        parsed = parse_mexc_ticker(raw) if raw is not None else None
         if parsed is None:
             return 0, True, False
         vol, oi = parsed

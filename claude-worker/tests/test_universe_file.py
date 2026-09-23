@@ -133,6 +133,28 @@ def test_cex_sections_seed_descriptor_names(tmp_path: pathlib.Path) -> None:
     assert "hyperliquid:BTC" not in props
 
 
+def test_mexc_sections_seed_spot_from_1_and_perp_from_512(tmp_path: pathlib.Path) -> None:
+    """MX7: `[mexc] spot[i]` -> venue 7 ordinal i+1, `perp[j]` -> ordinal
+    MEXC_PERP_ORDINAL_BASE + j + 1 (the Binance spot/usdm split)."""
+    text = '[mexc]\nspot = ["BTCUSDT", "AAPLXUSDT"]\nperp = ["BTC_USDT", "XAU_USDT"]\n'
+    p = _write(tmp_path, text)
+    mx = claude_worker.frames.VENUE_MEXC
+    assert claude_worker.fetchers.MEXC_PERP_ORDINAL_BASE == 512
+    universe = {(mx << 24) | 1: mx, (mx << 24) | 2: mx, (mx << 24) | 513: mx, (mx << 24) | 514: mx}
+    props, _pairs, _lines = claude_worker.fetchers.universe_file_proposals(p, universe)
+    assert props == {
+        "mexc:BTCUSDT": (mx << 24) | 1,
+        "mexc:AAPLXUSDT": (mx << 24) | 2,
+        "mexc-perp:BTC_USDT": (mx << 24) | 513,
+        "mexc-perp:XAU_USDT": (mx << 24) | 514,
+    }
+    # Observed-only: an ordinal the capture never saw is not proposed.
+    props, _pairs, _lines = claude_worker.fetchers.universe_file_proposals(
+        p, {(mx << 24) | 513: mx}
+    )
+    assert props == {"mexc-perp:BTC_USDT": (mx << 24) | 513}
+
+
 def test_refresh_appends_and_dedupes_pairs(tmp_path: pathlib.Path) -> None:
     """Operator pairs stay first and verbatim; proposals append,
     duplicates collapse; re-runs are idempotent."""

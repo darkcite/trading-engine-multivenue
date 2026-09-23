@@ -36,6 +36,9 @@ LAW: list[tuple[str, int]] = [
     ("hyperliquid:#NVDA", P),
     ("bybit:BTCUSDT", P),
     ("bybit-linear:BTCUSDT", P | F),
+    ("mexc:BTCUSDT", P),
+    ("mexc-perp:BTC_USDT", P | F),
+    ("mexc-perp:XAU_USDT", P | F),
 ]
 
 

@@ -104,6 +104,13 @@ BN_FUT_REST_HOST_DEFAULT: str = "fapi.binance.com"
 # WS9: Bybit REST host (mirrors the engine's BYBIT_REST_HOST).
 BYBIT_REST_HOST_ENV: str = "BYBIT_REST_HOST"
 BYBIT_REST_HOST_DEFAULT: str = "api.bybit.com"
+# MX7: MEXC splits spot and futures across TWO REST hosts (mirrors the
+# engine's MEXC_REST_HOST / MEXC_FUT_REST_HOST) — two budgets, see
+# `budget_key`.
+MEXC_REST_HOST_ENV: str = "MEXC_REST_HOST"
+MEXC_REST_HOST_DEFAULT: str = "api.mexc.com"
+MEXC_FUT_REST_HOST_ENV: str = "MEXC_FUT_REST_HOST"
+MEXC_FUT_REST_HOST_DEFAULT: str = "contract.mexc.com"
 
 MS_1M: int = 60_000
 MS_1H: int = 3_600_000
@@ -473,6 +480,19 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
     ]
     if bybit_linear:
         lanes.append(Lane("bybit-linear", frames.VENUE_BYBIT, bybit_linear, backward=False))
+    # MX7: MEXC — one lane per class (different hosts AND endpoints);
+    # symbols stay in the venue's UPPERCASE form (`BTCUSDT` spot,
+    # `BTC_USDT` perp). xStocks / TradFi perps are ordinary rows.
+    mexc_spot = [
+        LaneTarget(frames.VENUE_MEXC, f"mexc:{s}", s) for s in str_list("mexc", "spot")
+    ]
+    if mexc_spot:
+        lanes.append(Lane("mexc", frames.VENUE_MEXC, mexc_spot, backward=False))
+    mexc_perp = [
+        LaneTarget(frames.VENUE_MEXC, f"mexc-perp:{s}", s) for s in str_list("mexc", "perp")
+    ]
+    if mexc_perp:
+        lanes.append(Lane("mexc-perp", frames.VENUE_MEXC, mexc_perp, backward=False))
     return lanes
 
 
@@ -495,6 +515,25 @@ BYBIT_PAGE_BARS: int = 1000
 # clamp a pre-listing start to their earliest bar, the Deribit/HL
 # pattern).
 BYBIT_1D_FLOOR_MS: int = 1_514_764_800_000  # 2018-01-01
+# MX7: MEXC interval grammars — measured live 2026-09-23. Spot has NO
+# `1h` (`{"msg":"Invalid interval.","code":-1121}`); its hour is `60m`.
+MEXC_SPOT_INTERVAL: dict[str, str] = {"1m": "1m", "1h": "60m", "1d": "1d"}
+MEXC_PERP_INTERVAL: dict[str, str] = {"1m": "Min1", "1h": "Min60", "1d": "Day1"}
+# Spot answers at most 500 rows (`limit=1000` is clamped) over the window
+# [startTime, startTime + 500 bars); perp answers the NEWEST ≤ 2000 bars
+# of [start, end], so a 1000-bar window always comes back whole.
+MEXC_SPOT_PAGE_BARS: int = 500
+MEXC_PERP_PAGE_BARS: int = 1000
+# MX7: 1d is BOUNDED, not floored (the §9.5 cheapness carve-out, like
+# OKX): both endpoints answer an EMPTY page for a window that ends before
+# the listing (measured 2026-09-23 — `BTC_USDT` Day1 2017→2020 is empty
+# columns, `BTCUSDT` 1d from 2015 is `[]`), and an empty page ends the
+# forward walk. A pre-launch floor therefore backfills nothing for any
+# symbol listed more than one page after it (`AAPLXUSDT`: 2025-07). One
+# page back from now always contains the listing or covers the bound.
+MEXC_1D_BOUND_D: int = 500
+#: The contract kline's columns this lane reads (time in SECONDS).
+_MEXC_PERP_COLUMNS: tuple[str, ...] = ("time", "open", "high", "low", "close", "vol")
 
 
 def parse_binance_klines(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int] | None:
@@ -594,6 +633,92 @@ def parse_bybit_kline(raw: str) -> tuple[list[claude_worker.fetchers.Candle], in
     return out, malformed
 
 
+def _mexc_perp_columns(raw: str) -> list[list[object]] | None:
+    """The contract kline's aligned columns (``_MEXC_PERP_COLUMNS``
+    order), or ``None`` for an error envelope / missing column / columns
+    of unequal length (they align by index — a mismatch leaves no row
+    identity)."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    body = typing.cast(dict[str, object], obj) if isinstance(obj, dict) else {}
+    data = body.get("data") if body.get("success") is True and body.get("code") == 0 else None
+    if not isinstance(data, dict):
+        return None
+    found = [typing.cast(dict[str, object], data).get(key) for key in _MEXC_PERP_COLUMNS]
+    if not all(isinstance(col, list) for col in found):
+        return None
+    cols = typing.cast(list[list[object]], found)
+    if any(len(col) != len(cols[0]) for col in cols):
+        return None
+    return cols
+
+
+def parse_mexc_kline(raw: str) -> tuple[list[claude_worker.fetchers.Candle], int] | None:
+    """MX7: strict parse of BOTH MEXC kline shapes (measured live
+    2026-09-23 on ``BTCUSDT`` / ``BTC_USDT``).
+
+    - spot ``/api/v3/klines`` answers a JSON ARRAY of rows ``[openMs,
+      "o", "h", "l", "c", "v", closeMs, "quoteVol"]`` — Binance's first
+      eight columns, so it rides ``parse_binance_klines`` unchanged;
+    - perp ``/api/v1/contract/kline/{sym}`` answers ``{"success": true,
+      "code": 0, "data": {"time": [s, …], "open": […], "close": […],
+      "high": […], "low": […], "vol": […], "amount": […], "realOpen":
+      …}}`` — COLUMNAR, times in SECONDS, bare numbers. ``vol`` is venue
+      CONTRACTS (raw venue units, the OKX-swap precedent); ``amount`` is
+      quote turnover and is not read.
+
+    ``None`` = unusable body (either venue's error envelope included);
+    a malformed perp CELL skips and counts its row — the index still
+    names its bar."""
+    if raw.lstrip().startswith("["):
+        return parse_binance_klines(raw)
+    cols = _mexc_perp_columns(raw)
+    if cols is None:
+        return None
+    out: list[claude_worker.fetchers.Candle] = []
+    malformed = 0
+    for i in range(len(cols[0])):
+        cells = [col[i] for col in cols]
+        if any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in cells):
+            malformed += 1
+            continue
+        ts_s = cells[0]
+        if not isinstance(ts_s, int) or ts_s < 0:
+            malformed += 1
+            continue
+        o, h, low, c, v = (float(typing.cast(float, x)) for x in cells[1:])
+        out.append(
+            claude_worker.fetchers.Candle(
+                ts_ms=ts_s * 1000, open=o, high=h, low=low, close=c, volume=v
+            )
+        )
+    out.sort(key=lambda candle: candle.ts_ms)
+    return out, malformed
+
+
+def _mexc_url(host: str, lane_name: str, symbol: str, tf: str, start_ms: int) -> str:
+    """MX7: one forward page ``[start, start + page]`` for either MEXC
+    lane. Both endpoints need an explicit END — without ``endTime`` spot
+    ignores ``startTime`` and answers the newest 500 bars — and both
+    accept an end in the future, answering up to the open bar (measured
+    2026-09-23). Spot's end is exclusive and ms; perp's is inclusive and
+    SECONDS."""
+    tf_ms = FETCHED_TFS[tf]
+    if lane_name == "mexc":
+        end_ms = start_ms + MEXC_SPOT_PAGE_BARS * tf_ms
+        return (
+            f"https://{host}/api/v3/klines?symbol={symbol}&interval={MEXC_SPOT_INTERVAL[tf]}"
+            f"&startTime={start_ms}&endTime={end_ms}&limit={MEXC_SPOT_PAGE_BARS}"
+        )
+    end_ms = start_ms + MEXC_PERP_PAGE_BARS * tf_ms
+    return (
+        f"https://{host}/api/v1/contract/kline/{symbol}?interval={MEXC_PERP_INTERVAL[tf]}"
+        f"&start={start_ms // 1000}&end={end_ms // 1000}"
+    )
+
+
 def _bybit_url(host: str, category: str, symbol: str, tf: str, start_ms: int) -> str:
     return (
         f"https://{host}/v5/market/kline?category={category}&symbol={symbol}"
@@ -665,6 +790,13 @@ def _fetch_forward_page(
             return None
         parsed_bb = parse_bybit_kline(raw)
         return None if parsed_bb is None else parsed_bb[0]
+    if lane.name in ("mexc", "mexc-perp"):
+        # MX7: forward-paged; each class owns its host AND endpoint.
+        raw = http.get(_mexc_url(http.hosts[lane.name], lane.name, target.instrument, tf, lo_ms))
+        if raw is None:
+            return None
+        parsed_mx = parse_mexc_kline(raw)
+        return None if parsed_mx is None else parsed_mx[0]
     if lane.name == "hyperliquid":
         end = min(now_ms, lo_ms + HL_PAGE_BARS * tf_ms)
         body = json.dumps(
@@ -706,6 +838,8 @@ def backfill_start_ms(tf: str, now_ms: int, lane_name: str, env: collections.abc
         return HL_1D_FLOOR_MS
     if lane_name in ("bybit", "bybit-linear"):
         return BYBIT_1D_FLOOR_MS  # WS9: pre-launch floor (untested vs start=0)
+    if lane_name in ("mexc", "mexc-perp"):
+        return now_ms - MEXC_1D_BOUND_D * MS_1D  # MX7: bounded, see MEXC_1D_BOUND_D
     return 0  # Binance: startTime=0 = true listing lifetime (proven)
 
 
@@ -1169,7 +1303,8 @@ def budget_key(lane_name: str) -> str:
     and that is the pool a budget models. The two bybit categories
     share ``api.bybit.com``; every other lane owns its host (binance
     spot ``api.`` vs usdm ``fapi.`` are DIFFERENT hosts with
-    independent limits — see run_cycle's VM2 V6 note)."""
+    independent limits — see run_cycle's VM2 V6 note — and so are
+    MEXC spot ``api.mexc.com`` vs perp ``contract.mexc.com``, MX7)."""
     return "bybit" if lane_name.startswith("bybit") else lane_name
 
 
@@ -1267,6 +1402,8 @@ def make_http(client: httpx.Client, env: collections.abc.Mapping[str, str]) -> H
         "binance": env.get(BN_REST_HOST_ENV, "") or BN_REST_HOST_DEFAULT,
         "binance-usdm": env.get(BN_FUT_REST_HOST_ENV, "") or BN_FUT_REST_HOST_DEFAULT,
         "bybit": env.get(BYBIT_REST_HOST_ENV, "") or BYBIT_REST_HOST_DEFAULT,
+        "mexc": env.get(MEXC_REST_HOST_ENV, "") or MEXC_REST_HOST_DEFAULT,
+        "mexc-perp": env.get(MEXC_FUT_REST_HOST_ENV, "") or MEXC_FUT_REST_HOST_DEFAULT,
         "okx": env.get(claude_worker.fetchers.OKX_REST_HOST_ENV, "")
         or claude_worker.fetchers.OKX_REST_HOST_DEFAULT,
         "deribit": env.get(claude_worker.fetchers.DERIBIT_REST_HOST_ENV, "")

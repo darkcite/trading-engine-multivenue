@@ -61,6 +61,7 @@ KINDS: tuple[str, ...] = (
     "json-deribit-ann",
     "json-bybit-ann",
     "json-binance-cms",
+    "json-mexc-ann",
     "instruments-bn-usdm",
     "instruments-okx",
     "instruments-deribit",
@@ -70,6 +71,7 @@ KINDS: tuple[str, ...] = (
     "status-bybit",
     "status-kraken",
     "ping-binance",
+    "ping-mexc",
     "calendar-fed",
     "json-4chan-catalog",
     "series-bn-ls",
@@ -96,6 +98,7 @@ VENUES: tuple[str, ...] = (
     "deribit",
     "bybit",
     "binance",
+    "mexc",
     "coinbase",
     "kraken",
     "hyperliquid",
@@ -170,6 +173,8 @@ _TAG_RE: typing.Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 _URL_RE: typing.Final[re.Pattern[str]] = re.compile(r"https?://\S+")
 _WS_RE: typing.Final[re.Pattern[str]] = re.compile(r"\s+")
 _GDELT_TS_FMT: str = "%Y%m%dT%H%M%SZ"
+#: MEXC's announcement rows stamp ``createdAt`` as ISO-8601 UTC, whole seconds.
+_MEXC_TS_FMT: str = "%Y-%m-%dT%H:%M:%SZ"
 #: Some publishers serve a UTF-8 BOM ahead of the document (measured
 #: 2026-09-19 on www.federalreserve.gov/json/calendar.json). ``json.loads``
 #: refuses it outright and ElementTree chokes on it, so it is stripped once
@@ -920,11 +925,13 @@ def _parse_google_news(source: Source, payload: str, fetched_ts: int, cap: int) 
 # -- gdelt ------------------------------------------------------------------
 
 
-def _gdelt_ts(raw: object) -> int:
+def _utc_ts(raw: object, fmt: str) -> int:
+    """A UTC wall-clock stamp in ``fmt`` -> epoch seconds; 0 when absent or
+    malformed (never a crash — the item keeps its other fields)."""
     if not isinstance(raw, str) or not raw:
         return 0
     try:
-        stamp = datetime.datetime.strptime(raw, _GDELT_TS_FMT)
+        stamp = datetime.datetime.strptime(raw, fmt)
     except ValueError:
         return 0
     return int(stamp.replace(tzinfo=datetime.UTC).timestamp())
@@ -943,7 +950,7 @@ def _parse_gdelt(source: Source, payload: str, fetched_ts: int, cap: int) -> Par
             _mk(
                 source,
                 guid=url,
-                ts=_gdelt_ts(row.get("seendate")),
+                ts=_utc_ts(row.get("seendate"), _GDELT_TS_FMT),
                 title=str(row.get("title", "")),
                 link=url,
                 text=str(row.get("title", "")),
@@ -1117,6 +1124,54 @@ def _parse_binance_cms(source: Source, payload: str, fetched_ts: int, cap: int) 
     return Parsed(items, None, [])
 
 
+#: MEXC's announcement sections, keyed by the ``sectionId`` every row states
+#: about itself (MX7, read off the site's own section list 2026-09-23 —
+#: www.mexc.co/announcements/all). Every other section is ``other``.
+_MEXC_ANN_HINTS: dict[str, str] = {
+    "15425930840821": "listing",  # New Listings
+    "15425930840822": "delisting",  # Delistings
+    "15425930840826": "maintenance",  # Maintenance Updates
+}
+
+
+def _parse_mexc_ann(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
+    """MEXC announcements (MX7, Q-MX7 — the venue lists and delists
+    aggressively, plan R10). The site's keyless GET backend
+    ``/help/announce/api/en-US/section/<sectionId>/articles?page=1&perPage=N``
+    answers ``{"data": {"results": [{"id", "title", "sectionId",
+    "createdAt": "2026-09-23T03:27:16Z", "updateTime", "routerUrl", …}],
+    "count", "page", "perPage", "pageCount"}, "code": 0, "msg": "success"}``
+    (measured live 2026-09-23 on www.mexc.co; www.mexc.com answers 403 to
+    every path from the operator's network). The list carries no body, so
+    the text is the title; the link is the article's ``/announcements/<id>``
+    route on the source's own origin (a 308 to the article, measured)."""
+    del fetched_ts
+    rows = _dicts(_at(_obj(payload), "data", "results"))
+    items: list[Item] = []
+    for i in range(len(rows)):
+        row = rows[i]
+        ident = row.get("id")
+        if ident is None:
+            continue
+        title = str(row.get("title", ""))
+        items.append(
+            _mk(
+                source,
+                guid=str(ident),
+                ts=_utc_ts(row.get("createdAt"), _MEXC_TS_FMT)
+                or _utc_ts(row.get("updateTime"), _MEXC_TS_FMT),
+                title=title,
+                link=f"https://{source.origin}/announcements/{ident}",
+                text=title,
+                cap=cap,
+                hint=_MEXC_ANN_HINTS.get(str(row.get("sectionId", "")), HINT_OTHER),
+            )
+        )
+    if not items:
+        raise ValueError("mexc announcements: no results")
+    return Parsed(items, None, [])
+
+
 # -- class A: instrument sets -----------------------------------------------
 
 
@@ -1263,6 +1318,21 @@ def _parse_ping_binance(source: Source, payload: str, fetched_ts: int, cap: int)
         raise ValueError("binance ping: non-empty body")
     # Liveness only — but it must be a NON-empty Parsed, because an empty
     # Parsed is this module's "shape deviation" signal (§5.2).
+    return Parsed([], _snapshot(source, fetched_ts, {"ok": 1}), [])
+
+
+def _parse_ping_mexc(source: Source, payload: str, fetched_ts: int, cap: int) -> Parsed:
+    """MEXC liveness, either host (MX7, both bodies measured live
+    2026-09-23): spot ``api.mexc.com/api/v3/ping`` answers ``{}`` (the
+    Binance body), futures ``contract.mexc.com/api/v1/contract/ping``
+    answers ``{"success": true, "code": 0, "data": <server ms>}``. Anything
+    else is an error envelope. The server time is deliberately NOT kept: a
+    body carrying it would hash fresh on every poll (the kraken-status
+    lesson) — liveness IS the state."""
+    del cap
+    doc = _obj(payload)
+    if doc and (doc.get("success") is not True or doc.get("code") != 0):
+        raise ValueError("mexc ping: error envelope")
     return Parsed([], _snapshot(source, fetched_ts, {"ok": 1}), [])
 
 
@@ -1512,6 +1582,7 @@ PARSERS: dict[str, _Parser] = {
     "json-deribit-ann": _parse_deribit_ann,
     "json-bybit-ann": _parse_bybit_ann,
     "json-binance-cms": _parse_binance_cms,
+    "json-mexc-ann": _parse_mexc_ann,
     "instruments-bn-usdm": _parse_instruments_bn_usdm,
     "instruments-okx": _parse_instruments_okx,
     "instruments-deribit": _parse_instruments_deribit,
@@ -1521,6 +1592,7 @@ PARSERS: dict[str, _Parser] = {
     "status-bybit": _parse_status_bybit,
     "status-kraken": _parse_status_kraken,
     "ping-binance": _parse_ping_binance,
+    "ping-mexc": _parse_ping_mexc,
     "calendar-fed": _parse_calendar_fed,
     "json-4chan-catalog": _parse_4chan,
     "series-bn-ls": _parse_binance_series,
@@ -1630,6 +1702,9 @@ _REDUCTIONS: dict[str, _Reduction] = {
         (("data", "catalogs", 0, "articles"), ("data", "articles")),
         ("title", "code", "releaseDate"),
     ),
+    "json-mexc-ann": _Reduction(
+        "list", (("data", "results"),), ("id", "title", "sectionId", "createdAt", "updateTime")
+    ),
     "instruments-bn-usdm": _Reduction("list", (("symbols",),), ("symbol", *_BN_USDM_KEYS)),
     "instruments-okx": _Reduction("list", (("data",),), ("instId", *_OKX_INST_KEYS)),
     "instruments-deribit": _Reduction(
@@ -1643,6 +1718,7 @@ _REDUCTIONS: dict[str, _Reduction] = {
     "status-bybit": _Reduction("list", (("result", "list"),), _STATUS_BYBIT_KEYS),
     "status-kraken": _Reduction("object", (("result",),), ("status", "timestamp")),
     "ping-binance": _Reduction("object", ((),), ()),
+    "ping-mexc": _Reduction("object", ((),), ("success", "code")),
     "calendar-fed": _Reduction("list", (("events",), ("mtgs",), ()), _FED_EVENT_KEYS),
     "json-4chan-catalog": _Reduction(
         "list", ((0, "threads"),), ("no", "sub", "com", "time", "replies")

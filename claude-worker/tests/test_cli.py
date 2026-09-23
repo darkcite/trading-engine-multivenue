@@ -251,6 +251,35 @@ def test_push_order_intent_accepts_bybit_venue(
     assert uds_env.cmd_field(1, "strategy_id") == claude_worker.frames.STRATEGY_SLOT_AI_EXEC
 
 
+def test_push_order_intent_accepts_mexc_venue(
+    uds_env: tests.conftest.FakeUdsServer,
+) -> None:
+    """MX7 (plan §3, `cli.py` row): "mexc" joins the push verb's venue
+    table as VenueId 7, the WS9 bybit shape; data-only (O-MX1) — the
+    engine has no MEXC fill lane."""
+    result = _invoke(
+        "push",
+        "--kind",
+        "order-intent",
+        "--sym",
+        str((claude_worker.frames.VENUE_MEXC << 24) | 513),
+        "--venue",
+        "mexc",
+        "--side",
+        "bid",
+        "--px",
+        "4332.05",
+        "--qty",
+        "1",
+        "--ttl-s",
+        "5",
+    )
+    assert result.exit_code == 0, result.output
+    _wait_for_frames(uds_env, 2)
+    assert uds_env.cmd_field(1, "kind") == claude_worker.frames.KIND_ORDER_INTENT
+    assert uds_env.cmd_field(1, "venue") == claude_worker.frames.VENUE_MEXC
+
+
 def test_push_set_param_and_halt(uds_env: tests.conftest.FakeUdsServer) -> None:
     result = _invoke(
         "push", "--kind", "set-param", "--strategy", "1", "--param-id", "3", "--px", "0.5"

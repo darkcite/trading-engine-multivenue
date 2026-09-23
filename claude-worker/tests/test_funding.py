@@ -30,6 +30,7 @@ def hosts() -> dict[str, str]:
         "deribit": "dbt.test",
         "hyperliquid": "hl.test",
         "bybit": "bybit.test",
+        "mexc-perp": "mxf.test",
     }
 
 
@@ -65,7 +66,8 @@ def test_funding_lanes_select_only_funding_bearing(tmp_path: pathlib.Path) -> No
         "[okx]\ninstruments=[\"BTC-USDT\",\"ETH-USDT-SWAP\"]\n"
         "[deribit]\ninstruments=[\"BTC-PERPETUAL\",\"BTC_USDC\"]\n"
         "[hyperliquid]\ncoins=[\"BTC\",\"@1\",\"#330\"]\n"
-        "[bybit]\nspot=[\"BTCUSDT\"]\nlinear=[\"ETHUSDT\"]\n",
+        "[bybit]\nspot=[\"BTCUSDT\"]\nlinear=[\"ETHUSDT\"]\n"
+        "[mexc]\nspot=[\"BTCUSDT\",\"AAPLXUSDT\"]\nperp=[\"BTC_USDT\",\"XAU_USDT\"]\n",
         encoding="utf-8",
     )
     lanes = claude_worker.funding.read_funding_lanes(p)
@@ -77,6 +79,7 @@ def test_funding_lanes_select_only_funding_bearing(tmp_path: pathlib.Path) -> No
         "deribit": ["BTC-PERPETUAL"],  # spot name excluded
         "hyperliquid": ["BTC"],  # @spot/#outcome excluded
         "bybit-linear": ["ETHUSDT"],  # bybit spot lane never appears
+        "mexc-perp": ["BTC_USDT", "XAU_USDT"],  # every perp row; mexc spot never appears
     }
     # Descriptors keep the §9.4 namespaces.
     lane = next(x for x in lanes if x.name == "binance-usdm")
@@ -128,8 +131,78 @@ def test_parsers_cover_all_five_wire_shapes() -> None:
         claude_worker.funding.parse_deribit_funding,
         claude_worker.funding.parse_hl_funding,
         claude_worker.funding.parse_bybit_funding,
+        claude_worker.funding.parse_mexc_funding,
     ):
         assert parse("junk") is None
+
+
+#: MX7, measured live 2026-09-23: `GET contract.mexc.com/api/v1/contract/
+#: funding_rate/history?symbol=…&page_num=1&page_size=3` — newest first, bare
+#: numbers. XAU_USDT settles every FOUR hours (collectCycle 4), BTC_USDT every 8.
+MEXC_FUNDING_BTC = (
+    '{"success":true,"code":0,"data":{"pageSize":3,"totalCount":1619,"totalPage":540,'
+    '"currentPage":1,"resultList":[{"symbol":"BTC_USDT","fundingRate":0.000009,'
+    '"settleTime":1790121600000,"collectCycle":8},{"symbol":"BTC_USDT","fundingRate":0.000029,'
+    '"settleTime":1790092800000,"collectCycle":8},{"symbol":"BTC_USDT","fundingRate":0.0001,'
+    '"settleTime":1790064000000,"collectCycle":8}]}}'
+)
+MEXC_FUNDING_XAU = (
+    '{"success":true,"code":0,"data":{"pageSize":3,"totalCount":714,"totalPage":238,'
+    '"currentPage":1,"resultList":[{"symbol":"XAU_USDT","fundingRate":0.000041,'
+    '"settleTime":1790136000000,"collectCycle":4},{"symbol":"XAU_USDT","fundingRate":0.000047,'
+    '"settleTime":1790121600000,"collectCycle":4},{"symbol":"XAU_USDT","fundingRate":0.000087,'
+    '"settleTime":1790107200000,"collectCycle":4}]}}'
+)
+
+
+def test_parse_mexc_funding_live_shapes_and_failures() -> None:
+    parse = claude_worker.funding.parse_mexc_funding
+    assert parse(MEXC_FUNDING_BTC) == [
+        (1_790_121_600_000, 0.000009),
+        (1_790_092_800_000, 0.000029),
+        (1_790_064_000_000, 0.0001),
+    ]
+    xau = parse(MEXC_FUNDING_XAU)
+    assert xau is not None
+    # The cadence is per SYMBOL: gold settles 4 h apart, and the table
+    # stores the prints as settled — no 8 h assumption anywhere.
+    assert [xau[i][0] - xau[i + 1][0] for i in range(len(xau) - 1)] == [14_400_000, 14_400_000]
+    # An unknown symbol is a SUCCESS with an empty list (measured).
+    unknown = (
+        '{"success":true,"code":0,"data":{"pageSize":3,"totalCount":0,"totalPage":0,'
+        '"currentPage":1,"resultList":[]}}'
+    )
+    assert parse(unknown) == []
+    assert parse('{"success":false,"code":1001,"message":"Contract does not exist"}') is None
+    assert parse('{"success":true,"code":0,"data":{}}') is None
+    # Quoted or boolean fields skip their row, never the body.
+    doc = json.loads(MEXC_FUNDING_BTC)
+    rows = doc["data"]["resultList"]
+    rows[0]["fundingRate"] = "0.1"
+    rows[1]["settleTime"] = True
+    assert parse(json.dumps(doc)) == [(1_790_064_000_000, 0.0001)]
+
+
+def test_cycle_mexc_perp_reads_the_futures_host(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    target = claude_worker.funding.FundingTarget(
+        claude_worker.frames.VENUE_MEXC, "mexc-perp:XAU_USDT", "XAU_USDT"
+    )
+    lanes = [
+        claude_worker.funding.FundingLane("mexc-perp", claude_worker.frames.VENUE_MEXC, [target])
+    ]
+    url = (
+        "https://mxf.test/api/v1/contract/funding_rate/history"
+        "?symbol=XAU_USDT&page_num=1&page_size=1000"
+    )
+    http, calls = http_map({url: MEXC_FUNDING_XAU})
+    lines: list[str] = []
+    claude_worker.funding.run_cycle(conn, lanes, http, NOW, 30, lines.append)
+    assert calls == [url]
+    rows = all_rows(conn)
+    assert [r[2] for r in rows] == [1_790_107_200_000, 1_790_121_600_000, 1_790_136_000_000]
+    assert {r[0] for r in rows} == {claude_worker.frames.VENUE_MEXC}
+    assert any("mexc-perp: targets=1 points=3 +3 failed=0" in line for line in lines)
 
 
 # ---- store + cycle -------------------------------------------------------

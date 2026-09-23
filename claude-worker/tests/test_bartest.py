@@ -68,6 +68,8 @@ def test_venue_slot_mapping_and_unknown_descriptor():
     assert claude_worker.bartest.venue_of("hyperliquid:BTC") == "hl"
     assert claude_worker.bartest.venue_of("binance-usdm:btcusdt") == "bn"
     assert claude_worker.bartest.venue_of("bybit-linear:BTCUSDT") == "bybit"
+    assert claude_worker.bartest.venue_of("mexc:AAPLXUSDT") == "mexc"
+    assert claude_worker.bartest.venue_of("mexc-perp:XAU_USDT") == "mexc"
     with pytest.raises(claude_worker.bartest.BartestError):
         claude_worker.bartest.venue_of("kraken:BTCUSD")
 

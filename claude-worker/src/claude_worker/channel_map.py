@@ -77,7 +77,9 @@ def caps_of_descriptor(desc: str) -> int:
         return CAP_PRICE | CAP_DEPTH
     if venue == "binance-usdm":
         return CAP_PRICE | CAP_FUNDING
-    if venue == "bybit-linear":
+    if venue in ("bybit-linear", "mexc-perp"):
+        # MX7: every `[mexc] perp` row is a perpetual; `mexc` spot takes
+        # the CAP_PRICE default below (the bybit-spot shape).
         return CAP_PRICE | CAP_FUNDING
     if venue == "hyperliquid":
         if name.startswith("#"):

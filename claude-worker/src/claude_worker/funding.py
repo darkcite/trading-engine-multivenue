@@ -20,12 +20,27 @@ Funding-bearing selection (the class laws from the engine side):
   ``PERPETUAL``; spot/dated carry no funding — WS3/WS6 laws).
 - ``[hyperliquid] coins``       → perp coins only (no ``@``/``#``).
 - ``[bybit] linear``            → ``bybit-linear:<sym>`` (WS9).
+- ``[mexc] perp``               → ``mexc-perp:<sym>`` (MX7) — every row
+  of that key is a perpetual (crypto, xStocks-underlying, TradFi alike);
+  ``[mexc] spot`` carries no funding.
 
 Depth per cycle = ONE newest page per instrument (venue page sizes:
 BN 1000 pts ≈ 333 d · OKX 100 ≈ 33 d · Deribit range query 30 d ·
-HL since ``now − 33 d`` · Bybit 200 ≈ 66 d) — an immediately useful
-1–11 month history that stays current under any repeat cadence.
+HL since ``now − 33 d`` · Bybit 200 ≈ 66 d · MEXC 1000 ≈ 333 d at 8 h,
+166 d at 4 h) — an immediately useful 1–11 month history that stays
+current under any repeat cadence.
 Deeper pagination is a recorded extension, not v1.
+
+MEXC funding law (MX7, measured live 2026-09-23): the settlement
+cadence is PER SYMBOL, not per venue — ``collectCycle`` is 8 (hours) on
+``BTC_USDT`` / ``AAPLSTOCK_USDT`` / ``SPY_USDT`` but 4 on ``XAU_USDT`` /
+``EUR_USDT``, so an 8 h assumption is wrong for part of the TradFi
+plane. ``/api/v1/contract/funding_rate/history`` is the AUTHORITY: every
+row is one settled print at its own ``settleTime``, whatever the
+cadence, and that is all this table stores. The engine's live
+``Funding`` event (``push.ticker`` rate + a next-settlement ``v1``
+seeded from REST and advanced by the cycle) is DERIVED and never read
+back here.
 
 Best-effort discipline throughout: transport failure / unusable
 body = counted + skipped, never a crash; injectable
@@ -55,6 +70,9 @@ BUDGET_PER_H_DEFAULT: int = 30
 MS_1D: int = 86_400_000
 DERIBIT_RANGE_D: int = 30
 HL_RANGE_D: int = 33
+#: MX7: the history endpoint's page cap (``page_size=2000`` answers 1000,
+#: measured 2026-09-23); newest settlement first.
+MEXC_FUNDING_PAGE: int = 1000
 
 _SCHEMA: str = """
 CREATE TABLE IF NOT EXISTS funding (
@@ -125,6 +143,10 @@ def read_funding_lanes(universe_path: pathlib.Path) -> list[FundingLane] | None:
                 if not t.instrument.startswith("@") and not t.instrument.startswith("#")
             ]
         elif lane.name == "bybit-linear":
+            targets = [
+                FundingTarget(t.venue, t.descriptor, t.instrument) for t in lane.targets
+            ]
+        elif lane.name == "mexc-perp":
             targets = [
                 FundingTarget(t.venue, t.descriptor, t.instrument) for t in lane.targets
             ]
@@ -276,6 +298,45 @@ def parse_bybit_funding(raw: str) -> list[tuple[int, float]] | None:
     return out
 
 
+def parse_mexc_funding(raw: str) -> list[tuple[int, float]] | None:
+    """MX7: ``/api/v1/contract/funding_rate/history`` → ``[(settleTime
+    ms, rate)]``. Shape measured live 2026-09-23: ``{"success": true,
+    "code": 0, "data": {"pageSize", "totalCount", "totalPage",
+    "currentPage", "resultList": [{"symbol", "fundingRate": <number>,
+    "settleTime": <ms>, "collectCycle": <h>}]}}``, newest first — both
+    fields are BARE numbers. An unknown symbol answers ``success`` with
+    an empty ``resultList`` (``[]``, not ``None``). ``None`` = unusable
+    body (error envelope included)."""
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    body = typing.cast(dict[str, object], obj)
+    if body.get("success") is not True or body.get("code") != 0:
+        return None
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return None
+    rows = typing.cast(dict[str, object], data).get("resultList")
+    if not isinstance(rows, list):
+        return None
+    out: list[tuple[int, float]] = []
+    for row in typing.cast(list[object], rows):
+        if not isinstance(row, dict):
+            continue
+        d = typing.cast(dict[str, object], row)
+        ts = d.get("settleTime")
+        rate = d.get("fundingRate")
+        if isinstance(ts, bool) or not isinstance(ts, int):
+            continue
+        if isinstance(rate, bool) or not isinstance(rate, (int, float)):
+            continue
+        out.append((ts, float(rate)))
+    return out
+
+
 # ---- fetch + store -------------------------------------------------------
 
 
@@ -351,6 +412,12 @@ def _fetch_points(
             f"?category=linear&symbol={target.instrument}&limit=200"
         )
         return parse_bybit_funding(raw) if raw is not None else None
+    if lane.name == "mexc-perp":
+        raw = http.get(
+            f"https://{http.hosts['mexc-perp']}/api/v1/contract/funding_rate/history"
+            f"?symbol={target.instrument}&page_num=1&page_size={MEXC_FUNDING_PAGE}"
+        )
+        return parse_mexc_funding(raw) if raw is not None else None
     raise ValueError(f"funding: no fetcher for lane {lane.name}")
 
 

@@ -434,6 +434,9 @@ _VENUES: dict[str, int] = {
     # already accepts it (AiCmd shape law: OrderIntent takes any
     # VenueId except Ai; VenueId 6 = Bybit since WS9).
     "bybit": claude_worker.frames.VENUE_BYBIT,
+    # MX7 (docs/mexc-ingress-plan.md §3): VenueId 7 = MEXC, addressable
+    # the same way; data-only (O-MX1) — the engine has no MEXC fill lane.
+    "mexc": claude_worker.frames.VENUE_MEXC,
 }
 _SIDES: dict[str, int] = {
     "bid": claude_worker.frames.SIDE_BID,
