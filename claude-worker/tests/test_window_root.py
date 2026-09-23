@@ -89,6 +89,33 @@ def test_torn_trailing_slot_is_dropped(tmp_path):
     assert [t.ts_ns for t in r.ticks()] == [1_000, 2_000, 3_000]
 
 
+def test_run_span_skips_files_whose_header_never_landed(tmp_path):
+    """A boot that dies between creating a capture file and writing its 64-byte
+    header leaves a 0-byte (or torn) file. It holds no slot, so it must not stop
+    every SWEEP that asks a run for its span — the archive push (the 2026-09-22
+    cycle aborted on a 0-byte `okx-events.pmlr` and stranded every run behind
+    it), the window pools, the pnl-report windowing. `run_pmlr_version`'s law."""
+    run = _mk_run(tmp_path, [1_000, 3 * 3600 * S])
+    expected = claude_worker.window_root.run_span(run)
+    (run / "okx-events.pmlr").write_bytes(b"")  # the header never landed
+    (run / "deribit-events.pmlr").write_bytes(b"PMLR\x03")  # torn inside the header
+    (run / "hl-events.pmlr").write_bytes(b"JUNK" + b"\x00" * 60)  # 64 B, bad magic
+    assert claude_worker.window_root.run_span(run) == expected
+    assert claude_worker.window_root.windows_of(run) == [(0.0, 7200.0), (7200.0, 14400.0)]
+    assert claude_worker.window_root.complete_windows(run) == [(0.0, 7200.0)]
+    # A run whose only capture file is unreadable has no span — not an error.
+    dead = tmp_path / "logs3" / f"run-{EPOCH}"
+    dead.mkdir(parents=True)
+    (dead / "okx-events.pmlr").write_bytes(b"")
+    assert claude_worker.window_root.run_span(dead) is None
+    assert claude_worker.window_root.windows_of(dead) == []
+    assert claude_worker.window_root.complete_windows(dead) == []
+    # CUTTING stays strict: a cut is replayed by the harness, and a file it
+    # cannot read is an error there, not a hole to paper over.
+    with pytest.raises(claude_worker.window_root.WindowError):
+        claude_worker.window_root.cut_run(run, tmp_path / "roots", 0.0, 60.0)
+
+
 # ---- RG3: ai-cmds.pmlr — cut by ts_ns + the SetRegime carry-over ----
 
 _AI = struct.Struct("<QIIqqQBBBBHH")  # AiCmd head (48 B) — frames.py _HEAD without the len prefix

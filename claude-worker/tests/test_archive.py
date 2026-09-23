@@ -414,6 +414,45 @@ def test_push_run_still_refuses_an_empty_run(tmp_path: pathlib.Path) -> None:
     assert fake.count("PUT") == 0
 
 
+def test_push_pending_archives_a_run_with_a_truncated_file_and_keeps_going(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The second poison pill (the 2026-09-22 cycle). A boot that died between
+    creating `okx-events.pmlr` and writing its header left a 0-byte file;
+    `build_manifest` asked `window_root.run_span` for the span, the header read
+    raised, and the whole sweep aborted — stranding every run behind it and, one
+    stage later, retention (which deletes only what `verify` confirms). A
+    truncated file is data like any other: the run is archived byte-for-byte
+    and the sweep walks on."""
+    cfg = make_cfg(tmp_path)
+    fake = tests.fake_s3.FakeS3()
+    archiver = make_archiver(cfg, fake)
+    logs = tmp_path / "logs"
+    torn = make_run(logs, f"run-{EPOCH_NS}")
+    (torn / "okx-events.pmlr").write_bytes(b"")  # the header never landed
+    (torn / "deribit-events.pmlr").write_bytes(b"PMLR")  # torn inside the header
+    behind = f"run-{EPOCH_NS + 10**12}"
+    make_run(logs, behind)
+    make_run(logs, f"run-{EPOCH_NS + 2 * 10**12}")  # newest, never swept
+
+    results = archiver.push_pending(logs)
+
+    assert [r.run for r in results] == [torn.name, behind]
+    assert not results[0].skipped and results[0].files == 11
+    # Both runs are complete in the bucket — the torn one AND the one behind it.
+    assert cfg.index_key(torn.name) in fake.objects
+    assert cfg.index_key(behind) in fake.objects
+    manifest = json.loads(fake.objects[cfg.manifest_key(torn.name)])
+    assert manifest["span_ns"] == list(claude_worker.window_root.run_span(torn) or ())
+    assert manifest["span_ns"], "the readable files still give the run its span"
+    zero = next(f for f in manifest["files"] if f["name"] == "okx-events.pmlr")
+    assert zero["size_bytes"] == 0 and zero["pmlr_version"] is None
+    # Byte-faithful: the pulled run IS the local run, torn files included.
+    pulled = archiver.pull(torn.name, tmp_path / "pulled")
+    assert (pulled / "okx-events.pmlr").read_bytes() == b""
+    assert (pulled / "deribit-events.pmlr").read_bytes() == b"PMLR"
+
+
 def test_free_space_floor_refuses_and_touches_nothing(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
