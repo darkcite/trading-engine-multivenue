@@ -1,0 +1,16 @@
+[package]
+name         = "pine-ir"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "PVM contract v4 as Rust: every type that crosses a pine-* crate boundary, plus SymTable, the FNV-1a symbol/string keys, the Bar flag bits, the instruction encoding and the fixed-point scale helpers. A leaf crate: no dependencies, no allocation after construction, no clock."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# None, by contract (00-INDEX v4 §2): pine-ir is the leaf every other pine-*
+# crate may depend on. Adding an edge here re-opens the v1 dependency cycles.

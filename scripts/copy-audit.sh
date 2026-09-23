@@ -10,8 +10,8 @@
 # few lines), the way an `unsafe` block carries `// SAFETY:`.
 #
 # This script lists every byte-copy verb in the given crate directories
-# (default: the exec lane + core-net) that has NO `COPY:` marker within
-# the eight preceding lines, and compares the list against the committed
+# (default: the exec lane + core-net + each landed pine-* crate) that has
+# NO `COPY:` marker within the eight preceding lines, and compares the list against the committed
 # baseline `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
 #   * a hit that is in the baseline is legacy debt — printed in the
@@ -23,7 +23,7 @@
 #     by that path; growing it is an operator decision, never the
 #     auditor's.
 #
-#   scripts/copy-audit.sh                       # exec lane + core-net
+#   scripts/copy-audit.sh                       # exec lane + core-net + pine-*
 #   scripts/copy-audit.sh crates/ingress-okx    # any crate dir(s)
 #   scripts/copy-audit.sh --update-baseline     # rewrite the baseline
 #
@@ -57,7 +57,8 @@ if [ "${1:-}" = "--update-baseline" ]; then
 fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
-           crates/clob-dispatcher crates/core-net
+           crates/clob-dispatcher crates/core-net \
+           crates/pine-ir
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its

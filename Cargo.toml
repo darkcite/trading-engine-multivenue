@@ -52,6 +52,9 @@ members = [
     "crates/strategy-vrp",
     "crates/strategy-xsd",
 
+    # --- pine execution (PVM lane) ---
+    "crates/pine-ir",
+
     # --- execution ---
     "crates/clob-dispatcher",
     "crates/exec-router",
@@ -184,6 +187,9 @@ strategy-set          = { path = "crates/strategy-set" }
 strategy-vm           = { path = "crates/strategy-vm" }
 strategy-vrp          = { path = "crates/strategy-vrp" }
 strategy-xsd          = { path = "crates/strategy-xsd" }
+
+# --- pine execution (PVM lane) ---
+pine-ir = { path = "crates/pine-ir" }
 
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }
