@@ -4822,6 +4822,13 @@ What shares the law (E-10 is reserved for the doc-24 bankroll law):
   the carry to the expiry, and at least `SETTLE_MIN_MARKS` (3) marks
   inside it. Anything less is UNSETTLED — counted, never guessed, never
   averaged over part of the minute.
+* `claude_worker.hip4` — the worker's mirror of the same law
+  (`settle_reference_1e6` and `payout_1e6`, pinned to the harness by the
+  shared fixture `settle-1`; `link_successors`, by its own tests); the
+  accrual stores are
+  relabelled through it (`bin15_accrue relabel`, BIN15 S4) and every
+  offline reader labels an instance with it rather than restating the
+  window.
 * The value is knowable AT the expiry, so the harness settles a slot at
   the expiry and the successor trades from `T`; an order still resting
   on the slot is cancelled at that instant (the venue clears the book at

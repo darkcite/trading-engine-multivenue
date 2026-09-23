@@ -6,6 +6,109 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the BIN15 accrual stores on the venue's law and clock: `bin15_accrue relabel`, 12/14-column rows, G6.1 on the venue label, the pnl-report label tag (BIN15 S4)
+
+**What changed**
+- `claude_worker.hip4` mirrors the settlement law of
+  `cli::backtest::binary`: `settle_reference_1e6`, `payout_1e6`,
+  `y_next_strike`, `link_successors`, `Instance` and the evidence
+  constants. A new shared fixture pins it: `settle-1`, 532 queries,
+  with the gap bound tested to the nanosecond.
+  `backtest::binary::tests::the_settlement_law_matches_its_python_mirror`
+  writes the expected file under `BIN15_SETTLE_WRITE=1`, and pytest
+  asserts it.
+- New `claude_worker.bin15_tape` reads a capture on the VENUE clock. A
+  capture is a `run-*` directory, or a `part-*` pull with its
+  `anchor.json`. The reader returns:
+  - marks per underlying;
+  - created rolls, named by their slot descriptor;
+  - the span the pre-S2 anchor law gave the run, and that law's offset
+    against the venue (`delta_ns`).
+
+  A capture without v3 venue time is not a tape.
+- `bin15_accrue relabel [--pull DIR]… [--runs DIR]… [--dry-run]`
+  corrects both stores IN PLACE. Before writing, it keeps a
+  `.bak-relabel-<UTC>` copy of each file it changes. Every engine row
+  that a capture covers gets:
+  - LAW E-11's `y`, with the old label kept as `y_engine`;
+  - the venue-published `y_next_strike`;
+  - its stamp moved onto the venue clock, with `offset_s` recomputed.
+
+  Rows that no capture covers are kept and counted. A rerun converts
+  nothing.
+- Store formats (worker state, never git): ledger rows go from 10 to 12
+  columns and entry rows from 12 to 14. The two new columns are
+  `y_engine` and `y_next_strike`.
+  - **The width is the law.** A wide row is on the venue's law and
+    clock. A narrow row carries the engine's label on the anchor clock,
+    is never scored as the venue's, and waits for `relabel`.
+  - Readers accept 8/10/12 columns (ledger) and 11/12/14 (entries).
+  - The accrual writes wide rows from a sidecar whose runs all say
+    `"wall":"venue"` (an S2+ binary, which settles on E-11) and narrow
+    rows otherwise.
+  - Both merges let a venue row replace an engine row with the same
+    identity, never the reverse.
+- G6.1 (`bin15_ledger.calibration`) scores only settled VENUE rows
+  priced outside the settlement window (`tau_ns ≥ W/3`, S3). The
+  calibration lane prints how many rows it left out. A relabelled row
+  priced BEFORE S3 carries `τ + W/3 ≥ W/3`, so its last minute cannot be
+  told apart and stays in LATE.
+- `y_engine = -1` means the row has no engine label: it was accrued on
+  the venue law, or the engine could not settle it. On a row that an
+  S1+ binary accrued from an anchor-clocked run, `y_engine` is E-11
+  read on that clock. A venue row whose `y` is unknown takes the
+  captures' label when a later relabel finds the evidence; a known
+  label is never changed.
+- `bin15_accrue report` prints the venue label's numbers first, then the
+  label each entry was accrued with beside them; the two are never mixed
+  in one number. It adds a stake-weighted EV-per-$ line. Entry phases
+  are keyed on the pricing horizon, as the engine keys its recalibration.
+- `pnl_report`: the day JSON gains `bin15_label`, read from the audits'
+  own settlement lines:
+  - `venue` when the binary prints `law=twap[T-w,T]`;
+  - `engine(T,T+60)` for a pre-S1 binary;
+  - `mixed` when the units disagree;
+  - absent when no HIP-4 instance settled.
+
+  The bin15 summary line carries `label=…`.
+
+**Why**
+- The stores were labelled with the minute AFTER the expiry, on a
+  harness clock 22–42 s early (S1, S2). The runs are archived after a
+  day, so the correction is made in place from the captures on disk
+  (plan 28 S4, ruling O-3).
+
+**Impact**
+- The worker's own readers (G6.1, `report`, the merges) read the
+  venue's label and never mix it with the engine's. Research readers
+  that parse the stores by column position ignore the width law; they
+  must filter on the row width before they quote a number. Findings
+  scored on the engine's label are re-scored in the vault (doc 28-A).
+- The shared `settle-1` fixture pins `settle_reference_1e6` and
+  `payout_1e6`. `link_successors` and the tape reader are pinned by the
+  worker's own tests. The first live relabel was also cross-checked
+  against the S1–S3 harness on one day, 20/20 instance labels.
+- Wire formats and config keys: none.
+
+**Migration steps**
+1. Run `python -m claude_worker.bin15_accrue relabel --pull <pull root>
+   --runs ~/multivenue/logs` once.
+2. Re-run it after any accrual made by an older binary. Rows that
+   binary writes are narrow and convert on the next run.
+3. Never run it while an accrual is running; keep clear of the 00:20Z
+   slot. The lane refuses to replace a store that changed while it was
+   reading the captures, and says so; rerun it.
+4. Never accrue one day under two clock laws into the same store: an
+   old binary then an S2+ one, or a relabel then a re-accrual. The
+   ledger dedupes on the stamp, so rows of the same day on two clocks
+   do not collide and would be counted twice.
+
+**Rollback**
+- Restore the OLDEST `.bak-relabel-*` copy of each store, then revert
+  the commit. Later backups already hold 12/14-column rows, and the old
+  readers refuse those. Rows accrued after the relabel are lost unless
+  they are re-accrued.
+
 ## 2026-09-24 — the BIN15 pricer prices the venue's settlement window: horizon `τ − 2W/3`, the running TWAP inside the window, τ floors on the clock (BIN15 S3)
 
 **What changed**
@@ -89,8 +192,8 @@ Each entry is atomic: one version bump per section. Do not batch.
    average is not a ledger column.
 3. Until BIN15 S4's readers land, `bin15_ledger.calibration` files rows
    priced inside the window in LATE (their `p̂` carries a partly decided
-   average and flatters it); S4 gives them their own phase, outside
-   G6.1. Read no G6.1 verdict over S3 rows before S4.
+   average and flatters it); S4 leaves them out of G6.1 and counts
+   them. Read no G6.1 verdict over S3 rows before S4.
 
 **Rollback**
 - Revert the commit and restart. Rows accrued in between keep the new

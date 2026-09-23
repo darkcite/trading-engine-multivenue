@@ -485,6 +485,30 @@ def _merge_binary_fills(runs: list[tuple[str, dict]]) -> dict | None:
     }
 
 
+#: The audit's HIP-4 settlement line, and the law marker an S1 binary
+#: prints on it (BIN15 S1: ``law=twap[T-w,T]``).
+_BIN15_TABLE: str = "audit-pnl: bin15 settlement table:"
+_BIN15_LAW_VENUE: str = " law=twap[T-w,T]"
+
+
+def bin15_label_law(stderr_texts: typing.Iterable[str]) -> str | None:
+    """BIN15 S4: which LABEL the day's bin15 dollars were settled on,
+    read from the audits' own settlement lines — ``venue`` (LAW E-11,
+    ``TWAP[T-60 s, T]``: the binary prints ``law=twap[T-w,T]``),
+    ``engine(T,T+60)`` (a pre-S1 binary: the minute AFTER the expiry),
+    ``mixed`` when the units disagree, ``None`` when no unit settled a
+    HIP-4 instance. From the numbers' own producer, never from a guess
+    about which binary is installed."""
+    laws: set[str] = set()
+    for err in stderr_texts:
+        for line in err.splitlines():
+            if _BIN15_TABLE in line:
+                laws.add("venue" if _BIN15_LAW_VENUE in line else "engine(T,T+60)")
+    if not laws:
+        return None
+    return laws.pop() if len(laws) == 1 else "mixed"
+
+
 def merge_reports(day: str, runs: list[tuple[str, dict]]) -> dict:
     """Fold per-run audit-pnl JSONs into one day report (same top-level
     shape, ``audit_pnl_version`` 1, additive keys). Sums are exact to
@@ -760,6 +784,7 @@ def run_day(
     ok: list[tuple[str, dict]] = []
     failed: list[str] = []
     summaries: list[str] = []
+    errs: list[str] = []
     units: list[tuple[str, pathlib.Path, bool]] = []
     for i, run_dir in enumerate(runs):
         nxt = runs[i + 1] if i + 1 < len(runs) else None
@@ -796,12 +821,17 @@ def run_day(
             summaries.append(f"== {run_dir.name}: FAILED (exit {code})\n{err}")
             continue
         ok.append((run_dir.name, obj))
+        errs.append(err)
         summaries.append(f"== {run_dir.name}\n{err}")
     reports_dir.mkdir(parents=True, exist_ok=True)
     json_path, summary_path = report_paths(reports_dir, day)
     merged = merge_reports(day, ok)
     merged["failed_runs"] = failed
     merged["fee_flags"] = flags
+    # BIN15 S4: ADDITIVE, and absent when no unit settled a HIP-4 instance.
+    law = bin15_label_law(errs)
+    if law is not None:
+        merged["bin15_label"] = law
     # S-LAW 8: a number produced from archived data records where the bytes came
     # from. ADDITIVE — with the subsystem off the key is simply absent, so a
     # report built without an archive is byte-identical to a pre-S6 one.
@@ -823,13 +853,16 @@ def run_day(
         # numbers, so a figure cannot be quoted from this line without
         # it. One line per (strategy, accounting); there is no combined
         # line, because the combined number is the one §6.4 forbids.
+        # BIN15 S4: the bin15 line names the LABEL its settlements used, so
+        # no reader mistakes the engine's minute for the venue's.
+        tag = f" label={law}" if row["label"] == "bin15" and law is not None else ""
         head.append(
             f"strategy {row['strategy_id']} ({row['label']}) {row['accounting']}: "
             f"runs={row['runs']} orders={row['orders']} "
             f"fills={row['fills']} trades={row['trades']} net={row['net_usd']} fees={row['fees_usd']} "
             f"worst_run_dd={row['max_drawdown_usd']} ioc_fills={row['ioc_fills']} "
             f"ioc_canceled={row['ioc_canceled']} ttl_expired={row['ttl_expired']} "
-            f"ladder(0/1/2 bps)={row['fee_ladder_net_usd']}"
+            f"ladder(0/1/2 bps)={row['fee_ladder_net_usd']}{tag}"
         )
     bf = merged.get("binary_fills")
     if isinstance(bf, dict):

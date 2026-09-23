@@ -246,3 +246,86 @@ def test_the_first_n_law_ignores_unstamped_ticks_and_survives_a_stale_head() -> 
     # Even count: the mean of the two middles, integer.
     assert claude_worker.hip4.venue_offset_first_n([(1_010, 1_000_000_000), (2_030, 2_000_000_000)]) == 20_000_000
 
+
+
+# --- BIN15 S4: the settlement law, mirrored (LAW E-11) --------------------
+
+_FIX = pathlib.Path(__file__).parent / "fixtures" / "bin15"
+
+
+def _replay_settle(lines: list[str]) -> list[str]:
+    ts: list[int] = []
+    px: list[int] = []
+    out: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        f = line.split("\t")
+        if f[0] == "S":
+            ts, px = [], []
+        elif f[0] == "M":
+            ts.append(int(f[1]))
+            px.append(int(f[2]))
+        elif f[0] == "Q":
+            expiry, twap, strike = int(f[1]), int(f[2]), int(f[3])
+            ref = claude_worker.hip4.settle_reference_1e6(ts, px, expiry, twap)
+            if ref is None:
+                out.append("Q\t-\t-")
+            else:
+                out.append(f"Q\t{ref}\t{claude_worker.hip4.payout_1e6(ref, strike)}")
+        else:
+            raise ValueError(f"unknown record {f[0]!r}")
+    return out
+
+
+def test_the_settlement_law_is_mirrored_bit_for_bit() -> None:
+    """The shared tape ``settle-1``: the harness writes the expected file
+    (``BIN15_SETTLE_WRITE=1``), this mirror must match every row."""
+    got = _replay_settle((_FIX / "settle-1.input.tsv").read_text(encoding="utf-8").splitlines())
+    want = [
+        line.strip()
+        for line in (_FIX / "settle-1.expected.tsv").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert len(got) > 300
+    assert len(got) == len(want), "row count moved -- the tape changed, not the law"
+    for i, (g, w) in enumerate(zip(got, want, strict=True)):
+        assert g == w, f"row {i + 1}: {g!r} != {w!r}"
+
+
+def test_the_settlement_window_ends_at_the_expiry_and_is_time_weighted() -> None:
+    s = 1_000_000_000
+    t0 = 1_790_000_000 * s
+    # 30 s at 100 (three sparse marks), then 30 s at 400 (twelve dense
+    # ones): the TIME-weighted mean is 250; the sample mean of the marks
+    # inside the window would be (3 * 100 + 12 * 400) / 15 = 340.
+    ts = [t0 - 1 * s, t0 + 9 * s, t0 + 19 * s, t0 + 29 * s]
+    ts += [t0 + (30 + k) * s for k in range(10)] + [t0 + 49 * s, t0 + 59 * s]
+    px = [100] * 4 + [400] * 12
+    ref = claude_worker.hip4.settle_reference_1e6(ts, px, t0 + 60 * s, 60 * s)
+    assert ref == 250
+    assert claude_worker.hip4.payout_1e6(ref, 250) == 1_000_000, ">= settles in the money"
+    assert claude_worker.hip4.payout_1e6(ref, 251) == 0
+    # The open not covered: refused, never averaged over part of the minute.
+    assert claude_worker.hip4.settle_reference_1e6(ts[1:], px[1:], t0 + 60 * s, 60 * s) is None
+    # A daily family (twap 0): the last mark at or before the expiry.
+    assert claude_worker.hip4.settle_reference_1e6(ts, px, t0 + 45 * s, 0) == 400
+
+
+def test_the_successor_strike_is_the_venues_label_and_a_tie_is_unknown() -> None:
+    s = 1_000_000_000
+    btc = "hyperliquid:out:BTC:15m[yes]"
+    inst = claude_worker.hip4.Instance
+    a = inst(1, btc, 100, 900 * s, 60 * s, 0)
+    b = inst(2, btc, 107, 1_800 * s, 60 * s, 909 * s)
+    far = inst(3, btc, 90, 2_700 * s, 60 * s, 1_800 * s + 121 * s)
+    other = inst(4, "hyperliquid:out:ETH:15m[yes]", 5, 1_800 * s, 60 * s, 905 * s)
+    insts = [far, other, b, a]
+    claude_worker.hip4.link_successors(insts)
+    assert a.next_strike_1e6 == 107, "the successor on the same slot"
+    assert b.next_strike_1e6 == 0, "created 121 s after its expiry: a capture gap"
+    assert claude_worker.hip4.y_next_strike(a.strike_1e6, a.next_strike_1e6) == 1_000_000
+    assert claude_worker.hip4.y_next_strike(107, 90) == 0
+    assert claude_worker.hip4.y_next_strike(100, 100) == claude_worker.hip4.Y_NEXT_STRIKE_UNKNOWN
+    assert claude_worker.hip4.y_next_strike(100, 0) == claude_worker.hip4.Y_NEXT_STRIKE_UNKNOWN

@@ -36,7 +36,9 @@ Lanes (``python -m claude_worker.bin15_ledger <lane>``):
   the sidecars' ledger blocks, deduplicated by
   ``(ts_ns, family, outcome)``. Re-running one window is a no-op.
 - ``calibration [--ledger <tsv>] [--min-instances N] [--buckets N]`` —
-  the per-phase table and the G6.1 verdict.
+  the per-phase table and the G6.1 verdict, on the VENUE's label (BIN15
+  S4): rows still on the engine's label and rows priced inside the
+  settlement window are counted and left out (see :func:`calibration`).
 - ``status [--ledger <tsv>]`` — rows, instances, settled instances.
 
 Convention: full ``import x`` only. No ``from x import y``.
@@ -66,7 +68,20 @@ Y_UNKNOWN: int = -1
 HEADER: str = (
     "# bin15 ledger — one row per live instance per 30 s, merged from\n"
     "#   `backtest --member bin15 --emit-detail` sidecars.\n"
-    "# ts_ns\tfamily\toutcome\ttau_ns\tp_hat_1e6\tp_raw_1e6\tarm\tentered\tmid_1e6\ty\n"
+    "# ts_ns\tfamily\toutcome\ttau_ns\tp_hat_1e6\tp_raw_1e6\tarm\tentered\tmid_1e6\ty"
+    "[\ty_engine\ty_next_strike]\n"
+    "# 12 columns (BIN15 S4): the row is on the VENUE's law and clock — `y` is\n"
+    "#   LAW E-11's label (TWAP[T-W, T] >= strike), `ts_ns` a venue instant;\n"
+    "#   `y_engine` the label the row was accrued with before `bin15_accrue\n"
+    "#   relabel` corrected it (-1: none — accrued on the venue law, or the\n"
+    "#   engine could not settle it),\n"
+    "#   `y_next_strike` the venue-published label (the successor's strike;\n"
+    "#   -1 unknown or a tie). 10 columns: accrued on the ENGINE's label and\n"
+    "#   the anchor clock and not yet relabelled — never scored as the venue's.\n"
+    "# tau_ns: the horizon the price was computed at; below W/3 (20 s for a\n"
+    "#   15 m family) the row was priced INSIDE the settlement window (S3).\n"
+    "#   A row priced before S3 carries tau + W/3 >= W/3, so one priced in the\n"
+    "#   venue's last minute cannot be told apart and stays in LATE.\n"
     "# y: 1000000 settled ITM, 0 settled OTM, -1 the window could not\n"
     "# derive the payout (its expiry or TWAP falls outside the window).\n"
     "# entered: 1 once the instance's $50 coverage entry was submitted, 0\n"
@@ -102,6 +117,21 @@ BUCKETS_DEFAULT: int = 10
 #: Phase names, indexed by `claude_worker.bin15_ref.phase_of`.
 PHASE_NAMES: tuple[str, ...] = ("early", "mid", "late")
 
+#: The 15 m families' settlement window, ns (the venue's rules text).
+TWAP_15M_NS: int = 60_000_000_000
+
+#: BIN15 S3: a row whose pricing horizon is under this was priced INSIDE
+#: the settlement window — ``pricing_horizon_ns`` is monotone in the time
+#: left and is exactly ``W/3`` at the window's open. Its ``p_hat`` carries
+#: an average that is partly DECIDED, so it would flatter LATE; G6.1
+#: leaves it out (no row before S3 is ever under it: ``tau + W/3 >= W/3``).
+WINDOW_TAU_NS: int = TWAP_15M_NS // 3
+
+#: Columns of a relabelled (venue-law) row, a pre-S4 row, a pre-P3 row.
+COLUMNS_VENUE: int = 12
+COLUMNS_ENGINE: int = 10
+COLUMNS_LEGACY: int = 8
+
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class Row:
@@ -117,6 +147,15 @@ class Row:
     y: int
     entered: int = ENTERED_UNKNOWN
     mid_1e6: int = MID_UNKNOWN
+    #: BIN15 S4: the label the row was accrued with before the relabel;
+    #: ``Y_UNKNOWN`` = none (accrued on the venue law, or the engine could
+    #: not settle it).
+    y_engine: int = Y_UNKNOWN
+    #: BIN15 S4: the venue-published label (``Y_UNKNOWN`` unknown / a tie).
+    y_next_strike: int = Y_UNKNOWN
+    #: BIN15 S4: ``y`` is the VENUE's label and ``ts_ns`` a venue instant
+    #: (a 12-column row). ``False``: the engine's label on the anchor clock.
+    venue: bool = False
 
     @property
     def key(self) -> tuple[int, int, int]:
@@ -129,10 +168,11 @@ class Row:
         return self.y != Y_UNKNOWN
 
     def tsv(self) -> str:
+        tail = f"\t{self.y_engine}\t{self.y_next_strike}" if self.venue else ""
         return (
             f"{self.ts_ns}\t{self.family}\t{self.outcome}\t{self.tau_ns}\t"
             f"{self.p_hat_1e6}\t{self.p_raw_1e6}\t{self.arm}\t{self.entered}\t"
-            f"{self.mid_1e6}\t{self.y}\n"
+            f"{self.mid_1e6}\t{self.y}{tail}\n"
         )
 
 
@@ -141,19 +181,41 @@ def ledger_path(path: str | None = None) -> pathlib.Path:
     return pathlib.Path(os.path.expanduser(path or DEFAULT_LEDGER))
 
 
+def sidecar_on_venue(obj: dict) -> bool:
+    """Whether a sidecar's rows are on the VENUE's law and clock: every
+    run it replayed says ``"wall":"venue"`` (BIN15 S2 — a binary that
+    writes the key settles on LAW E-11 too, S1 being older). An anchor-law
+    or ``"refused"`` run, or a pre-S2 sidecar (no key), is not: its rows
+    are the engine's, and ``bin15_accrue relabel`` converts them."""
+    runs = (obj.get("stale") or {}).get("runs") or []
+    venue = [r.get("wall") == "venue" for r in runs]
+    if any(venue) and not all(venue):
+        # One sidecar, two clocks: its rows cannot be stored under one
+        # width without either re-clocking the venue ones twice later or
+        # scoring the anchor ones as the venue's. Refused, not guessed.
+        raise ValueError(
+            "sidecar mixes venue-clocked and anchor-clocked runs; merge one run per sidecar"
+        )
+    return bool(runs) and all(venue)
+
+
 def rows_from_sidecar(text: str) -> list[Row]:
     """The `bin15_ledger` block of one `--emit-detail` sidecar.
 
     An empty list for a sidecar that has no block — every member other
     than bin15 writes none, and so does a bin15 run that never priced.
+    A venue-clocked sidecar (:func:`sidecar_on_venue`) yields 12-column
+    rows carrying its ``y_next_strike``; any other yields engine rows.
     """
     obj = json.loads(text)
     block = obj.get(SIDECAR_KEY)
     if not block:
         return []
+    venue = sidecar_on_venue(obj)
     out: list[Row] = []
     for r in block:
         y = r.get("y")
+        y_next = r.get("y_next_strike")
         out.append(
             Row(
                 ts_ns=int(r["ts_ns"]),
@@ -166,6 +228,8 @@ def rows_from_sidecar(text: str) -> list[Row]:
                 y=Y_UNKNOWN if y is None else int(y),
                 entered=int(r.get("entered", ENTERED_UNKNOWN)),
                 mid_1e6=int(r.get("mid_1e6", MID_UNKNOWN)),
+                y_next_strike=Y_UNKNOWN if y_next is None else int(y_next),
+                venue=venue,
             )
         )
     return out
@@ -186,13 +250,19 @@ def read_ledger(path: pathlib.Path) -> list[Row]:
         # readable, they simply do not know which of them were paid for or
         # what the venue was asking at the time.
         v = [int(x) for x in f]
-        if len(f) == 8:
+        if len(f) == COLUMNS_LEGACY:
             out.append(
                 Row(*v[:7], y=v[7], entered=ENTERED_UNKNOWN, mid_1e6=MID_UNKNOWN)
             )
             continue
-        if len(f) != 10:
-            raise ValueError(f"{path}: want 8 or 10 columns, got {len(f)}: {s!r}")
+        if len(f) == COLUMNS_VENUE:
+            out.append(
+                Row(*v[:7], entered=v[7], mid_1e6=v[8], y=v[9], y_engine=v[10],
+                    y_next_strike=v[11], venue=True)
+            )
+            continue
+        if len(f) != COLUMNS_ENGINE:
+            raise ValueError(f"{path}: want 8, 10 or 12 columns, got {len(f)}: {s!r}")
         out.append(Row(*v[:7], entered=v[7], mid_1e6=v[8], y=v[9]))
     return out
 
@@ -207,12 +277,17 @@ def merge(
     unknown because its expiry now falls outside the new cut, and
     letting it overwrite a settled row would quietly un-settle the
     ledger. A row that gains its `y` later arrives under a different
-    window and a `y`-less duplicate of it is simply dropped.
+    window and a `y`-less duplicate of it is simply dropped. One
+    exception (BIN15 S4): a VENUE row replaces an ENGINE row of the same
+    key — the law is corrected, never reverted.
     """
     by_key: dict[tuple[int, int, int], Row] = {r.key: r for r in existing}
     added = 0
     for r in incoming:
-        if r.key in by_key:
+        old = by_key.get(r.key)
+        if old is not None:
+            if r.venue and not old.venue:
+                by_key[r.key] = r
             continue
         by_key[r.key] = r
         added += 1
@@ -273,14 +348,23 @@ class PhaseCalibration:
         return acc // self.rows
 
 
+def scored(r: Row) -> bool:
+    """Whether G6.1 scores this row: SETTLED, on the VENUE's label (BIN15
+    S4 — an engine row's ``y`` is the label the venue did not pay on), and
+    priced OUTSIDE the settlement window (S3, :data:`WINDOW_TAU_NS`)."""
+    return r.settled and r.venue and r.tau_ns >= WINDOW_TAU_NS
+
+
 def calibration(
     rows: typing.Sequence[Row], buckets: int = BUCKETS_DEFAULT
 ) -> list[PhaseCalibration]:
-    """The per-phase calibration table over SETTLED rows only.
+    """The per-phase calibration table over the rows :func:`scored` keeps.
 
     An unsettled row carries no outcome to be calibrated against;
     counting it as a miss would make a window that simply ends early
-    look like a model that is wrong.
+    look like a model that is wrong. An engine-label row is not the
+    venue's outcome, and a row priced inside the settlement window is
+    partly decided: :func:`render` counts both, the table leaves them out.
     """
     if buckets < 1:
         raise ValueError(f"buckets must be positive, got {buckets}")
@@ -290,7 +374,7 @@ def calibration(
     ]
     seen: list[set[int]] = [set() for _ in range(claude_worker.bin15_ref.PHASES)]
     for r in rows:
-        if not r.settled:
+        if not scored(r):
             continue
         phase = claude_worker.bin15_ref.phase_of(r.tau_ns)
         p = min(max(r.p_hat_1e6, 0), 1_000_000)
@@ -416,11 +500,19 @@ def main(argv: list[str] | None = None) -> int:
             f"settled_instances={len(settled)} families={len({r.family for r in rows})} "
             f"entered_instances={len(entered)} "
             f"settled_and_entered={len(settled & entered)} "
-            f"entered_unknown={len(unknown)}"
+            f"entered_unknown={len(unknown)} "
+            f"venue_rows={sum(1 for r in rows if r.venue)} "
+            f"engine_rows={sum(1 for r in rows if not r.venue)}"
         )
         return 0
 
     table = calibration(rows, args.buckets)
+    engine = sum(1 for r in rows if r.settled and not r.venue)
+    window = sum(1 for r in rows if r.settled and r.venue and r.tau_ns < WINDOW_TAU_NS)
+    print(
+        f"bin15-ledger: {len(rows)} rows; left out: {engine} settled on the ENGINE's "
+        f"label (run `bin15_accrue relabel`), {window} priced inside the settlement window"
+    )
     print(render(table))
     v, reasons = verdict(table, args.max_err_1e6, args.min_instances)
     for r in reasons:

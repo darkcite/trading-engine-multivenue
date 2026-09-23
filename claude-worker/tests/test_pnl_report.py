@@ -710,3 +710,20 @@ def test_the_ruleset_rollup_splits_by_accounting_too() -> None:
     with pytest.raises(ValueError, match="predates"):
         claude_worker.pnl_report.merge_reports(
             "2026-09-16", [("a", {**base, "vm_by_ruleset": [row]})])
+
+
+def test_the_bin15_line_names_the_label_its_settlements_used() -> None:
+    """BIN15 S4: the day's bin15 dollars are tagged with the LABEL the
+    audit settled them on, read from the audit's own settlement line — an
+    S1 binary prints ``law=twap[T-w,T]`` (the venue's minute), an older
+    one does not (the engine's minute after the expiry)."""
+    law = claude_worker.pnl_report.bin15_label_law
+    head = (
+        "audit-pnl: bin15 settlement table: 3 of 3 instance(s) settleable (3 reaching "
+        "their instant) from 6 roll row(s), marks=100 unpaired_rolls=0"
+    )
+    s1 = head + " law=twap[T-w,T] next_strike_checked=3 settle_disagree_next_strike=0"
+    assert law([f"x\n{s1}\ny"]) == "venue"
+    assert law([head]) == "engine(T,T+60)"
+    assert law([s1, head]) == "mixed"
+    assert law(["audit-pnl: no hip-4 here", ""]) is None

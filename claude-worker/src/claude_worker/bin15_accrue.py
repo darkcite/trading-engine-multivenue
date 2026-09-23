@@ -17,7 +17,11 @@ instance: cut it into ≤ 2 h windows (the capture-window law, absolute),
 cut a POINT-IN-TIME seed for each from ``candles.db``, drive
 ``backtest --member bin15 --emit-detail`` through it, and merge the
 sidecar's ``bin15_ledger`` and ``bin15_entries`` blocks into the stores.
-Idempotent: both merges dedupe, so re-running a day adds nothing.
+Idempotent: both merges dedupe, so re-running a day adds nothing -- on ONE
+clock law. A day accrued on the anchor clock, relabelled onto the venue's
+(BIN15 S4), and then re-accrued by a venue-clock binary is NOT deduped
+(the ledger's key is the stamp): never re-accrue a relabelled day into
+the same store.
 
 **Why the seed is the whole method.** ``bin15_boot``'s seed loader does
 NOT filter by time (xsd's does — it drops rows at or after the boot
@@ -37,7 +41,15 @@ Lanes (``python -m claude_worker.bin15_accrue <lane>``):
   slot wants.
 - ``report`` — the three operator questions (prediction success at the
   price paid, entry timing, entry price) with a Wilson interval and the
-  sample size each conclusion would need.
+  sample size each conclusion would need — on the VENUE's label first
+  (LAW E-11), the label each entry was accrued with beside it.
+- ``relabel [--pull DIR …] [--runs DIR …]`` — BIN15 S4: correct both
+  stores IN PLACE onto the venue's law and clock from the captures on
+  disk (``claude_worker.bin15_tape``): every row not yet on it gets
+  LAW E-11's ``y`` (the old one kept as ``y_engine``), the venue-published
+  ``y_next_strike``, and its stamp moved onto the venue clock. Rows no
+  capture covers stay as they are, counted. Idempotent: a second run
+  converts nothing.
 - ``status`` — rows, instances, settled entries, days covered.
 
 Convention: full ``import x`` only. No ``from x import y``.
@@ -45,6 +57,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 
 import argparse
 import collections
+import dataclasses
 import datetime
 import json
 import math
@@ -60,6 +73,7 @@ import typing
 import claude_worker.backtest
 import claude_worker.bin15_ledger
 import claude_worker.bin15_ref
+import claude_worker.bin15_tape
 import claude_worker.fill_origin
 import claude_worker.hip4
 import claude_worker.window_root
@@ -71,7 +85,16 @@ DEFAULT_ENTRIES: str = "~/multivenue/worker/bin15/entries.tsv"
 ENTRIES_HEADER: str = (
     "# bin15 entries — one row per COVERAGE ENTRY the member placed,\n"
     "#   merged from `backtest --member bin15 --emit-detail` sidecars.\n"
-    "# ts_ns\toutcome\tfamily\tstart_ns\texpiry_ns\toffset_s\tis_yes\tpx_1e6\tqty_1e6\tp_hat_1e6\ty\torigin\n"
+    "# ts_ns\toutcome\tfamily\tstart_ns\texpiry_ns\toffset_s\tis_yes\tpx_1e6\tqty_1e6"
+    "\tp_hat_1e6\ty\torigin[\ty_engine\ty_next_strike]\n"
+    "# 14 columns (BIN15 S4): on the VENUE's law and clock — `y` is LAW E-11's\n"
+    "#   label (TWAP[T-W, T] >= strike), `ts_ns`/`offset_s` venue-clocked,\n"
+    "#   `y_engine` the label accrued before `relabel` corrected it (-1: none —\n"
+    "#   accrued on the venue law, or the engine could not settle it; from an\n"
+    "#   S1+ binary on an anchor-clocked run it is E-11 read on that clock),\n"
+    "#   `y_next_strike` the venue-published label\n"
+    "#   (-1 unknown or a tie). 12 columns: the engine's label and the anchor\n"
+    "#   clock, not yet relabelled — never scored as the venue's.\n"
     "# origin: 1 PAPER (a modelled fill), 0 VENUE (a real one). NEVER\n"
     "#   summed together — a mixed total is meaningless (plan §6.4). An\n"
     "#   11-column row predates the split and reads as PAPER, which is\n"
@@ -98,6 +121,10 @@ ORIGIN_NAMES: dict[int, str] = claude_worker.fill_origin.NAMES
 #: written here when they were produced.
 LEGACY_COLUMNS: int = 11
 
+#: Columns of an engine-label row (§6.4) and of a venue-law row (BIN15 S4).
+ENGINE_COLUMNS: int = 12
+VENUE_COLUMNS: int = 14
+
 #: The 15 m tenor, ns.
 TAU_15M_NS: int = 900_000_000_000
 
@@ -121,6 +148,15 @@ class Entry(typing.NamedTuple):
     #: PAPER without saying so, which is the silent mislabelling the
     #: whole split exists to prevent.
     origin: int
+    #: BIN15 S4: the label the entry was accrued with before the relabel;
+    #: ``Y_UNKNOWN`` = none (accrued on the venue law, or the engine could
+    #: not settle it).
+    y_engine: int = Y_UNKNOWN
+    #: BIN15 S4: the venue-published label (``Y_UNKNOWN`` unknown / a tie).
+    y_next_strike: int = Y_UNKNOWN
+    #: BIN15 S4: ``y`` is the VENUE's label and the stamps venue-clocked
+    #: (a 14-column row); ``False`` = the engine's, not yet relabelled.
+    venue: bool = False
 
     @property
     def settled(self) -> bool:
@@ -138,7 +174,9 @@ class Entry(typing.NamedTuple):
         return ORIGIN_NAMES.get(self.origin, f"origin-{self.origin}")
 
     def tsv(self) -> str:
-        return "\t".join(str(v) for v in self) + "\n"
+        cols = self[:ENGINE_COLUMNS]
+        tail = f"\t{self.y_engine}\t{self.y_next_strike}" if self.venue else ""
+        return "\t".join(str(v) for v in cols) + tail + "\n"
 
 
 def entries_path(path: str | None = None) -> pathlib.Path:
@@ -147,12 +185,15 @@ def entries_path(path: str | None = None) -> pathlib.Path:
 
 def entries_from_sidecar(text: str) -> list[Entry]:
     """The `bin15_entries` block of one `--emit-detail` sidecar."""
-    block = json.loads(text).get("bin15_entries")
+    obj = json.loads(text)
+    block = obj.get("bin15_entries")
     if not block:
         return []
+    venue = claude_worker.bin15_ledger.sidecar_on_venue(obj)
     out: list[Entry] = []
     for r in block:
         y = r.get("y")
+        y_next = r.get("y_next_strike")
         if "origin" not in r:
             # The harness stamps it (`Bin15EntryRow::origin`). A sidecar
             # without it came from a binary that predates §6.4, and
@@ -177,6 +218,8 @@ def entries_from_sidecar(text: str) -> list[Entry]:
                 p_hat_1e6=int(r["p_hat_1e6"]),
                 y=Y_UNKNOWN if y is None else int(y),
                 origin=int(r["origin"]),
+                y_next_strike=Y_UNKNOWN if y_next is None else int(y_next),
+                venue=venue,
             )
         )
     return out
@@ -195,15 +238,17 @@ def read_entries(path: pathlib.Path) -> list[Entry]:
         if len(f) == LEGACY_COLUMNS:
             # Pre-§6.4. PAPER is not an assumption here: the harness
             # models every fill, so nothing else could have written
-            # these. Anything BUT 11 or 12 is a file this reader does
+            # these. Anything BUT 11, 12 or 14 is a file this reader does
             # not understand, and a reader that guesses at a column
             # count produces a number nobody can defend.
             out.append(Entry(*(int(v) for v in f), origin=ORIGIN_PAPER))
-        elif len(f) == len(Entry._fields):
+        elif len(f) == ENGINE_COLUMNS:
             out.append(Entry(*(int(v) for v in f)))
+        elif len(f) == VENUE_COLUMNS:
+            out.append(Entry(*(int(v) for v in f), venue=True))
         else:
             raise ValueError(
-                f"{path}: want {len(Entry._fields)} columns "
+                f"{path}: want {ENGINE_COLUMNS} or {VENUE_COLUMNS} columns "
                 f"(or {LEGACY_COLUMNS} pre-§6.4), got {len(f)}: {s!r}"
             )
     return out
@@ -227,6 +272,8 @@ def merge_entries(
     arrive: a window re-cut later can carry the same entry with its
     payout now derivable, and that is an upgrade, not a duplicate.
     Otherwise existing wins, so a re-cut can never un-settle the store.
+    Above both (BIN15 S4): a VENUE-law row beats an engine-label row,
+    settled or not — the law is corrected, never reverted.
     """
     by: dict[tuple[int, int], Entry] = {(e.outcome, e.origin): e for e in existing}
     added = 0
@@ -236,6 +283,9 @@ def merge_entries(
         if old is None:
             by[key] = e
             added += 1
+        elif e.venue != old.venue:
+            if e.venue:
+                by[key] = e
         elif not old.settled and e.settled:
             by[key] = e
     return (
@@ -253,6 +303,257 @@ def write_entries(path: pathlib.Path, rows: typing.Sequence[Entry]) -> None:
         for r in rows:
             f.write(r.tsv())
     os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------
+# BIN15 S4: the relabel — both stores onto the venue's law and clock
+# ---------------------------------------------------------------------
+
+
+class RelabelCount(typing.NamedTuple):
+    """What one store's relabel did."""
+
+    rows: int
+    converted: int
+    already: int
+    #: Left on the engine's label: no capture on disk covers their stamp.
+    uncovered: int
+    #: A converted row whose venue stamp another row already held.
+    collided: int
+    #: Venue rows whose unknown label (-1) the captures now settle.
+    filled: int = 0
+
+
+def _label_of(
+    labels: dict[int, claude_worker.bin15_tape.Label], outcome: int
+) -> claude_worker.bin15_tape.Label:
+    return labels.get(outcome) or claude_worker.bin15_tape.Label(Y_UNKNOWN, Y_UNKNOWN, -1)
+
+
+def _fill_unknown(rows: list, labels: dict, fill: typing.Callable) -> tuple[list, int]:
+    """Venue rows whose ``y`` is unknown take the captures' LAW E-11 label
+    when there is one now (a later pull can hold the evidence an earlier
+    one lacked). A known label is never touched: idempotent."""
+    out = []
+    filled = 0
+    for r in rows:
+        lab = labels.get(r.outcome)
+        if r.y == Y_UNKNOWN and lab is not None and lab.y != Y_UNKNOWN:
+            out.append(fill(r, lab))
+            filled += 1
+        else:
+            out.append(r)
+    return out, filled
+
+
+def _keep_next(row: typing.Any, lab: claude_worker.bin15_tape.Label) -> int:
+    """The captures' venue-published label, or the row's own when the
+    captures have none — a known ``y_next_strike`` is never downgraded."""
+    return row.y_next_strike if lab.y_next_strike == Y_UNKNOWN else lab.y_next_strike
+
+
+def _stat(path: pathlib.Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
+def relabel_ledger(
+    rows: typing.Sequence[claude_worker.bin15_ledger.Row],
+    tapes: typing.Sequence[claude_worker.bin15_tape.VenueTape],
+    labels: dict[int, claude_worker.bin15_tape.Label],
+) -> tuple[list[claude_worker.bin15_ledger.Row], RelabelCount]:
+    """Every ENGINE row a capture covers onto the venue's law and clock:
+    ``ts_ns`` moved by its run's :attr:`~claude_worker.bin15_tape.VenueTape.delta_ns`,
+    ``y`` = LAW E-11's label, the old one kept as ``y_engine``. Venue rows
+    are left exactly as they are, and so is an engine row no capture
+    covers (counted). A converted row whose new key a venue row already
+    holds is dropped (the venue row wins — merge's law)."""
+    venue, filled = _fill_unknown(
+        [r for r in rows if r.venue], labels,
+        lambda r, lab: dataclasses.replace(r, y=lab.y, y_next_strike=_keep_next(r, lab)),
+    )
+    keys = {r.key for r in venue}
+    out = list(venue)
+    converted = uncovered = collided = 0
+    for r in rows:
+        if r.venue:
+            continue
+        tape = claude_worker.bin15_tape.covering(tapes, r.ts_ns)
+        if tape is None:
+            out.append(r)
+            uncovered += 1
+            continue
+        lab = _label_of(labels, r.outcome)
+        new = dataclasses.replace(
+            r, ts_ns=r.ts_ns + tape.delta_ns, y=lab.y, y_engine=r.y,
+            y_next_strike=lab.y_next_strike, venue=True,
+        )
+        if new.key in keys:
+            collided += 1
+            continue
+        keys.add(new.key)
+        out.append(new)
+        converted += 1
+    out.sort(key=lambda r: (r.ts_ns, r.family, r.outcome))
+    return out, RelabelCount(len(rows), converted, len(venue), uncovered, collided, filled)
+
+
+def relabel_entries(
+    rows: typing.Sequence[Entry],
+    tapes: typing.Sequence[claude_worker.bin15_tape.VenueTape],
+    labels: dict[int, claude_worker.bin15_tape.Label],
+) -> tuple[list[Entry], RelabelCount]:
+    """:func:`relabel_ledger` for the entry store: ``offset_s`` follows the
+    stamp (``(ts − start) // 1 s``, never negative — the harness's own
+    arithmetic); one entry per ``(outcome, origin)`` as ever, a venue row
+    winning a collision."""
+    venue, filled = _fill_unknown(
+        [e for e in rows if e.venue], labels,
+        lambda e, lab: e._replace(y=lab.y, y_next_strike=_keep_next(e, lab)),
+    )
+    keys = {(e.outcome, e.origin) for e in venue}
+    out = list(venue)
+    converted = uncovered = collided = 0
+    for e in rows:
+        if e.venue:
+            continue
+        tape = claude_worker.bin15_tape.covering(tapes, e.ts_ns)
+        if tape is None:
+            out.append(e)
+            uncovered += 1
+            continue
+        if (e.outcome, e.origin) in keys:
+            collided += 1
+            continue
+        lab = _label_of(labels, e.outcome)
+        ts = e.ts_ns + tape.delta_ns
+        out.append(
+            e._replace(
+                ts_ns=ts, offset_s=max(ts - e.start_ns, 0) // 1_000_000_000,
+                y=lab.y, y_engine=e.y, y_next_strike=lab.y_next_strike, venue=True,
+            )
+        )
+        keys.add((e.outcome, e.origin))
+        converted += 1
+    out.sort(key=lambda e: (e.ts_ns, e.outcome, e.origin))
+    return out, RelabelCount(len(rows), converted, len(venue), uncovered, collided, filled)
+
+
+def label_changes_by_day(
+    rows: typing.Iterable[tuple[int, int, int, int]],
+) -> dict[str, tuple[int, int]]:
+    """``{expiry UTC day: (instances whose accrued label differs from the
+    venue's, instances with both labels known)}`` over ``(outcome,
+    expiry_ns, y, y_engine)`` rows, each instance counted once."""
+    seen: dict[int, tuple[int, int, int]] = {}
+    for outcome, expiry_ns, y, y_engine in rows:
+        seen.setdefault(outcome, (expiry_ns, y, y_engine))
+    out: dict[str, tuple[int, int]] = {}
+    for expiry_ns, y, y_engine in seen.values():
+        if Y_UNKNOWN in (y, y_engine):
+            continue
+        d = day_of(expiry_ns)
+        changed, n = out.get(d, (0, 0))
+        out[d] = (changed + int(y != y_engine), n + 1)
+    return dict(sorted(out.items()))
+
+
+def tape_dirs(pulls: typing.Sequence[str], runs: typing.Sequence[str]) -> list[pathlib.Path]:
+    """The capture directories: ``part-*`` under each pull root, ``run-*``
+    under each runs root (the logs root when neither is given)."""
+    if not pulls and not runs:
+        runs = ["~/multivenue/logs"]
+    out: list[pathlib.Path] = []
+    for root in pulls:
+        out += sorted(pathlib.Path(os.path.expanduser(root)).glob("part-*"))
+    for root in runs:
+        out += sorted(pathlib.Path(os.path.expanduser(root)).glob("run-*"))
+    return out
+
+
+def relabel(
+    ledger: pathlib.Path,
+    entries: pathlib.Path,
+    dirs: typing.Sequence[pathlib.Path],
+    report: typing.Callable[[str], None],
+    dry_run: bool = False,
+) -> tuple[RelabelCount, RelabelCount]:
+    """The ``relabel`` lane: load the captures, label every instance on
+    them on LAW E-11, correct both stores (a timestamped backup of each
+    changed file first), and say what moved."""
+    tapes = claude_worker.bin15_tape.load_all(dirs, report)
+    if tapes:
+        deltas = sorted(t.delta_ns / 1e9 for t in tapes)
+        report(
+            f"bin15-accrue relabel: the anchor law ran early by {deltas[0]:.1f} .. "
+            f"{deltas[len(deltas) // 2]:.1f} (median) .. {deltas[-1]:.1f} s against the venue"
+        )
+    insts = claude_worker.bin15_tape.instances(tapes)
+    marks = claude_worker.bin15_tape.marks_by_underlying(tapes)
+    labels = {o: claude_worker.bin15_tape.label(i, marks) for o, i in insts.items()}
+    settled = sum(1 for lab in labels.values() if lab.y != Y_UNKNOWN)
+    checked = [
+        lab for lab in labels.values() if Y_UNKNOWN not in (lab.y, lab.y_next_strike)
+    ]
+    disagree = sum(1 for lab in checked if lab.y != lab.y_next_strike)
+    report(
+        f"bin15-accrue relabel: {len(tapes)} capture(s) of {len(dirs)}; "
+        f"{len(insts)} instance(s), {settled} settled on LAW E-11 "
+        f"(TWAP[T-W, T] >= strike, strict evidence); venue-published check: "
+        f"{len(checked)} checked, {disagree} disagree"
+    )
+    # The stores are read ONCE and replaced whole; an accrual that lands in
+    # between would be lost. Their stat at read time is checked again just
+    # before each replace, and a change aborts that write (rerun).
+    seen = (_stat(ledger), _stat(entries))
+    led_rows = claude_worker.bin15_ledger.read_ledger(ledger)
+    ent_rows = read_entries(entries)
+    new_led, cl = relabel_ledger(led_rows, tapes, labels)
+    new_ent, ce = relabel_entries(ent_rows, tapes, labels)
+    for name, c in (("ledger", cl), ("entries", ce)):
+        report(
+            f"  {name}: rows {c.rows}: converted {c.converted}, already on the venue "
+            f"law {c.already} (unknown labels filled {c.filled}), left on the engine "
+            f"label (no capture covers them) {c.uncovered}, collided {c.collided}"
+        )
+    by_day = label_changes_by_day(
+        (r.outcome, insts[r.outcome].expiry_ns, r.y, r.y_engine)
+        for r in new_led
+        if r.venue and r.outcome in insts
+    )
+    if by_day:
+        report(
+            "  ledger instances whose accrued label differs from the venue's, by expiry day: "
+            + "  ".join(f"{d[5:]} {c}/{n}" for d, (c, n) in by_day.items())
+            + f"  (total {sum(c for c, _ in by_day.values())}/{sum(n for _, n in by_day.values())})"
+        )
+    both = [e for e in new_ent if e.venue and Y_UNKNOWN not in (e.y, e.y_engine)]
+    report(
+        f"  entries settled on both labels: {len(both)}, flipped by the venue's law: "
+        f"{sum(1 for e in both if e.y != e.y_engine)}"
+    )
+    if dry_run:
+        report("  --dry-run: nothing written")
+        return cl, ce
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+    for path, count, before, write in (
+        (ledger, cl, seen[0], lambda p: claude_worker.bin15_ledger.write_ledger(p, new_led)),
+        (entries, ce, seen[1], lambda p: write_entries(p, new_ent)),
+    ):
+        if not (count.converted or count.collided or count.filled):
+            continue
+        if _stat(path) != before:
+            raise RuntimeError(
+                f"{path} changed while the relabel was reading the captures (an accrual?) "
+                "— nothing written to it; rerun the relabel"
+            )
+        if path.is_file():
+            shutil.copyfile(path, path.with_name(f"{path.name}.bak-relabel-{stamp}"))
+        write(path)
+    return cl, ce
 
 
 # ---------------------------------------------------------------------
@@ -452,6 +753,35 @@ def needed_n(p: float, edge: float, z: float = 2.0) -> int:
     return int(math.ceil(z * z * p * (1 - p) / (edge * edge)))
 
 
+def on_label(entries: typing.Sequence[Entry], label: str) -> tuple[list[Entry], int]:
+    """``(entries scored on ONE label, entries that carry none)``.
+
+    ``venue``: LAW E-11's ``y`` — relabelled or venue-accrued rows only;
+    an engine row is not the venue's outcome and is left out (counted).
+    ``engine``: the label each entry was accrued with — ``y_engine`` on a
+    relabelled row, ``y`` on an engine row; a venue-accrued row has none.
+    The report prints the two side by side until every entry is the
+    venue's (BIN15 S4); they are never mixed in one number.
+    """
+    if label not in ("venue", "engine"):
+        raise ValueError(f"label must be venue or engine, got {label!r}")
+    out: list[Entry] = []
+    missing = 0
+    for e in entries:
+        if label == "venue":
+            if e.venue:
+                out.append(e)
+            else:
+                missing += 1
+        elif not e.venue:
+            out.append(e)
+        elif e.y_engine != Y_UNKNOWN:
+            out.append(e._replace(y=e.y_engine))
+        else:
+            missing += 1
+    return out, missing
+
+
 def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
     """The three operator questions, with the error bar that decides
     whether any of them is an answer yet.
@@ -512,6 +842,13 @@ def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
         f"gross {usd(payout-cost)} ({100*(payout-cost)/cost:+.2f} %)  "
         f"net of the {fee_bps} bps exit leg {usd(payout-cost-fee)}"
     )
+    # Doc 27 §1: EV per dollar staked is p/a − 1 per entry, and the
+    # account's number is its STAKE-weighted mean — which is exactly the
+    # gross over the cost. Named, so nobody reads the hit rate for it.
+    out.append(
+        f"   EV per $ staked (p/a - 1, stake-weighted): {(payout-cost)/cost:+.4f} gross, "
+        f"{(payout-cost-fee)/cost:+.4f} net"
+    )
     out.append(
         f"   Wilson 95 % CI on the hit rate [{100*lo:.1f} %, {100*hi:.1f} %] — "
         f"break-even {100*avg_px:.1f} % is "
@@ -529,10 +866,16 @@ def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
                 f"     {100*e_:>3.0f} pts -> n = {need:5d}  ({more} more, "
                 f"~{more/96:.1f} days at 96 instances/day on one family)"
             )
+    # Phases keyed as the ENGINE keys its recalibration since BIN15 S3: on
+    # the pricing horizon of the venue's window, not the raw time left.
     for ph in range(claude_worker.bin15_ref.PHASES):
         sub = [
             e for e in settled
-            if claude_worker.bin15_ref.phase_of(max(e.expiry_ns - e.ts_ns, 1)) == ph
+            if claude_worker.bin15_ref.phase_of(
+                claude_worker.bin15_ref.pricing_horizon_ns(
+                    max(e.expiry_ns - e.ts_ns, 0), claude_worker.bin15_ledger.TWAP_15M_NS
+                )
+            ) == ph
         ]
         if sub:
             sk = sum(1 for e in sub if e.won)
@@ -593,7 +936,29 @@ def main(argv: list[str] | None = None) -> int:
     st = sub.add_parser("status", help="rows, instances, settled, days")
     st.add_argument("--entries", default=None)
 
+    rl = sub.add_parser(
+        "relabel", help="BIN15 S4: correct both stores in place onto the venue's law and clock"
+    )
+    rl.add_argument(
+        "--pull", action="append", default=[], help="a root of part-* pulls (repeatable)"
+    )
+    rl.add_argument("--runs", action="append", default=[], help="a root of run-* dirs (repeatable)")
+    rl.add_argument("--ledger", default=None)
+    rl.add_argument("--entries", default=None)
+    rl.add_argument("--dry-run", action="store_true")
+
     args = ap.parse_args(argv)
+
+    if args.lane == "relabel":
+        dirs = tape_dirs(args.pull, args.runs)
+        relabel(
+            claude_worker.bin15_ledger.ledger_path(args.ledger),
+            entries_path(args.entries),
+            dirs,
+            print,
+            dry_run=args.dry_run,
+        )
+        return 0
 
     if args.lane == "accrue":
         replay = pathlib.Path(
@@ -624,11 +989,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"bin15-accrue: {ent} entries={len(rows)}")
         for origin, group in by_origin(rows):
             settled = [e for e in group if e.settled]
+            venue = sum(1 for e in group if e.venue)
             print(
                 f"  {ORIGIN_NAMES.get(origin, origin)}: entries={len(group)} "
                 f"settled={len(settled)} "
                 f"days={len({day_of(e.ts_ns) for e in group})} "
-                f"families={len({e.family for e in group})}"
+                f"families={len({e.family for e in group})} "
+                f"venue_label={venue} engine_label={len(group) - venue}"
             )
         return 0
 
@@ -642,8 +1009,25 @@ def main(argv: list[str] | None = None) -> int:
         # its own line above the figures rather than buried in one of
         # them, so that quoting a number without it takes effort.
         print(f"  == {ORIGIN_NAMES.get(origin, origin)} accounting — {len(group)} entr(ies)")
-        for line in render(group, args.fee_bps_exit):
+        # BIN15 S4: the VENUE's label first — LAW E-11, what the venue
+        # pays on — and the label each entry was accrued with beside it,
+        # until every entry is on the venue's. Never one mixed number.
+        venue, engine_only = on_label(group, "venue")
+        print(
+            f"    -- VENUE label (LAW E-11: TWAP[T-60 s, T] >= strike): {len(venue)} entr(ies); "
+            f"{engine_only} still on the engine label (run `relabel`)"
+        )
+        lines = render(venue, args.fee_bps_exit) if venue else ["no entry on the venue label yet"]
+        for line in lines:
             print(f"    {line}")
+        engine, _ = on_label(group, "engine")
+        if engine:
+            print(
+                f"    -- ENGINE label, as accrued (the label before the relabel), beside it: "
+                f"{len(engine)} entr(ies)"
+            )
+            for line in render(engine, args.fee_bps_exit):
+                print(f"    {line}")
     return 0
 
 

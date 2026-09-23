@@ -639,6 +639,71 @@ pub fn settle_labels_by_outcome(
 mod tests {
     use super::*;
 
+    /// BIN15 S4: LAW E-11 against its Python mirror
+    /// (`claude_worker.hip4.settle_reference_1e6` / `payout_1e6`, which the
+    /// accrual's `relabel` lane labels every stored instance through), on
+    /// the shared tape `claude-worker/tests/fixtures/bin15/settle-1.input.tsv`
+    /// (`S` new series · `M ts px` · `Q expiry twap strike`). The expected
+    /// file is written HERE under `BIN15_SETTLE_WRITE=1` — the engine's code
+    /// is the law and the worker follows it. Tolerance is zero.
+    #[test]
+    fn the_settlement_law_matches_its_python_mirror() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../claude-worker/tests/fixtures/bin15/");
+        let src = std::fs::read_to_string(format!("{dir}settle-1.input.tsv")).expect("settle-1 input");
+        let mut marks: Vec<(u64, i64)> = Vec::new();
+        let mut out: Vec<String> = Vec::new();
+        for line in src.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let f: Vec<&str> = l.split('\t').collect();
+            match f[0] {
+                "S" => marks.clear(),
+                "M" => marks.push((f[1].parse().expect("ts"), f[2].parse().expect("px"))),
+                "Q" => {
+                    let q = inst(
+                        f[3].parse().expect("strike"),
+                        f[1].parse().expect("expiry"),
+                        f[2].parse().expect("twap"),
+                    );
+                    out.push(match settle_reference_1e6(&marks, &q) {
+                        Some(r) => format!("Q\t{r}\t{}", payout_1e6(r, q.strike_1e6)),
+                        None => "Q\t-\t-".to_owned(),
+                    });
+                }
+                other => panic!("settle-1: unknown record `{other}`"),
+            }
+        }
+        assert!(out.len() > 300, "the tape produced almost nothing ({} rows)", out.len());
+        assert!(out.iter().any(|r| r == "Q\t-\t-"), "no refused query");
+        assert!(out.iter().any(|r| r.ends_with("\t0")), "no out-of-the-money query");
+        assert!(out.iter().any(|r| r.ends_with("\t1000000")), "no in-the-money query");
+        let expected = format!("{dir}settle-1.expected.tsv");
+        if std::env::var("BIN15_SETTLE_WRITE").as_deref() == Ok("1") {
+            let mut text = String::from(
+                "# settle-1.expected.tsv — WRITTEN by crates/cli/src/backtest/binary.rs \
+                 (BIN15_SETTLE_WRITE=1).\n# Q reference_1e6 payout_1e6   (`-` = the evidence is not there)\n",
+            );
+            for r in &out {
+                text.push_str(r);
+                text.push('\n');
+            }
+            std::fs::write(&expected, text).expect("write settle-1 expected");
+            return;
+        }
+        let want = std::fs::read_to_string(&expected)
+            .unwrap_or_else(|e| panic!("{expected}: {e} (run with BIN15_SETTLE_WRITE=1)"));
+        let want: Vec<&str> =
+            want.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        assert_eq!(out.len(), want.len(), "settle-1: row count moved — the tape changed, not the law");
+        let mut i = 0usize;
+        while i < want.len() {
+            assert_eq!(out[i], want[i], "settle-1 row {} disagrees with the mirror", i + 1);
+            i += 1;
+        }
+    }
+
     fn inst(strike_1e6: i64, expiry_ns: u64, twap_ns: u64) -> BinaryInstance {
         BinaryInstance {
             sym_yes: 0x0400_1000,
