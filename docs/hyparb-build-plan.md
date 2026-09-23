@@ -1900,7 +1900,7 @@ As §6 says, with these decisions recorded:
   Fuzz target `evm_exec_response`. `crates/exec-hyperevm` joins
   `scripts/copy-audit.sh`'s default list (new=0).
 
-### 16.15 H8 — the write path wired (live smoke: §16.16)
+### 16.15 H8 — the write path wired (live battery: §16.16, DONE)
 
 * **The shadow, as O-H12 rules it.** `mode = "testnet"` runs the SAME
   paper member; each AMM decision it submits is recorded in a 64-deep
@@ -1973,29 +1973,124 @@ As §6 says, with these decisions recorded:
   under zsh against a stub binary (hybrid, testnet, EVM_HYBRID alone →
   78, EVM_HYBRID=yes → 78, the live line byte-identical).
 
-### 16.16 H8 live — the testnet battery (PENDING: wallet 0 unfunded)
+### 16.16 H8 live — the testnet battery: DONE(H8) (2026-09-23 17:13–17:39Z)
 
-The code is gated; the live run waits on ONE operator action: testnet
-HYPE on HyperEVM (chain 998) for wallet 0 — the `HYPERLIQUID_TESTNET_AGENT_KEY`
-address, `0x4fae176f2961bfab3e3a71465b48c113efa0bfcd` (≈ 0.2 HYPE covers
-the deploy, the funding of wallets 1–2 and the battery). `status` on
-2026-09-23: chain 998 OK, every wallet `Unfunded`. Then, on the Mac,
-without stopping the armed engine (standalone verbs, pitfall 7):
+**An exec battery, not a market result** (§12): every number below is
+chain 998; none is a mainnet, edge or race-win number.
+
+The operator put 0.3 testnet HYPE on HyperEVM at wallet 0,
+`0x4fae176f2961bfab3e3a71465b48c113efa0bfcd`, the address of
+`HYPERLIQUID_TESTNET_AGENT_KEY`. A Core → EVM transfer credits the sender's
+own EVM address, so funding the master account's EVM balance did not reach
+wallet 0. A plain EVM transfer from the master account did.
+
+The runbook as run, on the Mac, with standalone verbs; the armed engine was
+never touched (pitfall 7). The wrapper is zsh: run it directly or with
+`zsh`. Never run it with `sh`, which fails on `${0:A:h:h}`.
 
 ```sh
-H=target/hyparb-stage/hyparb-h8.toml          # a copy of the example, mode = "testnet", wallets = 3
+H=target/hyparb-stage/hyparb-h8.toml    # the example; wallets = 3; [testnet] filled in below
 scripts/evm-testnet.sh status  --hyparb $H
 scripts/evm-testnet.sh fund    --hyparb $H --amount-wei 20000000000000000
-scripts/evm-testnet.sh deploy  --hyparb $H    # → set [testnet] executor
+scripts/evm-testnet.sh deploy  --hyparb $H    # → [testnet] executor
 scripts/evm-testnet.sh mint    --hyparb $H --token 0x87d7e58c6ebc80a2b61d3336972f5c909aff6851 \
-                               --amount-raw 1000000000000000000000000
-#   [testnet] pool = "0x7d03bc2f8b30b9ebe5ac3d473768af502ec43d29", amount_raw = 1000000000000000000
-scripts/evm-testnet.sh battery      --hyparb $H   # DONE(H8): (0) owner (a) (b) (c) (c2)
-scripts/evm-testnet.sh shadow-smoke --hyparb $H   # the engine's O-H12 path, read 999 / write 998
+                               --amount-raw 1000000000000000000000
+#   [testnet] pool = "0x7d03bc2f8b30b9ebe5ac3d473768af502ec43d29", amount_raw = 5000000000000000000
+scripts/evm-testnet.sh battery      --hyparb $H
+#   amount_raw = 100000000000000 (a sell spends token0, and the battery's buy left ~1.3e15)
+scripts/evm-testnet.sh shadow-smoke --hyparb $H
 ```
 
-Record the battery and smoke lines here (headed as an exec battery,
-never a market result) in a follow-up commit.
+**The pool** is a Hyperswap V3 pool (see the §12 correction):
+
+* token0 is leLIQD `0x6240…76e2`; token1 is leUSDT0 `0x87d7…6851`. Both
+  have 18 decimals.
+* Price ≈ 3,833 token1 per token0, at tick 82,517.
+
+**Run 1 (17:13–17:18Z, the H9c binary): FAILED on (a).**
+
+* **fund.**
+  * The first attempt got a transient JSON-RPC `-32602` from the public
+    endpoint. The verb reported an unreadable answer and exited 1;
+    nothing was sent.
+  * The rerun funded wallet 1 (block 65,056,066) and wallet 2
+    (65,056,069), 0.02 HYPE each.
+* **deploy.** Executor `0x207d…9f56`, from the H7b bytes (init sha256
+  `0x279f…2532`). Block 65,056,106, 541,752 gas.
+* **mint.**
+  * A 1e24 leUSDT0 mint was MINED AND REVERTED: block 65,056,158, 26,651
+    gas. The token enforces a per-account mint limit ("Mint limit exceeded
+    for this account").
+  * A 1e21 mint (1,000 leUSDT0) went through: block 65,056,195.
+* **battery.**
+  * (0) The owner check passed.
+  * **(a) REVERTED:** block 65,056,219, 90,828 gas. The pool calls
+    `hyperswapV3SwapCallback`, which the executor did not implement
+    (§16.7, H9d).
+  * (b) Wallets 0/1/2 at nonces 6/0/0, blocks 65,056,221/222/223.
+  * (c) Fee cap 44,417,408 < base fee 88,834,817: the node refused it and
+    nonce 7 was returned.
+  * (c2) The zero tip landed in block 65,056,227 (index 2); the high tip
+    in block 65,056,228 (index 0).
+
+**Run 2 (17:37–17:39Z, the binary built at H9d `9e1b68d`): PASS.**
+
+* **deploy.**
+  * Executor `0x6c164de64e91bbdae20e9b3d2a672675c0e89cc5`. Block
+    65,057,425, 544,106 gas.
+  * Init sha256 `0xea4b…75cb`, which is the committed H9d bytes.
+  * The on-chain runtime equals `HyparbExecutor.runtime.bin` with the three
+    `owner` immutable slots filled, checked byte for byte.
+* **mint.** 1e21 leUSDT0: block 65,057,449, 76,181 gas.
+* **battery**, at a base fee of 87,500,000 wei:
+  * (0) `owner()` = wallet 0.
+  * (a) Nonce 9, block 65,057,461, status 1, 109,298 gas. 5 leUSDT0 in,
+    1.299e15 raw leLIQD out. The receipt carries two `Transfer` logs and
+    the V3 `Swap` topic `0xc42079f9`, so the ingress's `v3` decoder reads
+    Hyperswap swaps as they are.
+  * (b) Wallets 0/1/2 at nonces 10/2/2, blocks 65,057,464/465/466. No
+    nonce collision.
+  * (c) Fee cap 43,750,000 < base fee 87,500,000: the node refused it and
+    nonce 11 was returned. The losing bid never took a nonce.
+  * (c2) The zero tip landed in block 65,057,471 (index 1); the
+    4,375,000,000-wei tip in block 65,057,472 (index 0). They landed in
+    different blocks again (2 runs of 2), so ordering inside a block was
+    not observed.
+  * The verdict line: `DONE(H8): (a) landed and reconciled · (b) three
+    wallets, no nonce collision · (c) the underbid lost`.
+* **shadow-smoke.** This exercises the engine's O-H12 path: the read
+  endpoint answered chain 999 (the archive endpoint), the writes went to
+  998.
+  * Input: 3 synthetic decisions (buy, sell, buy) at `amount_raw` 1e14.
+  * Result: 3 swaps from wallet 0 at nonces 11/12/13, blocks
+    65,057,501/503/506. All status 1, at 92,186 / 92,875 / 92,186 gas.
+    Each was mined ≈ 1.2 s after it was sent.
+  * G2 bid a 7.8125 gwei tip: a quarter of the synthetic $0.50 edge, at
+    the $40 gas coin.
+  * Counters: decisions 3, sends 3, accepted 3, `mined_ok` 3, reverted 0,
+    superseded 0, timeouts 0, halted 0.
+  * The verdict line: `shadow smoke PASS`.
+
+**Findings.**
+
+* **The battery caught a contract bug the fork suite could not.** The
+  suite had no Hyperswap pool. Fixed in H9d (§16.7): a third callback name
+  and a fifth fork test.
+* **§12's "no Hyperswap on testnet" was wrong.** The correction is in §12.
+* **An over-limit mint is not refused at the node.** A mint above the
+  token's per-account limit is mined and reverts, so the gas is spent.
+* **`[testnet] amount_raw` is an `i64`.** At 18 decimals that caps a swap
+  at ≤ 9.22 tokens. That is enough for the battery; a larger shadow size
+  would need `u128` in the grammar, which testnet does not need.
+* **The public endpoint's transient `-32602` stops a verb.** The verb
+  exits with an unreadable answer and nothing is sent; rerunning is the
+  recovery. In the engine's shadow, an unreadable answer to a routine read
+  at boot is DARK (R3).
+* **Left behind:**
+  * The run-1 executor `0x207d…9f56` holds 1,000 testnet leUSDT0. There is
+    no sweep verb; this is harmless.
+  * Wallet balances afterwards: wallet 0 ≈ 0.2597 HYPE, wallets 1/2 ≈
+    0.0200 / 0.0198.
 
 ### 16.17 H9 — review fixes, gates (2026-09-23)
 
