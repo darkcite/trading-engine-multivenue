@@ -720,7 +720,8 @@ const BIN_OUTCOME: u32 = 2650;
 /// A strike far below the mark: the Yes leg settles at 1.0.
 const BIN_STRIKE_1E6: i64 = 70_000_000_000;
 const BIN_MARK_1E6: i64 = 79_000_000_000;
-/// The instance expires 40 s into the run and TWAPs over 10 s.
+/// The instance expires 40 s into the run and TWAPs over the 10 s
+/// BEFORE that (BIN15 S1).
 const BIN_EXPIRY_OFF: u64 = 40_000_000_000;
 const BIN_TWAP_S: u16 = 10;
 
@@ -813,18 +814,24 @@ fn a_binary_held_through_expiry_settles_at_the_payout_not_the_last_book() {
     let root = tmp_root("bin15-settle");
     let dir = run_dir(&root, EPOCH_1);
     bin_manifest(&dir, true);
-    // The roll binds the instance at the run's start; the marks after
-    // the expiry are the settlement TWAP (>= SETTLE_MIN_MARKS of them).
+    // The roll binds the instance at the run's start; the marks in the
+    // TWAP window ENDING at the expiry (BIN15 S1, LAW E-11:
+    // `[expiry − twap, expiry]`) are the settlement evidence
+    // (>= SETTLE_MIN_MARKS of them). The one after the expiry must not
+    // be read.
     write_events(
         &dir,
         EPOCH_1,
         &[
             bin_roll(1_000, HL_YES, false),
             bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            // In force at the window's open (the evidence must cover it).
+            bin_mark(BIN_EXPIRY_OFF - 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 7_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 4_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 1_000_000_000, HL_BTC, BIN_MARK_1E6),
             bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 3_000_000_000, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 7_000_000_000, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 10_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF + 3_000_000_000, HL_BTC, 1_000_000),
         ],
     );
     // The Yes book: an ask at 0.40 that the order crosses, then a LAST
@@ -886,9 +893,9 @@ fn a_roll_whose_underlying_is_not_in_the_manifest_is_counted_not_guessed() {
         &[
             bin_roll(1_000, HL_YES, false),
             bin_mark(2_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 9_000_000_000, HL_BTC, BIN_MARK_1E6),
+            bin_mark(BIN_EXPIRY_OFF - 5_000_000_000, HL_BTC, BIN_MARK_1E6),
             bin_mark(BIN_EXPIRY_OFF, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 5_000_000_000, HL_BTC, BIN_MARK_1E6),
-            bin_mark(BIN_EXPIRY_OFF + 10_000_000_000, HL_BTC, BIN_MARK_1E6),
         ],
     );
     write_ticks(

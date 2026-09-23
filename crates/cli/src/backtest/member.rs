@@ -458,25 +458,63 @@ struct Bin15EntryRow {
     origin: u8,
 }
 
+/// BIN15 S1: a sidecar number that may be absent — `null` or the value,
+/// rendered straight into the row being written (no owned temporary).
+struct OrNull(Option<i64>);
+
+impl core::fmt::Display for OrNull {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{v}"),
+            None => f.write_str("null"),
+        }
+    }
+}
+
+/// BIN15 S1: the settlement fields every sidecar row carries — `y` (the
+/// venue's law, `null` when this window cannot derive it),
+/// `y_next_strike` (the venue-published label, `-1` unknown or a tie)
+/// and `settle_px_1e6` (the TWAP `y` was read from, `null` with `y`).
+fn label_of(
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+    outcome: u32,
+) -> (OrNull, i64, OrNull) {
+    match labels.get(&outcome) {
+        Some(l) => (OrNull(l.value_1e6), l.y_next_strike, OrNull(l.px_1e6)),
+        None => (
+            OrNull(None),
+            crate::backtest::binary::Y_NEXT_STRIKE_UNKNOWN,
+            OrNull(None),
+        ),
+    }
+}
+
 /// The `bin15_entries` block of the detail sidecar.
+///
+/// BIN15 S1: `y_next_strike` and `settle_px_1e6` are ADDITIVE keys; a
+/// reader that predates them ignores them (the worker's reads by key).
+/// Each row is written straight into `s` — the reservation covers a
+/// realistic row (~280 B of the 360 reserved), so the block renders in
+/// one buffer without regrowth in practice.
 fn render_bin15_entries(
     rows: &[Bin15EntryRow],
-    y_by_outcome: &BTreeMap<u32, i64>,
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
 ) -> String {
-    let mut s = String::with_capacity(64 + rows.len() * 160);
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(64 + rows.len() * 360);
     s.push_str("\"bin15_entries\":[");
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let y = match y_by_outcome.get(&r.outcome) {
-            Some(v) => v.to_string(),
-            None => "null".to_owned(),
-        };
-        s.push_str(&format!(
+        let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
              \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
-             \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{}}}",
+             \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{},\
+             \"y_next_strike\":{},\"settle_px_1e6\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -488,8 +526,10 @@ fn render_bin15_entries(
             r.qty_1e6,
             r.p_hat_1e6,
             r.origin,
-            y
-        ));
+            y,
+            y_next,
+            settle_px
+        );
     }
     s.push(']');
     s
@@ -503,22 +543,22 @@ fn render_bin15_entries(
 /// inventing a payout is how a calibration table comes out flattering.
 fn render_bin15_ledger(
     rows: &[Bin15LedgerRow],
-    y_by_outcome: &BTreeMap<u32, i64>,
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
 ) -> String {
-    let mut s = String::with_capacity(64 + rows.len() * 112);
+    use core::fmt::Write as _;
+    let mut s = String::with_capacity(64 + rows.len() * 256);
     s.push_str("\"bin15_ledger\":[");
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
-        let y = match y_by_outcome.get(&r.outcome) {
-            Some(v) => v.to_string(),
-            None => "null".to_owned(),
-        };
-        s.push_str(&format!(
+        let (y, y_next, _) = label_of(labels, r.outcome);
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"tau_ns\":{},\
              \"p_hat_1e6\":{},\"p_raw_1e6\":{},\"arm\":{},\"entered\":{},\
-             \"mid_1e6\":{},\"y\":{}}}",
+             \"mid_1e6\":{},\"y\":{},\"y_next_strike\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -528,8 +568,9 @@ fn render_bin15_ledger(
             r.arm,
             r.entered,
             r.mid_1e6,
-            y
-        ));
+            y,
+            y_next
+        );
     }
     s.push(']');
     s
@@ -1404,7 +1445,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
             &if bin15_ledger.is_empty() {
                 String::new()
             } else {
-                let y = crate::backtest::binary::settle_values_by_outcome(
+                let y = crate::backtest::binary::settle_labels_by_outcome(
                     &merged,
                     &binary_underlying,
                     window_end_wall_ns,
@@ -1611,11 +1652,21 @@ mod tests {
             origin: core_types::FILL_ORIGIN_PAPER,
         };
         let mut y = BTreeMap::new();
-        y.insert(7u32, 1_000_000i64);
+        y.insert(
+            7u32,
+            crate::backtest::binary::BinaryLabel {
+                value_1e6: Some(1_000_000),
+                px_1e6: Some(77_083_333_333),
+                y_next_strike: 1_000_000,
+            },
+        );
         let s = render_bin15_entries(&[row], &y);
 
         assert!(s.contains("\"origin\":1"), "{s}");
         assert!(s.contains("\"y\":1000000"), "{s}");
+        // BIN15 S1: the two additive settlement keys ride every row.
+        assert!(s.contains("\"y_next_strike\":1000000"), "{s}");
+        assert!(s.contains("\"settle_px_1e6\":77083333333"), "{s}");
         // PAPER is 1 and VENUE is 0 — pinned here because the Python
         // reader mirrors those two integers and nothing else connects
         // them.
@@ -1627,5 +1678,7 @@ mod tests {
         let s2 = render_bin15_entries(&[row], &BTreeMap::new());
         assert!(s2.contains("\"origin\":1"), "{s2}");
         assert!(s2.contains("\"y\":null"), "{s2}");
+        assert!(s2.contains("\"y_next_strike\":-1"), "{s2}");
+        assert!(s2.contains("\"settle_px_1e6\":null"), "{s2}");
     }
 }

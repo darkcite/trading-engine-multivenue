@@ -2800,9 +2800,17 @@ pub(crate) fn render_binary_line(reg: &binary::BinaryRegistration) -> String {
     if reg.instances == 0 {
         return String::new();
     }
+    // BIN15 S1: the law in force, and the venue-published cross-check
+    // (the successor's strike is the venue's settlement price) — a
+    // disagreement is a finding, printed, never absorbed.
     format!(
-        "binary: instances={} settled={} unsettleable={}",
-        reg.instances, reg.settled, reg.unsettleable
+        "binary: instances={} settled={} unsettleable={} law=twap[T-w,T] \
+         next_strike_checked={} settle_disagree_next_strike={}",
+        reg.instances,
+        reg.settled,
+        reg.unsettleable,
+        reg.next_strike_checked,
+        reg.settle_disagree_next_strike
     )
 }
 

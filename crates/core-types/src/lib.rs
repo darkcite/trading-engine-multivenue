@@ -3443,6 +3443,59 @@ pub const fn roll_kind_strict(seq: u64) -> Option<bool> {
     }
 }
 
+/// BIN15 S1 (LAW E-11): the first instant of a HIP-4 instance's
+/// settlement window, epoch ns.
+///
+/// The venue's rules text for the rolling BTC 15-minute market reads
+/// "Settlement is according to the 60-second TWAP of BTC-USDC perp mark
+/// price ENDING at <expiry> UTC". The window is therefore
+/// `[expiry − twap, expiry]` — the minute BEFORE the expiry — and not
+/// `[expiry, expiry + twap]`, which is what the harness, the audit and
+/// the lane's restart law assumed until 2026-09-23 (vault doc 27 R0,
+/// confirmed on all 15 of the account's own venue settlements, plan 28
+/// S0). `twap_ns == 0` (the native daily families) is the degenerate
+/// window `[expiry, expiry]`: they settle on the last mark at `T`.
+#[inline(always)]
+#[must_use]
+pub const fn binary_settle_open_ns(expiry_ns: u64, twap_ns: u64) -> u64 {
+    expiry_ns.saturating_sub(twap_ns)
+}
+
+/// BIN15 S1 (LAW E-11): one piece of a HIP-4 settlement TWAP — the
+/// price `px_1e6` IN FORCE over `[from_ns, to_ns)`, clipped to the
+/// window `[open_ns, close_ns]` — as `(px × dt, dt)` in (×1e6 · ns, ns).
+///
+/// The one arithmetic every consumer of the law shares: the harness
+/// and the audit fold a captured mark series through it
+/// (`cli::backtest::binary::settle_reference_1e6`), and the member's
+/// running TWAP (BIN15 S3) is to fold its live marks through the same
+/// piece to know how much of the average is already decided. A TWAP is
+/// TIME-weighted — each mark counts for as long as it was the mark —
+/// with the last mark carried forward, so a burst of prints in one
+/// second weighs one second and a quiet stretch keeps the price that
+/// was in force.
+///
+/// `i128` because `px × dt` is a mark ×1e6 (a $100k BTC is `1e11`)
+/// times up to a minute of ns (`6e10`): `6e21`, past `i64`.
+/// A piece that lies outside the window, or has no length, is `(0, 0)`.
+#[inline(always)]
+#[must_use]
+pub const fn binary_twap_segment(
+    px_1e6: i64,
+    from_ns: u64,
+    to_ns: u64,
+    open_ns: u64,
+    close_ns: u64,
+) -> (i128, u64) {
+    let lo = if from_ns > open_ns { from_ns } else { open_ns };
+    let hi = if to_ns < close_ns { to_ns } else { close_ns };
+    if hi <= lo {
+        return (0, 0);
+    }
+    let dt = hi - lo;
+    (px_1e6 as i128 * dt as i128, dt)
+}
+
 /// HIP-4 exposure for one outcome: `|yes − no|`.
 ///
 /// Equal legs are riskless collateral — one pays $1 and the other $0
@@ -3464,6 +3517,36 @@ pub const fn net_exposure_1e8(yes_1e8: i64, no_1e8: i64) -> i64 {
 #[cfg(test)]
 mod roll_codec_tests {
     use super::*;
+
+    /// BIN15 S1: the window is the minute BEFORE the expiry.
+    #[test]
+    fn the_settlement_window_ends_at_the_expiry() {
+        assert_eq!(binary_settle_open_ns(1_000_000, 60), 999_940);
+        assert_eq!(binary_settle_open_ns(10, 0), 10, "a zero TWAP is the instant T");
+        assert_eq!(binary_settle_open_ns(5, 60), 0, "saturates, never wraps");
+    }
+
+    /// BIN15 S1: a price counts for exactly the part of its interval
+    /// that lies inside the window.
+    #[test]
+    fn a_twap_segment_is_clipped_to_the_window() {
+        // Entirely inside.
+        assert_eq!(binary_twap_segment(7, 10, 20, 0, 100), (70, 10));
+        // Straddles the open: only [open, to) counts.
+        assert_eq!(binary_twap_segment(7, 0, 20, 10, 100), (70, 10));
+        // Straddles the close: only [from, close] counts.
+        assert_eq!(binary_twap_segment(7, 90, 200, 0, 100), (70, 10));
+        // Covers the whole window.
+        assert_eq!(binary_twap_segment(3, 0, 1_000, 100, 200), (300, 100));
+        // Before, after, and empty.
+        assert_eq!(binary_twap_segment(7, 0, 10, 10, 100), (0, 0));
+        assert_eq!(binary_twap_segment(7, 100, 110, 10, 100), (0, 0));
+        assert_eq!(binary_twap_segment(7, 50, 50, 10, 100), (0, 0));
+        // A $100k mark over a full minute does not overflow.
+        let (s, dt) = binary_twap_segment(100_000_000_000, 0, 60_000_000_000, 0, 60_000_000_000);
+        assert_eq!(dt, 60_000_000_000);
+        assert_eq!(s, 6_000_000_000_000_000_000_000i128);
+    }
 
     #[test]
     fn the_codec_round_trips_every_field() {

@@ -720,8 +720,10 @@ pub struct BinarySettle {
     /// Wall ns from which the instance no longer trades — the venue
     /// clears the book at expiry.
     pub halt_ns: u64,
-    /// Wall ns at which the value is known (expiry + the settlement
-    /// TWAP window; equal to `halt_ns` when the family settles at `T`).
+    /// Wall ns at which the value is known. BIN15 S1: the expiry itself
+    /// — the venue's TWAP ENDS at `T` (LAW E-11), so `settle_ns ==
+    /// halt_ns` for every HIP-4 instance today; the field stays its own
+    /// because the queue law does not need the two to coincide.
     pub settle_ns: u64,
     /// The binary payout: 0 or 1_000_000 (×1e6 of one USDC).
     pub value_1e6: i64,
@@ -1440,15 +1442,7 @@ impl FillEngine {
         // counted, which is also what the live matcher does to it (the
         // I1 TTL outlives nothing).
         if self.settled.contains(&sym) {
-            let mut i = 0usize;
-            while i < self.open_len {
-                if self.open[i].sym == sym {
-                    self.remove_open(i);
-                    self.settled_sym_orders_canceled += 1;
-                } else {
-                    i += 1;
-                }
-            }
+            self.cancel_open_of(sym);
             return;
         }
 
@@ -1531,6 +1525,20 @@ impl FillEngine {
                     }
                 }
                 _ => i += 1,
+            }
+        }
+    }
+
+    /// Cancel every open order on `sym` and count it — the venue took
+    /// the instrument's book away (an option or binary at its expiry).
+    fn cancel_open_of(&mut self, sym: u32) {
+        let mut i = 0usize;
+        while i < self.open_len {
+            if self.open[i].sym == sym {
+                self.remove_open(i);
+                self.settled_sym_orders_canceled += 1;
+            } else {
+                i += 1;
             }
         }
     }
@@ -1827,6 +1835,14 @@ impl FillEngine {
                 }
             }
             if let Some((sym, head)) = settle_now {
+                // BIN15 S1: the venue CLEARS the book at the expiry. With
+                // the TWAP ending at `T` the halt and the settle coincide
+                // (`settle_ns == halt_ns`), so the settle branch runs first
+                // and the sym never passes through `settled` — the F12
+                // guard that used to cancel an order resting across the
+                // expiry never sees it. Cancel here, as the halt would
+                // have, or that order fills against the successor's book.
+                self.cancel_open_of(sym);
                 self.settle_binary(sym, &head);
                 if let Some(q) = self.binary_settle.get_mut(&sym) {
                     q.remove(0);
@@ -1834,8 +1850,9 @@ impl FillEngine {
                         self.binary_settle.remove(&sym);
                     }
                 }
-                // The slot trades again the moment its successor is
-                // bound — nothing else un-settles a sym.
+                // The slot trades again from the settle instant — the
+                // successor instance exists from `T` (BIN15 S1). Nothing
+                // else un-settles a sym.
                 self.binary_halted.remove(&sym);
                 self.settled.remove(&sym);
                 continue;
@@ -2746,6 +2763,44 @@ mod tests {
         assert!(o.full_fees_1e12 > 0, "the closing legs paid");
         // Nothing is left open: every instance closed at its payout.
         assert_eq!(o.full_unreal_1e12, 0);
+    }
+
+    /// BIN15 S1: with the TWAP ending at the expiry the halt and the
+    /// settle are ONE instant. An order resting across it must still be
+    /// taken off the book — the venue clears it at `T` — and must never
+    /// fill against the successor's quotes on the same slot.
+    #[test]
+    fn a_settle_at_the_expiry_takes_a_resting_order_off_the_book() {
+        let sym = hl_slot_sym();
+        let mut e = binary_engine();
+        e.set_binary_settle(
+            sym,
+            BinarySettle {
+                halt_ns: 1_000_000_000,
+                settle_ns: 1_000_000_000,
+                value_1e6: 1_000_000,
+            },
+        );
+        let mut out = Vec::new();
+        // A bid at 0.50 against an ask of 0.60: it rests.
+        e.intake(&grid_bid(1), 1);
+        e.on_record(
+            &tick(sym, 300_000, 500_000_000, 600_000, 500_000_000),
+            10,
+            500_000_000,
+            &mut out,
+        );
+        assert!(out.is_empty(), "it rests while the instance is live");
+        // The expiry passes; the next record is the successor's book,
+        // which WOULD cross the resting bid.
+        e.on_record(&crossing_tick(), 20, 1_000_000_000, &mut out);
+        assert!(out.is_empty(), "the order died with the instance's book");
+        e.on_record(&crossing_tick(), 30, 1_500_000_000, &mut out);
+        assert!(out.is_empty(), "and never fills later either");
+        let o = e.finish();
+        assert_eq!(o.settled_sym_orders_canceled, 1, "canceled and counted");
+        assert_eq!(o.binary_settled, 0, "nothing was held, nothing settled");
+        assert_eq!(o.fills_total, 0);
     }
 
     /// E7 (2026-09-19, mainnet): the venue charges the TRADE nothing

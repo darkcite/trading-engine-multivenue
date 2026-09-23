@@ -977,6 +977,7 @@ fn load_run_events(
                         created_ns: wall_of(e.ts_ns),
                         expiry_ns: e.v1 as u64,
                         twap_ns: u64::from(twap_s) * 1_000_000_000,
+                        next_strike_1e6: 0,
                     });
                 } else if e.channel == ChannelId::Mark as u8 && e.v0 > 0 {
                     let Some(d) = desc else { continue };
@@ -1121,9 +1122,15 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // before the expiry" on a zero-TWAP instance, and a scan that
     // trusts an invariant should not have to trust that nothing ever
     // reorders the loader.
+    // BIN15 S1: a STABLE sort, as `binary::marks_by_sym` does — two marks
+    // on one stamp must carry forward in the same order on both surfaces,
+    // or the harness and the audit settle one minute two ways.
     for v in bin_out.marks.values_mut() {
-        v.sort_unstable_by_key(|(ts, _)| *ts);
+        v.sort_by_key(|(ts, _)| *ts);
     }
+    // BIN15 S1: each instance's successor strike — the venue's own
+    // settlement price — linked across runs, once every run is in.
+    crate::backtest::binary::link_successors(&mut bin_out.instances);
     for l in &loads {
         report(&format!(
             "audit-pnl: run-{}: ticks={} orders={} fills={} commits={} manifest={}{}{}{}",
@@ -1224,31 +1231,40 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     // slot 3 goes live — an unconditional zero line on every nightly
     // report would be noise.
     if bin_out.rolls > 0 {
-        let bin_reaches = bin_out
-            .instances
-            .iter()
-            .filter(|i| i.settle_ns() <= window_end_ns)
-            .count();
+        // BIN15 S1: an instance REACHES its settlement instant at its
+        // expiry — the TWAP ends there (LAW E-11).
+        let mut bin_reaches = 0usize;
         // SETTLEABLE is the number that matters: an instance can reach
         // its settlement instant inside the window and still have no
         // payout, because the window does not hold enough of its
         // underlying's marks to average. Those mark out, and the gap
         // between these two numbers is where a report quietly stops
         // being about settlements.
-        let bin_settleable = bin_out
-            .instances
-            .iter()
-            .filter(|i| {
-                i.settle_ns() <= window_end_ns
-                    && i.expiry_ns != 0
-                    && bin_out
-                        .underlying_of
-                        .get(&i.sym_yes)
-                        .and_then(|u| bin_out.marks.get(u))
-                        .and_then(|m| crate::backtest::binary::settle_value(m, i))
-                        .is_some()
-            })
-            .count();
+        let mut bin_settleable = 0usize;
+        // BIN15 S1: the venue-published cross-check — the successor's
+        // strike IS the venue's settlement price (rounded to the strike
+        // grid), so `next_strike > strike` is the venue's own label. A
+        // disagreement with our TWAP is a FINDING, printed, never
+        // absorbed; a tie (the rounding hides the side) is not judged.
+        let mut next_checked = 0u64;
+        let mut next_disagree = 0u64;
+        for i in &bin_out.instances {
+            if !i.settle_reached(window_end_ns) {
+                continue;
+            }
+            bin_reaches += 1;
+            let value = bin_out
+                .underlying_of
+                .get(&i.sym_yes)
+                .and_then(|u| bin_out.marks.get(u))
+                .and_then(|m| crate::backtest::binary::settle_value(m, i));
+            if let Some(v) = value {
+                bin_settleable += 1;
+                let (c, d) = crate::backtest::binary::next_strike_check(i, v);
+                next_checked += c;
+                next_disagree += d;
+            }
+        }
         // An unpaired roll's positions MARK OUT instead of settling:
         // its manifest is missing the [no] leg or the underlying.
         let unpaired = if bin_out.rolls_unpaired > 0 {
@@ -1257,7 +1273,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             ""
         };
         report(&format!(
-            "audit-pnl: bin15 settlement table: {} of {} instance(s) settleable ({} reaching their instant) from {} roll row(s), marks={} unpaired_rolls={}{}",
+            "audit-pnl: bin15 settlement table: {} of {} instance(s) settleable ({} reaching their instant) from {} roll row(s), marks={} unpaired_rolls={}{} law=twap[T-w,T] next_strike_checked={} settle_disagree_next_strike={}",
             bin_settleable,
             bin_out.instances.len(),
             bin_reaches,
@@ -1265,6 +1281,8 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             bin_out.marks_kept,
             bin_out.rolls_unpaired,
             unpaired,
+            next_checked,
+            next_disagree,
         ));
     }
 

@@ -918,10 +918,12 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
 
     // The events: the roll that binds the instance, then the marks.
     // Two marks in different minutes are what publish σ̂ (the
-    // transcendentals run once a minute, never per tick), and the four
-    // after expiry are the settlement TWAP.
+    // transcendentals run once a minute, never per tick), and the ones
+    // every 5 s through the minute ENDING at the expiry are the
+    // settlement TWAP (BIN15 S1, LAW E-11: `[expiry − twap, expiry]`,
+    // covered from its open with no hole over 10 s).
     let mut events = vec![bin15_roll(family, false), bin15_mark(1), bin15_mark(61)];
-    for at in [600u64, 620, 640, 660] {
+    for at in (540u64..=600).step_by(5) {
         events.push(bin15_mark(at));
     }
     let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, BIN15_EPOCH_NS)
@@ -940,8 +942,14 @@ fn build_bin15_capture(root: &Path, family: u8, families_toml: &str) -> (PathBuf
         bin15_tick(bin15_no_sym(), 62_000, 390_000, 600_000, 1),
         bin15_tick(bin15_yes_sym(), 63_000, 300_000, 400_000, 2), // 60 c wrong ⇒ take
         bin15_tick(bin15_yes_sym(), 63_300, 300_000, 400_000, 3), // the IoC fills here
+        // BIN15 S1: the settlement marks now sit in the minute BEFORE the
+        // expiry, and every mark re-prices — so the book is moved to a
+        // price with no edge first, or those re-prices would ask the
+        // exhausted cap for a second take (`skipped_cap`) and blur what
+        // this test pins: ONE take, held by the pending, not by the cap.
+        bin15_tick(bin15_yes_sym(), 500_000, 980_000, 990_000, 4),
         // Past the settlement instant, so the window HOLDS the payout.
-        bin15_tick(bin15_yes_sym(), 661_000, 300_000, 400_000, 4),
+        bin15_tick(bin15_yes_sym(), 661_000, 300_000, 400_000, 5),
     ];
     let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, BIN15_EPOCH_NS)
         .expect("open ticks");

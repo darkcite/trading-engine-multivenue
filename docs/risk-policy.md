@@ -4785,6 +4785,71 @@ having both.
   (the ruling was about the agents) — since ruling O-8 (2026-09-23)
   to `claude-opus-5-5`. Operator's call.
 
+## E8 — the BIN15 settlement law (S1, 2026-09-24)
+
+### LAW E-11 — a binary settles on the window the venue's rules text names
+
+> **A HIP-4 binary settles on the window the venue's rules text names —
+> today the 60-second TWAP of the underlying's perp MARK ENDING at the
+> expiry, `TWAP[T − 60 s, T] ≥ strike`. The harness, the audit and (from
+> BIN15 S3) the member share ONE implementation of that window; none
+> restates it.**
+
+The outcome.xyz rules text for the rolling BTC 15-minute market:
+*"Settlement is according to the 60-second TWAP of BTC-USDC perp mark
+price ENDING at <expiry> UTC."* Until 2026-09-24 the harness
+(`cli::backtest::binary::settle_value`), the audit (which reaches the
+same function) and the lane's restart law read the minute AFTER the
+expiry — wrong on ~8 % of instances. The corrected law was confirmed on
+the account's OWN venue settlements before any code moved: all 15
+`userFills` rows with `dir = "Settlement"` of the 2026-09-19 mainnet
+session agree with `TWAP[T − 60, T]`; the old window agreed with 14.
+
+What shares the law (E-10 is reserved for the doc-24 bankroll law):
+
+* `core_types::binary_settle_open_ns` / `binary_twap_segment` — the
+  window and the TIME-weighted piece (the mark in force counts for as
+  long as it was the mark, the last one carried forward, `dt` clipped at
+  the window's edges, `i128`) — in the one crate every consumer already
+  depends on.
+* `cli::backtest::binary::settle_reference_1e6` / `settle_value` — the
+  harness (`backtest`, `--member`) and `audit-pnl` both settle through
+  it; `>=` settles in the money. **The evidence is strict**: a mark in
+  force at the window's open, no piece longer than
+  `SETTLE_MARK_GAP_MAX_NS` (10 s — the venue marks every 1–3 s, so a
+  longer hole is a capture gap) anywhere across the window including
+  the carry to the expiry, and at least `SETTLE_MIN_MARKS` (3) marks
+  inside it. Anything less is UNSETTLED — counted, never guessed, never
+  averaged over part of the minute.
+* The value is knowable AT the expiry, so the harness settles a slot at
+  the expiry and the successor trades from `T`; an order still resting
+  on the slot is cancelled at that instant (the venue clears the book at
+  `T`) and counted in `settled_sym_orders_canceled`.
+* **The live member does not share it YET.** Until BIN15 S3 lands, the
+  member's pricer still builds its horizon for a window AFTER the expiry
+  (`τ + twap/3`); S3 moves it onto this window. A harness number scored
+  on E-11 is therefore scoring a member that priced the old window.
+
+**The venue-published cross-check.** The venue prints each settlement
+price as the SUCCESSOR's strike (rounded to the strike grid, ~9.5 s after
+the expiry), so `next_strike > strike` is the venue's own label. Both
+harness surfaces carry it (`BinaryInstance::next_strike_1e6`) and print
+`settle_disagree_next_strike` beside `next_strike_checked` (ties
+excluded). **A non-zero disagreement is a finding** — a mark tape that
+misses the venue's marks, a clock error, or a law change — and is never
+absorbed into the P&L silently. The sidecar carries the venue label per
+row (`y_next_strike`, `-1` unknown or a tie) beside `y`.
+
+**The settlement-sensitive minute is the one BEFORE each quarter-hour.**
+The engine is down 75–90 s across a restart, and an instance whose
+settlement minute is missing from the tape is unsettleable offline
+(counted, and lost to the accrual). So no restart window may cover
+`[T − 60 s, T]` of a live instance: manual restarts avoid hh:14–15,
+hh:29–30, hh:44–45 and hh:59–00 (ruling O-6), and the routine 00:10 /
+08:30 / 16:05Z slots are clear. (The ingress re-announces every bound
+family at its first Steady, so the member binds the live instance as
+soon as the boot completes.)
+
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 
 Slot 0 is `hyparb`, the HyperEVM AMM ↔ Hyperliquid Core arb

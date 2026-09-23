@@ -6,6 +6,83 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — HIP-4 settlement: the TWAP window ENDING at the expiry, time-weighted; the venue-published cross-check; `bin15_ledger`/`bin15_entries` gain `y_next_strike` (+ `settle_px_1e6`) (BIN15 S1)
+
+**What changed**
+- `cli::backtest::binary::settle_value` settles on `TWAP[expiry − twap,
+  expiry] >= strike` — LAW E-11 (`docs/risk-policy.md` "E8") — instead of
+  the mean over `[expiry, expiry + twap]`. The mean is TIME-weighted: each
+  mark counts for as long as it was the mark (the last mark before the
+  window carries into it, the last one inside carries to the expiry, `dt`
+  clipped at the edges, `i128` sum, one truncating divide).
+  `SETTLE_MIN_MARKS` (3) is unchanged and counted INSIDE the window, and
+  the evidence is now strict: a mark must be in force at the window's
+  open and no piece spanning the window (the carry-in and the carry to
+  the expiry included) may exceed `SETTLE_MARK_GAP_MAX_NS` (10 s), or the
+  instance is unsettleable (counted — the old law settled on whatever
+  marks the window happened to hold). `twap_ns == 0` (native dailies)
+  still reads the last mark at or before the expiry. New shared pieces: `core_types::binary_settle_open_ns`,
+  `core_types::binary_twap_segment`; `binary::settle_reference_1e6` (the
+  TWAP itself) and `binary::payout_1e6` (the one `>=`).
+- `BinaryInstance::settle_ns()` is gone; `settle_open_ns()` (= expiry −
+  twap) replaces it. The value is knowable AT the expiry, so the harness
+  schedule settles a slot at `expiry` (`BinarySettle.settle_ns ==
+  halt_ns`), and an instance is settleable once the window reaches its
+  expiry (was expiry + twap). An order still resting on the slot at that
+  instant is cancelled and counted in `settled_sym_orders_canceled` (the
+  venue clears the book at `T`; with halt == settle the F12 guard would
+  never see the sym). The successor trades from `T` — before, the harness
+  held a rolled slot halted for the first `twap` of every new instance,
+  which the venue never did. `instances_from_events` keeps ONE instance
+  per outcome (a boot re-announces the live instance), as audit-pnl's
+  collector always did.
+- The venue-published cross-check: `BinaryInstance.next_strike_1e6` (the
+  successor's strike = the venue's settlement price, linked by
+  `binary::link_successors` — same slot, created between the window's
+  open and `expiry + 120 s`), `BinaryInstance::y_next_strike()` (`1e6` /
+  `0` / `-1` unknown or a tie), and two counts on
+  `BinaryRegistration`: `next_strike_checked`,
+  `settle_disagree_next_strike`.
+- Stderr: `binary: instances=… settled=… unsettleable=… law=twap[T-w,T]
+  next_strike_checked=… settle_disagree_next_strike=…` (backtest and
+  `--member`); audit-pnl's `bin15 settlement table` line gains the same
+  three fields. A non-zero `settle_disagree_next_strike` is a finding.
+- Detail sidecar, ADDITIVE (`detail_version` stays 7): every
+  `bin15_ledger` row gains `y_next_strike`; every `bin15_entries` row
+  gains `y_next_strike` and `settle_px_1e6` (the TWAP `y` was read from,
+  `null` with `y`). `binary::settle_values_by_outcome` →
+  `settle_labels_by_outcome` (`BinaryLabel { value_1e6, px_1e6,
+  y_next_strike }`).
+
+**Why**
+- The venue's rules text names the minute BEFORE the expiry (vault doc 27
+  R0), and the account's own 15 venue settlements of 2026-09-19 agree with
+  it 15/15 (the old window 14/15; vault doc 29 S0). The old label was
+  wrong on ~8 % of instances.
+
+**Impact**
+- On-disk formats: sidecar keys added (above). The worker's readers read
+  by key and ignore them until BIN15 S4 teaches the accrual to store them
+  (with defaults, so an older binary's sidecar still reads).
+- Config keys: none. Wire formats: none.
+- Every replayed `y`, every bin15 replay P&L and every audit-pnl binary
+  settlement on a HIP-4 root moves on the instances whose two windows
+  disagree. Roots with no `InstrumentRoll` are byte-identical (no
+  schedule is built).
+
+**Migration steps**
+1. Rebuild the release binary before trusting any bin15 replay (G0).
+2. **This law needs the venue clock (BIN15 S2).** Until S2, the harness
+   wall clock runs 23–42 s early against the venue, so `[T − 60, T]` on
+   the harness clock reads roughly `[T − 36 s, T + 24 s]` of the venue's
+   marks. Judge no label change before S2 is in the binary.
+3. The accrual stores are relabelled in place by `claude_worker.bin15_accrue
+   relabel` (BIN15 S4), which keeps the old label as `y_engine`.
+
+**Rollback**
+- Revert the commit. The relabelled stores keep `y_engine`, so the old
+  label stays readable.
+
 ## 2026-09-24 — the HYPARB executor's bytecode: `hyperswapV3SwapCallback` (HYPARB H9d)
 
 **What changed**

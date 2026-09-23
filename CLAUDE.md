@@ -29,7 +29,8 @@ in the script; `ai` = 48 is the floor every name includes).
 ## Where to look — and where not to
 
 - **Current docs (read as needed):** `PLAN.md` (architecture deep-dive),
-  `docs/risk-policy.md` (caps, kill switches, LAWS E-1..E-9, the exec lane's
+  `docs/risk-policy.md` (caps, kill switches, LAWS E-1..E-9 + E-11 — the
+  HIP-4 settlement law, "E8" — the exec lane's
   record), `docs/wire-format.md`, `docs/migration.md`, `docs/local-setup.md`,
   `docs/venue-latency.md`, `docs/hot-path-latency.md`,
   `docs/research-universe.md`, `docs/ai-strategy-pipeline.md` + the three

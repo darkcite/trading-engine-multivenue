@@ -962,6 +962,14 @@ impl Bin15Strategy {
     }
 
     /// Settle a family's live instance.
+    ///
+    /// BIN15 S1: the forecast pair this closes is the ARM→EXPIRY
+    /// realised variance (`realised_since_arm_1e9`, armed at `bind` for
+    /// the instance's `expiry`), while the payoff itself is decided on
+    /// the venue's TWAP over `[T − twap, T]` (LAW E-11). Scoring σ̂
+    /// against the payoff's own window instead is a follow-up
+    /// MEASUREMENT, not a change — σ̂'s level was measured honest (vault
+    /// doc 27 §4) — so the observation is left exactly as it was.
     fn settle(&mut self, idx: usize) {
         debug_assert!(idx < self.params.n_families);
         if !self.fam[idx].is_live() {
