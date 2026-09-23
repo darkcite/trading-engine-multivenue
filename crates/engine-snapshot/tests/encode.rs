@@ -295,7 +295,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
         &body[..expected_head.len().min(body.len())]
     );
     assert!(body.contains(
-        "\"slots\":[{\"slot\":0,\"name\":\"latency-arb\",\"configured\":1,\"enabled\":0,\"gate\":0,\
+        "\"slots\":[{\"slot\":0,\"name\":\"hyparb\",\"configured\":1,\"enabled\":0,\"gate\":0,\
          \"label_terms\":0,\"label_off\":0,\"orders_emitted\":0,\"orders_dropped\":0},"
     ));
     assert!(body.contains(

@@ -1145,7 +1145,7 @@ pub struct PaperMatcher {
     /// Activation Δ by model venue byte ([`core_fill::ACTIVATION_NS_DEFAULT`]
     /// verbatim; a byte past its end is refused in [`Self::submit`]
     /// before it can index anything).
-    activation_ns: [u64; 8],
+    activation_ns: [u64; core_types::VENUE_COUNT],
     seq: u64,
     /// What the matcher did.
     pub counters: MatcherCounters,

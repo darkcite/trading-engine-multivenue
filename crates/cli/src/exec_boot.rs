@@ -101,14 +101,7 @@ const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
-    "latency-arb",
-    "vrp",
-    "xsd",
-    "bin15",
-    "ai-exec",
-    "vm",
-    "icdp",
-    "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
 ];
 
 /// A resolved execution configuration.
@@ -428,8 +421,8 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         }
         let vmask = boot.route.venue_mask_at(slot).unwrap_or(0);
         let mut venues = String::new();
-        for v in 0..8u8 {
-            if vmask & (1u8 << v) != 0 {
+        for v in 0..core_types::VENUE_COUNT as u8 {
+            if vmask & (1u16 << v) != 0 {
                 if !venues.is_empty() {
                     venues.push(',');
                 }

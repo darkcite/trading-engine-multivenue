@@ -61,7 +61,7 @@ use core_io::{PmlrReader, SlotKind};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, InstrumentClass,
     OptSummary, Order, Price, Qty, RegimeTerm, RuleTableV2, Tick, VenueId, AI_SIDE_NONE,
-    INSTRUMENT_CLASSES, REGIME_OFF_SOFT, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
+    INSTRUMENT_CLASSES, REGIME_OFF_SOFT, STRATEGY_SLOT_VM, SYMBOL_ID_NONE, VENUE_COUNT,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -116,7 +116,7 @@ pub(crate) const VENUE_LABELS: [&str; 8] =
 /// present although MEXC is NOT tradeable (O-MX1) — its stale / fee /
 /// Δ columns still have to be settable, exactly as its capture is
 /// replayable; `fill::tradeable_venue_byte` is the execution gate.
-const MODEL_VENUE_LABELS: [(&str, VenueId); 7] = [
+const MODEL_VENUE_LABELS: [(&str, VenueId); 8] = [
     ("pm", VenueId::Polymarket),
     ("bn", VenueId::Binance),
     ("okx", VenueId::Okx),
@@ -124,6 +124,7 @@ const MODEL_VENUE_LABELS: [(&str, VenueId); 7] = [
     ("hl", VenueId::Hyperliquid),
     ("bybit", VenueId::Bybit),
     ("mexc", VenueId::Mexc),
+    ("hyperevm", VenueId::HyperEvm),
 ];
 
 /// ns per millisecond. TEST-ONLY since X1: the §4.4 default table moved
@@ -340,7 +341,7 @@ pub struct ModelParams {
     /// sym comes from its descriptor ([`core_config::instrument_class`]);
     /// a sym of unknown class is charged the venue's DEAREST class
     /// ([`fill::FillEngine::fee_rate`]).
-    pub fee_bps: [[(u32, u32); INSTRUMENT_CLASSES]; 8],
+    pub fee_bps: [[(u32, u32); INSTRUMENT_CLASSES]; VENUE_COUNT],
     /// BIN15 O1: the pair charged on an **opening** fill, per venue ×
     /// class; `None` = "same as [`Self::fee_bps`]", which every venue
     /// and class carried before BIN15 and which is bit-identical to
@@ -353,7 +354,7 @@ pub struct ModelParams {
     /// relative to the position already held distinguishes them.
     /// `--fee-bps <venue>.<class>.open:<m>:<t>` sets it; a bare
     /// `<venue>` or `<venue>.<class>` flag never does.
-    pub fee_open_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; 8],
+    pub fee_open_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; VENUE_COUNT],
     /// E7 (2026-09-19, MEASURED on mainnet): the pair charged when a
     /// binary instance SETTLES, on the payout notional (`payout ×
     /// contracts`, so a losing leg pays nothing), per venue × class;
@@ -370,24 +371,24 @@ pub struct ModelParams {
     /// charges the second (taker) number — a settlement is a crossing
     /// by definition — and the pair shape is kept so every `m:t` reader
     /// of the fee grammar still parses the line.
-    pub fee_settle_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; 8],
+    pub fee_settle_bps: [[Option<(u32, u32)>; INSTRUMENT_CLASSES]; VENUE_COUNT],
     /// Activation penalty Δ ns per venue (§4.4). **A MEASUREMENT of the
     /// deployment host + network, not a constant** — see
     /// `docs/venue-latency.md` and the provenance on [`Default`].
-    pub latency_ns: [u64; 8],
+    pub latency_ns: [u64; VENUE_COUNT],
     /// VT4: staleness threshold ms per venue — the harness re-judges
     /// every v3 tick from its venue stamp against this table (a
     /// threshold change is a replay, not a recapture); 0 = never
     /// stale. Defaults = `VenueId::stale_after_ms_defaults()` (the
     /// doctrine-4 table the ingress uses); `--stale-after-ms
     /// <venue>:<ms>` overrides.
-    pub stale_after_ms: [u32; 8],
+    pub stale_after_ms: [u32; VENUE_COUNT],
     /// VRP V2b: per-venue OPTION trade fee. Only Deribit is active by
     /// default — the lane is Deribit-only (ruling O‑D1) and no other
     /// venue's option economics are expressed here.
     /// `--opt-fee <venue>:<index_bps>:<prem_bps>` overrides; `off`
     /// deactivates.
-    pub opt_fee: [OptFee; 8],
+    pub opt_fee: [OptFee; VENUE_COUNT],
     /// VRP V3: `--option-spread-frac` — parts-per-million of the
     /// PREMIUM for the FULL crossed option spread, half charged on
     /// each side of the D-7 synthetic mark tick
@@ -420,14 +421,14 @@ enum FeeLeg {
 impl Default for ModelParams {
     fn default() -> Self {
         Self {
-            fee_bps: [[(0, 0); INSTRUMENT_CLASSES]; 8],
-            fee_open_bps: [[None; INSTRUMENT_CLASSES]; 8],
-            fee_settle_bps: [[None; INSTRUMENT_CLASSES]; 8],
+            fee_bps: [[(0, 0); INSTRUMENT_CLASSES]; VENUE_COUNT],
+            fee_open_bps: [[None; INSTRUMENT_CLASSES]; VENUE_COUNT],
+            fee_settle_bps: [[None; INSTRUMENT_CLASSES]; VENUE_COUNT],
             // VRP V3: the ladder's optimistic rung — the D-7 floor
             // alone. Widening is opt-in and one-way.
             opt_spread_frac_1e6: 0,
             opt_fee: {
-                let mut t = [OptFee::OFF; 8];
+                let mut t = [OptFee::OFF; VENUE_COUNT];
                 t[VenueId::Deribit as usize] = OptFee::DERIBIT;
                 t
             },
@@ -569,7 +570,7 @@ pub fn parse_model_params(
         p.stale_after_ms[vi] = ms;
     }
     if let Some(ns) = latency_global {
-        p.latency_ns = [ns; 8];
+        p.latency_ns = [ns; VENUE_COUNT];
         p.latency_ns[VenueId::Ai as usize] = 0; // dead slot stays dead
     }
     for spec in latency_specs {
@@ -890,7 +891,7 @@ fn load_run(
     dead: &BTreeSet<u32>,
     opt_reg: &opt_registry::OptRegistry,
     opt_out: &mut opt::OptLoadOut,
-    stale_after_ms: [u32; 8],
+    stale_after_ms: [u32; VENUE_COUNT],
     binary_underlyings: &BTreeSet<u32>,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
@@ -1310,7 +1311,7 @@ fn load_run(
 /// replay can honestly represent — untrustworthy, nonzero exit.
 fn load_and_merge(
     runs: &[RunDir],
-    stale_after_ms: [u32; 8],
+    stale_after_ms: [u32; VENUE_COUNT],
     opt_out: &mut opt::OptLoadOut,
     sym_class: &mut BTreeMap<u32, InstrumentClass>,
     binary_underlying: &mut BTreeMap<u32, u32>,
@@ -3262,7 +3263,7 @@ mod tests {
     #[test]
     fn model_params_defaults_pin_measured_table() {
         let p = ModelParams::default();
-        assert_eq!(p.fee_bps, [[(0, 0); INSTRUMENT_CLASSES]; 8]);
+        assert_eq!(p.fee_bps, [[(0, 0); INSTRUMENT_CLASSES]; VENUE_COUNT]);
         // The 2026-09-03 measurement (docs/venue-latency.md §3); slot 5
         // = Ai (dead, 0), slot 6 = Bybit, slot 7 = MEXC (measured
         // 2026-09-23, MX9). A new deployment re-measures and
@@ -3270,9 +3271,22 @@ mod tests {
         // silently.
         assert_eq!(
             p.latency_ns,
-            [200 * MS, 130 * MS, 130 * MS, 220 * MS, 340 * MS, 0, 60 * MS, 150 * MS]
+            [
+                200 * MS,
+                130 * MS,
+                130 * MS,
+                220 * MS,
+                340 * MS,
+                0,
+                60 * MS,
+                150 * MS,
+                1_000 * MS
+            ]
         );
         assert_eq!(p.stale_after_ms[VenueId::Mexc as usize], 400);
+        // HYPARB: HyperEVM's Δ is one block; its pool state is stale
+        // after 2.5 s (HZ head inter-arrival p99 2.28 s).
+        assert_eq!(p.stale_after_ms[VenueId::HyperEvm as usize], 2_500);
         assert_eq!(p.opt_fee[VenueId::Mexc as usize], OptFee::OFF);
     }
 
@@ -3295,11 +3309,23 @@ mod tests {
         // Global latency replaced every TRADEABLE slot (the Ai dead
         // slot stays 0 — WS9), then deribit won on top. The MEXC slot
         // takes it too (a Δ column exists; the venue is data-only).
-        assert_eq!(p.latency_ns, [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000, 1_000]);
+        assert_eq!(
+            p.latency_ns,
+            [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000, 1_000, 1_000]
+        );
         // XSD-F: a bare `<venue>:` spec sets every class of the venue.
-        assert_eq!(p.fee_bps[VenueId::Polymarket as usize], [(0, 10); INSTRUMENT_CLASSES]);
-        assert_eq!(p.fee_bps[VenueId::Hyperliquid as usize], [(3, 4); INSTRUMENT_CLASSES]);
-        assert_eq!(p.fee_bps[VenueId::Binance as usize], [(0, 0); INSTRUMENT_CLASSES]);
+        assert_eq!(
+            p.fee_bps[VenueId::Polymarket as usize],
+            [(0, 10); INSTRUMENT_CLASSES]
+        );
+        assert_eq!(
+            p.fee_bps[VenueId::Hyperliquid as usize],
+            [(3, 4); INSTRUMENT_CLASSES]
+        );
+        assert_eq!(
+            p.fee_bps[VenueId::Binance as usize],
+            [(0, 0); INSTRUMENT_CLASSES]
+        );
         // VT4: stale thresholds default to the venue table; overrides
         // replace only the named venue, the last spec wins, 0 is legal.
         assert_eq!(p.stale_after_ms[VenueId::Okx as usize], 300);
@@ -3332,12 +3358,16 @@ mod tests {
         assert_eq!(dearest_fee(&p, VenueId::Mexc), (0, 5));
         let text = render_fee_table_text(&p);
         assert!(
-            text.ends_with(" bybit=0:0 mexc=spot:0:5,perp:1:4,dated:1:4,option:1:4,prediction:1:4"),
+            text.ends_with(
+                " bybit=0:0 mexc=spot:0:5,perp:1:4,dated:1:4,option:1:4,prediction:1:4 hyperevm=0:0"
+            ),
             "{text}"
         );
         let json = render_fee_table_json(&p);
         assert!(
-            json.ends_with(",\"mexc\":{\"spot\":[0,5],\"perp\":[1,4],\"dated\":[1,4],\"option\":[1,4],\"prediction\":[1,4]}}"),
+            json.ends_with(
+                ",\"mexc\":{\"spot\":[0,5],\"perp\":[1,4],\"dated\":[1,4],\"option\":[1,4],\"prediction\":[1,4]},\"hyperevm\":{\"spot\":[0,0],\"perp\":[0,0],\"dated\":[0,0],\"option\":[0,0],\"prediction\":[0,0]}}"
+            ),
             "{json}"
         );
         assert_eq!(model_venue("mexc"), Some(7));
@@ -3425,7 +3455,7 @@ mod tests {
         // The default table carries no open pair at all.
         assert_eq!(
             ModelParams::default().fee_open_bps,
-            [[None; INSTRUMENT_CLASSES]; 8]
+            [[None; INSTRUMENT_CLASSES]; VENUE_COUNT]
         );
         // E7: `.settle` sets the SETTLEMENT pair and nothing else, the
         // same way.
@@ -3445,7 +3475,7 @@ mod tests {
         assert_eq!(bare.fee_settle_bps[hl], [None; INSTRUMENT_CLASSES]);
         assert_eq!(
             ModelParams::default().fee_settle_bps,
-            [[None; INSTRUMENT_CLASSES]; 8]
+            [[None; INSTRUMENT_CLASSES]; VENUE_COUNT]
         );
         // `.open` / `.settle` need a class; the report renderers are
         // untouched (schema-1 stdout is frozen).
@@ -3462,12 +3492,15 @@ mod tests {
                 "{bad}"
             );
         }
-        assert_eq!(render_fee_table_json(&p), render_fee_table_json(&{
-            let mut q = p;
-            q.fee_open_bps = [[None; INSTRUMENT_CLASSES]; 8];
-            q.fee_settle_bps = [[None; INSTRUMENT_CLASSES]; 8];
-            q
-        }));
+        assert_eq!(
+            render_fee_table_json(&p),
+            render_fee_table_json(&{
+                let mut q = p;
+                q.fee_open_bps = [[None; INSTRUMENT_CLASSES]; VENUE_COUNT];
+                q.fee_settle_bps = [[None; INSTRUMENT_CLASSES]; VENUE_COUNT];
+                q
+            })
+        );
     }
 
     #[test]

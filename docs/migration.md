@@ -6,6 +6,109 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-23 — Strategy slot 0 = `hyparb`; `latency-arb` unlinked (HYPARB H0)
+
+**What changed**
+
+- Slot 0 of `crates/strategy-set` is the `strategy-hyparb` member
+  (`SLOT_HYPARB` / `BIT_HYPARB`, still bit 1 = 1). `strategy-latency-arb`
+  is UNLINKED, not deleted (ruling O-H1): it stays in the workspace, its
+  own tests and the `bench` alloc gate / `core-io` replay test still
+  build it, but no engine path composes it.
+- Mask names: `hyparb` (1), `ai+hyparb` (49), `ai+vrp+xsd+bin15+hyparb`
+  (63) are new; `latency-arb` is GONE as a name — `--strategy
+  latency-arb` refuses the boot ("unknown --strategy value"). Its
+  standalone paper/`--live` arm is deleted with it, so
+  `STRATEGY_SET_NAMES` now equals `MASK_TABLE` exactly (no exemption).
+- `run --strategy` defaults to `ai` (was `latency-arb`).
+- The hyparb member lands DARK (O-H8): at H0 it is a stub and is never
+  in the boot's configured mask, so `--strategy hyparb` refuses as "no
+  requested member is configured" and the composite names boot with
+  bit 0 cleared until HYPARB H5 lands its boot artifact.
+- Slot-0 labels: `/state` `slots[0].name`, `audit-pnl` `strategies[].label`
+  for `strategy_id 0`, `exec_boot::SLOT_NAMES[0]` and the dashboard read
+  `hyparb`. Gauge `engine_strategy_latency_arb_active` →
+  `engine_strategy_hyparb_active` (same F29 semantics: bare kind
+  `hyparb` or slot 0 enabled in the set).
+- `regime.toml`: `[labels.hyparb]` is the slot-0 section;
+  `[labels.latency_arb]` is refused at the grammar ("unknown coded
+  member"), exactly as `[labels.ev]` / `[labels.cross_arb]` are.
+- `scripts/engine-wrapper.sh` allow-list gains the three names.
+
+**Why**
+
+- HYPARB (HyperEVM ↔ HL Core arbitrage) takes slot 0 (O-H2). A label,
+  mask or audit row evidenced for latency-arb must never silently apply
+  to a different member.
+
+**Impact**
+
+- On-disk formats: none. The slot NUMBER is wire-stable: rows under
+  `strategy_id 0` in a capture taken BEFORE 2026-09-23 are latency-arb
+  rows wearing the `hyparb` label (latency-arb was OFF in every wrapper
+  mask, so a live capture carries none).
+- Config keys: `regime.toml [labels.latency_arb]` refuses the boot.
+- Metrics: `engine_strategy_latency_arb_active` is renamed.
+
+**Migration steps**
+
+1. None for the live engine: `strategy.conf` names no slot-0 mask and is
+   not edited (O-H8).
+2. A `regime.toml` carrying `[labels.latency_arb]` renames the section
+   to `[labels.hyparb]` or drops it.
+
+**Rollback**
+
+- Revert the H0 commit; no data or config migration to undo.
+
+## 2026-09-23 — VenueId 8 = HyperEvm; venue tables sized by `VENUE_COUNT`; exec venue mask u16 (HYPARB H0)
+
+**What changed**
+
+- `VenueId` gains `HyperEvm = 8` (append-only; the first unassigned byte
+  is now 9) and `SignalSource::HyperEvm = 5` (the HyperEVM ingress
+  publishes `Signal`s — H3). HyperEvm rides NO tick, depth, option or
+  fill lane (`engine::*_lane_of` → `None`); its AMM fills are judged in
+  process (H2).
+- `core_types::VENUE_COUNT = 9` is now the single size of every
+  venue-indexed table: `VenueId::stale_after_ms_defaults` (HyperEvm
+  2 500 ms — the HZ head p99 was 2 281 ms), `core_fill::ACTIVATION_NS_DEFAULT`
+  (HyperEvm 1 000 ms = one block), `ModelParams` (`fee_bps`,
+  `fee_open_bps`, `fee_settle_bps`, `latency_ns`, `stale_after_ms`,
+  `opt_fee`), `parse_stale_after_ms`, `clob-dispatcher` activation,
+  `core-config::exec::VENUE_NAMES` (`hyperevm` = 8).
+- Harness labels: `hyperevm` joins the backtest model labels
+  (`--fee-bps hyperevm:…`, `--latency-ns-venue hyperevm:…`,
+  `--stale-after-ms hyperevm:…`); the rendered fee table gains a
+  trailing `hyperevm` entry (text ` hyperevm=0:0`, JSON `"hyperevm":{…}`
+  after `"mexc"`).
+- `exec-router`: `EXEC_VENUES` 8 → 16 and the per-slot venue mask
+  `u8` → `u16` (`venue_mask_at -> Option<u16>`); the route table keeps
+  its 64-byte-bounded layout (pad 8).
+- Not yet: `SNAPSHOT_VENUES` / capture `VENUE_LABELS` gain `hyperevm`
+  with the ingress wiring (H3b), `TRADEABLE_VENUES` with the AMM fill
+  law (H2).
+
+**Why**
+
+- HYPARB's DEX leg (O-H11): HyperEVM is a venue of its own, and a ninth
+  venue does not fit an 8-bit venue mask.
+
+**Impact**
+
+- On-disk formats: none (no capture label yet).
+- Config keys: `exec.toml` venue names accept `hyperevm`; nothing arms
+  it (no exec arm until H7c/H8, testnet only — O-H5).
+- Wire formats: `VenueId` byte 8 and `SignalSource` byte 5 are assigned.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the H0 commit.
+
 ## 2026-09-23 — VenueId 7 = MEXC + tick lane 6 (MX2–MX9, the seventh venue)
 
 **What changed**

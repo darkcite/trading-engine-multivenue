@@ -2694,8 +2694,9 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
 }
 
 /// Phase 8f item 7: StrategySet fan-out steady state — mask-gated
-/// member dispatch (ticks through a configured latency-arb member,
-/// AI heartbeat fan-out, an Enable/Disable round trip) must allocate
+/// member dispatch (ticks through the slot-0 member — the hyparb stub
+/// since HYPARB H0, latency-arb before it — AI heartbeat fan-out, an
+/// Enable/Disable round trip of slot 0) must allocate
 /// nothing after boot. 8g item 6: the vm member joins the set it
 /// measures — a committed one-row table fires + re-arms on every PM
 /// tick through the set's fan-out, and a per-cycle `RulesetCommit`
@@ -2708,7 +2709,7 @@ fn strategy_set_fanout_is_zero_alloc() {
         STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
     };
     use strategy_core::{Ctx, Strategy, SubmitErr};
-    use strategy_set::{StrategySet, BIT_LATENCY_ARB, BIT_VM, SLOT_LATENCY_ARB};
+    use strategy_set::{StrategySet, BIT_HYPARB, BIT_VM, SLOT_HYPARB};
 
     struct CountCtx {
         submitted: u64,
@@ -2724,13 +2725,11 @@ fn strategy_set_fanout_is_zero_alloc() {
         }
     }
 
-    // Boot (allocation allowed): configure the latency-arb member
-    // and commit a one-row vm table on the same (PM=11, BN=22) pair.
-    // Clock is production-like (G3 lesson: fresh cooldown stamps arm
-    // only once `now ≥ horizon_ns`).
-    let mut set = StrategySet::new(BIT_LATENCY_ARB | BIT_VM);
-    set.latency_arb_mut().add_pair(11, 22).unwrap();
-    set.latency_arb_mut().set_cooldown_ns(0);
+    // Boot (allocation allowed): slot 0 (hyparb, dark at H0) rides
+    // the fan-out, and a one-row vm table is committed on the
+    // (PM=11, BN=22) pair. Clock is production-like (G3 lesson: fresh
+    // cooldown stamps arm only once `now ≥ horizon_ns`).
+    let mut set = StrategySet::new(BIT_HYPARB | BIT_VM);
     let mut ctx = CountCtx {
         submitted: 0,
         now: 100_000_000_000_000_000,
@@ -2819,7 +2818,7 @@ fn strategy_set_fanout_is_zero_alloc() {
         0,
         AiCmdKind::DisableStrategy,
         VenueId::Ai,
-        SLOT_LATENCY_ARB,
+        SLOT_HYPARB,
         AI_SIDE_NONE,
         0,
         0,
@@ -2833,7 +2832,7 @@ fn strategy_set_fanout_is_zero_alloc() {
         0,
         AiCmdKind::EnableStrategy,
         VenueId::Ai,
-        SLOT_LATENCY_ARB,
+        SLOT_HYPARB,
         AI_SIDE_NONE,
         0,
         0,
@@ -2857,10 +2856,10 @@ fn strategy_set_fanout_is_zero_alloc() {
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert!(
-        ctx.submitted >= 2 * u64::from(CYCLES),
-        "latency-arb and the vm row must both fire every cycle"
+        ctx.submitted >= u64::from(CYCLES),
+        "the vm row must fire every cycle"
     );
-    assert_eq!(set.enabled_mask(), BIT_LATENCY_ARB | BIT_VM);
+    assert_eq!(set.enabled_mask(), BIT_HYPARB | BIT_VM);
     assert_eq!(set.enable_refused_total(), 0);
     assert_eq!(set.vm().commits_applied, 1, "no further flip in-loop");
     assert_eq!(set.vm().commits_dropped, u64::from(CYCLES));

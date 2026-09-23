@@ -95,8 +95,8 @@ pub const HOLD_CAP: usize = 4096;
 /// Default snapshot radius, ticks either side of the price (≈ ±40 %).
 pub const DEFAULT_SNAPSHOT_RADIUS: i32 = 4_000;
 /// `Signal::source` of this ingress — `core_types::SignalSource::HyperEvm`
-/// (appended by H0; this crate names the wire value until then).
-pub const SIGNAL_SOURCE_HYPEREVM: u8 = 5;
+/// (appended by HYPARB H0).
+pub const SIGNAL_SOURCE_HYPEREVM: u8 = core_types::SignalSource::HyperEvm as u8;
 
 /// Scratch for one outgoing request body before it is masked into tx.
 const SCRATCH: usize = 8 * 1024;

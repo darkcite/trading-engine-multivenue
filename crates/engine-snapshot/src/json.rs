@@ -975,7 +975,7 @@ mod tests {
         let body = core::str::from_utf8(&buf[..n]).unwrap();
         assert!(body.starts_with("{\"v\":1,\"seq\":0,"), "{body}");
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
-        assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"latency-arb\""));
+        assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
         assert!(body.contains("\"venue\":\"rpc\""));
         // MX2: MEXC is appended after rpc — the array order is the
         // `/state` contract, so it must render LAST.

@@ -18,7 +18,8 @@ the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 researcher** — never in the hot path.
 
 Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
-0 latency-arb (the original PM strategy, OFF in every wrapper mask) · 1 vrp ·
+0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
+O-H8; `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
 2 xsd · 3 bin15 · 4 ai-exec (AI door 1, intents) · 5 ruleset VM (AI door 2,
 tables) · 6 icdp · 7 open. The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
@@ -315,7 +316,7 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
-- `crates/strategy-{set,core,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed
+- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed
   set and its members; `strategy-{latency-arb,cross-arb,ev,rule-tree}` are
   in-tree but unlinked/off. `book-builder`, `opt-registry`,
   `options-select`, `research-artifacts`.

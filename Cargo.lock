@@ -357,7 +357,6 @@ dependencies = [
  "strategy-core",
  "strategy-ev",
  "strategy-icdp",
- "strategy-latency-arb",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
@@ -1913,6 +1912,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-hyparb"
+version = "0.1.0"
+dependencies = [
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-icdp"
 version = "0.1.0"
 dependencies = [
@@ -1956,8 +1963,8 @@ dependencies = [
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
+ "strategy-hyparb",
  "strategy-icdp",
- "strategy-latency-arb",
  "strategy-vm",
  "strategy-vrp",
  "strategy-xsd",

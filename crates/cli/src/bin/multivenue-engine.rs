@@ -12,7 +12,7 @@
 //!   OKX when `--okx-symbols` is set, Deribit when
 //!   `--deribit-symbols` is set, Hyperliquid when `--hl-coins` is
 //!   set, Polygon RPC), boot the
-//!   real `Engine` with the latency-arb strategy + paper dispatcher,
+//!   real `Engine` with the composed strategy set + paper dispatcher,
 //!   drain consumers on the main thread until SIGINT.
 //! * `print-config` — load `.env` + env and print the resolved
 //!   (non-secret) config.
@@ -29,11 +29,11 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use cli::{
-    boot_info, engine_loop_ev_full, engine_loop_full, engine_loop_rule_tree_full,
-    engine_loop_set_full, install_sigint_handler, join_reverse,
-    spawn_binance, spawn_deribit, spawn_hyperliquid, spawn_okx, spawn_polymarket, spawn_rpc,
-    state_writer, Consumers, EngineConfig, EngineLoopResult, LatencyDump, LiveDispatcher,
-    Observability, Rings, StrategyPair, WssEndpoint, SHUTDOWN,
+    boot_info, engine_loop_ev_full, engine_loop_rule_tree_full, engine_loop_set_full,
+    install_sigint_handler, join_reverse, spawn_binance, spawn_deribit, spawn_hyperliquid,
+    spawn_okx, spawn_polymarket, spawn_rpc, state_writer, Consumers, EngineConfig,
+    EngineLoopResult, LatencyDump, LiveDispatcher, Observability, Rings, StrategyPair, WssEndpoint,
+    SHUTDOWN,
 };
 use core_config::{Config, Secrets};
 use core_net::TlsTransport;
@@ -42,9 +42,9 @@ use tracing_subscriber::EnvFilter;
 
 /// BIN15 O5 (2026-09-12): the composed-set names this binary will boot.
 ///
-/// This list MUST mirror `strategy_set::mask_for_name`, minus
-/// `latency-arb`, which has its own paper arm above and no set arm.
-/// It lives here as a named const rather than as match literals so the
+/// This list MUST mirror `strategy_set::mask_for_name` exactly (HYPARB
+/// H0 retired the one exemption: `latency-arb` and its standalone arm
+/// left with the member, O-H1). It lives here as a named const rather than as match literals so the
 /// `strategy_name_pin` tests below can read it: the arm and the mask
 /// table DID drift once. The five bin15 names reached `mask_for_name`
 /// and the wrapper allow-list but never the match arm, so
@@ -68,6 +68,12 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "ai+vrp+bin15",
     "ai+xsd+bin15",
     "ai+vrp+xsd+bin15",
+    // HYPARB H0: slot 0. Resolves, but refuses the boot as "no
+    // requested member is configured" until H5 lands its artifact
+    // (lands DARK — O-H8).
+    "hyparb",
+    "ai+hyparb",
+    "ai+vrp+xsd+bin15+hyparb",
 ];
 
 /// Top-level CLI.
@@ -686,8 +692,9 @@ struct RunArgs {
     /// `/state` serves. Implies `--metrics`.
     #[arg(long, default_value_t = false)]
     tui: bool,
-    /// Strategy selector. `latency-arb` (default) uses Binance →
-    /// Polymarket cross-venue arbitrage. `ev` uses Strategy A:
+    /// Strategy selector. `ai` (default since HYPARB H0 retired the
+    /// standalone `latency-arb` arm) composes ai-exec + vm through the
+    /// set path. `ev` uses Strategy A:
     /// model-vs-market mispricing against claude-worker artifacts.
     /// `ai-exec` (Phase 8f item 8) runs the AI-driven fair-value/
     /// intent strategy alone via the set path (no boot symbol
@@ -699,7 +706,7 @@ struct RunArgs {
     /// composed StrategySet: every built member whose config flags
     /// are present (ai-exec and vm need none and are always
     /// included), AI-toggleable at runtime; paper-only until 8i.
-    #[arg(long, default_value = "latency-arb")]
+    #[arg(long, default_value = "ai")]
     strategy: String,
     /// Path to claude-worker NDJSON tag artifacts. Required when
     /// `--strategy ev`.
@@ -3569,7 +3576,7 @@ fn run(args: RunArgs) -> ExitCode {
 
     // `--exec` is honoured ONLY by the composed strategy-set arm — it
     // is the only arm that builds a `RoutedDispatcher`. Accepting the
-    // flag for `latency-arb` / `rule-tree` / `ev` and then routing
+    // flag for `rule-tree` / `ev` and then routing
     // nothing would be the worst kind of silent no-op: the operator
     // passed an arming artifact and the engine ignored it.
     if args.exec.is_some() && !STRATEGY_SET_NAMES.contains(&args.strategy.as_str()) {
@@ -3583,23 +3590,9 @@ fn run(args: RunArgs) -> ExitCode {
     }
     let strategy_choice = args.strategy.as_str();
     let result = match (strategy_choice, args.live) {
-        ("latency-arb", true) => match boot_queued_live(&cfg, tls_config.clone()) {
-            Ok((queued, worker_handle)) => {
-                info!("running latency-arb LIVE — orders queued to dispatcher thread");
-                obs_handles.push(worker_handle);
-                engine_loop_full(cons, engine_cfg, queued, obs)
-            }
-            Err(reason) => EngineLoopResult::Failed(reason),
-        },
-        ("latency-arb", false) => {
-            info!("running latency-arb PAPER — no orders will be submitted");
-            engine_loop_full(
-                cons,
-                engine_cfg,
-                clob_dispatcher::PaperDispatcher::new(),
-                obs,
-            )
-        }
+        // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
+        // is the hyparb set member and the old name falls through to
+        // the "unknown --strategy" refusal below, on purpose.
         // XSD-S (2026-09-12): `cross-arb` has no arm any more — slot 2 is
         // vacant until `strategy-xsd` lands (XSD-3) and the name falls
         // through to the "unknown --strategy" refusal below, on purpose.
@@ -3660,7 +3653,7 @@ fn run(args: RunArgs) -> ExitCode {
         (name, _live) if STRATEGY_SET_NAMES.contains(&name) => {
             // Phase 8f item 7: the composed StrategySet. `all` means
             // "every built member the given flags can boot" —
-            // latency-arb from the mandatory pair flags, bin15 only
+            // hyparb never before H5 (lands DARK — O-H8), bin15 only
             // when its artifact resolves, vrp only when
             // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
             // artifact resolves (slot 2 is vacant — XSD-S),
@@ -3866,7 +3859,6 @@ fn run(args: RunArgs) -> ExitCode {
                     info!("running strategy-set PAPER — no orders will be submitted");
                     engine_loop_set_full(
                         cons,
-                        engine_cfg,
                         clob_dispatcher::PaperDispatcher::new(),
                         obs,
                         requested,
@@ -4007,7 +3999,6 @@ fn run(args: RunArgs) -> ExitCode {
                         );
                         engine_loop_set_full(
                             cons,
-                            engine_cfg,
                             exec_dispatcher,
                             obs,
                             requested,
@@ -4051,7 +4042,6 @@ fn run(args: RunArgs) -> ExitCode {
                         // position it has never seen. (Both arms.)
                         engine_loop_set_full(
                             cons,
-                            engine_cfg,
                             exec_dispatcher,
                             obs,
                             requested,
@@ -4149,10 +4139,6 @@ mod strategy_name_pin {
     //! passes the name, the process starts, capture runs, and only the
     //! mask gauge says the strategies never composed.
 
-    /// The one deliberate asymmetry: `latency-arb` is a mask name but
-    /// has its own `("latency-arb", false)` paper arm, never a set arm.
-    const EXEMPT: &[&str] = &["latency-arb"];
-
     /// Every bootable name must be a name the mask table can resolve —
     /// the arm body `expect`s exactly this.
     #[test]
@@ -4164,25 +4150,55 @@ mod strategy_name_pin {
                 strategy_set::mask_for_name(name).is_some(),
                 "{name} is bootable but mask_for_name does not know it"
             );
+            i += 1;
+        }
+    }
+
+    /// Every name the mask table accepts must be bootable. This is the
+    /// direction that failed on 2026-09-12. (HYPARB H0 retired the one
+    /// exemption, `latency-arb`, with its standalone arm — O-H1.)
+    #[test]
+    fn every_mask_name_is_bootable() {
+        let mut i = 0;
+        while i < strategy_set::MASK_TABLE.len() {
+            let (name, _mask) = strategy_set::MASK_TABLE[i];
             assert!(
-                !EXEMPT.contains(&name),
-                "{name} is exempt and must not also be bootable"
+                super::STRATEGY_SET_NAMES.contains(&name),
+                "mask_for_name accepts {name} but the boot arm refuses it"
             );
             i += 1;
         }
     }
 
-    /// Every name the mask table accepts must be bootable or exempt.
-    /// This is the direction that failed on 2026-09-12.
+    /// HYPARB H0 (O-H1): `latency-arb` is gone as a name — neither the
+    /// mask table nor the boot arm knows it, so the old wrapper line
+    /// refuses the boot instead of composing a different member — and
+    /// the three slot-0 names resolve to bit 0.
     #[test]
-    fn every_mask_name_is_bootable_or_exempt() {
+    fn latency_arb_is_refused_and_the_hyparb_names_resolve() {
+        assert_eq!(strategy_set::mask_for_name("latency-arb"), None);
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"latency-arb"));
+        let want = [
+            ("hyparb", strategy_set::BIT_HYPARB),
+            (
+                "ai+hyparb",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HYPARB,
+            ),
+            (
+                "ai+vrp+xsd+bin15+hyparb",
+                strategy_set::BIT_AI_EXEC
+                    | strategy_set::BIT_VM
+                    | strategy_set::BIT_VRP
+                    | strategy_set::BIT_XSD
+                    | strategy_set::BIT_BIN15
+                    | strategy_set::BIT_HYPARB,
+            ),
+        ];
         let mut i = 0;
-        while i < strategy_set::MASK_TABLE.len() {
-            let (name, _mask) = strategy_set::MASK_TABLE[i];
-            assert!(
-                super::STRATEGY_SET_NAMES.contains(&name) || EXEMPT.contains(&name),
-                "mask_for_name accepts {name} but the boot arm refuses it"
-            );
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
             i += 1;
         }
     }

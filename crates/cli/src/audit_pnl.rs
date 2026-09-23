@@ -132,9 +132,15 @@ pub const AUDIT_PNL_VERSION: u32 = 2;
 /// was unlinked and the slot is held for `strategy-xsd`: rows under slot
 /// 2 in a capture taken BEFORE that date are cross-arb rows wearing this
 /// label; between XSD-S and the XSD-3 wiring the slot emits nothing.
+///
+/// **Slot 0 changed meaning on 2026-09-23 (HYPARB H0).**
+/// `strategy-latency-arb` was unlinked (O-H1) and the slot is the
+/// hyparb member: rows under slot 0 in a capture taken BEFORE that date
+/// are latency-arb rows wearing this label (it was OFF in every wrapper
+/// mask, so a live capture carries none).
 fn strategy_label(id: u8) -> &'static str {
     match id {
-        0 => "latency-arb",
+        0 => "hyparb",
         1 => "vrp",
         2 => "xsd",
         // BIN15 O4b (2026-09-12): slot 3 is bin15. The NUMBER is
@@ -480,7 +486,7 @@ fn load_run_events(
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
     bin_out: &mut AuditBinOut,
-    stale_after_ms: [u32; 8],
+    stale_after_ms: [u32; core_types::VENUE_COUNT],
 ) -> Result<(Vec<Ev>, RunLoad), HarnessError> {
     let mut load = RunLoad {
         epoch_ns: run.epoch_ns,
@@ -1000,7 +1006,7 @@ fn load_and_merge_events(
     interner: &mut SymInterner,
     opt_out: &mut AuditOptOut,
     bin_out: &mut AuditBinOut,
-    stale_after_ms: [u32; 8],
+    stale_after_ms: [u32; core_types::VENUE_COUNT],
 ) -> Result<(Vec<MergedEv>, Vec<RunLoad>), HarnessError> {
     let epoch_0 = runs[0].epoch_ns;
     let mut merged: Vec<MergedEv> = Vec::new();

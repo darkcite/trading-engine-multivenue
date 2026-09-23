@@ -34,7 +34,6 @@ opt-registry         = { workspace = true }
 engine               = { workspace = true }
 engine-snapshot      = { workspace = true }
 strategy-core        = { workspace = true }
-strategy-latency-arb = { workspace = true }
 strategy-ev          = { workspace = true }
 strategy-bin15       = { workspace = true }
 strategy-rule-tree   = { workspace = true }

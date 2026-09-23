@@ -188,7 +188,7 @@ fn golden_modeled_fill_attribution_and_markout() {
     // (`claude_worker.pnl_report`) now REFUSES a row without it, and
     // this string is the only thing connecting the two.
     assert!(json.contains(
-        "\"strategy_id\":0,\"label\":\"latency-arb\",\"origin\":1,\"orders\":1,\"fills\":1,\"trades\":1"
+        "\"strategy_id\":0,\"label\":\"hyparb\",\"origin\":1,\"orders\":1,\"fills\":1,\"trades\":1"
     ));
     assert!(
         !json.contains("\"origin\":0"),
@@ -330,7 +330,9 @@ fn stale_tick_neither_fills_nor_marks_in_audit_pnl_and_is_reported() {
     );
     let (json, lines) = run_report(&root);
     assert!(
-        json.contains("\"strategy_id\":0,\"label\":\"latency-arb\",\"origin\":1,\"orders\":1,\"fills\":0,"),
+        json.contains(
+            "\"strategy_id\":0,\"label\":\"hyparb\",\"origin\":1,\"orders\":1,\"fills\":0,"
+        ),
         "json: {json}"
     );
     assert!(

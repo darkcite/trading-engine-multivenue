@@ -2232,8 +2232,8 @@ mod tests {
     #[test]
     fn fee_rate_is_per_class_with_a_dearest_fallback() {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2310,8 +2310,8 @@ mod tests {
 
     fn pred_params(open_pair: Option<(u32, u32)>) -> ModelParams {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2356,8 +2356,8 @@ mod tests {
         // both directions, and the unknown-class counter is untouched
         // by the new path.
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2442,8 +2442,8 @@ mod tests {
 
     fn binary_engine() -> FillEngine {
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2828,8 +2828,8 @@ mod tests {
     /// Zero latency, zero flat fee, the venue's option schedule live.
     fn opt_engine() -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -2923,8 +2923,8 @@ mod tests {
         // NOT a mark-fill sym: after F9 every real Deribit option is
         // priced by its own quote lane, which is pass (b).
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3267,7 +3267,7 @@ mod tests {
 
         let round_trip = |frac: u32| -> (i64, i64) {
             let mut params = ModelParams {
-                latency_ns: [0; 8],
+                latency_ns: [0; core_types::VENUE_COUNT],
                 opt_spread_frac_1e6: frac,
                 ..ModelParams::default()
             };
@@ -3364,8 +3364,8 @@ mod tests {
     /// (still never fills on it — the pass precedes the emit).
     fn engine_zero_delta(boundary: u64) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3473,8 +3473,8 @@ mod tests {
 
     fn engine_fees(boundary: u64, maker: u32, taker: u32) -> FillEngine {
         let p = ModelParams {
-            fee_bps: [[(maker, taker); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(maker, taker); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3841,8 +3841,18 @@ mod tests {
     #[test]
     fn maker_fee_charges_on_fill_notional() {
         let p = ModelParams {
-            fee_bps: [[(50, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]], // PM maker 50 bps
-            latency_ns: [0; 8],
+            fee_bps: [
+                [(50, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+            ], // PM maker 50 bps
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -3880,8 +3890,18 @@ mod tests {
         assert_eq!(model_venue_byte(BN_SYM), 1);
         let p = ModelParams {
             // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
-            fee_bps: [[(50, 0); 5], [(10, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5], [(0, 0); 5]],
-            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0, 0],
+            fee_bps: [
+                [(50, 0); 5],
+                [(10, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+                [(0, 0); 5],
+            ],
+            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0, 0, 0],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -4172,8 +4192,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(maker_bps, 0); 5]; 8],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000],
+                fee_bps: [[(maker_bps, 0); 5]; core_types::VENUE_COUNT],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4243,8 +4263,8 @@ mod tests {
             taker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(0, taker_bps); 5]; 8],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000],
+                fee_bps: [[(0, taker_bps); 5]; core_types::VENUE_COUNT],
+                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000, 100_000_000],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4325,8 +4345,8 @@ mod tests {
             maker_bps in 0u32..200,
         ) {
             let params = ModelParams {
-                fee_bps: [[(maker_bps, 0); 5]; 8],
-                latency_ns: [0; 8],
+                fee_bps: [[(maker_bps, 0); 5]; core_types::VENUE_COUNT],
+                latency_ns: [0; core_types::VENUE_COUNT],
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };

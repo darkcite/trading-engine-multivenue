@@ -51,6 +51,8 @@ members = [
     "crates/strategy-ev",
     "crates/strategy-icdp",
     "crates/strategy-latency-arb",
+    # HYPARB H0: the slot-0 member (strategy-latency-arb is unlinked, not deleted — O-H1)
+    "crates/strategy-hyparb",
     "crates/strategy-bin15",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
@@ -189,6 +191,7 @@ strategy-cross-arb    = { path = "crates/strategy-cross-arb" }
 strategy-ev           = { path = "crates/strategy-ev" }
 strategy-icdp         = { path = "crates/strategy-icdp" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
+strategy-hyparb       = { path = "crates/strategy-hyparb" }
 strategy-bin15        = { path = "crates/strategy-bin15" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }

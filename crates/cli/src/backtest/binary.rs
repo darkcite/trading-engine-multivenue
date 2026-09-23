@@ -584,8 +584,8 @@ mod tests {
         assert_eq!(insts[0].twap_ns, TWAP);
 
         let mut p = ModelParams {
-            fee_bps: [[(0, 0); 5]; 8],
-            latency_ns: [0; 8],
+            fee_bps: [[(0, 0); 5]; core_types::VENUE_COUNT],
+            latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };

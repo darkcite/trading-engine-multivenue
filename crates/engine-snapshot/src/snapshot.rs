@@ -45,16 +45,13 @@ pub const RUN_DIR_MAX: usize = 160;
 /// **Slot 2 changed meaning on 2026-09-12 (XSD-S/XSD-3)**:
 /// `strategy-cross-arb` was unlinked and `strategy-xsd` took the number
 /// the same day.
+/// **Slot 0 changed meaning on 2026-09-23 (HYPARB H0)**:
+/// `strategy-latency-arb` was unlinked (O-H1) and `strategy-hyparb`
+/// took the number the same day.
+/// **Slot 3 changed meaning on 2026-09-12 (BIN15 O4b)**: it was
+/// `rule-tree`.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
-    "latency-arb",
-    "vrp",
-    "xsd",
-    // BIN15 O4b (2026-09-12): slot 3 was `rule-tree`.
-    "bin15",
-    "ai-exec",
-    "vm",
-    "icdp",
-    "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
 ];
 
 /// Ingress index → venue name (see [`SNAPSHOT_VENUES`]).
@@ -569,7 +566,7 @@ pub struct EngineSnapshot {
     pub mono_ns: u64,
     /// Wall ns of this publish (anchor arithmetic — no syscall).
     pub wall_ns: u64,
-    /// `StrategyCounters::strategy_kind` ("set", "latency-arb", …).
+    /// `StrategyCounters::strategy_kind` ("set", "hyparb", …).
     pub strategy_kind: [u8; 16],
     /// Boot identity.
     pub boot: BootInfo,

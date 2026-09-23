@@ -108,7 +108,7 @@ const SLOT_KEYS: [&str; 15] = [
 /// venue — naming arms nothing. MEXC is data-only (O-MX1): no
 /// `ExecMode` arm, no dispatcher, no fill lane; arming it needs its
 /// own plan, E-law record and operator ruling.
-const VENUE_NAMES: [(&str, u8); 8] = [
+const VENUE_NAMES: [(&str, u8); core_types::VENUE_COUNT] = [
     ("polymarket", 0),
     ("binance", 1),
     ("okx", 2),
@@ -117,6 +117,7 @@ const VENUE_NAMES: [(&str, u8); 8] = [
     ("ai", 5),
     ("bybit", 6),
     ("mexc", 7),
+    ("hyperevm", 8),
 ];
 
 /// Resolve a venue spelling to its `VenueId` byte.
@@ -966,10 +967,13 @@ mode = "paper"
             assert_eq!(venue_name_from_id(id), Some(name));
         }
         assert_eq!(venue_id_from_name("nope"), None);
-        // MX2: `mexc` is byte 7; the first unassigned byte is now 8.
+        // MX2: `mexc` is byte 7. HYPARB: `hyperevm` is byte 8; the first
+        // unassigned byte is now 9.
         assert_eq!(venue_id_from_name("mexc"), Some(7));
         assert_eq!(venue_name_from_id(7), Some("mexc"));
-        assert_eq!(venue_name_from_id(8), None);
+        assert_eq!(venue_id_from_name("hyperevm"), Some(8));
+        assert_eq!(venue_name_from_id(8), Some("hyperevm"));
+        assert_eq!(venue_name_from_id(9), None);
         // Every name is the byte `core_types::VenueId` decodes it to.
         for (_, id) in VENUE_NAMES {
             assert!(core_types::VenueId::from_u8(id).is_some(), "byte {id}");

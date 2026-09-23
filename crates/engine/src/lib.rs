@@ -95,7 +95,8 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Hyperliquid => Some(4),
         VenueId::Bybit => Some(5),
         VenueId::Mexc => Some(6),
-        VenueId::Ai => None,
+        // HYPARB: HyperEVM pool events ride the signal lane — no ticks.
+        VenueId::Ai | VenueId::HyperEvm => None,
     }
 }
 
@@ -128,7 +129,8 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Bybit
         // MX2: MEXC spot incremental depth is `Blocked!` on the public
         // tier and futures BBO rides `depth.full` top-5 — no L2 lane.
-        | VenueId::Mexc => None,
+        | VenueId::Mexc
+        | VenueId::HyperEvm => None,
     }
 }
 
@@ -152,7 +154,8 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         | VenueId::Hyperliquid
         | VenueId::Ai
         | VenueId::Bybit
-        | VenueId::Mexc => None,
+        | VenueId::Mexc
+        | VenueId::HyperEvm => None,
     }
 }
 
@@ -185,7 +188,9 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         // submission is Stage-3, gaps-doc §7) — no fill lane yet.
         // MX2: MEXC is data-only by operator ruling O-MX1 — no exec
         // arm, no fill lane.
-        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc => None,
+        // HYPARB: AMM fills are PAPER fills (the matcher's judge); the
+        // O-H12 testnet sends are a shadow and never reach the book.
+        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc | VenueId::HyperEvm => None,
     }
 }
 

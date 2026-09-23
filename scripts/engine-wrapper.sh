@@ -156,10 +156,18 @@ fi
 # operator comes to watch a member that was never there. `rule-tree` is
 # GONE from the set: slot 3 is bin15, and the name was never in this
 # allow-list.
+#
+# HYPARB H0 (2026-09-23): slot 0 is the hyparb member (`hyparb`,
+# `ai+hyparb`, `ai+vrp+xsd+bin15+hyparb`); `latency-arb` was never in
+# this list and is now gone from the engine too (O-H1). The names are
+# here so they CAN be set later — the member lands DARK (O-H8): nothing
+# edits strategy.conf until HZ and H8 are green, and until H5 lands its
+# artifact the engine refuses a mask whose only request is slot 0.
 case "$STRATEGY" in
   ai|ai+icdp|icdp|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
   bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15)" >&2; exit 78 ;;
+  hyparb|ai+hyparb|ai+vrp+xsd+bin15+hyparb) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb)" >&2; exit 78 ;;
 esac
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's

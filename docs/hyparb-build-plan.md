@@ -1508,3 +1508,44 @@ impostor callbacks, USDT-style and false-returning tokens) + 4 on a
 HyperEVM MAINNET FORK — a real Uniswap-ABI, Slipstream, Algebra v1.0 and
 Algebra v1.2 pool each swapped exactly (local fork only; nothing sent).
 Deployment is H8, testnet only (O-H5).
+
+### 16.8 H0 — slot 0 is hyparb, HyperEvm = 8 — LANDED (dark)
+
+Done as §4 says, with these decisions recorded:
+
+* **The venue sweep went through one constant.** `core_types::VENUE_COUNT
+  = 9` (const-asserted against `VenueId::from_u8`) now sizes every
+  venue-indexed table (§2); the next venue is one edit plus its arms, not
+  a sweep of literal `8`s. HyperEvm's stale default is 2 500 ms (HZ head
+  p99 2 281 ms) and its activation Δ one block (1 000 ms); it rides no
+  tick / depth / option / fill lane. `SignalSource::HyperEvm = 5`.
+  `exec-router`: `EXEC_VENUES` 16, per-slot mask `u16`, table still
+  inside its 64-byte bound. Harness labels gain `hyperevm` (the rendered
+  fee table grows a trailing `hyperevm` entry). `SNAPSHOT_VENUES` /
+  capture labels wait for H3b, `TRADEABLE_VENUES` for H2.
+* **The standalone arm went with the name.** `engine_loop` /
+  `engine_loop_with` / `engine_loop_full` (the LatencyArb-only loops) and
+  `configure_latency_arb` are deleted; `engine_loop_set_full` loses its
+  `EngineConfig` argument (only latency-arb read it); the ev / rule-tree
+  defaults (`threshold`, `qty`, `cooldown`) are cli constants now. The
+  name-pin tests lost their exemption: `STRATEGY_SET_NAMES` ⇄
+  `MASK_TABLE` is an equality.
+* **Dark means NOT configured.** At H0 slot 0 is never in the set
+  builder's configured mask, so `--strategy hyparb` refuses ("no
+  requested member is configured") and the two composite names boot
+  with bit 0 cleared — an inert stub never boots under a healthy name.
+  H5 makes it configured iff its artifact resolves.
+* **The probe moved.** The strategy-set fan-out / mask / halt tests used
+  the latency-arb trigger pair; they now use the ai-exec member
+  (Heartbeat + one OrderIntent), and a new test pins the dark slot
+  (`hyparb_slot_is_dark_and_inert_at_h0`).
+* **Unlinked, not deleted — kept exercised.** `bench` (standalone alloc
+  gate + criterion bench) and `core-io` (replay parity test) keep their
+  dev-dependency on `strategy-latency-arb`, exactly as they do for the
+  earlier unlinked members (ev, cross-arb, rule-tree). Only the cli graph
+  dropped it. The set alloc gate measures slot 0 as the hyparb stub.
+* **Every slot-0 label follows the ev / cross_arb precedent:** `/state`
+  slot name, `audit-pnl` label, `exec_boot` names, the dashboard,
+  `regime.toml [labels.hyparb]` (`[labels.latency_arb]` refused at the
+  grammar), gauge `engine_strategy_hyparb_active`. `docs/migration.md`
+  carries the two entries (slot 0; VenueId 8).

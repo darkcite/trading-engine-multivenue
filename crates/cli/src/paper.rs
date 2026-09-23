@@ -62,7 +62,6 @@ use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
 // through `cli::` like every other paper-mode surface.
 pub use ingress_ai::AiIngressStatus;
 use rustls_pki_types::ServerName;
-use strategy_latency_arb::LatencyArb;
 
 use ingress_binance::run_loop as bwl;
 use ingress_bybit::run_loop as ywl;
@@ -2722,13 +2721,13 @@ pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
 // Engine loop — real strategy wired to the dispatcher
 // ---------------------------------------------------------------
 
-/// Slot capacity for the Phase 2 strategy table. Holds at most `N`
-/// symbol pairs (one Polymarket book + one Binance reference per
-/// pair). `8` is plenty for v1; bump and recompile when we widen
-/// coverage.
+/// Slot capacity for the standalone strategy tables (ev, rule-tree).
+/// Holds at most `N` symbol pairs (one Polymarket book + one Binance
+/// reference per pair). `8` is plenty for v1; bump and recompile when
+/// we widen coverage.
 pub const STRATEGY_SLOTS: usize = 8;
 
-/// A symbol pair to register with [`LatencyArb`] at boot.
+/// A symbol pair registered with the standalone members at boot.
 #[derive(Copy, Clone, Debug)]
 pub struct StrategyPair {
     /// Polymarket SymbolId (must match the run-loop's SymbolMap).
@@ -2751,22 +2750,24 @@ pub struct EngineConfig {
     pub cooldown_ns: u64,
 }
 
+/// Default trigger threshold (1e6 fixed-point) — the value the
+/// unlinked latency-arb member exported (HYPARB H0, O-H1: its numbers
+/// stay, its crate leaves the cli graph).
+const DEFAULT_THRESHOLD_1E6: i64 = 20_000;
+/// Default per-order quantity (1e6 fixed-point) — 10 units.
+const DEFAULT_QTY_1E6: i64 = 10_000_000;
+/// Default per-market cooldown between emits (ns) — 250 ms.
+const DEFAULT_COOLDOWN_NS: u64 = 250_000_000;
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             pairs: Vec::new(),
-            threshold_1e6: strategy_latency_arb::DEFAULT_THRESHOLD_1E6,
-            qty_1e6: strategy_latency_arb::DEFAULT_QTY.raw(),
-            cooldown_ns: strategy_latency_arb::DEFAULT_COOLDOWN_NS,
+            threshold_1e6: DEFAULT_THRESHOLD_1E6,
+            qty_1e6: DEFAULT_QTY_1E6,
+            cooldown_ns: DEFAULT_COOLDOWN_NS,
         }
     }
-}
-
-/// Run the real engine loop with a [`PaperDispatcher`]. Default
-/// `--paper` entry point — builds a `LatencyArb` strategy.
-pub fn engine_loop(cons: Consumers, cfg: EngineConfig) -> EngineLoopResult {
-    let disp = PaperDispatcher::new();
-    engine_loop_with(cons, cfg, disp)
 }
 
 /// Run the EV strategy (Strategy A) over the paper dispatcher.
@@ -2781,25 +2782,6 @@ pub fn engine_loop_ev_paper(
 ) -> EngineLoopResult {
     let disp = PaperDispatcher::new();
     engine_loop_ev_full(cons, cfg, disp, Observability::default(), artifact_path)
-}
-
-/// Configure a latency-arb instance from [`EngineConfig`] (threshold,
-/// qty, cooldown, pairs). Shared by the standalone path and the
-/// Phase-8f [`engine_loop_set_full`] builder — do not duplicate.
-fn configure_latency_arb<const N: usize>(
-    strat: &mut LatencyArb<N>,
-    cfg: &EngineConfig,
-) -> Result<(), &'static str> {
-    strat.set_threshold(cfg.threshold_1e6);
-    strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
-    strat.set_cooldown_ns(cfg.cooldown_ns);
-    for p in &cfg.pairs {
-        if let Err(e) = strat.add_pair(p.polymarket, p.binance) {
-            tracing::error!(error = ?e, pm = p.polymarket, bn = p.binance, "add_pair failed");
-            return Err("engine_loop: add_pair rejected");
-        }
-    }
-    Ok(())
 }
 
 /// Load + configure an EV instance (artifact table, params, symbol
@@ -2931,9 +2913,12 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — latency-arb always (pairs are mandatory), vrp when
-/// `vrp.toml` resolves, rule-tree with `--rules-path`, icdp when its
-/// artifact resolves, **ai-exec and vm unconditionally** (neither has
+/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / icdp
+/// when their artifacts resolve, **never slot 0 before HYPARB H5**
+/// (the hyparb member lands DARK — O-H8: it is configured only by its
+/// own boot artifact, so `--strategy hyparb` refuses until then rather
+/// than booting an inert member under a healthy-looking name),
+/// **ai-exec and vm unconditionally** (neither has
 /// boot config: ai-exec's universe arrives over UDS at runtime and
 /// its `on_start` validates parameters only; vm boots inert until a
 /// ruleset table is staged + committed — 8g §7.3, normal, not an
@@ -2947,7 +2932,6 @@ fn configure_rule_tree<const N: usize>(
 #[allow(clippy::too_many_arguments)]
 pub fn engine_loop_set_full<D: OrderDispatch>(
     cons: Consumers,
-    cfg: EngineConfig,
     disp: D,
     obs: Observability,
     requested_mask: u8,
@@ -2957,11 +2941,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
 ) -> EngineLoopResult {
-    if cfg.pairs.is_empty() {
-        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
-    }
-    let mut configured =
-        strategy_set::BIT_LATENCY_ARB | strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
+    let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if vrp.is_some() {
         configured |= strategy_set::BIT_VRP;
     }
@@ -2984,9 +2964,6 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     obs.boot.configured_mask = configured;
 
     let mut set = strategy_set::StrategySet::new(mask);
-    if let Err(reason) = configure_latency_arb(set.latency_arb_mut(), &cfg) {
-        return EngineLoopResult::Failed(reason);
-    }
     if let Some(boot) = vrp {
         // VRP V7: the wall anchor is taken HERE, once, right before the
         // engine loop starts — the member maps every tick's monotonic
@@ -3341,7 +3318,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     }
     tracing::info!(
         mask,
-        latency_arb = mask & strategy_set::BIT_LATENCY_ARB != 0,
+        hyparb = mask & strategy_set::BIT_HYPARB != 0,
         vrp = mask & strategy_set::BIT_VRP != 0,
         xsd = mask & strategy_set::BIT_XSD != 0,
         bin15 = mask & strategy_set::BIT_BIN15 != 0,
@@ -3392,7 +3369,7 @@ pub struct RegimeBoot {
 /// held to the law upstream — every row of a staged table must be
 /// labelled (the worker's RG8 gates), never at boot.
 const REQUIRE_LABEL_SLOTS: [u8; 5] = [
-    strategy_set::SLOT_LATENCY_ARB,
+    strategy_set::SLOT_HYPARB,
     strategy_set::SLOT_VRP,
     strategy_set::SLOT_XSD,
     strategy_set::SLOT_BIN15,
@@ -3474,9 +3451,9 @@ impl Observability {
             let ack_p99_ns = reg
                 .register_gauge("engine_latency_ack_p99_ns")
                 .map_err(|_| "register engine_latency_ack_p99_ns")?;
-            let strategy_latency_arb = reg
-                .register_gauge("engine_strategy_latency_arb_active")
-                .map_err(|_| "register engine_strategy_latency_arb_active")?;
+            let strategy_hyparb = reg
+                .register_gauge("engine_strategy_hyparb_active")
+                .map_err(|_| "register engine_strategy_hyparb_active")?;
             let strategy_vrp = reg
                 .register_gauge("engine_strategy_vrp_active")
                 .map_err(|_| "register engine_strategy_vrp_active")?;
@@ -3695,7 +3672,7 @@ impl Observability {
                 decide_p99_ns,
                 ack_p50_ns,
                 ack_p99_ns,
-                strategy_latency_arb,
+                strategy_hyparb,
                 strategy_vrp,
                 strategy_rule_tree,
                 strategy_set,
@@ -3770,9 +3747,9 @@ impl Observability {
 /// byte — the venue defaults (`VenueId::default_stale_after_ms`,
 /// docs/venue-time-capture-plan.md §2 doctrine 4) overridden by
 /// repeatable `--stale-after-ms <venue>:<ms>` specs (labels as the
-/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`). A
+/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`). A
 /// zero disables the judgement for that venue (nothing is ever stale).
-pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; 8], String> {
+pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; core_types::VENUE_COUNT], String> {
     let mut table = VenueId::stale_after_ms_defaults();
     for spec in specs {
         let (label, ms) = spec
@@ -3851,7 +3828,7 @@ impl LatencyDump {
 
 /// Optional observability surfaces wired around the engine loop.
 /// Build once at boot via [`Observability::build`] and hand the
-/// owned `Arc`s into [`engine_loop_full`] — the loop publishes
+/// owned `Arc`s into [`engine_loop_set_full`] — the loop publishes
 /// counters + dashboard snapshots into them.
 #[derive(Default)]
 pub struct Observability {
@@ -3969,8 +3946,9 @@ pub struct EngineCounters {
     pub ack_p50_ns: core_metrics::GaugeId,
     /// p99 submit→ack latency (ns).
     pub ack_p99_ns: core_metrics::GaugeId,
-    /// Active-strategy indicator — latency-arb (B).
-    pub strategy_latency_arb: core_metrics::GaugeId,
+    /// Active-strategy indicator — hyparb (slot 0; was latency-arb
+    /// before HYPARB H0).
+    pub strategy_hyparb: core_metrics::GaugeId,
     /// Active-strategy indicator — ev (A).
     pub strategy_vrp: core_metrics::GaugeId,
     /// Active-strategy indicator — rule-tree (D).
@@ -6673,43 +6651,6 @@ fn mirror_ingress_counters(
     *last = cur;
 }
 
-/// Generic engine loop: pass in any `OrderDispatch`. The `--live`
-/// path constructs a [`LiveDispatcher`] and forwards to this fn.
-pub fn engine_loop_with<D: OrderDispatch>(
-    cons: Consumers,
-    cfg: EngineConfig,
-    disp: D,
-) -> EngineLoopResult {
-    engine_loop_full(cons, cfg, disp, Observability::default())
-}
-
-/// Full engine loop with observability plumbed in. Used by the
-/// `--metrics`/`--tui` paths.
-pub fn engine_loop_full<D: OrderDispatch>(
-    cons: Consumers,
-    cfg: EngineConfig,
-    disp: D,
-    obs: Observability,
-) -> EngineLoopResult {
-    if cfg.pairs.is_empty() {
-        return EngineLoopResult::Failed("engine_loop: no symbol pairs configured");
-    }
-
-    // Build the strategy.
-    let mut strat: LatencyArb<STRATEGY_SLOTS> = LatencyArb::new();
-    strat.set_threshold(cfg.threshold_1e6);
-    strat.set_qty(core_types::Qty::from_raw(cfg.qty_1e6));
-    strat.set_cooldown_ns(cfg.cooldown_ns);
-    for p in &cfg.pairs {
-        if let Err(e) = strat.add_pair(p.polymarket, p.binance) {
-            tracing::error!(error = ?e, pm = p.polymarket, bn = p.binance, "add_pair failed");
-            return EngineLoopResult::Failed("engine_loop: add_pair rejected");
-        }
-    }
-
-    run_engine_loop(cons, disp, strat, obs)
-}
-
 fn run_engine_loop<S, D>(cons: Consumers, disp: D, strat: S, obs: Observability) -> EngineLoopResult
 where
     S: strategy_core::Strategy,
@@ -6953,11 +6894,9 @@ where
                 // Active-strategy gauges — flip exactly one to 1.
                 let kind = strategy_core::StrategyCounters::strategy_kind(eng.strategy());
                 let live_mask = strategy_core::StrategyCounters::enabled_mask(eng.strategy());
-                reg.gauge(ids.strategy_latency_arb)
-                    .set(i64::from(
-                        kind == "latency-arb"
-                            || live_mask & u64::from(strategy_set::BIT_LATENCY_ARB) != 0,
-                    ));
+                reg.gauge(ids.strategy_hyparb).set(i64::from(
+                    kind == "hyparb" || live_mask & u64::from(strategy_set::BIT_HYPARB) != 0,
+                ));
                 // F29: the live engine runs the SET, so `kind` is
                 // "set" and this gauge read 0 for the whole life of the
                 // member — an alert on "is the VRP member running"
@@ -7216,7 +7155,8 @@ pub struct EngineLoopStats {
     pub dispatcher_accepted: u64,
 }
 
-/// Outcome of [`engine_loop`].
+/// Outcome of an engine loop ([`engine_loop_set_full`] and the
+/// standalone ev / rule-tree arms).
 #[derive(Debug)]
 pub enum EngineLoopResult {
     /// Clean shutdown via SIGINT; carries cumulative stats.
@@ -10401,7 +10341,7 @@ mod tests {
         // On, every coded member ANY: the first enabled required slot names the refusal.
         assert_eq!(
             unlabelled_required_slot(&set, strategy_set::BUILT_MASK, true),
-            Some(strategy_set::SLOT_LATENCY_ARB)
+            Some(strategy_set::SLOT_HYPARB)
         );
         // The AI-only mask (ai-exec + vm) is exempt — nothing to label at boot.
         let ai = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
