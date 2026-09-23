@@ -234,9 +234,9 @@ nothing is R0-harness-reusable at all. Budget accordingly.
 ## 4. Phases
 
 ### R0 — Turn the one-shots into a screen harness (2–3 d)
-Generalise the parent study's scripts into a parameterised tool:
-`tools_cexdex_screen.py` (git-excluded, per the research-one-shot law; never
-named in a tracked doc). Inputs: chain endpoint set, `Swap` topic set, CEX
+Generalise the parent study's scripts into a parameterised research
+one-shot (git-excluded — see `docs/arch/research-tools-exclusion-plan.md`
+for where such tools live and how they are referred to). Inputs: chain endpoint set, `Swap` topic set, CEX
 tape selector, window list. Outputs: the standard report.
 Python convention: **full `import x` only, never `from x import y`.**
 
