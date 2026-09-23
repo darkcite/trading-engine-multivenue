@@ -213,7 +213,7 @@ in the script; `ai` = 48 is the floor every name includes).
   bounded ≤ 2 h window roots; `regime.toml
   [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
   names `claude-opus-4-6` as the session model (the three review agents are
-  pinned to `claude-opus-5`).
+  pinned to `claude-opus-5-5` — ruling O-8, 2026-09-23).
 
 ## Standing operator laws (survive every archival)
 
@@ -425,7 +425,7 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - `scripts/` + `launchd/` — the wrapper, daily-restart, candles/regime/
   archive/retention cycles, `exec-smoke.sh`, `copy-audit.sh`.
 - `.claude/` — agents (`alloc-auditor`, `zero-copy-auditor`,
-  `risk-reviewer`, `parser-property-tester`, all Opus 5), commands, hooks.
+  `risk-reviewer` on Opus 5.5, `parser-property-tester` on Sonnet), commands, hooks.
 - `docs/arch/` — history (index in its README). `docs/research/` — the vault.
 
 ## Common pitfalls — if you're about to do one of these, stop
@@ -498,7 +498,8 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   strategist): `MODEL_STRATEGIST = "claude-fable-5-1"` (needs `anthropic >=
   1.4.0`). NEWS tier-3 event analyst (`serve` only): `MODEL_ANALYST =
   "claude-opus-5"`. Hard work — reviews, architecture, the three review agents:
-  Opus 5 (`claude-opus-5`).
+  Opus 5.5 (`claude-opus-5-5`, ruling O-8 2026-09-23; the agents' frontmatter
+  pins, not a worker constant).
 - These are constants in `claude-worker/src/claude_worker/config.py`, pinned
   by `tests/test_config.py` — change the doc and the constant together, and
   verify a model id against the installed SDK's `anthropic/types/model.py`

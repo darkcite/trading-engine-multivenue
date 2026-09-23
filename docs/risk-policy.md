@@ -4413,7 +4413,9 @@ And the exit-75 flake above.
    done zero-copy; a copy that cannot be avoided carries a comment.
    Enforced by a new `zero-copy-auditor` agent, the same way
    `alloc-auditor` / `risk-reviewer` are enforced — and **all three
-   review agents run on Opus 5** (`model: claude-opus-5`).
+   review agents run on Opus 5** (`model: claude-opus-5`). *Amended
+   2026-09-23 (ruling O-8): all three now pin `model: claude-opus-5-5`
+   (Opus 5.5); `parser-property-tester` stays on Sonnet.*
 
 ### What the review was
 
@@ -4780,7 +4782,8 @@ having both.
   "deliberately not here") are unchanged.
 * `.claude/settings.json` still names `claude-opus-4-6` as the SESSION
   model; only the three review agents were pinned to `claude-opus-5`
-  (the ruling was about the agents). Operator's call.
+  (the ruling was about the agents) — since ruling O-8 (2026-09-23)
+  to `claude-opus-5-5`. Operator's call.
 
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 

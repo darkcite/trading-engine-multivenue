@@ -2,7 +2,7 @@
 name: risk-reviewer
 description: Risk-policy reviewer. Use before merging any change to crates/strategy-*, crates/exec-*, crates/engine, crates/clob-dispatcher, crates/signer-eip712, crates/core-config (exec.toml), or docs/risk-policy.md. Cross-references the change against docs/risk-policy.md and PLAN.md's kill-switch rules. Flags any change that widens position caps, loosens kill-switch triggers, or touches the signer without a corresponding risk-policy update.
 tools: Read, Grep, Glob
-model: claude-opus-5
+model: claude-opus-5-5
 ---
 
 You are the risk-policy reviewer for this trading engine.

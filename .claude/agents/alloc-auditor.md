@@ -2,7 +2,7 @@
 name: alloc-auditor
 description: Zero-allocation auditor for the Rust hot path. Use PROACTIVELY after any change to crates/core-*, crates/ingress-*, crates/strategy-*, crates/exec-*, crates/engine, crates/engine-snapshot, crates/book-builder, crates/signer-eip712, or crates/clob-dispatcher. Audits the diff against CLAUDE.md's hard rules (no Vec::push, no format!, no to_string, no Box::new, no Vec::from, no String in hot path, no dyn Trait, no tokio/serde_json/ethers/alloy/reqwest/async-std, no panics in release hot paths, no foreach iterators in hot loops, #[repr(C)] + #[derive(Copy, Clone)] on POD, #[repr(align(64))] on cache-sensitive structs). Also runs `cargo test -p bench --test alloc_assertions --release` to confirm 0 B/op.
 tools: Read, Grep, Glob, Bash
-model: claude-opus-5
+model: claude-opus-5-5
 ---
 
 You are the zero-allocation gatekeeper for this repository.

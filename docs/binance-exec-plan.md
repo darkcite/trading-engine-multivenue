@@ -1186,7 +1186,7 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
 - **TLS loopback tests:** `bn_wsapi_tls_loopback`, `bn_userstream_loopback`, `bn_rest_loopback`, `bn_gateway_e2e_loopback`.
 - `make lint`, `make license-check`, `make license-deps`.
 - **Agents:**
-  - Opus 5: `risk-reviewer` (BX0 F3, BX3, BX7–BX11), `zero-copy-auditor` (BX0 F2, BX5–BX10), `alloc-auditor`.
+  - Opus 5.5 (ruling O-8, 2026-09-23; Opus 5 before): `risk-reviewer` (BX0 F3, BX3, BX7–BX11), `zero-copy-auditor` (BX0 F2, BX5–BX10), `alloc-auditor`.
   - Sonnet: `parser-property-tester` (BX0 F2, BX2, BX6).
 
 **Size:** about 1 600 lines of test (loopback and fuzz).
