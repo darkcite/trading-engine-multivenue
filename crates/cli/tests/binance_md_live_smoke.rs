@@ -9,7 +9,12 @@
 //!   silent), on three perpetuals and the front dated future;
 //! - **F2**: the options lane's `<uly>@optionMarkPrice` array on
 //!   fstream's routed `/market/stream` path (the retired nbstream
-//!   `/eoptions/` base answers 404).
+//!   `/eoptions/` base answers 404);
+//! - **the spot sentinel** (BX0's zero-copy pass): a spot `bookTicker`
+//!   slot whose `<sym>@aggTrade` SUBSCRIBE is composed once at boot and
+//!   written straight from the driver into tx — the prints must come
+//!   back as captured `Trade` events and the book ticks must inherit
+//!   their stamp.
 //!
 //! The launchd engine is the ONE engine and is never stopped for this:
 //! nothing here binds 9191 or `ai.sock`. What runs is the production
@@ -43,7 +48,7 @@ use core_net::TlsTransport;
 use core_ring::Ring;
 use core_types::{
     make_symbol_id, ChannelEvent, ChannelId, OptSummary, SymbolId, Tick, VenueId,
-    EVENT_RING_SIZE, OPT_RING_SIZE,
+    EVENT_RING_SIZE, OPT_RING_SIZE, TICK_FLAG_VENUE_TIME_SENTINEL,
 };
 use engine::TICK_RING_SIZE;
 use ingress_binance::discovery::BnDiscovery;
@@ -163,6 +168,16 @@ fn binance_md_live_smoke() {
         mark_price: false,
         spot_sentinel: false,
     });
+    // ---- spot: one bookTicker slot carrying the aggTrade sentinel ----
+    let spot_sym = make_symbol_id(VenueId::Binance, 620);
+    specs.push(cli::BinanceConnSpec {
+        host: "stream.binance.com".to_string(),
+        path: "/ws/btcusdt@bookTicker".to_string(),
+        sym: spot_sym,
+        eapi: None,
+        mark_price: false,
+        spot_sentinel: true,
+    });
     let (run_dir, epoch_ns) = cli::new_capture_run_dir(&root).expect("run dir");
     let (tick_prod, mut tick_cons) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (ev_prod, mut ev_cons) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
@@ -191,12 +206,16 @@ fn binance_md_live_smoke() {
     let mut ticks = std::collections::HashMap::<SymbolId, u64>::new();
     let mut funding = std::collections::HashMap::<SymbolId, (u64, i64, i64)>::new();
     let mut summaries = std::collections::HashMap::<SymbolId, (u64, OptSummary)>::new();
+    let mut spot_inherited = 0u64;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(secs) {
         let mut idle = true;
         while let Some(t) = tick_cons.try_pop() {
             idle = false;
             *ticks.entry(t.sym).or_default() += 1;
+            if t.sym == spot_sym && t.flags & TICK_FLAG_VENUE_TIME_SENTINEL != 0 {
+                spot_inherited += 1;
+            }
         }
         while let Some(e) = ev_cons.try_pop() {
             idle = false;
@@ -223,12 +242,15 @@ fn binance_md_live_smoke() {
     // ---- the capture-only Mark events, read back from the run ----
     let events = PmlrReader::<ChannelEvent>::open(run_dir.join("bn-events.pmlr")).expect("bn-events.pmlr");
     let mut marks = std::collections::HashMap::<SymbolId, (u64, i64, i64)>::new();
+    let mut spot_prints = 0u64;
     for e in events.records() {
         if e.channel == ChannelId::Mark as u8 {
             let m = marks.entry(e.sym).or_default();
             m.0 += 1;
             m.1 = e.v0;
             m.2 = e.v1;
+        } else if e.channel == ChannelId::Trade as u8 && e.sym == spot_sym {
+            spot_prints += 1;
         }
     }
 
@@ -300,6 +322,19 @@ fn binance_md_live_smoke() {
             }
             None => failures.push(format!("{name}: no OptSummary at all")),
         }
+    }
+    // The spot sentinel: its SUBSCRIBE was accepted (prints arrived) and
+    // the book ticks inherited the prints' stamp.
+    let spot_book = ticks.get(&spot_sym).copied().unwrap_or(0);
+    println!("  spot btcusdt      book_ticks={spot_book:<6} sentinel_prints={spot_prints:<6} inherited_stamps={spot_inherited}");
+    if spot_book == 0 {
+        failures.push("spot btcusdt: no book ticks".to_string());
+    }
+    if spot_prints == 0 {
+        failures.push("spot btcusdt: no aggTrade prints — the sentinel SUBSCRIBE was not honoured".to_string());
+    }
+    if spot_inherited == 0 {
+        failures.push("spot btcusdt: no book tick inherited a sentinel stamp".to_string());
     }
     if status.parse_errors_total() != 0 {
         failures.push(format!("{} parse errors", status.parse_errors_total()));

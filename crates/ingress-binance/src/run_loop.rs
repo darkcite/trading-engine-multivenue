@@ -37,7 +37,7 @@ use std::io;
 use core_net::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
     write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_ping,
-    ws_write_pong, ws_write_text_frame, HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
+    ws_write_pong, ws_write_text_frame_parts, HandshakeResult, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
@@ -46,7 +46,7 @@ use core_types::{
     EVENT_RING_SIZE, OPT_RING_SIZE, TICK_FLAG_STALE, TICK_FLAG_VENUE_TIME_SENTINEL,
 };
 
-use crate::{parse_book_ticker, parse_trade};
+use crate::{parse_book_ticker, parse_trade, BookTickerFrame};
 
 // ---------------------------------------------------------------
 // Configuration + sizing
@@ -268,11 +268,11 @@ pub struct Driver {
     /// subscribes `<sym>@aggTrade` on the SAME socket after the upgrade;
     /// each aggTrade's `T` teaches [`Self::feed_clock`], and every
     /// bookTicker tick inherits the sentinel's latest stamp + verdict
-    /// with `TICK_FLAG_VENUE_TIME_SENTINEL` set. `sentinel_len == 0` ⇒
-    /// not a sentinel slot (USDS-M / legacy).
-    sentinel_stream: [u8; SENTINEL_STREAM_MAX],
-    /// Live bytes of `sentinel_stream` (`btcusdt@aggTrade`).
-    sentinel_len: u8,
+    /// with `TICK_FLAG_VENUE_TIME_SENTINEL` set. `false` ⇒ not a
+    /// sentinel slot (USDS-M / legacy). Nothing else is stored: the
+    /// SUBSCRIBE is written at each (re)connect from the slot's own
+    /// path ([`queue_sentinel_subscribe`]).
+    sentinel: bool,
     /// Latest sentinel stamp (ms; 0 = none seen this connection).
     sentinel_time_ms: u64,
     /// Latest sentinel verdict (`TICK_FLAG_STALE` or 0).
@@ -281,9 +281,28 @@ pub struct Driver {
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
 
-/// Longest sentinel stream name (`<symbol>@aggTrade`; spot symbols
-/// are ≤ 20 chars on this venue).
-pub const SENTINEL_STREAM_MAX: usize = 32;
+/// The sentinel's stream suffix (`btcusdt` → `btcusdt@aggTrade`).
+const SENTINEL_SUFFIX: &[u8] = b"@aggTrade";
+/// The SUBSCRIBE request before the sentinel's stream name …
+const SENTINEL_SUB_HEAD: &[u8] = b"{\"method\":\"SUBSCRIBE\",\"params\":[\"";
+/// … and after it.
+const SENTINEL_SUB_TAIL: &[u8] = b"\"],\"id\":1}";
+
+/// VT2: the stream symbol a spot sentinel slot subscribes for — its
+/// path's last segment up to the `@` (`/ws/btcusdt@bookTicker` →
+/// `btcusdt`), borrowed from the path. `None` when the path names no
+/// stream (no `@`, or nothing before it).
+#[inline]
+fn sentinel_symbol(path: &[u8]) -> Option<&[u8]> {
+    let seg = match memchr::memrchr(b'/', path) {
+        Some(i) => &path[i + 1..],
+        None => path,
+    };
+    match memchr::memchr(b'@', seg) {
+        Some(at) if at > 0 => Some(&seg[..at]),
+        _ => None,
+    }
+}
 
 impl Driver {
     /// Allocate rx/tx buffers and seed the opening-handshake nonce.
@@ -301,37 +320,27 @@ impl Driver {
             sym,
             lane: StreamLane::BookTicker,
             feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
-            sentinel_stream: [0; SENTINEL_STREAM_MAX],
-            sentinel_len: 0,
+            sentinel: false,
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
             _not_sync: ::core::marker::PhantomData,
         }
     }
 
-    /// VT2: a SPOT bookTicker slot with the aggTrade sentinel —
-    /// `symbol` is the lowercase stream symbol (`btcusdt`); the slot
-    /// subscribes `<symbol>@aggTrade` on the same socket right after
-    /// the upgrade. An over-long symbol leaves the slot sentinel-less
-    /// (debug-asserted; the boot universe caps symbol length).
-    pub fn new_spot_sentinel(nonce_seed: u64, sym: SymbolId, symbol: &[u8]) -> Self {
+    /// VT2: a SPOT bookTicker slot with the aggTrade sentinel — the
+    /// slot subscribes `<symbol>@aggTrade` on the same socket right
+    /// after the upgrade, the symbol read from its own endpoint path
+    /// (`/ws/<symbol>@bookTicker`) at each (re)connect.
+    pub fn new_spot_sentinel(nonce_seed: u64, sym: SymbolId) -> Self {
         let mut d = Self::new(nonce_seed, sym);
-        const SUFFIX: &[u8] = b"@aggTrade";
-        let n = symbol.len() + SUFFIX.len();
-        if symbol.is_empty() || n > SENTINEL_STREAM_MAX {
-            debug_assert!(false, "sentinel symbol length {} out of range", symbol.len());
-            return d;
-        }
-        d.sentinel_stream[..symbol.len()].copy_from_slice(symbol);
-        d.sentinel_stream[symbol.len()..n].copy_from_slice(SUFFIX);
-        d.sentinel_len = n as u8;
+        d.sentinel = true;
         d
     }
 
     /// VT2: true when this slot carries the aggTrade sentinel.
     #[inline]
     pub fn has_sentinel(&self) -> bool {
-        self.sentinel_len != 0
+        self.sentinel
     }
 
     /// VT2: the sentinel's latest stamp (ms; 0 = none this connection).
@@ -369,11 +378,13 @@ impl Driver {
     pub fn new_eapi(nonce_seed: u64, table: crate::eapi::EapiSymbolTable) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        // COPY: the ≤ 2.4 KiB boot table moves into the slot's lane,
-        // once, at boot (and moved through the spec before it) — the
-        // lane holds it INLINE so every per-element lookup walks
+        // COPY: the 2 568 B boot table (64 rows × 40 B + its length)
+        // moves into the slot's lane at boot — after moving through the
+        // spec, and before moving on with the Driver (`MultiConn::new`)
+        // — the lane holds it INLINE so every per-element lookup walks
         // contiguous rows with no pointer to chase — rejected: a `Box`
-        // (a heap hop on every lookup, and the crate's no-`Box` rule).
+        // (a heap hop on the options path, and the crate's no-`Box`
+        // rule).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(EAPI_RX_BUF_SIZE),
@@ -387,8 +398,7 @@ impl Driver {
             // Options tickers are never judged (no bookTicker on this
             // slot); the estimator sits idle.
             feed_clock: FeedClock::new(core_types::VenueId::Binance.default_stale_after_ms()),
-            sentinel_stream: [0; SENTINEL_STREAM_MAX],
-            sentinel_len: 0,
+            sentinel: false,
             sentinel_time_ms: 0,
             sentinel_stale_flag: 0,
             _not_sync: ::core::marker::PhantomData,
@@ -472,7 +482,7 @@ pub fn drive_one<T: Transport, C: Capture>(
             drv.state = State::AwaitingWsUpgrade;
         }
         State::AwaitingWsUpgrade => {
-            advance_ws_upgrade(drv, status)?;
+            advance_ws_upgrade(drv, path, status)?;
         }
         State::Steady => {
             drain_ws_frames(drv, producer, event_tx, event_mask, opt_tx, status, capture)?;
@@ -554,27 +564,30 @@ fn write_handshake_to_tx(drv: &mut Driver, host: &[u8], path: &[u8]) -> io::Resu
 
 /// VT2: queue the sentinel's live SUBSCRIBE (`{"method":"SUBSCRIBE",
 /// "params":["<sym>@aggTrade"],"id":1}`) onto the connection's tx.
-/// Fixed scratch on the stack — no allocation; the venue's ack
+/// Zero-copy: the stream symbol is read from the slot's own path
+/// ([`sentinel_symbol`]) and the request's four parts go straight into
+/// the masked frame ([`ws_write_text_frame_parts`]) — nothing is
+/// assembled first and nothing is stored. The venue's ack
 /// (`{"result":null,"id":1}`) is classified as a control frame.
-fn queue_sentinel_subscribe(drv: &mut Driver) -> io::Result<()> {
-    const HEAD: &[u8] = b"{\"method\":\"SUBSCRIBE\",\"params\":[\"";
-    const TAIL: &[u8] = b"\"],\"id\":1}";
-    let mut scratch = [0u8; HEAD.len() + SENTINEL_STREAM_MAX + TAIL.len()];
-    let n = drv.sentinel_len as usize;
-    let mut at = 0usize;
-    scratch[at..at + HEAD.len()].copy_from_slice(HEAD);
-    at += HEAD.len();
-    scratch[at..at + n].copy_from_slice(&drv.sentinel_stream[..n]);
-    at += n;
-    scratch[at..at + TAIL.len()].copy_from_slice(TAIL);
-    at += TAIL.len();
+fn queue_sentinel_subscribe(drv: &mut Driver, path: &[u8]) -> io::Result<()> {
+    let Some(symbol) = sentinel_symbol(path) else {
+        // The boot makes a sentinel slot only for a `/ws/<sym>@bookTicker`
+        // path: anything else is a boot bug — run the slot sentinel-less
+        // rather than send a broken SUBSCRIBE.
+        debug_assert!(false, "sentinel slot path names no stream symbol");
+        drv.sentinel = false;
+        return Ok(());
+    };
     // Same masked-frame shape as this crate's ping/pong writes (the
     // crate keeps its own private IoBuf).
     let mask = ws_mask_from_counter(drv.mask_counter);
     drv.mask_counter = drv.mask_counter.wrapping_add(1);
-    let dst = drv.tx.free_mut();
-    let n = ws_write_text_frame(dst, &scratch[..at], mask)
-        .map_err(|_| io::Error::other("sentinel subscribe: tx buffer too small"))?;
+    let n = ws_write_text_frame_parts(
+        drv.tx.free_mut(),
+        &[SENTINEL_SUB_HEAD, symbol, SENTINEL_SUFFIX, SENTINEL_SUB_TAIL],
+        mask,
+    )
+    .map_err(|_| io::Error::other("sentinel subscribe: tx buffer too small"))?;
     drv.tx.advance(n);
     Ok(())
 }
@@ -602,7 +615,11 @@ fn classify_sentinel_frame(payload: &[u8]) -> SentinelFrame {
     }
 }
 
-fn advance_ws_upgrade(drv: &mut Driver, status: &core_metrics::IngressStatus) -> io::Result<()> {
+fn advance_ws_upgrade(
+    drv: &mut Driver,
+    path: &[u8],
+    status: &core_metrics::IngressStatus,
+) -> io::Result<()> {
     match read_server_handshake(drv.rx.filled()) {
         HandshakeResult::Incomplete => Ok(()),
         HandshakeResult::Upgraded {
@@ -631,7 +648,7 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &core_metrics::IngressStatus) ->
             // VT2: the spot sentinel subscribes on the same socket the
             // moment the upgrade lands (the next flush sends it).
             if drv.has_sentinel() {
-                queue_sentinel_subscribe(drv)?;
+                queue_sentinel_subscribe(drv, path)?;
             }
             Ok(())
         }
@@ -691,15 +708,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let payload_start = payload.start;
-                        let payload_end = payload.end;
-                        let payload_len = payload_end - payload_start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(payload_len <= scratch.len());
-                        scratch[..payload_len]
-                            .copy_from_slice(&drv.rx.filled()[payload_start..payload_end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..payload_len], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -868,46 +884,46 @@ fn handle_mark_price_frame<C: Capture>(
 ) {
     let payload = &drv.rx.filled()[payload_range];
     capture.raw_frame(now_ns(), payload);
-    match crate::parse_mark_price(payload, drv.sym) {
-        Some(f) => {
-            capture.event(&core_types::ChannelEvent::new(
-                now_ns(),
-                core_types::VenueId::Binance,
-                core_types::ChannelId::Mark,
-                f.sym,
-                0,
-                f.ts_ns / 1_000_000,
-                f.mark_px_1e6,
-                f.index_px_1e6,
-            ));
-            if f.has_funding == 1 {
-                let ev = core_types::ChannelEvent::new(
-                    now_ns(),
-                    core_types::VenueId::Binance,
-                    core_types::ChannelId::Funding,
-                    f.sym,
-                    0,
-                    f.ts_ns / 1_000_000,
-                    f.funding_rate_1e9,
-                    f.next_funding_ms as i64,
-                );
-                capture.event(&ev);
-                // WS10-A: onto the venue-event lane (capture stays
-                // first — §6.5 capture-before-push law).
-                if event_mask & core_types::event_lane_bit(core_types::ChannelId::Funding) != 0
-                    && event_tx.try_push(ev).is_err()
-                {
-                    status.inc_event_ring_drops();
-                }
-            }
-            status.add_msgs(1);
-            status.add_ticks(1);
-        }
-        None => {
-            status.inc_parse_errors();
-            capture.parse_reject(now_ns(), payload);
+    // Parsed in place: the 64 B frame inside an `Option` would be 128 B
+    // by value.
+    let mut f = crate::BnMarkPriceFrame::ZERO;
+    if !crate::parse_mark_price(payload, drv.sym, &mut f) {
+        status.inc_parse_errors();
+        capture.parse_reject(now_ns(), payload);
+        return;
+    }
+    capture.event(&core_types::ChannelEvent::new(
+        now_ns(),
+        core_types::VenueId::Binance,
+        core_types::ChannelId::Mark,
+        f.sym,
+        0,
+        f.ts_ns / 1_000_000,
+        f.mark_px_1e6,
+        f.index_px_1e6,
+    ));
+    if f.has_funding == 1 {
+        let ev = core_types::ChannelEvent::new(
+            now_ns(),
+            core_types::VenueId::Binance,
+            core_types::ChannelId::Funding,
+            f.sym,
+            0,
+            f.ts_ns / 1_000_000,
+            f.funding_rate_1e9,
+            f.next_funding_ms as i64,
+        );
+        capture.event(&ev);
+        // WS10-A: onto the venue-event lane (capture stays first —
+        // §6.5 capture-before-push law).
+        if event_mask & core_types::event_lane_bit(core_types::ChannelId::Funding) != 0
+            && event_tx.try_push(ev).is_err()
+        {
+            status.inc_event_ring_drops();
         }
     }
+    status.add_msgs(1);
+    status.add_ticks(1);
 }
 
 fn handle_text_frame<C: Capture>(
@@ -933,7 +949,7 @@ fn handle_text_frame<C: Capture>(
         rx,
         sym: slot_sym,
         feed_clock,
-        sentinel_len,
+        sentinel,
         sentinel_time_ms,
         sentinel_stale_flag,
         ..
@@ -943,7 +959,7 @@ fn handle_text_frame<C: Capture>(
     capture.raw_frame(now_ns(), payload);
     // VT2 sentinel slot: the socket also carries aggTrade prints and
     // the SUBSCRIBE reply; one substring probe per frame sorts them.
-    if *sentinel_len != 0 {
+    if *sentinel {
         match classify_sentinel_frame(payload) {
             SentinelFrame::AggTrade => {
                 match parse_trade(payload, *slot_sym) {
@@ -990,7 +1006,10 @@ fn handle_text_frame<C: Capture>(
             SentinelFrame::BookTicker => {}
         }
     }
-    if let Some(f) = parse_book_ticker(payload, *slot_sym) {
+    // Parsed in place: the 64 B frame inside an `Option` would be 128 B
+    // by value.
+    let mut f = BookTickerFrame::ZERO;
+    if parse_book_ticker(payload, *slot_sym, &mut f) {
         let ts_ns = now_ns();
         // VT2: one parse-complete stamp serves the judgement and the
         // tick. A direct stamp (USDS-M `T`/`E`) is judged here; a spot
@@ -1190,16 +1209,17 @@ pub fn run<T: Transport, C: Capture>(
 ///
 /// Boot-time construction (allocations fine); steady state is the
 /// same zero-alloc [`drive_one`] the single-connection path runs.
-pub struct MultiConn<T: Transport> {
+pub struct MultiConn<'a, T: Transport> {
     /// Live transport; `None` while the slot awaits a reconnect.
     transport: Option<T>,
     /// Per-connection WS state machine (sym pinned inside).
     drv: Driver,
     /// Host bytes for the `Host:` header (spot vs USDS-M hosts
-    /// differ — each slot carries its own).
-    host: Vec<u8>,
-    /// Request path (`/ws/<symbol>@bookTicker`).
-    path: Vec<u8>,
+    /// differ — each slot carries its own), borrowed from the boot's
+    /// endpoint list, which outlives the loop.
+    host: &'a [u8],
+    /// Request path (`/ws/<symbol>@bookTicker`), borrowed likewise.
+    path: &'a [u8],
     keepalive: core_net::Keepalive,
     backoff: core_net::Backoff,
     /// Monotonic ns before which no reconnect is attempted.
@@ -1211,21 +1231,30 @@ pub struct MultiConn<T: Transport> {
     last_interest: Option<mio::Interest>,
 }
 
-impl<T: Transport> MultiConn<T> {
+impl<'a, T: Transport> MultiConn<'a, T> {
     /// New slot, initially disconnected (the loop's reconnect pass
-    /// dials it; `next_attempt_ns` 0 = due immediately).
+    /// dials it; `next_attempt_ns` 0 = due immediately). `host` and
+    /// `path` are borrowed, not copied: the boot keeps its endpoint list
+    /// alive for as long as the loop runs.
     pub fn new(
         drv: Driver,
-        host: &[u8],
-        path: &[u8],
+        host: &'a [u8],
+        path: &'a [u8],
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
+        // COPY: the Driver (≈ 2.9 KB: every slot's `StreamLane` is sized
+        // for the options table it carries inline) moves into its slot
+        // here and, with the slot, into the boot's Vec — 2–4 moves per
+        // connection, once, at boot, well under a millisecond for the
+        // whole lane — rejected: a two-phase in-place init behind `&mut`
+        // (every constructor split, for a boot-only cost) and boxing the
+        // table (a heap hop on the options path).
         Self {
             transport: None,
             drv,
-            host: host.to_vec(),
-            path: path.to_vec(),
+            host,
+            path,
             keepalive,
             backoff,
             next_attempt_ns: 0,
@@ -1264,7 +1293,7 @@ impl<T: Transport> MultiConn<T> {
 // loop (CLAUDE.md hot-path rules; `i` is also the mio Token identity).
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn run_multi<T: Transport, C: Capture>(
-    conns: &mut [MultiConn<T>],
+    conns: &mut [MultiConn<'_, T>],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<core_types::ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
@@ -1301,6 +1330,12 @@ pub fn run_multi<T: Transport, C: Capture>(
                         conns[i].drv.reset_for_reconnect(now);
                         conns[i].keepalive.reset();
                         conns[i].session_start_ns = now;
+                        // COPY: the new transport (rustls' ClientConnection
+                        // held inline, several hundred bytes) moves from
+                        // `connect` into its slot — once per reconnect,
+                        // beside a TCP + TLS handshake that costs orders of
+                        // magnitude more — rejected: a placement API on
+                        // core-net's connect, for one move per reconnect.
                         conns[i].transport = Some(t);
                     }
                 }
@@ -1341,7 +1376,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                 let n_before = producer.len();
                 let state_before = c.drv.state();
                 if drive_one(
-                    t, &mut c.drv, &c.host, &c.path, producer, event_tx, event_mask, opt_tx,
+                    t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, opt_tx,
                     status, capture,
                 )
                 .is_err()
@@ -1640,7 +1675,7 @@ mod tests {
     #[test]
     fn sentinel_slot_subscribes_agg_trade_after_upgrade() {
         let mut t = TestTransport::with_capacity(8192);
-        let mut d = Driver::new_spot_sentinel(42, 7, b"btcusdt");
+        let mut d = Driver::new_spot_sentinel(42, 7);
         assert!(d.has_sentinel());
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, _cons) = ring.split();
@@ -1672,13 +1707,28 @@ mod tests {
         );
     }
 
-    /// VT2: an over-long symbol leaves the slot sentinel-less instead
-    /// of truncating the stream name (debug-asserted in debug builds).
+    /// VT2 / BX0: the sentinel's stream symbol is read from the slot's
+    /// own path — its last segment up to the `@` — and borrowed.
     #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "sentinel symbol length"))]
-    fn sentinel_symbol_over_max_is_refused() {
-        let d = Driver::new_spot_sentinel(1, 7, &[b'a'; SENTINEL_STREAM_MAX]);
+    fn sentinel_symbol_is_read_from_the_path() {
+        assert_eq!(sentinel_symbol(b"/ws/btcusdt@bookTicker"), Some(&b"btcusdt"[..]));
+        assert_eq!(sentinel_symbol(b"/public/ws/ethusdt@bookTicker"), Some(&b"ethusdt"[..]));
+        let path: &[u8] = b"/ws/solusdt@bookTicker";
+        let s = sentinel_symbol(path).unwrap();
+        assert!(path.as_ptr_range().contains(&s.as_ptr()), "borrowed, not copied");
+        assert_eq!(sentinel_symbol(b"/ws/btcusdt"), None, "no stream suffix");
+        assert_eq!(sentinel_symbol(b"/ws/@bookTicker"), None, "empty symbol");
+    }
+
+    /// A sentinel slot whose path names no stream runs sentinel-less (a
+    /// boot bug, debug-asserted) instead of sending a broken SUBSCRIBE.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "names no stream symbol"))]
+    fn a_sentinel_path_without_a_symbol_subscribes_nothing() {
+        let mut d = Driver::new_spot_sentinel(1, 7);
+        assert!(queue_sentinel_subscribe(&mut d, b"/ws/btcusdt").is_ok());
         assert!(!d.has_sentinel());
+        assert_eq!(d.tx.filled().len(), 0);
     }
 
     /// VT2 helper: one spot bookTicker push (no stamp) on a sentinel
@@ -1724,7 +1774,7 @@ mod tests {
         // 5 s-older print it inherits STALE | SENTINEL; a fresh print
         // clears it again. aggTrades never produce ticks.
         let mut t = TestTransport::with_capacity(16 * 1024);
-        let mut d = Driver::new_spot_sentinel(7, 42, b"btcusdt");
+        let mut d = Driver::new_spot_sentinel(7, 42);
         d.set_state(State::Steady);
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();
@@ -1782,7 +1832,7 @@ mod tests {
             }
         }
         let mut t = TestTransport::with_capacity(16 * 1024);
-        let mut d = Driver::new_spot_sentinel(7, 42, b"btcusdt");
+        let mut d = Driver::new_spot_sentinel(7, 42);
         d.set_state(State::Steady);
         let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
         let (mut prod, mut cons) = ring.split();

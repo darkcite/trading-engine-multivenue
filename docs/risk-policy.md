@@ -2495,6 +2495,100 @@ these paths, which the router could not reach before BX0 and now can
    venue would cancel without a fill, which a fill-fed ledger never
    sees.
 
+### BX0 — `ingress-binance` joins the zero-copy gate (2026-09-23)
+
+On the operator's word (plan O-BX12d): every pre-existing zero-copy
+finding in `ingress-binance` fixed, and the crate put in
+`make copy-audit`'s scope.
+
+**The gate had a blind spot.** `scripts/copy-audit.sh` stopped reading a
+file at its first `#[cfg(test)]` line, on the convention that test
+modules sit at the end. Three files break the convention with a
+test-only METHOD mid-file, so everything after it went unaudited:
+`exec-router/src/routed.rs` from line 358 (≈ 920 lines of non-test
+code), `exec-hyperliquid/src/exchange.rs` from line 898 (≈ 1 570) and
+`ingress-binance/src/run_loop.rs` from line 436 (≈ 1 010). The sweep now
+skips a `#[cfg(test)]` ITEM to its own end and resumes: a brace-less
+line's `;`, a braced one-liner, or a block's closing brace at the
+attribute's indentation. It refuses to guess: `#[cfg(test)]` on a field,
+a variant, an arm or a multi-line expression, or an item that never
+closes, fails the sweep (exit 3). A `COPY:` marker inside a test item no
+longer covers the live copy below it. `scripts/copy-audit-selftest.sh`
+proves all of that on fixtures (14 live copies found and none inside a
+test item; 6 undelimitable constructs refused), and `make copy-audit`
+runs it first. A probe copy injected at the end of each formerly blind
+region was flagged in all three files. The exec lane's formerly blind
+code is clean: no new hit.
+
+**What the pass removed** (copies gone, not commented):
+
+* `parse_book_ticker` / `parse_mark_price` returned a 64 B `align(64)`
+  frame inside an `Option` — 128 B by value, on every bookTicker and
+  markPrice push. Both now fill the caller's frame in place
+  (`&mut Frame` → `bool`) and write it only once every field has
+  parsed: a failed parse leaves it untouched (a unit test, and both
+  fuzz targets assert it on every input). `parse_trade` keeps its
+  `Option` — under 64 B, asserted at compile time.
+* The spot sentinel's SUBSCRIBE was re-assembled through a stack
+  scratch on every (re)connect. Its stream symbol is now read from the
+  slot's own endpoint path, and the request's four parts go straight
+  into the masked frame through the new
+  `core_net::ws_write_text_frame_parts` (core-net's one frame
+  serialiser now writes a payload from parts; the single-payload
+  writers call it with one). Nothing is composed or stored: the
+  Driver's 32 B sentinel stream buffer is gone.
+* The Ping echo went rx → stack scratch → tx; it goes rx → tx.
+* `MultiConn` copied its host and path into two `Vec`s per connection;
+  it borrows them from the boot's endpoint list.
+* `parse_filters` copied each `filterType` into a 32 B buffer to
+  compare it; it compares the borrowed span, so an over-long
+  `filterType` no longer rejects its row (tested).
+* The discovery rows (`BnSymbolRow`; `EapiOptionRow`, 72 B) crossed a
+  return by value together with their end offset; they are parsed in
+  place into their table slot.
+* `options-select` sizes its output once (`with_capacity`), so a
+  selected row is copied in exactly once, never again by a growing Vec.
+
+**What the pass commented** (designed copies, each with its `// COPY:`):
+the ≤ 32 B symbol and ≤ 16 B underlying copied into each discovery row
+at boot (the row outlives the REST body it was scanned from, and the
+fetch buffer is reused by the next request); the options selection
+law's by-value rows (72 B, ≤ 64, once at boot — references into the
+table would change the three-venue law for ≤ 4.6 KB); the ≈ 2.9 KB
+Driver moving into its slot 2–4 times per connection at boot (every
+slot's `StreamLane` is sized for the 2 568 B options table it carries
+inline); the transport moving into its slot once per reconnect; and the
+test views that return a frame's `Option` by value.
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus): PASS — no hot
+copy left in `ingress-binance`; RX = 4 copies against the target of 3
+on every Binance lane, the extra one in core-net (below). Its cold
+findings were all acted on. The first sentinel fix carried a `// COPY:`
+whose reason was false ("the driver cannot borrow the boot strings" —
+the symbol is in the slot's own path), so that copy was removed rather
+than re-worded; the Driver, transport and test-view moves got honest
+markers; the options table's marker now states its real size and its
+second move. Its review of the first version of the new skip logic
+found shapes that would still have swallowed live code silently (a
+braced `use`, an empty-bodied method, a field or a variant, a struct
+literal, a multi-line array); the reader above delimits or refuses
+each, and the self-test pins them.
+
+**Escalated, not changed:** core-net's RX path keeps a fourth copy —
+rustls' plaintext into the caller's rx buffer — and its `// COPY:`
+rejection ("rustls has no in-place plaintext borrow") is out of date for
+the `unbuffered` API of rustls 0.23 (the pinned 0.23.38). The auditor
+also flagged that the buffered API may stage each received record's
+plaintext through a heap `Vec` — an allocation per record that the
+alloc gate cannot see, because it drives a test transport. UNVERIFIED:
+it needs an allocation count over a real TLS loopback before anyone
+moves the engine's TLS reader.
+
+Gate after the pass: `hits=32 baselined=32 new=0 paid=0` over the exec
+lane, `core-net` and `ingress-binance`. The baseline shrank by one (the
+old single-payload copy in `ws_frame.rs`, now the marked parts write)
+and did not grow.
+
 ## E6 — the risk gate and the kill switches
 
 ### E6 commit 1 — the per-order clamp (2026-09-19)
@@ -4296,6 +4390,9 @@ EIP-712 assembly, the PM dispatcher, `core-net`), listed in
 unmarked copy fails, a paid entry is dropped with `--update-baseline`,
 and only the operator grows it. Gate at the close: `hits=33 baselined=33
 new=0 paid=0` on the exec lane + core-net.
+Since BX0 the gate also covers `ingress-binance`, and a `#[cfg(test)]`
+ITEM no longer ends the scan of its file ("BX0 — `ingress-binance` joins
+the zero-copy gate", above).
 
 ### The auditor's own verdict on the pass
 

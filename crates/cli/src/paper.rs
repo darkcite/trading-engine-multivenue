@@ -836,7 +836,7 @@ pub fn spawn_binance(
             // (`/ws/<symbol>@bookTicker`) — it carries the aggTrade
             // sentinel too.
             let mut driver = match spot_stream_symbol(&ep.path) {
-                Some(symbol) => bwl::Driver::new_spot_sentinel(now_ns(), sym, symbol.as_bytes()),
+                Some(_) => bwl::Driver::new_spot_sentinel(now_ns(), sym),
                 None => bwl::Driver::new(now_ns(), sym),
             };
             // venue default or the operator's `--stale-after-ms bn:<ms>`.
@@ -1074,7 +1074,7 @@ pub fn spawn_binance_multi(
                     return;
                 }
             };
-            let mut conns: Vec<bwl::MultiConn<TlsTransport>> = Vec::with_capacity(specs.len());
+            let mut conns: Vec<bwl::MultiConn<'_, TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
                 // M2.4/BX0-F2: an options spec builds the mark-array
                 // lane driver; WS5: a markPrice spec builds the mark
@@ -1090,9 +1090,7 @@ pub fn spawn_binance_multi(
                         // (`<symbol>@aggTrade` from the path); USDS-M
                         // stamps its bookTicker directly.
                         let mut d = match (spec.spot_sentinel, spot_stream_symbol(&spec.path)) {
-                            (true, Some(symbol)) => {
-                                bwl::Driver::new_spot_sentinel(seed, spec.sym, symbol.as_bytes())
-                            }
+                            (true, Some(_)) => bwl::Driver::new_spot_sentinel(seed, spec.sym),
                             _ => bwl::Driver::new(seed, spec.sym),
                         };
                         // one estimator per CONNECTION, same threshold.
@@ -1100,6 +1098,8 @@ pub fn spawn_binance_multi(
                         d
                     }
                 };
+                // COPY: the slot (its Driver inline, ≈ 2.9 KB) moves into
+                // the Vec once at boot — see `MultiConn::new`.
                 conns.push(bwl::MultiConn::new(
                     drv,
                     eps[i].host.as_bytes(),

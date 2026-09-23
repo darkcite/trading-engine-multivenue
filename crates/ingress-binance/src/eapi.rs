@@ -113,6 +113,18 @@ pub struct EapiOptionRow {
 }
 
 impl EapiOptionRow {
+    /// The empty row a table slot starts as; [`parse_option_row`] fills
+    /// it in place.
+    const EMPTY: Self = Self {
+        symbol: [0; EAPI_SYM_MAX],
+        symbol_len: 0,
+        underlying: [0; EAPI_ULY_MAX],
+        underlying_len: 0,
+        is_call: false,
+        strike_1e9: 0,
+        expiry_ms: 0,
+    };
+
     /// The symbol as a byte slice.
     #[inline]
     pub fn symbol(&self) -> &[u8] {
@@ -173,13 +185,23 @@ impl EapiDiscovery {
                 b']' => break,
                 b',' => i += 1,
                 b'{' => {
-                    let (row, end) = parse_option_row(body, i)?;
-                    if self.rows.len() >= EAPI_DISCOVERY_ROWS_CAP {
+                    // The row (72 B) is parsed IN PLACE into its table
+                    // slot rather than returned by value past the 64 B
+                    // bound; so the cap is checked before the row parses,
+                    // and a row that fails leaves no slot behind.
+                    let idx = self.rows.len();
+                    if idx >= EAPI_DISCOVERY_ROWS_CAP {
                         return Err(EapiDiscoveryErr::TooMany);
                     }
-                    self.rows.push(row);
+                    self.rows.push(EapiOptionRow::EMPTY);
+                    i = match parse_option_row(body, i, &mut self.rows[idx]) {
+                        Ok(end) => end,
+                        Err(e) => {
+                            self.rows.truncate(idx);
+                            return Err(e);
+                        }
+                    };
                     added += 1;
-                    i = end;
                 }
                 _ => return Err(EapiDiscoveryErr::BadRow),
             }
@@ -206,16 +228,17 @@ impl Default for EapiDiscovery {
     }
 }
 
-/// Parse one option object at `pos` (must point at `{`). Returns the
-/// row and the position after the closing `}`.
-fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), EapiDiscoveryErr> {
+/// Parse one option object at `pos` (must point at `{`) INTO `out`, a
+/// fresh [`EapiOptionRow::EMPTY`] slot. Returns the position after the
+/// closing `}`; on `Err` the slot is half-filled and the caller drops
+/// it.
+fn parse_option_row(
+    body: &[u8],
+    pos: usize,
+    out: &mut EapiOptionRow,
+) -> Result<usize, EapiDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
-
-    let mut symbol = [0u8; EAPI_SYM_MAX];
-    let mut symbol_len = 0u8;
-    let mut underlying = [0u8; EAPI_ULY_MAX];
-    let mut underlying_len = 0u8;
     let mut is_call: Option<bool> = None;
     let mut strike: Option<i64> = None;
     let mut expiry: Option<i64> = None;
@@ -246,8 +269,13 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
                         if s.is_empty() || s.len() > EAPI_SYM_MAX {
                             return Err(EapiDiscoveryErr::BadRow);
                         }
-                        symbol[..s.len()].copy_from_slice(s);
-                        symbol_len = s.len() as u8;
+                        // COPY: ≤ 32 B option symbol into its table row,
+                        // once per row at boot — the row outlives the
+                        // exchangeInfo body it was scanned from — rejected:
+                        // rows borrowing the body (pinned for the table's
+                        // life, a lifetime threaded through the boot).
+                        out.symbol[..s.len()].copy_from_slice(s);
+                        out.symbol_len = s.len() as u8;
                         i = end;
                     }
                     b"underlying" => {
@@ -255,8 +283,10 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
                         if s.is_empty() || s.len() > EAPI_ULY_MAX {
                             return Err(EapiDiscoveryErr::BadRow);
                         }
-                        underlying[..s.len()].copy_from_slice(s);
-                        underlying_len = s.len() as u8;
+                        // COPY: ≤ 16 B underlying into the same row, same
+                        // reason and rejected alternative as the symbol.
+                        out.underlying[..s.len()].copy_from_slice(s);
+                        out.underlying_len = s.len() as u8;
                         i = end;
                     }
                     b"side" => {
@@ -301,19 +331,13 @@ fn parse_option_row(body: &[u8], pos: usize) -> Result<(EapiOptionRow, usize), E
         }
     }
 
-    if symbol_len == 0 || underlying_len == 0 {
+    if out.symbol_len == 0 || out.underlying_len == 0 {
         return Err(EapiDiscoveryErr::BadRow);
     }
-    let row = EapiOptionRow {
-        symbol,
-        symbol_len,
-        underlying,
-        underlying_len,
-        is_call: is_call.ok_or(EapiDiscoveryErr::BadRow)?,
-        strike_1e9: strike.ok_or(EapiDiscoveryErr::BadRow)?,
-        expiry_ms: expiry.ok_or(EapiDiscoveryErr::BadRow)?,
-    };
-    Ok((row, i))
+    out.is_call = is_call.ok_or(EapiDiscoveryErr::BadRow)?;
+    out.strike_1e9 = strike.ok_or(EapiDiscoveryErr::BadRow)?;
+    out.expiry_ms = expiry.ok_or(EapiDiscoveryErr::BadRow)?;
+    Ok(i)
 }
 
 /// Read a quoted string value at `pos` (must point at `"`).
@@ -386,6 +410,11 @@ pub fn select_capped_chain(
     strikes_k: u32,
     now_ms: i64,
 ) -> Vec<EapiOptionRow> {
+    // COPY: each selected row (72 B) into the returned Vec, ≤ E × K × 2
+    // rows (64 by default), once at boot — the shared selection law
+    // (`options-select`, three venues) hands back POD rows by value —
+    // rejected: references into the discovery table (an API change to
+    // the three-venue law, for ≤ 4.6 KB copied once at boot).
     options_select::select_capped_chain(
         rows,
         |r: &EapiOptionRow| r.underlying() == underlying && r.expiry_ms > now_ms,

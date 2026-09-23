@@ -170,25 +170,32 @@ fn ws_frame_roundtrip_is_zero_alloc() {
     );
 }
 
-/// Parse a Binance `@bookTicker` frame 10_000x — must be zero-alloc.
+/// Parse a Binance `@bookTicker` frame and a USDⓈ-M `@markPrice` frame
+/// 10_000x each, in place into one reused frame apiece (BX0) — must be
+/// zero-alloc.
 #[test]
 fn binance_book_ticker_is_zero_alloc() {
     let buf: &[u8] =
         br#"{"u":400900217,"s":"BTCUSDT","b":"65000.01","B":"1.234","a":"65000.55","A":"0.987"}"#;
+    let mark: &[u8] = br#"{"e":"markPriceUpdate","E":1790161527002,"s":"BTCUSDT","p":"85840.40234633","ap":"85840.40234633","P":"85863.42568007","i":"85882.44043478","r":"0.00005016","T":1790179200000,"st":1}"#;
     let sym: SymbolId = 7;
+    let mut t = ingress_binance::BookTickerFrame::ZERO;
+    let mut m = ingress_binance::BnMarkPriceFrame::ZERO;
 
     let g = AllocGuard::new();
     let mut acc: i64 = 0;
     for _ in 0..10_000u32 {
-        let t = parse_book_ticker(buf, sym).unwrap();
+        assert!(parse_book_ticker(buf, sym, &mut t));
         acc = acc.wrapping_add(t.bid_px_1e6);
+        assert!(ingress_binance::parse_mark_price(mark, sym, &mut m));
+        acc = acc.wrapping_add(m.funding_rate_1e9);
     }
     std::hint::black_box(acc);
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
         allocs, 0,
-        "parse_book_ticker allocated {allocs} times ({bytes} B)"
+        "parse_book_ticker / parse_mark_price allocated {allocs} times ({bytes} B)"
     );
 }
 

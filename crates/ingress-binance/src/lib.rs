@@ -67,24 +67,15 @@ pub struct TradeFrame {
 /// Parse a Binance `aggTrade` frame into a `TradeFrame`. Returns
 /// `None` on malformed input.
 pub fn parse_trade(buf: &[u8], sym: SymbolId) -> Option<TradeFrame> {
-    // Price: "p":"65432.10"
-    let pos = find_field(buf, b"\"p\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (price_1e6, _) = scan_price_1e6(buf, pos)?;
-
-    // Qty: "q":"0.05"
-    let pos = find_field(buf, b"\"q\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (qty_1e6, _) = scan_price_1e6(buf, pos)?;
+    // Price: "p":"65432.10"; qty: "q":"0.05".
+    let price_1e6 = quoted_field_1e6(buf, b"\"p\":")?;
+    let qty_1e6 = quoted_field_1e6(buf, b"\"q\":")?;
 
     // Trade time: "T":1713000000000
-    let pos = find_field(buf, b"\"T\":")?;
-    let (ts_ms, _) = scan_u64(buf, pos)?;
+    let ts_ms = bare_field_u64(buf, b"\"T\":")?;
 
     // Aggregate id: "a":26129 (optional — 0 when absent).
-    let agg_id = find_field(buf, b"\"a\":")
-        .and_then(|pos| scan_u64(buf, pos))
-        .map_or(0, |(v, _)| v);
+    let agg_id = bare_field_u64(buf, b"\"a\":").unwrap_or(0);
     let is_buyer_maker = memchr::memmem::find(buf, b"\"m\":true").is_some();
 
     Some(TradeFrame {
@@ -96,6 +87,22 @@ pub fn parse_trade(buf: &[u8], sym: SymbolId) -> Option<TradeFrame> {
         agg_id,
         is_buyer_maker,
     })
+}
+
+/// A bare (unquoted) integer field located by `key` (`"u":400900217`).
+#[inline(always)]
+fn bare_field_u64(buf: &[u8], key: &[u8]) -> Option<u64> {
+    let pos = find_field(buf, key)?;
+    let (v, _) = scan_u64(buf, pos)?;
+    Some(v)
+}
+
+/// A quoted decimal field located by `key` (`"b":"65000.01"`), ×1e6.
+#[inline(always)]
+fn quoted_field_1e6(buf: &[u8], key: &[u8]) -> Option<i64> {
+    let pos = find_field(buf, key)?;
+    let (v, _) = scan_price_1e6(buf, skip_byte(buf, pos, b'"'))?;
+    Some(v)
 }
 
 // ---------------------------------------------------------------
@@ -134,6 +141,9 @@ pub struct BookTickerFrame {
 }
 
 impl BookTickerFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self::new(0, 0, 0, 0, 0, 0, 0);
+
     /// Named-field-free constructor.
     #[inline(always)]
     const fn new(
@@ -165,21 +175,18 @@ impl BookTickerFrame {
 /// false-match any other bookTicker field.
 #[inline]
 fn book_ticker_venue_time_ms(buf: &[u8]) -> u64 {
-    if let Some(pos) = find_field(buf, b"\"T\":") {
-        if let Some((ms, _)) = scan_u64(buf, pos) {
-            return ms;
-        }
+    if let Some(ms) = bare_field_u64(buf, b"\"T\":") {
+        return ms;
     }
-    if let Some(pos) = find_field(buf, b"\"E\":") {
-        if let Some((ms, _)) = scan_u64(buf, pos) {
-            return ms;
-        }
-    }
-    0
+    bare_field_u64(buf, b"\"E\":").unwrap_or(0)
 }
 
-/// Parse a Binance `@bookTicker` frame. Zero-alloc. Returns `None` on
-/// malformed input (caller logs and drops).
+/// Parse a Binance `@bookTicker` frame INTO `out`. Zero-alloc and
+/// zero-copy: the frame is written in place — returned inside an
+/// `Option` it would be 128 B by value (a 64 B `align(64)` frame plus
+/// its tag), twice the by-value bound. `out` is written only once every
+/// field has parsed, so on `false` (malformed input; the caller counts
+/// and drops) it still holds what it held before.
 ///
 /// # Expected shape
 ///
@@ -192,32 +199,25 @@ fn book_ticker_venue_time_ms(buf: &[u8]) -> u64 {
 /// We match by key so the scanner is robust to field reordering (some
 /// upstream variants reorder `s` and `u`).
 #[inline]
-pub fn parse_book_ticker(buf: &[u8], sym: SymbolId) -> Option<BookTickerFrame> {
+pub fn parse_book_ticker(buf: &[u8], sym: SymbolId, out: &mut BookTickerFrame) -> bool {
     // update id: "u":<integer>
-    let pos = find_field(buf, b"\"u\":")?;
-    let (update_id, _) = scan_u64(buf, pos)?;
-
-    // best bid price: "b":"<decimal>"
-    let pos = find_field(buf, b"\"b\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (bid_px_1e6, _) = scan_price_1e6(buf, pos)?;
-
-    // bid qty: "B":"<decimal>"
-    let pos = find_field(buf, b"\"B\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (bid_qty_1e6, _) = scan_price_1e6(buf, pos)?;
-
-    // ask px: "a":"<decimal>"
-    let pos = find_field(buf, b"\"a\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (ask_px_1e6, _) = scan_price_1e6(buf, pos)?;
-
-    // ask qty: "A":"<decimal>"
-    let pos = find_field(buf, b"\"A\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (ask_qty_1e6, _) = scan_price_1e6(buf, pos)?;
-
-    Some(BookTickerFrame::new(
+    let Some(update_id) = bare_field_u64(buf, b"\"u\":") else {
+        return false;
+    };
+    // Best bid / ask, price then size: "b" "B" "a" "A", quoted decimals.
+    let Some(bid_px_1e6) = quoted_field_1e6(buf, b"\"b\":") else {
+        return false;
+    };
+    let Some(bid_qty_1e6) = quoted_field_1e6(buf, b"\"B\":") else {
+        return false;
+    };
+    let Some(ask_px_1e6) = quoted_field_1e6(buf, b"\"a\":") else {
+        return false;
+    };
+    let Some(ask_qty_1e6) = quoted_field_1e6(buf, b"\"A\":") else {
+        return false;
+    };
+    *out = BookTickerFrame::new(
         sym,
         update_id,
         bid_px_1e6,
@@ -225,7 +225,8 @@ pub fn parse_book_ticker(buf: &[u8], sym: SymbolId) -> Option<BookTickerFrame> {
         ask_px_1e6,
         ask_qty_1e6,
         book_ticker_venue_time_ms(buf),
-    ))
+    );
+    true
 }
 
 // ---------------------------------------------------------------
@@ -259,8 +260,24 @@ pub struct BnMarkPriceFrame {
     _pad: [u8; 19],
 }
 
-/// Parse a USDS-M `@markPrice` frame (WS5). Zero-alloc byte scan;
-/// `None` on malformed input (caller counts + taps).
+impl BnMarkPriceFrame {
+    /// The all-zero frame — the in-place parse's starting slot.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        mark_px_1e6: 0,
+        index_px_1e6: 0,
+        funding_rate_1e9: 0,
+        next_funding_ms: 0,
+        sym: 0,
+        has_funding: 0,
+        _pad: [0; 19],
+    };
+}
+
+/// Parse a USDS-M `@markPrice` frame (WS5) INTO `out`. Zero-alloc byte
+/// scan, written in place like [`parse_book_ticker`] (the same 64 B
+/// `align(64)` frame, the same 128 B `Option` it no longer returns);
+/// `false` on malformed input (caller counts + taps), `out` untouched.
 ///
 /// # Expected shape (live, fstream `/market/ws/`, 2026-09-23)
 ///
@@ -284,30 +301,30 @@ pub struct BnMarkPriceFrame {
 /// `has_funding` needs BOTH a parseable rate and `"T"` > 0; anything
 /// else reports rate 0 and next-funding 0.
 #[inline]
-pub fn parse_mark_price(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
-    memchr::memmem::find(buf, b"\"e\":\"markPriceUpdate\"")?;
-    let pos = find_field(buf, b"\"E\":")?;
-    let (ts_ms, _) = scan_u64(buf, pos)?;
-    let pos = find_field(buf, b"\"p\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (mark_px_1e6, _) = scan_price_1e6(buf, pos)?;
-    let pos = find_field(buf, b"\"i\":")?;
-    let pos = skip_byte(buf, pos, b'"');
-    let (index_px_1e6, _) = scan_price_1e6(buf, pos)?;
+pub fn parse_mark_price(buf: &[u8], sym: SymbolId, out: &mut BnMarkPriceFrame) -> bool {
+    if memchr::memmem::find(buf, b"\"e\":\"markPriceUpdate\"").is_none() {
+        return false;
+    }
+    let Some(ts_ms) = bare_field_u64(buf, b"\"E\":") else {
+        return false;
+    };
+    let Some(mark_px_1e6) = quoted_field_1e6(buf, b"\"p\":") else {
+        return false;
+    };
+    let Some(index_px_1e6) = quoted_field_1e6(buf, b"\"i\":") else {
+        return false;
+    };
     let rate_1e9 = match find_field(buf, b"\"r\":") {
         Some(pos) => scan_price_1e9(buf, skip_byte(buf, pos, b'"')).map(|(v, _)| v),
         None => None,
     };
-    let next_ms = match find_field(buf, b"\"T\":") {
-        Some(pos) => scan_u64(buf, pos).map_or(0, |(v, _)| v),
-        None => 0,
-    };
+    let next_ms = bare_field_u64(buf, b"\"T\":").unwrap_or(0);
     // Funding needs a rate AND a next settlement — see the doc above.
     let (funding_rate_1e9, next_funding_ms, has_funding) = match rate_1e9 {
         Some(r) if next_ms != 0 => (r, next_ms, 1u8),
         _ => (0, 0, 0u8),
     };
-    Some(BnMarkPriceFrame {
+    *out = BnMarkPriceFrame {
         ts_ns: ts_ms.saturating_mul(1_000_000),
         mark_px_1e6,
         index_px_1e6,
@@ -316,7 +333,8 @@ pub fn parse_mark_price(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
         sym,
         has_funding,
         _pad: [0; 19],
-    })
+    };
+    true
 }
 
 // ---------------------------------------------------------------
@@ -325,6 +343,10 @@ pub fn parse_mark_price(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
 
 const _BOOK_TICKER_SIZE_CHECK: [(); 64] = [(); ::core::mem::size_of::<BookTickerFrame>()];
 const _MARK_PRICE_SIZE_CHECK: [(); 64] = [(); ::core::mem::size_of::<BnMarkPriceFrame>()];
+// `parse_trade` keeps its `Option` return: the flag's niche carries the
+// tag, so the whole return stays inside the 64 B by-value bound that
+// sent the two frames above to in-place parsing.
+const _: () = assert!(::core::mem::size_of::<Option<TradeFrame>>() <= 64);
 
 // ---------------------------------------------------------------
 // Tests
@@ -333,6 +355,24 @@ const _MARK_PRICE_SIZE_CHECK: [(); 64] = [(); ::core::mem::size_of::<BnMarkPrice
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // COPY: the 128 B `Option` of a 64 B frame returns by value — a
+    // test-only view, so the assertions read naturally (tests are cold;
+    // the production callers use the in-place API) — rejected: an
+    // `&mut` frame threaded through every assertion.
+    /// Test view of the in-place [`parse_book_ticker`]: `Some(frame)`
+    /// on success.
+    pub(crate) fn book_of(buf: &[u8], sym: SymbolId) -> Option<BookTickerFrame> {
+        let mut f = BookTickerFrame::ZERO;
+        parse_book_ticker(buf, sym, &mut f).then_some(f)
+    }
+
+    // COPY: the same test-only view for the markPrice frame.
+    /// Test view of the in-place [`parse_mark_price`].
+    pub(crate) fn mark_of(buf: &[u8], sym: SymbolId) -> Option<BnMarkPriceFrame> {
+        let mut f = BnMarkPriceFrame::ZERO;
+        parse_mark_price(buf, sym, &mut f).then_some(f)
+    }
 
     const SAMPLE: &[u8] = br#"{"e":"aggTrade","E":1713000000000,"s":"BTCUSDT","p":"65432.1","q":"0.050000","T":1713000000000}"#;
 
@@ -374,7 +414,7 @@ mod tests {
     #[test]
     fn parse_mark_price_extracts_all_fields() {
         // WS5: mark + index + funding + next-funding in one frame.
-        let f = parse_mark_price(SAMPLE_MARK, 9).unwrap();
+        let f = mark_of(SAMPLE_MARK, 9).unwrap();
         assert_eq!(f.sym, 9);
         assert_eq!(f.ts_ns, 1_562_305_380_000 * 1_000_000);
         assert_eq!(f.mark_px_1e6, 11_794_150_000);
@@ -387,7 +427,7 @@ mod tests {
     #[test]
     fn parse_mark_price_negative_funding() {
         let b = br#"{"e":"markPriceUpdate","E":1000,"s":"X","p":"1.0","i":"1.0","r":"-0.00038167","T":2000}"#;
-        assert_eq!(parse_mark_price(b, 0).unwrap().funding_rate_1e9, -381_670);
+        assert_eq!(mark_of(b, 0).unwrap().funding_rate_1e9, -381_670);
     }
 
     #[test]
@@ -395,7 +435,7 @@ mod tests {
         // WS5: delivery contracts push `"r":""` — no funding, still a
         // valid frame (the WS3 has_funding convention).
         let b = br#"{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT_260327","p":"65000.1","i":"64999.9","P":"65000.0","r":"","T":0}"#;
-        let f = parse_mark_price(b, 7).unwrap();
+        let f = mark_of(b, 7).unwrap();
         assert_eq!(f.has_funding, 0);
         assert_eq!(f.funding_rate_1e9, 0);
         assert_eq!(f.mark_px_1e6, 65_000_100_000);
@@ -411,7 +451,7 @@ mod tests {
     #[test]
     fn parse_mark_price_live_shapes_2026_09_23() {
         let perp = br#"{"e":"markPriceUpdate","E":1790161527002,"s":"BTCUSDT","p":"85840.40234633","ap":"85840.40234633","P":"85863.42568007","i":"85882.44043478","r":"0.00005016","T":1790179200000,"st":1}"#;
-        let f = parse_mark_price(perp, 11).unwrap();
+        let f = mark_of(perp, 11).unwrap();
         assert_eq!(f.ts_ns, 1_790_161_527_002 * 1_000_000);
         assert_eq!(f.mark_px_1e6, 85_840_402_346);
         assert_eq!(f.index_px_1e6, 85_882_440_434);
@@ -420,7 +460,7 @@ mod tests {
         assert_eq!(f.has_funding, 1);
 
         let dated = br#"{"e":"markPriceUpdate","E":1790161545000,"s":"BTCUSDT_260925","p":"85901.84762319","ap":"85901.84762319","P":"85864.31580990","i":"85884.08695652","r":"0.00000000","T":0,"st":1}"#;
-        let f = parse_mark_price(dated, 12).unwrap();
+        let f = mark_of(dated, 12).unwrap();
         assert_eq!(f.mark_px_1e6, 85_901_847_623);
         assert_eq!(f.index_px_1e6, 85_884_086_956);
         assert_eq!(f.has_funding, 0, "a dated contract pays no funding");
@@ -429,7 +469,7 @@ mod tests {
         // A perp whose rate is genuinely zero still funds: the next
         // settlement is what separates it from a delivery contract.
         let flat = br#"{"e":"markPriceUpdate","E":1,"s":"X","p":"1.0","i":"1.0","r":"0.00000000","T":1790179200000}"#;
-        let f = parse_mark_price(flat, 0).unwrap();
+        let f = mark_of(flat, 0).unwrap();
         assert_eq!((f.has_funding, f.funding_rate_1e9), (1, 0));
     }
 
@@ -437,15 +477,15 @@ mod tests {
     fn parse_mark_price_rejects_foreign_and_malformed() {
         // A bookTicker frame on a markPrice slot is a reject (the
         // required "e" tag), as is a tagless blob.
-        assert!(parse_mark_price(SAMPLE_BT, 0).is_none());
-        assert!(parse_mark_price(b"{}", 0).is_none());
+        assert!(mark_of(SAMPLE_BT, 0).is_none());
+        assert!(mark_of(b"{}", 0).is_none());
         // Tag present but the price fields missing.
-        assert!(parse_mark_price(br#"{"e":"markPriceUpdate","E":1}"#, 0).is_none());
+        assert!(mark_of(br#"{"e":"markPriceUpdate","E":1}"#, 0).is_none());
     }
 
     #[test]
     fn parse_book_ticker_extracts_top_of_book() {
-        let f = parse_book_ticker(SAMPLE_BT, 42).unwrap();
+        let f = book_of(SAMPLE_BT, 42).unwrap();
         assert_eq!(f.sym, 42);
         assert_eq!(f.update_id, 400_900_217);
         assert_eq!(f.bid_px_1e6, 25_351_900);
@@ -460,31 +500,51 @@ mod tests {
         // stale"); USDS-M carries E (event) and T (transaction) ⇒ T
         // wins; E alone is the fallback; a garbage stamp is 0, never a
         // parse failure.
-        assert_eq!(parse_book_ticker(SAMPLE_BT, 42).unwrap().venue_time_ms, 0);
+        assert_eq!(book_of(SAMPLE_BT, 42).unwrap().venue_time_ms, 0);
         let usdm = br#"{"e":"bookTicker","u":400900217,"E":1568014460893,"T":1568014460891,"s":"BNBUSDT","b":"25.35190000","B":"31.21000000","a":"25.36520000","A":"40.66000000"}"#;
-        assert_eq!(parse_book_ticker(usdm, 42).unwrap().venue_time_ms, 1_568_014_460_891);
+        assert_eq!(book_of(usdm, 42).unwrap().venue_time_ms, 1_568_014_460_891);
         let e_only = br#"{"e":"bookTicker","u":1,"E":1568014460893,"s":"X","b":"1.0","B":"1.0","a":"1.0","A":"1.0"}"#;
-        assert_eq!(parse_book_ticker(e_only, 0).unwrap().venue_time_ms, 1_568_014_460_893);
+        assert_eq!(book_of(e_only, 0).unwrap().venue_time_ms, 1_568_014_460_893);
         let bad = br#"{"u":1,"T":"soon","s":"X","b":"1.0","B":"1.0","a":"1.0","A":"1.0"}"#;
-        assert_eq!(parse_book_ticker(bad, 0).unwrap().venue_time_ms, 0);
+        assert_eq!(book_of(bad, 0).unwrap().venue_time_ms, 0);
     }
 
     #[test]
     fn parse_book_ticker_returns_none_on_missing_fields() {
         // Missing "a" price.
         let b = br#"{"u":1,"s":"X","b":"1.0","B":"1.0","A":"1.0"}"#;
-        assert!(parse_book_ticker(b, 0).is_none());
+        assert!(book_of(b, 0).is_none());
     }
 
     #[test]
     fn parse_book_ticker_returns_none_on_garbage() {
-        assert!(parse_book_ticker(b"not json", 0).is_none());
+        assert!(book_of(b"not json", 0).is_none());
     }
 
     #[test]
     fn book_ticker_frame_is_64_bytes() {
         assert_eq!(::core::mem::size_of::<BookTickerFrame>(), 64);
         assert_eq!(::core::mem::align_of::<BookTickerFrame>(), 64);
+    }
+
+    /// The in-place contract: a frame that fails to parse leaves `out`
+    /// exactly as it was — never half-written over the caller's last
+    /// good frame.
+    #[test]
+    fn a_failed_parse_leaves_the_frame_untouched() {
+        let mut f = book_of(SAMPLE_BT, 42).unwrap();
+        let before = f;
+        // Every field but the ask price parses first.
+        let no_ask = br#"{"u":1,"s":"X","b":"1.0","B":"1.0","A":"1.0"}"#;
+        assert!(!parse_book_ticker(no_ask, 9, &mut f));
+        assert_eq!(f, before);
+
+        let mut m = mark_of(SAMPLE_MARK, 9).unwrap();
+        let before = m;
+        // Tag, stamp and mark parse; the index is missing.
+        let no_index = br#"{"e":"markPriceUpdate","E":1,"p":"1.0","r":"0.0001","T":5}"#;
+        assert!(!parse_mark_price(no_index, 3, &mut m));
+        assert_eq!(m, before);
     }
 }
 
@@ -494,7 +554,7 @@ mod tests {
 
 #[cfg(test)]
 mod proptests {
-    use super::*;
+    use crate::tests::{book_of, mark_of};
     use proptest::prelude::*;
 
     proptest! {
@@ -522,7 +582,7 @@ mod proptests {
                 &mut buf,
                 r#""u":{u},"s":"X","b":"0.{bp:06}","B":"0.{bq:06}","a":"0.{ap:06}","A":"0.{aq:06}"}}"#,
             ).unwrap();
-            let f = parse_book_ticker(buf.as_bytes(), 7).unwrap();
+            let f = book_of(buf.as_bytes(), 7).unwrap();
             prop_assert_eq!(f.sym, 7);
             prop_assert_eq!(f.update_id, u);
             prop_assert_eq!(f.bid_px_1e6, bp as i64);
@@ -535,7 +595,7 @@ mod proptests {
 
         #[test]
         fn bookticker_never_panics_on_arbitrary_bytes(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_book_ticker(&buf, 0);
+            let _ = book_of(&buf, 0);
         }
 
         // WS5: markPrice roundtrip — the funding sign and the dated
@@ -556,7 +616,7 @@ mod proptests {
                 r#"{{"e":"markPriceUpdate","E":{ts},"s":"X","p":"0.{mp:06}","i":"0.{ip:06}","r":"{sign}0.{:09}","T":{t_next}}}"#,
                 r_num.unsigned_abs(),
             ).unwrap();
-            let f = parse_mark_price(buf.as_bytes(), 7).unwrap();
+            let f = mark_of(buf.as_bytes(), 7).unwrap();
             prop_assert_eq!(f.sym, 7);
             prop_assert_eq!(f.ts_ns, ts * 1_000_000);
             prop_assert_eq!(f.mark_px_1e6, mp as i64);
@@ -571,7 +631,7 @@ mod proptests {
 
         #[test]
         fn mark_price_never_panics_on_arbitrary_bytes(buf in proptest::collection::vec(any::<u8>(), 0..=300)) {
-            let _ = parse_mark_price(&buf, 0);
+            let _ = mark_of(&buf, 0);
         }
     }
 }

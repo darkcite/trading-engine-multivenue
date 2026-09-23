@@ -87,6 +87,18 @@ impl BnContractType {
 }
 
 impl BnSymbolRow {
+    /// The empty row a table slot starts as; [`parse_row`] fills it in
+    /// place.
+    const EMPTY: Self = Self {
+        symbol: [0; BN_DISCOVERY_SYMBOL_MAX],
+        symbol_len: 0,
+        trading: false,
+        tick_size_1e9: 0,
+        lot_step_1e9: 0,
+        contract_type: BnContractType::None,
+        delivery_ms: 0,
+    };
+
     /// The venue symbol as a byte slice.
     #[inline]
     pub fn symbol(&self) -> &[u8] {
@@ -143,14 +155,26 @@ impl BnDiscovery {
             match body[i] {
                 b']' => break,
                 b'{' => {
-                    let (row, end) = parse_row(body, i)?;
-                    if self.rows.len() >= BN_DISCOVERY_ROWS_CAP {
+                    // The row is parsed IN PLACE into its table slot:
+                    // returned with its end offset it crossed the call
+                    // by value, past the 64 B bound. So the cap is
+                    // checked before the row parses, and a row that
+                    // fails leaves no slot behind.
+                    let idx = self.rows.len();
+                    if idx >= BN_DISCOVERY_ROWS_CAP {
                         return Err(BnDiscoveryErr::TooMany);
                     }
-                    if row.trading {
+                    self.rows.push(BnSymbolRow::EMPTY);
+                    let end = match parse_row(body, i, &mut self.rows[idx]) {
+                        Ok(end) => end,
+                        Err(e) => {
+                            self.rows.truncate(idx);
+                            return Err(e);
+                        }
+                    };
+                    if self.rows[idx].trading {
                         self.universe_trading += 1;
                     }
-                    self.rows.push(row);
                     added += 1;
                     i = skip_ws(body, end);
                     if i < body.len() && body[i] == b',' {
@@ -188,19 +212,14 @@ impl Default for BnDiscovery {
     }
 }
 
-/// Parse one symbol object starting at `pos` (must point at `{`).
-/// Returns the row and the position after the closing `}`.
-fn parse_row(body: &[u8], pos: usize) -> Result<(BnSymbolRow, usize), BnDiscoveryErr> {
+/// Parse one symbol object starting at `pos` (must point at `{`) INTO
+/// `out`, a fresh [`BnSymbolRow::EMPTY`] slot. Returns the position
+/// after the closing `}`; on `Err` the slot is half-filled and the
+/// caller drops it.
+fn parse_row(body: &[u8], pos: usize, out: &mut BnSymbolRow) -> Result<usize, BnDiscoveryErr> {
     debug_assert_eq!(body[pos], b'{');
     let mut i = pos + 1;
-
-    let mut symbol = [0u8; BN_DISCOVERY_SYMBOL_MAX];
-    let mut symbol_len = 0u8;
     let mut trading: Option<bool> = None;
-    let mut tick_size_1e9 = 0i64;
-    let mut lot_step_1e9 = 0i64;
-    let mut contract_type = BnContractType::None;
-    let mut delivery_ms = 0i64;
 
     loop {
         i = skip_ws(body, i);
@@ -231,8 +250,14 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(BnSymbolRow, usize), BnDiscover
                         if s.is_empty() || s.len() > BN_DISCOVERY_SYMBOL_MAX {
                             return Err(BnDiscoveryErr::BadRow);
                         }
-                        symbol[..s.len()].copy_from_slice(s);
-                        symbol_len = s.len() as u8;
+                        // COPY: ≤ 32 B venue symbol into its table row,
+                        // once per row at boot — the row outlives the REST
+                        // body it was scanned from — rejected: rows that
+                        // borrow the body (every exchangeInfo body pinned
+                        // for the table's life, a lifetime threaded
+                        // through the boot, to save ≤ 32 B a row).
+                        out.symbol[..s.len()].copy_from_slice(s);
+                        out.symbol_len = s.len() as u8;
                         i = end;
                     }
                     b"status" => {
@@ -246,14 +271,14 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(BnSymbolRow, usize), BnDiscover
                         // everything else skips structurally. Absent
                         // filters leave the 0 defaults (old fixtures
                         // keep parsing).
-                        i = parse_filters(body, i, &mut tick_size_1e9, &mut lot_step_1e9)?;
+                        i = parse_filters(body, i, &mut out.tick_size_1e9, &mut out.lot_step_1e9)?;
                     }
                     b"contractType" => {
                         // WS5: USDS-M contract class (dated-future
                         // semantics; unknown values are Other, never
                         // fatal — venue classes drift).
                         let (s, end) = quoted_span(body, i)?;
-                        contract_type = match s {
+                        out.contract_type = match s {
                             b"PERPETUAL" => BnContractType::Perpetual,
                             // BST2 (binance-stocks-plan, live-probed
                             // 2026-08-29): TradFi stock perps are
@@ -275,7 +300,7 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(BnSymbolRow, usize), BnDiscover
                         if v > i64::MAX as u64 {
                             return Err(BnDiscoveryErr::BadRow);
                         }
-                        delivery_ms = v as i64;
+                        out.delivery_ms = v as i64;
                         i = end;
                     }
                     _ => {
@@ -287,22 +312,11 @@ fn parse_row(body: &[u8], pos: usize) -> Result<(BnSymbolRow, usize), BnDiscover
         }
     }
 
-    if symbol_len == 0 {
+    if out.symbol_len == 0 {
         return Err(BnDiscoveryErr::BadRow);
     }
-    let trading = trading.ok_or(BnDiscoveryErr::BadRow)?;
-    Ok((
-        BnSymbolRow {
-            symbol,
-            symbol_len,
-            trading,
-            tick_size_1e9,
-            lot_step_1e9,
-            contract_type,
-            delivery_ms,
-        },
-        i,
-    ))
+    out.trading = trading.ok_or(BnDiscoveryErr::BadRow)?;
+    Ok(i)
 }
 
 /// WS5: parse a bare (unquoted) non-negative integer value at `pos`.
@@ -353,10 +367,9 @@ fn parse_filters(
             }
             b'{' => {
                 i += 1;
-                // Per-object accumulation: order-independent.
-                const FILTER_TYPE_MAX: usize = 32;
-                let mut ftype = [0u8; FILTER_TYPE_MAX];
-                let mut ftype_len = 0usize;
+                // Per-object accumulation: order-independent. The type is
+                // a span borrowed from `body` — nothing is copied.
+                let mut ftype: &[u8] = &[];
                 let mut tick: Option<i64> = None;
                 let mut step: Option<i64> = None;
                 loop {
@@ -391,11 +404,7 @@ fn parse_filters(
                             match key {
                                 b"filterType" => {
                                     let (s, end) = quoted_span(body, i)?;
-                                    if s.len() > FILTER_TYPE_MAX {
-                                        return Err(BnDiscoveryErr::BadRow);
-                                    }
-                                    ftype[..s.len()].copy_from_slice(s);
-                                    ftype_len = s.len();
+                                    ftype = s;
                                     i = end;
                                 }
                                 b"tickSize" => {
@@ -416,7 +425,7 @@ fn parse_filters(
                         _ => return Err(BnDiscoveryErr::BadRow),
                     }
                 }
-                match &ftype[..ftype_len] {
+                match ftype {
                     b"PRICE_FILTER" => {
                         if let Some(v) = tick {
                             *tick_size_1e9 = v;
@@ -577,6 +586,21 @@ mod tests {
             .unwrap_err(),
             BnDiscoveryErr::Truncated
         );
+    }
+
+    /// BX0 zero-copy pass: the filter type is compared where it lies in
+    /// the body, so an over-long `filterType` — once a reject, from the
+    /// 32 B buffer it was copied into — is just another type the walk
+    /// skips.
+    #[test]
+    fn an_overlong_filter_type_is_skipped_not_a_row_reject() {
+        let mut d = BnDiscovery::new();
+        let long = "X".repeat(40);
+        let body = format!(
+            r#"{{"symbols":[{{"symbol":"X","status":"TRADING","filters":[{{"filterType":"{long}","tickSize":"9"}},{{"filterType":"PRICE_FILTER","tickSize":"0.01"}}]}}]}}"#
+        );
+        assert_eq!(d.ingest_body(body.as_bytes()).unwrap(), 1);
+        assert_eq!(d.find(b"X").unwrap().tick_size_1e9, 10_000_000);
     }
 
     #[test]

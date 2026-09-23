@@ -59,11 +59,14 @@ alloc-assert:
 
 copy-audit:
 	# Offline, ~1 s. The zero-COPY gate beside the zero-ALLOCATION one
-	# (operator ruling 2026-09-19): every byte-copy verb in the exec lane
-	# + core-net either carries a `// COPY:` justification within the
-	# eight lines above it, or is in scripts/copy-audit-baseline.txt
+	# (operator ruling 2026-09-19): every byte-copy verb in the exec lane,
+	# core-net and (since BX0) ingress-binance either carries a `// COPY:`
+	# justification within the eight lines above it, or is in
+	# scripts/copy-audit-baseline.txt
 	# (pre-E1 legacy debt, may only shrink). A NEW unmarked copy fails.
 	# Judged by the `zero-copy-auditor` agent; this is the mechanical half.
+	# The self-test first proves the sweep's reading of #[cfg(test)] items.
+	bash scripts/copy-audit-selftest.sh
 	bash scripts/copy-audit.sh
 
 fuzz-quick:

@@ -1,6 +1,6 @@
 # Binance Execution Plan (BX0–BX14): fix-now pass first; then spot, USDⓈ-M + COIN-M futures (incl. TradFi stock perps), European options (long + short BTC/ETH), bStocks, Binance Stocks
 
-**Status: v2, 2026-09-23 — BX0 BUILT and COMMITTED.** The fix-now pass (F1–F4) is implemented, gated and committed in the main checkout; it goes live at the 16:05Z routine restart (§5 BX0, §12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
+**Status: v2, 2026-09-23 — BX0 LIVE.** The fix-now pass (F1–F4) is committed in the main checkout (`0a1f6ff`) and went live at the 16:05Z routine restart, verified (§5 BX0). Its zero-copy pass (O-BX12d) is the second BX0 commit and goes live at the 00:10Z restart (§12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
 
 **What this adds.** A second live arm, `VenueId::Binance = 1`, next to Hyperliquid. It sits behind the same two-switch interlock (`--exec` + `--arm-live`), the same risk gate and the same E-laws.
 
@@ -18,8 +18,8 @@
 
 **What has already happened:**
 - The probes in §1.2 and BX0's K6 ran on the operator's Mac, against public endpoints only, with no keys. The scripts live outside the repo.
-- The operator committed this plan (`022710a`). BX0 then changed the files its §12 entry lists and committed them on the operator's word (O-BX12d).
-- The session's only git write operations are those BX0 commits. The engine was never stopped.
+- The operator committed this plan (`022710a`). BX0 then changed the files its §12 entries list and committed them on the operator's word (O-BX12d): `0a1f6ff` (the fixes), then the zero-copy pass.
+- The session's only git write operations are those two BX0 commits. The engine was never stopped.
 
 ---
 
@@ -895,7 +895,7 @@ Every account mutation lives in the operator tool `exec-smoke --binance setup`.
 
 **Size:** about 410 src + 670 test.
 
-**BX0 status: BUILT and COMMITTED 2026-09-23, main checkout.** The release binary was built at 12:29Z; it goes live at the 16:05Z routine restart. The changed files are listed in §12.
+**BX0 status: LIVE since the 16:05Z routine restart, 2026-09-23** (main checkout, `0a1f6ff`; release binary built 12:29Z). Verified after the restart: the boot line `binance: options mark-array slot … host=fstream.binance.com … selected=64`; `engine_ingress_binance_options_selected` 64; within two minutes the new run's `bn-opt-summary.pmlr` held 143 KB and `bn-events.pmlr` 292 KB; 0 parse errors, 0 reconnects. The changed files are listed in §12.
 
 **K6, step 0: measured 2026-09-23 ~11:04Z** from the Mac, public endpoints, no keys. The trimmed frames are the test fixtures and the fuzz seeds.
 - **Options mark array.** `/market/stream?streams=btcusdt@optionMarkPrice/ethusdt@optionMarkPrice` pushes one unfragmented text frame per underlying about every 1 s: BTC 245.6 KB with 752 elements, ETH about 194 KB with 600.
@@ -940,7 +940,14 @@ Every account mutation lives in the operator tool `exec-smoke --binance setup`.
 3. **F3 test substitution: accepted (O-BX12c).**
 4. **The regime word may move after the restart.** `regime.toml [refs] fund = "binance-usdm:btcusdt"`: FUND_SIGN and FUND_LEVEL get live funding prints for the first time since 2026-04-23. The boot seed carries price only.
 5. **Before the maker goes live:** `exec-smoke --requote` and the six risk-reviewer paths.
-6. **Zero-copy follow-ups: ordered (O-BX12d).** Pre-existing: `parse_mark_price` returns `Option<BnMarkPriceFrame>` by value — a 64 B `align(64)` frame, 128 B inside the `Option`; `ingress-binance` sits outside `make copy-audit`'s scope, and six of its boot-time copies are unmarked. All of them are fixed, and the crate joins the scope, in a second BX0 commit.
+6. **Zero-copy follow-ups: done (O-BX12d)**: the second BX0 commit, below.
+
+**The zero-copy pass (O-BX12d, the second BX0 commit; live from the 00:10Z restart).** `ingress-binance` joined `make copy-audit`. The audit had been blind past the first test-only method in `routed.rs`, `exchange.rs` and `run_loop.rs`. It now skips a `#[cfg(test)]` item and nothing more, refuses what it cannot delimit, and proves both on fixtures first (`scripts/copy-audit-selftest.sh`).
+- **Removed:** the 128 B `Option` returns on the bookTicker and markPrice hot path (now in-place parses); the sentinel SUBSCRIBE scratch (the request is now written from parts, its symbol read from the slot's own path, through the new `core_net::ws_write_text_frame_parts`); the Ping-echo scratch; `MultiConn`'s host/path `Vec`s; the `filterType` buffer. Discovery rows are parsed in place, and `options-select` sizes its output once.
+- **Marked:** the designed boot copies.
+- **Auditor:** PASS (`zero-copy-auditor`, Opus). Every cold finding was acted on.
+- **Open:** core-net's rustls RX copy, and a possible allocation per record in rustls' buffered API. UNVERIFIED; it needs an allocation count over a real TLS loopback.
+- Details: `docs/risk-policy.md`, "BX0 — `ingress-binance` joins the zero-copy gate". Gates: §12.
 
 ### BX1: Probes. The worktree opens here (O-BX15)
 
@@ -1380,4 +1387,12 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - Docs: `docs/wire-format.md`, `docs/migration.md` (two entries), `docs/risk-policy.md` ("BX0-F3"), CLAUDE.md, `.env.example`, this plan.
   - **Changed files (22):** `.env.example`, `CLAUDE.md`, `crates/bench/tests/alloc_assertions.rs`, `crates/cli/src/bin/multivenue-engine.rs`, `crates/cli/src/lib.rs`, `crates/cli/src/options_manifest.rs`, `crates/cli/src/paper.rs`, `crates/cli/tests/binance_md_live_smoke.rs` (new), `crates/core-config/src/lib.rs`, `crates/core-net/src/transport.rs`, `crates/engine/src/lib.rs`, `crates/exec-hyperliquid/src/exchange.rs`, `crates/ingress-binance/src/eapi.rs`, `crates/ingress-binance/src/lib.rs`, `crates/ingress-binance/src/run_loop.rs`, `docs/binance-exec-plan.md`, `docs/migration.md`, `docs/risk-policy.md`, `docs/wire-format.md`, `fuzz/Cargo.toml`, `fuzz/fuzz_targets/binance_eapi.rs`, `fuzz/fuzz_targets/binance_eapi_mark_array.rs` (new). The fuzz corpus seeds are git-ignored.
   - Operator rulings after the build (§0): the session switched the live `.env` line to fstream (O-BX12b); F3's test substitution accepted (O-BX12c); commit BX0, and fix the zero-copy follow-ups (O-BX12d).
-  - Git: before the operator's word, one read-only `git status` / `git log`; then the BX0 commit, explicit paths. The engine was never stopped.
+  - Git: before the operator's word, one read-only `git status` / `git log`; then the BX0 commit `0a1f6ff`, explicit paths. The engine was never stopped.
+  - Live at the 16:05Z routine restart, verified (§5 BX0).
+- **2026-09-23, BX0 zero-copy pass** (the second BX0 commit, O-BX12d).
+  - `ingress-binance` is in `make copy-audit`'s scope. The sweep's `#[cfg(test)]` blind spot is fixed and self-tested (`scripts/copy-audit-selftest.sh`, which the target runs first). The baseline went from 33 to 32 entries (debt paid) and did not grow.
+  - bookTicker and markPrice parse in place. The sentinel SUBSCRIBE is written from parts (`core_net::ws_write_text_frame_parts`). The Ping-echo, `MultiConn` host/path and `filterType` copies are gone. Discovery rows are parsed in place, and `options-select` is sized once.
+  - `zero-copy-auditor`: PASS, with every cold finding acted on. The rustls RX copy and a possible allocation are escalated (UNVERIFIED).
+  - Gates: clippy clean; nextest 2742 passed (3 skipped); alloc 64/64 at 0 B/op; license-check OK; copy-audit hits=32 baselined=32 new=0 paid=0 after its self-test; fuzz binance_book_ticker 60.1 M, binance_mark_price 15.2 M, binance_exchange_info 3.83 M and binance_eapi 3.22 M runs at 120 s each, no crash; live smoke 60 s green (0 parse errors, 0 reconnects; the spot sentinel drew 695 prints and 11 756 book ticks inherited their stamp), now with a spot sentinel slot.
+  - Release binary built 16:18Z, live from the 00:10Z routine restart.
+  - **Changed files (19):** `CLAUDE.md`, `Makefile`, `crates/bench/tests/alloc_assertions.rs`, `crates/cli/src/paper.rs`, `crates/cli/tests/binance_md_live_smoke.rs`, `crates/core-net/src/lib.rs`, `crates/core-net/src/ws_frame.rs`, `crates/ingress-binance/src/discovery.rs`, `crates/ingress-binance/src/eapi.rs`, `crates/ingress-binance/src/lib.rs`, `crates/ingress-binance/src/run_loop.rs`, `crates/options-select/src/lib.rs`, `docs/binance-exec-plan.md`, `docs/risk-policy.md`, `fuzz/fuzz_targets/binance_book_ticker.rs`, `fuzz/fuzz_targets/binance_mark_price.rs`, `scripts/copy-audit-baseline.txt`, `scripts/copy-audit-selftest.sh` (new), `scripts/copy-audit.sh`.
