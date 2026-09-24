@@ -681,7 +681,7 @@ fn handle_data_frame<C: Capture>(
                                 // (capture stays first — §6.5
                                 // capture-before-push law).
                                 if event_mask & core_types::event_lane_bit(ChannelId::Funding) != 0
-                                    && event_tx.try_push(ev).is_err()
+                                    && !event_tx.try_push_ref(&ev)
                                 {
                                     status.inc_event_ring_drops();
                                 }
@@ -795,7 +795,7 @@ fn handle_data_frame<C: Capture>(
                 // §6.5: capture BEFORE the push (ring-dropped ticks
                 // still reach the replay log).
                 capture.tick(&tick);
-                if producer.try_push(tick).is_err() {
+                if !producer.try_push_ref(&tick) {
                     status.inc_ring_drops();
                 }
             }
@@ -1359,14 +1359,14 @@ mod tests {
         t.inject_incoming(&ws_text_frame(delta));
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
 
-        let t1 = cons.try_pop().expect("snapshot tick");
+        let t1 = *cons.try_pop_ref().expect("snapshot tick");
         assert_eq!(t1.sym, SYM_BTC);
         assert_eq!(t1.venue, VenueId::Bybit as u8);
         assert_eq!(t1.bid_px.raw(), 50_005_120_000);
         assert_eq!(t1.ask_px.raw(), 50_006_340_000);
         assert_eq!(t1.venue_seq, 100);
-        let t2 = cons
-            .try_pop()
+        let t2 = *cons
+            .try_pop_ref()
             .expect("delta tick — ask side carried forward");
         assert_eq!(t2.bid_px.raw(), 50_005_500_000);
         assert_eq!(
@@ -1397,7 +1397,9 @@ mod tests {
         );
         t.inject_incoming(&ws_text_frame(s.as_bytes()));
         drive_one(t, d, b"h", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("two-sided snapshot must produce a tick")
+        *cons
+            .try_pop_ref()
+            .expect("two-sided snapshot must produce a tick")
     }
 
     #[test]
@@ -1470,7 +1472,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        assert!(cons.try_pop().is_none(), "one-sided book is not a BBO");
+        assert!(cons.try_pop_ref().is_none(), "one-sided book is not a BBO");
         let ask = br#"{"topic":"orderbook.1.BTCUSDT","type":"delta","ts":2,"data":{"s":"BTCUSDT","b":[],"a":[["50006.00","1.0"]],"u":101,"seq":2}}"#;
         t.inject_incoming(&ws_text_frame(ask));
         drive_one(
@@ -1483,7 +1485,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        assert!(cons.try_pop().is_some(), "both sides live now");
+        assert!(cons.try_pop_ref().is_some(), "both sides live now");
     }
 
     #[test]
@@ -1582,12 +1584,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(cap.events.len(), 3, "capture: Mark + Funding + OI");
-        let ev = erx.try_pop().expect("funding event on the lane");
+        let ev = *erx.try_pop_ref().expect("funding event on the lane");
         assert_eq!(ev.channel, ChannelId::Funding as u8);
         assert_eq!(ev.v0, -212_000, "rate ×1e9");
         assert_eq!(ev.v1, 1_673_280_000_000, "next funding ms");
         assert!(
-            erx.try_pop().is_none(),
+            erx.try_pop_ref().is_none(),
             "Mark/OI are NOT on the lane (mask gates per channel)"
         );
         assert_eq!(status.event_ring_drops_total(), 0);

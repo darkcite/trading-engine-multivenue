@@ -1451,9 +1451,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// that no gate touched the fill path at all, which made "0 B/op"
     /// a statement about other code. Publishing it adds no capability:
     /// every ingredient (`scan_user_fills`, `to_fill`, `TidRing`,
-    /// `AddressBudget::on_venue_fill`, `Producer::try_push`) was
+    /// `AddressBudget::on_venue_fill`, `Producer::try_push_ref`) was
     /// already public, and every `HlExchange` field is private, so
-    /// this is a NARROWING wrapper over `try_push` — it adds the
+    /// this is a NARROWING wrapper over `try_push_ref` — it adds the
     /// channel test, the strict parse, the tid dedupe, the cloid
     /// containment and the zero-quantity refusal.
     #[allow(clippy::too_many_arguments)]
@@ -1567,15 +1567,17 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // a submit that was merely attempted. A leg nothing has
             // traded still books nothing.
             //
-            // COPY (both `try_push` below): one `Fill` POD (≤ 128 B)
-            // by value into lane 3's ring slot — the ring publish IS
-            // the ownership transfer to the engine thread (§7); the
-            // frame's bytes in `rx` are compacted away after the pump.
+            // COPY: one 64 B `Fill`, the stack value → lane 3's ring slot
+            // (`try_push_ref`, the only copy), per fill — the ring publish
+            // IS the handoff to the engine thread (§7); the frame's bytes
+            // in `rx` are compacted away after the pump — rejected: building
+            // it in a claimed slot (core-ring keeps one publish path; a warm
+            // 64 B copy does not buy a second, full-ring-aware one).
             if f.is_settlement && f.cloid.is_none() {
                 match assets.owner_of_sym(sym) {
                     Some(slot) => match to_fill_as(f, sym, ts, slot) {
                         Ok(fill) => {
-                            if fills.try_push(fill).is_err() {
+                            if !fills.try_push_ref(&fill) {
                                 counters.fills_dropped = counters.fills_dropped.wrapping_add(1);
                             } else {
                                 counters.fills_booked = counters.fills_booked.wrapping_add(1);
@@ -1600,7 +1602,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             }
             match to_fill(f, sym, ts) {
                 Ok(Routed::Slot(fill)) => {
-                    if fills.try_push(fill).is_err() {
+                    // COPY: the same 64 B `Fill` publish as the settlement
+                    // arm's above (same bound, reason and rejection).
+                    if !fills.try_push_ref(&fill) {
                         // A dropped fill is a position the engine does
                         // not know it has. Reconciliation catches it;
                         // this counter explains it afterwards.

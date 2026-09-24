@@ -2698,14 +2698,15 @@ at-bound returns got size pins; stale docs were corrected.
    Option<T>` — every consumer pops a 128 B `Option<Tick>` per tick and
    a 256 B `Option<DepthTopK>` per snapshot. An in-slot claim/commit
    push and a `pop_into(&mut T) -> bool` is its own change, across
-   every consumer.
+   every consumer. *Closed by ZC pass A, below (in-place pop, no claim).*
 2. **These seven crates are not in `make copy-audit`.** A sweep with
    the script's own reader finds 51 unmarked copy verbs, all older than
    this pass. The hot one is the WS Ping echo through a 125 B stack
    scratch in OKX, Deribit, HL, Bybit, RPC and Polymarket (BX0 removed
    it from Binance; MEXC marks it); the rest are cold (subscribe,
    resync and log renders, boot symbol copies, Bybit's boot `to_vec`).
-   Whether they join the gate is the operator's call.
+   Whether they join the gate is the operator's call. *Closed by ZC pass
+   B, below.*
 
 Gates after the pass: clippy clean; nextest 2743 passed (3 skipped; one
 earlier run hit the known parallel-load flake
@@ -2818,6 +2819,152 @@ ring drops. (The first smoke runs timed out at the boot REST call: the
 Mac's LuLu firewall blocks a freshly built binary's outbound connections
 until the operator allows it — a smoke `Timeout` there is LuLu, not the
 code.) The release engine binary was not rebuilt.
+
+### ZC pass A — core-ring lends its slots (2026-09-24)
+
+On the operator's word (the same plan and rulings as pass B: the RAII
+guard over a peek/advance pair, 128 B index padding, split exactly once,
+Miri plus a torn-read stress rather than loom, the slot stride decided on
+the numbers below): item 1 of "Open, not in this pass" above is closed.
+**No ring element crosses a function boundary by value.**
+
+**The API.** `Producer::try_push_ref(&T) -> bool` copies ONE element from
+the caller's value into its slot and publishes it — the ring-slot publish,
+the law's designed copy, marked `// COPY:` in core-ring; `false` = full,
+nothing written (`#[must_use]`). `Consumer::try_pop_ref() ->
+Option<Popped<'_, T, N>>` lends the oldest slot in place: the guard derefs
+to the slot itself, and dropping it releases the slot (a Release store of
+`tail`). A held guard keeps its slot occupied and its consumer borrowed; a
+`mem::forget`ten one consumes nothing. The by-value `try_push(T)` /
+`try_pop() -> Option<T>` are deleted, with their `compiler_fence`s and
+`impl Drop for Ring`: `Ring::new` and every handle method are bounded on
+`T: Copy`, so a ring never runs a destructor.
+
+**What left the data path (D1).** Every consumer copied an `Option<T>` out
+of its slot per element — 128 B per tick, event, option record and AI
+command, 256 B per depth snapshot; OKX and Deribit pushed their 192 B
+`DepthTopK` by value; `ingress-ai` pushed the 32 832 B ruleset table by
+value and the engine popped it into a 32 896 B `Option` on its own stack
+before `on_ruleset_table`. Now every lane is one copy into the slot and a
+read in place; the table's documented copies are the two left (scratch →
+slot, slot → the vm member's staged buffer — now marked `// COPY:` in
+`strategy-vm`). What still leaves a slot by value is ≤ 64 B and outlives
+it by design: the engine's store into the `/state` recent-fills ring, the
+HYPARB live arm's fills (the dispatcher trait hands the pump an owned
+`Fill`), retired oids and swap request, and the EVM shadow's pending
+decision (both of the last feed a `&mut self` send).
+
+**Hardening (D2–D5).**
+
+* **D2 — whole-buffer retags.** The old push and pop reached a slot
+  through a reference over the WHOLE buffer while the other thread used
+  another slot. Miri on the pre-pass ring reports that as a data race
+  under Stacked Borrows and under Tree Borrows. Every slot is now its own
+  `UnsafeCell`, reached through a raw element pointer; `Ring` is
+  `#[repr(C)]` (head | tail | buf | split).
+* **D3 — two producers from safe code.** `split()` worked on any `Arc`
+  clone. It now succeeds exactly once (an `AtomicBool` swap; a second call
+  panics — boot-time, an abort in release). It caught one latent double
+  split, in the test `cli::paper::rings_allocate_and_split`.
+* **D4 — false sharing on the M4.** `head` and `tail` sat 64 B apart,
+  one 128 B line on the M4 Pro (`hw.cachelinesize: 128`), contended on
+  every push and pop. Each now owns a 128 B granule; `offset_of!` pins
+  0 / 128 and `buf` at 256. The ring is built in place in its `Arc`
+  (`Arc::new_uninit`) — no stack temporary, no Box → Arc copy of a 1 MiB
+  tick ring.
+* **D5 — housekeeping.** The redundant `compiler_fence`s are gone (the
+  Release store and the Acquire load order the slot access for compiler
+  and CPU alike); the `Sync` SAFETY comment is true again; `proptest`
+  drives a model test; `book-builder`'s unused `core-ring` dependency is
+  dropped (Q13); the engine's "16 KiB" table reads 32 KiB.
+
+**Proof.** Unit tests (FIFO, full at exactly N, wrap-around, a held guard
+keeps its slot, a forgotten guard consumes nothing, the lent address lies
+inside the ring's allocation, a guard pushed into a second ring, a second
+split panics, the layout); two-thread hand-offs on the weakly ordered M4
+(16 384 values through 8 slots; 200 000 192 B payloads whose 24 words must
+agree — never torn); a proptest model against `VecDeque` (push, pop,
+hold-a-guard-and-push, forget). Miri: clean under Stacked Borrows and under
+Tree Borrows (14 tests; the proptest ignored), and under
+`-Zmiri-many-seeds=0..16` for the two-thread tests.
+
+**Callers.** Every production site moved — 48, and the 6 in
+`drain_and_count_loop` went with it. The engine reads all nine lanes in
+place (tick, RPC signal, pool, fill, event, depth, options, ruleset table,
+AI); `touch_sym_bucket` and `dispatch_signal` became associated fns over
+the fields they touch, because a guard borrows one lane of the engine for
+its arm. The effect order inside each arm is unchanged, and the engine's
+exactly-once tests (`ticks_dispatched` across budgeted iterations) pass
+unchanged. The queued dispatcher's worker submits each order from its
+slot. `drain_and_count_loop`, which had no caller but its own test, is
+deleted with its counters (Q8). About 250 test and bench call sites moved
+with it; a test that needs an owned value copies it out
+(`*c.try_pop_ref().expect(..)`, `.as_deref().copied()`).
+
+**Bench** (the Apple M4 Pro, criterion medians, the live engine running
+beside it; both APIs measured side by side before the deletion):
+
+| bench | in place | by value (deleted) |
+|---|---|---|
+| push + pop, `Tick` | 2.53 ns | 5.68 ns |
+| push + pop, 192 B `DepthTopK` | 4.35 ns | 6.21 ns |
+| two threads, stream — the engine's pattern | ~53 ns | ~58–61 ns |
+| two threads, ping-pong round trip | ~179–186 ns | ~149–154 ns |
+
+After the deletion: 2.51 ns, 4.30 ns, 49.7 ns and 168.8 ns. The queued
+dispatcher's `dispatcher/queued_submit` went from 1.65 ns (commit
+`0990e4f`, same host, same session) to 0.51 ns — with no worker draining,
+that bench mostly times the full-ring refusal, where the by-value push
+handed the 64 B order back in its `Err`.
+
+Q10 — **no slot-stride change.** Reading in place does not lose to copying
+out on the streaming path, adjacent 64 B slots sharing a 128 B line
+included. The round trip is ~20 % slower in place: the echo thread holds
+its guard across the onward push, so the source ring's `tail` store lands
+after the push and the other side waits on that line. Producer-cached
+`tail` / consumer-cached `head` (Rigtorp) take the cross-core index read
+off the push and pop paths of both shapes; that is its own pass, with
+these benches as its baseline. `crates/bench/baselines/hot_path.json`'s
+`ring/push_pop_tick` is now `ring/push_ref_pop_ref_tick` at the M4 median.
+
+`make bench-check` cannot compare on this Mac: `check_regression.py`'s
+`float | None` annotation needs Python ≥ 3.10 (the system Python is
+3.9.6), and criterion files `bench_function("ring/push_ref_pop_ref_tick")`
+under `target/criterion/ring_push_ref_pop_ref_tick/`, not the
+`ring/push_ref_pop_ref_tick/` path the script reads — so every sample
+reads "missing" and the check passes vacuously. The comparison was made by
+hand: the ring bench −0.8 % against its new baseline; the benches this pass
+does not touch (`book/apply_n8_middle` 2.01 ns, the latency-arb callback
+2.37 ns) read the same as at `0990e4f` on this host (1.96 ns, 2.33 ns) —
+their distance from the sandbox baseline is the host, not a regression.
+The script's repair is left to the operator.
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus 5.5): PASS — RX = 4
+against the target of 3 (the extra one core-net's escalated rustls copy),
+TX = 2; the consumer side of every lane now costs no copy. Every copy out
+of a guard is ≤ 64 B and forced; no production code moves a `DepthTopK`
+or a ruleset table by value; no soundness finding in core-ring (ordering,
+slot exclusion, `Send`/`Sync`, the split, `Arc::new_uninit`). Its findings
+were acted on: the lane-3 fill marker (it said ≤ 128 B; a `Fill` is 64 B)
+is in the canonical form and covers both pushes; the engine's `tick()` doc
+names the recent-fills copy it had denied; the EVM shadow takes its next
+decision out of the slot in one move, not two; core-ring's marker says
+≤ 64 B and gives the claim's real rejection; SAFETY (2) no longer assumes
+the loaded `tail` is current; stale ruleset docs ("16 KiB", "parked until
+item 7") and a dangling `receive_table` link are fixed; the vm member's
+copy #2 carries its `// COPY:` line.
+
+Gates after the pass: clippy clean; nextest 3125 passed (5 skipped); alloc 73/73 at
+0 B/op (fresh `Compiling bench`; −1 by-value ring gate, +2 in-place
+ring gates, one of them the 192 B depth lane); `make copy-audit`
+`hits=31 baselined=31 new=0 paid=0`, the baseline byte-identical
+(sha256 `caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK (no
+parser changed). **Live smokes: pending.** LuLu blocks the rebuilt smoke
+binaries' outbound connections until the operator allows them — both
+timed out at their boot REST call, as pass B's first runs did, while curl
+from the same Mac reached both venues — so the pass was committed with
+the MEXC and Binance smokes still to run before the deploy. The release
+engine binary was not rebuilt.
 
 ## E6 — the risk gate and the kill switches
 

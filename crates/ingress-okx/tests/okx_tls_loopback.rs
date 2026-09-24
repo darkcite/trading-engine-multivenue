@@ -299,7 +299,7 @@ fn okx_tls_loopback_yields_expected_tick() {
     assert!(status.bytes_total() > 0);
     assert_eq!(status.parse_errors_total(), 0);
     assert_eq!(status.ring_drops_total(), 0);
-    let tick = cons.try_pop().expect("tick must be on the ring");
+    let tick = *cons.try_pop_ref().expect("tick must be on the ring");
     assert_eq!(tick.venue, VenueId::Okx as u8);
     assert_eq!(tick.sym, SYM_BTC);
     // Prices are scaled 1e6 — 111.05 → 111_050_000; 111.06 → 111_060_000.

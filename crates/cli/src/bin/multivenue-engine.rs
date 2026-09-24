@@ -3206,10 +3206,11 @@ fn run(args: RunArgs) -> ExitCode {
     // Ruleset-table handoff ring (Phase 8g §6, item 7): the producer
     // half rides with the AI lane into `spawn_ai`; the consumer half
     // rides in `Consumers` to the engine, which pops it immediately
-    // before the AI-cmd drain each iteration and hands slots to the
-    // strategy's `on_ruleset_table` hook (→ the set's vm member —
-    // documented copy #2). Key-unset boots drop the producer and the
-    // lane reads empty forever (§3.3 unspawned shape).
+    // before the AI-cmd drain each iteration and lends each slot in
+    // place to the strategy's `on_ruleset_table` hook (→ the set's vm
+    // member, whose copy into its staged buffer is documented copy #2).
+    // Key-unset boots drop the producer and the lane reads empty
+    // forever (§3.3 unspawned shape).
     let (ruleset_table_prod, ruleset_table_cons) = rings.ruleset_tables.clone().split();
 
     // -- Per-ingress status slots (D7) --

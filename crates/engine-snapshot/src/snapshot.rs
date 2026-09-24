@@ -352,7 +352,7 @@ pub struct AiSnapshot {
     pub seq_gap: u64,
     /// Sequence regressions.
     pub seq_regress: u64,
-    /// Ring `try_push` failures.
+    /// Ring `try_push_ref` failures.
     pub ring_drops: u64,
     /// TTL-expired at the drain site.
     pub expired: u64,
@@ -387,7 +387,7 @@ pub struct IngressSnapshot {
     pub msgs: u64,
     /// Transport reconnects.
     pub reconnects: u64,
-    /// Tick-ring `try_push` failures.
+    /// Tick-ring `try_push_ref` failures.
     pub ring_drops: u64,
     /// VT2: ticks judged stale.
     pub stale_ticks: u64,

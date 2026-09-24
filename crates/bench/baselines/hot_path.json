@@ -1,10 +1,10 @@
 {
-  "_comment": "Hot-path criterion baseline. Numbers from 2026-05-19 post-fix run on Linux aarch64 sandbox. Each entry: median ns. Re-baseline by running `make bench` and updating this file when the regression is intentional (e.g. a new feature on the hot path).",
+  "_comment": "Hot-path criterion baseline. Numbers from 2026-05-19 post-fix run on Linux aarch64 sandbox, except `ring/push_ref_pop_ref_tick`: 2026-09-24 on the Apple M4 Pro (ZC pass A — the in-place ring API replaced the by-value `ring/push_pop_tick`, 5.25 ns on the sandbox). Each entry: median ns. Re-baseline by running `make bench` and updating this file when the regression is intentional (e.g. a new feature on the hot path).",
   "_source": "docs/hot-path-latency.md",
   "tolerance_pct": 15,
   "samples": {
     "clock/now_ns": 13.7,
-    "ring/push_pop_tick": 5.25,
+    "ring/push_ref_pop_ref_tick": 2.53,
     "latency/record_1us": 2.65,
     "latency/record_1ms": 2.68,
     "metrics/counter_inc_1": 1.58,

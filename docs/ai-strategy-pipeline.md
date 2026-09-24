@@ -353,7 +353,7 @@ which is why live evidence reads *stage seq 48 / commit seq 50* — heartbeat 47
 
 `len == 80` → HMAC (constant-time) → `validate_shape()` → seq policy → **`ts_ns` rewritten to engine
 monotonic** → **append to `ai-cmds.pmlr` *before* the ring push**, so even a ring-dropped command stays
-auditable → `try_push` → Stage/Commit additionally routed to the side-path seam. Failures at steps 1–2
+auditable → `try_push_ref` → Stage/Commit additionally routed to the side-path seam. Failures at steps 1–2
 drop the connection; step 3 discards the frame and keeps the connection.
 
 ### 6.5 Side path — the second validation
@@ -368,8 +368,8 @@ features/bind budget, and descriptor resolution.
 truth that writes `instrument-manifest.tsv`. Unresolvable ⇒ `Descriptor` refuse. This is exactly why
 the post-boot re-commit (§8) is what makes options tradeable across ordinal reshuffles.
 
-On success the table is stamped `epoch = self.epoch + 1` and pushed by value (copy #1, 32,832 B) onto
-a 2-slot ring. A successful Stage sets `committed = None` — **a new Stage supersedes an old Commit.**
+On success the table is stamped `epoch = self.epoch + 1` and copied once, scratch → slot, onto a
+2-slot ring (copy #1, 32,832 B; `try_push_ref` — no by-value temporary since ZC pass A). A successful Stage sets `committed = None` — **a new Stage supersedes an old Commit.**
 
 **The boot universe** rule 6 checks symbols against is `cli::build_ai_universe`: the PM and BN pair
 syms, the OKX / Deribit / Hyperliquid discovery tables and — since 2026-09-23 (ruling Q-MX6) — every
@@ -385,7 +385,8 @@ Inside one `Engine::tick()`, the table lane is drained **immediately before** th
 Stage and Commit arriving in the same batch always land in the right order:
 
 ```
-table lane:  try_pop → StrategySet::on_ruleset_table → vm.receive_table_v2   (copy #2)
+table lane:  try_pop_ref (read in the slot) → StrategySet::on_ruleset_table
+             → vm.receive_table_v2   (copy #2, slot → staged buffer)
              ⇒ tables[(active&1)^1] = table;  staged_valid = true
              ⇒ NOT mask-gated
 

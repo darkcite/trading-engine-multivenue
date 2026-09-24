@@ -293,7 +293,7 @@ fn mexc_tls_loopback_spot_pb_and_futures_json_through_run_multi() {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut ticks: Vec<Tick> = Vec::new();
             while ticks.len() < 2 && Instant::now() < deadline {
-                match cons.try_pop() {
+                match cons.try_pop_ref().as_deref().copied() {
                     Some(t) => ticks.push(t),
                     None => thread::sleep(Duration::from_millis(1)),
                 }

@@ -607,7 +607,7 @@ impl<const FILL_N: usize> HyparbLive<FILL_N> {
             return Err(DispatchError::RiskRefused);
         }
         self.shared.busy.store(true, Ordering::Release);
-        if self.swaps.try_push(req).is_err() {
+        if !self.swaps.try_push_ref(&req) {
             self.shared.busy.store(false, Ordering::Release);
             return Err(DispatchError::QueueFull);
         }
@@ -852,14 +852,16 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
     }
 
     fn try_next_fill(&mut self) -> Option<Fill> {
-        if let Some(f) = self.amm_fills.try_pop() {
+        // The fill leaves its slot by value (64 B): the trait hands the
+        // engine's pump an owned `Fill`.
+        if let Some(f) = self.amm_fills.try_pop_ref() {
             self.last_activity_ns = core_time::now_ns();
-            return Some(f);
+            return Some(*f);
         }
         let f = loop {
-            let f = self.hl_fills.try_pop()?;
+            let f = self.hl_fills.try_pop_ref()?;
             if from_this_session(f.ts_ns, self.boot_unix_ns) {
-                break f;
+                break *f;
             }
             self.stale_fills = self.stale_fills.wrapping_add(1);
         };
@@ -876,8 +878,8 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
     /// A swap that ended without a fill, else a hedge IoC whose fills
     /// have had their time to land (its remainder, if any, is gone).
     fn try_next_retired(&mut self) -> Option<(u64, u8)> {
-        if let Some(oid) = self.retired.try_pop() {
-            return Some((oid, SLOT));
+        if let Some(oid) = self.retired.try_pop_ref() {
+            return Some((*oid, SLOT));
         }
         let now = core_time::now_ns();
         let mut i = 0usize;
@@ -1028,7 +1030,10 @@ impl Worker {
             self.shared.busy.store(false, Ordering::Release);
         }
         if ready && self.inflight.is_none() {
-            if let Some(req) = self.swaps.try_pop() {
+            // The request leaves its slot by value (48 B): `send` needs
+            // the whole driver, so the slot cannot stay lent across it.
+            let next = self.swaps.try_pop_ref().as_deref().copied();
+            if let Some(req) = next {
                 worked = true;
                 self.send(&req, now);
             }
@@ -1135,7 +1140,7 @@ impl Worker {
 
     /// Swap `oid` left no fill: its resting row goes.
     fn retire(&mut self, oid: u64) {
-        if self.retired.try_push(oid).is_err() {
+        if !self.retired.try_push_ref(&oid) {
             warn!("hyparb live: the retirement ring is full — a resting row stays counted");
         }
     }
@@ -1203,7 +1208,7 @@ impl Worker {
                             tx = %Hex(&rc.tx_hash),
                             "hyparb live: swap MINED — the receipt is the fill"
                         );
-                        if self.fills.try_push(f).is_err() {
+                        if !self.fills.try_push_ref(&f) {
                             warn!("hyparb live: the fill ring is full — fill DROPPED");
                             self.retire(req.client_oid);
                         }

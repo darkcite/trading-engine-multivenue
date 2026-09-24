@@ -13,7 +13,7 @@
 //! Replaces the Phase-2 fiction `up = engine.iterations > 0` with the
 //! real per-thread connection state, and carries the §6.4
 //! loss-accounting counters (D4: `ring_drops` is incremented on every
-//! failed `try_push`).
+//! failed `try_push_ref`).
 
 use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -198,7 +198,7 @@ pub struct IngressStatus {
     resubscribes_total: AtomicU64,
     /// Transport reconnects.
     reconnects_total: AtomicU64,
-    /// Ring `try_push` failures — events dropped because the engine
+    /// Ring `try_push_ref` failures — events dropped because the engine
     /// was not draining fast enough (D4).
     ring_drops_total: AtomicU64,
     /// Market-data rows (ticks/trades/books/summaries) parsed — the

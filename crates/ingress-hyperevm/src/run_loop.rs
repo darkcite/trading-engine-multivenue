@@ -675,7 +675,7 @@ fn emit<C: Capture, const CAP: usize>(
     );
     // §6.5: capture BEFORE the push — a dropped signal still reaches the log.
     capture.signal(&sig);
-    if producer.try_push(sig).is_err() {
+    if !producer.try_push_ref(&sig) {
         status.inc_ring_drops();
         return false;
     }

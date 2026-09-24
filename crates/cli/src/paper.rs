@@ -3,8 +3,8 @@
 
 //! Paper-mode orchestration. Wires the four ingress run-loops into
 //! dedicated threads, pins each to its own core, owns the lock-free
-//! SPSC rings, and runs a drain-and-count consumer on the main
-//! thread that emits a tick/signal summary every 5 s.
+//! SPSC rings, and runs the engine loop on the main thread, which
+//! emits a tick/signal summary every 5 s.
 //!
 //! There is deliberately **no** strategy / dispatcher / signer
 //! wiring here. Paper mode exists to validate that the four ingress
@@ -15,7 +15,7 @@
 //!
 //! | Thread | Role |
 //! |--------|------|
-//! | main   | drain-and-count consumers + 5 s log timer + reverse-order join |
+//! | main   | the engine loop (drains every ring) + 5 s log timer + reverse-order join |
 //! | T1     | ingress-polymarket (CLOB WSS) |
 //! | T2     | ingress-binance (bookTicker WSS) |
 //! | T3     | ingress-rpc (Polygon JSON-RPC WSS) |
@@ -106,7 +106,7 @@ fn spawn_or_die(
 // rustls is re-exported through core_net.
 type RustlsConfig = std::sync::Arc<rustls::ClientConfig>;
 
-/// Cadence at which the main-thread drain loop logs ring counters.
+/// Cadence at which the main-thread engine loop logs its counters.
 const REPORT_PERIOD_NS: u64 = 5_000_000_000;
 
 /// RG6: cadence of the `/state` snapshot publish (plan §6.1 — one
@@ -2627,8 +2627,8 @@ pub fn spawn_ai(
         // 8g item 4: the §4.3 boot-universe snapshot is the REAL
         // sorted discovery-derived set (`build_ai_universe`, built in
         // the bin before threads spawn), and a validated Stage hands
-        // its table to the engine through the §6 ring — `try_push` of
-        // the scratch (documented 16 KiB copy #1, operator cadence);
+        // its table to the engine through the §6 ring — `try_push_ref` of
+        // the scratch (documented 32 KiB copy #1, operator cadence);
         // push-full ⇒ reject, counted (`table_push_fail`). The
         // consumer half parks in the bin until item 7 wires the
         // engine drain.
@@ -2781,47 +2781,10 @@ pub fn parse_raw_tap_flags(
 }
 
 // ---------------------------------------------------------------
-// Drain-and-count consumer (main thread)
+// Consumer ends (the engine drains every ring)
 // ---------------------------------------------------------------
 
-/// Per-ring observed counters reset every 5 s.
-#[derive(Default, Debug, Clone, Copy)]
-pub struct DrainCounters {
-    /// Polymarket ticks observed (lane 0).
-    pub polymarket_ticks: u64,
-    /// Binance ticks observed (lane 1).
-    pub binance_ticks: u64,
-    /// Ticks observed on the OKX/Deribit/Hyperliquid lanes (2..5).
-    /// Zero until those ingresses exist (Phases 8b–8d).
-    pub other_venue_ticks: u64,
-    /// RPC signals observed.
-    pub rpc_signals: u64,
-    /// HYPARB H3b: HyperEVM pool-event signals observed.
-    pub hyperevm_signals: u64,
-    /// WS10-A: venue events observed (all event lanes combined).
-    pub venue_events: u64,
-    /// WS10-B: depth snapshots observed (both depth lanes combined).
-    pub depth_snaps: u64,
-    /// VM2 V2: options records observed (all opt lanes combined).
-    pub opt_records: u64,
-}
-
-impl DrainCounters {
-    /// Add another reading.
-    #[inline]
-    pub fn add(&mut self, other: &Self) {
-        self.polymarket_ticks += other.polymarket_ticks;
-        self.binance_ticks += other.binance_ticks;
-        self.other_venue_ticks += other.other_venue_ticks;
-        self.rpc_signals += other.rpc_signals;
-        self.hyperevm_signals += other.hyperevm_signals;
-        self.venue_events += other.venue_events;
-        self.depth_snaps += other.depth_snaps;
-        self.opt_records += other.opt_records;
-    }
-}
-
-/// Consumer-side handles passed to the drain loop / engine. Created
+/// Consumer-side handles passed to the engine. Created
 /// from `Ring::split()`; the producer ends went to ingress threads.
 pub struct Consumers {
     /// Tick-lane consumers, indexed by `VenueId as usize` (§3.3).
@@ -2852,122 +2815,14 @@ pub struct Consumers {
     /// `Engine::ai_status()`.
     pub ai_status: Arc<AiIngressStatus>,
     /// Ruleset table-handoff lane (8g §6, item 7). The engine pops it
-    /// immediately before the AI-cmd drain each iteration and hands
-    /// slots to `Strategy::on_ruleset_table` (→ the set's vm member,
-    /// documented copy #2). Reads empty forever when `ingress-ai` is
+    /// immediately before the AI-cmd drain each iteration and lends
+    /// each slot in place to `Strategy::on_ruleset_table` (→ the set's
+    /// vm member, whose copy into its staged buffer is documented copy
+    /// #2). Reads empty forever when `ingress-ai` is
     /// not spawned (producer dropped — §3.3 unspawned shape); on
     /// non-set strategy paths the pops land on the trait's default
     /// no-op, mirroring how `on_ai` behaves on bare strategies.
     pub ruleset_tables: Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
-}
-
-/// Drain-and-count loop. Runs on the main thread until
-/// [`SHUTDOWN`](crate::sigint::SHUTDOWN) is raised. Emits one
-/// `info!` line every [`REPORT_PERIOD_NS`] with cumulative counters.
-///
-/// Returns the final counter snapshot when the loop exits.
-pub fn drain_and_count_loop(mut cons: Consumers) -> DrainCounters {
-    let mut total = DrainCounters::default();
-    let mut period = DrainCounters::default();
-    let mut next_report = now_ns() + REPORT_PERIOD_NS;
-
-    while !shutdown_requested() {
-        // Drain each lane in fixed-size batches; bounded so one ring
-        // can't monopolise the main thread. Lane order = VenueId.
-        let mut lane = 0;
-        while lane < NUM_TICK_LANES {
-            for _ in 0..DRAIN_BATCH {
-                if cons.tick_lanes[lane].try_pop().is_some() {
-                    match lane {
-                        0 => period.polymarket_ticks += 1,
-                        1 => period.binance_ticks += 1,
-                        _ => period.other_venue_ticks += 1,
-                    }
-                } else {
-                    break;
-                }
-            }
-            lane += 1;
-        }
-        // WS10-A: keep the event lanes drained in capture-only mode
-        // too — the events are already in capture; an undrained lane
-        // would fill within minutes and pollute event_ring_drops.
-        let mut lane = 0;
-        while lane < engine::NUM_EVENT_LANES {
-            for _ in 0..DRAIN_BATCH {
-                if cons.event_lanes[lane].try_pop().is_some() {
-                    period.venue_events += 1;
-                } else {
-                    break;
-                }
-            }
-            lane += 1;
-        }
-        // WS10-B: same for the depth lanes (snapshots are already in
-        // capture).
-        let mut lane = 0;
-        while lane < engine::NUM_DEPTH_LANES {
-            for _ in 0..DRAIN_BATCH {
-                if cons.depth_lanes[lane].try_pop().is_some() {
-                    period.depth_snaps += 1;
-                } else {
-                    break;
-                }
-            }
-            lane += 1;
-        }
-        // VM2 V2: same for the opt lanes (records are already in
-        // capture).
-        let mut lane = 0;
-        while lane < engine::NUM_OPT_LANES {
-            for _ in 0..DRAIN_BATCH {
-                if cons.opt_lanes[lane].try_pop().is_some() {
-                    period.opt_records += 1;
-                } else {
-                    break;
-                }
-            }
-            lane += 1;
-        }
-        for _ in 0..DRAIN_BATCH {
-            if cons.rpc_signal.try_pop().is_some() {
-                period.rpc_signals += 1;
-            } else {
-                break;
-            }
-        }
-        for _ in 0..DRAIN_BATCH {
-            if cons.hyperevm_signal.try_pop().is_some() {
-                period.hyperevm_signals += 1;
-            } else {
-                break;
-            }
-        }
-
-        let now = now_ns();
-        if now >= next_report {
-            total.add(&period);
-            tracing::info!(
-                pm_ticks = period.polymarket_ticks,
-                bn_ticks = period.binance_ticks,
-                other_ticks = period.other_venue_ticks,
-                rpc_sigs = period.rpc_signals,
-                hyperevm_sigs = period.hyperevm_signals,
-                venue_events = period.venue_events,
-                depth_snaps = period.depth_snaps,
-                "5s ring summary"
-            );
-            period = DrainCounters::default();
-            next_report = now + REPORT_PERIOD_NS;
-        }
-
-        // 1 ms park is plenty for paper mode — we're measuring, not
-        // trading. Production drain pipeline (Phase 2) doesn't park.
-        thread::sleep(Duration::from_millis(1));
-    }
-
-    total.add(&period);
-    total
 }
 
 // ---------------------------------------------------------------
@@ -4537,7 +4392,7 @@ pub struct IngressCounterIds {
     pub resubscribes: core_metrics::CounterId,
     /// Transport reconnects.
     pub reconnects: core_metrics::CounterId,
-    /// Ring `try_push` failures (D4).
+    /// Ring `try_push_ref` failures (D4).
     pub ring_drops: core_metrics::CounterId,
     /// Parsed market-data rows (T1(b): control frames excluded —
     /// `engine_ingress_<venue>_ticks_total`).
@@ -4612,7 +4467,7 @@ pub struct AiIngressCounterIds {
     pub ruleset_rejected: core_metrics::CounterId,
     /// `engine_ai_table_push_fail_total` — 8g §9: Stages that passed
     /// the §4.2 validator but were REJECTED at the table-ring
-    /// `try_push` (§5 push-full; isolates the cause inside
+    /// `try_push_ref` (§5 push-full; isolates the cause inside
     /// `ruleset_rejected`). Unreachable at operator cadence against a
     /// running engine since item 7 — it counts engine-down staging.
     pub table_push_fail: core_metrics::CounterId,
@@ -10004,13 +9859,15 @@ mod tests {
         let cons = split_all_consumers(&rings);
         assert_eq!(cons.tick_lanes.len(), NUM_TICK_LANES);
         assert_eq!(cons.fill_lanes.len(), NUM_FILL_LANES);
-        // 8g item 4: the ruleset-table handoff ring splits like every
-        // other ring and round-trips a slot.
-        let (mut tp, mut tc) = rings.ruleset_tables.clone().split();
+        // 8g item 4: the ruleset-table handoff ring is sized as planned
+        // and its type round-trips a slot. `split_all_consumers` already
+        // took this ring's handles — a ring splits exactly once — so the
+        // round trip runs on a fresh ring of the same type.
         assert_eq!(rings.ruleset_tables.capacity(), RULE_TABLE_RING_SLOTS);
-        assert!(tp.try_push(core_types::RuleTableV2::EMPTY).is_ok());
-        assert!(tc.try_pop().is_some());
-        assert!(tc.try_pop().is_none());
+        let (mut tp, mut tc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        assert!(tp.try_push_ref(&core_types::RuleTableV2::EMPTY));
+        assert!(tc.try_pop_ref().is_some());
+        assert!(tc.try_pop_ref().is_none());
     }
 
     /// 8g §4.3: the boot-universe snapshot is the PM/BN pair plus
@@ -10397,66 +10254,6 @@ mod tests {
         f.c.reprices = 10;
         mirror_bin15_metrics(&reg, &ids, &f, &mut last);
         assert_eq!(reg.counter(ids.reprices).get(), 10);
-    }
-
-    #[test]
-    fn drain_counters_add() {
-        let mut a = DrainCounters {
-            polymarket_ticks: 1,
-            binance_ticks: 2,
-            other_venue_ticks: 0,
-            rpc_signals: 3,
-            hyperevm_signals: 7,
-            venue_events: 4,
-            depth_snaps: 5,
-            opt_records: 6,
-        };
-        let b = DrainCounters {
-            polymarket_ticks: 10,
-            binance_ticks: 20,
-            other_venue_ticks: 5,
-            rpc_signals: 30,
-            hyperevm_signals: 70,
-            venue_events: 40,
-            depth_snaps: 50,
-            opt_records: 60,
-        };
-        a.add(&b);
-        assert_eq!(a.polymarket_ticks, 11);
-        assert_eq!(a.binance_ticks, 22);
-        assert_eq!(a.other_venue_ticks, 5);
-        assert_eq!(a.rpc_signals, 33);
-        assert_eq!(a.hyperevm_signals, 77);
-        assert_eq!(a.venue_events, 44);
-        assert_eq!(a.depth_snaps, 55);
-        assert_eq!(a.opt_records, 66);
-    }
-
-    /// Drain loop must exit promptly when `SHUTDOWN` is set, and
-    /// return whatever it had drained before the flag flipped.
-    #[test]
-    fn drain_loop_exits_when_shutdown_set() {
-        // Reset state — other tests in this binary may have flipped it.
-        SHUTDOWN.store(false, Ordering::Release);
-
-        let rings = Rings::new();
-        let cons = split_all_consumers(&rings);
-
-        // Flip shutdown from a sibling thread after a brief delay,
-        // then assert the drain loop returns.
-        let stop_handle = thread::spawn(|| {
-            thread::sleep(Duration::from_millis(50));
-            signal_shutdown();
-        });
-        let counters = drain_and_count_loop(cons);
-        stop_handle.join().unwrap();
-        // Empty rings → all zeros.
-        assert_eq!(counters.polymarket_ticks, 0);
-        assert_eq!(counters.binance_ticks, 0);
-        assert_eq!(counters.rpc_signals, 0);
-
-        // Reset for downstream tests.
-        SHUTDOWN.store(false, Ordering::Release);
     }
 
     /// The 2026-09-15 hang, as a test.

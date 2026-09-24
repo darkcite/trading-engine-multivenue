@@ -227,11 +227,11 @@ where
         });
 
         {
-            let mut pop = || cons.try_pop();
+            let mut pop = || cons.try_pop_ref().as_deref().copied();
             scenario(&path, &status, &mut pop);
         }
         // Drain anything the scenario left in the ring.
-        while let Some(c) = cons.try_pop() {
+        while let Some(c) = cons.try_pop_ref().as_deref().copied() {
             popped.push(c);
         }
         stop.store(true, Ordering::Relaxed);

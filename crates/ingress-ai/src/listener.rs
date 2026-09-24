@@ -19,14 +19,14 @@
 //! §4.4 accept order per full frame (the order is load-bearing):
 //! len == 80 → HMAC verify (fail ⇒ drop conn) → shape check (fail ⇒
 //! frame discarded, conn kept) → seq policy (regress discard / gap
-//! count) → `ts_ns := now_ns()` rewrite → capture → `try_push` → the
+//! count) → `ts_ns := now_ns()` rewrite → capture → `try_push_ref` → the
 //! Stage/Commit side-path seam. The captured slot is the **rewritten**
 //! slot (operator decision 2026-08-15 — see crate docs).
 //!
 //! Zero-copy accounting (doctrine): frames are parsed **in place**
 //! from the rx buffer. Documented copies: (1) the 64-B stack
 //! materialization in `AiCmd::read_le` (unaligned source), (2) the
-//! 64-B ring-slot memcpy on `try_push` (ownership transfer, identical
+//! 64-B ring-slot memcpy on `try_push_ref` (the ring publish, identical
 //! to every other ingress), (3) capture staging (identical to every
 //! other ingress), (4) a ≤ 81-B `copy_within` compaction of a partial
 //! trailing frame to the buffer front after processing (bounded,
@@ -156,9 +156,9 @@ where
     capture.append(&cmd);
 
     // §4.4 step 7 — engine never blocks on AI; AI never blocks the
-    // engine. `AiCmd` is Copy: the push copies the slot (ownership
-    // transfer, the documented ring memcpy), `cmd` stays readable.
-    if producer.try_push(cmd).is_err() {
+    // engine. `try_push_ref` copies `cmd` into its slot (the documented
+    // ring memcpy, the only copy); `cmd` stays readable for the seam.
+    if !producer.try_push_ref(&cmd) {
         status.inc_ring_drops();
     }
 
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(status.last_heartbeat_ns(), 555);
         assert_eq!(seam_hits, 0, "heartbeat must not hit the ruleset seam");
 
-        let popped = cons.try_pop().unwrap();
+        let popped = *cons.try_pop_ref().unwrap();
         assert_eq!(popped.ts_ns, 555, "ts_ns rewritten to engine time");
         assert_eq!(popped.seq, 1);
 
@@ -619,8 +619,8 @@ mod tests {
         assert_eq!(kinds[0], AiCmdKind::RulesetStage.to_u8());
         assert_eq!(kinds[1], AiCmdKind::RulesetCommit.to_u8());
         // Side-path is ADDITIONAL — both commands still reach the ring.
-        assert!(cons.try_pop().is_some());
-        assert!(cons.try_pop().is_some());
+        assert!(cons.try_pop_ref().is_some());
+        assert!(cons.try_pop_ref().is_some());
         drop(cap);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -701,7 +701,7 @@ mod tests {
         let mut seam = |_c: &AiCmd| {};
 
         // Capacity-1 usable slots in a 2-ring? core-ring semantics:
-        // push until try_push fails, then one more admit must count a
+        // push until try_push_ref fails, then one more admit must count a
         // drop while still reporting Accepted (capture-before-push).
         let mut s = 1u32;
         loop {

@@ -39,40 +39,6 @@ use ingress_rpc::{
     eth_block_number_request_parts, parse_block_number_result, parse_new_head_notification,
 };
 
-/// Push/pop a Tick through the SPSC ring 10_000 times — must not
-/// allocate on any iteration after the initial ring construction.
-#[test]
-fn ring_push_pop_is_zero_alloc() {
-    let ring: std::sync::Arc<Ring<Tick, 1024>> = Ring::new();
-    let (mut prod, mut cons) = ring.split();
-
-    // Prime the measurement window: ignore any boot-time allocs.
-    let g = AllocGuard::new();
-
-    for i in 0..10_000u32 {
-        let t = Tick::new(
-            0,
-            VenueId::Polymarket,
-            1,
-            i + 1,
-            Price::from_raw(500_000),
-            Qty::from_raw(100),
-            Price::from_raw(510_000),
-            Qty::from_raw(50),
-        );
-        prod.try_push(t).unwrap();
-        let popped = cons.try_pop().unwrap();
-        std::hint::black_box(popped);
-    }
-
-    let (allocs, bytes, deallocs) = g.delta();
-    assert_eq!(
-        allocs, 0,
-        "ring push/pop allocated {allocs} times ({bytes} B, {deallocs} deallocs)"
-    );
-    assert_eq!(bytes, 0, "ring push/pop bytes should be zero: saw {bytes}");
-}
-
 /// Scan 10_000 prices through the byte-scanner parser — must not allocate.
 #[test]
 fn price_scanner_is_zero_alloc() {
@@ -202,6 +168,61 @@ fn binance_book_ticker_is_zero_alloc() {
     assert_eq!(
         allocs, 0,
         "parse_book_ticker / parse_mark_price allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// The in-place ring API: 10 000 `Tick`s copied once into their slot
+/// and read there through the `Popped` guard. Must not allocate.
+#[test]
+fn ring_push_ref_pop_ref_is_zero_alloc() {
+    let (mut prod, mut cons) = Ring::<Tick, 1024>::new().split();
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    for i in 0..10_000u32 {
+        let t = Tick::new(
+            0,
+            VenueId::Polymarket,
+            1,
+            i + 1,
+            Price::from_raw(500_000),
+            Qty::from_raw(100),
+            Price::from_raw(510_000),
+            Qty::from_raw(50),
+        );
+        assert!(prod.try_push_ref(&t));
+        let slot = cons.try_pop_ref().expect("the tick just pushed");
+        acc = acc
+            .wrapping_add(slot.bid_px.raw())
+            .wrapping_add(i64::from(slot.venue_seq));
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "ring push_ref/pop_ref allocated {allocs} times ({bytes} B, {deallocs} deallocs)"
+    );
+}
+
+/// The same for the 192 B `DepthTopK` lane: one copy into the slot, the
+/// snapshot read in place. Must not allocate.
+#[test]
+fn depth_ring_push_ref_pop_ref_is_zero_alloc() {
+    let (mut prod, mut cons) =
+        Ring::<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>::new().split();
+    let mut snap = core_types::DepthTopK::EMPTY;
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    for i in 0..10_000u64 {
+        snap.ts_ns = i;
+        assert!(prod.try_push_ref(&snap));
+        let slot = cons.try_pop_ref().expect("the snapshot just pushed");
+        acc = acc.wrapping_add(slot.ts_ns).wrapping_add(u64::from(slot.k));
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "depth ring push_ref/pop_ref allocated {allocs} times ({bytes} B, {deallocs} deallocs)"
     );
 }
 
@@ -357,7 +378,7 @@ fn polymarket_run_loop_steady_state_is_zero_alloc() {
         .unwrap();
 
         // Drain the tick so the ring doesn't fill.
-        let t = cons.try_pop().expect("tick should be produced");
+        let t = *cons.try_pop_ref().expect("tick should be produced");
         acc = acc.wrapping_add(t.bid_px.raw());
     }
     // Flush-path inside the window too: staged capture bytes hit disk
@@ -538,7 +559,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
             &mut capture,
         )
         .unwrap();
-        let t = cons.try_pop().expect("tick should be produced");
+        let t = *cons.try_pop_ref().expect("tick should be produced");
         acc = acc.wrapping_add(t.bid_px.raw());
     }
     // Flush-path inside the window too: staged capture bytes hit disk
@@ -614,10 +635,10 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
             &mut capture,
         )
         .unwrap();
-        while cons.try_pop().is_some() {
+        while cons.try_pop_ref().is_some() {
             rows += 1;
         }
-        while orx.try_pop().is_some() {
+        while orx.try_pop_ref().is_some() {
             summaries += 1;
         }
     }
@@ -719,7 +740,7 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
     // Drain subscribe request so the tx buffer stays cursor=0.
     let _ = transport.drain_outgoing(&mut scratch);
     // Drain the subscribe-tracking pending signal from the ring.
-    let _ = cons.try_pop();
+    let _ = cons.try_pop_ref().as_deref().copied();
 
     // Canned newHeads notification frame — use medium length (<65k) because
     // the JSON is >125 B.
@@ -759,7 +780,7 @@ fn rpc_run_loop_steady_state_is_zero_alloc() {
         )
         .unwrap();
         // Drain the Signal so the ring doesn't fill.
-        if let Some(s) = cons.try_pop() {
+        if let Some(s) = cons.try_pop_ref().as_deref().copied() {
             acc = acc.wrapping_add(u64::from_le_bytes(s.payload[0..8].try_into().unwrap()));
         }
     }
@@ -1437,7 +1458,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
 
     // Prime + drain a few ticks outside the measurement window.
     for i in 0..16u32 {
-        pm_p.try_push(Tick::new(
+        assert!(pm_p.try_push_ref(&Tick::new(
             i as u64,
             VenueId::Polymarket,
             1,
@@ -1446,8 +1467,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             Qty::from_raw(0),
             Price::from_raw(0),
             Qty::from_raw(0),
-        ))
-        .unwrap();
+        )));
     }
     eng.tick(64);
 
@@ -1457,7 +1477,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         // Push one tick + one funding event, drain both (WS10-A: the
         // event-lane push + `on_venue_event` drain ride the same
         // 0 B/op assertion).
-        pm_p.try_push(Tick::new(
+        assert!(pm_p.try_push_ref(&Tick::new(
             (i as u64) * 1000,
             VenueId::Polymarket,
             1,
@@ -1466,21 +1486,18 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             Qty::from_raw(0),
             Price::from_raw(0),
             Qty::from_raw(0),
-        ))
-        .unwrap();
-        ev2_p
-            .try_push(core_types::ChannelEvent::new(
-                (i as u64) * 1000,
-                VenueId::Okx,
-                core_types::ChannelId::Funding,
-                1,
-                0,
-                0,
-                125,
-                0,
-            ))
-            .unwrap();
-        d0_p.try_push(core_types::DepthTopK::EMPTY).unwrap();
+        )));
+        assert!(ev2_p.try_push_ref(&core_types::ChannelEvent::new(
+            (i as u64) * 1000,
+            VenueId::Okx,
+            core_types::ChannelId::Funding,
+            1,
+            0,
+            0,
+            125,
+            0,
+        )));
+        assert!(d0_p.try_push_ref(&core_types::DepthTopK::EMPTY));
         eng.tick(1);
         acc = acc.wrapping_add(eng.ingest_p50_ns());
     }
@@ -1498,7 +1515,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
 
 /// QueuedDispatcher worker drain — engine pushes 1000 orders into
 /// the SPSC ring, worker drains them into a PaperDispatcher. The
-/// hot path (try_pop → inner.submit → atomic stats mirror) must
+/// hot path (try_pop_ref → inner.submit → atomic stats mirror) must
 /// be zero-alloc. Boot allocations (Ring, Arc&lt;DispatchStatsAtomic&gt;)
 /// happen before the guard.
 #[test]
@@ -1799,12 +1816,12 @@ fn okx_run_loop_steady_state_is_zero_alloc() {
     // Flush-path inside the window too: staged capture bytes hit disk
     // via plain write_all (no alloc).
     core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
-    // Drain the bbo ticks — one per cycle. try_pop is zero-alloc
+    // Drain the bbo ticks — one per cycle. try_pop_ref is zero-alloc
     // (asserted by the ring test above), so popping inside the guard
     // keeps the window honest.
     let mut acc: i64 = 0;
     let mut popped: usize = 0;
-    while let Some(t) = cons.try_pop() {
+    while let Some(t) = cons.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(t.bid_px.raw());
         popped += 1;
     }
@@ -2186,12 +2203,12 @@ fn deribit_run_loop_steady_state_is_zero_alloc() {
     // Flush-path inside the window too: staged capture bytes hit disk
     // via plain write_all (no alloc).
     core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
-    // Drain the quote ticks — one per cycle. try_pop is zero-alloc
+    // Drain the quote ticks — one per cycle. try_pop_ref is zero-alloc
     // (asserted by the ring test above), so popping inside the guard
     // keeps the window honest.
     let mut acc: i64 = 0;
     let mut popped: usize = 0;
-    while let Some(t) = cons.try_pop() {
+    while let Some(t) = cons.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(t.bid_px.raw());
         popped += 1;
     }
@@ -2709,7 +2726,7 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // Drain our pong replies out of the transport (stack scratch).
     let mut out_scratch = [0u8; 4096];
     let _ = transport.drain_outgoing(&mut out_scratch);
-    // Drain the ticks — THREE per cycle. try_pop is zero-alloc
+    // Drain the ticks — THREE per cycle. try_pop_ref is zero-alloc
     // (asserted by the ring test above), so popping inside the guard
     // keeps the window honest.
     //
@@ -2719,7 +2736,7 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // comes from bbo alone, so no perp number moved.
     let mut acc: i64 = 0;
     let mut popped: usize = 0;
-    while let Some(t) = cons.try_pop() {
+    while let Some(t) = cons.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(t.bid_px.raw());
         popped += 1;
     }
@@ -2754,7 +2771,7 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
 
 /// 8f item 5 (design §11 alloc gate): the full AI-ingress frame path —
 /// pack (client side of the loopback), then accept → HMAC verify →
-/// shape check → seq policy → ts rewrite → capture → try_push — must
+/// shape check → seq policy → ts rewrite → capture → try_push_ref — must
 /// allocate ZERO bytes per frame after boot. 10 000 frames; consumer
 /// pops in lockstep so the ring never saturates (`ring_drops` stays 0
 /// and the push path is exercised end-to-end).
@@ -2808,7 +2825,7 @@ fn ai_ingress_admit_frame_is_zero_alloc() {
             u64::from(i) + 1_000_000,
         );
         assert!(matches!(v, FrameVerdict::Accepted));
-        let popped = cons.try_pop().unwrap();
+        let popped = *cons.try_pop_ref().unwrap();
         acc = acc.wrapping_add(popped.ts_ns);
         i += 1;
     }
@@ -3638,9 +3655,8 @@ fn ruleset_table_handoff_is_zero_alloc() {
     // Prewarm: one full round trip incl. receive + flip before the
     // measurement window.
     table.epoch = 0;
-    assert!(prod.try_push(*table).is_ok());
-    let warm = cons.try_pop().expect("prewarm pop");
-    vm.receive_table_v2(&warm);
+    assert!(prod.try_push_ref(&table));
+    vm.receive_table_v2(&cons.try_pop_ref().expect("prewarm pop"));
     vm.on_ai(&commit, &mut ctx);
     assert_eq!(vm.commits_applied, 1, "prewarm flip must land");
 
@@ -3652,12 +3668,12 @@ fn ruleset_table_handoff_is_zero_alloc() {
     while i < 50 {
         // Two stages fill the RULE_TABLE_RING_SLOTS = 2 ring …
         table.epoch = 2 * i + 1;
-        ok_pushes += u32::from(prod.try_push(*table).is_ok());
+        ok_pushes += u32::from(prod.try_push_ref(&table));
         table.epoch = 2 * i + 2;
-        ok_pushes += u32::from(prod.try_push(*table).is_ok());
+        ok_pushes += u32::from(prod.try_push_ref(&table));
         // … the third is the §5 push-full reject path.
-        full_rejects += u32::from(prod.try_push(*table).is_err());
-        while let Some(t) = cons.try_pop() {
+        full_rejects += u32::from(!prod.try_push_ref(&table));
+        while let Some(t) = cons.try_pop_ref() {
             std::hint::black_box(t.epoch);
             // Copy #2: popped slot → member staged buffer. The second
             // pop of the pair overwrites the first — the engine-side
@@ -3707,7 +3723,11 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
     }
     impl Ctx for RingCtx {
         fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
-            self.prod.try_push(order).map_err(|_| SubmitErr::RingFull)
+            if self.prod.try_push_ref(&order) {
+                Ok(())
+            } else {
+                Err(SubmitErr::RingFull)
+            }
         }
         fn now_ns(&self) -> core_time::NsTs {
             self.now
@@ -3832,7 +3852,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
     while i < 258 {
         vm.on_tick(&storm_tick(i), &mut ctx);
         ctx.now += 1_000_000; // 1 ms per tick ⇒ 10 ms horizons re-arm
-        while let Some(o) = cons.try_pop() {
+        while let Some(o) = cons.try_pop_ref().as_deref().copied() {
             std::hint::black_box(o.client_oid);
         }
         i += 1;
@@ -3848,7 +3868,7 @@ fn vm_on_tick_steady_state_is_zero_alloc() {
     while i < 258 + 10_000 {
         vm.on_tick(&storm_tick(i), &mut ctx);
         ctx.now += 1_000_000;
-        while let Some(o) = cons.try_pop() {
+        while let Some(o) = cons.try_pop_ref().as_deref().copied() {
             std::hint::black_box(o.client_oid);
         }
         i += 1;
@@ -4111,7 +4131,11 @@ fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
     }
     impl Ctx for RingCtx {
         fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
-            self.prod.try_push(order).map_err(|_| SubmitErr::RingFull)
+            if self.prod.try_push_ref(&order) {
+                Ok(())
+            } else {
+                Err(SubmitErr::RingFull)
+            }
         }
         fn now_ns(&self) -> core_time::NsTs {
             0
@@ -4200,7 +4224,7 @@ fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
     let mut i = 0u32;
     while i < 120 {
         s.on_tick(&script_tick(i, t0, foreign), &mut ctx);
-        while let Some(o) = cons.try_pop() {
+        while let Some(o) = cons.try_pop_ref().as_deref().copied() {
             std::hint::black_box(o.client_oid);
         }
         i += 1;
@@ -4210,7 +4234,7 @@ fn icdp_on_tick_decision_and_roll_are_zero_alloc() {
     let g = AllocGuard::new();
     while i < 120 + 40 * 300 {
         s.on_tick(&script_tick(i, t0, foreign), &mut ctx);
-        while let Some(o) = cons.try_pop() {
+        while let Some(o) = cons.try_pop_ref().as_deref().copied() {
             std::hint::black_box(o.client_oid);
         }
         i += 1;
@@ -4252,7 +4276,11 @@ fn vm_regime_gate_and_view_rejudge_are_zero_alloc() {
     }
     impl Ctx for RingCtx {
         fn submit(&mut self, order: core_types::Order) -> Result<(), SubmitErr> {
-            self.prod.try_push(order).map_err(|_| SubmitErr::RingFull)
+            if self.prod.try_push_ref(&order) {
+                Ok(())
+            } else {
+                Err(SubmitErr::RingFull)
+            }
         }
         fn now_ns(&self) -> core_time::NsTs {
             self.now
@@ -4424,7 +4452,7 @@ fn vm_regime_gate_and_view_rejudge_are_zero_alloc() {
         }
         vm.on_tick(&storm_tick(i), &mut ctx);
         ctx.now += 1_000_000;
-        while let Some(o) = cons.try_pop() {
+        while let Some(o) = cons.try_pop_ref().as_deref().copied() {
             std::hint::black_box(o.client_oid);
         }
         i += 1;
@@ -4445,7 +4473,7 @@ fn vm_regime_gate_and_view_rejudge_are_zero_alloc() {
         }
         vm.on_tick(&storm_tick(i), &mut ctx);
         ctx.now += 1_000_000;
-        while let Some(o) = cons.try_pop() {
+        while let Some(o) = cons.try_pop_ref().as_deref().copied() {
             std::hint::black_box(o.client_oid);
         }
         i += 1;
@@ -6552,7 +6580,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     let prime = venue_frame(1_000_000);
 
     // The coin IS bound, so the measured region runs the whole book
-    // path — `to_fill`, the cloid attribution, `try_push` into the
+    // path — `to_fill`, the cloid attribution, `try_push_ref` into the
     // lane and `on_venue_fill` against the budget. Until the symbol
     // binding existed this was unreachable and the gate could only
     // measure as far as the unresolved counter.
@@ -6581,7 +6609,7 @@ fn hl_exchange_route_frame_is_zero_alloc() {
     // Priming with disjoint tids instead means measured iteration 0
     // takes the FRESH path (scan, admit, budget credit, per-row
     // routing) and 1..200 take the dedupe path. Both are measured.
-    // What is NOT reachable from here is `to_fill`/`try_push`: today
+    // What is NOT reachable from here is `to_fill`/`try_push_ref`: today
     // `resolve_sym` is a `None` stub, so no row can reach the lane.
     // Gate 55 measures those functions directly.
     let _ = HlExchange::<1024>::route_frame(
@@ -7765,12 +7793,12 @@ fn mexc_run_loop_steady_state_is_zero_alloc() {
     core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
     let mut acc: i64 = 0;
     let mut ticks = 0usize;
-    while let Some(t) = cons.try_pop() {
+    while let Some(t) = cons.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(t.bid_px.raw());
         ticks += 1;
     }
     let mut funding = 0usize;
-    while let Some(e) = erx.try_pop() {
+    while let Some(e) = erx.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(e.v1);
         funding += 1;
     }
@@ -8217,7 +8245,7 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
     .unwrap();
     let live = driver.phase() == hwl::Phase::Live;
     let mut acc: u64 = 0;
-    while let Some(s) = cons.try_pop() {
+    while let Some(s) = cons.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(s.payload[0] as u64);
     }
     let mut n = 0u32;
@@ -8233,7 +8261,7 @@ fn hyperevm_session_snapshot_and_live_swaps_are_zero_alloc() {
             &mut capture,
         )
         .unwrap();
-        while let Some(s) = cons.try_pop() {
+        while let Some(s) = cons.try_pop_ref().as_deref().copied() {
             acc = acc.wrapping_add(s.payload[0] as u64);
         }
         n += 1;

@@ -430,6 +430,12 @@ impl VmStrategy {
     /// backtest harness). Same staging semantics.
     pub fn receive_table_v2(&mut self, table: &RuleTableV2) {
         let sidx = ((self.active & 1) ^ 1) as usize;
+        // COPY: documented copy #2 (§6) — one 32 832 B table, the engine's
+        // ring slot → the staged half of the double buffer, once per Stage
+        // (operator cadence) — the slot goes back to the producer when the
+        // engine's guard drops, and the Commit flip swaps an index to this
+        // row — rejected: staging a reference into the ring (a `Popped`
+        // borrows the engine's consumer; the lane would stay pinned).
         self.tables[sidx] = *table;
         if self.tables[sidx].len as usize > RULE_TABLE_ROWS {
             // Unreachable through the validator; clamping here

@@ -206,7 +206,7 @@ fn harness(tag: &str) -> Harness {
 /// Stage cmd precedes the table in real time (§4.4/§6).
 fn stage(h: &mut Harness, seq: u32, hash128: [u8; 16]) {
     let cmd = ruleset_cmd(AiCmdKind::RulesetStage, seq, hash128);
-    h.ai_prod.try_push(cmd).expect("stage cmd push");
+    assert!(h.ai_prod.try_push_ref(&cmd), "stage cmd push");
     h.side.on_cmd(&cmd);
 }
 
@@ -226,9 +226,11 @@ fn staged_table_commits_and_fires_through_engine_loop() {
     // Same batch: the Commit is already in the AI ring before the
     // engine runs at all. Pop-precedes-AI-drain makes this flip in
     // ONE iteration.
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 2, hash_a))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 2, hash_a)),
+        "commit cmd push"
+    );
     h.eng.tick(16);
 
     assert_eq!(h.eng.ai_dispatched, 2, "Stage + Commit dispatched");
@@ -241,9 +243,10 @@ fn staged_table_commits_and_fires_through_engine_loop() {
     assert_eq!(vm.staged_hash128(), None, "flip consumes the staged buffer");
 
     // Committed row fires: bid row, best ask 0.49 ≤ level 0.5.
-    h.pm_prod
-        .try_push(pm_tick(1, 480_000, 490_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(1, 480_000, 490_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.fires, 1, "committed row fired through the engine loop");
@@ -261,9 +264,11 @@ fn staged_table_commits_and_fires_through_engine_loop() {
 #[test]
 fn commit_without_staged_table_drops_through_engine_loop() {
     let mut h = harness("nostage");
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 1, [0x5A; 16]))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 1, [0x5A; 16])),
+        "commit cmd push"
+    );
     h.eng.tick(16);
 
     let vm = h.eng.strategy().vm();
@@ -271,9 +276,10 @@ fn commit_without_staged_table_drops_through_engine_loop() {
     assert_eq!(vm.commits_applied, 0);
     assert_eq!(vm.rows_active(), 0, "still inert (§7.3)");
 
-    h.pm_prod
-        .try_push(pm_tick(1, 480_000, 490_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(1, 480_000, 490_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     assert_eq!(h.eng.strategy().vm().fires, 0);
     assert_eq!(h.eng.dispatcher().stats().accepted, 0);
@@ -295,18 +301,22 @@ fn mismatched_commit_drops_and_staged_survives_through_engine_loop() {
         "pop staged"
     );
 
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 2, [0x5A; 16]))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 2, [0x5A; 16])),
+        "commit cmd push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.commits_dropped, 1, "mismatch drops the Commit");
     assert_eq!(vm.commits_applied, 0);
     assert_eq!(vm.staged_hash128(), Some(hash_a), "staged survives");
 
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a)),
+        "commit cmd push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.commits_applied, 1, "correct Commit still lands");
@@ -342,12 +352,16 @@ fn restage_supersedes_and_newest_table_runs_through_engine_loop() {
         "engine-side supersede mirror"
     );
 
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a))
-        .expect("commit cmd push");
-    h.ai_prod
-        .try_push(ruleset_cmd(AiCmdKind::RulesetCommit, 4, hash_b))
-        .expect("commit cmd push");
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 3, hash_a)),
+        "commit cmd push"
+    );
+    assert!(
+        h.ai_prod
+            .try_push_ref(&ruleset_cmd(AiCmdKind::RulesetCommit, 4, hash_b)),
+        "commit cmd push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.commits_dropped, 1, "superseded hash must not commit");
@@ -357,16 +371,18 @@ fn restage_supersedes_and_newest_table_runs_through_engine_loop() {
 
     // Ask 0.45: at/below A's level (0.5) but ABOVE B's (0.4) — if A
     // were live this would fire; B stays quiet.
-    h.pm_prod
-        .try_push(pm_tick(1, 440_000, 450_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(1, 440_000, 450_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     assert_eq!(h.eng.strategy().vm().fires, 0, "A's threshold must be gone");
 
     // Ask 0.39 ≤ 0.4: B fires.
-    h.pm_prod
-        .try_push(pm_tick(2, 380_000, 390_000))
-        .expect("tick push");
+    assert!(
+        h.pm_prod.try_push_ref(&pm_tick(2, 380_000, 390_000)),
+        "tick push"
+    );
     h.eng.tick(16);
     let vm = h.eng.strategy().vm();
     assert_eq!(vm.fires, 1, "B's committed row fires");

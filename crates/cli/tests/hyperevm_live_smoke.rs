@@ -119,7 +119,7 @@ fn hyperevm_live_smoke() {
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(secs) {
         let mut idle = true;
-        while let Some(s) = cons.try_pop() {
+        while let Some(s) = cons.try_pop_ref().as_deref().copied() {
             idle = false;
             signals += 1;
             assert_eq!(s.source, core_types::SignalSource::HyperEvm as u8);

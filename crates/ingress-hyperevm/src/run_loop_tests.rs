@@ -280,7 +280,7 @@ fn to_live(r: &mut Rig, ps: &[FakePool], prod: &mut Producer<Signal, CAP>, mid: 
 
 fn drain(cons: &mut Consumer<Signal, CAP>) -> Vec<(u32, PoolEvent)> {
     let mut v = Vec::new();
-    while let Some(s) = cons.try_pop() {
+    while let Some(s) = cons.try_pop_ref() {
         assert_eq!(s.source, SIGNAL_SOURCE_HYPEREVM);
         v.push((s.sym, decode(&s.payload).expect("payload decodes")));
     }
@@ -392,12 +392,12 @@ fn a_ring_drop_in_live_forces_a_resync() {
     let _ = drain(&mut cons);
     // Fill the ring to the brim, then deliver a swap: it cannot be pushed.
     let filler = Signal::new(0, 0, core_types::LatencyClass::Warm, 0, [0; 40]);
-    while prod.try_push(filler).is_ok() {}
+    while prod.try_push_ref(&filler) {}
     r.t.inject_incoming(&swap_push([0x10; 20], B + 5, 0, false, 1));
     r.step(&mut prod).unwrap();
     assert_eq!(r.status.ring_drops_total(), 1);
     assert_eq!(r.d.phase(), Phase::Live, "the resync waits for room");
-    while cons.try_pop().is_some() {}
+    while cons.try_pop_ref().is_some() {}
     r.step(&mut prod).unwrap();
     assert_eq!(r.d.phase(), Phase::AwaitHead);
     let sig = drain(&mut cons);

@@ -449,7 +449,7 @@ pub struct Retired { pub client_oid: u64, pub slot: u8, pub why: u8, pub _pad: [
 ```
 loop {
     // 1. latency path first: every queued command, rendered into ONE tx burst per connection
-    while let Some(cmd) = cmd_rx.try_pop() { render(cmd) }   // WS API JSON, or REST query + signature
+    while let Some(cmd) = cmd_rx.try_pop_ref() { render(&cmd) }  // WS API JSON, or REST query + signature
     if rendered { mask_in_place(); rustls.write(); flush() } // ONE write_tls/send per burst — the E7 lesson
     // 2. sockets
     poll(0) → per ready conn: read → frames → WS responses (ACK/reject) | user events (fills, state, margin)

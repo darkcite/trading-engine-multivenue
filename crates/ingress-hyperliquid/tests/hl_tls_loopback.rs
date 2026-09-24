@@ -399,7 +399,7 @@ fn happy_path_hip4_coin_roundtrip() {
     assert_eq!(status.ring_drops_total(), 0);
     assert_eq!(status.gaps_total(), 0);
     // FIFO ring: BTC bbo first, then the HIP-4 coin.
-    let tick = cons.try_pop().expect("BTC tick must be on the ring");
+    let tick = *cons.try_pop_ref().expect("BTC tick must be on the ring");
     assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
     assert_eq!(tick.sym, SYM_BTC);
     // venue_seq = time (ms) truncated to u32 (crate-header policy).
@@ -410,14 +410,19 @@ fn happy_path_hip4_coin_roundtrip() {
     // Sizes are base-coin units ×1e6.
     assert_eq!(tick.bid_qty.raw(), 1_449_100);
     assert_eq!(tick.ask_qty.raw(), 541_000);
-    let tick = cons.try_pop().expect("HIP-4 tick must flow the same path");
+    let tick = *cons
+        .try_pop_ref()
+        .expect("HIP-4 tick must flow the same path");
     assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
     assert_eq!(tick.sym, SYM_HIP4);
     assert_eq!(tick.venue_seq, 1_723_600_000_001u64 as u32);
     // Outcome prices in [0, 1] collateral units ×1e6.
     assert_eq!(tick.bid_px.raw(), 400_000);
     assert_eq!(tick.ask_px.raw(), 600_000);
-    assert!(cons.try_pop().is_none(), "exactly two ticks were pushed");
+    assert!(
+        cons.try_pop_ref().is_none(),
+        "exactly two ticks were pushed"
+    );
 }
 
 /// §6.2 integrity: stateless snapshots have no chain — the only
@@ -521,7 +526,7 @@ fn staleness_trips_reconnect() {
     assert_eq!(status.msgs_total(), 7);
     assert_eq!(status.parse_errors_total(), 0);
     assert_eq!(status.ring_drops_total(), 0);
-    assert!(cons.try_pop().is_none());
+    assert!(cons.try_pop_ref().is_none());
 }
 
 /// Keepalive: after the acks the server goes silent; the client must
@@ -995,7 +1000,7 @@ fn a_roll_rebinds_unsubscribes_subscribes_and_emits_the_event() {
     assert_eq!(rolls[2].v1 - rolls[1].v1, 900 * 1_000_000_000);
 
     // The push for the NEW coin arrived on the family's stable slot.
-    let tick = cons.try_pop().expect("a tick for the rolled slot");
+    let tick = *cons.try_pop_ref().expect("a tick for the rolled slot");
     assert_eq!(tick.sym, rolling_sym(0, 0));
     assert_eq!(tick.bid_px.raw(), 410_000);
     assert_eq!(tick.ask_px.raw(), 440_000);

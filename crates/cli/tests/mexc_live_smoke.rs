@@ -223,7 +223,7 @@ fn mexc_live_smoke() {
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(secs) {
         let mut idle = true;
-        while let Some(t) = tick_cons.try_pop() {
+        while let Some(t) = tick_cons.try_pop_ref().as_deref().copied() {
             idle = false;
             assert_eq!(t.venue, VenueId::Mexc as u8);
             let k = idx_of(t.sym);
@@ -247,7 +247,7 @@ fn mexc_live_smoke() {
                 delay_ms.push(wall_ms - t.venue_time_ms as i64);
             }
         }
-        while let Some(e) = ev_cons.try_pop() {
+        while let Some(e) = ev_cons.try_pop_ref().as_deref().copied() {
             idle = false;
             if e.channel == ChannelId::Funding as u8 {
                 let k = idx_of(e.sym);

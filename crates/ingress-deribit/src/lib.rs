@@ -78,8 +78,8 @@
 //! ## Zero-copy note (house doctrine)
 //!
 //! All parsing is in-place over `&[u8]` in the rx buffer. The one
-//! unavoidable copy per event is the 64-byte parsed POD moved into the
-//! SPSC ring by `try_push` (ownership transfer) — same as every
+//! unavoidable copy per event is the 64-byte parsed POD copied into its
+//! SPSC ring slot by `try_push_ref` (the ring publish) — same as every
 //! ingress. Requests render into fixed stack scratch; no heap after
 //! construction.
 

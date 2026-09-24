@@ -25,7 +25,7 @@
 //! discarded, conn kept) → seq policy (regress discard / gap count) →
 //! `ts_ns := now_ns()` rewrite (§13 decision 1) → PMLR capture
 //! (BEFORE push, so ring-dropped commands stay auditable) →
-//! `try_push` (full ⇒ counted drop) → Stage/Commit side-path seam.
+//! `try_push_ref` (full ⇒ counted drop) → Stage/Commit side-path seam.
 //!
 //! **Capture timestamp semantics (operator decision 2026-08-15, S2):**
 //! the captured slot is the *rewritten* slot — byte-identical to what
@@ -42,7 +42,7 @@
 //! `bench/tests/alloc_assertions.rs`). Frames are parsed in place
 //! from the rx buffer. The documented copies: the 64-B stack
 //! materialization in `AiCmd::read_le` (unaligned rx offsets), the
-//! 64-B ring-slot copy on `try_push` (ownership transfer), capture
+//! 64-B ring-slot copy on `try_push_ref` (the ring publish), capture
 //! staging (`PmlrWriter` preallocated buffer), and a ≤ 81-B partial
 //! -frame compaction in the rx buffer.
 //!

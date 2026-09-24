@@ -14,7 +14,7 @@
 //! Output goes to `target/criterion/<group>/<bench>/report/`.
 
 use std::hint::black_box;
-use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
@@ -24,7 +24,7 @@ use core_latency::LatencyTracker;
 use core_metrics::MetricsRegistry;
 use core_ring::Ring;
 use core_time::now_ns;
-use core_types::{Order, Price, Qty, Side, Tick, VenueId};
+use core_types::{DepthTopK, Order, Price, Qty, Side, Tick, VenueId};
 use strategy_core::{CooldownGate, Ctx, Strategy, SubmitErr};
 use strategy_latency_arb::LatencyArb;
 
@@ -42,13 +42,17 @@ fn bench_clock(c: &mut Criterion) {
 }
 
 // -----------------------------------------------------------------
-// 2. Ring SPSC — push then pop single-threaded.
+// 2. Ring SPSC — the in-place API (`try_push_ref` / `try_pop_ref`):
+//    single-threaded push+pop of a `Tick` and of a 192 B `DepthTopK`,
+//    a two-thread round trip, and a two-thread stream whose consumer
+//    reads every field twice (the M4's 128 B line holds two 64 B slots,
+//    so an in-place reader can contend with the producer's next write).
+//    The by-value twins these replaced were measured side by side in
+//    ZC pass A (docs/risk-policy.md) and deleted with that API.
 // -----------------------------------------------------------------
 
-fn bench_ring(c: &mut Criterion) {
-    let ring: Arc<Ring<Tick, 1024>> = Ring::new();
-    let (mut prod, mut cons) = ring.split();
-    let t = Tick::new(
+fn sample_tick() -> Tick {
+    Tick::new(
         0,
         VenueId::Polymarket,
         7,
@@ -57,14 +61,120 @@ fn bench_ring(c: &mut Criterion) {
         Qty::from_raw(100),
         Price::from_raw(510_000),
         Qty::from_raw(50),
-    );
-    c.bench_function("ring/push_pop_tick", |b| {
+    )
+}
+
+/// Every field of `t`, folded — what a consumer that reads the whole
+/// tick does.
+#[inline(always)]
+fn fold_tick(t: &Tick) -> i64 {
+    (t.ts_ns as i64)
+        .wrapping_add(i64::from(t.sym))
+        .wrapping_add(i64::from(t.venue_seq))
+        .wrapping_add(t.bid_px.raw())
+        .wrapping_add(t.bid_qty.raw())
+        .wrapping_add(t.ask_px.raw())
+        .wrapping_add(t.ask_qty.raw())
+        .wrapping_add(i64::from(t.venue))
+        .wrapping_add(i64::from(t.flags))
+        .wrapping_add(t.venue_time_ms as i64)
+}
+
+fn bench_ring(c: &mut Criterion) {
+    let t = sample_tick();
+    let (mut prod, mut cons) = Ring::<Tick, 1024>::new().split();
+    c.bench_function("ring/push_ref_pop_ref_tick", |b| {
         b.iter(|| {
-            prod.try_push(t).expect("push");
-            let popped = cons.try_pop().expect("pop");
-            black_box(popped);
+            assert!(prod.try_push_ref(black_box(&t)));
+            let slot = cons.try_pop_ref().expect("pop");
+            black_box(fold_tick(&slot));
         });
     });
+
+    let mut d = DepthTopK::EMPTY;
+    d.k = 5;
+    let (mut prod, mut cons) = Ring::<DepthTopK, 1024>::new().split();
+    c.bench_function("ring/push_ref_pop_ref_depth", |b| {
+        b.iter(|| {
+            assert!(prod.try_push_ref(black_box(&d)));
+            let slot = cons.try_pop_ref().expect("pop");
+            black_box(slot.ts_ns.wrapping_add(u64::from(slot.k)));
+        });
+    });
+
+    c.bench_function("ring/spsc_rtt_tick", |b| b.iter_custom(spsc_rtt));
+    c.bench_function("ring/spsc_stream_tick", |b| b.iter_custom(spsc_stream));
+}
+
+/// `n` round trips: this thread pushes a tick into ring A; an echo
+/// thread reads it in its slot and pushes it into ring B; this thread
+/// reads it back.
+fn spsc_rtt(n: u64) -> Duration {
+    let (mut a_tx, mut a_rx) = Ring::<Tick, 1024>::new().split();
+    let (mut b_tx, mut b_rx) = Ring::<Tick, 1024>::new().split();
+    let echo = std::thread::spawn(move || {
+        let mut done = 0u64;
+        while done < n {
+            if let Some(slot) = a_rx.try_pop_ref() {
+                while !b_tx.try_push_ref(&slot) {
+                    std::hint::spin_loop();
+                }
+                done += 1;
+            }
+        }
+    });
+    let t = sample_tick();
+    let mut acc = 0i64;
+    let start = Instant::now();
+    for _ in 0..n {
+        assert!(a_tx.try_push_ref(&t));
+        loop {
+            if let Some(slot) = b_rx.try_pop_ref() {
+                acc = acc.wrapping_add(fold_tick(&slot));
+                break;
+            }
+            std::hint::spin_loop();
+        }
+    }
+    let elapsed = start.elapsed();
+    black_box(acc);
+    echo.join().expect("echo thread");
+    elapsed
+}
+
+/// `n` ticks streamed by a producer thread; this thread reads each one
+/// in its slot, every field twice.
+fn spsc_stream(n: u64) -> Duration {
+    let (mut tx, mut rx) = Ring::<Tick, 1024>::new().split();
+    let producer = std::thread::spawn(move || {
+        let mut t = sample_tick();
+        let mut sent = 0u64;
+        while sent < n {
+            t.ts_ns = sent;
+            if tx.try_push_ref(&t) {
+                sent += 1;
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    });
+    let mut acc = 0i64;
+    let mut got = 0u64;
+    let start = Instant::now();
+    while got < n {
+        if let Some(slot) = rx.try_pop_ref() {
+            acc = acc
+                .wrapping_add(fold_tick(&slot))
+                .wrapping_add(fold_tick(&slot));
+            got += 1;
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    let elapsed = start.elapsed();
+    black_box(acc);
+    producer.join().expect("producer thread");
+    elapsed
 }
 
 // -----------------------------------------------------------------

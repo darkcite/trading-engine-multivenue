@@ -58,8 +58,8 @@
 //! Everything after the handshake is zero-alloc: parsers slice the
 //! rx buffer in place; subscribe payloads render into stack scratch;
 //! the ring copies are the 64-byte `Tick` and, per changed book top-K,
-//! the 192-byte `DepthTopK` (core-ring pushes by value — marked at the
-//! push).
+//! the 192-byte `DepthTopK` (one copy each into the slot — marked at
+//! the push).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;
@@ -907,7 +907,7 @@ fn scan_opt_summaries<C: Capture>(
                         capture.opt_summary(&o);
                         // VM2 V2: onto the opt lane (capture stays
                         // first — the §6.5 capture-before-push law).
-                        if opt_tx.try_push(o).is_err() {
+                        if !opt_tx.try_push_ref(&o) {
                             status.inc_opt_ring_drops();
                         }
                         scan.rows_parsed += 1;
@@ -1124,7 +1124,7 @@ fn handle_data_frame<C: Capture>(
                                 // §6.5 capture-before-push law).
                                 if event_mask & core_types::event_lane_bit(ChannelId::Funding)
                                     != 0
-                                    && event_tx.try_push(ev).is_err()
+                                    && !event_tx.try_push_ref(&ev)
                                 {
                                     status.inc_event_ring_drops();
                                 }
@@ -1271,7 +1271,7 @@ fn handle_data_frame<C: Capture>(
             // counts with ring_drops_total).
             capture.tick(&tick);
             // D4: a full ring is data loss — count it, never block.
-            if producer.try_push(tick).is_err() {
+            if !producer.try_push_ref(&tick) {
                 status.inc_ring_drops();
             }
         }
@@ -1344,11 +1344,11 @@ fn okx_depth_step<C: Capture>(
         let stale = pair.spare_mut();
         ladder.snapshot_into(now_ns(), VenueId::Okx, sym, core_types::DEPTH_FLAG_STALE, stale);
         capture.depth(stale);
-        // COPY: one 192 B `DepthTopK` into the depth ring's slot, per
-        // emitted snapshot — the ring is what hands it to the strategy
-        // thread — rejected: none today (core-ring pushes by value; an
-        // in-slot claim/commit push is the follow-up).
-        if depth_tx.try_push(*stale).is_err() {
+        // COPY: one 192 B `DepthTopK`, `pair`'s row → the depth ring's
+        // slot (`try_push_ref`, the only copy), per emitted snapshot — the
+        // ring is what hands it to the strategy thread — rejected: building
+        // it in the slot (the pair keeps its own row to gate the next one).
+        if !depth_tx.try_push_ref(stale) {
             status.inc_depth_ring_drops();
         }
         pair.commit();
@@ -1363,11 +1363,12 @@ fn okx_depth_step<C: Capture>(
             let (snap, last) = pair.spare_and_last();
             if !book_builder::ladder::levels_equal(snap, last) {
                 capture.depth(snap);
-                // COPY: one 192 B `DepthTopK` into the depth ring's slot,
-                // per CHANGED snapshot — the ring is what hands it to the
-                // strategy thread — rejected: none today (core-ring pushes
-                // by value; an in-slot claim/commit push is the follow-up).
-                if depth_tx.try_push(*snap).is_err() {
+                // COPY: one 192 B `DepthTopK`, `pair`'s row → the depth
+                // ring's slot (`try_push_ref`, the only copy), per CHANGED
+                // snapshot — the ring hands it to the strategy thread —
+                // rejected: building it in the slot (the pair keeps its own
+                // row to gate the next one).
+                if !depth_tx.try_push_ref(snap) {
                     status.inc_depth_ring_drops();
                 }
                 pair.commit();
@@ -2155,7 +2156,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.ticks_total(), 1, "bbo push is a tick");
-        let _ = cons.try_pop().expect("tick must be pushed");
+        let _ = cons.try_pop_ref().expect("tick must be pushed");
     }
 
     /// VT2 helper: push one `bbo-tbt` frame stamped `ts_ms` through the
@@ -2176,7 +2177,7 @@ mod tests {
         let n = wrap_text_frame(s.as_bytes(), &mut frame);
         t.inject_incoming(&frame[..n]);
         drive_one(t, d, b"h", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("bbo must produce a tick")
+        *cons.try_pop_ref().expect("bbo must produce a tick")
     }
 
     #[test]
@@ -2290,7 +2291,7 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
-        let tick = cons.try_pop().expect("tick must be pushed");
+        let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.venue, VenueId::Okx as u8);
         assert_eq!(tick.venue_seq, 363_996_337u32);
@@ -2325,7 +2326,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
     }
 
     #[test]
@@ -2419,7 +2420,7 @@ mod tests {
         assert_eq!(snap.venue_code, 60018);
         assert_eq!(snap.site, 0, "no session-error site on the drop path");
         // The session still moves data.
-        let tick = cons.try_pop().expect("bbo after the drop still flows");
+        let tick = *cons.try_pop_ref().expect("bbo after the drop still flows");
         assert_eq!(tick.sym, SYM_BTC);
     }
 
@@ -2494,8 +2495,8 @@ mod tests {
             (2 << 24) | 513,
             "drop names the expired option row"
         );
-        let tick = cons
-            .try_pop()
+        let tick = *cons
+            .try_pop_ref()
             .expect("spot keeps flowing beside the dead option");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(
@@ -2783,13 +2784,13 @@ mod tests {
         )
         .unwrap();
 
-        let ev = erx.try_pop().expect("funding event on the lane");
+        let ev = *erx.try_pop_ref().expect("funding event on the lane");
         assert_eq!(ev.channel, ChannelId::Funding as u8);
         assert_eq!(ev.v0, 59_300, "rate ×1e9");
         assert_eq!(ev.v1, 1_630_051_200_000, "next funding ms");
-        assert!(erx.try_pop().is_none(), "exactly one event");
+        assert!(erx.try_pop_ref().is_none(), "exactly one event");
         assert_eq!(cap.events, 1, "capture saw it too (§6.5 first)");
-        assert!(cons.try_pop().is_none(), "funding is not a tick");
+        assert!(cons.try_pop_ref().is_none(), "funding is not a tick");
         assert_eq!(status.event_ring_drops_total(), 0);
     }
 
@@ -2824,7 +2825,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(erx.try_pop().is_none(), "mask 0 ⇒ no lane push");
+        assert!(erx.try_pop_ref().is_none(), "mask 0 ⇒ no lane push");
         assert_eq!(cap.events, 1, "capture unaffected by the mask");
         assert_eq!(status.event_ring_drops_total(), 0);
     }
@@ -2842,7 +2843,7 @@ mod tests {
 
         // Pre-fill the ring to capacity (consumer never pops).
         let filler = ChannelEvent::new(1, VenueId::Okx, ChannelId::Funding, 0, 0, 0, 0, 0);
-        while etx.try_push(filler).is_ok() {}
+        while etx.try_push_ref(&filler) {}
 
         let funding = br#"{"arg":{"channel":"funding-rate","instId":"ETH-USD-SWAP"},"data":[{"fundingRate":"0.0000593","fundingTime":"1630051200000","instId":"ETH-USD-SWAP","instType":"SWAP","ts":"1630048897897"}]}"#;
         let mut frame = [0u8; 1024];
@@ -2901,19 +2902,16 @@ mod tests {
         );
         assert_eq!(status.parse_errors_total(), 2);
         // Tick still captured when the ring is full: fill it, resend.
-        while prod
-            .try_push(Tick::new(
-                1,
-                VenueId::Okx,
-                SYM_BTC,
-                1,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                Price::from_raw(2),
-                Qty::from_raw(1),
-            ))
-            .is_ok()
-        {}
+        while prod.try_push_ref(&Tick::new(
+            1,
+            VenueId::Okx,
+            SYM_BTC,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        )) {}
         let n = wrap_text_frame(bbo, &mut frame);
         t.inject_incoming(&frame[..n]);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();

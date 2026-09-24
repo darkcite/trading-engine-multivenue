@@ -624,7 +624,7 @@ impl StrategySet {
     }
 
     /// Mutate the vm member. The engine's table-ring pop (item 7)
-    /// hands popped slots to `vm_mut().receive_table` — the §6
+    /// lends each slot to `vm_mut().receive_table_v2` — the §6
     /// copy-#2 seam; there is no boot config (§7.3: booting inert is
     /// normal).
     #[inline]
@@ -1334,9 +1334,10 @@ impl Strategy for StrategySet {
         }
     }
 
-    /// 8g §6 item 7: the engine's pre-AI-drain table pop lands here,
-    /// forwarded to the slot-5 vm member
-    /// ([`VmStrategy::receive_table`] — documented copy #2).
+    /// 8g §6 item 7: the engine's pre-AI-drain table pop lands here —
+    /// the ring slot itself, lent in place — forwarded to the slot-5
+    /// vm member ([`VmStrategy::receive_table_v2`] — documented copy
+    /// #2, slot → its staged buffer).
     /// Deliberately NOT mask-gated: staging is control plane and a
     /// staged table is inert until an in-stream `RulesetCommit`,
     /// which IS mask-gated through [`Strategy::on_ai`] — so an

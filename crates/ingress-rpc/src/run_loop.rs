@@ -766,7 +766,7 @@ fn emit_new_head_signal<C: Capture>(
     // counts with ring_drops_total).
     capture.signal(&sig);
     // D4: a full ring is data loss — count it, never block.
-    if producer.try_push(sig).is_err() {
+    if !producer.try_push_ref(&sig) {
         status.inc_ring_drops();
     }
 }
@@ -789,7 +789,7 @@ fn emit_block_number_signal<C: Capture>(
     // counts with ring_drops_total).
     capture.signal(&sig);
     // D4: a full ring is data loss — count it, never block.
-    if producer.try_push(sig).is_err() {
+    if !producer.try_push_ref(&sig) {
         status.inc_ring_drops();
     }
 }
@@ -1223,7 +1223,7 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
-        let sig = cons.try_pop().expect("signal must be pushed");
+        let sig = *cons.try_pop_ref().expect("signal must be pushed");
         assert_eq!(sig.sym, SYMBOL_ID_NONE);
         assert!(matches!(sig.class, LatencyClass::Warm));
         assert_eq!(sig.source, SignalSource::Rpc as u8);
@@ -1266,7 +1266,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.msgs_total(), 1);
 
-        let sig = cons.try_pop().expect("signal must be pushed");
+        let sig = *cons.try_pop_ref().expect("signal must be pushed");
         assert!(matches!(sig.class, LatencyClass::Warm));
         assert_eq!(sig.source, SignalSource::Rpc as u8);
         let block = u64::from_le_bytes(sig.payload[0..8].try_into().unwrap());
@@ -1620,7 +1620,7 @@ mod tests {
             SignalSource::Rpc as u8,
             [0u8; 40],
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         let n = wrap_text_frame(head, &mut frame_buf);
         t.inject_incoming(&frame_buf[..n]);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();

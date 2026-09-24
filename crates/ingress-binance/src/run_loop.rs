@@ -841,7 +841,7 @@ fn handle_eapi_frame<C: Capture>(
         // §6.5: capture first. VM2 V2: the summary also rides the opt
         // lane (the kind-6 channel's engine entry).
         capture.opt_summary(&summary);
-        if opt_tx.try_push(summary).is_err() {
+        if !opt_tx.try_push_ref(&summary) {
             status.inc_opt_ring_drops();
         }
         if f.bid_px_1e6 != 0 || f.ask_px_1e6 != 0 {
@@ -857,7 +857,7 @@ fn handle_eapi_frame<C: Capture>(
                 Qty::from_raw(f.ask_qty_1e6),
             );
             capture.tick(&tick);
-            if producer.try_push(tick).is_err() {
+            if !producer.try_push_ref(&tick) {
                 status.inc_ring_drops();
             }
         }
@@ -917,7 +917,7 @@ fn handle_mark_price_frame<C: Capture>(
         // WS10-A: onto the venue-event lane (capture stays first —
         // §6.5 capture-before-push law).
         if event_mask & core_types::event_lane_bit(core_types::ChannelId::Funding) != 0
-            && event_tx.try_push(ev).is_err()
+            && !event_tx.try_push_ref(&ev)
         {
             status.inc_event_ring_drops();
         }
@@ -1052,7 +1052,7 @@ fn handle_text_frame<C: Capture>(
         // ring_drops_total).
         capture.tick(&tick);
         // D4: a full ring is data loss — count it, never block on it.
-        if producer.try_push(tick).is_err() {
+        if !producer.try_push_ref(&tick) {
             status.inc_ring_drops();
         }
         status.add_msgs(1);
@@ -1744,7 +1744,7 @@ mod tests {
         let s = format!(r#"{{"u":{u},"s":"BTCUSDT","b":"25.35","B":"31.21","a":"25.36","A":"40.66"}}"#);
         t.inject_incoming(&ws_text_frame(s.as_bytes()));
         drive_one(t, d, b"host", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("bookTicker must produce a tick")
+        *cons.try_pop_ref().expect("bookTicker must produce a tick")
     }
 
     /// VT2 helper: one aggTrade print stamped `T = t_ms` on the same
@@ -1786,7 +1786,7 @@ mod tests {
         assert_eq!(unknown.flags, 0);
 
         push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut NullCapture, t0, 100, false);
-        assert!(cons.try_pop().is_none(), "a print is never a tick");
+        assert!(cons.try_pop_ref().is_none(), "a print is never a tick");
         assert_eq!(d.sentinel_time_ms(), t0);
         let fresh = push_spot_book_ticker(&mut t, &mut d, &mut prod, &mut cons, &status, 2);
         assert_eq!(fresh.venue_time_ms, t0, "inherited from the sentinel");
@@ -1847,7 +1847,7 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ticks_total(), 0);
         assert_eq!(cap.rejects, 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
 
         push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut cap, 1_755_216_000_000, 26_129, true);
         push_agg_trade(&mut t, &mut d, &mut prod, &status, &mut cap, 1_755_216_000_050, 26_130, false);
@@ -1861,7 +1861,10 @@ mod tests {
         assert_eq!(sell.v0, 25_350_000, "px ×1e6");
         assert_eq!(sell.v1, -500_000, "m:true = the aggressor sold ⇒ negated qty");
         assert_eq!(cap.events[1].v1, 500_000, "m:false = the aggressor bought");
-        assert!(cons.try_pop().is_none(), "prints never reach the tick ring");
+        assert!(
+            cons.try_pop_ref().is_none(),
+            "prints never reach the tick ring"
+        );
         assert_eq!(cap.rejects, 0);
     }
 
@@ -2000,10 +2003,11 @@ mod tests {
             assert_eq!(res, RunResult::Stopped);
         });
 
-        let mut syms = [cons.try_pop().unwrap().sym, cons.try_pop().unwrap().sym];
+        let first = cons.try_pop_ref().unwrap().sym;
+        let mut syms = [first, cons.try_pop_ref().unwrap().sym];
         syms.sort_unstable();
         assert_eq!(syms, [7, 42]);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         assert_eq!(status.msgs_total(), 2);
         // No kills: both transports still installed, zero reconnects.
         assert!(conns[0].transport.is_some());
@@ -2139,14 +2143,17 @@ mod tests {
 
         // Ticks: the put and the call from the live push, in wire
         // order; nothing for the empty book.
-        let tp = cons.try_pop().expect("put tick");
+        let tp = *cons.try_pop_ref().expect("put tick");
         assert_eq!(tp.sym, put);
         assert_eq!((tp.bid_px.raw(), tp.ask_px.raw()), (905_000_000, 920_000_000));
-        let tc = cons.try_pop().expect("call tick");
+        let tc = *cons.try_pop_ref().expect("call tick");
         assert_eq!(tc.sym, call);
         assert_eq!((tc.bid_px.raw(), tc.ask_px.raw()), (800_000_000, 810_000_000));
         assert_eq!((tc.bid_qty.raw(), tc.ask_qty.raw()), (5_080_000, 1_100_000));
-        assert!(cons.try_pop().is_none(), "the empty book yields no tick");
+        assert!(
+            cons.try_pop_ref().is_none(),
+            "the empty book yields no tick"
+        );
         assert_eq!(cap.ticks, 2);
 
         // Summaries: put, call, call (empty book) — captured AND laned.
@@ -2163,7 +2170,7 @@ mod tests {
         assert_eq!(cap.summaries[0].sym, put);
         assert_eq!(cap.summaries[2].underlying_px_1e9, 85_900_500_000_000);
         let mut laned = 0;
-        while orx.try_pop().is_some() {
+        while orx.try_pop_ref().is_some() {
             laned += 1;
         }
         assert_eq!(laned, 3, "every summary rides the opt lane too");
@@ -2223,9 +2230,9 @@ mod tests {
             &mut cap,
         )
         .unwrap();
-        assert_eq!(cons.try_pop().map(|t| t.sym), Some(11));
-        assert_eq!(cons.try_pop().map(|t| t.sym), Some(12));
-        assert!(cons.try_pop().is_none());
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(11));
+        assert_eq!(cons.try_pop_ref().map(|t| t.sym), Some(12));
+        assert!(cons.try_pop_ref().is_none());
         assert_eq!(cap.summaries.len(), 2);
         assert!(cap.rejects.is_empty());
         assert_eq!((status.msgs_total(), status.ticks_total()), (1, 2));
@@ -2261,7 +2268,7 @@ mod tests {
         )
         .unwrap();
 
-        let tick = cons.try_pop().expect("tick must be pushed");
+        let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, 42);
         assert_eq!(tick.bid_px.raw(), 25_351_900);
         assert_eq!(tick.ask_px.raw(), 25_365_200);
@@ -2270,7 +2277,7 @@ mod tests {
         assert_eq!(tick.venue_time_ms, 0);
         assert!(!tick.is_stale());
         assert_eq!(status.stale_ticks_total(), 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         // D5 accounting: one parsed message, whole frame counted.
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.bytes_total(), frame_len as u64);
@@ -2296,7 +2303,7 @@ mod tests {
         );
         t.inject_incoming(&ws_text_frame(s.as_bytes()));
         drive_one(t, d, b"host", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("bookTicker must produce a tick")
+        *cons.try_pop_ref().expect("bookTicker must produce a tick")
     }
 
     #[test]
@@ -2421,7 +2428,7 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         // Silent drop on the ring, but the rejection is counted.
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
@@ -2602,7 +2609,7 @@ mod tests {
             core_types::Price::from_raw(2),
             core_types::Qty::from_raw(1),
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         let mut frame3 = [0u8; 256];
         frame3[0] = 0x81;
         frame3[1] = good.len() as u8;
@@ -2641,7 +2648,7 @@ mod tests {
         assert_eq!(fu.channel, core_types::ChannelId::Funding as u8);
         assert_eq!(fu.v0, 381_670);
         assert_eq!(fu.v1, 1_562_306_400_000);
-        assert!(cons.try_pop().is_none(), "capture-only: nothing rings");
+        assert!(cons.try_pop_ref().is_none(), "capture-only: nothing rings");
         assert_eq!(status.ticks_total(), 1, "market-data row counted");
         assert_eq!(status.parse_errors_total(), 0);
     }
@@ -2677,12 +2684,12 @@ mod tests {
         )
         .unwrap();
 
-        let ev = erx.try_pop().expect("funding event on the lane");
+        let ev = *erx.try_pop_ref().expect("funding event on the lane");
         assert_eq!(ev.channel, core_types::ChannelId::Funding as u8);
         assert_eq!(ev.v0, 381_670, "rate ×1e9");
         assert_eq!(ev.v1, 1_562_306_400_000, "next funding ms");
         assert!(
-            erx.try_pop().is_none(),
+            erx.try_pop_ref().is_none(),
             "Mark event is NOT on the lane (mask gates per channel)"
         );
         assert_eq!(status.event_ring_drops_total(), 0);
@@ -2707,7 +2714,7 @@ mod tests {
             &mut cap,
         )
         .unwrap();
-        assert!(erx.try_pop().is_none(), "dated future never funds");
+        assert!(erx.try_pop_ref().is_none(), "dated future never funds");
     }
 
     #[test]

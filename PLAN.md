@@ -311,15 +311,15 @@ impl<S: Strategy> Engine<S> {
     pub fn run(&mut self) -> ! {
         self.strategy.on_start(&mut self.ctx());
         loop {
-            while let Some(t) = self.tick_ring.try_pop() {
+            while let Some(t) = self.tick_ring.try_pop_ref() {
                 self.books.apply(&t);
                 let book = self.books.get(t.market_id);
                 self.strategy.on_tick(&t, book, &mut self.ctx());
             }
-            while let Some(s) = self.sig_ring.try_pop() {
+            while let Some(s) = self.sig_ring.try_pop_ref() {
                 self.strategy.on_signal(&s, &mut self.ctx());
             }
-            while let Some(f) = self.fill_ring.try_pop() {
+            while let Some(f) = self.fill_ring.try_pop_ref() {
                 self.risk.apply_fill(&f);
                 self.strategy.on_fill(&f, &mut self.ctx());
             }

@@ -1290,7 +1290,7 @@ fn handle_data_frame<C: Capture>(
                 // §6.5: capture BEFORE the push (ring-dropped ticks
                 // still reach the replay log).
                 capture.tick(&tick);
-                if producer.try_push(tick).is_err() {
+                if !producer.try_push_ref(&tick) {
                     status.inc_ring_drops();
                     // The engine never saw this quote: forget it, so the
                     // venue's next republication of the same touch is
@@ -1368,7 +1368,7 @@ fn handle_data_frame<C: Capture>(
                 // WS10-A: onto the venue-event lane (capture stays first
                 // — §6.5 capture-before-push law).
                 if event_mask & core_types::event_lane_bit(ChannelId::Funding) != 0
-                    && event_tx.try_push(ev).is_err()
+                    && !event_tx.try_push_ref(&ev)
                 {
                     status.inc_event_ring_drops();
                 }
@@ -2021,7 +2021,7 @@ mod tests {
         t.inject_incoming(&binary(&frame));
         drive(&mut t, &mut d, &mut prod, &status, &mut cap).unwrap();
 
-        let tick = cons.try_pop().expect("tick");
+        let tick = *cons.try_pop_ref().expect("tick");
         assert_eq!(tick.venue, VenueId::Mexc as u8);
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.bid_px.raw(), 80_535_880_000);
@@ -2050,7 +2050,7 @@ mod tests {
         t.inject_incoming(&binary(&frame));
         drive(&mut t, &mut d, &mut prod, &status, &mut cap).unwrap();
 
-        assert!(cons.try_pop().is_none(), "prints are events, not ticks");
+        assert!(cons.try_pop_ref().is_none(), "prints are events, not ticks");
         let tr = cap.of(ChannelId::Trade);
         assert_eq!(tr.len(), 2);
         assert_eq!(tr[0].sym, SYM_ETH);
@@ -2193,7 +2193,7 @@ mod tests {
         let (mut prod, mut cons) = ring_pair();
         t.inject_incoming(&text(F_DEPTH));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        let tick = cons.try_pop().expect("tick");
+        let tick = *cons.try_pop_ref().expect("tick");
         assert_eq!(tick.sym, SYM_FBTC);
         assert_eq!(tick.venue, VenueId::Mexc as u8);
         assert_eq!(tick.bid_px.raw(), 80_468_600_000);
@@ -2213,7 +2213,7 @@ mod tests {
         let (mut prod, mut cons) = ring_pair();
         t.inject_incoming(&text(br#"{"symbol":"BTC_USDT","data":{"cts":5,"asks":[],"bids":[[1.5,2,1]],"version":3},"channel":"push.depth.full","ts":6}"#));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(d.sub_count(), 1, "still data: the pair is confirmed");
@@ -2264,15 +2264,15 @@ mod tests {
         let oi = cap.of(ChannelId::Ticker);
         assert_eq!(oi.len(), 1);
         assert_eq!((oi[0].v0, oi[0].v1), (0, 92_415_393_000_000));
-        let lane = erx.try_pop().expect("funding on the lane");
+        let lane = *erx.try_pop_ref().expect("funding on the lane");
         assert_eq!(lane.channel, ChannelId::Funding as u8);
         assert_eq!(lane.v1, t0 as i64);
-        assert!(erx.try_pop().is_none(), "Mark/OI stay capture-only");
+        assert!(erx.try_pop_ref().is_none(), "Mark/OI stay capture-only");
         assert_eq!(status.event_ring_drops_total(), 0);
         // Mask without the funding bit: capture only.
         t.inject_incoming(&text(&fut_ticker("0.0001", 1_789_897_545_760)));
         super::drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &mut etx, 0, &status, &mut cap).unwrap();
-        assert!(erx.try_pop().is_none());
+        assert!(erx.try_pop_ref().is_none());
         assert_eq!(cap.of(ChannelId::Funding).len(), 2);
     }
 
@@ -2471,14 +2471,14 @@ mod tests {
         let t0: u64 = 1_789_897_517_479;
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"1", t0)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        let fresh = cons.try_pop().unwrap();
+        let fresh = *cons.try_pop_ref().unwrap();
         assert!(!fresh.is_stale());
         assert_eq!(fresh.venue_time_ms, t0);
         // 5 s older than the learned offset: stale at the mexc 400 ms default.
         // (a changed ask — an identical quote is not a tick)
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"3", b"2", t0 - 5_000)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        let stale = cons.try_pop().unwrap();
+        let stale = *cons.try_pop_ref().unwrap();
         assert!(stale.is_stale());
         assert_eq!(stale.flags, TICK_FLAG_STALE);
         assert_eq!(status.stale_ticks_total(), 1);
@@ -2504,7 +2504,7 @@ mod tests {
         enc::len_field(&mut f, 315, &body);
         t.inject_incoming(&binary(&f));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(cons.try_pop().is_none(), "one side is not a BBO");
+        assert!(cons.try_pop_ref().is_none(), "one side is not a BBO");
         assert_eq!(status.parse_errors_total(), 0);
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(d.rows[0].last_book_seq, 9, "its version still counts");
@@ -2525,22 +2525,22 @@ mod tests {
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"11", t0 + 10)));
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"12", t0 + 20)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(cons.try_pop().is_some(), "the first quote is a tick");
-        assert!(cons.try_pop().is_none(), "two republications are not");
+        assert!(cons.try_pop_ref().is_some(), "the first quote is a tick");
+        assert!(cons.try_pop_ref().is_none(), "two republications are not");
         assert_eq!(status.msgs_total(), 3);
         assert_eq!(status.ticks_total(), 1);
         assert_eq!(d.rows[0].last_book_seq, 12, "the seq check saw every push");
         // A changed BBO emits.
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"3", b"13", t0 + 30)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert_eq!(cons.try_pop().unwrap().ask_px.raw(), 3_000_000);
+        assert_eq!(cons.try_pop_ref().unwrap().ask_px.raw(), 3_000_000);
         // A reconnect re-emits the same quote once.
         d.reset_for_reconnect(5);
         d.state = State::Steady;
         d.subscribed = true;
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"3", b"14", t0 + 40)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(cons.try_pop().is_some(), "first quote of a new session");
+        assert!(cons.try_pop_ref().is_some(), "first quote of a new session");
         assert_eq!(status.ticks_total(), 3);
     }
 
@@ -2560,18 +2560,25 @@ mod tests {
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"1", t0)));
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"2", t0 - 5_000)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(!cons.try_pop().expect("first quote").is_stale());
-        let late = cons.try_pop().expect("an unchanged quote that went stale is a tick");
+        assert!(!cons.try_pop_ref().expect("first quote").is_stale());
+        let late = *cons
+            .try_pop_ref()
+            .expect("an unchanged quote that went stale is a tick");
         assert!(late.is_stale());
         // The SAME touch fresh again: the tick that un-mutes the vm; the
         // next fresh republication is a duplicate again.
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"3", t0 + 20)));
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"4", t0 + 30)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        let healed = cons.try_pop().expect("the fresh republication of a stale quote is a tick");
+        let healed = *cons
+            .try_pop_ref()
+            .expect("the fresh republication of a stale quote is a tick");
         assert!(!healed.is_stale());
         assert_eq!(healed.bid_px.raw(), 1_000_000);
-        assert!(cons.try_pop().is_none(), "fresh and unchanged: still no tick");
+        assert!(
+            cons.try_pop_ref().is_none(),
+            "fresh and unchanged: still no tick"
+        );
         assert_eq!(status.msgs_total(), 4);
         assert_eq!(status.ticks_total(), 3);
         assert_eq!(status.stale_ticks_total(), 1);
@@ -2599,7 +2606,7 @@ mod tests {
             0,
         );
         let mut filled = 0usize;
-        while prod.try_push(filler).is_ok() {
+        while prod.try_push_ref(&filler) {
             filled += 1;
         }
         let t0: u64 = 1_789_897_517_479;
@@ -2609,14 +2616,16 @@ mod tests {
         // Room again; the venue republishes the SAME touch.
         let mut k = 0usize;
         while k < filled {
-            assert!(cons.try_pop().is_some());
+            assert!(cons.try_pop_ref().is_some());
             k += 1;
         }
         t.inject_incoming(&binary(&book_push(b"BTCUSDT", b"1", b"2", b"2", t0 + 10)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        let tick = cons.try_pop().expect("the dropped quote reaches the engine on its republication");
+        let tick = *cons
+            .try_pop_ref()
+            .expect("the dropped quote reaches the engine on its republication");
         assert_eq!(tick.sym, SYM_BTC);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         assert_eq!(status.ring_drops_total(), 1);
     }
 
@@ -2635,8 +2644,11 @@ mod tests {
         t.inject_incoming(&text(&depth(t0, 1)));
         t.inject_incoming(&text(&depth(t0 - 5_000, 2)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(!cons.try_pop().unwrap().is_stale());
-        assert!(!cons.try_pop().unwrap().is_stale(), "5 s under a 10 s threshold");
+        assert!(!cons.try_pop_ref().unwrap().is_stale());
+        assert!(
+            !cons.try_pop_ref().unwrap().is_stale(),
+            "5 s under a 10 s threshold"
+        );
         // Reconnect: a fresh offset; confirmations clear; seqs and the
         // funding seed survive.
         assert!(d.set_funding_seed(SYM_FBTC, 77, 8));
@@ -2651,7 +2663,10 @@ mod tests {
         d.subscribed = true;
         t.inject_incoming(&text(&depth(t0 - 60_000, 3)));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        assert!(!cons.try_pop().unwrap().is_stale(), "a reconnect starts a fresh offset");
+        assert!(
+            !cons.try_pop_ref().unwrap().is_stale(),
+            "a reconnect starts a fresh offset"
+        );
     }
 
     // ---- rejections ----------------------------------------------------

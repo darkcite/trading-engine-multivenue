@@ -210,14 +210,14 @@ fn binance_md_live_smoke() {
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(secs) {
         let mut idle = true;
-        while let Some(t) = tick_cons.try_pop() {
+        while let Some(t) = tick_cons.try_pop_ref().as_deref().copied() {
             idle = false;
             *ticks.entry(t.sym).or_default() += 1;
             if t.sym == spot_sym && t.flags & TICK_FLAG_VENUE_TIME_SENTINEL != 0 {
                 spot_inherited += 1;
             }
         }
-        while let Some(e) = ev_cons.try_pop() {
+        while let Some(e) = ev_cons.try_pop_ref().as_deref().copied() {
             idle = false;
             if e.channel == ChannelId::Funding as u8 {
                 let f = funding.entry(e.sym).or_default();
@@ -226,7 +226,7 @@ fn binance_md_live_smoke() {
                 f.2 = e.v1;
             }
         }
-        while let Some(o) = opt_cons.try_pop() {
+        while let Some(o) = opt_cons.try_pop_ref().as_deref().copied() {
             idle = false;
             let s = summaries.entry(o.sym).or_insert((0, o));
             s.0 += 1;

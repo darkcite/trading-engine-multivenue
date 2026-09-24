@@ -11,7 +11,7 @@
 //! ## Files (all under the per-run capture directory)
 //!
 //! * `<venue>-ticks.pmlr`   — [`SlotKind::Tick`] slots (BBO ticks,
-//!   captured **before** the ring `try_push`, so ring-dropped ticks are
+//!   captured **before** the ring `try_push_ref`, so ring-dropped ticks are
 //!   still visible to the offline audit).
 //! * `<venue>-events.pmlr`  — [`SlotKind::Event`] slots (all non-tick
 //!   channels: trades, books, mark, funding, ticker, ctx, …).

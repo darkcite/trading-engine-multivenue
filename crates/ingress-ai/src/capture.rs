@@ -57,7 +57,7 @@ impl AiCmdCapture {
     }
 
     /// Stage one accepted command (§4.4 step 6 — called BEFORE the
-    /// ring `try_push`, so ring-dropped commands remain auditable).
+    /// ring `try_push_ref`, so ring-dropped commands remain auditable).
     #[inline]
     pub fn append(&mut self, cmd: &AiCmd) {
         self.inner.append(cmd);

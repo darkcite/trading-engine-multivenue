@@ -674,7 +674,7 @@ fn emit_boot_rolls<C: Capture>(
         );
         capture.event(&ev);
         if event_mask & core_types::event_lane_bit(ChannelId::InstrumentRoll) != 0
-            && event_tx.try_push(ev).is_err()
+            && !event_tx.try_push_ref(&ev)
         {
             status.inc_event_ring_drops();
         }
@@ -789,7 +789,7 @@ fn perform_roll<C: Capture>(
     );
     capture.event(&ev);
     if event_mask & core_types::event_lane_bit(ChannelId::InstrumentRoll) != 0
-        && event_tx.try_push(ev).is_err()
+        && !event_tx.try_push_ref(&ev)
     {
         status.inc_event_ring_drops();
     }
@@ -1528,7 +1528,7 @@ fn handle_data_frame<C: Capture>(
                                             ChannelId::AssetCtx,
                                         )
                                         != 0
-                                        && event_tx.try_push(ev).is_err()
+                                        && !event_tx.try_push_ref(&ev)
                                     {
                                         status.inc_event_ring_drops();
                                     }
@@ -1555,7 +1555,7 @@ fn handle_data_frame<C: Capture>(
                                     if event_mask
                                         & core_types::event_lane_bit(ChannelId::Mark)
                                         != 0
-                                        && event_tx.try_push(mk).is_err()
+                                        && !event_tx.try_push_ref(&mk)
                                     {
                                         status.inc_event_ring_drops();
                                     }
@@ -1664,7 +1664,7 @@ fn handle_data_frame<C: Capture>(
             // counts with ring_drops_total).
             capture.tick(&tick);
             // D4: a full ring is data loss — count it, never block.
-            if producer.try_push(tick).is_err() {
+            if !producer.try_push_ref(&tick) {
                 status.inc_ring_drops();
             }
         }
@@ -1686,7 +1686,7 @@ fn handle_data_frame<C: Capture>(
                 }
                 status.set_feed_delay_ema_ms(drv.feed_clock.delay_ema_ms());
                 capture.tick(&tick);
-                if producer.try_push(tick).is_err() {
+                if !producer.try_push_ref(&tick) {
                     status.inc_ring_drops();
                 }
             }
@@ -2276,7 +2276,7 @@ mod tests {
         assert_eq!(status.msgs_total(), 1);
         assert_eq!(status.ring_drops_total(), 0);
 
-        let tick = cons.try_pop().expect("tick must be pushed");
+        let tick = *cons.try_pop_ref().expect("tick must be pushed");
         assert_eq!(tick.sym, SYM_BTC);
         assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
         // venue_seq = time (ms) truncated to u32 (crate-header policy).
@@ -2305,7 +2305,7 @@ mod tests {
         );
         inject_text(t, s.as_bytes());
         drive_one(t, d, b"h", b"/", prod, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("bbo must produce a tick")
+        *cons.try_pop_ref().expect("bbo must produce a tick")
     }
 
     #[test]
@@ -2390,7 +2390,7 @@ mod tests {
         assert_eq!(snap.bids[1], DepthLevel { px_1e6: 490_000, qty_1e6: 64_000_000 });
         assert_eq!(snap.asks[1], DepthLevel { px_1e6: 700_000, qty_1e6: 69_000_000 });
         assert_eq!(snap.bids[2], DepthLevel::EMPTY);
-        assert!(cons.try_pop().is_some(), "the touch tick still flows");
+        assert!(cons.try_pop_ref().is_some(), "the touch tick still flows");
 
         // The same book 5.3 s later: a new venue time, nothing moved —
         // no depth row.
@@ -2418,7 +2418,7 @@ mod tests {
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert_eq!(cap.depths, 3);
         assert_eq!(status.parse_errors_total(), 0);
-        while cons.try_pop().is_some() {}
+        while cons.try_pop_ref().is_some() {}
     }
 
     #[test]
@@ -2442,7 +2442,9 @@ mod tests {
             &mut NullCapture,
         )
         .unwrap();
-        let tick = cons.try_pop().expect("HIP-4 tick must flow the same path");
+        let tick = *cons
+            .try_pop_ref()
+            .expect("HIP-4 tick must flow the same path");
         assert_eq!(tick.sym, SYM_HIP4);
         assert_eq!(tick.venue, VenueId::Hyperliquid as u8);
         assert_eq!(tick.bid_px.raw(), 400_000);
@@ -2474,7 +2476,7 @@ mod tests {
         );
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert!(
-            cons.try_pop().is_none(),
+            cons.try_pop_ref().is_none(),
             "a one-sided outcome touch must never reach the ring"
         );
 
@@ -2483,8 +2485,19 @@ mod tests {
             &mut t,
             br##"{"channel":"l2Book","data":{"coin":"#330","time":1789252941096,"levels":[[{"px":"0.5","sz":"64.0","n":1},{"px":"0.49","sz":"64.0","n":1}],[{"px":"0.69","sz":"69.0","n":1},{"px":"0.7","sz":"69.0","n":1}]]}}"##,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
-        let tick = cons.try_pop().expect("l2Book must yield the outcome touch");
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let tick = *cons
+            .try_pop_ref()
+            .expect("l2Book must yield the outcome touch");
         assert_eq!(tick.sym, SYM_HIP4);
         assert_eq!(tick.bid_px.raw(), 500_000);
         assert_eq!(tick.ask_px.raw(), 690_000, "the ask the bbo dropped");
@@ -2499,7 +2512,7 @@ mod tests {
         );
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
         assert!(
-            cons.try_pop().is_none(),
+            cons.try_pop_ref().is_none(),
             "a perp's touch still comes from bbo alone"
         );
 
@@ -2510,8 +2523,19 @@ mod tests {
             &mut t,
             br##"{"channel":"bbo","data":{"coin":"#330","time":1789252950000,"bbo":[{"px":"0.51","sz":"10.0","n":1},{"px":"0.68","sz":"11.0","n":1}]}}"##,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
-        let tick = cons.try_pop().expect("a two-sided outcome bbo is still a tick");
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let tick = *cons
+            .try_pop_ref()
+            .expect("a two-sided outcome bbo is still a tick");
         assert_eq!(tick.bid_px.raw(), 510_000);
         assert_eq!(tick.ask_px.raw(), 680_000);
     }
@@ -2665,19 +2689,16 @@ mod tests {
         );
         assert_eq!(status.parse_errors_total(), 2);
         // Tick still captured when the ring is full: fill it, resend.
-        while prod
-            .try_push(Tick::new(
-                1,
-                VenueId::Hyperliquid,
-                SYM_BTC,
-                1,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                Price::from_raw(2),
-                Qty::from_raw(1),
-            ))
-            .is_ok()
-        {}
+        while prod.try_push_ref(&Tick::new(
+            1,
+            VenueId::Hyperliquid,
+            SYM_BTC,
+            1,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        )) {}
         inject_text(
             &mut t,
             br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398624,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#,
@@ -2802,8 +2823,8 @@ mod tests {
         assert_eq!((outcome, twap_s, family, settled), (2649, 60, 0, false));
         assert_eq!(ev.v0, 77_177_000_000, "strike ×1e6");
         assert_eq!(ev.v1 as u64, spec.expiry_ns, "expiry ns");
-        assert!(erx.try_pop().is_some(), "and it rode the event ring");
-        assert!(erx.try_pop().is_none());
+        assert!(erx.try_pop_ref().is_some(), "and it rode the event ring");
+        assert!(erx.try_pop_ref().is_none());
 
         // Once per process: a second Steady (reconnect) announces nothing.
         emit_boot_rolls(&mut d, &mut etx, mask, &status, &mut cap);
@@ -2837,7 +2858,7 @@ mod tests {
         .unwrap();
         assert_eq!(status.parse_errors_total(), 1);
         assert_eq!(status.msgs_total(), 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
     }
 
     #[test]

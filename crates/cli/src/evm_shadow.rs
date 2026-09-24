@@ -202,10 +202,10 @@ impl ShadowTap {
             let slot = &log[(seq % HYPARB_DECISION_LOG as u64) as usize];
             if slot.seq == seq {
                 self.status.add(ctr::DECISIONS, 1);
-                // COPY: one 48 B POD by value into its ring slot — the
-                // designed ring-slot publish; the shadow thread owns the
-                // slot's copy — rejected: none (the log is overwritten).
-                if self.prod.try_push(*slot).is_err() {
+                // COPY: one 48 B POD, log row → ring slot, the only copy —
+                // the designed ring-slot publish; the shadow thread owns
+                // the slot's copy — rejected: none (the log is overwritten).
+                if !self.prod.try_push_ref(slot) {
                     self.status.add(ctr::DROPPED, 1);
                 }
             } else {
@@ -373,19 +373,23 @@ impl ShadowWorker {
         // One swap in flight (wallet 0 only, R4). While it is busy the
         // ring collapses to its newest decision; when it is free, the
         // pending one (or the next) is sent.
+        //
+        // A decision leaves its slot by value (48 B): `send` needs the
+        // whole shadow, so a slot cannot stay lent across it, and a
+        // collapsed `pending` decision must outlive the slot it came from.
         if self.arm.nonces().state(SWAP_WALLET) == WalletState::Ready {
             let next = match self.pending.take() {
                 Some(d) => Some(d),
-                None => self.cons.try_pop(),
+                None => self.cons.try_pop_ref().as_deref().copied(),
             };
             if let Some(d) = next {
                 worked = true;
                 self.send(&d, now);
             }
         } else {
-            while let Some(d) = self.cons.try_pop() {
+            while let Some(d) = self.cons.try_pop_ref() {
                 worked = true;
-                if self.pending.replace(d).is_some() {
+                if self.pending.replace(*d).is_some() {
                     self.status.add(ctr::SUPERSEDED, 1);
                 }
             }
@@ -554,8 +558,9 @@ mod tests {
         tap.drain(&log);
         tap.drain(&log);
         assert_eq!(st.counter(ctr::DECISIONS), 2, "each once");
+        let first = cons.try_pop_ref().map(|d| d.seq);
         assert_eq!(
-            (cons.try_pop().map(|d| d.seq), cons.try_pop().map(|d| d.seq)),
+            (first, cons.try_pop_ref().map(|d| d.seq)),
             (Some(1), Some(2))
         );
         // 100 more before the next read: the member's ring kept the
@@ -570,7 +575,11 @@ mod tests {
             (st.counter(ctr::LOST), st.counter(ctr::DECISIONS)),
             (36, 66)
         );
-        assert_eq!(cons.try_pop().map(|d| d.seq), Some(39), "oldest kept first");
+        assert_eq!(
+            cons.try_pop_ref().map(|d| d.seq),
+            Some(39),
+            "oldest kept first"
+        );
         // A slot whose seq is not the one read for is a loss too.
         log.ring[104 % HYPARB_DECISION_LOG].seq = 0;
         log.newest = 104;

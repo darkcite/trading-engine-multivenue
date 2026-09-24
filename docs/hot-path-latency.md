@@ -34,6 +34,13 @@ The first three sit on the *engine* hot path. The last two sit on the *dispatche
 | Strategy callback (no fire) | `strategy/latency_arb_on_tick_no_fire` | 1.7 ns | 1.7 ns | Optimal |
 | **Signer (off-engine)** | `signer/sign_order_full` | **22.7 µs** | **24.5 µs** | **Hot — Secp256k1 ctx rebuild dominates** |
 
+**ZC pass A (2026-09-24).** The ring bench is now `ring/push_ref_pop_ref_tick`:
+core-ring copies a `Tick` once into its slot (`try_push_ref`) and lends it in
+place (`try_pop_ref`); the by-value `ring/push_pop_tick` above went with that
+API. Measured side by side on the Apple M4 Pro before the deletion — by-value
+5.68 ns, in place 2.53 ns; the numbers, the two-thread benches and the
+round-trip trade-off are in `docs/risk-policy.md` "ZC pass A".
+
 ### What is *not* measured
 
 - End-to-end engine tick batch cost under realistic burst — limited by disk space for the larger criterion harness; the per-stage adds suggest a 256-tick batch at steady state would be ~512 ns of strategy/book + ~1.4 µs of ring drains + ~50 ns latency recording = O(2 µs) total CPU per drain.

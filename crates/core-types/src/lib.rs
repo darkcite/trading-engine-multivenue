@@ -2020,8 +2020,8 @@ impl AiCmd {
     /// offsets in the rx buffer, so a 64-alignment-free view is
     /// impossible; this is the **one documented copy** that materializes
     /// the slot onto the stack (a handful of vector moves). The
-    /// subsequent ring `try_push` copy is ownership transfer, identical
-    /// to every other ingress.
+    /// subsequent `try_push_ref` copy into the ring slot is the ring
+    /// publish, identical to every other ingress.
     #[inline(always)]
     pub fn read_le(bytes: &[u8; 64]) -> Self {
         // SAFETY: the source is a valid, initialized 64-byte buffer;
@@ -2369,7 +2369,7 @@ impl AiCmd {
 /// capture, never the market-data session (the impl owns its error
 /// policy and surfaces loss through counters).
 pub trait Capture {
-    /// One parsed BBO tick (called before the ring `try_push`, so
+    /// One parsed BBO tick (called before the ring `try_push_ref`, so
     /// ring-dropped ticks are still captured — the offline audit
     /// compares capture counts against `ring_drops_total`).
     #[inline(always)]

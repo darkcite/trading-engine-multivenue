@@ -660,7 +660,7 @@ fn judge_and_push_tick<C: Capture>(
     // reach the replay log (the audit pairs capture counts with
     // ring_drops_total).
     capture.tick(&tick);
-    if producer.try_push(tick).is_err() {
+    if !producer.try_push_ref(&tick) {
         status.inc_ring_drops();
     }
 }
@@ -1207,14 +1207,16 @@ mod tests {
         )
         .unwrap();
 
-        let tick = cons.try_pop().expect("book tick must be pushed");
+        let tick = *cons.try_pop_ref().expect("book tick must be pushed");
         assert_eq!(tick.sym, 42);
         // Worst→best ordering: top-of-book is the LAST level.
         assert_eq!(tick.bid_px.raw(), 518_000);
         assert_eq!(tick.bid_qty.raw(), 100_000_000);
         assert_eq!(tick.ask_px.raw(), 520_000);
         assert_eq!(tick.ask_qty.raw(), 50_000_000);
-        let tick2 = cons.try_pop().expect("price_change tick must be pushed");
+        let tick2 = *cons
+            .try_pop_ref()
+            .expect("price_change tick must be pushed");
         assert_eq!(tick2.sym, 42);
         assert_eq!(tick2.bid_px.raw(), 519_000);
         assert_eq!(
@@ -1236,7 +1238,7 @@ mod tests {
         assert!(!tick.is_stale());
         assert!(!tick2.is_stale());
         assert_eq!(status.stale_ticks_total(), 0);
-        assert!(cons.try_pop().is_none());
+        assert!(cons.try_pop_ref().is_none());
         // §6.4 accounting: two parsed+dispatched messages, frame bytes
         // counted, nothing rejected, nothing dropped.
         assert_eq!(status.msgs_total(), 2);
@@ -1262,7 +1264,7 @@ mod tests {
         );
         inject_unmasked_text(t, s.as_bytes());
         drive_one(t, d, b"host", b"/", prod, map, status, &mut NullCapture).unwrap();
-        cons.try_pop().expect("book must produce a tick")
+        *cons.try_pop_ref().expect("book must produce a tick")
     }
 
     #[test]
@@ -1427,7 +1429,7 @@ mod tests {
             core_types::Price::from_raw(2),
             core_types::Qty::from_raw(1),
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         let good = br#"[{"market":"0x1","asset_id":"0xABC","timestamp":"1713000000000","hash":"h","bids":[{"price":"0.518","size":"100.0"}],"asks":[{"price":"0.520","size":"50.0"}],"event_type":"book"}]"#;
         inject_unmasked_text(&mut t, good);
         drive_one(
@@ -1655,7 +1657,7 @@ mod tests {
             core_types::Price::from_raw(2),
             core_types::Qty::from_raw(1),
         );
-        while prod.try_push(filler).is_ok() {}
+        while prod.try_push_ref(&filler) {}
         inject_unmasked_text(&mut t, good);
         drive_one(
             &mut t, &mut d, b"host", b"/", &mut prod, &map, &status, &mut cap,

@@ -12,7 +12,7 @@
 //! consumer field + drain arm per venue, the engine owns **lane
 //! arrays** indexed by `VenueId` — five tick lanes and four fill
 //! lanes. Unspawned venues hand the engine a permanently-empty ring
-//! (a `try_pop() → None` is two atomic loads — negligible), which
+//! (a `try_pop_ref() → None` is two atomic loads — negligible), which
 //! makes venues 4..N mechanical instead of structural.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -239,11 +239,12 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Ruleset table-handoff lane (Phase 8g §6, item 7). Sole
     /// consumer of the `Ring<RuleTableSlot, 2>` the ingress-ai side
     /// path pushes validated tables into at Stage time. Popped
-    /// IMMEDIATELY before the AI-cmd drain each iteration and handed
-    /// to `Strategy::on_ruleset_table` (→ the set's vm member —
-    /// documented copy #2). When `ingress-ai` is not spawned the
-    /// producer half is dropped and this lane reads empty forever
-    /// (§3.3 pattern — one acquire load per iteration).
+    /// IMMEDIATELY before the AI-cmd drain each iteration and read in
+    /// its slot by `Strategy::on_ruleset_table` (→ the set's vm
+    /// member, whose copy into its staged buffer is documented copy
+    /// #2). When `ingress-ai` is not spawned the producer half is
+    /// dropped and this lane reads empty forever (§3.3 pattern — one
+    /// acquire load per iteration).
     table_cons: Consumer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     /// AI commands dispatched to `Strategy::on_ai` (post TTL + shape
     /// checks). Read by paper-mode stats and tests.
@@ -425,6 +426,16 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// `ctx.submit` samples the `now - order.ts_ns` gap into the
     /// `decide_lat` tracker via [`EngineCtx::submit`]. Both record
     /// paths are zero-alloc.
+    ///
+    /// **Read in place (ZC pass A).** Every lane drains with
+    /// `try_pop_ref`: the item is read in its ring slot through the
+    /// `Popped` guard, and the slot goes back to its producer when the
+    /// guard drops at the end of the arm. The one copy out of a slot is
+    /// the fill lanes' 64 B store into the `/state` recent-fills ring,
+    /// whose history outlives the slot. The guard borrows one lane of
+    /// `self`, so an arm reaches everything else field by field, and the
+    /// two helpers the arms share are associated fns over the fields
+    /// they touch.
     #[inline]
     pub fn tick(&mut self, max_per_ring: usize) -> usize {
         self.iterations = self.iterations.wrapping_add(1);
@@ -454,12 +465,17 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while lane < NUM_TICK_LANES {
             let mut i = 0;
             while i < max_per_ring {
-                match self.tick_lanes[lane].try_pop() {
+                match self.tick_lanes[lane].try_pop_ref() {
                     Some(t) => {
                         consumed += 1;
                         let now = now_ns();
                         self.ingest_lat.record(now.saturating_sub(t.ts_ns));
-                        self.touch_sym_bucket(t.sym, now);
+                        Self::touch_sym_bucket(
+                            &mut self.sym_populated,
+                            &mut self.last_tick_ns_per_sym,
+                            t.sym,
+                            now,
+                        );
                         // X1: the dispatcher sees the tick FIRST, so a
                         // PAPER one can judge its open orders against
                         // it (`core_fill` — the harness's own law). A
@@ -497,27 +513,51 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         // --- signals ---
         let mut i = 0;
         while i < max_per_ring {
-            match self.sig_cons.try_pop() {
+            match self.sig_cons.try_pop_ref() {
                 Some(s) => {
                     consumed += 1;
-                    self.dispatch_signal(&s);
+                    let mut ctx = EngineCtx {
+                        disp: &mut self.disp,
+                        decide_lat: &self.decide_lat,
+                        order_capture: self.order_capture.as_mut(),
+                        recent_orders: &mut self.recent_orders,
+                        lifecycle: &mut self.lifecycle,
+                        now: now_ns(),
+                    };
+                    Self::dispatch_signal(
+                        &s,
+                        &mut self.strat,
+                        &self.ingest_lat,
+                        &mut self.signals_dispatched,
+                        &mut ctx,
+                    );
                 }
                 None => break,
             }
             i += 1;
         }
         // --- pool events (HYPARB H3b) ---
-        if self.pool_cons.is_some() {
+        if let Some(pool) = self.pool_cons.as_mut() {
             let mut i = 0;
             while i < max_per_ring {
-                let popped = match self.pool_cons.as_mut() {
-                    Some(c) => c.try_pop(),
-                    None => None,
-                };
-                match popped {
+                match pool.try_pop_ref() {
                     Some(s) => {
                         consumed += 1;
-                        self.dispatch_signal(&s);
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
+                            now: now_ns(),
+                        };
+                        Self::dispatch_signal(
+                            &s,
+                            &mut self.strat,
+                            &self.ingest_lat,
+                            &mut self.signals_dispatched,
+                            &mut ctx,
+                        );
                     }
                     None => break,
                 }
@@ -530,7 +570,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while lane < NUM_FILL_LANES {
             let mut i = 0;
             while i < max_per_ring {
-                match self.fill_lanes[lane].try_pop() {
+                match self.fill_lanes[lane].try_pop_ref() {
                     Some(f) => {
                         consumed += 1;
                         let now = now_ns();
@@ -541,7 +581,9 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         if let Some(cap) = self.fill_capture.as_mut() {
                             cap.append(&f);
                         }
-                        self.recent_fills.push(f);
+                        // The history keeps its own 64 B copy: it
+                        // outlives the slot.
+                        self.recent_fills.push(*f);
                         // E6: THE DISPATCHER FIRST, for the reason the
                         // venue-event drain below carries. A member
                         // handed a fill may submit in the same call,
@@ -626,7 +668,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while lane < NUM_EVENT_LANES {
             let mut i = 0;
             while i < max_per_ring {
-                match self.event_lanes[lane].try_pop() {
+                match self.event_lanes[lane].try_pop_ref() {
                     Some(e) => {
                         consumed += 1;
                         let now = now_ns();
@@ -667,7 +709,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while lane < NUM_DEPTH_LANES {
             let mut i = 0;
             while i < max_per_ring {
-                match self.depth_lanes[lane].try_pop() {
+                match self.depth_lanes[lane].try_pop_ref() {
                     Some(d) => {
                         consumed += 1;
                         let now = now_ns();
@@ -698,7 +740,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         while lane < NUM_OPT_LANES {
             let mut i = 0;
             while i < max_per_ring {
-                match self.opt_lanes[lane].try_pop() {
+                match self.opt_lanes[lane].try_pop_ref() {
                     Some(o) => {
                         consumed += 1;
                         let now = now_ns();
@@ -731,10 +773,10 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         // `VmStrategy::receive_table` overwrites). The while-let is
         // bounded by construction (RULE_TABLE_RING_SLOTS = 2); an
         // empty lane costs one acquire load (§3.3 unspawned shape).
-        // The pop moves the 16 KiB slot by value into the callee —
-        // that is documented copy #2 (§6), operator cadence, bytes
-        // not heap.
-        while let Some(t) = self.table_cons.try_pop() {
+        // The ~32 KiB table is read in its slot; the one copy is the
+        // member's, slot → its staged buffer (documented copy #2, §6),
+        // operator cadence, bytes not heap.
+        while let Some(t) = self.table_cons.try_pop_ref() {
             // The loop's "did we do work" answer is `consumed`; the
             // member's own `table_epoch` is the operator-facing count
             // of tables it took, so no second counter lives here (a
@@ -751,7 +793,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         // `max_per_ring` — see the constant's docs.
         let mut i = 0;
         while i < AI_DRAIN_BUDGET {
-            match self.ai_cons.try_pop() {
+            match self.ai_cons.try_pop_ref() {
                 Some(cmd) => {
                     consumed += 1;
                     // Per-item clock sample (E-2 pattern): TTL
@@ -878,14 +920,23 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// Touch the per-symbol last-tick bucket. Zero-alloc. The venue
     /// byte is mixed into the bucket index (Phase 8a §3.1) so two
     /// venues' ordinal-0 symbols do not collide on low bits.
+    ///
+    /// Over the two fields, not `&mut self`: the tick is read in its
+    /// ring slot, and the slot guard borrows a lane of the engine while
+    /// this runs.
     #[inline(always)]
-    fn touch_sym_bucket(&mut self, sym: core_types::SymbolId, now: NsTs) {
+    fn touch_sym_bucket(
+        sym_populated: &mut u64,
+        last_tick_ns_per_sym: &mut [u64; SYM_BUCKETS],
+        sym: core_types::SymbolId,
+        now: NsTs,
+    ) {
         let bucket = (core_types::symbol_bucket_mix(sym) as usize) & (SYM_BUCKETS - 1);
         // Bit `bucket` flagged in `sym_populated` so
         // `max_tick_age_ns` only inspects buckets we've actually
         // touched.
-        self.sym_populated |= 1u64 << bucket;
-        self.last_tick_ns_per_sym[bucket] = now;
+        *sym_populated |= 1u64 << bucket;
+        last_tick_ns_per_sym[bucket] = now;
     }
 
     /// Maximum tick age across every populated symbol bucket, in
@@ -959,24 +1010,25 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// dispatcher's pool hook (HYPARB H2 — a pool event reaches the
     /// dispatcher FIRST, exactly as a tick does: a PAPER one keeps pool
     /// state and judges its AMM swaps on each head, a live one does
-    /// nothing), then the member.
+    /// nothing), then the member. `ctx.now` is the pop-time clock.
+    ///
+    /// Over the fields it touches, not `&mut self`: the signal is read
+    /// in its ring slot, and the slot guard borrows a lane of the engine
+    /// while this runs.
     #[inline(always)]
-    fn dispatch_signal(&mut self, s: &Signal) {
-        let now = now_ns();
-        self.ingest_lat.record(now.saturating_sub(s.ts_ns));
+    fn dispatch_signal(
+        s: &Signal,
+        strat: &mut S,
+        ingest_lat: &LatencyTracker<24>,
+        signals_dispatched: &mut u64,
+        ctx: &mut EngineCtx<'_, D>,
+    ) {
+        ingest_lat.record(ctx.now.saturating_sub(s.ts_ns));
         if s.source == SignalSource::HyperEvm as u8 {
-            self.disp.observe_amm(s.sym, &s.payload, now);
+            ctx.disp.observe_amm(s.sym, &s.payload, ctx.now);
         }
-        let mut ctx = EngineCtx {
-            disp: &mut self.disp,
-            decide_lat: &self.decide_lat,
-            order_capture: self.order_capture.as_mut(),
-            recent_orders: &mut self.recent_orders,
-            lifecycle: &mut self.lifecycle,
-            now,
-        };
-        self.strat.on_signal(s, &mut ctx);
-        self.signals_dispatched = self.signals_dispatched.wrapping_add(1);
+        strat.on_signal(s, ctx);
+        *signals_dispatched = signals_dispatched.wrapping_add(1);
     }
 
     /// HYPARB H3b: attach the pool-event lane (boot-only, before
@@ -1553,9 +1605,11 @@ mod tests {
         let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..3u32 {
-            tp[VenueId::Polymarket as usize]
-                .try_push(mk_tick(VenueId::Polymarket, 1, i + 1))
-                .unwrap();
+            assert!(tp[VenueId::Polymarket as usize].try_push_ref(&mk_tick(
+                VenueId::Polymarket,
+                1,
+                i + 1
+            )));
         }
         eng.tick(16);
         assert_eq!(eng.iterations, 1);
@@ -1576,9 +1630,7 @@ mod tests {
         let mut i = 0;
         while i < venues.len() {
             let v = venues[i];
-            tp[v as usize]
-                .try_push(mk_tick(v, core_types::make_symbol_id(v, 1), 1))
-                .unwrap();
+            assert!(tp[v as usize].try_push_ref(&mk_tick(v, core_types::make_symbol_id(v, 1), 1)));
             i += 1;
         }
         eng.tick(16);
@@ -1590,10 +1642,8 @@ mod tests {
         let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         for i in 0..10u32 {
-            tp[0]
-                .try_push(mk_tick(VenueId::Polymarket, 1, i + 1))
-                .unwrap();
-            tp[2].try_push(mk_tick(VenueId::Okx, 2, i + 1)).unwrap();
+            assert!(tp[0].try_push_ref(&mk_tick(VenueId::Polymarket, 1, i + 1)));
+            assert!(tp[2].try_push_ref(&mk_tick(VenueId::Okx, 2, i + 1)));
         }
         eng.tick(3);
         // 3 drained per lane on this iteration; the rest stay queued.
@@ -1668,21 +1718,19 @@ mod tests {
         eng.start().unwrap();
         assert_eq!(eng.tick(16), 0, "an empty engine dispatched nothing");
 
-        tp[VenueId::Polymarket as usize]
-            .try_push(Tick::new(
-                1,
-                VenueId::Polymarket,
-                7,
-                0,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                Price::from_raw(2),
-                Qty::from_raw(1),
-            ))
-            .unwrap();
+        assert!(tp[VenueId::Polymarket as usize].try_push_ref(&Tick::new(
+            1,
+            VenueId::Polymarket,
+            7,
+            0,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        )));
         let f = Fill::new(10, 7, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
-        fp[0].try_push(f).unwrap();
-        fp[3].try_push(f).unwrap();
+        assert!(fp[0].try_push_ref(&f));
+        assert!(fp[3].try_push_ref(&f));
         assert_eq!(eng.tick(16), 3, "one tick and two fills");
         assert_eq!(eng.tick(16), 0, "and the rings are empty again");
     }
@@ -1733,48 +1781,51 @@ mod tests {
         // the expectation cannot silently drift from what was pushed.
         let mut pushed = 0usize;
 
-        tp[VenueId::Polymarket as usize]
-            .try_push(Tick::new(
-                1,
-                VenueId::Polymarket,
-                7,
-                0,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                Price::from_raw(2),
-                Qty::from_raw(1),
+        assert!(tp[VenueId::Polymarket as usize].try_push_ref(&Tick::new(
+            1,
+            VenueId::Polymarket,
+            7,
+            0,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            Price::from_raw(2),
+            Qty::from_raw(1),
+        )));
+        pushed += 1;
+
+        assert!(sp.try_push_ref(&Signal::new(
+            2,
+            7,
+            core_types::LatencyClass::Hot,
+            0,
+            [0u8; 40]
+        )));
+        pushed += 1;
+
+        assert!(fp[0].try_push_ref(&Fill::new(
+            10,
+            7,
+            Side::Bid,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            99,
+        )));
+        pushed += 1;
+
+        assert!(
+            ep[tick_lane_of(VenueId::Hyperliquid).unwrap()].try_push_ref(&mk_funding_event(
+                VenueId::Hyperliquid,
+                9,
+                10
             ))
-            .unwrap();
+        );
         pushed += 1;
 
-        sp.try_push(Signal::new(2, 7, core_types::LatencyClass::Hot, 0, [0u8; 40]))
-            .unwrap();
+        assert!(dp[depth_lane_of(VenueId::Okx).unwrap()].try_push_ref(&DepthTopK::EMPTY));
         pushed += 1;
 
-        fp[0]
-            .try_push(Fill::new(
-                10,
-                7,
-                Side::Bid,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                99,
-            ))
-            .unwrap();
-        pushed += 1;
-
-        ep[tick_lane_of(VenueId::Hyperliquid).unwrap()]
-            .try_push(mk_funding_event(VenueId::Hyperliquid, 9, 10))
-            .unwrap();
-        pushed += 1;
-
-        dp[depth_lane_of(VenueId::Okx).unwrap()]
-            .try_push(DepthTopK::EMPTY)
-            .unwrap();
-        pushed += 1;
-
-        op[opt_lane_of(VenueId::Okx).unwrap()]
-            .try_push(OptSummary::new(
+        assert!(
+            op[opt_lane_of(VenueId::Okx).unwrap()].try_push_ref(&OptSummary::new(
                 3,
                 VenueId::Okx,
                 7,
@@ -1788,13 +1839,13 @@ mod tests {
                 1,
                 1,
             ))
-            .unwrap();
+        );
         pushed += 1;
 
-        assert!(tblp.try_push(mk_table(1)).is_ok());
+        assert!(tblp.try_push_ref(&mk_table(1)));
         pushed += 1;
 
-        ap.try_push(AiCmd::new(
+        assert!(ap.try_push_ref(&AiCmd::new(
             4,
             1,
             7,
@@ -1807,8 +1858,7 @@ mod tests {
             0,
             0,
             0,
-        ))
-        .unwrap();
+        )));
         pushed += 1;
 
         assert_eq!(
@@ -1853,8 +1903,8 @@ mod tests {
         let (mut eng, _tp, _ep, _sp, mut fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
         let f = Fill::new(10, 7, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
-        fp[0].try_push(f).unwrap(); // Polymarket fill lane
-        fp[3].try_push(f).unwrap(); // Hyperliquid fill lane
+        assert!(fp[0].try_push_ref(&f)); // Polymarket fill lane
+        assert!(fp[3].try_push_ref(&f)); // Hyperliquid fill lane
         eng.tick(16);
         assert_eq!(eng.fills_dispatched, 2);
         assert_eq!(eng.strategy().fills, 2);
@@ -1880,21 +1930,17 @@ mod tests {
         eng.start().unwrap();
         // One funding event per producing venue (lane indices per
         // tick_lane_of: okx 2, deribit 3, bn 1, bybit 5, mexc 6).
-        ep[2]
-            .try_push(mk_funding_event(VenueId::Okx, 7, 125))
-            .unwrap();
-        ep[3]
-            .try_push(mk_funding_event(VenueId::Deribit, 8, -50))
-            .unwrap();
-        ep[1]
-            .try_push(mk_funding_event(VenueId::Binance, 9, 10))
-            .unwrap();
-        ep[5]
-            .try_push(mk_funding_event(VenueId::Bybit, 10, 99))
-            .unwrap();
-        ep[tick_lane_of(VenueId::Mexc).unwrap()]
-            .try_push(mk_funding_event(VenueId::Mexc, 11, 77))
-            .unwrap();
+        assert!(ep[2].try_push_ref(&mk_funding_event(VenueId::Okx, 7, 125)));
+        assert!(ep[3].try_push_ref(&mk_funding_event(VenueId::Deribit, 8, -50)));
+        assert!(ep[1].try_push_ref(&mk_funding_event(VenueId::Binance, 9, 10)));
+        assert!(ep[5].try_push_ref(&mk_funding_event(VenueId::Bybit, 10, 99)));
+        assert!(
+            ep[tick_lane_of(VenueId::Mexc).unwrap()].try_push_ref(&mk_funding_event(
+                VenueId::Mexc,
+                11,
+                77
+            ))
+        );
         eng.tick(16);
         assert_eq!(eng.events_dispatched, 5, "one event per producing lane");
         assert_eq!(eng.strategy().events, 5);
@@ -1915,9 +1961,7 @@ mod tests {
         assert_eq!(eng.events_dispatched, 0);
         // Budget: 10 queued on one lane, budget 3 → 3 per iteration.
         for i in 0..10 {
-            ep[2]
-                .try_push(mk_funding_event(VenueId::Okx, 7, i as i64))
-                .unwrap();
+            assert!(ep[2].try_push_ref(&mk_funding_event(VenueId::Okx, 7, i as i64)));
         }
         eng.tick(3);
         assert_eq!(eng.events_dispatched, 3, "budget caps one iteration");
@@ -1969,12 +2013,8 @@ mod tests {
             [core_types::DepthLevel::EMPTY; core_types::DEPTH_K],
         );
         // Lane map: OKX = 0, Deribit = 1 (depth_lane_of).
-        dp[depth_lane_of(VenueId::Okx).unwrap()]
-            .try_push(d_okx)
-            .unwrap();
-        dp[depth_lane_of(VenueId::Deribit).unwrap()]
-            .try_push(DepthTopK::EMPTY)
-            .unwrap();
+        assert!(dp[depth_lane_of(VenueId::Okx).unwrap()].try_push_ref(&d_okx));
+        assert!(dp[depth_lane_of(VenueId::Deribit).unwrap()].try_push_ref(&DepthTopK::EMPTY));
         eng.tick(16);
         assert_eq!(eng.depths_dispatched, 2, "one per depth lane");
         assert_eq!(eng.strategy().depths, 2);
@@ -2055,10 +2095,8 @@ mod tests {
             -5,
         );
         // Lane map: OKX = 0, Deribit = 1, Binance = 2 (opt_lane_of).
-        op[opt_lane_of(VenueId::Okx).unwrap()].try_push(o_okx).unwrap();
-        op[opt_lane_of(VenueId::Deribit).unwrap()]
-            .try_push(o_dbt)
-            .unwrap();
+        assert!(op[opt_lane_of(VenueId::Okx).unwrap()].try_push_ref(&o_okx));
+        assert!(op[opt_lane_of(VenueId::Deribit).unwrap()].try_push_ref(&o_dbt));
         eng.tick(16);
         assert_eq!(eng.opts_dispatched, 2, "one per populated opt lane");
         assert_eq!(eng.strategy().opts, 2);
@@ -2073,7 +2111,7 @@ mod tests {
         for i in 0..10 {
             let mut o = o_okx;
             o.ts_ns = 10 + i;
-            op[0].try_push(o).unwrap();
+            assert!(op[0].try_push_ref(&o));
         }
         eng.tick(3);
         assert_eq!(eng.opts_dispatched, 5, "budget caps one iteration");
@@ -2200,8 +2238,8 @@ mod tests {
     fn max_tick_age_tracks_freshest_per_bucket() {
         let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
-        tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
-        tp[0].try_push(mk_tick(VenueId::Polymarket, 11, 1)).unwrap();
+        assert!(tp[0].try_push_ref(&mk_tick(VenueId::Polymarket, 7, 1)));
+        assert!(tp[0].try_push_ref(&mk_tick(VenueId::Polymarket, 11, 1)));
         eng.tick(16);
         // Two distinct symbols → two populated buckets (no mix
         // collision for venue-0 syms 7 and 11).
@@ -2220,8 +2258,8 @@ mod tests {
         eng.start().unwrap();
         let pm = core_types::make_symbol_id(VenueId::Polymarket, 0);
         let okx = core_types::make_symbol_id(VenueId::Okx, 0);
-        tp[0].try_push(mk_tick(VenueId::Polymarket, pm, 1)).unwrap();
-        tp[2].try_push(mk_tick(VenueId::Okx, okx, 1)).unwrap();
+        assert!(tp[0].try_push_ref(&mk_tick(VenueId::Polymarket, pm, 1)));
+        assert!(tp[2].try_push_ref(&mk_tick(VenueId::Okx, okx, 1)));
         eng.tick(16);
         assert_eq!(eng.populated_sym_count(), 2);
     }
@@ -2275,16 +2313,14 @@ mod tests {
         eng.start().unwrap();
 
         // Fill-lane source: one Polymarket fill.
-        fp[0]
-            .try_push(Fill::new(
-                10,
-                7,
-                Side::Bid,
-                Price::from_raw(1),
-                Qty::from_raw(1),
-                99,
-            ))
-            .unwrap();
+        assert!(fp[0].try_push_ref(&Fill::new(
+            10,
+            7,
+            Side::Bid,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            99,
+        )));
         eng.tick(16);
         assert_eq!(eng.fills_dispatched, 2);
         assert_eq!(eng.fill_capture_records(), 2, "both fill sources captured");
@@ -2373,9 +2409,7 @@ mod tests {
             core_io::SlotCapture::open(&path, core_io::SlotKind::Order, 7).unwrap(),
         );
         eng.start().unwrap();
-        tp[VenueId::Polymarket as usize]
-            .try_push(mk_tick(VenueId::Polymarket, 1, 1))
-            .unwrap();
+        assert!(tp[VenueId::Polymarket as usize].try_push_ref(&mk_tick(VenueId::Polymarket, 1, 1)));
         eng.tick(16);
         assert_eq!(eng.order_capture_records(), 1, "accepted intent staged");
         assert_eq!(eng.order_capture_io_errors(), 0);
@@ -2492,8 +2526,8 @@ mod tests {
             SignalSource::Rpc as u8,
             [0; 40],
         );
-        sp.try_push(amm).unwrap();
-        sp.try_push(rpc).unwrap();
+        assert!(sp.try_push_ref(&amm));
+        assert!(sp.try_push_ref(&rpc));
         eng.tick(16);
         assert_eq!(
             *log.borrow(),
@@ -2506,7 +2540,7 @@ mod tests {
         let (mut pp, pc) = Ring::<Signal, POOL_RING_SIZE>::new().split();
         eng.set_pool_lane(pc);
         let n0 = eng.signals_dispatched;
-        pp.try_push(amm).unwrap();
+        assert!(pp.try_push_ref(&amm));
         eng.tick(16);
         assert_eq!(*log.borrow(), vec!["dispatcher-amm", "strategy"]);
         assert_eq!(eng.signals_dispatched, n0 + 1, "counted as a signal");
@@ -2621,10 +2655,15 @@ mod tests {
         );
         eng.start().unwrap();
 
-        let f = Fill::new(10, 4096, Side::Bid, Price::from_raw(1), Qty::from_raw(1), 99);
-        fp[fill_lane_of(VenueId::Hyperliquid).unwrap()]
-            .try_push(f)
-            .unwrap();
+        let f = Fill::new(
+            10,
+            4096,
+            Side::Bid,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            99,
+        );
+        assert!(fp[fill_lane_of(VenueId::Hyperliquid).unwrap()].try_push_ref(&f));
         eng.tick(16);
 
         assert_eq!(
@@ -2755,9 +2794,7 @@ mod tests {
             1,
             1,
         );
-        ep[tick_lane_of(VenueId::Hyperliquid).unwrap()]
-            .try_push(ev)
-            .unwrap();
+        assert!(ep[tick_lane_of(VenueId::Hyperliquid).unwrap()].try_push_ref(&ev));
         eng.tick(16);
 
         assert_eq!(
@@ -2815,9 +2852,7 @@ mod tests {
             core_io::SlotCapture::open(&path, core_io::SlotKind::Order, 0).unwrap(),
         );
         eng.start().unwrap();
-        tp[VenueId::Polymarket as usize]
-            .try_push(mk_tick(VenueId::Polymarket, 1, 1))
-            .unwrap();
+        assert!(tp[VenueId::Polymarket as usize].try_push_ref(&mk_tick(VenueId::Polymarket, 1, 1)));
         eng.tick(16);
         assert_eq!(
             eng.order_capture_records(),
@@ -2885,7 +2920,7 @@ mod tests {
         eng.start().unwrap();
         // ts = now, no TTL → never expires; heartbeat has no shape
         // surprises.
-        ap.try_push(mk_heartbeat(now_ns(), 1)).unwrap();
+        assert!(ap.try_push_ref(&mk_heartbeat(now_ns(), 1)));
         eng.tick(16);
         assert_eq!(eng.ai_dispatched, 1);
         assert_eq!(eng.strategy().ai_cmds, 1);
@@ -2899,10 +2934,9 @@ mod tests {
         eng.start().unwrap();
         let now = now_ns();
         // Accepted 10 ms ago with a 1 ms TTL → expired at pop.
-        ap.try_push(mk_fair_value(now.saturating_sub(10_000_000), 1, 1_000_000))
-            .unwrap();
+        assert!(ap.try_push_ref(&mk_fair_value(now.saturating_sub(10_000_000), 1, 1_000_000)));
         // Accepted now with a generous TTL → dispatched.
-        ap.try_push(mk_fair_value(now, 2, 60_000_000_000)).unwrap();
+        assert!(ap.try_push_ref(&mk_fair_value(now, 2, 60_000_000_000)));
         eng.tick(16);
         assert_eq!(eng.ai_status().expired(), 1, "stale command dropped at pop");
         assert_eq!(eng.ai_dispatched, 1, "fresh command still dispatched");
@@ -2915,7 +2949,7 @@ mod tests {
         eng.start().unwrap();
         let n = (AI_DRAIN_BUDGET * 2 + 3) as u32;
         for i in 0..n {
-            ap.try_push(mk_heartbeat(now_ns(), i + 1)).unwrap();
+            assert!(ap.try_push_ref(&mk_heartbeat(now_ns(), i + 1)));
         }
         eng.tick(16);
         assert_eq!(
@@ -2939,8 +2973,8 @@ mod tests {
         let mut bad = mk_heartbeat(now_ns(), 1);
         bad.px = 1;
         assert!(bad.validate_shape().is_err(), "fixture must be malformed");
-        ap.try_push(bad).unwrap();
-        ap.try_push(mk_heartbeat(now_ns(), 2)).unwrap();
+        assert!(ap.try_push_ref(&bad));
+        assert!(ap.try_push_ref(&mk_heartbeat(now_ns(), 2)));
         eng.tick(16);
         assert_eq!(
             eng.ai_drain_malformed, 1,
@@ -2973,8 +3007,8 @@ mod tests {
     fn ruleset_table_pop_precedes_ai_drain_same_iteration() {
         let (mut eng, _tp, _ep, _sp, _fp, mut ap, mut tblp) = build_engine();
         eng.start().unwrap();
-        assert!(tblp.try_push(mk_table(7)).is_ok());
-        ap.try_push(mk_heartbeat(now_ns(), 1)).unwrap();
+        assert!(tblp.try_push_ref(&mk_table(7)));
+        assert!(ap.try_push_ref(&mk_heartbeat(now_ns(), 1)));
         eng.tick(16);
         assert_eq!(
             eng.strategy().tables,
@@ -2997,10 +3031,10 @@ mod tests {
     fn ruleset_table_lane_drains_all_slots_in_order() {
         let (mut eng, _tp, _ep, _sp, _fp, _ap, mut tblp) = build_engine();
         eng.start().unwrap();
-        assert!(tblp.try_push(mk_table(1)).is_ok());
-        assert!(tblp.try_push(mk_table(2)).is_ok());
+        assert!(tblp.try_push_ref(&mk_table(1)));
+        assert!(tblp.try_push_ref(&mk_table(2)));
         assert!(
-            tblp.try_push(mk_table(3)).is_err(),
+            !tblp.try_push_ref(&mk_table(3)),
             "cap-2 ring must reject the third undrained stage (§5)"
         );
         eng.tick(16);
@@ -3015,7 +3049,7 @@ mod tests {
             "in-ring order: newest last"
         );
         // Ring drained ⇒ the lane accepts stages again.
-        assert!(tblp.try_push(mk_table(4)).is_ok());
+        assert!(tblp.try_push_ref(&mk_table(4)));
         eng.tick(16);
         assert_eq!(eng.strategy().tables, 3);
         assert_eq!(eng.strategy().last_table_epoch, 4);
@@ -3037,7 +3071,7 @@ mod tests {
     fn max_tick_age_handles_now_before_recorded() {
         let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
         eng.start().unwrap();
-        tp[0].try_push(mk_tick(VenueId::Polymarket, 7, 1)).unwrap();
+        assert!(tp[0].try_push_ref(&mk_tick(VenueId::Polymarket, 7, 1)));
         eng.tick(16);
         // `now` < last_touched → saturating_sub returns 0, not
         // wrapping nonsense.

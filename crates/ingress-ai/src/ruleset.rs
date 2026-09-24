@@ -7,7 +7,7 @@
 //! preallocated scratch [`RuleTable`]).
 //!
 //! Sits behind the §4.4 step-8 seam: the listener routes accepted
-//! `RulesetStage` / `RulesetCommit` commands here after `try_push`.
+//! `RulesetStage` / `RulesetCommit` commands here after `try_push_ref`.
 //!
 //! * **Stage**: resolve `AI_RULESET_DIR/<hash128-hex>.json` — the frame
 //!   carries only hash128 (8f §13 decision 5), so the filename MUST be
@@ -17,7 +17,7 @@
 //!   rule 1 recomputes the FULL SHA-256 (`core-crypto`) and requires
 //!   its first 16 bytes to equal the frame's hash128, then rules 2–8
 //!   scan the bytes into the side-path scratch table. Pass ⇒ stamp
-//!   the candidate epoch and `try_push` the scratch into the §6
+//!   the candidate epoch and `try_push_ref` the scratch into the §6
 //!   `Ring<RuleTableSlot, RULE_TABLE_RING_SLOTS>` (8g item 4 — v2-typed
 //!   slots since VM2 V4);
 //!   push ok ⇒ staged state + `engine_ai_ruleset_staged_total`;
@@ -80,10 +80,11 @@
 //! capture→push pump keeps its own 0 B/op gate.
 //!
 //! The stage-time table handoff is **documented copy #1** (§6):
-//! scratch → ring slot via `try_push`, 32 KiB + 64 by value, once per
-//! successful Stage — operator cadence, moves bytes, never the heap
-//! (alloc gate 35). Copy #2 (ring slot → the vm member's staged
-//! buffer at the engine pop) lands with item 7.
+//! scratch → ring slot via `try_push_ref`, 32 KiB + 64 copied once,
+//! straight into the slot (no by-value temporary since ZC pass A), once
+//! per successful Stage — operator cadence, moves bytes, never the heap
+//! (alloc gate 35). Copy #2 is ring slot → the vm member's staged
+//! buffer, the engine reading the slot in place (item 7).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1627,7 +1628,7 @@ pub fn validate_ruleset(
 /// [`AiIngressStatus`] slot so the cli mirrors the whole family from
 /// one place. Single-writer: only the ingress thread touches this.
 ///
-/// The scratch [`RuleTable`] (16 KiB + 64) is heap-allocated ONCE at
+/// The scratch [`RuleTable`] (32 KiB + 64) is heap-allocated ONCE at
 /// construction (boot) and reused for every Stage — the steady-state
 /// validator path is 0 B/op (gate 34).
 pub struct RulesetSidePath {
@@ -1642,9 +1643,9 @@ pub struct RulesetSidePath {
     /// from run manifests in the offline harness).
     descriptors: Arc<DescriptorTable>,
     /// Producer half of the §6 table-handoff ring (D1a). One
-    /// `try_push` per validated Stage — documented copy #1; the
-    /// engine owns the consumer half (parked at boot until item 7
-    /// wires the pre-AI-drain pop).
+    /// `try_push_ref` per validated Stage — documented copy #1; the
+    /// engine owns the consumer half and reads each slot in place in
+    /// its pre-AI-drain pop (item 7).
     producer: Producer<RuleTableSlot, RULE_TABLE_RING_SLOTS>,
     scratch: Box<RuleTableV2>,
     /// Monotonic successful-stage counter, stamped into
@@ -1661,8 +1662,8 @@ impl RulesetSidePath {
     /// boot — a Stage against a missing dir is just a rejected stage.
     /// `universe` MUST be sorted ascending (binary-searched per row).
     /// `producer` is the push half of the §6 table-handoff ring; the
-    /// bin parks the consumer half until item 7 wires the engine
-    /// drain.
+    /// bin hands the consumer half to the engine's pre-AI-drain pop
+    /// (item 7).
     pub fn new(
         dir: PathBuf,
         status: Arc<AiIngressStatus>,
@@ -1779,9 +1780,10 @@ impl RulesetSidePath {
     }
 
     /// §5 stage handoff (8g item 4): stamp the candidate epoch and
-    /// `try_push` the validated scratch into the §6 table ring —
-    /// **documented copy #1** (32 KiB + 64 by value, once per Stage,
-    /// operator cadence; moves bytes, never the heap — gate 35).
+    /// `try_push_ref` the validated scratch into the §6 table ring —
+    /// **documented copy #1** (32 KiB + 64, scratch → slot with no
+    /// by-value temporary, once per Stage, operator cadence; moves
+    /// bytes, never the heap — gate 35).
     ///
     /// Push ok ⇒ staged; a new Stage supersedes any previous Commit
     /// (the worker registry mirrors this — `state.py`), and a restage
@@ -1801,19 +1803,16 @@ impl RulesetSidePath {
         // (§3 "successful-stage counter"; wraps are harmless).
         let epoch = self.epoch.wrapping_add(1);
         self.scratch.epoch = epoch;
-        // Documented copy #1 (§6): scratch → ring slot, by value.
-        match self.producer.try_push(*self.scratch) {
-            Ok(()) => {
-                self.epoch = epoch;
-                self.staged = Some(hash128);
-                self.committed = None;
-                self.status.inc_ruleset_staged();
-            }
-            Err(_) => {
-                self.scratch.len = 0;
-                self.status.inc_ruleset_rejected();
-                self.status.inc_table_push_fail();
-            }
+        // Documented copy #1 (§6): scratch → ring slot, the only copy.
+        if self.producer.try_push_ref(&self.scratch) {
+            self.epoch = epoch;
+            self.staged = Some(hash128);
+            self.committed = None;
+            self.status.inc_ruleset_staged();
+        } else {
+            self.scratch.len = 0;
+            self.status.inc_ruleset_rejected();
+            self.status.inc_table_push_fail();
         }
     }
 
@@ -2109,15 +2108,15 @@ mod tests {
         // §5/§6: the restage is a SECOND push — the engine-side
         // supersede works because a later pop overwrites the staged
         // buffer. FIFO order with gapless epochs at the consumer.
-        let t1 = cons.try_pop().expect("first Stage pushed a table");
+        let t1 = *cons.try_pop_ref().expect("first Stage pushed a table");
         assert_eq!(t1.hash128, h1);
         assert_eq!(t1.epoch, 1);
         assert_eq!(t1.rows[0].name_h, fnv1a_64(b"restage-one"));
-        let t2 = cons.try_pop().expect("restage pushed a second table");
+        let t2 = *cons.try_pop_ref().expect("restage pushed a second table");
         assert_eq!(t2.hash128, h2);
         assert_eq!(t2.epoch, 2);
         assert_eq!(t2.rows[0].name_h, fnv1a_64(b"restage-two"));
-        assert!(cons.try_pop().is_none(), "exactly one push per Stage");
+        assert!(cons.try_pop_ref().is_none(), "exactly one push per Stage");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2161,7 +2160,7 @@ mod tests {
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h));
         assert_eq!(status.ruleset_staged(), 1);
 
-        let popped = cons.try_pop().expect("Stage must push one table");
+        let popped = *cons.try_pop_ref().expect("Stage must push one table");
         assert_eq!(popped.len, 1);
         assert_eq!(popped.epoch, 1);
         assert_eq!(popped.hash128, h);
@@ -2169,7 +2168,7 @@ mod tests {
         // The parked scratch is the push's source copy — the full
         // 16 KiB + 64 must match, padding included.
         assert_eq!(table_bytes(&popped), table_bytes(side.staged_table()));
-        assert!(cons.try_pop().is_none(), "exactly one push per Stage");
+        assert!(cons.try_pop_ref().is_none(), "exactly one push per Stage");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2204,9 +2203,9 @@ mod tests {
 
         // The two undrained stages are intact — FIFO h1 then h2, and
         // the rejected stage pushed nothing.
-        assert_eq!(cons.try_pop().expect("first stage").hash128, h1);
-        assert_eq!(cons.try_pop().expect("second stage").hash128, h2);
-        assert!(cons.try_pop().is_none());
+        assert_eq!(cons.try_pop_ref().expect("first stage").hash128, h1);
+        assert_eq!(cons.try_pop_ref().expect("second stage").hash128, h2);
+        assert!(cons.try_pop_ref().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2254,14 +2253,14 @@ mod tests {
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h3));
         assert_eq!(status.table_push_fail(), 1);
 
-        assert_eq!(cons.try_pop().expect("epoch 1").epoch, 1);
-        assert_eq!(cons.try_pop().expect("epoch 2").epoch, 2);
+        assert_eq!(cons.try_pop_ref().expect("epoch 1").epoch, 1);
+        assert_eq!(cons.try_pop_ref().expect("epoch 2").epoch, 2);
 
         // Drained — the retried Stage lands with the gapless next
         // epoch.
         side.on_cmd(&ruleset_cmd(AiCmdKind::RulesetStage, h3));
         assert_eq!(status.ruleset_staged(), 3);
-        let t = cons.try_pop().expect("epoch 3");
+        let t = *cons.try_pop_ref().expect("epoch 3");
         assert_eq!(t.epoch, 3);
         assert_eq!(t.hash128, h3);
 

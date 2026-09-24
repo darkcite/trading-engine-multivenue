@@ -162,8 +162,16 @@ in the script; `ai` = 48 is the floor every name includes).
   joined `make copy-audit` — the WS Ping echo goes rx → tx everywhere
   (the exec lane's user-WS too), fixed-shape requests are masked into tx
   from parts (`core_net::queue_masked_{text,binary}_frame_parts`),
-  false-premise copies are gone, the rest marked. Open: core-ring's
-  by-value push/pop (ZC pass A, next).
+  false-premise copies are gone, the rest marked. ZC pass A (2026-09-24,
+  risk-policy "ZC pass A"): core-ring lends its slots — `try_push_ref`
+  copies once into the slot, `try_pop_ref` lends it in place through a
+  `Popped` guard, the by-value API is gone; per-slot `UnsafeCell`, 128 B
+  index padding, `split()` once (Miri-clean, Stacked and Tree Borrows);
+  the engine reads all nine lanes in place. Open: `make bench-check`
+  cannot compare on this Mac (its script needs Python ≥ 3.10 and reads
+  a criterion path layout this criterion does not write); a
+  cached-index (Rigtorp) ring — the ping-pong round trip is ~20 % slower
+  in place, the stream faster.
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -207,10 +215,10 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **Gates at HEAD (ZC pass B, 2026-09-24; Foundry and worker pytest as of
-  the HYPARB merge):** nextest 3119 (5
+- **Gates at HEAD (ZC pass A, 2026-09-24; Foundry and worker pytest as of
+  the HYPARB merge):** nextest 3125 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
-  and `hyperevm_live_smoke` among them) · alloc 72/72 at the gates' pins
+  and `hyperevm_live_smoke` among them) · alloc 73/73 at the gates' pins
   (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
   child helper) · clippy clean · `make license-check` OK · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
@@ -228,8 +236,11 @@ in the script; `ai` = 48 is the floor every name includes).
   `amm_tick_walk`, `amm_map_payload`, `hyperevm_decode`, `evm_rlp` 240 s,
   `evm_exec_response` 540 s, `http1_response` 300 s clean; every fuzz bin
   checks at the merge; ZC pass B re-ran `deribit_vol_index` 300 s,
-  `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s
-  · live smokes 60 s: MEXC and Binance, 0 parse errors, 0 reconnects
+  `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
+  ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
+  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`)
+  · live smokes 60 s (ZC pass B; pass A's wait on LuLu allowing the
+  rebuilt smoke binaries): MEXC and Binance, 0 parse errors, 0 reconnects
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known
@@ -372,7 +383,9 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - **Zero-copy (operator ruling 2026-09-19).** Everything that CAN be done
   zero-copy IS: scanners borrow the rx buffer and return offsets, encoders
   render into the FINAL wire buffer, signers hash in place
-  (`keccak256_parts`), PODs move once into their ring slot. A copy that
+  (`keccak256_parts`), PODs are copied once into their ring slot
+  (`Producer::try_push_ref`) and read there in place
+  (`Consumer::try_pop_ref` lends the slot through a `Popped` guard). A copy that
   cannot be avoided carries, within the eight lines above it,
   `// COPY: <what> <bound> — <why unavoidable> — <alternative rejected>` —
   the way `unsafe` carries `// SAFETY:`. Designed copies: kernel↔user,
