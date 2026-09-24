@@ -2360,6 +2360,52 @@ fn boot_operator_hl_arm(
     // the cold assumption halted the first mainnet boot before its first
     // order (2026-09-19).
     arm.seed_budget_from_venue();
+    // S7-L1 (gap E): the request-weight top-up is a property of the
+    // ADDRESS, like the floor — the most conservative of the live slots'
+    // numbers (slot 0's address is its own). Each slot's own day ceiling
+    // holds at least its own weight (the parser refuses less), so the two
+    // minima never arm a top-up that cannot fire.
+    let topup_weight = eb
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live() && s.request_topup_weight > 0
+        })
+        .map(|(_, s)| s.request_topup_weight)
+        .min()
+        .and_then(|w| u64::try_from(w).ok())
+        .unwrap_or(0);
+    let topup_day_max = eb
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live() && s.request_topup_day_max > 0
+        })
+        .map(|(_, s)| s.request_topup_day_max)
+        .min()
+        .and_then(|w| u64::try_from(w).ok())
+        .unwrap_or(0);
+    arm.set_topup(topup_weight, topup_day_max);
+    // S7-L1 (gaps A, C): this arm's seeding waits for the venue's day
+    // spend and for a read of the account that finds nothing of ours
+    // resting.
+    arm.enable_restart_safety();
+    // S7-L1 (gap C): this process starts every member flat, so every
+    // order of ours still resting at the venue is a previous process's
+    // orphan — a crash, a `kill -9`, a drain that ran out of time. Taken
+    // off before anything trades.
+    let (boot_swept, boot_sweep_left) = arm.cancel_ours_everywhere();
+    if boot_sweep_left != 0 {
+        warn!(
+            left = boot_sweep_left,
+            "exec: the boot sweep could not confirm every resting order of ours cancelled \
+             (u32::MAX = the venue's open orders could not be read) — while any cancellable \
+             one may rest, the live slots stay unseeded and each reconciliation retries the \
+             sweep"
+        );
+    }
     info!(
         host = %hl_cfg.host,
         network = if ex_testnet { "testnet" } else { "MAINNET" },
@@ -2369,9 +2415,13 @@ fn boot_operator_hl_arm(
         budget_source = ?arm.budget_source(),
         budget_remaining = arm.budget_remaining(),
         budget_state = %budget_path.display(),
-        // E7 session bound: 0 = not anchored yet — the first FLAT
-        // reconciliation sets it and writes the file; a restart restores
-        // it.
+        topup_weight,
+        topup_day_max,
+        boot_swept,
+        boot_sweep_left,
+        // E7 session bound: 0 = not anchored yet — the first
+        // reconciliation sets it (equity at cost, S7-L1) and writes the
+        // file; a restart restores it.
         pnl_anchor_usd_1e6 = arm.pnl_anchor_usd_1e6(),
         pnl_anchor_state = %arm.pnl_state_path().display(),
         "exec: hyperliquid arm ARMED"

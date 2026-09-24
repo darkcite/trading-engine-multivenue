@@ -65,7 +65,7 @@ in the script; `ai` = 48 is the floor every name includes).
   `Order.strategy_id`, `RoutedDispatcher`, the E6 risk gate: per-order /
   open-orders / day / instance caps, the venue-fill ledger, six sticky halts
   incl. recon-STALE, `exec.HALT`) + `crates/exec-hyperliquid` (msgpack +
-  EIP-712 `Agent` signing pinned by 25 SDK vectors, mio+rustls `/exchange`
+  EIP-712 `Agent` signing pinned by 27 SDK vectors, mio+rustls `/exchange`
   arm with the request body rendered in place, `userFills` WS pumped from
   `on_idle` on the engine thread, reconciliation, address-budget governor,
   LAW E-8 sweeps). Armed ONLY by the two-switch interlock `--exec
@@ -73,7 +73,15 @@ in the script; `ai` = 48 is the floor every name includes).
   a market-data host and an exchange host on different networks refuse the
   boot. `halt_on_recon_stale_ms` is REQUIRED on every live slot. Record:
   `docs/risk-policy.md` "E6" + "E7".
-- **LIVE ON MAINNET since 2026-09-19 13:04Z — E7 R0, slot 3 (bin15)
+- **Slot 3 (bin15) is PAPER since the R0 session bound halted it** (R0:
+  6 entries, −$5.105, 2026-09-19; S7 law in paper since 2026-09-24). The
+  live arm is restart-proof since S7-L1 (2026-09-24, `docs/risk-policy.md`
+  "The live arm, restart-proof": SIGTERM drains, account-wide cancel at
+  boot and shutdown, day cap from the venue's fills, session bound at
+  cost, exits exempt from the order caps, `request_topup_*`). The next
+  arming follows vault doc 30's checklist and needs the operator's
+  signed S7-L1 entry in `docs/risk-policy.md` first. R0's record:
+- **E7 R0 was LIVE ON MAINNET 2026-09-19 13:04Z — slot 3 (bin15)
   armed** (operator ruling; testnet has no 15-minute family, so R0 ran
   there only as the exec battery, vault doc 23). The launchd engine
   boots `STRATEGY=ai+vrp+xsd+bin15` with `EXEC_TOML`/`ARM_LIVE=3` from

@@ -81,6 +81,10 @@ pub struct SpotBalance {
     pub total_1e8: i64,
     /// Amount held against open orders, 1e8.
     pub hold_1e8: i64,
+    /// The venue's cost basis of the holding (`entryNtl`), USDC 1e8.
+    /// What an outcome leg is valued at by [`account_view`]; `0` when
+    /// the row has none (the quote token, a husk).
+    pub entry_ntl_1e8: i64,
 }
 
 impl SpotBalance {
@@ -143,6 +147,8 @@ pub fn scan_spot_state(body: &[u8], out: &mut [SpotBalance]) -> Result<usize, Sc
         // `hold` is absent on some rows; absent means nothing is held,
         // which is a STATED default rather than a guess.
         let hold = decimal_field(obj, b"\"hold\"").unwrap_or(0);
+        // `entryNtl` likewise: absent is no cost basis, a stated zero.
+        let entry_ntl = decimal_field(obj, b"\"entryNtl\"").unwrap_or(0);
 
         if n >= out.len() {
             return Err(ScanErr::Malformed);
@@ -157,6 +163,7 @@ pub fn scan_spot_state(body: &[u8], out: &mut [SpotBalance]) -> Result<usize, Sc
             },
             total_1e8: total,
             hold_1e8: hold,
+            entry_ntl_1e8: entry_ntl,
         };
         n += 1;
         i = obj_end;
@@ -286,38 +293,85 @@ pub fn unreconciled_venue_legs(
     n
 }
 
-/// **E7 session bound** — the two numbers the bound is judged from,
-/// read off one scanned balance sheet: the account's spot USDC (×1e6)
-/// and how many outcome legs it holds.
+/// **E7 session bound** — one balance sheet, read for the account's
+/// worth. See [`account_view`].
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct AccountView {
+    /// Spot USDC, `total` (held-against-orders USDC is still USDC, so a
+    /// resting bid does not read as a loss), ×1e6.
+    pub usdc_1e6: i64,
+    /// What the held outcome legs COST — the sum of their `entryNtl`,
+    /// ×1e6.
+    pub held_cost_1e6: i64,
+    /// Outcome legs with a non-zero holding.
+    pub legs: u32,
+    /// Explicit padding.
+    _pad: u32,
+}
+
+impl AccountView {
+    /// A view from its three readings.
+    #[inline]
+    #[must_use]
+    pub const fn new(usdc_1e6: i64, held_cost_1e6: i64, legs: u32) -> Self {
+        Self {
+            usdc_1e6,
+            held_cost_1e6,
+            legs,
+            _pad: 0,
+        }
+    }
+
+    /// The account's worth AT COST: USDC plus what the held legs cost.
+    #[inline]
+    #[must_use]
+    pub const fn equity_at_cost_1e6(&self) -> i64 {
+        self.usdc_1e6.saturating_add(self.held_cost_1e6)
+    }
+}
+
+/// **E7 session bound** — the numbers the bound is judged from, read
+/// off one scanned balance sheet: spot USDC, the cost of the held
+/// outcome legs, and how many there are.
 ///
-/// `USDC` is the venue's quote row and the only balance whose change
-/// IS realised P&L once no leg is held — fees and settlements
-/// included, from the one source this arm already trusts over its
-/// own ledger. A `+` row with a non-zero total is a position worth
-/// anything from 0 to 1 USDC until the venue settles it, and the bound
-/// is not judged while one exists (`exec_router::halt::trigger_for`
-/// reads `pnl_flat`). Held-against-orders USDC is still USDC: `total`,
-/// not `free`, so a resting bid does not read as a loss.
+/// **A held leg is valued at COST (`entryNtl`).** Buying one moves
+/// nothing — USDC falls by the premium and the cost rises by it, fees
+/// aside — so the equity changes only when the venue REALISES P&L: a
+/// settlement pays 0 or 1 USDC and the leg's cost leaves the sheet, a
+/// sale returns its price. That makes the bound judgeable at every
+/// reconciliation. The first cut valued nothing and judged only while
+/// flat, and a book that is never flat — overlapping 15-minute
+/// instances, the daily families — was never judged at all (risk
+/// review 2026-09-24, gap B). An open leg's unrealised loss is not in
+/// the figure: the instance and day caps bound it, and it is realised
+/// at the leg's settlement.
 ///
-/// A sheet without a `USDC` row reports `0`, which the arm treats as
-/// "nothing to anchor" — never as a $-anchor loss.
+/// A sheet without a `USDC` row reports `usdc_1e6 = 0`, which the arm
+/// treats as "nothing to anchor" — never as a $-anchor loss.
 #[must_use]
-pub fn account_view(bal: &[SpotBalance], body: &[u8]) -> (i64, u32) {
-    let mut usdc_1e6 = 0i64;
-    let mut legs = 0u32;
+pub fn account_view(bal: &[SpotBalance], body: &[u8]) -> AccountView {
+    let mut v = AccountView::default();
     let mut i = 0usize;
     while i < bal.len() {
         let coin = bal[i].coin.of(body);
+        // The scanner is ×1e8; the bound, like every USD figure the
+        // router compares, is ×1e6.
         if coin == b"USDC" {
-            // The scanner is ×1e8; the bound, like every USD figure
-            // the router compares, is ×1e6.
-            usdc_1e6 = bal[i].total_1e8 / 100;
+            v.usdc_1e6 = bal[i].total_1e8 / 100;
         } else if matches!(coin.first(), Some(b'+')) && bal[i].total_1e8 != 0 {
-            legs = legs.saturating_add(1);
+            v.legs = v.legs.saturating_add(1);
+            // Clamped to what the holding can EVER pay — 1 USDC a
+            // contract, so `total` in USDC — and never below zero. A
+            // buy's basis is always under that; a partial sale whose
+            // basis the venue did not reduce pro rata (unmeasured) must
+            // not read as a leg worth more than it could settle for.
+            let cost_1e8 = bal[i].entry_ntl_1e8.min(bal[i].total_1e8).max(0);
+            v.held_cost_1e6 = v.held_cost_1e6.saturating_add(cost_1e8 / 100);
         }
         i += 1;
     }
-    (usdc_1e6, legs)
+    v
 }
 
 /// The most one HIP-4 outcome contract can ever be worth, 1e6.
@@ -534,7 +588,7 @@ pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]
     let mut n = 0usize;
     let mut i = 0usize;
     while i < rows.len() {
-        let row = rows[i];
+        let row = &rows[i];
         i += 1;
         if row.coin.of(body) != coin {
             continue;
@@ -560,6 +614,53 @@ pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]
         n += 1;
     }
     n
+}
+
+/// **S7-L1 — every resting order of OURS on the account, whatever the
+/// leg**, as `(asset, oid)` pairs for the cancel action. Returns
+/// `(written, unmapped)`: `unmapped` counts orders of ours on a coin
+/// that is not an outcome leg's `#<enc>` — this crate cannot name an
+/// asset id for one, so it cannot cancel it, and says so rather than
+/// skipping it in silence.
+///
+/// The boot and shutdown sweeps' selection. The cloid filter is
+/// [`ours_on_leg`]'s (LAW E-9: an order placed from the venue UI, or a
+/// stranger's, is never touched); there is no coin filter, because
+/// what these sweeps exist for is the order no leg of this process
+/// knows about — one a previous process left on an instance that has
+/// rolled since. The asset id comes off the venue's own coin name
+/// (`asset::asset_of_fill_coin` says why a cancel may do that and an
+/// order may not). `written == out.len()` means there may be more, as
+/// there.
+#[must_use]
+pub fn ours_everywhere(
+    rows: &[OpenOrder],
+    body: &[u8],
+    out: &mut [crate::action::CancelWire],
+) -> (usize, u32) {
+    let mut n = 0usize;
+    let mut unmapped = 0u32;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let row = &rows[i];
+        i += 1;
+        if !matches!(
+            row.cloid.as_ref().map(crate::cloid::decode),
+            Some(crate::cloid::Owner::Ours { .. })
+        ) {
+            continue;
+        }
+        let Some(asset) = crate::asset::asset_of_fill_coin(row.coin.of(body)) else {
+            unmapped = unmapped.saturating_add(1);
+            continue;
+        };
+        if n >= out.len() {
+            return (n, unmapped);
+        }
+        out[n] = crate::action::CancelWire { asset, oid: row.oid };
+        n += 1;
+    }
+    (n, unmapped)
 }
 
 /// An unsigned integer field, for `oid`. `decimal_field` is for the
@@ -945,30 +1046,51 @@ mod tests {
     }
 
     /// **E7 session bound.** The account view is the USDC row (×1e6,
-    /// total not free) and a count of legs with a non-zero holding —
-    /// the venue's zero husks do not count, and a sheet without USDC
+    /// total not free), the held legs' cost (`entryNtl`) and a count of
+    /// legs with a non-zero holding — the venue's zero husks do not
+    /// count (nor does a husk's stale cost), and a sheet without USDC
     /// reads zero rather than inventing a balance.
     #[test]
-    fn the_account_view_is_the_usdc_row_and_the_held_legs() {
+    fn the_account_view_is_the_usdc_row_and_the_held_legs_at_cost() {
+        // The `+194180` row is the shape mainnet sent (2026-09-19):
+        // 2 contracts, cost basis 1.36.
         let body = br#"{"balances":[
-            {"coin":"USDC","token":0,"total":"997.64","hold":"2.0"},
-            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0"},
-            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
+            {"coin":"USDC","token":0,"total":"997.64","hold":"2.0","entryNtl":"0.0"},
+            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0","entryNtl":"1.36"},
+            {"coin":"+195720","token":3,"total":"0.0","hold":"0.0","entryNtl":"0.9"}
         ]}"#;
         let mut bal = [SpotBalance::default(); MAX_SPOT_BALANCES];
         let n = scan_spot_state(body, &mut bal).expect("scans");
-        assert_eq!(account_view(&bal[..n], body), (997_640_000, 1));
+        assert_eq!(bal[1].entry_ntl_1e8, 136_000_000);
+        let v = account_view(&bal[..n], body);
+        assert_eq!((v.usdc_1e6, v.legs, v.held_cost_1e6), (997_640_000, 1, 1_360_000));
+        assert_eq!(v.equity_at_cost_1e6(), 999_000_000, "USDC plus the legs at cost");
 
         let flat = br#"{"balances":[
             {"coin":"USDC","token":0,"total":"8.63","hold":"0.0"},
             {"coin":"+195720","token":3,"total":"0.0","hold":"0.0"}
         ]}"#;
         let n2 = scan_spot_state(flat, &mut bal).expect("scans");
-        assert_eq!(account_view(&bal[..n2], flat), (8_630_000, 0), "a husk is not a leg");
+        let v2 = account_view(&bal[..n2], flat);
+        assert_eq!((v2.usdc_1e6, v2.legs, v2.held_cost_1e6), (8_630_000, 0, 0), "a husk");
+        assert_eq!(v2.equity_at_cost_1e6(), 8_630_000);
 
         let no_quote = br#"{"balances":[{"coin":"+195720","token":3,"total":"1.0","hold":"0.0"}]}"#;
         let n3 = scan_spot_state(no_quote, &mut bal).expect("scans");
-        assert_eq!(account_view(&bal[..n3], no_quote), (0, 1), "no USDC row reads zero");
+        let v3 = account_view(&bal[..n3], no_quote);
+        assert_eq!((v3.usdc_1e6, v3.legs), (0, 1), "no USDC row reads zero");
+        assert_eq!(v3.held_cost_1e6, 0, "a row without entryNtl has no cost basis");
+
+        // A basis above what the holding can pay (2 contracts pay at
+        // most $2) is clamped to it; a negative one to zero.
+        let over = br#"{"balances":[
+            {"coin":"USDC","token":0,"total":"5.0","hold":"0.0"},
+            {"coin":"+194180","token":2,"total":"2.0","hold":"0.0","entryNtl":"3.0"},
+            {"coin":"+195720","token":3,"total":"1.0","hold":"0.0","entryNtl":"-1.0"}
+        ]}"#;
+        let n4 = scan_spot_state(over, &mut bal).expect("scans");
+        let v4 = account_view(&bal[..n4], over);
+        assert_eq!((v4.legs, v4.held_cost_1e6), (2, 2_000_000));
     }
 
     /// The shape a sweep reads. `frontendOpenOrders` is a TOP-LEVEL
@@ -1001,6 +1123,35 @@ mod tests {
         // sweep must leave it alone.
         assert_eq!(out[1].oid, 60_246_216_460);
         assert!(out[1].cloid.is_none());
+    }
+
+    /// **S7-L1 — the boot and shutdown sweeps' selection.** Ours, on
+    /// every leg, with the asset id read off the venue's coin name; a
+    /// UI order and a stranger's are left alone; an order of ours on a
+    /// coin that is not `#<enc>` is COUNTED, not dropped; and a full
+    /// buffer stops at its length, which the caller reads as "maybe
+    /// more".
+    #[test]
+    fn the_account_wide_selection_is_ours_on_every_leg_and_nothing_else() {
+        let body = br##"[
+          {"coin":"#194180","oid":101,"side":"B","cloid":"0x4d560300000000000000000000000065"},
+          {"coin":"#195721","oid":102,"side":"A","cloid":"0x4d560300000000000000000000000066"},
+          {"coin":"#194180","oid":103,"side":"B"},
+          {"coin":"#194180","oid":104,"side":"B","cloid":"0x00000000000000000000000000000001"},
+          {"coin":"BTC","oid":105,"side":"B","cloid":"0x4d560300000000000000000000000067"}
+        ]"##;
+        let mut rows = [OpenOrder::default(); 8];
+        let n = scan_open_orders(body, &mut rows).expect("scans");
+        assert_eq!(n, 5);
+        let mut out = [crate::action::CancelWire { asset: 0, oid: 0 }; 8];
+        let (k, unmapped) = ours_everywhere(&rows[..n], body, &mut out);
+        assert_eq!((k, unmapped), (2, 1), "two outcome legs of ours; the BTC one counted");
+        assert_eq!((out[0].asset, out[0].oid), (crate::asset::ASSET_BASE + 194_180, 101));
+        assert_eq!((out[1].asset, out[1].oid), (crate::asset::ASSET_BASE + 195_721, 102));
+
+        let mut one = [crate::action::CancelWire { asset: 0, oid: 0 }; 1];
+        let (k1, _) = ours_everywhere(&rows[..n], body, &mut one);
+        assert_eq!(k1, one.len(), "a full buffer reports its length: maybe more");
     }
 
     /// An account with nothing resting answers `[]`. That is a real

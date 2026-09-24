@@ -81,7 +81,10 @@ pub struct AddressBudget {
     spent_requests: u64,
     /// Venue-observed traded notional, USDC 1e6. **Fills only.**
     traded_usdc_1e6: i64,
-    /// The venue's starting grant.
+    /// The GRANT: the venue's starting allowance plus every request
+    /// weight this address has reserved and paid for (S7-L1 —
+    /// `nRequestsSurplus` at boot, [`AddressBudget::on_reserved`]
+    /// after).
     initial_buffer: u64,
     /// Refuse a submit when headroom drops to this.
     floor: u64,
@@ -108,14 +111,44 @@ impl AddressBudget {
     }
 
     /// The budget as the VENUE states it: `nRequestsUsed` spent,
-    /// `cumVlm` traded. `remaining()` is then exactly the venue's
-    /// `nRequestsCap − nRequestsUsed`.
+    /// `cumVlm` traded, `nRequestsSurplus` reserved beyond use.
+    /// `remaining()` is then exactly the venue's
+    /// `nRequestsCap − nRequestsUsed + nRequestsSurplus`.
+    ///
+    /// **S7-L1 — why the surplus is part of the grant.** The venue nets
+    /// reserved weight against use: `nRequestsUsed` is
+    /// `max(0, used − reserved)` and `nRequestsSurplus` is
+    /// `max(0, reserved − used)`, so the headroom is
+    /// `cap − used + reserved` either way. Dropping the surplus would
+    /// read an address that had bought headroom as one that had not.
     #[must_use]
-    pub fn from_venue(address: [u8; 20], floor: u64, used: u64, cum_vlm_1e6: i64) -> Self {
-        Self::restored(address, floor, used, cum_vlm_1e6)
+    pub fn from_venue(
+        address: [u8; 20],
+        floor: u64,
+        used: u64,
+        cum_vlm_1e6: i64,
+        surplus: u64,
+    ) -> Self {
+        let mut b = Self::restored(address, floor, used, cum_vlm_1e6);
+        b.initial_buffer = INITIAL_BUFFER.saturating_add(surplus);
+        b
+    }
+
+    /// **S7-L1** — the venue accepted a `reserveRequestWeight` of
+    /// `weight`: this address may send that many more requests. Added
+    /// to the grant, which is where the venue's own arithmetic puts it
+    /// (see [`Self::from_venue`]).
+    #[inline]
+    pub fn on_reserved(&mut self, weight: u64) {
+        self.initial_buffer = self.initial_buffer.saturating_add(weight);
     }
 
     /// A budget restored from known figures.
+    ///
+    /// The grant restores to the venue's starting allowance: weight
+    /// reserved since is not in the state file, so a boot that falls
+    /// back to the file undercounts its headroom — the conservative
+    /// direction — and the venue read at boot restores it.
     #[must_use]
     pub fn restored(
         address: [u8; 20],
@@ -284,18 +317,141 @@ pub fn rate_limit_request(
     crate::recon::user_info_request(out, br#"{"type":"userRateLimit","user":"0x"#, master)
 }
 
-/// Scan a `userRateLimit` answer into `(nRequestsUsed, cumVlm × 1e6)`.
+/// Scan a `userRateLimit` answer into
+/// `(nRequestsUsed, cumVlm × 1e6, nRequestsSurplus)`.
 ///
-/// Both fields are REQUIRED: an answer missing either is refused, and
-/// the caller lands on the file or the cold budget — never on a
-/// half-read figure that could authorise spending the venue did not
-/// grant. `cumVlm` is a decimal string of USDC.
+/// `nRequestsUsed` and `cumVlm` are REQUIRED: an answer missing either
+/// is refused, and the caller lands on the file or the cold budget —
+/// never on a half-read figure that could authorise spending the venue
+/// did not grant. `cumVlm` is a decimal string of USDC.
+/// `nRequestsSurplus` (S7-L1) is counted only when the answer ALSO
+/// states `nRequestsCap` as exactly the grant plus volume
+/// (`10 000 + ⌊cumVlm⌋`) — the netting the venue documents, where
+/// reserved weight lives in `nRequestsUsed` / `nRequestsSurplus` and not
+/// in the cap. A cap that says otherwise may already carry the reserve,
+/// and counting the surplus on top would be the optimistic direction;
+/// an absent cap cannot be checked. Either way the surplus reads `0`:
+/// headroom not proven is headroom not claimed.
 #[must_use]
-pub fn scan_rate_limit(body: &[u8]) -> Option<(u64, i64)> {
+pub fn scan_rate_limit(body: &[u8]) -> Option<(u64, i64, u64)> {
     let used = crate::json::u64_field(body, b"\"nRequestsUsed\"")?;
     // `decimal_field` is ×1e8; the governor keeps USDC ×1e6.
     let vlm_1e6 = crate::json::decimal_field(body, b"\"cumVlm\"")? / 100;
-    Some((used, vlm_1e6))
+    let grant = INITIAL_BUFFER.saturating_add(u64::try_from(vlm_1e6 / 1_000_000).unwrap_or(0));
+    let surplus = match crate::json::u64_field(body, b"\"nRequestsCap\"") {
+        Some(cap) if cap == grant => {
+            crate::json::u64_field(body, b"\"nRequestsSurplus\"").unwrap_or(0)
+        }
+        _ => 0,
+    };
+    Some((used, vlm_1e6, surplus))
+}
+
+/// **S7-L1** — default location of the request-weight top-up's state,
+/// beside the budget's.
+pub const TOPUP_STATE_PATH: &str = "exec-topup.state";
+
+/// **S7-L1** — what the top-up must remember across a restart: the UTC
+/// day and the weight sent on it (the day ceiling), and the session's
+/// spend with the anchor it belongs to (the session P&L).
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct TopupState {
+    /// UTC day number (`wall_ms / 86 400 000`).
+    pub day: u64,
+    /// Weight sent on `day`.
+    pub used: u64,
+    /// `set_unix_s` of the session anchor the spend belongs to; `0` =
+    /// none.
+    pub anchor_set_s: u64,
+    /// The session's top-up spend, USD ×1e6.
+    pub cost_1e6: i64,
+}
+
+impl TopupState {
+    /// The state-file line:
+    /// `<0x master>\t<day>\t<used>\t<anchor s>\t<cost ×1e6>\n`.
+    #[must_use]
+    pub fn to_line(self, address: &[u8; 20]) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            crate::config::hex20(address),
+            self.day,
+            self.used,
+            self.anchor_set_s,
+            self.cost_1e6
+        )
+    }
+
+    /// Restore for `address`; `None` for a malformed line, a negative
+    /// spend, or a line written for another address.
+    #[must_use]
+    pub fn from_line(line: &str, address: [u8; 20]) -> Option<Self> {
+        let mut f = line.trim().split('\t');
+        let addr_s = f.next()?;
+        let day: u64 = f.next()?.parse().ok()?;
+        let used: u64 = f.next()?.parse().ok()?;
+        let anchor_set_s: u64 = f.next()?.parse().ok()?;
+        let cost_1e6: i64 = f.next()?.parse().ok()?;
+        if f.next().is_some() || cost_1e6 < 0 {
+            return None;
+        }
+        if !addr_s.eq_ignore_ascii_case(&crate::config::hex20(&address)) {
+            return None;
+        }
+        Some(Self {
+            day,
+            used,
+            anchor_set_s,
+            cost_1e6,
+        })
+    }
+}
+
+/// **S7-L1** — restore the top-up's `(day, used, cost ×1e6)` for
+/// `today` and the anchor set at `anchor_set_s`.
+///
+/// A MISSING file is a fresh start: nothing sent today, nothing spent
+/// this session. Every other failure — unreadable, malformed, another
+/// address — reads as today's ceiling already SPENT (`used =
+/// u64::MAX`): the arm cannot know what it bought, and the safe answer
+/// is to buy nothing until tomorrow. The spend carries over only for the
+/// anchor it was recorded under; a new session starts at zero.
+#[must_use]
+pub fn restore_topup(
+    path: &std::path::Path,
+    address: [u8; 20],
+    today: u64,
+    anchor_set_s: u64,
+) -> (u64, u64, i64) {
+    // COPY: one ≤ 120 B state line read into a String at BOOT — the
+    // restore path, once per process; never the tick path.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (today, 0, 0),
+        Err(_) => return (today, u64::MAX, 0),
+    };
+    let Some(s) = TopupState::from_line(&text, address) else {
+        return (today, u64::MAX, 0);
+    };
+    let used = if s.day == today { s.used } else { 0 };
+    let cost = if anchor_set_s != 0 && s.anchor_set_s == anchor_set_s {
+        s.cost_1e6
+    } else {
+        0
+    };
+    (today, used, cost)
+}
+
+/// **S7-L1** — write the top-up state durably (temp file, `sync_all`,
+/// rename). After every top-up that left the host: rare, on the idle
+/// path, never the tick path.
+///
+/// # Errors
+/// The temp write, the fsync or the rename failed; the message names
+/// the path.
+pub fn store_topup(path: &std::path::Path, address: &[u8; 20], s: TopupState) -> Result<(), String> {
+    core_io::write_atomic(path, &s.to_line(address))
 }
 
 /// Read the budget for `address` from `path`.
@@ -378,16 +534,28 @@ mod tests {
             br#"{"cumVlm":"0.0","nRequestsUsed":5,"nRequestsCap":10000,"nRequestsSurplus":0}"#;
         const TESTNET: &[u8] =
             br#"{"cumVlm":"42.0","nRequestsUsed":95,"nRequestsCap":10042,"nRequestsSurplus":0}"#;
-        let (used, vlm) = scan_rate_limit(MAINNET).expect("mainnet shape");
-        assert_eq!((used, vlm), (5, 0));
-        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm);
+        let (used, vlm, surplus) = scan_rate_limit(MAINNET).expect("mainnet shape");
+        assert_eq!((used, vlm, surplus), (5, 0, 0));
+        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm, surplus);
         assert_eq!(b.remaining(), 10_000 - 5);
         assert!(b.may_submit().is_ok(), "9 995 is over any sane floor");
 
-        let (used, vlm) = scan_rate_limit(TESTNET).expect("testnet shape");
-        assert_eq!((used, vlm), (95, 42_000_000));
-        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm);
+        let (used, vlm, surplus) = scan_rate_limit(TESTNET).expect("testnet shape");
+        assert_eq!((used, vlm, surplus), (95, 42_000_000, 0));
+        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm, surplus);
         assert_eq!(b.remaining(), 10_042 - 95, "cap − used, as the venue says");
+
+        // S7-L1: the surplus is optional on the wire and reads 0 absent.
+        let bare = br#"{"cumVlm":"1.0","nRequestsUsed":7}"#;
+        assert_eq!(scan_rate_limit(bare), Some((7, 1_000_000, 0)));
+        // ...and counts only beside a cap that is exactly the grant plus
+        // volume (the docs' own example: 10 000 + 2 854 574).
+        let docs = br#"{"cumVlm":"2854574.593578","nRequestsUsed":2890,"nRequestsCap":2864574,"nRequestsSurplus":7}"#;
+        assert_eq!(scan_rate_limit(docs).map(|t| t.2), Some(7));
+        let carried = br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsCap":15000,"nRequestsSurplus":5000}"#;
+        assert_eq!(scan_rate_limit(carried).map(|t| t.2), Some(0), "a cap that carries it");
+        let uncapped = br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsSurplus":5000}"#;
+        assert_eq!(scan_rate_limit(uncapped).map(|t| t.2), Some(0), "unprovable");
 
         // Half an answer is no answer.
         assert!(scan_rate_limit(br#"{"nRequestsUsed":5}"#).is_none());
@@ -403,6 +571,76 @@ mod tests {
         );
         let mut tiny = [0u8; 8];
         assert!(rate_limit_request(&mut tiny, &ADDR).is_err());
+    }
+
+    /// **S7-L1 — reserved weight is headroom, in both of the venue's
+    /// regimes.** Reserved beyond use, the venue reports `used = 0` and
+    /// the rest as `nRequestsSurplus`; used beyond the reserve, it nets
+    /// the reserve out of `used`. Either way `remaining()` is
+    /// `cap − used + reserved`, and a reserve accepted mid-session adds
+    /// exactly its weight.
+    #[test]
+    fn reserved_weight_is_headroom_in_both_of_the_venues_regimes() {
+        // 10 000 cap, 3 000 used, 5 000 reserved: surplus 2 000.
+        let over = br#"{"cumVlm":"0.0","nRequestsUsed":0,"nRequestsCap":10000,"nRequestsSurplus":2000}"#;
+        let (used, vlm, surplus) = scan_rate_limit(over).expect("shape");
+        let b = AddressBudget::from_venue(ADDR, 2000, used, vlm, surplus);
+        assert_eq!(b.remaining(), 10_000 - 3_000 + 5_000);
+
+        // 10 000 cap, 9 000 used, 5 000 reserved: used nets to 4 000.
+        let under = br#"{"cumVlm":"0.0","nRequestsUsed":4000,"nRequestsCap":10000,"nRequestsSurplus":0}"#;
+        let (used, vlm, surplus) = scan_rate_limit(under).expect("shape");
+        let mut b = AddressBudget::from_venue(ADDR, 2000, used, vlm, surplus);
+        assert_eq!(b.remaining(), 10_000 - 9_000 + 5_000);
+
+        // A reserve accepted now adds its weight; the action that
+        // bought it is one request like any other.
+        b.on_action_sent(1);
+        b.on_reserved(5_000);
+        assert_eq!(b.remaining(), 6_000 - 1 + 5_000);
+        assert!(b.may_submit().is_ok());
+    }
+
+    /// **S7-L1 — the top-up's state.** The line round-trips for its own
+    /// address only; a missing file is a fresh start; a garbled or
+    /// foreign one reads as the day's ceiling spent; the day's usage
+    /// carries only within its day and the spend only under its anchor.
+    #[test]
+    fn the_topup_state_restores_conservatively() {
+        let s = TopupState {
+            day: 20_720,
+            used: 10_000,
+            anchor_set_s: 1_790_200_000,
+            cost_1e6: 5_000_000,
+        };
+        let line = s.to_line(&ADDR);
+        assert_eq!(
+            line,
+            "0xabababababababababababababababababababab\t20720\t10000\t1790200000\t5000000\n"
+        );
+        assert_eq!(TopupState::from_line(&line, ADDR), Some(s));
+        assert_eq!(TopupState::from_line(&line, OTHER), None);
+        assert_eq!(TopupState::from_line("0xab\t1\t2\t3\t-4", ADDR), None, "negative");
+
+        let dir = std::env::temp_dir().join(format!("mv-topup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(TOPUP_STATE_PATH);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(restore_topup(&path, ADDR, 20_720, 1_790_200_000), (20_720, 0, 0), "fresh");
+
+        store_topup(&path, &ADDR, s).expect("stores");
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_720, 1_790_200_000),
+            (20_720, 10_000, 5_000_000),
+            "same day, same session"
+        );
+        assert_eq!(restore_topup(&path, ADDR, 20_721, 1_790_200_000), (20_721, 0, 5_000_000));
+        assert_eq!(restore_topup(&path, ADDR, 20_720, 1_790_300_000), (20_720, 10_000, 0));
+        assert_eq!(restore_topup(&path, ADDR, 20_720, 0), (20_720, 10_000, 0), "unanchored");
+        assert_eq!(restore_topup(&path, OTHER, 20_720, 1), (20_720, u64::MAX, 0), "foreign");
+        std::fs::write(&path, "garbage").unwrap();
+        assert_eq!(restore_topup(&path, ADDR, 20_720, 1), (20_720, u64::MAX, 0), "garbled");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **A cold boot must not hand itself the allowance** — the

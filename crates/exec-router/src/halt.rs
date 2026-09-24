@@ -294,11 +294,12 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     }
     // E7 session bound — last, because it is the operator's stopping
     // rule and not a fault: when a fault and the bound coincide the
-    // fault is the thing to read. Judged only while FLAT (the arm
-    // reports `pnl_flat` = anchor set AND no outcome leg held), so a
-    // position's premium never reads as a loss and a payout not yet
-    // settled never reads as a gain.
-    if sig.pnl_flat != 0 {
+    // fault is the thing to read. Judged whenever the arm reports
+    // `pnl_judged` (anchored, and the account read since boot). The
+    // arm values held legs at cost, so a position's premium never
+    // reads as a loss and a payout not yet settled never reads as a
+    // gain — and a book that is never flat is still judged (S7-L1).
+    if sig.pnl_judged != 0 {
         if lim.pnl_gain_usd_1e6 > 0 && sig.pnl_delta_usd_1e6 >= lim.pnl_gain_usd_1e6 {
             return HaltReason::PnlGain;
         }
@@ -626,11 +627,12 @@ mod tests {
         assert_eq!(trigger_for(&s, &lim()), HaltReason::AssetRefusals);
     }
 
-    /// **E7 session bound.** Judged only while the arm reports FLAT;
-    /// the gain side at `>=`, the loss side at `<=`; a zero limit is
-    /// no bound; and a fault outranks the bound when both hold.
+    /// **E7 session bound.** Judged only while the arm reports it
+    /// judgeable (anchored and read since boot); the gain side at
+    /// `>=`, the loss side at `<=`; a zero limit is no bound; and a
+    /// fault outranks the bound when both hold.
     #[test]
-    fn the_session_bound_halts_only_when_flat_and_only_where_the_operator_wrote() {
+    fn the_session_bound_halts_only_when_judged_and_only_where_the_operator_wrote() {
         let bound = lim().with_pnl_bound(15_000_000, 5_000_000);
         let mut s = healthy().with_pnl(true, 14_999_999);
         assert_eq!(trigger_for(&s, &bound), HaltReason::None, "$14.999999 is not $15");
@@ -641,10 +643,10 @@ mod tests {
         s.pnl_delta_usd_1e6 = -5_000_000;
         assert_eq!(trigger_for(&s, &bound), HaltReason::PnlLoss);
 
-        // Not flat: the same delta is an open position's premium, not
-        // a loss, and no bound is judged.
-        s.pnl_flat = 0;
-        assert_eq!(trigger_for(&s, &bound), HaltReason::None, "an open leg has no P&L");
+        // Not judgeable (unanchored, or nothing read since boot): no
+        // bound is judged, at any delta.
+        s.pnl_judged = 0;
+        assert_eq!(trigger_for(&s, &bound), HaltReason::None, "not judged, not halted");
         s.pnl_delta_usd_1e6 = 40_000_000;
         assert_eq!(trigger_for(&s, &bound), HaltReason::None);
 

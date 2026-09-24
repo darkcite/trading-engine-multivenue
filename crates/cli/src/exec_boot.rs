@@ -505,12 +505,15 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         let loss = s.map_or(0, |s| s.halt_on_loss_usd_1e6) / 1_000_000;
         lines.push(format!(
             "exec: slot {slot} HALTS reject_streak={} asset_refusals={} recon_drift=${drift} \
-             recon_stale_ms={} ws_gap_ms={} budget_floor={} session_bound=+${gain}/-${loss} halt_file={}",
+             recon_stale_ms={} ws_gap_ms={} budget_floor={} topup={}/{} \
+             session_bound=+${gain}/-${loss} halt_file={}",
             s.map_or(0, |s| s.halt_on_reject_streak),
             s.map_or(0, |s| s.halt_on_asset_refusal_streak),
             s.map_or(0, |s| s.halt_on_recon_stale_ms),
             s.map_or(0, |s| s.halt_on_ws_gap_ms),
             s.map_or(0, |s| s.request_budget_floor),
+            s.map_or(0, |s| s.request_topup_weight),
+            s.map_or(0, |s| s.request_topup_day_max),
             halt_file_path(&boot.path).display(),
         ));
     }
@@ -928,8 +931,8 @@ mod tests {
         assert_eq!(
             lines[2],
             "exec: slot 3 HALTS reject_streak=5 asset_refusals=3 recon_drift=$5 \
-             recon_stale_ms=300000 ws_gap_ms=30000 budget_floor=2000 session_bound=+$0/-$0 \
-             halt_file=/tmp/exec.HALT"
+             recon_stale_ms=300000 ws_gap_ms=30000 budget_floor=2000 topup=0/0 \
+             session_bound=+$0/-$0 halt_file=/tmp/exec.HALT"
         );
         // The stale E1 wording must never come back: it described a
         // clamp that did not exist, and after E6 it described one

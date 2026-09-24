@@ -1065,9 +1065,15 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         }
     }
 
-    /// Call `on_stop` on the owned strategy, then drain the fills
-    /// capture (orderly-shutdown path; drop would also drain, but an
-    /// explicit flush surfaces the I/O error counter first).
+    /// Call `on_stop` on the owned strategy, let the dispatcher take
+    /// its resting orders off any venue, then drain the fills capture
+    /// (orderly-shutdown path; drop would also drain, but an explicit
+    /// flush surfaces the I/O error counter first).
+    ///
+    /// **S7-L1** — `OrderDispatch::on_shutdown` runs AFTER the members'
+    /// `on_stop`, so a member that cancels its own orders there goes
+    /// first and the dispatcher's sweep takes whatever is left. A no-op
+    /// for every dispatcher that models rather than trades.
     pub fn stop(&mut self) {
         let mut ctx = EngineCtx {
             disp: &mut self.disp,
@@ -1078,6 +1084,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             now: now_ns(),
         };
         self.strat.on_stop(&mut ctx);
+        self.disp.on_shutdown();
         if let Some(cap) = self.fill_capture.as_mut() {
             // Sticky-disable policy: errors here are counted by the
             // sink itself; nothing to propagate at teardown.

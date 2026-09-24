@@ -478,9 +478,17 @@ if slot_ready 0020; then
       # nothing and can never un-settle a row. Non-fatal like the report
       # above — a failed night is retried by tomorrow's, because the
       # capture is what is precious, not the derivation.
+      #
+      # S7-L1: once slot 3 trades live, ~/multivenue/bin15.toml is the
+      # LIVE-sized artifact, and the replay must keep scoring the PAPER
+      # law — the arming step copies the paper artifact to
+      # bin15.paper-s7.toml first, and the replay reads that copy when
+      # it exists.
       if [ -f "$HOME/multivenue/bin15.toml" ]; then
-        echo "daily-restart: 0020 bin15 accrual (closed UTC day)" >&2
-        uv run python -m claude_worker.bin15_accrue accrue >&2 ||
+        b15="$HOME/multivenue/bin15.toml"
+        [ -f "$HOME/multivenue/bin15.paper-s7.toml" ] && b15="$HOME/multivenue/bin15.paper-s7.toml"
+        echo "daily-restart: 0020 bin15 accrual (closed UTC day, $b15)" >&2
+        uv run python -m claude_worker.bin15_accrue accrue --bin15 "$b15" >&2 ||
           echo "daily-restart: bin15 accrual failed (non-fatal; tomorrow retries)" >&2
       fi
     )

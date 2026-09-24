@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 15] = [
+const SLOT_KEYS: [&str; 17] = [
     "mode",
     "name",
     "venues",
@@ -87,6 +87,8 @@ const SLOT_KEYS: [&str; 15] = [
     "cap_day_usd_1e6",
     "cap_instance_usd_1e6",
     "request_budget_floor",
+    "request_topup_weight",
+    "request_topup_day_max",
     "halt_on_reject_streak",
     "halt_on_recon_drift_usd_1e6",
     "halt_on_ws_gap_ms",
@@ -181,6 +183,17 @@ pub struct ExecSlot {
     /// Address request-budget floor below which the governor stops
     /// placing. 0 = unset. Carried for E4's governor.
     pub request_budget_floor: i64,
+    /// **S7-L1 (gap E)** — request weight the Hyperliquid arm buys per
+    /// top-up (`reserveRequestWeight`, paid from the account's PERPS
+    /// balance at the venue's price per request) when the address
+    /// headroom comes within this much of `request_budget_floor`.
+    /// `0` = no top-up: the floor halts the slot as it always did.
+    pub request_topup_weight: i64,
+    /// **S7-L1 (gap E)** — the most weight the top-up may buy per UTC
+    /// day: the operator's ceiling on what the arm spends on requests.
+    /// Required, and at least one top-up, when `request_topup_weight`
+    /// is set.
+    pub request_topup_day_max: i64,
     /// Consecutive venue rejections that trip a sticky halt. 0 = unset.
     /// Carried for E6.
     pub halt_on_reject_streak: i64,
@@ -213,17 +226,18 @@ pub struct ExecSlot {
     pub halt_on_recon_stale_ms: i64,
     /// **E7 (operator ruling 2026-09-19: "run until it either earns
     /// +15 USDC or loses 5 USDC")** — the SESSION BOUND. USD ×1e6 of
-    /// spot-USDC gain over the anchor (the balance at the first flat
-    /// reconciliation, persisted beside this file) at which the slot
-    /// halts sticky. `0` = no bound. OPTIONAL even on a live slot: it
-    /// is the operator's stopping rule, not a fault detector, and the
+    /// gain in the account's equity at cost (spot USDC plus the held
+    /// legs' cost basis) over the anchor (that equity at the session's
+    /// first reconciliation, persisted beside this file) at which the
+    /// slot halts sticky. `0` = no bound. OPTIONAL even on a live slot:
+    /// it is the operator's stopping rule, not a fault detector, and the
     /// five fault halts above stay required whatever this says.
     pub halt_on_gain_usd_1e6: i64,
-    /// The loss side of the same bound: USD ×1e6 of spot-USDC loss
-    /// under the anchor at which the slot halts sticky. `0` = no
-    /// bound. Both are judged only when the account is FLAT (no
-    /// outcome leg held), so an open position's premium never reads
-    /// as a loss.
+    /// The loss side of the same bound: USD ×1e6 of equity-at-cost
+    /// loss under the anchor at which the slot halts sticky. `0` = no
+    /// bound. Both are judged at every reconciliation, legs held or not
+    /// (S7-L1): at cost, an open position's premium never reads as a
+    /// loss, and a book that is never flat is still bounded.
     pub halt_on_loss_usd_1e6: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
@@ -243,6 +257,8 @@ impl ExecSlot {
             cap_day_usd_1e6: 0,
             cap_instance_usd_1e6: 0,
             request_budget_floor: 0,
+            request_topup_weight: 0,
+            request_topup_day_max: 0,
             halt_on_reject_streak: 0,
             halt_on_recon_drift_usd_1e6: 0,
             halt_on_ws_gap_ms: 0,
@@ -260,6 +276,19 @@ impl ExecSlot {
         self.mode == "live"
     }
 }
+
+/// **S7-L1** — the largest `request_topup_weight` a slot may write:
+/// 100 000 requests, $50 at the venue's 0.0005 USDC a request.
+pub const REQUEST_TOPUP_WEIGHT_MAX: i64 = 100_000;
+
+/// **S7-L1** — the smallest non-zero `request_topup_weight`: 1 000
+/// requests, $0.50. A purchase is itself a request, so a tiny weight
+/// buys almost nothing per round trip.
+pub const REQUEST_TOPUP_WEIGHT_MIN: i64 = 1_000;
+
+/// **S7-L1** — the largest `request_topup_day_max`: 1 000 000
+/// requests, $500 a day at the same price.
+pub const REQUEST_TOPUP_DAY_MAX: i64 = 1_000_000;
 
 /// `exec_router::LEDGER_RESTING`, mirrored.
 ///
@@ -447,6 +476,8 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         cap_day_usd_1e6: opt_int(kv, "cap_day_usd_1e6", 0)?,
         cap_instance_usd_1e6: opt_int(kv, "cap_instance_usd_1e6", 0)?,
         request_budget_floor: opt_int(kv, "request_budget_floor", 0)?,
+        request_topup_weight: opt_int(kv, "request_topup_weight", 0)?,
+        request_topup_day_max: opt_int(kv, "request_topup_day_max", 0)?,
         halt_on_reject_streak: opt_int(kv, "halt_on_reject_streak", 0)?,
         halt_on_ws_gap_ms: opt_int(kv, "halt_on_ws_gap_ms", 0)?,
         halt_on_asset_refusal_streak: opt_int(kv, "halt_on_asset_refusal_streak", 0)?,
@@ -548,6 +579,35 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
                 )));
             }
         }
+    }
+
+    // S7-L1 (gap E): a top-up is money the arm spends on its own, so
+    // the operator writes the day's ceiling with it — and a ceiling
+    // under one top-up would arm a top-up that can never fire. Both
+    // are bounded, so a slipped digit is a refusal and not a bill.
+    if s.request_topup_weight > REQUEST_TOPUP_WEIGHT_MAX
+        || s.request_topup_day_max > REQUEST_TOPUP_DAY_MAX
+        || (s.request_topup_weight > 0 && s.request_topup_weight < REQUEST_TOPUP_WEIGHT_MIN)
+    {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `request_topup_weight` is {REQUEST_TOPUP_WEIGHT_MIN}..=\
+             {REQUEST_TOPUP_WEIGHT_MAX} (or 0, off) and `request_topup_day_max` at most \
+             {REQUEST_TOPUP_DAY_MAX}"
+        )));
+    }
+    if s.request_topup_weight > 0 && s.request_topup_day_max < s.request_topup_weight {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `request_topup_weight = {}` needs a \
+             `request_topup_day_max` of at least that — the day's ceiling on what the \
+             arm spends buying requests",
+            s.request_topup_weight
+        )));
+    }
+    if s.request_topup_day_max > 0 && s.request_topup_weight == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `request_topup_day_max` without \
+             `request_topup_weight` arms nothing — write both, or neither"
+        )));
     }
 
     // E6: and it must fit the table the clamp is counted in.
@@ -764,6 +824,50 @@ mode = "paper"
         assert_eq!(f.slot(3).halt_on_loss_usd_1e6, 0);
         expect_err(
             &EXAMPLE.replace("halt_on_loss_usd_1e6 = 5000000", "halt_on_loss_usd_1e6 = -5000000"),
+            "must be >= 0",
+        );
+    }
+
+    /// **S7-L1 (gap E).** The request-weight top-up is optional and
+    /// off by default; when written, its day ceiling comes with it and
+    /// holds at least one top-up; a ceiling alone arms nothing; both
+    /// are bounded.
+    #[test]
+    fn the_request_topup_is_optional_and_carries_its_own_ceiling() {
+        let f = parse(MINIMAL_LIVE).expect("a live slot without a top-up parses");
+        assert_eq!(f.slot(3).request_topup_weight, 0);
+        assert_eq!(f.slot(3).request_topup_day_max, 0);
+
+        let with = format!("{MINIMAL_LIVE}request_topup_weight = 5000\nrequest_topup_day_max = 30000\n");
+        let s3 = parse(&with).expect("parses").slot(3);
+        assert_eq!((s3.request_topup_weight, s3.request_topup_day_max), (5_000, 30_000));
+
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_weight = 5000\n"),
+            "needs a `request_topup_day_max`",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_weight = 5000\nrequest_topup_day_max = 4999\n"),
+            "needs a `request_topup_day_max`",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_day_max = 30000\n"),
+            "arms nothing",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_weight = 100001\nrequest_topup_day_max = 200000\n"),
+            "at most",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_weight = 999\nrequest_topup_day_max = 30000\n"),
+            "(or 0, off)",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_weight = 5000\nrequest_topup_day_max = 1000001\n"),
+            "at most",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}request_topup_weight = -1\n"),
             "must be >= 0",
         );
     }

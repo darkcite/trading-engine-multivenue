@@ -5194,7 +5194,7 @@ const LEDGER_COUNTER_NAMES: [&str; 6] = [
 /// order — one per `clob_dispatcher::LiveArmCounters` counter field,
 /// mirrored by [`live_arm_counter_values`], which is what pins the two
 /// together.
-const LIVE_ARM_COUNTER_NAMES: [&str; 25] = [
+const LIVE_ARM_COUNTER_NAMES: [&str; 30] = [
     "engine_exec_hl_submitted_total",
     "engine_exec_hl_rejected_total",
     "engine_exec_hl_ioc_missed_total",
@@ -5220,6 +5220,11 @@ const LIVE_ARM_COUNTER_NAMES: [&str; 25] = [
     "engine_exec_hl_rolls_bound_total",
     "engine_exec_hl_rolls_refused_total",
     "engine_exec_hl_owner_contested_total",
+    "engine_exec_hl_sweep_all_cancelled_total",
+    "engine_exec_hl_topup_ok_total",
+    "engine_exec_hl_topup_failed_total",
+    "engine_exec_hl_day_sync_ok_total",
+    "engine_exec_hl_day_sync_failed_total",
 ];
 
 /// `LiveArmCounters`' counter fields in [`LIVE_ARM_COUNTER_NAMES`]
@@ -5227,12 +5232,15 @@ const LIVE_ARM_COUNTER_NAMES: [&str; 25] = [
 /// the last reconciliation, mirrored as monotonic counters like the
 /// bin15 dormant-families level is — a rising series means the
 /// comparisons keep disagreeing, and `/state` carries the level.
-// COPY: [u64; 25] (200 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 30] (240 B) returned by value — cold, the 5 s /metrics
 // mirror; the struct's fields are visited once in the metric name order
 // and the array is what the registry's delta loop indexes — rejected:
-// an out-param, for 200 B five times a minute.
+// an out-param, for 240 B twice every 5 s (cur and last).
+// `sweep_all_left` is not mirrored: it is a level whose "unreadable"
+// sentinel is `u64::MAX`, which a delta counter would read as a jump;
+// the drain logs it.
 #[inline]
-fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 25] {
+fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 30] {
     [
         a.submitted,
         a.rejected,
@@ -5259,6 +5267,11 @@ fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 25] {
         a.rolls_bound,
         a.rolls_refused,
         a.owner_contested,
+        a.sweep_all_cancelled,
+        a.topup_ok,
+        a.topup_failed,
+        a.day_sync_ok,
+        a.day_sync_failed,
     ]
 }
 
@@ -7812,6 +7825,17 @@ where
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
     eng.stop();
+    // S7-L1: what the live arm's shutdown sweep did — every resting
+    // order of ours taken off the venue, or how many it could not
+    // confirm (`u64::MAX`: the open orders could not be read).
+    let ec = eng.dispatcher().exec_counters();
+    if ec.configured != 0 {
+        tracing::info!(
+            cancelled_total = ec.arm.sweep_all_cancelled,
+            left = ec.arm.sweep_all_left,
+            "exec: shutdown sweep of resting orders done"
+        );
+    }
     let total = EngineLoopResult::Done(EngineLoopStats {
         iterations: eng.iterations,
         ticks_dispatched: eng.ticks_dispatched,

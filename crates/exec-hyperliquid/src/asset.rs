@@ -73,6 +73,41 @@ pub const COIN_MAX: usize = 20;
 /// directly, the mistake would have been silent non-booking at best.
 const _NAMESPACE_NOTE: () = ();
 
+/// **S7-L1 — the asset id a CANCEL may name, read off the venue's own
+/// coin name**: `#<enc>` → `ASSET_BASE + enc`.
+///
+/// Not a way round LAW E-4. That law refuses to DERIVE an id for an
+/// ORDER, because a derived id can place a real order on someone
+/// else's market. A cancel cannot: it names an oid the venue itself
+/// just reported as resting and ours, and an id that disagreed with
+/// that oid would have the venue refuse the cancel — never touch
+/// another market. The boot and shutdown sweeps need it because the
+/// orders they take back can sit on instances no roll of THIS process
+/// ever bound.
+///
+/// `None` for anything but `#` and canonical decimal digits (no sign,
+/// no leading zero) naming an id that fits `u32`.
+#[must_use]
+pub(crate) fn asset_of_fill_coin(coin: &[u8]) -> Option<u32> {
+    if coin.len() < 2 || coin.len() > COIN_MAX || coin[0] != b'#' {
+        return None;
+    }
+    if coin.len() > 2 && coin[1] == b'0' {
+        return None;
+    }
+    let mut enc: u32 = 0;
+    let mut i = 1usize;
+    while i < coin.len() {
+        let d = coin[i];
+        i += 1;
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        enc = enc.checked_mul(10)?.checked_add(u32::from(d - b'0'))?;
+    }
+    ASSET_BASE.checked_add(enc)
+}
+
 /// Why a lookup did not produce an asset id.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AssetError {
@@ -761,6 +796,24 @@ mod tests {
         assert_eq!(AssetTable::asset_id(3253, 0).expect("in range"), 100_032_530);
         assert_eq!(AssetTable::asset_id(3253, 1).expect("in range"), 100_032_531);
         assert_eq!(AssetTable::asset_id(0, 0).expect("in range"), 100_000_000);
+    }
+
+    /// **S7-L1.** A cancel's asset id from the venue's `#<enc>` — the
+    /// same formula as [`AssetTable::asset_id`], and nothing but the
+    /// canonical fill-namespace spelling is read.
+    #[test]
+    fn a_cancel_reads_the_asset_id_off_the_venues_coin_name() {
+        assert_eq!(asset_of_fill_coin(b"#32530"), AssetTable::asset_id(3253, 0));
+        assert_eq!(asset_of_fill_coin(b"#194180"), Some(ASSET_BASE + 194_180));
+        assert_eq!(asset_of_fill_coin(b"#0"), Some(ASSET_BASE));
+        assert_eq!(asset_of_fill_coin(b"#4194967295"), Some(u32::MAX), "the last id");
+        assert_eq!(asset_of_fill_coin(b"#4194967296"), None, "past u32");
+        assert_eq!(asset_of_fill_coin(b"#99999999999"), None, "past u32 in the digits");
+        assert_eq!(asset_of_fill_coin(b"+194180"), None, "a balance name");
+        assert_eq!(asset_of_fill_coin(b"#0194180"), None, "a leading zero");
+        assert_eq!(asset_of_fill_coin(b"#-1"), None);
+        assert_eq!(asset_of_fill_coin(b"#"), None);
+        assert_eq!(asset_of_fill_coin(b"BTC"), None);
     }
 
     #[test]

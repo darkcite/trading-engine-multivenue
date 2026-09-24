@@ -29,18 +29,19 @@
 //!
 //! ## Two checks, and they cover different halves
 //!
-//! 1. **The chain, over all 25 rows.** For every vector, recompute the
+//! 1. **The chain, over all 27 rows.** For every vector, recompute the
 //!    connection id, the `Agent` EIP-712 digest and the 65-byte
 //!    signature from the SDK's *recorded* msgpack. This covers keccak,
 //!    the domain separator, the nonce/vault/expiry framing and
 //!    secp256k1 — but takes the action bytes as given, so it cannot
 //!    catch a key-order change.
-//! 2. **The encoders, over all four action types.** Rebuild the
+//! 2. **The encoders, over all five action types.** Rebuild the
 //!    msgpack from inputs written out below and compare it to the
 //!    recorded bytes. This is the half that catches LAW E-3, and it is
 //!    why one case per action type is the minimum: `order`, `cancel`,
-//!    `cancelByCloid` and `batchModify` (whose payload nests an
-//!    `OrderWire`, so it covers the order key order a second time).
+//!    `cancelByCloid`, `batchModify` (whose payload nests an
+//!    `OrderWire`, so it covers the order key order a second time) and
+//!    `reserveRequestWeight` (S7-L1, the request-budget top-up).
 //!
 //! The inputs below are a second statement of what `gen_vectors.py`
 //! fed the SDK. They cannot drift silently: if they ever stop matching
@@ -74,12 +75,12 @@ const TEST_KEY: [u8; 32] = [
 /// sends, not a round number that would hide an arithmetic bug.
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 
-/// The fixture's row count, EXACTLY. The header says "all 25", so the
-/// gate asserts 25 — a `>= 20` (the first cut) let five rows vanish
+/// The fixture's row count, EXACTLY. The header says "all 27", so the
+/// gate asserts 27 — a `>= 20` (the first cut) let five rows vanish
 /// with both gates still green, which is a claim the code did not
 /// test. Regenerating the fixture with more vectors moves this number
-/// on purpose.
-pub const VECTOR_ROWS: u32 = 25;
+/// on purpose (S7-L1 moved it from 25 for the two request-weight rows).
+pub const VECTOR_ROWS: u32 = 27;
 
 /// Why the binary failed to certify itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +207,7 @@ pub fn run() -> Result<SelfTestReport, SelfTestErr> {
     }
 
     if rows != VECTOR_ROWS {
-        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 25 vectors"));
+        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 27 vectors"));
     }
 
     let encoders = check_encoders()?;
@@ -255,7 +256,13 @@ fn check_encoders() -> Result<u32, SelfTestErr> {
     .map_err(|_| SelfTestErr::Encode("batchModify"))?;
     want("batch_modify_1", &buf[..n], "batchModify")?;
 
-    Ok(4)
+    // S7-L1: the request-budget top-up — the one action the arm signs
+    // that is neither an order nor a cancel.
+    let n = crate::action::encode_reserve_weight(&mut buf, 5_000)
+        .map_err(|_| SelfTestErr::Encode("reserveRequestWeight"))?;
+    want("reserve_weight", &buf[..n], "reserveRequestWeight")?;
+
+    Ok(5)
 }
 
 /// The cloid `gen_vectors.py` used for the cloid-bearing cases.
@@ -330,7 +337,7 @@ mod tests {
     fn this_binary_certifies_itself() {
         let r = run().expect("the embedded vectors must reproduce");
         assert_eq!(r.rows, VECTOR_ROWS, "{r:?}");
-        assert_eq!(r.encoders, 4, "one case per action type, no fewer");
+        assert_eq!(r.encoders, 5, "one case per action type, no fewer");
     }
 
     /// The self-test is only worth running if it can FAIL. Feed the

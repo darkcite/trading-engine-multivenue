@@ -197,6 +197,22 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
     fn arm_counters(&self) -> LiveArmCounters {
         self.a.arm_counters()
     }
+
+    /// Both arms take their own orders off the venue on the way out.
+    fn on_shutdown(&mut self) {
+        self.a.on_shutdown();
+        self.b.on_shutdown();
+    }
+
+    /// Each slot's day, from the arm that trades it.
+    #[inline]
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        if slot == self.slot as usize {
+            self.b.venue_day_bought(slot)
+        } else {
+            self.a.venue_day_bought(slot)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +228,8 @@ mod tests {
         cancelled: Vec<u64>,
         fills: Vec<Fill>,
         retired: Vec<(u64, u8)>,
+        day: Option<(u64, i64)>,
+        shutdowns: u32,
         sig: HaltSignal,
         cancel_all_calls: u32,
         cancel_all_err: bool,
@@ -236,6 +254,12 @@ mod tests {
         }
         fn try_next_retired(&mut self) -> Option<(u64, u8)> {
             self.retired.pop()
+        }
+        fn on_shutdown(&mut self) {
+            self.shutdowns += 1;
+        }
+        fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
+            self.day
         }
         fn stats(&self) -> DispatchStats {
             DispatchStats::default()
@@ -324,6 +348,17 @@ mod tests {
         assert_eq!(s.try_next_retired(), Some((5, 3)));
         assert_eq!(s.try_next_retired(), Some((6, 0)));
         assert_eq!(s.try_next_retired(), None);
+    }
+
+    #[test]
+    fn shutdown_reaches_both_arms_and_each_slot_reads_its_own_day() {
+        let mut s = split();
+        s.a_mut().day = Some((20_000, 7));
+        s.b_mut().day = Some((20_000, 9));
+        assert_eq!(s.venue_day_bought(3), Some((20_000, 7)));
+        assert_eq!(s.venue_day_bought(0), Some((20_000, 9)));
+        s.on_shutdown();
+        assert_eq!((s.a().shutdowns, s.b().shutdowns), (1, 1));
     }
 
     #[test]

@@ -719,6 +719,37 @@ pub trait OrderDispatch {
     fn arm_counters(&self) -> LiveArmCounters {
         LiveArmCounters::default()
     }
+
+    /// **S7-L1 — the engine is stopping: take every resting order of
+    /// ours off the venue, NOW.**
+    ///
+    /// Called once, from `Engine::stop`, after the members' `on_stop`.
+    /// Blocking and bounded — unlike [`Self::cancel_all`], which queues
+    /// work for idle moments that at shutdown will not come. A restart
+    /// boots every member flat: a paper matcher's resting orders die
+    /// with its process, and a live quote left on the venue would fill
+    /// into a position no member of the next process knows it has.
+    ///
+    /// Defaulted to a no-op: a dispatcher that models rather than
+    /// trades has nothing resting anywhere but in its own memory.
+    #[inline]
+    fn on_shutdown(&mut self) {}
+
+    /// **S7-L1 — what the VENUE says `slot` bought today**:
+    /// `(UTC day number, filled BUY notional since that day's 00:00Z,
+    /// USD ×1e6)`, from the venue's own fill history, or `None` until
+    /// the arm has read it.
+    ///
+    /// The router adopts it into its day cap (never lowering it), which
+    /// is what makes `cap_day_usd_1e6` survive a restart: the router's
+    /// own count starts at zero on every boot, the venue's does not.
+    /// The day number is `wall_ms / 86 400 000` — the ledger's day
+    /// epoch. Defaulted to `None`: a paper matcher has no history
+    /// outside its own memory.
+    #[inline]
+    fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
+        None
+    }
 }
 
 /// **E7 — the live arm's operator numbers**, carried across the
@@ -786,17 +817,41 @@ pub struct LiveArmCounters {
     /// The address request budget's remaining headroom, per the
     /// governor. Negative = past the venue's cliff.
     pub budget_remaining: i64,
-    /// **E7 session bound** — the spot USDC (USD ×1e6) the session's
-    /// P&L is measured from: the balance at the first FLAT
-    /// reconciliation, persisted across restarts. `0` = not anchored
-    /// yet.
+    /// **E7 session bound** — the equity AT COST (spot USDC plus the
+    /// held legs' cost basis, USD ×1e6) the session's P&L is measured
+    /// from: the account at its first reconciliation, persisted across
+    /// restarts. `0` = not anchored yet.
     pub pnl_anchor_usd_1e6: i64,
-    /// **E7 session bound** — spot USDC minus the anchor at the last
-    /// reconciliation, USD ×1e6, signed. A LEVEL; `0` while not
-    /// anchored. The number `halt_on_gain_usd_1e6` /
-    /// `halt_on_loss_usd_1e6` are judged against while flat.
+    /// **E7 session bound** — the equity at cost minus the anchor at
+    /// the last reconciliation, USD ×1e6, signed. A LEVEL; `0` while
+    /// not anchored. The number `halt_on_gain_usd_1e6` /
+    /// `halt_on_loss_usd_1e6` are judged against — legs held or not
+    /// (S7-L1).
     pub session_pnl_usd_1e6: i64,
+    /// **S7-L1** — cancels the account-wide sweep (boot and shutdown)
+    /// had the venue confirm. A total.
+    pub sweep_all_cancelled: u64,
+    /// **S7-L1** — orders of ours the last account-wide sweep could
+    /// not confirm gone. A level; `u64::MAX` = the venue's open orders
+    /// could not be read, which is NOT clear.
+    pub sweep_all_left: u64,
+    /// **S7-L1** — request-weight top-ups the venue accepted.
+    pub topup_ok: u64,
+    /// **S7-L1** — request-weight top-up checks that failed.
+    pub topup_failed: u64,
+    /// **S7-L1** — day-spend reads (`userFillsByTime`) that parsed.
+    pub day_sync_ok: u64,
+    /// **S7-L1** — day-spend reads that did not. While the first read
+    /// of a boot keeps failing, a slot under restart safety stays
+    /// unseeded and refuses every live place.
+    pub day_sync_failed: u64,
 }
+
+// S7-L1: both counter blocks cross the `OrderDispatch` boundary BY
+// VALUE (`// COPY:` at `exec_router::RoutedDispatcher::exec_counters`),
+// and the byte bounds those comments state have drifted twice. Pinned.
+const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 568);
 
 /// **What the venue has told us about a requested cancel-all.**
 ///
@@ -871,11 +926,12 @@ pub struct HaltSignal {
     /// the arm know about the venue?") answered by the same poll.
     pub reconciled: u8,
     /// `1` when the E7 session bound may be judged: the arm has an
-    /// anchor (the spot USDC at its first flat reconciliation) AND the
-    /// account holds no outcome leg right now. `0` otherwise — an open
-    /// position's premium is not a loss, an unsettled win is not a
-    /// gain.
-    pub pnl_flat: u8,
+    /// anchor and has read the account since boot. Held legs no longer
+    /// withdraw it — the arm values them at COST, so an open
+    /// position's premium is not a loss and an unsettled win is not a
+    /// gain (S7-L1, gap B: a book that was never flat was never
+    /// judged). `0` otherwise.
+    pub pnl_judged: u8,
     /// Explicit padding.
     _pad: [u8; 5],
     /// Nanoseconds since the last reconciliation that AGREED. `0` =
@@ -887,14 +943,15 @@ pub struct HaltSignal {
     /// silently disabled while the arm kept trading (E7 review,
     /// 2026-09-19). Compared against `halt_on_recon_stale_ms`.
     pub recon_age_ns: u64,
-    /// E7 session bound: the account's spot USDC minus the anchor,
-    /// USD ×1e6, as of the last reconciliation. Meaningful only while
-    /// [`Self::pnl_flat`] is set; `0` otherwise.
+    /// E7 session bound: the account's equity at cost (spot USDC plus
+    /// the held legs' cost basis) minus the anchor, USD ×1e6, as of
+    /// the last reconciliation. Meaningful only while
+    /// [`Self::pnl_judged`] is set; `0` otherwise.
     pub pnl_delta_usd_1e6: i64,
 }
 
 impl HaltSignal {
-    /// Build a signal with the session bound unobserved (`pnl_flat`
+    /// Build a signal with the session bound unobserved (`pnl_judged`
     /// 0). The arm is the only caller; see [`Self::with_pnl`].
     #[inline]
     #[must_use]
@@ -914,19 +971,19 @@ impl HaltSignal {
             asset_refusal_streak,
             budget_floor_breached: budget_floor_breached as u8,
             reconciled: reconciled as u8,
-            pnl_flat: 0,
+            pnl_judged: 0,
             _pad: [0; 5],
             recon_age_ns,
             pnl_delta_usd_1e6: 0,
         }
     }
 
-    /// E7: attach the session-bound reading — `flat` says the bound
-    /// may be judged, `delta` is spot USDC minus the anchor.
+    /// E7: attach the session-bound reading — `judged` says the bound
+    /// may be judged, `delta` is the equity at cost minus the anchor.
     #[inline]
     #[must_use]
-    pub const fn with_pnl(mut self, flat: bool, delta_usd_1e6: i64) -> Self {
-        self.pnl_flat = flat as u8;
+    pub const fn with_pnl(mut self, judged: bool, delta_usd_1e6: i64) -> Self {
+        self.pnl_judged = judged as u8;
         self.pnl_delta_usd_1e6 = delta_usd_1e6;
         self
     }

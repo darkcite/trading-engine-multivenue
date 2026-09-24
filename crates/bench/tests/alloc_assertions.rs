@@ -6336,8 +6336,10 @@ fn hl_action_encode_sign() {
 /// and we are sending the most orders.
 #[test]
 fn hl_exchange_encode_and_scan_are_zero_alloc() {
-    use exec_hyperliquid::action::{encode_cancel, encode_order, CancelWire, OrderWire, Tif, MAX_ACTION};
-    use exec_hyperliquid::request::{cancel_json, envelope, order_json};
+    use exec_hyperliquid::action::{
+        encode_cancel, encode_order, encode_reserve_weight, CancelWire, OrderWire, Tif, MAX_ACTION,
+    };
+    use exec_hyperliquid::request::{cancel_json, envelope, order_json, reserve_weight_json};
     use exec_hyperliquid::response::{scan, HlResponse};
 
     const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
@@ -6354,6 +6356,8 @@ fn hl_exchange_encode_and_scan_are_zero_alloc() {
     let ack: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77216390}}]}}}"#;
     let item_err: &[u8] = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"error":"Order must have minimum value of $10."}]}}}"#;
     let top_err: &[u8] = br#"{"status":"err","response":"Unable to recover signer."}"#;
+    // S7-L1: the request-weight top-up's answer.
+    let default_ok: &[u8] = br#"{"status":"ok","response":{"type":"default"}}"#;
 
     let mut mp = [0u8; MAX_ACTION];
     let mut aj = [0u8; MAX_ACTION];
@@ -6379,8 +6383,14 @@ fn hl_exchange_encode_and_scan_are_zero_alloc() {
         let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
         acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
 
+        // S7-L1: the request-weight top-up, the same three steps.
+        let n = encode_reserve_weight(&mut mp, 5_000).unwrap();
+        let m = reserve_weight_json(&mut aj, 5_000).unwrap();
+        let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
+        acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
+
         // Scanning is per-order too, and the error paths most of all.
-        for bytes in [ack, item_err, top_err] {
+        for bytes in [ack, item_err, top_err, default_ok] {
             match scan(bytes) {
                 Ok(HlResponse::Ok(ok)) => {
                     acc = acc.wrapping_add(ok.statuses as usize);
@@ -6923,8 +6933,9 @@ fn hl_exchange_reconcile_compare_is_zero_alloc() {
     // padding a one-coin account really came back with.
     let mut sheet = String::from(r#"{"balances":[{"coin":"USDC","token":0,"total":"997.64","hold":"0.0"}"#);
     for i in 0..8u32 {
+        // S7-L1: with the cost basis the at-cost account view reads.
         sheet.push_str(&format!(
-            r#",{{"coin":"+{}","total":"2.0","hold":"0.0"}}"#,
+            r#",{{"coin":"+{}","total":"2.0","hold":"0.0","entryNtl":"1.36"}}"#,
             194_180 + i
         ));
     }
@@ -6961,6 +6972,9 @@ fn hl_exchange_reconcile_compare_is_zero_alloc() {
         let n = scan_spot_state(&sheet, &mut bal).expect("scans");
         let (legs, worst) = HlExchange::<64>::compare(&assets, &bal[..n], &sheet);
         acc = acc.wrapping_add(legs as i64).wrapping_add(worst);
+        // S7-L1: the session bound's account view, at cost.
+        let v = exec_hyperliquid::recon::account_view(&bal[..n], &sheet);
+        acc = acc.wrapping_add(v.equity_at_cost_1e6());
     }
     std::hint::black_box(acc);
 
@@ -6970,6 +6984,45 @@ fn hl_exchange_reconcile_compare_is_zero_alloc() {
         "hl reconcile compare allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "hl reconcile compare bytes should be zero: saw {bytes}");
+    let n = scan_spot_state(&sheet, &mut bal).expect("scans");
+    let v = exec_hyperliquid::recon::account_view(&bal[..n], &sheet);
+    assert_eq!((v.legs, v.held_cost_1e6), (8, 8 * 1_360_000), "the cost basis was read");
+
+    // S7-L1: the day-spend read's render and scan, over a page one row
+    // short of the venue's limit — built outside the window.
+    use exec_hyperliquid::dayspend::{fills_since_request, scan_day_bought, MAX_DAY_REQ, VENUE_PAGE_MAX};
+    const DAY0_MS: u64 = 1_790_208_000_000;
+    let mut page = String::from("[");
+    for i in 0..(VENUE_PAGE_MAX - 1) {
+        if i > 0 {
+            page.push(',');
+        }
+        page.push_str(&format!(
+            r##"{{"coin":"#194180","px":"0.5","sz":"4.0","side":"{}","time":{},"oid":{i},"tid":{i},"cloid":"0x4d560300000000000000000000000065","fee":"0.0"}}"##,
+            if i % 2 == 0 { "B" } else { "A" },
+            DAY0_MS + i as u64,
+        ));
+    }
+    page.push(']');
+    let page = page.into_bytes();
+    let mut bought = [0i64; 8];
+    let mut req = [0u8; MAX_DAY_REQ];
+    let _ = scan_day_bought(&page, DAY0_MS, &mut bought).expect("prime");
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    let mut rows = 0usize;
+    for k in 0..20u64 {
+        let n = fills_since_request(&mut req, &[0xAB; 20], DAY0_MS + k).expect("renders");
+        rows = scan_day_bought(&page, DAY0_MS, &mut bought).expect("a complete page");
+        acc = acc.wrapping_add(n as i64).wrapping_add(bought[3]);
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(allocs, 0, "hl day-spend read allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "hl day-spend read bytes should be zero: saw {bytes}");
+    assert_eq!(rows, VENUE_PAGE_MAX - 1);
+    assert_eq!(bought[3], 1_000 * 2_000_000, "a thousand $2 buys by slot 3");
     // And the comparison must actually have found the drift, or the
     // guard measured a walk that returned early.
     let n = scan_spot_state(&sheet, &mut bal).expect("scans");
@@ -7310,7 +7363,18 @@ fn routed_halt_idle_steady_state() {
             self.sweeping = self.sweeping.saturating_sub(1);
             false
         }
+        /// S7-L1: the venue's day spend for slot 3 — and the NEXT day's
+        /// from poll 250, so the adoption's roll runs inside the window.
+        fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+            if slot != SLOT as usize {
+                return None;
+            }
+            let day = DAY0 + u64::from(self.polls > 250);
+            Some((day, 1_000_000 + 1_000_000 * i64::from(self.polls > 250)))
+        }
     }
+    /// The day the gate's anchor sits in.
+    const DAY0: u64 = 1_789_776_001_000_000_000 / 86_400_000_000_000;
 
     // Boot-time construction — outside the window, as the engine's is.
     let mut route = ExecRoute::all_paper();
@@ -7371,6 +7435,12 @@ fn routed_halt_idle_steady_state() {
     std::hint::black_box(idles);
 
     assert!(d.ledger().is_seeded(), "the seeding edge must have run");
+    assert_eq!(
+        d.ledger().slot_day_turnover_1e6(SLOT as usize),
+        2_000_000,
+        "S7-L1: the venue's day spend was adopted, and the next day's after the roll"
+    );
+    assert!(d.ledger().counters().day_rollovers >= 1, "and the roll ran in the window");
     assert_eq!(
         d.halt_file_polls(),
         1,

@@ -215,6 +215,16 @@ pub fn batch_modify_json(dst: &mut [u8], modifies: &[ModifyWire]) -> Result<usiz
     Ok(j.len)
 }
 
+/// `{"type":"reserveRequestWeight","weight":…}` as JSON — the twin of
+/// [`crate::action::encode_reserve_weight`].
+pub fn reserve_weight_json(dst: &mut [u8], weight: u64) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"reserveRequestWeight\",\"weight\":")?;
+    j.u64(weight)?;
+    j.put(b"}")?;
+    Ok(j.len)
+}
+
 /// **Open the request envelope in place.** Writes `{"action":` at the
 /// start of `dst` and returns the offset at which the caller renders
 /// the action JSON DIRECTLY into `dst` (`order_json(&mut dst[n..], …)`

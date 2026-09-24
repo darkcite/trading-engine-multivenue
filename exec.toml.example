@@ -224,6 +224,15 @@ cap_instance_usd_1e6 = 1000000000
 # Consumed by the budget governor in E4.
 request_budget_floor = 2000
 
+# OPTIONAL (S7-L1): buy request weight before the floor is reached.
+# When the remaining budget comes within `request_topup_weight` of the
+# floor, the arm sends one `reserveRequestWeight` of that many requests,
+# paid from the account's PERPS balance at the venue's price (0.0005
+# USDC a request: 5000 = $2.50), at most `request_topup_day_max` per UTC
+# day. Both or neither; unset, the floor halts the slot as above.
+# request_topup_weight = 5000
+# request_topup_day_max = 30000
+
 # ---- the kill switches (E6) -----------------------------------------
 #
 # All five are REQUIRED NON-ZERO on a live slot and the boot refuses
@@ -269,14 +278,17 @@ halt_on_recon_stale_ms = 300000
 # is "no bound on that side", and the five kill switches above stay
 # required whatever these say.
 #
-# Measured from the account's SPOT USDC as the reconciler reads it
-# every 60 s, against an ANCHOR: the balance at the first reconciliation
-# that found the account FLAT (no outcome leg held). The anchor is
-# written once to `exec-pnl-anchor.state` beside this file and restored
-# on every restart, so the session outlives the process (KeepAlive
-# relaunches it) — delete that file before a restart to start a new
-# session. The bound is judged ONLY while flat: an open leg's premium
-# is not a loss and its payout is not a gain until the venue settles.
+# Measured from the account's EQUITY AT COST as the reconciler reads it
+# every 60 s — spot USDC plus what the held outcome legs cost (the
+# venue's `entryNtl`) — against an ANCHOR: that equity at the session's
+# first reconciliation. The anchor is written once to
+# `exec-pnl-anchor.state` beside this file and restored on every
+# restart, so the session outlives the process (KeepAlive relaunches
+# it) — delete that file before a restart to start a new session.
+# Judged at every reconciliation, legs held or not (S7-L1): at cost, an
+# open leg's premium is not a loss and its payout is not a gain until
+# the venue settles or it is sold, and a book that is never flat is
+# still bounded.
 # `/state` shows `arm_pnl_anchor_usd_1e6` and `arm_session_pnl_usd_1e6`;
 # `/metrics` the same two as gauges.
 #

@@ -6,6 +6,67 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the live arm made restart-proof: SIGTERM drains, account-wide cancel at boot and shutdown, the day cap from the venue, the session bound at cost, exits exempt from the order caps, `request_topup_*` (BIN15 S7-L1)
+
+**What changed**
+- `SIGTERM` now takes the SIGINT path (`cli::sigint`): the drain runs —
+  member state flushed, `Engine::stop`, threads joined — under a 30 s
+  `alarm` (`DRAIN_DEADLINE_S`) that kills a drain that hangs. Before,
+  the restart lane's SIGTERM killed the process where it stood.
+- `clob_dispatcher::OrderDispatch` gains two defaulted methods:
+  `on_shutdown()` (called by `Engine::stop` after the members'
+  `on_stop`) and `venue_day_bought(slot) -> Option<(u64, i64)>`.
+- `HlExchange::cancel_ours_everywhere` — every resting order whose cloid
+  is ours, on any outcome leg, cancelled by oid (asset id read off the
+  venue's `#<enc>`). Run at boot before `exec: hyperliquid arm ARMED`
+  (new fields `boot_swept`, `boot_sweep_left`) and at shutdown (log line
+  `exec: shutdown sweep of resting orders done`).
+- The router's day cap adopts the venue's own day spend (`userFillsByTime`
+  since 00:00Z, our BUYS per slot, `exec_hyperliquid::dayspend`), never
+  lowering its own; the arm reports `reconciled` only once it has read
+  it. `HlHttp`'s response buffer is 1 MiB (was 16 KiB) to hold that page.
+- The E7 session bound is judged on EQUITY AT COST (spot USDC plus the
+  held legs' `entryNtl`) at every reconciliation, legs held or not.
+  `clob_dispatcher::HaltSignal::pnl_flat` is renamed `pnl_judged`;
+  `SpotBalance` gains `entry_ntl_1e8`; `recon::account_view` returns an
+  `AccountView`. A flat anchor file written before reads the same.
+- The risk gate never refuses a sell no larger than the slot's holding
+  on that leg under `max_order_usd_1e6` or `max_open_orders`
+  (`Ledger::held_on_sym_1e6`).
+- `exec.toml` `[exec.slot.<n>]` gains two OPTIONAL keys,
+  `request_topup_weight` and `request_topup_day_max` (both or neither;
+  weight 1 000–100 000, day ≤ 1 000 000): `reserveRequestWeight`
+  top-ups of the address request budget, paid from the PERPS balance.
+  The boot tell's HALTS line gains `topup=<weight>/<day_max>`. New state
+  file `exec-topup.state` beside `exec-budget.state`
+  (`<master>\t<day>\t<used>\t<anchor s>\t<cost ×1e6>`).
+- `HlExchange::enable_restart_safety` (the operator arm's boot calls it):
+  seeding waits for the day-spend read and a clean account-wide sweep.
+- `budget::scan_rate_limit` returns `nRequestsSurplus` too and
+  `AddressBudget::from_venue` takes it; the SDK vectors are 27 rows
+  (`reserve_weight`, `reserve_weight_testnet`) and the self-test checks
+  five encoders.
+- `LiveArmCounters` gains `sweep_all_cancelled`, `sweep_all_left`,
+  `topup_ok`, `topup_failed`, `day_sync_ok`, `day_sync_failed` (272 B;
+  `ExecCounters` 568 B, both const-asserted); `/metrics` gains
+  `engine_exec_hl_sweep_all_cancelled_total`,
+  `engine_exec_hl_topup_ok_total`, `engine_exec_hl_topup_failed_total`,
+  `engine_exec_hl_day_sync_ok_total`, `engine_exec_hl_day_sync_failed_total`.
+- `budget::scan_rate_limit` counts `nRequestsSurplus` only beside an
+  `nRequestsCap` of exactly `10 000 + ⌊cumVlm⌋`.
+- `exec_router::Ledger`'s day epoch rolls FORWARD only: a stamp from an
+  earlier day is booked into the current day instead of wiping it.
+- `scripts/daily-restart.sh`'s 00:20Z accrual passes
+  `--bin15 ~/multivenue/bin15.paper-s7.toml` when that paper copy exists
+  (the arming step creates it), else `~/multivenue/bin15.toml` as before.
+
+**What to do**
+- Nothing for a paper engine: every change is inert without a live
+  Hyperliquid slot, except the SIGTERM drain, which every restart now
+  runs.
+- Before arming a live slot with top-ups: add both `request_topup_*`
+  keys to `~/multivenue/exec.toml` and fund the master's PERPS balance.
+
 ## 2026-09-24 — slot 0 can arm LIVE (three switches); `hyparb.toml mode = "live"`; `OrderDispatch::try_next_retired`; `evm-live arm-smoke`; `scripts/hyparb-flip.sh` (HYPARB L2–L5)
 
 **What changed**

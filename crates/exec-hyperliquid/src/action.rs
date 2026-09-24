@@ -331,6 +331,22 @@ pub fn encode_batch_modify(dst: &mut [u8], modifies: &[ModifyWire]) -> Result<us
     Ok(w.len())
 }
 
+/// `{"type":"reserveRequestWeight","weight":…}` — **S7-L1**: buy
+/// `weight` more address requests, paid from the PERPS balance at the
+/// venue's price per request. `destination` is omitted, which the
+/// venue documents as skipped in the hash when unset: the weight is
+/// this address's own.
+#[inline]
+pub fn encode_reserve_weight(dst: &mut [u8], weight: u64) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(2)?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"reserveRequestWeight")?;
+    w.str_bytes(b"weight")?;
+    w.uint(weight)?;
+    Ok(w.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

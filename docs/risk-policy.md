@@ -4713,7 +4713,10 @@ the same sticky halt machine as every kill switch — reasons
 written, refused submits until an operator restart. A gain halt is a
 halt: "run until" means until.
 
-**What is measured, and from where.** The account's SPOT USDC as the
+**What is measured, and from where** (superseded 2026-09-24 by S7-L1,
+gap B: the equity AT COST, anchored at the session's first
+reconciliation, flat or not — see "The live arm, restart-proof"). The
+account's SPOT USDC as the
 reconciler already reads it (`spotClearinghouseState`, every 60 s on the
 idle path), against an ANCHOR: the balance at the first reconciliation
 of the session that found the account FLAT — no outcome leg with a
@@ -4726,7 +4729,9 @@ boot would be a bound on nothing. An operator starts a new session by
 deleting the file before a restart — the manual step every sticky halt
 already requires, not an auto-resume.
 
-**Judged only while flat.** An outcome leg is worth anything from 0 to
+**Judged only while flat** (superseded 2026-09-24 by S7-L1, gap B: the
+bound is judged at cost at every reconciliation, and the field below
+is `HaltSignal::pnl_judged`). An outcome leg is worth anything from 0 to
 1 USDC until the venue settles it, so an account holding one has no
 P&L to read: the premium it paid is not a loss, the payout it may get
 is not a gain. `HaltSignal::pnl_flat` (anchored AND no leg held AND a
@@ -4985,6 +4990,107 @@ left and is `W/3` at the open — and needs no flag of its own.
   on fills < 50 %, are judged on the first live step's own fills. The
   report says so under every counterfactual block ("not measurable in
   the paper model"), so a CONFIRM read off it cannot forget it.
+
+### The live arm, restart-proof (S7-L1, 2026-09-24)
+
+The risk review of the live-sized package (2026-09-24) found five gaps
+between the paper engine and a live one. Each is closed in code for the
+arm that trades the operator's Hyperliquid slots — the boot turns on
+`HlExchange::enable_restart_safety` there. Slot 0's own hedge account
+(HYPARB) is not covered by A or C.
+
+- **(A) The day cap restarted at zero on every boot.** Five scheduled
+  drains a UTC day each handed a slot its whole `cap_day_usd_1e6` again.
+  The arm reads the day's spend from the venue's own fill history
+  (`userFillsByTime` since 00:00Z, our BUYS per slot) once per UTC day,
+  retrying a failed read after one minute, doubling to fifteen, and
+  reports `reconciled` only after a boot's first read succeeds; the
+  router adopts the figure into its day cap — never lowering its own
+  count — before the slot's first live place. A page the venue may have
+  cut short (2 000 fills) is refused, never summed: a day that busy
+  stays unseeded until 00:00Z, with
+  `engine_exec_hl_day_sync_failed_total` climbing and every live place
+  counted in `refused_unseeded`. The router's day ledger only rolls
+  forward.
+- **(B) The session bound was judged only while flat**, and a book that
+  is never flat — overlapping 15-minute instances, the daily families —
+  was never judged. It is judged at every reconciliation on the equity
+  AT COST: spot USDC plus the held legs' `entryNtl`, each leg's basis
+  clamped to what the holding can ever pay (1 USDC a contract), minus
+  the session's request-weight spend (E). Buying a leg moves nothing; a
+  settlement or a sale moves it. How the venue lowers `entryNtl` on a
+  PARTIAL sale is not yet measured; the clamp bounds the error, and the
+  first live partial sale's balance row is to be checked. **The
+  overshoot:** an open leg's
+  unrealised loss is not in the figure, so the halt fires at the stated
+  loss PLUS the cost of whatever legs are still open and losing at that
+  moment — at most the day's premium (`cap_day_usd_1e6`) and the daily
+  legs still held from the day before. Deposits, withdrawals and
+  transfers between spot and perps move the figure: never fund
+  mid-session. An anchor written flat reads the same as before.
+- **(C) Nothing took resting quotes off the venue at shutdown**, and
+  SIGTERM — what the restart lane sends — killed the process with no
+  drain at all. SIGTERM now drains like SIGINT, under a 30 s deadline;
+  `Engine::stop` calls `OrderDispatch::on_shutdown`, and the Hyperliquid
+  arm cancels every resting order whose cloid is ours, on any outcome
+  leg. The asset id is read off the venue's `#<enc>`: a cancel names an
+  oid the venue itself reported resting, so a wrong id is a refused
+  cancel and never another market — LAW E-4 refuses DERIVED ids for
+  orders, not for this. The same sweep runs at boot, before the arm is
+  announced, for the crash, the `kill -9` and the drain that ran out of
+  time; until a read of the account finds nothing of ours resting, the
+  slot stays unseeded and each reconciliation retries one sweep round.
+  The sweeps leave the reject streaks as they found them: an order that
+  filled or expired under its cancel is not the venue refusing to
+  trade. A restart clears resting ORDERS; held legs stay (below).
+- **(D) `max_order_usd_1e6` refused position-reducing sells.** A sell no
+  larger than the slot's holding on that leg is exempt from
+  `max_order_usd_1e6` and `max_open_orders`: a cap that can trap a
+  member in a position is not a risk control. `cap_instance` still
+  judges it — selling one leg of an outcome whose other leg is also
+  held raises the net exposure — and `cap_day` never counted sells.
+- **(E) The address request budget ran out in about half a day under
+  full parity**, after which the floor halts the slot.
+  `request_topup_weight` / `request_topup_day_max` (both or neither;
+  weight 1 000–100 000, ceiling ≤ 1 000 000) buy weight with
+  `reserveRequestWeight`, paid from the PERPS balance at 0.0005 USDC a
+  request, when the headroom comes within one top-up of the floor.
+  Guarded six ways: the venue's headroom is re-read before every
+  purchase; right after one, the venue's own figures must show it, or
+  top-ups stop for the process (this holds whatever the venue's netting
+  of reserved weight turns out to be — the success answer and the
+  netting are documented, not yet measured, and the first live
+  purchase's rise in `arm_budget_remaining` is to be checked); one check
+  a minute, whatever it found; a purchase is charged to the day ceiling
+  and the session when accepted or sent without a readable answer (a
+  clear refusal buys nothing), persisted in `exec-topup.state` before
+  the next step (an unreadable file reads as the day's ceiling spent,
+  and a failed write stops top-ups); only on a budget the venue stated
+  at boot; never at or under the floor, where the router has already
+  halted the slot. A refused purchase is counted
+  (`engine_exec_hl_topup_failed_total`), never put in the reject streak;
+  if purchases keep failing, the floor halts the slot. The spend is
+  subtracted from the session bound's figure (B). The perps balance is
+  refilled only by a deposit — the engine never moves money.
+
+**Not changed — positions across a restart.** The member boots flat,
+live as in paper, and does not learn a position the previous process
+held. The venue still holds it: the router's ledger re-learns legs the
+new process binds from the `userFills` snapshot replay, the reconciler
+compares them, and a held leg of an instance the new process has not
+bound keeps the slot unseeded until it settles. After a restart
+mid-instance the member may enter that instance again up to its own
+per-instance cap; the bounds on the combined position are the router's
+`cap_instance_usd_1e6` (net contracts × $1) and the venue-synced
+`cap_day_usd_1e6` on premium.
+
+**Tells.** ARMED gains `topup_weight`, `topup_day_max`, `boot_swept`,
+`boot_sweep_left`; HALTS gains `topup=<weight>/<day_max>`; the drain
+logs `exec: shutdown sweep of resting orders done` (`cancelled_total`,
+`left`); `/metrics` gains `engine_exec_hl_sweep_all_cancelled_total`,
+`engine_exec_hl_topup_ok_total`, `engine_exec_hl_topup_failed_total`,
+`engine_exec_hl_day_sync_ok_total` and
+`engine_exec_hl_day_sync_failed_total`.
 
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 

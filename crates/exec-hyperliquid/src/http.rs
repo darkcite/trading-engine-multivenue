@@ -61,7 +61,15 @@ use rustls::ClientConfig;
 pub const MAX_REQ_BODY: usize = 16 * 1024;
 /// Response buffer. Exchange responses are small; a batch of statuses
 /// is still well under this.
-pub const MAX_RESP_BUF: usize = 16 * 1024;
+///
+/// **S7-L1: sized for the largest `/info` answer the arm reads** — a
+/// `userFillsByTime` page (the day-spend read, `crate::dayspend`) of up
+/// to 2 000 fills, measured on mainnet at 751 477 B for a full page
+/// (~376 B a row, 2026-09-24, `Content-Length`-framed). A body that
+/// does not fit is refused (`HttpErr::Overflow`), and a day-spend read
+/// that can never succeed would never let the live slot seed. One
+/// boot allocation; nothing on the order path touches the unused tail.
+pub const MAX_RESP_BUF: usize = 1024 * 1024;
 /// Request-header buffer, written separately from the body so the two
 /// go out as one logical frame without a copy.
 const REQ_HEADER_BUF: usize = 1024;

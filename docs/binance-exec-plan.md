@@ -494,7 +494,7 @@ These go through `risk-reviewer`, and the review reads the diff together with `d
 2. **Per-venue halt signal.** A defaulted `halt_signal_venue(&self, venue: u8) -> HaltSignal { self.halt_signal() }`. Per live slot, the router merges the signals of the venues in **its** mask:
    - **max** of `reject_streak`, `asset_refusal_streak`, `recon_drift_usd_1e6`, `ws_gap_ns` and `recon_age_ns`;
    - **OR** of `budget_floor_breached`, the new `venue_lock` and the new `margin_risk`;
-   - **AND** of `reconciled` and `pnl_flat`;
+   - **AND** of `reconciled` and `pnl_judged` (was `pnl_flat` before S7-L1);
    - **sum** of `pnl_delta_usd_1e6`.
 
    `HaltSignal` is asserted at 48 B (`clob-dispatcher/src/lib.rs:898`) and has 5 pad bytes. The two new `u8` flags take two of them, so **the size is unchanged**. The ledger is seeded only when every present arm reports reconciled.

@@ -184,6 +184,13 @@ case(
     True,
 )
 
+# --- request weight (S7-L1): the address-budget top-up ----------------
+# The SDK has no helper for this action, so the dict IS the reference:
+# the documented key order (`type`, `weight`; `destination` is skipped
+# when unset), signed by the SDK's own L1 chain like every row above.
+case("reserve_weight", {"type": "reserveRequestWeight", "weight": 5000}, 26, True)
+case("reserve_weight_testnet", {"type": "reserveRequestWeight", "weight": 1}, 27, False)
+
 out = []
 for c in CASES:
     packed = msgpack.packb(c["action"])

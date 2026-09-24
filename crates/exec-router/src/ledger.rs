@@ -594,6 +594,36 @@ impl Ledger {
         self.resting_by_slot[slot]
     }
 
+    /// **L1** — what the slot HOLDS on one leg, contracts ×1e6: the
+    /// bound row's Yes or No position for `sym`, `0` when no bound row
+    /// carries that leg (an unbound leg holds nothing the router can
+    /// see, so nothing it could sell is exempt).
+    ///
+    /// The risk gate's exit test reads it: a sell no larger than this
+    /// only returns premium, and the order caps are never allowed to
+    /// block one (`RoutedDispatcher::risk_check`).
+    #[must_use]
+    pub fn held_on_sym_1e6(&self, slot: usize, sym: SymbolId) -> i64 {
+        if slot >= EXEC_SLOTS {
+            return 0;
+        }
+        let mut i = 0usize;
+        while i < LEDGER_ROWS {
+            let r = &self.rows[i];
+            i += 1;
+            if !r.is_bound() {
+                continue;
+            }
+            if sym == r.sym_yes {
+                return r.pos_yes_1e6[slot];
+            }
+            if sym == r.sym_no {
+                return r.pos_no_1e6[slot];
+            }
+        }
+        0
+    }
+
     /// The slot's position in one outcome, `(yes, no)` ×1e6, or `None`
     /// when the outcome is not bound. Test and `/state` only.
     #[must_use]
@@ -631,6 +661,12 @@ impl Ledger {
     /// `wall_ns == 0` is ignored rather than adopted as epoch 0: a
     /// zero timestamp is an unstamped record, and adopting it would
     /// make the next real timestamp look like a rollover.
+    ///
+    /// **Forward only (S7-L1).** A stamp from an EARLIER day — a fill
+    /// stamped before midnight booked after an order stamped after it,
+    /// or a stale venue figure — never rolls the day back: rolling back
+    /// would wipe the new day's turnover, and the late fill is counted
+    /// in the day it lands in instead, the conservative direction.
     fn roll_day(&mut self, wall_ns: u64) {
         if wall_ns == 0 {
             return;
@@ -638,10 +674,35 @@ impl Ledger {
         let epoch = wall_ns / DAY_NS;
         if self.day_epoch == 0 {
             self.day_epoch = epoch;
-        } else if epoch != self.day_epoch {
+        } else if epoch > self.day_epoch {
             self.day_epoch = epoch;
             self.day_turnover_1e6 = [0; EXEC_SLOTS];
             self.counters.day_rollovers = self.counters.day_rollovers.saturating_add(1);
+        }
+    }
+
+    /// **S7-L1 (gap A) — adopt the venue's own count of a slot's day
+    /// spend.** `day` is the UTC day number (`wall / DAY`) the figure
+    /// is for; `bought_1e6` is the slot's filled BUY notional since that
+    /// day's 00:00Z as the venue's fill history reports it.
+    ///
+    /// Only ever RAISES the turnover: a fill this ledger booked that
+    /// the venue's answer had not caught up with is never un-counted,
+    /// and the adoption is idempotent, so the router offers it on every
+    /// poll. A figure for a LATER day rolls the ledger first (the first
+    /// read after midnight); one for an EARLIER day is a stale answer
+    /// from before a rollover and is ignored — letting it through would
+    /// roll the day BACKWARDS and wipe it.
+    pub fn adopt_venue_day_turnover(&mut self, slot: usize, day: u64, bought_1e6: i64) {
+        if slot >= EXEC_SLOTS || day == 0 {
+            return;
+        }
+        if self.day_epoch != 0 && day < self.day_epoch {
+            return;
+        }
+        self.roll_day(day.saturating_mul(DAY_NS));
+        if bought_1e6 > self.day_turnover_1e6[slot] {
+            self.day_turnover_1e6[slot] = bought_1e6;
         }
     }
 
@@ -1881,6 +1942,66 @@ mod tests {
             64 * 400_000,
             "turnover was wiped by a phantom midnight"
         );
+    }
+
+    /// **S7-L1 (gap A).** A restart's ledger starts the day at zero;
+    /// the venue's figure lifts it. Adoption never LOWERS the turnover
+    /// (a local fill the venue had not caught up with stays counted),
+    /// is idempotent, rolls forward on a later day, and ignores an
+    /// earlier day rather than rolling backwards over it.
+    #[test]
+    fn the_venue_day_spend_lifts_the_turnover_and_never_lowers_it() {
+        let day = T0 / DAY_NS;
+        let mut l = bound();
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 0, "a fresh boot's day");
+        l.adopt_venue_day_turnover(SLOT, day, 30_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 30_000_000, "the venue's day");
+        l.adopt_venue_day_turnover(SLOT, day, 30_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 30_000_000, "idempotent");
+
+        // A buy booked here that the venue's answer has not caught up
+        // with: the stale figure must not un-count it.
+        l.book_fill(&fill(T0 + 1, sym(100), true, 500_000, 4_000_000, 1));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 32_000_000);
+        l.adopt_venue_day_turnover(SLOT, day, 30_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 32_000_000, "never lowered");
+
+        // Another slot's figure is that slot's.
+        l.adopt_venue_day_turnover(1, day, 7_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(1), 7_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 32_000_000);
+
+        // An EARLIER day is a stale answer: ignored, not a rollback.
+        let rollovers = l.counters().day_rollovers;
+        l.adopt_venue_day_turnover(SLOT, day - 1, 99_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 32_000_000);
+        assert_eq!(l.counters().day_rollovers, rollovers);
+
+        // The next day's first read rolls the day and adopts it.
+        l.adopt_venue_day_turnover(SLOT, day + 1, 5_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 5_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(1), 0, "the roll zeroed every slot");
+        assert_eq!(l.counters().day_rollovers, rollovers + 1);
+
+        // Out of range and day 0 are nothing.
+        l.adopt_venue_day_turnover(EXEC_SLOTS, day + 1, 1);
+        l.adopt_venue_day_turnover(SLOT, 0, 1_000_000_000);
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 5_000_000);
+    }
+
+    /// **S7-L1 — the day only rolls forward.** A fill stamped before
+    /// midnight that is booked after the day has rolled counts in the
+    /// day it lands in; it never rolls the day back over the new day's
+    /// turnover.
+    #[test]
+    fn a_late_stamp_never_rolls_the_day_back() {
+        let mut l = bound();
+        l.book_fill(&fill(T0 + DAY_NS, sym(100), true, 500_000, 2_000_000, 1));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 1_000_000);
+        let rolls = l.counters().day_rollovers;
+        l.book_fill(&fill(T0, sym(100), true, 500_000, 2_000_000, 2));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 2_000_000, "counted in the day it landed in");
+        assert_eq!(l.counters().day_rollovers, rolls, "and nothing rolled");
     }
 
     #[test]

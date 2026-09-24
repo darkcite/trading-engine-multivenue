@@ -812,9 +812,28 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         let notional_1e6 =
             i64::try_from((px as i128).saturating_mul(qty as i128) / 1_000_000)
                 .unwrap_or(i64::MAX);
+        // **L1 — an EXIT is never capped by clamps 1 and 2** ("a cap
+        // never blocks an exit", the policy's own rule). A SELL no
+        // larger than what the slot holds on that very leg returns
+        // premium and adds no turnover. Clamps 1 and 2 read the order's
+        // notional and the resting count, which are blind to direction,
+        // so without this a close larger than one entry (an Arm A close
+        // sells the whole free holding) was refused on every reprice and
+        // trapped the member in the position. Clamps 3 and 4 still judge
+        // it on their own terms — clamp 3 matters when the slot holds
+        // BOTH legs of an outcome, where selling one leg raises the net
+        // exposure. A halted or unseeded slot still refuses above: a
+        // halt trades nothing, and an unseeded ledger knows no holding.
+        //
+        // `buy || qty > held` is "not an exit", asked only when clamp 1
+        // or 2 would otherwise refuse: the holding is a walk of up to
+        // `LEDGER_ROWS` rows, and the clamps' own tests are the cheaper
+        // ones.
 
         // ---- 1. this one order ---------------------------------------
-        if notional_1e6 > caps.max_order_usd_1e6 {
+        if notional_1e6 > caps.max_order_usd_1e6
+            && (buy || qty > self.ledger.held_on_sym_1e6(slot, order.sym))
+        {
             return self.refuse(order.strategy_id, RiskRefusal::MaxOrder);
         }
 
@@ -827,6 +846,7 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         // quotes.
         if matches!(verb, RiskVerb::Place)
             && self.ledger.slot_resting(slot) >= caps.max_open_orders
+            && (buy || qty > self.ledger.held_on_sym_1e6(slot, order.sym))
         {
             return self.refuse(order.strategy_id, RiskRefusal::OpenOrders);
         }
@@ -1141,6 +1161,23 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         // seeded by that arm's reconciler. With one arm the signal is
         // the same for every slot, exactly as before.
         //
+        // **S7-L1 (gap A)** — the venue's own count of each live slot's
+        // day spend, adopted BEFORE the per-slot seeding below. The arm reports
+        // `reconciled` only once it has read it, so the first live
+        // place a boot allows is judged against the day the venue says
+        // was spent, never against the zero a fresh ledger reads.
+        let mut s = 0usize;
+        while s < EXEC_SLOTS {
+            let here = s;
+            s += 1;
+            if !matches!(self.route.mode_at(here), Some(ExecMode::Live)) {
+                continue;
+            }
+            if let Some((day, bought_1e6)) = self.live.venue_day_bought(here) {
+                self.ledger.adopt_venue_day_turnover(here, day, bought_1e6);
+            }
+        }
+
         // ONE edge per poll, however many slots latch in it — the file
         // names every halted slot and the cancel is venue-wide, so N
         // `write_atomic` calls (N allocations, N fsyncs on the engine
@@ -1252,7 +1289,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     }
 
     fn exec_counters(&self) -> ExecCounters {
-        let c = self.counters;
+        let c = &self.counters;
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         for (slot, m) in modes.iter_mut().enumerate() {
             *m = self
@@ -1266,9 +1303,10 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             *h = self.halt.reason(slot) as u8;
         }
         let l = self.ledger.counters();
-        // COPY: ExecCounters (≈ 504 B by repr(C) layout — the 208 B
-        // LiveArmCounters ride inside) returned by value across the
-        // OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics —
+        // COPY: ExecCounters (568 B by repr(C) layout, const-asserted —
+        // the 272 B LiveArmCounters ride inside) returned by value across
+        // the OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics
+        // (+ once at the drain) —
         // it is COMPOSED here from the router, the halt state, the
         // ledger and the live arm, so there is nothing to borrow —
         // rejected: an out-param, which trades the copy for a second
@@ -1306,6 +1344,20 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     #[inline]
     fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
         self.live.arm_counters()
+    }
+
+    /// **S7-L1** — both arms; only the live one has anything resting
+    /// outside its own memory.
+    fn on_shutdown(&mut self) {
+        self.paper.on_shutdown();
+        self.live.on_shutdown();
+    }
+
+    /// **S7-L1** — the live arm's answer; the paper arm has no venue
+    /// history to report.
+    #[inline]
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        self.live.venue_day_bought(slot)
     }
 }
 
@@ -2197,6 +2249,31 @@ mod tests {
         assert_eq!(d.counters().refused_cap_day, 0);
     }
 
+    /// **L1 — an exit is never refused by the order caps.** A sell no
+    /// larger than the slot's holding on that leg passes `max_order`
+    /// and `max_open_orders` however large it is; one share more than
+    /// the holding is an ordinary order and is clamped again.
+    #[test]
+    fn an_exit_is_never_refused_by_the_order_caps() {
+        // max_order $2, one open order at most.
+        let mut d = armed(SlotCaps::new(2_000_000, i64::MAX, i64::MAX, 1));
+        d.on_fill_booked(&venue_fill(SYM_YES, true, 200_000, 10_000_000, 1));
+        assert_eq!(d.ledger().held_on_sym_1e6(STRATEGY_SLOT_BIN15 as usize, SYM_YES), 10_000_000);
+        // A resting buy fills the one open slot.
+        assert!(d.submit(&leg_order(2, SYM_YES, true, 100_000, 1_000_000)).is_ok());
+        // Selling all 10 at $0.60 is $6 — three times `max_order`, with
+        // the open-order cap full — and passes: it is the exit.
+        assert!(d.submit(&leg_order(3, SYM_YES, false, 600_000, 10_000_000)).is_ok());
+        // Eleven is more than is held: an ordinary order, clamped.
+        assert_eq!(
+            d.submit(&leg_order(4, SYM_YES, false, 600_000, 11_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_max_order, 1);
+        // A sell on a leg the slot does not hold is not an exit either.
+        assert_eq!(d.ledger().held_on_sym_1e6(STRATEGY_SLOT_BIN15 as usize, SYM_NO), 0);
+    }
+
     #[test]
     fn the_open_order_cap_counts_what_the_arm_accepted_and_nothing_else() {
         let mut d = armed(SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 2));
@@ -2369,6 +2446,8 @@ mod tests {
         /// The last request did not land, so the arm has stopped and
         /// the venue was never confirmed clear.
         stranded: bool,
+        /// S7-L1: what the venue says the bin15 slot bought today.
+        day_bought: Option<(u64, i64)>,
         /// Orders the arm says ended without a fill (HYPARB L5).
         retired: Vec<(u64, u8)>,
     }
@@ -2404,6 +2483,13 @@ mod tests {
         }
         fn halt_signal(&self) -> clob_dispatcher::HaltSignal {
             self.sig
+        }
+        fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+            if slot == STRATEGY_SLOT_BIN15 as usize {
+                self.day_bought
+            } else {
+                None
+            }
         }
         fn cancel_all(&mut self) -> Result<(), DispatchError> {
             self.cancel_all_calls += 1;
@@ -2646,6 +2732,46 @@ mod tests {
         // Slot 0 is paper and keeps trading.
         assert!(!d.halt().is_halted(0));
         assert!(d.submit(&order(0, VenueId::Polymarket, 99)).is_ok());
+    }
+
+    /// **S7-L1 (gap A) — a restart's day cap is the venue's from the
+    /// first live place.** The arm reports the day's spend on the poll
+    /// that seeds the ledger, and the router adopts it first: a boot
+    /// that finds $2.50 already bought today refuses the buy that would
+    /// cross a $3 cap — the buy a fresh ledger reading zero would have
+    /// let through.
+    #[test]
+    fn a_restart_adopts_the_venues_day_spend_before_its_first_live_place() {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, 3_000_000, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d = RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            SpyHalt::default(),
+            test_anchor(),
+        );
+        d.on_venue_event(&roll(OUTCOME, SYM_YES, false));
+        let day = T0 / 86_400_000_000_000;
+        d.live_mut().sig = clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true, 0);
+        d.live_mut().day_bought = Some((day, 2_500_000));
+        d.on_idle();
+        assert!(d.ledger().is_seeded());
+        assert_eq!(d.ledger().slot_day_turnover_1e6(STRATEGY_SLOT_BIN15 as usize), 2_500_000);
+        // $1 more would be $3.50 against the $3 cap.
+        assert_eq!(
+            d.submit(&leg_order(1, SYM_YES, true, 500_000, 2_000_000)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_cap_day, 1);
+        // $0.50 lands on it.
+        assert!(d.submit(&leg_order(2, SYM_YES, true, 500_000, 1_000_000)).is_ok());
     }
 
     #[test]

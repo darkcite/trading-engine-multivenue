@@ -25,8 +25,8 @@
 //! whose only purpose is to make (4) reproducible.
 
 use exec_hyperliquid::action::{
-    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order, CancelByCloidWire,
-    CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
+    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order,
+    encode_reserve_weight, CancelByCloidWire, CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
 };
 use exec_hyperliquid::sign::{connection_id, Network, Vault};
 use signer_eip712::hyperliquid as hl;
@@ -349,6 +349,14 @@ fn every_vector_reproduces_byte_for_byte() {
     .unwrap();
     check(&r, "batch_modify_2", &buf[..n]);
     seen.push("batch_modify_2");
+
+    // --- request weight (S7-L1) ----------------------------------------
+    let n = encode_reserve_weight(&mut buf, 5_000).unwrap();
+    check(&r, "reserve_weight", &buf[..n]);
+    seen.push("reserve_weight");
+    let n = encode_reserve_weight(&mut buf, 1).unwrap();
+    check(&r, "reserve_weight_testnet", &buf[..n]);
+    seen.push("reserve_weight_testnet");
 
     // Every fixture row must have been exercised: a row nobody checks
     // is a vector that proves nothing.
