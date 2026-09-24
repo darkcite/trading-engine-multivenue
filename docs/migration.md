@@ -6,6 +6,27 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — `scripts/bin15-flip.sh`: slot 3 PAPER ⇄ LIVE in one command (BIN15 S7-L1)
+
+**What changed**
+- `scripts/bin15-flip.sh status|live|paper [--switch-only]` edits
+  `~/multivenue/strategy.conf` (`EXEC_TOML`, slot 3 in `ARM_LIVE`; other
+  armed slots are kept), `[exec.slot.3]` of `exec.toml` and `bin15.toml`,
+  then restarts the engine in a safe minute and checks the boot tells.
+- LIVE: `bin15.toml` is a cut of the paper artifact — first line
+  `# bin15-flip LIVE cut`, only the four sizing lines changed — and the
+  paper artifact waits as `bin15.paper-s7.toml` (the nightly accrual
+  reads it while it exists). PAPER puts it back and archives the copy.
+- Lines the script switches off in `strategy.conf` carry the tag
+  `#bin15-flip# `; backups are `<file>.bak-<stamp>-bin15flip`; the session
+  anchor and slot 3's `operator` halt are archived into `logs/` (any
+  other halt reason stays in `exec.HALT` for a human, and `live` refuses
+  on it); every step is logged to `logs/bin15-flip.log`.
+
+**Operator action**
+- None until arming. Do not hand-edit a LIVE cut: flip to paper, change
+  the paper artifact, flip again.
+
 ## 2026-09-24 — the live arm made restart-proof: SIGTERM drains, account-wide cancel at boot and shutdown, the day cap from the venue, the session bound at cost, exits exempt from the order caps, `request_topup_*` (BIN15 S7-L1)
 
 **What changed**

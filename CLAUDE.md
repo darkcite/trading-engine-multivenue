@@ -78,9 +78,9 @@ in the script; `ai` = 48 is the floor every name includes).
   live arm is restart-proof since S7-L1 (2026-09-24, `docs/risk-policy.md`
   "The live arm, restart-proof": SIGTERM drains, account-wide cancel at
   boot and shutdown, day cap from the venue's fills, session bound at
-  cost, exits exempt from the order caps, `request_topup_*`). The next
-  arming follows vault doc 30's checklist and needs the operator's
-  signed S7-L1 entry in `docs/risk-policy.md` first. R0's record:
+  cost, exits exempt from the order caps, `request_topup_*`). Arming is
+  the operator's `scripts/bin15-flip.sh live` (the S7-L1 entry in
+  `docs/risk-policy.md`); `bin15-flip.sh paper` disarms. R0's record:
 - **E7 R0 was LIVE ON MAINNET 2026-09-19 13:04Z — slot 3 (bin15)
   armed** (operator ruling; testnet has no 15-minute family, so R0 ran
   there only as the exec battery, vault doc 23). The launchd engine
@@ -290,7 +290,8 @@ in the script; `ai` = 48 is the floor every name includes).
   submit AND modify passes the risk gate, a cancel is never blocked by a cap;
   the HTTP response is the ACK, the `userFills` stream is the FILL (E-5); a
   requote is a MODIFY (E-7); the roll takes its own quotes back (E-8); the
-  cloid encodes the slot (E-9); caps stay exactly paper's (O-E4); fees are
+  cloid encodes the slot (E-9); caps stay exactly paper's (O-E4; slot 3's
+  S7-L1 caps are the operator's own entry); fees are
   MEASURED from `userFills.fee`, never read from a doc. Full text:
   `docs/risk-policy.md`.
 - **Venue latency is measured, never assumed** — per host AND per location

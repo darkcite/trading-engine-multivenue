@@ -511,7 +511,7 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 25 known-answer vectors the official
+  the binary reproduces all 27 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
   from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify` —
   demanding the SDK's exact msgpack. **This is the half that covers LAW
@@ -4460,7 +4460,7 @@ Smaller items closed in the same pass: `libc` literal dep in
 repo's existing convention (cli, core-config, core-io, core-time all do
 it; there is no workspace `libc`); `gen_vectors.py` now drives the SDK's
 own `order_request_to_order_wire` / `order_wires_to_order_action` and
-records the SDK version; `selftest` pins the vector count (25);
+records the SDK version; `selftest` pins the vector count (25; 27 since S7-L1);
 `MAX_ORDERS` enforced in all four batch encoders; `BudgetGauge` removed;
 `cancel_by_cloid` / `modify_by_cloid` render into the boot-owned `mp` / `req`
 buffers (no 16 KiB stack arrays on the engine thread); `POLL_SLICE`
@@ -5091,6 +5091,93 @@ logs `exec: shutdown sweep of resting orders done` (`cancelled_total`,
 `engine_exec_hl_topup_ok_total`, `engine_exec_hl_topup_failed_total`,
 `engine_exec_hl_day_sync_ok_total` and
 `engine_exec_hl_day_sync_failed_total`.
+
+### S7-L1 — slot 3 LIVE on Hyperliquid mainnet at the $100 frame (operator rulings 2026-09-24)
+
+Slot 3 armed again after R0, at full paper parity. Nothing arms until
+the operator runs `scripts/bin15-flip.sh live`; `bin15-flip.sh paper`
+disarms. The numbers below are that script's `LIVE_SIZING` and
+`slot3_section`. This entry supersedes ruling O-E4 ("caps stay exactly
+paper's") for slot 3.
+
+**The operator's rulings (2026-09-24):** doc 27 R4's $100 frame; FULL
+paper parity — the entry, Arm A and Arm B on every family, chosen after
+the request-budget warning; no price floor. Running `bin15-flip.sh
+live` is the operator's sign-off for every number in this entry, the
+$10 per instance and the router's caps included.
+
+**Caps and halts.**
+- `bin15.toml`: four lines differ from the paper artifact, nothing else
+  — entry $2 (R4: stake = max($2, ¼·f·B), f = 0 until 300 venue
+  entries), per instance $10 (the entry plus up to $8 of Arm A/B), per
+  UTC day $50 (R4: 50 % of B = $100), clip 4 contracts. The entry law
+  and both arms are paper's byte for byte, so paper and venue evidence
+  stay one law. The flip refuses a paper artifact with a price floor or
+  any other sizing key.
+- `[exec.slot.3]`: `max_order` $10 (it bounds buys; a sell within the
+  holding is exempt, gap D); `max_open_orders` 24 (up to 10 quotes — one
+  15-minute and four daily families — plus accepted IoCs the router
+  counts until their leg rolls); `cap_day` $50, venue-synced (gap A);
+  `cap_instance` 200 contracts (net contracts × $1, a backstop against
+  runaway accumulation: two days of daily legs at ~0.50); request floor
+  2 000 with top-ups of 5 000 ($2.50) up to 30 000 ($15) a UTC day
+  (gap E); the R0 halts — reject streak 5, drift $2, WS gap 30 s, asset
+  refusals 3, recon stale 300 s. The router's caps sit above B (200
+  contracts, 24 × $10): the 200-contract cap can bind on a very cheap
+  leg that paper buys, the one place live may refuse what paper does.
+- Session bound: loss −$54 on equity at cost (gap B) — B = $100 falling
+  to R4's no-edge 5th percentile, $46, a figure from R4's entry-only,
+  paced frame: under unpaced full parity it is a stop, not a statistical
+  bound. The at-cost figure lets the halt overshoot by the open legs'
+  loss — at most the day's $50 of premium plus daily legs carried from
+  the day before — so the funded balance is the real limit. No gain
+  halt: a measurement step does not stop on success.
+- **Every `live` starts a new session:** the flip archives the anchor,
+  and −$54 is measured from the equity at cost at the session's first
+  reconciliation. An engine halt of slot 3 (`pnl-loss` or any other
+  reason than `operator`) stays in `exec.HALT` through `paper`, and
+  `live` refuses until the operator has read it and archived it by
+  hand. After a `pnl-loss` stop, re-arming means re-funding to B or a
+  new ruling.
+
+**Widening versus R0 (2026-09-19):** `cap_day` $8 → $50; `max_order`,
+`max_open_orders` and the router's instance cap widen; the gain halt
+goes (+$15 → none) and the loss halt loosens (−$5 → −$54); the 0.70
+price floor goes; Arm A, Arm B and the daily families trade live for
+the first time.
+
+**Precondition 1 (the prior phase's P&L):** R0 — 6 VENUE entries on
+2026-09-19, −$5.105, stopped by its own −$5 session bound; no cap was
+the bottleneck. The paper record since is in the vault (the
+`bin15_accrue` report). The vault checklist's paper CONFIRM (≥ 200
+settled entries over ≥ 10 days, about 2026-10-04 at the earliest) is the
+recommended bar; arming before it is the operator's call at flip time.
+
+**Precondition 2 (the engine):** the five gaps the 2026-09-24 review
+found are closed in commit `5b9fb3f` ("The live arm, restart-proof",
+above). Still to check by hand on the first live day: the first partial
+sale's `entryNtl`, the first top-up's rise in `arm_budget_remaining`,
+and each daily family's settlement text against LAW E-11.
+
+**The flip** refuses `live` unless this entry is in the COMMITTED file,
+slot 3 is not running live, `exec.HALT` does not name slot 3, no gated
+restart is owed, and `exec-smoke` passes on the binary launchd boots
+(checked unchanged before the switch). It restarts only at :04–:10, :19–:25, :34–:40 or
+:49–:55 UTC, outside 00:05–00:59Z and the scheduled drains, then checks
+the boot tells. `paper` halts slot 3 first, requires the venue to show
+none of slot 3's orders resting before and after the restart, and
+leaves held legs to settle unmanaged. `--switch-only` arms or disarms
+at the NEXT restart, which may be an unattended scheduled drain.
+
+**Money:** the master account (R0's) holds the bankroll on SPOT, about
+$100 USDC, and the top-up budget on PERPS, at least one day's ceiling
+($15; about $7 a day at paper's pace). Fund before `live`, never during
+a session. The API agent holds nothing; its approval expires
+2026-10-19.
+
+**Precondition 3 (sign-off):** the rulings above set the frame; arming
+is the operator's own act, `scripts/bin15-flip.sh live`, logged with
+its time in `~/multivenue/logs/bin15-flip.log`.
 
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 

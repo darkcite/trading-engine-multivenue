@@ -155,7 +155,7 @@ fi
 # handing it the fleet.
 #
 # TWO HALVES, AND ONLY ONE OF THEM COSTS ANYTHING
-#   offline  the binary reproduces the 25 SDK known-answer vectors and
+#   offline  the binary reproduces the 27 SDK known-answer vectors and
 #            rebuilds one action per TYPE from inputs. This is the half
 #            that covers LAW E-3 for ORDERS — the network probe sends a
 #            cancel, so it structurally cannot. Free, no venue, no key.
