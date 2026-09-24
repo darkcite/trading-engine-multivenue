@@ -2326,6 +2326,31 @@ and a restart.
     The engine's own boot parsers were run over both candidate files
     before they were installed: universe parse/allocate/bootable, the
     pool table, `load_hyparb_boot`.
+* **Pre-flight on the installed files (2026-09-24 ~04:40–05:00Z).** The
+  engine was not touched.
+  * **Release binary.** Built at `1d6960b`; `exec-smoke` passes.
+  * **`evm-testnet status`** with the live artifact: wallet 0 Ready,
+    0.955 test HYPE.
+  * **`shadow-smoke --decisions 2`** with the LIVE artifact: PASS. The
+    hybrid read answered 999; a buy and a sell mined at `amount_raw`
+    1e11, 0 reverted.
+  * **`hyperevm_live_smoke`** with the 14 pools (separate target dir):
+    every pool snapshotted and went live in ~36 s — 120 heads, 2,513
+    signals, 0 reconnects, the book refused nothing. The mids agree
+    across pools (WHYPE ≈ $92 in all five USD pools; the implied
+    BTC / ETH / SOL match the UBTC and UETH pools).
+  * **An endpoint outage, seen once.** The first 14-pool run, minutes
+    earlier, got NO bytes from the archive endpoint for 4 minutes (3
+    silent reconnects). A 1-, 2-, 4- and 8-pool bisect right after was
+    healthy, and so was the 14-pool rerun: a transient endpoint silence,
+    not the pool count. In the engine this is O-H15's shape: the member
+    is dark, never the boot.
+  * **The judged fee spiked on two dynamic-fee pools.** On two factory
+    `0x07e6…6b45` pools (`0x5a17…c9d4`, `0x0d3e…16b7`) the judged fee
+    read 20–27 % in one run and ~0.13 % in the other. The observed-fee
+    estimator is noisy there. The judge takes the worse fee, so those
+    pools are simply not traded while it spikes — conservative, and
+    recorded for a later look.
 * **The go-live runbook.** This supersedes §16.17's for the testnet
   shadow.
   1. Build the release binary on `main` at or after this commit. The
