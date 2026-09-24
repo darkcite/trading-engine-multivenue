@@ -6096,6 +6096,10 @@ pub struct Bin15MetricIds {
     pub skipped_grid: core_metrics::CounterId,
     /// `engine_bin15_skipped_entry_price_total`
     pub skipped_entry_price: core_metrics::CounterId,
+    /// `engine_bin15_skipped_entry_persist_total` (BIN15 S5)
+    pub skipped_entry_persist: core_metrics::CounterId,
+    /// `engine_bin15_skipped_entry_elapsed_total` (BIN15 S5)
+    pub skipped_entry_elapsed: core_metrics::CounterId,
     /// `engine_bin15_families_dormant_total`
     pub families_dormant: core_metrics::CounterId,
     /// `engine_bin15_fills_total`
@@ -6267,6 +6271,8 @@ fn register_bin15_metrics(
     let skipped_cap = one("engine_bin15_skipped_cap_total")?;
     let skipped_grid = one("engine_bin15_skipped_grid_total")?;
     let skipped_entry_price = one("engine_bin15_skipped_entry_price_total")?;
+    let skipped_entry_persist = one("engine_bin15_skipped_entry_persist_total")?;
+    let skipped_entry_elapsed = one("engine_bin15_skipped_entry_elapsed_total")?;
     let families_dormant = one("engine_bin15_families_dormant_total")?;
     let fills = one("engine_bin15_fills_total")?;
     let unknown_fills = one("engine_bin15_unknown_fills_total")?;
@@ -6312,6 +6318,8 @@ fn register_bin15_metrics(
         skipped_cap,
         skipped_grid,
         skipped_entry_price,
+        skipped_entry_persist,
+        skipped_entry_elapsed,
         families_dormant,
         fills,
         unknown_fills,
@@ -6388,6 +6396,10 @@ fn mirror_bin15_metrics<S: strategy_core::StrategyCounters>(
         .inc(cur.skipped_grid.saturating_sub(last.skipped_grid));
     reg.counter(ids.skipped_entry_price)
         .inc(cur.skipped_entry_price.saturating_sub(last.skipped_entry_price));
+    reg.counter(ids.skipped_entry_persist)
+        .inc(cur.skipped_entry_persist.saturating_sub(last.skipped_entry_persist));
+    reg.counter(ids.skipped_entry_elapsed)
+        .inc(cur.skipped_entry_elapsed.saturating_sub(last.skipped_entry_elapsed));
     reg.counter(ids.families_dormant)
         .inc(cur.families_dormant.saturating_sub(last.families_dormant));
     reg.counter(ids.fills)
@@ -10090,6 +10102,12 @@ mod tests {
     /// `the_exec_family_size_is_pinned` test in `exec_boot` counts
     /// that family; the registry-wide number is re-measured on the
     /// host at every ramp step.
+    ///
+    /// BIN15 S5 (2026-09-24) added `skipped_entry_persist` and
+    /// `skipped_entry_elapsed`: 31 → **33 counters** (pinned by
+    /// `the_bin15_family_is_33_counters_and_80_gauges`); the gauge side
+    /// did not move.
+    ///
     /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
     /// refused boot, and the registry is shared by every family.
     #[test]
@@ -10229,12 +10247,12 @@ mod tests {
     }
 
     #[test]
-    fn the_bin15_family_is_31_counters_and_80_gauges() {
+    fn the_bin15_family_is_33_counters_and_80_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_bin15_metrics(&mut reg).expect("register bin15");
-        assert_eq!(reg.counters_len() - before_c, 31, "the counter block");
+        assert_eq!(reg.counters_len() - before_c, 33, "the counter block");
         assert_eq!(reg.gauges_len() - before_g, 80, "8 families x 10 levels");
         assert!(
             reg.gauges_len() <= core_metrics::MAX_GAUGES,

@@ -458,6 +458,30 @@ struct Bin15EntryRow {
     origin: u8,
 }
 
+/// BIN15 S5 (ruling O-4): the COUNTERFACTUAL on one instance — when the
+/// entry's price test first held (`FamilyState::entry_first_ok_ts`), the
+/// preferred-side ask then, and its side: the pre-S5 law's entry attempt
+/// (persist 1, no ceiling), logged, never traded. A cap, grid or ring
+/// refusal at that reprice would have moved the old law's real entry
+/// later; the $50 entry sits far under the caps, so that is the rare case.
+///
+/// Recorded once per instance per window, entered or not. An entry row
+/// carries its own instance's as `first_fire_*` columns; the rest form
+/// the `bin15_first_fires` block — every instance the old law would have
+/// entered, each exactly once.
+#[derive(Copy, Clone, Debug)]
+struct Bin15FirstFireRow {
+    ts_ns: u64,
+    family: u8,
+    outcome: u32,
+    /// The instance's start, as [`Bin15EntryRow::start_ns`].
+    start_ns: u64,
+    expiry_ns: u64,
+    /// `1` the old law would have bought YES, `0` NO.
+    is_yes: u8,
+    px_1e6: i64,
+}
+
 /// BIN15 S1: a sidecar number that may be absent — `null` or the value,
 /// rendered straight into the row being written (no owned temporary).
 struct OrNull(Option<i64>);
@@ -498,23 +522,29 @@ fn label_of(
 /// one buffer without regrowth in practice.
 fn render_bin15_entries(
     rows: &[Bin15EntryRow],
+    first_fires: &[Bin15FirstFireRow],
     labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
 ) -> String {
     use core::fmt::Write as _;
-    let mut s = String::with_capacity(64 + rows.len() * 360);
+    let mut s = String::with_capacity(64 + rows.len() * 420);
     s.push_str("\"bin15_entries\":[");
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
         let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        // BIN15 S5: the instance's counterfactual, joined by outcome. The
+        // gate cannot pass a reprice whose price test failed, so an entry
+        // always has one; `null` would mean the harness lost it.
+        let ff = first_fires.iter().find(|f| f.outcome == r.outcome);
         // Writing into a `String` cannot fail.
         let _ = write!(
             s,
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
              \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
              \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{},\
-             \"y_next_strike\":{},\"settle_px_1e6\":{}}}",
+             \"y_next_strike\":{},\"settle_px_1e6\":{},\"first_fire_ts_ns\":{},\
+             \"first_fire_px_1e6\":{},\"first_fire_is_yes\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -526,6 +556,53 @@ fn render_bin15_entries(
             r.qty_1e6,
             r.p_hat_1e6,
             r.origin,
+            y,
+            y_next,
+            settle_px,
+            OrNull(ff.map(|f| f.ts_ns as i64)),
+            OrNull(ff.map(|f| f.px_1e6)),
+            OrNull(ff.map(|f| i64::from(f.is_yes)))
+        );
+    }
+    s.push(']');
+    s
+}
+
+/// The `bin15_first_fires` block of the detail sidecar (BIN15 S5, ruling
+/// O-4): the counterfactual on every instance the old law would have
+/// entered and this window's member did not — an instance that carries
+/// an entry row is left out here, because that row carries its own as
+/// `first_fire_*` columns. Additive: a reader that predates it ignores it.
+fn render_bin15_first_fires(
+    rows: &[Bin15FirstFireRow],
+    entries: &[Bin15EntryRow],
+    labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
+) -> String {
+    use core::fmt::Write as _;
+    let entered: std::collections::BTreeSet<u32> = entries.iter().map(|e| e.outcome).collect();
+    let mut s = String::with_capacity(64 + rows.len() * 240);
+    s.push_str("\"bin15_first_fires\":[");
+    let mut first = true;
+    for r in rows.iter().filter(|r| !entered.contains(&r.outcome)) {
+        if !first {
+            s.push(',');
+        }
+        first = false;
+        let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        // Writing into a `String` cannot fail.
+        let _ = write!(
+            s,
+            "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
+             \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
+             \"y\":{},\"y_next_strike\":{},\"settle_px_1e6\":{}}}",
+            r.ts_ns,
+            r.family,
+            r.outcome,
+            r.start_ns,
+            r.expiry_ns,
+            r.ts_ns.saturating_sub(r.start_ns) / 1_000_000_000,
+            r.is_yes,
+            r.px_1e6,
             y,
             y_next,
             settle_px
@@ -661,6 +738,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     // empty for every other member.
     let mut bin15_ledger: Vec<Bin15LedgerRow> = Vec::new();
     let mut bin15_entries: Vec<Bin15EntryRow> = Vec::new();
+    let mut bin15_first_fires: Vec<Bin15FirstFireRow> = Vec::new();
+    // BIN15 S5: the entry law the member ran under (persistence, ceiling),
+    // stamped on the sidecar so a reader never pairs two laws in one number.
+    let mut bin15_entry_law: (u8, u64) = (1, 0);
     // HYPARB H6: the gas ledger. The fill model has no gas lane, so the
     // member's per-ATTEMPT charge is the ledger; the OOS share comes
     // off the reported OOS net (0 for every other member).
@@ -1033,9 +1114,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     .on_start(&mut ctx)
                     .map_err(|e| HarnessError::Internal(format!("bin15 on_start failed: {e}")))?;
                 let seeded = boot.seeds.iter().filter(|s| !s.is_empty()).count();
+                bin15_entry_law =
+                    (boot.params.entry_persist_polls, boot.params.entry_elapsed_max_ns);
                 let line = format!(
                     "member: bin15 params={} hash={} families={} underlyings={} \
-                     instances={} seeds={} seed_dir={} anchor=wall (identity)",
+                     instances={} seeds={} seed_dir={} entry={} anchor=wall (identity)",
                     spec.params.display(),
                     hash_hex,
                     boot.params.n_families,
@@ -1043,6 +1126,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     instances.len(),
                     seeded,
                     seed_dir.display(),
+                    crate::bin15_boot::entry_law(&boot.params),
                 );
                 // The calibration ledger (spec §6.6): one sample per
                 // live instance per 30 s, recorded from inside the
@@ -1057,11 +1141,20 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 let mut entries: Vec<Bin15EntryRow> = Vec::new();
                 let mut was_covered: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
                     [0; strategy_bin15::BIN15_MAX_FAMILIES];
+                // BIN15 S5: the counterfactual, caught once per instance —
+                // keyed on the OUTCOME rather than a 0 -> 1 edge, so a
+                // roll and a first fire landing between two observations
+                // cannot hide the successor's.
+                let mut first_fires: Vec<Bin15FirstFireRow> = Vec::new();
+                let mut fired_outcome: [u32; strategy_bin15::BIN15_MAX_FAMILIES] =
+                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
                 let out = {
                     let ledger_ref = &mut ledger;
                     let last_ref = &mut last_sample;
                     let entries_ref = &mut entries;
                     let cov_ref = &mut was_covered;
+                    let first_ref = &mut first_fires;
+                    let fired_ref = &mut fired_outcome;
                     let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
                         let mut f = 0usize;
                         while f < s.n_families() {
@@ -1150,6 +1243,24 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                                 });
                             }
                             cov_ref[f] = fam.covered;
+                            if fam.is_live()
+                                && fam.entry_first_ok_ts != 0
+                                && fired_ref[f] != fam.live.outcome
+                            {
+                                fired_ref[f] = fam.live.outcome;
+                                first_ref.push(Bin15FirstFireRow {
+                                    ts_ns: fam.entry_first_ok_ts,
+                                    family: f as u8,
+                                    outcome: fam.live.outcome,
+                                    start_ns: fam
+                                        .live
+                                        .expiry_ns
+                                        .saturating_sub(strategy_bin15::TAU_15M_NS),
+                                    expiry_ns: fam.live.expiry_ns,
+                                    is_yes: fam.entry_first_ok_yes,
+                                    px_1e6: fam.entry_first_ok_px_1e6,
+                                });
+                            }
                             f += 1;
                         }
                     };
@@ -1164,6 +1275,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 };
                 bin15_ledger = ledger;
                 bin15_entries = entries;
+                bin15_first_fires = first_fires;
                 let c = strat.counters();
                 let counters = format!(
                     "member: bin15 reprices={} rolls={} rolls_settled={} spec_overrides={} \
@@ -1172,7 +1284,8 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                      skipped_tau={} skipped_tail={} skipped_stale={} \
                      skipped_mark_stale={} skipped_book={} \
                      skipped_inventory={} skipped_cap={} skipped_grid={} \
-                     skipped_entry_price={} families_dormant={} \
+                     skipped_entry_price={} skipped_entry_persist={} \
+                     skipped_entry_elapsed={} families_dormant={} \
                      fills={} unknown_fills={} ledger_rows={} orders_emitted={} \
                      regime=not-replayed(v1)",
                 c.reprices,
@@ -1196,6 +1309,8 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 c.skipped_cap,
                 c.skipped_grid,
                 c.skipped_entry_price,
+                c.skipped_entry_persist,
+                c.skipped_entry_elapsed,
                 c.families_dormant,
                 c.fills,
                 c.unknown_fills,
@@ -1452,9 +1567,12 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     window_end_wall_ns,
                 );
                 format!(
-                    "{},{}",
+                    "{},{},{},\"bin15_entry_law\":{{\"persist_polls\":{},\"elapsed_max_ns\":{}}}",
                     render_bin15_ledger(&bin15_ledger, &y),
-                    render_bin15_entries(&bin15_entries, &y)
+                    render_bin15_entries(&bin15_entries, &bin15_first_fires, &y),
+                    render_bin15_first_fires(&bin15_first_fires, &bin15_entries, &y),
+                    bin15_entry_law.0,
+                    bin15_entry_law.1
                 )
             },
         );
@@ -1658,6 +1776,15 @@ mod tests {
             p_hat_1e6: 700_000,
             origin: core_types::FILL_ORIGIN_PAPER,
         };
+        let ff = Bin15FirstFireRow {
+            ts_ns: 900,
+            family: 0,
+            outcome: 7,
+            start_ns: 100,
+            expiry_ns: 900_000_000_100,
+            is_yes: 1,
+            px_1e6: 620_000,
+        };
         let mut y = BTreeMap::new();
         y.insert(
             7u32,
@@ -1667,7 +1794,7 @@ mod tests {
                 y_next_strike: 1_000_000,
             },
         );
-        let s = render_bin15_entries(&[row], &y);
+        let s = render_bin15_entries(&[row], &[ff], &y);
 
         assert!(s.contains("\"origin\":1"), "{s}");
         assert!(s.contains("\"y\":1000000"), "{s}");
@@ -1682,10 +1809,75 @@ mod tests {
 
         // An unsettled row still carries the stamp: `y` being null is
         // about the payout, never about which accounting it belongs to.
-        let s2 = render_bin15_entries(&[row], &BTreeMap::new());
+        let s2 = render_bin15_entries(&[row], &[], &BTreeMap::new());
         assert!(s2.contains("\"origin\":1"), "{s2}");
         assert!(s2.contains("\"y\":null"), "{s2}");
         assert!(s2.contains("\"y_next_strike\":-1"), "{s2}");
         assert!(s2.contains("\"settle_px_1e6\":null"), "{s2}");
+        // BIN15 S5: the counterfactual rides the entry row it pairs with,
+        // joined by outcome; with none recorded the keys are null.
+        assert!(
+            s.ends_with(
+                "\"first_fire_ts_ns\":900,\"first_fire_px_1e6\":620000,\"first_fire_is_yes\":1}]"
+            ),
+            "{s}"
+        );
+        assert!(
+            s2.ends_with(
+                "\"first_fire_ts_ns\":null,\"first_fire_px_1e6\":null,\"first_fire_is_yes\":null}]"
+            ),
+            "{s2}"
+        );
+    }
+
+    /// BIN15 S5 (ruling O-4): the `bin15_first_fires` block carries the
+    /// counterfactual on every instance the member did NOT enter, labelled
+    /// like an entry — and leaves out an entered one, whose row already
+    /// carries it, so every old-law instance appears exactly once.
+    #[test]
+    fn the_first_fires_block_is_the_old_law_on_the_instances_not_entered() {
+        let ff = |outcome: u32, is_yes: u8, px_1e6: i64| Bin15FirstFireRow {
+            ts_ns: 1_000_000_000_000 + 95_000_000_000,
+            family: 0,
+            outcome,
+            start_ns: 1_000_000_000_000,
+            expiry_ns: 1_900_000_000_000,
+            is_yes,
+            px_1e6,
+        };
+        let entered = Bin15EntryRow {
+            ts_ns: 1_000_000_000_000 + 130_000_000_000,
+            family: 0,
+            outcome: 8,
+            start_ns: 1_000_000_000_000,
+            expiry_ns: 1_900_000_000_000,
+            is_yes: 1,
+            px_1e6: 650_000,
+            qty_1e6: 76_000_000,
+            p_hat_1e6: 700_000,
+            origin: core_types::FILL_ORIGIN_PAPER,
+        };
+        let mut y = BTreeMap::new();
+        y.insert(
+            9u32,
+            crate::backtest::binary::BinaryLabel {
+                value_1e6: Some(0),
+                px_1e6: Some(2_500_000_000),
+                y_next_strike: 0,
+            },
+        );
+        let s = render_bin15_first_fires(
+            &[ff(8, 1, 640_000), ff(9, 0, 410_000)],
+            &[entered],
+            &y,
+        );
+        assert_eq!(
+            s,
+            "\"bin15_first_fires\":[{\"ts_ns\":1095000000000,\"family\":0,\"outcome\":9,\
+             \"start_ns\":1000000000000,\"expiry_ns\":1900000000000,\"offset_s\":95,\
+             \"is_yes\":0,\"px_1e6\":410000,\"y\":0,\"y_next_strike\":0,\
+             \"settle_px_1e6\":2500000000}]"
+        );
+        assert_eq!(render_bin15_first_fires(&[], &[], &y), "\"bin15_first_fires\":[]");
     }
 }

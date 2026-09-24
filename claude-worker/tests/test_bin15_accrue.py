@@ -431,3 +431,174 @@ def _row_l(ts: int, outcome: int, y: int):
         ts_ns=ts, family=0, outcome=outcome, tau_ns=300_000_000_000,
         p_hat_1e6=600_000, p_raw_1e6=600_000, arm=0, y=y, entered=1, mid_1e6=-1,
     )
+
+
+# --- BIN15 S5: the counterfactual first fires (ruling O-4) --------------
+
+_VENUE: dict = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "venue"}]}
+
+#: A persistence law for the tests -- not a research setting.
+_LAW: dict = {"persist_polls": 3, "elapsed_max_ns": 240 * _S}
+
+
+def _ff(outcome: int, ts: int = 1_000, px: int = 600_000, y: int = 1_000_000,
+        is_yes: int = 1, entered: int = 0, law: tuple[int, int] = (3, 240 * _S)):
+    expiry = ts + 800_000_000_000
+    start = expiry - claude_worker.bin15_accrue.TAU_15M_NS
+    return claude_worker.bin15_accrue.FirstFire(
+        ts_ns=ts, outcome=outcome, family=0, start_ns=start, expiry_ns=expiry,
+        offset_s=(ts - start) // 1_000_000_000, is_yes=is_yes, px_1e6=px, y=y,
+        y_next_strike=y, entered=entered, persist_polls=law[0], elapsed_max_ns=law[1],
+    )
+
+
+def test_first_fires_come_from_the_entry_columns_and_the_block() -> None:
+    """Every instance the old law would have bought, once: an entered one
+    from its entry row's `first_fire_*` columns, the rest from the
+    `bin15_first_fires` block, all stamped with the sidecar's entry law. A
+    pre-S5 sidecar yields nothing; one off the venue clock yields nothing
+    and counts what it dropped."""
+    entry = {
+        "ts_ns": 130 * _S, "outcome": 7, "family": 0, "start_ns": 0,
+        "expiry_ns": 900 * _S, "offset_s": 130, "is_yes": 1, "px_1e6": 650_000,
+        "qty_1e6": 76_000_000, "p_hat_1e6": 700_000, "origin": 1, "y": 1_000_000,
+        "y_next_strike": 1_000_000, "settle_px_1e6": 77_000_000_000,
+        "first_fire_ts_ns": 95 * _S, "first_fire_px_1e6": 640_000, "first_fire_is_yes": 1,
+    }
+    declined = {
+        "ts_ns": 40 * _S, "family": 1, "outcome": 9, "start_ns": 0, "expiry_ns": 900 * _S,
+        "offset_s": 40, "is_yes": 0, "px_1e6": 410_000, "y": None, "y_next_strike": -1,
+        "settle_px_1e6": None,
+    }
+    blocks = {"bin15_entries": [entry], "bin15_first_fires": [declined], "bin15_entry_law": _LAW}
+    fires, dropped = claude_worker.bin15_accrue.first_fires_from_sidecar(
+        json.dumps({"stale": _VENUE, **blocks})
+    )
+    assert dropped == 0
+    assert [(f.outcome, f.ts_ns, f.px_1e6, f.is_yes, f.offset_s, f.entered) for f in fires] == [
+        (7, 95 * _S, 640_000, 1, 95, 1),
+        (9, 40 * _S, 410_000, 0, 40, 0),
+    ]
+    assert {f.law for f in fires} == {(3, 240 * _S)}
+    assert fires[0].won and not fires[1].settled
+    lost = dict(entry, first_fire_ts_ns=None, first_fire_px_1e6=None, first_fire_is_yes=None)
+    assert claude_worker.bin15_accrue.first_fires_from_sidecar(
+        json.dumps({"stale": _VENUE, "bin15_entries": [lost]})
+    ) == ([], 0), "a lost first fire is not guessed"
+    pre_s5 = {k: v for k, v in entry.items() if not k.startswith("first_fire_")}
+    assert claude_worker.bin15_accrue.first_fires_from_sidecar(
+        json.dumps({"stale": _VENUE, "bin15_entries": [pre_s5]})
+    ) == ([], 0)
+    anchor = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "anchor"}]}
+    assert claude_worker.bin15_accrue.first_fires_from_sidecar(
+        json.dumps({"stale": anchor, **blocks})
+    ) == ([], 2)
+
+
+def test_the_first_fire_store_keeps_the_earliest_fire_and_never_mixes_two_laws(
+    tmp_path,
+) -> None:
+    """A window cut replays a straddling instance twice: the EARLIEST fire
+    is the old law's, the label comes from whichever row has it, `entered`
+    from either. A row accrued under another entry law only lends the
+    label. A second merge changes nothing; the file round-trips."""
+    unknown = claude_worker.bin15_accrue.Y_UNKNOWN
+    early = _ff(7, ts=10 * _S, px=600_000, y=unknown)
+    late = _ff(7, ts=20 * _S, px=700_000, y=0, entered=1)
+    merged, added = claude_worker.bin15_accrue.merge_first_fires([early], [late])
+    assert added == 0 and len(merged) == 1
+    m = merged[0]
+    assert (m.ts_ns, m.px_1e6, m.y, m.y_next_strike, m.entered) == (10 * _S, 600_000, 0, 0, 1)
+    again, added = claude_worker.bin15_accrue.merge_first_fires(merged, [late, early])
+    assert added == 0 and again == merged
+    other_law = _ff(8, ts=5 * _S, y=0, entered=1, law=claude_worker.bin15_accrue.OLD_LAW)
+    stored = _ff(8, ts=30 * _S, px=650_000, y=unknown)
+    (mix,), _ = claude_worker.bin15_accrue.merge_first_fires([stored], [other_law])
+    assert (mix.ts_ns, mix.px_1e6, mix.entered, mix.law) == (30 * _S, 650_000, 0, (3, 240 * _S))
+    assert mix.y == 0, "the label is a fact about the instance, whatever the law"
+    p = tmp_path / "first_fires.tsv"
+    rows = [*again, _ff(9, ts=30 * _S)]
+    claude_worker.bin15_accrue.write_first_fires(p, rows)
+    assert claude_worker.bin15_accrue.read_first_fires(p) == rows
+    p.write_text("1\t2\t3\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="want 13 columns"):
+        claude_worker.bin15_accrue.read_first_fires(p)
+
+
+def test_the_counterfactual_is_scored_per_law_on_the_same_instances_and_the_declined() -> None:
+    """Doc 27 §5's "over today's law on the SAME instances": paired by
+    outcome, each side at an equal dollar, one block per entry law -- the
+    old law itself only counted -- plus the old law on the instances the
+    member declined. An unsettled fire is counted, never scored."""
+    unknown = claude_worker.bin15_accrue.Y_UNKNOWN
+    entries = [
+        _e(7, px=650_000, y=1_000_000)._replace(venue=True),
+        _e(8, ts=2_000, px=700_000, y=0)._replace(venue=True),
+        _e(11, ts=5_000, px=500_000, y=0)._replace(venue=True),
+        _e(12, ts=6_000, px=500_000, y=0)._replace(venue=True),
+        _e(13, ts=7_000, px=500_000, y=0)._replace(venue=True),
+    ]
+    # 9 is declined: an entry for it (a day re-accrued under another law)
+    # is not a pair, and 9 is scored once, as declined.
+    entries.append(_e(9, ts=3_000, px=500_000, y=0)._replace(venue=True))
+    fires = [
+        _ff(7, px=600_000, y=1_000_000, entered=1),
+        _ff(8, ts=2_000, px=600_000, y=0, is_yes=0, entered=1),
+        _ff(9, ts=3_000, px=400_000, y=0, is_yes=1),
+        _ff(10, ts=4_000, y=unknown),
+        _ff(11, ts=5_000, y=unknown, entered=1),
+        _ff(12, ts=6_000, px=500_000, y=0, entered=1, law=claude_worker.bin15_accrue.OLD_LAW),
+    ]
+    lines = claude_worker.bin15_accrue.render_counterfactual(entries, fires)
+    assert lines == [
+        "counterfactual (persist 1, no ceiling, the artifact's own price test: the first "
+        "passing reprice, not traded): 6 first fire(s), 4 settled; 4 on instances the "
+        "member entered, 2 it declined",
+        "   1 entr(ies) with no first fire (accrued before S5) -- not paired",
+        "   -- entry law persist 1, no ceiling: the old law itself, 1 first fire(s) -- "
+        "identical to its entries by construction, not a comparison",
+        "   -- entry law persist 3, ceiling 240 s: 5 first fire(s)",
+        "      1 settled entr(ies) whose first fire is unsettled (run `relabel`) -- left out",
+        "      the SAME 2 instance(s): hit 50.0 % vs the old law's 100.0 % (-50.0 pts); "
+        "EV per $1 -0.2308 vs +0.6667; mean price 0.6750 vs 0.6000",
+        "      the 1 instance(s) it declined: the old law would have hit 0.0 % at a mean "
+        "0.4000, EV per $1 -1.0000",
+    ]
+
+
+def test_an_entry_of_an_instance_stored_under_another_law_is_not_merged() -> None:
+    """A day re-accrued after the artifact changed: an instance whose first
+    fire is stored under another entry law keeps its stored entry; one with
+    none stored (or under the same law) merges."""
+    other = claude_worker.bin15_accrue.OLD_LAW
+    law = (3, 240 * _S)
+    stored = [_ff(7, law=other), _ff(8, law=law)]
+    incoming = [(_e(7), law), (_e(8), law), (_e(9), law)]
+    kept = claude_worker.bin15_accrue.same_law_entries(incoming, stored)
+    assert [e.outcome for e in kept] == [8, 9]
+
+
+def test_relabel_fills_an_unknown_first_fire_label_and_nothing_else(tmp_path) -> None:
+    """BIN15 S5: a first fire whose window could not settle it takes the
+    captures' LAW E-11 label, exactly as a venue entry does; a known label
+    is never touched, and a rerun fills nothing."""
+    pull = tmp_path / "pull"
+    _capture(pull)
+    ledger = tmp_path / "ledger.tsv"
+    entries = tmp_path / "entries.tsv"
+    fires = tmp_path / "first_fires.tsv"
+    unknown = claude_worker.bin15_accrue.Y_UNKNOWN
+    claude_worker.bin15_accrue.write_first_fires(
+        fires, [_ff(100, ts=_EPOCH, y=unknown), _ff(7, ts=_EPOCH + _S, y=0)]
+    )
+    lines: list[str] = []
+    dirs = claude_worker.bin15_accrue.tape_dirs([str(pull)], [])
+    claude_worker.bin15_accrue.relabel(ledger, entries, dirs, lines.append, first_fires=fires)
+    got = {f.outcome: (f.y, f.y_next_strike) for f in
+           claude_worker.bin15_accrue.read_first_fires(fires)}
+    assert got == {100: (1_000_000, 1_000_000), 7: (0, 0)}, lines
+    assert any("first fires: rows 2: unknown labels filled 1" in line for line in lines), lines
+    assert len(list(tmp_path.glob("first_fires.tsv.bak-relabel-*"))) == 1
+    before = fires.read_bytes()
+    claude_worker.bin15_accrue.relabel(ledger, entries, dirs, lines.append, first_fires=fires)
+    assert fires.read_bytes() == before

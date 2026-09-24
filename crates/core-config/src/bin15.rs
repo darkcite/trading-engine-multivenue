@@ -73,7 +73,7 @@ fn err(msg: impl Into<String>) -> Bin15Error {
 /// Every key the grammar accepts. An unknown key is a REFUSAL: a
 /// typo'd `e_take_1e6` that silently took the default is a member
 /// trading an edge nobody chose.
-const BIN15_KEYS: [&str; 25] = [
+const BIN15_KEYS: [&str; 27] = [
     "families",
     "underlying",
     "tau_ns",
@@ -118,6 +118,15 @@ const BIN15_KEYS: [&str; 25] = [
     // BIN15 R0 (2026-09-19): the coverage entry's price FLOOR. Optional;
     // absent = 0 = no floor, which is the 2026-09-13 law bit for bit.
     "entry_min_px_1e6",
+    // BIN15 S5 (2026-09-24): the coverage entry's PERSISTENCE — how many
+    // consecutive distinct book snapshots of the preferred leg its price
+    // test must hold on before it fires. Optional; absent = 1 = the first
+    // snapshot that passes fires, which is the pre-S5 law bit for bit.
+    "entry_persist_polls",
+    // BIN15 S5: the entry's ELAPSED CEILING — the latest, after the
+    // instance's start (expiry − the tenor), that a run of passing
+    // snapshots may begin, ns. Optional; absent = 0 = no ceiling.
+    "entry_elapsed_max_ns",
 ];
 
 /// `bin15.toml` as parsed. The strings stay descriptors: resolving them
@@ -175,6 +184,13 @@ pub struct Bin15File {
     /// BIN15 R0 (2026-09-19): the lowest preferred-side ask the coverage
     /// entry will pay ×1e6. Absent = 0 = no floor.
     pub entry_min_px_1e6: i64,
+    /// BIN15 S5: consecutive distinct preferred-leg book snapshots the
+    /// coverage entry's price test must hold on before it fires, in
+    /// `[1, ENTRY_PERSIST_POLLS_MAX]`. Absent = 1 = the pre-S5 law.
+    pub entry_persist_polls: u8,
+    /// BIN15 S5: the latest a run of passing snapshots may begin, ns after
+    /// the instance's start; `0` or under `tau_ns`. Absent = 0 = no ceiling.
+    pub entry_elapsed_max_ns: u64,
 }
 
 /// Read and parse the artifact, returning it with its RAW BYTES so the
@@ -246,6 +262,26 @@ pub const MARK_STALE_NS_MIN: u64 = 1_000_000_000;
 /// EV per dollar of premium of `p/a − 1`). This is the cushion on top:
 /// model error plus the exit-leg fee at the operator tier.
 pub const E_ENTRY_1E6_DEFAULT: i64 = 20_000;
+
+/// BIN15 S5: the most consecutive snapshots the persistence law may ask
+/// for. The outcome legs' two-sided touch is the `l2Book` push, ~5.3 s
+/// apart, so eight is ~40 s of an instance's 900: past it the entry is a
+/// different (late) strategy, not a filter on this one.
+pub const ENTRY_PERSIST_POLLS_MAX: u8 = 8;
+
+/// BIN15 S5: `entry_persist_polls`, absent = 1, bounded to
+/// `[1, ENTRY_PERSIST_POLLS_MAX]`. Zero is refused rather than read as
+/// "off": a law that needs no passing snapshot would fire on a failing one.
+fn persist_polls(kv: &[(String, Value, usize)]) -> Result<u8, Bin15Error> {
+    let v = opt_int(kv, "entry_persist_polls", 1)?;
+    match u8::try_from(v) {
+        Ok(p) if (1..=ENTRY_PERSIST_POLLS_MAX).contains(&p) => Ok(p),
+        _ => Err(err(format!(
+            "`entry_persist_polls` must be in [1, {ENTRY_PERSIST_POLLS_MAX}] (got {v}); \
+             absent means 1 = the entry fires on the first snapshot that passes"
+        ))),
+    }
+}
 
 fn opt_pos_u64(
     kv: &[(String, Value, usize)],
@@ -414,6 +450,8 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         mark_stale_ns: opt_pos_u64(&kv, "mark_stale_ns", MARK_STALE_NS_DEFAULT)?,
         e_entry_1e6: opt_int(&kv, "e_entry_1e6", E_ENTRY_1E6_DEFAULT)?,
         entry_min_px_1e6: opt_int(&kv, "entry_min_px_1e6", 0)?,
+        entry_persist_polls: persist_polls(&kv)?,
+        entry_elapsed_max_ns: opt_pos_u64(&kv, "entry_elapsed_max_ns", 0)?,
     };
 
     if file.families.is_empty() || file.families.len() > BIN15_MAX_FAMILIES {
@@ -550,6 +588,15 @@ pub fn parse(src: &str) -> Result<Bin15File, Bin15Error> {
         return Err(err(format!(
             "`entry_min_px_1e6` must be in [0, 1000000) (got {}); absent means 0 = no floor",
             file.entry_min_px_1e6
+        )));
+    }
+    // BIN15 S5. A ceiling at or past the tenor is later than any instance
+    // lives, so it would never close one: a gate spelled as if it worked.
+    if file.entry_elapsed_max_ns >= file.tau_ns {
+        return Err(err(format!(
+            "`entry_elapsed_max_ns` {} must be under `tau_ns` {} — a ceiling at or \
+             past the tenor never closes an instance; absent means 0 = no ceiling",
+            file.entry_elapsed_max_ns, file.tau_ns
         )));
     }
     if file.scale_1e9 <= 0 {
@@ -792,6 +839,54 @@ mod tests {
         assert_eq!(f.hour_ln_off_1e9, [0i64; HOURS], "no hour table = no offset");
         assert_eq!(f.scale_1e9, 1_000_000_000, "no scale = no scaling");
         assert_eq!(f.entry_min_px_1e6, 0, "no floor = the 2026-09-13 entry law");
+        assert_eq!(f.entry_persist_polls, 1, "no persistence key = the pre-S5 entry law");
+        assert_eq!(f.entry_elapsed_max_ns, 0, "no ceiling key = no ceiling");
+    }
+
+    /// BIN15 S5: the persistence entry's two keys are KNOWN optional keys
+    /// (O4b's lesson), round-trip, and are bounded: persistence in
+    /// `[1, 8]` (zero would fire on a failing snapshot), the ceiling `0`
+    /// (off) or under the tenor (at or past it no instance is ever closed).
+    #[test]
+    fn the_persistence_keys_are_known_round_trip_and_are_bounded() {
+        let src = format!(
+            "{}entry_persist_polls = 3\nentry_elapsed_max_ns = 240000000000\n",
+            artifact()
+        );
+        let f = parse(&src).expect("both keys are known");
+        assert_eq!(f.entry_persist_polls, 3);
+        assert_eq!(f.entry_elapsed_max_ns, 240_000_000_000);
+        let edges: [(&str, u8, u64); 3] = [
+            ("entry_persist_polls = 1\nentry_elapsed_max_ns = 0", 1, 0),
+            ("entry_persist_polls = 8\nentry_elapsed_max_ns = 1", 8, 1),
+            ("entry_elapsed_max_ns = 899999999999", 1, 899_999_999_999),
+        ];
+        let mut i = 0usize;
+        while i < edges.len() {
+            let (lines, persist, ceiling) = edges[i];
+            let f = parse(&format!("{}{lines}\n", artifact())).expect(lines);
+            assert_eq!(
+                (f.entry_persist_polls, f.entry_elapsed_max_ns),
+                (persist, ceiling),
+                "{lines}"
+            );
+            i += 1;
+        }
+        let bad: [(&str, &str); 6] = [
+            ("entry_persist_polls = 0", "[1, 8]"),
+            ("entry_persist_polls = 9", "[1, 8]"),
+            ("entry_persist_polls = -1", "[1, 8]"),
+            ("entry_elapsed_max_ns = 900000000000", "must be under `tau_ns`"),
+            ("entry_elapsed_max_ns = 900000000001", "must be under `tau_ns`"),
+            ("entry_elapsed_max_ns = -1", "must be positive"),
+        ];
+        let mut i = 0usize;
+        while i < bad.len() {
+            let (line, want) = bad[i];
+            let e = parse(&format!("{}{line}\n", artifact())).expect_err(line);
+            assert!(e.0.contains(want), "{line}: got {}", e.0);
+            i += 1;
+        }
     }
 
     /// BIN15 R0 (2026-09-19): the coverage entry's price floor is a

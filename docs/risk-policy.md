@@ -4919,6 +4919,46 @@ computed at (the member's own `last_tau_ns`), so a row priced inside
 the window reads `tau_ns < W/3` — the horizon is monotone in the time
 left and is `W/3` at the open — and needs no flag of its own.
 
+### The coverage entry's persistence and elapsed ceiling (S5, 2026-09-24)
+
+* **The price test can be required to HOLD before the entry pays.**
+  `entry_persist_polls = n` fires the coverage entry only on the n-th
+  consecutive distinct book snapshot of the preferred leg whose ask
+  passes (the floor, and `ask ≤ belief − e_entry`), on one side. A
+  snapshot is one write of the leg's touch — the `l2Book` push, ~5.3 s
+  apart while the venue publishes the outcome `bbo` one-sided (O8) — and
+  the run is judged per snapshot, as the research's polls were (except its
+  first poll, which a mark may establish mid-snapshot): a new
+  snapshot extends it or, failing, breaks it; a mark re-pricing the same
+  snapshot neither extends nor breaks it (it can only start one on a
+  snapshot that failed at its arrival); a flip of the preferred side
+  starts a new one.
+* **The elapsed ceiling.** `entry_elapsed_max_ns` makes a run BEGIN
+  within that long of the instance's start (expiry − 900 s; doc 27 R2's
+  "the first of them"). Past it a run already under way may still fire;
+  a reprice that would begin a run or break one closes the instance for
+  good, counted ONCE (`skipped_entry_elapsed`), not per reprice.
+* **Refusals burn nothing, as before.** `covered` is set only after a
+  submitted emit, so a cap, grid or ring refusal on a completed run
+  retries while the run lasts; past the ceiling, a break closes it.
+* Both keys absent is the pre-S5 law bit for bit. The gate
+  (`Bin15Strategy::entry_gate`) allocates nothing; gate 52 runs it with a
+  persistence count, a price refusal, a ceiling and one close under the
+  guard.
+* **The counterfactual is logged, never traded (ruling O-4).** Each
+  instance records when its price test — the artifact's own floor and
+  `e_entry` — first held and the ask then (`FamilyState::entry_first_ok_*`):
+  the pre-S5 law's entry attempt on it (a cap, grid or ring refusal there
+  would have moved its real entry later). The harness writes it beside each entry (`first_fire_*`) and,
+  for the instances the persistence law declined, in
+  `bin15_first_fires`, with the entry law the member ran under;
+  `bin15_accrue` keeps it in `first_fires.tsv` and reports the old law on
+  the SAME instances beside the new, one block per law — what doc 27
+  §5's bars are scored on. No order is ever sized or sent from it.
+* These are research keys. The shipped example and the fitter carry the
+  old law; a persistence setting is a hand edit of the live artifact,
+  measured in paper first (plan 28 S7).
+
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 
 Slot 0 is `hyparb`, the HyperEVM AMM ↔ Hyperliquid Core arb

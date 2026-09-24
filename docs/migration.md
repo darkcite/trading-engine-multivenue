@@ -6,6 +6,112 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the BIN15 coverage entry's persistence and elapsed ceiling: `entry_persist_polls`, `entry_elapsed_max_ns`, the counterfactual first fires (BIN15 S5)
+
+**What changed**
+- `bin15.toml` gains two optional keys; the grammar knows 27.
+  - `entry_persist_polls` (`[1, 8]`, absent = 1). The coverage entry
+    fires only once its price test (the floor, and `ask ≤ belief −
+    e_entry`) has held on this many consecutive distinct book snapshots
+    of the preferred leg, on one side. A snapshot is one write of the
+    leg's touch: the `l2Book` push, ~5.3 s apart while the venue
+    publishes the outcome `bbo` one-sided (BIN15 O8). The run is judged
+    per snapshot, as the research's polls were (except its first poll,
+    which a mark may establish mid-snapshot). A new snapshot extends
+    the run when the test holds and breaks it when it fails. A reprice on
+    the same snapshot (a mark) neither extends nor breaks a run; it can
+    only start one, on a snapshot that failed at its arrival. A flip of
+    the preferred side starts a new run. A reprice that never reaches
+    the gate (a stale or one-sided book, a take in flight) is not a
+    poll.
+  - `entry_elapsed_max_ns` (absent = 0 = no ceiling; otherwise under
+    `tau_ns`). A run must BEGIN within this long of the instance's start
+    (expiry − 900 s). Past it a run already under way may still fire; a
+    reprice that would begin a run, or break one, closes the instance
+    for good, counted once.
+  - Both absent (every artifact before S5) is today's law bit for bit:
+    the first passing reprice fires.
+- The member: `Bin15Params` gains both keys. `FamilyState` gains the
+  run (`entry_hits`, `entry_yes`, `entry_last_touch_ts`), the ceiling's
+  flag (`entry_closed`) and the counterfactual (`entry_first_ok_ts`,
+  `entry_first_ok_px_1e6`, `entry_first_ok_yes`); it stays 512 B.
+- Counters: `skipped_entry_persist` (per reprice) and
+  `skipped_entry_elapsed` (per instance), published as
+  `engine_bin15_skipped_entry_{persist,elapsed}_total` on `/metrics`.
+  The bin15 family goes from 31 to 33 counters. The harness's
+  `member: bin15` line prints both.
+- The boot tell's `entry=` term adds `&persist<n>` (from 2) and
+  `&el<=<s>s` when they are set. An artifact without them prints the
+  pre-S5 line exactly.
+- The `--emit-detail` sidecar gains additive keys; readers by key
+  ignore them.
+  - `bin15_entries` rows gain `first_fire_ts_ns`, `first_fire_px_1e6`
+    and `first_fire_is_yes`: the counterfactual on that instance. That
+    is when the entry's price test first held, the ask then, and its
+    side — the pre-S5 law's entry attempt, logged and never traded.
+    The price test is the artifact's own (its floor and `e_entry`): the
+    counterfactual differs from the member only in persistence and the
+    ceiling.
+  - A new block, `bin15_first_fires`, holds the same for every instance
+    the old law would have bought and this window's member did not
+    enter (the persistence law or the ceiling declined it). Its rows
+    are labelled like an entry.
+  - A new key, `bin15_entry_law` (`persist_polls`, `elapsed_max_ns`):
+    the law the member ran under. The harness's `member: bin15` line
+    prints it as `entry=`.
+- `bin15_accrue` keeps a third store,
+  `~/multivenue/worker/bin15/first_fires.tsv` (13 columns, worker
+  state, never git; `--first-fires` sets the path on `accrue`, `report`,
+  `status` and `relabel`).
+  - One row per outcome, stamped with the entry law it was accrued
+    under. Across window cuts the earliest fire is kept. A row accrued
+    under another law only lends its label, and an incoming entry of an
+    instance stored under another law is not merged (counted), so a
+    stored pair never mixes two laws.
+  - Venue-clocked only: a sidecar off the venue clock drops its fires
+    and says how many. `relabel` fills an unknown label from the
+    captures, as it does for the entries.
+  - `report` prints the old law beside the PAPER entries, one block per
+    entry law: on the SAME instances (hit, equal-dollar EV per $1, mean
+    price) and on the instances the member declined. Under the old law
+    itself the pairs are identical by construction and are only
+    counted. `status` counts the store.
+- `bin15_fit.KNOBS` and `bin15.toml.example` carry
+  `entry_persist_polls = 1` and `entry_elapsed_max_ns = 0`, so the
+  example stays the old law.
+
+**Why**
+- Plan 28 S5 (doc 27 R2): the persistence rule is the one entry
+  hypothesis the research left standing. Ruling O-4 measures it in ONE
+  paper run, against the old law's first fire on the same instances,
+  rather than on a second paper family.
+
+**Impact**
+- With the keys absent nothing changes. The persistence count and the
+  ceiling never bind, and every existing coverage test is unchanged.
+- An artifact that sets them changes WHICH instances are bought and
+  WHEN: fewer entries, and later. `skipped_entry_persist` counts the
+  reprices that waited. A closed instance is silent after, so
+  `skipped_entry_price` stops counting its refusals too.
+- The accrual replays each closed day under the artifact in force at
+  00:20Z, so the day an artifact changes is the first day accrued under
+  the new law. The report keeps the laws apart.
+- The accrual writes one more file. `entries.tsv` keeps its width.
+- Wire formats: none. Config keys: two, both optional.
+
+**Migration steps**
+1. None for the defaults.
+2. To measure the rule (plan 28 S7): set the keys, and any
+   `e_entry_1e6`, in `~/multivenue/bin15.toml` by hand. Restart at a
+   safe minute and read the boot tell's `entry=` term. The next 00:20Z
+   accrual starts `first_fires.tsv`.
+
+**Rollback**
+- Remove the two keys from the artifact to return to the old law.
+- To revert the commit, remove the keys FIRST: a pre-S5 binary refuses
+  an artifact that carries them (unknown keys are refused).
+  `first_fires.tsv` is inert to older readers.
+
 ## 2026-09-24 — the BIN15 accrual stores on the venue's law and clock: `bin15_accrue relabel`, 12/14-column rows, G6.1 on the venue label, the pnl-report label tag (BIN15 S4)
 
 **What changed**

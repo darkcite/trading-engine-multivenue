@@ -253,6 +253,16 @@ KNOBS: tuple[tuple[str, int], ...] = (
     # model, and on the paper tape the venue won those; the testnet
     # research artifact sets 500000 (0.50) or 700000 (0.70) by hand.
     ("entry_min_px_1e6", 0),
+    # BIN15 S5 (2026-09-24): the coverage entry's PERSISTENCE -- how many
+    # consecutive distinct book snapshots of the preferred leg its price
+    # test must hold on before it fires, in [1, 8]. 1 = the first passing
+    # snapshot fires, the pre-S5 law bit for bit. A persistence rule is a
+    # hand edit of the live artifact, never a fitted default.
+    ("entry_persist_polls", 1),
+    # BIN15 S5: the entry's ELAPSED CEILING, ns after the instance's start
+    # (expiry - 900 s): a run of passing snapshots must BEGIN by then.
+    # 0 = no ceiling.
+    ("entry_elapsed_max_ns", 0),
     ("maker_enabled", 1),
     ("null_arm", 1),
 )

@@ -10,13 +10,18 @@ the hit rate spanning 51 %-82 %. Detecting even a 10-point edge needs
 object storage and removed locally after a day (``PROTECT_DAYS=1``), so
 a lane that only analyses on request analyses the same fortnight of tape
 over and over. This module makes the day's evidence PERMANENT and small:
-two append-only TSVs under the worker's own state root.
+append-only TSVs under the worker's own state root -- the ledger, the
+entries, and (BIN15 S5, ruling O-4) the COUNTERFACTUAL first fires: the
+pre-S5 entry law's entry on every instance it would have bought, logged
+by the harness and never traded, which is what the persistence law is
+scored against on the same instances.
 
 **What it does.** For every run of the closed day that carries a HIP-4
 instance: cut it into ≤ 2 h windows (the capture-window law, absolute),
 cut a POINT-IN-TIME seed for each from ``candles.db``, drive
 ``backtest --member bin15 --emit-detail`` through it, and merge the
-sidecar's ``bin15_ledger`` and ``bin15_entries`` blocks into the stores.
+sidecar's ``bin15_ledger``, ``bin15_entries`` and ``bin15_first_fires``
+blocks into the stores.
 Idempotent: both merges dedupe, so re-running a day adds nothing -- on ONE
 clock law. A day accrued on the anchor clock, relabelled onto the venue's
 (BIN15 S4), and then re-accrued by a venue-clock binary is NOT deduped
@@ -42,14 +47,17 @@ Lanes (``python -m claude_worker.bin15_accrue <lane>``):
 - ``report`` — the three operator questions (prediction success at the
   price paid, entry timing, entry price) with a Wilson interval and the
   sample size each conclusion would need — on the VENUE's label first
-  (LAW E-11), the label each entry was accrued with beside it.
+  (LAW E-11), the label each entry was accrued with beside it — and,
+  once first fires exist, the pre-S5 law on the SAME instances beside
+  the persistence law's (BIN15 S5).
 - ``relabel [--pull DIR …] [--runs DIR …]`` — BIN15 S4: correct both
   stores IN PLACE onto the venue's law and clock from the captures on
   disk (``claude_worker.bin15_tape``): every row not yet on it gets
   LAW E-11's ``y`` (the old one kept as ``y_engine``), the venue-published
   ``y_next_strike``, and its stamp moved onto the venue clock. Rows no
   capture covers stay as they are, counted. Idempotent: a second run
-  converts nothing.
+  converts nothing. The first-fire store (BIN15 S5) has its unknown labels
+  filled the same way.
 - ``status`` — rows, instances, settled entries, days covered.
 
 Convention: full ``import x`` only. No ``from x import y``.
@@ -306,6 +314,218 @@ def write_entries(path: pathlib.Path, rows: typing.Sequence[Entry]) -> None:
 
 
 # ---------------------------------------------------------------------
+# BIN15 S5 (ruling O-4): the counterfactual first fires
+# ---------------------------------------------------------------------
+
+#: The counterfactual store, beside the entries.
+DEFAULT_FIRST_FIRES: str = "~/multivenue/worker/bin15/first_fires.tsv"
+
+#: Header; `#` lines are skipped on read.
+FIRST_FIRES_HEADER: str = (
+    "# bin15 first fires -- BIN15 S5 (ruling O-4): the COUNTERFACTUAL. One row\n"
+    "#   per instance the pre-S5 entry law (persist 1, no ceiling, at the\n"
+    "#   artifact's own floor and e_entry) would have bought: the first reprice\n"
+    "#   whose price test held, logged by the harness and NEVER traded.\n"
+    "#   From the `bin15_entries` rows' `first_fire_*`\n"
+    "#   columns (entered 1: the member bought the instance too) and the\n"
+    "#   `bin15_first_fires` block (entered 0: the persistence law or the\n"
+    "#   elapsed ceiling declined it).\n"
+    "# ts_ns\toutcome\tfamily\tstart_ns\texpiry_ns\toffset_s\tis_yes\tpx_1e6"
+    "\ty\ty_next_strike\tentered\tpersist_polls\telapsed_max_ns\n"
+    "# persist_polls / elapsed_max_ns: the entry law the member ran under when\n"
+    "#   the row was accrued (the sidecar's `bin15_entry_law`). 1 / 0 is the old\n"
+    "#   law itself: its pairs are identical by construction, not a comparison.\n"
+    "# On the VENUE's law and clock only: a first fire exists only from an S5\n"
+    "#   harness, and one from a run without venue time is dropped (counted).\n"
+    "# y: 1000000 settled ITM, 0 OTM, -1 the window could not derive it.\n"
+    "# Worker state. Never git; findings go to docs/research/outcome/.\n"
+)
+
+#: Columns of a first-fire row.
+FIRST_FIRE_COLUMNS: int = 13
+
+#: The entry law with neither S5 key set: the old law itself.
+OLD_LAW: tuple[int, int] = (1, 0)
+
+
+class FirstFire(typing.NamedTuple):
+    """The pre-S5 law's entry on one instance: logged, never traded."""
+
+    ts_ns: int
+    outcome: int
+    family: int
+    start_ns: int
+    expiry_ns: int
+    offset_s: int
+    is_yes: int
+    px_1e6: int
+    y: int
+    #: The venue-published label (``Y_UNKNOWN`` unknown / a tie).
+    y_next_strike: int
+    #: ``1``: the member entered this instance too, so the two laws are
+    #: scored on the SAME instance; ``0``: the persistence law declined it.
+    entered: int
+    #: The entry law the member ran under (``entry_persist_polls``,
+    #: ``entry_elapsed_max_ns``) -- :data:`OLD_LAW` is the old law itself.
+    persist_polls: int
+    elapsed_max_ns: int
+
+    @property
+    def law(self) -> tuple[int, int]:
+        return (self.persist_polls, self.elapsed_max_ns)
+
+    @property
+    def settled(self) -> bool:
+        return self.y != Y_UNKNOWN
+
+    @property
+    def won(self) -> bool:
+        """Whether the side the old law would have bought settled ITM."""
+        return (self.y >= 500_000) == (self.is_yes == 1)
+
+    def tsv(self) -> str:
+        return "\t".join(str(v) for v in self) + "\n"
+
+
+def first_fires_path(path: str | None = None) -> pathlib.Path:
+    return pathlib.Path(os.path.expanduser(path or DEFAULT_FIRST_FIRES))
+
+
+def _first_fire(
+    r: dict, keys: tuple[str, str, str], entered: int, law: tuple[int, int]
+) -> FirstFire:
+    ts_key, px_key, side_key = keys
+    y = r.get("y")
+    y_next = r.get("y_next_strike")
+    ts = int(r[ts_key])
+    start = int(r["start_ns"])
+    return FirstFire(
+        ts_ns=ts,
+        outcome=int(r["outcome"]),
+        family=int(r["family"]),
+        start_ns=start,
+        expiry_ns=int(r["expiry_ns"]),
+        offset_s=max(ts - start, 0) // 1_000_000_000,
+        is_yes=int(r[side_key]),
+        px_1e6=int(r[px_key]),
+        y=Y_UNKNOWN if y is None else int(y),
+        y_next_strike=Y_UNKNOWN if y_next is None else int(y_next),
+        entered=entered,
+        persist_polls=law[0],
+        elapsed_max_ns=law[1],
+    )
+
+
+def entry_law_of(obj: dict) -> tuple[int, int]:
+    """The sidecar's ``bin15_entry_law`` -- the entry law its member ran
+    under; :data:`OLD_LAW` for a pre-S5 sidecar, which has none."""
+    law = obj.get("bin15_entry_law") or {}
+    return (int(law.get("persist_polls", 1)), int(law.get("elapsed_max_ns", 0)))
+
+
+def first_fires_from_sidecar(text: str) -> tuple[list[FirstFire], int]:
+    """``(first fires, dropped)`` of one `--emit-detail` sidecar: the
+    entries' own ``first_fire_*`` columns (``entered`` 1) and the
+    ``bin15_first_fires`` block (``entered`` 0), each stamped with the
+    sidecar's ``bin15_entry_law``. A pre-S5 sidecar carries none and yields
+    nothing; one whose runs are not on the venue clock yields nothing either
+    and counts what it dropped -- the store is on one clock, and a first
+    fire on the anchor clock is not a fact about it."""
+    obj = json.loads(text)
+    law = entry_law_of(obj)
+    out: list[FirstFire] = []
+    for r in obj.get("bin15_entries") or []:
+        # Absent: a pre-S5 harness. `null`: the harness lost the instance's
+        # first fire (the gate cannot pass without one) -- nothing to pair.
+        if r.get("first_fire_ts_ns") is not None:
+            keys = ("first_fire_ts_ns", "first_fire_px_1e6", "first_fire_is_yes")
+            out.append(_first_fire(r, keys, 1, law))
+    for r in obj.get("bin15_first_fires") or []:
+        out.append(_first_fire(r, ("ts_ns", "px_1e6", "is_yes"), 0, law))
+    if out and not claude_worker.bin15_ledger.sidecar_on_venue(obj):
+        return [], len(out)
+    return out, 0
+
+
+def read_first_fires(path: pathlib.Path) -> list[FirstFire]:
+    """Every first fire, oldest first. Empty when absent."""
+    if not path.is_file():
+        return []
+    out: list[FirstFire] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        f = s.split("\t")
+        if len(f) != FIRST_FIRE_COLUMNS:
+            raise ValueError(f"{path}: want {FIRST_FIRE_COLUMNS} columns, got {len(f)}: {s!r}")
+        out.append(FirstFire(*(int(v) for v in f)))
+    return out
+
+
+def merge_first_fires(
+    existing: typing.Sequence[FirstFire], incoming: typing.Sequence[FirstFire]
+) -> tuple[list[FirstFire], int]:
+    """``(merged oldest first, added)``, one row per OUTCOME.
+
+    An instance that straddles a window cut is replayed twice, and each
+    window's member records its own first fire. The EARLIEST is the old
+    law's -- a later one is a re-bound member firing again -- so its
+    stamp, price and side are kept; the label is taken from whichever
+    row has it (settled beats unsettled, a known venue label beats -1);
+    and ``entered`` from either, because the member entering the
+    instance in any window is what makes it a same-instance pair.
+
+    A row accrued under ANOTHER entry law (a day re-accrued after the
+    artifact changed) is a different fact: the stored row keeps its fire,
+    law and ``entered`` -- existing wins, as in the entries' merge -- and
+    only takes a label it lacked. With :func:`same_law_entries` on the
+    entries' side, a stored pair never mixes two laws.
+    """
+    by: dict[int, FirstFire] = {f.outcome: f for f in existing}
+    added = 0
+    for f in incoming:
+        old = by.get(f.outcome)
+        if old is None:
+            by[f.outcome] = f
+            added += 1
+            continue
+        same_law = old.law == f.law
+        first = old if not same_law or old.ts_ns <= f.ts_ns else f
+        lab = old if old.settled or not f.settled else f
+        by[f.outcome] = first._replace(
+            y=lab.y,
+            y_next_strike=(
+                old.y_next_strike if old.y_next_strike != Y_UNKNOWN else f.y_next_strike
+            ),
+            entered=max(old.entered, f.entered) if same_law else old.entered,
+        )
+    return sorted(by.values(), key=lambda f: (f.ts_ns, f.outcome)), added
+
+
+def same_law_entries(
+    incoming: typing.Sequence[tuple[Entry, tuple[int, int]]],
+    stored: typing.Sequence[FirstFire],
+) -> list[Entry]:
+    """The incoming entries (each with its sidecar's entry law) that may
+    merge: an instance whose first fire is stored under ANOTHER law keeps
+    its stored entry, because the pair is scored under that law."""
+    law_of = {f.outcome: f.law for f in stored}
+    return [e for e, law in incoming if law_of.get(e.outcome, law) == law]
+
+
+def write_first_fires(path: pathlib.Path, rows: typing.Sequence[FirstFire]) -> None:
+    """Atomic write (tmp + rename), as the entries."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(FIRST_FIRES_HEADER)
+        for r in rows:
+            f.write(r.tsv())
+    os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------------
 # BIN15 S4: the relabel — both stores onto the venue's law and clock
 # ---------------------------------------------------------------------
 
@@ -480,10 +700,13 @@ def relabel(
     dirs: typing.Sequence[pathlib.Path],
     report: typing.Callable[[str], None],
     dry_run: bool = False,
+    first_fires: pathlib.Path | None = None,
 ) -> tuple[RelabelCount, RelabelCount]:
     """The ``relabel`` lane: load the captures, label every instance on
     them on LAW E-11, correct both stores (a timestamped backup of each
-    changed file first), and say what moved."""
+    changed file first), and say what moved. BIN15 S5: the first-fire
+    store, when given, has its unknown labels filled the same way (its
+    rows are venue-clocked by construction, so nothing else moves)."""
     tapes = claude_worker.bin15_tape.load_all(dirs, report)
     if tapes:
         deltas = sorted(t.delta_ns / 1e9 for t in tapes)
@@ -508,11 +731,18 @@ def relabel(
     # The stores are read ONCE and replaced whole; an accrual that lands in
     # between would be lost. Their stat at read time is checked again just
     # before each replace, and a change aborts that write (rerun).
-    seen = (_stat(ledger), _stat(entries))
+    seen = (_stat(ledger), _stat(entries), None if first_fires is None else _stat(first_fires))
     led_rows = claude_worker.bin15_ledger.read_ledger(ledger)
     ent_rows = read_entries(entries)
+    ff_rows = [] if first_fires is None else read_first_fires(first_fires)
     new_led, cl = relabel_ledger(led_rows, tapes, labels)
     new_ent, ce = relabel_entries(ent_rows, tapes, labels)
+    new_ff, filled_ff = _fill_unknown(
+        ff_rows, labels, lambda r, lab: r._replace(y=lab.y, y_next_strike=_keep_next(r, lab))
+    )
+    cf = RelabelCount(len(ff_rows), 0, len(ff_rows), 0, 0, filled_ff)
+    if first_fires is not None:
+        report(f"  first fires: rows {cf.rows}: unknown labels filled {cf.filled}")
     for name, c in (("ledger", cl), ("entries", ce)):
         report(
             f"  {name}: rows {c.rows}: converted {c.converted}, already on the venue "
@@ -539,10 +769,13 @@ def relabel(
         report("  --dry-run: nothing written")
         return cl, ce
     stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
-    for path, count, before, write in (
+    stores = [
         (ledger, cl, seen[0], lambda p: claude_worker.bin15_ledger.write_ledger(p, new_led)),
         (entries, ce, seen[1], lambda p: write_entries(p, new_ent)),
-    ):
+    ]
+    if first_fires is not None:
+        stores.append((first_fires, cf, seen[2], lambda p: write_first_fires(p, new_ff)))
+    for path, count, before, write in stores:
         if not (count.converted or count.collided or count.filled):
             continue
         if _stat(path) != before:
@@ -679,16 +912,20 @@ def accrue(
     day: str | None,
     ledger: pathlib.Path,
     entries: pathlib.Path,
+    first_fires: pathlib.Path,
     fee_flag: str,
     report: typing.Callable[[str], None] = lambda s: None,
-) -> tuple[int, int, int]:
-    """``(windows driven, ledger rows added, entries added)``."""
+) -> tuple[int, int, int, int]:
+    """``(windows driven, ledger rows added, entries added, first fires
+    added)``."""
     runs = hip4_runs(replay_dir, day)
     if not runs:
         report(f"bin15-accrue: no HIP-4 run for {day or 'any day'}")
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     new_ledger: list = []
-    new_entries: list[Entry] = []
+    new_entries: list[tuple[Entry, tuple[int, int]]] = []
+    new_fires: list[FirstFire] = []
+    dropped_fires = 0
     units = 0
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -718,16 +955,37 @@ def accrue(
                     new_ledger.extend(
                         claude_worker.bin15_ledger.rows_from_sidecar(text)
                     )
-                    new_entries.extend(entries_from_sidecar(text))
+                    law = entry_law_of(json.loads(text))
+                    new_entries.extend((e, law) for e in entries_from_sidecar(text))
+                    fires, dropped = first_fires_from_sidecar(text)
+                    new_fires.extend(fires)
+                    dropped_fires += dropped
                 shutil.rmtree(unit, ignore_errors=True)
                 shutil.rmtree(seed_dir, ignore_errors=True)
     merged_l, added_l = claude_worker.bin15_ledger.merge(
         claude_worker.bin15_ledger.read_ledger(ledger), new_ledger
     )
     claude_worker.bin15_ledger.write_ledger(ledger, merged_l)
-    merged_e, added_e = merge_entries(read_entries(entries), new_entries)
+    # BIN15 S5: an instance whose first fire is stored under another entry
+    # law (a day re-accrued after the artifact changed) keeps its stored
+    # entry -- merging this law's would pair two laws in one number.
+    kept = same_law_entries(new_entries, read_first_fires(first_fires))
+    if len(kept) < len(new_entries):
+        report(
+            f"bin15-accrue: {len(new_entries) - len(kept)} entr(ies) of instances accrued "
+            "under another entry law — not merged (never accrue one day under two laws)"
+        )
+    merged_e, added_e = merge_entries(read_entries(entries), kept)
     write_entries(entries, merged_e)
-    return (units, added_l, added_e)
+    if dropped_fires:
+        report(
+            f"bin15-accrue: {dropped_fires} first fire(s) dropped — their run has no "
+            "venue clock (the counterfactual store is on the venue's law only)"
+        )
+    merged_f, added_f = merge_first_fires(read_first_fires(first_fires), new_fires)
+    if merged_f:
+        write_first_fires(first_fires, merged_f)
+    return (units, added_l, added_e, added_f)
 
 
 # ---------------------------------------------------------------------
@@ -916,6 +1174,95 @@ def render(entries: typing.Sequence[Entry], fee_bps: int) -> list[str]:
     return out
 
 
+def ev_per_dollar(won: bool, px_1e6: int) -> float:
+    """One dollar staked at ``px``: ``1/px - 1`` when the side won, ``-1``
+    when it lost -- doc 27 §1's ``p/a - 1`` with the outcome for ``p``."""
+    return (1_000_000 / px_1e6 - 1.0) if won else -1.0
+
+
+def render_counterfactual(
+    entries: typing.Sequence[Entry], fires: typing.Sequence[FirstFire]
+) -> list[str]:
+    """BIN15 S5 (ruling O-4): the pre-S5 entry law (persist 1, no ceiling,
+    at the artifact's own floor and ``e_entry``) beside the member's, on
+    the VENUE's label -- doc 27 §5's "over today's law on the same
+    instances", and the old law on the instances the member declined --
+    one block per entry law the rows were accrued under, never mixed. A
+    pair needs the fire's own ``entered``: an entry its law declined (a day
+    re-accrued under another law) is not one.
+
+    The pairing is by outcome and exact: the gate cannot pass a reprice
+    whose price test failed, so every entry of an S5 accrual has its own
+    instance's first fire. Both sides are scored at an EQUAL dollar per
+    instance (the old law's size was never decided), so the EV here is a
+    mean of ``won/px - 1``, not the stake-weighted figure above it. Under
+    the old law itself (persist 1, no ceiling) the pairs are identical by
+    construction and are only counted.
+    """
+    out: list[str] = []
+    entered = sum(f.entered for f in fires)
+    out.append(
+        f"counterfactual (persist 1, no ceiling, the artifact's own price test: the first "
+        f"passing reprice, not traded): {len(fires)} first fire(s), "
+        f"{sum(f.settled for f in fires)} settled; {entered} on instances the member "
+        f"entered, {len(fires) - entered} it declined"
+    )
+    fire_of = {f.outcome: f for f in fires}
+    ours = [e for e in entries if e.venue]
+    unpaired = sum(1 for e in ours if e.outcome not in fire_of)
+    if unpaired:
+        out.append(f"   {unpaired} entr(ies) with no first fire (accrued before S5) -- not paired")
+    for law in sorted({f.law for f in fires}):
+        persist, ceiling = law
+        name = f"persist {persist}, " + (
+            f"ceiling {ceiling / 1e9:g} s" if ceiling else "no ceiling"
+        )
+        group = [f for f in fires if f.law == law]
+        if law == OLD_LAW:
+            out.append(
+                f"   -- entry law {name}: the old law itself, {len(group)} first fire(s) -- "
+                "identical to its entries by construction, not a comparison"
+            )
+            continue
+        out.append(f"   -- entry law {name}: {len(group)} first fire(s)")
+        mine = [
+            e for e in ours
+            if e.settled and e.outcome in fire_of
+            and fire_of[e.outcome].law == law and fire_of[e.outcome].entered
+        ]
+        pairs = [(e, fire_of[e.outcome]) for e in mine if fire_of[e.outcome].settled]
+        if len(pairs) < len(mine):
+            out.append(
+                f"      {len(mine) - len(pairs)} settled entr(ies) whose first fire is unsettled "
+                "(run `relabel`) -- left out"
+            )
+        if pairs:
+            hit_new, ev_new, px_new = _scored([e for e, _ in pairs])
+            hit_old, ev_old, px_old = _scored([f for _, f in pairs])
+            out.append(
+                f"      the SAME {len(pairs)} instance(s): hit {100*hit_new:.1f} % vs the old "
+                f"law's {100*hit_old:.1f} % ({100*(hit_new-hit_old):+.1f} pts); EV per $1 "
+                f"{ev_new:+.4f} vs {ev_old:+.4f}; mean price {px_new:.4f} vs {px_old:.4f}"
+            )
+        declined = [f for f in group if f.settled and not f.entered]
+        if declined:
+            hit, ev, px = _scored(declined)
+            out.append(
+                f"      the {len(declined)} instance(s) it declined: the old law would have hit "
+                f"{100*hit:.1f} % at a mean {px:.4f}, EV per $1 {ev:+.4f}"
+            )
+    return out
+
+
+def _scored(rows: typing.Sequence[Entry | FirstFire]) -> tuple[float, float, float]:
+    """``(hit rate, equal-dollar EV per $1, mean price)`` of settled rows."""
+    return (
+        sum(r.won for r in rows) / len(rows),
+        statistics.fmean(ev_per_dollar(r.won, r.px_1e6) for r in rows),
+        statistics.fmean(r.px_1e6 for r in rows) / 1e6,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; the verb surface stays frozen once published."""
     ap = argparse.ArgumentParser(prog="claude_worker.bin15_accrue")
@@ -927,14 +1274,17 @@ def main(argv: list[str] | None = None) -> int:
     ac.add_argument("--bin15", default=None)
     ac.add_argument("--ledger", default=None)
     ac.add_argument("--entries", default=None)
+    ac.add_argument("--first-fires", default=None)
     ac.add_argument("--fee-bps", default="hl.prediction:0:0")
 
     rp = sub.add_parser("report", help="the three questions, with the error bar")
     rp.add_argument("--entries", default=None)
+    rp.add_argument("--first-fires", default=None)
     rp.add_argument("--fee-bps-exit", type=int, default=0)
 
     st = sub.add_parser("status", help="rows, instances, settled, days")
     st.add_argument("--entries", default=None)
+    st.add_argument("--first-fires", default=None)
 
     rl = sub.add_parser(
         "relabel", help="BIN15 S4: correct both stores in place onto the venue's law and clock"
@@ -945,6 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
     rl.add_argument("--runs", action="append", default=[], help="a root of run-* dirs (repeatable)")
     rl.add_argument("--ledger", default=None)
     rl.add_argument("--entries", default=None)
+    rl.add_argument("--first-fires", default=None)
     rl.add_argument("--dry-run", action="store_true")
 
     args = ap.parse_args(argv)
@@ -957,6 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
             dirs,
             print,
             dry_run=args.dry_run,
+            first_fires=first_fires_path(args.first_fires),
         )
         return 0
 
@@ -974,19 +1326,22 @@ def main(argv: list[str] | None = None) -> int:
             day = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         led = claude_worker.bin15_ledger.ledger_path(args.ledger)
         ent = entries_path(args.entries)
-        units, dl, de = accrue(
-            replay, bin15, day, led, ent, args.fee_bps, lambda s: print(s, file=sys.stderr)
+        ff = first_fires_path(args.first_fires)
+        units, dl, de, df = accrue(
+            replay, bin15, day, led, ent, ff, args.fee_bps, lambda s: print(s, file=sys.stderr)
         )
         print(
             f"bin15-accrue: day {day}: {units} window(s) <= 2 h driven; "
-            f"+{dl} ledger row(s) -> {led}; +{de} entry(ies) -> {ent}"
+            f"+{dl} ledger row(s) -> {led}; +{de} entry(ies) -> {ent}; "
+            f"+{df} first fire(s) -> {ff}"
         )
         return 0
 
     ent = entries_path(args.entries)
     rows = read_entries(ent)
+    fires = read_first_fires(first_fires_path(args.first_fires))
     if args.lane == "status":
-        print(f"bin15-accrue: {ent} entries={len(rows)}")
+        print(f"bin15-accrue: {ent} entries={len(rows)} first_fires={len(fires)}")
         for origin, group in by_origin(rows):
             settled = [e for e in group if e.settled]
             venue = sum(1 for e in group if e.venue)
@@ -1020,6 +1375,11 @@ def main(argv: list[str] | None = None) -> int:
         lines = render(venue, args.fee_bps_exit) if venue else ["no entry on the venue label yet"]
         for line in lines:
             print(f"    {line}")
+        if origin == ORIGIN_PAPER and fires:
+            # BIN15 S5: first fires come from the harness, so they sit
+            # beside the PAPER accounting and nowhere else.
+            for line in render_counterfactual(venue, fires):
+                print(f"    {line}")
         engine, _ = on_label(group, "engine")
         if engine:
             print(

@@ -1267,6 +1267,19 @@ pub struct Bin15Counters {
     /// means the bound is not binding and the arm is a market order
     /// wearing a price limit.
     pub skipped_entry_price: u64,
+    /// BIN15 S5: coverage entries NOT taken YET because the price test
+    /// has not held on `entry_persist_polls` consecutive distinct book
+    /// snapshots. Counted per reprice, like `skipped_entry_price`; zero
+    /// for ever under `entry_persist_polls = 1` (the pre-S5 law).
+    pub skipped_entry_persist: u64,
+    /// BIN15 S5: instances whose coverage entry the elapsed ceiling
+    /// CLOSED — past `entry_elapsed_max_ns` with no run of passing
+    /// snapshots under way (none began by then, or the one that did was
+    /// broken after it). Counted ONCE per instance, not per reprice, so it
+    /// reads as instances; zero for ever with no ceiling. A closed
+    /// instance is silent after, so `skipped_entry_price` stops counting
+    /// its refusals too.
+    pub skipped_entry_elapsed: u64,
     /// Configured families with no live instance (a level, not a total).
     pub families_dormant: u64,
     /// Fills matched to one of this member's pendings.

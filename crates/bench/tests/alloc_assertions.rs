@@ -5716,6 +5716,14 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
     params.null_arm = 1;
     params.cap_instance_usd_1e6 = 1_000_000_000;
     params.cap_day_usd_1e6 = 1_000_000_000_000;
+    // BIN15 S5: the coverage entry ON, with its persistence gate and its
+    // elapsed ceiling, so the run, the counterfactual, a price refusal and
+    // (in the S3 phase below) the ceiling's close are all under the guard.
+    // The legs tick every 10 s and a failing Yes book lands at 5 s, so
+    // each 15 m instance enters on its third passing snapshot, 30 s in.
+    params.entry_usd_1e6 = 50_000_000;
+    params.entry_persist_polls = 3;
+    params.entry_elapsed_max_ns = 240_000_000_000;
 
     // A real CDF shape, boxed before the guard.
     let mut luts = Box::new(price::Bin15Luts::identity());
@@ -5870,6 +5878,12 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
                 }
                 m.on_timer(ts, &mut ctx);
             }
+            // BIN15 S5: once per instance a Yes ask the entry's bound
+            // refuses — a failing snapshot — so the gate's price refusal
+            // and a broken run are under the guard too.
+            if k == 5 {
+                m.on_tick(&leg_tick(yes_sym(fam), ts, 980_000, 990_000), &mut ctx);
+            }
             k += 1;
         }
         roll += 1;
@@ -5895,6 +5909,12 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
         ctx.now = ts;
         let px = 79_000_000_000 + (next() % 20_000_001) as i64 - 10_000_000;
         m.on_venue_event(&mark_ev(0, px, ts), &mut ctx);
+        if k == 0 {
+            // BIN15 S5: this instance is bound 830 s into its life, past
+            // the ceiling, so its first coverage reprice CLOSES it.
+            m.on_tick(&leg_tick(yes_sym(0) + 1, ts, 390_000, 600_000), &mut ctx);
+            m.on_tick(&leg_tick(yes_sym(0), ts, 300_000, 400_000), &mut ctx);
+        }
         if let Some(f0) = m.family(0) {
             priced_inside += u64::from(
                 f0.p_ts_ns == ts && f0.twap_last_ts > 0 && f0.last_tau_ns < 20_000_000_000,
@@ -5921,6 +5941,9 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
     assert!(counters.takes_submitted > 0, "the gate must measure real takes");
     assert!(counters.takes_filled > 0, "and real fills");
     assert!(counters.quotes_submitted > 0, "and Arm B");
+    assert!(counters.skipped_entry_persist > 0, "and the S5 persistence gate");
+    assert!(counters.skipped_entry_price > 0, "and its price refusal");
+    assert_eq!(counters.skipped_entry_elapsed, 1, "and the S5 ceiling's close, once");
     assert!(ctx.n > 0, "the gate must measure real submits");
     assert_eq!(
         allocs, 0,

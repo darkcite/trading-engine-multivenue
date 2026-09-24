@@ -275,6 +275,11 @@ pub fn load_bin15_boot(
     // BIN15 R0 (2026-09-19): absent = 0 = no floor, the old law bit for
     // bit; the parser has already bounded a present value to [0, 1e6).
     params.entry_min_px_1e6 = file.entry_min_px_1e6;
+    // BIN15 S5: absent = 1 and 0 = the pre-S5 law bit for bit (the
+    // first passing snapshot fires; no ceiling); the parser has bounded
+    // both.
+    params.entry_persist_polls = file.entry_persist_polls;
+    params.entry_elapsed_max_ns = file.entry_elapsed_max_ns;
     params.maker_enabled = file.maker_enabled;
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
@@ -386,31 +391,7 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
     for b in &boot.hash {
         hex.push_str(&format!("{b:02x}"));
     }
-    // BIN15 O9: the ENTRY LAW is on the boot line, because "what size
-    // do we take, and on what" is the first question asked of this
-    // member and the artifact hash alone does not answer it.
-    // `entry_usd=0` means the edge law alone (pre-2026-09-13 shape).
-    let entry = if boot.params.entry_usd_1e6 > 0 {
-        // BIN15 P3 (F6): the BOUND is part of the entry law, so it is
-        // on the line beside the size. "$50 on every instance" and
-        // "$50 on every instance whose ask clears the model by 2 c"
-        // are different strategies.
-        // BIN15 R0 (2026-09-19): a FLOOR is part of the entry law too,
-        // so it is on the line whenever it is set; at 0 the line is
-        // exactly what it was before the key existed.
-        let floor = if boot.params.entry_min_px_1e6 > 0 {
-            format!("&ask>={}c", boot.params.entry_min_px_1e6 / 10_000)
-        } else {
-            String::new()
-        };
-        format!(
-            "every-15m@${}<=p_hat-{}c{floor}",
-            boot.params.entry_usd_1e6 / 1_000_000,
-            boot.params.e_entry_1e6 / 10_000
-        )
-    } else {
-        String::from("edge-only")
-    };
+    let entry = entry_law(&boot.params);
     format!(
         "bin15: artifact configured hash={hex} families={} dormant={dormant} \
          seeds={seeded} daily_seeds={daily} entry={entry} \
@@ -421,6 +402,41 @@ pub fn render_boot_tell(boot: &Bin15Boot, dormant: usize) -> String {
         boot.params.mark_stale_ns / 1_000_000,
         day_cap_warning(&boot.params)
     )
+}
+
+/// The ENTRY LAW as the boot line spells it (BIN15 O9), because "what
+/// size do we take, and on what" is the first question asked of this
+/// member and the artifact hash alone does not answer it. `edge-only` is
+/// the edge law alone (`entry_usd_1e6 = 0`, the pre-2026-09-13 shape).
+///
+/// Every term that changes WHICH instances are bought is on the line: the
+/// BOUND (P3 F6 — "$50 on every instance" and "$50 whose ask clears the
+/// model by 2 c" are different strategies), the FLOOR (R0) when set, and
+/// since BIN15 S5 the PERSISTENCE (`&persist<n>`, from 2 up) and the
+/// ELAPSED CEILING (`&el<=<s>s`) when set. A term at its off value is
+/// absent, so a pre-S5 artifact prints exactly the line it always did.
+#[must_use]
+pub fn entry_law(p: &strategy_bin15::Bin15Params) -> String {
+    use core::fmt::Write as _;
+    if p.entry_usd_1e6 <= 0 {
+        return String::from("edge-only");
+    }
+    let mut law = format!(
+        "every-15m@${}<=p_hat-{}c",
+        p.entry_usd_1e6 / 1_000_000,
+        p.e_entry_1e6 / 10_000
+    );
+    // Writing into a `String` cannot fail.
+    if p.entry_min_px_1e6 > 0 {
+        let _ = write!(law, "&ask>={}c", p.entry_min_px_1e6 / 10_000);
+    }
+    if p.entry_persist_polls > 1 {
+        let _ = write!(law, "&persist{}", p.entry_persist_polls);
+    }
+    if p.entry_elapsed_max_ns > 0 {
+        let _ = write!(law, "&el<={}s", p.entry_elapsed_max_ns / 1_000_000_000);
+    }
+    law
 }
 
 /// Instances a 15 m family opens in one UTC day: 96 quarter-hours.
@@ -649,6 +665,24 @@ mod tests {
             }
             ph += 1;
         }
+    }
+
+    /// BIN15 S5: the entry law on the boot line — every term that changes
+    /// which instances are bought, and none at its off value, so a pre-S5
+    /// artifact prints the line it always did.
+    #[test]
+    fn the_boot_line_spells_the_whole_entry_law() {
+        let mut p = strategy_bin15::Bin15Params::default();
+        assert_eq!(entry_law(&p), "edge-only");
+        p.entry_usd_1e6 = 50_000_000;
+        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-2c", "the pre-S5 line, unchanged");
+        p.entry_min_px_1e6 = 700_000;
+        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-2c&ask>=70c");
+        p.entry_min_px_1e6 = 0;
+        p.e_entry_1e6 = 30_000;
+        p.entry_persist_polls = 3;
+        p.entry_elapsed_max_ns = 240_000_000_000;
+        assert_eq!(entry_law(&p), "every-15m@$50<=p_hat-3c&persist3&el<=240s");
     }
 
     /// BIN15 P2 (F2): the entry law's arithmetic against the day cap,
