@@ -6,6 +6,80 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — the BIN15 entry's R2-exact polls and today's-law control: `ctl_*` sidecar keys, 17-column `first_fires.tsv` (BIN15 S5b)
+
+**What changed**
+- The persistence run, for `entry_persist_polls` above 1, counts POLLS
+  only: the reprice a new snapshot of the preferred leg triggers on its
+  arrival (doc 27 R2's poll instant exactly). A poll extends the run,
+  starts one on a flipped side, or breaks it on a failed test. The
+  reprices between polls (marks, the other leg's ticks) never move the
+  run; they may fire only a run already complete (a retry after a
+  refused emit). S5's mark rescue, where a mark could start a run on a
+  snapshot that failed at its arrival, is gone. `entry_persist_polls = 1`
+  (and absent) is unchanged: every reprice is judged, the pre-S5 law.
+- The elapsed ceiling follows the polls: past it, a poll that would begin
+  or break a run closes the instance, and so does any reprice between
+  polls when no run is under way.
+- The member records a second counterfactual, the CONTROL: the first
+  reprice on which today's law held (the artifact's floor, the compiled
+  default bound `core_config::bin15::E_ENTRY_1E6_DEFAULT`, persist 1, no
+  ceiling). `Bin15Params` gains `entry_control_e_1e6`; the cli sets it
+  at boot, and it is not an artifact key (the grammar is unchanged).
+  `FamilyState` gains `entry_ctl_ok_ts`, `entry_ctl_ok_px_1e6` and
+  `entry_ctl_ok_yes`; both counterfactual prices narrow to `i32` so the
+  struct stays 512 B.
+- The `--emit-detail` sidecar gains keys (readers by key ignore them),
+  but one existing key changes shape (below):
+  - `bin15_entries` rows gain `ctl_fire_ts_ns`, `ctl_fire_px_1e6` and
+    `ctl_fire_is_yes` (`null` when today's law never held on the
+    instance).
+  - `bin15_first_fires` rows gain `ctl_ts_ns`, `ctl_offset_s`,
+    `ctl_is_yes` and `ctl_px_1e6`. The block now holds every instance
+    the member did not enter on which EITHER test held, so the artifact's
+    own `ts_ns`, `offset_s`, `is_yes` and `px_1e6` may be `null` — which
+    a pre-S5b worker cannot read (it fails on the row).
+  - `bin15_entry_law` gains `control_e_entry_1e6`.
+- `bin15_accrue`: `first_fires.tsv` rows grow from 13 to 17 columns
+  (`ctl_ts_ns`, `ctl_offset_s`, `ctl_is_yes`, `ctl_px_1e6`; a test that
+  never held is `0 / 0 / -1 / 0`, on either side). 13-column rows still
+  read, with no control. The merge keeps the earliest of EACH
+  counterfactual on its own, and the store is ordered by instance
+  start. `report` pairs the entries with the artifact's unpersisted
+  trigger and with today's law, on the SAME instances and on the ones
+  the member declined, and says the §5 fill bar is gated at the first
+  live step (ruling 2026-09-24).
+
+**Why**
+- Plan 28 S7 moves `e_entry` along with the persistence law. From then
+  on the artifact's own first fire is no longer today's law, and doc 27
+  §5's CONFIRM bar ("≥ +5 pts over today's law on the same instances")
+  needs today's law recorded on those instances. The control is that
+  record, from the same reprice stream.
+- R2-exact: the research's polls were book snapshots judged at their
+  arrival. The mark rescue let a run begin between polls, which R2
+  never did.
+
+**Impact**
+- An artifact without the S5 keys behaves exactly as before.
+- The harness and the worker ship together (one commit): a pre-S5b
+  worker fails on a `bin15_first_fires` row with a null `ts_ns`, and a
+  pre-S5b harness writes no control.
+- With `entry_persist_polls` above 1, a run can start only at a
+  snapshot's arrival, so some entries come one poll later than under S5.
+- The next accrual rewrites `first_fires.tsv` at 17 columns. A pre-S5b
+  reader refuses a 17-column row, so run the matching worker.
+- Wire formats: none. Config keys: none.
+
+**Migration steps**
+1. None. The next 00:20Z accrual widens the store.
+
+**Rollback**
+- Revert the commit, then move `first_fires.tsv` aside before a pre-S5b
+  worker reads it. Cutting it back to 13 columns is not enough: a row
+  on which only the control held (`ts_ns` 0, `px_1e6` 0) would reach
+  the S5 report as a declined fire at price 0, which it cannot score.
+
 ## 2026-09-24 — the BIN15 coverage entry's persistence and elapsed ceiling: `entry_persist_polls`, `entry_elapsed_max_ns`, the counterfactual first fires (BIN15 S5)
 
 **What changed**

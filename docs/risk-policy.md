@@ -4922,22 +4922,25 @@ left and is `W/3` at the open — and needs no flag of its own.
 ### The coverage entry's persistence and elapsed ceiling (S5, 2026-09-24)
 
 * **The price test can be required to HOLD before the entry pays.**
-  `entry_persist_polls = n` fires the coverage entry only on the n-th
-  consecutive distinct book snapshot of the preferred leg whose ask
-  passes (the floor, and `ask ≤ belief − e_entry`), on one side. A
-  snapshot is one write of the leg's touch — the `l2Book` push, ~5.3 s
-  apart while the venue publishes the outcome `bbo` one-sided (O8) — and
-  the run is judged per snapshot, as the research's polls were (except its
-  first poll, which a mark may establish mid-snapshot): a new
-  snapshot extends it or, failing, breaks it; a mark re-pricing the same
-  snapshot neither extends nor breaks it (it can only start one on a
-  snapshot that failed at its arrival); a flip of the preferred side
-  starts a new one.
+  `entry_persist_polls = n` fires the coverage entry only once its ask
+  has passed (the floor, and `ask ≤ belief − e_entry`) at n consecutive
+  POLLS of the preferred leg, on one side. Above 1, a poll is the
+  reprice a new book snapshot of that leg triggers on its arrival — doc
+  27 R2's poll instant exactly (S5b) — and a snapshot is one write of the
+  leg's touch: the `l2Book` push, ~5.3 s apart while the venue publishes
+  the outcome `bbo` one-sided (O8). A poll extends the run, starts one on
+  a flipped side, or breaks it when the test fails; the reprices between
+  polls (marks, the other leg's ticks) never move the run and may fire
+  only a run already complete (a retry after a refused emit). A snapshot
+  whose arrival never reaches the gate (a stale or one-sided book, a take
+  in flight) is not a poll. Under `n = 1` every reprice is judged — the
+  pre-S5 law.
 * **The elapsed ceiling.** `entry_elapsed_max_ns` makes a run BEGIN
   within that long of the instance's start (expiry − 900 s; doc 27 R2's
   "the first of them"). Past it a run already under way may still fire;
-  a reprice that would begin a run or break one closes the instance for
-  good, counted ONCE (`skipped_entry_elapsed`), not per reprice.
+  a poll that would begin a run or break one — or, between polls, any
+  reprice with no run under way — closes the instance for good, counted
+  ONCE (`skipped_entry_elapsed`), not per reprice.
 * **Refusals burn nothing, as before.** `covered` is set only after a
   submitted emit, so a cap, grid or ring refusal on a completed run
   retries while the run lasts; past the ceiling, a break closes it.
@@ -4952,12 +4955,36 @@ left and is `W/3` at the open — and needs no flag of its own.
   would have moved its real entry later). The harness writes it beside each entry (`first_fire_*`) and,
   for the instances the persistence law declined, in
   `bin15_first_fires`, with the entry law the member ran under;
-  `bin15_accrue` keeps it in `first_fires.tsv` and reports the old law on
-  the SAME instances beside the new, one block per law — what doc 27
-  §5's bars are scored on. No order is ever sized or sent from it.
+  `bin15_accrue` keeps it in `first_fires.tsv` and reports it on the SAME
+  instances beside the new, one block per law — what the persistence law
+  and the ceiling alone changed; doc 27 §5's "over today's law" bar is
+  scored against the control (S5b, below). No order is ever sized or
+  sent from it.
 * These are research keys. The shipped example and the fitter carry the
   old law; a persistence setting is a hand edit of the live artifact,
   measured in paper first (plan 28 S7).
+
+### The entry's control and the fill bar (S5b, 2026-09-24)
+
+* **Today's law is recorded beside the artifact's.** A second
+  counterfactual, the CONTROL, records the first reprice on which
+  today's law would have bought the instance: the artifact's floor, the
+  compiled default bound (`core_config::bin15::E_ENTRY_1E6_DEFAULT`, set
+  by the cli as `Bin15Params::entry_control_e_1e6` — not an artifact key),
+  persist 1, no ceiling (`FamilyState::entry_ctl_ok_*`). Same reprice
+  stream, same record; it gates nothing and emits nothing. Once an
+  artifact moves `e_entry`, the artifact's own first fire is no longer
+  today's law, and doc 27 §5's "≥ +5 pts over today's law on the same
+  instances" is scored against the control: the harness writes it as
+  `ctl_fire_*` beside each entry and `ctl_*` in `bin15_first_fires`, and
+  `bin15_accrue report` pairs the member's entries with both.
+* **Fills gate the first live step, not the paper CONFIRM (ruling
+  2026-09-24).** The harness models every fill, so doc 27 §5's "IoC
+  fills on ≥ 50 % of signals" cannot be measured in paper. A paper
+  CONFIRM is judged on the other five bars; the fill bar, and the kill
+  on fills < 50 %, are judged on the first live step's own fills. The
+  report says so under every counterfactual block ("not measurable in
+  the paper model"), so a CONFIRM read off it cannot forget it.
 
 ## HYPARB — slot 0: paper-first, TESTNET-only EVM writes (H0–H9, 2026-09-23)
 

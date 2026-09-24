@@ -11,10 +11,11 @@ object storage and removed locally after a day (``PROTECT_DAYS=1``), so
 a lane that only analyses on request analyses the same fortnight of tape
 over and over. This module makes the day's evidence PERMANENT and small:
 append-only TSVs under the worker's own state root -- the ledger, the
-entries, and (BIN15 S5, ruling O-4) the COUNTERFACTUAL first fires: the
-pre-S5 entry law's entry on every instance it would have bought, logged
-by the harness and never traded, which is what the persistence law is
-scored against on the same instances.
+entries, and (BIN15 S5, ruling O-4; S5b) the COUNTERFACTUALS: on every
+instance, the first reprice the artifact's own price test held and the
+first today's law (the control) held, logged by the harness and never
+traded -- what the persistence law is scored against on the same
+instances.
 
 **What it does.** For every run of the closed day that carries a HIP-4
 instance: cut it into ≤ 2 h windows (the capture-window law, absolute),
@@ -48,8 +49,9 @@ Lanes (``python -m claude_worker.bin15_accrue <lane>``):
   price paid, entry timing, entry price) with a Wilson interval and the
   sample size each conclusion would need — on the VENUE's label first
   (LAW E-11), the label each entry was accrued with beside it — and,
-  once first fires exist, the pre-S5 law on the SAME instances beside
-  the persistence law's (BIN15 S5).
+  once first fires exist, the artifact's unpersisted trigger and today's
+  law (the control) on the SAME instances beside the member's (BIN15
+  S5/S5b).
 - ``relabel [--pull DIR …] [--runs DIR …]`` — BIN15 S4: correct both
   stores IN PLACE onto the venue's law and clock from the captures on
   disk (``claude_worker.bin15_tape``): every row not yet on it gets
@@ -322,35 +324,53 @@ DEFAULT_FIRST_FIRES: str = "~/multivenue/worker/bin15/first_fires.tsv"
 
 #: Header; `#` lines are skipped on read.
 FIRST_FIRES_HEADER: str = (
-    "# bin15 first fires -- BIN15 S5 (ruling O-4): the COUNTERFACTUAL. One row\n"
-    "#   per instance the pre-S5 entry law (persist 1, no ceiling, at the\n"
-    "#   artifact's own floor and e_entry) would have bought: the first reprice\n"
-    "#   whose price test held, logged by the harness and NEVER traded.\n"
-    "#   From the `bin15_entries` rows' `first_fire_*`\n"
-    "#   columns (entered 1: the member bought the instance too) and the\n"
+    "# bin15 first fires -- BIN15 S5 (ruling O-4) + S5b: the COUNTERFACTUALS.\n"
+    "#   One row per instance on which either of two price tests held, each\n"
+    "#   the first reprice it held at persist 1 with no ceiling, logged by the\n"
+    "#   harness and NEVER traded: ts_ns .. px_1e6 the ARTIFACT's own test (its\n"
+    "#   floor and e_entry -- the unpersisted trigger), ctl_* TODAY'S law (the\n"
+    "#   floor and the compiled default bound -- the control, doc 27 §5).\n"
+    "#   From the `bin15_entries` rows' `first_fire_*` / `ctl_fire_*` columns\n"
+    "#   (entered 1: the member bought the instance too) and the\n"
     "#   `bin15_first_fires` block (entered 0: the persistence law or the\n"
     "#   elapsed ceiling declined it).\n"
     "# ts_ns\toutcome\tfamily\tstart_ns\texpiry_ns\toffset_s\tis_yes\tpx_1e6"
-    "\ty\ty_next_strike\tentered\tpersist_polls\telapsed_max_ns\n"
+    "\ty\ty_next_strike\tentered\tpersist_polls\telapsed_max_ns"
+    "\tctl_ts_ns\tctl_offset_s\tctl_is_yes\tctl_px_1e6\n"
+    "# A test that never held: ts 0, offset 0, is_yes -1, px 0. A row accrued\n"
+    "#   before S5b (13 columns) recorded no control and reads as one.\n"
     "# persist_polls / elapsed_max_ns: the entry law the member ran under when\n"
     "#   the row was accrued (the sidecar's `bin15_entry_law`). 1 / 0 is the old\n"
-    "#   law itself: its pairs are identical by construction, not a comparison.\n"
+    "#   law itself: its entries ARE its unpersisted trigger, not a comparison.\n"
     "# On the VENUE's law and clock only: a first fire exists only from an S5\n"
     "#   harness, and one from a run without venue time is dropped (counted).\n"
     "# y: 1000000 settled ITM, 0 OTM, -1 the window could not derive it.\n"
     "# Worker state. Never git; findings go to docs/research/outcome/.\n"
 )
 
-#: Columns of a first-fire row.
-FIRST_FIRE_COLUMNS: int = 13
+#: Columns of a first-fire row: 17 since S5b (the control's four) ...
+FIRST_FIRE_COLUMNS: int = 17
+#: ... and 13 before it, still read (no control recorded).
+FIRST_FIRE_COLUMNS_PRE_S5B: int = 13
 
 #: The entry law with neither S5 key set: the old law itself.
 OLD_LAW: tuple[int, int] = (1, 0)
 
+#: The sidecar keys of one counterfactual: (stamp, ask, side).
+_ENTRY_FIRE: tuple[str, str, str] = ("first_fire_ts_ns", "first_fire_px_1e6", "first_fire_is_yes")
+_ENTRY_CTL: tuple[str, str, str] = ("ctl_fire_ts_ns", "ctl_fire_px_1e6", "ctl_fire_is_yes")
+_BLOCK_FIRE: tuple[str, str, str] = ("ts_ns", "px_1e6", "is_yes")
+_BLOCK_CTL: tuple[str, str, str] = ("ctl_ts_ns", "ctl_px_1e6", "ctl_is_yes")
+
+#: One counterfactual that never held: (ts_ns, offset_s, is_yes, px_1e6).
+_NO_FIRE: tuple[int, int, int, int] = (0, 0, -1, 0)
+
 
 class FirstFire(typing.NamedTuple):
-    """The pre-S5 law's entry on one instance: logged, never traded."""
+    """One instance's two counterfactuals: logged, never traded."""
 
+    #: The ARTIFACT's own test at persist 1, no ceiling -- the unpersisted
+    #: trigger. ``ts_ns == 0``: it never held (``is_yes`` -1).
     ts_ns: int
     outcome: int
     family: int
@@ -362,13 +382,20 @@ class FirstFire(typing.NamedTuple):
     y: int
     #: The venue-published label (``Y_UNKNOWN`` unknown / a tie).
     y_next_strike: int
-    #: ``1``: the member entered this instance too, so the two laws are
-    #: scored on the SAME instance; ``0``: the persistence law declined it.
+    #: ``1``: the member entered this instance too, so the laws are scored
+    #: on the SAME instance; ``0``: the persistence law declined it.
     entered: int
     #: The entry law the member ran under (``entry_persist_polls``,
     #: ``entry_elapsed_max_ns``) -- :data:`OLD_LAW` is the old law itself.
     persist_polls: int
     elapsed_max_ns: int
+    #: BIN15 S5b: TODAY'S law, the control -- the same record at the
+    #: compiled default bound. ``ctl_ts_ns == 0``: it never held, or the row
+    #: predates S5b and recorded none.
+    ctl_ts_ns: int = 0
+    ctl_offset_s: int = 0
+    ctl_is_yes: int = -1
+    ctl_px_1e6: int = 0
 
     @property
     def law(self) -> tuple[int, int]:
@@ -379,9 +406,28 @@ class FirstFire(typing.NamedTuple):
         return self.y != Y_UNKNOWN
 
     @property
+    def fired(self) -> bool:
+        """Whether the artifact's own test held on the instance."""
+        return self.ts_ns != 0
+
+    @property
+    def ctl_fired(self) -> bool:
+        """Whether today's law held on the instance."""
+        return self.ctl_ts_ns != 0
+
+    @property
     def won(self) -> bool:
-        """Whether the side the old law would have bought settled ITM."""
+        """Whether the side the artifact's test would have bought settled ITM."""
         return (self.y >= 500_000) == (self.is_yes == 1)
+
+    def control(self) -> "FirstFire":
+        """The control as a first fire of its own -- what the scoring reads."""
+        return self._replace(
+            ts_ns=self.ctl_ts_ns,
+            offset_s=self.ctl_offset_s,
+            is_yes=self.ctl_is_yes,
+            px_1e6=self.ctl_px_1e6,
+        )
 
     def tsv(self) -> str:
         return "\t".join(str(v) for v in self) + "\n"
@@ -391,28 +437,47 @@ def first_fires_path(path: str | None = None) -> pathlib.Path:
     return pathlib.Path(os.path.expanduser(path or DEFAULT_FIRST_FIRES))
 
 
-def _first_fire(
-    r: dict, keys: tuple[str, str, str], entered: int, law: tuple[int, int]
-) -> FirstFire:
+def _fire(r: dict, keys: tuple[str, str, str], start: int) -> tuple[int, int, int, int]:
+    """``(ts_ns, offset_s, is_yes, px_1e6)`` of one counterfactual on a
+    sidecar row -- :data:`_NO_FIRE` when its test never held (``null``) or
+    the harness predates it (absent)."""
     ts_key, px_key, side_key = keys
+    ts = r.get(ts_key)
+    if ts is None:
+        return _NO_FIRE
+    ts = int(ts)
+    return (ts, max(ts - start, 0) // 1_000_000_000, int(r[side_key]), int(r[px_key]))
+
+
+def _first_fire(
+    r: dict,
+    keys: tuple[tuple[str, str, str], tuple[str, str, str]],
+    entered: int,
+    law: tuple[int, int],
+) -> FirstFire:
     y = r.get("y")
     y_next = r.get("y_next_strike")
-    ts = int(r[ts_key])
     start = int(r["start_ns"])
+    ts, offset, side, px = _fire(r, keys[0], start)
+    cts, coffset, cside, cpx = _fire(r, keys[1], start)
     return FirstFire(
         ts_ns=ts,
         outcome=int(r["outcome"]),
         family=int(r["family"]),
         start_ns=start,
         expiry_ns=int(r["expiry_ns"]),
-        offset_s=max(ts - start, 0) // 1_000_000_000,
-        is_yes=int(r[side_key]),
-        px_1e6=int(r[px_key]),
+        offset_s=offset,
+        is_yes=side,
+        px_1e6=px,
         y=Y_UNKNOWN if y is None else int(y),
         y_next_strike=Y_UNKNOWN if y_next is None else int(y_next),
         entered=entered,
         persist_polls=law[0],
         elapsed_max_ns=law[1],
+        ctl_ts_ns=cts,
+        ctl_offset_s=coffset,
+        ctl_is_yes=cside,
+        ctl_px_1e6=cpx,
     )
 
 
@@ -425,30 +490,32 @@ def entry_law_of(obj: dict) -> tuple[int, int]:
 
 def first_fires_from_sidecar(text: str) -> tuple[list[FirstFire], int]:
     """``(first fires, dropped)`` of one `--emit-detail` sidecar: the
-    entries' own ``first_fire_*`` columns (``entered`` 1) and the
-    ``bin15_first_fires`` block (``entered`` 0), each stamped with the
-    sidecar's ``bin15_entry_law``. A pre-S5 sidecar carries none and yields
-    nothing; one whose runs are not on the venue clock yields nothing either
-    and counts what it dropped -- the store is on one clock, and a first
-    fire on the anchor clock is not a fact about it."""
+    entries' own ``first_fire_*`` / ``ctl_fire_*`` columns (``entered`` 1)
+    and the ``bin15_first_fires`` block (``entered`` 0), each stamped with
+    the sidecar's ``bin15_entry_law``. A pre-S5 sidecar carries none and
+    yields nothing; a pre-S5b one yields rows without a control. One whose
+    runs are not on the venue clock yields nothing either and counts what it
+    dropped -- the store is on one clock, and a first fire on the anchor
+    clock is not a fact about it."""
     obj = json.loads(text)
     law = entry_law_of(obj)
+    rows = [(r, (_ENTRY_FIRE, _ENTRY_CTL), 1) for r in obj.get("bin15_entries") or []]
+    rows += [(r, (_BLOCK_FIRE, _BLOCK_CTL), 0) for r in obj.get("bin15_first_fires") or []]
     out: list[FirstFire] = []
-    for r in obj.get("bin15_entries") or []:
-        # Absent: a pre-S5 harness. `null`: the harness lost the instance's
-        # first fire (the gate cannot pass without one) -- nothing to pair.
-        if r.get("first_fire_ts_ns") is not None:
-            keys = ("first_fire_ts_ns", "first_fire_px_1e6", "first_fire_is_yes")
-            out.append(_first_fire(r, keys, 1, law))
-    for r in obj.get("bin15_first_fires") or []:
-        out.append(_first_fire(r, ("ts_ns", "px_1e6", "is_yes"), 0, law))
+    for r, keys, entered in rows:
+        f = _first_fire(r, keys, entered, law)
+        # Neither test recorded: a pre-S5 row, or an entry whose first fire
+        # the harness lost (the gate cannot pass without one) -- nothing to
+        # pair, and nothing is guessed.
+        if f.fired or f.ctl_fired:
+            out.append(f)
     if out and not claude_worker.bin15_ledger.sidecar_on_venue(obj):
         return [], len(out)
     return out, 0
 
 
 def read_first_fires(path: pathlib.Path) -> list[FirstFire]:
-    """Every first fire, oldest first. Empty when absent."""
+    """Every first fire, oldest instance first. Empty when absent."""
     if not path.is_file():
         return []
     out: list[FirstFire] = []
@@ -457,27 +524,47 @@ def read_first_fires(path: pathlib.Path) -> list[FirstFire]:
         if not s or s.startswith("#"):
             continue
         f = s.split("\t")
-        if len(f) != FIRST_FIRE_COLUMNS:
-            raise ValueError(f"{path}: want {FIRST_FIRE_COLUMNS} columns, got {len(f)}: {s!r}")
+        if len(f) not in (FIRST_FIRE_COLUMNS, FIRST_FIRE_COLUMNS_PRE_S5B):
+            raise ValueError(
+                f"{path}: want {FIRST_FIRE_COLUMNS} columns "
+                f"({FIRST_FIRE_COLUMNS_PRE_S5B} before S5b), got {len(f)}: {s!r}"
+            )
         out.append(FirstFire(*(int(v) for v in f)))
     return out
+
+
+def _earliest(a: FirstFire, b: FirstFire) -> FirstFire:
+    """``a`` with each counterfactual the EARLIER of the two rows' -- each on
+    its own, since the two tests fire apart; a test that never held (``0``)
+    is later than any that did, and a tie keeps ``a``'s."""
+    if b.fired and (not a.fired or b.ts_ns < a.ts_ns):
+        a = a._replace(ts_ns=b.ts_ns, offset_s=b.offset_s, is_yes=b.is_yes, px_1e6=b.px_1e6)
+    if b.ctl_fired and (not a.ctl_fired or b.ctl_ts_ns < a.ctl_ts_ns):
+        a = a._replace(
+            ctl_ts_ns=b.ctl_ts_ns,
+            ctl_offset_s=b.ctl_offset_s,
+            ctl_is_yes=b.ctl_is_yes,
+            ctl_px_1e6=b.ctl_px_1e6,
+        )
+    return a
 
 
 def merge_first_fires(
     existing: typing.Sequence[FirstFire], incoming: typing.Sequence[FirstFire]
 ) -> tuple[list[FirstFire], int]:
-    """``(merged oldest first, added)``, one row per OUTCOME.
+    """``(merged oldest instance first, added)``, one row per OUTCOME.
 
     An instance that straddles a window cut is replayed twice, and each
-    window's member records its own first fire. The EARLIEST is the old
-    law's -- a later one is a re-bound member firing again -- so its
-    stamp, price and side are kept; the label is taken from whichever
-    row has it (settled beats unsettled, a known venue label beats -1);
-    and ``entered`` from either, because the member entering the
-    instance in any window is what makes it a same-instance pair.
+    window's member records its own counterfactuals. The EARLIEST of each
+    is the law's -- a later one is a re-bound member firing again -- so its
+    stamp, price and side are kept, each counterfactual on its own; the
+    label is taken from whichever row has it (settled beats unsettled, a
+    known venue label beats -1); and ``entered`` from either, because the
+    member entering the instance in any window is what makes it a
+    same-instance pair.
 
     A row accrued under ANOTHER entry law (a day re-accrued after the
-    artifact changed) is a different fact: the stored row keeps its fire,
+    artifact changed) is a different fact: the stored row keeps its fires,
     law and ``entered`` -- existing wins, as in the entries' merge -- and
     only takes a label it lacked. With :func:`same_law_entries` on the
     entries' side, a stored pair never mixes two laws.
@@ -491,16 +578,15 @@ def merge_first_fires(
             added += 1
             continue
         same_law = old.law == f.law
-        first = old if not same_law or old.ts_ns <= f.ts_ns else f
         lab = old if old.settled or not f.settled else f
-        by[f.outcome] = first._replace(
+        by[f.outcome] = (_earliest(old, f) if same_law else old)._replace(
             y=lab.y,
             y_next_strike=(
                 old.y_next_strike if old.y_next_strike != Y_UNKNOWN else f.y_next_strike
             ),
             entered=max(old.entered, f.entered) if same_law else old.entered,
         )
-    return sorted(by.values(), key=lambda f: (f.ts_ns, f.outcome)), added
+    return sorted(by.values(), key=lambda f: (f.start_ns, f.outcome)), added
 
 
 def same_law_entries(
@@ -1183,29 +1269,38 @@ def ev_per_dollar(won: bool, px_1e6: int) -> float:
 def render_counterfactual(
     entries: typing.Sequence[Entry], fires: typing.Sequence[FirstFire]
 ) -> list[str]:
-    """BIN15 S5 (ruling O-4): the pre-S5 entry law (persist 1, no ceiling,
-    at the artifact's own floor and ``e_entry``) beside the member's, on
-    the VENUE's label -- doc 27 §5's "over today's law on the same
-    instances", and the old law on the instances the member declined --
-    one block per entry law the rows were accrued under, never mixed. A
-    pair needs the fire's own ``entered``: an entry its law declined (a day
-    re-accrued under another law) is not one.
+    """BIN15 S5 (ruling O-4) + S5b: the member's entries beside the two
+    counterfactuals -- each the first passing reprice at persist 1 with no
+    ceiling, logged, never traded -- on the VENUE's label, one block per
+    entry law the rows were accrued under, never mixed:
 
-    The pairing is by outcome and exact: the gate cannot pass a reprice
-    whose price test failed, so every entry of an S5 accrual has its own
-    instance's first fire. Both sides are scored at an EQUAL dollar per
-    instance (the old law's size was never decided), so the EV here is a
-    mean of ``won/px - 1``, not the stake-weighted figure above it. Under
-    the old law itself (persist 1, no ceiling) the pairs are identical by
-    construction and are only counted.
+    * the ARTIFACT's own test, unpersisted: what the persistence law and the
+      ceiling alone changed;
+    * TODAY'S law, the control: doc 27 §5's CONFIRM bar "≥ +5 pts over
+      today's law on the same instances".
+
+    Each is paired with the entries by outcome on the instances the member
+    entered (the fire's own ``entered``: an entry its law declined -- a day
+    re-accrued under another law -- is not a pair), and scored alone on the
+    instances it would have bought and the member declined. Both sides at an
+    equal dollar per instance (a counterfactual's size was never decided),
+    so the EV is a mean of ``won/px - 1``, not the stake-weighted figure
+    above it. A pairing identical by construction -- the artifact's test
+    under the old law itself, or the control wherever it IS the artifact's
+    test (the artifact's bound is today's) -- is counted, not compared. A
+    control that is absent is either one that never held or a row accrued
+    before S5b, which recorded none; the report does not guess which. The
+    §5 fill bar is not measurable in the paper model: ruling 2026-09-24
+    gates it at the first live step.
     """
     out: list[str] = []
     entered = sum(f.entered for f in fires)
     out.append(
-        f"counterfactual (persist 1, no ceiling, the artifact's own price test: the first "
-        f"passing reprice, not traded): {len(fires)} first fire(s), "
-        f"{sum(f.settled for f in fires)} settled; {entered} on instances the member "
-        f"entered, {len(fires) - entered} it declined"
+        "counterfactuals (the first passing reprice at persist 1, no ceiling -- logged, not "
+        f"traded): {len(fires)} instance(s), {sum(f.settled for f in fires)} settled; "
+        f"{entered} the member entered, {len(fires) - entered} it declined; the artifact's "
+        f"test held on {sum(f.fired for f in fires)}, today's law (the control) on "
+        f"{sum(f.ctl_fired for f in fires)}"
     )
     fire_of = {f.outcome: f for f in fires}
     ours = [e for e in entries if e.venue]
@@ -1218,39 +1313,83 @@ def render_counterfactual(
             f"ceiling {ceiling / 1e9:g} s" if ceiling else "no ceiling"
         )
         group = [f for f in fires if f.law == law]
-        if law == OLD_LAW:
-            out.append(
-                f"   -- entry law {name}: the old law itself, {len(group)} first fire(s) -- "
-                "identical to its entries by construction, not a comparison"
-            )
-            continue
-        out.append(f"   -- entry law {name}: {len(group)} first fire(s)")
         mine = [
             e for e in ours
             if e.settled and e.outcome in fire_of
             and fire_of[e.outcome].law == law and fire_of[e.outcome].entered
         ]
-        pairs = [(e, fire_of[e.outcome]) for e in mine if fire_of[e.outcome].settled]
-        if len(pairs) < len(mine):
+        if law == OLD_LAW:
             out.append(
-                f"      {len(mine) - len(pairs)} settled entr(ies) whose first fire is unsettled "
-                "(run `relabel`) -- left out"
+                f"   -- entry law {name}: the old law itself, {len(group)} instance(s) -- its "
+                "entries ARE its unpersisted trigger, not a comparison"
             )
-        if pairs:
-            hit_new, ev_new, px_new = _scored([e for e, _ in pairs])
-            hit_old, ev_old, px_old = _scored([f for _, f in pairs])
+        else:
+            out.append(f"   -- entry law {name}: {len(group)} instance(s)")
+            out.extend(_pairing(mine, fire_of, group, "the artifact's unpersisted trigger", False))
+        fired = [f for f in group if f.fired]
+        ctl_only = sum(1 for f in group if f.ctl_fired and not f.fired)
+        if not any(f.ctl_fired for f in group):
             out.append(
-                f"      the SAME {len(pairs)} instance(s): hit {100*hit_new:.1f} % vs the old "
-                f"law's {100*hit_old:.1f} % ({100*(hit_new-hit_old):+.1f} pts); EV per $1 "
-                f"{ev_new:+.4f} vs {ev_old:+.4f}; mean price {px_new:.4f} vs {px_old:.4f}"
+                "      today's law (the control): no fire recorded (accrued before S5b, or it "
+                "never held) -- not paired"
             )
-        declined = [f for f in group if f.settled and not f.entered]
-        if declined:
-            hit, ev, px = _scored(declined)
+        elif not ctl_only and all(f.control() == f for f in fired):
             out.append(
-                f"      the {len(declined)} instance(s) it declined: the old law would have hit "
-                f"{100*hit:.1f} % at a mean {px:.4f}, EV per $1 {ev:+.4f}"
+                f"      today's law (the control): the artifact's own test on all {len(fired)} "
+                "instance(s) (its bound is today's) -- the same fires, not a second comparison"
             )
+        else:
+            out.extend(_pairing(mine, fire_of, group, "today's law (the control)", True))
+    out.append(
+        "   IoC fills (doc 27 §5's fill bar): not measurable in the paper model -- the harness "
+        "models every fill; gated at the first live step (ruling 2026-09-24)"
+    )
+    return out
+
+
+def _pairing(
+    mine: typing.Sequence[Entry],
+    fire_of: dict[int, FirstFire],
+    group: typing.Sequence[FirstFire],
+    name: str,
+    control: bool,
+) -> list[str]:
+    """One counterfactual against the member's settled entries ``mine``:
+    the pairs on the SAME instances, then the instances it would have bought
+    that the member declined."""
+    def view(f: FirstFire) -> FirstFire:
+        return f.control() if control else f
+
+    out: list[str] = []
+    fired = [(e, view(fire_of[e.outcome])) for e in mine if view(fire_of[e.outcome]).fired]
+    if len(fired) < len(mine):
+        why = "or accrued before S5b" if control else "the harness lost it"
+        out.append(
+            f"      {len(mine) - len(fired)} settled entr(ies) {name} never bought ({why}) "
+            "-- not paired"
+        )
+    pairs = [(e, f) for e, f in fired if f.settled]
+    if len(pairs) < len(fired):
+        out.append(
+            f"      {len(fired) - len(pairs)} settled entr(ies) whose counterfactual is unsettled "
+            "(run `relabel`) -- left out"
+        )
+    if pairs:
+        hit_new, ev_new, px_new = _scored([e for e, _ in pairs])
+        hit_old, ev_old, px_old = _scored([f for _, f in pairs])
+        out.append(
+            f"      vs {name}: the SAME {len(pairs)} instance(s): hit {100*hit_new:.1f} % vs "
+            f"{100*hit_old:.1f} % ({100*(hit_new-hit_old):+.1f} pts); EV per $1 {ev_new:+.4f} "
+            f"vs {ev_old:+.4f} ({100*(ev_new-ev_old):+.1f} pts); mean price {px_new:.4f} vs "
+            f"{px_old:.4f}"
+        )
+    declined = [view(f) for f in group if f.settled and not f.entered and view(f).fired]
+    if declined:
+        hit, ev, px = _scored(declined)
+        out.append(
+            f"      the {len(declined)} instance(s) it declined that {name} would have bought: "
+            f"hit {100*hit:.1f} % at a mean {px:.4f}, EV per $1 {ev:+.4f}"
+        )
     return out
 
 

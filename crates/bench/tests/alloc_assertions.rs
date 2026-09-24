@@ -5944,6 +5944,18 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
     assert!(counters.skipped_entry_persist > 0, "and the S5 persistence gate");
     assert!(counters.skipped_entry_price > 0, "and its price refusal");
     assert_eq!(counters.skipped_entry_elapsed, 1, "and the S5 ceiling's close, once");
+    // BIN15 S5b: both counterfactuals were stamped under the guard. The last
+    // roll's instance (family 3 — the S3 phase rebinds family 0 only) passed
+    // both tests on its first Yes snapshot, at its own bind second.
+    let last = ROLLS - 1;
+    assert_ne!(last % BIN15_MAX_FAMILIES, 0, "the S3 phase rebinds family 0");
+    let f_last = *m.family(last % BIN15_MAX_FAMILIES).expect("the last roll's family");
+    let t_last = at(1 + last as u64 * MARKS_PER_ROLL);
+    assert_eq!(
+        (f_last.entry_first_ok_ts, f_last.entry_ctl_ok_ts),
+        (t_last, t_last),
+        "the artifact's first fire and the control"
+    );
     assert!(ctx.n > 0, "the gate must measure real submits");
     assert_eq!(
         allocs, 0,

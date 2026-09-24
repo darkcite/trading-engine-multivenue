@@ -280,6 +280,10 @@ pub fn load_bin15_boot(
     // both.
     params.entry_persist_polls = file.entry_persist_polls;
     params.entry_elapsed_max_ns = file.entry_elapsed_max_ns;
+    // BIN15 S5b (ruling 2026-09-24): the control counterfactual is TODAY'S
+    // law — the stated default bound, whatever this artifact's own
+    // `e_entry_1e6` says. It prices nothing and emits nothing.
+    params.entry_control_e_1e6 = core_config::bin15::E_ENTRY_1E6_DEFAULT;
     params.maker_enabled = file.maker_enabled;
     params.null_arm = file.null_arm;
     params.hour_ln_off_1e9 = file.hour_ln_off_1e9;
@@ -782,6 +786,29 @@ mod tests {
         assert_eq!(boot.seeds.len(), 4);
         assert!(boot.seeds.iter().all(Bin15Seed::is_empty));
         assert!(render_boot_tell(&boot, 3).contains("families=8 dormant=3 seeds=0 daily_seeds=0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BIN15 S5b (ruling 2026-09-24): the control counterfactual is TODAY'S
+    /// law — the stated default bound — whatever the artifact's own
+    /// `e_entry_1e6` says, so no artifact moves its own control.
+    #[test]
+    fn the_control_bound_is_todays_law_whatever_the_artifact_says() {
+        let (dir, artifact) = scratch("control", &[]);
+        let moved = EXAMPLE.replacen("e_entry_1e6     = 20000", "e_entry_1e6     = 30000", 1);
+        assert_ne!(moved, EXAMPLE, "the example states its bound on one line");
+        std::fs::write(&artifact, moved).expect("artifact");
+        let boot = load_bin15_boot(
+            Some(&artifact),
+            Some(&dir),
+            &resolver,
+            &rolling(),
+            &rolling_syms(),
+        )
+        .expect("load")
+        .expect("configured");
+        assert_eq!(boot.params.e_entry_1e6, 30_000);
+        assert_eq!(boot.params.entry_control_e_1e6, core_config::bin15::E_ENTRY_1E6_DEFAULT);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

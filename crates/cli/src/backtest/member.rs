@@ -458,28 +458,117 @@ struct Bin15EntryRow {
     origin: u8,
 }
 
-/// BIN15 S5 (ruling O-4): the COUNTERFACTUAL on one instance — when the
-/// entry's price test first held (`FamilyState::entry_first_ok_ts`), the
-/// preferred-side ask then, and its side: the pre-S5 law's entry attempt
-/// (persist 1, no ceiling), logged, never traded. A cap, grid or ring
-/// refusal at that reprice would have moved the old law's real entry
-/// later; the $50 entry sits far under the caps, so that is the rare case.
+/// BIN15 S5 (ruling O-4) + S5b: the two COUNTERFACTUALS on one instance,
+/// logged and never traded — each the first reprice whose price test held
+/// (persist 1, no ceiling), the preferred-side ask then and its side:
 ///
-/// Recorded once per instance per window, entered or not. An entry row
-/// carries its own instance's as `first_fire_*` columns; the rest form
-/// the `bin15_first_fires` block — every instance the old law would have
-/// entered, each exactly once.
+/// * `ff_*` at the ARTIFACT's own test (`FamilyState::entry_first_ok_*`) —
+///   against it the member's law differs in persistence and the ceiling
+///   alone;
+/// * `ctl_*` at TODAY'S law, the control (`FamilyState::entry_ctl_ok_*`) —
+///   doc 27 §5's "over today's law on the same instances".
+///
+/// A `*_ts_ns` of `0` is a test that never held. A cap, grid or ring refusal
+/// at that reprice would have moved the old law's real entry later; the $50
+/// entry sits far under the caps, so that is the rare case.
+///
+/// Held per family while its instance holds the slot and flushed when
+/// another takes it (or the window ends), so both are whole however far
+/// apart they fired. An entry row carries its own instance's as
+/// `first_fire_*` / `ctl_fire_*` columns; the rest form the
+/// `bin15_first_fires` block — each instance exactly once.
 #[derive(Copy, Clone, Debug)]
 struct Bin15FirstFireRow {
-    ts_ns: u64,
     family: u8,
     outcome: u32,
     /// The instance's start, as [`Bin15EntryRow::start_ns`].
     start_ns: u64,
     expiry_ns: u64,
-    /// `1` the old law would have bought YES, `0` NO.
-    is_yes: u8,
-    px_1e6: i64,
+    ff_ts_ns: u64,
+    /// `1` YES, `0` NO.
+    ff_is_yes: u8,
+    ff_px_1e6: i64,
+    ctl_ts_ns: u64,
+    ctl_is_yes: u8,
+    ctl_px_1e6: i64,
+}
+
+impl Bin15FirstFireRow {
+    /// A live instance's row, before either test held.
+    fn of(family: u8, fam: &strategy_bin15::FamilyState) -> Self {
+        Self {
+            family,
+            outcome: fam.live.outcome,
+            start_ns: fam.live.expiry_ns.saturating_sub(strategy_bin15::TAU_15M_NS),
+            expiry_ns: fam.live.expiry_ns,
+            ff_ts_ns: 0,
+            ff_is_yes: 0,
+            ff_px_1e6: 0,
+            ctl_ts_ns: 0,
+            ctl_is_yes: 0,
+            ctl_px_1e6: 0,
+        }
+    }
+
+    /// Refreshed from the member's state: each counterfactual is written
+    /// once (`0` → a stamp) and never moves after.
+    fn observe(&mut self, fam: &strategy_bin15::FamilyState) {
+        if self.ff_ts_ns == 0 && fam.entry_first_ok_ts != 0 {
+            self.ff_ts_ns = fam.entry_first_ok_ts;
+            self.ff_is_yes = fam.entry_first_ok_yes;
+            self.ff_px_1e6 = i64::from(fam.entry_first_ok_px_1e6);
+        }
+        if self.ctl_ts_ns == 0 && fam.entry_ctl_ok_ts != 0 {
+            self.ctl_ts_ns = fam.entry_ctl_ok_ts;
+            self.ctl_is_yes = fam.entry_ctl_ok_yes;
+            self.ctl_px_1e6 = i64::from(fam.entry_ctl_ok_px_1e6);
+        }
+    }
+
+    /// Whether either test ever held — a row worth keeping.
+    const fn fired(&self) -> bool {
+        self.ff_ts_ns != 0 || self.ctl_ts_ns != 0
+    }
+
+    /// The artifact's own test, as the sidecar writes it.
+    fn fire_cols(&self) -> FireCols {
+        FireCols::of(self.ff_ts_ns, self.start_ns, self.ff_is_yes, self.ff_px_1e6)
+    }
+
+    /// Today's law — the control — as the sidecar writes it.
+    fn ctl_cols(&self) -> FireCols {
+        FireCols::of(self.ctl_ts_ns, self.start_ns, self.ctl_is_yes, self.ctl_px_1e6)
+    }
+}
+
+/// One family's step of the harness observer, after every record: a new
+/// outcome on the slot flushes the ended instance's row, and the live one's
+/// row is refreshed. A dormant slot keeps its row, so an instance's row is
+/// whole however its slot idles.
+fn track_first_fire(
+    rows: &mut Vec<Bin15FirstFireRow>,
+    open: &mut Option<Bin15FirstFireRow>,
+    family: u8,
+    fam: &strategy_bin15::FamilyState,
+) {
+    if !fam.is_live() {
+        return;
+    }
+    let outcome = fam.live.outcome;
+    // By reference: the observer runs per record, and the row is copied
+    // only when its instance ends.
+    if open.as_ref().is_some_and(|r| r.outcome != outcome) {
+        flush_first_fire(rows, open);
+    }
+    open.get_or_insert_with(|| Bin15FirstFireRow::of(family, fam)).observe(fam);
+}
+
+/// Moves an ended instance's row into the block — when either of its tests
+/// ever held; a row on which neither did records nothing.
+fn flush_first_fire(rows: &mut Vec<Bin15FirstFireRow>, open: &mut Option<Bin15FirstFireRow>) {
+    if let Some(r) = open.take().filter(Bin15FirstFireRow::fired) {
+        rows.push(r);
+    }
 }
 
 /// BIN15 S1: a sidecar number that may be absent — `null` or the value,
@@ -513,12 +602,43 @@ fn label_of(
     }
 }
 
+/// BIN15 S5b: one counterfactual as the sidecar writes it — the stamp, its
+/// offset from the instance's start in seconds, the side and the ask; all
+/// four `null` when its test never held (`ts_ns == 0`).
+struct FireCols {
+    ts_ns: OrNull,
+    offset_s: OrNull,
+    is_yes: OrNull,
+    px_1e6: OrNull,
+}
+
+impl FireCols {
+    const NONE: Self = Self {
+        ts_ns: OrNull(None),
+        offset_s: OrNull(None),
+        is_yes: OrNull(None),
+        px_1e6: OrNull(None),
+    };
+
+    fn of(ts_ns: u64, start_ns: u64, is_yes: u8, px_1e6: i64) -> Self {
+        if ts_ns == 0 {
+            return Self::NONE;
+        }
+        Self {
+            ts_ns: OrNull(i64::try_from(ts_ns).ok()),
+            offset_s: OrNull(i64::try_from(ts_ns.saturating_sub(start_ns) / 1_000_000_000).ok()),
+            is_yes: OrNull(Some(i64::from(is_yes))),
+            px_1e6: OrNull(Some(px_1e6)),
+        }
+    }
+}
+
 /// The `bin15_entries` block of the detail sidecar.
 ///
 /// BIN15 S1: `y_next_strike` and `settle_px_1e6` are ADDITIVE keys; a
 /// reader that predates them ignores them (the worker's reads by key).
 /// Each row is written straight into `s` — the reservation covers a
-/// realistic row (~280 B of the 360 reserved), so the block renders in
+/// realistic row (~440 B of the 480 reserved), so the block renders in
 /// one buffer without regrowth in practice.
 fn render_bin15_entries(
     rows: &[Bin15EntryRow],
@@ -526,17 +646,22 @@ fn render_bin15_entries(
     labels: &BTreeMap<u32, crate::backtest::binary::BinaryLabel>,
 ) -> String {
     use core::fmt::Write as _;
-    let mut s = String::with_capacity(64 + rows.len() * 420);
+    let mut s = String::with_capacity(64 + rows.len() * 480);
     s.push_str("\"bin15_entries\":[");
     for (i, r) in rows.iter().enumerate() {
         if i > 0 {
             s.push(',');
         }
         let (y, y_next, settle_px) = label_of(labels, r.outcome);
-        // BIN15 S5: the instance's counterfactual, joined by outcome. The
-        // gate cannot pass a reprice whose price test failed, so an entry
-        // always has one; `null` would mean the harness lost it.
-        let ff = first_fires.iter().find(|f| f.outcome == r.outcome);
+        // BIN15 S5/S5b: the instance's two counterfactuals, joined by
+        // outcome. The gate cannot pass a reprice whose price test failed,
+        // so an entry always has its first fire (`null` would mean the
+        // harness lost it); the control is `null` when today's law never
+        // held on the instance — an artifact whose test is looser than it.
+        let (ff, ctl) = first_fires
+            .iter()
+            .find(|f| f.outcome == r.outcome)
+            .map_or((FireCols::NONE, FireCols::NONE), |f| (f.fire_cols(), f.ctl_cols()));
         // Writing into a `String` cannot fail.
         let _ = write!(
             s,
@@ -544,7 +669,8 @@ fn render_bin15_entries(
              \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
              \"qty_1e6\":{},\"p_hat_1e6\":{},\"origin\":{},\"y\":{},\
              \"y_next_strike\":{},\"settle_px_1e6\":{},\"first_fire_ts_ns\":{},\
-             \"first_fire_px_1e6\":{},\"first_fire_is_yes\":{}}}",
+             \"first_fire_px_1e6\":{},\"first_fire_is_yes\":{},\"ctl_fire_ts_ns\":{},\
+             \"ctl_fire_px_1e6\":{},\"ctl_fire_is_yes\":{}}}",
             r.ts_ns,
             r.family,
             r.outcome,
@@ -559,9 +685,12 @@ fn render_bin15_entries(
             y,
             y_next,
             settle_px,
-            OrNull(ff.map(|f| f.ts_ns as i64)),
-            OrNull(ff.map(|f| f.px_1e6)),
-            OrNull(ff.map(|f| i64::from(f.is_yes)))
+            ff.ts_ns,
+            ff.px_1e6,
+            ff.is_yes,
+            ctl.ts_ns,
+            ctl.px_1e6,
+            ctl.is_yes
         );
     }
     s.push(']');
@@ -569,10 +698,12 @@ fn render_bin15_entries(
 }
 
 /// The `bin15_first_fires` block of the detail sidecar (BIN15 S5, ruling
-/// O-4): the counterfactual on every instance the old law would have
-/// entered and this window's member did not — an instance that carries
-/// an entry row is left out here, because that row carries its own as
-/// `first_fire_*` columns. Additive: a reader that predates it ignores it.
+/// O-4; S5b): both counterfactuals on every instance where either test held
+/// and this window's member did not enter — an instance that carries an
+/// entry row is left out here, because that row carries its own as
+/// `first_fire_*` / `ctl_fire_*` columns. `ts_ns` .. `px_1e6` are the
+/// artifact's own test and `ctl_*` today's law, each four `null`s when it
+/// never held. Additive: a reader that predates it ignores it.
 fn render_bin15_first_fires(
     rows: &[Bin15FirstFireRow],
     entries: &[Bin15EntryRow],
@@ -580,7 +711,7 @@ fn render_bin15_first_fires(
 ) -> String {
     use core::fmt::Write as _;
     let entered: std::collections::BTreeSet<u32> = entries.iter().map(|e| e.outcome).collect();
-    let mut s = String::with_capacity(64 + rows.len() * 240);
+    let mut s = String::with_capacity(64 + rows.len() * 360);
     s.push_str("\"bin15_first_fires\":[");
     let mut first = true;
     for r in rows.iter().filter(|r| !entered.contains(&r.outcome)) {
@@ -589,20 +720,26 @@ fn render_bin15_first_fires(
         }
         first = false;
         let (y, y_next, settle_px) = label_of(labels, r.outcome);
+        let (ff, ctl) = (r.fire_cols(), r.ctl_cols());
         // Writing into a `String` cannot fail.
         let _ = write!(
             s,
             "{{\"ts_ns\":{},\"family\":{},\"outcome\":{},\"start_ns\":{},\
              \"expiry_ns\":{},\"offset_s\":{},\"is_yes\":{},\"px_1e6\":{},\
+             \"ctl_ts_ns\":{},\"ctl_offset_s\":{},\"ctl_is_yes\":{},\"ctl_px_1e6\":{},\
              \"y\":{},\"y_next_strike\":{},\"settle_px_1e6\":{}}}",
-            r.ts_ns,
+            ff.ts_ns,
             r.family,
             r.outcome,
             r.start_ns,
             r.expiry_ns,
-            r.ts_ns.saturating_sub(r.start_ns) / 1_000_000_000,
-            r.is_yes,
-            r.px_1e6,
+            ff.offset_s,
+            ff.is_yes,
+            ff.px_1e6,
+            ctl.ts_ns,
+            ctl.offset_s,
+            ctl.is_yes,
+            ctl.px_1e6,
             y,
             y_next,
             settle_px
@@ -740,8 +877,9 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
     let mut bin15_entries: Vec<Bin15EntryRow> = Vec::new();
     let mut bin15_first_fires: Vec<Bin15FirstFireRow> = Vec::new();
     // BIN15 S5: the entry law the member ran under (persistence, ceiling),
-    // stamped on the sidecar so a reader never pairs two laws in one number.
-    let mut bin15_entry_law: (u8, u64) = (1, 0);
+    // stamped on the sidecar so a reader never pairs two laws in one number;
+    // S5b: with the control's bound, the law its `ctl_*` columns record.
+    let mut bin15_entry_law: (u8, u64, i64) = (1, 0, core_config::bin15::E_ENTRY_1E6_DEFAULT);
     // HYPARB H6: the gas ledger. The fill model has no gas lane, so the
     // member's per-ATTEMPT charge is the ledger; the OOS share comes
     // off the reported OOS net (0 for every other member).
@@ -1114,8 +1252,11 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     .on_start(&mut ctx)
                     .map_err(|e| HarnessError::Internal(format!("bin15 on_start failed: {e}")))?;
                 let seeded = boot.seeds.iter().filter(|s| !s.is_empty()).count();
-                bin15_entry_law =
-                    (boot.params.entry_persist_polls, boot.params.entry_elapsed_max_ns);
+                bin15_entry_law = (
+                    boot.params.entry_persist_polls,
+                    boot.params.entry_elapsed_max_ns,
+                    boot.params.entry_control_e_1e6,
+                );
                 let line = format!(
                     "member: bin15 params={} hash={} families={} underlyings={} \
                      instances={} seeds={} seed_dir={} entry={} anchor=wall (identity)",
@@ -1141,20 +1282,23 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 let mut entries: Vec<Bin15EntryRow> = Vec::new();
                 let mut was_covered: [u8; strategy_bin15::BIN15_MAX_FAMILIES] =
                     [0; strategy_bin15::BIN15_MAX_FAMILIES];
-                // BIN15 S5: the counterfactual, caught once per instance —
-                // keyed on the OUTCOME rather than a 0 -> 1 edge, so a
-                // roll and a first fire landing between two observations
-                // cannot hide the successor's.
+                // BIN15 S5/S5b: the two counterfactuals, one row per
+                // instance — held per family while its instance holds the
+                // slot and flushed when another takes it (or the window
+                // ends), so each stamp is its own test's FIRST hold however
+                // far apart the two fired. Keyed on the OUTCOME rather than
+                // an edge, so a roll and a fire landing between two
+                // observations cannot hide the successor's.
                 let mut first_fires: Vec<Bin15FirstFireRow> = Vec::new();
-                let mut fired_outcome: [u32; strategy_bin15::BIN15_MAX_FAMILIES] =
-                    [0; strategy_bin15::BIN15_MAX_FAMILIES];
+                let mut open_fires =
+                    [None::<Bin15FirstFireRow>; strategy_bin15::BIN15_MAX_FAMILIES];
                 let out = {
                     let ledger_ref = &mut ledger;
                     let last_ref = &mut last_sample;
                     let entries_ref = &mut entries;
                     let cov_ref = &mut was_covered;
                     let first_ref = &mut first_fires;
-                    let fired_ref = &mut fired_outcome;
+                    let open_ref = &mut open_fires;
                     let mut observe = |rec: &MergedRec, s: &strategy_bin15::Bin15Strategy| {
                         let mut f = 0usize;
                         while f < s.n_families() {
@@ -1243,24 +1387,7 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                                 });
                             }
                             cov_ref[f] = fam.covered;
-                            if fam.is_live()
-                                && fam.entry_first_ok_ts != 0
-                                && fired_ref[f] != fam.live.outcome
-                            {
-                                fired_ref[f] = fam.live.outcome;
-                                first_ref.push(Bin15FirstFireRow {
-                                    ts_ns: fam.entry_first_ok_ts,
-                                    family: f as u8,
-                                    outcome: fam.live.outcome,
-                                    start_ns: fam
-                                        .live
-                                        .expiry_ns
-                                        .saturating_sub(strategy_bin15::TAU_15M_NS),
-                                    expiry_ns: fam.live.expiry_ns,
-                                    is_yes: fam.entry_first_ok_yes,
-                                    px_1e6: fam.entry_first_ok_px_1e6,
-                                });
-                            }
+                            track_first_fire(first_ref, &mut open_ref[f], f as u8, fam);
                             f += 1;
                         }
                     };
@@ -1275,6 +1402,14 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                 };
                 bin15_ledger = ledger;
                 bin15_entries = entries;
+                let mut slot = 0usize;
+                while slot < open_fires.len() {
+                    flush_first_fire(&mut first_fires, &mut open_fires[slot]);
+                    slot += 1;
+                }
+                // Instance order: a row flushes when its instance ENDS,
+                // which interleaves the families.
+                first_fires.sort_unstable_by_key(|r| (r.start_ns, r.family));
                 bin15_first_fires = first_fires;
                 let c = strat.counters();
                 let counters = format!(
@@ -1567,12 +1702,14 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     window_end_wall_ns,
                 );
                 format!(
-                    "{},{},{},\"bin15_entry_law\":{{\"persist_polls\":{},\"elapsed_max_ns\":{}}}",
+                    "{},{},{},\"bin15_entry_law\":{{\"persist_polls\":{},\"elapsed_max_ns\":{},\
+                     \"control_e_entry_1e6\":{}}}",
                     render_bin15_ledger(&bin15_ledger, &y),
                     render_bin15_entries(&bin15_entries, &bin15_first_fires, &y),
                     render_bin15_first_fires(&bin15_first_fires, &bin15_entries, &y),
                     bin15_entry_law.0,
-                    bin15_entry_law.1
+                    bin15_entry_law.1,
+                    bin15_entry_law.2
                 )
             },
         );
@@ -1777,13 +1914,16 @@ mod tests {
             origin: core_types::FILL_ORIGIN_PAPER,
         };
         let ff = Bin15FirstFireRow {
-            ts_ns: 900,
             family: 0,
             outcome: 7,
             start_ns: 100,
             expiry_ns: 900_000_000_100,
-            is_yes: 1,
-            px_1e6: 620_000,
+            ff_ts_ns: 900,
+            ff_is_yes: 1,
+            ff_px_1e6: 620_000,
+            ctl_ts_ns: 800,
+            ctl_is_yes: 1,
+            ctl_px_1e6: 630_000,
         };
         let mut y = BTreeMap::new();
         y.insert(
@@ -1814,36 +1954,53 @@ mod tests {
         assert!(s2.contains("\"y\":null"), "{s2}");
         assert!(s2.contains("\"y_next_strike\":-1"), "{s2}");
         assert!(s2.contains("\"settle_px_1e6\":null"), "{s2}");
-        // BIN15 S5: the counterfactual rides the entry row it pairs with,
-        // joined by outcome; with none recorded the keys are null.
+        // BIN15 S5/S5b: both counterfactuals ride the entry row they pair
+        // with, joined by outcome; with none recorded the keys are null.
         assert!(
             s.ends_with(
-                "\"first_fire_ts_ns\":900,\"first_fire_px_1e6\":620000,\"first_fire_is_yes\":1}]"
+                "\"first_fire_ts_ns\":900,\"first_fire_px_1e6\":620000,\"first_fire_is_yes\":1,\
+                 \"ctl_fire_ts_ns\":800,\"ctl_fire_px_1e6\":630000,\"ctl_fire_is_yes\":1}]"
             ),
             "{s}"
         );
         assert!(
             s2.ends_with(
-                "\"first_fire_ts_ns\":null,\"first_fire_px_1e6\":null,\"first_fire_is_yes\":null}]"
+                "\"first_fire_ts_ns\":null,\"first_fire_px_1e6\":null,\"first_fire_is_yes\":null,\
+                 \"ctl_fire_ts_ns\":null,\"ctl_fire_px_1e6\":null,\"ctl_fire_is_yes\":null}]"
             ),
             "{s2}"
         );
+        // A control that never held is null on its own — an artifact whose
+        // test is looser than today's law.
+        let loose = Bin15FirstFireRow { ctl_ts_ns: 0, ..ff };
+        let s3 = render_bin15_entries(&[row], &[loose], &y);
+        assert!(
+            s3.ends_with(
+                "\"first_fire_ts_ns\":900,\"first_fire_px_1e6\":620000,\"first_fire_is_yes\":1,\
+                 \"ctl_fire_ts_ns\":null,\"ctl_fire_px_1e6\":null,\"ctl_fire_is_yes\":null}]"
+            ),
+            "{s3}"
+        );
     }
 
-    /// BIN15 S5 (ruling O-4): the `bin15_first_fires` block carries the
-    /// counterfactual on every instance the member did NOT enter, labelled
-    /// like an entry — and leaves out an entered one, whose row already
-    /// carries it, so every old-law instance appears exactly once.
+    /// BIN15 S5 (ruling O-4) + S5b: the `bin15_first_fires` block carries
+    /// both counterfactuals on every instance the member did NOT enter,
+    /// labelled like an entry, each `null` where its test never held — and
+    /// leaves out an entered one, whose row already carries them, so every
+    /// instance appears exactly once.
     #[test]
-    fn the_first_fires_block_is_the_old_law_on_the_instances_not_entered() {
-        let ff = |outcome: u32, is_yes: u8, px_1e6: i64| Bin15FirstFireRow {
-            ts_ns: 1_000_000_000_000 + 95_000_000_000,
+    fn the_first_fires_block_carries_both_counterfactuals_on_the_instances_not_entered() {
+        let row = |outcome: u32, ff_ts_ns: u64, is_yes: u8, px_1e6: i64| Bin15FirstFireRow {
             family: 0,
             outcome,
             start_ns: 1_000_000_000_000,
             expiry_ns: 1_900_000_000_000,
-            is_yes,
-            px_1e6,
+            ff_ts_ns,
+            ff_is_yes: is_yes,
+            ff_px_1e6: px_1e6,
+            ctl_ts_ns: 1_000_000_000_000 + 60_000_000_000,
+            ctl_is_yes: is_yes,
+            ctl_px_1e6: px_1e6 + 20_000,
         };
         let entered = Bin15EntryRow {
             ts_ns: 1_000_000_000_000 + 130_000_000_000,
@@ -1866,8 +2023,9 @@ mod tests {
                 y_next_strike: 0,
             },
         );
+        let fired = 1_000_000_000_000 + 95_000_000_000;
         let s = render_bin15_first_fires(
-            &[ff(8, 1, 640_000), ff(9, 0, 410_000)],
+            &[row(8, fired, 1, 640_000), row(9, fired, 0, 410_000), row(10, 0, 1, 700_000)],
             &[entered],
             &y,
         );
@@ -1875,9 +2033,89 @@ mod tests {
             s,
             "\"bin15_first_fires\":[{\"ts_ns\":1095000000000,\"family\":0,\"outcome\":9,\
              \"start_ns\":1000000000000,\"expiry_ns\":1900000000000,\"offset_s\":95,\
-             \"is_yes\":0,\"px_1e6\":410000,\"y\":0,\"y_next_strike\":0,\
-             \"settle_px_1e6\":2500000000}]"
+             \"is_yes\":0,\"px_1e6\":410000,\"ctl_ts_ns\":1060000000000,\"ctl_offset_s\":60,\
+             \"ctl_is_yes\":0,\"ctl_px_1e6\":430000,\"y\":0,\"y_next_strike\":0,\
+             \"settle_px_1e6\":2500000000},{\"ts_ns\":null,\"family\":0,\"outcome\":10,\
+             \"start_ns\":1000000000000,\"expiry_ns\":1900000000000,\"offset_s\":null,\
+             \"is_yes\":null,\"px_1e6\":null,\"ctl_ts_ns\":1060000000000,\"ctl_offset_s\":60,\
+             \"ctl_is_yes\":1,\"ctl_px_1e6\":720000,\"y\":null,\"y_next_strike\":-1,\
+             \"settle_px_1e6\":null}]"
         );
         assert_eq!(render_bin15_first_fires(&[], &[], &y), "\"bin15_first_fires\":[]");
+    }
+
+    /// BIN15 S5b: the observer's step — a dormant slot records nothing, a
+    /// roll flushes the ended instance's row (the successor's control can
+    /// fire in the same record), and a row on which neither test held is
+    /// dropped at the window's end.
+    #[test]
+    fn a_roll_flushes_the_ended_instance_and_the_window_end_the_rest() {
+        let mut rows = Vec::new();
+        let mut open = None;
+        let mut fam = strategy_bin15::FamilyState::default();
+        track_first_fire(&mut rows, &mut open, 1, &fam);
+        assert!(open.is_none(), "a dormant slot opens no row");
+        fam.live.outcome = 7;
+        fam.live.expiry_ns = 1_900_000_000_000;
+        track_first_fire(&mut rows, &mut open, 1, &fam);
+        fam.entry_first_ok_ts = 1_095_000_000_000;
+        fam.entry_first_ok_yes = 1;
+        fam.entry_first_ok_px_1e6 = 620_000;
+        track_first_fire(&mut rows, &mut open, 1, &fam);
+        // The roll: 7 settles and 8 binds, its control firing in the same
+        // record — the member's slot is already the successor's.
+        let mut next = strategy_bin15::FamilyState::default();
+        next.live.outcome = 8;
+        next.live.expiry_ns = 2_800_000_000_000;
+        next.entry_ctl_ok_ts = 1_950_000_000_000;
+        next.entry_ctl_ok_px_1e6 = 700_000;
+        track_first_fire(&mut rows, &mut open, 1, &next);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].outcome, rows[0].ff_ts_ns, rows[0].family), (7, 1_095_000_000_000, 1));
+        assert_eq!(open.map(|r| (r.outcome, r.ctl_ts_ns)), Some((8, 1_950_000_000_000)));
+        // 9 binds and neither test ever holds on it: the window's end drops it.
+        let mut idle = strategy_bin15::FamilyState::default();
+        idle.live.outcome = 9;
+        idle.live.expiry_ns = 3_700_000_000_000;
+        track_first_fire(&mut rows, &mut open, 1, &idle);
+        flush_first_fire(&mut rows, &mut open);
+        assert_eq!(rows.iter().map(|r| r.outcome).collect::<Vec<_>>(), [7, 8]);
+    }
+
+    /// BIN15 S5b: a row keeps each counterfactual's FIRST stamp — written
+    /// once, whichever test held first — and reaches the block only when
+    /// either test ever held.
+    #[test]
+    fn a_first_fire_row_keeps_each_first_stamp_and_flushes_only_when_fired() {
+        let mut fam = strategy_bin15::FamilyState::default();
+        fam.live.outcome = 7;
+        fam.live.expiry_ns = 1_900_000_000_000;
+        let mut rows = Vec::new();
+        let mut open = Some(Bin15FirstFireRow::of(2, &fam));
+        flush_first_fire(&mut rows, &mut open);
+        assert!(rows.is_empty() && open.is_none(), "neither test held: nothing to keep");
+
+        let mut row = Bin15FirstFireRow::of(2, &fam);
+        assert_eq!((row.family, row.outcome, row.start_ns), (2, 7, 1_000_000_000_000));
+        fam.entry_ctl_ok_ts = 1_060_000_000_000;
+        fam.entry_ctl_ok_yes = 1;
+        fam.entry_ctl_ok_px_1e6 = 640_000;
+        row.observe(&fam);
+        assert!(row.fired() && row.ff_ts_ns == 0, "the control alone held");
+        fam.entry_first_ok_ts = 1_095_000_000_000;
+        fam.entry_first_ok_yes = 1;
+        fam.entry_first_ok_px_1e6 = 620_000;
+        // The member never rewrites a stamp within an instance; the row
+        // holds its first regardless.
+        fam.entry_ctl_ok_ts = 1_200_000_000_000;
+        row.observe(&fam);
+        assert_eq!((row.ff_ts_ns, row.ff_is_yes, row.ff_px_1e6), (1_095_000_000_000, 1, 620_000));
+        assert_eq!(
+            (row.ctl_ts_ns, row.ctl_is_yes, row.ctl_px_1e6),
+            (1_060_000_000_000, 1, 640_000)
+        );
+        let mut open = Some(row);
+        flush_first_fire(&mut rows, &mut open);
+        assert_eq!((rows.len(), open.is_none()), (1, true));
     }
 }

@@ -363,6 +363,9 @@ pub struct FamilyState {
     /// BIN15 S5: the counterfactual's side, `1` Yes / `0` No (valid while
     /// `entry_first_ok_ts != 0`).
     pub entry_first_ok_yes: u8,
+    /// BIN15 S5b: the CONTROL counterfactual's side (valid while
+    /// `entry_ctl_ok_ts != 0`).
+    pub entry_ctl_ok_yes: u8,
     /// BIN15 S5: the preferred-leg snapshot (`TouchState::ts_ns`) the run
     /// last counted — a reprice on the same snapshot (a mark) is not a new
     /// poll.
@@ -371,17 +374,27 @@ pub struct FamilyState {
     /// test FIRST held on this instance, engine ns (the venue wall in the
     /// harness), whatever the persistence law and the ceiling then did.
     /// That instant and [`Self::entry_first_ok_px_1e6`] are the pre-S5
-    /// law's entry attempt (persist 1, no ceiling): logged, never traded —
-    /// a cap, grid or ring refusal there would have moved the old law's
-    /// real entry later. `0` = the test never held.
+    /// law's entry attempt (persist 1, no ceiling) at the artifact's own
+    /// price test: logged, never traded — a cap, grid or ring refusal there
+    /// would have moved the old law's real entry later. `0` = never held.
     pub entry_first_ok_ts: u64,
-    /// BIN15 S5: the preferred-side ask at that reprice ×1e6.
-    pub entry_first_ok_px_1e6: i64,
+    /// BIN15 S5b (ruling 2026-09-24): the CONTROL — the same record under
+    /// TODAY'S law (the artifact's floor, `Bin15Params::entry_control_e_1e6`
+    /// as the bound, persist 1, no ceiling), from the same reprice stream.
+    /// What doc 27 §5's "over today's law on the same instances" is scored
+    /// on once an artifact moves `e_entry_1e6`. `0` = never held.
+    pub entry_ctl_ok_ts: u64,
+    /// BIN15 S5: the preferred-side ask at the counterfactual's reprice
+    /// ×1e6 — `i32`, because an ask that passed the test is at most 1e6.
+    pub entry_first_ok_px_1e6: i32,
+    /// BIN15 S5b: the preferred-side ask at the control's reprice ×1e6.
+    pub entry_ctl_ok_px_1e6: i32,
 }
 
 // Eight cache lines: the three S3 fields took the eighth (see
-// `twap_sum`) and S5's seven sit in its tail (bytes 473..504). A field
-// added here that crosses into a ninth is a decision, not an accident.
+// `twap_sum`) and S5's ten sit in its tail (bytes 473..512, the two
+// counterfactual prices narrowed to `i32` to fit). A field added here
+// that crosses into a ninth is a decision, not an accident.
 const _: () = assert!(::core::mem::size_of::<FamilyState>() == 512);
 
 impl Default for FamilyState {
@@ -417,9 +430,12 @@ impl Default for FamilyState {
             entry_yes: 0,
             entry_closed: 0,
             entry_first_ok_yes: 0,
+            entry_ctl_ok_yes: 0,
             entry_last_touch_ts: 0,
             entry_first_ok_ts: 0,
+            entry_ctl_ok_ts: 0,
             entry_first_ok_px_1e6: 0,
+            entry_ctl_ok_px_1e6: 0,
         }
     }
 }
@@ -464,14 +480,17 @@ impl FamilyState {
         self.twap_sum = 0;
         self.twap_last_ts = 0;
         self.twap_gap = 0;
-        // BIN15 S5: and its own persistence run, ceiling and counterfactual.
+        // BIN15 S5: and its own persistence run, ceiling and counterfactuals.
         self.entry_hits = 0;
         self.entry_yes = 0;
         self.entry_closed = 0;
         self.entry_first_ok_yes = 0;
+        self.entry_ctl_ok_yes = 0;
         self.entry_last_touch_ts = 0;
         self.entry_first_ok_ts = 0;
+        self.entry_ctl_ok_ts = 0;
         self.entry_first_ok_px_1e6 = 0;
+        self.entry_ctl_ok_px_1e6 = 0;
     }
 }
 
@@ -588,6 +607,12 @@ pub struct Bin15Params {
     /// 428 settled submitted entries, t ≈ 1.5 at 0.70 — a research
     /// setting, not a proven edge.
     pub entry_min_px_1e6: i64,
+    /// BIN15 S5b (ruling 2026-09-24): the bound of the CONTROL
+    /// counterfactual ×1e6 — TODAY'S entry law, which a research artifact's
+    /// own `e_entry_1e6` no longer is. The cli sets it from `core-config`'s
+    /// stated default; it prices nothing and emits nothing, it only names
+    /// the law `FamilyState::entry_ctl_ok_*` records.
+    pub entry_control_e_1e6: i64,
     /// BIN15 P0 (F4): the oldest an underlying mark may be and still
     /// price a binary, ns.
     ///
@@ -652,6 +677,7 @@ impl Default for Bin15Params {
             entry_usd_1e6: 0,
             e_entry_1e6: 20_000,
             entry_min_px_1e6: 0,
+            entry_control_e_1e6: 20_000,
             // 5 s = ~2-5 missed HL mark prints. Long enough that an
             // ordinary jitter does not hold the member, short enough
             // that a dead feed cannot price a 15-minute binary.
@@ -767,9 +793,24 @@ impl Bin15Strategy {
         if params.e_take_1e6 < GRID_TICK_1E6 {
             return Err(StrategyError::Config("bin15: e_take under one tick"));
         }
+        // BIN15 S5b: the entry's own bound, held here as core-config holds
+        // it — a passing ask is then under 1e6, which the counterfactual
+        // prices' `i32` relies on.
+        if params.e_entry_1e6 < GRID_TICK_1E6 || params.e_entry_1e6 >= ONE_1E6 / 2 {
+            return Err(StrategyError::Config(
+                "bin15: e_entry_1e6 outside [one tick, 0.5) — core-config's own bounds",
+            ));
+        }
         if params.entry_min_px_1e6 < 0 || params.entry_min_px_1e6 >= ONE_1E6 {
             return Err(StrategyError::Config(
                 "bin15: entry_min_px_1e6 outside [0, 1e6) — a floor of 1.0 or more refuses every ask",
+            ));
+        }
+        if params.entry_control_e_1e6 < GRID_TICK_1E6
+            || params.entry_control_e_1e6 >= ONE_1E6 / 2
+        {
+            return Err(StrategyError::Config(
+                "bin15: entry_control_e_1e6 outside [one tick, 0.5) — no law to control against",
             ));
         }
         if params.entry_persist_polls == 0 {
@@ -1569,41 +1610,47 @@ impl Bin15Strategy {
 
     /// BIN15 S5 — the coverage entry's GATE: whether this reprice may
     /// emit, given the price test `ok` (floor and bound) read off the
-    /// preferred leg's snapshot `snap_ts`. A refusal is counted on its own
+    /// preferred leg's snapshot `snap_ts`, and `ok_ctl`, the same test under
+    /// today's law (the control's bound). A refusal is counted on its own
     /// reason and burns nothing — `covered` stays down and the next reprice
     /// asks again — except past the elapsed ceiling, which closes the
     /// instance for good.
     ///
-    /// The run is judged per SNAPSHOT, as doc 27 R2's polls are: a snapshot
-    /// is one write of the preferred leg's touch (the `l2Book` push), and a
-    /// reprice that never reaches this gate — a stale or one-sided book, a
-    /// take in flight — is not a poll at all.
-    ///
-    /// 1. **The counterfactual** (ruling O-4): the first reprice whose test
-    ///    holds is recorded — the pre-S5 law's entry attempt on this
-    ///    instance — whatever the steps below then do. Logged, never traded.
-    /// 2. **The elapsed ceiling**, judged first: a run must BEGIN within
-    ///    `entry_elapsed_max_ns` of the instance's start (doc 27 R2: "the
-    ///    first of them"). Past it a run already under way continues; a
-    ///    reprice that would begin a run, or break one, closes the instance
-    ///    — counted ONCE in `skipped_entry_elapsed`, silent after.
-    /// 3. **The run**: a NEW snapshot extends a run on its side (starts one
-    ///    on the other) when the test holds and breaks it when the test
-    ///    fails. A reprice on the SAME snapshot (a mark moved `p̂`) neither
-    ///    extends nor breaks a run; it can only start one, on a snapshot
-    ///    that failed at its arrival. With `entry_persist_polls = 1` the gate
-    ///    is therefore the pre-S5 law exactly: every passing reprice fires.
+    /// 1. **The counterfactuals** (ruling O-4, S5b): the first reprice whose
+    ///    test holds is recorded — the pre-S5 law's entry attempt at the
+    ///    artifact's own test — and so is the first whose CONTROL test
+    ///    holds (today's law), whatever the steps below then do. Logged,
+    ///    never traded.
+    /// 2. **The polls.** Under the pre-S5 law (`entry_persist_polls = 1`)
+    ///    every reprice is judged, so a mark may start a run on a snapshot
+    ///    that failed at its arrival and the gate is that law exactly.
+    ///    Above 1 a POLL is only the reprice the preferred leg's own new
+    ///    snapshot triggered (`now == snap_ts`: its `l2Book` arrival) — doc
+    ///    27 R2's poll instant, exactly. A poll extends the run on its side,
+    ///    starts one on the other, or breaks it when the test fails;
+    ///    reprices between polls (marks, the other leg's ticks) never change
+    ///    the run, and may fire only a run already long enough (a retry
+    ///    after a refused emit) while the test holds on its side. A snapshot
+    ///    whose arrival never reaches this gate (a stale or one-sided book,
+    ///    a take in flight) is not a poll at all.
+    /// 3. **The elapsed ceiling**, judged before the run moves: a run must
+    ///    BEGIN within `entry_elapsed_max_ns` of the instance's start (doc 27
+    ///    R2: "the first of them"). Past it a run under way continues; a poll
+    ///    that would begin or break a run closes the instance, and so does
+    ///    any reprice when no run is under way — counted ONCE in
+    ///    `skipped_entry_elapsed`, silent after.
     /// 4. **The refusals**: the test (`skipped_entry_price` — not an attempt
     ///    and not a spray; the calibration observation is written by the
     ///    ledger regardless, P3.3, so refusing to pay costs the gate
     ///    nothing), then the run's length (`skipped_entry_persist`).
     ///
-    /// Branch-light: the run update is two selects and a multiply.
+    /// Branch-light: the run update is a few selects and a multiply.
     #[inline(always)]
     fn entry_gate(
         &mut self,
         idx: usize,
         ok: bool,
+        ok_ctl: bool,
         want_yes: bool,
         px: i64,
         snap_ts: u64,
@@ -1612,34 +1659,52 @@ impl Bin15Strategy {
     ) -> bool {
         let yes = u8::from(want_yes);
         let pass = u8::from(ok);
+        // An ask that passed either test is at most 1e6, so it fits.
+        debug_assert!(!(ok || ok_ctl) || (0..=ONE_1E6).contains(&px));
         let fam = &mut self.fam[idx];
         if ok && fam.entry_first_ok_ts == 0 {
             fam.entry_first_ok_ts = now;
-            fam.entry_first_ok_px_1e6 = px;
+            fam.entry_first_ok_px_1e6 = px as i32;
             fam.entry_first_ok_yes = yes;
+        }
+        if ok_ctl && fam.entry_ctl_ok_ts == 0 {
+            fam.entry_ctl_ok_ts = now;
+            fam.entry_ctl_ok_px_1e6 = px as i32;
+            fam.entry_ctl_ok_yes = yes;
         }
         if fam.entry_closed != 0 {
             return false;
         }
+        let persist = self.params.entry_persist_polls;
         let same_side = yes == fam.entry_yes;
         let fresh = snap_ts != fam.entry_last_touch_ts || !same_side;
         let run = if same_side { fam.entry_hits } else { 0 };
-        let next = if fresh { run.saturating_add(1) * pass } else { run.max(pass) };
+        let poll = persist == 1 || (fresh && now == snap_ts);
+        let next = if !poll {
+            run
+        } else if fresh {
+            run.saturating_add(1) * pass
+        } else {
+            run.max(pass)
+        };
         let max = self.params.entry_elapsed_max_ns;
-        if max > 0 && TAU_15M_NS.saturating_sub(to_expiry_ns) > max && (run == 0 || next == 0) {
+        let close = if poll { run == 0 || next == 0 } else { fam.entry_hits == 0 };
+        if max > 0 && close && TAU_15M_NS.saturating_sub(to_expiry_ns) > max {
             fam.entry_closed = 1;
             self.counters.skipped_entry_elapsed =
                 self.counters.skipped_entry_elapsed.wrapping_add(1);
             return false;
         }
-        fam.entry_hits = next;
-        fam.entry_yes = yes;
-        fam.entry_last_touch_ts = snap_ts;
+        if poll {
+            fam.entry_hits = next;
+            fam.entry_yes = yes;
+            fam.entry_last_touch_ts = snap_ts;
+        }
         if !ok {
             self.counters.skipped_entry_price = self.counters.skipped_entry_price.wrapping_add(1);
             return false;
         }
-        if next < self.params.entry_persist_polls {
+        if next < persist {
             self.counters.skipped_entry_persist =
                 self.counters.skipped_entry_persist.wrapping_add(1);
             return false;
@@ -1748,7 +1813,11 @@ impl Bin15Strategy {
             // `0` is no floor, which is the old law.
             let ok = px >= self.params.entry_min_px_1e6
                 && px <= belief.saturating_sub(self.params.e_entry_1e6);
-            if !self.entry_gate(idx, ok, want_yes, px, touch.ts_ns, to_expiry_ns, now) {
+            // BIN15 S5b: the same test under today's law — the control the
+            // counterfactual records; it gates nothing.
+            let ok_ctl = px >= self.params.entry_min_px_1e6
+                && px <= belief.saturating_sub(self.params.entry_control_e_1e6);
+            if !self.entry_gate(idx, ok, ok_ctl, want_yes, px, touch.ts_ns, to_expiry_ns, now) {
                 return;
             }
             // Contracts ×1e6 the entry notional buys at that ask, then
@@ -2988,6 +3057,20 @@ mod tests {
         assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
         let mut bad = params_1(FAMILY_OUT_15M);
         bad.cap_day_usd_1e6 = 0;
+        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
+        // BIN15 S5b: the entry's bound and the control's, each in
+        // [one tick, 0.5).
+        let mut bad = params_1(FAMILY_OUT_15M);
+        bad.e_entry_1e6 = GRID_TICK_1E6 - 1;
+        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
+        let mut bad = params_1(FAMILY_OUT_15M);
+        bad.e_entry_1e6 = ONE_1E6 / 2;
+        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
+        let mut bad = params_1(FAMILY_OUT_15M);
+        bad.entry_control_e_1e6 = 0;
+        assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
+        let mut bad = params_1(FAMILY_OUT_15M);
+        bad.entry_control_e_1e6 = ONE_1E6 / 2;
         assert!(Bin15Strategy::new().configure(bad, luts(), anchor).is_err());
     }
 
@@ -4786,12 +4869,14 @@ mod tests {
         assert_eq!((f.entry_hits, f.entry_last_touch_ts, f.entry_first_ok_ts), (0, 0, 0));
     }
 
-    /// BIN15 S5: the run is judged per SNAPSHOT (doc 27 R2's polls). A new
-    /// snapshot that fails the test breaks it; a mark that fails it on the
-    /// same snapshot does not; a mark that passes it on a snapshot that
-    /// failed at its arrival starts a run there.
+    /// BIN15 S5b: above one poll the run is judged at POLLS only — the
+    /// reprice a new snapshot of the preferred leg triggers (doc 27 R2's
+    /// poll instant). A failing poll breaks the run; a mark failing the test
+    /// between polls does not; and a mark passing it cannot start a run on a
+    /// snapshot that failed at its arrival (the pre-S5 law's rescue, kept for
+    /// `entry_persist_polls = 1` only).
     #[test]
-    fn a_failing_snapshot_breaks_the_run_and_a_failing_mark_does_not() {
+    fn above_one_poll_only_a_poll_moves_the_run() {
         let (mut m, mut c) = s5_member(3, 0, 600);
         m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
         s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
@@ -4800,41 +4885,63 @@ mod tests {
         // A new snapshot whose ask no longer clears the bound breaks it.
         m.on_venue_event(&mark_event(S5_UP, at(68)), &mut c);
         m.on_tick(&tick(yes_sym(0), 690_000, 700_000, 1_000_000_000, at(69), false), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 0, "a failing snapshot breaks the run");
+        assert_eq!(m.family(0).expect("f").entry_hits, 0, "a failing poll breaks the run");
         assert!(m.counters().skipped_entry_price > 0, "on the price counter, as before S5");
-        // A mark lifting p̂ over that ask starts a run on the same snapshot.
+        // A mark lifting p̂ over that ask is not a poll: no run starts.
         m.on_venue_event(&mark_event(79_300_000_000, at(70)), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 1, "the snapshot counts, once");
-        // A mark failing the test on that snapshot neither breaks nor
-        // extends the run.
-        m.on_venue_event(&mark_event(79_050_000_000, at(71)), &mut c);
-        assert_eq!(m.family(0).expect("f").entry_hits, 1, "a mark never breaks a run");
+        assert_eq!(m.family(0).expect("f").entry_hits, 0, "no rescue above one poll");
         s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 73);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2);
-        assert_eq!(iocs(&c), 0, "no run of three yet");
         s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 76);
-        assert_eq!(iocs(&c), 1, "the third passing snapshot fires");
+        assert_eq!(m.family(0).expect("f").entry_hits, 2);
+        // A mark failing the test between polls neither breaks nor extends.
+        m.on_venue_event(&mark_event(79_050_000_000, at(77)), &mut c);
+        assert_eq!(m.family(0).expect("f").entry_hits, 2, "a mark never breaks a run");
+        assert_eq!(iocs(&c), 0, "no run of three yet");
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 79);
+        assert_eq!(iocs(&c), 1, "the third passing poll fires");
     }
 
-    /// BIN15 S5: the run is on ONE side. A flip of the preferred side —
-    /// the mark crossing the strike — starts a new run on the other leg,
-    /// and flipping back starts again from the current snapshot.
+    /// BIN15 S5: under the pre-S5 law a mark that passes the test on a
+    /// snapshot which failed at its arrival fires — every reprice is judged,
+    /// which is what makes `entry_persist_polls = 1` the old law exactly.
     #[test]
-    fn a_preferred_side_flip_resets_the_run() {
+    fn under_the_pre_s5_law_a_mark_can_fire_on_a_snapshot_that_failed() {
+        let (mut m, mut c) = s5_member(1, 0, 600);
+        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
+        m.on_venue_event(&mark_event(S5_UP, at(62)), &mut c);
+        m.on_tick(&tick(yes_sym(0), 690_000, 700_000, 1_000_000_000, at(63), false), &mut c);
+        assert_eq!(iocs(&c), 0, "0.70 does not clear p̂ − 2 c at the arrival");
+        m.on_venue_event(&mark_event(79_300_000_000, at(64)), &mut c);
+        assert_eq!(iocs(&c), 1, "the mark lifts p̂ and the old law fires");
+    }
+
+    /// BIN15 S5: the run is on ONE side, and a side is judged at a poll. A
+    /// flip that a mark shows and a mark takes back before the next poll is
+    /// invisible (R2 never saw it); a flip seen at a poll of the other leg
+    /// starts a run there, and the way back starts afresh.
+    #[test]
+    fn a_preferred_side_flip_seen_at_a_poll_resets_the_run() {
         let (mut m, mut c) = s5_member(3, 0, 600);
         m.on_tick(&tick(no_sym(0), 640_000, 650_000, 1_000_000_000, at(61), false), &mut c);
         s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
         s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
-        assert_eq!(m.family(0).expect("f").entry_hits, 2);
+        // Down and back between two polls: nothing moved.
         m.on_venue_event(&mark_event(S5_DOWN, at(67)), &mut c);
-        let f = *m.family(0).expect("f");
-        assert_eq!((f.entry_hits, f.entry_yes), (1, 0), "a new run on NO");
         m.on_venue_event(&mark_event(S5_UP, at(68)), &mut c);
         let f = *m.family(0).expect("f");
+        assert_eq!((f.entry_hits, f.entry_yes), (2, 1), "a flip between polls is invisible");
+        // Down, and the No book polls: a run on NO.
+        m.on_venue_event(&mark_event(S5_DOWN, at(69)), &mut c);
+        m.on_tick(&tick(no_sym(0), 640_000, 650_000, 1_000_000_000, at(70), false), &mut c);
+        let f = *m.family(0).expect("f");
+        assert_eq!((f.entry_hits, f.entry_yes), (1, 0), "a flip seen at a poll: a run on NO");
+        // Back up: the YES run starts again from its next poll.
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 72);
+        let f = *m.family(0).expect("f");
         assert_eq!((f.entry_hits, f.entry_yes), (1, 1), "and back: a new run on YES");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 70);
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 75);
         assert_eq!(iocs(&c), 0, "two on the new run");
-        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 73);
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 78);
         assert_eq!(iocs(&c), 1, "three on the new run fire");
         assert_eq!(c.orders[0].sym, yes_sym(0));
     }
@@ -4893,6 +5000,45 @@ mod tests {
         assert_eq!(m.family(0).expect("f").entry_closed, 1);
     }
 
+    /// BIN15 S5b: past the ceiling, BETWEEN polls, a reprice with no run
+    /// under way closes the instance — as the next poll would have, one
+    /// snapshot sooner. Here the Yes snapshot's own arrival never reached
+    /// the gate (no mark yet to price it), so the first gated reprice is
+    /// the mark's, and it is not a poll.
+    #[test]
+    fn past_the_ceiling_a_reprice_between_polls_with_no_run_closes_the_instance() {
+        // expiry 600 s after the anchor: at(64) is 364 s in, past 240 s.
+        let (mut m, mut c) = s5_member(3, 240_000_000_000, 600);
+        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
+        m.on_tick(&tick(yes_sym(0), 640_000, 650_000, 1_000_000_000, at(62), false), &mut c);
+        assert_eq!(m.family(0).expect("f").entry_first_ok_ts, 0, "unpriced: never gated");
+        m.on_venue_event(&mark_event(S5_UP, at(64)), &mut c);
+        let f = *m.family(0).expect("f");
+        assert_eq!((f.entry_closed, f.entry_hits, f.covered), (1, 0, 0));
+        assert_eq!(m.counters().skipped_entry_elapsed, 1);
+        assert_eq!(f.entry_first_ok_ts, at(64), "the counterfactual still records it");
+        assert_eq!(iocs(&c), 0);
+    }
+
+    /// BIN15 S5b: a complete run whose emit was REFUSED (the ring full)
+    /// burns nothing — the next reprice, a mark between polls, retries it
+    /// while the test holds on the run's side, without waiting a poll.
+    #[test]
+    fn a_complete_run_whose_emit_was_refused_retries_between_polls() {
+        let (mut m, mut c) = s5_member(3, 0, 600);
+        m.on_tick(&tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false), &mut c);
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
+        c.full = true;
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 69);
+        let f = *m.family(0).expect("f");
+        assert_eq!((f.entry_hits, f.covered, iocs(&c)), (3, 0, 0), "complete, refused, kept");
+        c.full = false;
+        m.on_venue_event(&mark_event(S5_UP, at(70)), &mut c);
+        assert_eq!(iocs(&c), 1, "the mark retries the complete run");
+        assert_eq!(m.family(0).expect("f").covered, 1);
+    }
+
     /// BIN15 S5: under `entry_persist_polls = 1` and no ceiling — the
     /// defaults, and every artifact before S5 — the counterfactual IS the
     /// entry: same reprice, same ask, same side.
@@ -4906,10 +5052,44 @@ mod tests {
         assert_eq!(iocs(&c), 1, "the first passing snapshot fires");
         let f = *m.family(0).expect("f");
         assert_eq!(f.entry_first_ok_ts, at(63));
-        assert_eq!(f.entry_first_ok_px_1e6, c.orders[0].px.raw());
+        assert_eq!(i64::from(f.entry_first_ok_px_1e6), c.orders[0].px.raw());
         assert_eq!(f.entry_first_ok_yes, 1);
+        // BIN15 S5b: with the artifact AT today's bound the control is the
+        // same record.
+        assert_eq!(
+            (f.entry_ctl_ok_ts, f.entry_ctl_ok_px_1e6, f.entry_ctl_ok_yes),
+            (f.entry_first_ok_ts, f.entry_first_ok_px_1e6, f.entry_first_ok_yes)
+        );
         assert_eq!(m.counters().skipped_entry_persist, 0, "never counted under persist 1");
         assert_eq!(m.counters().skipped_entry_elapsed, 0, "never counted with no ceiling");
+    }
+
+    /// BIN15 S5b: the CONTROL counterfactual records today's law from the
+    /// same reprice stream, whatever the artifact's own bound. With the
+    /// artifact at 3 c and the control at the 2 c default, an ask of 0.67
+    /// against `p̂ ≈ 0.697` clears the control only: the control records it
+    /// there, and the artifact's own counterfactual waits for the 0.65 that
+    /// clears 3 c. Neither trades.
+    #[test]
+    fn the_control_records_todays_law_when_the_artifact_moves_its_bound() {
+        let (mut m, mut c) = s5_member(3, 0, 600);
+        m.params.e_entry_1e6 = 30_000;
+        assert_eq!(m.params.entry_control_e_1e6, 20_000, "today's law");
+        m.on_tick(&tick(no_sym(0), 320_000, 330_000, 1_000_000_000, at(61), false), &mut c);
+        m.on_venue_event(&mark_event(S5_UP, at(62)), &mut c);
+        m.on_tick(&tick(yes_sym(0), 660_000, 670_000, 1_000_000_000, at(63), false), &mut c);
+        let f = *m.family(0).expect("f");
+        assert_eq!(
+            (f.entry_ctl_ok_ts, f.entry_ctl_ok_px_1e6, f.entry_ctl_ok_yes),
+            (at(63), 670_000, 1),
+            "0.67 clears today's 2 c"
+        );
+        assert_eq!(f.entry_first_ok_ts, 0, "0.67 does not clear the artifact's 3 c");
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 66);
+        let f = *m.family(0).expect("f");
+        assert_eq!((f.entry_first_ok_ts, f.entry_first_ok_px_1e6), (at(66), 650_000));
+        assert_eq!(f.entry_ctl_ok_ts, at(63), "the control keeps its first fire");
+        assert_eq!(iocs(&c), 0, "neither counterfactual trades");
     }
 
     #[test]

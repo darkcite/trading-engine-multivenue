@@ -433,7 +433,7 @@ def _row_l(ts: int, outcome: int, y: int):
     )
 
 
-# --- BIN15 S5: the counterfactual first fires (ruling O-4) --------------
+# --- BIN15 S5: the counterfactual first fires (ruling O-4) + S5b ----------
 
 _VENUE: dict = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "venue"}]}
 
@@ -442,35 +442,56 @@ _LAW: dict = {"persist_polls": 3, "elapsed_max_ns": 240 * _S}
 
 
 def _ff(outcome: int, ts: int = 1_000, px: int = 600_000, y: int = 1_000_000,
-        is_yes: int = 1, entered: int = 0, law: tuple[int, int] = (3, 240 * _S)):
+        is_yes: int = 1, entered: int = 0, law: tuple[int, int] = (3, 240 * _S),
+        ctl: tuple[int, int, int] | None = None, fired: bool = True):
+    """A first-fire row. ``ctl``: the control's ``(ts, px, is_yes)`` --
+    ``None``, none recorded; ``fired=False``: the artifact's test never held."""
     expiry = ts + 800_000_000_000
     start = expiry - claude_worker.bin15_accrue.TAU_15M_NS
-    return claude_worker.bin15_accrue.FirstFire(
+    c = {} if ctl is None else {
+        "ctl_ts_ns": ctl[0], "ctl_offset_s": max(ctl[0] - start, 0) // 1_000_000_000,
+        "ctl_is_yes": ctl[2], "ctl_px_1e6": ctl[1],
+    }
+    f = claude_worker.bin15_accrue.FirstFire(
         ts_ns=ts, outcome=outcome, family=0, start_ns=start, expiry_ns=expiry,
         offset_s=(ts - start) // 1_000_000_000, is_yes=is_yes, px_1e6=px, y=y,
-        y_next_strike=y, entered=entered, persist_polls=law[0], elapsed_max_ns=law[1],
+        y_next_strike=y, entered=entered, persist_polls=law[0], elapsed_max_ns=law[1], **c,
     )
+    return f if fired else f._replace(ts_ns=0, offset_s=0, is_yes=-1, px_1e6=0)
 
 
 def test_first_fires_come_from_the_entry_columns_and_the_block() -> None:
-    """Every instance the old law would have bought, once: an entered one
-    from its entry row's `first_fire_*` columns, the rest from the
-    `bin15_first_fires` block, all stamped with the sidecar's entry law. A
-    pre-S5 sidecar yields nothing; one off the venue clock yields nothing
-    and counts what it dropped."""
+    """Every instance either test held on, once: an entered one from its
+    entry row's `first_fire_*` / `ctl_fire_*` columns, the rest from the
+    `bin15_first_fires` block (a null test is one that never held), all
+    stamped with the sidecar's entry law. A pre-S5 sidecar yields nothing, a
+    pre-S5b one rows without a control; one off the venue clock yields
+    nothing and counts what it dropped."""
     entry = {
         "ts_ns": 130 * _S, "outcome": 7, "family": 0, "start_ns": 0,
         "expiry_ns": 900 * _S, "offset_s": 130, "is_yes": 1, "px_1e6": 650_000,
         "qty_1e6": 76_000_000, "p_hat_1e6": 700_000, "origin": 1, "y": 1_000_000,
         "y_next_strike": 1_000_000, "settle_px_1e6": 77_000_000_000,
         "first_fire_ts_ns": 95 * _S, "first_fire_px_1e6": 640_000, "first_fire_is_yes": 1,
+        "ctl_fire_ts_ns": 60 * _S, "ctl_fire_px_1e6": 660_000, "ctl_fire_is_yes": 1,
     }
     declined = {
         "ts_ns": 40 * _S, "family": 1, "outcome": 9, "start_ns": 0, "expiry_ns": 900 * _S,
-        "offset_s": 40, "is_yes": 0, "px_1e6": 410_000, "y": None, "y_next_strike": -1,
-        "settle_px_1e6": None,
+        "offset_s": 40, "is_yes": 0, "px_1e6": 410_000, "ctl_ts_ns": 30 * _S,
+        "ctl_offset_s": 30, "ctl_is_yes": 0, "ctl_px_1e6": 430_000, "y": None,
+        "y_next_strike": -1, "settle_px_1e6": None,
     }
-    blocks = {"bin15_entries": [entry], "bin15_first_fires": [declined], "bin15_entry_law": _LAW}
+    control_only = {
+        "ts_ns": None, "family": 2, "outcome": 10, "start_ns": 0, "expiry_ns": 900 * _S,
+        "offset_s": None, "is_yes": None, "px_1e6": None, "ctl_ts_ns": 70 * _S,
+        "ctl_offset_s": 70, "ctl_is_yes": 1, "ctl_px_1e6": 450_000, "y": 1_000_000,
+        "y_next_strike": 1_000_000, "settle_px_1e6": 77_000_000_000,
+    }
+    blocks = {
+        "bin15_entries": [entry],
+        "bin15_first_fires": [declined, control_only],
+        "bin15_entry_law": dict(_LAW, control_e_entry_1e6=20_000),
+    }
     fires, dropped = claude_worker.bin15_accrue.first_fires_from_sidecar(
         json.dumps({"stale": _VENUE, **blocks})
     )
@@ -478,30 +499,47 @@ def test_first_fires_come_from_the_entry_columns_and_the_block() -> None:
     assert [(f.outcome, f.ts_ns, f.px_1e6, f.is_yes, f.offset_s, f.entered) for f in fires] == [
         (7, 95 * _S, 640_000, 1, 95, 1),
         (9, 40 * _S, 410_000, 0, 40, 0),
+        (10, 0, 0, -1, 0, 0),
+    ]
+    assert [(f.ctl_ts_ns, f.ctl_px_1e6, f.ctl_is_yes, f.ctl_offset_s) for f in fires] == [
+        (60 * _S, 660_000, 1, 60),
+        (30 * _S, 430_000, 0, 30),
+        (70 * _S, 450_000, 1, 70),
     ]
     assert {f.law for f in fires} == {(3, 240 * _S)}
     assert fires[0].won and not fires[1].settled
-    lost = dict(entry, first_fire_ts_ns=None, first_fire_px_1e6=None, first_fire_is_yes=None)
+    assert fires[2].ctl_fired and not fires[2].fired and fires[2].control().won
+    lost = dict(
+        entry, first_fire_ts_ns=None, first_fire_px_1e6=None, first_fire_is_yes=None,
+        ctl_fire_ts_ns=None, ctl_fire_px_1e6=None, ctl_fire_is_yes=None,
+    )
     assert claude_worker.bin15_accrue.first_fires_from_sidecar(
         json.dumps({"stale": _VENUE, "bin15_entries": [lost]})
     ) == ([], 0), "a lost first fire is not guessed"
-    pre_s5 = {k: v for k, v in entry.items() if not k.startswith("first_fire_")}
+    pre_s5 = {k: v for k, v in entry.items() if not k.startswith(("first_fire_", "ctl_fire_"))}
     assert claude_worker.bin15_accrue.first_fires_from_sidecar(
         json.dumps({"stale": _VENUE, "bin15_entries": [pre_s5]})
     ) == ([], 0)
+    pre_s5b = {k: v for k, v in entry.items() if not k.startswith("ctl_fire_")}
+    (old,), _ = claude_worker.bin15_accrue.first_fires_from_sidecar(
+        json.dumps({"stale": _VENUE, "bin15_entries": [pre_s5b]})
+    )
+    assert old.fired and not old.ctl_fired and old.ctl_is_yes == -1
     anchor = {"runs": [{"epoch_ns": 1, "lanes": {}, "wall": "anchor"}]}
     assert claude_worker.bin15_accrue.first_fires_from_sidecar(
         json.dumps({"stale": anchor, **blocks})
-    ) == ([], 2)
+    ) == ([], 3)
 
 
 def test_the_first_fire_store_keeps_the_earliest_fire_and_never_mixes_two_laws(
     tmp_path,
 ) -> None:
-    """A window cut replays a straddling instance twice: the EARLIEST fire
-    is the old law's, the label comes from whichever row has it, `entered`
-    from either. A row accrued under another entry law only lends the
-    label. A second merge changes nothing; the file round-trips."""
+    """A window cut replays a straddling instance twice: the EARLIEST of
+    each counterfactual is the law's -- each on its own -- the label comes
+    from whichever row has it, `entered` from either. A row accrued under
+    another entry law only lends the label. A second merge changes nothing;
+    the file round-trips, and a pre-S5b row (13 columns) reads with no
+    control."""
     unknown = claude_worker.bin15_accrue.Y_UNKNOWN
     early = _ff(7, ts=10 * _S, px=600_000, y=unknown)
     late = _ff(7, ts=20 * _S, px=700_000, y=0, entered=1)
@@ -516,20 +554,36 @@ def test_the_first_fire_store_keeps_the_earliest_fire_and_never_mixes_two_laws(
     (mix,), _ = claude_worker.bin15_accrue.merge_first_fires([stored], [other_law])
     assert (mix.ts_ns, mix.px_1e6, mix.entered, mix.law) == (30 * _S, 650_000, 0, (3, 240 * _S))
     assert mix.y == 0, "the label is a fact about the instance, whatever the law"
+    # S5b: the control can come from one window and the artifact's test
+    # from the other; a test that never held is later than any that did.
+    a = _ff(30, ts=40 * _S, ctl=(35 * _S, 610_000, 1))
+    b = _ff(30, ts=30 * _S, ctl=(50 * _S, 620_000, 0))
+    (m2,), _ = claude_worker.bin15_accrue.merge_first_fires([a], [b])
+    assert (m2.ts_ns, m2.ctl_ts_ns, m2.ctl_px_1e6, m2.ctl_is_yes) == (
+        30 * _S, 35 * _S, 610_000, 1
+    )
+    only_ctl = _ff(31, ts=30 * _S, fired=False, ctl=(20 * _S, 600_000, 1))
+    (m3,), _ = claude_worker.bin15_accrue.merge_first_fires([only_ctl], [_ff(31, ts=45 * _S)])
+    assert (m3.ts_ns, m3.ctl_ts_ns) == (45 * _S, 20 * _S)
     p = tmp_path / "first_fires.tsv"
-    rows = [*again, _ff(9, ts=30 * _S)]
+    rows = [*again, _ff(9, ts=30 * _S), m2, m3]
     claude_worker.bin15_accrue.write_first_fires(p, rows)
     assert claude_worker.bin15_accrue.read_first_fires(p) == rows
+    legacy = tmp_path / "legacy.tsv"
+    legacy.write_text("\t".join(str(v) for v in tuple(_ff(40))[:13]) + "\n", encoding="utf-8")
+    assert claude_worker.bin15_accrue.read_first_fires(legacy) == [_ff(40)]
     p.write_text("1\t2\t3\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="want 13 columns"):
+    with pytest.raises(ValueError, match="want 17 columns"):
         claude_worker.bin15_accrue.read_first_fires(p)
 
 
-def test_the_counterfactual_is_scored_per_law_on_the_same_instances_and_the_declined() -> None:
-    """Doc 27 §5's "over today's law on the SAME instances": paired by
-    outcome, each side at an equal dollar, one block per entry law -- the
-    old law itself only counted -- plus the old law on the instances the
-    member declined. An unsettled fire is counted, never scored."""
+def test_the_counterfactuals_are_scored_per_law_on_the_same_instances_and_the_declined() -> None:
+    """Doc 27 §5's "over today's law on the SAME instances": each
+    counterfactual paired with the entries by outcome, each side at an equal
+    dollar, one block per entry law -- the old law itself only counted --
+    plus each on the instances the member declined. An unsettled fire is
+    counted, never scored; an entry today's law never bought is not a pair;
+    the fill bar is named, not scored."""
     unknown = claude_worker.bin15_accrue.Y_UNKNOWN
     entries = [
         _e(7, px=650_000, y=1_000_000)._replace(venue=True),
@@ -537,32 +591,80 @@ def test_the_counterfactual_is_scored_per_law_on_the_same_instances_and_the_decl
         _e(11, ts=5_000, px=500_000, y=0)._replace(venue=True),
         _e(12, ts=6_000, px=500_000, y=0)._replace(venue=True),
         _e(13, ts=7_000, px=500_000, y=0)._replace(venue=True),
+        _e(15, ts=9_000, px=660_000, y=1_000_000)._replace(venue=True),
     ]
     # 9 is declined: an entry for it (a day re-accrued under another law)
     # is not a pair, and 9 is scored once, as declined.
     entries.append(_e(9, ts=3_000, px=500_000, y=0)._replace(venue=True))
+    old = claude_worker.bin15_accrue.OLD_LAW
     fires = [
-        _ff(7, px=600_000, y=1_000_000, entered=1),
-        _ff(8, ts=2_000, px=600_000, y=0, is_yes=0, entered=1),
-        _ff(9, ts=3_000, px=400_000, y=0, is_yes=1),
+        _ff(7, px=600_000, y=1_000_000, entered=1, ctl=(500, 620_000, 1)),
+        _ff(8, ts=2_000, px=600_000, y=0, is_yes=0, entered=1, ctl=(1_500, 580_000, 0)),
+        _ff(9, ts=3_000, px=400_000, y=0, is_yes=1, ctl=(2_500, 420_000, 1)),
         _ff(10, ts=4_000, y=unknown),
-        _ff(11, ts=5_000, y=unknown, entered=1),
-        _ff(12, ts=6_000, px=500_000, y=0, entered=1, law=claude_worker.bin15_accrue.OLD_LAW),
+        _ff(11, ts=5_000, y=unknown, entered=1, ctl=(4_000, 610_000, 1)),
+        _ff(12, ts=6_000, px=500_000, y=0, entered=1, law=old, ctl=(6_000, 500_000, 1)),
+        _ff(14, ts=8_000, fired=False, ctl=(8_000, 450_000, 1)),
+        _ff(15, ts=9_000, px=640_000, y=1_000_000, entered=1),
     ]
     lines = claude_worker.bin15_accrue.render_counterfactual(entries, fires)
     assert lines == [
-        "counterfactual (persist 1, no ceiling, the artifact's own price test: the first "
-        "passing reprice, not traded): 6 first fire(s), 4 settled; 4 on instances the "
-        "member entered, 2 it declined",
+        "counterfactuals (the first passing reprice at persist 1, no ceiling -- logged, not "
+        "traded): 8 instance(s), 6 settled; 5 the member entered, 3 it declined; the "
+        "artifact's test held on 7, today's law (the control) on 6",
         "   1 entr(ies) with no first fire (accrued before S5) -- not paired",
-        "   -- entry law persist 1, no ceiling: the old law itself, 1 first fire(s) -- "
-        "identical to its entries by construction, not a comparison",
-        "   -- entry law persist 3, ceiling 240 s: 5 first fire(s)",
-        "      1 settled entr(ies) whose first fire is unsettled (run `relabel`) -- left out",
-        "      the SAME 2 instance(s): hit 50.0 % vs the old law's 100.0 % (-50.0 pts); "
-        "EV per $1 -0.2308 vs +0.6667; mean price 0.6750 vs 0.6000",
-        "      the 1 instance(s) it declined: the old law would have hit 0.0 % at a mean "
-        "0.4000, EV per $1 -1.0000",
+        "   -- entry law persist 1, no ceiling: the old law itself, 1 instance(s) -- its "
+        "entries ARE its unpersisted trigger, not a comparison",
+        "      today's law (the control): the artifact's own test on all 1 instance(s) (its "
+        "bound is today's) -- the same fires, not a second comparison",
+        "   -- entry law persist 3, ceiling 240 s: 7 instance(s)",
+        "      1 settled entr(ies) whose counterfactual is unsettled (run `relabel`) -- left out",
+        "      vs the artifact's unpersisted trigger: the SAME 3 instance(s): hit 66.7 % vs "
+        "100.0 % (-33.3 pts); EV per $1 +0.0179 vs +0.6319 (-61.4 pts); mean price 0.6700 "
+        "vs 0.6133",
+        "      the 1 instance(s) it declined that the artifact's unpersisted trigger would "
+        "have bought: hit 0.0 % at a mean 0.4000, EV per $1 -1.0000",
+        "      1 settled entr(ies) today's law (the control) never bought (or accrued before "
+        "S5b) -- not paired",
+        "      1 settled entr(ies) whose counterfactual is unsettled (run `relabel`) -- left out",
+        "      vs today's law (the control): the SAME 2 instance(s): hit 50.0 % vs 100.0 % "
+        "(-50.0 pts); EV per $1 -0.2308 vs +0.6685 (-89.9 pts); mean price 0.6750 vs 0.6000",
+        "      the 2 instance(s) it declined that today's law (the control) would have "
+        "bought: hit 50.0 % at a mean 0.4350, EV per $1 +0.1111",
+        "   IoC fills (doc 27 §5's fill bar): not measurable in the paper model -- the "
+        "harness models every fill; gated at the first live step (ruling 2026-09-24)",
+    ]
+
+
+def test_the_control_is_counted_where_it_is_the_artifacts_own_test_or_was_never_recorded() -> None:
+    """BIN15 S5b: where the artifact's bound IS today's, the control fires
+    are the artifact's own and are counted, not compared a second time; a
+    law whose rows predate S5b recorded no control and says so."""
+    old = claude_worker.bin15_accrue.OLD_LAW
+    entries = [
+        _e(20, px=600_000, y=1_000_000)._replace(venue=True),
+        _e(21, ts=2_000, px=650_000, y=1_000_000)._replace(venue=True),
+    ]
+    fires = [
+        _ff(20, entered=1, law=old),
+        _ff(21, ts=2_000, entered=1, ctl=(2_000, 600_000, 1)),
+    ]
+    assert claude_worker.bin15_accrue.render_counterfactual(entries, fires) == [
+        "counterfactuals (the first passing reprice at persist 1, no ceiling -- logged, not "
+        "traded): 2 instance(s), 2 settled; 2 the member entered, 0 it declined; the "
+        "artifact's test held on 2, today's law (the control) on 1",
+        "   -- entry law persist 1, no ceiling: the old law itself, 1 instance(s) -- its "
+        "entries ARE its unpersisted trigger, not a comparison",
+        "      today's law (the control): no fire recorded (accrued before S5b, or it never "
+        "held) -- not paired",
+        "   -- entry law persist 3, ceiling 240 s: 1 instance(s)",
+        "      vs the artifact's unpersisted trigger: the SAME 1 instance(s): hit 100.0 % vs "
+        "100.0 % (+0.0 pts); EV per $1 +0.5385 vs +0.6667 (-12.8 pts); mean price 0.6500 "
+        "vs 0.6000",
+        "      today's law (the control): the artifact's own test on all 1 instance(s) (its "
+        "bound is today's) -- the same fires, not a second comparison",
+        "   IoC fills (doc 27 §5's fill bar): not measurable in the paper model -- the "
+        "harness models every fill; gated at the first live step (ruling 2026-09-24)",
     ]
 
 
