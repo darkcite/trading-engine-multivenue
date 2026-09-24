@@ -118,6 +118,17 @@ pub fn write_call(
     Ok(o.len())
 }
 
+/// `eth_getCode(addr, "latest")` — a contract's runtime (cold: the
+/// operator's deploy check).
+pub fn write_get_code(dst: &mut [u8], id: u64, addr: &[u8; 20]) -> Result<usize, RpcWriteErr> {
+    let mut o = RpcOut::new(dst);
+    head(&mut o, id, b"eth_getCode")?;
+    o.put(b"\"")?;
+    o.put_hex(addr)?;
+    o.put(b"\",\"latest\"]}")?;
+    Ok(o.len())
+}
+
 #[inline(always)]
 fn too_small(_: RpcWriteErr) -> EvmTxErr {
     EvmTxErr::BufferTooSmall
@@ -401,6 +412,50 @@ pub fn scan_word(buf: &[u8], id: u64) -> Result<[u8; 32], ScanErr> {
     scan_hash(buf, id)
 }
 
+/// A DATA result (`eth_getCode`, a multi-word `eth_call`) decoded into
+/// `out`: `"0x"` plus an even number of hex digits, at most `out.len()`
+/// bytes. Returns the byte count (`"0x"` — no code — is 0). Anything
+/// else refuses; `out` past the count is untouched.
+pub fn scan_data(buf: &[u8], id: u64, out: &mut [u8]) -> Result<usize, ScanErr> {
+    let v = result_of(buf, id)?;
+    if v.1 < v.0 + 4 || buf[v.0] != b'"' || buf[v.1 - 1] != b'"' {
+        return Err(ScanErr::Malformed);
+    }
+    if buf[v.0 + 1] != b'0' || buf[v.0 + 2] != b'x' {
+        return Err(ScanErr::Malformed);
+    }
+    let (s, e) = (v.0 + 3, v.1 - 1);
+    let digits = e - s;
+    if digits % 2 != 0 || digits / 2 > out.len() {
+        return Err(ScanErr::Malformed);
+    }
+    let mut i = 0usize;
+    while i < digits {
+        let (hi, lo) = (nibble(buf[s + i]), nibble(buf[s + i + 1]));
+        if hi > 15 || lo > 15 {
+            return Err(ScanErr::Malformed);
+        }
+        i += 2;
+    }
+    i = 0;
+    while i < digits {
+        out[i / 2] = (nibble(buf[s + i]) << 4) | nibble(buf[s + i + 1]);
+        i += 2;
+    }
+    Ok(digits / 2)
+}
+
+/// A hex digit's value; > 15 for anything else.
+#[inline(always)]
+const fn nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0xff,
+    }
+}
+
 /// The next block's base fee: the LAST entry of `eth_feeHistory`'s
 /// `baseFeePerGas` (an empty or absent array refuses).
 pub fn scan_next_base_fee(buf: &[u8], id: u64) -> Result<u128, ScanErr> {
@@ -679,6 +734,47 @@ mod tests {
     }
 
     #[test]
+    fn get_code_renders_and_its_data_decodes_into_the_callers_buffer() {
+        let mut b = [0u8; 256];
+        let n = write_get_code(&mut b, 9, &[0xe7; 20]).unwrap();
+        assert_eq!(
+            s(&b[..n]),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":9,"method":"eth_getCode","params":["0x{}","latest"]}}"#,
+                "e7".repeat(20)
+            )
+        );
+        let mut out = [0xa5u8; 4];
+        let ok = br#"{"jsonrpc":"2.0","id":9,"result":"0x60A0ff"}"#;
+        assert_eq!(scan_data(ok, 9, &mut out), Ok(3));
+        assert_eq!(out, [0x60, 0xa0, 0xff, 0xa5], "the tail is untouched");
+        let none = br#"{"jsonrpc":"2.0","id":9,"result":"0x"}"#;
+        assert_eq!(scan_data(none, 9, &mut out), Ok(0), "no code");
+        let refused: [&[u8]; 6] = [
+            br#"{"jsonrpc":"2.0","id":9,"result":"0x6"}"#,
+            br#"{"jsonrpc":"2.0","id":9,"result":"0x6g"}"#,
+            br#"{"jsonrpc":"2.0","id":9,"result":"6060"}"#,
+            br#"{"jsonrpc":"2.0","id":9,"result":0}"#,
+            br#"{"jsonrpc":"2.0","id":9,"result":"0x0102030405"}"#,
+            br#"{"jsonrpc":"2.0","id":9,"result":null}"#,
+        ];
+        let mut i = 0;
+        while i < refused.len() {
+            assert_eq!(
+                scan_data(refused[i], 9, &mut out),
+                Err(ScanErr::Malformed),
+                "{}",
+                s(refused[i])
+            );
+            i += 1;
+        }
+        assert_eq!(
+            scan_data(ok, 8, &mut out),
+            Err(ScanErr::IdMismatch { got: 9 })
+        );
+    }
+
+    #[test]
     fn a_view_call_renders_and_its_word_scans() {
         let mut b = [0u8; 256];
         let n = write_call(&mut b, 5, &[0xe7; 20], &[0x8d, 0xa5, 0xcb, 0x5b]).unwrap();
@@ -925,6 +1021,8 @@ mod tests {
             let _ = scan_quantity(&bytes, 1);
             let _ = scan_hash(&bytes, 1);
             let _ = scan_next_base_fee(&bytes, 1);
+            let mut out = [0u8; 64];
+            let _ = scan_data(&bytes, 1, &mut out);
             let _ = classify_send_refusal(&bytes);
         }
 

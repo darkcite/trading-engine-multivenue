@@ -5025,11 +5025,14 @@ and never lifts it — an exposure of unknown size is under no cap.
 ### The EVM write path's interlock
 
 1. **Compiled:** `exec_hyperevm::EVM_ARM_CHAIN_IDS = [998]`,
-   compile-time asserted; `Network` has no mainnet variant, so an arm
-   for chain 999 cannot be constructed.
-2. **Signed:** every transaction is EIP-155 — chain id 998 inside the
-   signed payload, so no signature this engine makes is valid on 999
-   (the node answers "invalid chain ID"; the arm HALTS on that refusal).
+   compile-time asserted — configuration arms testnet only. Since L1
+   (O-HL1) `Network::Mainnet` exists, but `EvmArm::new` refuses it and
+   `EvmArm::new_mainnet` demands a `MainnetAuthority`; nothing in the
+   ENGINE holds one (next section).
+2. **Signed:** every transaction is EIP-155 — the shadow's transactions
+   carry chain id 998 in the signed payload, so no signature the engine makes
+   is valid on 999 (the node answers "invalid chain ID"; the arm HALTS
+   on that refusal).
 3. **At the wire, at boot:** the write endpoint's `eth_chainId` must be
    998 (the arm halts otherwise), and `check_chains(read, write,
    --evm-hybrid)` allows same-chain, or exactly 999 reads → 998 writes
@@ -5054,6 +5057,35 @@ running. Dark bypasses no interlock: an interlock that could not be
 verified is still not passed, because nothing is sent. (A mistyped HOST
 is a DNS failure and therefore dark — it looks like an outage from
 here; the ERROR line names it.)
+
+### Mainnet writes: the operator's verbs only (L1, ruling O-HL1, 2026-09-24)
+
+Live mode (plan §17) will swap on HyperEVM MAINNET. Until L5 lands its
+three switches, the only code that can sign for chain 999 is the
+operator's `evm-live` verbs (`cli::evm_live`, `scripts/evm-live.sh`):
+`deploy`, `wrap`, `swap`, `sweep` — run by hand, never by the engine.
+
+* **The authority.** `exec_hyperevm::MainnetAuthority` is the one proof
+  a mainnet arm accepts. Its only door is `operator_verb(--confirm)`:
+  without `--confirm` the verb refuses before a key is read or a socket
+  opened. `status` only reads (its own connection, no arm, no key).
+* **The wallet (O-HL3).** One key, `HYPEREVM_MAINNET_KEY` (repo `.env`):
+  its address X owns the executor, pays gas and — from L2 — IS slot 0's
+  Hyperliquid account (`HYPERLIQUID_HYPARB_MASTER_ADDR` must equal X
+  when set). X is never slot 3's: a key equal to `HYPERLIQUID_AGENT_KEY`
+  or an X equal to `HYPERLIQUID_MASTER_ADDR` refuses.
+* **The bytes (O-HL2).** `deploy` sends only creation code whose sha256
+  is the pinned H9d hash, then requires the deployed runtime to equal
+  the committed one byte for byte, `owner` slots holding X, and
+  `owner()` = X. `status` repeats the check.
+* **The wire.** The endpoint's `eth_chainId` must be 999 (the arm halts
+  otherwise); `swap` trades only the artifact's `[[pool]]`s, needs an
+  explicit `--min-out-raw > 0`, and refuses a size the executor does
+  not hold; every send is refused unless X can pay its whole gas limit
+  at the fee cap.
+* **What bounds a verb's loss:** the balances the operator funded (the
+  live plan's ≈ $110 minimum) — the verbs have no cap of their own; the
+  P&L bound is live mode's (L3).
 
 ### The shadow is a submission path OUTSIDE the risk gate
 

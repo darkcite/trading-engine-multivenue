@@ -87,6 +87,8 @@ pub struct Node {
     /// …and say so on the last answer (`Connection: close`).
     pub announce_close: bool,
     pub txs: HashMap<[u8; 32], Tx>,
+    /// Every raw transaction received, in order (what was signed).
+    pub raws: Vec<Vec<u8>>,
     /// Methods seen, in order.
     pub seen: Vec<String>,
     /// Connections accepted.
@@ -188,6 +190,7 @@ fn handle(node: &mut Node, req: &str) -> Reply {
         "eth_sendRawTransaction" => {
             let raw = unhex(&p[0]);
             let h = signer_eip712::keccak256(&raw);
+            node.raws.push(raw);
             let next = match (node.script.pop_front(), node.default_accept) {
                 (Some(s), _) => s,
                 (None, Some((from, to))) => SendScript::Accept {

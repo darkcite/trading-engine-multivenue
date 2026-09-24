@@ -2419,9 +2419,63 @@ and the gates live in the vault: `docs/research/hyparb/hyparb-live-plan-2026-09-
 
 | Phase | What |
 |---|---|
-| L1 | The mainnet EVM write path: `Network::Mainnet` (chain 999) constructible only from the live interlock's token, never from config text; boot verifies `eth_chainId`; operator verbs `evm-live status / deploy / wrap / swap / sweep` with an explicit `--confirm`. |
+| L1 | LANDED (§17.4). The mainnet EVM write path: `Network::Mainnet` (chain 999) armed only through a `MainnetAuthority`, never from config text; the endpoint's `eth_chainId` verified; operator verbs `evm-live status / deploy / wrap / swap / sweep`, every mainnet write behind `--confirm`. |
 | L2 | Slot 0's Hyperliquid arm: a second `HlExchange` as the slot's own account (its own budget and anchor files), perp + spot asset binding from `meta` / `spotMeta`, price (5 significant figures) and size (`szDecimals`) rounding, IoC hedges, perp reconciliation. |
 | L3 | `HyparbLive` (`OrderDispatch`): the swap RECEIPT's `Swap` log is the AMM fill (the E-5 analogue); its own halts (reverts, receipt timeouts, recon drift, a daily gas cap) and the combined-equity session bound, judged only when nothing is in flight. |
 | L4 | The router carries per-slot live arms and halt signals; slot 0's fault never halts slot 3. |
 | L5 | Three switches: artifact `mode = "live"` + `exec.toml [exec.slot.0] mode = "live"` + `--arm-live 0`; any one alone refuses. `NEVER_LIVE_SLOTS` lifted for slot 0, `LIVE_ARM_VENUES` gains HyperEvm. |
 | L6 | The mainnet battery (real money, by hand) and the three reviews. R0 follows only after G1 and the operator's word. |
+
+### 17.4 L1 — the mainnet EVM write path and the `evm-live` verbs — LANDED
+
+* **`exec-hyperevm`.**
+  * `Network::Mainnet` (999) exists.
+  * `EVM_ARM_CHAIN_IDS` stays `[998]`: CONFIGURATION arms testnet only,
+    and `arm_network` still refuses 999.
+  * `EvmArm::new` refuses `Network::Mainnet` (`MainnetUnauthorised`).
+    `EvmArm::new_mainnet` demands a `MainnetAuthority`.
+  * The authority's one door today is `operator_verb(--confirm)`. The
+    engine's door lands with L5's three switches.
+  * `rpc` gains `eth_getCode` and a fail-closed `scan_data`, which
+    decodes into the caller's buffer and joins the totality proptest.
+  * `calldata` gains `balanceOf`, `transfer`, `deposit`, `token0`,
+    `token1` and the executor's `sweep`, each pinned to its keccak and
+    to eth-abi bytes.
+* **Loopback (the TLS test node).**
+  * `new` refuses mainnet.
+  * `new_mainnet` against a 999 node signs a swap whose raw transaction
+    carries chain id 999 (read back from the bytes the node received)
+    and mines it.
+  * A mainnet arm on a 998 endpoint HALTS at verify with nothing
+    signed.
+  * The testnet arm's raw bytes carry 998.
+* **`signer-evm`.** C2: the executor's MAINNET creation, exactly as
+  `evm-live deploy` sends it (chain 999, the operator bid at 0.1 gwei),
+  is byte-equal to eth-account 0.14. The type-2 call vectors already
+  covered chain 999 (V2).
+* **`hyparb.toml [mainnet]`.** OPTIONAL in every mode: `endpoint`
+  (https) and `executor` (once deployed). The member ignores it until
+  L5.
+* **`cli::evm_live` + `scripts/evm-live.sh`.**
+  * Mainnet by default. `--network testnet` runs the same verb on
+    `[testnet]`: the dry run.
+  * Every mainnet write is refused without `--confirm`, before a key is
+    read.
+  * `status` only reads, on its own connection.
+  * **The wallet X** (`HYPEREVM_MAINNET_KEY`) must equal
+    `HYPERLIQUID_HYPARB_MASTER_ADDR` when that is set, and is never
+    slot 3's key or master (O-HL3).
+  * **`deploy`** sends only the pinned H9d creation code (sha256
+    `ea4b18f3…75cb`). It then requires the on-chain runtime to be the
+    committed one byte for byte, with X in the `owner` slots, and
+    `owner()` = X.
+  * **`wrap`** is HYPE → WHYPE (`0x5555…5555`, the same system address
+    on 998 and 999) → the executor, and checks the executor's WHYPE
+    rose by exactly the amount.
+  * **`swap`** trades only an artifact `[[pool]]` (on testnet, the
+    `[testnet] pool`). It needs
+    `--min-out-raw > 0` and refuses a size the executor does not hold.
+    A revert is reported, not hidden.
+  * **`sweep`** moves a token from the executor to X.
+  * Every send is refused unless X can pay its whole gas limit at the
+    fee cap.

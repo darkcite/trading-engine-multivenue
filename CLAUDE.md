@@ -173,7 +173,9 @@ in the script; `ai` = 48 is the floor every name includes).
   O-HL1..O-HL5):** paper = testnet, live = HyperEVM mainnet + real HL
   hedges from slot 0's OWN wallet; the P&L stop (+$50 / −$20, combined
   equity) is LIVE-only; the reused H9d executor; real money only after
-  paper's gate G1. Phases L0 (done) … L6. HZ part B is NOT green from
+  paper's gate G1. Phases L0, L1 (done: mainnet writes only as the
+  operator's `scripts/evm-live.sh` verbs behind `--confirm`, a
+  `MainnetAuthority`) … L6. HZ part B is NOT green from
   this Mac (a tx fired at head N lands in N+1 ~56 %): paper AMM fills
   are an upper bound on latency. Slot 0 can NEVER be armed live
   (`exec_boot::NEVER_LIVE_SLOTS`). Its one real write path is the
@@ -424,8 +426,10 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
-  path, TESTNET ONLY (`EVM_ARM_CHAIN_IDS = [998]`, compile-time asserted;
-  `docs/hyparb-build-plan.md` §11, §16.14).
+  path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
+  compile-time asserted); mainnet only through a `MainnetAuthority`
+  (L1: the operator's `evm-live` verbs; `docs/hyparb-build-plan.md` §11,
+  §16.14, §17.4).
 - `crates/cli` — `multivenue-engine` (run / audit-replay / capture-catalog /
   backtest / audit-pnl / exec-smoke …); `paper.rs` = the boot + metrics
   assembly; `exec_boot.rs` = the arming interlock.

@@ -37,6 +37,43 @@ pub const OWNER_SIGNATURE: &str = "owner()";
 /// `keccak256(OWNER_SIGNATURE)[..4]`.
 pub const OWNER_SELECTOR: [u8; 4] = [0x8d, 0xa5, 0xcb, 0x5b];
 
+/// `balanceOf(address)` — an ERC-20's balance view (the operator verbs'
+/// inventory reads).
+pub const BALANCE_OF_SIGNATURE: &str = "balanceOf(address)";
+/// `keccak256(BALANCE_OF_SIGNATURE)[..4]`.
+pub const BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+/// Selector + one address word.
+pub const ADDR_CALLDATA_LEN: usize = 4 + 32;
+
+/// `transfer(address,uint256)` — ERC-20 (the operator funding the
+/// executor with WHYPE).
+pub const TRANSFER_SIGNATURE: &str = "transfer(address,uint256)";
+/// `keccak256(TRANSFER_SIGNATURE)[..4]`.
+pub const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
+
+/// `deposit()` — WHYPE's wrap: the call's value becomes WHYPE held by
+/// the sender.
+pub const DEPOSIT_SIGNATURE: &str = "deposit()";
+/// `keccak256(DEPOSIT_SIGNATURE)[..4]` — the whole calldata.
+pub const DEPOSIT_SELECTOR: [u8; 4] = [0xd0, 0xe3, 0x0d, 0xb0];
+
+/// `token0()` — a pool's first token (immutable in every traded family).
+pub const TOKEN0_SIGNATURE: &str = "token0()";
+/// `keccak256(TOKEN0_SIGNATURE)[..4]`.
+pub const TOKEN0_SELECTOR: [u8; 4] = [0x0d, 0xfe, 0x16, 0x81];
+/// `token1()` — a pool's second token.
+pub const TOKEN1_SIGNATURE: &str = "token1()";
+/// `keccak256(TOKEN1_SIGNATURE)[..4]`.
+pub const TOKEN1_SELECTOR: [u8; 4] = [0xd2, 0x12, 0x20, 0xa7];
+
+/// `sweep(address token, address to, uint256 amount)` — the executor's
+/// owner-only unwind (O-H18).
+pub const SWEEP_SIGNATURE: &str = "sweep(address,address,uint256)";
+/// `keccak256(SWEEP_SIGNATURE)[..4]`.
+pub const SWEEP_SELECTOR: [u8; 4] = [0x62, 0xc0, 0x67, 0x67];
+/// Selector + two address words + an amount word.
+pub const SWEEP_CALLDATA_LEN: usize = 4 + 3 * 32;
+
 /// One executor swap. POD, passed by value across the arm's ring.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -126,6 +163,49 @@ pub fn encode_swap(c: &SwapCall, dst: &mut [u8; SWAP_CALLDATA_LEN]) {
     put_u128(dst, w4, c.min_out);
 }
 
+/// The selector into `dst[..4]`.
+#[inline(always)]
+fn put_selector(dst: &mut [u8], selector: [u8; 4]) {
+    let mut i = 0;
+    while i < 4 {
+        dst[i] = selector[i];
+        i += 1;
+    }
+}
+
+/// An address, left-padded, into the 32-byte word at `w`.
+#[inline(always)]
+fn put_addr_word(dst: &mut [u8], w: usize, a: &[u8; 20]) {
+    let mut i = 0;
+    while i < 12 {
+        dst[w + i] = 0;
+        i += 1;
+    }
+    i = 0;
+    while i < 20 {
+        dst[w + 12 + i] = a[i];
+        i += 1;
+    }
+}
+
+/// A `u128`, as a uint256, into the 32-byte word at `w`.
+#[inline(always)]
+fn put_amount_word(dst: &mut [u8], w: usize, v: u128) {
+    let mut i = 0;
+    while i < 16 {
+        dst[w + i] = 0;
+        dst[w + 16 + i] = (v >> (8 * (15 - i))) as u8;
+        i += 1;
+    }
+}
+
+/// Render `selector(address a)` into `dst` (every byte written).
+#[inline]
+pub fn encode_addr(selector: [u8; 4], a: &[u8; 20], dst: &mut [u8; ADDR_CALLDATA_LEN]) {
+    put_selector(dst, selector);
+    put_addr_word(dst, 4, a);
+}
+
 /// Render `selector(address to, uint256 amount)` into `dst` (every byte
 /// written).
 #[inline]
@@ -135,27 +215,24 @@ pub fn encode_addr_amount(
     amount: u128,
     dst: &mut [u8; ADDR_AMOUNT_CALLDATA_LEN],
 ) {
-    let mut i = 0;
-    while i < 4 {
-        dst[i] = selector[i];
-        i += 1;
-    }
-    i = 0;
-    while i < 12 {
-        dst[4 + i] = 0;
-        i += 1;
-    }
-    i = 0;
-    while i < 20 {
-        dst[16 + i] = to[i];
-        i += 1;
-    }
-    i = 0;
-    while i < 16 {
-        dst[36 + i] = 0;
-        dst[52 + i] = (amount >> (8 * (15 - i))) as u8;
-        i += 1;
-    }
+    put_selector(dst, selector);
+    put_addr_word(dst, 4, to);
+    put_amount_word(dst, 36, amount);
+}
+
+/// Render the executor's `sweep(token, to, amount)` into `dst` (every
+/// byte written).
+#[inline]
+pub fn encode_sweep(
+    token: &[u8; 20],
+    to: &[u8; 20],
+    amount: u128,
+    dst: &mut [u8; SWEEP_CALLDATA_LEN],
+) {
+    put_selector(dst, SWEEP_SELECTOR);
+    put_addr_word(dst, 4, token);
+    put_addr_word(dst, 36, to);
+    put_amount_word(dst, 68, amount);
 }
 
 #[cfg(test)]
@@ -223,6 +300,57 @@ mod tests {
         assert_eq!(
             hex(&dst),
             "40c10f190000000000000000000000006c9a33e3b592c0d65b3ba59355d5be0d3825928500000000000000000000000000000000000000000000d3c21bcecceda1000005"
+        );
+    }
+
+    #[test]
+    fn every_operator_selector_is_its_signatures_keccak() {
+        let sigs = [
+            (BALANCE_OF_SIGNATURE, BALANCE_OF_SELECTOR),
+            (TRANSFER_SIGNATURE, TRANSFER_SELECTOR),
+            (DEPOSIT_SIGNATURE, DEPOSIT_SELECTOR),
+            (TOKEN0_SIGNATURE, TOKEN0_SELECTOR),
+            (TOKEN1_SIGNATURE, TOKEN1_SELECTOR),
+            (SWEEP_SIGNATURE, SWEEP_SELECTOR),
+        ];
+        let mut i = 0;
+        while i < sigs.len() {
+            let h = signer_eip712::keccak256(sigs[i].0.as_bytes());
+            assert_eq!(h[..4], sigs[i].1, "{}", sigs[i].0);
+            i += 1;
+        }
+    }
+
+    /// Byte-equal to `eth_abi.encode` (eth-abi 5, generated 2026-09-24).
+    #[test]
+    fn sweep_balance_of_and_transfer_match_eth_abi() {
+        let x = {
+            let s = "2c7536e3605d9c16a7a3d7b1898e529396a65c23";
+            let mut a = [0u8; 20];
+            let mut i = 0;
+            while i < 20 {
+                a[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+                i += 1;
+            }
+            a
+        };
+        let mut sw = [0xa5u8; SWEEP_CALLDATA_LEN];
+        encode_sweep(&pool(), &x, 123_456_789_012_345_678_901_234_567, &mut sw);
+        assert_eq!(
+            hex(&sw),
+            "62c067670000000000000000000000006c9a33e3b592c0d65b3ba59355d5be0d382592850000000000000000000000002c7536e3605d9c16a7a3d7b1898e529396a65c23000000000000000000000000000000000000000000661efdf158f2a82c9f4b87"
+        );
+        let mut b = [0xa5u8; ADDR_CALLDATA_LEN];
+        encode_addr(BALANCE_OF_SELECTOR, &x, &mut b);
+        assert_eq!(
+            hex(&b),
+            "70a082310000000000000000000000002c7536e3605d9c16a7a3d7b1898e529396a65c23"
+        );
+        let mut t = [0xa5u8; ADDR_AMOUNT_CALLDATA_LEN];
+        encode_addr_amount(TRANSFER_SELECTOR, &pool(), u128::MAX, &mut t);
+        assert_eq!(
+            hex(&t),
+            "a9059cbb0000000000000000000000006c9a33e3b592c0d65b3ba59355d5be0d3825928500000000000000000000000000000000ffffffffffffffffffffffffffffffff"
         );
     }
 

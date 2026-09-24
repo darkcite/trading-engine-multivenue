@@ -141,6 +141,75 @@ enum Cmd {
     /// key from the environment and never opens `.env` —
     /// `scripts/evm-testnet.sh` sources it. Report on stdout.
     EvmTestnet(EvmTestnetArgs),
+    /// HYPARB L1 (ruling O-HL1): the HyperEVM MAINNET operator verbs —
+    /// `status` (read-only), `deploy` (the H9d executor, bytes checked
+    /// on chain), `wrap` (HYPE → WHYPE → the executor), `swap` (one
+    /// executor swap on an artifact pool), `sweep` (executor → the
+    /// wallet). Every mainnet WRITE needs `--confirm`; `--network
+    /// testnet` runs the same verb on chain 998 against `[testnet]`.
+    /// Reads keys from the environment and never opens `.env` —
+    /// `scripts/evm-live.sh` sources it. Report on stdout.
+    EvmLive(EvmLiveArgs),
+}
+
+/// `evm-live` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LiveVerb {
+    /// Chain, wallet X, and the executor's code, owner and balances.
+    Status,
+    /// Deploy the H9d executor from X.
+    Deploy,
+    /// Wrap `--amount-wei` HYPE into WHYPE and hand it to the executor.
+    Wrap,
+    /// One executor swap: `--pool`, `--zero-for-one`, `--amount-raw`,
+    /// `--min-out-raw`.
+    Swap,
+    /// The executor returns `--amount-raw` of `--token` to X.
+    Sweep,
+}
+
+/// `evm-live --network`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum LiveNetArg {
+    /// Chain 999 — real money.
+    Mainnet,
+    /// Chain 998 — the dry run.
+    Testnet,
+}
+
+#[derive(Debug, Parser)]
+struct EvmLiveArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: LiveVerb,
+    /// The chain. MAINNET unless stated.
+    #[arg(long, value_enum, default_value = "mainnet")]
+    network: LiveNetArg,
+    /// The artifact whose `[mainnet]` / `[testnet]` block to use
+    /// (default `~/multivenue/hyparb.toml`).
+    #[arg(long)]
+    hyparb: Option<PathBuf>,
+    /// Required by every mainnet write: this send spends real money.
+    #[arg(long, default_value_t = false)]
+    confirm: bool,
+    /// `wrap`: HYPE to wrap and hand to the executor, wei.
+    #[arg(long)]
+    amount_wei: Option<u128>,
+    /// `swap`: exact input; `sweep`: the amount returned. Raw units.
+    #[arg(long)]
+    amount_raw: Option<u128>,
+    /// `swap`: the least output accepted, raw units (> 0).
+    #[arg(long)]
+    min_out_raw: Option<u128>,
+    /// `swap`: the pool (one of the artifact's `[[pool]]`s).
+    #[arg(long)]
+    pool: Option<String>,
+    /// `swap`: token0 in (true) or token1 in (false).
+    #[arg(long)]
+    zero_for_one: Option<bool>,
+    /// `sweep`: the token; `status`: extra executor balances (repeatable).
+    #[arg(long)]
+    token: Vec<String>,
 }
 
 /// `evm-testnet` verbs.
@@ -970,6 +1039,107 @@ fn main() -> ExitCode {
         Cmd::EvmTestnet(args) => {
             init_tracing_stderr();
             evm_testnet(args)
+        }
+        Cmd::EvmLive(args) => {
+            init_tracing_stderr();
+            evm_live(args)
+        }
+    }
+}
+
+/// HYPARB L1: the `evm-live` verbs. Exit 0 only when the verb did what
+/// it says (`status`: every check held; `swap`: mined without a revert).
+fn evm_live(args: EvmLiveArgs) -> ExitCode {
+    use cli::evm_live as el;
+    let net = match args.network {
+        LiveNetArg::Mainnet => el::LiveNet::Mainnet,
+        LiveNetArg::Testnet => el::LiveNet::Testnet,
+    };
+    let write = args.verb != LiveVerb::Status;
+    // O-HL1: a mainnet write's authority is the operator's --confirm.
+    let auth = if write && net == el::LiveNet::Mainnet {
+        match exec_hyperevm::MainnetAuthority::operator_verb(args.confirm) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("evm-live: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let path = match args.hyparb.clone() {
+        Some(p) => p,
+        None => match core_config::hyparb::default_hyparb_path() {
+            Ok(p) => PathBuf::from(p),
+            Err(e) => {
+                eprintln!("evm-live: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let target = match core_config::hyparb::load(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|(f, _)| el::Target::from_file(&f, net))
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("evm-live: {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let mut tokens = Vec::with_capacity(args.token.len());
+    let mut i = 0usize;
+    while i < args.token.len() {
+        match cli::evm_testnet::parse_addr(&args.token[i]) {
+            Ok(a) => tokens.push(a),
+            Err(e) => {
+                eprintln!("evm-live: --token {e}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let tls = TlsTransport::default_client_config();
+    let a = auth.as_ref();
+    let out = match args.verb {
+        LiveVerb::Status => el::verb_status(&target, &tokens, tls),
+        LiveVerb::Deploy => el::verb_deploy(&target, a, tls).map(|r| (r, true)),
+        LiveVerb::Wrap => match args.amount_wei {
+            Some(w) => el::verb_wrap(&target, a, w, tls).map(|r| (r, true)),
+            None => Err("wrap needs --amount-wei".to_owned()),
+        },
+        LiveVerb::Swap => match (
+            args.pool.as_deref().map(cli::evm_testnet::parse_addr),
+            args.zero_for_one,
+            args.amount_raw,
+            args.min_out_raw,
+        ) {
+            (Some(Ok(pool)), Some(z), Some(amt), Some(min)) => {
+                el::verb_swap(&target, a, pool, z, amt, min, tls)
+            }
+            (Some(Err(e)), ..) => Err(format!("--pool {e}")),
+            _ => Err(
+                "swap needs --pool, --zero-for-one, --amount-raw and --min-out-raw".to_owned(),
+            ),
+        },
+        LiveVerb::Sweep => match (tokens.as_slice(), args.amount_raw) {
+            ([tok], Some(amt)) => el::verb_sweep(&target, a, *tok, amt, tls).map(|r| (r, true)),
+            _ => Err("sweep needs exactly one --token and --amount-raw".to_owned()),
+        },
+    };
+    match out {
+        Ok((report, ok)) => {
+            print!("{report}");
+            if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("evm-live: {e}");
+            ExitCode::from(1)
         }
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! # exec-hyperevm (HYPARB H7c) — the HyperEVM write path, TESTNET ONLY
+//! # exec-hyperevm (HYPARB H7c, L1) — the HyperEVM write path
 //!
 //! Everything between a decided AMM swap and a reconciled receipt:
 //!
@@ -17,19 +17,27 @@
 //!   over one keep-alive HTTPS connection ([`core_net::HttpsPost`]),
 //!   and reconcile every receipt against what was signed.
 //!
-//! ## The interlock (plan §11.4 layer 4, O-H5)
+//! ## The interlock (plan §11.4 layer 4; O-H5, then O-HL1)
 //!
-//! [`EVM_ARM_CHAIN_IDS`] is the compiled capability list, mirroring
+//! **Configuration arms TESTNET only.** [`EVM_ARM_CHAIN_IDS`] is the
+//! list a chain id read from configuration may arm, mirroring
 //! `exec_boot::LIVE_ARM_VENUES`: **998 and nothing else**, held there by
-//! a compile-time assertion. [`Network`] has no mainnet variant, so an
-//! arm for chain 999 cannot be constructed; [`arm_network`] refuses the
-//! id from configuration, and the arm refuses an endpoint whose
-//! `eth_chainId` disagrees. Deleting the assertion is the moment the
-//! engine becomes able to spend mainnet gas — a phase after H9 says so
-//! in writing, or it does not happen. [`check_chains`] is layer 5 plus
-//! the O-H12 hybrid: market data and writes on the same chain, or reads
-//! on 999 with writes on 998 when (and only when) the hybrid switch is
-//! set — never the inverse.
+//! a compile-time assertion; [`arm_network`] refuses anything else.
+//!
+//! **HyperEVM MAINNET is reached only through a [`MainnetAuthority`]**
+//! (ruling O-HL1, 2026-09-24, plan §17). [`arm::EvmArm::new`] refuses
+//! [`Network::Mainnet`]; [`arm::EvmArm::new_mainnet`] demands the
+//! authority, and the authority has one door per path allowed to spend
+//! mainnet gas — each a named constructor, so every such path is one
+//! grep away. Today the only door is [`MainnetAuthority::operator_verb`]:
+//! an operator verb run by hand with `--confirm` (`cli::evm_live`). The
+//! armed engine's door lands with its three switches (plan §17.3 L5).
+//!
+//! Whatever the network, the arm refuses an endpoint whose `eth_chainId`
+//! disagrees with the chain it signs for. [`check_chains`] is layer 5
+//! plus the O-H12 hybrid for the testnet shadow: market data and writes
+//! on the same chain, or reads on 999 with writes on 998 when (and only
+//! when) the hybrid switch is set — never the inverse.
 //!
 //! ## Doctrine
 //!
@@ -70,18 +78,21 @@ pub const HYPEREVM_MAINNET_CHAIN_ID: u64 = 999;
 /// HyperEVM testnet.
 pub const HYPEREVM_TESTNET_CHAIN_ID: u64 = 998;
 
-/// **O-H5.** The chain ids the write path may sign for. Testnet only,
-/// until a phase after H9 says otherwise in writing.
+/// **O-H5.** The chain ids CONFIGURATION may arm: testnet only. Mainnet
+/// is never chosen by configuration text — it needs a
+/// [`MainnetAuthority`] (O-HL1).
 pub const EVM_ARM_CHAIN_IDS: &[u64] = &[HYPEREVM_TESTNET_CHAIN_ID];
 const _: () = assert!(EVM_ARM_CHAIN_IDS.len() == 1 && EVM_ARM_CHAIN_IDS[0] == 998);
 
-/// The networks the write path can name. **Mainnet is deliberately
-/// absent** — an arm for chain 999 is not expressible.
+/// The networks the write path can name.
 #[repr(u64)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Network {
     /// HyperEVM testnet, chain 998.
     Testnet = HYPEREVM_TESTNET_CHAIN_ID,
+    /// HyperEVM mainnet, chain 999 — armed only through a
+    /// [`MainnetAuthority`] ([`arm::EvmArm::new_mainnet`]).
+    Mainnet = HYPEREVM_MAINNET_CHAIN_ID,
 }
 
 impl Network {
@@ -93,6 +104,28 @@ impl Network {
     }
 }
 
+/// The proof that a HyperEVM MAINNET write path was authorised (ruling
+/// O-HL1). Configuration never yields one; each constructor is one door,
+/// named for the path it authorises. Not `Clone`: it is lent, never
+/// copied.
+#[derive(Debug)]
+pub struct MainnetAuthority {
+    _sealed: (),
+}
+
+impl MainnetAuthority {
+    /// An operator verb run by hand (`multivenue-engine evm-live …`): the
+    /// operator's `--confirm` on the command line IS the authority, and
+    /// without it nothing is signed.
+    pub fn operator_verb(confirmed: bool) -> Result<Self, ChainRefusal> {
+        if confirmed {
+            Ok(Self { _sealed: () })
+        } else {
+            Err(ChainRefusal::Unconfirmed)
+        }
+    }
+}
+
 /// Why a chain configuration was refused.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ChainRefusal {
@@ -101,6 +134,8 @@ pub enum ChainRefusal {
         /// The refused chain id.
         chain_id: u64,
     },
+    /// A mainnet write without the operator's `--confirm`.
+    Unconfirmed,
     /// The market-data and write chains disagree outside the one
     /// hybrid the switch permits (or the switch is set without it).
     Mismatch {
@@ -118,14 +153,18 @@ impl core::fmt::Display for ChainRefusal {
         match *self {
             Self::NotArmable { chain_id } => write!(
                 f,
-                "evm write path: chain id {chain_id}{} is not in EVM_ARM_CHAIN_IDS [998] — the \
-                 write path is TESTNET ONLY (O-H5); a mainnet chain id needs a phase after H9 \
-                 that says so in writing",
+                "evm write path: chain id {chain_id}{} is not in EVM_ARM_CHAIN_IDS [998] — \
+                 configuration arms TESTNET ONLY (O-H5); HyperEVM mainnet is reached only \
+                 through a MainnetAuthority (O-HL1), never from configuration",
                 if chain_id == HYPEREVM_MAINNET_CHAIN_ID {
                     " (HYPEREVM MAINNET)"
                 } else {
                     ""
                 }
+            ),
+            Self::Unconfirmed => f.write_str(
+                "evm write path: a HyperEVM MAINNET write needs the operator's --confirm \
+                 (O-HL1) — it spends real money",
             ),
             Self::Mismatch {
                 read,
@@ -192,7 +231,9 @@ mod tests {
         assert_eq!(e, ChainRefusal::NotArmable { chain_id: 999 });
         let s = e.to_string();
         assert!(
-            s.contains("HYPEREVM MAINNET") && s.contains("TESTNET ONLY"),
+            s.contains("HYPEREVM MAINNET")
+                && s.contains("TESTNET ONLY")
+                && s.contains("MainnetAuthority"),
             "{s}"
         );
         assert_eq!(
@@ -201,6 +242,19 @@ mod tests {
         );
         assert_eq!(arm_network(998), Ok(Network::Testnet));
         assert_eq!(Network::Testnet.chain_id(), 998);
+        assert_eq!(Network::Mainnet.chain_id(), 999);
+    }
+
+    /// O-HL1: the operator door opens only on `--confirm`.
+    #[test]
+    fn the_operator_door_needs_the_confirm() {
+        assert_eq!(
+            MainnetAuthority::operator_verb(false).unwrap_err(),
+            ChainRefusal::Unconfirmed
+        );
+        assert!(MainnetAuthority::operator_verb(true).is_ok());
+        let s = ChainRefusal::Unconfirmed.to_string();
+        assert!(s.contains("--confirm") && s.contains("real money"), "{s}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ use crate::rpc::{
     write_balance, write_call, write_chain_id, write_fee_history, write_receipt, write_send_raw,
     write_tx_count, BlockTag, Receipt, ScanErr, SendRefusal,
 };
-use crate::Network;
+use crate::{MainnetAuthority, Network};
 
 /// Request-body buffer: a creation's init code (the executor is 2.3 KB,
 /// 4.7 KB as hex) plus the envelope, with room.
@@ -64,6 +64,9 @@ pub enum ArmBootErr {
     DuplicateWallet,
     /// The HTTPS client's body window is under [`MAX_BODY`].
     BodyWindow,
+    /// [`Network::Mainnet`] through [`EvmArm::new`]: mainnet needs a
+    /// [`MainnetAuthority`] ([`EvmArm::new_mainnet`], O-HL1).
+    MainnetUnauthorised,
 }
 
 impl core::fmt::Display for ArmBootErr {
@@ -73,6 +76,9 @@ impl core::fmt::Display for ArmBootErr {
             Self::BadKey => "evm arm: a wallet key is not a valid secp256k1 secret",
             Self::DuplicateWallet => "evm arm: two keys resolve to one address",
             Self::BodyWindow => "evm arm: the https client's body window is under MAX_BODY",
+            Self::MainnetUnauthorised => {
+                "evm arm: HyperEVM MAINNET needs a MainnetAuthority (EvmArm::new_mainnet, O-HL1)"
+            }
         })
     }
 }
@@ -336,10 +342,33 @@ pub struct EvmArm {
 }
 
 impl EvmArm {
-    /// Build the arm. **Boot-only** (the allocations live here). Keys
-    /// stay in their mlock'd pages; each is parsed once into the signer's
-    /// key type, as `exec-hyperliquid` does. No request is made.
+    /// Build a TESTNET arm. **Boot-only** (the allocations live here).
+    /// Keys stay in their mlock'd pages; each is parsed once into the
+    /// signer's key type, as `exec-hyperliquid` does. No request is made.
+    /// [`Network::Mainnet`] is refused: mainnet is [`Self::new_mainnet`].
     pub fn new(
+        http: HttpsPost,
+        network: Network,
+        keys: &[core_config::SecretKeyBytes],
+    ) -> Result<Self, ArmBootErr> {
+        if network == Network::Mainnet {
+            return Err(ArmBootErr::MainnetUnauthorised);
+        }
+        Self::build(http, network, keys)
+    }
+
+    /// Build a HyperEVM MAINNET arm (O-HL1): the only constructor that
+    /// signs for chain 999, and it takes the [`MainnetAuthority`] as
+    /// proof that a door allowed it. Boot-only, as [`Self::new`].
+    pub fn new_mainnet(
+        http: HttpsPost,
+        _authority: &MainnetAuthority,
+        keys: &[core_config::SecretKeyBytes],
+    ) -> Result<Self, ArmBootErr> {
+        Self::build(http, Network::Mainnet, keys)
+    }
+
+    fn build(
         http: HttpsPost,
         network: Network,
         keys: &[core_config::SecretKeyBytes],
@@ -628,7 +657,7 @@ impl EvmArm {
     }
 
     /// Deploy `init_code` from wallet `w` (cold path — the executor's
-    /// testnet deployer). The deployed address is
+    /// deployer, `evm-testnet` / `evm-live deploy`). The deployed address is
     /// `signer_evm::create_address(address(w), nonce)`; the receipt's
     /// `contract` is reconciled against it.
     #[allow(clippy::too_many_arguments)]

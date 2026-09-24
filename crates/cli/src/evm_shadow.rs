@@ -242,21 +242,33 @@ pub struct ShadowTarget {
 /// on the swap's side), any positive output.
 #[must_use]
 pub fn shadow_swap(d: &HyparbDecision, t: &ShadowTarget) -> SwapCall {
-    let zero_for_one = d.buy == 0;
+    open_limit_swap(t.pool, d.buy == 0, t.amount_raw, 1)
+}
+
+/// An exact-input swap of `amount_raw` on `pool` whose price limit is the
+/// pool's own bound (just inside `MIN/MAX_SQRT_RATIO`): only `min_out`
+/// bounds the price — the executor reverts `BelowMinOut` under it.
+#[inline]
+pub fn open_limit_swap(
+    pool: [u8; 20],
+    zero_for_one: bool,
+    amount_raw: u128,
+    min_out: u128,
+) -> SwapCall {
     SwapCall {
-        amount_specified: t.amount_raw as i128,
+        amount_specified: amount_raw as i128,
         sqrt_limit_lo: if zero_for_one {
             core_amm::MIN_SQRT_LO + 1
         } else {
             core_amm::MAX_SQRT_LO - 1
         },
-        min_out: 1,
+        min_out,
         sqrt_limit_hi: if zero_for_one {
             0
         } else {
             core_amm::MAX_SQRT_HI
         },
-        pool: t.pool,
+        pool,
         zero_for_one,
     }
 }

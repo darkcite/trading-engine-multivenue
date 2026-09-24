@@ -23,6 +23,7 @@
 //! | timeout | no receipt → quarantine → a settled sync re-arms the wallet |
 //! | foreign receipt | a receipt from another sender HALTS |
 //! | wrong chain | the endpoint serves 999 → HALT at verify |
+//! | mainnet (O-HL1) | `new` refuses mainnet; `new_mainnet` with the authority signs chain 999; a mainnet arm on a 998 endpoint HALTS |
 //! | creation | the deployed address is reconciled against the receipt |
 //! | refusals | nonce too low quarantines; insufficient funds parks the wallet |
 //!
@@ -36,7 +37,7 @@ use exec_hyperevm::gas::GasBid;
 use exec_hyperevm::nonce::WalletState;
 use exec_hyperevm::rpc::SendRefusal;
 use exec_hyperevm::testnode::{boot, Node, SendScript};
-use exec_hyperevm::Network;
+use exec_hyperevm::{MainnetAuthority, Network};
 use rustls::ClientConfig;
 
 const EXECUTOR: [u8; 20] = [0xe7; 20];
@@ -342,6 +343,86 @@ fn an_endpoint_on_another_chain_halts_at_verify() {
         a.send_swap(0, &EXECUTOR, &swap(), BID, 1, S),
         SendOutcome::Halted
     );
+}
+
+/// The chain id an EIP-1559 raw transaction was signed for (the first
+/// field of its RLP list, which follows the `0x02` type byte).
+fn signed_chain_id(raw: &[u8]) -> u64 {
+    assert_eq!(raw[0], 0x02, "type-2");
+    let h = raw[1];
+    let at = if h >= 0xf8 { 2 + (h - 0xf7) as usize } else { 2 };
+    let b = raw[at];
+    if b < 0x80 {
+        return b as u64;
+    }
+    let n = (b - 0x80) as usize;
+    let mut v = 0u64;
+    let mut i = 0;
+    while i < n {
+        v = (v << 8) | raw[at + 1 + i] as u64;
+        i += 1;
+    }
+    v
+}
+
+#[test]
+fn mainnet_is_refused_without_the_authority_and_signs_999_with_it() {
+    let cfg = core_net::TlsTransport::default_client_config();
+    let mk = || core_net::HttpsPost::new("127.0.0.1", 1, "/", cfg.clone(), MAX_BODY, 64).unwrap();
+    assert_eq!(
+        EvmArm::new(mk(), Network::Mainnet, &[key(0)]).err(),
+        Some(exec_hyperevm::arm::ArmBootErr::MainnetUnauthorised),
+        "O-HL1: the testnet constructor never arms mainnet"
+    );
+    let mut n = node(1);
+    n.chain_id = 999;
+    let (port, cfg, node) = boot_node(n);
+    let http =
+        core_net::HttpsPost::new("localhost", port, "/evm", cfg, MAX_BODY, MAX_RESP).expect("http");
+    let auth = MainnetAuthority::operator_verb(true).expect("confirmed");
+    let mut a = EvmArm::new_mainnet(http, &auth, &[key(0)]).expect("arm");
+    assert_eq!(a.network(), Network::Mainnet);
+    a.verify_chain().expect("chain 999");
+    a.sync(0).expect("sync");
+    node.lock().unwrap().script.push_back(accept(addr(0)));
+    let out = a.send_swap(0, &EXECUTOR, &swap(), BID, 7, S);
+    assert!(matches!(out, SendOutcome::Sent { .. }), "{out:?}");
+    let raw = node.lock().unwrap().raws[0].clone();
+    assert_eq!(signed_chain_id(&raw), 999, "signed for mainnet");
+    node.lock().unwrap().mine_all();
+    assert!(matches!(a.poll(0, 2 * S), PollOutcome::Mined { tag: 7, .. }));
+}
+
+#[test]
+fn a_mainnet_arm_on_a_testnet_endpoint_halts_at_verify() {
+    let (port, cfg, node) = boot_node(node(1));
+    let http =
+        core_net::HttpsPost::new("localhost", port, "/evm", cfg, MAX_BODY, MAX_RESP).expect("http");
+    let auth = MainnetAuthority::operator_verb(true).expect("confirmed");
+    let mut a = EvmArm::new_mainnet(http, &auth, &[key(0)]).expect("arm");
+    assert_eq!(
+        a.verify_chain(),
+        Err(exec_hyperevm::arm::ArmErr::ChainMismatch { got: 998 })
+    );
+    assert_eq!(a.halted(), Some(HaltCause::ChainMismatch { got: 998 }));
+    a.sync(0).expect("reads still work");
+    assert_eq!(
+        a.send_swap(0, &EXECUTOR, &swap(), BID, 1, S),
+        SendOutcome::Halted
+    );
+    assert!(node.lock().unwrap().raws.is_empty(), "nothing was signed");
+}
+
+#[test]
+fn a_testnet_swap_is_signed_for_998() {
+    let (port, cfg, node) = boot_node(node(1));
+    let mut a = arm(port, cfg, 1);
+    a.verify_chain().expect("chain 998");
+    a.sync(0).expect("sync");
+    node.lock().unwrap().script.push_back(accept(addr(0)));
+    let out = a.send_swap(0, &EXECUTOR, &swap(), BID, 1, S);
+    assert!(matches!(out, SendOutcome::Sent { .. }), "{out:?}");
+    assert_eq!(signed_chain_id(&node.lock().unwrap().raws[0]), 998);
 }
 
 #[test]

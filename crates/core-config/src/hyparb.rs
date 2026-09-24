@@ -19,7 +19,11 @@
 //!   endpoint, wallet count and TESTNET targets (the executor, the pool
 //!   the shadow swaps, the swap size). Optional in `mode = "paper"` (the
 //!   `evm-testnet` operator tool reads it); `mode = "testnet"` requires
-//!   it with every target set.
+//!   it with every target set;
+//! * `[mainnet]` — at most once (HYPARB L1, ruling O-HL1): the HyperEVM
+//!   MAINNET endpoint and, once deployed, the executor. Read by the
+//!   `evm-live` operator verbs; the member ignores it (live mode lands
+//!   with plan §17.3 L5).
 //!
 //! **Laws** (inherited, all FATAL, all naming `hyparb.toml` and the line):
 //! integers only — a float anywhere refuses · an unknown key or section
@@ -124,6 +128,9 @@ const POOL_KEYS: [&str; 5] = ["address", "coin0", "coin1", "trade", "max_notiona
 /// and REQUIRED by `mode = "testnet"`).
 const TESTNET_KEYS: [&str; 5] = ["endpoint", "wallets", "executor", "pool", "amount_raw"];
 
+/// `[mainnet]` keys (`executor` OPTIONAL: absent until `evm-live deploy`).
+const MAINNET_KEYS: [&str; 2] = ["endpoint", "executor"];
+
 /// Wallets the write path may drive (mirrors
 /// `exec_hyperevm::nonce::MAX_WALLETS`, const-asserted in the cli).
 pub const HYPARB_MAX_WALLETS: i64 = 8;
@@ -195,6 +202,16 @@ pub struct HyparbTestnet {
     pub amount_raw: Option<i64>,
 }
 
+/// `[mainnet]` — the HyperEVM MAINNET endpoint and executor (O-HL1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HyparbMainnet {
+    /// The chain-999 JSON-RPC endpoint, `https://…`.
+    pub endpoint: String,
+    /// The deployed H9d executor on chain 999 (owned by the slot's wallet),
+    /// if deployed yet.
+    pub executor: Option<String>,
+}
+
 /// `hyparb.toml` as parsed and bound-checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HyparbFile {
@@ -240,6 +257,8 @@ pub struct HyparbFile {
     pub pools: Vec<HyparbPool>,
     /// `[testnet]`, if present.
     pub testnet: Option<HyparbTestnet>,
+    /// `[mainnet]`, if present.
+    pub mainnet: Option<HyparbMainnet>,
 }
 
 /// Read + parse. Returns the bytes too so the caller hashes the EXACT
@@ -454,6 +473,7 @@ fn finish_hyparb(kv: &Kv) -> Result<HyparbFile, HyparbError> {
         coins: Vec::new(),
         pools: Vec::new(),
         testnet: None,
+        mainnet: None,
     })
 }
 
@@ -518,31 +538,48 @@ fn finish_pool(kv: &Kv, ln: usize) -> Result<HyparbPool, HyparbError> {
     })
 }
 
+/// `endpoint` of an EVM block: an https URL.
+fn https_endpoint(kv: &Kv, block: &str) -> Result<String, HyparbError> {
+    let endpoint = string(kv, "endpoint", block)?;
+    if !endpoint.starts_with("https://") {
+        return Err(err(format!(
+            "{block}: `endpoint` must be an https:// URL (got \"{endpoint}\")"
+        )));
+    }
+    Ok(endpoint)
+}
+
+/// An OPTIONAL address key of an EVM block.
+fn opt_address(kv: &Kv, key: &str, block: &str) -> Result<Option<String>, HyparbError> {
+    match opt_string(kv, key)? {
+        Some(a) if !valid_address(&a) => Err(err(format!(
+            "{block}: `{key}` must be 0x + 40 lowercase hex (got \"{a}\")"
+        ))),
+        v => Ok(v),
+    }
+}
+
+fn finish_mainnet(kv: &Kv) -> Result<HyparbMainnet, HyparbError> {
+    const B: &str = "[mainnet]";
+    check_keys(kv, &MAINNET_KEYS, B)?;
+    Ok(HyparbMainnet {
+        endpoint: https_endpoint(kv, B)?,
+        executor: opt_address(kv, "executor", B)?,
+    })
+}
+
 fn finish_testnet(kv: &Kv) -> Result<HyparbTestnet, HyparbError> {
     const B: &str = "[testnet]";
     check_keys(kv, &TESTNET_KEYS, B)?;
-    let endpoint = string(kv, "endpoint", B)?;
-    if !endpoint.starts_with("https://") {
-        return Err(err(format!(
-            "`endpoint` must be an https:// URL (got \"{endpoint}\")"
-        )));
-    }
+    let endpoint = https_endpoint(kv, B)?;
     let wallets = int(kv, "wallets", B)?;
     if !(1..=HYPARB_MAX_WALLETS).contains(&wallets) {
         return Err(err(format!(
             "`wallets` must be 1..={HYPARB_MAX_WALLETS} (got {wallets})"
         )));
     }
-    let addr = |key: &str| -> Result<Option<String>, HyparbError> {
-        match opt_string(kv, key)? {
-            Some(a) if !valid_address(&a) => Err(err(format!(
-                "{B}: `{key}` must be 0x + 40 lowercase hex (got \"{a}\")"
-            ))),
-            v => Ok(v),
-        }
-    };
-    let executor = addr("executor")?;
-    let pool = addr("pool")?;
+    let executor = opt_address(kv, "executor", B)?;
+    let pool = opt_address(kv, "pool", B)?;
     let amount_raw = opt_int(kv, "amount_raw")?;
     if let Some(v) = amount_raw {
         if v <= 0 {
@@ -567,10 +604,12 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
         Coin(usize),
         Pool(usize),
         Testnet,
+        Mainnet,
     }
     let mut sec = Sec::None;
     let mut head: Option<Kv> = None;
     let mut testnet: Option<Kv> = None;
+    let mut mainnet: Option<Kv> = None;
     let mut cur: Kv = Vec::new();
     let mut coins: Vec<HyparbCoin> = Vec::new();
     let mut pools: Vec<HyparbPool> = Vec::new();
@@ -579,6 +618,7 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
                  cur: &mut Kv,
                  head: &mut Option<Kv>,
                  testnet: &mut Option<Kv>,
+                 mainnet: &mut Option<Kv>,
                  coins: &mut Vec<HyparbCoin>,
                  pools: &mut Vec<HyparbPool>|
      -> Result<(), HyparbError> {
@@ -586,6 +626,7 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
             Sec::None => {}
             Sec::Hyparb => *head = Some(std::mem::take(cur)),
             Sec::Testnet => *testnet = Some(std::mem::take(cur)),
+            Sec::Mainnet => *mainnet = Some(std::mem::take(cur)),
             Sec::Coin(l) => coins.push(finish_coin(cur, l)?),
             Sec::Pool(l) => pools.push(finish_pool(cur, l)?),
         }
@@ -605,6 +646,7 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
                 &mut cur,
                 &mut head,
                 &mut testnet,
+                &mut mainnet,
                 &mut coins,
                 &mut pools,
             )?;
@@ -620,6 +662,12 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
                         return Err(err(format!("line {ln}: duplicate `[testnet]`")));
                     }
                     Sec::Testnet
+                }
+                "[mainnet]" => {
+                    if mainnet.is_some() || sec == Sec::Mainnet {
+                        return Err(err(format!("line {ln}: duplicate `[mainnet]`")));
+                    }
+                    Sec::Mainnet
                 }
                 "[[coin]]" => {
                     if coins.len() >= HYPARB_MAX_COINS {
@@ -661,6 +709,7 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
         &mut cur,
         &mut head,
         &mut testnet,
+        &mut mainnet,
         &mut coins,
         &mut pools,
     )?;
@@ -669,6 +718,10 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
     let mut file = finish_hyparb(&head)?;
     file.testnet = match testnet {
         Some(kv) => Some(finish_testnet(&kv)?),
+        None => None,
+    };
+    file.mainnet = match mainnet {
+        Some(kv) => Some(finish_mainnet(&kv)?),
         None => None,
     };
     if file.mode == HyparbMode::Testnet {
@@ -843,6 +896,38 @@ mod tests {
         let t = parse(&full).expect("complete").testnet.unwrap();
         assert_eq!(t.executor.as_deref(), Some(A));
         assert_eq!(t.amount_raw, Some(1000));
+    }
+
+    const MAINNET: &str = "\n[mainnet]\nendpoint = \"https://rpc.hyperliquid.xyz/evm\"\n";
+
+    /// L1 (O-HL1): `[mainnet]` is optional in every mode, its executor
+    /// optional until deployed, and every value is checked.
+    #[test]
+    fn the_mainnet_block_is_optional_and_checked() {
+        assert!(parse(&good()).unwrap().mainnet.is_none());
+        let m = parse(&(good() + MAINNET))
+            .expect("paper + [mainnet]")
+            .mainnet
+            .expect("present");
+        assert_eq!(m.endpoint, "https://rpc.hyperliquid.xyz/evm");
+        assert_eq!(m.executor, None);
+        let with = format!("{}{MAINNET}executor = \"{A}\"\n", good());
+        assert_eq!(
+            parse(&with).unwrap().mainnet.unwrap().executor.as_deref(),
+            Some(A)
+        );
+        let both = good() + TESTNET + MAINNET;
+        let f = parse(&both).expect("both blocks");
+        assert!(f.testnet.is_some() && f.mainnet.is_some());
+        let e = refused(&(good() + &MAINNET.replace("https://", "http://")));
+        assert!(e.contains("[mainnet]: `endpoint` must be an https:// URL"), "{e}");
+        let e = refused(&(good() + MAINNET + "executor = \"0xABC\"\n"));
+        assert!(e.contains("[mainnet]: `executor` must be 0x + 40"), "{e}");
+        let e = refused(&(good() + MAINNET + "wallets = 1\n"));
+        assert!(e.contains("unknown [mainnet] key `wallets`"), "{e}");
+        let e = refused(&(good() + MAINNET + "[mainnet]\n"));
+        assert!(e.contains("duplicate `[mainnet]`"), "{e}");
+        assert!(refused(&(good() + "\n[mainnet]\n")).contains("endpoint"));
     }
 
     #[test]

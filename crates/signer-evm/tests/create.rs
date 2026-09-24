@@ -9,7 +9,10 @@
 //! and the raw hex must all agree. C0 is the committed executor's own
 //! creation bytecode (2,346 B since H9d's third callback — a three-byte
 //! string length; re-signed by eth-account 0.14 on 2026-09-24); C1 is a
-//! two-byte init code with a 81-bit fee cap and a non-zero endowment.
+//! two-byte init code with a 81-bit fee cap and a non-zero endowment; C2
+//! is the executor's MAINNET creation exactly as `evm-live deploy` sends
+//! it (chain 999, the operator bid at a 0.1 gwei base fee — HYPARB L1,
+//! eth-account 0.14, 2026-09-24).
 //!
 //! The deployed address, `keccak256(rlp([sender, nonce]))[12..]`, is
 //! pinned by the Yellow Paper's worked example and by eth-utils for
@@ -104,6 +107,41 @@ fn the_executor_creation_is_byte_equal_to_eth_account() {
     assert_eq!(
         hex(&create_hash(&tx, &sig).unwrap()),
         "2f7e008c758058cbf0b6fc4ca7d957bd4dde9aaeec57f38880b0f38d763c256d"
+    );
+}
+
+/// C2 — O-HL1: the mainnet deploy. Chain 999, nonce 0, tip = the
+/// 0.1 gwei base fee, cap = 3 × base (`evm_testnet::operator_bid`), the
+/// deploy gas limit.
+#[test]
+fn the_mainnet_executor_creation_is_byte_equal_to_eth_account() {
+    let init = unhex(EXECUTOR_BIN);
+    let tx = Eip1559Create {
+        chain_id: 999,
+        nonce: 0,
+        max_priority_fee_per_gas: 100_000_000,
+        max_fee_per_gas: 300_000_000,
+        gas_limit: 1_500_000,
+        value: 0,
+        init_code: &init,
+    };
+    let (sig, raw) = render(&tx);
+    assert_eq!(raw.len(), 2 + 4882);
+    assert!(raw.starts_with(
+        "0x02f909858203e7808405f5e1008411e1a3008316e3608080b9092a60a0604052348015600e575f5ffd5b5033"
+    ));
+    assert_eq!(
+        hex(&sig[..32]),
+        "35dbc834978cf288df65c61a4f670484092a006927c9fcb5f7201a9552ff5f64"
+    );
+    assert_eq!(
+        hex(&sig[32..64]),
+        "6ce2ea0a1b213c950f00cf18b720a4fe4bcb25b00917b6f864f43fdb8b6d6f34"
+    );
+    assert_eq!(sig[64], 27, "y_parity 0");
+    assert_eq!(
+        hex(&create_hash(&tx, &sig).unwrap()),
+        "95fcbc0e5f56fc5fcc6dcd31d5e113f018a11b2b2f58e7014cd8e49a2ded2e0d"
     );
 }
 

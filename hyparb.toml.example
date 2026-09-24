@@ -131,3 +131,16 @@ wallets = 3
 # executor = "0x..."
 # pool = "0x..."
 # amount_raw = 1000000000000000000
+
+# HyperEVM MAINNET (plan §17, ruling O-HL1), at most once, OPTIONAL in
+# every mode: the member ignores it until live mode lands (plan §17.3
+# L5). The operator verbs `multivenue-engine evm-live` (scripts/
+# evm-live.sh) read it: `status`, and - each refused without --confirm,
+# because each spends real HYPE - `deploy`, `wrap`, `swap`, `sweep`. The
+# wallet is HYPEREVM_MAINNET_KEY from the repo .env: one address that
+# owns the executor, pays gas and is slot 0's own Hyperliquid account.
+[mainnet]
+endpoint = "https://rpc.hyperliquid.xyz/evm"
+# Set by the operator after `evm-live deploy --confirm`: the H9d
+# executor on chain 999, owned by that wallet.
+# executor = "0x..."

@@ -3,9 +3,11 @@
 
 //! # HYPARB H8 — the EVM write path, wired (plan §12; O-H5, O-H12)
 //!
-//! TESTNET ONLY. `exec-hyperevm` cannot name chain 999 (its `Network`
-//! has no mainnet variant and `EVM_ARM_CHAIN_IDS = [998]` is asserted at
-//! compile time); this module adds the two checks that need the wire:
+//! TESTNET ONLY. Configuration arms chain 998 alone (`exec-hyperevm`'s
+//! `EVM_ARM_CHAIN_IDS = [998]`, asserted at compile time) and a mainnet
+//! arm needs a `MainnetAuthority`, which nothing here holds (the mainnet
+//! verbs are [`crate::evm_live`], O-HL1); this module adds the two
+//! checks that need the wire:
 //! the WRITE endpoint's `eth_chainId` must be 998 (the arm halts
 //! otherwise), and `check_chains(read, write, --evm-hybrid)` — the READ
 //! endpoint (the pool ingress's host) answering 999 is allowed only
@@ -30,9 +32,8 @@
 //! its owner is its deployer, wallet 0 — boot reads `owner()` and
 //! refuses an executor owned by anyone else. Wallets 1.. carry the
 //! battery's nonce-parallelism and ordering probes (0-value
-//! self-transfers), never a swap. A MAINNET arm needs an executor
-//! allow-list or one executor per wallet — a contract change under its
-//! own review, not a flag.
+//! self-transfers), never a swap. Live mode keeps that shape (O-HL2):
+//! one wallet, the executor's owner, swaps on mainnet ([`crate::evm_live`]).
 //!
 //! ## Refuse vs dark (H9 R3)
 //!
@@ -105,7 +106,7 @@ use crate::evm_shadow::{shadow_loop, ShadowWorker};
 /// The operator verbs' fee: tip = base fee, cap = 3 × base fee.
 const OPERATOR_FEE_MULT: u128 = 3;
 /// A plain transfer's gas.
-const TRANSFER_GAS: u64 = 21_000;
+pub(crate) const TRANSFER_GAS: u64 = 21_000;
 
 /// Wallet `i`'s key, derived from the seed (wallet 0 IS the seed).
 #[must_use]
@@ -387,7 +388,7 @@ pub fn boot_shadow(
 // ---------------------------------------------------------------
 
 /// The operator verbs' fee at base fee `base`.
-fn operator_bid(base: u128) -> GasBid {
+pub(crate) fn operator_bid(base: u128) -> GasBid {
     GasBid {
         max_priority_fee_per_gas: base,
         max_fee_per_gas: base.saturating_mul(OPERATOR_FEE_MULT),
@@ -395,7 +396,7 @@ fn operator_bid(base: u128) -> GasBid {
 }
 
 /// Wait (blocking, ~1 s polls) for wallet `w`'s transaction.
-fn wait_mined(arm: &mut EvmArm, w: usize) -> Result<Receipt, String> {
+pub(crate) fn wait_mined(arm: &mut EvmArm, w: usize) -> Result<Receipt, String> {
     let deadline = core_time::now_ns() + RECEIPT_TIMEOUT_NS + 5_000_000_000;
     loop {
         std::thread::sleep(Duration::from_millis(1_000));
@@ -415,7 +416,7 @@ fn wait_mined(arm: &mut EvmArm, w: usize) -> Result<Receipt, String> {
     }
 }
 
-fn sent(out: SendOutcome, what: &str) -> Result<(u64, [u8; 32]), String> {
+pub(crate) fn sent(out: SendOutcome, what: &str) -> Result<(u64, [u8; 32]), String> {
     match out {
         SendOutcome::Sent { nonce, hash, .. } | SendOutcome::MaybeSent { nonce, hash, .. } => {
             Ok((nonce, hash))
@@ -424,7 +425,7 @@ fn sent(out: SendOutcome, what: &str) -> Result<(u64, [u8; 32]), String> {
     }
 }
 
-fn receipt_line(r: &Receipt) -> String {
+pub(crate) fn receipt_line(r: &Receipt) -> String {
     format!(
         "block {} index {} status {} gas_used {} tx {}",
         r.block,
@@ -515,10 +516,11 @@ pub fn verb_fund(
 }
 
 /// The committed O-H18 executor creation bytecode.
-const EXECUTOR_BIN: &str = include_str!("../../../contracts/hyparb-executor/HyparbExecutor.bin");
+pub(crate) const EXECUTOR_BIN: &str =
+    include_str!("../../../contracts/hyparb-executor/HyparbExecutor.bin");
 /// Gas limit of the executor's creation (≈ 0.55 M measured by the
 /// bytecode's size: 200 gas per runtime byte + calldata + base).
-const DEPLOY_GAS_LIMIT: u64 = 1_500_000;
+pub(crate) const DEPLOY_GAS_LIMIT: u64 = 1_500_000;
 
 /// `deploy`: create the executor from wallet 0 (its owner) and print
 /// the address `[testnet] executor` must name.
@@ -552,7 +554,7 @@ pub fn verb_deploy(t: &HyparbTestnet, tls: Arc<ClientConfig>) -> Result<String, 
 }
 
 /// Hex text (optional `0x`, surrounding whitespace) → bytes (cold).
-fn decode_hex_loose(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_hex_loose(s: &str) -> Result<Vec<u8>, String> {
     let h = s.trim().trim_start_matches("0x").as_bytes();
     if h.len() % 2 != 0 {
         return Err("odd-length hex".to_owned());

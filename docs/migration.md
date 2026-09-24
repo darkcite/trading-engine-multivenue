@@ -6,6 +6,26 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — `hyparb.toml [mainnet]`, `multivenue-engine evm-live`, `scripts/evm-live.sh` (HYPARB L1)
+
+**What changed**
+- `hyparb.toml` gains an OPTIONAL `[mainnet]` block (`endpoint`, and
+  `executor` once deployed), valid in every mode; the member ignores it
+  until live mode (plan §17.3 L5).
+- New verb `multivenue-engine evm-live status|deploy|wrap|swap|sweep`
+  (wrapper `scripts/evm-live.sh`, zsh): HyperEVM MAINNET by default,
+  `--network testnet` for the dry run; every mainnet write needs
+  `--confirm`.
+- New environment names (repo `.env`, written by the operator):
+  `HYPEREVM_MAINNET_KEY`, `HYPERLIQUID_HYPARB_MASTER_ADDR`.
+- `exec_hyperevm::Network` gains `Mainnet`; `EvmArm::new` refuses it
+  and `EvmArm::new_mainnet` takes a `MainnetAuthority`.
+
+**What to do**
+- Nothing for the running engine. Before the first mainnet verb: the
+  operator's steps 1–5 of the live plan (the wallet, the two `.env`
+  lines, the funding), then add `[mainnet]` to `~/multivenue/hyparb.toml`.
+
 ## 2026-09-24 — `hyparb.toml` refuses `halt_on_gain/loss_usd_1e6`; `/state` `hyparb.pnl_halt` and `engine_hyparb_pnl_halt` removed (HYPARB L0)
 
 **What changed**
