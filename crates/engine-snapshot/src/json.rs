@@ -527,10 +527,8 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(u64::from(hy.n_coins));
     c.key("halted");
     c.u64(hc.halted);
-    // The session P&L stop (go-live 2026-09-24): which side tripped
-    // (0 none, 1 gain, 2 loss) and the marked P&L it judges.
-    c.key("pnl_halt");
-    c.u64(hc.pnl_halt);
+    // The session's marked P&L (go-live 2026-09-24): a level, paper's
+    // evidence for gate G1 — the P&L stop is live-only (O-HL5).
     c.key("pnl_session_usd_1e6");
     c.i64(hc.pnl_session_usd_1e6);
     // The counters sit flat in the object (a nested `counters` key would

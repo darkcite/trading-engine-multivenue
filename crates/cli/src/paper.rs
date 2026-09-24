@@ -5830,11 +5830,8 @@ pub struct HyparbMetricIds {
     /// `engine_hyparb_halted` (0/1).
     pub halted: core_metrics::GaugeId,
     /// `engine_hyparb_pnl_session_usd_1e6` — the member's marked session
-    /// P&L, the level the session stop judges (signed).
+    /// P&L (signed): a level, paper's evidence for gate G1.
     pub pnl_session: core_metrics::GaugeId,
-    /// `engine_hyparb_pnl_halt` — the session P&L stop: 0 none, 1 the
-    /// gain side, 2 the loss side.
-    pub pnl_halt: core_metrics::GaugeId,
     /// `engine_hyparb_pools_live` — pools judgeable right now.
     pub pools_live: core_metrics::GaugeId,
     /// `engine_hyparb_c<k>_<suffix>` for the first
@@ -5918,7 +5915,7 @@ fn mirror_hyparb_evm_metrics(
     }
 }
 
-/// Register the hyparb family: 27 counters, 5 + 4×5 + 4×3 = 37 gauges.
+/// Register the hyparb family: 27 counters, 4 + 4×5 + 4×3 = 36 gauges.
 /// UNCONDITIONAL like every family — a mask without slot 0 exposes the
 /// rows at zero, which is how an operator tells "off" from "broken".
 fn register_hyparb_metrics(
@@ -5939,7 +5936,6 @@ fn register_hyparb_metrics(
     let funding_earned = gauge("engine_hyparb_funding_earned_usd_1e6")?;
     let halted = gauge("engine_hyparb_halted")?;
     let pnl_session = gauge("engine_hyparb_pnl_session_usd_1e6")?;
-    let pnl_halt = gauge("engine_hyparb_pnl_halt")?;
     let pools_live = gauge("engine_hyparb_pools_live")?;
     let mut coins = [[core_metrics::GaugeId::default(); 5]; HYPARB_METRIC_COINS];
     let mut k = 0usize;
@@ -5966,7 +5962,6 @@ fn register_hyparb_metrics(
         funding_earned,
         halted,
         pnl_session,
-        pnl_halt,
         pools_live,
         coins,
         pools,
@@ -5995,7 +5990,6 @@ fn mirror_hyparb_metrics<S: strategy_core::StrategyCounters>(
         .set(cur.funding_earned_usd_1e6);
     reg.gauge(ids.halted).set(cur.halted as i64);
     reg.gauge(ids.pnl_session).set(cur.pnl_session_usd_1e6);
-    reg.gauge(ids.pnl_halt).set(cur.pnl_halt as i64);
     // Levels: a coin or pool the member does not configure keeps its row
     // at zero rather than vanishing.
     let mut coins = [strategy_core::HyparbCoinView::default(); HYPARB_METRIC_COINS];
@@ -10123,7 +10117,7 @@ mod tests {
     /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
     /// refused boot, and the registry is shared by every family.
     #[test]
-    fn the_hyparb_family_is_27_counters_and_37_gauges() {
+    fn the_hyparb_family_is_27_counters_and_36_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
@@ -10131,8 +10125,8 @@ mod tests {
         assert_eq!(reg.counters_len() - before_c, 27, "the counter block");
         assert_eq!(
             reg.gauges_len() - before_g,
-            37,
-            "5 + 4 coins x 5 + 4 pools x 3 (the session P&L stop's two levels since go-live)"
+            36,
+            "4 + 4 coins x 5 + 4 pools x 3 (the session P&L level since go-live)"
         );
         // A second registration collides on every name — nothing reused
         // a name silently.
@@ -10234,7 +10228,6 @@ mod tests {
         f.c.funding_earned_usd_1e6 = -12;
         f.c.halted = 1;
         f.c.pnl_session_usd_1e6 = -20_000_000;
-        f.c.pnl_halt = 2;
         f.coin.perp_depth_usd_1e6 = 900_000_000;
         mirror_hyparb_metrics(&reg, &ids, &f, &mut last);
         assert_eq!(reg.counter(ids.counters[6]).get(), 3, "side_buy");
@@ -10243,7 +10236,6 @@ mod tests {
         assert_eq!(reg.gauge(ids.funding_earned).get(), -12);
         assert_eq!(reg.gauge(ids.halted).get(), 1);
         assert_eq!(reg.gauge(ids.pnl_session).get(), -20_000_000);
-        assert_eq!(reg.gauge(ids.pnl_halt).get(), 2);
         assert_eq!(reg.gauge(ids.pools_live).get(), 1);
         assert_eq!(reg.gauge(ids.pools[0][0]).get(), -1_000);
         assert_eq!(reg.gauge(ids.pools[0][1]).get(), 42);

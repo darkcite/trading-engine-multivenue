@@ -111,7 +111,6 @@ fn full_snapshot() -> Box<EngineSnapshot> {
     s.hyparb.counters.gas_charged_usd_1e6 = i64::MIN;
     s.hyparb.counters.funding_earned_usd_1e6 = i64::MIN;
     s.hyparb.counters.pnl_session_usd_1e6 = i64::MIN;
-    s.hyparb.counters.pnl_halt = u64::MAX;
     for r in s.hyparb.pools.iter_mut() {
         *r = strategy_core::HyparbPoolView::new(
             u32::MAX,
@@ -400,7 +399,6 @@ fn the_hyparb_section_renders_counters_pools_and_coins() {
     s.hyparb.counters.arbs_buy = 3;
     s.hyparb.counters.arbs_sell = 2;
     s.hyparb.counters.funding_earned_usd_1e6 = -7;
-    s.hyparb.counters.pnl_halt = 2;
     s.hyparb.counters.pnl_session_usd_1e6 = -20_000_001;
     s.hyparb.pools[0] =
         strategy_core::HyparbPoolView::new(0x0800_0001, 1, 1, 0, 500, 97_600_000, -1_000, 5, 42);
@@ -411,7 +409,7 @@ fn the_hyparb_section_renders_counters_pools_and_coins() {
     assert!(body.contains("\"arbs_buy\":3,\"arbs_sell\":2"), "{body}");
     assert!(body.contains("\"funding_earned_usd_1e6\":-7"));
     assert!(
-        body.contains("\"halted\":0,\"pnl_halt\":2,\"pnl_session_usd_1e6\":-20000001,"),
+        body.contains("\"halted\":0,\"pnl_session_usd_1e6\":-20000001,"),
         "{body}"
     );
     assert!(body.contains(

@@ -164,11 +164,16 @@ in the script; `ai` = 48 is the floor every name includes).
   pools` in universe.toml, `--hyperevm-path` on `HYPEREVM_WS_HOST`).
   **Go-live PREPARED 2026-09-24 (plan §16.18):** both are in the live
   config — `~/multivenue/hyparb.toml` (`mode = "testnet"`: paper + the
-  testnet shadow, 14 pools, 4 perp-hedged coins, the session P&L stop
-  +$50 / −$20 — `/state` `hyparb.pnl_halt`) and `[hyperevm]` in
-  `universe.toml` — and the wrapper hands the shadow its testnet key
-  from `~/multivenue/.env`; turning it on is the operator's four
-  `strategy.conf` lines (§16.18 runbook). HZ part B is NOT green from
+  testnet shadow, 14 pools, 4 perp-hedged coins; the marked P&L LEVEL
+  `/state` `hyparb.pnl_session_usd_1e6`, no paper stop since L0) and
+  `[hyperevm]` in `universe.toml` — and the wrapper hands the shadow
+  its testnet key from `~/multivenue/.env`; turning it on is the
+  operator's four `strategy.conf` lines (§16.18 runbook).
+  **LIVE-ON-MAINNET build started 2026-09-24 (plan §17, rulings
+  O-HL1..O-HL5):** paper = testnet, live = HyperEVM mainnet + real HL
+  hedges from slot 0's OWN wallet; the P&L stop (+$50 / −$20, combined
+  equity) is LIVE-only; the reused H9d executor; real money only after
+  paper's gate G1. Phases L0 (done) … L6. HZ part B is NOT green from
   this Mac (a tx fired at head N lands in N+1 ~56 %): paper AMM fills
   are an upper bound on latency. Slot 0 can NEVER be armed live
   (`exec_boot::NEVER_LIVE_SLOTS`). Its one real write path is the

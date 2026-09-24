@@ -2253,6 +2253,9 @@ and a restart.
 * **The session P&L stop** (`hyparb.toml` `halt_on_gain_usd_1e6` /
   `halt_on_loss_usd_1e6`, OPTIONAL, absent = 0 = off). It is the E7
   session bound's shape for a slot that is never live.
+  **Superseded by L0 (§17.2, ruling O-HL5):** the stop left paper; the
+  marked level `pnl_session_usd_1e6` stays, and `[hyparb]` now refuses
+  the two keys by name.
   * **What it measures.** The member marks its own P&L: cash from every
     fill (a USD pool token is cash; a hedge buy spends, a sale earns),
     less the hedge taker fee (`perp_taker` / `spot_taker`, every hedge is
@@ -2353,8 +2356,9 @@ and a restart.
     recorded for a later look.
 * **The go-live runbook.** This supersedes §16.17's for the testnet
   shadow.
-  1. Build the release binary on `main` at or after this commit. The
-     artifact's new keys are refused by an older parser.
+  1. Build the release binary on `main` at or after L0 (§17.2). The
+     live artifact carries no `halt_on_*` key since L0; the L0 parser
+     refuses them.
   2. Run `scripts/exec-smoke.sh`.
   3. Add four lines to `~/multivenue/strategy.conf` (the operator's
      edit):
@@ -2367,13 +2371,57 @@ and a restart.
   4. Restart: the next `daily-restart` slot, or the sanctioned
      `echo 19700101 > ~/multivenue/state/last-restart-utc-0010`.
   5. Check the boot tells:
-     - `hyparb: artifact configured … pnl_stop_usd_1e6=+50000000/-20000000`;
+     - `hyparb: artifact configured … mode=testnet …`;
      - the wrapper's `hyparb EVM write path` and `HYBRID` lines;
      - `hyparb: EVM WRITE PATH ARMED — TESTNET`, or a `DARK` line naming
        why.
   6. Check `/state`:
      - `vm_rows_active ≥ 1`;
      - `hyparb.pools_live` climbing as each snapshot completes;
-     - `halted = 0`, `pnl_halt = 0`;
+     - `halted = 0`; `pnl_session_usd_1e6` moving once arbs fill;
      - slot 3's tell unchanged.
   7. Rollback: drop the four lines and restart.
+
+## 17. Live on mainnet — rulings O-HL1..O-HL5, phases L0–L6 (2026-09-24)
+
+The operator asked for two modes — paper on TESTNET, live on MAINNET —
+with every prerequisite written down and the P&L stop in LIVE mode only.
+The prerequisites (accounts, least balances, the mainnet deploy guide)
+and the gates live in the vault: `docs/research/hyparb/hyparb-live-plan-2026-09-24.md`.
+
+### 17.1 Rulings (operator, 2026-09-24)
+
+| # | Ruling |
+|---|---|
+| O-HL1 | **Two modes.** Paper = the paper member + the TESTNET shadow (chain 998). Live = real swaps on HyperEVM MAINNET (chain 999) + real hedges on Hyperliquid. Supersedes O-H5 for live mode only. |
+| O-HL2 | **The executor is the H9d contract as reviewed** — no new contract code. A pool trades live only after a mainnet-fork swap of it (G4). |
+| O-HL3 | **Slot 0 hedges from its own Hyperliquid account**, never slot 3's. A separate wallet, not a sub-account: sub-accounts unlock at $100k of master volume. The same wallet pays HyperEVM gas and owns the executor. |
+| O-HL4 | **Real money only after paper shows an edge** (G1). The build proceeds; the switch waits. |
+| O-HL5 | **The P&L stop is LIVE-only:** +$50 / −$20 on slot 0's combined equity (both venues), sticky until the operator clears it. Paper keeps the marked level as G1's evidence. |
+
+### 17.2 L0 — the paper stop removed — LANDED
+
+* `strategy-hyparb`: the `halt_on_gain/loss` params, their validation,
+  the sticky trip and its entry gate are gone. The marked level stays
+  (`mark_pnl`: cash + marks + funding − gas, held while a held coin is
+  unmarked) and is re-marked on a held coin's tick. A paper member that
+  is up keeps trading (pinned by a test).
+* `HyparbCounters.pnl_halt`, `/state` `hyparb.pnl_halt` and the gauge
+  `engine_hyparb_pnl_halt` are removed (the family is 27 counters, 36
+  gauges); `pnl_session_usd_1e6` and its gauge stay.
+* `hyparb.toml`: `[hyparb]` refuses `halt_on_gain_usd_1e6` /
+  `halt_on_loss_usd_1e6` BY NAME, pointing at `exec.toml [exec.slot.0]`
+  (where L5 puts the live bound). The example and the boot tell drop
+  them. The live artifact lost its two lines in the same deploy as the
+  L0 release binary (a `.bak` kept).
+
+### 17.3 L1–L6 (to build)
+
+| Phase | What |
+|---|---|
+| L1 | The mainnet EVM write path: `Network::Mainnet` (chain 999) constructible only from the live interlock's token, never from config text; boot verifies `eth_chainId`; operator verbs `evm-live status / deploy / wrap / swap / sweep` with an explicit `--confirm`. |
+| L2 | Slot 0's Hyperliquid arm: a second `HlExchange` as the slot's own account (its own budget and anchor files), perp + spot asset binding from `meta` / `spotMeta`, price (5 significant figures) and size (`szDecimals`) rounding, IoC hedges, perp reconciliation. |
+| L3 | `HyparbLive` (`OrderDispatch`): the swap RECEIPT's `Swap` log is the AMM fill (the E-5 analogue); its own halts (reverts, receipt timeouts, recon drift, a daily gas cap) and the combined-equity session bound, judged only when nothing is in flight. |
+| L4 | The router carries per-slot live arms and halt signals; slot 0's fault never halts slot 3. |
+| L5 | Three switches: artifact `mode = "live"` + `exec.toml [exec.slot.0] mode = "live"` + `--arm-live 0`; any one alone refuses. `NEVER_LIVE_SLOTS` lifted for slot 0, `LIVE_ARM_VENUES` gains HyperEvm. |
+| L6 | The mainnet battery (real money, by hand) and the three reviews. R0 follows only after G1 and the operator's word. |

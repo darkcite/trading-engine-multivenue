@@ -664,7 +664,7 @@ fn expected_pnl(o: &Order, h: &Order, hedge_px: i64, mid: i64) -> i64 {
 }
 
 #[test]
-fn the_session_pnl_is_cash_and_marks_less_fees_and_gas_and_zero_is_off() {
+fn the_session_pnl_is_cash_and_marks_less_fees_and_gas() {
     let (mut m, mut c) = armed();
     let o = c.orders[0];
     m.on_fill(
@@ -683,18 +683,14 @@ fn the_session_pnl_is_cash_and_marks_less_fees_and_gas_and_zero_is_off() {
         "a 1 % dislocation round-trips at a profit: {want}"
     );
     assert_eq!(m.counters().pnl_session_usd_1e6, want);
-    // Both sides of the stop are 0: nothing trips, whatever the P&L.
-    assert_eq!((m.pnl_halt(), m.counters().pnl_halt), (0, 0));
 }
 
 #[test]
-fn the_gain_side_of_the_session_stop_trips_and_holds_new_arbs() {
-    let mut p = params();
-    p.halt_on_gain_usd_1e6 = 1;
-    let mut m = member_with(p);
-    let mut c = ctx();
-    perp_at(&mut m, &mut c, 100);
-    snapshot(&mut m, &mut c, POOL, 2, 2);
+fn the_pnl_level_stops_nothing_in_paper_the_stop_is_live_only() {
+    // Ruling O-HL5: the P&L stop belongs to LIVE mode (the execution
+    // arm's combined-equity bound). A paper member that is up keeps
+    // trading the next dislocation.
+    let (mut m, mut c) = armed();
     let o = c.orders[0];
     m.on_fill(
         &Fill::new(c.now, POOL, Side::Bid, o.px, o.qty, o.client_oid),
@@ -705,48 +701,31 @@ fn the_gain_side_of_the_session_stop_trips_and_holds_new_arbs() {
         &Fill::new(c.now, PERP, Side::Ask, h.px, h.qty, h.client_oid),
         &mut c,
     );
-    assert_eq!(m.pnl_halt(), 1, "{:?}", m.counters());
-    assert_eq!(m.counters().pnl_halt, 1);
-    // The next dislocation is held, and counted as held.
+    assert!(m.counters().pnl_session_usd_1e6 > 0);
     c.now += INFLIGHT_NS + 2 * TIMER_NS;
     m.on_timer(c.now, &mut c);
     let before = (c.orders.len(), m.counters().skipped_halted);
     perp_at(&mut m, &mut c, 150);
-    assert_eq!(c.orders.len(), before.0, "no new arb");
-    assert!(m.counters().skipped_halted > before.1);
+    assert!(c.orders.len() > before.0, "the next arb is sent");
+    assert_eq!(m.counters().skipped_halted, before.1);
 }
 
 #[test]
-fn the_loss_side_trips_on_marks_stays_tripped_and_the_flattening_still_runs() {
-    let mut p = params();
-    p.halt_on_loss_usd_1e6 = 1_000_000;
-    let mut m = member_with(p);
-    let mut c = ctx();
-    perp_at(&mut m, &mut c, 100);
-    snapshot(&mut m, &mut c, POOL, 2, 2);
+fn the_pnl_level_re_marks_on_the_tick_both_ways() {
+    let (mut m, mut c) = armed();
     let o = c.orders[0];
     m.on_fill(
         &Fill::new(c.now, POOL, Side::Bid, o.px, o.qty, o.client_oid),
         &mut c,
     );
-    assert_eq!(m.pnl_halt(), 0, "{:?}", m.counters());
     // The hedge book falls 20 % before the hedge fills: the held coin
-    // re-marks on the tick itself, and the pool that is now rich is NOT
-    // sold into — the stop is judged before the decision.
-    let n = c.orders.len();
+    // re-marks on the tick itself, before any pool is decided.
     perp_at(&mut m, &mut c, -2_000);
-    assert_eq!(m.pnl_halt(), 2, "{:?}", m.counters());
-    assert!(m.counters().pnl_session_usd_1e6 <= -1_000_000);
-    assert_eq!(c.orders.len(), n, "no arb after the stop");
-    // Sticky: the book recovers, the stop does not.
+    let low = m.counters().pnl_session_usd_1e6;
+    assert!(low <= -1_000_000, "{low}");
     perp_at(&mut m, &mut c, 100);
-    assert_eq!(m.pnl_halt(), 2);
-    assert!(
-        m.counters().pnl_session_usd_1e6 > -1_000_000,
-        "the level moves"
-    );
-    assert_eq!(c.orders.len(), n);
-    // The unfilled hedge misses and the timer still flattens the coin.
+    assert!(m.counters().pnl_session_usd_1e6 > low, "the level moves back");
+    // The unfilled hedge misses and the timer flattens the coin.
     c.now += 500_000_000 + HEDGE_GRACE_NS + 1;
     m.on_timer(c.now, &mut c);
     let k = m.counters();
@@ -756,14 +735,12 @@ fn the_loss_side_trips_on_marks_stays_tripped_and_the_flattening_still_runs() {
 }
 
 #[test]
-fn an_unmarked_coin_holds_the_session_pnl_and_judges_nothing() {
-    let mut p = params();
-    p.halt_on_loss_usd_1e6 = 1;
-    let mut m = member_with(p);
+fn an_unmarked_coin_holds_the_session_pnl() {
+    let mut m = member();
     let mut c = ctx();
     // Inventory in a coin that never had a mid: the P&L cannot be
-    // known, so the level stays where it was and the stop is not judged
-    // (the inventory rule halts on the unvalued exposure instead).
+    // known, so the level stays where it was (the inventory rule halts
+    // entries on the unvalued exposure).
     m.on_fill(
         &Fill::new(
             T0,
@@ -776,22 +753,7 @@ fn an_unmarked_coin_holds_the_session_pnl_and_judges_nothing() {
         &mut c,
     );
     assert_eq!(m.counters().pnl_session_usd_1e6, 0);
-    assert_eq!(m.pnl_halt(), 0);
     assert!(m.is_halted(), "unvalued inventory halts entries");
-}
-
-#[test]
-fn validate_refuses_a_negative_session_stop() {
-    let mut p = params();
-    p.halt_on_gain_usd_1e6 = -1;
-    assert!(p.validate().is_err());
-    let mut p = params();
-    p.halt_on_loss_usd_1e6 = -1;
-    assert!(p.validate().is_err());
-    let mut p = params();
-    p.halt_on_gain_usd_1e6 = 50_000_000;
-    p.halt_on_loss_usd_1e6 = 20_000_000;
-    assert_eq!(p.validate(), Ok(()));
 }
 
 #[test]

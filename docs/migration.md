@@ -6,6 +6,25 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — `hyparb.toml` refuses `halt_on_gain/loss_usd_1e6`; `/state` `hyparb.pnl_halt` and `engine_hyparb_pnl_halt` removed (HYPARB L0)
+
+**What changed**
+- Ruling O-HL5: the P&L stop is LIVE-only. The paper member's session
+  stop (added at the go-live prep, `1d6960b`) is removed; its marked
+  level stays (`/state` `hyparb.pnl_session_usd_1e6`, gauge
+  `engine_hyparb_pnl_session_usd_1e6`).
+- `[hyparb]` refuses `halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6` by
+  name, with a pointer to `exec.toml [exec.slot.0]`.
+- `/state` `hyparb` loses `pnl_halt`; the metrics family loses
+  `engine_hyparb_pnl_halt` (27 counters, 36 gauges); the boot tell loses
+  `pnl_stop_usd_1e6=`.
+
+**What to do**
+- Remove the two lines from `~/multivenue/hyparb.toml` in the SAME
+  deploy as a release binary at or after L0 (done on this host with a
+  `.bak`). A binary at `1d6960b` still accepts them; a binary at L0
+  refuses them.
+
 ## 2026-09-24 — the BIN15 entry's R2-exact polls and today's-law control: `ctl_*` sidecar keys, 17-column `first_fires.tsv` (BIN15 S5b)
 
 **What changed**

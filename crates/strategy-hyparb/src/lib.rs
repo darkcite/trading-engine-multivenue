@@ -33,15 +33,14 @@
 //! 5. **Unhedged inventory is first-class:** tracked per coin, flattened by
 //!    the 1 s timer at the touch, capped — a breach halts new arbs until
 //!    it is back under half the cap.
-//! 6. **The session P&L stop** (go-live, 2026-09-24): the member marks its
-//!    own P&L — cash from every fill, less the hedge taker fees and the
-//!    gas it charges per attempt, plus funding, plus the coins it holds at
-//!    their mids — and once that reaches `+halt_on_gain` or
-//!    `−halt_on_loss` it opens no new arb until the engine restarts.
-//!    Hedges and flattening keep running: they are how the exposure comes
-//!    down. The shape of the E7 session bound, for a slot that is never
-//!    live; unlike E7 it is judged continuously on marks (every position
-//!    here has a mid), and never on a coin that has none.
+//! 6. **The session P&L level** (go-live 2026-09-24; a level since ruling
+//!    O-HL5): the member marks its own P&L — cash from every fill, less
+//!    the hedge taker fees and the gas it charges per attempt, plus
+//!    funding, plus the coins it holds at their mids — and publishes it
+//!    (`pnl_session_usd_1e6`) as the paper evidence for the live gate G1.
+//!    It stops nothing: the P&L stop belongs to LIVE mode, where the
+//!    execution arm bounds the slot's combined equity (the E7 shape).
+//!    It is never judged on a coin that has no mid.
 //!
 //! ## The four corrections (plan §8.4) — each a config knob
 //!
@@ -192,10 +191,6 @@ pub struct HyparbParams {
     pub funding_window_ns: u64,
     /// Least time between two arbs on one pool, ns.
     pub cooldown_ns: u64,
-    /// The session P&L stop's gain side, USD × 1e6 (0 = off).
-    pub halt_on_gain_usd_1e6: i64,
-    /// The session P&L stop's loss side, USD × 1e6 (0 = off).
-    pub halt_on_loss_usd_1e6: i64,
     /// The coin gas is paid in (HYPE on HyperEVM), or [`COIN_USD`] when
     /// no configured coin is it: each decision records its USD mid so a
     /// gas bid in USD can be priced in wei (H8).
@@ -225,8 +220,6 @@ impl HyparbParams {
         spot_taker_bps_1e6: 0,
         funding_window_ns: 0,
         cooldown_ns: 0,
-        halt_on_gain_usd_1e6: 0,
-        halt_on_loss_usd_1e6: 0,
         gas_coin: COIN_USD,
     };
 
@@ -289,8 +282,6 @@ impl HyparbParams {
             || self.perp_taker_bps_1e6 >= ONE_BPS_1E6
             || self.spot_taker_bps_1e6 >= ONE_BPS_1E6
             || self.hedge_switch_hysteresis_bps_1e6 < 0
-            || self.halt_on_gain_usd_1e6 < 0
-            || self.halt_on_loss_usd_1e6 < 0
         {
             return Err("hyparb: a cap, fee, gas or window is out of range");
         }
@@ -409,10 +400,8 @@ pub struct HyparbStrategy {
     day_notional_usd_1e6: i64,
     halted: bool,
     /// The session's USD cash from fills, less the hedge taker fees,
-    /// USD × 1e6 — the session P&L stop's cash term.
+    /// USD × 1e6 — the session P&L level's cash term.
     cash_usd_1e6: i64,
-    /// The session P&L stop: 0 not tripped, 1 gain, 2 loss (sticky).
-    pnl_halt: u8,
     oid_seq: u64,
     counters: HyparbCounters,
     orders_emitted: u64,
@@ -470,7 +459,6 @@ impl HyparbStrategy {
             day_notional_usd_1e6: 0,
             halted: false,
             cash_usd_1e6: 0,
-            pnl_halt: 0,
             oid_seq: 0,
             counters: HyparbCounters {
                 pool_events: 0,
@@ -503,7 +491,6 @@ impl HyparbStrategy {
                 funding_earned_usd_1e6: 0,
                 halted: 0,
                 pnl_session_usd_1e6: 0,
-                pnl_halt: 0,
             },
             orders_emitted: 0,
             last_funding_ns: 0,
@@ -569,13 +556,6 @@ impl HyparbStrategy {
     #[must_use]
     pub const fn is_halted(&self) -> bool {
         self.halted
-    }
-
-    /// The session P&L stop: 0 not tripped, 1 the gain side, 2 the loss
-    /// side.
-    #[must_use]
-    pub const fn pnl_halt(&self) -> u8 {
-        self.pnl_halt
     }
 
     /// The AMM book the member sizes against (tests, cross-checks).
@@ -725,10 +705,7 @@ impl HyparbStrategy {
         // A size the hedge venue would refuse is not an arb: a day budget
         // below the pool's hedge minimum is spent.
         let min_hedge = self.min_hedge_usd_1e6(&pp);
-        if self.halted
-            || self.pnl_halt != 0
-            || self.params.cap_day_usd_1e6 - self.day_notional_usd_1e6 < min_hedge
-        {
+        if self.halted || self.params.cap_day_usd_1e6 - self.day_notional_usd_1e6 < min_hedge {
             self.counters.skipped_halted = self.counters.skipped_halted.wrapping_add(1);
             return;
         }
@@ -1103,7 +1080,7 @@ impl HyparbStrategy {
             }
             c += 1;
         }
-        self.judge_pnl(marked, unvalued);
+        self.mark_pnl(marked, unvalued);
         let cap = self.params.inventory_cap_usd_1e6;
         if !self.halted && (total > cap || unvalued) {
             self.halted = true;
@@ -1114,31 +1091,19 @@ impl HyparbStrategy {
         self.counters.halted = u64::from(self.halted);
     }
 
-    /// The session P&L stop. `marked` is the held coins at their marks;
+    /// The session P&L level. `marked` is the held coins at their marks;
     /// with a held coin unmarked the P&L cannot be known, so the level
-    /// holds and nothing is judged (the inventory rule already halts
-    /// entries on unvalued exposure). Once tripped the stop stays until
-    /// the engine restarts — "run until" means until (the E7 law).
-    fn judge_pnl(&mut self, marked: i64, unvalued: bool) {
+    /// holds its last value (the inventory rule already halts entries on
+    /// unvalued exposure).
+    fn mark_pnl(&mut self, marked: i64, unvalued: bool) {
         if unvalued {
             return;
         }
-        let pnl = self
+        self.counters.pnl_session_usd_1e6 = self
             .cash_usd_1e6
             .saturating_add(marked)
             .saturating_add(self.counters.funding_earned_usd_1e6)
             .saturating_sub(self.counters.gas_charged_usd_1e6);
-        self.counters.pnl_session_usd_1e6 = pnl;
-        if self.pnl_halt == 0 {
-            let gain = self.params.halt_on_gain_usd_1e6;
-            let loss = self.params.halt_on_loss_usd_1e6;
-            if gain > 0 && pnl >= gain {
-                self.pnl_halt = 1;
-            } else if loss > 0 && pnl <= -loss {
-                self.pnl_halt = 2;
-            }
-            self.counters.pnl_halt = u64::from(self.pnl_halt);
-        }
     }
 
     /// The 1 s pass: day roll, funding, in-flight and hedge deadlines,
@@ -1291,8 +1256,8 @@ impl Strategy for HyparbStrategy {
             return;
         }
         let now = ctx.now_ns();
-        // A held coin's mark moved: the inventory cap and the session P&L
-        // stop are re-judged BEFORE any pool is decided on this tick.
+        // A held coin's mark moved: the inventory cap is re-judged (and
+        // the P&L level re-marked) BEFORE any pool is decided on this tick.
         if self.coins[c].inventory_1e6 != 0 {
             self.check_inventory();
         }
