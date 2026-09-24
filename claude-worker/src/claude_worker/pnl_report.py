@@ -674,16 +674,23 @@ def latest_report_regimes(reports_dir: pathlib.Path) -> list[dict[str, object]]:
     return [p for p in profiles if isinstance(p, dict)] if isinstance(profiles, list) else []
 
 
-def _audit_units(
+def _iter_units(
     run_dir: pathlib.Path,
     window_root: pathlib.Path | None,
     report: typing.Callable[[str], None],
     next_run: pathlib.Path | None = None,
-) -> list[tuple[str, pathlib.Path, bool]]:
+) -> typing.Iterator[tuple[str, pathlib.Path, bool]]:
     """(label, dir to audit, is_temporary) per ≤ 2 h window of the run —
     the capture-window law; a run without ticks (or windowing off)
     audits as-is. Every cut carries its own ``regime-seed.tsv`` when the
     artifact + candles.db exist (RG3).
+
+    LAZY on purpose: a window is cut only when the caller asks for the
+    next unit, so a caller that audits and deletes each unit before
+    taking another holds ONE window on disk. Materialising every cut of
+    the closed day first put the whole day on disk at once — 48 GiB on
+    2026-09-24 — and ran the Data volume out (ENOSPC stopped the live
+    capture at 02:06Z) before a single audit had run.
 
     BIN15 O10: a unit is a ROOT that may hold more than one run dir.
     When HIP-4 instances are still open at the run's end, the head of
@@ -695,20 +702,22 @@ def _audit_units(
     payout lands on a flat book in the next.
     """
     if window_root is None:
-        return [(run_dir.name, run_dir, False)]
+        yield (run_dir.name, run_dir, False)
+        return
     try:
         windows = claude_worker.window_root.windows_of(run_dir)
     except claude_worker.window_root.WindowError as exc:
         report(f"pnl-report: {run_dir.name}: cannot window ({exc}) — auditing whole")
-        return [(run_dir.name, run_dir, False)]
+        yield (run_dir.name, run_dir, False)
+        return
     carried = (
         claude_worker.window_root.carry_wanted(run_dir) if next_run is not None else False
     )
     if len(windows) <= 1 and not carried:
         # The fast path: nothing open, one window — audit the run in
         # place and copy nothing.
-        return [(run_dir.name, run_dir, False)]
-    units: list[tuple[str, pathlib.Path, bool]] = []
+        yield (run_dir.name, run_dir, False)
+        return
     seed = regime_seed_inputs()
     if len(windows) <= 1:
         # One window, but something is open: a unit root holding a
@@ -718,7 +727,8 @@ def _audit_units(
         root.mkdir(parents=True)
         (root / run_dir.name).symlink_to(run_dir, target_is_directory=True)
         _carry(root, run_dir, next_run, report)
-        return [(run_dir.name, root, True)]
+        yield (run_dir.name, root, True)
+        return
     for i, (lo, hi) in enumerate(windows):
         root = window_root / f"unit-{run_dir.name}-{lo:.0f}"
         shutil.rmtree(root, ignore_errors=True)
@@ -731,8 +741,33 @@ def _audit_units(
             continue
         if i == len(windows) - 1:
             _carry(root, run_dir, next_run, report)
-        units.append((f"{run_dir.name}@{lo:.0f}s", root, True))
-    return units
+        yield (f"{run_dir.name}@{lo:.0f}s", root, True)
+
+
+def _units_of_day(
+    runs: list[pathlib.Path],
+    window_root: pathlib.Path | None,
+    report: typing.Callable[[str], None],
+) -> typing.Iterator[tuple[str, pathlib.Path, bool]]:
+    """Every run's units in run order, cut one at a time (``_iter_units``)."""
+    for i, run_dir in enumerate(runs):
+        nxt = runs[i + 1] if i + 1 < len(runs) else None
+        yield from _iter_units(run_dir, window_root, report, next_run=nxt)
+
+
+def _sweep_stale_units(window_root: pathlib.Path, report: typing.Callable[[str], None]) -> None:
+    """Remove the ``unit-*`` / ``hyparb-ladder-*`` leftovers of a run that died
+    mid-day. Every such dir is temporary by construction (deleted after its
+    own audit); a leftover only shrinks the headroom the next night cuts in."""
+    if not window_root.is_dir():
+        return
+    stale = sorted(
+        p for p in window_root.iterdir() if p.name.startswith(("unit-", "hyparb-ladder-"))
+    )
+    for p in stale:
+        shutil.rmtree(p, ignore_errors=True)
+    if stale:
+        report(f"pnl-report: swept {len(stale)} stale unit dir(s) under {window_root}")
 
 
 def _carry(
@@ -763,8 +798,9 @@ def run_day(
     hyparb_artifact: pathlib.Path | None = None,
 ) -> int:
     """Day mode: one bounded audit-pnl per ≤ 2 h window of every run of
-    ``day`` (``window_root`` = where the cuts are materialised, deleted
-    after their audit; None = audit each run whole), merged. Nonzero
+    ``day`` (``window_root`` = where the cuts are materialised, ONE at a
+    time: cut, audit, delete, then the next — so the disk holds a single
+    window, never the day; None = audit each run whole), merged. Nonzero
     when nothing audited cleanly (a failed unit is listed in the report
     and on stderr; the merge still lands for the others).
 
@@ -785,28 +821,32 @@ def run_day(
     failed: list[str] = []
     summaries: list[str] = []
     errs: list[str] = []
-    units: list[tuple[str, pathlib.Path, bool]] = []
-    for i, run_dir in enumerate(runs):
-        nxt = runs[i + 1] if i + 1 < len(runs) else None
-        units.extend(_audit_units(run_dir, window_root, report, next_run=nxt))
     ladder_text: str | None = None
     if hyparb_artifact is not None:
         try:
             ladder_text = hyparb_artifact.read_text(encoding="utf-8")
         except OSError as exc:
             report(f"pnl-report: hyparb ladder skipped — {hyparb_artifact}: {exc}")
+    if window_root is not None:
+        _sweep_stale_units(window_root, report)
     ladder_units: list[list[dict[str, object]]] = []
-    for label, unit_dir, temporary in units:
+    for label, unit_dir, temporary in _units_of_day(runs, window_root, report):
         argv = [claude_worker.backtest.ENGINE_BINARY, "audit-pnl", "--dir", str(unit_dir)] + flags
-        code, out, err = fn(argv)
-        if ladder_text is not None:
-            scratch = (window_root or reports_dir) / f"hyparb-ladder-{pathlib.Path(label).name}"
-            ladder_units.append(
-                claude_worker.hyparb_ladder.run_ladder(unit_dir, ladder_text, scratch, flags, fn)
-            )
-            shutil.rmtree(scratch, ignore_errors=True)
-        if temporary:
-            shutil.rmtree(unit_dir, ignore_errors=True)
+        scratch = (window_root or reports_dir) / f"hyparb-ladder-{pathlib.Path(label).name}"
+        try:
+            code, out, err = fn(argv)
+            if ladder_text is not None:
+                ladder = claude_worker.hyparb_ladder.run_ladder(
+                    unit_dir, ladder_text, scratch, flags, fn
+                )
+                ladder_units.append(ladder)
+        finally:
+            # Nothing outlives its own unit, not even when the audit raises:
+            # the generator cuts the next window only after this one is gone.
+            if ladder_text is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
+            if temporary:
+                shutil.rmtree(unit_dir, ignore_errors=True)
         run_dir = pathlib.Path(label)
         body = out.strip()
         obj = None

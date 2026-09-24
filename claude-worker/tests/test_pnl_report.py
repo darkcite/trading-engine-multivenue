@@ -206,15 +206,23 @@ def test_merge_folds_the_per_regime_section_across_runs_and_tolerates_pre_rg3_re
     assert claude_worker.pnl_report.regime_head_lines(empty) == []
 
 
-def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
-    # ICDP I6 + the 2 h law: a 3 h run becomes two window units, each a
-    # bounded run dir of its own (epoch advanced), deleted after audit.
+def _three_hour_run(tmp_path):
+    """A 3 h run of yesterday (two ≤ 2 h windows) → (logs dir, run epoch, day string)."""
     day_ns = 86_400 * 10**9
     d0 = (NOW_MS // 1000 // 86_400 - 1) * day_ns
     epoch = d0 + 3_600 * 10**9
     logs = tmp_path / "logs"
-    run = tests.craft.write_run(logs, epoch, [1_000, 1_000 + 3_600 * 10**9, 1_000 + 3 * 3_600 * 10**9 - 1])
+    ticks = [1_000, 1_000 + 3_600 * 10**9, 1_000 + 3 * 3_600 * 10**9 - 1]
+    run = tests.craft.write_run(logs, epoch, ticks)
     (run / "instrument-manifest.tsv").write_text("42\tPMTOK\n")
+    day = datetime.datetime.fromtimestamp(d0 / 1e9, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+    return logs, epoch, day
+
+
+def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
+    # ICDP I6 + the 2 h law: a 3 h run becomes two window units, each a
+    # bounded run dir of its own (epoch advanced), deleted after audit.
+    logs, epoch, day = _three_hour_run(tmp_path)
     seen: list[tuple[str, int]] = []
 
     def fn(argv):
@@ -231,7 +239,6 @@ def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
         return 0, _day_run_json(int(d.name[4:]), 2, "0.5", "0.1") + "\n", ""
 
     lines: list[str] = []
-    day = datetime.datetime.fromtimestamp(d0 / 1e9, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
     root = tmp_path / "nightly"
     rc = claude_worker.pnl_report.run_day(logs, tmp_path / "reports", day, lines.append, run_fn=fn, window_root=root)
     assert rc == 0, lines
@@ -241,6 +248,66 @@ def test_day_mode_audits_two_hour_windows_and_cleans_the_cuts(tmp_path):
     assert obj["runs"] == 2
     assert [r["run"] for r in obj["runs_detail"]] == [f"run-{epoch}@0s", f"run-{epoch}@7200s"]
     assert obj["strategies"][0]["orders"] == 4
+
+
+def _unit_json(argv):
+    """audit-pnl stdout for the one run dir inside the unit root `argv[3]`."""
+    run = next(q for q in pathlib.Path(argv[3]).iterdir() if q.name.startswith("run-"))
+    return _day_run_json(int(run.name[4:]), 2, "0.5", "0.1") + "\n"
+
+
+def test_day_mode_holds_one_window_on_disk_at_a_time(tmp_path):
+    # 2026-09-24: the nightly cut EVERY window of the closed day before its
+    # first audit — 48 GiB at once — and ran the Data volume out (ENOSPC
+    # stopped the live capture). Cut, audit, delete, THEN the next cut.
+    logs, epoch, day = _three_hour_run(tmp_path)
+    root = tmp_path / "nightly"
+    on_disk: list[list[str]] = []
+
+    def fn(argv):
+        on_disk.append(sorted(p.name for p in root.glob("unit-*")))
+        return 0, _unit_json(argv), ""
+
+    rc = claude_worker.pnl_report.run_day(
+        logs, tmp_path / "reports", day, [].append, run_fn=fn, window_root=root
+    )
+    assert rc == 0
+    assert on_disk == [[f"unit-run-{epoch}-0"], [f"unit-run-{epoch}-7200"]]
+    assert not any(root.glob("unit-*"))
+
+
+def test_day_mode_deletes_the_cut_when_the_audit_raises(tmp_path):
+    logs, _, day = _three_hour_run(tmp_path)
+    root = tmp_path / "nightly"
+
+    def fn(argv):
+        raise OSError("audit-pnl binary missing")
+
+    with pytest.raises(OSError):
+        claude_worker.pnl_report.run_day(
+            logs, tmp_path / "reports", day, [].append, run_fn=fn, window_root=root
+        )
+    assert not any(root.glob("unit-*")), "a raising audit must not strand its cut"
+
+
+def test_day_mode_sweeps_the_units_a_dead_run_left_behind(tmp_path):
+    logs, _, day = _three_hour_run(tmp_path)
+    root = tmp_path / "nightly"
+    (root / "unit-run-1-0").mkdir(parents=True)
+    (root / "unit-run-1-0" / "bn-ticks.pmlr").write_bytes(b"\x00" * 64)
+    (root / "hyparb-ladder-run-1@0s").mkdir()
+    (root / "keep-me").mkdir()
+    lines: list[str] = []
+
+    def fn(argv):
+        return 0, _unit_json(argv), ""
+
+    rc = claude_worker.pnl_report.run_day(
+        logs, tmp_path / "reports", day, lines.append, run_fn=fn, window_root=root
+    )
+    assert rc == 0
+    assert sorted(p.name for p in root.iterdir()) == ["keep-me"]
+    assert any("swept 2 stale unit dir(s)" in ln for ln in lines), lines
 
 
 def test_main_closed_day_selects_yesterday(tmp_path, monkeypatch):
