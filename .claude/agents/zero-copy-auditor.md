@@ -126,7 +126,10 @@ Everything else is presumed avoidable until proven otherwise.
    - **`Option<[u8; N]>` / `Result<[u8; N], _>` returns** — same thing,
      with a discriminant on top.
 10. Run the mechanical sweep and attach its output verbatim:
-    `scripts/copy-audit.sh [<crate dirs…>]` (also `make copy-audit`)
+    `scripts/copy-audit.sh [<crate dirs…>]` (also `make copy-audit`,
+    whose default set is the exec lane, core-net, core-ring, all nine
+    ingress crates and the HYPARB crates — a subset run reports the
+    other dirs' baseline keys as `paid=`, which is not debt paid)
     lists every copy verb in those crates that has no `// COPY:` marker
     within the eight preceding lines and is not in the committed
     baseline `scripts/copy-audit-baseline.txt` (pre-E1 legacy debt —

@@ -36,7 +36,7 @@ use ingress_polymarket::run_loop::{
     drive_one, note_transport_ready, Driver, State, SymbolMap, DEFAULT_TICK_RING_CAP,
 };
 use ingress_rpc::{
-    parse_block_number_result, parse_new_head_notification, write_request_eth_block_number,
+    eth_block_number_request_parts, parse_block_number_result, parse_new_head_notification,
 };
 
 /// Push/pop a Tick through the SPSC ring 10_000 times — must not
@@ -219,7 +219,9 @@ fn rpc_block_number_is_zero_alloc() {
 
     let mut acc: u64 = 0;
     for i in 0..10_000u64 {
-        let n = write_request_eth_block_number(&mut req, i).unwrap();
+        let mut digits = [0u8; 20];
+        let parts = eth_block_number_request_parts(i, &mut digits);
+        let n = core_net::ws_write_binary_frame_parts(&mut req, &parts, [1, 2, 3, 4]).unwrap();
         acc = acc.wrapping_add(n as u64);
         let (id, block) = parse_block_number_result(resp).unwrap();
         acc = acc.wrapping_add(id).wrapping_add(block);

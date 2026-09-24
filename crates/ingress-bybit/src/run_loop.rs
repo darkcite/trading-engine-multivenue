@@ -178,6 +178,12 @@ impl Driver {
     pub fn new(nonce_seed: u64, symbols: BybitSymbolTable, want_tickers: bool) -> Self {
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        // COPY: the 2 056 B symbol table moves into the driver, and the
+        // 4 296 B driver returns by value — once per connection, at boot —
+        // the driver holds its table INLINE so every hot lookup walks
+        // contiguous rows with no pointer to chase — rejected: a `Box` (a
+        // heap hop on the hot lookup) and a two-phase in-place init behind
+        // `&mut` (for a boot-only cost).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -511,14 +517,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -828,6 +834,13 @@ fn log_sub_drop_rate_limited(drv: &mut Driver) {
     let mut ok = true;
     let put = |buf: &mut [u8; 128], n: &mut usize, ok: &mut bool, src: &[u8]| {
         if *n + src.len() <= buf.len() {
+            // COPY: one part of the WARN line into the 128 B stack line, rate-limited
+            // to one line per DROP_LOG_INTERVAL_NS (1 s) — the line must reach stderr in
+            // ONE write so it cannot interleave with the cli's tracing output —
+            // rejected: one write per part (interleaves), `write!` into the same buffer
+            // (the same bytes, through fmt), and one `writev` of the parts (a short
+            // writev splits the line and `write_all_vectored` is unstable; its retry
+            // loop costs more than assembling ≤ 128 B once a second).
             buf[*n..*n + src.len()].copy_from_slice(src);
             *n += src.len();
         } else {
@@ -881,13 +894,16 @@ fn fmt_u64(mut v: u64, scratch: &mut [u8; 20]) -> &[u8] {
 pub type StopFlag = AtomicBool;
 
 /// One connection slot for [`run_multi`] (spot or linear).
-pub struct BybitConn<T: Transport> {
+pub struct BybitConn<'a, T: Transport> {
     /// Live transport, `None` while disconnected.
     pub transport: Option<T>,
     /// Per-connection driver.
     pub drv: Driver,
-    host: Vec<u8>,
-    path: Vec<u8>,
+    /// Host bytes for the `Host:` header, borrowed from the boot's
+    /// endpoint list, which outlives the loop.
+    host: &'a [u8],
+    /// Request path, borrowed likewise.
+    path: &'a [u8],
     keepalive: core_net::Keepalive,
     backoff: core_net::Backoff,
     next_attempt_ns: NsTs,
@@ -895,22 +911,27 @@ pub struct BybitConn<T: Transport> {
     last_interest: Option<mio::Interest>,
 }
 
-impl<T: Transport> BybitConn<T> {
+impl<'a, T: Transport> BybitConn<'a, T> {
     /// New slot, initially disconnected (`next_attempt_ns` 0 = due
-    /// immediately). Boot-time allocation for host/path is sanctioned
-    /// (never touched on the hot path).
+    /// immediately). `host` and `path` are borrowed, not copied: the
+    /// boot keeps its endpoint list alive for as long as the loop runs.
     pub fn new(
         drv: Driver,
-        host: &[u8],
-        path: &[u8],
+        host: &'a [u8],
+        path: &'a [u8],
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
+        // COPY: the Driver (4 296 B, its symbol table inline) moves into its
+        // slot here and, with the slot (5 488 B), into the boot's Vec — two
+        // moves per connection, once, at boot — rejected: a two-phase
+        // in-place init behind `&mut` (every constructor split, for a
+        // boot-only cost).
         Self {
             transport: None,
             drv,
-            host: host.to_vec(),
-            path: path.to_vec(),
+            host,
+            path,
             keepalive,
             backoff,
             next_attempt_ns: 0,
@@ -944,7 +965,7 @@ impl<T: Transport> BybitConn<T> {
 // loop (CLAUDE.md hot-path rules; `i` is also the mio Token identity).
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn run_multi<T: Transport, C: Capture>(
-    conns: &mut [BybitConn<T>],
+    conns: &mut [BybitConn<'_, T>],
     producer: &mut Producer<Tick, DEFAULT_TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
@@ -980,6 +1001,12 @@ pub fn run_multi<T: Transport, C: Capture>(
                         conns[i].drv.reset_for_reconnect(now);
                         conns[i].keepalive.reset();
                         conns[i].session_start_ns = now;
+                        // COPY: the new transport (1 080 B `TlsTransport`, rustls'
+                        // ClientConnection held inline) moves from `connect` into
+                        // its slot — once per reconnect, beside a TCP + TLS
+                        // handshake that costs orders of magnitude more —
+                        // rejected: a placement API on core-net's connect, for
+                        // one move per reconnect.
                         conns[i].transport = Some(t);
                     }
                 }
@@ -1020,8 +1047,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                 let n_before = producer.len();
                 let state_before = c.drv.state();
                 if drive_one(
-                    t, &mut c.drv, &c.host, &c.path, producer, event_tx, event_mask, status,
-                    capture,
+                    t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
                 )
                 .is_err()
                 {
@@ -1221,6 +1247,31 @@ mod tests {
         }
         fn parse_reject(&mut self, _ts: u64, _p: &[u8]) {
             self.rejects += 1;
+        }
+    }
+
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = steady_driver(false);
+            let (mut prod, _cons) = ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
         }
     }
 

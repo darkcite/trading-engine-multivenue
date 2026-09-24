@@ -1228,7 +1228,7 @@ pub fn spawn_bybit(
                     return;
                 }
             };
-            let mut conns: Vec<ywl::BybitConn<TlsTransport>> = Vec::with_capacity(specs.len());
+            let mut conns: Vec<ywl::BybitConn<'_, TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
                 let mut drv = ywl::Driver::new(
                     now_ns().wrapping_add(i as u64),
@@ -1237,6 +1237,8 @@ pub fn spawn_bybit(
                 );
                 // VT2: one estimator per CONNECTION, same threshold.
                 drv.set_stale_after_ms(stale_after_ms);
+                // COPY: the slot (its Driver inline, 5 488 B) moves into the
+                // Vec once at boot — see `BybitConn::new`.
                 conns.push(ywl::BybitConn::new(
                     drv,
                     eps[i].host.as_bytes(),
@@ -1361,7 +1363,7 @@ pub fn spawn_mexc(
                     return;
                 }
             };
-            let mut conns: Vec<mxl::MexcConn<TlsTransport>> = Vec::with_capacity(specs.len());
+            let mut conns: Vec<mxl::MexcConn<'_, TlsTransport>> = Vec::with_capacity(specs.len());
             for (i, spec) in specs.into_iter().enumerate() {
                 let mut drv =
                     mxl::Driver::new(now_ns().wrapping_add(i as u64), spec.class, spec.table);
@@ -1376,6 +1378,8 @@ pub fn spawn_mexc(
                         return;
                     }
                 }
+                // COPY: the slot (its Driver inline, 3 008 B) moves into the
+                // Vec once at boot — see `MexcConn::new`.
                 conns.push(mxl::MexcConn::new(
                     drv,
                     eps[i].host.as_bytes(),

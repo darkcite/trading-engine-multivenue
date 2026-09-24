@@ -267,15 +267,18 @@ fn boot(script: Script) -> (u16, Arc<ClientConfig>, mpsc::Receiver<ClientFrame>)
                 thread::sleep(Duration::from_millis(30));
                 let _ = stream.write_all(&f2[cut..]);
                 let _ = stream.flush();
-                // Two messages in ONE write, then a Ping with a payload,
-                // in the same write too.
+                // Two messages in ONE write, then three Pings — empty, a
+                // word, and the 125 B control-frame cap — in the same write
+                // too.
                 let mut two = server_frame(0x1, br#"{"channel":"orderUpdates","data":[]}"#);
                 two.extend_from_slice(&server_frame(0x1, br#"{"channel":"pong"}"#));
-                two.extend_from_slice(&server_frame(0x9, b"hl-ping-7"));
+                for p in core_net::TestTransport::PING_ECHO_CASES {
+                    two.extend_from_slice(&server_frame(0x9, p));
+                }
                 let _ = stream.write_all(&two);
                 let _ = stream.flush();
-                // The pong the client owes us.
-                read_client_frames(&mut stream, &mut buf, &mut len, 1, &tx);
+                // The three pongs the client owes us.
+                read_client_frames(&mut stream, &mut buf, &mut len, 3, &tx);
                 // And a Close.
                 let _ = stream.write_all(&server_frame(0x8, &[0x03, 0xE8]));
                 let _ = stream.flush();
@@ -361,10 +364,13 @@ fn the_stream_script_round_trips_every_frame_shape() {
     assert_eq!(got[2], br#"{"channel":"orderUpdates","data":[]}"#.to_vec());
     assert_eq!(got[3], br#"{"channel":"pong"}"#.to_vec());
 
-    // The Ping that rode in with them was answered with its payload.
-    let pong = from_server.recv_timeout(Duration::from_secs(5)).expect("pong");
-    assert_eq!(pong.opcode, WsOpcode::Pong);
-    assert_eq!(pong.payload, b"hl-ping-7".to_vec());
+    // The Pings that rode in with them were answered, in order, each
+    // with its own payload.
+    for want in core_net::TestTransport::PING_ECHO_CASES {
+        let pong = from_server.recv_timeout(Duration::from_secs(5)).expect("pong");
+        assert_eq!(pong.opcode, WsOpcode::Pong);
+        assert_eq!(pong.payload, want.to_vec(), "the echo of a {} B ping", want.len());
+    }
 
     // The Close is a disconnect, and the socket is gone.
     let mut rest: Vec<Vec<u8>> = Vec::new();

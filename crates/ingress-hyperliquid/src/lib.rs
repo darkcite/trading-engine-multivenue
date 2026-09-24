@@ -1047,8 +1047,8 @@ impl HlCoinTable {
     /// Reserve an EMPTY row bound to `sym` and return its index.
     ///
     /// BIN15 O2: the slot exists from boot so that `SymbolId` is
-    /// stable, but names no venue instrument until [`Self::rebind`]
-    /// writes one. A reserved row is skipped by [`Self::lookup`],
+    /// stable, but names no venue instrument until
+    /// [`Self::rebind_outcome`] writes one. A reserved row is skipped by [`Self::lookup`],
     /// [`expected_mask`] and the run loop's subscribe sweep, so a
     /// dormant family costs nothing on the wire. Boot-time only.
     pub fn reserve(&mut self, sym: SymbolId) -> Result<usize, CoinTableErr> {
@@ -1064,25 +1064,27 @@ impl HlCoinTable {
         Ok(idx)
     }
 
-    /// Point row `idx` at `coin`, keeping its `SymbolId`.
-    ///
-    /// An EMPTY `coin` unbinds the row (the slot stays reserved).
+    /// Point row `idx` at outcome `outcome`'s side-`side` coin
+    /// (`#<10·outcome + side>`), keeping its `SymbolId`. The coin is
+    /// rendered straight into the row — no buffer in between.
     /// **Ingress-thread only** — this is the roll. Allocation-free.
-    pub fn rebind(&mut self, idx: usize, coin: &[u8]) -> Result<(), CoinTableErr> {
+    pub fn rebind_outcome(
+        &mut self,
+        idx: usize,
+        outcome: u32,
+        side: usize,
+    ) -> Result<(), CoinTableErr> {
+        use crate::family::{render_outcome_coin, HL_OUTCOME_COIN_MAX};
+        const { assert!(HL_OUTCOME_COIN_MAX <= HL_COIN_MAX) };
         if idx >= self.len {
             return Err(CoinTableErr::NoSuchRow);
         }
-        if coin.len() > HL_COIN_MAX {
-            return Err(CoinTableErr::TooLong);
-        }
         let row = &mut self.rows[idx];
-        row.0 = coin.len() as u8;
         row.1 = [0; HL_COIN_MAX];
-        let mut k = 0usize;
-        while k < coin.len() {
-            row.1[k] = coin[k];
-            k += 1;
-        }
+        let Some(dst) = row.1.first_chunk_mut::<HL_OUTCOME_COIN_MAX>() else {
+            return Err(CoinTableErr::TooLong);
+        };
+        row.0 = render_outcome_coin(dst, outcome, side) as u8;
         Ok(())
     }
 
@@ -1099,6 +1101,10 @@ impl HlCoinTable {
         }
         let row = &mut self.rows[self.len];
         row.0 = coin.len() as u8;
+        // COPY: ≤ 24 B coin (HL_COIN_MAX) into its coin-table row, once per coin
+        // at boot — the table owns fixed rows so the hot lookup compares in place
+        // with no pointer chase — rejected: borrowing the boot strings (the table
+        // moves onto the ingress thread and must not pin boot allocations).
         row.1[..coin.len()].copy_from_slice(coin);
         row.2 = sym;
         self.len += 1;
@@ -1438,69 +1444,59 @@ impl HlStaleness {
 }
 
 // ---------------------------------------------------------------
-// Subscribe writer + SubId derivation
+// Subscription frames as wire parts + SubId derivation
 // ---------------------------------------------------------------
 
-#[inline]
-fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
-    let end = at.checked_add(src.len())?;
-    dst.get_mut(at..end)?.copy_from_slice(src);
-    Some(end)
+/// A subscription frame's verb.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HlSubVerb {
+    /// `"method":"subscribe"`.
+    Subscribe,
+    /// `"method":"unsubscribe"` — BIN15 O2: when a rolling family's
+    /// instance settles, its two coins must stop consuming a
+    /// subscription slot on the venue side before the next instance's
+    /// are opened. The venue's echo is deliberately IGNORED —
+    /// `parse_sub_response` matches only `"method":"subscribe"`, so an
+    /// unsubscribe ack cannot disturb the ack mask and none is awaited.
+    Unsubscribe,
 }
 
-/// Serialize one `{"method":"subscribe","subscription":{...}}` frame
-/// into `dst`. Hyperliquid takes **one subscription per message** —
-/// there is no batch form; the run loop queues one frame per
-/// configured pair (well inside the 2000 client msgs/min budget).
-/// Returns the byte length, `None` if `dst` is too small or a
-/// per-coin channel is missing its coin.
+/// `{"method":"<verb>","subscription":{"type":"<name>"[,"coin":"<coin>"]}}`
+/// as wire parts for `core_net::queue_masked_text_frame_parts`, laid
+/// into the caller's `parts` in place — the frame is never assembled
+/// anywhere first. Hyperliquid takes **one subscription per message** —
+/// there is no batch form; the run loop queues one frame per configured
+/// pair (well inside the 2000 client msgs/min budget). A global channel
+/// leaves the two coin parts empty. `false`, with `parts` untouched,
+/// when coin presence disagrees with the channel.
 #[inline]
-pub fn write_subscribe(dst: &mut [u8], channel: HlChannel, coin: Option<&[u8]>) -> Option<usize> {
+#[must_use = "on `false` the parts were not written"]
+pub fn subscription_parts<'a>(
+    verb: HlSubVerb,
+    channel: HlChannel,
+    coin: Option<&'a [u8]>,
+    parts: &mut [&'a [u8]; 5],
+) -> bool {
     if channel.per_coin() != coin.is_some() {
-        return None;
+        return false;
     }
-    let mut n = 0;
-    n = push_bytes(
-        dst,
-        n,
-        b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"",
-    )?;
-    n = push_bytes(dst, n, channel.wire_name())?;
-    if let Some(c) = coin {
-        n = push_bytes(dst, n, b"\",\"coin\":\"")?;
-        n = push_bytes(dst, n, c)?;
+    parts[0] = match verb {
+        HlSubVerb::Subscribe => b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"",
+        HlSubVerb::Unsubscribe => b"{\"method\":\"unsubscribe\",\"subscription\":{\"type\":\"",
+    };
+    parts[1] = channel.wire_name();
+    match coin {
+        Some(c) => {
+            parts[2] = b"\",\"coin\":\"";
+            parts[3] = c;
+        }
+        None => {
+            parts[2] = b"";
+            parts[3] = b"";
+        }
     }
-    n = push_bytes(dst, n, b"\"}}")?;
-    Some(n)
-}
-
-/// Render `{"method":"unsubscribe","subscription":{…}}` into `dst`.
-///
-/// BIN15 O2: when a rolling family's instance settles, its two coins
-/// must stop consuming a subscription slot on the venue side before
-/// the next instance's are opened. The frame is [`write_subscribe`]'s
-/// with one verb changed, and the venue's echo is deliberately
-/// IGNORED — `parse_sub_response` matches only `"method":"subscribe"`,
-/// so an unsubscribe ack cannot disturb the ack mask and none is
-/// awaited.
-#[inline]
-pub fn write_unsubscribe(dst: &mut [u8], channel: HlChannel, coin: Option<&[u8]>) -> Option<usize> {
-    if channel.per_coin() != coin.is_some() {
-        return None;
-    }
-    let mut n = 0;
-    n = push_bytes(
-        dst,
-        n,
-        b"{\"method\":\"unsubscribe\",\"subscription\":{\"type\":\"",
-    )?;
-    n = push_bytes(dst, n, channel.wire_name())?;
-    if let Some(c) = coin {
-        n = push_bytes(dst, n, b"\",\"coin\":\"")?;
-        n = push_bytes(dst, n, c)?;
-    }
-    n = push_bytes(dst, n, b"\"}}")?;
-    Some(n)
+    parts[4] = b"\"}}";
+    true
 }
 
 /// FNV-1a 64-bit over the channel tag byte + coin bytes — a stable
@@ -1979,7 +1975,7 @@ mod tests {
         assert_eq!(m.count_ones(), 4, "BTC's four channels only");
 
         // Bound: it resolves, keeps its sym, and joins the mask.
-        t.rebind(slot, b"#26490").unwrap();
+        t.rebind_outcome(slot, 2649, 0).unwrap();
         assert_eq!(t.lookup(b"#26490"), Some(4096));
         assert_eq!(t.index_of_coin(b"#26490"), Some(slot));
         let (m, _g) = expected_mask(&t);
@@ -1989,20 +1985,13 @@ mod tests {
         assert_eq!(m.count_ones(), 7);
 
         // Rebound again: the OLD coin stops resolving, the sym holds.
-        t.rebind(slot, b"#26500").unwrap();
+        t.rebind_outcome(slot, 2650, 1).unwrap();
         assert_eq!(t.lookup(b"#26490"), None);
-        assert_eq!(t.lookup(b"#26500"), Some(4096));
-        // Unbound by an empty coin; the slot survives.
-        t.rebind(slot, b"").unwrap();
-        assert_eq!(t.lookup(b"#26500"), None);
+        assert_eq!(t.lookup(b"#26501"), Some(4096));
         assert_eq!(t.len(), 2);
         assert_eq!(t.get(slot).unwrap().1, 4096);
         // Bad input.
-        assert_eq!(t.rebind(9, b"BTC"), Err(CoinTableErr::NoSuchRow));
-        assert_eq!(
-            t.rebind(slot, &[b'A'; HL_COIN_MAX + 1]),
-            Err(CoinTableErr::TooLong)
-        );
+        assert_eq!(t.rebind_outcome(9, 1, 0), Err(CoinTableErr::NoSuchRow));
     }
 
     /// `n` NAMED coins — what the monitor is meant to judge.
@@ -2111,7 +2100,7 @@ mod tests {
         );
 
         // The family goes live: rebind + reset brings it under watch.
-        coins.rebind(reserved, b"@2750").expect("rebind");
+        coins.rebind_outcome(reserved, 275, 0).expect("rebind");
         s.reset(reserved, 100_100);
         assert_eq!(s.first_stale(100_500), None, "inside budget");
         // Keep the named coin fresh so the next assertion can only be
@@ -2145,30 +2134,34 @@ mod tests {
         assert_eq!(d.first_stale(u64::MAX), None);
     }
 
+    /// The frame payload `subscription_parts` spells, laid end to end.
+    fn spelled(verb: HlSubVerb, channel: HlChannel, coin: Option<&[u8]>) -> Option<Vec<u8>> {
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        subscription_parts(verb, channel, coin, &mut parts).then(|| parts.concat())
+    }
+
     #[test]
     fn unsubscribe_is_the_subscribe_frame_with_one_verb_changed() {
-        let mut sub_buf = [0u8; 160];
-        let mut unsub_buf = [0u8; 160];
-        let ns = write_subscribe(&mut sub_buf, HlChannel::Bbo, Some(b"#26490")).unwrap();
-        let nu = write_unsubscribe(&mut unsub_buf, HlChannel::Bbo, Some(b"#26490")).unwrap();
+        let sub = spelled(HlSubVerb::Subscribe, HlChannel::Bbo, Some(b"#26490")).unwrap();
+        let unsub = spelled(HlSubVerb::Unsubscribe, HlChannel::Bbo, Some(b"#26490")).unwrap();
         assert_eq!(
-            &unsub_buf[..nu],
+            unsub,
             br##"{"method":"unsubscribe","subscription":{"type":"bbo","coin":"#26490"}}"##
         );
         // Identical but for the verb.
-        let a = core::str::from_utf8(&sub_buf[..ns]).unwrap();
-        let b = core::str::from_utf8(&unsub_buf[..nu]).unwrap();
+        let a = core::str::from_utf8(&sub).unwrap();
+        let b = core::str::from_utf8(&unsub).unwrap();
         assert_eq!(a.replace("\"subscribe\"", "\"unsubscribe\""), b);
         // The global form takes no coin, and the arity rule holds.
-        let n = write_unsubscribe(&mut unsub_buf, HlChannel::AllMids, None).unwrap();
+        let global = spelled(HlSubVerb::Unsubscribe, HlChannel::AllMids, None).unwrap();
         assert_eq!(
-            &unsub_buf[..n],
+            global,
             br#"{"method":"unsubscribe","subscription":{"type":"allMids"}}"#
         );
-        assert!(write_unsubscribe(&mut unsub_buf, HlChannel::Bbo, None).is_none());
-        assert!(write_unsubscribe(&mut unsub_buf, HlChannel::AllMids, Some(b"BTC")).is_none());
+        assert!(spelled(HlSubVerb::Unsubscribe, HlChannel::Bbo, None).is_none());
+        assert!(spelled(HlSubVerb::Unsubscribe, HlChannel::AllMids, Some(b"BTC")).is_none());
         // An unsubscribe echo is NOT an ack (the parser gates on the verb).
-        assert!(parse_sub_response(&unsub_buf[..n]).is_none());
+        assert!(parse_sub_response(&global).is_none());
     }
 
     // ---- staleness monitor ---------------------------------------
@@ -2205,36 +2198,41 @@ mod tests {
         assert_eq!(s.first_stale(u64::MAX), None);
     }
 
-    // ---- subscribe writer ----------------------------------------
+    // ---- subscription parts ---------------------------------------
 
     #[test]
-    fn write_subscribe_exact_bytes() {
-        let mut dst = [0u8; 160];
-        let n = write_subscribe(&mut dst, HlChannel::Bbo, Some(b"BTC")).unwrap();
+    fn subscription_parts_spell_the_exact_bytes() {
         assert_eq!(
-            &dst[..n],
-            br#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"# as &[u8]
+            spelled(HlSubVerb::Subscribe, HlChannel::Bbo, Some(b"BTC")).unwrap(),
+            br#"{"method":"subscribe","subscription":{"type":"bbo","coin":"BTC"}}"#
         );
-        let n = write_subscribe(&mut dst, HlChannel::AllMids, None).unwrap();
         assert_eq!(
-            &dst[..n],
-            br#"{"method":"subscribe","subscription":{"type":"allMids"}}"# as &[u8]
+            spelled(HlSubVerb::Subscribe, HlChannel::AllMids, None).unwrap(),
+            br#"{"method":"subscribe","subscription":{"type":"allMids"}}"#
         );
-        let n = write_subscribe(&mut dst, HlChannel::L2Book, Some(b"#330")).unwrap();
         assert_eq!(
-            &dst[..n],
+            spelled(HlSubVerb::Subscribe, HlChannel::L2Book, Some(b"#330")).unwrap(),
             br##"{"method":"subscribe","subscription":{"type":"l2Book","coin":"#330"}}"##
-                as &[u8]
         );
     }
 
     #[test]
-    fn write_subscribe_rejects_coin_mismatch_and_tiny_dst() {
-        let mut dst = [0u8; 160];
-        assert!(write_subscribe(&mut dst, HlChannel::Bbo, None).is_none());
-        assert!(write_subscribe(&mut dst, HlChannel::AllMids, Some(b"BTC")).is_none());
-        let mut tiny = [0u8; 8];
-        assert!(write_subscribe(&mut tiny, HlChannel::Bbo, Some(b"BTC")).is_none());
+    fn subscription_parts_refuse_a_coin_mismatch_and_write_nothing() {
+        let x: &[u8] = b"x";
+        let mut parts = [x; 5];
+        assert!(!subscription_parts(
+            HlSubVerb::Subscribe,
+            HlChannel::Bbo,
+            None,
+            &mut parts
+        ));
+        assert!(!subscription_parts(
+            HlSubVerb::Subscribe,
+            HlChannel::AllMids,
+            Some(b"BTC"),
+            &mut parts
+        ));
+        assert_eq!(parts, [x; 5], "a refusal writes nothing");
     }
 
     // ---- sub ids --------------------------------------------------

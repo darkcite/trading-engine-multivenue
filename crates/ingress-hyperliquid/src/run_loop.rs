@@ -52,10 +52,11 @@ use std::sync::Arc;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, ReqKind,
-    Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_parts,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf,
+    Keepalive, KeepaliveAction, ReqKind, Status, SubErr, SubId, SubTable, Transport, WsOpcode,
+    WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, WallAnchor};
@@ -66,19 +67,14 @@ use core_types::{
 };
 
 use crate::discovery::{parse_outcome_spec, HlOutcomeSpec};
-use crate::family::{
-    pack_roll_seq, render_outcome_coin, HlFamilyTable, HlRollStatus, HL_OUTCOME_COIN_MAX,
-    ROLL_ACK_ALL, ROLL_CHANNELS,
-};
+use crate::family::{pack_roll_seq, HlFamilyTable, HlRollStatus, ROLL_ACK_ALL, ROLL_CHANNELS};
 use crate::{
-    bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, outcome_meta_description,
-    is_outcome_coin, parse_active_asset_ctx, parse_all_mids, parse_bbo, parse_l2book_depth,
-    parse_l2book_header,
-    parse_outcome_meta, parse_sub_response, parse_trade, sub_id_of, write_subscribe,
-    write_unsubscribe, GlobalBits,
-    HlChannel, HlCoinTable, HlMsgKind, HlStaleness, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN,
-    HL_MAX_COINS, OUTCOME_CREATED, OUTCOME_ENC_NONE, OUTCOME_META_BIT, OUTCOME_SETTLED,
-    PING_PAYLOAD,
+    bit_of, classify, coin_wants_asset_ctx, expected_mask, extract_coin, is_outcome_coin,
+    outcome_meta_description, parse_active_asset_ctx, parse_all_mids, parse_bbo,
+    parse_l2book_depth, parse_l2book_header, parse_outcome_meta, parse_sub_response, parse_trade,
+    sub_id_of, subscription_parts, GlobalBits, HlChannel, HlCoinTable, HlMsgKind, HlStaleness,
+    HlSubVerb, MaskBits, ALL_MIDS_BIT, CHANNELS_PER_COIN, HL_MAX_COINS, OUTCOME_CREATED,
+    OUTCOME_ENC_NONE, OUTCOME_META_BIT, OUTCOME_SETTLED, PING_PAYLOAD,
 };
 
 // ---------------------------------------------------------------
@@ -110,10 +106,6 @@ pub const TICK_RING_CAP: usize = 16_384;
 /// Upper bound on subscriptions: 4 per-coin channels ×
 /// [`HL_MAX_COINS`] + `allMids` + `outcomeMetaUpdates`.
 pub const MAX_SUBS: usize = CHANNELS_PER_COIN * HL_MAX_COINS + 2;
-
-/// Stack scratch for one rendered subscribe frame (longest:
-/// `l2Book` + a [`crate::HL_COIN_MAX`]-byte coin ≈ 90 B).
-const SUBSCRIBE_SCRATCH: usize = 160;
 
 /// Ack deadline: every subscribe must be echoed within this budget
 /// of entering `Steady` (acks normally arrive within one RTT; 5 s
@@ -587,41 +579,42 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()
 // Subscribe queueing (one frame per subscription — venue protocol)
 // ---------------------------------------------------------------
 
+/// Queue one (un)subscribe frame, its parts masked straight into `tx`.
+///
+/// Takes the two tx fields, never the driver: every caller reads its
+/// coin in place from `drv.coins`, a field disjoint from these, so no
+/// coin is copied out first. An unsubscribe awaits no ack (see
+/// [`HlSubVerb::Unsubscribe`]).
 #[inline]
-fn queue_one_subscribe(
-    drv: &mut Driver,
+fn queue_one(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    verb: HlSubVerb,
     channel: HlChannel,
     coin: Option<&[u8]>,
 ) -> io::Result<()> {
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = write_subscribe(&mut scratch, channel, coin)
-        .ok_or_else(|| io::Error::other("hl: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    if !subscription_parts(verb, channel, coin, &mut parts) {
+        return Err(io::Error::other(
+            "hl: coin presence disagrees with the channel",
+        ));
+    }
+    queue_masked_text_frame_parts(tx, mask_counter, &parts)
 }
 
-/// BIN15 O2: queue one unsubscribe frame. No ack is awaited — the
-/// venue's echo names `"method":"unsubscribe"`, which
-/// `parse_sub_response` does not accept, so it cannot disturb the ack
-/// mask.
+/// Queue the three per-coin channels for one coin — the roll's
+/// subscribe half.
 #[inline]
-fn queue_one_unsubscribe(
-    drv: &mut Driver,
-    channel: HlChannel,
-    coin: Option<&[u8]>,
-) -> io::Result<()> {
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = write_unsubscribe(&mut scratch, channel, coin)
-        .ok_or_else(|| io::Error::other("hl: unsubscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])
-}
-
-/// Queue the three per-coin channels for one coin held in stack
-/// scratch — the roll's subscribe half.
-#[inline]
-fn queue_roll_subscribes(drv: &mut Driver, coin: &[u8]) -> io::Result<()> {
+fn queue_roll_subscribes(tx: &mut IoBuf, mask_counter: &mut u64, coin: &[u8]) -> io::Result<()> {
     let mut c = 0usize;
     while c < ROLL_CHANNELS.len() {
-        queue_one_subscribe(drv, ROLL_CHANNELS[c], Some(coin))?;
+        queue_one(
+            tx,
+            mask_counter,
+            HlSubVerb::Subscribe,
+            ROLL_CHANNELS[c],
+            Some(coin),
+        )?;
         c += 1;
     }
     Ok(())
@@ -725,28 +718,26 @@ fn perform_roll<C: Capture>(
     let had_live = row.live.outcome != 0;
 
     if !settled {
-        // (a) Unsubscribe the outgoing instance, reading its coins out
-        // of the table before the rebind overwrites them.
+        // (a) Unsubscribe the outgoing instance while its coins are
+        // still in the table — the rebind below overwrites them. The
+        // frames go through `tx`, a field disjoint from `coins`, so each
+        // coin is read in place.
         if had_live {
-            let mut old = [[0u8; crate::HL_COIN_MAX]; 2];
-            let mut old_len = [0usize; 2];
             let mut side = 0usize;
             while side < 2 {
                 if let Some((coin, _sym)) = drv.coins.get(coin_idx[side]) {
-                    old_len[side] = coin.len();
-                    old[side][..coin.len()].copy_from_slice(coin);
-                }
-                side += 1;
-            }
-            let mut side = 0usize;
-            while side < 2 {
-                if old_len[side] > 0 {
-                    let coin = old[side];
-                    let n = old_len[side];
-                    let mut c = 0usize;
-                    while c < ROLL_CHANNELS.len() {
-                        queue_one_unsubscribe(drv, ROLL_CHANNELS[c], Some(&coin[..n]))?;
-                        c += 1;
+                    if !coin.is_empty() {
+                        let mut c = 0usize;
+                        while c < ROLL_CHANNELS.len() {
+                            queue_one(
+                                &mut drv.tx,
+                                &mut drv.mask_counter,
+                                HlSubVerb::Unsubscribe,
+                                ROLL_CHANNELS[c],
+                                Some(coin),
+                            )?;
+                            c += 1;
+                        }
                     }
                 }
                 side += 1;
@@ -757,12 +748,13 @@ fn perform_roll<C: Capture>(
             debug_assert!(false, "hl roll: rebind refused");
             return Ok(());
         }
-        // (c) Subscribe the incoming instance.
+        // (c) Subscribe the incoming instance — its coins now sit in the
+        // table, read there in place.
         let mut side = 0usize;
         while side < 2 {
-            let mut buf = [0u8; HL_OUTCOME_COIN_MAX];
-            let n = render_outcome_coin(&mut buf, spec.outcome, side);
-            queue_roll_subscribes(drv, &buf[..n])?;
+            if let Some((coin, _sym)) = drv.coins.get(coin_idx[side]) {
+                queue_roll_subscribes(&mut drv.tx, &mut drv.mask_counter, coin)?;
+            }
             side += 1;
         }
         if let Some(row) = drv.families.get_mut(family_idx) {
@@ -861,14 +853,10 @@ pub fn roll_health<C: Capture>(
                 // without widening the row.
                 let mut side = 0usize;
                 while side < 2 {
-                    let mut buf = [0u8; crate::HL_COIN_MAX];
-                    let mut n = 0usize;
                     if let Some((coin, _sym)) = drv.coins.get(coin_idx[side]) {
-                        n = coin.len();
-                        buf[..n].copy_from_slice(coin);
-                    }
-                    if n > 0 {
-                        queue_roll_subscribes(drv, &buf[..n])?;
+                        if !coin.is_empty() {
+                            queue_roll_subscribes(&mut drv.tx, &mut drv.mask_counter, coin)?;
+                        }
                     }
                     side += 1;
                 }
@@ -897,35 +885,38 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     let mut i = 0;
     while i < drv.coins.len() {
         // Row `i` exists — bounded by the loop condition.
-        let (coin_bytes, _sym) = match drv.coins.get(i) {
+        let (coin, _sym) = match drv.coins.get(i) {
             Some(row) => row,
             None => break,
         };
-        // Borrow discipline: copy the coin into stack scratch so the
-        // `&drv.coins` borrow ends before `&mut drv.tx` is taken.
-        let mut coin_buf = [0u8; crate::HL_COIN_MAX];
-        let coin_len = coin_bytes.len();
         // BIN15 O2: a RESERVED row (a dormant family's slot) names no
         // instrument — nothing to subscribe, and nothing waited on in
         // `expected_mask` either.
-        if coin_len == 0 {
+        if coin.is_empty() {
             i += 1;
             continue;
         }
-        coin_buf[..coin_len].copy_from_slice(coin_bytes);
-        let coin = &coin_buf[..coin_len];
-        let wants_ctx = coin_wants_asset_ctx(coin);
-
-        queue_one_subscribe(drv, HlChannel::Bbo, Some(coin))?;
-        queue_one_subscribe(drv, HlChannel::L2Book, Some(coin))?;
-        queue_one_subscribe(drv, HlChannel::Trades, Some(coin))?;
-        if wants_ctx {
-            queue_one_subscribe(drv, HlChannel::ActiveAssetCtx, Some(coin))?;
+        // The coin is read in place: the frames go through `tx` and
+        // `mask_counter`, fields disjoint from `coins`.
+        let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+        let sub = HlSubVerb::Subscribe;
+        queue_one(tx, mc, sub, HlChannel::Bbo, Some(coin))?;
+        queue_one(tx, mc, sub, HlChannel::L2Book, Some(coin))?;
+        queue_one(tx, mc, sub, HlChannel::Trades, Some(coin))?;
+        if coin_wants_asset_ctx(coin) {
+            queue_one(tx, mc, sub, HlChannel::ActiveAssetCtx, Some(coin))?;
         }
         i += 1;
     }
-    queue_one_subscribe(drv, HlChannel::AllMids, None)?;
-    queue_one_subscribe(drv, HlChannel::OutcomeMetaUpdates, None)?;
+    let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+    queue_one(tx, mc, HlSubVerb::Subscribe, HlChannel::AllMids, None)?;
+    queue_one(
+        tx,
+        mc,
+        HlSubVerb::Subscribe,
+        HlChannel::OutcomeMetaUpdates,
+        None,
+    )?;
     let (expected, expected_global) = expected_mask(&drv.coins);
     drv.expected = expected;
     drv.expected_global = expected_global;
@@ -1087,14 +1078,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -2046,6 +2037,31 @@ mod tests {
         let mut frame = vec![0u8; body.len() + 8];
         let n = wrap_text_frame(body, &mut frame);
         t.inject_incoming(&frame[..n]);
+    }
+
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = steady_driver();
+            let (mut prod, _cons) = ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
+        }
     }
 
     #[test]

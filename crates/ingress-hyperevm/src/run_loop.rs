@@ -47,18 +47,19 @@ use std::io;
 use core_amm::payload::{encode_gap, encode_head, Payload};
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_binary_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    PendingTable, ReqKind, Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_binary_frame, queue_masked_binary_frame_parts,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf,
+    Keepalive, KeepaliveAction, PendingTable, ReqKind, Status, SubErr, SubId, SubTable, Transport,
+    WsOpcode, WsReadResult,
 };
 use core_parse::{find_field, skip_byte, skip_ws};
 use core_ring::Producer;
 use core_time::now_ns;
 use core_types::{Capture, LatencyClass, NsTs, Signal, SymbolId, SYMBOL_ID_NONE};
 use ingress_rpc::{
-    classify_rpc, parse_rpc_error, write_request_eth_block_number,
-    write_request_subscribe_new_heads, RpcFrameKind,
+    classify_rpc, eth_block_number_request_parts, parse_rpc_error,
+    subscribe_new_heads_request_parts, RpcFrameKind,
 };
 
 use crate::logs::{parse_log, payloads, LogErr, LogMeta, PoolLog, SUBSCRIBED_TOPICS};
@@ -468,9 +469,9 @@ fn on_session_start<C: Capture, const CAP: usize>(
     drv.phase = Phase::Subscribing;
     let id = alloc_id(drv);
     record_pending(drv, id, RpcKind::SubscribeNewHeads)?;
-    let n = write_request_subscribe_new_heads(&mut drv.scratch[..], id)
-        .map_err(|_| io::Error::other("subscribe request buffer too small"))?;
-    queue_frame(drv, n)?;
+    let mut digits = [0u8; 20];
+    let parts = subscribe_new_heads_request_parts(id, &mut digits);
+    queue_masked_binary_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
     let id = alloc_id(drv);
     record_pending(drv, id, RpcKind::SubscribeLogs)?;
     let n = crate::rpc::write_request_subscribe_logs(
@@ -765,9 +766,9 @@ fn maybe_queue_block_number_poll(drv: &mut Driver) -> io::Result<()> {
     drv.next_poll_at_ns = now.saturating_add(RPC_POLL_NS);
     let id = alloc_id(drv);
     record_pending(drv, id, RpcKind::BlockNumber)?;
-    let n = write_request_eth_block_number(&mut drv.scratch[..], id)
-        .map_err(|_| io::Error::other("blockNumber request buffer too small"))?;
-    queue_frame(drv, n)
+    let mut digits = [0u8; 20];
+    let parts = eth_block_number_request_parts(id, &mut digits);
+    queue_masked_binary_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)
 }
 
 /// The next request id whose pending slot is free. Ids fold onto

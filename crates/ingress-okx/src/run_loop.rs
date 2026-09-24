@@ -66,10 +66,11 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, ReqKind,
-    Status, SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_parts,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf,
+    Keepalive, KeepaliveAction, ReqKind, Status, SubErr, SubId, SubTable, Transport, WsOpcode,
+    WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
@@ -79,9 +80,9 @@ use core_types::{
 };
 
 use crate::{
-    classify, extract_error_inst_id, extract_inst_id, parse_bbo, parse_book_header, parse_trade,
-    sub_id_of, write_subscribe_batch, write_unsubscribe_batch, ChainOutcome, OkxChannel,
-    OkxInstType, OkxMsgKind, OkxSeqChain, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome,
+    books_op_parts, classify, extract_error_inst_id, extract_inst_id, parse_bbo, parse_book_header,
+    parse_trade, sub_id_of, write_subscribe_batch, ChainOutcome, OkxChannel, OkxInstType,
+    OkxMsgKind, OkxSeqChain, OkxSubVerb, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome,
     OKX_MAX_SYMBOLS, PING_PAYLOAD,
 };
 
@@ -333,10 +334,21 @@ impl Driver {
                 continue;
             }
             fam[n_families].0 = f.len() as u8;
+            // COPY: ≤ 24 B option family (`BTC-USD`) into the driver's family table,
+            // ≤ OPT_FAMILIES_MAX (16) rows = ≤ 384 B, once at boot — the driver
+            // re-subscribes them every session, long after the boot's config slices are
+            // gone — rejected: a lifetime on `Driver` (threaded through the run loop,
+            // the spawn wrapper and every test) for ≤ 384 B.
             fam[n_families].1[..f.len()].copy_from_slice(f);
             n_families += 1;
             i += 1;
         }
+        // COPY: the 3 208 B symbol table and the ≤ 400 B family table above
+        // move into the driver, and the 7 696 B driver returns by value — once
+        // per connection, at boot — the driver holds its tables INLINE so
+        // every hot lookup walks contiguous rows with no pointer to chase —
+        // rejected: a `Box` per table (a heap hop on the hot lookup) and a
+        // two-phase in-place init behind `&mut` (for a boot-only cost).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -697,18 +709,11 @@ fn queue_books_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
         debug_assert!(false, "resync for unknown symbol row {sym_idx}");
         return Ok(());
     };
-    let args = [SubArg {
-        channel: OkxChannel::Books,
-        inst_id: inst,
-    }];
-    let mut scratch = [0u8; 256];
-    let n = write_unsubscribe_batch(&mut scratch, &args)
-        .ok_or_else(|| io::Error::other("okx: resync scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    let n = write_subscribe_batch(&mut scratch, &args)
-        .ok_or_else(|| io::Error::other("okx: resync scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    Ok(())
+    // The instrument is read in place and both frames are masked into
+    // tx part by part: `tx` is a field disjoint from `symbols`.
+    let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+    queue_masked_text_frame_parts(tx, mc, &books_op_parts(OkxSubVerb::Unsubscribe, inst))?;
+    queue_masked_text_frame_parts(tx, mc, &books_op_parts(OkxSubVerb::Subscribe, inst))
 }
 
 // ---------------------------------------------------------------
@@ -810,14 +815,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -1470,6 +1475,13 @@ fn log_sub_drop_rate_limited(drv: &mut Driver, sym: u32, code: u32) {
     let mut ok = true;
     let put = |buf: &mut [u8; 128], n: &mut usize, ok: &mut bool, src: &[u8]| {
         if *n + src.len() <= buf.len() {
+            // COPY: one part of the WARN line into the 128 B stack line, rate-limited
+            // to one line per DROP_LOG_INTERVAL_NS (1 s) — the line must reach stderr in
+            // ONE write so it cannot interleave with the cli's tracing output —
+            // rejected: one write per part (interleaves), `write!` into the same buffer
+            // (the same bytes, through fmt), and one `writev` of the parts (a short
+            // writev splits the line and `write_all_vectored` is unstable; its retry
+            // loop costs more than assembling ≤ 128 B once a second).
             buf[*n..*n + src.len()].copy_from_slice(src);
             *n += src.len();
         } else {
@@ -1980,6 +1992,31 @@ mod tests {
             keepalive,
             capture,
         )
+    }
+
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = steady_driver(false);
+            let (mut prod, _cons) = ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
+        }
     }
 
     #[test]

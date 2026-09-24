@@ -269,20 +269,12 @@ impl Driver {
         );
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
-        let mut id_bufs = [[0u8; crate::PM_ASSET_ID_MAX]; crate::PM_SUBSCRIBE_IDS_MAX];
-        let mut id_lens = [0u8; crate::PM_SUBSCRIBE_IDS_MAX];
         let count = ids.len().min(crate::PM_SUBSCRIBE_IDS_MAX);
-        for i in 0..count {
-            debug_assert!(
-                !ids[i].is_empty() && ids[i].len() <= crate::PM_ASSET_ID_MAX,
-                "polymarket asset id must be 1..={} bytes",
-                crate::PM_ASSET_ID_MAX
-            );
-            let len = ids[i].len().min(crate::PM_ASSET_ID_MAX);
-            id_bufs[i][..len].copy_from_slice(&ids[i][..len]);
-            id_lens[i] = len as u8;
-        }
-        Self {
+        // COPY: the 10 536 B driver (its id table inline) returns by value,
+        // once per connection at boot — rejected: a two-phase in-place init
+        // behind `&mut` (every constructor split, for a boot-only cost). The
+        // id table itself is filled in place below, never built beside it.
+        let mut d = Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
             tx: IoBuf::with_capacity(TX_BUF_SIZE),
@@ -290,13 +282,31 @@ impl Driver {
             expected_accept_val: accept,
             last_activity_ns: 0,
             mask_counter: 0,
-            asset_ids: id_bufs,
-            asset_id_lens: id_lens,
+            asset_ids: [[0u8; crate::PM_ASSET_ID_MAX]; crate::PM_SUBSCRIBE_IDS_MAX],
+            asset_id_lens: [0u8; crate::PM_SUBSCRIBE_IDS_MAX],
             asset_id_count: count as u16,
             subscribed: false,
             feed_clock: FeedClock::new(core_types::VenueId::Polymarket.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
+        };
+        let mut i = 0usize;
+        while i < count {
+            debug_assert!(
+                !ids[i].is_empty() && ids[i].len() <= crate::PM_ASSET_ID_MAX,
+                "polymarket asset id must be 1..={} bytes",
+                crate::PM_ASSET_ID_MAX
+            );
+            let len = ids[i].len().min(crate::PM_ASSET_ID_MAX);
+            // COPY: each ≤ 80 B CLOB token id into the driver's id table (≤ 128 ids,
+            // ≤ 10 240 B), once at boot — the driver re-sends them in every
+            // connection's market subscribe — rejected: a lifetime on `Driver`
+            // (threaded through drive_one, the run loop, the spawn wrapper and the alloc
+            // gate) to borrow the boot's id list.
+            d.asset_ids[i][..len].copy_from_slice(&ids[i][..len]);
+            d.asset_id_lens[i] = len as u8;
+            i += 1;
         }
+        d
     }
 
     /// VT2: override the staleness threshold (operator
@@ -587,18 +597,14 @@ fn drain_ws_frames<C: Capture>(
                         // frame per RFC 6455 §5.3.
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let payload_start = payload.start;
-                        let payload_end = payload.end;
-                        let payload_len = payload_end - payload_start;
-                        // Split-borrow: copy payload into a small stack
-                        // scratch so we can hand &mut drv.tx.free_mut()
-                        // into the writer without aliasing rx.
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(payload_len <= scratch.len());
-                        scratch[..payload_len]
-                            .copy_from_slice(&drv.rx.filled()[payload_start..payload_end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..payload_len], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -1314,49 +1320,32 @@ mod tests {
         assert_eq!(after.venue_time_ms, t0 - 60_000);
     }
 
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
     #[test]
     fn steady_state_replies_pong_to_ping() {
-        let mut t = TestTransport::with_capacity(4096);
-        let mut d = build_driver_with_seed(7);
-        d.set_state(State::Steady);
-
-        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
-        let (mut prod, _cons) = ring.split();
-        let map = SymbolMap::from_pairs(std::iter::empty());
-        let status = IngressStatus::new();
-
-        // Unmasked Ping with a 4-byte payload.
-        let mut frame = [0u8; 16];
-        frame[0] = 0x89; // FIN + Ping
-        frame[1] = 4;
-        frame[2..6].copy_from_slice(b"PING");
-        t.inject_incoming(&frame[..6]);
-
-        drive_one(
-            &mut t,
-            &mut d,
-            b"host",
-            b"/",
-            &mut prod,
-            &map,
-            &status,
-            &mut NullCapture,
-        )
-        .unwrap();
-        assert!(t.outgoing_len() > 0, "driver should have emitted a pong");
-
-        let mut out = [0u8; 64];
-        let n = t.drain_outgoing(&mut out);
-        // Pong is 0x8A + (0x80|4) + 4-byte mask + 4-byte XORed payload.
-        assert_eq!(out[0], 0x8A);
-        assert_eq!(out[1], 0x80 | 4);
-        let mask = [out[2], out[3], out[4], out[5]];
-        let mut unmasked = [0u8; 4];
-        for i in 0..4 {
-            unmasked[i] = out[6 + i] ^ mask[i & 3];
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = build_driver_with_seed(7);
+            d.set_state(State::Steady);
+            let (mut prod, _cons) = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new().split();
+            let map = SymbolMap::from_pairs(std::iter::empty());
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &map,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
         }
-        assert_eq!(&unmasked, b"PING");
-        assert_eq!(n, 10);
     }
 
     /// Inject an unmasked (server-side) text frame (short or 16-bit

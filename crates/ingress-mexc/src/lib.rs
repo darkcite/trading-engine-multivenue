@@ -118,8 +118,8 @@
 //!
 //! Everything after the handshake is zero-alloc and zero-copy: parsers
 //! return spans into the rx buffer; the only copies are the sanctioned
-//! ones marked `// COPY:` (subscribe render scratch, the WS ping echo,
-//! the 64-byte PODs moved into their ring slots).
+//! ones marked `// COPY:` (subscribe render scratch, the 64-byte PODs
+//! moved into their ring slots); the WS ping echo goes rx → tx.
 
 #![forbid(unsafe_code)]
 #![deny(

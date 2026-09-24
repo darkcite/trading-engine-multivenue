@@ -405,11 +405,8 @@ impl HlFamilyTable {
             let f = &self.rows[idx];
             (f.coin_idx[0] as usize, f.coin_idx[1] as usize)
         };
-        let mut buf = [0u8; HL_OUTCOME_COIN_MAX];
-        let n = render_outcome_coin(&mut buf, spec.outcome, 0);
-        coins.rebind(yes_idx, &buf[..n])?;
-        let n = render_outcome_coin(&mut buf, spec.outcome, 1);
-        coins.rebind(no_idx, &buf[..n])?;
+        coins.rebind_outcome(yes_idx, spec.outcome, 0)?;
+        coins.rebind_outcome(no_idx, spec.outcome, 1)?;
         let f = &mut self.rows[idx];
         f.live = *spec;
         f.dormant = false;

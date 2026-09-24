@@ -453,6 +453,11 @@ fn parse_row(
                         if s.is_empty() || s.len() > DERIBIT_INSTR_MAX || s.contains(&b'.') {
                             return Err(DeribitDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 32 B `instrument_name` (DERIBIT_INSTR_MAX) into its discovery
+                        // row, once per instrument row at boot — the row outlives the REST body it
+                        // was scanned from — rejected: rows borrowing the body (the instruments
+                        // body pinned for the table's life and a lifetime threaded through the
+                        // boot, to save ≤ 32 B a row).
                         instrument_name[..s.len()].copy_from_slice(s);
                         instrument_name_len = s.len() as u8;
                         i = end;

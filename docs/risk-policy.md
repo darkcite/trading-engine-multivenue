@@ -2715,6 +2715,110 @@ new=0; license-check OK; fourteen fuzz targets 60 s each, no crash
 (1.1 M–31 M runs); live smokes 60 s — MEXC 31 002 messages, Binance
 59 819 — both with 0 parse errors and 0 reconnects.
 
+### ZC pass B — the seven ingress crates join the zero-copy gate (2026-09-24)
+
+On the operator's word (the zero-copy next-pass plan; its open questions
+ruled 2026-09-24 — every plan default, plus: delete
+`drain_and_count_loop`, drop `book-builder`'s unused `core-ring`
+dependency, commit each green checkpoint): item 2 of "Open, not in this
+pass" above is closed. `ingress-okx`, `-deribit`, `-hyperliquid`,
+`-mexc`, `-bybit`, `-polymarket` and `-rpc` — and `core-ring` — are in
+`make copy-audit`'s default scope, which now covers the exec lane,
+core-net, core-ring, all nine ingress crates and the HYPARB crates.
+
+**Before:** the script's own reader over the seven crates found 51
+unmarked copy lines (47 unique keys). MEXC had none, because its two
+copies carried markers — and both markers stated a false premise.
+
+**What the pass removed** (copies gone, not commented):
+
+* **The WS Ping echo** (hot: every venue ping) went rx → 125 B stack
+  scratch → tx in OKX, Deribit, HL, Bybit, RPC and Polymarket; MEXC's
+  marker on the same copy said echoing from rx "would alias rx and tx
+  borrows". It would not: rx and tx are disjoint driver fields. All
+  seven echo rx → tx, as Binance has since BX0 — and so does
+  `exec-hyperliquid`'s user-WS (the FILLS socket), whose marker made the
+  same false claim (found by the auditor). Every crate now tests a 0 B,
+  4 B and 125 B ping through core-net's shared test support
+  (`TestTransport::PING_ECHO_CASES`, `inject_server_ping`,
+  `expect_pong_echo`); the user-WS loopback answers all three.
+* **Deribit's DVOL index name** was copied into the frame's 16 B array
+  on every push. The frame carries its span instead
+  (`index_name_off`, `index_name_len`; still 64 B, integer-only) and the
+  run loop compares the name where it lies in rx
+  (`DeribitVolIndexFrame::index_name(payload)`); the fuzz target asserts
+  the span on every input that parses.
+* **Fixed-shape requests are masked into tx from their parts** —
+  core-net `ws_write_binary_frame_parts`,
+  `queue_masked_binary_frame_parts` and `queue_masked_text_frame_parts`
+  (the single-payload queue functions are one-line wrappers; the old
+  `ws_write_binary_frame` is gone). This retired: RPC's 2 s
+  `eth_blockNumber` poll and its `newHeads` subscribe (a 96 B scratch
+  each, the id's digits copied twice) — and `ingress-hyperevm`'s
+  identical two requests, which had reused RPC's writers; Deribit's
+  `public/test` (the answer to every heartbeat), its book resync and its
+  `set_heartbeat`; OKX's books resync; and every HL (un)subscribe (a
+  160 B scratch per frame, on every session and every 15-minute outcome
+  roll). A parts array wider than 64 B is filled in the caller's slot
+  (`&mut [&[u8]; 5]`), never returned by value.
+* **False borrow premises.** HL copied each coin out of its table before
+  queueing a frame (the roll's unsubscribe, the ack retry, the subscribe
+  sweep), and Deribit each instrument (the resync, the confirmed-sub
+  registration). The queue helpers now take the tx fields rather than
+  the driver, so every name is read in place. Bybit and MEXC copied
+  host and path into two `Vec`s per connection; they borrow them from
+  the boot's endpoint list (MEXC's marker said the conn "must own them"
+  — it is built on the ingress thread, from that list).
+* **HL's roll** rendered each new coin into a stack buffer, copied it
+  into its table row, then rendered it again to subscribe. It renders
+  straight into the row (`HlCoinTable::rebind_outcome`) and subscribes
+  from the row.
+* **Polymarket** built its 10 240 B id table beside the driver and moved
+  it in; it fills the driver's own table.
+
+**What the pass commented** (every remaining copy verb, 24 markers over
+29 lines, plus the hidden moves the auditor flagged): boot discovery and
+symbol-table rows (16–80 B; a row outlives the REST body it was scanned
+from, and the table owns fixed rows for the hot lookup); boot driver
+tables (OKX families ≤ 384 B, Deribit DVOL ≤ 128 B, Polymarket ids ≤
+10 240 B); the variable-length batch subscribe renders (OKX ≤ 12 KiB,
+Deribit ≤ 16 KiB, Bybit ≤ 8 KiB, Polymarket ≤ 11 KiB — the frame length
+is unknown until the render ends; a header-first render is the
+operator's later pass, Q7); the rate-limited WARN lines (≤ 224 B, one a
+second — one `writev` rejected: a short writev splits the line);
+Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
+payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
+1 080 B `TlsTransport` moving into its slot once per reconnect (Bybit,
+MEXC — Binance's marker), and the boot moves at MEASURED sizes — the
+OKX (7 696 B), Deribit (9 520 B), Bybit (4 296 B; slot 5 488 B), MEXC
+(1 792 B; slot 3 008 B) and Polymarket (10 536 B) drivers with the
+tables they take by value.
+
+**The auditor on the pass** (`zero-copy-auditor`, Opus 5.5): PASS —
+RX = 4 against the target of 3 on every lane (the extra one core-net's
+escalated rustls copy, above), TX = 2 plus the serialiser's single
+write. Every cold finding and every flagged hidden move was acted on
+(above); its borderline notes — MEXC futures' per-(symbol, channel)
+subscribe render and the other remaining render markers as candidates
+for Q7's pass — stay open.
+
+Gate after the pass: `hits=31 baselined=31 new=0 paid=0` over 21 dirs —
+the baseline byte-identical (sha256 `caf8a05e…`), the seven crates and
+core-ring at zero hits.
+
+Gates after the pass: clippy clean; nextest 3119 passed (5 skipped);
+alloc 72/72 at 0 B/op (fresh `Compiling bench`); license-check OK;
+fuzz from a poisoned start — `deribit_vol_index` 300 s (52.9 M runs),
+`rpc_subscribe_envelope` 120 s (13.8 M) and `deribit_jsonrpc_frame`,
+`hl_ws_frame`, `okx_frame`, `bybit_ws_frame`, `polymarket_clob_frame`,
+`rpc_response`, `mexc_ws_frame` 60 s each, no crash; Miri was not needed
+(no unsafe changed). Live smokes 60 s, the engine untouched — MEXC
+31 008 messages, Binance 65 120, both 0 parse errors, 0 reconnects, 0
+ring drops. (The first smoke runs timed out at the boot REST call: the
+Mac's LuLu firewall blocks a freshly built binary's outbound connections
+until the operator allows it — a smoke `Timeout` there is LuLu, not the
+code.) The release engine binary was not rebuilt.
+
 ## E6 — the risk gate and the kill switches
 
 ### E6 commit 1 — the per-order clamp (2026-09-19)

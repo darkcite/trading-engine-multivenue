@@ -937,6 +937,11 @@ impl OkxSymbolTable {
         }
         let row = &mut self.rows[self.len];
         row.0 = inst_id.len() as u8;
+        // COPY: ≤ 32 B `instId` (OKX_INST_ID_MAX) into its symbol-table row, once
+        // per instrument at boot — the table owns fixed rows so the hot lookup
+        // compares in place with no pointer chase — rejected: borrowing the boot
+        // strings (the table moves onto the ingress thread and must not pin boot
+        // allocations).
         row.1[..inst_id.len()].copy_from_slice(inst_id);
         row.2 = sym;
         row.3 = inst_type;
@@ -1151,6 +1156,11 @@ pub struct SubArg<'a> {
 #[inline]
 fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
     let end = at.checked_add(src.len())?;
+    // COPY: the batched subscribe text into the caller's render scratch
+    // (≤ 12 KiB), once per connection session — the WS frame header needs the
+    // payload length before the payload is masked into tx — rejected: rendering
+    // straight into tx (the 7/16-bit length field is unknown until the batch
+    // render ends) and wire parts (≈ 5 slices per arg, up to MAX_SUB_ARGS args).
     dst.get_mut(at..end)?.copy_from_slice(src);
     Some(end)
 }
@@ -1193,12 +1203,33 @@ pub fn write_subscribe_batch(dst: &mut [u8], args: &[SubArg<'_>]) -> Option<usiz
     write_op(dst, b"subscribe", args)
 }
 
-/// Serialize one `{"op":"unsubscribe","args":[...]}` request —
-/// used by the books resync (unsubscribe + subscribe ⇒ fresh
-/// snapshot).
+/// A books resync request's verb.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OkxSubVerb {
+    /// `"op":"subscribe"`.
+    Subscribe,
+    /// `"op":"unsubscribe"`.
+    Unsubscribe,
+}
+
+/// `{"op":"<verb>","args":[{"channel":"books","instId":"<inst>"}]}` —
+/// the books resync (unsubscribe, then subscribe ⇒ a fresh snapshot) —
+/// as wire parts for `core_net::queue_masked_text_frame_parts`: the
+/// fixed-shape repair request is masked into tx part by part, never
+/// rendered into a scratch first.
 #[inline]
-pub fn write_unsubscribe_batch(dst: &mut [u8], args: &[SubArg<'_>]) -> Option<usize> {
-    write_op(dst, b"unsubscribe", args)
+#[must_use]
+pub fn books_op_parts(verb: OkxSubVerb, inst_id: &[u8]) -> [&[u8]; 3] {
+    [
+        match verb {
+            OkxSubVerb::Subscribe => br#"{"op":"subscribe","args":[{"channel":"books","instId":""#,
+            OkxSubVerb::Unsubscribe => {
+                br#"{"op":"unsubscribe","args":[{"channel":"books","instId":""#
+            }
+        },
+        inst_id,
+        br#""}]}"#,
+    ]
 }
 
 /// FNV-1a 64-bit over the channel tag byte + `instId` bytes — a
@@ -1669,15 +1700,23 @@ mod tests {
     }
 
     #[test]
-    fn write_unsubscribe_batch_and_tiny_dst() {
+    fn books_op_parts_spell_the_resync_requests() {
         let mut dst = [0u8; 256];
         let args = [SubArg {
             channel: OkxChannel::Books,
             inst_id: b"BTC-USDT",
         }];
-        let n = write_unsubscribe_batch(&mut dst, &args).unwrap();
-        assert!(n > 0);
-        assert!(dst[..n].starts_with(br#"{"op":"unsubscribe""#));
+        // The subscribe half is the batch writer's one-arg frame, byte
+        // for byte.
+        let n = write_subscribe_batch(&mut dst, &args).unwrap();
+        assert_eq!(
+            books_op_parts(OkxSubVerb::Subscribe, b"BTC-USDT").concat(),
+            &dst[..n]
+        );
+        assert_eq!(
+            books_op_parts(OkxSubVerb::Unsubscribe, b"BTC-USDT").concat(),
+            br#"{"op":"unsubscribe","args":[{"channel":"books","instId":"BTC-USDT"}]}"#
+        );
         let mut tiny = [0u8; 8];
         assert!(write_subscribe_batch(&mut tiny, &args).is_none());
     }

@@ -451,19 +451,12 @@ impl UserWs {
                 }
                 WsOpcode::Ping => {
                     let mask = self.next_mask();
-                    let payload_len = p1 - p0;
-                    if payload_len > 125 {
+                    if p1 - p0 > 125 {
                         return Err(WsErr::BadFrame);
                     }
-                    // COPY: a Ping payload, ≤ 125 B (RFC 6455), copied
-                    // out before writing — the pong borrows `tx`
-                    // mutably while the payload borrows `rx`, both
-                    // fields of one struct — rejected: splitting rx/tx
-                    // into separate owners buys 125 B at the cost of
-                    // the pump's single-borrow shape.
-                    let mut echo = [0u8; 125];
-                    echo[..payload_len].copy_from_slice(&self.rx[p0..p1]);
-                    let n = ws_write_pong(&mut self.tx, &echo[..payload_len], mask)
+                    // The echo goes straight from rx into tx — two
+                    // disjoint fields, so no scratch.
+                    let n = ws_write_pong(&mut self.tx, &self.rx[p0..p1], mask)
                         .map_err(|_| WsErr::BadFrame)?;
                     write_all_t(t, &self.tx[..n], deadline)?;
                 }

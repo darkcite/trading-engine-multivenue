@@ -10,10 +10,11 @@
 # few lines), the way an `unsafe` block carries `// SAFETY:`.
 #
 # This script lists every byte-copy verb in the given crate directories
-# (default: the exec lane, core-net, ingress-binance and the HYPARB
-# lane's ingress, AMM math and member) that has NO `COPY:` marker within
-# the eight preceding lines, and compares the list against the committed
-# baseline `scripts/copy-audit-baseline.txt`. It is a RATCHET:
+# (default: the exec lane, core-net, core-ring, all nine ingress crates
+# (since the ZC pass of 2026-09-24) and the HYPARB lane's AMM math and
+# member) that has NO `COPY:` marker within the eight preceding lines,
+# and compares the list against the committed baseline
+# `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
 #   * a hit that is in the baseline is legacy debt — printed in the
 #     summary count, never a failure;
@@ -70,8 +71,10 @@ fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
            crates/signer-evm crates/exec-hyperevm crates/clob-dispatcher crates/core-net \
-           crates/ingress-binance crates/ingress-hyperevm crates/core-amm \
-           crates/strategy-hyparb crates/cli/src/evm_shadow.rs \
+           crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
+           crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \
+           crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
+           crates/core-amm crates/strategy-hyparb crates/cli/src/evm_shadow.rs \
            crates/cli/src/hyparb_live.rs
 fi
 

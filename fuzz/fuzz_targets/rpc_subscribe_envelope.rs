@@ -8,7 +8,7 @@
 //! `newPendingTransactions`) flows through the same envelope shape.
 //! This target exercises:
 //!
-//! 1. The subscribe-request serializer (`write_request_subscribe_new_heads`).
+//! 1. The subscribe request's wire parts (`subscribe_new_heads_request_parts`).
 //! 2. The subscription-response classifier and numeric-result parser
 //!    (both paths of `classify_rpc` and `parse_block_number_result`,
 //!    which accepts any `"id":N,"result":"0x..."` envelope — the
@@ -62,39 +62,51 @@ fuzz_target!(|data: &[u8]| {
         assert!(end <= data.len());
     }
 
-    // --- Subscribe-request serializer -------------------------------
+    // --- Subscribe request as wire parts -----------------------------
     // Treat the first 8 bytes of input as the request id. Zero-alloc.
     if data.len() >= 8 {
         let mut id_bytes = [0u8; 8];
         id_bytes.copy_from_slice(&data[..8]);
         let id = u64::from_le_bytes(id_bytes);
 
+        // Lay the parts end to end the way the frame serialiser masks
+        // them into tx (a copy is fine here: this is the fuzz harness).
+        let mut digits = [0u8; 20];
+        let parts = ingress_rpc::subscribe_new_heads_request_parts(id, &mut digits);
         let mut dst = [0u8; 128];
-        match ingress_rpc::write_request_subscribe_new_heads(&mut dst, id) {
-            Ok(n) => {
-                // Bytes written fit inside dst.
-                assert!(n <= dst.len());
-                // The request envelope is self-consistent: classify
-                // must see it as "not a subscription, not an error"
-                // and `parse_rpc_error` must return None on a bare
-                // request. (A request has no "error" or "result".)
-                let frame = &dst[..n];
-                assert_ne!(
-                    ingress_rpc::classify_rpc(frame),
-                    ingress_rpc::RpcFrameKind::Subscription
-                );
-                assert!(ingress_rpc::parse_rpc_error(frame).is_none());
-                let mut head: ingress_rpc::NewHead = poison::poisoned();
-                assert!(!ingress_rpc::parse_new_head_notification(frame, &mut head));
-                assert_eq!(head, poison::poisoned::<ingress_rpc::NewHead>(), "a failed parse wrote the frame");
-            }
-            Err(ingress_rpc::RpcWriteErr::BufferTooSmall) => {}
+        let mut n = 0usize;
+        for p in parts {
+            dst[n..n + p.len()].copy_from_slice(p);
+            n += p.len();
         }
+        // The request envelope is self-consistent: classify must see it
+        // as "not a subscription, not an error" and `parse_rpc_error`
+        // must return None on a bare request. (A request has no "error"
+        // or "result".)
+        let frame = &dst[..n];
+        assert_ne!(
+            ingress_rpc::classify_rpc(frame),
+            ingress_rpc::RpcFrameKind::Subscription
+        );
+        assert!(ingress_rpc::parse_rpc_error(frame).is_none());
+        let mut head: ingress_rpc::NewHead = poison::poisoned();
+        assert!(!ingress_rpc::parse_new_head_notification(frame, &mut head));
+        assert_eq!(head, poison::poisoned::<ingress_rpc::NewHead>(), "a failed parse wrote the frame");
 
-        // Also fuzz the block-number serializer with the same id —
-        // lets libFuzzer explore buffer-sizing edges.
-        let mut dst2 = [0u8; 96];
-        let _ = ingress_rpc::write_request_eth_block_number(&mut dst2, id);
+        // The id part is the id in decimal: 1..=20 ASCII digits that
+        // read back as `id`.
+        let mut digits2 = [0u8; 20];
+        let bn = ingress_rpc::eth_block_number_request_parts(id, &mut digits2);
+        assert!((1..=20).contains(&bn[1].len()), "id digits {}", bn[1].len());
+        let mut back: u64 = 0;
+        for &c in bn[1] {
+            assert!(c.is_ascii_digit(), "a non-digit in the id part");
+            back = back
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(u64::from(c - b'0')))
+                .expect("the id part overflows u64");
+        }
+        assert_eq!(back, id, "the id part reads back as the id");
     }
 
     // --- Hex-digit scanner over sliding positions -------------------

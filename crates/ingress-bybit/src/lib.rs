@@ -550,6 +550,11 @@ impl BybitSymbolTable {
         }
         let row = &mut self.rows[self.len];
         row.0 = symbol.len() as u8;
+        // COPY: ≤ 24 B symbol (BYBIT_SYMBOL_MAX) into its symbol-table row, once
+        // per instrument at boot — the table owns fixed rows so the hot lookup
+        // compares in place with no pointer chase — rejected: borrowing the boot
+        // strings (the table moves onto the ingress thread and must not pin boot
+        // allocations).
         row.1[..symbol.len()].copy_from_slice(symbol);
         row.2 = sym;
         self.len += 1;
@@ -623,6 +628,10 @@ fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
     if end > dst.len() {
         return None;
     }
+    // COPY: the batched subscribe text into the caller's render scratch
+    // (≤ 8 KiB), once per connection session — the WS frame header needs the
+    // payload length before the payload is masked into tx — rejected: rendering
+    // straight into tx (the length field is unknown until the batch render ends).
     dst[at..end].copy_from_slice(src);
     Some(end)
 }

@@ -50,7 +50,7 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_binary_frame, read_server_handshake,
+    constant_time_eq, expected_accept, queue_masked_binary_frame_parts, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
     ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
     PendingTable, ReqKind, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
@@ -60,8 +60,8 @@ use core_time::now_ns;
 use core_types::{Capture, LatencyClass, NsTs, Signal, SignalSource, SymbolId, SYMBOL_ID_NONE};
 
 use crate::{
-    classify_rpc, parse_block_number_result, parse_hex_u64, parse_new_head_notification,
-    parse_rpc_error, write_request_eth_block_number, write_request_subscribe_new_heads, NewHead,
+    classify_rpc, eth_block_number_request_parts, parse_block_number_result, parse_hex_u64,
+    parse_new_head_notification, parse_rpc_error, subscribe_new_heads_request_parts, NewHead,
     RequestIds, RpcFrameKind,
 };
 
@@ -452,10 +452,9 @@ fn queue_subscribe_new_heads(drv: &mut Driver) -> io::Result<()> {
     debug_assert!(!drv.subscribed, "subscribe must only be fired once");
     let id = drv.ids.allocate();
     record_pending(drv, id, RpcKind::SubscribeNewHeads)?;
-    let mut scratch = [0u8; 96];
-    let n = write_request_subscribe_new_heads(&mut scratch, id)
-        .map_err(|_| io::Error::other("subscribe request buffer too small"))?;
-    queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    let mut digits = [0u8; 20];
+    let parts = subscribe_new_heads_request_parts(id, &mut digits);
+    queue_masked_binary_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
     drv.subscribed = true;
     Ok(())
 }
@@ -468,10 +467,9 @@ fn maybe_queue_block_number_poll(drv: &mut Driver) -> io::Result<()> {
     drv.next_poll_at_ns = now.saturating_add(RPC_POLL_NS);
     let id = drv.ids.allocate();
     record_pending(drv, id, RpcKind::BlockNumber)?;
-    let mut scratch = [0u8; 96];
-    let n = write_request_eth_block_number(&mut scratch, id)
-        .map_err(|_| io::Error::other("blockNumber request buffer too small"))?;
-    queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])
+    let mut digits = [0u8; 20];
+    let parts = eth_block_number_request_parts(id, &mut digits);
+    queue_masked_binary_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)
 }
 
 fn record_pending(drv: &mut Driver, id: u64, kind: RpcKind) -> io::Result<()> {
@@ -535,14 +533,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -726,6 +724,11 @@ fn register_subscription(drv: &mut Driver, id: SubId, kind: SubKind) {
 #[inline]
 fn pack_new_head_into_payload(head: NewHead) -> [u8; 40] {
     let mut out = [0u8; 40];
+    // COPY: three 8 B little-endian words (number, timestamp, gasUsed) into the
+    // 40 B signal payload, per newHeads notification — the Signal contract
+    // carries its payload as bytes and this IS the encode (one 8-byte store per
+    // word) — rejected: typed payload fields (a core-types wire change for three
+    // stores).
     out[0..8].copy_from_slice(&head.number.to_le_bytes());
     out[8..16].copy_from_slice(&head.ts_sec.to_le_bytes());
     out[16..24].copy_from_slice(&head.gas_used.to_le_bytes());
@@ -739,6 +742,8 @@ fn pack_new_head_into_payload(head: NewHead) -> [u8; 40] {
 #[inline]
 fn pack_block_number_into_payload(block: u64) -> [u8; 40] {
     let mut out = [0u8; 40];
+    // COPY: one 8 B little-endian block number into the 40 B signal payload, per
+    // blockNumber answer — the same encode as the newHeads pack above.
     out[0..8].copy_from_slice(&block.to_le_bytes());
     out
 }
@@ -1091,6 +1096,61 @@ mod tests {
         // Drain any additional frame (e.g. the liveness poll) that may
         // have been queued after the subscribe.
         let _ = n;
+    }
+
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = Driver::new(7);
+            d.set_state(State::Steady);
+            d.suppress_polling_for_test();
+            d.subscribed = true;
+            let (mut prod, _cons) = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new().split();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
+        }
+    }
+
+    #[test]
+    fn a_block_number_poll_queues_one_masked_binary_frame() {
+        let mut d = Driver::new(7);
+        d.set_state(State::Steady);
+        let before = d.ids.allocate();
+        d.next_poll_at_ns = 0;
+        maybe_queue_block_number_poll(&mut d).unwrap();
+        let mut wire = d.tx.filled().to_vec();
+        let WsReadResult::Frame { header, payload } = ws_read_frame(&wire) else {
+            panic!("the poll queued one whole frame");
+        };
+        assert_eq!(header.opcode, WsOpcode::Binary);
+        assert!(header.masked, "client frames are masked");
+        assert_eq!(
+            header.header_len as usize + header.payload_len as usize,
+            wire.len(),
+            "exactly one frame"
+        );
+        ws_unmask_in_place(&mut wire[payload.start..payload.end], header.mask);
+        let expected = format!(
+            r#"{{"jsonrpc":"2.0","id":{},"method":"eth_blockNumber","params":[]}}"#,
+            before + 1
+        );
+        assert_eq!(&wire[payload.start..payload.end], expected.as_bytes());
+        assert_eq!(d.pending_count(), 1);
     }
 
     #[test]

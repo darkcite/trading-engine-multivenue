@@ -327,95 +327,62 @@ pub fn parse_rpc_error(buf: &[u8]) -> Option<RpcError> {
 }
 
 // ---------------------------------------------------------------
-// Request serializers (zero-alloc; write into caller's buffer)
+// Requests as wire parts (zero-alloc, zero-copy)
 // ---------------------------------------------------------------
 
-/// Serialization error. Mirrors the shape used in core-net.
+/// Serialization error of the JSON-RPC request writers built on this
+/// crate's envelope (`ingress-hyperevm`, `exec-hyperevm`). Mirrors the
+/// shape used in core-net.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RpcWriteErr {
     /// Destination slice too small.
     BufferTooSmall,
 }
 
-/// Write an `eth_blockNumber` request into `dst`. Returns bytes
-/// written. Zero-alloc.
-///
-/// Shape:
-/// ```text
-/// {"jsonrpc":"2.0","id":<id>,"method":"eth_blockNumber","params":[]}
-/// ```
+/// Every request's head, up to its id.
+const REQ_HEAD: &[u8] = br#"{"jsonrpc":"2.0","id":"#;
+
+/// `{"jsonrpc":"2.0","id":<id>,"method":"eth_blockNumber","params":[]}`
+/// as wire parts for `core_net::queue_masked_binary_frame_parts`: the
+/// id's digits render into `digits`, and the frame serialiser masks each
+/// part straight into tx — the request is never assembled first.
 #[inline]
-pub fn write_request_eth_block_number(dst: &mut [u8], id: u64) -> Result<usize, RpcWriteErr> {
-    const PREFIX: &[u8] = br#"{"jsonrpc":"2.0","id":"#;
-    const SUFFIX: &[u8] = br#","method":"eth_blockNumber","params":[]}"#;
-
-    // Worst-case id length: 20 digits (u64::MAX).
-    let mut tmp = [0u8; 20];
-    let id_len = format_u64(&mut tmp, id);
-
-    let total = PREFIX.len() + id_len + SUFFIX.len();
-    if dst.len() < total {
-        return Err(RpcWriteErr::BufferTooSmall);
-    }
-
-    let mut o = 0usize;
-    dst[o..o + PREFIX.len()].copy_from_slice(PREFIX);
-    o += PREFIX.len();
-    dst[o..o + id_len].copy_from_slice(&tmp[..id_len]);
-    o += id_len;
-    dst[o..o + SUFFIX.len()].copy_from_slice(SUFFIX);
-    o += SUFFIX.len();
-    debug_assert_eq!(o, total);
-    Ok(total)
+#[must_use]
+pub fn eth_block_number_request_parts(id: u64, digits: &mut [u8; 20]) -> [&[u8]; 3] {
+    [
+        REQ_HEAD,
+        format_u64(id, digits),
+        br#","method":"eth_blockNumber","params":[]}"#,
+    ]
 }
 
-/// Write an `eth_subscribe(newHeads)` request into `dst`.
-///
-/// Shape:
-/// ```text
-/// {"jsonrpc":"2.0","id":<id>,"method":"eth_subscribe","params":["newHeads"]}
-/// ```
+/// `{"jsonrpc":"2.0","id":<id>,"method":"eth_subscribe","params":["newHeads"]}`
+/// as wire parts — the contract of [`eth_block_number_request_parts`].
 #[inline]
-pub fn write_request_subscribe_new_heads(dst: &mut [u8], id: u64) -> Result<usize, RpcWriteErr> {
-    const PREFIX: &[u8] = br#"{"jsonrpc":"2.0","id":"#;
-    const SUFFIX: &[u8] = br#","method":"eth_subscribe","params":["newHeads"]}"#;
-
-    let mut tmp = [0u8; 20];
-    let id_len = format_u64(&mut tmp, id);
-
-    let total = PREFIX.len() + id_len + SUFFIX.len();
-    if dst.len() < total {
-        return Err(RpcWriteErr::BufferTooSmall);
-    }
-
-    let mut o = 0usize;
-    dst[o..o + PREFIX.len()].copy_from_slice(PREFIX);
-    o += PREFIX.len();
-    dst[o..o + id_len].copy_from_slice(&tmp[..id_len]);
-    o += id_len;
-    dst[o..o + SUFFIX.len()].copy_from_slice(SUFFIX);
-    debug_assert_eq!(o + SUFFIX.len(), total);
-    Ok(total)
+#[must_use]
+pub fn subscribe_new_heads_request_parts(id: u64, digits: &mut [u8; 20]) -> [&[u8]; 3] {
+    [
+        REQ_HEAD,
+        format_u64(id, digits),
+        br#","method":"eth_subscribe","params":["newHeads"]}"#,
+    ]
 }
 
-/// Format a u64 into a byte buffer; returns number of bytes written.
-/// Zero-alloc. Max output length is 20 bytes.
+/// `v` in decimal, rendered right-aligned into `digits` (20 = the digit
+/// count of `u64::MAX`); the returned tail IS the number — nothing is
+/// copied. Zero-alloc.
 #[inline]
-fn format_u64(buf: &mut [u8], mut v: u64) -> usize {
-    if v == 0 {
-        buf[0] = b'0';
-        return 1;
-    }
-    let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
-    while v > 0 {
+fn format_u64(mut v: u64, digits: &mut [u8; 20]) -> &[u8] {
+    let mut i = digits.len();
+    loop {
         i -= 1;
-        tmp[i] = b'0' + (v % 10) as u8;
+        digits[i] = b'0' + (v % 10) as u8;
         v /= 10;
+        if v == 0 {
+            break;
+        }
     }
-    let n = tmp.len() - i;
-    buf[..n].copy_from_slice(&tmp[i..]);
-    n
+    &digits[i..]
 }
 
 // ---------------------------------------------------------------
@@ -584,49 +551,32 @@ mod tests {
         assert!(parse_rpc_error(b).is_none());
     }
 
-    // ---- Request writers ----
+    // ---- Requests as wire parts ----
 
     #[test]
-    fn write_eth_block_number_roundtrip() {
-        let mut dst = [0u8; 128];
-        let n = write_request_eth_block_number(&mut dst, 7).unwrap();
+    fn eth_block_number_request_parts_pin_the_bytes() {
+        let mut digits = [0u8; 20];
         assert_eq!(
-            &dst[..n],
+            eth_block_number_request_parts(7, &mut digits).concat(),
             br#"{"jsonrpc":"2.0","id":7,"method":"eth_blockNumber","params":[]}"#
         );
     }
 
     #[test]
-    fn write_eth_block_number_buffer_too_small() {
-        let mut dst = [0u8; 10];
+    fn subscribe_new_heads_request_parts_pin_the_bytes() {
+        let mut digits = [0u8; 20];
         assert_eq!(
-            write_request_eth_block_number(&mut dst, 1),
-            Err(RpcWriteErr::BufferTooSmall)
-        );
-    }
-
-    #[test]
-    fn write_subscribe_new_heads_roundtrip() {
-        let mut dst = [0u8; 128];
-        let n = write_request_subscribe_new_heads(&mut dst, 99).unwrap();
-        assert_eq!(
-            &dst[..n],
+            subscribe_new_heads_request_parts(99, &mut digits).concat(),
             br#"{"jsonrpc":"2.0","id":99,"method":"eth_subscribe","params":["newHeads"]}"#
         );
     }
 
     #[test]
-    fn format_u64_zero() {
-        let mut buf = [0u8; 20];
-        let n = format_u64(&mut buf, 0);
-        assert_eq!(&buf[..n], b"0");
-    }
-
-    #[test]
-    fn format_u64_max() {
-        let mut buf = [0u8; 20];
-        let n = format_u64(&mut buf, u64::MAX);
-        assert_eq!(&buf[..n], b"18446744073709551615");
+    fn format_u64_renders_zero_one_and_max() {
+        let mut digits = [0u8; 20];
+        assert_eq!(format_u64(0, &mut digits), b"0");
+        assert_eq!(format_u64(1, &mut digits), b"1");
+        assert_eq!(format_u64(u64::MAX, &mut digits), b"18446744073709551615");
     }
 }
 
@@ -679,9 +629,9 @@ mod proptests {
 
         #[test]
         fn eth_block_number_request_contains_id(id in 0u64..u64::MAX) {
-            let mut dst = [0u8; 128];
-            let n = write_request_eth_block_number(&mut dst, id).unwrap();
-            let frame = &dst[..n];
+            let mut digits = [0u8; 20];
+            let request = eth_block_number_request_parts(id, &mut digits).concat();
+            let frame = &request[..];
             // Frame contains `"id":<id>,"`
             let mut expected = String::new();
             use std::fmt::Write;

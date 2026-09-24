@@ -157,10 +157,13 @@ in the script; `ai` = 48 is the floor every name includes).
   hyperliquid, mexc, bybit, polymarket, rpc; `docs/risk-policy.md` "the
   other ingress crates parse in place too"): 30 parsers fill in place,
   frames left the dispatch values, `DepthPair` replaced the top-K
-  copies, the fuzz targets start from a poisoned frame. Open: core-ring's
-  by-value push/pop, and these seven crates are not in `make copy-audit`
-  (51 older unmarked copy verbs; the hot one, the WS Ping echo scratch,
-  in six of them).
+  copies, the fuzz targets start from a poisoned frame. ZC pass B
+  (2026-09-24, risk-policy "ZC pass B"): those seven crates and core-ring
+  joined `make copy-audit` — the WS Ping echo goes rx → tx everywhere
+  (the exec lane's user-WS too), fixed-shape requests are masked into tx
+  from parts (`core_net::queue_masked_{text,binary}_frame_parts`),
+  false-premise copies are gone, the rest marked. Open: core-ring's
+  by-value push/pop (ZC pass A, next).
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -204,13 +207,15 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **Gates at HEAD (the HYPARB merge, 2026-09-23):** nextest 3014 (5
+- **Gates at HEAD (ZC pass B, 2026-09-24; Foundry and worker pytest as of
+  the HYPARB merge):** nextest 3119 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
   and `hyperevm_live_smoke` among them) · alloc 72/72 at the gates' pins
   (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
   child helper) · clippy clean · `make license-check` OK · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
-  core-net, ingress-binance and the HYPARB crates) · Foundry 11 unit +
+  core-net, core-ring, all nine ingress crates and the HYPARB crates) ·
+  Foundry 11 unit +
   5 mainnet-fork (session sandbox; forge is not on this Mac) ·
   worker pytest 1513 (5 skipped; `test_news_lanes::test_report_prints_the_funnel`
   is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
@@ -222,8 +227,12 @@ in the script; `ai` = 48 is the floor every name includes).
   `binance_eapi`, `binance_exchange_info` 120 s clean; HYPARB (pre-merge)
   `amm_tick_walk`, `amm_map_payload`, `hyperevm_decode`, `evm_rlp` 240 s,
   `evm_exec_response` 540 s, `http1_response` 300 s clean; every fuzz bin
-  checks at the merge · live smokes 60 s:
-  MEXC and Binance, 0 parse errors, 0 reconnects. Known
+  checks at the merge; ZC pass B re-ran `deribit_vol_index` 300 s,
+  `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s
+  · live smokes 60 s: MEXC and Binance, 0 parse errors, 0 reconnects
+  (LuLu on this Mac blocks a freshly built binary's outbound connections
+  until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
+  not the code). Known
   isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
@@ -372,8 +381,8 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   PLACE (`&mut Frame` → `bool`, written once, untouched on `false`); no
   frame rides a run loop's `Dispatch` (each const-asserted ≤ 64 B); a
   top-K change gate flips a `core_types::DepthPair`, never copies.
-  Enforced by `make copy-audit` (the exec lane,
-  core-net and ingress-binance; a RATCHET against
+  Enforced by `make copy-audit` (the exec lane, core-net, core-ring, all
+  nine ingress crates and the HYPARB crates; a RATCHET against
   `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
   `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)
   and the `zero-copy-auditor` agent. A cold operator module may opt out with

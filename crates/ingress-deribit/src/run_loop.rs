@@ -102,10 +102,11 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    PendingTable, ReqKind, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_parts,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf,
+    Keepalive, KeepaliveAction, PendingTable, ReqKind, Status, SubErr, SubTable, Transport,
+    WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
@@ -115,11 +116,11 @@ use core_types::{
 };
 
 use crate::{
-    classify, extract_instrument, parse_book_header, parse_option_ticker, parse_quote,
-    parse_ticker, parse_trade, parse_vol_index, row_wants_channel, sub_id_of, write_book_op,
-    write_set_heartbeat, write_subscribe_all, write_test, ChainOutcome, DeribitChannel,
-    DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName, TradeSeqOutcome,
-    DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
+    book_op_parts, classify, extract_instrument, parse_book_header, parse_option_ticker,
+    parse_quote, parse_ticker, parse_trade, parse_vol_index, row_wants_channel,
+    set_heartbeat_parts, sub_id_of, test_request_parts, write_subscribe_all, ChainOutcome,
+    DeribitBookOp, DeribitChannel, DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName,
+    TradeSeqOutcome, DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
 };
 
 // ---------------------------------------------------------------
@@ -410,6 +411,12 @@ impl Driver {
                 continue;
             }
             dvol[n_dvol].0 = name.len() as u8;
+            // COPY: ≤ 16 B DVOL index name into the driver's index table,
+            // ≤ DERIBIT_DVOL_MAX (8) rows = ≤ 128 B, once at boot — the driver matches
+            // every DVOL push against them and re-subscribes them every session, long
+            // after the boot's config slices are gone — rejected: a lifetime on `Driver`
+            // (threaded through the run loop, the spawn wrapper and every test) for
+            // ≤ 128 B.
             dvol[n_dvol].1[..name.len()].copy_from_slice(name);
             n_dvol += 1;
             i += 1;
@@ -425,6 +432,12 @@ impl Driver {
         } else {
             (Vec::new(), Vec::new())
         };
+        // COPY: the 3 224 B symbol table and the ≤ 136 B DVOL table above move
+        // into the driver, and the 9 520 B driver returns by value — once per
+        // connection, at boot — the driver holds its tables INLINE so every
+        // hot lookup walks contiguous rows with no pointer to chase —
+        // rejected: a `Box` per table (a heap hop on the hot lookup) and a
+        // two-phase in-place init behind `&mut` (for a boot-only cost).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -701,9 +714,14 @@ fn advance_ws_upgrade(drv: &mut Driver, status: &IngressStatus) -> io::Result<()
 
 /// Record a freshly-queued JSON-RPC request. Slot collision means
 /// more than [`PENDING_CAP`] unanswered requests — a protocol bug or
-/// a dead venue; fail-fast either way.
-fn record_pending(drv: &mut Driver, id: u64, kind: DeribitReqKind) -> io::Result<()> {
-    match drv.pending.record(id, kind, now_ns()) {
+/// a dead venue; fail-fast either way. Takes the table, not the
+/// driver, so a caller may hold a symbol row borrowed meanwhile.
+fn record_pending(
+    pending: &mut PendingTable<DeribitReqKind, PENDING_CAP>,
+    id: u64,
+    kind: DeribitReqKind,
+) -> io::Result<()> {
+    match pending.record(id, kind, now_ns()) {
         Ok(()) => Ok(()),
         Err(_e) => {
             debug_assert!(false, "deribit pending table rejected id {id}: {_e:?}");
@@ -726,11 +744,17 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
     // 1. Heartbeat first — the venue polices the connection from the
     //    moment this is acked (test_request every 15 s).
     let hb_id = drv.alloc_req_id();
-    let mut scratch = [0u8; 128];
-    let n = write_set_heartbeat(&mut scratch, hb_id, HEARTBEAT_INTERVAL_SECS)
-        .ok_or_else(|| io::Error::other("deribit: set_heartbeat scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, hb_id, DeribitReqKind::SetHeartbeat)?;
+    let (mut id_digits, mut secs_digits) = ([0u8; 20], [0u8; 20]);
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    set_heartbeat_parts(
+        hb_id,
+        HEARTBEAT_INTERVAL_SECS,
+        &mut id_digits,
+        &mut secs_digits,
+        &mut parts,
+    );
+    queue_masked_text_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
+    record_pending(&mut drv.pending, hb_id, DeribitReqKind::SetHeartbeat)?;
 
     // 2. One batched subscribe for every (channel × instrument)
     //    (+ WS6 DVOL indices).
@@ -745,20 +769,20 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
     )
     .ok_or_else(|| io::Error::other("deribit: subscribe scratch too small"))?;
     queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, sub_id, DeribitReqKind::SubscribeAll)?;
+    record_pending(&mut drv.pending, sub_id, DeribitReqKind::SubscribeAll)?;
     drv.subscribe_req_id = sub_id;
     drv.session_started = true;
     Ok(())
 }
 
-/// Queue one `public/test` (test_request answer / proactive probe).
+/// Queue one `public/test` (test_request answer / proactive probe),
+/// its parts masked straight into tx.
 fn queue_test(drv: &mut Driver) -> io::Result<()> {
     let id = drv.alloc_req_id();
-    let mut scratch = [0u8; 96];
-    let n = write_test(&mut scratch, id)
-        .ok_or_else(|| io::Error::other("deribit: test scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, id, DeribitReqKind::Test)
+    let mut digits = [0u8; 20];
+    let parts = test_request_parts(id, &mut digits);
+    queue_masked_text_frame_parts(&mut drv.tx, &mut drv.mask_counter, &parts)?;
+    record_pending(&mut drv.pending, id, DeribitReqKind::Test)
 }
 
 /// Queue an unsubscribe+subscribe pair for one `book.{instr}.100ms` —
@@ -767,27 +791,34 @@ fn queue_book_resync(drv: &mut Driver, sym_idx: usize) -> io::Result<()> {
     // Ids allocated before the symbol-row borrow (alloc needs &mut).
     let unsub_id = drv.alloc_req_id();
     let sub_id = drv.alloc_req_id();
-    let Some((instr_ref, _sym)) = drv.symbols.get(sym_idx) else {
+    // The instrument is read in place for the whole function: the
+    // frames go through `tx`/`mask_counter` and the ids into `pending`,
+    // every one a field disjoint from `symbols`.
+    let Some((instr, _sym)) = drv.symbols.get(sym_idx) else {
         debug_assert!(false, "resync for unknown symbol row {sym_idx}");
         return Ok(());
     };
-    // Copy the instrument out of the table row (≤32 B stack) so the
-    // immutable borrow ends before the tx queueing below.
-    let mut instr_buf = [0u8; crate::DERIBIT_INSTR_MAX];
-    let instr_len = instr_ref.len();
-    instr_buf[..instr_len].copy_from_slice(instr_ref);
-    let instr = &instr_buf[..instr_len];
+    let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+    queue_book_op(tx, mc, DeribitBookOp::Unsubscribe, unsub_id, instr)?;
+    record_pending(&mut drv.pending, unsub_id, DeribitReqKind::BookUnsub)?;
+    let (tx, mc) = (&mut drv.tx, &mut drv.mask_counter);
+    queue_book_op(tx, mc, DeribitBookOp::Subscribe, sub_id, instr)?;
+    record_pending(&mut drv.pending, sub_id, DeribitReqKind::BookSub)
+}
 
-    let mut scratch = [0u8; 256];
-    let n = write_book_op(&mut scratch, unsub_id, b"public/unsubscribe", instr)
-        .ok_or_else(|| io::Error::other("deribit: resync scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, unsub_id, DeribitReqKind::BookUnsub)?;
-    let n = write_book_op(&mut scratch, sub_id, b"public/subscribe", instr)
-        .ok_or_else(|| io::Error::other("deribit: resync scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
-    record_pending(drv, sub_id, DeribitReqKind::BookSub)?;
-    Ok(())
+/// Queue one book (un)subscribe, its parts masked straight into `tx`.
+#[inline]
+fn queue_book_op(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    op: DeribitBookOp,
+    id: u64,
+    instrument: &[u8],
+) -> io::Result<()> {
+    let mut digits = [0u8; 20];
+    let mut parts: [&[u8]; 5] = [b""; 5];
+    book_op_parts(op, id, instrument, &mut digits, &mut parts);
+    queue_masked_text_frame_parts(tx, mask_counter, &parts)
 }
 
 // ---------------------------------------------------------------
@@ -878,6 +909,9 @@ fn found_mask(payload: &[u8], symbols: &DeribitSymbolTable, depth_enabled: bool)
             name[n] = b'"';
             n += 1;
             let p = ch.wire_prefix();
+            // COPY: the quoted channel name (≤ 64 B) as one memmem needle, once per wanted
+            // channel per subscribe RESULT (once per session) — memmem needs a contiguous needle
+            // — rejected: find-then-verify per hit of the bare instrument (more work per hit).
             name[n..n + p.len()].copy_from_slice(p);
             n += p.len();
             name[n..n + instr.len()].copy_from_slice(instr);
@@ -1075,14 +1109,14 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        scratch[..plen].copy_from_slice(&drv.rx.filled()[start..end]);
-                        let dst = drv.tx.free_mut();
-                        if let Ok(n) = ws_write_pong(dst, &scratch[..plen], mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Ok(n) = ws_write_pong(
+                            drv.tx.free_mut(),
+                            &drv.rx.filled()[payload.start..payload.end],
+                            mask,
+                        ) {
                             drv.tx.advance(n);
                         }
                     }
@@ -1252,7 +1286,10 @@ fn handle_data_frame<C: Capture>(
             DeribitMsgKind::VolIndexPush => {
                 let mut f = crate::DeribitVolIndexFrame::ZERO;
                 if parse_vol_index(payload, &mut f) {
-                    let name = &f.index_name[..f.index_name_len as usize];
+                    // The name is compared where it lies in rx: the
+                    // parser returned its span, never a copy (a frame
+                    // parsed from this payload always has one).
+                    let name = f.index_name(payload).unwrap_or_default();
                     let mut ordinal: i64 = -1;
                     let mut d = 0;
                     while d < drv.n_dvol {
@@ -1954,18 +1991,12 @@ fn fmt_i64(v: i64, scratch: &mut [u8; 20]) -> &[u8] {
 fn register_confirmed_subs(drv: &mut Driver, found: u128) {
     let mut i = 0;
     while i < drv.symbols.len() {
-        // Instrument bytes copied to end the immutable table borrow
-        // before the mutable subs borrow (two-phase pattern).
-        let mut instr_buf = [0u8; crate::DERIBIT_INSTR_MAX];
-        let instr_len = {
-            let Some((instr, _sym)) = drv.symbols.get(i) else {
-                debug_assert!(false, "row {i} < len() must exist");
-                break;
-            };
-            instr_buf[..instr.len()].copy_from_slice(instr);
-            instr.len()
+        // The instrument is read in place: `subs` is a field disjoint
+        // from `symbols`.
+        let Some((instr, _sym)) = drv.symbols.get(i) else {
+            debug_assert!(false, "row {i} < len() must exist");
+            break;
         };
-        let instr = &instr_buf[..instr_len];
         let mut c = 0;
         while c < CHANNELS_PER_INSTR {
             if !row_wants_channel(&drv.symbols, i, c, drv.depth_enabled) {
@@ -2490,6 +2521,31 @@ mod tests {
         t.inject_incoming(&frame[..n]);
     }
 
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
+    #[test]
+    fn a_ws_ping_is_echoed_straight_from_rx() {
+        for payload in TestTransport::PING_ECHO_CASES {
+            let mut t = TestTransport::with_capacity(4096);
+            let mut d = steady_driver(false);
+            let (mut prod, _cons) = ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_ping(payload);
+            drive_one(
+                &mut t,
+                &mut d,
+                b"host",
+                b"/",
+                &mut prod,
+                &status,
+                &mut NullCapture,
+            )
+            .unwrap();
+            t.expect_pong_echo(payload);
+        }
+    }
+
     #[test]
     fn driver_starts_in_connecting() {
         let d = Driver::new(1, test_symbols(), false);
@@ -2575,7 +2631,7 @@ mod tests {
     fn subscribe_result_confirms_all_channels() {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 
@@ -2615,7 +2671,7 @@ mod tests {
         }
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 
@@ -2656,7 +2712,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
         d.subs_ever_confirmed = true; // a boot session verified fully
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
         let mut cap = EventRecCap::default();
@@ -2724,7 +2780,7 @@ mod tests {
         d.next_req_id = 3;
         d.subscribe_req_id = 2;
         d.subs_ever_confirmed = true;
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let mut cap = EventRecCap::default();
@@ -2757,7 +2813,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
         assert!(!d.subs_ever_confirmed);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
 
@@ -3081,7 +3137,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = steady_driver(false);
         d.subs_ever_confirmed = true;
-        record_pending(&mut d, 9, DeribitReqKind::BookSub).unwrap();
+        record_pending(&mut d.pending, 9, DeribitReqKind::BookSub).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let mut cap = EventRecCap::default();
@@ -3152,7 +3208,7 @@ mod tests {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver(false);
         d.set_establish_budget_ns(1);
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
         let stop = StopFlag::new(false);
@@ -3308,7 +3364,7 @@ mod tests {
         d.session_started = true;
         d.next_req_id = 3;
         d.subscribe_req_id = 2;
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
 
@@ -3362,7 +3418,7 @@ mod tests {
         d.session_started = true;
         d.next_req_id = 3;
         d.subscribe_req_id = 2;
-        record_pending(&mut d, 2, DeribitReqKind::SubscribeAll).unwrap();
+        record_pending(&mut d.pending, 2, DeribitReqKind::SubscribeAll).unwrap();
         let status = IngressStatus::new();
         let (mut prod, mut cons) = ring_pair();
 
@@ -3923,7 +3979,7 @@ mod tests {
     #[test]
     fn reset_for_reconnect_clears_connection_state() {
         let mut d = steady_driver(true);
-        record_pending(&mut d, 9, DeribitReqKind::Test).unwrap();
+        record_pending(&mut d.pending, 9, DeribitReqKind::Test).unwrap();
         d.subs
             .insert(
                 sub_id_of(DeribitChannel::Quote, b"BTC-PERPETUAL"),

@@ -384,6 +384,11 @@ fn parse_row(
                         // the end of the row. Parsing continues so the
                         // cursor still lands on the next row.
                         if !s.is_empty() {
+                            // COPY: ≤ 32 B `instId` (OKX_INST_ID_MAX) into its discovery row, once
+                            // per instrument row at boot — the row outlives the REST body it was
+                            // scanned from — rejected: rows borrowing the body (the instruments
+                            // body pinned for the table's life and a lifetime threaded through the
+                            // boot, to save ≤ 32 B a row).
                             inst_id[..s.len()].copy_from_slice(s);
                             inst_id_len = s.len() as u8;
                         }

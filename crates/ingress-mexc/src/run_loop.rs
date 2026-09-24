@@ -257,6 +257,12 @@ impl Driver {
         );
         let sec_key = sec_websocket_key_from_seed(nonce_seed);
         let accept = expected_accept(&sec_key);
+        // COPY: the 520 B symbol table moves into the driver, and the 1 792 B
+        // driver returns by value — once per connection, at boot — the
+        // driver holds its table INLINE so every hot lookup walks contiguous
+        // rows with no pointer to chase — rejected: a `Box` (a heap hop on
+        // the hot lookup) and a two-phase in-place init behind `&mut` (for a
+        // boot-only cost).
         Self {
             state: State::Connecting,
             rx: IoBuf::with_capacity(RX_BUF_SIZE),
@@ -736,22 +742,11 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Ping => {
                         let mask = ws_mask_from_counter(drv.mask_counter);
                         drv.mask_counter = drv.mask_counter.wrapping_add(1);
-                        let start = payload.start;
-                        let end = payload.end;
-                        let plen = end - start;
-                        let mut scratch = [0u8; 125];
-                        debug_assert!(plen <= scratch.len());
-                        if let (Some(dst), Some(src)) =
-                            (scratch.get_mut(..plen), drv.rx.filled().get(start..end))
-                        {
-                            // COPY: WS ping echo ≤ 125 B (RFC 6455 control-
-                            // frame cap) — the pong is written into tx while
-                            // the ping still lives in rx, and both are fields
-                            // of one driver — echoing straight from rx
-                            // rejected: it would alias rx and tx borrows.
-                            dst.copy_from_slice(src);
-                            let out = drv.tx.free_mut();
-                            if let Ok(n) = ws_write_pong(out, dst, mask) {
+                        // The echo goes straight from rx into tx (disjoint
+                        // field borrows) — no scratch; `ws_read_frame`
+                        // already refused a control payload over 125 B.
+                        if let Some(src) = drv.rx.filled().get(payload.start..payload.end) {
+                            if let Ok(n) = ws_write_pong(drv.tx.free_mut(), src, mask) {
                                 drv.tx.advance(n);
                             }
                         }
@@ -1413,10 +1408,12 @@ fn log_sub_drop_rate_limited(drv: &mut Driver) {
     let put = |buf: &mut [u8; 128], n: &mut usize, ok: &mut bool, src: &[u8]| {
         match buf.get_mut(*n..*n + src.len()) {
             Some(dst) => {
-                // COPY: one WARN line ≤ 128 B, rate-limited to 1/s — the
-                // line is assembled in stack scratch so it reaches stderr
-                // in ONE write (no interleaving) — `write!` formatting
-                // rejected: it would allocate on the ingress thread.
+                // COPY: one part of the WARN line into the 128 B stack line,
+                // rate-limited to one line per DROP_LOG_INTERVAL_NS (1 s) — the line
+                // must reach stderr in ONE write (no interleaving with tracing) —
+                // rejected: one write per part (interleaves), `write!` into the same
+                // buffer (the same bytes, through fmt), one `writev` of the parts (a
+                // short writev splits the line; `write_all_vectored` is unstable).
                 dst.copy_from_slice(src);
                 *n += src.len();
             }
@@ -1463,13 +1460,16 @@ pub type StopFlag = AtomicBool;
 
 /// One connection slot for [`run_multi`] (spot or futures — the
 /// driver's class decides).
-pub struct MexcConn<T: Transport> {
+pub struct MexcConn<'a, T: Transport> {
     /// Live transport, `None` while disconnected.
     pub transport: Option<T>,
     /// Per-connection driver.
     pub drv: Driver,
-    host: Vec<u8>,
-    path: Vec<u8>,
+    /// Host bytes for the `Host:` header, borrowed from the boot's
+    /// endpoint list, which outlives the loop.
+    host: &'a [u8],
+    /// Request path, borrowed likewise.
+    path: &'a [u8],
     keepalive: core_net::Keepalive,
     backoff: core_net::Backoff,
     next_attempt_ns: NsTs,
@@ -1477,28 +1477,30 @@ pub struct MexcConn<T: Transport> {
     last_interest: Option<mio::Interest>,
 }
 
-impl<T: Transport> MexcConn<T> {
+impl<'a, T: Transport> MexcConn<'a, T> {
     /// New slot, initially disconnected (`next_attempt_ns` 0 = due
     /// immediately). `host`/`path` are usually the driver class's
     /// [`MexcClass::default_ws_host`] / [`MexcClass::ws_path`] (or the
-    /// operator's host override). Boot-time allocation for host/path is
-    /// sanctioned (never touched on the hot path).
+    /// operator's host override). They are borrowed, not copied: the
+    /// conns are built on the ingress thread itself, from an endpoint
+    /// list that lives for as long as the loop runs.
     pub fn new(
         drv: Driver,
-        host: &[u8],
-        path: &[u8],
+        host: &'a [u8],
+        path: &'a [u8],
         keepalive: core_net::Keepalive,
         backoff: core_net::Backoff,
     ) -> Self {
+        // COPY: the Driver (1 792 B, its symbol table inline) moves into its
+        // slot here and, with the slot (3 008 B), into the boot's Vec — two
+        // moves per connection, once, at boot — rejected: a two-phase
+        // in-place init behind `&mut` (every constructor split, for a
+        // boot-only cost).
         Self {
             transport: None,
             drv,
-            // COPY: host + path ≤ ~40 B each, once at boot — the slot
-            // re-sends them in every reconnect's handshake, long after
-            // the cli's config strings are gone — borrowing rejected:
-            // the conn moves onto the ingress thread and must own them.
-            host: host.to_vec(),
-            path: path.to_vec(),
+            host,
+            path,
             keepalive,
             backoff,
             next_attempt_ns: 0,
@@ -1532,7 +1534,7 @@ impl<T: Transport> MexcConn<T> {
 // loop (CLAUDE.md hot-path rules; `i` is also the mio Token identity).
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn run_multi<T: Transport, C: Capture>(
-    conns: &mut [MexcConn<T>],
+    conns: &mut [MexcConn<'_, T>],
     producer: &mut Producer<Tick, TICK_RING_CAP>,
     event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
     event_mask: u16,
@@ -1568,6 +1570,12 @@ pub fn run_multi<T: Transport, C: Capture>(
                         conns[i].drv.reset_for_reconnect(now);
                         conns[i].keepalive.reset();
                         conns[i].session_start_ns = now;
+                        // COPY: the new transport (1 080 B `TlsTransport`, rustls'
+                        // ClientConnection held inline) moves from `connect` into
+                        // its slot — once per reconnect, beside a TCP + TLS
+                        // handshake that costs orders of magnitude more —
+                        // rejected: a placement API on core-net's connect, for
+                        // one move per reconnect.
                         conns[i].transport = Some(t);
                     }
                 }
@@ -1608,8 +1616,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                 let n_before = producer.len();
                 let state_before = c.drv.state();
                 if drive_one(
-                    t, &mut c.drv, &c.host, &c.path, producer, event_tx, event_mask, status,
-                    capture,
+                    t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
                 )
                 .is_err()
                 {
@@ -2677,18 +2684,20 @@ mod tests {
         assert_eq!(status.msgs_total(), 1, "the one good print");
     }
 
+    /// The WS Ping echo goes rx → tx with no scratch (the BX0 shape): an
+    /// empty, a 4 B and a 125 B (control-frame cap) ping each come back
+    /// as exactly one masked pong carrying the same bytes.
     #[test]
     fn a_venue_ws_ping_is_answered_with_a_pong() {
         let mut t = TestTransport::with_capacity(8192);
         let mut d = steady(MexcClass::Spot);
         let status = IngressStatus::new();
         let (mut prod, _cons) = ring_pair();
-        t.inject_incoming(&ws_frame(0x89, b"hi"));
-        drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
-        let mut out = [0u8; 64];
-        let n = t.drain_outgoing(&mut out);
-        let frames = client_frames(&out[..n]);
-        assert_eq!(frames, vec![(0xA, b"hi".to_vec())]);
+        for payload in TestTransport::PING_ECHO_CASES {
+            t.inject_server_ping(payload);
+            drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
+            t.expect_pong_echo(payload);
+        }
         // A close frame closes.
         t.inject_incoming(&ws_frame(0x88, b""));
         drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();

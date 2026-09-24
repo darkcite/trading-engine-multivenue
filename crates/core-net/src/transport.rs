@@ -390,6 +390,18 @@ impl Transport for TlsTransport {
 // TestTransport — integration tests + alloc-assertion harness
 // ---------------------------------------------------------------
 
+/// The 125 B control-frame maximum (RFC 6455 §5.5), patterned so an
+/// echo that reorders or drops a byte cannot pass.
+const PING_MAX: [u8; 125] = {
+    let mut a = [0u8; 125];
+    let mut i = 0;
+    while i < a.len() {
+        a[i] = (i as u8) ^ 0x5A;
+        i += 1;
+    }
+    a
+};
+
 /// Simple in-process [`Transport`] backed by two preallocated byte
 /// buffers. Used by integration tests to feed scripted bytes into the
 /// run-loop and by the allocation-assertion harness to drive
@@ -493,6 +505,43 @@ impl TestTransport {
     /// will drain. Used by tests to script a server response.
     pub fn inject_incoming(&mut self, src: &[u8]) -> usize {
         self.rx.append(src)
+    }
+
+    /// The ping payloads every ingress run loop's echo test drives:
+    /// empty, a word, and the 125 B control-frame maximum.
+    pub const PING_ECHO_CASES: [&'static [u8]; 3] = [b"", b"PING", &PING_MAX];
+
+    /// Script one server Ping — FIN, unmasked (a server never masks,
+    /// RFC 6455 §5.1) — carrying `payload`, at most 125 B.
+    pub fn inject_server_ping(&mut self, payload: &[u8]) {
+        assert!(payload.len() <= 125, "a control payload is at most 125 B");
+        assert_eq!(self.rx.append(&[0x89, payload.len() as u8]), 2, "rx full");
+        assert_eq!(self.rx.append(payload), payload.len(), "rx full");
+    }
+
+    /// Drain the outbound bytes and assert they are exactly ONE client
+    /// Pong — FIN, masked (RFC 6455 §5.3) — echoing `payload` byte for
+    /// byte (§5.5.3).
+    pub fn expect_pong_echo(&mut self, payload: &[u8]) {
+        let mut out = [0u8; 2 + 4 + 125 + 1];
+        let n = self.tx.drain(&mut out);
+        assert_eq!(
+            n,
+            2 + 4 + payload.len(),
+            "exactly one masked pong, nothing else"
+        );
+        assert_eq!(out[0], 0x8A, "FIN + Pong");
+        assert_eq!(
+            usize::from(out[1]),
+            0x80 | payload.len(),
+            "masked, the ping's length"
+        );
+        let mask = [out[2], out[3], out[4], out[5]];
+        let mut i = 0;
+        while i < payload.len() {
+            assert_eq!(out[6 + i] ^ mask[i & 3], payload[i], "echo byte {i}");
+            i += 1;
+        }
     }
 
     /// Drain plaintext bytes the transport produced via

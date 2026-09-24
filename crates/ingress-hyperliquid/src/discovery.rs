@@ -961,6 +961,11 @@ fn parse_meta_row(
                         if s.is_empty() || s.len() > HL_COIN_MAX {
                             return Err(HlDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 24 B coin name (HL_COIN_MAX) into its discovery row, once per
+                        // coin row at boot — the row outlives the /info meta body it was scanned
+                        // from — rejected: rows borrowing the body (the meta body pinned for the
+                        // table's life and a lifetime threaded through the boot, to save ≤ 24 B a
+                        // row).
                         name[..s.len()].copy_from_slice(s);
                         name_len = s.len() as u8;
                         i = end;
@@ -1089,6 +1094,11 @@ fn parse_dex_row(
                         if s.is_empty() || s.len() > DEX_NAME_MAX {
                             return Err(HlDiscoveryErr::BadRow);
                         }
+                        // COPY: ≤ 16 B perp-dex name (DEX_NAME_MAX) into its discovery row, once
+                        // per dex row at boot — the row outlives the /info perpDexs body it was
+                        // scanned from — rejected: rows borrowing the body (the body pinned for the
+                        // table's life and a lifetime threaded through the boot, to save ≤ 16 B a
+                        // row).
                         name[..s.len()].copy_from_slice(s);
                         name_len = s.len() as u8;
                         i = end;

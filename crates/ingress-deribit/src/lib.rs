@@ -830,12 +830,14 @@ pub struct DeribitVolIndexFrame {
     /// `volatility` POINTS ×1e9 (venue sends percent points, e.g.
     /// `84.71`).
     pub vol_1e9: i64,
-    /// Length of the index name captured into `index_name`.
+    /// Byte offset of the `index_name` value (`btc_usd`) in the payload
+    /// the frame was parsed from — the name stays in the rx buffer;
+    /// read it with [`Self::index_name`].
+    pub index_name_off: u32,
+    /// Length of that value, 1..=16.
     pub index_name_len: u8,
-    /// `index_name` bytes (`btc_usd`), `index_name_len` valid.
-    pub index_name: [u8; 16],
     // Explicit tail padding.
-    _pad: [u8; 31],
+    _pad: [u8; 43],
 }
 
 impl DeribitVolIndexFrame {
@@ -843,10 +845,20 @@ impl DeribitVolIndexFrame {
     pub const ZERO: Self = Self {
         ts_ns: 0,
         vol_1e9: 0,
+        index_name_off: 0,
         index_name_len: 0,
-        index_name: [0; 16],
-        _pad: [0; 31],
+        _pad: [0; 43],
     };
+
+    /// The index name as a span of `payload` — the payload this frame
+    /// was parsed from; `None` if the span does not lie inside it.
+    #[inline]
+    #[must_use]
+    pub fn index_name<'a>(&self, payload: &'a [u8]) -> Option<&'a [u8]> {
+        payload
+            .get(self.index_name_off as usize..)?
+            .get(..usize::from(self.index_name_len))
+    }
 }
 
 /// WS6: parse one DVOL push. The index name resolves to a
@@ -876,14 +888,12 @@ fn parse_vol_index_fill(payload: &[u8], out: &mut DeribitVolIndexFrame) -> Optio
     if name.is_empty() || name.len() > 16 {
         return None;
     }
-    let mut index_name = [0u8; 16];
-    index_name[..name.len()].copy_from_slice(name);
     *out = DeribitVolIndexFrame {
         ts_ns,
         vol_1e9,
+        index_name_off: u32::try_from(start).ok()?,
         index_name_len: name.len() as u8,
-        index_name,
-        _pad: [0; 31],
+        _pad: [0; 43],
     };
     Some(())
 }
@@ -1179,6 +1189,11 @@ impl DeribitSymbolTable {
     fn push_row(&mut self, instrument: &[u8], sym: SymbolId) {
         let row = &mut self.rows[self.len];
         row.0 = instrument.len() as u8;
+        // COPY: ≤ 32 B instrument (DERIBIT_INSTR_MAX) into its symbol-table row,
+        // once per instrument at boot — the table owns fixed rows so the hot lookup
+        // compares in place with no pointer chase — rejected: borrowing the boot
+        // strings (the table moves onto the ingress thread and must not pin boot
+        // allocations).
         row.1[..instrument.len()].copy_from_slice(instrument);
         row.2 = sym;
         self.len += 1;
@@ -1512,6 +1527,13 @@ impl Default for DeribitTradeSeq {
 #[inline]
 pub(crate) fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
     let end = at.checked_add(src.len())?;
+    // COPY: text into the caller's scratch — the batched subscribe (≤ 16 KiB, once per
+    // session) and the WARN lines (≤ 224 B gap, ≤ 160 B sub-drop, ≤ 1 per GAP_LOG_INTERVAL_NS,
+    // 1 s) — the frame header needs the payload length before the masked payload, and a
+    // WARN line must reach stderr in ONE write — rejected: rendering straight into tx (the
+    // length is unknown until the batch render ends), wire parts (≈ 5 slices per channel,
+    // up to 4 × DERIBIT_MAX_SYMBOLS), one write per WARN part (interleaves) and one
+    // `writev` (a short writev splits the line; `write_all_vectored` is unstable).
     dst.get_mut(at..end)?.copy_from_slice(src);
     Some(end)
 }
@@ -1533,12 +1555,15 @@ pub(crate) fn fmt_u64(v: u64, scratch: &mut [u8; 20]) -> &[u8] {
     &scratch[i..]
 }
 
+/// Every request's head, up to its id.
+const REQ_HEAD: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":";
+
 /// `{"jsonrpc":"2.0","id":<id>,"method":"<method>","params":` — the
 /// shared request head. Caller appends the params body and `}`.
 #[inline]
 fn write_req_head(dst: &mut [u8], id: u64, method: &[u8]) -> Option<usize> {
     let mut n = 0;
-    n = push_bytes(dst, n, b"{\"jsonrpc\":\"2.0\",\"id\":")?;
+    n = push_bytes(dst, n, REQ_HEAD)?;
     let mut digits = [0u8; 20];
     n = push_bytes(dst, n, fmt_u64(id, &mut digits))?;
     n = push_bytes(dst, n, b",\"method\":\"")?;
@@ -1631,37 +1656,74 @@ pub fn write_subscribe_all(
     Some(n)
 }
 
-/// Serialize a one-channel `public/subscribe` or `public/unsubscribe`
-/// for `book.{instr}.100ms` — the §6.2 resync action after a chain
-/// break (unsubscribe + subscribe ⇒ fresh snapshot).
-#[inline]
-pub fn write_book_op(dst: &mut [u8], id: u64, method: &[u8], instrument: &[u8]) -> Option<usize> {
-    let mut n = write_req_head(dst, id, method)?;
-    n = push_bytes(dst, n, b"{\"channels\":[")?;
-    n = write_channel_name(dst, n, DeribitChannel::Book, instrument)?;
-    n = push_bytes(dst, n, b"]}}")?;
-    Some(n)
+/// A book resync request's verb.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeribitBookOp {
+    /// `public/subscribe`.
+    Subscribe,
+    /// `public/unsubscribe`.
+    Unsubscribe,
 }
 
-/// Serialize `public/set_heartbeat {"interval": <secs>}` — queued
-/// once per connection, immediately after the WS upgrade.
+/// A one-channel `public/(un)subscribe` for `book.{instr}.100ms` — the
+/// §6.2 resync after a chain break (unsubscribe + subscribe ⇒ a fresh
+/// snapshot) — as wire parts laid into the caller's `parts` in place,
+/// for `core_net::queue_masked_text_frame_parts`: the id's digits
+/// render into `digits`; the request is never assembled first.
 #[inline]
-pub fn write_set_heartbeat(dst: &mut [u8], id: u64, interval_secs: u64) -> Option<usize> {
-    let mut n = write_req_head(dst, id, b"public/set_heartbeat")?;
-    n = push_bytes(dst, n, b"{\"interval\":")?;
-    let mut digits = [0u8; 20];
-    n = push_bytes(dst, n, fmt_u64(interval_secs, &mut digits))?;
-    n = push_bytes(dst, n, b"}}")?;
-    Some(n)
+pub fn book_op_parts<'a>(
+    op: DeribitBookOp,
+    id: u64,
+    instrument: &'a [u8],
+    digits: &'a mut [u8; 20],
+    parts: &mut [&'a [u8]; 5],
+) {
+    parts[0] = REQ_HEAD;
+    parts[1] = fmt_u64(id, digits);
+    parts[2] = match op {
+        DeribitBookOp::Subscribe => {
+            b",\"method\":\"public/subscribe\",\"params\":{\"channels\":[\"book."
+        }
+        DeribitBookOp::Unsubscribe => {
+            b",\"method\":\"public/unsubscribe\",\"params\":{\"channels\":[\"book."
+        }
+    };
+    parts[3] = instrument;
+    parts[4] = b".100ms\"]}}";
 }
 
-/// Serialize `public/test {}` — the mandatory `test_request` answer
-/// and our proactive idle probe.
+/// `public/set_heartbeat {"interval": <secs>}` — queued once per
+/// connection, right after the WS upgrade — as wire parts laid into the
+/// caller's `parts` in place: the id and the interval render into their
+/// digit buffers; the request is never assembled first.
 #[inline]
-pub fn write_test(dst: &mut [u8], id: u64) -> Option<usize> {
-    let mut n = write_req_head(dst, id, b"public/test")?;
-    n = push_bytes(dst, n, b"{}}")?;
-    Some(n)
+pub fn set_heartbeat_parts<'a>(
+    id: u64,
+    interval_secs: u64,
+    id_digits: &'a mut [u8; 20],
+    secs_digits: &'a mut [u8; 20],
+    parts: &mut [&'a [u8]; 5],
+) {
+    parts[0] = REQ_HEAD;
+    parts[1] = fmt_u64(id, id_digits);
+    parts[2] = b",\"method\":\"public/set_heartbeat\",\"params\":{\"interval\":";
+    parts[3] = fmt_u64(interval_secs, secs_digits);
+    parts[4] = b"}}";
+}
+
+/// `public/test {}` — the mandatory `test_request` answer and our
+/// proactive idle probe, so THE steady-state request — as wire parts
+/// for `core_net::queue_masked_text_frame_parts`: the id's digits
+/// render into `digits`, and the frame serialiser masks each part
+/// straight into tx; the request is never assembled first.
+#[inline]
+#[must_use]
+pub fn test_request_parts(id: u64, digits: &mut [u8; 20]) -> [&[u8]; 3] {
+    [
+        REQ_HEAD,
+        fmt_u64(id, digits),
+        b",\"method\":\"public/test\",\"params\":{}}",
+    ]
 }
 
 /// FNV-1a 64-bit over the channel tag byte + instrument bytes — a
@@ -2164,7 +2226,11 @@ mod tests {
         let f = parse_vol_index_view(b).expect("parses");
         assert_eq!(f.ts_ns, 1_619_777_946_007 * 1_000_000);
         assert_eq!(f.vol_1e9, 84_710_000_000, "points ×1e9");
-        assert_eq!(&f.index_name[..f.index_name_len as usize], b"btc_usd");
+        assert_eq!(
+            f.index_name(b),
+            Some(&b"btc_usd"[..]),
+            "a span of the payload"
+        );
         assert_eq!(
             classify(b),
             DeribitMsgKind::VolIndexPush,
@@ -2349,27 +2415,51 @@ mod tests {
     }
 
     #[test]
-    fn write_book_op_heartbeat_and_test_exact_bytes() {
-        let mut dst = [0u8; 512];
-        let n = write_book_op(&mut dst, 9, b"public/unsubscribe", b"BTC-PERPETUAL").unwrap();
+    fn book_op_heartbeat_and_test_parts_spell_the_exact_bytes() {
+        let mut digits = [0u8; 20];
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        book_op_parts(
+            DeribitBookOp::Unsubscribe,
+            9,
+            b"BTC-PERPETUAL",
+            &mut digits,
+            &mut parts,
+        );
         assert_eq!(
-            &dst[..n],
+            parts.concat(),
             br#"{"jsonrpc":"2.0","id":9,"method":"public/unsubscribe","params":{"channels":["book.BTC-PERPETUAL.100ms"]}}"#
-                as &[u8]
         );
-        let n = write_set_heartbeat(&mut dst, 1, HEARTBEAT_INTERVAL_SECS).unwrap();
+        let mut digits = [0u8; 20];
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        book_op_parts(
+            DeribitBookOp::Subscribe,
+            10,
+            b"ETH-PERPETUAL",
+            &mut digits,
+            &mut parts,
+        );
         assert_eq!(
-            &dst[..n],
+            parts.concat(),
+            br#"{"jsonrpc":"2.0","id":10,"method":"public/subscribe","params":{"channels":["book.ETH-PERPETUAL.100ms"]}}"#
+        );
+        let (mut id_digits, mut secs_digits) = ([0u8; 20], [0u8; 20]);
+        let mut parts: [&[u8]; 5] = [b""; 5];
+        set_heartbeat_parts(
+            1,
+            HEARTBEAT_INTERVAL_SECS,
+            &mut id_digits,
+            &mut secs_digits,
+            &mut parts,
+        );
+        assert_eq!(
+            parts.concat(),
             br#"{"jsonrpc":"2.0","id":1,"method":"public/set_heartbeat","params":{"interval":15}}"#
-                as &[u8]
         );
-        let n = write_test(&mut dst, 12345).unwrap();
+        let mut digits = [0u8; 20];
         assert_eq!(
-            &dst[..n],
-            br#"{"jsonrpc":"2.0","id":12345,"method":"public/test","params":{}}"# as &[u8]
+            test_request_parts(12345, &mut digits).concat(),
+            br#"{"jsonrpc":"2.0","id":12345,"method":"public/test","params":{}}"#
         );
-        let mut tiny = [0u8; 8];
-        assert!(write_test(&mut tiny, 1).is_none());
     }
 
     // ---- sub ids --------------------------------------------------
@@ -2423,7 +2513,7 @@ mod proptests {
                 f.vol_1e9,
                 (points as i64) * 1_000_000_000 + (frac as i64) * 10_000_000
             );
-            prop_assert_eq!(&f.index_name[..f.index_name_len as usize], b"btc_usd");
+            prop_assert_eq!(f.index_name(buf.as_bytes()), Some(&b"btc_usd"[..]));
         }
 
         #[test]

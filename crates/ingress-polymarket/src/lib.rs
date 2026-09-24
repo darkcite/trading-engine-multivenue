@@ -343,6 +343,12 @@ pub fn write_market_subscribe_multi(dst: &mut [u8], ids: &[&[u8]]) -> Option<usi
         return None;
     }
     let mut w = 0usize;
+    // COPY: the market subscribe text into the caller's render scratch (≤ 11 KiB:
+    // head, ≤ 128 quoted ids of ≤ 80 B, tail), once per connection — the frame
+    // is masked into tx behind a length-prefixed header — rejected: a
+    // header-first render straight into tx (the length IS pre-computed above,
+    // but core-net has no header-only writer; its parts writer would need
+    // 2 + 3n slices for n ≤ 128 ids).
     dst[w..w + HEAD.len()].copy_from_slice(HEAD);
     w += HEAD.len();
     for i in 0..ids.len() {
@@ -352,6 +358,8 @@ pub fn write_market_subscribe_multi(dst: &mut [u8], ids: &[&[u8]]) -> Option<usi
         }
         dst[w] = b'"';
         w += 1;
+        // COPY: each quoted id (≤ 80 B), then the tail — same bound, reason and
+        // rejected alternative as the head above.
         dst[w..w + ids[i].len()].copy_from_slice(ids[i]);
         w += ids[i].len();
         dst[w] = b'"';

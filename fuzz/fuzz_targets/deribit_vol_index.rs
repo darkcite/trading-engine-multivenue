@@ -18,7 +18,11 @@ mod poison;
 
 fuzz_target!(|data: &[u8]| {
     let mut f: ingress_deribit::DeribitVolIndexFrame = poison::poisoned();
-    if !ingress_deribit::parse_vol_index(data, &mut f) {
+    if ingress_deribit::parse_vol_index(data, &mut f) {
+        // The name is a span of THIS payload, 1..=16 bytes.
+        let name = f.index_name(data).expect("a parsed frame's name span lies inside its payload");
+        assert!((1..=16).contains(&name.len()), "name length {}", name.len());
+    } else {
         assert_eq!(f, poison::poisoned::<ingress_deribit::DeribitVolIndexFrame>(), "a failed parse wrote the frame");
     }
 });

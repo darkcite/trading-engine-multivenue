@@ -359,14 +359,17 @@ pub fn ws_write_text_frame_parts(
     ws_write_frame_parts(dst, WsOpcode::Text, parts, mask)
 }
 
-/// Binary counterpart of [`ws_write_text_frame`].
+/// Binary counterpart of [`ws_write_text_frame_parts`]: the payload is
+/// the concatenation of `parts`, each written straight into `dst` (the
+/// RPC venues' fixed-shape JSON-RPC requests). `FIN=1`, masked,
+/// zero-alloc.
 #[inline]
-pub fn ws_write_binary_frame(
+pub fn ws_write_binary_frame_parts(
     dst: &mut [u8],
-    payload: &[u8],
+    parts: &[&[u8]],
     mask: [u8; 4],
 ) -> Result<usize, WsWriteErr> {
-    ws_write_frame(dst, WsOpcode::Binary, payload, mask)
+    ws_write_frame_parts(dst, WsOpcode::Binary, parts, mask)
 }
 
 /// Serialize a Pong control frame (in response to a Ping). Control
@@ -691,7 +694,7 @@ mod tests {
         // 126 triggers the 16-bit form.
         let payload = vec![0xAAu8; 126];
         let mut dst = vec![0u8; 4 + 4 + payload.len()];
-        let n = ws_write_binary_frame(&mut dst, &payload, [9, 9, 9, 9]).unwrap();
+        let n = ws_write_binary_frame_parts(&mut dst, &[&payload], [9, 9, 9, 9]).unwrap();
         assert_eq!(n, 2 + 2 + 4 + 126);
         // Re-parse.
         let r = ws_read_frame(&dst[..n]);

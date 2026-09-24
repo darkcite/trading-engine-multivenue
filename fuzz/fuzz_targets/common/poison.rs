@@ -18,6 +18,9 @@ pub unsafe trait AnyBits: Copy {}
 
 // SAFETY: each frame below was checked field by field against its
 // definition (2026-09-23): `repr(C)`, integers and `[u8; N]` only.
+// `DeribitVolIndexFrame` re-checked 2026-09-24 after its index name
+// became a payload span: `ts_ns: NsTs`, `vol_1e9: i64`,
+// `index_name_off: u32`, `index_name_len: u8`, `_pad: [u8; 43]`.
 unsafe impl AnyBits for core_types::Tick {}
 unsafe impl AnyBits for ingress_okx::OkxBboFrame {}
 unsafe impl AnyBits for ingress_okx::OkxTradeFrame {}
