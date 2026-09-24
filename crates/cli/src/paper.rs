@@ -4154,6 +4154,10 @@ pub struct Observability {
     /// (`evm_testnet::ShadowBootErr::Dark`) — published as
     /// `engine_hyparb_evm_dark`.
     pub hyparb_shadow_dark: bool,
+    /// HYPARB L5: slot 0's LIVE arm's status — the same
+    /// `engine_hyparb_evm_*` family the shadow publishes, now from the
+    /// mainnet swap path. `None` unless slot 0 is armed live.
+    pub hyparb_live_status: Option<std::sync::Arc<crate::hyparb_live::LiveShared>>,
 }
 
 /// XSD-3: the state writer's identity — the path, the table hash the
@@ -7399,6 +7403,7 @@ where
     // HYPARB H8: the testnet shadow's tap, owned by this thread from here.
     let mut hyparb_shadow = obs.hyparb_shadow.take();
     let hyparb_shadow_dark = obs.hyparb_shadow_dark;
+    let hyparb_live_status = obs.hyparb_live_status.take();
     let mut hyparb_evm_last = [0u64; crate::evm_testnet::SHADOW_COUNTER_NAMES.len()];
     let xsd_sink = obs.xsd_state.clone();
     let mut xsd_state_epoch = strategy_core::StrategyCounters::xsd_state_epoch(eng.strategy());
@@ -7586,9 +7591,12 @@ where
                 mirror_hyparb_evm_metrics(
                     reg,
                     &ids.hyparb_evm,
-                    hyparb_shadow
-                        .as_ref()
-                        .map(crate::evm_testnet::ShadowTap::status),
+                    match hyparb_live_status.as_deref() {
+                        Some(l) => Some(&l.status),
+                        None => hyparb_shadow
+                            .as_ref()
+                            .map(crate::evm_testnet::ShadowTap::status),
+                    },
                     hyparb_shadow_dark,
                     &mut hyparb_evm_last,
                 );

@@ -38,9 +38,10 @@ use crate::calldata::{encode_swap, SwapCall, SWAP_CALLDATA_LEN};
 use crate::gas::{fee_paid_wei, GasBid, SWAP_GAS_LIMIT};
 use crate::nonce::{NonceTable, WalletState, MAX_WALLETS};
 use crate::rpc::{
-    classify_send_refusal, scan_hash, scan_next_base_fee, scan_quantity, scan_receipt, scan_word,
-    write_balance, write_call, write_chain_id, write_fee_history, write_receipt, write_send_raw,
-    write_tx_count, BlockTag, Receipt, ScanErr, SendRefusal,
+    classify_send_refusal, scan_hash, scan_next_base_fee, scan_quantity, scan_receipt,
+    scan_transfers, scan_word, write_balance, write_call, write_chain_id, write_fee_history,
+    write_receipt, write_send_raw, write_tx_count, BlockTag, Receipt, ScanErr, SendRefusal,
+    TokenMove,
 };
 use crate::{MainnetAuthority, Network};
 
@@ -339,6 +340,10 @@ pub struct EvmArm {
     counters: EvmArmCounters,
     /// The last receipt a poll scanned (read after `Mined`).
     last_receipt: Receipt,
+    /// Where that receipt's body sits in the response buffer, and the
+    /// request id it answered (HYPARB L3 reads its logs).
+    last_body: core::ops::Range<usize>,
+    last_body_id: u64,
 }
 
 impl EvmArm {
@@ -412,6 +417,8 @@ impl EvmArm {
             halted: None,
             counters: EvmArmCounters::default(),
             last_receipt: Receipt::ZERO,
+            last_body: 0..0,
+            last_body_id: 0,
         })
     }
 
@@ -420,6 +427,25 @@ impl EvmArm {
     #[must_use]
     pub const fn last_receipt(&self) -> &Receipt {
         &self.last_receipt
+    }
+
+    /// HYPARB L3 — the ERC-20 `Transfer`s between `a` and `b` in the
+    /// receipt the last `Mined` poll reconciled: the receipt IS the
+    /// fill. Read it before the next request, which reuses the response
+    /// buffer; afterwards the stored request id no longer matches and
+    /// the scan refuses rather than reading another answer.
+    pub fn last_receipt_transfers(
+        &self,
+        a: &[u8; 20],
+        b: &[u8; 20],
+        out: &mut [TokenMove],
+    ) -> Result<usize, ScanErr> {
+        let body = self
+            .http
+            .resp()
+            .get(self.last_body.clone())
+            .ok_or(ScanErr::Malformed)?;
+        scan_transfers(body, self.last_body_id, a, b, out)
     }
 
     /// The armed network.
@@ -572,16 +598,7 @@ impl EvmArm {
     /// sender the executor's `swap` accepts. A contract that does not
     /// answer one address-shaped word refuses (`Scan`).
     pub fn owner_of(&mut self, contract: &[u8; 20]) -> Result<[u8; 20], ArmErr> {
-        let id = self.id();
-        let n = write_call(
-            self.http.body_mut(),
-            id,
-            contract,
-            &crate::calldata::OWNER_SELECTOR,
-        )
-        .map_err(too_small)?;
-        let r = self.exchange(n)?;
-        let w = scan_word(&self.http.resp()[r.clone()], id).map_err(|e| self.scan_err(e, r))?;
+        let w = self.call_word(contract, &crate::calldata::OWNER_SELECTOR)?;
         let mut hi = 0usize;
         while hi < 12 {
             if w[hi] != 0 {
@@ -595,6 +612,15 @@ impl EvmArm {
         // back the word (every caller wants the address).
         a.copy_from_slice(&w[12..]);
         Ok(a)
+    }
+
+    /// One single-word view call (`eth_call` at `latest`): `owner()`,
+    /// `balanceOf(…)` — the HYPARB L3 reconciler's inventory reads.
+    pub fn call_word(&mut self, to: &[u8; 20], data: &[u8]) -> Result<[u8; 32], ArmErr> {
+        let id = self.id();
+        let n = write_call(self.http.body_mut(), id, to, data).map_err(too_small)?;
+        let r = self.exchange(n)?;
+        scan_word(&self.http.resp()[r.clone()], id).map_err(|e| self.scan_err(e, r))
     }
 
     /// The next block's base fee (`eth_feeHistory`).
@@ -846,8 +872,12 @@ impl EvmArm {
         let (tag, nonce) = (f.tag, f.nonce);
         let timed_out = now_ns.saturating_sub(f.sent_ns) > RECEIPT_TIMEOUT_NS;
         let got = match self.exchange(n) {
-            Ok(r) => scan_receipt(&self.http.resp()[r.clone()], id, &mut self.last_receipt)
-                .map_err(|e| self.scan_err(e, r)),
+            Ok(r) => {
+                self.last_body = r.clone();
+                self.last_body_id = id;
+                scan_receipt(&self.http.resp()[r.clone()], id, &mut self.last_receipt)
+                    .map_err(|e| self.scan_err(e, r))
+            }
             Err(e) => Err(e),
         };
         match got {

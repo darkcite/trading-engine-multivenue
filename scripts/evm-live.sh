@@ -10,6 +10,10 @@
 #   evm-live.sh swap   --pool 0x… --zero-for-one true|false \
 #                      --amount-raw <n> --min-out-raw <n> --confirm
 #   evm-live.sh sweep  --token 0x… --amount-raw <n> --confirm   # executor -> X
+#   evm-live.sh arm-smoke [--coin HYPE] [--pool 0x…] --confirm   # slot 0's live arm,
+#                      end to end: one swap + one hedge round trip (HYPARB L5)
+#   evm-live.sh arm-smoke --no-trade --confirm [--exec <toml> --arm-live 0,3]
+#                      # the PREFLIGHT hyparb-flip.sh runs: nothing is sent
 #
 #   add --network testnet to run the same verb on chain 998 ([testnet]);
 #   add --hyparb <toml> for another artifact (default ~/multivenue/hyparb.toml).

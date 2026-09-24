@@ -6,6 +6,29 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-24 — slot 0 can arm LIVE (three switches); `hyparb.toml mode = "live"`; `OrderDispatch::try_next_retired`; `evm-live arm-smoke`; `scripts/hyparb-flip.sh` (HYPARB L2–L5)
+
+**What changed**
+- `hyparb.toml` accepts `mode = "live"` (live checks: `[mainnet]
+  executor`, perp-only coins, USD-quoted traded pools).
+- `exec.toml` accepts a live `[exec.slot.0]` on exactly `["hyperliquid",
+  "hyperevm"]`; `hyperevm` on any other slot refuses; `NEVER_LIVE_SLOTS`
+  is gone. Slot 0's state files: `<exec.toml dir>/hyparb/` (X's HL
+  budget and anchor, `hyparb-equity-anchor.state`).
+- The wrapper: `HYPARB_LIVE=1` + `HYPARB_TOML` + `ARM_LIVE` naming 0 +
+  `HYPEREVM_MAINNET_KEY` (repo `.env`) → `--hyparb <toml>` without
+  `--evm-testnet`; exclusive with `EVM_TESTNET` / `EVM_HYBRID`.
+- `clob_dispatcher::OrderDispatch` gains `try_next_retired` (default
+  none) and `halt_signal_for` (default = `halt_signal`); the router
+  drains the first on idle and judges each live slot by the second.
+- New verb `evm-live arm-smoke [--no-trade] [--exec --arm-live]`; new
+  script `scripts/hyparb-flip.sh status|live|paper`.
+- `exec.toml.example` documents slot 0 (shipped paper).
+
+**What to do**
+- Nothing for the running engine: every existing config boots as before
+  (slot 0 paper). To go live: plan §17.6.
+
 ## 2026-09-24 — `hyparb.toml [mainnet]`, `multivenue-engine evm-live`, `scripts/evm-live.sh` (HYPARB L1)
 
 **What changed**

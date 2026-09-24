@@ -363,7 +363,12 @@ pub struct Ledger {
     /// venue must not pass orders, and "it refuses everything" is a
     /// failure an operator sees in the first second rather than a cap
     /// that was never really there.
-    seeded: bool,
+    ///
+    /// **Per slot since HYPARB L4** (bit `s` = slot `s`): with two
+    /// live arms, each slot is seeded by the reconciler of the arm
+    /// that trades it, so slot 0's first reconcile never admits slot
+    /// 3's orders, nor the reverse.
+    seeded: u8,
     counters: LedgerCounters,
 }
 
@@ -390,7 +395,7 @@ impl Ledger {
             resting_by_slot: [0; EXEC_SLOTS],
             day_epoch: 0,
             anchor,
-            seeded: false,
+            seeded: 0,
             counters: LedgerCounters::default(),
         }
     }
@@ -401,17 +406,37 @@ impl Ledger {
     /// gate refuses every live PLACE. E6 commit 3's reconciler is what
     /// will call it; it is public now so that the interlock is a
     /// thing the code states rather than a thing commit 3 remembers.
+    ///
+    /// Every slot at once: one venue relationship reconciled for all
+    /// of them. [`Self::mark_slot_seeded`] is the per-arm form.
     #[inline]
     pub fn mark_seeded(&mut self) {
-        self.seeded = true;
+        self.seeded = u8::MAX;
     }
 
-    /// Whether the ledger has been reconciled against the venue since
-    /// boot. See [`Ledger::seeded`].
+    /// HYPARB L4: slot `slot`'s arm has reconciled. A slot at or above
+    /// [`EXEC_SLOTS`] is ignored (it can never be live).
+    #[inline]
+    pub fn mark_slot_seeded(&mut self, slot: usize) {
+        if slot < EXEC_SLOTS {
+            self.seeded |= 1 << slot;
+        }
+    }
+
+    /// Whether ANY slot has been reconciled against its venue since
+    /// boot (the `/state` byte). See [`Ledger::seeded`].
     #[inline]
     #[must_use]
     pub const fn is_seeded(&self) -> bool {
-        self.seeded
+        self.seeded != 0
+    }
+
+    /// Whether slot `slot` has been reconciled — what the risk gate
+    /// asks before a live PLACE.
+    #[inline]
+    #[must_use]
+    pub const fn is_slot_seeded(&self, slot: usize) -> bool {
+        slot < EXEC_SLOTS && self.seeded & (1 << slot) != 0
     }
 
     /// What the ledger had to refuse. Cold; `/metrics` and `/state`.
@@ -1863,8 +1888,12 @@ mod tests {
         let l = Ledger::new(anchor());
         assert!(!l.is_seeded(), "a fresh ledger knows nothing of the venue");
         let mut l = l;
+        l.mark_slot_seeded(0);
+        assert!(l.is_seeded() && l.is_slot_seeded(0) && !l.is_slot_seeded(3));
+        l.mark_slot_seeded(EXEC_SLOTS);
+        assert!(!l.is_slot_seeded(EXEC_SLOTS), "no slot past the table");
         l.mark_seeded();
-        assert!(l.is_seeded());
+        assert!(l.is_seeded() && l.is_slot_seeded(3) && l.is_slot_seeded(7));
     }
 
     #[test]

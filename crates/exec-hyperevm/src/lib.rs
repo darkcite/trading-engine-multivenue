@@ -29,9 +29,11 @@
 //! [`Network::Mainnet`]; [`arm::EvmArm::new_mainnet`] demands the
 //! authority, and the authority has one door per path allowed to spend
 //! mainnet gas — each a named constructor, so every such path is one
-//! grep away. Today the only door is [`MainnetAuthority::operator_verb`]:
-//! an operator verb run by hand with `--confirm` (`cli::evm_live`). The
-//! armed engine's door lands with its three switches (plan §17.3 L5).
+//! grep away. There are two doors:
+//! [`MainnetAuthority::operator_verb`], an operator verb run by hand with
+//! `--confirm` (`cli::evm_live`); and [`MainnetAuthority::armed_engine`],
+//! the engine with all three of live mode's switches set (plan §17.3
+//! L5).
 //!
 //! Whatever the network, the arm refuses an endpoint whose `eth_chainId`
 //! disagrees with the chain it signs for. [`check_chains`] is layer 5
@@ -124,6 +126,22 @@ impl MainnetAuthority {
             Err(ChainRefusal::Unconfirmed)
         }
     }
+
+    /// The armed engine (HYPARB L5): `hyparb.toml mode = "live"`
+    /// (`artifact_live`) AND the exec interlock — `exec.toml
+    /// [exec.slot.0] mode = "live"` with `--arm-live` naming slot 0, the
+    /// two of which `cli::exec_boot::resolve` has already required to
+    /// agree (`interlock_live`). Any one alone is no authority.
+    pub fn armed_engine(artifact_live: bool, interlock_live: bool) -> Result<Self, ChainRefusal> {
+        if artifact_live && interlock_live {
+            Ok(Self { _sealed: () })
+        } else {
+            Err(ChainRefusal::Unarmed {
+                artifact_live,
+                interlock_live,
+            })
+        }
+    }
 }
 
 /// Why a chain configuration was refused.
@@ -136,6 +154,13 @@ pub enum ChainRefusal {
     },
     /// A mainnet write without the operator's `--confirm`.
     Unconfirmed,
+    /// The engine without all three of live mode's switches.
+    Unarmed {
+        /// `hyparb.toml mode = "live"`.
+        artifact_live: bool,
+        /// `exec.toml` slot 0 live and `--arm-live 0`, agreeing.
+        interlock_live: bool,
+    },
     /// The market-data and write chains disagree outside the one
     /// hybrid the switch permits (or the switch is set without it).
     Mismatch {
@@ -165,6 +190,17 @@ impl core::fmt::Display for ChainRefusal {
             Self::Unconfirmed => f.write_str(
                 "evm write path: a HyperEVM MAINNET write needs the operator's --confirm \
                  (O-HL1) — it spends real money",
+            ),
+            Self::Unarmed {
+                artifact_live,
+                interlock_live,
+            } => write!(
+                f,
+                "evm write path: HYPARB live mode needs all three switches — hyparb.toml \
+                 `mode = \"live\"` ({}), and exec.toml [exec.slot.0] `mode = \"live\"` with \
+                 `--arm-live 0` ({}) — any one alone refuses (O-HL1)",
+                if artifact_live { "set" } else { "NOT set" },
+                if interlock_live { "set" } else { "NOT set" },
             ),
             Self::Mismatch {
                 read,
@@ -255,6 +291,16 @@ mod tests {
         assert!(MainnetAuthority::operator_verb(true).is_ok());
         let s = ChainRefusal::Unconfirmed.to_string();
         assert!(s.contains("--confirm") && s.contains("real money"), "{s}");
+    }
+
+    /// L5: the engine's door opens on all three switches, never fewer.
+    #[test]
+    fn the_engine_door_needs_every_switch() {
+        assert!(MainnetAuthority::armed_engine(true, true).is_ok());
+        let e = MainnetAuthority::armed_engine(true, false).unwrap_err();
+        assert!(e.to_string().contains("(set)") && e.to_string().contains("(NOT set)"));
+        assert!(MainnetAuthority::armed_engine(false, true).is_err());
+        assert!(MainnetAuthority::armed_engine(false, false).is_err());
     }
 
     #[test]

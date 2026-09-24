@@ -71,7 +71,8 @@ if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
            crates/signer-evm crates/exec-hyperevm crates/clob-dispatcher crates/core-net \
            crates/ingress-binance crates/ingress-hyperevm crates/core-amm \
-           crates/strategy-hyparb crates/cli/src/evm_shadow.rs
+           crates/strategy-hyparb crates/cli/src/evm_shadow.rs \
+           crates/cli/src/hyparb_live.rs
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its

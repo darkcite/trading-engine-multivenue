@@ -599,6 +599,94 @@ pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, Sc
     user_info_request(out, br#"{"type":"spotClearinghouseState","user":"0x"#, master)
 }
 
+/// HYPARB L3: render `{"type":"clearinghouseState","user":"0x<40 hex>"}`
+/// — the PERP account (margin, positions), which the spot sheet above
+/// does not show. Zero-alloc; the buffer needs [`MAX_STATE_REQ`].
+///
+/// # Errors
+/// The buffer is too short.
+pub fn perp_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
+    user_info_request(out, br#"{"type":"clearinghouseState","user":"0x"#, master)
+}
+
+/// One perp position from a `clearinghouseState` body.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PerpPosition {
+    /// The coin (`"HYPE"`), a span into the scanned body.
+    pub coin: Span,
+    /// Signed size, coin × 1e8 (negative = short).
+    pub szi_1e8: i64,
+}
+
+/// Scan a `clearinghouseState` body: `marginSummary.accountValue`
+/// (USD × 1e8 — margin plus every position's unrealised P&L at the
+/// venue's marks) and each `assetPositions[].position{coin, szi}` into
+/// `out`. Returns `(account value, positions written)`.
+///
+/// # Errors
+/// A missing `marginSummary` / `accountValue` / `assetPositions`, a
+/// row without a `coin` or an `szi`, a truncated array, or more rows
+/// than `out` holds — every one a refusal, never "no positions" (a
+/// reconciler that read a broken sheet as flat would anchor on it).
+pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, usize), ScanErr> {
+    let ms = find_field(body, b"\"marginSummary\"").ok_or(ScanErr::Malformed)?;
+    let mut i = skip_ws(body, ms);
+    if i >= body.len() || body[i] != b':' {
+        return Err(ScanErr::Malformed);
+    }
+    i = skip_ws(body, i + 1);
+    if i >= body.len() || body[i] != b'{' {
+        return Err(ScanErr::Malformed);
+    }
+    let ms_end = object_end(body, i).ok_or(ScanErr::Malformed)?;
+    let value =
+        decimal_field(&body[i..ms_end], b"\"accountValue\"").ok_or(ScanErr::Malformed)?;
+
+    let pos = find_field(body, b"\"assetPositions\"").ok_or(ScanErr::Malformed)?;
+    let mut i = skip_ws(body, pos);
+    if i >= body.len() || body[i] != b':' {
+        return Err(ScanErr::Malformed);
+    }
+    i = skip_ws(body, i + 1);
+    if i >= body.len() || body[i] != b'[' {
+        return Err(ScanErr::Malformed);
+    }
+    i += 1;
+    let mut n = 0usize;
+    loop {
+        i = skip_ws(body, i);
+        if i >= body.len() {
+            return Err(ScanErr::Malformed);
+        }
+        if body[i] == b']' {
+            return Ok((value, n));
+        }
+        if body[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if body[i] != b'{' {
+            return Err(ScanErr::Malformed);
+        }
+        let end = object_end(body, i).ok_or(ScanErr::Malformed)?;
+        let row = &body[i..end];
+        let coin = string_field(row, b"\"coin\"").ok_or(ScanErr::Malformed)?;
+        let szi = decimal_field(row, b"\"szi\"").ok_or(ScanErr::Malformed)?;
+        if n >= out.len() {
+            return Err(ScanErr::Malformed);
+        }
+        out[n] = PerpPosition {
+            coin: Span {
+                start: coin.start + i as u32,
+                end: coin.end + i as u32,
+            },
+            szi_1e8: szi,
+        };
+        n += 1;
+        i = end;
+    }
+}
+
 const HEX: [u8; 16] = *b"0123456789abcdef";
 
 /// Does a BALANCE-namespace coin name refer to the same leg as a
@@ -640,6 +728,39 @@ mod tests {
         // A buffer one byte short is refused, not truncated.
         let mut small = [0u8; 8];
         assert!(spot_state_request(&mut small, &[0xAB; 20]).is_err());
+    }
+
+    /// HYPARB L3: the perp sheet, in the venue's documented shape.
+    /// `crossMarginSummary` carries its own `accountValue`; the one read
+    /// is `marginSummary`'s. Short sizes are negative.
+    #[test]
+    fn the_perp_sheet_reads_the_account_value_and_every_position() {
+        let body = br#"{"marginSummary":{"accountValue":"13109.482328","totalNtlPos":"1.1","totalRawUsd":"13108.3","totalMarginUsed":"0.1"},"crossMarginSummary":{"accountValue":"999.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"13104.5","assetPositions":[{"type":"oneWay","position":{"coin":"ETH","cumFunding":{"allTime":"514.08","sinceChange":"0.0","sinceOpen":"0.0"},"entryPx":"2986.3","leverage":{"rawUsd":"-95.06","type":"isolated","value":20},"liquidationPx":"2866.26","marginUsed":"4.97","maxLeverage":50,"positionValue":"100.02","returnOnEquity":"-0.0026","szi":"0.0335","unrealizedPnl":"-0.0134"}},{"type":"oneWay","position":{"coin":"HYPE","entryPx":"92.1","szi":"-0.5","unrealizedPnl":"0.1"}}],"time":1708622398623}"#;
+        let mut out = [PerpPosition::default(); 4];
+        let (value, n) = scan_perp_state(body, &mut out).expect("scans");
+        assert_eq!(value, 1_310_948_232_800);
+        assert_eq!(n, 2);
+        assert_eq!(out[0].coin.of(body), b"ETH");
+        assert_eq!(out[0].szi_1e8, 3_350_000);
+        assert_eq!(out[1].coin.of(body), b"HYPE");
+        assert_eq!(out[1].szi_1e8, -50_000_000);
+        // Measured shape of an empty account (testnet, 2026-09-24).
+        let empty = br#"{"marginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMarginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[],"time":1790230894391}"#;
+        assert_eq!(scan_perp_state(empty, &mut out), Ok((0, 0)));
+        // Refusals: too many rows, a row without szi, a truncated array,
+        // no margin summary.
+        let mut one = [PerpPosition::default(); 1];
+        assert!(scan_perp_state(body, &mut one).is_err());
+        let s = core::str::from_utf8(body).unwrap();
+        assert!(scan_perp_state(s.replacen("\"szi\":\"-0.5\",", "", 1).as_bytes(), &mut out).is_err());
+        assert!(scan_perp_state(&body[..body.len() - 30], &mut out).is_err());
+        assert!(scan_perp_state(s.replacen("\"marginSummary\"", "\"x\"", 1).as_bytes(), &mut out).is_err());
+        let mut buf = [0u8; MAX_STATE_REQ];
+        let n = perp_state_request(&mut buf, &[0xAB; 20]).expect("fits");
+        assert_eq!(
+            core::str::from_utf8(&buf[..n]).unwrap(),
+            "{\"type\":\"clearinghouseState\",\"user\":\"0xabababababababababababababababababababab\"}"
+        );
     }
 
     /// The two namespaces meet in exactly one function, and it

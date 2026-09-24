@@ -29,7 +29,17 @@ endpoint_kind = "archive"
 # decision SHADOWED by one swap on chain 998 (O-H5, O-H12) - refused
 # unless the engine is also started with --evm-testnet, and it needs the
 # [testnet] block at the end of this file and a [[coin]] named "HYPE"
-# (gas is bid in USD, paid in HYPE). There is no mainnet mode.
+# (gas is bid in USD, paid in HYPE). "live" (plan §17.5, O-HL1): the SAME
+# member, its orders sent for real - swaps on HyperEVM MAINNET through the
+# [mainnet] executor, hedges on Hyperliquid perps, both from slot 0's own
+# wallet X. Refused unless exec.toml [exec.slot.0] is live on
+# ["hyperliquid", "hyperevm"] and --arm-live names 0 (three switches;
+# scripts/hyparb-flip.sh sets all three), and unless: [mainnet] names the
+# executor, every [[coin]] hedges on a perp and none names a spot pair,
+# and every traded pool's coin1 is "USD" (the router's caps are USD).
+# Live runs from its OWN file (~/multivenue/hyparb-live.toml): the paper
+# artifact restricted to the pools the executor's tokens can trade, with
+# caps sized to the wallet.
 mode = "paper"
 # Gas is charged per ATTEMPT from the MEASURED distribution (a reverted
 # swap pays too), never the base fee. The only value is "measured".
@@ -133,10 +143,11 @@ wallets = 3
 # amount_raw = 1000000000000000000
 
 # HyperEVM MAINNET (plan §17, ruling O-HL1), at most once, OPTIONAL in
-# every mode: the member ignores it until live mode lands (plan §17.3
-# L5). The operator verbs `multivenue-engine evm-live` (scripts/
+# paper and testnet mode, REQUIRED with its executor in live mode (the
+# live arm's chain). The operator verbs `multivenue-engine evm-live` (scripts/
 # evm-live.sh) read it: `status`, and - each refused without --confirm,
-# because each spends real HYPE - `deploy`, `wrap`, `swap`, `sweep`. The
+# because each spends real HYPE - `deploy`, `wrap`, `swap`, `sweep`,
+# `arm-smoke` (slot 0's live arm end to end; `--no-trade` sends nothing). The
 # wallet is HYPEREVM_MAINNET_KEY from the repo .env: one address that
 # owns the executor, pays gas and is slot 0's own Hyperliquid account.
 [mainnet]

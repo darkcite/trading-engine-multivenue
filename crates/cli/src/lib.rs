@@ -46,6 +46,8 @@ pub mod evm_testnet;
 pub mod exec_boot;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
+pub mod hyparb_live;
+pub mod hyparb_rehearsal;
 pub mod options_manifest;
 pub mod paper;
 pub mod pinning;

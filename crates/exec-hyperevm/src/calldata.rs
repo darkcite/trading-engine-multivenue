@@ -66,6 +66,12 @@ pub const TOKEN1_SIGNATURE: &str = "token1()";
 /// `keccak256(TOKEN1_SIGNATURE)[..4]`.
 pub const TOKEN1_SELECTOR: [u8; 4] = [0xd2, 0x12, 0x20, 0xa7];
 
+/// `decimals()` — an ERC-20's unit (HYPARB L3 checks the universe's
+/// claim against the chain before trading a token).
+pub const DECIMALS_SIGNATURE: &str = "decimals()";
+/// `keccak256(DECIMALS_SIGNATURE)[..4]`.
+pub const DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
+
 /// `sweep(address token, address to, uint256 amount)` — the executor's
 /// owner-only unwind (O-H18).
 pub const SWEEP_SIGNATURE: &str = "sweep(address,address,uint256)";
@@ -312,6 +318,7 @@ mod tests {
             (TOKEN0_SIGNATURE, TOKEN0_SELECTOR),
             (TOKEN1_SIGNATURE, TOKEN1_SELECTOR),
             (SWEEP_SIGNATURE, SWEEP_SELECTOR),
+            (DECIMALS_SIGNATURE, DECIMALS_SELECTOR),
         ];
         let mut i = 0;
         while i < sigs.len() {

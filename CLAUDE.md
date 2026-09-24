@@ -69,7 +69,7 @@ in the script; `ai` = 48 is the floor every name includes).
   arm with the request body rendered in place, `userFills` WS pumped from
   `on_idle` on the engine thread, reconciliation, address-budget governor,
   LAW E-8 sweeps). Armed ONLY by the two-switch interlock `--exec
-  ~/multivenue/exec.toml --arm-live <slot>`; `LIVE_ARM_VENUES = [Hyperliquid]`;
+  ~/multivenue/exec.toml --arm-live <slot>`; `LIVE_ARM_VENUES = [Hyperliquid, HyperEvm]` (HyperEvm on slot 0 only, L5);
   a market-data host and an exchange host on different networks refuse the
   boot. `halt_on_recon_stale_ms` is REQUIRED on every live slot. Record:
   `docs/risk-policy.md` "E6" + "E7".
@@ -177,8 +177,13 @@ in the script; `ai` = 48 is the floor every name includes).
   operator's `scripts/evm-live.sh` verbs behind `--confirm`, a
   `MainnetAuthority`) … L6. HZ part B is NOT green from
   this Mac (a tx fired at head N lands in N+1 ~56 %): paper AMM fills
-  are an upper bound on latency. Slot 0 can NEVER be armed live
-  (`exec_boot::NEVER_LIVE_SLOTS`). Its one real write path is the
+  are an upper bound on latency. **L2–L5 LANDED (plan §17.5):** slot 0
+  arms LIVE only through three switches (artifact `mode = "live"`,
+  `exec.toml [exec.slot.0]` live on `["hyperliquid","hyperevm"]`,
+  `--arm-live 0`) with its own arm `cli::hyparb_live::HyparbLive` behind
+  `exec_router::SlotSplit`; `scripts/hyparb-flip.sh status|live|paper`
+  flips it (preflight = `evm-live arm-smoke --no-trade`); the runbook is
+  plan §17.6. In PAPER its one real write path is the
   HyperEVM TESTNET shadow — chain 998 only, compile-time; `mode =
   "testnet"` + `--evm-testnet` (+ `--evm-hybrid` for mainnet reads).
   **DONE(H8) live** 2026-09-23 17:37Z (plan §16.16): the executor
@@ -428,8 +433,8 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
   path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
   compile-time asserted); mainnet only through a `MainnetAuthority`
-  (L1: the operator's `evm-live` verbs; `docs/hyparb-build-plan.md` §11,
-  §16.14, §17.4).
+  (L1: the operator's `evm-live` verbs; L5: the engine's three
+  switches; `docs/hyparb-build-plan.md` §11, §16.14, §17.4, §17.5).
 - `crates/cli` — `multivenue-engine` (run / audit-replay / capture-catalog /
   backtest / audit-pnl / exec-smoke …); `paper.rs` = the boot + metrics
   assembly; `exec_boot.rs` = the arming interlock.

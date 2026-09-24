@@ -799,7 +799,10 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         // have been judged against a ledger reading zero. Commit 1's
         // own note names that hole: "a clamp on `submit` alone leaves
         // the cap reachable by repricing upward."
-        if !self.ledger.is_seeded() {
+        //
+        // Per slot since HYPARB L4: seeded by the reconciler of the arm
+        // that trades THIS slot.
+        if !self.ledger.is_slot_seeded(slot) {
             return self.refuse(order.strategy_id, RiskRefusal::Unseeded);
         }
 
@@ -1042,12 +1045,18 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         }
     }
 
-    /// Paper fills only — see the module note on §0.1-1. Venue fills
-    /// ride the engine's own fill lane 3, which the engine drains
-    /// before it ever pumps this.
+    /// Paper fills first, then the live arm's. The Hyperliquid arm's
+    /// venue fills ride the engine's own fill lane 3 and its
+    /// `try_next_fill` is always `None`; HYPARB L3's arm hands its
+    /// swap receipts and its account's hedge fills out here instead —
+    /// the engine books both kinds through the same `on_fill_booked`
+    /// hook either way.
     #[inline]
     fn try_next_fill(&mut self) -> Option<Fill> {
-        self.paper.try_next_fill()
+        match self.paper.try_next_fill() {
+            Some(f) => Some(f),
+            None => self.live.try_next_fill(),
+        }
     }
 
     /// Both arms, summed (plan §0.1-3). Cold: the 5 s tick only.
@@ -1061,9 +1070,13 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     /// still need judging against the book. Gating this on "is any
     /// slot live" would silently freeze the paper matcher for every
     /// member that is still modelling.
+    ///
+    /// The live arm sees every tick too (HYPARB L3 marks its account at
+    /// the hedge books' mids). The Hyperliquid arm's hook is a no-op.
     #[inline]
     fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         self.paper.observe_tick(tick, now_ns);
+        self.live.observe_tick(tick, now_ns);
     }
 
     /// HYPARB H2: every pool event reaches the paper matcher, ungated,
@@ -1106,6 +1119,14 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         let a = self.paper.on_idle();
         let b = self.live.on_idle();
 
+        // HYPARB L5: orders the arm accepted that ended without a
+        // (further) fill leave the resting count — a reverted swap is
+        // not working anywhere, and counting it would stall the slot
+        // at `max_open_orders`. Bounded by what the arm queued.
+        while let Some((oid, slot)) = self.live.try_next_retired() {
+            self.ledger.on_cancel(oid, slot as usize);
+        }
+
         // **E6 commit 3 — the halt machine runs HERE, not on the
         // dispatch path.**
         //
@@ -1114,15 +1135,12 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         // fire last or never. Commit 3a gave this hook a thread on
         // the `--exec` path, so the triggers are polled every 2 ms
         // whether or not anything is trading.
-        let sig = self.live.halt_signal();
-
-        // The reconciler has compared this arm against the venue, so
-        // the ledger's numbers mean something. Until this, every live
-        // PLACE is refused — see `Ledger::mark_seeded`.
-        if sig.reconciled != 0 && !self.ledger.is_seeded() {
-            self.ledger.mark_seeded();
-        }
-
+        //
+        // HYPARB L4: each live slot is judged against the signal of the
+        // arm that trades it (`OrderDispatch::halt_signal_for`), and is
+        // seeded by that arm's reconciler. With one arm the signal is
+        // the same for every slot, exactly as before.
+        //
         // ONE edge per poll, however many slots latch in it — the file
         // names every halted slot and the cancel is venue-wide, so N
         // `write_atomic` calls (N allocations, N fsyncs on the engine
@@ -1140,6 +1158,14 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             let Some(lim) = self.route.halts_at(here) else {
                 continue;
             };
+            let sig = self.live.halt_signal_for(here as u8);
+            // The reconciler has compared this slot's arm against the
+            // venue, so the ledger's numbers mean something. Until this,
+            // every live PLACE for the slot is refused — see
+            // `Ledger::mark_seeded`.
+            if sig.reconciled != 0 && !self.ledger.is_slot_seeded(here) {
+                self.ledger.mark_slot_seeded(here);
+            }
             let why = trigger_for(&sig, &lim);
             if self.halt.latch(here, why) {
                 latched += 1;
@@ -2343,6 +2369,8 @@ mod tests {
         /// The last request did not land, so the arm has stopped and
         /// the venue was never confirmed clear.
         stranded: bool,
+        /// Orders the arm says ended without a fill (HYPARB L5).
+        retired: Vec<(u64, u8)>,
     }
 
     /// `clob_dispatcher::HaltSignal` under a short name, so the test
@@ -2355,6 +2383,9 @@ mod tests {
         fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
             self.seen.push(order.client_oid);
             Ok(())
+        }
+        fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+            self.retired.pop()
         }
         fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
             self.cancelled.push(req.client_oid);
@@ -3155,5 +3186,126 @@ mod tests {
         d.on_idle();
         assert!(!d.halt().cancel_outstanding());
         assert_eq!(d.ledger().slot_resting(slot), 0, "now it did");
+    }
+
+    // -----------------------------------------------------------------
+    // HYPARB L4 — two live arms: slot 0 on its own, slot 3 on the other
+    // -----------------------------------------------------------------
+
+    /// Slot 3 live on Hyperliquid through arm `a`; slot 0 live on
+    /// HyperEVM + Hyperliquid through arm `b`.
+    fn two_arms() -> RoutedDispatcher<PaperDispatcher, crate::SlotSplit<SpyHalt, SpyHalt>> {
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        r.set_slot(
+            0,
+            ExecMode::Live,
+            &[VenueId::HyperEvm.to_u8(), VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits().with_pnl_bound(50_000_000, 20_000_000),
+        )
+        .unwrap();
+        RoutedDispatcher::new(
+            r,
+            PaperDispatcher::new(),
+            crate::SlotSplit::new(0, SpyHalt::default(), SpyHalt::default()),
+            test_anchor(),
+        )
+    }
+
+    fn healthy() -> clob_dispatcher::HaltSignal {
+        clob_dispatcher::HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+    }
+
+    #[test]
+    fn each_slot_is_seeded_by_its_own_arm() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.on_idle();
+        assert!(d.submit(&order(3, VenueId::Hyperliquid, 1)).is_ok());
+        assert_eq!(
+            d.submit(&order(0, VenueId::HyperEvm, 2)),
+            Err(DispatchError::RiskRefused),
+            "slot 0's arm has not reconciled"
+        );
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        assert!(d.submit(&order(0, VenueId::HyperEvm, 3)).is_ok());
+        assert_eq!(d.live().a().seen, [1]);
+        assert_eq!(d.live().b().seen, [3]);
+    }
+
+    #[test]
+    fn slot_0s_pnl_bound_halts_slot_0_and_never_slot_3() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        // Slot 0's arm reports a flat account $20.000001 below its
+        // anchor; slot 3's arm is healthy.
+        d.live_mut().b_mut().sig = healthy().with_pnl(true, -20_000_001);
+        d.on_idle();
+        assert!(d.halt().is_halted(0), "slot 0 tripped its loss bound");
+        assert!(!d.halt().is_halted(STRATEGY_SLOT_BIN15 as usize));
+        assert_eq!(
+            d.submit(&order(0, VenueId::Hyperliquid, 4)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert!(
+            d.submit(&order(3, VenueId::Hyperliquid, 5)).is_ok(),
+            "slot 3 keeps trading"
+        );
+        // The venue-wide cancel reached both arms.
+        assert_eq!(
+            (d.live().a().cancel_all_calls, d.live().b().cancel_all_calls),
+            (1, 1)
+        );
+        // Slot 3's arm reports a flat account too: slot 3 has no bound
+        // configured, so it never trips on it.
+        d.live_mut().a_mut().sig = healthy().with_pnl(true, -99_000_000);
+        d.on_idle();
+        assert!(!d.halt().is_halted(STRATEGY_SLOT_BIN15 as usize));
+    }
+
+    #[test]
+    fn slot_0s_venues_are_its_own_and_slot_3_cannot_reach_hyperevm() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        assert_eq!(
+            d.submit(&order(3, VenueId::HyperEvm, 6)),
+            Err(DispatchError::NoLiveRoute)
+        );
+        assert!(d.submit(&order(0, VenueId::Hyperliquid, 7)).is_ok());
+        assert_eq!(d.live().b().seen, [7]);
+    }
+
+    /// A reverted swap is not working anywhere: the arm retires it and
+    /// the slot's resting count comes back down — without it, eight
+    /// reverts would stall slot 0 at `max_open_orders` for the session.
+    #[test]
+    fn an_order_the_arm_retires_leaves_the_resting_count() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        assert!(d.submit(&order(0, VenueId::HyperEvm, 8)).is_ok());
+        assert!(d.submit(&order(3, VenueId::Hyperliquid, 9)).is_ok());
+        assert_eq!((d.ledger().slot_resting(0), d.ledger().slot_resting(3)), (1, 1));
+        d.live_mut().b_mut().retired.push((8, 0));
+        d.on_idle();
+        assert_eq!((d.ledger().slot_resting(0), d.ledger().slot_resting(3)), (0, 1));
+        // An unknown or already-filled key is silent.
+        d.live_mut().b_mut().retired.push((8, 0));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1);
     }
 }

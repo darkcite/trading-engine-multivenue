@@ -447,38 +447,45 @@ impl ShadowWorker {
         }
     }
 
-    /// Mirror the arm's counters into the shared status (absolute
-    /// values; the metrics mirror publishes deltas).
+    /// Mirror the arm's counters into the shared status.
+    #[inline]
     fn publish(&self) {
-        let c = self.arm.counters();
-        let arm = [
-            c.sends,
-            c.accepted,
-            c.maybe_sent,
-            c.refused_fee,
-            c.refused_rate,
-            c.refused_nonce,
-            c.refused_funds,
-            c.refused_other,
-            c.not_sent,
-            c.mined_ok,
-            c.mined_reverted,
-            c.timeouts,
-            c.syncs,
-        ];
-        let mut i = 0usize;
-        while i < arm.len() {
-            self.status.counters[ctr::ARM0 + i].store(arm[i], Ordering::Relaxed);
-            i += 1;
-        }
-        let g = &self.status.gauges;
-        g[gauge::READY].store(self.arm.nonces().ready_count() as u64, Ordering::Relaxed);
-        g[gauge::HALTED].store(u64::from(self.arm.halted().is_some()), Ordering::Relaxed);
-        g[gauge::GAS_GWEI].store(
-            (c.gas_paid_wei / 1_000_000_000).min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
+        publish_arm(&self.status, &self.arm);
     }
+}
+
+/// Mirror `arm`'s counters into `status` (absolute values; the metrics
+/// mirror publishes deltas) — the shadow's thread and HYPARB L3's live
+/// thread publish the same `engine_hyparb_evm_*` family.
+pub(crate) fn publish_arm(status: &ShadowStatus, arm: &EvmArm) {
+    let c = arm.counters();
+    let arm_c = [
+        c.sends,
+        c.accepted,
+        c.maybe_sent,
+        c.refused_fee,
+        c.refused_rate,
+        c.refused_nonce,
+        c.refused_funds,
+        c.refused_other,
+        c.not_sent,
+        c.mined_ok,
+        c.mined_reverted,
+        c.timeouts,
+        c.syncs,
+    ];
+    let mut i = 0usize;
+    while i < arm_c.len() {
+        status.counters[ctr::ARM0 + i].store(arm_c[i], Ordering::Relaxed);
+        i += 1;
+    }
+    let g = &status.gauges;
+    g[gauge::READY].store(arm.nonces().ready_count() as u64, Ordering::Relaxed);
+    g[gauge::HALTED].store(u64::from(arm.halted().is_some()), Ordering::Relaxed);
+    g[gauge::GAS_GWEI].store(
+        (c.gas_paid_wei / 1_000_000_000).min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
 }
 
 const _: () = assert!(ctr::ARM0 + 13 == SHADOW_COUNTER_NAMES.len());

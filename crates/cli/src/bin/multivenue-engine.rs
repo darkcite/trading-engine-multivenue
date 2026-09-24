@@ -166,6 +166,11 @@ enum LiveVerb {
     Swap,
     /// The executor returns `--amount-raw` of `--token` to X.
     Sweep,
+    /// HYPARB L5: slot 0's live arm end to end — boot, reconcile, a
+    /// refused unfundable swap, one AMM swap, one `--coin` hedge round
+    /// trip, retirements, the settled equity. `--network testnet` is
+    /// the rehearsal; mainnet trades a few dollars and needs `--confirm`.
+    ArmSmoke,
 }
 
 /// `evm-live --network`.
@@ -210,6 +215,20 @@ struct EvmLiveArgs {
     /// `sweep`: the token; `status`: extra executor balances (repeatable).
     #[arg(long)]
     token: Vec<String>,
+    /// `arm-smoke`: the hedge coin (one of the artifact's `[[coin]]`s).
+    #[arg(long, default_value = "HYPE")]
+    coin: String,
+    /// `arm-smoke`: the PREFLIGHT — boot, reconcile and the refused
+    /// unfundable swap only; nothing is sent to either venue.
+    #[arg(long, default_value_t = false)]
+    no_trade: bool,
+    /// `arm-smoke`: also check this exec.toml arms slot 0 with
+    /// `--arm-live` (the engine's own interlock, run without the engine).
+    #[arg(long)]
+    exec: Option<PathBuf>,
+    /// `arm-smoke --exec`: the slots the engine would be armed with.
+    #[arg(long)]
+    arm_live: Option<String>,
 }
 
 /// `evm-testnet` verbs.
@@ -1078,11 +1097,11 @@ fn evm_live(args: EvmLiveArgs) -> ExitCode {
             }
         },
     };
-    let target = match core_config::hyparb::load(&path)
+    let (file, target) = match core_config::hyparb::load(&path)
         .map_err(|e| e.to_string())
-        .and_then(|(f, _)| el::Target::from_file(&f, net))
+        .and_then(|(f, _)| el::Target::from_file(&f, net).map(|t| (f, t)))
     {
-        Ok(t) => t,
+        Ok(ft) => ft,
         Err(e) => {
             eprintln!("evm-live: {}: {e}", path.display());
             return ExitCode::from(2);
@@ -1127,6 +1146,39 @@ fn evm_live(args: EvmLiveArgs) -> ExitCode {
             ([tok], Some(amt)) => el::verb_sweep(&target, a, *tok, amt, tls).map(|r| (r, true)),
             _ => Err("sweep needs exactly one --token and --amount-raw".to_owned()),
         },
+        LiveVerb::ArmSmoke => {
+            let interlock = match args.exec.as_deref() {
+                None => Ok(String::new()),
+                Some(x) => match cli::exec_boot::resolve(Some(x), args.arm_live.as_deref()) {
+                    Ok(Some(eb)) if eb.hyparb_live() => Ok(format!(
+                        "interlock: {} + --arm-live {} arms slot 0 — OK\n",
+                        x.display(),
+                        args.arm_live.as_deref().unwrap_or("")
+                    )),
+                    Ok(_) => Err(format!(
+                        "{} with --arm-live {:?} does not arm slot 0",
+                        x.display(),
+                        args.arm_live
+                    )),
+                    Err(e) => Err(format!("{}: {e}", x.display())),
+                },
+            };
+            let pool = args.pool.as_deref().map(cli::evm_testnet::parse_addr).transpose();
+            match (interlock, pool) {
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(format!("--pool {e}")),
+                (Ok(head), Ok(p)) => cli::hyparb_rehearsal::verb_arm_smoke(
+                    &target,
+                    &file,
+                    a,
+                    &args.coin,
+                    p,
+                    args.no_trade,
+                    tls,
+                )
+                .map(|(r, ok)| (head + &r, ok)),
+            }
+        }
     };
     match out {
         Ok((report, ok)) => {
@@ -2252,6 +2304,125 @@ fn print_config(args: ConfigArgs) -> ExitCode {
 /// Boot a [`LiveDispatcher`] from the loaded config + secrets.
 /// Returns a static error message on any boot-time failure so the
 /// caller can surface a clean `EngineLoopResult::Failed`.
+/// **E7 — the operator's Hyperliquid arm**, for every live slot on
+/// Hyperliquid except slot 0 (which hedges from its own account). Fed by
+/// fill lane 3; configured from the `HYPERLIQUID_*` variables.
+fn boot_operator_hl_arm(
+    eb: &cli::exec_boot::ExecBoot,
+    md_ws_host: &str,
+    f3p: core_ring::Producer<core_types::Fill, { engine::FILL_RING_SIZE }>,
+) -> Result<exec_hyperliquid::HlExchange<{ engine::FILL_RING_SIZE }>, String> {
+    let hl_cfg = exec_hyperliquid::HlConfig::from_env(exec_hyperliquid::Scope::Live).map_err(|e| {
+        format!("slot(s) LIVE on hyperliquid but the arm cannot be configured: {e}")
+    })?;
+    // **LAW E-4's precondition.** The asset ids the arm binds come from
+    // the MARKET-DATA ingress's roll events; the orders go to the
+    // EXCHANGE host. A testnet id is a mainnet stranger's market and vice
+    // versa, so both hosts must be on the same network or the boot
+    // refuses.
+    let md_testnet = md_ws_host.contains("testnet");
+    let ex_testnet = hl_cfg.network == exec_hyperliquid::Network::Testnet;
+    if md_testnet != ex_testnet {
+        return Err(format!(
+            "HYPERLIQUID_WS_HOST ({md_ws_host}) and HYPERLIQUID_EXCHANGE_HOST ({}) are on \
+             different networks — the roll events that bind asset ids would name another \
+             network's markets (LAW E-4). Point both at testnet or both at mainnet.",
+            hl_cfg.host
+        ));
+    }
+    // The tightest floor across the live HL slots this arm trades: the
+    // budget is a property of the ADDRESS (slot 0's is its own).
+    let floor = eb
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live())
+        .map(|(_, s)| s.request_budget_floor)
+        .filter(|f| *f > 0)
+        .min()
+        .and_then(|f| u64::try_from(f).ok())
+        .unwrap_or(0);
+    let budget_path = eb
+        .path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default()
+        .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH);
+    let mut arm = exec_hyperliquid::HlExchange::new(
+        &hl_cfg,
+        TlsTransport::default_client_config(),
+        f3p,
+        budget_path.clone(),
+        floor,
+    )
+    .map_err(|e| e.to_string())?;
+    // E7-F1: the address budget is the venue's number, read once here;
+    // the cold assumption halted the first mainnet boot before its first
+    // order (2026-09-19).
+    arm.seed_budget_from_venue();
+    info!(
+        host = %hl_cfg.host,
+        network = if ex_testnet { "testnet" } else { "MAINNET" },
+        agent = %exec_hyperliquid::config::hex20(&hl_cfg.agent_addr),
+        master = %exec_hyperliquid::config::hex20(&hl_cfg.master_addr),
+        budget_floor = floor,
+        budget_source = ?arm.budget_source(),
+        budget_remaining = arm.budget_remaining(),
+        budget_state = %budget_path.display(),
+        // E7 session bound: 0 = not anchored yet — the first FLAT
+        // reconciliation sets it and writes the file; a restart restores
+        // it.
+        pnl_anchor_usd_1e6 = arm.pnl_anchor_usd_1e6(),
+        pnl_anchor_state = %arm.pnl_state_path().display(),
+        "exec: hyperliquid arm ARMED"
+    );
+    Ok(arm)
+}
+
+/// **HYPARB L5 — slot 0's live arm** from the booted artifact, the
+/// exec interlock and the universe. The engine's `MainnetAuthority` door
+/// opens only on all three switches.
+fn boot_hyparb_live_arm(
+    eb: &cli::exec_boot::ExecBoot,
+    hb: Option<&cli::hyparb_boot::HyparbBoot>,
+    universe: &core_config::universe::AllocatedUniverse,
+) -> Result<cli::hyparb_live::LiveBoot<{ engine::FILL_RING_SIZE }>, String> {
+    let hb = hb.ok_or("slot 0 is armed live but no hyparb artifact is booted")?;
+    let authority = exec_hyperevm::MainnetAuthority::armed_engine(
+        hb.mode == core_config::hyparb::HyparbMode::Live,
+        eb.hyparb_live(),
+    )
+    .map_err(|e| e.to_string())?;
+    let m = hb
+        .mainnet
+        .as_ref()
+        .ok_or("hyparb.toml has no [mainnet] block")?;
+    let executor = cli::evm_testnet::parse_addr(
+        m.executor
+            .as_deref()
+            .ok_or("hyparb.toml [mainnet] `executor` is not set")?,
+    )?;
+    let (pools, coins) =
+        cli::hyparb_live::pools_and_coins(hb, &universe.hyperevm, &universe.hyperevm_pools)?;
+    let floor = eb
+        .slots
+        .get(cli::exec_boot::HYPEREVM_SLOT)
+        .and_then(|s| u64::try_from(s.request_budget_floor).ok())
+        .unwrap_or(0);
+    let spec = cli::hyparb_live::LiveSpec {
+        net: cli::evm_live::LiveNet::Mainnet,
+        authority: Some(&authority),
+        evm_endpoint: &m.endpoint,
+        executor,
+        pools,
+        coins,
+        gas_coin: hb.params.gas_coin,
+        state_dir: cli::hyparb_live::state_dir(&eb.path),
+        budget_floor: floor,
+    };
+    cli::hyparb_live::boot_hyparb_live(&spec, TlsTransport::default_client_config())
+}
+
 /// **E6 commit 3/4 — the halt machine, wired.** Shared by both
 /// `--exec` arms (the real Hyperliquid arm and the refusing stub), so
 /// the halt file, the boot read-back and `--halt-slot` behave the same
@@ -4266,6 +4437,28 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // HYPARB L5 (O-HL1): live mode's three switches — the
+            // artifact's `mode = "live"`, and the exec interlock's slot 0
+            // (`exec.toml [exec.slot.0] mode = "live"` + `--arm-live 0`,
+            // which `exec_boot::resolve` already made agree) — agree, or
+            // no boot. Either side alone is a refusal, never a downgrade.
+            let hyparb_live_mode = hyparb_boot
+                .as_ref()
+                .is_some_and(|b| b.mode == core_config::hyparb::HyparbMode::Live);
+            let slot0_armed = exec_boot
+                .as_ref()
+                .is_some_and(cli::exec_boot::ExecBoot::hyparb_live);
+            if hyparb_live_mode != slot0_armed {
+                error!(
+                    artifact_live = hyparb_live_mode,
+                    exec_slot0_live = slot0_armed,
+                    "hyparb: LIVE mode needs all three switches — hyparb.toml `mode = \"live\"`, \
+                     exec.toml [exec.slot.0] `mode = \"live\"` and --arm-live 0 — and they \
+                     disagree; boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG6: the `/state` `boot` section's regime identity.
             let mut obs = obs;
             if let Some(rb) = regime_boot.as_ref() {
@@ -4368,177 +4561,166 @@ fn run(args: RunArgs) -> ExitCode {
                 // rather than by care.
                 Some(eb) => {
                     cli::exec_boot::log_boot_tell(&eb);
-                    // **E7 — the live arm.** A route table with
-                    // Hyperliquid live gets a real `HlExchange` behind
-                    // the router, fed by fill lane 3's producer and
-                    // configured from the `HYPERLIQUID_*` variables the
-                    // wrapper sourced from `.env`. Anything else keeps
-                    // the refusing stub, so LAW E-1 stays true by
-                    // construction on a boot that armed nothing.
-                    //
-                    // The two dispatcher types cannot share one binding
-                    // (the loop is monomorphised over `D`), so the halt
-                    // wiring below is a generic helper and the loop is
-                    // entered from two arms.
-                    if eb.route.venue_live(core_types::VenueId::Hyperliquid.to_u8()) {
-                        let hl_cfg = match exec_hyperliquid::HlConfig::from_env(
-                            exec_hyperliquid::Scope::Live,
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!(
-                                    error = %e,
-                                    "exec: slot(s) LIVE on hyperliquid but the arm cannot be \
-                                     configured — boot aborted"
-                                );
+                    // **HYPARB L5 — slot 0's own live arm** (O-HL1/O-HL3):
+                    // real swaps on HyperEVM mainnet and real hedges from
+                    // the slot's own Hyperliquid account, authorised only
+                    // by all three switches (checked above, and again by
+                    // `MainnetAuthority::armed_engine`).
+                    let hyparb_live = if eb.hyparb_live() {
+                        match boot_hyparb_live_arm(&eb, hyparb_boot.as_ref(), &boot.allocated) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                obs.hyparb_live_status = Some(b.arm.shared().clone());
+                                handles.push(b.handle);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(reason, "hyparb: the LIVE arm refused — boot aborted");
                                 join_reverse(handles);
                                 return ExitCode::from(1);
                             }
-                        };
-                        // **LAW E-4's precondition.** The asset ids the
-                        // arm binds come from the MARKET-DATA ingress's
-                        // roll events; the orders go to the EXCHANGE
-                        // host. A testnet id is a mainnet stranger's
-                        // market and vice versa, so both hosts must be
-                        // on the same network or the boot refuses.
-                        let md_testnet = cfg.hyperliquid_ws_host.contains("testnet");
-                        let ex_testnet = hl_cfg.network == exec_hyperliquid::Network::Testnet;
-                        if md_testnet != ex_testnet {
-                            error!(
-                                market_data = %cfg.hyperliquid_ws_host,
-                                exchange = %hl_cfg.host,
-                                "exec: HYPERLIQUID_WS_HOST and HYPERLIQUID_EXCHANGE_HOST are on \
-                                 different networks — the roll events that bind asset ids \
-                                 would name another network's markets (LAW E-4). Point both \
-                                 at testnet or both at mainnet. Boot aborted."
-                            );
-                            join_reverse(handles);
-                            return ExitCode::from(1);
                         }
-                        // The tightest floor across the live HL slots:
-                        // the budget is a property of the ADDRESS.
-                        let floor = eb
-                            .slots
-                            .iter()
-                            .filter(|s| s.is_live() && s.request_budget_floor > 0)
-                            .map(|s| s.request_budget_floor)
-                            .min()
-                            .and_then(|f| u64::try_from(f).ok())
-                            .unwrap_or(0);
-                        let budget_path = eb
-                            .path
-                            .parent()
-                            .map(std::path::Path::to_path_buf)
-                            .unwrap_or_default()
-                            .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH);
+                    } else {
+                        None
+                    };
+                    // **E7 — the operator's Hyperliquid arm**, for every
+                    // live slot on Hyperliquid other than slot 0, fed by
+                    // fill lane 3's producer and configured from the
+                    // `HYPERLIQUID_*` variables the wrapper sourced.
+                    let hl_arm = if eb.hl_arm_needed() {
                         let Some(f3p) = hl_fill_prod.take() else {
                             error!("exec: fill lane 3 producer already taken — boot aborted");
                             join_reverse(handles);
                             return ExitCode::from(1);
                         };
-                        let mut arm = match exec_hyperliquid::HlExchange::new(
-                            &hl_cfg,
-                            TlsTransport::default_client_config(),
-                            f3p,
-                            budget_path.clone(),
-                            floor,
-                        ) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                error!(error = %e, "exec: hyperliquid arm refused — boot aborted");
+                        match boot_operator_hl_arm(&eb, &cfg.hyperliquid_ws_host, f3p) {
+                            Ok(a) => Some(a),
+                            Err(reason) => {
+                                error!(reason, "exec: hyperliquid arm refused — boot aborted");
                                 join_reverse(handles);
                                 return ExitCode::from(1);
                             }
-                        };
-                        // E7-F1: the address budget is the venue's
-                        // number, read once here; the cold assumption
-                        // halted the first mainnet boot before its
-                        // first order (2026-09-19).
-                        arm.seed_budget_from_venue();
-                        info!(
-                            host = %hl_cfg.host,
-                            network = if ex_testnet { "testnet" } else { "MAINNET" },
-                            agent = %exec_hyperliquid::config::hex20(&hl_cfg.agent_addr),
-                            master = %exec_hyperliquid::config::hex20(&hl_cfg.master_addr),
-                            budget_floor = floor,
-                            budget_source = ?arm.budget_source(),
-                            budget_remaining = arm.budget_remaining(),
-                            budget_state = %budget_path.display(),
-                            // E7 session bound: 0 = not anchored yet —
-                            // the first FLAT reconciliation sets it and
-                            // writes the file; a restart restores it.
-                            pnl_anchor_usd_1e6 = arm.pnl_anchor_usd_1e6(),
-                            pnl_anchor_state = %arm.pnl_state_path().display(),
-                            "exec: hyperliquid arm ARMED"
-                        );
-                        let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
-                            eb.route,
-                            clob_dispatcher::PaperDispatcher::new(),
-                            arm,
-                            core_time::WallAnchor::now(),
-                        );
-                        wire_exec_halts(&mut exec_dispatcher, &eb, halt_mask);
-                        info!(
-                            live = %cli::exec_boot::render_slot_mask(eb.live_mask),
-                            network = if ex_testnet { "testnet" } else { "MAINNET" },
-                            "running strategy-set with LIVE slots — real orders will be submitted"
-                        );
-                        engine_loop_set_full(
-                            cons,
-                            exec_dispatcher,
-                            obs,
-                            requested,
-                            vrp_boot.as_ref(),
-                            xsd_boot.as_ref(),
-                            bin15_boot.as_ref(),
-                            icdp_params.as_ref(),
-                            regime_boot.as_ref(),
-                            hyparb_boot.as_ref(),
-                        )
+                        }
                     } else {
-                        // Nothing armed: the refusing stub, so a live
-                        // slot on a venue with no arm cannot exist here
-                        // (already refused by `exec_boot::resolve`).
-                        let mut exec_dispatcher = exec_router::RoutedDispatcher::new(
-                            eb.route,
-                            clob_dispatcher::PaperDispatcher::new(),
-                            exec_router::NullLiveDispatcher::new(),
-                            core_time::WallAnchor::now(),
-                        );
-                        wire_exec_halts(&mut exec_dispatcher, &eb, halt_mask);
-                        info!(
-                            "running strategy-set PAPER (exec artifact present, nothing armed) \
-                             — no orders will be submitted"
-                        );
-                        // E6: `WallAnchor::now()` above is the anchor
-                        // the venue-fill ledger's 00:00Z day epoch
-                        // needs. Taken HERE, at boot, because an
-                        // `Order`'s `ts_ns` is `CLOCK_MONOTONIC_RAW` and
-                        // the day cap is a wall-clock fact;
-                        // `strategy_bin15` anchors its own day cap the
-                        // same way.
-                        //
-                        // The ledger is deliberately left UNSEEDED: it
-                        // has not been reconciled against the venue, so
-                        // every live PLACE is refused until the arm's
-                        // reconciler reports success, which E6 commit 3
-                        // reads from `halt_signal().reconciled` on the
-                        // idle path. An `--exec` boot with a live slot
-                        // therefore trades nothing until it has seen
-                        // the venue, rather than clamping against a
-                        // position it has never seen. (Both arms.)
-                        engine_loop_set_full(
-                            cons,
-                            exec_dispatcher,
-                            obs,
-                            requested,
-                            vrp_boot.as_ref(),
-                            xsd_boot.as_ref(),
-                            bin15_boot.as_ref(),
-                            icdp_params.as_ref(),
-                            regime_boot.as_ref(),
-                            hyparb_boot.as_ref(),
-                        )
+                        None
+                    };
+                    // The dispatcher types cannot share one binding (the
+                    // loop is monomorphised over `D`), so each shape enters
+                    // the loop from its own arm; the halt wiring is one
+                    // generic helper. Nothing armed keeps the refusing
+                    // stub, so LAW E-1 stays true by construction.
+                    let anchor = core_time::WallAnchor::now();
+                    let paper = clob_dispatcher::PaperDispatcher::new();
+                    let live_line = cli::exec_boot::render_slot_mask(eb.live_mask);
+                    match (hl_arm, hyparb_live) {
+                        (Some(arm), None) => {
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            info!(
+                                live = %live_line,
+                                "running strategy-set with LIVE slots — real orders will be \
+                                 submitted"
+                            );
+                            engine_loop_set_full(
+                                cons,
+                                d,
+                                obs,
+                                requested,
+                                vrp_boot.as_ref(),
+                                xsd_boot.as_ref(),
+                                bin15_boot.as_ref(),
+                                icdp_params.as_ref(),
+                                regime_boot.as_ref(),
+                                hyparb_boot.as_ref(),
+                            )
+                        }
+                        (Some(arm), Some(live)) => {
+                            let split =
+                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            info!(
+                                live = %live_line,
+                                "running strategy-set with LIVE slots on TWO arms (slot 0 on its \
+                                 own wallet) — real orders will be submitted"
+                            );
+                            engine_loop_set_full(
+                                cons,
+                                d,
+                                obs,
+                                requested,
+                                vrp_boot.as_ref(),
+                                xsd_boot.as_ref(),
+                                bin15_boot.as_ref(),
+                                icdp_params.as_ref(),
+                                regime_boot.as_ref(),
+                                hyparb_boot.as_ref(),
+                            )
+                        }
+                        (None, Some(live)) => {
+                            let split = exec_router::SlotSplit::new(
+                                cli::hyparb_live::SLOT,
+                                exec_router::NullLiveDispatcher::new(),
+                                live,
+                            );
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            info!(
+                                live = %live_line,
+                                "running strategy-set with slot 0 LIVE on its own wallet — real \
+                                 orders will be submitted"
+                            );
+                            engine_loop_set_full(
+                                cons,
+                                d,
+                                obs,
+                                requested,
+                                vrp_boot.as_ref(),
+                                xsd_boot.as_ref(),
+                                bin15_boot.as_ref(),
+                                icdp_params.as_ref(),
+                                regime_boot.as_ref(),
+                                hyparb_boot.as_ref(),
+                            )
+                        }
+                        (None, None) => {
+                            // Nothing armed: the refusing stub, so a live
+                            // slot on a venue with no arm cannot exist here
+                            // (already refused by `exec_boot::resolve`).
+                            //
+                            // E6: `WallAnchor::now()` above is the anchor
+                            // the venue-fill ledger's 00:00Z day epoch
+                            // needs — an `Order`'s `ts_ns` is monotonic and
+                            // the day cap is a wall-clock fact. The ledger
+                            // is left UNSEEDED: every live PLACE is refused
+                            // until the arm's reconciler reports success.
+                            let mut d = exec_router::RoutedDispatcher::new(
+                                eb.route,
+                                paper,
+                                exec_router::NullLiveDispatcher::new(),
+                                anchor,
+                            );
+                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            info!(
+                                "running strategy-set PAPER (exec artifact present, nothing \
+                                 armed) — no orders will be submitted"
+                            );
+                            engine_loop_set_full(
+                                cons,
+                                d,
+                                obs,
+                                requested,
+                                vrp_boot.as_ref(),
+                                xsd_boot.as_ref(),
+                                bin15_boot.as_ref(),
+                                icdp_params.as_ref(),
+                                regime_boot.as_ref(),
+                                hyparb_boot.as_ref(),
+                            )
+                        }
                     }
                 }
             }

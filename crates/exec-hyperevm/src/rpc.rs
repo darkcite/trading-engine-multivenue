@@ -615,6 +615,201 @@ pub fn scan_receipt(buf: &[u8], id: u64, rc: &mut Receipt) -> Result<bool, ScanE
     Ok(true)
 }
 
+/// `keccak256("Transfer(address,address,uint256)")` — ERC-20's transfer
+/// event, `topics[0]` of every token movement.
+pub const TRANSFER_TOPIC: [u8; 32] = [
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
+];
+
+/// One ERC-20 transfer between the two parties a scan names.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenMove {
+    /// Raw token units.
+    pub amount: u128,
+    /// The token contract (the log's `address`).
+    pub token: [u8; 20],
+    /// `true`: from `a` to `b`; `false`: from `b` to `a`.
+    pub a_to_b: bool,
+}
+
+/// HYPARB L3 — the receipt IS the fill (the E-5 analogue): the
+/// receipt's ERC-20 `Transfer` logs between `a` and `b`, in log order,
+/// into `out`. Returns how many.
+///
+/// Family-agnostic by construction: a V3, Algebra or Slipstream pool
+/// each emits its own `Swap` event, but every token that moves emits
+/// the same `Transfer`. Logs of any other shape, and transfers between
+/// other parties, are skipped. A malformed log, a `Transfer` whose
+/// indexed addresses are not address-shaped or whose value does not
+/// fit 128 bits, more matches than `out` holds, or a pending receipt
+/// (`null`) refuses. Zero-alloc; `out` past the count is untouched.
+pub fn scan_transfers(
+    buf: &[u8],
+    id: u64,
+    a: &[u8; 20],
+    b: &[u8; 20],
+    out: &mut [TokenMove],
+) -> Result<usize, ScanErr> {
+    let r = result_of(buf, id)?;
+    if is_null(buf, r) {
+        return Err(ScanErr::Malformed);
+    }
+    let mut o = Obj::open(buf, r.0).ok_or(ScanErr::Malformed)?;
+    let mut logs: Option<(Pos, Pos)> = None;
+    loop {
+        match o.next() {
+            Ok(Some(m)) => {
+                if key_is(buf, &m, b"logs") {
+                    if logs.is_some() {
+                        return Err(ScanErr::Malformed);
+                    }
+                    logs = Some(m.v);
+                }
+            }
+            Ok(None) => break,
+            Err(()) => return Err(ScanErr::Malformed),
+        }
+    }
+    let logs = logs.ok_or(ScanErr::Malformed)?;
+    let mut arr = Arr::open(buf, logs.0).ok_or(ScanErr::Malformed)?;
+    let mut n = 0usize;
+    loop {
+        let e = match arr.next() {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(n),
+            Err(()) => return Err(ScanErr::Malformed),
+        };
+        let Some(t) = transfer_of(buf, e)? else {
+            continue;
+        };
+        let a_to_b = if t.from == *a && t.to == *b {
+            true
+        } else if t.from == *b && t.to == *a {
+            false
+        } else {
+            continue;
+        };
+        if n >= out.len() {
+            return Err(ScanErr::Malformed);
+        }
+        out[n] = TokenMove {
+            amount: t.amount,
+            token: t.token,
+            a_to_b,
+        };
+        n += 1;
+    }
+}
+
+/// A `Transfer` log's parties and value.
+struct Transfer {
+    amount: u128,
+    token: [u8; 20],
+    from: [u8; 20],
+    to: [u8; 20],
+}
+
+/// The address in the low 20 bytes of an ABI word whose high 12 are
+/// zero.
+#[inline]
+fn word_address(w: &[u8; 32]) -> Option<[u8; 20]> {
+    let mut i = 0usize;
+    while i < 12 {
+        if w[i] != 0 {
+            return None;
+        }
+        i += 1;
+    }
+    let mut a = [0u8; 20];
+    i = 0;
+    while i < 20 {
+        a[i] = w[12 + i];
+        i += 1;
+    }
+    Some(a)
+}
+
+/// One log object: `Ok(Some)` for an ERC-20 `Transfer`, `Ok(None)` for
+/// any other event, `Err` for a malformed log.
+fn transfer_of(buf: &[u8], e: (Pos, Pos)) -> Result<Option<Transfer>, ScanErr> {
+    let mut o = Obj::open(buf, e.0).ok_or(ScanErr::Malformed)?;
+    let mut token: Option<[u8; 20]> = None;
+    let mut topics: Option<(Pos, Pos)> = None;
+    let mut data: Option<(Pos, Pos)> = None;
+    loop {
+        let m = match o.next() {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(()) => return Err(ScanErr::Malformed),
+        };
+        let slot = if key_is(buf, &m, b"address") {
+            if token.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            token = Some(fixed::<20>(buf, m.v).ok_or(ScanErr::Malformed)?);
+            continue;
+        } else if key_is(buf, &m, b"topics") {
+            &mut topics
+        } else if key_is(buf, &m, b"data") {
+            &mut data
+        } else {
+            continue;
+        };
+        if slot.is_some() {
+            return Err(ScanErr::Malformed);
+        }
+        *slot = Some(m.v);
+    }
+    let (token, topics, data) = match (token, topics, data) {
+        (Some(t), Some(p), Some(d)) => (t, p, d),
+        _ => return Err(ScanErr::Malformed),
+    };
+    // topics: exactly [TRANSFER_TOPIC, from, to] for an ERC-20 transfer
+    // (an ERC-721 transfer carries a fourth, indexed id — not ours).
+    let mut words = [[0u8; 32]; 3];
+    let mut count = 0usize;
+    let mut arr = Arr::open(buf, topics.0).ok_or(ScanErr::Malformed)?;
+    loop {
+        match arr.next() {
+            Ok(Some(t)) => {
+                let w = fixed::<32>(buf, t).ok_or(ScanErr::Malformed)?;
+                if count < 3 {
+                    words[count] = w;
+                }
+                count += 1;
+            }
+            Ok(None) => break,
+            Err(()) => return Err(ScanErr::Malformed),
+        }
+    }
+    if count != 3 || words[0] != TRANSFER_TOPIC {
+        return Ok(None);
+    }
+    let from = word_address(&words[1]).ok_or(ScanErr::Malformed)?;
+    let to = word_address(&words[2]).ok_or(ScanErr::Malformed)?;
+    let v = fixed::<32>(buf, data).ok_or(ScanErr::Malformed)?;
+    let mut i = 0usize;
+    while i < 16 {
+        if v[i] != 0 {
+            return Err(ScanErr::Malformed);
+        }
+        i += 1;
+    }
+    let mut amount = 0u128;
+    while i < 32 {
+        amount = (amount << 8) | v[i] as u128;
+        i += 1;
+    }
+    Ok(Some(Transfer {
+        amount,
+        token,
+        from,
+        to,
+    }))
+}
+
 // ---------------------------------------------------------------
 // Send refusals
 // ---------------------------------------------------------------
@@ -730,6 +925,74 @@ mod tests {
         assert_eq!(
             write_receipt(&mut b[..40], 5, &[0; 32]),
             Err(RpcWriteErr::BufferTooSmall)
+        );
+    }
+
+    /// A real HyperEVM testnet swap by the H9d executor (the L1 dry run,
+    /// 2026-09-24, tx 0x6b29…c4c4): two `Transfer`s between the pool and
+    /// the executor, and the pool's own `Swap` event, which is skipped.
+    const SWAP_RECEIPT: &[u8] = include_bytes!("../tests/data/swap-receipt-998.json");
+
+    fn addr(s: &str) -> [u8; 20] {
+        let mut a = [0u8; 20];
+        let mut i = 0usize;
+        while i < 20 {
+            a[i] = u8::from_str_radix(&s[2 + 2 * i..4 + 2 * i], 16).unwrap();
+            i += 1;
+        }
+        a
+    }
+
+    #[test]
+    fn a_swap_receipts_transfers_are_the_fill() {
+        let pool = addr("0x7d03bc2f8b30b9ebe5ac3d473768af502ec43d29");
+        let exec = addr("0x6c164de64e91bbdae20e9b3d2a672675c0e89cc5");
+        let mut out = [TokenMove::default(); 4];
+        let n = scan_transfers(SWAP_RECEIPT, 7, &pool, &exec, &mut out).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            out[0],
+            TokenMove {
+                amount: 25_108_724,
+                token: addr("0x62403e98e26e000ba7cbf102cde2eea7f96a76e2"),
+                a_to_b: true,
+            },
+            "token0 out of the pool into the executor"
+        );
+        assert_eq!(
+            out[1],
+            TokenMove {
+                amount: 100_000_000_000,
+                token: addr("0x87d7e58c6ebc80a2b61d3336972f5c909aff6851"),
+                a_to_b: false,
+            },
+            "token1 from the executor into the pool"
+        );
+        // Other parties: nothing. Too small an `out`: refused.
+        assert_eq!(scan_transfers(SWAP_RECEIPT, 7, &[9; 20], &exec, &mut out), Ok(0));
+        let mut one = [TokenMove::default(); 1];
+        assert_eq!(
+            scan_transfers(SWAP_RECEIPT, 7, &pool, &exec, &mut one),
+            Err(ScanErr::Malformed)
+        );
+        assert_eq!(
+            scan_transfers(SWAP_RECEIPT, 8, &pool, &exec, &mut out),
+            Err(ScanErr::IdMismatch { got: 7 })
+        );
+        let pending = br#"{"jsonrpc":"2.0","id":7,"result":null}"#;
+        assert_eq!(
+            scan_transfers(pending, 7, &pool, &exec, &mut out),
+            Err(ScanErr::Malformed)
+        );
+        // A value past 128 bits is refused, not truncated.
+        let big = core::str::from_utf8(SWAP_RECEIPT).unwrap().replacen(
+            "0x00000000000000000000000000000000000000000000000000000000017f20f4",
+            "0x00000000000000000000000000000001000000000000000000000000017f20f4",
+            1,
+        );
+        assert_eq!(
+            scan_transfers(big.as_bytes(), 7, &pool, &exec, &mut out),
+            Err(ScanErr::Malformed)
         );
     }
 
@@ -1023,6 +1286,8 @@ mod tests {
             let _ = scan_next_base_fee(&bytes, 1);
             let mut out = [0u8; 64];
             let _ = scan_data(&bytes, 1, &mut out);
+            let mut moves = [TokenMove::default(); 4];
+            let _ = scan_transfers(&bytes, 1, &[1; 20], &[2; 20], &mut moves);
             let _ = classify_send_refusal(&bytes);
         }
 

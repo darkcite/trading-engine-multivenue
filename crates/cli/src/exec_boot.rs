@@ -88,7 +88,20 @@ use tracing::info;
 /// `HYPERLIQUID_EXCHANGE_HOST` on the same network, or no boot), and
 /// the `.env` itself: a boot with no `HYPERLIQUID_*` variables refuses
 /// before any socket opens.
-pub const LIVE_ARM_VENUES: &[u8] = &[core_types::VenueId::Hyperliquid as u8];
+///
+/// **HYPARB L5 (2026-09-24, ruling O-HL1): `VenueId::HyperEvm`**, for
+/// slot 0 only ([`HYPEREVM_SLOT`]) and only together with Hyperliquid:
+/// its live arm (`cli::hyparb_live`) swaps on HyperEVM mainnet and
+/// hedges on Hyperliquid from the slot's own wallet.
+pub const LIVE_ARM_VENUES: &[u8] = &[
+    core_types::VenueId::Hyperliquid as u8,
+    core_types::VenueId::HyperEvm as u8,
+];
+
+/// The one slot with a live HyperEVM arm: `hyparb`. It is live on BOTH
+/// of its venues or not at all — an AMM leg without its hedge, or a
+/// hedge without its AMM leg, is a one-legged arb.
+pub const HYPEREVM_SLOT: usize = 0;
 
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
@@ -97,14 +110,6 @@ pub const LIVE_ARM_VENUES: &[u8] = &[core_types::VenueId::Hyperliquid as u8];
 /// `ExecFile::live_mask`'s shift set the wrong bit.
 const _: () = assert!(core_config::exec::EXEC_SLOTS == EXEC_SLOTS);
 const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
-
-/// Slots that may NEVER be armed live by this binary, whatever the two
-/// switches say (HYPARB H9). Slot 0 is `hyparb`: its AMM leg has no
-/// live arm (the only EVM write path is the TESTNET shadow, O-H5) while
-/// its hedge legs name Hyperliquid, which DOES — arming it would send
-/// real hedges against paper swaps: a one-legged arb that builds real
-/// inventory. The lane is paper-first (O-H8).
-pub const NEVER_LIVE_SLOTS: u8 = 1 << 0;
 
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
@@ -143,6 +148,32 @@ impl ExecBoot {
     #[must_use]
     pub fn any_live(&self) -> bool {
         self.live_mask != 0
+    }
+
+    /// HYPARB L5: is slot 0 (its own live arm) armed?
+    #[must_use]
+    pub fn hyparb_live(&self) -> bool {
+        self.live_mask & (1 << HYPEREVM_SLOT) != 0
+    }
+
+    /// Does a live slot OTHER than slot 0 trade Hyperliquid — i.e. is
+    /// the operator's Hyperliquid arm (`HlExchange` on the
+    /// `HYPERLIQUID_*` account) needed? Slot 0 hedges from its own
+    /// account and never counts here.
+    #[must_use]
+    pub fn hl_arm_needed(&self) -> bool {
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let mut slot = 0usize;
+        while slot < EXEC_SLOTS {
+            if slot != HYPEREVM_SLOT
+                && self.live_mask & (1u8 << slot) != 0
+                && self.route.venue_allowed(slot as u8, hl)
+            {
+                return true;
+            }
+            slot += 1;
+        }
+        false
     }
 }
 
@@ -313,14 +344,25 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             ));
         }
 
-        if mode == ExecMode::Live && NEVER_LIVE_SLOTS & (1u8 << slot) != 0 {
-            return Err(format!(
-                "exec: slot {slot} ({slot_name}) is marked live, and this binary never arms it: \
-                 its AMM leg has no live arm (HyperEVM writes are TESTNET-only, O-H5) while its \
-                 hedges would go to Hyperliquid for real — a one-legged arb. HYPARB is \
-                 paper-first (O-H8); its write path is `--evm-testnet`. Mark slot {slot} \
-                 \"paper\" or \"off\"."
-            ));
+        // HYPARB L5: HyperEVM is slot 0's alone, and slot 0 is live on
+        // both of its venues or not at all.
+        if mode == ExecMode::Live {
+            let evm = s.venues.contains(&(core_types::VenueId::HyperEvm as u8));
+            let hl = s.venues.contains(&(core_types::VenueId::Hyperliquid as u8));
+            if slot == HYPEREVM_SLOT && !(evm && hl && s.venues.len() == 2) {
+                return Err(format!(
+                    "exec: slot {slot} ({slot_name}) is marked live with venues {:?}; it is live \
+                     on exactly [\"hyperliquid\", \"hyperevm\"] or not at all — an AMM leg \
+                     without its hedge (or the reverse) is a one-legged arb",
+                    s.venues
+                ));
+            }
+            if slot != HYPEREVM_SLOT && evm {
+                return Err(format!(
+                    "exec: slot {slot} ({slot_name}) is marked live for `hyperevm`, whose only \
+                     live arm is slot 0's (hyparb) — refusing"
+                ));
+            }
         }
 
         // A live slot needs a compiled arm for EVERY venue it names.
@@ -332,10 +374,10 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                     let vname = core_config::exec::venue_name_from_id(*v).unwrap_or("?");
                     return Err(format!(
                         "exec: slot {slot} ({slot_name}) is marked live for venue `{vname}`, \
-                         but this binary has NO live execution arm for it (the only arm \
-                         compiled in is hyperliquid). Slot {slot} can only be \"paper\" or \
-                         \"off\" on that venue. Refusing the boot rather than trading it on \
-                         paper under a live label."
+                         but this binary has NO live execution arm for it (the arms compiled \
+                         in are hyperliquid, and hyperevm for slot 0). Slot {slot} can only be \
+                         \"paper\" or \"off\" on that venue. Refusing the boot rather than \
+                         trading it on paper under a live label."
                     ));
                 }
             }
@@ -670,7 +712,14 @@ mod tests {
         assert!(b.any_live());
         assert!(b.route.venue_live(core_types::VenueId::Hyperliquid as u8));
         assert!(!b.route.venue_live(core_types::VenueId::Okx as u8));
-        assert_eq!(LIVE_ARM_VENUES, &[core_types::VenueId::Hyperliquid as u8]);
+        assert_eq!(
+            LIVE_ARM_VENUES,
+            &[
+                core_types::VenueId::Hyperliquid as u8,
+                core_types::VenueId::HyperEvm as u8
+            ]
+        );
+        assert!(b.hl_arm_needed() && !b.hyparb_live());
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -776,25 +825,54 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
-    /// HYPARB H9: slot 0 is never armed live, even with both switches
-    /// agreeing and a venue that has an arm.
+    /// HYPARB L5 (O-HL1): slot 0 arms on exactly its two venues —
+    /// never one of them — and HyperEVM on no other slot.
     #[test]
-    fn slot_0_hyparb_is_never_armed_live() {
+    fn slot_0_is_live_on_both_of_its_venues_or_not_at_all() {
         let d = tmp();
         let hyparb = MINIMAL_LIVE
             .replace("[exec.slot.3]", "[exec.slot.0]")
             .replace("name = \"bin15\"", "name = \"hyparb\"");
+        // Hyperliquid alone: the hedge without the AMM leg.
         let p = write(&d, "exec.toml", &hyparb);
         let e = resolve(Some(&p), Some("0")).unwrap_err();
-        assert!(
-            e.contains("slot 0 (hyparb)") && e.contains("never arms it"),
-            "{e}"
-        );
-        assert!(e.contains("one-legged"), "{e}");
+        assert!(e.contains("slot 0 (hyparb)") && e.contains("one-legged"), "{e}");
+        // HyperEVM alone: the AMM leg without the hedge.
+        let evm_only = hyparb.replace("[\"hyperliquid\"]", "[\"hyperevm\"]");
+        let p = write(&d, "exec-evm.toml", &evm_only);
+        assert!(resolve(Some(&p), Some("0")).unwrap_err().contains("one-legged"));
+        // Both: armed, and it needs no operator HL arm of its own.
+        let both = hyparb.replace("[\"hyperliquid\"]", "[\"hyperliquid\", \"hyperevm\"]");
+        let p = write(&d, "exec-both.toml", &both);
+        let b = resolve(Some(&p), Some("0")).unwrap().unwrap();
+        assert!(b.hyparb_live() && !b.hl_arm_needed());
+        assert!(b.route.venue_allowed(0, core_types::VenueId::HyperEvm as u8));
+        // With slot 3 live too: both arms.
+        let two = format!("{both}{}", MINIMAL_LIVE.replace("[exec]\n", ""));
+        let p = write(&d, "exec-two.toml", &two);
+        let b = resolve(Some(&p), Some("0,3")).unwrap().unwrap();
+        assert!(b.hyparb_live() && b.hl_arm_needed());
+        // HyperEVM on any other slot is refused.
+        let bin15_evm = MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"hyperliquid\", \"hyperevm\"]");
+        let p = write(&d, "exec-3evm.toml", &bin15_evm);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("only") && e.contains("slot 0"), "{e}");
         // Paper is fine.
         let paper = hyparb.replace("mode = \"live\"", "mode = \"paper\"");
         let p = write(&d, "exec-paper.toml", &paper);
         assert!(!resolve(Some(&p), None).unwrap().unwrap().any_live());
+        // `hyparb-flip.sh paper` leaves slot 0's whole live section with
+        // `mode = "paper"` beside a live slot 3: that boots with slot 3
+        // armed alone, and `live` is the one word back.
+        let flipped = format!(
+            "{}{}",
+            both.replace("mode = \"live\"", "mode = \"paper\""),
+            MINIMAL_LIVE.replace("[exec]\n", "")
+        );
+        let p = write(&d, "exec-flipped.toml", &flipped);
+        let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+        assert!(!b.hyparb_live() && b.hl_arm_needed());
+        assert!(resolve(Some(&p), Some("0,3")).is_err(), "--arm-live 0 on a paper slot 0");
         std::fs::remove_dir_all(&d).ok();
     }
 

@@ -289,3 +289,44 @@ halt_on_recon_stale_ms = 300000
 # a reader of this file knows the slot was considered, not forgotten.
 [exec.slot.1]
 mode = "paper"
+
+
+# Slot 0 — hyparb (HyperEVM AMM <-> Hyperliquid perp hedge, HYPARB §17).
+#
+# SHIPPED AS PAPER. Paper = the testnet shadow (hyparb.toml
+# `mode = "testnet"`); live = HyperEVM MAINNET swaps through the H9d
+# executor plus real HL perp hedges, BOTH from slot 0's OWN wallet X
+# (`HYPEREVM_MAINNET_KEY`), never the bin15 account.
+#
+# The flip is THREE switches that must agree, or the boot refuses:
+#   1. hyparb.toml   mode = "live"  (+ its [mainnet] executor)
+#   2. this section  mode = "live", venues EXACTLY both below
+#   3. --arm-live    names 0        (strategy.conf ARM_LIVE=0,3 + HYPARB_LIVE=1)
+#
+# Slot 0's state (X's HL budget, the HL anchor, the equity anchor
+# `hyparb-equity-anchor.state`) lives in `hyparb/` beside this file —
+# never slot 3's files. Delete the equity anchor to start a new session.
+#
+# The P&L bound is LIVE-ONLY and is COMBINED EQUITY: X's HL perp account
+# value + HL spot USDC + the executor's tokens at mids + X's HYPE gas,
+# judged only while flat (no swap in flight, 2 s quiet). Paper has none.
+#
+# Caps are USD x1e6 (every traded pool is USD-quoted — hyparb.toml's
+# live check refuses any other). Sized for the ~$115 wallet:
+[exec.slot.0]
+mode = "paper"
+# mode = "live"
+# name = "hyparb"
+# venues = ["hyperliquid", "hyperevm"]
+# max_order_usd_1e6 = 25000000
+# max_open_orders = 8
+# cap_day_usd_1e6 = 2000000000
+# cap_instance_usd_1e6 = 60000000
+# request_budget_floor = 2000
+# halt_on_reject_streak = 5
+# halt_on_recon_drift_usd_1e6 = 5000000
+# halt_on_ws_gap_ms = 30000
+# halt_on_asset_refusal_streak = 3
+# halt_on_recon_stale_ms = 120000
+# halt_on_gain_usd_1e6 = 50000000
+# halt_on_loss_usd_1e6 = 20000000

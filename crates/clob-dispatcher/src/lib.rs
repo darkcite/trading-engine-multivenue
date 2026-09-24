@@ -462,6 +462,18 @@ pub trait OrderDispatch {
     /// Pop the next fill, if any.
     fn try_next_fill(&mut self) -> Option<Fill>;
 
+    /// **HYPARB L5 — an accepted order that ended without a (further)
+    /// fill**, as `(client_oid, slot)`: a swap that reverted or was
+    /// never mined, the unfilled remainder of an IoC. The router
+    /// retires its resting row, or `max_open_orders` would count
+    /// orders that no longer exist and stall the slot. Defaulted to
+    /// none: an arm whose orders end only by fill or by the member's
+    /// own cancel has nothing to say here.
+    #[inline]
+    fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+        None
+    }
+
     /// Snapshot of dispatch counters.
     fn stats(&self) -> DispatchStats;
 
@@ -619,6 +631,20 @@ pub trait OrderDispatch {
     #[inline]
     fn halt_signal(&self) -> HaltSignal {
         HaltSignal::default()
+    }
+
+    /// **HYPARB L4 — the signal for ONE live slot.**
+    ///
+    /// The router polls this once per live slot and judges each slot
+    /// only against the arm that trades it: with two live arms behind
+    /// one router (`exec_router::SlotSplit`), slot 0's reconciler, its
+    /// stream and its P&L bound must never halt slot 3, nor the
+    /// reverse. An arm that serves every slot from one venue
+    /// relationship answers its one signal for all of them — the
+    /// default, and exactly the behaviour before L4.
+    #[inline]
+    fn halt_signal_for(&self, _slot: u8) -> HaltSignal {
+        self.halt_signal()
     }
 
     /// **E6 commit 3 — REQUEST that every order come off the venue.**

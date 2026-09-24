@@ -26,6 +26,8 @@
 //!   paper arm and a live arm, enforcing LAW E-1 and LAW E-2.
 //! * [`NullLiveDispatcher`] — the refusing live arm E1 ships with,
 //!   replaced by the Hyperliquid exchange arm in E2/E3.
+//! * [`SlotSplit`] — HYPARB L4: two live arms as one, split by slot
+//!   (slot 0 on its own wallet, every other slot on the other arm).
 //! * [`RouteCounters`] — what the router did, for `/metrics` and
 //!   `/state`.
 //!
@@ -65,6 +67,7 @@ pub mod mode;
 pub mod null;
 pub mod route;
 pub mod routed;
+pub mod split;
 
 pub use counters::{RiskRefusal, RouteCounters};
 pub use halt::{HaltReason, HaltState};
@@ -73,3 +76,4 @@ pub use mode::ExecMode;
 pub use null::NullLiveDispatcher;
 pub use route::{ExecRoute, ExecRouteErr, HaltLimits, SlotCaps, EXEC_SLOTS, EXEC_VENUES};
 pub use routed::RoutedDispatcher;
+pub use split::SlotSplit;

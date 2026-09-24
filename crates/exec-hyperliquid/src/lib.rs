@@ -133,7 +133,10 @@ pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::Nonce;
 pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
-pub use recon::{drift, net_exposure_1e8, scan_spot_state, SpotBalance, MAX_SPOT_BALANCES};
+pub use recon::{
+    drift, net_exposure_1e8, perp_state_request, scan_perp_state, scan_spot_state, spot_state_request,
+    PerpPosition, SpotBalance, MAX_SPOT_BALANCES, MAX_STATE_REQ,
+};
 pub use response::{scan, HlOk, HlResponse, ScanErr, Span};
 pub use selftest::{SelfTestErr, SelfTestReport};
 pub use sign::{connection_id, sign_action, Network, Vault};

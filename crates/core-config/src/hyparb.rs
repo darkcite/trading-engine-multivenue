@@ -142,6 +142,11 @@ pub enum HyparbMode {
     Paper,
     /// The EVM write path on chain 998 (O-H5). Requires `--evm-testnet`.
     Testnet,
+    /// HYPARB L5 (O-HL1): REAL MONEY — swaps on HyperEVM mainnet and
+    /// hedges on Hyperliquid mainnet, from the slot's own wallet. Needs
+    /// `[mainnet]` with the executor, and the exec interlock's other two
+    /// switches (`exec.toml [exec.slot.0] mode = "live"`, `--arm-live 0`).
+    Live,
 }
 
 /// Which hedge venue the selector may use.
@@ -427,10 +432,10 @@ fn finish_hyparb(kv: &Kv) -> Result<HyparbFile, HyparbError> {
     let mode = match string(kv, "mode", B)?.as_str() {
         "paper" => HyparbMode::Paper,
         "testnet" => HyparbMode::Testnet,
+        "live" => HyparbMode::Live,
         m => {
             return Err(err(format!(
-                "`mode` must be \"paper\" or \"testnet\" (got \"{m}\") — there is no \
-                 mainnet mode (O-H5)"
+                "`mode` must be \"paper\", \"testnet\" or \"live\" (got \"{m}\")"
             )))
         }
     };
@@ -595,6 +600,56 @@ fn finish_testnet(kv: &Kv) -> Result<HyparbTestnet, HyparbError> {
     })
 }
 
+/// HYPARB L5: what `mode = "live"` requires beyond the grammar.
+///
+/// * `[mainnet]` with the executor deployed (`evm-live deploy`).
+/// * Hedges on PERPS only: the live arm binds Hyperliquid perps (O-HL3's
+///   account), so a `spot` book is refused rather than silently unused.
+/// * Every traded pool quoted in USD (`coin1 = "USD"`): the router's
+///   caps are USD notional, and a pool quoted in another coin would
+///   read its orders' notional in that coin.
+fn live_checks(
+    file: &HyparbFile,
+    coins: &[HyparbCoin],
+    pools: &[HyparbPool],
+) -> Result<(), HyparbError> {
+    if file.mainnet.as_ref().and_then(|m| m.executor.as_ref()).is_none() {
+        return Err(err(
+            "`mode = \"live\"` requires a `[mainnet]` block with `executor` set (deploy it \
+             with `scripts/evm-live.sh deploy --confirm`)",
+        ));
+    }
+    let mut i = 0usize;
+    while i < coins.len() {
+        if coins[i].perp.is_none() {
+            return Err(err(format!(
+                "`mode = \"live\"` hedges on perps — coin `{}` names no `perp` book",
+                coins[i].name
+            )));
+        }
+        if coins[i].spot.is_some() {
+            return Err(err(format!(
+                "`mode = \"live\"` hedges on perps only — coin `{}` names a `spot` book",
+                coins[i].name
+            )));
+        }
+        i += 1;
+    }
+    i = 0;
+    while i < pools.len() {
+        let p = &pools[i];
+        if p.trade && p.coin1 != COIN_USD_NAME {
+            return Err(err(format!(
+                "`mode = \"live\"` trades USD-quoted pools only (coin1 = \"USD\") — pool {} \
+                 is quoted in `{}`; set `trade = 0` to keep observing it",
+                p.address, p.coin1
+            )));
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Parse the artifact text.
 pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
     #[derive(Copy, Clone, PartialEq, Eq)]
@@ -736,6 +791,9 @@ pub fn parse(src: &str) -> Result<HyparbFile, HyparbError> {
                  evm-testnet deploy`)",
             ));
         }
+    }
+    if file.mode == HyparbMode::Live {
+        live_checks(&file, &coins, &pools)?;
     }
     if coins.is_empty() {
         return Err(err("at least one `[[coin]]` is required"));
@@ -928,6 +986,37 @@ mod tests {
         let e = refused(&(good() + MAINNET + "[mainnet]\n"));
         assert!(e.contains("duplicate `[mainnet]`"), "{e}");
         assert!(refused(&(good() + "\n[mainnet]\n")).contains("endpoint"));
+    }
+
+    /// HYPARB L5: `mode = "live"` needs the deployed executor, perps
+    /// only, and USD-quoted traded pools.
+    #[test]
+    fn live_mode_needs_the_executor_perps_only_and_usd_pools() {
+        let live = good()
+            .replace("mode = \"paper\"", "mode = \"live\"")
+            .replace("spot = \"hyperliquid:@107\"  # optional\n", "");
+        assert!(refused(&live).contains("requires a `[mainnet]` block with `executor`"));
+        assert!(refused(&(live.clone() + MAINNET)).contains("with `executor` set"));
+        let armed = format!("{live}{MAINNET}executor = \"{A}\"\n");
+        let f = parse(&armed).expect("a complete live artifact");
+        assert_eq!(f.mode, HyparbMode::Live);
+        let spot = armed.replace(
+            "perp = \"hyperliquid:HYPE\"\n",
+            "perp = \"hyperliquid:HYPE\"\nspot = \"hyperliquid:@107\"\n",
+        );
+        assert!(refused(&spot).contains("perps only"));
+        let no_perp = armed.replace(
+            "perp = \"hyperliquid:HYPE\"\n",
+            "spot = \"hyperliquid:@107\"\n",
+        );
+        assert!(refused(&no_perp).contains("names no `perp` book"));
+        let quoted = armed
+            .replace("coin0 = \"HYPE\"\ncoin1 = \"USD\"", "coin0 = \"USD\"\ncoin1 = \"HYPE\"");
+        assert!(refused(&quoted).contains("USD-quoted pools only"));
+        let observed = quoted.replace("trade = 1", "trade = 0");
+        assert!(parse(&observed).is_ok(), "an observed pool may be quoted in anything");
+        assert!(refused(&good().replace("mode = \"paper\"", "mode = \"mainnet\""))
+            .contains("\"paper\", \"testnet\" or \"live\""));
     }
 
     #[test]

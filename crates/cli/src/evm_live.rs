@@ -185,7 +185,7 @@ impl Target {
         })
     }
 
-    fn executor(&self) -> Result<[u8; 20], String> {
+    pub(crate) fn executor(&self) -> Result<[u8; 20], String> {
         self.executor.ok_or_else(|| {
             format!(
                 "{} `executor` is not set — `evm-live deploy` first, then set it",
@@ -413,7 +413,7 @@ fn parse_env_addr(var: &str, v: &str) -> Result<[u8; 20], String> {
 }
 
 /// [`check_wallet`] against the environment.
-fn check_wallet_env(x: &[u8; 20], key: &[u8; 32]) -> Result<(), String> {
+pub(crate) fn check_wallet_env(x: &[u8; 20], key: &[u8; 32]) -> Result<(), String> {
     let hyparb = std::env::var(ADDR_ENV).ok();
     let slot3 = SecretKeyBytes::from_hex_env(exec_hyperliquid::config::ENV_AGENT_KEY).ok();
     let master = std::env::var(exec_hyperliquid::config::ENV_MASTER_ADDR).ok();

@@ -36,7 +36,9 @@
 
 use std::path::{Path, PathBuf};
 
-use core_config::hyparb::{HyparbFile, HyparbHedgeVenue, HyparbMode, HyparbTestnet, COIN_USD_NAME};
+use core_config::hyparb::{
+    HyparbFile, HyparbHedgeVenue, HyparbMainnet, HyparbMode, HyparbTestnet, COIN_USD_NAME,
+};
 use core_config::universe::Instrument;
 use core_types::SymbolId;
 use strategy_hyparb::{CoinParams, HedgeMode, HyparbParams, PoolParams, COIN_USD};
@@ -66,6 +68,12 @@ pub struct HyparbBoot {
     /// `[testnet]`, if the artifact has one (required — and complete —
     /// in testnet mode; the parser enforces it).
     pub testnet: Option<HyparbTestnet>,
+    /// `[mainnet]`, if the artifact has one (required with the executor
+    /// in live mode; the parser enforces it).
+    pub mainnet: Option<HyparbMainnet>,
+    /// The `[[coin]]` names, in coin-index order (the live arm binds
+    /// each to its Hyperliquid perp by name).
+    pub coin_names: Vec<String>,
 }
 
 /// Whether the operator asked for the member.
@@ -106,10 +114,10 @@ pub fn load_hyparb_boot(
     let hash = core_crypto::sha256(&bytes);
     check_switches(file.mode, evm_testnet)?;
     let params = build_params(&file, resolve, universe_pools)?;
-    if file.mode == HyparbMode::Testnet && params.gas_coin == COIN_USD {
+    if file.mode != HyparbMode::Paper && params.gas_coin == COIN_USD {
         return Err(format!(
-            "hyparb.toml: `mode = \"testnet\"` needs a `[[coin]]` named \"{GAS_COIN_NAME}\" — \
-             the gas bid is a fraction of a USD edge, paid in {GAS_COIN_NAME}"
+            "hyparb.toml: a mode that sends swaps needs a `[[coin]]` named \
+             \"{GAS_COIN_NAME}\" — gas is paid, and marked, in {GAS_COIN_NAME}"
         ));
     }
     let traded = file.pools.iter().filter(|p| p.trade).count();
@@ -120,13 +128,22 @@ pub fn load_hyparb_boot(
         mode: file.mode,
         traded,
         testnet: file.testnet,
+        mainnet: file.mainnet,
+        coin_names: file.coins.iter().map(|c| c.name.clone()).collect(),
     }))
 }
 
-/// O-H5: the artifact's mode and `--evm-testnet` agree.
+/// O-H5: the artifact's mode and `--evm-testnet` agree. Live mode's own
+/// switches (the exec interlock's slot 0) are the bin's to check — it
+/// holds both artifacts.
 fn check_switches(mode: HyparbMode, evm_testnet: bool) -> Result<(), String> {
     match (mode, evm_testnet) {
-        (HyparbMode::Paper, false) | (HyparbMode::Testnet, true) => Ok(()),
+        (HyparbMode::Paper, false) | (HyparbMode::Testnet, true) | (HyparbMode::Live, false) => {
+            Ok(())
+        }
+        (HyparbMode::Live, true) => Err("hyparb: --evm-testnet with `mode = \"live\"` — live \
+             mode swaps on MAINNET through the exec interlock; the testnet shadow is paper's"
+            .to_owned()),
         (HyparbMode::Paper, true) => Err("hyparb: --evm-testnet with `mode = \"paper\"` — the \
              two switches of the EVM write path must agree (O-H5)"
             .to_owned()),
@@ -265,6 +282,7 @@ pub fn render_boot_tell(boot: &HyparbBoot) -> String {
     let mode = match boot.mode {
         HyparbMode::Paper => "paper",
         HyparbMode::Testnet => "testnet",
+        HyparbMode::Live => "LIVE",
     };
     format!(
         "hyparb: artifact configured hash={hex} path={} mode={mode} coins={} pools={} \

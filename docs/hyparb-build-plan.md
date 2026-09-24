@@ -2120,7 +2120,8 @@ The review's findings, fixed in this order (critical first):
   not `Ready`) logs at ERROR, sets `engine_hyparb_evm_dark = 1` and
   boots with the shadow off.
 * **Slot 0 is never armed live** — `exec_boot::NEVER_LIVE_SLOTS`
-  (risk-policy "HYPARB — slot 0").
+  (risk-policy "HYPARB — slot 0"). SUPERSEDED by §17.5 (L5, 2026-09-24):
+  slot 0 arms live through three switches and its own live arm.
 * **`HttpsPost`, reworked** (`core-net`):
   * ONE contiguous request written ONCE — `[pad | prefix | digits |
     CRLFCRLF | body]`; the prefix (method, path, host, fixed headers) is
@@ -2415,16 +2416,16 @@ and the gates live in the vault: `docs/research/hyparb/hyparb-live-plan-2026-09-
   them. The live artifact lost its two lines in the same deploy as the
   L0 release binary (a `.bak` kept).
 
-### 17.3 L1–L6 (to build)
+### 17.3 L1–L6
 
 | Phase | What |
 |---|---|
 | L1 | LANDED (§17.4). The mainnet EVM write path: `Network::Mainnet` (chain 999) armed only through a `MainnetAuthority`, never from config text; the endpoint's `eth_chainId` verified; operator verbs `evm-live status / deploy / wrap / swap / sweep`, every mainnet write behind `--confirm`. |
-| L2 | Slot 0's Hyperliquid arm: a second `HlExchange` as the slot's own account (its own budget and anchor files), perp + spot asset binding from `meta` / `spotMeta`, price (5 significant figures) and size (`szDecimals`) rounding, IoC hedges, perp reconciliation. |
-| L3 | `HyparbLive` (`OrderDispatch`): the swap RECEIPT's `Swap` log is the AMM fill (the E-5 analogue); its own halts (reverts, receipt timeouts, recon drift, a daily gas cap) and the combined-equity session bound, judged only when nothing is in flight. |
-| L4 | The router carries per-slot live arms and halt signals; slot 0's fault never halts slot 3. |
-| L5 | Three switches: artifact `mode = "live"` + `exec.toml [exec.slot.0] mode = "live"` + `--arm-live 0`; any one alone refuses. `NEVER_LIVE_SLOTS` lifted for slot 0, `LIVE_ARM_VENUES` gains HyperEvm. |
-| L6 | The mainnet battery (real money, by hand) and the three reviews. R0 follows only after G1 and the operator's word. |
+| L2 | LANDED (§17.5). Slot 0's Hyperliquid arm: a second `HlExchange` as X itself (its own budget and anchor files under `hyparb/`), PERP assets bound from `meta` (the member's lot must equal the venue's `szDecimals` step), IoC hedges at the touch, perp reconciliation (`clearinghouseState`). Spot hedges are refused in live mode. |
+| L3 | LANDED (§17.5). `HyparbLive` (`OrderDispatch`): the swap RECEIPT's ERC-20 `Transfer`s are the AMM fill (the E-5 analogue); its halts and the combined-equity session bound, judged only when nothing is in flight. Gas is inside the equity (X's HYPE at the HYPE mid), so the −$20 bound is also the gas cap. |
+| L4 | LANDED (§17.5). The router carries per-slot live arms (`SlotSplit`) and halt signals (`halt_signal_for`); slot 0's fault never halts slot 3. |
+| L5 | LANDED (§17.5). Three switches: artifact `mode = "live"` + `exec.toml [exec.slot.0] mode = "live"` on exactly `["hyperliquid", "hyperevm"]` + `--arm-live 0`; any one alone refuses. `NEVER_LIVE_SLOTS` lifted; `LIVE_ARM_VENUES` gains HyperEvm (slot 0 only). `scripts/hyparb-flip.sh` sets all three after a preflight. |
+| L6 | The mainnet battery (real money, by hand): fund X, `deploy`, `wrap`, one `swap`, `arm-smoke`. R0 follows only after G1 and the operator's word. |
 
 ### 17.4 L1 — the mainnet EVM write path and the `evm-live` verbs — LANDED
 
@@ -2479,3 +2480,93 @@ and the gates live in the vault: `docs/research/hyparb/hyparb-live-plan-2026-09-
   * **`sweep`** moves a token from the executor to X.
   * Every send is refused unless X can pay its whole gas limit at the
     fee cap.
+
+### 17.5 L2–L5 — slot 0's live arm, the router's two arms, the three switches — LANDED
+
+* **The arm (`crates/cli/src/hyparb_live.rs`).** `HyparbLive` is slot 0's
+  `OrderDispatch`; the member and its orders are paper's, unchanged.
+  * **AMM leg.** An `ORDER_KIND_AMM_SWAP` becomes ONE exact-input
+    executor swap (`swap_request`: Ask sells `qty` token0 with `minOut =
+    qty × px`; Bid pays `ceil(qty × px)` token1 with `minOut = qty`), sent
+    by the `hyparb-live` thread from X. The mined receipt's `Transfer`s
+    are the fill (`fill_of`; `px` derived from the truncated `qty` so
+    `qty × px` is the token1 that moved). One swap in flight; a second is
+    refused. A swap the executor cannot fund is refused BEFORE it is
+    sent (`fundable`, against the worker's own account of the executor:
+    the first reconciliation plus every receipt), counted
+    `short_inventory`.
+  * **Hedge leg.** IoCs on the coin's perp through X's own
+    `HlExchange` (X signs as itself, O-HL3); `userFills` are the fills.
+    **A fill older than the process is dropped** (`from_this_session`,
+    counted `stale_fills`): `userFills` opens every connect with a
+    SNAPSHOT of recent fills, and on a perp — bound for good, unlike a
+    HIP-4 instance, whose old coins no longer resolve — that history
+    would re-book the last session's hedges on every restart (member,
+    ledger and drift all double). Caught by the testnet rehearsal.
+  * **What halts slot 0** (router, `halt_signal_for(0)`): X's stream gap,
+    budget floor and asset refusals; the reject streak = X's HL rejects +
+    swaps refused / unsent / unconfirmed in a row. **A revert is a MISS**
+    (the pool moved past `minOut` — the E7-F2 reading of an IoC that did
+    not cross): counted `swap_misses`, no streak. Recon drift = the
+    executor's tokens and X's perp sizes against this session's fills, at
+    mids, the smaller of the last two readings (E7-F3). Recon every
+    15 s: `clearinghouseState`, `spotClearinghouseState`, X's HYPE,
+    `balanceOf` per token.
+  * **The bound (O-HL5).** Combined equity = perp account value + spot
+    USDC + the executor's tokens at mids + X's HYPE at the HYPE mid,
+    judged only while flat (no swap in flight, a reconciliation 2 s after
+    the last activity). The anchor is the first flat reading, persisted
+    at `<exec.toml dir>/hyparb/hyparb-equity-anchor.state`; delete it to
+    start a new session (and after any top-up of X — a top-up reads as a
+    gain, and as drift).
+  * **Retirements** (new `OrderDispatch::try_next_retired`, default
+    none): a swap that ended without a fill, and every hedge IoC 5 s
+    after it was accepted, leave the router's resting count — without
+    it eight reverts would stall slot 0 at `max_open_orders`.
+* **The router (`exec-router`).** `SlotSplit<A, B>` is two live arms
+  behind one router (slot 0 → `HyparbLive`, the rest → the operator's
+  `HlExchange`); per-slot halt signals and per-slot ledger seeding;
+  cancel-all is venue-wide and reaches both.
+* **The switches.** `hyparb.toml mode = "live"` (its live checks: the
+  `[mainnet]` executor, perp-only coins, USD-quoted traded pools);
+  `exec.toml [exec.slot.0]` live on exactly `["hyperliquid",
+  "hyperevm"]` (HyperEVM on any other slot refuses); `--arm-live 0`.
+  `MainnetAuthority::armed_engine` is the engine's door and needs every
+  switch. Slot 0's state files live in `hyparb/` beside `exec.toml`.
+  The wrapper: `HYPARB_LIVE=1` + `HYPARB_TOML=<live artifact>` +
+  `ARM_LIVE` naming 0 + `HYPEREVM_MAINNET_KEY` in the repo `.env`
+  (exclusive with `EVM_TESTNET` / `EVM_HYBRID`).
+* **The rehearsal** (`evm-live arm-smoke`, `crates/cli/src/hyparb_rehearsal.rs`):
+  boots the SAME arm and drives the router's verbs — first
+  reconciliation, a refused unfundable swap, one AMM swap read back from
+  its receipt, one perp IoC round trip, the retirements, the settled
+  equity. `--network testnet` is the rehearsal; mainnet trades a few
+  dollars; `--no-trade` is the preflight (nothing sent) that
+  `hyparb-flip.sh live` runs, with `--exec/--arm-live` through the
+  engine's own interlock. TESTNET rehearsal 2026-09-24 (gated binary):
+  PASS — boot on chain 998, first reconciliation, the unfundable swap
+  refused locally, one executor swap filled from its receipt, an ETH
+  perp IoC round trip filled from `userFills` (a miss retried), both
+  IoCs retired, settled flat with drift $0.
+
+### 17.6 The flip (runbook)
+
+Once: ONE new wallet X (its key = `HYPEREVM_MAINNET_KEY` in the repo
+`.env`, its address = `HYPERLIQUID_HYPARB_MASTER_ADDR`), funded with HYPE
+on HyperEVM (gas + the executor's inventory) and USDC on Hyperliquid
+(the hedges' margin) — the least balances are in the vault's live plan.
+Then, by the session or the operator:
+
+1. `evm-live.sh deploy --confirm` → set `[mainnet] executor` in
+   `~/multivenue/hyparb-live.toml`.
+2. `evm-live.sh wrap --amount-wei <≈0.75 HYPE> --confirm`, then one
+   `evm-live.sh swap` on the WHYPE/USDC pool selling half the WHYPE for
+   USDC (the executor's two-sided inventory).
+3. `evm-live.sh arm-smoke --hyparb ~/multivenue/hyparb-live.toml --confirm`
+   — the first real round trip (a few dollars).
+4. `scripts/hyparb-flip.sh live` (preflight, then the three switches),
+   `scripts/exec-smoke.sh`, restart. `/state`: slot 0 seeded, the
+   anchor set at the first flat reading.
+
+Back to paper at any time: `scripts/hyparb-flip.sh paper`, restart.
+`scripts/hyparb-flip.sh status` says which mode the next restart boots.

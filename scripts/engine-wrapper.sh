@@ -220,11 +220,22 @@ fi
 # O-H12 third switch EVM_HYBRID=1 (--evm-hybrid: mainnet pool reads,
 # testnet writes) is valid only on top of the pair - alone it REFUSES.
 # Per O-H8 nothing here edits strategy.conf.
+# HYPARB L5 (2026-09-24, O-HL1): LIVE mode — real swaps on HyperEVM
+# MAINNET and real hedges from slot 0's own Hyperliquid account — takes
+# HYPARB_TOML=<an artifact with mode = "live"> AND HYPARB_LIVE=1, on top
+# of EXEC_TOML/ARM_LIVE with ARM_LIVE naming slot 0 (the engine checks
+# the artifact's mode against exec.toml's slot 0 itself: three switches,
+# any one alone refuses). The wallet key HYPEREVM_MAINNET_KEY comes from
+# the repo .env sourced above. HYPARB_LIVE and EVM_TESTNET are exclusive.
 HYPARB_ARGS=()
 case "$STRATEGY" in
   *hyparb*) HYPARB_ARGS=(--hyperevm-path "${HYPEREVM_PATH:-/}") ;;
   *) if [ -n "${HYPEREVM_PATH:-}" ]; then HYPARB_ARGS=(--hyperevm-path "$HYPEREVM_PATH"); fi ;;
 esac
+if [ -n "${HYPARB_LIVE:-}" ] && [ -n "${EVM_TESTNET:-}${EVM_HYBRID:-}" ]; then
+  echo "engine-wrapper: refusing — HYPARB_LIVE is exclusive with EVM_TESTNET / EVM_HYBRID (the testnet shadow is paper's)" >&2
+  exit 78
+fi
 if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
   if [ "$EVM_TESTNET" != "1" ]; then
     echo "engine-wrapper: refusing — EVM_TESTNET must be 1 (got '$EVM_TESTNET')" >&2
@@ -273,11 +284,37 @@ if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
     HYPARB_ARGS+=(--evm-hybrid)
     echo "engine-wrapper: HYBRID — mainnet (999) pool reads, TESTNET (998) writes (O-H12)" >&2
   fi
+elif [ -n "${HYPARB_TOML:-}" ] && [ -n "${HYPARB_LIVE:-}" ]; then
+  if [ "$HYPARB_LIVE" != "1" ]; then
+    echo "engine-wrapper: refusing — HYPARB_LIVE must be 1 (got '$HYPARB_LIVE')" >&2
+    exit 78
+  fi
+  if [ ! -f "$HYPARB_TOML" ]; then
+    echo "engine-wrapper: refusing — HYPARB_TOML=$HYPARB_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY" in
+    *hyparb*) ;;
+    *) echo "engine-wrapper: refusing — HYPARB_LIVE without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  case ",${ARM_LIVE:-}," in
+    *,0,*) ;;
+    *) echo "engine-wrapper: refusing — HYPARB_LIVE needs EXEC_TOML and ARM_LIVE naming slot 0 (got ARM_LIVE='${ARM_LIVE:-}')" >&2; exit 78 ;;
+  esac
+  if [ -z "${HYPEREVM_MAINNET_KEY:-}" ]; then
+    echo "engine-wrapper: refusing — HYPARB_LIVE=1 but HYPEREVM_MAINNET_KEY is not in the repo .env" >&2
+    exit 78
+  fi
+  HYPARB_ARGS+=(--hyparb "$HYPARB_TOML")
+  echo "engine-wrapper: hyparb LIVE via $HYPARB_TOML — HyperEVM MAINNET + Hyperliquid MAINNET, REAL MONEY" >&2
 elif [ -n "${EVM_HYBRID:-}" ]; then
   echo "engine-wrapper: refusing — EVM_HYBRID needs HYPARB_TOML and EVM_TESTNET=1" >&2
   exit 78
+elif [ -n "${HYPARB_LIVE:-}" ]; then
+  echo "engine-wrapper: refusing — HYPARB_LIVE needs HYPARB_TOML (an artifact with mode = \"live\")" >&2
+  exit 78
 elif [ -n "${HYPARB_TOML:-}${EVM_TESTNET:-}" ]; then
-  echo "engine-wrapper: refusing — HYPARB_TOML and EVM_TESTNET must BOTH be set for the EVM write path (got HYPARB_TOML='${HYPARB_TOML:-}' EVM_TESTNET='${EVM_TESTNET:-}')" >&2
+  echo "engine-wrapper: refusing — HYPARB_TOML needs EVM_TESTNET=1 (the testnet shadow) or HYPARB_LIVE=1 (live mode), and EVM_TESTNET needs HYPARB_TOML (got HYPARB_TOML='${HYPARB_TOML:-}' EVM_TESTNET='${EVM_TESTNET:-}')" >&2
   exit 78
 fi
 exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}"

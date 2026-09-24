@@ -4994,15 +4994,41 @@ it in `strategy.conf` is an operator action after H9 (O-H8). Its only
 real submission path is the HyperEVM **TESTNET** shadow (chain 998).
 Build record: `docs/hyparb-build-plan.md` §16.
 
-### Slot 0 is never armed live (H9)
+### Slot 0 live — three switches, its own wallet (L5, 2026-09-24; supersedes H9's "never armed")
 
-`exec_boot::NEVER_LIVE_SLOTS` holds slot 0: a `mode = "live"` slot 0
-refuses the boot even when both arming switches agree and the venue it
-names has a live arm. The reason is structural, not cautious: the
-member's AMM leg has NO live arm (HyperEVM writes are testnet-only),
-while its hedge legs name Hyperliquid, which DOES — arming slot 0 would
-send real hedges against paper swaps, a one-legged arb building real
-inventory. Pinned by `exec_boot::tests::slot_0_hyparb_is_never_armed_live`.
+H9 held slot 0 out of `--arm-live` because its AMM leg had no live arm:
+arming it would have sent real hedges against paper swaps. L2–L5 built
+that arm (`docs/hyparb-build-plan.md` §17.5), so the refusal became an
+interlock:
+
+* **Three switches, any one alone refuses:** `hyparb.toml mode =
+  "live"`; `exec.toml [exec.slot.0] mode = "live"` on EXACTLY
+  `["hyperliquid", "hyperevm"]` (one-legged is refused; `hyperevm` on
+  any other slot is refused); `--arm-live` naming 0.
+  `MainnetAuthority::armed_engine` opens the mainnet EVM arm only when
+  all three agree. `scripts/hyparb-flip.sh live|paper` sets them after
+  a preflight that sends nothing.
+* **Its own money (O-HL3):** wallet X swaps, pays gas, owns the executor
+  and hedges on its own Hyperliquid account. Slot 0's state files live
+  in `hyparb/` beside `exec.toml`; slot 3's are never touched.
+* **The five kill switches apply as on slot 3**, from slot 0's arm
+  alone (`halt_signal_for(0)`), never halting slot 3 nor the reverse.
+  The reject streak counts swaps refused, unsent or unconfirmed; a
+  REVERT (below `minOut`) is a miss, counted and never a streak — the
+  E7-F2 law for an IoC that did not cross. Drift covers the executor's
+  tokens and X's perp sizes.
+* **A swap the executor cannot fund is refused before it is sent**
+  (never a chain revert that pays gas to say so).
+* **The session bound (O-HL5, LIVE-only):** +$50 / −$20 on combined
+  equity (X's perp value + spot USDC + the executor's tokens at mids +
+  X's HYPE), judged only while flat, anchored at the first flat reading
+  and persisted. Gas lowers the equity, so the loss bound caps gas too.
+* **Only this process's fills book.** A `userFills` snapshot row older
+  than the arm's boot is dropped: a perp coin stays bound across
+  restarts, so the replayed history would otherwise be booked again.
+* **Resting rows retire** when the arm says an accepted order ended
+  without a fill (`OrderDispatch::try_next_retired`): a reverted swap,
+  a hedge IoC 5 s after acceptance.
 
 ### The member's caps (`hyparb.toml`, paper)
 
