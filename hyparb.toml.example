@@ -78,6 +78,15 @@ perp_taker_bps_1e6 = 4500000
 spot_taker_bps_1e6 = 7000000
 # The least time between two arbs on one pool.
 cooldown_ns = 1000000000
+# OPTIONAL - the paper session's P&L stop (0 or absent = off). The
+# member marks its own P&L - cash from every fill, less the hedge taker
+# fees and the gas it charges per attempt, plus funding, plus the coins
+# it holds valued at their mids - and once that reaches +gain or -loss
+# it opens NO new arb until the engine restarts (hedges and flattening
+# keep running; /state `pnl_halt` says which side tripped). The shape of
+# the E7 session bound on slot 3, for a slot that is never live.
+halt_on_gain_usd_1e6 = 50000000
+halt_on_loss_usd_1e6 = 20000000
 
 # One block per hedge coin (at most 8). `name` is what pools refer to
 # (1-16 letters/digits; "USD" is reserved for the numeraire). `perp` and

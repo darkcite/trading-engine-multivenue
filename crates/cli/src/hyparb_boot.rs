@@ -223,6 +223,8 @@ fn build_params(
     p.spot_taker_bps_1e6 = file.spot_taker_bps_1e6;
     p.funding_window_ns = file.funding_window_ns;
     p.cooldown_ns = file.cooldown_ns;
+    p.halt_on_gain_usd_1e6 = file.halt_on_gain_usd_1e6;
+    p.halt_on_loss_usd_1e6 = file.halt_on_loss_usd_1e6;
     p.gas_coin = file
         .coins
         .iter()
@@ -269,7 +271,8 @@ pub fn render_boot_tell(boot: &HyparbBoot) -> String {
     format!(
         "hyparb: artifact configured hash={hex} path={} mode={mode} coins={} pools={} \
          traded={} hedge={venue} depth_cap={} basis={} lag_ns={} gas_p50_usd_1e6={} \
-         min_net_bps_1e6={} max_order_usd_1e6={} cap_day_usd_1e6={} inventory_cap_usd_1e6={}",
+         min_net_bps_1e6={} max_order_usd_1e6={} cap_day_usd_1e6={} inventory_cap_usd_1e6={} \
+         pnl_stop_usd_1e6=+{}/-{}",
         boot.path.display(),
         p.n_coins,
         p.n_pools,
@@ -282,6 +285,8 @@ pub fn render_boot_tell(boot: &HyparbBoot) -> String {
         p.max_order_usd_1e6,
         p.cap_day_usd_1e6,
         p.inventory_cap_usd_1e6,
+        p.halt_on_gain_usd_1e6,
+        p.halt_on_loss_usd_1e6,
     )
 }
 
@@ -338,9 +343,18 @@ mod tests {
         );
         assert_eq!(b.params.coins[0].spot_sym, core_types::SYMBOL_ID_NONE);
         assert_eq!(b.traded, 1);
+        assert_eq!(
+            (b.params.halt_on_gain_usd_1e6, b.params.halt_on_loss_usd_1e6),
+            (50_000_000, 20_000_000),
+            "the example's session P&L stop"
+        );
         let tell = render_boot_tell(&b);
         assert!(
             tell.contains("mode=paper") && tell.contains("hedge=auto"),
+            "{tell}"
+        );
+        assert!(
+            tell.contains("pnl_stop_usd_1e6=+50000000/-20000000"),
             "{tell}"
         );
         let mut hex = String::new();

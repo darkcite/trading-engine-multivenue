@@ -161,9 +161,16 @@ in the script; `ai` = 48 is the floor every name includes).
   `scripts/hyparb-executor-repro.sh`). PAPER only and in NO configured mask:
   `strategy.conf` is untouched (O-H8), and the member boots only with
   `--hyparb ~/multivenue/hyparb.toml` plus the pool ingress (`[hyperevm]
-  pools` in universe.toml, `--hyperevm-path` on `HYPEREVM_WS_HOST`) —
-  neither is in the live config; turning it on is the operator's mask
-  flip (plan §16.17, end). Slot 0 can NEVER be armed live
+  pools` in universe.toml, `--hyperevm-path` on `HYPEREVM_WS_HOST`).
+  **Go-live PREPARED 2026-09-24 (plan §16.18):** both are in the live
+  config — `~/multivenue/hyparb.toml` (`mode = "testnet"`: paper + the
+  testnet shadow, 14 pools, 4 perp-hedged coins, the session P&L stop
+  +$50 / −$20 — `/state` `hyparb.pnl_halt`) and `[hyperevm]` in
+  `universe.toml` — and the wrapper hands the shadow its testnet key
+  from `~/multivenue/.env`; turning it on is the operator's four
+  `strategy.conf` lines (§16.18 runbook). HZ part B is NOT green from
+  this Mac (a tx fired at head N lands in N+1 ~56 %): paper AMM fills
+  are an upper bound on latency. Slot 0 can NEVER be armed live
   (`exec_boot::NEVER_LIVE_SLOTS`). Its one real write path is the
   HyperEVM TESTNET shadow — chain 998 only, compile-time; `mode =
   "testnet"` + `--evm-testnet` (+ `--evm-hybrid` for mainnet reads).

@@ -72,7 +72,7 @@ fn err(msg: impl Into<String>) -> HyparbError {
 }
 
 /// `[hyparb]` keys. Every one is required unless marked OPTIONAL.
-const HYPARB_KEYS: [&str; 22] = [
+const HYPARB_KEYS: [&str; 24] = [
     // The endpoint the pools are read from must answer historical reads
     // honestly (O-H4); the only value is "archive". The artifact states
     // the assumption so a reader of the file sees it.
@@ -100,6 +100,13 @@ const HYPARB_KEYS: [&str; 22] = [
     "perp_taker_bps_1e6",
     "spot_taker_bps_1e6",
     "cooldown_ns",
+    // OPTIONAL (absent = 0 = off): the paper session's P&L stop — once
+    // the member's own marked P&L reaches +gain or −loss it opens no new
+    // arb until the engine restarts; hedges and flattening keep running.
+    // The shape of the E7 session bound (`exec.toml` slot 3), for a slot
+    // that is never live.
+    "halt_on_gain_usd_1e6",
+    "halt_on_loss_usd_1e6",
     // Reserved spellings refused with a pointed message (see below).
     "tick_cap",
     "pools",
@@ -227,6 +234,10 @@ pub struct HyparbFile {
     pub spot_taker_bps_1e6: i64,
     /// Least time between two arbs on one pool, ns.
     pub cooldown_ns: u64,
+    /// The session P&L stop's gain side, USD × 1e6 (≥ 0; 0 = off).
+    pub halt_on_gain_usd_1e6: i64,
+    /// The session P&L stop's loss side, USD × 1e6 (≥ 0; 0 = off).
+    pub halt_on_loss_usd_1e6: i64,
     /// Hedge coins, in file order.
     pub coins: Vec<HyparbCoin>,
     /// Pools, in file order.
@@ -310,6 +321,15 @@ fn positive_u64(kv: &Kv, key: &str, block: &str) -> Result<u64, HyparbError> {
 
 fn non_negative(kv: &Kv, key: &str, block: &str) -> Result<i64, HyparbError> {
     let v = int(kv, key, block)?;
+    if v < 0 {
+        return Err(err(format!("`{key}` must be ≥ 0 (got {v})")));
+    }
+    Ok(v)
+}
+
+/// An OPTIONAL non-negative integer: absent reads as 0 (off).
+fn opt_non_negative(kv: &Kv, key: &str) -> Result<i64, HyparbError> {
+    let v = opt_int(kv, key)?.unwrap_or(0);
     if v < 0 {
         return Err(err(format!("`{key}` must be ≥ 0 (got {v})")));
     }
@@ -432,6 +452,8 @@ fn finish_hyparb(kv: &Kv) -> Result<HyparbFile, HyparbError> {
         perp_taker_bps_1e6: fee(kv, "perp_taker_bps_1e6", B)?,
         spot_taker_bps_1e6: fee(kv, "spot_taker_bps_1e6", B)?,
         cooldown_ns: non_negative(kv, "cooldown_ns", B)? as u64,
+        halt_on_gain_usd_1e6: opt_non_negative(kv, "halt_on_gain_usd_1e6")?,
+        halt_on_loss_usd_1e6: opt_non_negative(kv, "halt_on_loss_usd_1e6")?,
         coins: Vec::new(),
         pools: Vec::new(),
         testnet: None,
@@ -783,6 +805,36 @@ mod tests {
         assert_eq!(
             parse(&with_cap).unwrap().pools[0].max_notional_usd_1e6,
             Some(7)
+        );
+    }
+
+    #[test]
+    fn the_session_pnl_stop_is_optional_and_never_negative() {
+        let f = parse(&good()).expect("parses");
+        assert_eq!(
+            (f.halt_on_gain_usd_1e6, f.halt_on_loss_usd_1e6),
+            (0, 0),
+            "absent = off"
+        );
+        let with = good().replace(
+            "cooldown_ns = 1000000000\n",
+            "cooldown_ns = 1000000000\nhalt_on_gain_usd_1e6 = 50000000\nhalt_on_loss_usd_1e6 = 20000000\n",
+        );
+        let f = parse(&with).expect("parses with the stop");
+        assert_eq!(f.halt_on_gain_usd_1e6, 50_000_000);
+        assert_eq!(f.halt_on_loss_usd_1e6, 20_000_000);
+        let e = refused(&with.replace(
+            "halt_on_loss_usd_1e6 = 20000000",
+            "halt_on_loss_usd_1e6 = -1",
+        ));
+        assert!(e.contains("`halt_on_loss_usd_1e6` must be ≥ 0"), "{e}");
+        let e = refused(&with.replace(
+            "halt_on_gain_usd_1e6 = 50000000",
+            "halt_on_gain_usd_1e6 = \"50\"",
+        ));
+        assert!(
+            e.contains("`halt_on_gain_usd_1e6` must be an integer"),
+            "{e}"
         );
     }
 

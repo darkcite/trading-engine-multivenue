@@ -1022,7 +1022,8 @@ pub struct HyparbCounters {
     pub skipped_inflight: u64,
     /// Held: the pool's cooldown.
     pub skipped_cooldown: u64,
-    /// Held: the member is halted (inventory cap) or the day cap is full.
+    /// Held: the member is halted (the inventory cap, or the session P&L
+    /// stop) or the day cap is full.
     pub skipped_halted: u64,
     /// Decisions whose size a cap cut (depth, order, pool, day).
     pub size_capped: u64,
@@ -1065,6 +1066,17 @@ pub struct HyparbCounters {
     pub funding_earned_usd_1e6: i64,
     /// HYPARB H6 LEVEL: 1 while the inventory cap halts new arbs.
     pub halted: u64,
+    /// HYPARB go-live LEVEL (2026-09-24): the member's own marked P&L
+    /// this session, USD × 1e6, signed — cash from every fill less the
+    /// hedge taker fees and the gas charged per attempt, plus funding,
+    /// plus the coins held valued at their mids. Held at its last value
+    /// while some held coin has no mark.
+    pub pnl_session_usd_1e6: i64,
+    /// HYPARB go-live LEVEL: the session P&L stop (`hyparb.toml`
+    /// `halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6`) — 0 not tripped,
+    /// 1 the gain side, 2 the loss side. Sticky until the engine
+    /// restarts; while set no new arb opens.
+    pub pnl_halt: u64,
 }
 
 /// HYPARB H4: one pool's row (`/state`, the dashboard).

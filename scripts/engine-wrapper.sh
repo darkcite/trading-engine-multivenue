@@ -238,6 +238,31 @@ if [ -n "${HYPARB_TOML:-}" ] && [ -n "${EVM_TESTNET:-}" ]; then
     *hyparb*) ;;
     *) echo "engine-wrapper: refusing — EVM_TESTNET without hyparb in STRATEGY=$STRATEGY" >&2; exit 78 ;;
   esac
+  # HYPARB go-live (2026-09-24): the shadow's wallet key. The engine reads
+  # HYPEREVM_TESTNET_KEY, else the E3 gate's HYPERLIQUID_TESTNET_AGENT_KEY,
+  # from its ENVIRONMENT; the repo .env sourced above carries neither on
+  # this host — the operator's testnet keys live in ~/multivenue/.env,
+  # which exec-smoke.sh and evm-testnet.sh read. Take exactly those two
+  # names from it: a subshell sources the file and only the named value
+  # leaves it (never printed; nothing else in that file reaches the
+  # engine). Neither found => refuse before the exec — the engine would
+  # refuse the same boot, less clearly.
+  if [ -z "${HYPEREVM_TESTNET_KEY:-}${HYPERLIQUID_TESTNET_AGENT_KEY:-}" ]; then
+    EVM_ENV_FILE="${MULTIVENUE_ENV_FILE:-$HOME/multivenue/.env}"
+    if [ -f "$EVM_ENV_FILE" ]; then
+      for _k in HYPEREVM_TESTNET_KEY HYPERLIQUID_TESTNET_AGENT_KEY; do
+        _v="$(set +u; . "$EVM_ENV_FILE" >/dev/null 2>&1; printf '%s' "${(P)_k:-}")"
+        if [ -n "$_v" ]; then
+          export "$_k=$_v"
+        fi
+      done
+      unset _k _v
+    fi
+  fi
+  if [ -z "${HYPEREVM_TESTNET_KEY:-}${HYPERLIQUID_TESTNET_AGENT_KEY:-}" ]; then
+    echo "engine-wrapper: refusing — EVM_TESTNET=1 but neither HYPEREVM_TESTNET_KEY nor HYPERLIQUID_TESTNET_AGENT_KEY is in the repo .env or ${MULTIVENUE_ENV_FILE:-$HOME/multivenue/.env}" >&2
+    exit 78
+  fi
   HYPARB_ARGS+=(--hyparb "$HYPARB_TOML" --evm-testnet)
   echo "engine-wrapper: hyparb EVM write path via $HYPARB_TOML — TESTNET (chain 998) only" >&2
   if [ -n "${EVM_HYBRID:-}" ]; then

@@ -2241,3 +2241,114 @@ through launchd; (5) verify `vm_rows_active ≥ 1` and the `hyparb`
 object on `/state` (`pools_live`, `halted = 0`) and that the live arm's
 tell (slot 3) is unchanged; (6) rollback = the previous `STRATEGY` line
 and a restart.
+
+### 16.18 Go-live prep — the session P&L stop, the shadow's key, HZ part B (2026-09-24)
+
+**The operator's choice (2026-09-24):**
+- paper and the testnet shadow;
+- a paper P&L stop of **+$50 / −$20**, the shape of BIN15's live bound;
+- a real-money HYPARB **plan only**, no code (it lives outside git until
+  the operator rules).
+
+* **The session P&L stop** (`hyparb.toml` `halt_on_gain_usd_1e6` /
+  `halt_on_loss_usd_1e6`, OPTIONAL, absent = 0 = off). It is the E7
+  session bound's shape for a slot that is never live.
+  * **What it measures.** The member marks its own P&L: cash from every
+    fill (a USD pool token is cash; a hedge buy spends, a sale earns),
+    less the hedge taker fee (`perp_taker` / `spot_taker`, every hedge is
+    an IoC), less the gas it charges per attempt, plus funding, plus each
+    coin held at its mid.
+  * **What it does.** At +gain or −loss it opens no new arb until the
+    engine restarts. Hedges and flattening keep running, because they are
+    how the exposure comes down.
+  * **When it is judged.** On every fill, every 1 s pass and every hedge
+    tick of a held coin, BEFORE any pool is decided on that tick. With a
+    held coin unmarked the level holds and nothing is judged; the
+    inventory rule already halts entries on unvalued exposure.
+  * **How it differs from E7.** It is judged continuously on marks, since
+    every position here has a mid. It is per engine session: the three
+    daily restarts re-arm it, and paper inventory does not survive a
+    restart either.
+  * **Where it shows.** `/state` `hyparb.pnl_halt` (0/1 gain/2 loss) and
+    `pnl_session_usd_1e6`; gauges `engine_hyparb_pnl_halt` and
+    `engine_hyparb_pnl_session_usd_1e6` (the family is now 27 counters,
+    37 gauges); the boot tell `pnl_stop_usd_1e6=+G/-L`.
+  * **The harness** runs the same member, so a backtest with an artifact
+    that sets the keys stops the same way. The example sets +$50/−$20.
+* **The shadow's wallet key reaches the engine (`scripts/engine-wrapper.sh`).**
+  * The engine reads `HYPEREVM_TESTNET_KEY`, else
+    `HYPERLIQUID_TESTNET_AGENT_KEY`, from its ENVIRONMENT. The wrapper
+    sources only the REPO `.env`, which carries neither on this host; the
+    operator's testnet keys live in `~/multivenue/.env`, which
+    `exec-smoke.sh` / `evm-testnet.sh` read.
+  * The go-live `strategy.conf` would therefore have REFUSED the boot (a
+    missing key is `ShadowBootErr::Refuse`, H9 R3), and launchd's
+    KeepAlive would have kept the engine down.
+  * **Fix, with `EVM_TESTNET=1` only:** when neither name is set, the
+    wrapper takes exactly those two names from
+    `${MULTIVENUE_ENV_FILE:-~/multivenue/.env}`. A subshell sources the
+    file and only the named value leaves it: never printed, nothing else
+    in that file reaches the engine. Neither found → exit 78 before the
+    exec.
+  * Exercised under zsh against a stub engine, six cases:
+    - the live line is byte-identical;
+    - paper hyparb adds `--hyperevm-path /` only;
+    - the go-live line with the key in `~/multivenue/.env` exports it
+      alone;
+    - a key in the repo `.env` wins and the other file is not read;
+    - no key refuses (78);
+    - no key file refuses (78).
+* **HZ part B — inclusion from this MacBook (numbers in the vault,
+  `hz/hz-b-2026-09-24.md`).** Setup: a 0-value self-transfer fired from
+  wallet 0 the moment block N was seen (a 20 ms `eth_blockNumber` poll,
+  testnet); 27 samples before the public endpoint's `-32005` throttle.
+  * About half landed in N+1; p99 is N+3. The tip bought nothing.
+  * The testnet `eth_sendRawTransaction` ACK alone is ~0.9 s p50, against
+    part A's official-mainnet p99 of 211 ms.
+  * By §3's criterion (p99 inside one block) **HZ is NOT green from this
+    box.** Per O-H8/O-H13 that gates the mask flip; the flip is the
+    operator's to make knowingly.
+  * **The consequence for paper:** the judge charges ONE block for the
+    AMM leg, and from here the swap lands a block later in ~44 % of
+    attempts. Read the paper P&L as an UPPER BOUND on latency.
+* **The go-live artifact** (`~/multivenue/hyparb.toml`, `mode =
+  "testnet"`):
+  * 4 hedge coins, PERPS only (HYPE, BTC, ETH, SOL — already in
+    `[hyperliquid] coins`; the §7.7 spot appends stay deferred, so the
+    Hyperliquid subscription set does not move).
+  * 14 pools: the research universe's most-swapped HYPE / BTC / ETH /
+    SOL / USD pools. They cover every family: 7 `v3` (Hyperswap
+    `0x337b…0c30` among them), 6 `algebra`, 1 `slipstream`. Each family
+    was measured on chain (the `slot0` word count / `globalState`).
+  * `[testnet]`: `wallets = 1` (the shadow swaps from wallet 0 alone),
+    the H9d executor `0x6c16…9cc5`, the battery pool, `amount_raw` 1e11.
+  * The pools are appended to the live `universe.toml` as `[hyperevm]`.
+    The engine's own boot parsers were run over both candidate files
+    before they were installed: universe parse/allocate/bootable, the
+    pool table, `load_hyparb_boot`.
+* **The go-live runbook.** This supersedes §16.17's for the testnet
+  shadow.
+  1. Build the release binary on `main` at or after this commit. The
+     artifact's new keys are refused by an older parser.
+  2. Run `scripts/exec-smoke.sh`.
+  3. Add four lines to `~/multivenue/strategy.conf` (the operator's
+     edit):
+     ```
+     STRATEGY=ai+vrp+xsd+bin15+hyparb
+     HYPARB_TOML=$HOME/multivenue/hyparb.toml
+     EVM_TESTNET=1
+     EVM_HYBRID=1
+     ```
+  4. Restart: the next `daily-restart` slot, or the sanctioned
+     `echo 19700101 > ~/multivenue/state/last-restart-utc-0010`.
+  5. Check the boot tells:
+     - `hyparb: artifact configured … pnl_stop_usd_1e6=+50000000/-20000000`;
+     - the wrapper's `hyparb EVM write path` and `HYBRID` lines;
+     - `hyparb: EVM WRITE PATH ARMED — TESTNET`, or a `DARK` line naming
+       why.
+  6. Check `/state`:
+     - `vm_rows_active ≥ 1`;
+     - `hyparb.pools_live` climbing as each snapshot completes;
+     - `halted = 0`, `pnl_halt = 0`;
+     - slot 3's tell unchanged.
+  7. Rollback: drop the four lines and restart.
