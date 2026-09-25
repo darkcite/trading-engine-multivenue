@@ -2924,7 +2924,8 @@ its guard across the onward push, so the source ring's `tail` store lands
 after the push and the other side waits on that line. Producer-cached
 `tail` / consumer-cached `head` (Rigtorp) take the cross-core index read
 off the push and pop paths of both shapes; that is its own pass, with
-these benches as its baseline. `crates/bench/baselines/hot_path.json`'s
+these benches as its baseline. *Done: "core-ring caches the other side's
+index", below.* `crates/bench/baselines/hot_path.json`'s
 `ring/push_pop_tick` is now `ring/push_ref_pop_ref_tick` at the M4 median.
 
 `make bench-check` cannot compare on this Mac: `check_regression.py`'s
@@ -2968,6 +2969,102 @@ They ran on 2026-09-25, after the commit: LuLu had blocked the rebuilt
 smoke binaries until the operator allowed them (both first timed out at
 the boot REST call while curl from the same Mac reached both venues). The
 release engine binary was not rebuilt.
+
+### core-ring caches the other side's index (2026-09-25)
+
+On the operator's word (2026-09-25: implement the cached-index ring "to
+win back the slower two-thread round trip") — the follow-up ZC pass A
+named.
+
+**What changed.** Each handle keeps its OWN index in a plain field — it is
+that index's only writer, so it publishes the shared atomic (Release) and
+never reads it back — and a CACHE of the OTHER side's index, refreshed
+(Acquire) only when the cache shows the ring full (producer) or empty
+(consumer) and stored only when the refresh finds news. Per element,
+neither side touches the other side's index line: a burst of `k` costs the
+consumer one `head` load, and the producer refreshes `tail` once per
+`N − L` pushes at occupancy `L`. The API is unchanged;
+`Producer::published()` is new — the producer's own publish count, a field
+read. A guard still carries its position; dropping it advances the private
+`tail` and publishes it.
+
+**Which variant.** An interleaved A/B on the M4 — every variant on the
+same two OS threads, alternating round by round (21 rounds), so thread
+placement and background load hit them alike — in ns per operation
+(median; the round trip across two such runs):
+
+| variant | round trip | saturated stream | same-core push+pop |
+|---|---|---|---|
+| uncached (pass A) | 170–175 | 50 | 2.14 |
+| each side re-loads its own index from the ring (Rigtorp's C++) | 114–126 | 2.7 | 2.76 |
+| the producer's own index private | 107 | 4.1 | 2.81 |
+| **both own indices private (chosen)** | **99–108** | 3.9–4.3 | 2.68 |
+
+The round trip is the engine's regime — one tick in flight, the consumer
+waiting — and there the private own index is what wins: re-loading it from
+its shared line, which the other side's refreshes read, cost 6–27 % per
+round trip. The saturated stream (a producer flat out against a consumer
+that reads every field twice) is bistable in the private variants (2.5–5 ns,
+as the ring runs full or in lockstep) — orders of magnitude above any
+feed's rate either way. 256 B index granules changed nothing measurable.
+
+Criterion, same session, three runs each, before → after: round trip
+170–177 → 103–111 ns; stream 50 → 9.2–9.4 ns; same-core push+pop, `Tick`
+2.52 → 2.99–3.06 ns and `DepthTopK` 4.31–4.37 → 4.86–4.91 ns. The same-core
+cost is the price of the private state — about 0.5 ns per push+pop against
+about 35 ns saved per cross-core hop — and `hot_path.json`'s
+`ring/push_ref_pop_ref_tick` is re-baselined to 2.99 ns with that note.
+`dispatcher/queued_submit` (mostly the full-ring refusal) reads 0.57 ns.
+
+**The ingress drain loops.** The ten I-3 loops (Binance ×2, Bybit, Deribit,
+HyperEVM, Hyperliquid, MEXC, OKX, Polymarket, RPC) judged progress by
+`producer.len()` before and after each drive step: two loads of the
+engine's `tail` per iteration — the cross-core read the caches remove —
+and a count every concurrent engine pop also moves, so a pop during a
+tick-less step read as progress and a push cancelled by a pop read as
+none. Their own comment defines progress as "we produced a tick OR moved
+the driver's state machine forward"; they now compare
+`producer.published()`, which is exactly that, at the cost of a field
+read. HyperEVM's three `len() < CAP` room checks (snapshot emission, boot
+and resync cadence) keep `len()`, an upper bound: a true answer guarantees
+the push lands.
+
+What this does NOT fix (pre-existing; the reviewer's notes, left to the
+operator): progress counts ticks only, so a drive step that stops on a
+FULL rx (not on WouldBlock) and publishes no tick — non-tick frames, or
+ticks dropped on a full ring — leaves its unread bytes for the next
+readiness edge or the poll timeout (the old `len()` check re-drove such a
+step only when an engine pop happened to land inside it); and the
+multi-connection loops (Binance, Bybit, MEXC) have no per-connection step
+cap. Both want their own change — consumed rx bytes and the other rings'
+publishes counted as progress; a step cap with a zero-timeout re-poll.
+
+**Proof.** 21 core-ring tests. New: a stale tail cache refreshes when the
+ring looks full (a refused push keeps it); a stale head cache refreshes
+when it looks empty (one refresh serves a burst); `published` counts
+publishes only; the private indices match the published ones (a forgotten
+guard advancing neither); each handle carries its index and one cache;
+every index wraps through `usize::MAX`. The proptest model now starts up
+to 64 below the wrap, checks both `len`s and `published`, and after every
+operation asserts the private indices equal the published ones and each
+cache lags its side. Miri: Stacked and Tree Borrows clean,
+`-Zmiri-many-seeds=0..16` clean on the two-thread tests.
+
+**The review** (a subagent acting as `zero-copy-auditor`, concurrency
+focus): PASS — no memory-ordering, aliasing or zero-copy finding; the
+core-ring `// COPY:` marker stands. Its wording findings were acted on: the
+SAFETY comments no longer claim a refresh before the first lap and state
+the wrapping distances; the docs no longer promise one `tail` load per `N`
+pushes when the consumer lags; the `len`s document their bounds; the tests
+pin the caches, the lag invariants and the wrap. Its two ingress notes are
+the paragraph above.
+
+Gates: clippy clean; nextest 3131 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31 new=0
+paid=0`, the baseline byte-identical; license-check OK; `cargo +nightly fuzz
+build` OK; live smokes 60 s, the engine untouched — MEXC 31 245 messages
+(1 719 ticks), Binance 44 785 (45 610 ticks), 0 parse errors, 0 reconnects,
+0 drops on every ring. The release engine binary was not rebuilt.
 
 ## E6 — the risk gate and the kill switches
 

@@ -1130,7 +1130,7 @@ pub fn run<T: Transport, C: Capture>(
         // I-3: tight inner drain loop. See ingress-polymarket for
         // rationale.
         loop {
-            let n_before = producer.len();
+            let n_before = producer.published();
             let state_before = drv.state();
             if drive_one(
                 transport, drv, host, path, producer, event_tx, event_mask, opt_tx, status,
@@ -1143,7 +1143,7 @@ pub fn run<T: Transport, C: Capture>(
             if drv.state() == State::Closed {
                 return RunResult::Disconnected;
             }
-            if producer.len() == n_before && drv.state() == state_before {
+            if producer.published() == n_before && drv.state() == state_before {
                 break;
             }
         }
@@ -1373,7 +1373,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                 continue;
             };
             loop {
-                let n_before = producer.len();
+                let n_before = producer.published();
                 let state_before = c.drv.state();
                 if drive_one(
                     t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, opt_tx,
@@ -1388,7 +1388,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                     c.kill(now_ns(), status);
                     break;
                 }
-                if producer.len() == n_before && c.drv.state() == state_before {
+                if producer.published() == n_before && c.drv.state() == state_before {
                     break;
                 }
             }

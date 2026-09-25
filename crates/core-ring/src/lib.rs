@@ -33,7 +33,10 @@
 //!   alias — sound under Stacked and Tree Borrows (Miri-checked).
 //! * **No false sharing between the indices.** `head` and `tail` each
 //!   own a 128 B granule: the Apple M-series report a 128 B cache line,
-//!   and x86's adjacent-line prefetcher pulls 64 B lines in pairs.
+//!   and x86's adjacent-line prefetcher pulls 64 B lines in pairs. The
+//!   private copies and caches live in the handles, written on every
+//!   operation: a handle belongs in memory only its own thread touches (an
+//!   ingress driver, the engine) — never beside another thread's hot data.
 //! * **SPSC by construction.** A ring splits exactly once
 //!   ([`Ring::split`]); `Producer` and `Consumer` are `Send + !Sync`,
 //!   every mutating method takes `&mut self`, and a [`Popped`] borrows
@@ -50,19 +53,43 @@
 //!     └─────────────────────────────────────────────────────────┘
 //!                │                              │
 //!            Producer                        Consumer ──► Popped (lends a slot)
+//!       (head, tail cache)               (tail, head cache)
 //! ```
+//!
+//! ## The index caches
+//!
+//! Each handle keeps its OWN index in a plain field — it is that index's
+//! only writer, so it publishes the shared copy (a Release store) and
+//! never reads it back — and a CACHE of the OTHER side's index (Erik
+//! Rigtorp's SPSC scheme), loading that side's line only when the cache
+//! says the ring is full (producer) or empty (consumer). In steady state
+//! a push writes its slot and publishes `head`, a pop reads its slot and
+//! publishes `tail`, and neither side reads the other side's INDEX line
+//! per element: a burst of `k` costs the consumer one `head` load, and
+//! the producer refreshes `tail` once per `N − L` pushes at occupancy `L`
+//! — once per `N` while the consumer keeps up, on every push (and every
+//! refused one) while the ring is full.
+//!
+//! Reading one's own index back is not free either: the other side's
+//! refreshes read that line. On the M4, re-loading each side's own index
+//! from the ring (Rigtorp's C++ shape) cost 6–27 % more per round trip,
+//! across two interleaved A/B runs, than keeping it in the handle — hence
+//! the private copies (`docs/risk-policy.md`, "core-ring caches the other
+//! side's index").
 //!
 //! ## Memory ordering
 //!
-//! * Producer: `tail` is loaded with **Acquire** — it pairs with the
-//!   Release store in `Popped::drop`, so every read the consumer made of
-//!   a slot happens-before the producer writes that slot again (the
-//!   write-after-read hazard, real on aarch64). The copy into the slot
-//!   is then published by the **Release** store of `head`.
-//! * Consumer: `head` is loaded with **Acquire** — it pairs with that
-//!   Release, so a slot's bytes are visible before [`Popped`] lends
-//!   them. Dropping the guard stores `tail` with **Release**.
-//! * Each side's own index is loaded Relaxed: it is its only writer.
+//! * Producer: a refresh loads `tail` with **Acquire** — it pairs with
+//!   the Release store in `Popped::drop`, so every read the consumer made
+//!   of a slot happens-before the producer writes that slot again (the
+//!   write-after-read hazard, real on aarch64). A stale cache is safe:
+//!   the consumer only moves forward, so a stale `tail` under-reports
+//!   room, never over-reports it. The copy into the slot is published by
+//!   the **Release** store of `head`.
+//! * Consumer: a refresh loads `head` with **Acquire** — it pairs with
+//!   that Release, so a slot's bytes are visible before [`Popped`] lends
+//!   them; a stale `head` under-reports elements. Dropping the guard
+//!   stores `tail` with **Release**.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -193,10 +220,14 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         assert!(first, "core-ring: a ring is split exactly once (SPSC)");
         let prod = Producer {
             ring: Arc::clone(&self),
+            head: 0,
+            tail_cache: 0,
             _not_sync: PhantomData,
         };
         let cons = Consumer {
             ring: self,
+            tail: 0,
+            head_cache: 0,
             _not_sync: PhantomData,
         };
         (prod, cons)
@@ -219,6 +250,15 @@ impl<T: Copy, const N: usize> Ring<T, N> {
 /// Single producer handle. `!Sync` by construction.
 pub struct Producer<T, const N: usize> {
     ring: Arc<Ring<T, N>>,
+    /// Next position to write: the private copy of `head`, whose only
+    /// writer this handle is. The shared `head` is published from it and
+    /// never read back.
+    head: usize,
+    /// The consumer's position as last loaded from `tail`. The consumer
+    /// only moves forward, so this is a lower bound: while it shows room
+    /// there is room, and the consumer's line is left alone. Refreshed
+    /// only when it shows the ring full.
+    tail_cache: usize,
     // The producer's unique-writer status is a runtime invariant
     // enforced by the type — make it !Sync so the compiler stops
     // you from sharing it across threads.
@@ -236,24 +276,33 @@ impl<T: Copy, const N: usize> Producer<T, N> {
     #[inline(always)]
     #[must_use = "`false` means the ring was full and nothing was published"]
     pub fn try_push_ref(&mut self, src: &T) -> bool {
-        // The producer is `head`'s only writer.
-        let head = self.ring.head.value.load(Ordering::Relaxed);
-        // Pairs with `Popped::drop`'s Release: the consumer's reads of the
-        // slot we are about to reuse happen-before our write.
-        let tail = self.ring.tail.value.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) >= N {
-            return false;
+        let head = self.head;
+        if head.wrapping_sub(self.tail_cache) >= N {
+            // The cache shows the ring full: learn how far the consumer
+            // has got. Pairs with `Popped::drop`'s Release: the consumer's
+            // reads of the slot about to be reused happen-before our write.
+            let tail = self.ring.tail.value.load(Ordering::Acquire);
+            if head.wrapping_sub(tail) >= N {
+                return false;
+            }
+            self.tail_cache = tail;
         }
         let dst = self.ring.slot(head);
-        // SAFETY: (1) `dst` is the slot at `head`; `head − tail < N`
-        // observed with Acquire means the consumer released it. (2) No
-        // `&T` lives in it: a live `Popped` lends a position `pos` with
-        // `tail ≤ pos < head` (the `tail` loaded above may lag the
-        // consumer, never lead it), so `0 < head − pos ≤ head − tail < N`
-        // and `head ≢ pos (mod N)`. (3) `src` cannot overlap `dst`: a `&T`
-        // into this ring comes only from that `Popped`, a different slot by
-        // (2); a `&T` into anything else is another allocation. (4)
-        // `T: Copy`, so duplicating its bytes is a copy.
+        // SAFETY: all index arithmetic below is wrapping distance.
+        // (1) `dst` is the slot at `head`. On the first lap it was never
+        // written or lent. After that, its previous lap `head − N` lies
+        // before `tail_cache` (`head − tail_cache < N`), and `tail_cache`
+        // came from an Acquire load of `tail` — this call's refresh or an
+        // earlier one (none runs before `head = N`): the consumer had
+        // released that lap, releases are never undone, and its reads of
+        // the slot happen-before this write. (2) No `&T` lives in it: a
+        // live `Popped` lends a position `pos` at or after `tail_cache`
+        // (the cache lags the consumer, never leads it) and before `head`,
+        // so `head − pos ∈ 1..=(head − tail_cache)`, inside `1..N`, and
+        // `head ≢ pos (mod N)`. (3) `src` cannot overlap `dst`: a `&T` into
+        // this ring comes only from that `Popped`, a different slot by (2);
+        // any other `&T` lies outside `buf`. (4) `T: Copy`, so duplicating
+        // its bytes is a copy.
         unsafe {
             // COPY: one `T` from the caller's value into its ring slot — ≤ 64 B
             // on every lane but depth (192 B `DepthTopK`) and the ruleset table
@@ -264,20 +313,29 @@ impl<T: Copy, const N: usize> Producer<T, N> {
             // ≤ 64 B warm or operator cadence — not worth a second push path).
             ::core::ptr::copy_nonoverlapping(src, dst, 1);
         }
+        let next = head.wrapping_add(1);
+        self.head = next;
         // Publishes the bytes written above.
-        self.ring
-            .head
-            .value
-            .store(head.wrapping_add(1), Ordering::Release);
+        self.ring.head.value.store(next, Ordering::Release);
         true
     }
 
-    /// Number of slots currently full (snapshot, may race).
+    /// Elements this producer has published so far (wrapping): its own
+    /// count, a plain field — no shared line is touched. Two readings tell
+    /// whether anything was published in between; [`Self::len`] cannot
+    /// (every pop moves it too) and loads the consumer's index.
+    #[inline(always)]
+    pub fn published(&self) -> usize {
+        self.head
+    }
+
+    /// Number of slots currently full (snapshot, may race) — an upper
+    /// bound: the consumer may have moved on since. Loads the consumer's
+    /// index, a cross-core read; see [`Self::published`].
     #[inline]
     pub fn len(&self) -> usize {
-        let h = self.ring.head.value.load(Ordering::Relaxed);
-        let t = self.ring.tail.value.load(Ordering::Relaxed);
-        h.wrapping_sub(t)
+        self.head
+            .wrapping_sub(self.ring.tail.value.load(Ordering::Relaxed))
     }
 
     /// True iff no slots are currently full (snapshot, may race).
@@ -294,6 +352,14 @@ impl<T: Copy, const N: usize> Producer<T, N> {
 /// Single consumer handle. `!Sync` by construction.
 pub struct Consumer<T, const N: usize> {
     ring: Arc<Ring<T, N>>,
+    /// Next position to read: the private copy of `tail`, whose only
+    /// writer this handle is (through its guards). The shared `tail` is
+    /// published from it and never read back.
+    tail: usize,
+    /// The producer's position as last loaded from `head`: a lower bound —
+    /// while it shows an element there is one, and the producer's line is
+    /// left alone. Refreshed only when it shows the ring empty.
+    head_cache: usize,
     _not_sync: PhantomData<UnsafeCell<()>>,
 }
 
@@ -312,13 +378,16 @@ impl<T: Copy, const N: usize> Consumer<T, N> {
     #[inline(always)]
     #[must_use = "dropping the guard consumes the element"]
     pub fn try_pop_ref(&mut self) -> Option<Popped<'_, T, N>> {
-        // The consumer is `tail`'s only writer (through its guards).
-        let pos = self.ring.tail.value.load(Ordering::Relaxed);
-        // Pairs with `try_push_ref`'s Release: the slot's bytes are
-        // visible before they are lent.
-        let head = self.ring.head.value.load(Ordering::Acquire);
-        if head == pos {
-            return None;
+        let pos = self.tail;
+        if pos == self.head_cache {
+            // The cache shows the ring empty: learn how far the producer
+            // has got. Pairs with `try_push_ref`'s Release: the slots'
+            // bytes are visible before they are lent.
+            let head = self.ring.head.value.load(Ordering::Acquire);
+            if head == pos {
+                return None;
+            }
+            self.head_cache = head;
         }
         // SAFETY: a slot pointer points into the `Arc`'d ring — never null.
         let slot = unsafe { NonNull::new_unchecked(self.ring.slot(pos)) };
@@ -329,12 +398,15 @@ impl<T: Copy, const N: usize> Consumer<T, N> {
         })
     }
 
-    /// Snapshot length (may race).
+    /// Snapshot length (may race) — a lower bound: the producer may have
+    /// published more since. Loads the producer's index.
     #[inline]
     pub fn len(&self) -> usize {
-        let h = self.ring.head.value.load(Ordering::Relaxed);
-        let t = self.ring.tail.value.load(Ordering::Relaxed);
-        h.wrapping_sub(t)
+        self.ring
+            .head
+            .value
+            .load(Ordering::Relaxed)
+            .wrapping_sub(self.tail)
     }
 
     /// True iff the ring is empty (snapshot, may race).
@@ -363,11 +435,13 @@ impl<T, const N: usize> Deref for Popped<'_, T, N> {
 
     #[inline(always)]
     fn deref(&self) -> &T {
-        // SAFETY: position `pos` was published (`head > pos` observed with
-        // Acquire in `try_pop_ref`), and the producer cannot write it again
-        // until `drop` stores `tail = pos + 1`. The ring outlives the guard
-        // (the borrowed `Consumer` holds its `Arc`), and the returned `&T`
-        // cannot outlive `&self`.
+        // SAFETY: position `pos` was published — the producer's Release
+        // store of a `head` past it (wrapping distance) was observed with
+        // Acquire, by this `try_pop_ref` or by the refresh that filled the
+        // cache — and the producer will not write it again until an Acquire
+        // refresh of its own observes a `tail` past `pos`, which only `drop`
+        // stores. The ring outlives the guard (the borrowed `Consumer` holds
+        // its `Arc`), and the returned `&T` cannot outlive `&self`.
         unsafe { self.slot.as_ref() }
     }
 }
@@ -375,13 +449,11 @@ impl<T, const N: usize> Deref for Popped<'_, T, N> {
 impl<T, const N: usize> Drop for Popped<'_, T, N> {
     #[inline(always)]
     fn drop(&mut self) {
+        let next = self.pos.wrapping_add(1);
+        self.cons.tail = next;
         // Every read made through this guard happens-before the producer's
         // Acquire load that observes the release.
-        self.cons
-            .ring
-            .tail
-            .value
-            .store(self.pos.wrapping_add(1), Ordering::Release);
+        self.cons.ring.tail.value.store(next, Ordering::Release);
     }
 }
 
@@ -500,6 +572,135 @@ mod tests {
         }
         assert!(ca.try_pop_ref().is_none());
         assert_eq!(cb.try_pop_ref().as_deref().copied(), Some([1, 2, 3]));
+    }
+
+    #[test]
+    fn a_stale_tail_cache_refreshes_when_the_ring_looks_full() {
+        let (mut p, mut c) = Ring::<u64, 4>::new().split();
+        for v in 0..4u64 {
+            assert!(p.try_push_ref(&v));
+        }
+        assert_eq!(p.tail_cache, 0, "no refresh while there is room");
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(0));
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(1));
+        assert_eq!(p.tail_cache, 0, "the cache still has the consumer at 0");
+        assert!(p.try_push_ref(&4), "the full-looking cache is refreshed");
+        assert_eq!(p.tail_cache, 2, "and holds what the refresh saw");
+        assert!(p.try_push_ref(&5));
+        assert_eq!(p.tail_cache, 2, "room left: no second refresh");
+        assert!(!p.try_push_ref(&6), "full for real");
+        assert_eq!(p.tail_cache, 2, "a refused push keeps the cache");
+        for want in 2..6u64 {
+            assert_eq!(c.try_pop_ref().as_deref().copied(), Some(want));
+        }
+        assert!(c.try_pop_ref().is_none());
+    }
+
+    #[test]
+    fn a_stale_head_cache_refreshes_when_the_ring_looks_empty() {
+        let (mut p, mut c) = Ring::<u64, 8>::new().split();
+        assert!(c.try_pop_ref().is_none(), "the refresh finds nothing");
+        assert_eq!(c.head_cache, 0);
+        for v in 10..13u64 {
+            assert!(p.try_push_ref(&v));
+        }
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(10));
+        assert_eq!(c.head_cache, 3, "one refresh saw all three");
+        assert!(p.try_push_ref(&99));
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(11));
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(12));
+        assert_eq!(c.head_cache, 3, "the cached elements need no refresh");
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(99));
+        assert!(c.try_pop_ref().is_none());
+        assert!(p.try_push_ref(&13));
+        assert_eq!(c.try_pop_ref().as_deref().copied(), Some(13));
+    }
+
+    /// Moves every index of a fresh ring to `base`, as if `base` elements
+    /// had passed through it — to walk the `usize` wrap.
+    fn rebase<T: Copy, const M: usize>(
+        p: &mut Producer<T, M>,
+        c: &mut Consumer<T, M>,
+        base: usize,
+    ) {
+        p.ring.head.value.store(base, Ordering::Relaxed);
+        p.ring.tail.value.store(base, Ordering::Relaxed);
+        p.head = base;
+        p.tail_cache = base;
+        c.tail = base;
+        c.head_cache = base;
+    }
+
+    #[test]
+    fn the_indices_wrap_through_usize_max() {
+        let (mut p, mut c) = Ring::<u64, 4>::new().split();
+        rebase(&mut p, &mut c, usize::MAX - 2);
+        for v in 0..4u64 {
+            assert!(p.try_push_ref(&v), "push {v} across the wrap");
+        }
+        assert!(!p.try_push_ref(&4), "full across the wrap");
+        assert_eq!(p.len(), 4);
+        assert_eq!(c.len(), 4);
+        for want in 0..2u64 {
+            assert_eq!(c.try_pop_ref().as_deref().copied(), Some(want));
+        }
+        assert!(p.try_push_ref(&4), "the refresh sees room past the wrap");
+        assert!(p.try_push_ref(&5));
+        for want in 2..6u64 {
+            assert_eq!(c.try_pop_ref().as_deref().copied(), Some(want));
+        }
+        assert!(c.try_pop_ref().is_none(), "empty past the wrap");
+        assert_eq!(p.published(), (usize::MAX - 2).wrapping_add(6));
+        assert_eq!(p.len(), 0);
+    }
+
+    #[test]
+    fn published_counts_publishes_only() {
+        let (mut p, mut c) = Ring::<u64, 2>::new().split();
+        assert_eq!(p.published(), 0);
+        assert!(p.try_push_ref(&1));
+        assert!(p.try_push_ref(&2));
+        assert!(!p.try_push_ref(&3), "full");
+        assert_eq!(p.published(), 2, "a refused push publishes nothing");
+        drop(c.try_pop_ref());
+        assert_eq!(p.published(), 2, "a pop is not a publish");
+        assert_eq!(p.len(), 1, "len sees the pop");
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn each_handle_carries_its_index_and_one_cache() {
+        let word = ::core::mem::size_of::<usize>();
+        assert_eq!(::core::mem::size_of::<Producer<u64, 4>>(), 3 * word);
+        assert_eq!(::core::mem::size_of::<Consumer<u64, 4>>(), 3 * word);
+        assert_eq!(
+            ::core::mem::size_of::<Option<Popped<'static, u64, 4>>>(),
+            ::core::mem::size_of::<Popped<'static, u64, 4>>(),
+            "the niche keeps `None` free"
+        );
+    }
+
+    #[test]
+    fn the_private_indices_match_the_published_ones() {
+        let (mut p, mut c) = Ring::<u64, 4>::new().split();
+        let mut next = 0u64;
+        let mut v = 0u64;
+        while v < 11 {
+            assert!(p.try_push_ref(&v));
+            if v % 3 != 2 {
+                assert_eq!(c.try_pop_ref().as_deref().copied(), Some(next));
+                next += 1;
+            }
+            v += 1;
+        }
+        assert_eq!(p.head, p.ring.head.value.load(Ordering::Relaxed));
+        assert_eq!(c.tail, c.ring.tail.value.load(Ordering::Relaxed));
+        ::core::mem::forget(c.try_pop_ref().expect("an element"));
+        assert_eq!(
+            c.tail,
+            c.ring.tail.value.load(Ordering::Relaxed),
+            "a forgotten guard advances neither"
+        );
     }
 
     #[test]
@@ -622,6 +823,8 @@ mod tests {
         HoldAndPush(u32),
         /// Forget a guard: consumes nothing.
         ForgetOne,
+        /// Both handles' occupancy, and the producer's publish count.
+        Len,
     }
 
     fn op() -> impl proptest::strategy::Strategy<Value = Op> {
@@ -631,15 +834,22 @@ mod tests {
             Just(Op::Pop),
             any::<u32>().prop_map(Op::HoldAndPush),
             Just(Op::ForgetOne),
+            Just(Op::Len),
         ]
     }
 
     proptest::proptest! {
         #[test]
         #[cfg_attr(miri, ignore)]
-        fn the_ring_is_a_bounded_fifo(ops in proptest::collection::vec(op(), 0..256)) {
+        fn the_ring_is_a_bounded_fifo(
+            ops in proptest::collection::vec(op(), 0..256),
+            before_wrap in 0usize..64,
+        ) {
             let (mut p, mut c) = Ring::<u32, 8>::new().split();
+            let base = usize::MAX - before_wrap;
+            rebase(&mut p, &mut c, base);
             let mut model: VecDeque<u32> = VecDeque::new();
+            let mut published = 0usize;
             for op in ops {
                 match op {
                     Op::Push(v) => {
@@ -647,6 +857,7 @@ mod tests {
                         proptest::prop_assert_eq!(ok, model.len() < 8);
                         if ok {
                             model.push_back(v);
+                            published += 1;
                         }
                     }
                     Op::Pop => {
@@ -660,6 +871,7 @@ mod tests {
                             proptest::prop_assert_eq!(ok, model.len() < 8);
                             if ok {
                                 model.push_back(v);
+                                published += 1;
                             }
                             drop(g);
                             model.pop_front();
@@ -672,7 +884,22 @@ mod tests {
                             ::core::mem::forget(g);
                         }
                     }
+                    Op::Len => {
+                        proptest::prop_assert_eq!(p.len(), model.len());
+                        proptest::prop_assert_eq!(c.len(), model.len());
+                        proptest::prop_assert_eq!(p.published().wrapping_sub(base), published);
+                    }
                 }
+                // The private indices are the published ones; each cache
+                // lags its side, never leads it.
+                proptest::prop_assert_eq!(p.head, p.ring.head.value.load(Ordering::Relaxed));
+                proptest::prop_assert_eq!(c.tail, c.ring.tail.value.load(Ordering::Relaxed));
+                let room = p.head.wrapping_sub(p.tail_cache);
+                proptest::prop_assert!(room <= 8);
+                proptest::prop_assert!(c.tail.wrapping_sub(p.tail_cache) <= room);
+                proptest::prop_assert!(
+                    c.head_cache.wrapping_sub(c.tail) <= p.head.wrapping_sub(c.tail)
+                );
             }
         }
     }

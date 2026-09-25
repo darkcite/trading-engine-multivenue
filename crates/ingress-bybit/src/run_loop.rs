@@ -1044,7 +1044,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                 continue;
             };
             loop {
-                let n_before = producer.len();
+                let n_before = producer.published();
                 let state_before = c.drv.state();
                 if drive_one(
                     t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
@@ -1059,7 +1059,7 @@ pub fn run_multi<T: Transport, C: Capture>(
                     c.kill(now_ns(), status, moved);
                     break;
                 }
-                if producer.len() == n_before && c.drv.state() == state_before {
+                if producer.published() == n_before && c.drv.state() == state_before {
                     break;
                 }
             }

@@ -167,11 +167,16 @@ in the script; `ai` = 48 is the floor every name includes).
   copies once into the slot, `try_pop_ref` lends it in place through a
   `Popped` guard, the by-value API is gone; per-slot `UnsafeCell`, 128 B
   index padding, `split()` once (Miri-clean, Stacked and Tree Borrows);
-  the engine reads all nine lanes in place. Open: `make bench-check`
-  cannot compare on this Mac (its script needs Python ≥ 3.10 and reads
-  a criterion path layout this criterion does not write); a
-  cached-index (Rigtorp) ring — the ping-pong round trip is ~20 % slower
-  in place, the stream faster.
+  the engine reads all nine lanes in place. Then (2026-09-25, risk-policy
+  "core-ring caches the other side's index") each handle keeps its own
+  index private and caches the other side's (Rigtorp): the M4 round trip
+  170 → ~100 ns, the saturated stream 50 → 4–9 ns, same-core push+pop
+  +0.5 ns; the ingress drain loops judge progress by
+  `Producer::published()`. Open: `make bench-check` cannot compare on
+  this Mac (its script needs Python ≥ 3.10 and reads a criterion path
+  layout this criterion does not write); the I-3 drain loops count only
+  ticks as progress (an rx-full step of non-tick frames waits for the
+  next readiness edge) and cap no steps per connection.
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -215,8 +220,8 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **Gates at HEAD (ZC pass A, 2026-09-24; Foundry and worker pytest as of
-  the HYPARB merge):** nextest 3125 (5
+- **Gates at HEAD (the cached-index ring, 2026-09-25; Foundry and worker
+  pytest as of the HYPARB merge):** nextest 3131 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
   and `hyperevm_live_smoke` among them) · alloc 73/73 at the gates' pins
   (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
@@ -239,8 +244,8 @@ in the script; `ai` = 48 is the floor every name includes).
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
   (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`)
-  · live smokes 60 s (ZC pass A, 2026-09-25): MEXC and Binance, 0 parse
-  errors, 0 reconnects, 0 ring drops
+  · live smokes 60 s (the cached-index ring, 2026-09-25): MEXC and
+  Binance, 0 parse errors, 0 reconnects, 0 ring drops
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known

@@ -1158,7 +1158,7 @@ pub fn run<T: Transport, C: Capture, const CAP: usize>(
             }
         }
         loop {
-            let n_before = producer.len();
+            let n_before = producer.published();
             let state_before = drv.state();
             let phase_before = drv.phase();
             if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
@@ -1171,7 +1171,7 @@ pub fn run<T: Transport, C: Capture, const CAP: usize>(
             if drv.state() == State::Closed {
                 return RunResult::Disconnected;
             }
-            if producer.len() == n_before
+            if producer.published() == n_before
                 && drv.state() == state_before
                 && drv.phase() == phase_before
             {

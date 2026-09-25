@@ -2235,7 +2235,7 @@ pub fn run<T: Transport, C: Capture>(
 
         // Tight inner drain (see ingress-polymarket for rationale).
         loop {
-            let n_before = producer.len();
+            let n_before = producer.published();
             let state_before = drv.state();
             if let Err(e) = drive_one(
                 transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx,
@@ -2250,7 +2250,7 @@ pub fn run<T: Transport, C: Capture>(
             if drv.state() == State::Closed {
                 return RunResult::Disconnected;
             }
-            if producer.len() == n_before && drv.state() == state_before {
+            if producer.published() == n_before && drv.state() == state_before {
                 break;
             }
         }

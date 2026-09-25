@@ -857,7 +857,7 @@ pub fn run<T: Transport, C: Capture>(
         // idle bursts where one poll surfaces multiple frames'
         // worth of buffered bytes.
         loop {
-            let n_before = producer.len();
+            let n_before = producer.published();
             let state_before = drv.state();
             if let Err(_e) = drive_one(
                 transport, drv, host, path, producer, symbol_map, status, capture,
@@ -869,7 +869,7 @@ pub fn run<T: Transport, C: Capture>(
             }
             // Progress iff we produced a tick OR moved the
             // driver's state machine forward.
-            if producer.len() == n_before && drv.state() == state_before {
+            if producer.published() == n_before && drv.state() == state_before {
                 break;
             }
         }
