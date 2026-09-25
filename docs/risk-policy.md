@@ -3040,6 +3040,8 @@ step only when an engine pop happened to land inside it); and the
 multi-connection loops (Binance, Bybit, MEXC) have no per-connection step
 cap. Both want their own change — consumed rx bytes and the other rings'
 publishes counted as progress; a step cap with a zero-timeout re-poll.
+*Fixed, with a read that stopped on a full rx as the progress signal: "The
+I-3 drain loops read past a full rx", below.*
 
 **Proof.** 21 core-ring tests. New: a stale tail cache refreshes when the
 ring looks full (a refused push keeps it); a stale head cache refreshes
@@ -3116,6 +3118,87 @@ Gates: `make bench-check` passes; against the old baseline it fails, as it
 should (book +114 %, latency-arb +43 %, the `_ns` key missing). The
 script's error paths — no baseline, a non-positive value, no tolerance, a
 missing sample, a regression, no criterion directory — exit as documented.
+This work built no engine binary.
+
+### The I-3 drain loops read past a full rx (2026-09-25)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the I-3 item of the three).
+
+**What was wrong** (the cached-ring pass's open notes, above). A drive step
+reads until rx is full or the transport says `WouldBlock`. The ten loops
+drove again only when a step published a tick or moved its state, so a
+step that stopped on a *full* rx and published nothing — a run of pongs,
+acks, heartbeats, events or options summaries, or ticks a full ring
+dropped — left the rest in the kernel or in rustls, and an edge-triggered
+poller never announces bytes that already arrived: they waited for the
+next packet or the 50 ms poll timeout. And the three multi-connection loops
+(Binance, Bybit, MEXC) drained each slot without a bound, so one slot's
+backlog held every other slot, the keepalives, the capture flush and the
+stop flag.
+
+**What changed.** `core_net::drain` holds what the loops share.
+`fill_rx` — the read half of every `drive_one`, one copy where there were
+nine — reports `RxFill::Full` when a read took bytes and stopped on a full
+rx; a read that finds rx already full took nothing and reports `Drained`,
+since driving again cannot shrink a frame larger than rx. `drive_one`
+returns that as a bool, and each crate's new `drive_until_idle` — one
+body, the `core_net::drain_until_idle!` macro (each crate's `drive_one`
+takes its own lanes, and a closure is off the table on this path) —
+drives again while a step filled rx, published, or moved its state
+(HyperEVM: or its phase), for at most `DRAIN_STEP_CAP` = 8 steps. A capped
+drain ends `Drained::Capped` and the next poll does not sleep
+(`poll_timeout`); every live connection is driven every iteration anyway,
+so the capped one resumes once the others have had their turn. Eight steps bound one turn at
+eight rx buffers: 0.5 MiB (Binance spot, Polymarket, RPC) to 32 MiB (OKX,
+Deribit). The kill and reconnect paths are unchanged; OKX and Deribit still
+record the failing step's io-kind (`Drained::Failed(kind)`). Binance dropped
+its private copy of `IoBuf` for core-net's — the same type — and its
+sentinel SUBSCRIBE now goes through `queue_masked_text_frame_parts`.
+
+Why "filled rx" rather than "read any bytes": a step that read to
+`WouldBlock` has taken everything that had arrived, and anything newer
+arrives with its own readiness edge, so counting every read would buy one
+wasted drive — one read syscall — per wake. The publish criterion stays:
+HyperEVM's snapshot phases emit as the engine frees ring room, and a step
+that published costs one more read, as before.
+
+**Proof.** core-net: `fill_rx` drained at `WouldBlock`; `Full` with input
+left below; an exact fill reports `Full` and the next read decides; rx
+already full is not progress; EOF keeps the bytes before it. The macro,
+over a scripted connection: a full read, a publish and a state change
+each count as progress; a step without any ends the drain at once; a
+drain that keeps progressing stops at exactly `DRAIN_STEP_CAP` steps and
+the next one resumes; a close or a failure ends it at the step that saw
+it. All nine crates: two rx buffers of Pongs with a tick behind them (a
+signal on RPC, a swap on HyperEVM) are delivered by one drain — on the old
+criterion the test fails (checked by mutation on Polymarket) — and eight
+end `Capped` with the tick still below; the next drain delivers it. And
+Polymarket's `run`, fed a backlog one rx past the cap that no readiness
+edge will announce, delivers its tick well inside one `POLL_IDLE`; with
+`Capped` not wired to the zero-timeout poll it takes 50.7 ms and the test
+fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES, all correctness
+areas clean — no path stalls input or spins, `repoll_now` is set and reset
+right in all ten loops, no slot is starved or forgotten, the close and
+error paths are unchanged. Acted on: the `run`-level re-poll test, the
+macro in place of nine copies of the loop, three doc comments. Left open,
+pre-existing, each its own change: Binance (its 2 MiB options slot
+included), OKX, Polymarket, RPC and HyperEVM stall on a frame larger than
+rx until the idle timeout (Bybit, Deribit, Hyperliquid and MEXC fail fast
+on one); every `drive_one` marks `Closed` on EOF before parsing the
+complete frames that arrived with it; the multi-connection re-poll is
+tested through the drain, not end to end (a `TestTransport` slot cannot
+finish a handshake inside `run_multi`); and the exec lane's user-WS fill
+(`exec-hyperliquid` `userws_conn`) reads only on a readiness event, the
+same gap outside this change.
+
+Gates: clippy clean; nextest 3150 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31 new=0
+paid=0`; license-check OK; `cargo +nightly fuzz build` OK; live smokes
+60 s, the engine untouched — MEXC 31 195 messages (1 575 ticks), Binance
+92 037 (92 876 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
 This work built no engine binary.
 
 ## E6 — the risk gate and the kill switches

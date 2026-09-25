@@ -7,7 +7,8 @@
 //! TWO classes (spot `/ws` protobuf, futures `/edge` JSON) run on ONE
 //! thread with ONE tick producer and ONE venue-event producer via
 //! [`run_multi`] — the Bybit spot/linear multi-conn shape beat for beat
-//! (slot index = `mio::Token`, 50 ms poll, the six raw-index passes,
+//! (slot index = `mio::Token`, the `core_net::drain` poll — 50 ms idle,
+//! zero after a capped drain — the six raw-index passes,
 //! the WS2 establishment budget, `Backoff`, `Keepalive`); the
 //! driver's [`MexcClass`] picks the parser, the subscribe renderer, the
 //! ping payload and the confirmation law.
@@ -47,8 +48,8 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Status, Transport, WsOpcode,
-    WsReadResult,
+    ws_unmask_in_place, ws_write_pong, Drained, HandshakeResult, IoBuf, RxFill, Status, Transport,
+    WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, NsTs};
@@ -392,6 +393,10 @@ impl Driver {
 
 /// Pump the transport once and advance the state machine. Zero-alloc
 /// once the handshake has completed.
+///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
@@ -403,9 +408,12 @@ pub fn drive_one<T: Transport, C: Capture>(
     event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+    }
 
     match drv.state {
         State::Connecting => {}
@@ -426,7 +434,31 @@ pub fn drive_one<T: Transport, C: Capture>(
     }
 
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive one connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run, so
+/// one connection's backlog cannot starve the others on this thread.
+#[allow(clippy::too_many_arguments)]
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, event_tx, event_mask, status, capture),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -464,24 +496,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -1545,6 +1559,8 @@ pub fn run_multi<T: Transport, C: Capture>(
     capture: &mut C,
     mut connect: impl FnMut(usize) -> Option<T>,
 ) -> RunResult {
+    // Set when a slot's drain hit the step cap: poll without sleeping.
+    let mut repoll_now = false;
     while !stop.load(core::sync::atomic::Ordering::Relaxed) {
         // 1. Reconnect pass — one dial per iteration, oldest-due first.
         let now = now_ns();
@@ -1584,11 +1600,12 @@ pub fn run_multi<T: Transport, C: Capture>(
         }
 
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
         }
+        repoll_now = false;
 
         // 2. Readiness → per-slot pump.
         for ev in events.iter() {
@@ -1606,31 +1623,24 @@ pub fn run_multi<T: Transport, C: Capture>(
             }
         }
 
-        // 3. Drain every live slot (bounded no-progress loop).
+        // 3. Drain every live slot (I-3, core_net::drain), at most
+        //    DRAIN_STEP_CAP steps each; a capped slot is driven again next
+        //    iteration, after a poll that does not sleep.
         for i in 0..conns.len() {
             let c = &mut conns[i];
             let Some(t) = c.transport.as_mut() else {
                 continue;
             };
-            loop {
-                let n_before = producer.published();
-                let state_before = c.drv.state();
-                if drive_one(
-                    t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
-                )
-                .is_err()
-                {
-                    c.kill(now_ns(), status, false);
-                    break;
-                }
-                if c.drv.state() == State::Closed {
+            match drive_until_idle(
+                t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
+            ) {
+                Drained::Idle => {}
+                Drained::Capped => repoll_now = true,
+                Drained::Closed => {
                     let moved = c.drv.sub_count() > 0;
                     c.kill(now_ns(), status, moved);
-                    break;
                 }
-                if producer.published() == n_before && c.drv.state() == state_before {
-                    break;
-                }
+                Drained::Failed(_) => c.kill(now_ns(), status, false),
             }
         }
 
@@ -1783,7 +1793,7 @@ mod tests {
         prod: &mut Producer<Tick, TICK_RING_CAP>,
         status: &IngressStatus,
         cap: &mut C,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let (mut etx, _erx) = event_ring_pair();
         super::drive_one(
             t,
@@ -2009,6 +2019,46 @@ mod tests {
     }
 
     // ---- spot data ---------------------------------------------------
+
+    /// I-3: a burst of non-tick frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the tick behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (`run_multi` re-polls at once and the
+    /// other slots get their turn) and the next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let frame = binary(&enc::wrapper(enc::CHANNEL_BOOK, b"BTCUSDT", 315, &enc::book_body()));
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = steady(MexcClass::Spot);
+            let (mut prod, mut cons) = ring_pair();
+            let (mut etx, _erx) = event_ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            t.inject_incoming(&frame);
+            for expect in [first, Drained::Idle] {
+                assert_eq!(
+                    drive_until_idle(
+                        &mut t,
+                        &mut d,
+                        b"h",
+                        b"/",
+                        &mut prod,
+                        &mut etx,
+                        core_types::EVENT_LANE_FUNDING,
+                        &status,
+                        &mut NullCapture,
+                    ),
+                    expect
+                );
+                if expect == Drained::Capped {
+                    assert!(cons.try_pop_ref().is_none(), "the tick still waits below the cap");
+                }
+            }
+            assert_eq!(cons.try_pop_ref().expect("the tick behind the burst").sym, SYM_BTC);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
+    }
 
     #[test]
     fn spot_golden_book_push_emits_the_exact_tick() {

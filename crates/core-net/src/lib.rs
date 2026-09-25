@@ -35,6 +35,7 @@
 
 pub mod backoff;
 pub mod boot_http;
+pub mod drain;
 pub mod error;
 pub mod http1;
 pub mod https_post;
@@ -46,6 +47,7 @@ pub mod ws_frame;
 pub mod ws_handshake;
 
 pub use backoff::{Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS};
+pub use drain::{fill_rx, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP, POLL_IDLE};
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
 pub use iobuf::IoBuf;
 pub use keepalive::{

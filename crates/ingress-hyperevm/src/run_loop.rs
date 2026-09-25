@@ -49,9 +49,9 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_binary_frame, queue_masked_binary_frame_parts,
     read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf,
-    Keepalive, KeepaliveAction, PendingTable, ReqKind, Status, SubErr, SubId, SubTable, Transport,
-    WsOpcode, WsReadResult,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
+    HandshakeResult, IoBuf, Keepalive, KeepaliveAction, PendingTable, ReqKind, RxFill, Status,
+    SubErr, SubId, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_parse::{find_field, skip_byte, skip_ws};
 use core_ring::Producer;
@@ -397,7 +397,9 @@ impl Driver {
 // ---------------------------------------------------------------
 
 /// Pump the transport once and advance both state machines. Zero-alloc
-/// after the handshake.
+/// after the handshake. Returns `Ok(true)` when this step's read stopped
+/// on a full rx ([`RxFill::Full`]): input may still wait below it, so the
+/// caller drives again ([`core_net::drain`]).
 ///
 /// # Errors
 /// A transport error, a protocol error, or a snapshot the archive probe
@@ -410,9 +412,12 @@ pub fn drive_one<T: Transport, C: Capture, const CAP: usize>(
     producer: &mut Producer<Signal, CAP>,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+    }
 
     match drv.state {
         State::Connecting | State::Closed => {}
@@ -440,7 +445,29 @@ pub fn drive_one<T: Transport, C: Capture, const CAP: usize>(
     }
 
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no signal,
+/// neither its state nor its phase moved (the phase machine emits as the
+/// engine frees ring room) — or [`core_net::DRAIN_STEP_CAP`] steps have
+/// run.
+fn drive_until_idle<T: Transport, C: Capture, const CAP: usize>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Signal, CAP>,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, status, capture),
+        published: producer.published(),
+        key: (drv.state(), drv.phase()),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once TLS is ready.
@@ -703,24 +730,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -1140,10 +1149,11 @@ pub fn run<T: Transport, C: Capture, const CAP: usize>(
         return RunResult::Error;
     }
     let mut last_interest = transport.interest();
+    let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
@@ -1157,25 +1167,18 @@ pub fn run<T: Transport, C: Capture, const CAP: usize>(
                 Err(_) => return RunResult::Error,
             }
         }
-        loop {
-            let n_before = producer.published();
-            let state_before = drv.state();
-            let phase_before = drv.phase();
-            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
+        // I-3 (core_net::drain): drive until a step leaves nothing
+        // behind; re-poll at once if the step cap cut a backlog short.
+        match drive_until_idle(transport, drv, host, path, producer, status, capture) {
+            Drained::Idle => repoll_now = false,
+            Drained::Capped => repoll_now = true,
+            Drained::Closed => return RunResult::Disconnected,
+            Drained::Failed(_) => {
                 return if drv.archive_dishonest {
                     RunResult::ArchiveDishonest
                 } else {
                     RunResult::Error
                 };
-            }
-            if drv.state() == State::Closed {
-                return RunResult::Disconnected;
-            }
-            if producer.published() == n_before
-                && drv.state() == state_before
-                && drv.phase() == phase_before
-            {
-                break;
             }
         }
         capture.maybe_flush(now_ns());
