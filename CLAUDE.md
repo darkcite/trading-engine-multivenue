@@ -172,11 +172,12 @@ in the script; `ai` = 48 is the floor every name includes).
   index private and caches the other side's (Rigtorp): the M4 round trip
   170 → ~100 ns, the saturated stream 50 → 4–9 ns, same-core push+pop
   +0.5 ns; the ingress drain loops judge progress by
-  `Producer::published()`. Open: `make bench-check` cannot compare on
-  this Mac (its script needs Python ≥ 3.10 and reads a criterion path
-  layout this criterion does not write); the I-3 drain loops count only
-  ticks as progress (an rx-full step of non-tick frames waits for the
-  next readiness edge) and cap no steps per connection.
+  `Producer::published()`. `make bench-check` compares (2026-09-25,
+  risk-policy "`make bench-check` compares"): results found by
+  criterion's own ids, a missing or stale one fails, the baseline re-taken
+  on the M4. Open: the I-3 drain loops count only ticks as progress (an
+  rx-full step of non-tick frames waits for the next readiness edge) and
+  cap no steps per connection.
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -226,6 +227,7 @@ in the script; `ai` = 48 is the floor every name includes).
   and `hyperevm_live_smoke` among them) · alloc 73/73 at the gates' pins
   (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
   child helper) · clippy clean · `make license-check` OK · `make
+  bench-check` OK (the M4 baseline, 2026-09-25) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all nine ingress crates and the HYPARB crates) ·
   Foundry 11 unit +

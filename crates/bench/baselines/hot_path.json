@@ -1,17 +1,24 @@
 {
-  "_comment": "Hot-path criterion baseline. Numbers from 2026-05-19 post-fix run on Linux aarch64 sandbox, except `ring/push_ref_pop_ref_tick`: the Apple M4 Pro — 2.53 ns on 2026-09-24 (ZC pass A: the in-place ring API replaced the by-value `ring/push_pop_tick`, 5.25 ns on the sandbox), re-baselined 2026-09-25 to 2.99 ns when core-ring started caching the other side's index (docs/risk-policy.md): +0.5 ns same-core for the private indices, the two-thread round trip 170 -> ~105 ns. Each entry: median ns. Re-baseline by running `make bench` and updating this file when the regression is intentional (e.g. a new feature on the hot path).",
-  "_source": "docs/hot-path-latency.md",
+  "_comment": [
+    "Hot-path criterion baseline: the median ns of each bench in crates/bench/benches/hot_path.rs, keyed by the id the bench gives `bench_function` (criterion's `full_id`), gated by `make bench-check` (check_regression.py) at `tolerance_pct`.",
+    "Host: the Apple M4 Pro. Re-baselined 2026-09-25 at 5f2140f, each value the median of three `make bench-check` runs (warm-up 1 s, 2 s, 50 samples) with the launchd engine running, as it always is. The values before were a 2026-05-19 Linux aarch64 sandbox run that the check never compared on this Mac: it looked for results under a path this criterion does not write.",
+    "book/apply_n8_middle and strategy/latency_arb_on_tick_no_fire have not been the sandbox's 0.94 / 1.66 ns since phase 8a: the initial commit's code (02db7a6) measures 1.07 / 1.69 ns on the M4, 5f2140f 1.99 / 2.47 ns. Both benches repeat one tick, so every apply after the first is stale, and D10 (503606f) made a stale apply count itself (`stale_drops += 1`, a read-modify-write per call) where it used to return.",
+    "Not gated: ring/spsc_rtt_tick and ring/spsc_stream_tick, two threads that macOS places as it likes (103-122 ns and 9-11 ns across sessions); docs/risk-policy.md records them.",
+    "Re-baseline when a change moves a number on purpose: three `make bench-check` runs, each value their median, and the reason recorded here and in docs/risk-policy.md."
+  ],
+  "_source": "docs/risk-policy.md, \"make bench-check compares (2026-09-25)\"",
   "tolerance_pct": 15,
   "samples": {
     "clock/now_ns": 13.7,
-    "ring/push_ref_pop_ref_tick": 2.99,
-    "latency/record_1us": 2.65,
-    "latency/record_1ms": 2.68,
-    "metrics/counter_inc_1": 1.58,
-    "book/apply_n8_middle": 0.94,
-    "cooldown/allow": 0.51,
-    "dispatcher/queued_submit": 1.54,
-    "strategy/latency_arb_on_tick_no_fire": 1.66,
-    "signer/sign_order_full_ns": 20490
+    "ring/push_ref_pop_ref_tick": 3.02,
+    "ring/push_ref_pop_ref_depth": 4.89,
+    "latency/record_1us": 2.14,
+    "latency/record_1ms": 2.16,
+    "metrics/counter_inc_1": 1.77,
+    "book/apply_n8_middle": 1.99,
+    "cooldown/allow": 0.524,
+    "dispatcher/queued_submit": 0.581,
+    "strategy/latency_arb_on_tick_no_fire": 2.47,
+    "signer/sign_order_full": 19000
   }
 }

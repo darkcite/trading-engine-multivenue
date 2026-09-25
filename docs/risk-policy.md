@@ -2938,7 +2938,9 @@ hand: the ring bench −0.8 % against its new baseline; the benches this pass
 does not touch (`book/apply_n8_middle` 2.01 ns, the latency-arb callback
 2.37 ns) read the same as at `0990e4f` on this host (1.96 ns, 2.33 ns) —
 their distance from the sandbox baseline is the host, not a regression.
-The script's repair is left to the operator.
+The script's repair is left to the operator. *Repaired, and that distance
+measured: it is D10's stale-drop count, not the host — "`make
+bench-check` compares", below.*
 
 **The auditor on the pass** (`zero-copy-auditor`, Opus 5.5): PASS — RX = 4
 against the target of 3 (the extra one core-net's escalated rustls copy),
@@ -3065,6 +3067,56 @@ paid=0`, the baseline byte-identical; license-check OK; `cargo +nightly fuzz
 build` OK; live smokes 60 s, the engine untouched — MEXC 31 245 messages
 (1 719 ticks), Binance 44 785 (45 610 ticks), 0 parse errors, 0 reconnects,
 0 drops on every ring. The release engine binary was not rebuilt.
+
+### `make bench-check` compares (2026-09-25)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the bench-check item of the three).
+
+**What was wrong.** `check_regression.py` could not run on this Mac, and
+could not have compared anything if it had: its `float | None` annotation
+needs Python ≥ 3.10 (the Mac's is 3.9.6); it looked for results under
+`target/criterion/<group>/<name>/`, where criterion 0.5 files
+`bench_function("ring/push_ref_pop_ref_tick")` under
+`ring_push_ref_pop_ref_tick/`; its `_ns`-suffix rule turned `clock/now_ns`
+into `clock/now`; and a sample with no result printed a WARNING, then "OK".
+The baseline beside it was a 2026-05-19 Linux sandbox run.
+
+**What it does now.** It finds each result by the id criterion records in
+the result's own `new/benchmark.json` (`full_id`), never by path, and the
+baseline's keys are those ids exactly (`signer/sign_order_full_ns` is now
+`signer/sign_order_full`; the suffix rule is gone). A baselined sample with
+no result fails the check, and so, under `--since`, does a result written
+before the run began — one left from an earlier run, or from a bench since
+deleted, cannot stand in for this run's; `make bench-check` passes its
+start time. Samples faster than the baseline by more than the tolerance are
+listed (re-baseline, or a slide back to the old number passes unseen), and
+benches that ran without a baseline are named. Exit 0 pass, 1 regression
+or missing result, 2 unusable baseline. Python ≥ 3.9, full imports only.
+
+**The baseline, on the M4.** Each value the median of three `make
+bench-check` runs at `5f2140f`, with the launchd engine running as it
+always is; a fourth run against it: all 11 within 1.3 %. The single-thread
+`ring/push_ref_pop_ref_depth` joins the gate. The two-thread ring benches
+stay out: macOS places their threads, and between sessions they moved
+103–122 ns (round trip) and 9–11 ns (stream) with no code change.
+
+**A correction.** ZC pass A (above) read `book/apply_n8_middle` (2.01 ns)
+and the latency-arb callback (2.37 ns) against the sandbox's 0.94 /
+1.66 ns and called the distance the host. It is not: the initial commit's
+code (`02db7a6`), benched on this M4 in the same hour, reads 1.07 /
+1.69 ns. The rise is phase 8a's D10 (`503606f`): a stale apply now counts
+itself (`stale_drops += 1`, a read-modify-write per call) where it used to
+return, and both benches repeat one tick, so every apply after the first
+is stale. That is the policy — D10 never drops silently — not a regression
+to undo; it does mean both benches time the stale path, not an apply (a
+bench of the applied path would be a new id).
+
+Gates: `make bench-check` passes; against the old baseline it fails, as it
+should (book +114 %, latency-arb +43 %, the `_ns` key missing). The
+script's error paths — no baseline, a non-positive value, no tolerance, a
+missing sample, a regression, no criterion directory — exit as documented.
+This work built no engine binary.
 
 ## E6 — the risk gate and the kill switches
 

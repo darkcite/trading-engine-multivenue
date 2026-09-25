@@ -17,7 +17,7 @@ help:
 	@echo "  copy-audit      zero-copy ratchet: scripts/copy-audit.sh vs its baseline (offline, fast)"
 	@echo "  fuzz-quick      cargo fuzz run polymarket_clob_frame -- -max_total_time=60"
 	@echo "  bench           cargo bench --workspace"
-	@echo "  bench-check     diff criterion output against crates/bench/baselines/*.json"
+	@echo "  bench-check     gate the hot_path bench against crates/bench/baselines/hot_path.json"
 	@echo "  coverage        cargo llvm-cov --workspace --html (line + branch coverage)"
 	@echo "  run-paper       cargo run --release -p cli -- run --paper --env-file ./.env"
 	@echo "  py-test         cd claude-worker && uv run pytest"
@@ -78,11 +78,14 @@ bench:
 	cargo bench --workspace
 
 bench-check:
-	# Run the hot_path bench and diff against the checked-in baseline.
-	# Exits non-zero if any sample regresses more than `tolerance_pct`.
+	# Run the hot_path bench and gate it against the checked-in baseline
+	# (crates/bench/baselines/hot_path.json, medians on the Apple M4 Pro).
+	# Fails if a sample regresses beyond `tolerance_pct`, or has no result
+	# from THIS run: --since rejects results written before it started.
+	since=$$(date +%s) && \
 	cargo bench -p bench --bench hot_path -- \
-		--warm-up-time 1 --measurement-time 2 --sample-size 50
-	python3 crates/bench/baselines/check_regression.py
+		--warm-up-time 1 --measurement-time 2 --sample-size 50 && \
+	python3 crates/bench/baselines/check_regression.py --since "$$since"
 
 coverage:
 	# Requires `cargo install cargo-llvm-cov` (one-time). Writes HTML
