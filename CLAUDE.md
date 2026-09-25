@@ -239,8 +239,8 @@ in the script; `ai` = 48 is the floor every name includes).
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
   (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`)
-  · live smokes 60 s (ZC pass B; pass A's wait on LuLu allowing the
-  rebuilt smoke binaries): MEXC and Binance, 0 parse errors, 0 reconnects
+  · live smokes 60 s (ZC pass A, 2026-09-25): MEXC and Binance, 0 parse
+  errors, 0 reconnects, 0 ring drops
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known

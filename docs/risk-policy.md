@@ -2959,12 +2959,15 @@ Gates after the pass: clippy clean; nextest 3125 passed (5 skipped); alloc 73/73
 ring gates, one of them the 192 B depth lane); `make copy-audit`
 `hits=31 baselined=31 new=0 paid=0`, the baseline byte-identical
 (sha256 `caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK (no
-parser changed). **Live smokes: pending.** LuLu blocks the rebuilt smoke
-binaries' outbound connections until the operator allows them — both
-timed out at their boot REST call, as pass B's first runs did, while curl
-from the same Mac reached both venues — so the pass was committed with
-the MEXC and Binance smokes still to run before the deploy. The release
-engine binary was not rebuilt.
+parser changed). Live smokes 60 s, the engine untouched, every element
+through the in-place rings: MEXC 31 176 messages (1 594 ticks, funding on
+the event lane), Binance 27 334 (28 159 ticks — four USDⓈ-M books, spot,
+16 options; markPrice and funding events; 59 summaries per option on the
+opt lane), both 0 parse errors, 0 reconnects and 0 drops on every ring.
+They ran on 2026-09-25, after the commit: LuLu had blocked the rebuilt
+smoke binaries until the operator allowed them (both first timed out at
+the boot REST call while curl from the same Mac reached both venues). The
+release engine binary was not rebuilt.
 
 ## E6 — the risk gate and the kill switches
 
