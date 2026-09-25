@@ -192,8 +192,10 @@ case "${1:-}" in
     kv_off HYPARB_LIVE "$work_conf"
     kv_set HYPARB_TOML "$PAPER_TOML" "$work_conf"
     kv_set EVM_TESTNET 1 "$work_conf"
+    # Paper is the runbook's shadow (plan §16.18): testnet writes judged
+    # on mainnet pool reads (O-H12) unless the operator had set otherwise.
     hyb="$(kv_tagged EVM_HYBRID "$work_conf")"
-    [ -n "$hyb" ] && kv_set EVM_HYBRID "$hyb" "$work_conf"
+    [ -n "$(kv_get EVM_HYBRID)" ] || kv_set EVM_HYBRID "${hyb:-1}" "$work_conf"
     if [ -n "$arm" ]; then
       kv_set ARM_LIVE "$arm" "$work_conf"
     else
