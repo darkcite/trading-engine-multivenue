@@ -332,8 +332,9 @@ const fn dec_digits(mut v: u64) -> usize {
 /// ```
 ///
 /// Returns the number of bytes written. Fails with
-/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request — never
-/// allocates.
+/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request, and with
+/// [`HttpErr::BadHead`] on a field that would break the head (the
+/// framing law of [`write_request_head`]) — never allocates.
 #[inline]
 pub fn write_get_request(
     dst: &mut [u8],
@@ -372,8 +373,9 @@ pub fn write_get_request(
 /// followed by the body bytes. Needed for venue REST endpoints that are
 /// POST-only (Hyperliquid `/info` — plan §8.1). Returns the total number
 /// of bytes written (headers + body). Fails with
-/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request — never
-/// allocates.
+/// [`HttpErr::BufferTooSmall`] if `dst` can't fit the request, and with
+/// [`HttpErr::BadHead`] on a field that would break the head (the
+/// framing law of [`write_request_head`]) — never allocates.
 #[inline]
 pub fn write_post_request(
     dst: &mut [u8],

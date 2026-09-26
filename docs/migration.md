@@ -65,7 +65,10 @@ Each entry is atomic: one version bump per section. Do not batch.
 
 - **On-disk / config / wire formats:** none.
 - **API:** additive. `HttpErr` and `PostErrKind` each gain a variant.
-  Nothing outside core-net matched either exhaustively.
+  Outside core-net only the `http1_response` fuzz target matched one
+  exhaustively (the fuzz crate is its own workspace, so no workspace gate
+  builds it); it now covers `BadHead` and checks the framing law on every
+  input — `BadHead` exactly when a field would break the head.
 
 **Migration steps**
 
