@@ -3244,6 +3244,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     icdp: Option<&strategy_icdp::IcdpParams>,
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
+    har: Option<&crate::har_boot::HarBoot>,
 ) -> EngineLoopResult {
     let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if hyparb.is_some() {
@@ -3569,6 +3570,17 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             table_hash: boot.table.hash,
             descriptors: boot.descriptors.clone(),
         });
+    }
+    // HAR H3.4: the long-tenor HAR series — configured, restored and told
+    // here, beside the regime detector (same seat, same 1 s poll). No
+    // member reads them (plan law L4); a refusal turns the service off and
+    // never the boot (`har_boot`'s failure isolation). The anchor is taken
+    // here, once, like every other member's minute grid.
+    if let Some(hb) = har {
+        let anchor = core_time::WallAnchor::now();
+        if crate::har_boot::install(&mut set, hb, anchor, core_time::now_ns()) {
+            obs.har_state_paths = hb.series.iter().map(|s| s.state_path.clone()).collect();
+        }
     }
     // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
     // `[labels.*]` overrides, seed, and print the boot tells. An
@@ -4221,6 +4233,10 @@ pub struct Observability {
     /// XSD-3: where and how the xsd member's positions are persisted.
     /// `None` = no xsd member is configured. Set by the set builder.
     pub xsd_state: Option<XsdStateSink>,
+    /// HAR H3.4: `state-<NAME>.tsv` per long-tenor series, in the set's
+    /// order. Empty = no HAR service, and the engine writes nothing. Set
+    /// by the set builder from the boot bundle.
+    pub har_state_paths: Vec<std::path::PathBuf>,
     /// HYPARB H8: the testnet write path's tap (`mode = "testnet"`
     /// only) — **taken** by the engine loop, drained once per report
     /// period (O-H12: each paper AMM decision is shadowed on chain 998).
@@ -6743,6 +6759,36 @@ fn write_xsd_state_if_changed<S: strategy_core::StrategyCounters>(
     }
 }
 
+/// HAR H3.4: rewrite each long-tenor series' `state-<NAME>.tsv` whose
+/// epoch moved — one file per series, so a day close writes one engine's
+/// rows (~350 KiB for a fitted series), never all twelve. `force` (the
+/// shutdown drain) writes every series: its open day moves the state
+/// without moving the epoch. A failed write is logged, never fatal.
+fn write_har_state<S: strategy_core::StrategyCounters>(
+    paths: &[std::path::PathBuf],
+    strat: &S,
+    written: &mut [u64; core_vol::LONG_SET_MAX],
+    buf: &mut String,
+    last_warn_ns: &mut u64,
+    now: u64,
+    force: bool,
+) {
+    let n = strategy_core::StrategyCounters::har_series(strat).min(paths.len());
+    let mut i = 0usize;
+    while i < n && i < core_vol::LONG_SET_MAX {
+        let epoch = strategy_core::StrategyCounters::har_series_epoch(strat, i);
+        if (force || epoch != written[i])
+            && strategy_core::StrategyCounters::render_har_series(strat, i, buf)
+        {
+            match crate::state_file::write_atomic(&paths[i], buf) {
+                Ok(()) => written[i] = epoch,
+                Err(reason) => warn_state_write("har", &reason, last_warn_ns, now),
+            }
+        }
+        i += 1;
+    }
+}
+
 // ---------------------------------------------------------------
 // RG2: the `engine_regime_*` family (plan §4.9)
 // ---------------------------------------------------------------
@@ -7620,6 +7666,21 @@ where
         vec![strategy_core::XsdPositionView::default(); strategy_xsd::XSD_MAX_TARGETS];
     let mut vrp_state_warn_ns: u64 = 0;
     let mut xsd_state_warn_ns: u64 = 0;
+    // HAR H3.4: the long-tenor writer's per-series epochs start at the
+    // restore's (a boot that changed nothing rewrites nothing); the buffer
+    // is reused for every series.
+    let har_state_paths = std::mem::take(&mut obs.har_state_paths);
+    let mut har_state_epochs = [0u64; core_vol::LONG_SET_MAX];
+    {
+        let n = strategy_core::StrategyCounters::har_series(eng.strategy());
+        let mut i = 0usize;
+        while i < n && i < core_vol::LONG_SET_MAX {
+            har_state_epochs[i] = strategy_core::StrategyCounters::har_series_epoch(eng.strategy(), i);
+            i += 1;
+        }
+    }
+    let mut har_state_buf = String::new();
+    let mut har_state_warn_ns: u64 = 0;
     // X1: the paper matcher's delta snapshot.
     let mut matcher_last = clob_dispatcher::MatcherCounters::default();
     let mut lifecycle_last = engine::LifecycleCounters::default();
@@ -7649,6 +7710,15 @@ where
                 &mut xsd_views,
                 &mut xsd_state_warn_ns,
                 now_ns(),
+            );
+            write_har_state(
+                &har_state_paths,
+                eng.strategy(),
+                &mut har_state_epochs,
+                &mut har_state_buf,
+                &mut har_state_warn_ns,
+                now_ns(),
+                false,
             );
         }};
     }
@@ -8036,6 +8106,18 @@ where
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
     eng.stop();
+    // HAR H3.4: after `on_stop` delivered any minute the day-close stagger
+    // still held, every series' state is written UNCONDITIONALLY — its
+    // open day moves the state without moving the epoch.
+    write_har_state(
+        &har_state_paths,
+        eng.strategy(),
+        &mut har_state_epochs,
+        &mut har_state_buf,
+        &mut har_state_warn_ns,
+        now_ns(),
+        true,
+    );
     // S7-L1: what the live arm's shutdown sweep did — every resting
     // order of ours taken off the venue, or how many it could not
     // confirm (`u64::MAX`: the open orders could not be read).

@@ -824,6 +824,33 @@ impl StrategyCounters for StrategySet {
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
     }
+    /// HAR H3.4: the long-tenor series (the set owns them, no member).
+    #[inline]
+    fn har_series(&self) -> usize {
+        self.har.len()
+    }
+    #[inline]
+    fn har_series_epoch(&self, i: usize) -> u64 {
+        self.har.series_epoch(i)
+    }
+    fn render_har_series(&self, i: usize, out: &mut String) -> bool {
+        use std::fmt::Write as _;
+        let (Some(name), Some(e)) = (self.har.name(i), self.har.engine(i)) else {
+            return false;
+        };
+        out.clear();
+        let name = core::str::from_utf8(name).unwrap_or("?");
+        // A `String` sink cannot fail.
+        let _ = writeln!(
+            out,
+            "# har-state.tsv v{} (HAR H3) -- {name}: the engine's own long-tenor state,\n\
+             # written at each of its UTC day closes and at shutdown; merged at boot with\n\
+             # seed-{name}.tsv (core_vol::merge_rows). Never tracked by git.",
+            core_vol::ROWS_VERSION
+        );
+        let _ = e.write_rows(out);
+        true
+    }
     /// HYPARB H4: slot 0's observables.
     #[inline]
     fn hyparb_counters(&self) -> strategy_core::HyparbCounters {

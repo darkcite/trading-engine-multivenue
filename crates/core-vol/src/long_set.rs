@@ -89,7 +89,7 @@ const _: () = assert!(LONG_SET_CAP.is_power_of_two() && LONG_SET_CAP >= LONG_SET
 const _: () = assert!(MAP_SLOTS.is_power_of_two() && MAP_SLOTS >= 2 * LONG_SET_MAX);
 const _: () = assert!(LONG_SET_MAX < SLOT_NONE as usize);
 const _: () = assert!(core::mem::align_of::<LongVolSet>() == 64);
-const _: () = assert!(core::mem::size_of::<LongVolSet>() == 2_688);
+const _: () = assert!(core::mem::size_of::<LongVolSet>() == 2_816);
 
 /// One series to configure: its name and its feed's symbol.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -188,6 +188,9 @@ pub struct LongVolSet {
     name_len: [u8; LONG_SET_CAP],
     profile_1e6: [[i64; WEEKDAYS]; LONG_SET_CAP],
     profile_n: [[u32; WEEKDAYS]; LONG_SET_CAP],
+    /// Per series: bumped at each of its day closes and at the restore —
+    /// the state writer rewrites `state-<NAME>.tsv` only when it moved.
+    series_epoch: [u64; LONG_SET_CAP],
     counters: LongSetCounters,
     /// The engines, boxed at configure (~201 KiB each).
     engines: [Option<Box<LongVolEngine>>; LONG_SET_CAP],
@@ -257,6 +260,7 @@ impl LongVolSet {
             name_len: [0; LONG_SET_CAP],
             profile_1e6: [[0; WEEKDAYS]; LONG_SET_CAP],
             profile_n: [[0; WEEKDAYS]; LONG_SET_CAP],
+            series_epoch: [0; LONG_SET_CAP],
             counters: LongSetCounters {
                 minutes_rolled: 0,
                 closes: 0,
@@ -520,6 +524,7 @@ impl LongVolSet {
         let (profile, n_days) = e.weekday_profile_1e6();
         self.profile_1e6[k] = profile;
         self.profile_n[k] = n_days;
+        self.series_epoch[k] += 1;
         let c = &mut self.counters;
         c.day_closes += 1;
         c.epoch += 1;
@@ -570,10 +575,20 @@ impl LongVolSet {
                 let (profile, n_days) = e.weekday_profile_1e6();
                 self.profile_1e6[k] = profile;
                 self.profile_n[k] = n_days;
+                self.series_epoch[k] += 1;
             }
             i += 1;
         }
         self.counters.epoch += 1;
+    }
+
+    /// Series `i`'s state epoch (`0` past the configured series).
+    #[must_use]
+    pub fn series_epoch(&self, i: usize) -> u64 {
+        if i >= self.n as usize {
+            return 0;
+        }
+        self.series_epoch[i & MASK]
     }
 
     /// Series `i`'s engine.

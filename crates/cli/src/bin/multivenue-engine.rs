@@ -930,6 +930,20 @@ struct RunArgs {
     /// absent = warm live (boot tell `regime: seed absent`).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// HAR H3.4: the long-tenor HAR series list (`~/multivenue/har.toml`
+    /// by default). Set boots only; no member reads the forecasts. An
+    /// ABSENT default file boots without the service (the pre-H3 engine,
+    /// bit for bit); a file that does not parse turns the service OFF with
+    /// a named error and never refuses the boot; a series whose feed the
+    /// boot universe does not carry is dropped. Only an explicit
+    /// `--har <path>` that cannot be read refuses the boot.
+    #[arg(long)]
+    har: Option<PathBuf>,
+    /// HAR H3.4: where the per-series seeds (`seed-<NAME>.tsv`, cut hourly
+    /// by `candles-cycle.sh`) and the engine's own state (`state-<NAME>.tsv`)
+    /// live. Default `~/multivenue/har`.
+    #[arg(long)]
+    har_dir: Option<PathBuf>,
     /// VRP V5: the worker-written boot seed
     /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
     /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
@@ -4388,6 +4402,23 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // HAR H3.4: the long-tenor HAR series, their feeds resolved
+            // against the same descriptor table (D-6 truth), each engine's
+            // seed and state read and merged. Only an EXPLICIT `--har`
+            // that cannot be read refuses the boot; every other problem
+            // turns the service (or one series) off with a named error.
+            let har_boot = match cli::har_boot::load_har_boot(
+                args.har.as_deref(),
+                args.har_dir.as_deref(),
+                &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+            ) {
+                Ok(hb) => hb,
+                Err(reason) => {
+                    error!(reason, "har: the explicit --har file is unreadable — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
             // VRP V7: the member's artifact, its chain table and its
             // boot seed, all resolved against the same descriptor table
             // (D-6 truth). F19: ONLY when the bit is requested. This
@@ -4686,6 +4717,7 @@ fn run(args: RunArgs) -> ExitCode {
                         icdp_params.as_ref(),
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
+                        har_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -4773,6 +4805,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 icdp_params.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                         (Some(arm), Some(live)) => {
@@ -4797,6 +4830,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 icdp_params.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                         (None, Some(live)) => {
@@ -4824,6 +4858,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 icdp_params.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                         (None, None) => {
@@ -4859,6 +4894,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 icdp_params.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                     }

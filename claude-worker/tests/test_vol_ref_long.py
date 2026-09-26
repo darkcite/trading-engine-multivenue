@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Anton (darkcite)
-"""vol_ref.LongVolEngine -- the Python half of the long-tenor parity (HAR H1/H2, H3.3).
+"""vol_ref.LongVolEngine -- the Python half of the long-tenor parity (HAR H1/H2, H3.3/H3.4).
 
 ``tests/fixtures/vol/long-<n>.{input,expected}.tsv`` are the SAME files
 ``crates/core-vol/tests/long_parity.rs`` consumes; the expected rows are
@@ -12,6 +12,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 
 import pathlib
 
+import claude_worker.har_seed
 import claude_worker.vol_ref
 
 _DIR: pathlib.Path = pathlib.Path(__file__).resolve().parent / "fixtures" / "vol"
@@ -21,6 +22,14 @@ _U64: int = (1 << 64) - 1
 _LCG_MUL: int = 6_364_136_223_846_793_005
 _LCG_INC: int = 1_442_695_040_888_963_407
 _PX_FLOOR: int = 1_000_000_000
+
+
+def _fnv1a_64(data: bytes) -> int:
+    """``core_types::fnv1a_64``, bit for bit."""
+    h = 0xCBF2_9CE4_8422_2325
+    for b in data:
+        h = ((h ^ b) * 0x0000_0100_0000_01B3) & _U64
+    return h
 
 
 def _opt(v: int | None) -> str:
@@ -114,6 +123,11 @@ def _emit(e: claude_worker.vol_ref.LongVolEngine, f: list[str], out: list[str]) 
     elif op == "E":
         for d in f[1:]:
             out.append(_tenor_row(len(out), e, int(d)))
+    elif op == "R":
+        text = "\n".join(claude_worker.har_seed.seed_rows(e)) + "\n"
+        counts = [sum(1 for line in text.splitlines() if line.startswith(k)) for k in "VDCAPQ"]
+        fnv = f"{_fnv1a_64(text.encode('utf-8')):016x}"
+        out.append(f"{len(out)}\tR\t" + "\t".join(map(str, counts)) + f"\t{fnv}")
     elif op == "K":
         prof, n_days = e.weekday_profile_1e6()
         out.append(f"{len(out)}\tK\t{','.join(map(str, prof))}\t{','.join(map(str, n_days))}")
@@ -145,7 +159,7 @@ def _replay(name: str) -> list[str]:
             e = claude_worker.vol_ref.LongVolEngine()
         elif op == "F":
             e.refresh()
-        elif op in {"W", "O", "A", "P", "Q", "S", "D", "E", "K"}:
+        elif op in {"W", "O", "A", "P", "Q", "S", "D", "E", "K", "R"}:
             _emit(e, f, out)
         else:
             raise AssertionError(f"{name}: unknown op {op!r}")

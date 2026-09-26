@@ -205,6 +205,7 @@ fn the_staggered_set_equals_engines_fed_by_hand() {
     assert_eq!(c.held, 34 * 11, "one crossing per poll, the rest held");
     assert_eq!(c.forced, 0, "a poll a second releases everything before the next roll");
     assert_eq!(c.epoch, c.day_closes);
+    assert!((0..12).all(|i| set.series_epoch(i) == 34), "one bump per day close");
     for (i, closes) in want.iter().enumerate() {
         let mut e = Box::new(LongVolEngine::new());
         for &(px, ms) in closes {
@@ -297,6 +298,8 @@ fn a_restore_refits_profiles_and_bumps_the_epoch() {
     let epoch = set.counters().epoch;
     set.restored();
     assert_eq!(set.counters().epoch, epoch + 1);
+    assert_eq!(set.series_epoch(0), 1);
+    assert_eq!(set.series_epoch(1), 0, "past the configured series");
     let (p, cnt) = set.profile(0).unwrap();
     assert_eq!((*p, *cnt), src.weekday_profile_1e6());
     assert_eq!(cnt.iter().sum::<u32>(), 39, "39 closed days (day 39 was open), by weekday");

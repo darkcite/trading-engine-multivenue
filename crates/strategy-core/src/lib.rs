@@ -337,6 +337,33 @@ pub trait StrategyCounters {
         false
     }
 
+    /// HAR H3.4: the long-tenor HAR series the strategy runs (`0`: none —
+    /// no `har.toml`, and nothing is ever written).
+    #[inline]
+    fn har_series(&self) -> usize {
+        0
+    }
+
+    /// HAR H3.4: series `i`'s state epoch — bumped at each of its UTC day
+    /// closes and at the boot restore. The cli rewrites that series'
+    /// `state-<NAME>.tsv` only when it moved (the
+    /// [`Self::vrp_state_epoch`] law, one file per series so a day close
+    /// writes one engine's rows, not twelve).
+    #[inline]
+    fn har_series_epoch(&self, i: usize) -> u64 {
+        let _ = i;
+        0
+    }
+
+    /// HAR H3.4: render series `i`'s state file into `out` (cleared
+    /// first): a comment header, then the rows `core_vol::parse_rows`
+    /// reads. `false` = no such series. Cold path.
+    #[inline]
+    fn render_har_series(&self, i: usize, out: &mut String) -> bool {
+        let _ = (i, out);
+        false
+    }
+
     /// XSD (slot 2, statarb doc 08): the cross-sectional member's
     /// observables (`engine_xsd_*`), mirrored like [`Self::icdp_counters`].
     #[inline]

@@ -31,6 +31,9 @@
 //!                          n_pairs q_n q_raw q_fit beats last_pair last_arm
 //! K                        row K p_mon,…,p_sun n_mon,…,n_sun — the weekday
 //!                          profile (HAR H3.3)
+//! R                        row R nV nD nC nA nP nQ fnv — the state writer
+//!                          (HAR H3.4): each row kind's count in
+//!                          `write_rows`' text and the FNV-1a 64 of its bytes
 //! ```
 //!
 //! Test-only code: allocation and `unwrap` are fine here.
@@ -179,6 +182,21 @@ fn run(name: &str) -> Vec<String> {
                     out.push(r);
                 }
             }
+            "R" => {
+                let mut t = String::new();
+                e.write_rows(&mut t).unwrap();
+                let n = |k: &str| t.lines().filter(|l| l.starts_with(k)).count();
+                out.push(format!(
+                    "{row}\tR\t{}\t{}\t{}\t{}\t{}\t{}\t{:016x}",
+                    n("V"),
+                    n("D"),
+                    n("C"),
+                    n("A"),
+                    n("P"),
+                    n("Q"),
+                    core_types::fnv1a_64(t.as_bytes())
+                ));
+            }
             "K" => {
                 let (p, n) = e.weekday_profile_1e6();
                 let join = |v: &[String]| v.join(",");
@@ -309,4 +327,13 @@ fn the_profile_tape_shows_the_weekend() {
     assert!(full[..5].iter().all(|&p| p > 1_200_000), "{full:?}");
     assert!(full[5..].iter().all(|&p| p < 100_000), "{full:?}");
     assert_eq!(k[8], [0; 7], "a fresh engine after `N`");
+    // The writer ran on a fitted engine with its rings full.
+    let r: Vec<Vec<String>> = rows
+        .iter()
+        .map(|l| l.split('\t').map(str::to_owned).collect::<Vec<_>>())
+        .filter(|c| c[1] == "R")
+        .collect();
+    assert!(r.iter().any(|c| c[4] == "1" && c[7] != "0" && c[5] != "0"), "fitted rows written");
+    assert!(r.iter().any(|c| c[7].parse::<usize>().unwrap() > 1_000), "QLIKE rows written");
+    assert!(r.iter().any(|c| c[6].parse::<usize>().unwrap() > 4_000), "pair rings wrapped");
 }
