@@ -43,8 +43,9 @@
 //! rather than livelocked (fail-fast doctrine).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the
-//! rx buffer in place; subscribe/ping payloads render into stack
-//! scratch; the only copy is the 64-byte `Tick` moved into the ring.
+//! rx buffer in place; subscribe frames are masked into tx from their
+//! wire parts, pings from their literal; the only copy is the 64-byte
+//! `Tick` moved into the ring.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io;

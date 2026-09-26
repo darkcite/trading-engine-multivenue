@@ -178,7 +178,12 @@ in the script; `ai` = 48 is the floor every name includes).
   on the M4. The I-3 drain loops (risk-policy "The I-3 drain loops read
   past a full rx") share `core_net::drain`: a step whose read filled rx is
   driven again, as one that published or moved its state; at most 8 steps
-  per connection per poll, then a poll that does not sleep.
+  per connection per poll, then a poll that does not sleep. Batch
+  subscribes render straight into tx (2026-09-26, risk-policy "Batch
+  subscribes render straight into tx"): `core_net::queue_masked_text_frame_rendered`
+  counts the payload, writes the header, renders behind it and masks in
+  place — OKX, Deribit, Bybit, Polymarket and MEXC dropped their stack
+  scratches and the copy into tx; HyperEVM's request bodies stay copied.
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -222,13 +227,15 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **Gates at HEAD (the I-3 drain loops, 2026-09-25; Foundry and worker
-  pytest as of the HYPARB merge):** nextest 3150 (5
+- **Gates at HEAD (the header-first subscribe renders, 2026-09-26; Foundry
+  and worker pytest as of the HYPARB merge):** nextest 3158 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
   and `hyperevm_live_smoke` among them) · alloc 73/73 at the gates' pins
   (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
   child helper) · clippy clean · `make license-check` OK · `make
-  bench-check` OK (the M4 baseline, 2026-09-25) · `make
+  bench-check` OK at `4fec7ec` (the M4 baseline, 2026-09-25; not judged at
+  the D3 renders — its binary links none of the changed crates, and the
+  Mac ran at load 12–31) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all nine ingress crates and the HYPARB crates) ·
   Foundry 11 unit +
@@ -247,8 +254,8 @@ in the script; `ai` = 48 is the floor every name includes).
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
   (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`)
-  · live smokes 60 s (the I-3 drain loops, 2026-09-25): MEXC and
-  Binance, 0 parse errors, 0 reconnects, 0 ring drops
+  · live smokes 60 s (the header-first subscribe renders, 2026-09-26):
+  MEXC and Binance, 0 parse errors, 0 reconnects, 0 ring drops
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known

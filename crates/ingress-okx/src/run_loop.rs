@@ -56,7 +56,8 @@
 //! [`crate::TradeSeqMonitor`] (regression ⇒ `gaps_total`).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the
-//! rx buffer in place; subscribe payloads render into stack scratch;
+//! rx buffer in place; the batched subscribe renders straight into tx,
+//! header first (`core_net::queue_masked_text_frame_rendered`);
 //! the ring copies are the 64-byte `Tick` and, per changed book top-K,
 //! the 192-byte `DepthTopK` (one copy each into the slot — marked at
 //! the push).
@@ -67,10 +68,10 @@ use std::io;
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_parts,
-    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
-    HandshakeResult, IoBuf, Keepalive, KeepaliveAction, ReqKind, RxFill, Status, SubErr, SubId,
-    SubTable, Transport, WsOpcode, WsReadResult,
+    queue_masked_text_frame_rendered, read_server_handshake, sec_websocket_key_from_seed,
+    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong,
+    Drained, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, ReqKind, RxFill, Status, SubErr,
+    SubId, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
@@ -81,7 +82,7 @@ use core_types::{
 
 use crate::{
     books_op_parts, classify, extract_error_inst_id, extract_inst_id, parse_bbo, parse_book_header,
-    parse_trade, sub_id_of, write_subscribe_batch, ChainOutcome, OkxChannel, OkxInstType,
+    parse_trade, render_subscribe_batch, sub_id_of, ChainOutcome, OkxChannel, OkxInstType,
     OkxMsgKind, OkxSeqChain, OkxSubVerb, OkxSymbolTable, SubArg, TradeSeqMonitor, TradeSeqOutcome,
     OKX_MAX_SYMBOLS, PING_PAYLOAD,
 };
@@ -100,10 +101,10 @@ use crate::{
 /// margin absorbs exactly that (log entry 2026-08-22).
 pub const RX_BUF_SIZE: usize = 4 * 1024 * 1024;
 
-/// Tx buffer: handshake + one batched subscribe op (~46 B per arg ×
-/// [`MAX_SUB_ARGS`] = 144 args ≈ 6.7 KiB with a full M2.2 options
-/// block) + resync pairs + pings. 16 KiB keeps ≥2× margin
-/// (boot-time allocation).
+/// Tx buffer: handshake + one batched subscribe op, rendered straight
+/// into it (~46 B per arg; ≤ 71 B at the longest channel name, key and
+/// instrument id — × [`MAX_SUB_ARGS`] = 160 args ≤ 11.2 KiB) + resync
+/// pairs + pings. 16 KiB holds the worst case (boot-time allocation).
 pub const TX_BUF_SIZE: usize = 16 * 1024;
 
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
@@ -122,10 +123,6 @@ pub const OPT_FAMILIES_MAX: usize = 16;
 /// configured underlying ([`OPT_FAMILIES_MAX`], M2.3) =
 /// 80 + 64 + 16 = 160.
 pub const MAX_SUB_ARGS: usize = 5 * crate::OKX_STATIC_MAX + crate::OKX_OPT_MAX + OPT_FAMILIES_MAX;
-
-/// Stack scratch for one rendered subscribe batch (~46 B/arg × 144
-/// args ≈ 6.7 KiB; ~2× margin).
-const SUBSCRIBE_SCRATCH: usize = 12 * 1024;
 
 /// Max `trades` rows whose `seqId` is chain-checked per push; rows
 /// beyond this are still counted as messages (OKX batches trades in
@@ -628,7 +625,7 @@ fn build_sub_args<'a>(
 ) -> usize {
     let mut n = 0;
     // M2.3: one family-keyed `opt-summary` arg per configured option
-    // underlying (the write_op key branch renders `instFamily`).
+    // underlying (`render_subscribe_batch` keys it `instFamily`).
     let mut f = 0;
     while f < families.len() {
         let (len, ref bytes) = families[f];
@@ -711,10 +708,11 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
         args[i] = args_buf[i].expect("contiguous prefix");
         i += 1;
     }
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let len = write_subscribe_batch(&mut scratch, &args[..n_args])
-        .ok_or_else(|| io::Error::other("okx: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+    // Header first, the batch rendered straight into tx: no scratch.
+    let args = &args[..n_args];
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        render_subscribe_batch(p, args)
+    })?;
     drv.subscribed = true;
     Ok(())
 }

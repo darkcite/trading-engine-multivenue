@@ -514,7 +514,14 @@ fn on_session_start<C: Capture, const CAP: usize>(
 /// Mask `drv.scratch[..n]` into tx as one binary frame.
 #[inline]
 fn queue_frame(drv: &mut Driver, n: usize) -> io::Result<()> {
-    // COPY: one request body (≤ 8 KiB, typically ~200 B) scratch → tx — the WebSocket client mask is a transform pass into tx regardless; rendering in place would need a core-net "reserve header, mask in place" API for no saved pass.
+    // COPY: one request body (≤ 8 KiB, typically ~200 B) scratch → tx behind its
+    // header, per snapshot read and once per session for the logs subscribe —
+    // rejected: a header-first render straight into tx (core-net's
+    // `ws_write_text_frame_rendered`; a binary twin is one opcode away): it
+    // trades this copy for a second run of every render (count, then write) on
+    // the warm read path, and `write_eth_call`'s calldata writer is a one-shot
+    // `FnOnce` into the request's tail, so every ABI encoder would need a
+    // counting mode.
     queue_masked_binary_frame(&mut drv.tx, &mut drv.mask_counter, &drv.scratch[..n])
 }
 

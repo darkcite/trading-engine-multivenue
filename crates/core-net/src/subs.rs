@@ -14,7 +14,9 @@
 //! * [`queue_masked_binary_frame`] / [`queue_masked_text_frame`] and
 //!   their `_parts` forms — the "serialize into tx IoBuf with a fresh
 //!   mask" pattern every client-side WS writer needs; a `_parts` payload
-//!   is masked into tx part by part, never assembled first.
+//!   is masked into tx part by part, never assembled first — and
+//!   [`queue_masked_text_frame_rendered`], whose payload a render writes
+//!   straight into tx behind its header (the batch subscribes).
 //!
 //! Everything is preallocated, `Copy`-only rows, zero-alloc, no
 //! `dyn`: per-venue request kinds are monomorphized through the
@@ -30,6 +32,7 @@ use std::io;
 use crate::iobuf::IoBuf;
 use crate::ws_frame::{
     ws_mask_from_counter, ws_write_binary_frame_parts, ws_write_text_frame_parts,
+    ws_write_text_frame_rendered, WsPayload, WsWriteErr,
 };
 
 // ---------------------------------------------------------------
@@ -341,6 +344,34 @@ pub fn queue_masked_text_frame_parts(
     Ok(())
 }
 
+/// Text frame whose payload `render` writes straight into the tx window,
+/// header first ([`ws_write_text_frame_rendered`]) — the batch
+/// subscribes, whose length is unknown until rendered: no scratch, no
+/// second copy. `render` runs twice (count, then write) and must produce
+/// the same bytes both times. tx advances only over a whole frame.
+///
+/// # Errors
+/// tx too small, the render's own error, or a render whose two passes
+/// disagree.
+#[inline]
+pub fn queue_masked_text_frame_rendered<F>(
+    tx: &mut IoBuf,
+    mask_counter: &mut u64,
+    render: F,
+) -> io::Result<()>
+where
+    F: Fn(&mut WsPayload<'_>) -> Result<(), WsWriteErr>,
+{
+    let mask = ws_mask_from_counter(*mask_counter);
+    *mask_counter = mask_counter.wrapping_add(1);
+    let n = ws_write_text_frame_rendered(tx.free_mut(), mask, render).map_err(|e| match e {
+        WsWriteErr::BufferTooSmall => io::Error::other("ws text frame: tx buffer too small"),
+        WsWriteErr::RenderDiverged => io::Error::other("ws text frame: the render diverged"),
+    })?;
+    tx.advance(n);
+    Ok(())
+}
+
 // ---------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------
@@ -464,5 +495,47 @@ mod tests {
         assert!(queue_masked_binary_frame_parts(&mut tx, &mut ctr, &[b"abc", b"defgh"]).is_err());
         assert!(queue_masked_text_frame_parts(&mut tx, &mut ctr, &[b"abc", b"defgh"]).is_err());
         assert!(tx.is_empty(), "a refused frame writes nothing");
+    }
+
+    #[test]
+    fn a_rendered_frame_is_the_frame_of_its_bytes() {
+        // Rendered or passed whole, the same bytes under the same mask
+        // counter give the same wire frame, and tx advances over it once.
+        let (mut rendered, mut whole) = (IoBuf::with_capacity(256), IoBuf::with_capacity(256));
+        let (mut cr, mut cw) = (7u64, 7u64);
+        queue_masked_text_frame_rendered(&mut rendered, &mut cr, |p| {
+            p.put(b"{\"op\":")?;
+            p.put(b"\"subscribe\"}")
+        })
+        .unwrap();
+        queue_masked_text_frame(&mut whole, &mut cw, b"{\"op\":\"subscribe\"}").unwrap();
+        assert_eq!(rendered.filled(), whole.filled());
+        assert_eq!((cr, cw), (8, 8));
+    }
+
+    #[test]
+    fn a_rendered_frame_that_does_not_fit_leaves_tx_empty() {
+        let mut tx = IoBuf::with_capacity(8);
+        let mut ctr = 0u64;
+        let r = queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| p.put(b"abcdefgh"));
+        assert!(r.is_err());
+        assert!(tx.is_empty(), "a refused frame writes nothing");
+    }
+
+    /// A render whose writing pass diverges from its count leaves tx where
+    /// it was: a release build fails the frame; a debug build panics first.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "diverged from its count"))]
+    fn a_diverging_render_never_advances_tx() {
+        let mut tx = IoBuf::with_capacity(64);
+        let mut ctr = 0u64;
+        let calls = core::cell::Cell::new(0);
+        let r = queue_masked_text_frame_rendered(&mut tx, &mut ctr, |p| {
+            calls.set(calls.get() + 1);
+            let bytes: &[u8] = if calls.get() == 1 { b"ab" } else { b"abc" };
+            p.put(bytes)
+        });
+        assert!(r.is_err());
+        assert!(tx.is_empty(), "tx never advances over a torn frame");
     }
 }

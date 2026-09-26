@@ -32,6 +32,7 @@ pub use run_loop::{
     DEFAULT_TICK_RING_CAP, RX_BUF_SIZE, TX_BUF_SIZE,
 };
 
+use core_net::{WsPayload, WsWriteErr};
 use core_parse::{find_field, scan_price_1e6, scan_u64, skip_byte};
 use core_types::{NsTs, Price, Qty, SymbolId, Tick};
 
@@ -299,76 +300,58 @@ pub const PM_ASSET_ID_MAX: usize = 80;
 /// enforces the market-entry cap upstream).
 pub const PM_SUBSCRIBE_IDS_MAX: usize = 128;
 
-/// Serialize the market-channel subscribe frame the CLOB WS host
-/// (`ws-subscriptions-clob.polymarket.com/ws/market`) requires
-/// before it sends anything:
-/// `{"assets_ids":["<id>"],"type":"market"}`.
-///
-/// Discovered live 2026-08-14: without this frame the server stays
-/// silent and the endpoint path `/ws/` (pre-8d value) 404s — the
-/// Phase-1 run loop had never been proven against the venue because
-/// D1 masked it. Returns the byte length, `None` if the id is
-/// empty/oversized or `dst` is too small. Single-id form of
-/// [`write_market_subscribe_multi`] — byte-identical output for one
-/// id (pinned by test).
+/// Whether `ids` can go in one market subscribe: 1..=
+/// [`PM_SUBSCRIBE_IDS_MAX`] ids, each 1..=[`PM_ASSET_ID_MAX`] bytes.
 #[inline]
-pub fn write_market_subscribe(dst: &mut [u8], asset_id: &[u8]) -> Option<usize> {
-    write_market_subscribe_multi(dst, &[asset_id])
+pub(crate) fn market_subscribe_ids_valid(ids: &[&[u8]]) -> bool {
+    if ids.is_empty() || ids.len() > PM_SUBSCRIBE_IDS_MAX {
+        return false;
+    }
+    let mut i = 0;
+    while i < ids.len() {
+        if ids[i].is_empty() || ids[i].len() > PM_ASSET_ID_MAX {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
-/// Serialize the N-id market-channel subscribe (M1 multi-market):
-/// `{"assets_ids":["<id0>","<id1>",…],"type":"market"}`.
+/// Render the market-channel subscribe through `p`, straight into its
+/// frame, header first (`core_net::queue_masked_text_frame_rendered`):
+/// `{"assets_ids":["<id0>","<id1>",…],"type":"market"}` — one frame
+/// lists every id (M1 multi-market). `ids` must pass
+/// [`market_subscribe_ids_valid`].
 ///
-/// Returns the byte length; `None` if the list is empty or larger
-/// than [`PM_SUBSCRIBE_IDS_MAX`], any id is empty/oversized, or
-/// `dst` is too small. Zero-alloc: pure byte copies into `dst`.
-// Doctrine: raw indices, not iterator adapters (CLAUDE.md hot-path rules;
-// `i` both indexes `ids` and drives the comma rule).
-#[allow(clippy::needless_range_loop)]
-pub fn write_market_subscribe_multi(dst: &mut [u8], ids: &[&[u8]]) -> Option<usize> {
-    if ids.is_empty() || ids.len() > PM_SUBSCRIBE_IDS_MAX {
-        return None;
-    }
-    const HEAD: &[u8] = b"{\"assets_ids\":[";
-    const TAIL: &[u8] = b"],\"type\":\"market\"}";
-    let mut total = HEAD.len() + TAIL.len();
-    for i in 0..ids.len() {
-        if ids[i].is_empty() || ids[i].len() > PM_ASSET_ID_MAX {
-            return None;
-        }
-        // "<id>" plus a leading comma for every id after the first.
-        total += ids[i].len() + 2 + usize::from(i > 0);
-    }
-    if dst.len() < total {
-        return None;
-    }
-    let mut w = 0usize;
-    // COPY: the market subscribe text into the caller's render scratch (≤ 11 KiB:
-    // head, ≤ 128 quoted ids of ≤ 80 B, tail), once per connection — the frame
-    // is masked into tx behind a length-prefixed header — rejected: a
-    // header-first render straight into tx (the length IS pre-computed above,
-    // but core-net has no header-only writer; its parts writer would need
-    // 2 + 3n slices for n ≤ 128 ids).
-    dst[w..w + HEAD.len()].copy_from_slice(HEAD);
-    w += HEAD.len();
-    for i in 0..ids.len() {
+/// The CLOB WS host (`ws-subscriptions-clob.polymarket.com/ws/market`)
+/// sends nothing before it: discovered live 2026-08-14 — without this
+/// frame the server stays silent and the endpoint path `/ws/` (pre-8d
+/// value) 404s; the Phase-1 run loop had never been proven against the
+/// venue because D1 masked it.
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
+#[inline]
+pub(crate) fn render_market_subscribe(
+    p: &mut WsPayload<'_>,
+    ids: &[&[u8]],
+) -> Result<(), WsWriteErr> {
+    debug_assert!(
+        market_subscribe_ids_valid(ids),
+        "market subscribe ids must be checked first"
+    );
+    p.put(b"{\"assets_ids\":[")?;
+    let mut i = 0;
+    while i < ids.len() {
         if i > 0 {
-            dst[w] = b',';
-            w += 1;
+            p.put(b",")?;
         }
-        dst[w] = b'"';
-        w += 1;
-        // COPY: each quoted id (≤ 80 B), then the tail — same bound, reason and
-        // rejected alternative as the head above.
-        dst[w..w + ids[i].len()].copy_from_slice(ids[i]);
-        w += ids[i].len();
-        dst[w] = b'"';
-        w += 1;
+        p.put(b"\"")?;
+        p.put(ids[i])?;
+        p.put(b"\"")?;
+        i += 1;
     }
-    dst[w..w + TAIL.len()].copy_from_slice(TAIL);
-    w += TAIL.len();
-    debug_assert_eq!(w, total);
-    Some(total)
+    p.put(b"],\"type\":\"market\"}")
 }
 
 // ---------------------------------------------------------------
@@ -425,28 +408,26 @@ mod tests {
         assert_eq!(classify(SAMPLE_BOOK), FrameKind::BookUpdate);
     }
 
-    #[test]
-    fn write_market_subscribe_exact_bytes() {
-        let mut dst = [0u8; 160];
-        let n = write_market_subscribe(&mut dst, b"1234567890").unwrap();
-        assert_eq!(
-            &dst[..n],
-            br#"{"assets_ids":["1234567890"],"type":"market"}"# as &[u8]
-        );
-    }
-
-    #[test]
-    fn write_market_subscribe_rejects_bad_input() {
-        let mut dst = [0u8; 160];
-        assert!(write_market_subscribe(&mut dst, b"").is_none());
-        assert!(write_market_subscribe(&mut dst, &[b'1'; PM_ASSET_ID_MAX + 1]).is_none());
-        let mut tiny = [0u8; 16];
-        assert!(write_market_subscribe(&mut tiny, b"1234567890").is_none());
+    /// The market subscribe rendered into a plain buffer — exactly what
+    /// the frame's payload span receives; `None` for an id list
+    /// [`market_subscribe_ids_valid`] refuses, or when it does not fit.
+    fn write_market_subscribe_multi(buf: &mut [u8], ids: &[&[u8]]) -> Option<usize> {
+        if !market_subscribe_ids_valid(ids) {
+            return None;
+        }
+        let mut p = WsPayload::writing(buf);
+        render_market_subscribe(&mut p, ids).ok()?;
+        Some(p.len())
     }
 
     #[test]
     fn write_market_subscribe_multi_exact_bytes() {
         let mut dst = [0u8; 256];
+        let n = write_market_subscribe_multi(&mut dst, &[b"1234567890"]).unwrap();
+        assert_eq!(
+            &dst[..n],
+            br#"{"assets_ids":["1234567890"],"type":"market"}"# as &[u8]
+        );
         let n = write_market_subscribe_multi(&mut dst, &[b"1234567890", b"9876543210"]).unwrap();
         assert_eq!(
             &dst[..n],

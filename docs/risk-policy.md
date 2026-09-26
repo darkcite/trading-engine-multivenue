@@ -2785,7 +2785,8 @@ tables (OKX families ≤ 384 B, Deribit DVOL ≤ 128 B, Polymarket ids ≤
 10 240 B); the variable-length batch subscribe renders (OKX ≤ 12 KiB,
 Deribit ≤ 16 KiB, Bybit ≤ 8 KiB, Polymarket ≤ 11 KiB — the frame length
 is unknown until the render ends; a header-first render is the
-operator's later pass, Q7); the rate-limited WARN lines (≤ 224 B, one a
+operator's later pass, Q7 — done 2026-09-26, "Batch subscribes render
+straight into tx", below); the rate-limited WARN lines (≤ 224 B, one a
 second — one `writev` rejected: a short writev splits the line);
 Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
 payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
@@ -2801,7 +2802,8 @@ escalated rustls copy, above), TX = 2 plus the serialiser's single
 write. Every cold finding and every flagged hidden move was acted on
 (above); its borderline notes — MEXC futures' per-(symbol, channel)
 subscribe render and the other remaining render markers as candidates
-for Q7's pass — stay open.
+for Q7's pass — stay open (closed 2026-09-26 by the header-first renders,
+below; HyperEVM's request bodies stay copied, re-marked).
 
 Gate after the pass: `hits=31 baselined=31 new=0 paid=0` over 21 dirs —
 the baseline byte-identical (sha256 `caf8a05e…`), the seven crates and
@@ -3200,6 +3202,105 @@ paid=0`; license-check OK; `cargo +nightly fuzz build` OK; live smokes
 60 s, the engine untouched — MEXC 31 195 messages (1 575 ticks), Binance
 92 037 (92 876 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
 This work built no engine binary.
+
+### Batch subscribes render straight into tx (2026-09-26)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the in-place subscribe renders of plan Q7, the last of the
+three).
+
+**What was wrong.** A client frame's header carries its payload length in
+a 7-, 16- or 64-bit form (RFC 6455 §5.2), and a batch subscribe's length
+is unknown until it has been rendered. So OKX, Deribit, Bybit, Polymarket
+and MEXC rendered theirs into a stack scratch (OKX 12 KiB, Deribit
+16 KiB, Bybit 8 KiB, Polymarket 11 KiB, MEXC spot ~2.3 KiB and one
+~80 B futures frame per (symbol, channel)), and `queue_masked_text_frame`
+then copied it into tx behind the header and masked it: every subscribe
+byte written twice, and up to 16 KiB of stack per call. ZC pass B marked
+those copies (OKX K3, Deribit K8, Bybit K16, Polymarket K20/K21, MEXC's
+`push_bytes`) and left the header-first render to this pass.
+
+**What changed.** core-net's `ws_write_text_frame_rendered` (on tx:
+`queue_masked_text_frame_rendered`) takes a render in place of the
+payload. The render appends through a `WsPayload` and runs twice: a
+counting pass that writes nothing and sizes the payload, then — the
+header written at its minimal width — a writing pass into exactly the
+counted span of tx; the payload is then masked in place. A render must be
+a pure function of what it captured, and its `Fn` bound keeps it from
+mutating a capture: a writing pass that fails, runs past its count or
+stops short of it is `RenderDiverged` — a `debug_assert!` in debug builds;
+in release the error fails the session, which reconnects, and tx never
+advances over the torn frame. The venues' writers became renders — OKX
+`render_subscribe_batch`, Deribit `render_subscribe_all`, Bybit
+`render_subscribe`, Polymarket `render_market_subscribe` (its id-list
+check split out as `market_subscribe_ids_valid`, run first), MEXC
+`render_spot_subscribe` and `render_fut_subscribe` — and the scratches
+and their markers are gone. The one copy left — each literal fragment,
+symbol and id put once, straight into the frame — is marked once, in
+`WsPayload::put`. The parts writer builds its header from the same two
+helpers (`client_header_len`, `write_client_header`). A subscribe is now
+bounded by tx's free room rather than by a scratch; every venue's tx was
+already sized for its largest batch, since the copied frame had to fit
+there too (OKX's doc now counts its 160 args: ≤ 11.2 KiB in 16 KiB).
+Cold paths only: every render runs twice, at session start.
+
+HyperEVM's request bodies — the logs subscribe and every snapshot
+`eth_call` — still render into the driver's 8 KiB scratch and are copied
+into tx behind the header. Their marker said a header-first render needed
+a core-net API that did not exist; it is re-worded: the API exists (a
+binary twin is one opcode away), but it would trade that copy for a
+second run of every render on the warm read path, and `write_eth_call`'s
+calldata writer is a one-shot `FnOnce` into the request's tail, so every
+ABI encoder would need a counting mode.
+
+**Proof.** core-net: a rendered frame is byte-identical to the parts
+writer's in all three length forms, and reads back through
+`ws_read_frame` and unmasks to its payload at every length boundary (0,
+125, 126, 65 535 and 65 536 B) — a check independent of the header writer
+the two share, which both writers now also check against its length; one
+that does not fit fails `BufferTooSmall`, and a render that fails its
+counting pass returns its own error, both without writing a byte; a render
+that writes more, or less, on its writing pass than it counted is refused;
+`WsPayload` counts without writing and refuses a put past its span. On tx:
+a rendered frame is the plain frame of its bytes under the same mask
+counter, and a refused or diverging render leaves tx empty. The zero-alloc
+round trip (alloc gate) runs the rendered writer beside the plain one. The
+venues' exact-bytes tests run unchanged through a `WsPayload::writing`
+helper, and the run-loop tests that unmask the subscribe off the wire —
+all five venues, and MEXC's TLS loopback — see the same frames. A const
+assert pins that MEXC's `from_slot` names exactly `channels_per_symbol`
+slots per class (both subscribe loops walk `from_slot`; the ack
+bookkeeping counts the other).
+
+**The review** (a read-only subagent): PASS WITH NOTES — byte identity
+holds for all six renders, each render captures only shared references
+and `Copy` values, the header forms and the mask are right, and every call
+site borrows disjoint fields. Acted on: the `Fn` bound, the queue-level
+and boundary tests, the counting-pass test, the header check, the alloc
+gate, MEXC's const assert, Polymarket's render and id check made
+`pub(crate)` (the check guards the render) with its duplicated tests
+folded, Deribit's `push_bytes` moved beside the WARN lines that are its
+only callers, and the stale docs (the scratch wording in OKX, Deribit,
+Bybit and Hyperliquid — Hyperliquid's since pass B — OKX's `write_op` and
+its tx sizing, the `put` marker's bound). Left open:
+Deribit's subscribe-result check (`found_mask`) builds its needle apart
+from `render_channel_name`, and OKX, Deribit, Bybit and Polymarket size
+tx for their worst batch in docs, not in a const assert as MEXC does.
+
+Gates: clippy clean; nextest 3158 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); core-net's tests in release (the torn-frame
+path) pass; `make copy-audit` `hits=31 baselined=31 new=0 paid=0`, the
+baseline byte-identical (sha256 `caf8a05e…`); license-check OK; `cargo
++nightly fuzz build` OK; live smokes 60 s, the engine untouched — MEXC
+30 814 messages (1 216 ticks; one spot `SUBSCRIPTION` for 5 symbols and
+21 futures frames, every channel confirmed: 0 sub-drops), Binance 34 118
+(34 943 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
+`make bench-check` was not judged: the hot_path binary links none of the
+changed crates (`nm`: no core-net or ingress symbols), and at a load of
+12–31 (RustRover's background checks at ~550 % CPU, another session's
+build and tests beside the engine) two benches it does link read slow
+(latency-arb `on_tick` +61 %, `sign_order_full` +23 %) — to re-run on a
+quiet Mac. This work built no engine binary.
 
 ## E6 — the risk gate and the kill switches
 

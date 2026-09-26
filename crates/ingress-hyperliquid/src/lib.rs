@@ -96,7 +96,8 @@
 //! All parsing is in-place over `&[u8]` in the rx buffer. The one
 //! unavoidable copy per event is the 64-byte parsed POD copied into
 //! its SPSC ring slot by `try_push_ref` (the ring publish) — same as
-//! every ingress. Subscribe/ping frames render into fixed stack scratch.
+//! every ingress. Subscribe frames are masked into the tx buffer from
+//! their wire parts ([`subscription_parts`]); pings from their literal.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(

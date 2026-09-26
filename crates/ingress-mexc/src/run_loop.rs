@@ -46,10 +46,10 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, Drained, HandshakeResult, IoBuf, RxFill, Status, Transport,
-    WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_rendered,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
+    HandshakeResult, IoBuf, RxFill, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, NsTs};
@@ -61,12 +61,11 @@ use core_types::{
 use crate::futures::FUT_SUB_PAYLOAD_MAX;
 use crate::{
     classify_futures, classify_spot, extract_fut_symbol, extract_fut_ts_ms, extract_param_channel,
-    extract_refused_contract,
-    extract_param_symbol, funding_next_settle_ms, parse_book_ticker_body, parse_deal_item,
-    parse_depth_full, parse_fut_deal_item, parse_spot_wrapper, parse_sub_ack, parse_ticker,
-    write_fut_subscribe, write_spot_subscribe, MexcChannel, MexcClass, MexcDeal, MexcDealsWalk,
-    MexcFutDealsWalk, MexcFutKind, MexcSpotAck, MexcSpotKind, MexcSymbolTable, MexcTickerFrame,
-    MEXC_MAX_SYMBOLS_PER_CONN, MEXC_SYMBOL_MAX, MS_PER_HOUR,
+    extract_param_symbol, extract_refused_contract, funding_next_settle_ms, parse_book_ticker_body,
+    parse_deal_item, parse_depth_full, parse_fut_deal_item, parse_spot_wrapper, parse_sub_ack,
+    parse_ticker, render_fut_subscribe, render_spot_subscribe, MexcChannel, MexcClass, MexcDeal,
+    MexcDealsWalk, MexcFutDealsWalk, MexcFutKind, MexcSpotAck, MexcSpotKind, MexcSymbolTable,
+    MexcTickerFrame, MEXC_MAX_SYMBOLS_PER_CONN, MEXC_SYMBOL_MAX, MS_PER_HOUR,
 };
 
 // ---------------------------------------------------------------
@@ -97,7 +96,7 @@ pub const SUB_DROP_REFUSED: i64 = 1;
 /// `SubDrop.v1` when the refused channel cannot be named.
 const SUB_DROP_CHANNEL_UNKNOWN: i64 = -1;
 
-/// Longest spot subscribe payload (the render scratch size): the
+/// Longest spot subscribe payload (the tx budget's spot term): the
 /// envelope + per param (two quotes, a comma, the longest topic, the
 /// longest symbol) — ~2.3 KiB at the 16-row table cap.
 const SPOT_SUB_PAYLOAD_MAX: usize = br#"{"method":"SUBSCRIPTION","params":[]}"#.len()
@@ -564,23 +563,19 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     };
     match drv.class {
         MexcClass::Spot => {
-            let mut scratch = [0u8; SPOT_SUB_PAYLOAD_MAX];
-            let len = write_spot_subscribe(&mut scratch, &drv.symbols)
-                .ok_or_else(|| io::Error::other("mexc: spot subscribe scratch too small"))?;
-            queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+            let symbols = &drv.symbols;
+            queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+                render_spot_subscribe(p, symbols)
+            })?;
         }
         MexcClass::Futures => {
-            let per_symbol = MexcClass::Futures.channels_per_symbol() as u8;
             let mut i = 0;
             while let Some((symbol, _sym)) = drv.symbols.get(i) {
                 let mut slot = 0u8;
-                while slot < per_symbol {
-                    let ch = MexcChannel::from_slot(MexcClass::Futures, slot)
-                        .ok_or_else(|| io::Error::other("mexc: futures slot out of range"))?;
-                    let mut scratch = [0u8; FUT_SUB_PAYLOAD_MAX];
-                    let len = write_fut_subscribe(&mut scratch, ch, symbol)
-                        .ok_or_else(|| io::Error::other("mexc: futures subscribe scratch too small"))?;
-                    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+                while let Some(ch) = MexcChannel::from_slot(MexcClass::Futures, slot) {
+                    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+                        render_fut_subscribe(p, ch, symbol)
+                    })?;
                     slot += 1;
                 }
                 i += 1;

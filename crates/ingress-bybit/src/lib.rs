@@ -51,8 +51,8 @@
 //! differ in shape; both contain `"pong"`).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the
-//! rx buffer in place; subscribe payloads render into stack scratch;
-//! the only copy is the 64-byte `Tick` moved into the ring.
+//! rx buffer in place; the batch subscribe renders straight into tx,
+//! header first; the only copy is the 64-byte `Tick` moved into the ring.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -72,6 +72,7 @@ pub use run_loop::{
     DEFAULT_TICK_RING_CAP, RX_BUF_SIZE, TX_BUF_SIZE,
 };
 
+use core_net::{WsPayload, WsWriteErr};
 use core_parse::{find_field, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte};
 use core_types::{NsTs, SymbolId};
 
@@ -622,31 +623,21 @@ impl Default for BybitSymbolTable {
 // Subscribe writer
 // ---------------------------------------------------------------
 
-#[inline]
-fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
-    let end = at + src.len();
-    if end > dst.len() {
-        return None;
-    }
-    // COPY: the batched subscribe text into the caller's render scratch
-    // (≤ 8 KiB), once per connection session — the WS frame header needs the
-    // payload length before the payload is masked into tx — rejected: rendering
-    // straight into tx (the length field is unknown until the batch render ends).
-    dst[at..end].copy_from_slice(src);
-    Some(end)
-}
-
-/// Serialize the single batched subscribe op for one connection:
+/// Render the single batched subscribe op for one connection —
 /// `orderbook.1.<SYM>` + `publicTrade.<SYM>` per symbol, plus
-/// `tickers.<SYM>` when `want_tickers` (linear connections). Returns
-/// the byte length, `None` if `dst` is too small.
+/// `tickers.<SYM>` when `want_tickers` (linear connections) — through `p`,
+/// straight into its frame, header first
+/// (`core_net::queue_masked_text_frame_rendered`).
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
 #[inline]
-pub fn write_subscribe(
-    dst: &mut [u8],
+pub fn render_subscribe(
+    p: &mut WsPayload<'_>,
     symbols: &BybitSymbolTable,
     want_tickers: bool,
-) -> Option<usize> {
-    let mut n = push_bytes(dst, 0, b"{\"op\":\"subscribe\",\"args\":[")?;
+) -> Result<(), WsWriteErr> {
+    p.put(b"{\"op\":\"subscribe\",\"args\":[")?;
     let mut first = true;
     let mut i = 0;
     while let Some((symbol, _sym)) = symbols.get(i) {
@@ -659,19 +650,18 @@ pub fn write_subscribe(
         let mut c = 0;
         while c < n_ch {
             if !first {
-                n = push_bytes(dst, n, b",")?;
+                p.put(b",")?;
             }
             first = false;
-            n = push_bytes(dst, n, b"\"")?;
-            n = push_bytes(dst, n, channels[c].topic_prefix())?;
-            n = push_bytes(dst, n, symbol)?;
-            n = push_bytes(dst, n, b"\"")?;
+            p.put(b"\"")?;
+            p.put(channels[c].topic_prefix())?;
+            p.put(symbol)?;
+            p.put(b"\"")?;
             c += 1;
         }
         i += 1;
     }
-    n = push_bytes(dst, n, b"]}")?;
-    Some(n)
+    p.put(b"]}")
 }
 
 // ---------------------------------------------------------------
@@ -711,6 +701,18 @@ mod views {
 mod tests {
     use super::*;
     use super::views::*;
+
+    /// The subscribe rendered into a plain buffer — exactly what the
+    /// frame's payload span receives; `None` when it does not fit.
+    fn write_subscribe(
+        buf: &mut [u8],
+        symbols: &BybitSymbolTable,
+        want_tickers: bool,
+    ) -> Option<usize> {
+        let mut p = WsPayload::writing(buf);
+        render_subscribe(&mut p, symbols, want_tickers).ok()?;
+        Some(p.len())
+    }
 
     const BOOK_SNAP: &[u8] = br#"{"topic":"orderbook.1.BTCUSDT","type":"snapshot","ts":1687940967466,"data":{"s":"BTCUSDT","b":[["50005.12","403.24"]],"a":[["50006.34","0.2297"]],"u":18521288,"seq":7961638724},"cts":1687940967464}"#;
     const BOOK_DELTA_BID_ONLY: &[u8] = br#"{"topic":"orderbook.1.BTCUSDT","type":"delta","ts":1687940967470,"data":{"s":"BTCUSDT","b":[["50006.00","1.5"]],"a":[],"u":18521289,"seq":7961638725}}"#;

@@ -38,7 +38,7 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
+    constant_time_eq, expected_accept, queue_masked_text_frame_rendered, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
     ws_unmask_in_place, ws_write_ping, ws_write_pong, Drained, HandshakeResult, IoBuf, Keepalive,
     KeepaliveAction, RxFill, Status, Transport, WsOpcode, WsReadResult,
@@ -64,10 +64,6 @@ pub const RX_BUF_SIZE: usize = 64 * 1024;
 /// [`crate::PM_SUBSCRIBE_IDS_MAX`] ids (≈ 10.7 KiB payload worst
 /// case, plus WS framing), so 16 KiB.
 pub const TX_BUF_SIZE: usize = 16 * 1024;
-
-/// Worst-case market-subscribe payload: every id maximal, full cap.
-/// `{"assets_ids":[…]}` envelope + 128 × (80 + 3) bytes < 11 KiB.
-const SUBSCRIBE_SCRATCH: usize = 11 * 1024;
 
 /// Compile-time guard that the tick-ring capacity is a power of two.
 /// Ring construction itself checks this, but we restate it here because
@@ -486,9 +482,9 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
 
 /// Queue the market-channel subscribe for the configured assets —
 /// the venue sends nothing until it arrives (8d live fix; see
-/// [`crate::write_market_subscribe_multi`]). One frame lists every
-/// configured id (M1 multi-market). Runs exactly once per
-/// connection, on the upgrade→Steady edge.
+/// [`crate::render_market_subscribe`]). One frame lists every
+/// configured id (M1 multi-market), rendered straight into tx.
+/// Runs exactly once per connection, on the upgrade→Steady edge.
 // Doctrine: raw indices, not iterator adapters (CLAUDE.md hot-path rules;
 // `i` indexes three parallel fixed arrays).
 #[allow(clippy::needless_range_loop)]
@@ -502,10 +498,13 @@ fn queue_market_subscribe(drv: &mut Driver) -> io::Result<()> {
     for i in 0..count {
         refs[i] = &drv.asset_ids[i][..drv.asset_id_lens[i] as usize];
     }
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = crate::write_market_subscribe_multi(&mut scratch, &refs[..count])
-        .ok_or_else(|| io::Error::other("polymarket: bad asset ids for subscribe"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    let ids = &refs[..count];
+    if !crate::market_subscribe_ids_valid(ids) {
+        return Err(io::Error::other("polymarket: bad asset ids for subscribe"));
+    }
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        crate::render_market_subscribe(p, ids)
+    })?;
     drv.subscribed = true;
     Ok(())
 }

@@ -93,7 +93,8 @@
 //! livelocking (fail-fast doctrine).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the rx
-//! buffer in place; requests render into stack scratch; the ring copies
+//! buffer in place; requests go straight into tx (the batch subscribe
+//! rendered header first, the rest from parts); the ring copies
 //! are the 64-byte `Tick` and, per changed book top-K, the 192-byte
 //! `DepthTopK` (one copy each into the slot — marked at the push).
 
@@ -102,11 +103,11 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_parts,
-    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
-    HandshakeResult, IoBuf, Keepalive, KeepaliveAction, PendingTable, ReqKind, RxFill, Status,
-    SubErr, SubTable, Transport, WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame_parts,
+    queue_masked_text_frame_rendered, read_server_handshake, sec_websocket_key_from_seed,
+    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong,
+    Drained, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, PendingTable, ReqKind, RxFill,
+    Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
@@ -117,8 +118,8 @@ use core_types::{
 
 use crate::{
     book_op_parts, classify, extract_instrument, parse_book_header, parse_option_ticker,
-    parse_quote, parse_ticker, parse_trade, parse_vol_index, row_wants_channel,
-    set_heartbeat_parts, sub_id_of, test_request_parts, write_subscribe_all, ChainOutcome,
+    parse_quote, parse_ticker, parse_trade, parse_vol_index, render_subscribe_all,
+    row_wants_channel, set_heartbeat_parts, sub_id_of, test_request_parts, ChainOutcome,
     DeribitBookOp, DeribitChannel, DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName,
     TradeSeqOutcome, DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
 };
@@ -167,10 +168,6 @@ pub const MAX_CHANNELS: usize =
 
 /// Subscription-table capacity (≥ [`MAX_CHANNELS`]).
 pub const SUB_CAP: usize = MAX_CHANNELS;
-
-/// Stack scratch for one rendered subscribe batch (≤ ~48 B/channel ×
-/// 192 channels ≈ 9.2 KiB; ~1.7× margin).
-const SUBSCRIBE_SCRATCH: usize = 16 * 1024;
 
 /// Stack scratch for one rendered channel name
 /// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
@@ -775,17 +772,12 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
 
     // 2. One batched subscribe for every (channel × instrument)
     //    (+ WS6 DVOL indices).
+    //    Header first, rendered straight into tx: no scratch.
     let sub_id = drv.alloc_req_id();
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = write_subscribe_all(
-        &mut scratch,
-        sub_id,
-        &drv.symbols,
-        drv.depth_enabled,
-        &drv.dvol[..drv.n_dvol],
-    )
-    .ok_or_else(|| io::Error::other("deribit: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    let (symbols, depth_enabled, dvol) = (&drv.symbols, drv.depth_enabled, &drv.dvol[..drv.n_dvol]);
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        render_subscribe_all(p, sub_id, symbols, depth_enabled, dvol)
+    })?;
     record_pending(&mut drv.pending, sub_id, DeribitReqKind::SubscribeAll)?;
     drv.subscribe_req_id = sub_id;
     drv.session_started = true;
@@ -1913,15 +1905,14 @@ fn log_gap_rate_limited(
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put =
-        |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
-            &mut buf[..],
-            *n,
-            src,
-        ) {
-            Some(e) => *n = e,
-            None => *ok = false,
-        };
+    let put = |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match push_bytes(
+        &mut buf[..],
+        *n,
+        src,
+    ) {
+        Some(e) => *n = e,
+        None => *ok = false,
+    };
     put(
         &mut buf,
         &mut n,
@@ -1964,6 +1955,20 @@ fn log_gap_rate_limited(
         let mut err = std::io::stderr().lock();
         let _ = std::io::Write::write_all(&mut err, &buf[..n]);
     }
+}
+
+/// Append `src` at `at` in a WARN line's stack buffer; `None` when it
+/// does not fit.
+#[inline]
+fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
+    let end = at.checked_add(src.len())?;
+    // COPY: WARN-line text into the caller's stack line (≤ 224 B gap, ≤ 160 B
+    // sub-drop, ≤ 1 per GAP_LOG_INTERVAL_NS, 1 s) — a WARN line must reach
+    // stderr in ONE write — rejected: one write per part (interleaves) and one
+    // `writev` (a short writev splits the line; `write_all_vectored` is
+    // unstable).
+    dst.get_mut(at..end)?.copy_from_slice(src);
+    Some(end)
 }
 
 /// Render `v` as `0x`-prefixed lowercase hex (SymbolId display form —
@@ -2129,15 +2134,14 @@ fn log_sub_drop_rate_limited(drv: &mut Driver, sym: u32, code: i64, ch: i64) {
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put =
-        |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
-            &mut buf[..],
-            *n,
-            src,
-        ) {
-            Some(e) => *n = e,
-            None => *ok = false,
-        };
+    let put = |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match push_bytes(
+        &mut buf[..],
+        *n,
+        src,
+    ) {
+        Some(e) => *n = e,
+        None => *ok = false,
+    };
     put(
         &mut buf,
         &mut n,
