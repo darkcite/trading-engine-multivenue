@@ -6,6 +6,96 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `core_regime::math::isqrt_i128` is the floor root at v = 2
+
+**What changed**
+
+- `isqrt_i128(2)` returned 2: the Newton start `v/2 + 1` equals `v` at 2,
+  so the loop never ran. `v < 4` is now answered directly (1), and a
+  test pins the floor law on every input up to 10 000. Python's
+  `math.isqrt` — every mirror's — always said 1.
+
+**Why**
+
+- Found by the HAR H1 review as a Rust ↔ Python parity break (the long
+  tape now carries the case: a day whose `Σ r²` is exactly 2).
+
+**Impact**
+
+- Every caller (core-vol, core-regime, strategy-bin15/-vm/-xsd) moves only
+  for an input of exactly 2 — a sum of squared bps×1e9 returns that no
+  market produces; every existing fixture is byte-identical and green.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the commit.
+
+## 2026-09-26 — `core_vol::LongVolEngine`: the HAR over whole days, 1–40 d (HAR H1)
+
+**What changed**
+
+- `crates/core-vol/src/long.rs` (new, re-exported at the crate root):
+  `LongVolEngine`, the long-tenor sibling of `VolEngine`, fed by the same
+  minute-close law but keeping one `Σ r²` per UTC day.
+  - A day ring of 64 calendar-contiguous days. A UTC day with no minute
+    is pushed EMPTY, and the EMPTY-DAY LAW holds: no return is formed
+    across it (the next close only primes), no pair forms through it, no
+    arm forms while it is in the 30-day fold window — ABSENT DATA HOLDS
+    over biased pairs that would sit in the ring for months (the review
+    measured a 40-day silence dragging the raw 1 d σ from 17.3 % to
+    11.9 % while "warm"). A silence of 64 days or more clears the ring
+    and keeps every pair and fit.
+  - The fold over `[1, 7, 30]` completed days, `VolEngine`'s integer
+    steps in days; the grid is EVERY whole day `1 ..= 40`
+    (`long_tenor_of`), with `ANNUALISE_LONG_1E9` computed at compile
+    time by the law that reproduces `ANNUALISE_15M/4H/8H_1E9` (1 d
+    19 111 514 854, 1 w 7 223 473 640, 1 M 3 489 269 264, pinned).
+  - At each day close every tenor ARMS (its `x` and the fitted forecast
+    made from it) and SETTLES its arm from `τ` closes ago against the
+    `τ` days since: overlapping, daily-stepped pairs keyed by the
+    target's first day, 128 per tenor, a rolling fit per tenor, and a
+    QLIKE tell of the raw fold against the fit AS ARMED.
+  - Writer accessors (`day_at`, `open_day`, `arm_at`, `pair_at`,
+    `qlike_at`) and their exact inverses (`seed_day`, `seed_open`,
+    `seed_arm`, `seed_pair`, `seed_qlike`, `refresh`) for the H3 state
+    file; a round trip is identical and continues identically (tested).
+    A seed the writer could never have produced (a "none" or an
+    out-of-range log-vol, a day sum above 1e32) is refused, never
+    repaired — the review showed one wrapping the fit's sums.
+  - 206 080 B, `#[repr(C, align(64))]`, size-asserted; no allocation
+    after `new()` — bench gate 77 (`long_vol_is_zero_alloc`: 60 day
+    closes over the whole grid under the guard, 0 B/op).
+- `core_vol::ols_fit_1e9` (new, public): `VolEngine::refit`'s closed-form
+  OLS lifted into a free function that BOTH engines call, and the QLIKE
+  trailing means into a crate-private helper. `VolEngine`'s outputs are
+  unchanged: the shared parity fixtures (`claude-worker/tests/fixtures/vol/`)
+  are byte-identical and green before and after (gate G3).
+
+**Why**
+
+- The long-tenor plan (vault `docs/research/vol/har-long-tenor-plan-2026-09-19.md`
+  §3.1, phase H1) under ruling O-HC5: weekly/monthly tenors plus the
+  1–40 d grid that spans a Hypercall option chain, on all 12 series.
+
+**Impact**
+
+- None on the engine: no owner holds a `LongVolEngine` yet (H3 — the
+  feed descriptor per series, `StrategySet` ownership and `/state.har`
+  are operator rulings). No member reads it; nothing here is a trading
+  signal (plan law L4).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the `HAR:` H1 commit.
+
 ## 2026-09-26 — `crates/core-settle`: the Hypercall settlement law, replicated; the settlement shadow (HC7)
 
 **What changed**

@@ -9358,3 +9358,71 @@ fn settlement_window_and_median_of_means_are_zero_alloc() {
     assert_eq!(allocs, 0, "settlement replicator allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0);
 }
+
+/// The long-tenor gate's price walk: a slow 40-day vol regime so the
+/// fold's regressor varies and the fits exist (test-only, no model).
+fn long_vol_px(s: &mut u64, px: &mut i64, day: u64) -> i64 {
+    *s = s
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let phase = day % 40;
+    let level = if phase < 20 { phase } else { 40 - phase };
+    let amp = 2_000_000 * (4 + level) as i64;
+    *px = (*px + ((*s >> 32) % (2 * amp as u64 + 1)) as i64 - amp).max(1_000_000_000);
+    *px
+}
+
+/// **HAR H1 gate 77 — the long-tenor engine is 0 B/op.** Sixty UTC days
+/// of minute closes (86 400) through a WARM engine whose short tenors
+/// are fitted: every minute's return and add, every day close's settle +
+/// pair + refit + arm over the whole 1–40 d grid (the 1 d pair ring and
+/// the QLIKE ring wrap), and every tenor's forecasts, fit and QLIKE tell
+/// read once an hour. The engine is boot-boxed and
+/// warmed by 100 unmeasured days (the only allocation is the box).
+#[test]
+fn long_vol_is_zero_alloc() {
+    use core_vol::{LongForecast, LongVolEngine, DAY_MS, DAY_NS, LONG_TAU_DAYS_MAX};
+    const DAY0: u64 = 1_767_225_600_000; // 2026-01-01 00:00Z
+    let mut e = Box::new(LongVolEngine::new());
+    let mut s: u64 = 20_260_926;
+    let mut px: i64 = 79_000_000_000;
+    let mut day = 0u64;
+    while day < 100 {
+        let mut m = 0u64;
+        while m < 1440 {
+            e.on_minute_close_at(long_vol_px(&mut s, &mut px, day), DAY0 + day * DAY_MS + m * 60_000);
+            m += 1;
+        }
+        day += 1;
+    }
+    assert!(e.is_warm());
+    assert!(e.fit(DAY_NS).is_some(), "the gate must measure a FITTED engine");
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    while day < 160 {
+        let mut m = 0u64;
+        while m < 1440 {
+            e.on_minute_close_at(long_vol_px(&mut s, &mut px, day), DAY0 + day * DAY_MS + m * 60_000);
+            if m % 60 == 0 {
+                let mut d = 1u64;
+                while d <= LONG_TAU_DAYS_MAX as u64 {
+                    let t = d * DAY_NS;
+                    acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Raw).unwrap_or(0));
+                    acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Fit).unwrap_or(0));
+                    acc = acc.wrapping_add(e.qlike_counters(t).fit_mean_1e9);
+                    acc = acc.wrapping_add(e.n_pairs(t) as i64);
+                    d += 1;
+                }
+            }
+            m += 1;
+        }
+        day += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(e.n_pairs(DAY_NS), core_vol::PAIR_RING_LONG, "the 1 d ring wrapped under the guard");
+    assert_eq!(allocs, 0, "long-tenor engine allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "long-tenor engine bytes should be zero: saw {bytes}");
+}

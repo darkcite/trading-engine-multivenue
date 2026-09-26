@@ -62,10 +62,28 @@
 //!   "extends the horizon" has to delete a line that says why, rather
 //!   than pass a bigger number.
 
+//!
+//! ## The long tenors live beside it, not in it
+//!
+//! [`LongVolEngine`] (HAR H1, `long.rs`) forecasts whole days — 1 to 40
+//! of them — from one `Σ r²` per UTC day, with the same minute-close
+//! law, the same `ln`/`exp`, the same annualising law and the same fit
+//! ([`ols_fit_1e9`], lifted out of this engine's `refit` so the two
+//! cannot drift). This engine and [`tenor_of`] are untouched by it: its
+//! 15 m / 4 h / 8 h numbers are bit-identical by construction, and the
+//! shared parity fixtures prove it (gate G3).
+
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod fx;
+mod long;
+
+pub use long::{
+    long_tenor_of, LongForecast, LongQlike, LongTenor, LongVolEngine, ANNUALISE_LONG_1E9,
+    DAY_MINUTES, DAY_MS, DAY_NS, DAY_RING, LONG_TAU_DAYS_MAX, LONG_WARM_DAYS, LONG_WINDOWS_DAYS,
+    PAIR_RING_LONG,
+};
 
 /// 1-minute return ring. 1536 > 1440 by a whole 96 minutes, so the
 /// sample leaving the longest window is always still resident when the
@@ -874,17 +892,10 @@ impl VolEngine {
         if self.q_n == 0 {
             return QlikeCounters::default();
         }
-        let n = self.q_n as i128;
-        let mut si: i128 = 0;
-        let mut sh: i128 = 0;
-        let mut i = 0usize;
-        while i < self.q_n {
-            si += self.qlike_iv_1e9[i] as i128;
-            sh += self.qlike_har_1e9[i] as i128;
-            i += 1;
-        }
-        let iv = core_regime::math::floor_div(si, n) as i64;
-        let har = core_regime::math::floor_div(sh, n) as i64;
+        let (iv, har) = trailing_means_1e9(
+            &self.qlike_iv_1e9[..self.q_n],
+            &self.qlike_har_1e9[..self.q_n],
+        );
         QlikeCounters {
             n: self.q_n as u32,
             iv_mean_1e9: iv,
@@ -965,69 +976,120 @@ impl VolEngine {
         }
     }
 
-    /// Closed-form OLS over the pair ring, in `i128`. Cold path: once
-    /// per settled expiry, O(128).
+    /// Refit the line over the pair ring ([`ols_fit_1e9`] — the one body
+    /// [`LongVolEngine`] fits with too). Cold path: once per settled
+    /// expiry, O(128). An unfit ring leaves `a`/`b` unread: every reader
+    /// is gated on `fitted`.
     fn refit(&mut self) {
-        if self.n_pairs < MIN_PAIRS {
-            self.fitted = false;
-            return;
+        match ols_fit_1e9(
+            &self.pair_x_1e9[..self.n_pairs],
+            &self.pair_y_1e9[..self.n_pairs],
+        ) {
+            Some((a, b)) => {
+                self.a_1e9 = a;
+                self.b_1e9 = b;
+                self.fitted = true;
+            }
+            None => self.fitted = false,
         }
-        let n = self.n_pairs as i128;
-        let mut sx: i128 = 0;
-        let mut sy: i128 = 0;
-        let mut i = 0usize;
-        while i < self.n_pairs {
-            sx += self.pair_x_1e9[i] as i128;
-            sy += self.pair_y_1e9[i] as i128;
-            i += 1;
-        }
-        let xbar = core_regime::math::floor_div(sx, n);
-        let ybar = core_regime::math::floor_div(sy, n);
-        let mut sxy: i128 = 0;
-        let mut sxx: i128 = 0;
-        i = 0;
-        while i < self.n_pairs {
-            let dx = self.pair_x_1e9[i] as i128 - xbar;
-            let dy = self.pair_y_1e9[i] as i128 - ybar;
-            sxy += dx * dy;
-            sxx += dx * dx;
-            i += 1;
-        }
-        if sxx == 0 {
-            // Every regressor identical: the slope is undefined, and a
-            // fit that cannot see x is not a forecast.
-            self.fitted = false;
-            return;
-        }
-        // BIN15 P1b (F5): a REGRESSOR FLOOR, not just a non-zero test.
-        // `sxx == 0` only catches x's that are bit-identical; sixty
-        // log-vols that differ in the ninth decimal are numerically
-        // distinct and give a slope of hundreds, which then multiplies
-        // the forecast into a sigma nothing in the tape supports. The
-        // floor asks for real dispersion: Sxx >= n * X_SPREAD_MIN_1E9^2
-        // is a root-mean-square deviation of at least 0.01 in log,
-        // i.e. the regressor actually varied by ~1 %.
-        if sxx < n * (X_SPREAD_MIN_1E9 as i128) * (X_SPREAD_MIN_1E9 as i128) {
-            self.fitted = false;
-            return;
-        }
-        // The slope, then CLAMPED — before the intercept is formed, so
-        // `a` is the intercept OF THE LINE THE ENGINE WILL USE and not
-        // of a line it just rejected. A HAR log-vol regressed on its own
-        // lagged log-vol has a slope in [0, 1] by construction and
-        // anything up to 2 is a defensible mean-reversion overshoot; a
-        // slope of 40 is an artefact of a degenerate x, and it is the
-        // one that made sigma_hat 1e4 too large without moving a single
-        // counter. ABSENT DATA HOLDS is the shape of the branch above;
-        // this is its arithmetic twin — an untrustworthy fit becomes a
-        // BOUNDED one rather than a wild one.
-        let b = core_regime::math::floor_div(sxy * 1_000_000_000, sxx)
-            .clamp(B_MIN_1E9 as i128, B_MAX_1E9 as i128);
-        let a = ybar - core_regime::math::floor_div(b * xbar, 1_000_000_000);
-        self.b_1e9 = i64::try_from(b).unwrap_or(0);
-        self.a_1e9 = i64::try_from(a).unwrap_or(0);
-        self.fitted = i128::from(self.b_1e9) == b && i128::from(self.a_1e9) == a;
     }
+}
+
+/// The fit both engines take: closed-form OLS of `ys` on `xs` in `i128`,
+/// `(a_1e9, b_1e9)` — lifted verbatim out of `VolEngine::refit` at HAR
+/// H1 so the two engines cannot drift (gate G3: the shared parity
+/// fixtures are byte-identical before and after the lift).
+///
+/// `None` — ABSENT DATA HOLDS — on fewer than [`MIN_PAIRS`] pairs, a
+/// regressor with no spread (or less than [`X_SPREAD_MIN_1E9`] of it),
+/// or a line that does not fit `i64`. The slope is clamped to
+/// `[B_MIN_1E9, B_MAX_1E9]` BEFORE the intercept is formed. The pair
+/// order is irrelevant (exact integer sums). Cold path: O(n).
+#[must_use]
+pub fn ols_fit_1e9(xs: &[i64], ys: &[i64]) -> Option<(i64, i64)> {
+    debug_assert_eq!(xs.len(), ys.len());
+    let len = xs.len().min(ys.len());
+    if len < MIN_PAIRS {
+        return None;
+    }
+    let n = len as i128;
+    let mut sx: i128 = 0;
+    let mut sy: i128 = 0;
+    let mut i = 0usize;
+    while i < len {
+        sx += xs[i] as i128;
+        sy += ys[i] as i128;
+        i += 1;
+    }
+    let xbar = core_regime::math::floor_div(sx, n);
+    let ybar = core_regime::math::floor_div(sy, n);
+    let mut sxy: i128 = 0;
+    let mut sxx: i128 = 0;
+    i = 0;
+    while i < len {
+        let dx = xs[i] as i128 - xbar;
+        let dy = ys[i] as i128 - ybar;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        i += 1;
+    }
+    if sxx == 0 {
+        // Every regressor identical: the slope is undefined, and a
+        // fit that cannot see x is not a forecast.
+        return None;
+    }
+    // BIN15 P1b (F5): a REGRESSOR FLOOR, not just a non-zero test.
+    // `sxx == 0` only catches x's that are bit-identical; sixty
+    // log-vols that differ in the ninth decimal are numerically
+    // distinct and give a slope of hundreds, which then multiplies
+    // the forecast into a sigma nothing in the tape supports. The
+    // floor asks for real dispersion: Sxx >= n * X_SPREAD_MIN_1E9^2
+    // is a root-mean-square deviation of at least 0.01 in log,
+    // i.e. the regressor actually varied by ~1 %.
+    if sxx < n * (X_SPREAD_MIN_1E9 as i128) * (X_SPREAD_MIN_1E9 as i128) {
+        return None;
+    }
+    // The slope, then CLAMPED — before the intercept is formed, so
+    // `a` is the intercept OF THE LINE THE ENGINE WILL USE and not
+    // of a line it just rejected. A HAR log-vol regressed on its own
+    // lagged log-vol has a slope in [0, 1] by construction and
+    // anything up to 2 is a defensible mean-reversion overshoot; a
+    // slope of 40 is an artefact of a degenerate x, and it is the
+    // one that made sigma_hat 1e4 too large without moving a single
+    // counter. ABSENT DATA HOLDS is the shape of the branch above;
+    // this is its arithmetic twin — an untrustworthy fit becomes a
+    // BOUNDED one rather than a wild one.
+    let b = core_regime::math::floor_div(sxy * 1_000_000_000, sxx)
+        .clamp(B_MIN_1E9 as i128, B_MAX_1E9 as i128);
+    let a = ybar - core_regime::math::floor_div(b * xbar, 1_000_000_000);
+    match (i64::try_from(a), i64::try_from(b)) {
+        (Ok(a), Ok(b)) => Some((a, b)),
+        _ => None,
+    }
+}
+
+/// The floored means of two equally long trailing windows — the QLIKE
+/// tell's arithmetic, one body for both engines (`(0, 0)` when empty).
+/// Order-free: exact integer sums.
+fn trailing_means_1e9(a: &[i64], b: &[i64]) -> (i64, i64) {
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return (0, 0);
+    }
+    let mut sa: i128 = 0;
+    let mut sb: i128 = 0;
+    let mut i = 0usize;
+    while i < len {
+        sa += a[i] as i128;
+        sb += b[i] as i128;
+        i += 1;
+    }
+    let n = len as i128;
+    (
+        core_regime::math::floor_div(sa, n) as i64,
+        core_regime::math::floor_div(sb, n) as i64,
+    )
 }
 
 /// `QLIKE(σ̂², rv²) = u − ln u − 1` where `u = rv²/σ̂²`, in ×1e9.
