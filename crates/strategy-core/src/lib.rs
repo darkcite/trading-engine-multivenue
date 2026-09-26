@@ -364,6 +364,22 @@ pub trait StrategyCounters {
         false
     }
 
+    /// HAR H3.5: the long-tenor set's counters (`/state.har`, the
+    /// `engine_har_*` gauges); all zero with no `har.toml`.
+    #[inline]
+    fn har_counters(&self) -> HarCounters {
+        HarCounters::default()
+    }
+
+    /// HAR H3.5: copy the configured series' rows into `out` (`har.toml`
+    /// order, `min(series, out.len())` rows); returns the series
+    /// configured — `0` for a plain strategy. Never allocates.
+    #[inline]
+    fn har_series_view(&self, out: &mut [HarSeriesView]) -> u32 {
+        let _ = out;
+        0
+    }
+
     /// XSD (slot 2, statarb doc 08): the cross-sectional member's
     /// observables (`engine_xsd_*`), mirrored like [`Self::icdp_counters`].
     #[inline]
@@ -1454,6 +1470,114 @@ pub struct XsdPositionView {
     /// Boundary hour of the last add (`entry_hour` when none).
     pub last_add_hour: i64,
 }
+
+// ---------------------------------------------------------------
+// HAR H3.5 — the long-tenor set's `/state.har` rows and counters
+// ---------------------------------------------------------------
+
+/// Series `/state.har` carries — `core_vol::LONG_SET_MAX` (a const assert
+/// in `strategy-set` pins the two together).
+pub const HAR_VIEW_SERIES: usize = 12;
+/// A series name's bytes — `core_vol::LONG_SET_NAME_MAX`.
+pub const HAR_VIEW_NAME_MAX: usize = 12;
+/// The dashboard's tenors (the H3 plan's §7 panel), whole days, in
+/// `/state` order.
+pub const HAR_VIEW_TENORS_D: [u32; 9] = [1, 2, 3, 5, 7, 14, 21, 30, 40];
+/// Tenors per series row.
+pub const HAR_VIEW_TENORS: usize = HAR_VIEW_TENORS_D.len();
+/// Weekdays of the profile, Monday first — `core_vol::WEEKDAYS`.
+pub const HAR_VIEW_WEEKDAYS: usize = 7;
+
+/// HAR H3.5: the long-tenor set's own counters (`core_vol::LongSetCounters`,
+/// field for field) — defined here so the cli mirrors them without naming
+/// `core-vol` (the regime-counters precedent). POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarCounters {
+    /// Minute boundaries the clock rolled.
+    pub minutes_rolled: u64,
+    /// Minute closes delivered to the engines.
+    pub closes: u64,
+    /// Closes that crossed a UTC day (the close law ran).
+    pub day_closes: u64,
+    /// First new-day minutes held for a later poll (the stagger).
+    pub held: u64,
+    /// Held minutes forced out by a newer minute of their series.
+    pub forced: u64,
+    /// The costliest day close, ns (the engine's close law alone).
+    pub day_close_ns_max: u64,
+    /// The newest day close's cost, ns.
+    pub day_close_ns_last: u64,
+    /// Bumped at every day close and at the boot restore.
+    pub epoch: u64,
+}
+
+/// HAR H3.5: one long-tenor series as `/state.har` and the dashboard read
+/// it. POD, 176 B.
+///
+/// The forecasts, the pairs, the profile and the day census move only at
+/// the series' own UTC day close (or the boot restore), so the set builds
+/// this row there and the 1 s publish copies it; `last_min_ms`,
+/// `open_minutes` and `gaps` are read live at the publish.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarSeriesView {
+    /// The newest folded minute's open, ms since the epoch (0 = none).
+    pub last_min_ms: u64,
+    /// The newest CLOSED day's UTC midnight, ms since the epoch (0 = none).
+    pub newest_day_ms: u64,
+    /// Non-contiguous minutes folded (one splice per restart is normal).
+    pub gaps: u64,
+    /// The series' state epoch when this row was built.
+    pub epoch: u64,
+    /// The feed's symbol.
+    pub feed: SymbolId,
+    /// Minutes folded into the open day.
+    pub open_minutes: u32,
+    /// σ annualised ×1e6 at each [`HAR_VIEW_TENORS_D`] tenor: the raw
+    /// fold (`0` = none — cold, or before the first close).
+    pub raw_1e6: [i32; HAR_VIEW_TENORS],
+    /// σ annualised ×1e6: the rolling fit applied to the fold (`0` =
+    /// unfitted — fewer than 60 pairs).
+    pub fit_1e6: [i32; HAR_VIEW_TENORS],
+    /// The weekday profile ×1e6, Monday first: the mean `Σ r²` of that
+    /// weekday's observed days over the mean observed day (`1e6` = an
+    /// average day; `0` = no observed day of it).
+    pub weekday_1e6: [i32; HAR_VIEW_WEEKDAYS],
+    /// Observed days behind each weekday's mean (saturating at 255).
+    pub weekday_n: [u8; HAR_VIEW_WEEKDAYS],
+    /// Pairs held at each tenor (the ring holds 128).
+    pub pairs: [u8; HAR_VIEW_TENORS],
+    /// The `har.toml` name, `name_len` bytes live.
+    pub name: [u8; HAR_VIEW_NAME_MAX],
+    /// Live bytes of `name`.
+    pub name_len: u8,
+    /// 1 when the fold forecasts: the newest 30 closed days are resident
+    /// and every one was observed.
+    pub warm: u8,
+    /// Closed days resident (≤ 64).
+    pub days: u8,
+    /// Resident days with no minute at all (holes — the empty-day law).
+    pub empty_days: u8,
+    /// Bit `k`: tenor `k` has a fit.
+    pub fitted: u16,
+    /// Bit `k`: tenor `k`'s QLIKE over a FULL window says the fit beats
+    /// the raw fold.
+    pub fit_beats_raw: u16,
+}
+
+impl HarSeriesView {
+    /// The live name bytes.
+    #[inline]
+    #[must_use]
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(HAR_VIEW_NAME_MAX)]
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<HarSeriesView>() == 176);
+const _: () = assert!(core::mem::size_of::<HarCounters>() == 64);
+const _: () = assert!(HAR_VIEW_TENORS <= 16, "fitted / fit_beats_raw are u16 masks");
 
 // ---------------------------------------------------------------
 // risk — the venue-aware notional caps (`docs/risk-policy.md`)

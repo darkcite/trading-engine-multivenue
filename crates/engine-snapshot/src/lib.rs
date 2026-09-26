@@ -53,7 +53,7 @@ pub use cell::SnapshotCell;
 pub use json::{encode_state_json, JsonOverflow, STATE_JSON_MAX};
 pub use snapshot::{
     halt_reason_word, AiSnapshot, BootInfo, CaptureSnapshot, EngineSnapshot, ExecSnapshot,
-    HyparbSnapshot, IcdpSnapshot, IngressSnapshot, LatencySnapshot, LoopCounters, RecentRing,
+    HarSnapshot, HyparbSnapshot, IcdpSnapshot, IngressSnapshot, LatencySnapshot, LoopCounters, RecentRing,
     VmSnapshot, BOOT_TEXT_MAX, HALT_REASON_WORDS, RECENT_FILLS, RECENT_ORDERS, RUN_DIR_MAX,
     SLOT_NAMES, SNAPSHOT_HYPARB_COINS, SNAPSHOT_HYPARB_POOLS, SNAPSHOT_SCHEMA, SNAPSHOT_SLOTS,
     SNAPSHOT_VENUES, VENUE_NAMES,

@@ -3,7 +3,7 @@
 
 //! The `/state` snapshot POD (plan §6.1 sections: `boot`, `regime`,
 //! `slots`, `vm`, `icdp`, `ai`, `ingress`, `latency`, `recent`,
-//! `capture`). Every field is a plain integer, a fixed array or an
+//! `capture`; later additive sections: `vrp`, `hyparb`, `exec`, `har`). Every field is a plain integer, a fixed array or an
 //! embedded `#[repr(C)]` POD from `core-types` / `strategy-core`;
 //! `Copy` throughout so the seqlock can copy it whole.
 //!
@@ -13,8 +13,9 @@
 
 use core_types::{Fill, Order};
 use strategy_core::{
-    HyparbCoinView, HyparbCounters, HyparbPoolView, IcdpCounters, RegimeCounters, RegimeRelView,
-    SlotCounters, VmRowView, VrpCounters, VrpSnapshotView,
+    HarCounters, HarSeriesView, HyparbCoinView, HyparbCounters, HyparbPoolView, IcdpCounters,
+    RegimeCounters, RegimeRelView, SlotCounters, VmRowView, VrpCounters, VrpSnapshotView,
+    HAR_VIEW_SERIES,
 };
 
 /// JSON schema version of `/state` (`"v"`). Bump on any field removal
@@ -337,6 +338,37 @@ impl Default for HyparbSnapshot {
     }
 }
 
+/// HAR H3.5: the long-tenor HAR series (`core_vol::LongVolSet`, held by
+/// the strategy set) — its identity, its counters and one row per
+/// configured series, all from ONE publish instant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct HarSnapshot {
+    /// SHA-256 of the `har.toml` loaded at boot (all-zero: none).
+    pub hash: [u8; 32],
+    /// The set's counters.
+    pub counters: HarCounters,
+    /// Series configured (`0` = the service is off).
+    pub n: u32,
+    /// Series the file names that the boot DROPPED (a feed the boot
+    /// universe does not carry — the rest run).
+    pub dropped: u32,
+    /// The rows, `[..n]` live, in `har.toml` order.
+    pub series: [HarSeriesView; HAR_VIEW_SERIES],
+}
+
+impl Default for HarSnapshot {
+    fn default() -> Self {
+        Self {
+            hash: [0; 32],
+            counters: HarCounters::default(),
+            n: 0,
+            dropped: 0,
+            series: [HarSeriesView::default(); HAR_VIEW_SERIES],
+        }
+    }
+}
+
 /// The AI command plane (`AiIngressStatus` cumulative counters + the
 /// two engine-side values).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -629,6 +661,8 @@ pub struct EngineSnapshot {
     pub vrp: VrpSnapshot,
     /// HYPARB H6: the slot-0 member.
     pub hyparb: HyparbSnapshot,
+    /// HAR H3.5: the long-tenor HAR series.
+    pub har: HarSnapshot,
     /// **E6: the execution router's kill switches.**
     pub exec: ExecSnapshot,
     /// The AI plane.
@@ -668,6 +702,7 @@ impl EngineSnapshot {
             icdp: IcdpSnapshot::default(),
             vrp: VrpSnapshot::default(),
             hyparb: HyparbSnapshot::default(),
+            har: HarSnapshot::default(),
             exec: ExecSnapshot::default(),
             ai: AiSnapshot::default(),
             ingress: [IngressSnapshot::default(); SNAPSHOT_VENUES],
@@ -714,9 +749,12 @@ mod tests {
         assert_eq!(core::mem::align_of::<EngineSnapshot>(), 64);
         // Plan §6.1 budget: ≈ 24 KB. The rings (8 KB) + 256 row views
         // (12 KB) dominate; anything past 32 KB is a layout regression.
+        // HAR H3.5 added 2 216 B (twelve 176 B series rows + identity and
+        // counters): 27 776 → 30 016 B.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
+        assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }
 
     #[test]

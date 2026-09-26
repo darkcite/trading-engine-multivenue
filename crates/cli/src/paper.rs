@@ -3580,6 +3580,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         let anchor = core_time::WallAnchor::now();
         if crate::har_boot::install(&mut set, hb, anchor, core_time::now_ns()) {
             obs.har_state_paths = hb.series.iter().map(|s| s.state_path.clone()).collect();
+            // H3.5: the file's identity and what it lost, for `/state.har`.
+            obs.har_hash = hb.hash;
+            obs.har_dropped = hb.dropped.len().min(u32::MAX as usize) as u32;
         }
     }
     // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
@@ -3986,6 +3989,7 @@ impl Observability {
             let hyparb = register_hyparb_metrics(&mut reg)?;
             let hyparb_evm = register_hyparb_evm_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
+            let har = register_har_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             // E1: only when a router is actually in force. A boot with
             // no `--exec` reports `configured == 0` here and registers
@@ -4093,6 +4097,7 @@ impl Observability {
                 hyparb,
                 hyparb_evm,
                 regime,
+                har,
                 paper_matcher,
                 exec,
             });
@@ -4237,6 +4242,12 @@ pub struct Observability {
     /// order. Empty = no HAR service, and the engine writes nothing. Set
     /// by the set builder from the boot bundle.
     pub har_state_paths: Vec<std::path::PathBuf>,
+    /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
+    /// (all-zero: no HAR service) — `/state.har.hash`.
+    pub har_hash: [u8; 32],
+    /// HAR H3.5: series the file named that the boot dropped (a feed the
+    /// boot universe does not carry) — `/state.har.dropped`.
+    pub har_dropped: u32,
     /// HYPARB H8: the testnet write path's tap (`mode = "testnet"`
     /// only) — **taken** by the engine loop, drained once per report
     /// period (O-H12: each paper AMM decision is shadowed on chain 998).
@@ -4493,6 +4504,8 @@ pub struct EngineCounters {
     pub hyparb_evm: HyparbEvmMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
+    /// HAR H3.5: the `engine_har_*` gauges.
+    pub har: HarMetricIds,
     /// X1: the `engine_paper_matcher_*` family + the set's
     /// `engine_set_fills_unrouted_total`.
     pub paper_matcher: PaperMatcherMetricIds,
@@ -6942,6 +6955,74 @@ fn mirror_regime_metrics<S: strategy_core::StrategyCounters>(
 }
 
 // ---------------------------------------------------------------
+// HAR H3.5: the `engine_har_*` gauges
+// ---------------------------------------------------------------
+
+/// Registry handles of the long-tenor HAR gauges. Always registered (the
+/// regime family's precedent): a boot without `har.toml` reports
+/// `engine_har_series_configured 0` and nothing else moves.
+#[derive(Copy, Clone, Debug)]
+pub struct HarMetricIds {
+    /// `engine_har_series_configured` — series the set runs.
+    pub configured: GaugeId,
+    /// `engine_har_series_warm` — series whose fold forecasts.
+    pub warm: GaugeId,
+    /// `engine_har_day_age_max_s` — the stalest series: whole seconds since
+    /// its newest closed day ENDED (−1 = no series has closed a day). Past
+    /// 26 h (93 600 s) a series is not recalibrating.
+    pub day_age_max_s: GaugeId,
+    /// `engine_har_day_close_ns_max` — the costliest UTC day close since
+    /// boot (the engine's close law alone; the stagger pays one a poll).
+    pub day_close_ns_max: GaugeId,
+}
+
+/// Register the HAR gauges. Boot-only.
+fn register_har_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HarMetricIds, &'static str> {
+    let mut gauge = |name: &str| -> Result<GaugeId, &'static str> {
+        reg.register_gauge(name).map_err(|_| "register har gauge")
+    };
+    Ok(HarMetricIds {
+        configured: gauge("engine_har_series_configured")?,
+        warm: gauge("engine_har_series_warm")?,
+        day_age_max_s: gauge("engine_har_day_age_max_s")?,
+        day_close_ns_max: gauge("engine_har_day_close_ns_max")?,
+    })
+}
+
+/// Mirror the HAR gauges from the set's rows. 5 s cadence — cold path;
+/// the rows land in the caller's boot-allocated scratch.
+fn mirror_har_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HarMetricIds,
+    strat: &S,
+    rows: &mut [strategy_core::HarSeriesView],
+    wall_ms: u64,
+) {
+    let n = strat.har_series_view(rows) as usize;
+    let m = n.min(rows.len());
+    let mut warm = 0i64;
+    let mut age_max: i64 = -1;
+    let mut i = 0usize;
+    while i < m {
+        let r = &rows[i];
+        warm += i64::from(r.warm);
+        if r.newest_day_ms != 0 {
+            let closed_ms = r.newest_day_ms.saturating_add(core_vol::DAY_MS);
+            let age = (wall_ms.saturating_sub(closed_ms) / 1_000).min(i64::MAX as u64) as i64;
+            age_max = age_max.max(age);
+        }
+        i += 1;
+    }
+    reg.gauge(ids.configured).set(n as i64);
+    reg.gauge(ids.warm).set(warm);
+    reg.gauge(ids.day_age_max_s).set(age_max);
+    reg.gauge(ids.day_close_ns_max)
+        .set(strat.har_counters().day_close_ns_max.min(i64::MAX as u64) as i64);
+}
+
+// ---------------------------------------------------------------
 // RG6 `/state` snapshot — filled once per second by the engine loop
 // ---------------------------------------------------------------
 
@@ -7106,6 +7187,13 @@ fn fill_snapshot<S, D>(
     out.hyparb.counters = Sc::hyparb_counters(strat);
     out.hyparb.n_pools = Sc::hyparb_pools_view(strat, &mut out.hyparb.pools);
     out.hyparb.n_coins = Sc::hyparb_coins_view(strat, &mut out.hyparb.coins);
+
+    // HAR H3.5: the long-tenor series — the set's cached rows (rebuilt
+    // at each series' day close) with the minute fields read live.
+    out.har.hash = obs.har_hash;
+    out.har.dropped = obs.har_dropped;
+    out.har.counters = Sc::har_counters(strat);
+    out.har.n = Sc::har_series_view(strat, &mut out.har.series);
 
     // E6 c4: the router's kill switches. Read through the trait, from
     // the same publish instant as everything else, so a halted slot
@@ -7723,6 +7811,8 @@ where
         }};
     }
     let mut regime_last = strategy_core::RegimeCounters::default();
+    // HAR H3.5: the gauges' row scratch (boot-allocated, reused).
+    let mut har_rows = [strategy_core::HarSeriesView::default(); strategy_core::HAR_VIEW_SERIES];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -7893,6 +7983,17 @@ where
                     &mut lifecycle_last,
                 );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
+                // HAR H3.5: day ages are wall time (UTC days).
+                mirror_har_metrics(
+                    reg,
+                    &ids.har,
+                    eng.strategy(),
+                    &mut har_rows,
+                    obs.boot
+                        .boot_wall_ns
+                        .wrapping_add(now.wrapping_sub(obs.boot.boot_mono_ns))
+                        / 1_000_000,
+                );
                 // E1: the router's own counters. Absent family = no
                 // `--exec` = nothing to mirror, and no branch cost that
                 // a pre-E1 boot did not already pay.
@@ -10624,6 +10725,56 @@ mod tests {
         assert!(text.contains("engine_ingress_hypercall_capture_records"));
         assert!(text.contains("engine_ingress_hypercall_coverage_configured"));
         assert!(text.contains("engine_ingress_hypercall_options_selected"));
+    }
+
+    /// HAR H3.5: four gauges, always registered (a boot without
+    /// `har.toml` reports `configured 0`); the mirror counts the warm
+    /// series and reports the STALEST newest-day age (−1: none closed).
+    #[test]
+    fn the_har_family_is_4_gauges_and_mirrors_the_stalest_day() {
+        struct Fake(Vec<strategy_core::HarSeriesView>, u64);
+        impl strategy_core::StrategyCounters for Fake {
+            fn har_counters(&self) -> strategy_core::HarCounters {
+                strategy_core::HarCounters {
+                    day_close_ns_max: self.1,
+                    ..strategy_core::HarCounters::default()
+                }
+            }
+            fn har_series_view(&self, out: &mut [strategy_core::HarSeriesView]) -> u32 {
+                let m = self.0.len().min(out.len());
+                out[..m].copy_from_slice(&self.0[..m]);
+                self.0.len() as u32
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_har_metrics(&mut reg).expect("register har");
+        assert_eq!(reg.counters_len() - c0, 0, "gauges only");
+        assert_eq!(reg.gauges_len() - g0, 4);
+        assert!(register_har_metrics(&mut reg).is_err(), "names are unique");
+        let mut rows = [strategy_core::HarSeriesView::default(); strategy_core::HAR_VIEW_SERIES];
+        mirror_har_metrics(&reg, &ids, &Fake(Vec::new(), 0), &mut rows, 0);
+        assert_eq!(reg.gauge(ids.configured).get(), 0);
+        assert_eq!(reg.gauge(ids.warm).get(), 0);
+        assert_eq!(reg.gauge(ids.day_age_max_s).get(), -1, "no series: never");
+        // 2026-09-26T09:00Z: one warm series whose newest closed day is
+        // 09-25 (ended 9 h ago), one cold series stuck on 09-24 (33 h).
+        let wall_ms: u64 = 1_790_413_200_000;
+        let current = strategy_core::HarSeriesView {
+            warm: 1,
+            newest_day_ms: 1_790_294_400_000,
+            ..strategy_core::HarSeriesView::default()
+        };
+        let stuck = strategy_core::HarSeriesView {
+            newest_day_ms: 1_790_294_400_000 - core_vol::DAY_MS,
+            ..strategy_core::HarSeriesView::default()
+        };
+        let never = strategy_core::HarSeriesView::default();
+        mirror_har_metrics(&reg, &ids, &Fake(vec![current, stuck, never], 70_000), &mut rows, wall_ms);
+        assert_eq!(reg.gauge(ids.configured).get(), 3);
+        assert_eq!(reg.gauge(ids.warm).get(), 1);
+        assert_eq!(reg.gauge(ids.day_age_max_s).get(), 33 * 3_600, "the stalest wins");
+        assert_eq!(reg.gauge(ids.day_close_ns_max).get(), 70_000);
     }
 
     #[test]

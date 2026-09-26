@@ -85,7 +85,7 @@ use core_regime::{
 };
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::REL_UNKNOWN;
-use core_vol::LongVolSet;
+use core_vol::{LongForecast, LongSetCounters, LongVolSet, DAY_NS};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, RegimeLabelSet, RegimeWord,
     RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_PROFILES, STRATEGY_SLOT_AI_EXEC,
@@ -93,13 +93,23 @@ use core_types::{
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{
-    Ctx, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters, Strategy, StrategyCounters,
-    StrategyError, SubmitErr, VmRowView, REGIME_REL_SYMS,
+    Ctx, HarCounters, HarSeriesView, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters,
+    Strategy, StrategyCounters, StrategyError, SubmitErr, VmRowView, HAR_VIEW_NAME_MAX,
+    HAR_VIEW_SERIES, HAR_VIEW_TENORS, HAR_VIEW_TENORS_D, HAR_VIEW_WEEKDAYS, REGIME_REL_SYMS,
 };
 
 // RG6: `regime_rel_view` copies the detector's view arrays straight
 // into the trait's POD — the two capacities must agree.
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
+// HAR H3.5: `/state.har` carries every series the set can run, whole
+// names, the engine's own weekday count, and only tenors it forecasts.
+const _: () = assert!(HAR_VIEW_SERIES == core_vol::LONG_SET_MAX);
+const _: () = assert!(HAR_VIEW_NAME_MAX == core_vol::LONG_SET_NAME_MAX);
+const _: () = assert!(HAR_VIEW_WEEKDAYS == core_vol::WEEKDAYS);
+const _: () = assert!(HAR_VIEW_TENORS_D[HAR_VIEW_TENORS - 1] as usize <= core_vol::LONG_TAU_DAYS_MAX);
+const _: () = assert!(
+    core::mem::size_of::<HarCounters>() == core::mem::size_of::<LongSetCounters>()
+);
 use strategy_bin15::Bin15Strategy;
 use strategy_hyparb::HyparbStrategy;
 use strategy_icdp::IcdpStrategy;
@@ -316,6 +326,14 @@ pub struct StrategySet {
     /// Beside the regime detector, in the same seat and on the same
     /// timer; no member reads it (plan law L4).
     har: Box<LongVolSet>,
+    /// HAR H3.5: each series' `/state.har` row as of its newest day close
+    /// or the restore — rebuilt in `on_timer` only when that series'
+    /// epoch moved (the forecasts do not move between day closes), so
+    /// the 1 s publish copies rows instead of re-reading 9 tenors × 12
+    /// engines. Boot-boxed.
+    har_view: Box<[HarSeriesView; HAR_VIEW_SERIES]>,
+    /// The epoch each cached row was built at (`u64::MAX`: never).
+    har_view_epoch: [u64; HAR_VIEW_SERIES],
 }
 
 /// RG2: the set's timer cadence once a detector is configured — the
@@ -352,6 +370,8 @@ impl StrategySet {
             regime_declared_total: 0,
             regime_gate_changes: 0,
             har: Box::new(LongVolSet::new()),
+            har_view: Box::new([HarSeriesView::default(); HAR_VIEW_SERIES]),
+            har_view_epoch: [u64::MAX; HAR_VIEW_SERIES],
         }
     }
 
@@ -366,6 +386,24 @@ impl StrategySet {
     /// and restore their state. Nothing on the engine loop calls this.
     pub fn har_mut(&mut self) -> &mut LongVolSet {
         &mut self.har
+    }
+
+    /// HAR H3.5: rebuild the cached `/state.har` row of every series whose
+    /// epoch moved since its row was built — at most one a poll in steady
+    /// state (the day closes are staggered), all of them once after the
+    /// boot restore. `n` compares when nothing moved; nothing while inert.
+    #[inline]
+    fn refresh_har_view(&mut self) {
+        let n = self.har.len().min(HAR_VIEW_SERIES);
+        let mut i = 0usize;
+        while i < n {
+            let e = self.har.series_epoch(i);
+            if e != self.har_view_epoch[i] {
+                self.har_view[i] = har_row(&self.har, i);
+                self.har_view_epoch[i] = e;
+            }
+            i += 1;
+        }
     }
 
     // ---- RG2: regime detector (plan §4.2) ----------------------------
@@ -850,6 +888,42 @@ impl StrategyCounters for StrategySet {
         );
         let _ = e.write_rows(out);
         true
+    }
+    /// HAR H3.5: the set's counters, field for field.
+    #[inline]
+    fn har_counters(&self) -> HarCounters {
+        let c = self.har.counters();
+        HarCounters {
+            minutes_rolled: c.minutes_rolled,
+            closes: c.closes,
+            day_closes: c.day_closes,
+            held: c.held,
+            forced: c.forced,
+            day_close_ns_max: c.day_close_ns_max,
+            day_close_ns_last: c.day_close_ns_last,
+            epoch: c.epoch,
+        }
+    }
+    /// HAR H3.5: the cached rows, with the three per-minute fields read
+    /// live. Never allocates.
+    fn har_series_view(&self, out: &mut [HarSeriesView]) -> u32 {
+        let n = self.har.len().min(HAR_VIEW_SERIES);
+        let m = n.min(out.len());
+        let mut i = 0usize;
+        while i < m {
+            let mut v = self.har_view[i];
+            if let Some(e) = self.har.engine(i) {
+                v.last_min_ms = e.last_min_ts_ms();
+                v.open_minutes = match e.open_day() {
+                    Some((_, _, n_min)) => n_min,
+                    None => 0,
+                };
+                v.gaps = e.gaps();
+            }
+            out[i] = v;
+            i += 1;
+        }
+        n as u32
     }
     /// HYPARB H4: slot 0's observables.
     #[inline]
@@ -1413,8 +1487,10 @@ impl Strategy for StrategySet {
             self.push_regime_views();
         }
         // HAR H3.3: the long-tenor minute roll and its staggered day
-        // closes (one branch while inert).
+        // closes (one branch while inert). H3.5: then the `/state.har`
+        // row of the series whose day just closed.
         self.har.on_timer(now_ns);
+        self.refresh_har_view();
         if self.enabled & BIT_HYPARB != 0 {
             self.hyparb
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
@@ -1506,6 +1582,69 @@ impl Strategy for StrategySet {
         self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
         self.icdp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_ICDP));
     }
+}
+
+// ---------------------------------------------------------------
+// HAR H3.5: one series' `/state.har` row
+// ---------------------------------------------------------------
+
+/// An annualised σ ×1e9 as the row's ×1e6 `i32` (`0` = none; a σ past
+/// ~2 147 annualised saturates — no real series is near it).
+#[inline]
+fn har_sigma_1e6(s: Option<i64>) -> i32 {
+    match s {
+        Some(v) => (v / 1_000).clamp(0, i64::from(i32::MAX)) as i32,
+        None => 0,
+    }
+}
+
+/// Build series `i`'s row from its engine: the census of resident days,
+/// both forecasts, the pairs, the fit and QLIKE bits at every panel tenor
+/// and the weekday profile. The per-minute fields are left for the reader
+/// (`har_series_view` reads them live). Cold: once per series per UTC
+/// day, and once after the restore.
+fn har_row(set: &LongVolSet, i: usize) -> HarSeriesView {
+    let mut v = HarSeriesView::default();
+    let (Some(e), Some(name), Some(feed)) = (set.engine(i), set.name(i), set.feed(i)) else {
+        return v;
+    };
+    let nl = name.len().min(HAR_VIEW_NAME_MAX);
+    v.name[..nl].copy_from_slice(&name[..nl]);
+    v.name_len = nl as u8;
+    v.feed = feed;
+    v.warm = u8::from(e.is_warm());
+    let days = e.n_resident();
+    v.days = days.min(usize::from(u8::MAX)) as u8;
+    let mut empty = 0u8;
+    let mut d = 0usize;
+    while d < days {
+        if let Some((ts, _, n_min)) = e.day_at(d) {
+            empty = empty.saturating_add(u8::from(n_min == 0));
+            v.newest_day_ms = ts;
+        }
+        d += 1;
+    }
+    v.empty_days = empty;
+    let mut k = 0usize;
+    while k < HAR_VIEW_TENORS {
+        let tau = u64::from(HAR_VIEW_TENORS_D[k]) * DAY_NS;
+        v.raw_1e6[k] = har_sigma_1e6(e.sigma_ann_1e9(tau, LongForecast::Raw));
+        v.fit_1e6[k] = har_sigma_1e6(e.sigma_ann_1e9(tau, LongForecast::Fit));
+        v.pairs[k] = e.n_pairs(tau).min(usize::from(u8::MAX)) as u8;
+        v.fitted |= u16::from(e.fit(tau).is_some()) << k;
+        v.fit_beats_raw |= u16::from(e.qlike_counters(tau).fit_beats_raw) << k;
+        k += 1;
+    }
+    if let Some((ratio, n_days)) = set.profile(i) {
+        let mut w = 0usize;
+        while w < HAR_VIEW_WEEKDAYS {
+            v.weekday_1e6[w] = ratio[w].clamp(0, i64::from(i32::MAX)) as i32;
+            v.weekday_n[w] = n_days[w].min(u32::from(u8::MAX)) as u8;
+            w += 1;
+        }
+    }
+    v.epoch = set.series_epoch(i);
+    v
 }
 
 // ---------------------------------------------------------------
@@ -2773,5 +2912,89 @@ mod tests {
         assert_eq!(s.har().counters().closes, 1);
         s.on_stop(&mut c);
         assert_eq!(s.har().held(0), None);
+    }
+
+    /// HAR H3.5: a series' `/state.har` row is built by the poll after the
+    /// restore (and after each of its day closes), from the engine's own
+    /// readers; the per-minute fields are read live at every view.
+    #[test]
+    fn the_har_row_is_built_on_the_poll_and_its_minute_fields_read_live() {
+        use core_vol::LongSeries;
+        const MIN: NsTs = 60_000_000_000;
+        const DAY_MS: u64 = 86_400_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let mut out = [HarSeriesView::default(); HAR_VIEW_SERIES];
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 0, "inert: no rows");
+        assert_eq!(StrategyCounters::har_counters(&s), HarCounters::default());
+
+        let wall0_ms: u64 = 1_767_225_600_000; // 2026-01-01T00:00Z
+        let anchor = WallAnchor::new(0, wall0_ms * 1_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"SP500", feed }], anchor, 0)
+            .unwrap();
+        // Restore 40 closed days ending 2025-12-31 — the third one EMPTY —
+        // 60 one-day pairs, and the newest close's one-day arm.
+        let first = wall0_ms - 40 * DAY_MS;
+        let tau1 = core_vol::DAY_NS;
+        {
+            let e = s.har_mut().engine_mut(0).unwrap();
+            for d in 0..40u64 {
+                let (sq, n) = if d == 2 { (0, 0) } else { (4_000_000_000_000_000_000_000, 1_440) };
+                assert!(e.seed_day(first + d * DAY_MS, sq, n));
+            }
+            for i in 0..60i64 {
+                let x = 25_000_000_000 + i * 10_000_000;
+                let target = first - 20 * DAY_MS + i as u64 * DAY_MS;
+                assert!(e.seed_pair(tau1, target, x, x + (i % 7 - 3) * 10_000_000));
+            }
+            assert!(e.seed_arm(tau1, first + 39 * DAY_MS, 25_300_000_000, i64::MIN));
+        }
+        s.har_mut().restored();
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        assert_eq!(out[0].days, 0, "the row waits for the poll");
+
+        // The poll builds it (no minute has rolled yet).
+        s.on_timer(1, &mut c);
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        let v = out[0];
+        assert_eq!(v.name(), b"SP500");
+        assert_eq!(v.feed, feed);
+        assert_eq!((v.warm, v.days, v.empty_days), (1, 40, 1));
+        assert_eq!(v.newest_day_ms, wall0_ms - DAY_MS);
+        assert!(v.raw_1e6[0] > 0, "the one-day arm is the raw forecast");
+        assert_eq!(&v.raw_1e6[1..], &[0; HAR_VIEW_TENORS - 1], "no other tenor armed");
+        assert_eq!(v.fitted, 1, "60 pairs fit the one-day tenor only");
+        assert!(v.fit_1e6[0] > 0);
+        assert_eq!(v.fit_1e6[1], 0);
+        assert_eq!((v.pairs[0], v.pairs[1]), (60, 0));
+        assert_eq!(v.fit_beats_raw, 0, "no QLIKE window yet");
+        assert_eq!(v.weekday_1e6, [1_000_000; HAR_VIEW_WEEKDAYS], "every observed day alike");
+        assert_eq!(v.weekday_n.iter().map(|&n| u32::from(n)).sum::<u32>(), 39);
+        assert_eq!(v.epoch, 1, "the restore's epoch");
+        assert_eq!((v.last_min_ms, v.open_minutes), (0, 0));
+        assert_eq!(StrategyCounters::har_counters(&s).epoch, 1);
+
+        // Two live minutes: the first opens 2026-01-01 over a restore that
+        // ended on a closed day — a crossing by the set's rule (it could
+        // have pushed empty days), so the epoch moves and the poll
+        // rebuilds the row; the second only folds, and the minute fields
+        // move without a rebuild.
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+        s.on_timer(MIN, &mut c);
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        assert_eq!((out[0].epoch, out[0].open_minutes), (2, 0), "a crossing; the first primes");
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_004), &mut c);
+        s.on_timer(2 * MIN, &mut c);
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        assert_eq!(out[0].last_min_ms, wall0_ms + 60_000);
+        assert_eq!(out[0].open_minutes, 1);
+        assert_eq!(out[0].epoch, 2, "no further crossing");
+        assert_eq!((out[0].days, out[0].raw_1e6), (40, v.raw_1e6), "no day closed");
+        // A short buffer takes what fits and still reports the count.
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut []), 1);
     }
 }

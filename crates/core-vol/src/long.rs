@@ -75,8 +75,9 @@
 //!   touches share the struct's first cache line. **Per UTC day:** the
 //!   close law over the grid — ≤ 40 settles (a τ-day sum, 820 adds in
 //!   all, one `ln` and two QLIKE `exp2` each, and a refit of ≤ 128
-//!   pairs) and 40 arms (one `isqrt` and one `ln` each); measured ~63 µs
-//!   a series on the review host. **Per tick: nothing** — the minute
+//!   pairs) and 40 arms (one `isqrt` and one `ln` each); measured ~38 µs
+//!   a series on the M4 Pro (bench `vol/long_day_close_warm`; ~63 µs on the
+//!   review host). **Per tick: nothing** — the minute
 //!   boundary is the owner's, never derived from a tick.
 //! * **ABSENT DATA HOLDS.** Fewer than [`LONG_WARM_DAYS`] observed days
 //!   and nothing forecasts; fewer than [`crate::MIN_PAIRS`] pairs and the

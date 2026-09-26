@@ -25,9 +25,10 @@
 //! ## The day close, staggered
 //!
 //! The first minute of a new UTC day closes the engine's open day — the
-//! close law over the whole 1–40 d grid, ~63 µs a series (measured on the
-//! review host). Twelve series would pay ~0.76 ms in one poll at 00:01Z,
-//! the minute a BIN15 quarter-hour also turns. So at most
+//! close law over the whole 1–40 d grid, ~38 µs a series on the M4 Pro
+//! (bench `vol/long_day_close_warm`, warm rings). Twelve series would pay
+//! ~0.45 ms in one poll at 00:01Z, the minute a BIN15 quarter-hour also
+//! turns. So at most
 //! [`DAY_CLOSES_PER_POLL`] series crosses a day per poll; the others HOLD
 //! their first new-day minute — value and stamp — and release it at a
 //! later poll, one a poll, before any later minute of theirs. Twelve

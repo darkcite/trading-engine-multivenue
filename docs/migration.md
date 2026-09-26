@@ -6,6 +6,103 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `/state.har` and the `engine_har_*` gauges (HAR H3.5)
+
+**What changed**
+
+- `/state` gains a `har` object (additive — `"v":1` stays; placed before
+  `recent`): `configured` (series the set runs), `hash` (SHA-256 of the
+  `har.toml` loaded), `dropped` (series the file names whose feed the boot
+  universe does not carry), the set's counters flat (`minutes_rolled`,
+  `closes`, `day_closes`, `held`, `forced`, `day_close_ns_max`,
+  `day_close_ns_last`, `epoch`), `tenors_d` = `[1,2,3,5,7,14,21,30,40]`
+  and `series` — one object per series in `har.toml` order: `name`,
+  `feed` (symbol id), `warm`, `days` (closed days resident, ≤ 64),
+  `empty_days`, `gaps`, `newest_day_ms`, `day_age_s` (WALL-derived: whole
+  seconds since the newest closed day ended; `-1` = none), `last_min_ms`,
+  `open_minutes`, `epoch`, and per tenor `raw_1e6` / `fit_1e6` (σ
+  annualised ×1e6; `0` = none), `pairs`, `fitted` and `fit_beats_raw`
+  (`0`/`1` arrays), plus `weekday_1e6` (Monday first; `1e6` = a mean day)
+  and `weekday_n`.
+- `EngineSnapshot` grows 27 776 → 30 016 B (twelve 176 B rows; the
+  32 KiB test bound holds). A row is rebuilt only at its series' UTC day
+  close (or the boot restore) and copied by the 1 s publish.
+- Four gauges, always registered: `engine_har_series_configured`,
+  `engine_har_series_warm`, `engine_har_day_age_max_s` (the stalest
+  series; `-1` = none closed a day) and `engine_har_day_close_ns_max`.
+
+**Why**
+
+- The ruling "publish a profile" and the H3 plan's §7 panel: the fit and
+  the raw fold side by side (L2), and a series that stopped recalibrating
+  must be visible (`day_age_s` > 93 600 is the red rule).
+
+**Impact**
+
+- A boot without `har.toml` renders `"har":{"configured":0,…,"series":[]}`
+  and `engine_har_series_configured 0`; every other byte of `/state` and
+  every other metric is unchanged. Readers keyed on names are unaffected.
+
+**Migration steps**
+
+1. None. The dashboard panel reads the object from H3.6.
+
+**Rollback**
+
+- Revert the commit; nothing on disk depends on it.
+
+## 2026-09-26 — the long-tenor HAR runs in the engine: `har.toml`, `--har`, `~/multivenue/har/` (HAR H3.2–H3.4)
+
+**What changed**
+
+- `~/multivenue/har.toml` (new, optional; `har.toml.example` is its
+  contract, `core_config::har` its parser — the engine's line grammar, not
+  standard TOML): up to 12 `[[series]]` of `name` (1–12 of `[A-Z0-9]`),
+  `feed` and an optional one-line `fallback` array (≤ 4, newest first) of
+  `<venue>:<instrument>` descriptors. `claude_worker.har_config` reads the
+  same grammar with the same messages.
+- `multivenue-engine run` gains `--har <path>` and `--har-dir <dir>`
+  (default `~/multivenue/har`). Without `--har` the default file is read if
+  present; absent = the pre-H3 engine, bit for bit.
+- `~/multivenue/har/seed-<NAME>.tsv` (the worker's cut, H3.6 hourly) and
+  `state-<NAME>.tsv` (the engine's own rows: written at each of the series'
+  UTC day closes and at shutdown) share one row grammar (`V 1`, then
+  `D`/`C`/`A`/`P`/`Q`; `core_vol::parse_rows`, `LongVolEngine::write_rows`,
+  byte-identical to `har_seed.seed_rows`). At boot the two merge by
+  `core_vol::merge_rows` (the §6 day-merge law) and restore the series'
+  `LongVolEngine`, held by `StrategySet` (`core_vol::LongVolSet`). No member
+  reads it.
+
+**Why**
+
+- The HAR H3 rulings (2026-09-26): the long-tenor HAR runs in the ENGINE,
+  one series per Hypercall underlying, seeded from the external backfill.
+
+**Impact**
+
+- Failure isolation: only an explicit `--har` that cannot be read refuses
+  the boot. A default file that does not parse turns the service off (a
+  named error); a series whose feed the universe lacks is dropped (named),
+  the rest run; a seed or state that does not parse is dropped for its
+  series. `engine-wrapper.sh` does NOT pass `--har` (a KeepAlive loop is
+  the cost of an unreadable explicit path) — the default path is the
+  switch.
+- Cost: ~2.5 MB boxed at configure (twelve engines); per tick one hash
+  probe; per minute one close per quoting series; per UTC day one close
+  per series, staggered one a 1 s poll.
+
+**Migration steps**
+
+1. At the restart the operator names: write `~/multivenue/har.toml` (the
+   example's twelve), append the seven TradFi perps to `[binance] usdm`,
+   import the dry run's rows and run `claude_worker.har_backfill` once,
+   cut the seeds (H3.6: then hourly by `candles-cycle.sh`).
+
+**Rollback**
+
+- Remove `~/multivenue/har.toml` (the next boot runs without the service);
+  `~/multivenue/har/` may stay — nothing else reads it.
+
 ## 2026-09-26 — `core_regime::math::isqrt_i128` is the floor root at v = 2
 
 **What changed**
