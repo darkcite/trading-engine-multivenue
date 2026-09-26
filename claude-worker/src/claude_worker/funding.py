@@ -6,7 +6,7 @@ A standalone MODULE (``python -m claude_worker.funding``) — NOT a
 verb (the frozen CLI surface; the candles/iv_digest/refdata
 precedent). One cycle = read the universe file → per funding-bearing
 instrument: fetch the venue's NEWEST funding-history page under a
-per-venue ``RestBudget`` → ``INSERT OR IGNORE`` into the ``funding``
+per-host ``RestBudget`` (BX2) → ``INSERT OR IGNORE`` into the ``funding``
 table BESIDE candles inside ``candles.db`` (§9 keying:
 ``venue + descriptor``; historical funding points are immutable, so
 ignore-on-conflict makes every cycle idempotent).
@@ -15,6 +15,11 @@ Funding-bearing selection (the class laws from the engine side):
 
 - ``[binance] usdm``            → ``binance-usdm:<sym>`` — dated
   (``usdm_dated``) futures carry NO funding and are excluded.
+- ``[binance] coinm``           → ``binance-coinm:<sym>`` (BX2) — the
+  ``_PERP`` names only: every COIN-M name carries a ``_``, so the usdm
+  underscore test would drop the perps too; ``coinm_dated`` carries no
+  funding. ``/dapi/v1/fundingRate`` answers the fapi body (plus
+  ``markPrice`` / ``rateType``), newest page without ``startTime``.
 - ``[okx] instruments``         → SWAP instIds only (``*-SWAP``).
 - ``[deribit] instruments``     → perps only (name contains
   ``PERPETUAL``; spot/dated carry no funding — WS3/WS6 laws).
@@ -73,6 +78,12 @@ HL_RANGE_D: int = 33
 #: MX7: the history endpoint's page cap (``page_size=2000`` answers 1000,
 #: measured 2026-09-23); newest settlement first.
 MEXC_FUNDING_PAGE: int = 1000
+#: The two Binance futures funding-history endpoints, by lane (BX2: one
+#: body shape, a ``limit=1000`` newest page on both).
+_BN_FUNDING_PATH: dict[str, str] = {
+    "binance-usdm": "/fapi/v1/fundingRate",
+    "binance-coinm": "/dapi/v1/fundingRate",
+}
 
 _SCHEMA: str = """
 CREATE TABLE IF NOT EXISTS funding (
@@ -123,6 +134,12 @@ def read_funding_lanes(universe_path: pathlib.Path) -> list[FundingLane] | None:
                 FundingTarget(t.venue, t.descriptor, t.instrument)
                 for t in lane.targets
                 if "_" not in t.instrument  # dated names carry `_`
+            ]
+        elif lane.name == "binance-coinm":
+            targets = [
+                FundingTarget(t.venue, t.descriptor, t.instrument)
+                for t in lane.targets
+                if t.instrument.endswith("_PERP")  # every COIN-M name carries `_`
             ]
         elif lane.name == "okx":
             targets = [
@@ -376,9 +393,9 @@ def _fetch_points(
     (M5-onboarding find, 2026-08-29 — first real consumer). Resuming
     from the newest stored point makes repeat cycles converge on
     now, exactly like the other venues' newest-first pages."""
-    if lane.name == "binance-usdm":
+    if lane.name in _BN_FUNDING_PATH:
         raw = http.get(
-            f"https://{http.hosts['binance-usdm']}/fapi/v1/fundingRate"
+            f"https://{http.hosts[lane.name]}{_BN_FUNDING_PATH[lane.name]}"
             f"?symbol={target.instrument}&limit=1000"
         )
         return parse_bn_funding(raw) if raw is not None else None
@@ -429,18 +446,22 @@ def run_cycle(
     budget_per_h: int,
     report: collections.abc.Callable[[str], None],
 ) -> None:
-    """One newest-page cycle over every lane × target (per-venue
-    budgets, the fetchers convention)."""
-    budgets: dict[int, claude_worker.features.RestBudget] = {}
+    """One newest-page cycle over every lane and target. Budgets are per
+    REST HOST (``claude_worker.candles.budget_key``, the candles law):
+    BX2's COIN-M lane is the Binance venue's second funding lane, on its
+    own host — a per-VENUE budget would let a broad usdm list starve it
+    to zero pages, the spot/usdm candle failure of VM2 V6. Every other
+    funding lane owns its host, so its budget is unchanged."""
+    budgets: dict[str, claude_worker.features.RestBudget] = {}
     for lane in lanes:
         budgets.setdefault(
-            lane.venue,
+            claude_worker.candles.budget_key(lane.name),
             claude_worker.features.RestBudget(
                 budget_per_h, claude_worker.fetchers.BUDGET_WINDOW_NS
             ),
         )
     for lane in lanes:
-        budget = budgets[lane.venue]
+        budget = budgets[claude_worker.candles.budget_key(lane.name)]
         added = 0
         points_seen = 0
         failed = 0

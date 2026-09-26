@@ -43,7 +43,7 @@ pub use clob_dispatcher::{LiveDispatcher, LiveDispatcherErr};
 use core_io::{PmlrCapture, TapCfg, TapMode};
 use core_io::{SlotCapture, SlotKind};
 use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
-use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
+use core_net::{should_reset_backoff, Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
@@ -567,9 +567,10 @@ pub struct Rings {
     /// (`Engine::set_trade_lane`). Permanently empty when the ingress is
     /// not spawned.
     pub trade: Arc<Ring<TradePrint, TRADE_RING_SIZE>>,
-    /// One fill ring per execution lane (`engine::fill_lane_of`).
-    /// Live dispatchers gain producers in Phase 8j; until then the
-    /// engine's dispatcher fill pump (D3) is the only fill source.
+    /// One fill ring per execution lane (`engine::fill_lane_of`): the
+    /// Hyperliquid arm produces on lane 3, the Binance gateway on lane
+    /// 4 (BX3; its producer is taken at BX6). A lane nothing produces on
+    /// reads empty.
     pub fill: [Arc<Ring<Fill, FILL_RING_SIZE>>; NUM_FILL_LANES],
     /// AI command ring (Phase 8f §4.3). Producer half goes to the
     /// `ingress-ai` thread when `AI_INGRESS_HMAC_KEY` is configured;
@@ -619,7 +620,13 @@ impl Rings {
             rpc_signal: Ring::new(),
             hyperevm_signal: Ring::new(),
             trade: Ring::new(),
-            fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
+            fill: [
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+            ],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
             event: [
@@ -1032,6 +1039,18 @@ pub fn bn_usdm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [Bina
     ]
 }
 
+/// BX2 (O-BX3): the two COIN-M slots one instrument gets on `host`
+/// (`BINANCE_COINM_WS_HOST`, dstream). K10 (measured 2026-09-26)
+/// found dstream serving `@bookTicker` and `@markPrice` on `/ws/`,
+/// `/market/ws/` and `/public/ws/` alike, so COIN-M takes the USDⓈ-M
+/// path law unchanged — one builder, so a later split of the two laws
+/// is one edit here. The frames carry `st: 2`; bookTicker quantities
+/// are CONTRACTS (100 USD on BTC, 10 USD on the others), not coin.
+#[must_use]
+pub fn bn_coinm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [BinanceConnSpec; 2] {
+    bn_usdm_specs(host, name, sym)
+}
+
 /// BX0-F2: the options lane's combined path on fstream's routed
 /// `/market` path — one `<underlying>@optionMarkPrice` stream per
 /// configured underlying (lowercase). Each push is ONE array holding
@@ -1059,6 +1078,9 @@ pub fn bn_options_path(underlyings: &[String]) -> String {
 /// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
 /// connections (ONE per instrument — the parser stays byte-frozen),
 /// ONE thread, ONE producer (single-writer law), one `"bn"` capture.
+/// `event_mask` is the lane's event set: `EVENT_LANE_FUNDING`, plus
+/// **BX6 (O-BX29)** the `Mark` bit when a Binance arm is armed — the
+/// marks then ride the event lane flagged for the dispatcher alone.
 /// `ingress_binance::run_multi` owns the in-thread reconnect pacing
 /// (one dial per poll iteration, jittered per-slot backoff). See
 /// [`spawn_polymarket`] for the capture-open / fail-fast contract.
@@ -1076,6 +1098,7 @@ pub fn spawn_binance_multi(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    event_mask: u16,
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?,
@@ -1161,7 +1184,7 @@ pub fn spawn_binance_multi(
                 &mut conns,
                 &mut producer,
                 &mut event_tx,
-                EVENT_LANE_FUNDING,
+                event_mask,
                 &mut opt_tx,
                 &mut poll,
                 &mut events,
@@ -2289,6 +2312,10 @@ pub fn build_hl_families(
 /// resolved at boot like `ep`): a reconnect that retired a rolling
 /// family re-discovers its successor there
 /// ([`boot_discovery::fetch_hl_outcome_specs`]).
+///
+/// `mark_lane` (HC11): the MARK rides the event lane even without rolling
+/// families — slot 7 reads each underlying's `oraclePx` (`Mark.v1`), the
+/// price Hypercall settles on.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_hyperliquid(
     ep: WssEndpoint,
@@ -2298,6 +2325,7 @@ pub fn spawn_hyperliquid(
     families: ingress_hyperliquid::family::HlFamilyTable,
     roll_status: Arc<ingress_hyperliquid::family::HlRollStatus>,
     wall_anchor: core_time::WallAnchor,
+    mark_lane: bool,
     stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
@@ -2351,7 +2379,8 @@ pub fn spawn_hyperliquid(
             // MARK — a member cannot price a HIP-4 binary without the
             // strike's reference, and cannot know which instance its
             // slot holds without the roll.
-            let event_mask = if has_families {
+            // HC11: slot 7 reads the MARK too (`mark_lane`).
+            let mut event_mask = if has_families {
                 EVENT_LANE_FUNDING
                     | EVENT_LANE_ASSET_CTX
                     | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
@@ -2359,6 +2388,9 @@ pub fn spawn_hyperliquid(
             } else {
                 EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
             };
+            if mark_lane {
+                event_mask |= core_types::event_lane_bit(core_types::ChannelId::Mark);
+            }
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             let mut last_rediscovery_ns: Option<u64> = None;
@@ -2897,9 +2929,14 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// every SymbolId the boot wired into a venue ingress — the PM/BN
 /// pair flags plus each discovery-gated venue table, plus (MX6,
 /// operator ruling Q-MX6) every MEXC instrument the boot allocated
-/// (spot + perp; Bybit stays out by its own WS9 precedent) — **sorted
-/// strict-ascending and deduped** (binary-searched per §4.2 rule-6
-/// check; `RulesetSidePath::new` debug-asserts the ordering).
+/// (spot + perp; Bybit stays out by its own WS9 precedent), plus
+/// (ruling O-HC17) every Hypercall option the boot selected — its
+/// `hypercall-idx:<U>` index syms stay out (capture-only `Mark`s, caps
+/// 0: nothing could read them) — **sorted strict-ascending and
+/// deduped** (binary-searched per §4.2 rule-6 check;
+/// `RulesetSidePath::new` debug-asserts the ordering). Data-only venues
+/// (MEXC, Hypercall) enter as signal or reference legs: an order on one
+/// stays unroutable in the paper matcher and the harness.
 ///
 /// Universe membership is a boot-time fact: a symbol that later
 /// loses its feed still validates — the row just never triggers
@@ -2913,6 +2950,7 @@ pub fn build_ai_universe(
     deribit: Option<&ingress_deribit::DeribitSymbolTable>,
     hl: Option<&ingress_hyperliquid::HlCoinTable>,
     mexc_syms: &[SymbolId],
+    hypercall_option_syms: &[SymbolId],
 ) -> Arc<[u32]> {
     let mut v: Vec<u32> = Vec::with_capacity(
         polymarket_syms.len()
@@ -2920,11 +2958,13 @@ pub fn build_ai_universe(
             + okx.map_or(0, |t| t.len())
             + deribit.map_or(0, |t| t.len())
             + hl.map_or(0, |t| t.len())
-            + mexc_syms.len(),
+            + mexc_syms.len()
+            + hypercall_option_syms.len(),
     );
     v.extend_from_slice(polymarket_syms);
     v.extend_from_slice(binance_syms);
     v.extend_from_slice(mexc_syms);
+    v.extend_from_slice(hypercall_option_syms);
     if let Some(t) = okx {
         let mut i = 0usize;
         while let Some((_, sym, _)) = t.get(i) {
@@ -3180,9 +3220,10 @@ pub struct Consumers {
     /// XMM XH1: trade-print consumer (the engine's trade lane). Reads
     /// empty forever when the Hyperliquid ingress is not spawned.
     pub trades: Consumer<TradePrint, TRADE_RING_SIZE>,
-    /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
-    /// arrive with the venue dispatchers in Phase 8j; paper-mode
-    /// fills flow through the engine's dispatcher pump (D3).
+    /// Fill-lane consumers (`engine::fill_lane_of` order): lane 3 the
+    /// Hyperliquid arm's, lane 4 the Binance gateway's (BX3; produced
+    /// from BX6). Paper-mode fills flow through the engine's dispatcher
+    /// pump (D3).
     pub fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     /// AI command lane consumer (Phase 8f). Reads empty forever when
     /// `ingress-ai` is not spawned (producer dropped).
@@ -3400,8 +3441,8 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / xmm
-/// when their artifacts resolve, slot 0 when `hyparb.toml` resolves
+/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / xmm /
+/// hcv when their artifacts resolve, slot 0 when `hyparb.toml` resolves
 /// (HYPARB H5 — the member is configured only by its own boot
 /// artifact; unconfigured it refuses `on_start`, so it never boots
 /// inert under a healthy-looking name),
@@ -3426,6 +3467,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     xsd: Option<&crate::xsd_boot::XsdBoot>,
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
     xmm: Option<&crate::xmm_boot::XmmBoot>,
+    hcv: Option<&crate::hcv_boot::HcvBoot>,
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
     har: Option<&crate::har_boot::HarBoot>,
@@ -3446,6 +3488,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if xmm.is_some() {
         configured |= strategy_set::BIT_XMM;
     }
+    if hcv.is_some() {
+        configured |= strategy_set::BIT_HCV;
+    }
     let mask = requested_mask & configured;
     if mask == 0 {
         return EngineLoopResult::Failed("engine_loop_set: no requested member is configured");
@@ -3459,6 +3504,10 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         // and the names of its perp rows, in row order (boot-only).
         obs.boot.xmm_hash = boot.hash;
         obs.boot.set_xmm_coins(boot.coins.join(",").as_bytes());
+    }
+    if let Some(boot) = hcv {
+        // HC11: the artifact's identity on `/state` (`boot.hcv_hash`).
+        obs.boot.hcv_hash = boot.hash;
     }
 
     let mut set = strategy_set::StrategySet::new(mask);
@@ -3695,6 +3744,123 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
     }
+    if let Some(boot) = hcv {
+        // HC11 (O-HC18): slot 7 — DARK, paper only (a live slot 7 refuses
+        // the boot in `exec_boot`). The wall anchor is taken HERE, once,
+        // right before the loop: every expiry the member compares is
+        // wall. The calendar arrives from the `hcv-events` thread by
+        // mailbox — the engine thread never opens the file; a reader that
+        // did not spawn leaves the member without one, and under the
+        // event law it then trades nothing (fail closed).
+        let mut params = boot.params.clone();
+        params.anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.hcv_mut().configure(&params) {
+            tracing::error!(error = %e, "hcv: artifact refused");
+            return EngineLoopResult::Failed("hcv: artifact refused by the strategy");
+        }
+        // HC11b: the book a previous process left — positions by contract,
+        // hedges, cash, the day's mark, open settlement windows. A file the
+        // member cannot read exactly is a position nobody would hedge or
+        // settle, so it refuses the boot (the VRP / XSD law).
+        if let Some(text) = boot.state.as_deref() {
+            let now_ms = params.anchor.wall_of(core_time::now_ns()) / 1_000_000;
+            match set.hcv_mut().restore_state(text, now_ms) {
+                Ok(r) => {
+                    tracing::info!(
+                        positions = r.positions,
+                        orphans = r.orphans,
+                        expired = r.expired,
+                        hedges = r.hedges,
+                        hedges_dropped = r.hedges_dropped,
+                        windows = r.windows,
+                        cash_usd_1e6 = r.cash_usd_1e6,
+                        path = %boot.state_path.display(),
+                        "hcv: book restored"
+                    );
+                    if r.orphans > 0 {
+                        tracing::warn!(
+                            orphans = r.orphans,
+                            "hcv: held contracts outside this boot's chain — carried by their terms \
+                             (hedged and marked at σ̂, settled at expiry), never traded until a chain \
+                             lists them again"
+                        );
+                    }
+                    if r.expired > 0 {
+                        tracing::warn!(
+                            expired = r.expired,
+                            "hcv: positions expired while the engine was down — booked at the first \
+                             timer, on their window if one was kept (else counted in settle_fallbacks)"
+                        );
+                    }
+                    if r.hedges_dropped > 0 {
+                        tracing::warn!(
+                            hedges_dropped = r.hedges_dropped,
+                            "hcv: hedge residuals under the venue's minimum on underlyings hcv.toml no \
+                             longer trades were dropped from the book"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(reason = %e, path = %boot.state_path.display(), "hcv: book refused");
+                    return EngineLoopResult::Failed("hcv: state file refused by the strategy");
+                }
+            }
+        }
+        // …and where it goes. The book is written once here, on the boot
+        // path, so a file it cannot write refuses the boot before anything
+        // trades; from then on the member hands every change to the writer
+        // thread at its timer (a writer that stops taking them stops new
+        // risk, `HCV_BOOK_STALE_NS`). A book that cannot persist must not
+        // trade, so a writer that did not spawn refuses the boot too.
+        let mut first = String::new();
+        if strategy_core::StrategyCounters::render_hcv_state(set.hcv(), &mut first) {
+            if let Err(reason) = crate::state_file::write_atomic(&boot.state_path, &first) {
+                tracing::error!(%reason, path = %boot.state_path.display(), "hcv: the book's file is not writable");
+                return EngineLoopResult::Failed("hcv: the book's file is not writable");
+            }
+        }
+        match crate::hcv_boot::spawn_state_writer(boot.state_path.clone()) {
+            Ok((tx, w)) => {
+                set.hcv_mut().install_state_outbox(tx);
+                obs.hcv_writer = Some(w);
+                obs.hcv_state_path = Some(boot.state_path.clone());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "hcv: the state writer did not spawn");
+                return EngineLoopResult::Failed("hcv: the state writer did not spawn");
+            }
+        }
+        let (tx, rx) = core_ring::Mailbox::new(Box::new(strategy_hcv::HcvEvents::new())).split();
+        set.hcv_mut().install_events(rx);
+        match crate::hcv_boot::HcvEventsReader::spawn(
+            boot.events_path.clone(),
+            boot.underlyings.clone(),
+            boot.known.clone(),
+            tx,
+        ) {
+            Ok(r) => obs.hcv_events = Some(r),
+            Err(e) => tracing::error!(
+                error = %e,
+                "hcv: the calendar reader did not spawn — under the event law slot 7 trades nothing"
+            ),
+        }
+        tracing::info!("{}", crate::hcv_boot::render_boot_tell(boot));
+        // O-HC22: σ̂ is the HAR set's — a traded underlying no `har.toml`
+        // series serves forecasts nothing and never trades. Told, not
+        // refused (the HAR service's failure isolation).
+        let mut i = 0usize;
+        while i < boot.underlyings.len() {
+            let name = boot.underlyings[i];
+            let served = har.is_some_and(|hb| hb.series.iter().any(|x| x.name == name));
+            if !served {
+                tracing::warn!(
+                    underlying = name,
+                    "hcv: no har.toml series serves this underlying — slot 7 never trades it (O-HC22)"
+                );
+            }
+            i += 1;
+        }
+    }
     if let Some(boot) = xsd {
         // XSD-3: the wall anchor is taken HERE, once — the member's hour
         // grid is UTC-aligned from this instant on (the icdp law). The
@@ -3770,6 +3936,22 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             // H3.5: the file's identity and what it lost, for `/state.har`.
             obs.har_hash = hb.hash;
             obs.har_dropped = hb.dropped.len().min(u32::MAX as usize) as u32;
+            // H3.7: the state leaves the engine thread — one copy into a
+            // mailbox at each day close, the render and the fsync on the
+            // writer thread. A spawn failure keeps the write on the loop
+            // (logged, never a refusal — the boot's failure isolation).
+            let (tx, rx) = crate::har_writer::outbox(hb.series.len());
+            let names = hb.series.iter().map(|s| s.name.clone()).collect();
+            match crate::har_writer::spawn(rx, names, obs.har_state_paths.clone()) {
+                Ok(w) => {
+                    set.install_har_outbox(tx);
+                    obs.har_writer = Some(w);
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "har: the state writer thread did not spawn — the engine loop writes the state"
+                ),
+            }
         }
     }
     // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
@@ -3845,6 +4027,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
         xmm = mask & strategy_set::BIT_XMM != 0,
+        hcv = mask & strategy_set::BIT_HCV != 0,
         "strategy-set: composed"
     );
     run_engine_loop(cons, disp, set, obs)
@@ -3934,10 +4117,7 @@ impl Observability {
     /// `exec.toml` is in force, `None` when there is no `--exec`.
     /// `None` registers NOTHING, which is what keeps `/metrics`
     /// byte-identical to a pre-E1 binary's on an unconfigured boot.
-    pub fn build(
-        enable_metrics: bool,
-        exec_modes: Option<[u8; clob_dispatcher::EXEC_COUNTER_SLOTS]>,
-    ) -> Result<Self, &'static str> {
+    pub fn build(enable_metrics: bool, exec_modes: Option<ExecObs>) -> Result<Self, &'static str> {
         let mut out = Observability::default();
         if enable_metrics {
             let mut reg = core_metrics::MetricsRegistry::new();
@@ -4175,6 +4355,7 @@ impl Observability {
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
             let xmm = register_xmm_metrics(&mut reg)?;
+            let hcv = register_hcv_metrics(&mut reg)?;
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
@@ -4188,7 +4369,7 @@ impl Observability {
             // NOTHING, which is what keeps `/metrics` byte-identical.
             let exec = match exec_modes.as_ref() {
                 None => None,
-                Some(m) => Some(register_exec_metrics(&mut reg, m)?),
+                Some(spec) => Some(register_exec_metrics(&mut reg, spec)?),
             };
             let fills_capture = {
                 let io_errors = reg
@@ -4284,6 +4465,7 @@ impl Observability {
                 strategy_enabled_mask,
                 vm,
                 xmm,
+                hcv,
                 vrp,
                 xsd,
                 bin15,
@@ -4390,6 +4572,17 @@ impl LatencyDump {
     }
 }
 
+/// What the exec metric family registers (E1): the per-slot modes, and
+/// **BX6** whether a Binance arm is armed (its router counters register
+/// only then).
+#[derive(Copy, Clone, Debug)]
+pub struct ExecObs {
+    /// Per-slot `ExecMode as u8`.
+    pub modes: [u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+    /// A live slot names binance.
+    pub binance: bool,
+}
+
 /// Optional observability surfaces wired around the engine loop.
 /// Build once at boot via [`Observability::build`] and hand the
 /// owned `Arc`s into [`engine_loop_set_full`] — the loop publishes
@@ -4436,6 +4629,24 @@ pub struct Observability {
     /// order. Empty = no HAR service, and the engine writes nothing. Set
     /// by the set builder from the boot bundle.
     pub har_state_paths: Vec<std::path::PathBuf>,
+    /// HAR H3.7: the thread that renders and writes those files — each
+    /// series' state handed to it at its day close through the set's
+    /// outbox. `None` (no HAR service, or its spawn failed) = the engine
+    /// loop writes them itself (the pre-H3.7 path). **Taken** by the
+    /// engine loop, stopped and joined before its shutdown write.
+    pub har_writer: Option<crate::persist::StateWriter>,
+    /// HC11: slot 7's calendar reader (`hcv-events`) — it hands the
+    /// member each new `scheduled-events.json` through the mailbox the
+    /// set builder installed. Stopped and joined when this drops, at the
+    /// loop's end. `None` = no hcv member (or its spawn failed).
+    pub hcv_events: Option<crate::hcv_boot::HcvEventsReader>,
+    /// HC11b: where slot 7's book is written — `None` = no hcv member, and
+    /// the engine writes nothing. Set by the set builder from the boot.
+    pub hcv_state_path: Option<std::path::PathBuf>,
+    /// HC11b: the thread that renders and writes that book — handed to it
+    /// by the member at its timer. **Taken** by the engine loop, stopped and
+    /// joined before the shutdown's forced write.
+    pub hcv_writer: Option<crate::persist::StateWriter>,
     /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
     /// (all-zero: no HAR service) — `/state.har.hash`.
     pub har_hash: [u8; 32],
@@ -4689,6 +4900,8 @@ pub struct EngineCounters {
     /// XMM XH3: the `engine_xmm_*` family (slot 6; it replaced the
     /// retired `engine_icdp_*_total` family).
     pub xmm: XmmMetricIds,
+    /// HC11: the `engine_hcv_*` family (slot 7).
+    pub hcv: HcvMetricIds,
     /// VRP V7: the `engine_vrp_*` family (slot 1).
     pub vrp: VrpMetricIds,
     /// XSD-3: the `engine_xsd_*` family (slot 2).
@@ -4733,8 +4946,9 @@ pub struct ExecMetricIds {
     /// `engine_exec_refused_off_total`
     pub refused_off: core_metrics::CounterId,
     /// `engine_exec_refused_risk_total` (E6) — requests the RISK GATE
-    /// refused, ALL six reasons summed (max_order, cap_instance,
-    /// cap_day, open_orders, unseeded, halted). Only the max_order
+    /// refused, ALL eight reasons summed (max_order, cap_instance,
+    /// cap_day, open_orders, unseeded, halted, and BX3's short and
+    /// unpriced). Only the max_order
     /// share means "the member's ledger and the operator's number
     /// disagreed"; the rest are the clamp working. An alert belongs on
     /// the router's `refused_max_order` (in `/state`), not here.
@@ -4758,6 +4972,17 @@ pub struct ExecMetricIds {
     /// few seconds after a boot and zero after; still climbing means
     /// the arm never reached the venue.
     pub refused_unseeded: core_metrics::CounterId,
+    /// `engine_exec_refused_unpriced_total` (BX3) — live requests on a
+    /// Binance instrument row the gate could not price: a non-positive
+    /// price, a Binance-routed order with no instrument row, a short
+    /// option with no index. Refused rather than measured as zero. `short` (BX3's other
+    /// law refusal) registers with the first boot that can move it —
+    /// a live Binance slot, BX6; until then `/state` carries it.
+    pub refused_unpriced: core_metrics::CounterId,
+    /// `engine_exec_retired_total` (BX3, F9) — accepted orders the arm
+    /// reported ended without a (further) fill, every `why` summed;
+    /// `/state` spells them by `why`.
+    pub retired: core_metrics::CounterId,
     /// `engine_exec_halts_total` (E6 c4) — halt EDGES. **The alarm.**
     pub halts: core_metrics::CounterId,
     /// `engine_exec_cancel_all_failures_total` (E6 c4) — cancel-all
@@ -4802,7 +5027,40 @@ pub struct ExecMetricIds {
     /// Fixed array rather than a `Vec` so [`MetricIds`] stays `Copy`,
     /// which the engine loop relies on.
     pub slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS],
+    /// **BX6** — registered with the first boot that can move them (a
+    /// live Binance slot, plan §5 BX3 item 11): `None` otherwise.
+    pub bn: Option<ExecBnMetricIds>,
 }
+
+/// **BX6** — the router counters only a Binance boot can move.
+#[derive(Copy, Clone, Debug)]
+pub struct ExecBnMetricIds {
+    /// `engine_exec_refused_short_total` — refused by an instrument law
+    /// (a spot sell past the holding; a short option that is not
+    /// writable).
+    pub refused_short: core_metrics::CounterId,
+    /// `engine_exec_retired_<why>_total`, in [`RETIRED_METRIC_NAMES`]
+    /// order — `engine_exec_retired_total` split by `why`.
+    pub retired: [core_metrics::CounterId; RETIRED_METRIC_NAMES.len()],
+    /// `engine_exec_ledger_marks_refused_total` — venue marks refused as
+    /// insane (obligation 6).
+    pub marks_refused: core_metrics::CounterId,
+    /// `engine_exec_ledger_marks_expired_total` — rows whose mark went
+    /// stale.
+    pub marks_expired: core_metrics::CounterId,
+}
+
+/// **BX6** — the per-`why` retirement counters, index = the `RETIRED_*`
+/// code (6 is never counted); `unknown` is the last slot.
+const RETIRED_METRIC_NAMES: [&str; 7] = [
+    "engine_exec_retired_rejected_total",
+    "engine_exec_retired_expired_total",
+    "engine_exec_retired_canceled_venue_total",
+    "engine_exec_retired_canceled_ttl_total",
+    "engine_exec_retired_canceled_member_total",
+    "engine_exec_retired_filled_total",
+    "engine_exec_retired_unknown_total",
+];
 
 /// E1: one live slot's metric handles.
 ///
@@ -5616,8 +5874,9 @@ fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 30] {
 
 fn register_exec_metrics(
     reg: &mut core_metrics::MetricsRegistry,
-    modes: &[u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+    spec: &ExecObs,
 ) -> Result<ExecMetricIds, &'static str> {
+    let modes = &spec.modes;
     let configured = reg
         .register_gauge("engine_exec_configured")
         .map_err(|_| "register engine_exec_configured")?;
@@ -5631,6 +5890,8 @@ fn register_exec_metrics(
     let refused_risk = one("engine_exec_refused_risk_total")?;
     let refused_halted = one("engine_exec_refused_halted_total")?;
     let refused_unseeded = one("engine_exec_refused_unseeded_total")?;
+    let refused_unpriced = one("engine_exec_refused_unpriced_total")?;
+    let retired = one("engine_exec_retired_total")?;
     let halts = one("engine_exec_halts_total")?;
     let cancel_all_failures = one("engine_exec_cancel_all_failures_total")?;
     let cancel_all_stranded = one("engine_exec_cancel_all_stranded_total")?;
@@ -5678,7 +5939,28 @@ fn register_exec_metrics(
                 .map_err(|_| "register exec slot gauge")?,
         });
     }
+    let bn = if spec.binance {
+        let mut retired_by = [core_metrics::CounterId::default(); RETIRED_METRIC_NAMES.len()];
+        for (i, name) in RETIRED_METRIC_NAMES.iter().enumerate() {
+            retired_by[i] = reg.register_counter(name).map_err(|_| "register exec retired")?;
+        }
+        Some(ExecBnMetricIds {
+            refused_short: reg
+                .register_counter("engine_exec_refused_short_total")
+                .map_err(|_| "register engine_exec_refused_short_total")?,
+            retired: retired_by,
+            marks_refused: reg
+                .register_counter("engine_exec_ledger_marks_refused_total")
+                .map_err(|_| "register engine_exec_ledger_marks_refused_total")?,
+            marks_expired: reg
+                .register_counter("engine_exec_ledger_marks_expired_total")
+                .map_err(|_| "register engine_exec_ledger_marks_expired_total")?,
+        })
+    } else {
+        None
+    };
     Ok(ExecMetricIds {
+        bn,
         configured,
         live_submits,
         paper_submits,
@@ -5687,6 +5969,8 @@ fn register_exec_metrics(
         refused_risk,
         refused_halted,
         refused_unseeded,
+        refused_unpriced,
+        retired,
         halts,
         cancel_all_failures,
         cancel_all_stranded,
@@ -5724,6 +6008,16 @@ fn mirror_exec_metrics(
         .inc(cur.refused_halted.saturating_sub(last.refused_halted));
     reg.counter(ids.refused_unseeded)
         .inc(cur.refused_unseeded.saturating_sub(last.refused_unseeded));
+    reg.counter(ids.refused_unpriced)
+        .inc(cur.refused_unpriced.saturating_sub(last.refused_unpriced));
+    let mut retired_cur = 0u64;
+    let mut retired_last = 0u64;
+    for i in 0..clob_dispatcher::RETIRED_WHY_SLOTS {
+        retired_cur = retired_cur.saturating_add(cur.retired[i]);
+        retired_last = retired_last.saturating_add(last.retired[i]);
+    }
+    reg.counter(ids.retired)
+        .inc(retired_cur.saturating_sub(retired_last));
     reg.counter(ids.halts)
         .inc(cur.halts.saturating_sub(last.halts));
     reg.counter(ids.cancel_all_failures)
@@ -5760,6 +6054,24 @@ fn mirror_exec_metrics(
     reg.gauge(ids.pnl_anchor).set(cur.arm.pnl_anchor_usd_1e6);
     reg.gauge(ids.session_pnl).set(cur.arm.session_pnl_usd_1e6);
     reg.gauge(ids.seeded).set(i64::from(cur.seeded));
+    if let Some(bn) = ids.bn.as_ref() {
+        reg.counter(bn.refused_short)
+            .inc(cur.refused_short.saturating_sub(last.refused_short));
+        for (i, id) in bn.retired.iter().enumerate() {
+            // The last name is `unknown`: the dispatcher's own last slot.
+            let why = if i + 1 == RETIRED_METRIC_NAMES.len() {
+                clob_dispatcher::RETIRED_WHY_UNKNOWN
+            } else {
+                i
+            };
+            reg.counter(*id)
+                .inc(cur.retired[why].saturating_sub(last.retired[why]));
+        }
+        reg.counter(bn.marks_refused)
+            .inc(cur.ledger_marks_refused.saturating_sub(last.ledger_marks_refused));
+        reg.counter(bn.marks_expired)
+            .inc(cur.ledger_marks_expired.saturating_sub(last.ledger_marks_expired));
+    }
     for (s, slot) in ids.slots.iter().enumerate() {
         let Some(slot) = slot else { continue };
         reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
@@ -5897,7 +6209,7 @@ fn write_vrp_state_if_changed<S: strategy_core::StrategyCounters>(
 /// F18: a failing state write repeats every 5 s for as long as the
 /// cause lasts — a full disk lasts hours. One line a minute per writer
 /// says the same thing and leaves the log readable.
-fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
+pub(crate) fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
     const STATE_WARN_PERIOD_NS: u64 = 60_000_000_000;
     if *last_warn_ns != 0 && now.saturating_sub(*last_warn_ns) < STATE_WARN_PERIOD_NS {
         return;
@@ -6122,6 +6434,149 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
         reg.gauge(ids.pos[k]).set(if (k as u32) < n { rows[k].pos_1e6 } else { 0 });
         k += 1;
     }
+}
+
+// ---------------------------------------------------------------
+// HC11 — slot-7 observability (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// The counter rows of the hcv family, in [`hcv_counter_values`] order
+/// — which is what pins the two together.
+const HCV_COUNTER_NAMES: [&str; 18] = [
+    "engine_hcv_judged_total",
+    "engine_hcv_sells_total",
+    "engine_hcv_buys_total",
+    "engine_hcv_option_fills_total",
+    "engine_hcv_hedges_total",
+    "engine_hcv_hedge_fills_total",
+    "engine_hcv_unwind_slices_total",
+    "engine_hcv_settlements_total",
+    "engine_hcv_settle_fallbacks_total",
+    "engine_hcv_skip_event_total",
+    "engine_hcv_skip_stale_total",
+    "engine_hcv_skip_forecast_total",
+    "engine_hcv_skip_caps_total",
+    "engine_hcv_skip_stopped_total",
+    "engine_hcv_ctx_refused_total",
+    "engine_hcv_calendars_total",
+    "engine_hcv_har_updates_total",
+    "engine_hcv_restored_total",
+];
+
+/// The gauge rows of the hcv family, in [`hcv_gauge_values`] order.
+const HCV_GAUGE_NAMES: [&str; 7] = [
+    "engine_hcv_positions",
+    "engine_hcv_vega_abs_usd_1e6",
+    "engine_hcv_pnl_usd_1e6",
+    "engine_hcv_day_pnl_usd_1e6",
+    "engine_hcv_orphans",
+    "engine_hcv_book_stale",
+    "engine_hcv_marks_unknown",
+];
+
+/// `HcvCounters`' counter fields in [`HCV_COUNTER_NAMES`] order.
+// COPY: [u64; 18] (144 B) returned by value — cold, the 5 s /metrics
+// mirror; the xmm precedent (the POD is a struct, not an array).
+fn hcv_counter_values(c: &strategy_core::HcvCounters) -> [u64; 18] {
+    [
+        c.judged,
+        c.sells,
+        c.buys,
+        c.option_fills,
+        c.hedges,
+        c.hedge_fills,
+        c.unwind_slices,
+        c.settlements,
+        c.settle_fallbacks,
+        c.skip_event,
+        c.skip_stale,
+        c.skip_forecast,
+        c.skip_caps,
+        c.skip_stopped,
+        c.ctx_refused,
+        c.calendars,
+        c.har_updates,
+        c.restored,
+    ]
+}
+
+/// `HcvCounters`' gauge fields in [`HCV_GAUGE_NAMES`] order.
+fn hcv_gauge_values(c: &strategy_core::HcvCounters) -> [i64; 7] {
+    [
+        c.positions,
+        c.vega_abs_usd_1e6,
+        c.pnl_usd_1e6,
+        c.day_pnl_usd_1e6,
+        c.orphans,
+        c.book_stale,
+        c.marks_unknown,
+    ]
+}
+
+/// HC11: the `engine_hcv_*` family (slot 7) — what the member judged,
+/// did and skipped (by cause), and its book: positions, |vega|, the
+/// marked P&L and the day's; since HC11b what the boot restored, the
+/// orphans it carries, whether its file is behind the book, and how many
+/// held underlyings still wait for a mark.
+#[derive(Copy, Clone, Debug)]
+pub struct HcvMetricIds {
+    /// The counters, in [`HCV_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 18],
+    /// The gauges, in [`HCV_GAUGE_NAMES`] order.
+    pub gauges: [core_metrics::GaugeId; 7],
+}
+
+/// Register the hcv family. Boot-only.
+fn register_hcv_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HcvMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 18];
+    let mut i = 0usize;
+    while i < HCV_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(HCV_COUNTER_NAMES[i])
+            .map_err(|_| "register hcv counter")?;
+        i += 1;
+    }
+    let mut gauges = [core_metrics::GaugeId::default(); 7];
+    let mut k = 0usize;
+    while k < HCV_GAUGE_NAMES.len() {
+        gauges[k] = reg
+            .register_gauge(HCV_GAUGE_NAMES[k])
+            .map_err(|_| "register hcv gauge")?;
+        k += 1;
+    }
+    Ok(HcvMetricIds { counters, gauges })
+}
+
+/// Mirror the hcv family: the counters as monotonic deltas of the
+/// member's cumulative ones, the gauges as levels. 5 s cadence — cold.
+fn mirror_hcv_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HcvMetricIds,
+    strat: &S,
+    last: &mut strategy_core::HcvCounters,
+) {
+    // COPY: the 200 B `HcvCounters` read into `cur`, then kept as the
+    // next delta's baseline — 5 s cadence, cold; a delta needs the
+    // previous value (the xmm precedent).
+    let mut cur = strategy_core::HcvCounters::default();
+    strat.hcv_counters(&mut cur);
+    let c = hcv_counter_values(&cur);
+    let l = hcv_counter_values(last);
+    let mut i = 0usize;
+    while i < c.len() {
+        reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
+        i += 1;
+    }
+    let g = hcv_gauge_values(&cur);
+    let mut k = 0usize;
+    while k < g.len() {
+        reg.gauge(ids.gauges[k]).set(g[k]);
+        k += 1;
+    }
+    // COPY: 200 B — the next delta's baseline (see above).
+    *last = cur;
 }
 
 /// HYPARB H6: coins carried by the per-coin gauges (the first N configured;
@@ -7262,26 +7717,13 @@ fn mirror_har_metrics<S: strategy_core::StrategyCounters>(
     rows: &mut [strategy_core::HarSeriesView],
     wall_ms: u64,
 ) {
-    let n = strat.har_series_view(rows) as usize;
-    let m = n.min(rows.len());
-    let mut warm = 0i64;
-    let mut age_max: i64 = -1;
-    let mut i = 0usize;
-    while i < m {
-        let r = &rows[i];
-        warm += i64::from(r.warm);
-        if r.newest_day_ms != 0 {
-            let closed_ms = r.newest_day_ms.saturating_add(core_vol::DAY_MS);
-            let age = (wall_ms.saturating_sub(closed_ms) / 1_000).min(i64::MAX as u64) as i64;
-            age_max = age_max.max(age);
-        }
-        i += 1;
-    }
-    reg.gauge(ids.configured).set(n as i64);
-    reg.gauge(ids.warm).set(warm);
-    reg.gauge(ids.day_age_max_s).set(age_max);
-    reg.gauge(ids.day_close_ns_max)
-        .set(strat.har_counters().day_close_ns_max.min(i64::MAX as u64) as i64);
+    let n = strat.har_series_view(rows);
+    // H3.7: one law, `strategy_core::har_gauges` (alloc gate 82 runs it).
+    let g = strategy_core::har_gauges(rows, n, &strat.har_counters(), wall_ms);
+    reg.gauge(ids.configured).set(g.configured);
+    reg.gauge(ids.warm).set(g.warm);
+    reg.gauge(ids.day_age_max_s).set(g.day_age_max_s);
+    reg.gauge(ids.day_close_ns_max).set(g.day_close_ns_max);
 }
 
 // ---------------------------------------------------------------
@@ -7439,6 +7881,8 @@ fn fill_snapshot<S, D>(
     // (a quote and the touch it was placed against can never disagree).
     Sc::xmm_counters(strat, &mut out.xmm.counters);
     out.xmm.n_perps = Sc::xmm_perps_view(strat, &mut out.xmm.perps);
+    // HC11: slot 7's counters and gauges.
+    Sc::hcv_counters(strat, &mut out.hcv.counters);
 
     // P6: slot 1. Both halves come from the same publish instant, so a
     // strike and the position held against it can never disagree.
@@ -7492,6 +7936,39 @@ fn fill_snapshot<S, D>(
     ex.arm_budget_remaining = ec.arm.budget_remaining;
     ex.arm_pnl_anchor_usd_1e6 = ec.arm.pnl_anchor_usd_1e6;
     ex.arm_session_pnl_usd_1e6 = ec.arm.session_pnl_usd_1e6;
+    // BX3: the instrument laws' refusals and the retirements by `why`.
+    ex.refused_short = ec.refused_short;
+    ex.refused_unpriced = ec.refused_unpriced;
+    ex.retired = ec.retired;
+    // BX6: the mark law, and the Binance arm when there is one.
+    ex.ledger_marks_refused = ec.ledger_marks_refused;
+    ex.ledger_marks_expired = ec.ledger_marks_expired;
+    let bn = &ec.arm_bn;
+    ex.arms_binance = engine_snapshot::ArmSnapshot {
+        present: ec.arm_bn_present,
+        submitted: bn.submitted,
+        rejected: bn.rejected,
+        ioc_missed: bn.ioc_missed,
+        refused_local: bn.refused_local,
+        refused_stale: bn.refused_stale,
+        sent_unanswered: bn.sent_unanswered,
+        fills_booked: bn.fills_booked,
+        fills_unresolved: bn.fills_unresolved,
+        fills_foreign: bn.fills_foreign,
+        fills_dropped: bn.fills_dropped,
+        fills_unowned: bn.fills_unowned,
+        recon_ok: bn.recon_ok,
+        recon_failed: bn.recon_failed,
+        recon_drift_legs: bn.recon_drift_legs,
+        recon_unseen_legs: bn.recon_unseen_legs,
+        sweep_left: bn.sweep_left,
+        sweep_stalled: bn.sweep_stalled,
+        cancel_all_unqueued: bn.cancel_all_unqueued,
+        ws_reconnects: bn.ws_reconnects,
+        ws_connect_failures: bn.ws_connect_failures,
+        pnl_anchor_usd_1e6: bn.pnl_anchor_usd_1e6,
+        session_pnl_usd_1e6: bn.session_pnl_usd_1e6,
+    };
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -7917,8 +8394,8 @@ where
     // Phase 8a lane engine: five tick lanes + one signal lane + four
     // fill lanes. The signal lane is bound to the RPC ring — the D2
     // disposition for Stage 1 (per §3.3).
-    // Fills flow from the dispatcher pump (D3) until 8j wires the
-    // per-venue fill-lane producers.
+    // Paper fills flow from the dispatcher pump (D3); a live arm's
+    // venue fills ride its own fill lane (3 Hyperliquid, 4 Binance).
     let Consumers {
         tick_lanes,
         event_lanes,
@@ -8000,6 +8477,8 @@ where
     let mut vm_last = VmCountersSnapshot::default();
     // XMM XH3 slot-6 family delta snapshot (same bookkeeping).
     let mut xmm_last = strategy_core::XmmCounters::default();
+    // HC11 slot-7 family delta snapshot (same bookkeeping).
+    let mut hcv_last = strategy_core::HcvCounters::default();
     let mut vrp_last = strategy_core::VrpCounters::default();
     // VRP V8a: the persisted-state writer. The epoch starts at whatever
     // the member came up with, so a boot that changed nothing rewrites
@@ -8033,6 +8512,15 @@ where
     // restore's (a boot that changed nothing rewrites nothing); the buffer
     // is reused for every series.
     let har_state_paths = std::mem::take(&mut obs.har_state_paths);
+    // H3.7: with the writer thread running, the loop only hands the states
+    // (the set's outbox, in `on_timer`) and writes none of them until the
+    // shutdown's forced write.
+    let har_writer = obs.har_writer.take();
+    let har_on_loop = har_writer.is_none();
+    // HC11b: slot 7's book writer and path, for the shutdown's forced write
+    // (the member hands every other one to the writer at its timer).
+    let hcv_writer = obs.hcv_writer.take();
+    let hcv_state_path = obs.hcv_state_path.take();
     let mut har_state_epochs = [0u64; core_vol::LONG_SET_MAX];
     {
         let n = strategy_core::StrategyCounters::har_series(eng.strategy());
@@ -8074,15 +8562,17 @@ where
                 &mut xsd_state_warn_ns,
                 now_ns(),
             );
-            write_har_state(
-                &har_state_paths,
-                eng.strategy(),
-                &mut har_state_epochs,
-                &mut har_state_buf,
-                &mut har_state_warn_ns,
-                now_ns(),
-                false,
-            );
+            if har_on_loop {
+                write_har_state(
+                    &har_state_paths,
+                    eng.strategy(),
+                    &mut har_state_epochs,
+                    &mut har_state_buf,
+                    &mut har_state_warn_ns,
+                    now_ns(),
+                    false,
+                );
+            }
         }};
     }
     let mut regime_last = strategy_core::RegimeCounters::default();
@@ -8227,6 +8717,7 @@ where
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_xmm_metrics(reg, &ids.xmm, eng.strategy(), &mut xmm_last);
+                mirror_hcv_metrics(reg, &ids.hcv, eng.strategy(), &mut hcv_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
@@ -8487,6 +8978,12 @@ where
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
     eng.stop();
+    // H3.7: the state writer stops and is joined FIRST — a write in flight
+    // and the forced write below must never share a path's temp file. A
+    // state it still held is superseded by that write.
+    if let Some(w) = har_writer {
+        w.shutdown();
+    }
     // HAR H3.4: after `on_stop` delivered any minute the day-close stagger
     // still held, every series' state is written UNCONDITIONALLY — its
     // open day moves the state without moving the epoch.
@@ -8499,6 +8996,21 @@ where
         now_ns(),
         true,
     );
+    // HC11b: slot 7's book, the same way — its writer joined first, then
+    // the live book written UNCONDITIONALLY (an open window's samples since
+    // its last minute move the book without moving the epoch).
+    if let Some(w) = hcv_writer {
+        w.shutdown();
+    }
+    if let Some(path) = hcv_state_path.as_deref() {
+        let mut buf = String::new();
+        if strategy_core::StrategyCounters::render_hcv_state(eng.strategy(), &mut buf) {
+            match crate::state_file::write_atomic(path, &buf) {
+                Ok(()) => tracing::info!(path = %path.display(), "hcv: book written at shutdown"),
+                Err(reason) => tracing::error!(%reason, path = %path.display(), "hcv: the shutdown's book write failed"),
+            }
+        }
+    }
     // S7-L1: what the live arm's shutdown sweep did — every resting
     // order of ours taken off the venue, or how many it could not
     // confirm (`u64::MAX`: the open orders could not be read).
@@ -8700,42 +9212,11 @@ fn new_poll() -> io::Result<(mio::Poll, mio::Events, mio::Token)> {
 
 /// Sleep for the next capped-exponential delay (D8). The schedule
 /// lives in the caller's per-thread [`Backoff`]; a healthy session
-/// resets it (see the spawn loops).
+/// resets it (`core_net::should_reset_backoff`, see the spawn loops).
 fn sleep_backoff(b: &mut Backoff) {
     let delay = Duration::from_nanos(b.next_delay_ns());
     tracing::debug!(?delay, attempt = b.attempt(), "reconnect backoff");
     thread::sleep(delay);
-}
-
-/// A session must live this long, moving market data, before its end
-/// resets the reconnect backoff ([`should_reset_backoff`]).
-const HEALTHY_SESSION_MIN_NS: u64 = 30_000_000_000;
-
-/// T1(b) — the D8 intent, restored (outage 2026-08-27 §5.3): the
-/// reconnect schedule resets only when the session actually MOVED
-/// MARKET DATA (`ticks_total` advanced) for at least
-/// [`HEALTHY_SESSION_MIN_NS`], or ended in a venue-quiet
-/// idle/staleness trip (inherently rate-limited by the keepalive /
-/// staleness budget, so it cannot hammer). A session that only
-/// received its own subscribe rejection — the exact post-settlement
-/// failure that reconnected at ~1 Hz for 16 h/day — keeps
-/// escalating.
-///
-/// The lifetime clause (2026-09-26): a Hyperliquid session that
-/// re-subscribed a settled HIP-4 coin got its snapshots and was then
-/// dropped by the venue within a second — ticks moved, so the backoff
-/// reset every time and the lane reconnected every ~1.2 s for hours
-/// (~48 connects/min against the venue's 30/min per IP). Whatever the
-/// cause, a session that dies young now escalates to the 8 s cap.
-/// One definition for every single-connection venue loop.
-#[inline]
-fn should_reset_backoff(
-    ticks_after: u64,
-    ticks_before: u64,
-    session_ns: u64,
-    venue_quiet_trip: bool,
-) -> bool {
-    (ticks_after > ticks_before && session_ns >= HEALTHY_SESSION_MIN_NS) || venue_quiet_trip
 }
 
 /// T1(c) (outage 2026-08-27 finding F12): age in seconds of the
@@ -8804,7 +9285,9 @@ fn log_pin_outcome(thread_label: &str, core_id: usize) {
 // ---------------------------------------------------------------
 
 /// Boot-only venue REST discovery: validates every `--okx-symbols` /
-/// `--deribit-symbols` / `--hl-coins` / `--polymarket-asset-id` entry
+/// `--deribit-symbols` / `--hl-coins` / `--polymarket-asset-id` entry,
+/// and every Binance list (spot, USDⓈ-M, dated, COIN-M and the eapi
+/// options chain, each against its own product's `exchangeInfo`),
 /// against the venue's live instrument universe *before* any ingress
 /// thread spawns, and (OKX only) builds the discovery-gated
 /// [`ingress_okx::OkxSymbolTable`] `build_okx_symbol_table` now
@@ -8815,8 +9298,7 @@ fn log_pin_outcome(thread_label: &str, core_id: usize) {
 /// live HIP-4 outcomes (2026-09-26 reconnect-loop fix) — cold,
 /// throttled, to an address resolved at boot, on a short deadline.
 ///
-/// BN + RPC deliberately have no discovery here: Binance discovery is
-/// out of Phase-8 scope (plan §6.1), and Polygon RPC has no
+/// RPC deliberately has no discovery here: Polygon RPC has no
 /// instrument universe to validate against (it streams block headers,
 /// not a tradable-instrument list).
 ///
@@ -8835,7 +9317,7 @@ pub mod boot_discovery {
     use core_config::universe::{OptionsPolicy, BN_OPT_ORDINAL_BASE, OPT_ORDINAL_BASE};
     use core_config::Config;
     use core_types::{make_symbol_id, SymbolId, VenueId};
-    use ingress_binance::discovery::BnDiscovery;
+    use ingress_binance::discovery::{BnDiscovery, BnSymbolRow};
     use ingress_deribit::discovery::{parse_index_price, select_capped_chain, DeribitDiscovery};
     use ingress_hyperliquid::discovery::HlDiscovery;
     use ingress_okx::discovery::OkxDiscovery;
@@ -8866,6 +9348,42 @@ pub mod boot_discovery {
         /// `universe_total()` for hl/pm — see each venue's bullet in
         /// the phase-8e plan §6.1).
         pub universe: u32,
+    }
+
+    /// BX2: the Binance lists the boot audit checks — M1 spot and
+    /// USDⓈ-M, the WS5 dated class, and the COIN-M perpetuals and
+    /// delivery futures (lowercase stream symbols, file order).
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct BnLists<'a> {
+        /// `[binance] spot`.
+        pub spot: &'a [String],
+        /// `[binance] usdm`.
+        pub usdm: &'a [String],
+        /// `[binance] usdm_dated`.
+        pub dated: &'a [String],
+        /// `[binance] coinm`.
+        pub coinm: &'a [String],
+        /// `[binance] coinm_dated`.
+        pub coinm_dated: &'a [String],
+    }
+
+    impl BnLists<'_> {
+        /// No Binance list is configured (the audit is skipped).
+        pub fn is_empty(&self) -> bool {
+            self.spot.is_empty()
+                && self.usdm.is_empty()
+                && self.dated.is_empty()
+                && self.coinm.is_empty()
+                && self.coinm_dated.is_empty()
+        }
+
+        fn configured(&self) -> u32 {
+            (self.spot.len()
+                + self.usdm.len()
+                + self.dated.len()
+                + self.coinm.len()
+                + self.coinm_dated.len()) as u32
+        }
     }
 
     /// Everything [`run_all`] produces, consumed by the cli's `run()`
@@ -8917,10 +9435,21 @@ pub mod boot_discovery {
         /// of waiting for the next lifecycle push. Empty when the
         /// venue is off or no row parsed.
         pub hl_outcome_specs: Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
+        /// HC11: `(coin, szDecimals)` of every configured Hyperliquid
+        /// perp whose size decimals the venue stated — a native perp from
+        /// `meta`, a builder-dex perp from its dex's own meta (HC10); a
+        /// builder coin whose dex meta did not load is absent. Slot 7's
+        /// hedge law (lot and price) reads it; empty when HL is off.
+        pub hl_sz_decimals: Vec<(String, u8)>,
         /// Binance coverage (M1 exchangeInfo audit); `None` when the
         /// caller skipped it (legacy flag boots keep their historical
         /// zero-REST Binance behavior — config boots audit).
         pub bn: Option<VenueCoverage>,
+        /// **BX6** — the USDⓈ-M rows (perpetual and dated) the audit
+        /// matched, `(configured name, row)` in configuration order: the
+        /// live Binance arm binds its instrument table from these, never
+        /// from a second fetch. Empty when the audit did not run.
+        pub bn_fapi_rows: Vec<(String, BnSymbolRow)>,
         /// M2.4: the selected Binance eapi options chain — `(symbol,
         /// sym)` in deterministic allocation order (base
         /// [`BN_OPT_ORDINAL_BASE`]), the OKX shape. The bin builds the
@@ -8986,13 +9515,16 @@ pub mod boot_discovery {
         }
     }
 
-    /// `None` ⇒ `symbol_upper` is a TRADING Binance symbol in the
-    /// ingested exchangeInfo table. `Some(reason)` ⇒ MISSING.
-    pub fn bn_missing_reason(d: &BnDiscovery, symbol_upper: &[u8]) -> Option<MissingReason> {
-        match d.find(symbol_upper) {
-            None => Some("not_found"),
-            Some(row) if !row.trading => Some("not_trading"),
-            Some(_) => None,
+    /// The Binance audit law over one looked-up row: listed, TRADING,
+    /// and — on a dated list — a dated contract class (WS5: a perpetual
+    /// misfiled there would ride the dated ordinal block and lie to
+    /// every offline consumer about its class). `Ok` hands the row on.
+    fn bn_row_audit(row: Option<&BnSymbolRow>, dated: bool) -> Result<&BnSymbolRow, MissingReason> {
+        match row {
+            None => Err("not_found"),
+            Some(r) if !r.trading => Err("not_trading"),
+            Some(r) if dated && !r.contract_type.is_dated() => Err("not_dated"),
+            Some(r) => Ok(r),
         }
     }
 
@@ -9584,6 +10116,7 @@ pub mod boot_discovery {
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
         out_specs: &mut Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
+        out_sz: &mut Vec<(String, u8)>,
     ) -> Result<VenueCoverage, &'static str> {
         let (host, port) = split_host_port(&cfg.hyperliquid_api_host, 443)?;
         let mut d = HlDiscovery::new();
@@ -9615,6 +10148,36 @@ pub mod boot_discovery {
             })?;
         }
 
+        // HC10: the own meta of every builder dex a configured coin
+        // names (`xyz:NVDA` → `{"type":"meta","dex":"xyz"}`), so those
+        // coins resolve to real asset ids and szDecimals. Only a dex the
+        // venue's own `perpDexs` listed is asked for; a failed fetch
+        // leaves its coins name-validated (market data addresses them by
+        // string — nothing here trades).
+        let mut dexes: Vec<&[u8]> = Vec::new();
+        for coin in spec.split(',').map(str::trim) {
+            if let Some(dx) = ingress_hyperliquid::discovery::dex_of(coin.as_bytes()) {
+                if d.has_dex(dx) && !dexes.contains(&dx) {
+                    dexes.push(dx);
+                }
+            }
+        }
+        for dx in &dexes {
+            std::thread::sleep(Duration::from_millis(250));
+            let dname = String::from_utf8_lossy(dx);
+            let body = format!(r#"{{"type":"meta","dex":"{dname}"}}"#);
+            match post(tls, host, port, "/info", body.as_bytes(), buf) {
+                Ok(range) => {
+                    if let Err(e) = d.ingest_dex_meta(dx, &buf[range]) {
+                        tracing::error!(venue = "hl", dex = %dname, error = ?e, "discovery: dex meta parse failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(venue = "hl", dex = %dname, error = ?e, "discovery: dex meta fetch failed — its coins stay name-validated");
+                }
+            }
+        }
+
         // BIN15 O2: hand the parsed outcome economics back before the
         // discovery table is dropped — the rolling families' boot
         // binding reads this instead of waiting a whole period for the
@@ -9631,6 +10194,17 @@ pub mod boot_discovery {
             match d.resolve(coin.as_bytes()) {
                 Some(info) => {
                     matched += 1;
+                    // HC11: the size decimals the venue stated (a native
+                    // perp's, or a builder perp's whose dex meta loaded —
+                    // its asset id is then real).
+                    let stated = match info.kind {
+                        ingress_hyperliquid::discovery::HlAssetKind::Perp => true,
+                        ingress_hyperliquid::discovery::HlAssetKind::BuilderDex => info.asset_id != 0,
+                        _ => false,
+                    };
+                    if stated {
+                        out_sz.push(((*coin).to_owned(), info.sz_decimals));
+                    }
                     // WS8 (gaps §2.5 tick/lot): the audit row now
                     // names the venue's size/price granularity for
                     // perps (lot step = 10^-szDecimals; price tick =
@@ -9671,133 +10245,128 @@ pub mod boot_discovery {
         })
     }
 
+    /// The Binance boot audit (M1, WS5, BX2). One table per product
+    /// page — a name listed on two products (spot `BTCUSDT`, USDⓈ-M
+    /// `BTCUSDT`) must resolve against the product it is configured
+    /// for, never against whichever page was ingested first:
+    ///
+    /// - spot: one `?symbol=` probe per configured symbol (the venue
+    ///   400s unknown symbols — MISSING, not fatal), 150 ms apart;
+    /// - USDⓈ-M: one `GET /fapi/v1/exchangeInfo` page for `usdm` and
+    ///   `usdm_dated`;
+    /// - COIN-M (BX2): one `GET /dapi/v1/exchangeInfo` page for `coinm`
+    ///   and `coinm_dated` (rows say `contractStatus`, carry
+    ///   `contractSize`).
+    ///
+    /// Every matched instrument's venue rules are logged (F11); every
+    /// other transport or parse failure stays fatal.
     fn run_bn(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
-        spot: &[String],
-        usdm: &[String],
-        dated: &[String],
+        lists: BnLists<'_>,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
+        fapi_rows: &mut Vec<(String, BnSymbolRow)>,
     ) -> Result<VenueCoverage, &'static str> {
-        let mut d = BnDiscovery::new();
         let mut matched = 0u32;
+        let mut universe = 0u32;
 
-        // Spot: one `?symbol=` probe per configured symbol. The venue
-        // 400s unknown symbols — mapped to MISSING (not fatal), every
-        // other transport/parse failure stays fatal. 150 ms spacing
-        // mirrors the OKX page pacing.
-        let (spot_host, spot_port) = split_host_port(&cfg.binance_rest_host, 443)?;
-        for (i, sym) in spot.iter().enumerate() {
-            if i > 0 {
-                std::thread::sleep(Duration::from_millis(150));
-            }
-            let (up, up_len) = upper_symbol(sym);
-            let upper = core::str::from_utf8(&up[..up_len]).unwrap_or("");
-            let path = format!("/api/v3/exchangeInfo?symbol={upper}");
-            match get(tls, spot_host, spot_port, &path, buf) {
-                Ok(range) => {
-                    d.ingest_body(&buf[range]).map_err(|e| {
-                        tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: parse failed");
-                        "bn: discovery parse failed"
-                    })?;
-                    match bn_missing_reason(&d, &up[..up_len]) {
-                        None => matched += 1,
-                        Some(reason) => {
-                            *any_missing = true;
-                            tracing::error!(
-                                venue = "bn",
-                                symbol = sym.as_str(),
-                                reason,
-                                "discovery: configured symbol missing from venue universe"
-                            );
-                        }
+        if !lists.spot.is_empty() {
+            let mut d = BnDiscovery::new();
+            let (spot_host, spot_port) = split_host_port(&cfg.binance_rest_host, 443)?;
+            for (i, sym) in lists.spot.iter().enumerate() {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                let (up, up_len) = upper_symbol(sym);
+                let upper = core::str::from_utf8(&up[..up_len]).unwrap_or("");
+                let path = format!("/api/v3/exchangeInfo?symbol={upper}");
+                match get(tls, spot_host, spot_port, &path, buf) {
+                    Ok(range) => {
+                        d.ingest_body(&buf[range]).map_err(|e| {
+                            tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: parse failed");
+                            "bn: discovery parse failed"
+                        })?;
+                        matched += audit_bn_symbol(&d, "spot", sym, false, any_missing);
+                    }
+                    Err(core_net::boot_http::BootHttpErr::Status(400)) => {
+                        *any_missing = true;
+                        tracing::error!(
+                            venue = "bn",
+                            symbol = sym.as_str(),
+                            reason = "not_found",
+                            "discovery: configured symbol missing from venue universe (HTTP 400)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: fetch failed");
+                        return Err("bn: discovery fetch failed");
                     }
                 }
-                Err(core_net::boot_http::BootHttpErr::Status(400)) => {
-                    *any_missing = true;
-                    tracing::error!(
-                        venue = "bn",
-                        symbol = sym.as_str(),
-                        reason = "not_found",
-                        "discovery: configured symbol missing from venue universe (HTTP 400)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: fetch failed");
-                    return Err("bn: discovery fetch failed");
-                }
             }
+            universe += d.universe_trading();
         }
 
-        // USDS-M: one full exchangeInfo page, membership-checked
-        // (perps AND — WS5 — the dated delivery class).
-        if !usdm.is_empty() || !dated.is_empty() {
-            let (fut_host, fut_port) = split_host_port(&cfg.binance_fut_rest_host, 443)?;
-            let range = get(tls, fut_host, fut_port, "/fapi/v1/exchangeInfo", buf).map_err(|e| {
-                tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: fetch failed");
+        // One futures page per product: (page, REST host, path, the
+        // perpetual list, the dated list).
+        let pages: [(&'static str, &str, &'static str, &[String], &[String]); 2] = [
+            (
+                "fapi",
+                cfg.binance_fut_rest_host.as_str(),
+                "/fapi/v1/exchangeInfo",
+                lists.usdm,
+                lists.dated,
+            ),
+            (
+                "dapi",
+                cfg.binance_coinm_rest_host.as_str(),
+                "/dapi/v1/exchangeInfo",
+                lists.coinm,
+                lists.coinm_dated,
+            ),
+        ];
+        for (page, host, path, perps, dated) in pages {
+            if perps.is_empty() && dated.is_empty() {
+                continue;
+            }
+            let (host, port) = split_host_port(host, 443)?;
+            let range = get(tls, host, port, path, buf).map_err(|e| {
+                tracing::error!(venue = "bn", page, error = ?e, "discovery: fetch failed");
                 "bn: discovery fetch failed"
             })?;
+            let mut d = BnDiscovery::new();
             d.ingest_body(&buf[range]).map_err(|e| {
-                tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: parse failed");
+                tracing::error!(venue = "bn", page, error = ?e, "discovery: parse failed");
                 "bn: discovery parse failed"
             })?;
-            for sym in usdm {
-                let (up, up_len) = upper_symbol(sym);
-                match bn_missing_reason(&d, &up[..up_len]) {
-                    None => matched += 1,
-                    Some(reason) => {
-                        *any_missing = true;
-                        tracing::error!(
-                            venue = "bn",
-                            symbol = sym.as_str(),
-                            market = "usdm",
-                            reason,
-                            "discovery: configured symbol missing from venue universe"
-                        );
-                    }
-                }
+            let (perp_market, dated_market) = if page == "fapi" {
+                ("usdm", "usdm_dated")
+            } else {
+                ("coinm", "coinm_dated")
+            };
+            for sym in perps {
+                matched += audit_bn_symbol(&d, perp_market, sym, false, any_missing);
             }
-            // WS5: a `usdm_dated` entry must exist AND be a dated
-            // contract class — a perpetual misfiled here would ride
-            // the dated ordinal block and lie to every offline
-            // consumer about its class.
             for sym in dated {
-                let (up, up_len) = upper_symbol(sym);
-                match bn_missing_reason(&d, &up[..up_len]) {
-                    None => {
-                        let is_dated = d
-                            .find(&up[..up_len])
-                            .is_some_and(|row| row.contract_type.is_dated());
-                        if is_dated {
-                            matched += 1;
-                        } else {
-                            *any_missing = true;
-                            tracing::error!(
-                                venue = "bn",
-                                symbol = sym.as_str(),
-                                market = "usdm_dated",
-                                reason = "not_dated",
-                                "discovery: configured symbol is not a dated contract"
-                            );
-                        }
-                    }
-                    Some(reason) => {
-                        *any_missing = true;
-                        tracing::error!(
-                            venue = "bn",
-                            symbol = sym.as_str(),
-                            market = "usdm_dated",
-                            reason,
-                            "discovery: configured symbol missing from venue universe"
-                        );
+                matched += audit_bn_symbol(&d, dated_market, sym, true, any_missing);
+            }
+            if page == "fapi" {
+                // BX6: the rows the live arm binds from (208 B each, boot).
+                for (sym, is_dated) in perps.iter().map(|s| (s, false)).chain(dated.iter().map(|s| (s, true))) {
+                    let (up, up_len) = upper_symbol(sym);
+                    if let Ok(row) = bn_row_audit(d.find(&up[..up_len]), is_dated) {
+                        // COPY: one discovery row (208 B) per configured
+                        // USDⓈ-M symbol, once at boot — the page's table
+                        // is dropped when this loop ends; keeping the whole
+                        // table for a few rows was rejected.
+                        fapi_rows.push((sym.clone(), *row));
                     }
                 }
             }
+            universe += d.universe_trading();
         }
 
-        let configured = (spot.len() + usdm.len() + dated.len()) as u32;
-        let universe = d.universe_trading();
+        let configured = lists.configured();
         tracing::info!(
             venue = "bn",
             configured,
@@ -9810,6 +10379,79 @@ pub mod boot_discovery {
             matched,
             universe,
         })
+    }
+
+    /// Audit one configured Binance symbol against its product's table
+    /// ([`bn_row_audit`]); a match logs the venue's rules for it (F11)
+    /// and counts 1, a miss flags `any_missing` and counts 0.
+    fn audit_bn_symbol(
+        d: &BnDiscovery,
+        market: &'static str,
+        sym: &str,
+        dated: bool,
+        any_missing: &mut bool,
+    ) -> u32 {
+        let (up, up_len) = upper_symbol(sym);
+        match bn_row_audit(d.find(&up[..up_len]), dated) {
+            Ok(row) => {
+                log_bn_rules(market, sym, row);
+                1
+            }
+            Err(reason) => {
+                *any_missing = true;
+                if reason == "not_dated" {
+                    tracing::error!(
+                        venue = "bn",
+                        symbol = sym,
+                        market,
+                        reason,
+                        "discovery: configured symbol is not a dated contract"
+                    );
+                } else {
+                    tracing::error!(
+                        venue = "bn",
+                        symbol = sym,
+                        market,
+                        reason,
+                        "discovery: configured symbol missing from venue universe"
+                    );
+                }
+                0
+            }
+        }
+    }
+
+    /// BX2 (F11): the venue's rules for one resolved instrument, as the
+    /// boot saw them — the rows the gateway's instrument table is built
+    /// from at BX6.
+    fn log_bn_rules(market: &'static str, symbol: &str, row: &BnSymbolRow) {
+        let f = &row.filters;
+        tracing::debug!(
+            venue = "bn",
+            market,
+            symbol,
+            status = ?row.status,
+            contract_type = ?row.contract_type,
+            underlying = ?row.underlying,
+            tradfi = row.is_tradfi(),
+            inverse = row.is_inverse(),
+            contract_size = row.contract_size,
+            price_precision = row.price_precision,
+            qty_precision = row.qty_precision,
+            tick_size_1e9 = f.tick_size_1e9,
+            lot_step_1e9 = f.lot_step_1e9,
+            min_qty_1e9 = f.min_qty_1e9,
+            max_qty_1e9 = f.max_qty_1e9,
+            min_notional_1e9 = f.min_notional_1e9,
+            bid_up_1e9 = f.bid_up_1e9,
+            bid_down_1e9 = f.bid_down_1e9,
+            ask_up_1e9 = f.ask_up_1e9,
+            ask_down_1e9 = f.ask_down_1e9,
+            max_num_orders = f.max_num_orders,
+            perm_names = row.perm.names,
+            perm_groups = row.perm.group_count,
+            "discovery: bn instrument rules"
+        );
     }
 
     /// M2.4: fetch + select the capped Binance eapi options chain —
@@ -9884,6 +10526,22 @@ pub mod boot_discovery {
                     .map_err(|_| "bn: non-utf8 eapi option symbol")?;
                 let sym = make_symbol_id(VenueId::Binance, BN_OPT_ORDINAL_BASE + k + 1);
                 k += 1;
+                // BX2 (F11): the venue's rules for the selected series.
+                tracing::debug!(
+                    venue = "bn",
+                    market = "options",
+                    symbol,
+                    unit = row.unit,
+                    naked_sell = row.naked_sell,
+                    tradfi = row.is_tradfi(),
+                    price_scale = row.price_scale,
+                    qty_scale = row.qty_scale,
+                    tick_size_1e9 = row.filters.tick_size_1e9,
+                    lot_step_1e9 = row.filters.lot_step_1e9,
+                    min_qty_1e9 = row.filters.min_qty_1e9,
+                    max_qty_1e9 = row.filters.max_qty_1e9,
+                    "discovery: bn instrument rules"
+                );
                 out.push((symbol.to_string(), sym));
             }
             tracing::info!(
@@ -9913,8 +10571,9 @@ pub mod boot_discovery {
     /// Run the full boot discovery pass: OKX (if `okx_spec` is
     /// configured), Deribit (if `deribit_spec` is configured),
     /// Hyperliquid (if `hl_spec` is configured), Binance (M1 — if the
-    /// caller passes the spot/usdm lists; legacy flag boots pass
-    /// `None` and keep their historical zero-REST Binance behavior),
+    /// caller passes its [`BnLists`], COIN-M included since BX2;
+    /// legacy flag boots pass `None` and keep their historical
+    /// zero-REST Binance behavior),
     /// then Polymarket (always). One reused `Vec<u8>` buffer carries
     /// every fetch's response body. Any fetch/parse failure is FATAL —
     /// returned as `Err` for the caller to log + exit non-zero; a
@@ -9929,7 +10588,7 @@ pub mod boot_discovery {
         deribit_spec: Option<&str>,
         deribit_options_policy: &OptionsPolicy,
         hl_spec: Option<&str>,
-        binance: Option<(&[String], &[String], &[String])>,
+        binance: Option<BnLists<'_>>,
         bn_options_policy: &OptionsPolicy,
         bybit: Option<(&[String], &[String])>,
         mexc: Option<(&[String], &[String])>,
@@ -9996,6 +10655,7 @@ pub mod boot_discovery {
         };
 
         let mut hl_outcome_specs = Vec::new();
+        let mut hl_sz_decimals = Vec::new();
         let hl = match hl_spec.map(str::trim).filter(|s| !s.is_empty()) {
             Some(spec) => Some(run_hl(
                 cfg,
@@ -10004,24 +10664,21 @@ pub mod boot_discovery {
                 &mut buf,
                 &mut any_missing,
                 &mut hl_outcome_specs,
+                &mut hl_sz_decimals,
             )?),
             None => None,
         };
 
+        let mut bn_fapi_rows = Vec::new();
         let bn = match binance {
-            Some((spot, usdm, dated))
-                if !spot.is_empty() || !usdm.is_empty() || !dated.is_empty() =>
-            {
-                Some(run_bn(
-                    cfg,
-                    tls_config,
-                    spot,
-                    usdm,
-                    dated,
-                    &mut buf,
-                    &mut any_missing,
-                )?)
-            }
+            Some(lists) if !lists.is_empty() => Some(run_bn(
+                cfg,
+                tls_config,
+                lists,
+                &mut buf,
+                &mut any_missing,
+                &mut bn_fapi_rows,
+            )?),
             _ => None,
         };
 
@@ -10092,7 +10749,9 @@ pub mod boot_discovery {
             deribit_options,
             hl,
             hl_outcome_specs,
+            hl_sz_decimals,
             bn,
+            bn_fapi_rows,
             bn_options,
             bybit: bybit_cov,
             mexc: mexc_cov,
@@ -10513,19 +11172,42 @@ pub mod boot_discovery {
             d.ingest_body(
                 br#"{"symbols":[
                   {"symbol":"BTCUSDT","status":"TRADING"},
-                  {"symbol":"OLDUSDT","status":"BREAK"}
+                  {"symbol":"OLDUSDT","status":"BREAK"},
+                  {"symbol":"BTCUSD_PERP","contractStatus":"TRADING","contractType":"PERPETUAL","contractSize":100},
+                  {"symbol":"BTCUSD_261225","contractStatus":"TRADING","contractType":"CURRENT_QUARTER","contractSize":100}
                 ]}"#,
             )
             .unwrap();
             d
         }
 
+        fn audit(d: &BnDiscovery, sym: &[u8], dated: bool) -> Result<(), MissingReason> {
+            bn_row_audit(d.find(sym), dated).map(|_| ())
+        }
+
         #[test]
-        fn bn_missing_reason_covers_found_not_trading_and_absent() {
+        fn bn_row_audit_covers_found_not_trading_absent_and_class() {
             let d = bn_fixture();
-            assert_eq!(bn_missing_reason(&d, b"BTCUSDT"), None);
-            assert_eq!(bn_missing_reason(&d, b"OLDUSDT"), Some("not_trading"));
-            assert_eq!(bn_missing_reason(&d, b"NOPEUSDT"), Some("not_found"));
+            assert_eq!(audit(&d, b"BTCUSDT", false), Ok(()));
+            assert_eq!(audit(&d, b"OLDUSDT", false), Err("not_trading"));
+            assert_eq!(audit(&d, b"NOPEUSDT", false), Err("not_found"));
+            // BX2: COIN-M rows say `contractStatus`; a dated list wants
+            // a dated class (WS5), a perpetual list takes the row.
+            assert_eq!(audit(&d, b"BTCUSD_PERP", false), Ok(()));
+            assert_eq!(audit(&d, b"BTCUSD_261225", true), Ok(()));
+            assert_eq!(audit(&d, b"BTCUSD_PERP", true), Err("not_dated"));
+            assert_eq!(audit(&d, b"BTCUSDT", true), Err("not_dated"));
+            // Absence outranks class; a halted row outranks class too.
+            assert_eq!(audit(&d, b"NOPE_261225", true), Err("not_found"));
+            assert_eq!(audit(&d, b"OLDUSDT", true), Err("not_trading"));
+        }
+
+        #[test]
+        fn a_coinm_symbol_uppercases_like_any_other() {
+            let (buf, n) = upper_symbol("btcusd_perp");
+            assert_eq!(&buf[..n], b"BTCUSD_PERP");
+            let (buf, n) = upper_symbol("1000shibusd_261225");
+            assert_eq!(&buf[..n], b"1000SHIBUSD_261225");
         }
 
         #[test]
@@ -10680,32 +11362,6 @@ mod tests {
             bn_options_path(&["BTCUSDT".to_string()]),
             "/market/stream?streams=btcusdt@optionMarkPrice"
         );
-    }
-
-    /// T1(b) (outage 2026-08-27 §5.3): the predicate that replaces
-    /// the msgs-based reset. Happy path: data moved for a healthy
-    /// lifetime ⇒ reset. Failure modes: a rejection-only session (msgs
-    /// moved, ticks did not) must keep escalating, and so must a session
-    /// that moved data but died young (2026-09-26: HL snapshots, then
-    /// the venue's drop, every ~1.2 s); a venue-quiet idle/staleness
-    /// trip is rate-limited by construction and may reset.
-    #[test]
-    fn backoff_resets_only_on_a_healthy_session_or_quiet_trip() {
-        let healthy = HEALTHY_SESSION_MIN_NS;
-        // Data moved for a healthy lifetime ⇒ reset.
-        assert!(should_reset_backoff(10, 3, healthy, false));
-        assert!(should_reset_backoff(10, 3, u64::MAX, false));
-        // Rejection-only session: ticks unchanged ⇒ keep escalating.
-        assert!(!should_reset_backoff(3, 3, healthy, false));
-        // The exact outage shape: rejection received every cycle,
-        // never a tick — first cycle from zero included.
-        assert!(!should_reset_backoff(0, 0, healthy, false));
-        // The 2026-09-26 shape: snapshots moved, then the venue dropped
-        // the socket ~1 s in ⇒ keep escalating, however many ticks.
-        assert!(!should_reset_backoff(1_000, 3, 1_000_000_000, false));
-        assert!(!should_reset_backoff(10, 3, healthy - 1, false));
-        // Venue-quiet idle/staleness trip ⇒ reset (budget-limited).
-        assert!(should_reset_backoff(3, 3, 0, true));
     }
 
     /// T1(c): stamp-age helper degrades to -1, never panics, when
@@ -10900,13 +11556,16 @@ mod tests {
         let hl = build_hl_coin_table("BTC,ETH").unwrap();
 
         let mexc = [make_symbol_id(VenueId::Mexc, 1), make_symbol_id(VenueId::Mexc, 513)];
-        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc);
+        let hc = [make_symbol_id(VenueId::Hypercall, 513), make_symbol_id(VenueId::Hypercall, 514)];
+        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc, &hc);
         let expect: Vec<u32> = {
             let mut v = vec![
                 42,
                 7,
                 make_symbol_id(VenueId::Mexc, 1),
                 make_symbol_id(VenueId::Mexc, 513),
+                make_symbol_id(VenueId::Hypercall, 513),
+                make_symbol_id(VenueId::Hypercall, 514),
                 make_symbol_id(VenueId::Okx, 1),
                 make_symbol_id(VenueId::Okx, 2),
                 make_symbol_id(VenueId::Deribit, 1),
@@ -10931,16 +11590,22 @@ mod tests {
     #[test]
     fn ai_universe_dedups_and_handles_absent_venues() {
         // PM and BN misconfigured to the same id: one survivor.
-        let u = build_ai_universe(&[7], &[7], None, None, None, &[]);
+        let u = build_ai_universe(&[7], &[7], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[7]);
 
         // No optional venues: exactly the sorted pair.
-        let u = build_ai_universe(&[42], &[7], None, None, None, &[]);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[7, 42]);
 
         // M1 multi-market: every PM token + every BN sym flows in.
-        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[]);
+        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[2, 3, 7, 42, 16_777_218]);
+
+        // O-HC17: the Hypercall options sort among the rest, a duplicate
+        // collapses; the caller passes no index sym.
+        let o = make_symbol_id(VenueId::Hypercall, 600);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[o, o]);
+        assert_eq!(&u[..], &[7, 42, o]);
     }
 
     #[test]
@@ -11073,9 +11738,13 @@ mod tests {
         assert_eq!(v[at("engine_ingress_hypercall_rest_handoff_drops_total")], 30);
         assert_eq!(v[at("engine_ingress_hypercall_rest_last_round_ms")], 31);
         assert_eq!(ids.gauges.len(), HC_METRICS);
-        // The whole registry, worst case, still fits.
-        let obs = Observability::build(true, Some([1u8; clob_dispatcher::EXEC_COUNTER_SLOTS]))
-            .expect("every family fits the fixed registry");
+        // The whole registry, worst case, still fits: every slot live and
+        // the Binance arm's router counters registered (BX6).
+        let worst = ExecObs {
+            modes: [1u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+            binance: true,
+        };
+        let obs = Observability::build(true, Some(worst)).expect("every family fits the fixed registry");
         let reg = obs.metrics.as_ref().unwrap();
         assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
@@ -12373,7 +13042,7 @@ mod tests {
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         modes[3] = 1;
         modes[6] = 2;
-        let obs = Observability::build(true, Some(modes)).unwrap();
+        let obs = Observability::build(true, Some(ExecObs { modes, binance: false })).unwrap();
         let reg = obs.metrics.as_ref().unwrap();
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).unwrap();
@@ -12388,6 +13057,9 @@ mod tests {
             // E6 commit 4 — the halt family.
             "engine_exec_refused_halted_total",
             "engine_exec_refused_unseeded_total",
+            // BX3.
+            "engine_exec_refused_unpriced_total",
+            "engine_exec_retired_total",
             "engine_exec_halts_total",
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",
@@ -12409,8 +13081,51 @@ mod tests {
             "engine_exec_slot6_mode",
             "engine_exec_slot6_refused_total",
             "engine_exec_slot6_halted",
+            // BX6: only a Binance boot can move these.
+            "engine_exec_refused_short_total",
+            "engine_exec_retired_filled_total",
+            "engine_exec_ledger_marks_refused_total",
         ] {
             assert!(!text.contains(absent), "must NOT register {absent}");
+        }
+    }
+
+    /// **BX6** — a boot with a live Binance slot registers the router
+    /// counters only it can move (plan §5 BX3 item 11), and mirrors them:
+    /// the per-`why` retirements from their own slots (`unknown` from the
+    /// dispatcher's last), the short refusals and the mark law's two.
+    #[test]
+    fn a_binance_boot_registers_and_mirrors_its_router_counters() {
+        let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        modes[3] = 1;
+        let obs = Observability::build(true, Some(ExecObs { modes, binance: true })).unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let ids = obs.counter_ids.as_ref().and_then(|i| i.exec.as_ref()).expect("the exec family");
+        let cur = clob_dispatcher::ExecCounters {
+            refused_short: 2,
+            retired: [1, 2, 3, 4, 5, 6, 0, 9],
+            ledger_marks_refused: 7,
+            ledger_marks_expired: 8,
+            ..clob_dispatcher::ExecCounters::default()
+        };
+        let mut last = clob_dispatcher::ExecCounters::default();
+        mirror_exec_metrics(reg, ids, cur, &mut last);
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        for (name, v) in [
+            ("engine_exec_refused_short_total", 2),
+            ("engine_exec_retired_rejected_total", 1),
+            ("engine_exec_retired_canceled_member_total", 5),
+            ("engine_exec_retired_filled_total", 6),
+            ("engine_exec_retired_unknown_total", 9),
+            ("engine_exec_ledger_marks_refused_total", 7),
+            ("engine_exec_ledger_marks_expired_total", 8),
+        ] {
+            assert!(text.contains(&format!("{name} {v}\n")), "{name} {v}: {text}");
+        }
+        for n in RETIRED_METRIC_NAMES {
+            assert!(n.len() <= core_metrics::NAME_MAX);
         }
     }
 
@@ -12436,6 +13151,8 @@ mod tests {
             "engine_exec_refused_risk_total",
             "engine_exec_refused_halted_total",
             "engine_exec_refused_unseeded_total",
+            "engine_exec_refused_unpriced_total",
+            "engine_exec_retired_total",
             "engine_exec_halts_total",
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",

@@ -24,11 +24,19 @@
 //! ## Wire shapes (live-verified 2026-09-23, BX0 K6 — pitfall #11)
 //!
 //! REST `GET /eapi/v1/exchangeInfo` (ONE page, ALL underlyings):
-//! `{"optionSymbols":[{"symbol":"BTC-260327-100000-C",
+//! `{"optionContracts":[{"underlying":"BTCUSDT","nakedSell":true,…},…],
+//!   "optionSymbols":[{"symbol":"BTC-260327-100000-C",
 //!   "underlying":"BTCUSDT","strikePrice":"100000.00000000",
-//!   "expiryDate":1774598400000,"side":"CALL","filters":[…],…},…]}`
+//!   "expiryDate":1774598400000,"side":"CALL","status":"TRADING",
+//!   "unit":1,"priceScale":3,"quantityScale":2,
+//!   "contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO",
+//!   "filters":[…],…},…]}`
 //! — `strikePrice` QUOTED decimal, `expiryDate` BARE ms integer,
-//! `side` `"CALL"|"PUT"`; `filters`/noise skipped structurally.
+//! `side` `"CALL"|"PUT"`, `status` `TRADING|CLOSED_MARKET` (BX2,
+//! 2026-09-26: 1 558 rows, the TradFi `XAU`/`XAG` week closed);
+//! `filters` (`PRICE_FILTER`, `LOT_SIZE`) walk through the discovery
+//! module's reader; the row's own `minQty`/`maxQty` repeat `LOT_SIZE`
+//! on every live row and are skipped with the rest of the noise.
 //!
 //! REST `GET /eapi/v1/index?underlying=BTCUSDT`:
 //! `{"time":…,"indexPrice":"77000.12"}` — quoted decimal; the boot
@@ -69,6 +77,8 @@ use core_parse::{
 };
 use core_types::SymbolId;
 
+use crate::discovery::{BnDiscoveryErr, BnFilters, BnStatus, BnUnderlying, BN_ROW_TRADFI};
+
 // ---------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------
@@ -94,6 +104,7 @@ pub const EAPI_DISCOVERY_ROWS_CAP: usize = 8192;
 // ---------------------------------------------------------------
 
 /// One discovered eapi option instrument.
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct EapiOptionRow {
     /// `symbol` bytes as listed (venue case; `symbol_len` valid).
@@ -106,11 +117,38 @@ pub struct EapiOptionRow {
     pub underlying_len: u8,
     /// `side == "CALL"`.
     pub is_call: bool,
+    /// BX2: `status == TRADING` — the only selectable state.
+    pub trading: bool,
+    /// BX2: `status` (`TRADING`, `CLOSED_MARKET` → `Close`).
+    pub status: BnStatus,
+    /// BX2: [`BN_ROW_TRADFI`] when `contractType` is `TRADFI_OPTIONS`.
+    pub flags: u8,
+    /// BX2: `underlyingType` (`CRYPTO` → `Coin`, `COMMODITY`).
+    pub underlying_type: BnUnderlying,
+    /// BX2: `priceScale`, a price's decimals (`u8::MAX` = absent).
+    pub price_scale: u8,
+    /// BX2: `quantityScale`, a quantity's decimals (`u8::MAX` = absent).
+    pub qty_scale: u8,
+    /// BX2: the underlying's `optionContracts[].nakedSell` — false when
+    /// the page lists no contract for it (a short then needs cover).
+    pub naked_sell: bool,
+    /// BX2: `unit`, underlying units per contract (1, 100 on `XRP`,
+    /// 1 000 on `DOGE` live); 0 = absent.
+    pub unit: u32,
     /// `strikePrice` ×1e9 (quoted decimal on this wire).
     pub strike_1e9: i64,
     /// `expiryDate` ms since epoch (bare integer on this wire).
     pub expiry_ms: i64,
+    /// BX2: the venue's rules (`PRICE_FILTER` tick, `LOT_SIZE` step and
+    /// bounds; F11 retention).
+    pub filters: BnFilters,
 }
+
+// Parsed in place and never passed by value on a hot path; the layout
+// is pinned (declaration order, `repr(C)`) and keeps the boot
+// reservation (8 192 rows) under 1.5 MiB and the selected chain (64
+// rows) under 11 KiB.
+const _: () = assert!(core::mem::size_of::<EapiOptionRow>() == 160);
 
 impl EapiOptionRow {
     /// The empty row a table slot starts as; [`parse_option_row`] fills
@@ -121,9 +159,24 @@ impl EapiOptionRow {
         underlying: [0; EAPI_ULY_MAX],
         underlying_len: 0,
         is_call: false,
+        trading: false,
+        status: BnStatus::Absent,
+        flags: 0,
+        underlying_type: BnUnderlying::Absent,
+        price_scale: u8::MAX,
+        qty_scale: u8::MAX,
+        naked_sell: false,
+        unit: 0,
         strike_1e9: 0,
         expiry_ms: 0,
+        filters: BnFilters::EMPTY,
     };
+
+    /// A TradFi option (`TRADFI_OPTIONS`).
+    #[inline]
+    pub fn is_tradfi(&self) -> bool {
+        self.flags & BN_ROW_TRADFI != 0
+    }
 
     /// The symbol as a byte slice.
     #[inline]
@@ -144,7 +197,8 @@ pub enum EapiDiscoveryErr {
     /// Missing `"optionSymbols":[` array.
     Envelope,
     /// A row violated the option-object contract (missing required
-    /// key, over-long symbol/underlying, bad side, malformed value).
+    /// key, over-long symbol/underlying, bad side, malformed value) —
+    /// or an `optionContracts` entry did (BX2).
     BadRow,
     /// Body ended inside the array.
     Truncated,
@@ -167,8 +221,10 @@ impl EapiDiscovery {
     }
 
     /// Parse one `exchangeInfo` body into the table. Returns rows
-    /// added.
+    /// added. BX2: the body's `optionContracts` then stamp each new
+    /// row's [`EapiOptionRow::naked_sell`].
     pub fn ingest_exchange_info(&mut self, body: &[u8]) -> Result<u32, EapiDiscoveryErr> {
+        let first = self.rows.len();
         let arr_pos = find_field(body, b"\"optionSymbols\":").ok_or(EapiDiscoveryErr::Envelope)?;
         let mut i = skip_ws(body, arr_pos);
         if i >= body.len() || body[i] != b'[' {
@@ -185,7 +241,7 @@ impl EapiDiscovery {
                 b']' => break,
                 b',' => i += 1,
                 b'{' => {
-                    // The row (72 B) is parsed IN PLACE into its table
+                    // The row (≤ 160 B) is parsed IN PLACE into its table
                     // slot rather than returned by value past the 64 B
                     // bound; so the cap is checked before the row parses,
                     // and a row that fails leaves no slot behind.
@@ -204,6 +260,15 @@ impl EapiDiscovery {
                     added += 1;
                 }
                 _ => return Err(EapiDiscoveryErr::BadRow),
+            }
+        }
+        // BX2: no `optionContracts` leaves every row's naked_sell false
+        // — the conservative reading. A malformed entry refuses the page
+        // with its new rows (fail fast; nothing half-stamped is kept).
+        if let Some(pos) = find_field(body, b"\"optionContracts\":") {
+            if let Err(e) = stamp_naked_sell(body, pos, &mut self.rows[first..]) {
+                self.rows.truncate(first);
+                return Err(e);
             }
         }
         Ok(added)
@@ -259,10 +324,18 @@ fn parse_option_row(
                 let key_end_q = skip_string(body, key_start).ok_or(EapiDiscoveryErr::Truncated)?;
                 let key = &body[key_start..key_end_q - 1];
                 i = skip_ws(body, key_end_q);
-                if i >= body.len() || body[i] != b':' {
+                // End-of-buffer after a key or its colon is a truncation,
+                // not a malformed row (as `crate::discovery`).
+                if i >= body.len() {
+                    return Err(EapiDiscoveryErr::Truncated);
+                }
+                if body[i] != b':' {
                     return Err(EapiDiscoveryErr::BadRow);
                 }
                 i = skip_ws(body, i + 1);
+                if i >= body.len() {
+                    return Err(EapiDiscoveryErr::Truncated);
+                }
                 match key {
                     b"symbol" => {
                         let (s, end) = quoted_span(body, i)?;
@@ -322,6 +395,53 @@ fn parse_option_row(
                         expiry = Some(v as i64);
                         i = end;
                     }
+                    b"status" => {
+                        // One lifecycle per row, as on the other pages
+                        // (`crate::discovery`): a repeat is ambiguous and
+                        // refused, never last-wins.
+                        if out.status != BnStatus::Absent {
+                            return Err(EapiDiscoveryErr::BadRow);
+                        }
+                        let (s, end) = quoted_span(body, i)?;
+                        out.status = BnStatus::of(s);
+                        i = end;
+                    }
+                    b"contractType" => {
+                        let (s, end) = quoted_span(body, i)?;
+                        if s == b"TRADFI_OPTIONS" {
+                            out.flags |= BN_ROW_TRADFI;
+                        }
+                        i = end;
+                    }
+                    b"underlyingType" => {
+                        let (s, end) = quoted_span(body, i)?;
+                        out.underlying_type = BnUnderlying::of(s);
+                        i = end;
+                    }
+                    b"unit" => {
+                        let (v, end) = scan_u64(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
+                        if v == 0 || v > u32::MAX as u64 {
+                            return Err(EapiDiscoveryErr::BadRow);
+                        }
+                        out.unit = v as u32;
+                        i = end;
+                    }
+                    b"priceScale" | b"quantityScale" => {
+                        let (v, end) = scan_u64(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
+                        if v >= u8::MAX as u64 {
+                            return Err(EapiDiscoveryErr::BadRow);
+                        }
+                        if key == b"priceScale" {
+                            out.price_scale = v as u8;
+                        } else {
+                            out.qty_scale = v as u8;
+                        }
+                        i = end;
+                    }
+                    b"filters" => {
+                        i = crate::discovery::parse_filters(body, i, &mut out.filters)
+                            .map_err(eapi_err)?;
+                    }
                     _ => {
                         i = skip_json_value(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
                     }
@@ -331,13 +451,142 @@ fn parse_option_row(
         }
     }
 
-    if out.symbol_len == 0 || out.underlying_len == 0 {
+    if out.symbol_len == 0 || out.underlying_len == 0 || out.status == BnStatus::Absent {
         return Err(EapiDiscoveryErr::BadRow);
     }
     out.is_call = is_call.ok_or(EapiDiscoveryErr::BadRow)?;
     out.strike_1e9 = strike.ok_or(EapiDiscoveryErr::BadRow)?;
     out.expiry_ms = expiry.ok_or(EapiDiscoveryErr::BadRow)?;
+    out.trading = out.status == BnStatus::Trading;
     Ok(i)
+}
+
+/// The discovery module's filter reader speaks its own error; only its
+/// row-level kinds can come back from a filter walk.
+fn eapi_err(e: BnDiscoveryErr) -> EapiDiscoveryErr {
+    match e {
+        BnDiscoveryErr::Truncated => EapiDiscoveryErr::Truncated,
+        BnDiscoveryErr::Envelope | BnDiscoveryErr::BadRow | BnDiscoveryErr::TooMany => {
+            EapiDiscoveryErr::BadRow
+        }
+    }
+}
+
+/// BX2: walk `"optionContracts":[{"underlying":…,"nakedSell":…},…]` at
+/// `pos` and stamp `naked_sell` on every row of `rows` whose underlying
+/// an entry names. An entry needs both keys (`nakedSell` a bare JSON
+/// bool); anything else in it skips structurally. Two passes — the
+/// `true` entries, then the `false` ones — so an underlying the page
+/// names both ways ends up covered-only, the conservative reading,
+/// rather than whichever entry came last (BX2 review). Boot-only.
+fn stamp_naked_sell(
+    body: &[u8],
+    pos: usize,
+    rows: &mut [EapiOptionRow],
+) -> Result<(), EapiDiscoveryErr> {
+    stamp_pass(body, pos, rows, true)?;
+    stamp_pass(body, pos, rows, false)
+}
+
+/// One [`stamp_naked_sell`] pass: every entry is validated, and the ones
+/// whose `nakedSell` is `pass` stamp their rows.
+fn stamp_pass(
+    body: &[u8],
+    pos: usize,
+    rows: &mut [EapiOptionRow],
+    pass: bool,
+) -> Result<(), EapiDiscoveryErr> {
+    let mut i = skip_ws(body, pos);
+    if i >= body.len() || body[i] != b'[' {
+        return Err(EapiDiscoveryErr::BadRow);
+    }
+    i += 1;
+    loop {
+        i = skip_ws(body, i);
+        if i >= body.len() {
+            return Err(EapiDiscoveryErr::Truncated);
+        }
+        match body[i] {
+            b']' => return Ok(()),
+            b',' => i += 1,
+            b'{' => {
+                let mut uly: &[u8] = &[];
+                let mut naked: Option<bool> = None;
+                i += 1;
+                loop {
+                    i = skip_ws(body, i);
+                    if i >= body.len() {
+                        return Err(EapiDiscoveryErr::Truncated);
+                    }
+                    match body[i] {
+                        b'}' => {
+                            i += 1;
+                            break;
+                        }
+                        b',' => i += 1,
+                        b'"' => {
+                            let key_end_q =
+                                skip_string(body, i + 1).ok_or(EapiDiscoveryErr::Truncated)?;
+                            let key = &body[i + 1..key_end_q - 1];
+                            i = skip_ws(body, key_end_q);
+                            if i >= body.len() {
+                                return Err(EapiDiscoveryErr::Truncated);
+                            }
+                            if body[i] != b':' {
+                                return Err(EapiDiscoveryErr::BadRow);
+                            }
+                            i = skip_ws(body, i + 1);
+                            if i >= body.len() {
+                                return Err(EapiDiscoveryErr::Truncated);
+                            }
+                            match key {
+                                b"underlying" => {
+                                    let (s, end) = quoted_span(body, i)?;
+                                    uly = s;
+                                    i = end;
+                                }
+                                b"nakedSell" => {
+                                    let rest = &body[i..];
+                                    if rest.starts_with(b"true") {
+                                        naked = Some(true);
+                                        i += 4;
+                                    } else if rest.starts_with(b"false") {
+                                        naked = Some(false);
+                                        i += 5;
+                                    } else if b"true".starts_with(rest)
+                                        || b"false".starts_with(rest)
+                                    {
+                                        // The body ends inside the bool.
+                                        return Err(EapiDiscoveryErr::Truncated);
+                                    } else {
+                                        return Err(EapiDiscoveryErr::BadRow);
+                                    }
+                                }
+                                _ => {
+                                    i = skip_json_value(body, i).ok_or(EapiDiscoveryErr::BadRow)?;
+                                }
+                            }
+                        }
+                        _ => return Err(EapiDiscoveryErr::BadRow),
+                    }
+                }
+                let naked = naked.ok_or(EapiDiscoveryErr::BadRow)?;
+                if uly.is_empty() {
+                    return Err(EapiDiscoveryErr::BadRow);
+                }
+                if naked == pass {
+                    let mut k = 0usize;
+                    while k < rows.len() {
+                        if rows[k].underlying() == uly {
+                            rows[k].naked_sell = naked;
+                        }
+                        k += 1;
+                    }
+                }
+            }
+            _ => return Err(EapiDiscoveryErr::BadRow),
+        }
+    }
 }
 
 /// Read a quoted string value at `pos` (must point at `"`).
@@ -398,10 +647,11 @@ impl options_select::ChainRow for EapiOptionRow {
 /// invariants keep pinning all three venue surfaces) — here lives only
 /// the VENUE candidacy predicate, which for eapi adds the `underlying`
 /// filter because ONE exchangeInfo page carries every family
-/// (`row.underlying == underlying && expiry_ms > now_ms`; eapi lists
-/// tradable symbols only — no per-row state field). Deterministic
-/// order = the allocation order; ≤ `E × K × 2` by construction.
-/// Boot-only: allocates freely.
+/// (`row.trading && row.underlying == underlying && expiry_ms >
+/// now_ms`; BX2: rows carry a `status` — a `CLOSED_MARKET` series
+/// before its expiry never selects). Deterministic order = the
+/// allocation order; ≤ `E × K × 2` by construction. Boot-only:
+/// allocates freely.
 pub fn select_capped_chain(
     rows: &[EapiOptionRow],
     underlying: &[u8],
@@ -410,14 +660,14 @@ pub fn select_capped_chain(
     strikes_k: u32,
     now_ms: i64,
 ) -> Vec<EapiOptionRow> {
-    // COPY: each selected row (72 B) into the returned Vec, ≤ E × K × 2
-    // rows (64 by default), once at boot — the shared selection law
+    // COPY: each selected row (≤ 160 B) into the returned Vec, ≤ E × K
+    // × 2 rows (64 by default), once at boot — the shared selection law
     // (`options-select`, three venues) hands back POD rows by value —
     // rejected: references into the discovery table (an API change to
-    // the three-venue law, for ≤ 4.6 KB copied once at boot).
+    // the three-venue law, for ≤ 10 KB copied once at boot).
     options_select::select_capped_chain(
         rows,
-        |r: &EapiOptionRow| r.underlying() == underlying && r.expiry_ms > now_ms,
+        |r: &EapiOptionRow| r.trading && r.underlying() == underlying && r.expiry_ms > now_ms,
         index_px_1e9,
         expiries_e,
         strikes_k,
@@ -799,7 +1049,7 @@ mod tests {
 
     fn opt_row(sym: &str, uly: &str, side: &str, strike: &str, exp: i64) -> String {
         format!(
-            r#"{{"contractId":3,"expiryDate":{exp},"filters":[{{"filterType":"PRICE_FILTER","minPrice":"0.02","maxPrice":"80000.01","tickSize":"0.01"}},{{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":"0.01"}}],"id":2474,"symbol":"{sym}","side":"{side}","strikePrice":"{strike}","underlying":"{uly}","unit":1,"makerFeeRate":"0.0002","takerFeeRate":"0.0002","minQty":"0.01","maxQty":"100","initialMargin":"0.15","maintenanceMargin":"0.075","minInitialMargin":"0.1","minMaintenanceMargin":"0.05","priceScale":2,"quantityScale":2,"quoteAsset":"USDT"}}"#
+            r#"{{"contractId":3,"expiryDate":{exp},"filters":[{{"filterType":"PRICE_FILTER","minPrice":"0.02","maxPrice":"80000.01","tickSize":"0.01"}},{{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"100","stepSize":"0.01"}}],"id":2474,"symbol":"{sym}","side":"{side}","strikePrice":"{strike}","underlying":"{uly}","unit":1,"makerFeeRate":"0.0002","takerFeeRate":"0.0002","minQty":"0.01","maxQty":"100","initialMargin":"0.15","maintenanceMargin":"0.075","minInitialMargin":"0.1","minMaintenanceMargin":"0.05","priceScale":2,"quantityScale":2,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"}}"#
         )
     }
 
@@ -961,6 +1211,297 @@ mod tests {
         // Determinism.
         let again = select_capped_chain(d.rows(), b"BTCUSDT", 100_000_000_000_000, 4, 32, NOW);
         assert_eq!(names(&all), names(&again));
+    }
+
+    // -----------------------------------------------------------
+    // BX2 (F11 retention): live rows and contracts, verbatim from
+    // `/eapi/v1/exchangeInfo` (2026-09-26 05:45Z).
+    // -----------------------------------------------------------
+
+    /// The live `optionContracts` array, verbatim.
+    const LIVE_CONTRACTS: &str = r#""optionContracts":[{"baseAsset":"XAG","quoteAsset":"USDT","underlying":"XAGUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"BTC","quoteAsset":"USDT","underlying":"BTCUSDT","settleAsset":"USDT","nakedSell":true},{"baseAsset":"CL","quoteAsset":"USDT","underlying":"CLUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"ETH","quoteAsset":"USDT","underlying":"ETHUSDT","settleAsset":"USDT","nakedSell":true},{"baseAsset":"BZ","quoteAsset":"USDT","underlying":"BZUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"BNB","quoteAsset":"USDT","underlying":"BNBUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"SOL","quoteAsset":"USDT","underlying":"SOLUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"XRP","quoteAsset":"USDT","underlying":"XRPUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"DOGE","quoteAsset":"USDT","underlying":"DOGEUSDT","settleAsset":"USDT","nakedSell":false},{"baseAsset":"XAU","quoteAsset":"USDT","underlying":"XAUUSDT","settleAsset":"USDT","nakedSell":false}]"#;
+
+    /// Three live rows, verbatim: a BTC call, a closed TradFi XAU call
+    /// and a DOGE call (unit 1 000).
+    const LIVE_ROWS: &str = r#"{"expiryDate":1798185600000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"1245.000","maxPrice":"11165.000","tickSize":"5.000"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"200","stepSize":"0.01"}],"symbol":"BTC-261225-85000-C","side":"CALL","strikePrice":"85000.000","underlying":"BTCUSDT","unit":1,"liquidationFeeRate":"0.001900","minQty":"0.01","maxQty":"200","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":3,"quantityScale":2,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"},{"expiryDate":1790974800000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"69.73","maxPrice":"627.63","tickSize":"0.01"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"2000","stepSize":"0.01"}],"symbol":"XAU-261002-3950-C","side":"CALL","strikePrice":"3950.00","underlying":"XAUUSDT","unit":1,"liquidationFeeRate":"0.001900","minQty":"0.01","maxQty":"2000","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":2,"quantityScale":2,"quoteAsset":"USDT","status":"CLOSED_MARKET","contractType":"TRADFI_OPTIONS","underlyingType":"COMMODITY"},{"expiryDate":1790928000000,"filters":[{"filterType":"PRICE_FILTER","minPrice":"2.8000","maxPrice":"25.1200","tickSize":"0.0100"},{"filterType":"LOT_SIZE","minQty":"0.01","maxQty":"4000","stepSize":"0.01"}],"symbol":"DOGE-261002-0.084-C","side":"CALL","strikePrice":"0.0840","underlying":"DOGEUSDT","unit":1000,"liquidationFeeRate":"0.001900","minQty":"0.01","maxQty":"4000","initialMargin":"0.15000000","maintenanceMargin":"0.07500000","minInitialMargin":"0.10000000","minMaintenanceMargin":"0.05000000","priceScale":4,"quantityScale":2,"quoteAsset":"USDT","status":"TRADING","contractType":"CRYPTO_OPTIONS","underlyingType":"CRYPTO"}"#;
+
+    /// The live envelope's order: contracts, assets, then the rows.
+    fn live_page(contracts: &str, rows: &str) -> Vec<u8> {
+        format!(
+            r#"{{"timezone":"UTC","serverTime":1790401849637,{contracts},"optionAssets":[{{"name":"USDT"}}],"optionSymbols":[{rows}],"rateLimits":[]}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn live_rows_keep_rules_status_and_naked_sell() {
+        let mut d = EapiDiscovery::new();
+        assert_eq!(
+            d.ingest_exchange_info(&live_page(LIVE_CONTRACTS, LIVE_ROWS))
+                .unwrap(),
+            3
+        );
+        let btc = &d.rows()[0];
+        assert_eq!(btc.symbol(), b"BTC-261225-85000-C");
+        assert_eq!(btc.status, BnStatus::Trading);
+        assert!(btc.trading);
+        assert!(btc.naked_sell, "BTCUSDT: nakedSell true");
+        assert!(!btc.is_tradfi());
+        assert_eq!(btc.underlying_type, BnUnderlying::Coin);
+        assert_eq!((btc.unit, btc.price_scale, btc.qty_scale), (1, 3, 2));
+        assert_eq!(btc.strike_1e9, 85_000_000_000_000);
+        let f = btc.filters;
+        assert_eq!(f.tick_size_1e9, 5_000_000_000);
+        assert_eq!((f.lot_step_1e9, f.min_qty_1e9), (10_000_000, 10_000_000));
+        assert_eq!(f.max_qty_1e9, 200_000_000_000);
+        assert_eq!(f.min_notional_1e9, 0);
+        let xau = &d.rows()[1];
+        assert_eq!(xau.status, BnStatus::Close, "CLOSED_MARKET");
+        assert!(!xau.trading);
+        assert!(xau.is_tradfi());
+        assert_eq!(xau.underlying_type, BnUnderlying::Commodity);
+        assert!(!xau.naked_sell);
+        assert_eq!(xau.filters.tick_size_1e9, 10_000_000);
+        let doge = &d.rows()[2];
+        assert_eq!(doge.unit, 1_000);
+        assert_eq!(doge.price_scale, 4);
+        assert_eq!(doge.strike_1e9, 84_000_000);
+        assert_eq!(doge.filters.max_qty_1e9, 4_000_000_000_000);
+        assert!(!doge.naked_sell);
+    }
+
+    #[test]
+    fn a_closed_series_never_selects() {
+        let mut d = EapiDiscovery::new();
+        d.ingest_exchange_info(&live_page(LIVE_CONTRACTS, LIVE_ROWS))
+            .unwrap();
+        // The XAU call is unexpired and on the chain, but CLOSED_MARKET.
+        let sel = select_capped_chain(
+            d.rows(),
+            b"XAUUSDT",
+            3_950_000_000_000,
+            4,
+            32,
+            1_790_401_849_637,
+        );
+        assert!(sel.is_empty());
+        let sel = select_capped_chain(
+            d.rows(),
+            b"BTCUSDT",
+            85_000_000_000_000,
+            4,
+            32,
+            1_790_401_849_637,
+        );
+        assert_eq!(names(&sel), vec!["BTC-261225-85000-C"]);
+    }
+
+    #[test]
+    fn option_contracts_stamp_only_their_own_page() {
+        // No contracts array: nothing is naked-sellable.
+        let mut d = EapiDiscovery::new();
+        d.ingest_exchange_info(&info(&opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1)))
+            .unwrap();
+        assert!(!d.rows()[0].naked_sell);
+        // Contracts AFTER the rows stamp the same (field order is not
+        // assumed); a second page stamps its rows, not the first's.
+        let rows = opt_row("BTC-2-C", "BTCUSDT", "CALL", "2", EXP1);
+        let page = format!(
+            r#"{{"optionSymbols":[{rows}],"optionContracts":[{{"underlying":"BTCUSDT","nakedSell":true}}]}}"#
+        );
+        d.ingest_exchange_info(page.as_bytes()).unwrap();
+        assert!(!d.rows()[0].naked_sell, "the first page had no contracts");
+        assert!(d.rows()[1].naked_sell);
+        // An entry for an unlisted underlying stamps nothing.
+        let mut d = EapiDiscovery::new();
+        let page = format!(
+            r#"{{"optionContracts":[{{"underlying":"CLUSDT","nakedSell":true}}],"optionSymbols":[{rows}]}}"#
+        );
+        d.ingest_exchange_info(page.as_bytes()).unwrap();
+        assert!(!d.rows()[0].naked_sell);
+    }
+
+    /// BX2 review: an underlying the page names both ways is covered-only
+    /// whatever the order; agreeing repeats stamp as one.
+    #[test]
+    fn a_false_contract_entry_wins_over_a_true_one() {
+        let rows = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1);
+        for (contracts, naked) in [
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":true},{"underlying":"BTCUSDT","nakedSell":false}]"#,
+                false,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":false},{"underlying":"BTCUSDT","nakedSell":true}]"#,
+                false,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":true},{"nakedSell":true,"underlying":"BTCUSDT"}]"#,
+                true,
+            ),
+        ] {
+            let mut d = EapiDiscovery::new();
+            d.ingest_exchange_info(&live_page(contracts, &rows))
+                .unwrap();
+            assert_eq!(d.rows()[0].naked_sell, naked, "{contracts}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_contract_refuses_the_page_and_keeps_no_rows() {
+        let rows = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1);
+        let cases: [(&str, EapiDiscoveryErr); 7] = [
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":"true"}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT","nakedSell":1}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"BTCUSDT"}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"nakedSell":true}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":[{"underlying":"","nakedSell":true}]"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""optionContracts":{"underlying":"BTCUSDT"}"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (r#""optionContracts":[7]"#, EapiDiscoveryErr::BadRow),
+        ];
+        for (contracts, want) in cases {
+            let mut d = EapiDiscovery::new();
+            d.ingest_exchange_info(&info(&rows)).unwrap();
+            assert_eq!(
+                d.ingest_exchange_info(&live_page(contracts, &rows))
+                    .unwrap_err(),
+                want,
+                "{contracts}"
+            );
+            assert_eq!(
+                d.universe_total(),
+                1,
+                "the refused page left no rows: {contracts}"
+            );
+        }
+        // A body cut inside the contracts array (they precede the rows
+        // on the wire, but the rows parse first): a truncation — also
+        // inside a bool, or right after its colon.
+        let mut d = EapiDiscovery::new();
+        for tail in ["tr", "fals", ""] {
+            let page = format!(
+                r#"{{"optionSymbols":[{rows}],"optionContracts":[{{"underlying":"BTCUSDT","nakedSell":{tail}"#
+            );
+            assert_eq!(
+                d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+                EapiDiscoveryErr::Truncated,
+                "{tail}"
+            );
+        }
+        let page = format!(
+            r#"{{"optionSymbols":[{rows}],"optionContracts":[{{"underlying":"BTCUSDT","nakedSell":tru}}]}}"#
+        );
+        assert_eq!(
+            d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+            EapiDiscoveryErr::BadRow
+        );
+        for tail in [
+            r#""underlying":"BTCUSDT""#,
+            r#""underlying""#,
+            r#""underlying":"#,
+        ] {
+            let page = format!(r#"{{"optionSymbols":[{rows}],"optionContracts":[{{{tail}"#);
+            assert_eq!(
+                d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+                EapiDiscoveryErr::Truncated,
+                "{tail}"
+            );
+        }
+        assert_eq!(d.universe_total(), 0);
+    }
+
+    #[test]
+    fn malformed_bx2_row_fields_refuse_the_row() {
+        let base = opt_row("BTC-1-C", "BTCUSDT", "CALL", "1", EXP1);
+        let cases: [(&str, &str, EapiDiscoveryErr); 10] = [
+            (r#""unit":1"#, r#""unit":0"#, EapiDiscoveryErr::BadRow),
+            (r#""unit":1"#, r#""unit":"1""#, EapiDiscoveryErr::BadRow),
+            (
+                r#""unit":1"#,
+                r#""unit":4294967296"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""priceScale":2"#,
+                r#""priceScale":255"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""quantityScale":2"#,
+                r#""quantityScale":-2"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (r#""status":"TRADING","#, "", EapiDiscoveryErr::BadRow),
+            (
+                r#""status":"TRADING""#,
+                r#""status":1"#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""status":"TRADING""#,
+                r#""status":"TRADING","status":"TRADING""#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (
+                r#""tickSize":"0.01""#,
+                r#""tickSize":"0.0000000001""#,
+                EapiDiscoveryErr::BadRow,
+            ),
+            (r#""filters":["#, r#""filters":{"#, EapiDiscoveryErr::BadRow),
+        ];
+        for (from, to, want) in cases {
+            assert_eq!(base.matches(from).count(), 1, "{from}");
+            let bad = base.replacen(from, to, 1);
+            let mut d = EapiDiscovery::new();
+            assert_eq!(
+                d.ingest_exchange_info(&info(&bad)).unwrap_err(),
+                want,
+                "{to}"
+            );
+            assert_eq!(d.universe_total(), 0);
+        }
+        // A body cut inside a row's filters, or right after a key or its
+        // colon, is a truncation.
+        let at = base.find("stepSize").unwrap();
+        let sym = base.find(r#""symbol""#).unwrap();
+        for cut in [
+            &base[..at],
+            &base[..sym + 8],
+            &base[..sym + 9],
+            &base[..at + 9],
+        ] {
+            let mut d = EapiDiscovery::new();
+            let page = format!(r#"{{"optionSymbols":[{cut}"#);
+            assert_eq!(
+                d.ingest_exchange_info(page.as_bytes()).unwrap_err(),
+                EapiDiscoveryErr::Truncated,
+                "{cut}"
+            );
+        }
+        // An unknown status is Other: parsed, not tradable, never selected.
+        let other = base.replacen(r#""status":"TRADING""#, r#""status":"PENDING_LIST""#, 1);
+        let mut d = EapiDiscovery::new();
+        d.ingest_exchange_info(&info(&other)).unwrap();
+        assert_eq!(d.rows()[0].status, BnStatus::Other);
+        assert!(!d.rows()[0].trading);
     }
 
     /// The K6 frame (2026-09-23, fstream `/market/stream`), trimmed to
@@ -1193,6 +1734,62 @@ mod proptests {
         parse_eapi_mark(elem, &mut f).then_some(f)
     }
 
+    /// `m` with `d` (≤ 9) fraction digits: its text and ×1e9 value.
+    fn dec(m: u64, d: u32) -> (String, i64) {
+        let p = 10u64.pow(d);
+        let text = if d == 0 {
+            m.to_string()
+        } else {
+            format!("{}.{:0w$}", m / p, m % p, w = d as usize)
+        };
+        (text, (m * 10u64.pow(9 - d)) as i64)
+    }
+
+    /// Deterministic Fisher-Yates (xorshift64): proptest shrinks the
+    /// seed like any other input.
+    fn shuffle<T>(v: &mut [T], x: &mut u64) {
+        for j in (1..v.len()).rev() {
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            v.swap(j, (*x % (j as u64 + 1)) as usize);
+        }
+    }
+
+    /// `{"k":v,…}` from key/raw-value pairs, in their order.
+    fn object(pairs: &[(String, String)]) -> String {
+        let mut s = String::from("{");
+        for (j, (k, v)) in pairs.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"{k}\":{v}"));
+        }
+        s.push('}');
+        s
+    }
+
+    /// Row underlyings; the last is never listed (a contract entry for
+    /// it stamps nothing).
+    const ULYS: [&str; 5] = ["BTCUSDT", "ETHUSDT", "XAUUSDT", "DOGEUSDT", "CLUSDT"];
+    const STATUSES: [(&str, BnStatus); 5] = [
+        ("TRADING", BnStatus::Trading),
+        ("CLOSED_MARKET", BnStatus::Close),
+        ("HALT", BnStatus::Halt),
+        ("PENDING_LIST", BnStatus::Other),
+        ("DELIVERING", BnStatus::Delivering),
+    ];
+    const CONTRACT_TYPES: [(Option<&str>, u8); 3] = [
+        (None, 0),
+        (Some("CRYPTO_OPTIONS"), 0),
+        (Some("TRADFI_OPTIONS"), BN_ROW_TRADFI),
+    ];
+    const ULY_TYPES: [(Option<&str>, BnUnderlying); 3] = [
+        (None, BnUnderlying::Absent),
+        (Some("CRYPTO"), BnUnderlying::Coin),
+        (Some("COMMODITY"), BnUnderlying::Commodity),
+    ];
+
     proptest! {
         /// §21.3: no eapi scanner panics on arbitrary bytes, and a
         /// cursor walk always terminates within one step per byte.
@@ -1371,6 +1968,170 @@ mod proptests {
             prop_assert_eq!(hits, expect.iter().filter(|e| e.is_some()).count());
         }
 
+        /// BX2 review: an option row — status, contractType,
+        /// underlyingType, unit, scales and filters, each present or not,
+        /// in any key order beside noise keys — parses back to exactly
+        /// what was written; and the page's `optionContracts`, before or
+        /// after the rows, stamp `naked_sell` on exactly the underlyings
+        /// with a `true` entry and no `false` one.
+        #[test]
+        fn option_rows_roundtrip_in_any_key_order(
+            rows in proptest::collection::vec(
+                (
+                    (0usize..4, any::<bool>(), (1u64..100_000_000, 0u32..=4), 1u64..4_000_000_000_000),
+                    (0usize..5, 0usize..3, 0usize..3, proptest::option::of(1u32..=u32::MAX)),
+                    (proptest::option::of(0u8..255), proptest::option::of(0u8..255)),
+                    proptest::option::of((
+                        (1u64..100_000, 0u32..=9),
+                        (1u64..100_000, 0u32..=9),
+                        (1u64..100_000, 0u32..=9),
+                        (1u64..100_000, 0u32..=9),
+                    )),
+                    any::<u64>(),
+                ),
+                1..12,
+            ),
+            contracts in proptest::collection::vec((0usize..5, any::<bool>(), any::<bool>()), 0..8),
+            contracts_first in any::<bool>(),
+            seed in any::<u64>(),
+        ) {
+            let mut objs: Vec<String> = Vec::with_capacity(rows.len());
+            let mut want: Vec<EapiOptionRow> = Vec::with_capacity(rows.len());
+            for (k, row) in rows.iter().enumerate() {
+                let ((u, call, (strike_m, strike_d), exp), (st, ct, ut, unit), (px_scale, qty_scale),
+                    filters, row_seed) = *row;
+                let mut x = row_seed | 1;
+                let symbol = format!("R{k}-{}-{}", ULYS[u], if call { 'C' } else { 'P' });
+                let (strike, strike_1e9) = dec(strike_m, strike_d);
+                let mut pairs: Vec<(String, String)> = vec![
+                    ("symbol".into(), format!("\"{symbol}\"")),
+                    ("underlying".into(), format!("\"{}\"", ULYS[u])),
+                    ("side".into(), (if call { "\"CALL\"" } else { "\"PUT\"" }).into()),
+                    ("strikePrice".into(), format!("\"{strike}\"")),
+                    ("expiryDate".into(), exp.to_string()),
+                    ("status".into(), format!("\"{}\"", STATUSES[st].0)),
+                    // Noise the walk skips: row-level twins of filter
+                    // keys in shapes a filter would refuse, fee and
+                    // margin strings, a nested value.
+                    ("minQty".into(), "\"junk\"".into()),
+                    ("maxQty".into(), "7".into()),
+                    ("liquidationFeeRate".into(), "\"0.001900\"".into()),
+                    ("quoteAsset".into(), "\"USDT\"".into()),
+                    ("extra".into(), r#"{"a":[1,-2.5e3,{"b":null}],"c":true}"#.into()),
+                ];
+                if let Some(t) = CONTRACT_TYPES[ct].0 {
+                    pairs.push(("contractType".into(), format!("\"{t}\"")));
+                }
+                if let Some(t) = ULY_TYPES[ut].0 {
+                    pairs.push(("underlyingType".into(), format!("\"{t}\"")));
+                }
+                if let Some(v) = unit {
+                    pairs.push(("unit".into(), v.to_string()));
+                }
+                if let Some(v) = px_scale {
+                    pairs.push(("priceScale".into(), v.to_string()));
+                }
+                if let Some(v) = qty_scale {
+                    pairs.push(("quantityScale".into(), v.to_string()));
+                }
+                let mut f_want = BnFilters::EMPTY;
+                if let Some((tick, step, min_q, max_q)) = filters {
+                    let (tick_s, tick_v) = dec(tick.0, tick.1);
+                    let (step_s, step_v) = dec(step.0, step.1);
+                    let (min_s, min_v) = dec(min_q.0, min_q.1);
+                    let (max_s, max_v) = dec(max_q.0, max_q.1);
+                    let mut price: Vec<(String, String)> = vec![
+                        ("filterType".into(), "\"PRICE_FILTER\"".into()),
+                        ("minPrice".into(), "\"0.02\"".into()),
+                        ("maxPrice".into(), "\"80000.01\"".into()),
+                        ("tickSize".into(), format!("\"{tick_s}\"")),
+                    ];
+                    let mut lot: Vec<(String, String)> = vec![
+                        ("filterType".into(), "\"LOT_SIZE\"".into()),
+                        ("minQty".into(), format!("\"{min_s}\"")),
+                        ("maxQty".into(), format!("\"{max_s}\"")),
+                        ("stepSize".into(), format!("\"{step_s}\"")),
+                    ];
+                    shuffle(&mut price, &mut x);
+                    shuffle(&mut lot, &mut x);
+                    let (a, b) = (object(&price), object(&lot));
+                    let arr = if x & 1 == 0 { format!("[{a},{b}]") } else { format!("[{b},{a}]") };
+                    pairs.push(("filters".into(), arr));
+                    f_want = BnFilters {
+                        tick_size_1e9: tick_v,
+                        lot_step_1e9: step_v,
+                        min_qty_1e9: min_v,
+                        max_qty_1e9: max_v,
+                        ..BnFilters::EMPTY
+                    };
+                }
+                shuffle(&mut pairs, &mut x);
+                objs.push(object(&pairs));
+
+                let mut w = EapiOptionRow::EMPTY;
+                w.symbol[..symbol.len()].copy_from_slice(symbol.as_bytes());
+                w.symbol_len = symbol.len() as u8;
+                w.underlying[..ULYS[u].len()].copy_from_slice(ULYS[u].as_bytes());
+                w.underlying_len = ULYS[u].len() as u8;
+                w.is_call = call;
+                w.status = STATUSES[st].1;
+                w.trading = STATUSES[st].1 == BnStatus::Trading;
+                w.flags = CONTRACT_TYPES[ct].1;
+                w.underlying_type = ULY_TYPES[ut].1;
+                w.price_scale = px_scale.unwrap_or(u8::MAX);
+                w.qty_scale = qty_scale.unwrap_or(u8::MAX);
+                w.unit = unit.unwrap_or(0);
+                w.strike_1e9 = strike_1e9;
+                w.expiry_ms = exp as i64;
+                w.filters = f_want;
+                let named_true = contracts.iter().any(|&(cu, naked, _)| cu == u && naked);
+                let named_false = contracts.iter().any(|&(cu, naked, _)| cu == u && !naked);
+                w.naked_sell = named_true && !named_false;
+                want.push(w);
+            }
+            let mut x = seed | 1;
+            let mut entries: Vec<String> = Vec::with_capacity(contracts.len());
+            for &(cu, naked, noise) in &contracts {
+                let mut pairs: Vec<(String, String)> = vec![
+                    ("underlying".into(), format!("\"{}\"", ULYS[cu])),
+                    ("nakedSell".into(), naked.to_string()),
+                ];
+                if noise {
+                    pairs.push(("settleAsset".into(), "\"USDT\"".into()));
+                    pairs.push(("id".into(), r#"[1,{"x":false}]"#.into()));
+                }
+                shuffle(&mut pairs, &mut x);
+                entries.push(object(&pairs));
+            }
+            let contracts_json = format!("\"optionContracts\":[{}]", entries.join(","));
+            let rows_json = format!("\"optionSymbols\":[{}]", objs.join(","));
+            let page = if contracts_first {
+                format!("{{\"timezone\":\"UTC\",{contracts_json},{rows_json}}}")
+            } else {
+                format!("{{{rows_json},{contracts_json},\"rateLimits\":[]}}")
+            };
+
+            let mut d = EapiDiscovery::new();
+            prop_assert_eq!(d.ingest_exchange_info(page.as_bytes()), Ok(rows.len() as u32));
+            prop_assert_eq!(d.rows().len(), want.len());
+            for (got, w) in d.rows().iter().zip(want.iter()) {
+                prop_assert_eq!(got.symbol(), w.symbol());
+                prop_assert_eq!(got.underlying(), w.underlying());
+                prop_assert_eq!(got.is_call, w.is_call);
+                prop_assert_eq!(got.status, w.status);
+                prop_assert_eq!(got.trading, w.trading);
+                prop_assert_eq!(got.flags, w.flags);
+                prop_assert_eq!(got.underlying_type, w.underlying_type);
+                prop_assert_eq!(got.price_scale, w.price_scale);
+                prop_assert_eq!(got.qty_scale, w.qty_scale);
+                prop_assert_eq!(got.unit, w.unit);
+                prop_assert_eq!(got.strike_1e9, w.strike_1e9);
+                prop_assert_eq!(got.expiry_ms, w.expiry_ms);
+                prop_assert_eq!(got.filters, w.filters);
+                prop_assert_eq!(got.naked_sell, w.naked_sell);
+            }
+        }
+
         /// M2 selection invariants — the SAME properties pinning the
         /// Deribit/OKX twins (law parity): ≤ E×K×2, candidate filter
         /// (underlying + unexpired), deterministic expiry→strike→C/P
@@ -1382,6 +2143,7 @@ mod proptests {
             e in 1u32..=4,
             k_half in 1u32..=16,
             idx in 1i64..2_000_000,
+            closed in prop_oneof![Just(0u64), any::<u64>()],
         ) {
             let now_ms = 500_000i64;
             let mut rows: Vec<EapiOptionRow> = Vec::new();
@@ -1395,14 +2157,19 @@ mod proptests {
                         symbol[..n].copy_from_slice(&tb[..n]);
                         let mut underlying = [0u8; EAPI_ULY_MAX];
                         underlying[..7].copy_from_slice(b"BTCUSDT");
+                        // BX2: a random subset is closed; it never selects.
+                        let open = closed & (1u64 << (rows.len() % 64)) == 0;
                         rows.push(EapiOptionRow {
                             symbol,
                             symbol_len: n as u8,
                             underlying,
                             underlying_len: 7,
                             is_call: call,
+                            trading: open,
+                            status: if open { BnStatus::Trading } else { BnStatus::Close },
                             strike_1e9: s,
                             expiry_ms: exp,
+                            ..EapiOptionRow::EMPTY
                         });
                     }
                 }
@@ -1413,6 +2180,7 @@ mod proptests {
             for r in &sel {
                 prop_assert!(r.expiry_ms > now_ms);
                 prop_assert_eq!(r.underlying(), b"BTCUSDT");
+                prop_assert!(r.trading, "a closed series selected");
             }
             for w in sel.windows(2) {
                 let (a, b) = (&w[0], &w[1]);

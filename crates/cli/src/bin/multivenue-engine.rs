@@ -78,6 +78,12 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "xmm",
     "ai+xmm",
     "ai+vrp+xsd+bin15+hyparb+xmm",
+    // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/hcv.toml`
+    // (or `--hcv`); in no configured mask until the operator names it.
+    "hcv",
+    "ai+hcv",
+    "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
 ];
 
 /// Top-level CLI.
@@ -160,6 +166,51 @@ enum Cmd {
     /// Reads keys from the environment and never opens `.env` —
     /// `scripts/evm-live.sh` sources it. Report on stdout.
     EvmLive(EvmLiveArgs),
+    /// HC9 (ruling O-HC19): the Hypercall order arm's MAINNET operator
+    /// verbs — `status`, `simulate` (`POST /risk/simulate/orders`, never
+    /// mutates), `recon` (read-only), `dust` (one `book_only` bid of
+    /// `--size` at `--price` on `--symbol`, its cancel by client id and
+    /// a reconcile) and `cancel-all` (every order of ours the venue
+    /// lists). There is no testnet: the two writes need `--confirm`.
+    /// Reads `HYPERCALL_WALLET` / `HYPERCALL_AGENT_KEY` from the
+    /// environment and never opens `.env` — `scripts/hypercall-live.sh`
+    /// sources it. Report on stdout.
+    HypercallLive(HypercallLiveArgs),
+}
+
+/// `hypercall-live` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HcVerb {
+    /// Who signs for which wallet; the private socket; balance, orders.
+    Status,
+    /// The venue's margin check of the dust leg (never mutates).
+    Simulate,
+    /// One reconciliation.
+    Recon,
+    /// The mainnet dust smoke (a WRITE: `--confirm`).
+    Dust,
+    /// Cancel every order of ours (a WRITE: `--confirm`).
+    CancelAll,
+}
+
+#[derive(Debug, Parser)]
+struct HypercallLiveArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: HcVerb,
+    /// The instrument, the venue's own spelling
+    /// (`<UND>-<YYYYMMDD>-<STRIKE>-<C|P>`); `simulate` and `dust` need it.
+    #[arg(long)]
+    symbol: Option<String>,
+    /// `dust` / `simulate`: the bid, USD per contract.
+    #[arg(long, default_value = "0.0005")]
+    price: String,
+    /// `dust` / `simulate`: contracts.
+    #[arg(long, default_value = "0.000001")]
+    size: String,
+    /// Required by every write: this is mainnet.
+    #[arg(long, default_value_t = false)]
+    confirm: bool,
 }
 
 /// `evm-live` verbs.
@@ -962,6 +1013,27 @@ struct RunArgs {
     /// (O-XH1): `backtest --member icdp` keeps its own `--icdp`.
     #[arg(long)]
     xmm: Option<PathBuf>,
+    /// HC11: the slot-7 parameter artifact (`~/multivenue/hcv.toml` by
+    /// default; `hcv.toml.example`). Read only when the requested mask
+    /// carries the hcv bit (`--strategy hcv` / `ai+hcv` / … / `all`); an
+    /// absent or unresolvable artifact refuses the boot with the bit set
+    /// (the icdp/F19 law). Paper only: a live slot 7 refuses (O-HC18).
+    #[arg(long)]
+    hcv: Option<PathBuf>,
+    /// HC11: the calendar slot 7's event law reads — the news lane's
+    /// `scheduled-events.json` (`~/multivenue/worker/news/…` by default;
+    /// name it when the worker runs with `CLAUDE_WORKER_NEWS_DIR`). Read
+    /// only when the requested mask carries the hcv bit.
+    #[arg(long)]
+    hcv_events: Option<PathBuf>,
+    /// HC11b: slot 7's book — the engine's OWN persisted positions (by
+    /// contract), hedges, cash, day mark and open settlement windows.
+    /// Default: `hcv-state.tsv` beside an explicit `--hcv`, else
+    /// `~/multivenue/hcv-state.tsv` (the F22 law: a smoke boot never reads or
+    /// rewrites the standing engine's book). A file the member cannot read
+    /// exactly refuses the boot.
+    #[arg(long)]
+    hcv_state: Option<PathBuf>,
     /// RG2: the regime detector's parameter artifact
     /// (`~/multivenue/regime.toml` by default; `docs/regime-and-dashboard-plan.md`
     /// §4.6). Set boots only. An ABSENT default file boots the detector
@@ -1127,7 +1199,80 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             evm_live(args)
         }
+        Cmd::HypercallLive(args) => {
+            init_tracing_stderr();
+            hypercall_live(args)
+        }
     }
+}
+
+/// HC9: the `hypercall-live` verbs (`exec_hypercall::smoke`). Exit 0
+/// PASS, 1 FAIL, 2 refused (no `--confirm`, or a configuration that
+/// does not build).
+fn hypercall_live(args: HypercallLiveArgs) -> ExitCode {
+    use exec_hypercall::smoke;
+    let cfg = match exec_hypercall::HcExecConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "hypercall-live: wallet {} · signer {} ({}) · host {}",
+        exec_hypercall::config::hex20(cfg.wallet()),
+        exec_hypercall::config::hex20(cfg.signer()),
+        if cfg.owner_signs() {
+            "the owner's own key"
+        } else {
+            "an agent — the owner must have approved it"
+        },
+        cfg.rest_host()
+    );
+    let (Some(px), Some(qty)) = (
+        exec_hypercall::num::scan_1e6_exact(args.price.as_bytes()),
+        exec_hypercall::num::scan_1e6_exact(args.size.as_bytes()),
+    ) else {
+        eprintln!("hypercall-live: --price and --size are plain decimals");
+        return ExitCode::from(2);
+    };
+    let mut table = exec_hypercall::HcInstruments::new();
+    if let Some(sym) = args.symbol.as_deref() {
+        let id = core_types::make_symbol_id(
+            core_types::VenueId::Hypercall,
+            core_config::universe::OPT_ORDINAL_BASE + 1,
+        );
+        if let Err(e) = table.insert(id, sym.as_bytes()) {
+            eprintln!("hypercall-live: --symbol {sym:?} refused: {e:?}");
+            return ExitCode::from(2);
+        }
+    } else if matches!(args.verb, HcVerb::Simulate | HcVerb::Dust) {
+        eprintln!("hypercall-live: this verb needs --symbol");
+        return ExitCode::from(2);
+    }
+    let mut arm = match exec_hypercall::HcExchange::new(
+        &cfg,
+        TlsTransport::default_client_config(),
+        table,
+        exec_hypercall::HC_SLOT,
+        443,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut out = std::io::stdout();
+    let v = match args.verb {
+        HcVerb::Status => smoke::status(&mut arm, &mut out),
+        HcVerb::Simulate => smoke::simulate(&mut arm, px, qty, &mut out),
+        HcVerb::Recon => smoke::recon(&mut arm, &mut out),
+        HcVerb::Dust => smoke::dust(&mut arm, px, qty, args.confirm, &mut out),
+        HcVerb::CancelAll => smoke::cancel_all(&mut arm, args.confirm, &mut out),
+    };
+    println!("hypercall-live: counters {:?}", arm.counters());
+    ExitCode::from(v.code())
 }
 
 /// HYPARB L1: the `evm-live` verbs. Exit 0 only when the verb did what
@@ -1653,7 +1798,7 @@ fn exec_watch(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
         }
     };
     let tls = TlsTransport::default_client_config();
-    let mut ws = match UserWs::new(&cfg.host, 443, tls, &cfg.master_addr) {
+    let mut ws = match UserWs::new(&cfg.host, cfg.port(), tls, &cfg.master_addr) {
         Ok(w) => w,
         Err(e) => {
             error!("{e}");
@@ -2442,18 +2587,10 @@ fn boot_operator_hl_arm(
             hl_cfg.host
         ));
     }
-    // The tightest floor across the live HL slots this arm trades: the
-    // budget is a property of the ADDRESS (slot 0's is its own).
-    let floor = eb
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live())
-        .map(|(_, s)| s.request_budget_floor)
-        .filter(|f| *f > 0)
-        .min()
-        .and_then(|f| u64::try_from(f).ok())
-        .unwrap_or(0);
+    // The address's numbers, from the live slots THIS arm trades
+    // (`ExecBoot::hl_address_numbers`: the highest floor, O-BX27; the
+    // lowest top-up weight and day ceiling, S7-L1).
+    let (floor, topup_weight, topup_day_max) = eb.hl_address_numbers();
     let budget_path = eb
         .path
         .parent()
@@ -2473,32 +2610,7 @@ fn boot_operator_hl_arm(
     // order (2026-09-19).
     arm.seed_budget_from_venue();
     // S7-L1 (gap E): the request-weight top-up is a property of the
-    // ADDRESS, like the floor — the most conservative of the live slots'
-    // numbers (slot 0's address is its own). Each slot's own day ceiling
-    // holds at least its own weight (the parser refuses less), so the two
-    // minima never arm a top-up that cannot fire.
-    let topup_weight = eb
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live() && s.request_topup_weight > 0
-        })
-        .map(|(_, s)| s.request_topup_weight)
-        .min()
-        .and_then(|w| u64::try_from(w).ok())
-        .unwrap_or(0);
-    let topup_day_max = eb
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live() && s.request_topup_day_max > 0
-        })
-        .map(|(_, s)| s.request_topup_day_max)
-        .min()
-        .and_then(|w| u64::try_from(w).ok())
-        .unwrap_or(0);
+    // ADDRESS, like the floor (numbers above).
     arm.set_topup(topup_weight, topup_day_max);
     // S7-L1 (gaps A, C): this arm's seeding waits for the venue's day
     // spend and for a read of the account that finds nothing of ours
@@ -2593,11 +2705,17 @@ fn boot_hyparb_live_arm(
 /// `set_halt_path` before any halt can fire: the writer is a no-op
 /// without it, and a halt that leaves no file is cleared by the 00:10Z
 /// restart and resumes trading into whatever tripped it, unattended.
+///
+/// **BX3** — the route aliases are set here too, before the first order
+/// can exist, so every boot shape routes the Binance anchor the same way
+/// (`cli::exec_boot::route_aliases`).
 fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
     exec_dispatcher: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
     eb: &cli::exec_boot::ExecBoot,
     halt_mask: u8,
+    aliases: clob_dispatcher::RouteAliases,
 ) {
+    exec_dispatcher.set_route_aliases(aliases);
     exec_dispatcher.set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
     // **E6 commit 4 — read back what the last run halted.** Before
     // anything else touches the table: a slot the last run stopped
@@ -2661,6 +2779,29 @@ fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
             );
         }
     }
+}
+
+/// **BX6 — a Binance shape's last boot steps**, after `wire_exec_halts`:
+/// the ledger binds every instrument the arm bound, under the same engine
+/// ids (obligation 7), and the venue split routes by the router's own
+/// alias table (obligation 4: `split_aliases` is what the split holds).
+fn finish_bn_boot<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    split_aliases: clob_dispatcher::RouteAliases,
+    specs: &[exec_router::InstrumentSpec],
+) -> Result<(), String> {
+    if split_aliases != *d.route_aliases() {
+        return Err(String::from(
+            "the venue split's alias table is not the router's (obligation 4) — an order could \
+             be allowed for one venue and reach another arm",
+        ));
+    }
+    for spec in specs {
+        d.bind_instrument(spec)
+            .map_err(|e| format!("the ledger refused Binance instrument {}: {e:?}", spec.sym))?;
+    }
+    info!(instruments = specs.len(), "exec: binance instruments bound in the ledger");
+    Ok(())
 }
 
 fn boot_live_dispatcher(
@@ -2798,6 +2939,8 @@ fn run(args: RunArgs) -> ExitCode {
         bn_spot = boot.allocated.bn_spot.len(),
         bn_usdm = boot.allocated.bn_usdm.len(),
         bn_dated = boot.allocated.bn_dated.len(),
+        bn_coinm = boot.allocated.bn_coinm.len(),
+        bn_coinm_dated = boot.allocated.bn_coinm_dated.len(),
         pairs = boot.allocated.pairs.len(),
         "universe resolved"
     );
@@ -2868,8 +3011,26 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .map(|i| i.name.clone())
         .collect();
-    let bn_discovery_arg: Option<(&[String], &[String], &[String])> = if boot.from_config {
-        Some((&bn_spot_names, &bn_usdm_names, &bn_dated_names))
+    let bn_coinm_names: Vec<String> = boot
+        .allocated
+        .bn_coinm
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_coinm_dated_names: Vec<String> = boot
+        .allocated
+        .bn_coinm_dated
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_discovery_arg = if boot.from_config {
+        Some(cli::boot_discovery::BnLists {
+            spot: &bn_spot_names,
+            usdm: &bn_usdm_names,
+            dated: &bn_dated_names,
+            coinm: &bn_coinm_names,
+            coinm_dated: &bn_coinm_dated_names,
+        })
     } else {
         None
     };
@@ -3214,7 +3375,7 @@ fn run(args: RunArgs) -> ExitCode {
     // spawn calls below). Sorted strict-ascending, deduped; feeds
     // `spawn_ai` → `RulesetSidePath` (§4.2 rule-6 membership checks).
     // M1: spawn-aligned — every PM token + every Binance instrument
-    // (spot + USDS-M) this boot wires.
+    // (spot + USDS-M, BX2: + COIN-M) this boot wires.
     let pm_syms: Vec<core_types::SymbolId> =
         boot.allocated.pm_tokens.iter().map(|t| t.sym).collect();
     let bn_syms: Vec<core_types::SymbolId> = boot
@@ -3223,6 +3384,8 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .chain(boot.allocated.bn_usdm.iter())
         .chain(boot.allocated.bn_dated.iter())
+        .chain(boot.allocated.bn_coinm.iter())
+        .chain(boot.allocated.bn_coinm_dated.iter())
         .map(|i| i.sym)
         .collect();
     // MX6 (ruling Q-MX6): every MEXC instrument this boot allocates
@@ -3234,6 +3397,11 @@ fn run(args: RunArgs) -> ExitCode {
         .chain(boot.allocated.mexc_perp.iter())
         .map(|i| i.sym)
         .collect();
+    // O-HC17: every Hypercall option the boot selected is addressable by
+    // AI rulesets (signal / reference legs — orders on it stay
+    // unroutable); the `hypercall-idx:<U>` index syms stay out (caps 0).
+    let hypercall_option_syms: Vec<core_types::SymbolId> =
+        discovery.hypercall_options.iter().map(|o| o.1).collect();
     let ai_universe = cli::build_ai_universe(
         &pm_syms,
         &bn_syms,
@@ -3241,6 +3409,7 @@ fn run(args: RunArgs) -> ExitCode {
         deribit_boot.as_ref().map(|(t, _)| t),
         hl_boot.as_ref().map(|(t, _f, _e, _i)| t),
         &mexc_syms,
+        &hypercall_option_syms,
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
     // grammar's stage-time resolution — same allocation truth as the
@@ -3339,12 +3508,16 @@ fn run(args: RunArgs) -> ExitCode {
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
     // `on_fill_booked` ordering were reachable only from tests.
-    let (mut hl_fill_prod, fill_lane_cons) = {
+    let (mut hl_fill_prod, mut bn_fill_prod, fill_lane_cons) = {
         let (_f0p, f0) = rings.fill[0].clone().split();
         let (_f1p, f1) = rings.fill[1].clone().split();
         let (_f2p, f2) = rings.fill[2].clone().split();
         let (f3p, f3) = rings.fill[3].clone().split();
-        (Some(f3p), [f0, f1, f2, f3])
+        // BX3/BX6: lane 4 is the Binance gateway's (plan §3.1). Its
+        // producer goes to the gateway when a Binance slot is armed, and
+        // is dropped (the engine reads the lane empty) otherwise.
+        let (f4p, f4) = rings.fill[4].clone().split();
+        (Some(f3p), Some(f4p), [f0, f1, f2, f3, f4])
     };
     // AI command lane (Phase 8f). The producer half feeds the
     // `ingress-ai` thread (spawned below, gated on
@@ -3427,8 +3600,15 @@ fn run(args: RunArgs) -> ExitCode {
                 .unwrap_or(exec_router::ExecMode::Paper)
                 .as_u8();
         }
-        m
+        cli::ExecObs {
+            modes: m,
+            binance: b.binance_slot().is_some(),
+        }
     });
+    // BX6: a live slot names binance — its arm reads the marks (O-BX29).
+    let bn_armed = exec_boot
+        .as_ref()
+        .is_some_and(|b| b.binance_slot().is_some());
     let enable_metrics = args.metrics || args.tui;
     let obs = match Observability::build(enable_metrics, exec_modes) {
         // RG6: the `/state` boot identity (pid, anchor, binary link
@@ -3566,13 +3746,16 @@ fn run(args: RunArgs) -> ExitCode {
     // own ordinal block); every USDS-M instrument (perp + dated) also
     // gets a `@markPrice` slot — the capture-only mark/index/funding
     // lane (dated frames carry no funding; the parser's has_funding
-    // gate handles it).
+    // gate handles it). BX2: COIN-M perps and delivery futures take
+    // the same two slots each on the COIN-M host (dstream).
     let bn_usdm_all = boot.allocated.bn_usdm.len() + boot.allocated.bn_dated.len();
-    let bn_total = boot.allocated.bn_spot.len() + bn_usdm_all;
+    let bn_coinm_all = boot.allocated.bn_coinm.len() + boot.allocated.bn_coinm_dated.len();
+    let bn_fut_all = bn_usdm_all + bn_coinm_all;
+    let bn_total = boot.allocated.bn_spot.len() + bn_fut_all;
     let bn_eapi_on = !discovery.bn_options.is_empty();
-    let bn_handle = if bn_total > 1 || bn_usdm_all > 0 || bn_eapi_on {
+    let bn_handle = if bn_total > 1 || bn_fut_all > 0 || bn_eapi_on {
         let mut specs: Vec<cli::BinanceConnSpec> =
-            Vec::with_capacity(bn_total + bn_usdm_all + usize::from(bn_eapi_on));
+            Vec::with_capacity(bn_total + bn_fut_all + usize::from(bn_eapi_on));
         for inst in &boot.allocated.bn_spot {
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_ws_host.clone(),
@@ -3595,6 +3778,17 @@ fn run(args: RunArgs) -> ExitCode {
             // delivering), markPrice on the routed `/market/ws/` path —
             // one builder shared with the live smoke.
             let [book, mark] = cli::bn_usdm_specs(&cfg.binance_fut_ws_host, &inst.name, inst.sym);
+            specs.push(book);
+            specs.push(mark);
+        }
+        for inst in boot
+            .allocated
+            .bn_coinm
+            .iter()
+            .chain(boot.allocated.bn_coinm_dated.iter())
+        {
+            let [book, mark] =
+                cli::bn_coinm_specs(&cfg.binance_coinm_ws_host, &inst.name, inst.sym);
             specs.push(book);
             specs.push(mark);
         }
@@ -3639,7 +3833,9 @@ fn run(args: RunArgs) -> ExitCode {
             spot = boot.allocated.bn_spot.len(),
             usdm = boot.allocated.bn_usdm.len(),
             dated = boot.allocated.bn_dated.len(),
-            mark_price = bn_usdm_all,
+            coinm = boot.allocated.bn_coinm.len(),
+            coinm_dated = boot.allocated.bn_coinm_dated.len(),
+            mark_price = bn_fut_all,
             eapi_options = discovery.bn_options.len(),
             stale_after_ms = stale_after_ms[core_types::VenueId::Binance as usize],
             "binance: M1 multi-connection lane"
@@ -3657,6 +3853,14 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.bn,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+            // BX6 (O-BX29): the marks ride the lane — flagged for the
+            // dispatcher alone — only when a Binance arm will read them.
+            if bn_armed {
+                core_types::EVENT_LANE_FUNDING
+                    | core_types::event_lane_bit(core_types::ChannelId::Mark)
+            } else {
+                core_types::EVENT_LANE_FUNDING
+            },
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -3840,6 +4044,9 @@ fn run(args: RunArgs) -> ExitCode {
             hl_families,
             statuses.hl_roll.clone(),
             hl_wall_anchor,
+            // HC11: slot 7 reads each underlying's oracle off the MARK.
+            strategy_set::mask_for_name(&args.strategy)
+                .is_some_and(|m| m & strategy_set::BIT_HCV != 0),
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
@@ -4496,6 +4703,45 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // HC11: slot 7's artifact — its hedges resolved against the
+            // SAME descriptor table (D-6 truth), their szDecimals from this
+            // boot's Hyperliquid discovery, its options this boot's
+            // Hypercall chain. Only when the bit is requested.
+            let hcv_boot = if cli::hcv_boot::hcv_wanted(requested) {
+                match cli::hcv_boot::load_hcv_boot(
+                    args.hcv.as_deref(),
+                    args.hcv_events.as_deref(),
+                    args.hcv_state.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &|coin: &str| {
+                        discovery
+                            .hl_sz_decimals
+                            .iter()
+                            .find(|(c, _)| c == coin)
+                            .map(|(_, sz)| *sz)
+                    },
+                    &discovery.hypercall_options,
+                    &boot.hypercall_options.underlyings,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hcv: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            // The same law for slot 7.
+            if cli::hcv_boot::hcv_wanted(requested) && hcv_boot.is_none() {
+                error!(
+                    "hcv: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hcv.toml or --hcv) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG2: the regime detector's artifact + seed, resolved
             // against the same descriptor table (D-6 truth). An absent
             // DEFAULT file is legal (unconfigured); an explicit path
@@ -4825,6 +5071,7 @@ fn run(args: RunArgs) -> ExitCode {
                         xsd_boot.as_ref(),
                         bin15_boot.as_ref(),
                         xmm_boot.as_ref(),
+                        hcv_boot.as_ref(),
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
                         har_boot.as_ref(),
@@ -4843,6 +5090,24 @@ fn run(args: RunArgs) -> ExitCode {
                 // rather than by care.
                 Some(eb) => {
                     cli::exec_boot::log_boot_tell(&eb);
+                    // **BX3 — the route alias** (plan §3.2 item 4): Binance
+                    // spot[0]'s flat legacy id routes to Binance. Built
+                    // before any arm boots, so a refusal opens no socket.
+                    let bn_anchor = boot.allocated.bn_spot.first().map(|i| i.sym);
+                    let aliases = match cli::exec_boot::route_aliases(bn_anchor) {
+                        Ok(a) => a,
+                        Err(reason) => {
+                            error!(%reason, "exec: route alias refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    };
+                    if let Some(sym) = bn_anchor.filter(|_| !aliases.is_empty()) {
+                        info!(
+                            sym,
+                            "exec: route alias — the Binance spot anchor routes to binance"
+                        );
+                    }
                     // **HYPARB L5 — slot 0's own live arm** (O-HL1/O-HL3):
                     // real swaps on HyperEVM mainnet and real hedges from
                     // the slot's own Hyperliquid account, authorised only
@@ -4886,64 +5151,126 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         None
                     };
+                    // **BX6 — the Binance arm** (obligations 4, 7, 9): the one
+                    // live slot naming binance, fed by fill lane 4, its
+                    // instruments bound from the boot discovery's rows, its
+                    // gateway BOOTED (the BX-19 assertions held, the orphans
+                    // swept, the day read) before any member can order.
+                    let bn_arm = if eb.binance_slot().is_some() {
+                        let Some(f4p) = bn_fill_prod.take() else {
+                            error!("exec: fill lane 4 producer already taken — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        };
+                        let alias = bn_anchor
+                            .filter(|_| !aliases.is_empty())
+                            .unwrap_or(core_types::SYMBOL_ID_NONE);
+                        if let Err(reason) =
+                            cli::exec_boot::check_alias_unique(alias, &boot.allocated)
+                        {
+                            error!(%reason, "exec: binance arm refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                        let usdm: Vec<core_config::universe::Instrument> = boot
+                            .allocated
+                            .bn_usdm
+                            .iter()
+                            .chain(boot.allocated.bn_dated.iter())
+                            .cloned()
+                            .collect();
+                        let md_hosts = [
+                            cfg.binance_fut_ws_host.as_str(),
+                            cfg.binance_fut_rest_host.as_str(),
+                        ];
+                        let spec = cli::bn_live::BnSpec {
+                            eb: &eb,
+                            rows: &discovery.bn_fapi_rows,
+                            usdm: &usdm,
+                            alias,
+                            md_hosts: &md_hosts,
+                            run_dir: &run_dir,
+                        };
+                        match cli::bn_live::boot_binance_arm(
+                            &spec,
+                            TlsTransport::default_client_config(),
+                            f4p,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                handles.push(b.handle);
+                                Some((b.arm, b.specs))
+                            }
+                            Err(reason) => {
+                                error!(%reason, "exec: binance arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
-                    // the loop from its own arm; the halt wiring is one
-                    // generic helper. Nothing armed keeps the refusing
-                    // stub, so LAW E-1 stays true by construction.
+                    // the loop from its own arm — enumerated, eight (O-BX30);
+                    // the halt wiring is one generic helper. Nothing armed
+                    // keeps the refusing stub, so LAW E-1 stays true by
+                    // construction. A Binance shape splits by route venue
+                    // (`VenueSplit`), built from the router's own route.
                     let anchor = core_time::WallAnchor::now();
                     let paper = clob_dispatcher::PaperDispatcher::new();
                     let live_line = cli::exec_boot::render_slot_mask(eb.live_mask);
-                    match (hl_arm, hyparb_live) {
-                        (Some(arm), None) => {
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask);
-                            info!(
-                                live = %live_line,
-                                "running strategy-set with LIVE slots — real orders will be \
-                                 submitted"
-                            );
+                    let bn_venue = core_types::VenueId::Binance as u8;
+                    macro_rules! enter_loop {
+                        ($d:expr, $what:expr) => {{
+                            info!(live = %live_line, "{}", $what);
                             engine_loop_set_full(
                                 cons,
-                                d,
+                                $d,
                                 obs,
                                 requested,
                                 vrp_boot.as_ref(),
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
                                 xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
                             )
+                        }};
+                    }
+                    macro_rules! finish_bn {
+                        ($d:expr, $split_aliases:expr, $specs:expr) => {
+                            if let Err(reason) = finish_bn_boot(&mut $d, $split_aliases, &$specs) {
+                                error!(%reason, "exec: binance arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        };
+                    }
+                    const REAL: &str = "running strategy-set with LIVE slots — real orders will be \
+                                        submitted";
+                    match (hl_arm, bn_arm, hyparb_live) {
+                        (Some(arm), None, None) => {
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            enter_loop!(d, REAL)
                         }
-                        (Some(arm), Some(live)) => {
+                        (Some(arm), None, Some(live)) => {
                             let split =
                                 exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask);
-                            info!(
-                                live = %live_line,
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            enter_loop!(
+                                d,
                                 "running strategy-set with LIVE slots on TWO arms (slot 0 on its \
                                  own wallet) — real orders will be submitted"
-                            );
-                            engine_loop_set_full(
-                                cons,
-                                d,
-                                obs,
-                                requested,
-                                vrp_boot.as_ref(),
-                                xsd_boot.as_ref(),
-                                bin15_boot.as_ref(),
-                                xmm_boot.as_ref(),
-                                regime_boot.as_ref(),
-                                hyparb_boot.as_ref(),
-                                har_boot.as_ref(),
                             )
                         }
-                        (None, Some(live)) => {
+                        (None, None, Some(live)) => {
                             let split = exec_router::SlotSplit::new(
                                 cli::hyparb_live::SLOT,
                                 exec_router::NullLiveDispatcher::new(),
@@ -4951,27 +5278,14 @@ fn run(args: RunArgs) -> ExitCode {
                             );
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask);
-                            info!(
-                                live = %live_line,
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            enter_loop!(
+                                d,
                                 "running strategy-set with slot 0 LIVE on its own wallet — real \
                                  orders will be submitted"
-                            );
-                            engine_loop_set_full(
-                                cons,
-                                d,
-                                obs,
-                                requested,
-                                vrp_boot.as_ref(),
-                                xsd_boot.as_ref(),
-                                bin15_boot.as_ref(),
-                                xmm_boot.as_ref(),
-                                regime_boot.as_ref(),
-                                hyparb_boot.as_ref(),
-                                har_boot.as_ref(),
                             )
                         }
-                        (None, None) => {
+                        (None, None, None) => {
                             // Nothing armed: the refusing stub, so a live
                             // slot on a venue with no arm cannot exist here
                             // (already refused by `exec_boot::resolve`).
@@ -4988,23 +5302,76 @@ fn run(args: RunArgs) -> ExitCode {
                                 exec_router::NullLiveDispatcher::new(),
                                 anchor,
                             );
-                            wire_exec_halts(&mut d, &eb, halt_mask);
-                            info!(
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            enter_loop!(
+                                d,
                                 "running strategy-set PAPER (exec artifact present, nothing \
                                  armed) — no orders will be submitted"
+                            )
+                        }
+                        (None, Some((bn, specs)), None) => {
+                            let split = exec_router::VenueSplit::new(
+                                bn_venue,
+                                exec_router::NullLiveDispatcher::new(),
+                                bn,
+                                &eb.route,
                             );
-                            engine_loop_set_full(
-                                cons,
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(d, REAL)
+                        }
+                        (Some(arm), Some((bn, specs)), None) => {
+                            let split =
+                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(
                                 d,
-                                obs,
-                                requested,
-                                vrp_boot.as_ref(),
-                                xsd_boot.as_ref(),
-                                bin15_boot.as_ref(),
-                                xmm_boot.as_ref(),
-                                regime_boot.as_ref(),
-                                hyparb_boot.as_ref(),
-                                har_boot.as_ref(),
+                                "running strategy-set with LIVE slots on TWO venue arms \
+                                 (hyperliquid, binance) — real orders will be submitted"
+                            )
+                        }
+                        (None, Some((bn, specs)), Some(live)) => {
+                            let venues = exec_router::VenueSplit::new(
+                                bn_venue,
+                                exec_router::NullLiveDispatcher::new(),
+                                bn,
+                                &eb.route,
+                            );
+                            let split =
+                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, venues, live);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().a().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with LIVE slots on TWO arms (binance; slot 0 \
+                                 on its own wallet) — real orders will be submitted"
+                            )
+                        }
+                        (Some(arm), Some((bn, specs)), Some(live)) => {
+                            let venues =
+                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
+                            let split =
+                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, venues, live);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().a().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with LIVE slots on THREE arms (hyperliquid, \
+                                 binance; slot 0 on its own wallet) — real orders will be \
+                                 submitted"
                             )
                         }
                     }
@@ -5127,7 +5494,31 @@ mod strategy_name_pin {
                 "ai+xmm",
                 strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_XMM,
             ),
-            ("ai+vrp+xsd+bin15+hyparb+xmm", strategy_set::BUILT_MASK),
+            (
+                "ai+vrp+xsd+bin15+hyparb+xmm",
+                strategy_set::BUILT_MASK & !strategy_set::BIT_HCV,
+            ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// HC11 (O-HC18): the three slot-7 names resolve to bit 7, and the
+    /// widest one composes every slot.
+    #[test]
+    fn the_hcv_names_resolve() {
+        let want = [
+            ("hcv", strategy_set::BIT_HCV),
+            (
+                "ai+hcv",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HCV,
+            ),
+            ("ai+vrp+xsd+bin15+hyparb+xmm+hcv", strategy_set::BUILT_MASK),
         ];
         let mut i = 0;
         while i < want.len() {

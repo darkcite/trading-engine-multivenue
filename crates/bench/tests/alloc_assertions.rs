@@ -475,7 +475,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let event_ring: std::sync::Arc<
         Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
     > = Ring::new();
-    let (mut etx, _erx) = event_ring.split();
+    let (mut etx, mut erx) = event_ring.split();
     let depth_ring: std::sync::Arc<Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>> =
         Ring::new();
     let (_dtx, _drx) = depth_ring.split();
@@ -657,6 +657,51 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     // unselected one never did.
     assert_eq!(rows, 2_000, "a tick per selected row per push");
     assert_eq!(summaries, 2_000, "a summary per selected row per push");
+
+    // ---- BX6 (O-BX29): the mark slot with the Mark bit ARMED (boot NOT
+    // measured) — the armed engine's mask: every mark is captured, then
+    // flagged in place and pushed onto the venue-event lane ----
+    let armed = core_types::EVENT_LANE_FUNDING | core_types::event_lane_bit(core_types::ChannelId::Mark);
+    let mut mdriver = bwl::Driver::new_mark_price(0xBA09u64, sym);
+    bwl::note_transport_ready(&mut mdriver, core_net::Status::Ready);
+    let mut mtransport = TestTransport::with_capacity(128 * 1024);
+    for step in 0..2 {
+        if step == 1 {
+            let _ = mtransport.drain_outgoing(&mut scratch);
+            let n = bn_upgrade_reply(0xBA09u64, &mut resp);
+            mtransport.inject_incoming(&resp[..n]);
+        }
+        bwl::drive_one(&mut mtransport, &mut mdriver, b"h", b"/", &mut prod, &mut etx, armed, &mut otx, &status, &mut capture)
+            .unwrap();
+    }
+    assert_eq!(mdriver.state(), bwl::State::Steady);
+    let mpayload: &[u8] = br#"{"e":"markPriceUpdate","E":1790000000000,"s":"BTCUSDT","p":"65000.10","i":"64998.20","P":"64999.00","r":"0.00010000","T":1790006400000}"#;
+    assert!(mpayload.len() > 125);
+    let mut mark_frame = [0u8; 512];
+    mark_frame[0] = 0x81;
+    mark_frame[1] = 126;
+    mark_frame[2..4].copy_from_slice(&(mpayload.len() as u16).to_be_bytes());
+    mark_frame[4..4 + mpayload.len()].copy_from_slice(mpayload);
+    let mark_len = 4 + mpayload.len();
+    let g3 = AllocGuard::new();
+    let (mut marks, mut fundings) = (0u64, 0u64);
+    for _ in 0..1_000u32 {
+        assert_eq!(mtransport.inject_incoming(&mark_frame[..mark_len]), mark_len);
+        bwl::drive_one(&mut mtransport, &mut mdriver, b"h", b"/", &mut prod, &mut etx, armed, &mut otx, &status, &mut capture)
+            .unwrap();
+        while let Some(ev) = erx.try_pop_ref() {
+            if ev.channel == core_types::ChannelId::Mark as u8 {
+                assert_eq!(ev.flags, core_types::EVENT_FLAG_EXEC_ONLY);
+                marks += 1;
+            } else {
+                fundings += 1;
+            }
+        }
+    }
+    let (allocs, bytes, _deallocs) = g3.delta();
+    assert_eq!(allocs, 0, "the armed Binance mark lane allocated {allocs} times ({bytes} B)");
+    assert_eq!((marks, fundings), (1_000, 1_000), "every mark flagged onto the lane, then its funding");
+
     assert_eq!(status.parse_errors_total(), 0);
     assert!(!capture.is_disabled());
     assert_eq!(capture.io_errors(), 0);
@@ -1364,9 +1409,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // The lane arrays below are written out for the lane geometry
     // (eight tick lanes since HC1 added Hypercall at lane 7, after
     // MX2's MEXC at lane 6 and WS9's Bybit at lane 5; four opt lanes
-    // since HC1; four fill lanes); break the build loudly if that
-    // drifts.
-    const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 4);
+    // since HC1; five fill lanes since BX3 gave Binance lane 4); break
+    // the build loudly if that drifts.
+    const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 5);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1389,7 +1434,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
 
     // Lane arrays: eight tick lanes (Polymarket, Binance, OKX,
     // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2, Hypercall — HC1)
-    // + four fill lanes. Only
+    // + five fill lanes. Only
     // lane 0 (Polymarket) gets a live producer here; the unused
     // producer halves stay alive until end of scope, and their lanes
     // simply read empty every iteration.
@@ -1439,6 +1484,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f4p, f4) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     // Phase 8f: the AI lane rides in every engine; producer-dropped
     // here so it reads empty (two atomic loads per iteration inside
     // the measured window — part of the real tick cost).
@@ -1465,7 +1511,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         [d0, d1],
         [o0, o1, o2, o3],
         sc,
-        [f0, f1, f2, f3],
+        [f0, f1, f2, f3, f4],
         ai_c,
         std::sync::Arc::new(AiIngressStatus::new()),
         tbl_c,
@@ -5465,7 +5511,8 @@ fn regime_on_tick_and_minute_roll_are_zero_alloc() {
 
 /// RG6 gate 43 (`docs/regime-and-dashboard-plan.md` §7): the `/state`
 /// path — a FULL `EngineSnapshot` (256 vm rows, 64 + 64 recents, the
-/// eight xmm perp rows since XMM XH3, every text field at capacity)
+/// eight xmm perp rows since XMM XH3, the twelve `har` rows since HAR
+/// H3.7, every text field at capacity)
 /// published into the seqlock, read back into
 /// the server thread's scratch and encoded as JSON into a 256 KiB
 /// response buffer, 1 000 times — allocates nothing. Truncation is a
@@ -5477,7 +5524,10 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         encode_state_json, EngineSnapshot, SnapshotCell, RECENT_FILLS, RECENT_ORDERS,
         RUN_DIR_MAX, SNAPSHOT_XMM_PERPS,
     };
-    use strategy_core::{VmRowView, XmmPerpView};
+    use strategy_core::{
+        HarCounters, HarSeriesView, VmRowView, XmmPerpView, HAR_VIEW_NAME_MAX, HAR_VIEW_SERIES,
+        HAR_VIEW_TENORS, HAR_VIEW_WEEKDAYS,
+    };
 
     // Boot-time construction (allocation sanctioned): the cell, the
     // engine-side scratch, the server-side scratch, the response buf.
@@ -5506,6 +5556,46 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
             ask_state: u8::MAX,
             stale_flags: u8::MAX,
             _pad: [0; 5],
+        };
+    }
+    // HAR H3.7: the `har` block at its widest — all twelve rows, every
+    // name byte a control byte (six out per byte), every number at its
+    // widest, and a wall clock that makes each `day_age_s` a real age
+    // (eleven digits) rather than the `-1` of a series that never closed.
+    scratch.wall_ns = u64::MAX;
+    scratch.har.hash = [0xFF; 32];
+    scratch.har.n = HAR_VIEW_SERIES as u32;
+    scratch.har.dropped = u32::MAX;
+    scratch.har.counters = HarCounters {
+        minutes_rolled: u64::MAX,
+        closes: u64::MAX,
+        day_closes: u64::MAX,
+        held: u64::MAX,
+        forced: u64::MAX,
+        day_close_ns_max: u64::MAX,
+        day_close_ns_last: u64::MAX,
+        epoch: u64::MAX,
+    };
+    for r in scratch.har.series.iter_mut() {
+        *r = HarSeriesView {
+            last_min_ms: u64::MAX,
+            newest_day_ms: 1_000_000_000_000,
+            gaps: u64::MAX,
+            epoch: u64::MAX,
+            feed: u32::MAX,
+            open_minutes: u32::MAX,
+            raw_1e6: [i32::MIN; HAR_VIEW_TENORS],
+            fit_1e6: [i32::MIN; HAR_VIEW_TENORS],
+            weekday_1e6: [i32::MIN; HAR_VIEW_WEEKDAYS],
+            weekday_n: [u8::MAX; HAR_VIEW_WEEKDAYS],
+            pairs: [u8::MAX; HAR_VIEW_TENORS],
+            name: [0x01; HAR_VIEW_NAME_MAX],
+            name_len: HAR_VIEW_NAME_MAX as u8,
+            warm: u8::MAX,
+            days: u8::MAX,
+            empty_days: u8::MAX,
+            fitted: u16::MAX,
+            fit_beats_raw: u16::MAX,
         };
     }
     scratch.set_strategy_kind(b"set");
@@ -5565,6 +5655,13 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
     let body = core::str::from_utf8(&resp[..n]).expect("utf-8");
     assert_eq!(body.matches("\"touch_bid_1e6\":").count(), SNAPSHOT_XMM_PERPS);
     assert!(body.contains("\"lead_age_ms\":-1"), "the never-heard arm ran");
+    assert_eq!(body.matches("\"weekday_n\":").count(), HAR_VIEW_SERIES, "every har row encoded");
+    assert_eq!(
+        body.matches("\\u0001").count(),
+        HAR_VIEW_SERIES * HAR_VIEW_NAME_MAX,
+        "every har name byte escaped"
+    );
+    assert!(body.contains("\"day_age_s\":17446657673"), "a real age, not -1");
     assert_eq!(
         allocs, 0,
         "/state publish+read+encode allocated {allocs} times ({bytes} B)"
@@ -10323,11 +10420,25 @@ fn long_vol_is_zero_alloc() {
 /// poll's rolls, and at each UTC boundary the STAGGERED day close — one
 /// series per poll, eleven held and released — with every forecast, the
 /// weekday profile and the counters read once an hour.
+///
+/// **HAR H3.7, the second half — the set as the engine holds it.** The
+/// same traffic through a `StrategySet` with the twelve series and the
+/// state writer's outbox installed (twelve boxed mailboxes — boot): its
+/// own 1 s HAR timer, the `/state.har` rows rebuilt at each close, every
+/// series' state copied whole into its mailbox at its close and taken
+/// back (the writer thread's side, here on one thread), and once an hour
+/// `har_series_view` + `har_counters` + `har_gauges` — the report
+/// block's `/state.har` and `engine_har_*` reads.
 #[test]
 fn long_vol_set_is_zero_alloc() {
     use core_time::WallAnchor;
-    use core_types::{make_symbol_id, TICK_FLAG_STALE};
-    use core_vol::{LongForecast, LongSeries, LongVolSet, DAY_NS, LONG_SET_MAX, LONG_TAU_DAYS_MAX};
+    use core_types::{make_symbol_id, Order, TICK_FLAG_STALE};
+    use core_vol::{
+        LongForecast, LongSeries, LongStateSnap, LongVolSet, DAY_NS, LONG_SET_MAX,
+        LONG_TAU_DAYS_MAX,
+    };
+    use strategy_core::{Ctx, HarSeriesView, Strategy, StrategyCounters, SubmitErr, HAR_VIEW_SERIES};
+    use strategy_set::{StrategySet, BIT_AI_EXEC};
     const MIN_NS: u64 = 60_000_000_000;
     const SEC_NS: u64 = 1_000_000_000;
     const NAMES: [&[u8]; LONG_SET_MAX] = [
@@ -10412,9 +10523,2180 @@ fn long_vol_set_is_zero_alloc() {
     assert_eq!(after.held - before.held, 2 * (LONG_SET_MAX as u64 - 1), "the stagger held");
     assert_eq!(allocs, 0, "long-tenor set allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "long-tenor set bytes should be zero: saw {bytes}");
+
+    // ---- H3.7: the second half, through the `StrategySet` ----
+    struct NowCtx(u64);
+    impl Ctx for NowCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.0
+        }
+    }
+    const WALL0_MS: u64 = 1_767_225_600_000;
+    let mut ctx = NowCtx(0);
+    let mut sset = Box::new(StrategySet::new(BIT_AI_EXEC));
+    sset.on_start(&mut ctx).expect("gate 82 on_start");
+    sset.har_mut()
+        .configure(&series, WallAnchor::new(0, WALL0_MS * 1_000_000), 0)
+        .expect("gate 82 set configure");
+    let mut tx = Vec::with_capacity(LONG_SET_MAX);
+    let mut rx = Vec::with_capacity(LONG_SET_MAX);
+    let mut k = 0usize;
+    while k < LONG_SET_MAX {
+        let (t, r) = core_ring::Mailbox::new(Box::new(LongStateSnap::new())).split();
+        tx.push(t);
+        rx.push(r);
+        k += 1;
+    }
+    sset.install_har_outbox(tx);
+    let mut rows = [HarSeriesView::default(); HAR_VIEW_SERIES];
+    let (mut s2, mut px2) = (20_260_927u64, [79_000_000_000i64; LONG_SET_MAX]);
+    let mut run_set = |sset: &mut StrategySet,
+                       rx: &mut [core_ring::MailboxRx<LongStateSnap>],
+                       from_day: u64,
+                       to_day: u64,
+                       acc: &mut i64,
+                       handed: &mut u64| {
+        let mut m = from_day * 1440;
+        while m < to_day * 1440 {
+            let t0 = m * MIN_NS;
+            let mut p = 0u64;
+            while p < 13 {
+                sset.on_timer(t0 + p * SEC_NS, &mut ctx);
+                p += 1;
+            }
+            let mut i = 0usize;
+            while i < LONG_SET_MAX {
+                let v = long_vol_px(&mut s2, &mut px2[i], m / 1440 + i as u64);
+                sset.on_tick(&quote(t0 + 20 * SEC_NS, feeds[i], v, 0), &mut ctx);
+                sset.on_tick(&quote(t0 + 21 * SEC_NS, feeds[i], 1, TICK_FLAG_STALE), &mut ctx);
+                sset.on_tick(&quote(t0 + 22 * SEC_NS, feeds[i], 0, 0), &mut ctx);
+                i += 1;
+            }
+            sset.on_tick(&quote(t0 + 23 * SEC_NS, stranger, 5, 0), &mut ctx);
+            // The writer's side: take every handed state, read it, free it.
+            let mut j = 0usize;
+            while j < rx.len() {
+                if let Some(snap) = rx[j].try_take() {
+                    *acc = acc.wrapping_add(snap.epoch as i64);
+                    *acc = acc.wrapping_add(snap.engine.last_min_ts_ms() as i64);
+                    *handed += 1;
+                }
+                j += 1;
+            }
+            if m % 60 == 0 {
+                let n = StrategyCounters::har_series_view(&*sset, &mut rows);
+                let c = StrategyCounters::har_counters(&*sset);
+                let g = strategy_core::har_gauges(&rows, n, &c, WALL0_MS + m * 60_000);
+                *acc = acc
+                    .wrapping_add(g.warm)
+                    .wrapping_add(g.day_age_max_s)
+                    .wrapping_add(rows[LONG_SET_MAX - 1].fit_1e6[0] as i64);
+            }
+            m += 1;
+        }
+    };
+    let mut handed = 0u64;
+    run_set(&mut sset, &mut rx, 0, 35, &mut acc, &mut handed);
+    assert!(sset.har().engine(0).expect("gate 82 set").is_warm(), "WARM engines, again");
+    assert_eq!(handed, 34 * LONG_SET_MAX as u64, "every close of the warm-up handed");
+    let before = sset.har().counters();
+
+    let g = AllocGuard::new();
+    let mut handed = 0u64;
+    run_set(&mut sset, &mut rx, 35, 37, &mut acc, &mut handed);
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let after = sset.har().counters();
+    assert_eq!(after.day_closes - before.day_closes, 2 * LONG_SET_MAX as u64, "two staggered boundaries");
+    assert_eq!(handed, 2 * LONG_SET_MAX as u64, "every close handed through its mailbox");
+    let n = StrategyCounters::har_series_view(&*sset, &mut rows);
+    let gauges = strategy_core::har_gauges(&rows, n, &StrategyCounters::har_counters(&*sset), WALL0_MS);
+    assert_eq!((gauges.configured, gauges.warm), (LONG_SET_MAX as i64, LONG_SET_MAX as i64));
+    assert_eq!(allocs, 0, "the set's HAR path allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "the set's HAR path bytes should be zero: saw {bytes}");
 }
 
-/// **XMM XH4a gate 83 — the order-gateway kit is 0 B/op.** Built once
+/// **HC8 gate 83 — a Hypercall signature is 0 B/op.** The exec arm's
+/// per-order work: each struct hash over the request body's OWN spans
+/// (D7 — the view borrows the rendered body), the digest under the
+/// boot-cached domain separator, and the secp256k1 signature — for the
+/// live `PlaceOrder`, a `ReplaceOrder`, a `CancelOrderByClientId` and an
+/// `AcceptRFQQuote` (a sign-extended `int256`). The body, the key and the
+/// separator are boot; the first signature builds the process-wide
+/// secp256k1 context outside the guard, as the arm does at boot.
+#[test]
+fn hypercall_sign_with_key_is_zero_alloc() {
+    use signer_eip712::hypercall as hc;
+    // The value of `"key":"<value>"` in `body` (boot-time lookup).
+    fn span<'a>(body: &'a [u8], key: &[u8]) -> &'a [u8] {
+        let mut i = 0usize;
+        while i + key.len() + 4 <= body.len() {
+            if body[i] == b'"'
+                && &body[i + 1..i + 1 + key.len()] == key
+                && &body[i + 1 + key.len()..i + 4 + key.len()] == b"\":\""
+            {
+                let from = i + 4 + key.len();
+                let mut to = from;
+                while body[to] != b'"' {
+                    to += 1;
+                }
+                return &body[from..to];
+            }
+            i += 1;
+        }
+        panic!("gate 83: no {key:?} in the body");
+    }
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 83 key");
+    let ds = hc::hc_domain_separator(hc::HC_CHAIN_ID_MAINNET);
+    let wallet = [0x5a; 20];
+    let body: Vec<u8> = br#"{"symbol":"BOT-20260925-2.5-C","side":"Buy","size":"12.345678","price":"0.0005","tif":"ioc","route":"best_execution","client_id":"0x4843000300000000000000000000002a","order_id":"123456789"}"#.to_vec();
+    let (symbol, side, size, price) =
+        (span(&body, b"symbol"), span(&body, b"side"), span(&body, b"size"), span(&body, b"price"));
+    let (tif, route, cloid, order_id) =
+        (span(&body, b"tif"), span(&body, b"route"), span(&body, b"client_id"), span(&body, b"order_id"));
+    let (rfq, quote) = ([0x11u8; 32], [0x22u8; 32]);
+    let warm = hc::revoke_all_agents_struct_hash(0);
+    hc::sign_hc_with_key(&sk, &ds, &warm).expect("gate 83 warm-up");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 1_000 {
+        let place = hc::HcPlaceView {
+            wallet: &wallet,
+            symbol,
+            side,
+            size,
+            price,
+            tif,
+            route,
+            client_id: cloid,
+            nonce: 1_790_400_000_000_000 + n,
+        };
+        let s1 = hc::sign_place_order_with_key(&sk, &ds, &place).expect("gate 83 place");
+        let replace = hc::HcReplaceView {
+            wallet: &wallet,
+            order_id,
+            symbol,
+            side,
+            size,
+            price,
+            tif,
+            client_id: cloid,
+            nonce: n,
+        };
+        let s2 = hc::sign_hc_with_key(&sk, &ds, &hc::replace_order_struct_hash(&replace))
+            .expect("gate 83 replace");
+        let s3 = hc::sign_hc_with_key(&sk, &ds, &hc::cancel_order_by_client_id_struct_hash(&wallet, cloid, n))
+            .expect("gate 83 cancel");
+        let s4 = hc::sign_hc_with_key(
+            &sk,
+            &ds,
+            &hc::accept_rfq_quote_struct_hash(&rfq, &quote, -(n as i128) - 1, &wallet, n),
+        )
+        .expect("gate 83 rfq");
+        acc = acc
+            .wrapping_add(u64::from(s1[0]))
+            .wrapping_add(u64::from(s2[1]))
+            .wrapping_add(u64::from(s3[2]))
+            .wrapping_add(u64::from(s4[64]));
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "Hypercall signing allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "Hypercall signing bytes should be zero: saw {bytes}");
+}
+
+/// **HC9 gate 84 — the Hypercall arm's per-order work is 0 B/op.** What
+/// one place, one replace and one cancel cost on the engine thread
+/// before and after the round trip: each body rendered IN PLACE into
+/// the (boot-allocated) body window and signed over its own spans (D7),
+/// the fail-closed answer scans, the rate governor, and the private
+/// socket's reader over a `Fill` and an `OrderUpdate` with the fill-id
+/// dedupe — plus one reconcile page of each kind. The TLS round trip
+/// itself is gate 77b's (`HttpsReq`, exactly rustls' 2 per request).
+#[test]
+fn hypercall_arm_render_sign_and_scan_is_zero_alloc() {
+    use exec_hypercall::{budget, cloid, events, recon, render, response};
+    use signer_eip712::hypercall as hc;
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 84 key");
+    let ds = hc::hc_domain_separator(hc::HC_CHAIN_ID_MAINNET);
+    let wallet = [0x5a; 20];
+    let mut body = vec![0u8; 2048];
+    let mut gov = budget::HcBudget::new();
+    let mut ids = events::FillIds::new();
+    const ACK: &[u8] = br#"{"timestamp":1,"info":{"symbol":"BTC-20261002-100000-C","price":"12.5","size":"0.2","side":"Buy","tif":"ioc","is_perp":false,"order_id":42},"status":"PARTIALLY_FILLED","filled_size":"0.1","wallet_address":"0x5a","order_id":42,"reason":null}"#;
+    const CXL: &[u8] = br#"{"success":true,"data":{"status":"CANCELED","filled_size":"0.1","order_id":42},"error":null}"#;
+    const FILL: &[u8] = br#"{"type":"Fill","order_id":42,"fill_id":7,"symbol":"BTC-20261002-100000-C","side":"buy","price":"12.5","size":"0.1","timestamp":1767225600000,"wallet_address":"0x5a","fee":"0.01","trade_id":9,"is_taker":true}"#;
+    const UPD: &[u8] = br#"{"type":"OrderUpdate","order_id":42,"status":"CANCELED","filled_size":"0.1","timestamp":2,"reason":null}"#;
+    const ORDERS: &[u8] = br#"{"success":true,"data":[{"order_id":1,"symbol":"BTC-20261002-100000-C","side":"buy","size":"0.2","filled_size":"0","client_id":"48430107000000000000002a00000000","status":"open"}],"pagination":{"limit":100,"offset":0,"count":1}}"#;
+    const PORT: &[u8] = br#"{"success":true,"data":{"positions":[{"symbol":"BTC-20261002-100000-C","amount":"-0.1","entry_price":"12.5"}],"available_balance":"4.5"},"error":null}"#;
+    // Warm: the process-wide secp256k1 context, as the arm at boot.
+    hc::sign_hc_with_key(&sk, &ds, &hc::revoke_all_agents_struct_hash(0)).expect("gate 84 warm-up");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 500 {
+        let cid = cloid::encode(7, n);
+        let p = render::Place {
+            wallet: &wallet,
+            symbol: b"BTC-20261002-100000-C",
+            buy: n % 2 == 0,
+            px_1e6: 12_500_000 + n as i64,
+            qty_1e6: 200_000,
+            tif: render::Tif::Ioc,
+            route: render::Route::BestExecution,
+            client_id: &cid,
+            nonce: 1_790_400_000_000_000 + n,
+        };
+        let k1 = render::place(&mut body, &p, &sk, &ds).expect("gate 84 place");
+        let r = render::Replace {
+            wallet: &wallet,
+            order_id: 42 + n,
+            symbol: b"BTC-20261002-100000-C",
+            buy: true,
+            px_1e6: 12_000_000,
+            qty_1e6: 100_000,
+            tif: render::Tif::Gtc,
+            client_id: &cid,
+            nonce: 2 * n + 1,
+        };
+        let k2 = render::replace(&mut body, &r, &sk, &ds).expect("gate 84 replace");
+        let k3 = render::cancel_cloid(&mut body, &wallet, &cid, 3 * n + 2, &sk, &ds).expect("gate 84 cancel");
+        let a = response::scan_place(200, ACK).expect("gate 84 ack");
+        let c = response::scan_cancel(200, CXL).expect("gate 84 cancel ack");
+        assert!(gov.place(1_000 + n * 2_000).is_ok(), "gate 84 governor place");
+        assert!(gov.cancel(1_000 + n * 2_000).is_ok(), "gate 84 governor cancel");
+        if let events::Msg::Fill(f) = events::parse(FILL) {
+            acc = acc.wrapping_add(u64::from(ids.first_time(f.fill_id + n))).wrapping_add(f.qty_1e6 as u64);
+        }
+        if let events::Msg::Update(u) = events::parse(UPD) {
+            acc = acc.wrapping_add(u.filled_1e6 as u64);
+        }
+        let mut open = 0u64;
+        assert_eq!(recon::scan_orders(200, ORDERS, |o| open += o.size_1e6 as u64), Ok(1));
+        assert!(recon::scan_portfolio(200, PORT, |_, amt, _| open = open.wrapping_add(amt as u64)).is_ok());
+        acc = acc
+            .wrapping_add((k1 + k2 + k3) as u64)
+            .wrapping_add(a.order_id + c.order_id)
+            .wrapping_add(u64::from(body[k3 - 3]))
+            .wrapping_add(open);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "the Hypercall arm's per-order work allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "the Hypercall arm's per-order work bytes should be zero: saw {bytes}");
+}
+
+/// **HC11 gate 85 — the slot-7 member and the paper held-quote law are
+/// 0 B/op.** Two underlyings, a near-ATM chain, σ̂ pushed, a calendar by
+/// mailbox; the member's orders go into a `PaperMatcher` (Hypercall IoCs
+/// under the held-quote law, the hedges under the strict-cross IoC law)
+/// and its fills and order events come back — 2 400 one-second engine
+/// steps: the quote swings rich and cheap (sales, buy-backs, the caps),
+/// the hedge follows outside its band, a position injected at boot runs
+/// through the final window's TWAP to its median-of-means settlement, the
+/// calendar is replaced and the HAR view re-pushed mid-run — and (HC11b)
+/// every change to the book is handed to the writer's mailbox, grid and
+/// all, and taken back as the writer thread would. Everything is boxed at
+/// `configure` and at the outbox's install (the only allocations).
+#[test]
+fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
+    use clob_dispatcher::PaperMatcher;
+    use core_types::{make_symbol_id, ChannelEvent, ChannelId, Order, OrderEvent, Side};
+    use strategy_core::{Ctx, HarSeriesView, Strategy, SubmitErr, HAR_VIEW_TENORS};
+    use strategy_hcv::{HcvEvents, HcvOpt, HcvParams, HcvStrategy, HcvUnd};
+
+    struct PaperCtx<'a> {
+        m: &'a mut PaperMatcher,
+        now: u64,
+    }
+    impl Ctx for PaperCtx<'_> {
+        fn submit(&mut self, mut order: Order) -> Result<(), SubmitErr> {
+            order.strategy_id = 7;
+            self.m.submit(&order, self.now);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const T0_MS: u64 = 1_790_424_000_000;
+    const MONO0: u64 = 1_000_000_000_000;
+    const DAY: u64 = 86_400_000;
+    const STEPS: u64 = 2_400;
+    let ns = |ms: u64| MONO0 + ms * 1_000_000;
+    let sp = make_symbol_id(VenueId::Hyperliquid, 40);
+    let btc = make_symbol_id(VenueId::Hyperliquid, 1);
+    let opt = |k: u32| make_symbol_id(VenueId::Hypercall, 513 + k);
+    let s_sp: i64 = 6_600_000_000;
+    let s_btc: i64 = 110_000_000_000;
+    let mut options = Vec::new();
+    let mut k = 0u32;
+    while k < 6 {
+        let strike = s_sp - 100_000_000 + i64::from(k / 2) * 100_000_000;
+        options.push(HcvOpt { sym: opt(k), und: 0, call: k % 2 == 0, strike_1e6: strike, exp_ms: T0_MS + 7 * DAY });
+        k += 1;
+    }
+    options.push(HcvOpt { sym: opt(6), und: 1, call: true, strike_1e6: s_btc, exp_ms: T0_MS + 7 * DAY });
+    // Injected at boot: expires 15 minutes in — the final window and the
+    // settlement run inside the measured loop.
+    options.push(HcvOpt { sym: opt(7), und: 0, call: true, strike_1e6: s_sp, exp_ms: T0_MS + 15 * 60_000 });
+    let p = HcvParams {
+        und: vec![HcvUnd::new(b"SP500", sp, 2), HcvUnd::new(b"BTC", btc, 5)],
+        options,
+        theta_vol_1e6: 50_000,
+        atm_band_bps: 500,
+        tenor_min_d: 1,
+        tenor_max_d: 40,
+        clip_usd_1e6: 5_000_000,
+        vega_cap_usd_1e6: 20_000_000,
+        premium_cap_usd_1e6: 50_000_000,
+        day_loss_usd_1e6: 1_000_000_000,
+        tail_loss_usd_1e6: 1_000_000_000,
+        opt_size_step_1e6: 1_000,
+        hedge_band_1e6: 100_000,
+        hedge_min_usd_1e6: 10_000_000,
+        hedge_slip_bps: 10,
+        quote_stale_ms: 10_000,
+        oracle_stale_ms: 10_000,
+        unwind_min: 30,
+        settle_delay_ms: 60_000,
+        settle_order: strategy_hcv::BucketOrder::Sorted,
+        event_law: true,
+        events_stale_ms: 7_200_000,
+        kill: false,
+        timer_ms: 1_000,
+        anchor: core_time::WallAnchor::new(MONO0, T0_MS * 1_000_000),
+    };
+    // Boot (allocation allowed).
+    let mut s = HcvStrategy::new();
+    s.configure(&p).expect("gate 85 configure");
+    let mut rows = [HarSeriesView::default(); 2];
+    rows[0].name[..5].copy_from_slice(b"SP500");
+    rows[0].name_len = 5;
+    rows[1].name[..3].copy_from_slice(b"BTC");
+    rows[1].name_len = 3;
+    rows[0].warm = 1;
+    rows[1].warm = 1;
+    rows[0].raw_1e6 = [150_000; HAR_VIEW_TENORS];
+    rows[1].raw_1e6 = [450_000; HAR_VIEW_TENORS];
+    s.set_har_view(&rows);
+    let (mut tx, rx) = core_ring::Mailbox::new(Box::new(HcvEvents::new())).split();
+    s.install_events(rx);
+    let (book_tx, mut book_rx) = core_ring::Mailbox::new(strategy_hcv::HcvStateSnap::new_boxed()).split();
+    s.install_state_outbox(book_tx);
+    let mut books = 0u64;
+    let calendar = |gen_ms: u64| {
+        let mut c = HcvEvents::new();
+        c.generated_ms = gen_ms;
+        c.from_ms = gen_ms - 30 * DAY;
+        c.until_ms = gen_ms + 60 * DAY;
+        c.push(gen_ms + 20 * DAY, 0b01);
+        c
+    };
+    {
+        let mut f = tx.try_fill().expect("gate 85 mailbox");
+        *f = calendar(T0_MS - 60_000);
+        f.commit();
+    }
+    let mut m = Box::new(PaperMatcher::new());
+    {
+        let mut c = PaperCtx { m: &mut m, now: ns(0) };
+        s.on_fill(&core_types::Fill::new(ns(0), opt(7), Side::Bid, Price::from_raw(30_000_000), Qty::from_raw(1_000_000), 999), &mut c);
+    }
+    // Premiums at ~22 % (rich) and ~9 % (cheap) of a 7-day ATM SP500
+    // option; the BTC call at ~70 % / ~30 %.
+    let px_sp = |rich: bool| if rich { (80_000_000i64, 84_000_000i64) } else { (30_000_000i64, 33_000_000i64) };
+    let px_btc = |rich: bool| if rich { (4_250_000_000i64, 4_400_000_000i64) } else { (1_700_000_000i64, 1_850_000_000i64) };
+
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < STEPS {
+        let now = ns(i * 1_000);
+        let rich = (i / 40) % 2 == 0;
+        let drift = ((i * 7_919) % 2_001) as i64 * 100_000 - 100_000_000;
+        let (spx, bpx) = (s_sp + drift, s_btc + drift * 16);
+        let hl_sp = Tick::new_stamped(now, VenueId::Hyperliquid, sp, 0, Price::from_raw(spx - 500_000), Qty::from_raw(100_000_000), Price::from_raw(spx + 500_000), Qty::from_raw(100_000_000), 0, 0);
+        let hl_btc = Tick::new_stamped(now, VenueId::Hyperliquid, btc, 0, Price::from_raw(bpx - 1_000_000), Qty::from_raw(10_000_000), Price::from_raw(bpx + 1_000_000), Qty::from_raw(10_000_000), 0, 0);
+        m.observe_tick(&hl_sp, now);
+        m.observe_tick(&hl_btc, now);
+        {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_venue_event(&ChannelEvent::new(now, VenueId::Hyperliquid, ChannelId::Mark, sp, 0, 0, spx, spx), &mut c);
+            s.on_venue_event(&ChannelEvent::new(now, VenueId::Hyperliquid, ChannelId::Mark, btc, 0, 0, bpx, bpx), &mut c);
+            s.on_tick(&hl_sp, &mut c);
+            s.on_tick(&hl_btc, &mut c);
+        }
+        let mut k = 0u32;
+        while k < 7 {
+            let (b, a) = if k == 6 { px_btc(rich) } else { px_sp(rich) };
+            let q = Tick::new_stamped(now, VenueId::Hypercall, opt(k), 0, Price::from_raw(b), Qty::from_raw(1_000_000), Price::from_raw(a), Qty::from_raw(1_000_000), 0, 0);
+            m.observe_tick(&q, now);
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_tick(&q, &mut c);
+            k += 1;
+        }
+        {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_timer(now, &mut c);
+        }
+        while let Some(f) = m.try_next_fill() {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_fill(&f, &mut c);
+        }
+        let mut ev = OrderEvent::ZERO;
+        while m.try_next_order_event(&mut ev) {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_order_event(&ev, &mut c);
+        }
+        // The writer's end: take the handed book, hand the slot back.
+        if let Some(b) = book_rx.try_take() {
+            books += u64::from(b.epoch != 0 && b.n_pos as usize <= strategy_hcv::state::HCV_SNAP_POSITIONS);
+        }
+        if i % 600 == 300 {
+            if let Some(mut f) = tx.try_fill() {
+                *f = calendar(T0_MS + i * 1_000);
+                f.commit();
+            }
+            s.set_har_view(&rows);
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let k = s.counters();
+    assert!(k.sells > 0 && k.buys > 0, "both sides traded: {k:?}");
+    assert!(k.option_fills > 0 && k.hedges > 0 && k.hedge_fills > 0, "fills and hedges: {k:?}");
+    assert!(k.unwind_slices > 0 && k.settlements >= 1, "the final window and the settlement ran: {k:?}");
+    assert!(k.calendars >= 3 && k.skip_caps > 0, "calendars replaced, caps met: {k:?}");
+    assert!(books > 30, "the book was handed at its fills, bookings and window minutes: {books}");
+    assert_eq!(allocs, 0, "slot 7 over the held-quote law allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0);
+}
+
+/// **BX4 gate 86 — the Ed25519 sign + base64 render (`signer-ed25519`).**
+///
+/// Binance's WS API logon and every REST order request (options,
+/// Portfolio Margin, Binance Stocks) carry one Ed25519 signature, written
+/// as base64 (WS API) or percent-encoded base64 (REST) straight into the
+/// request's wire buffer. `ring` signs into its own return value on the
+/// stack; the render writes into the caller's buffer. The whole path must
+/// be 0 B/op. Boot is pinned too, the way gate 72 pins `HttpsPost`: a
+/// signer costs exactly one allocation (its page), and the self-test one
+/// per known answer — so a `ring` bump that starts allocating in
+/// `from_seed_unchecked`, or a keypair moved into a `Box`, fails here.
+#[test]
+fn ed25519_sign_and_render_are_zero_alloc() {
+    use signer_ed25519::{Ed25519Signer, RFC8032, SIG_B64_LEN, SIG_B64_PCT_MAX};
+    let g = AllocGuard::new();
+    let signer = Ed25519Signer::from_seed(&[0x42; 32]).expect("gate 86 key");
+    let (boot_allocs, boot_bytes, _) = g.delta();
+    assert_eq!(boot_allocs, 1, "from_seed: exactly one page ({boot_bytes} B)");
+    let g = AllocGuard::new();
+    signer_ed25519::self_test().expect("gate 86 self-test");
+    let (st_allocs, _, _) = g.delta();
+    assert_eq!(st_allocs as usize, RFC8032.len(), "self_test: one page per known answer");
+    // A REST order query's worth of payload.
+    let mut payload = [0x61u8; 200];
+    let mut b64 = [0u8; SIG_B64_LEN];
+    let mut pct = [0u8; SIG_B64_PCT_MAX];
+    signer.sign_b64(&payload, &mut b64); // warm-up
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 2_000 {
+        payload[..8].copy_from_slice(&n.to_le_bytes());
+        acc = acc.wrapping_add(signer.sign_b64(&payload, &mut b64) as u64);
+        acc = acc.wrapping_add(signer.sign_b64_pct(&payload, &mut pct) as u64);
+        acc = acc.wrapping_add(u64::from(b64[0]) + u64::from(pct[0]));
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "signer-ed25519 sign/render allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "signer-ed25519 hot bytes should be zero: saw {bytes}");
+}
+
+/// **BX5 gate 87 — the exec gateway's transports, their socket-free
+/// half: request staging, the answer judge, the WebSocket framer and the
+/// request ids.**
+///
+/// An exec gateway (BX6) stages every REST request in place
+/// (`ReqWire::stage`: body form — the length digits, the head moved on a
+/// digit-count change; query form — the header tail after the query),
+/// judges each answer where it was read (`parse_answer`, a chunked body
+/// decoded in place), and runs its WebSocket API sessions through
+/// `WsFramer` (data frames handed out in place, pings echoed into the
+/// send window, requests masked straight into it) with `ReqIds`
+/// matching answers to requests. All of it must be 0 B/op; the windows
+/// and tables are allocated at boot, outside the guard. The socket half
+/// is gate 87b.
+#[test]
+fn bx5_staging_answer_judge_ws_framing_and_ids_are_zero_alloc() {
+    use core_net::https_conn::parse_answer;
+    use core_net::{
+        Method, Params, ReqIds, ReqKind, ReqSpec, ReqWire, WsFramer, WsNext,
+    };
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    enum Kind {
+        Place = 0,
+        Free = 255,
+    }
+    impl ReqKind for Kind {
+        const FREE: Self = Self::Free;
+    }
+
+    const H: &[(&str, &str)] = &[("X-MBX-APIKEY", "gate87key")];
+    let specs = [
+        ReqSpec {
+            method: Method::Post,
+            path: "/eapi/v1/order",
+            params: Params::Body("application/x-www-form-urlencoded"),
+            headers: H,
+        },
+        ReqSpec {
+            method: Method::Get,
+            path: "/eapi/v1/openOrders",
+            params: Params::Query,
+            headers: H,
+        },
+    ];
+    let mut wire = ReqWire::new("eapi.binance.com", &specs, 2048).expect("gate 87 wire");
+    let mut framer = WsFramer::new(64 * 1024, 64 * 1024, 7);
+    let mut ids: ReqIds<Kind, 64> = ReqIds::new();
+    let resp: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{\"orderId\":1,\"status\":\"NEW\"}";
+    let chunked: &[u8] =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n3\r\n12}\r\n0\r\n\r\n";
+    // What a WS API socket delivers per request: the answer, a server
+    // ping, a pong, and a user-data event (server frames are unmasked).
+    let mut inbound = [0u8; 256];
+    let mut len = 0usize;
+    let parts: [(u8, &[u8]); 4] = [
+        (0x81, br#"{"id":"1","status":200,"result":{"orderId":1}}"#),
+        (0x89, b"ping"),
+        (0x8A, b"pong"),
+        (0x81, br#"{"subscriptionId":0,"event":{"e":"executionReport"}}"#),
+    ];
+    let mut k = 0;
+    while k < parts.len() {
+        inbound[len] = parts[k].0;
+        inbound[len + 1] = parts[k].1.len() as u8;
+        inbound[len + 2..len + 2 + parts[k].1.len()].copy_from_slice(parts[k].1);
+        len += 2 + parts[k].1.len();
+        k += 1;
+    }
+    let inbound = &inbound[..len];
+    let mut rbuf = [0u8; 512];
+    // Held unanswered through the whole run: every 64th id lands on its
+    // slot and is skipped — the busy path.
+    let hold = ids.issue(Kind::Place, u64::MAX).expect("gate 87 hold");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0usize;
+    while n < 2_000 {
+        // REST: bodies of 1–4 digits (the head moves), queries of any
+        // length (the tail follows), each staged in place.
+        let blen = [9usize, 99, 180, 1500][n % 4];
+        wire.window_mut(0)[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        let s = wire.stage(0, blen).expect("gate 87 body");
+        acc = acc.wrapping_add(wire.bytes(s).len() as u64);
+        let s = wire.stage(1, n % 64).expect("gate 87 query");
+        acc = acc.wrapping_add(wire.bytes(s).len() as u64);
+        // The answers, judged where they lie.
+        rbuf[..resp.len()].copy_from_slice(resp);
+        let a = parse_answer(&mut rbuf[..resp.len()], false)
+            .expect("gate 87 answer")
+            .expect("whole");
+        acc = acc.wrapping_add(u64::from(a.status) + (a.body.end - a.body.start) as u64);
+        rbuf[..chunked.len()].copy_from_slice(chunked);
+        let a = parse_answer(&mut rbuf[..chunked.len()], false)
+            .expect("gate 87 chunked")
+            .expect("whole");
+        acc = acc.wrapping_add((a.body.end - a.body.start) as u64);
+        // …and the refusals: a short answer waits, a short answer after a
+        // close is a lost connection.
+        rbuf[..resp.len()].copy_from_slice(resp);
+        assert_eq!(parse_answer(&mut rbuf[..resp.len() - 3], false), Ok(None));
+        assert_eq!(
+            parse_answer(&mut rbuf[..resp.len() - 3], true),
+            Err(core_net::PostErrKind::Disconnected)
+        );
+        // WS API: a request out, its answer and the traffic around it in.
+        let id = ids.issue(Kind::Place, n as u64).expect("gate 87 id");
+        let lost = ids.issue(Kind::Place, n as u64).expect("gate 87 id");
+        framer
+            .queue_text(&[b"{\"id\":\"1\",\"method\":\"order.place\",\"params\":{", b"}}"])
+            .expect("gate 87 queue");
+        let free = framer.rx_free_mut();
+        free[..inbound.len()].copy_from_slice(inbound);
+        framer.rx_advance(inbound.len());
+        loop {
+            match framer.next_frame() {
+                WsNext::Text(s) | WsNext::Binary(s) => {
+                    acc = acc.wrapping_add(framer.payload(s).len() as u64);
+                }
+                WsNext::Idle => break,
+                WsNext::Failed(e) => panic!("gate 87 framer: {e}"),
+            }
+        }
+        acc = acc.wrapping_add(ids.answer(id).map_or(0, |r| r.id));
+        // The unanswered one expires (the held one is younger than 1 ns).
+        let r = ids.take_expired(n as u64 + 1, 1).expect("gate 87 expiry");
+        assert_eq!(r.id, lost);
+        let out = framer.tx_pending().len();
+        acc = acc.wrapping_add(out as u64);
+        framer.tx_consume(out);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(ids.answer(hold).map(|r| r.id), Some(hold));
+    assert_eq!(ids.in_flight(), 0, "every request was answered or expired");
+    assert_eq!(allocs, 0, "BX5 staging/judge/framing/ids allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "BX5 hot bytes should be zero: saw {bytes}");
+}
+
+/// One gate 87b request on the owner's poll: start, then events and
+/// ticks until the answer is whole.
+fn gate87_cycle(
+    conn: &mut core_net::HttpsConn,
+    poll: &mut mio::Poll,
+    events: &mut mio::Events,
+    epoch: std::time::Instant,
+    n: usize,
+) -> u16 {
+    use core_net::Progress;
+    let now = epoch.elapsed().as_nanos() as u64;
+    conn.start(0, n, poll.registry(), now).expect("gate 87 start");
+    // The deadline check on a request in flight, every cycle.
+    assert_eq!(conn.on_tick(now), Progress::Waiting);
+    loop {
+        poll.poll(events, Some(std::time::Duration::from_millis(5)))
+            .expect("gate 87 poll");
+        for ev in events.iter() {
+            match conn.on_event(ev, poll.registry()) {
+                Progress::Waiting => {}
+                Progress::Done { status, .. } => return status,
+                Progress::Failed(e) => panic!("gate 87: {e}"),
+            }
+        }
+        match conn.on_tick(epoch.elapsed().as_nanos() as u64) {
+            Progress::Waiting => {}
+            Progress::Done { status, .. } => return status,
+            Progress::Failed(e) => panic!("gate 87: {e}"),
+        }
+    }
+}
+
+/// **BX5 gate 87b — the non-blocking HTTPS cycle, as allocations per
+/// request.**
+///
+/// `HttpsConn` is `HttpsPost`'s protocol split for an owner's poll (the
+/// exec gateway's): `start` stages and writes, `on_event` reads and
+/// judges, `on_tick` keeps the deadline. Same law as gate 72: rustls'
+/// buffered API allocates one record buffer per sealed write and one per
+/// decrypted record, so a request costs exactly 2 allocations, and
+/// anything above that is ours. Served by gate 72's child-process node
+/// (the counting allocator is process-global).
+///
+/// "Exactly 2" is THIS fixture's number: one request ≤ 16 KiB (one
+/// record out), one answer in one record read whole (one record in).
+/// Across a WAN, with no regression of ours, rustls adds one allocation
+/// per further inbound record, a grow-and-shrink of its deframer buffer
+/// whenever a record is split across reads, and three on a burst of
+/// more than 16 KiB of plaintext. BX6's budget is not 2 per request.
+#[test]
+fn https_conn_nonblocking_cycle_allocates_only_rustls_record_buffers() {
+    use core_net::{ConnCfg, HttpsConn, Method, Params, ReqSpec};
+    const REQS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_REQ: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate87-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 87 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 87 exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 87 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 87 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 87: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 87 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 87 anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let spec = [ReqSpec {
+        method: Method::Post,
+        path: "/evm",
+        params: Params::Body("application/json"),
+        headers: &[],
+    }];
+    let c = ConnCfg {
+        win_cap: 8192,
+        resp_cap: 16 * 1024,
+        req_timeout_ns: 5_000_000_000,
+    };
+    let mut conn =
+        HttpsConn::new("localhost", port, cfg, &spec, c, mio::Token(5)).expect("gate 87 conn");
+    let mut poll = mio::Poll::new().expect("gate 87 poll");
+    let mut events = mio::Events::with_capacity(8);
+    let epoch = std::time::Instant::now();
+    let n = exec_hyperevm::rpc::write_chain_id(conn.window_mut(0), 1).expect("gate 87 body");
+    let mut i = 0;
+    while i < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        assert_eq!(gate87_cycle(&mut conn, &mut poll, &mut events, epoch, n), 200);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < REQS {
+        let status = gate87_cycle(&mut conn, &mut poll, &mut events, epoch, n);
+        acc = acc.wrapping_add(u64::from(status) + conn.resp().len() as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(conn.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(conn.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_REQ * REQS,
+        "HttpsConn cycle: {allocs} allocations ({bytes} B) over {REQS} requests — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_REQ}/request (one sealed record \
+         out, one decrypted record in); anything above is ours"
+    );
+}
+
+/// A server frame (unmasked), FIN set.
+fn gate87_server_frame(op: u8, payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x80 | op];
+    if payload.len() < 126 {
+        v.push(payload.len() as u8);
+    } else {
+        v.push(126);
+        v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    v.extend_from_slice(payload);
+    v
+}
+
+/// Gate 87c's server half: runs ONLY in the child process gate 87c
+/// spawns (`#[ignore]`d; a no-op without `GATE87_WS_DIR`). A rustls
+/// WebSocket node: it upgrades one client, then answers every client
+/// text frame with ONE server frame in ONE write — every 8th answer
+/// carrying a ping in the same write — until the parent kills it.
+#[test]
+#[ignore = "gate 87c's child process; never run on its own"]
+fn gate87_ws_node_helper() {
+    use std::io::{Read, Write};
+    let Some(dir) = std::env::var_os("GATE87_WS_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let cert = c.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(c.key_pair.serialize_der()).expect("key");
+    let cfg = std::sync::Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .expect("gate 87c server cfg"),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("gate 87c bind");
+    let port = listener.local_addr().expect("gate 87c addr").port();
+    std::fs::write(dir.join("cert.der"), cert.as_ref()).expect("gate 87c cert");
+    // The port last: its presence says the rest is written.
+    std::fs::write(dir.join("port.tmp"), port.to_string()).expect("gate 87c port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 87c port");
+    let (sock, _) = listener.accept().expect("gate 87c accept");
+    sock.set_nodelay(true).ok();
+    let mut tls = rustls::StreamOwned::new(
+        rustls::ServerConnection::new(cfg).expect("gate 87c conn"),
+        sock,
+    );
+    let mut buf: Vec<u8> = Vec::new();
+    let mut b = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = tls.read(&mut b).expect("gate 87c upgrade");
+        assert!(n > 0, "gate 87c: no upgrade");
+        buf.extend_from_slice(&b[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    buf.drain(..head_end);
+    let key: [u8; 24] = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("gate 87c key")
+        .as_bytes()
+        .try_into()
+        .expect("gate 87c key length");
+    let accept = core_net::expected_accept(&key);
+    let ok = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        String::from_utf8_lossy(&accept)
+    );
+    tls.write_all(ok.as_bytes()).expect("gate 87c 101");
+    tls.flush().expect("gate 87c flush");
+    let mut answered = 0u64;
+    loop {
+        // One client frame: FIN, masked, 7- or 16-bit length.
+        let (op, payload) = loop {
+            if buf.len() >= 2 {
+                let (len, at) = match buf[1] & 0x7F {
+                    126 if buf.len() >= 4 => (usize::from(u16::from_be_bytes([buf[2], buf[3]])), 4),
+                    126 => (usize::MAX, 0),
+                    n => (usize::from(n), 2),
+                };
+                if len != usize::MAX && buf.len() >= at + 4 + len {
+                    let mask = [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]];
+                    let p: Vec<u8> = (0..len).map(|i| buf[at + 4 + i] ^ mask[i & 3]).collect();
+                    let op = buf[0] & 0x0F;
+                    buf.drain(..at + 4 + len);
+                    break (op, p);
+                }
+            }
+            match tls.read(&mut b) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+            }
+        };
+        if op != 0x1 {
+            continue; // the pongs ride in with the next request
+        }
+        answered += 1;
+        let mut out = gate87_server_frame(0x1, &payload);
+        if answered % 8 == 0 {
+            out.extend(gate87_server_frame(0x9, b"k"));
+        }
+        if tls.write_all(&out).is_err() || tls.flush().is_err() {
+            return;
+        }
+    }
+}
+
+/// One gate 87c round on the owner's poll: queue a request, flush once
+/// (with any pong the last round queued), turn the loop until its echo
+/// is drained. Returns the echo's length.
+fn gate87c_round(
+    conn: &mut core_net::WsConn,
+    poll: &mut mio::Poll,
+    events: &mut mio::Events,
+    epoch: std::time::Instant,
+    req: &[&[u8]],
+) -> usize {
+    use core_net::{WsNext, WsProgress};
+    conn.queue_text(req).expect("gate 87c queue");
+    conn.flush(poll.registry()).expect("gate 87c flush");
+    loop {
+        poll.poll(events, Some(std::time::Duration::from_millis(5)))
+            .expect("gate 87c poll");
+        let now = epoch.elapsed().as_nanos() as u64;
+        for ev in events.iter() {
+            if let WsProgress::Failed(e) = conn.on_event(ev, poll.registry(), now) {
+                panic!("gate 87c: {e}");
+            }
+        }
+        let mut got = 0usize;
+        loop {
+            match conn.next_frame() {
+                WsNext::Text(s) | WsNext::Binary(s) => got += conn.payload(s).len(),
+                WsNext::Idle => break,
+                WsNext::Failed(e) => panic!("gate 87c: {e}"),
+            }
+        }
+        if let WsProgress::Failed(e) = conn.on_tick(now) {
+            panic!("gate 87c: {e}");
+        }
+        if got > 0 {
+            return got;
+        }
+    }
+}
+
+/// **BX5 gate 87c — the WebSocket session's socket half, as allocations
+/// per round.**
+///
+/// `WsConn` is what BX6's WS API session sends `session.logon` and
+/// `order.place` through. A round is: `queue_text` (masked into the send
+/// window), `flush` (the whole window in ONE write, with the pong the
+/// last round's ping queued), `on_event` (pump, read to `WouldBlock`),
+/// `next_frame` (the echo handed out in place; every 8th round a ping
+/// answered into the send window), `on_tick` (the idle law). rustls'
+/// buffered API allocates one record buffer per sealed write and one per
+/// decrypted record, and the node answers each round in ONE write, so a
+/// round costs exactly 2 — anything above is ours. The node runs in a
+/// CHILD process ([`gate87_ws_node_helper`]): the counting allocator is
+/// process-global. Gate 87b's caveat holds: 2 is this fixture's number.
+#[test]
+fn ws_conn_session_round_allocates_only_rustls_record_buffers() {
+    use core_net::{WsCfg, WsConn};
+    const ROUNDS: u64 = 400;
+    const RUSTLS_ALLOCS_PER_ROUND: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate87c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 87c dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 87c exe"))
+        .args([
+            "gate87_ws_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE87_WS_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 87c child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 87c port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 87c: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 87c cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 87c anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let c = WsCfg {
+        rx_cap: 64 * 1024,
+        tx_cap: 64 * 1024,
+        establish_ns: 10_000_000_000,
+        idle_ns: 60_000_000_000,
+    };
+    let mut conn = WsConn::new("localhost", port, "/ws-api/v3", cfg, c, mio::Token(6), 0x74C)
+        .expect("gate 87c conn");
+    let mut poll = mio::Poll::new().expect("gate 87c poll");
+    let mut events = mio::Events::with_capacity(8);
+    let epoch = std::time::Instant::now();
+    conn.connect(poll.registry(), 0).expect("gate 87c connect");
+    while !conn.is_open() {
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(5)))
+            .expect("gate 87c poll");
+        let now = epoch.elapsed().as_nanos() as u64;
+        for ev in events.iter() {
+            if let core_net::WsProgress::Failed(e) = conn.on_event(ev, poll.registry(), now) {
+                panic!("gate 87c open: {e}");
+            }
+        }
+        assert!(epoch.elapsed() < std::time::Duration::from_secs(10), "gate 87c: never opened");
+    }
+    let req: [&[u8]; 3] = [
+        br#"{"id":"7","method":"order.place","params":{"symbol":"BTCUSDT","side":"BUY","#,
+        br#""type":"LIMIT","timeInForce":"IOC","quantity":"0.001","price":"60000","#,
+        br#""signature":"Ws+5m/CMnpkko0uBFxGTZ2+fjqqBXsUjRiaz173fPhXTkhoDBYNZ6wcYNeWItdrGn1pvG7vkwx2fhmJdAZ3KDQ=="}}"#,
+    ];
+    let mut i = 0;
+    while i < 50 {
+        // The session tickets and rustls' queues growing to their working
+        // size: the cold part.
+        assert!(gate87c_round(&mut conn, &mut poll, &mut events, epoch, &req) > 0);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < ROUNDS {
+        acc = acc.wrapping_add(gate87c_round(&mut conn, &mut poll, &mut events, epoch, &req) as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(conn.is_open(), "one session throughout");
+    assert_eq!(conn.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_ROUND * ROUNDS,
+        "WsConn round: {allocs} allocations ({bytes} B) over {ROUNDS} rounds — rustls' buffered \
+         API accounts for exactly {RUSTLS_ALLOCS_PER_ROUND}/round (one sealed record out, one \
+         decrypted record in); anything above is ours"
+    );
+}
+
+/// **BX3 gate 88 — the router's retirement drain (F9).**
+///
+/// An arm reports every accepted order that ended without a (further)
+/// fill as a `Retired`; the router drains at most `RETIRED_DRAIN_MAX`
+/// of them per `on_idle`, releases each one's resting row and counts it
+/// by `why`. It runs on the engine thread every idle moment, so it must
+/// be allocation-free in the steady state — including the poll where
+/// the bound fires, which is every poll here: the arm queues a burst of
+/// 100 a poll from a preallocated ring, every `why` code and two
+/// undefined ones in turn.
+#[test]
+fn routed_retired_drain_steady_state() {
+    use clob_dispatcher::{DispatchError, HaltSignal, OrderDispatch, PaperDispatcher, Retired};
+    use core_types::{CancelReq, Fill, ModifyReq, Order};
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, RoutedDispatcher, SlotCaps, RETIRED_DRAIN_MAX,
+    };
+
+    const SLOT: u8 = 3;
+    const RING: usize = 256;
+    const BURST: usize = 100;
+    const POLLS: u64 = 1_000;
+
+    /// A fixed ring of retirements, refilled by a burst each idle.
+    struct Arm {
+        ring: [Retired; RING],
+        head: usize,
+        len: usize,
+        polls: u64,
+    }
+    impl OrderDispatch for Arm {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+        }
+        fn try_next_retired(&mut self) -> Option<Retired> {
+            if self.len == 0 {
+                return None;
+            }
+            let r = self.ring[self.head];
+            self.head = (self.head + 1) % RING;
+            self.len -= 1;
+            Some(r)
+        }
+        fn on_idle(&mut self) -> bool {
+            self.polls += 1;
+            let mut k = 0usize;
+            while k < BURST && self.len < RING {
+                let tail = (self.head + self.len) % RING;
+                let n = self.polls * BURST as u64 + k as u64;
+                self.ring[tail] = Retired::new(n, SLOT, (n % 8) as u8);
+                self.len += 1;
+                k += 1;
+            }
+            false
+        }
+    }
+
+    // Boot-time construction — outside the window.
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[core_types::VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+        )
+        .expect("boot: slot 3 live");
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        Arm {
+            ring: [Retired::default(); RING],
+            head: 0,
+            len: 0,
+            polls: 0,
+        },
+        core_time::WallAnchor::new(1_789_776_001_000_000_000, 1_789_776_001_000_000_000),
+    );
+    // One poll outside the window: the seeding edge.
+    d.on_idle();
+
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < POLLS {
+        std::hint::black_box(d.on_idle());
+        std::hint::black_box(d.retired().total());
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    // The bound fired on every poll: the arm always held more.
+    assert_eq!(d.retired().total(), (POLLS + 1) * RETIRED_DRAIN_MAX as u64);
+    let mut w = 0usize;
+    while w < 6 {
+        assert!(d.retired().by_why[w] > 0, "why {w} never drained");
+        w += 1;
+    }
+    assert!(
+        d.retired().by_why[clob_dispatcher::RETIRED_WHY_UNKNOWN] > 0,
+        "the undefined codes were counted"
+    );
+    assert_eq!(
+        allocs, 0,
+        "gate 88: the retirement drain allocated {allocs} times ({bytes} B) over {POLLS} polls"
+    );
+}
+
+/// **BX3 gate 89 — two live arms split by venue, under the HYPARB split.**
+///
+/// The engine's BX3 shape: `SlotSplit<VenueSplit<Hl, Bn>, HyparbLive>`
+/// behind the router, with the legacy anchor aliased to Binance. Inside
+/// the window every verb reaches each arm by its route venue (Hyperliquid
+/// ids, native Binance ids and the aliased anchor), the idle poll merges
+/// the signal of a slot both venue arms trade, and ticks, venue events
+/// and option summaries fan out to all three arms. Zero allocations.
+#[test]
+fn venuesplit_route_steady_state() {
+    use clob_dispatcher::{
+        DispatchError, HaltSignal, OrderDispatch, PaperDispatcher, RouteAliases,
+    };
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, OptSummary, Order, Price, Qty, Side,
+        Tick, VenueId,
+    };
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, RoutedDispatcher, SlotCaps, SlotSplit,
+        VenueSplit, LAW_LINEAR, LAW_SPOT,
+    };
+
+    const T0: u64 = 1_789_776_001_000_000_000;
+    const BN: u8 = VenueId::Binance as u8;
+    const HL: u8 = VenueId::Hyperliquid as u8;
+    const EVM: u8 = VenueId::HyperEvm as u8;
+
+    /// Accepts every verb and counts what reached it.
+    #[derive(Default)]
+    struct Count {
+        verbs: u64,
+        idles: u64,
+        events: u64,
+        ticks: u64,
+        opts: u64,
+    }
+    impl OrderDispatch for Count {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            self.verbs += 1;
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            self.verbs += 1;
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            self.verbs += 1;
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn observe_tick(&mut self, _t: &Tick, _now: core_types::NsTs) {
+            self.ticks += 1;
+        }
+        fn on_venue_event(&mut self, _e: &ChannelEvent) {
+            self.events += 1;
+        }
+        fn on_opt_summary(&mut self, _s: &OptSummary) {
+            self.opts += 1;
+        }
+        fn on_idle(&mut self) -> bool {
+            self.idles += 1;
+            false
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+        }
+    }
+
+    // Boot-time construction — outside the window.
+    let caps = SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64);
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(3, ExecMode::Live, &[HL], caps, HaltLimits::none())
+        .expect("slot 3");
+    route
+        .set_slot(2, ExecMode::Live, &[BN], caps, HaltLimits::none())
+        .expect("slot 2");
+    route
+        .set_slot(5, ExecMode::Live, &[HL, BN], caps, HaltLimits::none())
+        .expect("slot 5");
+    route
+        .set_slot(0, ExecMode::Live, &[EVM, HL], caps, HaltLimits::none())
+        .expect("slot 0");
+    let aliases = RouteAliases::NONE.with(7, BN).expect("alias");
+    let venue = VenueSplit::new(BN, Count::default(), Count::default(), &route);
+    let live = SlotSplit::new(0, venue, Count::default());
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        live,
+        core_time::WallAnchor::new(T0, T0),
+    );
+    d.set_route_aliases(aliases);
+    let lin = core_types::make_symbol_id(VenueId::Binance, 600);
+    d.bind_instrument(&InstrumentSpec::new(7, LAW_SPOT, 0, 0, 0))
+        .expect("anchor row");
+    d.bind_instrument(&InstrumentSpec::new(lin, LAW_LINEAR, 0, 0, 0))
+        .expect("linear row");
+    d.on_idle(); // the seeding edge
+
+    let mk = |slot: u8, venue: u8, sym: core_types::SymbolId, oid: u64| {
+        let mut o = Order::new(
+            T0,
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            0,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            oid,
+        );
+        o.venue = venue;
+        o.strategy_id = slot;
+        o
+    };
+    let tick = Tick::new(
+        T0,
+        VenueId::Binance,
+        lin,
+        1,
+        Price::from_raw(1_000_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(1_001_000),
+        Qty::from_raw(1_000_000),
+    );
+    let ev = ChannelEvent::new(T0, VenueId::Binance, ChannelId::Funding, lin, 1, 0, 1, 1);
+    let opt = OptSummary::new(T0, VenueId::Binance, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    let g = AllocGuard::new();
+    let mut refused = 0u64;
+    let mut i = 0u64;
+    while i < 10_000 {
+        let oid = 1_000_000 + i * 4;
+        let (slot, venue, sym) = match i % 5 {
+            0 => (3u8, HL, 4096 + (i as u32 & 63)),
+            1 => (2u8, BN, lin),
+            2 => (5u8, 0u8, 7u32),
+            3 => (5u8, HL, 4200 + (i as u32 & 63)),
+            _ => (0u8, EVM, core_types::make_symbol_id(VenueId::HyperEvm, 1)),
+        };
+        let o = mk(slot, venue, sym, oid);
+        if d.submit(&o).is_err() {
+            refused += 1;
+        }
+        let mut rep = o;
+        rep.client_oid = oid + 1;
+        if d.modify(&ModifyReq::new(oid, rep)).is_err() {
+            refused += 1;
+        }
+        if d.cancel(&CancelReq::of(&rep, T0)).is_err() {
+            refused += 1;
+        }
+        d.observe_tick(&tick, T0);
+        if i % 8 == 0 {
+            d.on_idle();
+        }
+        if i % 16 == 0 {
+            d.on_venue_event(&ev);
+        }
+        if i % 32 == 0 {
+            d.on_opt_summary(&opt);
+        }
+        std::hint::black_box(d.exec_counters().live_submits);
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    let s = d.live();
+    let (hl, bn, evm) = (s.a().a(), s.a().b(), s.b());
+    assert_eq!(refused, 0, "every verb was routed and accepted");
+    assert!(
+        hl.verbs > 0 && bn.verbs > 0 && evm.verbs > 0,
+        "a venue arm saw no verb"
+    );
+    assert_eq!(hl.verbs, 3 * 4_000, "Hyperliquid: slots 3 and 5");
+    assert_eq!(
+        bn.verbs,
+        3 * 4_000,
+        "Binance: slot 2 native and the slot-5 anchor"
+    );
+    assert_eq!(evm.verbs, 3 * 2_000, "HYPARB: slot 0");
+    assert!(hl.idles > 0 && bn.idles > 0 && evm.idles > 0);
+    assert!(hl.events > 0 && bn.events > 0 && evm.events > 0);
+    assert!(hl.ticks > 0 && bn.ticks > 0 && evm.ticks > 0);
+    assert!(hl.opts > 0 && bn.opts > 0 && evm.opts > 0);
+    assert_eq!(
+        allocs, 0,
+        "gate 89: the venue split allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// Boot a router with one live Binance slot and a full instrument table:
+/// 64 rows of each law (spot, linear, inverse, option — half the options
+/// writable calls, half non-writable puts). Shared by gates 90 and 91.
+fn bx3_instrument_router<L: clob_dispatcher::OrderDispatch>(
+    live: L,
+    caps: exec_router::SlotCaps,
+) -> exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L> {
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, RoutedDispatcher, INST_CALL,
+        INST_WRITABLE, LAW_INVERSE, LAW_LINEAR, LAW_OPTION, LAW_SPOT, LEDGER_INSTRUMENTS,
+    };
+    const T0: u64 = 1_789_776_001_000_000_000;
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            3,
+            ExecMode::Live,
+            &[core_types::VenueId::Binance.to_u8()],
+            caps,
+            HaltLimits::none(),
+        )
+        .expect("slot 3 on Binance");
+    let mut d = RoutedDispatcher::new(
+        route,
+        clob_dispatcher::PaperDispatcher::new(),
+        live,
+        core_time::WallAnchor::new(T0, T0),
+    );
+    d.mark_ledger_seeded();
+    let mut k = 0u32;
+    while k < LEDGER_INSTRUMENTS as u32 {
+        let sym = core_types::make_symbol_id(core_types::VenueId::Binance, 5_000 + k);
+        let spec = match k % 4 {
+            0 => InstrumentSpec::new(sym, LAW_SPOT, 0, 0, 0),
+            1 => InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0),
+            2 => InstrumentSpec::new(sym, LAW_INVERSE, 0, 100_000_000, 0),
+            _ if k % 8 == 3 => InstrumentSpec::new(
+                sym,
+                LAW_OPTION,
+                INST_WRITABLE | INST_CALL,
+                1_000_000,
+                100_000_000_000,
+            ),
+            _ => InstrumentSpec::new(sym, LAW_OPTION, 0, 1_000_000_000, 84_000),
+        };
+        d.bind_instrument(&spec).expect("bind");
+        k += 1;
+    }
+    d
+}
+
+/// **BX3 gate 90 — the ledger's instrument rows on the order and fill
+/// paths.** A full table (256 rows, every law): orders of every law
+/// through the probe and the four clamps — the law refusals (`Short`,
+/// `Unpriced`) and every clamp fire inside the window — venue fills that
+/// open, grow, reduce and cross positions, settlements, and a modify and
+/// a cancel per order. Zero allocations.
+#[test]
+fn ledger_instrument_rows_steady_state() {
+    use clob_dispatcher::{DispatchError, OrderDispatch};
+    use core_types::{
+        CancelReq, Fill, ModifyReq, OptSummary, Order, Price, Qty, Side, VenueId,
+        FILL_FLAG_SETTLEMENT, FILL_ORIGIN_VENUE,
+    };
+    use exec_router::{SlotCaps, LEDGER_INSTRUMENTS};
+
+    const T0: u64 = 1_789_776_001_000_000_000;
+    const E6: i64 = 1_000_000;
+
+    struct Yes;
+    impl OrderDispatch for Yes {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+    }
+
+    // Tight enough that every clamp fires; loose enough that most pass.
+    let caps = SlotCaps::new(50_000 * E6, 2_000_000 * E6, 50_000_000 * E6, 64);
+    let mut d = bx3_instrument_router(Yes, caps);
+    // Half the writable calls get an index; the rest stay unpriced.
+    let mut k = 0u32;
+    while k < LEDGER_INSTRUMENTS as u32 {
+        if k % 16 == 3 {
+            let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+            let s = OptSummary::new(
+                T0,
+                VenueId::Binance,
+                sym,
+                core_types::OPT_SUMMARY_FLAG_MARK_PX,
+                400 * E6 * 1_000,
+                0,
+                100_000 * E6 * 1_000,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            d.on_opt_summary(&s);
+        }
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut placed = 0u64;
+    let mut refused = 0u64;
+    let mut i = 0u64;
+    while i < 20_000 {
+        let k = (i % LEDGER_INSTRUMENTS as u64) as u32;
+        let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+        let buy = (i / 3) % 3 != 0;
+        let qty = (1 + (i % 7) as i64) * E6;
+        let px = if i % 97 == 0 {
+            0
+        } else {
+            (100 + (i % 900) as i64) * E6
+        };
+        let oid = 10_000_000 + i * 2;
+        let mut o = Order::new(
+            T0 + i,
+            VenueId::Binance,
+            sym,
+            if buy { Side::Bid } else { Side::Ask },
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        );
+        o.strategy_id = 3;
+        match d.submit(&o) {
+            Ok(()) => placed += 1,
+            Err(DispatchError::RiskRefused) => refused += 1,
+            Err(e) => panic!("unexpected dispatch error {e:?}"),
+        }
+        let mut rep = o;
+        rep.client_oid = oid + 1;
+        let _ = d.modify(&ModifyReq::new(oid, rep));
+        let _ = d.cancel(&CancelReq::of(&rep, T0 + i));
+        // A venue fill on the row — some opening, some crossing — and
+        // now and then a settlement.
+        let mut f = Fill::new(
+            T0 + i,
+            sym,
+            if buy { Side::Bid } else { Side::Ask },
+            Price::from_raw(if px > 0 { px } else { 100 * E6 }),
+            Qty::from_raw(qty),
+            oid,
+        )
+        .with_attribution(3, FILL_ORIGIN_VENUE);
+        if i % 211 == 0 {
+            f = f.with_flags(FILL_FLAG_SETTLEMENT);
+        }
+        d.on_fill_booked(&f);
+        std::hint::black_box(d.ledger().slot_exposure_1e6(3));
+        std::hint::black_box(d.ledger().slot_day_turnover_1e6(3));
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    let c = d.counters();
+    assert!(placed > 0, "no order was ever accepted");
+    assert!(refused > 0);
+    assert!(c.refused_short > 0, "the Short law never fired");
+    assert!(c.refused_unpriced > 0, "the Unpriced law never fired");
+    assert!(c.refused_max_order > 0, "clamp 1 never fired");
+    assert!(c.refused_cap_instance > 0, "clamp 3 never fired");
+    assert!(d.ledger().counters().fills_booked > 0);
+    assert_eq!(
+        allocs, 0,
+        "gate 90: the instrument rows allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// **BX3 gate 91 — the ledger's price feed.** Venue `Mark` events on
+/// bound and unbound ids, interleaved with the rolls the family rows
+/// bind from and with option summaries — with and without a mark, on
+/// bound options and on another venue's ids. Each mark re-prices its
+/// row for every slot and keeps the aggregate exact. Zero allocations.
+#[test]
+fn ledger_price_feed_steady_state() {
+    use clob_dispatcher::{DispatchError, OrderDispatch};
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, OptSummary, Order, Price, Qty, Side,
+        VenueId, FILL_ORIGIN_VENUE,
+    };
+    use exec_router::{SlotCaps, LEDGER_INSTRUMENTS};
+
+    const T0: u64 = 1_789_776_001_000_000_000;
+    const E6: i64 = 1_000_000;
+
+    struct Yes;
+    impl OrderDispatch for Yes {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+    }
+
+    let caps = SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, 64);
+    let mut d = bx3_instrument_router(Yes, caps);
+    // A position on every row, so every re-price moves the aggregate.
+    let mut k = 0u32;
+    while k < LEDGER_INSTRUMENTS as u32 {
+        let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+        let f = Fill::new(
+            T0,
+            sym,
+            Side::Bid,
+            Price::from_raw(100 * E6),
+            Qty::from_raw(E6),
+            1,
+        )
+        .with_attribution(3, FILL_ORIGIN_VENUE);
+        d.on_fill_booked(&f);
+        k += 1;
+    }
+    let before = d.ledger().instrument_exposure_1e6(3);
+
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 50_000 {
+        let k = (i % (LEDGER_INSTRUMENTS as u64 + 16)) as u32;
+        let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+        match i % 4 {
+            0 | 1 => {
+                let m = ChannelEvent::new(
+                    T0 + i,
+                    VenueId::Binance,
+                    ChannelId::Mark,
+                    sym,
+                    i,
+                    0,
+                    (100 + (i % 50) as i64) * E6,
+                    (100 + (i % 51) as i64) * E6,
+                );
+                d.on_venue_event(&m);
+            }
+            2 => {
+                let s = OptSummary::new(
+                    T0 + i,
+                    if i % 8 == 2 {
+                        VenueId::Deribit
+                    } else {
+                        VenueId::Binance
+                    },
+                    sym,
+                    if i % 3 == 0 {
+                        0
+                    } else {
+                        core_types::OPT_SUMMARY_FLAG_MARK_PX
+                    },
+                    (300 + (i % 70) as i64) * E6 * 1_000,
+                    0,
+                    (90_000 + (i % 20_000) as i64) * E6 * 1_000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                d.on_opt_summary(&s);
+            }
+            _ => {
+                let roll = ChannelEvent::new(
+                    T0 + i,
+                    VenueId::Hyperliquid,
+                    ChannelId::InstrumentRoll,
+                    (4u32 << 24) | (100 + (i as u32 & 15) * 2),
+                    core_types::pack_roll_seq(
+                        1_000 + (i as u32 & 15),
+                        60,
+                        (i & 15) as usize,
+                        false,
+                    ),
+                    0,
+                    0,
+                    0,
+                );
+                d.on_venue_event(&roll);
+            }
+        }
+        std::hint::black_box(d.ledger().instrument_exposure_1e6(3));
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    assert_ne!(
+        d.ledger().instrument_exposure_1e6(3),
+        before,
+        "the marks never re-priced a row"
+    );
+    assert_eq!(
+        allocs, 0,
+        "gate 91: the price feed allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// BX6 gates 92–93: two USDⓈ-M rows as discovery reports them.
+const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.10","maxPrice":"4529764","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"1000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"100"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]},{"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01","maxPrice":"300000","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"10000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"20"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]}]}"#;
+
+/// **BX6 gate 92 — the Binance arm on the engine thread, in the engine's
+/// own shape**: `RoutedDispatcher<Paper, VenueSplit<NullLive, BnArm>>`
+/// with the anchor aliased to Binance and both rows bound in the ledger.
+///
+/// Every verb passes the router's risk gate, the split and the arm (the
+/// alias-first row, the BX-5 quantization, the order budget, QTR,
+/// breadth, the per-row cap) onto the command ring; the router's idle
+/// hook drains the gateway's events through the arm and takes its
+/// confirm-later retirements and renames into the ledger, sweeps the
+/// stale marks and reads the arm's counters. Inside the window: IoC and
+/// maker places on both sides of the aliased anchor and a native row —
+/// accepted, and once the venue's order budget is spent, refused —
+/// cancels, modifies, EVERY event kind the gateway sends, the marks (one
+/// of them stale: the sweep expires it), `/state`'s counters and, last,
+/// a venue lock that halts the slot and the sweep that clears it. Zero
+/// allocations.
+#[test]
+fn binance_arm_steady_state() {
+    use clob_dispatcher::{
+        CancelAllState, OrderDispatch, PaperDispatcher, RouteAliases, RETIRED_CANCELED_MEMBER,
+        RETIRED_EXPIRED, RETIRED_FILLED,
+    };
+    use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
+    use core_types::{CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, Side};
+    use exec_binance::arm::{ArmKnobs, BnArm};
+    use exec_binance::cmd::{
+        BnCmd, BnEvt, CMD_RING, EVT_ACK, EVT_BUDGET, EVT_CANCEL_FAILED, EVT_DAY, EVT_F_CLOCK_OK,
+        EVT_F_DEADMAN_OK, EVT_F_IOC, EVT_F_ORDER_UP, EVT_F_RECONCILED, EVT_F_SWEEP_DONE,
+        EVT_F_USER_UP, EVT_LOCK, EVT_MARGIN, EVT_MODIFIED, EVT_MODIFY_FAILED, EVT_POSITION,
+        EVT_RECON, EVT_REJECT, EVT_RETIRED, EVT_RING, EVT_SCAN_FAIL, EVT_STATUS, EVT_SWEEP,
+        EVT_TALLY, VERB_CANCEL, VERB_CANCEL_ALL, VERB_MODIFY, VERB_PLACE,
+    };
+    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::margin::{MarginBook, SLOTS};
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, RoutedDispatcher,
+        SlotCaps, VenueSplit, LAW_LINEAR,
+    };
+
+    const SLOT: u8 = 2;
+    const ALIAS: SymbolId = 7;
+    const N: u64 = 4_000;
+
+    // Boot-time construction — outside the window.
+    let mut disc = ingress_binance::discovery::BnDiscovery::new();
+    disc.ingest_body(BX6_FAPI).expect("gate 92 discovery");
+    let (mut t, mut w) = InstTable::new(ALIAS);
+    let eth = core_types::make_symbol_id(VenueId::Binance, 514);
+    let rows = [(ALIAS, &b"BTCUSDT"[..]), (eth, &b"ETHUSDT"[..])];
+    for (sym, name) in rows {
+        let row = disc.find(name).expect("gate 92 row");
+        t.bind(&mut w, &BindSpec { sym, product: PRODUCT_USDM, row, owned: true, maker_ok: true })
+            .expect("gate 92 bind");
+    }
+    let (cmd_tx, mut cmd_rx) = Ring::<BnCmd, CMD_RING>::new().split();
+    let (mut evt_tx, evt_rx) = Ring::<BnEvt, EVT_RING>::new().split();
+    let mut lim = [0i64; SLOTS];
+    lim[SLOT as usize] = 600_000;
+    let mut prod = [0u8; SLOTS];
+    prod[SLOT as usize] = 1 << PRODUCT_USDM;
+    let arm = BnArm::new(
+        cmd_tx,
+        evt_rx,
+        t,
+        ArmKnobs {
+            orders_frac_1e6: 1_000_000,
+            qtr_frac_1e6: 1_000_000,
+            owner_slot: SLOT,
+            max_symbols: 20,
+            min_maker_ttl_ns: 5_000_000_000,
+            margin: MarginBook::new(lim, prod),
+            anchor: core_time::WallAnchor::now(),
+        },
+    );
+    let bn = VenueId::Binance.to_u8();
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, 1_024),
+            HaltLimits::none(),
+        )
+        .expect("gate 92 route");
+    let split = VenueSplit::new(bn, NullLiveDispatcher::new(), arm, &route);
+    let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), split, core_time::WallAnchor::now());
+    d.set_route_aliases(RouteAliases::NONE.with(ALIAS, bn).expect("gate 92 alias"));
+    for sym in [ALIAS, eth] {
+        d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0)).expect("gate 92 ledger row");
+    }
+    let healthy = |now: u64| {
+        let mut s = BnEvt::new(EVT_STATUS, now);
+        s.flags = EVT_F_ORDER_UP | EVT_F_USER_UP | EVT_F_CLOCK_OK | EVT_F_DEADMAN_OK;
+        s
+    };
+    let t0 = core_time::now_ns();
+    let mut r = BnEvt::new(EVT_RECON, t0);
+    r.flags = EVT_F_RECONCILED;
+    let mut day = BnEvt::new(EVT_DAY, t0);
+    day.slot = SLOT;
+    day.a = (t0 / 86_400_000_000_000) as i64;
+    assert!(evt_tx.try_push_ref(&healthy(t0)) && evt_tx.try_push_ref(&r) && evt_tx.try_push_ref(&day));
+    d.on_idle();
+    d.on_idle();
+    assert!(d.ledger().is_slot_seeded(SLOT as usize), "gate 92: the slot is seeded from the arm's day");
+    // A mark already stale when the window opens: the router's next sweep
+    // (once a second) expires it inside the window.
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let old = core_time::now_ns().saturating_sub(exec_router::ledger::MARK_STALE_NS + 1_000_000_000);
+    d.on_venue_event(&ChannelEvent::new(old, VenueId::Binance, ChannelId::Mark, eth, 0, 0, 3_000_000_000, 3_000_000_000));
+    let expired_before = d.ledger().counters().marks_expired;
+
+    // The venue's side keeps what a real one knows: a refused modify's new
+    // id names the order still resting under its previous one.
+    let mut aborted = [(0u64, 0u64); 16];
+    let mut aborted_at = 0usize;
+
+    let g = AllocGuard::new();
+    // The sweep is due: the stale mark stops pricing its row.
+    d.on_idle();
+    let (mut ok, mut refused, mut polls) = (0u64, 0u64, 0u64);
+    let mut i = 0u64;
+    while i < N {
+        let now = core_time::now_ns();
+        if i % 32 == 0 {
+            let _ = evt_tx.try_push_ref(&healthy(now));
+            for sym in [ALIAS, eth] {
+                let px = if sym == ALIAS { 65_000_000_000 } else { 3_000_000_000 };
+                d.on_venue_event(&ChannelEvent::new(now, VenueId::Binance, ChannelId::Mark, sym, i, 0, px, px + 10_000));
+            }
+        }
+        // The gateway's cold reports, one kind in turn.
+        if i % 64 == 16 {
+            let mut e = match (i / 64) % 6 {
+                0 => BnEvt::new(EVT_MARGIN, now),
+                1 => BnEvt::new(EVT_BUDGET, now),
+                2 => BnEvt::new(EVT_TALLY, now),
+                3 => BnEvt::new(EVT_POSITION, now),
+                4 => BnEvt::new(EVT_RECON, now),
+                _ => BnEvt::new(EVT_DAY, now),
+            };
+            e.product = PRODUCT_USDM;
+            e.slot = SLOT;
+            e.why = (i / 64 % 5) as u8;
+            e.a = if e.kind == EVT_MARGIN { 100_000 } else { (i & 7) as i64 };
+            e.b = 1_000_000_000;
+            e.c = 1_000_000_000;
+            e.flags = if e.kind == EVT_RECON { EVT_F_RECONCILED } else { 0 };
+            if e.kind == EVT_BUDGET {
+                // Already past: an observation, not a floor.
+                e.a = 1;
+            }
+            if e.kind == EVT_DAY {
+                e.a = (now / 86_400_000_000_000) as i64;
+            }
+            let _ = evt_tx.try_push_ref(&e);
+        }
+        let btc = i & 4 == 0;
+        let buy = i & 1 == 0;
+        let maker = i & 2 == 0;
+        // Off the tick and off the step: the quantization has work to do.
+        let (sym, px, qty) = if btc {
+            (ALIAS, 65_000_000_000 + (i % 100) as i64 * 100_000 + 37, 2_345)
+        } else {
+            (eth, 3_000_000_000 + (i % 100) as i64 * 10_000 + 3, 12_345)
+        };
+        let side = if buy { Side::Bid } else { Side::Ask };
+        let kind = if maker { ORDER_KIND_MAKER } else { ORDER_KIND_IOC };
+        let mut o = Order::new(now, VenueId::Binance, sym, side, kind, Price::from_raw(px), Qty::from_raw(qty), 10_000 + i);
+        o.strategy_id = SLOT;
+        o.ttl_ns = if maker { 6_000_000_000 } else { 0 };
+        if d.submit(&o).is_ok() {
+            ok += 1;
+            if maker && i % 8 < 4 {
+                let _ = d.cancel(&CancelReq::of(&o, now));
+            } else if maker {
+                let mut repl = o;
+                repl.client_oid = 1_000_000 + i;
+                repl.qty = Qty::from_raw(qty + 1_000);
+                let _ = d.modify(&ModifyReq::new(o.client_oid, repl));
+                let _ = d.cancel(&CancelReq::of(&repl, now));
+            }
+        } else {
+            refused += 1;
+        }
+        // The gateway's side: every command answered in order — now and
+        // then refused (a reject, a failed cancel, a failed modify).
+        while let Some(gc) = cmd_rx.try_pop_ref() {
+            let c: BnCmd = *gc;
+            drop(gc);
+            let e = match c.verb {
+                // An IoC refused (a maker's refusal would meet its cancel).
+                VERB_PLACE if i % 97 == 1 && c.kind != ORDER_KIND_MAKER => {
+                    let mut x = BnEvt::order(EVT_REJECT, now, c.client_oid, c.row, c.slot);
+                    x.code = -2019;
+                    x
+                }
+                VERB_PLACE if c.kind == ORDER_KIND_MAKER => BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot),
+                VERB_PLACE => {
+                    let _ = evt_tx.try_push_ref(&BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot));
+                    let mut x = BnEvt::order(EVT_RETIRED, now, c.client_oid, c.row, c.slot);
+                    x.why = if i % 3 == 0 { RETIRED_FILLED } else { RETIRED_EXPIRED };
+                    x.flags = EVT_F_IOC;
+                    x
+                }
+                VERB_MODIFY if i % 13 == 0 => {
+                    aborted[aborted_at & 15] = (c.client_oid, c.prev_client_oid);
+                    aborted_at += 1;
+                    let mut x = BnEvt::order(EVT_MODIFY_FAILED, now, c.client_oid, c.row, c.slot);
+                    x.a = c.prev_client_oid as i64;
+                    x.code = -1000;
+                    x
+                }
+                VERB_MODIFY => {
+                    let mut x = BnEvt::order(EVT_MODIFIED, now, c.client_oid, c.row, c.slot);
+                    x.a = c.prev_client_oid as i64;
+                    x.b = c.qty_1e6;
+                    x.c = c.px_1e6;
+                    x.side = c.side;
+                    x
+                }
+                VERB_CANCEL => {
+                    if i % 11 == 0 {
+                        let mut f = BnEvt::order(EVT_CANCEL_FAILED, now, c.client_oid, c.row, c.slot);
+                        f.code = -1000;
+                        let _ = evt_tx.try_push_ref(&f);
+                    }
+                    // The order ends under the id it rests by.
+                    let mut oid = c.client_oid;
+                    let mut k = 0;
+                    while k < aborted.len() {
+                        if aborted[k].0 == oid && oid != 0 {
+                            oid = aborted[k].1;
+                            aborted[k] = (0, 0);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    let mut x = BnEvt::order(EVT_RETIRED, now, oid, c.row, c.slot);
+                    x.why = RETIRED_CANCELED_MEMBER;
+                    x
+                }
+                _ => BnEvt::new(0, now),
+            };
+            let _ = evt_tx.try_push_ref(&e);
+        }
+        polls += d.on_idle() as u64;
+        if i % 256 == 0 {
+            std::hint::black_box(d.exec_counters());
+        }
+        i += 1;
+    }
+    // Last: a venue lock and a frame that did not scan halt the slot; the
+    // router asks for the sweep and the gateway confirms it clear.
+    let now = core_time::now_ns();
+    let _ = evt_tx.try_push_ref(&BnEvt::new(EVT_LOCK, now));
+    let _ = evt_tx.try_push_ref(&BnEvt::new(EVT_SCAN_FAIL, now));
+    let mut swept = 0u32;
+    let mut k = 0;
+    while k < 8 {
+        d.on_idle();
+        while let Some(gc) = cmd_rx.try_pop_ref() {
+            let verb = gc.verb;
+            drop(gc);
+            if verb == VERB_CANCEL_ALL {
+                swept += 1;
+                let mut s = BnEvt::new(EVT_SWEEP, core_time::now_ns());
+                s.flags = EVT_F_SWEEP_DONE;
+                let _ = evt_tx.try_push_ref(&s);
+            }
+        }
+        k += 1;
+    }
+    let state = d.live().cancel_all_state();
+    let (allocs, bytes, _) = g.delta();
+
+    assert!(ok > 100 && refused > 0, "both halves of the gate ran: {ok} accepted, {refused} refused");
+    assert!(polls > 100, "the idle hook drained events: {polls}");
+    let c = d.exec_counters();
+    assert!(c.arm_bn.submitted > 100 && c.arm_bn.rejected > 0, "{:?}", c.arm_bn);
+    assert!(d.ledger().counters().marks_expired > expired_before, "the stale mark was swept");
+    assert_eq!((swept, state), (1, CancelAllState::Clear), "the lock halted the slot and the sweep cleared it");
+    assert_eq!(allocs, 0, "gate 92: the Binance arm allocated {allocs} times ({bytes} B)");
+}
+
+/// **BX6 gate 93 — the Binance gateway's order path either side of the
+/// socket.** Everything the gateway thread does per order that is not
+/// the transport (gate 87c measures `WsConn` itself): the client id
+/// classified; `order.place`, `order.cancel`, `order.modify`,
+/// `order.status` and `v2/account.status` rendered — their numbers and
+/// client ids IN the frame — and masked by core-net's own writer into a
+/// send window; the answers and user events scanned in place and their
+/// rows found; the open-order table (insert, rename, remove), the TTL
+/// wheel, the trade-id and ended rings and the clock; the dead-man's
+/// signed query rendered and signed in its window, its answer and a
+/// refusal scanned; and — at their own cadence — the reconciliation's
+/// scans and judges. Zero allocations.
+#[test]
+fn binance_gateway_render_and_scan_steady_state() {
+    use exec_binance::cid::CidPrefix;
+    use exec_binance::clock::VenueClock;
+    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::oot::{EndedRing, Oot, TidRing};
+    use exec_binance::recon::{day_increasing_1e6, judge_positions, scan_um_account, Leg, PosRow, Verdict};
+    use exec_binance::rest::{scan_countdown, scan_error, scan_orders, scan_trades, OrderRow, QueryWriter, TradeRow};
+    use exec_binance::ttl::TtlWheel;
+    use exec_binance::userstream::{scan_user_event, UserEvent};
+    use exec_binance::wsapi::{
+        queue_account, queue_cancel, queue_modify, queue_place, queue_status, scan_answer, FrameSink,
+        Part, Place, WsAnswer, WsStatic,
+    };
+
+    const N: u64 = 20_000;
+    const PLACED: &[u8] = br#"{"id":17,"status":200,"result":{"orderId":8001,"symbol":"BTCUSDT","status":"NEW","clientOrderId":"mv6512ab0f2000000000000006500000","price":"65000.0","avgPrice":"0.00","origQty":"0.002","executedQty":"0","cumQuote":"0","timeInForce":"GTX","type":"LIMIT","side":"BUY","updateTime":1790000000000},"rateLimits":[{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":300,"count":1}]}"#;
+    const REFUSED: &[u8] = br#"{"id":18,"status":400,"error":{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected."}}"#;
+    const UPDATE: &[u8] = br#"{"e":"ORDER_TRADE_UPDATE","E":1790000000123,"T":1790000000120,"o":{"s":"BTCUSDT","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.002","p":"65000.0","ap":"64999.9","sp":"0","x":"TRADE","X":"FILLED","i":8001,"l":"0.002","z":"0.002","L":"64999.9","N":"USDT","n":"0.06499990","T":1790000000120,"t":9001,"b":"0","a":"0","m":false,"R":false,"wt":"CONTRACT_PRICE","ot":"LIMIT","ps":"BOTH","cp":false,"rp":"0","pP":false,"si":0,"ss":0,"V":"EXPIRE_MAKER","pm":"NONE","gtd":0}}"#;
+    const LITE: &[u8] = br#"{"e":"TRADE_LITE","E":1790000000121,"T":1790000000120,"s":"BTCUSDT","q":"0.002","p":"65000.0","m":false,"c":"mv6512ab0f2000000000000006500000","S":"BUY","L":"64999.9","l":"0.002","t":9001,"i":8001}"#;
+    const OPEN: &[u8] = br#"[{"avgPrice":"0.00","clientOrderId":"mv6512ab0f2000000000000006500000","cumQuote":"0","executedQty":"0","orderId":8001,"origQty":"0.002","price":"60000.0","side":"BUY","status":"NEW","symbol":"BTCUSDT","timeInForce":"GTX","type":"LIMIT","updateTime":1790000000000},{"avgPrice":"0.00","clientOrderId":"web_stranger_1","cumQuote":"0","executedQty":"0","orderId":7002,"origQty":"0.001","price":"90000.0","side":"SELL","status":"NEW","symbol":"BTCUSDT","timeInForce":"GTC","type":"LIMIT","updateTime":1790000000000}]"#;
+    const TRADES: &[u8] = br#"[{"buyer":true,"commission":"0.032","commissionAsset":"USDT","id":501,"maker":false,"orderId":4001,"price":"64000.0","qty":"0.001","quoteQty":"64.0","realizedPnl":"0","side":"BUY","positionSide":"BOTH","symbol":"BTCUSDT","time":1790000000001},{"buyer":false,"commission":"0.032","commissionAsset":"USDT","id":502,"maker":false,"orderId":4002,"price":"64100.0","qty":"0.001","quoteQty":"64.1","realizedPnl":"0.1","side":"SELL","positionSide":"BOTH","symbol":"BTCUSDT","time":1790000000002}]"#;
+    const ACCOUNT: &[u8] = br#"{"id":19,"status":200,"result":{"totalInitialMargin":"1.00","totalMaintMargin":"0.52","totalWalletBalance":"1000.00","totalMarginBalance":"1000.00","availableBalance":"999.00","assets":[{"asset":"USDT","walletBalance":"1000.00"}],"positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0.003","unrealizedProfit":"0.00","notional":"195.00","updateTime":1790000000000}]}}"#;
+
+    const COUNTDOWN: &[u8] = br#"{"symbol":"BTCUSDT","countdownTime":"30000"}"#;
+    const REST_REFUSED: &[u8] = br#"{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}"#;
+
+    /// The send window, as `WsConn`'s: one preallocated buffer, each frame
+    /// written and masked by core-net's own in-place writer.
+    struct Window {
+        buf: [u8; 4_096],
+        n: usize,
+        mask: u64,
+    }
+    impl FrameSink for Window {
+        fn queue_parts(&mut self, parts: &[Part<'_>]) -> Result<(), core_net::WsErr> {
+            self.mask = self.mask.wrapping_add(1);
+            let m = core_net::ws_mask_from_counter(self.mask);
+            self.n = core_net::ws_write_text_frame_with(&mut self.buf, parts, m).map_err(|_| core_net::WsErr::Overflow)?;
+            Ok(())
+        }
+    }
+
+    // Boot-time construction — outside the window.
+    let prefix = CidPrefix::new(0x6512_ab0f);
+    let st = WsStatic::new("EXPIRE_MAKER", 5_000);
+    let signer = signer_ed25519::Ed25519Signer::from_seed(&[0x5a; 32]).expect("gate 93 signer");
+    let mut disc = ingress_binance::discovery::BnDiscovery::new();
+    disc.ingest_body(BX6_FAPI).expect("gate 93 discovery");
+    let (mut table, mut wire) = InstTable::new(7);
+    for (sym, name) in [(7, &b"BTCUSDT"[..]), (core_types::make_symbol_id(VenueId::Binance, 514), &b"ETHUSDT"[..])] {
+        let row = disc.find(name).expect("gate 93 row");
+        table
+            .bind(&mut wire, &BindSpec { sym, product: PRODUCT_USDM, row, owned: true, maker_ok: true })
+            .expect("gate 93 bind");
+    }
+    let mut win = Window { buf: [0; 4_096], n: 0, mask: 0x6512 };
+    let mut rest_win = [0u8; 1_024];
+    let mut oot = Oot::new();
+    let mut ttl = TtlWheel::new(core_time::now_ns());
+    let mut tids = TidRing::<256>::new();
+    let mut ended = EndedRing::new();
+    let mut clock = VenueClock::new(core_time::WallAnchor::now());
+    let mut orders = [OrderRow::default(); 16];
+    let mut trades = [TradeRow::default(); 16];
+    let mut pos = [PosRow::default(); 8];
+    let mut legs = [Leg::default(); 2];
+    legs[0].owned = true;
+    let mut a = WsAnswer::default();
+    let mut ev = UserEvent::default();
+
+    let g = AllocGuard::new();
+    let (mut rendered, mut expired) = (0usize, 0u64);
+    let mut i = 0u64;
+    while i < N {
+        let now = core_time::now_ns();
+        let ts = 1_790_000_000_000 + i;
+        let side = (i & 1) as u8;
+        // The client ids the venue reports, classified.
+        std::hint::black_box(prefix.classify(b"mv6512ab0f2000000000000006500000"));
+        std::hint::black_box(prefix.classify(b"web_stranger_1"));
+        // The order session's requests, the client id rendered in place.
+        let px = 65_000_000_000 + (i % 100) as i64 * 100_000;
+        let cid = Part::Cid(&prefix, 2, 0x65 + i);
+        let mut o = Place {
+            symbol: wire.row(0).symbol(),
+            side,
+            maker: i & 2 == 0,
+            qty_1e6: 2_000,
+            qty_dec: 3,
+            px_1e6: px,
+            px_dec: 1,
+            cid,
+            ts_ms: ts,
+        };
+        queue_place(&mut win, 17 + i, &st, &o).expect("gate 93 place");
+        rendered += win.n;
+        queue_cancel(&mut win, 18 + i, &st, b"BTCUSDT", cid, ts).expect("gate 93 cancel");
+        o.qty_1e6 = 3_000;
+        queue_modify(&mut win, 19 + i, &st, &o).expect("gate 93 modify");
+        queue_status(&mut win, 20 + i, &st, b"BTCUSDT", cid, ts).expect("gate 93 status");
+        // A ghost's cancel, by the venue's own id.
+        queue_cancel(&mut win, 21 + i, &st, b"BTCUSDT", Part::Lit(b"mv65110000200000000000000004d00000"), ts)
+            .expect("gate 93 ghost cancel");
+        queue_account(&mut win, 22 + i, &st, ts).expect("gate 93 account");
+        rendered += win.n;
+        // Their answers and the user stream.
+        scan_answer(PLACED, &mut a).expect("gate 93 answer");
+        std::hint::black_box(a.venue_oid);
+        scan_answer(REFUSED, &mut a).expect("gate 93 refusal");
+        std::hint::black_box(a.code);
+        scan_user_event(UPDATE, &mut ev).expect("gate 93 update");
+        std::hint::black_box(prefix.classify(ev.cid.get(UPDATE)));
+        std::hint::black_box(wire.find(PRODUCT_USDM, ev.symbol.get(UPDATE)));
+        scan_user_event(LITE, &mut ev).expect("gate 93 lite");
+        std::hint::black_box(tids.seen_or_record(0, 9_000 + (i & 511)));
+        // The open-order table and the TTL wheel.
+        let ix = oot
+            .insert(2, 1_000 + i, 0, side, (i & 1) as u8, px, 2_000, now)
+            .expect("gate 93 insert");
+        ttl.insert(ix, now + 5_000_000_000);
+        assert!(oot.add_pending(ix, 2_000_000 + i, px, 3_000, now));
+        oot.confirm_rename(ix);
+        std::hint::black_box(oot.by_current(2, 2_000_000 + i));
+        ttl.remove(ix);
+        if i % 16 == 0 {
+            ttl.insert(ix, now);
+            while let Some(x) = ttl.pop_expired(now + 8_000_000) {
+                expired += (x == ix) as u64;
+            }
+        }
+        // S7: the place path's question, then the end and a late trade.
+        std::hint::black_box(ended.holds(2, 1_000 + i));
+        ended.record(2, 1_000 + i, now, 2_000, 2_000 * px as i128, i & 8 == 0);
+        if let Some(k) = ended.find(2, 1_000 + i) {
+            ended.add_filled(k, 1, px as i128);
+            ended.set_status_booked(k);
+            std::hint::black_box((ended.filled_1e6(k), ended.status_booked(k)));
+            // S1: a quantity booked without its trades, at the implied average.
+            std::hint::black_box(exec_binance::gateway::implied_px_1e6(2_002, px, ended.quote_1e12(k), 1));
+        }
+        oot.remove(ix);
+        // The clock.
+        std::hint::black_box(clock.sample(now, now + 40_000, 1_790_000_000_000 + i));
+        std::hint::black_box(clock.venue_ms(now));
+        // The dead-man's signed query, in its window.
+        let mut q = QueryWriter::new(&mut rest_win);
+        q.put(b"symbol=").put(b"BTCUSDT").put(b"&countdownTime=").uint(30_000);
+        q.put(b"&recvWindow=").uint(5_000).put(b"&timestamp=").uint(ts);
+        rendered += q.sign(&signer).expect("gate 93 sign");
+        std::hint::black_box(scan_countdown(COUNTDOWN).is_ok());
+        std::hint::black_box(scan_error(REST_REFUSED));
+        // The reconciliation, at its own cadence.
+        if i % 64 == 0 {
+            let n = scan_orders(OPEN, &mut orders).expect("gate 93 open orders");
+            std::hint::black_box(prefix.classify(orders[n - 1].cid.get(OPEN)));
+            let n = scan_trades(TRADES, &mut trades).expect("gate 93 trades");
+            std::hint::black_box(day_increasing_1e6(&mut trades[..n], 0, false, 0));
+            scan_answer(ACCOUNT, &mut a).expect("gate 93 account answer");
+            let snap = scan_um_account(ACCOUNT, a.result, &mut pos).expect("gate 93 account");
+            legs[0].venue_1e6 = pos[0].amt_1e6;
+            legs[0].booked_1e6 = snap.n_pos as i64 * 3_000;
+            let mut v = Verdict::default();
+            judge_positions(&mut legs, &mut v);
+            std::hint::black_box(v.reconciled());
+            std::hint::black_box(ended.ended_since(2, 1_000 + i, now));
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    assert!(rendered > 0 && expired == N.div_ceil(16), "{rendered} B rendered, {expired} expired");
+    assert!(oot.is_empty());
+    std::hint::black_box(&table);
+    assert_eq!(allocs, 0, "gate 93: the gateway's render and scan allocated {allocs} times ({bytes} B)");
+}
+
+/// **XMM XH4a gate 95 — the order-gateway kit is 0 B/op.** Built once
 /// (both rings, the stats block, the in-flight table, the deadline queue,
 /// the tx buffer — boot). Under the guard:
 ///
@@ -10507,7 +12789,7 @@ fn exec_gateway_kit_is_zero_alloc() {
             oid += 1;
             k += 1;
         }
-        let post = pending.claim(post_id, now).expect("gate 83 claim");
+        let post = pending.claim(post_id, now).expect("gate 95 claim");
         post.n = 0;
         let mut worked = false;
         while let Some(c) = gw.cmd.pop() {
@@ -10516,7 +12798,7 @@ fn exec_gateway_kit_is_zero_alloc() {
             stats.push_to_write.record(now.saturating_sub(c.t_ns) + 1);
             assert!(
                 timers.arm(now + 30 * MS, c.oid, TTL).is_ok(),
-                "gate 83: TTL queue full"
+                "gate 95: TTL queue full"
             );
             worked = true;
         }
@@ -10528,17 +12810,17 @@ fn exec_gateway_kit_is_zero_alloc() {
             body.len(),
             [1, 2, 3, 4],
         )
-        .expect("gate 83 frame");
+        .expect("gate 95 frame");
         acc = acc.wrapping_add(u64::from(tx[start]));
         stats.note_action_sent();
         tids[(post_id & 255) as usize] = Some(
             timers
                 .arm(now + 5_000 * MS, post_id, TIMEOUT)
-                .expect("gate 83 timeout"),
+                .expect("gate 95 timeout"),
         );
         if post_id > IN_FLIGHT {
             let old = post_id - IN_FLIGHT;
-            let sent = pending.sent_ns(old).expect("gate 83: in flight");
+            let sent = pending.sent_ns(old).expect("gate 95: in flight");
             if let Some(p) = pending.get_mut(old) {
                 p.n = p.n.min(39);
             }
@@ -10552,7 +12834,7 @@ fn exec_gateway_kit_is_zero_alloc() {
             assert!(pending.release(old));
             let t = tids[(old & 255) as usize]
                 .take()
-                .expect("gate 83: its timeout");
+                .expect("gate 95: its timeout");
             assert!(timers.cancel(t));
             stats.note_reply();
             stats.post_rtt.record(now - sent);
@@ -10608,17 +12890,17 @@ fn exec_gateway_kit_is_zero_alloc() {
         }
         s += 1;
     }
-    let a = mbb.active().expect("gate 83: a live connection");
+    let a = mbb.active().expect("gate 95: a live connection");
     mbb.on_down(a, t0);
     match mbb.poll(t0 + 10_000 * MS) {
         MbbAction::Dial(s) => mbb.on_live(s, t0 + 10_000 * MS),
-        other => panic!("gate 83: no re-dial ({other:?})"),
+        other => panic!("gate 95: no re-dial ({other:?})"),
     }
     mbb.request_replace();
-    let old = mbb.active().expect("gate 83: re-dialled");
+    let old = mbb.active().expect("gate 95: re-dialled");
     match mbb.poll(t0 + 11_000 * MS) {
         MbbAction::Dial(s) => mbb.on_live(s, t0 + 11_000 * MS),
-        other => panic!("gate 83: no replacement dial ({other:?})"),
+        other => panic!("gate 95: no replacement dial ({other:?})"),
     }
     let retire = mbb.poll(t0 + 16_000 * MS);
     if retire == MbbAction::Retire(old) {
@@ -10697,7 +12979,7 @@ fn exec_gateway_kit_is_zero_alloc() {
     );
 }
 
-/// **XMM gate 84a (XH4b) — the HL gateway's ENGINE half is 0 B/op.**
+/// **XMM gate 96a (XH4b) — the HL gateway's ENGINE half is 0 B/op.**
 /// XG-1: an arm's submit is one `HlCmd` ring write and its answers are
 /// `ExecEvent` ring reads — no syscall, no allocation, never blocking.
 /// 10 000 round trips through the production duplex (`hl_duplex`, the
@@ -10721,12 +13003,12 @@ fn hl_gateway_engine_half_is_zero_alloc() {
         assert!(eng.cmd.push(&cmd.at(i)));
         match gw.cmd.pop() {
             Some(c) => acc ^= c.ts_ns,
-            None => panic!("gate 84a: the command did not arrive"),
+            None => panic!("gate 96a: the command did not arrive"),
         }
         assert!(gw.evt.emit(&ExecEvent { aux: i, ..ev }));
         match eng.evt.pop() {
             Some(e) => acc ^= e.aux,
-            None => panic!("gate 84a: the event did not arrive"),
+            None => panic!("gate 96a: the event did not arrive"),
         }
         i += 1;
     }
@@ -10738,7 +13020,7 @@ fn hl_gateway_engine_half_is_zero_alloc() {
     );
 }
 
-/// **XMM gate 85 (XH4c) — the dead-man switch and the perp rules are
+/// **XMM gate 97 (XH4c) — the dead-man switch and the perp rules are
 /// 0 B/op.** Both run on the engine thread from XH4f, the switch on
 /// every arm tick: `DeadMan::poll/on_event/unsent` over a scripted 55 h
 /// (the boot clear, the probe, pushes every 5 s, clears, a full ring, a
@@ -10849,10 +13131,10 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
     );
 }
 
-/// **XMM gate 86 (XH4d) — the gateway arm is 0 B/op.** The engine's half
+/// **XMM gate 98 (XH4d) — the gateway arm is 0 B/op.** The engine's half
 /// of the Hyperliquid gateway arm (`HlGatewayArm`, an `OrderDispatch`)
 /// against a scripted gateway end in-process (no socket: the gateway's
-/// own turn, reads included, is gate 84b's). Every round: a place (bids
+/// own turn, reads included, is gate 96b's). Every round: a place (bids
 /// and asks), a modify of the last round's order on its own side, cancels,
 /// the cancel-all word every thousand; the script answers resting (the
 /// stream's `open` row first, every fourth), fills (the stream's `filled`
@@ -11131,8 +13413,8 @@ fn hl_gateway_arm_is_zero_alloc() {
             );
             *acc ^= ev.client_oid ^ u64::from(ev.kind);
         }
-        while let Some((cid, _)) = arm.try_next_retired() {
-            *acc ^= cid;
+        while let Some(r) = arm.try_next_retired() {
+            *acc ^= r.client_oid ^ u64::from(r.why);
         }
     }
 
@@ -11262,9 +13544,9 @@ fn hl_gateway_arm_is_zero_alloc() {
         let _ = arm.on_idle();
         answer(&mut gw, &mut s);
         spins += 1;
-        assert!(spins < 1_000_000, "gate 86: the arm never booted");
+        assert!(spins < 1_000_000, "gate 98: the arm never booted");
     }
-    assert!(!arm.boot_position(), "gate 86: the seeding sheet was flat");
+    assert!(!arm.boot_position(), "gate 98: the seeding sheet was flat");
     s.flat = false;
 
     // Warm-up (NOT measured): until every path has run.
@@ -11274,7 +13556,7 @@ fn hl_gateway_arm_is_zero_alloc() {
         r += 1;
         assert!(
             r < 2_000_000,
-            "gate 86: a path never ran: {:?}",
+            "gate 98: a path never ran: {:?}",
             paths(arm.counters(), &s)
         );
     }
@@ -11294,7 +13576,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     while k < after.len() {
         assert!(
             after[k] > before[k],
-            "gate 86: path {k} did not run in the window: {before:?} → {after:?}"
+            "gate 98: path {k} did not run in the window: {before:?} → {after:?}"
         );
         k += 1;
     }
@@ -11304,8 +13586,8 @@ fn hl_gateway_arm_is_zero_alloc() {
     );
 }
 
-/// Gate 84b's venue half: runs ONLY in the child process gate 84b spawns
-/// (it is `#[ignore]`d, and a no-op without `GATE84_VENUE_DIR`). A
+/// Gate 96b's venue half: runs ONLY in the child process gate 96b spawns
+/// (it is `#[ignore]`d, and a no-op without `GATE96_VENUE_DIR`). A
 /// scripted Hyperliquid (`exec_hyperliquid::testvenue`, which sends the
 /// empty `userFills` snapshot on subscribe) that answers the ALO post
 /// with one resting status and one post-only cross, then pushes one
@@ -11315,11 +13597,11 @@ fn hl_gateway_arm_is_zero_alloc() {
 /// open orders (one ours, one a stranger's) and its perp sheet (one
 /// position); it writes its port and certificate for the parent.
 #[test]
-#[ignore = "gate 84b's child process; never run on its own"]
-fn gate84_venue_helper() {
+#[ignore = "gate 96b's child process; never run on its own"]
+fn gate96_venue_helper() {
     use exec_hyperliquid::cloid::{encode, to_hex};
     use exec_hyperliquid::testvenue::{Answer, Venue};
-    let Some(dir) = std::env::var_os("GATE84_VENUE_DIR") else {
+    let Some(dir) = std::env::var_os("GATE96_VENUE_DIR") else {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
@@ -11366,14 +13648,14 @@ fn gate84_venue_helper() {
             r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":{k}}}}},{{"error":"Post only order would have immediately matched, bbo was 1@2. asset=1"}}]}}}}}}"#
         ))
     });
-    std::fs::write(dir.join("cert.der"), &v.cert_der).expect("gate 84 cert");
+    std::fs::write(dir.join("cert.der"), &v.cert_der).expect("gate 96 cert");
     // The port last: its presence says the rest is written.
-    std::fs::write(dir.join("port.tmp"), v.port.to_string()).expect("gate 84 port");
-    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 84 port");
+    std::fs::write(dir.join("port.tmp"), v.port.to_string()).expect("gate 96 port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 96 port");
     std::thread::sleep(std::time::Duration::from_secs(120));
 }
 
-/// **XMM gate 84b (XH4b) — the HL gateway's whole turn, over a real
+/// **XMM gate 96b (XH4b) — the HL gateway's whole turn, over a real
 /// rustls loopback, allocates only rustls' record buffers.**
 ///
 /// The REAL gateway (`HlGateway::turn`) against a scripted venue in a
@@ -11426,36 +13708,36 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     /// One sweep round: the read and the cancel sealed, their answers
     /// opened.
     const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
-    let dir = std::env::temp_dir().join(format!("mv-gate84-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("gate 84 dir");
-    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 84 exe"))
+    let dir = std::env::temp_dir().join(format!("mv-gate96-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 96 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
         .args([
-            "gate84_venue_helper",
+            "gate96_venue_helper",
             "--exact",
             "--ignored",
             "--test-threads=1",
         ])
-        .env("GATE84_VENUE_DIR", &dir)
+        .env("GATE96_VENUE_DIR", &dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("gate 84 child");
+        .expect("gate 96 child");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let port: u16 = loop {
         if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
-            break s.trim().parse().expect("gate 84 port");
+            break s.trim().parse().expect("gate 96 port");
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "gate 84: the venue never came up"
+            "gate 96: the venue never came up"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let der = std::fs::read(dir.join("cert.der")).expect("gate 84 cert");
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 96 cert");
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(der))
-        .expect("gate 84 anchor");
+        .expect("gate 96 anchor");
     let tls = std::sync::Arc::new(
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
@@ -11474,14 +13756,14 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         post_timeout_ns: 5_000_000_000,
         idle: Idle::new(0, 200_000),
     };
-    let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("gate 84 key");
-    let mut gw = HlGateway::new(cfg, gw_end, sk, coins).expect("gate 84 gateway");
+    let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("gate 96 key");
+    let mut gw = HlGateway::new(cfg, gw_end, sk, coins).expect("gate 96 gateway");
     let mut kinds = [0u64; 16];
     let t0 = std::time::Instant::now();
     while !gw.ws_live() || kinds[usize::from(EV_SNAPSHOT)] == 0 {
         assert!(
             t0.elapsed() < std::time::Duration::from_secs(10),
-            "gate 84: the socket never came up with its snapshot"
+            "gate 96: the socket never came up with its snapshot"
         );
         gw.turn();
         while let Some(e) = eng.evt.pop() {
@@ -11520,7 +13802,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             // records at once and its record queue reaches its
             // high-water mark here, in the warm-up.
             while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
-                assert!(t.elapsed() < std::time::Duration::from_secs(5), "gate 84: posts not written");
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "gate 96: posts not written");
                 gw.turn();
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -11528,7 +13810,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         while got < EVENTS_PER_ROUND {
             assert!(
                 t.elapsed() < std::time::Duration::from_secs(5),
-                "gate 84: a round stalled at {got}/{EVENTS_PER_ROUND} events"
+                "gate 96: a round stalled at {got}/{EVENTS_PER_ROUND} events"
             );
             gw.turn();
             while let Some(e) = eng.evt.pop() {
@@ -11566,7 +13848,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     while kinds[usize::from(EV_ACK)] == acks {
         assert!(
             t.elapsed() < std::time::Duration::from_secs(5),
-            "gate 84: the sweep never cancelled ours"
+            "gate 96: the sweep never cancelled ours"
         );
         gw.turn();
         while let Some(e) = eng.evt.pop() {

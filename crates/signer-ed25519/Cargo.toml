@@ -1,0 +1,22 @@
+[package]
+name         = "signer-ed25519"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "BX4 (O-BX5): the Binance arm's Ed25519 request signatures, from ring. The expanded key lives in its own mlock'd page, wiped by hand on drop; signatures are written as base64 (WS API) or percent-encoded base64 (REST) straight into the caller's final buffer. RFC 8032 known answers as the boot self-test."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-crypto = { workspace = true }
+ring        = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+proptest = { workspace = true }

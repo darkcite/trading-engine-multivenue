@@ -4,7 +4,7 @@
 //! The binary certifying its own signing chain, offline, before it
 //! talks to anyone.
 //!
-//! COPY-DOCTRINE: a boot self-test over the `VECTOR_ROWS` (36) embedded vectors, run once
+//! COPY-DOCTRINE: a boot self-test over the `VECTOR_ROWS` (38) embedded vectors, run once
 //! before the arm exists and never again; every copy in it is cold.
 //! `scripts/copy-audit.sh` skips this module on that line.
 //!
@@ -19,7 +19,7 @@
 //! sent was rejected with a valid signature over a digest the venue
 //! never computed. The network probe cannot see that, by construction.
 //!
-//! What can see it is the 36 known-answer vectors the official
+//! What can see it is the 38 known-answer vectors the official
 //! `hyperliquid-python-sdk` generated. They already guard CI through
 //! `tests/hl_vectors.rs` — but `cargo nextest` is not what runs before
 //! a restart. **So the vectors are embedded in the binary** and checked
@@ -29,7 +29,7 @@
 //!
 //! ## Two checks, and they cover different halves
 //!
-//! 1. **The chain, over all 36 rows.** For every vector, recompute the
+//! 1. **The chain, over all 38 rows.** For every vector, recompute the
 //!    connection id, the `Agent` EIP-712 digest and the 65-byte
 //!    signature from the SDK's *recorded* msgpack. This covers keccak,
 //!    the domain separator, the nonce/vault/expiry framing and
@@ -78,13 +78,14 @@ const TEST_KEY: [u8; 32] = [
 /// sends, not a round number that would hide an arithmetic bug.
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 
-/// The fixture's row count, EXACTLY. The header says "all 36", so the
-/// gate asserts 36 — a `>= 20` (the first cut) let five rows vanish
+/// The fixture's row count, EXACTLY. The header says "all 38", so the
+/// gate asserts 38 — a `>= 20` (the first cut) let five rows vanish
 /// with both gates still green, which is a claim the code did not
 /// test. Regenerating the fixture with more vectors moves this number
 /// on purpose (S7-L1 moved it from 25 for the two request-weight rows;
-/// XH4c from 27 for the five control rows and the four 39-item rows).
-pub const VECTOR_ROWS: u32 = 36;
+/// XH4c by nine for the five control rows and the four 39-item rows;
+/// HC10 by two for the HIP-3 builder-perp rows).
+pub const VECTOR_ROWS: u32 = 38;
 
 /// Why the binary failed to certify itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,7 +212,7 @@ pub fn run() -> Result<SelfTestReport, SelfTestErr> {
     }
 
     if rows != VECTOR_ROWS {
-        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 36 vectors"));
+        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 38 vectors"));
     }
 
     let encoders = check_encoders()?;

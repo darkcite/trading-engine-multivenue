@@ -92,7 +92,7 @@
 //! one buffer per TLS record it seals or opens — more for an inbound
 //! burst over 4 KiB (its receive window grows and shrinks), and once per
 //! connection when its decrypted-record queue first grows to its
-//! high-water mark; gate 84b pins the residue exactly — and a dial or DNS
+//! high-water mark; gate 96b pins the residue exactly — and a dial or DNS
 //! re-resolve allocates.
 
 use std::net::{SocketAddr, ToSocketAddrs};

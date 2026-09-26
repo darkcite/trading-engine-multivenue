@@ -355,6 +355,24 @@ pub fn merge_rows(seed: Option<&LongRows>, state: Option<&LongRows>) -> LongRows
     out
 }
 
+/// HAR H3.4/H3.7: render series `name`'s state file into `out` (cleared
+/// first) — the comment header, then [`LongVolEngine::write_rows`]. The one
+/// renderer of `state-<NAME>.tsv`: the state writer thread's and the
+/// shutdown write's. Cold path: `out` grows to the rows once, then is
+/// reused.
+pub fn render_state_file(name: &str, e: &LongVolEngine, out: &mut String) {
+    use core::fmt::Write as _;
+    out.clear();
+    // A `String` sink cannot fail.
+    let _ = writeln!(
+        out,
+        "# har-state.tsv v{ROWS_VERSION} (HAR H3) -- {name}: the engine's own long-tenor state,\n\
+         # written at each of its UTC day closes and at shutdown; merged at boot with\n\
+         # seed-{name}.tsv (core_vol::merge_rows). Never tracked by git."
+    );
+    let _ = e.write_rows(out);
+}
+
 impl LongVolEngine {
     /// Write the engine's restorable state as rows (module doc) into `w`:
     /// `V`, every resident day, the open day, the arms still pending (made

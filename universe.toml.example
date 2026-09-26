@@ -37,6 +37,17 @@ usdm = []
 # `@markPrice` connection (mark/index/funding events; dated contracts
 # carry no funding by design).
 usdm_dated = []
+# BX2 (O-BX3): COIN-M (coin-margined, inverse) futures on
+# BINANCE_COINM_WS_HOST (default dstream.binance.com) — the usdm path
+# law: `/ws/<sym>@bookTicker` + `/market/ws/<sym>@markPrice`, two sockets
+# per instrument. Perpetuals are `<coin>usd_perp` (ordinal base 3072),
+# delivery contracts `<coin>usd_<yymmdd>` (base 3584); descriptors
+# `binance-coinm:<sym>`. Discovery reads GET /dapi/v1/exchangeInfo on
+# BINANCE_COINM_REST_HOST. bookTicker quantities are CONTRACTS (100 USD on
+# BTC, 10 USD on the others). `--binance-symbol` replaces `spot` only;
+# these lists stay.
+coinm = []         # e.g. ["btcusd_perp", "ethusd_perp"]
+coinm_dated = []   # e.g. ["btcusd_261225"]
 # M2.4 capped options chain — same law as [deribit]/[okx]; underlyings
 # are eapi names (e.g. "BTCUSDT"); discovered instruments join the
 # eapi combined stream (BBO ticks + OptSummary records; no OI on this

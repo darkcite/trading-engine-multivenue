@@ -463,6 +463,24 @@ pub trait StrategyCounters {
         *out = XmmCounters::default();
     }
 
+    /// HC11: the slot-7 member's counters (`engine_hcv_*`, `/state`
+    /// `hcv`). Zeroes for every strategy but the set carrying a
+    /// configured hcv member.
+    #[inline]
+    fn hcv_counters(&self, out: &mut HcvCounters) {
+        *out = HcvCounters::default();
+    }
+
+    /// HC11b: render the slot-7 member's book into `out` (cleared first) —
+    /// the shutdown's forced write, once the state writer is joined (the
+    /// writer thread renders every other one). `false` = no configured hcv
+    /// member, and nothing is written. Cold path: it boxes its own snapshot.
+    #[inline]
+    fn render_hcv_state(&self, out: &mut String) -> bool {
+        let _ = out;
+        false
+    }
+
     /// XMM XH3: copy the per-perp view into `out` (`min(out.len())`
     /// rows), returning how many perps are CONFIGURED. Cold path (the
     /// 1 s publish); never allocates.
@@ -1308,6 +1326,71 @@ pub struct XmmCounters {
 }
 const _: () = assert!(core::mem::size_of::<XmmCounters>() == 17 * 8);
 
+/// HC11: the slot-7 HCV member's counters and gauges (`engine_hcv_*`,
+/// `/state` `hcv`), written by the member crate. POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HcvCounters {
+    /// Instruments judged (a fresh quote inside the policy).
+    pub judged: u64,
+    /// Option sells sent.
+    pub sells: u64,
+    /// Option buys sent.
+    pub buys: u64,
+    /// Option fills received.
+    pub option_fills: u64,
+    /// Hedge IoCs sent.
+    pub hedges: u64,
+    /// Hedge fills received.
+    pub hedge_fills: u64,
+    /// Final-window unwind slices worked.
+    pub unwind_slices: u64,
+    /// Expiries booked at the replicated settlement.
+    pub settlements: u64,
+    /// …of which the window was too thin and the last oracle price stood.
+    pub settle_fallbacks: u64,
+    /// Skipped: an event inside the option's life, or no current calendar.
+    pub skip_event: u64,
+    /// Skipped: a stale provider quote, oracle or hedge touch.
+    pub skip_stale: u64,
+    /// Skipped: no HAR forecast for the tenor.
+    pub skip_forecast: u64,
+    /// Skipped: a cap (vega, premium, tail) left no size.
+    pub skip_caps: u64,
+    /// Skipped: the kill switch or the day's stop.
+    pub skip_stopped: u64,
+    /// Submits the ctx refused.
+    pub ctx_refused: u64,
+    /// Calendars taken from the reader.
+    pub calendars: u64,
+    /// HAR views taken from the set.
+    pub har_updates: u64,
+    /// HC11b: held options the boot restored from the state file.
+    pub restored: u64,
+    /// Gauge: options held (non-zero positions).
+    pub positions: i64,
+    /// Gauge: Σ |net vega| over underlyings, USD per vol point ×1e6.
+    pub vega_abs_usd_1e6: i64,
+    /// Gauge: the book's marked P&L — its cash plus every position at its
+    /// mark — since the book began (HC11b: it persists across restarts),
+    /// USD ×1e6.
+    pub pnl_usd_1e6: i64,
+    /// Gauge: the day's marked P&L, USD ×1e6.
+    pub day_pnl_usd_1e6: i64,
+    /// HC11b gauge: options held outside this boot's chain — carried by
+    /// their terms (hedged and marked at σ̂, settled at expiry), never
+    /// traded.
+    pub orphans: i64,
+    /// HC11b gauge: 1 while the book's file is behind the book — the writer
+    /// has not taken a moved book for 30 s — and new risk is stopped.
+    pub book_stale: i64,
+    /// HC11b gauge: underlyings the book holds (an option or a hedge) with
+    /// no oracle yet this process — while it is non-zero the book's mark is
+    /// unknown and new risk is stopped.
+    pub marks_unknown: i64,
+}
+const _: () = assert!(core::mem::size_of::<HcvCounters>() == 25 * 8);
+
 /// XMM XH3: one quoted perp's row, read at one instant — the follower's
 /// touch, our two quotes on it, what the member holds and how old each
 /// feed is (the `/state` `xmm.perps` array).
@@ -1692,6 +1775,59 @@ impl HarSeriesView {
 const _: () = assert!(core::mem::size_of::<HarSeriesView>() == 176);
 const _: () = assert!(core::mem::size_of::<HarCounters>() == 64);
 const _: () = assert!(HAR_VIEW_TENORS <= 16, "fitted / fit_beats_raw are u16 masks");
+
+/// A UTC day, ms — `core_vol::DAY_MS` (a const assert in `strategy-set`
+/// pins the two together).
+pub const HAR_DAY_MS: u64 = 86_400_000;
+
+/// HAR H3.7: the `engine_har_*` gauges, as one law the cli mirrors and the
+/// alloc gate measures. POD.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarGauges {
+    /// `engine_har_series_configured`.
+    pub configured: i64,
+    /// `engine_har_series_warm`: series whose fold forecasts.
+    pub warm: i64,
+    /// `engine_har_day_age_max_s`: seconds since the stalest series'
+    /// newest closed day ENDED (`-1` = no series has closed a day).
+    pub day_age_max_s: i64,
+    /// `engine_har_day_close_ns_max`: the costliest day close since boot.
+    pub day_close_ns_max: i64,
+}
+
+/// HAR H3.7: the gauges from the set's rows — `configured` series, the
+/// first `min(configured, rows.len())` rows read — and its counters, at
+/// `wall_ms`. Never allocates.
+#[must_use]
+pub fn har_gauges(
+    rows: &[HarSeriesView],
+    configured: u32,
+    counters: &HarCounters,
+    wall_ms: u64,
+) -> HarGauges {
+    let m = (configured as usize).min(rows.len());
+    let mut warm = 0i64;
+    let mut age_max: i64 = -1;
+    let mut i = 0usize;
+    while i < m {
+        let r = &rows[i];
+        warm += i64::from(r.warm);
+        if r.newest_day_ms != 0 {
+            let closed_ms = r.newest_day_ms.saturating_add(HAR_DAY_MS);
+            let age = (wall_ms.saturating_sub(closed_ms) / 1_000).min(i64::MAX as u64) as i64;
+            if age > age_max {
+                age_max = age;
+            }
+        }
+        i += 1;
+    }
+    HarGauges {
+        configured: i64::from(configured),
+        warm,
+        day_age_max_s: age_max,
+        day_close_ns_max: counters.day_close_ns_max.min(i64::MAX as u64) as i64,
+    }
+}
 
 // ---------------------------------------------------------------
 // risk — the venue-aware notional caps (`docs/risk-policy.md`)
@@ -2425,6 +2561,17 @@ mod tests {
         let mut rows = [XmmPerpView::default(); 2];
         assert_eq!(s.xmm_perps_view(&mut rows), 0);
         assert_eq!(rows, [XmmPerpView::default(); 2]);
+        // HC11b (slot 7): zero counters, and no book to write — the buffer
+        // is left untouched.
+        let mut h = HcvCounters {
+            restored: 3,
+            ..HcvCounters::default()
+        };
+        s.hcv_counters(&mut h);
+        assert_eq!(h, HcvCounters::default());
+        let mut text = String::from("kept");
+        assert!(!s.render_hcv_state(&mut text));
+        assert_eq!(text, "kept");
     }
 
     #[test]
@@ -2531,5 +2678,36 @@ mod tests {
         gate.record_emit(0, 42);
         assert_eq!(gate.last_emit_ns(0), 42);
         assert_eq!(gate.last_emit_ns(99), 0, "OOB returns 0");
+    }
+
+    /// HAR H3.7: the gauge law — warm series counted, the STALEST newest
+    /// closed day's age (a day ends at the next midnight), `-1` before any
+    /// close, rows past `configured` ignored, the counter saturated.
+    #[test]
+    fn har_gauges_read_the_stalest_day_and_only_the_configured_rows() {
+        let day = HAR_DAY_MS;
+        let mut rows = [HarSeriesView::default(); 3];
+        rows[0].warm = 1;
+        rows[0].newest_day_ms = 10 * day;
+        rows[1].newest_day_ms = 8 * day;
+        rows[2].warm = 1;
+        rows[2].newest_day_ms = day; // past `configured`: never read
+        let c = HarCounters {
+            day_close_ns_max: u64::MAX,
+            ..HarCounters::default()
+        };
+        let now = 11 * day + 5_000;
+        let g = har_gauges(&rows, 2, &c, now);
+        assert_eq!((g.configured, g.warm), (2, 1));
+        assert_eq!(g.day_age_max_s, (2 * day + 5_000) as i64 / 1_000, "series 1: day 8 ended at day 9");
+        assert_eq!(g.day_close_ns_max, i64::MAX, "saturated, never negative");
+
+        // Nothing closed yet: the age is -1; a clock behind the close is 0.
+        let fresh = [HarSeriesView::default(); 2];
+        assert_eq!(har_gauges(&fresh, 2, &HarCounters::default(), now).day_age_max_s, -1);
+        assert_eq!(har_gauges(&rows, 1, &c, 0).day_age_max_s, 0);
+        // More series configured than rows handed: only the rows count.
+        assert_eq!(har_gauges(&rows[..1], 12, &c, now).configured, 12);
+        assert_eq!(har_gauges(&rows[..1], 12, &c, now).warm, 1);
     }
 }

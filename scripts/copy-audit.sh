@@ -10,10 +10,15 @@
 # few lines), the way an `unsafe` block carries `// SAFETY:`.
 #
 # This script lists every byte-copy verb in the given crate directories
-# (default: the exec lane, core-net, core-ring, all nine ingress crates
+# (default: the exec lane incl. the Binance signer (BX4) and arm (BX6),
+# core-net, core-ring, all nine ingress crates
 # (since the ZC pass of 2026-09-24) plus ingress-hypercall (born inside
-# the gate, HC3) and the HYPARB lane's AMM math and member; XMM's member and, since
-# XH4a, the order-gateway kit `crates/exec-gateway`) that has NO `COPY:` marker within the eight preceding lines,
+# the gate, HC3), the HYPARB lane's AMM math and member, XMM's member and,
+# since XH4a, the order-gateway kit `crates/exec-gateway`, and the threads
+# the engine hands work to — the EVM shadow, the HYPARB live arm and the
+# state writers (HAR H3.7; HC11b's generic `persist` thread and the
+# slot-7 settlement law it persists, `core-settle`)) that has NO `COPY:`
+# marker within the eight preceding lines,
 # and compares the list against the committed baseline
 # `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
@@ -71,15 +76,20 @@ if [ "${1:-}" = "--update-baseline" ]; then
 fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
-           crates/signer-evm crates/exec-hyperevm crates/clob-dispatcher crates/core-net \
+           crates/signer-evm crates/signer-ed25519 crates/exec-binance crates/exec-hyperevm \
+           crates/clob-dispatcher crates/cli/src/bn_live.rs \
+           crates/core-net \
            crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \
            crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
-           crates/ingress-hypercall \
-           crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/core-fill crates/engine \
+           crates/ingress-hypercall crates/exec-hypercall \
+           crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/strategy-hcv \
+           crates/core-fill crates/engine \
            crates/exec-gateway \
            crates/cli/src/evm_shadow.rs \
-           crates/cli/src/hyparb_live.rs
+           crates/cli/src/hyparb_live.rs \
+           crates/cli/src/har_writer.rs \
+           crates/cli/src/persist.rs crates/core-settle
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its

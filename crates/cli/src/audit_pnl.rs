@@ -158,6 +158,8 @@ fn strategy_label(id: u8) -> &'static str {
         4 => "ai-exec",
         5 => "vm",
         6 => "xmm",
+        // HC11 (2026-09-26): slot 7 was reserved until the hcv member.
+        7 => "hcv",
         0xFF => "unattributed",
         _ => "unknown",
     }

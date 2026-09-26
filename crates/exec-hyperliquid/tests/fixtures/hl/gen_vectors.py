@@ -184,6 +184,15 @@ case(
     True,
 )
 
+# --- HIP-3 builder-dex perps (HC10): 100_000 + dex_idx*10_000 + index -
+# The shape of the `xyz` hedge leg (dex_idx 1 measured 2026-09-25); the
+# live index comes from the dex's own meta at boot. Prices obey the perp
+# law — five significant figures, 6 - szDecimals decimals (szDecimals 3).
+HIP3_XYZ_A = 100_000 + 1 * 10_000 + 2
+HIP3_XYZ_B = 100_000 + 1 * 10_000 + 9
+case("hip3_ioc_buy", order_action([wire(HIP3_XYZ_A, True, 187.12, 0.012, False, "Ioc", CLOID_B)]), 28, True)
+case("hip3_alo_sell_reduce", order_action([wire(HIP3_XYZ_B, False, 18.712, 1.5, True, "Alo")]), 29, True)
+
 # --- request weight (S7-L1): the address-budget top-up ----------------
 # The SDK has no helper for this action, so the dict IS the reference:
 # the documented key order (`type`, `weight`; `destination` is skipped

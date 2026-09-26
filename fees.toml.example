@@ -88,7 +88,9 @@
 #
 # The CLASS of a sym is its descriptor's (core-config `instrument_class`, mirrored
 # in `claude_worker.instrument_class`, one shared fixture): `binance:` spot,
-# `binance-usdm:` perp (`_yymmdd` dated), `binance-opt:` option, `okx:` by instId
+# `binance-usdm:` perp (`_yymmdd` dated), `binance-coinm:` perp (`_perp`) or
+# dated (`_yymmdd`) — BX2: COIN-M shares the bn perp/dated rows below until a
+# measured COIN-M schedule differs (plan BX-14) —, `binance-opt:` option, `okx:` by instId
 # shape, `deribit:` by name, `hyperliquid:` perp, `bybit:` spot, `bybit-linear:`
 # perp (`-DDMMMYY` dated), `mexc:` spot (xStocks included), `mexc-perp:` perp
 # (always — MEXC lists no dated futures), a bare token id prediction. A sym whose class the law

@@ -102,3 +102,16 @@ uv run python -m claude_worker.depth_digest ||
 # newest page per instrument, best-effort.
 uv run python -m claude_worker.funding ||
   echo "candles-cycle: funding failed (non-fatal; next hour retries)" >&2
+# HC6 go-live (ruling O-HC2; scheduled 2026-09-26, O-HC29): the Hypercall
+# research-store puller rides beside the funding lane — public REST only:
+# the venue's trades by its own cursor, the options summaries of
+# `[hypercall] underlyings`, and the settlement payouts of the wallets in
+# CLAUDE_WORKER_HC_WALLETS (.env; the lane skips while it is unset — the
+# wallets stay out of git by the research law). Guarded on the section,
+# like the lanes above on their artifacts: no Hypercall, no noise.
+if grep -q '^\[hypercall\]' "$HOME/multivenue/universe.toml" 2>/dev/null; then
+  uv run python -m claude_worker.hypercall_history \
+    --universe "$HOME/multivenue/universe.toml" \
+    --db "$HOME/multivenue/worker/candles.db" ||
+    echo "candles-cycle: hypercall_history failed (non-fatal; next hour retries)" >&2
+fi

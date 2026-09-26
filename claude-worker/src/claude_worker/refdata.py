@@ -51,6 +51,11 @@ added Hyperliquid):
 - ``mexc-perp`` (MX7): ONE ``GET /api/v1/contract/ticker?symbol=S`` on
   the futures host → ``amount24`` → ``vol24h_quote`` (quote units) and
   ``holdVol`` → ``oi`` (venue CONTRACTS).
+- ``binance-coinm`` (BX2): SKIPPED, one report line per cycle — a
+  recorded extension, not v1. dapi's ``ticker/24hr`` answers an ARRAY
+  carrying ``volume`` (contracts) and ``baseVolume`` (coin) but no
+  ``quoteVolume`` (measured 2026-09-26), so a ``vol24h_quote`` needs the
+  contract face the engine's discovery holds and this lane does not.
 
 Values are stored in RAW VENUE UNITS — the consumer resolves
 semantics via ``(venue, descriptor, kind)`` exactly like the candle
@@ -93,6 +98,10 @@ MS_1H: int = 3_600_000
 
 KIND_VOL24H: str = "vol24h_quote"
 KIND_OI: str = "oi"
+
+#: Candle lanes this module has no fetcher for yet (module docs) —
+#: reported and skipped, never a crash.
+SKIPPED_LANES: frozenset[str] = frozenset(("binance-coinm",))
 
 _SCHEMA: str = """
 CREATE TABLE IF NOT EXISTS refdata (
@@ -528,6 +537,9 @@ def run_cycle(
         )
     for lane in lanes:
         budget = budgets[lane.venue]
+        if lane.name in SKIPPED_LANES:
+            report(f"refdata: {lane.name}: targets={len(lane.targets)} skipped (no v1 lane)")
+            continue
         if lane.name == "hyperliquid":
             # WS8: one body for the whole lane.
             stats = _fetch_hl_lane(conn, http, lane, now_ms, budget)

@@ -48,7 +48,7 @@
 //! the inline dispatcher's QueueFull bucket.
 
 use core_ring::{Consumer, Producer, Ring};
-use core_types::{Fill, Order};
+use core_types::{CancelReq, Fill, ModifyReq, Order};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -116,6 +116,19 @@ impl OrderDispatch for QueuedDispatcher {
         } else {
             Err(DispatchError::QueueFull)
         }
+    }
+
+    /// The ring carries orders only: a lifecycle verb cannot reach the
+    /// worker, so it is refused here, in writing (BX3, O-BX19).
+    #[inline]
+    fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
+    }
+
+    /// As [`Self::cancel`].
+    #[inline]
+    fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
     }
 
     /// Fills flow through a separate path (engine fill ring); the

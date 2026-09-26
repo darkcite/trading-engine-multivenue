@@ -133,6 +133,26 @@ def test_cex_sections_seed_descriptor_names(tmp_path: pathlib.Path) -> None:
     assert "hyperliquid:BTC" not in props
 
 
+def test_coinm_sections_seed_from_3072_and_3584(tmp_path: pathlib.Path) -> None:
+    """BX2: `[binance] coinm[j]` -> ordinal BN_COINM_ORDINAL_BASE + j + 1,
+    `coinm_dated[j]` -> BN_COINM_DATED_ORDINAL_BASE + j + 1, one
+    `binance-coinm:` namespace (mirrors core-config)."""
+    text = '[binance]\ncoinm = ["btcusd_perp", "ethusd_perp"]\ncoinm_dated = ["btcusd_261225"]\n'
+    p = _write(tmp_path, text)
+    bn = claude_worker.frames.VENUE_BINANCE
+    universe = {
+        (bn << 24) | 3073: bn,
+        (bn << 24) | 3074: bn,
+        (bn << 24) | 3585: bn,
+    }
+    props, _pairs, _lines = claude_worker.fetchers.universe_file_proposals(p, universe)
+    assert props == {
+        "binance-coinm:btcusd_perp": (bn << 24) | 3073,
+        "binance-coinm:ethusd_perp": (bn << 24) | 3074,
+        "binance-coinm:btcusd_261225": (bn << 24) | 3585,
+    }
+
+
 def test_mexc_sections_seed_spot_from_1_and_perp_from_512(tmp_path: pathlib.Path) -> None:
     """MX7: `[mexc] spot[i]` -> venue 7 ordinal i+1, `perp[j]` -> ordinal
     MEXC_PERP_ORDINAL_BASE + j + 1 (the Binance spot/usdm split)."""

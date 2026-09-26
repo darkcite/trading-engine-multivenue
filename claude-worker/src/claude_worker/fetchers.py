@@ -118,6 +118,11 @@ BN_USDM_ORDINAL_BASE: int = 512
 # (mirrors core-config BN_DATED_ORDINAL_BASE), shared `binance-usdm:`
 # descriptor namespace.
 BN_DATED_ORDINAL_BASE: int = 2048
+# BX2: `[binance] coinm` / `coinm_dated` COIN-M blocks (mirror core-config
+# BN_COINM_ORDINAL_BASE / BN_COINM_DATED_ORDINAL_BASE), one
+# `binance-coinm:` descriptor namespace for both.
+BN_COINM_ORDINAL_BASE: int = 3072
+BN_COINM_DATED_ORDINAL_BASE: int = 3584
 # WS9: `[bybit] linear` block (mirrors core-config
 # BYBIT_LINEAR_ORDINAL_BASE; spot ordinals are file-order from 1).
 BYBIT_LINEAR_ORDINAL_BASE: int = 512
@@ -869,6 +874,22 @@ def universe_file_proposals(
         claude_worker.frames.VENUE_BINANCE,
         "binance-usdm:",
         BN_DATED_ORDINAL_BASE,
+        None,
+    )
+    _propose_list(
+        "binance",
+        "coinm",
+        claude_worker.frames.VENUE_BINANCE,
+        "binance-coinm:",
+        BN_COINM_ORDINAL_BASE,
+        None,
+    )
+    _propose_list(
+        "binance",
+        "coinm_dated",
+        claude_worker.frames.VENUE_BINANCE,
+        "binance-coinm:",
+        BN_COINM_DATED_ORDINAL_BASE,
         None,
     )
     _propose_list("okx", "instruments", claude_worker.frames.VENUE_OKX, "okx:", 0, None)

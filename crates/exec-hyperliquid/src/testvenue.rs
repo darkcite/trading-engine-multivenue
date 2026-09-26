@@ -2,7 +2,7 @@
 // Copyright 2026 Anton (darkcite)
 
 //! A scripted Hyperliquid over a real rustls server on `127.0.0.1` — the
-//! loopback the order gateway's tests and allocation gate 84 run against
+//! loopback the order gateway's tests and allocation gate 96 run against
 //! (XH4b). Feature `testvenue` only; never in a production build.
 //!
 //! It upgrades `/ws`, acknowledges the subscribes, answers the

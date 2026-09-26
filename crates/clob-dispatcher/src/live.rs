@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use core_net::{read_response, HttpResult, TlsTransport, Transport};
 use core_time::now_ns;
-use core_types::{Fill, Order, SymbolId};
+use core_types::{CancelReq, Fill, ModifyReq, Order, SymbolId};
 use mio::{Events, Poll, Token};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
@@ -549,6 +549,17 @@ impl LiveDispatcher {
 impl OrderDispatch for LiveDispatcher {
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
         self.submit_inline(order)
+    }
+
+    /// The legacy Polymarket path places only: no cancel endpoint is
+    /// wired, so the verb is refused, in writing (BX3, O-BX19).
+    fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
+    }
+
+    /// As [`Self::cancel`].
+    fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
+        Err(DispatchError::Unsupported)
     }
 
     fn try_next_fill(&mut self) -> Option<Fill> {

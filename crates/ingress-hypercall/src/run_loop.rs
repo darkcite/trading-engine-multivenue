@@ -987,6 +987,10 @@ pub struct HcConn<'a, T: Transport> {
     backoff: core_net::Backoff,
     next_attempt_ns: NsTs,
     session_start_ns: NsTs,
+    /// The venue's `ticks_total` when this session began (O-HC16: the
+    /// healthy-session law's `ticks_before`; one connection, so the
+    /// venue's count is the session's).
+    ticks_at_start: u64,
     last_interest: Option<mio::Interest>,
 }
 
@@ -1002,17 +1006,27 @@ impl<'a, T: Transport> HcConn<'a, T> {
             backoff,
             next_attempt_ns: 0,
             session_start_ns: 0,
+            ticks_at_start: 0,
             last_interest: None,
         }
     }
 
-    /// Tear down and schedule the next dial; a session that confirmed
-    /// anything resets the backoff. A venue close with a slow-consumer
-    /// cause asks the poller for a snapshot (the gap is not replayed).
-    fn kill(&mut self, now: NsTs, status: &IngressStatus, counters: &HcCounters) {
+    /// Tear down and schedule the next dial. The backoff resets only by
+    /// the healthy-session law (O-HC16, `core_net::should_reset_backoff`):
+    /// the session moved market data and lived 30 s, or it ended in the
+    /// keepalive's 60 s-silence trip (`quiet_trip`, rate-limited by that
+    /// silence) — a session that confirmed its subscribe and died young
+    /// keeps escalating. A venue close with a slow-consumer cause asks the
+    /// poller for a snapshot (the gap is not replayed).
+    fn kill(&mut self, now: NsTs, status: &IngressStatus, counters: &HcCounters, quiet_trip: bool) {
         if self.transport.take().is_some() {
             status.inc_reconnects();
-            if self.drv.sub_count() > 0 {
+            if core_net::should_reset_backoff(
+                status.ticks_total(),
+                self.ticks_at_start,
+                now.saturating_sub(self.session_start_ns),
+                quiet_trip,
+            ) {
                 self.backoff.reset();
             }
             if matches!(self.drv.last_close, Some(c) if c != HcCloseCause::Other) {
@@ -1049,12 +1063,13 @@ pub fn run<T: Transport, C: Capture>(
             match connect() {
                 Some(mut t) => {
                     if t.register(poll.registry(), TOKEN).is_err() {
-                        conn.kill(now, status, counters);
+                        conn.kill(now, status, counters, false);
                     } else {
                         conn.last_interest = Some(t.interest());
                         conn.drv.reset_for_reconnect(now);
                         conn.keepalive.reset();
                         conn.session_start_ns = now;
+                        conn.ticks_at_start = status.ticks_total();
                         // COPY: the new transport (a `TlsTransport`, rustls'
                         // ClientConnection held inline, ~1 KB) moves from
                         // `connect` into its slot — once per reconnect, beside
@@ -1064,7 +1079,7 @@ pub fn run<T: Transport, C: Capture>(
                         conn.transport = Some(t);
                     }
                 }
-                None => conn.kill(now, status, counters),
+                None => conn.kill(now, status, counters, false),
             }
         }
 
@@ -1086,7 +1101,7 @@ pub fn run<T: Transport, C: Capture>(
             };
             match t.pump(ev) {
                 Ok(s) => note_transport_ready(&mut conn.drv, s),
-                Err(_e) => conn.kill(now_ns(), status, counters),
+                Err(_e) => conn.kill(now_ns(), status, counters, false),
             }
         }
 
@@ -1101,7 +1116,7 @@ pub fn run<T: Transport, C: Capture>(
             match drive_until_idle(t, &mut conn.drv, conn.host, lanes, status, counters, capture) {
                 Drained::Idle => {}
                 Drained::Capped => repoll_now = true,
-                Drained::Closed | Drained::Failed(_) => conn.kill(now_ns(), status, counters),
+                Drained::Closed | Drained::Failed(_) => conn.kill(now_ns(), status, counters, false),
             }
         }
 
@@ -1123,7 +1138,7 @@ pub fn run<T: Transport, C: Capture>(
                 core_metrics::ERR_SITE_ESTABLISH,
                 core_metrics::io_kind_code(io::ErrorKind::TimedOut),
             );
-            conn.kill(flush_now, status, counters);
+            conn.kill(flush_now, status, counters, false);
         }
 
         // 6. Client heartbeat: a ClockSync every interval from the last
@@ -1141,10 +1156,11 @@ pub fn run<T: Transport, C: Capture>(
                         let ok = queue_clock_sync(&mut conn.drv, now).is_ok();
                         conn.keepalive.mark_ping_sent(now);
                         if !ok || flush_tx(t, &mut conn.drv).is_err() {
-                            conn.kill(now, status, counters);
+                            conn.kill(now, status, counters, false);
                         }
                     }
-                    core_net::KeepaliveAction::Reconnect => conn.kill(now, status, counters),
+                    // The venue went quiet for 60 s: the law's quiet trip.
+                    core_net::KeepaliveAction::Reconnect => conn.kill(now, status, counters, true),
                     core_net::KeepaliveAction::None => {}
                 }
             }
@@ -1155,7 +1171,7 @@ pub fn run<T: Transport, C: Capture>(
             let cur = t.interest();
             if conn.last_interest != Some(cur) {
                 if t.reregister(poll.registry(), TOKEN).is_err() {
-                    conn.kill(now_ns(), status, counters);
+                    conn.kill(now_ns(), status, counters, false);
                 } else {
                     conn.last_interest = Some(cur);
                 }

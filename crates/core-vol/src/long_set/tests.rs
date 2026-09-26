@@ -340,3 +340,37 @@ fn the_profile_law_is_the_ratio_of_weekday_means() {
     let empty = LongVolEngine::new();
     assert_eq!(empty.weekday_profile_1e6(), ([0; 7], [0; 7]));
 }
+
+/// HAR H3.7: a series' snapshot is its engine copied WHOLE — the copy
+/// renders the same state file byte for byte, reads the same everywhere,
+/// and keeps nothing of what `dst` held — and carries the epoch it was
+/// taken at; a series past the configured ones leaves `dst` untouched.
+#[test]
+fn a_snapshot_is_the_engine_copied_whole_with_its_epoch() {
+    let mut set = set_of(2);
+    run_days(&mut set, 2, 33, 3);
+    let e = set.engine(1).unwrap();
+    assert!(e.is_warm(), "the copy must be tested on a warm engine");
+
+    let mut snap = Box::new(LongStateSnap::new());
+    // Poison the destination: nothing of it may survive the copy.
+    for m in 0..(3 * 1440u64) {
+        snap.engine.on_minute_close_at(mid(7, m), WALL0_MS + (m + 900 * 1440) * 60_000);
+    }
+    snap.epoch = u64::MAX;
+    assert!(set.snapshot_series(1, &mut snap));
+    assert_eq!(snap.epoch, set.series_epoch(1));
+    assert!(snap.epoch > 0, "day closes bumped it");
+    assert_eq!(fingerprint(&snap.engine), fingerprint(e));
+
+    let (mut a, mut b) = (String::new(), String::new());
+    crate::render_state_file("MU", e, &mut a);
+    crate::render_state_file("MU", &snap.engine, &mut b);
+    assert_eq!(a, b, "the copy renders the same state file");
+    assert!(a.starts_with("# har-state.tsv v"), "the header leads");
+    assert!(a.contains("\nV\t"), "then the rows");
+
+    let before = snap.epoch;
+    assert!(!set.snapshot_series(2, &mut snap), "past the configured series");
+    assert_eq!(snap.epoch, before, "untouched");
+}

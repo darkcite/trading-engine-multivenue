@@ -14,6 +14,9 @@ cargo-fuzz = true
 
 [dependencies]
 exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
+# bn_cid / bn_wsapi_frame / bn_user_event / bn_rest_body / bn_account /
+# bn_mode: the BX6 arm's scanners and boot assertions.
+exec-binance     = { path = "../crates/exec-binance" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
 
@@ -51,6 +54,8 @@ core-fill          = { path = "../crates/core-fill" }
 ingress-hypercall  = { path = "../crates/ingress-hypercall" }
 # evm_exec_response: the HYPARB H7c write-path response scanners.
 exec-hyperevm      = { path = "../crates/exec-hyperevm" }
+# hypercall_{response,userws}: the HC9 order arm's answer and event scanners.
+exec-hypercall     = { path = "../crates/exec-hypercall" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -403,6 +408,62 @@ doc    = false
 bench  = false
 
 [[bin]]
+name   = "https_answer"
+path   = "fuzz_targets/https_answer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ws_framer"
+path   = "fuzz_targets/ws_framer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_cid"
+path   = "fuzz_targets/bn_cid.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_wsapi_frame"
+path   = "fuzz_targets/bn_wsapi_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_user_event"
+path   = "fuzz_targets/bn_user_event.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_rest_body"
+path   = "fuzz_targets/bn_rest_body.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_account"
+path   = "fuzz_targets/bn_account.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_mode"
+path   = "fuzz_targets/bn_mode.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
 name   = "hypercall_ws_frame"
 path   = "fuzz_targets/hypercall_ws_frame.rs"
 test   = false
@@ -419,6 +480,20 @@ bench  = false
 [[bin]]
 name   = "hypercall_summary"
 path   = "fuzz_targets/hypercall_summary.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_response"
+path   = "fuzz_targets/hypercall_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_userws"
+path   = "fuzz_targets/hypercall_userws.rs"
 test   = false
 doc    = false
 bench  = false

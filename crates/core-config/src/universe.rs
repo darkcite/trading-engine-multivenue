@@ -71,6 +71,19 @@ pub const BN_OPT_ORDINAL_BASE: u32 = 1024;
 /// ≤ 500, usdm ends at 1013, eapi options end well under 2048.
 pub const BN_DATED_ORDINAL_BASE: u32 = 2048;
 
+/// BX2 (O-BX3): ordinal base for `[binance] coinm` COIN-M perpetual
+/// ids: `make_symbol_id(Binance, BN_COINM_ORDINAL_BASE + j + 1)`.
+/// Disjoint by construction: the dated block ends at 2048 + 500 + 1 =
+/// 2549 < 3072, and [`VENUE_LIST_MAX`] = 500 keeps this block under
+/// [`BN_COINM_DATED_ORDINAL_BASE`].
+pub const BN_COINM_ORDINAL_BASE: u32 = 3072;
+
+/// BX2 (O-BX3): ordinal base for `[binance] coinm_dated` COIN-M
+/// delivery-future ids: `make_symbol_id(Binance,
+/// BN_COINM_DATED_ORDINAL_BASE + j + 1)`; ends at 3584 + 500 + 1 = 4085,
+/// under the equity block the plan reserves at 4096 (§3.6).
+pub const BN_COINM_DATED_ORDINAL_BASE: u32 = 3584;
+
 /// WS6: ordinal base for `[deribit] combos` option-combo ids:
 /// `make_symbol_id(Deribit, DERIBIT_COMBO_ORDINAL_BASE + j + 1)`.
 /// Disjoint from statics (≤ 500) and discovered options
@@ -401,6 +414,14 @@ pub struct Universe {
     /// discovery audit can enforce dated-ness and ordinals get their
     /// own block ([`BN_DATED_ORDINAL_BASE`]).
     pub binance_usdm_dated: Vec<String>,
+    /// BX2: `[binance] coinm` — COIN-M perpetual stream symbols
+    /// (`btcusd_perp`: `<base>usd_perp`) in file order, own ordinal
+    /// block ([`BN_COINM_ORDINAL_BASE`]).
+    pub binance_coinm: Vec<String>,
+    /// BX2: `[binance] coinm_dated` — COIN-M delivery stream symbols
+    /// (`btcusd_261225`: `<base>usd_<yymmdd>`) in file order, own
+    /// ordinal block ([`BN_COINM_DATED_ORDINAL_BASE`]).
+    pub binance_coinm_dated: Vec<String>,
     /// `[binance] options_underlyings` / `options_expiries` /
     /// `options_strikes` — the M2.4 capped options-chain policy
     /// (underlyings are eapi names, e.g. `"BTCUSDT"`; see
@@ -522,6 +543,12 @@ pub struct AllocatedUniverse {
     /// same `binance-usdm:` descriptor prefix (one fapi lane for
     /// every offline consumer), own ordinal block.
     pub bn_dated: Vec<Instrument>,
+    /// BX2: Binance COIN-M perpetuals (`binance-coinm:` descriptors,
+    /// own ordinal block).
+    pub bn_coinm: Vec<Instrument>,
+    /// BX2: Binance COIN-M delivery futures — the same `binance-coinm:`
+    /// namespace (the class law reads the suffix), own ordinal block.
+    pub bn_coinm_dated: Vec<Instrument>,
     /// OKX instruments.
     pub okx: Vec<Instrument>,
     /// Deribit instruments.
@@ -599,6 +626,8 @@ enum Slot {
     BnSpot,
     BnUsdm,
     BnUsdmDated,
+    BnCoinm,
+    BnCoinmDated,
     BnOptUnderlyings,
     BnOptExpiries,
     BnOptStrikes,
@@ -635,6 +664,10 @@ enum ElemKind {
     /// WS5: dated-future stream symbols (`btcusdt_260327`) — the
     /// spot/usdm alphabet plus the delivery-name underscore.
     BnDatedSymbol,
+    /// BX2: COIN-M perpetual stream symbols (`btcusd_perp`).
+    BnCoinmSymbol,
+    /// BX2: COIN-M delivery stream symbols (`btcusd_261225`).
+    BnCoinmDatedSymbol,
     /// WS9: Bybit venue symbols (`BTCUSDT` — uppercase [A-Z0-9]).
     BybitSymbol,
     /// MX2/MX5: MEXC spot symbols (`BTCUSDT` — uppercase [A-Z0-9]).
@@ -672,6 +705,8 @@ struct Builder {
     bn_spot: Option<Vec<String>>,
     bn_usdm: Option<Vec<String>>,
     bn_usdm_dated: Option<Vec<String>>,
+    bn_coinm: Option<Vec<String>>,
+    bn_coinm_dated: Option<Vec<String>>,
     bn_opt_underlyings: Option<Vec<String>>,
     bn_opt_expiries: Option<u32>,
     bn_opt_strikes: Option<u32>,
@@ -845,6 +880,8 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Binance, "spot") => Some(Slot::BnSpot),
         (Section::Binance, "usdm") => Some(Slot::BnUsdm),
         (Section::Binance, "usdm_dated") => Some(Slot::BnUsdmDated),
+        (Section::Binance, "coinm") => Some(Slot::BnCoinm),
+        (Section::Binance, "coinm_dated") => Some(Slot::BnCoinmDated),
         (Section::Binance, "options_underlyings") => Some(Slot::BnOptUnderlyings),
         (Section::Binance, "options_expiries") => Some(Slot::BnOptExpiries),
         (Section::Binance, "options_strikes") => Some(Slot::BnOptStrikes),
@@ -887,6 +924,8 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::PmMarkets => ElemKind::PmMarket,
         Slot::BnSpot | Slot::BnUsdm => ElemKind::BnSymbol,
         Slot::BnUsdmDated => ElemKind::BnDatedSymbol,
+        Slot::BnCoinm => ElemKind::BnCoinmSymbol,
+        Slot::BnCoinmDated => ElemKind::BnCoinmDatedSymbol,
         Slot::BybitSpot | Slot::BybitLinear => ElemKind::BybitSymbol,
         Slot::MexcSpot => ElemKind::MexcSpotSymbol,
         Slot::MexcPerp => ElemKind::MexcPerpSymbol,
@@ -1014,6 +1053,8 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::PmMarket => validate_pm_entry(s, line_no),
         ElemKind::BnSymbol => validate_bn_symbol(s, line_no),
         ElemKind::BnDatedSymbol => validate_bn_dated_symbol(s, line_no),
+        ElemKind::BnCoinmSymbol => validate_bn_coinm_symbol(s, false, line_no),
+        ElemKind::BnCoinmDatedSymbol => validate_bn_coinm_symbol(s, true, line_no),
         ElemKind::BybitSymbol => validate_bybit_symbol(s, line_no),
         ElemKind::MexcSpotSymbol => validate_mexc_spot_symbol(s, line_no),
         ElemKind::MexcPerpSymbol => validate_mexc_perp_symbol(s, line_no),
@@ -1183,6 +1224,44 @@ fn validate_bn_dated_symbol(s: &str, line_no: usize) -> Result<(), UniverseError
     }
 }
 
+/// BX2: COIN-M stream symbols are `<coin>usd_perp` (perpetual) or
+/// `<coin>usd_<yymmdd>` (delivery) — lowercase `[a-z0-9]`, exactly one
+/// `_`. The suffix is REQUIRED to match the list: a `_perp` name in
+/// `coinm_dated` (or a dated one in `coinm`) is refused here, before
+/// the discovery audit would refuse it as the wrong class — and the
+/// `usd` quote keeps a USDⓈ-M name (`btcusdt_261225`) out of both.
+fn validate_bn_coinm_symbol(s: &str, dated: bool, line_no: usize) -> Result<(), UniverseError> {
+    let shape_ok = match s.split_once('_') {
+        Some((base, tail)) => {
+            let base_ok = base.len() > 3
+                && base.ends_with("usd")
+                && base
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+            let tail_ok = if dated {
+                tail.len() == 6 && tail.bytes().all(|b| b.is_ascii_digit())
+            } else {
+                tail == "perp"
+            };
+            base_ok && tail_ok
+        }
+        None => false,
+    };
+    if shape_ok && s.len() <= BN_SYMBOL_LEN_MAX {
+        Ok(())
+    } else {
+        let want = if dated {
+            "`<coin>usd_<yymmdd>`"
+        } else {
+            "`<coin>usd_perp`"
+        };
+        Err(err(
+            line_no,
+            format!("bad Binance COIN-M symbol `{s}` (want {want} lowercase, 1..={BN_SYMBOL_LEN_MAX})"),
+        ))
+    }
+}
+
 /// BIN15 O2: `<out|native>:<COIN>:<15m|1d>`.
 ///
 /// The crossed forms (`out:…:1d`, `native:…:15m`) are REFUSED: neither
@@ -1305,6 +1384,16 @@ fn store_array(
         Slot::BnUsdmDated => {
             if b.bn_usdm_dated.replace(items).is_some() {
                 return Err(dup("usdm_dated"));
+            }
+        }
+        Slot::BnCoinm => {
+            if b.bn_coinm.replace(items).is_some() {
+                return Err(dup("coinm"));
+            }
+        }
+        Slot::BnCoinmDated => {
+            if b.bn_coinm_dated.replace(items).is_some() {
+                return Err(dup("coinm_dated"));
             }
         }
         Slot::OkxInstr => {
@@ -1526,6 +1615,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     let binance_spot = b.bn_spot.unwrap_or_default();
     let binance_usdm = b.bn_usdm.unwrap_or_default();
     let binance_usdm_dated = b.bn_usdm_dated.unwrap_or_default();
+    let binance_coinm = b.bn_coinm.unwrap_or_default();
+    let binance_coinm_dated = b.bn_coinm_dated.unwrap_or_default();
     let okx_instruments = b.okx_instr.unwrap_or_default();
     let deribit_instruments = b.deribit_instr.unwrap_or_default();
     let deribit_combos = b.deribit_combos.unwrap_or_default();
@@ -1545,6 +1636,12 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         binance_usdm_dated.len(),
         VENUE_LIST_MAX,
         "Binance usdm_dated symbols",
+    )?;
+    check_cap(binance_coinm.len(), VENUE_LIST_MAX, "Binance coinm symbols")?;
+    check_cap(
+        binance_coinm_dated.len(),
+        VENUE_LIST_MAX,
+        "Binance coinm_dated symbols",
     )?;
     check_cap(okx_instruments.len(), VENUE_LIST_MAX, "OKX instruments")?;
     check_cap(
@@ -1585,6 +1682,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     check_unique(&binance_spot, "Binance spot symbol")?;
     check_unique(&binance_usdm, "Binance usdm symbol")?;
     check_unique(&binance_usdm_dated, "Binance usdm_dated symbol")?;
+    check_unique(&binance_coinm, "Binance coinm symbol")?;
+    check_unique(&binance_coinm_dated, "Binance coinm_dated symbol")?;
     check_unique(&okx_instruments, "OKX instrument")?;
     check_unique(&deribit_instruments, "Deribit instrument")?;
     check_unique(&deribit_combos, "Deribit combo")?;
@@ -1616,6 +1715,18 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // WS5 note: `usdm` and `usdm_dated` cannot overlap BY ALPHABET —
     // plain usdm symbols reject `_`, dated symbols require exactly
     // one — so no cross-list check is needed here.
+    // BX2: `coinm` and `coinm_dated` cannot overlap each other (`_perp`
+    // against six digits) or `usdm` (no `_`) — but both fit
+    // `usdm_dated`'s wider alphabet (`btcusd_261225` has its one `_`),
+    // and one name in two lists would mint two ids for one stream.
+    for s in binance_coinm.iter().chain(binance_coinm_dated.iter()) {
+        if binance_usdm_dated.contains(s) {
+            return Err(err(
+                0,
+                format!("`{s}` appears in both `usdm_dated` and a COIN-M list — pick one"),
+            ));
+        }
+    }
 
     // Options policies (M2.1 deribit, M2.2 okx) — one law, per venue.
     let deribit_options = finalize_options_policy(
@@ -1721,6 +1832,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         binance_spot,
         binance_usdm,
         binance_usdm_dated,
+        binance_coinm,
+        binance_coinm_dated,
         okx_instruments,
         okx_depth: b.okx_depth.unwrap_or(false),
         deribit_instruments,
@@ -1895,6 +2008,28 @@ pub fn allocate_with_anchors(
             name,
         });
     }
+    // BX2 (O-BX3): COIN-M perpetuals and delivery futures — two
+    // blocks, one `binance-coinm:` namespace (the class law reads the
+    // `_perp` / `_yymmdd` suffix; inverse is a discovery-row flag,
+    // never a class).
+    for j in 0..u.binance_coinm.len() {
+        let sym = make_symbol_id(VenueId::Binance, BN_COINM_ORDINAL_BASE + j as u32 + 1);
+        let name = u.binance_coinm[j].clone();
+        out.bn_coinm.push(Instrument {
+            sym,
+            descriptor: format!("binance-coinm:{name}"),
+            name,
+        });
+    }
+    for j in 0..u.binance_coinm_dated.len() {
+        let sym = make_symbol_id(VenueId::Binance, BN_COINM_DATED_ORDINAL_BASE + j as u32 + 1);
+        let name = u.binance_coinm_dated[j].clone();
+        out.bn_coinm_dated.push(Instrument {
+            sym,
+            descriptor: format!("binance-coinm:{name}"),
+            name,
+        });
+    }
 
     // OKX / Deribit / HL — the standing per-venue convention.
     for i in 0..u.okx_instruments.len() {
@@ -2023,6 +2158,8 @@ pub fn allocate_with_anchors(
         &out.bn_spot,
         &out.bn_usdm,
         &out.bn_dated,
+        &out.bn_coinm,
+        &out.bn_coinm_dated,
         &out.okx,
         &out.deribit,
         &out.deribit_combos,
@@ -2289,6 +2426,96 @@ map = ["0:0", "1:1"]
                 parse(&src).unwrap_err().msg.contains("dated symbol"),
                 "`{bad}` must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn coinm_lists_parse_allocate_own_blocks_and_share_one_namespace() {
+        // BX2 (O-BX3): perps from 3072, delivery from 3584, one
+        // `binance-coinm:` namespace for both (the class law reads the
+        // suffix).
+        let src = "[binance]\nspot=[\"btcusdt\"]\nusdm=[\"btcusdt\"]\n\
+                   coinm=[\"btcusd_perp\",\"ethusd_perp\"]\ncoinm_dated=[\"btcusd_261225\"]\n";
+        let u = parse(src).unwrap();
+        assert_eq!(u.binance_coinm, vec!["btcusd_perp", "ethusd_perp"]);
+        assert_eq!(u.binance_coinm_dated, vec!["btcusd_261225"]);
+        let a = allocate(&u).unwrap();
+        assert_eq!(
+            a.bn_coinm[0].sym,
+            make_symbol_id(VenueId::Binance, BN_COINM_ORDINAL_BASE + 1)
+        );
+        assert_eq!(
+            a.bn_coinm[1].sym,
+            make_symbol_id(VenueId::Binance, BN_COINM_ORDINAL_BASE + 2)
+        );
+        assert_eq!(a.bn_coinm[1].descriptor, "binance-coinm:ethusd_perp");
+        assert_eq!(
+            a.bn_coinm_dated[0].sym,
+            make_symbol_id(VenueId::Binance, BN_COINM_DATED_ORDINAL_BASE + 1)
+        );
+        assert_eq!(a.bn_coinm_dated[0].descriptor, "binance-coinm:btcusd_261225");
+        // The blocks stay disjoint at the list cap: the last dated USDⓈ-M
+        // ordinal sits under the first COIN-M one, the last COIN-M perp
+        // under the first COIN-M delivery, and that block under 4096.
+        let cap = VENUE_LIST_MAX as u32;
+        assert!(BN_DATED_ORDINAL_BASE + cap + 1 < BN_COINM_ORDINAL_BASE);
+        assert!(BN_COINM_ORDINAL_BASE + cap + 1 < BN_COINM_DATED_ORDINAL_BASE);
+        assert!(BN_COINM_DATED_ORDINAL_BASE + cap + 1 < 4096);
+        // Duplicate key law, per key.
+        for key in ["coinm", "coinm_dated"] {
+            let item = if key == "coinm" { "btcusd_perp" } else { "btcusd_261225" };
+            let dup = format!("[binance]\n{key}=[\"{item}\"]\n{key}=[\"{item}\"]\n");
+            assert!(parse(&dup).unwrap_err().msg.contains("duplicate key"), "{key}");
+            let twice = format!("[binance]\n{key}=[\"{item}\",\"{item}\"]\n");
+            assert!(parse(&twice).unwrap_err().msg.contains("duplicate"), "{key}");
+        }
+    }
+
+    #[test]
+    fn coinm_symbols_must_match_their_list() {
+        // A perp list wants `_perp`; a delivery list wants six digits;
+        // both want the `usd` quote and the lowercase alphabet.
+        for bad in [
+            "btcusd_261225",
+            "btcusdt_perp",
+            "btcusd",
+            "usd_perp",
+            "btcusd_perp_x",
+            "BTCUSD_PERP",
+            "btc-usd_perp",
+            "btcusd_",
+        ] {
+            let src = format!("[binance]\ncoinm=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("COIN-M symbol"),
+                "coinm `{bad}` must be rejected"
+            );
+        }
+        for bad in [
+            "btcusd_perp",
+            "btcusdt_261225",
+            "btcusd_2612",
+            "btcusd_2612251",
+            "btcusd_26122a",
+            "BTCUSD_261225",
+        ] {
+            let src = format!("[binance]\ncoinm_dated=[\"{bad}\"]\n");
+            assert!(
+                parse(&src).unwrap_err().msg.contains("COIN-M symbol"),
+                "coinm_dated `{bad}` must be rejected"
+            );
+        }
+        // Digits in the coin are fine (`1000shibusd` is a shape the
+        // venue could list).
+        parse("[binance]\ncoinm=[\"1000shibusd_perp\"]\n").unwrap();
+        // A COIN-M name also fits `usdm_dated`'s wider alphabet: one
+        // name in both lists is refused, naming it.
+        for list in ["coinm=[\"btcusd_perp\"]", "coinm_dated=[\"btcusd_261225\"]"] {
+            let name = if list.starts_with("coinm=") { "btcusd_perp" } else { "btcusd_261225" };
+            let src = format!("[binance]\nusdm_dated=[\"{name}\"]\n{list}\n");
+            let msg = parse(&src).unwrap_err().msg;
+            assert!(msg.contains("both `usdm_dated` and a COIN-M list"), "{msg}");
+            assert!(msg.contains(name), "{msg}");
         }
     }
 

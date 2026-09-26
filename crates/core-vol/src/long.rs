@@ -344,6 +344,74 @@ impl LongVolEngine {
         }
     }
 
+    /// Copy the whole engine into `dst` — HAR H3.7's state snapshot: the
+    /// engine thread hands a series' state to the state writer this way, so
+    /// the render and the fsync run off the loop. Every field goes, through
+    /// an exhaustive destructure: a field added to the engine without a line
+    /// here does not compile.
+    pub fn copy_to(&self, dst: &mut Self) {
+        let Self {
+            cur_sq,
+            prev_px_1e6,
+            cur_day_ts_ms,
+            last_min_ts_ms,
+            gaps,
+            refused,
+            cur_n,
+            dirty,
+            n_days,
+            day_sq,
+            day_ts_ms,
+            day_n,
+            day_x,
+            day_fit,
+            a_1e9,
+            b_1e9,
+            fitted,
+            pair_head,
+            n_pairs,
+            q_head,
+            q_n,
+            pair_x_1e9,
+            pair_y_1e9,
+            pair_ts_ms,
+            q_raw_1e9,
+            q_fit_1e9,
+        } = self;
+        // COPY: the whole engine, ~201 KiB, once per series per UTC day close
+        // on the engine thread (2.6 µs warm on the M4) — the price of taking
+        // the ~350 KiB render and the fsync off the loop — rejected:
+        // rendering and fsyncing on the loop (12 a day, a disk round trip
+        // each) and a shared engine the writer reads under a lock (the loop
+        // would wait on a disk).
+        dst.cur_sq = *cur_sq;
+        dst.prev_px_1e6 = *prev_px_1e6;
+        dst.cur_day_ts_ms = *cur_day_ts_ms;
+        dst.last_min_ts_ms = *last_min_ts_ms;
+        dst.gaps = *gaps;
+        dst.refused = *refused;
+        dst.cur_n = *cur_n;
+        dst.dirty = *dirty;
+        dst.n_days = *n_days;
+        dst.day_sq = *day_sq;
+        dst.day_ts_ms = *day_ts_ms;
+        dst.day_n = *day_n;
+        dst.day_x = *day_x;
+        dst.day_fit = *day_fit;
+        dst.a_1e9 = *a_1e9;
+        dst.b_1e9 = *b_1e9;
+        dst.fitted = *fitted;
+        dst.pair_head = *pair_head;
+        dst.n_pairs = *n_pairs;
+        dst.q_head = *q_head;
+        dst.q_n = *q_n;
+        dst.pair_x_1e9 = *pair_x_1e9;
+        dst.pair_y_1e9 = *pair_y_1e9;
+        dst.pair_ts_ms = *pair_ts_ms;
+        dst.q_raw_1e9 = *q_raw_1e9;
+        dst.q_fit_1e9 = *q_fit_1e9;
+    }
+
     // -----------------------------------------------------------------
     // The feed
     // -----------------------------------------------------------------

@@ -6,6 +6,403 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — Binance COIN-M market data: `[binance] coinm` / `coinm_dated`, the `binance-coinm:` namespace, `BINANCE_COINM_WS_HOST` / `BINANCE_COINM_REST_HOST` (BX2)
+
+**What changed**
+- `universe.toml [binance]` gains two OPTIONAL lists: `coinm`
+  (`<coin>usd_perp`, ordinals from 3072) and `coinm_dated`
+  (`<coin>usd_<yymmdd>`, from 3584). A name must match its list's suffix
+  and carry the `usd` quote; one name in `usdm_dated` and a COIN-M list is
+  refused. Absent or empty lists = the pre-BX2 boot, bit for bit (no REST
+  call, no socket, no manifest row).
+- Boot discovery fetches `GET /dapi/v1/exchangeInfo` on
+  `BINANCE_COINM_REST_HOST` (default `dapi.binance.com`) when either list
+  is set: every name must be listed and TRADING, a `coinm_dated` name a
+  dated class. Each instrument gets two sockets on `BINANCE_COINM_WS_HOST`
+  (default `dstream.binance.com`): `/ws/<sym>@bookTicker` (the tick lane)
+  and `/market/ws/<sym>@markPrice` (capture-only `Mark` / `Funding`) — the
+  USDⓈ-M path law, measured on dstream (K10).
+- Descriptors are `binance-coinm:<sym>` (VenueId 1, `bn` capture files).
+  Class: `_perp` → perp, six digits → dated (`core-config`
+  `instrument_class`, the worker mirror and the shared fixture);
+  capabilities PRICE | FUNDING (`ingress_ai::caps_of_descriptor` and
+  `channel_map`); fees: the `bn` perp/dated rows.
+- Quantities are CONTRACTS (100 USD of face on BTC, 10 USD on the
+  others): the tick lane's sizes and the worker candle `v` column.
+- Worker: candles gain a `binance-coinm` lane (`/dapi/v1/klines`, its own
+  per-host budget); funding takes the `_PERP` names on
+  `/dapi/v1/fundingRate`, and its budgets are now per REST host (the
+  candles law) so COIN-M cannot be starved by a broad usdm list; refdata
+  reports the lane as skipped (no v1 fetcher); the seed, bartest and
+  universe-proposal tables know the namespace.
+- `--binance-symbol` replaces `[binance] spot` only; `usdm`, `usdm_dated`,
+  `coinm` and `coinm_dated` stay as configured.
+
+**Operator action**
+- None to keep today's boot. To capture COIN-M, add the lists, check the
+  wrapper's descriptor budget (two per instrument, inside the 8 192 the
+  wrapper sets) and restart the engine at a quiet moment.
+
+## 2026-09-26 — Binance discovery keeps the venue's rules; the boot audit reads each product's own page; the options chain skips closed series (BX2, F11)
+
+**What changed**
+- `BnSymbolRow` keeps the lifecycle status (`status` or COIN-M's
+  `contractStatus`), the tick and step, min/max quantity, min notional,
+  the percent-price band per side, the open-order cap, the wire
+  precisions, COIN-M's contract size (the inverse flag), the underlying
+  type, the TradFi flag and spot's permission groups. `EapiOptionRow`
+  keeps `unit`, the scales, the filters, the status, the TradFi flag and
+  its underlying's `nakedSell` (`optionContracts`). The boot logs every
+  resolved instrument's rules at debug (`discovery: bn instrument rules`).
+- A `maxQty` past the ×1e9 grid saturates (a LOWER cap) instead of
+  refusing the page: live USDⓈ-M `1000SATSUSDT` says `60000000000`,
+  which would have refused the whole fapi page. Every other value still
+  refuses its row when it overflows.
+- The audit resolves each configured name against ITS product's page
+  (spot probes, fapi, dapi): a `usdm` name listed on spot only is now
+  `not_found` instead of passing on the spot row.
+- The eapi capped chain selects `TRADING` series only: a
+  `CLOSED_MARKET` series before its expiry (live: the TradFi `XAU` /
+  `XAG` Oct-02 week) no longer selects.
+- Stricter readings, none met on today's pages: a row that states its
+  lifecycle twice (`status` and `contractStatus`, or either one twice)
+  is refused rather than read last-wins; a filter value is judged only
+  on the filter type that keeps it (a `MARKET_LOT_SIZE` or
+  `ICEBERG_PARTS` value can no longer refuse a row); an underlying that
+  `optionContracts` lists both `nakedSell: true` and `false` reads as
+  `false`; a body that ends after a key or its colon is a truncation.
+
+**Operator action**
+- None. A boot whose options chain selected a closed series now logs
+  fewer instruments for that underlying; one whose `usdm` list named a
+  spot-only symbol now reports it missing (paper continues, live refuses).
+
+## 2026-09-26 — Slot 7's book persists: `hcv-state.tsv`, `--hcv-state`; `/state.hcv` +4 rows; `engine_hcv_*` +4 (HC11b)
+
+**What changed**
+
+- `strategy_hcv::state` (new): the member's book — every held option BY CONTRACT (underlying, expiry, strike, right), with its entry basis and last price; the hedges (with the oracle they were written at); the cash; the UTC day and its opening mark; every live settlement window (its 1 s grid run-length encoded, or its fixed price) — is written to `hcv-state.tsv` and restored at boot (risk-policy "HYPERCALL — slot 7", "The book persists"). The grammar is version 1 (`V C D P H W S` rows); a file the member cannot read exactly — or whose values are implausible — refuses the boot, except a hedge residual under the venue's minimum on an underlying no longer traded, which is dropped and counted.
+- After a boot the book's mark is unknown until every held underlying's oracle arrives: the day does not roll and new risk stops meanwhile. A moved book the writer has not taken for 30 s stops new risk (`book_stale`). The boot writes the book once itself and refuses when it cannot.
+- **The file:** `--hcv-state <path>`; else `hcv-state.tsv` beside an explicit `--hcv`; else `~/multivenue/hcv-state.tsv` (the F22 law, now shared: `cli::state_file::resolve_state_path` / `read_state`, which VRP's boot also calls — `read_state` now refuses any read error but a missing file, where `Path::exists` read a stat error as a first boot).
+- **Off the engine thread:** the member hands its book to a mailbox at its timer whenever the book moved; the `hcv-state-writer` thread renders and writes it (atomic, fsynced). The H3.7 writer thread is generic now (`cli::persist::StateWriter`); `cli::har_writer` keeps the HAR side (`outbox`, `spawn`) and `HarWriter` is gone (the thread is `persist::StateWriter`). The shutdown joins the writer, then writes the live book once more.
+- **Orphans:** a held contract the booted chain no longer lists is carried by its terms (hedged and marked at σ̂, settled at expiry, never traded); at most 64.
+- `core_settle::SettleWindow`: `samples`, `next_index`, `last_ts_ms` and `restore` (the held price does not carry across an outage).
+- `StrategyCounters::render_hcv_state` (the shutdown's forced write, through the set).
+- `/state.hcv`: `restored` (counter) after `har_updates`, then `orphans`, `book_stale` and `marks_unknown` (gauges) last — 18 counters, 7 gauges. `/metrics`: `engine_hcv_restored_total`, `engine_hcv_orphans`, `engine_hcv_book_stale`, `engine_hcv_marks_unknown`. Schema stays 2 — additive.
+- `hcv.toml` is unchanged.
+
+**Impact**
+
+- None on a configured mask (slot 7 is in none). A boot with hcv requested now reads `hcv-state.tsv` when it exists and writes it from the first change on; a first boot has none.
+- A boot whose `hcv.toml` stops trading an underlying the book holds REFUSES — trade it again, or move the file aside (a position nobody hedges or settles is worse than a boot that asks for a hand).
+
+**Migration steps**
+
+1. None beyond HC11's. The first boot with slot 7 creates the file at its first fill (or the day's first timer).
+
+**Rollback**
+
+- Drop hcv from `STRATEGY=` (the file stays and is read again when slot 7 returns); moving `hcv-state.tsv` aside starts the book flat.
+
+## 2026-09-26 — Strategy slot 7 = `hcv` (Hypercall S1, DARK); `hcv.toml`; the held-quote paper law; `/state.hcv`; `engine_hcv_*` (HC11)
+
+**What changed**
+
+- `crates/strategy-hcv` (new): the slot-7 member (risk-policy "HYPERCALL — slot 7").
+- `strategy-set`: slot 7 is built — `SLOT_HCV = 7`, `BIT_HCV = 128`, `BUILT_MASK` 127 → **255**; the names `hcv` (128), `ai+hcv` (176) and `ai+vrp+xsd+bin15+hyparb+xmm+hcv` (255). No slot is reserved any more: an `EnableStrategy` for slot 7 is honored, one past 7 is refused. The set hands slot 7 the HAR rows whenever one moves.
+- `core_config::hcv` + `hcv.toml.example` (every key required); `--hcv`, `--hcv-events`; the wrapper's allow-list takes the three names and `HCV_TOML` / `HCV_EVENTS`.
+- `core_fill::held` — the held-quote IoC law; `PaperMatcher` now MODELS Hypercall IoCs by it (they were unroutable). A stale Hypercall quote is no quote; a miss emits a `CANCELED`/`EXPIRED` order event.
+- The boot discovery keeps each configured HL perp's `szDecimals` (`hl_sz_decimals`).
+- `/state`: a new `hcv` object (`configured`, `hash`, 17 counters, 4 gauges); `slots[7]` is named `hcv` (was `reserved`); `BootInfo` carries `hcv_hash` (rendered inside `hcv`, so the pinned `boot` section is unchanged). Schema stays 2 — all additive.
+- `/metrics`: `engine_hcv_*` — 17 `_total` counters and 4 gauges (`positions`, `vega_abs_usd_1e6`, `pnl_usd_1e6`, `day_pnl_usd_1e6`).
+- `exec.toml`: slot 7's name is `hcv`; a live slot 7 refuses the boot (O-HC18). `audit-pnl` names slot 7 `hcv`.
+- The HC9 arm's nonce is the wall clock in ms (`84fc32b`, measured on mainnet) — the risk-policy entry is corrected.
+
+**Impact**
+
+- None on a configured mask: slot 7 is in none, and nothing reads `hcv.toml` unless the requested mask carries bit 7.
+- `--strategy all` now composes slot 7 too, so it needs `hcv.toml` as it needs `xmm.toml`: requested-but-absent refuses the boot (the F19 law).
+- Dashboards reading `slots[7].name` see `hcv`.
+
+**Migration steps** (go-live, the operator's; each after the ones before)
+
+1. The Hypercall go-live itself (`[hypercall]` live — O-HC12) and `har.toml` live (O-HC22); `[events]` is live since 12:03Z.
+2. Append the eight hedge coins to `[hyperliquid] coins` (O-HC20: `xyz:SP500`, `xyz:SPCX`, `xyz:MU`, `xyz:NVDA`, `xyz:MSFT`, `xyz:META`, `xyz:AAPL`, `xyz:SNDK`) — **append, never reorder**.
+3. `cp hcv.toml.example ~/multivenue/hcv.toml` (edit the knobs, if any).
+4. One `strategy.conf` line naming a mask with hcv; restart at a daily restart. `/state.hcv.configured` = 1 and the boot tell `hcv: artifact configured` confirm it.
+
+**Rollback**
+
+- Drop hcv from `STRATEGY=`; slot 7 is paper only, so nothing is open on any venue.
+
+## 2026-09-26 — HIP-3 builder-dex perps: real asset ids and size decimals (HC10)
+
+**What changed**
+
+- `ingress_hyperliquid::discovery`:
+  - `perpDexs` keeps each dex's index;
+  - `HlDiscovery::ingest_dex_meta` reads a builder dex's own `{"type":"meta","dex":…}`;
+  - a `dex:COIN` coin resolves to `100_000 + dex_idx × 10_000 + index` with that meta's `szDecimals` (`builder_asset_id`, `dex_of`, `has_dex`).
+  - A coin its dex's meta does not list no longer resolves. A dex whose meta was not ingested stays name-validated at asset 0, as before.
+- **The engine's HL boot discovery** also fetches the meta of every builder dex a configured coin names. It fetches only dexes the venue's own `perpDexs` listed, 250 ms apart like the other discovery requests. A failed fetch is a warning; market data addresses coins by string.
+- `exec_hyperliquid::asset`: `BUILDER_BASE`, `SPOT_BASE`, `AssetKind`, `kind_of`, `is_perp_id`. The mirrored id law is held together with the ingress one by the cli test `builder_asset_ids_agree`.
+- The HYPARB binder (`cli::hyparb_live`) binds a builder-dex coin by its derived id (never id 0).
+- `core_types::hl_px`: the HL perp price law (five significant figures, `6 − szDecimals` decimals, integers always legal), its rounding, and the size step.
+- `tests/fixtures/hl/vectors.tsv`: two HIP-3 order rows (asset `110_002` IoC buy, `110_009` ALO reduce-only sell) from the official `hyperliquid-python-sdk` 0.24.0.
+  - The 27 older rows regenerate byte-identical.
+  - The header now names the SDK version.
+  - `VECTOR_ROWS` is 29.
+- The `hl_info` fuzz target drives `ingest_dex_meta`.
+
+**Impact**
+
+- None at runtime today: no `xyz:` coin is in the live `[hyperliquid] coins`. At go-live (O-HC20: the eight hedge coins appended), the boot adds one `/info` request (the `xyz` meta) and logs each hedge coin's asset id and `szDecimals`.
+
+**Migration steps**
+
+1. None. The go-live's `[hyperliquid] coins` append is the operator's (O-HC20).
+
+**Rollback**
+
+- Remove the `xyz:` coins from `[hyperliquid] coins`.
+
+## 2026-09-26 — `crates/exec-hypercall`: the Hypercall order arm and its operator verbs (HC9, O-HC19)
+
+**What changed**
+
+- `crates/exec-hypercall` (new): `HcExchange`, a complete `OrderDispatch` for Hypercall options:
+  - `POST /order`, `PUT /order` and `DELETE /order_cloid` bodies are rendered in place and signed over their own spans (HC8, D7);
+  - a fail-closed answer scanner;
+  - the private fills socket (`Authenticate` the owner, then `fills` and `order_updates`);
+  - reconciliation over `/portfolio`, `/orders?status=open` and `/fills`;
+  - a sliding-window rate governor for the Default tier;
+  - the E-9 client id (`HC`, version, slot, `client_oid`, check).
+- `multivenue-engine hypercall-live <status|simulate|recon|dust|cancel-all>` and `scripts/hypercall-live.sh`, the mainnet operator verbs. The two writes need `--confirm`.
+- `exec_boot` refuses a live slot on `hypercall` with a reason of its own. It names what slot 7's live-arming ruling must settle; the risk-policy entry "HYPERCALL — the order arm" has the detail.
+- `make copy-audit` covers `crates/exec-hypercall`.
+- New fuzz targets `hypercall_response` and `hypercall_userws`.
+- New alloc gate 84.
+
+**Impact**
+
+- None on the running engine: nothing in it constructs the arm, and a live `hypercall` slot refuses the boot. The new keys (`HYPERCALL_WALLET`, `HYPERCALL_AGENT_KEY`) are read by the verbs only.
+
+**Migration steps**
+
+1. The operator adds `HYPERCALL_WALLET` (the owner address) and `HYPERCALL_AGENT_KEY` (the signer) to the repo `.env` (`chmod 600`). A session never writes `.env`.
+2. `cargo build --release -p cli` (or a separate `CARGO_TARGET_DIR` for a standalone smoke — G0).
+3. Run the read-only verbs first: `scripts/hypercall-live.sh status` and `recon`, then `simulate --symbol <SYM>`.
+4. The operator's dust smoke: `scripts/hypercall-live.sh dust --symbol <SYM> --confirm`. PASS means the order was signed on mainnet, cancelled, and nothing filled.
+
+**Rollback**
+
+- Nothing to roll back at runtime. Remove the two `.env` lines to disable the verbs.
+
+## 2026-09-26 — `signer_eip712::hypercall`: the venue's EIP-712 actions, sign-only (HC8, O-HC17)
+
+**What changed**
+
+- `signer-eip712` gains a parameterised domain (`Eip712Domain`,
+  `domain_separator_of` — boot-time), `eip712_digest`, and public word
+  encoders (`enc_string`, `enc_address`, `enc_u64`, `enc_bool`, `enc_i256`
+  — sign-extended). The Polymarket and Hyperliquid paths are unchanged;
+  the tests pin that the generic domain reproduces both cached separators.
+- `signer_eip712::hypercall`: the domain (`Hypercall`, `1`, chain 999 /
+  998, the zero contract), the 18 type strings of the official SDK
+  0.1.0 plus the route-less legacy `PlaceOrder` (19), their typehashes as
+  compile-time constants, a struct hash per type over BORROWED spans (the
+  request body's own bytes — D7), `hc_eip712_digest`, `sign_hc_with_key`
+  and the hot path's `sign_place_order_with_key`.
+- `crates/signer-eip712/tests/fixtures/hypercall/vectors.tsv`: 38
+  known-answer vectors generated by the SDK's builders + ethers 6.17.0
+  (test keys only; the header says how). Every one is byte-exact —
+  struct hash, digest, 65-byte signature.
+- Alloc gate 83 (`hypercall_sign_with_key_is_zero_alloc`): place,
+  replace, cancel by client id and an RFQ accept, 0 B/op. Criterion
+  `signer/hypercall_place_order`.
+
+**Impact**
+
+- None at runtime: nothing calls it yet. No keys, no network, no exec arm
+  (O-HC1 stands; HC9 is its own ruling). The RFQ ids' mapping from the
+  body's strings to `bytes32` is not in the SDK and is HC9's to take from
+  the venue.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the commit.
+
+## 2026-09-26 — Hypercall options in the AI boot universe (O-HC17)
+
+**What changed**
+
+- `cli::build_ai_universe` takes the Hypercall option syms the boot
+  selected (`discovery.hypercall_options`); the `hypercall-idx:<U>` index
+  syms stay out (capture-only `Mark`s, caps 0).
+- The v1 ruleset grammar's rule 6 now admits them; the v2 grammar already
+  resolved `hypercall:` descriptors through the `DescriptorTable` (HC4).
+
+**Impact**
+
+- None until `[hypercall]` is configured live (O-HC12): an empty chain adds
+  nothing. Then `ai: ruleset boot-universe snapshot built symbols=` grows by
+  the chain's size. An order leg on a Hypercall option stays `unroutable`
+  in the paper matcher and the harness (HC1) — the Q-MX6 shape.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the commit.
+
+## 2026-09-26 — `candles.toml`: `extra` instruments and a lane's `backfill_1m_h` (HAR W1)
+
+**What changed**
+
+- Two lane keys in the candles lane's policy file (`~/multivenue/candles.toml`,
+  worker-only; grammar in `candles.toml.example`):
+  - `extra = ["<sym>", …]` — instruments the universe does not name,
+    fetched by that lane like its own under the lane's descriptor
+    (`[hyperliquid] extra = ["xyz:SP500"]` → `hyperliquid:xyz:SP500`); a lane
+    the universe lacks is created, a symbol it already names is not doubled;
+  - `backfill_1m_h = <1..8760>` — that lane's 1 m backfill for an EMPTY
+    series, over `CLAUDE_WORKER_CANDLES_BACKFILL_1M_H` and the 48 h default.
+- A malformed value of either ignores the whole file (the file's standing
+  law: a typo only widens back to §9.5).
+- The candles cycle reads the policy before its "no candle-lane instruments"
+  exit, so a universe with no lane can still run `extra` lanes.
+- `claude_worker.candles` builds every lane from one table (`LANE_FORMS`);
+  the lanes read from `universe.toml` are unchanged.
+- The HL lane is PACED to half of HL's per-IP weight minute (1 200, shared
+  with the engine on this host): a rolling-minute budget,
+  `CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN` (default 600), booked per page at
+  HL's published weights (`candleSnapshot`: 20 + 1 per 60 candles). Before,
+  a fresh store's first HL cycle (and W1's — ~90 pages, ~3 300 weight) could
+  spend the IP's minute two or three times over.
+
+**Why**
+
+- HAR W1: the ten `xyz` perps (HL dex `xyz`) do not fit the engine's HL
+  coin table, and HL keeps only the newest ~5 000 minutes at 1 m — accrual
+  must start in the worker, from the first cycle's 96 h reach.
+
+**Impact**
+
+- None until the live `candles.toml` names an `extra` (the example's W1
+  block, after this branch reaches `main`). Then ~20 more HL
+  `candleSnapshot` calls an hour (ten coins × 1 m + 1 h), inside the lane's
+  demand-sized budget.
+- The pacing: a steady hourly cycle (~900 HL weight with the extras) takes
+  about a minute longer; W1's first cycle about six minutes. The worker
+  serialisation guard is held that much longer.
+
+**Migration steps**
+
+1. After the merge: uncomment the example's W1 block into
+   `~/multivenue/candles.toml`; the next hourly cycle backfills 96 h of 1 m
+   and 90 d of 1 h for each coin.
+
+**Rollback**
+
+- Remove the block (the rows already stored stay; nothing reads them but
+  the HAR seed).
+
+## 2026-09-26 — the healthy-session backoff in core-net; Hypercall and MEXC reconnect by it (O-HC16)
+
+**What changed**
+
+- `core_net::{HEALTHY_SESSION_MIN_NS, should_reset_backoff}` — moved from
+  `cli/src/paper.rs` unchanged; the seven outer spawn loops call it from
+  core-net.
+- `ingress-hypercall`: the internal reconnect (`HcConn`) resets its
+  backoff only after a session that moved market data (the venue's
+  `ticks_total` against its value at session start) AND lived ≥ 30 s, or
+  that ended in the keepalive's 60 s-silence trip. Before: any confirmed
+  subscription reset it.
+- `ingress-mexc`: the same law per `run_multi` slot, over the new
+  `Driver::session_ticks` (the ticks that connection published this
+  session); the keepalive's silence trip is the quiet trip. Before: a
+  confirmed pair reset it on a venue close or a keepalive trip.
+
+**Impact**
+
+- A Hypercall or MEXC venue that drops sessions young now sees those
+  reconnects climb 0.5 → 8 s (≤ 7.5 connects a minute per connection),
+  as the seven outer loops have since `7235201`. A healthy session's end
+  still redials after ~0.5 s. `engine_ingress_{hypercall,mexc}_reconnects_total`
+  count as before.
+
+**Migration steps**
+
+1. None. Live at the first release build + restart after the branch
+   merges (MEXC is live; Hypercall is not yet configured).
+
+**Rollback**
+
+- Revert the commit.
+
+## 2026-09-26 — the long-tenor state files are written off the engine thread (HAR H3.7)
+
+**What changed**
+
+- A new thread, `har-state-writer` (`cli::har_writer`), is spawned at boot
+  when `har.toml` configures the long-tenor set. At each series' UTC day
+  close the engine thread copies that series' engine whole (~201 KiB,
+  `core_vol::LongVolEngine::copy_to`) into the series' mailbox — one
+  `core_ring::Mailbox` per series, new in core-ring: a single-slot SPSC
+  hand-off by ownership, filled and read in place, never waiting — at the
+  close's own 1 s poll. The writer renders `state-<NAME>.tsv` and runs
+  create/write/fsync/rename. The engine loop no longer renders or fsyncs a
+  HAR state in its 5 s report block.
+- The file is unchanged — path, header, rows: one renderer,
+  `core_vol::render_state_file`, serves the writer and the shutdown write.
+- A failed write keeps the state and is retried every 5 s (the F18 warning,
+  `kind="har"`, once a minute); the engine's offers are refused meanwhile,
+  never waited on, and the newest state follows the first retry that lands
+  — a file never goes backwards.
+- Shutdown: the writer is stopped and joined, then the forced synchronous
+  write of every series runs on the engine thread as before (a state the
+  writer still held is superseded by it).
+- The writer failing to spawn is an error log (`har: the state writer
+  thread did not spawn`) and the pre-H3.7 write on the engine loop — never
+  a refusal.
+- `engine_har_*` are computed by `strategy_core::har_gauges` (values
+  unchanged; bench gate 82 now runs it).
+- `docs/hot-path-latency.md`: the staggered day closes run
+  00:01:00–00:01:12Z (the minute stamped 00:00Z is delivered at its close),
+  not "by 00:00:12Z".
+
+**Why**
+
+- Ruling O-HC15 (H3.7): the render and the fsync — a disk round trip —
+  ran on the engine thread twelve times a UTC day. The hand-off that
+  replaces them costs the loop 2.56 µs per close, warm (bench
+  `vol/long_state_copy_warm` on the M4).
+
+**Impact**
+
+- One more thread, parked 250 ms between passes; the twelve mailbox slots
+  are ~2.4 MiB of heap boxed at boot. A boot without `har.toml` spawns
+  nothing and boxes nothing. Nothing on disk changes.
+
+**Migration steps**
+
+1. None. Live at the first release build + restart after the branch
+   merges, and only on a boot that finds a `har.toml` (`~/multivenue/har.toml`
+   or `--har`; none is live yet — the HAR go-live steps of the H3 plan §15
+   are staged with O-HC12).
+
+**Rollback**
+
+- Revert the commit; the files it writes are the files the engine loop
+  wrote before.
+
 ## 2026-09-26 — `/state` schema 2: `xmm` replaces `icdp`; `engine_xmm_*`; `[labels.xmm]`; audit-pnl reads the queue venue's prints (XMM XH3)
 
 **What changed**
@@ -631,7 +1028,10 @@ supervised restart and the post-boot checks.
    missing one charges the harness default.
 2. Optional: schedule `python -m claude_worker.hypercall_history` beside
    the funding lane, with the provider wallets in
-   `CLAUDE_WORKER_HC_WALLETS` (the research vault names them).
+   `CLAUDE_WORKER_HC_WALLETS` (the research vault names them). **Done at
+   the go-live (2026-09-26, O-HC29):** `scripts/candles-cycle.sh` runs it
+   hourly, guarded on `[hypercall]` in `universe.toml`; the payouts lane
+   skips until the wallets are in `.env`.
 
 **Rollback**
 

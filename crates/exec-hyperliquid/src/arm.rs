@@ -76,10 +76,13 @@
 //! ALO rate, and the gateway's halt word (read from the stats block: an
 //! event can be lost, the word cannot). The budget floor is XH4e's.
 //!
-//! Engine thread, 0 B/op after boot (gate 86): fixed tables, fixed
+//! Engine thread, 0 B/op after boot (gate 98): fixed tables, fixed
 //! queues, linear scans over at most [`ARM_ORDERS`] rows.
 
-use clob_dispatcher::{CancelAllState, DispatchError, DispatchStats, HaltSignal, OrderDispatch};
+use clob_dispatcher::{
+    CancelAllState, DispatchError, DispatchStats, HaltSignal, OrderDispatch, Retired,
+    RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_VENUE, RETIRED_EXPIRED, RETIRED_REJECTED,
+};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_time::now_ns;
 use core_types::{
@@ -452,7 +455,7 @@ pub struct HlGatewayArm {
     n_rows: usize,
     events: Out<OrderEvent>,
     fills: Out<Fill>,
-    retired: Out<(u64, u8)>,
+    retired: Out<Retired>,
     counters: ArmCounters,
     stats: DispatchStats,
     // XH-7 and the streaks.
@@ -528,6 +531,27 @@ pub struct HlGatewayArm {
 // tables are boxed).
 const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_344);
 
+/// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
+/// reports: a post-only cross, or an order in doubt that never landed,
+/// expired; any other refusal was rejected; the member's cancel — or its
+/// modify, which ended the original — is the member's; every other end is
+/// the venue's cancel.
+#[inline]
+const fn retired_why(kind: u8, reason: u8) -> u8 {
+    if kind == ORDER_EVENT_REJECTED {
+        if reason == ORDER_EVENT_REASON_BAD_ALO_PX || reason == ORDER_EVENT_REASON_EXPIRED {
+            RETIRED_EXPIRED
+        } else {
+            RETIRED_REJECTED
+        }
+    } else if reason == ORDER_EVENT_REASON_CANCEL_REQUESTED || reason == ORDER_EVENT_REASON_REPLACED
+    {
+        RETIRED_CANCELED_MEMBER
+    } else {
+        RETIRED_CANCELED_VENUE
+    }
+}
+
 impl HlGatewayArm {
     /// Boot: every table allocated here.
     ///
@@ -580,7 +604,7 @@ impl HlGatewayArm {
             n_rows: 0,
             events: Out::new(OrderEvent::ZERO),
             fills: Out::new(Fill::new(0, 0, Side::Bid, Price(0), Qty(0), 0)),
-            retired: Out::new((0, 0)),
+            retired: Out::new(Retired::default()),
             counters: ArmCounters::default(),
             stats: DispatchStats::default(),
             alo: boxed_array(0),
@@ -843,11 +867,16 @@ impl HlGatewayArm {
         }
     }
 
-    /// A final event other than `FILLED`: the event, the retirement, the
-    /// row gone.
+    /// A final event other than `FILLED`: the event, the retirement (with
+    /// the router's `why`), the row gone.
     fn close_as(&mut self, i: usize, kind: u8, reason: u8, now: u64, inferred: bool) {
         self.emit(i, kind, reason, now);
-        if !self.retired.push((self.rows[i].client_oid, self.cfg.slot)) {
+        let r = Retired::new(
+            self.rows[i].client_oid,
+            self.cfg.slot,
+            retired_why(kind, reason),
+        );
+        if !self.retired.push(r) {
             self.counters.dropped += 1;
         }
         self.remove(i, now, inferred);
@@ -1964,7 +1993,7 @@ impl OrderDispatch for HlGatewayArm {
         self.events.pop_into(out)
     }
 
-    fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+    fn try_next_retired(&mut self) -> Option<Retired> {
         self.retired.pop()
     }
 
@@ -2246,9 +2275,9 @@ mod tests {
 
     fn retired(arm: &mut HlGatewayArm) -> Vec<u64> {
         let mut out = Vec::new();
-        while let Some((cid, slot)) = arm.try_next_retired() {
-            assert_eq!(slot, SLOT);
-            out.push(cid);
+        while let Some(r) = arm.try_next_retired() {
+            assert_eq!(r.slot, SLOT);
+            out.push(r.client_oid);
         }
         out
     }

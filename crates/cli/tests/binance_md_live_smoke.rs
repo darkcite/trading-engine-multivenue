@@ -199,6 +199,8 @@ fn binance_md_live_smoke() {
             budget_bytes: 64 * 1024 * 1024,
         },
         None,
+        // The lane as a boot without a Binance arm runs it (no marks).
+        core_types::EVENT_LANE_FUNDING,
     )
     .expect("spawn_binance_multi");
 

@@ -47,7 +47,7 @@
 //! * **XG-5 — one halt registry.** Every reason lives in [`stats`]; the
 //!   first reason wins.
 //! * **Zero allocation after construction; no `unsafe`.** Every table is
-//!   sized by a const generic and allocated once (alloc gate 83); the
+//!   sized by a const generic and allocated once (alloc gate 95); the
 //!   rings' unsafe lives in `core-ring`.
 
 #![forbid(unsafe_code)]

@@ -9,8 +9,9 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
-spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
-MEXC (data-only), Hypercall options (data-only),
+spot/USDM/COIN-M, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
+MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
+PAPER only since HC11; the HC9 order arm runs as operator verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
 Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
@@ -18,7 +19,7 @@ the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 `claude-worker` Python process, and in-session) is an **offline strategy
 researcher** — never in the hot path.
 
-Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
+Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 255):
 0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
 O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
 `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
@@ -27,7 +28,12 @@ tables) · 6 xmm (HL post-only maker, since XMM XH1 2026-09-26; quotes on the
 queue law since XH2, paper only; `/state` `xmm` block, `engine_xmm_*`,
 `[labels.xmm]` and audit-pnl prints since XH3; boots only with
 `~/multivenue/xmm.toml`; `icdp` unlinked, its name refuses the boot,
-`backtest --member icdp` stays) · 7 open. Member timers run per
+`backtest --member icdp` stays) · 7 hcv (Hypercall S1 options vs the HAR
+σ̂, hedged on HL perps, since HC11 2026-09-26 — lands DARK, O-HC18: paper
+only on the held-quote law, in no configured mask; boots only with
+`~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
+in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
+risk-policy "HYPERCALL — slot 7"). Member timers run per
 slot (each on its own period). The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
 in the script; `ai` = 48 is the floor every name includes).
@@ -71,7 +77,7 @@ in the script; `ai` = 48 is the floor every name includes).
   `Order.strategy_id`, `RoutedDispatcher`, the E6 risk gate: per-order /
   open-orders / day / instance caps, the venue-fill ledger, six sticky halts
   incl. recon-STALE, `exec.HALT`) + `crates/exec-hyperliquid` (msgpack +
-  EIP-712 `Agent` signing pinned by 27 SDK vectors, mio+rustls `/exchange`
+  EIP-712 `Agent` signing pinned by 29 SDK vectors (two HIP-3 rows since HC10), mio+rustls `/exchange`
   arm with the request body rendered in place, `userFills` WS pumped from
   `on_idle` on the engine thread, reconciliation, address-budget governor,
   LAW E-8 sweeps). Armed ONLY by the two-switch interlock `--exec
@@ -244,8 +250,9 @@ in the script; `ai` = 48 is the floor every name includes).
   `/info outcomeMeta` for their successors (to the address resolved at
   boot — the HL thread never runs DNS; 3 s; at most once a minute);
   staleness stops judging an instance at its expiry; the backoff resets
-  only after a session that lived 30 s (the seven loops sharing
-  `should_reset_backoff`); `hyperliquid: run-loop returned` names each end
+  only after a session that lived 30 s (`core_net::should_reset_backoff`:
+  the seven outer loops, and since O-HC16 the Hypercall and MEXC internal
+  reconnects — MEXC per slot); `hyperliquid: run-loop returned` names each end
   (`err_site`, `io_kind`, `venue_code`, `lived_ms`, `acks`/`acks_expected`).
   Its ~1.5/s "parse errors" were BIN15 O8's one-sided outcome `bbo` drops,
   counted on their own from the next release build + restart
@@ -256,11 +263,20 @@ in the script; `ai` = 48 is the floor every name includes).
 - **HYPERCALL — the eighth market-data venue, DATA-ONLY, MERGED to main
   2026-09-26 (branch `hypercall`: HC0–HC7, HAR H1–H3, O-HC8), NOT yet
   configured live** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
-  rulings O-HC1..O-HC10: no keys, no exec arm; HC8–HC11 each a separate
-  ruling after the research's R1 gate; go-live is staged for a daily
+  rulings O-HC1..O-HC10: no keys, no exec arm; HC9–HC11 each a separate
+  ruling after the research's R1 gate — HC8, the sign-only signer, came
+  forward under O-HC17: `signer_eip712::hypercall`, every SDK type, 38
+  SDK vectors byte-exact, gate 83; HC9 — the order arm
+  `crates/exec-hypercall` — came forward under O-HC19 as the operator's
+  `hypercall-live` verbs, never armed by the engine — its mainnet dust
+  PASSED 2026-09-26 after the nonce fix `84fc32b` (the nonce is wall ms);
+  HC10 bound the HIP-3 hedge perps; HC11 built slot 7, `strategy-hcv`,
+  DARK paper, and HC11b made its book persist across restarts; go-live is
+  staged for a daily
   restart the operator names — `[hypercall]` and the `fees.toml` lines
-  just before it, `hypercall_history` scheduled, `[events]` pasted, the
-  HAR steps of the H3 plan §15). `VenueId::Hypercall = 9`, tick
+  just before it, `hypercall_history` scheduled, the HAR steps of the H3
+  plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
+  `VenueId::Hypercall = 9`, tick
   lane 7, `crates/ingress-hypercall` (one public WS: the one-frame
   indicative subscribe, quotes kept crossed or one-sided as published,
   per-provider sides on `ChannelId::ProviderQuote` = 14, index `Mark`s
@@ -268,7 +284,9 @@ in the script; `ai` = 48 is the floor every name includes).
   an SPSC handoff; the I-3 drain, `core_net::drain`, since the merge),
   capture label `hypercall`, `/state` ingress row 10,
   `[hypercall]` in universe.toml (all 12 underlyings, E 3 × K 8 × {C,P}
-  ≤ 1 024 instruments). `crates/core-settle`
+  ≤ 1 024 instruments); its options are in the AI boot universe (O-HC17:
+  signal and reference legs, orders unroutable; the index syms stay out).
+  `crates/core-settle`
   replicates the venue's settlement (median-of-means over a 1 s
   sample-and-hold grid, both bucket orders until the HC7 gate picks one;
   bench gate 80); worker lanes `hypercall_history` (the research store)
@@ -285,7 +303,10 @@ in the script; `ai` = 48 is the floor every name includes).
   `~/multivenue/har.toml` (`core_config::har`; `--har`/`--har-dir`; NOT
   passed by the wrapper — an absent default file is the pre-H3 engine),
   restored at boot from `~/multivenue/har/seed-<NAME>.tsv` merged with the
-  engine's own `state-<NAME>.tsv` (`core_vol::merge_rows`), published as
+  engine's own `state-<NAME>.tsv` (`core_vol::merge_rows`; written OFF the
+  engine thread since H3.7 — each close copies the engine into a
+  `core_ring::Mailbox`, the `har-state-writer` thread renders and fsyncs,
+  `cli::har_writer`), published as
   `/state.har` + `engine_har_*`; the worker's `har_backfill` (every source
   kept live, `--import-from`) and `har_seed` ride `candles-cycle.sh`
   hourly when `har.toml` exists (`har/drift.json`: the dashboard's drift
@@ -293,22 +314,27 @@ in the script; `ai` = 48 is the floor every name includes).
   `news.toml [events]` → `scheduled-events.json` every news cycle; the
   reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
   is now 1, the floor root (it returned 2).
-- **Gates at HEAD (the Hypercall merge onto XMM XH3, 2026-09-26; Foundry
-  as of the HYPARB merge):** nextest 3423 (6
+- **Gates at HEAD (branch `hypercall`: HC11b, after HC8–HC11 on B1–B5 of its
+  2026-09-26 plan; Foundry as of the HYPARB merge):**
+  nextest 3583 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
-  86/86 at the gates' pins (0 B/op; gates 72 and 77b pin `HttpsPost` and
-  `HttpsReq` at exactly 2 per request — rustls; +1 ignored child
-  helper) · clippy clean · `make license-check` OK · `make
+  99/99 at the gates' pins (0 B/op; gate 85 is slot 7 over the
+  held-quote law, its book handed to the writer's mailbox inside the
+  measured loop; gates 72 and 77b pin `HttpsPost` and
+  `HttpsReq` at exactly 2 per request — rustls; +2 ignored child
+  helpers) · clippy clean · `make license-check` OK · `make
   bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
-  samples within 15 % at load ~10; `vol/long_day_close_warm` is measured,
-  not baselined) · `make
+  samples within 15 % at load ~10; `vol/long_day_close_warm`,
+  `vol/long_state_copy_warm` and `signer/hypercall_place_order` are
+  measured, not baselined) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all ten ingress crates, the HYPARB crates,
-  strategy-xmm, core-fill and the engine) ·
+  strategy-xmm, strategy-hcv, core-settle, core-fill, the engine and the
+  state writers — `har_writer` and the generic `persist` thread) ·
   Foundry 11 unit +
   5 mainnet-fork (session sandbox; forge is not on this Mac) ·
-  worker pytest 1634 passed, 5 skipped (its one red,
+  worker pytest 1643 passed, 5 skipped (its one red,
   `test_news_lanes::test_report_prints_the_funnel`, is a date time-bomb —
   its fixture fell out of the 24 h window) · fuzz
   (poisoned start) `okx_frame`, `deribit_{jsonrpc_frame,option_ticker,vol_index}`,
@@ -322,13 +348,14 @@ in the script; `ai` = 48 is the floor every name includes).
   checks at the merge; ZC pass B re-ran `deribit_vol_index` 300 s,
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
-  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`); the Hypercall
+  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`; again for the
+  H3.7 mailbox, whose invariance a `compile_fail` doctest pins — nextest
+  runs no doctests); the Hypercall
   merge: every fuzz bin builds, `hypercall_{ws_frame,markets,summary}` and
   `http1_response` 60 s each clean (also at HC3)
-  · live smokes 60 s (the header-first subscribe renders, 2026-09-26):
-  MEXC and Binance, 0 parse errors, 0 reconnects, 0 ring drops;
-  Hypercall 90 s (HC5, before the merge), 0 parse errors, 0 reconnects,
-  0 ring drops
+  · live smokes (2026-09-26): Binance 60 s (the header-first subscribe
+  renders); MEXC 60 s and Hypercall 90 s at B2 (13:24–13:26Z, 992 and
+  1 558 ticks) — 0 parse errors, 0 reconnects, 0 ring drops each
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known
@@ -337,9 +364,10 @@ in the script; `ai` = 48 is the floor every name includes).
   `settlement_window_and_median_of_means_are_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
-  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`
-  and `guard_reports_zero_when_nothing_allocates` (bench, debug profile,
-  under full-workspace nextest load), the worker's UDS-fixture
+  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`,
+  `guard_reports_zero_when_nothing_allocates` and
+  `xmm_queue_law_place_land_fill_modify_cancel_are_zero_alloc` (bench,
+  debug profile, under full-workspace nextest load), the worker's UDS-fixture
   family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file`)
   — rerun in isolation before believing a red. `make py-lint` (ruff) is
   RED at HEAD and has been for weeks; `make lint` means clippy.
@@ -465,7 +493,10 @@ ordinals; the worker map keeps the OLD sym for a reordered name by design.
 Polymarket: `clobTokenIds` from the Gamma lane, `"<yes>:<no>"` pairs, ≤ 6
 tokens (token 7 collides with anchor id 7). Binance: lowercase stream
 symbols, one socket per symbol (254 at the current universe — the wrapper
-raises the launchd fd soft limit to 8192). MEXC: spot UPPERCASE
+raises the launchd fd soft limit to 8192). COIN-M (BX2): `coinm`
+`<coin>usd_perp` (ordinals from 3072), `coinm_dated` `<coin>usd_<yymmdd>`
+(from 3584), `binance-coinm:` descriptors, two sockets each on dstream;
+sizes are contracts (100 USD of face on BTC, 10 on the others). MEXC: spot UPPERCASE
 (`BTCUSDT`), perp `BASE_QUOTE` (`BTC_USDT`), perp ordinals from 512. After
 a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 
@@ -490,8 +521,9 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   frame rides a run loop's `Dispatch` (each const-asserted ≤ 64 B); a
   top-K change gate flips a `core_types::DepthPair`, never copies.
   Enforced by `make copy-audit` (the exec lane, core-net, core-ring, all
-  ten ingress crates, the HYPARB crates, strategy-xmm, core-fill and the
-  engine; a RATCHET against
+  ten ingress crates, the HYPARB crates, strategy-xmm, strategy-hcv,
+  core-settle, core-fill, the engine and the state-writer threads; a
+  RATCHET against
   `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
   `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)
   and the `zero-copy-auditor` agent. A cold operator module may opt out with
@@ -552,7 +584,7 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm,hypercall}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
-- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,xmm}` — the composed
+- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,xmm,hcv}` — the composed
   set and its members; `strategy-{latency-arb,cross-arb,ev,rule-tree,icdp}` are
   in-tree but unlinked/off. `book-builder`, `opt-registry`,
   `options-select`, `research-artifacts`.
@@ -566,6 +598,11 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   post gateway thread — built and loopback-tested, wired to the engine in
   XH4f); `exec-hyperliquid`'s test-only feature `testvenue` is a scripted
   rustls Hyperliquid (never in a shipping build).
+  `crates/exec-hypercall` — the Hypercall order arm (HC9, O-HC19): driven
+  only by the operator's `hypercall-live` verbs
+  (`scripts/hypercall-live.sh`; mainnet writes need `--confirm`); the
+  engine refuses a live `hypercall` slot until slot 7's live-arming
+  ruling (risk-policy "HYPERCALL — the order arm").
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
   path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
   compile-time asserted); mainnet only through a `MainnetAuthority`

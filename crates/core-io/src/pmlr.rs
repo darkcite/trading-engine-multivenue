@@ -94,6 +94,9 @@ pub enum SlotKind {
     /// [`core_types::DepthTopK`] — top-K L2 depth capture
     /// (WS10-B, D-B1; docs/ws10-engine-plumbing-design.md §3).
     Depth = 7,
+    /// [`core_types::ExecRecord`] — an execution arm's journal
+    /// (BX6, `binance-exec.pmlr`).
+    Exec = 8,
 }
 
 impl SlotKind {
@@ -129,6 +132,7 @@ impl SlotKind {
             5 => Some(Self::Event),
             6 => Some(Self::OptSummary),
             7 => Some(Self::Depth),
+            8 => Some(Self::Exec),
             _ => None,
         }
     }

@@ -77,6 +77,13 @@
 //! the private copies (`docs/risk-policy.md`, "core-ring caches the other
 //! side's index").
 //!
+//! ## The mailbox
+//!
+//! [`Mailbox`] (HAR H3.7) is the single-slot sibling for a message too
+//! large to queue: one slot handed back and forth by ownership — FREE is
+//! the producer's, FULL the consumer's — each side filling or reading it in
+//! place through a guard. Its own module doc carries the law.
+//!
 //! ## Memory ordering
 //!
 //! * Producer: a refresh loads `tail` with **Acquire** — it pairs with
@@ -100,6 +107,10 @@
     clippy::missing_safety_doc,
     clippy::undocumented_unsafe_blocks
 )]
+
+mod mailbox;
+
+pub use mailbox::{Filling, Mailbox, MailboxRx, MailboxTx, Taken};
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;

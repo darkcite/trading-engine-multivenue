@@ -377,11 +377,42 @@ fn bench_signer_sign_order(c: &mut Criterion) {
     });
 }
 
+// HC8: one Hypercall `PlaceOrder` — the struct hash over the body's
+// spans, the digest under the boot-cached separator, the signature. What
+// the exec arm (HC9) will pay per order; `docs/hot-path-latency.md`.
+fn bench_signer_hypercall_place_order(c: &mut Criterion) {
+    use signer_eip712::hypercall as hc;
+    let mut key = [0u8; 32];
+    key[31] = 1;
+    let sk = signer_eip712::parse_secret_key(&key).unwrap();
+    let ds = hc::hc_domain_separator(hc::HC_CHAIN_ID_MAINNET);
+    let wallet = [0x5a; 20];
+    let v = hc::HcPlaceView {
+        wallet: &wallet,
+        symbol: b"BTC-20261002-100000-C",
+        side: b"Buy",
+        size: b"0.5",
+        price: b"1234.5",
+        tif: b"ioc",
+        route: b"best_execution",
+        client_id: b"0x4843000300000000000000000000002a",
+        nonce: 1_790_400_000_000_123,
+    };
+    c.bench_function("signer/hypercall_place_order", |b| {
+        b.iter(|| {
+            let sig = hc::sign_place_order_with_key(&sk, &ds, black_box(&v)).unwrap();
+            black_box(sig);
+        });
+    });
+}
+
 // -----------------------------------------------------------------
 // 11. HAR H3.5 — the long-tenor day close: one warm `LongVolEngine`'s
 //     close law over the whole 1–40 d grid, what ONE series costs the
-//     engine thread at 00:00Z (`core_vol::LongVolSet` staggers the twelve
-//     one a poll). `docs/hot-path-latency.md` "Addendum 2026-09-26".
+//     engine thread at 00:01Z (`core_vol::LongVolSet` staggers the twelve
+//     one a poll). HAR H3.7 — and the state hand-off that follows it at
+//     the same poll: the warm engine copied whole into the state writer's
+//     mailbox. `docs/hot-path-latency.md` "Addendum 2026-09-26".
 // -----------------------------------------------------------------
 
 /// A ±10 bps-a-minute xorshift walk — every day observed, every ring
@@ -421,6 +452,15 @@ fn bench_long_vol_day_close(c: &mut Criterion) {
             black_box(e.x_1e9(DAY_NS));
         });
     });
+    // H3.7: the engine thread's whole share of a series' state write — the
+    // warm engine copied into its (boxed) mailbox slot.
+    let mut dst = Box::new(LongVolEngine::new());
+    c.bench_function("vol/long_state_copy_warm", |b| {
+        b.iter(|| {
+            black_box(&*e).copy_to(&mut dst);
+            black_box(&*dst);
+        });
+    });
 }
 
 criterion_group!(
@@ -434,6 +474,7 @@ criterion_group!(
     bench_queued_dispatcher_submit,
     bench_latency_arb_on_tick,
     bench_signer_sign_order,
+    bench_signer_hypercall_place_order,
     bench_long_vol_day_close,
 );
 criterion_main!(benches);

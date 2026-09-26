@@ -819,7 +819,7 @@ fn handle_mark_price_frame<C: Capture>(
         capture.parse_reject(now_ns(), payload);
         return;
     }
-    capture.event(&core_types::ChannelEvent::new(
+    let mut mark = core_types::ChannelEvent::new(
         now_ns(),
         core_types::VenueId::Binance,
         core_types::ChannelId::Mark,
@@ -828,7 +828,18 @@ fn handle_mark_price_frame<C: Capture>(
         f.ts_ns / 1_000_000,
         f.mark_px_1e6,
         f.index_px_1e6,
-    ));
+    );
+    capture.event(&mark);
+    // BX6 (O-BX29): the mark reaches the lane only when the boot armed a
+    // Binance arm (the Mark bit in the mask), flagged — in place, after the
+    // capture — for the execution side alone: the engine never hands it to
+    // a member.
+    if event_mask & core_types::event_lane_bit(core_types::ChannelId::Mark) != 0 {
+        mark.flags |= core_types::EVENT_FLAG_EXEC_ONLY;
+        if !event_tx.try_push_ref(&mark) {
+            status.inc_event_ring_drops();
+        }
+    }
     if f.has_funding == 1 {
         let ev = core_types::ChannelEvent::new(
             now_ns(),
@@ -2669,6 +2680,32 @@ mod tests {
         )
         .unwrap();
         assert!(erx.try_pop_ref().is_none(), "dated future never funds");
+    }
+
+    /// BX6 (O-BX29): with the Mark bit armed, the mark rides the lane
+    /// FLAGGED for the execution side (mark and index ×1e6), ahead of the
+    /// funding event; without the bit it stays capture-only (above).
+    #[test]
+    fn an_armed_mark_rides_the_lane_flagged_exec_only() {
+        let mut t = TestTransport::with_capacity(8192);
+        let mut d = Driver::new_mark_price(7, 42);
+        d.set_state(State::Steady);
+        let ring = Ring::<Tick, DEFAULT_TICK_RING_CAP>::new();
+        let (mut prod, _cons) = ring.split();
+        let status = core_metrics::IngressStatus::new();
+        let mut cap = CountingCapture::default();
+        let (mut etx, mut erx) = event_ring_pair();
+        let mark = br#"{"e":"markPriceUpdate","E":1562305380000,"s":"BTCUSDT","p":"11794.15","i":"11784.62","P":"11784.25","r":"0.00038167","T":1562306400000}"#;
+        t.inject_incoming(&ws_text_frame(mark));
+        let mask = core_types::EVENT_LANE_FUNDING | core_types::event_lane_bit(core_types::ChannelId::Mark);
+        super::drive_one(&mut t, &mut d, b"host", b"/", &mut prod, &mut etx, mask, &mut opt_ring_pair().0, &status, &mut cap)
+            .unwrap();
+        let m = *erx.try_pop_ref().expect("the mark on the lane");
+        assert_eq!(m.channel, core_types::ChannelId::Mark as u8);
+        assert_eq!(m.flags, core_types::EVENT_FLAG_EXEC_ONLY);
+        assert_eq!((m.v0, m.v1), (11_794_150_000, 11_784_620_000));
+        let f = *erx.try_pop_ref().expect("then the funding event");
+        assert_eq!((f.channel, f.flags), (core_types::ChannelId::Funding as u8, 0));
     }
 
     #[test]

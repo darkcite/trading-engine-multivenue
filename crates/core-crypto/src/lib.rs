@@ -16,6 +16,10 @@
 //!   ([`ct_eq`]).
 //! * `core-net` WS handshake key/accept encoding (base64 lives here;
 //!   the WS-specific SHA-1 stays in `core-net::ws_handshake`).
+//! * Binance REST signatures (BX4): an Ed25519 signature rides a query
+//!   as percent-encoded base64 ([`base64_encode_pct`]). Ed25519 itself is
+//!   NOT here — ruling O-BX5 puts it in `signer-ed25519`, on `ring` — so
+//!   this crate stays dependency-free.
 //!
 //! ## Hot-path posture
 //!
@@ -351,34 +355,86 @@ pub const fn base64_encoded_len(n: usize) -> usize {
 /// via the bounds check (fail-fast doctrine). Zero-alloc.
 pub fn base64_encode(input: &[u8], dst: &mut [u8]) -> usize {
     debug_assert!(dst.len() >= base64_encoded_len(input.len()));
+    b64_render::<false>(input, dst)
+}
+
+/// Upper bound of [`base64_encode_pct`]'s output for `n` input bytes:
+/// every base64 character escaped to three bytes.
+#[inline(always)]
+pub const fn base64_pct_encoded_max_len(n: usize) -> usize {
+    base64_encoded_len(n) * 3
+}
+
+/// Base64 (standard alphabet, `=` padding) percent-encoded for a URL
+/// query or an `application/x-www-form-urlencoded` body (RFC 3986 §2.1):
+/// `+` → `%2B`, `/` → `%2F`, `=` → `%3D`, every other alphabet byte as
+/// is. Returns the bytes written.
+///
+/// Binance's REST APIs take an Ed25519 signature this way. It is the
+/// same one-pass render as [`base64_encode`], escaping each character as
+/// it is written — no base64 string exists anywhere but in `dst`.
+///
+/// `dst` must hold [`base64_pct_encoded_max_len`]`(input.len())`: a
+/// programmer error otherwise, as for [`base64_encode`] (debug assert;
+/// release aborts on the bounds check). Zero-alloc.
+pub fn base64_encode_pct(input: &[u8], dst: &mut [u8]) -> usize {
+    debug_assert!(dst.len() >= base64_pct_encoded_max_len(input.len()));
+    b64_render::<true>(input, dst)
+}
+
+/// The one base64 walk behind both encoders: 3-byte groups, then the
+/// padded tail. `PCT` escapes each character as it is written; `false`
+/// monomorphizes to the plain encoder.
+#[inline(always)]
+fn b64_render<const PCT: bool>(input: &[u8], dst: &mut [u8]) -> usize {
     let mut i = 0usize;
     let mut o = 0usize;
     while i + 3 <= input.len() {
         let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
-        dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
-        dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
-        dst[o + 2] = B64_ALPHA[((n >> 6) & 0x3F) as usize];
-        dst[o + 3] = B64_ALPHA[(n & 0x3F) as usize];
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 6) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(B64_ALPHA[(n & 0x3F) as usize], &mut dst[o..]);
         i += 3;
-        o += 4;
     }
     let rem = input.len() - i;
     if rem == 1 {
         let n = (input[i] as u32) << 16;
-        dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
-        dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
-        dst[o + 2] = b'=';
-        dst[o + 3] = b'=';
-        o += 4;
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(b'=', &mut dst[o..]);
+        o += b64_put::<PCT>(b'=', &mut dst[o..]);
     } else if rem == 2 {
         let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
-        dst[o] = B64_ALPHA[((n >> 18) & 0x3F) as usize];
-        dst[o + 1] = B64_ALPHA[((n >> 12) & 0x3F) as usize];
-        dst[o + 2] = B64_ALPHA[((n >> 6) & 0x3F) as usize];
-        dst[o + 3] = b'=';
-        o += 4;
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 18) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 12) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(B64_ALPHA[((n >> 6) & 0x3F) as usize], &mut dst[o..]);
+        o += b64_put::<PCT>(b'=', &mut dst[o..]);
     }
     o
+}
+
+/// One base64 character into `dst`; with `PCT`, escaped when RFC 3986
+/// reserves it. Returns the bytes written (1, or 3 for an escape).
+#[inline(always)]
+fn b64_put<const PCT: bool>(c: u8, dst: &mut [u8]) -> usize {
+    if PCT {
+        let esc: &[u8; 2] = match c {
+            b'+' => b"2B",
+            b'/' => b"2F",
+            b'=' => b"3D",
+            _ => {
+                dst[0] = c;
+                return 1;
+            }
+        };
+        dst[0] = b'%';
+        dst[1] = esc[0];
+        dst[2] = esc[1];
+        return 3;
+    }
+    dst[0] = c;
+    1
 }
 
 // ---------------------------------------------------------------
@@ -632,6 +688,76 @@ mod tests {
         // Every byte must be valid base64 or padding.
         for b in dst {
             assert!(b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+        }
+    }
+
+    // ---- base64, percent-encoded (RFC 4648 §10 + RFC 3986 §2.1) ----
+
+    #[test]
+    fn base64_pct_rfc4648_vectors() {
+        // The RFC 4648 §10 table, its '=' padding escaped.
+        let cases: [(&[u8], &str); 7] = [
+            (b"", ""),
+            (b"f", "Zg%3D%3D"),
+            (b"fo", "Zm8%3D"),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg%3D%3D"),
+            (b"fooba", "Zm9vYmE%3D"),
+            (b"foobar", "Zm9vYmFy"),
+        ];
+        for (input, want) in cases {
+            let mut dst = [0u8; 32];
+            let n = base64_encode_pct(input, &mut dst);
+            assert_eq!(&dst[..n], want.as_bytes(), "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_pct_escapes_plus_and_slash() {
+        // 0xFB 0xFF encodes to "+/8=" — all three reserved bytes at once.
+        let mut plain = [0u8; 4];
+        assert_eq!(base64_encode(&[0xFB, 0xFF], &mut plain), 4);
+        assert_eq!(&plain, b"+/8=");
+        let mut dst = [0u8; 12];
+        let n = base64_encode_pct(&[0xFB, 0xFF], &mut dst);
+        assert_eq!(&dst[..n], b"%2B%2F8%3D");
+    }
+
+    #[test]
+    fn base64_pct_unescapes_to_the_plain_form_and_fits_its_bound() {
+        // Every 2-byte input: the escaped form decodes back to exactly
+        // base64_encode's output, never exceeds the bound, and carries
+        // no byte outside [A-Za-z0-9%].
+        let mut plain = [0u8; 4];
+        let mut dst = [0u8; 12];
+        let mut back = [0u8; 12];
+        let mut v = 0u32;
+        while v < 0x1_0000 {
+            let input = [(v >> 8) as u8, v as u8];
+            let p = base64_encode(&input, &mut plain);
+            let n = base64_encode_pct(&input, &mut dst);
+            assert!(n <= base64_pct_encoded_max_len(2));
+            let mut i = 0;
+            let mut m = 0;
+            while i < n {
+                let b = dst[i];
+                assert!(b.is_ascii_alphanumeric() || b == b'%', "byte {b:#x}");
+                if b == b'%' {
+                    back[m] = match (dst[i + 1], dst[i + 2]) {
+                        (b'2', b'B') => b'+',
+                        (b'2', b'F') => b'/',
+                        (b'3', b'D') => b'=',
+                        other => panic!("unexpected escape {other:?}"),
+                    };
+                    i += 3;
+                } else {
+                    back[m] = b;
+                    i += 1;
+                }
+                m += 1;
+            }
+            assert_eq!(&back[..m], &plain[..p], "input {input:?}");
+            v += 1;
         }
     }
 }

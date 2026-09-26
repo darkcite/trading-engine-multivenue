@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 17] = [
+const SLOT_KEYS: [&str; 20] = [
     "mode",
     "name",
     "venues",
@@ -96,6 +96,34 @@ const SLOT_KEYS: [&str; 17] = [
     "halt_on_recon_stale_ms",
     "halt_on_gain_usd_1e6",
     "halt_on_loss_usd_1e6",
+    "halt_on_margin_ratio_1e6",
+    "max_symbols",
+    "min_maker_ttl_ms",
+];
+
+/// Keys the `[exec.binance]` section accepts (BX6, plan §3.12).
+const BINANCE_KEYS: [&str; 21] = [
+    "network",
+    "account_mode",
+    "account_scope",
+    "owned_spot_assets",
+    "owned_usdm",
+    "owned_coinm",
+    "owned_option_underlyings",
+    "owned_equities",
+    "products",
+    "options_write",
+    "equity_session",
+    "equity_tokenize",
+    "equity_quote",
+    "recv_window_ms",
+    "stp_mode",
+    "countdown_ms",
+    "heartbeat_ms",
+    "orders_frac_1e6",
+    "qtr_frac_1e6",
+    "recon_every_ms",
+    "spin",
 ];
 
 /// Venue spellings the `venues` array accepts, and the `VenueId` byte
@@ -243,6 +271,25 @@ pub struct ExecSlot {
     /// (S7-L1): at cost, an open position's premium never reads as a
     /// loss, and a book that is never flat is still bounded.
     pub halt_on_loss_usd_1e6: i64,
+    /// **BX3 (D6, O-BX18)** — the margin ratio (maintenance margin over
+    /// margin balance or equity, ×1e6) at which the Binance arm reports
+    /// `MarginRisk` and the slot halts sticky. Only a slot that names
+    /// binance may set it; a live one must (`1..=`
+    /// [`MARGIN_RATIO_MAX_1E6`]). `0` = unset. The arm holds it per slot
+    /// (a side table outside the router's pinned route) and judges it
+    /// on every `ACCOUNT_UPDATE` / `MARGIN_CALL` and at recon (BX6).
+    pub halt_on_margin_ratio_1e6: i64,
+    /// **BX6 (plan §3.9)** — the most Binance symbols this slot may hold
+    /// positions or open orders in at once: the venue may make an account
+    /// with ≥ 50 such symbols reduce-only. Only a slot that names binance
+    /// may set it; `1..=`[`BN_MAX_SYMBOLS_MAX`], default
+    /// [`BN_MAX_SYMBOLS_DEFAULT`].
+    pub max_symbols: i64,
+    /// **BX6 (BX-13)** — the shortest maker TTL, ms, the Binance arm
+    /// accepts: the UM ICR rule counts a cancel within 5 s of placement.
+    /// Only a slot that names binance may set it; at least
+    /// [`BN_MIN_MAKER_TTL_MS`], which is also the default.
+    pub min_maker_ttl_ms: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
 }
@@ -270,6 +317,9 @@ impl ExecSlot {
             halt_on_recon_stale_ms: 0,
             halt_on_gain_usd_1e6: 0,
             halt_on_loss_usd_1e6: 0,
+            halt_on_margin_ratio_1e6: 0,
+            max_symbols: BN_MAX_SYMBOLS_DEFAULT,
+            min_maker_ttl_ms: BN_MIN_MAKER_TTL_MS,
             line: 0,
         }
     }
@@ -284,6 +334,22 @@ impl ExecSlot {
 /// **S7-L1** — the largest `request_topup_weight` a slot may write:
 /// 100 000 requests, $50 at the venue's 0.0005 USDC a request.
 pub const REQUEST_TOPUP_WEIGHT_MAX: i64 = 100_000;
+
+/// **BX3 (O-BX26)** — the highest `halt_on_margin_ratio_1e6` a slot may
+/// set: just under the venue's 80 % margin call. From BX6 any
+/// `MARGIN_CALL` raises `MarginRisk` (plan BX-20), so a threshold at or
+/// past it could never fire first — and one sampled toward the 95 %
+/// liquidation could never beat it.
+pub const MARGIN_RATIO_MAX_1E6: i64 = 799_999;
+
+/// **BX6** — the highest `max_symbols`: one under the venue's 50-symbol
+/// reduce-only rule (plan §1.4).
+pub const BN_MAX_SYMBOLS_MAX: i64 = 49;
+/// **BX6** — `max_symbols` when a slot does not say (plan §3.12).
+pub const BN_MAX_SYMBOLS_DEFAULT: i64 = 20;
+/// **BX6 (BX-13)** — the floor and default of `min_maker_ttl_ms`: the UM
+/// ICR rule's 5 s.
+pub const BN_MIN_MAKER_TTL_MS: i64 = 5_000;
 
 /// **S7-L1** — the smallest non-zero `request_topup_weight`: 1 000
 /// requests, $0.50. A purchase is itself a request, so a tiny weight
@@ -321,6 +387,9 @@ pub struct ExecFile {
     /// Only the slots the artifact actually named, in file order.
     /// A slot absent here is paper (law 2).
     pub slots: Vec<ExecSlot>,
+    /// **BX6** — `[exec.binance]`, the Binance arm's account and venue
+    /// knobs (plan §3.12). Required when a live slot names binance.
+    pub binance: Option<ExecBinance>,
 }
 
 impl ExecFile {
@@ -377,12 +446,259 @@ pub fn load(path: &Path) -> Result<(ExecFile, Vec<u8>), ExecError> {
     Ok((file, bytes))
 }
 
+/// **BX6 — `[exec.binance]`** (plan §3.12): the Binance arm's account and
+/// venue knobs. Words are kept as the artifact wrote them (the arm maps
+/// them to its own enums); every bound is checked here, with the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecBinance {
+    /// `network`: `"mainnet"` — the only network inside the engine (BX-16:
+    /// one network for the arm and for market data). REQUIRED.
+    pub network: String,
+    /// `account_mode`: `"classic"`, `"pm"` or `"pm_pro"` (O-BX2; asserted
+    /// against the account at boot, BX-19). REQUIRED.
+    pub account_mode: String,
+    /// `account_scope`: `"dedicated"` or `"shared"` (O-BX2a). REQUIRED.
+    pub account_scope: String,
+    /// `owned_spot_assets` (shared scope only): base assets, e.g. `"BTC"`.
+    pub owned_spot_assets: Vec<String>,
+    /// `owned_usdm` (shared scope only): symbols, e.g. `"BTCUSDT"`.
+    pub owned_usdm: Vec<String>,
+    /// `owned_coinm` (shared scope only): symbols, e.g. `"BTCUSD_PERP"`.
+    pub owned_coinm: Vec<String>,
+    /// `owned_option_underlyings` (shared scope only), e.g. `"BTCUSDT"`.
+    pub owned_option_underlyings: Vec<String>,
+    /// `owned_equities` (shared scope only), e.g. `"AAPL"`.
+    pub owned_equities: Vec<String>,
+    /// `products`: the armed products, from `spot`, `usdm`, `coinm`,
+    /// `options`, `equity`. REQUIRED, non-empty, no duplicate.
+    pub products: Vec<String>,
+    /// `options_write` (O-BX10): 1 lets the arm open short options where
+    /// the contract says `nakedSell`. Default 0.
+    pub options_write: bool,
+    /// `equity_session` (D5): `"RTH"`, `"EXTENDED"` or `"24H"`. Required
+    /// when equity is armed; refused otherwise.
+    pub equity_session: String,
+    /// `equity_tokenize` (D5): 0 or 1. Required when equity is armed.
+    pub equity_tokenize: bool,
+    /// `equity_quote` (D5), e.g. `"USDC"`. Required when equity is armed.
+    pub equity_quote: String,
+    /// `recv_window_ms` (BX-6): `1..=`[`BN_RECV_WINDOW_MAX_MS`], default
+    /// 1 000 — the stale-order guard, never the venue's 5 000 default.
+    pub recv_window_ms: i64,
+    /// `stp_mode`: `"EXPIRE_TAKER"`, `"EXPIRE_MAKER"` or `"EXPIRE_BOTH"`
+    /// (UM/CM refuse `NONE`). REQUIRED.
+    pub stp_mode: String,
+    /// `countdown_ms` (O-BX13): the UM dead-man's countdown while an order
+    /// rests. Default 30 000; at least twice `heartbeat_ms`.
+    pub countdown_ms: i64,
+    /// `heartbeat_ms`: how often the countdown is re-armed. Default 10 000.
+    pub heartbeat_ms: i64,
+    /// `orders_frac_1e6`: the share of each venue order window the arm may
+    /// use (plan §3.9). `1..=1 000 000`, default 800 000.
+    pub orders_frac_1e6: i64,
+    /// `qtr_frac_1e6`: the share of each UM quantitative-rule threshold
+    /// the arm may reach (plan §3.9). `1..=1 000 000`, default 800 000.
+    pub qtr_frac_1e6: i64,
+    /// `recon_every_ms` (plan §3.10): `10 000..=600 000`, default 60 000.
+    pub recon_every_ms: i64,
+    /// `spin`: 1 = the gateway thread busy-polls; 0 = it sleeps in `poll`
+    /// up to 1 ms. Default 1.
+    pub spin: bool,
+    /// Line the section header sat on.
+    pub line: usize,
+}
+
+/// **BX6 (BX-6)** — the widest `recv_window_ms` this binary sends: the
+/// venue's own default (it accepts up to 60 000, but a wider window only
+/// lets a delayed order land later than any stale-order guard means).
+pub const BN_RECV_WINDOW_MAX_MS: i64 = 5_000;
+
+/// The `products` words `[exec.binance]` accepts.
+pub const BN_PRODUCT_WORDS: [&str; 5] = ["spot", "usdm", "coinm", "options", "equity"];
+
+fn req_str(kv: &Kv, key: &str, line: usize, allowed: &[&str]) -> Result<String, ExecError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        Some((_, Value::Str(v), ln)) => {
+            if !allowed.contains(&v.as_str()) {
+                return Err(err(format!(
+                    "line {ln}: `{key}` must be one of {allowed:?} (saw \"{v}\")"
+                )));
+            }
+            Ok(v.clone())
+        }
+        Some((_, _, ln)) => Err(err(format!("line {ln}: `{key}` must be a string"))),
+        None => Err(err(format!(
+            "[exec.binance] at line {line}: `{key}` is required — one of {allowed:?}"
+        ))),
+    }
+}
+
+fn opt_strs(kv: &Kv, key: &str) -> Result<(Vec<String>, usize), ExecError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        Some((_, Value::Strs(list), ln)) => {
+            for (i, v) in list.iter().enumerate() {
+                if v.is_empty() || list[..i].contains(v) {
+                    return Err(err(format!(
+                        "line {ln}: `{key}` has an empty or duplicate entry \"{v}\""
+                    )));
+                }
+            }
+            Ok((list.clone(), *ln))
+        }
+        // `[]` parses as an empty `Ints` (no element type).
+        Some((_, Value::Ints(v), ln)) if v.is_empty() => Ok((Vec::new(), *ln)),
+        Some((_, _, ln)) => Err(err(format!("line {ln}: `{key}` must be an array of strings"))),
+        None => Ok((Vec::new(), 0)),
+    }
+}
+
+fn bounded(kv: &Kv, key: &str, default: i64, lo: i64, hi: i64) -> Result<i64, ExecError> {
+    let v = opt_int(kv, key, default)?;
+    if v < lo || v > hi {
+        return Err(err(format!("[exec.binance]: `{key} = {v}` must be {lo}..={hi}")));
+    }
+    Ok(v)
+}
+
+/// Finish `[exec.binance]`.
+fn finish_binance(kv: &Kv, line: usize) -> Result<ExecBinance, ExecError> {
+    let network = req_str(kv, "network", line, &["mainnet"])?;
+    let account_mode = req_str(kv, "account_mode", line, &["classic", "pm", "pm_pro"])?;
+    let account_scope = req_str(kv, "account_scope", line, &["dedicated", "shared"])?;
+    let stp_mode = req_str(kv, "stp_mode", line, &["EXPIRE_TAKER", "EXPIRE_MAKER", "EXPIRE_BOTH"])?;
+    let (products, pln) = opt_strs(kv, "products")?;
+    if products.is_empty() {
+        return Err(err(format!(
+            "[exec.binance] at line {line}: `products` is required and non-empty — from \
+             {BN_PRODUCT_WORDS:?}"
+        )));
+    }
+    for p in &products {
+        if !BN_PRODUCT_WORDS.contains(&p.as_str()) {
+            return Err(err(format!(
+                "line {pln}: unknown product \"{p}\" (known: {BN_PRODUCT_WORDS:?})"
+            )));
+        }
+    }
+    let armed = |w: &str| products.iter().any(|p| p == w);
+    let shared = account_scope == "shared";
+    let owned_keys: [(&str, &str); 5] = [
+        ("owned_spot_assets", "spot"),
+        ("owned_usdm", "usdm"),
+        ("owned_coinm", "coinm"),
+        ("owned_option_underlyings", "options"),
+        ("owned_equities", "equity"),
+    ];
+    let mut owned: [Vec<String>; 5] = Default::default();
+    for (i, (key, product)) in owned_keys.iter().enumerate() {
+        let (list, ln) = opt_strs(kv, key)?;
+        if !shared && !list.is_empty() {
+            return Err(err(format!(
+                "line {ln}: `{key}` is a shared-scope list, but `account_scope` is \
+                 \"dedicated\" — a dedicated account owns everything it trades"
+            )));
+        }
+        if shared && armed(product) && list.is_empty() {
+            return Err(err(format!(
+                "[exec.binance] at line {line}: a shared account arming `{product}` needs a \
+                 non-empty `{key}` — the owned list IS the arm's universe there (O-BX2a)"
+            )));
+        }
+        if !list.is_empty() && !armed(product) {
+            return Err(err(format!(
+                "line {ln}: `{key}` lists instruments of `{product}`, which `products` does \
+                 not arm"
+            )));
+        }
+        owned[i] = list;
+    }
+    let equity = armed("equity");
+    let eq_key = |k: &str| kv.iter().any(|(key, _, _)| key == k);
+    let (equity_session, equity_tokenize, equity_quote) = if equity {
+        let session = req_str(kv, "equity_session", line, &["RTH", "EXTENDED", "24H"])?;
+        let tok = match take_int(kv, "equity_tokenize")? {
+            Some((v @ (0 | 1), _)) => v == 1,
+            Some((v, ln)) => {
+                return Err(err(format!("line {ln}: `equity_tokenize` must be 0 or 1 (saw {v})")))
+            }
+            None => {
+                return Err(err(format!(
+                    "[exec.binance] at line {line}: `equity_tokenize` is required when equity \
+                     is armed (D5)"
+                )))
+            }
+        };
+        let quote = match kv.iter().find(|(k, _, _)| k == "equity_quote") {
+            Some((_, Value::Str(v), _)) if !v.is_empty() => v.clone(),
+            Some((_, _, ln)) => {
+                return Err(err(format!("line {ln}: `equity_quote` must be a non-empty string")))
+            }
+            None => {
+                return Err(err(format!(
+                    "[exec.binance] at line {line}: `equity_quote` is required when equity is \
+                     armed (D5)"
+                )))
+            }
+        };
+        (session, tok, quote)
+    } else {
+        if eq_key("equity_session") || eq_key("equity_tokenize") || eq_key("equity_quote") {
+            return Err(err(format!(
+                "[exec.binance] at line {line}: the `equity_*` keys need `equity` in `products`"
+            )));
+        }
+        (String::new(), false, String::new())
+    };
+    let options_write = bounded(kv, "options_write", 0, 0, 1)? == 1;
+    if options_write && !armed("options") {
+        return Err(err(format!(
+            "[exec.binance] at line {line}: `options_write = 1` needs `options` in `products`"
+        )));
+    }
+    let countdown_ms = bounded(kv, "countdown_ms", 30_000, 1_000, 600_000)?;
+    let heartbeat_ms = bounded(kv, "heartbeat_ms", 10_000, 100, 300_000)?;
+    if heartbeat_ms.saturating_mul(2) > countdown_ms {
+        return Err(err(format!(
+            "[exec.binance] at line {line}: `heartbeat_ms = {heartbeat_ms}` must be at most half \
+             of `countdown_ms = {countdown_ms}` — one late heartbeat must not let the venue \
+             cancel everything"
+        )));
+    }
+    let [owned_spot_assets, owned_usdm, owned_coinm, owned_option_underlyings, owned_equities] =
+        owned;
+    Ok(ExecBinance {
+        network,
+        account_mode,
+        account_scope,
+        owned_spot_assets,
+        owned_usdm,
+        owned_coinm,
+        owned_option_underlyings,
+        owned_equities,
+        products,
+        options_write,
+        equity_session,
+        equity_tokenize,
+        equity_quote,
+        recv_window_ms: bounded(kv, "recv_window_ms", 1_000, 1, BN_RECV_WINDOW_MAX_MS)?,
+        stp_mode,
+        countdown_ms,
+        heartbeat_ms,
+        orders_frac_1e6: bounded(kv, "orders_frac_1e6", 800_000, 1, 1_000_000)?,
+        qtr_frac_1e6: bounded(kv, "qtr_frac_1e6", 800_000, 1, 1_000_000)?,
+        recon_every_ms: bounded(kv, "recon_every_ms", 60_000, 10_000, 600_000)?,
+        spin: bounded(kv, "spin", 1, 0, 1)? == 1,
+        line,
+    })
+}
+
 /// Section the parser is currently inside.
 #[derive(Clone, PartialEq, Eq)]
 enum Sec {
     None,
     Policy(usize),
     Slot(usize, usize),
+    Binance(usize),
 }
 
 type Kv = Vec<(String, Value, usize)>;
@@ -489,8 +805,12 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         halt_on_recon_stale_ms: opt_int(kv, "halt_on_recon_stale_ms", 0)?,
         halt_on_gain_usd_1e6: opt_int(kv, "halt_on_gain_usd_1e6", 0)?,
         halt_on_loss_usd_1e6: opt_int(kv, "halt_on_loss_usd_1e6", 0)?,
+        halt_on_margin_ratio_1e6: opt_int(kv, "halt_on_margin_ratio_1e6", 0)?,
+        max_symbols: opt_int(kv, "max_symbols", BN_MAX_SYMBOLS_DEFAULT)?,
+        min_maker_ttl_ms: opt_int(kv, "min_maker_ttl_ms", BN_MIN_MAKER_TTL_MS)?,
         line,
     };
+    let names = |venue: &str| venue_id_from_name(venue).is_some_and(|id| s.venues.contains(&id));
 
     // A live slot with no venue can never dispatch anything — it would
     // refuse every order it emitted with `NoLiveRoute` and look like a
@@ -567,13 +887,6 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
             ("halt_on_ws_gap_ms", s.halt_on_ws_gap_ms),
             ("halt_on_asset_refusal_streak", s.halt_on_asset_refusal_streak),
             ("halt_on_recon_stale_ms", s.halt_on_recon_stale_ms),
-            // Not a threshold the router compares against — the ARM
-            // owns this one, and reports a flag. It is required for
-            // the same reason all the same: at `0` the budget trigger
-            // fires only at TOTAL exhaustion, which is a kill switch
-            // that waits until the address is already bricked. `0`
-            // would be a floor with no room under it.
-            ("request_budget_floor", s.request_budget_floor),
         ] {
             if v == 0 {
                 return Err(err(format!(
@@ -583,6 +896,72 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
                 )));
             }
         }
+    }
+    // Not a threshold the router compares against — the Hyperliquid ARM
+    // owns this one, and reports a flag. It is required for the same
+    // reason all the same: at `0` the budget trigger fires only at TOTAL
+    // exhaustion, which is a kill switch that waits until the address is
+    // already bricked. **Only a slot that trades Hyperliquid has that
+    // address budget** (BX3, plan §3.12): a Binance-only slot is governed
+    // by its own arm's windows instead.
+    if s.is_live() && names("hyperliquid") && s.request_budget_floor == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` on hyperliquid needs a non-zero \
+             `request_budget_floor` — `0` means UNSET here, never \"unlimited\", and a \
+             halt trigger with no headroom never fires in time"
+        )));
+    }
+
+    // BX3 (D6, O-BX18, O-BX26): the margin halt. A ratio is a Binance
+    // account's, so only a slot that names binance can set one; at or
+    // past the venue's 80 % margin call (which halts on its own) it could
+    // never fire first; and a live Binance slot must state it — `0` means
+    // UNSET, and a margin halt that is unset never fires.
+    if s.halt_on_margin_ratio_1e6 != 0 && !names("binance") {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `halt_on_margin_ratio_1e6` is a Binance margin \
+             halt, but the slot's `venues` does not name binance"
+        )));
+    }
+    // (`opt_int` has already refused a negative one.)
+    if s.halt_on_margin_ratio_1e6 > MARGIN_RATIO_MAX_1E6 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `halt_on_margin_ratio_1e6 = {}` exceeds \
+             {MARGIN_RATIO_MAX_1E6} — at or past the venue's 80 % margin call, which halts \
+             the slot on its own, this halt could never fire first",
+            s.halt_on_margin_ratio_1e6
+        )));
+    }
+    // BX6 (plan §3.9, BX-13): the breadth and maker-TTL knobs are the
+    // Binance arm's, bounded where the operator writes them.
+    let bn_knob = |k: &str| kv.iter().any(|(key, _, _)| key == k);
+    if (bn_knob("max_symbols") || bn_knob("min_maker_ttl_ms")) && !names("binance") {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `max_symbols` and `min_maker_ttl_ms` are the Binance \
+             arm's, but the slot's `venues` does not name binance"
+        )));
+    }
+    if s.max_symbols < 1 || s.max_symbols > BN_MAX_SYMBOLS_MAX {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `max_symbols = {}` must be 1..={BN_MAX_SYMBOLS_MAX} \
+             — at 50 symbols with positions or open orders the venue may make the account \
+             reduce-only",
+            s.max_symbols
+        )));
+    }
+    if s.min_maker_ttl_ms < BN_MIN_MAKER_TTL_MS {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `min_maker_ttl_ms = {}` is under \
+             {BN_MIN_MAKER_TTL_MS} — the venue counts a cancel within 5 s of placement \
+             against the account (ICR)",
+            s.min_maker_ttl_ms
+        )));
+    }
+    if s.is_live() && names("binance") && s.halt_on_margin_ratio_1e6 == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` on binance needs a non-zero \
+             `halt_on_margin_ratio_1e6` — `0` means UNSET here, never \"unlimited\""
+        )));
     }
 
     // S7-L1 (gap E): a top-up is money the arm spends on its own, so
@@ -645,18 +1024,21 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
     let mut cur: Kv = Vec::new();
     let mut policy: Option<Kv> = None;
     let mut slots: Vec<ExecSlot> = Vec::new();
+    let mut binance: Option<ExecBinance> = None;
 
     fn close(
         sec: &Sec,
         cur: &mut Kv,
         policy: &mut Option<Kv>,
         slots: &mut Vec<ExecSlot>,
+        binance: &mut Option<ExecBinance>,
     ) -> Result<(), ExecError> {
         let kv = std::mem::take(cur);
         match sec {
             Sec::None => {}
             Sec::Policy(_) => *policy = Some(kv),
             Sec::Slot(n, ln) => slots.push(finish_slot(&kv, *n, *ln)?),
+            Sec::Binance(ln) => *binance = Some(finish_binance(&kv, *ln)?),
         }
         Ok(())
     }
@@ -672,10 +1054,14 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
                 .strip_suffix(']')
                 .ok_or_else(|| err(format!("line {ln}: unterminated section header")))?
                 .trim();
-            close(&sec, &mut cur, &mut policy, &mut slots)?;
+            close(&sec, &mut cur, &mut policy, &mut slots, &mut binance)?;
             sec = match name {
                 "exec" if policy.is_none() => Sec::Policy(ln),
                 "exec" => return Err(err(format!("line {ln}: duplicate section [exec]"))),
+                "exec.binance" if binance.is_none() => Sec::Binance(ln),
+                "exec.binance" => {
+                    return Err(err(format!("line {ln}: duplicate section [exec.binance]")))
+                }
                 other => match other.strip_prefix("exec.slot.") {
                     Some(n) => {
                         let idx: usize = n.parse().map_err(|_| {
@@ -711,6 +1097,7 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
             Sec::None => return Err(err(format!("line {ln}: key outside any section"))),
             Sec::Policy(_) => &EXEC_KEYS,
             Sec::Slot(_, _) => &SLOT_KEYS,
+            Sec::Binance(_) => &BINANCE_KEYS,
         };
         // Law 1: an optional key must still be a KNOWN key.
         if !known.contains(&key) {
@@ -725,9 +1112,21 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
             ln,
         ));
     }
-    close(&sec, &mut cur, &mut policy, &mut slots)?;
+    close(&sec, &mut cur, &mut policy, &mut slots, &mut binance)?;
 
     let policy = policy.ok_or_else(|| err("missing `[exec]` section"))?;
+    // BX6: a live slot on binance reads the arm's account knobs; without
+    // them there is no account mode to assert and no product to arm.
+    let bn_id = venue_id_from_name("binance");
+    for sl in &slots {
+        if sl.is_live() && bn_id.is_some_and(|id| sl.venues.contains(&id)) && binance.is_none() {
+            return Err(err(format!(
+                "slot {} at line {}: `mode = \"live\"` on binance needs an `[exec.binance]` \
+                 section (network, account_mode, account_scope, products, stp_mode)",
+                sl.slot, sl.line
+            )));
+        }
+    }
     let enabled_i = opt_int(&policy, "enabled", 1)?;
     if enabled_i > 1 {
         return Err(err(format!(
@@ -738,6 +1137,7 @@ pub fn parse(src: &str) -> Result<ExecFile, ExecError> {
     Ok(ExecFile {
         enabled: enabled_i == 1,
         slots,
+        binance,
     })
 }
 
@@ -1117,5 +1517,116 @@ mode = "paper"
         let f = parse(&src).expect("the committed example must parse");
         // The example ships SAFE: nothing armed.
         assert_eq!(f.live_mask(), 0, "exec.toml.example must not arm anything");
+    }
+
+    /// A live Binance slot, every required key but the margin halt (and
+    /// no budget floor: that is Hyperliquid's).
+    const LIVE_BINANCE: &str = "[exec]\n[exec.slot.2]\nmode = \"live\"\nname = \"xsd\"\n\
+         venues = [\"binance\"]\nmax_order_usd_1e6 = 100000000\n\
+         cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
+         max_open_orders = 64\nhalt_on_reject_streak = 5\n\
+         halt_on_recon_drift_usd_1e6 = 5000000\nhalt_on_ws_gap_ms = 30000\n\
+         halt_on_asset_refusal_streak = 3\nhalt_on_recon_stale_ms = 300000\n";
+
+    /// BX3 (D6, O-BX18): a Binance key, a bounded ratio, required live.
+    #[test]
+    fn the_margin_halt_is_a_bounded_binance_key_required_on_a_live_binance_slot() {
+        let paper = |venue: &str, v: &str| {
+            format!(
+                "[exec]\n[exec.slot.2]\nmode = \"paper\"\nvenues = [\"{venue}\"]\n\
+                 halt_on_margin_ratio_1e6 = {v}\n"
+            )
+        };
+        let f = parse(&paper("binance", "600000")).unwrap();
+        assert_eq!(f.slot(2).halt_on_margin_ratio_1e6, 600_000);
+        assert!(parse(&paper("binance", "799999")).is_ok());
+        expect_err(&paper("binance", "800000"), "80 % margin call");
+        expect_err(&paper("binance", "-1"), ">= 0");
+        expect_err(&paper("hyperliquid", "600000"), "does not name binance");
+        expect_err(LIVE_BINANCE, "halt_on_margin_ratio_1e6");
+        let live = format!("{LIVE_BINANCE}halt_on_margin_ratio_1e6 = 600000\n{BN_SECTION}");
+        let f = parse(&live).unwrap();
+        assert_eq!(
+            f.slot(2).request_budget_floor,
+            0,
+            "no floor on a Binance-only slot"
+        );
+        assert_eq!(f.live_mask(), 1 << 2);
+    }
+
+    /// BX6: the smallest valid `[exec.binance]`.
+    const BN_SECTION: &str = "[exec.binance]\nnetwork = \"mainnet\"\naccount_mode = \"classic\"\n\
+                              account_scope = \"dedicated\"\nproducts = [\"usdm\"]\n\
+                              stp_mode = \"EXPIRE_TAKER\"\n";
+
+    /// BX6: a live Binance slot needs the arm's section; the section's
+    /// words and bounds are checked where they are written.
+    #[test]
+    fn the_binance_section_is_required_and_bounded() {
+        let live = format!("{LIVE_BINANCE}halt_on_margin_ratio_1e6 = 600000\n");
+        expect_err(&live, "needs an `[exec.binance]`");
+        let f = parse(&format!("{live}{BN_SECTION}")).unwrap();
+        let b = f.binance.as_ref().unwrap();
+        assert_eq!((b.account_mode.as_str(), b.account_scope.as_str()), ("classic", "dedicated"));
+        assert_eq!(b.products, vec![String::from("usdm")]);
+        assert_eq!((b.recv_window_ms, b.countdown_ms, b.heartbeat_ms), (1_000, 30_000, 10_000));
+        assert_eq!((b.orders_frac_1e6, b.qtr_frac_1e6, b.recon_every_ms), (800_000, 800_000, 60_000));
+        assert!(b.spin && !b.options_write);
+        assert_eq!((f.slot(2).max_symbols, f.slot(2).min_maker_ttl_ms), (20, 5_000));
+
+        let with = |extra: &str| format!("{live}{BN_SECTION}{extra}\n");
+        expect_err(&with("[exec.binance]"), "duplicate section [exec.binance]");
+        expect_err(&with("netwrk = 1"), "unknown key `netwrk`");
+        expect_err(&BN_SECTION.replace("mainnet", "demo"), "`network` must be one of");
+        expect_err(&BN_SECTION.replace("classic", "cross"), "`account_mode` must be one of");
+        expect_err(&BN_SECTION.replace("EXPIRE_TAKER", "NONE"), "`stp_mode` must be one of");
+        expect_err(&BN_SECTION.replace("products = [\"usdm\"]\n", ""), "`products` is required");
+        expect_err(&BN_SECTION.replace("[\"usdm\"]", "[\"usdm\", \"futures\"]"), "unknown product");
+        expect_err(&BN_SECTION.replace("[\"usdm\"]", "[\"usdm\", \"usdm\"]"), "duplicate entry");
+        expect_err(&with("recv_window_ms = 5001"), "`recv_window_ms = 5001` must be");
+        expect_err(&with("heartbeat_ms = 20000"), "at most half");
+        expect_err(&with("owned_usdm = [\"BTCUSDT\"]"), "shared-scope list");
+        let shared = format!("[exec]\n{}", BN_SECTION.replace("dedicated", "shared"));
+        expect_err(&shared, "needs a non-empty `owned_usdm`");
+        let ok = parse(&format!("{shared}owned_usdm = [\"BTCUSDT\"]\n")).unwrap();
+        assert_eq!(ok.binance.unwrap().owned_usdm, vec![String::from("BTCUSDT")]);
+        expect_err(&format!("{shared}owned_usdm = [\"BTCUSDT\"]\nowned_coinm = [\"X\"]\n"), "does not arm");
+        expect_err(&with("equity_session = \"RTH\""), "need `equity` in `products`");
+        let eq = format!("[exec]\n{}", BN_SECTION.replace("[\"usdm\"]", "[\"usdm\", \"equity\"]"));
+        expect_err(&eq, "`equity_session` is required");
+        assert!(parse(&format!(
+            "{eq}equity_session = \"RTH\"\nequity_tokenize = 0\nequity_quote = \"USDC\"\n"
+        ))
+        .is_ok());
+        expect_err(&with("options_write = 1"), "needs `options` in `products`");
+    }
+
+    /// BX6: the breadth and maker-TTL knobs are the Binance arm's.
+    #[test]
+    fn the_breadth_and_ttl_knobs_are_bounded_binance_keys() {
+        let live = format!("{LIVE_BINANCE}halt_on_margin_ratio_1e6 = 600000\n");
+        let f = parse(&format!("{live}max_symbols = 49\nmin_maker_ttl_ms = 9000\n{BN_SECTION}"))
+            .unwrap();
+        assert_eq!((f.slot(2).max_symbols, f.slot(2).min_maker_ttl_ms), (49, 9_000));
+        expect_err(&format!("{live}max_symbols = 50\n{BN_SECTION}"), "`max_symbols = 50` must be");
+        expect_err(&format!("{live}max_symbols = 0\n{BN_SECTION}"), "`max_symbols = 0` must be");
+        expect_err(&format!("{live}min_maker_ttl_ms = 4999\n{BN_SECTION}"), "under");
+        expect_err(
+            "[exec]\n[exec.slot.3]\nmode = \"paper\"\nvenues = [\"hyperliquid\"]\nmax_symbols = 5\n",
+            "are the Binance arm's",
+        );
+    }
+
+    /// BX3: the address budget floor is Hyperliquid's — still required on
+    /// every live slot that trades it, alone or beside another venue.
+    #[test]
+    fn the_budget_floor_is_required_wherever_hyperliquid_is_live() {
+        let no_floor = MINIMAL_LIVE.replace("request_budget_floor = 2000\n", "");
+        expect_err(&no_floor, "request_budget_floor");
+        let both = no_floor.replace(
+            "venues = [\"hyperliquid\"]",
+            "venues = [\"hyperliquid\", \"binance\"]\nhalt_on_margin_ratio_1e6 = 600000",
+        );
+        expect_err(&both, "request_budget_floor");
     }
 }

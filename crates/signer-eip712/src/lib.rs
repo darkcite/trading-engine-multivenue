@@ -18,6 +18,12 @@
 //!    canonical `Order(...)` type string. Encodes per the EIP-712
 //!    spec with no `serde`, no heap, no third-party EIP-712 crate.
 //! 4. [`sign_order`] — convenience that ties (3) and (2) together.
+//! 5. Any domain (HC8): [`Eip712Domain`] + [`domain_separator_of`]
+//!    (once, at boot), [`eip712_digest`], and the word encoders
+//!    [`enc_string`] / [`enc_address`] / [`enc_u64`] / [`enc_bool`] /
+//!    [`enc_i256`] that the venue modules absorb in place —
+//!    [`hyperliquid`] (the `Agent` envelope) and [`hypercall`] (every
+//!    type of the venue's SDK, pinned by its known-answer vectors).
 //!
 //! ## Polymarket constants (Phase 3 v1)
 //!
@@ -43,6 +49,10 @@
 /// Hyperliquid's `Agent` EIP-712 envelope (E2). Additive: nothing
 /// in the Polymarket path changes.
 pub mod hyperliquid;
+
+/// Hypercall's EIP-712 actions (HC8): every type of the venue's SDK,
+/// struct hashes over the request body's own bytes. Sign-only; additive.
+pub mod hypercall;
 
 use std::sync::OnceLock;
 
@@ -409,6 +419,109 @@ pub fn sign_order_with_key(o: &OrderToSign, sk: &SecretKey) -> Result<[u8; 65], 
 }
 
 // -----------------------------------------------------------------
+// Any domain, any struct (HC8)
+// -----------------------------------------------------------------
+
+/// A parameterised EIP-712 domain — the four-field `EIP712Domain` of
+/// [`EIP712_DOMAIN_TYPE`], its two strings hashed once. Built at boot;
+/// [`domain_separator_of`] makes the separator every per-signature
+/// digest then absorbs. (The Polymarket and Hyperliquid separators keep
+/// their own cached constants, and the tests pin both against this.)
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Eip712Domain {
+    /// `keccak256(name)`.
+    pub name_hash: [u8; 32],
+    /// `keccak256(version)`.
+    pub version_hash: [u8; 32],
+    /// `chainId` (a `uint256` on the wire; every chain here fits a u64).
+    pub chain_id: u64,
+    /// `verifyingContract`.
+    pub verifying_contract: [u8; 20],
+}
+
+impl Eip712Domain {
+    /// The domain of `name`, `version`, `chain_id` and
+    /// `verifying_contract`. Hashes the two strings: boot-time.
+    #[must_use]
+    pub fn new(name: &[u8], version: &[u8], chain_id: u64, verifying_contract: [u8; 20]) -> Self {
+        Self {
+            name_hash: keccak256(name),
+            version_hash: keccak256(version),
+            chain_id,
+            verifying_contract,
+        }
+    }
+}
+
+/// `hashStruct(EIP712Domain)` of `d` — the domain separator. Once per
+/// domain, at boot; the five words are absorbed where they are.
+#[must_use]
+pub fn domain_separator_of(d: &Eip712Domain) -> [u8; 32] {
+    keccak256_parts(&[
+        domain_typehash(),
+        &d.name_hash,
+        &d.version_hash,
+        &enc_u64(d.chain_id),
+        &enc_address(&d.verifying_contract),
+    ])
+}
+
+/// The digest a signature covers: `keccak256(0x19 0x01 ‖ domainSeparator
+/// ‖ structHash)`, absorbed in place (no 66-byte preimage).
+#[inline]
+#[must_use]
+pub fn eip712_digest(domain_separator: &[u8; 32], struct_hash: &[u8; 32]) -> [u8; 32] {
+    keccak256_parts(&[&[0x19, 0x01], domain_separator, struct_hash])
+}
+
+/// EIP-712 `string` / `bytes`: the keccak of the bytes — hashed straight
+/// from the caller's span (D7: the request body's own bytes).
+#[inline]
+#[must_use]
+pub fn enc_string(s: &[u8]) -> [u8; 32] {
+    keccak256(s)
+}
+
+/// EIP-712 `address`: the 20 bytes right-aligned in a zero word.
+#[inline]
+#[must_use]
+pub fn enc_address(a: &[u8; 20]) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    encode_address(&mut w, a);
+    w
+}
+
+/// EIP-712 `uint64` (any `uintN` ≤ 64): big-endian, right-aligned.
+#[inline]
+#[must_use]
+pub fn enc_u64(v: u64) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    encode_uint(&mut w, u128::from(v));
+    w
+}
+
+/// EIP-712 `bool`: a zero word with the last byte 0 or 1.
+#[inline]
+#[must_use]
+pub fn enc_bool(b: bool) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    w[31] = u8::from(b);
+    w
+}
+
+/// EIP-712 `int256` from an `i128`: two's complement, SIGN-EXTENDED over
+/// the high 16 bytes (a negative value's word starts `ff…ff`).
+#[inline]
+#[must_use]
+pub fn enc_i256(v: i128) -> [u8; 32] {
+    let mut w = if v < 0 { [0xFFu8; 32] } else { [0u8; 32] };
+    // COPY: the i128's 16 big-endian bytes into the low half of its 32 B
+    // word — the encoding IS the placement; per int256 field, stack only.
+    w[16..32].copy_from_slice(&v.to_be_bytes());
+    w
+}
+
+// -----------------------------------------------------------------
 // EIP-712 atom encoders — all left-padded to 32 bytes
 // -----------------------------------------------------------------
 
@@ -461,6 +574,46 @@ pub fn address_from_private_key(key: &[u8; 32]) -> Result<[u8; 20], SignError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HC8: the parameterised domain reproduces BOTH cached separators —
+    /// Polymarket's and Hyperliquid's — from their parameters, so the
+    /// generic encoding is the one the vectors already pin.
+    #[test]
+    fn a_parameterised_domain_reproduces_the_cached_separators() {
+        let pm = Eip712Domain::new(
+            DOMAIN_NAME.as_bytes(),
+            DOMAIN_VERSION.as_bytes(),
+            CHAIN_ID,
+            VERIFYING_CONTRACT,
+        );
+        assert_eq!(domain_separator_of(&pm), domain_separator());
+        let hl = Eip712Domain::new(
+            hyperliquid::HL_DOMAIN_NAME.as_bytes(),
+            hyperliquid::HL_DOMAIN_VERSION.as_bytes(),
+            hyperliquid::HL_CHAIN_ID,
+            hyperliquid::HL_VERIFYING_CONTRACT,
+        );
+        assert_eq!(domain_separator_of(&hl), hyperliquid::hl_domain_separator());
+    }
+
+    /// HC8: the word encoders — right-aligned, zero- or sign-extended.
+    #[test]
+    fn the_word_encoders_pad_and_sign_extend() {
+        assert_eq!(enc_u64(0x0102)[30..], [0x01, 0x02]);
+        assert_eq!(enc_u64(u64::MAX)[..24], [0u8; 24]);
+        assert_eq!(enc_bool(true)[31], 1);
+        assert_eq!(enc_bool(false), [0u8; 32]);
+        assert_eq!(enc_address(&[0xAB; 20])[..12], [0u8; 12]);
+        assert_eq!(enc_address(&[0xAB; 20])[12..], [0xAB; 20]);
+        assert_eq!(enc_i256(-1), [0xFF; 32], "-1 is all ones");
+        assert_eq!(enc_i256(1)[31], 1);
+        assert_eq!(enc_i256(1)[..31], [0u8; 31]);
+        let min = enc_i256(i128::MIN);
+        assert_eq!(min[..16], [0xFF; 16]);
+        assert_eq!((min[16], min[31]), (0x80, 0x00));
+        assert_eq!(enc_string(b""), keccak256(b""));
+        assert_eq!(eip712_digest(&[1; 32], &[2; 32]), keccak256_parts(&[&[0x19, 0x01], &[1; 32], &[2; 32]]));
+    }
 
     #[test]
     fn keccak_known_answer() {
