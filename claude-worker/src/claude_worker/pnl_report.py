@@ -167,7 +167,7 @@ def run_once(
 # ---- ICDP I6: fee tier file + day mode ------------------------------------
 
 FEES_PATH_DEFAULT: str = "~/multivenue/fees.toml"
-FEE_VENUES: tuple[str, ...] = ("pm", "bn", "okx", "deribit", "hl", "bybit", "mexc")
+FEE_VENUES: tuple[str, ...] = ("pm", "bn", "okx", "deribit", "hl", "bybit", "mexc", "hypercall")
 #: XSD-F: the instrument classes a `[fees.<venue>]` table may name — the
 #: harness's `--fee-bps <venue>.<class>` grammar (core_types::InstrumentClass).
 FEE_CLASSES: tuple[str, ...] = ("spot", "perp", "dated", "option", "prediction")

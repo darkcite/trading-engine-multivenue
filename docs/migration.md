@@ -6,6 +6,55 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — worker lanes for Hypercall: the research-store puller, the fee table (HC6)
+
+**What changed**
+
+- `claude_worker.hypercall_history` (new module, `python -m …` — never a
+  worker verb): one cycle pulls three public REST lanes under one
+  per-hour budget (`CLAUDE_WORKER_HC_BUDGET_PER_H`, default 120) into
+  tables beside candles in `candles.db`:
+  - `hc_trades` — `/trades` forward from the table's own
+    `max(trade_id)` (the venue's exclusive cursor), with the maker and
+    taker wallets the WS never sends;
+  - `hc_payouts` — `/settlement-payouts` for the wallets named by
+    `--wallets` / `CLAUDE_WORKER_HC_WALLETS` (none = the lane is skipped;
+    no wallet is compiled in). `--settle-prices` prints the derived
+    (underlying, expiry) → S table (S = K ± intrinsic) and flags an
+    expiry whose rows disagree — the reference HC7 is judged against;
+  - `hc_summary` — one `/options-summary?…&include_rfq_provider_quotes=true`
+    per `[hypercall] underlyings` entry: mark, IV, underlying, OI, best
+    bid/ask, provider count.
+  Host: `HYPERCALL_REST_HOST`. Serialized like every worker invocation
+  (`pgrep` first; WAL + busy timeout).
+- `frames.VENUE_HYPERCALL = 9`.
+- Fees: `pnl_report.FEE_VENUES` accepts `hypercall`; `fees.toml.example`
+  carries `hypercall = "0:0"` and `[fees.hypercall] option = "0:0"`,
+  UNVERIFIED (ruling O-HC7: the launch configuration — every public trade
+  row so far carries zero fees), with the published future schedule as a
+  commented fee-on STRESS variant (`option = "2:5"`,
+  `option_cap = "5:1250"`; the settlement leg is not expressible yet).
+
+**Impact**
+
+- **Store:** three new tables in `candles.db`, created on first run.
+- **Config:** optional env keys; the live `fees.toml` is the operator's
+  (see below).
+
+**Migration steps**
+
+1. Operator: add the two `hypercall` lines to `~/multivenue/fees.toml`
+   (copy them from `fees.toml.example`) before the first report that
+   includes a Hypercall run — an unknown venue table is fatal, and a
+   missing one charges the harness default.
+2. Optional: schedule `python -m claude_worker.hypercall_history` beside
+   the funding lane, with the provider wallets in
+   `CLAUDE_WORKER_HC_WALLETS` (the research vault names them).
+
+**Rollback**
+
+- Revert the HC6 commit; the tables are inert without the module.
+
 ## 2026-09-26 — the Hypercall ingress is spawned: two threads, `/state` row 10, `--raw-tap hypercall`, the venue metrics (HC5)
 
 **What changed**
