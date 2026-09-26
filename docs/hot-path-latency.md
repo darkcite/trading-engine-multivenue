@@ -371,6 +371,22 @@ and a QLIKE score.
   `/state.har` rows, the gauges' law and every state handed through its
   mailbox and taken back, 0 B/op).
 
+## Addendum 2026-09-26 (HC8) — a Hypercall signature
+
+`signer_eip712::hypercall` signs the venue's EIP-712 actions (sign-only; the
+exec arm is HC9's ruling). A live `PlaceOrder` is nine keccaks — its seven
+strings over the request body's own spans, the struct, and the digest under
+the boot-cached separator — and one secp256k1 signature.
+
+- **Measured on the M4 Pro** (`cargo bench -p bench --bench hot_path --
+  signer/`, 2026-09-26, beside the live engine at load ~10, niced):
+  `signer/hypercall_place_order` **20.0 µs** median (CI 19.97–20.03 µs);
+  the Polymarket order under the same conditions, `signer/sign_order_full`,
+  18.9 µs — the signature dominates both, the extra keccaks cost ~1 µs.
+- Allocation: none after the first signature builds the process-wide
+  secp256k1 context (bench gate 83, `hypercall_sign_with_key_is_zero_alloc`:
+  place, replace, cancel by client id, an RFQ accept — 0 B/op).
+
 Files referenced in this report:
 - `crates/engine/src/lib.rs`
 - `crates/strategy-*/src/lib.rs`

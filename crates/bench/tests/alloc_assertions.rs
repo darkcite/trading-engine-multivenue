@@ -10546,3 +10546,97 @@ fn long_vol_set_is_zero_alloc() {
     assert_eq!(allocs, 0, "the set's HAR path allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "the set's HAR path bytes should be zero: saw {bytes}");
 }
+
+/// **HC8 gate 83 — a Hypercall signature is 0 B/op.** The exec arm's
+/// per-order work: each struct hash over the request body's OWN spans
+/// (D7 — the view borrows the rendered body), the digest under the
+/// boot-cached domain separator, and the secp256k1 signature — for the
+/// live `PlaceOrder`, a `ReplaceOrder`, a `CancelOrderByClientId` and an
+/// `AcceptRFQQuote` (a sign-extended `int256`). The body, the key and the
+/// separator are boot; the first signature builds the process-wide
+/// secp256k1 context outside the guard, as the arm does at boot.
+#[test]
+fn hypercall_sign_with_key_is_zero_alloc() {
+    use signer_eip712::hypercall as hc;
+    // The value of `"key":"<value>"` in `body` (boot-time lookup).
+    fn span<'a>(body: &'a [u8], key: &[u8]) -> &'a [u8] {
+        let mut i = 0usize;
+        while i + key.len() + 4 <= body.len() {
+            if body[i] == b'"'
+                && &body[i + 1..i + 1 + key.len()] == key
+                && &body[i + 1 + key.len()..i + 4 + key.len()] == b"\":\""
+            {
+                let from = i + 4 + key.len();
+                let mut to = from;
+                while body[to] != b'"' {
+                    to += 1;
+                }
+                return &body[from..to];
+            }
+            i += 1;
+        }
+        panic!("gate 83: no {key:?} in the body");
+    }
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 83 key");
+    let ds = hc::hc_domain_separator(hc::HC_CHAIN_ID_MAINNET);
+    let wallet = [0x5a; 20];
+    let body: Vec<u8> = br#"{"symbol":"BOT-20260925-2.5-C","side":"Buy","size":"12.345678","price":"0.0005","tif":"ioc","route":"best_execution","client_id":"0x4843000300000000000000000000002a","order_id":"123456789"}"#.to_vec();
+    let (symbol, side, size, price) =
+        (span(&body, b"symbol"), span(&body, b"side"), span(&body, b"size"), span(&body, b"price"));
+    let (tif, route, cloid, order_id) =
+        (span(&body, b"tif"), span(&body, b"route"), span(&body, b"client_id"), span(&body, b"order_id"));
+    let (rfq, quote) = ([0x11u8; 32], [0x22u8; 32]);
+    let warm = hc::revoke_all_agents_struct_hash(0);
+    hc::sign_hc_with_key(&sk, &ds, &warm).expect("gate 83 warm-up");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 1_000 {
+        let place = hc::HcPlaceView {
+            wallet: &wallet,
+            symbol,
+            side,
+            size,
+            price,
+            tif,
+            route,
+            client_id: cloid,
+            nonce: 1_790_400_000_000_000 + n,
+        };
+        let s1 = hc::sign_place_order_with_key(&sk, &ds, &place).expect("gate 83 place");
+        let replace = hc::HcReplaceView {
+            wallet: &wallet,
+            order_id,
+            symbol,
+            side,
+            size,
+            price,
+            tif,
+            client_id: cloid,
+            nonce: n,
+        };
+        let s2 = hc::sign_hc_with_key(&sk, &ds, &hc::replace_order_struct_hash(&replace))
+            .expect("gate 83 replace");
+        let s3 = hc::sign_hc_with_key(&sk, &ds, &hc::cancel_order_by_client_id_struct_hash(&wallet, cloid, n))
+            .expect("gate 83 cancel");
+        let s4 = hc::sign_hc_with_key(
+            &sk,
+            &ds,
+            &hc::accept_rfq_quote_struct_hash(&rfq, &quote, -(n as i128) - 1, &wallet, n),
+        )
+        .expect("gate 83 rfq");
+        acc = acc
+            .wrapping_add(u64::from(s1[0]))
+            .wrapping_add(u64::from(s2[1]))
+            .wrapping_add(u64::from(s3[2]))
+            .wrapping_add(u64::from(s4[64]));
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "Hypercall signing allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "Hypercall signing bytes should be zero: saw {bytes}");
+}

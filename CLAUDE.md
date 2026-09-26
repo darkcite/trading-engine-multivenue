@@ -257,8 +257,10 @@ in the script; `ai` = 48 is the floor every name includes).
 - **HYPERCALL — the eighth market-data venue, DATA-ONLY, MERGED to main
   2026-09-26 (branch `hypercall`: HC0–HC7, HAR H1–H3, O-HC8), NOT yet
   configured live** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
-  rulings O-HC1..O-HC10: no keys, no exec arm; HC8–HC11 each a separate
-  ruling after the research's R1 gate; go-live is staged for a daily
+  rulings O-HC1..O-HC10: no keys, no exec arm; HC9–HC11 each a separate
+  ruling after the research's R1 gate — HC8, the sign-only signer, came
+  forward under O-HC17: `signer_eip712::hypercall`, every SDK type, 38
+  SDK vectors byte-exact, gate 83; go-live is staged for a daily
   restart the operator names — `[hypercall]` and the `fees.toml` lines
   just before it, `hypercall_history` scheduled, the HAR steps of the H3
   plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
@@ -300,22 +302,24 @@ in the script; `ai` = 48 is the floor every name includes).
   `news.toml [events]` → `scheduled-events.json` every news cycle; the
   reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
   is now 1, the floor root (it returned 2).
-- **Gates at HEAD (the Hypercall merge onto XMM XH3, 2026-09-26; Foundry
-  as of the HYPARB merge):** nextest 3423 (6
+- **Gates at HEAD (branch `hypercall`: B1–B5 of its 2026-09-26 plan after
+  the Hypercall merge onto XMM XH3; Foundry as of the HYPARB merge):**
+  nextest 3447 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
-  86/86 at the gates' pins (0 B/op; gates 72 and 77b pin `HttpsPost` and
+  87/87 at the gates' pins (0 B/op; gates 72 and 77b pin `HttpsPost` and
   `HttpsReq` at exactly 2 per request — rustls; +1 ignored child
   helper) · clippy clean · `make license-check` OK · `make
   bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
-  samples within 15 % at load ~10; `vol/long_day_close_warm` is measured,
-  not baselined) · `make
+  samples within 15 % at load ~10; `vol/long_day_close_warm`,
+  `vol/long_state_copy_warm` and `signer/hypercall_place_order` are
+  measured, not baselined) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all ten ingress crates, the HYPARB crates,
-  strategy-xmm, core-fill and the engine) ·
+  strategy-xmm, core-fill, the engine and the HAR state writer) ·
   Foundry 11 unit +
   5 mainnet-fork (session sandbox; forge is not on this Mac) ·
-  worker pytest 1634 passed, 5 skipped (its one red,
+  worker pytest 1643 passed, 5 skipped (its one red,
   `test_news_lanes::test_report_prints_the_funnel`, is a date time-bomb —
   its fixture fell out of the 24 h window) · fuzz
   (poisoned start) `okx_frame`, `deribit_{jsonrpc_frame,option_ticker,vol_index}`,
@@ -329,13 +333,14 @@ in the script; `ai` = 48 is the floor every name includes).
   checks at the merge; ZC pass B re-ran `deribit_vol_index` 300 s,
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
-  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`); the Hypercall
+  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`; again for the
+  H3.7 mailbox, whose invariance a `compile_fail` doctest pins — nextest
+  runs no doctests); the Hypercall
   merge: every fuzz bin builds, `hypercall_{ws_frame,markets,summary}` and
   `http1_response` 60 s each clean (also at HC3)
-  · live smokes 60 s (the header-first subscribe renders, 2026-09-26):
-  MEXC and Binance, 0 parse errors, 0 reconnects, 0 ring drops;
-  Hypercall 90 s (the merged content, 2026-09-26 12:00Z), 1 494 ticks,
-  0 parse errors, 0 reconnects, 0 ring drops
+  · live smokes (2026-09-26): Binance 60 s (the header-first subscribe
+  renders); MEXC 60 s and Hypercall 90 s at B2 (13:24–13:26Z, 992 and
+  1 558 ticks) — 0 parse errors, 0 reconnects, 0 ring drops each
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known
@@ -343,9 +348,10 @@ in the script; `ai` = 48 is the floor every name includes).
   `hl_outcome_meta_parsers_are_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
-  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`
-  and `guard_reports_zero_when_nothing_allocates` (bench, debug profile,
-  under full-workspace nextest load), the worker's UDS-fixture
+  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`,
+  `guard_reports_zero_when_nothing_allocates` and
+  `xmm_queue_law_place_land_fill_modify_cancel_are_zero_alloc` (bench,
+  debug profile, under full-workspace nextest load), the worker's UDS-fixture
   family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file`)
   — rerun in isolation before believing a red. `make py-lint` (ruff) is
   RED at HEAD and has been for weeks; `make lint` means clippy.
