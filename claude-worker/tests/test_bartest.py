@@ -67,6 +67,7 @@ def test_missing_fees_file_is_fail_fast():
 def test_venue_slot_mapping_and_unknown_descriptor():
     assert claude_worker.bartest.venue_of("hyperliquid:BTC") == "hl"
     assert claude_worker.bartest.venue_of("binance-usdm:btcusdt") == "bn"
+    assert claude_worker.bartest.venue_of("binance-coinm:btcusd_perp") == "bn"  # BX2
     assert claude_worker.bartest.venue_of("bybit-linear:BTCUSDT") == "bybit"
     assert claude_worker.bartest.venue_of("mexc:AAPLXUSDT") == "mexc"
     assert claude_worker.bartest.venue_of("mexc-perp:XAU_USDT") == "mexc"

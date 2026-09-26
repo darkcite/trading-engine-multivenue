@@ -35,6 +35,9 @@ use core_types::InstrumentClass;
 /// * `binance:<sym>` → `Spot`; `binance-usdm:<sym>` → `Perp`, or
 ///   `Dated` when the venue symbol carries the delivery suffix
 ///   `_yymmdd` (`btcusdt_260327`); `binance-opt:<name>` → `Option`;
+///   `binance-coinm:<sym>` (BX2) → `Perp` for `…_perp`, `Dated` for
+///   `…_yymmdd`, anything else unknown — inverse is a discovery-row
+///   flag, never a class;
 /// * `okx:<instId>` — `…-SWAP` → `Perp`; `…-C` / `…-P` with a strike
 ///   segment → `Option`; a 6-digit date segment → `Dated`; the plain
 ///   `BASE-QUOTE` pair → `Spot`;
@@ -77,6 +80,7 @@ pub fn class_of_descriptor(descriptor: &str) -> Option<InstrumentClass> {
             InstrumentClass::Perp
         }),
         "binance-opt" => Some(InstrumentClass::Option),
+        "binance-coinm" => bn_coinm_class(name),
         "okx" => okx_class(name),
         "deribit" => deribit_class(name),
         "hyperliquid" => Some(hl_class(name)),
@@ -119,6 +123,20 @@ fn has_bn_delivery_suffix(name: &str) -> bool {
     match name.rsplit_once('_') {
         Some((base, tail)) => !base.is_empty() && is_digits(tail, 6),
         None => false,
+    }
+}
+
+/// COIN-M stream symbols (`universe.rs` `coinm` / `coinm_dated`):
+/// `btcusd_perp` → `Perp`, `btcusd_261225` → `Dated`. The list
+/// validators require one of the two suffixes, so any other shape is a
+/// descriptor this law does not know.
+fn bn_coinm_class(name: &str) -> Option<InstrumentClass> {
+    match name.rsplit_once('_') {
+        Some((base, "perp")) if !base.is_empty() => Some(InstrumentClass::Perp),
+        Some((base, tail)) if !base.is_empty() && is_digits(tail, 6) => {
+            Some(InstrumentClass::Dated)
+        }
+        _ => None,
     }
 }
 
@@ -228,6 +246,8 @@ mod tests {
         assert_eq!(class_of_descriptor("binance-usdm:btcusdt"), Some(Perp));
         assert_eq!(class_of_descriptor("binance-usdm:btcusdt_260327"), Some(Dated));
         assert_eq!(class_of_descriptor("binance-opt:BTC-260912-76500-C"), Some(Opt));
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd_perp"), Some(Perp));
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd_261225"), Some(Dated));
         assert_eq!(class_of_descriptor("okx:BTC-USDT"), Some(Spot));
         assert_eq!(class_of_descriptor("okx:ETH-USDT-SWAP"), Some(Perp));
         assert_eq!(class_of_descriptor("okx:BTC-USDT-260926"), Some(Dated));
@@ -274,6 +294,11 @@ mod tests {
         assert_eq!(class_of_descriptor("run-1789187999444152000/sym-0x0200000a"), None);
         assert_eq!(class_of_descriptor("kraken:XBTUSD"), None);
         assert_eq!(class_of_descriptor("binance:"), None);
+        // BX2: a COIN-M name without one of its two suffixes.
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd"), None);
+        assert_eq!(class_of_descriptor("binance-coinm:btcusd_2612"), None);
+        assert_eq!(class_of_descriptor("binance-coinm:_perp"), None);
+        assert_eq!(class_of_descriptor("binance-coinm:"), None);
         assert_eq!(class_of_descriptor("mexc:"), None);
         assert_eq!(class_of_descriptor("mexc-perp:"), None);
         assert_eq!(class_of_descriptor("mexc-spot:BTCUSDT"), None);

@@ -1004,6 +1004,18 @@ pub fn bn_usdm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [Bina
     ]
 }
 
+/// BX2 (O-BX3): the two COIN-M slots one instrument gets on `host`
+/// (`BINANCE_COINM_WS_HOST`, dstream). K10 (measured 2026-09-26)
+/// found dstream serving `@bookTicker` and `@markPrice` on `/ws/`,
+/// `/market/ws/` and `/public/ws/` alike, so COIN-M takes the USDⓈ-M
+/// path law unchanged — one builder, so a later split of the two laws
+/// is one edit here. The frames carry `st: 2`; bookTicker quantities
+/// are CONTRACTS (100 USD on BTC, 10 USD on the others), not coin.
+#[must_use]
+pub fn bn_coinm_specs(host: &str, name: &str, sym: core_types::SymbolId) -> [BinanceConnSpec; 2] {
+    bn_usdm_specs(host, name, sym)
+}
+
 /// BX0-F2: the options lane's combined path on fstream's routed
 /// `/market` path — one `<underlying>@optionMarkPrice` stream per
 /// configured underlying (lowercase). Each push is ONE array holding
@@ -7971,14 +7983,15 @@ fn log_pin_outcome(thread_label: &str, core_id: usize) {
 // ---------------------------------------------------------------
 
 /// Boot-only venue REST discovery: validates every `--okx-symbols` /
-/// `--deribit-symbols` / `--hl-coins` / `--polymarket-asset-id` entry
+/// `--deribit-symbols` / `--hl-coins` / `--polymarket-asset-id` entry,
+/// and every Binance list (spot, USDⓈ-M, dated, COIN-M and the eapi
+/// options chain, each against its own product's `exchangeInfo`),
 /// against the venue's live instrument universe *before* any ingress
 /// thread spawns, and (OKX only) builds the discovery-gated
 /// [`ingress_okx::OkxSymbolTable`] `build_okx_symbol_table` now
 /// requires.
 ///
-/// BN + RPC deliberately have no discovery here: Binance discovery is
-/// out of Phase-8 scope (plan §6.1), and Polygon RPC has no
+/// RPC deliberately has no discovery here: Polygon RPC has no
 /// instrument universe to validate against (it streams block headers,
 /// not a tradable-instrument list).
 ///
@@ -7997,7 +8010,7 @@ pub mod boot_discovery {
     use core_config::universe::{OptionsPolicy, BN_OPT_ORDINAL_BASE, OPT_ORDINAL_BASE};
     use core_config::Config;
     use core_types::{make_symbol_id, SymbolId, VenueId};
-    use ingress_binance::discovery::BnDiscovery;
+    use ingress_binance::discovery::{BnDiscovery, BnSymbolRow};
     use ingress_deribit::discovery::{parse_index_price, select_capped_chain, DeribitDiscovery};
     use ingress_hyperliquid::discovery::HlDiscovery;
     use ingress_okx::discovery::OkxDiscovery;
@@ -8028,6 +8041,42 @@ pub mod boot_discovery {
         /// `universe_total()` for hl/pm — see each venue's bullet in
         /// the phase-8e plan §6.1).
         pub universe: u32,
+    }
+
+    /// BX2: the Binance lists the boot audit checks — M1 spot and
+    /// USDⓈ-M, the WS5 dated class, and the COIN-M perpetuals and
+    /// delivery futures (lowercase stream symbols, file order).
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct BnLists<'a> {
+        /// `[binance] spot`.
+        pub spot: &'a [String],
+        /// `[binance] usdm`.
+        pub usdm: &'a [String],
+        /// `[binance] usdm_dated`.
+        pub dated: &'a [String],
+        /// `[binance] coinm`.
+        pub coinm: &'a [String],
+        /// `[binance] coinm_dated`.
+        pub coinm_dated: &'a [String],
+    }
+
+    impl BnLists<'_> {
+        /// No Binance list is configured (the audit is skipped).
+        pub fn is_empty(&self) -> bool {
+            self.spot.is_empty()
+                && self.usdm.is_empty()
+                && self.dated.is_empty()
+                && self.coinm.is_empty()
+                && self.coinm_dated.is_empty()
+        }
+
+        fn configured(&self) -> u32 {
+            (self.spot.len()
+                + self.usdm.len()
+                + self.dated.len()
+                + self.coinm.len()
+                + self.coinm_dated.len()) as u32
+        }
     }
 
     /// Everything [`run_all`] produces, consumed by the cli's `run()`
@@ -8137,13 +8186,16 @@ pub mod boot_discovery {
         }
     }
 
-    /// `None` ⇒ `symbol_upper` is a TRADING Binance symbol in the
-    /// ingested exchangeInfo table. `Some(reason)` ⇒ MISSING.
-    pub fn bn_missing_reason(d: &BnDiscovery, symbol_upper: &[u8]) -> Option<MissingReason> {
-        match d.find(symbol_upper) {
-            None => Some("not_found"),
-            Some(row) if !row.trading => Some("not_trading"),
-            Some(_) => None,
+    /// The Binance audit law over one looked-up row: listed, TRADING,
+    /// and — on a dated list — a dated contract class (WS5: a perpetual
+    /// misfiled there would ride the dated ordinal block and lie to
+    /// every offline consumer about its class). `Ok` hands the row on.
+    fn bn_row_audit(row: Option<&BnSymbolRow>, dated: bool) -> Result<&BnSymbolRow, MissingReason> {
+        match row {
+            None => Err("not_found"),
+            Some(r) if !r.trading => Err("not_trading"),
+            Some(r) if dated && !r.contract_type.is_dated() => Err("not_dated"),
+            Some(r) => Ok(r),
         }
     }
 
@@ -8771,133 +8823,114 @@ pub mod boot_discovery {
         })
     }
 
+    /// The Binance boot audit (M1, WS5, BX2). One table per product
+    /// page — a name listed on two products (spot `BTCUSDT`, USDⓈ-M
+    /// `BTCUSDT`) must resolve against the product it is configured
+    /// for, never against whichever page was ingested first:
+    ///
+    /// - spot: one `?symbol=` probe per configured symbol (the venue
+    ///   400s unknown symbols — MISSING, not fatal), 150 ms apart;
+    /// - USDⓈ-M: one `GET /fapi/v1/exchangeInfo` page for `usdm` and
+    ///   `usdm_dated`;
+    /// - COIN-M (BX2): one `GET /dapi/v1/exchangeInfo` page for `coinm`
+    ///   and `coinm_dated` (rows say `contractStatus`, carry
+    ///   `contractSize`).
+    ///
+    /// Every matched instrument's venue rules are logged (F11); every
+    /// other transport or parse failure stays fatal.
     fn run_bn(
         cfg: &Config,
         tls: &Arc<rustls::ClientConfig>,
-        spot: &[String],
-        usdm: &[String],
-        dated: &[String],
+        lists: BnLists<'_>,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
     ) -> Result<VenueCoverage, &'static str> {
-        let mut d = BnDiscovery::new();
         let mut matched = 0u32;
+        let mut universe = 0u32;
 
-        // Spot: one `?symbol=` probe per configured symbol. The venue
-        // 400s unknown symbols — mapped to MISSING (not fatal), every
-        // other transport/parse failure stays fatal. 150 ms spacing
-        // mirrors the OKX page pacing.
-        let (spot_host, spot_port) = split_host_port(&cfg.binance_rest_host, 443)?;
-        for (i, sym) in spot.iter().enumerate() {
-            if i > 0 {
-                std::thread::sleep(Duration::from_millis(150));
-            }
-            let (up, up_len) = upper_symbol(sym);
-            let upper = core::str::from_utf8(&up[..up_len]).unwrap_or("");
-            let path = format!("/api/v3/exchangeInfo?symbol={upper}");
-            match get(tls, spot_host, spot_port, &path, buf) {
-                Ok(range) => {
-                    d.ingest_body(&buf[range]).map_err(|e| {
-                        tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: parse failed");
-                        "bn: discovery parse failed"
-                    })?;
-                    match bn_missing_reason(&d, &up[..up_len]) {
-                        None => matched += 1,
-                        Some(reason) => {
-                            *any_missing = true;
-                            tracing::error!(
-                                venue = "bn",
-                                symbol = sym.as_str(),
-                                reason,
-                                "discovery: configured symbol missing from venue universe"
-                            );
-                        }
+        if !lists.spot.is_empty() {
+            let mut d = BnDiscovery::new();
+            let (spot_host, spot_port) = split_host_port(&cfg.binance_rest_host, 443)?;
+            for (i, sym) in lists.spot.iter().enumerate() {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                let (up, up_len) = upper_symbol(sym);
+                let upper = core::str::from_utf8(&up[..up_len]).unwrap_or("");
+                let path = format!("/api/v3/exchangeInfo?symbol={upper}");
+                match get(tls, spot_host, spot_port, &path, buf) {
+                    Ok(range) => {
+                        d.ingest_body(&buf[range]).map_err(|e| {
+                            tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: parse failed");
+                            "bn: discovery parse failed"
+                        })?;
+                        matched += audit_bn_symbol(&d, "spot", sym, false, any_missing);
+                    }
+                    Err(core_net::boot_http::BootHttpErr::Status(400)) => {
+                        *any_missing = true;
+                        tracing::error!(
+                            venue = "bn",
+                            symbol = sym.as_str(),
+                            reason = "not_found",
+                            "discovery: configured symbol missing from venue universe (HTTP 400)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: fetch failed");
+                        return Err("bn: discovery fetch failed");
                     }
                 }
-                Err(core_net::boot_http::BootHttpErr::Status(400)) => {
-                    *any_missing = true;
-                    tracing::error!(
-                        venue = "bn",
-                        symbol = sym.as_str(),
-                        reason = "not_found",
-                        "discovery: configured symbol missing from venue universe (HTTP 400)"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(venue = "bn", symbol = sym.as_str(), error = ?e, "discovery: fetch failed");
-                    return Err("bn: discovery fetch failed");
-                }
             }
+            universe += d.universe_trading();
         }
 
-        // USDS-M: one full exchangeInfo page, membership-checked
-        // (perps AND — WS5 — the dated delivery class).
-        if !usdm.is_empty() || !dated.is_empty() {
-            let (fut_host, fut_port) = split_host_port(&cfg.binance_fut_rest_host, 443)?;
-            let range = get(tls, fut_host, fut_port, "/fapi/v1/exchangeInfo", buf).map_err(|e| {
-                tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: fetch failed");
+        // One futures page per product: (page, REST host, path, the
+        // perpetual list, the dated list).
+        let pages: [(&'static str, &str, &'static str, &[String], &[String]); 2] = [
+            (
+                "fapi",
+                cfg.binance_fut_rest_host.as_str(),
+                "/fapi/v1/exchangeInfo",
+                lists.usdm,
+                lists.dated,
+            ),
+            (
+                "dapi",
+                cfg.binance_coinm_rest_host.as_str(),
+                "/dapi/v1/exchangeInfo",
+                lists.coinm,
+                lists.coinm_dated,
+            ),
+        ];
+        for (page, host, path, perps, dated) in pages {
+            if perps.is_empty() && dated.is_empty() {
+                continue;
+            }
+            let (host, port) = split_host_port(host, 443)?;
+            let range = get(tls, host, port, path, buf).map_err(|e| {
+                tracing::error!(venue = "bn", page, error = ?e, "discovery: fetch failed");
                 "bn: discovery fetch failed"
             })?;
+            let mut d = BnDiscovery::new();
             d.ingest_body(&buf[range]).map_err(|e| {
-                tracing::error!(venue = "bn", page = "fapi", error = ?e, "discovery: parse failed");
+                tracing::error!(venue = "bn", page, error = ?e, "discovery: parse failed");
                 "bn: discovery parse failed"
             })?;
-            for sym in usdm {
-                let (up, up_len) = upper_symbol(sym);
-                match bn_missing_reason(&d, &up[..up_len]) {
-                    None => matched += 1,
-                    Some(reason) => {
-                        *any_missing = true;
-                        tracing::error!(
-                            venue = "bn",
-                            symbol = sym.as_str(),
-                            market = "usdm",
-                            reason,
-                            "discovery: configured symbol missing from venue universe"
-                        );
-                    }
-                }
+            let (perp_market, dated_market) = if page == "fapi" {
+                ("usdm", "usdm_dated")
+            } else {
+                ("coinm", "coinm_dated")
+            };
+            for sym in perps {
+                matched += audit_bn_symbol(&d, perp_market, sym, false, any_missing);
             }
-            // WS5: a `usdm_dated` entry must exist AND be a dated
-            // contract class — a perpetual misfiled here would ride
-            // the dated ordinal block and lie to every offline
-            // consumer about its class.
             for sym in dated {
-                let (up, up_len) = upper_symbol(sym);
-                match bn_missing_reason(&d, &up[..up_len]) {
-                    None => {
-                        let is_dated = d
-                            .find(&up[..up_len])
-                            .is_some_and(|row| row.contract_type.is_dated());
-                        if is_dated {
-                            matched += 1;
-                        } else {
-                            *any_missing = true;
-                            tracing::error!(
-                                venue = "bn",
-                                symbol = sym.as_str(),
-                                market = "usdm_dated",
-                                reason = "not_dated",
-                                "discovery: configured symbol is not a dated contract"
-                            );
-                        }
-                    }
-                    Some(reason) => {
-                        *any_missing = true;
-                        tracing::error!(
-                            venue = "bn",
-                            symbol = sym.as_str(),
-                            market = "usdm_dated",
-                            reason,
-                            "discovery: configured symbol missing from venue universe"
-                        );
-                    }
-                }
+                matched += audit_bn_symbol(&d, dated_market, sym, true, any_missing);
             }
+            universe += d.universe_trading();
         }
 
-        let configured = (spot.len() + usdm.len() + dated.len()) as u32;
-        let universe = d.universe_trading();
+        let configured = lists.configured();
         tracing::info!(
             venue = "bn",
             configured,
@@ -8910,6 +8943,79 @@ pub mod boot_discovery {
             matched,
             universe,
         })
+    }
+
+    /// Audit one configured Binance symbol against its product's table
+    /// ([`bn_row_audit`]); a match logs the venue's rules for it (F11)
+    /// and counts 1, a miss flags `any_missing` and counts 0.
+    fn audit_bn_symbol(
+        d: &BnDiscovery,
+        market: &'static str,
+        sym: &str,
+        dated: bool,
+        any_missing: &mut bool,
+    ) -> u32 {
+        let (up, up_len) = upper_symbol(sym);
+        match bn_row_audit(d.find(&up[..up_len]), dated) {
+            Ok(row) => {
+                log_bn_rules(market, sym, row);
+                1
+            }
+            Err(reason) => {
+                *any_missing = true;
+                if reason == "not_dated" {
+                    tracing::error!(
+                        venue = "bn",
+                        symbol = sym,
+                        market,
+                        reason,
+                        "discovery: configured symbol is not a dated contract"
+                    );
+                } else {
+                    tracing::error!(
+                        venue = "bn",
+                        symbol = sym,
+                        market,
+                        reason,
+                        "discovery: configured symbol missing from venue universe"
+                    );
+                }
+                0
+            }
+        }
+    }
+
+    /// BX2 (F11): the venue's rules for one resolved instrument, as the
+    /// boot saw them — the rows the gateway's instrument table is built
+    /// from at BX6.
+    fn log_bn_rules(market: &'static str, symbol: &str, row: &BnSymbolRow) {
+        let f = &row.filters;
+        tracing::debug!(
+            venue = "bn",
+            market,
+            symbol,
+            status = ?row.status,
+            contract_type = ?row.contract_type,
+            underlying = ?row.underlying,
+            tradfi = row.is_tradfi(),
+            inverse = row.is_inverse(),
+            contract_size = row.contract_size,
+            price_precision = row.price_precision,
+            qty_precision = row.qty_precision,
+            tick_size_1e9 = f.tick_size_1e9,
+            lot_step_1e9 = f.lot_step_1e9,
+            min_qty_1e9 = f.min_qty_1e9,
+            max_qty_1e9 = f.max_qty_1e9,
+            min_notional_1e9 = f.min_notional_1e9,
+            bid_up_1e9 = f.bid_up_1e9,
+            bid_down_1e9 = f.bid_down_1e9,
+            ask_up_1e9 = f.ask_up_1e9,
+            ask_down_1e9 = f.ask_down_1e9,
+            max_num_orders = f.max_num_orders,
+            perm_names = row.perm.names,
+            perm_groups = row.perm.group_count,
+            "discovery: bn instrument rules"
+        );
     }
 
     /// M2.4: fetch + select the capped Binance eapi options chain —
@@ -8984,6 +9090,22 @@ pub mod boot_discovery {
                     .map_err(|_| "bn: non-utf8 eapi option symbol")?;
                 let sym = make_symbol_id(VenueId::Binance, BN_OPT_ORDINAL_BASE + k + 1);
                 k += 1;
+                // BX2 (F11): the venue's rules for the selected series.
+                tracing::debug!(
+                    venue = "bn",
+                    market = "options",
+                    symbol,
+                    unit = row.unit,
+                    naked_sell = row.naked_sell,
+                    tradfi = row.is_tradfi(),
+                    price_scale = row.price_scale,
+                    qty_scale = row.qty_scale,
+                    tick_size_1e9 = row.filters.tick_size_1e9,
+                    lot_step_1e9 = row.filters.lot_step_1e9,
+                    min_qty_1e9 = row.filters.min_qty_1e9,
+                    max_qty_1e9 = row.filters.max_qty_1e9,
+                    "discovery: bn instrument rules"
+                );
                 out.push((symbol.to_string(), sym));
             }
             tracing::info!(
@@ -9013,8 +9135,9 @@ pub mod boot_discovery {
     /// Run the full boot discovery pass: OKX (if `okx_spec` is
     /// configured), Deribit (if `deribit_spec` is configured),
     /// Hyperliquid (if `hl_spec` is configured), Binance (M1 — if the
-    /// caller passes the spot/usdm lists; legacy flag boots pass
-    /// `None` and keep their historical zero-REST Binance behavior),
+    /// caller passes its [`BnLists`], COIN-M included since BX2;
+    /// legacy flag boots pass `None` and keep their historical
+    /// zero-REST Binance behavior),
     /// then Polymarket (always). One reused `Vec<u8>` buffer carries
     /// every fetch's response body. Any fetch/parse failure is FATAL —
     /// returned as `Err` for the caller to log + exit non-zero; a
@@ -9029,7 +9152,7 @@ pub mod boot_discovery {
         deribit_spec: Option<&str>,
         deribit_options_policy: &OptionsPolicy,
         hl_spec: Option<&str>,
-        binance: Option<(&[String], &[String], &[String])>,
+        binance: Option<BnLists<'_>>,
         bn_options_policy: &OptionsPolicy,
         bybit: Option<(&[String], &[String])>,
         mexc: Option<(&[String], &[String])>,
@@ -9108,19 +9231,13 @@ pub mod boot_discovery {
         };
 
         let bn = match binance {
-            Some((spot, usdm, dated))
-                if !spot.is_empty() || !usdm.is_empty() || !dated.is_empty() =>
-            {
-                Some(run_bn(
-                    cfg,
-                    tls_config,
-                    spot,
-                    usdm,
-                    dated,
-                    &mut buf,
-                    &mut any_missing,
-                )?)
-            }
+            Some(lists) if !lists.is_empty() => Some(run_bn(
+                cfg,
+                tls_config,
+                lists,
+                &mut buf,
+                &mut any_missing,
+            )?),
             _ => None,
         };
 
@@ -9470,19 +9587,42 @@ pub mod boot_discovery {
             d.ingest_body(
                 br#"{"symbols":[
                   {"symbol":"BTCUSDT","status":"TRADING"},
-                  {"symbol":"OLDUSDT","status":"BREAK"}
+                  {"symbol":"OLDUSDT","status":"BREAK"},
+                  {"symbol":"BTCUSD_PERP","contractStatus":"TRADING","contractType":"PERPETUAL","contractSize":100},
+                  {"symbol":"BTCUSD_261225","contractStatus":"TRADING","contractType":"CURRENT_QUARTER","contractSize":100}
                 ]}"#,
             )
             .unwrap();
             d
         }
 
+        fn audit(d: &BnDiscovery, sym: &[u8], dated: bool) -> Result<(), MissingReason> {
+            bn_row_audit(d.find(sym), dated).map(|_| ())
+        }
+
         #[test]
-        fn bn_missing_reason_covers_found_not_trading_and_absent() {
+        fn bn_row_audit_covers_found_not_trading_absent_and_class() {
             let d = bn_fixture();
-            assert_eq!(bn_missing_reason(&d, b"BTCUSDT"), None);
-            assert_eq!(bn_missing_reason(&d, b"OLDUSDT"), Some("not_trading"));
-            assert_eq!(bn_missing_reason(&d, b"NOPEUSDT"), Some("not_found"));
+            assert_eq!(audit(&d, b"BTCUSDT", false), Ok(()));
+            assert_eq!(audit(&d, b"OLDUSDT", false), Err("not_trading"));
+            assert_eq!(audit(&d, b"NOPEUSDT", false), Err("not_found"));
+            // BX2: COIN-M rows say `contractStatus`; a dated list wants
+            // a dated class (WS5), a perpetual list takes the row.
+            assert_eq!(audit(&d, b"BTCUSD_PERP", false), Ok(()));
+            assert_eq!(audit(&d, b"BTCUSD_261225", true), Ok(()));
+            assert_eq!(audit(&d, b"BTCUSD_PERP", true), Err("not_dated"));
+            assert_eq!(audit(&d, b"BTCUSDT", true), Err("not_dated"));
+            // Absence outranks class; a halted row outranks class too.
+            assert_eq!(audit(&d, b"NOPE_261225", true), Err("not_found"));
+            assert_eq!(audit(&d, b"OLDUSDT", true), Err("not_trading"));
+        }
+
+        #[test]
+        fn a_coinm_symbol_uppercases_like_any_other() {
+            let (buf, n) = upper_symbol("btcusd_perp");
+            assert_eq!(&buf[..n], b"BTCUSD_PERP");
+            let (buf, n) = upper_symbol("1000shibusd_261225");
+            assert_eq!(&buf[..n], b"1000SHIBUSD_261225");
         }
 
         #[test]

@@ -987,6 +987,89 @@ Every account mutation lives in the operator tool `exec-smoke --binance setup`.
 
 **Size:** about 1 300 src + 1 150 test, including about 250 + 200 in the worker.
 
+**BX2 record (2026-09-26, branch `binance`): the public half.**
+- **Built:**
+  - `ingress-binance/src/discovery.rs` (F11):
+    - `BnSymbolRow` (208 B, `#[repr(C)]`, size pinned) keeps:
+      - the lifecycle `BnStatus`, from `status` or COIN-M's `contractStatus`: eleven named states, `Other` for a new word and `Absent`, with `TRADING_CANCEL_ONLY` a state of its own;
+      - `BnContractType`, now with `PERPETUAL_DELIVERING` (never dated) and the delivering spellings;
+      - `BnUnderlying`, the wire precisions, COIN-M's `contractSize` (the inverse flag) and `BN_ROW_TRADFI`;
+      - `BnFilters` (80 B): tick, step, min/max quantity, min notional, the percent-price band per side, and the open-order cap;
+      - `BnPermissions` (72 B): the name bits, plus spot's exact `TRD_GRP_n` set as a 512-bit bitset with an overflow flag.
+    - The filter walk records each value's raw span first and converts it only for the filter type that keeps it.
+      - Only `LOT_SIZE.maxQty` saturates past the ×1e9 grid, which lowers the cap. Live USDⓈ-M `1000SATSUSDT` says `60000000000`, which used to refuse the whole fapi page.
+      - Every other overflow refuses its row.
+    - A row that states its lifecycle twice is refused.
+  - `eapi.rs`:
+    - `EapiOptionRow` (160 B, `#[repr(C)]`) keeps status, the TradFi flag, `underlyingType`, `unit`, the scales and the filters.
+    - It also keeps its underlying's `nakedSell` from `optionContracts[]`, stamped in two passes so that a `false` entry wins. No entry means false.
+    - `select_capped_chain` selects TRADING series only. The live TradFi XAU/XAG Oct-02 week is CLOSED_MARKET before expiry.
+  - **COIN-M market data (O-BX3):**
+    - `[binance] coinm` / `coinm_dated` (core-config `universe.rs`): suffix-checked `<coin>usd_perp` / `<coin>usd_<yymmdd>`, ordinal bases 3072 / 3584, one namespace, with `usdm_dated` overlap refused.
+    - `BINANCE_COINM_WS_HOST` (default `dstream.binance.com`) and `BINANCE_COINM_REST_HOST` (default `dapi.binance.com`).
+    - `cli::bn_coinm_specs`: the USDⓈ-M path law, bookTicker on `/ws/` and markPrice on `/market/ws/` (K10).
+    - Boot discovery of `GET /dapi/v1/exchangeInfo`.
+    - Descriptors `binance-coinm:` in the manifest, `bn_coinm_class` with its worker mirror and the shared TSV, and the ruleset caps arm (PRICE | FUNDING; 19 laws).
+  - **The Binance boot audit** (`cli/src/paper.rs`, `boot_discovery`):
+    - `BnLists` names what the boot checks.
+    - One `BnDiscovery` table per product page (the spot probes, fapi, dapi), each dropped before the next.
+    - `bn_row_audit` checks found / TRADING / dated class. `log_bn_rules` logs each resolved instrument's rules at debug.
+  - **Worker:**
+    - candles gain a `binance-coinm` lane (`/dapi/v1/klines`; volume in contracts);
+    - funding takes the `_PERP` names on `/dapi/v1/fundingRate`, with budgets now per REST host;
+    - channel map, instrument class, seeds, bartest and universe proposals know the namespace;
+    - refdata reports the lane as skipped.
+  - `--binance-symbol` replaces `[binance] spot` only.
+  - Live smoke `cli/tests/binance_coinm_live_smoke.rs` (ignored): it reads the whole dapi page, checks every row's rules, and runs BTCUSD_PERP, ETHUSD_PERP and the front BTCUSD delivery contract on dstream through the production specs and spawn.
+- **Departures from the text above:**
+  1. **No `BnInstTable` yet.** The rules are retained in `BnDiscovery::rows()`. The gateway's instrument table (§3.6) is built in BX6, its only consumer, and until then the boot logs the rules.
+  2. **A bitset, not a permission-group digest.** BX8's bStock check needs membership (`has_group`), which a digest cannot answer.
+  3. **The audit reads each product's own page.** A latent M1 fault let a `usdm` name that was listed only on spot pass on the spot row.
+  4. **`maxQty` saturates** (above).
+  5. **Equity discovery is the keyed half.** `GET /sapi/v1/equity/market/exchangeInfo` waits for keys (O-BX1, K15).
+  6. **Refdata skips COIN-M.** v1 has no fetcher for it, and the skip is reported.
+- **Measurements:** K7 and K10 are closed (§13.5). The tick lane stays on `/ws/`.
+- **Copies:** no new `// COPY:`; the row symbol copies stand from BX0. `bn_coinm_specs` returns `[BinanceConnSpec; 2]` by value, inherited from `bn_usdm_specs`. Each spec is about 2.6 KB (an inline `Option<EapiSymbolTable>`), but this happens at boot only, in `cli`, which is outside copy-audit's scope.
+- **Gates** (Mac, final tree):
+  - clippy clean;
+  - nextest: 3 227 run, 3 227 passed, 7 skipped (the new ignored smoke);
+  - alloc: 77/77 at 0 B/op, 2 ignored, with a fresh `Compiling bench` in the log. BX2 adds no hot path, so it adds no gate;
+  - `make copy-audit`: `hits=31 baselined=31 new=0 paid=0`, after its self-test;
+  - `make license-check` OK. No dependency changed.
+  - `make py-test`: 1 550 passed, 5 skipped, 1 failed. The failure is `test_news_lanes::test_report_prints_the_funnel`: its news cycle counts `llm_unhealthy` and keeps no items. That is the news lane's local-LLM health gate, which BX2 does not touch; the lane's only link to a BX2 file is two unchanged constants in `candles.py`. Reported, not fixed here.
+  - `make py-lint`: 822 findings, none on a line this branch added. One had moved onto a rewritten docstring and was fixed.
+  - Fuzz, 151 s per target, no crash in any run:
+    - final tree: `binance_exchange_info` 3.77 M runs, `binance_eapi` 4.14 M;
+    - after round 1's fixes: 4.96 M and 5.36 M;
+    - on the pre-review parser: 5.68 M and 5.22 M.
+  - Proptests: nextest's default 256 cases, plus separate harness runs at 4 096 (after round 1) and 2 048 (the final revision).
+  - COIN-M live smoke: green, 45 s at 07:34Z, with a separate `CARGO_TARGET_DIR`.
+    - The dapi page had 30 rows, all TRADING, and every row's rules were present.
+    - Book ticks: `btcusd_perp` 118, `ethusd_perp` 100, `btcusd_261225` 49.
+    - 15 marks each, one per 3 s. Funding came through on the perpetuals only.
+    - 0 parse errors, 0 reconnects, 0 ring drops.
+- **Reviewers** (subagents acting as the agents, read-only):
+  - **`parser-property-tester` (Sonnet), round 1:** five findings, all fixed.
+    - Filter values were judged whatever the filter type (fixed as above).
+    - No round trip for eapi rows. Added: `option_rows_roundtrip_in_any_key_order`.
+    - `status` + `contractStatus` on one row was order-dependent. Now refused.
+    - The eapi fuzz target lacked the row laws.
+    - `nakedSell` was last-wins. Now `false` wins.
+    - While fixing, the session found a panic that the first fix had introduced: a body cut right after a filter key's colon indexed one past its end. It is now `Truncated`, and a test cuts at every byte of a filter.
+  - **Round 2:** PASS, with two nits, both acted on. The end of a body after a key or its colon is `Truncated` in all three walkers, and `bare_u64`'s parameter is named for spans.
+  - **`alloc-auditor` (Opus 5.5):** PASS. BX2 adds no hot-path code: COIN-M frames (`ps`, `st`, contract sizes) go through the unchanged run loop and parsers, and every new allocation is boot-only. Its borderline items:
+    - `repr(C)` and exact pins on the four row structs, added before its pass;
+    - the stale `boot_discovery` doc, fixed;
+    - engine-side capacity for COIN-M ordinals 3073–4085, settled by grep: book-builder scans full `SymbolId`s; opt-registry, the AMM book and the ledger bound-check ordinals; the engine's staleness table is 64 hashed buckets;
+    - the boot table reservation grew from about 0.56 MiB to 1.66 MiB, transient.
+- **Carried to BX6:**
+  - Build the instrument table from `BnDiscovery::rows()` and `EapiDiscovery::rows()`.
+  - COIN-M sizes are contracts: 100 USD of face on BTC and 10 on the others, so notional is `qty × contract_size` in USD, never `qty × price`.
+  - `CancelOnly`, `Delivering`, `Settling`, `Halt` and `Break` refuse new orders.
+  - A `PERPETUAL_DELIVERING` row is a perpetual being delisted, not a dated future.
+- **Carried to the risk review (BX3/BX7):** on the tick lane, the `Qty` of a `binance-coinm:` symbol is a contract count.
+- **Size:** Rust about 1 250 source lines and 1 650 test lines (the smoke included); the worker about 130 + 190.
+
 ### BX3: Router, ledger, lanes
 
 This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk-policy.md`. **The merge order against HYPARB is ruled at BX3's start (O-BX14).**
@@ -1495,6 +1578,13 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - HYPARB's `HttpsPost` now delivers a whole answer after a close without `close_notify` (risk-policy "BX5"). It reaches the engine only through merge, release build and restart.
   - Fuzz, 120 s each on the Mac: `https_answer` 11.86 M runs and `ws_framer` 8.47 M runs, no crash.
   - Git: one commit `BX5:`, explicit paths. The engine was never touched.
+- **2026-09-26, BX2 public half built** (branch `binance`). The record is in §5 BX2; K7 and K10 are closed (§13.5).
+  - COIN-M market data end to end: `[binance] coinm` / `coinm_dated`, dapi discovery, dstream feeds, and the `binance-coinm:` namespace through the engine and the worker.
+  - Discovery keeps the venue's rules (F11), the boot audit reads each product's own page, and the options chain skips closed series.
+  - Reviewers: `parser-property-tester` in two rounds (five findings plus one panic found while fixing, all fixed; round 2 PASS), `alloc-auditor` PASS.
+  - Fuzz on the final tree, 151 s each: `binance_exchange_info` 3.77 M runs and `binance_eapi` 4.14 M runs, no crash. The COIN-M live smoke is green (45 s).
+  - CLAUDE.md gained the COIN-M line on the operator's word.
+  - Git: one commit `BX2:`, explicit paths. The engine was never touched.
 
 ---
 
@@ -1568,7 +1658,9 @@ Binance Stocks requires `clientOrderId` to match **`^[a-zA-Z0-9-_]{32,36}$`**: a
 | **K1** | **Closed by docs.** Spot user data arrives on the order socket: `userDataStream.subscribe` "in the current WebSocket connection"; one subscription per account per connection; `userDataStream.subscribe.signature` works with any key type; the listenKey endpoints were removed 2026-02-20. | spot WS API user-data-stream + authentication pages; spot CHANGELOG 2025-08-12, 2026-01-21 | Demo support: `session.logon` + `userDataStream.subscribe` on `demo-ws-api` (keyed probe) |
 | **K3** | **Partly closed.** The options kill-switch (`countdownCancelAll` / `…HeartBeat`) is **market-maker only**: the FAQ (updated 2026-01-02) says "only applicable to Options Market Makers", and error `-6005 IS_NOT_MARKET_MAKER` exists. **Options are therefore IoC-only under BX-17** unless the account becomes an options MM. | options FAQ; options error codes; Market Maker Endpoints pages | Demo probe: Ed25519 on eapi REST (the docs show HMAC; the official SDK says RSA/Ed25519); the cid charset and length; the STP default read from an ACK (the pages disagree: legacy `EXPIRE_MAKER`); `-6005` on this account; the options Demo REST host (the docs print `demo-fapi`) |
 | **K5** | **Closed by docs**, one detail open. `apiTradingStatus` returns per-symbol and `ACCOUNT` arrays of `{isLocked, plannedRecoverTime, indicator, value, triggerValue}` plus `updateTime`. The Regular / VIP 1–3 thresholds are §1.4's table (FAQ updated 2026-08-31). | USDⓈ-M account docs; Quantitative Rules FAQ | Whether the API emits `GCR` (its example) or `ICR` (the FAQ): the first read-only call |
+| **K7** | **Closed (BX2, measured):** the tick lane stays on `/ws/`. fstream bookTicker on the legacy `/ws/` path vs `/public/ws/`: 24 disjoint 60 s windows, 180 s apart, over 96 minutes (2026-09-26 05:40–07:17Z), BTC, ETH and SOL, both paths read at once, no errors. **Same rate:** median frames per window 5 684 vs 5 680 on BTC, 7 050 vs 7 051 on ETH, 4 130 vs 4 140 on SOL. **No systematic lead:** the median of the per-window medians of `public − legacy` is +0.08, −0.35 and −0.04 ms. **`/public/` stalled more often:** in 7 symbol-windows it trailed by a median 0.1–3.4 s, against 1 for `/ws/` (1.5 s); in 6 it missed ≥ 1 % of `/ws/`'s update ids (up to 27.5 %), against 1 the other way (4.1 %). One host, one morning: evidence, not proof. | vault `docs/research/bx/bx2_k7.{py,jsonl}`, `bx2_k7_sum.py` | Revisit only if Binance retires bookTicker on `/ws/` |
 | **K8** | **Closed by docs:** spot has no cancel-on-disconnect on the WS API, REST or FIX (the FIX Logon field list; the change log through 2026-09-18). Spot stays IoC-only (BX-17). | spot FIX API page; spot CHANGELOG | — |
+| **K10** | **Closed (BX2, measured 2026-09-26 05:39Z):** COIN-M runs on dstream with the USDⓈ-M path law. **dstream serves bookTicker and markPrice on `/ws/`, `/market/ws/` and `/public/ws/` alike**, so the USDⓈ-M law (bookTicker on `/ws/`, markPrice on `/market/ws/`) holds there, and one spec builder serves both products (`cli::bn_coinm_specs`). **fstream's merged universe carries COIN-M too:** `btcusd_perp@bookTicker` on `/ws/` and `/public/ws/`, with the same update ids as dstream; `@markPrice` only on `/market/ws/`, not on `/ws/` (the F1 law). Frames carry `st` (1 USDⓈ-M, 2 COIN-M) and bookTicker carries `ps` (the pair); COIN-M `B` / `A` are contracts. A delivered contract (`btcusd_260925`) streams nothing. | vault `docs/research/bx/bx2_k10.{py,jsonl}`; the BX2 live smoke | None. fstream is a fallback host through `BINANCE_COINM_WS_HOST` |
 | **K11** | **Open, likely negative.** The docs list only `wss://testnet.binancefuture.com/ws-fapi/v1` and `/ws-dapi/v1` for the futures WS API; there is no `demo-ws-fapi`; an official forum answer says Ed25519 is unsupported on the Futures Testnet. | USDⓈ-M and COIN-M WS API general info; `dev.binance.vision` thread 35886 | Demo probe. If refused, R20 (§13.6) |
 | **K13** | **Partly closed.** PM has **no countdown / auto-cancel, no batch endpoint and no testnet or demo** (the docs' trade list and the official SDK's method list) → **PM is IoC-only** under BX-17. | papi general info + trade pages; the official Python/JS PM connectors | Read-only probe: is Ed25519 accepted on papi REST (docs: HMAC/RSA; SDK: Ed25519) |
 | **K14** | **Open; eligibility-bound.** PM Pro's user stream is `/pm-classic` (`POST /fapi/v1/listenKey`) and carries only `RISK_LEVEL_CHANGE` and `PM_PRO_ACCOUNT_UPDATE`; whether ws-fapi / ws-dapi work under PM Pro is undocumented. | PM Pro FAQ + user-data page | Only an account in PM Pro can answer. Carried as a named risk unless the account is PM Pro (K17 tells) |
@@ -1579,7 +1671,7 @@ Binance Stocks requires `clientOrderId` to match **`^[a-zA-Z0-9-_]{32,36}$`**: a
 | **K19 (new)** | **Open.** Ed25519 on REST for fapi, dapi, eapi and papi: the docs describe HMAC and RSA only; the official SDKs say Ed25519. SAPI (hence equity) accepts Ed25519 (CONFIRMED). | per-product general info; SDK READMEs; wallet general info | Read-only probe per host. Any refusal adds that product's HMAC fallback in BX4 (§3.12's fallback variables) |
 | **K20 (new)** | **Open.** Whether `events=` is required on USDⓈ-M's `/private/ws?listenKey=…&events=…`. | USDⓈ-M WebSocket change notice | Demo probe |
 
-K2 and K4 stay BX7-battery items; K6 was closed at BX0; K7 and K10 are BX2's public half; K9 is the operator's; K12 is closed.
+K2 and K4 stay BX7-battery items; K6 was closed at BX0, K7 and K10 at BX2; K9 is the operator's; K12 is closed.
 
 **What BX-17's maker list reads after this pass:** makers only on **UM classic**, and on PM Pro if its fapi countdown works there (K14). **IoC-only:** spot (K8, closed), PM (K13, closed), options (K3: MM-only kill-switch), COIN-M (until K16 answers). Binance Stocks keeps its DAY + gateway-TTL exception.
 

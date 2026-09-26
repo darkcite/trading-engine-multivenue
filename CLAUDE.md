@@ -9,7 +9,7 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
-spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
+spot/USDM/COIN-M, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
 MEXC (data-only), Polymarket CLOB, Polygon RPC, plus a boot-selected options
 ladder. Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
@@ -375,7 +375,10 @@ ordinals; the worker map keeps the OLD sym for a reordered name by design.
 Polymarket: `clobTokenIds` from the Gamma lane, `"<yes>:<no>"` pairs, ≤ 6
 tokens (token 7 collides with anchor id 7). Binance: lowercase stream
 symbols, one socket per symbol (254 at the current universe — the wrapper
-raises the launchd fd soft limit to 8192). MEXC: spot UPPERCASE
+raises the launchd fd soft limit to 8192). COIN-M (BX2): `coinm`
+`<coin>usd_perp` (ordinals from 3072), `coinm_dated` `<coin>usd_<yymmdd>`
+(from 3584), `binance-coinm:` descriptors, two sockets each on dstream;
+sizes are contracts (100 USD of face on BTC, 10 on the others). MEXC: spot UPPERCASE
 (`BTCUSDT`), perp `BASE_QUOTE` (`BTC_USDT`), perp ordinals from 512. After
 a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 

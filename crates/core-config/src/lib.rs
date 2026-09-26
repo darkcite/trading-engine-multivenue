@@ -99,6 +99,16 @@ pub struct Config {
     /// (`GET /fapi/v1/exchangeInfo`). Env: `BINANCE_FUT_REST_HOST`.
     /// Default: `fapi.binance.com`.
     pub binance_fut_rest_host: String,
+    /// Binance COIN-M futures WS host (BX2): `/ws/<sym>@bookTicker` and
+    /// `/market/ws/<sym>@markPrice` — the USDⓈ-M path law (K10,
+    /// measured 2026-09-26: dstream carries both streams on `/ws/`,
+    /// `/market/ws/` and `/public/ws/`). Env: `BINANCE_COINM_WS_HOST`.
+    /// Default: `dstream.binance.com`.
+    pub binance_coinm_ws_host: String,
+    /// Binance COIN-M REST host for BX2 boot discovery
+    /// (`GET /dapi/v1/exchangeInfo`). Env: `BINANCE_COINM_REST_HOST`.
+    /// Default: `dapi.binance.com`.
+    pub binance_coinm_rest_host: String,
     /// Binance European-options REST host (M2.4 eapi discovery:
     /// `GET /eapi/v1/exchangeInfo`, `GET /eapi/v1/index`). Env:
     /// `BINANCE_EAPI_REST_HOST`. Default: `eapi.binance.com`.
@@ -215,6 +225,10 @@ impl Config {
                 .unwrap_or_else(|| "api.binance.com".into()),
             binance_fut_rest_host: env_opt("BINANCE_FUT_REST_HOST")
                 .unwrap_or_else(|| "fapi.binance.com".into()),
+            binance_coinm_ws_host: env_opt("BINANCE_COINM_WS_HOST")
+                .unwrap_or_else(|| "dstream.binance.com".into()),
+            binance_coinm_rest_host: env_opt("BINANCE_COINM_REST_HOST")
+                .unwrap_or_else(|| "dapi.binance.com".into()),
             binance_eapi_rest_host: env_opt("BINANCE_EAPI_REST_HOST")
                 .unwrap_or_else(|| "eapi.binance.com".into()),
             binance_eapi_ws_host: env_opt("BINANCE_EAPI_WS_HOST")

@@ -2686,6 +2686,8 @@ fn run(args: RunArgs) -> ExitCode {
         bn_spot = boot.allocated.bn_spot.len(),
         bn_usdm = boot.allocated.bn_usdm.len(),
         bn_dated = boot.allocated.bn_dated.len(),
+        bn_coinm = boot.allocated.bn_coinm.len(),
+        bn_coinm_dated = boot.allocated.bn_coinm_dated.len(),
         pairs = boot.allocated.pairs.len(),
         "universe resolved"
     );
@@ -2756,8 +2758,26 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .map(|i| i.name.clone())
         .collect();
-    let bn_discovery_arg: Option<(&[String], &[String], &[String])> = if boot.from_config {
-        Some((&bn_spot_names, &bn_usdm_names, &bn_dated_names))
+    let bn_coinm_names: Vec<String> = boot
+        .allocated
+        .bn_coinm
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_coinm_dated_names: Vec<String> = boot
+        .allocated
+        .bn_coinm_dated
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+    let bn_discovery_arg = if boot.from_config {
+        Some(cli::boot_discovery::BnLists {
+            spot: &bn_spot_names,
+            usdm: &bn_usdm_names,
+            dated: &bn_dated_names,
+            coinm: &bn_coinm_names,
+            coinm_dated: &bn_coinm_dated_names,
+        })
     } else {
         None
     };
@@ -3080,7 +3100,7 @@ fn run(args: RunArgs) -> ExitCode {
     // spawn calls below). Sorted strict-ascending, deduped; feeds
     // `spawn_ai` → `RulesetSidePath` (§4.2 rule-6 membership checks).
     // M1: spawn-aligned — every PM token + every Binance instrument
-    // (spot + USDS-M) this boot wires.
+    // (spot + USDS-M, BX2: + COIN-M) this boot wires.
     let pm_syms: Vec<core_types::SymbolId> =
         boot.allocated.pm_tokens.iter().map(|t| t.sym).collect();
     let bn_syms: Vec<core_types::SymbolId> = boot
@@ -3089,6 +3109,8 @@ fn run(args: RunArgs) -> ExitCode {
         .iter()
         .chain(boot.allocated.bn_usdm.iter())
         .chain(boot.allocated.bn_dated.iter())
+        .chain(boot.allocated.bn_coinm.iter())
+        .chain(boot.allocated.bn_coinm_dated.iter())
         .map(|i| i.sym)
         .collect();
     // MX6 (ruling Q-MX6): every MEXC instrument this boot allocates
@@ -3412,13 +3434,16 @@ fn run(args: RunArgs) -> ExitCode {
     // own ordinal block); every USDS-M instrument (perp + dated) also
     // gets a `@markPrice` slot — the capture-only mark/index/funding
     // lane (dated frames carry no funding; the parser's has_funding
-    // gate handles it).
+    // gate handles it). BX2: COIN-M perps and delivery futures take
+    // the same two slots each on the COIN-M host (dstream).
     let bn_usdm_all = boot.allocated.bn_usdm.len() + boot.allocated.bn_dated.len();
-    let bn_total = boot.allocated.bn_spot.len() + bn_usdm_all;
+    let bn_coinm_all = boot.allocated.bn_coinm.len() + boot.allocated.bn_coinm_dated.len();
+    let bn_fut_all = bn_usdm_all + bn_coinm_all;
+    let bn_total = boot.allocated.bn_spot.len() + bn_fut_all;
     let bn_eapi_on = !discovery.bn_options.is_empty();
-    let bn_handle = if bn_total > 1 || bn_usdm_all > 0 || bn_eapi_on {
+    let bn_handle = if bn_total > 1 || bn_fut_all > 0 || bn_eapi_on {
         let mut specs: Vec<cli::BinanceConnSpec> =
-            Vec::with_capacity(bn_total + bn_usdm_all + usize::from(bn_eapi_on));
+            Vec::with_capacity(bn_total + bn_fut_all + usize::from(bn_eapi_on));
         for inst in &boot.allocated.bn_spot {
             specs.push(cli::BinanceConnSpec {
                 host: cfg.binance_ws_host.clone(),
@@ -3441,6 +3466,17 @@ fn run(args: RunArgs) -> ExitCode {
             // delivering), markPrice on the routed `/market/ws/` path —
             // one builder shared with the live smoke.
             let [book, mark] = cli::bn_usdm_specs(&cfg.binance_fut_ws_host, &inst.name, inst.sym);
+            specs.push(book);
+            specs.push(mark);
+        }
+        for inst in boot
+            .allocated
+            .bn_coinm
+            .iter()
+            .chain(boot.allocated.bn_coinm_dated.iter())
+        {
+            let [book, mark] =
+                cli::bn_coinm_specs(&cfg.binance_coinm_ws_host, &inst.name, inst.sym);
             specs.push(book);
             specs.push(mark);
         }
@@ -3485,7 +3521,9 @@ fn run(args: RunArgs) -> ExitCode {
             spot = boot.allocated.bn_spot.len(),
             usdm = boot.allocated.bn_usdm.len(),
             dated = boot.allocated.bn_dated.len(),
-            mark_price = bn_usdm_all,
+            coinm = boot.allocated.bn_coinm.len(),
+            coinm_dated = boot.allocated.bn_coinm_dated.len(),
+            mark_price = bn_fut_all,
             eapi_options = discovery.bn_options.len(),
             stale_after_ms = stale_after_ms[core_types::VenueId::Binance as usize],
             "binance: M1 multi-connection lane"

@@ -253,9 +253,10 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
             } else {
                 (u.okx_options.clone(), false)
             };
-            // M2.4: --binance-symbol replaces the whole [binance]
-            // section (spot/usdm handled above via the allocated
-            // universe) — the options policy drops with it.
+            // M2.4: --binance-symbol replaces the [binance] spot list
+            // (above, before allocation) and drops the options policy;
+            // the futures lists — usdm, usdm_dated and (BX2) coinm,
+            // coinm_dated — stay as configured.
             let bn_flag_active = f
                 .bn_symbol
                 .map(str::trim)
@@ -608,5 +609,32 @@ mod tests {
         let b2 = resolve_boot_universe(&f2).expect("resolves");
         assert!(!b2.bn_options.enabled());
         assert!(b2.bn_options_dropped);
+    }
+
+    // ---- BX2 COIN-M lists through the resolver ---------------------
+
+    #[test]
+    fn binance_symbol_flag_replaces_spot_and_keeps_the_futures_lists() {
+        let src = format!(
+            "[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n\
+             usdm = [\"btcusdt\"]\ncoinm = [\"btcusd_perp\"]\ncoinm_dated = [\"btcusd_261225\"]\n"
+        );
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("resolves");
+        assert_eq!(b.allocated.bn_coinm[0].descriptor, "binance-coinm:btcusd_perp");
+        assert_eq!(b.allocated.bn_coinm_dated[0].name, "btcusd_261225");
+        let f2 = UniverseFlags {
+            config_src: Some(&src),
+            bn_symbol: Some("ethusdt"),
+            ..UniverseFlags::default()
+        };
+        let b2 = resolve_boot_universe(&f2).expect("resolves");
+        assert_eq!(b2.allocated.bn_spot[0].name, "ethusdt");
+        assert_eq!(b2.allocated.bn_usdm, b.allocated.bn_usdm);
+        assert_eq!(b2.allocated.bn_coinm, b.allocated.bn_coinm);
+        assert_eq!(b2.allocated.bn_coinm_dated, b.allocated.bn_coinm_dated);
     }
 }

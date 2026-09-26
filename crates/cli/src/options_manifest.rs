@@ -37,7 +37,8 @@ pub const OPTIONS_MANIFEST_FILE: &str = "options-manifest.tsv";
 /// EVERY allocated instrument on every venue, `<sym_u32>\t<descriptor>`
 /// per line (descriptors are the §9.4 worker map-name convention,
 /// baked engine-side: PM token ids bare; `binance:` / `binance-usdm:` /
-/// `okx:` / `deribit:` / `hyperliquid:` from the allocation lane;
+/// `binance-coinm:` (BX2) / `okx:` / `deribit:` / `hyperliquid:` from
+/// the allocation lane;
 /// options `deribit:`/`okx:`/`binance-opt:` + instrument name). Written
 /// on EVERY boot (a boot always has ≥ 1 instrument — venue-blind boots
 /// refuse). [`OPTIONS_MANIFEST_FILE`] stays for one release for
@@ -90,6 +91,14 @@ pub fn render_instruments(
     // missing from the manifest until the first offline consumer
     // (carry_signal) needed a Bybit descriptor.
     for i in &allocated.bn_dated {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    // BX2: the COIN-M blocks (empty without `coinm` / `coinm_dated`, so
+    // a pre-BX2 boot's manifest is byte-identical).
+    for i in &allocated.bn_coinm {
+        push_desc_row(&mut out, i.sym, &i.descriptor);
+    }
+    for i in &allocated.bn_coinm_dated {
         push_desc_row(&mut out, i.sym, &i.descriptor);
     }
     for i in &allocated.okx {
@@ -168,6 +177,8 @@ pub fn build_descriptor_entries(
         .iter()
         .chain(allocated.bn_usdm.iter())
         .chain(allocated.bn_dated.iter())
+        .chain(allocated.bn_coinm.iter())
+        .chain(allocated.bn_coinm_dated.iter())
         .chain(allocated.okx.iter())
         .chain(allocated.deribit.iter())
         .chain(allocated.deribit_combos.iter())
@@ -278,6 +289,18 @@ mod tests {
             name: "btcusdt_260925".to_string(),
             descriptor: "binance-usdm:btcusdt_260925".to_string(),
         });
+        // BX2: both COIN-M blocks (perps from 3072, delivery from 3584),
+        // one namespace.
+        alloc.bn_coinm.push(core_config::universe::Instrument {
+            sym: 0x0100_0C01,
+            name: "btcusd_perp".to_string(),
+            descriptor: "binance-coinm:btcusd_perp".to_string(),
+        });
+        alloc.bn_coinm_dated.push(core_config::universe::Instrument {
+            sym: 0x0100_0E01,
+            name: "btcusd_261225".to_string(),
+            descriptor: "binance-coinm:btcusd_261225".to_string(),
+        });
         alloc.deribit_combos.push(core_config::universe::Instrument {
             sym: 0x0300_0101,
             name: "BTC-FS-27MAR26_PERP".to_string(),
@@ -317,6 +340,8 @@ mod tests {
             "42\t2875608808\n\
              {}\tbinance:btcusdt\n\
              {}\tbinance-usdm:btcusdt_260925\n\
+             {}\tbinance-coinm:btcusd_perp\n\
+             {}\tbinance-coinm:btcusd_261225\n\
              {}\tderibit:BTC-PERPETUAL\n\
              {}\tderibit:BTC-FS-27MAR26_PERP\n\
              {}\tbybit:BTCUSDT\n\
@@ -327,6 +352,8 @@ mod tests {
              {}\tbinance-opt:BTC-260327-100000-C\n",
             0x0100_0007u32,
             0x0100_0301u32,
+            0x0100_0C01u32,
+            0x0100_0E01u32,
             0x0300_0001u32,
             0x0300_0101u32,
             0x0600_0001u32,
@@ -349,5 +376,17 @@ mod tests {
         assert!(entries.iter().any(|(d, s, c)| d == "mexc:AAPLXUSDT"
             && *s == 0x0700_0001
             && *c == ingress_ai::CAP_PRICE));
+        // BX2: both COIN-M blocks resolve, with the futures grant.
+        for (desc, sym) in [
+            ("binance-coinm:btcusd_perp", 0x0100_0C01u32),
+            ("binance-coinm:btcusd_261225", 0x0100_0E01u32),
+        ] {
+            assert!(
+                entries.iter().any(|(d, s, c)| d == desc
+                    && *s == sym
+                    && *c == ingress_ai::CAP_PRICE | ingress_ai::CAP_FUNDING),
+                "{desc}"
+            );
+        }
     }
 }

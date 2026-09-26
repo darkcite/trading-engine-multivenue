@@ -75,7 +75,9 @@ def caps_of_descriptor(desc: str) -> int:
         if name.endswith("-SWAP"):
             return CAP_PRICE | CAP_FUNDING | CAP_DEPTH
         return CAP_PRICE | CAP_DEPTH
-    if venue == "binance-usdm":
+    if venue in ("binance-usdm", "binance-coinm"):
+        # BX2: COIN-M's markPrice lane carries funding on the perps; its
+        # dated rows take the permissive grant, as usdm's do.
         return CAP_PRICE | CAP_FUNDING
     if venue in ("bybit-linear", "mexc-perp"):
         # MX7: every `[mexc] perp` row is a perpetual; `mexc` spot takes

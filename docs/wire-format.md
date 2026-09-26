@@ -602,8 +602,8 @@ The options manifest generalized to EVERY allocated instrument:
 written once by the bin on EVERY boot (a boot always carries ≥ 1
 instrument), `<sym_u32_decimal>\t<descriptor>\n` per line, where
 `descriptor` is the FINAL §9.4 worker map-name string (PM token ids
-bare; `binance:` / `binance-usdm:` / `okx:` / `deribit:` /
-`hyperliquid:` for the static lanes — baked by
+bare; `binance:` / `binance-usdm:` / `binance-coinm:` / `okx:` /
+`deribit:` / `hyperliquid:` for the static lanes — baked by
 `core-config::universe` at allocation; options
 `deribit:`/`okx:`/`binance-opt:` + instrument name). Emission order =
 allocation order. This is the sym→descriptor resolution lane for
@@ -611,6 +611,18 @@ every offline venue+descriptor consumer (`audit-pnl`, the §9.8 IV
 digest, M5 naming); `options-manifest.tsv` is kept ONE release for
 pre-D3 readers and then retires. Absence = a pre-D3 run. Readers
 parse strictly and skip-and-count malformed lines.
+
+**COIN-M (BX2).** `[binance] coinm` / `coinm_dated` instruments are
+VenueId 1 (`bn` captures, the same files as spot and USDⓈ-M), ordinals
+from 3072 (perpetuals, `<coin>usd_perp`) and 3584 (delivery,
+`<coin>usd_<yymmdd>`), one `binance-coinm:` namespace — the class law
+reads the suffix (`_perp` → perp, six digits → dated). Each gets a
+bookTicker `Tick` and a capture-only `markPrice` lane exactly like
+USDⓈ-M (mark/index `Mark` events; `Funding` on perpetuals only). The
+contracts are INVERSE: `Tick` quantities and the worker's candle `v`
+are CONTRACTS (100 USD of face on BTC, 10 USD on the others), not
+coin; the frames carry `st: 2`. A consumer converting to coin or USD
+needs the contract face (dapi `exchangeInfo` `contractSize`).
 
 ### Raw tap — `<venue>-raw.tap`
 

@@ -50,3 +50,15 @@ def test_hyperevm_pools_are_spot() -> None:
     f = claude_worker.instrument_class.class_of_descriptor
     assert f("hyperevm:0x6c9a33e3b592c0d65b3ba59355d5be0d38259285") == "spot"
     assert f("hyperevm:") is None
+
+
+def test_coinm_class_reads_the_suffix() -> None:
+    """BX2: `_perp` -> perp, six digits -> dated, anything else unknown —
+    inverse is a discovery-row flag, never a class."""
+    f = claude_worker.instrument_class.class_of_descriptor
+    assert f("binance-coinm:btcusd_perp") == "perp"
+    assert f("binance-coinm:1000shibusd_perp") == "perp"
+    assert f("binance-coinm:btcusd_261225") == "dated"
+    for bad in ("btcusd", "btcusd_2612", "_perp", "_261225"):
+        assert f(f"binance-coinm:{bad}") is None, bad
+    assert f("binance-coinm:") is None

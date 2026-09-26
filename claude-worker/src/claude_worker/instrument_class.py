@@ -39,6 +39,20 @@ def _bn_delivery_suffix(name: str) -> bool:
     return bool(sep) and bool(base) and _is_digits(tail, 6)
 
 
+def _bn_coinm(name: str) -> str | None:
+    """BX2 COIN-M: ``btcusd_perp`` → perp, ``btcusd_261225`` → dated;
+    any other shape is unknown. Inverse is a discovery-row flag, never a
+    class."""
+    base, sep, tail = name.rpartition("_")
+    if not sep or not base:
+        return None
+    if tail == "perp":
+        return "perp"
+    if _is_digits(tail, 6):
+        return "dated"
+    return None
+
+
 def _okx(name: str) -> str | None:
     segs = name.split("-")
     if len(segs) == 2 and segs[0] and segs[1]:
@@ -114,6 +128,8 @@ def class_of_descriptor(descriptor: str) -> str | None:
         return fixed
     if ns == "binance-usdm":
         return "dated" if _bn_delivery_suffix(name) else "perp"
+    if ns == "binance-coinm":
+        return _bn_coinm(name)
     if ns == "okx":
         return _okx(name)
     if ns == "deribit":

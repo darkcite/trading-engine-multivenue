@@ -26,6 +26,7 @@ def hosts() -> dict[str, str]:
     return {
         "binance": "bn.test",
         "binance-usdm": "bnf.test",
+        "binance-coinm": "bnd.test",
         "okx": "okx.test",
         "deribit": "dbt.test",
         "hyperliquid": "hl.test",
@@ -310,3 +311,60 @@ def test_hl_fetch_resumes_from_newest_stored_point(tmp_path: pathlib.Path) -> No
     assert len(seen_bodies) == 1
     body = json.loads(seen_bodies[0])
     assert body["startTime"] == stored_ts + 1, "must resume past the stored point"
+
+
+# ---- BX2: COIN-M ---------------------------------------------------------
+
+#: BX2, measured live 2026-09-26: `GET dapi.binance.com/dapi/v1/fundingRate
+#: ?symbol=BTCUSD_PERP&limit=2`, verbatim — fapi's body plus `markPrice` /
+#: `rateType`.
+DAPI_FUNDING_BTC = (
+    '[{"symbol":"BTCUSD_PERP","fundingTime":1790352000002,"fundingRate":"0.00000272",'
+    '"markPrice":"83742.41308536","rateType":"Regular"},'
+    '{"symbol":"BTCUSD_PERP","fundingTime":1790380800000,"fundingRate":"-0.00006517",'
+    '"markPrice":"84032.71460797","rateType":"Regular"}]'
+)
+
+
+def test_coinm_funding_takes_the_perps_only(tmp_path: pathlib.Path) -> None:
+    """Every COIN-M name carries a `_`: the usdm underscore law would drop
+    the perps too — the lane keeps the `_PERP` names, never a delivery."""
+    p = tmp_path / "universe.toml"
+    p.write_text(
+        '[binance]\nusdm=["ethusdt"]\ncoinm=["btcusd_perp","ethusd_perp"]\n'
+        'coinm_dated=["btcusd_261225"]\n',
+        encoding="utf-8",
+    )
+    lanes = claude_worker.funding.read_funding_lanes(p)
+    assert lanes is not None
+    by_name = {lane.name: [t.descriptor for t in lane.targets] for lane in lanes}
+    assert by_name == {
+        "binance-usdm": ["binance-usdm:ethusdt"],
+        "binance-coinm": ["binance-coinm:btcusd_perp", "binance-coinm:ethusd_perp"],
+    }
+
+
+def test_cycle_coinm_reads_dapi_on_its_own_budget(tmp_path: pathlib.Path) -> None:
+    """The venue's second funding lane sits on its own host: a usdm lane
+    that spends its whole budget must not starve it (budgets per host)."""
+    conn = db(tmp_path)
+    bn = claude_worker.frames.VENUE_BINANCE
+    usdm = [
+        claude_worker.funding.FundingTarget(bn, f"binance-usdm:c{i}usdt", f"C{i}USDT")
+        for i in range(3)
+    ]
+    coinm = claude_worker.funding.FundingTarget(bn, "binance-coinm:btcusd_perp", "BTCUSD_PERP")
+    lanes = [
+        claude_worker.funding.FundingLane("binance-usdm", bn, usdm),
+        claude_worker.funding.FundingLane("binance-coinm", bn, [coinm]),
+    ]
+    url = "https://bnd.test/dapi/v1/fundingRate?symbol=BTCUSD_PERP&limit=1000"
+    http, calls = http_map({url: DAPI_FUNDING_BTC})
+    lines: list[str] = []
+    claude_worker.funding.run_cycle(conn, lanes, http, NOW, 2, lines.append)
+    assert len(calls) == 3, "usdm spends its 2; COIN-M still gets its own"
+    assert calls[-1] == url
+    assert any(line.startswith("funding: binance-usdm:") and "BUDGET" in line for line in lines)
+    assert any("binance-coinm: targets=1 points=2 +2 failed=0" in line for line in lines)
+    rows = [(r[2], r[3]) for r in all_rows(conn) if r[1] == "binance-coinm:btcusd_perp"]
+    assert rows == [(1_790_352_000_002, 0.00000272), (1_790_380_800_000, -0.00006517)]

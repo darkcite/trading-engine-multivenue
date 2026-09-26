@@ -25,6 +25,8 @@ LAW: list[tuple[str, int]] = [
     ("123456789", P),  # bare PM token id
     ("binance:btcusdt", P),
     ("binance-usdm:btcusdt", P | F),
+    ("binance-coinm:btcusd_perp", P | F),
+    ("binance-coinm:btcusd_261225", P | F),
     ("okx:BTC-USDT-SWAP", P | F | D),
     ("okx:BTC-USDT", P | D),
     ("okx:BTC-USD-260925-100000-C", O),

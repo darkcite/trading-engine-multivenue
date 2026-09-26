@@ -269,9 +269,12 @@ impl DescriptorTable {
 /// * `binance-opt:*` → OPT|PRICE (eapi tickers carry BBO).
 /// * `deribit:`/`okx:` names ending `-C`/`-P` → OPT|PRICE.
 /// * `deribit:*-PERPETUAL`, `okx:*-SWAP`, `binance-usdm:*`,
-///   `bybit-linear:*`, `mexc-perp:*` (MX2 — funding on every MEXC
-///   contract, TradFi included), `hyperliquid:<coin>` (no `#` prefix)
-///   → PRICE|FUNDING (+DEPTH on okx/deribit).
+///   `binance-coinm:*` (BX2 — its markPrice lane carries funding on
+///   the perps; its dated rows take the permissive grant, as
+///   `binance-usdm:`'s do), `bybit-linear:*`, `mexc-perp:*` (MX2 —
+///   funding on every MEXC contract, TradFi included),
+///   `hyperliquid:<coin>` (no `#` prefix) → PRICE|FUNDING (+DEPTH on
+///   okx/deribit).
 /// * everything else (PM tokens, spot, dated futures, `#` outcome
 ///   coins, `mexc:*` spot incl. xStocks) → PRICE (+DEPTH on
 ///   okx/deribit non-options).
@@ -302,6 +305,7 @@ pub fn caps_of_descriptor(desc: &str) -> u8 {
             }
         }
         "binance-usdm" => CAP_PRICE | CAP_FUNDING,
+        "binance-coinm" => CAP_PRICE | CAP_FUNDING,
         "bybit-linear" => CAP_PRICE | CAP_FUNDING,
         "mexc-perp" => CAP_PRICE | CAP_FUNDING,
         "hyperliquid" => {
@@ -3471,10 +3475,12 @@ mod v2_grammar_tests {
         const F: u8 = CAP_FUNDING;
         const D: u8 = CAP_DEPTH;
         const O: u8 = CAP_OPT;
-        let law: [(&str, u8); 17] = [
+        let law: [(&str, u8); 19] = [
             ("123456789", P), // bare PM token id
             ("binance:btcusdt", P),
             ("binance-usdm:btcusdt", P | F),
+            ("binance-coinm:btcusd_perp", P | F),
+            ("binance-coinm:btcusd_261225", P | F),
             ("okx:BTC-USDT-SWAP", P | F | D),
             ("okx:BTC-USDT", P | D),
             ("okx:BTC-USD-260925-100000-C", O),

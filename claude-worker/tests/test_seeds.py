@@ -174,6 +174,24 @@ def test_mexc_perp_rows_seed_and_mexc_spot_never_does(tmp_path):
     assert frames[0].px == 41_000  # 0.000041 x 1e9, raw
 
 
+def test_coinm_perp_rows_seed_under_the_binance_venue(tmp_path):
+    """BX2: `binance-coinm:` descriptors carry CAP_FUNDING and seed under
+    venue 1, like `binance-usdm:` (the funding table's venue key)."""
+    now_ms = EPOCH_MS
+    bn = claude_worker.frames.VENUE_BINANCE
+    _db, conn = _funding_db(
+        tmp_path,
+        [(bn, "binance-coinm:btcusd_perp", now_ms - MS_1H, -0.00006517)],
+    )
+    sym = (bn << 24) | 3073
+    manifest = {(bn, sym): "binance-coinm:btcusd_perp"}
+    frames, stats = claude_worker.seeds.funding_seed_frames(conn, manifest, now_ms)
+    conn.close()
+    assert stats == claude_worker.seeds.FundingStats(1, 1, 0)
+    assert frames[0].sym == sym
+    assert frames[0].px == -65_170  # -0.00006517 x 1e9, raw
+
+
 def test_funding_seed_rows_and_tsv_carry_the_harness_shape(tmp_path):
     """The harness seed file (``funding-seed.tsv``) is the SAME law as
     the boot frames: descriptor / venue ms / rate ×1e9 RAW, oldest

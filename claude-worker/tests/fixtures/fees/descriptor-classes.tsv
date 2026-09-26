@@ -16,6 +16,11 @@ binance-usdm:nvdausdt	perp
 binance-usdm:btcusdt_260327	dated
 binance-opt:BTC-260912-76500-C	option
 binance-opt:BTC-260912-76750-P	option
+binance-coinm:btcusd_perp	perp
+binance-coinm:ethusd_perp	perp
+binance-coinm:btcusd_261225	dated
+binance-coinm:btcusd	none
+binance-coinm:btcusd_2612	none
 okx:BTC-USDT	spot
 okx:ETH-USDT-SWAP	perp
 okx:BTC-USDT-260926	dated
