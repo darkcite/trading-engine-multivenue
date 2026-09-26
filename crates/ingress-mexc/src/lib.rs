@@ -118,8 +118,9 @@
 //!
 //! Everything after the handshake is zero-alloc and zero-copy: parsers
 //! return spans into the rx buffer; the only copies are the sanctioned
-//! ones marked `// COPY:` (subscribe render scratch, the 64-byte PODs
-//! moved into their ring slots); the WS ping echo goes rx → tx.
+//! ones marked `// COPY:` (the 64-byte PODs moved into their ring
+//! slots, the rate-limited sub-drop WARN line); subscribes render
+//! straight into tx, header first; the WS ping echo goes rx → tx.
 
 #![forbid(unsafe_code)]
 #![deny(
@@ -138,9 +139,8 @@ pub mod spot;
 
 pub use futures::{
     classify_futures, extract_fut_symbol, extract_fut_ts_ms, extract_refused_contract,
-    parse_depth_full,
-    parse_fut_deal_item, parse_ticker, write_fut_subscribe, MexcDepthFrame, MexcFutDealsWalk,
-    MexcFutKind, MexcTickerFrame,
+    parse_depth_full, parse_fut_deal_item, parse_ticker, render_fut_subscribe, MexcDepthFrame,
+    MexcFutDealsWalk, MexcFutKind, MexcTickerFrame,
 };
 pub use run_loop::{
     drive_one, note_transport_ready, run_multi, Driver, MexcConn, RunResult, State, StopFlag,
@@ -148,7 +148,7 @@ pub use run_loop::{
 };
 pub use spot::{
     classify_spot, extract_param_channel, extract_param_symbol, parse_book_ticker_body,
-    parse_deal_item, parse_spot_wrapper, parse_sub_ack, trade_id_seq, write_spot_subscribe,
+    parse_deal_item, parse_spot_wrapper, parse_sub_ack, render_spot_subscribe, trade_id_seq,
     MexcAckParams, MexcBookTicker, MexcDealsWalk, MexcSpotAck, MexcSpotFrame, MexcSpotKind,
 };
 
@@ -349,6 +349,24 @@ impl MexcChannel {
         self as u8 as i64
     }
 }
+
+// The subscribe renders walk `MexcChannel::from_slot` until it runs out,
+// while the ack bookkeeping and the tx budget count `channels_per_symbol`:
+// both must name the same slots, per class.
+const _: () = {
+    let classes = [MexcClass::Spot, MexcClass::Futures];
+    let mut c = 0;
+    while c < classes.len() {
+        let n = classes[c].channels_per_symbol();
+        let mut slot = 0;
+        while slot < n {
+            assert!(MexcChannel::from_slot(classes[c], slot as u8).is_some());
+            slot += 1;
+        }
+        assert!(MexcChannel::from_slot(classes[c], n as u8).is_none());
+        c += 1;
+    }
+};
 
 // ---------------------------------------------------------------
 // One print (both classes)
@@ -552,21 +570,6 @@ impl Default for MexcSymbolTable {
 // Shared byte helpers
 // ---------------------------------------------------------------
 
-/// Append `src` at `at` in `dst` (subscribe rendering into stack
-/// scratch). `None` when `dst` is too small.
-#[inline]
-pub(crate) fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
-    let end = at.checked_add(src.len())?;
-    let slot = dst.get_mut(at..end)?;
-    // COPY: subscribe text ≤ the render scratch (4 KiB spot / 128 B
-    // futures), once per session — the WS frame header needs the
-    // payload length before the payload is masked into tx — rendering
-    // straight into tx rejected: the header width (7/16-bit length) is
-    // unknown until the render ends.
-    slot.copy_from_slice(src);
-    Some(end)
-}
-
 /// Checked ASCII-digit run at `pos` → `(value, end)`. `None` when no
 /// digit is present or the run overflows `u64` (never wraps — unlike
 /// `core_parse::scan_u64`, whose wrap would turn a garbage id into a
@@ -709,16 +712,6 @@ mod tests {
         assert_eq!(scan_u64_checked(b"", 0), None);
         assert_eq!(scan_u64_checked(b"18446744073709551615", 0), Some((u64::MAX, 20)));
         assert_eq!(scan_u64_checked(b"18446744073709551616", 0), None, "overflow");
-    }
-
-    #[test]
-    fn push_bytes_bounds() {
-        let mut d = [0u8; 4];
-        assert_eq!(push_bytes(&mut d, 0, b"ab"), Some(2));
-        assert_eq!(push_bytes(&mut d, 2, b"cd"), Some(4));
-        assert_eq!(push_bytes(&mut d, 4, b"e"), None);
-        assert_eq!(push_bytes(&mut d, usize::MAX, b"e"), None);
-        assert_eq!(&d, b"abcd");
     }
 }
 

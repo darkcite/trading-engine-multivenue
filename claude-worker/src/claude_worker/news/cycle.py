@@ -23,8 +23,10 @@ import dataclasses
 import time
 import typing
 
+import claude_worker.news
 import claude_worker.news.detect
 import claude_worker.news.filter
+import claude_worker.news.scheduled
 import claude_worker.news.sources
 import claude_worker.news.store
 
@@ -60,6 +62,7 @@ class CycleStats:
     xsd_rows: int = 0
     alerts: int = 0
     calendar: int = 0
+    scheduled: int = 0
     resolved: int = 0
     parse_empty: int = 0
     refused_origin: int = 0
@@ -85,7 +88,7 @@ class CycleStats:
             f"transport={self.transport} skipped_deadline={self.deadline_skipped} "
             f"snapshots={self.snapshots} series={self.series} dup_items={self.items_dup} "
             f"closed={self.closed} proposals={self.proposals} xsd_rows={self.xsd_rows} "
-            f"alerts={self.alerts} calendar={self.calendar}"
+            f"alerts={self.alerts} calendar={self.calendar} scheduled={self.scheduled}"
         )
 
 
@@ -351,6 +354,14 @@ def aggregate_once(  # noqa: PLR0913 — the composition root of one pass
         store.add_items_total(source.name, stats.items_new - before)
     final = claude_worker.news.detect.finalize(store, registry, now_ts, alerts, ctx)
     stats.calendar = final.calendar_events
+    feed = claude_worker.news.scheduled.build_feed(registry, store, now_ts)
+    stats.scheduled = len(typing.cast(list[object], feed["events"]))
+    if ctx is not None:
+        # -1 when the write failed: shown on the detail line, never silent
+        # (the next cycle rewrites the file).
+        stats.scheduled = claude_worker.news.scheduled.write_feed(
+            ctx.file(claude_worker.news.SCHEDULED_EVENTS_FILE), feed
+        )
     stats.alerts = final.alerts
     stats.elapsed_ms = max(0, (clock_ns() - started) // 1_000_000)
     return stats

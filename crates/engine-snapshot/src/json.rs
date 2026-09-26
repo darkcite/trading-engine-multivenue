@@ -21,11 +21,14 @@
 //! byte-exact test in `tests/encode.rs`.
 
 use core_types::{Fill, Order, RegimeWord, REGIME_PROFILES};
-use strategy_core::{RegimeCounters, RegimeRelView, VmRowView};
+use strategy_core::{
+    HarSeriesView, RegimeCounters, RegimeRelView, VmRowView, HAR_VIEW_SERIES, HAR_VIEW_TENORS,
+    HAR_VIEW_TENORS_D, HAR_VIEW_WEEKDAYS,
+};
 
 use crate::snapshot::{
-    EngineSnapshot, IngressSnapshot, RecentRing, SLOT_NAMES, SNAPSHOT_SLOTS, SNAPSHOT_VENUES,
-    VENUE_NAMES,
+    EngineSnapshot, HarSnapshot, IngressSnapshot, RecentRing, SLOT_NAMES, SNAPSHOT_SLOTS,
+    SNAPSHOT_VENUES, VENUE_NAMES,
 };
 
 /// The destination buffer was too small for the body. The caller's
@@ -95,8 +98,10 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.hex(&s.vm.active_hash);
     c.key("ruleset_staged_hash");
     c.hex(&s.vm.staged_hash);
-    c.key("icdp_hash");
-    c.hex(&s.icdp.hash);
+    c.key("xmm_hash");
+    c.hex(&b.xmm_hash);
+    c.key("xmm_coins");
+    c.text(b.xmm_coins());
     c.key("regime_hash");
     c.hex(&b.regime_hash);
     c.key("regime_configured");
@@ -221,44 +226,151 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     }
     c.put(b"]}");
 
-    // --- icdp ---
-    let ic = &s.icdp;
-    c.key("icdp");
+    // --- xmm (XMM XH3; schema 2 — it replaced `icdp`) ---
+    //
+    // The counters sit flat in the object (the hyparb precedent); one row
+    // per quoted perp, its feed ages against this publish's clock.
+    let xm = &s.xmm;
+    let xc = &xm.counters;
+    c.key("xmm");
     c.put(b"{\"configured\":");
-    c.u64(u64::from(ic.instruments > 0));
+    c.u64(u64::from(xm.n_perps > 0));
+    c.key("n_perps");
+    c.u64(u64::from(xm.n_perps));
+    c.key("placed");
+    c.u64(xc.placed);
+    c.key("modifies");
+    c.u64(xc.modifies);
+    c.key("lead_cancels");
+    c.u64(xc.lead_cancels);
+    c.key("requote_cancels");
+    c.u64(xc.requote_cancels);
+    c.key("pull_cancels");
+    c.u64(xc.pull_cancels);
+    c.key("expiry_cancels");
+    c.u64(xc.expiry_cancels);
+    c.key("gated");
+    c.u64(xc.gated);
+    c.key("gate_overflow");
+    c.u64(xc.gate_overflow);
+    c.key("capped");
+    c.u64(xc.capped);
+    c.key("rejected_alo");
+    c.u64(xc.rejected_alo);
+    c.key("rejected_other");
+    c.u64(xc.rejected_other);
+    c.key("canceled");
+    c.u64(xc.canceled);
+    c.key("filled");
+    c.u64(xc.filled);
+    c.key("fills");
+    c.u64(xc.fills);
+    c.key("unmatched");
+    c.u64(xc.unmatched);
+    c.key("ctx_refused");
+    c.u64(xc.ctx_refused);
+    c.key("stuck");
+    c.u64(xc.stuck);
+    c.key("perps");
+    c.put(b"[");
+    let np = (xm.n_perps as usize).min(crate::SNAPSHOT_XMM_PERPS);
+    let mut i = 0usize;
+    while i < np {
+        let r = &xm.perps[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"hl_sym\":");
+        c.u64(u64::from(r.hl_sym));
+        c.key("lead_sym");
+        c.u64(u64::from(r.lead_sym));
+        c.key("pos_1e6");
+        c.i64(r.pos_1e6);
+        c.key("touch_bid_1e6");
+        c.i64(r.touch_bid_1e6);
+        c.key("touch_ask_1e6");
+        c.i64(r.touch_ask_1e6);
+        c.key("bid_px_1e6");
+        c.i64(r.bid_px_1e6);
+        c.key("ask_px_1e6");
+        c.i64(r.ask_px_1e6);
+        c.key("bid_state");
+        c.u64(u64::from(r.bid_state));
+        c.key("ask_state");
+        c.u64(u64::from(r.ask_state));
+        c.key("stale_flags");
+        c.u64(u64::from(r.stale_flags));
+        c.key("lead_age_ms");
+        c.age_ms(s.mono_ns, r.lead_rx_ns);
+        c.key("fol_age_ms");
+        c.age_ms(s.mono_ns, r.fol_rx_ns);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]}");
+
+    // --- hcv (HC11: slot 7, Hypercall S1 — DARK, paper only) ---
+    //
+    // Flat, like `xmm`'s counters; `configured` is the artifact's
+    // presence (its hash — rendered here, the `vrp` precedent, so the
+    // pinned `boot` section is unchanged), so an unconfigured member
+    // reads all zeros.
+    let hc = &s.hcv.counters;
+    c.key("hcv");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(s.boot.hcv_hash != [0u8; 32]));
     c.key("hash");
-    c.hex(&ic.hash);
-    c.key("instruments");
-    c.u64(u64::from(ic.instruments));
-    let cnt = &ic.counters;
-    c.key("decisions");
-    c.u64(cnt.decisions);
-    c.key("signals");
-    c.u64(cnt.signals);
-    c.key("intents");
-    c.u64(cnt.intents);
-    c.key("exits");
-    c.u64(cnt.exits);
-    c.key("exit_on_stale");
-    c.u64(cnt.exit_on_stale);
-    c.key("skipped_spread");
-    c.u64(cnt.skipped_spread);
-    c.key("skipped_stale_open");
-    c.u64(cnt.skipped_stale_open);
-    c.key("skipped_stale_dec");
-    c.u64(cnt.skipped_stale_dec);
-    c.key("skipped_prev");
-    c.u64(cnt.skipped_prev);
-    c.key("late_bars");
-    c.u64(cnt.late_bars);
-    c.key("caps_rejected");
-    c.u64(cnt.caps_rejected);
-    c.key("rolls");
-    c.u64(cnt.rolls);
-    c.key("regime_blocked");
-    c.u64(cnt.regime_blocked);
-    c.key("regime_exits");
-    c.u64(cnt.regime_exits);
+    c.hex(&s.boot.hcv_hash);
+    c.key("judged");
+    c.u64(hc.judged);
+    c.key("sells");
+    c.u64(hc.sells);
+    c.key("buys");
+    c.u64(hc.buys);
+    c.key("option_fills");
+    c.u64(hc.option_fills);
+    c.key("hedges");
+    c.u64(hc.hedges);
+    c.key("hedge_fills");
+    c.u64(hc.hedge_fills);
+    c.key("unwind_slices");
+    c.u64(hc.unwind_slices);
+    c.key("settlements");
+    c.u64(hc.settlements);
+    c.key("settle_fallbacks");
+    c.u64(hc.settle_fallbacks);
+    c.key("skip_event");
+    c.u64(hc.skip_event);
+    c.key("skip_stale");
+    c.u64(hc.skip_stale);
+    c.key("skip_forecast");
+    c.u64(hc.skip_forecast);
+    c.key("skip_caps");
+    c.u64(hc.skip_caps);
+    c.key("skip_stopped");
+    c.u64(hc.skip_stopped);
+    c.key("ctx_refused");
+    c.u64(hc.ctx_refused);
+    c.key("calendars");
+    c.u64(hc.calendars);
+    c.key("har_updates");
+    c.u64(hc.har_updates);
+    c.key("restored");
+    c.u64(hc.restored);
+    c.key("positions");
+    c.i64(hc.positions);
+    c.key("vega_abs_usd_1e6");
+    c.i64(hc.vega_abs_usd_1e6);
+    c.key("pnl_usd_1e6");
+    c.i64(hc.pnl_usd_1e6);
+    c.key("day_pnl_usd_1e6");
+    c.i64(hc.day_pnl_usd_1e6);
+    c.key("orphans");
+    c.i64(hc.orphans);
+    c.key("book_stale");
+    c.i64(hc.book_stale);
+    c.key("marks_unknown");
+    c.i64(hc.marks_unknown);
     c.put(b"}");
 
     // --- exec (E6 c4) ---
@@ -686,6 +798,16 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     }
     c.put(b"]}");
 
+    // --- har (HAR H3.5) ---
+    //
+    // Additive (`"v"` does not move). One row per long-tenor series: at the
+    // nine panel tenors the raw fold AND the fit (plan law L2 — neither
+    // hides the other), the pairs behind the fit, and the day census
+    // that says whether any of it is current (`day_age_s` > 26 h =
+    // "not recalibrating").
+    c.key("har");
+    har(&mut c, &s.har, s.wall_ns);
+
     // --- recent ---
     c.key("recent");
     c.put(b"{\"orders_total\":");
@@ -799,6 +921,151 @@ fn regime(c: &mut Cursor<'_>, r: &RegimeCounters, rel: &RegimeRelView, mono_ns: 
         p += 1;
     }
     c.put(b"}}");
+}
+
+/// The `har` object. `day_age_s` is WALL-derived — a UTC day is wall
+/// time — against the snapshot's own `wall_ns`: whole seconds since the
+/// newest closed day ended (its next midnight); `-1` = no closed day.
+fn har(c: &mut Cursor<'_>, h: &HarSnapshot, wall_ns: u64) {
+    let k = &h.counters;
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(h.n));
+    c.key("hash");
+    c.hex(&h.hash);
+    c.key("dropped");
+    c.u64(u64::from(h.dropped));
+    // Flat, like `hyparb`'s: a nested `counters` key would shadow the
+    // top-level section of that name.
+    c.key("minutes_rolled");
+    c.u64(k.minutes_rolled);
+    c.key("closes");
+    c.u64(k.closes);
+    c.key("day_closes");
+    c.u64(k.day_closes);
+    c.key("held");
+    c.u64(k.held);
+    c.key("forced");
+    c.u64(k.forced);
+    c.key("day_close_ns_max");
+    c.u64(k.day_close_ns_max);
+    c.key("day_close_ns_last");
+    c.u64(k.day_close_ns_last);
+    c.key("epoch");
+    c.u64(k.epoch);
+    c.key("tenors_d");
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(HAR_VIEW_TENORS_D[t]));
+        t += 1;
+    }
+    c.put(b"]");
+    c.key("series");
+    c.put(b"[");
+    let n = (h.n as usize).min(HAR_VIEW_SERIES);
+    let wall_ms = wall_ns / 1_000_000;
+    let mut i = 0usize;
+    while i < n {
+        if i > 0 {
+            c.put(b",");
+        }
+        har_series(c, &h.series[i], wall_ms);
+        i += 1;
+    }
+    c.put(b"]}");
+}
+
+fn har_series(c: &mut Cursor<'_>, v: &HarSeriesView, wall_ms: u64) {
+    c.put(b"{\"name\":");
+    c.text(v.name());
+    c.key("feed");
+    c.u64(u64::from(v.feed));
+    c.key("warm");
+    c.u64(u64::from(v.warm));
+    c.key("days");
+    c.u64(u64::from(v.days));
+    c.key("empty_days");
+    c.u64(u64::from(v.empty_days));
+    c.key("gaps");
+    c.u64(v.gaps);
+    c.key("newest_day_ms");
+    c.u64(v.newest_day_ms);
+    c.key("day_age_s");
+    if v.newest_day_ms == 0 {
+        c.put(b"-1");
+    } else {
+        let closed_ms = v.newest_day_ms.saturating_add(86_400_000);
+        c.u64(wall_ms.saturating_sub(closed_ms) / 1_000);
+    }
+    c.key("last_min_ms");
+    c.u64(v.last_min_ms);
+    c.key("open_minutes");
+    c.u64(u64::from(v.open_minutes));
+    c.key("epoch");
+    c.u64(v.epoch);
+    c.key("raw_1e6");
+    i32_array(c, &v.raw_1e6);
+    c.key("fit_1e6");
+    i32_array(c, &v.fit_1e6);
+    c.key("pairs");
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(v.pairs[t]));
+        t += 1;
+    }
+    c.put(b"]");
+    c.key("fitted");
+    bits(c, v.fitted);
+    c.key("fit_beats_raw");
+    bits(c, v.fit_beats_raw);
+    c.key("weekday_1e6");
+    i32_array(c, &v.weekday_1e6);
+    c.key("weekday_n");
+    c.put(b"[");
+    let mut w = 0usize;
+    while w < HAR_VIEW_WEEKDAYS {
+        if w > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(v.weekday_n[w]));
+        w += 1;
+    }
+    c.put(b"]}");
+}
+
+/// `[a,b,…]` of signed values.
+fn i32_array(c: &mut Cursor<'_>, a: &[i32]) {
+    c.put(b"[");
+    let mut i = 0usize;
+    while i < a.len() {
+        if i > 0 {
+            c.put(b",");
+        }
+        c.i64(i64::from(a[i]));
+        i += 1;
+    }
+    c.put(b"]");
+}
+
+/// A per-tenor bit mask as `[0|1, …]`, tenor order.
+fn bits(c: &mut Cursor<'_>, mask: u16) {
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.byte(b'0' + ((mask >> t) & 1) as u8);
+        t += 1;
+    }
+    c.put(b"]");
 }
 
 /// A regime word: its raw hex plus the seven dimension bytes (the
@@ -1139,6 +1406,17 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Whole milliseconds from `stamp` to `now`; `-1` when `stamp == 0`
+    /// (never) — the maker's feeds go stale in hundreds of ms.
+    #[inline]
+    fn age_ms(&mut self, now: u64, stamp: u64) {
+        if stamp == 0 {
+            self.put(b"-1");
+        } else {
+            self.u64(now.saturating_sub(stamp) / 1_000_000);
+        }
+    }
+
     #[inline]
     fn finish(self) -> Result<usize, JsonOverflow> {
         if self.overflow {
@@ -1197,7 +1475,7 @@ mod tests {
         let mut buf = vec![0u8; STATE_JSON_MAX];
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(body.starts_with("{\"v\":1,\"seq\":0,"), "{body}");
+        assert!(body.starts_with("{\"v\":2,\"seq\":0,"), "{body}");
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
         assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
         assert!(body.contains("\"venue\":\"rpc\""));
@@ -1213,6 +1491,10 @@ mod tests {
             mexc < hev,
             "hyperevm must follow mexc (append, never reorder)"
         );
+        let hc = body
+            .find("\"venue\":\"hypercall\"")
+            .expect("hypercall ingress row");
+        assert!(hev < hc, "hypercall must follow hyperevm (append, never reorder)");
         assert!(body.contains("\"heartbeat_age_s\":-1"));
     }
 

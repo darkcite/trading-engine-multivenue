@@ -1,0 +1,17 @@
+[package]
+name         = "core-settle"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "The Hypercall settlement law, replicated (HC7): a 1 s sample-and-hold grid over the last 30 minutes of the underlying's oracle, and the 5 %-trimmed median-of-means over it. Stack-only, 0 B/op; no dependencies."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }

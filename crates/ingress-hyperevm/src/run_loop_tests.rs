@@ -211,7 +211,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn step(&mut self, prod: &mut Producer<Signal, CAP>) -> io::Result<()> {
+    fn step(&mut self, prod: &mut Producer<Signal, CAP>) -> io::Result<bool> {
         drive_one(
             &mut self.t,
             &mut self.d,
@@ -378,6 +378,48 @@ fn the_full_lifecycle_snapshot_then_held_events_then_live() {
     assert_eq!(r.d.phase(), Phase::AwaitHead);
     assert_eq!(r.d.counters().resyncs, 1);
     assert_eq!(r.d.sub_count(), 2, "subscriptions survive a resync");
+}
+
+/// I-3: a burst of non-event frames past a full rx no longer strands what
+/// follows it until the next readiness edge — one drain reads it all, the
+/// swap behind it included; a backlog past `DRAIN_STEP_CAP` full-rx steps
+/// ends `Capped` (the loop re-polls at once) and the next drain finishes it.
+#[test]
+fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+    let ps = pools();
+    for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+        let ring = Ring::<Signal, CAP>::new();
+        let (mut prod, mut cons) = ring.split();
+        let mut r = to_await_head(&ps, &mut prod);
+        r.t.inject_incoming(&head_push(B));
+        r.step(&mut prod).unwrap();
+        to_live(&mut r, &ps, &mut prod, &[]);
+        let _ = drain(&mut cons);
+        // A transport that holds the whole burst (the rig's holds 1 MiB).
+        r.t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+        r.t.inject_server_pongs(fills * RX_BUF_SIZE);
+        r.t.inject_incoming(&swap_push([0x30; 20], B + 2, 3, false, -9));
+        for expect in [first, Drained::Idle] {
+            assert_eq!(
+                drive_until_idle(
+                    &mut r.t,
+                    &mut r.d,
+                    b"rpc.example",
+                    b"/",
+                    &mut prod,
+                    &r.status,
+                    &mut NullCapture,
+                ),
+                expect
+            );
+            if expect == Drained::Capped {
+                assert!(cons.try_pop_ref().is_none(), "the swap still waits below the cap");
+            }
+        }
+        let sig = drain(&mut cons);
+        assert!(matches!(sig[0], (102, PoolEvent::Swap { block, .. }) if block == B + 2));
+        assert_eq!(r.t.incoming_len(), 0, "every byte was read");
+    }
 }
 
 #[test]

@@ -47,6 +47,7 @@ gate. Caps law for both (the 2026-08-29 $50k research tier):
 | **Hyperliquid** | Perp coins (7: BTC/ETH/SOL/XRP/DOGE/ADA/LTC; spot @idx + HIP-4 config-in) | bbo, l2Book, ctx (premium/funding hourly), allMids, outcomeMeta | Hourly funding = fastest funding signal |
 | **Bybit** | Spot + linear perps (14: majors + CVFC coins + S1 pilot alts) | orderbook.1 ticks, publicTrade, tickers (mark/funding/OI) | Data-only sixth venue; intent-addressable since the 2026-08-29 unfreeze |
 | **MEXC** | Spot (crypto + **xStocks** tokenized equities) + USDT perps (crypto + **TradFi**: equities, indices, metals, energy, FX); first universe 5 spot + 7 perp (config-in) | spot aggre.bookTicker ticks + deals (protobuf); futures depth.full ticks, deal, ticker (mark/index/funding/OI) | Data-only seventh venue (2026-09-23) — capture only, §2.1 |
+| **Hypercall** | Options on 12 underlyings (crypto, US single names, SP500 — `[hypercall]`, E ≤ 3 × K ≤ 8 × {C,P}) + each underlying's settlement index (config-in; NOT yet configured live) | indicative BBO ticks, per-provider sides (`ProviderQuote`), index `Mark`s; REST `/options-summary` poll → opt-summary | Data-only eighth venue (merged 2026-09-26) — capture only, §2.2 |
 
 ### 2.1 MEXC — the seventh venue (landed 2026-09-23, `docs/mexc-ingress-plan.md`)
 
@@ -101,6 +102,27 @@ Product facts only; the plan's §1 / §1.7 carry the measurements.
   caps `mexc:` price, `mexc-perp:` price + funding) as signal or
   reference legs. From this host its REST RTT is 131–134 ms (Δ 150 ms,
   `docs/venue-latency.md` §3): nothing latency-sensitive belongs on it.
+
+### 2.2 Hypercall — the eighth venue (merged 2026-09-26, data-only)
+
+- **Instruments.** Options, settled at expiry against each underlying's
+  index, on the twelve underlyings `[hypercall]` names — a boot-selected
+  E ≤ 3 × K ≤ 8 × {C,P} chain each:
+  descriptors `hypercall:<U>-<YYYYMMDD>-<K>-<C|P>`; each underlying's
+  settlement index is `hypercall-idx:<U>` (index `Mark` events only).
+- **Channels.** The venue's indicative BBO is the tick — kept crossed or
+  one-sided as published; the providers' own sides ride
+  `ChannelId::ProviderQuote`; a REST `/options-summary` poller fills the
+  opt-summary lane. The settlement law is replicated in
+  `crates/core-settle` (the shadow: worker `hypercall_settle`); the
+  research store is the worker's `hypercall_history`.
+- **Capture only.** No keys, no exec arm, no fill lane (rulings
+  O-HC1..O-HC10); an order on venue byte 9 is unroutable. Rulesets may
+  NAME its options (ruling O-HC17; caps `CAP_OPT | CAP_PRICE`) as signal
+  or reference legs; the index syms are capture-only (caps 0). Fees
+  `[fees.hypercall] option = "0:0"` are UNVERIFIED (O-HC7). It is captured
+  only once `[hypercall]` is in `~/multivenue/universe.toml` and the engine
+  has restarted (the go-live, O-HC12).
 
 ## 3. Derived/offline data (what research actually reads)
 

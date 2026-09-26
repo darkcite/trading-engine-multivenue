@@ -8,6 +8,8 @@ single-threaded, READ-ONLY. Routes:
 - ``/``                    → ``dashboard/dashboard.html`` (one file, inline CSS+JS,
                              no CDN — the engine's offline law).
 - ``/api/worker``          → the worker-side JSON (this module's ``worker_payload``):
+                             the HAR H3 series (``har.toml``, each seed's sources,
+                             the hourly ``har/drift.json``),
                              rulesets catalog, library + evidence, compositions,
                              regime history (24 h) + ``declared.json`` + the
                              ``regime.toml`` bands, the latest ``pnl-<day>.json``
@@ -16,8 +18,8 @@ single-threaded, READ-ONLY. Routes:
                              from the fills tail of the CURRENT run (the
                              ``positions`` verb's code path, marks carried at
                              cost), the config snapshot (``strategy.conf``,
-                             ``fees.toml``, ``regime.toml``, ``icdp.toml`` hash +
-                             instruments, ``universe.toml`` summary) and the Data
+                             ``fees.toml``, ``regime.toml``, ``xmm.toml`` hash +
+                             quoted perps, ``universe.toml`` summary) and the Data
                              volume's free space. **Never ``.env``.**
 - ``/api/engine/state``, ``/api/engine/metrics`` → same-origin proxies to the
                              engine's 9191 (no CORS, one page); 502 when the
@@ -50,6 +52,8 @@ import urllib.request
 
 import claude_worker.features
 import claude_worker.frames
+import claude_worker.har_config
+import claude_worker.har_seed
 import claude_worker.library
 import claude_worker.news
 import claude_worker.news.actions
@@ -691,19 +695,142 @@ def _universe_summary(path: pathlib.Path) -> dict[str, object] | None:
     return out
 
 
+def _xmm_summary(path: pathlib.Path) -> dict[str, object]:
+    """``xmm.toml`` (slot 6 since XMM XH1): its hash and the perps it quotes
+    (``quote_<coin> = 1``, upper-cased, sorted). Absent or unparseable → no
+    perps; the hash says which (``None`` = absent)."""
+    text = _read_text(path, limit=1 << 20)
+    quoted: list[str] = []
+    if text is not None:
+        try:
+            section = tomllib.loads(text).get("xmm", {})
+        except ValueError:
+            section = {}
+        if isinstance(section, dict):
+            quoted = sorted(
+                k[len("quote_"):].upper() for k, v in section.items() if k.startswith("quote_") and v == 1
+            )
+    return {"hash": _sha256_file(path), "quoted": quoted}
+
+
 def config_section(inputs: Inputs) -> dict[str, object]:
     d = inputs.multivenue_dir
-    icdp = d / "icdp.toml"
-    icdp_text = _read_text(icdp, limit=1 << 20)
-    icdp_instruments = icdp_text.count("[[instrument]]") if icdp_text else 0
     return {
         "strategy_conf": _read_text(d / "strategy.conf"),
         "fees_toml": _read_text(d / "fees.toml"),
         "regime_toml": _read_text(d / "regime.toml"),
-        "icdp": {"hash": _sha256_file(icdp), "instruments": icdp_instruments},
+        "xmm": _xmm_summary(d / "xmm.toml"),
         "universe": _universe_summary(d / "universe.toml"),
         "retention_conf": _read_text(d / "retention.conf"),
     }
+
+
+# ---- HAR H3.6: the worker half of the "Volatility (HAR, long)" panel ----
+
+#: The §7 amber rule: a fallback whose median ``|ln vol ratio|`` against the
+#: source before it exceeds this over the drift window (~22 % in ``sum r^2``).
+HAR_DRIFT_AMBER: float = 0.10
+#: The §7 red rule: a newest closed day older than this is "not
+#: recalibrating" (the engine's ``day_age_s``), seconds.
+HAR_DAY_AGE_RED_S: int = 26 * 3600
+#: Bytes of a seed's head read for its ``span`` lines (the header is < 1 KiB;
+#: a fitted seed is ~350 KiB of rows that are never read here).
+_HAR_SEED_HEAD: int = 8 * 1024
+#: ``# span <descriptor> <first_ms> <last_ms> <minutes>``: six fields.
+_HAR_SPAN_FIELDS: int = 6
+
+
+def _seed_spans(path: pathlib.Path) -> list[dict[str, object]] | None:
+    """The ``# span <descriptor> <first_ms> <last_ms> <minutes>`` lines a seed
+    opens with (``har_seed.seed_header``), oldest first -- which venues the
+    series' history came from. ``None``: no readable seed."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            head = f.read(_HAR_SEED_HEAD)
+    except (OSError, UnicodeDecodeError):
+        return None
+    spans: list[dict[str, object]] = []
+    for line in head.splitlines():
+        if not line.startswith("#"):
+            break
+        parts = line.split()
+        if len(parts) != _HAR_SPAN_FIELDS or parts[1] != "span":
+            continue
+        try:
+            first, last, minutes = int(parts[3]), int(parts[4]), int(parts[5])
+        except ValueError:
+            continue
+        spans.append(
+            {"descriptor": parts[2], "first_ms": first, "last_ms": last, "minutes": minutes}
+        )
+    return spans
+
+
+def _file_age_s(path: pathlib.Path, now_ms: int) -> int | None:
+    """Seconds since ``path`` was written; ``None`` when it is absent."""
+    try:
+        return max(0, now_ms // 1000 - int(path.stat().st_mtime))
+    except OSError:
+        return None
+
+
+def _har_drift(path: pathlib.Path) -> dict[str, object] | None:
+    """``har/drift.json`` (``har_seed compare --json-out``), or ``None`` when
+    it is absent, torn or another version -- never a guess."""
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(doc, dict)
+        or doc.get("v") != claude_worker.har_seed.DRIFT_VERSION
+        or not isinstance(doc.get("pairs"), list)
+    ):
+        return None
+    return typing.cast(dict[str, object], doc)
+
+
+def har_section(inputs: Inputs, now_ms: int) -> dict[str, object]:
+    """HAR H3.6: what the engine's ``/state.har`` cannot say -- the series
+    ``har.toml`` names with their feed and ordered fallbacks, each seed's
+    sources and age, each engine state file's age, and ``drift.json``, the
+    hourly ``compare`` of every feed against its fallbacks (the ruling "keep
+    fallbacks live"). The page joins it with ``/state.har`` by name and
+    applies the thresholds carried here. No ``har.toml`` = not configured."""
+    toml = inputs.multivenue_dir / "har.toml"
+    har_dir = inputs.multivenue_dir / "har"
+    doc: dict[str, object] = {
+        "configured": False,
+        "error": None,
+        "amber_drift": HAR_DRIFT_AMBER,
+        "red_day_age_s": HAR_DAY_AGE_RED_S,
+        "series": [],
+        "drift": None,
+        "drift_age_s": None,
+    }
+    if not toml.is_file():
+        return doc
+    try:
+        series = claude_worker.har_config.read(toml)
+    except (OSError, claude_worker.har_config.HarConfigError) as e:
+        doc["error"] = str(e)
+        return doc
+    drift_path = har_dir / "drift.json"
+    doc["configured"] = True
+    doc["series"] = [
+        {
+            "name": s.name,
+            "feed": s.feed,
+            "fallback": list(s.fallback),
+            "spans": _seed_spans(har_dir / f"seed-{s.name}.tsv"),
+            "seed_age_s": _file_age_s(har_dir / f"seed-{s.name}.tsv", now_ms),
+            "state_age_s": _file_age_s(har_dir / f"state-{s.name}.tsv", now_ms),
+        }
+        for s in series
+    ]
+    doc["drift"] = _har_drift(drift_path)
+    doc["drift_age_s"] = _file_age_s(drift_path, now_ms)
+    return doc
 
 
 def disk_section(path: pathlib.Path) -> dict[str, object] | None:
@@ -751,6 +878,7 @@ def worker_payload(
         "config": config_section(inputs),
         "disk": disk_section(inputs.replay_dir),
         "news": news_section(inputs, ts),
+        "har": har_section(inputs, ts),
     }
 
 

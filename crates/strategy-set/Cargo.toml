@@ -13,13 +13,20 @@ path = "src/lib.rs"
 
 [dependencies]
 core-regime          = { workspace = true }
+# HAR H3.7: the state writer's mailboxes (each series' state leaves the
+# engine thread at its day close).
+core-ring            = { workspace = true }
 core-time            = { workspace = true }
 core-types           = { workspace = true }
+# HAR H3.3: the long-tenor HAR series the set owns.
+core-vol             = { workspace = true }
 strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-hyparb      = { workspace = true }
-strategy-icdp        = { workspace = true }
 strategy-bin15       = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }
+strategy-xmm         = { workspace = true }
+# HC11: the slot-7 member (Hypercall S1 — DARK, paper only).
+strategy-hcv         = { workspace = true }

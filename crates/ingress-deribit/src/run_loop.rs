@@ -93,7 +93,8 @@
 //! livelocking (fail-fast doctrine).
 //!
 //! Everything after the handshake is zero-alloc: parsers slice the rx
-//! buffer in place; requests render into stack scratch; the ring copies
+//! buffer in place; requests go straight into tx (the batch subscribe
+//! rendered header first, the rest from parts); the ring copies
 //! are the 64-byte `Tick` and, per changed book top-K, the 192-byte
 //! `DepthTopK` (one copy each into the slot — marked at the push).
 
@@ -102,11 +103,11 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_parts,
-    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf,
-    Keepalive, KeepaliveAction, PendingTable, ReqKind, Status, SubErr, SubTable, Transport,
-    WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame_parts,
+    queue_masked_text_frame_rendered, read_server_handshake, sec_websocket_key_from_seed,
+    write_client_handshake, ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong,
+    Drained, HandshakeResult, IoBuf, Keepalive, KeepaliveAction, PendingTable, ReqKind, RxFill,
+    Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock};
@@ -117,8 +118,8 @@ use core_types::{
 
 use crate::{
     book_op_parts, classify, extract_instrument, parse_book_header, parse_option_ticker,
-    parse_quote, parse_ticker, parse_trade, parse_vol_index, row_wants_channel,
-    set_heartbeat_parts, sub_id_of, test_request_parts, write_subscribe_all, ChainOutcome,
+    parse_quote, parse_ticker, parse_trade, parse_vol_index, render_subscribe_all,
+    row_wants_channel, set_heartbeat_parts, sub_id_of, test_request_parts, ChainOutcome,
     DeribitBookOp, DeribitChannel, DeribitMsgKind, DeribitSymbolTable, DeribitTradeSeq, DvolName,
     TradeSeqOutcome, DERIBIT_DVOL_MAX, DERIBIT_MAX_SYMBOLS, HEARTBEAT_INTERVAL_SECS,
 };
@@ -167,10 +168,6 @@ pub const MAX_CHANNELS: usize =
 
 /// Subscription-table capacity (≥ [`MAX_CHANNELS`]).
 pub const SUB_CAP: usize = MAX_CHANNELS;
-
-/// Stack scratch for one rendered subscribe batch (≤ ~48 B/channel ×
-/// 192 channels ≈ 9.2 KiB; ~1.7× margin).
-const SUBSCRIBE_SCRATCH: usize = 16 * 1024;
 
 /// Stack scratch for one rendered channel name
 /// (`"` + prefix ≤ 7 + instrument ≤ 32 + `.100ms` + `"` = 47 max).
@@ -567,6 +564,10 @@ impl Driver {
 ///   and bumps `IngressStatus::ring_drops`.
 /// * `status`: per-ingress observability slot; this thread is its
 ///   single writer.
+///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
@@ -580,9 +581,12 @@ pub fn drive_one<T: Transport, C: Capture>(
     opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+    }
 
     match drv.state {
         State::Connecting => {}
@@ -605,7 +609,35 @@ pub fn drive_one<T: Transport, C: Capture>(
     }
 
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run.
+#[allow(clippy::too_many_arguments)]
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    depth_tx: &mut Producer<DepthTopK, DEPTH_RING_SIZE>,
+    opt_tx: &mut Producer<OptSummary, OPT_RING_SIZE>,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(
+            transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx, status,
+            capture,
+        ),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -643,24 +675,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -758,17 +772,12 @@ fn queue_session_start(drv: &mut Driver) -> io::Result<()> {
 
     // 2. One batched subscribe for every (channel × instrument)
     //    (+ WS6 DVOL indices).
+    //    Header first, rendered straight into tx: no scratch.
     let sub_id = drv.alloc_req_id();
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let n = write_subscribe_all(
-        &mut scratch,
-        sub_id,
-        &drv.symbols,
-        drv.depth_enabled,
-        &drv.dvol[..drv.n_dvol],
-    )
-    .ok_or_else(|| io::Error::other("deribit: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..n])?;
+    let (symbols, depth_enabled, dvol) = (&drv.symbols, drv.depth_enabled, &drv.dvol[..drv.n_dvol]);
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        render_subscribe_all(p, sub_id, symbols, depth_enabled, dvol)
+    })?;
     record_pending(&mut drv.pending, sub_id, DeribitReqKind::SubscribeAll)?;
     drv.subscribe_req_id = sub_id;
     drv.session_started = true;
@@ -1896,15 +1905,14 @@ fn log_gap_rate_limited(
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put =
-        |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
-            &mut buf[..],
-            *n,
-            src,
-        ) {
-            Some(e) => *n = e,
-            None => *ok = false,
-        };
+    let put = |buf: &mut [u8; 224], n: &mut usize, ok: &mut bool, src: &[u8]| match push_bytes(
+        &mut buf[..],
+        *n,
+        src,
+    ) {
+        Some(e) => *n = e,
+        None => *ok = false,
+    };
     put(
         &mut buf,
         &mut n,
@@ -1947,6 +1955,20 @@ fn log_gap_rate_limited(
         let mut err = std::io::stderr().lock();
         let _ = std::io::Write::write_all(&mut err, &buf[..n]);
     }
+}
+
+/// Append `src` at `at` in a WARN line's stack buffer; `None` when it
+/// does not fit.
+#[inline]
+fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
+    let end = at.checked_add(src.len())?;
+    // COPY: WARN-line text into the caller's stack line (≤ 224 B gap, ≤ 160 B
+    // sub-drop, ≤ 1 per GAP_LOG_INTERVAL_NS, 1 s) — a WARN line must reach
+    // stderr in ONE write — rejected: one write per part (interleaves) and one
+    // `writev` (a short writev splits the line; `write_all_vectored` is
+    // unstable).
+    dst.get_mut(at..end)?.copy_from_slice(src);
+    Some(end)
 }
 
 /// Render `v` as `0x`-prefixed lowercase hex (SymbolId display form —
@@ -2112,15 +2134,14 @@ fn log_sub_drop_rate_limited(drv: &mut Driver, sym: u32, code: i64, ch: i64) {
     let mut digits = [0u8; 20];
     let mut n = 0usize;
     let mut ok = true;
-    let put =
-        |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match crate::push_bytes(
-            &mut buf[..],
-            *n,
-            src,
-        ) {
-            Some(e) => *n = e,
-            None => *ok = false,
-        };
+    let put = |buf: &mut [u8; 160], n: &mut usize, ok: &mut bool, src: &[u8]| match push_bytes(
+        &mut buf[..],
+        *n,
+        src,
+    ) {
+        Some(e) => *n = e,
+        None => *ok = false,
+    };
     put(
         &mut buf,
         &mut n,
@@ -2206,9 +2227,10 @@ pub fn run<T: Transport, C: Capture>(
         return RunResult::Error;
     }
     let mut last_interest = transport.interest();
+    let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = poll.poll(events, Some(std::time::Duration::from_millis(50))) {
+        if let Err(e) = poll.poll(events, Some(core_net::poll_timeout(repoll_now))) {
             status.note_session_err(
                 core_metrics::ERR_SITE_POLL,
                 core_metrics::io_kind_code(e.kind()),
@@ -2233,25 +2255,18 @@ pub fn run<T: Transport, C: Capture>(
             note_transport_ready(drv, transport_status);
         }
 
-        // Tight inner drain (see ingress-polymarket for rationale).
-        loop {
-            let n_before = producer.published();
-            let state_before = drv.state();
-            if let Err(e) = drive_one(
-                transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx,
-                status, capture,
-            ) {
-                status.note_session_err(
-                    core_metrics::ERR_SITE_DRIVE,
-                    core_metrics::io_kind_code(e.kind()),
-                );
+        // I-3 (core_net::drain): drive until a step leaves nothing
+        // behind; re-poll at once if the step cap cut a backlog short.
+        match drive_until_idle(
+            transport, drv, host, path, producer, event_tx, event_mask, depth_tx, opt_tx, status,
+            capture,
+        ) {
+            Drained::Idle => repoll_now = false,
+            Drained::Capped => repoll_now = true,
+            Drained::Closed => return RunResult::Disconnected,
+            Drained::Failed(kind) => {
+                status.note_session_err(core_metrics::ERR_SITE_DRIVE, core_metrics::io_kind_code(kind));
                 return RunResult::Error;
-            }
-            if drv.state() == State::Closed {
-                return RunResult::Disconnected;
-            }
-            if producer.published() == n_before && drv.state() == state_before {
-                break;
             }
         }
 
@@ -2458,7 +2473,7 @@ mod tests {
         producer: &mut Producer<Tick, TICK_RING_CAP>,
         status: &IngressStatus,
         capture: &mut C,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let (mut etx, _erx) = event_ring_pair();
         let (mut dtx, _drx) = depth_ring_pair();
         let (mut otx, _orx) = opt_ring_pair();
@@ -3001,6 +3016,50 @@ mod tests {
         // VT2: the venue stamp rides the slot in full (venue_seq keeps
         // its truncated-u32 law).
         assert_eq!(tick.venue_time_ms, 1_550_658_624_149);
+    }
+
+    /// I-3: a burst of non-tick frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the tick behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (the loop re-polls at once) and the
+    /// next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let quote = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = steady_driver(false);
+            let (mut prod, mut cons) = ring_pair();
+            let (mut etx, _erx) = event_ring_pair();
+            let (mut dtx, _drx) = depth_ring_pair();
+            let (mut otx, _orx) = opt_ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            inject_text(&mut t, quote);
+            for expect in [first, Drained::Idle] {
+                assert_eq!(
+                    drive_until_idle(
+                        &mut t,
+                        &mut d,
+                        b"h",
+                        b"/",
+                        &mut prod,
+                        &mut etx,
+                        core_types::EVENT_LANE_FUNDING,
+                        &mut dtx,
+                        &mut otx,
+                        &status,
+                        &mut NullCapture,
+                    ),
+                    expect
+                );
+                if expect == Drained::Capped {
+                    assert!(cons.try_pop_ref().is_none(), "the tick still waits below the cap");
+                }
+            }
+            assert_eq!(cons.try_pop_ref().expect("the tick behind the burst").sym, SYM_BTC);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
     }
 
     /// VT2 helper: one two-sided `quote.BTC-PERPETUAL` push stamped

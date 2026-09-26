@@ -43,6 +43,10 @@ const VAULT: [u8; 20] = [
 
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 const HIP4_NO: u32 = 100_000_000 + 10 * 3253 + 1;
+/// HC10: HIP-3 builder-dex perps on dex 1 (`xyz`), indices 2 and 9 —
+/// `100_000 + dex_idx × 10_000 + index`.
+const HIP3_XYZ_A: u32 = 100_000 + 10_000 + 2;
+const HIP3_XYZ_B: u32 = 100_000 + 10_000 + 9;
 
 fn cloid_a() -> [u8; 16] {
     let mut c = [0u8; 16];
@@ -221,6 +225,22 @@ fn every_vector_reproduces_byte_for_byte() {
         b"na",
     );
     seen.push("hip4_trailing_zero_px");
+
+    // --- HIP-3 builder-dex perps (HC10): the hedge leg's asset ids --
+    order(
+        "hip3_ioc_buy",
+        &r,
+        &[OrderWire::new(HIP3_XYZ_A, true, 18_712_000_000, 1_200_000, Tif::Ioc).with_cloid(cloid_b())],
+        b"na",
+    );
+    seen.push("hip3_ioc_buy");
+    order(
+        "hip3_alo_sell_reduce",
+        &r,
+        &[OrderWire::new(HIP3_XYZ_B, false, 1_871_200_000, 150_000_000, Tif::Alo).reduce_only()],
+        b"na",
+    );
+    seen.push("hip3_alo_sell_reduce");
 
     // --- batches ----------------------------------------------------
     order(

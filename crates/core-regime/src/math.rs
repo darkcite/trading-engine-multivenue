@@ -31,13 +31,18 @@ pub fn ret_bps_1e9(from_1e6: i64, to_1e6: i64) -> i64 {
 /// Integer square root (floor) of a non-negative `i128`, returned as
 /// `i64` (saturating — inputs are sums of squared bps×1e9 returns,
 /// whose root fits easily). Newton's method from `v / 2 + 1`, which
-/// converges to the exact floor from any start ≥ the root — so
-/// Python's `math.isqrt` is bit-identical without sharing the
-/// iteration.
+/// converges to the exact floor from any start STRICTLY above the root
+/// — so Python's `math.isqrt` is bit-identical without sharing the
+/// iteration. `v < 4` is answered directly: at `v = 2` the start
+/// `2 / 2 + 1 = 2` IS `v`, the loop never ran and the answer was 2
+/// (found by the HAR H1 review; the floor root of 1, 2 and 3 is 1).
 #[inline]
 pub const fn isqrt_i128(v: i128) -> i64 {
     if v <= 0 {
         return 0;
+    }
+    if v < 4 {
+        return 1;
     }
     let mut x = v;
     let mut y = (x >> 1) + 1;
@@ -77,6 +82,16 @@ mod tests {
         assert_eq!(isqrt_i128(0), 0);
         assert_eq!(isqrt_i128(-7), 0);
         assert_eq!(isqrt_i128(1), 1);
+        assert_eq!(isqrt_i128(2), 1, "the start 2/2+1 is v itself");
+        assert_eq!(isqrt_i128(3), 1);
+        assert_eq!(isqrt_i128(4), 2);
+        // The floor law on every small input: k² ≤ v < (k+1)².
+        let mut v: i128 = 1;
+        while v <= 10_000 {
+            let k = isqrt_i128(v) as i128;
+            assert!(k * k <= v && (k + 1) * (k + 1) > v, "{v}");
+            v += 1;
+        }
         assert_eq!(isqrt_i128(15), 3);
         assert_eq!(isqrt_i128(16), 4);
         assert_eq!(isqrt_i128(17), 4);

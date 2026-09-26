@@ -32,6 +32,10 @@ ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 # MX8: the MEXC spot-PB + futures-JSON parsers and run loop.
 ingress-mexc         = { workspace = true }
+# HC3 gates 78/79: the Hypercall parsers and run loop.
+ingress-hypercall    = { workspace = true }
+# HC7 gate 80: the settlement window and the median-of-means law.
+core-settle          = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 core-net             = { workspace = true }
@@ -53,14 +57,16 @@ strategy-cross-arb   = { workspace = true }
 exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
 exec-hyperliquid     = { workspace = true }
-# BX6 gates 79-80: the Binance arm, and the gateway's render and scan.
+# BX6 gates 92-93: the Binance arm, and the gateway's render and scan.
 exec-binance         = { workspace = true }
 signer-eip712        = { workspace = true }
+# HC9 gate 84: the Hypercall arm's render + sign + answer scan.
+exec-hypercall       = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.
 signer-evm           = { workspace = true }
-# BX4 gate 73: the Ed25519 sign + base64 render.
+# BX4 gate 86: the Ed25519 sign + base64 render.
 signer-ed25519       = { workspace = true }
 # HYPARB H3 gate 66: the HyperEVM ingress session after the handshake.
 ingress-hyperevm     = { workspace = true }
@@ -68,13 +74,17 @@ ingress-hyperevm     = { workspace = true }
 core-fill            = { workspace = true }
 # HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
 strategy-hyparb      = { workspace = true }
+# XMM XH1: the slot-6 member rides the set's trade / order-event / timer gate.
+strategy-xmm         = { workspace = true }
+# HC11 gate 85: the slot-7 member over the paper held-quote law.
+strategy-hcv         = { workspace = true }
 # HYPARB H7c gate 71: the EVM write path either side of the socket.
 # H9 gate 72: its `testnode` serves the HttpsPost cycle from a CHILD
 # process (a server thread here would allocate under the global count).
 exec-hyperevm        = { workspace = true, features = ["testnode"] }
 rustls               = { workspace = true }
-# BX5 gate 74b: the owner's poll a non-blocking HttpsConn runs on;
-# gate 74c: the certificate of its child-process WebSocket node.
+# BX5 gate 87b: the owner's poll a non-blocking HttpsConn runs on;
+# gate 87c: the certificate of its child-process WebSocket node.
 mio                  = { workspace = true }
 rcgen                = { workspace = true }
 strategy-rule-tree   = { workspace = true }

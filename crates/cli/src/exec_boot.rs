@@ -120,6 +120,20 @@ pub const PNL_JUDGING_VENUES: &[u8] = &[
 /// hedge without its AMM leg, is a one-legged arb.
 pub const HYPEREVM_SLOT: usize = 0;
 
+/// XMM XH1: slot 6 (`xmm`) has NO live arm of its own until XH4 gives it
+/// its own Hyperliquid master account and gateway (rulings O-XH3,
+/// O-XH7). Until then a live slot 6 refuses the boot: armed today it
+/// would share slot 3's Hyperliquid arm, where a slot-6 halt's
+/// venue-wide cancel would pull bin15's quotes.
+pub const XMM_SLOT: usize = strategy_set::SLOT_XMM as usize;
+
+/// HC11 (O-HC18): slot 7 (`hcv`) is built DARK — paper only. A live slot
+/// 7 refuses the boot until its own live-arming ruling, whatever venues
+/// it names: the engine does not arm the Hypercall order arm (HC9), the
+/// E6 ledger has no options row, and the member's HL hedges would need
+/// their own reconciled account.
+pub const HCV_SLOT: usize = strategy_set::SLOT_HCV as usize;
+
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
 /// COMPILE time: a mismatch would silently truncate the per-slot arrays
@@ -131,7 +145,7 @@ const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv",
 ];
 
 /// A resolved execution configuration.
@@ -424,6 +438,27 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             ));
         }
 
+        // XMM XH1: no live arm for slot 6 before XH4 ([`XMM_SLOT`]).
+        if mode == ExecMode::Live && slot == XMM_SLOT {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} has no live \
+                 arm of its own before XMM XH4 (its own Hyperliquid master account and \
+                 gateway, rulings O-XH3/O-XH7) — refusing rather than arming it on slot 3's \
+                 account, where its halt would cancel bin15's quotes"
+            ));
+        }
+
+        // HC11 (O-HC18): slot 7 is paper only until its own ruling
+        // ([`HCV_SLOT`]).
+        if mode == ExecMode::Live && slot == HCV_SLOT {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} is DARK — paper \
+                 only by ruling O-HC18. Arming it is its own live-arming ruling, which must \
+                 settle the E6 ledger's options row, its HL hedges' reconciled account and the \
+                 two-venue composition. Refusing the boot."
+            ));
+        }
+
         // HYPARB L5: HyperEVM is slot 0's alone, and slot 0 is live on
         // both of its venues or not at all.
         if mode == ExecMode::Live {
@@ -450,6 +485,22 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         // boot inert, never downgrade to paper.
         if mode == ExecMode::Live {
             for v in &s.venues {
+                // HC9 (O-HC19): the Hypercall arm is BUILT — the
+                // `hypercall-live` verbs drive it on mainnet — but the
+                // engine does not arm it before slot 7's live-arming
+                // ruling (plan hc9-hc11 §1). Named on its own so the
+                // refusal says what that ruling has to settle.
+                if *v == core_types::VenueId::Hypercall as u8 {
+                    return Err(format!(
+                        "exec: slot {slot} ({slot_name}) is marked live for venue `hypercall`. \
+                         The Hypercall arm (HC9) is built, but the engine does not arm it \
+                         before slot 7's live-arming ruling, which must settle three things: \
+                         the E6 ledger has no options row (a short option would pass \
+                         cap_instance unseen), slot 7's HL hedges need an account whose perps \
+                         are reconciled, and the two-venue composition lands with it. The \
+                         arm's mainnet proof is scripts/hypercall-live.sh. Refusing the boot."
+                    ));
+                }
                 if !LIVE_ARM_VENUES.contains(v) {
                     let vname = core_config::exec::venue_name_from_id(*v).unwrap_or("?");
                     return Err(format!(
@@ -992,6 +1043,44 @@ mod tests {
         d
     }
 
+    /// XMM XH1: a live slot 6 refuses the boot until XH4 gives xmm its
+    /// own arm — even correctly named and agreed by `--arm-live` — while
+    /// a PAPER slot 6 is an ordinary artifact.
+    #[test]
+    fn a_live_slot_six_refuses_until_its_own_arm_exists() {
+        let d = tmp();
+        let six = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.6]")
+            .replace("name = \"bin15\"", "name = \"xmm\"");
+        let p = write(&d, "exec.toml", &six);
+        let e = resolve(Some(&p), Some("6")).expect_err("no live arm for slot 6 before XH4");
+        assert!(e.contains("slot 6 (xmm)") && e.contains("XH4"), "{e}");
+        let paper = six.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec-paper.toml", &paper);
+        let boot = resolve(Some(&p), None).expect("a paper slot 6 is fine").expect("present");
+        assert_eq!(boot.route.mode_at(XMM_SLOT), Some(ExecMode::Paper));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// HC11 (O-HC18): a live slot 7 refuses the boot — correctly named,
+    /// agreed by `--arm-live`, on any venue — while a PAPER slot 7 is an
+    /// ordinary artifact.
+    #[test]
+    fn a_live_slot_seven_refuses_it_is_dark() {
+        let d = tmp();
+        let seven = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.7]")
+            .replace("name = \"bin15\"", "name = \"hcv\"");
+        let p = write(&d, "exec.toml", &seven);
+        let e = resolve(Some(&p), Some("7")).expect_err("slot 7 is paper only");
+        assert!(e.contains("slot 7 (hcv)") && e.contains("O-HC18"), "{e}");
+        let paper = seven.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec-paper.toml", &paper);
+        let boot = resolve(Some(&p), None).expect("a paper slot 7 is fine").expect("present");
+        assert_eq!(boot.route.mode_at(HCV_SLOT), Some(ExecMode::Paper));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn no_exec_flag_is_ok_none_and_arms_nothing() {
         assert!(resolve(None, None).unwrap().is_none());
@@ -1304,6 +1393,22 @@ mod tests {
         assert!(route_aliases(None).unwrap().is_empty());
         let e = route_aliases(Some(core_types::SYMBOL_ID_NONE)).unwrap_err();
         assert!(e.contains("NoneSym"), "{e}");
+    }
+
+    /// HC9: a live `hypercall` venue refuses the boot with its own
+    /// reason — the arm exists, the engine does not arm it before slot
+    /// 7's ruling — and the refusal names what that ruling settles.
+    #[test]
+    fn a_live_hypercall_venue_refuses_and_names_the_ruling() {
+        let d = tmp();
+        let p = write(&d, "exec.toml", &MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"hypercall\"]"));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("`hypercall`"), "{e}");
+        assert!(e.contains("slot 7's live-arming ruling"), "{e}");
+        assert!(e.contains("options row") && e.contains("reconciled"), "{e}");
+        assert!(e.contains("Refusing the boot"), "{e}");
+        assert!(!LIVE_ARM_VENUES.contains(&(core_types::VenueId::Hypercall as u8)));
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]

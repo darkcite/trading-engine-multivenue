@@ -52,8 +52,8 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_binary_frame_parts, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
-    PendingTable, ReqKind, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
+    ws_unmask_in_place, ws_write_pong, Drained, HandshakeResult, IoBuf, Keepalive, KeepaliveAction,
+    PendingTable, ReqKind, RxFill, Status, SubErr, SubTable, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::now_ns;
@@ -301,6 +301,10 @@ impl Driver {
 /// * `capture`: §6.5 replay/tap sink — raw frames pre-classify,
 ///   signals pre-push, parse rejects at the reject site.
 ///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
+///
 /// # Errors
 ///
 /// Any transport error is surfaced so the outer scheduler can close +
@@ -313,9 +317,12 @@ pub fn drive_one<T: Transport, C: Capture>(
     producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+    }
 
     match drv.state {
         State::Connecting => {}
@@ -340,7 +347,27 @@ pub fn drive_one<T: Transport, C: Capture>(
     }
 
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no signal,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run.
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Signal, DEFAULT_SIGNAL_RING_CAP>,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, status, capture),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -378,24 +405,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -879,10 +888,11 @@ pub fn run<T: Transport, C: Capture>(
     // See ingress-polymarket for rationale — skip `epoll_ctl`
     // when the readable+writable bitmask is unchanged.
     let mut last_interest = transport.interest();
+    let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
@@ -899,20 +909,13 @@ pub fn run<T: Transport, C: Capture>(
             note_transport_ready(drv, transport_status);
         }
 
-        // I-3: tight inner drain loop. See ingress-polymarket
-        // for rationale.
-        loop {
-            let n_before = producer.published();
-            let state_before = drv.state();
-            if drive_one(transport, drv, host, path, producer, status, capture).is_err() {
-                return RunResult::Error;
-            }
-            if drv.state() == State::Closed {
-                return RunResult::Disconnected;
-            }
-            if producer.published() == n_before && drv.state() == state_before {
-                break;
-            }
+        // I-3 (core_net::drain): drive until a step leaves nothing
+        // behind; re-poll at once if the step cap cut a backlog short.
+        match drive_until_idle(transport, drv, host, path, producer, status, capture) {
+            Drained::Idle => repoll_now = false,
+            Drained::Capped => repoll_now = true,
+            Drained::Closed => return RunResult::Disconnected,
+            Drained::Failed(_) => return RunResult::Error,
         }
 
         // §6.5: staged capture reaches disk within the flush interval
@@ -1233,6 +1236,42 @@ mod tests {
         assert_eq!(number, 0x2A);
         assert_eq!(ts, 0x65);
         assert_eq!(gas, 0x1);
+    }
+
+    /// I-3: a burst of non-signal frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the head behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (the loop re-polls at once) and the
+    /// next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let body = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0xab","result":{"number":"0x2a","timestamp":"0x65","gasUsed":"0x1"}}}"#;
+        let mut frame_buf = [0u8; 512];
+        let n = wrap_text_frame(body, &mut frame_buf);
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = Driver::new(7);
+            d.set_state(State::Steady);
+            d.suppress_polling_for_test();
+            d.subscribed = true;
+            let (mut prod, mut cons) = Ring::<Signal, DEFAULT_SIGNAL_RING_CAP>::new().split();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            t.inject_incoming(&frame_buf[..n]);
+            assert_eq!(
+                drive_until_idle(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture),
+                first
+            );
+            if first == Drained::Capped {
+                assert!(cons.try_pop_ref().is_none(), "the head still waits below the cap");
+                assert_eq!(
+                    drive_until_idle(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture),
+                    Drained::Idle
+                );
+            }
+            assert_eq!(cons.try_pop_ref().expect("the head behind the burst").sym, SYMBOL_ID_NONE);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
     }
 
     #[test]

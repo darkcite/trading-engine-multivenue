@@ -321,6 +321,72 @@ a policy raise (E ≤ 4 × K ≤ 32 caps) ever multiplies the table by an
 order of magnitude — the I-7 fix (boot-time u64 hashes, scan over
 `[u64]`) is the ready answer then.
 
+## Addendum 2026-09-26 (HAR H3.5) — the long-tenor day close
+
+HAR H3 put `core_vol::LongVolEngine` on the engine thread: up to twelve
+series (`core_vol::LongVolSet`, held by `StrategySet`), fed one minute close
+per quoting series per minute from the set's 1 s poll. The only non-trivial
+cost is the UTC day close — the close law over the whole 1–40 d grid: the
+day ring's fold, then per tenor a settle, a pair, a refit over ≤ 128 pairs
+and a QLIKE score.
+
+- **Measured on the M4 Pro** (`cargo bench -p bench --bench hot_path --
+  vol/long_day_close_warm`, 2026-09-26, beside the live engine, niced):
+  **37.6 µs** median per series (CI 37.4–37.8 µs), warm — every ring full,
+  every tenor fitted. (The ~63 µs the H1/H3.3 docs quoted was the review
+  host's, not the M4's; both module docs now carry the M4 figure.)
+- **Twelve at once would be ~0.45 ms** at 00:01Z — the minute stamped
+  00:00Z is delivered at its close, 00:01:00Z, the minute a BIN15
+  quarter-hour also turns. The set STAGGERS them: at most one series crosses
+  a day per 1 s poll (`DAY_CLOSES_PER_POLL`), the others hold their first
+  new-day minute and release it one a poll, so the loop never pays more
+  than one close (~38 µs) at once and all twelve run 00:01:00–00:01:12Z
+  (H3.7 corrected the "by 00:00:12Z" this line first said).
+- **The state file leaves the loop (H3.7).** Until H3.7 the 5 s report
+  block after a close rendered that series' `state-<NAME>.tsv` (~350 KiB
+  fitted) and ran create/write/fsync/rename on the engine thread — a text
+  render and a disk round trip, twelve times a UTC day (not measured here).
+  Now the close's own poll copies
+  the engine whole into the series' `core_ring::Mailbox`
+  (`LongVolEngine::copy_to`, ~201 KiB, the one designed copy) and the
+  `har-state-writer` thread (`cli::har_writer`) renders and writes it. The
+  loop never waits: a mailbox the writer still holds (a write in flight, or
+  failing and retried every 5 s) refuses the offer, retried at the next
+  poll. **Measured on the M4 Pro** (`cargo bench -p bench --bench hot_path
+  -- vol/long_state_copy_warm`, 2026-09-26, beside the live engine,
+  niced): **2.56 µs** median per series (CI 2.55–2.59 µs), both 201 KiB in
+  cache — the live slot is written once a UTC day, so its first touch also
+  pays the cache misses the bench does not; the close it follows measured
+  38.3 µs in the same run.
+- **Per minute:** one `on_minute_close_at` per quoting series (tens of ns);
+  **per tick:** one open-addressing probe of the feed map; **per 1 s
+  publish:** a copy of the cached `/state.har` rows (rebuilt only at a
+  series' own day close, ~9 tenor reads).
+- **Live tell:** `engine_har_day_close_ns_max` (and `/state.har`
+  `day_close_ns_max` / `day_close_ns_last`) time the close law on the
+  engine thread itself; the bench number is the floor to compare against.
+- Allocation: none after configure (bench gate 82,
+  `long_vol_set_is_zero_alloc`: 12 series, two staggered UTC boundaries,
+  0 B/op — since H3.7 also through the `StrategySet` that holds them: the
+  `/state.har` rows, the gauges' law and every state handed through its
+  mailbox and taken back, 0 B/op).
+
+## Addendum 2026-09-26 (HC8) — a Hypercall signature
+
+`signer_eip712::hypercall` signs the venue's EIP-712 actions (sign-only; the
+exec arm is HC9's ruling). A live `PlaceOrder` is nine keccaks — its seven
+strings over the request body's own spans, the struct, and the digest under
+the boot-cached separator — and one secp256k1 signature.
+
+- **Measured on the M4 Pro** (`cargo bench -p bench --bench hot_path --
+  signer/`, 2026-09-26, beside the live engine at load ~10, niced):
+  `signer/hypercall_place_order` **20.0 µs** median (CI 19.97–20.03 µs);
+  the Polymarket order under the same conditions, `signer/sign_order_full`,
+  18.9 µs — the signature dominates both, the extra keccaks cost ~1 µs.
+- Allocation: none after the first signature builds the process-wide
+  secp256k1 context (bench gate 83, `hypercall_sign_with_key_is_zero_alloc`:
+  place, replace, cancel by client id, an RFQ accept — 0 B/op).
+
 Files referenced in this report:
 - `crates/engine/src/lib.rs`
 - `crates/strategy-*/src/lib.rs`

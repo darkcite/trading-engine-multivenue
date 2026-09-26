@@ -251,6 +251,29 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for VenueSplit<A, B> {
         self.b.observe_amm(sym, payload, now_ns);
     }
 
+    /// XMM XH2 (met at the 2026-09-26 merge, as main's `SlotSplit` has
+    /// it): both arms see every print, like every tick.
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        self.a.observe_trade(print, now_ns);
+        self.b.observe_trade(print, now_ns);
+    }
+
+    /// XMM XH2: arm `a`'s order events first, then `b`'s — the fill
+    /// order; forwarded so an arm's events cannot vanish into the
+    /// defaulted `false` behind this wrapper.
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.a.try_next_order_event(out) || self.b.try_next_order_event(out)
+    }
+
+    /// XMM XH2: both arms learn the queue law's instruments.
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        self.a.track_queue_sym(sym);
+        self.b.track_queue_sym(sym);
+    }
+
     /// Both arms, unconditionally — neither may starve the other.
     #[inline]
     fn on_idle(&mut self) -> bool {
@@ -372,6 +395,10 @@ mod tests {
         cancel_all_calls: u32,
         state: u8,
         busy: bool,
+        prints: u32,
+        queue_syms: u32,
+        /// Order events to hand out, by client id (popped from the back).
+        events: Vec<u64>,
     }
 
     impl OrderDispatch for Arm {
@@ -416,6 +443,19 @@ mod tests {
                 2 => CancelAllState::Stranded,
                 _ => CancelAllState::Clear,
             }
+        }
+        fn observe_trade(&mut self, _p: &core_types::TradePrint, _now_ns: NsTs) {
+            self.prints += 1;
+        }
+        fn track_queue_sym(&mut self, _sym: SymbolId) {
+            self.queue_syms += 1;
+        }
+        fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+            let Some(oid) = self.events.pop() else {
+                return false;
+            };
+            out.client_oid = oid;
+            true
         }
     }
 
@@ -561,5 +601,27 @@ mod tests {
         s.a_mut().day = None;
         assert_eq!(s.venue_day_bought(5), Some((20_001, 1)));
         assert_eq!(s.venue_day_bought(0), None);
+    }
+
+    /// XMM XH2 through this wrapper (the forwards the merge added): both
+    /// arms see every print and every queue instrument, and each arm's
+    /// order events come out — `a`'s first — instead of vanishing into
+    /// the trait's defaulted `false`.
+    #[test]
+    fn prints_queue_syms_and_order_events_reach_both_arms() {
+        let mut s = split();
+        let print = core_types::TradePrint::new(1, VenueId::Hyperliquid, 4096, 9, 1, 1_000_000, 1_000_000, 0);
+        s.observe_trade(&print, 2);
+        s.track_queue_sym(4096);
+        assert_eq!((s.a().prints, s.b().prints), (1, 1));
+        assert_eq!((s.a().queue_syms, s.b().queue_syms), (1, 1));
+        s.a_mut().events.push(11);
+        s.b_mut().events.push(22);
+        let mut ev = core_types::OrderEvent::ZERO;
+        assert!(s.try_next_order_event(&mut ev));
+        assert_eq!(ev.client_oid, 11, "arm a first");
+        assert!(s.try_next_order_event(&mut ev));
+        assert_eq!(ev.client_oid, 22, "then arm b");
+        assert!(!s.try_next_order_event(&mut ev));
     }
 }

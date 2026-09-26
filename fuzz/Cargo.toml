@@ -50,8 +50,12 @@ core-amm           = { path = "../crates/core-amm" }
 ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
 # amm_book: the HYPARB H2 AMM fill law (pool book + judge).
 core-fill          = { path = "../crates/core-fill" }
+# hypercall_{ws_frame,markets,summary}: the HC3/HC4 Hypercall parsers.
+ingress-hypercall  = { path = "../crates/ingress-hypercall" }
 # evm_exec_response: the HYPARB H7c write-path response scanners.
 exec-hyperevm      = { path = "../crates/exec-hyperevm" }
+# hypercall_{response,userws}: the HC9 order arm's answer and event scanners.
+exec-hypercall     = { path = "../crates/exec-hypercall" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -455,6 +459,41 @@ bench  = false
 [[bin]]
 name   = "bn_mode"
 path   = "fuzz_targets/bn_mode.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_ws_frame"
+path   = "fuzz_targets/hypercall_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_markets"
+path   = "fuzz_targets/hypercall_markets.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_summary"
+path   = "fuzz_targets/hypercall_summary.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_response"
+path   = "fuzz_targets/hypercall_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_userws"
+path   = "fuzz_targets/hypercall_userws.rs"
 test   = false
 doc    = false
 bench  = false

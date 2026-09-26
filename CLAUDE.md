@@ -10,19 +10,31 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
 spot/USDM/COIN-M, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
-MEXC (data-only), Polymarket CLOB, Polygon RPC, plus a boot-selected options
-ladder. Strategies are composed at boot from an 8-slot set and may trade
+MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
+PAPER only since HC11; the HC9 order arm runs as operator verbs only),
+Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
+Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
 the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 `claude-worker` Python process, and in-session) is an **offline strategy
 researcher** — never in the hot path.
 
-Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
+Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 255):
 0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
 O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
 `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
 2 xsd · 3 bin15 · 4 ai-exec (AI door 1, intents) · 5 ruleset VM (AI door 2,
-tables) · 6 icdp · 7 open. The engine boots the mask named in
+tables) · 6 xmm (HL post-only maker, since XMM XH1 2026-09-26; quotes on the
+queue law since XH2, paper only; `/state` `xmm` block, `engine_xmm_*`,
+`[labels.xmm]` and audit-pnl prints since XH3; boots only with
+`~/multivenue/xmm.toml`; `icdp` unlinked, its name refuses the boot,
+`backtest --member icdp` stays) · 7 hcv (Hypercall S1 options vs the HAR
+σ̂, hedged on HL perps, since HC11 2026-09-26 — lands DARK, O-HC18: paper
+only on the held-quote law, in no configured mask; boots only with
+`~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
+in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
+risk-policy "HYPERCALL — slot 7"). Member timers run per
+slot (each on its own period). The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
 in the script; `ai` = 48 is the floor every name includes).
 
@@ -65,7 +77,7 @@ in the script; `ai` = 48 is the floor every name includes).
   `Order.strategy_id`, `RoutedDispatcher`, the E6 risk gate: per-order /
   open-orders / day / instance caps, the venue-fill ledger, six sticky halts
   incl. recon-STALE, `exec.HALT`) + `crates/exec-hyperliquid` (msgpack +
-  EIP-712 `Agent` signing pinned by 27 SDK vectors, mio+rustls `/exchange`
+  EIP-712 `Agent` signing pinned by 29 SDK vectors (two HIP-3 rows since HC10), mio+rustls `/exchange`
   arm with the request body rendered in place, `userFills` WS pumped from
   `on_idle` on the engine thread, reconciliation, address-budget governor,
   LAW E-8 sweeps). Armed ONLY by the two-switch interlock `--exec
@@ -172,11 +184,18 @@ in the script; `ai` = 48 is the floor every name includes).
   index private and caches the other side's (Rigtorp): the M4 round trip
   170 → ~100 ns, the saturated stream 50 → 4–9 ns, same-core push+pop
   +0.5 ns; the ingress drain loops judge progress by
-  `Producer::published()`. Open: `make bench-check` cannot compare on
-  this Mac (its script needs Python ≥ 3.10 and reads a criterion path
-  layout this criterion does not write); the I-3 drain loops count only
-  ticks as progress (an rx-full step of non-tick frames waits for the
-  next readiness edge) and cap no steps per connection.
+  `Producer::published()`. `make bench-check` compares (2026-09-25,
+  risk-policy "`make bench-check` compares"): results found by
+  criterion's own ids, a missing or stale one fails, the baseline re-taken
+  on the M4. The I-3 drain loops (risk-policy "The I-3 drain loops read
+  past a full rx") share `core_net::drain`: a step whose read filled rx is
+  driven again, as one that published or moved its state; at most 8 steps
+  per connection per poll, then a poll that does not sleep. Batch
+  subscribes render straight into tx (2026-09-26, risk-policy "Batch
+  subscribes render straight into tx"): `core_net::queue_masked_text_frame_rendered`
+  counts the payload, writes the header, renders behind it and masks in
+  place — OKX, Deribit, Bybit, Polymarket and MEXC dropped their stack
+  scratches and the copy into tx; HyperEVM's request bodies stay copied.
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -220,18 +239,104 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **Gates at HEAD (the cached-index ring, 2026-09-25; Foundry and worker
-  pytest as of the HYPARB merge):** nextest 3131 (5
-  skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
-  and `hyperevm_live_smoke` among them) · alloc 83/83 at the gates' pins
-  (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +2 ignored
-  child helpers) · clippy clean · `make license-check` OK · `make
+- **The Hyperliquid reconnect loop — fixed 2026-09-26 (`7235201`), LIVE
+  since the 09:03Z restart, verified at the 09:15Z roll** (risk-policy
+  "The Hyperliquid reconnect loop — dead HIP-4 instances"). The venue drops the whole socket (a bare FIN) on
+  a subscribe to a settled or unknown HIP-4 coin, and `outcomeMetaUpdates`
+  pushes a roll once and replays none to a later subscriber (both probed),
+  so a reconnect that re-subscribed a family's settled instance died every
+  ~1.2 s until a restart (15 190 times on 09-26 before the operator's
+  07:18Z revive). Now a reconnect retires dead instances and re-reads
+  `/info outcomeMeta` for their successors (to the address resolved at
+  boot — the HL thread never runs DNS; 3 s; at most once a minute);
+  staleness stops judging an instance at its expiry; the backoff resets
+  only after a session that lived 30 s (`core_net::should_reset_backoff`:
+  the seven outer loops, and since O-HC16 the Hypercall and MEXC internal
+  reconnects — MEXC per slot); `hyperliquid: run-loop returned` names each end
+  (`err_site`, `io_kind`, `venue_code`, `lived_ms`, `acks`/`acks_expected`).
+  Its ~1.5/s "parse errors" were BIN15 O8's one-sided outcome `bbo` drops,
+  counted on their own from the next release build + restart
+  (`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`; risk-policy
+  "The one-sided outcome `bbo` is not a parse error"). Open:
+  `roll_health`'s second strike is unreachable (pre-existing); each roll's
+  unsubscribe echoes still count as parse errors.
+- **HYPERCALL — the eighth market-data venue, DATA-ONLY, MERGED to main
+  2026-09-26 (branch `hypercall`: HC0–HC7, HAR H1–H3, O-HC8), NOT yet
+  configured live** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
+  rulings O-HC1..O-HC10: no keys, no exec arm; HC9–HC11 each a separate
+  ruling after the research's R1 gate — HC8, the sign-only signer, came
+  forward under O-HC17: `signer_eip712::hypercall`, every SDK type, 38
+  SDK vectors byte-exact, gate 83; HC9 — the order arm
+  `crates/exec-hypercall` — came forward under O-HC19 as the operator's
+  `hypercall-live` verbs, never armed by the engine — its mainnet dust
+  PASSED 2026-09-26 after the nonce fix `84fc32b` (the nonce is wall ms);
+  HC10 bound the HIP-3 hedge perps; HC11 built slot 7, `strategy-hcv`,
+  DARK paper, and HC11b made its book persist across restarts; go-live is
+  staged for a daily
+  restart the operator names — `[hypercall]` and the `fees.toml` lines
+  just before it, `hypercall_history` scheduled, the HAR steps of the H3
+  plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
+  `VenueId::Hypercall = 9`, tick
+  lane 7, `crates/ingress-hypercall` (one public WS: the one-frame
+  indicative subscribe, quotes kept crossed or one-sided as published,
+  per-provider sides on `ChannelId::ProviderQuote` = 14, index `Mark`s
+  on `hypercall-idx:<U>`; a REST `/options-summary` poller thread over
+  an SPSC handoff; the I-3 drain, `core_net::drain`, since the merge),
+  capture label `hypercall`, `/state` ingress row 10,
+  `[hypercall]` in universe.toml (all 12 underlyings, E 3 × K 8 × {C,P}
+  ≤ 1 024 instruments); its options are in the AI boot universe (O-HC17:
+  signal and reference legs, orders unroutable; the index syms stay out).
+  `crates/core-settle`
+  replicates the venue's settlement (median-of-means over a 1 s
+  sample-and-hold grid, both bucket orders until the HC7 gate picks one;
+  bench gate 80); worker lanes `hypercall_history` (the research store)
+  and `hypercall_settle` (the shadow). Fees `[fees.hypercall] option =
+  "0:0"` UNVERIFIED (O-HC7). Live smoke WITHOUT stopping the engine:
+  `crates/cli/tests/hypercall_live_smoke.rs` (`#[ignore]`, `HC_SMOKE_SECS`
+  ≤ 900). The merge carries **HAR H1–H3** — `core_vol::LongVolEngine`
+  (whole-day tenors 1–40 d, the empty-day law, the lifted
+  `ols_fit_1e9`; bench gate 81; worker mirror `vol_ref.LongVolEngine`
+  pinned by `tests/fixtures/vol/long-{1,2}.*`; `claude_worker.har_seed`),
+  owned since H3 by the ENGINE: `core_vol::LongVolSet` (≤ 12 series,
+  held by `StrategySet` in the regime's seat on its own 1 s timer, day
+  closes staggered one a poll — ~38 µs each on the M4; bench gate 82; no member reads it) from
+  `~/multivenue/har.toml` (`core_config::har`; `--har`/`--har-dir`; NOT
+  passed by the wrapper — an absent default file is the pre-H3 engine),
+  restored at boot from `~/multivenue/har/seed-<NAME>.tsv` merged with the
+  engine's own `state-<NAME>.tsv` (`core_vol::merge_rows`; written OFF the
+  engine thread since H3.7 — each close copies the engine into a
+  `core_ring::Mailbox`, the `har-state-writer` thread renders and fsyncs,
+  `cli::har_writer`), published as
+  `/state.har` + `engine_har_*`; the worker's `har_backfill` (every source
+  kept live, `--import-from`) and `har_seed` ride `candles-cycle.sh`
+  hourly when `har.toml` exists (`har/drift.json`: the dashboard's drift
+  alert) — and the **scheduled-events feed** (O-HC8:
+  `news.toml [events]` → `scheduled-events.json` every news cycle; the
+  reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
+  is now 1, the floor root (it returned 2).
+- **Gates at HEAD (branch `hypercall`: HC11b, after HC8–HC11 on B1–B5 of its
+  2026-09-26 plan; Foundry as of the HYPARB merge):**
+  nextest 3583 (6
+  skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
+  `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
+  99/99 at the gates' pins (0 B/op; gate 85 is slot 7 over the
+  held-quote law, its book handed to the writer's mailbox inside the
+  measured loop; gates 72 and 77b pin `HttpsPost` and
+  `HttpsReq` at exactly 2 per request — rustls; +2 ignored child
+  helpers) · clippy clean · `make license-check` OK · `make
+  bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
+  samples within 15 % at load ~10; `vol/long_day_close_warm`,
+  `vol/long_state_copy_warm` and `signer/hypercall_place_order` are
+  measured, not baselined) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
-  core-net, core-ring, all nine ingress crates and the HYPARB crates) ·
+  core-net, core-ring, all ten ingress crates, the HYPARB crates,
+  strategy-xmm, strategy-hcv, core-settle, core-fill, the engine and the
+  state writers — `har_writer` and the generic `persist` thread) ·
   Foundry 11 unit +
   5 mainnet-fork (session sandbox; forge is not on this Mac) ·
-  worker pytest 1513 (5 skipped; `test_news_lanes::test_report_prints_the_funnel`
-  is a date time-bomb — its fixture fell out of the 24 h window) · fuzz
+  worker pytest 1643 passed, 5 skipped (its one red,
+  `test_news_lanes::test_report_prints_the_funnel`, is a date time-bomb —
+  its fixture fell out of the 24 h window) · fuzz
   (poisoned start) `okx_frame`, `deribit_{jsonrpc_frame,option_ticker,vol_index}`,
   `hl_{ws_frame,l2book,outcome_spec}`, `mexc_ws_frame`, `bybit_ws_frame`,
   `polymarket_clob_frame`, `rpc_{response,subscribe_envelope}`,
@@ -243,18 +348,25 @@ in the script; `ai` = 48 is the floor every name includes).
   checks at the merge; ZC pass B re-ran `deribit_vol_index` 300 s,
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
-  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`)
-  · live smokes 60 s (the cached-index ring, 2026-09-25): MEXC and
-  Binance, 0 parse errors, 0 reconnects, 0 ring drops
+  (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`; again for the
+  H3.7 mailbox, whose invariance a `compile_fail` doctest pins — nextest
+  runs no doctests); the Hypercall
+  merge: every fuzz bin builds, `hypercall_{ws_frame,markets,summary}` and
+  `http1_response` 60 s each clean (also at HC3)
+  · live smokes (2026-09-26): Binance 60 s (the header-first subscribe
+  renders); MEXC 60 s and Hypercall 90 s at B2 (13:24–13:26Z, 992 and
+  1 558 ticks) — 0 parse errors, 0 reconnects, 0 ring drops each
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known
-  isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` (debug profile),
+  isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` and
+  `hl_outcome_meta_parsers_are_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
-  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`
-  and `guard_reports_zero_when_nothing_allocates` (bench, debug profile,
-  under full-workspace nextest load), the worker's UDS-fixture
+  (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`,
+  `guard_reports_zero_when_nothing_allocates` and
+  `xmm_queue_law_place_land_fill_modify_cancel_are_zero_alloc` (bench,
+  debug profile, under full-workspace nextest load), the worker's UDS-fixture
   family (`test_recommit…`, `test_commit_ruleset_happy_by_hash_then_by_file`)
   — rerun in isolation before believing a red. `make py-lint` (ruff) is
   RED at HEAD and has been for weeks; `make lint` means clippy.
@@ -267,6 +379,11 @@ in the script; `ai` = 48 is the floor every name includes).
   [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
   names `claude-opus-4-6` as the session model (the three review agents are
   pinned to `claude-opus-5-5` — ruling O-8, 2026-09-23).
+- **Reminder — upgrade to rustls 0.24 once 0.24.0 is released** (operator,
+  2026-09-26: the only rustls work we need). 0.24 decrypts records in
+  place — the fix for core-net's rustls RX copy and allocation per record
+  (gate 72). Today: pinned 0.23.38, only `0.24.0-dev.*` published;
+  `cargo info rustls@0.24.0` answers "could not find" until it is out.
 
 ## Standing operator laws (survive every archival)
 
@@ -403,7 +520,9 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   frame rides a run loop's `Dispatch` (each const-asserted ≤ 64 B); a
   top-K change gate flips a `core_types::DepthPair`, never copies.
   Enforced by `make copy-audit` (the exec lane, core-net, core-ring, all
-  nine ingress crates and the HYPARB crates; a RATCHET against
+  ten ingress crates, the HYPARB crates, strategy-xmm, strategy-hcv,
+  core-settle, core-fill, the engine and the state-writer threads; a
+  RATCHET against
   `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
   `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)
   and the `zero-copy-auditor` agent. A cold operator module may opt out with
@@ -457,18 +576,26 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   state files), net (mio + rustls transport, WS framing, `IoBuf`,
   `Keepalive`), parse (byte scanners + the `pb` protobuf walker), simd,
   crypto (SHA-256/HMAC/base64), types (wire PODs, `SymbolId`, `VenueId`),
-  regime, vol, fill, latency, metrics (fixed registry, 512 counters).
-- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm}` —
+  regime, vol (the HAR `VolEngine`, the whole-day `LongVolEngine` and its
+  engine owner `LongVolSet`),
+  settle (the Hypercall settlement law), fill, latency, metrics (fixed
+  registry, 512 counters).
+- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm,hypercall}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
-- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed
-  set and its members; `strategy-{latency-arb,cross-arb,ev,rule-tree}` are
+- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,xmm,hcv}` — the composed
+  set and its members; `strategy-{latency-arb,cross-arb,ev,rule-tree,icdp}` are
   in-tree but unlinked/off. `book-builder`, `opt-registry`,
   `options-select`, `research-artifacts`.
 - `crates/engine` — the single-threaded loop; `crates/engine-snapshot` —
   the seqlock `/state` snapshot; `crates/tui`.
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
+  `crates/exec-hypercall` — the Hypercall order arm (HC9, O-HC19): driven
+  only by the operator's `hypercall-live` verbs
+  (`scripts/hypercall-live.sh`; mainnet writes need `--confirm`); the
+  engine refuses a live `hypercall` slot until slot 7's live-arming
+  ruling (risk-policy "HYPERCALL — the order arm").
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
   path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
   compile-time asserted); mainnet only through a `MainnetAuthority`

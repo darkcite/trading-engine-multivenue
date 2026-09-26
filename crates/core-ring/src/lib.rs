@@ -77,6 +77,13 @@
 //! the private copies (`docs/risk-policy.md`, "core-ring caches the other
 //! side's index").
 //!
+//! ## The mailbox
+//!
+//! [`Mailbox`] (HAR H3.7) is the single-slot sibling for a message too
+//! large to queue: one slot handed back and forth by ownership — FREE is
+//! the producer's, FULL the consumer's — each side filling or reading it in
+//! place through a guard. Its own module doc carries the law.
+//!
 //! ## Memory ordering
 //!
 //! * Producer: a refresh loads `tail` with **Acquire** — it pairs with
@@ -100,6 +107,10 @@
     clippy::missing_safety_doc,
     clippy::undocumented_unsafe_blocks
 )]
+
+mod mailbox;
+
+pub use mailbox::{Filling, Mailbox, MailboxRx, MailboxTx, Taken};
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
@@ -308,9 +319,9 @@ impl<T: Copy, const N: usize> Producer<T, N> {
             // on every lane but depth (192 B `DepthTopK`) and the ruleset table
             // (32 832 B, operator cadence) — the designed ring-slot publish: the
             // slot IS the message the consumer reads in place — rejected: a
-            // claimed slot built in place (the ingress lanes capture `T` before
-            // the push, the depth gate keeps its row; the other producers are
-            // ≤ 64 B warm or operator cadence — not worth a second push path).
+            // claimed slot built in place (most ingress lanes capture `T` first,
+            // the depth gate keeps its row; the rest — the HL trade print among
+            // them — are ≤ 64 B warm or operator cadence: no second push path).
             ::core::ptr::copy_nonoverlapping(src, dst, 1);
         }
         let next = head.wrapping_add(1);

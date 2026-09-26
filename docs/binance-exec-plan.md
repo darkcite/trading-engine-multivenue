@@ -1163,7 +1163,7 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
 - **Gates** (Mac, final tree):
   - clippy clean;
   - nextest: 3 279 run, 3 279 passed, 7 skipped (BX2 closed at 3 227). One pre-existing flake in an intermediate full run: `ingress-okx` `okx_tls_loopback_idle_timeout_sends_literal_ping` hung past 300 s and was killed; it passed alone in 0.15 s and in both final full runs. BX3 does not touch `ingress-okx`;
-  - alloc: 81/81 at 0 B/op, 2 ignored (the gate 72 and 74 child helpers), with a fresh `Compiling bench` in the last run that changed a crate the bench builds (the final run changed only a `cli` test); BX3 adds gates 75–78 (`routed_retired_drain_steady_state`, `venuesplit_route_steady_state`, `ledger_instrument_rows_steady_state`, `ledger_price_feed_steady_state`), and gate 77 runs the working-quantity exit test inside its window;
+  - alloc: 81/81 at 0 B/op, 2 ignored (the gate 72 and 87 child helpers), with a fresh `Compiling bench` in the last run that changed a crate the bench builds (the final run changed only a `cli` test); BX3 adds gates 88–91 (`routed_retired_drain_steady_state`, `venuesplit_route_steady_state`, `ledger_instrument_rows_steady_state`, `ledger_price_feed_steady_state`), and gate 90 runs the working-quantity exit test inside its window;
   - `make copy-audit`: new=0, after its self-test;
   - `make license-check` OK; `make license-deps` OK, THIRD-PARTY-NOTICES.md regenerated unchanged (Cargo.lock gains only `cli`'s dev-dependency edge to `rcgen`; no new crate);
   - no new parser, so no fuzz target; the ledger's randomized properties stand in (every reducing order recognised on every signed law, the aggregate equal to a full recompute, the branchless search equal to a linear scan).
@@ -1199,14 +1199,14 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
   - `sign_b64` (the WS API form, 88 B) and `sign_b64_pct` (the REST form, percent-encoded) write straight into the caller's final buffer. `public_key_spki_b64` renders the PEM body Binance shows, for BX6's boot tell.
   - `self_test()` runs RFC 8032 §7.1 TEST 1–3 and SHA(abc) through the signer itself and compares both renders with literals computed outside the crate. One corrupted byte, or an empty table, refuses.
   - `core_crypto::base64_encode_pct`: the percent-encoded render (RFC 3986's `+ / =`), one pass shared with `base64_encode` (`b64_render::<PCT>`), no scratch.
-  - Bench gate 73: signing at 0 B/op; boot pinned at exactly one allocation per signer and one per known answer.
+  - Bench gate 86: signing at 0 B/op; boot pinned at exactly one allocation per signer and one per known answer.
   - `crates/signer-ed25519` joins `make copy-audit`'s default scope, and the three review agents' triggers name it (and `signer-evm`).
 - **Departures from the text above:**
   1. **No HMAC path, no `hex_encode`, no `SecretKeyBytes<N>`, no RSA.** Each is gated on a probe that has not run (K19; the Demo key types; RSA only if K13 or K15 refuse Ed25519), and §5 builds no verb for an unverified gate. The docs' HMAC worked example (`c8db5682…`, verified against Python's `hmac`) waits for that path.
   2. **The expansion's page is the crate's own, not `SecretKeyBytes`:** the 96 B expansion does not fit the 32 B type. That makes two locked-memory implementations — the open question below.
   3. **Vectors.** The docs' Ed25519 example publishes no private key, so the Binance-shaped answers are the docs' WS API payload and a REST order query signed under RFC keys, with answers from an independent implementation (OpenSSL via Python `cryptography`). The official connectors' own vectors land with BX6's payload renderer.
 - **Copies** (all marked, sizes const-asserted): `ring`'s `Signature`, 120 B by value, per signature (`ring` 0.17 has no sign-into call); `ring`'s `Result<Ed25519KeyPair, _>` (104 B) and the 96 B keypair into the page, once per boot.
-- **Gates (Mac, 2026-09-25 21:22–21:24Z, final tree):** clippy clean; nextest 3 154 run, 3 154 passed, 5 skipped; alloc 74/74 at 0 B/op (1 ignored; fresh `Compiling bench`; gate 73 incl. the boot pins); `make copy-audit` `hits=31 baselined=31 new=0 paid=0`, signer-ed25519 in scope; `make license-check` OK; `make license-deps` OK. No parser was added, so no fuzz target.
+- **Gates (Mac, 2026-09-25 21:22–21:24Z, final tree):** clippy clean; nextest 3 154 run, 3 154 passed, 5 skipped; alloc 74/74 at 0 B/op (1 ignored; fresh `Compiling bench`; gate 86 incl. the boot pins); `make copy-audit` `hits=31 baselined=31 new=0 paid=0`, signer-ed25519 in scope; `make license-check` OK; `make license-deps` OK. No parser was added, so no fuzz target.
 - **Reviewers** (Opus 5.5 subagents acting as the agents, read-only): `alloc-auditor` PASS; `zero-copy-auditor` PASS, one cold finding (the 104 B `Result` move, now marked); `risk-reviewer` NEEDS-DOCS, fixed in this change — `docs/risk-policy.md`'s "mlock'd into its own page" corrected, and the self-test stated as BX6's duty. Every should-fix and borderline item was acted on: the literal-backed self-test incl. the REST form; the empty table refused; the real `Drop` observed from a watching allocator (`tests/drop_wipes.rs`; break-and-watch: without the wipe it fails); the public-key copy dropped; the sizes and `Send + Sync` pinned; the one-pass encoder; the boot allocations pinned; the wording.
 - **Open operator question (BX4): one locked-memory implementation?** `SecretKeyBytes` mlocks a 32 B heap box; `mlock` does not stack on Linux, so dropping a neighbour on that page unlocks it. The hazard is reachable today outside this lane (`cli::evm_live::check_wallet_env`; `docs/risk-policy.md` "Signing-key handling"). Until it is ruled, BX6 keeps the seed's `SecretKeyBytes` alive for the life of the process.
 - **Carried to BX6:** call `self_test()` at boot before `from_seed` on the real seed, and refuse the boot on `Err`; build the signer ONCE (a re-logon reuses it); render a REST request's parameters contiguously in its query string and sign them where they sit (`split_at_mut`), with `&signature=` straight after; the `session.logon` payload is a second, sorted render (once per session, cold, its own `// COPY:`).
@@ -1266,16 +1266,16 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
   - clippy clean.
   - nextest: 3 201 run, 3 201 passed, 6 skipped.
   - alloc: 77/77, 2 ignored (the child-process helpers), with a fresh `Compiling bench` in the log.
-    - Gate 74a: staging, the answer judge, the framer and the ids, at 0 B/op, including their refusal paths.
-    - Gate 74b: `HttpsConn`'s cycle at exactly 2 allocations per request.
-    - Gate 74c: `WsConn`'s round at exactly 2 allocations per round, against a child-process rustls WebSocket node. Splitting the flush into two writes makes it fail.
+    - Gate 87a: staging, the answer judge, the framer and the ids, at 0 B/op, including their refusal paths.
+    - Gate 87b: `HttpsConn`'s cycle at exactly 2 allocations per request.
+    - Gate 87c: `WsConn`'s round at exactly 2 allocations per round, against a child-process rustls WebSocket node. Splitting the flush into two writes makes it fail.
     - Gate 72 still passes.
   - `make copy-audit`: `hits=31 baselined=31 new=0 paid=0`.
   - `make license-check` OK.
   - Tests: TLS loopback, 13 HTTPS and 9 WebSocket; each unclean-close fix breaks its test when disabled. Unit tests and proptests for every new parser. Fuzz targets `https_answer` and `ws_framer` (results in §12).
 - **Reviewers** (Opus 5.5 subagents acting as the agents, read-only):
   - `zero-copy-auditor`: PASS, one should-fix: state that the tail copy is cold-only at the copy site. Done.
-  - `alloc-auditor`: PASS, one should-fix: a gate on `WsConn`'s socket half. That is gate 74c.
+  - `alloc-auditor`: PASS, one should-fix: a gate on `WsConn`'s socket half. That is gate 87c.
   - `risk-reviewer` (a focused pass, because the change reaches HYPARB's live client): NEEDS-DOCS. Written: risk-policy "BX5".
   - Every should-fix and nit was acted on:
     - the clean close is confirmed by a read;
@@ -1292,7 +1292,7 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
   - `WsConn` has no `left_host`. A WS API request is maybe-sent from `flush` onward. Frames queued but never flushed are dropped by `connect`, so they were not sent.
   - No transport enforces a cap: every order enters through `RoutedDispatcher`'s risk gate.
   - DNS is resolved on a cold thread and handed in with `set_addr`. Reconnect by reusing the object; never call `new()` after boot.
-  - The "2 allocations per request" of gates 74b and 74c is the loopback's number (gate 74b's doc says why). The end-to-end gateway gate is BX6's.
+  - The "2 allocations per request" of gates 87b and 87c is the loopback's number (gate 87b's doc says why). The end-to-end gateway gate is BX6's.
   - Log the `#[repr(u8)]` error kinds, never `to_string()`.
 - **Size:** about 2 150 source lines, docs included (`https_post.rs` shrank by 400), and 2 450 test lines. The plan's 500 + 500 predates the non-blocking requirement and two review rounds.
 
@@ -1338,7 +1338,7 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
 
   | file | as built |
   |---|---|
-  | `lib.rs` | module map; the doctrine header (after boot, rustls's record buffers are the only allocations — gates 72, 74b, 74c) |
+  | `lib.rs` | module map; the doctrine header (after boot, rustls's record buffers are the only allocations — gates 72, 87b, 87c) |
   | `config.rs` | `BnConfig`: the key pair from `.env` (`BINANCE_API_KEY`, `BINANCE_ED25519_SEED`, names only), hosts, a test-only `loopback` feature; `Debug` redacts the key |
   | `mode.rs` | `AccountMode`; the BX-19 judges (one-way, single-asset, a key that trades futures and cannot withdraw, the account mode); `built(product, mode)` |
   | `inst.rs` | `InstTable` (64 B hot rows + cold rows) and `WireTable`, boxed fixed arrays indexed through a mask; the alias-first lookup; magic reciprocals |
@@ -1367,7 +1367,7 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
   - `core-config`: `[exec.binance]`; the slot keys `max_symbols` (1–49) and `min_maker_ttl_ms` (≥ 5 000); `recv_window_ms` ≤ 5 000.
   - `engine`: the lane-4 producer; an exec-only event reaches the dispatcher, never a member. `engine-snapshot`: `exec.arms.binance`, the ledger's mark counters. `ingress-binance`: the `Mark` bit (O-BX29).
   - `cli`: `bn_live.rs` (new: binds the table from discovery, boots the gateway on the boot thread, the arm, `bn-gateway` on core 10 with an 8 s grace, the journal and the anchor); `exec_boot.rs` (`LIVE_ARM_VENUES` gains Binance; one live Binance slot; built products and modes only; dedicated only; obligations 5 and 7; `recon_every_ms` × 2 ≤ `halt_on_recon_stale_ms`; the request-weight refusal); `paper.rs` (observability, metrics, the lane's event mask); the engine binary (lane 4, the `Mark` bit, the eight shapes of O-BX30, `finish_bn_boot`).
-  - `fuzz`: `bn_wsapi_frame`, `bn_user_event`, `bn_rest_body`, `bn_cid`, `bn_account`, `bn_mode`. `bench`: gates 79 and 80, the run loop's armed `Mark` segment.
+  - `fuzz`: `bn_wsapi_frame`, `bn_user_event`, `bn_rest_body`, `bn_cid`, `bn_account`, `bn_mode`. `bench`: gates 92 and 93, the run loop's armed `Mark` segment.
 - **The BX3 obligations, closed** (risk-policy "BX6" states each with its residual):
   1. Fills go out on lane 4 before the event that retires their order, through ONE ordered held queue when a ring is full; the arm releases a retirement one idle later.
   2. Cancels and modifies are confirmed later: an `Ok` means queued. A rename lands on the answer, the stream's `AMENDMENT` or a status showing the new terms; the old terms are final only after `recvWindow` + 5 s.
@@ -1395,13 +1395,13 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
   - TX: every number, id and literal is written straight into the frame (`Part`); the mask is applied in place. Wire copies: 2 (TLS, kernel).
   - RX: a fill is scanned in place and pushed to lane 4 by reference (3 copies: kernel, TLS, the lane slot). The combined-frame probe scans straight into its output.
   - Cold only: the logon's signer input (≤ 192 B) and signature (88 B), once per connection; the listenKey path (≤ 100 B), once per key; a held fill or event (64 B) only while a ring is full or something is held ahead of it; the boot renders.
-- **Gates** (Mac; the final tree's run is in §12): clippy clean; nextest; alloc 83/83 at 0 B/op, 2 ignored — gate 79 (`RoutedDispatcher<Paper, VenueSplit<NullLive, BnArm>>`: every event kind, `exec_counters`, a stale mark expired, a lock-halt swept `Clear`), gate 80 (every order request rendered, every answer and event scanned, the table, the wheel, the rings, the clock, the signed countdown, the recon scans), the run loop's `Mark` segment; copy-audit; license-check. Fuzz on the six targets (§12).
+- **Gates** (Mac; the final tree's run is in §12): clippy clean; nextest; alloc 83/83 at 0 B/op, 2 ignored — gate 92 (`RoutedDispatcher<Paper, VenueSplit<NullLive, BnArm>>`: every event kind, `exec_counters`, a stale mark expired, a lock-halt swept `Clear`), gate 93 (every order request rendered, every answer and event scanned, the table, the wheel, the rings, the clock, the signed countdown, the recon scans), the run loop's `Mark` segment; copy-audit; license-check. Fuzz on the six targets (§12).
 - **Reviewers** (Opus 5.5 subagents acting as the agents, read-only; full dispositions in risk-policy "BX6"):
   - Round 1: `zero-copy-auditor` FAIL (order digits and ids staged, then copied; a 128 B `Out` by value) → fixed (`WsPart`); `alloc-auditor` PASS with borderlines → all acted on; `parser-property-tester` one bug (`dec_1e6` wrapped on a 20-digit integer part) → fixed, and two fuzz targets added; `risk-reviewer` BLOCK (B1 the dead-man renewed while the arm could not cancel; B2 lost stream events never resolved and double booking; B3 fills on the monotonic clock; B4 no back-off after a 429) → all four fixed, each with a test that fails without it.
   - Round 2: `zero-copy-auditor` PASS (one should-fix: the logon's markers; six nits) → all acted on. `risk-reviewer` APPROVE WITH CONDITIONS: S1–S8 and nits N1–N9 → fixed (N8, N9 recorded).
   - Round 3 (verification): `risk-reviewer` APPROVE WITH CONDITIONS — S1–S8, N1–N7 verified; F1 (an ACK did not send a cancel `-2011` had parked) and F2 (a failed anchor store was silent) → fixed; nits N-a…N-e → fixed.
 - **End to end** (`tests/bn_e2e_loopback.rs`, a scripted USDⓈ-M venue over rustls): four tests — the trading flow; a lost stream, a 5xx modify and a dead order session; a 429's quiet; an early cancel (both orderings), a partial fill lost with the stream, a reused id and a half-open order session. **Closed:** stream reopen, order-session outage with the REST sweep, 429 quiet, 5xx modify, owed-cancel retry, `-2011` early cancel, lost partial, id reuse, half-open session. **Still open:** a lock at boot, a restart with a position, the margin and scan-failure halts end to end; no test for `go_quiet` with a named end, the probe's `countdownTime=0`, N2, N3, N7, the anchor's ring retry, or a Binance fill rolling the ledger's day (B3 is tested at the stamp).
-- **Carried** (and in risk-policy "BX6"): BX13 must prove a live fill on the user stream before any member arms; K2, K5, K11/R20, K19, K20; DNS once per boot, the half-open USER stream (240 s idle law), `ACCOUNT_CONFIG_UPDATE` ignored and margin type never asserted (BX7); gate 81, the live-socket allocation gate (before BX13); `/state` omissions (BX11).
+- **Carried** (and in risk-policy "BX6"): BX13 must prove a live fill on the user stream before any member arms; K2, K5, K11/R20, K19, K20; DNS once per boot, the half-open USER stream (240 s idle law), `ACCOUNT_CONFIG_UPDATE` ignored and margin type never asserted (BX7); gate 94, the live-socket allocation gate (before BX13); `/state` omissions (BX11).
 - **Size:** about 11 800 lines in `exec-binance` (unit tests included), 2 070 of end-to-end and proptest, about 2 500 across the shared crates and `cli`. The plan's 5 000 + 3 800 predates three review rounds.
 
 ### BX7: Futures. UM + COIN-M × classic / PM / PM Pro, all together (O-BX2b)
@@ -1722,7 +1722,7 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - The plan re-read against the base; the deltas are §13 (authoritative where it disagrees with §1–§10).
   - The K-items re-checked against Binance's docs; K1, K5, K8, K17 closed by docs, K3 and K13 partly (options and PM are IoC-only), K15 mostly; K19 and K20 added (§13.5).
   - Git: the worktree creation only (O-BX15 and the operator's word of 2026-09-26). The engine was never touched.
-- **2026-09-26, BX4 committed** (`ce2ee4a`, branch `binance`): `crates/signer-ed25519`, `core_crypto::base64_encode_pct`, bench gate 73. It also carries §13. Record in §5 BX4.
+- **2026-09-26, BX4 committed** (`ce2ee4a`, branch `binance`): `crates/signer-ed25519`, `core_crypto::base64_encode_pct`, bench gate 86. It also carries §13. Record in §5 BX4.
 - **2026-09-26, BX5 built** (branch `binance`). What was built: `HttpsConn` (non-blocking keep-alive HTTPS with templates), `HttpsPost` as its blocking form, `WsConn`/`WsFramer`, and `ReqIds`. The record is in §5 BX5.
   - HYPARB's `HttpsPost` now delivers a whole answer after a close without `close_notify` (risk-policy "BX5"). It reaches the engine only through merge, release build and restart.
   - Fuzz, 120 s each on the Mac: `https_answer` 11.86 M runs and `ws_framer` 8.47 M runs, no crash.
@@ -1746,6 +1746,24 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - Gates on the final tree (Mac, 16:30–16:34Z): clippy clean; nextest 3 421 run, 3 420 passed, 7 skipped — the one red is CLAUDE.md's known load flake `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`, green alone (4 of 4), and the round-2 tree ran 3 419 of 3 419; alloc 83/83 at 0 B/op, 2 ignored, with a fresh `Compiling bench`; `make copy-audit` hits=31 baselined=31 new=0 paid=0; `make license-check` OK (530 files).
   - Docs: `docs/risk-policy.md` ("BX6"), `docs/wire-format.md` (`binance-exec.pmlr`), `exec.toml.example`, `.env.example`, this plan. CLAUDE.md is untouched: its alloc-count line still reads 81, and the tree now has 83 — changing it needs the operator's word.
   - Git: one commit `BX6:`, explicit paths. The engine was never touched.
+- **2026-09-26, BX6 follow-up** (`8271706`): CLAUDE.md's alloc-count line set to 83, on the operator's word.
+- **2026-09-26, main merged into `binance`** (the operator's word; main at `0a7303a`: Hypercall HC0–HC11b, HAR H1–H3.7, XMM XH1–XH3, the ZC pass and the HL reconnect fix). 23 files conflicted; every resolution keeps both lanes' work.
+  - **The BX bench gates are renumbered after main's 73–85:** BX4 73 → **86**; BX5 74 (74a), 74b and 74c → **87** (87a), **87b** and **87c**; BX3 75–78 → **88–91**; BX6 79 → **92** and 80 → **93**; the planned live-socket gate 81 → **94**. This plan, risk-policy, the bench manifest and the code use the new numbers. Commit messages from before the merge keep the old ones. The merged tree has 99 alloc gates (+2 ignored child helpers).
+  - **core-net: two keep-alive engines, for now.** Both lanes refactored `HttpsPost`: BX5 onto `HttpsConn`, HC2 onto a blocking `KeepAlive` engine it shares with `HttpsReq`. The merge keeps BX5's `HttpsPost` (the reviewed BX5 behaviour; gate 72 still pins it at 2). Main's `KeepAlive` stays for `HttpsReq`, moved to the private `core_net::https_keepalive`, because the `https_conn` name is `HttpsConn`'s. There is one `Method` (HC2's `http1::Method`). `PostErrKind` carries both `Busy` (BX5) and `BadRequest` (HC2). The two engines implement the `left_host` law twice. **Follow-up: move `HttpsReq` onto `HttpsConn`.**
+  - **WebSocket frames:** BX6's self-rendering `WsPart` parts and HC's header-first `ws_write_text_frame_rendered` (`WsPayload`) now share one header writer (`write_client_header`).
+  - **Lanes:** eight tick lanes and four opt lanes (HC1), with five fill lanes (BX3). Main's generic `split_lanes` and `from_fn` builders take the fifth lane.
+  - **Boot:** the eight BX6 shapes (O-BX30) enter the loop through `enter_loop!`, which now passes main's `engine_loop_set_full` arguments (xmm, hcv, har; icdp is gone).
+  - **Semantic fixes the merge needed** (none was a textual conflict):
+    - `exec-hypercall` (HC9) implements BX3's `try_next_retired -> Option<Retired>`: `REJECTED` for a refusal after acceptance, `EXPIRED` for a `CANCELED` IoC remainder, `CANCELED_MEMBER` where its cancel answer is read.
+    - `VenueSplit` (BX3) forwards XH2's `observe_trade`, `try_next_order_event` and `track_queue_sym`, as main's `SlotSplit` does, with a test.
+    - XH2's defaulted test dispatcher writes its own `cancel` / `modify` (O-BX19).
+    - HC5's registry worst case uses `ExecObs`, with the Binance counters.
+  - **Worker:** the COIN-M candle lane joins main's lane table (`LANE_FORMS`, `sources`).
+  - `scripts/copy-audit.sh` is executable again; BX6's commit had dropped its mode to 644.
+  - CLAUDE.md: the venue list names COIN-M; the gate line's alloc count is 99 (+2 ignored). risk-policy's HC9 and HC11 lines about `VenueSplit` now say the type exists (BX3) and only a Hypercall boot branch waits for its ruling.
+  - Verified in a cloud clone before replaying on the Mac. The replay's tree matched the verified tree byte for byte (`git write-tree`).
+  - **Gates on the merged tree** (Mac, 19:51–19:54Z): clippy clean; nextest 3 874 run, 3 874 passed, 8 skipped; alloc 99/99 at 0 B/op, 2 ignored, with a fresh `Compiling bench`; `make copy-audit` hits=31 baselined=31 new=0 paid=0 after its self-test; `make license-check` OK. Fuzz, 61 s each on the Mac, no crash: `ws_framer` 5.15 M, `https_answer` 6.23 M, `http1_response` 4.20 M and `bn_wsapi_frame` 7.50 M runs; the fuzz workspace (both lanes' targets) checks clean (cloud). The worker suite through `make py-test`: 1 651 passed, 5 skipped, 1 failed — `test_news_lanes::test_report_prints_the_funnel` (`llm_unhealthy`: the news cycle's LLM health on this machine), in files identical to main's.
+  - Git: the merge commit on `binance`, then `git merge binance` on main, both on the operator's word. The engine was never touched.
 
 ---
 

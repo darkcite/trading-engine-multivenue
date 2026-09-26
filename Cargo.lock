@@ -138,6 +138,7 @@ dependencies = [
  "core-parse",
  "core-regime",
  "core-ring",
+ "core-settle",
  "core-time",
  "core-types",
  "core-vol",
@@ -146,12 +147,14 @@ dependencies = [
  "engine",
  "engine-snapshot",
  "exec-binance",
+ "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
@@ -171,6 +174,7 @@ dependencies = [
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
@@ -178,6 +182,7 @@ dependencies = [
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
 ]
 
@@ -344,6 +349,7 @@ dependencies = [
  "engine",
  "engine-snapshot",
  "exec-binance",
+ "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
@@ -351,6 +357,7 @@ dependencies = [
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
@@ -369,12 +376,14 @@ dependencies = [
  "strategy-bin15",
  "strategy-core",
  "strategy-ev",
+ "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-rule-tree",
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
  "tracing",
  "tracing-subscriber",
@@ -456,6 +465,7 @@ version = "0.1.0"
 dependencies = [
  "core-amm",
  "core-types",
+ "proptest",
 ]
 
 [[package]]
@@ -518,6 +528,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-settle"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "core-simd"
 version = "0.1.0"
 
@@ -537,6 +554,8 @@ name = "core-vol"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-time",
+ "core-types",
 ]
 
 [[package]]
@@ -764,6 +783,25 @@ dependencies = [
  "ring",
  "rustls",
  "signer-ed25519",
+]
+
+[[package]]
+name = "exec-hypercall"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-time",
+ "core-types",
+ "mio 0.8.11",
+ "rcgen",
+ "rustls",
+ "secp256k1",
+ "signer-eip712",
+ "zeroize",
 ]
 
 [[package]]
@@ -1006,6 +1044,24 @@ name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
  "book-builder",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "options-select",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
  "core-metrics",
  "core-net",
  "core-parse",
@@ -1981,6 +2037,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-hcv"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-ring",
+ "core-settle",
+ "core-time",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-hyparb"
 version = "0.1.0"
 dependencies = [
@@ -2030,15 +2098,18 @@ name = "strategy-set"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-ring",
  "core-time",
  "core-types",
+ "core-vol",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
+ "strategy-hcv",
  "strategy-hyparb",
- "strategy-icdp",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
 ]
 
@@ -2064,6 +2135,14 @@ dependencies = [
  "core-types",
  "core-vol",
  "opt-registry",
+ "strategy-core",
+]
+
+[[package]]
+name = "strategy-xmm"
+version = "0.1.0"
+dependencies = [
+ "core-types",
  "strategy-core",
 ]
 

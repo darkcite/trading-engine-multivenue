@@ -43,14 +43,14 @@ pub use clob_dispatcher::{LiveDispatcher, LiveDispatcherErr};
 use core_io::{PmlrCapture, TapCfg, TapMode};
 use core_io::{SlotCapture, SlotKind};
 use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
-use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
+use core_net::{should_reset_backoff, Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    RuleTableSlot, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
+    RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
     EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
-    RULE_TABLE_RING_SLOTS,
+    RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
     Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
@@ -67,6 +67,7 @@ use ingress_binance::run_loop as bwl;
 use ingress_bybit::run_loop as ywl;
 use ingress_deribit::run_loop as dwl;
 use ingress_hyperevm::run_loop as hel;
+use ingress_hypercall::run_loop as hcl;
 use ingress_hyperliquid::run_loop as hwl;
 use ingress_mexc::run_loop as mxl;
 use ingress_okx::run_loop as owl;
@@ -461,6 +462,11 @@ mod dispatcher_idle_tests {
 
 /// Endpoint config for a single WSS ingress. All strings are owned
 /// + boxed because they have to outlive the ingress thread.
+///
+/// It also carries the Hyperliquid `/info` endpoint (`path` =
+/// `/info`) that ingress re-reads between sessions — resolved at boot
+/// like the WS host, so the Hyperliquid ingress thread never runs a
+/// DNS lookup.
 #[derive(Debug, Clone)]
 pub struct WssEndpoint {
     /// Hostname (for SNI + the `Host:` header).
@@ -538,6 +544,7 @@ const _: () = {
     assert!(hwl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(ywl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(mxl::TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(hcl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
@@ -545,7 +552,7 @@ const _: () = {
 pub struct Rings {
     /// One tick ring per venue lane, indexed by `engine::tick_lane_of`
     /// (0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
-    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC). Lanes without a spawned
+    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC, 7 = Hypercall). Lanes without a spawned
     /// ingress simply never see a producer push — the engine drains
     /// them empty.
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
@@ -555,6 +562,11 @@ pub struct Rings {
     /// pool lane (`Engine::set_pool_lane`). Permanently empty when the
     /// ingress is not spawned.
     pub hyperevm_signal: Arc<Ring<Signal, { engine::POOL_RING_SIZE }>>,
+    /// XMM XH1: the trade-print ring — the Hyperliquid ingress's
+    /// `trades` rows, feeding the engine's trade lane
+    /// (`Engine::set_trade_lane`). Permanently empty when the ingress is
+    /// not spawned.
+    pub trade: Arc<Ring<TradePrint, TRADE_RING_SIZE>>,
     /// One fill ring per execution lane (`engine::fill_lane_of`): the
     /// Hyperliquid arm produces on lane 3, the Binance gateway on lane
     /// 4 (BX3; its producer is taken at BX6). A lane nothing produces on
@@ -585,9 +597,9 @@ pub struct Rings {
     pub depth: [Arc<Ring<DepthTopK, DEPTH_RING_SIZE>>; engine::NUM_DEPTH_LANES],
     /// VM2 V2: one options-summary ring per opt lane
     /// (`engine::opt_lane_of` order: 0 = OKX, 1 = Deribit,
-    /// 2 = Binance eapi). Producers ride into the three
-    /// options-capable spawns; without an options subscription the
-    /// lane reads empty forever (§3.3).
+    /// 2 = Binance eapi, 3 = Hypercall REST summary — HC1). Producers
+    /// ride into the options-capable spawns; without an options
+    /// subscription the lane reads empty forever (§3.3).
     pub opt: [Arc<Ring<OptSummary, OPT_RING_SIZE>>; engine::NUM_OPT_LANES],
 }
 
@@ -603,9 +615,11 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
+                Ring::new(),
             ],
             rpc_signal: Ring::new(),
             hyperevm_signal: Ring::new(),
+            trade: Ring::new(),
             fill: [
                 Ring::new(),
                 Ring::new(),
@@ -623,9 +637,10 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
+                Ring::new(),
             ],
             depth: [Ring::new(), Ring::new()],
-            opt: [Ring::new(), Ring::new(), Ring::new()],
+            opt: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
         }
     }
 }
@@ -666,6 +681,12 @@ pub struct IngressStatusSet {
     /// logs + in-session snapshots). Down unless `--hyperevm-path` and
     /// `[hyperevm] pools` are both given.
     pub hyperevm: Arc<IngressStatus>,
+    /// HC5: the Hypercall WSS thread (one public socket; data-only,
+    /// O-HC1). Down unless `[hypercall]` selected a chain at boot.
+    pub hypercall: Arc<IngressStatus>,
+    /// HC5: the Hypercall venue counters (WS + REST poller). Venue-
+    /// specific, so they ride beside the generic slot, like `hl_roll`.
+    pub hc: Arc<ingress_hypercall::HcCounters>,
     /// BIN15 O2: the Hyperliquid ROLL counters. Venue-specific, so
     /// they could not live in the size-locked generic
     /// [`IngressStatus`] slot; they ride here so the metrics
@@ -674,7 +695,8 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all nine slots + the HL roll counters (boot only).
+    /// Allocate all ten slots + the HL roll and Hypercall counters (boot
+    /// only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -686,6 +708,8 @@ impl IngressStatusSet {
             rpc: Arc::new(IngressStatus::new()),
             mexc: Arc::new(IngressStatus::new()),
             hyperevm: Arc::new(IngressStatus::new()),
+            hypercall: Arc::new(IngressStatus::new()),
+            hc: Arc::new(ingress_hypercall::HcCounters::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
         }
     }
@@ -776,6 +800,7 @@ pub fn spawn_polymarket(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = pwl::run(
                     &mut transport,
@@ -804,6 +829,7 @@ pub fn spawn_polymarket(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, pwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -891,6 +917,7 @@ pub fn spawn_binance(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = bwl::run(
                     &mut transport,
@@ -919,6 +946,7 @@ pub fn spawn_binance(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, bwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -1445,6 +1473,182 @@ pub fn spawn_mexc(
     ))
 }
 
+/// HC5: everything [`spawn_hypercall`] moves onto the Hypercall threads,
+/// built by the bin from the HC4 discovery outcome.
+pub struct HypercallSpec {
+    /// WS host (`HYPERCALL_WS_HOST`); the path is `/ws`.
+    pub ws_host: String,
+    /// REST host (`HYPERCALL_REST_HOST`) — the `/options-summary` poller.
+    pub rest_host: String,
+    /// The universe: every selected option, `name → sym` (its clone
+    /// goes to the poller).
+    pub symbols: ingress_hypercall::HcSymbolTable,
+    /// Underlying → its `hypercall-idx:<U>` sym (the index `Mark`s).
+    pub underlyings: ingress_hypercall::HcUnderlyings,
+    /// The underlyings the poller refreshes, in config order.
+    pub summary_underlyings: Vec<String>,
+    /// Each underlying's refresh period (`[hypercall] summary_every_s`).
+    pub summary_every_s: u32,
+    /// VT2 staleness threshold (venue default or `--stale-after-ms`).
+    pub stale_after_ms: u32,
+}
+
+/// HC5: spawn the Hypercall ingress (data-only, ruling O-HC1) — TWO
+/// threads over ONE capture: `ingress-hypercall` owns the public
+/// socket, the tick / event / opt producers and the `"hypercall"`
+/// capture; `hypercall-poller` runs the REST `/options-summary` cycle
+/// (a request may block up to its deadline — never on the socket's
+/// thread) and hands its rows to the ingress thread over an SPSC ring,
+/// so every file and every lane keeps ONE writer (plan §3 HC3).
+///
+/// The poller resolves its host on its own thread: a DNS failure there
+/// ends the poller (an error line, `polls_err` flat) and leaves the
+/// quote stream running.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_hypercall(
+    spec: HypercallSpec,
+    tls_config: RustlsConfig,
+    mut ticks: Producer<Tick, TICK_RING_SIZE>,
+    mut events: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut opts: Producer<OptSummary, OPT_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    counters: Arc<ingress_hypercall::HcCounters>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<[JoinHandle<()>; 2]> {
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "hypercall", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "hypercall", VenueId::Hypercall.to_u8())?;
+    }
+    let (handoff_tx, mut handoff_rx) =
+        Ring::<OptSummary, { hcl::HANDOFF_RING_CAP }>::new().split();
+    // Boot-time copy of the universe for the poller (its own thread).
+    let poller_symbols = spec.symbols.clone();
+    let poller_counters = counters.clone();
+    let rest_host = spec.rest_host;
+    let summary_underlyings = spec.summary_underlyings;
+    let every_s = spec.summary_every_s;
+    let poller_tls = tls_config.clone();
+    let poller = spawn_or_die(
+        thread::Builder::new().name("hypercall-poller".into()),
+        "hypercall-poller",
+        move || {
+            let http = match core_net::HttpsReq::new(
+                &rest_host,
+                443,
+                poller_tls,
+                ingress_hypercall::rest::REST_HEAD_CAP,
+                0,
+                ingress_hypercall::rest::REST_RESP_CAP,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(error = ?e, host = %rest_host, "hypercall: poller client failed — no summary rows this run");
+                    return;
+                }
+            };
+            let names: Vec<&[u8]> = summary_underlyings.iter().map(|u| u.as_bytes()).collect();
+            let Some(mut p) = ingress_hypercall::rest::Poller::new(
+                http,
+                poller_symbols,
+                &names,
+                every_s,
+                handoff_tx,
+                poller_counters,
+            ) else {
+                tracing::error!(underlyings = names.len(), every_s, "hypercall: poller refused its targets");
+                return;
+            };
+            tracing::info!(host = %rest_host, underlyings = names.len(), every_s, "hypercall: poller running");
+            ingress_hypercall::rest::run_poller(&mut p, &SHUTDOWN);
+            tracing::info!("hypercall: poller returned");
+        },
+    );
+    let ingress = spawn_or_die(
+        thread::Builder::new().name("ingress-hypercall".into()),
+        "ingress-hypercall",
+        move || {
+            log_pin_outcome("hypercall", core_id);
+            let ep = match WssEndpoint::resolve(&spec.ws_host, 443, "/ws") {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(error = ?e, host = %spec.ws_host, "hypercall: DNS failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hypercall: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let (mut poll, mut mio_events, _token) = match new_poll() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hypercall: mio init failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut drv = hcl::Driver::new(now_ns(), spec.symbols, spec.underlyings);
+            drv.set_stale_after_ms(spec.stale_after_ms);
+            let mut conn = hcl::HcConn::new(
+                drv,
+                ep.host.as_bytes(),
+                Backoff::default_for_ingress(core_id as u64 + 1),
+            );
+            let mut lanes = hcl::Lanes {
+                ticks: &mut ticks,
+                events: &mut events,
+                // The v1 venue-event lane law: only funding flows —
+                // Hypercall has none, so its events are capture-only.
+                event_mask: EVENT_LANE_FUNDING,
+                opts: &mut opts,
+            };
+            status.set_state(IngressState::Connecting);
+            let res = hcl::run(
+                &mut conn,
+                &mut lanes,
+                &mut handoff_rx,
+                &mut poll,
+                &mut mio_events,
+                &SHUTDOWN,
+                &status,
+                &counters,
+                &mut capture,
+                || match connect_tls(&ep, &name, &tls_config) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, host = %ep.host, "hypercall: connect failed");
+                        None
+                    }
+                },
+            );
+            // T1(a): name any recorded session error on the exit line.
+            let err = status.take_last_err();
+            tracing::info!(
+                ?res,
+                err_site = core_metrics::err_site_name(err.site),
+                io_kind = core_metrics::io_kind_name(err.io_kind),
+                venue_code = err.venue_code as i32,
+                "hypercall: run-loop returned"
+            );
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    );
+    Ok([ingress, poller])
+}
+
 /// Build the boot-time OKX `instId → SymbolId` table from the
 /// comma-separated `--okx-symbols` value, gated on `discovery` (the
 /// Phase-8e REST instrument table — see `boot_discovery::run_okx`).
@@ -1642,6 +1846,7 @@ pub fn spawn_okx(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = owl::run(
                     &mut transport,
@@ -1681,6 +1886,7 @@ pub fn spawn_okx(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, owl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -1931,6 +2137,7 @@ pub fn spawn_deribit(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = dwl::run(
                     &mut transport,
@@ -1971,6 +2178,7 @@ pub fn spawn_deribit(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, dwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -2099,17 +2307,29 @@ pub fn build_hl_families(
 /// §4.3). There is no depth flag: `l2Book` is always subscribed —
 /// it feeds the §6.2 per-coin staleness monitor. See
 /// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+///
+/// `info_ep` is the `/info` endpoint (`Config::hyperliquid_api_host`,
+/// resolved at boot like `ep`): a reconnect that retired a rolling
+/// family re-discovers its successor there
+/// ([`boot_discovery::fetch_hl_outcome_specs`]).
+///
+/// `mark_lane` (HC11): the MARK rides the event lane even without rolling
+/// families — slot 7 reads each underlying's `oraclePx` (`Mark.v1`), the
+/// price Hypercall settles on.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_hyperliquid(
     ep: WssEndpoint,
+    info_ep: WssEndpoint,
     tls_config: RustlsConfig,
     coins: ingress_hyperliquid::HlCoinTable,
     families: ingress_hyperliquid::family::HlFamilyTable,
     roll_status: Arc<ingress_hyperliquid::family::HlRollStatus>,
     wall_anchor: core_time::WallAnchor,
+    mark_lane: bool,
     stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    trade_tx: Producer<TradePrint, TRADE_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -2150,10 +2370,70 @@ pub fn spawn_hyperliquid(
             // path in the driver exactly as it was before BIN15.
             let has_families = !families.is_empty();
             driver.set_families(families, roll_status, wall_anchor);
+            // XMM XH1: every parsed `trades` row also reaches the
+            // engine's trade lane (the driver outlives reconnects).
+            driver.set_trade_lane(trade_tx);
+            // VM2 V2: HL funding rides AssetCtx — the lane mask carries
+            // both bits (feature-engine law). BIN15 O2: with rolling
+            // families configured the lane also carries the roll and the
+            // MARK — a member cannot price a HIP-4 binary without the
+            // strike's reference, and cannot know which instance its
+            // slot holds without the roll.
+            // HC11: slot 7 reads the MARK too (`mark_lane`).
+            let mut event_mask = if has_families {
+                EVENT_LANE_FUNDING
+                    | EVENT_LANE_ASSET_CTX
+                    | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
+                    | core_types::event_lane_bit(core_types::ChannelId::Mark)
+            } else {
+                EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
+            };
+            if mark_lane {
+                event_mask |= core_types::event_lane_bit(core_types::ChannelId::Mark);
+            }
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            let mut last_rediscovery_ns: Option<u64> = None;
             while !shutdown_requested() {
                 status.set_state(IngressState::Connecting);
+                // Reconnect hygiene (2026-09-26): a family on a settled
+                // or expired instance is retired here — never
+                // re-subscribed (the venue drops the socket on it) — and
+                // its successor re-discovered over `/info`, because
+                // `outcomeMetaUpdates` replays nothing on subscribe.
+                // Before the socket opens, so the `/info` round trip
+                // never idles a fresh TLS session; at most once a
+                // minute, so a family whose deployer stopped creating
+                // instances cannot turn every reconnect into a fetch.
+                let retired = driver.reset_for_reconnect(now_ns());
+                if retired > 0 {
+                    tracing::warn!(
+                        retired,
+                        "hyperliquid: families on a settled/expired instance retired before resubscribing"
+                    );
+                }
+                let now = now_ns();
+                let due = match last_rediscovery_ns {
+                    Some(at) => now.saturating_sub(at) >= HL_REDISCOVERY_MIN_INTERVAL_NS,
+                    None => true,
+                };
+                if driver.families_awaiting() > 0 && due && !shutdown_requested() {
+                    last_rediscovery_ns = Some(now);
+                    let bound = rediscover_hl_families(
+                        &mut driver,
+                        &info_ep,
+                        &tls_config,
+                        &mut event_tx,
+                        event_mask,
+                        &status,
+                        &mut capture,
+                    );
+                    // The roll records must reach disk even if the
+                    // connect that follows fails.
+                    if bound > 0 {
+                        capture.mirror_now();
+                    }
+                }
                 let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
                     Ok(t) => t,
                     Err(e) => {
@@ -2171,8 +2451,8 @@ pub fn spawn_hyperliquid(
                         return;
                     }
                 };
-                driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = hwl::run(
                     &mut transport,
@@ -2181,21 +2461,7 @@ pub fn spawn_hyperliquid(
                     ep.path.as_bytes(),
                     &mut producer,
                     &mut event_tx,
-                    // VM2 V2: HL funding rides AssetCtx — the lane
-                    // mask carries both bits (feature-engine law).
-                    // BIN15 O2: with rolling families configured the
-                    // lane also carries the roll and the MARK — a
-                    // member cannot price a HIP-4 binary without the
-                    // strike's reference, and cannot know which
-                    // instance its slot holds without the roll.
-                    if has_families {
-                        EVENT_LANE_FUNDING
-                            | EVENT_LANE_ASSET_CTX
-                            | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
-                            | core_types::event_lane_bit(core_types::ChannelId::Mark)
-                    } else {
-                        EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
-                    },
+                    event_mask,
                     &mut poll,
                     &mut events,
                     token,
@@ -2204,7 +2470,22 @@ pub fn spawn_hyperliquid(
                     &mut keepalive,
                     &mut capture,
                 );
-                tracing::info!(?res, "hyperliquid: run-loop returned");
+                let session_ns = now_ns().saturating_sub(session_start_ns);
+                // T1(a): name the end on the line the operator greps —
+                // `res=Disconnected` alone hid a 1.2 s reconnect loop
+                // for hours (2026-09-26).
+                let err = status.take_last_err();
+                let (acks, acks_expected) = driver.ack_progress();
+                tracing::info!(
+                    ?res,
+                    err_site = core_metrics::err_site_name(err.site),
+                    io_kind = core_metrics::io_kind_name(err.io_kind),
+                    venue_code = err.venue_code as i32,
+                    lived_ms = session_ns / 1_000_000,
+                    acks,
+                    acks_expected,
+                    "hyperliquid: run-loop returned"
+                );
                 capture.mirror_now();
                 if matches!(res, hwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
@@ -2224,6 +2505,7 @@ pub fn spawn_hyperliquid(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    session_ns,
                     matches!(res, hwl::RunResult::IdleTimeout | hwl::RunResult::Stale),
                 ) {
                     backoff.reset();
@@ -2236,6 +2518,99 @@ pub fn spawn_hyperliquid(
             status.set_state(IngressState::Down);
         },
     ))
+}
+
+/// Minimum spacing of the between-session `/info` re-read
+/// ([`rediscover_hl_families`]): a family whose deployer stopped
+/// creating instances stays `awaiting` for good, and a connect-failure
+/// storm reconnects every ≤ 8 s — neither may turn into a fetch per
+/// attempt.
+const HL_REDISCOVERY_MIN_INTERVAL_NS: u64 = 60_000_000_000;
+
+/// Re-discover the live instance of every rolling family a reconnect
+/// retired (2026-09-26): one `/info {"type":"outcomeMeta"}` fetch —
+/// the boot's own request and parser — then
+/// [`hwl::Driver::rebind_dormant`], which binds without touching the
+/// wire and announces each adoption as a roll. Returns how many
+/// families were bound (the caller flushes their roll events).
+///
+/// Cold path: between sessions, only while a family awaits a
+/// successor, throttled by the caller. A failed fetch leaves the
+/// family awaiting; the venue's next `outcomeCreated` adopts it on a
+/// healthy session, and a later reconnect asks again.
+///
+/// One race remains, by construction: a successor created between
+/// this snapshot and the new session's `outcomeMetaUpdates` ack is
+/// missed until the family's NEXT instance — at most one 15-minute
+/// instance (a daily's successor is listed a day ahead).
+fn rediscover_hl_families<C: core_types::Capture>(
+    driver: &mut hwl::Driver,
+    info_ep: &WssEndpoint,
+    tls: &RustlsConfig,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> usize {
+    let specs = match boot_discovery::fetch_hl_outcome_specs(tls, info_ep) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = e,
+                awaiting = driver.families_awaiting(),
+                "hyperliquid: successor re-discovery failed — retired families wait for the venue's next outcomeCreated"
+            );
+            return 0;
+        }
+    };
+    let bound = driver.rebind_dormant(&specs, event_tx, event_mask, status, capture);
+    tracing::info!(
+        bound,
+        awaiting = driver.families_awaiting(),
+        candidates = specs.len(),
+        "hyperliquid: successors re-discovered at reconnect"
+    );
+    if bound > 0 {
+        log_hl_families(driver.families());
+    }
+    bound
+}
+
+/// One line per rolling family — its instance, or that it has none.
+/// The boot binding and every reconnect re-discovery report through
+/// this, so both read the same in the log.
+pub fn log_hl_families(families: &ingress_hyperliquid::family::HlFamilyTable) {
+    let mut f = 0usize;
+    while f < families.len() {
+        let Some(row) = families.get(f) else {
+            break;
+        };
+        let underlying = core::str::from_utf8(row.underlying_bytes()).unwrap_or("?");
+        if row.dormant {
+            tracing::info!(
+                family = f,
+                underlying,
+                period_s = row.period_s,
+                sym_yes = row.sym[0],
+                sym_no = row.sym[1],
+                "hyperliquid: family dormant (no live instance)"
+            );
+        } else {
+            tracing::info!(
+                family = f,
+                underlying,
+                period_s = row.period_s,
+                sym_yes = row.sym[0],
+                sym_no = row.sym[1],
+                live = row.live.outcome,
+                strike_1e6 = row.live.strike_1e6,
+                expiry_ns = row.live.expiry_ns,
+                twap_s = row.live.twap_s,
+                "hyperliquid: family live"
+            );
+        }
+        f += 1;
+    }
 }
 
 /// Spawn the Polygon JSON-RPC ingress thread. See [`spawn_polymarket`]
@@ -2301,6 +2676,7 @@ pub fn spawn_rpc(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = rwl::run(
                     &mut transport,
@@ -2326,6 +2702,7 @@ pub fn spawn_rpc(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, rwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -2439,6 +2816,7 @@ pub fn spawn_hyperevm(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
                 let res = hel::run(
                     &mut transport,
                     &mut driver,
@@ -2475,6 +2853,7 @@ pub fn spawn_hyperevm(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, hel::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -2550,9 +2929,14 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// every SymbolId the boot wired into a venue ingress — the PM/BN
 /// pair flags plus each discovery-gated venue table, plus (MX6,
 /// operator ruling Q-MX6) every MEXC instrument the boot allocated
-/// (spot + perp; Bybit stays out by its own WS9 precedent) — **sorted
-/// strict-ascending and deduped** (binary-searched per §4.2 rule-6
-/// check; `RulesetSidePath::new` debug-asserts the ordering).
+/// (spot + perp; Bybit stays out by its own WS9 precedent), plus
+/// (ruling O-HC17) every Hypercall option the boot selected — its
+/// `hypercall-idx:<U>` index syms stay out (capture-only `Mark`s, caps
+/// 0: nothing could read them) — **sorted strict-ascending and
+/// deduped** (binary-searched per §4.2 rule-6 check;
+/// `RulesetSidePath::new` debug-asserts the ordering). Data-only venues
+/// (MEXC, Hypercall) enter as signal or reference legs: an order on one
+/// stays unroutable in the paper matcher and the harness.
 ///
 /// Universe membership is a boot-time fact: a symbol that later
 /// loses its feed still validates — the row just never triggers
@@ -2566,6 +2950,7 @@ pub fn build_ai_universe(
     deribit: Option<&ingress_deribit::DeribitSymbolTable>,
     hl: Option<&ingress_hyperliquid::HlCoinTable>,
     mexc_syms: &[SymbolId],
+    hypercall_option_syms: &[SymbolId],
 ) -> Arc<[u32]> {
     let mut v: Vec<u32> = Vec::with_capacity(
         polymarket_syms.len()
@@ -2573,11 +2958,13 @@ pub fn build_ai_universe(
             + okx.map_or(0, |t| t.len())
             + deribit.map_or(0, |t| t.len())
             + hl.map_or(0, |t| t.len())
-            + mexc_syms.len(),
+            + mexc_syms.len()
+            + hypercall_option_syms.len(),
     );
     v.extend_from_slice(polymarket_syms);
     v.extend_from_slice(binance_syms);
     v.extend_from_slice(mexc_syms);
+    v.extend_from_slice(hypercall_option_syms);
     if let Some(t) = okx {
         let mut i = 0usize;
         while let Some((_, sym, _)) = t.get(i) {
@@ -2716,6 +3103,9 @@ pub struct RawTapConfig {
     pub mexc: TapCfg,
     /// HYPARB H3b: tap config for the HyperEVM ingress.
     pub hyperevm: TapCfg,
+    /// HC5: tap config for the Hypercall ingress (every WS text
+    /// payload; the REST poller's bodies are not tapped).
+    pub hypercall: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -2723,7 +3113,7 @@ pub struct RawTapConfig {
 /// absent/empty ⇒ every venue gets [`TapCfg::off`] (default: none).
 /// `raw_tap` equal (after trim) to the literal `all` enables every
 /// venue; otherwise it's a comma-separated list of venue labels
-/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`), trimmed, non-empty, no
+/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`/`hypercall`), trimmed, non-empty, no
 /// duplicates. Every enabled venue shares the same `mode` +
 /// `budget_mb` (×1 MiB → `TapCfg::budget_bytes`). Unknown venue
 /// labels and a bad `--raw-tap-mode` value both fail fast at parse —
@@ -2754,6 +3144,7 @@ pub fn parse_raw_tap_flags(
         bybit: TapCfg::off(),
         mexc: TapCfg::off(),
         hyperevm: TapCfg::off(),
+        hypercall: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2771,10 +3162,11 @@ pub fn parse_raw_tap_flags(
         cfg.bybit = enabled_cfg;
         cfg.mexc = enabled_cfg;
         cfg.hyperevm = enabled_cfg;
+        cfg.hypercall = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 9] = [""; 9];
+    let mut seen: [&str; 10] = [""; 10];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -2797,6 +3189,7 @@ pub fn parse_raw_tap_flags(
             "bybit" => cfg.bybit = enabled_cfg,
             "mexc" => cfg.mexc = enabled_cfg,
             "hyperevm" => cfg.hyperevm = enabled_cfg,
+            "hypercall" => cfg.hypercall = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -2824,6 +3217,9 @@ pub struct Consumers {
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// HYPARB H3b: HyperEVM pool-event consumer (the engine's pool lane).
     pub hyperevm_signal: Consumer<Signal, { engine::POOL_RING_SIZE }>,
+    /// XMM XH1: trade-print consumer (the engine's trade lane). Reads
+    /// empty forever when the Hyperliquid ingress is not spawned.
+    pub trades: Consumer<TradePrint, TRADE_RING_SIZE>,
     /// Fill-lane consumers (`engine::fill_lane_of` order): lane 3 the
     /// Hyperliquid arm's, lane 4 the Binance gateway's (BX3; produced
     /// from BX6). Paper-mode fills flow through the engine's dispatcher
@@ -3045,8 +3441,8 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / icdp
-/// when their artifacts resolve, slot 0 when `hyparb.toml` resolves
+/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / xmm /
+/// hcv when their artifacts resolve, slot 0 when `hyparb.toml` resolves
 /// (HYPARB H5 — the member is configured only by its own boot
 /// artifact; unconfigured it refuses `on_start`, so it never boots
 /// inert under a healthy-looking name),
@@ -3064,15 +3460,17 @@ fn configure_rule_tree<const N: usize>(
 #[allow(clippy::too_many_arguments)]
 pub fn engine_loop_set_full<D: OrderDispatch>(
     cons: Consumers,
-    disp: D,
+    mut disp: D,
     obs: Observability,
     requested_mask: u8,
     vrp: Option<&crate::vrp_boot::VrpBoot>,
     xsd: Option<&crate::xsd_boot::XsdBoot>,
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
-    icdp: Option<&strategy_icdp::IcdpParams>,
+    xmm: Option<&crate::xmm_boot::XmmBoot>,
+    hcv: Option<&crate::hcv_boot::HcvBoot>,
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
+    har: Option<&crate::har_boot::HarBoot>,
 ) -> EngineLoopResult {
     let mut configured = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
     if hyparb.is_some() {
@@ -3087,8 +3485,11 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if bin15.is_some() {
         configured |= strategy_set::BIT_BIN15;
     }
-    if icdp.is_some() {
-        configured |= strategy_set::BIT_ICDP;
+    if xmm.is_some() {
+        configured |= strategy_set::BIT_XMM;
+    }
+    if hcv.is_some() {
+        configured |= strategy_set::BIT_HCV;
     }
     let mask = requested_mask & configured;
     if mask == 0 {
@@ -3098,6 +3499,16 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     let mut obs = obs;
     obs.boot.requested_mask = requested_mask;
     obs.boot.configured_mask = configured;
+    if let Some(boot) = xmm {
+        // XMM XH3: the artifact's identity on `/state` (`boot.xmm_hash`)
+        // and the names of its perp rows, in row order (boot-only).
+        obs.boot.xmm_hash = boot.hash;
+        obs.boot.set_xmm_coins(boot.coins.join(",").as_bytes());
+    }
+    if let Some(boot) = hcv {
+        // HC11: the artifact's identity on `/state` (`boot.hcv_hash`).
+        obs.boot.hcv_hash = boot.hash;
+    }
 
     let mut set = strategy_set::StrategySet::new(mask);
     if let Some(boot) = vrp {
@@ -3316,25 +3727,139 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         tracing::info!("{}", crate::hyparb_boot::render_boot_tell(boot));
     }
-    if let Some(params) = icdp {
-        // ICDP I2/I4: the wall anchor is taken HERE, once, right
-        // before the engine loop starts — the bar grid is UTC-aligned
-        // from this instant on; replay rebuilds the same anchor from
-        // the harness rebase (core_time::WallAnchor docs).
-        let anchor = core_time::WallAnchor::now();
-        if let Err(e) = set.icdp_mut().configure(anchor, params) {
-            tracing::error!(error = %e, "icdp: artifact refused");
-            return EngineLoopResult::Failed("icdp: artifact refused by the strategy");
+    if let Some(boot) = xmm {
+        // XMM XH1: the member validates and stores its artifact. It
+        // quotes on the paper queue law since XH2 (a live slot 6 refuses
+        // the boot until XH4).
+        if let Err(e) = set.xmm_mut().configure(&boot.params) {
+            tracing::error!(error = %e, "xmm: artifact refused");
+            return EngineLoopResult::Failed("xmm: artifact refused by the strategy");
         }
-        let h = set.icdp().params_hash();
-        tracing::info!(
-            hash = %format_hex32(h),
-            instruments = set.icdp().instruments(),
-            tf_ns = params.tf_ns,
-            delta_ns = params.delta_ns,
-            anchor_wall_ns = anchor.wall_ns,
-            "icdp: artifact configured"
-        );
+        // XMM XH2: the queue law tracks the member's perps from boot, so
+        // the first post-only order on each meets a known book.
+        let mut i = 0usize;
+        while i < boot.params.n_perps as usize {
+            disp.track_queue_sym(boot.params.perps[i].hl_sym);
+            i += 1;
+        }
+        tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
+    }
+    if let Some(boot) = hcv {
+        // HC11 (O-HC18): slot 7 — DARK, paper only (a live slot 7 refuses
+        // the boot in `exec_boot`). The wall anchor is taken HERE, once,
+        // right before the loop: every expiry the member compares is
+        // wall. The calendar arrives from the `hcv-events` thread by
+        // mailbox — the engine thread never opens the file; a reader that
+        // did not spawn leaves the member without one, and under the
+        // event law it then trades nothing (fail closed).
+        let mut params = boot.params.clone();
+        params.anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.hcv_mut().configure(&params) {
+            tracing::error!(error = %e, "hcv: artifact refused");
+            return EngineLoopResult::Failed("hcv: artifact refused by the strategy");
+        }
+        // HC11b: the book a previous process left — positions by contract,
+        // hedges, cash, the day's mark, open settlement windows. A file the
+        // member cannot read exactly is a position nobody would hedge or
+        // settle, so it refuses the boot (the VRP / XSD law).
+        if let Some(text) = boot.state.as_deref() {
+            let now_ms = params.anchor.wall_of(core_time::now_ns()) / 1_000_000;
+            match set.hcv_mut().restore_state(text, now_ms) {
+                Ok(r) => {
+                    tracing::info!(
+                        positions = r.positions,
+                        orphans = r.orphans,
+                        expired = r.expired,
+                        hedges = r.hedges,
+                        hedges_dropped = r.hedges_dropped,
+                        windows = r.windows,
+                        cash_usd_1e6 = r.cash_usd_1e6,
+                        path = %boot.state_path.display(),
+                        "hcv: book restored"
+                    );
+                    if r.orphans > 0 {
+                        tracing::warn!(
+                            orphans = r.orphans,
+                            "hcv: held contracts outside this boot's chain — carried by their terms \
+                             (hedged and marked at σ̂, settled at expiry), never traded until a chain \
+                             lists them again"
+                        );
+                    }
+                    if r.expired > 0 {
+                        tracing::warn!(
+                            expired = r.expired,
+                            "hcv: positions expired while the engine was down — booked at the first \
+                             timer, on their window if one was kept (else counted in settle_fallbacks)"
+                        );
+                    }
+                    if r.hedges_dropped > 0 {
+                        tracing::warn!(
+                            hedges_dropped = r.hedges_dropped,
+                            "hcv: hedge residuals under the venue's minimum on underlyings hcv.toml no \
+                             longer trades were dropped from the book"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(reason = %e, path = %boot.state_path.display(), "hcv: book refused");
+                    return EngineLoopResult::Failed("hcv: state file refused by the strategy");
+                }
+            }
+        }
+        // …and where it goes. The book is written once here, on the boot
+        // path, so a file it cannot write refuses the boot before anything
+        // trades; from then on the member hands every change to the writer
+        // thread at its timer (a writer that stops taking them stops new
+        // risk, `HCV_BOOK_STALE_NS`). A book that cannot persist must not
+        // trade, so a writer that did not spawn refuses the boot too.
+        let mut first = String::new();
+        if strategy_core::StrategyCounters::render_hcv_state(set.hcv(), &mut first) {
+            if let Err(reason) = crate::state_file::write_atomic(&boot.state_path, &first) {
+                tracing::error!(%reason, path = %boot.state_path.display(), "hcv: the book's file is not writable");
+                return EngineLoopResult::Failed("hcv: the book's file is not writable");
+            }
+        }
+        match crate::hcv_boot::spawn_state_writer(boot.state_path.clone()) {
+            Ok((tx, w)) => {
+                set.hcv_mut().install_state_outbox(tx);
+                obs.hcv_writer = Some(w);
+                obs.hcv_state_path = Some(boot.state_path.clone());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "hcv: the state writer did not spawn");
+                return EngineLoopResult::Failed("hcv: the state writer did not spawn");
+            }
+        }
+        let (tx, rx) = core_ring::Mailbox::new(Box::new(strategy_hcv::HcvEvents::new())).split();
+        set.hcv_mut().install_events(rx);
+        match crate::hcv_boot::HcvEventsReader::spawn(
+            boot.events_path.clone(),
+            boot.underlyings.clone(),
+            boot.known.clone(),
+            tx,
+        ) {
+            Ok(r) => obs.hcv_events = Some(r),
+            Err(e) => tracing::error!(
+                error = %e,
+                "hcv: the calendar reader did not spawn — under the event law slot 7 trades nothing"
+            ),
+        }
+        tracing::info!("{}", crate::hcv_boot::render_boot_tell(boot));
+        // O-HC22: σ̂ is the HAR set's — a traded underlying no `har.toml`
+        // series serves forecasts nothing and never trades. Told, not
+        // refused (the HAR service's failure isolation).
+        let mut i = 0usize;
+        while i < boot.underlyings.len() {
+            let name = boot.underlyings[i];
+            let served = har.is_some_and(|hb| hb.series.iter().any(|x| x.name == name));
+            if !served {
+                tracing::warn!(
+                    underlying = name,
+                    "hcv: no har.toml series serves this underlying — slot 7 never trades it (O-HC22)"
+                );
+            }
+            i += 1;
+        }
     }
     if let Some(boot) = xsd {
         // XSD-3: the wall anchor is taken HERE, once — the member's hour
@@ -3398,6 +3923,36 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             table_hash: boot.table.hash,
             descriptors: boot.descriptors.clone(),
         });
+    }
+    // HAR H3.4: the long-tenor HAR series — configured, restored and told
+    // here, beside the regime detector (same seat, same 1 s poll). No
+    // member reads them (plan law L4); a refusal turns the service off and
+    // never the boot (`har_boot`'s failure isolation). The anchor is taken
+    // here, once, like every other member's minute grid.
+    if let Some(hb) = har {
+        let anchor = core_time::WallAnchor::now();
+        if crate::har_boot::install(&mut set, hb, anchor, core_time::now_ns()) {
+            obs.har_state_paths = hb.series.iter().map(|s| s.state_path.clone()).collect();
+            // H3.5: the file's identity and what it lost, for `/state.har`.
+            obs.har_hash = hb.hash;
+            obs.har_dropped = hb.dropped.len().min(u32::MAX as usize) as u32;
+            // H3.7: the state leaves the engine thread — one copy into a
+            // mailbox at each day close, the render and the fsync on the
+            // writer thread. A spawn failure keeps the write on the loop
+            // (logged, never a refusal — the boot's failure isolation).
+            let (tx, rx) = crate::har_writer::outbox(hb.series.len());
+            let names = hb.series.iter().map(|s| s.name.clone()).collect();
+            match crate::har_writer::spawn(rx, names, obs.har_state_paths.clone()) {
+                Ok(w) => {
+                    set.install_har_outbox(tx);
+                    obs.har_writer = Some(w);
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "har: the state writer thread did not spawn — the engine loop writes the state"
+                ),
+            }
+        }
     }
     // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
     // `[labels.*]` overrides, seed, and print the boot tells. An
@@ -3471,7 +4026,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         bin15 = mask & strategy_set::BIT_BIN15 != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
-        icdp = mask & strategy_set::BIT_ICDP != 0,
+        xmm = mask & strategy_set::BIT_XMM != 0,
+        hcv = mask & strategy_set::BIT_HCV != 0,
         "strategy-set: composed"
     );
     run_engine_loop(cons, disp, set, obs)
@@ -3510,7 +4066,7 @@ pub struct RegimeBoot {
 }
 
 /// RG8: the coded members the `[labels] require` law covers — the ones
-/// that carry their OWN signal (slots 0–3 + icdp). `ai-exec` (slot 4) is
+/// that carry their OWN signal (slots 0–3 + xmm, slot 6). `ai-exec` (slot 4) is
 /// exempt: it carries the worker's intent lanes, which gate themselves
 /// through `regime_allows()` (their `REGIME_LABEL`); the vm (slot 5) is
 /// held to the law upstream — every row of a staged table must be
@@ -3520,7 +4076,7 @@ const REQUIRE_LABEL_SLOTS: [u8; 5] = [
     strategy_set::SLOT_VRP,
     strategy_set::SLOT_XSD,
     strategy_set::SLOT_BIN15,
-    strategy_set::SLOT_ICDP,
+    strategy_set::SLOT_XMM,
 ];
 
 /// RG8: the first enabled, label-required slot whose label set is ANY —
@@ -3638,6 +4194,11 @@ impl Observability {
             let ingress_hl_families_dormant = reg
                 .register_gauge("engine_ingress_hyperliquid_families_dormant")
                 .map_err(|_| "register engine_ingress_hyperliquid_families_dormant")?;
+            // BIN15 O8: outcome legs' one-sided `bbo` pushes, dropped by
+            // policy — their own count, out of `parse_errors_total`.
+            let ingress_hl_outcome_bbo_one_sided = reg
+                .register_gauge("engine_ingress_hyperliquid_outcome_bbo_one_sided_total")
+                .map_err(|_| "register engine_ingress_hyperliquid_outcome_bbo_one_sided_total")?;
             let ingress_bybit_state = reg
                 .register_gauge("engine_ingress_bybit_state")
                 .map_err(|_| "register engine_ingress_bybit_state")?;
@@ -3650,6 +4211,9 @@ impl Observability {
             let ingress_hyperevm_state = reg
                 .register_gauge("engine_ingress_hyperevm_state")
                 .map_err(|_| "register engine_ingress_hyperevm_state")?;
+            let ingress_hypercall_state = reg
+                .register_gauge("engine_ingress_hypercall_state")
+                .map_err(|_| "register engine_ingress_hypercall_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
@@ -3679,6 +4243,8 @@ impl Observability {
                     .map_err(|_| "register engine_ingress_mexc_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_hyperevm_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_hyperevm_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_hypercall_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_hypercall_last_tick_age_seconds")?,
             ];
             // T1(c) / F12: age of the newest launchd restart-lane
             // slot stamp — the restart lane failing silently for 28 h
@@ -3726,6 +4292,7 @@ impl Observability {
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
             let ingress_mexc = register_ingress_counters(&mut reg, "mexc")?;
             let ingress_hyperevm = register_ingress_counters(&mut reg, "hyperevm")?;
+            let ingress_hypercall = register_ingress_counters(&mut reg, "hypercall")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -3743,6 +4310,7 @@ impl Observability {
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
             let capture_mexc = register_capture_gauges(&mut reg, "mexc")?;
             let capture_hyperevm = register_capture_gauges(&mut reg, "hyperevm")?;
+            let capture_hypercall = register_capture_gauges(&mut reg, "hypercall")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -3754,6 +4322,7 @@ impl Observability {
             let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
             let coverage_bybit = register_coverage_gauge(&mut reg, "bybit")?;
             let coverage_mexc = register_coverage_gauge(&mut reg, "mexc")?;
+            let coverage_hypercall = register_coverage_gauge(&mut reg, "hypercall")?;
             // M2.1/M2.2: how many capped-chain option instruments
             // this boot selected + subscribed (0 = options lane off).
             let deribit_options_selected = reg
@@ -3765,6 +4334,12 @@ impl Observability {
             let binance_options_selected = reg
                 .register_gauge("engine_ingress_binance_options_selected")
                 .map_err(|_| "register engine_ingress_binance_options_selected")?;
+            let hypercall_options_selected = reg
+                .register_gauge("engine_ingress_hypercall_options_selected")
+                .map_err(|_| "register engine_ingress_hypercall_options_selected")?;
+            // HC5: the venue's own family (the slow-consumer law, quote
+            // shapes, the poller) — gauges mirrored from its atomics.
+            let hypercall = register_hypercall_metrics(&mut reg)?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -3779,13 +4354,15 @@ impl Observability {
                 .register_gauge("engine_strategy_enabled_mask")
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
-            let icdp = register_icdp_metrics(&mut reg)?;
+            let xmm = register_xmm_metrics(&mut reg)?;
+            let hcv = register_hcv_metrics(&mut reg)?;
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
             let hyparb = register_hyparb_metrics(&mut reg)?;
             let hyparb_evm = register_hyparb_evm_metrics(&mut reg)?;
             let regime = register_regime_metrics(&mut reg)?;
+            let har = register_har_metrics(&mut reg)?;
             let paper_matcher = register_paper_matcher_metrics(&mut reg)?;
             // E1: only when a router is actually in force. A boot with
             // no `--exec` reports `configured == 0` here and registers
@@ -3838,10 +4415,12 @@ impl Observability {
                 ingress_hl_rolls_ignored,
                 ingress_hl_family_ack_timeouts,
                 ingress_hl_families_dormant,
+                ingress_hl_outcome_bbo_one_sided,
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_mexc_state,
                 ingress_hyperevm_state,
+                ingress_hypercall_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -3855,6 +4434,7 @@ impl Observability {
                 ingress_rpc,
                 ingress_mexc,
                 ingress_hyperevm,
+                ingress_hypercall,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -3864,6 +4444,7 @@ impl Observability {
                 capture_rpc,
                 capture_mexc,
                 capture_hyperevm,
+                capture_hypercall,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
@@ -3871,22 +4452,27 @@ impl Observability {
                 coverage_binance,
                 coverage_bybit,
                 coverage_mexc,
+                coverage_hypercall,
                 deribit_options_selected,
                 okx_options_selected,
                 binance_options_selected,
+                hypercall_options_selected,
+                hypercall,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
                 orders_capture,
                 strategy_enabled_mask,
                 vm,
-                icdp,
+                xmm,
+                hcv,
                 vrp,
                 xsd,
                 bin15,
                 hyparb,
                 hyparb_evm,
                 regime,
+                har,
                 paper_matcher,
                 exec,
             });
@@ -3905,8 +4491,9 @@ impl Observability {
 /// byte — the venue defaults (`VenueId::default_stale_after_ms`,
 /// docs/venue-time-capture-plan.md §2 doctrine 4) overridden by
 /// repeatable `--stale-after-ms <venue>:<ms>` specs (labels as the
-/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`). A
-/// zero disables the judgement for that venue (nothing is ever stale).
+/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`/
+/// `hyperevm`/`hypercall`). A zero disables the judgement for that
+/// venue (nothing is ever stale).
 pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; core_types::VENUE_COUNT], String> {
     let mut table = VenueId::stale_after_ms_defaults();
     for spec in specs {
@@ -3945,6 +4532,7 @@ fn register_ingress_counters(
         sub_drops: one("sub_drops")?,
         event_ring_drops: one("event_ring_drops")?,
         depth_ring_drops: one("depth_ring_drops")?,
+        trade_ring_drops: one("trade_ring_drops")?,
         stale_ticks: one("stale_ticks")?,
         seq_regressions: one("seq_regressions")?,
         feed_delay_ema_ms: reg
@@ -4037,6 +4625,34 @@ pub struct Observability {
     /// XSD-3: where and how the xsd member's positions are persisted.
     /// `None` = no xsd member is configured. Set by the set builder.
     pub xsd_state: Option<XsdStateSink>,
+    /// HAR H3.4: `state-<NAME>.tsv` per long-tenor series, in the set's
+    /// order. Empty = no HAR service, and the engine writes nothing. Set
+    /// by the set builder from the boot bundle.
+    pub har_state_paths: Vec<std::path::PathBuf>,
+    /// HAR H3.7: the thread that renders and writes those files — each
+    /// series' state handed to it at its day close through the set's
+    /// outbox. `None` (no HAR service, or its spawn failed) = the engine
+    /// loop writes them itself (the pre-H3.7 path). **Taken** by the
+    /// engine loop, stopped and joined before its shutdown write.
+    pub har_writer: Option<crate::persist::StateWriter>,
+    /// HC11: slot 7's calendar reader (`hcv-events`) — it hands the
+    /// member each new `scheduled-events.json` through the mailbox the
+    /// set builder installed. Stopped and joined when this drops, at the
+    /// loop's end. `None` = no hcv member (or its spawn failed).
+    pub hcv_events: Option<crate::hcv_boot::HcvEventsReader>,
+    /// HC11b: where slot 7's book is written — `None` = no hcv member, and
+    /// the engine writes nothing. Set by the set builder from the boot.
+    pub hcv_state_path: Option<std::path::PathBuf>,
+    /// HC11b: the thread that renders and writes that book — handed to it
+    /// by the member at its timer. **Taken** by the engine loop, stopped and
+    /// joined before the shutdown's forced write.
+    pub hcv_writer: Option<crate::persist::StateWriter>,
+    /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
+    /// (all-zero: no HAR service) — `/state.har.hash`.
+    pub har_hash: [u8; 32],
+    /// HAR H3.5: series the file named that the boot dropped (a feed the
+    /// boot universe does not carry) — `/state.har.dropped`.
+    pub har_dropped: u32,
     /// HYPARB H8: the testnet write path's tap (`mode = "testnet"`
     /// only) — **taken** by the engine loop, drained once per report
     /// period (O-H12: each paper AMM decision is shadowed on chain 998).
@@ -4154,6 +4770,8 @@ pub struct EngineCounters {
     pub ingress_hl_family_ack_timeouts: core_metrics::GaugeId,
     /// BIN15 O2: `engine_ingress_hyperliquid_families_dormant` (gauge).
     pub ingress_hl_families_dormant: core_metrics::GaugeId,
+    /// BIN15 O8: `engine_ingress_hyperliquid_outcome_bbo_one_sided_total`.
+    pub ingress_hl_outcome_bbo_one_sided: core_metrics::GaugeId,
     /// WS9: per-ingress state gauge, Bybit v5 public WS.
     pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
@@ -4162,10 +4780,13 @@ pub struct EngineCounters {
     pub ingress_mexc_state: core_metrics::GaugeId,
     /// HYPARB H3b: per-ingress state gauge, HyperEVM pool events.
     pub ingress_hyperevm_state: core_metrics::GaugeId,
+    /// HC5: per-ingress state gauge, Hypercall public WS.
+    pub ingress_hypercall_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
     /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc,
-    /// hyperevm (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
+    /// hyperevm, hypercall (the `SNAPSHOT_VENUES` / `ingress_lanes`
+    /// order).
     pub ingress_last_tick_age: [core_metrics::GaugeId; SNAPSHOT_VENUES],
     /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
     /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
@@ -4196,6 +4817,8 @@ pub struct EngineCounters {
     pub ingress_mexc: IngressCounterIds,
     /// HYPARB H3b: §6.4 counters, HyperEVM pool events.
     pub ingress_hyperevm: IngressCounterIds,
+    /// HC5: §6.4 loss-accounting counters, Hypercall thread.
+    pub ingress_hypercall: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -4214,6 +4837,9 @@ pub struct EngineCounters {
     pub capture_mexc: CaptureGaugeIds,
     /// HYPARB H3b: capture-health gauges, HyperEVM.
     pub capture_hyperevm: CaptureGaugeIds,
+    /// HC5: capture-health gauges, Hypercall (its REST rows included —
+    /// the ingress thread writes them).
+    pub capture_hypercall: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -4229,6 +4855,10 @@ pub struct EngineCounters {
     /// M2.4: same for the Binance eapi lane
     /// (`engine_ingress_binance_options_selected`).
     pub binance_options_selected: GaugeId,
+    /// HC5: same for Hypercall (`engine_ingress_hypercall_options_selected`).
+    pub hypercall_options_selected: GaugeId,
+    /// HC5: the Hypercall venue family ([`register_hypercall_metrics`]).
+    pub hypercall: HcMetricIds,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -4241,6 +4871,9 @@ pub struct EngineCounters {
     /// MX6: boot-discovery coverage gauge, MEXC exchangeInfo +
     /// contract/detail audit (0 when the `[mexc]` section is empty).
     pub coverage_mexc: GaugeId,
+    /// HC5: boot-discovery coverage gauge, Hypercall `/markets`
+    /// (configured underlyings; 0 when `[hypercall]` is off).
+    pub coverage_hypercall: GaugeId,
     /// Phase-8f AI ingress family (`engine_ingress_ai_*` + the engine
     /// drain-site counter + heartbeat-age gauge).
     pub ingress_ai: AiIngressCounterIds,
@@ -4264,8 +4897,11 @@ pub struct EngineCounters {
     /// Phase-8g §9 vm-member family (`engine_vm_*`), mirrored
     /// centrally on the 5 s cadence.
     pub vm: VmMetricIds,
-    /// ICDP I4: the `engine_icdp_*_total` family (slot 6).
-    pub icdp: IcdpMetricIds,
+    /// XMM XH3: the `engine_xmm_*` family (slot 6; it replaced the
+    /// retired `engine_icdp_*_total` family).
+    pub xmm: XmmMetricIds,
+    /// HC11: the `engine_hcv_*` family (slot 7).
+    pub hcv: HcvMetricIds,
     /// VRP V7: the `engine_vrp_*` family (slot 1).
     pub vrp: VrpMetricIds,
     /// XSD-3: the `engine_xsd_*` family (slot 2).
@@ -4278,6 +4914,8 @@ pub struct EngineCounters {
     pub hyparb_evm: HyparbEvmMetricIds,
     /// RG2: the `engine_regime_*` family.
     pub regime: RegimeMetricIds,
+    /// HAR H3.5: the `engine_har_*` gauges.
+    pub har: HarMetricIds,
     /// X1: the `engine_paper_matcher_*` family + the set's
     /// `engine_set_fills_unrouted_total`.
     pub paper_matcher: PaperMatcherMetricIds,
@@ -4483,6 +5121,10 @@ pub struct IngressCounterIds {
     /// WS10-B: depth-lane pushes refused by a full ring
     /// (`engine_ingress_<venue>_depth_ring_drops_total`).
     pub depth_ring_drops: core_metrics::CounterId,
+    /// XMM XH1: trade-lane pushes refused by a full ring
+    /// (`engine_ingress_<venue>_trade_ring_drops_total`; the print is
+    /// still captured).
+    pub trade_ring_drops: core_metrics::CounterId,
     /// VT2: ticks the ingress judged stale
     /// (`engine_ingress_<venue>_stale_ticks_total`).
     pub stale_ticks: core_metrics::CounterId,
@@ -5050,6 +5692,14 @@ pub struct PaperMatcherMetricIds {
     /// HYPARB H6: `engine_paper_matcher_amm_{fills,canceled,partial,
     /// not_live}_total` — the AMM fill law's verdicts (H2), in that order.
     pub amm: [core_metrics::CounterId; 4],
+    /// XMM XH2: `engine_paper_matcher_queue_{placed,rested,rejected_alo,
+    /// canceled,fills}_total` — the queue law's own tally, in that order —
+    /// and `engine_paper_matcher_order_events_overflow_total` (must stay 0).
+    pub queue: [core_metrics::CounterId; 6],
+    /// XMM XH2: `engine_set_order_events_unrouted_total` — order events
+    /// that reached the set for a slot not enabled or not built, or
+    /// attributed to none. Counted, never fanned out.
+    pub order_events_unrouted: core_metrics::CounterId,
 }
 
 /// Register the paper-matcher family. Boot-only.
@@ -5083,8 +5733,19 @@ fn register_paper_matcher_metrics(
         one("engine_paper_matcher_amm_partial_total")?,
         one("engine_paper_matcher_amm_not_live_total")?,
     ];
+    let queue = [
+        one("engine_paper_matcher_queue_placed_total")?,
+        one("engine_paper_matcher_queue_rested_total")?,
+        one("engine_paper_matcher_queue_rejected_alo_total")?,
+        one("engine_paper_matcher_queue_canceled_total")?,
+        one("engine_paper_matcher_queue_fills_total")?,
+        one("engine_paper_matcher_order_events_overflow_total")?,
+    ];
+    let order_events_unrouted = one("engine_set_order_events_unrouted_total")?;
     Ok(PaperMatcherMetricIds {
         amm,
+        queue,
+        order_events_unrouted,
         intake,
         fills,
         ioc_canceled,
@@ -5430,12 +6091,14 @@ fn mirror_paper_matcher_metrics(
     ids: &PaperMatcherMetricIds,
     cur: clob_dispatcher::MatcherCounters,
     open_orders: usize,
-    fills_unrouted: u64,
+    unrouted: [u64; 2],
     lifecycle: engine::LifecycleCounters,
     last: &mut clob_dispatcher::MatcherCounters,
-    last_unrouted: &mut u64,
+    last_unrouted: &mut [u64; 2],
     last_lifecycle: &mut engine::LifecycleCounters,
 ) {
+    // `unrouted` = [fills, order events] the set could not route.
+    let fills_unrouted = unrouted[0];
     reg.counter(ids.intake)
         .inc(cur.intake.saturating_sub(last.intake));
     reg.counter(ids.fills)
@@ -5451,7 +6114,9 @@ fn mirror_paper_matcher_metrics(
     reg.counter(ids.out_overflow)
         .inc(cur.out_overflow.saturating_sub(last.out_overflow));
     reg.counter(ids.fills_unrouted)
-        .inc(fills_unrouted.saturating_sub(*last_unrouted));
+        .inc(fills_unrouted.saturating_sub(last_unrouted[0]));
+    reg.counter(ids.order_events_unrouted)
+        .inc(unrouted[1].saturating_sub(last_unrouted[1]));
     reg.counter(ids.cancels)
         .inc(cur.cancels.saturating_sub(last.cancels));
     reg.counter(ids.modifies)
@@ -5471,6 +6136,19 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.amm_partial.saturating_sub(last.amm_partial));
     reg.counter(ids.amm[3])
         .inc(cur.amm_not_live.saturating_sub(last.amm_not_live));
+    // XMM XH2: the queue law's verdicts.
+    reg.counter(ids.queue[0])
+        .inc(cur.queue_placed.saturating_sub(last.queue_placed));
+    reg.counter(ids.queue[1])
+        .inc(cur.queue_rested.saturating_sub(last.queue_rested));
+    reg.counter(ids.queue[2])
+        .inc(cur.queue_rejected_alo.saturating_sub(last.queue_rejected_alo));
+    reg.counter(ids.queue[3])
+        .inc(cur.queue_canceled.saturating_sub(last.queue_canceled));
+    reg.counter(ids.queue[4])
+        .inc(cur.queue_fills.saturating_sub(last.queue_fills));
+    reg.counter(ids.queue[5])
+        .inc(cur.order_events_overflow.saturating_sub(last.order_events_overflow));
     // E5: the engine-level tally, which counts verbs on BOTH arms —
     // the matcher family above sees only the paper one, so a live
     // slot's cancels would otherwise be invisible here.
@@ -5490,7 +6168,7 @@ fn mirror_paper_matcher_metrics(
             .saturating_sub(last_lifecycle.modifies_err));
     reg.gauge(ids.open_orders).set(open_orders as i64);
     *last = cur;
-    *last_unrouted = fills_unrouted;
+    *last_unrouted = unrouted;
     *last_lifecycle = lifecycle;
 }
 
@@ -5531,7 +6209,7 @@ fn write_vrp_state_if_changed<S: strategy_core::StrategyCounters>(
 /// F18: a failing state write repeats every 5 s for as long as the
 /// cause lasts — a full disk lasts hours. One line a minute per writer
 /// says the same thing and leaves the log readable.
-fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
+pub(crate) fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
     const STATE_WARN_PERIOD_NS: u64 = 60_000_000_000;
     if *last_warn_ns != 0 && now.saturating_sub(*last_warn_ns) < STATE_WARN_PERIOD_NS {
         return;
@@ -5626,110 +6304,278 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
 }
 
 // ---------------------------------------------------------------
-// ICDP I4 — slot-6 observability (5 s mirror, cold path)
+// XMM XH3 — slot-6 observability (5 s mirror, cold path)
 // ---------------------------------------------------------------
 
-/// Registry handles for the ICDP family (`engine_icdp_*_total`),
-/// mirrored like the vm family through the `StrategyCounters`
-/// default accessor `icdp_counters` (zeros on every boot without a
-/// configured slot-6 member).
-#[derive(Copy, Clone, Debug)]
-pub struct IcdpMetricIds {
-    /// `engine_icdp_decisions_total`
-    pub decisions: core_metrics::CounterId,
-    /// `engine_icdp_signals_total`
-    pub signals: core_metrics::CounterId,
-    /// `engine_icdp_intents_total`
-    pub intents: core_metrics::CounterId,
-    /// `engine_icdp_exits_total`
-    pub exits: core_metrics::CounterId,
-    /// `engine_icdp_exit_on_stale_total`
-    pub exit_on_stale: core_metrics::CounterId,
-    /// `engine_icdp_skipped_spread_total`
-    pub skipped_spread: core_metrics::CounterId,
-    /// `engine_icdp_skipped_stale_open_total`
-    pub skipped_stale_open: core_metrics::CounterId,
-    /// `engine_icdp_skipped_stale_dec_total`
-    pub skipped_stale_dec: core_metrics::CounterId,
-    /// `engine_icdp_skipped_prev_total`
-    pub skipped_prev: core_metrics::CounterId,
-    /// `engine_icdp_late_bars_total`
-    pub late_bars: core_metrics::CounterId,
-    /// `engine_icdp_caps_rejected_total`
-    pub caps_rejected: core_metrics::CounterId,
-    /// `engine_icdp_rolls_total`
-    pub rolls: core_metrics::CounterId,
-    /// `engine_icdp_regime_blocked_total` (RG2)
-    pub regime_blocked: core_metrics::CounterId,
-    /// `engine_icdp_regime_exits_total` (RG2)
-    pub regime_exits: core_metrics::CounterId,
+/// XMM XH3: perps carried by the per-perp gauges (the first N
+/// configured; `/state` carries all eight).
+pub const XMM_METRIC_PERPS: usize = 4;
+
+/// The counter rows of the xmm family, in [`xmm_counter_values`] order
+/// — which is what pins the two together.
+const XMM_COUNTER_NAMES: [&str; 17] = [
+    "engine_xmm_placed_total",
+    "engine_xmm_modifies_total",
+    "engine_xmm_lead_cancels_total",
+    "engine_xmm_requote_cancels_total",
+    "engine_xmm_pull_cancels_total",
+    "engine_xmm_expiry_cancels_total",
+    "engine_xmm_gated_total",
+    "engine_xmm_gate_overflow_total",
+    "engine_xmm_capped_total",
+    "engine_xmm_rejected_alo_total",
+    "engine_xmm_rejected_other_total",
+    "engine_xmm_canceled_total",
+    "engine_xmm_filled_total",
+    "engine_xmm_fills_total",
+    "engine_xmm_unmatched_total",
+    "engine_xmm_ctx_refused_total",
+    "engine_xmm_stuck_total",
+];
+
+/// `XmmCounters`' fields in [`XMM_COUNTER_NAMES`] order.
+// COPY: [u64; 17] (136 B) returned by value — cold, the 5 s /metrics
+// mirror; the fields are visited once in the name order — a borrowed
+// view would need the struct to be an array, which the POD is not.
+fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; 17] {
+    [
+        c.placed,
+        c.modifies,
+        c.lead_cancels,
+        c.requote_cancels,
+        c.pull_cancels,
+        c.expiry_cancels,
+        c.gated,
+        c.gate_overflow,
+        c.capped,
+        c.rejected_alo,
+        c.rejected_other,
+        c.canceled,
+        c.filled,
+        c.fills,
+        c.unmatched,
+        c.ctx_refused,
+        c.stuck,
+    ]
 }
 
-/// Register the ICDP family. Boot-only.
-fn register_icdp_metrics(
+/// XMM XH3: the `engine_xmm_*` family (slot 6) — what the member did
+/// (the XH3 bar reads `stuck`, the pulls by reason and the requote
+/// rate from here), how many perps it quotes, and each perp's position.
+#[derive(Copy, Clone, Debug)]
+pub struct XmmMetricIds {
+    /// The counters, in [`XMM_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 17],
+    /// `engine_xmm_perps` — perps configured (0 = the member is off).
+    pub perps: core_metrics::GaugeId,
+    /// `engine_xmm_p{k}_pos_1e6` — the signed position on the k-th
+    /// configured perp, base × 1e6.
+    pub pos: [core_metrics::GaugeId; XMM_METRIC_PERPS],
+}
+
+/// Register the xmm family. Boot-only.
+fn register_xmm_metrics(
     reg: &mut core_metrics::MetricsRegistry,
-) -> Result<IcdpMetricIds, &'static str> {
-    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
-        reg.register_counter(name)
-            .map_err(|_| "register icdp counter")
-    };
-    Ok(IcdpMetricIds {
-        decisions: one("engine_icdp_decisions_total")?,
-        signals: one("engine_icdp_signals_total")?,
-        intents: one("engine_icdp_intents_total")?,
-        exits: one("engine_icdp_exits_total")?,
-        exit_on_stale: one("engine_icdp_exit_on_stale_total")?,
-        skipped_spread: one("engine_icdp_skipped_spread_total")?,
-        skipped_stale_open: one("engine_icdp_skipped_stale_open_total")?,
-        skipped_stale_dec: one("engine_icdp_skipped_stale_dec_total")?,
-        skipped_prev: one("engine_icdp_skipped_prev_total")?,
-        late_bars: one("engine_icdp_late_bars_total")?,
-        caps_rejected: one("engine_icdp_caps_rejected_total")?,
-        rolls: one("engine_icdp_rolls_total")?,
-        regime_blocked: one("engine_icdp_regime_blocked_total")?,
-        regime_exits: one("engine_icdp_regime_exits_total")?,
+) -> Result<XmmMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 17];
+    let mut i = 0usize;
+    while i < XMM_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(XMM_COUNTER_NAMES[i])
+            .map_err(|_| "register xmm counter")?;
+        i += 1;
+    }
+    let perps = reg
+        .register_gauge("engine_xmm_perps")
+        .map_err(|_| "register xmm gauge")?;
+    let mut pos = [core_metrics::GaugeId::default(); XMM_METRIC_PERPS];
+    let mut k = 0usize;
+    while k < XMM_METRIC_PERPS {
+        pos[k] = reg
+            .register_gauge(&format!("engine_xmm_p{k}_pos_1e6"))
+            .map_err(|_| "register xmm gauge")?;
+        k += 1;
+    }
+    Ok(XmmMetricIds {
+        counters,
+        perps,
+        pos,
     })
 }
 
-/// Mirror the ICDP family as monotonic deltas of the cumulative
-/// strategy counters. 5 s cadence — cold path.
-fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
+/// Mirror the xmm family: the counters as monotonic deltas of the
+/// member's cumulative ones, the gauges as levels. 5 s cadence — cold
+/// path (the perp rows are read into a stack buffer, never allocated).
+fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
     reg: &core_metrics::MetricsRegistry,
-    ids: &IcdpMetricIds,
+    ids: &XmmMetricIds,
     strat: &S,
-    last: &mut strategy_core::IcdpCounters,
+    last: &mut strategy_core::XmmCounters,
 ) {
-    let cur = strat.icdp_counters();
-    reg.counter(ids.decisions)
-        .inc(cur.decisions.saturating_sub(last.decisions));
-    reg.counter(ids.signals)
-        .inc(cur.signals.saturating_sub(last.signals));
-    reg.counter(ids.intents)
-        .inc(cur.intents.saturating_sub(last.intents));
-    reg.counter(ids.exits)
-        .inc(cur.exits.saturating_sub(last.exits));
-    reg.counter(ids.exit_on_stale)
-        .inc(cur.exit_on_stale.saturating_sub(last.exit_on_stale));
-    reg.counter(ids.skipped_spread)
-        .inc(cur.skipped_spread.saturating_sub(last.skipped_spread));
-    reg.counter(ids.skipped_stale_open).inc(
-        cur.skipped_stale_open
-            .saturating_sub(last.skipped_stale_open),
-    );
-    reg.counter(ids.skipped_stale_dec)
-        .inc(cur.skipped_stale_dec.saturating_sub(last.skipped_stale_dec));
-    reg.counter(ids.skipped_prev)
-        .inc(cur.skipped_prev.saturating_sub(last.skipped_prev));
-    reg.counter(ids.late_bars)
-        .inc(cur.late_bars.saturating_sub(last.late_bars));
-    reg.counter(ids.caps_rejected)
-        .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
-    reg.counter(ids.rolls)
-        .inc(cur.rolls.saturating_sub(last.rolls));
-    reg.counter(ids.regime_blocked)
-        .inc(cur.regime_blocked.saturating_sub(last.regime_blocked));
-    reg.counter(ids.regime_exits)
-        .inc(cur.regime_exits.saturating_sub(last.regime_exits));
+    // COPY: the 136 B `XmmCounters` read into `cur`, then kept as the
+    // next delta's baseline (`*last = cur`) — 5 s cadence, cold; a delta
+    // needs the previous value, so one copy survives either way.
+    let mut cur = strategy_core::XmmCounters::default();
+    strat.xmm_counters(&mut cur);
+    let c = xmm_counter_values(&cur);
+    let l = xmm_counter_values(last);
+    let mut i = 0usize;
+    while i < c.len() {
+        reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
+        i += 1;
+    }
+    // COPY: 136 B — the next delta's baseline (see above).
+    *last = cur;
+    let mut rows = [strategy_core::XmmPerpView::default(); XMM_METRIC_PERPS];
+    let n = strat.xmm_perps_view(&mut rows);
+    reg.gauge(ids.perps).set(i64::from(n));
+    let mut k = 0usize;
+    while k < XMM_METRIC_PERPS {
+        reg.gauge(ids.pos[k]).set(if (k as u32) < n { rows[k].pos_1e6 } else { 0 });
+        k += 1;
+    }
+}
+
+// ---------------------------------------------------------------
+// HC11 — slot-7 observability (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// The counter rows of the hcv family, in [`hcv_counter_values`] order
+/// — which is what pins the two together.
+const HCV_COUNTER_NAMES: [&str; 18] = [
+    "engine_hcv_judged_total",
+    "engine_hcv_sells_total",
+    "engine_hcv_buys_total",
+    "engine_hcv_option_fills_total",
+    "engine_hcv_hedges_total",
+    "engine_hcv_hedge_fills_total",
+    "engine_hcv_unwind_slices_total",
+    "engine_hcv_settlements_total",
+    "engine_hcv_settle_fallbacks_total",
+    "engine_hcv_skip_event_total",
+    "engine_hcv_skip_stale_total",
+    "engine_hcv_skip_forecast_total",
+    "engine_hcv_skip_caps_total",
+    "engine_hcv_skip_stopped_total",
+    "engine_hcv_ctx_refused_total",
+    "engine_hcv_calendars_total",
+    "engine_hcv_har_updates_total",
+    "engine_hcv_restored_total",
+];
+
+/// The gauge rows of the hcv family, in [`hcv_gauge_values`] order.
+const HCV_GAUGE_NAMES: [&str; 7] = [
+    "engine_hcv_positions",
+    "engine_hcv_vega_abs_usd_1e6",
+    "engine_hcv_pnl_usd_1e6",
+    "engine_hcv_day_pnl_usd_1e6",
+    "engine_hcv_orphans",
+    "engine_hcv_book_stale",
+    "engine_hcv_marks_unknown",
+];
+
+/// `HcvCounters`' counter fields in [`HCV_COUNTER_NAMES`] order.
+// COPY: [u64; 18] (144 B) returned by value — cold, the 5 s /metrics
+// mirror; the xmm precedent (the POD is a struct, not an array).
+fn hcv_counter_values(c: &strategy_core::HcvCounters) -> [u64; 18] {
+    [
+        c.judged,
+        c.sells,
+        c.buys,
+        c.option_fills,
+        c.hedges,
+        c.hedge_fills,
+        c.unwind_slices,
+        c.settlements,
+        c.settle_fallbacks,
+        c.skip_event,
+        c.skip_stale,
+        c.skip_forecast,
+        c.skip_caps,
+        c.skip_stopped,
+        c.ctx_refused,
+        c.calendars,
+        c.har_updates,
+        c.restored,
+    ]
+}
+
+/// `HcvCounters`' gauge fields in [`HCV_GAUGE_NAMES`] order.
+fn hcv_gauge_values(c: &strategy_core::HcvCounters) -> [i64; 7] {
+    [
+        c.positions,
+        c.vega_abs_usd_1e6,
+        c.pnl_usd_1e6,
+        c.day_pnl_usd_1e6,
+        c.orphans,
+        c.book_stale,
+        c.marks_unknown,
+    ]
+}
+
+/// HC11: the `engine_hcv_*` family (slot 7) — what the member judged,
+/// did and skipped (by cause), and its book: positions, |vega|, the
+/// marked P&L and the day's; since HC11b what the boot restored, the
+/// orphans it carries, whether its file is behind the book, and how many
+/// held underlyings still wait for a mark.
+#[derive(Copy, Clone, Debug)]
+pub struct HcvMetricIds {
+    /// The counters, in [`HCV_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 18],
+    /// The gauges, in [`HCV_GAUGE_NAMES`] order.
+    pub gauges: [core_metrics::GaugeId; 7],
+}
+
+/// Register the hcv family. Boot-only.
+fn register_hcv_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HcvMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 18];
+    let mut i = 0usize;
+    while i < HCV_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(HCV_COUNTER_NAMES[i])
+            .map_err(|_| "register hcv counter")?;
+        i += 1;
+    }
+    let mut gauges = [core_metrics::GaugeId::default(); 7];
+    let mut k = 0usize;
+    while k < HCV_GAUGE_NAMES.len() {
+        gauges[k] = reg
+            .register_gauge(HCV_GAUGE_NAMES[k])
+            .map_err(|_| "register hcv gauge")?;
+        k += 1;
+    }
+    Ok(HcvMetricIds { counters, gauges })
+}
+
+/// Mirror the hcv family: the counters as monotonic deltas of the
+/// member's cumulative ones, the gauges as levels. 5 s cadence — cold.
+fn mirror_hcv_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HcvMetricIds,
+    strat: &S,
+    last: &mut strategy_core::HcvCounters,
+) {
+    // COPY: the 200 B `HcvCounters` read into `cur`, then kept as the
+    // next delta's baseline — 5 s cadence, cold; a delta needs the
+    // previous value (the xmm precedent).
+    let mut cur = strategy_core::HcvCounters::default();
+    strat.hcv_counters(&mut cur);
+    let c = hcv_counter_values(&cur);
+    let l = hcv_counter_values(last);
+    let mut i = 0usize;
+    while i < c.len() {
+        reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
+        i += 1;
+    }
+    let g = hcv_gauge_values(&cur);
+    let mut k = 0usize;
+    while k < g.len() {
+        reg.gauge(ids.gauges[k]).set(g[k]);
+        k += 1;
+    }
+    // COPY: 200 B — the next delta's baseline (see above).
     *last = cur;
 }
 
@@ -6643,6 +7489,36 @@ fn write_xsd_state_if_changed<S: strategy_core::StrategyCounters>(
     }
 }
 
+/// HAR H3.4: rewrite each long-tenor series' `state-<NAME>.tsv` whose
+/// epoch moved — one file per series, so a day close writes one engine's
+/// rows (~350 KiB for a fitted series), never all twelve. `force` (the
+/// shutdown drain) writes every series: its open day moves the state
+/// without moving the epoch. A failed write is logged, never fatal.
+fn write_har_state<S: strategy_core::StrategyCounters>(
+    paths: &[std::path::PathBuf],
+    strat: &S,
+    written: &mut [u64; core_vol::LONG_SET_MAX],
+    buf: &mut String,
+    last_warn_ns: &mut u64,
+    now: u64,
+    force: bool,
+) {
+    let n = strategy_core::StrategyCounters::har_series(strat).min(paths.len());
+    let mut i = 0usize;
+    while i < n && i < core_vol::LONG_SET_MAX {
+        let epoch = strategy_core::StrategyCounters::har_series_epoch(strat, i);
+        if (force || epoch != written[i])
+            && strategy_core::StrategyCounters::render_har_series(strat, i, buf)
+        {
+            match crate::state_file::write_atomic(&paths[i], buf) {
+                Ok(()) => written[i] = epoch,
+                Err(reason) => warn_state_write("har", &reason, last_warn_ns, now),
+            }
+        }
+        i += 1;
+    }
+}
+
 // ---------------------------------------------------------------
 // RG2: the `engine_regime_*` family (plan §4.9)
 // ---------------------------------------------------------------
@@ -6796,6 +7672,61 @@ fn mirror_regime_metrics<S: strategy_core::StrategyCounters>(
 }
 
 // ---------------------------------------------------------------
+// HAR H3.5: the `engine_har_*` gauges
+// ---------------------------------------------------------------
+
+/// Registry handles of the long-tenor HAR gauges. Always registered (the
+/// regime family's precedent): a boot without `har.toml` reports
+/// `engine_har_series_configured 0` and nothing else moves.
+#[derive(Copy, Clone, Debug)]
+pub struct HarMetricIds {
+    /// `engine_har_series_configured` — series the set runs.
+    pub configured: GaugeId,
+    /// `engine_har_series_warm` — series whose fold forecasts.
+    pub warm: GaugeId,
+    /// `engine_har_day_age_max_s` — the stalest series: whole seconds since
+    /// its newest closed day ENDED (−1 = no series has closed a day). Past
+    /// 26 h (93 600 s) a series is not recalibrating.
+    pub day_age_max_s: GaugeId,
+    /// `engine_har_day_close_ns_max` — the costliest UTC day close since
+    /// boot (the engine's close law alone; the stagger pays one a poll).
+    pub day_close_ns_max: GaugeId,
+}
+
+/// Register the HAR gauges. Boot-only.
+fn register_har_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HarMetricIds, &'static str> {
+    let mut gauge = |name: &str| -> Result<GaugeId, &'static str> {
+        reg.register_gauge(name).map_err(|_| "register har gauge")
+    };
+    Ok(HarMetricIds {
+        configured: gauge("engine_har_series_configured")?,
+        warm: gauge("engine_har_series_warm")?,
+        day_age_max_s: gauge("engine_har_day_age_max_s")?,
+        day_close_ns_max: gauge("engine_har_day_close_ns_max")?,
+    })
+}
+
+/// Mirror the HAR gauges from the set's rows. 5 s cadence — cold path;
+/// the rows land in the caller's boot-allocated scratch.
+fn mirror_har_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HarMetricIds,
+    strat: &S,
+    rows: &mut [strategy_core::HarSeriesView],
+    wall_ms: u64,
+) {
+    let n = strat.har_series_view(rows);
+    // H3.7: one law, `strategy_core::har_gauges` (alloc gate 82 runs it).
+    let g = strategy_core::har_gauges(rows, n, &strat.har_counters(), wall_ms);
+    reg.gauge(ids.configured).set(g.configured);
+    reg.gauge(ids.warm).set(g.warm);
+    reg.gauge(ids.day_age_max_s).set(g.day_age_max_s);
+    reg.gauge(ids.day_close_ns_max).set(g.day_close_ns_max);
+}
+
+// ---------------------------------------------------------------
 // RG6 `/state` snapshot — filled once per second by the engine loop
 // ---------------------------------------------------------------
 
@@ -6843,7 +7774,7 @@ pub fn state_writer(
 
 /// The ingress status slots in the T1(c) / `VENUE_NAMES` order:
 /// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended),
-/// hyperevm (HYPARB H3b, appended).
+/// hyperevm (HYPARB H3b, appended), hypercall (HC5, appended).
 #[inline]
 fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
     [
@@ -6856,6 +7787,7 @@ fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
         &ing.rpc,
         &ing.mexc,
         &ing.hyperevm,
+        &ing.hypercall,
     ]
 }
 
@@ -6903,7 +7835,8 @@ fn fill_snapshot<S, D>(
         .boot
         .boot_wall_ns
         .wrapping_add(now.wrapping_sub(obs.boot.boot_mono_ns));
-    out.boot = obs.boot;
+    // `out.boot` was stored once when the scratch was boxed: the boot
+    // identity never changes, so it is not re-copied every second.
     out.set_strategy_kind(Sc::strategy_kind(strat).as_bytes());
     out.halted = u8::from(Sc::is_halted(strat));
     out.enabled_mask = Sc::enabled_mask(strat) as u8;
@@ -6944,9 +7877,12 @@ fn fill_snapshot<S, D>(
     v.regime_blocked = Sc::vm_regime_blocked(strat);
     v.regime_hard_exits = Sc::vm_regime_hard_exits(strat);
 
-    out.icdp.hash = Sc::icdp_params_hash(strat);
-    out.icdp.instruments = Sc::icdp_instruments(strat);
-    out.icdp.counters = Sc::icdp_counters(strat);
+    // XMM XH3: slot 6 — counters and perp rows from ONE publish instant
+    // (a quote and the touch it was placed against can never disagree).
+    Sc::xmm_counters(strat, &mut out.xmm.counters);
+    out.xmm.n_perps = Sc::xmm_perps_view(strat, &mut out.xmm.perps);
+    // HC11: slot 7's counters and gauges.
+    Sc::hcv_counters(strat, &mut out.hcv.counters);
 
     // P6: slot 1. Both halves come from the same publish instant, so a
     // strike and the position held against it can never disagree.
@@ -6959,6 +7895,13 @@ fn fill_snapshot<S, D>(
     out.hyparb.counters = Sc::hyparb_counters(strat);
     out.hyparb.n_pools = Sc::hyparb_pools_view(strat, &mut out.hyparb.pools);
     out.hyparb.n_coins = Sc::hyparb_coins_view(strat, &mut out.hyparb.coins);
+
+    // HAR H3.5: the long-tenor series — the set's cached rows (rebuilt
+    // at each series' day close) with the minute fields read live.
+    out.har.hash = obs.har_hash;
+    out.har.dropped = obs.har_dropped;
+    out.har.counters = Sc::har_counters(strat);
+    out.har.n = Sc::har_series_view(strat, &mut out.har.series);
 
     // E6 c4: the router's kill switches. Read through the trait, from
     // the same publish instant as everything else, so a halted slot
@@ -7260,6 +8203,110 @@ fn register_coverage_gauge(
         .map_err(|_| "register coverage_configured gauge")
 }
 
+/// HC5: the Hypercall venue family, in [`HC_METRIC_NAMES`] order —
+/// every value is a GAUGE mirrored from the venue's own atomics
+/// (`ingress_hypercall::HcCounters`; the `_total` ones are monotonic by
+/// construction, the BIN15 roll-gauge precedent), so the mirror is a
+/// plain store per value, no delta bookkeeping.
+#[derive(Copy, Clone, Debug)]
+pub struct HcMetricIds {
+    /// One gauge per [`HC_METRIC_NAMES`] entry.
+    pub gauges: [GaugeId; HC_METRICS],
+}
+
+/// Size of the Hypercall family.
+pub const HC_METRICS: usize = 31;
+
+/// The Hypercall family's names — the ORDER is [`hc_metric_values`]'
+/// (pinned by a test). Closes by cause follow `HcCloseCause::ALL`.
+pub const HC_METRIC_NAMES: [&str; HC_METRICS] = [
+    "engine_ingress_hypercall_closes_message_limit_total",
+    "engine_ingress_hypercall_closes_byte_limit_total",
+    "engine_ingress_hypercall_closes_queue_age_total",
+    "engine_ingress_hypercall_closes_write_timeout_total",
+    "engine_ingress_hypercall_closes_slow_other_total",
+    "engine_ingress_hypercall_closes_other_total",
+    "engine_ingress_hypercall_subscribes_total",
+    "engine_ingress_hypercall_one_sided_quotes_total",
+    "engine_ingress_hypercall_empty_quotes_total",
+    "engine_ingress_hypercall_crossed_quotes_total",
+    "engine_ingress_hypercall_provider_quotes_total",
+    "engine_ingress_hypercall_clock_syncs_total",
+    "engine_ingress_hypercall_listings_created_total",
+    "engine_ingress_hypercall_listings_expired_total",
+    "engine_ingress_hypercall_listings_deleted_total",
+    "engine_ingress_hypercall_listings_other_total",
+    "engine_ingress_hypercall_foreign_trades_total",
+    "engine_ingress_hypercall_venue_errors_total",
+    "engine_ingress_hypercall_quote_publish_lag_ms",
+    "engine_ingress_hypercall_quoted_instruments",
+    "engine_ingress_hypercall_providers_max",
+    "engine_ingress_hypercall_index_age_ms",
+    "engine_ingress_hypercall_clock_rtt_ms",
+    "engine_ingress_hypercall_snapshot_requests_total",
+    "engine_ingress_hypercall_rest_polls_ok_total",
+    "engine_ingress_hypercall_rest_polls_err_total",
+    "engine_ingress_hypercall_rest_opt_rows_total",
+    "engine_ingress_hypercall_rest_foreign_rows_total",
+    "engine_ingress_hypercall_rest_snapshots_total",
+    "engine_ingress_hypercall_rest_handoff_drops_total",
+    "engine_ingress_hypercall_rest_last_round_ms",
+];
+
+/// Register the Hypercall family (boot-only).
+fn register_hypercall_metrics(reg: &mut MetricsRegistry) -> Result<HcMetricIds, &'static str> {
+    let mut gauges = [GaugeId::default(); HC_METRICS];
+    let mut i = 0usize;
+    while i < HC_METRICS {
+        gauges[i] = reg
+            .register_gauge(HC_METRIC_NAMES[i])
+            .map_err(|_| "register hypercall gauge")?;
+        i += 1;
+    }
+    Ok(HcMetricIds { gauges })
+}
+
+/// The Hypercall family's current values, in [`HC_METRIC_NAMES`] order.
+/// Relaxed loads — statistics, never a synchronization point.
+#[must_use]
+pub fn hc_metric_values(c: &ingress_hypercall::HcCounters) -> [u64; HC_METRICS] {
+    use ingress_hypercall::counters::get;
+    let (w, r) = (&c.ws, &c.rest);
+    [
+        get(&w.closes[0]),
+        get(&w.closes[1]),
+        get(&w.closes[2]),
+        get(&w.closes[3]),
+        get(&w.closes[4]),
+        get(&w.closes[5]),
+        get(&w.subscribes),
+        get(&w.one_sided_quotes),
+        get(&w.empty_quotes),
+        get(&w.crossed_quotes),
+        get(&w.provider_quotes),
+        get(&w.clock_syncs),
+        get(&w.listings[0]),
+        get(&w.listings[1]),
+        get(&w.listings[2]),
+        get(&w.listings[3]),
+        get(&w.foreign_trades),
+        get(&w.venue_errors),
+        get(&w.quote_publish_lag_ms),
+        get(&w.quoted_instruments),
+        get(&w.providers_max),
+        get(&w.index_age_ms),
+        get(&w.clock_rtt_ms),
+        get(&c.snapshot_req),
+        get(&r.polls_ok),
+        get(&r.polls_err),
+        get(&r.opt_rows),
+        get(&r.foreign_rows),
+        get(&r.snapshots),
+        get(&r.handoff_drops),
+        get(&r.last_round_ms),
+    ]
+}
+
 /// Last-mirrored cumulative values for one ingress — the registry
 /// wants monotonic increments, the status slot exposes cumulative
 /// totals; the delta lives here.
@@ -7276,6 +8323,7 @@ struct IngressCountersSnapshot {
     sub_drops: u64,
     event_ring_drops: u64,
     depth_ring_drops: u64,
+    trade_ring_drops: u64,
     stale_ticks: u64,
     seq_regressions: u64,
 }
@@ -7301,6 +8349,7 @@ fn mirror_ingress_counters(
         sub_drops: st.sub_drops_total(),
         event_ring_drops: st.event_ring_drops_total(),
         depth_ring_drops: st.depth_ring_drops_total(),
+        trade_ring_drops: st.trade_ring_drops_total(),
         stale_ticks: st.stale_ticks_total(),
         seq_regressions: st.seq_regressions_total(),
     };
@@ -7326,6 +8375,8 @@ fn mirror_ingress_counters(
         .inc(cur.event_ring_drops.saturating_sub(last.event_ring_drops));
     reg.counter(ids.depth_ring_drops)
         .inc(cur.depth_ring_drops.saturating_sub(last.depth_ring_drops));
+    reg.counter(ids.trade_ring_drops)
+        .inc(cur.trade_ring_drops.saturating_sub(last.trade_ring_drops));
     reg.counter(ids.stale_ticks)
         .inc(cur.stale_ticks.saturating_sub(last.stale_ticks));
     reg.counter(ids.seq_regressions)
@@ -7352,6 +8403,7 @@ where
         opt_lanes,
         rpc_signal,
         hyperevm_signal,
+        trades,
         fill_lanes,
         ai_cmds,
         ai_status,
@@ -7374,6 +8426,9 @@ where
     // HYPARB H3b: the pool-event lane (empty forever when the HyperEVM
     // ingress is not spawned).
     eng.set_pool_lane(hyperevm_signal);
+    // XMM XH1: the trade lane (empty forever when the Hyperliquid
+    // ingress is not spawned).
+    eng.set_trade_lane(trades);
     // Phase 8f: the fills capture is opened by the bin (per-run
     // capture directory) and rides in via Observability; the engine
     // thread owns it from here.
@@ -7393,19 +8448,22 @@ where
     // RG6: the 1 s `/state` publish gate + the boot-boxed scratch the
     // loop fills before each seqlock copy (one allocation, here).
     let mut next_state = now_ns() + SNAPSHOT_PERIOD_NS;
-    let mut state_scratch: Option<Box<EngineSnapshot>> = obs
-        .state
-        .as_ref()
-        .map(|_| Box::new(EngineSnapshot::empty()));
+    let mut state_scratch: Option<Box<EngineSnapshot>> = obs.state.as_ref().map(|_| {
+        let mut s = Box::new(EngineSnapshot::empty());
+        // The boot identity (416 B since XMM XH3) is fixed for the
+        // process: stored here once, never re-copied per publish.
+        s.boot = obs.boot;
+        s
+    });
     let mut state_seq = 0u64;
     let mut last_ticks = 0u64;
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm) so
-    // registry counters get monotonic deltas. Append-only: existing
-    // indices are load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 9];
+    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm,
+    // hypercall) so registry counters get monotonic deltas. Append-only:
+    // existing indices are load-bearing, new venues go at the end.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 10];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
@@ -7417,8 +8475,10 @@ where
     let mut ai_last = AiCountersSnapshot::default();
     // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
     let mut vm_last = VmCountersSnapshot::default();
-    // ICDP I4 slot-6 family delta snapshot (same bookkeeping).
-    let mut icdp_last = strategy_core::IcdpCounters::default();
+    // XMM XH3 slot-6 family delta snapshot (same bookkeeping).
+    let mut xmm_last = strategy_core::XmmCounters::default();
+    // HC11 slot-7 family delta snapshot (same bookkeeping).
+    let mut hcv_last = strategy_core::HcvCounters::default();
     let mut vrp_last = strategy_core::VrpCounters::default();
     // VRP V8a: the persisted-state writer. The epoch starts at whatever
     // the member came up with, so a boot that changed nothing rewrites
@@ -7448,10 +8508,34 @@ where
         vec![strategy_core::XsdPositionView::default(); strategy_xsd::XSD_MAX_TARGETS];
     let mut vrp_state_warn_ns: u64 = 0;
     let mut xsd_state_warn_ns: u64 = 0;
+    // HAR H3.4: the long-tenor writer's per-series epochs start at the
+    // restore's (a boot that changed nothing rewrites nothing); the buffer
+    // is reused for every series.
+    let har_state_paths = std::mem::take(&mut obs.har_state_paths);
+    // H3.7: with the writer thread running, the loop only hands the states
+    // (the set's outbox, in `on_timer`) and writes none of them until the
+    // shutdown's forced write.
+    let har_writer = obs.har_writer.take();
+    let har_on_loop = har_writer.is_none();
+    // HC11b: slot 7's book writer and path, for the shutdown's forced write
+    // (the member hands every other one to the writer at its timer).
+    let hcv_writer = obs.hcv_writer.take();
+    let hcv_state_path = obs.hcv_state_path.take();
+    let mut har_state_epochs = [0u64; core_vol::LONG_SET_MAX];
+    {
+        let n = strategy_core::StrategyCounters::har_series(eng.strategy());
+        let mut i = 0usize;
+        while i < n && i < core_vol::LONG_SET_MAX {
+            har_state_epochs[i] = strategy_core::StrategyCounters::har_series_epoch(eng.strategy(), i);
+            i += 1;
+        }
+    }
+    let mut har_state_buf = String::new();
+    let mut har_state_warn_ns: u64 = 0;
     // X1: the paper matcher's delta snapshot.
     let mut matcher_last = clob_dispatcher::MatcherCounters::default();
     let mut lifecycle_last = engine::LifecycleCounters::default();
-    let mut fills_unrouted_last: u64 = 0;
+    let mut fills_unrouted_last: [u64; 2] = [0; 2];
     // E1: the router's previous snapshot, for the monotonic deltas.
     let mut exec_last = clob_dispatcher::ExecCounters::default();
     // F18/F21: ONE call site for every member's persisted state, so a
@@ -7478,9 +8562,22 @@ where
                 &mut xsd_state_warn_ns,
                 now_ns(),
             );
+            if har_on_loop {
+                write_har_state(
+                    &har_state_paths,
+                    eng.strategy(),
+                    &mut har_state_epochs,
+                    &mut har_state_buf,
+                    &mut har_state_warn_ns,
+                    now_ns(),
+                    false,
+                );
+            }
         }};
     }
     let mut regime_last = strategy_core::RegimeCounters::default();
+    // HAR H3.5: the gauges' row scratch (boot-allocated, reused).
+    let mut har_rows = [strategy_core::HarSeriesView::default(); strategy_core::HAR_VIEW_SERIES];
     // Periodic HdrHistogram dump cadence. `next_dump_ns` is only
     // consulted when `obs.latency_dump.is_some()`.
     let mut next_dump_ns: u64 = match obs.latency_dump.as_ref() {
@@ -7619,7 +8716,8 @@ where
                 reg.gauge(ids.strategy_enabled_mask)
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
-                mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
+                mirror_xmm_metrics(reg, &ids.xmm, eng.strategy(), &mut xmm_last);
+                mirror_hcv_metrics(reg, &ids.hcv, eng.strategy(), &mut hcv_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
@@ -7644,13 +8742,27 @@ where
                     &ids.paper_matcher,
                     clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
                     clob_dispatcher::OrderDispatch::open_paper_orders(eng.dispatcher()),
-                    strategy_core::StrategyCounters::fills_unrouted(eng.strategy()),
+                    [
+                        strategy_core::StrategyCounters::fills_unrouted(eng.strategy()),
+                        strategy_core::StrategyCounters::order_events_unrouted(eng.strategy()),
+                    ],
                     eng.lifecycle_counters(),
                     &mut matcher_last,
                     &mut fills_unrouted_last,
                     &mut lifecycle_last,
                 );
                 mirror_regime_metrics(reg, &ids.regime, eng.strategy(), &mut regime_last, now);
+                // HAR H3.5: day ages are wall time (UTC days).
+                mirror_har_metrics(
+                    reg,
+                    &ids.har,
+                    eng.strategy(),
+                    &mut har_rows,
+                    obs.boot
+                        .boot_wall_ns
+                        .wrapping_add(now.wrapping_sub(obs.boot.boot_mono_ns))
+                        / 1_000_000,
+                );
                 // E1: the router's own counters. Absent family = no
                 // `--exec` = nothing to mirror, and no branch cost that
                 // a pre-E1 boot did not already pay.
@@ -7682,6 +8794,8 @@ where
                         .set(ing.hl_roll.family_ack_timeouts() as i64);
                     reg.gauge(ids.ingress_hl_families_dormant)
                         .set(ing.hl_roll.families_dormant() as i64);
+                    reg.gauge(ids.ingress_hl_outcome_bbo_one_sided)
+                        .set(ing.hl_roll.outcome_bbo_one_sided() as i64);
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_bybit_state)
@@ -7691,6 +8805,16 @@ where
                         .set(ing.mexc.state() as i64);
                     reg.gauge(ids.ingress_hyperevm_state)
                         .set(ing.hyperevm.state() as i64);
+                    reg.gauge(ids.ingress_hypercall_state)
+                        .set(ing.hypercall.state() as i64);
+                    // HC5: the venue family — plain stores (see
+                    // `HcMetricIds`).
+                    let hc = hc_metric_values(&ing.hc);
+                    let mut k = 0usize;
+                    while k < HC_METRICS {
+                        reg.gauge(ids.hypercall.gauges[k]).set(hc[k] as i64);
+                        k += 1;
+                    }
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
                     // monotonic deltas (D4: ring_drops included).
@@ -7737,6 +8861,12 @@ where
                         &ids.ingress_hyperevm,
                         &ing.hyperevm,
                         &mut ingress_last[8],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_hypercall,
+                        &ing.hypercall,
+                        &mut ingress_last[9],
                     );
 
                     // T1(c): per-venue last-tick age from the stamps
@@ -7848,6 +8978,39 @@ where
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
     eng.stop();
+    // H3.7: the state writer stops and is joined FIRST — a write in flight
+    // and the forced write below must never share a path's temp file. A
+    // state it still held is superseded by that write.
+    if let Some(w) = har_writer {
+        w.shutdown();
+    }
+    // HAR H3.4: after `on_stop` delivered any minute the day-close stagger
+    // still held, every series' state is written UNCONDITIONALLY — its
+    // open day moves the state without moving the epoch.
+    write_har_state(
+        &har_state_paths,
+        eng.strategy(),
+        &mut har_state_epochs,
+        &mut har_state_buf,
+        &mut har_state_warn_ns,
+        now_ns(),
+        true,
+    );
+    // HC11b: slot 7's book, the same way — its writer joined first, then
+    // the live book written UNCONDITIONALLY (an open window's samples since
+    // its last minute move the book without moving the epoch).
+    if let Some(w) = hcv_writer {
+        w.shutdown();
+    }
+    if let Some(path) = hcv_state_path.as_deref() {
+        let mut buf = String::new();
+        if strategy_core::StrategyCounters::render_hcv_state(eng.strategy(), &mut buf) {
+            match crate::state_file::write_atomic(path, &buf) {
+                Ok(()) => tracing::info!(path = %path.display(), "hcv: book written at shutdown"),
+                Err(reason) => tracing::error!(%reason, path = %path.display(), "hcv: the shutdown's book write failed"),
+            }
+        }
+    }
     // S7-L1: what the live arm's shutdown sweep did — every resting
     // order of ours taken off the venue, or how many it could not
     // confirm (`u64::MAX`: the open orders could not be read).
@@ -8049,24 +9212,11 @@ fn new_poll() -> io::Result<(mio::Poll, mio::Events, mio::Token)> {
 
 /// Sleep for the next capped-exponential delay (D8). The schedule
 /// lives in the caller's per-thread [`Backoff`]; a healthy session
-/// resets it (see the spawn loops).
+/// resets it (`core_net::should_reset_backoff`, see the spawn loops).
 fn sleep_backoff(b: &mut Backoff) {
     let delay = Duration::from_nanos(b.next_delay_ns());
     tracing::debug!(?delay, attempt = b.attempt(), "reconnect backoff");
     thread::sleep(delay);
-}
-
-/// T1(b) — the D8 intent, restored (outage 2026-08-27 §5.3): the
-/// reconnect schedule resets only when the session actually MOVED
-/// MARKET DATA (`ticks_total` advanced), or ended in a venue-quiet
-/// idle/staleness trip (inherently rate-limited by the keepalive /
-/// staleness budget, so it cannot hammer). A session that only
-/// received its own subscribe rejection — the exact post-settlement
-/// failure that reconnected at ~1 Hz for 16 h/day — keeps
-/// escalating. One definition for all six venue loops.
-#[inline]
-fn should_reset_backoff(ticks_after: u64, ticks_before: u64, venue_quiet_trip: bool) -> bool {
-    ticks_after > ticks_before || venue_quiet_trip
 }
 
 /// T1(c) (outage 2026-08-27 finding F12): age in seconds of the
@@ -8142,6 +9292,11 @@ fn log_pin_outcome(thread_label: &str, core_id: usize) {
 /// thread spawns, and (OKX only) builds the discovery-gated
 /// [`ingress_okx::OkxSymbolTable`] `build_okx_symbol_table` now
 /// requires.
+///
+/// One exception runs after boot: [`fetch_hl_outcome_specs`](boot_discovery::fetch_hl_outcome_specs),
+/// the Hyperliquid ingress thread's between-session re-read of the
+/// live HIP-4 outcomes (2026-09-26 reconnect-loop fix) — cold,
+/// throttled, to an address resolved at boot, on a short deadline.
 ///
 /// RPC deliberately has no discovery here: Polygon RPC has no
 /// instrument universe to validate against (it streams block headers,
@@ -8280,6 +9435,12 @@ pub mod boot_discovery {
         /// of waiting for the next lifecycle push. Empty when the
         /// venue is off or no row parsed.
         pub hl_outcome_specs: Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
+        /// HC11: `(coin, szDecimals)` of every configured Hyperliquid
+        /// perp whose size decimals the venue stated — a native perp from
+        /// `meta`, a builder-dex perp from its dex's own meta (HC10); a
+        /// builder coin whose dex meta did not load is absent. Slot 7's
+        /// hedge law (lot and price) reads it; empty when HL is off.
+        pub hl_sz_decimals: Vec<(String, u8)>,
         /// Binance coverage (M1 exchangeInfo audit); `None` when the
         /// caller skipped it (legacy flag boots keep their historical
         /// zero-REST Binance behavior — config boots audit).
@@ -8305,6 +9466,17 @@ pub mod boot_discovery {
         /// per LIVE configured perp, in `[mexc] perp` order — the
         /// Funding events' `v1` clock. Empty when no perp is live.
         pub mexc_funding: Vec<(String, ingress_mexc::discovery::MexcFundingSeed)>,
+        /// HC4: Hypercall coverage — `configured` underlyings,
+        /// `matched` = those that selected a chain, `universe` = the
+        /// candidate rows `/markets` listed for them. `None` when
+        /// `[hypercall]` is off.
+        pub hypercall: Option<VenueCoverage>,
+        /// HC4: the selected Hypercall capped chain (O-HC2), in the
+        /// DETERMINISTIC allocation order (underlyings in config order;
+        /// per underlying: expiry asc → strike asc → call before put;
+        /// ordinals from [`OPT_ORDINAL_BASE`]) with the venue's own
+        /// terms. Empty when the lane is off.
+        pub hypercall_options: Vec<super::DiscoveredOption>,
     }
 
     // -----------------------------------------------------------
@@ -8885,6 +10057,57 @@ pub mod boot_discovery {
         Ok(out)
     }
 
+    /// The `/info` body that lists every live HIP-4 outcome.
+    const HL_OUTCOME_META_REQ: &[u8] = br#"{"type":"outcomeMeta"}"#;
+
+    /// Deadline for the between-session re-read: the ingress thread
+    /// waits on it with the lane dark, so it is kept far below the
+    /// boot's [`FETCH_TIMEOUT`].
+    const REDISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// The live HIP-4 outcome specs, re-read from
+    /// `/info {"type":"outcomeMeta"}` with the boot's own request and
+    /// parser.
+    ///
+    /// Reconnect-loop fix (2026-09-26): how the Hyperliquid ingress
+    /// re-discovers the successor of a rolling family it retired at a
+    /// reconnect — `outcomeMetaUpdates` replays nothing on subscribe,
+    /// so an `outcomeCreated` a dead session missed never comes back,
+    /// and without this a daily family would stay dark until the next
+    /// day's instance. Cold path: the ingress thread calls it between
+    /// sessions, only while a family awaits a successor, at most once a
+    /// minute — to `ep`'s boot-resolved address, so no DNS lookup runs
+    /// and every socket step is armed with what remains of
+    /// [`REDISCOVERY_TIMEOUT`].
+    pub fn fetch_hl_outcome_specs(
+        tls: &Arc<rustls::ClientConfig>,
+        ep: &super::WssEndpoint,
+    ) -> Result<Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>, &'static str> {
+        let mut buf = Vec::new();
+        let range = core_net::boot_http::https_post_at(
+            tls,
+            ep.addr,
+            &ep.host,
+            &ep.path,
+            USER_AGENT,
+            b"application/json",
+            HL_OUTCOME_META_REQ,
+            &mut buf,
+            MAX_BODY,
+            REDISCOVERY_TIMEOUT,
+        )
+        .map_err(|e| {
+            tracing::warn!(venue = "hl", request = "outcomeMeta", error = ?e, "re-discovery: fetch failed");
+            "hl: outcomeMeta fetch failed"
+        })?;
+        let mut d = HlDiscovery::new();
+        d.ingest_outcome_meta(&buf[range]).map_err(|e| {
+            tracing::warn!(venue = "hl", request = "outcomeMeta", error = ?e, "re-discovery: parse failed");
+            "hl: outcomeMeta parse failed"
+        })?;
+        Ok(d.outcome_specs())
+    }
+
     #[allow(clippy::type_complexity)]
     fn run_hl(
         cfg: &Config,
@@ -8893,6 +10116,7 @@ pub mod boot_discovery {
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
         out_specs: &mut Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
+        out_sz: &mut Vec<(String, u8)>,
     ) -> Result<VenueCoverage, &'static str> {
         let (host, port) = split_host_port(&cfg.hyperliquid_api_host, 443)?;
         let mut d = HlDiscovery::new();
@@ -8901,7 +10125,7 @@ pub mod boot_discovery {
             ("meta", br#"{"type":"meta"}"#),
             ("spotMeta", br#"{"type":"spotMeta"}"#),
             ("perpDexs", br#"{"type":"perpDexs"}"#),
-            ("outcomeMeta", br#"{"type":"outcomeMeta"}"#),
+            ("outcomeMeta", HL_OUTCOME_META_REQ),
         ];
         for (i, (label, body)) in requests.iter().enumerate() {
             if i > 0 {
@@ -8924,6 +10148,36 @@ pub mod boot_discovery {
             })?;
         }
 
+        // HC10: the own meta of every builder dex a configured coin
+        // names (`xyz:NVDA` → `{"type":"meta","dex":"xyz"}`), so those
+        // coins resolve to real asset ids and szDecimals. Only a dex the
+        // venue's own `perpDexs` listed is asked for; a failed fetch
+        // leaves its coins name-validated (market data addresses them by
+        // string — nothing here trades).
+        let mut dexes: Vec<&[u8]> = Vec::new();
+        for coin in spec.split(',').map(str::trim) {
+            if let Some(dx) = ingress_hyperliquid::discovery::dex_of(coin.as_bytes()) {
+                if d.has_dex(dx) && !dexes.contains(&dx) {
+                    dexes.push(dx);
+                }
+            }
+        }
+        for dx in &dexes {
+            std::thread::sleep(Duration::from_millis(250));
+            let dname = String::from_utf8_lossy(dx);
+            let body = format!(r#"{{"type":"meta","dex":"{dname}"}}"#);
+            match post(tls, host, port, "/info", body.as_bytes(), buf) {
+                Ok(range) => {
+                    if let Err(e) = d.ingest_dex_meta(dx, &buf[range]) {
+                        tracing::error!(venue = "hl", dex = %dname, error = ?e, "discovery: dex meta parse failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(venue = "hl", dex = %dname, error = ?e, "discovery: dex meta fetch failed — its coins stay name-validated");
+                }
+            }
+        }
+
         // BIN15 O2: hand the parsed outcome economics back before the
         // discovery table is dropped — the rolling families' boot
         // binding reads this instead of waiting a whole period for the
@@ -8940,6 +10194,17 @@ pub mod boot_discovery {
             match d.resolve(coin.as_bytes()) {
                 Some(info) => {
                     matched += 1;
+                    // HC11: the size decimals the venue stated (a native
+                    // perp's, or a builder perp's whose dex meta loaded —
+                    // its asset id is then real).
+                    let stated = match info.kind {
+                        ingress_hyperliquid::discovery::HlAssetKind::Perp => true,
+                        ingress_hyperliquid::discovery::HlAssetKind::BuilderDex => info.asset_id != 0,
+                        _ => false,
+                    };
+                    if stated {
+                        out_sz.push(((*coin).to_owned(), info.sz_decimals));
+                    }
                     // WS8 (gaps §2.5 tick/lot): the audit row now
                     // names the venue's size/price granularity for
                     // perps (lot step = 10^-szDecimals; price tick =
@@ -9327,6 +10592,7 @@ pub mod boot_discovery {
         bn_options_policy: &OptionsPolicy,
         bybit: Option<(&[String], &[String])>,
         mexc: Option<(&[String], &[String])>,
+        hypercall_policy: &OptionsPolicy,
         polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
@@ -9389,6 +10655,7 @@ pub mod boot_discovery {
         };
 
         let mut hl_outcome_specs = Vec::new();
+        let mut hl_sz_decimals = Vec::new();
         let hl = match hl_spec.map(str::trim).filter(|s| !s.is_empty()) {
             Some(spec) => Some(run_hl(
                 cfg,
@@ -9397,6 +10664,7 @@ pub mod boot_discovery {
                 &mut buf,
                 &mut any_missing,
                 &mut hl_outcome_specs,
+                &mut hl_sz_decimals,
             )?),
             None => None,
         };
@@ -9454,6 +10722,15 @@ pub mod boot_discovery {
             _ => (None, Vec::new()),
         };
 
+        // HC4: ONE /markets pass + the O-HC2 capped chain.
+        let (hypercall, hypercall_options) = if hypercall_policy.enabled() {
+            let (cov, opts) =
+                run_hypercall(cfg, tls_config, hypercall_policy, &mut buf, &mut any_missing)?;
+            (Some(cov), opts)
+        } else {
+            (None, Vec::new())
+        };
+
         let pm = run_pm(
             cfg,
             tls_config,
@@ -9472,13 +10749,147 @@ pub mod boot_discovery {
             deribit_options,
             hl,
             hl_outcome_specs,
+            hl_sz_decimals,
             bn,
             bn_fapi_rows,
             bn_options,
             bybit: bybit_cov,
             mexc: mexc_cov,
             mexc_funding,
+            hypercall,
+            hypercall_options,
         })
+    }
+
+    /// HC4: the Hypercall boot discovery. ONE `GET /markets` — every
+    /// listed instrument, ≈ 4.3 MB (927 ms from the Mac, 2026-09-25) —
+    /// scanned in one forward pass (`ingress_hypercall::discovery`),
+    /// then the O-HC2 capped chain per configured underlying: the
+    /// nearest `expiries` series OUTSIDE the provider's pre-expiry
+    /// quoting blackout × the `strikes` nearest the venue's index.
+    ///
+    /// A configured underlying the venue does not list is FATAL (a typo
+    /// must never boot a silently smaller universe — the Deribit-combo
+    /// precedent); one that is listed but selects nothing (every series
+    /// inside the blackout) marks the boot `any_missing`. Options take
+    /// ordinals from [`OPT_ORDINAL_BASE`] in selection order; the
+    /// indices below them are the config file's.
+    fn run_hypercall(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        policy: &OptionsPolicy,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<(VenueCoverage, Vec<super::DiscoveredOption>), &'static str> {
+        use ingress_hypercall::discovery::{
+            parse_markets, select_universe, DiscoveryErr, DEFAULT_BLACKOUT_MS, MARKETS_MAX_BODY,
+            MARKETS_PATH,
+        };
+        let (host, port) = split_host_port(&cfg.hypercall_rest_host, 443)?;
+        let range = core_net::boot_http::https_get(
+            tls,
+            host,
+            port,
+            MARKETS_PATH,
+            USER_AGENT,
+            buf,
+            MARKETS_MAX_BODY,
+            FETCH_TIMEOUT,
+        )
+        .map_err(|e| {
+            tracing::error!(venue = "hypercall", error = ?e, "discovery: /markets fetch failed");
+            "hypercall: /markets fetch failed"
+        })?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let unds: Vec<&[u8]> = policy.underlyings.iter().map(|u| u.as_bytes()).collect();
+        let m = parse_markets(&buf[range], &unds, now_ms, DEFAULT_BLACKOUT_MS).map_err(|e| {
+            let underlying = match e {
+                DiscoveryErr::NotListed(i) => policy.underlyings.get(i).map_or("?", String::as_str),
+                _ => "",
+            };
+            tracing::error!(venue = "hypercall", error = %e, underlying, "discovery: /markets refused");
+            match e {
+                DiscoveryErr::NotListed(_) => {
+                    "hypercall: a configured underlying is not listed — fix [hypercall] underlyings"
+                }
+                DiscoveryErr::TooManyUnderlyings => "hypercall: too many underlyings configured",
+                DiscoveryErr::Malformed => "hypercall: /markets body is not a markets answer",
+            }
+        })?;
+        let sel = select_universe(&m, unds.len(), policy.expiries, policy.strikes);
+        let mut per_und = vec![0u32; unds.len()];
+        let mut out: Vec<super::DiscoveredOption> = Vec::with_capacity(sel.len());
+        for (k, row) in sel.iter().enumerate() {
+            let name = core::str::from_utf8(row.name())
+                .map_err(|_| "hypercall: non-utf8 option instrument name")?;
+            let sym = make_symbol_id(VenueId::Hypercall, OPT_ORDINAL_BASE + k as u32 + 1);
+            if let Some(n) = per_und.get_mut(row.underlying as usize) {
+                *n += 1;
+            }
+            out.push((
+                name.to_string(),
+                sym,
+                row.strike_1e9,
+                row.exp_ms,
+                if row.call {
+                    opt_registry::RIGHT_CALL
+                } else {
+                    opt_registry::RIGHT_PUT
+                },
+            ));
+        }
+        let mut matched = 0u32;
+        for (i, u) in policy.underlyings.iter().enumerate() {
+            let selected = per_und[i];
+            if selected == 0 {
+                *any_missing = true;
+                tracing::error!(
+                    venue = "hypercall",
+                    underlying = %u,
+                    reason = "no_chain",
+                    "discovery: options underlying selected no instruments"
+                );
+            } else {
+                matched += 1;
+            }
+            tracing::info!(
+                venue = "hypercall",
+                underlying = %u,
+                index_px_1e9 = m.index_1e9[i],
+                expiries = policy.expiries,
+                strikes = policy.strikes,
+                selected,
+                "discovery: options chain"
+            );
+        }
+        if out.len() > ingress_hypercall::HC_MAX_INSTRUMENTS {
+            tracing::error!(
+                venue = "hypercall",
+                selected = out.len(),
+                cap = ingress_hypercall::HC_MAX_INSTRUMENTS,
+                "discovery: selected chain exceeds the one-frame subscribe cap"
+            );
+            return Err("hypercall: selected chain exceeds HC_MAX_INSTRUMENTS — shrink \
+                 [hypercall] underlyings/expiries/strikes");
+        }
+        tracing::info!(
+            venue = "hypercall",
+            candidates = m.rows.len(),
+            refused = m.refused,
+            selected = out.len(),
+            "discovery: hypercall universe"
+        );
+        Ok((
+            VenueCoverage {
+                configured: unds.len() as u32,
+                matched,
+                universe: m.rows.len() as u32,
+            },
+            out,
+        ))
     }
 
     /// MX6: the MEXC boot audit. Spot: ONE `GET /api/v3/exchangeInfo`
@@ -9953,24 +11364,6 @@ mod tests {
         );
     }
 
-    /// T1(b) (outage 2026-08-27 §5.3): the predicate that replaces
-    /// the msgs-based reset. Happy path: data moved ⇒ reset. Failure
-    /// mode: a rejection-only session (msgs moved, ticks did not)
-    /// must keep escalating; a venue-quiet idle/staleness trip is
-    /// rate-limited by construction and may reset.
-    #[test]
-    fn backoff_resets_only_on_moved_data_or_quiet_trip() {
-        // Data moved ⇒ reset regardless of result class.
-        assert!(should_reset_backoff(10, 3, false));
-        // Rejection-only session: ticks unchanged ⇒ keep escalating.
-        assert!(!should_reset_backoff(3, 3, false));
-        // The exact outage shape: rejection received every cycle,
-        // never a tick — first cycle from zero included.
-        assert!(!should_reset_backoff(0, 0, false));
-        // Venue-quiet idle/staleness trip ⇒ reset (budget-limited).
-        assert!(should_reset_backoff(3, 3, true));
-    }
-
     /// T1(c): stamp-age helper degrades to -1, never panics, when
     /// the stamp dir is missing (fresh hosts, CI).
     #[test]
@@ -10068,48 +11461,13 @@ mod tests {
     /// halves, dropping the producers (the "unspawned venue"
     /// shape). Returns engine-ready `Consumers`.
     fn split_all_consumers(rings: &Rings) -> Consumers {
-        let tick_lanes = {
-            let mut it = rings.tick.iter().map(|r| r.clone().split().1);
-            [
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-            ]
-        };
-        let fill_lanes = {
-            let mut it = rings.fill.iter().map(|r| r.clone().split().1);
-            [
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-            ]
-        };
-        let event_lanes = {
-            let mut it = rings.event.iter().map(|r| r.clone().split().1);
-            [
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-            ]
-        };
-        let depth_lanes = {
-            let mut it = rings.depth.iter().map(|r| r.clone().split().1);
-            [it.next().unwrap(), it.next().unwrap()]
-        };
-        let opt_lanes = {
-            let mut it = rings.opt.iter().map(|r| r.clone().split().1);
-            [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()]
-        };
+        // Built over each lane array's own length (HC1: the eighth tick
+        // lane and fourth opt lane are not an edit here).
+        let tick_lanes = core::array::from_fn(|i| rings.tick[i].clone().split().1);
+        let fill_lanes = core::array::from_fn(|i| rings.fill[i].clone().split().1);
+        let event_lanes = core::array::from_fn(|i| rings.event[i].clone().split().1);
+        let depth_lanes = core::array::from_fn(|i| rings.depth[i].clone().split().1);
+        let opt_lanes = core::array::from_fn(|i| rings.opt[i].clone().split().1);
         Consumers {
             tick_lanes,
             event_lanes,
@@ -10117,6 +11475,7 @@ mod tests {
             opt_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
             hyperevm_signal: rings.hyperevm_signal.clone().split().1,
+            trades: rings.trade.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
             ai_status: Arc::new(AiIngressStatus::new()),
@@ -10197,13 +11556,16 @@ mod tests {
         let hl = build_hl_coin_table("BTC,ETH").unwrap();
 
         let mexc = [make_symbol_id(VenueId::Mexc, 1), make_symbol_id(VenueId::Mexc, 513)];
-        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc);
+        let hc = [make_symbol_id(VenueId::Hypercall, 513), make_symbol_id(VenueId::Hypercall, 514)];
+        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc, &hc);
         let expect: Vec<u32> = {
             let mut v = vec![
                 42,
                 7,
                 make_symbol_id(VenueId::Mexc, 1),
                 make_symbol_id(VenueId::Mexc, 513),
+                make_symbol_id(VenueId::Hypercall, 513),
+                make_symbol_id(VenueId::Hypercall, 514),
                 make_symbol_id(VenueId::Okx, 1),
                 make_symbol_id(VenueId::Okx, 2),
                 make_symbol_id(VenueId::Deribit, 1),
@@ -10228,16 +11590,22 @@ mod tests {
     #[test]
     fn ai_universe_dedups_and_handles_absent_venues() {
         // PM and BN misconfigured to the same id: one survivor.
-        let u = build_ai_universe(&[7], &[7], None, None, None, &[]);
+        let u = build_ai_universe(&[7], &[7], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[7]);
 
         // No optional venues: exactly the sorted pair.
-        let u = build_ai_universe(&[42], &[7], None, None, None, &[]);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[7, 42]);
 
         // M1 multi-market: every PM token + every BN sym flows in.
-        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[]);
+        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[2, 3, 7, 42, 16_777_218]);
+
+        // O-HC17: the Hypercall options sort among the rest, a duplicate
+        // collapses; the caller passes no index sym.
+        let o = make_symbol_id(VenueId::Hypercall, 600);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[o, o]);
+        assert_eq!(&u[..], &[7, 42, o]);
     }
 
     #[test]
@@ -10324,6 +11692,123 @@ mod tests {
     ///
     /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
     /// refused boot, and the registry is shared by every family.
+    /// HC5: the Hypercall family is 31 gauges, every name distinct and
+    /// within `NAME_MAX`, and the value order IS the name order (the
+    /// mirror is positional). A worst-case boot — every exec slot live —
+    /// still fits the fixed registry with the new venue's ~50 rows.
+    #[test]
+    fn the_hypercall_family_is_31_gauges_in_value_order() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_hypercall_metrics(&mut reg).expect("register hypercall");
+        assert_eq!(reg.counters_len() - c0, 0, "gauges only");
+        assert_eq!(reg.gauges_len() - g0, HC_METRICS);
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for n in HC_METRIC_NAMES {
+            assert!(n.starts_with("engine_ingress_hypercall_"), "{n}");
+            assert!(n.len() <= core_metrics::NAME_MAX, "{n} is {} bytes", n.len());
+            assert!(seen.insert(n), "duplicate {n}");
+        }
+        // Positional: poke one distinct value into each source and read
+        // it back at its name's index.
+        let c = ingress_hypercall::HcCounters::new();
+        let mut k = 0u64;
+        for x in c.ws.closes.iter() {
+            k += 1;
+            x.store(k, Ordering::Relaxed);
+        }
+        c.ws.subscribes.store(7, Ordering::Relaxed);
+        c.ws.crossed_quotes.store(10, Ordering::Relaxed);
+        c.ws.listings[1].store(14, Ordering::Relaxed);
+        c.ws.clock_rtt_ms.store(23, Ordering::Relaxed);
+        c.snapshot_req.store(24, Ordering::Relaxed);
+        c.rest.handoff_drops.store(30, Ordering::Relaxed);
+        c.rest.last_round_ms.store(31, Ordering::Relaxed);
+        let v = hc_metric_values(&c);
+        assert_eq!(&v[..6], &[1, 2, 3, 4, 5, 6], "closes in HcCloseCause::ALL order");
+        let at = |name: &str| HC_METRIC_NAMES.iter().position(|n| *n == name).expect(name);
+        for (i, cause) in ingress_hypercall::HcCloseCause::ALL.iter().enumerate() {
+            assert_eq!(at(&format!("engine_ingress_hypercall_closes_{}_total", cause.label())), i);
+        }
+        assert_eq!(v[at("engine_ingress_hypercall_subscribes_total")], 7);
+        assert_eq!(v[at("engine_ingress_hypercall_crossed_quotes_total")], 10);
+        assert_eq!(v[at("engine_ingress_hypercall_listings_expired_total")], 14);
+        assert_eq!(v[at("engine_ingress_hypercall_clock_rtt_ms")], 23);
+        assert_eq!(v[at("engine_ingress_hypercall_snapshot_requests_total")], 24);
+        assert_eq!(v[at("engine_ingress_hypercall_rest_handoff_drops_total")], 30);
+        assert_eq!(v[at("engine_ingress_hypercall_rest_last_round_ms")], 31);
+        assert_eq!(ids.gauges.len(), HC_METRICS);
+        // The whole registry, worst case, still fits: every slot live and
+        // the Binance arm's router counters registered (BX6).
+        let worst = ExecObs {
+            modes: [1u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+            binance: true,
+        };
+        let obs = Observability::build(true, Some(worst)).expect("every family fits the fixed registry");
+        let reg = obs.metrics.as_ref().unwrap();
+        assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
+        assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("engine_ingress_hypercall_state"));
+        assert!(text.contains("engine_ingress_hypercall_last_tick_age_seconds"));
+        assert!(text.contains("engine_ingress_hypercall_msgs_total"));
+        assert!(text.contains("engine_ingress_hypercall_capture_records"));
+        assert!(text.contains("engine_ingress_hypercall_coverage_configured"));
+        assert!(text.contains("engine_ingress_hypercall_options_selected"));
+    }
+
+    /// HAR H3.5: four gauges, always registered (a boot without
+    /// `har.toml` reports `configured 0`); the mirror counts the warm
+    /// series and reports the STALEST newest-day age (−1: none closed).
+    #[test]
+    fn the_har_family_is_4_gauges_and_mirrors_the_stalest_day() {
+        struct Fake(Vec<strategy_core::HarSeriesView>, u64);
+        impl strategy_core::StrategyCounters for Fake {
+            fn har_counters(&self) -> strategy_core::HarCounters {
+                strategy_core::HarCounters {
+                    day_close_ns_max: self.1,
+                    ..strategy_core::HarCounters::default()
+                }
+            }
+            fn har_series_view(&self, out: &mut [strategy_core::HarSeriesView]) -> u32 {
+                let m = self.0.len().min(out.len());
+                out[..m].copy_from_slice(&self.0[..m]);
+                self.0.len() as u32
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_har_metrics(&mut reg).expect("register har");
+        assert_eq!(reg.counters_len() - c0, 0, "gauges only");
+        assert_eq!(reg.gauges_len() - g0, 4);
+        assert!(register_har_metrics(&mut reg).is_err(), "names are unique");
+        let mut rows = [strategy_core::HarSeriesView::default(); strategy_core::HAR_VIEW_SERIES];
+        mirror_har_metrics(&reg, &ids, &Fake(Vec::new(), 0), &mut rows, 0);
+        assert_eq!(reg.gauge(ids.configured).get(), 0);
+        assert_eq!(reg.gauge(ids.warm).get(), 0);
+        assert_eq!(reg.gauge(ids.day_age_max_s).get(), -1, "no series: never");
+        // 2026-09-26T09:00Z: one warm series whose newest closed day is
+        // 09-25 (ended 9 h ago), one cold series stuck on 09-24 (33 h).
+        let wall_ms: u64 = 1_790_413_200_000;
+        let current = strategy_core::HarSeriesView {
+            warm: 1,
+            newest_day_ms: 1_790_294_400_000,
+            ..strategy_core::HarSeriesView::default()
+        };
+        let stuck = strategy_core::HarSeriesView {
+            newest_day_ms: 1_790_294_400_000 - core_vol::DAY_MS,
+            ..strategy_core::HarSeriesView::default()
+        };
+        let never = strategy_core::HarSeriesView::default();
+        mirror_har_metrics(&reg, &ids, &Fake(vec![current, stuck, never], 70_000), &mut rows, wall_ms);
+        assert_eq!(reg.gauge(ids.configured).get(), 3);
+        assert_eq!(reg.gauge(ids.warm).get(), 1);
+        assert_eq!(reg.gauge(ids.day_age_max_s).get(), 33 * 3_600, "the stalest wins");
+        assert_eq!(reg.gauge(ids.day_close_ns_max).get(), 70_000);
+    }
+
     #[test]
     fn the_hyparb_family_is_27_counters_and_36_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
@@ -10351,6 +11836,88 @@ mod tests {
             );
             assert!(seen.insert(n), "duplicate {n}");
         }
+    }
+
+    /// XMM XH3: the slot-6 family — 17 counters (the member's, in name
+    /// order) and 1 + 4 gauges; every name distinct, none reused.
+    #[test]
+    fn the_xmm_family_is_17_counters_and_5_gauges() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let before_c = reg.counters_len();
+        let before_g = reg.gauges_len();
+        let ids = register_xmm_metrics(&mut reg).expect("register xmm");
+        assert_eq!(reg.counters_len() - before_c, 17, "the counter block");
+        assert_eq!(reg.gauges_len() - before_g, 1 + XMM_METRIC_PERPS, "perps + positions");
+        assert!(register_xmm_metrics(&mut reg).is_err(), "a second registration collides");
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for n in XMM_COUNTER_NAMES {
+            assert!(n.starts_with("engine_xmm_") && n.ends_with("_total"), "{n}");
+            assert!(seen.insert(n), "duplicate {n}");
+        }
+        reg.gauge(ids.pos[3]).set(-7);
+        assert_eq!(reg.gauge(ids.pos[3]).get(), -7);
+    }
+
+    /// XMM XH3: the mirror publishes DELTAS of the member's cumulative
+    /// counters and LEVELS for the gauges; perps the member does not
+    /// quote read zero; an unconfigured member publishes zeros.
+    #[test]
+    fn the_xmm_mirror_publishes_deltas_and_levels() {
+        struct Fake {
+            c: strategy_core::XmmCounters,
+            rows: [strategy_core::XmmPerpView; 2],
+            n: u32,
+        }
+        impl strategy_core::StrategyCounters for Fake {
+            fn orders_emitted(&self) -> u64 {
+                0
+            }
+            fn orders_dropped(&self) -> u64 {
+                0
+            }
+            fn strategy_kind(&self) -> &'static str {
+                "fake"
+            }
+            fn xmm_counters(&self, out: &mut strategy_core::XmmCounters) {
+                *out = self.c;
+            }
+            fn xmm_perps_view(&self, out: &mut [strategy_core::XmmPerpView]) -> u32 {
+                let m = out.len().min(self.rows.len());
+                out[..m].copy_from_slice(&self.rows[..m]);
+                self.n
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let ids = register_xmm_metrics(&mut reg).expect("register");
+        let mut last = strategy_core::XmmCounters::default();
+        let mut f = Fake {
+            c: strategy_core::XmmCounters::default(),
+            rows: [strategy_core::XmmPerpView::default(); 2],
+            n: 2,
+        };
+        f.c.placed = 9;
+        f.c.pull_cancels = 4;
+        f.c.stuck = 1;
+        f.rows[0].pos_1e6 = 150_000;
+        f.rows[1].pos_1e6 = -20_000;
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[0]).get(), 9, "placed");
+        assert_eq!(reg.counter(ids.counters[4]).get(), 4, "pull_cancels");
+        assert_eq!(reg.counter(ids.counters[16]).get(), 1, "stuck");
+        assert_eq!(reg.gauge(ids.perps).get(), 2);
+        assert_eq!((reg.gauge(ids.pos[0]).get(), reg.gauge(ids.pos[1]).get()), (150_000, -20_000));
+        assert_eq!(reg.gauge(ids.pos[2]).get(), 0, "a perp not quoted reads zero");
+        // The same cumulative counters again add nothing; a move adds
+        // exactly the move.
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[0]).get(), 9);
+        f.c.placed = 12;
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[0]).get(), 12);
+        // An unconfigured member: the gauges fall to zero.
+        f.n = 0;
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!((reg.gauge(ids.perps).get(), reg.gauge(ids.pos[0]).get()), (0, 0));
     }
 
     /// HYPARB H8: the shadow family's size is pinned too, and its mirror
@@ -11079,6 +12646,7 @@ mod tests {
             cfg.bybit,
             cfg.mexc,
             cfg.hyperevm,
+            cfg.hypercall,
         ] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
@@ -11103,6 +12671,7 @@ mod tests {
             cfg.bybit,
             cfg.mexc,
             cfg.hyperevm,
+            cfg.hypercall,
         ] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
@@ -11113,7 +12682,7 @@ mod tests {
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
         let cfg = parse_raw_tap_flags(
-            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm"),
+            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall"),
             "all",
             1,
         )
@@ -11128,6 +12697,7 @@ mod tests {
             cfg.bybit,
             cfg.mexc,
             cfg.hyperevm,
+            cfg.hypercall,
         ] {
             assert_eq!(c.mode, TapMode::All);
         }
@@ -11167,16 +12737,16 @@ mod tests {
         );
     }
 
-    /// More than nine comma-separated labels trips the defensive
-    /// capacity guard — there are only nine capture labels (WS9 added
-    /// bybit, MX6 mexc, HYPARB H3b hyperevm), so this branch is a pure
-    /// defense-in-depth backstop reached here by listing all nine plus a
-    /// tenth item.
+    /// More than ten comma-separated labels trips the defensive
+    /// capacity guard — there are only ten capture labels (WS9 added
+    /// bybit, MX6 mexc, HYPARB H3b hyperevm, HC5 hypercall), so this
+    /// branch is a pure defense-in-depth backstop reached here by
+    /// listing all ten plus an eleventh item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
             parse_raw_tap_flags(
-                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,pm2"),
+                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm2"),
                 "rejects",
                 64
             )
@@ -11397,18 +12967,28 @@ mod tests {
         // The AI-only mask (ai-exec + vm) is exempt — nothing to label at boot.
         let ai = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
         assert_eq!(unlabelled_required_slot(&set, ai, true), None);
-        // ai+icdp: icdp is a signal member ⇒ refused until labelled.
-        let ai_icdp = ai | strategy_set::BIT_ICDP;
-        assert_eq!(
-            unlabelled_required_slot(&set, ai_icdp, true),
-            Some(strategy_set::SLOT_ICDP)
-        );
         let mut b = RegimeLabelBuilder::new();
         b.add(b"fast:shape:trend").unwrap();
         let label = core_types::RegimeLabelSet::from_terms(&[b.finish()], core_types::REGIME_OFF_SOFT)
             .unwrap();
-        assert!(set.set_regime_label(strategy_set::SLOT_ICDP, label));
-        assert_eq!(unlabelled_required_slot(&set, ai_icdp, true), None);
+        // ai+bin15: bin15 is a signal member ⇒ refused until labelled.
+        let ai_bin15 = ai | strategy_set::BIT_BIN15;
+        assert_eq!(
+            unlabelled_required_slot(&set, ai_bin15, true),
+            Some(strategy_set::SLOT_BIN15)
+        );
+        assert!(set.set_regime_label(strategy_set::SLOT_BIN15, label));
+        assert_eq!(unlabelled_required_slot(&set, ai_bin15, true), None);
+        // XMM XH3: ai+xmm — xmm carries its own signal (the Binance lead),
+        // so with the law on it is refused until labelled; its label is
+        // carried (never consulted — the HORIZON law) and satisfies it.
+        let ai_xmm = ai | strategy_set::BIT_XMM;
+        assert_eq!(
+            unlabelled_required_slot(&set, ai_xmm, true),
+            Some(strategy_set::SLOT_XMM)
+        );
+        assert!(set.set_regime_label(strategy_set::SLOT_XMM, label));
+        assert_eq!(unlabelled_required_slot(&set, ai_xmm, true), None);
     }
 
     /// Boot-surface pin: `Observability::build(true)` registers

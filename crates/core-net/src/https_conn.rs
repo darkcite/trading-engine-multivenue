@@ -17,7 +17,9 @@
 //!
 //! [`crate::HttpsPost`] is this connection's blocking one-template form
 //! (its own poll; the caller's thread waits): one implementation of the
-//! protocol, two ways to drive it.
+//! protocol, two ways to drive it. [`crate::HttpsReq`] (HC2) still runs
+//! on the older blocking engine (`crate::https_keepalive`); moving it
+//! here is a recorded follow-up of the 2026-09-26 merge.
 //!
 //! ## Templates: every request is rendered in place, in its wire buffer
 //!
@@ -131,6 +133,11 @@ pub enum PostErrKind {
     /// A request was started while another was in flight on the same
     /// connection — an owner's bug; nothing was written.
     Busy,
+    /// HC2 ([`crate::HttpsReq`]): the request head carried a field that
+    /// would break its framing — a CR, LF or NUL (header injection), a
+    /// target that is not `/…` origin-form, or a bad header name.
+    /// Refused before any byte is written.
+    BadRequest,
 }
 
 impl core::fmt::Display for PostErrKind {
@@ -143,6 +150,7 @@ impl core::fmt::Display for PostErrKind {
             Self::BadHttp => "https: response was not bounded HTTP/1.1",
             Self::Timeout => "https: request deadline exceeded",
             Self::Busy => "https: a request is already in flight on this connection",
+            Self::BadRequest => "https: the request head would break its framing",
         })
     }
 }
@@ -185,31 +193,10 @@ const fn not_left(err: PostErrKind) -> PostErr {
 // Request templates
 // ---------------------------------------------------------------
 
-/// An HTTP request method.
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Method {
-    /// `GET` — parameters in the query only.
-    Get,
-    /// `POST`.
-    Post,
-    /// `PUT`.
-    Put,
-    /// `DELETE`.
-    Delete,
-}
-
-impl Method {
-    #[inline]
-    const fn token(self) -> &'static [u8] {
-        match self {
-            Self::Get => b"GET",
-            Self::Post => b"POST",
-            Self::Put => b"PUT",
-            Self::Delete => b"DELETE",
-        }
-    }
-}
+/// The request method: HC2's [`crate::http1::Method`], one type for every
+/// client in the crate (a `GET` template carries its parameters in the
+/// query only).
+pub use crate::http1::Method;
 
 /// Where a template's parameters go.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -53,6 +53,15 @@ pub const ERR_SITE_SUBSCRIBE_MISSING: u8 = 8;
 /// outage 2026-08-27 §5.3 — covers Connecting/AwaitingUpgrade
 /// wedges AND zero-sub `Steady` sessions kept alive by pongs).
 pub const ERR_SITE_ESTABLISH: u8 = 9;
+/// Session-END site (not a local error): the peer ended the stream
+/// with no WebSocket Close first — a bare FIN or TLS close. It is
+/// Hyperliquid's entire answer to a subscribe for a settled or unknown
+/// coin (probed 2026-09-26), which `res=Disconnected` alone hid for
+/// hours.
+pub const ERR_SITE_PEER_EOF: u8 = 10;
+/// Session-END site: the peer sent a WebSocket Close (`venue_code` =
+/// its status code; 1005 when the frame carried none).
+pub const ERR_SITE_PEER_CLOSE: u8 = 11;
 
 /// Human name for a session-error site code (0 = "none").
 #[inline]
@@ -68,6 +77,8 @@ pub const fn err_site_name(site: u8) -> &'static str {
         ERR_SITE_VENUE_ERROR => "venue-error",
         ERR_SITE_SUBSCRIBE_MISSING => "subscribe-missing",
         ERR_SITE_ESTABLISH => "establish-timeout",
+        ERR_SITE_PEER_EOF => "peer-eof",
+        ERR_SITE_PEER_CLOSE => "peer-close",
         _ => "unknown",
     }
 }
@@ -222,6 +233,9 @@ pub struct IngressStatus {
     /// VM2 V2: options-summary lane pushes refused by a full ring.
     /// Same separation rationale as the two above.
     opt_ring_drops_total: AtomicU64,
+    /// XMM XH1: trade-lane pushes refused by a full ring (the print is
+    /// still captured). Same separation rationale as the three above.
+    trade_ring_drops_total: AtomicU64,
     /// T1(a) diag: `ERR_SITE_*` of the first fatal error this
     /// session (0 = none). First-error-wins; cleared by the venue
     /// loop via [`Self::take_last_err`] (same thread as the writer).
@@ -261,6 +275,7 @@ impl IngressStatus {
             event_ring_drops_total: AtomicU64::new(0),
             depth_ring_drops_total: AtomicU64::new(0),
             opt_ring_drops_total: AtomicU64::new(0),
+            trade_ring_drops_total: AtomicU64::new(0),
             last_err_site: AtomicU8::new(0),
             last_err_io_kind: AtomicU8::new(0),
             feed_delay_ema_ms: AtomicU16::new(0),
@@ -364,6 +379,12 @@ impl IngressStatus {
     #[inline(always)]
     pub fn inc_opt_ring_drops(&self) {
         self.opt_ring_drops_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one trade-lane push refused by a full ring (XMM XH1).
+    #[inline(always)]
+    pub fn inc_trade_ring_drops(&self) {
+        self.trade_ring_drops_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count one tick the ingress judged stale (VT2).
@@ -495,6 +516,12 @@ impl IngressStatus {
         self.opt_ring_drops_total.load(Ordering::Relaxed)
     }
 
+    /// Total trade-lane pushes refused by a full ring (XMM XH1).
+    #[inline]
+    pub fn trade_ring_drops_total(&self) -> u64 {
+        self.trade_ring_drops_total.load(Ordering::Relaxed)
+    }
+
     /// Total ticks judged stale by the ingress (VT2).
     #[inline]
     pub fn stale_ticks_total(&self) -> u64 {
@@ -592,10 +619,11 @@ mod tests {
     #[test]
     fn slot_is_cache_aligned() {
         assert_eq!(::core::mem::align_of::<IngressStatus>(), 64);
-        // 1(+7 pad) + 8 + 13×8 + (1+1+2+4) + 8 = 136 B → 192 B with
+        // 1(+7 pad) + 8 + 14×8 + (1+1+2+4) + 8 = 144 B → 192 B with
         // the alignment tail: three cache lines (MX3's
-        // seq_regressions_total crossed the second; 56 B of slack now
-        // remain for the next counters before 256).
+        // seq_regressions_total crossed the second; XMM XH1's
+        // trade_ring_drops_total took 8 of the slack — 48 B remain for
+        // the next counters before 256).
         assert_eq!(::core::mem::size_of::<IngressStatus>(), 192);
     }
 
@@ -672,6 +700,21 @@ mod tests {
     }
 
     #[test]
+    fn trade_ring_drops_counter_accumulates_independently() {
+        // XMM XH1: a refused print advances trade_ring_drops ONLY —
+        // never ring_drops (tick loss) or the other lanes' counters.
+        let s = IngressStatus::new();
+        assert_eq!(s.trade_ring_drops_total(), 0);
+        s.inc_trade_ring_drops();
+        s.inc_trade_ring_drops();
+        assert_eq!(s.trade_ring_drops_total(), 2);
+        assert_eq!(s.ring_drops_total(), 0);
+        assert_eq!(s.event_ring_drops_total(), 0);
+        assert_eq!(s.depth_ring_drops_total(), 0);
+        assert_eq!(s.opt_ring_drops_total(), 0);
+    }
+
+    #[test]
     fn depth_ring_drops_counter_accumulates_independently() {
         // WS10-B: same separation law for the depth lane.
         let s = IngressStatus::new();
@@ -719,6 +762,8 @@ mod tests {
             "subscribe-missing"
         );
         assert_eq!(err_site_name(ERR_SITE_ESTABLISH), "establish-timeout");
+        assert_eq!(err_site_name(ERR_SITE_PEER_EOF), "peer-eof");
+        assert_eq!(err_site_name(ERR_SITE_PEER_CLOSE), "peer-close");
         assert_eq!(err_site_name(200), "unknown");
         assert_eq!(io_kind_name(0), "none");
         assert_eq!(

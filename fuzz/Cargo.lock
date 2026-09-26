@@ -147,6 +147,8 @@ name = "core-vol"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-time",
+ "core-types",
 ]
 
 [[package]]
@@ -179,6 +181,24 @@ dependencies = [
  "mio",
  "rustls",
  "signer-ed25519",
+]
+
+[[package]]
+name = "exec-hypercall"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-time",
+ "core-types",
+ "mio",
+ "rustls",
+ "secp256k1",
+ "signer-eip712",
+ "zeroize",
 ]
 
 [[package]]
@@ -290,6 +310,21 @@ name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
  "book-builder",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+ "options-select",
+]
+
+[[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
  "core-metrics",
  "core-net",
  "core-parse",
@@ -463,12 +498,14 @@ dependencies = [
  "core-parse",
  "core-types",
  "exec-binance",
+ "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
  "ingress-ai",
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",

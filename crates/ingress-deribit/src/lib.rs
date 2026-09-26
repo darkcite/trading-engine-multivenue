@@ -21,7 +21,7 @@
 //! One `public/subscribe` call costs **3000 credits of a 30 000 pool**
 //! (~3.3 calls/s refill) — the run loop batches **all** configured
 //! `(channel × instrument)` pairs into a single call
-//! ([`write_subscribe_all`]). The subscribe *result* echoes the list of
+//! ([`render_subscribe_all`]). The subscribe *result* echoes the list of
 //! successfully-subscribed channels; any expected channel missing from
 //! the result is a misconfiguration and fails the session (fail-fast)
 //! — at BOOT. Once one full verification has ever succeeded, missing
@@ -80,8 +80,9 @@
 //! All parsing is in-place over `&[u8]` in the rx buffer. The one
 //! unavoidable copy per event is the 64-byte parsed POD copied into its
 //! SPSC ring slot by `try_push_ref` (the ring publish) — same as every
-//! ingress. Requests render into fixed stack scratch; no heap after
-//! construction.
+//! ingress. Requests go straight into the tx buffer: the batch subscribe
+//! renders there header first, the fixed-shape requests are masked in
+//! from parts; no heap after construction.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -101,7 +102,7 @@ pub use run_loop::{
     RX_BUF_SIZE, TX_BUF_SIZE,
 };
 
-use core_net::SubId;
+use core_net::{SubId, WsPayload, WsWriteErr};
 use core_parse::{
     find_field, scan_i64, scan_number_sci_1e6, scan_number_sci_1e9, scan_u64, skip_byte,
 };
@@ -1524,20 +1525,6 @@ impl Default for DeribitTradeSeq {
 // JSON-RPC request writers + SubId derivation
 // ---------------------------------------------------------------
 
-#[inline]
-pub(crate) fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
-    let end = at.checked_add(src.len())?;
-    // COPY: text into the caller's scratch — the batched subscribe (≤ 16 KiB, once per
-    // session) and the WARN lines (≤ 224 B gap, ≤ 160 B sub-drop, ≤ 1 per GAP_LOG_INTERVAL_NS,
-    // 1 s) — the frame header needs the payload length before the masked payload, and a
-    // WARN line must reach stderr in ONE write — rejected: rendering straight into tx (the
-    // length is unknown until the batch render ends), wire parts (≈ 5 slices per channel,
-    // up to 4 × DERIBIT_MAX_SYMBOLS), one write per WARN part (interleaves) and one
-    // `writev` (a short writev splits the line; `write_all_vectored` is unstable).
-    dst.get_mut(at..end)?.copy_from_slice(src);
-    Some(end)
-}
-
 /// Render `v` as decimal ASCII into `scratch`, returning the digit
 /// slice (right-aligned internally; no allocation).
 #[inline]
@@ -1558,34 +1545,17 @@ pub(crate) fn fmt_u64(v: u64, scratch: &mut [u8; 20]) -> &[u8] {
 /// Every request's head, up to its id.
 const REQ_HEAD: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":";
 
-/// `{"jsonrpc":"2.0","id":<id>,"method":"<method>","params":` — the
-/// shared request head. Caller appends the params body and `}`.
 #[inline]
-fn write_req_head(dst: &mut [u8], id: u64, method: &[u8]) -> Option<usize> {
-    let mut n = 0;
-    n = push_bytes(dst, n, REQ_HEAD)?;
-    let mut digits = [0u8; 20];
-    n = push_bytes(dst, n, fmt_u64(id, &mut digits))?;
-    n = push_bytes(dst, n, b",\"method\":\"")?;
-    n = push_bytes(dst, n, method)?;
-    n = push_bytes(dst, n, b"\",\"params\":")?;
-    Some(n)
-}
-
-#[inline]
-fn write_channel_name(
-    dst: &mut [u8],
-    at: usize,
+fn render_channel_name(
+    p: &mut WsPayload<'_>,
     channel: DeribitChannel,
     instrument: &[u8],
-) -> Option<usize> {
-    let mut n = at;
-    n = push_bytes(dst, n, b"\"")?;
-    n = push_bytes(dst, n, channel.wire_prefix())?;
-    n = push_bytes(dst, n, instrument)?;
-    n = push_bytes(dst, n, channel.wire_suffix())?;
-    n = push_bytes(dst, n, b"\"")?;
-    Some(n)
+) -> Result<(), WsWriteErr> {
+    p.put(b"\"")?;
+    p.put(channel.wire_prefix())?;
+    p.put(instrument)?;
+    p.put(channel.wire_suffix())?;
+    p.put(b"\"")
 }
 
 /// WS6: max DVOL index subscriptions per session (`[deribit]
@@ -1606,18 +1576,23 @@ pub type DvolName = (u8, [u8; 16]);
 /// index (WS6 — OUTSIDE the verification mask: an absent echo shows
 /// up as a missing capture series, never a session verdict).
 /// **One call** — subscribe costs 3000 of 30 000 credits (§4.2), so
-/// batching is mandatory. Returns the byte length, `None` if `dst`
-/// is too small.
+/// batching is mandatory. Rendered through `p` straight into its frame,
+/// header first (`core_net::queue_masked_text_frame_rendered`).
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
 #[inline]
-pub fn write_subscribe_all(
-    dst: &mut [u8],
+pub fn render_subscribe_all(
+    p: &mut WsPayload<'_>,
     id: u64,
     symbols: &DeribitSymbolTable,
     depth_enabled: bool,
     dvol: &[DvolName],
-) -> Option<usize> {
-    let mut n = write_req_head(dst, id, b"public/subscribe")?;
-    n = push_bytes(dst, n, b"{\"channels\":[")?;
+) -> Result<(), WsWriteErr> {
+    p.put(REQ_HEAD)?;
+    let mut digits = [0u8; 20];
+    p.put(fmt_u64(id, &mut digits))?;
+    p.put(b",\"method\":\"public/subscribe\",\"params\":{\"channels\":[")?;
     let mut first = true;
     let mut i = 0;
     while let Some((instr, _sym)) = symbols.get(i) {
@@ -1631,10 +1606,10 @@ pub fn write_subscribe_all(
         while c < channels.len() {
             if row_wants_channel(symbols, i, c, depth_enabled) {
                 if !first {
-                    n = push_bytes(dst, n, b",")?;
+                    p.put(b",")?;
                 }
                 first = false;
-                n = write_channel_name(dst, n, channels[c], instr)?;
+                render_channel_name(p, channels[c], instr)?;
             }
             c += 1;
         }
@@ -1644,16 +1619,15 @@ pub fn write_subscribe_all(
     while d < dvol.len() {
         let (len, ref bytes) = dvol[d];
         if !first {
-            n = push_bytes(dst, n, b",")?;
+            p.put(b",")?;
         }
         first = false;
-        n = push_bytes(dst, n, b"\"deribit_volatility_index.")?;
-        n = push_bytes(dst, n, &bytes[..len as usize])?;
-        n = push_bytes(dst, n, b"\"")?;
+        p.put(b"\"deribit_volatility_index.")?;
+        p.put(&bytes[..len as usize])?;
+        p.put(b"\"")?;
         d += 1;
     }
-    n = push_bytes(dst, n, b"]}}")?;
-    Some(n)
+    p.put(b"]}}")
 }
 
 /// A book resync request's verb.
@@ -1804,6 +1778,20 @@ mod views {
 mod tests {
     use super::*;
     use super::views::*;
+
+    /// The subscribe rendered into a plain buffer — exactly what the
+    /// frame's payload span receives; `None` when it does not fit.
+    fn write_subscribe_all(
+        buf: &mut [u8],
+        id: u64,
+        symbols: &DeribitSymbolTable,
+        depth_enabled: bool,
+        dvol: &[DvolName],
+    ) -> Option<usize> {
+        let mut p = WsPayload::writing(buf);
+        render_subscribe_all(&mut p, id, symbols, depth_enabled, dvol).ok()?;
+        Some(p.len())
+    }
 
     const QUOTE: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"quote.BTC-PERPETUAL","data":{"timestamp":1550658624149,"instrument_name":"BTC-PERPETUAL","best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;
     const TICKER: &[u8] = br#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1550652954406,"state":"open","settlement_price":3925.85,"open_interest":18918470,"min_price":3943.21,"max_price":3982.84,"mark_price":3940.06,"last_price":3906.0,"instrument_name":"BTC-PERPETUAL","index_price":3931.73,"funding_8h":0.00655,"current_funding":0.00042,"best_bid_price":3914.97,"best_bid_amount":40.0,"best_ask_price":3996.61,"best_ask_amount":50.0}}}"#;

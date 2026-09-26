@@ -44,12 +44,19 @@ pub mod evm_live;
 pub mod evm_shadow;
 pub mod evm_testnet;
 pub mod exec_boot;
+/// HAR H3.4: `har.toml` + the seeds + the engine's own state → the long-tenor set.
+pub mod har_boot;
+/// HAR H3.7: the long-tenor state files, rendered and written off the engine thread.
+pub mod har_writer;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
 pub mod hyparb_rehearsal;
 pub mod options_manifest;
 pub mod paper;
+/// HC11b: a member's persisted state, rendered and written off the engine
+/// thread (the long-tenor series' and slot 7's book).
+pub mod persist;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;
@@ -58,19 +65,26 @@ pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;
 pub mod xsd_boot;
+/// XMM XH1: the slot-6 member's boot (`xmm.toml` → `XmmParams`).
+pub mod xmm_boot;
+/// HC11: the slot-7 member's boot (`hcv.toml` → `HcvParams`), its
+/// calendar reader thread and (HC11b) its book's file.
+pub mod hcv_boot;
 
 pub use paper::{
     bn_coinm_specs, bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
     build_deribit_symbol_table, build_hl_coin_table, build_hl_families, build_okx_symbol_table,
     engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full, engine_loop_set_full,
     extend_deribit_table_with_combos, extend_deribit_table_with_options,
-    extend_okx_table_with_options, hyperevm_pool_table, join_reverse, new_capture_run_dir,
-    open_fills_capture, open_orders_capture, parse_ai_hmac_key, parse_raw_tap_flags,
-    parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance, spawn_binance_multi,
-    spawn_bybit, spawn_deribit, spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx,
-    spawn_polymarket, spawn_rpc, split_host_port, state_writer, AiIngressCounterIds,
+    extend_okx_table_with_options, hyperevm_pool_table, join_reverse, log_hl_families,
+    new_capture_run_dir, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
+    parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
+    spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall, spawn_hyperevm,
+    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc, split_host_port,
+    state_writer, AiIngressCounterIds,
     AiIngressStatus, BinanceConnSpec, BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers,
-    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, ExecObs, IngressCounterIds,
+    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds,
+    HypercallSpec, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
     RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };

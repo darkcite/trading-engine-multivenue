@@ -1,0 +1,32 @@
+[package]
+name         = "exec-hypercall"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Hypercall options execution (HC9): the EIP-712 order arm — bodies rendered in place and signed over their own spans, a fail-closed ack scanner, the private fills socket, reconciliation, the per-wallet rate governor, and the operator's mainnet verbs."
+
+[dependencies]
+# HC8: the typed structs, their hashes and the signature.
+signer-eip712 = { workspace = true }
+# The key lives in core_config::SecretKeyBytes — the ONE mlock'd,
+# zeroize-on-drop representation docs/risk-policy.md allows a signing
+# key to have after boot.
+core-config   = { workspace = true }
+secp256k1     = { workspace = true }
+zeroize       = { workspace = true }
+# HC2: HttpsReq (any method, per-call target) and the WS pieces.
+core-net      = { workspace = true }
+core-parse    = { workspace = true }
+core-types    = { workspace = true }
+core-time     = { workspace = true }
+core-fill     = { workspace = true }
+# The engine-facing trait (`OrderDispatch`).
+clob-dispatcher = { workspace = true }
+mio           = { workspace = true }
+rustls        = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }

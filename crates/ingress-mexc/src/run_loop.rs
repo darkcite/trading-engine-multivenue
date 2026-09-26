@@ -7,7 +7,8 @@
 //! TWO classes (spot `/ws` protobuf, futures `/edge` JSON) run on ONE
 //! thread with ONE tick producer and ONE venue-event producer via
 //! [`run_multi`] — the Bybit spot/linear multi-conn shape beat for beat
-//! (slot index = `mio::Token`, 50 ms poll, the six raw-index passes,
+//! (slot index = `mio::Token`, the `core_net::drain` poll — 50 ms idle,
+//! zero after a capped drain — the six raw-index passes,
 //! the WS2 establishment budget, `Backoff`, `Keepalive`); the
 //! driver's [`MexcClass`] picks the parser, the subscribe renderer, the
 //! ping payload and the confirmation law.
@@ -45,10 +46,10 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Status, Transport, WsOpcode,
-    WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_rendered,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
+    HandshakeResult, IoBuf, RxFill, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, NsTs};
@@ -60,12 +61,11 @@ use core_types::{
 use crate::futures::FUT_SUB_PAYLOAD_MAX;
 use crate::{
     classify_futures, classify_spot, extract_fut_symbol, extract_fut_ts_ms, extract_param_channel,
-    extract_refused_contract,
-    extract_param_symbol, funding_next_settle_ms, parse_book_ticker_body, parse_deal_item,
-    parse_depth_full, parse_fut_deal_item, parse_spot_wrapper, parse_sub_ack, parse_ticker,
-    write_fut_subscribe, write_spot_subscribe, MexcChannel, MexcClass, MexcDeal, MexcDealsWalk,
-    MexcFutDealsWalk, MexcFutKind, MexcSpotAck, MexcSpotKind, MexcSymbolTable, MexcTickerFrame,
-    MEXC_MAX_SYMBOLS_PER_CONN, MEXC_SYMBOL_MAX, MS_PER_HOUR,
+    extract_param_symbol, extract_refused_contract, funding_next_settle_ms, parse_book_ticker_body,
+    parse_deal_item, parse_depth_full, parse_fut_deal_item, parse_spot_wrapper, parse_sub_ack,
+    parse_ticker, render_fut_subscribe, render_spot_subscribe, MexcChannel, MexcClass, MexcDeal,
+    MexcDealsWalk, MexcFutDealsWalk, MexcFutKind, MexcSpotAck, MexcSpotKind, MexcSymbolTable,
+    MexcTickerFrame, MEXC_MAX_SYMBOLS_PER_CONN, MEXC_SYMBOL_MAX, MS_PER_HOUR,
 };
 
 // ---------------------------------------------------------------
@@ -96,7 +96,7 @@ pub const SUB_DROP_REFUSED: i64 = 1;
 /// `SubDrop.v1` when the refused channel cannot be named.
 const SUB_DROP_CHANNEL_UNKNOWN: i64 = -1;
 
-/// Longest spot subscribe payload (the render scratch size): the
+/// Longest spot subscribe payload (the tx budget's spot term): the
 /// envelope + per param (two quotes, a comma, the longest topic, the
 /// longest symbol) — ~2.3 KiB at the 16-row table cap.
 const SPOT_SUB_PAYLOAD_MAX: usize = br#"{"method":"SUBSCRIPTION","params":[]}"#.len()
@@ -235,6 +235,11 @@ pub struct Driver {
     establish_budget_ns: u64,
     /// WS2 drop-log rate limiter (process-lifetime, operator budget).
     drop_log_last_ns: u64,
+    /// O-HC16: ticks THIS connection published since its session began
+    /// (cleared by [`Self::reset_for_reconnect`]) — the per-slot half of
+    /// the healthy-session law, since the venue's `IngressStatus` is
+    /// shared by every slot on the thread.
+    session_ticks: u64,
     /// Drops swallowed by the rate limit since the last line.
     drop_log_suppressed: u32,
     /// VT2: THIS connection's venue-clock offset estimator + staleness
@@ -278,6 +283,7 @@ impl Driver {
             ever_confirmed: false,
             establish_budget_ns: core_net::ESTABLISH_BUDGET_NS,
             drop_log_last_ns: 0,
+            session_ticks: 0,
             drop_log_suppressed: 0,
             feed_clock: FeedClock::new(VenueId::Mexc.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
@@ -381,8 +387,16 @@ impl Driver {
             i += 1;
         }
         self.subscribed = false;
+        self.session_ticks = 0;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+    }
+
+    /// Ticks this connection published since its session began (O-HC16).
+    #[inline]
+    #[must_use]
+    pub const fn session_ticks(&self) -> u64 {
+        self.session_ticks
     }
 }
 
@@ -392,6 +406,10 @@ impl Driver {
 
 /// Pump the transport once and advance the state machine. Zero-alloc
 /// once the handshake has completed.
+///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
@@ -403,9 +421,12 @@ pub fn drive_one<T: Transport, C: Capture>(
     event_mask: u16,
     status: &IngressStatus,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+    }
 
     match drv.state {
         State::Connecting => {}
@@ -426,7 +447,31 @@ pub fn drive_one<T: Transport, C: Capture>(
     }
 
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive one connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run, so
+/// one connection's backlog cannot starve the others on this thread.
+#[allow(clippy::too_many_arguments)]
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    path: &[u8],
+    producer: &mut Producer<Tick, TICK_RING_CAP>,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, path, producer, event_tx, event_mask, status, capture),
+        published: producer.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -464,24 +509,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -550,23 +577,19 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     };
     match drv.class {
         MexcClass::Spot => {
-            let mut scratch = [0u8; SPOT_SUB_PAYLOAD_MAX];
-            let len = write_spot_subscribe(&mut scratch, &drv.symbols)
-                .ok_or_else(|| io::Error::other("mexc: spot subscribe scratch too small"))?;
-            queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+            let symbols = &drv.symbols;
+            queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+                render_spot_subscribe(p, symbols)
+            })?;
         }
         MexcClass::Futures => {
-            let per_symbol = MexcClass::Futures.channels_per_symbol() as u8;
             let mut i = 0;
             while let Some((symbol, _sym)) = drv.symbols.get(i) {
                 let mut slot = 0u8;
-                while slot < per_symbol {
-                    let ch = MexcChannel::from_slot(MexcClass::Futures, slot)
-                        .ok_or_else(|| io::Error::other("mexc: futures slot out of range"))?;
-                    let mut scratch = [0u8; FUT_SUB_PAYLOAD_MAX];
-                    let len = write_fut_subscribe(&mut scratch, ch, symbol)
-                        .ok_or_else(|| io::Error::other("mexc: futures subscribe scratch too small"))?;
-                    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+                while let Some(ch) = MexcChannel::from_slot(MexcClass::Futures, slot) {
+                    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+                        render_fut_subscribe(p, ch, symbol)
+                    })?;
                     slot += 1;
                 }
                 i += 1;
@@ -1272,6 +1295,7 @@ fn handle_data_frame<C: Capture>(
                 && scan.ask_qty_1e6 > 0
             {
                 status.add_ticks(1);
+                drv.session_ticks = drv.session_ticks.wrapping_add(1);
                 let tick = Tick::new_stamped(
                     now,
                     VenueId::Mexc,
@@ -1305,6 +1329,7 @@ fn handle_data_frame<C: Capture>(
         Dispatch::Trades { row, channel, scan } => {
             status.add_msgs(scan.parsed as u64);
             status.add_ticks(scan.parsed as u64);
+            drv.session_ticks = drv.session_ticks.wrapping_add(scan.parsed as u64);
             let mut r = 0;
             while r < scan.rejected {
                 status.inc_parse_errors();
@@ -1325,6 +1350,7 @@ fn handle_data_frame<C: Capture>(
             let frame = &ticker;
             status.add_msgs(1);
             status.add_ticks(1);
+            drv.session_ticks = drv.session_ticks.wrapping_add(1);
             note_confirmed(drv, row, MexcChannel::FutTicker);
             let ts_ms = frame.venue_time_ms;
             // §6.5 capture, presence-gated per field group.
@@ -1509,13 +1535,22 @@ impl<'a, T: Transport> MexcConn<'a, T> {
         }
     }
 
-    /// Tear down + schedule the next dial. A session that CONFIRMED
-    /// subscriptions resets the backoff (the caller passes
-    /// `ticks_moved`).
-    fn kill(&mut self, now: NsTs, status: &IngressStatus, ticks_moved: bool) {
+    /// Tear down + schedule the next dial. The backoff resets only by
+    /// the healthy-session law (O-HC16, `core_net::should_reset_backoff`),
+    /// per slot: THIS connection moved market data
+    /// ([`Driver::session_ticks`]) and lived 30 s, or it ended in the
+    /// keepalive's silence trip (`quiet_trip`, rate-limited by the silence
+    /// itself). A session that confirmed its pairs and died young keeps
+    /// escalating (the old `sub_count() > 0` reset did not).
+    fn kill(&mut self, now: NsTs, status: &IngressStatus, quiet_trip: bool) {
         if self.transport.take().is_some() {
             status.inc_reconnects();
-            if ticks_moved {
+            if core_net::should_reset_backoff(
+                self.drv.session_ticks,
+                0,
+                now.saturating_sub(self.session_start_ns),
+                quiet_trip,
+            ) {
                 self.backoff.reset();
             }
         }
@@ -1545,6 +1580,8 @@ pub fn run_multi<T: Transport, C: Capture>(
     capture: &mut C,
     mut connect: impl FnMut(usize) -> Option<T>,
 ) -> RunResult {
+    // Set when a slot's drain hit the step cap: poll without sleeping.
+    let mut repoll_now = false;
     while !stop.load(core::sync::atomic::Ordering::Relaxed) {
         // 1. Reconnect pass — one dial per iteration, oldest-due first.
         let now = now_ns();
@@ -1584,11 +1621,12 @@ pub fn run_multi<T: Transport, C: Capture>(
         }
 
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
         }
+        repoll_now = false;
 
         // 2. Readiness → per-slot pump.
         for ev in events.iter() {
@@ -1606,31 +1644,20 @@ pub fn run_multi<T: Transport, C: Capture>(
             }
         }
 
-        // 3. Drain every live slot (bounded no-progress loop).
+        // 3. Drain every live slot (I-3, core_net::drain), at most
+        //    DRAIN_STEP_CAP steps each; a capped slot is driven again next
+        //    iteration, after a poll that does not sleep.
         for i in 0..conns.len() {
             let c = &mut conns[i];
             let Some(t) = c.transport.as_mut() else {
                 continue;
             };
-            loop {
-                let n_before = producer.published();
-                let state_before = c.drv.state();
-                if drive_one(
-                    t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
-                )
-                .is_err()
-                {
-                    c.kill(now_ns(), status, false);
-                    break;
-                }
-                if c.drv.state() == State::Closed {
-                    let moved = c.drv.sub_count() > 0;
-                    c.kill(now_ns(), status, moved);
-                    break;
-                }
-                if producer.published() == n_before && c.drv.state() == state_before {
-                    break;
-                }
+            match drive_until_idle(
+                t, &mut c.drv, c.host, c.path, producer, event_tx, event_mask, status, capture,
+            ) {
+                Drained::Idle => {}
+                Drained::Capped => repoll_now = true,
+                Drained::Closed | Drained::Failed(_) => c.kill(now_ns(), status, false),
             }
         }
 
@@ -1689,10 +1716,8 @@ pub fn run_multi<T: Transport, C: Capture>(
                         c.kill(now, status, false);
                     }
                 }
-                core_net::KeepaliveAction::Reconnect => {
-                    let moved = c.drv.sub_count() > 0;
-                    c.kill(now, status, moved);
-                }
+                // The venue went quiet: the law's quiet trip.
+                core_net::KeepaliveAction::Reconnect => c.kill(now, status, true),
                 core_net::KeepaliveAction::None => {}
             }
         }
@@ -1783,7 +1808,7 @@ mod tests {
         prod: &mut Producer<Tick, TICK_RING_CAP>,
         status: &IngressStatus,
         cap: &mut C,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let (mut etx, _erx) = event_ring_pair();
         super::drive_one(
             t,
@@ -2009,6 +2034,46 @@ mod tests {
     }
 
     // ---- spot data ---------------------------------------------------
+
+    /// I-3: a burst of non-tick frames past a full rx no longer strands
+    /// what follows it until the next readiness edge — one drain reads it
+    /// all, the tick behind it included; a backlog past `DRAIN_STEP_CAP`
+    /// full-rx steps ends `Capped` (`run_multi` re-polls at once and the
+    /// other slots get their turn) and the next drain finishes it.
+    #[test]
+    fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+        let frame = binary(&enc::wrapper(enc::CHANNEL_BOOK, b"BTCUSDT", 315, &enc::book_body()));
+        for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+            let mut t = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+            let mut d = steady(MexcClass::Spot);
+            let (mut prod, mut cons) = ring_pair();
+            let (mut etx, _erx) = event_ring_pair();
+            let status = IngressStatus::new();
+            t.inject_server_pongs(fills * RX_BUF_SIZE);
+            t.inject_incoming(&frame);
+            for expect in [first, Drained::Idle] {
+                assert_eq!(
+                    drive_until_idle(
+                        &mut t,
+                        &mut d,
+                        b"h",
+                        b"/",
+                        &mut prod,
+                        &mut etx,
+                        core_types::EVENT_LANE_FUNDING,
+                        &status,
+                        &mut NullCapture,
+                    ),
+                    expect
+                );
+                if expect == Drained::Capped {
+                    assert!(cons.try_pop_ref().is_none(), "the tick still waits below the cap");
+                }
+            }
+            assert_eq!(cons.try_pop_ref().expect("the tick behind the burst").sym, SYM_BTC);
+            assert_eq!(t.incoming_len(), 0, "every byte was read");
+        }
+    }
 
     #[test]
     fn spot_golden_book_push_emits_the_exact_tick() {
@@ -2750,6 +2815,76 @@ mod tests {
         t.inject_incoming(&big);
         let e = drive(&mut t, &mut s, &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- the healthy-session law, per slot (O-HC16) -------------------------
+
+    /// A slot's published ticks are ITS session's: counted per driver,
+    /// cleared when the next session begins.
+    #[test]
+    fn a_driver_counts_the_ticks_of_its_own_session() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady(MexcClass::Spot);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let frame = enc::wrapper(enc::CHANNEL_BOOK, b"BTCUSDT", 315, &enc::book_body());
+        t.inject_incoming(&binary(&frame));
+        drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
+        assert_eq!((d.session_ticks(), status.ticks_total()), (1, 1));
+        d.reset_for_reconnect(7);
+        assert_eq!(d.session_ticks(), 0, "a new session starts from nothing");
+        assert_eq!(status.ticks_total(), 1, "the venue's count is not the slot's");
+    }
+
+    /// The internal reconnect resets a slot's backoff only by the law:
+    /// THIS slot moved data and lived 30 s, or the keepalive's silence
+    /// trip ended it. Data moved by the other slots on the thread (the
+    /// venue-wide status) and pairs confirmed without data do not reset
+    /// it; a young session keeps escalating however much it moved.
+    #[test]
+    fn a_slot_resets_its_backoff_only_after_a_healthy_session_or_a_quiet_trip() {
+        const S: NsTs = 1_000_000_000;
+        let status = IngressStatus::new();
+        let mut conn = MexcConn::<TestTransport>::new(
+            Driver::new(1, MexcClass::Futures, fut_symbols()),
+            crate::FUT_WS_HOST,
+            b"/edge",
+            core_net::Keepalive::new(core_net::KeepaliveCfg {
+                ping_interval_ns: u64::MAX / 4,
+                idle_timeout_ns: u64::MAX / 2,
+            }),
+            core_net::Backoff::default_for_ingress(3),
+        );
+        // One session: began at `t0`, THIS slot published `ticks`, the
+        // other slots `others`, and it ends at `t0 + lived`.
+        let session = |conn: &mut MexcConn<'_, TestTransport>, t0: NsTs, ticks: u64, others: u64, lived: NsTs, quiet: bool| {
+            conn.transport = Some(TestTransport::with_capacity(64));
+            conn.drv.reset_for_reconnect(t0);
+            conn.session_start_ns = t0;
+            conn.drv.session_ticks = ticks;
+            status.add_ticks(ticks + others);
+            conn.kill(t0 + lived, &status, quiet);
+            conn.backoff.attempt()
+        };
+        assert_eq!(session(&mut conn, 10 * S, 0, 0, S, false), 1, "the first failure");
+        assert_eq!(session(&mut conn, 20 * S, 900, 0, S, false), 2, "data, died young: escalates");
+        assert_eq!(session(&mut conn, 30 * S, 0, 5_000, 60 * S, false), 3, "the others' data is not ours");
+        assert_eq!(session(&mut conn, 100 * S, 1, 0, 30 * S, false), 1, "healthy: reset, then this failure");
+        assert_eq!(session(&mut conn, 200 * S, 0, 0, 2 * S, false), 2);
+        assert_eq!(session(&mut conn, 300 * S, 0, 0, 90 * S, true), 1, "the quiet trip resets");
+        // Every pair confirmed, no tick this session: the old reset, gone.
+        conn.transport = Some(TestTransport::with_capacity(64));
+        conn.drv.reset_for_reconnect(400 * S);
+        conn.session_start_ns = 400 * S;
+        let n = conn.drv.symbols.len();
+        let mut i = 0;
+        while i < n {
+            conn.drv.rows[i].confirmed = u8::MAX;
+            i += 1;
+        }
+        assert!(conn.drv.sub_count() > 0);
+        conn.kill(460 * S, &status, false);
+        assert_eq!(conn.backoff.attempt(), 2, "confirmed, no data: escalates");
     }
 
     // ---- run_multi -------------------------------------------------------

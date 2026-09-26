@@ -50,6 +50,10 @@ strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }
+# XMM XH1: the slot-6 member's params, built by `xmm_boot`.
+strategy-xmm         = { workspace = true }
+# HC11: the slot-7 member (Hypercall S1 — DARK, paper only).
+strategy-hcv         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
@@ -58,6 +62,9 @@ exec-router          = { workspace = true }
 # also the engine's live Hyperliquid arm (`HlExchange`, LIVE_ARM_VENUES)
 # and HYPARB L5's hedge leg.
 exec-hyperliquid     = { workspace = true }
+# HC9 (O-HC19): the Hypercall order arm, driven by the `hypercall-live`
+# operator verbs (the engine does not arm it before slot 7's ruling).
+exec-hypercall       = { workspace = true }
 # HYPARB H8: the HyperEVM write path, TESTNET ONLY (O-H5) — the shadow of
 # each paper AMM decision (O-H12) and the `evm-testnet` operator verbs.
 exec-hyperevm        = { workspace = true }
@@ -76,6 +83,8 @@ ingress-okx          = { workspace = true }
 ingress-deribit      = { workspace = true }
 ingress-bybit        = { workspace = true }
 ingress-mexc         = { workspace = true }
+# HC4: the Hypercall boot discovery (HC5: the ingress spawn).
+ingress-hypercall    = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-rpc          = { workspace = true }
 ingress-ai           = { workspace = true }

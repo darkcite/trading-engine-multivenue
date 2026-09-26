@@ -56,8 +56,6 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "ai",
     "ai-exec",
     "vm",
-    "icdp",
-    "ai+icdp",
     "vrp",
     "ai+vrp",
     "xsd",
@@ -74,6 +72,18 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "hyparb",
     "ai+hyparb",
     "ai+vrp+xsd+bin15+hyparb",
+    // XMM XH1 (O-XH1): slot 6. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/xmm.toml`
+    // (or `--xmm`); `icdp` and `ai+icdp` are gone with the unlink.
+    "xmm",
+    "ai+xmm",
+    "ai+vrp+xsd+bin15+hyparb+xmm",
+    // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/hcv.toml`
+    // (or `--hcv`); in no configured mask until the operator names it.
+    "hcv",
+    "ai+hcv",
+    "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
 ];
 
 /// Top-level CLI.
@@ -106,6 +116,12 @@ enum Cmd {
     /// stderr; exit 0 only when a trustworthy report was printed.
     /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
     Backtest(BacktestArgs),
+    /// XMM XH2 parity gate (plan §7.3): replay ONE window of one capture
+    /// run through the xmm member on the queue law, on the XMM
+    /// simulator's venue clock and S1 latencies, and write one TSV row
+    /// per (perp, side) beside the simulator's for the comparison.
+    /// Research only; the frozen `backtest` argv is untouched.
+    XmmParity(XmmParityArgs),
     /// Offline M3 capture catalog (mvp-plan §4-M3): walks a replay
     /// root (or one `run-<epoch_ns>` dir) and reports per-run wall
     /// spans, per-venue tick coverage, UTC-day continuity (gap map,
@@ -150,6 +166,51 @@ enum Cmd {
     /// Reads keys from the environment and never opens `.env` —
     /// `scripts/evm-live.sh` sources it. Report on stdout.
     EvmLive(EvmLiveArgs),
+    /// HC9 (ruling O-HC19): the Hypercall order arm's MAINNET operator
+    /// verbs — `status`, `simulate` (`POST /risk/simulate/orders`, never
+    /// mutates), `recon` (read-only), `dust` (one `book_only` bid of
+    /// `--size` at `--price` on `--symbol`, its cancel by client id and
+    /// a reconcile) and `cancel-all` (every order of ours the venue
+    /// lists). There is no testnet: the two writes need `--confirm`.
+    /// Reads `HYPERCALL_WALLET` / `HYPERCALL_AGENT_KEY` from the
+    /// environment and never opens `.env` — `scripts/hypercall-live.sh`
+    /// sources it. Report on stdout.
+    HypercallLive(HypercallLiveArgs),
+}
+
+/// `hypercall-live` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HcVerb {
+    /// Who signs for which wallet; the private socket; balance, orders.
+    Status,
+    /// The venue's margin check of the dust leg (never mutates).
+    Simulate,
+    /// One reconciliation.
+    Recon,
+    /// The mainnet dust smoke (a WRITE: `--confirm`).
+    Dust,
+    /// Cancel every order of ours (a WRITE: `--confirm`).
+    CancelAll,
+}
+
+#[derive(Debug, Parser)]
+struct HypercallLiveArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: HcVerb,
+    /// The instrument, the venue's own spelling
+    /// (`<UND>-<YYYYMMDD>-<STRIKE>-<C|P>`); `simulate` and `dust` need it.
+    #[arg(long)]
+    symbol: Option<String>,
+    /// `dust` / `simulate`: the bid, USD per contract.
+    #[arg(long, default_value = "0.0005")]
+    price: String,
+    /// `dust` / `simulate`: contracts.
+    #[arg(long, default_value = "0.000001")]
+    size: String,
+    /// Required by every write: this is mainnet.
+    #[arg(long, default_value_t = false)]
+    confirm: bool,
 }
 
 /// `evm-live` verbs.
@@ -569,6 +630,35 @@ struct AuditPnlArgs {
 }
 
 #[derive(Debug, Parser)]
+struct XmmParityArgs {
+    /// The `run-<epoch_ns>` directory holding the window.
+    #[arg(long)]
+    replay_dir: PathBuf,
+    /// The parity artifact (`xmm.toml` shape, production pulls off).
+    #[arg(long)]
+    xmm: PathBuf,
+    /// Window start, venue-clock ns (the simulator's `utc_lo_ns`).
+    #[arg(long)]
+    lo_ns: u64,
+    /// Window end, venue-clock ns (`utc_hi_ns`).
+    #[arg(long)]
+    hi_ns: u64,
+    /// The window's label (`W01`, …), echoed into the rows.
+    #[arg(long)]
+    win: String,
+    /// Output TSV path.
+    #[arg(long)]
+    out: PathBuf,
+    /// Seconds of both feeds watched before the window (the gate's
+    /// history).
+    #[arg(long, default_value_t = 60)]
+    preroll_s: u64,
+    /// The simulator's tail: no decision in the window's last seconds.
+    #[arg(long, default_value_t = 90)]
+    tail_s: u64,
+}
+
+#[derive(Debug, Parser)]
 struct BacktestArgs {
     /// Candidate ruleset JSON artifact (8g §4.1 grammar). Required
     /// unless `--member` names a coded member (Tier 3).
@@ -576,7 +666,8 @@ struct BacktestArgs {
     ruleset: Option<PathBuf>,
     /// Tier 3 (statarb doc 08 §6.2): drive a CODED member through the
     /// harness instead of the ruleset VM — `icdp` (with `--icdp <toml>`;
-    /// default `~/multivenue/icdp.toml`), `xsd`, `vrp`, `bin15`.
+    /// default `~/multivenue/icdp.toml` — unlinked from the set at XMM
+    /// XH1, still driven here), `xsd`, `vrp`, `bin15`, `hyparb`, `xmm`.
     /// Additive: the frozen worker argv never passes it.
     #[arg(long)]
     member: Option<String>,
@@ -611,6 +702,11 @@ struct BacktestArgs {
     /// `~/multivenue/hyparb.toml`).
     #[arg(long, requires = "member")]
     hyparb: Option<PathBuf>,
+    /// `--member xmm`: the parameter artifact (`xmm.toml`; default
+    /// `~/multivenue/xmm.toml`); descriptors resolve against the
+    /// capture's newest manifest.
+    #[arg(long, requires = "member")]
+    xmm: Option<PathBuf>,
     /// `--member hyparb`: the `universe.toml` whose `[hyperevm] pools`
     /// names the pools (default `~/multivenue/universe.toml` — the list
     /// is append-only, so the live file names every pool an older
@@ -909,13 +1005,35 @@ struct RunArgs {
     /// with `--evm-testnet`; never the inverse. Shouted in the ARMED tell.
     #[arg(long, default_value_t = false, requires = "evm_testnet")]
     evm_hybrid: bool,
-    /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
-    /// by default). Read only when the requested mask carries the icdp
-    /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
+    /// XMM XH1: the slot-6 parameter artifact (`~/multivenue/xmm.toml`
+    /// by default). Read only when the requested mask carries the xmm
+    /// bit (`--strategy xmm` / `ai+xmm` / … / `all`); an absent or
     /// unresolvable artifact refuses the boot with the bit set — never
-    /// a silent no-op.
+    /// a silent no-op (the icdp/F19 law). `--icdp` left with the unlink
+    /// (O-XH1): `backtest --member icdp` keeps its own `--icdp`.
     #[arg(long)]
-    icdp: Option<PathBuf>,
+    xmm: Option<PathBuf>,
+    /// HC11: the slot-7 parameter artifact (`~/multivenue/hcv.toml` by
+    /// default; `hcv.toml.example`). Read only when the requested mask
+    /// carries the hcv bit (`--strategy hcv` / `ai+hcv` / … / `all`); an
+    /// absent or unresolvable artifact refuses the boot with the bit set
+    /// (the icdp/F19 law). Paper only: a live slot 7 refuses (O-HC18).
+    #[arg(long)]
+    hcv: Option<PathBuf>,
+    /// HC11: the calendar slot 7's event law reads — the news lane's
+    /// `scheduled-events.json` (`~/multivenue/worker/news/…` by default;
+    /// name it when the worker runs with `CLAUDE_WORKER_NEWS_DIR`). Read
+    /// only when the requested mask carries the hcv bit.
+    #[arg(long)]
+    hcv_events: Option<PathBuf>,
+    /// HC11b: slot 7's book — the engine's OWN persisted positions (by
+    /// contract), hedges, cash, day mark and open settlement windows.
+    /// Default: `hcv-state.tsv` beside an explicit `--hcv`, else
+    /// `~/multivenue/hcv-state.tsv` (the F22 law: a smoke boot never reads or
+    /// rewrites the standing engine's book). A file the member cannot read
+    /// exactly refuses the boot.
+    #[arg(long)]
+    hcv_state: Option<PathBuf>,
     /// RG2: the regime detector's parameter artifact
     /// (`~/multivenue/regime.toml` by default; `docs/regime-and-dashboard-plan.md`
     /// §4.6). Set boots only. An ABSENT default file boots the detector
@@ -930,6 +1048,20 @@ struct RunArgs {
     /// absent = warm live (boot tell `regime: seed absent`).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// HAR H3.4: the long-tenor HAR series list (`~/multivenue/har.toml`
+    /// by default). Set boots only; no member reads the forecasts. An
+    /// ABSENT default file boots without the service (the pre-H3 engine,
+    /// bit for bit); a file that does not parse turns the service OFF with
+    /// a named error and never refuses the boot; a series whose feed the
+    /// boot universe does not carry is dropped. Only an explicit
+    /// `--har <path>` that cannot be read refuses the boot.
+    #[arg(long)]
+    har: Option<PathBuf>,
+    /// HAR H3.4: where the per-series seeds (`seed-<NAME>.tsv`, cut hourly
+    /// by `candles-cycle.sh`) and the engine's own state (`state-<NAME>.tsv`)
+    /// live. Default `~/multivenue/har`.
+    #[arg(long)]
+    har_dir: Option<PathBuf>,
     /// VRP V5: the worker-written boot seed
     /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
     /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
@@ -1038,6 +1170,10 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             backtest(args)
         }
+        Cmd::XmmParity(args) => {
+            init_tracing_stderr();
+            xmm_parity(args)
+        }
         Cmd::CaptureCatalog(args) => {
             // stderr tracing for the same reason as the backtest arm:
             // stdout carries the catalog JSON and nothing else.
@@ -1063,7 +1199,80 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             evm_live(args)
         }
+        Cmd::HypercallLive(args) => {
+            init_tracing_stderr();
+            hypercall_live(args)
+        }
     }
+}
+
+/// HC9: the `hypercall-live` verbs (`exec_hypercall::smoke`). Exit 0
+/// PASS, 1 FAIL, 2 refused (no `--confirm`, or a configuration that
+/// does not build).
+fn hypercall_live(args: HypercallLiveArgs) -> ExitCode {
+    use exec_hypercall::smoke;
+    let cfg = match exec_hypercall::HcExecConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "hypercall-live: wallet {} · signer {} ({}) · host {}",
+        exec_hypercall::config::hex20(cfg.wallet()),
+        exec_hypercall::config::hex20(cfg.signer()),
+        if cfg.owner_signs() {
+            "the owner's own key"
+        } else {
+            "an agent — the owner must have approved it"
+        },
+        cfg.rest_host()
+    );
+    let (Some(px), Some(qty)) = (
+        exec_hypercall::num::scan_1e6_exact(args.price.as_bytes()),
+        exec_hypercall::num::scan_1e6_exact(args.size.as_bytes()),
+    ) else {
+        eprintln!("hypercall-live: --price and --size are plain decimals");
+        return ExitCode::from(2);
+    };
+    let mut table = exec_hypercall::HcInstruments::new();
+    if let Some(sym) = args.symbol.as_deref() {
+        let id = core_types::make_symbol_id(
+            core_types::VenueId::Hypercall,
+            core_config::universe::OPT_ORDINAL_BASE + 1,
+        );
+        if let Err(e) = table.insert(id, sym.as_bytes()) {
+            eprintln!("hypercall-live: --symbol {sym:?} refused: {e:?}");
+            return ExitCode::from(2);
+        }
+    } else if matches!(args.verb, HcVerb::Simulate | HcVerb::Dust) {
+        eprintln!("hypercall-live: this verb needs --symbol");
+        return ExitCode::from(2);
+    }
+    let mut arm = match exec_hypercall::HcExchange::new(
+        &cfg,
+        TlsTransport::default_client_config(),
+        table,
+        exec_hypercall::HC_SLOT,
+        443,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut out = std::io::stdout();
+    let v = match args.verb {
+        HcVerb::Status => smoke::status(&mut arm, &mut out),
+        HcVerb::Simulate => smoke::simulate(&mut arm, px, qty, &mut out),
+        HcVerb::Recon => smoke::recon(&mut arm, &mut out),
+        HcVerb::Dust => smoke::dust(&mut arm, px, qty, args.confirm, &mut out),
+        HcVerb::CancelAll => smoke::cancel_all(&mut arm, args.confirm, &mut out),
+    };
+    println!("hypercall-live: counters {:?}", arm.counters());
+    ExitCode::from(v.code())
 }
 
 /// HYPARB L1: the `evm-live` verbs. Exit 0 only when the verb did what
@@ -2120,6 +2329,44 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
     }
 }
 
+/// XMM XH2 parity arm: one JSON line on stdout (the replay's own tally
+/// and the member's, its must-stay-0 counters included), the rows in
+/// `--out`; any failure prints its reason to stderr and exits nonzero.
+fn xmm_parity(args: XmmParityArgs) -> ExitCode {
+    let spec = cli::backtest::xmm_parity::ParitySpec {
+        run_dir: args.replay_dir,
+        xmm: args.xmm,
+        lo_ns: args.lo_ns,
+        hi_ns: args.hi_ns,
+        win: args.win,
+        out: args.out,
+        preroll_ns: args.preroll_s.saturating_mul(1_000_000_000),
+        tail_ns: args.tail_s.saturating_mul(1_000_000_000),
+        lat: cli::backtest::xmm_parity::ParityLatency::S1,
+    };
+    match cli::backtest::xmm_parity::run(&spec) {
+        Ok(s) => {
+            let m = s.member;
+            println!(
+                "{{\"win\":\"{}\",\"records\":{},\"no_venue_time\":{},\"placed\":{},\"fills\":{},\"rows\":{},\
+                 \"member\":{{\"placed\":{},\"modifies\":{},\"lead_cancels\":{},\"requote_cancels\":{},\
+                 \"pull_cancels\":{},\"expiry_cancels\":{},\"gated\":{},\"gate_overflow\":{},\"capped\":{},\
+                 \"rejected_alo\":{},\"rejected_other\":{},\"canceled\":{},\"filled\":{},\"fills\":{},\
+                 \"unmatched\":{},\"ctx_refused\":{},\"stuck\":{}}}}}",
+                spec.win, s.records, s.no_venue_time, s.placed, s.fills, s.rows,
+                m.placed, m.modifies, m.lead_cancels, m.requote_cancels, m.pull_cancels, m.expiry_cancels,
+                m.gated, m.gate_overflow, m.capped, m.rejected_alo, m.rejected_other, m.canceled, m.filled,
+                m.fills, m.unmatched, m.ctx_refused, m.stuck
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xmm-parity: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// M3 catalog arm: JSON on stdout + summary on stderr, exit 0 iff a
 /// report was produced (an empty root IS a report); any failure
 /// prints its reason to stderr only and exits nonzero.
@@ -2153,7 +2400,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
                 eprintln!(
-                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb)"
+                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb, xmm)"
                 );
                 return ExitCode::from(1);
             };
@@ -2204,6 +2451,16 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         Ok(p) => PathBuf::from(p),
                         Err(e) => {
                             eprintln!("backtest: --member hyparb needs --hyparb <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
+                cli::backtest::member::MemberKind::Xmm => match args.xmm.clone() {
+                    Some(p) => p,
+                    None => match core_config::xmm::default_xmm_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member xmm needs --xmm <toml>: {e}");
                             return ExitCode::from(1);
                         }
                     },
@@ -2851,6 +3108,7 @@ fn run(args: RunArgs) -> ExitCode {
         &boot.bn_options,
         bybit_discovery_arg,
         mexc_discovery_arg,
+        &boot.hypercall_options,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -2882,6 +3140,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     if !options_manifest.is_empty() {
         let manifest_path = run_dir.join(cli::options_manifest::OPTIONS_MANIFEST_FILE);
@@ -2893,7 +3152,8 @@ fn run(args: RunArgs) -> ExitCode {
             path = %manifest_path.display(),
             rows = discovery.deribit_options.len()
                 + discovery.okx_options.len()
-                + discovery.bn_options.len(),
+                + discovery.bn_options.len()
+                + discovery.hypercall_options.len(),
             "capture: options manifest written"
         );
     }
@@ -2905,6 +3165,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     {
         let manifest_path = run_dir.join(cli::options_manifest::INSTRUMENT_MANIFEST_FILE);
@@ -3085,7 +3346,25 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            Some((coins, families, hl_ep))
+            // The `/info` endpoint a reconnect re-discovers retired
+            // families' successors on (2026-09-26 reconnect-loop fix) —
+            // resolved here, once, like the WS host: the ingress thread
+            // never runs a DNS lookup.
+            let (api_host, api_port) = match cli::split_host_port(&cfg.hyperliquid_api_host, 443) {
+                Ok(v) => v,
+                Err(reason) => {
+                    error!(reason, host = %cfg.hyperliquid_api_host, "bad hyperliquid_api_host");
+                    return ExitCode::from(1);
+                }
+            };
+            let hl_info_ep = match WssEndpoint::resolve(api_host, api_port, "/info") {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = ?e, "hyperliquid /info DNS failed");
+                    return ExitCode::from(1);
+                }
+            };
+            Some((coins, families, hl_ep, hl_info_ep))
         }
         _ => None,
     };
@@ -3118,13 +3397,19 @@ fn run(args: RunArgs) -> ExitCode {
         .chain(boot.allocated.mexc_perp.iter())
         .map(|i| i.sym)
         .collect();
+    // O-HC17: every Hypercall option the boot selected is addressable by
+    // AI rulesets (signal / reference legs — orders on it stay
+    // unroutable); the `hypercall-idx:<U>` index syms stay out (caps 0).
+    let hypercall_option_syms: Vec<core_types::SymbolId> =
+        discovery.hypercall_options.iter().map(|o| o.1).collect();
     let ai_universe = cli::build_ai_universe(
         &pm_syms,
         &bn_syms,
         okx_boot.as_ref().map(|(t, _)| t),
         deribit_boot.as_ref().map(|(t, _)| t),
-        hl_boot.as_ref().map(|(t, _f, _e)| t),
+        hl_boot.as_ref().map(|(t, _f, _e, _i)| t),
         &mexc_syms,
+        &hypercall_option_syms,
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
     // grammar's stage-time resolution — same allocation truth as the
@@ -3135,6 +3420,7 @@ fn run(args: RunArgs) -> ExitCode {
             &discovery.deribit_options,
             &discovery.okx_options,
             &discovery.bn_options,
+            &discovery.hypercall_options,
             boot.okx_depth,
             boot.deribit_depth,
         ),
@@ -3167,6 +3453,9 @@ fn run(args: RunArgs) -> ExitCode {
     let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
     // MX2: lane 6 = MEXC (VenueId 7, engine::tick_lane_of).
     let (mexc_prod, mexc_lane_cons) = rings.tick[6].clone().split();
+    // HC1: lane 7 = Hypercall (VenueId 9 — HyperEvm, 8, has no tick
+    // lane; engine::tick_lane_of).
+    let (hypercall_prod, hypercall_lane_cons) = rings.tick[7].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -3177,6 +3466,7 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
     let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
     let (mexc_event_prod, mexc_event_cons) = rings.event[6].clone().split();
+    let (hypercall_event_prod, hypercall_event_cons) = rings.event[7].clone().split();
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
     // VM2 V2: HL gained its event lane — funding rides AssetCtx.
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
@@ -3188,6 +3478,7 @@ fn run(args: RunArgs) -> ExitCode {
         hl_event_cons,
         bybit_event_cons,
         mexc_event_cons,
+        hypercall_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
@@ -3195,14 +3486,24 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
     let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
     // VM2 V2: options-summary lanes (engine::opt_lane_of order —
-    // okx 0, deribit 1, binance 2). Producers ride into the three
-    // options-capable spawns.
+    // okx 0, deribit 1, binance 2, hypercall 3 — HC1). Producers ride
+    // into the options-capable spawns.
     let (okx_opt_prod, okx_opt_cons) = rings.opt[0].clone().split();
     let (deribit_opt_prod, deribit_opt_cons) = rings.opt[1].clone().split();
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
-    let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
+    let (hypercall_opt_prod, hypercall_opt_cons) = rings.opt[3].clone().split();
+    let opt_lane_cons = [
+        okx_opt_cons,
+        deribit_opt_cons,
+        bn_opt_cons,
+        hypercall_opt_cons,
+    ];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
+    // XMM XH1: the trade lane — Hyperliquid prints, pushed by the HL
+    // ingress thread after their capture. Dropped with the HL producers
+    // when no coin is subscribed (the unspawned-venue shape, §3.3).
+    let (trade_prod, trade_cons) = rings.trade.clone().split();
     // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
@@ -3368,6 +3669,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.bybit.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_mexc)
             .set(discovery.mexc.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_hypercall)
+            .set(discovery.hypercall.map(|c| c.configured).unwrap_or(0) as i64);
         // M2.1/M2.2/M2.4: capped options chain sizes this boot
         // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
@@ -3376,6 +3679,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.okx_options.len() as i64);
         reg.gauge(ids.binance_options_selected)
             .set(discovery.bn_options.len() as i64);
+        reg.gauge(ids.hypercall_options_selected)
+            .set(discovery.hypercall_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
@@ -3702,7 +4007,7 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Hyperliquid rides core 7 per the §9 core map.
     let hl_wall_anchor = core_time::WallAnchor::now();
-    if let Some((mut hl_coins, mut hl_families, hl_ep)) = hl_boot {
+    if let Some((mut hl_coins, mut hl_families, hl_ep, hl_info_ep)) = hl_boot {
         // BIN15 O2: adopt each family's LIVE instance out of the
         // discovery body, so the first `Steady` subscribes it instead
         // of waiting up to a whole period for the venue's next
@@ -3723,35 +4028,7 @@ fn run(args: RunArgs) -> ExitCode {
                 candidates = discovery.hl_outcome_specs.len(),
                 "hyperliquid: rolling families bound"
             );
-            for f in 0..hl_families.len() {
-                let Some(row) = hl_families.get(f) else {
-                    continue;
-                };
-                let underlying = core::str::from_utf8(row.underlying_bytes()).unwrap_or("?");
-                if row.dormant {
-                    info!(
-                        family = f,
-                        underlying,
-                        period_s = row.period_s,
-                        sym_yes = row.sym[0],
-                        sym_no = row.sym[1],
-                        "hyperliquid: family dormant (no live instance)"
-                    );
-                } else {
-                    info!(
-                        family = f,
-                        underlying,
-                        period_s = row.period_s,
-                        sym_yes = row.sym[0],
-                        sym_no = row.sym[1],
-                        live = row.live.outcome,
-                        strike_1e6 = row.live.strike_1e6,
-                        expiry_ns = row.live.expiry_ns,
-                        twap_s = row.live.twap_s,
-                        "hyperliquid: family live"
-                    );
-                }
-            }
+            cli::log_hl_families(&hl_families);
         }
         info!(
             coins = hl_coins.len(),
@@ -3761,14 +4038,19 @@ fn run(args: RunArgs) -> ExitCode {
         );
         let hl_handle = match spawn_hyperliquid(
             hl_ep,
+            hl_info_ep,
             tls_config.clone(),
             hl_coins,
             hl_families,
             statuses.hl_roll.clone(),
             hl_wall_anchor,
+            // HC11: slot 7 reads each underlying's oracle off the MARK.
+            strategy_set::mask_for_name(&args.strategy)
+                .is_some_and(|m| m & strategy_set::BIT_HCV != 0),
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
+            trade_prod,
             statuses.hyperliquid.clone(),
             7,
             &run_dir,
@@ -3790,6 +4072,7 @@ fn run(args: RunArgs) -> ExitCode {
         // empty ring (the unspawned-venue shape, §3.3).
         drop(hl_prod);
         drop(hl_event_prod);
+        drop(trade_prod);
     }
 
     // WS9: Bybit — spot + linear connection slots on ONE thread
@@ -3953,6 +4236,74 @@ fn run(args: RunArgs) -> ExitCode {
         // no `[mexc]` section is the pre-MEXC boot, bit for bit.
         drop(mexc_prod);
         drop(mexc_event_prod);
+    }
+
+    // -- Hypercall (HC5; data-only, ruling O-HC1): ONE public socket on
+    // its own thread (core 11, past HyperEVM's 10) + the REST poller
+    // thread, whenever `[hypercall]` selected a chain at boot. The
+    // universe is the HC4 discovery outcome; the index syms are the
+    // config file's. --
+    if !discovery.hypercall_options.is_empty() {
+        let mut symbols = ingress_hypercall::HcSymbolTable::new();
+        for (name, sym, ..) in &discovery.hypercall_options {
+            if let Err(e) = symbols.insert(name.as_bytes(), *sym) {
+                error!(?e, instrument = %name, "hypercall: table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let mut underlyings = ingress_hypercall::HcUnderlyings::new();
+        for inst in &boot.allocated.hypercall_idx {
+            if let Err(e) = underlyings.insert(inst.name.as_bytes(), inst.sym) {
+                error!(?e, underlying = %inst.name, "hypercall: index table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let stale = stale_after_ms[core_types::VenueId::Hypercall as usize];
+        info!(
+            instruments = discovery.hypercall_options.len(),
+            underlyings = boot.allocated.hypercall_idx.len(),
+            summary_every_s = boot.hypercall_summary_every_s,
+            stale_after_ms = stale,
+            "hypercall: starting ingress + poller threads"
+        );
+        let spec = cli::HypercallSpec {
+            ws_host: cfg.hypercall_ws_host.clone(),
+            rest_host: cfg.hypercall_rest_host.clone(),
+            symbols,
+            underlyings,
+            summary_underlyings: boot.hypercall_options.underlyings.clone(),
+            summary_every_s: boot.hypercall_summary_every_s,
+            stale_after_ms: stale,
+        };
+        match cli::spawn_hypercall(
+            spec,
+            tls_config.clone(),
+            hypercall_prod,
+            hypercall_event_prod,
+            hypercall_opt_prod,
+            statuses.hypercall.clone(),
+            statuses.hc.clone(),
+            11,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.hypercall,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hypercall)),
+        ) {
+            Ok(hs) => handles.extend(hs),
+            Err(e) => {
+                error!(error = ?e, "hypercall: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        // The unspawned-venue shape (§3.3): permanently-empty rings, so a
+        // boot without `[hypercall]` is the pre-HC5 boot, bit for bit.
+        drop(hypercall_prod);
+        drop(hypercall_event_prod);
+        drop(hypercall_opt_prod);
     }
 
     if let Some(polygon_path) = args.polygon_path {
@@ -4136,12 +4487,14 @@ fn run(args: RunArgs) -> ExitCode {
             hl_lane_cons,
             bybit_lane_cons,
             mexc_lane_cons,
+            hypercall_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,
         opt_lanes: opt_lane_cons,
         rpc_signal: rpc_cons,
         hyperevm_signal: hyperevm_cons,
+        trades: trade_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,
@@ -4307,8 +4660,8 @@ fn run(args: RunArgs) -> ExitCode {
             // "every built member the given flags can boot" —
             // hyparb only when `hyparb.toml` resolves (H5), bin15 only
             // when its artifact resolves, vrp only when
-            // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
-            // artifact resolves (slot 2 is vacant — XSD-S),
+            // `vrp.toml` resolves (VRP V7: slot 1), xmm only when its
+            // artifact resolves (slot 6 — XMM XH1),
             // ai-exec and vm unconditionally (neither has boot
             // config; items 8 / 8g-6) (members without config boot
             // inert; see engine_loop_set_full docs). `ai-exec` (item
@@ -4320,15 +4673,18 @@ fn run(args: RunArgs) -> ExitCode {
             // live arm.
             let requested =
                 strategy_set::mask_for_name(name).expect("matched names are valid mask names");
-            // ICDP I5: resolve the artifact against the SAME
+            // XMM XH1: slot 6's artifact, resolved against the SAME
             // descriptor table the ruleset validator uses (D-6 truth).
             // Only when the bit is requested — `--strategy ai` never
             // touches the file.
-            let icdp_params = if requested & strategy_set::BIT_ICDP != 0 {
-                match load_icdp_params(args.icdp.as_deref(), &ai_descriptors) {
-                    Ok(p) => Some(p),
+            let xmm_boot = if cli::xmm_boot::xmm_wanted(requested) {
+                match cli::xmm_boot::load_xmm_boot(
+                    args.xmm.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                ) {
+                    Ok(b) => b,
                     Err(reason) => {
-                        error!(reason, "icdp: artifact refused — boot aborted");
+                        error!(reason, "xmm: artifact refused — boot aborted");
                         join_reverse(handles);
                         return ExitCode::from(1);
                     }
@@ -4336,6 +4692,56 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 None
             };
+            // F19 / the icdp law: requested-but-absent REFUSES. Booting
+            // `ai+xmm` silently as `ai` is how an operator comes to watch
+            // a member that was never there.
+            if cli::xmm_boot::xmm_wanted(requested) && xmm_boot.is_none() {
+                error!(
+                    "xmm: requested by --strategy but the artifact is absent \
+                     (~/multivenue/xmm.toml or --xmm) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+            // HC11: slot 7's artifact — its hedges resolved against the
+            // SAME descriptor table (D-6 truth), their szDecimals from this
+            // boot's Hyperliquid discovery, its options this boot's
+            // Hypercall chain. Only when the bit is requested.
+            let hcv_boot = if cli::hcv_boot::hcv_wanted(requested) {
+                match cli::hcv_boot::load_hcv_boot(
+                    args.hcv.as_deref(),
+                    args.hcv_events.as_deref(),
+                    args.hcv_state.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &|coin: &str| {
+                        discovery
+                            .hl_sz_decimals
+                            .iter()
+                            .find(|(c, _)| c == coin)
+                            .map(|(_, sz)| *sz)
+                    },
+                    &discovery.hypercall_options,
+                    &boot.hypercall_options.underlyings,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hcv: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            // The same law for slot 7.
+            if cli::hcv_boot::hcv_wanted(requested) && hcv_boot.is_none() {
+                error!(
+                    "hcv: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hcv.toml or --hcv) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG2: the regime detector's artifact + seed, resolved
             // against the same descriptor table (D-6 truth). An absent
             // DEFAULT file is legal (unconfigured); an explicit path
@@ -4348,6 +4754,23 @@ fn run(args: RunArgs) -> ExitCode {
                 Ok(rb) => rb,
                 Err(reason) => {
                     error!(reason, "regime: artifact refused — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            // HAR H3.4: the long-tenor HAR series, their feeds resolved
+            // against the same descriptor table (D-6 truth), each engine's
+            // seed and state read and merged. Only an EXPLICIT `--har`
+            // that cannot be read refuses the boot; every other problem
+            // turns the service (or one series) off with a named error.
+            let har_boot = match cli::har_boot::load_har_boot(
+                args.har.as_deref(),
+                args.har_dir.as_deref(),
+                &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+            ) {
+                Ok(hb) => hb,
+                Err(reason) => {
+                    error!(reason, "har: the explicit --har file is unreadable — boot aborted");
                     join_reverse(handles);
                     return ExitCode::from(1);
                 }
@@ -4647,9 +5070,11 @@ fn run(args: RunArgs) -> ExitCode {
                         vrp_boot.as_ref(),
                         xsd_boot.as_ref(),
                         bin15_boot.as_ref(),
-                        icdp_params.as_ref(),
+                        xmm_boot.as_ref(),
+                        hcv_boot.as_ref(),
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
+                        har_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -4807,9 +5232,11 @@ fn run(args: RunArgs) -> ExitCode {
                                 vrp_boot.as_ref(),
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
+                                xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }};
                     }
@@ -4980,53 +5407,6 @@ fn run(args: RunArgs) -> ExitCode {
     exit_code
 }
 
-/// ICDP I5: read `icdp.toml`, resolve every descriptor against the boot
-/// universe, build the POD artifact the strategy consumes, hash the
-/// exact bytes (logged + stamped by the strategy). Boot-only.
-fn load_icdp_params(
-    path: Option<&std::path::Path>,
-    descriptors: &ingress_ai::DescriptorTable,
-) -> Result<strategy_icdp::IcdpParams, String> {
-    let owned;
-    let path: &std::path::Path = match path {
-        Some(p) => p,
-        None => {
-            owned = core_config::icdp::default_icdp_path().map_err(|e| e.to_string())?;
-            std::path::Path::new(&owned)
-        }
-    };
-    let (file, bytes) = core_config::icdp::load(path).map_err(|e| e.to_string())?;
-    let mut params = strategy_icdp::IcdpParams::EMPTY;
-    params.tf_ns = file.tf_ms.saturating_mul(1_000_000);
-    params.delta_ns = file.delta_ms.saturating_mul(1_000_000);
-    params.n = file.instruments.len();
-    params.hash = core_crypto::sha256(&bytes);
-    for (i, inst) in file.instruments.iter().enumerate() {
-        let (sym, _caps) = descriptors
-            .resolve(inst.descriptor.as_bytes())
-            .ok_or_else(|| format!("icdp: `{}` is not in the boot universe", inst.descriptor))?;
-        params.syms[i] = strategy_icdp::IcdpSymParams {
-            sym,
-            mu: inst.mu,
-            inv_sd: inst.inv_sd,
-            w: inst.w,
-            b: inst.b,
-            thr: inst.thr,
-            notional_1e6: inst.notional_usd_1e6,
-            spread_cap_1e9: inst.spread_cap_1e9,
-            entry_slip_1e9: inst.entry_slip_1e9,
-            exit_slip_1e9: inst.exit_slip_1e9,
-        };
-        info!(
-            descriptor = %inst.descriptor,
-            sym,
-            notional_usd_1e6 = inst.notional_usd_1e6,
-            thr_1e9 = inst.thr,
-            "icdp: instrument resolved"
-        );
-    }
-    Ok(params)
-}
 #[cfg(test)]
 mod strategy_name_pin {
     //! BIN15 O5: the regression pin for the arm/mask drift recorded on
@@ -5089,6 +5469,56 @@ mod strategy_name_pin {
                     | strategy_set::BIT_BIN15
                     | strategy_set::BIT_HYPARB,
             ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// XMM XH1 (O-XH1): `icdp` and `ai+icdp` are gone as names — the
+    /// old wrapper line refuses the boot instead of composing a different
+    /// member — and the three slot-6 names resolve to bit 6.
+    #[test]
+    fn icdp_is_refused_and_the_xmm_names_resolve() {
+        assert_eq!(strategy_set::mask_for_name("icdp"), None);
+        assert_eq!(strategy_set::mask_for_name("ai+icdp"), None);
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"icdp"));
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"ai+icdp"));
+        let want = [
+            ("xmm", strategy_set::BIT_XMM),
+            (
+                "ai+xmm",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_XMM,
+            ),
+            (
+                "ai+vrp+xsd+bin15+hyparb+xmm",
+                strategy_set::BUILT_MASK & !strategy_set::BIT_HCV,
+            ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// HC11 (O-HC18): the three slot-7 names resolve to bit 7, and the
+    /// widest one composes every slot.
+    #[test]
+    fn the_hcv_names_resolve() {
+        let want = [
+            ("hcv", strategy_set::BIT_HCV),
+            (
+                "ai+hcv",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HCV,
+            ),
+            ("ai+vrp+xsd+bin15+hyparb+xmm+hcv", strategy_set::BUILT_MASK),
         ];
         let mut i = 0;
         while i < want.len() {

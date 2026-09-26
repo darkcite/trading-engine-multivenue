@@ -22,14 +22,36 @@
 //! | 3 | `strategy-bin15` | built (BIN15 O4b, 2026-09-12 — **was `strategy-rule-tree`**, unlinked the same day) — configured only when `~/multivenue/bin15.toml` + its seeds resolve |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
 //! | 5 | `strategy-vm` | built (8g item 6) |
-//! | 6 | `strategy-icdp` | built (ICDP I4, 2026-09-03) — configured only when `~/multivenue/icdp.toml` resolves |
+//! | 6 | `strategy-xmm` | built (XMM XH1, 2026-09-26 — **was `strategy-icdp`**, unlinked the same day, O-XH1; lands DARK until XH3) — configured only when `~/multivenue/xmm.toml` resolves |
+//! | 7 | `strategy-hcv` | built (HC11, 2026-09-26 — Hypercall S1; lands DARK, paper only, in no configured mask, O-HC18) — configured only when `~/multivenue/hcv.toml` resolves |
 //!
-//! Slot 7 is the only reserved value: no member exists behind it, no
-//! bit constant is defined (the cli cannot express it via
-//! [`mask_for_name`]), and an `EnableStrategy` targeting it is
-//! refused (counted). Slot 2 changed hands on 2026-09-12:
+//! Every slot is built since HC11: an `EnableStrategy` for a slot past 7
+//! is refused (counted), and slot 7 was never assigned before, so no
+//! capture carries rows of another member under it. Slot 2 changed hands on 2026-09-12:
 //! `strategy-cross-arb` was unlinked (the crate stays in the workspace
 //! — the `strategy-ev` precedent) and `strategy-xsd` took the number.
+//! Slot 6 changed hands on 2026-09-26 the same way: `strategy-icdp`
+//! stays in the workspace (and `backtest --member icdp` still drives
+//! it); nothing in the set links it.
+//!
+//! ## Timers are per slot (XMM XH1)
+//!
+//! The engine calls [`Strategy::on_timer`] at the set's
+//! [`Strategy::timer_period_ns`] — the smallest period of any built
+//! member. Each member is then called only when ITS OWN period has
+//! elapsed since its own last call, so a fast member no longer runs
+//! everyone's timer at its rate. Every member that existed before XH1
+//! has a 1 s period or an empty `on_timer`, so each fires exactly when
+//! it fired before. The regime detector and the long-tenor HAR set are
+//! timer clients the same way, each on its own [`REGIME_TIMER_NS`] clock
+//! once configured.
+//!
+//! ## Trades and order events (XMM XH1)
+//!
+//! [`Strategy::on_trade`] fans out to enabled members like `on_tick`.
+//! [`Strategy::on_order_event`] goes to the slot that placed the order
+//! ALONE — the X1 fill law — and an event for a disabled, unbuilt or
+//! unattributed slot is counted, never delivered.
 //!
 //! ## AI command routing (`on_ai`, §7)
 //!
@@ -85,25 +107,39 @@ use core_regime::{
 };
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::REL_UNKNOWN;
+use core_ring::MailboxTx;
+use core_vol::{LongForecast, LongSetCounters, LongStateSnap, LongVolSet, DAY_NS};
 use core_types::{
-    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, RegimeLabelSet, RegimeWord,
-    RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_PROFILES, STRATEGY_SLOT_AI_EXEC,
-    STRATEGY_SLOT_VM,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, OrderEvent, RegimeLabelSet,
+    RegimeWord, RuleTableV2, Signal, Tick, TradePrint, REGIME_OFF_HARD, REGIME_PROFILES,
+    STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{
-    Ctx, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters, Strategy, StrategyCounters,
-    StrategyError, SubmitErr, VmRowView, REGIME_REL_SYMS,
+    Ctx, HarCounters, HarSeriesView, RegimeCounters, RegimeGate, RegimeRelView, SlotCounters,
+    Strategy, StrategyCounters, StrategyError, SubmitErr, VmRowView, HAR_VIEW_NAME_MAX,
+    HAR_VIEW_SERIES, HAR_VIEW_TENORS, HAR_VIEW_TENORS_D, HAR_VIEW_WEEKDAYS, REGIME_REL_SYMS,
 };
 
 // RG6: `regime_rel_view` copies the detector's view arrays straight
 // into the trait's POD — the two capacities must agree.
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
+// HAR H3.5: `/state.har` carries every series the set can run, whole
+// names, the engine's own weekday count, and only tenors it forecasts.
+const _: () = assert!(HAR_VIEW_SERIES == core_vol::LONG_SET_MAX);
+const _: () = assert!(HAR_VIEW_NAME_MAX == core_vol::LONG_SET_NAME_MAX);
+const _: () = assert!(HAR_VIEW_WEEKDAYS == core_vol::WEEKDAYS);
+const _: () = assert!(strategy_core::HAR_DAY_MS == core_vol::DAY_MS);
+const _: () = assert!(HAR_VIEW_TENORS_D[HAR_VIEW_TENORS - 1] as usize <= core_vol::LONG_TAU_DAYS_MAX);
+const _: () = assert!(
+    core::mem::size_of::<HarCounters>() == core::mem::size_of::<LongSetCounters>()
+);
 use strategy_bin15::Bin15Strategy;
 use strategy_hyparb::HyparbStrategy;
-use strategy_icdp::IcdpStrategy;
 use strategy_vm::VmStrategy;
+use strategy_hcv::HcvStrategy;
 use strategy_vrp::VrpStrategy;
+use strategy_xmm::XmmStrategy;
 use strategy_xsd::XsdStrategy;
 
 // ---------------------------------------------------------------
@@ -156,9 +192,22 @@ pub const SLOT_AI_EXEC: u8 = STRATEGY_SLOT_AI_EXEC;
 /// Slot index of the vm member (wire value pinned in `core-types` —
 /// `RulesetStage`/`RulesetCommit` shape enforcement depends on it).
 pub const SLOT_VM: u8 = STRATEGY_SLOT_VM;
-/// Slot index of the icdp member (ICDP I4; `docs/wire-format.md`
-/// `Order.strategy_id` 6 = icdp).
-pub const SLOT_ICDP: u8 = 6;
+/// Slot index of the xmm member (XMM XH1, ruling O-XH1).
+///
+/// **The third swap boundary.** Slot 6 was `strategy-icdp` (ICDP I4,
+/// 2026-09-03) until 2026-09-26; icdp is UNLINKED — the crate stays in
+/// the workspace and `backtest --member icdp` still drives it, but
+/// nothing in the set links it and no mask name reaches it. The NUMBER
+/// is wire-stable — `Order.strategy_id` 6 and `AiCmd::strategy_id` 6
+/// still mean "slot 6" — so a capture taken before XH1 carries icdp
+/// rows under this slot and one taken after carries xmm rows.
+/// `docs/migration.md` records the boundary.
+pub const SLOT_XMM: u8 = 6;
+/// Slot index of the hcv member (HC11, ruling O-HC18): the Hypercall S1
+/// options member — DARK, paper only (`exec.toml` refuses a live slot 7
+/// until its own arming ruling). Slot 7 was reserved until HC11, so the
+/// number carries no earlier member's rows.
+pub const SLOT_HCV: u8 = 7;
 
 /// Enable-mask bit for the hyparb member (slot 0 — see [`SLOT_HYPARB`]).
 pub const BIT_HYPARB: u8 = 1 << SLOT_HYPARB;
@@ -174,12 +223,14 @@ pub const BIT_BIN15: u8 = 1 << SLOT_BIN15;
 pub const BIT_AI_EXEC: u8 = 1 << SLOT_AI_EXEC;
 /// Enable-mask bit for the vm member (8g item 6).
 pub const BIT_VM: u8 = 1 << SLOT_VM;
-/// Enable-mask bit for the icdp member (ICDP I4).
-pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
+/// Enable-mask bit for the xmm member (slot 6 — see [`SLOT_XMM`]).
+pub const BIT_XMM: u8 = 1 << SLOT_XMM;
+/// Enable-mask bit for the hcv member (slot 7 — see [`SLOT_HCV`]).
+pub const BIT_HCV: u8 = 1 << SLOT_HCV;
 
-/// Every built member's bit (slots 0–6).
+/// Every built member's bit (slots 0–7: all of them since HC11).
 pub const BUILT_MASK: u8 =
-    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_XMM | BIT_HCV;
 
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
@@ -231,11 +282,28 @@ pub const MASK_TABLE: &[(&str, u8)] = &[
     // strategies disabled at boot; the engine executes only what
     // the AI command plane pushes — ai-exec intents + VM rulesets).
     ("ai", BIT_AI_EXEC | BIT_VM),
-    // ICDP I4: the operator opts the intrabar member in beside
-    // the AI lanes (paper only — the wrapper refuses it without
-    // `--paper`); `icdp` alone boots it bare.
-    ("icdp", BIT_ICDP),
-    ("ai+icdp", BIT_AI_EXEC | BIT_VM | BIT_ICDP),
+    // XMM XH1 (2026-09-26, O-XH1): slot 6 is the xmm member; `icdp`
+    // and `ai+icdp` are GONE as names — an operator who types the old
+    // one gets a boot refusal, not a different strategy than the one
+    // asked for. The member boots only with its artifact
+    // (`~/multivenue/xmm.toml`), paper only; the last name is the live
+    // set plus xmm, for the XH3 paper run.
+    ("xmm", BIT_XMM),
+    ("ai+xmm", BIT_AI_EXEC | BIT_VM | BIT_XMM),
+    (
+        "ai+vrp+xsd+bin15+hyparb+xmm",
+        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB | BIT_XMM,
+    ),
+    // HC11 (2026-09-26, O-HC18): slot 7 is the hcv member — Hypercall
+    // S1, DARK: paper only and in no configured mask. It boots only with
+    // its artifact (`~/multivenue/hcv.toml`); the last name is the live
+    // set plus xmm and hcv, so switching it on is one `STRATEGY=` line.
+    ("hcv", BIT_HCV),
+    ("ai+hcv", BIT_AI_EXEC | BIT_VM | BIT_HCV),
+    (
+        "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
+        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB | BIT_XMM | BIT_HCV,
+    ),
     // VRP V7: slot 1 is the VRP member. `ev` is GONE as a name —
     // an operator who types it must get a boot refusal, not a
     // different strategy than the one they asked for.
@@ -280,9 +348,10 @@ pub struct StrategySet {
     bin15: Bin15Strategy,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
     vm: VmStrategy,
-    icdp: IcdpStrategy,
-    /// Runtime enable mask (bits per the slot map). Only built bits
-    /// are ever set — Enable of a reserved slot is refused.
+    xmm: XmmStrategy,
+    hcv: HcvStrategy,
+    /// Runtime enable mask (bits per the slot map). Every bit is a
+    /// built slot since HC11.
     enabled: u8,
     /// Initial mask as passed to [`Self::new`] — `on_start` validates
     /// exactly these members.
@@ -296,6 +365,14 @@ pub struct StrategySet {
     /// X1: fills stamped for a slot that is not enabled, or not built.
     /// Mirrored to `engine_set_fills_unrouted_total`.
     fills_unrouted: u64,
+    /// XMM XH1: order events for a slot that is not enabled, not built,
+    /// or not attributed — counted, never delivered.
+    order_events_unrouted: u64,
+    /// XMM XH1: when each slot's `on_timer` last ran (per-slot gating —
+    /// module docs).
+    timer_last_ns: [NsTs; 8],
+    /// XMM XH1: when the regime detector's timer last ran.
+    regime_timer_last_ns: NsTs,
     /// RG2: the regime detector (boot-boxed; inert until
     /// [`Self::configure_regime`] — every word UNKNOWN, every gate open
     /// for the unconstrained members that exist today).
@@ -309,10 +386,35 @@ pub struct StrategySet {
     regime_declared_total: u64,
     /// RG2: gate edges fanned out (`on_regime` calls).
     regime_gate_changes: u64,
+    /// HAR H3.3: the long-tenor HAR series (boot-boxed; inert until the
+    /// cli configures it from `har.toml` — one branch per tick and per
+    /// poll, so a boot without the file is the pre-H3 set, bit for bit).
+    /// Beside the regime detector, in the same seat and on the same 1 s
+    /// period (its own clock); no member reads it (plan law L4).
+    har: Box<LongVolSet>,
+    /// HAR H3.5: each series' `/state.har` row as of its newest day close
+    /// or the restore — rebuilt in `on_timer` only when that series'
+    /// epoch moved (the forecasts do not move between day closes), so
+    /// the 1 s publish copies rows instead of re-reading 9 tenors × 12
+    /// engines. Boot-boxed.
+    har_view: Box<[HarSeriesView; HAR_VIEW_SERIES]>,
+    /// The epoch each cached row was built at (`u64::MAX`: never).
+    har_view_epoch: [u64; HAR_VIEW_SERIES],
+    /// When the long-tenor set's timer last ran: its own clock on the
+    /// regime's 1 s period (XMM XH1's per-slot timers).
+    har_timer_last_ns: NsTs,
+    /// HAR H3.7: one mailbox per series to the cli's state-writer thread
+    /// (`har.toml` order). Empty = no writer: the cli writes the state on
+    /// the engine thread instead (the pre-H3.7 path). Boot-only.
+    har_out: Vec<MailboxTx<LongStateSnap>>,
+    /// HAR H3.7: the epoch each series' state was last handed to the writer.
+    har_offered: [u64; HAR_VIEW_SERIES],
 }
 
 /// RG2: the set's timer cadence once a detector is configured — the
 /// regime rolls once per wall minute, the timer polls for the boundary.
+/// HAR H3.3: a configured long-tenor set arms the same poll (its minute
+/// rolls and its staggered day closes ride it).
 pub const REGIME_TIMER_NS: u64 = 1_000_000_000;
 
 impl StrategySet {
@@ -331,17 +433,107 @@ impl StrategySet {
             bin15: Bin15Strategy::new(),
             ai_exec: AiExec::new(),
             vm: VmStrategy::new(),
-            icdp: IcdpStrategy::new(),
+            xmm: XmmStrategy::new(),
+            hcv: HcvStrategy::new(),
             enabled: m,
             initial: m,
             halted: false,
             enable_refused: 0,
             fills_unrouted: 0,
+            order_events_unrouted: 0,
+            timer_last_ns: [0; 8],
+            regime_timer_last_ns: 0,
             regime: RegimeState::new_boxed(),
             regime_labels: [RegimeLabelSet::ANY; 8],
             regime_gates: [RegimeGate::OPEN_UNKNOWN; 8],
             regime_declared_total: 0,
             regime_gate_changes: 0,
+            har: Box::new(LongVolSet::new()),
+            har_view: Box::new([HarSeriesView::default(); HAR_VIEW_SERIES]),
+            har_view_epoch: [u64::MAX; HAR_VIEW_SERIES],
+            har_timer_last_ns: 0,
+            har_out: Vec::new(),
+            har_offered: [0; HAR_VIEW_SERIES],
+        }
+    }
+
+    // ---- HAR H3.3: the long-tenor HAR series --------------------------
+
+    /// The long-tenor HAR series (readers: `/state`, the state writer).
+    pub fn har(&self) -> &LongVolSet {
+        &self.har
+    }
+
+    /// Boot only: configure the series (`core_vol::LongVolSet::configure`)
+    /// and restore their state. Nothing on the engine loop calls this.
+    pub fn har_mut(&mut self) -> &mut LongVolSet {
+        &mut self.har
+    }
+
+    /// HAR H3.7, boot only: from now on hand each series' state to the
+    /// cli's state-writer thread through `out` (one mailbox per series,
+    /// `har.toml` order), at each of its day closes — instead of the cli's
+    /// render and fsync on the engine thread. The epochs the restore left
+    /// count as handed: a boot that changed nothing writes nothing.
+    pub fn install_har_outbox(&mut self, out: Vec<MailboxTx<LongStateSnap>>) {
+        debug_assert_eq!(out.len(), self.har.len(), "one mailbox per configured series");
+        let mut i = 0usize;
+        while i < HAR_VIEW_SERIES {
+            self.har_offered[i] = self.har.series_epoch(i);
+            i += 1;
+        }
+        self.har_out = out;
+    }
+
+    /// HAR H3.7: hand the state of every series whose epoch moved (its day
+    /// close, or the restore) to the writer — one ~201 KiB copy into its
+    /// mailbox, the engine thread's whole share of the write. A mailbox the
+    /// writer still holds (a write in flight, or failing) is tried again at
+    /// the next poll, so the newest state follows. Nothing without a writer.
+    #[inline]
+    fn offer_har_state(&mut self) {
+        let n = self.har.len().min(self.har_out.len()).min(HAR_VIEW_SERIES);
+        let mut i = 0usize;
+        while i < n {
+            let e = self.har.series_epoch(i);
+            if e != self.har_offered[i] {
+                if let Some(tx) = self.har_out.get_mut(i) {
+                    if let Some(mut slot) = tx.try_fill() {
+                        if self.har.snapshot_series(i, &mut slot) {
+                            self.har_offered[i] = e;
+                            slot.commit();
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// HAR H3.5: rebuild the cached `/state.har` row of every series whose
+    /// epoch moved since its row was built — at most one a poll in steady
+    /// state (the day closes are staggered), all of them once after the
+    /// boot restore. `n` compares when nothing moved; nothing while inert.
+    ///
+    /// HC11 (O-HC22 — law L4 lifted for slot 7 alone): when a row moved,
+    /// the hcv member is handed the rows (its σ̂), enabled or not, so it
+    /// is current the moment it is enabled. Once a series per UTC day.
+    #[inline]
+    fn refresh_har_view(&mut self) {
+        let n = self.har.len().min(HAR_VIEW_SERIES);
+        let mut moved = false;
+        let mut i = 0usize;
+        while i < n {
+            let e = self.har.series_epoch(i);
+            if e != self.har_view_epoch[i] {
+                self.har_view[i] = har_row(&self.har, i);
+                self.har_view_epoch[i] = e;
+                moved = true;
+            }
+            i += 1;
+        }
+        if moved {
+            self.hcv.set_har_view(&self.har_view[..n]);
         }
     }
 
@@ -386,7 +578,8 @@ impl StrategySet {
             SLOT_XSD => self.xsd.set_regime_label(set),
             SLOT_BIN15 => self.bin15.set_regime_label(set),
             SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
-            SLOT_ICDP => self.icdp.set_regime_label(set),
+            SLOT_XMM => self.xmm.set_regime_label(set),
+            SLOT_HCV => self.hcv.set_regime_label(set),
             _ => false,
         };
         if ok {
@@ -428,8 +621,8 @@ impl StrategySet {
         self.regime_labels[SLOT_BIN15 as usize] = self.bin15.regime_label();
         self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
         self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
-        self.regime_labels[SLOT_ICDP as usize] = self.icdp.regime_label();
-        self.regime_labels[7] = RegimeLabelSet::ANY;
+        self.regime_labels[SLOT_XMM as usize] = self.xmm.regime_label();
+        self.regime_labels[SLOT_HCV as usize] = self.hcv.regime_label();
     }
 
     /// The gate verdict for `slot` on the current effective words.
@@ -510,9 +703,12 @@ impl StrategySet {
             SLOT_VM => self
                 .vm
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_ICDP => self
-                .icdp
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_ICDP)),
+            SLOT_XMM => self
+                .xmm
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
+            SLOT_HCV => self
+                .hcv
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_HCV)),
             _ => {}
         }
     }
@@ -562,10 +758,13 @@ impl StrategySet {
                 .ai_exec
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
             SLOT_VM => self.vm.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_ICDP => self
-                .icdp
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_ICDP)),
-            // Slot 7 is not built. A fill stamped with it is a bug
+            SLOT_XMM => self
+                .xmm
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
+            SLOT_HCV => self
+                .hcv
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HCV)),
+            // No slot past 7 exists. A fill stamped with one is a bug
             // upstream, not a member to deliver to.
             _ => self.fills_unrouted = self.fills_unrouted.wrapping_add(1),
         }
@@ -578,6 +777,63 @@ impl StrategySet {
     #[must_use]
     pub const fn fills_unrouted(&self) -> u64 {
         self.fills_unrouted
+    }
+
+    /// XMM XH1: deliver an order event to exactly one enabled slot —
+    /// the [`Self::route_fill_to_slot`] law.
+    #[inline(always)]
+    fn route_order_event_to_slot<C: Ctx>(&mut self, slot: u8, event: &OrderEvent, ctx: &mut C) {
+        match slot {
+            SLOT_HYPARB => self
+                .hyparb
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
+            SLOT_VRP => self
+                .vrp
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
+            SLOT_XSD => self
+                .xsd
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
+            SLOT_BIN15 => self
+                .bin15
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
+            SLOT_AI_EXEC => self
+                .ai_exec
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
+            SLOT_VM => self
+                .vm
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
+            SLOT_XMM => self
+                .xmm
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
+            SLOT_HCV => self
+                .hcv
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HCV)),
+            // No slot past 7 exists — the caller's mask check keeps it
+            // out, and this arm counts it if that ever changes.
+            _ => self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1),
+        }
+    }
+
+    /// XMM XH1: order events that reached the set for a slot that is not
+    /// enabled, not built, or not attributed. Non-zero means an order
+    /// outlived a `DisableStrategy`, or an event is not ours.
+    #[inline]
+    #[must_use]
+    pub const fn order_events_unrouted(&self) -> u64 {
+        self.order_events_unrouted
+    }
+
+    /// XMM XH1: the per-slot timer gate — true, and the slot's clock
+    /// advanced, when `period` has elapsed since the slot last ran.
+    /// `u64::MAX` never fires (a member with no timer).
+    #[inline(always)]
+    fn timer_due(last_ns: &mut NsTs, period: u64, now_ns: NsTs) -> bool {
+        if period != u64::MAX && now_ns.saturating_sub(*last_ns) >= period {
+            *last_ns = now_ns;
+            true
+        } else {
+            false
+        }
     }
 
     /// Configure the VRP member (boot-only).
@@ -632,17 +888,24 @@ impl StrategySet {
         &mut self.vm
     }
 
-    /// Read the icdp member (counters, params hash).
+    /// Configure the xmm member (boot-only: `configure` with the
+    /// resolved artifact).
     #[inline]
-    pub fn icdp(&self) -> &IcdpStrategy {
-        &self.icdp
+    pub fn xmm_mut(&mut self) -> &mut XmmStrategy {
+        &mut self.xmm
     }
 
-    /// Configure the icdp member (boot-only: `configure` with the wall
-    /// anchor + the resolved artifact).
+    /// Configure the hcv member (boot-only: `configure` with the resolved
+    /// artifact, `install_events` with the calendar's mailbox).
     #[inline]
-    pub fn icdp_mut(&mut self) -> &mut IcdpStrategy {
-        &mut self.icdp
+    pub fn hcv_mut(&mut self) -> &mut HcvStrategy {
+        &mut self.hcv
+    }
+
+    /// The hcv member (cli: boot tells).
+    #[inline]
+    pub fn hcv(&self) -> &HcvStrategy {
+        &self.hcv
     }
 
     /// Set-level `EnableStrategy` handling. See module docs.
@@ -659,9 +922,9 @@ impl StrategySet {
             SLOT_BIN15 => BIT_BIN15,
             SLOT_AI_EXEC => BIT_AI_EXEC,
             SLOT_VM => BIT_VM,
-            SLOT_ICDP => BIT_ICDP,
-            // Reserved slot (7): no member behind it — refuse and
-            // count.
+            SLOT_XMM => BIT_XMM,
+            SLOT_HCV => BIT_HCV,
+            // No slot past 7: no member behind it — refuse and count.
             _ => {
                 self.enable_refused = self.enable_refused.wrapping_add(1);
                 return;
@@ -700,7 +963,8 @@ impl StrategyCounters for StrategySet {
             + self.bin15.orders_emitted()
             + self.ai_exec.orders_emitted()
             + self.vm.orders_emitted()
-            + self.icdp.orders_emitted()
+            + self.xmm.orders_emitted()
+            + self.hcv.orders_emitted()
     }
     #[inline]
     fn orders_dropped(&self) -> u64 {
@@ -710,7 +974,8 @@ impl StrategyCounters for StrategySet {
             + self.bin15.orders_dropped()
             + self.ai_exec.orders_dropped()
             + self.vm.orders_dropped()
-            + self.icdp.orders_dropped()
+            + self.xmm.orders_dropped()
+            + self.hcv.orders_dropped()
     }
     #[inline]
     fn strategy_kind(&self) -> &'static str {
@@ -767,10 +1032,6 @@ impl StrategyCounters for StrategySet {
     fn vm_regime_hard_exits(&self) -> u64 {
         self.vm.regime_hard_exits
     }
-    #[inline]
-    fn icdp_counters(&self) -> strategy_core::IcdpCounters {
-        self.icdp.icdp_counters()
-    }
     /// VRP V7: slot 1's observables.
     #[inline]
     fn vrp_counters(&self) -> strategy_core::VrpCounters {
@@ -798,8 +1059,64 @@ impl StrategyCounters for StrategySet {
         self.fills_unrouted
     }
     #[inline]
+    fn order_events_unrouted(&self) -> u64 {
+        self.order_events_unrouted
+    }
+    #[inline]
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
+    }
+    /// HAR H3.4: the long-tenor series (the set owns them, no member).
+    #[inline]
+    fn har_series(&self) -> usize {
+        self.har.len()
+    }
+    #[inline]
+    fn har_series_epoch(&self, i: usize) -> u64 {
+        self.har.series_epoch(i)
+    }
+    fn render_har_series(&self, i: usize, out: &mut String) -> bool {
+        let (Some(name), Some(e)) = (self.har.name(i), self.har.engine(i)) else {
+            return false;
+        };
+        core_vol::render_state_file(core::str::from_utf8(name).unwrap_or("?"), e, out);
+        true
+    }
+    /// HAR H3.5: the set's counters, field for field.
+    #[inline]
+    fn har_counters(&self) -> HarCounters {
+        let c = self.har.counters();
+        HarCounters {
+            minutes_rolled: c.minutes_rolled,
+            closes: c.closes,
+            day_closes: c.day_closes,
+            held: c.held,
+            forced: c.forced,
+            day_close_ns_max: c.day_close_ns_max,
+            day_close_ns_last: c.day_close_ns_last,
+            epoch: c.epoch,
+        }
+    }
+    /// HAR H3.5: the cached rows, with the three per-minute fields read
+    /// live. Never allocates.
+    fn har_series_view(&self, out: &mut [HarSeriesView]) -> u32 {
+        let n = self.har.len().min(HAR_VIEW_SERIES);
+        let m = n.min(out.len());
+        let mut i = 0usize;
+        while i < m {
+            let mut v = self.har_view[i];
+            if let Some(e) = self.har.engine(i) {
+                v.last_min_ms = e.last_min_ts_ms();
+                v.open_minutes = match e.open_day() {
+                    Some((_, _, n_min)) => n_min,
+                    None => 0,
+                };
+                v.gaps = e.gaps();
+            }
+            out[i] = v;
+            i += 1;
+        }
+        n as u32
     }
     /// HYPARB H4: slot 0's observables.
     #[inline]
@@ -813,6 +1130,28 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn hyparb_coins_view(&self, out: &mut [strategy_core::HyparbCoinView]) -> u32 {
         self.hyparb.hyparb_coins_view(out)
+    }
+    /// XMM XH3: slot 6's counters and per-perp rows (`/metrics`,
+    /// `/state`). An unconfigured member reports zeros and no rows.
+    #[inline]
+    fn xmm_counters(&self, out: &mut strategy_core::XmmCounters) {
+        self.xmm.xmm_counters(out);
+    }
+    #[inline]
+    fn xmm_perps_view(&self, out: &mut [strategy_core::XmmPerpView]) -> u32 {
+        self.xmm.xmm_perps_view(out)
+    }
+    /// HC11: slot 7's counters (`/metrics`, `/state`). An unconfigured
+    /// member reports zeros.
+    #[inline]
+    fn hcv_counters(&self, out: &mut strategy_core::HcvCounters) {
+        self.hcv.hcv_counters(out);
+    }
+    /// HC11b: slot 7's book, for the shutdown's forced write — enabled or
+    /// not (a member switched off at runtime still holds its positions).
+    #[inline]
+    fn render_hcv_state(&self, out: &mut String) -> bool {
+        self.hcv.render_hcv_state(out)
     }
     #[inline]
     fn hyparb_decision_log(&self) -> (&[strategy_core::HyparbDecision], u64) {
@@ -898,7 +1237,8 @@ impl StrategyCounters for StrategySet {
             SLOT_BIN15 => (self.bin15.orders_emitted(), self.bin15.orders_dropped()),
             SLOT_AI_EXEC => (self.ai_exec.orders_emitted(), self.ai_exec.orders_dropped()),
             SLOT_VM => (self.vm.orders_emitted(), self.vm.orders_dropped()),
-            SLOT_ICDP => (self.icdp.orders_emitted(), self.icdp.orders_dropped()),
+            SLOT_XMM => (self.xmm.orders_emitted(), self.xmm.orders_dropped()),
+            SLOT_HCV => (self.hcv.orders_emitted(), self.hcv.orders_dropped()),
             _ => return SlotCounters::default(),
         };
         let label = self.regime_labels[slot as usize];
@@ -915,18 +1255,6 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vm_rows_view(&self, out: &mut [VmRowView]) -> u32 {
         self.vm.rows_view(out)
-    }
-    #[inline]
-    fn icdp_params_hash(&self) -> [u8; 32] {
-        if self.icdp.is_configured() {
-            *self.icdp.params_hash()
-        } else {
-            [0; 32]
-        }
-    }
-    #[inline]
-    fn icdp_instruments(&self) -> u32 {
-        self.icdp.instruments() as u32
     }
     /// The detector's per-symbol REL state (its view minus the words).
     fn regime_rel_view(&self) -> RegimeRelView {
@@ -1015,9 +1343,13 @@ impl Strategy for StrategySet {
         if self.initial & BIT_VM != 0 {
             self.vm.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VM))?;
         }
-        if self.initial & BIT_ICDP != 0 {
-            self.icdp
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_ICDP))?;
+        if self.initial & BIT_XMM != 0 {
+            self.xmm
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_XMM))?;
+        }
+        if self.initial & BIT_HCV != 0 {
+            self.hcv
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_HCV))?;
         }
         Ok(())
     }
@@ -1027,6 +1359,8 @@ impl Strategy for StrategySet {
         // RG2: the detector sees every fresh tick first (one probe +
         // one store for members, one probe for everything else).
         self.regime.on_tick(tick);
+        // HAR H3.3: so does the long-tenor set (one branch while inert).
+        self.har.on_tick(tick);
         if self.enabled & BIT_HYPARB != 0 {
             self.hyparb
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
@@ -1051,9 +1385,13 @@ impl Strategy for StrategySet {
             self.vm
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
@@ -1083,9 +1421,13 @@ impl Strategy for StrategySet {
             self.vm
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
@@ -1128,9 +1470,13 @@ impl Strategy for StrategySet {
             self.vm
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
@@ -1162,9 +1508,13 @@ impl Strategy for StrategySet {
             self.vm
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
@@ -1196,10 +1546,70 @@ impl Strategy for StrategySet {
             self.vm
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
+        }
+    }
+
+    /// XMM XH1: trade prints fan out to enabled members exactly like
+    /// ticks — same mask gate, same slot stamping. Every member but
+    /// xmm inherits the default no-op.
+    #[inline(always)]
+    fn on_trade<C: Ctx>(&mut self, trade: &TradePrint, ctx: &mut C) {
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
+        }
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
+        }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
+        }
+        if self.enabled & BIT_AI_EXEC != 0 {
+            self.ai_exec
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
+        }
+        if self.enabled & BIT_VM != 0 {
+            self.vm
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
+        }
+    }
+
+    /// XMM XH1: an order event goes to the slot that placed the order
+    /// ALONE — the X1 fill law, and stricter: an event is never fanned
+    /// out, because an event about slot 3's order handed to slot 6 would
+    /// move slot 6's order state machine for an order it never sent. An
+    /// event for a disabled, unbuilt or unattributed
+    /// (`STRATEGY_ID_NONE`) slot is counted (`order_events_unrouted`),
+    /// never delivered.
+    #[inline(always)]
+    fn on_order_event<C: Ctx>(&mut self, event: &OrderEvent, ctx: &mut C) {
+        let slot = event.strategy_id;
+        if slot >= 8 || self.enabled & (1u8 << slot) == 0 {
+            self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1);
+            return;
+        }
+        self.route_order_event_to_slot(slot, event, ctx);
     }
 
     /// X1: an ATTRIBUTED fill goes to its slot ALONE.
@@ -1253,9 +1663,13 @@ impl Strategy for StrategySet {
             self.vm
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
@@ -1328,9 +1742,13 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0 {
+            self.hcv
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
@@ -1348,55 +1766,142 @@ impl Strategy for StrategySet {
         self.vm.receive_table_v2(table);
     }
 
+    /// XMM XH1: each timer client runs on ITS OWN period (module docs,
+    /// "Timers are per slot"): the regime detector and the long-tenor
+    /// set every [`REGIME_TIMER_NS`] once configured, and each enabled
+    /// member when its own `timer_period_ns` has elapsed since its own
+    /// last call.
+    ///
+    /// Before XH1 every enabled member ran on every call, at the set's
+    /// minimum period. The members that existed then all run a 1 s
+    /// period or an empty `on_timer` (hyparb, xsd and bin15 when
+    /// configured; vrp, ai-exec and vm never), and without xmm the set's
+    /// own period is that same 1 s — so a member's clock equals the
+    /// engine's and each fires exactly when it did. A `u64::MAX` member
+    /// is no longer called at all, which its empty body cannot notice.
     #[inline(always)]
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
         // RG2: roll the minute clock (nothing until a boundary) and
         // re-judge the gates only when an effective word changed.
         // RG3: a roll that changed no word may still have moved a
         // member's REL — the vm's `rel:` rows get the view anyway.
-        let minutes_before = self.regime.minutes_judged();
-        if self.regime.on_timer(now_ns) != 0 {
-            self.refresh_gates(ctx);
-        } else if self.regime.minutes_judged() != minutes_before {
-            self.push_regime_views();
+        // An unconfigured detector's timer is a no-op, so it arms none.
+        let regime_period = if self.regime.is_configured() {
+            REGIME_TIMER_NS
+        } else {
+            u64::MAX
+        };
+        if Self::timer_due(&mut self.regime_timer_last_ns, regime_period, now_ns) {
+            let minutes_before = self.regime.minutes_judged();
+            if self.regime.on_timer(now_ns) != 0 {
+                self.refresh_gates(ctx);
+            } else if self.regime.minutes_judged() != minutes_before {
+                self.push_regime_views();
+            }
         }
-        if self.enabled & BIT_HYPARB != 0 {
+        // HAR H3.3: the long-tenor minute roll and its staggered day
+        // closes, every 1 s once configured, on its own clock (XMM XH1's
+        // per-slot timers; an inert set arms none). H3.5: then the
+        // `/state.har` row of the series whose day just closed.
+        let har_period = if self.har.is_configured() {
+            REGIME_TIMER_NS
+        } else {
+            u64::MAX
+        };
+        if Self::timer_due(&mut self.har_timer_last_ns, har_period, now_ns) {
+            self.har.on_timer(now_ns);
+            self.refresh_har_view();
+            self.offer_har_state();
+        }
+        if self.enabled & BIT_HYPARB != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_HYPARB as usize],
+                self.hyparb.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.hyparb
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
-        if self.enabled & BIT_VRP != 0 {
+        if self.enabled & BIT_VRP != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_VRP as usize],
+                self.vrp.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.vrp
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_XSD != 0 {
+        if self.enabled & BIT_XSD != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_XSD as usize],
+                self.xsd.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.xsd
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_BIN15 != 0 {
+        if self.enabled & BIT_BIN15 != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_BIN15 as usize],
+                self.bin15.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.bin15
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
-        if self.enabled & BIT_AI_EXEC != 0 {
+        if self.enabled & BIT_AI_EXEC != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_AI_EXEC as usize],
+                self.ai_exec.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.ai_exec
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
-        if self.enabled & BIT_VM != 0 {
+        if self.enabled & BIT_VM != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_VM as usize],
+                self.vm.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.vm
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_XMM as usize],
+                self.xmm.timer_period_ns(),
+                now_ns,
+            )
+        {
+            self.xmm
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+        if self.enabled & BIT_HCV != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_HCV as usize],
+                self.hcv.timer_period_ns(),
+                now_ns,
+            )
+        {
+            self.hcv
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HCV));
         }
     }
 
     /// Minimum over the BUILT members (mask-independent so the
     /// engine's timer arming is stable across runtime Enable/Disable;
-    /// `on_timer` itself fans out to enabled members only). All seven
-    /// members currently return `u64::MAX` (disabled); a configured
-    /// regime detector arms the 1 s [`REGIME_TIMER_NS`] poll.
+    /// `on_timer` gates each member on its own period). A configured
+    /// regime detector or long-tenor set arms the 1 s
+    /// [`REGIME_TIMER_NS`] poll.
     fn timer_period_ns(&self) -> u64 {
-        let mut min = if self.regime.is_configured() {
+        let mut min = if self.regime.is_configured() || self.har.is_configured() {
             REGIME_TIMER_NS
         } else {
             u64::MAX
@@ -1425,7 +1930,11 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
-        let v = self.icdp.timer_period_ns();
+        let v = self.xmm.timer_period_ns();
+        if v < min {
+            min = v;
+        }
+        let v = self.hcv.timer_period_ns();
         if v < min {
             min = v;
         }
@@ -1433,6 +1942,9 @@ impl Strategy for StrategySet {
     }
 
     fn on_stop<C: Ctx>(&mut self, ctx: &mut C) {
+        // HAR H3.3: a minute still held by the stagger goes in before
+        // the shutdown state write.
+        self.har.drain_held();
         // Stop is unconditional — even disabled members get the
         // teardown callback (they may hold capture-worthy state some
         // day; today all six are no-ops).
@@ -1445,8 +1957,72 @@ impl Strategy for StrategySet {
         self.ai_exec
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
-        self.icdp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        self.xmm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        self.hcv.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_HCV));
     }
+}
+
+// ---------------------------------------------------------------
+// HAR H3.5: one series' `/state.har` row
+// ---------------------------------------------------------------
+
+/// An annualised σ ×1e9 as the row's ×1e6 `i32` (`0` = none; a σ past
+/// ~2 147 annualised saturates — no real series is near it).
+#[inline]
+fn har_sigma_1e6(s: Option<i64>) -> i32 {
+    match s {
+        Some(v) => (v / 1_000).clamp(0, i64::from(i32::MAX)) as i32,
+        None => 0,
+    }
+}
+
+/// Build series `i`'s row from its engine: the census of resident days,
+/// both forecasts, the pairs, the fit and QLIKE bits at every panel tenor
+/// and the weekday profile. The per-minute fields are left for the reader
+/// (`har_series_view` reads them live). Cold: once per series per UTC
+/// day, and once after the restore.
+fn har_row(set: &LongVolSet, i: usize) -> HarSeriesView {
+    let mut v = HarSeriesView::default();
+    let (Some(e), Some(name), Some(feed)) = (set.engine(i), set.name(i), set.feed(i)) else {
+        return v;
+    };
+    let nl = name.len().min(HAR_VIEW_NAME_MAX);
+    v.name[..nl].copy_from_slice(&name[..nl]);
+    v.name_len = nl as u8;
+    v.feed = feed;
+    v.warm = u8::from(e.is_warm());
+    let days = e.n_resident();
+    v.days = days.min(usize::from(u8::MAX)) as u8;
+    let mut empty = 0u8;
+    let mut d = 0usize;
+    while d < days {
+        if let Some((ts, _, n_min)) = e.day_at(d) {
+            empty = empty.saturating_add(u8::from(n_min == 0));
+            v.newest_day_ms = ts;
+        }
+        d += 1;
+    }
+    v.empty_days = empty;
+    let mut k = 0usize;
+    while k < HAR_VIEW_TENORS {
+        let tau = u64::from(HAR_VIEW_TENORS_D[k]) * DAY_NS;
+        v.raw_1e6[k] = har_sigma_1e6(e.sigma_ann_1e9(tau, LongForecast::Raw));
+        v.fit_1e6[k] = har_sigma_1e6(e.sigma_ann_1e9(tau, LongForecast::Fit));
+        v.pairs[k] = e.n_pairs(tau).min(usize::from(u8::MAX)) as u8;
+        v.fitted |= u16::from(e.fit(tau).is_some()) << k;
+        v.fit_beats_raw |= u16::from(e.qlike_counters(tau).fit_beats_raw) << k;
+        k += 1;
+    }
+    if let Some((ratio, n_days)) = set.profile(i) {
+        let mut w = 0usize;
+        while w < HAR_VIEW_WEEKDAYS {
+            v.weekday_1e6[w] = ratio[w].clamp(0, i64::from(i32::MAX)) as i32;
+            v.weekday_n[w] = n_days[w].min(u32::from(u8::MAX)) as u8;
+            w += 1;
+        }
+    }
+    v.epoch = set.series_epoch(i);
+    v
 }
 
 // ---------------------------------------------------------------
@@ -1608,7 +2184,19 @@ mod tests {
         assert_eq!(mask_for_name("ai+vrp+xsd"), Some(54));
         assert_eq!(mask_for_name("ai"), Some(48));
         assert_eq!(mask_for_name("ai+vrp"), Some(50));
-        assert_eq!(mask_for_name("ai+icdp"), Some(112));
+        // XMM XH1 (O-XH1): slot 6 is the xmm member; `icdp` and
+        // `ai+icdp` are gone as NAMES and refuse the boot.
+        assert_eq!(mask_for_name("icdp"), None);
+        assert_eq!(mask_for_name("ai+icdp"), None);
+        assert_eq!(mask_for_name("xmm"), Some(BIT_XMM));
+        assert_eq!(mask_for_name("xmm"), Some(64), "slot 6's bit is wire-stable across the swap");
+        assert_eq!(mask_for_name("ai+xmm"), Some(112));
+        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb+xmm"), Some(127));
+        // HC11 (O-HC18): slot 7 is the hcv member.
+        assert_eq!(mask_for_name("hcv"), Some(BIT_HCV));
+        assert_eq!(mask_for_name("hcv"), Some(128), "slot 7's bit");
+        assert_eq!(mask_for_name("ai+hcv"), Some(176));
+        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb+xmm+hcv"), Some(255));
         assert_eq!(mask_for_name("bin15"), Some(BIT_BIN15));
         assert_eq!(mask_for_name("rule-tree"), None, "the old name is GONE");
         assert_eq!(
@@ -1619,7 +2207,7 @@ mod tests {
         assert_eq!(mask_for_name("vm"), Some(BIT_VM));
         assert_eq!(mask_for_name("ai"), Some(BIT_AI_EXEC | BIT_VM));
         assert_eq!(mask_for_name("all"), Some(BUILT_MASK));
-        assert_eq!(mask_for_name("all"), Some(127), "every built slot 0..=6");
+        assert_eq!(mask_for_name("all"), Some(255), "every slot 0..=7 is built since HC11");
         // `ai` = AI-pushed lanes only — NO Rust-coded strategy bit
         // (operator ruling 2026-09-02).
         const _: () = assert!(
@@ -1639,12 +2227,13 @@ mod tests {
     fn new_clamps_reserved_bits_to_built_mask() {
         let s = StrategySet::new(0xFF);
         assert_eq!(s.enabled_mask(), BUILT_MASK);
+        const _: () = assert!(BUILT_MASK == 0xFF, "no reserved bit is left since HC11");
         let s = StrategySet::new(0b1000_0000);
-        assert_eq!(s.enabled_mask(), 0, "reserved bit 7 cleared");
+        assert_eq!(s.enabled_mask(), BIT_HCV, "slot 7 is built (hcv since HC11)");
         let s = StrategySet::new(BIT_XSD);
         assert_eq!(s.enabled_mask(), BIT_XSD, "slot 2 is built now (XSD-3)");
-        let s = StrategySet::new(BIT_ICDP);
-        assert_eq!(s.enabled_mask(), BIT_ICDP, "slot 6 is built now (ICDP I4)");
+        let s = StrategySet::new(BIT_XMM);
+        assert_eq!(s.enabled_mask(), BIT_XMM, "slot 6 is built (xmm since XMM XH1)");
         let s = StrategySet::new(BIT_AI_EXEC);
         assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built now");
         let s = StrategySet::new(BIT_VM);
@@ -1750,7 +2339,7 @@ mod tests {
 
         // And a slot that is not BUILT at all.
         s.on_fill(&fill_for(7), &mut c);
-        assert_eq!(s.fills_unrouted(), 2, "slot 7 does not exist");
+        assert_eq!(s.fills_unrouted(), 2, "slot 7 is not enabled here");
         s.on_fill(&fill_for(200), &mut c);
         assert_eq!(s.fills_unrouted(), 3, "nor does slot 200");
 
@@ -1869,26 +2458,34 @@ mod tests {
         assert_eq!(s.enable_refused_total(), 2);
     }
 
-    /// Migrated from slot 5 in 8g item 6 (§8) and from slot 6 in ICDP
-    /// I4: the only reserved slot is 7 (probed twice: reserved + an
-    /// out-of-range id).
+    /// Migrated from slot 5 in 8g item 6 (§8), from slot 6 in ICDP I4
+    /// (slot 6 is xmm since XMM XH1) and from slot 7 in HC11 (hcv): no
+    /// slot is reserved any more — ids past 7 are the unknown ones
+    /// (probed twice).
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
         let mut s = StrategySet::new(0);
         let mut c = ctx();
         s.on_start(&mut c).unwrap();
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 7), &mut c);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 8), &mut c);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, 9), &mut c);
         assert_eq!(s.enabled_mask(), 0);
         assert_eq!(s.enable_refused_total(), 2);
-        assert!(!s.is_halted(), "reserved-slot refusal is not a halt");
-        // Slot 6 enables (an unconfigured icdp member is inert: it
-        // registers nothing and never fires); slot 2 likewise (XSD-3: an
+        assert!(!s.is_halted(), "unknown-slot refusal is not a halt");
+        // Slot 7 enables: an unconfigured hcv member is inert and arms no
+        // timer (HC11).
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_HCV), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_HCV);
+        assert_eq!(s.timer_period_ns(), s_timer_without_xsd());
+        s.on_ai(&ai_cmd(AiCmdKind::DisableStrategy, SLOT_HCV), &mut c);
+        assert_eq!(s.enabled_mask(), 0);
+        // Slot 6 enables (an unconfigured xmm member is inert: it never
+        // fires and arms no timer — XMM XH1); slot 2 likewise (XSD-3: an
         // unconfigured xsd member maps no sym and arms no timer).
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_ICDP), &mut c);
-        assert_eq!(s.enabled_mask(), BIT_ICDP);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XMM), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_XMM);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XSD), &mut c);
-        assert_eq!(s.enabled_mask(), BIT_ICDP | BIT_XSD);
+        assert_eq!(s.enabled_mask(), BIT_XMM | BIT_XSD);
         assert_eq!(s.enable_refused_total(), 2);
         assert_eq!(s.timer_period_ns(), s_timer_without_xsd(), "an unconfigured xsd arms no timer");
     }
@@ -2410,8 +3007,8 @@ mod tests {
             );
             s.on_timer(c.now, &mut c);
             assert_eq!(s.regime_counters().configured, 0);
-            // Labels of unconstrained members are ANY; the vm and the
-            // reserved slot cannot be relabelled.
+            // Labels of unconstrained members are ANY; the vm and hcv
+            // (slot 7: it stores no label) cannot be relabelled.
             assert_eq!(s.regime_label_of(SLOT_AI_EXEC), RegimeLabelSet::ANY);
             assert!(!s.set_regime_label(SLOT_VM, bull_label(REGIME_OFF_SOFT)));
             assert!(!s.set_regime_label(7, bull_label(REGIME_OFF_SOFT)));
@@ -2683,5 +3280,538 @@ mod tests {
             assert_eq!(mask & !BUILT_MASK, 0, "{name} composes an unbuilt slot");
             i += 1;
         }
+    }
+
+    // ---- HC11 ---------------------------------------------------------
+
+    /// HC11 (O-HC22, law L4 lifted for slot 7 alone): the set hands the
+    /// hcv member the HAR rows each time one moves — enabled or not — and
+    /// never when nothing moved.
+    #[test]
+    fn the_har_view_reaches_hcv_when_a_row_moves_enabled_or_not() {
+        use core_vol::LongSeries;
+        const DAY_MS: u64 = 86_400_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let wall0_ms: u64 = 1_767_225_600_000;
+        let anchor = WallAnchor::new(0, wall0_ms * 1_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"SP500", feed }], anchor, 0)
+            .unwrap();
+        {
+            let e = s.har_mut().engine_mut(0).unwrap();
+            let first = wall0_ms - 40 * DAY_MS;
+            for d in 0..40u64 {
+                assert!(e.seed_day(first + d * DAY_MS, 4_000_000_000_000_000_000_000, 1_440));
+            }
+            assert!(e.seed_arm(core_vol::DAY_NS, first + 39 * DAY_MS, 25_300_000_000, i64::MIN));
+        }
+        s.har_mut().restored();
+        assert_eq!(s.hcv().counters().har_updates, 0, "nothing handed before the poll");
+        s.on_timer(REGIME_TIMER_NS, &mut c);
+        assert_eq!(s.hcv().counters().har_updates, 1, "the restore's rows, slot 7 disabled");
+        s.on_timer(2 * REGIME_TIMER_NS, &mut c);
+        assert_eq!(s.hcv().counters().har_updates, 1, "no row moved: nothing handed");
+    }
+
+    /// HC11: slot 7 trades through the set — its inputs fan in, its order
+    /// carries slot 7, and its paper fill comes back to it alone.
+    #[test]
+    fn hcv_trades_through_the_set_on_slot_7() {
+        struct Rec(Vec<Order>, NsTs);
+        impl Ctx for Rec {
+            fn submit(&mut self, order: Order) -> Result<(), SubmitErr> {
+                self.0.push(order);
+                Ok(())
+            }
+            fn now_ns(&self) -> NsTs {
+                self.1
+            }
+        }
+        const DAY_MS: u64 = 86_400_000;
+        let t0_ms: u64 = 1_790_424_000_000;
+        let hedge = make_symbol_id(VenueId::Hyperliquid, 40);
+        let opt = make_symbol_id(VenueId::Hypercall, 513);
+        let p = strategy_hcv::HcvParams {
+            und: vec![strategy_hcv::HcvUnd::new(b"SP500", hedge, 2)],
+            options: vec![strategy_hcv::HcvOpt {
+                sym: opt,
+                und: 0,
+                call: true,
+                strike_1e6: 6_600_000_000,
+                exp_ms: t0_ms + 7 * DAY_MS,
+            }],
+            theta_vol_1e6: 50_000,
+            atm_band_bps: 500,
+            tenor_min_d: 1,
+            tenor_max_d: 40,
+            clip_usd_1e6: 5_000_000,
+            vega_cap_usd_1e6: 20_000_000,
+            premium_cap_usd_1e6: 50_000_000,
+            day_loss_usd_1e6: 20_000_000,
+            tail_loss_usd_1e6: 1_000_000_000,
+            opt_size_step_1e6: 1_000,
+            hedge_band_1e6: 100_000,
+            hedge_min_usd_1e6: 10_000_000,
+            hedge_slip_bps: 10,
+            quote_stale_ms: 10_000,
+            oracle_stale_ms: 10_000,
+            unwind_min: 30,
+            settle_delay_ms: 60_000,
+            settle_order: strategy_hcv::BucketOrder::Sorted,
+            event_law: false,
+            events_stale_ms: 7_200_000,
+            kill: false,
+            timer_ms: 1_000,
+            anchor: WallAnchor::new(0, t0_ms * 1_000_000),
+        };
+        let mut s = StrategySet::new(BIT_HCV);
+        s.hcv_mut().configure(&p).expect("hcv params");
+        let mut row = HarSeriesView::default();
+        row.name[..5].copy_from_slice(b"SP500");
+        row.name_len = 5;
+        row.warm = 1;
+        row.raw_1e6 = [150_000; HAR_VIEW_TENORS];
+        s.hcv_mut().set_har_view(&[row]);
+        let mut c = Rec(Vec::new(), 0);
+        s.on_start(&mut c).unwrap();
+        assert_eq!(s.timer_period_ns(), 1_000_000_000, "a configured hcv arms its 1 s timer");
+        let ev = ChannelEvent::new(10, VenueId::Hyperliquid, ChannelId::Mark, hedge, 0, 0, 6_600_000_000, 6_600_000_000);
+        s.on_venue_event(&ev, &mut c);
+        // Stamped ticks (a zero stamp is "never seen" to the member).
+        let stamped = |venue, sym, bid, ask| {
+            let mut t = tick(venue, sym, bid, ask);
+            t.ts_ns = 10;
+            t
+        };
+        s.on_tick(&stamped(VenueId::Hyperliquid, hedge, 6_599_500_000, 6_600_500_000), &mut c);
+        // The ATM call quoted rich: ~$80 bid is ~22 % against a 15 % σ̂.
+        s.on_tick(&stamped(VenueId::Hypercall, opt, 80_000_000, 86_000_000), &mut c);
+        s.on_timer(1_000_000_000, &mut c);
+        assert_eq!(c.0.len(), 1, "{:?}", s.hcv().counters());
+        let o = c.0[0];
+        assert_eq!((o.strategy_id, o.venue, o.sym, o.side), (SLOT_HCV, VenueId::Hypercall as u8, opt, Side::Ask));
+        assert_eq!(StrategyCounters::slot_counters(&s, SLOT_HCV).orders_emitted, 1);
+        // Its paper fill, attributed to slot 7, reaches it alone.
+        let f = core_types::Fill::new(2, opt, Side::Ask, o.px, o.qty, o.client_oid)
+            .with_attribution(SLOT_HCV, core_types::FILL_ORIGIN_PAPER);
+        s.on_fill(&f, &mut c);
+        assert_eq!(s.hcv().position_1e6(opt), -o.qty.raw());
+        assert_eq!(s.fills_unrouted(), 0);
+        let mut k = strategy_core::HcvCounters::default();
+        StrategyCounters::hcv_counters(&s, &mut k);
+        assert_eq!((k.sells, k.option_fills), (1, 1));
+        // HC11b: the book reaches the shutdown's forced write through the
+        // set — by contract, with the position the fill made.
+        let mut text = String::new();
+        assert!(StrategyCounters::render_hcv_state(&s, &mut text));
+        let row = format!("P\tSP500\t{}\t6600000000\tC\t{}\t", t0_ms + 7 * DAY_MS, -o.qty.raw());
+        assert!(text.contains(&row), "{text}");
+        assert!(!StrategyCounters::render_hcv_state(&StrategySet::new(BIT_VM), &mut text), "no hcv member");
+    }
+
+    // ---- XMM XH1 ----------------------------------------------------
+
+    const XMM_HL: SymbolId = make_symbol_id(VenueId::Hyperliquid, 2);
+
+    /// A valid probe-shaped artifact: one perp and its leader.
+    fn xmm_params() -> strategy_xmm::XmmParams {
+        let mut p = strategy_xmm::XmmParams::EMPTY;
+        p.perps[0] = strategy_xmm::XmmPerp {
+            hl_sym: XMM_HL,
+            lead_sym: make_symbol_id(VenueId::Binance, 5),
+            lot_1e6: 10_000,
+        };
+        p.n_perps = 1;
+        p.maker_enabled = 1;
+        p.theta_bps_1e6 = 500_000;
+        p.gate_window_ms = 500;
+        p.lifetime_ms = 30_000;
+        p.lead_stale_ms = 300;
+        p.follower_stale_ms = 2_000;
+        p.rtt_pull_ms = 1_500;
+        p.requote_min_ms = 250;
+        p.clip_usd_1e6 = 15_000_000;
+        p.inv_cap_usd_1e6 = 150_000_000;
+        p.gross_inv_cap_usd_1e6 = 400_000_000;
+        p.resting_cap_usd_1e6 = 300_000_000;
+        p
+    }
+
+    fn print(tid: u64) -> TradePrint {
+        TradePrint::new(
+            1,
+            VenueId::Hyperliquid,
+            XMM_HL,
+            tid,
+            0,
+            186_000_000,
+            2_000_000,
+            core_types::TRADE_AGGRESSOR_SELL,
+        )
+    }
+
+    /// Slot 6 is a REAL member: unconfigured it refuses the boot (the
+    /// cli never puts it in the configured mask without its artifact);
+    /// configured it starts and, at XH1, stays dark — no order, no timer.
+    #[test]
+    fn xmm_slot_refuses_unconfigured_and_quotes_once_it_has_both_feeds() {
+        let mut s = StrategySet::new(BIT_XMM);
+        assert!(matches!(
+            s.on_start(&mut ctx()),
+            Err(StrategyError::Config(_))
+        ));
+        let mut s = StrategySet::new(BIT_XMM);
+        s.xmm_mut().configure(&xmm_params()).expect("xmm params");
+        let mut c = ctx();
+        assert!(s.on_start(&mut c).is_ok());
+        // XH2: no leader yet — the follower and the tape alone place nothing.
+        s.on_tick(&tick(VenueId::Hyperliquid, XMM_HL, 185_990_000, 186_000_000), &mut c);
+        s.on_trade(&print(1), &mut c);
+        s.on_timer(c.now, &mut c);
+        assert_eq!(c.submitted, 0);
+        // With its leader fresh, both sides go out at the touch.
+        let lead = make_symbol_id(VenueId::Binance, 5);
+        s.on_tick(&tick(VenueId::Binance, lead, 185_980_000, 186_010_000), &mut c);
+        s.on_tick(&tick(VenueId::Hyperliquid, XMM_HL, 185_990_000, 186_000_000), &mut c);
+        assert_eq!(c.submitted, 2);
+        assert_eq!(s.orders_emitted(), 2);
+        assert_eq!(
+            s.timer_period_ns(),
+            strategy_xmm::XMM_TIMER_NS,
+            "xmm's safety timer is the set's shortest"
+        );
+        assert!(s.timer_period_ns() < s_timer_without_xsd());
+    }
+
+    /// A print reaches every enabled member and changes nothing for the
+    /// members that existed before XH1: the probe emits exactly its one
+    /// order with or without the tape.
+    #[test]
+    fn a_trade_print_changes_no_existing_member() {
+        let mut quiet = StrategySet::new(PROBE_BIT);
+        let mut cq = ctx();
+        quiet.on_start(&mut cq).unwrap();
+        feed_probe(&mut quiet, &mut cq);
+
+        let mut taped = StrategySet::new(PROBE_BIT);
+        let mut ct = ctx();
+        taped.on_start(&mut ct).unwrap();
+        taped.on_trade(&print(1), &mut ct);
+        feed_probe(&mut taped, &mut ct);
+        taped.on_trade(&print(2), &mut ct);
+
+        assert_eq!((cq.submitted, ct.submitted), (1, 1));
+        assert_eq!(quiet.orders_emitted(), taped.orders_emitted());
+        assert_eq!(taped.enabled_mask(), PROBE_BIT);
+    }
+
+    /// An order event reaches its own enabled slot alone; an event for
+    /// a disabled slot (slot 7 here), or unattributed, is counted and
+    /// never delivered — never fanned out.
+    #[test]
+    fn an_order_event_reaches_only_its_own_slot_or_is_counted() {
+        let mut s = StrategySet::new(PROBE_BIT);
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        let ev = |slot: u8| {
+            OrderEvent::new(
+                1,
+                VenueId::Hyperliquid,
+                XMM_HL,
+                5,
+                slot,
+                core_types::ORDER_EVENT_CANCELED,
+                core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED,
+                0,
+            )
+        };
+        s.on_order_event(&ev(PROBE_SLOT), &mut c);
+        assert_eq!(s.order_events_unrouted(), 0, "an enabled slot's event is delivered");
+        s.on_order_event(&ev(SLOT_VRP), &mut c);
+        assert_eq!(s.order_events_unrouted(), 1, "a disabled slot's event is counted");
+        s.on_order_event(&ev(7), &mut c);
+        assert_eq!(s.order_events_unrouted(), 2, "slot 7 is not enabled here");
+        s.on_order_event(&ev(core_types::STRATEGY_ID_NONE), &mut c);
+        assert_eq!(s.order_events_unrouted(), 3, "an unattributed event is never fanned out");
+        // XMM XH2: the same count through the trait the metrics read.
+        assert_eq!(StrategyCounters::order_events_unrouted(&s), 3);
+        assert_eq!(c.submitted, 0);
+    }
+
+    /// The per-slot gate: fires at its period and not before, advances
+    /// only when it fires, never fires for `u64::MAX`, and never for a
+    /// clock that went backwards.
+    #[test]
+    fn timer_due_fires_on_its_own_period_only() {
+        let mut last: NsTs = 0;
+        assert!(StrategySet::timer_due(&mut last, 1_000, 1_000));
+        assert_eq!(last, 1_000);
+        assert!(!StrategySet::timer_due(&mut last, 1_000, 1_999));
+        assert_eq!(last, 1_000, "a miss leaves the clock");
+        assert!(StrategySet::timer_due(&mut last, 1_000, 2_000));
+        assert_eq!(last, 2_000);
+        let mut never: NsTs = 0;
+        assert!(!StrategySet::timer_due(&mut never, u64::MAX, u64::MAX));
+        assert_eq!(never, 0);
+        let mut ahead: NsTs = 5_000;
+        assert!(!StrategySet::timer_due(&mut ahead, 1_000, 4_000));
+        assert_eq!(ahead, 5_000);
+    }
+
+    /// Through the set, each member runs on its own period whatever the
+    /// call cadence: a 1 s member called every 250 ms runs once a second,
+    /// and a member with no timer never runs. At the pre-XH1 cadence
+    /// (calls ≥ 1 s apart) the 1 s member runs on EVERY call — exactly
+    /// what it did before per-slot gating.
+    #[test]
+    fn per_slot_timers_run_each_member_on_its_own_period() {
+        const S: u64 = 1_000_000_000;
+        let mut s = hyparb_set();
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_AI_EXEC), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_HYPARB | BIT_AI_EXEC);
+        let mut runs = [0u64; 3];
+        let mut n = 0usize;
+        let mut t = S;
+        while t <= 3 * S {
+            let before = s.timer_last_ns[SLOT_HYPARB as usize];
+            s.on_timer(t, &mut c);
+            if s.timer_last_ns[SLOT_HYPARB as usize] != before {
+                runs[n] = t;
+                n += 1;
+            }
+            t += S / 4;
+        }
+        assert_eq!((n, runs), (3, [S, 2 * S, 3 * S]), "once a second, not four times");
+        assert_eq!(
+            s.timer_last_ns[SLOT_AI_EXEC as usize], 0,
+            "a member with no timer is never run"
+        );
+
+        let mut s = hyparb_set();
+        s.on_start(&mut c).unwrap();
+        let mut k = 1u64;
+        while k <= 4 {
+            s.on_timer(k * (S + 1), &mut c);
+            assert_eq!(
+                s.timer_last_ns[SLOT_HYPARB as usize],
+                k * (S + 1),
+                "the pre-XH1 cadence runs the 1 s member on every call"
+            );
+            k += 1;
+        }
+    }
+
+    /// HAR H3.3: the long-tenor set rides the set's tick and timer, arms
+    /// the 1 s poll only once configured, and drains at stop.
+    #[test]
+    fn the_long_tenor_set_is_inert_until_configured_then_fed() {
+        use core_vol::{LongSeries, LongSetCounters};
+        const MIN: NsTs = 60_000_000_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        assert_eq!(s.timer_period_ns(), u64::MAX, "no har.toml: no poll");
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+        s.on_timer(10 * MIN, &mut c);
+        assert_eq!(s.har().counters(), LongSetCounters::default());
+        let anchor = WallAnchor::new(0, 1_767_225_600_000_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"BTC", feed }], anchor, 0)
+            .unwrap();
+        assert_eq!(s.timer_period_ns(), REGIME_TIMER_NS);
+        // One quote in minute 0 (the helper stamps ts 0), the roll at 1 min.
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+        s.on_timer(MIN, &mut c);
+        let e = s.har().engine(0).unwrap();
+        assert_eq!(e.last_min_ts_ms(), 1_767_225_600_000);
+        assert_eq!(e.prev_px_1e6(), 100_000_001);
+        assert_eq!(s.har().counters().closes, 1);
+        s.on_stop(&mut c);
+        assert_eq!(s.har().held(0), None);
+    }
+
+    /// HAR H3.5: a series' `/state.har` row is built by the poll after the
+    /// restore (and after each of its day closes), from the engine's own
+    /// readers; the per-minute fields are read live at every view.
+    #[test]
+    fn the_har_row_is_built_on_the_poll_and_its_minute_fields_read_live() {
+        use core_vol::LongSeries;
+        const MIN: NsTs = 60_000_000_000;
+        const DAY_MS: u64 = 86_400_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let mut out = [HarSeriesView::default(); HAR_VIEW_SERIES];
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 0, "inert: no rows");
+        assert_eq!(StrategyCounters::har_counters(&s), HarCounters::default());
+
+        let wall0_ms: u64 = 1_767_225_600_000; // 2026-01-01T00:00Z
+        let anchor = WallAnchor::new(0, wall0_ms * 1_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"SP500", feed }], anchor, 0)
+            .unwrap();
+        // Restore 40 closed days ending 2025-12-31 — the third one EMPTY —
+        // 60 one-day pairs, and the newest close's one-day arm.
+        let first = wall0_ms - 40 * DAY_MS;
+        let tau1 = core_vol::DAY_NS;
+        {
+            let e = s.har_mut().engine_mut(0).unwrap();
+            for d in 0..40u64 {
+                let (sq, n) = if d == 2 { (0, 0) } else { (4_000_000_000_000_000_000_000, 1_440) };
+                assert!(e.seed_day(first + d * DAY_MS, sq, n));
+            }
+            for i in 0..60i64 {
+                let x = 25_000_000_000 + i * 10_000_000;
+                let target = first - 20 * DAY_MS + i as u64 * DAY_MS;
+                assert!(e.seed_pair(tau1, target, x, x + (i % 7 - 3) * 10_000_000));
+            }
+            assert!(e.seed_arm(tau1, first + 39 * DAY_MS, 25_300_000_000, i64::MIN));
+        }
+        s.har_mut().restored();
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        assert_eq!(out[0].days, 0, "the row waits for the poll");
+
+        // The poll builds it: the set's first due poll, 1 s in (no minute
+        // has rolled yet).
+        s.on_timer(REGIME_TIMER_NS, &mut c);
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        let v = out[0];
+        assert_eq!(v.name(), b"SP500");
+        assert_eq!(v.feed, feed);
+        assert_eq!((v.warm, v.days, v.empty_days), (1, 40, 1));
+        assert_eq!(v.newest_day_ms, wall0_ms - DAY_MS);
+        assert!(v.raw_1e6[0] > 0, "the one-day arm is the raw forecast");
+        assert_eq!(&v.raw_1e6[1..], &[0; HAR_VIEW_TENORS - 1], "no other tenor armed");
+        assert_eq!(v.fitted, 1, "60 pairs fit the one-day tenor only");
+        assert!(v.fit_1e6[0] > 0);
+        assert_eq!(v.fit_1e6[1], 0);
+        assert_eq!((v.pairs[0], v.pairs[1]), (60, 0));
+        assert_eq!(v.fit_beats_raw, 0, "no QLIKE window yet");
+        assert_eq!(v.weekday_1e6, [1_000_000; HAR_VIEW_WEEKDAYS], "every observed day alike");
+        assert_eq!(v.weekday_n.iter().map(|&n| u32::from(n)).sum::<u32>(), 39);
+        assert_eq!(v.epoch, 1, "the restore's epoch");
+        assert_eq!((v.last_min_ms, v.open_minutes), (0, 0));
+        assert_eq!(StrategyCounters::har_counters(&s).epoch, 1);
+
+        // Two live minutes: the first opens 2026-01-01 over a restore that
+        // ended on a closed day — a crossing by the set's rule (it could
+        // have pushed empty days), so the epoch moves and the poll
+        // rebuilds the row; the second only folds, and the minute fields
+        // move without a rebuild.
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+        s.on_timer(MIN, &mut c);
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        assert_eq!((out[0].epoch, out[0].open_minutes), (2, 0), "a crossing; the first primes");
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_004), &mut c);
+        s.on_timer(2 * MIN, &mut c);
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut out), 1);
+        assert_eq!(out[0].last_min_ms, wall0_ms + 60_000);
+        assert_eq!(out[0].open_minutes, 1);
+        assert_eq!(out[0].epoch, 2, "no further crossing");
+        assert_eq!((out[0].days, out[0].raw_1e6), (40, v.raw_1e6), "no day closed");
+        // A short buffer takes what fits and still reports the count.
+        assert_eq!(StrategyCounters::har_series_view(&s, &mut []), 1);
+    }
+
+    /// HAR H3.7: with the writer's outbox installed the set hands a series'
+    /// state at each of its day closes — the engine copied whole, with its
+    /// epoch, while the cli writes nothing on the loop. A mailbox the writer
+    /// still holds is refused, and the newest state follows at the first
+    /// poll after it is handed back; a boot's epoch counts as handed.
+    #[test]
+    fn the_set_hands_each_day_close_to_the_state_writer() {
+        use core_vol::{LongSeries, LongStateSnap};
+        const MIN: NsTs = 60_000_000_000;
+        const DAY_MIN: u64 = 1_440;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let anchor = WallAnchor::new(0, 1_767_225_600_000_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"BTC", feed }], anchor, 0)
+            .unwrap();
+        let (tx, mut rx) = core_ring::Mailbox::new(Box::new(LongStateSnap::new())).split();
+        s.install_har_outbox(vec![tx]);
+        // One quote a minute, the poll at every minute's end, through
+        // minute `until` (exclusive).
+        let mut m = 0u64;
+        let mut run = |s: &mut StrategySet, c: &mut CountCtx, until: u64| {
+            while m < until {
+                let px = 100_000_000 + ((m * 7_919) % 4_001) as i64;
+                s.on_tick(&tick(VenueId::Binance, feed, px, px + 2), c);
+                s.on_timer((m + 1) * MIN, c);
+                m += 1;
+            }
+        };
+        run(&mut s, &mut c, DAY_MIN);
+        assert!(rx.try_take().is_none(), "no day closed: nothing handed");
+        // The first minute of day 1 closes day 0: its state is handed.
+        run(&mut s, &mut c, DAY_MIN + 1);
+        assert_eq!(s.har().series_epoch(0), 1);
+        let (mut want, mut got) = (String::new(), String::new());
+        {
+            let snap = rx.try_take().expect("handed at the close");
+            assert_eq!(snap.epoch, 1);
+            core_vol::render_state_file("BTC", &snap.engine, &mut got);
+        }
+        assert!(StrategyCounters::render_har_series(&s, 0, &mut want));
+        assert_eq!(got, want, "the engine copied whole");
+        // Day 1's close is handed, and the writer keeps it (a write that
+        // failed, to be retried) while day 2 closes: that close is refused,
+        // and nothing is lost.
+        run(&mut s, &mut c, 2 * DAY_MIN + 1);
+        assert_eq!(s.har().series_epoch(0), 2);
+        rx.try_take().expect("epoch 2 handed").keep();
+        run(&mut s, &mut c, 3 * DAY_MIN + 1);
+        assert_eq!(s.har().series_epoch(0), 3);
+        assert_eq!(rx.try_take().expect("still the held one").epoch, 2, "refused while held");
+        // Handed back (the drop above): the next poll hands the newest.
+        run(&mut s, &mut c, 3 * DAY_MIN + 2);
+        assert_eq!(rx.try_take().expect("the newest follows").epoch, 3);
+        run(&mut s, &mut c, 3 * DAY_MIN + 3);
+        assert!(rx.try_take().is_none(), "nothing moved since");
+    }
+
+    /// HAR H3.7: the restore's epoch counts as handed — a boot that changed
+    /// nothing hands (and so writes) nothing — and the first day close after
+    /// it is handed with the next epoch.
+    #[test]
+    fn a_restored_state_is_not_handed_again_at_boot() {
+        use core_vol::{LongSeries, LongStateSnap};
+        const MIN: NsTs = 60_000_000_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let anchor = WallAnchor::new(0, 1_767_225_600_000_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"BTC", feed }], anchor, 0)
+            .unwrap();
+        s.har_mut().restored();
+        assert_eq!(s.har().series_epoch(0), 1, "the restore's epoch");
+        let (tx, mut rx) = core_ring::Mailbox::new(Box::new(LongStateSnap::new())).split();
+        s.install_har_outbox(vec![tx]);
+        s.on_timer(REGIME_TIMER_NS, &mut c);
+        assert!(rx.try_take().is_none(), "the restore is already on disk");
+        let mut m = 0u64;
+        while m <= 1_440 {
+            s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+            s.on_timer((m + 1) * MIN, &mut c);
+            m += 1;
+        }
+        assert_eq!(rx.try_take().expect("the first close").epoch, 2);
     }
 }

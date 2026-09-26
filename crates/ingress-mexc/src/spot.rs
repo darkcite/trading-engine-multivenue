@@ -39,14 +39,15 @@
 //! (`{"id":0,"code":0,"msg":"…"}`, [`parse_sub_ack`]) and the answer to
 //! our `{"method":"PING"}` (`"msg":"PONG"`).
 
+use core_net::{WsPayload, WsWriteErr};
 use core_parse::{
     find_field, scan_i64, scan_pb_field, scan_price_1e6, skip_string, skip_ws, PB_WT_LEN,
     PB_WT_VARINT,
 };
 
 use crate::{
-    push_bytes, scan_u64_checked, MexcChannel, MexcClass, MexcDeal, MexcSymbolTable,
-    DEAL_SIDE_BUY, DEAL_SIDE_SELL,
+    scan_u64_checked, MexcChannel, MexcClass, MexcDeal, MexcSymbolTable, DEAL_SIDE_BUY,
+    DEAL_SIDE_SELL,
 };
 
 // Wrapper field numbers (`PushDataV3ApiWrapper`; f1 `channel` is
@@ -667,32 +668,37 @@ pub fn extract_param_channel(param: &[u8]) -> Option<MexcChannel> {
 // Subscribe writer
 // ---------------------------------------------------------------
 
-/// Render the single spot subscribe op for one connection:
+/// Render the single spot subscribe op for one connection through `p`,
+/// straight into its frame, header first
+/// (`core_net::queue_masked_text_frame_rendered`):
 /// `{"method":"SUBSCRIPTION","params":["<bookTicker><SYM>","<deals><SYM>",…]}`.
-/// Returns the byte length, `None` if `dst` is too small.
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
 #[inline]
-pub fn write_spot_subscribe(dst: &mut [u8], symbols: &MexcSymbolTable) -> Option<usize> {
-    let mut n = push_bytes(dst, 0, b"{\"method\":\"SUBSCRIPTION\",\"params\":[")?;
-    let per_symbol = MexcClass::Spot.channels_per_symbol() as u8;
+pub fn render_spot_subscribe(
+    p: &mut WsPayload<'_>,
+    symbols: &MexcSymbolTable,
+) -> Result<(), WsWriteErr> {
+    p.put(b"{\"method\":\"SUBSCRIPTION\",\"params\":[")?;
     let mut first = true;
     let mut i = 0;
     while let Some((symbol, _sym)) = symbols.get(i) {
         let mut slot = 0u8;
-        while slot < per_symbol {
-            let ch = MexcChannel::from_slot(MexcClass::Spot, slot)?;
+        while let Some(ch) = MexcChannel::from_slot(MexcClass::Spot, slot) {
             if !first {
-                n = push_bytes(dst, n, b",")?;
+                p.put(b",")?;
             }
             first = false;
-            n = push_bytes(dst, n, b"\"")?;
-            n = push_bytes(dst, n, ch.topic())?;
-            n = push_bytes(dst, n, symbol)?;
-            n = push_bytes(dst, n, b"\"")?;
+            p.put(b"\"")?;
+            p.put(ch.topic())?;
+            p.put(symbol)?;
+            p.put(b"\"")?;
             slot += 1;
         }
         i += 1;
     }
-    push_bytes(dst, n, b"]}")
+    p.put(b"]}")
 }
 
 // ---------------------------------------------------------------
@@ -824,6 +830,14 @@ mod tests {
 
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         memchr::memmem::find(hay, needle).is_some()
+    }
+
+    /// The spot subscribe rendered into a plain buffer — exactly what the
+    /// frame's payload span receives; `None` when it does not fit.
+    fn write_spot_subscribe(buf: &mut [u8], symbols: &MexcSymbolTable) -> Option<usize> {
+        let mut p = WsPayload::writing(buf);
+        render_spot_subscribe(&mut p, symbols).ok()?;
+        Some(p.len())
     }
 
     #[test]

@@ -33,9 +33,10 @@ use core_latency::LatencyTracker;
 use core_ring::Consumer;
 use core_time::{now_ns, NsTs};
 use core_types::{
-    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, OptSummary, Order, RuleTableSlot,
-    Signal, SignalSource, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE, EVENT_RING_SIZE,
-    OPT_RING_SIZE, RULE_TABLE_RING_SLOTS,
+    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, ModifyReq, OptSummary, Order, OrderEvent,
+    RuleTableSlot, Signal, SignalSource, Tick, TradePrint, VenueId, AI_RING_SIZE,
+    DEPTH_RING_SIZE, EVENT_RING_SIZE, OPT_RING_SIZE, ORDER_EVENT_RING_SIZE,
+    RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine_snapshot::{RecentRing, RECENT_FILLS, RECENT_ORDERS};
 use ingress_ai::AiIngressStatus;
@@ -80,13 +81,16 @@ pub const POOL_RING_SIZE: usize = 4_096;
 pub const FILL_RING_SIZE: usize = 1_024;
 
 /// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
-/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2).
+/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2),
+/// 7 = Hypercall (HC1).
 /// Lane indices are BOOT-WIRED and NO LONGER equal `VenueId as usize`
 /// past lane 4:
 /// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
 /// ring, 8f), so `VenueId::Bybit = 6` occupies lane 5 and
-/// `VenueId::Mexc = 7` lane 6 — see [`tick_lane_of`].
-pub const NUM_TICK_LANES: usize = 7;
+/// `VenueId::Mexc = 7` lane 6; `VenueId::HyperEvm = 8` has none (pool
+/// events ride the signal lane), so `VenueId::Hypercall = 9` occupies
+/// lane 7 — see [`tick_lane_of`].
+pub const NUM_TICK_LANES: usize = 8;
 
 /// Tick-lane index for a market-data venue (WS9 — the lane↔venue
 /// identity broke when Bybit's discriminant landed past `Ai`).
@@ -102,6 +106,8 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Hyperliquid => Some(4),
         VenueId::Bybit => Some(5),
         VenueId::Mexc => Some(6),
+        // HC1: option BBO ticks off the indicative (quote-provider) feed.
+        VenueId::Hypercall => Some(7),
         // HYPARB: HyperEVM pool events ride the signal lane — no ticks.
         VenueId::Ai | VenueId::HyperEvm => None,
     }
@@ -137,7 +143,10 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         // MX2: MEXC spot incremental depth is `Blocked!` on the public
         // tier and futures BBO rides `depth.full` top-5 — no L2 lane.
         | VenueId::Mexc
-        | VenueId::HyperEvm => None,
+        | VenueId::HyperEvm
+        // HC1: Hypercall's book is RFQ-provider indicative quotes — a
+        // touch per instrument, no L2 depth to stream.
+        | VenueId::Hypercall => None,
     }
 }
 
@@ -145,9 +154,11 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
 /// options analytics channel — 0 = OKX (`opt-summary`), 1 = Deribit
 /// (option `ticker.100ms`), 2 = Binance (`<uly>@optionMarkPrice` on
 /// fstream `/market`, BX0-F2 — dark from the venue's 2025-12 options
-/// migration until then). [`OptSummary`] slots, [`OPT_RING_SIZE`]
-/// capacity, mapped by [`opt_lane_of`].
-pub const NUM_OPT_LANES: usize = 3;
+/// migration until then), 3 = Hypercall (REST `/options-summary`, HC1 —
+/// the mark / IV / greeks row the indicative feed does not carry).
+/// [`OptSummary`] slots, [`OPT_RING_SIZE`] capacity, mapped by
+/// [`opt_lane_of`].
+pub const NUM_OPT_LANES: usize = 4;
 
 /// Options-summary lane index for a venue with an options channel;
 /// `None` for every other venue. Cold-path helper for boot wiring.
@@ -157,6 +168,7 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Okx => Some(0),
         VenueId::Deribit => Some(1),
         VenueId::Binance => Some(2),
+        VenueId::Hypercall => Some(3),
         VenueId::Polymarket
         | VenueId::Hyperliquid
         | VenueId::Ai
@@ -202,7 +214,13 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         // arm, no fill lane.
         // HYPARB: AMM fills are PAPER fills (the matcher's judge); the
         // O-H12 testnet sends are a shadow and never reach the book.
-        VenueId::Ai | VenueId::Bybit | VenueId::Mexc | VenueId::HyperEvm => None,
+        // HC1: Hypercall is data-only by operator ruling O-HC1 — no exec
+        // arm (HC9 waits for its own ruling), no fill lane.
+        VenueId::Ai
+        | VenueId::Bybit
+        | VenueId::Mexc
+        | VenueId::HyperEvm
+        | VenueId::Hypercall => None,
     }
 }
 
@@ -229,6 +247,14 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// HYPARB H3b: the pool-event lane, attached by
     /// [`Self::set_pool_lane`] (boot-only). `None` = no HyperEVM source.
     pool_cons: Option<Consumer<Signal, POOL_RING_SIZE>>,
+    /// XMM XH1: the trade-print lane, attached by
+    /// [`Self::set_trade_lane`] (boot-only). `None` = no source feeds
+    /// prints (every boot before XH1, and every test that does not).
+    trade_cons: Option<Consumer<TradePrint, TRADE_RING_SIZE>>,
+    /// XMM XH1: the order-event lane, attached by
+    /// [`Self::set_order_event_lane`] (boot-only) — the live gateway's
+    /// events (XH4). `None` = nothing produces them.
+    order_event_cons: Option<Consumer<OrderEvent, ORDER_EVENT_RING_SIZE>>,
     /// Fill lanes; see [`fill_lane_of`] for the venue → index map.
     fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     /// AI command lane (Phase 8f §4.3). Sole consumer of the
@@ -306,6 +332,10 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// Cumulative options records dispatched to `on_opt_summary`
     /// (VM2 V2, all opt lanes combined).
     pub opts_dispatched: u64,
+    /// Cumulative trade prints dispatched to `on_trade` (XMM XH1).
+    pub trades_dispatched: u64,
+    /// Cumulative order events dispatched to `on_order_event` (XMM XH1).
+    pub order_events_dispatched: u64,
 
     // ---- Per-stage latency trackers (lock-free) ----
     //
@@ -372,6 +402,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             opt_lanes,
             sig_cons,
             pool_cons: None,
+            trade_cons: None,
+            order_event_cons: None,
             fill_lanes,
             ai_cons,
             ai_status,
@@ -391,6 +423,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             events_dispatched: 0,
             depths_dispatched: 0,
             opts_dispatched: 0,
+            trades_dispatched: 0,
+            order_events_dispatched: 0,
             ingest_lat: LatencyTracker::new(),
             decide_lat: LatencyTracker::new(),
             ack_lat: LatencyTracker::new(),
@@ -419,7 +453,8 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     /// Tick lanes drain in **fixed `VenueId` order** (Polymarket,
     /// Binance, OKX, Deribit, Hyperliquid) so the venue book update
     /// precedes any cross-venue trigger within one iteration; the
-    /// per-lane budget prevents starvation. Then signals, then fill
+    /// per-lane budget prevents starvation. Then the trade lane and the
+    /// order-event lane (XMM XH1, when attached), then signals, then fill
     /// lanes, then the dispatcher's own fill queue (D3 fix — paper
     /// and queued dispatchers surface fills via `try_next_fill`,
     /// live venue dispatchers via their fill lane), then the ruleset
@@ -513,6 +548,42 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 i += 1;
             }
             lane += 1;
+        }
+
+        // --- trade lane (XMM XH1) ---
+        // Right after the tick lanes: prints are market data, and a
+        // maker reading its queue from the tape sees the quote before
+        // the prints of the same iteration. Same per-lane budget. No
+        // latency sample and no sym-bucket touch: tick freshness is
+        // the tick lanes' question. An unattached lane costs one branch.
+        if let Some(trades) = self.trade_cons.as_mut() {
+            let mut i = 0;
+            while i < max_per_ring {
+                match trades.try_pop_ref() {
+                    Some(t) => {
+                        consumed += 1;
+                        let now = now_ns();
+                        // XMM XH2: the dispatcher sees the print FIRST,
+                        // as it sees a tick first — a PAPER one judges
+                        // its post-only makers by the queue law, and the
+                        // fills it produced are pumped at the END of the
+                        // iteration. A live dispatcher does nothing.
+                        self.disp.observe_trade(&t, now);
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
+                            now,
+                        };
+                        self.strat.on_trade(&t, &mut ctx);
+                        self.trades_dispatched = self.trades_dispatched.wrapping_add(1);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
         }
 
         // --- signals ---
@@ -661,6 +732,64 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 None => break,
             }
             i += 1;
+        }
+
+        // --- dispatcher order-event pump (XMM XH2) ---
+        // The paper arm's order events (the queue law's RESTING,
+        // REJECTED, CANCELED, FILLED) — after the fill pump, so a member
+        // sees a fill before the FILLED it causes, and before the lane
+        // below for the same reason the lane is where it is. Budgeted
+        // like every other source; a dispatcher without events returns
+        // `false` at once.
+        let mut ev = OrderEvent::ZERO;
+        let mut i = 0;
+        while i < max_per_ring && self.disp.try_next_order_event(&mut ev) {
+            consumed += 1;
+            let mut ctx = EngineCtx {
+                disp: &mut self.disp,
+                decide_lat: &self.decide_lat,
+                order_capture: self.order_capture.as_mut(),
+                recent_orders: &mut self.recent_orders,
+                lifecycle: &mut self.lifecycle,
+                now: now_ns(),
+            };
+            self.strat.on_order_event(&ev, &mut ctx);
+            self.order_events_dispatched = self.order_events_dispatched.wrapping_add(1);
+            i += 1;
+        }
+
+        // --- order-event lane (XMM XH1) ---
+        // After EVERY fill source — the fill lanes and the dispatcher
+        // pump above — for the E6 reason those carry: a member handed
+        // an order event (a CANCELED, a FILLED) may submit in the same
+        // call, and a fill already waiting this iteration has to be
+        // booked by the router, and seen by the member, before the
+        // order it causes is judged. The venue sends an order's state
+        // and its fills on different streams with no order between
+        // them, so this fixes only what one iteration does; a member
+        // must handle either arriving first. Same per-lane budget.
+        if let Some(events) = self.order_event_cons.as_mut() {
+            let mut i = 0;
+            while i < max_per_ring {
+                match events.try_pop_ref() {
+                    Some(e) => {
+                        consumed += 1;
+                        let mut ctx = EngineCtx {
+                            disp: &mut self.disp,
+                            decide_lat: &self.decide_lat,
+                            order_capture: self.order_capture.as_mut(),
+                            recent_orders: &mut self.recent_orders,
+                            lifecycle: &mut self.lifecycle,
+                            now: now_ns(),
+                        };
+                        self.strat.on_order_event(&e, &mut ctx);
+                        self.order_events_dispatched =
+                            self.order_events_dispatched.wrapping_add(1);
+                    }
+                    None => break,
+                }
+                i += 1;
+            }
         }
 
         // --- venue-event lanes (WS10-A) ---
@@ -1054,6 +1183,20 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.pool_cons = Some(cons);
     }
 
+    /// XMM XH1: attach the trade-print lane (boot-only, before
+    /// [`Self::start`]). Drained every iteration right after the tick
+    /// lanes, into [`Strategy::on_trade`].
+    pub fn set_trade_lane(&mut self, cons: Consumer<TradePrint, TRADE_RING_SIZE>) {
+        self.trade_cons = Some(cons);
+    }
+
+    /// XMM XH1: attach the order-event lane (boot-only, before
+    /// [`Self::start`]). Drained every iteration right after the trade
+    /// lane, into [`Strategy::on_order_event`].
+    pub fn set_order_event_lane(&mut self, cons: Consumer<OrderEvent, ORDER_EVENT_RING_SIZE>) {
+        self.order_event_cons = Some(cons);
+    }
+
     /// Attach the engine-thread fills capture (boot-only, before
     /// [`Self::start`]). The cli opens [`ENGINE_FILLS_FILE`] inside
     /// the per-run capture directory and hands it over here.
@@ -1168,6 +1311,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     #[inline]
     pub fn dispatcher(&self) -> &D {
         &self.disp
+    }
+
+    /// Borrow the dispatcher mutably — boot only (XMM XH2: the queue
+    /// law's instruments are tracked on the engine's own dispatcher).
+    #[inline]
+    pub fn dispatcher_mut(&mut self) -> &mut D {
+        &mut self.disp
     }
 
     /// Borrow the strategy (for paper-mode stats reads).
@@ -1455,6 +1605,20 @@ mod tests {
         /// `tables` observed when the FIRST AiCmd dispatched — pins
         /// the §6 pop-precedes-AI-drain same-iteration ordering.
         tables_at_first_ai: u32,
+        /// Trade prints delivered via `on_trade` (XMM XH1).
+        trades: u32,
+        /// tid of the most recent print — pins payload pass-through.
+        last_trade_tid: u64,
+        /// `ticks` observed when the FIRST print arrived — pins the
+        /// tick-lanes-then-trade-lane order within one iteration.
+        ticks_at_first_trade: u32,
+        /// Order events delivered via `on_order_event` (XMM XH1).
+        order_events: u32,
+        /// `(kind, reason)` of the most recent event — pins pass-through.
+        last_order_event: (u8, u8),
+        /// `fills` observed when the FIRST order event arrived — pins
+        /// the fill-lanes-then-order-event-lane order (E6).
+        fills_at_first_order_event: u32,
     }
 
     impl strategy_core::StrategyCounters for Counter {}
@@ -1494,11 +1658,210 @@ mod tests {
             self.tables += 1;
             self.last_table_epoch = table.epoch;
         }
+        fn on_trade<C: Ctx>(&mut self, t: &TradePrint, _ctx: &mut C) {
+            if self.trades == 0 {
+                self.ticks_at_first_trade = self.ticks;
+            }
+            self.trades += 1;
+            self.last_trade_tid = t.tid;
+        }
+        fn on_order_event<C: Ctx>(&mut self, e: &OrderEvent, _ctx: &mut C) {
+            if self.order_events == 0 {
+                self.fills_at_first_order_event = self.fills;
+            }
+            self.order_events += 1;
+            self.last_order_event = (e.kind, e.reason);
+        }
         fn on_timer<C: Ctx>(&mut self, _n: NsTs, _ctx: &mut C) {}
         fn timer_period_ns(&self) -> u64 {
             u64::MAX
         }
         fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+    }
+
+    fn mk_trade(tid: u64) -> TradePrint {
+        TradePrint::new(
+            0,
+            VenueId::Hyperliquid,
+            core_types::make_symbol_id(VenueId::Hyperliquid, 1),
+            tid,
+            0,
+            187_000_000,
+            1_000_000,
+            core_types::TRADE_AGGRESSOR_SELL,
+        )
+    }
+
+    fn mk_order_event(oid: u64, kind: u8, reason: u8) -> OrderEvent {
+        OrderEvent::new(
+            0,
+            VenueId::Hyperliquid,
+            core_types::make_symbol_id(VenueId::Hyperliquid, 1),
+            oid,
+            6,
+            kind,
+            reason,
+            0,
+        )
+    }
+
+    /// XMM XH1: prints reach `on_trade` in ring order, AFTER the tick
+    /// lanes of the same iteration, and count as consumed work.
+    #[test]
+    fn trade_lane_reaches_on_trade_after_the_tick_lanes() {
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut trp, trc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        eng.set_trade_lane(trc);
+        eng.start().unwrap();
+        assert!(tp[VenueId::Hyperliquid as usize].try_push_ref(&mk_tick(VenueId::Hyperliquid, 1, 1)));
+        assert!(tp[VenueId::Hyperliquid as usize].try_push_ref(&mk_tick(VenueId::Hyperliquid, 1, 2)));
+        for tid in 1..=3u64 {
+            assert!(trp.try_push_ref(&mk_trade(tid)));
+        }
+        let consumed = eng.tick(16);
+        assert_eq!(consumed, 5, "two ticks and three prints are work");
+        assert_eq!(eng.trades_dispatched, 3);
+        assert_eq!(eng.strategy().trades, 3);
+        assert_eq!(eng.strategy().last_trade_tid, 3, "ring order");
+        assert_eq!(eng.strategy().ticks_at_first_trade, 2, "tick lanes first");
+    }
+
+    /// XMM XH2: the paper dispatcher sees a print before `on_trade`, and
+    /// the queue law's order events reach `on_order_event` after the
+    /// fill pump of the same iteration.
+    #[test]
+    fn paper_queue_fills_and_order_events_reach_the_member() {
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut trp, trc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        eng.set_trade_lane(trc);
+        eng.start().unwrap();
+        let sym = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
+        eng.dispatcher_mut().track_queue_sym(sym);
+        // Emitted at 0: it lands at the first book after Δ_hl, and the
+        // engine clock is far past that.
+        let mut o = Order::new(
+            0,
+            VenueId::Hyperliquid,
+            sym,
+            core_types::Side::Bid,
+            0,
+            Price::from_raw(187_000_000),
+            Qty::from_raw(1_000_000),
+            5,
+        )
+        .with_post_only();
+        o.strategy_id = 6;
+        eng.dispatcher_mut().submit(&o).unwrap();
+        let book = Tick::new(
+            0,
+            VenueId::Hyperliquid,
+            sym,
+            1,
+            Price::from_raw(187_000_000),
+            Qty::from_raw(0),
+            Price::from_raw(188_000_000),
+            Qty::from_raw(1_000_000),
+        );
+        assert!(tp[VenueId::Hyperliquid as usize].try_push_ref(&book));
+        // A seller takes 1.0 at 187: nothing shown ahead, so it is ours.
+        assert!(trp.try_push_ref(&mk_trade(1)));
+        eng.tick(16);
+        assert_eq!(eng.fills_dispatched, 1, "the queue fill is pumped");
+        assert_eq!(eng.order_events_dispatched, 2, "RESTING, then FILLED");
+        assert_eq!(
+            eng.strategy().last_order_event,
+            (core_types::ORDER_EVENT_FILLED, core_types::ORDER_EVENT_REASON_NONE)
+        );
+        assert_eq!(eng.dispatcher().open_orders(), 0);
+        // Failure mode: a dispatcher with nothing to say costs one call.
+        assert_eq!(eng.tick(16), 0);
+        assert_eq!(eng.order_events_dispatched, 2);
+    }
+
+    /// The trade lane obeys the per-lane budget, and a backlog drains
+    /// across iterations.
+    #[test]
+    fn trade_lane_budget_caps_one_iteration() {
+        let (mut eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut trp, trc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        eng.set_trade_lane(trc);
+        eng.start().unwrap();
+        for tid in 1..=5u64 {
+            assert!(trp.try_push_ref(&mk_trade(tid)));
+        }
+        assert_eq!(eng.tick(2), 2);
+        assert_eq!(eng.trades_dispatched, 2);
+        eng.tick(16);
+        assert_eq!(eng.trades_dispatched, 5);
+        assert_eq!(eng.strategy().last_trade_tid, 5);
+    }
+
+    /// Failure mode: an engine with neither lane attached — every boot
+    /// before XH1 — dispatches nothing to either hook and reports no
+    /// work, and a producer-dropped lane reads empty forever.
+    #[test]
+    fn unattached_or_dropped_xmm_lanes_do_nothing() {
+        let (mut eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
+        eng.start().unwrap();
+        assert_eq!(eng.tick(16), 0);
+        assert_eq!((eng.trades_dispatched, eng.order_events_dispatched), (0, 0));
+        let (trp, trc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        let (oep, oec) = Ring::<OrderEvent, ORDER_EVENT_RING_SIZE>::new().split();
+        drop(trp);
+        drop(oep);
+        eng.set_trade_lane(trc);
+        eng.set_order_event_lane(oec);
+        assert_eq!(eng.tick(16), 0);
+        assert_eq!(eng.strategy().trades, 0);
+        assert_eq!(eng.strategy().order_events, 0);
+    }
+
+    /// XMM XH1: order events reach `on_order_event` unchanged, AFTER
+    /// the fill lanes of the same iteration (E6: a fill waiting this
+    /// iteration is booked before a member can act on an order event),
+    /// under the same budget.
+    #[test]
+    fn order_event_lane_reaches_on_order_event_after_the_fill_lanes() {
+        let (mut eng, _tp, _ep, _sp, mut fp, _ap, _tblp) = build_engine();
+        let (mut oep, oec) = Ring::<OrderEvent, ORDER_EVENT_RING_SIZE>::new().split();
+        eng.set_order_event_lane(oec);
+        eng.start().unwrap();
+        assert!(fp[0].try_push_ref(&Fill::new(
+            10,
+            7,
+            Side::Bid,
+            Price::from_raw(1),
+            Qty::from_raw(1),
+            99,
+        )));
+        assert!(oep.try_push_ref(&mk_order_event(
+            7,
+            core_types::ORDER_EVENT_RESTING,
+            core_types::ORDER_EVENT_REASON_NONE
+        )));
+        assert!(oep.try_push_ref(&mk_order_event(
+            8,
+            core_types::ORDER_EVENT_REJECTED,
+            core_types::ORDER_EVENT_REASON_BAD_ALO_PX
+        )));
+        assert!(oep.try_push_ref(&mk_order_event(
+            9,
+            core_types::ORDER_EVENT_CANCELED,
+            core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED
+        )));
+        assert_eq!(eng.tick(2), 3, "one fill and a budget of two events");
+        assert_eq!(eng.order_events_dispatched, 2);
+        assert_eq!(eng.strategy().fills_at_first_order_event, 1, "fill lanes first");
+        assert_eq!(
+            eng.strategy().last_order_event,
+            (core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_BAD_ALO_PX)
+        );
+        eng.tick(16);
+        assert_eq!(eng.order_events_dispatched, 3);
+        assert_eq!(
+            eng.strategy().last_order_event,
+            (core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)
+        );
     }
 
     fn mk_tick(venue: VenueId, sym: u32, seq: u32) -> Tick {
@@ -1514,63 +1877,52 @@ mod tests {
         )
     }
 
+    /// `N` freshly split rings of one slot type — built over the lane
+    /// count, so a new lane (HC1: tick lane 7, opt lane 3) is not an
+    /// edit here. Test-only (allocates).
+    #[allow(clippy::type_complexity)]
+    fn split_lanes<T: Copy, const CAP: usize, const N: usize>(
+    ) -> ([Producer<T, CAP>; N], [Consumer<T, CAP>; N]) {
+        let (ps, cs): (Vec<_>, Vec<_>) = (0..N).map(|_| Ring::<T, CAP>::new().split()).unzip();
+        match (ps.try_into(), cs.try_into()) {
+            (Ok(ps), Ok(cs)) => (ps, cs),
+            _ => unreachable!("exactly N rings were split"),
+        }
+    }
+
     fn split_tick_lanes() -> (
         [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
     ) {
-        let (p0, c0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p3, c3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p4, c4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p5, c5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p6, c6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4, p5, p6], [c0, c1, c2, c3, c4, c5, c6])
+        split_lanes()
     }
 
     fn split_event_lanes() -> (
         [Producer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
         [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
     ) {
-        let (p0, c0) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p3, c3) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p4, c4) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p5, c5) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p6, c6) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4, p5, p6], [c0, c1, c2, c3, c4, c5, c6])
+        split_lanes()
     }
 
     fn split_depth_lanes() -> (
         [Producer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
         [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
     ) {
-        let (p0, c0) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
-        ([p0, p1], [c0, c1])
+        split_lanes()
     }
 
     fn split_opt_lanes() -> (
         [Producer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
         [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
     ) {
-        let (p0, c0) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
-        ([p0, p1, p2], [c0, c1, c2])
+        split_lanes()
     }
 
     fn split_fill_lanes() -> (
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     ) {
-        let (p0, c0) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p3, c3) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p4, c4) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4], [c0, c1, c2, c3, c4])
+        split_lanes()
     }
 
     /// Build an engine plus producer halves for every lane. Tick
@@ -2060,6 +2412,8 @@ mod tests {
         assert_eq!(depth_lane_of(VenueId::Bybit), None);
         assert_eq!(depth_lane_of(VenueId::Mexc), None);
         assert_eq!(depth_lane_of(VenueId::Ai), None);
+        assert_eq!(depth_lane_of(VenueId::HyperEvm), None);
+        assert_eq!(depth_lane_of(VenueId::Hypercall), None);
     }
 
     #[test]
@@ -2152,6 +2506,11 @@ mod tests {
         assert_eq!(opt_lane_of(VenueId::Bybit), None);
         assert_eq!(opt_lane_of(VenueId::Mexc), None);
         assert_eq!(opt_lane_of(VenueId::Ai), None);
+        assert_eq!(opt_lane_of(VenueId::HyperEvm), None);
+        // HC1: the REST `/options-summary` mark row, lane 3.
+        assert_eq!(opt_lane_of(VenueId::Hypercall), Some(3));
+        // The last options venue occupies the last lane — no gaps.
+        assert_eq!(NUM_OPT_LANES, 4);
     }
 
     /// Dispatcher that emits one queued fill — proves the D3 pump.
@@ -2235,6 +2594,9 @@ mod tests {
         assert_eq!(fill_lane_of(VenueId::Bybit), None);
         // MX2 / O-MX1: MEXC is data-only — never a fill lane.
         assert_eq!(fill_lane_of(VenueId::Mexc), None);
+        assert_eq!(fill_lane_of(VenueId::HyperEvm), None);
+        // HC1 / O-HC1: Hypercall is data-only — no fill lane until HC9.
+        assert_eq!(fill_lane_of(VenueId::Hypercall), None);
     }
 
     #[test]
@@ -2246,9 +2608,11 @@ mod tests {
         assert_eq!(tick_lane_of(VenueId::Hyperliquid), Some(4));
         assert_eq!(tick_lane_of(VenueId::Bybit), Some(5));
         assert_eq!(tick_lane_of(VenueId::Mexc), Some(6));
+        assert_eq!(tick_lane_of(VenueId::Hypercall), Some(7));
         assert_eq!(tick_lane_of(VenueId::Ai), None);
+        assert_eq!(tick_lane_of(VenueId::HyperEvm), None);
         // The last market venue occupies the last lane — no gaps.
-        assert_eq!(NUM_TICK_LANES, 7);
+        assert_eq!(NUM_TICK_LANES, 8);
         assert_eq!(NUM_EVENT_LANES, NUM_TICK_LANES);
     }
 

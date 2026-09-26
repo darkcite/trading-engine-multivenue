@@ -10,10 +10,14 @@
 # few lines), the way an `unsafe` block carries `// SAFETY:`.
 #
 # This script lists every byte-copy verb in the given crate directories
-# (default: the exec lane incl. the Binance signer (BX4) and arm (BX6), core-net,
-# core-ring, all nine ingress crates
-# (since the ZC pass of 2026-09-24) and the HYPARB lane's AMM math and
-# member) that has NO `COPY:` marker within the eight preceding lines,
+# (default: the exec lane incl. the Binance signer (BX4) and arm (BX6),
+# core-net, core-ring, all nine ingress crates
+# (since the ZC pass of 2026-09-24) plus ingress-hypercall (born inside
+# the gate, HC3), the HYPARB lane's AMM math and member, and the threads
+# the engine hands work to — the EVM shadow, the HYPARB live arm and the
+# state writers (HAR H3.7; HC11b's generic `persist` thread and the
+# slot-7 settlement law it persists, `core-settle`)) that has NO `COPY:`
+# marker within the eight preceding lines,
 # and compares the list against the committed baseline
 # `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
@@ -77,8 +81,13 @@ if [ "$#" -eq 0 ]; then
            crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \
            crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
-           crates/core-amm crates/strategy-hyparb crates/cli/src/evm_shadow.rs \
-           crates/cli/src/hyparb_live.rs
+           crates/ingress-hypercall crates/exec-hypercall \
+           crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/strategy-hcv \
+           crates/core-fill crates/engine \
+           crates/cli/src/evm_shadow.rs \
+           crates/cli/src/hyparb_live.rs \
+           crates/cli/src/har_writer.rs \
+           crates/cli/src/persist.rs crates/core-settle
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its

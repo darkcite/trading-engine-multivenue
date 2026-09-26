@@ -1,0 +1,85 @@
+# HAR H3: the long-tenor HAR over whole UTC days, one engine per series.
+#
+# Copy to ~/multivenue/har.toml. OPTIONAL: without the file the engine
+# boots exactly as before H3. Parsed by core_config::har (the engine) and
+# claude_worker.har_config (the worker), the same grammar line for line:
+# one [[series]] block per series (at most 12), `key = value` per line,
+# strings without escapes, arrays on ONE line, unknown keys refused.
+#
+#   name      the Hypercall underlying the series serves: 1..=12 of [A-Z0-9]
+#   feed      the LIVE minute source: a tick descriptor in the boot universe
+#             (universe.toml). The engine folds its mid at every minute roll;
+#             a feed the universe does not carry refuses the HAR service with
+#             a named error, and the engine boots without it.
+#   fallback  OPTIONAL, newest first, at most 4: the SEED's older sources.
+#             claude_worker.har_backfill fetches each one's 1 m history and
+#             claude_worker.har_seed splices them in front of the feed (each
+#             fills only the minutes before the previous source's first one;
+#             no return is formed across a source boundary). The engine
+#             checks them and never reads them.
+#
+# Rulings (2026-09-26): the equities' feeds are the Binance USDⓈ-M TradFi
+# perps (SPY, NVDA and AAPL are already in [binance] usdm; the other seven
+# are appended at a restart the operator chooses), BTC/ETH read USDⓈ-M, and
+# each fallback is the longest 1 m history on a venue we already use.
+# SP500 is 10.03 x SPY: vol is scale-free, and no return crosses a splice.
+
+[[series]]
+name     = "SP500"
+feed     = "binance-usdm:spyusdt"
+fallback = ["okx:SPY-USDT-SWAP"]
+
+[[series]]
+name     = "SPCX"
+feed     = "binance-usdm:spcxusdt"
+fallback = ["okx:SPCX-USDT-SWAP"]
+
+[[series]]
+name     = "MU"
+feed     = "binance-usdm:muusdt"
+fallback = ["okx:MU-USDT-SWAP"]
+
+[[series]]
+name     = "NVDA"
+feed     = "binance-usdm:nvdausdt"
+fallback = ["okx:NVDA-USDT-SWAP"]
+
+[[series]]
+name     = "MSFT"
+feed     = "binance-usdm:msftusdt"
+fallback = ["okx:MSFT-USDT-SWAP"]
+
+[[series]]
+name     = "META"
+feed     = "binance-usdm:metausdt"
+fallback = ["okx:META-USDT-SWAP"]
+
+[[series]]
+name     = "AAPL"
+feed     = "binance-usdm:aaplusdt"
+fallback = ["okx:AAPL-USDT-SWAP"]
+
+# OKX lists no BABA perp, and Bybit's starts after Binance's.
+[[series]]
+name     = "BABA"
+feed     = "binance-usdm:babausdt"
+
+[[series]]
+name     = "SNDK"
+feed     = "binance-usdm:sndkusdt"
+fallback = ["okx:SNDK-USDT-SWAP"]
+
+[[series]]
+name     = "BOT"
+feed     = "binance-usdm:botusdt"
+fallback = ["bybit-linear:BOTUSDT"]
+
+[[series]]
+name     = "BTC"
+feed     = "binance-usdm:btcusdt"
+fallback = ["binance:btcusdt"]
+
+[[series]]
+name     = "ETH"
+feed     = "binance-usdm:ethusdt"
+fallback = ["binance:ethusdt"]

@@ -50,7 +50,7 @@
 //! ## Doctrine
 //!
 //! Boot allocates one page per signer; signing allocates nothing (bench
-//! gate 73). No `dyn`, no iterators, no closures on the signing path.
+//! gate 86). No `dyn`, no iterators, no closures on the signing path.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(

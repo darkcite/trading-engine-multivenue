@@ -41,7 +41,7 @@ use crate::mode::ExecMode;
 
 /// Strategy slots the table covers. Matches `strategy_set`'s slot
 /// count (0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec ·
-/// 5 vm · 6 icdp · 7 reserved) and is a power of two so the
+/// 5 vm · 6 xmm · 7 reserved) and is a power of two so the
 /// range mask is a single `&`.
 pub const EXEC_SLOTS: usize = 8;
 

@@ -24,7 +24,7 @@
 //! [profile.fast]  trend_w_min = 60 … fund_p70_1e9 = 0     # every key of core_regime::ProfileParams
 //! [profile.slow]  …
 //! [labels]        require = 1                                   # RG8: optional, 0 | 1
-//! [labels.icdp]   off = "soft"   term1 = ["fast:shape:trend"]   # optional, ≤ 4 terms
+//! [labels.xsd]    off = "soft"   term1 = ["fast:shape:trend"]   # optional, ≤ 4 terms
 //! ```
 //!
 //! `[labels] require = 1` (RG8 — operator ruling 2026-09-05, "enforce
@@ -62,8 +62,8 @@ impl From<IcdpError> for RegimeConfigError {
 /// One `[labels.<member>]` override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelOverride {
-    /// The coded member's name (`hyparb`, `vrp`, `xsd`, `rule_tree`,
-    /// `ai_exec`, `icdp`).
+    /// The coded member's name (`hyparb`, `vrp`, `xsd`, `bin15`,
+    /// `ai_exec`, `xmm`).
     pub member: String,
     /// The parsed label set.
     pub set: RegimeLabelSet,
@@ -150,7 +150,18 @@ const PROFILE_KEYS: [&str; 22] = [
 ///
 /// **HYPARB H0 (2026-09-23): `latency_arb` is GONE the same way and
 /// slot 0 is `hyparb`.**
-const MEMBER_NAMES: [&str; 6] = ["hyparb", "vrp", "xsd", "rule_tree", "ai_exec", "icdp"];
+///
+/// **XMM XH1 (2026-09-26): `icdp` is GONE the same way.** Slot 6 is
+/// `xmm`.
+///
+/// **XMM XH3 (2026-09-26): `xmm` joins the list** — its label is carried
+/// (so `[labels] require = 1` can boot it enabled) and never consulted
+/// (the HORIZON law, bin15's precedent). The same change repairs a
+/// BIN15 O4b leftover: this list still named `rule_tree` (which the boot
+/// could never resolve) and not `bin15` (which it maps), so
+/// `[labels.bin15]` was refused here and `require = 1` could never boot
+/// bin15 enabled.
+const MEMBER_NAMES: [&str; 6] = ["hyparb", "vrp", "xsd", "bin15", "ai_exec", "xmm"];
 
 type Kv = Vec<(String, Value, usize)>;
 
@@ -623,7 +634,7 @@ mod tests {
 
     fn with_labels() -> String {
         format!(
-            "{EXAMPLE}\n[labels.icdp]\noff = \"hard\"\nterm1 = [\"fast:shape:trend\", \"slow:trend:bull|neutral\"]\nterm2 = [\"fast:shape:trend\", \"slow:trend:bear\"]\n[labels.hyparb]\noff = \"soft\"\nterm1 = [\"fast:vol:!high\"]\n"
+            "{EXAMPLE}\n[labels.xsd]\noff = \"hard\"\nterm1 = [\"fast:shape:trend\", \"slow:trend:bull|neutral\"]\nterm2 = [\"fast:shape:trend\", \"slow:trend:bear\"]\n[labels.hyparb]\noff = \"soft\"\nterm1 = [\"fast:vol:!high\"]\n"
         )
     }
 
@@ -644,7 +655,7 @@ mod tests {
         assert!(!parse(&bare).unwrap().require_labels, "absent = advisory");
         assert!(!parse(&format!("{bare}\n[labels]\nrequire = 0\n")).unwrap().require_labels);
         let both = format!(
-            "{bare}\n[labels]\nrequire = 1\n[labels.icdp]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n"
+            "{bare}\n[labels]\nrequire = 1\n[labels.xsd]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n"
         );
         let f = parse(&both).unwrap();
         assert!(f.require_labels && f.labels.len() == 1, "policy + member sections coexist");
@@ -662,16 +673,16 @@ mod tests {
     fn labels_parse_into_label_sets() {
         let f = parse(&with_labels()).unwrap();
         assert_eq!(f.labels.len(), 2);
-        let icdp = &f.labels[0];
-        assert_eq!(icdp.member, "icdp");
-        assert_eq!(icdp.set.n, 2);
-        assert_eq!(icdp.set.off, REGIME_OFF_HARD);
+        let xsd = &f.labels[0];
+        assert_eq!(xsd.member, "xsd");
+        assert_eq!(xsd.set.n, 2);
+        assert_eq!(xsd.set.off, REGIME_OFF_HARD);
         assert_eq!(
-            icdp.set.terms[0].fast.0 >> (8 * DIM_SHAPE as u32) & 0xFF,
+            xsd.set.terms[0].fast.0 >> (8 * DIM_SHAPE as u32) & 0xFF,
             1 << SHAPE_TREND
         );
         assert_eq!(
-            icdp.set.terms[1].slow.0 & 0xFF,
+            xsd.set.terms[1].slow.0 & 0xFF,
             1 << core_types::regime::TREND_BEAR
         );
         let la = &f.labels[1];
@@ -733,6 +744,28 @@ mod tests {
         assert_eq!(ok.labels[0].member, "hyparb");
         let err = parse(&with("latency_arb")).expect_err("[labels.latency_arb] must be refused");
         assert!(err.0.contains("unknown coded member"), "{}", err.0);
+    }
+
+    /// XMM XH1/XH3 (2026-09-26): slot 6 is `xmm`, so `[labels.icdp]` is
+    /// refused at the grammar for the same reason `[labels.ev]` is, and
+    /// `[labels.xmm]` parses (XH3). `rule_tree` is gone the same way and
+    /// `bin15` — which the boot always mapped — finally parses too.
+    #[test]
+    fn slot_six_is_xmm_icdp_and_rule_tree_are_refused_bin15_parses() {
+        let with = |member: &str| {
+            format!(
+                "{EXAMPLE}\n[labels.{member}]\noff = \"soft\"\nterm1 = [\"fast:shape:trend\"]\n"
+            )
+        };
+        for gone in ["icdp", "rule_tree"] {
+            let err = parse(&with(gone)).expect_err("a retired name is refused");
+            assert!(err.0.contains("unknown coded member"), "{gone}: {}", err.0);
+        }
+        for name in ["xmm", "bin15", "ai_exec"] {
+            let ok = parse(&with(name)).unwrap_or_else(|e| panic!("[labels.{name}]: {}", e.0));
+            assert_eq!(ok.labels.len(), 1);
+            assert_eq!(ok.labels[0].member, name);
+        }
     }
 
     #[test]
@@ -797,26 +830,26 @@ mod tests {
             "unknown coded member",
         );
         expect_err(
-            &format!("{EXAMPLE}\n[labels.icdp]\noff = \"maybe\"\nterm1 = [\"fast:vol:low\"]\n"),
+            &format!("{EXAMPLE}\n[labels.xsd]\noff = \"maybe\"\nterm1 = [\"fast:vol:low\"]\n"),
             "off must be",
         );
         expect_err(
-            &format!("{EXAMPLE}\n[labels.icdp]\noff = \"soft\"\nterm2 = [\"fast:vol:low\"]\n"),
+            &format!("{EXAMPLE}\n[labels.xsd]\noff = \"soft\"\nterm2 = [\"fast:vol:low\"]\n"),
             "contiguous",
         );
         expect_err(
-            &format!("{EXAMPLE}\n[labels.icdp]\noff = \"soft\"\nterm1 = [\"fast:rel:lagging\"]\n"),
+            &format!("{EXAMPLE}\n[labels.xsd]\noff = \"soft\"\nterm1 = [\"fast:rel:lagging\"]\n"),
             "rel: terms",
         );
         expect_err(
-            &format!("{EXAMPLE}\n[labels.icdp]\noff = \"soft\"\nterm1 = [\"fast:mood:happy\"]\n"),
+            &format!("{EXAMPLE}\n[labels.xsd]\noff = \"soft\"\nterm1 = [\"fast:mood:happy\"]\n"),
             "UnknownDim",
         );
         expect_err(
-            &format!("{EXAMPLE}\n[labels.icdp]\noff = \"soft\"\n"),
+            &format!("{EXAMPLE}\n[labels.xsd]\noff = \"soft\"\n"),
             "needs at least term1",
         );
-        expect_err(&format!("{EXAMPLE}\n[labels.icdp]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n[labels.icdp]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n"), "duplicate section [labels.icdp]");
+        expect_err(&format!("{EXAMPLE}\n[labels.xsd]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n[labels.xsd]\noff = \"soft\"\nterm1 = [\"fast:vol:low\"]\n"), "duplicate section [labels.xsd]");
         let no_profile = EXAMPLE.split("[profile.slow]").next().unwrap().to_owned();
         expect_err(&no_profile, "missing [profile.slow]");
     }

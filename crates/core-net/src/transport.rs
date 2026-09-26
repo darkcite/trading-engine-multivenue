@@ -402,6 +402,20 @@ const PING_MAX: [u8; 125] = {
     a
 };
 
+/// One server Pong — FIN, unmasked (RFC 6455 §5.1) — carrying
+/// [`PING_MAX`]: 127 B on the wire.
+const PONG_MAX_FRAME: [u8; 2 + 125] = {
+    let mut a = [0u8; 2 + 125];
+    a[0] = 0x8A;
+    a[1] = 125;
+    let mut i = 0;
+    while i < 125 {
+        a[2 + i] = PING_MAX[i];
+        i += 1;
+    }
+    a
+};
+
 /// Simple in-process [`Transport`] backed by two preallocated byte
 /// buffers. Used by integration tests to feed scripted bytes into the
 /// run-loop and by the allocation-assertion harness to drive
@@ -517,6 +531,23 @@ impl TestTransport {
         assert!(payload.len() <= 125, "a control payload is at most 125 B");
         assert_eq!(self.rx.append(&[0x89, payload.len() as u8]), 2, "rx full");
         assert_eq!(self.rx.append(payload), payload.len(), "rx full");
+    }
+
+    /// Script server Pongs — 127 B each — until at least `min_bytes` are
+    /// queued; returns the bytes queued. Every ingress drains a Pong as a
+    /// no-op, so this is the burst of non-tick frames the I-3 drain tests
+    /// ([`crate::drain`]) fill rx with.
+    pub fn inject_server_pongs(&mut self, min_bytes: usize) -> usize {
+        let mut queued = 0;
+        while queued < min_bytes {
+            assert_eq!(
+                self.rx.append(&PONG_MAX_FRAME),
+                PONG_MAX_FRAME.len(),
+                "rx full"
+            );
+            queued += PONG_MAX_FRAME.len();
+        }
+        queued
     }
 
     /// Drain the outbound bytes and assert they are exactly ONE client

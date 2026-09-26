@@ -20,6 +20,7 @@ frozen-surface amendment with this ruling cited in the pin tests).
 | ---------------------------- | --------- | ------------------------------------ |
 | max open orders per symbol   | 8         | `cli::backtest::fill` (paper model)  |
 | max total open orders        | 64        | `cli::backtest::fill` (paper model)  |
+| xmm queue orders (XMM XH2)   | 32 total, 8 symbols | `core_fill::queue` — a SEPARATE table for post-only makers on Hyperliquid, in the paper matcher and the harness; no per-symbol cap of its own (the member holds ≤ 4 per perp: two sides, each with a modify in flight). Combined paper capacity is 96 |
 | max net notional per symbol  | $20 000   | rule 7 + gates (RiskGate at 8i)      |
 | max net notional total       | $100 000  | rule 7 + gates (2× book gross)       |
 | max single-order notional    | $10 000   | rule 7 + VM clamp + gates            |
@@ -109,7 +110,8 @@ laws, enforced in `crates/core-regime` (the detector), `crates/strategy-set`
 - **Entries only.** A closed gate blocks ENTRIES; it never blocks an
   exit and never flips a table. `off = soft` lets the position drain by
   its own exit law; `off = hard` flattens on the flip
-  (`engine_vm_regime_hard_exits_total`, `engine_icdp_regime_exits_total`).
+  (`engine_vm_regime_hard_exits_total`; icdp's `engine_icdp_regime_exits_total`
+  was retired with its member at XMM XH3).
 - **Fail closed.** UNKNOWN words (warm-up, a declaration that expired,
   a venue-dark FUND dimension) close every LABELLED row/member; an
   unlabelled row is bit-identical to pre-RG0 behaviour.
@@ -372,8 +374,10 @@ funding requirement.
 ### `off` is a STOP, and it stops exits too
 
 `mode = "off"` refuses EVERY order from the slot, entries and **exits**
-alike: `Order` carries no reduce-only bit today, so the dispatcher cannot
-tell them apart. It also does not cancel orders already resting.
+alike: the dispatcher cannot tell them apart. (`Order.flags` bit 0,
+`ORDER_FLAG_REDUCE_ONLY`, exists since XMM XH1 — but nothing sets or
+honours it before XH4; see "XMM — slot 6" below.) It also does not
+cancel orders already resting.
 
 This is a deliberate, documented **exception** to the standing law above
 that a cap never blocks an exit. `off` is not a cap — it is an operator
@@ -555,7 +559,7 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 27 known-answer vectors the official
+  the binary reproduces all 29 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
   from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify` —
   demanding the SDK's exact msgpack. **This is the half that covers LAW
@@ -1330,15 +1334,17 @@ Arm B reprices ~333 times per instance, so a modify routed to
 which is the address-budget exhaustion the governor exists to prevent.
 **One case this gets wrong, deliberately**: a modify that REDUCES
 exposure — smaller size, or a price further from the market — is
-arguably an exit and is refused at the floor anyway. `Order` carries no
-reduce-only bit, which is the same limitation already recorded for
-`mode = "off"`, so treating every modify as a submit is the fail-closed
-choice with an existing precedent. **When the reduce-only bit lands
-with E6, this is one of the sites to revisit.**
+arguably an exit and is refused at the floor anyway. No reduce-only bit
+is honoured — the same limitation already recorded for `mode = "off"`
+(the bit itself exists since XMM XH1, unread until XH4) — so treating
+every modify as a submit is the fail-closed choice with an existing
+precedent. **When the reduce-only bit is honoured (XH4), this is one of
+the sites to revisit.**
 
-**A repeated roll retires nothing.** The venue re-sends
-`outcomeCreated` on a reconnect snapshot and a replayed ring entry
-carries it too, so the handler compares the bound asset against the one
+**A repeated roll retires nothing.** A replayed ring entry carries one
+(the venue itself pushes `outcomeCreated` once and replays none on a
+reconnect — corrected 2026-09-26, probed; "The Hyperliquid reconnect
+loop" below), so the handler compares the bound asset against the one
 it is about to bind. Without that the queued asset is the very one the
 bind re-establishes as live, and the next idle would enumerate the
 account and cancel every quote on a LIVE leg — at the moment the member
@@ -2829,7 +2835,8 @@ tables (OKX families ≤ 384 B, Deribit DVOL ≤ 128 B, Polymarket ids ≤
 10 240 B); the variable-length batch subscribe renders (OKX ≤ 12 KiB,
 Deribit ≤ 16 KiB, Bybit ≤ 8 KiB, Polymarket ≤ 11 KiB — the frame length
 is unknown until the render ends; a header-first render is the
-operator's later pass, Q7); the rate-limited WARN lines (≤ 224 B, one a
+operator's later pass, Q7 — done 2026-09-26, "Batch subscribes render
+straight into tx", below); the rate-limited WARN lines (≤ 224 B, one a
 second — one `writev` rejected: a short writev splits the line);
 Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
 payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
@@ -2845,7 +2852,8 @@ escalated rustls copy, above), TX = 2 plus the serialiser's single
 write. Every cold finding and every flagged hidden move was acted on
 (above); its borderline notes — MEXC futures' per-(symbol, channel)
 subscribe render and the other remaining render markers as candidates
-for Q7's pass — stay open.
+for Q7's pass — stay open (closed 2026-09-26 by the header-first renders,
+below; HyperEVM's request bodies stay copied, re-marked).
 
 Gate after the pass: `hits=31 baselined=31 new=0 paid=0` over 21 dirs —
 the baseline byte-identical (sha256 `caf8a05e…`), the seven crates and
@@ -2982,7 +2990,9 @@ hand: the ring bench −0.8 % against its new baseline; the benches this pass
 does not touch (`book/apply_n8_middle` 2.01 ns, the latency-arb callback
 2.37 ns) read the same as at `0990e4f` on this host (1.96 ns, 2.33 ns) —
 their distance from the sandbox baseline is the host, not a regression.
-The script's repair is left to the operator.
+The script's repair is left to the operator. *Repaired, and that distance
+measured: it is D10's stale-drop count, not the host — "`make
+bench-check` compares", below.*
 
 **The auditor on the pass** (`zero-copy-auditor`, Opus 5.5): PASS — RX = 4
 against the target of 3 (the extra one core-net's escalated rustls copy),
@@ -3082,6 +3092,8 @@ step only when an engine pop happened to land inside it); and the
 multi-connection loops (Binance, Bybit, MEXC) have no per-connection step
 cap. Both want their own change — consumed rx bytes and the other rings'
 publishes counted as progress; a step cap with a zero-timeout re-poll.
+*Fixed, with a read that stopped on a full rx as the progress signal: "The
+I-3 drain loops read past a full rx", below.*
 
 **Proof.** 21 core-ring tests. New: a stale tail cache refreshes when the
 ring looks full (a refused push keeps it); a stale head cache refreshes
@@ -3109,6 +3121,509 @@ paid=0`, the baseline byte-identical; license-check OK; `cargo +nightly fuzz
 build` OK; live smokes 60 s, the engine untouched — MEXC 31 245 messages
 (1 719 ticks), Binance 44 785 (45 610 ticks), 0 parse errors, 0 reconnects,
 0 drops on every ring. The release engine binary was not rebuilt.
+
+### `make bench-check` compares (2026-09-25)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the bench-check item of the three).
+
+**What was wrong.** `check_regression.py` could not run on this Mac, and
+could not have compared anything if it had: its `float | None` annotation
+needs Python ≥ 3.10 (the Mac's is 3.9.6); it looked for results under
+`target/criterion/<group>/<name>/`, where criterion 0.5 files
+`bench_function("ring/push_ref_pop_ref_tick")` under
+`ring_push_ref_pop_ref_tick/`; its `_ns`-suffix rule turned `clock/now_ns`
+into `clock/now`; and a sample with no result printed a WARNING, then "OK".
+The baseline beside it was a 2026-05-19 Linux sandbox run.
+
+**What it does now.** It finds each result by the id criterion records in
+the result's own `new/benchmark.json` (`full_id`), never by path, and the
+baseline's keys are those ids exactly (`signer/sign_order_full_ns` is now
+`signer/sign_order_full`; the suffix rule is gone). A baselined sample with
+no result fails the check, and so, under `--since`, does a result written
+before the run began — one left from an earlier run, or from a bench since
+deleted, cannot stand in for this run's; `make bench-check` passes its
+start time. Samples faster than the baseline by more than the tolerance are
+listed (re-baseline, or a slide back to the old number passes unseen), and
+benches that ran without a baseline are named. Exit 0 pass, 1 regression
+or missing result, 2 unusable baseline. Python ≥ 3.9, full imports only.
+
+**The baseline, on the M4.** Each value the median of three `make
+bench-check` runs at `5f2140f`, with the launchd engine running as it
+always is; a fourth run against it: all 11 within 1.3 %. The single-thread
+`ring/push_ref_pop_ref_depth` joins the gate. The two-thread ring benches
+stay out: macOS places their threads, and between sessions they moved
+103–122 ns (round trip) and 9–11 ns (stream) with no code change.
+
+**A correction.** ZC pass A (above) read `book/apply_n8_middle` (2.01 ns)
+and the latency-arb callback (2.37 ns) against the sandbox's 0.94 /
+1.66 ns and called the distance the host. It is not: the initial commit's
+code (`02db7a6`), benched on this M4 in the same hour, reads 1.07 /
+1.69 ns. The rise is phase 8a's D10 (`503606f`): a stale apply now counts
+itself (`stale_drops += 1`, a read-modify-write per call) where it used to
+return, and both benches repeat one tick, so every apply after the first
+is stale. That is the policy — D10 never drops silently — not a regression
+to undo; it does mean both benches time the stale path, not an apply (a
+bench of the applied path would be a new id).
+
+Gates: `make bench-check` passes; against the old baseline it fails, as it
+should (book +114 %, latency-arb +43 %, the `_ns` key missing). The
+script's error paths — no baseline, a non-positive value, no tolerance, a
+missing sample, a regression, no criterion directory — exit as documented.
+This work built no engine binary.
+
+### The I-3 drain loops read past a full rx (2026-09-25)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the I-3 item of the three).
+
+**What was wrong** (the cached-ring pass's open notes, above). A drive step
+reads until rx is full or the transport says `WouldBlock`. The ten loops
+drove again only when a step published a tick or moved its state, so a
+step that stopped on a *full* rx and published nothing — a run of pongs,
+acks, heartbeats, events or options summaries, or ticks a full ring
+dropped — left the rest in the kernel or in rustls, and an edge-triggered
+poller never announces bytes that already arrived: they waited for the
+next packet or the 50 ms poll timeout. And the three multi-connection loops
+(Binance, Bybit, MEXC) drained each slot without a bound, so one slot's
+backlog held every other slot, the keepalives, the capture flush and the
+stop flag.
+
+**What changed.** `core_net::drain` holds what the loops share.
+`fill_rx` — the read half of every `drive_one`, one copy where there were
+nine — reports `RxFill::Full` when a read took bytes and stopped on a full
+rx; a read that finds rx already full took nothing and reports `Drained`,
+since driving again cannot shrink a frame larger than rx. `drive_one`
+returns that as a bool, and each crate's new `drive_until_idle` — one
+body, the `core_net::drain_until_idle!` macro (each crate's `drive_one`
+takes its own lanes, and a closure is off the table on this path) —
+drives again while a step filled rx, published, or moved its state
+(HyperEVM: or its phase), for at most `DRAIN_STEP_CAP` = 8 steps. A capped
+drain ends `Drained::Capped` and the next poll does not sleep
+(`poll_timeout`); every live connection is driven every iteration anyway,
+so the capped one resumes once the others have had their turn. Eight steps bound one turn at
+eight rx buffers: 0.5 MiB (Binance spot, Polymarket, RPC) to 32 MiB (OKX,
+Deribit). The kill and reconnect paths are unchanged; OKX and Deribit still
+record the failing step's io-kind (`Drained::Failed(kind)`). Binance dropped
+its private copy of `IoBuf` for core-net's — the same type — and its
+sentinel SUBSCRIBE now goes through `queue_masked_text_frame_parts`.
+
+Why "filled rx" rather than "read any bytes": a step that read to
+`WouldBlock` has taken everything that had arrived, and anything newer
+arrives with its own readiness edge, so counting every read would buy one
+wasted drive — one read syscall — per wake. The publish criterion stays:
+HyperEVM's snapshot phases emit as the engine frees ring room, and a step
+that published costs one more read, as before.
+
+**Proof.** core-net: `fill_rx` drained at `WouldBlock`; `Full` with input
+left below; an exact fill reports `Full` and the next read decides; rx
+already full is not progress; EOF keeps the bytes before it. The macro,
+over a scripted connection: a full read, a publish and a state change
+each count as progress; a step without any ends the drain at once; a
+drain that keeps progressing stops at exactly `DRAIN_STEP_CAP` steps and
+the next one resumes; a close or a failure ends it at the step that saw
+it. All nine crates: two rx buffers of Pongs with a tick behind them (a
+signal on RPC, a swap on HyperEVM) are delivered by one drain — on the old
+criterion the test fails (checked by mutation on Polymarket) — and eight
+end `Capped` with the tick still below; the next drain delivers it. And
+Polymarket's `run`, fed a backlog one rx past the cap that no readiness
+edge will announce, delivers its tick well inside one `POLL_IDLE`; with
+`Capped` not wired to the zero-timeout poll it takes 50.7 ms and the test
+fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES, all correctness
+areas clean — no path stalls input or spins, `repoll_now` is set and reset
+right in all ten loops, no slot is starved or forgotten, the close and
+error paths are unchanged. Acted on: the `run`-level re-poll test, the
+macro in place of nine copies of the loop, three doc comments. Left open,
+pre-existing, each its own change: Binance (its 2 MiB options slot
+included), OKX, Polymarket, RPC and HyperEVM stall on a frame larger than
+rx until the idle timeout (Bybit, Deribit, Hyperliquid and MEXC fail fast
+on one); every `drive_one` marks `Closed` on EOF before parsing the
+complete frames that arrived with it; the multi-connection re-poll is
+tested through the drain, not end to end (a `TestTransport` slot cannot
+finish a handshake inside `run_multi`); and the exec lane's user-WS fill
+(`exec-hyperliquid` `userws_conn`) reads only on a readiness event, the
+same gap outside this change.
+
+Gates: clippy clean; nextest 3150 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31 new=0
+paid=0`; license-check OK; `cargo +nightly fuzz build` OK; live smokes
+60 s, the engine untouched — MEXC 31 195 messages (1 575 ticks), Binance
+92 037 (92 876 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
+This work built no engine binary.
+
+**Hypercall joins (2026-09-26, the commit after its merge).**
+`ingress-hypercall` was built beside this change with its own drain:
+progress was a consumed frame or a state change, 64 steps, then the
+50 ms poll. That read past a run of republications that publish
+nothing, but a capped backlog still waited for the poll timeout, and
+the crate kept its own copy of the read loop. It now drains by
+`core_net::drain` like the others: `fill_rx`; `drive_one` returns the
+full-rx bool; `drive_until_idle` over `drain_until_idle!` (published =
+its tick producer, key = its state); `DRAIN_STEP_CAP` = 8 steps of its
+1 MiB rx; `poll_timeout` after a capped drain. Proof: two rx buffers of
+Pongs with a quote behind them are delivered by one drain; eight end
+`Capped` with the quote still below, and the next drain delivers it;
+with the full-rx signal cut, the test fails (checked by mutation). As
+for MEXC, the `run`-level re-poll is wired and tested through the
+drain, not end to end. Not changed: its reconnect is internal (one
+`HcConn`), like MEXC's `run_multi`, and a confirmed subscription resets
+its backoff; the 30 s healthy-session law (`7235201`) binds the seven
+outer spawn loops. Gates: nextest 3424 (6 skipped); alloc 86/86;
+clippy clean; copy-audit new=0; license OK; worker pytest unchanged.
+Live smoke, the engine untouched (2026-09-26 12:00Z, ruling O-HC13: the
+operator allowed the freshly built test binary in LuLu, which had held its
+11:36Z boot `GET /markets` — curl fetched the same 4.3 MB in 1.7 s): `GET
+/markets` 4.34 MB in 1.8 s, 32 instruments; 90 s — 2 342 messages, 1 494
+ticks, 0 parse errors, 0 reconnects, 0 ring drops, 0 opt-ring drops, one
+subscribe, no venue close, 880 provider sides, the poller 6 ok / 0 err /
+48 rows, clock-sync RTT 98 ms.
+
+**The internal reconnects join the healthy-session law (2026-09-26,
+ruling O-HC16).** The law — reset the backoff only after a session that
+moved market data AND lived `HEALTHY_SESSION_MIN_NS` (30 s), or one that
+ended in a venue-quiet trip — lived in `cli/src/paper.rs` for the seven
+outer spawn loops; Hypercall's `HcConn` and MEXC's `run_multi` slots
+reconnect internally and reset on any confirmed subscription, so a
+session that confirmed and then died young — the 2026-09-26 HL shape —
+reset them every time. The law moved to core-net unchanged
+(`core_net::{HEALTHY_SESSION_MIN_NS, should_reset_backoff}`, its test with
+it; the seven loops call it from there) and both crates reset through it:
+Hypercall with the venue's `ticks_total` recorded at session start (one
+connection, so the venue's count is the session's); MEXC per slot, with
+`Driver::session_ticks` — the ticks THIS connection published, cleared by
+`reset_for_reconnect` — because the venue's status is shared by every slot
+on the thread. The keepalive's `Reconnect` (inbound silence) is the quiet
+trip; every other end (a transport error, the venue's close, the
+establishment budget, a failed ping) is not. Proof, per crate: a session
+that moved data and died young escalates; one that lived 30 s moving data
+resets; the quiet trip resets; pairs confirmed without data escalate;
+MEXC: another slot's data does not reset this one.
+
+### Batch subscribes render straight into tx (2026-09-26)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the in-place subscribe renders of plan Q7, the last of the
+three).
+
+**What was wrong.** A client frame's header carries its payload length in
+a 7-, 16- or 64-bit form (RFC 6455 §5.2), and a batch subscribe's length
+is unknown until it has been rendered. So OKX, Deribit, Bybit, Polymarket
+and MEXC rendered theirs into a stack scratch (OKX 12 KiB, Deribit
+16 KiB, Bybit 8 KiB, Polymarket 11 KiB, MEXC spot ~2.3 KiB and one
+~80 B futures frame per (symbol, channel)), and `queue_masked_text_frame`
+then copied it into tx behind the header and masked it: every subscribe
+byte written twice, and up to 16 KiB of stack per call. ZC pass B marked
+those copies (OKX K3, Deribit K8, Bybit K16, Polymarket K20/K21, MEXC's
+`push_bytes`) and left the header-first render to this pass.
+
+**What changed.** core-net's `ws_write_text_frame_rendered` (on tx:
+`queue_masked_text_frame_rendered`) takes a render in place of the
+payload. The render appends through a `WsPayload` and runs twice: a
+counting pass that writes nothing and sizes the payload, then — the
+header written at its minimal width — a writing pass into exactly the
+counted span of tx; the payload is then masked in place. A render must be
+a pure function of what it captured, and its `Fn` bound keeps it from
+mutating a capture: a writing pass that fails, runs past its count or
+stops short of it is `RenderDiverged` — a `debug_assert!` in debug builds;
+in release the error fails the session, which reconnects, and tx never
+advances over the torn frame. The venues' writers became renders — OKX
+`render_subscribe_batch`, Deribit `render_subscribe_all`, Bybit
+`render_subscribe`, Polymarket `render_market_subscribe` (its id-list
+check split out as `market_subscribe_ids_valid`, run first), MEXC
+`render_spot_subscribe` and `render_fut_subscribe` — and the scratches
+and their markers are gone. The one copy left — each literal fragment,
+symbol and id put once, straight into the frame — is marked once, in
+`WsPayload::put`. The parts writer builds its header from the same two
+helpers (`client_header_len`, `write_client_header`). A subscribe is now
+bounded by tx's free room rather than by a scratch; every venue's tx was
+already sized for its largest batch, since the copied frame had to fit
+there too (OKX's doc now counts its 160 args: ≤ 11.2 KiB in 16 KiB).
+Cold paths only: every render runs twice, at session start.
+
+HyperEVM's request bodies — the logs subscribe and every snapshot
+`eth_call` — still render into the driver's 8 KiB scratch and are copied
+into tx behind the header. Their marker said a header-first render needed
+a core-net API that did not exist; it is re-worded: the API exists (a
+binary twin is one opcode away), but it would trade that copy for a
+second run of every render on the warm read path, and `write_eth_call`'s
+calldata writer is a one-shot `FnOnce` into the request's tail, so every
+ABI encoder would need a counting mode.
+
+**Proof.** core-net: a rendered frame is byte-identical to the parts
+writer's in all three length forms, and reads back through
+`ws_read_frame` and unmasks to its payload at every length boundary (0,
+125, 126, 65 535 and 65 536 B) — a check independent of the header writer
+the two share, which both writers now also check against its length; one
+that does not fit fails `BufferTooSmall`, and a render that fails its
+counting pass returns its own error, both without writing a byte; a render
+that writes more, or less, on its writing pass than it counted is refused;
+`WsPayload` counts without writing and refuses a put past its span. On tx:
+a rendered frame is the plain frame of its bytes under the same mask
+counter, and a refused or diverging render leaves tx empty. The zero-alloc
+round trip (alloc gate) runs the rendered writer beside the plain one. The
+venues' exact-bytes tests run unchanged through a `WsPayload::writing`
+helper, and the run-loop tests that unmask the subscribe off the wire —
+all five venues, and MEXC's TLS loopback — see the same frames. A const
+assert pins that MEXC's `from_slot` names exactly `channels_per_symbol`
+slots per class (both subscribe loops walk `from_slot`; the ack
+bookkeeping counts the other).
+
+**The review** (a read-only subagent): PASS WITH NOTES — byte identity
+holds for all six renders, each render captures only shared references
+and `Copy` values, the header forms and the mask are right, and every call
+site borrows disjoint fields. Acted on: the `Fn` bound, the queue-level
+and boundary tests, the counting-pass test, the header check, the alloc
+gate, MEXC's const assert, Polymarket's render and id check made
+`pub(crate)` (the check guards the render) with its duplicated tests
+folded, Deribit's `push_bytes` moved beside the WARN lines that are its
+only callers, and the stale docs (the scratch wording in OKX, Deribit,
+Bybit and Hyperliquid — Hyperliquid's since pass B — OKX's `write_op` and
+its tx sizing, the `put` marker's bound). Left open:
+Deribit's subscribe-result check (`found_mask`) builds its needle apart
+from `render_channel_name`, and OKX, Deribit, Bybit and Polymarket size
+tx for their worst batch in docs, not in a const assert as MEXC does.
+
+Gates: clippy clean; nextest 3158 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); core-net's tests in release (the torn-frame
+path) pass; `make copy-audit` `hits=31 baselined=31 new=0 paid=0`, the
+baseline byte-identical (sha256 `caf8a05e…`); license-check OK; `cargo
++nightly fuzz build` OK; live smokes 60 s, the engine untouched — MEXC
+30 814 messages (1 216 ticks; one spot `SUBSCRIPTION` for 5 symbols and
+21 futures frames, every channel confirmed: 0 sub-drops), Binance 34 118
+(34 943 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
+`make bench-check` was not judged: the hot_path binary links none of the
+changed crates (`nm`: no core-net or ingress symbols), and at a load of
+12–31 (RustRover's background checks at ~550 % CPU, another session's
+build and tests beside the engine) two benches it does link read slow
+(latency-arb `on_tick` +61 %, `sign_order_full` +23 %) — to re-run on a
+quiet Mac. This work built no engine binary.
+
+### The Hyperliquid reconnect loop — dead HIP-4 instances (2026-09-26)
+
+On the operator's word (2026-09-26: "investigate why hyperliquid lane is
+reconnecting constantly", then "implement the fix and restart now").
+
+**What was wrong.** From 01:45:11Z the lane logged `hyperliquid: run-loop
+returned res=Disconnected` every ~1.24 s — 15 190 times by 07:13Z, 43 139
+since 09-19 — in episodes that began at a reconnect and ended only at a
+process restart. The venue answers a subscribe to a settled or unknown
+coin by dropping the whole socket: a bare FIN, no `error` frame, no Close
+(probed from the Mac: `l2Book` on the BTC 15-minute instance that expired
+at 00:15Z, or on `NOTACOIN`, EOF within 0.25 s; the engine's own 70
+subscriptions ran 20 s and 786 frames on the live instances, and died at
+1.2 s after 56 acks with the BTC family on its settled one). The engine
+re-subscribed exactly that: `perform_roll` keeps a settled instance bound
+until the next `outcomeCreated`, and `reset_for_reconnect` re-subscribed
+every binding. The successor could not arrive — each session died before
+`outcomeMetaUpdates`, subscribed last, was acknowledged, and that channel
+replays nothing (below) — so only boot discovery rebound. The backoff
+never grew: `should_reset_backoff` reset on any tick, and the perp
+snapshots arrived in a session's first 0.2 s. What started it: an
+instance expired, the venue settled it and listed its successor late, and
+the expired coin's silence — the staleness monitor let go of a coin only
+at `outcomeSettled` — tripped the whole session 10 s after the expiry
+(logged at 12:35:11 and 18:30:11Z on 09-25 and at 01:45:11Z; two other
+episodes began at a `res=Error`). During a loop the lane carried
+connect-time snapshots only, every BIN15 family was dark, and it opened
+~48 connections a minute against the venue's 30 per IP.
+
+**What changed.** A dead instance is never subscribed again.
+`perform_roll` flags a family whose instance settles (`HlFamily::settled`);
+`instance_dead` holds for a bound instance that settled or passed its WALL
+expiry; and `reset_for_reconnect` now ends by retiring every dead family
+(`HlFamilyTable::retire`: both coin rows unbound through the new
+`HlCoinTable::unbind`, the family dormant and `awaiting`), so the next
+subscribe sweep and the ack masks skip it; it returns the count, which
+the caller logs. On a live session a settled instance stays bound and
+subscribed as before — the venue keeps a subscription it already holds.
+Successors are re-discovered between sessions: while a family awaits
+one, the HL thread re-reads `/info {"type":"outcomeMeta"}` before the
+socket opens, at most once a minute — the boot's own request and parser
+(`boot_discovery::fetch_hl_outcome_specs`), sent with core-net's new
+`boot_http::https_post_at` to the address the engine resolved at boot
+(like the WS host's), so no DNS lookup runs on that thread and every
+socket step is armed with what remains of a 3 s deadline — and
+`Driver::rebind_dormant` binds every family naming no instance, the
+boot's dormant ones included, by the boot's rule (`best_live_spec`: the
+earliest-expiring instance still live), announcing each adoption as
+`perform_roll` announces a roll (`emit_roll_event`, now the one writer
+for the roll, the boot announcement and the re-discovery). A failed fetch
+leaves the family waiting for the venue's next `outcomeCreated`.
+Staleness stops judging an instance at its expiry: `session_health`
+unwatches the rows of every expired instance — right after `arm`, and
+again at each expiry (`next_expiry_ns`, one compare per iteration;
+`perform_roll` puts the successor on the schedule) — and its ack check is
+masked, since a roll can ack rows the sweep did not expect. The backoff
+resets only after a session that moved market data AND lived 30 s
+(`HEALTHY_SESSION_MIN_NS`), or a venue-quiet trip, in the seven venue
+loops that share `should_reset_backoff` (in core-net since O-HC16, which
+extended it to the Hypercall and MEXC internal reconnects — "Hypercall
+joins" above): a silent-drop loop of any cause
+now climbs to the 8 s cap (≤ 7.5 connects a minute). And every end names
+itself on the T1(a) status triple: the run loop's error exits record site
+and io-kind (`session_err`), a peer Close `peer-close` with its code
+(1005 when it carried none), a bare EOF `peer-eof`, a missed ack deadline
+`subscribe-missing` with the count missing, a venue error frame
+`venue-error`; `run-loop returned` prints them with `lived_ms`, `acks`
+and `acks_expected`. core-metrics gains `ERR_SITE_PEER_EOF` (10) and
+`ERR_SITE_PEER_CLOSE` (11). A retired instance's later `outcomeSettled`
+matches no family, so the capture carries no `settled` for it, and its
+re-discovered successor arrives as a lone `created`
+(`docs/wire-format.md`).
+
+**Proof.** ingress-hyperliquid (162 tests): a reconnect never
+re-subscribes an expired instance (12 subscribes on the wire, none for
+`#2649`); a settled instance stays bound on its own session and is
+retired at the reconnect; staleness stops judging an instance at its
+expiry, and a mid-session roll puts the successor on the schedule;
+`rebind_dormant` adopts the live successor and announces it, or leaves
+the announcement to the boot's when that has not gone out; a boot binding
+dead before the first connect is announced exactly once; a retired family
+is off the wire and `bind` revives it; the end of a session is named on
+the status slot (Close 1008; a Close with no code → 1005; a bare EOF →
+`peer-eof`; the ack deadline → `subscribe-missing`, 9 missing). cli:
+`backoff_resets_only_on_a_healthy_session_or_quiet_trip`. core-net: a
+POST to a boot-resolved address does no lookup — the server name is under
+`.invalid` (RFC 6761), so a lookup fails `Resolve` before any connect
+(checked by mutation) — a closed port is refused (`Connect(ConnectionRefused)`),
+and a peer that accepts and stays silent is cut off by the deadline
+(300 ms), not by the peer (1.5 s). And the venue fact the fix rests on,
+probed at the 08:15Z and 08:30Z rolls: `outcomeMetaUpdates` pushes a roll
+once, live, and replays nothing to a later subscriber. A socket
+subscribed from 08:28:30Z got `outcomeSettled` for 5791 and 5790 at
+08:30:04Z and one `outcomeCreated` push for their successors 5792/5793 at
+08:30:06.6Z; sockets subscribed 14 s and 74 s after that push — and at
+08:15:30 and 08:16:30Z, after the 08:15Z roll — got the ack and nothing
+else, while `/info outcomeMeta` listed the successors by 08:16:10 and
+08:31:00Z. (A probe socket must ping: the venue closes one 60 s after the
+client's last message.) Five comments said the venue re-sends
+`outcomeCreated` on a reconnect — the run loop's roll dispatch, the TLS
+loopback test, `exec-router`'s ledger (twice), `exec-hyperliquid`'s
+exchange (twice) — as did "LAW E-8 — the roll takes its own quotes back"
+above; each now says what was measured, and the guards they explain stay:
+a replayed ring entry still carries a repeat, and an instance adopted from
+an `/info` snapshot can see its own push arrive after the session
+subscribed.
+
+**The review** (read-only subagents, two passes). The fix: PASS WITH
+NOTES — the loop is closed, and each new test fails without its part of
+the fix. Acted on: the post-boot use of `boot_http`, whose doc said boot
+only — throttled to one fetch a minute, run before the socket opens, on a
+3 s deadline, and documented; the one expiry-schedule write that matters
+(`perform_roll`'s) got its test, and the four dead ones went;
+`rebind_dormant` picks families by `live.outcome == 0`, not the `dormant`
+flag, which would re-announce a live instance once the second-strike bug
+below is fixed — and BIN15 would zero a position the ledger keeps; the
+masked ack check; one WALL clock for every judgement; the roll records
+mirrored to disk before the connect; the race documented; the family log
+shared with boot; the first-connect test; stale docs and `debug_assert!`s.
+The replay contradiction it found went to the probe above. The second
+pass, over what followed — the boot-resolved `/info` address and the
+comment corrections: PASS WITH NOTES — boot's own fetches behave exactly
+as before (the deadline starts before the lookup, `RequestTooLarge`
+before any I/O, the same errors), and nothing on the HL thread can reach
+DNS. Acted on: the failure tests for `https_post_at`, the E-8 paragraph,
+the deadline wording (each socket step is armed, not the call as one),
+the module title and error docs, `WssEndpoint`'s doc narrowed to the HL
+thread, the guard's remaining trigger, the wire-format note, and a
+duplicated `#[allow]` on `run`. Left open: `roll_health`'s retry sets
+`ack_deadline_ns = u64::MAX`, so its second strike (dormant) is
+unreachable — pre-existing, its own change; a successor listed between
+the `/info` snapshot and the new session's `outcomeMetaUpdates` ack is
+missed until the family's next instance (at most one 15-minute instance;
+a daily's successor is listed a day ahead); the `/info` host is resolved
+whenever HL is configured, families or not — boot discovery already
+posts to it then, so nothing new can fail; and the venue now acks
+`l2Book` with `"fast":false` (≈ one push per coin every 4–5 s against
+`bbo` at ~1/s in the probes) — unverified, not this change.
+
+**Operations.** The operator's restart at 07:18Z (the sanctioned 0010
+revive) rebound the live instances and ended the loop; the lane then ran
+clean through the 07:30–08:30Z rolls. At 08:32Z a venue-side incident —
+the probes' control socket dropped at 08:32:21Z, a fresh upgrade answered
+502, `/info` timed out — tripped the lane (`res=Stale` at 08:32:01Z) into
+26 more session ends in 102 s — the first 12 about 1.2 s apart, the rest
+5–7 s — until the 08:33Z daily restart stopped it. Under the new rule
+those 1.2 s gaps climb to the 8 s cap, and the new line says how each
+session ended; the old one could not tell this outage from the loop. That restart's boot
+discovery failed on the same outage (`spotMeta` Timeout, exit 1), and
+launchd's relaunch booted clean at 08:36:24Z (the 15-minute families on
+5792/5793, the dailies on 5755–5758; `vm_rows_active` 2). Deployed on the
+operator's word: `7235201` built and restarted through the 0010 revive at
+09:03Z (the old engine drained, exit 0); the new one booted at 09:05:11Z,
+and at the 09:15Z roll it settled 5796/5797 and adopted 5799/5800 in
+session — no reconnect, no ack timeout, no staleness trip. The lane counts
+~1 parse reject a second, before and after that roll; the parse path and
+the subscription set are unchanged by this work — they are BIN15 O8's
+one-sided outcome `bbo` drops (next section).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc
+73/73 at 0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31
+baselined=31 new=0 paid=0`, the baseline byte-identical (sha256
+`caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK. No live
+smoke exists for this lane, and what one would need to show — a reconnect
+across an expiry — is what the unit tests script. This work built no
+engine binary.
+
+### The one-sided outcome `bbo` is not a parse error (2026-09-26)
+
+On the operator's word (2026-09-26: "Fix it (own counter)", after the
+probe below).
+
+**What was wrong.** After the deploy above the lane counted 1–1.5 parse
+errors a second. A read-only probe carried the engine's exact 70
+subscriptions for 60 s (3 504 frames) and sorted every frame by the
+parser's rules: the only reject class was `bbo` pushes on HIP-4 outcome
+legs with the ask `null` — 1.57/s, against the engine's 1.45/s over the
+same window; trades, asset contexts, books and unknown channels, none.
+BIN15 O8 drops those pushes by policy (the leg's two-sided touch comes
+from its `l2Book`), but it dropped them through `Dispatch::Nothing`, the
+rejection path: each one counted in `parse_errors_total` and was tapped as
+a reject. No data was lost; the counter stopped meaning anything for this
+lane, and a real parse failure would have hidden in it.
+
+**What changed.** The drop has its own dispatch
+(`Dispatch::OutcomeBboOneSided`): it counts as a message — not a tick, so
+neither the last-tick age nor the backoff reset ever feeds on a dropped
+frame — and in `HlRollStatus::outcome_bbo_one_sided`, published as
+`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`;
+`parse_errors_total` and the reject tap are left to real rejections. The
+drop condition is unchanged: a two-sided outcome `bbo` is still a tick, a
+perp's is untouched, and a `bbo` with both sides `null` is still a parse
+failure. Docs: `HlRollStatus` (the slot `IngressStatus` could not take is
+192 B, three lines), the driver's `roll_status` and `verified`,
+`set_families`, and `session_health` (the masked ack check, both halves).
+
+**Proof.** `a_one_sided_outcome_bbo_is_dropped_and_l2book_carries_the_touch`
+now pins the count: the one-sided push leaves the ring empty, adds one to
+the new counter and to `msgs_total`, and no tick, parse error or reject
+tap (it is still tapped raw, like every frame); a both-`null` push is one
+parse error and one reject tap with the count untouched; the two-sided
+push is a tick and the count stays 1. Routed back through `Nothing`, the
+test fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES — the change is
+correct; `msgs_total` feeds only the metric mirror and `/state`, while the
+health tells read `ticks_total` and the venue clock, so counting the drop
+there masks nothing (MEXC's dropped quotes and HL's `RollUnmatched` count
+the same way). Acted on: the stale records, a `docs/migration.md` entry,
+the tick and both-`null` assertions, the doc nits, and the name — `one
+sided`, O8's own word, not `ask_null`, so a widened condition would not
+need a rename. Left open: the parse count is not zero after this — each
+mid-session roll's six unsubscribe echoes still land in `Nothing`
+(`parse_sub_response` takes only `"subscribe"`, though `lib.rs` calls the
+echo deliberately ignored), and so do frames in flight for the retired
+coins; the same class, its own change. Only a `null` ask is guarded, which
+is what the venue does (2026-09-12: 194 of 194 outcome ticks had a zero
+ask, none a zero bid).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc 73/73 at
+0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31
+new=0 paid=0`, the baseline byte-identical (sha256 `caf8a05e…`);
+license-check OK; `cargo +nightly fuzz build` OK. This work built no
+engine binary.
 
 ## E6 — the risk gate and the kill switches
 
@@ -6351,7 +6866,7 @@ phase (BX7–BX10; "shared" is refused outright).
   liquidation is invisible to the ratio; a mid-session switch to hedge
   mode surfaces as a scan failure, `ReconDrift` at MAX, not
   `VenueLock`).
-* Gate 81, the live-socket allocation gate, is due before BX13.
+* Gate 94, the live-socket allocation gate, is due before BX13.
 * `/state` omits jobs dropped, doubts raised, fills deferred, journal
   drops, refusals by reason, budget and lock counts and the anchor flag
   (the arm's counters carry them): BX11.
@@ -6371,9 +6886,526 @@ BX11 (the flatten tool, observability); the Stage-3 member gate.
 | round | reviewer | verdict | disposition |
 |---|---|---|---|
 | 1 | zero-copy | FAIL: order digits and client ids staged then copied; a 128 B `Out` by value | `core_net::WsPart`: every part written in place; fills and events pushed by reference |
-| 1 | alloc | PASS with borderlines | all acted on: the anchor store moved to the writer thread; cross-multiplied compares; masked indexes over boxed fixed arrays; gate 79 through the router |
+| 1 | alloc | PASS with borderlines | all acted on: the anchor store moved to the writer thread; cross-multiplied compares; masked indexes over boxed fixed arrays; gate 92 through the router |
 | 1 | parser | one bug: `dec_1e6` wrapped on a 20-digit integer part | capped at 18 digits; fuzz `bn_account`, `bn_mode`; a tautology fixed |
 | 1 | risk | BLOCK: B1 the dead-man renewed while the arm could not cancel; B2 lost stream events never resolved, double booking; B3 fills on the monotonic clock; B4 no back-off after a 429 | all fixed, each with a test that fails without it; 17 should-fix items fixed or recorded above |
 | 2 | zero-copy | PASS; the logon's markers; six nits | all acted on |
 | 2 | risk | APPROVE WITH CONDITIONS: S1 lost fills, S2 half-open session, S3 `-2011`, S4 stalled sweep, S5 weight, S6 ban length, S7 id reuse, S8 anchor drop; N1–N9 | all fixed (N8, N9 recorded) |
 | 3 | risk (verification) | APPROVE WITH CONDITIONS: F1 the ACK did not send a parked cancel; F2 a failed anchor store was silent; five nits | all fixed, F1 and F2 each with a test that fails without it |
+
+## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
+
+Slot 6 is `xmm` (`crates/strategy-xmm`, plan
+`docs/research/xmm/xmm-hl-maker-plan-2026-09-26.md`, rulings
+O-XH1…O-XH15). `strategy-icdp` is UNLINKED from the set (its crate and
+`backtest --member icdp` stay); `icdp` / `ai+icdp` refuse the boot.
+
+**XH1 widens nothing and arms nothing.**
+
+* **The member places nothing.** Configured from `~/multivenue/xmm.toml`
+  (a requested bit with no artifact refuses the boot — the F19 law), it
+  implements no order path: every callback is a no-op and its timer is
+  off. No `strategy.conf` names it.
+* **A live slot 6 refuses the boot** (`cli::exec_boot::XMM_SLOT`), even
+  correctly named and agreed by `--arm-live`, until XH4 gives xmm its own
+  Hyperliquid master account and gateway (O-XH3, O-XH7). Armed on today's
+  arm it would share slot 3's account, where a slot-6 halt's venue-wide
+  cancel would pull bin15's quotes. Lifting this refusal is XH4's own
+  entry here (the "no phase may arm without its own entry" rule above).
+* **`Order.flags` bit 0 = `ORDER_FLAG_REDUCE_ONLY`** (byte 14, former
+  padding — every older `Order` reads 0). **Nothing honours it before
+  XH4:** not `risk_check`, not `mode = "off"`, not the budget floor, not
+  the Hyperliquid order (sent reduce-only = false), and it is not part of
+  `OrderIdentity`. No member may rely on it for an exit until XH4's entry
+  here says otherwise.
+* **The member's caps (`xmm.toml`, the XH5 probe values, O-XH5):** clip
+  $15, per perp $150, gross $400, resting $300. Parse-time ceilings bound
+  them at the largest configuration the plan names — clip $10 000, per
+  perp $5 000 000, gross $20 000 000, resting $1 000 000; the clip's
+  ceiling also refuses a probe clip written at ×1e9. Raising a ceiling is
+  a scale step (XH7): a code change with its entry here. The caps' boot
+  cross-check against `exec.toml` slot 6 (E6: a mismatch refuses) lands
+  with the slot's arm (XH4).
+* **Two new engine lanes, no new submission path.** Trade prints
+  (`on_trade`) and order events (`on_order_event`) reach members with
+  the same `EngineCtx` as ticks, so anything a member submits from them
+  passes the same router and `risk_check`. Order events route to the
+  placing slot ALONE (the X1 fill law); an unattributed or disabled slot
+  is counted, never fanned out. They drain AFTER every fill source, so a
+  fill waiting in the same iteration is booked (E6) before a member can
+  act on an order event. No producer exists before XH2 (paper) / XH4
+  (live).
+* **Per-slot timers.** Each member's `on_timer` runs on its own period.
+  Every existing member has a 1 s period or an empty `on_timer`, so each
+  fires exactly as before (bin15's LAW E-8 sweep and day roll, hyparb's
+  timer pass). **Re-review at XH3**: once xmm has a period under 1 s, the
+  1 s members run every 1 s to 1 s + p.
+* **Regime:** slot 6 takes no label yet; with `[labels] require = 1` an
+  enabled xmm refuses the boot (fail-closed). `[labels.icdp]` refuses at
+  the grammar.
+
+### XH2 amendment (2026-09-26): the policy and the queue law — PAPER only
+
+* **The member now quotes** (`maker_enabled = 1`): post-only orders at the
+  Hyperliquid touch, sized `clip ÷ px` down to the venue lot (never under
+  $10); a requote is a modify (E-7); the LEAD rule and the 500 ms gate
+  pull or hold the side about to be picked off. Every order carries the
+  TTL `lifetime_ms` (E-8, ≤ 30 s). **Still no `strategy.conf` names it,
+  and a live slot 6 still refuses the boot** — XH2 arms nothing; XH3
+  enables it on paper.
+* **Hard caps in the member** (rule 6), on PROJECTED exposure — the E6
+  rule "the clamp projects": every order the member has out (sent,
+  resting, cancelling, and a modify's predecessor, counted at the
+  replacement's size) is counted as if it filled. A side whose
+  worst-case exposure would pass `inv_cap_usd_1e6`, the gross past
+  `gross_inv_cap_usd_1e6` or the resting notional past
+  `resting_cap_usd_1e6` is not quoted; an order that does not raise its
+  perp's worst case always is. A requote's replacement is checked with
+  its predecessor still counted (both can fill in the race).
+* **Safety pulls (XH-2), the member's half:** a leader silent for
+  `lead_stale_ms` or a follower for `follower_stale_ms`, or either one's
+  last update flagged stale by its ingress, cancels both sides and places
+  nothing — on the next update, and on a 100 ms timer when the feeds
+  themselves are silent. A stale-flagged leader tick refreshes nothing
+  (no reference price, no LEAD trigger, no gate history). The halt,
+  ACK-RTT and congestion pulls are the XH4 arm's.
+* **The gate fails closed on lost history:** a burst of leader updates
+  that overwrites the gate's ring (8 192 samples per perp, ≈ 16 k
+  updates/s over the 500 ms window) closes the gate for that decision
+  and is counted (`gate_overflow`, must stay 0); history never received
+  (the first half-second) leaves it open, as the simulator does.
+* **LAW E-8, the member's half:** the member cancels its own order at
+  its TTL (`expiry_cancels`), whoever else expires it; the paper model
+  expires it at the same instant. **XH4 precondition:** Hyperliquid has
+  no per-order TTL — its limit TIFs are `Alo`, `Ioc` and `Gtc` (no GTD);
+  `expiresAfter` only rejects an ACTION processed after that instant and
+  never ends a resting order; `scheduleCancel` is an account-wide
+  cancel-all dead-man's switch (≥ 5 s ahead, ≤ 10 triggers per UTC day).
+  On this venue the TTL is therefore an engine-sent cancel: the XH4
+  gateway sends it itself at each order's expiry, whatever the member
+  does, and `scheduleCancel` is at most a coarse account-level backstop,
+  never the TTL.
+* **A lost order event cannot wedge a side:** a side waiting on its
+  order's final event for 10 s (or resting 10 s past its TTL) is released,
+  a best-effort cancel goes out for what it held (the order and a
+  modify's predecessor), and it is counted (`stuck`, must stay 0). In
+  paper a long Hyperliquid outage can trip it without an event being
+  lost — read `stuck` next to the feed's health.
+* **Departures from E5 for queue orders** (the paper matcher and the
+  harness, post-only makers on Hyperliquid only):
+  * `Ok` from a cancel means the cancel was SENT: it lands at the first
+    record at or after `CancelReq.ts_ns + Δ_hl`, ahead of that block's
+    prints — the order can still fill until then, and its `CANCELED` (or
+    `FILLED`) event is the answer. So `CancelReq.ts_ns` sets when a
+    queue cancel lands; stamp it from `ctx.now_ns()`.
+  * A modify of an order no longer held is `NoSuchOrder` and places
+    nothing (fail-closed; whether the venue ever places the replacement
+    is not measured). A replacement whose predecessor filled or was
+    cancelled while the modify flew is REJECTED on landing
+    (`stale_modify`) — one quote decision cannot fill twice. A modify
+    against a full table is `QueueFull`, the old order untouched ("a
+    refused modify changes NOTHING"). The replacement inherits the old
+    order's expiry (E-7).
+  * A refused replacement hands the side back to its predecessor, which
+    the member then cancels; the side is free only on the predecessor's
+    final event. A modify the arm refuses is followed by a cancel, never
+    retried on every update.
+* **The paper model is the queue law** for post-only makers on
+  Hyperliquid (`core_fill::queue`): an order that would cross on arrival
+  is REJECTED (`BAD_ALO_PX` — information, not a fault, XH-7); a resting
+  one fills only from prints, after the displayed size ahead of it. Every
+  other member's order keeps the strict-cross law, unchanged.
+* **Per-slot timers, re-reviewed:** with xmm enabled the set's timer runs
+  every 100 ms; each member's own `timer_due` gate still fires it on its
+  own period (a 1 s member now fires every 1.0–1.1 s).
+
+**Open before XH3 enables xmm** (both closed by the XH3 amendment below):
+* `audit-pnl` does not replay trade prints, so a slot-6 queue order can
+  never fill there — its shadow P&L would read flat until it does.
+* The member's counters reach `/metrics` — at least `stuck`,
+  `gate_overflow`, `unmatched` and `ctx_refused`, each of which must
+  stay 0; until then they print only in the harness lines.
+
+**Open for XH4:** a position with no follower mark yet counts $0 in the
+projected gross (`exposure()` prices at the follower mid, 0 until the
+first fresh Hyperliquid book). Unreachable in paper — every fill needs a
+quote and every quote a touch — but reachable once XH4 seeds positions
+from the venue at boot: XH4 refuses every growing order while any perp
+holds a position without a mark.
+
+Gates (XH2, 2026-09-26): alloc 79/79 at 0 B/op (+1 ignored helper),
+incl. gates 74 (queue law), 75/75b/75c (the member, its fail-safe
+branches included), 76 (the paper dispatcher's queue path) and the
+engine gate driving the paper order-event pump.
+
+### XH3 amendment (2026-09-26): the member on the live paper engine
+
+* **Observability (the XH2 open items, closed).** `/metrics` carries the
+  member's 17 counters (`engine_xmm_*_total` — `stuck`, `gate_overflow`,
+  `unmatched` and `ctx_refused` must stay 0; the pulls by reason are
+  `lead_cancels`, `requote_cancels`, `pull_cancels`, `expiry_cancels`;
+  a modify or cancel of an order the venue already ended is a race, not
+  a refusal, and is not counted in `ctx_refused`),
+  `engine_xmm_perps` and the first four perps' positions. `/state`
+  (schema 2) carries them plus one row per perp: the touch, our two
+  quotes and their states, the position, each feed's age. `audit-pnl`
+  replays the queue venue's prints — only for a run with a post-only
+  maker in it, and only inside its ticks, so every other run reports
+  exactly as before — and slot 6's shadow P&L is the queue law's, not
+  flat. Caveats: a regime-bucketed audit replay can hold a queue order
+  whose cancel landed in another bucket (its own TTL, ≤ 30 s, ends it
+  there); an audit engine is born at its first intent, so that first
+  queue order meets no known book (conservative: an unknown queue).
+* **Regime: carried, never consulted.** `[labels.xmm]` is accepted so
+  `[labels] require = 1` can boot the member enabled; the label never
+  gates it (the HORIZON law, bin15's precedent — a quote that lives
+  seconds and is scored on a 5 s markout is not a cell of a 4–8 h
+  lane). Its off switches are the XH-2 pulls, the caps and (XH4) the
+  arm's halts.
+* **Enabling is paper only** (`STRATEGY=…+xmm` in `strategy.conf` and
+  `~/multivenue/xmm.toml` — the probe: $15 clip, ±$150 per perp, $400
+  gross, $300 resting, θ 0.5 bp). A live slot 6 still refuses the boot
+  (XH4). The set's timer runs every 100 ms with xmm enabled; each
+  member's own period still gates it (1 s members fire every 1.0–1.1 s).
+  **The runbook, in this order:**
+  1. The build: merge, then the release build the wrapper execs
+     (`cargo build --release -p cli`; check the binary's mtime). An
+     older binary or wrapper refuses `+xmm`.
+  2. Pre-flight — every descriptor must resolve, or `xmm_boot` refuses
+     the WHOLE boot (and an unattended daily restart would then take
+     every member down in a KeepAlive loop): `hyperliquid:{BTC,ETH,SOL,
+     XRP}` and `binance-usdm:{btc,eth,sol,xrp}usdt` in `universe.toml`;
+     `backtest --member xmm --xmm ~/multivenue/xmm.toml` on the current
+     run's ≤ 2 h window resolves them with the boot's own code.
+  3. Place `xmm.toml`, then edit `strategy.conf` LAST, outside the quiet
+     windows; restart supervised rather than waiting for 00:10/08:30/
+     16:05Z.
+  4. Restart `com.multivenue.dashboard` with the engine: it reads its page
+     once at start, and the page before XH3 stops rendering its later
+     panels on `/state` v2 (the page since XH3 reads v1 and v2).
+     After the boot: the tell `xmm: artifact configured … phase=XH3(paper)`;
+     `/state` `xmm.configured = 1`, `boot.xmm_coins = BTC,ETH,SOL,XRP`;
+     `engine_xmm_perps 4`; `engine_xmm_placed_total` and
+     `engine_paper_matcher_queue_rested_total` rising; `stuck`,
+     `gate_overflow`, `unmatched`, `ctx_refused` at 0; every other
+     member back (`vm_rows_active ≥ 1`, as after any restart).
+  5. Rollback: `STRATEGY` back to the previous name, restart.
+  6. Arming later (`EXEC_TOML`/`ARM_LIVE`): `exec.toml` must leave slot 6
+     absent or `paper` — `off` refuses every xmm order, `live` refuses
+     the boot. Under `[labels] require = 1` both `[labels.xmm]` and
+     `[labels.bin15]` are then needed.
+* **The XH3 bar (plan §9)** — measured on the live paper engine, never
+  on hours: ≥ 2,000 paper fills over ≥ 6 windows; `stuck`,
+  `gate_overflow`, `unmatched` and `ctx_refused` all 0; requote rate
+  ≤ 1.25 × the XH0(c) model; pulls reported by reason; the paper 5 s
+  markout inside the XMM CUR back-of-queue CI per perp; clean through
+  the 00:10, 08:30 and 16:05Z restarts. In paper a `stuck` needs ≥ 10 s
+  with no Hyperliquid record at all — of ANY symbol, since a block is the
+  venue's (below): each one is read against the ingress health, and one
+  no outage explains fails the bar. XH4's testnet battery does not wait
+  on the bar (operator, 2026-09-26: "through XH4 on testnet"); XH5's
+  mainnet probe does.
+* **The queue law's block is the venue's (XH3).** Hyperliquid processes a
+  cancel in the next block whether or not that perp's book changes, so
+  off the parity switch any record of the venue (any symbol, tracked or
+  not) lands what is due on every tracked perp of that venue, against
+  its last known book: a quiet book never holds a pull or a TTL cancel
+  back (before, a perp quiet for 12 s — the 2 s follower pull, then the
+  10 s watchdog — read as `stuck` with no outage anywhere). The paper
+  matcher, `backtest --member xmm` and `audit-pnl` follow; the parity
+  verb keeps the simulator's per-symbol clock, so the XH2 parity result
+  stands.
+
+The laws XH-1…XH-7 (plan §10) are proposed for this file when their
+phase lands (XH3 paper member, XH4 execution).
+
+## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
+
+`crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
+options (`HcExchange`). It is **not armed by the engine**:
+`exec_boot` refuses any live slot naming `hypercall`, and its refusal
+names what slot 7's live-arming ruling must settle first:
+
+1. **An options row in the E6 ledger.** Its exposure clamp values HIP-4
+   binaries (Σ|yes−no|, $1 a contract). An option SELL is an unbound leg
+   that adds nothing, so a short option would pass `cap_instance` unseen.
+2. **An HL account whose perps are reconciled, for slot 7's hedges.**
+   The operator arm reconciles `spotClearinghouseState`, not perps.
+   HYPARB's answer was its own wallet plus a `clearinghouseState` recon
+   (O-HL3).
+3. **The two-venue composition.** `VenueSplit`, the venue-keyed twin of
+   `SlotSplit`, exists since the Binance lane's BX3 (Hyperliquid +
+   Binance; merged 2026-09-26); a Hypercall boot branch over it lands
+   with that ruling.
+
+What drives the arm today is the operator's `hypercall-live` verbs
+(`scripts/hypercall-live.sh`, zsh). There is no testnet, so every live
+proof is a mainnet micro-step:
+
+| verb | effect |
+|---|---|
+| `status` | read-only |
+| `simulate` | `POST /risk/simulate/orders`, never mutates |
+| `recon` | read-only |
+| `dust --symbol S [--price P --size Q] --confirm` | places one `book_only` GTC bid, 0.000001 @ $0.0005 by default; cancels it by client id; reconciles. PASS needs all of: the place accepted; the cancel answered CANCELED with nothing filled; no fill on the socket; and a reconcile afterwards that agrees on every leg, finds nothing of ours open, and leaves the symbol's position unchanged. It refuses to send while orders of ours are already open. When a place's fate is unknown (a 5xx, a 429, an unreadable answer, or no answer) it takes the order back by client id and reconciles. |
+| `cancel-all --confirm` | cancels every order of ours that the venue lists |
+
+- **Writes need `--confirm`**, else exit 2. This is the HYPARB L1 precedent: a session builds the verbs and runs only the reads, and **an order on mainnet is the operator's to send**.
+- **Keys:** the verbs read `HYPERCALL_WALLET` (the owner, an address only) and `HYPERCALL_AGENT_KEY` (the signer, `SecretKeyBytes`, mlock'd) from the environment. The script sources the repo `.env`, or `HYPERCALL_ENV_FILE`. The binary never opens it.
+- **Signer:** `owner_signs` says whether the owner's own key or an approved agent signs.
+
+The arm's laws, which bind the verbs now and the engine later:
+
+* **E-1.** A failure is a refusal, counted, and never a modelled fill.
+* **E-3 / D7.** Every write body (`POST /order`, `PUT /order`, `DELETE /order_cloid`) is rendered IN PLACE into the `HttpsReq` body window. The EIP-712 struct hash is taken over that body's own spans (HC8). Price and size are rendered once, as 6 dp with trailing zeros trimmed.
+* **Fail closed.** An acceptance requires all of:
+  * HTTP 200;
+  * a body that is one well-formed object;
+  * a UNIQUE top-level `status` in {ACKED, OPEN, PARTIALLY_FILLED, FILLED};
+  * a top-level integer `order_id`.
+
+  A `REJECTED` at 200 is a refusal and keeps its reason. `CANCELED` with nothing filled is an IoC miss: not a reject streak, the E7-F2 lesson. A 401/403 is `SignerRejected`. The fuzz target is `hypercall_response`.
+* **IoC only.** The engine's maker (kind 0) is POST-ONLY and the venue has no post-only time in force (`gtc | ioc | fok`), so `submit` refuses it — a `gtc` would cross, and paper and live would disagree. The verbs' resting order is `place_resting` (`gtc` + `book_only`, priced where nothing can cross).
+* **A refused cancel is not a gone order.** Only an explicit "not found" releases the row; any other refusal (a used nonce, a 4xx, a 5xx, an unreadable answer) keeps the order WORKING, and `cancel_all_state` reads Working until the venue confirms. A `success:true` whose order is still working is not a cancel.
+* **E-5.** The HTTP answer is the ACK. The private socket's `Fill` is the FILL. The socket is separate from the data lane (D1), unsigned `Authenticate` of the OWNER wallet, then `fills` + `order_updates`, both confirmed (`Subscribed`) before the socket counts as up; an `Error` on it forces a reconnect. Liveness is a pump that read without error (the venue pings every 20 s). Fills are deduped by `fill_id`, attributed to the slot and to the member's `client_oid` through the ACK table, and handed out by `try_next_fill` from the arm's own queue (the HyparbLive precedent, so no engine fill lane).
+* **E-9.** `client_id` is 32 hex characters: `HC`, version, slot, `client_oid`, and an FNV check. An id not of that shape is not ours, and the sweep leaves it alone.
+* **Reconcile.** `GET /portfolio`, `/orders?status=open` and `/fills` run once a minute on the idle path. The first adopts the venue's positions; each later one compares them and reports drift and unseen legs in `HaltSignal`. Every read refuses an unreadable body; none reads an empty book.
+* **The rate governor.** It enforces the Default tier as a SLIDING 60 s window on the monotonic clock, assuming one venue replica:
+  * places stop at 90 % of 60 orders and 600 requests;
+  * cancels are exits and pass up to 120 cancels and 600 requests, even during a 429 back-off (5 s; `Retry-After` is not read — `HttpsReq` returns no headers).
+* **Nonces.** The wall clock in ms — `max(now_ms, last + 1)` — below 2^53 (the SDK's JS `Number`), never on a zero clock. MEASURED: the venue bounds the nonce by its own command clock in ms; the first dust smoke, signed with `ms × 1000`, was refused "nonce … is outside time bounds for signer … (command_ts=<ms>)" with its signature accepted (fix `84fc32b`).
+
+- **Gates:** unit and TLS-loopback tests, fuzz `hypercall_response` and `hypercall_userws`, alloc gate 84 (render + sign + scans at 0 B/op), and `make copy-audit` over the crate.
+- **Deferred:** MMP, because SDK 0.1.0 has no `SetMmpConfig` field order. RFQ, because S1 routes `best_execution`.
+- **Mainnet proof, 2026-09-26 (operator, after the nonce fix):** `dust --symbol BTC-20260927-83000-P --confirm` PASS — an agent (`0x97f4…19ee`) signing for the owner wallet (`0x4479…5644`, $5 USDC), the `book_only` bid accepted (order 31965), cancelled by client id (`CANCELED`, nothing filled), 3 order updates on the private socket, the reconcile agreed before and after, 0 fills, 0 orphans. The owner and the signer are separate: the arm authenticates the socket and reads the portfolio as the OWNER, and signs as the agent the owner approved in the venue's app.
+
+## HYPERCALL — slot 7, the S1 member (HC11, rulings O-HC18..O-HC23, 2026-09-26): DARK, paper only
+
+`crates/strategy-hcv` (`HcvStrategy`) is slot 7 of the set. Its names are
+`hcv`, `ai+hcv` and `ai+vrp+xsd+bin15+hyparb+xmm+hcv`; `all` (`BUILT_MASK`
+= 255) composes it too, inert without its artifact.
+
+**DARK (O-HC18).** Paper only and in no configured mask: `strategy.conf` is
+untouched. `exec_boot` refuses a live slot 7 whatever venues it names, and
+the engine never arms the Hypercall order arm. Arming it is its own ruling,
+which must settle: an options row in the E6 ledger; a reconciled HL perp
+account for its hedges; a Hypercall boot branch over `VenueSplit` (the
+type is BX3's); hedge-fill attribution by client id
+(paper matches the member's `client_oid`); and the R1 gate — the harness
+mirror (`backtest --member hcv`) is its prerequisite and is not built.
+
+**Boot.** Only with `~/multivenue/hcv.toml` (or `--hcv`); requested but
+absent refuses (the F19 law). Every traded underlying's hedge must resolve
+in the boot universe — `hyperliquid:xyz:<U>` for the eight equities, BTC and
+ETH native (O-HC20: `[hyperliquid] coins` gains the eight at go-live) — with
+the `szDecimals` the venue stated at this boot's discovery, or the boot
+refuses. The options are the boot's own Hypercall chain; an untraded
+underlying's (BABA, BOT) are counted in the tell. The wall anchor is taken
+right before the loop.
+
+**The decision (O-HC23, every knob in `hcv.toml`).** Per option whose quote
+or underlying moved, inside the policy — |ln K/S| ≤ 5 %, tenor 1–40 d, a
+live uncrossed provider quote, a fresh oracle and a live HL touch, a
+forecast, and the **event law**: an event of the underlying in (t, T] — or a
+calendar that is missing, older than 2 h, or does not vouch for (t, T] — is
+no trade:
+
+- `g_sell = σ_bid − σ̂(τ)`, `g_buy = σ̂(τ) − σ_ask` (Black–Scholes, r = 0,
+  the implied vol by bracketed Newton);
+- at `g ≥ θ` (5 vol points) ONE IoC at the quote — a sale at the bid, a
+  purchase at the ask — and **one IoC in flight per underlying** until its
+  verdict (its fill, the paper law's expiry event, or 5 s): every cap below
+  reads the book that verdict moves, and its new risk counts in the gross
+  premium meanwhile.
+
+**σ̂ (O-HC22).** The HAR set's rows, handed to slot 7 by the set whenever a
+row moves (law L4 lifted for slot 7 alone): the fit where fitted, the raw
+fold otherwise; a cold series forecasts nothing. Interpolated in total
+variance across the 1–40 d tenors, flat beyond them.
+
+**Sizing and the caps.** The displayed size and the clip ($5 of premium);
+then the gross-premium cap ($50 — the premium at stake is each position's
+ENTRY BASIS, plus the in-flight IoC's new risk at its limit), the
+per-underlying |net vega| cap ($20 a vol point) and the one-day 10σ stress:
+the size halves until the stress loss fits the tail cap ($20) or the trade
+lowers it. A **reduce** passes the premium cap (a reduce lowers the basis at
+stake) and never flips through zero, but NOT the vega and stress laws: net
+vega is not the position — selling one leg of a vega-neutral pair raises
+it — so a reduce may leave |net vega| and the stress no worse than the cap
+or than now, and is halved until it does.
+
+**Stops.** The day's marked P&L at or below −$20 stops new risk; `kill = 1`
+stops it at boot; per underlying, a stale or crossed provider quote, a stale
+oracle or a stale touch stops it (the dead-man); a mark not yet known (below)
+and a book whose file has fallen behind (below) stop it too. **Hedging continues under
+every stop, and so do reduces** (a buy-back of a short is closing risk).
+
+**The calendar fails closed.** A row naming an underlying outside `[hypercall]
+underlyings` (a misspelt "SPX" for "SP500") refuses the whole calendar — the
+last good one stays until it is older than 2 h, and then nothing trades.
+
+**Liveness, not age.** A tick is a BBO CHANGE (both ingresses' tick law): a
+quote the venue keeps re-pushing unchanged emits nothing. So a provider
+quote stands while the Hypercall FEED is alive (any instrument's tick within
+`quote_stale_ms`), and a hedge touch while the HL feed is (`oracle_stale_ms`);
+a quote or touch the ingress marked STALE is none; the oracle is judged by
+its own prints' age. Known gap, for R1 to measure: the Hypercall ingress
+emits nothing for a push with neither side, so a quote withdrawn on both
+sides at once stands in the member — and in the held-quote law — until its
+next change.
+
+**The hedge.** Never before a fill (the VRP F7 lesson). Per underlying the
+net delta — options at their mid IV (else σ̂), plus the perp — is kept
+inside **±0.10 per contract held**: O-HC23's "±0.10 delta" read per contract,
+so the band means the same on a $100 and a $100 000 underlying (read in raw
+underlying units it would never hedge BTC or ETH at these sizes — the
+reading awaits the operator's word). An IoC crosses the touch by 10 bps,
+rounded by the HL price law and the lot, never below $10 notional; its ttl
+is the member's own release (5 s), so the paper law expires a released hedge
+before its successor can fill beside it. A held option that cannot be
+priced (no live two-sided quote, no σ̂) leaves the delta unknown: the hedge
+is held, not traded on part of it. Over the final 30 minutes the options'
+delta decays in one-minute slices and every slice re-hedges, so the hedge's
+average exit tracks the settlement's average; a slice under $10 carries into
+the next; at T the option leaves the delta and the band, and the last
+slice's residual closes there.
+
+**Settlement (paper, in the member).** A `core_settle::SettleWindow` per
+held expiry, sampled on the 1 s sample-and-hold grid from T − 30 min − 5 s
+to T; at T + 60 s each position is booked at intrinsic on the median of
+means (`settle_order`, the HC7 gate's pick). A window under 90 % coverage —
+or none — counts in `settle_fallbacks` (no window: the last oracle).
+
+**Paper fills (O-HC21) — `core_fill::held`.** A Hypercall IoC is judged at
+submit + 2 s against the provider quote in force then (sample-and-hold: the
+due record's own quote is applied after), up to its displayed size. A stale
+quote is no quote; a miss is an order event (`CANCELED`, `EXPIRED`) back to
+the slot; a Hypercall maker is unmodellable. Only slot 7 emits Hypercall
+orders.
+
+**Money.** Premiums are USD per 1-unit contract; τ counts 365.25-day years
+(the HAR set's annualiser). The marked P&L is cash + options at their mid
+IV (else σ̂) + perps at the oracle — an expired position not yet booked at
+its intrinsic on the fixed settlement (else the oracle), never at a stale
+premium — since the book began (it persists, below); the day's is that less
+its value at the first timer of the UTC day that had a known mark. The mark
+is UNKNOWN while an underlying the book holds (an option or its hedge) has
+no oracle yet — after a boot, until its first Hyperliquid Mark: the day does
+not roll, the P&L gauges keep their last value, and new risk stops (the
+HC11b review found a restored hedge marked at a zero price lifting a
+tripped stop).
+
+**The book persists (HC11b, `strategy_hcv::state`).** The engine restarts at
+00:10, 08:33 and 16:05Z and a position lives for days, so the book outlives
+the process in `hcv-state.tsv` (`--hcv-state`; else beside an explicit
+`--hcv`, else `~/multivenue/hcv-state.tsv` — the F22 law: a smoke boot never
+reads or rewrites the standing engine's book):
+
+- **What is kept:** every held option **by contract** — underlying,
+  expiry, strike, right; never by symbol, since the chain's ordinals are
+  re-allocated every boot — with its entry basis and last traded price; each
+  underlying's hedge position; the cash; the UTC day and its opening mark
+  (the day's stop carries across a restart); every live settlement window —
+  its 1 s grid run-length encoded, or its price once fixed.
+- **What is not:** IoCs in flight (the X1 law — the paper matcher's table
+  dies with the process; armed live, a fill that lands across a restart is
+  the reconcile's to carry — the live-arming ruling's), quotes, touches, the
+  oracle, σ̂, the calendar and the counters.
+- **Written off the engine thread (the H3.7 law).** A fill, a booking, a
+  window opened, fixed or freed, a window's sample in a new minute and the
+  UTC day move the member's state epoch; at its timer, while it moved, the
+  member copies the book into a `core_ring::Mailbox` and the
+  `hcv-state-writer` thread (`cli::persist`, shared with the HAR series)
+  renders and fsyncs it. A slot the writer still holds (a write in flight or
+  failing — retried every 5 s, one warning a minute) is offered again at the
+  next timer: the file never goes backwards. At shutdown the writer is joined
+  and the live book is written once more, unconditionally. **A book that
+  cannot persist must not grow:** the boot writes the book once itself and
+  refuses if it cannot, a writer that does not spawn refuses the boot, and a
+  moved book the writer has not taken for 30 s stops new risk
+  (`book_stale` = 1) until it takes one again — hedging and reduces go on.
+- **Restored at boot, fail closed.** After `configure`, before the first
+  event. A row the member cannot place — an underlying `hcv.toml` does not
+  trade, a malformed or extra field, an implausible value (any ×1e6
+  magnitude past 1e15, an expiry past 2100), an unknown tag, a duplicate, a
+  window's grid short of its points, more than eight windows — refuses the
+  boot (the VRP / XSD law), and the member is left unchanged. One exception:
+  a hedge residual under the venue's minimum (`hedge_min_usd`, judged at the
+  oracle the row was written with — the last one known, carried from the
+  restored book until the process's first Mark, so a restart never erases
+  it) on an underlying `hcv.toml` no longer trades — one the member could
+  never close — is dropped and counted in the tell. A file that exists but cannot be read (a directory it may not
+  search, bytes that are not UTF-8) refuses too: only a MISSING file is a
+  first boot.
+- **Orphans.** A held contract this boot's chain no longer lists (the capped
+  chain is ±4 strikes around the index, so a move can drop a held strike) is
+  carried by its terms — hedged and marked at σ̂ (no quote reaches it) or,
+  without σ̂, at the implied vol of its expiry's nearest quoted strike (the
+  same fallback serves any held option with neither), sampled and settled at
+  expiry — and never traded, until a later boot's chain lists it again. At
+  most 64; more refuses the boot.
+- **A restart inside the final window** keeps the grid it had and holds
+  NOTHING across the outage (sample-and-hold holds what was seen, never across
+  a gap): the dark instants are missing, not filled, so a long outage shows
+  as a thin window (`settle_fallbacks`). A position that expired while the
+  engine was down is booked at the first timer — on its window if one was
+  kept, else on the first oracle, counted.
+
+**Observability.** `/state` `hcv` (configured, the artifact hash, 18
+counters, 7 gauges — `restored`: positions the boot read back; `orphans`:
+positions carried outside the chain; `book_stale`: 1 while the file is
+behind the book; `marks_unknown`: held underlyings still waiting for their
+first oracle this process — while it is non-zero the mark is unknown and new
+risk stops) and `slots[7]` named `hcv`; `engine_hcv_*` (18 counters, 7
+gauges); the boot tells `hcv: artifact configured … state=<path>` and `hcv:
+book restored positions= orphans= expired= hedges= hedges_dropped= windows=
+cash_usd_1e6=` (a warning each for orphans, for positions that expired while
+down and for dropped residuals). The calendar is read by the `hcv-events`
+thread on each change of `scheduled-events.json` and handed over a
+`core_ring::Mailbox`; the book leaves by another — the engine thread never
+opens either file.
+
+**Known gaps — each blocks switching slot 7 on (or is R1's to measure):**
+
+1. The final-window delta is the European delta scaled by the fraction of
+   the average still to come, not an average-price (Asian) delta on the
+   running mean's effective strike: R1 measures how well the TWAP tracks.
+2. No cost term: HL taker fees and funding are not booked, and Hypercall's
+   fee is `0:0` UNVERIFIED (O-HC7) — R1 carries both.
+3. A hedge residual under $10 cannot be closed (the venue minimum), and a
+   stale oracle held in a settlement window counts as coverage.
+4. An orphan is marked and hedged at σ̂ (else its expiry's nearest quote),
+   not at a market it can no longer see, and cannot be reduced; a position
+   that expired while the engine was down is booked on the first oracle
+   rather than the venue's posted price.
+
+- **Gates:** `strategy-hcv`'s 50 tests (the laws above, the independent
+  review's eight regressions, HC11b's eight — the round trip by contract
+  under a renumbered chain, the orphan hedged and settled but never traded,
+  a position expired while down, a restart inside the final window, a fixed
+  window, the epoch law, the mailbox hand-off and its retry, the refusals —
+  and its review's five: the unknown mark, the orphan's neighbour vol, the
+  dropped residual, the stale book, the kept mark),
+  `core-settle`'s window restore, the set's slot-7 tests, `cli`'s path law
+  and the writer-to-restore round trip, alloc gate 85 (the member over the
+  held-quote law, 2 400 engine steps with fills, hedges, a TWAP, a
+  settlement and every book hand-off, 0 B/op), `make copy-audit` over the
+  crate, `core-settle` and the writer thread.
+- **Review (2026-09-26, independent, Opus 5.5):** it found the caps blind to
+  the IoC in flight, reduces bypassing the vega and stress laws, stale-premium
+  marking of expired positions, a venue-blind option index, a residual hedge
+  after T, the day stop blocking buy-backs, paper hedge IoCs that never
+  expired, hedging on a partial delta, and a calendar that failed open on a
+  misspelt name — all fixed above; the per-session book it named is closed
+  by HC11b (the book persists, above).
+- **Review of HC11b (2026-09-26, independent, Opus 5.5, 19 min, each defect
+  reproduced by a probe):** MAJOR — right after a restore the day's opening
+  mark and its stop were judged with a hedge at a zero oracle (a tripped
+  stop lifted, and a sale went out). MINOR — an orphan without σ̂ froze its
+  underlying's hedge; a dust hedge on an underlying no longer traded refused
+  the boot; no plausibility bounds (`i64::MIN` sizes overflowed `abs`); a
+  book the writer could not write kept trading; a stat error read as a
+  first boot; two doc overclaims. All fixed above, each with a regression.
+  Its re-verification confirmed all six and found one regression — the
+  boot's own write erased every hedge's mark before the first oracle —
+  fixed: the last known mark is carried until the feed brings one.

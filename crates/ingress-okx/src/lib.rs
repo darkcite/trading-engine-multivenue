@@ -36,8 +36,9 @@
 //! All parsing is in-place over `&[u8]` in the rx buffer. The one
 //! unavoidable copy per event is the 64-byte parsed POD copied into
 //! its SPSC ring slot by `try_push_ref` (the ring publish) — same as
-//! every ingress. Subscribe/ping frames are serialized into the tx buffer
-//! through fixed scratch arrays; no heap after construction.
+//! every ingress. The batch subscribe renders straight into the tx
+//! buffer, header first; the resync requests and pings are masked into
+//! it from parts; no heap after construction.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -57,7 +58,7 @@ pub use run_loop::{
     TX_BUF_SIZE,
 };
 
-use core_net::SubId;
+use core_net::{SubId, WsPayload, WsWriteErr};
 use core_parse::{
     find_field, scan_i64, scan_number_sci_1e9, scan_price_1e6, scan_price_1e9, scan_u64, skip_byte,
 };
@@ -1153,54 +1154,39 @@ pub struct SubArg<'a> {
     pub inst_id: &'a [u8],
 }
 
+/// Render one batched `{"op":"subscribe","args":[...]}` request through
+/// `p` — straight into its frame, header first
+/// (`core_net::queue_masked_text_frame_rendered`). OKX budgets 480
+/// sub/unsub **operations per hour** — batch all args into one op (§4.1).
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
 #[inline]
-fn push_bytes(dst: &mut [u8], at: usize, src: &[u8]) -> Option<usize> {
-    let end = at.checked_add(src.len())?;
-    // COPY: the batched subscribe text into the caller's render scratch
-    // (≤ 12 KiB), once per connection session — the WS frame header needs the
-    // payload length before the payload is masked into tx — rejected: rendering
-    // straight into tx (the 7/16-bit length field is unknown until the batch
-    // render ends) and wire parts (≈ 5 slices per arg, up to MAX_SUB_ARGS args).
-    dst.get_mut(at..end)?.copy_from_slice(src);
-    Some(end)
-}
-
-#[inline]
-fn write_op(dst: &mut [u8], op: &[u8], args: &[SubArg<'_>]) -> Option<usize> {
-    let mut n = 0;
-    n = push_bytes(dst, n, b"{\"op\":\"")?;
-    n = push_bytes(dst, n, op)?;
-    n = push_bytes(dst, n, b"\",\"args\":[")?;
+pub fn render_subscribe_batch(
+    p: &mut WsPayload<'_>,
+    args: &[SubArg<'_>],
+) -> Result<(), WsWriteErr> {
+    p.put(b"{\"op\":\"subscribe\",\"args\":[")?;
     let mut i = 0;
     while i < args.len() {
         if i > 0 {
-            n = push_bytes(dst, n, b",")?;
+            p.put(b",")?;
         }
-        n = push_bytes(dst, n, b"{\"channel\":\"")?;
-        n = push_bytes(dst, n, args[i].channel.wire_name())?;
+        p.put(b"{\"channel\":\"")?;
+        p.put(args[i].channel.wire_name())?;
         // M2.3: `opt-summary` is the one FAMILY-keyed channel — its
         // arg key is `instFamily` (the SubArg's inst_id bytes carry
         // the family string for it).
         if args[i].channel == OkxChannel::OptSummary {
-            n = push_bytes(dst, n, b"\",\"instFamily\":\"")?;
+            p.put(b"\",\"instFamily\":\"")?;
         } else {
-            n = push_bytes(dst, n, b"\",\"instId\":\"")?;
+            p.put(b"\",\"instId\":\"")?;
         }
-        n = push_bytes(dst, n, args[i].inst_id)?;
-        n = push_bytes(dst, n, b"\"}")?;
+        p.put(args[i].inst_id)?;
+        p.put(b"\"}")?;
         i += 1;
     }
-    n = push_bytes(dst, n, b"]}")?;
-    Some(n)
-}
-
-/// Serialize one batched `{"op":"subscribe","args":[...]}` request
-/// into `dst`. Returns the byte length, `None` if `dst` is too small.
-/// OKX budgets 480 sub/unsub **operations per hour** — batch all args
-/// into one op (§4.1).
-#[inline]
-pub fn write_subscribe_batch(dst: &mut [u8], args: &[SubArg<'_>]) -> Option<usize> {
-    write_op(dst, b"subscribe", args)
+    p.put(b"]}")
 }
 
 /// A books resync request's verb.
@@ -1303,6 +1289,14 @@ mod views {
 mod tests {
     use super::*;
     use super::views::*;
+
+    /// The batch rendered into a plain buffer — exactly what the frame's
+    /// payload span receives; `None` when it does not fit.
+    fn write_subscribe_batch(buf: &mut [u8], args: &[SubArg<'_>]) -> Option<usize> {
+        let mut p = WsPayload::writing(buf);
+        render_subscribe_batch(&mut p, args).ok()?;
+        Some(p.len())
+    }
 
     const BBO: &[u8] = br#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"asks":[["111.06","55154","0","2"]],"bids":[["111.05","57745","0","2"]],"ts":"1670324386802","seqId":363996337}]}"#;
     const TRADE_BUY: &[u8] = br#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"130639474","px":"42219.9","sz":"0.12060306","side":"buy","ts":"1630048897897","count":"3","seqId":123456}]}"#;
@@ -1557,8 +1551,8 @@ mod tests {
         let ack = br#"{"event":"subscribe","arg":{"channel":"opt-summary","instFamily":"BTC-USD"},"connId":"x"}"#;
         assert_eq!(extract_inst_family(ack), Some(&b"BTC-USD"[..]));
         assert_eq!(extract_inst_family(b"{}"), None);
-        // write_op renders instFamily for the opt-summary channel and
-        // instId for everything else, in one batch.
+        // The batch keys the opt-summary channel `instFamily` and
+        // everything else `instId`, in one op.
         let args = [
             SubArg {
                 channel: OkxChannel::OptSummary,

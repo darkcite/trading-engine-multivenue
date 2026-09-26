@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
-description  = "EIP-712 typed-data signer for Polymarket CLOB orders. secp256k1 + tiny-keccak directly — NOT ethers or alloy."
+description  = "EIP-712 typed-data signer: Polymarket CLOB orders, Hyperliquid agent actions, Hypercall actions. secp256k1 + tiny-keccak directly — NOT ethers or alloy."
 
 [lib]
 path = "src/lib.rs"

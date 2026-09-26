@@ -801,7 +801,7 @@ mod tests {
         assert_eq!(ingress_state_name(2), "UP");
         assert_eq!(hex_short(&[0; 16]), "-");
         assert_eq!(hex_short(&[0xfd, 0xe6, 0xf7, 0x33, 0xaa]), "fde6f733");
-        assert_eq!(text(b"ai+icdp"), "ai+icdp");
+        assert_eq!(text(b"ai+xmm"), "ai+xmm");
         assert_eq!(text(&[0xff]), "?");
         assert_eq!(yes_no(1), "yes");
     }
@@ -817,7 +817,7 @@ mod tests {
 
         let mut s = Box::new(EngineSnapshot::empty());
         s.mono_ns = 100_000_000_000;
-        s.boot.set_strategy_name(b"ai+icdp");
+        s.boot.set_strategy_name(b"ai+xmm");
         s.boot.set_git_sha(b"abc123");
         s.boot.set_run_dir(b"/tmp/run-1");
         s.set_strategy_kind(b"set");
@@ -846,7 +846,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render_frame(f, &s)).unwrap();
         let rendered = format!("{:?}", terminal.backend().buffer());
-        assert!(rendered.contains("ai+icdp"));
+        assert!(rendered.contains("ai+xmm"));
         assert!(rendered.contains("fdfdfdfd"));
         assert!(rendered.contains("recent orders (10 total)"));
     }

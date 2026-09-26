@@ -177,8 +177,10 @@ fn short_partial_day_is_gapped_and_monitor_skips() {
 
 /// MX2 (the pre-existing off-by-one, plan §3 MX9.6 / R6): the per-day
 /// `venue_ticks` array covers EVERY `VENUE_LABELS` slot in label
-/// order — pm, bn, okx, rpc, deribit, hl, bybit, mexc. It used to
-/// render six fixed placeholders and silently drop bybit's count.
+/// order — pm, bn, okx, rpc, deribit, hl, bybit, mexc, hyperevm,
+/// hypercall. It used to render six fixed placeholders and silently
+/// drop bybit's count. HC1: the tenth label (`hypercall`, venue byte
+/// 9) is counted in its own slot.
 #[test]
 fn per_day_venue_ticks_cover_every_label_incl_bybit_and_mexc() {
     let root = unique_root("allvenues");
@@ -211,12 +213,18 @@ fn per_day_venue_ticks_cover_every_label_incl_bybit_and_mexc() {
             mk_tick(1_000, VenueId::Mexc, (7 << 24) | 513, 3),
         ],
     );
+    write_ticks(
+        &run,
+        "hypercall",
+        epoch,
+        &[mk_tick(1_100, VenueId::Hypercall, (9 << 24) | 513, 1)],
+    );
 
     let out = catalog(&root);
-    assert_eq!(out.facts.ticks, 6);
+    assert_eq!(out.facts.ticks, 7);
     assert!(out.facts.whole_root_backtestable);
     assert!(
-        out.json.contains("\"venue_ticks\":[1,0,0,0,0,0,2,3,0]}"),
+        out.json.contains("\"venue_ticks\":[1,0,0,0,0,0,2,3,0,1]}"),
         "{}",
         out.json
     );
@@ -225,6 +233,7 @@ fn per_day_venue_ticks_cover_every_label_incl_bybit_and_mexc() {
     ));
     assert!(out.summary.contains(" bybit=2"), "{}", out.summary);
     assert!(out.summary.contains(" mexc=3"), "{}", out.summary);
+    assert!(out.summary.contains(" hypercall=1"), "{}", out.summary);
     let _ = std::fs::remove_dir_all(&root);
 }
 

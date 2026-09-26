@@ -2,8 +2,9 @@
 // Copyright 2026 Anton (darkcite)
 
 //! The `/state` snapshot POD (plan §6.1 sections: `boot`, `regime`,
-//! `slots`, `vm`, `icdp`, `ai`, `ingress`, `latency`, `recent`,
-//! `capture`). Every field is a plain integer, a fixed array or an
+//! `slots`, `vm`, `xmm` (was `icdp` until schema 2), `ai`, `ingress`,
+//! `latency`, `recent`, `capture`; later additive sections: `vrp`, `hyparb`,
+//! `exec`, `har`, `hcv` (HC11)). Every field is a plain integer, a fixed array or an
 //! embedded `#[repr(C)]` POD from `core-types` / `strategy-core`;
 //! `Copy` throughout so the seqlock can copy it whole.
 //!
@@ -13,24 +14,33 @@
 
 use core_types::{Fill, Order};
 use strategy_core::{
-    HyparbCoinView, HyparbCounters, HyparbPoolView, IcdpCounters, RegimeCounters, RegimeRelView,
-    SlotCounters, VmRowView, VrpCounters, VrpSnapshotView,
+    HarCounters, HarSeriesView, HcvCounters, HyparbCoinView, HyparbCounters, HyparbPoolView,
+    RegimeCounters,
+    RegimeRelView, SlotCounters, VmRowView, VrpCounters, VrpSnapshotView, XmmCounters,
+    XmmPerpView, HAR_VIEW_SERIES,
 };
 
 /// JSON schema version of `/state` (`"v"`). Bump on any field removal
 /// or semantic change; additions are free.
-pub const SNAPSHOT_SCHEMA: u32 = 1;
+///
+/// **2 (XMM XH3, 2026-09-26):** the `icdp` object and `boot.icdp_hash`
+/// are gone (slot 6 has been xmm since XH1 and they read zeros); the
+/// `xmm` object and `boot.xmm_hash` take their place. The dashboard
+/// reads either version.
+pub const SNAPSHOT_SCHEMA: u32 = 2;
 /// Orders kept in the `recent` ring.
 pub const RECENT_ORDERS: usize = 64;
 /// Fills kept in the `recent` ring.
 pub const RECENT_FILLS: usize = 64;
-/// Strategy-set slots mirrored (the wire-stable slot map; 7 = reserved).
+/// Strategy-set slots mirrored (the wire-stable slot map; every slot
+/// is a member since HC11).
 pub const SNAPSHOT_SLOTS: usize = 8;
 /// Ingress lanes mirrored, in the cli's T1(c) order:
 /// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2 — appended, never
 /// reordered: the index is the `/state` array position), hyperevm
-/// (HYPARB H3b — appended after mexc).
-pub const SNAPSHOT_VENUES: usize = 9;
+/// (HYPARB H3b — appended after mexc), hypercall (HC5 — appended after
+/// hyperevm).
+pub const SNAPSHOT_VENUES: usize = 10;
 /// Capacity of the fixed text fields (`git_sha` — 40 hex — and the
 /// strategy names).
 pub const BOOT_TEXT_MAX: usize = 48;
@@ -51,8 +61,15 @@ pub const RUN_DIR_MAX: usize = 160;
 /// took the number the same day.
 /// **Slot 3 changed meaning on 2026-09-12 (BIN15 O4b)**: it was
 /// `rule-tree`.
+/// **Slot 6 changed meaning on 2026-09-26 (XMM XH1)**: `strategy-icdp`
+/// was unlinked and `strategy-xmm` took the number the same day. The
+/// `icdp` block read zeros until XH3 replaced it with the `xmm` block
+/// ([`SNAPSHOT_SCHEMA`] 2).
+/// **Slot 7 was reserved until HC11 (2026-09-26)**: it is `strategy-hcv`
+/// since — no member ever stood there before, so no row changed meaning
+/// (the name, `"reserved"` → `"hcv"`, is additive).
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv",
 ];
 
 /// Ingress index → venue name (see [`SNAPSHOT_VENUES`]).
@@ -66,6 +83,7 @@ pub const VENUE_NAMES: [&str; SNAPSHOT_VENUES] = [
     "rpc",
     "mexc",
     "hyperevm",
+    "hypercall",
 ];
 
 /// Boot identity — filled once by the bin and the set builder, then
@@ -86,6 +104,12 @@ pub struct BootInfo {
     pub run_epoch_ns: u64,
     /// SHA-256 of `regime.toml` (all-zero when no detector configured).
     pub regime_hash: [u8; 32],
+    /// XMM XH3: SHA-256 of `xmm.toml` (all-zero when slot 6 is not
+    /// configured).
+    pub xmm_hash: [u8; 32],
+    /// HC11: SHA-256 of `hcv.toml` (all-zero when slot 7 is not
+    /// configured).
+    pub hcv_hash: [u8; 32],
     /// Process id.
     pub pid: u32,
     /// `--strategy` mask as requested (`mask_for_name`).
@@ -104,14 +128,20 @@ pub struct BootInfo {
     pub strategy_name: [u8; BOOT_TEXT_MAX],
     /// The capture run directory (`run_dir_len` live; see [`RUN_DIR_MAX`]).
     pub run_dir: [u8; RUN_DIR_MAX],
+    /// XMM XH3: the coins slot 6 quotes, in its perp-row order
+    /// (`"BTC,ETH,SOL,XRP"`; `xmm_coins_len` live) — the names of the
+    /// `/state` `xmm.perps` rows.
+    pub xmm_coins: [u8; BOOT_TEXT_MAX],
     /// Live bytes of `git_sha`.
     pub git_sha_len: u8,
     /// Live bytes of `strategy_name`.
     pub strategy_name_len: u8,
     /// Live bytes of `run_dir`.
     pub run_dir_len: u8,
+    /// Live bytes of `xmm_coins`.
+    pub xmm_coins_len: u8,
     /// Explicit padding — always zero.
-    _pad: [u8; 5],
+    _pad: [u8; 4],
 }
 
 impl BootInfo {
@@ -123,6 +153,8 @@ impl BootInfo {
         binary_mtime_ns: 0,
         run_epoch_ns: 0,
         regime_hash: [0; 32],
+        xmm_hash: [0; 32],
+        hcv_hash: [0; 32],
         pid: 0,
         requested_mask: 0,
         configured_mask: 0,
@@ -131,10 +163,12 @@ impl BootInfo {
         git_sha: [0; BOOT_TEXT_MAX],
         strategy_name: [0; BOOT_TEXT_MAX],
         run_dir: [0; RUN_DIR_MAX],
+        xmm_coins: [0; BOOT_TEXT_MAX],
         git_sha_len: 0,
         strategy_name_len: 0,
         run_dir_len: 0,
-        _pad: [0; 5],
+        xmm_coins_len: 0,
+        _pad: [0; 4],
     };
 
     /// Store `s` into `git_sha` (truncated to the field).
@@ -148,6 +182,11 @@ impl BootInfo {
     /// Store `s` into `run_dir` (truncated to the field).
     pub fn set_run_dir(&mut self, s: &[u8]) {
         self.run_dir_len = copy_text(&mut self.run_dir, s);
+    }
+    /// Store `s` into `xmm_coins` (truncated to the field; seven coins
+    /// fit in 28 bytes).
+    pub fn set_xmm_coins(&mut self, s: &[u8]) {
+        self.xmm_coins_len = copy_text(&mut self.xmm_coins, s);
     }
     /// The live `git_sha` bytes.
     #[inline]
@@ -163,6 +202,11 @@ impl BootInfo {
     #[inline]
     pub fn run_dir(&self) -> &[u8] {
         &self.run_dir[..self.run_dir_len as usize]
+    }
+    /// The live `xmm_coins` bytes.
+    #[inline]
+    pub fn xmm_coins(&self) -> &[u8] {
+        &self.xmm_coins[..self.xmm_coins_len as usize]
     }
 }
 
@@ -268,18 +312,32 @@ impl VmSnapshot {
     }
 }
 
-/// The icdp member (slot 6).
+/// Perp rows `/state` carries (the member's own bound).
+pub const SNAPSHOT_XMM_PERPS: usize = 8;
+
+/// XMM XH3: the slot-6 member — its counters and one row per quoted
+/// perp, read at ONE instant (a quote and the touch it was placed
+/// against can never disagree).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
-pub struct IcdpSnapshot {
-    /// SHA-256 of the artifact (all-zero = unconfigured).
-    pub hash: [u8; 32],
-    /// The member's diagnostic counters.
-    pub counters: IcdpCounters,
-    /// Instruments configured (0 = unconfigured).
-    pub instruments: u32,
+pub struct XmmSnapshot {
+    /// The member's counters.
+    pub counters: XmmCounters,
+    /// Perps configured (0 = unconfigured).
+    pub n_perps: u32,
     /// Explicit padding — always zero.
     pub _pad: u32,
+    /// Perp rows, `[..n_perps]` live.
+    pub perps: [XmmPerpView; SNAPSHOT_XMM_PERPS],
+}
+
+/// HC11: the slot-7 member (Hypercall S1 — DARK, paper only): its
+/// counters and gauges at one publish instant.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct HcvSnapshot {
+    /// The member's counters and gauges.
+    pub counters: HcvCounters,
 }
 
 /// P6: the VRP member (slot 1).
@@ -331,6 +389,37 @@ impl Default for HyparbSnapshot {
             n_coins: 0,
             pools: [HyparbPoolView::default(); SNAPSHOT_HYPARB_POOLS],
             coins: [HyparbCoinView::default(); SNAPSHOT_HYPARB_COINS],
+        }
+    }
+}
+
+/// HAR H3.5: the long-tenor HAR series (`core_vol::LongVolSet`, held by
+/// the strategy set) — its identity, its counters and one row per
+/// configured series, all from ONE publish instant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct HarSnapshot {
+    /// SHA-256 of the `har.toml` loaded at boot (all-zero: none).
+    pub hash: [u8; 32],
+    /// The set's counters.
+    pub counters: HarCounters,
+    /// Series configured (`0` = the service is off).
+    pub n: u32,
+    /// Series the file names that the boot DROPPED (a feed the boot
+    /// universe does not carry — the rest run).
+    pub dropped: u32,
+    /// The rows, `[..n]` live, in `har.toml` order.
+    pub series: [HarSeriesView; HAR_VIEW_SERIES],
+}
+
+impl Default for HarSnapshot {
+    fn default() -> Self {
+        Self {
+            hash: [0; 32],
+            counters: HarCounters::default(),
+            n: 0,
+            dropped: 0,
+            series: [HarSeriesView::default(); HAR_VIEW_SERIES],
         }
     }
 }
@@ -715,12 +804,16 @@ pub struct EngineSnapshot {
     pub slots: [SlotCounters; SNAPSHOT_SLOTS],
     /// The vm member.
     pub vm: VmSnapshot,
-    /// The icdp member.
-    pub icdp: IcdpSnapshot,
+    /// XMM XH3: the slot-6 member.
+    pub xmm: XmmSnapshot,
+    /// HC11: the slot-7 member.
+    pub hcv: HcvSnapshot,
     /// The VRP member.
     pub vrp: VrpSnapshot,
     /// HYPARB H6: the slot-0 member.
     pub hyparb: HyparbSnapshot,
+    /// HAR H3.5: the long-tenor HAR series.
+    pub har: HarSnapshot,
     /// **E6: the execution router's kill switches.**
     pub exec: ExecSnapshot,
     /// The AI plane.
@@ -757,9 +850,11 @@ impl EngineSnapshot {
             regime_rel: RegimeRelView::EMPTY,
             slots: [SlotCounters::default(); SNAPSHOT_SLOTS],
             vm: VmSnapshot::empty(),
-            icdp: IcdpSnapshot::default(),
+            xmm: XmmSnapshot::default(),
+            hcv: HcvSnapshot::default(),
             vrp: VrpSnapshot::default(),
             hyparb: HyparbSnapshot::default(),
+            har: HarSnapshot::default(),
             exec: ExecSnapshot::default(),
             ai: AiSnapshot::default(),
             ingress: [IngressSnapshot::default(); SNAPSHOT_VENUES],
@@ -804,11 +899,16 @@ mod tests {
     #[test]
     fn snapshot_is_cache_aligned_and_bounded() {
         assert_eq!(core::mem::align_of::<EngineSnapshot>(), 64);
-        // Plan §6.1 budget: ≈ 24 KB. The rings (8 KB) + 256 row views
-        // (12 KB) dominate; anything past 32 KB is a layout regression.
+        // Plan §6.1 budget: ≈ 24 KB, 28,352 B at XMM XH3. The rings
+        // (8 KB) + 256 row views (12 KB) dominate; anything past 32 KB is
+        // a layout regression. HAR H3.5's `har` section (twelve 176 B
+        // series rows + identity and counters) makes it 30,656 B at the
+        // Hypercall merge; HC11's `hcv` section and `boot.hcv_hash` add
+        // 200 B.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);
+        assert_eq!(core::mem::size_of::<HarSnapshot>(), 2_216);
     }
 
     #[test]
@@ -839,8 +939,8 @@ mod tests {
         let long = [b'x'; RUN_DIR_MAX + 40];
         b.set_run_dir(&long);
         assert_eq!(b.run_dir().len(), RUN_DIR_MAX);
-        b.set_strategy_name(b"ai+icdp");
-        assert_eq!(b.strategy_name(), b"ai+icdp");
+        b.set_strategy_name(b"ai+xmm");
+        assert_eq!(b.strategy_name(), b"ai+xmm");
         let mut s = EngineSnapshot::empty();
         s.set_strategy_kind(b"set");
         assert_eq!(s.strategy_kind(), b"set");

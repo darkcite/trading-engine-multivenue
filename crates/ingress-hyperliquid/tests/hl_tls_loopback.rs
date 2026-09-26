@@ -1018,9 +1018,12 @@ fn a_roll_rebinds_unsubscribes_subscribes_and_emits_the_event() {
 /// A family with no live instance subscribes NOTHING — its reserved
 /// rows are invisible to the subscribe sweep and to the ack mask, so
 /// the session verifies on the configured coins alone. And a repeated
-/// `outcomeCreated` for the instance already held is idempotent: the
-/// venue re-pushes on reconnect, and a second rebind would churn the
-/// wire for no change.
+/// `outcomeCreated` for the instance already held is idempotent: a
+/// second rebind would churn the wire for no change. The venue pushes a
+/// roll once and replays none to a later subscriber (probed
+/// 2026-09-26), but an instance adopted from an `/info` snapshot — at
+/// boot, or at a reconnect's re-discovery — can still see its own push
+/// arrive after the session subscribed.
 #[test]
 fn a_dormant_family_subscribes_nothing_and_repeats_are_idempotent() {
     use ingress_hyperliquid::family::{rolling_sym, HlFamilyTable};

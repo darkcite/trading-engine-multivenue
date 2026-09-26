@@ -373,7 +373,13 @@ On success the table is stamped `epoch = self.epoch + 1` and copied once, scratc
 
 **The boot universe** rule 6 checks symbols against is `cli::build_ai_universe`: the PM and BN pair
 syms, the OKX / Deribit / Hyperliquid discovery tables and — since 2026-09-23 (ruling Q-MX6) — every
-MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Rule 10
+MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Since
+2026-09-26 (ruling O-HC17) it also holds every Hypercall option the boot selected
+(`hypercall:<U>-<YYYYMMDD>-<K>-<C|P>`, caps `CAP_OPT | CAP_PRICE`, HC4); the `hypercall-idx:<U>`
+index syms stay out — capture-only `Mark`s, caps 0, nothing could read them. Both data-only venues
+enter as signal or reference legs: an order on one is `unroutable` in the paper matcher and the
+harness. (The v2 grammar resolves descriptors through the `DescriptorTable`, which already carried
+Hypercall since HC4; the snapshot is the v1 arm's sym universe.) Rule 10
 reads the per-descriptor channel caps, mirrored Rust↔Python (`caps_of_descriptor`): `mexc:<SYM>`
 (spot, xStocks included) → `CAP_PRICE`; `mexc-perp:<SYM>` (every MEXC perp, TradFi included) →
 `CAP_PRICE | CAP_FUNDING`. MEXC has no depth or options lane, so no depth or option feature validates
@@ -427,7 +433,7 @@ to enabled members in slot order:
 | 3 | 8 | `rule-tree` |
 | 4 | 16 | `ai-exec` — the s4 Intent lane |
 | 5 | 32 | `vm` — the ruleset VM |
-| 6 | 64 | `icdp` — the intrabar candle-direction member (ICDP I3, 2026-09-03; configured only when `~/multivenue/icdp.toml` resolves) |
+| 6 | 64 | `xmm` — the HL post-only maker (XMM XH1, 2026-09-26 — was `icdp`, the intrabar candle-direction member, now unlinked; configured only when `~/multivenue/xmm.toml` resolves; DARK at XH1) |
 
 `--strategy all` requests 127, but slots 1/2/3 need `vrp.toml` / `xsd.toml`+`xsd-table.tsv` / `--rules-path`,
 which the launchd wrapper does not pass. **Since the operator ruling of 2026-09-02 the wrapper boots
@@ -541,7 +547,7 @@ Proven live 2026-08-30: 1,669 frames, 52 funding descriptors, `cmds_total` 1674,
 | `parity` | `python -m claude_worker.parity --window-h 48` | `engine-orders.pmlr` only | s4-vs-s5 verdict (§10) |
 | `audit-replay` | `multivenue-engine audit-replay --dir run-<ns>` | the whole run dir | cadence/integrity verdicts + the full AI-command chain |
 | `/metrics` | `127.0.0.1:9191/metrics` | live counters | `engine_vm_*`, `engine_ai_ruleset_*`, `engine_ingress_ai_*`, `engine_regime_*` |
-| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 1` — boot / regime words + per-row gate bytes / slots / vm rows / icdp / ai / ingress / recent orders + fills |
+| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 2` — boot / regime words + per-row gate bytes / slots / vm rows / xmm (was icdp until v2) / ai / ingress / recent orders + fills |
 | dashboard | `http://127.0.0.1:9292/` (`python -m claude_worker.dashboard`) | `/state` + `/metrics` proxied, `state.db`, reports, regime history, configs | the read-only operator page (no controls) |
 | `regime soak` | `python -m claude_worker.regime soak` (RG7) | the regime history + the runs' complete ≤ 2 h windows + the nightly reports | the pooled soak verdict (`~/multivenue/worker/regime/soak-<utc>.json`) |
 

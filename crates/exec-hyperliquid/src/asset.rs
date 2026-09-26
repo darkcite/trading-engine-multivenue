@@ -27,6 +27,51 @@ pub const ASSET_SLOTS: usize = 32;
 /// The HIP-4 asset-id base. `asset = ASSET_BASE + 10 * outcome_id + side`.
 pub const ASSET_BASE: u32 = 100_000_000;
 
+/// HC10: the first HIP-3 builder-dex asset id. A builder perp is
+/// `BUILDER_BASE + dex_idx × 10_000 + index` (`dex_idx ≥ 1`, `index <
+/// 10_000`), below [`ASSET_BASE`]. Mirrors
+/// `ingress_hyperliquid::discovery::builder_asset_id` — duplicated, as
+/// [`OUTCOME_ID_MAX`] is, because this crate must not depend on the
+/// market-data crate; the cli's `builder_asset_ids_agree` holds them
+/// together.
+pub const BUILDER_BASE: u32 = 100_000;
+
+/// The first spot-pair asset id (`10_000 + index`).
+pub const SPOT_BASE: u32 = 10_000;
+
+/// What an asset id names, by the venue's id scheme.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AssetKind {
+    /// A native perp (`0 ≤ id < 10_000`).
+    Perp,
+    /// A spot pair (`10_000 ≤ id < 100_000`).
+    Spot,
+    /// A HIP-3 builder-dex perp (`100_000 ≤ id < 100_000_000`).
+    BuilderPerp,
+    /// A HIP-4 outcome leg (`id ≥ 100_000_000`).
+    Outcome,
+}
+
+/// The kind an asset id names.
+#[must_use]
+pub const fn kind_of(asset: u32) -> AssetKind {
+    if asset >= ASSET_BASE {
+        AssetKind::Outcome
+    } else if asset >= BUILDER_BASE {
+        AssetKind::BuilderPerp
+    } else if asset >= SPOT_BASE {
+        AssetKind::Spot
+    } else {
+        AssetKind::Perp
+    }
+}
+
+/// Is `asset` an id a perp hedge may be bound to (native or builder)?
+#[must_use]
+pub const fn is_perp_id(asset: u32) -> bool {
+    matches!(kind_of(asset), AssetKind::Perp | AssetKind::BuilderPerp)
+}
+
 /// The largest outcome id whose asset id fits in `u32`.
 ///
 /// Mirrors `ingress_hyperliquid`'s own bound (`discovery.rs:103`),
@@ -788,6 +833,18 @@ impl AssetTable {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_id_scheme_names_each_kind() {
+        assert_eq!(kind_of(0), AssetKind::Perp);
+        assert_eq!(kind_of(9_999), AssetKind::Perp);
+        assert_eq!(kind_of(10_000), AssetKind::Spot);
+        assert_eq!(kind_of(110_002), AssetKind::BuilderPerp);
+        assert_eq!(kind_of(ASSET_BASE - 1), AssetKind::BuilderPerp);
+        assert_eq!(kind_of(ASSET_BASE + 10_811), AssetKind::Outcome);
+        assert!(is_perp_id(3) && is_perp_id(110_002));
+        assert!(!is_perp_id(10_001) && !is_perp_id(ASSET_BASE));
+    }
     use super::*;
 
     #[test]

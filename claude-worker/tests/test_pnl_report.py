@@ -548,6 +548,35 @@ def test_load_fee_flags_accepts_the_mexc_venue_table(tmp_path: pathlib.Path) -> 
         claude_worker.pnl_report.load_fee_flags(fees)
 
 
+def test_load_fee_flags_accepts_the_hypercall_venue_table(tmp_path: pathlib.Path) -> None:
+    """HC6 (O-HC7): Hypercall's launch schedule, UNVERIFIED — options 0:0,
+    with the published future schedule as the fee-on stress variant. An
+    unknown venue table is fatal, so without `hypercall` in FEE_VENUES the
+    shipped example would refuse the report."""
+    assert "hypercall" in claude_worker.pnl_report.FEE_VENUES
+    fees = tmp_path / "fees.toml"
+    fees.write_text(
+        '[fees]\nhypercall = "0:0"\n[fees.hypercall]\noption = "0:0"   # UNVERIFIED\n',
+        encoding="utf-8",
+    )
+    assert claude_worker.pnl_report.load_fee_flags(fees) == [
+        "--fee-bps", "hypercall:0:0",
+        "--fee-bps", "hypercall.option:0:0",
+    ]
+    # The stress variant parses as written in the example's comment.
+    fees.write_text(
+        '[fees.hypercall]\noption = "2:5"\noption_cap = "5:1250"\n', encoding="utf-8"
+    )
+    assert claude_worker.pnl_report.load_fee_flags(fees) == [
+        "--fee-bps", "hypercall.option:2:5",
+        "--opt-fee", "hypercall:5:1250",
+    ]
+    example = pathlib.Path(__file__).resolve().parents[2] / "fees.toml.example"
+    flags = claude_worker.pnl_report.load_fee_flags(example)
+    assert "hypercall:0:0" in flags
+    assert "hypercall.option:0:0" in flags
+
+
 def test_load_fee_flags_charge_once_open_keys(tmp_path: pathlib.Path) -> None:
     """BIN15 O1: `<class>_open` becomes the harness's
     `--fee-bps <venue>.<class>.open` pair; the ordinary class line is

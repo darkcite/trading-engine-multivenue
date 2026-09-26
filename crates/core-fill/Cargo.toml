@@ -15,3 +15,7 @@ path = "src/lib.rs"
 core-types = { workspace = true }
 # HYPARB H2: the AMM fill law judges with core-amm's exact swap arithmetic.
 core-amm   = { workspace = true }
+
+[dev-dependencies]
+# XMM XH2: the queue law's property tests (plan §7.3).
+proptest = { workspace = true }

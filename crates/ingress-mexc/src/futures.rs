@@ -23,11 +23,12 @@
 //! `[price, volume (contracts), orderCount]`, best first. Everything is
 //! a key-matched in-place scan; nothing allocates or copies.
 
+use core_net::{WsPayload, WsWriteErr};
 use core_parse::{
     find_field, scan_number_sci_1e6, scan_number_sci_1e9, skip_json_value, skip_ws,
 };
 
-use crate::{push_bytes, scan_u64_checked, MexcChannel, MexcDeal, DEAL_SIDE_BUY, DEAL_SIDE_SELL};
+use crate::{scan_u64_checked, MexcChannel, MexcDeal, DEAL_SIDE_BUY, DEAL_SIDE_SELL};
 
 // ---------------------------------------------------------------
 // Number readers (bare — the wire — or quoted, tolerated)
@@ -575,30 +576,38 @@ const _POD_SIZES: () = {
 // Subscribe writer — ONE frame per (symbol, channel)
 // ---------------------------------------------------------------
 
-/// Render one futures subscribe frame:
+/// Render one futures subscribe frame through `p`, straight into its
+/// frame, header first (`core_net::queue_masked_text_frame_rendered`):
 /// `{"method":"sub.depth.full","param":{"symbol":"BTC_USDT","limit":5}}`,
 /// `{"method":"sub.deal","param":{"symbol":"BTC_USDT"}}` or
-/// `{"method":"sub.ticker","param":{"symbol":"BTC_USDT"}}`. `None` for a
-/// spot channel or when `dst` is too small.
+/// `{"method":"sub.ticker","param":{"symbol":"BTC_USDT"}}`. `channel`
+/// must be a futures channel.
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `p` runs out of room.
 #[inline]
-pub fn write_fut_subscribe(dst: &mut [u8], channel: MexcChannel, symbol: &[u8]) -> Option<usize> {
-    if channel.class() != crate::MexcClass::Futures {
-        return None;
-    }
-    let mut n = push_bytes(dst, 0, b"{\"method\":\"")?;
-    n = push_bytes(dst, n, channel.topic())?;
-    n = push_bytes(dst, n, b"\",\"param\":{\"symbol\":\"")?;
-    n = push_bytes(dst, n, symbol)?;
-    n = push_bytes(dst, n, b"\"")?;
+pub fn render_fut_subscribe(
+    p: &mut WsPayload<'_>,
+    channel: MexcChannel,
+    symbol: &[u8],
+) -> Result<(), WsWriteErr> {
+    debug_assert!(
+        channel.class() == crate::MexcClass::Futures,
+        "a futures subscribe needs a futures channel"
+    );
+    p.put(b"{\"method\":\"")?;
+    p.put(channel.topic())?;
+    p.put(b"\",\"param\":{\"symbol\":\"")?;
+    p.put(symbol)?;
+    p.put(b"\"")?;
     if channel == MexcChannel::FutDepthFull {
-        n = push_bytes(dst, n, b",\"limit\":5")?;
+        p.put(b",\"limit\":5")?;
     }
-    push_bytes(dst, n, b"}}")
+    p.put(b"}}")
 }
 
 /// Longest rendered futures subscribe payload (depth.full at the
-/// longest accepted symbol) — sizes the render scratch and the tx
-/// budget.
+/// longest accepted symbol) — sizes the tx budget.
 pub const FUT_SUB_PAYLOAD_MAX: usize = br#"{"method":"sub.depth.full","param":{"symbol":"","limit":5}}"#.len()
     + crate::MEXC_SYMBOL_MAX;
 
@@ -639,6 +648,14 @@ mod views {
 mod tests {
     use super::*;
     use super::views::*;
+
+    /// One futures subscribe rendered into a plain buffer — exactly what
+    /// the frame's payload span receives; `None` when it does not fit.
+    fn write_fut_subscribe(buf: &mut [u8], channel: MexcChannel, symbol: &[u8]) -> Option<usize> {
+        let mut p = WsPayload::writing(buf);
+        render_fut_subscribe(&mut p, channel, symbol).ok()?;
+        Some(p.len())
+    }
 
     // Plan §1.2, verbatim shapes.
     const DEPTH: &[u8] = br#"{"symbol":"BTC_USDT","data":{"cts":1789897581009,"asks":[[80468.7,3446,2],[80469.1,1239,1]],"bids":[[80468.6,31288,7],[80468.5,10,1]],"version":41925002140},"channel":"push.depth.full","ts":1789897581013}"#;
@@ -841,12 +858,20 @@ mod tests {
         assert_eq!(&buf[..n], br#"{"method":"sub.deal","param":{"symbol":"BTC_USDT"}}"# as &[u8]);
         let n = write_fut_subscribe(&mut buf, MexcChannel::FutTicker, b"XAU_USDT").unwrap();
         assert_eq!(&buf[..n], br#"{"method":"sub.ticker","param":{"symbol":"XAU_USDT"}}"# as &[u8]);
-        assert!(write_fut_subscribe(&mut buf, MexcChannel::SpotDeals, b"BTC_USDT").is_none());
         let mut tiny = [0u8; 12];
         assert!(write_fut_subscribe(&mut tiny, MexcChannel::FutDeal, b"BTC_USDT").is_none());
         let long = [b'A'; crate::MEXC_SYMBOL_MAX];
         let mut exact = [0u8; FUT_SUB_PAYLOAD_MAX];
         assert_eq!(write_fut_subscribe(&mut exact, MexcChannel::FutDepthFull, &long), Some(FUT_SUB_PAYLOAD_MAX));
+    }
+
+    /// A spot channel is a caller bug: the run loop draws futures
+    /// channels only (`MexcChannel::from_slot(MexcClass::Futures, …)`).
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "needs a futures channel"))]
+    fn render_fut_subscribe_refuses_a_spot_channel_in_debug() {
+        let mut buf = [0u8; 256];
+        let _ = write_fut_subscribe(&mut buf, MexcChannel::SpotDeals, b"BTC_USDT");
     }
 
     #[test]

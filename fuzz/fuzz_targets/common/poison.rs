@@ -49,6 +49,10 @@ unsafe impl AnyBits for ingress_bybit::BybitTickerFrame {}
 unsafe impl AnyBits for ingress_rpc::NewHead {}
 unsafe impl AnyBits for ingress_binance::BookTickerFrame {}
 unsafe impl AnyBits for ingress_binance::BnMarkPriceFrame {}
+// SAFETY (HC3, 2026-09-25): `HcQuote` is `repr(C, align(64))`: six
+// `i64`/`u64` fields and two `(u32, u32)` spans — integers only, 64 B
+// with no padding (const-asserted in the crate).
+unsafe impl AnyBits for ingress_hypercall::HcQuote {}
 
 /// A `T` with every byte `0xA5`.
 pub fn poisoned<T: AnyBits>() -> T {
