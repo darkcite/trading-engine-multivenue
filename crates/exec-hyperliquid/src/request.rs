@@ -61,9 +61,10 @@ impl<'a> Json<'a> {
         if end > self.buf.len() {
             return Err(MsgPackErr::Overflow);
         }
-        // COPY: the JSON renderer's own write — literals and ≤ 24 B
-        // rendered numbers into the request body IN PLACE (behind the
-        // envelope head, `envelope_open`). As with `msgpack::put_all`,
+        // COPY: the JSON renderer's own write — literals, ≤ 24 B
+        // rendered numbers and ≤ 42 B caller tokens (a channel name, the
+        // master's hex) into the body IN PLACE (behind a head or the
+        // frame-header room, `envelope_open`). As with `msgpack::put_all`,
         // the body must exist contiguously once; it is written here
         // and read by the TLS layer, with no staging buffer between.
         self.buf[self.len..end].copy_from_slice(bytes);
@@ -309,6 +310,84 @@ pub fn envelope(
     // action bytes on their own to print and compare.
     dst[head..end].copy_from_slice(action_json);
     envelope_close(dst, end, nonce, sig, vault, expires_after)
+}
+
+/// **Open a WebSocket post** (XH4b): writes
+/// `{"method":"post","id":<id>,"request":{"type":"action","payload":` at
+/// the start of `dst` and returns the offset at which the caller renders
+/// the envelope IN PLACE ([`envelope_open`] … [`envelope_close`] on
+/// `&mut dst[n..]`). Close with [`ws_post_close`]. The post is the
+/// `/exchange` body wrapped, byte for byte: the same envelope a REST
+/// fallback sends is a sub-slice of it.
+pub fn ws_post_open(dst: &mut [u8], id: u64) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"method\":\"post\",\"id\":")?;
+    j.u64(id)?;
+    j.put(b",\"request\":{\"type\":\"action\",\"payload\":")?;
+    Ok(j.len)
+}
+
+/// **Close a WebSocket post**: the post occupies `dst[..end]`, envelope
+/// included; appends the two closing braces and returns its length.
+pub fn ws_post_close(dst: &mut [u8], end: usize) -> Result<usize, MsgPackErr> {
+    if end > dst.len() {
+        return Err(MsgPackErr::Overflow);
+    }
+    let mut j = Json::at(dst, end);
+    j.put(b"}}")?;
+    Ok(j.len)
+}
+
+/// `{"method":"subscribe","subscription":{"type":"<channel>","user":"<user_hex>"}}`
+/// — a user-channel subscription; `user_hex` is the `0x…` MASTER
+/// address. ONE renderer for the blocking `UserWs` and the gateway's
+/// connections.
+pub fn subscribe_json(dst: &mut [u8], channel: &[u8], user_hex: &[u8]) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"method\":\"subscribe\",\"subscription\":{\"type\":\"")?;
+    j.put(channel)?;
+    j.put(b"\",\"user\":\"")?;
+    j.put(user_hex)?;
+    j.put(b"\"}}")?;
+    Ok(j.len)
+}
+
+#[cfg(test)]
+mod ws_post_tests {
+    use super::*;
+
+    #[test]
+    fn a_ws_post_wraps_the_envelope_byte_for_byte() {
+        let mut dst = [0u8; 512];
+        let p = ws_post_open(&mut dst, 42).unwrap();
+        assert_eq!(
+            &dst[..p],
+            br#"{"method":"post","id":42,"request":{"type":"action","payload":"#
+        );
+        let head = envelope_open(&mut dst[p..]).unwrap();
+        let body = br#"{"type":"noop"}"#;
+        dst[p + head..p + head + body.len()].copy_from_slice(body);
+        let sig = [0u8; 65];
+        let env = envelope_close(&mut dst[p..], head + body.len(), 7, &sig, None, None).unwrap();
+        let mut rest = [0u8; 512];
+        let n = envelope(&mut rest, body, 7, &sig, None, None).unwrap();
+        assert_eq!(&dst[p..p + env], &rest[..n], "the REST body is the post's sub-slice");
+        let total = ws_post_close(&mut dst, p + env).unwrap();
+        assert_eq!(total, p + env + 2);
+        assert!(dst[..total].ends_with(b"}}}"));
+        assert_eq!(ws_post_close(&mut dst[..4], 5), Err(MsgPackErr::Overflow));
+        assert_eq!(ws_post_open(&mut [0u8; 8], 1), Err(MsgPackErr::Overflow));
+    }
+
+    #[test]
+    fn a_subscription_names_the_channel_and_the_master() {
+        let mut dst = [0u8; 256];
+        let n = subscribe_json(&mut dst, b"orderUpdates", b"0xabc").unwrap();
+        assert_eq!(
+            &dst[..n],
+            br#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xabc"}}"#
+        );
+    }
 }
 
 #[cfg(test)]

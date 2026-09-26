@@ -27,8 +27,21 @@ clob-dispatcher = { workspace = true }
 core-ring     = { workspace = true }
 core-fill     = { workspace = true }
 core-types    = { workspace = true }
+# XH4b: the order gateway — the command/event duplex, pending table,
+# deadline queue, make-before-break machine and idle policy — and the
+# engine's monotonic clock the gateway stamps its events with.
+exec-gateway  = { workspace = true }
+core-time     = { workspace = true }
 mio           = { workspace = true }
 rustls        = { workspace = true }
+# `testvenue` only: the scripted rustls Hyperliquid the gateway's tests
+# and alloc gate 84 run against (never in a build that ships).
+rcgen         = { workspace = true, optional = true }
+
+[features]
+testvenue = ["dep:rcgen"]
 
 [dev-dependencies]
 rcgen = { workspace = true }
+# The integration tests drive the gateway against `testvenue`.
+exec-hyperliquid = { path = ".", features = ["testvenue"] }

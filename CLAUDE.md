@@ -561,8 +561,11 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
   `crates/exec-gateway` — the venue-agnostic async order-gateway kit (XMM
-  XH4a: duplex rings, in-flight table, deadline queue, make-before-break;
-  nothing wired to it before XH4b).
+  XH4a: duplex rings, in-flight table, deadline queue, make-before-break).
+  Its first user is `exec_hyperliquid::gateway` (XH4b: the HL WebSocket-
+  post gateway thread — built and loopback-tested, wired to the engine in
+  XH4f); `exec-hyperliquid`'s test-only feature `testvenue` is a scripted
+  rustls Hyperliquid (never in a shipping build).
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
   path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
   compile-time asserted); mainnet only through a `MainnetAuthority`

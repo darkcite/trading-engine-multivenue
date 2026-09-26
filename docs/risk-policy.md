@@ -6571,3 +6571,124 @@ members' replays byte-identical against main's binary.
 The laws XH-1…XH-7 (plan §10) are recorded here as their XH4 sub-phases
 land (the XH2/XH3 amendments carry the member's halves of XH-2, XH-4 and
 XH-6).
+
+### XH4b amendment (2026-09-26): the Hyperliquid order gateway — built, loopback-tested, nothing wired, nothing armed
+
+`exec_hyperliquid::gateway::HlGateway`: one thread per HL arm, the only
+place an HL order meets a socket. **No engine path uses it yet** (XH4f
+wires slot 6); the blocking arm (`exchange.rs`) is untouched; a live slot
+6 still refuses the boot. Shared changes: `action::MAX_ORDERS` 16 → 39
+and `MAX_ACTION` 4 096 → 8 192 (the blocking arm sends one-item actions;
+its budget accounting is unchanged); `UserFill` gains `crossed`
+(additive); `UserWs` renders its subscribe through the shared
+`request::subscribe_json`, framed in place (byte-identical).
+
+**What it does:**
+- 64 B `HlCmd` and `ExecEvent` (layouts const-asserted) on the kit's
+  duplex (1 024 / 4 096). The engine's half is one ring write per command
+  and one ring read per event (gate 84a, 0 B/op).
+- **Admission (refused unsent, `EV_REJECTED`):** a slot outside the
+  gateway's configured mask (two arms may share an account, never a cloid
+  namespace); a kind or time-in-force it does not carry — ALO and IoC
+  places, ALO modifies and cancels only (XH-3: a Gtc place or a taker
+  modify is refused); growth while the halt word is set (`HALTED`;
+  cancels still go, and the word is re-checked when a batch is posted);
+  growth before the process's first `userFills` snapshot was absorbed
+  (`NOT_READY` — no fill of ours can be taken for history).
+- **Coalescing (XH-3):** four classes, never mixed, ≤ 39 items per action
+  (one IP request); batches post in the order they opened; a full batch
+  posts every open batch; a cancel or modify whose target is still in an
+  open batch posts every open batch first. **On one socket nothing
+  overtakes the order it names; across sockets (a swap, the REST
+  fallback) and after an unanswered post there is no such guarantee** —
+  XH4d's sticky intent covers cancels AND modifies (a not-found answer
+  about an unresolved target does not mean the order is gone).
+- **One post:** msgpack encoded once and signed on the gateway thread
+  (one nonce stream per arm); the JSON rendered once behind the WebSocket
+  post head and framed in place; the REST fallback's body is the
+  envelope sub-slice. `expiresAfter` = the smallest non-zero per-command
+  offset (XH4c configures it).
+- **Streams:** `userFills` → FILL + FILL_META (fee signed, crossed),
+  tid-deduped across sockets and reconnects (E-5); `orderUpdates` →
+  RESTING / CANCELED / FILLED / REJECTED with the status's reason,
+  deduped. **The first `userFills` snapshot is history:** its tids are
+  admitted, nothing is emitted, and `EV_SNAPSHOT` (rows, the latest
+  fill's venue time) tells the arm to read its boot reconciliation after
+  it. **A stream gap is an event:** a frame that does not scan, a socket
+  that comes up after a spell with none live, or one that replaces a
+  socket that had gone silent (`orderUpdates` has no snapshot) is
+  `EV_GAP` — the arm re-checks its open orders (XH4d).
+- Make-before-break (XG-4) on two sockets; ping at 30 s of silence,
+  replace at 45 s, dead at 60 s — and **a post that times out on the
+  active socket with nothing read since it was written replaces that
+  socket at once** (a second one while the replacement is still dialing
+  closes the silent socket, so posts go by REST instead of into it);
+  DNS re-resolve after 3 failed dials, only while no socket is live.
+
+**E-5, implemented (the "Open for XH4b" paragraph above):**
+
+| outcome | event |
+|---|---|
+| a status per item, each one its item's kind can have | `resting`/`filled`/`success` → ACK; `error` → REJECTED with the venue's reason |
+| `status: err` (the exchange refused the action) | REJECTED, every item — unless the post is a re-send |
+| deadline passed (5 s); an answer that does not scan, miscounts its items or answers an item with a status its kind cannot have; a post stranded on a socket that died or was retired | UNANSWERED |
+| a WebSocket `"type":"error"` answer (the venue's API layer, not the exchange) | UNANSWERED, the message's reason carried |
+| REST: 2xx → as above; 429 on a first send → REJECTED (rate limit); any other status, or a 429 on a re-send → UNANSWERED; a failure before the request left the host → REJECTED (transport), unless a re-send | |
+| a WebSocket write that died → the SAME signed bytes re-sent by REST (the mask XORs back, never re-signed); **only a per-item answer settles a re-send — any refusal of it is UNANSWERED** | |
+
+**Rules it fixes (XH4b):**
+- XG-2: the gateway stops popping commands while 97 posts are in flight
+  or the event ring lacks room for every in-flight item's answer, one
+  batch per class and 512 for the streams; an emit into a full ring waits
+  ≤ 50 ms for the engine before the kit counts the drop and halts.
+- XG-3: a post's deadline is armed before its write; a growing post that
+  cannot be timed is refused unsent and halts the arm (`HALT_TIMER_FULL`);
+  a cancel goes anyway (counted).
+- The halt word gets its first reader (the gateway); the engine reads it
+  from XH4f.
+- **The engine-written cancel-all word moves to XH4d, with the sweep:** a
+  cancel-all needs the venue's open-order list and the gateway keeps no
+  order state. Until then a halted arm's cancels need command-ring room
+  and wait behind the in-flight and event-room limits.
+- The REST fallback blocks the gateway thread up to its 5 s deadline
+  (never the engine thread).
+
+**Obligations handed on:** XH4d — XH-7's counter counts reply items only
+(a post-only cross also arrives as a `badAloPxRejected` row); cancel slot-6
+orders before quoting; halt if `EV_SNAPSHOT` never arrives; a fill with
+`venue_ms` at or before the boot `clearinghouseState` read is already in
+it; `SLOT_FOREIGN` fills go to the tape only (never broadcast to every
+member); the sticky intent above. XH4f — the TTL cancel; shutdown order
+(drain the ring, cancel, mark in-flight posts unanswered, join); **on
+testnet slot 6 shares the agent key with slots 0/3 (Anton's ruling), so
+the two arms must draw nonces from ONE stream** (two millisecond streams
+on one signer collide); the 100-in-flight WebSocket bound is per IP and
+shared once more arms run gateways. For Anton: whether known
+pre-execution wordings of a WebSocket `"type":"error"` answer may be
+REJECTED instead of UNANSWERED — to be decided on what XH4g's testnet
+battery shows.
+
+**Tests:** unit tests per module (the E-5 table above row by row, the
+first-snapshot and gap rules, layouts, the reason map); the loopback
+(`tests/hl_gateway_loopback.rs`, 10 scripts against `testvenue`, the
+test-only scripted rustls Hyperliquid): coalescing and item mapping, both
+streams and their dedupe, the snapshot gate and admission refusals, the
+39 split and class separation, cancel ordering, silence → UNANSWERED, a
+dropped socket → stranded UNANSWERED + redial + gap, the REST fallback
+(the envelope alone), make-before-break with an answer landing on the
+draining socket, the halt, malformed / miscounted / API-error / refused
+answers.
+
+**Gates (XH4b, 2026-09-26):** alloc 89/89 in release — gate 84a (the
+engine half: 10 000 command/event round trips, 0 B/op) and gate 84b (the
+whole gateway turn over a real rustls loopback, the venue in a child
+process: two ALO places, a modify and a cancel a round → three posts,
+their answers, an `orderUpdates` row and a `userFills` row — exactly 8
+allocations a round, rustls' record buffers (3 sealed, 5 opened), so 0 B
+of the gateway's own); clippy `-D warnings` clean; nextest 3492/3492;
+copy-audit hits 31 = baseline, new 0; license-check OK; the existing
+members' replays (bin15, vrp, xsd, hyparb, icdp, vm, xmm) byte-identical
+against main's binary. Reviews: zero-copy and alloc APPROVE WITH NITS,
+risk REJECT (r1: a refused REST re-send read as REJECTED; the first
+snapshot could absorb our own fills; a silent socket kept taking posts
+for 45 s) → fixed (r2) → all three APPROVE WITH NITS → nits applied (r3).

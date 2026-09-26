@@ -10670,3 +10670,291 @@ fn exec_gateway_kit_is_zero_alloc() {
         "the gateway kit bytes should be zero: saw {bytes}"
     );
 }
+
+/// **XMM gate 84a (XH4b) — the HL gateway's ENGINE half is 0 B/op.**
+/// XG-1: an arm's submit is one `HlCmd` ring write and its answers are
+/// `ExecEvent` ring reads — no syscall, no allocation, never blocking.
+/// 10 000 round trips through the production duplex (`hl_duplex`, the
+/// 1 024 / 4 096 rings), each command read in place on the gateway side
+/// and each event read in place on the engine side.
+#[test]
+fn hl_gateway_engine_half_is_zero_alloc() {
+    use exec_hyperliquid::event::{ExecEvent, EV_ACK};
+    use exec_hyperliquid::{hl_duplex, HlCmd, Tif};
+
+    let (mut eng, mut gw) = hl_duplex();
+    let cmd = HlCmd::place(6, 1, 1, true, 250_000_000_000, 10_000_000, Tif::Alo);
+    let ev = ExecEvent {
+        kind: EV_ACK,
+        ..ExecEvent::default()
+    };
+    let mut acc = 0u64;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 10_000 {
+        assert!(eng.cmd.push(&cmd.at(i)));
+        match gw.cmd.pop() {
+            Some(c) => acc ^= c.ts_ns,
+            None => panic!("gate 84a: the command did not arrive"),
+        }
+        assert!(gw.evt.emit(&ExecEvent { aux: i, ..ev }));
+        match eng.evt.pop() {
+            Some(e) => acc ^= e.aux,
+            None => panic!("gate 84a: the event did not arrive"),
+        }
+        i += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "the HL gateway's engine half allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// Gate 84b's venue half: runs ONLY in the child process gate 84b spawns
+/// (it is `#[ignore]`d, and a no-op without `GATE84_VENUE_DIR`). A
+/// scripted Hyperliquid (`exec_hyperliquid::testvenue`, which sends the
+/// empty `userFills` snapshot on subscribe) that answers the ALO post
+/// with one resting status and one post-only cross, then pushes one
+/// `orderUpdates` row and one `userFills` row carrying our cloids — each
+/// its own TLS record — and answers the modify with a resting status and
+/// the cancel with `success`; it writes its port and certificate for the
+/// parent.
+#[test]
+#[ignore = "gate 84b's child process; never run on its own"]
+fn gate84_venue_helper() {
+    use exec_hyperliquid::cloid::{encode, to_hex};
+    use exec_hyperliquid::testvenue::{Answer, Venue};
+    let Some(dir) = std::env::var_os("GATE84_VENUE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let v = Venue::start();
+    let push = v.pusher();
+    let mut k = 0u64;
+    v.policy(move |s| {
+        k += 1;
+        if s.body.contains("cancelByCloid") {
+            return Answer::Action(
+                r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#
+                    .to_string(),
+            );
+        }
+        if s.body.contains("batchModify") {
+            return Answer::Action(format!(
+                r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":{k}}}}}]}}}}}}"#
+            ));
+        }
+        let mut hex = [0u8; 34];
+        to_hex(&encode(6, k), &mut hex);
+        let c = String::from_utf8_lossy(&hex).to_string();
+        push.push_all(&format!(
+            r#"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"ETH","side":"B","limitPx":"2500","sz":"0.01","oid":{k},"timestamp":1,"origSz":"0.01","cloid":"{c}"}},"status":"open","statusTimestamp":{k}}}]}}"#
+        ));
+        push.push_all(&format!(
+            r#"{{"channel":"userFills","data":{{"user":"0x","fills":[{{"coin":"ETH","px":"2500","sz":"0.01","side":"B","time":1700000000000,"dir":"Open Long","oid":{k},"crossed":false,"fee":"-0.0001","tid":{k},"cloid":"{c}"}}]}}}}"#
+        ));
+        Answer::Action(format!(
+            r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":{k}}}}},{{"error":"Post only order would have immediately matched, bbo was 1@2. asset=1"}}]}}}}}}"#
+        ))
+    });
+    std::fs::write(dir.join("cert.der"), &v.cert_der).expect("gate 84 cert");
+    // The port last: its presence says the rest is written.
+    std::fs::write(dir.join("port.tmp"), v.port.to_string()).expect("gate 84 port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 84 port");
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+
+/// **XMM gate 84b (XH4b) — the HL gateway's whole turn, over a real
+/// rustls loopback, allocates only rustls' record buffers.**
+///
+/// The REAL gateway (`HlGateway::turn`) against a scripted venue in a
+/// CHILD process (the counting allocator is process-global — gate 72's
+/// harness). Every round pushes two ALO places, an ALO modify and a
+/// cancel, which the gateway coalesces into THREE posts (the ALO batch,
+/// the batchModify, the cancelByCloid) — each encoded, signed, rendered
+/// and framed in place; the venue answers them (one item resting, one a
+/// post-only cross; the modify resting; the cancel `success`) and pushes
+/// an `orderUpdates` row and a `userFills` row carrying our cloids; the
+/// gateway maps every status onto its item, decodes the cloids, scans
+/// both streams, dedupes and emits — 3 ACKs, a BAD_ALO_PX rejection,
+/// RESTING, FILL and FILL_META. Pinned like gate 72: rustls 0.23's
+/// buffered API allocates one `Vec` per record it seals (the three posts)
+/// and one per application-data record it opens (three answers, two
+/// pushes) — exactly 8 per round while every inbound burst stays under
+/// rustls' 4 KiB receive window (a larger burst grows and shrinks that
+/// window: more). rustls' decrypted-record queue grows ONCE per
+/// connection, the first time five records wait in it together: the
+/// warm-up forces that (a round whose answers are all in before the
+/// gateway reads), so it never lands in the window by chance. Everything
+/// else in the round — admission, pending, deadlines,
+/// coalescing, msgpack, the signature, the JSON, the frame, the scans,
+/// the dedupe rings, the events — is 0 B: a regression in the gateway
+/// shows as a ninth. The residue goes with the rustls record-layer pass
+/// (TL4/TL5b).
+#[test]
+fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
+    use exec_gateway::Idle;
+    use exec_hyperliquid::event::{
+        ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_REJECTED, EV_RESTING, EV_SNAPSHOT,
+    };
+    use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
+    use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
+
+    const ROUNDS: u64 = 300;
+    const POSTS_PER_ROUND: u64 = 3;
+    const EVENTS_PER_ROUND: u64 = 7;
+    const RUSTLS_ALLOCS_PER_ROUND: u64 = 8;
+    let dir = std::env::temp_dir().join(format!("mv-gate84-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 84 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 84 exe"))
+        .args([
+            "gate84_venue_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE84_VENUE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 84 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 84 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 84: the venue never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 84 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 84 anchor");
+    let tls = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let (mut eng, gw_end) = hl_duplex();
+    let mut coins = CoinMap::new();
+    assert!(coins.insert(b"ETH", 1));
+    let cfg = GatewayCfg {
+        host: "localhost".to_string(),
+        port,
+        tls,
+        network: Network::Testnet,
+        master: [0xA5; 20],
+        slots: 1 << 6,
+        post_timeout_ns: 5_000_000_000,
+        idle: Idle::new(0, 200_000),
+    };
+    let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("gate 84 key");
+    let mut gw = HlGateway::new(cfg, gw_end, sk, coins).expect("gate 84 gateway");
+    let mut kinds = [0u64; 16];
+    let t0 = std::time::Instant::now();
+    while !gw.ws_live() || kinds[usize::from(EV_SNAPSHOT)] == 0 {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "gate 84: the socket never came up with its snapshot"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            kinds[usize::from(e.kind & 15)] += 1;
+        }
+    }
+
+    // One round: two ALO places, a modify and a cancel of orders from no
+    // open batch — three posts; their answers and the two pushes back.
+    let mut oid = 0u64;
+    let mut round = |gw: &mut HlGateway,
+                     eng: &mut HlEngineEnd,
+                     kinds: &mut [u64; 16],
+                     stall: bool| {
+        oid += 3;
+        let sent = eng.stats.io()[0];
+        let cmds = [
+            HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo),
+            HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo),
+            HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
+                .replacing(oid + 1_000_000),
+            HlCmd::cancel(6, oid + 2_000_000, 1),
+        ];
+        let mut j = 0usize;
+        while j < cmds.len() {
+            assert!(eng.cmd.push(&cmds[j]));
+            j += 1;
+        }
+        let mut got = 0u64;
+        let t = std::time::Instant::now();
+        if stall {
+            // Write the three posts, then let every answer and push
+            // arrive before the next read: rustls decrypts all five
+            // records at once and its record queue reaches its
+            // high-water mark here, in the warm-up.
+            while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "gate 84: posts not written");
+                gw.turn();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        while got < EVENTS_PER_ROUND {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(5),
+                "gate 84: a round stalled at {got}/{EVENTS_PER_ROUND} events"
+            );
+            gw.turn();
+            while let Some(e) = eng.evt.pop() {
+                let ev: &ExecEvent = &e;
+                kinds[usize::from(ev.kind & 15)] += 1;
+                got += 1;
+            }
+        }
+    };
+    let mut w = 0;
+    while w < 50 {
+        // The handshake's tail, session tickets and rustls' queues growing
+        // to their working size: the cold part (the first round stalls).
+        round(&mut gw, &mut eng, &mut kinds, w == 0);
+        w += 1;
+    }
+    let warm = kinds;
+    let g = AllocGuard::new();
+    let mut r = 0u64;
+    while r < ROUNDS {
+        round(&mut gw, &mut eng, &mut kinds, false);
+        r += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    let n = |k: u8| kinds[usize::from(k)] - warm[usize::from(k)];
+    assert_eq!(n(EV_ACK), ROUNDS * 3, "the resting place, the modify and the cancel");
+    assert_eq!(n(EV_REJECTED), ROUNDS, "the post-only cross, item by item");
+    assert_eq!(n(EV_RESTING), ROUNDS, "every orderUpdates row routed");
+    assert_eq!(
+        (n(EV_FILL), n(EV_FILL_META)),
+        (ROUNDS, ROUNDS),
+        "every fill routed with its fee"
+    );
+    assert_eq!(
+        eng.stats.io()[0],
+        POSTS_PER_ROUND * (50 + ROUNDS),
+        "three posts a round, no REST, no retry"
+    );
+    assert_eq!(gw.swaps(), 0, "one connection throughout");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_ROUND * ROUNDS,
+        "HL gateway round: {allocs} allocations ({bytes} B) over {ROUNDS} rounds — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_ROUND}/round (three sealed \
+         records out, five opened in); anything above is the gateway's"
+    );
+}

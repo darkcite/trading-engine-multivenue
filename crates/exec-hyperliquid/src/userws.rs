@@ -103,6 +103,10 @@ pub struct UserFill {
     /// so that a settlement is never merely *inferred* from a price of
     /// 1.0, which a genuine trade can also print.
     pub is_settlement: bool,
+    /// The fill took liquidity — the venue's `crossed`. `false` when the
+    /// row does not say. The fee is the venue's own `fee`, never
+    /// inferred from this flag (XH4b: the gateway carries both).
+    pub crossed: bool,
 }
 
 impl UserFill {
@@ -405,6 +409,7 @@ pub fn scan_user_fills(
         // a refusal — only the settlement case is load-bearing here.
         let is_settlement = string_field(obj, b"\"dir\"")
             .is_some_and(|d| d.of(obj) == b"Settlement");
+        let crossed = bool_field(obj, b"\"crossed\"").unwrap_or(false);
 
         if n >= out.len() {
             return Err(ScanErr::Malformed);
@@ -423,6 +428,7 @@ pub fn scan_user_fills(
             time_ms,
             is_buy,
             is_settlement,
+            crossed,
         };
         n += 1;
         i = end;

@@ -56,7 +56,7 @@ strategy-cross-arb   = { workspace = true }
 # E1 gate 53: the execution router's hot path.
 exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
-exec-hyperliquid     = { workspace = true }
+exec-hyperliquid     = { workspace = true, features = ["testvenue"] }
 signer-eip712        = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }

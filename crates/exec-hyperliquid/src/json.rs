@@ -125,6 +125,15 @@ pub(crate) fn bool_field(b: &[u8], key: &[u8]) -> Option<bool> {
     }
 }
 
+/// `"key":{…}` → the object's `(start, end)`, `end` just past its brace.
+pub(crate) fn object_field(b: &[u8], key: &[u8]) -> Option<(usize, usize)> {
+    let i = value_start(b, key)?;
+    if i >= b.len() || b[i] != b'{' {
+        return None;
+    }
+    Some((i, object_end(b, i)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

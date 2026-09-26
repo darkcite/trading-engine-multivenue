@@ -99,23 +99,31 @@ pub mod anchor;
 pub mod asset;
 pub mod budget;
 pub mod cloid;
+pub mod cmd;
 pub mod config;
 pub mod dayspend;
+pub mod event;
 pub mod exchange;
+pub mod gateway;
+mod gwconn;
 pub mod http;
 mod json;
 pub mod lifecycle;
 pub mod msgpack;
 pub mod nonce;
+pub mod orderupd;
 pub mod recon;
 pub mod request;
 pub mod response;
 pub mod selftest;
 pub mod sign;
 pub mod smoke;
+#[cfg(feature = "testvenue")]
+pub mod testvenue;
 pub mod userws;
 pub mod userws_conn;
 pub mod wire;
+pub mod wspost;
 
 pub use action::{
     encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order, CancelByCloidWire,
@@ -148,3 +156,6 @@ pub use smoke::{
 pub use userws_conn::{UserWs, WsErr, MAX_WS_BUF};
 pub use userws::{owner_of, scan_user_fills, to_fill, ConvertErr, TidRing, UserFill};
 pub use wire::{WireNum, WIRE_SCALE};
+pub use cmd::HlCmd;
+pub use event::ExecEvent;
+pub use gateway::{hl_duplex, CoinMap, GatewayCfg, HlGateway};

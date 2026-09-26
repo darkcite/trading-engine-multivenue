@@ -30,18 +30,20 @@
 use crate::msgpack::{MsgPackErr, Writer};
 use crate::wire::WireNum;
 
-/// Largest action this crate will encode. A batch of
-/// [`MAX_ORDERS`] wires with cloids is far below this.
-pub const MAX_ACTION: usize = 4096;
+/// Largest action this crate will encode. A batch of [`MAX_ORDERS`]
+/// modifies, each naming its resting cloid and carrying a new one
+/// (~150 B of msgpack apiece), is ≈ 5.9 KiB.
+pub const MAX_ACTION: usize = 8192;
 
-/// Most orders in one batched action. The venue counts a batch of `n`
-/// as ONE IP request but `n` ADDRESS requests (§2.2), so batching
-/// helps the IP limit and not the address budget — there is no reason
-/// to make this large. ENFORCED by every batch encoder (`Overflow`
-/// past it); the first cut declared it and read it nowhere, so the
-/// only bound on a batch was the 4 KiB buffer while the budget
-/// governor charged one request per POST.
-pub const MAX_ORDERS: usize = 16;
+/// Most orders in one batched action: 39 (Anton's ruling, XH4 plan
+/// §4.2). The venue weighs an action `1 + ⌊n / 40⌋` IP requests and
+/// counts `n` ADDRESS requests (§2.2), so 39 is the largest batch that
+/// still costs ONE IP request — the XH4b gateway's coalescer splits
+/// there; the address budget is unchanged by batching. ENFORCED by
+/// every batch encoder (`Overflow` past it); the first cut declared it
+/// and read it nowhere, so the only bound on a batch was the buffer
+/// while the budget governor charged one request per POST.
+pub const MAX_ORDERS: usize = 39;
 
 /// Time-in-force. The mapping to `Order.kind` is fixed and exhaustive:
 /// IoC for takes and coverage entries, Alo for maker quotes.
