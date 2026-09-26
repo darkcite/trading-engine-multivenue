@@ -43,7 +43,9 @@
 //!
 //! Everything here is fixed-capacity, `#[repr(C)]`, allocation-free
 //! and integer-only; `match_spec` and the rebind run on the ingress
-//! thread inside the `outcomeMetaUpdates` arm.
+//! thread — inside the `outcomeMetaUpdates` arm, or between sessions
+//! when a reconnect retires a dead instance and re-discovers its
+//! successor ([`HlFamilyTable::retire`], [`HlFamilyTable::best_live_spec`]).
 
 use core_types::{make_symbol_id, SymbolId, VenueId};
 
@@ -128,8 +130,19 @@ pub struct HlFamily {
     /// No live instance: the slots are reserved but bound to nothing
     /// and nothing is subscribed for them.
     pub dormant: bool,
+    /// The bound instance SETTLED — an `outcomeSettled` push named it.
+    /// Its coins stay bound and subscribed on the session that saw the
+    /// push (the venue keeps an existing subscription), but a NEW
+    /// subscribe to a settled coin makes the venue drop the whole
+    /// socket, so the next reconnect retires the family first
+    /// ([`Self::instance_dead`], [`HlFamilyTable::retire`]).
+    pub settled: bool,
+    /// Retired at a reconnect and waiting for its successor: the
+    /// reconnect re-discovers it over `/info`, or the venue's next
+    /// `outcomeCreated` push adopts it. Cleared by [`HlFamilyTable::bind`].
+    pub awaiting: bool,
     /// Explicit tail padding.
-    _pad: [u8; 7],
+    _pad: [u8; 5],
 }
 
 const _: () = assert!(::core::mem::size_of::<HlFamily>() == 112);
@@ -201,6 +214,18 @@ impl HlFamily {
         debug_assert!(n <= HL_OUTCOME_UNDERLYING_MAX);
         &self.underlying[..n.min(HL_OUTCOME_UNDERLYING_MAX)]
     }
+
+    /// Whether the bound instance must never be subscribed again: it
+    /// settled, or its expiry (a WALL instant) is at or before
+    /// `wall_now_ns`. The venue answers a subscribe to such a coin by
+    /// dropping the whole socket — no error frame, no close frame
+    /// (probed 2026-09-26) — so a reconnect that re-subscribed one would
+    /// die within a second, forever. `false` for a dormant family.
+    #[inline]
+    #[must_use]
+    pub fn instance_dead(&self, wall_now_ns: u64) -> bool {
+        self.live.outcome != 0 && (self.settled || self.live.expiry_ns <= wall_now_ns)
+    }
 }
 
 /// Fixed-capacity table of rolling families. Built at boot from the
@@ -223,7 +248,9 @@ const EMPTY_FAMILY: HlFamily = HlFamily {
     underlying: [0; HL_OUTCOME_UNDERLYING_MAX],
     pending_ack: 0,
     dormant: true,
-    _pad: [0; 7],
+    settled: false,
+    awaiting: false,
+    _pad: [0; 5],
 };
 
 impl HlFamilyTable {
@@ -344,10 +371,10 @@ impl HlFamilyTable {
         None
     }
 
-    /// Boot binding: for each family, adopt the LATEST-expiring spec
-    /// discovery found that the family matches, and write its two
-    /// coins into the reserved rows so the first `Steady` subscribes
-    /// them like any coin.
+    /// Boot binding: for each family, adopt the instance trading now —
+    /// [`Self::best_live_spec`], the EARLIEST-expiring spec discovery
+    /// found that the family matches — and write its two coins into the
+    /// reserved rows so the first `Steady` subscribes them like any coin.
     ///
     /// Returns the number of families bound. A family with no match
     /// stays dormant — the next `outcomeCreated` push adopts it.
@@ -360,25 +387,7 @@ impl HlFamilyTable {
         let mut bound = 0usize;
         let mut i = 0usize;
         while i < self.len {
-            let mut best: Option<HlOutcomeSpec> = None;
-            let mut j = 0usize;
-            while j < specs.len() {
-                let s = specs[j];
-                if self.match_spec(&s, now_ns) == Some(i) {
-                    let take = match best {
-                        // The venue can list the current instance and
-                        // its successor; the family wants the one
-                        // trading now, i.e. the EARLIEST still ahead.
-                        Some(b) => s.expiry_ns < b.expiry_ns,
-                        None => true,
-                    };
-                    if take {
-                        best = Some(s);
-                    }
-                }
-                j += 1;
-            }
-            if let Some(spec) = best {
+            if let Some(spec) = self.best_live_spec(i, specs, now_ns) {
                 if self.bind(i, &spec, coins).is_ok() {
                     bound += 1;
                 }
@@ -386,6 +395,89 @@ impl HlFamilyTable {
             i += 1;
         }
         bound
+    }
+
+    /// The instance family `idx` should hold at WALL instant `now_ns`
+    /// out of a discovery body's `specs`: the EARLIEST-expiring spec
+    /// the family matches ([`Self::match_spec`]). The venue can list
+    /// the current instance and its successor; the family wants the
+    /// one trading now. Shared by the boot binding
+    /// ([`Self::bind_live`]) and the reconnect re-discovery.
+    #[must_use]
+    pub fn best_live_spec(
+        &self,
+        idx: usize,
+        specs: &[HlOutcomeSpec],
+        now_ns: u64,
+    ) -> Option<HlOutcomeSpec> {
+        let mut best: Option<HlOutcomeSpec> = None;
+        let mut j = 0usize;
+        while j < specs.len() {
+            let s = specs[j];
+            if self.match_spec(&s, now_ns) == Some(idx) {
+                let take = match best {
+                    Some(b) => s.expiry_ns < b.expiry_ns,
+                    None => true,
+                };
+                if take {
+                    best = Some(s);
+                }
+            }
+            j += 1;
+        }
+        best
+    }
+
+    /// Retire family `idx`'s bound instance: both reserved rows go
+    /// EMPTY again — off the wire and out of the ack mask, exactly like
+    /// a family that booted dormant — and the family is marked
+    /// `awaiting` its successor.
+    ///
+    /// For a RECONNECT only (between sessions, before the subscribe
+    /// sweep): the venue drops the whole socket on a subscribe to a
+    /// settled or expired coin, and `outcomeMetaUpdates` never replays
+    /// the `outcomeCreated` a dead session missed, so re-subscribing the
+    /// old binding looped a reconnect every ~1.2 s until the process
+    /// restarted (2026-09-25/26). Does NOT touch the wire.
+    pub fn retire(
+        &mut self,
+        idx: usize,
+        coins: &mut HlCoinTable,
+    ) -> Result<(), crate::CoinTableErr> {
+        debug_assert!(idx < self.len);
+        if idx >= self.len {
+            return Err(crate::CoinTableErr::NoSuchRow);
+        }
+        let (yes_idx, no_idx) = {
+            let f = &self.rows[idx];
+            (f.coin_idx[0] as usize, f.coin_idx[1] as usize)
+        };
+        coins.unbind(yes_idx)?;
+        coins.unbind(no_idx)?;
+        let f = &mut self.rows[idx];
+        f.live = HlOutcomeSpec::empty(0);
+        f.dormant = true;
+        f.settled = false;
+        f.awaiting = true;
+        f.pending_ack = 0;
+        f.ack_deadline_ns = 0;
+        Ok(())
+    }
+
+    /// Families retired at a reconnect and still waiting for a
+    /// successor ([`HlFamily::awaiting`]).
+    #[inline]
+    #[must_use]
+    pub fn awaiting_count(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < self.len {
+            if self.rows[i].awaiting {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
     }
 
     /// Bind `spec`'s two coins into family `idx`'s reserved rows and
@@ -410,6 +502,8 @@ impl HlFamilyTable {
         let f = &mut self.rows[idx];
         f.live = *spec;
         f.dormant = false;
+        f.settled = false;
+        f.awaiting = false;
         Ok(())
     }
 
@@ -772,6 +866,63 @@ mod tests {
         assert_eq!(all.count_ones(), 6);
         // A channel a rolling slot never subscribes has no bit.
         assert_eq!(roll_ack_bit(0, HlChannel::ActiveAssetCtx), 0);
+    }
+
+    /// 2026-09-26 reconnect loop: a dead instance (settled, or past its
+    /// expiry) is recognised; `retire` takes it off the wire exactly
+    /// like a boot-dormant family and marks it awaiting; `bind` clears
+    /// both flags.
+    #[test]
+    fn a_dead_instance_is_retired_off_the_wire_and_bind_revives_the_family() {
+        let mut t = table_with(&[b"out:BTC:15m"]);
+        let mut coins = HlCoinTable::new();
+        coins.reserve(rolling_sym(0, 0)).unwrap();
+        coins.reserve(rolling_sym(0, 1)).unwrap();
+        let spec = parse_outcome_spec(2649, DESC_2649);
+        t.bind(0, &spec, &mut coins).unwrap();
+        assert_eq!(coins.lookup(b"#26490"), Some(rolling_sym(0, 0)));
+
+        // Alive one minute before expiry; dead at and after it; dead
+        // whenever settled; never "dead" while dormant.
+        let row = *t.get(0).unwrap();
+        assert!(!row.instance_dead(NOW_NS));
+        assert!(row.instance_dead(spec.expiry_ns));
+        assert!(row.instance_dead(spec.expiry_ns + 1));
+        t.get_mut(0).unwrap().settled = true;
+        assert!(t.get(0).unwrap().instance_dead(NOW_NS));
+
+        t.retire(0, &mut coins).unwrap();
+        let row = *t.get(0).unwrap();
+        assert!(row.dormant && row.awaiting && !row.settled);
+        assert_eq!(row.live.outcome, 0);
+        assert!(
+            !row.instance_dead(u64::MAX),
+            "a retired family names nothing"
+        );
+        assert_eq!(t.awaiting_count(), 1);
+        // Both rows are EMPTY again: never looked up, never subscribed,
+        // never waited on — but the slots keep their syms.
+        assert_eq!(coins.lookup(b"#26490"), None);
+        assert_eq!(coins.lookup(b"#26491"), None);
+        assert!(!coins.is_named(0) && !coins.is_named(1));
+        assert_eq!(coins.get(0), Some((&b""[..], rolling_sym(0, 0))));
+        assert_eq!(crate::expected_mask(&coins).0, 0);
+
+        // The successor binds like any roll and clears the flags.
+        let next = parse_outcome_spec(
+            2650,
+            b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645",
+        );
+        assert_eq!(
+            t.best_live_spec(0, &[spec, next], spec.expiry_ns),
+            Some(next)
+        );
+        t.bind(0, &next, &mut coins).unwrap();
+        let row = *t.get(0).unwrap();
+        assert!(!row.dormant && !row.awaiting && !row.settled);
+        assert_eq!(t.awaiting_count(), 0);
+        assert_eq!(coins.lookup(b"#26500"), Some(rolling_sym(0, 0)));
+        assert_eq!(coins.lookup(b"#26501"), Some(rolling_sym(0, 1)));
     }
 }
 

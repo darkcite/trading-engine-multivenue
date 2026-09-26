@@ -42,6 +42,30 @@
 //! completes — detected (buffer full + frame incomplete) and failed
 //! rather than livelocked (fail-fast doctrine).
 //!
+//! ## Reconnect hygiene — dead HIP-4 instances (2026-09-26)
+//!
+//! The venue answers a subscribe to a SETTLED or unknown coin by
+//! dropping the whole socket: a bare FIN, no `error` frame, no Close
+//! (probed from the engine host). A reconnect that re-subscribed a
+//! family's settled instance therefore died within a second, before
+//! `outcomeMetaUpdates` (subscribed last) could deliver the successor
+//! — and that channel replays nothing on subscribe, so a missed
+//! `outcomeCreated` never comes back — and the lane reconnected every
+//! ~1.2 s until the process restarted. Three rules close it:
+//!
+//! 1. [`Driver::reset_for_reconnect`] retires every family whose
+//!    instance settled or passed its expiry before the sweep can name
+//!    it; the caller re-discovers successors over `/info`
+//!    ([`Driver::rebind_dormant`]).
+//! 2. [`session_health`] stops judging an instance's rows at its
+//!    expiry, not only at `outcomeSettled` — the expiry + 10 s
+//!    staleness trip was what started the loop.
+//! 3. Every error and every peer-initiated end names itself on the
+//!    status slot — the T1(a) triple, now with `peer-eof` /
+//!    `peer-close` + code — so the caller's `run-loop returned` line
+//!    says what `res=Disconnected` never did (`IdleTimeout`, `Stale`
+//!    and `Stopped` are named by `res` itself).
+//!
 //! Everything after the handshake is zero-alloc: parsers slice the
 //! rx buffer in place; subscribe frames are masked into tx from their
 //! wire parts, pings from their literal; the only copy is the 64-byte
@@ -197,6 +221,9 @@ pub enum RunResult {
     Error,
 }
 
+/// RFC 6455 §7.4.1 status 1005: a Close frame that carried no code.
+const WS_CLOSE_NO_STATUS: u16 = 1005;
+
 // ---------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------
@@ -253,6 +280,11 @@ pub struct Driver {
     /// BIN15 O2 / E7 R0: the boot-bound families have been announced
     /// (see [`emit_boot_rolls`]). Once per process, never on reconnect.
     boot_rolls_emitted: bool,
+    /// MONOTONIC instant of the next bound family instance's expiry —
+    /// the one compare [`session_health`] makes per iteration before
+    /// `unwatch_expired` sweeps; `u64::MAX` when none is ahead, 0 to
+    /// force a sweep (set on every change of the bindings).
+    next_expiry_ns: u64,
     /// BIN15 O2: the spec of the roll phase 1 decided on, read by phase
     /// 2 when the dispatch is `Roll` — parked here because inside the
     /// dispatch value it would widen it past the 64 B bound.
@@ -317,6 +349,7 @@ impl Driver {
             sub_ack_budget_ns,
             steady_since_ns: 0,
             boot_rolls_emitted: false,
+            next_expiry_ns: 0,
             roll_spec: HlOutcomeSpec::empty(0),
             depth: vec![DepthPair::new(DepthTopK::new(0, VenueId::Hyperliquid, 0, 0, [DepthLevel::EMPTY; DEPTH_K], [DepthLevel::EMPTY; DEPTH_K])); HL_MAX_COINS]
                 .into_boxed_slice(),
@@ -392,7 +425,12 @@ impl Driver {
 
     /// Reset per-connection state for a reconnect. Subscriptions,
     /// ack masks and the staleness monitor are connection-scoped.
-    pub fn reset_for_reconnect(&mut self, nonce_seed: u64) {
+    ///
+    /// Also retires every family bound to a dead instance (settled, or
+    /// past its expiry) before the next subscribe sweep can name it,
+    /// and returns how many — the caller logs them and re-discovers
+    /// their successors ([`Self::rebind_dormant`]).
+    pub fn reset_for_reconnect(&mut self, nonce_seed: u64) -> usize {
         self.state = State::Connecting;
         self.rx.clear();
         self.tx.clear();
@@ -408,7 +446,8 @@ impl Driver {
         // BIN15 O2: a reconnect re-subscribes the table's CURRENT
         // bindings like any coin (§4.3 rule 4), so the families and
         // their live instances survive — only the in-flight ack
-        // bookkeeping is connection-scoped.
+        // bookkeeping is connection-scoped. A DEAD instance does not
+        // survive: `retire_dead_families` below takes it off the table.
         let mut f = 0usize;
         while f < self.families.len() {
             if let Some(row) = self.families.get_mut(f) {
@@ -423,6 +462,128 @@ impl Driver {
         self.verified = false;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+        self.retire_dead_families(self.wall.wall_of(now_ns()))
+    }
+
+    /// Retire every family whose bound instance is dead — settled, or
+    /// past its expiry at WALL instant `wall_now_ns`
+    /// ([`HlFamily::instance_dead`](crate::family::HlFamily::instance_dead)):
+    /// its rows go EMPTY, so the next subscribe sweep and ack mask skip
+    /// it, and it waits for a successor. Returns how many.
+    ///
+    /// Why, and why only between sessions: the venue drops the socket on
+    /// a subscribe to a settled or expired coin (a bare FIN, probed
+    /// 2026-09-26), and `outcomeMetaUpdates` replays nothing on
+    /// subscribe, so an `outcomeCreated` a dead session missed never
+    /// comes back. A reconnect that re-subscribed the old binding
+    /// therefore died within a second, every second, until the process
+    /// restarted — 15 190 reconnects on 2026-09-26 alone. On a LIVE
+    /// session the dead coins stay bound and subscribed (the venue keeps
+    /// an existing subscription) until `perform_roll` adopts the
+    /// successor.
+    fn retire_dead_families(&mut self, wall_now_ns: u64) -> usize {
+        debug_assert!(
+            self.state == State::Connecting && !self.subscribed,
+            "families are retired between sessions only"
+        );
+        let mut retired = 0usize;
+        let mut f = 0usize;
+        while f < self.families.len() {
+            let dead = match self.families.get(f) {
+                Some(row) => row.instance_dead(wall_now_ns),
+                None => false,
+            };
+            if dead {
+                // `retire` refuses only a row index the table never
+                // handed out — a programming error, never venue input.
+                let ok = self.families.retire(f, &mut self.coins).is_ok();
+                debug_assert!(ok, "hl retire: family {f} names a missing coin row");
+                retired += usize::from(ok);
+            }
+            f += 1;
+        }
+        if retired > 0 {
+            self.roll_status
+                .set_dormant(self.families.dormant_count() as u64);
+        }
+        retired
+    }
+
+    /// Bind every family that names no instance — retired at a
+    /// reconnect, or dormant since boot — to the instance trading now
+    /// out of a fresh `/info {"type":"outcomeMeta"}` body's `specs`
+    /// ([`HlFamilyTable::best_live_spec`], the boot's own rule), judged
+    /// on the driver's own WALL anchor. Returns how many were bound.
+    ///
+    /// Between sessions only: it writes the coin table and never the
+    /// wire — the next subscribe sweep subscribes the new coins like any
+    /// bound row. Each adoption is announced exactly as `perform_roll`
+    /// announces one (a created `InstrumentRoll`), unless the boot
+    /// announcement has not gone out yet, in which case
+    /// `emit_boot_rolls` announces the binding at the first `Steady`.
+    /// A family that still holds an instance is never touched, so no
+    /// binding is ever announced twice.
+    pub fn rebind_dormant<C: Capture>(
+        &mut self,
+        specs: &[HlOutcomeSpec],
+        event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+        event_mask: u16,
+        status: &IngressStatus,
+        capture: &mut C,
+    ) -> usize {
+        debug_assert!(
+            self.state == State::Connecting && !self.subscribed,
+            "families are re-discovered between sessions only"
+        );
+        let now = now_ns();
+        let wall_now = self.wall.wall_of(now);
+        let mut bound = 0usize;
+        let mut f = 0usize;
+        while f < self.families.len() {
+            let (vacant, sym_yes) = match self.families.get(f) {
+                Some(row) => (row.live.outcome == 0, row.sym[0]),
+                None => break,
+            };
+            if vacant {
+                if let Some(spec) = self.families.best_live_spec(f, specs, wall_now) {
+                    if self.families.bind(f, &spec, &mut self.coins).is_ok() {
+                        bound += 1;
+                        self.roll_status.inc_rolls();
+                        if self.boot_rolls_emitted {
+                            emit_roll_event(
+                                now, sym_yes, &spec, f, false, event_tx, event_mask, status,
+                                capture,
+                            );
+                        }
+                    }
+                }
+            }
+            f += 1;
+        }
+        if bound > 0 {
+            self.roll_status
+                .set_dormant(self.families.dormant_count() as u64);
+        }
+        bound
+    }
+
+    /// Families retired at a reconnect and still waiting for a
+    /// successor — the caller re-discovers them while this is non-zero.
+    #[inline]
+    #[must_use]
+    pub fn families_awaiting(&self) -> usize {
+        self.families.awaiting_count()
+    }
+
+    /// `(acknowledged, expected)` subscriptions of the current session —
+    /// how far the subscribe sweep got before a session ended.
+    #[inline]
+    #[must_use]
+    pub fn ack_progress(&self) -> (u32, u32) {
+        (
+            self.found.count_ones() + self.found_global.count_ones(),
+            self.expected.count_ones() + self.expected_global.count_ones(),
+        )
     }
 }
 
@@ -675,23 +836,46 @@ fn emit_boot_rolls<C: Capture>(
             continue;
         }
         let spec = row.live;
-        let ev = ChannelEvent::new(
-            now,
-            VenueId::Hyperliquid,
-            ChannelId::InstrumentRoll,
-            row.sym[0],
-            pack_roll_seq(spec.outcome, spec.twap_s, f, false),
-            0,
-            spec.strike_1e6,
-            spec.expiry_ns as i64,
+        let sym_yes = row.sym[0];
+        emit_roll_event(
+            now, sym_yes, &spec, f, false, event_tx, event_mask, status, capture,
         );
-        capture.event(&ev);
-        if event_mask & core_types::event_lane_bit(ChannelId::InstrumentRoll) != 0
-            && !event_tx.try_push_ref(&ev)
-        {
-            status.inc_event_ring_drops();
-        }
         f += 1;
+    }
+}
+
+/// Announce one roll: the `InstrumentRoll` event keyed on the family's
+/// YES slot — captured first, then onto the event lane when the lane
+/// carries rolls. The one shape shared by [`perform_roll`] step (e),
+/// [`emit_boot_rolls`] and [`Driver::rebind_dormant`], so every offline
+/// reader and the member see the same record however the binding came.
+#[inline]
+fn emit_roll_event<C: Capture>(
+    now: u64,
+    sym_yes: core_types::SymbolId,
+    spec: &HlOutcomeSpec,
+    family_idx: usize,
+    settled: bool,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) {
+    let ev = ChannelEvent::new(
+        now,
+        VenueId::Hyperliquid,
+        ChannelId::InstrumentRoll,
+        sym_yes,
+        pack_roll_seq(spec.outcome, spec.twap_s, family_idx, settled),
+        0,
+        spec.strike_1e6,
+        spec.expiry_ns as i64,
+    );
+    capture.event(&ev);
+    if event_mask & core_types::event_lane_bit(ChannelId::InstrumentRoll) != 0
+        && !event_tx.try_push_ref(&ev)
+    {
+        status.inc_event_ring_drops();
     }
 }
 
@@ -706,10 +890,12 @@ fn emit_boot_rolls<C: Capture>(
 /// roll; and the `InstrumentRoll` event is emitted last, so a capture
 /// consumer never sees a roll recorded for a binding that failed.
 ///
-/// A SETTLED instance keeps its coins bound and subscribed: the book
-/// is simply empty until the next `outcomeCreated` rebinds them, and
-/// unsubscribing first would open a window with no subscription for
-/// no gain.
+/// A SETTLED instance keeps its coins bound and subscribed ON THIS
+/// SESSION: the book is simply empty until the next `outcomeCreated`
+/// rebinds them, and unsubscribing first would open a window with no
+/// subscription for no gain. It is flagged `settled`, though, because
+/// a NEW subscribe to it makes the venue drop the socket — the next
+/// reconnect retires it instead ([`Driver::retire_dead_families`]).
 #[allow(clippy::too_many_arguments)]
 fn perform_roll<C: Capture>(
     drv: &mut Driver,
@@ -780,6 +966,8 @@ fn perform_roll<C: Capture>(
         drv.roll_status.inc_rolls();
         drv.roll_status
             .set_dormant(drv.families.dormant_count() as u64);
+        // The new instance's expiry joins the unwatch schedule.
+        drv.next_expiry_ns = 0;
     } else {
         // BIN15 O7: a settled instance stops publishing while keeping
         // its coins bound, so the staleness monitor must stop judging
@@ -787,25 +975,17 @@ fn perform_roll<C: Capture>(
         // `HlStaleness::unwatch`.
         drv.staleness.unwatch(coin_idx[0]);
         drv.staleness.unwatch(coin_idx[1]);
+        // …and it must never be subscribed again: flag it for the next
+        // reconnect's retire (see the doc above).
+        if let Some(row) = drv.families.get_mut(family_idx) {
+            row.settled = true;
+        }
     }
 
     // (e) The offline record: which instance this slot means from now.
-    let ev = ChannelEvent::new(
-        now,
-        VenueId::Hyperliquid,
-        ChannelId::InstrumentRoll,
-        sym_yes,
-        pack_roll_seq(spec.outcome, spec.twap_s, family_idx, settled),
-        0,
-        spec.strike_1e6,
-        spec.expiry_ns as i64,
+    emit_roll_event(
+        now, sym_yes, spec, family_idx, settled, event_tx, event_mask, status, capture,
     );
-    capture.event(&ev);
-    if event_mask & core_types::event_lane_bit(ChannelId::InstrumentRoll) != 0
-        && !event_tx.try_push_ref(&ev)
-    {
-        status.inc_event_ring_drops();
-    }
     Ok(())
 }
 
@@ -959,13 +1139,28 @@ pub fn session_health(drv: &mut Driver, status: &IngressStatus, now_ns: u64) -> 
         return None;
     }
     if !drv.verified {
-        if drv.found == drv.expected && drv.found_global == drv.expected_global {
+        // Masked, not `==`: a roll that adopts a family retired before
+        // this sweep acks rows the sweep never expected.
+        if drv.found & drv.expected == drv.expected
+            && drv.found_global & drv.expected_global == drv.expected_global
+        {
             drv.verified = true;
             drv.staleness.arm(now_ns, &drv.coins);
+            // `arm` watches every named row — an instance that expired
+            // before this session verified must drop out again.
+            unwatch_expired(drv, now_ns);
         } else if now_ns.saturating_sub(drv.steady_since_ns) > drv.sub_ack_budget_ns {
+            // T1(a): name it — `venue_code` = the count of missing acks.
+            let missing = (drv.expected & !drv.found).count_ones()
+                + (drv.expected_global & !drv.found_global).count_ones();
+            status.note_venue_err_code(missing);
+            status.note_session_err(core_metrics::ERR_SITE_SUBSCRIBE_MISSING, 0);
             return Some(RunResult::Error);
         }
         return None;
+    }
+    if now_ns >= drv.next_expiry_ns {
+        unwatch_expired(drv, now_ns);
     }
     if drv.staleness.first_stale(now_ns).is_some() {
         // §6.2: staleness counts into gaps_total (no dedicated
@@ -974,6 +1169,41 @@ pub fn session_health(drv: &mut Driver, status: &IngressStatus, now_ns: u64) -> 
         return Some(RunResult::Stale);
     }
     None
+}
+
+/// Stop judging the rows of every family instance whose expiry has
+/// passed, and schedule the next sweep at the earliest expiry still
+/// ahead (`Driver::next_expiry_ns`).
+///
+/// An expired instance stops publishing at its expiry second, but its
+/// `outcomeSettled` arrives only after the settlement TWAP. Judged in
+/// between, its silence tripped the WHOLE session at expiry + 10 s
+/// whenever the venue created the successor late — and that
+/// reconnect then re-subscribed the dead coin (2026-09-26, 01:45:11Z).
+/// [`perform_roll`] re-watches the successor's rows when it binds.
+/// Integer compares over at most [`crate::family::HL_MAX_FAMILIES`]
+/// rows, run once per expiry.
+fn unwatch_expired(drv: &mut Driver, now_ns: u64) {
+    let wall_now = drv.wall.wall_of(now_ns);
+    let mut next = u64::MAX;
+    let mut f = 0usize;
+    while f < drv.families.len() {
+        if let Some(row) = drv.families.get(f) {
+            if row.live.outcome != 0 {
+                if row.live.expiry_ns <= wall_now {
+                    drv.staleness.unwatch(row.coin_idx[0] as usize);
+                    drv.staleness.unwatch(row.coin_idx[1] as usize);
+                } else {
+                    let at = drv.wall.mono_of(row.live.expiry_ns);
+                    if at < next {
+                        next = at;
+                    }
+                }
+            }
+        }
+        f += 1;
+    }
+    drv.next_expiry_ns = next;
 }
 
 // ---------------------------------------------------------------
@@ -1105,6 +1335,17 @@ fn drain_ws_frames<C: Capture>(
                     WsOpcode::Pong => {}
                     WsOpcode::Close => {
                         drv.state = State::Closed;
+                        // T1(a): the peer's own Close — RFC 6455 §5.5.1:
+                        // an optional 2-byte status code leads the
+                        // (already unmasked) payload.
+                        let p = &drv.rx.filled()[payload.start..payload.end];
+                        let code = if p.len() >= 2 {
+                            u16::from_be_bytes([p[0], p[1]])
+                        } else {
+                            WS_CLOSE_NO_STATUS
+                        };
+                        status.note_venue_err_code(u32::from(code));
+                        status.note_session_err(core_metrics::ERR_SITE_PEER_CLOSE, 0);
                     }
                     WsOpcode::Continuation => {
                         // Hyperliquid does not fragment public pushes;
@@ -1319,9 +1560,17 @@ fn handle_data_frame<C: Capture>(
                                                         .get(fam)
                                                         .map_or(0, |r| r.live.outcome);
                                                     if live == drv.roll_spec.outcome {
-                                                        // Idempotent: the venue
-                                                        // repeats pushes on a
-                                                        // reconnect.
+                                                        // Already held: a repeat
+                                                        // changes nothing. The
+                                                        // venue pushes a roll
+                                                        // once and replays none
+                                                        // on subscribe (probed
+                                                        // 2026-09-26), but an
+                                                        // instance adopted from
+                                                        // an `/info` snapshot
+                                                        // (boot, or a reconnect's
+                                                        // re-discovery) can see
+                                                        // its own push after.
                                                         Dispatch::Slow
                                                     } else {
                                                         Dispatch::Roll {
@@ -1656,6 +1905,7 @@ fn handle_data_frame<C: Capture>(
             // subscribe (or framing) is wrong. Crash loudly in debug,
             // surface a session error in release — the reconnect
             // path applies backoff and the operator sees it.
+            status.note_session_err(core_metrics::ERR_SITE_VENUE_ERROR, 0);
             debug_assert!(false, "hl venue error frame");
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1738,7 +1988,6 @@ pub type StopFlag = AtomicBool;
 /// [`RunResult::IdleTimeout`]. [`session_health`] then enforces the
 /// ack deadline and the §6.2 staleness budget.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn run<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
@@ -1758,18 +2007,15 @@ pub fn run<T: Transport, C: Capture>(
     let session_start_ns = now_ns();
     keepalive.reset();
 
-    if transport.register(poll.registry(), token).is_err() {
-        return RunResult::Error;
+    if let Err(e) = transport.register(poll.registry(), token) {
+        return session_err(status, core_metrics::ERR_SITE_REGISTER, e.kind());
     }
     let mut last_interest = transport.interest();
     let mut repoll_now = false;
 
     while !stop.load(Ordering::Relaxed) {
-        if poll
-            .poll(events, Some(core_net::poll_timeout(repoll_now)))
-            .is_err()
-        {
-            return RunResult::Error;
+        if let Err(e) = poll.poll(events, Some(core_net::poll_timeout(repoll_now))) {
+            return session_err(status, core_metrics::ERR_SITE_POLL, e.kind());
         }
 
         for ev in events.iter() {
@@ -1778,7 +2024,7 @@ pub fn run<T: Transport, C: Capture>(
             }
             let transport_status = match transport.pump(ev) {
                 Ok(s) => s,
-                Err(_e) => return RunResult::Error,
+                Err(e) => return session_err(status, core_metrics::ERR_SITE_PUMP, e.kind()),
             };
             note_transport_ready(drv, transport_status);
         }
@@ -1790,8 +2036,18 @@ pub fn run<T: Transport, C: Capture>(
         ) {
             Drained::Idle => repoll_now = false,
             Drained::Capped => repoll_now = true,
-            Drained::Closed => return RunResult::Disconnected,
-            Drained::Failed(_) => return RunResult::Error,
+            // T1(a): the peer ended the stream. A Close frame already
+            // recorded `peer-close` + its code (first-error-wins);
+            // otherwise it was a bare FIN — the venue's whole answer to
+            // a subscribe for a settled or unknown coin.
+            Drained::Closed => {
+                status.note_session_err(core_metrics::ERR_SITE_PEER_EOF, 0);
+                return RunResult::Disconnected;
+            }
+            // A venue error frame recorded `venue-error` first.
+            Drained::Failed(kind) => {
+                return session_err(status, core_metrics::ERR_SITE_DRIVE, kind);
+            }
         }
 
         // §6.5: staged capture reaches disk within the flush interval
@@ -1811,11 +2067,16 @@ pub fn run<T: Transport, C: Capture>(
             match keepalive.poll(now, last) {
                 KeepaliveAction::None => {}
                 KeepaliveAction::SendPing => {
-                    if queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, PING_PAYLOAD)
-                        .is_err()
-                        || flush_tx(transport, drv).is_err()
-                    {
-                        return RunResult::Error;
+                    let sent = match queue_masked_text_frame(
+                        &mut drv.tx,
+                        &mut drv.mask_counter,
+                        PING_PAYLOAD,
+                    ) {
+                        Ok(()) => flush_tx(transport, drv),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = sent {
+                        return session_err(status, core_metrics::ERR_SITE_KEEPALIVE, e.kind());
                     }
                     keepalive.mark_ping_sent(now);
                 }
@@ -1826,21 +2087,30 @@ pub fn run<T: Transport, C: Capture>(
                 return r;
             }
             // BIN15 O2: the families' own, non-fatal ack deadline.
-            if roll_health(drv, status, capture, now).is_err() {
-                return RunResult::Error;
+            if let Err(e) = roll_health(drv, status, capture, now) {
+                return session_err(status, core_metrics::ERR_SITE_DRIVE, e.kind());
             }
         }
 
         let cur = transport.interest();
         if cur != last_interest {
-            if transport.reregister(poll.registry(), token).is_err() {
-                return RunResult::Error;
+            if let Err(e) = transport.reregister(poll.registry(), token) {
+                return session_err(status, core_metrics::ERR_SITE_REREGISTER, e.kind());
             }
             last_interest = cur;
         }
     }
 
     RunResult::Stopped
+}
+
+/// T1(a): record where the session died and its io-kind class on the
+/// status slot (the caller names both on its `run-loop returned` line),
+/// then fail the session. The one cold exit every error in [`run`] takes.
+#[cold]
+fn session_err(status: &IngressStatus, site: u8, kind: io::ErrorKind) -> RunResult {
+    status.note_session_err(site, core_metrics::io_kind_code(kind));
+    RunResult::Error
 }
 
 // ---------------------------------------------------------------
@@ -3138,5 +3408,447 @@ mod tests {
         );
         assert_eq!(res, RunResult::Disconnected);
         assert_eq!(status.bytes_total(), 2);
+    }
+
+    // -----------------------------------------------------------
+    // 2026-09-26 reconnect loop: dead HIP-4 instances
+    // -----------------------------------------------------------
+
+    /// 2026-09-12T06:29:00Z — one minute before 2649 expires.
+    const T_0629: u64 = 1_789_194_540_000_000_000;
+    /// 2026-09-12T06:31:00Z — one minute after.
+    const T_0631: u64 = 1_789_194_660_000_000_000;
+
+    fn spec_2649() -> HlOutcomeSpec {
+        parse_outcome_spec(
+            2649,
+            b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630",
+        )
+    }
+
+    fn spec_2650() -> HlOutcomeSpec {
+        parse_outcome_spec(
+            2650,
+            b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645",
+        )
+    }
+
+    fn spec_eth_daily() -> HlOutcomeSpec {
+        parse_outcome_spec(
+            3254,
+            b"class:priceBinary|underlying:ETH|expiry:20260913-0600|targetPrice:2686.3|period:1d",
+        )
+    }
+
+    /// BTC perp (row 0) + `out:BTC:15m` bound to 2649 (rows 1–2) +
+    /// `native:ETH:1d` bound to 3254 (rows 3–4), judged on `wall`.
+    fn family_driver(wall: WallAnchor) -> Driver {
+        use crate::family::{rolling_sym, HlFamilyKind};
+        let mut coins = HlCoinTable::new();
+        coins.insert(b"BTC", SYM_BTC).unwrap();
+        let mut fams = HlFamilyTable::new();
+        fams.push(
+            HlFamilyKind::Out15m,
+            b"BTC",
+            900,
+            [1, 2],
+            [rolling_sym(0, 0), rolling_sym(0, 1)],
+        )
+        .unwrap();
+        fams.push(
+            HlFamilyKind::NativeDaily,
+            b"ETH",
+            86_400,
+            [3, 4],
+            [rolling_sym(1, 0), rolling_sym(1, 1)],
+        )
+        .unwrap();
+        for f in 0..2usize {
+            coins.reserve(rolling_sym(f, 0)).unwrap();
+            coins.reserve(rolling_sym(f, 1)).unwrap();
+        }
+        fams.bind(0, &spec_2649(), &mut coins).unwrap();
+        fams.bind(1, &spec_eth_daily(), &mut coins).unwrap();
+        let mut d = Driver::new(
+            7,
+            coins,
+            crate::HL_STALENESS_BUDGET_NS,
+            HL_SUB_ACK_BUDGET_NS,
+        );
+        d.set_families(fams, Arc::new(HlRollStatus::new()), wall);
+        d
+    }
+
+    /// The loop's own shape, end to end on the wire: a reconnect after
+    /// 2649 expired retires that family BEFORE the subscribe sweep, so
+    /// the dead coin is never sent (the venue would drop the socket)
+    /// and never waited on, while the live daily and the perp are.
+    #[test]
+    fn a_reconnect_never_resubscribes_an_expired_instance() {
+        let mut d = family_driver(WallAnchor::new(now_ns(), T_0631));
+        assert_eq!(d.reset_for_reconnect(7), 1, "exactly the expired family");
+        assert_eq!(d.families_awaiting(), 1);
+        let row = *d.families().get(0).unwrap();
+        assert!(row.dormant && row.awaiting);
+        assert!(
+            !d.families().get(1).unwrap().dormant,
+            "the live daily stays bound"
+        );
+
+        let mut t = TestTransport::with_capacity(65536);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        note_transport_ready(&mut d, Status::Ready);
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/ws",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        let mut scratch = vec![0u8; 65536];
+        let _ = t.drain_outgoing(&mut scratch);
+        let accept = expected_accept_pub(&sec_key_pub(7));
+        t.inject_incoming(&build_server_response(&accept));
+        drive_one(
+            &mut t,
+            &mut d,
+            b"h",
+            b"/ws",
+            &mut prod,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        assert_eq!(d.state(), State::Steady);
+
+        let n = t.drain_outgoing(&mut scratch);
+        let body = unmask_client_frames(&scratch[..n]);
+        assert!(
+            memchr::memmem::find(&body, b"#2649").is_none(),
+            "the expired instance is never named on the wire"
+        );
+        // BTC perp 4 + the daily's 2 sides × 3 + allMids + outcomeMetaUpdates.
+        assert_eq!(
+            memchr::memmem::find_iter(&body, b"{\"method\":\"subscribe\"").count(),
+            12
+        );
+        assert!(memchr::memmem::find(&body, br##"{"type":"l2Book","coin":"#32540"}"##).is_some());
+        assert!(memchr::memmem::find(&body, br##"{"type":"trades","coin":"#32541"}"##).is_some());
+        // …and never waited on: the ack mask covers what was sent.
+        assert_eq!((d.expected, d.expected_global), expected_mask(&d.coins));
+        assert_eq!(
+            d.expected & (bit_of(1, HlChannel::Bbo) | bit_of(2, HlChannel::Bbo)),
+            0
+        );
+    }
+
+    /// An `outcomeSettled` push keeps the instance bound on its own
+    /// session but flags it; the next reconnect retires it even though
+    /// its expiry is still ahead.
+    #[test]
+    fn a_settled_instance_stays_bound_on_its_session_and_is_retired_at_the_reconnect() {
+        use crate::family::rolling_sym;
+        let mut d = family_driver(WallAnchor::new(now_ns(), T_0629));
+        let status = IngressStatus::new();
+        let (mut etx, _erx) = event_ring_pair();
+        let mask = core_types::event_lane_bit(ChannelId::InstrumentRoll);
+        let spec = d.families().get(0).unwrap().live;
+        perform_roll(
+            &mut d,
+            0,
+            &spec,
+            true,
+            &mut etx,
+            mask,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        assert!(d.families().get(0).unwrap().settled);
+        assert_eq!(
+            d.coins.lookup(b"#26490"),
+            Some(rolling_sym(0, 0)),
+            "still bound on this session"
+        );
+
+        assert_eq!(d.reset_for_reconnect(7), 1);
+        assert_eq!(d.coins.lookup(b"#26490"), None);
+        assert_eq!(d.coins.lookup(b"#26491"), None);
+        assert!(d.families().get(0).unwrap().awaiting);
+        assert_eq!(d.reset_for_reconnect(8), 0, "retiring is idempotent");
+    }
+
+    /// The trigger of 2026-09-26 01:45:11Z: an instance that expired
+    /// stops publishing, and judged until its settlement it tripped the
+    /// whole session at expiry + 10 s. It is unwatched AT its expiry;
+    /// a live row that goes silent still trips.
+    #[test]
+    fn staleness_stops_judging_an_instance_at_its_expiry() {
+        let t0 = now_ns();
+        // 2649's expiry falls 1 µs after `t0`.
+        let mut d = family_driver(WallAnchor::new(t0, spec_2649().expiry_ns - 1_000));
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let (e, g) = expected_mask(&d.coins);
+        d.expected = e;
+        d.expected_global = g;
+        d.found = e;
+        d.found_global = g;
+        d.steady_since_ns = t0;
+        let status = IngressStatus::new();
+        assert_eq!(session_health(&mut d, &status, t0), None);
+        assert!(d.is_verified());
+
+        // The perp and the daily's two rows publish; 2649's rows fall
+        // silent at their expiry.
+        let fresh = t0 + 10_500_000_000;
+        for row in [0usize, 3, 4] {
+            d.staleness.on_l2book(row, 1, fresh);
+        }
+        assert_eq!(
+            session_health(&mut d, &status, t0 + 11_000_000_000),
+            None,
+            "an expired instance's silence never trips the session"
+        );
+        assert_eq!(status.gaps_total(), 0);
+        // A live row going silent still does.
+        assert_eq!(
+            session_health(&mut d, &status, t0 + 21_000_000_000),
+            Some(RunResult::Stale)
+        );
+    }
+
+    /// The re-discovery half: an awaiting family adopts the instance
+    /// trading now out of an `/info outcomeMeta` body — the coin table
+    /// only, nothing on the wire — and the adoption is announced as a
+    /// created roll once the boot announcement has gone out (before it,
+    /// `emit_boot_rolls` announces the binding instead).
+    #[test]
+    fn rebind_dormant_adopts_the_live_successor_and_announces_it() {
+        use crate::family::rolling_sym;
+        let mask = core_types::event_lane_bit(ChannelId::InstrumentRoll);
+        for booted in [true, false] {
+            let mut d = family_driver(WallAnchor::new(now_ns(), T_0631));
+            assert_eq!(d.reset_for_reconnect(7), 1);
+            d.boot_rolls_emitted = booted;
+            let status = IngressStatus::new();
+            let (mut etx, mut erx) = event_ring_pair();
+            let mut cap = EventRecCap::default();
+
+            let specs = [spec_2649(), spec_2650(), spec_eth_daily()];
+            let bound = d.rebind_dormant(&specs, &mut etx, mask, &status, &mut cap);
+            assert_eq!(
+                bound, 1,
+                "only the dormant family; the live daily is left alone"
+            );
+            assert_eq!(d.families_awaiting(), 0);
+            assert_eq!(d.families().get(0).unwrap().live.outcome, 2650);
+            assert_eq!(d.coins.lookup(b"#26500"), Some(rolling_sym(0, 0)));
+            assert_eq!(d.coins.lookup(b"#26501"), Some(rolling_sym(0, 1)));
+            assert!(d.tx.is_empty(), "nothing queued before the upgrade");
+            assert_eq!(d.roll_status.rolls_total(), 1);
+
+            let rolls: Vec<&ChannelEvent> = cap
+                .events
+                .iter()
+                .filter(|e| e.channel == ChannelId::InstrumentRoll as u8)
+                .collect();
+            if booted {
+                assert_eq!(rolls.len(), 1);
+                assert_eq!(rolls[0].sym, rolling_sym(0, 0));
+                assert_eq!(
+                    core_types::unpack_roll_seq(rolls[0].venue_seq),
+                    (2650, 60, 0, false)
+                );
+                assert!(erx.try_pop_ref().is_some(), "and it rode the event ring");
+            } else {
+                assert!(rolls.is_empty(), "the boot announcement will carry it");
+                assert!(erx.try_pop_ref().is_none());
+            }
+        }
+    }
+
+    /// T1(a) for this venue: every end names itself on the status slot —
+    /// the peer's Close with its code (1005 when none), a bare EOF (the
+    /// venue's whole answer to a subscribe for a settled coin), and a
+    /// missed ack deadline with the count of missing acks.
+    #[test]
+    fn the_end_of_a_session_is_named_on_the_status_slot() {
+        fn run_once(t: &mut TestTransport, d: &mut Driver, status: &IngressStatus) -> RunResult {
+            let (mut prod, _cons) = ring_pair();
+            let stop = StopFlag::new(false);
+            let mut poll = mio::Poll::new().unwrap();
+            let mut events = mio::Events::with_capacity(4);
+            let mut ka = generous_keepalive();
+            run(
+                t,
+                d,
+                b"h",
+                b"/",
+                &mut prod,
+                &mut poll,
+                &mut events,
+                mio::Token(1),
+                &stop,
+                status,
+                &mut ka,
+                &mut NullCapture,
+            )
+        }
+
+        // A Close carrying 1008 (policy violation).
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = steady_driver();
+        let status = IngressStatus::new();
+        t.inject_incoming(&[0x88, 0x02, 0x03, 0xF0]);
+        assert_eq!(run_once(&mut t, &mut d, &status), RunResult::Disconnected);
+        let err = status.take_last_err();
+        assert_eq!(err.site, core_metrics::ERR_SITE_PEER_CLOSE);
+        assert_eq!(err.venue_code, 1008);
+
+        // A Close with no code.
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = steady_driver();
+        t.inject_incoming(&[0x88, 0x00]);
+        assert_eq!(run_once(&mut t, &mut d, &status), RunResult::Disconnected);
+        let err = status.take_last_err();
+        assert_eq!(err.site, core_metrics::ERR_SITE_PEER_CLOSE);
+        assert_eq!(err.venue_code, u32::from(WS_CLOSE_NO_STATUS));
+
+        // A bare EOF: no Close, the stream just ends.
+        let mut t = TestTransport::with_capacity(4096);
+        let mut d = steady_driver();
+        t.mark_closed();
+        assert_eq!(run_once(&mut t, &mut d, &status), RunResult::Disconnected);
+        let err = status.take_last_err();
+        assert_eq!(err.site, core_metrics::ERR_SITE_PEER_EOF);
+        assert_eq!(err.venue_code, 0);
+
+        // The ack deadline: nothing acknowledged of the nine subscribes.
+        let mut d = steady_driver();
+        let past = d.steady_since_ns + HL_SUB_ACK_BUDGET_NS + 1;
+        assert_eq!(
+            session_health(&mut d, &status, past),
+            Some(RunResult::Error)
+        );
+        let err = status.take_last_err();
+        assert_eq!(err.site, core_metrics::ERR_SITE_SUBSCRIBE_MISSING);
+        assert_eq!(err.venue_code, 9);
+    }
+
+    /// The production shape of the expiry schedule: a family that rolls
+    /// MID-SESSION must have its successor's expiry swept too, or the
+    /// successor's silence after ITS expiry trips the session one period
+    /// later (`perform_roll` re-arms the schedule).
+    #[test]
+    fn a_mid_session_roll_puts_the_successor_on_the_unwatch_schedule() {
+        let t0 = now_ns();
+        let mut d = family_driver(WallAnchor::new(t0, spec_2649().expiry_ns - 1_000));
+        d.set_state(State::Steady);
+        d.subscribed = true;
+        let (e, g) = expected_mask(&d.coins);
+        d.expected = e;
+        d.expected_global = g;
+        d.found = e;
+        d.found_global = g;
+        d.steady_since_ns = t0;
+        let status = IngressStatus::new();
+        assert_eq!(session_health(&mut d, &status, t0), None);
+
+        // 2649 expires; the sweep unwatches it and schedules the daily.
+        let s = 1_000_000_000u64;
+        for row in [0usize, 3, 4] {
+            d.staleness.on_l2book(row, 1, t0 + s);
+        }
+        assert_eq!(session_health(&mut d, &status, t0 + 2 * s), None);
+
+        // The successor binds mid-session (re-watched from now) …
+        let (mut etx, _erx) = event_ring_pair();
+        let mask = core_types::event_lane_bit(ChannelId::InstrumentRoll);
+        perform_roll(
+            &mut d,
+            0,
+            &spec_2650(),
+            false,
+            &mut etx,
+            mask,
+            &status,
+            &mut NullCapture,
+        )
+        .unwrap();
+        // … and falls silent at ITS expiry (t0 + 900 s): the perp and the
+        // daily keep publishing, so only 2650's rows could trip.
+        for row in [0usize, 3, 4] {
+            d.staleness.on_l2book(row, 2, t0 + 910 * s + s / 2);
+        }
+        assert_eq!(
+            session_health(&mut d, &status, t0 + 911 * s),
+            None,
+            "the rolled successor is unwatched at its own expiry"
+        );
+        assert_eq!(status.gaps_total(), 0);
+    }
+
+    /// The FIRST connect takes the same path: a boot binding that
+    /// expired before the first socket is retired and re-discovered
+    /// silently, and the boot announcement at the first `Steady` names
+    /// the successor — each binding exactly once, the dead coin never.
+    #[test]
+    fn a_boot_binding_dead_before_the_first_connect_is_announced_once() {
+        let mut d = family_driver(WallAnchor::new(now_ns(), T_0631));
+        assert_eq!(d.reset_for_reconnect(7), 1);
+        let status = IngressStatus::new();
+        let (mut etx, mut erx) = event_ring_pair();
+        let mut cap = EventRecCap::default();
+        let mask = core_types::event_lane_bit(ChannelId::InstrumentRoll);
+        assert_eq!(
+            d.rebind_dormant(&[spec_2650()], &mut etx, mask, &status, &mut cap),
+            1
+        );
+        assert!(cap.events.is_empty(), "silent before the boot announcement");
+
+        let mut t = TestTransport::with_capacity(65536);
+        let (mut prod, _cons) = ring_pair();
+        note_transport_ready(&mut d, Status::Ready);
+        super::drive_one(
+            &mut t, &mut d, b"h", b"/ws", &mut prod, &mut etx, mask, &status, &mut cap,
+        )
+        .unwrap();
+        let mut scratch = vec![0u8; 65536];
+        let _ = t.drain_outgoing(&mut scratch);
+        let accept = expected_accept_pub(&sec_key_pub(7));
+        t.inject_incoming(&build_server_response(&accept));
+        super::drive_one(
+            &mut t, &mut d, b"h", b"/ws", &mut prod, &mut etx, mask, &status, &mut cap,
+        )
+        .unwrap();
+        assert_eq!(d.state(), State::Steady);
+
+        let mut outcomes: Vec<u32> = cap
+            .events
+            .iter()
+            .filter(|e| e.channel == ChannelId::InstrumentRoll as u8)
+            .map(|e| core_types::unpack_roll_seq(e.venue_seq).0)
+            .collect();
+        outcomes.sort_unstable();
+        assert_eq!(
+            outcomes,
+            vec![2650, 3254],
+            "each live binding once, 2649 never"
+        );
+        let mut on_ring = 0;
+        while erx.try_pop_ref().is_some() {
+            on_ring += 1;
+        }
+        assert_eq!(on_ring, 2);
+
+        let n = t.drain_outgoing(&mut scratch);
+        let body = unmask_client_frames(&scratch[..n]);
+        assert!(memchr::memmem::find(&body, b"#2649").is_none());
+        assert!(memchr::memmem::find(&body, br##"{"type":"bbo","coin":"#26500"}"##).is_some());
     }
 }

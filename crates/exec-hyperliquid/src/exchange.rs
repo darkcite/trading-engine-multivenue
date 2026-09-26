@@ -2754,11 +2754,12 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         for side in 0..syms.len() {
             if let Some((asset, coin, coin_len)) = self.assets.bound(syms[side]) {
                 // A REPEAT of the roll that is already live retires
-                // nothing. The venue re-sends `outcomeCreated` on a
-                // reconnect snapshot and a replayed ring entry carries
-                // it too — and without this the sweep would enumerate
-                // the account and cancel every one of our quotes on a
-                // LIVE leg, at the moment the member is quoting it.
+                // nothing. A replayed ring entry carries one (the venue
+                // itself pushes `outcomeCreated` once and replays none
+                // on a reconnect — probed 2026-09-26) — and without
+                // this the sweep would enumerate the account and cancel
+                // every one of our quotes on a LIVE leg, at the moment
+                // the member is quoting it.
                 if asset != assets[side] {
                     self.queue_sweep(asset, coin, coin_len);
                 }
@@ -3737,12 +3738,13 @@ mod tests {
         assert_eq!(x.reject_streak, 1);
     }
 
-    /// **A REPEAT of the live roll retires nothing.** The venue
-    /// re-sends `outcomeCreated` on a reconnect snapshot and a replayed
-    /// ring entry carries it too. Without the guard the queued asset is
-    /// the very one the bind re-establishes as live, and the next idle
-    /// would enumerate the account and cancel every one of our quotes
-    /// on a LIVE leg — at the moment the member is quoting it.
+    /// **A REPEAT of the live roll retires nothing.** A replayed ring
+    /// entry carries one (the venue itself pushes `outcomeCreated` once
+    /// and replays none on a reconnect — probed 2026-09-26). Without
+    /// the guard the queued asset is the very one the bind
+    /// re-establishes as live, and the next idle would enumerate the
+    /// account and cancel every one of our quotes on a LIVE leg — at
+    /// the moment the member is quoting it.
     #[test]
     fn a_repeated_roll_never_queues_a_sweep_of_the_live_leg() {
         let mut x = exchange();

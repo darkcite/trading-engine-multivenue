@@ -1292,9 +1292,10 @@ reduce-only bit, which is the same limitation already recorded for
 choice with an existing precedent. **When the reduce-only bit lands
 with E6, this is one of the sites to revisit.**
 
-**A repeated roll retires nothing.** The venue re-sends
-`outcomeCreated` on a reconnect snapshot and a replayed ring entry
-carries it too, so the handler compares the bound asset against the one
+**A repeated roll retires nothing.** A replayed ring entry carries one
+(the venue itself pushes `outcomeCreated` once and replays none on a
+reconnect — corrected 2026-09-26, probed; "The Hyperliquid reconnect
+loop" below), so the handler compares the bound asset against the one
 it is about to bind. Without that the queued asset is the very one the
 bind re-establishes as live, and the next idle would enumerate the
 account and cancel every quote on a LIVE leg — at the moment the member
@@ -3301,6 +3302,165 @@ changed crates (`nm`: no core-net or ingress symbols), and at a load of
 build and tests beside the engine) two benches it does link read slow
 (latency-arb `on_tick` +61 %, `sign_order_full` +23 %) — to re-run on a
 quiet Mac. This work built no engine binary.
+
+### The Hyperliquid reconnect loop — dead HIP-4 instances (2026-09-26)
+
+On the operator's word (2026-09-26: "investigate why hyperliquid lane is
+reconnecting constantly", then "implement the fix and restart now").
+
+**What was wrong.** From 01:45:11Z the lane logged `hyperliquid: run-loop
+returned res=Disconnected` every ~1.24 s — 15 190 times by 07:13Z, 43 139
+since 09-19 — in episodes that began at a reconnect and ended only at a
+process restart. The venue answers a subscribe to a settled or unknown
+coin by dropping the whole socket: a bare FIN, no `error` frame, no Close
+(probed from the Mac: `l2Book` on the BTC 15-minute instance that expired
+at 00:15Z, or on `NOTACOIN`, EOF within 0.25 s; the engine's own 70
+subscriptions ran 20 s and 786 frames on the live instances, and died at
+1.2 s after 56 acks with the BTC family on its settled one). The engine
+re-subscribed exactly that: `perform_roll` keeps a settled instance bound
+until the next `outcomeCreated`, and `reset_for_reconnect` re-subscribed
+every binding. The successor could not arrive — each session died before
+`outcomeMetaUpdates`, subscribed last, was acknowledged, and that channel
+replays nothing (below) — so only boot discovery rebound. The backoff
+never grew: `should_reset_backoff` reset on any tick, and the perp
+snapshots arrived in a session's first 0.2 s. What started it: an
+instance expired, the venue settled it and listed its successor late, and
+the expired coin's silence — the staleness monitor let go of a coin only
+at `outcomeSettled` — tripped the whole session 10 s after the expiry
+(logged at 12:35:11 and 18:30:11Z on 09-25 and at 01:45:11Z; two other
+episodes began at a `res=Error`). During a loop the lane carried
+connect-time snapshots only, every BIN15 family was dark, and it opened
+~48 connections a minute against the venue's 30 per IP.
+
+**What changed.** A dead instance is never subscribed again.
+`perform_roll` flags a family whose instance settles (`HlFamily::settled`);
+`instance_dead` holds for a bound instance that settled or passed its WALL
+expiry; and `reset_for_reconnect` now ends by retiring every dead family
+(`HlFamilyTable::retire`: both coin rows unbound through the new
+`HlCoinTable::unbind`, the family dormant and `awaiting`), so the next
+subscribe sweep and the ack masks skip it; it returns the count, which
+the caller logs. On a live session a settled instance stays bound and
+subscribed as before — the venue keeps a subscription it already holds.
+Successors are re-discovered between sessions: while a family awaits
+one, the HL thread re-reads `/info {"type":"outcomeMeta"}` before the
+socket opens, at most once a minute — the boot's own request and parser
+(`boot_discovery::fetch_hl_outcome_specs`), sent with core-net's new
+`boot_http::https_post_at` to the address the engine resolved at boot
+(like the WS host's), so no DNS lookup runs on that thread and every
+socket step is armed with what remains of a 3 s deadline — and
+`Driver::rebind_dormant` binds every family naming no instance, the
+boot's dormant ones included, by the boot's rule (`best_live_spec`: the
+earliest-expiring instance still live), announcing each adoption as
+`perform_roll` announces a roll (`emit_roll_event`, now the one writer
+for the roll, the boot announcement and the re-discovery). A failed fetch
+leaves the family waiting for the venue's next `outcomeCreated`.
+Staleness stops judging an instance at its expiry: `session_health`
+unwatches the rows of every expired instance — right after `arm`, and
+again at each expiry (`next_expiry_ns`, one compare per iteration;
+`perform_roll` puts the successor on the schedule) — and its ack check is
+masked, since a roll can ack rows the sweep did not expect. The backoff
+resets only after a session that moved market data AND lived 30 s
+(`HEALTHY_SESSION_MIN_NS`), or a venue-quiet trip, in the seven venue
+loops that share `should_reset_backoff`: a silent-drop loop of any cause
+now climbs to the 8 s cap (≤ 7.5 connects a minute). And every end names
+itself on the T1(a) status triple: the run loop's error exits record site
+and io-kind (`session_err`), a peer Close `peer-close` with its code
+(1005 when it carried none), a bare EOF `peer-eof`, a missed ack deadline
+`subscribe-missing` with the count missing, a venue error frame
+`venue-error`; `run-loop returned` prints them with `lived_ms`, `acks`
+and `acks_expected`. core-metrics gains `ERR_SITE_PEER_EOF` (10) and
+`ERR_SITE_PEER_CLOSE` (11). A retired instance's later `outcomeSettled`
+matches no family, so the capture carries no `settled` for it, and its
+re-discovered successor arrives as a lone `created`
+(`docs/wire-format.md`).
+
+**Proof.** ingress-hyperliquid (162 tests): a reconnect never
+re-subscribes an expired instance (12 subscribes on the wire, none for
+`#2649`); a settled instance stays bound on its own session and is
+retired at the reconnect; staleness stops judging an instance at its
+expiry, and a mid-session roll puts the successor on the schedule;
+`rebind_dormant` adopts the live successor and announces it, or leaves
+the announcement to the boot's when that has not gone out; a boot binding
+dead before the first connect is announced exactly once; a retired family
+is off the wire and `bind` revives it; the end of a session is named on
+the status slot (Close 1008; a Close with no code → 1005; a bare EOF →
+`peer-eof`; the ack deadline → `subscribe-missing`, 9 missing). cli:
+`backoff_resets_only_on_a_healthy_session_or_quiet_trip`. core-net: a
+POST to a boot-resolved address does no lookup — the server name is under
+`.invalid` (RFC 6761), so a lookup fails `Resolve` before any connect
+(checked by mutation) — a closed port is refused (`Connect(ConnectionRefused)`),
+and a peer that accepts and stays silent is cut off by the deadline
+(300 ms), not by the peer (1.5 s). And the venue fact the fix rests on,
+probed at the 08:15Z and 08:30Z rolls: `outcomeMetaUpdates` pushes a roll
+once, live, and replays nothing to a later subscriber. A socket
+subscribed from 08:28:30Z got `outcomeSettled` for 5791 and 5790 at
+08:30:04Z and one `outcomeCreated` push for their successors 5792/5793 at
+08:30:06.6Z; sockets subscribed 14 s and 74 s after that push — and at
+08:15:30 and 08:16:30Z, after the 08:15Z roll — got the ack and nothing
+else, while `/info outcomeMeta` listed the successors by 08:16:10 and
+08:31:00Z. (A probe socket must ping: the venue closes one 60 s after the
+client's last message.) Five comments said the venue re-sends
+`outcomeCreated` on a reconnect — the run loop's roll dispatch, the TLS
+loopback test, `exec-router`'s ledger (twice), `exec-hyperliquid`'s
+exchange (twice) — as did "LAW E-8 — the roll takes its own quotes back"
+above; each now says what was measured, and the guards they explain stay:
+a replayed ring entry still carries a repeat, and an instance adopted from
+an `/info` snapshot can see its own push arrive after the session
+subscribed.
+
+**The review** (read-only subagents, two passes). The fix: PASS WITH
+NOTES — the loop is closed, and each new test fails without its part of
+the fix. Acted on: the post-boot use of `boot_http`, whose doc said boot
+only — throttled to one fetch a minute, run before the socket opens, on a
+3 s deadline, and documented; the one expiry-schedule write that matters
+(`perform_roll`'s) got its test, and the four dead ones went;
+`rebind_dormant` picks families by `live.outcome == 0`, not the `dormant`
+flag, which would re-announce a live instance once the second-strike bug
+below is fixed — and BIN15 would zero a position the ledger keeps; the
+masked ack check; one WALL clock for every judgement; the roll records
+mirrored to disk before the connect; the race documented; the family log
+shared with boot; the first-connect test; stale docs and `debug_assert!`s.
+The replay contradiction it found went to the probe above. The second
+pass, over what followed — the boot-resolved `/info` address and the
+comment corrections: PASS WITH NOTES — boot's own fetches behave exactly
+as before (the deadline starts before the lookup, `RequestTooLarge`
+before any I/O, the same errors), and nothing on the HL thread can reach
+DNS. Acted on: the failure tests for `https_post_at`, the E-8 paragraph,
+the deadline wording (each socket step is armed, not the call as one),
+the module title and error docs, `WssEndpoint`'s doc narrowed to the HL
+thread, the guard's remaining trigger, the wire-format note, and a
+duplicated `#[allow]` on `run`. Left open: `roll_health`'s retry sets
+`ack_deadline_ns = u64::MAX`, so its second strike (dormant) is
+unreachable — pre-existing, its own change; a successor listed between
+the `/info` snapshot and the new session's `outcomeMetaUpdates` ack is
+missed until the family's next instance (at most one 15-minute instance;
+a daily's successor is listed a day ahead); the `/info` host is resolved
+whenever HL is configured, families or not — boot discovery already
+posts to it then, so nothing new can fail; and the venue now acks
+`l2Book` with `"fast":false` (≈ one push per coin every 4–5 s against
+`bbo` at ~1/s in the probes) — unverified, not this change.
+
+**Operations.** The operator's restart at 07:18Z (the sanctioned 0010
+revive) rebound the live instances and ended the loop; the lane then ran
+clean through the 07:30–08:30Z rolls. At 08:32Z a venue-side incident —
+the probes' control socket dropped at 08:32:21Z, a fresh upgrade answered
+502, `/info` timed out — tripped the lane (`res=Stale` at 08:32:01Z) into
+26 more session ends in 102 s — the first 12 about 1.2 s apart, the rest
+5–7 s — until the 08:33Z daily restart stopped it. Under the new rule
+those 1.2 s gaps climb to the 8 s cap, and the new line says how each
+session ended; the old one could not tell this outage from the loop. That restart's boot
+discovery failed on the same outage (`spotMeta` Timeout, exit 1), and
+launchd's relaunch booted clean at 08:36:24Z (the 15-minute families on
+5792/5793, the dailies on 5755–5758; `vm_rows_active` 2). The fix is not
+deployed: a loop can recur at any expiry until a build of it runs.
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc
+73/73 at 0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31
+baselined=31 new=0 paid=0`, the baseline byte-identical (sha256
+`caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK. No live
+smoke exists for this lane, and what one would need to show — a reconnect
+across an expiry — is what the unit tests script. This work built no
+engine binary.
 
 ## E6 — the risk gate and the kill switches
 

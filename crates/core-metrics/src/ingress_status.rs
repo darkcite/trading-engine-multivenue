@@ -53,6 +53,15 @@ pub const ERR_SITE_SUBSCRIBE_MISSING: u8 = 8;
 /// outage 2026-08-27 §5.3 — covers Connecting/AwaitingUpgrade
 /// wedges AND zero-sub `Steady` sessions kept alive by pongs).
 pub const ERR_SITE_ESTABLISH: u8 = 9;
+/// Session-END site (not a local error): the peer ended the stream
+/// with no WebSocket Close first — a bare FIN or TLS close. It is
+/// Hyperliquid's entire answer to a subscribe for a settled or unknown
+/// coin (probed 2026-09-26), which `res=Disconnected` alone hid for
+/// hours.
+pub const ERR_SITE_PEER_EOF: u8 = 10;
+/// Session-END site: the peer sent a WebSocket Close (`venue_code` =
+/// its status code; 1005 when the frame carried none).
+pub const ERR_SITE_PEER_CLOSE: u8 = 11;
 
 /// Human name for a session-error site code (0 = "none").
 #[inline]
@@ -68,6 +77,8 @@ pub const fn err_site_name(site: u8) -> &'static str {
         ERR_SITE_VENUE_ERROR => "venue-error",
         ERR_SITE_SUBSCRIBE_MISSING => "subscribe-missing",
         ERR_SITE_ESTABLISH => "establish-timeout",
+        ERR_SITE_PEER_EOF => "peer-eof",
+        ERR_SITE_PEER_CLOSE => "peer-close",
         _ => "unknown",
     }
 }
@@ -719,6 +730,8 @@ mod tests {
             "subscribe-missing"
         );
         assert_eq!(err_site_name(ERR_SITE_ESTABLISH), "establish-timeout");
+        assert_eq!(err_site_name(ERR_SITE_PEER_EOF), "peer-eof");
+        assert_eq!(err_site_name(ERR_SITE_PEER_CLOSE), "peer-close");
         assert_eq!(err_site_name(200), "unknown");
         assert_eq!(io_kind_name(0), "none");
         assert_eq!(

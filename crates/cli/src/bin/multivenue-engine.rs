@@ -3069,7 +3069,25 @@ fn run(args: RunArgs) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            Some((coins, families, hl_ep))
+            // The `/info` endpoint a reconnect re-discovers retired
+            // families' successors on (2026-09-26 reconnect-loop fix) —
+            // resolved here, once, like the WS host: the ingress thread
+            // never runs a DNS lookup.
+            let (api_host, api_port) = match cli::split_host_port(&cfg.hyperliquid_api_host, 443) {
+                Ok(v) => v,
+                Err(reason) => {
+                    error!(reason, host = %cfg.hyperliquid_api_host, "bad hyperliquid_api_host");
+                    return ExitCode::from(1);
+                }
+            };
+            let hl_info_ep = match WssEndpoint::resolve(api_host, api_port, "/info") {
+                Ok(e) => e,
+                Err(e) => {
+                    error!(error = ?e, "hyperliquid /info DNS failed");
+                    return ExitCode::from(1);
+                }
+            };
+            Some((coins, families, hl_ep, hl_info_ep))
         }
         _ => None,
     };
@@ -3105,7 +3123,7 @@ fn run(args: RunArgs) -> ExitCode {
         &bn_syms,
         okx_boot.as_ref().map(|(t, _)| t),
         deribit_boot.as_ref().map(|(t, _)| t),
-        hl_boot.as_ref().map(|(t, _f, _e)| t),
+        hl_boot.as_ref().map(|(t, _f, _e, _i)| t),
         &mexc_syms,
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
@@ -3649,7 +3667,7 @@ fn run(args: RunArgs) -> ExitCode {
 
     // Hyperliquid rides core 7 per the §9 core map.
     let hl_wall_anchor = core_time::WallAnchor::now();
-    if let Some((mut hl_coins, mut hl_families, hl_ep)) = hl_boot {
+    if let Some((mut hl_coins, mut hl_families, hl_ep, hl_info_ep)) = hl_boot {
         // BIN15 O2: adopt each family's LIVE instance out of the
         // discovery body, so the first `Steady` subscribes it instead
         // of waiting up to a whole period for the venue's next
@@ -3670,35 +3688,7 @@ fn run(args: RunArgs) -> ExitCode {
                 candidates = discovery.hl_outcome_specs.len(),
                 "hyperliquid: rolling families bound"
             );
-            for f in 0..hl_families.len() {
-                let Some(row) = hl_families.get(f) else {
-                    continue;
-                };
-                let underlying = core::str::from_utf8(row.underlying_bytes()).unwrap_or("?");
-                if row.dormant {
-                    info!(
-                        family = f,
-                        underlying,
-                        period_s = row.period_s,
-                        sym_yes = row.sym[0],
-                        sym_no = row.sym[1],
-                        "hyperliquid: family dormant (no live instance)"
-                    );
-                } else {
-                    info!(
-                        family = f,
-                        underlying,
-                        period_s = row.period_s,
-                        sym_yes = row.sym[0],
-                        sym_no = row.sym[1],
-                        live = row.live.outcome,
-                        strike_1e6 = row.live.strike_1e6,
-                        expiry_ns = row.live.expiry_ns,
-                        twap_s = row.live.twap_s,
-                        "hyperliquid: family live"
-                    );
-                }
-            }
+            cli::log_hl_families(&hl_families);
         }
         info!(
             coins = hl_coins.len(),
@@ -3708,6 +3698,7 @@ fn run(args: RunArgs) -> ExitCode {
         );
         let hl_handle = match spawn_hyperliquid(
             hl_ep,
+            hl_info_ep,
             tls_config.clone(),
             hl_coins,
             hl_families,
