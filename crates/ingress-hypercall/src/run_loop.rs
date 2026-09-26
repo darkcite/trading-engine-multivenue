@@ -39,6 +39,13 @@
 //! 0/0) and CROSSED included; a push with neither side emits nothing.
 //! An instrument the venue announced `Expired`/`Deleted` stops emitting.
 //!
+//! **Drain law (I-3, [`core_net::drain`]).** A wake drives the socket
+//! again while a step's read stopped on a full rx, published a tick or
+//! moved the state, at most [`core_net::DRAIN_STEP_CAP`] steps; a capped
+//! drain re-polls without sleeping, so a backlog never waits for a
+//! readiness edge and the poller handoff and the heartbeat keep their
+//! turn.
+//!
 //! Everything after the handshake is zero-alloc: parsers slice the rx
 //! buffer in place; outbound frames are serialised from parts straight
 //! into tx; the only copies are the 64-byte PODs moved into their slots.
@@ -50,8 +57,8 @@ use core_metrics::{IngressState, IngressStatus};
 use core_net::{
     constant_time_eq, expected_accept, queue_masked_text_frame_parts, read_server_handshake,
     sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, HandshakeResult, IoBuf, Status, Transport, WsOpcode,
-    WsReadResult,
+    ws_unmask_in_place, ws_write_pong, Drained, HandshakeResult, IoBuf, RxFill, Status, Transport,
+    WsOpcode, WsReadResult,
 };
 use core_ring::{Consumer, Producer};
 use core_time::{now_ns, FeedClock, NsTs};
@@ -94,10 +101,6 @@ pub const HANDOFF_RING_CAP: usize = 2048;
 
 /// Handshake allowance in the tx budget.
 const HANDSHAKE_TX_MAX: usize = 1024;
-
-/// `drive_one` calls per loop iteration while frames keep arriving
-/// (each can consume up to a full rx buffer).
-const MAX_DRAIN_STEPS: u32 = 64;
 
 /// The indicative subscribe's worst case at the table cap: the
 /// envelope and per row two quotes, a comma and the widest name, plus
@@ -357,6 +360,10 @@ pub struct Lanes<'a> {
 
 /// Pump the transport once and advance the state machine. Zero-alloc
 /// once the handshake has completed.
+///
+/// Returns `Ok(true)` when this step's read stopped on a full rx
+/// ([`RxFill::Full`]): input may still wait below it, so the caller
+/// drives again ([`core_net::drain`]).
 pub fn drive_one<T: Transport, C: Capture>(
     transport: &mut T,
     drv: &mut Driver,
@@ -365,9 +372,12 @@ pub fn drive_one<T: Transport, C: Capture>(
     status: &IngressStatus,
     counters: &HcCounters,
     capture: &mut C,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     flush_tx(transport, drv)?;
-    fill_rx(transport, drv)?;
+    let fill = core_net::fill_rx(transport, &mut drv.rx)?;
+    if fill == RxFill::Eof {
+        drv.state = State::Closed;
+    }
     match drv.state {
         State::Connecting | State::Closed => {}
         State::NeedsWsWrite => {
@@ -386,7 +396,28 @@ pub fn drive_one<T: Transport, C: Capture>(
         State::Steady => drain_ws_frames(drv, lanes, status, counters, capture)?,
     }
     flush_tx(transport, drv)?;
-    Ok(())
+    Ok(fill == RxFill::Full)
+}
+
+/// I-3 ([`core_net::drain`]): drive the connection until a step makes no
+/// progress — its read did not stop on a full rx, it published no tick,
+/// its state held — or [`core_net::DRAIN_STEP_CAP`] steps have run, so a
+/// flood cannot hold the poller handoff, the heartbeat or the stop flag.
+fn drive_until_idle<T: Transport, C: Capture>(
+    transport: &mut T,
+    drv: &mut Driver,
+    host: &[u8],
+    lanes: &mut Lanes<'_>,
+    status: &IngressStatus,
+    counters: &HcCounters,
+    capture: &mut C,
+) -> Drained {
+    core_net::drain_until_idle!(
+        step: drive_one(transport, drv, host, lanes, status, counters, capture),
+        published: lanes.ticks.published(),
+        key: drv.state(),
+        closed: drv.state() == State::Closed,
+    )
 }
 
 /// Bump `Connecting → NeedsWsWrite` once the transport is TLS-ready.
@@ -416,24 +447,6 @@ fn flush_tx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()>
         drv.tx.clear();
     } else if written > 0 {
         drv.tx.consume(written);
-    }
-    Ok(())
-}
-
-fn fill_rx<T: Transport>(transport: &mut T, drv: &mut Driver) -> io::Result<()> {
-    loop {
-        if drv.rx.free_mut().is_empty() {
-            break;
-        }
-        match transport.read(drv.rx.free_mut()) {
-            Ok(0) => {
-                drv.state = State::Closed;
-                break;
-            }
-            Ok(n) => drv.rx.advance(n),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
-        }
     }
     Ok(())
 }
@@ -1027,6 +1040,8 @@ pub fn run<T: Transport, C: Capture>(
     mut connect: impl FnMut() -> Option<T>,
 ) -> RunResult {
     const TOKEN: mio::Token = mio::Token(0);
+    // Set when the drain hit its step cap: poll without sleeping.
+    let mut repoll_now = false;
     while !stop.load(Ordering::Relaxed) {
         // 1. Dial when due.
         let now = now_ns();
@@ -1054,11 +1069,12 @@ pub fn run<T: Transport, C: Capture>(
         }
 
         if poll
-            .poll(events, Some(std::time::Duration::from_millis(50)))
+            .poll(events, Some(core_net::poll_timeout(repoll_now)))
             .is_err()
         {
             return RunResult::Error;
         }
+        repoll_now = false;
 
         // 2. Readiness → pump.
         for ev in events.iter() {
@@ -1074,31 +1090,18 @@ pub fn run<T: Transport, C: Capture>(
             }
         }
 
-        // 3. Drain the connection. Progress is a CONSUMED FRAME or a
-        //    state change — not a tick: most Hypercall pushes are
-        //    republications that emit nothing, and an rx-full step of
-        //    them must not wait for the next readiness edge (the I-3 gap
-        //    of the tick-judged loops). Bounded, so the handoff and the
-        //    heartbeat keep their turn under a sustained flood.
+        // 3. Drain the connection (I-3, core_net::drain): again while a
+        //    step's read stopped on a full rx — most Hypercall pushes are
+        //    republications that publish nothing, and an rx-full run of
+        //    them must not wait for a readiness edge that never comes —
+        //    or it published or moved the state, at most DRAIN_STEP_CAP
+        //    steps; a capped drain resumes after a poll that does not
+        //    sleep, so the handoff and the heartbeat keep their turn.
         if let Some(t) = conn.transport.as_mut() {
-            let mut steps = 0u32;
-            loop {
-                let frames_before = conn.drv.frames;
-                let state_before = conn.drv.state();
-                if drive_one(t, &mut conn.drv, conn.host, lanes, status, counters, capture).is_err() {
-                    conn.kill(now_ns(), status, counters);
-                    break;
-                }
-                if conn.drv.state() == State::Closed {
-                    conn.kill(now_ns(), status, counters);
-                    break;
-                }
-                steps += 1;
-                if (conn.drv.frames == frames_before && conn.drv.state() == state_before)
-                    || steps >= MAX_DRAIN_STEPS
-                {
-                    break;
-                }
+            match drive_until_idle(t, &mut conn.drv, conn.host, lanes, status, counters, capture) {
+                Drained::Idle => {}
+                Drained::Capped => repoll_now = true,
+                Drained::Closed | Drained::Failed(_) => conn.kill(now_ns(), status, counters),
             }
         }
 

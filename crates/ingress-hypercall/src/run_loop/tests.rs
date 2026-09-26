@@ -73,7 +73,7 @@ impl Rig {
         }
     }
 
-    fn drive<C: Capture>(&mut self, t: &mut TestTransport, d: &mut Driver, cap: &mut C) -> io::Result<()> {
+    fn drive<C: Capture>(&mut self, t: &mut TestTransport, d: &mut Driver, cap: &mut C) -> io::Result<bool> {
         let mut lanes = Lanes {
             ticks: &mut self.ticks.0,
             events: &mut self.events.0,
@@ -81,6 +81,16 @@ impl Rig {
             opts: &mut self.opts.0,
         };
         drive_one(t, d, b"api.hypercall.xyz", &mut lanes, &self.status, &self.counters, cap)
+    }
+
+    fn drain<C: Capture>(&mut self, t: &mut TestTransport, d: &mut Driver, cap: &mut C) -> Drained {
+        let mut lanes = Lanes {
+            ticks: &mut self.ticks.0,
+            events: &mut self.events.0,
+            event_mask: self.mask,
+            opts: &mut self.opts.0,
+        };
+        drive_until_idle(t, d, b"api.hypercall.xyz", &mut lanes, &self.status, &self.counters, cap)
     }
 
     fn pop_ticks(&mut self) -> Vec<Tick> {
@@ -206,6 +216,30 @@ fn the_handshake_queues_a_clock_sync_then_one_subscribe_per_channel() {
     tr.inject_incoming(&text(br#"{"type":"Subscribed","channel":"indicative_market_data"}"#));
     rig.drive(&mut tr, &mut d, &mut NullCapture).unwrap();
     assert_eq!(d.sub_count(), 1);
+}
+
+/// I-3 (`core_net::drain`): a run of frames that publish nothing past a
+/// full rx no longer strands what follows it until a readiness edge that
+/// never comes — one drain reads it all, the quote behind it included;
+/// a backlog of `DRAIN_STEP_CAP` full-rx steps ends `Capped` (`run`
+/// re-polls at once, the handoff and the heartbeat get their turn) and
+/// the next drain finishes it.
+#[test]
+fn drive_until_idle_reads_past_a_full_rx_and_caps_a_backlog() {
+    for (fills, first) in [(2, Drained::Idle), (core_net::DRAIN_STEP_CAP as usize, Drained::Capped)] {
+        let mut rig = Rig::new(EVENT_LANE_FUNDING);
+        let mut d = steady();
+        let mut tr = TestTransport::with_capacity((fills + 1) * RX_BUF_SIZE);
+        tr.inject_server_pongs(fills * RX_BUF_SIZE);
+        tr.inject_incoming(&text(Q1));
+        assert_eq!(rig.drain(&mut tr, &mut d, &mut NullCapture), first);
+        if first == Drained::Capped {
+            assert!(rig.pop_ticks().is_empty(), "the quote still waits below the cap");
+            assert_eq!(rig.drain(&mut tr, &mut d, &mut NullCapture), Drained::Idle);
+        }
+        assert_eq!(rig.pop_ticks().len(), 1, "the quote behind the pongs is one tick");
+        assert_eq!(rig.drain(&mut tr, &mut d, &mut NullCapture), Drained::Idle, "nothing left");
+    }
 }
 
 #[test]

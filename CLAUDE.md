@@ -265,7 +265,8 @@ in the script; `ai` = 48 is the floor every name includes).
   indicative subscribe, quotes kept crossed or one-sided as published,
   per-provider sides on `ChannelId::ProviderQuote` = 14, index `Mark`s
   on `hypercall-idx:<U>`; a REST `/options-summary` poller thread over
-  an SPSC handoff), capture label `hypercall`, `/state` ingress row 10,
+  an SPSC handoff; the I-3 drain, `core_net::drain`, since the merge),
+  capture label `hypercall`, `/state` ingress row 10,
   `[hypercall]` in universe.toml (all 12 underlyings, E 3 × K 8 × {C,P}
   ≤ 1 024 instruments). `crates/core-settle`
   replicates the venue's settlement (median-of-means over a 1 s

@@ -3209,6 +3209,27 @@ paid=0`; license-check OK; `cargo +nightly fuzz build` OK; live smokes
 92 037 (92 876 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
 This work built no engine binary.
 
+**Hypercall joins (2026-09-26, the commit after its merge).**
+`ingress-hypercall` was built beside this change with its own drain:
+progress was a consumed frame or a state change, 64 steps, then the
+50 ms poll. That read past a run of republications that publish
+nothing, but a capped backlog still waited for the poll timeout, and
+the crate kept its own copy of the read loop. It now drains by
+`core_net::drain` like the others: `fill_rx`; `drive_one` returns the
+full-rx bool; `drive_until_idle` over `drain_until_idle!` (published =
+its tick producer, key = its state); `DRAIN_STEP_CAP` = 8 steps of its
+1 MiB rx; `poll_timeout` after a capped drain. Proof: two rx buffers of
+Pongs with a quote behind them are delivered by one drain; eight end
+`Capped` with the quote still below, and the next drain delivers it;
+with the full-rx signal cut, the test fails (checked by mutation). As
+for MEXC, the `run`-level re-poll is wired and tested through the
+drain, not end to end. Not changed: its reconnect is internal (one
+`HcConn`), like MEXC's `run_multi`, and a confirmed subscription resets
+its backoff; the 30 s healthy-session law (`7235201`) binds the seven
+outer spawn loops. Gates: nextest 3424 (6 skipped); alloc 86/86;
+clippy clean; copy-audit new=0; license OK; worker pytest unchanged.
+Live smoke, the engine untouched: at the go-live (the freshly built test binary waits on LuLu; 2026-09-26 11:36Z its boot `GET /markets` timed out while curl fetched the same 4.3 MB in 1.7 s).
+
 ### Batch subscribes render straight into tx (2026-09-26)
 
 On the operator's word (2026-09-25: "finish what's left of our
