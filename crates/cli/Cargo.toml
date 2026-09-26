@@ -60,6 +60,9 @@ exec-router          = { workspace = true }
 # the crate's ONLY caller in the binary; the engine's dispatch path
 # does not reach it (LIVE_ARM_VENUES is empty and asserted so).
 exec-hyperliquid     = { workspace = true }
+# HC9 (O-HC19): the Hypercall order arm, driven by the `hypercall-live`
+# operator verbs (the engine does not arm it before slot 7's ruling).
+exec-hypercall       = { workspace = true }
 # HYPARB H8: the HyperEVM write path, TESTNET ONLY (O-H5) — the shadow of
 # each paper AMM decision (O-H12) and the `evm-testnet` operator verbs.
 exec-hyperevm        = { workspace = true }

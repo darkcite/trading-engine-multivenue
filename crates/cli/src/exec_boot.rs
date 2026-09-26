@@ -387,6 +387,22 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         // boot inert, never downgrade to paper.
         if mode == ExecMode::Live {
             for v in &s.venues {
+                // HC9 (O-HC19): the Hypercall arm is BUILT — the
+                // `hypercall-live` verbs drive it on mainnet — but the
+                // engine does not arm it before slot 7's live-arming
+                // ruling (plan hc9-hc11 §1). Named on its own so the
+                // refusal says what that ruling has to settle.
+                if *v == core_types::VenueId::Hypercall as u8 {
+                    return Err(format!(
+                        "exec: slot {slot} ({slot_name}) is marked live for venue `hypercall`. \
+                         The Hypercall arm (HC9) is built, but the engine does not arm it \
+                         before slot 7's live-arming ruling, which must settle three things: \
+                         the E6 ledger has no options row (a short option would pass \
+                         cap_instance unseen), slot 7's HL hedges need an account whose perps \
+                         are reconciled, and the two-venue composition lands with it. The \
+                         arm's mainnet proof is scripts/hypercall-live.sh. Refusing the boot."
+                    ));
+                }
                 if !LIVE_ARM_VENUES.contains(v) {
                     let vname = core_config::exec::venue_name_from_id(*v).unwrap_or("?");
                     return Err(format!(
@@ -759,6 +775,22 @@ mod tests {
             ]
         );
         assert!(b.hl_arm_needed() && !b.hyparb_live());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// HC9: a live `hypercall` venue refuses the boot with its own
+    /// reason — the arm exists, the engine does not arm it before slot
+    /// 7's ruling — and the refusal names what that ruling settles.
+    #[test]
+    fn a_live_hypercall_venue_refuses_and_names_the_ruling() {
+        let d = tmp();
+        let p = write(&d, "exec.toml", &MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"hypercall\"]"));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("`hypercall`"), "{e}");
+        assert!(e.contains("slot 7's live-arming ruling"), "{e}");
+        assert!(e.contains("options row") && e.contains("reconciled"), "{e}");
+        assert!(e.contains("Refusing the boot"), "{e}");
+        assert!(!LIVE_ARM_VENUES.contains(&(core_types::VenueId::Hypercall as u8)));
         std::fs::remove_dir_all(&d).ok();
     }
 

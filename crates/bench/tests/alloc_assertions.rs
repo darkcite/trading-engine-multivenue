@@ -10640,3 +10640,88 @@ fn hypercall_sign_with_key_is_zero_alloc() {
     assert_eq!(allocs, 0, "Hypercall signing allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "Hypercall signing bytes should be zero: saw {bytes}");
 }
+
+/// **HC9 gate 84 — the Hypercall arm's per-order work is 0 B/op.** What
+/// one place, one replace and one cancel cost on the engine thread
+/// before and after the round trip: each body rendered IN PLACE into
+/// the (boot-allocated) body window and signed over its own spans (D7),
+/// the fail-closed answer scans, the rate governor, and the private
+/// socket's reader over a `Fill` and an `OrderUpdate` with the fill-id
+/// dedupe — plus one reconcile page of each kind. The TLS round trip
+/// itself is gate 77b's (`HttpsReq`, exactly rustls' 2 per request).
+#[test]
+fn hypercall_arm_render_sign_and_scan_is_zero_alloc() {
+    use exec_hypercall::{budget, cloid, events, recon, render, response};
+    use signer_eip712::hypercall as hc;
+    let sk = signer_eip712::parse_secret_key(&[0x42; 32]).expect("gate 84 key");
+    let ds = hc::hc_domain_separator(hc::HC_CHAIN_ID_MAINNET);
+    let wallet = [0x5a; 20];
+    let mut body = vec![0u8; 2048];
+    let mut gov = budget::HcBudget::new();
+    let mut ids = events::FillIds::new();
+    const ACK: &[u8] = br#"{"timestamp":1,"info":{"symbol":"BTC-20261002-100000-C","price":"12.5","size":"0.2","side":"Buy","tif":"ioc","is_perp":false,"order_id":42},"status":"PARTIALLY_FILLED","filled_size":"0.1","wallet_address":"0x5a","order_id":42,"reason":null}"#;
+    const CXL: &[u8] = br#"{"success":true,"data":{"status":"CANCELED","filled_size":"0.1","order_id":42},"error":null}"#;
+    const FILL: &[u8] = br#"{"type":"Fill","order_id":42,"fill_id":7,"symbol":"BTC-20261002-100000-C","side":"buy","price":"12.5","size":"0.1","timestamp":1767225600000,"wallet_address":"0x5a","fee":"0.01","trade_id":9,"is_taker":true}"#;
+    const UPD: &[u8] = br#"{"type":"OrderUpdate","order_id":42,"status":"CANCELED","filled_size":"0.1","timestamp":2,"reason":null}"#;
+    const ORDERS: &[u8] = br#"{"success":true,"data":[{"order_id":1,"symbol":"BTC-20261002-100000-C","side":"buy","size":"0.2","filled_size":"0","client_id":"48430107000000000000002a00000000","status":"open"}],"pagination":{"limit":100,"offset":0,"count":1}}"#;
+    const PORT: &[u8] = br#"{"success":true,"data":{"positions":[{"symbol":"BTC-20261002-100000-C","amount":"-0.1","entry_price":"12.5"}],"available_balance":"4.5"},"error":null}"#;
+    // Warm: the process-wide secp256k1 context, as the arm at boot.
+    hc::sign_hc_with_key(&sk, &ds, &hc::revoke_all_agents_struct_hash(0)).expect("gate 84 warm-up");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 500 {
+        let cid = cloid::encode(7, n);
+        let p = render::Place {
+            wallet: &wallet,
+            symbol: b"BTC-20261002-100000-C",
+            buy: n % 2 == 0,
+            px_1e6: 12_500_000 + n as i64,
+            qty_1e6: 200_000,
+            tif: render::Tif::Ioc,
+            route: render::Route::BestExecution,
+            client_id: &cid,
+            nonce: 1_790_400_000_000_000 + n,
+        };
+        let k1 = render::place(&mut body, &p, &sk, &ds).expect("gate 84 place");
+        let r = render::Replace {
+            wallet: &wallet,
+            order_id: 42 + n,
+            symbol: b"BTC-20261002-100000-C",
+            buy: true,
+            px_1e6: 12_000_000,
+            qty_1e6: 100_000,
+            tif: render::Tif::Gtc,
+            client_id: &cid,
+            nonce: 2 * n + 1,
+        };
+        let k2 = render::replace(&mut body, &r, &sk, &ds).expect("gate 84 replace");
+        let k3 = render::cancel_cloid(&mut body, &wallet, &cid, 3 * n + 2, &sk, &ds).expect("gate 84 cancel");
+        let a = response::scan_place(200, ACK).expect("gate 84 ack");
+        let c = response::scan_cancel(200, CXL).expect("gate 84 cancel ack");
+        assert!(gov.place(1_000 + n * 2_000).is_ok(), "gate 84 governor place");
+        assert!(gov.cancel(1_000 + n * 2_000).is_ok(), "gate 84 governor cancel");
+        if let events::Msg::Fill(f) = events::parse(FILL) {
+            acc = acc.wrapping_add(u64::from(ids.first_time(f.fill_id + n))).wrapping_add(f.qty_1e6 as u64);
+        }
+        if let events::Msg::Update(u) = events::parse(UPD) {
+            acc = acc.wrapping_add(u.filled_1e6 as u64);
+        }
+        let mut open = 0u64;
+        assert_eq!(recon::scan_orders(200, ORDERS, |o| open += o.size_1e6 as u64), Ok(1));
+        assert!(recon::scan_portfolio(200, PORT, |_, amt, _| open = open.wrapping_add(amt as u64)).is_ok());
+        acc = acc
+            .wrapping_add((k1 + k2 + k3) as u64)
+            .wrapping_add(a.order_id + c.order_id)
+            .wrapping_add(u64::from(body[k3 - 3]))
+            .wrapping_add(open);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "the Hypercall arm's per-order work allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "the Hypercall arm's per-order work bytes should be zero: saw {bytes}");
+}

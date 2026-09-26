@@ -70,6 +70,9 @@ members = [
     "crates/clob-dispatcher",
     "crates/exec-router",
     "crates/exec-hyperliquid",
+    # HC9 (O-HC19): the Hypercall order arm — operator verbs only until
+    # slot 7's live-arming ruling (plan hc9-hc11 §1)
+    "crates/exec-hypercall",
     "crates/signer-eip712",
     # HYPARB H7 (O-H7): chain-agnostic EIP-1559 render + sign
     "crates/signer-evm",
@@ -213,6 +216,7 @@ strategy-xsd          = { path = "crates/strategy-xsd" }
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }
 exec-hyperliquid = { path = "crates/exec-hyperliquid" }
+exec-hypercall  = { path = "crates/exec-hypercall" }
 signer-eip712   = { path = "crates/signer-eip712" }
 signer-evm      = { path = "crates/signer-evm" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }

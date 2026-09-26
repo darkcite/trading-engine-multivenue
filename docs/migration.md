@@ -6,6 +6,38 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `crates/exec-hypercall`: the Hypercall order arm and its operator verbs (HC9, O-HC19)
+
+**What changed**
+
+- `crates/exec-hypercall` (new): `HcExchange`, a complete `OrderDispatch` for Hypercall options:
+  - `POST /order`, `PUT /order` and `DELETE /order_cloid` bodies are rendered in place and signed over their own spans (HC8, D7);
+  - a fail-closed answer scanner;
+  - the private fills socket (`Authenticate` the owner, then `fills` and `order_updates`);
+  - reconciliation over `/portfolio`, `/orders?status=open` and `/fills`;
+  - a sliding-window rate governor for the Default tier;
+  - the E-9 client id (`HC`, version, slot, `client_oid`, check).
+- `multivenue-engine hypercall-live <status|simulate|recon|dust|cancel-all>` and `scripts/hypercall-live.sh`, the mainnet operator verbs. The two writes need `--confirm`.
+- `exec_boot` refuses a live slot on `hypercall` with a reason of its own. It names what slot 7's live-arming ruling must settle; the risk-policy entry "HYPERCALL — the order arm" has the detail.
+- `make copy-audit` covers `crates/exec-hypercall`.
+- New fuzz targets `hypercall_response` and `hypercall_userws`.
+- New alloc gate 84.
+
+**Impact**
+
+- None on the running engine: nothing in it constructs the arm, and a live `hypercall` slot refuses the boot. The new keys (`HYPERCALL_WALLET`, `HYPERCALL_AGENT_KEY`) are read by the verbs only.
+
+**Migration steps**
+
+1. The operator adds `HYPERCALL_WALLET` (the owner address) and `HYPERCALL_AGENT_KEY` (the signer) to the repo `.env` (`chmod 600`). A session never writes `.env`.
+2. `cargo build --release -p cli` (or a separate `CARGO_TARGET_DIR` for a standalone smoke — G0).
+3. Run the read-only verbs first: `scripts/hypercall-live.sh status` and `recon`, then `simulate --symbol <SYM>`.
+4. The operator's dust smoke: `scripts/hypercall-live.sh dust --symbol <SYM> --confirm`. PASS means the order was signed on mainnet, cancelled, and nothing filled.
+
+**Rollback**
+
+- Nothing to roll back at runtime. Remove the two `.env` lines to disable the verbs.
+
 ## 2026-09-26 — `signer_eip712::hypercall`: the venue's EIP-712 actions, sign-only (HC8, O-HC17)
 
 **What changed**

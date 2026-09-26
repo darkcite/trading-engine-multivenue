@@ -51,6 +51,8 @@ core-fill          = { path = "../crates/core-fill" }
 ingress-hypercall  = { path = "../crates/ingress-hypercall" }
 # evm_exec_response: the HYPARB H7c write-path response scanners.
 exec-hyperevm      = { path = "../crates/exec-hyperevm" }
+# hypercall_{response,userws}: the HC9 order arm's answer and event scanners.
+exec-hypercall     = { path = "../crates/exec-hypercall" }
 
 [[bin]]
 name   = "ai_cmd_frame"
@@ -419,6 +421,20 @@ bench  = false
 [[bin]]
 name   = "hypercall_summary"
 path   = "fuzz_targets/hypercall_summary.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_response"
+path   = "fuzz_targets/hypercall_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_userws"
+path   = "fuzz_targets/hypercall_userws.rs"
 test   = false
 doc    = false
 bench  = false

@@ -160,6 +160,51 @@ enum Cmd {
     /// Reads keys from the environment and never opens `.env` —
     /// `scripts/evm-live.sh` sources it. Report on stdout.
     EvmLive(EvmLiveArgs),
+    /// HC9 (ruling O-HC19): the Hypercall order arm's MAINNET operator
+    /// verbs — `status`, `simulate` (`POST /risk/simulate/orders`, never
+    /// mutates), `recon` (read-only), `dust` (one `book_only` bid of
+    /// `--size` at `--price` on `--symbol`, its cancel by client id and
+    /// a reconcile) and `cancel-all` (every order of ours the venue
+    /// lists). There is no testnet: the two writes need `--confirm`.
+    /// Reads `HYPERCALL_WALLET` / `HYPERCALL_AGENT_KEY` from the
+    /// environment and never opens `.env` — `scripts/hypercall-live.sh`
+    /// sources it. Report on stdout.
+    HypercallLive(HypercallLiveArgs),
+}
+
+/// `hypercall-live` verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HcVerb {
+    /// Who signs for which wallet; the private socket; balance, orders.
+    Status,
+    /// The venue's margin check of the dust leg (never mutates).
+    Simulate,
+    /// One reconciliation.
+    Recon,
+    /// The mainnet dust smoke (a WRITE: `--confirm`).
+    Dust,
+    /// Cancel every order of ours (a WRITE: `--confirm`).
+    CancelAll,
+}
+
+#[derive(Debug, Parser)]
+struct HypercallLiveArgs {
+    /// The verb.
+    #[arg(value_enum)]
+    verb: HcVerb,
+    /// The instrument, the venue's own spelling
+    /// (`<UND>-<YYYYMMDD>-<STRIKE>-<C|P>`); `simulate` and `dust` need it.
+    #[arg(long)]
+    symbol: Option<String>,
+    /// `dust` / `simulate`: the bid, USD per contract.
+    #[arg(long, default_value = "0.0005")]
+    price: String,
+    /// `dust` / `simulate`: contracts.
+    #[arg(long, default_value = "0.000001")]
+    size: String,
+    /// Required by every write: this is mainnet.
+    #[arg(long, default_value_t = false)]
+    confirm: bool,
 }
 
 /// `evm-live` verbs.
@@ -1127,7 +1172,80 @@ fn main() -> ExitCode {
             init_tracing_stderr();
             evm_live(args)
         }
+        Cmd::HypercallLive(args) => {
+            init_tracing_stderr();
+            hypercall_live(args)
+        }
     }
+}
+
+/// HC9: the `hypercall-live` verbs (`exec_hypercall::smoke`). Exit 0
+/// PASS, 1 FAIL, 2 refused (no `--confirm`, or a configuration that
+/// does not build).
+fn hypercall_live(args: HypercallLiveArgs) -> ExitCode {
+    use exec_hypercall::smoke;
+    let cfg = match exec_hypercall::HcExecConfig::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    println!(
+        "hypercall-live: wallet {} · signer {} ({}) · host {}",
+        exec_hypercall::config::hex20(cfg.wallet()),
+        exec_hypercall::config::hex20(cfg.signer()),
+        if cfg.owner_signs() {
+            "the owner's own key"
+        } else {
+            "an agent — the owner must have approved it"
+        },
+        cfg.rest_host()
+    );
+    let (Some(px), Some(qty)) = (
+        exec_hypercall::num::scan_1e6_exact(args.price.as_bytes()),
+        exec_hypercall::num::scan_1e6_exact(args.size.as_bytes()),
+    ) else {
+        eprintln!("hypercall-live: --price and --size are plain decimals");
+        return ExitCode::from(2);
+    };
+    let mut table = exec_hypercall::HcInstruments::new();
+    if let Some(sym) = args.symbol.as_deref() {
+        let id = core_types::make_symbol_id(
+            core_types::VenueId::Hypercall,
+            core_config::universe::OPT_ORDINAL_BASE + 1,
+        );
+        if let Err(e) = table.insert(id, sym.as_bytes()) {
+            eprintln!("hypercall-live: --symbol {sym:?} refused: {e:?}");
+            return ExitCode::from(2);
+        }
+    } else if matches!(args.verb, HcVerb::Simulate | HcVerb::Dust) {
+        eprintln!("hypercall-live: this verb needs --symbol");
+        return ExitCode::from(2);
+    }
+    let mut arm = match exec_hypercall::HcExchange::new(
+        &cfg,
+        TlsTransport::default_client_config(),
+        table,
+        exec_hypercall::HC_SLOT,
+        443,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("hypercall-live: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut out = std::io::stdout();
+    let v = match args.verb {
+        HcVerb::Status => smoke::status(&mut arm, &mut out),
+        HcVerb::Simulate => smoke::simulate(&mut arm, px, qty, &mut out),
+        HcVerb::Recon => smoke::recon(&mut arm, &mut out),
+        HcVerb::Dust => smoke::dust(&mut arm, px, qty, args.confirm, &mut out),
+        HcVerb::CancelAll => smoke::cancel_all(&mut arm, args.confirm, &mut out),
+    };
+    println!("hypercall-live: counters {:?}", arm.counters());
+    ExitCode::from(v.code())
 }
 
 /// HYPARB L1: the `evm-live` verbs. Exit 0 only when the verb did what

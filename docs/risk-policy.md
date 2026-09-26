@@ -6496,3 +6496,60 @@ engine gate driving the paper order-event pump.
 
 The laws XH-1…XH-7 (plan §10) are proposed for this file when their
 phase lands (XH3 paper member, XH4 execution).
+
+## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
+
+`crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
+options (`HcExchange`). It is **not armed by the engine**:
+`exec_boot` refuses any live slot naming `hypercall`, and its refusal
+names what slot 7's live-arming ruling must settle first:
+
+1. **An options row in the E6 ledger.** Its exposure clamp values HIP-4
+   binaries (Σ|yes−no|, $1 a contract). An option SELL is an unbound leg
+   that adds nothing, so a short option would pass `cap_instance` unseen.
+2. **An HL account whose perps are reconciled, for slot 7's hedges.**
+   The operator arm reconciles `spotClearinghouseState`, not perps.
+   HYPARB's answer was its own wallet plus a `clearinghouseState` recon
+   (O-HL3).
+3. **The two-venue composition.** `VenueSplit`, the venue-keyed twin of
+   `SlotSplit`, and its boot branch land with that ruling.
+
+What drives the arm today is the operator's `hypercall-live` verbs
+(`scripts/hypercall-live.sh`, zsh). There is no testnet, so every live
+proof is a mainnet micro-step:
+
+| verb | effect |
+|---|---|
+| `status` | read-only |
+| `simulate` | `POST /risk/simulate/orders`, never mutates |
+| `recon` | read-only |
+| `dust --symbol S [--price P --size Q] --confirm` | places one `book_only` GTC bid, 0.000001 @ $0.0005 by default; cancels it by client id; reconciles. PASS needs all of: the place accepted; the cancel answered CANCELED with nothing filled; no fill on the socket; and a reconcile afterwards that agrees on every leg, finds nothing of ours open, and leaves the symbol's position unchanged. It refuses to send while orders of ours are already open. When a place's fate is unknown (a 5xx, a 429, an unreadable answer, or no answer) it takes the order back by client id and reconciles. |
+| `cancel-all --confirm` | cancels every order of ours that the venue lists |
+
+- **Writes need `--confirm`**, else exit 2. This is the HYPARB L1 precedent: a session builds the verbs and runs only the reads, and **an order on mainnet is the operator's to send**.
+- **Keys:** the verbs read `HYPERCALL_WALLET` (the owner, an address only) and `HYPERCALL_AGENT_KEY` (the signer, `SecretKeyBytes`, mlock'd) from the environment. The script sources the repo `.env`, or `HYPERCALL_ENV_FILE`. The binary never opens it.
+- **Signer:** `owner_signs` says whether the owner's own key or an approved agent signs.
+
+The arm's laws, which bind the verbs now and the engine later:
+
+* **E-1.** A failure is a refusal, counted, and never a modelled fill.
+* **E-3 / D7.** Every write body (`POST /order`, `PUT /order`, `DELETE /order_cloid`) is rendered IN PLACE into the `HttpsReq` body window. The EIP-712 struct hash is taken over that body's own spans (HC8). Price and size are rendered once, as 6 dp with trailing zeros trimmed.
+* **Fail closed.** An acceptance requires all of:
+  * HTTP 200;
+  * a body that is one well-formed object;
+  * a UNIQUE top-level `status` in {ACKED, OPEN, PARTIALLY_FILLED, FILLED};
+  * a top-level integer `order_id`.
+
+  A `REJECTED` at 200 is a refusal and keeps its reason. `CANCELED` with nothing filled is an IoC miss: not a reject streak, the E7-F2 lesson. A 401/403 is `SignerRejected`. The fuzz target is `hypercall_response`.
+* **IoC only.** The engine's maker (kind 0) is POST-ONLY and the venue has no post-only time in force (`gtc | ioc | fok`), so `submit` refuses it — a `gtc` would cross, and paper and live would disagree. The verbs' resting order is `place_resting` (`gtc` + `book_only`, priced where nothing can cross).
+* **A refused cancel is not a gone order.** Only an explicit "not found" releases the row; any other refusal (a used nonce, a 4xx, a 5xx, an unreadable answer) keeps the order WORKING, and `cancel_all_state` reads Working until the venue confirms. A `success:true` whose order is still working is not a cancel.
+* **E-5.** The HTTP answer is the ACK. The private socket's `Fill` is the FILL. The socket is separate from the data lane (D1), unsigned `Authenticate` of the OWNER wallet, then `fills` + `order_updates`, both confirmed (`Subscribed`) before the socket counts as up; an `Error` on it forces a reconnect. Liveness is a pump that read without error (the venue pings every 20 s). Fills are deduped by `fill_id`, attributed to the slot and to the member's `client_oid` through the ACK table, and handed out by `try_next_fill` from the arm's own queue (the HyparbLive precedent, so no engine fill lane).
+* **E-9.** `client_id` is 32 hex characters: `HC`, version, slot, `client_oid`, and an FNV check. An id not of that shape is not ours, and the sweep leaves it alone.
+* **Reconcile.** `GET /portfolio`, `/orders?status=open` and `/fills` run once a minute on the idle path. The first adopts the venue's positions; each later one compares them and reports drift and unseen legs in `HaltSignal`. Every read refuses an unreadable body; none reads an empty book.
+* **The rate governor.** It enforces the Default tier as a SLIDING 60 s window on the monotonic clock, assuming one venue replica:
+  * places stop at 90 % of 60 orders and 600 requests;
+  * cancels are exits and pass up to 120 cancels and 600 requests, even during a 429 back-off (5 s; `Retry-After` is not read — `HttpsReq` returns no headers).
+* **Nonces.** `max(ms × 1000, last + 1)`, below 2^53 (the SDK's JS `Number`), never on a zero clock.
+
+- **Gates:** unit and TLS-loopback tests, fuzz `hypercall_response` and `hypercall_userws`, alloc gate 84 (render + sign + scans at 0 B/op), and `make copy-audit` over the crate.
+- **Deferred:** MMP, because SDK 0.1.0 has no `SetMmpConfig` field order. RFQ, because S1 routes `best_execution`.

@@ -58,6 +58,8 @@ exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
 exec-hyperliquid     = { workspace = true }
 signer-eip712        = { workspace = true }
+# HC9 gate 84: the Hypercall arm's render + sign + answer scan.
+exec-hypercall       = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.

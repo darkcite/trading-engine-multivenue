@@ -146,6 +146,7 @@ dependencies = [
  "dhat",
  "engine",
  "engine-snapshot",
+ "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
@@ -342,6 +343,7 @@ dependencies = [
  "core-vol",
  "engine",
  "engine-snapshot",
+ "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
  "exec-router",
@@ -748,6 +750,25 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exec-hypercall"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-fill",
+ "core-net",
+ "core-parse",
+ "core-time",
+ "core-types",
+ "mio 0.8.11",
+ "rcgen",
+ "rustls",
+ "secp256k1",
+ "signer-eip712",
+ "zeroize",
 ]
 
 [[package]]

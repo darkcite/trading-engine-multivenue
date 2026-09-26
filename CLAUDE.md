@@ -10,7 +10,8 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
 spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
-MEXC (data-only), Hypercall options (data-only),
+MEXC (data-only), Hypercall options (data-only in the engine; the
+HC9 order arm runs as operator verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
 Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
@@ -260,7 +261,9 @@ in the script; `ai` = 48 is the floor every name includes).
   rulings O-HC1..O-HC10: no keys, no exec arm; HC9–HC11 each a separate
   ruling after the research's R1 gate — HC8, the sign-only signer, came
   forward under O-HC17: `signer_eip712::hypercall`, every SDK type, 38
-  SDK vectors byte-exact, gate 83; go-live is staged for a daily
+  SDK vectors byte-exact, gate 83; HC9 — the order arm
+  `crates/exec-hypercall` — came forward under O-HC19 as the operator's
+  `hypercall-live` verbs, never armed by the engine; go-live is staged for a daily
   restart the operator names — `[hypercall]` and the `fees.toml` lines
   just before it, `hypercall_history` scheduled, the HAR steps of the H3
   plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
@@ -572,6 +575,11 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   the seqlock `/state` snapshot; `crates/tui`.
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
+  `crates/exec-hypercall` — the Hypercall order arm (HC9, O-HC19): driven
+  only by the operator's `hypercall-live` verbs
+  (`scripts/hypercall-live.sh`; mainnet writes need `--confirm`); the
+  engine refuses a live `hypercall` slot until slot 7's live-arming
+  ruling (risk-policy "HYPERCALL — the order arm").
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
   path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
   compile-time asserted); mainnet only through a `MainnetAuthority`
