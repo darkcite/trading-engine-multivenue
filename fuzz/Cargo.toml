@@ -47,6 +47,8 @@ core-amm           = { path = "../crates/core-amm" }
 ingress-hyperevm   = { path = "../crates/ingress-hyperevm" }
 # amm_book: the HYPARB H2 AMM fill law (pool book + judge).
 core-fill          = { path = "../crates/core-fill" }
+# hypercall_{ws_frame,markets,summary}: the HC3/HC4 Hypercall parsers.
+ingress-hypercall  = { path = "../crates/ingress-hypercall" }
 # evm_exec_response: the HYPARB H7c write-path response scanners.
 exec-hyperevm      = { path = "../crates/exec-hyperevm" }
 
@@ -396,6 +398,27 @@ bench  = false
 [[bin]]
 name   = "evm_exec_response"
 path   = "fuzz_targets/evm_exec_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_ws_frame"
+path   = "fuzz_targets/hypercall_ws_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_markets"
+path   = "fuzz_targets/hypercall_markets.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "hypercall_summary"
+path   = "fuzz_targets/hypercall_summary.rs"
 test   = false
 doc    = false
 bench  = false

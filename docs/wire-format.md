@@ -218,7 +218,7 @@ per-venue event log (plan §6.5). BBO has no `ChannelId` — BBO flows as
 |      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete time             |
 |      8 |     4 | sym           | `u32` SymbolId | `SYMBOL_ID_NONE` for venue-global channels |
 |     12 |     1 | venue         | `u8` VenueId   |                                         |
-|     13 |     1 | channel       | `u8` ChannelId | 0=Trade (VT2, 2026-09-03: Binance SPOT prints now emitted by the aggTrade sentinel — `venue_seq`=aggregate id, `venue_time_ms`=`T`, `v0`=px ×1e6, `v1`=qty ×1e6 negated when `m:true` (aggressor sold), the cross-venue sign convention; capture only) 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta (clarified 2026-09-12, BIN15 O1 — no layout change: `v0`=the `HlOutcomeMetaFrame::kind` byte, `venue_time_ms`=the optional `time` (**0 on every live frame** — the venue's `outcomeMetaUpdates` shape carries no top-level `time`), `v1`=0. The frame's `enc` is now derived from the outcome id as `10 * id` (the Yes side) instead of from a `#<enc>` coin key, but `enc` is NOT a captured field: `sym` still resolves only through a `#<enc>` coin present in the boot coin table, and the live shape carries no coin key, so captured OutcomeMeta rows keep `sym`=`SYMBOL_ID_NONE` until the BIN15 O2 rolling-family pool maps an enc to a reserved slot sym. The per-instance economics — strike, expiry, TWAP window — live in the `description` string, which this event does not carry either; O2 puts them in their own event) 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) 11=SubDrop (appended 2026-08-29, WS2 — non-fatal subscribe drop on a reconnect session: `sym`=dropped instrument (`SYMBOL_ID_NONE` when the venue error names none), `venue_seq`=0, `venue_time_ms`=0, `v0`=venue numeric error code (0 = missing-from-echo), `v1`=venue-local channel discriminant (−1 = unknown / folded Deribit option row; Deribit static rows carry the CHANNEL\_ORDER index 0=quote 1=ticker 2=trades 3=book). Emitted 1:1 with every `sub_drops_total` increment — same §6.6 pairing contract as the gap events) 13=InstrumentRoll (appended 2026-09-12, BIN15 O2 — a ROLLING family's `SymbolId` slot changed which venue instrument it means. HIP-4 outcome markets are born and die on a schedule (the BTC 15-minute family creates its next instance at the previous one's expiry, 96 times a day), so a fixed sym cannot name one instrument for a whole capture, and `instrument-manifest.tsv` is two columns by law. This event IS the record of which instance a slot meant from when, and without it a captured slot sym is uninterpretable offline. `sym` = the family's **Yes** slot (the No leg is the next ordinal); `venue_time_ms` = 0 (the venue's lifecycle push carries no time); `v0` = strike ×1e6; `v1` = expiry ns; `venue_seq` PACKS the identity — bits 0..32 outcome id (`enc` = `10 × id`), 32..48 settlement TWAP seconds (`seconds:`, 0 = settle at `T`), 48..56 family index in the boot `rolling` list, 56..64 0 = created / 1 = settled. Two events per roll in the venue's own order: the outgoing instance's `settled` (the book empties, the slot keeps its binding) then the successor's `created` (the slot is rebound). One exception (2026-09-26): a reconnect that retires a settled or expired instance records no `settled` for it — its later push matches no slot — and the successor re-discovered over `/info` arrives as a lone `created`, stamped when adopted. Read offline with `claude_worker.hip4.read_rolls`) 12=VolIndex (appended 2026-08-29, WS6 — Deribit DVOL `deribit_volatility_index.{index}`: venue-GLOBAL series, `sym`=`SYMBOL_ID_NONE`, `venue_time_ms`=venue ts, `v0`=volatility POINTS ×1e9 (59.18 → 59\_180\_000\_000), `v1`=0-based ordinal of the index in the boot-configured `[deribit] options_underlyings` list — the boot log + universe file are the ordinal's resolution) |
+|     13 |     1 | channel       | `u8` ChannelId | 0=Trade (VT2, 2026-09-03: Binance SPOT prints now emitted by the aggTrade sentinel — `venue_seq`=aggregate id, `venue_time_ms`=`T`, `v0`=px ×1e6, `v1`=qty ×1e6 negated when `m:true` (aggressor sold), the cross-venue sign convention; capture only) 1=Book 2=Mark 3=Funding 4=Ticker 5=AssetCtx 6=AllMids 7=OutcomeMeta (clarified 2026-09-12, BIN15 O1 — no layout change: `v0`=the `HlOutcomeMetaFrame::kind` byte, `venue_time_ms`=the optional `time` (**0 on every live frame** — the venue's `outcomeMetaUpdates` shape carries no top-level `time`), `v1`=0. The frame's `enc` is now derived from the outcome id as `10 * id` (the Yes side) instead of from a `#<enc>` coin key, but `enc` is NOT a captured field: `sym` still resolves only through a `#<enc>` coin present in the boot coin table, and the live shape carries no coin key, so captured OutcomeMeta rows keep `sym`=`SYMBOL_ID_NONE` until the BIN15 O2 rolling-family pool maps an enc to a reserved slot sym. The per-instance economics — strike, expiry, TWAP window — live in the `description` string, which this event does not carry either; O2 puts them in their own event) 8=PriceChange 9=TradeGap 10=BookGap (appended 2026-08-15, G1 remediation — gap-monitor pairing events: TradeGap `v0`=expected seq `v1`=observed seq; BookGap `v0`=expected prev\_change\_id (`i64::MIN` = awaiting snapshot) `v1`=observed prev\_change\_id. Emitted 1:1 with every runtime `gaps_total` increment so §6.6's pairing letter is checkable offline) 11=SubDrop (appended 2026-08-29, WS2 — non-fatal subscribe drop on a reconnect session: `sym`=dropped instrument (`SYMBOL_ID_NONE` when the venue error names none), `venue_seq`=0, `venue_time_ms`=0, `v0`=venue numeric error code (0 = missing-from-echo), `v1`=venue-local channel discriminant (−1 = unknown / folded Deribit option row; Deribit static rows carry the CHANNEL\_ORDER index 0=quote 1=ticker 2=trades 3=book). Emitted 1:1 with every `sub_drops_total` increment — same §6.6 pairing contract as the gap events) 13=InstrumentRoll (appended 2026-09-12, BIN15 O2 — a ROLLING family's `SymbolId` slot changed which venue instrument it means. HIP-4 outcome markets are born and die on a schedule (the BTC 15-minute family creates its next instance at the previous one's expiry, 96 times a day), so a fixed sym cannot name one instrument for a whole capture, and `instrument-manifest.tsv` is two columns by law. This event IS the record of which instance a slot meant from when, and without it a captured slot sym is uninterpretable offline. `sym` = the family's **Yes** slot (the No leg is the next ordinal); `venue_time_ms` = 0 (the venue's lifecycle push carries no time); `v0` = strike ×1e6; `v1` = expiry ns; `venue_seq` PACKS the identity — bits 0..32 outcome id (`enc` = `10 × id`), 32..48 settlement TWAP seconds (`seconds:`, 0 = settle at `T`), 48..56 family index in the boot `rolling` list, 56..64 0 = created / 1 = settled. Two events per roll in the venue's own order: the outgoing instance's `settled` (the book empties, the slot keeps its binding) then the successor's `created` (the slot is rebound). One exception (2026-09-26): a reconnect that retires a settled or expired instance records no `settled` for it — its later push matches no slot — and the successor re-discovered over `/info` arrives as a lone `created`, stamped when adopted. Read offline with `claude_worker.hip4.read_rolls`) 12=VolIndex (appended 2026-08-29, WS6 — Deribit DVOL `deribit_volatility_index.{index}`: venue-GLOBAL series, `sym`=`SYMBOL_ID_NONE`, `venue_time_ms`=venue ts, `v0`=volatility POINTS ×1e9 (59.18 → 59\_180\_000\_000), `v1`=0-based ordinal of the index in the boot-configured `[deribit] options_underlyings` list — the boot log + universe file are the ordinal's resolution) 14=ProviderQuote (appended 2026-09-26, HC3 — Hypercall, plan `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md` §3 HC3: ONE side of ONE market-maker's indicative quote, emitted for every `IndicativeMarketData` push with **≥ 2 providers** (the headline BBO is the tick; with one provider the tick IS that provider). Two events per provider in the venue's array order — bid, then ask. `sym` = the option instrument, `venue_time_ms` = the provider's own `updated_at`, `v0` = px ×1e6, `v1` = max size ×1e6 contracts (0 / 0 for a side the provider does not quote), `venue_seq` PACKS the identity — bits 0..8 the provider's index in the frame, bit 8 the side (0 bid / 1 ask), 16..24 the frame's `num_providers`, 32..64 the provider wallet's LOW 32 bits (its last 8 hex digits; a stable per-provider key, not an address). Capture always; the event lane only when the boot's lane mask names it. Why it exists: the venue's headline BBO can be CROSSED across providers (5.3 % of two-sided pushes on 2026-09-25, one stale provider) and only the per-provider rows let an offline reader attribute it) |
 |     14 |     2 | _pad0         | `[u8; 2]`      | explicit, zeroed                        |
 |     16 |     8 | venue_seq     | `u64`          | full-width venue seq; 0 where none. WS3 (2026-08-29) exception: HL AssetCtx rows (channel 5) carry `premium` ×1e9 BIT-CAST `i64`→`u64` here (the ctx has no venue seq; pre-WS3 rows are a constant 0 — the M4 hash128-in-px/qty packing precedent) |
 |     24 |     8 | venue_time_ms | `u64`          | venue timestamp ms; 0 where absent      |
@@ -642,7 +642,7 @@ shadow-P&L) resolve option syms through this file. UTF-8 text, one
 line per selected instrument,
 `<venue_label>\t<sym_u32_decimal>\t<instrument_name>\n`, where
 `venue_label` is the venue's capture-file prefix (`deribit`, `okx`,
-`bn`); no header line; present only when the boot selected ≥ 1
+`bn`, `hypercall` since HC4); no header line; present only when the boot selected ≥ 1
 option instrument (absence = options-less or pre-M2-close run).
 Readers parse strictly and skip-and-count malformed lines.
 
@@ -698,6 +698,49 @@ before any later event, so a replay rebuilds the maps the live member
 walked. A capture is therefore self-describing: the harness prices and
 judges a pool from the tape alone (`core_fill::AmmBook`). Volume: one
 signal per event (≈ 2 per swap), never per block per pool.
+
+### Hypercall (HC3)
+
+Label `hypercall` (VenueId 9), appended after `hyperevm`. DATA-ONLY
+(ruling O-HC1: no keys, no exec arm, the paper matcher refuses the
+venue). One public WebSocket (`wss://api.hypercall.xyz/ws`) plus a REST
+poller thread; both write through the ingress thread's one
+`PmlrCapture` (the poller hands its rows over an SPSC ring), so every
+file keeps one writer. The per-venue law (`crates/ingress-hypercall`):
+
+- **Ticks are BBO CHANGES** of the `indicative_market_data` quote (the
+  MEXC D11 law): a push whose `(bid px, bid qty, ask px, ask qty)` and
+  stale verdict equal the last one EMITTED for the instrument writes no
+  tick row. Quotes are written as the venue published them — ONE-SIDED
+  (the missing side `0 / 0`) and CROSSED included; a push with neither
+  side writes nothing. Prices ×1e6 USD per contract, quantities ×1e6
+  CONTRACTS (1 contract = 1 unit of the underlying). `venue_time_ms` =
+  the quote's `timestamp` (the providers' quote stamp — the staleness
+  clock), NOT `published_at` (their difference is the
+  `quote_publish_lag_ms` gauge). `venue_seq` = 0: the feed has no
+  sequence, so the §6.2 chain law does not apply and `gaps_total`
+  stays 0. An instrument the venue announces `Expired`/`Deleted` stops
+  writing for the rest of the process.
+- `Trade` (0): `v0` = px ×1e6, `v1` = size ×1e6 contracts, negated when
+  the aggressor sold; `venue_time_ms` = the print's `timestamp`. Prints
+  on instruments outside the universe are counted, not written.
+- `Mark` (2): the venue's underlying INDEX, one row per configured
+  underlying per `IndexPriceUpdate` (≈ every 2 s) on its
+  `hypercall-idx:<U>` sym: `v0` = index ×1e6; `v1` and
+  `venue_time_ms` both carry the entry's own source time (ms).
+- `ProviderQuote` (14): see the `ChannelEvent` table.
+- `<venue>-opt-summary.pmlr` rows come from the REST poller
+  (`GET /options-summary?currency=<U>`, one underlying at a time,
+  staggered over `summary_every_s`, default 300 s, plus one full round
+  after a slow-consumer close): `mark_px_1e9` USD per contract (0 on an
+  unpriced row, which then carries no `MARK_PX` flag), `mark_iv_1e9` a
+  FRACTION (0.52 → 520 000 000 — Hypercall, unlike Deribit, does not
+  send percent), `underlying_px_1e9`, `open_interest_1e6` contracts and
+  the four greeks. `ts_ns` = the poll's receive instant.
+- Descriptors (`instrument-manifest.tsv` / `options-manifest.tsv`):
+  `hypercall:<instrument>` (e.g. `hypercall:BTC-20261002-100000-C`) and
+  `hypercall-idx:<U>` for the index syms; the options manifest's label
+  is `hypercall`.
 
 ## Replay log
 

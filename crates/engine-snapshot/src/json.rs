@@ -21,11 +21,14 @@
 //! byte-exact test in `tests/encode.rs`.
 
 use core_types::{Fill, Order, RegimeWord, REGIME_PROFILES};
-use strategy_core::{RegimeCounters, RegimeRelView, VmRowView};
+use strategy_core::{
+    HarSeriesView, RegimeCounters, RegimeRelView, VmRowView, HAR_VIEW_SERIES, HAR_VIEW_TENORS,
+    HAR_VIEW_TENORS_D, HAR_VIEW_WEEKDAYS,
+};
 
 use crate::snapshot::{
-    EngineSnapshot, IngressSnapshot, RecentRing, SLOT_NAMES, SNAPSHOT_SLOTS, SNAPSHOT_VENUES,
-    VENUE_NAMES,
+    EngineSnapshot, HarSnapshot, IngressSnapshot, RecentRing, SLOT_NAMES, SNAPSHOT_SLOTS,
+    SNAPSHOT_VENUES, VENUE_NAMES,
 };
 
 /// The destination buffer was too small for the body. The caller's
@@ -697,6 +700,16 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     }
     c.put(b"]}");
 
+    // --- har (HAR H3.5) ---
+    //
+    // Additive (`"v"` does not move). One row per long-tenor series: at the
+    // nine panel tenors the raw fold AND the fit (plan law L2 — neither
+    // hides the other), the pairs behind the fit, and the day census
+    // that says whether any of it is current (`day_age_s` > 26 h =
+    // "not recalibrating").
+    c.key("har");
+    har(&mut c, &s.har, s.wall_ns);
+
     // --- recent ---
     c.key("recent");
     c.put(b"{\"orders_total\":");
@@ -810,6 +823,151 @@ fn regime(c: &mut Cursor<'_>, r: &RegimeCounters, rel: &RegimeRelView, mono_ns: 
         p += 1;
     }
     c.put(b"}}");
+}
+
+/// The `har` object. `day_age_s` is WALL-derived — a UTC day is wall
+/// time — against the snapshot's own `wall_ns`: whole seconds since the
+/// newest closed day ended (its next midnight); `-1` = no closed day.
+fn har(c: &mut Cursor<'_>, h: &HarSnapshot, wall_ns: u64) {
+    let k = &h.counters;
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(h.n));
+    c.key("hash");
+    c.hex(&h.hash);
+    c.key("dropped");
+    c.u64(u64::from(h.dropped));
+    // Flat, like `hyparb`'s: a nested `counters` key would shadow the
+    // top-level section of that name.
+    c.key("minutes_rolled");
+    c.u64(k.minutes_rolled);
+    c.key("closes");
+    c.u64(k.closes);
+    c.key("day_closes");
+    c.u64(k.day_closes);
+    c.key("held");
+    c.u64(k.held);
+    c.key("forced");
+    c.u64(k.forced);
+    c.key("day_close_ns_max");
+    c.u64(k.day_close_ns_max);
+    c.key("day_close_ns_last");
+    c.u64(k.day_close_ns_last);
+    c.key("epoch");
+    c.u64(k.epoch);
+    c.key("tenors_d");
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(HAR_VIEW_TENORS_D[t]));
+        t += 1;
+    }
+    c.put(b"]");
+    c.key("series");
+    c.put(b"[");
+    let n = (h.n as usize).min(HAR_VIEW_SERIES);
+    let wall_ms = wall_ns / 1_000_000;
+    let mut i = 0usize;
+    while i < n {
+        if i > 0 {
+            c.put(b",");
+        }
+        har_series(c, &h.series[i], wall_ms);
+        i += 1;
+    }
+    c.put(b"]}");
+}
+
+fn har_series(c: &mut Cursor<'_>, v: &HarSeriesView, wall_ms: u64) {
+    c.put(b"{\"name\":");
+    c.text(v.name());
+    c.key("feed");
+    c.u64(u64::from(v.feed));
+    c.key("warm");
+    c.u64(u64::from(v.warm));
+    c.key("days");
+    c.u64(u64::from(v.days));
+    c.key("empty_days");
+    c.u64(u64::from(v.empty_days));
+    c.key("gaps");
+    c.u64(v.gaps);
+    c.key("newest_day_ms");
+    c.u64(v.newest_day_ms);
+    c.key("day_age_s");
+    if v.newest_day_ms == 0 {
+        c.put(b"-1");
+    } else {
+        let closed_ms = v.newest_day_ms.saturating_add(86_400_000);
+        c.u64(wall_ms.saturating_sub(closed_ms) / 1_000);
+    }
+    c.key("last_min_ms");
+    c.u64(v.last_min_ms);
+    c.key("open_minutes");
+    c.u64(u64::from(v.open_minutes));
+    c.key("epoch");
+    c.u64(v.epoch);
+    c.key("raw_1e6");
+    i32_array(c, &v.raw_1e6);
+    c.key("fit_1e6");
+    i32_array(c, &v.fit_1e6);
+    c.key("pairs");
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(v.pairs[t]));
+        t += 1;
+    }
+    c.put(b"]");
+    c.key("fitted");
+    bits(c, v.fitted);
+    c.key("fit_beats_raw");
+    bits(c, v.fit_beats_raw);
+    c.key("weekday_1e6");
+    i32_array(c, &v.weekday_1e6);
+    c.key("weekday_n");
+    c.put(b"[");
+    let mut w = 0usize;
+    while w < HAR_VIEW_WEEKDAYS {
+        if w > 0 {
+            c.put(b",");
+        }
+        c.u64(u64::from(v.weekday_n[w]));
+        w += 1;
+    }
+    c.put(b"]}");
+}
+
+/// `[a,b,…]` of signed values.
+fn i32_array(c: &mut Cursor<'_>, a: &[i32]) {
+    c.put(b"[");
+    let mut i = 0usize;
+    while i < a.len() {
+        if i > 0 {
+            c.put(b",");
+        }
+        c.i64(i64::from(a[i]));
+        i += 1;
+    }
+    c.put(b"]");
+}
+
+/// A per-tenor bit mask as `[0|1, …]`, tenor order.
+fn bits(c: &mut Cursor<'_>, mask: u16) {
+    c.put(b"[");
+    let mut t = 0usize;
+    while t < HAR_VIEW_TENORS {
+        if t > 0 {
+            c.put(b",");
+        }
+        c.byte(b'0' + ((mask >> t) & 1) as u8);
+        t += 1;
+    }
+    c.put(b"]");
 }
 
 /// A regime word: its raw hex plus the seven dimension bytes (the
@@ -1186,6 +1344,10 @@ mod tests {
             mexc < hev,
             "hyperevm must follow mexc (append, never reorder)"
         );
+        let hc = body
+            .find("\"venue\":\"hypercall\"")
+            .expect("hypercall ingress row");
+        assert!(hev < hc, "hypercall must follow hyperevm (append, never reorder)");
         assert!(body.contains("\"heartbeat_age_s\":-1"));
     }
 

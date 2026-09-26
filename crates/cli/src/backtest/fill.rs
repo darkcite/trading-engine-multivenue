@@ -116,7 +116,9 @@ pub const TRADEABLE_VENUES: usize = 7;
 /// can execute; the Ai feed (5), MEXC (7 — data-only by operator
 /// ruling O-MX1; arming it needs its own plan) and corrupt bytes
 /// cannot. HYPARB H2: HyperEVM (8) executes AMM swaps — and only
-/// those (`FillEngine::intake` holds the kind to the venue).
+/// those (`FillEngine::intake` holds the kind to the venue). HC1:
+/// Hypercall (9) is data-only by ruling O-HC1 — refused until its own
+/// exec ruling (HC9).
 #[inline]
 pub const fn tradeable_venue_byte(venue: usize) -> bool {
     venue <= 4 || venue == 6 || venue == 8
@@ -4336,6 +4338,8 @@ mod tests {
     fn mexc_order_is_refused_data_only() {
         assert!(!tradeable_venue_byte(VenueId::Mexc as usize));
         assert!(tradeable_venue_byte(VenueId::Bybit as usize));
+        // HC1 / O-HC1: Hypercall is data-only — refused like MEXC.
+        assert!(!tradeable_venue_byte(VenueId::Hypercall as usize));
         let mut e = engine(u64::MAX);
         let spot = make_symbol_id(VenueId::Mexc, 1);
         let perp = make_symbol_id(VenueId::Mexc, core_config::universe::MEXC_PERP_ORDINAL_BASE + 1);
@@ -4356,17 +4360,13 @@ mod tests {
     #[test]
     fn maker_fee_charges_on_fill_notional() {
         let p = ModelParams {
-            fee_bps: [
-                [(50, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-            ], // PM maker 50 bps
+            // PM maker 50 bps; every other venue free. Built over
+            // VENUE_COUNT so the next venue is not an edit here (HC1).
+            fee_bps: {
+                let mut f = [[(0, 0); 5]; core_types::VENUE_COUNT];
+                f[VenueId::Polymarket as usize] = [(50, 0); 5];
+                f
+            },
             latency_ns: [0; core_types::VENUE_COUNT],
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
@@ -4405,18 +4405,17 @@ mod tests {
         assert_eq!(model_venue_byte(BN_SYM), 1);
         let p = ModelParams {
             // PM: 50 bps maker, Δ 1 s; BN: 10 bps maker, Δ 0.
-            fee_bps: [
-                [(50, 0); 5],
-                [(10, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-                [(0, 0); 5],
-            ],
-            latency_ns: [1_000_000_000, 0, 0, 0, 0, 0, 0, 0, 0],
+            fee_bps: {
+                let mut f = [[(0, 0); 5]; core_types::VENUE_COUNT];
+                f[VenueId::Polymarket as usize] = [(50, 0); 5];
+                f[VenueId::Binance as usize] = [(10, 0); 5];
+                f
+            },
+            latency_ns: {
+                let mut l = [0; core_types::VENUE_COUNT];
+                l[VenueId::Polymarket as usize] = 1_000_000_000;
+                l
+            },
             stale_after_ms: VenueId::stale_after_ms_defaults(),
             ..ModelParams::default()
         };
@@ -4655,6 +4654,17 @@ mod tests {
         },
     }
 
+    /// The proptests' Δ table: 100 ms everywhere except PM 200, HL 600
+    /// and the dead `Ai` slot 0 — built over VENUE_COUNT so a new venue
+    /// byte is not an edit here (HC1).
+    fn proptest_latency_ns() -> [u64; core_types::VENUE_COUNT] {
+        let mut l = [100_000_000; core_types::VENUE_COUNT];
+        l[VenueId::Polymarket as usize] = 200_000_000;
+        l[VenueId::Hyperliquid as usize] = 600_000_000;
+        l[VenueId::Ai as usize] = 0;
+        l
+    }
+
     fn syms() -> [u32; 4] {
         [
             make_symbol_id(VenueId::Polymarket, 1),
@@ -4708,7 +4718,7 @@ mod tests {
         ) {
             let params = ModelParams {
                 fee_bps: [[(maker_bps, 0); 5]; core_types::VENUE_COUNT],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000, 100_000_000],
+                latency_ns: proptest_latency_ns(),
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };
@@ -4779,7 +4789,7 @@ mod tests {
         ) {
             let params = ModelParams {
                 fee_bps: [[(0, taker_bps); 5]; core_types::VENUE_COUNT],
-                latency_ns: [200_000_000, 100_000_000, 100_000_000, 100_000_000, 600_000_000, 0, 100_000_000, 100_000_000, 100_000_000],
+                latency_ns: proptest_latency_ns(),
                 stale_after_ms: VenueId::stale_after_ms_defaults(),
                 ..ModelParams::default()
             };

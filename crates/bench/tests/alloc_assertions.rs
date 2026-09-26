@@ -1362,10 +1362,11 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
     // The lane arrays below are written out for the lane geometry
-    // (seven tick lanes since MX2 added MEXC at lane 6, after WS9's
-    // Bybit at lane 5; four fill lanes); break the build loudly if
-    // that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 4);
+    // (eight tick lanes since HC1 added Hypercall at lane 7, after
+    // MX2's MEXC at lane 6 and WS9's Bybit at lane 5; four opt lanes
+    // since HC1; four fill lanes); break the build loudly if that
+    // drifts.
+    const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 4);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1386,8 +1387,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // unused inside this test fixture.
     let _ = std::marker::PhantomData::<SubmitErr>;
 
-    // Lane arrays: seven tick lanes (Polymarket, Binance, OKX,
-    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2) + four fill lanes. Only
+    // Lane arrays: eight tick lanes (Polymarket, Binance, OKX,
+    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2, Hypercall — HC1)
+    // + four fill lanes. Only
     // lane 0 (Polymarket) gets a live producer here; the unused
     // producer halves stay alive until end of scope, and their lanes
     // simply read empty every iteration.
@@ -1398,11 +1400,12 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-    // WS10-A: seven venue-event lanes ride in every engine. Lane 2
+    let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // WS10-A: eight venue-event lanes ride in every engine. Lane 2
     // (OKX) gets a live producer — the measured window below pushes
     // one funding ChannelEvent per iteration and the engine drains
     // it through `on_venue_event`, proving lane push + drain are
-    // 0 B/op; the other six read empty (two atomic loads each).
+    // 0 B/op; the other seven read empty (two atomic loads each).
     let (mut ev2_p, e2) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e0p, e0) =
@@ -1417,6 +1420,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e6p, e6) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e7p, e7) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
     // window pushes one DepthTopK per iteration and the engine
     // drains it through `on_depth` (192 B Copy slot, 0 B/op).
@@ -1428,6 +1433,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o1p, o1) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o2p, o2) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o3p, o3) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -1454,10 +1460,10 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6],
-        [e0, e1, e2, e3, e4, e5, e6],
+        [t0, t1, t2, t3, t4, t5, t6, t7],
+        [e0, e1, e2, e3, e4, e5, e6, e7],
         [d0, d1],
-        [o0, o1, o2],
+        [o0, o1, o2, o3],
         sc,
         [f0, f1, f2, f3],
         ai_c,
@@ -9714,4 +9720,670 @@ fn https_post_keep_alive_cycle_allocates_only_rustls_record_buffers() {
          buffered API accounts for exactly {RUSTLS_ALLOCS_PER_POST}/post (one sealed record \
          out, one decrypted record in); anything above is ours"
     );
+}
+
+/// **HC2 gate 77a — the generic HTTP/1.1 head writer is 0 B/op.** Every
+/// Hypercall REST head — a `GET` with a query, a signed `DELETE` with
+/// two extra headers — is sized and rendered into a caller-owned buffer
+/// without touching the heap.
+#[test]
+fn http1_request_head_writer_is_zero_alloc() {
+    use core_net::{request_head_len, write_request_head, Header, Method, ReqHead};
+    let extra: [Header<'_>; 2] = [
+        (b"X-Hypercall-Expires-At-Ms", b"1790371200000"),
+        (b"X-Hypercall-Signature", b"0x1b2c3d4e5f"),
+    ];
+    let heads = [
+        ReqHead {
+            method: Method::Get,
+            host: b"api.hypercall.xyz",
+            target: b"/options-summary?currency=BTC&include_rfq_provider_quotes=true",
+            user_agent: core_net::REQ_USER_AGENT,
+            content_type: None,
+            extra: &[],
+            keep_alive: true,
+        },
+        ReqHead {
+            method: Method::Delete,
+            host: b"api.hypercall.xyz",
+            target: b"/order",
+            user_agent: core_net::REQ_USER_AGENT,
+            content_type: Some(b"application/json"),
+            extra: &extra,
+            keep_alive: true,
+        },
+    ];
+    let mut buf = [0u8; 512];
+    // Warm-up outside the window.
+    let _ = write_request_head(&mut buf, &heads[0], 0);
+    let g = AllocGuard::new();
+    let mut acc = 0usize;
+    let mut i = 0usize;
+    while i < 10_000 {
+        let h = &heads[i & 1];
+        let body_len = (i & 1) * 57;
+        let n = request_head_len(h, body_len).expect("sized");
+        let w = write_request_head(&mut buf, h, body_len).expect("rendered");
+        acc = acc.wrapping_add(n ^ w ^ usize::from(buf[w - 1]));
+        i += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "http1 head writer allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0);
+}
+
+/// **HC2 gate 77b — `HttpsReq`'s keep-alive cycle, as allocations per
+/// request: exactly gate 72's two.** `HttpsReq` renders its head per
+/// request (any method, any target) flush against the body already in
+/// place and writes ONE contiguous slice ONCE, over the same connection
+/// engine as `HttpsPost` (`core_net::https_conn`). rustls' buffered API
+/// seals one record out and decrypts one in; a regression in our render
+/// or in the shared engine shows as a third. Same child-process server
+/// as gate 72 (the counting allocator is process-global).
+#[test]
+fn https_req_keep_alive_cycle_allocates_only_rustls_record_buffers() {
+    const REQS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_REQ: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate73-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 77b dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 77b exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 77b child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 77b port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 77b: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 77b cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 77b anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let mut h = core_net::HttpsReq::new("localhost", port, cfg, 1024, 8192, 16 * 1024)
+        .expect("gate 77b client");
+    let n = exec_hyperevm::rpc::write_chain_id(h.body_mut(), 1).expect("gate 77b body");
+    let extra: [core_net::Header<'_>; 1] = [(b"X-Gate", b"73")];
+    let mut i = 0;
+    while i < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        let (status, _) = h
+            .request(core_net::Method::Post, b"/evm", &extra, n)
+            .expect("gate 77b warm-up");
+        assert_eq!(status, 200);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < REQS {
+        let (status, r) = h
+            .request(core_net::Method::Post, b"/evm", &extra, n)
+            .expect("gate 77b request");
+        acc = acc.wrapping_add(u64::from(status) + (r.end - r.start) as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(h.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(h.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_REQ * REQS,
+        "HttpsReq cycle: {allocs} allocations ({bytes} B) over {REQS} requests — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_REQ}/request (one sealed record \
+         out, one decrypted record in); anything above is ours"
+    );
+}
+
+// ---------------------------------------------------------------
+// HC3: Hypercall ingress hot-path assertions (gates 78, 79)
+// ---------------------------------------------------------------
+
+/// The golden frames, captured live from the Mac on 2026-09-25 (HC0).
+const HC_Q1: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/quote_one_provider.json");
+const HC_Q2X: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/quote_two_providers_crossed.json");
+const HC_Q0: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/quote_empty.json");
+const HC_IDX: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/index_update.json");
+const HC_TRADE: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/trade_docs_example.json");
+const HC_MU_EXPIRED: &[u8] =
+    include_bytes!("../../ingress-hypercall/tests/fixtures/market_update_expired_schema.json");
+const HC_CLOCK: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/clock_synced.json");
+const HC_SUBSCRIBED: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/subscribed.json");
+const HC_CLOSE_ML: &[u8] =
+    include_bytes!("../../ingress-hypercall/tests/fixtures/close_reason_message_limit.json");
+const HC_SUMMARY: &[u8] = include_bytes!("../../ingress-hypercall/tests/fixtures/options_summary_trimmed.json");
+
+/// The gates' universe: the golden frames' instruments, and two of the
+/// index frame's twelve underlyings (boot side, outside every window).
+fn hc_tables() -> (ingress_hypercall::HcSymbolTable, ingress_hypercall::HcUnderlyings) {
+    let mut t = ingress_hypercall::HcSymbolTable::new();
+    t.insert(b"ETH-20260927-2675-P", (9 << 24) | 512).unwrap();
+    t.insert(b"MU-20260928-1090-C", (9 << 24) | 513).unwrap();
+    t.insert(b"BTC-20261002-100000-C", (9 << 24) | 514).unwrap();
+    t.insert(b"AAPL-20260926-300-C", (9 << 24) | 515).unwrap();
+    let mut u = ingress_hypercall::HcUnderlyings::new();
+    u.insert(b"AAPL", (9 << 24) | 1).unwrap();
+    u.insert(b"BTC", (9 << 24) | 2).unwrap();
+    (t, u)
+}
+
+/// `src` with every `from` replaced by the same-length `to` — a second
+/// touch of a golden quote (boot side).
+fn hc_swap_all(src: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    assert_eq!(from.len(), to.len(), "a same-length swap keeps the frame shape");
+    let mut out = src.to_vec();
+    let mut i = 0;
+    let mut hits = 0;
+    while i + from.len() <= out.len() {
+        if &out[i..i + from.len()] == from {
+            out[i..i + from.len()].copy_from_slice(to);
+            i += from.len();
+            hits += 1;
+        } else {
+            i += 1;
+        }
+    }
+    assert!(hits > 0, "the swap must change the frame");
+    out
+}
+
+/// **HC3 gate 78 — every Hypercall parser is 0 B/op.** Classify over
+/// every message kind; the indicative quote (one provider, two providers
+/// CROSSED, empty) with its symbol-table lookup and the provider walk;
+/// the 12-underlying index frame; a trade; a listing update; ClockSynced;
+/// a venue error; the 1008 close reason; the outbound side (the universe
+/// subscribe as parts, the ClockSync nonce render); and the REST
+/// poller's summary scan into `OptSummary` rows — 10 000 iterations.
+#[test]
+fn hypercall_parsers_are_zero_alloc() {
+    use ingress_hypercall as hc;
+    let (table, _) = hc_tables();
+    let error_frame: &[u8] = br#"{"type":"Error","message":"unknown channel"}"#;
+    let kinds: [&[u8]; 9] = [
+        HC_Q1,
+        HC_Q2X,
+        HC_Q0,
+        HC_IDX,
+        HC_TRADE,
+        HC_MU_EXPIRED,
+        HC_CLOCK,
+        HC_SUBSCRIBED,
+        error_frame,
+    ];
+    let mut parts: [&[u8]; hc::SUBSCRIBE_PARTS_MAX] = [&[]; hc::SUBSCRIBE_PARTS_MAX];
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    let mut i = 0u64;
+    while i < 10_000 {
+        let mut k = 0;
+        while k < kinds.len() {
+            std::hint::black_box(hc::classify(kinds[k]));
+            k += 1;
+        }
+        // The quote path: in place, the lookup, the provider walk.
+        let mut q = hc::HcQuote::ZERO;
+        let meta = hc::parse_indicative(HC_Q2X, &mut q).expect("gate 78 quote");
+        acc = acc.wrapping_add(q.bid_px_1e6 - q.ask_px_1e6 + i64::from(meta.num_providers));
+        let (row, sym) = table.lookup(hc::span_bytes(HC_Q2X, q.instrument)).expect("gate 78 lookup");
+        acc = acc.wrapping_add(row as i64 + i64::from(sym));
+        let mut ps = [hc::HcProvider::default(); hc::HC_MAX_PROVIDERS];
+        let (read, present) = hc::walk_providers(HC_Q2X, q.providers, &mut ps).expect("gate 78 providers");
+        acc = acc.wrapping_add(ps[1].ask_px_1e6 + i64::from(read) + i64::from(present));
+        acc = acc.wrapping_add(hc::provider_quote_seq(1, true, meta.num_providers, ps[1].wallet_lo32) as i64);
+        let mut q1 = hc::HcQuote::ZERO;
+        assert_eq!(hc::parse_indicative(HC_Q1, &mut q1).map(|m| m.sides), Some(hc::SIDE_BID | hc::SIDE_ASK));
+        let mut q0 = hc::HcQuote::ZERO;
+        assert_eq!(hc::parse_indicative(HC_Q0, &mut q0).map(|m| m.sides), Some(0));
+        // The index frame, every entry in place.
+        let mut xs = [hc::HcIndexEntry::default(); hc::HC_MAX_UNDERLYINGS];
+        let (n, all, ts) = hc::parse_index_update(HC_IDX, &mut xs).expect("gate 78 index");
+        acc = acc.wrapping_add(xs[3].price_1e6 + i64::from(n) + i64::from(all) + ts as i64);
+        // Trades, listings, the clock, errors, the close reason.
+        let t = hc::parse_trade(HC_TRADE).expect("gate 78 trade");
+        acc = acc.wrapping_add(t.px_1e6 + t.signed_qty_1e6);
+        let (action, name, ts) = hc::parse_market_update(HC_MU_EXPIRED).expect("gate 78 listing");
+        acc = acc.wrapping_add(
+            i64::from(action == hc::HcListingAction::Expired) + hc::span_bytes(HC_MU_EXPIRED, name).len() as i64 + ts as i64,
+        );
+        let (nonce, server_at) = hc::parse_clock_synced(HC_CLOCK).expect("gate 78 clock");
+        acc = acc.wrapping_add((nonce ^ server_at) as i64);
+        acc = acc.wrapping_add(hc::parse_error(error_frame).map_or(-1, |s| i64::from(s.1 - s.0)));
+        acc = acc.wrapping_add(hc::parse_close_reason(HC_CLOSE_ML) as i64);
+        // The outbound side: the universe subscribe as parts, a nonce.
+        let n = hc::subscribe_parts(hc::CH_INDICATIVE, Some(&table), &mut parts).expect("gate 78 parts");
+        acc = acc.wrapping_add(n as i64 + parts[n - 1].len() as i64);
+        let mut digits = [0u8; 20];
+        let d = hc::fmt_u64(1_790_373_478_201 + i, &mut digits);
+        acc = acc.wrapping_add(hc::clock_sync_parts(d)[1].len() as i64);
+        // The poller's scan: REST rows → `OptSummary`.
+        let rows = hc::rest::parse_summary_rows(HC_SUMMARY, |r| {
+            acc = acc.wrapping_add(hc::rest::to_opt_summary(i, (9 << 24) | 515, r).mark_iv_1e9);
+        })
+        .expect("gate 78 summary");
+        acc = acc.wrapping_add(rows as i64);
+        i += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(allocs, 0, "hypercall parsers allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "hypercall parser bytes should be zero: saw {bytes}");
+}
+
+/// **HC3 gate 79 — the Hypercall run loop in steady state is 0 B/op.**
+/// The real handshake (GET → 101 → ClockSync + the four subscribes, the
+/// indicative one naming the universe in ONE frame) and the four acks
+/// are boot; then CYCLES rounds of the measured wire mix are injected,
+/// driven and drained the way the engine drains its lanes: a
+/// one-provider quote alternating between two touches (the emit path)
+/// plus its unchanged republication (the dedupe path), a CROSSED
+/// two-provider quote alternating too (4 `ProviderQuote` events), the
+/// 12-underlying index frame (2 configured → 2 `Mark`s), a trade, a
+/// `ClockSynced` and a server Ping (the Pong goes rx → tx), and one
+/// poller row through the SPSC handoff onto opt lane 3 — with a REAL
+/// `PmlrCapture` (raw tap `All`).
+#[test]
+fn hypercall_run_loop_steady_state_is_zero_alloc() {
+    use core_types::{event_lane_bit, ChannelEvent, ChannelId, OptSummary, EVENT_RING_SIZE, OPT_RING_SIZE};
+    use ingress_hypercall::counters::get;
+    use ingress_hypercall::run_loop as hwl;
+
+    // ---- boot (NOT measured) ----
+    const CYCLES: usize = 300;
+    const SEED: u64 = 0x4C09;
+    const HOST: &[u8] = b"api.hypercall.xyz";
+    let (table, unds) = hc_tables();
+    let mut drv = hwl::Driver::new(SEED, table, unds);
+    // The golden frames carry FIXED venue stamps: disable the stale
+    // judgement so a slow (debug) run cannot flip a verdict mid-stream
+    // and add a tick (a flipped verdict is a tick by the dedupe law).
+    drv.set_stale_after_ms(0);
+    let mut t = TestTransport::with_capacity(256 * 1024);
+    let status = core_metrics::IngressStatus::new();
+    let counters = ingress_hypercall::HcCounters::new();
+    let (mut tick_tx, mut tick_rx) = Ring::<Tick, { hwl::TICK_RING_CAP }>::new().split();
+    let (mut ev_tx, mut ev_rx) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
+    let (mut opt_tx, mut opt_rx) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
+    let (mut hand_tx, mut hand_rx) = Ring::<OptSummary, { hwl::HANDOFF_RING_CAP }>::new().split();
+    let mut lanes = hwl::Lanes {
+        ticks: &mut tick_tx,
+        events: &mut ev_tx,
+        event_mask: event_lane_bit(ChannelId::ProviderQuote)
+            | event_lane_bit(ChannelId::Mark)
+            | event_lane_bit(ChannelId::Trade),
+        opts: &mut opt_tx,
+    };
+    let cap_dir = std::env::temp_dir().join(format!("hypercall_bench_cap_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cap_dir);
+    let mut capture = core_io::PmlrCapture::open(
+        &cap_dir,
+        "hypercall",
+        0,
+        core_io::TapCfg {
+            mode: core_io::TapMode::All,
+            budget_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+
+    /// Unmasked server→client frame (`first` = 0x81 text / 0x89 ping).
+    fn push_frame(stream: &mut Vec<u8>, first: u8, body: &[u8]) {
+        stream.push(first);
+        if body.len() <= 125 {
+            stream.push(body.len() as u8);
+        } else {
+            stream.push(126);
+            stream.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        }
+        stream.extend_from_slice(body);
+    }
+
+    // The real handshake: GET → 101 → ClockSync + four subscribes.
+    hwl::note_transport_ready(&mut drv, core_net::Status::Ready);
+    hwl::drive_one(&mut t, &mut drv, HOST, &mut lanes, &status, &counters, &mut capture).unwrap();
+    let mut scratch = [0u8; 8192];
+    let _ = t.drain_outgoing(&mut scratch);
+    let accept = core_net::expected_accept(&core_net::sec_websocket_key_from_seed(SEED));
+    let mut resp = Vec::new();
+    resp.extend_from_slice(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+    resp.extend_from_slice(&accept);
+    resp.extend_from_slice(b"\r\n\r\n");
+    t.inject_incoming(&resp);
+    hwl::drive_one(&mut t, &mut drv, HOST, &mut lanes, &status, &counters, &mut capture).unwrap();
+    assert_eq!(drv.state(), hwl::State::Steady);
+    let _ = t.drain_outgoing(&mut scratch); // the ClockSync + the subscribe set
+    let mut acks = Vec::new();
+    for ch in ["index_prices", "trades", "market_updates", "indicative_market_data"] {
+        push_frame(&mut acks, 0x81, format!("{{\"type\":\"Subscribed\",\"channel\":\"{ch}\"}}").as_bytes());
+    }
+    t.inject_incoming(&acks);
+    hwl::drive_one(&mut t, &mut drv, HOST, &mut lanes, &status, &counters, &mut capture).unwrap();
+    assert_eq!(drv.sub_count(), 4, "every channel acked");
+
+    // Two touches per quote; a cycle's stream alternates between them.
+    let q1_alt = hc_swap_all(HC_Q1, b"\"7.679\"", b"\"7.681\"");
+    let q2x_alt = hc_swap_all(HC_Q2X, b"\"18.6445\"", b"\"18.6451\"");
+    let mut streams = [Vec::with_capacity(4096), Vec::with_capacity(4096)];
+    for (s, q1, q2x) in [(0usize, HC_Q1, HC_Q2X), (1, &q1_alt[..], &q2x_alt[..])] {
+        push_frame(&mut streams[s], 0x81, q1);
+        push_frame(&mut streams[s], 0x81, q1); // republication: no tick
+        push_frame(&mut streams[s], 0x81, q2x);
+        push_frame(&mut streams[s], 0x81, HC_IDX);
+        push_frame(&mut streams[s], 0x81, HC_TRADE);
+        push_frame(&mut streams[s], 0x81, HC_CLOCK);
+        push_frame(&mut streams[s], 0x89, b"PING");
+    }
+    let poller_row = OptSummary::new(1, VenueId::Hypercall, (9 << 24) | 515, 0, 1, 2, 3, 4, 5, 6, 7, 8);
+    let mut pong = [0u8; 64];
+
+    // ---- measurement window ----
+    let g = AllocGuard::new();
+
+    let mut acc: i64 = 0;
+    let (mut ticks, mut events, mut opts, mut handed) = (0usize, 0usize, 0usize, 0usize);
+    let mut cycle = 0usize;
+    while cycle < CYCLES {
+        let s = &streams[cycle & 1];
+        assert_eq!(t.inject_incoming(s), s.len());
+        let mut drives = 0u32;
+        while t.incoming_len() > 0 {
+            hwl::drive_one(&mut t, &mut drv, HOST, &mut lanes, &status, &counters, &mut capture).unwrap();
+            drives += 1;
+            assert!(drives <= 64, "scripted stream failed to drain");
+        }
+        assert_eq!(t.drain_outgoing(&mut pong), 2 + 4 + 4, "one masked Pong echoing PING");
+        // The poller's round, through the handoff (the poller's own
+        // thread in production).
+        assert!(hand_tx.try_push_ref(&poller_row));
+        handed += hwl::drain_handoff(&mut hand_rx, &mut lanes, &status, &mut capture);
+        // The engine's side: every lane read in place.
+        while let Some(x) = tick_rx.try_pop_ref() {
+            acc = acc.wrapping_add(x.bid_px.raw() - x.ask_px.raw());
+            ticks += 1;
+        }
+        while let Some(e) = ev_rx.try_pop_ref() {
+            acc = acc.wrapping_add(e.v0);
+            events += 1;
+        }
+        while let Some(o) = opt_rx.try_pop_ref() {
+            acc = acc.wrapping_add(o.mark_iv_1e9);
+            opts += 1;
+        }
+        cycle += 1;
+    }
+    core_types::Capture::maybe_flush(&mut capture, core_io::CAPTURE_FLUSH_INTERVAL_NS + 1);
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    // One tick per BBO CHANGE of either quote (never per republication);
+    // per cycle 4 ProviderQuote + 2 Mark + 1 Trade on the lane; one opt
+    // row; every text frame counted; nothing lost.
+    assert_eq!(ticks, 2 * CYCLES);
+    assert_eq!(events, 7 * CYCLES);
+    assert_eq!((handed, opts), (CYCLES, CYCLES));
+    assert_eq!(status.msgs_total(), (4 + 6 * CYCLES) as u64);
+    assert_eq!(status.parse_errors_total(), 0);
+    assert_eq!(status.ring_drops_total(), 0);
+    assert_eq!(status.event_ring_drops_total(), 0);
+    assert_eq!(status.opt_ring_drops_total(), 0);
+    assert_eq!(drv.sub_count(), 5, "four acks + the first quote");
+    assert_eq!(get(&counters.ws.crossed_quotes), CYCLES as u64);
+    assert_eq!(get(&counters.ws.provider_quotes), (4 * CYCLES) as u64);
+    assert_eq!(get(&counters.ws.clock_syncs), CYCLES as u64);
+    assert_eq!(allocs, 0, "hypercall run-loop allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "hypercall run-loop bytes should be zero: saw {bytes}");
+
+    // Capture accounting: a tick per BBO change, every event, one opt
+    // row per round, a tap record per text payload (the 4 acks + 6 per
+    // cycle), no I/O errors.
+    assert!(!capture.is_disabled());
+    assert_eq!(capture.io_errors(), 0);
+    assert_eq!(capture.ticks_written(), (2 * CYCLES) as u64);
+    assert_eq!(capture.events_written(), (7 * CYCLES) as u64);
+    assert_eq!(capture.opt_summaries_written(), CYCLES as u64);
+    assert_eq!(capture.tap_records(), (4 + 6 * CYCLES) as u64);
+    assert_eq!(capture.tap_dropped(), 0);
+    drop(capture);
+    let _ = std::fs::remove_dir_all(&cap_dir);
+}
+
+/// **HC7 gate 80 — the settlement replicator is 0 B/op.** A 30-minute
+/// window of oracle prints (one every 700 ms, a trending walk with
+/// spikes, starting before the window so a price carries in), the grid
+/// closed at `T`, and the median-of-means under BOTH bucket orders —
+/// then the window reset and refilled for the next expiry, 20 times.
+/// The window and the scratch are boot-boxed (the only allocations).
+#[test]
+fn settlement_window_and_median_of_means_are_zero_alloc() {
+    use core_settle::{BucketOrder, SettleWindow, GRID_POINTS, SETTLE_WINDOW_MS};
+    const T0: u64 = 1_790_366_400_000;
+    let mut w = Box::new(SettleWindow::new(T0));
+    let mut scratch = Box::new([0i64; GRID_POINTS]);
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    let mut e = 0u64;
+    while e < 20 {
+        let t_end = T0 + e * 86_400_000;
+        w.reset(t_end);
+        let mut ts = t_end - SETTLE_WINDOW_MS - 5_000;
+        let mut px: i64 = 224_000_000;
+        let mut i = 0u64;
+        while ts <= t_end {
+            px += ((i * 7_919) % 95_001) as i64 - 40_000;
+            let spike = if i % 211 == 7 { 3_000_000 } else { 0 };
+            if w.push(ts, px + spike).is_err() {
+                acc = acc.wrapping_add(1);
+            }
+            ts += 700;
+            i += 1;
+        }
+        acc = acc.wrapping_add(w.points() as i64);
+        acc = acc.wrapping_add(w.settle_1e6(BucketOrder::Sorted, &mut scratch).unwrap_or(0));
+        acc = acc.wrapping_add(w.settle_1e6(BucketOrder::Time, &mut scratch).unwrap_or(0));
+        e += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(w.points(), GRID_POINTS, "a full grid every expiry");
+    assert_eq!(allocs, 0, "settlement replicator allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0);
+}
+
+/// The long-tenor gate's price walk: a slow 40-day vol regime so the
+/// fold's regressor varies and the fits exist (test-only, no model).
+fn long_vol_px(s: &mut u64, px: &mut i64, day: u64) -> i64 {
+    *s = s
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let phase = day % 40;
+    let level = if phase < 20 { phase } else { 40 - phase };
+    let amp = 2_000_000 * (4 + level) as i64;
+    *px = (*px + ((*s >> 32) % (2 * amp as u64 + 1)) as i64 - amp).max(1_000_000_000);
+    *px
+}
+
+/// **HAR H1 gate 81 — the long-tenor engine is 0 B/op.** Sixty UTC days
+/// of minute closes (86 400) through a WARM engine whose short tenors
+/// are fitted: every minute's return and add, every day close's settle +
+/// pair + refit + arm over the whole 1–40 d grid (the 1 d pair ring and
+/// the QLIKE ring wrap), and every tenor's forecasts, fit and QLIKE tell
+/// read once an hour. The engine is boot-boxed and
+/// warmed by 100 unmeasured days (the only allocation is the box).
+#[test]
+fn long_vol_is_zero_alloc() {
+    use core_vol::{LongForecast, LongVolEngine, DAY_MS, DAY_NS, LONG_TAU_DAYS_MAX};
+    const DAY0: u64 = 1_767_225_600_000; // 2026-01-01 00:00Z
+    let mut e = Box::new(LongVolEngine::new());
+    let mut s: u64 = 20_260_926;
+    let mut px: i64 = 79_000_000_000;
+    let mut day = 0u64;
+    while day < 100 {
+        let mut m = 0u64;
+        while m < 1440 {
+            e.on_minute_close_at(long_vol_px(&mut s, &mut px, day), DAY0 + day * DAY_MS + m * 60_000);
+            m += 1;
+        }
+        day += 1;
+    }
+    assert!(e.is_warm());
+    assert!(e.fit(DAY_NS).is_some(), "the gate must measure a FITTED engine");
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    while day < 160 {
+        let mut m = 0u64;
+        while m < 1440 {
+            e.on_minute_close_at(long_vol_px(&mut s, &mut px, day), DAY0 + day * DAY_MS + m * 60_000);
+            if m % 60 == 0 {
+                let mut d = 1u64;
+                while d <= LONG_TAU_DAYS_MAX as u64 {
+                    let t = d * DAY_NS;
+                    acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Raw).unwrap_or(0));
+                    acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Fit).unwrap_or(0));
+                    acc = acc.wrapping_add(e.qlike_counters(t).fit_mean_1e9);
+                    acc = acc.wrapping_add(e.n_pairs(t) as i64);
+                    d += 1;
+                }
+            }
+            m += 1;
+        }
+        day += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(e.n_pairs(DAY_NS), core_vol::PAIR_RING_LONG, "the 1 d ring wrapped under the guard");
+    assert_eq!(allocs, 0, "long-tenor engine allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "long-tenor engine bytes should be zero: saw {bytes}");
+}
+
+/// **HAR H3.3 gate 82 — the long-tenor SET is 0 B/op.** Twelve series
+/// (the Hypercall underlyings) configured and warmed by 35 unmeasured days
+/// (the boxes are the only allocation — boot). Under the guard, two more
+/// UTC days of the engine loop's traffic: every minute a fresh quote of
+/// all twelve feeds among stale, one-sided and stranger ticks, the 1 s
+/// poll's rolls, and at each UTC boundary the STAGGERED day close — one
+/// series per poll, eleven held and released — with every forecast, the
+/// weekday profile and the counters read once an hour.
+#[test]
+fn long_vol_set_is_zero_alloc() {
+    use core_time::WallAnchor;
+    use core_types::{make_symbol_id, TICK_FLAG_STALE};
+    use core_vol::{LongForecast, LongSeries, LongVolSet, DAY_NS, LONG_SET_MAX, LONG_TAU_DAYS_MAX};
+    const MIN_NS: u64 = 60_000_000_000;
+    const SEC_NS: u64 = 1_000_000_000;
+    const NAMES: [&[u8]; LONG_SET_MAX] = [
+        b"SP500", b"SPCX", b"MU", b"NVDA", b"MSFT", b"META", b"AAPL", b"BABA", b"SNDK", b"BOT",
+        b"BTC", b"ETH",
+    ];
+    fn quote(ts: u64, sym: SymbolId, px: i64, flags: u8) -> Tick {
+        let mut t = Tick::new(
+            ts,
+            VenueId::Binance,
+            sym,
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(1),
+            Price::from_raw(px + 2),
+            Qty::from_raw(1),
+        );
+        t.flags = flags;
+        t
+    }
+    let feeds: [SymbolId; LONG_SET_MAX] =
+        core::array::from_fn(|i| make_symbol_id(VenueId::Binance, 300 + i as u32));
+    let stranger = make_symbol_id(VenueId::Binance, 999);
+    let series: [LongSeries<'_>; LONG_SET_MAX] =
+        core::array::from_fn(|i| LongSeries { name: NAMES[i], feed: feeds[i] });
+    let mut set = Box::new(LongVolSet::new());
+    set.configure(&series, WallAnchor::new(0, 1_767_225_600_000_000_000), 0)
+        .expect("gate 82 configure");
+    let mut s: u64 = 20_260_926;
+    let mut px = [79_000_000_000i64; LONG_SET_MAX];
+    let mut run = |set: &mut LongVolSet, from_day: u64, to_day: u64, acc: &mut i64| {
+        let mut m = from_day * 1440;
+        while m < to_day * 1440 {
+            let t0 = m * MIN_NS;
+            let mut p = 0u64;
+            while p < 13 {
+                set.on_timer(t0 + p * SEC_NS);
+                p += 1;
+            }
+            let mut i = 0usize;
+            while i < LONG_SET_MAX {
+                let v = long_vol_px(&mut s, &mut px[i], m / 1440 + i as u64);
+                set.on_tick(&quote(t0 + 20 * SEC_NS, feeds[i], v, 0));
+                set.on_tick(&quote(t0 + 21 * SEC_NS, feeds[i], 1, TICK_FLAG_STALE));
+                set.on_tick(&quote(t0 + 22 * SEC_NS, feeds[i], 0, 0));
+                i += 1;
+            }
+            set.on_tick(&quote(t0 + 23 * SEC_NS, stranger, 5, 0));
+            if m % 60 == 0 {
+                let mut k = 0usize;
+                while k < set.len() {
+                    let e = set.engine(k).expect("gate 82 engine");
+                    let mut d = 1u64;
+                    while d <= LONG_TAU_DAYS_MAX as u64 {
+                        let t = d * DAY_NS;
+                        *acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Raw).unwrap_or(0));
+                        *acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Fit).unwrap_or(0));
+                        *acc = acc.wrapping_add(e.qlike_counters(t).fit_mean_1e9);
+                        d += 1;
+                    }
+                    let (prof, n) = set.profile(k).expect("gate 82 profile");
+                    *acc = acc.wrapping_add(prof[0]).wrapping_add(n[6] as i64);
+                    k += 1;
+                }
+                *acc = acc.wrapping_add(set.counters().day_closes as i64);
+            }
+            m += 1;
+        }
+    };
+    let mut acc: i64 = 0;
+    run(&mut set, 0, 35, &mut acc);
+    assert!(set.engine(0).expect("gate 82").is_warm(), "the gate must measure WARM engines");
+    let before = set.counters();
+
+    let g = AllocGuard::new();
+    run(&mut set, 35, 37, &mut acc);
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let after = set.counters();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(after.day_closes - before.day_closes, 2 * LONG_SET_MAX as u64, "two staggered boundaries");
+    assert_eq!(after.held - before.held, 2 * (LONG_SET_MAX as u64 - 1), "the stagger held");
+    assert_eq!(allocs, 0, "long-tenor set allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "long-tenor set bytes should be zero: saw {bytes}");
 }

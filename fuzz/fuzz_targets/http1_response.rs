@@ -15,7 +15,8 @@
 //!
 //! Finally, we round-trip the request serializer (`write_get_request`)
 //! over the first few bytes of the input (split into host/path/UA) to
-//! stress the zero-alloc bounded writer path.
+//! stress the zero-alloc bounded writer path and its framing law
+//! (`HttpErr::BadHead`).
 
 #![no_main]
 
@@ -104,20 +105,31 @@ fuzz_target!(|data: &[u8]| {
     // Splits the input into (host, path, user-agent) as a cheap way
     // to exercise `write_get_request` with bounded, arbitrary byte
     // strings. The writer is bounded and must never overflow the
-    // 256-byte destination (or must return BufferTooSmall).
+    // 256-byte destination (or must return BufferTooSmall), and it
+    // keeps the framing law: BadHead exactly when a field would break
+    // the head — a target that is not visible-ASCII `/…`, an empty or
+    // non-visible host, a CR / LF / NUL in the user agent — decided
+    // before a byte is written.
     if data.len() >= 6 {
         let third = data.len() / 3;
         let host = &data[..third];
         let path = &data[third..2 * third];
         let ua = &data[2 * third..];
+        let well_formed = path.first() == Some(&b'/')
+            && path.iter().all(u8::is_ascii_graphic)
+            && !host.is_empty()
+            && host.iter().all(u8::is_ascii_graphic)
+            && !ua.iter().any(|&b| b == b'\r' || b == b'\n' || b == 0);
         let mut dst = [0u8; 256];
         match core_net::write_get_request(&mut dst, host, path, ua) {
             Ok(n) => {
                 // The writer returns the number of bytes written and
                 // those bytes are always within `dst`.
                 assert!(n <= dst.len());
+                assert!(well_formed);
             }
-            Err(core_net::HttpErr::BufferTooSmall) => {}
+            Err(core_net::HttpErr::BufferTooSmall) => assert!(well_formed),
+            Err(core_net::HttpErr::BadHead) => assert!(!well_formed),
         }
     }
 });

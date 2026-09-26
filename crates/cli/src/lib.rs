@@ -43,6 +43,8 @@ pub mod evm_live;
 pub mod evm_shadow;
 pub mod evm_testnet;
 pub mod exec_boot;
+/// HAR H3.4: `har.toml` + the seeds + the engine's own state → the long-tenor set.
+pub mod har_boot;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;
@@ -68,10 +70,12 @@ pub use paper::{
     extend_okx_table_with_options, hyperevm_pool_table, join_reverse, log_hl_families,
     new_capture_run_dir, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
     parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
-    spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hyperevm, spawn_hyperliquid, spawn_mexc,
-    spawn_okx, spawn_polymarket, spawn_rpc, split_host_port, state_writer, AiIngressCounterIds,
+    spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall, spawn_hyperevm,
+    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc, split_host_port,
+    state_writer, AiIngressCounterIds,
     AiIngressStatus, BinanceConnSpec, BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers,
-    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds,
+    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, HcMetricIds, HypercallSpec,
+    IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
     RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };

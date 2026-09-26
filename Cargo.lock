@@ -138,6 +138,7 @@ dependencies = [
  "core-parse",
  "core-regime",
  "core-ring",
+ "core-settle",
  "core-time",
  "core-types",
  "core-vol",
@@ -151,6 +152,7 @@ dependencies = [
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
@@ -347,6 +349,7 @@ dependencies = [
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
@@ -515,6 +518,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-settle"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "core-simd"
 version = "0.1.0"
 
@@ -534,6 +544,8 @@ name = "core-vol"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-time",
+ "core-types",
 ]
 
 [[package]]
@@ -978,6 +990,24 @@ name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
  "book-builder",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "options-select",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
  "core-metrics",
  "core-net",
  "core-parse",
@@ -1994,6 +2024,7 @@ dependencies = [
  "core-regime",
  "core-time",
  "core-types",
+ "core-vol",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",

@@ -43,6 +43,27 @@ fixed_daily  = [{ kind = "pm_daily_resolve", at = "16:00" }, { kind = "hip4_dail
                 { kind = "engine_restart", at = "00:10" }, { kind = "engine_restart", at = "08:30" },
                 { kind = "engine_restart", at = "16:05" }]
 
+[events]
+# The scheduled-events feed (operator ruling O-HC8): dated events that move
+# an underlying's vol, for the Hypercall S1 event law — the R1 study and any
+# future member read `scheduled-events.json` beside `calendar.json`,
+# rewritten every cycle. Operator-maintained like `bls_releases`: no keyless
+# JSON serves earnings dates (Nasdaq's calendar API refuses robots). ONE
+# inline table per event, ONE LINE each. `at` is ISO-8601 WITH its zone;
+# `kind` is earnings | lockup | macro | other; `underlyings` use the
+# `[hypercall]` spelling (SP500, NVDA, BTC …); `confirmed = 0` marks a date
+# the operator ESTIMATED rather than read from an announcement (default 1).
+# FOMC statements (from the Fed calendar source) and every `[calendar]
+# bls_releases` entry are added as `macro` events on the `macro` list.
+horizon_days  = 45     # forward: past the longest listed Hypercall expiry
+lookback_days = 120    # back: R1 replays captured windows this old
+macro     = []         # e.g. ["SP500", "BTC", "ETH"]
+scheduled = []
+# scheduled = [
+#   { at = "2026-11-17T21:20:00Z", kind = "earnings", underlyings = ["NVDA"], label = "Q3 FY27 (after close)" },
+#   { at = "2026-10-28T20:05:00Z", kind = "earnings", underlyings = ["MSFT"], label = "FQ1 FY27", confirmed = 0 },
+# ]
+
 [registry]
 # ONE inline table per source, ONE LINE each: an array of inline tables is
 # valid TOML, a one-line `[[source]] k=v k=v` is not, and an inline table may

@@ -252,6 +252,758 @@ supervised restart and the post-boot checks.
 **Rollback**
 - Unsafe: an older binary re-subscribes dead instances on a reconnect —
   the 1.2 s loop this fixed.
+## 2026-09-26 — `/state.har` and the `engine_har_*` gauges (HAR H3.5)
+
+**What changed**
+
+- `/state` gains a `har` object (additive — `"v"` does not move; placed before
+  `recent`): `configured` (series the set runs), `hash` (SHA-256 of the
+  `har.toml` loaded), `dropped` (series the file names whose feed the boot
+  universe does not carry), the set's counters flat (`minutes_rolled`,
+  `closes`, `day_closes`, `held`, `forced`, `day_close_ns_max`,
+  `day_close_ns_last`, `epoch`), `tenors_d` = `[1,2,3,5,7,14,21,30,40]`
+  and `series` — one object per series in `har.toml` order: `name`,
+  `feed` (symbol id), `warm`, `days` (closed days resident, ≤ 64),
+  `empty_days`, `gaps`, `newest_day_ms`, `day_age_s` (WALL-derived: whole
+  seconds since the newest closed day ended; `-1` = none), `last_min_ms`,
+  `open_minutes`, `epoch`, and per tenor `raw_1e6` / `fit_1e6` (σ
+  annualised ×1e6; `0` = none), `pairs`, `fitted` and `fit_beats_raw`
+  (`0`/`1` arrays), plus `weekday_1e6` (Monday first; `1e6` = a mean day)
+  and `weekday_n`.
+- `EngineSnapshot` grows 28 352 → 30 656 B at the Hypercall merge (twelve
+  176 B rows over XMM XH3's `xmm` block; the
+  32 KiB test bound holds). A row is rebuilt only at its series' UTC day
+  close (or the boot restore) and copied by the 1 s publish.
+- Four gauges, always registered: `engine_har_series_configured`,
+  `engine_har_series_warm`, `engine_har_day_age_max_s` (the stalest
+  series; `-1` = none closed a day) and `engine_har_day_close_ns_max`.
+
+**Why**
+
+- The ruling "publish a profile" and the H3 plan's §7 panel: the fit and
+  the raw fold side by side (L2), and a series that stopped recalibrating
+  must be visible (`day_age_s` > 93 600 is the red rule).
+
+**Impact**
+
+- A boot without `har.toml` renders `"har":{"configured":0,…,"series":[]}`
+  and `engine_har_series_configured 0`; every other byte of `/state` and
+  every other metric is unchanged. Readers keyed on names are unaffected.
+
+**Migration steps**
+
+1. None. The dashboard panel reads the object from H3.6.
+
+**Rollback**
+
+- Revert the commit; nothing on disk depends on it.
+
+## 2026-09-26 — the long-tenor HAR runs in the engine: `har.toml`, `--har`, `~/multivenue/har/` (HAR H3.2–H3.4)
+
+**What changed**
+
+- `~/multivenue/har.toml` (new, optional; `har.toml.example` is its
+  contract, `core_config::har` its parser — the engine's line grammar, not
+  standard TOML): up to 12 `[[series]]` of `name` (1–12 of `[A-Z0-9]`),
+  `feed` and an optional one-line `fallback` array (≤ 4, newest first) of
+  `<venue>:<instrument>` descriptors. `claude_worker.har_config` reads the
+  same grammar with the same messages.
+- `multivenue-engine run` gains `--har <path>` and `--har-dir <dir>`
+  (default `~/multivenue/har`). Without `--har` the default file is read if
+  present; absent = the pre-H3 engine, bit for bit.
+- `~/multivenue/har/seed-<NAME>.tsv` (the worker's cut, H3.6 hourly) and
+  `state-<NAME>.tsv` (the engine's own rows: written at each of the series'
+  UTC day closes and at shutdown) share one row grammar (`V 1`, then
+  `D`/`C`/`A`/`P`/`Q`; `core_vol::parse_rows`, `LongVolEngine::write_rows`,
+  byte-identical to `har_seed.seed_rows`). At boot the two merge by
+  `core_vol::merge_rows` (the §6 day-merge law) and restore the series'
+  `LongVolEngine`, held by `StrategySet` (`core_vol::LongVolSet`). No member
+  reads it.
+
+**Why**
+
+- The HAR H3 rulings (2026-09-26): the long-tenor HAR runs in the ENGINE,
+  one series per Hypercall underlying, seeded from the external backfill.
+
+**Impact**
+
+- Failure isolation: only an explicit `--har` that cannot be read refuses
+  the boot. A default file that does not parse turns the service off (a
+  named error); a series whose feed the universe lacks is dropped (named),
+  the rest run; a seed or state that does not parse is dropped for its
+  series. `engine-wrapper.sh` does NOT pass `--har` (a KeepAlive loop is
+  the cost of an unreadable explicit path) — the default path is the
+  switch.
+- Cost: ~2.5 MB boxed at configure (twelve engines); per tick one hash
+  probe; per minute one close per quoting series; per UTC day one close
+  per series, staggered one a 1 s poll.
+
+**Migration steps**
+
+1. At the restart the operator names: write `~/multivenue/har.toml` (the
+   example's twelve), append the seven TradFi perps to `[binance] usdm`,
+   import the dry run's rows and run `claude_worker.har_backfill` once,
+   cut the seeds (H3.6: then hourly by `candles-cycle.sh`).
+
+**Rollback**
+
+- Remove `~/multivenue/har.toml` (the next boot runs without the service);
+  `~/multivenue/har/` may stay — nothing else reads it.
+
+## 2026-09-26 — `core_regime::math::isqrt_i128` is the floor root at v = 2
+
+**What changed**
+
+- `isqrt_i128(2)` returned 2: the Newton start `v/2 + 1` equals `v` at 2,
+  so the loop never ran. `v < 4` is now answered directly (1), and a
+  test pins the floor law on every input up to 10 000. Python's
+  `math.isqrt` — every mirror's — always said 1.
+
+**Why**
+
+- Found by the HAR H1 review as a Rust ↔ Python parity break (the long
+  tape now carries the case: a day whose `Σ r²` is exactly 2).
+
+**Impact**
+
+- Every caller (core-vol, core-regime, strategy-bin15/-vm/-xsd) moves only
+  for an input of exactly 2 — a sum of squared bps×1e9 returns that no
+  market produces; every existing fixture is byte-identical and green.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the commit.
+
+## 2026-09-26 — the scheduled-events feed on the news/event plane (O-HC8)
+
+**What changed**
+
+- `news.toml [events]` (new, optional; `news.toml.example` documents it):
+  `horizon_days` (45), `lookback_days` (120), `macro` (the underlyings
+  FOMC and BLS releases apply to) and `scheduled` — one inline table per
+  dated event: `at` (ISO-8601 with its zone), `kind` (`earnings` |
+  `lockup` | `macro` | `other`), `underlyings` (the `[hypercall]`
+  spelling), `label`, `confirmed` (0 = an estimated date; default 1).
+  A malformed table refuses the registry whole, like every other table.
+- `claude_worker.news.scheduled` (new): every `news cycle` now also
+  writes `scheduled-events.json` beside `calendar.json` — the events in
+  `[now − lookback, now + horizon]`, each tagged with the underlyings it
+  moves: the `[events] scheduled` entries, plus the Fed calendar's FOMC
+  statements (one per UTC day, placed at the earliest row that states
+  its time) and `[calendar] bls_releases` as `macro` on `[events]
+  macro`. Every source's events at one instant and of one kind are ONE
+  event (underlyings united, details joined, confirmed only if every part
+  was): the event law sums a jump per event and must not count one twice.
+  The module is also the READER: `load_feed(path)` → a `Feed` that keeps
+  the window it vouches for (an absent, reshaped or other-version file
+  covers nothing), and `events_in(feed, underlying, t, T)` — the S1 event
+  law's `(t, T]`, or `None` (UNKNOWN, not empty) outside the window.
+- `claude_worker.news.detect`: the Fed and BLS readings are lifted into
+  `fed_rows(registry, store)` and `bls_rows(registry)`, which the 7-day
+  calendar and the feed both take (the calendar's output is unchanged;
+  its tests are untouched and green) — and `_fed_at` now dates a meeting
+  whose day range crosses a month end (`"30-1"`) in the NEXT month. The
+  cycle's detail line gains `scheduled=<n>` (`-1`: the write failed).
+
+**Why**
+
+- Operator ruling O-HC8: the S1 event law's calendar (earnings, CPI/FOMC,
+  lock-ups) comes from the news/event plane as ONE scheduled-events feed
+  that R1 and any future member both read.
+
+**Impact**
+
+- None on the engine (nothing reads the feed yet). One more small file
+  write per cycle. An absent `[events]` table writes a feed that carries
+  nothing.
+
+**Migration steps**
+
+1. Add `[events]` to `~/multivenue/news.toml` (the operator's file) with
+   `macro` and the dated events of the Hypercall underlyings; the next
+   cycle writes the feed.
+
+**Rollback**
+
+- Revert the commit; delete `~/multivenue/worker/news/scheduled-events.json`.
+
+## 2026-09-26 — the long-tenor HAR in the worker: the parity mirror, the shared tape, `har_seed` (HAR H2)
+
+**What changed**
+
+- `claude_worker.vol_ref` gains `LongVolEngine` (+ `long_tenor_of`,
+  `ANNUALISE_LONG_1E9`, the day constants), the bit-exact mirror of
+  `core_vol::LongVolEngine`, and the lifted `ols_fit_1e9` /
+  `trailing_means_1e9` that its `VolEngine` now delegates to (the V4
+  fixtures stay byte-identical and green).
+- A shared tape, `claude-worker/tests/fixtures/vol/long-1.{input,expected}.tsv`:
+  ~210 days of a regime walk through the day clock, a hole, a short day,
+  two empty days, refusals, the fits and QLIKE windows filling, the 1 d
+  pair ring wrapping, a whole-ring silence that clears, and a restore
+  into a fresh engine (seeds accepted and refused, the withheld fit,
+  `refresh`, a live continuation). The expected rows are WRITTEN by
+  `crates/core-vol/tests/long_parity.rs` (`HAR_LONG_PARITY_WRITE=long-1`)
+  and replayed row by row by `tests/test_vol_ref_long.py`; a second
+  harness test fails if a regenerated tape stops exercising any branch.
+- `claude_worker.har_seed` (new module, `python -m …`, never a verb):
+  `show` (the forecast table per tenor, raw beside fit, annualised, with
+  the QLIKE tell), `seed-out` (the v1 seed rows `V`/`D`/`C`/`A`/`P`/`Q`
+  the H3 reader will apply in file order — the lookahead law holds:
+  nothing at or after `--now-ms` is read) and `compare` (the per-day
+  `Σ r²` agreement of two series — the measurement a `--fallback` must
+  pass before its days are trusted).
+
+**Why**
+
+- Plan phase H2: the engine's long-tenor numbers must be reproducible
+  offline to the bit, and the boot seed must be cut by the same law.
+
+**Impact**
+
+- None on the engine or any worker verb. The `candles-cycle.sh` /
+  `engine-wrapper.sh` seed hooks the plan lists for H2 are NOT added: they
+  would run for a `har.toml` that has no parser until H3 (whose feed
+  descriptor per series, `StrategySet` ownership and `/state.har` are
+  operator rulings).
+
+**Migration steps**
+
+1. None. To read the long tenors of a series today:
+   `python -m claude_worker.har_seed show --descriptor binance-usdm:btcusdt`.
+
+**Rollback**
+
+- Revert the `HAR:` H2 commit.
+
+## 2026-09-26 — `core_vol::LongVolEngine`: the HAR over whole days, 1–40 d (HAR H1)
+
+**What changed**
+
+- `crates/core-vol/src/long.rs` (new, re-exported at the crate root):
+  `LongVolEngine`, the long-tenor sibling of `VolEngine`, fed by the same
+  minute-close law but keeping one `Σ r²` per UTC day.
+  - A day ring of 64 calendar-contiguous days. A UTC day with no minute
+    is pushed EMPTY, and the EMPTY-DAY LAW holds: no return is formed
+    across it (the next close only primes), no pair forms through it, no
+    arm forms while it is in the 30-day fold window — ABSENT DATA HOLDS
+    over biased pairs that would sit in the ring for months (the review
+    measured a 40-day silence dragging the raw 1 d σ from 17.3 % to
+    11.9 % while "warm"). A silence of 64 days or more clears the ring
+    and keeps every pair and fit.
+  - The fold over `[1, 7, 30]` completed days, `VolEngine`'s integer
+    steps in days; the grid is EVERY whole day `1 ..= 40`
+    (`long_tenor_of`), with `ANNUALISE_LONG_1E9` computed at compile
+    time by the law that reproduces `ANNUALISE_15M/4H/8H_1E9` (1 d
+    19 111 514 854, 1 w 7 223 473 640, 1 M 3 489 269 264, pinned).
+  - At each day close every tenor ARMS (its `x` and the fitted forecast
+    made from it) and SETTLES its arm from `τ` closes ago against the
+    `τ` days since: overlapping, daily-stepped pairs keyed by the
+    target's first day, 128 per tenor, a rolling fit per tenor, and a
+    QLIKE tell of the raw fold against the fit AS ARMED.
+  - Writer accessors (`day_at`, `open_day`, `arm_at`, `pair_at`,
+    `qlike_at`) and their exact inverses (`seed_day`, `seed_open`,
+    `seed_arm`, `seed_pair`, `seed_qlike`, `refresh`) for the H3 state
+    file; a round trip is identical and continues identically (tested).
+    A seed the writer could never have produced (a "none" or an
+    out-of-range log-vol, a day sum above 1e32) is refused, never
+    repaired — the review showed one wrapping the fit's sums.
+  - 206 080 B, `#[repr(C, align(64))]`, size-asserted; no allocation
+    after `new()` — bench gate 81 (`long_vol_is_zero_alloc`: 60 day
+    closes over the whole grid under the guard, 0 B/op).
+- `core_vol::ols_fit_1e9` (new, public): `VolEngine::refit`'s closed-form
+  OLS lifted into a free function that BOTH engines call, and the QLIKE
+  trailing means into a crate-private helper. `VolEngine`'s outputs are
+  unchanged: the shared parity fixtures (`claude-worker/tests/fixtures/vol/`)
+  are byte-identical and green before and after (gate G3).
+
+**Why**
+
+- The long-tenor plan (vault `docs/research/vol/har-long-tenor-plan-2026-09-19.md`
+  §3.1, phase H1) under ruling O-HC5: weekly/monthly tenors plus the
+  1–40 d grid that spans a Hypercall option chain, on all 12 series.
+
+**Impact**
+
+- None on the engine: no owner holds a `LongVolEngine` yet (H3 — the
+  feed descriptor per series, `StrategySet` ownership and `/state.har`
+  are operator rulings). No member reads it; nothing here is a trading
+  signal (plan law L4).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the `HAR:` H1 commit.
+
+## 2026-09-26 — `crates/core-settle`: the Hypercall settlement law, replicated; the settlement shadow (HC7)
+
+**What changed**
+
+- `crates/core-settle` (new, no dependencies): the law Hypercall settles
+  by, and the window that feeds it.
+  - `SettleWindow`: a 1 s sample-and-hold grid over `[T − 30 min, T]`
+    (1 800 points; a price from before the window carries in; a print
+    stamped after `T`, out of order or non-positive is refused).
+  - `median_of_means(samples, order, scratch)`: trim ⌊5 % · n⌋ from each
+    tail, ⌊√n′⌋ buckets of ⌊n′/k⌋ (the last takes the rest), the median of
+    the bucket means. `BucketOrder::{Sorted, Time}` both, because the
+    venue's docs do not say which and the first measurement did not
+    separate them.
+  - Fixed point ×1e6, `i128` sums, `select_nth_unstable` at every trim
+    and bucket boundary (no full sort), stack-only. Bench gate 80: a
+    window filled, closed and settled under both orders, 20 expiries,
+    0 B/op.
+- `claude_worker.hypercall_settle` (new module, never a verb): the
+  Python MIRROR of the law (pinned bit for bit against the Rust tests'
+  table) and the shadow — for every expiry `hc_payouts` pins, the
+  captured index Marks (`hypercall-events.pmlr`) over the window, the law
+  under both orders, `settle_err_bps` per expiry, and the HC7 gate line
+  per order (median |err| ≤ 1 bp and max ≤ 3 bp over ≥ 20 consecutive
+  full-coverage expiries on ≥ 3 underlyings).
+
+**Why**
+
+- HC7 of the Hypercall plan: paper settlement of a held Hypercall option
+  must use the venue's own law, and the gate must choose the bucket
+  order from data before any member books with it.
+
+**Impact**
+
+- None on the engine: nothing books with the law until the gate passes
+  and a member is ruled in (HC11).
+
+**Migration steps**
+
+1. None. To accumulate gate evidence: keep `[hypercall]` capturing
+   (HC5), run `hypercall_history` with the provider wallets (HC6), then
+   `python -m claude_worker.hypercall_settle`.
+
+**Rollback**
+
+- Revert the HC7 commit.
+
+## 2026-09-26 — worker lanes for Hypercall: the research-store puller, the fee table (HC6)
+
+**What changed**
+
+- `claude_worker.hypercall_history` (new module, `python -m …` — never a
+  worker verb): one cycle pulls three public REST lanes under one
+  per-hour budget (`CLAUDE_WORKER_HC_BUDGET_PER_H`, default 120) into
+  tables beside candles in `candles.db`:
+  - `hc_trades` — `/trades` forward from the table's own
+    `max(trade_id)` (the venue's exclusive cursor), with the maker and
+    taker wallets the WS never sends;
+  - `hc_payouts` — `/settlement-payouts` for the wallets named by
+    `--wallets` / `CLAUDE_WORKER_HC_WALLETS` (none = the lane is skipped;
+    no wallet is compiled in). `--settle-prices` prints the derived
+    (underlying, expiry) → S table (S = K ± intrinsic) and flags an
+    expiry whose rows disagree — the reference HC7 is judged against;
+  - `hc_summary` — one `/options-summary?…&include_rfq_provider_quotes=true`
+    per `[hypercall] underlyings` entry: mark, IV, underlying, OI, best
+    bid/ask, provider count.
+  Host: `HYPERCALL_REST_HOST`. Serialized like every worker invocation
+  (`pgrep` first; WAL + busy timeout).
+- `frames.VENUE_HYPERCALL = 9`.
+- Fees: `pnl_report.FEE_VENUES` accepts `hypercall`; `fees.toml.example`
+  carries `hypercall = "0:0"` and `[fees.hypercall] option = "0:0"`,
+  UNVERIFIED (ruling O-HC7: the launch configuration — every public trade
+  row so far carries zero fees), with the published future schedule as a
+  commented fee-on STRESS variant (`option = "2:5"`,
+  `option_cap = "5:1250"`; the settlement leg is not expressible yet).
+
+**Impact**
+
+- **Store:** three new tables in `candles.db`, created on first run.
+- **Config:** optional env keys; the live `fees.toml` is the operator's
+  (see below).
+
+**Migration steps**
+
+1. Operator: add the two `hypercall` lines to `~/multivenue/fees.toml`
+   (copy them from `fees.toml.example`) before the first report that
+   includes a Hypercall run — an unknown venue table is fatal, and a
+   missing one charges the harness default.
+2. Optional: schedule `python -m claude_worker.hypercall_history` beside
+   the funding lane, with the provider wallets in
+   `CLAUDE_WORKER_HC_WALLETS` (the research vault names them).
+
+**Rollback**
+
+- Revert the HC6 commit; the tables are inert without the module.
+
+## 2026-09-26 — the Hypercall ingress is spawned: two threads, `/state` row 10, `--raw-tap hypercall`, the venue metrics (HC5)
+
+**What changed**
+
+- `cli::spawn_hypercall` (paper.rs) runs the HC3 crate whenever the HC4
+  discovery selected a chain:
+  - `ingress-hypercall` owns the public socket, the tick lane 7 / event
+    / opt lane 3 producers and the `"hypercall"` capture (+ the raw-tap
+    venue byte 9);
+  - `hypercall-poller` runs the REST `/options-summary` cycle on its own
+    thread (a request may block up to its deadline) and hands its rows
+    to the ingress thread over an SPSC ring. It resolves its host on its
+    own thread: a DNS failure ends the poller and leaves the quotes
+    running.
+  - The bin builds the universe table from the discovered chain and the
+    index table from `allocated.hypercall_idx`; the staleness threshold
+    is the venue default (500 ms) or `--stale-after-ms hypercall:<ms>`.
+  - Hypercall events stay capture-only: the event-lane mask is the v1
+    law (`EVENT_LANE_FUNDING`) and the venue has no funding.
+- `/state`: `SNAPSHOT_VENUES` 9 → 10; `hypercall` is the tenth ingress
+  row, appended after `hyperevm` (append, never reorder). The TUI's
+  ingress panel grows one row (derived).
+- `--raw-tap` accepts `hypercall` (and `all` includes it).
+- Metrics (`/metrics`):
+  - the standard per-venue set — `engine_ingress_hypercall_state`,
+    `_last_tick_age_seconds`, the 13 §6.4 counters + `_feed_delay_ema_ms`,
+    `_capture_{io_errors,records}`, `_coverage_configured`, and
+    `engine_ingress_hypercall_options_selected`;
+  - the venue family, 31 gauges mirrored from `HcCounters`
+    (`cli::HC_METRIC_NAMES`): closes by slow-consumer cause, subscribe
+    sets, one-sided / empty / crossed quotes, provider sides, ClockSyncs,
+    listings by action, foreign trades, venue errors, the publish-lag /
+    quoted-instruments / providers-max / index-age / clock-RTT gauges,
+    snapshot requests, and the poller's ok / err / rows / foreign rows /
+    snapshots / handoff drops / last round.
+  - A worst-case boot (every exec slot live) still fits the fixed
+    registry (a test builds it).
+- `crates/cli/tests/hypercall_live_smoke.rs` (`#[ignore]`): discovery,
+  then the production spawn against the REAL venue for a bounded window,
+  WITHOUT the engine (the MX9 shape — nothing binds 9191 or `ai.sock`).
+  Run from the Cowork container on 2026-09-26 (4 underlyings × E1 × K4,
+  90 s): 2 402 messages, 1 947 BBO ticks + 176 index Marks, 0 parse
+  errors, 0 reconnects, one subscribe set, 688 provider sides, 6 polls
+  → 48 summary rows, the capture holding every tick. The container's
+  egress re-signs TLS, so that run passed `HC_SMOKE_CA_BUNDLE` (test-only;
+  the engine trusts only the compiled-in roots).
+
+**Why**
+
+- HC5 of the Hypercall plan: the venue captures once `[hypercall]` is
+  configured.
+
+**Impact**
+
+- **On-disk formats:** a boot with `[hypercall]` writes
+  `hypercall-{ticks,events,opt-summary,signals,depth}.pmlr` (the uniform
+  file set; signals and depth header-only).
+- **`/state`:** one more ingress row (the array is append-only; readers
+  that index the first nine are unaffected).
+- **`/metrics`:** ~50 new names; nothing renamed.
+- **Threads:** two more when enabled.
+
+**Migration steps**
+
+1. To enable (the operator's step, at a restart he chooses — the session
+   never restarts the engine): add `[hypercall]` to
+   `~/multivenue/universe.toml` (O-HC2: the twelve underlyings,
+   `expiries = 3`, `strikes = 8`), `cargo build --release -p cli`, run the
+   live smoke (above) standalone first, then restart. After the restart:
+   `vm_rows_active ≥ 1` on `/state` (the restart law) and
+   `engine_ingress_hypercall_options_selected` = the selected chain.
+
+**Rollback**
+
+- Remove `[hypercall]` (the pre-HC5 boot, bit for bit), or revert the HC5
+  commit.
+
+## 2026-09-26 — `[hypercall]` universe section, boot discovery, manifests, the descriptor caps (HC4)
+
+**What changed**
+
+- `universe.toml` gains an optional `[hypercall]` section
+  (`universe.toml.example`; parser `core-config::universe`):
+  - `underlyings` — Hypercall's own names, UPPERCASE `[A-Z0-9]`,
+    1..=12 bytes (`SP500`, `SPCX`, `BTC`, …);
+  - `expiries` / `strikes` — the shared M2 options-policy law (E 1..=4,
+    K even 2..=32, defaults 2 / 8) under this section's own key names;
+  - `summary_every_s` — each underlying's REST `/options-summary` period,
+    60..=3600, default 300;
+  - `underlyings × expiries × strikes × 2 ≤ 1024`: the universe must fit
+    the ONE indicative subscribe frame (the venue's D3 law).
+  - Allocation: each underlying's settlement index is
+    `hypercall-idx:<U>` at ordinal `i + 1` of venue byte 9
+    (`AllocatedUniverse::hypercall_idx`). The options are
+    boot-discovered and take ordinals from `OPT_ORDINAL_BASE` (513 up)
+    in selection order — they reshuffle every boot, like Deribit's.
+- `core-config::Config`: `HYPERCALL_WS_HOST` and `HYPERCALL_REST_HOST`
+  (both default `api.hypercall.xyz`; `.env.example`).
+- Boot discovery (`cli::boot_discovery::run_all`) gains the Hypercall arm
+  when `underlyings` is non-empty: ONE `GET /markets` (≈ 4.3 MB, body cap
+  32 MiB), one forward scan, then the capped chain per underlying — the
+  nearest series OUTSIDE the provider's 2 h pre-expiry blackout × the K
+  strikes nearest the venue's index. A configured underlying the venue
+  does not list refuses the boot; one that selects nothing marks it
+  `any_missing` (fatal live, a warning in paper).
+- Manifests and the live descriptor table carry the venue:
+  - `options-manifest.tsv`: `hypercall\t<sym>\t<instrument>` rows;
+  - `instrument-manifest.tsv`: `hypercall-idx:<U>` rows after the
+    `mexc-perp:` block, `hypercall:<instrument>` rows last;
+  - the ruleset `DescriptorTable` gets the same rows (its membership is
+    the manifest's by construction).
+- The capability string law (`ingress_ai::caps_of_descriptor` and its
+  pinned Python mirror `claude_worker.channel_map.caps_of_descriptor`):
+  `hypercall:` options → `OPT|PRICE`; `hypercall-idx:` → none (the index
+  has no tick and no summary, so no ruleset feature can read it).
+- `opt-registry` is UNCHANGED: a Hypercall-keyed registry (and a
+  premium-denomination field) belongs to the first consumer that needs
+  one — the HC11 member, on its own ruling — not to a data-only lane.
+
+**Why**
+
+- HC4 of the Hypercall plan (rulings O-HC1…O-HC10): the O-HC2 universe
+  (12 underlyings × E3 × K8 × {C,P} = 576) is chosen at boot the way the
+  M2 law chooses Deribit's chain, and every offline consumer resolves
+  its reshuffled ordinals through the manifests.
+
+**Impact**
+
+- **Config keys:** one optional section and two optional env keys. A
+  file without `[hypercall]` (or with `underlyings = []`) parses to the
+  pre-HC4 universe bit for bit; no discovery runs.
+- **On-disk formats:** manifest rows appear only with the section.
+- **API:** `boot_discovery::run_all`, `options_manifest::render`,
+  `render_instruments` and `build_descriptor_entries` each gain a
+  Hypercall parameter.
+
+**Migration steps**
+
+1. None. Do NOT enable `[hypercall]` before HC5: until the ingress is
+   spawned, discovery would run and the manifests would name instruments
+   nothing captures.
+
+**Rollback**
+
+- Revert the HC4 commit.
+
+## 2026-09-26 — `crates/ingress-hypercall`: the Hypercall market-data ingress, data-only (HC3)
+
+**What changed**
+
+- New crate `crates/ingress-hypercall` (ruling O-HC1: no keys, no exec
+  arm). Not spawned yet: the bin wiring is HC5, so nothing changes at
+  runtime.
+  - ONE public WebSocket, one thread: `ClockSync` at connect, then one
+    `Subscribe` per channel — `indicative_market_data` naming the whole
+    universe in ONE frame (the D3 law: 3 or 12 frames were closed 1008
+    within 0.12 s, measured 2026-09-25), plus `index_prices`, `trades`,
+    `market_updates`.
+  - A slow-consumer close (1008 + a reason JSON) is counted by cause and
+    torn down; the reconnect re-subscribes in one frame and asks the
+    REST poller for a full snapshot round (quotes that changed in the
+    gap are not replayed).
+  - A REST poller thread (`GET /options-summary?currency=<U>` over the
+    HC2 `HttpsReq`, staggered, default 300 s per underlying) hands its
+    `OptSummary` rows over an SPSC ring; the ingress thread captures them
+    and pushes them onto opt lane 3 — every file and lane keeps one
+    writer.
+  - The capture law — BBO-change ticks (one-sided and crossed quotes
+    kept), `Trade`, `Mark` on the index syms, `ProviderQuote` (14) for
+    multi-provider quotes, the summary rows — is `docs/wire-format.md`
+    "Hypercall (HC3)".
+  - The drain loop judges progress by frames CONSUMED, not ticks
+    published (the I-3 gap of the tick-judged loops), capped at 64 steps
+    per iteration.
+  - `discovery`: the one-pass `/markets` scan and the capped-chain
+    selection (the M2 law via `options-select`, plus the provider's 2 h
+    pre-expiry blackout) as pure functions over a trimmed real body; the
+    boot wires them at HC4.
+- `core_types::ChannelId::ProviderQuote = 14` (NEW, additive): one side
+  of one market-maker's indicative quote, for a quote with ≥ 2 providers.
+  `venue_seq` packs the provider's index, the side, the provider count
+  and the wallet's low 32 bits (`docs/wire-format.md`, the
+  `ChannelEvent` table). `ChannelId::from_u8(14)` now resolves.
+- Parsers fill in place (the poison law) with in-place object/array
+  walkers; the subscribe frame is serialised from parts straight into
+  the masked tx buffer; the poller's rows are read in place in the
+  handoff slot.
+- Gates:
+  - bench gate 78: every Hypercall parser, the lookup, the subscribe
+    parts and the summary scan, 0 B/op;
+  - bench gate 79: the run loop's steady state (real handshake, then
+    300 rounds of the measured wire mix incl. a server Ping and the
+    handoff) with a real `PmlrCapture`, 0 B/op;
+  - fuzz targets `hypercall_ws_frame`, `hypercall_markets`,
+    `hypercall_summary` (poisoned start);
+  - `make copy-audit` covers the crate (new = 0).
+
+**Why**
+
+- HC3 of the Hypercall plan: the venue's public market data — option
+  premia and IV on 12 underlyings incl. tokenised equities — as a
+  capture/research lane (O-HC1).
+
+**Impact**
+
+- **On-disk formats:** none until HC5 spawns the ingress (then the
+  `hypercall-*` capture files, the label reserved at HC1).
+- **API:** additive (a new crate).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the HC3 commit.
+
+## 2026-09-25 — core-net: any-method HTTP/1.1 heads and `HttpsReq`; `HttpsPost` on the shared keep-alive engine (HC2)
+
+**What changed**
+
+- `core_net::http1` gains ONE head writer for every request:
+  - `Method` (`Get`/`Post`/`Put`/`Delete`, `#[repr(u8)]`), `Header<'a> =
+    (&[u8], &[u8])` and `ReqHead`: method, host, origin-form target, UA,
+    optional `Content-Type`, extra headers, keep-alive.
+  - `request_head_len` sizes the head; `write_request_head` renders it;
+    `write_request` renders the head, then the body.
+  - `Content-Length` goes on every method but a bodiless `GET`. A `DELETE`
+    may carry a body; Hypercall cancels with one.
+  - `write_get_request` / `write_post_request` are thin wrappers and emit
+    the same bytes as before (pinned by their golden tests).
+  - `HttpErr::BadHead` is new: a CR / LF / NUL in any field (header
+    injection), a target that is not visible-ASCII `/…`, an empty host, or
+    a bad header name. Refused, never rewritten. A proptest proves no field
+    can smuggle a line in.
+- `core_net::HttpsReq` is new: a keep-alive HTTPS client for ONE host and
+  ANY request.
+  - `request(method, target, extra, body_len) -> (status, body_range)`.
+    The body is rendered in place (`body_mut`); the head is rendered per
+    request flush against it; ONE contiguous slice goes out in ONE write.
+  - The User-Agent is `multivenue-engine/1` and every request sends
+    `Accept-Encoding: identity`.
+- `crate::https_conn::KeepAlive` (private) now holds the connection engine
+  that used to live inside `HttpsPost`, **moved unchanged**: the dial, the
+  idle-close probe before reuse, the one-exchange cycle, the retire rules
+  and the `left_host` law. `HttpsPost` and `HttpsReq` both run on it.
+  `HttpsPost`'s public API, wire bytes and allocation profile are
+  unchanged: gate 72 is still exactly 2 per post, and its loopback suite
+  and the HYPARB arm loopback pass untouched.
+- `PostErrKind::BadRequest` is new (`HttpsReq` only): a head refused
+  before any byte left, `left_host == false`.
+- New alloc gates:
+  - 77a: the head writer is 0 B/op.
+  - 77b: the `HttpsReq` keep-alive cycle is exactly 2 allocations per
+    request, gate 72's rustls record residue.
+- New TLS loopback `core-net/tests/https_req_tls_loopback.rs` covers:
+  - every method on one connection, and extra headers verbatim;
+  - no `Content-Length` on a bodiless GET;
+  - idle close and announced close;
+  - chunked framing;
+  - a 600 KB answer over many records, and `Overflow` when it does not fit;
+  - refusals that never dial.
+
+**Why**
+
+- Hypercall's REST surface spans many paths and methods on one host. The
+  data plane needs a runtime `GET /options-summary?currency=<U>` (HC3). The
+  exec plane will need `PUT` replace, `DELETE` cancel with a JSON body, and
+  signed `X-Hypercall-*` headers on MMP reads (HC9).
+- `HttpsPost` is POST-only with a boot-fixed path. `boot_http::https_get`
+  is boot-only and blocking.
+
+**Impact**
+
+- **On-disk / config / wire formats:** none.
+- **API:** additive. `HttpErr` and `PostErrKind` each gain a variant.
+  Outside core-net only the `http1_response` fuzz target matched one
+  exhaustively (the fuzz crate is its own workspace, so no workspace gate
+  builds it); it now covers `BadHead` and checks the framing law on every
+  input — `BadHead` exactly when a field would break the head.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the HC2 commit.
+
+## 2026-09-25 — VenueId 9 = Hypercall; tick lane 7, opt lane 3; `VENUE_COUNT` 10 (HC1)
+
+**What changed**
+
+- `VenueId` gains `Hypercall = 9`, appended; the first unassigned byte is now
+  10. `core_types::VENUE_COUNT` goes 9 → 10, so every venue-indexed table
+  grows by one slot:
+  - `VenueId::stale_after_ms_defaults`: Hypercall 500 ms (HC0: the
+    quote-stamp feed-delay p99 was 447.6 ms);
+  - `core_fill::ACTIVATION_NS_DEFAULT` / `ModelParams`: Hypercall 130 ms
+    (HC0, `docs/venue-latency.md` §3);
+  - `core-config::exec::VENUE_NAMES`: `hypercall` = 9, reserved so an
+    artifact can name it — naming it arms nothing.
+- Engine lanes:
+  - `engine::NUM_TICK_LANES` 7 → 8: `tick_lane_of(Hypercall) = 7`, for
+    option BBO ticks off the indicative feed. Event lanes follow the tick
+    geometry, so there are 8 of them.
+  - `engine::NUM_OPT_LANES` 3 → 4: `opt_lane_of(Hypercall) = 3`, for the
+    REST `/options-summary` mark row.
+  - No depth lane and no fill lane: data-only, ruling O-HC1.
+  - The bin splits the three new rings and drops their producers (the
+    unspawned-venue shape). The ingress spawn is HC5.
+- Capture and harness labels:
+  - `hypercall` is appended to the capture `VENUE_LABELS` (backtest,
+    audit-replay, audit-pnl, capture-catalog). A run without Hypercall
+    files is read exactly as before.
+  - `hypercall` is appended to the model labels: `--fee-bps hypercall:…`,
+    `--latency-ns-venue hypercall:…`, `--stale-after-ms hypercall:…`.
+  - The rendered fee table gains a trailing `hypercall` entry: text
+    ` hypercall=0:0`, JSON `"hypercall":{…}` after `"hyperevm"`.
+  - Capture-catalog `venue_ticks` arrays have 10 entries.
+- The backtest merge's lane-ordinal bands are widened from a stride of 8 to
+  16 (`LORD_BAND`). Ticks = vi, events 16+vi, depth 32+vi, opt 48+vi,
+  synthetic marks 64+vi, regime 80, pool signals 96.
+  - At the stride of 8, the ninth label (`hyperevm`) already shared tick
+    lord 8 with `pm`'s events and synthetic lord 48 with the regime lane.
+    The tenth label would have broken the `(lord, idx)` injectivity the
+    sort's totality relies on.
+  - Band ORDER is unchanged, so every existing replay merges record for
+    record as before.
+- `clob-dispatcher::PaperMatcher` refuses venue byte 9 as `unroutable`
+  explicitly. Before HC1 the byte sat past the activation table's end and
+  the length check refused it; the new slot would otherwise have made it
+  routable. `backtest::fill::tradeable_venue_byte(9)` stays `false`.
+- Descriptor law, in Rust, Python and the shared
+  `descriptor-classes.tsv`:
+  - `hypercall:<UND>-<YYYYMMDD>-<STRIKE>-<C|P>` → `option`. Decimal strikes
+    are allowed; any other name → `none`.
+  - `hypercall-idx:<UND>` → `spot`: the settlement index, capture-only.
+
+**Why**
+
+- Hypercall integration, data-only (plan
+  `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
+  rulings O-HC1…O-HC10). HC1 is identity and lanes only. The venue is
+  present but unconfigured: no ingress thread, no `[hypercall]` section
+  yet (HC4 and HC5).
+
+**Impact**
+
+- **On-disk formats:** no PMLR bump. A new venue byte is not a slot-layout
+  change. No `hypercall-*.pmlr` file exists until HC5.
+- **Config keys:** `exec.toml` venue names accept `hypercall`; nothing arms
+  it. `--stale-after-ms` / `--fee-bps` / `--latency-ns-venue` accept the
+  `hypercall` label.
+- **Wire formats:** `VenueId` byte 9 is assigned.
+- **Memory:** three more preallocated rings (tick 1 MiB, event, opt) that
+  nothing produces into. The engine drains them empty: two atomic loads
+  per lane per iteration.
+
+**Migration steps**
+
+1. None. A boot with no `[hypercall]` section is the pre-HC1 boot in
+   behaviour.
+
+**Rollback**
+
+- Revert the HC1 commit. There is no data or config migration to undo.
 
 ## 2026-09-24 — `scripts/bin15-flip.sh`: slot 3 PAPER ⇄ LIVE in one command (BIN15 S7-L1)
 

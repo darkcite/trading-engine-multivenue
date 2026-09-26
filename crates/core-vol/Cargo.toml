@@ -6,10 +6,13 @@ rust-version.workspace = true
 license.workspace      = true
 publish.workspace      = true
 authors.workspace      = true
-description  = "Integer volatility forecast engine (VRP V4): a rolling HAR over 1-minute returns, an OLS fit in log space, and the decision bounds the VRP member compares implied vol against. No floats anywhere on the path; no allocation after new()."
+description  = "Integer volatility forecast engines: VRP V4's rolling HAR over 1-minute returns, an OLS fit in log space and the decision bounds the VRP member compares implied vol against; and HAR H1's long-tenor sibling over whole days (1-40 d). No floats anywhere on the path; no allocation after new()."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 core-regime = { workspace = true }
+# HAR H3.3: the set's clock (`WallAnchor`) and its feed (`Tick`, `SymbolId`).
+core-time   = { workspace = true }
+core-types  = { workspace = true }

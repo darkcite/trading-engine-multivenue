@@ -740,3 +740,113 @@ def test_the_xmm_summary_reads_the_quoted_perps_and_survives_absence(tmp_path):
     summary = claude_worker.dashboard._xmm_summary(ok)
     assert summary["quoted"] == ["BTC", "ETH"]
     assert len(summary["hash"]) == 64
+
+
+# ---- HAR H3.6: the "Volatility (HAR, long)" panel's worker half ---------------
+
+
+def _har_inputs(tmp_path: pathlib.Path) -> claude_worker.dashboard.Inputs:
+    mv = tmp_path / "multivenue"
+    (mv / "har").mkdir(parents=True)
+    return claude_worker.dashboard.Inputs(
+        db_path=tmp_path / "missing.db",
+        reports_dir=tmp_path / "reports",
+        regime_dir=tmp_path / "regime",
+        candidates_dir=tmp_path / "candidates",
+        replay_dir=tmp_path / "logs",
+        multivenue_dir=mv,
+        news_dir=tmp_path / "news",
+        news_policy_path=tmp_path / "news-policy.toml",
+        news_llm_path=tmp_path / "llm.toml",
+        engine_url="http://127.0.0.1:1",
+    )
+
+
+def test_the_har_section_is_off_without_har_toml_and_names_a_refusal(
+    tmp_path: pathlib.Path,
+) -> None:
+    inputs = _har_inputs(tmp_path)
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=0)
+    har = doc["har"]
+    assert har["configured"] is False and har["error"] is None and har["series"] == []
+    assert (har["amber_drift"], har["red_day_age_s"]) == (0.10, 93_600)
+    (inputs.multivenue_dir / "har.toml").write_text('[[series]]\nname = "btc"\n', encoding="utf-8")
+    har = claude_worker.dashboard.har_section(inputs, 0)
+    assert har["configured"] is False
+    assert "`name` must be 1..=12 of [A-Z0-9]" in str(har["error"])
+
+
+def test_the_har_section_carries_the_sources_the_ages_and_the_drift(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The page joins this with ``/state.har`` by name: each series' feed and
+    fallbacks, the sources its seed actually spliced (the header's ``span``
+    lines), how old the seed and the engine's state are, and ``drift.json``
+    as the hourly ``compare`` wrote it -- a torn or foreign file is absent,
+    never guessed."""
+    inputs = _har_inputs(tmp_path)
+    mv = inputs.multivenue_dir
+    (mv / "har.toml").write_text(
+        '[[series]]\nname = "BTC"\nfeed = "binance-usdm:btcusdt"\nfallback = ["binance:btcusdt"]\n'
+        '[[series]]\nname = "BOT"\nfeed = "binance-usdm:botusdt"\n',
+        encoding="utf-8",
+    )
+    har = mv / "har"
+    (har / "seed-BTC.tsv").write_text(
+        "# har-seed.tsv v1 (HAR H3) -- BTC: feed binance-usdm:btcusdt, now_ms=1.\n"
+        "# span binance:btcusdt 1000 2000 30\n"
+        "# span binance-usdm:btcusdt 2060 9000 40\n"
+        "# span not-a-number x y z\n"
+        "V\t1\n"
+        "# span after-the-rows 1 2 3\n",
+        encoding="utf-8",
+    )
+    (har / "state-BTC.tsv").write_text("V\t1\n", encoding="utf-8")
+    drift = {
+        "v": claude_worker.har_seed.DRIFT_VERSION,
+        "now_ms": 5,
+        "since_ms": 1,
+        "until_ms": 5,
+        "pairs": [
+            {
+                "series": "BTC",
+                "a": "binance-usdm:btcusdt",
+                "b": "binance:btcusdt",
+                "days": 14,
+                "median_abs": 0.012,
+                "p90_abs": 0.03,
+                "median_signed": 0.011,
+            }
+        ],
+    }
+    (har / "drift.json").write_text(json.dumps(drift), encoding="utf-8")
+    now_ms = int((har / "drift.json").stat().st_mtime * 1000) + 90_000
+    doc = claude_worker.dashboard.worker_payload(inputs, now_ms=now_ms)["har"]
+    assert doc["configured"] is True and doc["error"] is None
+    btc, bot = doc["series"]
+    assert (btc["name"], btc["feed"], btc["fallback"]) == (
+        "BTC",
+        "binance-usdm:btcusdt",
+        ["binance:btcusdt"],
+    )
+    assert btc["spans"] == [
+        {"descriptor": "binance:btcusdt", "first_ms": 1000, "last_ms": 2000, "minutes": 30},
+        {"descriptor": "binance-usdm:btcusdt", "first_ms": 2060, "last_ms": 9000, "minutes": 40},
+    ], "only the header's well-formed span lines"
+    assert 89 <= btc["seed_age_s"] <= 91 and 89 <= btc["state_age_s"] <= 91
+    assert (bot["spans"], bot["seed_age_s"], bot["state_age_s"]) == (None, None, None)
+    assert doc["drift"] == drift and 89 <= doc["drift_age_s"] <= 91
+    (har / "drift.json").write_text('{"v": 2, "pairs": []}', encoding="utf-8")
+    assert claude_worker.dashboard.har_section(inputs, now_ms)["drift"] is None
+    (har / "drift.json").write_text('{"v": 1, "pai', encoding="utf-8")
+    assert claude_worker.dashboard.har_section(inputs, now_ms)["drift"] is None
+
+
+def test_the_har_panel_is_wired_into_the_page() -> None:
+    html = claude_worker.dashboard.HTML_PATH.read_text(encoding="utf-8")
+    assert 'id="s-har"' in html and 'id="har"' in html and 'id="har-sub"' in html
+    assert "function renderHar()" in html and "renderHar();" in html
+    # It joins the engine's /state.har with the worker's har by name, and the
+    # thresholds are the worker's (one place).
+    assert "E && E.har" in html and "W && W.har" in html
+    assert "WH.red_day_age_s" in html and "WH.amber_drift" in html

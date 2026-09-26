@@ -81,13 +81,16 @@ pub const POOL_RING_SIZE: usize = 4_096;
 pub const FILL_RING_SIZE: usize = 1_024;
 
 /// Number of tick lanes: 0 = Polymarket, 1 = Binance, 2 = OKX,
-/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2).
+/// 3 = Deribit, 4 = Hyperliquid, 5 = Bybit (WS9), 6 = MEXC (MX2),
+/// 7 = Hypercall (HC1).
 /// Lane indices are BOOT-WIRED and NO LONGER equal `VenueId as usize`
 /// past lane 4:
 /// `VenueId::Ai = 5` has no tick lane (AI commands ride their own
 /// ring, 8f), so `VenueId::Bybit = 6` occupies lane 5 and
-/// `VenueId::Mexc = 7` lane 6 — see [`tick_lane_of`].
-pub const NUM_TICK_LANES: usize = 7;
+/// `VenueId::Mexc = 7` lane 6; `VenueId::HyperEvm = 8` has none (pool
+/// events ride the signal lane), so `VenueId::Hypercall = 9` occupies
+/// lane 7 — see [`tick_lane_of`].
+pub const NUM_TICK_LANES: usize = 8;
 
 /// Tick-lane index for a market-data venue (WS9 — the lane↔venue
 /// identity broke when Bybit's discriminant landed past `Ai`).
@@ -103,6 +106,8 @@ pub const fn tick_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Hyperliquid => Some(4),
         VenueId::Bybit => Some(5),
         VenueId::Mexc => Some(6),
+        // HC1: option BBO ticks off the indicative (quote-provider) feed.
+        VenueId::Hypercall => Some(7),
         // HYPARB: HyperEVM pool events ride the signal lane — no ticks.
         VenueId::Ai | VenueId::HyperEvm => None,
     }
@@ -138,7 +143,10 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
         // MX2: MEXC spot incremental depth is `Blocked!` on the public
         // tier and futures BBO rides `depth.full` top-5 — no L2 lane.
         | VenueId::Mexc
-        | VenueId::HyperEvm => None,
+        | VenueId::HyperEvm
+        // HC1: Hypercall's book is RFQ-provider indicative quotes — a
+        // touch per instrument, no L2 depth to stream.
+        | VenueId::Hypercall => None,
     }
 }
 
@@ -146,9 +154,11 @@ pub const fn depth_lane_of(venue: VenueId) -> Option<usize> {
 /// options analytics channel — 0 = OKX (`opt-summary`), 1 = Deribit
 /// (option `ticker.100ms`), 2 = Binance (`<uly>@optionMarkPrice` on
 /// fstream `/market`, BX0-F2 — dark from the venue's 2025-12 options
-/// migration until then). [`OptSummary`] slots, [`OPT_RING_SIZE`]
-/// capacity, mapped by [`opt_lane_of`].
-pub const NUM_OPT_LANES: usize = 3;
+/// migration until then), 3 = Hypercall (REST `/options-summary`, HC1 —
+/// the mark / IV / greeks row the indicative feed does not carry).
+/// [`OptSummary`] slots, [`OPT_RING_SIZE`] capacity, mapped by
+/// [`opt_lane_of`].
+pub const NUM_OPT_LANES: usize = 4;
 
 /// Options-summary lane index for a venue with an options channel;
 /// `None` for every other venue. Cold-path helper for boot wiring.
@@ -158,6 +168,7 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Okx => Some(0),
         VenueId::Deribit => Some(1),
         VenueId::Binance => Some(2),
+        VenueId::Hypercall => Some(3),
         VenueId::Polymarket
         | VenueId::Hyperliquid
         | VenueId::Ai
@@ -198,7 +209,14 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         // arm, no fill lane.
         // HYPARB: AMM fills are PAPER fills (the matcher's judge); the
         // O-H12 testnet sends are a shadow and never reach the book.
-        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc | VenueId::HyperEvm => None,
+        // HC1: Hypercall is data-only by operator ruling O-HC1 — no exec
+        // arm (HC9 waits for its own ruling), no fill lane.
+        VenueId::Binance
+        | VenueId::Ai
+        | VenueId::Bybit
+        | VenueId::Mexc
+        | VenueId::HyperEvm
+        | VenueId::Hypercall => None,
     }
 }
 
@@ -1844,62 +1862,52 @@ mod tests {
         )
     }
 
+    /// `N` freshly split rings of one slot type — built over the lane
+    /// count, so a new lane (HC1: tick lane 7, opt lane 3) is not an
+    /// edit here. Test-only (allocates).
+    #[allow(clippy::type_complexity)]
+    fn split_lanes<T: Copy, const CAP: usize, const N: usize>(
+    ) -> ([Producer<T, CAP>; N], [Consumer<T, CAP>; N]) {
+        let (ps, cs): (Vec<_>, Vec<_>) = (0..N).map(|_| Ring::<T, CAP>::new().split()).unzip();
+        match (ps.try_into(), cs.try_into()) {
+            (Ok(ps), Ok(cs)) => (ps, cs),
+            _ => unreachable!("exactly N rings were split"),
+        }
+    }
+
     fn split_tick_lanes() -> (
         [Producer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
         [Consumer<Tick, TICK_RING_SIZE>; NUM_TICK_LANES],
     ) {
-        let (p0, c0) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p3, c3) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p4, c4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p5, c5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        let (p6, c6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4, p5, p6], [c0, c1, c2, c3, c4, c5, c6])
+        split_lanes()
     }
 
     fn split_event_lanes() -> (
         [Producer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
         [Consumer<ChannelEvent, EVENT_RING_SIZE>; NUM_EVENT_LANES],
     ) {
-        let (p0, c0) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p3, c3) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p4, c4) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p5, c5) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        let (p6, c6) = Ring::<ChannelEvent, EVENT_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3, p4, p5, p6], [c0, c1, c2, c3, c4, c5, c6])
+        split_lanes()
     }
 
     fn split_depth_lanes() -> (
         [Producer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
         [Consumer<DepthTopK, DEPTH_RING_SIZE>; NUM_DEPTH_LANES],
     ) {
-        let (p0, c0) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<DepthTopK, DEPTH_RING_SIZE>::new().split();
-        ([p0, p1], [c0, c1])
+        split_lanes()
     }
 
     fn split_opt_lanes() -> (
         [Producer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
         [Consumer<OptSummary, OPT_RING_SIZE>; NUM_OPT_LANES],
     ) {
-        let (p0, c0) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<OptSummary, OPT_RING_SIZE>::new().split();
-        ([p0, p1, p2], [c0, c1, c2])
+        split_lanes()
     }
 
     fn split_fill_lanes() -> (
         [Producer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
         [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     ) {
-        let (p0, c0) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p1, c1) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p2, c2) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        let (p3, c3) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3], [c0, c1, c2, c3])
+        split_lanes()
     }
 
     /// Build an engine plus producer halves for every lane. Tick
@@ -2383,6 +2391,8 @@ mod tests {
         assert_eq!(depth_lane_of(VenueId::Bybit), None);
         assert_eq!(depth_lane_of(VenueId::Mexc), None);
         assert_eq!(depth_lane_of(VenueId::Ai), None);
+        assert_eq!(depth_lane_of(VenueId::HyperEvm), None);
+        assert_eq!(depth_lane_of(VenueId::Hypercall), None);
     }
 
     #[test]
@@ -2475,6 +2485,11 @@ mod tests {
         assert_eq!(opt_lane_of(VenueId::Bybit), None);
         assert_eq!(opt_lane_of(VenueId::Mexc), None);
         assert_eq!(opt_lane_of(VenueId::Ai), None);
+        assert_eq!(opt_lane_of(VenueId::HyperEvm), None);
+        // HC1: the REST `/options-summary` mark row, lane 3.
+        assert_eq!(opt_lane_of(VenueId::Hypercall), Some(3));
+        // The last options venue occupies the last lane — no gaps.
+        assert_eq!(NUM_OPT_LANES, 4);
     }
 
     /// Dispatcher that emits one queued fill — proves the D3 pump.
@@ -2550,6 +2565,9 @@ mod tests {
         assert_eq!(fill_lane_of(VenueId::Bybit), None);
         // MX2 / O-MX1: MEXC is data-only — never a fill lane.
         assert_eq!(fill_lane_of(VenueId::Mexc), None);
+        assert_eq!(fill_lane_of(VenueId::HyperEvm), None);
+        // HC1 / O-HC1: Hypercall is data-only — no fill lane until HC9.
+        assert_eq!(fill_lane_of(VenueId::Hypercall), None);
     }
 
     #[test]
@@ -2561,9 +2579,11 @@ mod tests {
         assert_eq!(tick_lane_of(VenueId::Hyperliquid), Some(4));
         assert_eq!(tick_lane_of(VenueId::Bybit), Some(5));
         assert_eq!(tick_lane_of(VenueId::Mexc), Some(6));
+        assert_eq!(tick_lane_of(VenueId::Hypercall), Some(7));
         assert_eq!(tick_lane_of(VenueId::Ai), None);
+        assert_eq!(tick_lane_of(VenueId::HyperEvm), None);
         // The last market venue occupies the last lane — no gaps.
-        assert_eq!(NUM_TICK_LANES, 7);
+        assert_eq!(NUM_TICK_LANES, 8);
         assert_eq!(NUM_EVENT_LANES, NUM_TICK_LANES);
     }
 

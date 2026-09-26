@@ -31,6 +31,8 @@ use zeroize::Zeroize;
 
 pub mod bin15;
 pub mod exec;
+/// HAR H3: the long-tenor HAR series list (`har.toml`).
+pub mod har;
 /// HYPARB H5: the slot-0 member's parameter artifact (`hyparb.toml`).
 pub mod hyparb;
 pub mod icdp;
@@ -178,6 +180,15 @@ pub struct Config {
     /// return LATEST state for a past block. The path is the boot flag
     /// `--hyperevm-path`.
     pub hyperevm_ws_host: String,
+    /// HC4: Hypercall public WS host (path `/ws`, JSON; data-only by
+    /// ruling O-HC1). Env: `HYPERCALL_WS_HOST`. Default:
+    /// `api.hypercall.xyz`.
+    pub hypercall_ws_host: String,
+    /// HC4: Hypercall REST host — boot discovery (`GET /markets`) and
+    /// the `/options-summary` poller. Env: `HYPERCALL_REST_HOST`.
+    /// Default: `api.hypercall.xyz` (one host serves both planes today;
+    /// two keys so either can move without a code change).
+    pub hypercall_rest_host: String,
     /// AI-command UDS path (Phase 8f §4.2). Env: `AI_INGRESS_SOCK`.
     /// Default: `~/multivenue/run/ai.sock` (tilde expanded at load,
     /// like `log_dir`). The companion secret `AI_INGRESS_HMAC_KEY` is
@@ -246,6 +257,10 @@ impl Config {
                 .unwrap_or_else(|| "contract.mexc.com".into()),
             hyperevm_ws_host: env_opt("HYPEREVM_WS_HOST")
                 .unwrap_or_else(|| "rpc.purroofgroup.com".into()),
+            hypercall_ws_host: env_opt("HYPERCALL_WS_HOST")
+                .unwrap_or_else(|| "api.hypercall.xyz".into()),
+            hypercall_rest_host: env_opt("HYPERCALL_REST_HOST")
+                .unwrap_or_else(|| "api.hypercall.xyz".into()),
             ai_ingress_sock: expand_tilde(
                 &env_opt("AI_INGRESS_SOCK").unwrap_or_else(|| "~/multivenue/run/ai.sock".into()),
             )?,
@@ -735,6 +750,35 @@ mod tests {
             std::env::remove_var("OKX_REST_HOST");
             std::env::remove_var("DERIBIT_WS_HOST");
             std::env::remove_var("HYPERLIQUID_API_HOST");
+        }
+    }
+
+    /// HC4: the two Hypercall hosts default to the one measured host
+    /// and each honours its own env override.
+    #[test]
+    fn hypercall_host_fields_default_and_override() {
+        let _env = env_guard();
+        set_required_env();
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("HYPERCALL_WS_HOST");
+            std::env::remove_var("HYPERCALL_REST_HOST");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.hypercall_ws_host, "api.hypercall.xyz");
+        assert_eq!(cfg.hypercall_rest_host, "api.hypercall.xyz");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::set_var("HYPERCALL_WS_HOST", "ws.example");
+            std::env::set_var("HYPERCALL_REST_HOST", "rest.example");
+        }
+        let cfg = Config::load(None).expect("required vars present");
+        assert_eq!(cfg.hypercall_ws_host, "ws.example");
+        assert_eq!(cfg.hypercall_rest_host, "rest.example");
+        // SAFETY: test-only env mutation; see module note above.
+        unsafe {
+            std::env::remove_var("HYPERCALL_WS_HOST");
+            std::env::remove_var("HYPERCALL_REST_HOST");
         }
     }
 

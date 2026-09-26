@@ -44,6 +44,7 @@
 #            (bybit SPOT is capture-only)    0.1000 % / 0.1000 %          10:10
 #   mexc     (none — data-only, O-MX1)       perp FX plate 0.01 % / 0.04 % 1:4  <- UNVERIFIED
 #            (spot incl. xStocks)            0 % / 0.05 %                  0:5     (REST, 2026-09-20)
+#   hypercall (none — data-only, O-HC1)      options: launch 0 / 0         0:0  <- UNVERIFIED
 #
 # pm CAVEAT — the one line that does not fit the model. Polymarket's taker fee
 # is `C x 0.07 x p x (1-p)`, i.e. 0.07·(1-p) OF NOTIONAL: price-dependent, and
@@ -149,6 +150,7 @@ deribit = "2:5"
 hl = "2:5"
 bybit = "2:6"
 mexc = "1:4"
+hypercall = "0:0"
 
 [fees.pm]
 prediction = "0:350"
@@ -223,3 +225,20 @@ option_cap = "3:700"
 [fees.mexc]
 spot = "0:5"
 perp = "1:4"
+
+# HYPERCALL (HC6, ruling O-HC7): options only; the venue's LAUNCH
+# configuration charges nothing (every captured `/trades` row, 14 355 to
+# 2026-09-25, carries maker_fee = taker_fee = "0") — UNVERIFIED: no fill of
+# ours exists (O-HC1, data-only), so the fees law is satisfied only if the
+# venue is ever armed, and the first measured `fee` overwrites this.
+#
+# FEE-ON STRESS VARIANT (O-HC7) — the venue's PUBLISHED future schedule, to
+# swap in for a stressed report (L3: whole bps, rounded up):
+#   trade       maker 2 / taker 5 bps of NOTIONAL, capped at 12.5 % of the
+#               premium            -> option = "2:5", option_cap = "5:1250"
+#   settlement  1.5 bps of notional, capped at 12.5 % of the intrinsic ->
+#               NOT expressible: `option_settle` charges a share of the
+#               PAYOUT, and `option_cap` carries one index rate for both
+#               sides (the maker/taker split is open question Q-HC6).
+[fees.hypercall]
+option = "0:0"

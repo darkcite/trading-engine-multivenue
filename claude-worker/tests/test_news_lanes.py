@@ -15,8 +15,10 @@ launchd slot.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import datetime
 import json
 import pathlib
+import time
 import tomllib
 import typing
 
@@ -30,6 +32,7 @@ import claude_worker.news.actions
 import claude_worker.news.cascade
 import claude_worker.news.cycle
 import claude_worker.news.filter
+import claude_worker.news.scheduled
 import claude_worker.news.sources
 import claude_worker.news.store
 
@@ -174,6 +177,29 @@ def test_cycle_fetches_parses_filters_and_stores(
         health = {str(r["name"]): r for r in store.source_rows()}
         assert int(typing.cast(int, health["press"]["polls_ok"])) == 1
         assert int(typing.cast(int, health["press"]["items_total"])) == 2
+
+
+def test_cycle_writes_the_scheduled_events_feed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """O-HC8: every cycle rewrites ``scheduled-events.json`` from ``[events]``
+    — the feed R1 and any future member read."""
+    at = int(time.time()) + 7 * 86_400
+    stamp = datetime.datetime.fromtimestamp(at, tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events = (
+        '\n[events]\nscheduled = [{ at = "' + stamp + '", kind = "earnings",'
+        ' underlyings = ["NVDA"], label = "Q3" }]\n'
+    )
+    _env(monkeypatch, tmp_path, _TOML + events)
+    _install_transport(monkeypatch)
+    assert claude_worker.news.__main__.main(["cycle"]) == claude_worker.news.__main__.EXIT_OK
+    assert "scheduled=1" in capsys.readouterr().out
+    path = tmp_path / "worker" / "news" / claude_worker.news.SCHEDULED_EVENTS_FILE
+    feed = claude_worker.news.scheduled.load_feed(path)
+    assert [(e.at_ts, e.kind, e.underlyings, e.detail) for e in feed.events] == [
+        (at, "earnings", ("NVDA",), "Q3")
+    ]
+    assert feed.covers(at - 86_400, at)
 
 
 def test_a_second_cycle_stores_nothing_twice(

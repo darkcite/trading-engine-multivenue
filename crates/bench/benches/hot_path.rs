@@ -377,6 +377,52 @@ fn bench_signer_sign_order(c: &mut Criterion) {
     });
 }
 
+// -----------------------------------------------------------------
+// 11. HAR H3.5 — the long-tenor day close: one warm `LongVolEngine`'s
+//     close law over the whole 1–40 d grid, what ONE series costs the
+//     engine thread at 00:00Z (`core_vol::LongVolSet` staggers the twelve
+//     one a poll). `docs/hot-path-latency.md` "Addendum 2026-09-26".
+// -----------------------------------------------------------------
+
+/// A ±10 bps-a-minute xorshift walk — every day observed, every ring
+/// fills, every tenor fits.
+fn long_vol_step(s: &mut u64, px: &mut i64) -> i64 {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    let bps = (*s % 21) as i64 - 10;
+    *px = (*px + *px * bps / 10_000).max(1_000_000);
+    *px
+}
+
+fn bench_long_vol_day_close(c: &mut Criterion) {
+    use core_vol::{LongVolEngine, DAY_MS, DAY_NS};
+    const DAY0: u64 = 1_767_225_600_000; // 2026-01-01T00:00Z
+    let mut e = Box::new(LongVolEngine::new());
+    let (mut s, mut px) = (0x9E37_79B9_7F4A_7C15u64, 100_000_000i64);
+    // 70 whole days: the day ring, every pair ring and every QLIKE
+    // window full — the steady state a live series closes in.
+    let mut day = 0u64;
+    while day < 70 {
+        let mut m = 0u64;
+        while m < 1_440 {
+            e.on_minute_close_at(long_vol_step(&mut s, &mut px), DAY0 + day * DAY_MS + m * 60_000);
+            m += 1;
+        }
+        day += 1;
+    }
+    c.bench_function("vol/long_day_close_warm", |b| {
+        b.iter(|| {
+            // The first minute of the next UTC day: the close law runs
+            // over the day before (one observed minute — the close's cost
+            // is the ring's, never the minutes').
+            e.on_minute_close_at(long_vol_step(&mut s, &mut px), DAY0 + day * DAY_MS);
+            day += 1;
+            black_box(e.x_1e9(DAY_NS));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_clock,
@@ -388,5 +434,6 @@ criterion_group!(
     bench_queued_dispatcher_submit,
     bench_latency_arb_on_tick,
     bench_signer_sign_order,
+    bench_long_vol_day_close,
 );
 criterion_main!(benches);

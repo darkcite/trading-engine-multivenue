@@ -86,7 +86,7 @@ impl<T: Copy> SnapshotCell<T> {
         // that overlapped it (see `Sync` impl note). The pointer is
         // valid, aligned, and owned by `self`.
         // COPY: the whole `T` once per publish (the engine snapshot:
-        // 28,352 B at XMM XH3, ≤ 32 KiB pinned) — the seqlock's design,
+        // 30,656 B at the Hypercall merge, ≤ 32 KiB pinned) — the seqlock's design,
         // plan §8: readers copy out under the version bracket.
         unsafe { *self.data.get() = *s };
         // Exit the write section: publish the copy to any reader

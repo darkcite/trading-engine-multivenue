@@ -976,6 +976,20 @@ struct RunArgs {
     /// absent = warm live (boot tell `regime: seed absent`).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+    /// HAR H3.4: the long-tenor HAR series list (`~/multivenue/har.toml`
+    /// by default). Set boots only; no member reads the forecasts. An
+    /// ABSENT default file boots without the service (the pre-H3 engine,
+    /// bit for bit); a file that does not parse turns the service OFF with
+    /// a named error and never refuses the boot; a series whose feed the
+    /// boot universe does not carry is dropped. Only an explicit
+    /// `--har <path>` that cannot be read refuses the boot.
+    #[arg(long)]
+    har: Option<PathBuf>,
+    /// HAR H3.4: where the per-series seeds (`seed-<NAME>.tsv`, cut hourly
+    /// by `candles-cycle.sh`) and the engine's own state (`state-<NAME>.tsv`)
+    /// live. Default `~/multivenue/har`.
+    #[arg(long)]
+    har_dir: Option<PathBuf>,
     /// VRP V5: the worker-written boot seed
     /// (`~/multivenue/vrp-seed.tsv` by default) — the settled `(x, y)`
     /// pairs the VRP member's forecast is fitted from. Absent is LEGAL
@@ -2933,6 +2947,7 @@ fn run(args: RunArgs) -> ExitCode {
         &boot.bn_options,
         bybit_discovery_arg,
         mexc_discovery_arg,
+        &boot.hypercall_options,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -2964,6 +2979,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     if !options_manifest.is_empty() {
         let manifest_path = run_dir.join(cli::options_manifest::OPTIONS_MANIFEST_FILE);
@@ -2975,7 +2991,8 @@ fn run(args: RunArgs) -> ExitCode {
             path = %manifest_path.display(),
             rows = discovery.deribit_options.len()
                 + discovery.okx_options.len()
-                + discovery.bn_options.len(),
+                + discovery.bn_options.len()
+                + discovery.hypercall_options.len(),
             "capture: options manifest written"
         );
     }
@@ -2987,6 +3004,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     {
         let manifest_path = run_dir.join(cli::options_manifest::INSTRUMENT_MANIFEST_FILE);
@@ -3233,6 +3251,7 @@ fn run(args: RunArgs) -> ExitCode {
             &discovery.deribit_options,
             &discovery.okx_options,
             &discovery.bn_options,
+            &discovery.hypercall_options,
             boot.okx_depth,
             boot.deribit_depth,
         ),
@@ -3265,6 +3284,9 @@ fn run(args: RunArgs) -> ExitCode {
     let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
     // MX2: lane 6 = MEXC (VenueId 7, engine::tick_lane_of).
     let (mexc_prod, mexc_lane_cons) = rings.tick[6].clone().split();
+    // HC1: lane 7 = Hypercall (VenueId 9 — HyperEvm, 8, has no tick
+    // lane; engine::tick_lane_of).
+    let (hypercall_prod, hypercall_lane_cons) = rings.tick[7].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -3275,6 +3297,7 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
     let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
     let (mexc_event_prod, mexc_event_cons) = rings.event[6].clone().split();
+    let (hypercall_event_prod, hypercall_event_cons) = rings.event[7].clone().split();
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
     // VM2 V2: HL gained its event lane — funding rides AssetCtx.
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
@@ -3286,6 +3309,7 @@ fn run(args: RunArgs) -> ExitCode {
         hl_event_cons,
         bybit_event_cons,
         mexc_event_cons,
+        hypercall_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
@@ -3293,12 +3317,18 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
     let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
     // VM2 V2: options-summary lanes (engine::opt_lane_of order —
-    // okx 0, deribit 1, binance 2). Producers ride into the three
-    // options-capable spawns.
+    // okx 0, deribit 1, binance 2, hypercall 3 — HC1). Producers ride
+    // into the options-capable spawns.
     let (okx_opt_prod, okx_opt_cons) = rings.opt[0].clone().split();
     let (deribit_opt_prod, deribit_opt_cons) = rings.opt[1].clone().split();
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
-    let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
+    let (hypercall_opt_prod, hypercall_opt_cons) = rings.opt[3].clone().split();
+    let opt_lane_cons = [
+        okx_opt_cons,
+        deribit_opt_cons,
+        bn_opt_cons,
+        hypercall_opt_cons,
+    ];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
     // XMM XH1: the trade lane — Hyperliquid prints, pushed by the HL
@@ -3459,6 +3489,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.bybit.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_mexc)
             .set(discovery.mexc.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_hypercall)
+            .set(discovery.hypercall.map(|c| c.configured).unwrap_or(0) as i64);
         // M2.1/M2.2/M2.4: capped options chain sizes this boot
         // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
@@ -3467,6 +3499,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.okx_options.len() as i64);
         reg.gauge(ids.binance_options_selected)
             .set(discovery.bn_options.len() as i64);
+        reg.gauge(ids.hypercall_options_selected)
+            .set(discovery.hypercall_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
@@ -3997,6 +4031,74 @@ fn run(args: RunArgs) -> ExitCode {
         drop(mexc_event_prod);
     }
 
+    // -- Hypercall (HC5; data-only, ruling O-HC1): ONE public socket on
+    // its own thread (core 11, past HyperEVM's 10) + the REST poller
+    // thread, whenever `[hypercall]` selected a chain at boot. The
+    // universe is the HC4 discovery outcome; the index syms are the
+    // config file's. --
+    if !discovery.hypercall_options.is_empty() {
+        let mut symbols = ingress_hypercall::HcSymbolTable::new();
+        for (name, sym, ..) in &discovery.hypercall_options {
+            if let Err(e) = symbols.insert(name.as_bytes(), *sym) {
+                error!(?e, instrument = %name, "hypercall: table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let mut underlyings = ingress_hypercall::HcUnderlyings::new();
+        for inst in &boot.allocated.hypercall_idx {
+            if let Err(e) = underlyings.insert(inst.name.as_bytes(), inst.sym) {
+                error!(?e, underlying = %inst.name, "hypercall: index table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let stale = stale_after_ms[core_types::VenueId::Hypercall as usize];
+        info!(
+            instruments = discovery.hypercall_options.len(),
+            underlyings = boot.allocated.hypercall_idx.len(),
+            summary_every_s = boot.hypercall_summary_every_s,
+            stale_after_ms = stale,
+            "hypercall: starting ingress + poller threads"
+        );
+        let spec = cli::HypercallSpec {
+            ws_host: cfg.hypercall_ws_host.clone(),
+            rest_host: cfg.hypercall_rest_host.clone(),
+            symbols,
+            underlyings,
+            summary_underlyings: boot.hypercall_options.underlyings.clone(),
+            summary_every_s: boot.hypercall_summary_every_s,
+            stale_after_ms: stale,
+        };
+        match cli::spawn_hypercall(
+            spec,
+            tls_config.clone(),
+            hypercall_prod,
+            hypercall_event_prod,
+            hypercall_opt_prod,
+            statuses.hypercall.clone(),
+            statuses.hc.clone(),
+            11,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.hypercall,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hypercall)),
+        ) {
+            Ok(hs) => handles.extend(hs),
+            Err(e) => {
+                error!(error = ?e, "hypercall: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        // The unspawned-venue shape (§3.3): permanently-empty rings, so a
+        // boot without `[hypercall]` is the pre-HC5 boot, bit for bit.
+        drop(hypercall_prod);
+        drop(hypercall_event_prod);
+        drop(hypercall_opt_prod);
+    }
+
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
@@ -4178,6 +4280,7 @@ fn run(args: RunArgs) -> ExitCode {
             hl_lane_cons,
             bybit_lane_cons,
             mexc_lane_cons,
+            hypercall_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,
@@ -4405,6 +4508,23 @@ fn run(args: RunArgs) -> ExitCode {
                 Ok(rb) => rb,
                 Err(reason) => {
                     error!(reason, "regime: artifact refused — boot aborted");
+                    join_reverse(handles);
+                    return ExitCode::from(1);
+                }
+            };
+            // HAR H3.4: the long-tenor HAR series, their feeds resolved
+            // against the same descriptor table (D-6 truth), each engine's
+            // seed and state read and merged. Only an EXPLICIT `--har`
+            // that cannot be read refuses the boot; every other problem
+            // turns the service (or one series) off with a named error.
+            let har_boot = match cli::har_boot::load_har_boot(
+                args.har.as_deref(),
+                args.har_dir.as_deref(),
+                &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+            ) {
+                Ok(hb) => hb,
+                Err(reason) => {
+                    error!(reason, "har: the explicit --har file is unreadable — boot aborted");
                     join_reverse(handles);
                     return ExitCode::from(1);
                 }
@@ -4707,6 +4827,7 @@ fn run(args: RunArgs) -> ExitCode {
                         xmm_boot.as_ref(),
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
+                        har_boot.as_ref(),
                     )
                 }
                 // WITH `--exec`: the same loop over the compositing
@@ -4794,6 +4915,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                         (Some(arm), Some(live)) => {
@@ -4818,6 +4940,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                         (None, Some(live)) => {
@@ -4845,6 +4968,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                         (None, None) => {
@@ -4880,6 +5004,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
+                                har_boot.as_ref(),
                             )
                         }
                     }

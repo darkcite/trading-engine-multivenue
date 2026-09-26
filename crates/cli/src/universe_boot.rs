@@ -107,6 +107,13 @@ pub struct BootUniverse {
     /// logs the consequence. The dropped combos are also cleared
     /// from `allocated.deribit_combos`.
     pub deribit_combos_dropped: bool,
+    /// HC4: the `[hypercall]` capped-chain policy (config-file only —
+    /// no flag names the venue, so nothing overrides it; disabled in
+    /// legacy boots). The settlement indices are already allocated in
+    /// `allocated.hypercall_idx`.
+    pub hypercall_options: universe::OptionsPolicy,
+    /// HC4: `[hypercall] summary_every_s` (0 while the lane is off).
+    pub hypercall_summary_every_s: u32,
     /// True when a universe config file drove this resolution.
     pub from_config: bool,
 }
@@ -193,6 +200,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 deribit_options: universe::OptionsPolicy::default(),
                 deribit_options_dropped: false,
                 deribit_combos_dropped: false,
+                hypercall_options: universe::OptionsPolicy::default(),
+                hypercall_summary_every_s: 0,
                 from_config: false,
             }
         }
@@ -280,6 +289,8 @@ pub fn resolve_boot_universe(f: &UniverseFlags<'_>) -> Result<BootUniverse, Stri
                 deribit_options,
                 deribit_options_dropped,
                 deribit_combos_dropped,
+                hypercall_options: u.hypercall.clone(),
+                hypercall_summary_every_s: u.hypercall_summary_every_s,
                 allocated,
                 from_config: true,
             }
@@ -482,6 +493,36 @@ mod tests {
 
     fn cfg_src_no_deribit() -> String {
         format!("[polymarket]\nmarkets = [\"{T1}\"]\n[binance]\nspot = [\"btcusdt\"]\n")
+    }
+
+    #[test]
+    fn config_hypercall_policy_carried_and_legacy_off() {
+        // HC4: config-file only; no flag touches it, the indices are
+        // allocated with the rest of the file.
+        let src = format!(
+            "{}[hypercall]\nunderlyings = [\"SP500\", \"BTC\"]\nexpiries = 3\nstrikes = 8\n",
+            cfg_src()
+        );
+        let f = UniverseFlags {
+            config_src: Some(&src),
+            okx_symbols: Some("BTC-USDT"),
+            ..UniverseFlags::default()
+        };
+        let b = resolve_boot_universe(&f).expect("config resolves");
+        assert!(b.hypercall_options.enabled());
+        assert_eq!(b.hypercall_options.underlyings, vec!["SP500", "BTC"]);
+        assert_eq!((b.hypercall_options.expiries, b.hypercall_options.strikes), (3, 8));
+        assert_eq!(b.hypercall_summary_every_s, universe::HC_SUMMARY_EVERY_S_DEFAULT);
+        assert_eq!(b.allocated.hypercall_idx.len(), 2);
+        assert_eq!(b.allocated.hypercall_idx[1].descriptor, "hypercall-idx:BTC");
+        let legacy = resolve_boot_universe(&UniverseFlags {
+            pm_asset_id: Some(T1),
+            ..UniverseFlags::default()
+        })
+        .expect("legacy resolves");
+        assert!(!legacy.hypercall_options.enabled());
+        assert_eq!(legacy.hypercall_summary_every_s, 0);
+        assert!(legacy.allocated.hypercall_idx.is_empty());
     }
 
     #[test]

@@ -266,6 +266,39 @@ class Calendar:
     fixed_daily: tuple[FixedDaily, ...] = ()
 
 
+#: The ``[events]`` kinds (O-HC8): what moves an underlying's vol on a known
+#: date. ``macro`` is also what the feed tags FOMC statements and
+#: ``[calendar] bls_releases`` with.
+EVENT_KINDS: tuple[str, ...] = ("earnings", "lockup", "macro", "other")
+#: An ``[events]`` underlying: the Hypercall universe's own spelling (``SP500``,
+#: ``NVDA``, ``BTC`` — ``core_config::universe`` validates the same shape).
+_UNDERLYING_RE: re.Pattern[str] = re.compile(r"[A-Z0-9]{1,12}")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ScheduledEntry:
+    """One ``[events].scheduled`` entry: a dated event and the underlyings
+    whose vol it moves. ``confirmed = 0`` marks a date the operator
+    ESTIMATED (last year's pattern) rather than read from an announcement."""
+
+    at: str
+    kind: str
+    underlyings: tuple[str, ...]
+    label: str
+    confirmed: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class EventsConfig:
+    """The ``[events]`` table — the scheduled-events feed's inputs (O-HC8).
+    Absent, the feed carries nothing (and the lane does everything else)."""
+
+    horizon_days: int = 45
+    lookback_days: int = 120
+    macro: tuple[str, ...] = ()
+    scheduled: tuple[ScheduledEntry, ...] = ()
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class Registry:
     """``news.toml`` as one immutable record, read once per lane run."""
@@ -274,6 +307,7 @@ class Registry:
     keywords: tuple[str, ...]
     calendar: Calendar
     sources: tuple[Source, ...]
+    events: EventsConfig = EventsConfig()
 
     def by_name(self, name: str) -> Source | None:
         for i in range(len(self.sources)):
@@ -388,8 +422,10 @@ _NEWS_KEYS: frozenset[str] = frozenset(
         "snapshots_retention_days",
     )
 )
-_TOP_KEYS: frozenset[str] = frozenset(("news", "keywords", "calendar", "registry"))
+_TOP_KEYS: frozenset[str] = frozenset(("news", "keywords", "calendar", "events", "registry"))
 _CALENDAR_KEYS: frozenset[str] = frozenset(("bls_releases", "fixed_daily"))
+_EVENTS_KEYS: frozenset[str] = frozenset(("horizon_days", "lookback_days", "macro", "scheduled"))
+_SCHEDULED_KEYS: frozenset[str] = frozenset(("at", "kind", "underlyings", "label", "confirmed"))
 _FIXED_DAILY_KEYS: frozenset[str] = frozenset(("kind", "at"))
 _REQUIRED_SOURCE_KEYS: tuple[str, ...] = ("name", "kind", "url", "origin", "class")
 
@@ -568,6 +604,88 @@ def _calendar_from(table: typing.Mapping[str, object]) -> Calendar:
     return Calendar(bls_releases=tuple(out), fixed_daily=tuple(daily))
 
 
+def _underlyings(where: str, raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list):
+        raise ValueError(f"{where}: underlyings must be a list of names")
+    names = typing.cast(list[object], raw)
+    out: list[str] = []
+    for i in range(len(names)):
+        name = names[i]
+        if not isinstance(name, str) or _UNDERLYING_RE.fullmatch(name) is None:
+            raise ValueError(f"{where}: underlying {name!r} is not [A-Z0-9]{{1,12}}")
+        out.append(name)
+    return tuple(out)
+
+
+def _whole_days(where: str, raw: object) -> int:
+    # `bool` is an `int` to Python and `4.9` would truncate: neither is a
+    # count of days.
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(f"{where}: {raw!r} is not a whole number of days >= 0")
+    return raw
+
+
+def _scheduled_from(entry: typing.Mapping[str, object]) -> ScheduledEntry:
+    where = "[events].scheduled entry"
+    _reject_unknown(where, entry, _SCHEDULED_KEYS)
+    raw_at = entry.get("at", "")
+    # A TOML datetime literal is as good as a quoted stamp; anything else
+    # is not a stamp at all.
+    if not isinstance(raw_at, (str, datetime.datetime)):
+        raise ValueError(f"{where}: at {raw_at!r} is not an ISO-8601 stamp")
+    at = str(raw_at)
+    try:
+        stamp = datetime.datetime.fromisoformat(at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{where}: at {at!r} is not an ISO-8601 stamp") from exc
+    if stamp.tzinfo is None:
+        raise ValueError(f"{where}: at {at!r} names no zone (write the Z)")
+    kind = str(entry.get("kind", ""))
+    if kind not in EVENT_KINDS:
+        raise ValueError(f"{where}: kind {kind!r} is not one of {EVENT_KINDS}")
+    underlyings = _underlyings(where, entry.get("underlyings"))
+    if not underlyings:
+        raise ValueError(f"{where} at {at}: no underlyings")
+    confirmed = entry.get("confirmed", 1)
+    if confirmed not in (0, 1):
+        raise ValueError(f"{where} at {at}: confirmed must be 0 or 1")
+    label = entry.get("label", "")
+    if not isinstance(label, str):
+        raise ValueError(f"{where} at {at}: label must be a string")
+    return ScheduledEntry(
+        at=at,
+        kind=kind,
+        underlyings=underlyings,
+        label=label,
+        confirmed=bool(confirmed),
+    )
+
+
+def _events_from(table: typing.Mapping[str, object]) -> EventsConfig:
+    _reject_unknown("[events]", table, _EVENTS_KEYS)
+    base = EventsConfig()
+    raw = table.get("scheduled", [])
+    if not isinstance(raw, list):
+        raise ValueError("[events].scheduled: must be a list of inline tables")
+    entries = typing.cast(list[object], raw)
+    scheduled: list[ScheduledEntry] = []
+    for i in range(len(entries)):
+        entry = entries[i]
+        if not isinstance(entry, dict):
+            raise ValueError("[events].scheduled: every entry is an inline table")
+        scheduled.append(_scheduled_from(typing.cast(dict[str, object], entry)))
+    return EventsConfig(
+        horizon_days=_whole_days(
+            "[events].horizon_days", table.get("horizon_days", base.horizon_days)
+        ),
+        lookback_days=_whole_days(
+            "[events].lookback_days", table.get("lookback_days", base.lookback_days)
+        ),
+        macro=_underlyings("[events].macro", table.get("macro", [])),
+        scheduled=tuple(scheduled),
+    )
+
+
 def load_registry(path: pathlib.Path) -> Registry:
     """Parse and validate ``news.toml``.
 
@@ -603,6 +721,7 @@ def load_registry(path: pathlib.Path) -> Registry:
         keywords=tuple(keywords),
         calendar=calendar,
         sources=tuple(sources),
+        events=_events_from(typing.cast(dict[str, object], doc.get("events", {}))),
     )
 
 

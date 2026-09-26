@@ -272,6 +272,10 @@ impl DescriptorTable {
 ///   `bybit-linear:*`, `mexc-perp:*` (MX2 — funding on every MEXC
 ///   contract, TradFi included), `hyperliquid:<coin>` (no `#` prefix)
 ///   → PRICE|FUNDING (+DEPTH on okx/deribit).
+/// * `hypercall:` options (HC4 — every `hypercall:` name is an option;
+///   the indicative BBO is the tick, the REST poll the summary) →
+///   OPT|PRICE; `hypercall-idx:<U>` (a settlement index: `Mark` events
+///   only, no tick, no summary) → NOTHING, so no feature can read it.
 /// * everything else (PM tokens, spot, dated futures, `#` outcome
 ///   coins, `mexc:*` spot incl. xStocks) → PRICE (+DEPTH on
 ///   okx/deribit non-options).
@@ -311,6 +315,14 @@ pub fn caps_of_descriptor(desc: &str) -> u8 {
                 CAP_PRICE | CAP_FUNDING
             }
         }
+        "hypercall" => {
+            if is_opt {
+                CAP_OPT | CAP_PRICE
+            } else {
+                0
+            }
+        }
+        "hypercall-idx" => 0,
         _ => CAP_PRICE,
     }
 }
@@ -3471,7 +3483,7 @@ mod v2_grammar_tests {
         const F: u8 = CAP_FUNDING;
         const D: u8 = CAP_DEPTH;
         const O: u8 = CAP_OPT;
-        let law: [(&str, u8); 17] = [
+        let law: [(&str, u8); 20] = [
             ("123456789", P), // bare PM token id
             ("binance:btcusdt", P),
             ("binance-usdm:btcusdt", P | F),
@@ -3489,6 +3501,9 @@ mod v2_grammar_tests {
             ("mexc:BTCUSDT", P),
             ("mexc-perp:BTC_USDT", P | F),
             ("mexc-perp:XAU_USDT", P | F),
+            ("hypercall:BTC-20261002-100000-C", O | P),
+            ("hypercall:SP500-20260930-7742.5-P", O | P),
+            ("hypercall-idx:SP500", 0),
         ];
         let mut i = 0;
         while i < law.len() {

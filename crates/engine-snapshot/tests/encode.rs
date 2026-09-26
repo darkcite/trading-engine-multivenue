@@ -157,6 +157,33 @@ fn full_snapshot() -> Box<EngineSnapshot> {
             funding_1e9: i64::MIN,
         };
     }
+    // HAR H3.5: every series row at its widest render.
+    s.har.hash = [0xFF; 32];
+    s.har.n = u32::MAX;
+    s.har.dropped = u32::MAX;
+    s.har.counters.minutes_rolled = u64::MAX;
+    s.har.counters.day_close_ns_max = u64::MAX;
+    s.har.counters.epoch = u64::MAX;
+    for r in s.har.series.iter_mut() {
+        r.name = [b'Z'; strategy_core::HAR_VIEW_NAME_MAX];
+        r.name_len = u8::MAX;
+        r.feed = u32::MAX;
+        r.last_min_ms = u64::MAX;
+        r.newest_day_ms = 1;
+        r.gaps = u64::MAX;
+        r.epoch = u64::MAX;
+        r.open_minutes = u32::MAX;
+        r.raw_1e6 = [i32::MIN; strategy_core::HAR_VIEW_TENORS];
+        r.fit_1e6 = [i32::MIN; strategy_core::HAR_VIEW_TENORS];
+        r.weekday_1e6 = [i32::MIN; strategy_core::HAR_VIEW_WEEKDAYS];
+        r.weekday_n = [u8::MAX; strategy_core::HAR_VIEW_WEEKDAYS];
+        r.pairs = [u8::MAX; strategy_core::HAR_VIEW_TENORS];
+        r.warm = u8::MAX;
+        r.days = u8::MAX;
+        r.empty_days = u8::MAX;
+        r.fitted = u16::MAX;
+        r.fit_beats_raw = u16::MAX;
+    }
     s
 }
 
@@ -212,6 +239,7 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
         "\"capture\":",
         "\"recent\":",
         "\"hyparb\":",
+        "\"har\":",
     ] {
         assert_eq!(body.matches(key).count(), 1, "{key} must appear once");
     }
@@ -232,6 +260,11 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
         engine_snapshot::SNAPSHOT_XMM_PERPS
     );
     assert!(!body.contains("\"icdp"), "schema 2 retired the icdp block");
+    // HAR H3.5: the series rows are capped at the snapshot's own.
+    assert_eq!(
+        body.matches("\"weekday_n\":").count(),
+        strategy_core::HAR_VIEW_SERIES
+    );
     assert_eq!(body.matches("\"ttl_ns\":").count(), RECENT_ORDERS);
     assert_eq!(body.matches("\"oid\":").count(), RECENT_ORDERS + RECENT_FILLS);
     // The run_dir made of quotes escaped every byte.
@@ -504,4 +537,72 @@ fn the_xmm_section_renders_counters_and_perp_rows() {
     let body = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(body.contains("\"xmm\":{\"configured\":0,\"n_perps\":0,\"placed\":0,"));
     assert!(body.contains("\"stuck\":0,\"perps\":[]}"));
+}
+
+/// HAR H3.5: the `har` object — additive, so a `contains` pin. The raw
+/// fold and the fit render side by side at every tenor (plan law L2),
+/// and `day_age_s` is wall-derived: seconds since the newest closed day
+/// ENDED.
+#[test]
+fn the_har_section_renders_the_census_both_forecasts_and_the_profile() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+        body.contains(concat!(
+            "\"har\":{\"configured\":0,",
+            "\"hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",",
+            "\"dropped\":0,\"minutes_rolled\":0,\"closes\":0,\"day_closes\":0,\"held\":0,",
+            "\"forced\":0,\"day_close_ns_max\":0,\"day_close_ns_last\":0,\"epoch\":0,",
+            "\"tenors_d\":[1,2,3,5,7,14,21,30,40],\"series\":[]},\"recent\":"
+        )),
+        "har schema drift; got: {body}"
+    );
+
+    // 2026-09-26T09:00Z; the newest closed day is 09-25 (ended 00:00Z).
+    s.wall_ns = 1_790_413_200_000_000_000;
+    s.har.n = 1;
+    s.har.dropped = 2;
+    s.har.hash = [0xab; 32];
+    s.har.counters.day_closes = 12;
+    s.har.counters.day_close_ns_max = 70_123;
+    let r = &mut s.har.series[0];
+    r.name[..3].copy_from_slice(b"BTC");
+    r.name_len = 3;
+    r.feed = 0x0100_0007;
+    r.warm = 1;
+    r.days = 64;
+    r.empty_days = 0;
+    r.gaps = 1;
+    r.newest_day_ms = 1_790_294_400_000;
+    r.last_min_ms = 1_790_413_140_000;
+    r.open_minutes = 539;
+    r.epoch = 5;
+    r.raw_1e6 = [371_400, 372_000, 373_000, 374_000, 375_000, 380_000, 390_000, 394_600, 396_900];
+    r.fit_1e6 = [332_100, 0, 0, 0, 374_100, 0, 0, 0, 396_900];
+    r.pairs = [128, 128, 128, 128, 128, 128, 128, 97, 60];
+    r.fitted = 0b1_0001_0001;
+    r.fit_beats_raw = 0b1_0000;
+    r.weekday_1e6 = [1_010_000, 1_200_000, 1_300_000, 1_100_000, 1_000_000, 390_000, 430_000];
+    r.weekday_n = [9, 9, 9, 9, 9, 9, 10];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains(concat!(
+        "\"har\":{\"configured\":1,",
+        "\"hash\":\"abababababababababababababababababababababababababababababababab\",",
+        "\"dropped\":2,\"minutes_rolled\":0,\"closes\":0,\"day_closes\":12,\"held\":0,",
+        "\"forced\":0,\"day_close_ns_max\":70123,\"day_close_ns_last\":0,\"epoch\":0,",
+        "\"tenors_d\":[1,2,3,5,7,14,21,30,40],\"series\":[",
+        "{\"name\":\"BTC\",\"feed\":16777223,\"warm\":1,\"days\":64,\"empty_days\":0,",
+        "\"gaps\":1,\"newest_day_ms\":1790294400000,\"day_age_s\":32400,",
+        "\"last_min_ms\":1790413140000,\"open_minutes\":539,\"epoch\":5,",
+        "\"raw_1e6\":[371400,372000,373000,374000,375000,380000,390000,394600,396900],",
+        "\"fit_1e6\":[332100,0,0,0,374100,0,0,0,396900],",
+        "\"pairs\":[128,128,128,128,128,128,128,97,60],",
+        "\"fitted\":[1,0,0,0,1,0,0,0,1],\"fit_beats_raw\":[0,0,0,0,1,0,0,0,0],",
+        "\"weekday_1e6\":[1010000,1200000,1300000,1100000,1000000,390000,430000],",
+        "\"weekday_n\":[9,9,9,9,9,9,10]}]},\"recent\":"
+    )), "har schema drift; got: {body}");
+    assert_balanced(body.as_bytes());
 }

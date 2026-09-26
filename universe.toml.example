@@ -147,6 +147,26 @@ perp = []   # e.g. ["BTC_USDT", "XAU_USDT", "USOIL_USDT", "EUR_USDT", "SPY_USDT"
 # with --hyperevm-path on HYPEREVM_WS_HOST (an archive-honest endpoint).
 pools = []  # e.g. ["0x6c9a33e3b592c0d65b3ba59355d5be0d38259285:v3:18:6"]
 
+[hypercall]
+# HC4 (ruling O-HC1: DATA-ONLY — no keys, no exec arm). Underlyings as
+# Hypercall names them, UPPERCASE [A-Z0-9] (SP500, SPCX, MU, BTC, …).
+# Each underlying:
+#   - names its settlement index, hypercall-idx:<U> at ordinal i+1;
+#   - is chain-capped at boot from GET /markets: the `expiries` nearest
+#     series OUTSIDE the provider's 2 h pre-expiry quoting blackout ×
+#     the `strikes` nearest the index (K/2 at-or-below + K/2 above),
+#     calls AND puts — options allocated from ordinal 513 in selection
+#     order (they reshuffle every boot: options-manifest.tsv resolves).
+# underlyings × expiries × strikes × 2 ≤ 1024 (the ONE-frame indicative
+# subscribe; the venue closes a socket that subscribes in pieces).
+# summary_every_s: each underlying's REST /options-summary refresh
+# (marks, IV, greeks, OI), staggered; 60..=3600, default 300.
+# Hosts: HYPERCALL_WS_HOST / HYPERCALL_REST_HOST (.env; sane defaults).
+underlyings = []  # e.g. ["SP500", "SPCX", "MU", "NVDA", "MSFT", "META", "AAPL", "BABA", "SNDK", "BOT", "BTC", "ETH"]
+# expiries = 3
+# strikes = 8
+# summary_every_s = 300
+
 [pairs]
 # Latency-arb pairs: "P:B" = polymarket.markets[P] × binance.spot[B]
 # (0-based file order; a YES/NO market entry resolves to its YES token).

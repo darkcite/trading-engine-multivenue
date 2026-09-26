@@ -75,6 +75,8 @@ ingress-okx          = { workspace = true }
 ingress-deribit      = { workspace = true }
 ingress-bybit        = { workspace = true }
 ingress-mexc         = { workspace = true }
+# HC4: the Hypercall boot discovery (HC5: the ingress spawn).
+ingress-hypercall    = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 ingress-rpc          = { workspace = true }
 ingress-ai           = { workspace = true }

@@ -22,6 +22,11 @@
 //! chunked / close-delimited framing). Consumers today: the boot-time
 //! REST discovery path ([`boot_http`], 8e) and the CLOB dispatcher's
 //! POST path (its original consumer, the RSS poller, was retired in 8f).
+//!
+//! HC2 generalises the request side — any [`http1::Method`], any target,
+//! extra headers ([`http1::write_request_head`]) — and adds
+//! [`HttpsReq`], a keep-alive client for one host and any request,
+//! sharing [`HttpsPost`]'s connection engine (`https_conn`).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -38,7 +43,9 @@ pub mod boot_http;
 pub mod drain;
 pub mod error;
 pub mod http1;
+mod https_conn;
 pub mod https_post;
+pub mod https_req;
 pub mod iobuf;
 pub mod keepalive;
 pub mod subs;
@@ -60,10 +67,12 @@ pub use subs::{
 };
 
 pub use http1::{
-    chunked_body, dechunk_in_place, head_says_close, read_response, write_get_request, BodyFraming,
-    ChunkedBody, DechunkResult, HttpErr, HttpResult,
+    chunked_body, dechunk_in_place, head_says_close, read_response, request_head_len,
+    write_get_request, write_request, write_request_head, BodyFraming, ChunkedBody, DechunkResult,
+    Header, HttpErr, HttpResult, Method, ReqHead,
 };
 pub use https_post::{parse_https_url, HttpsPost, PostErr, PostErrKind, MAX_BODY_CAP};
+pub use https_req::{HttpsReq, REQ_USER_AGENT};
 pub use transport::{
     PlainTcpTransport, Status, TestBuffer, TestTransport, TlsTransport, Transport,
 };

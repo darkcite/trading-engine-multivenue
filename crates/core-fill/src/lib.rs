@@ -113,6 +113,11 @@ const MS: u64 = 1_000_000;
 /// §6.3): **one block, not a network RTT** — a swap cannot land before
 /// the next block however fast the wire is (0.983 s measured, rounded
 /// up); modelling it as an RTT is the easiest way to invent edge.
+/// Index 9 is Hypercall, MEASURED 2026-09-25 21:05–21:15Z (HC0) on the
+/// same Mac / network: quote-stamp feed 64.3 + kept-alive RTT 113.7/2
+/// → 130 ms (the publish stamp alone gives 57.3 → 120). Hypercall is
+/// data-only (O-HC1) — no fill model executes an order on it until its
+/// own exec ruling.
 ///
 /// **RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.** One table, both
 /// consumers — the harness's `ModelParams::default()` reads it from
@@ -127,6 +132,7 @@ pub const ACTIVATION_NS_DEFAULT: [u64; core_types::VENUE_COUNT] = [
     60 * MS,  // bybit
     150 * MS, // mexc (spot binds; futures 130)
     1_000 * MS, // hyperevm — ONE BLOCK (0.983 s measured, rounded up)
+    130 * MS,   // hypercall — quote-stamp feed 64 + RTT 114/2 (HC0)
 ];
 
 /// Venues whose post-only makers are judged by the queue law (module
@@ -145,6 +151,7 @@ pub const QUEUE_VENUE: [bool; core_types::VENUE_COUNT] = [
     false, // bybit
     false, // mexc (data-only)
     false, // hyperevm (AMM law)
+    false, // hypercall (data-only)
 ];
 
 /// Whether post-only makers on model venue byte `venue` are judged by
@@ -571,7 +578,8 @@ mod tests {
                 0,
                 60 * MS,
                 150 * MS,
-                1_000 * MS
+                1_000 * MS,
+                130 * MS
             ]
         );
         assert_eq!(
@@ -587,6 +595,8 @@ mod tests {
             ACTIVATION_NS_DEFAULT[VenueId::HyperEvm as usize],
             1_000 * MS
         );
+        // HC0: Hypercall measured on the Mac 2026-09-25.
+        assert_eq!(ACTIVATION_NS_DEFAULT[VenueId::Hypercall as usize], 130 * MS);
     }
 
     #[test]

@@ -1418,7 +1418,10 @@ impl PaperMatcher {
         // order on it is ever modelled, exactly as the harness's
         // `tradeable_venue_byte` refuses it. Before MX2 the byte sat past
         // the table's end and was refused by the length check; this
-        // keeps that behaviour bit for bit.
+        // keeps that behaviour bit for bit. HC1 / O-HC1: Hypercall (venue
+        // byte 9) is data-only on the same terms — it too gained a slot
+        // (VENUE_COUNT 9 → 10) and is refused explicitly for the same
+        // reason.
         //
         // HYPARB H2: HyperEVM (venue byte 8) takes AMM swaps on a known
         // pool slot and nothing else; every other venue takes makers and
@@ -1431,6 +1434,7 @@ impl PaperMatcher {
         };
         if venue as usize >= core_fill::ACTIVATION_NS_DEFAULT.len()
             || venue == core_types::VenueId::Mexc.to_u8()
+            || venue == core_types::VenueId::Hypercall.to_u8()
             || px <= 0
             || qty <= 0
             || !kind_ok
@@ -2422,6 +2426,31 @@ mod tests {
         );
         m.submit(&o, 1_000);
         assert_eq!(m.counters.unroutable, 1);
+        assert_eq!(m.counters.intake, 0);
+        assert_eq!(m.open_len(), 0);
+    }
+
+    /// HC1 / O-HC1: Hypercall gained an activation slot at VENUE_COUNT
+    /// 10 but is data-only — its order is refused as `unroutable`, exactly
+    /// as it was when the byte sat past the table's end.
+    #[test]
+    fn a_hypercall_order_is_unroutable_data_only() {
+        let mut m = PaperMatcher::new();
+        let sym = core_types::make_symbol_id(VenueId::Hypercall, 512);
+        for kind in [core_fill::ORDER_KIND_IOC, core_fill::ORDER_KIND_MAKER] {
+            let o = Order::new(
+                1_000,
+                VenueId::Hypercall,
+                sym,
+                Side::Bid,
+                kind,
+                Price::from_raw(1_000_000),
+                Qty::from_raw(1_000_000),
+                1,
+            );
+            m.submit(&o, 1_000);
+        }
+        assert_eq!(m.counters.unroutable, 2);
         assert_eq!(m.counters.intake, 0);
         assert_eq!(m.open_len(), 0);
     }

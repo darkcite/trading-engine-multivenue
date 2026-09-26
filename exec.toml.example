@@ -151,10 +151,14 @@ name = "bin15"
 #
 # Known spellings — the same ones universe.toml uses:
 #   polymarket  binance  okx  deribit  hyperliquid  ai  bybit  mexc
+#   hyperevm  hypercall
 #
 # `mexc` (byte 7) is reserved so an artifact can NAME the venue; MEXC is
 # DATA-ONLY (docs/mexc-ingress-plan.md, ruling O-MX1) — no execution arm,
 # so a live slot naming it refuses the boot like any venue without one.
+# `hypercall` (byte 9) is reserved the same way: DATA-ONLY by ruling O-HC1
+# (docs/research/hypercall/hypercall-integration-plan-2026-09-26.md); its
+# execution arm (HC9) waits for its own operator ruling.
 #
 # A LIVE SLOT NEVER FALLS BACK TO PAPER (law E-1). An order naming a
 # venue not listed here is refused and counted, never modelled — a

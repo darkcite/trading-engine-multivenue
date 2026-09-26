@@ -56,3 +56,16 @@ mexc-perp:XAU_USDT	perp
 mexc-perp:AAPLSTOCK_USDT	perp
 hyperevm:0x6c9a33e3b592c0d65b3ba59355d5be0d38259285	spot
 hyperevm:	none
+hypercall:BTC-20261002-100000-C	option
+hypercall:SNDK-20260927-1948-P	option
+hypercall:BOT-20260925-2.5-C	option
+hypercall-idx:SP500	spot
+hypercall-idx:BTC	spot
+hypercall:	none
+hypercall-idx:	none
+hypercall:BTC-20261002-100000	none
+hypercall:BTC-261002-100000-C	none
+hypercall:BTC-20261002-1.2.3-P	none
+hypercall:BTC-20261002-.5-P	none
+hypercall:-20261002-100-C	none
+hypercall:BTC-20261002-100-X	none
