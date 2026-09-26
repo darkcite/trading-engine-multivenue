@@ -71,6 +71,10 @@ strategy-hyparb      = { workspace = true }
 # process (a server thread here would allocate under the global count).
 exec-hyperevm        = { workspace = true, features = ["testnode"] }
 rustls               = { workspace = true }
+# BX5 gate 74b: the owner's poll a non-blocking HttpsConn runs on;
+# gate 74c: the certificate of its child-process WebSocket node.
+mio                  = { workspace = true }
+rcgen                = { workspace = true }
 strategy-rule-tree   = { workspace = true }
 strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }

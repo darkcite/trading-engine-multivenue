@@ -8899,3 +8899,551 @@ fn ed25519_sign_and_render_are_zero_alloc() {
     assert_eq!(allocs, 0, "signer-ed25519 sign/render allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "signer-ed25519 hot bytes should be zero: saw {bytes}");
 }
+
+/// **BX5 gate 74 — the exec gateway's transports, their socket-free
+/// half: request staging, the answer judge, the WebSocket framer and the
+/// request ids.**
+///
+/// An exec gateway (BX6) stages every REST request in place
+/// (`ReqWire::stage`: body form — the length digits, the head moved on a
+/// digit-count change; query form — the header tail after the query),
+/// judges each answer where it was read (`parse_answer`, a chunked body
+/// decoded in place), and runs its WebSocket API sessions through
+/// `WsFramer` (data frames handed out in place, pings echoed into the
+/// send window, requests masked straight into it) with `ReqIds`
+/// matching answers to requests. All of it must be 0 B/op; the windows
+/// and tables are allocated at boot, outside the guard. The socket half
+/// is gate 74b.
+#[test]
+fn bx5_staging_answer_judge_ws_framing_and_ids_are_zero_alloc() {
+    use core_net::https_conn::parse_answer;
+    use core_net::{
+        Method, Params, ReqIds, ReqKind, ReqSpec, ReqWire, WsFramer, WsNext,
+    };
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    enum Kind {
+        Place = 0,
+        Free = 255,
+    }
+    impl ReqKind for Kind {
+        const FREE: Self = Self::Free;
+    }
+
+    const H: &[(&str, &str)] = &[("X-MBX-APIKEY", "gate74key")];
+    let specs = [
+        ReqSpec {
+            method: Method::Post,
+            path: "/eapi/v1/order",
+            params: Params::Body("application/x-www-form-urlencoded"),
+            headers: H,
+        },
+        ReqSpec {
+            method: Method::Get,
+            path: "/eapi/v1/openOrders",
+            params: Params::Query,
+            headers: H,
+        },
+    ];
+    let mut wire = ReqWire::new("eapi.binance.com", &specs, 2048).expect("gate 74 wire");
+    let mut framer = WsFramer::new(64 * 1024, 64 * 1024, 7);
+    let mut ids: ReqIds<Kind, 64> = ReqIds::new();
+    let resp: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{\"orderId\":1,\"status\":\"NEW\"}";
+    let chunked: &[u8] =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n3\r\n12}\r\n0\r\n\r\n";
+    // What a WS API socket delivers per request: the answer, a server
+    // ping, a pong, and a user-data event (server frames are unmasked).
+    let mut inbound = [0u8; 256];
+    let mut len = 0usize;
+    let parts: [(u8, &[u8]); 4] = [
+        (0x81, br#"{"id":"1","status":200,"result":{"orderId":1}}"#),
+        (0x89, b"ping"),
+        (0x8A, b"pong"),
+        (0x81, br#"{"subscriptionId":0,"event":{"e":"executionReport"}}"#),
+    ];
+    let mut k = 0;
+    while k < parts.len() {
+        inbound[len] = parts[k].0;
+        inbound[len + 1] = parts[k].1.len() as u8;
+        inbound[len + 2..len + 2 + parts[k].1.len()].copy_from_slice(parts[k].1);
+        len += 2 + parts[k].1.len();
+        k += 1;
+    }
+    let inbound = &inbound[..len];
+    let mut rbuf = [0u8; 512];
+    // Held unanswered through the whole run: every 64th id lands on its
+    // slot and is skipped — the busy path.
+    let hold = ids.issue(Kind::Place, u64::MAX).expect("gate 74 hold");
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0usize;
+    while n < 2_000 {
+        // REST: bodies of 1–4 digits (the head moves), queries of any
+        // length (the tail follows), each staged in place.
+        let blen = [9usize, 99, 180, 1500][n % 4];
+        wire.window_mut(0)[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        let s = wire.stage(0, blen).expect("gate 74 body");
+        acc = acc.wrapping_add(wire.bytes(s).len() as u64);
+        let s = wire.stage(1, n % 64).expect("gate 74 query");
+        acc = acc.wrapping_add(wire.bytes(s).len() as u64);
+        // The answers, judged where they lie.
+        rbuf[..resp.len()].copy_from_slice(resp);
+        let a = parse_answer(&mut rbuf[..resp.len()], false)
+            .expect("gate 74 answer")
+            .expect("whole");
+        acc = acc.wrapping_add(u64::from(a.status) + (a.body.end - a.body.start) as u64);
+        rbuf[..chunked.len()].copy_from_slice(chunked);
+        let a = parse_answer(&mut rbuf[..chunked.len()], false)
+            .expect("gate 74 chunked")
+            .expect("whole");
+        acc = acc.wrapping_add((a.body.end - a.body.start) as u64);
+        // …and the refusals: a short answer waits, a short answer after a
+        // close is a lost connection.
+        rbuf[..resp.len()].copy_from_slice(resp);
+        assert_eq!(parse_answer(&mut rbuf[..resp.len() - 3], false), Ok(None));
+        assert_eq!(
+            parse_answer(&mut rbuf[..resp.len() - 3], true),
+            Err(core_net::PostErrKind::Disconnected)
+        );
+        // WS API: a request out, its answer and the traffic around it in.
+        let id = ids.issue(Kind::Place, n as u64).expect("gate 74 id");
+        let lost = ids.issue(Kind::Place, n as u64).expect("gate 74 id");
+        framer
+            .queue_text(&[b"{\"id\":\"1\",\"method\":\"order.place\",\"params\":{", b"}}"])
+            .expect("gate 74 queue");
+        let free = framer.rx_free_mut();
+        free[..inbound.len()].copy_from_slice(inbound);
+        framer.rx_advance(inbound.len());
+        loop {
+            match framer.next_frame() {
+                WsNext::Text(s) | WsNext::Binary(s) => {
+                    acc = acc.wrapping_add(framer.payload(s).len() as u64);
+                }
+                WsNext::Idle => break,
+                WsNext::Failed(e) => panic!("gate 74 framer: {e}"),
+            }
+        }
+        acc = acc.wrapping_add(ids.answer(id).map_or(0, |r| r.id));
+        // The unanswered one expires (the held one is younger than 1 ns).
+        let r = ids.take_expired(n as u64 + 1, 1).expect("gate 74 expiry");
+        assert_eq!(r.id, lost);
+        let out = framer.tx_pending().len();
+        acc = acc.wrapping_add(out as u64);
+        framer.tx_consume(out);
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(ids.answer(hold).map(|r| r.id), Some(hold));
+    assert_eq!(ids.in_flight(), 0, "every request was answered or expired");
+    assert_eq!(allocs, 0, "BX5 staging/judge/framing/ids allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "BX5 hot bytes should be zero: saw {bytes}");
+}
+
+/// One gate 74b request on the owner's poll: start, then events and
+/// ticks until the answer is whole.
+fn gate74_cycle(
+    conn: &mut core_net::HttpsConn,
+    poll: &mut mio::Poll,
+    events: &mut mio::Events,
+    epoch: std::time::Instant,
+    n: usize,
+) -> u16 {
+    use core_net::Progress;
+    let now = epoch.elapsed().as_nanos() as u64;
+    conn.start(0, n, poll.registry(), now).expect("gate 74 start");
+    // The deadline check on a request in flight, every cycle.
+    assert_eq!(conn.on_tick(now), Progress::Waiting);
+    loop {
+        poll.poll(events, Some(std::time::Duration::from_millis(5)))
+            .expect("gate 74 poll");
+        for ev in events.iter() {
+            match conn.on_event(ev, poll.registry()) {
+                Progress::Waiting => {}
+                Progress::Done { status, .. } => return status,
+                Progress::Failed(e) => panic!("gate 74: {e}"),
+            }
+        }
+        match conn.on_tick(epoch.elapsed().as_nanos() as u64) {
+            Progress::Waiting => {}
+            Progress::Done { status, .. } => return status,
+            Progress::Failed(e) => panic!("gate 74: {e}"),
+        }
+    }
+}
+
+/// **BX5 gate 74b — the non-blocking HTTPS cycle, as allocations per
+/// request.**
+///
+/// `HttpsConn` is `HttpsPost`'s protocol split for an owner's poll (the
+/// exec gateway's): `start` stages and writes, `on_event` reads and
+/// judges, `on_tick` keeps the deadline. Same law as gate 72: rustls'
+/// buffered API allocates one record buffer per sealed write and one per
+/// decrypted record, so a request costs exactly 2 allocations, and
+/// anything above that is ours. Served by gate 72's child-process node
+/// (the counting allocator is process-global).
+///
+/// "Exactly 2" is THIS fixture's number: one request ≤ 16 KiB (one
+/// record out), one answer in one record read whole (one record in).
+/// Across a WAN, with no regression of ours, rustls adds one allocation
+/// per further inbound record, a grow-and-shrink of its deframer buffer
+/// whenever a record is split across reads, and three on a burst of
+/// more than 16 KiB of plaintext. BX6's budget is not 2 per request.
+#[test]
+fn https_conn_nonblocking_cycle_allocates_only_rustls_record_buffers() {
+    use core_net::{ConnCfg, HttpsConn, Method, Params, ReqSpec};
+    const REQS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_REQ: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate74-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 74 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 74 exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 74 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 74 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 74: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 74 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 74 anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let spec = [ReqSpec {
+        method: Method::Post,
+        path: "/evm",
+        params: Params::Body("application/json"),
+        headers: &[],
+    }];
+    let c = ConnCfg {
+        win_cap: 8192,
+        resp_cap: 16 * 1024,
+        req_timeout_ns: 5_000_000_000,
+    };
+    let mut conn =
+        HttpsConn::new("localhost", port, cfg, &spec, c, mio::Token(5)).expect("gate 74 conn");
+    let mut poll = mio::Poll::new().expect("gate 74 poll");
+    let mut events = mio::Events::with_capacity(8);
+    let epoch = std::time::Instant::now();
+    let n = exec_hyperevm::rpc::write_chain_id(conn.window_mut(0), 1).expect("gate 74 body");
+    let mut i = 0;
+    while i < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        assert_eq!(gate74_cycle(&mut conn, &mut poll, &mut events, epoch, n), 200);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < REQS {
+        let status = gate74_cycle(&mut conn, &mut poll, &mut events, epoch, n);
+        acc = acc.wrapping_add(u64::from(status) + conn.resp().len() as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(conn.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(conn.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_REQ * REQS,
+        "HttpsConn cycle: {allocs} allocations ({bytes} B) over {REQS} requests — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_REQ}/request (one sealed record \
+         out, one decrypted record in); anything above is ours"
+    );
+}
+
+/// A server frame (unmasked), FIN set.
+fn gate74_server_frame(op: u8, payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x80 | op];
+    if payload.len() < 126 {
+        v.push(payload.len() as u8);
+    } else {
+        v.push(126);
+        v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    }
+    v.extend_from_slice(payload);
+    v
+}
+
+/// Gate 74c's server half: runs ONLY in the child process gate 74c
+/// spawns (`#[ignore]`d; a no-op without `GATE74_WS_DIR`). A rustls
+/// WebSocket node: it upgrades one client, then answers every client
+/// text frame with ONE server frame in ONE write — every 8th answer
+/// carrying a ping in the same write — until the parent kills it.
+#[test]
+#[ignore = "gate 74c's child process; never run on its own"]
+fn gate74_ws_node_helper() {
+    use std::io::{Read, Write};
+    let Some(dir) = std::env::var_os("GATE74_WS_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
+    let cert = c.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(c.key_pair.serialize_der()).expect("key");
+    let cfg = std::sync::Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .expect("gate 74c server cfg"),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("gate 74c bind");
+    let port = listener.local_addr().expect("gate 74c addr").port();
+    std::fs::write(dir.join("cert.der"), cert.as_ref()).expect("gate 74c cert");
+    // The port last: its presence says the rest is written.
+    std::fs::write(dir.join("port.tmp"), port.to_string()).expect("gate 74c port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 74c port");
+    let (sock, _) = listener.accept().expect("gate 74c accept");
+    sock.set_nodelay(true).ok();
+    let mut tls = rustls::StreamOwned::new(
+        rustls::ServerConnection::new(cfg).expect("gate 74c conn"),
+        sock,
+    );
+    let mut buf: Vec<u8> = Vec::new();
+    let mut b = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        let n = tls.read(&mut b).expect("gate 74c upgrade");
+        assert!(n > 0, "gate 74c: no upgrade");
+        buf.extend_from_slice(&b[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    buf.drain(..head_end);
+    let key: [u8; 24] = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("gate 74c key")
+        .as_bytes()
+        .try_into()
+        .expect("gate 74c key length");
+    let accept = core_net::expected_accept(&key);
+    let ok = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n\r\n",
+        String::from_utf8_lossy(&accept)
+    );
+    tls.write_all(ok.as_bytes()).expect("gate 74c 101");
+    tls.flush().expect("gate 74c flush");
+    let mut answered = 0u64;
+    loop {
+        // One client frame: FIN, masked, 7- or 16-bit length.
+        let (op, payload) = loop {
+            if buf.len() >= 2 {
+                let (len, at) = match buf[1] & 0x7F {
+                    126 if buf.len() >= 4 => (usize::from(u16::from_be_bytes([buf[2], buf[3]])), 4),
+                    126 => (usize::MAX, 0),
+                    n => (usize::from(n), 2),
+                };
+                if len != usize::MAX && buf.len() >= at + 4 + len {
+                    let mask = [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]];
+                    let p: Vec<u8> = (0..len).map(|i| buf[at + 4 + i] ^ mask[i & 3]).collect();
+                    let op = buf[0] & 0x0F;
+                    buf.drain(..at + 4 + len);
+                    break (op, p);
+                }
+            }
+            match tls.read(&mut b) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&b[..n]),
+            }
+        };
+        if op != 0x1 {
+            continue; // the pongs ride in with the next request
+        }
+        answered += 1;
+        let mut out = gate74_server_frame(0x1, &payload);
+        if answered % 8 == 0 {
+            out.extend(gate74_server_frame(0x9, b"k"));
+        }
+        if tls.write_all(&out).is_err() || tls.flush().is_err() {
+            return;
+        }
+    }
+}
+
+/// One gate 74c round on the owner's poll: queue a request, flush once
+/// (with any pong the last round queued), turn the loop until its echo
+/// is drained. Returns the echo's length.
+fn gate74c_round(
+    conn: &mut core_net::WsConn,
+    poll: &mut mio::Poll,
+    events: &mut mio::Events,
+    epoch: std::time::Instant,
+    req: &[&[u8]],
+) -> usize {
+    use core_net::{WsNext, WsProgress};
+    conn.queue_text(req).expect("gate 74c queue");
+    conn.flush(poll.registry()).expect("gate 74c flush");
+    loop {
+        poll.poll(events, Some(std::time::Duration::from_millis(5)))
+            .expect("gate 74c poll");
+        let now = epoch.elapsed().as_nanos() as u64;
+        for ev in events.iter() {
+            if let WsProgress::Failed(e) = conn.on_event(ev, poll.registry(), now) {
+                panic!("gate 74c: {e}");
+            }
+        }
+        let mut got = 0usize;
+        loop {
+            match conn.next_frame() {
+                WsNext::Text(s) | WsNext::Binary(s) => got += conn.payload(s).len(),
+                WsNext::Idle => break,
+                WsNext::Failed(e) => panic!("gate 74c: {e}"),
+            }
+        }
+        if let WsProgress::Failed(e) = conn.on_tick(now) {
+            panic!("gate 74c: {e}");
+        }
+        if got > 0 {
+            return got;
+        }
+    }
+}
+
+/// **BX5 gate 74c — the WebSocket session's socket half, as allocations
+/// per round.**
+///
+/// `WsConn` is what BX6's WS API session sends `session.logon` and
+/// `order.place` through. A round is: `queue_text` (masked into the send
+/// window), `flush` (the whole window in ONE write, with the pong the
+/// last round's ping queued), `on_event` (pump, read to `WouldBlock`),
+/// `next_frame` (the echo handed out in place; every 8th round a ping
+/// answered into the send window), `on_tick` (the idle law). rustls'
+/// buffered API allocates one record buffer per sealed write and one per
+/// decrypted record, and the node answers each round in ONE write, so a
+/// round costs exactly 2 — anything above is ours. The node runs in a
+/// CHILD process ([`gate74_ws_node_helper`]): the counting allocator is
+/// process-global. Gate 74b's caveat holds: 2 is this fixture's number.
+#[test]
+fn ws_conn_session_round_allocates_only_rustls_record_buffers() {
+    use core_net::{WsCfg, WsConn};
+    const ROUNDS: u64 = 400;
+    const RUSTLS_ALLOCS_PER_ROUND: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate74c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 74c dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 74c exe"))
+        .args([
+            "gate74_ws_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE74_WS_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 74c child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 74c port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 74c: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 74c cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 74c anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let c = WsCfg {
+        rx_cap: 64 * 1024,
+        tx_cap: 64 * 1024,
+        establish_ns: 10_000_000_000,
+        idle_ns: 60_000_000_000,
+    };
+    let mut conn = WsConn::new("localhost", port, "/ws-api/v3", cfg, c, mio::Token(6), 0x74C)
+        .expect("gate 74c conn");
+    let mut poll = mio::Poll::new().expect("gate 74c poll");
+    let mut events = mio::Events::with_capacity(8);
+    let epoch = std::time::Instant::now();
+    conn.connect(poll.registry(), 0).expect("gate 74c connect");
+    while !conn.is_open() {
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(5)))
+            .expect("gate 74c poll");
+        let now = epoch.elapsed().as_nanos() as u64;
+        for ev in events.iter() {
+            if let core_net::WsProgress::Failed(e) = conn.on_event(ev, poll.registry(), now) {
+                panic!("gate 74c open: {e}");
+            }
+        }
+        assert!(epoch.elapsed() < std::time::Duration::from_secs(10), "gate 74c: never opened");
+    }
+    let req: [&[u8]; 3] = [
+        br#"{"id":"7","method":"order.place","params":{"symbol":"BTCUSDT","side":"BUY","#,
+        br#""type":"LIMIT","timeInForce":"IOC","quantity":"0.001","price":"60000","#,
+        br#""signature":"Ws+5m/CMnpkko0uBFxGTZ2+fjqqBXsUjRiaz173fPhXTkhoDBYNZ6wcYNeWItdrGn1pvG7vkwx2fhmJdAZ3KDQ=="}}"#,
+    ];
+    let mut i = 0;
+    while i < 50 {
+        // The session tickets and rustls' queues growing to their working
+        // size: the cold part.
+        assert!(gate74c_round(&mut conn, &mut poll, &mut events, epoch, &req) > 0);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < ROUNDS {
+        acc = acc.wrapping_add(gate74c_round(&mut conn, &mut poll, &mut events, epoch, &req) as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(conn.is_open(), "one session throughout");
+    assert_eq!(conn.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_ROUND * ROUNDS,
+        "WsConn round: {allocs} allocations ({bytes} B) over {ROUNDS} rounds — rustls' buffered \
+         API accounts for exactly {RUSTLS_ALLOCS_PER_ROUND}/round (one sealed record out, one \
+         decrypted record in); anything above is ours"
+    );
+}

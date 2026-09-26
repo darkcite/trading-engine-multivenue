@@ -1,6 +1,6 @@
 # Binance Execution Plan (BX0–BX14): fix-now pass first; then spot, USDⓈ-M + COIN-M futures (incl. TradFi stock perps), European options (long + short BTC/ETH), bStocks, Binance Stocks
 
-**Status: v2.1, 2026-09-26 — BX1 OPEN** on branch `binance` (worktree `~/trading-engine-multivenue-binance`, base `5f2140f`). **§13, the BX1 refresh, is authoritative wherever it differs from §1–§10.** v2, 2026-09-23 — BX0 LIVE. The fix-now pass (F1–F4) is committed in the main checkout (`0a1f6ff`) and went live at the 16:05Z routine restart, verified (§5 BX0). Its zero-copy pass (O-BX12d) is the second BX0 commit and goes live at the 00:10Z restart (§12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
+**Status: v2.1, 2026-09-26 — BX1 OPEN (its keyed probes wait on keys); BX4 committed (`ce2ee4a`), BX5 built (§5 records)** on branch `binance` (worktree `~/trading-engine-multivenue-binance`, base `5f2140f`). **§13, the BX1 refresh, is authoritative wherever it differs from §1–§10.** v2, 2026-09-23 — BX0 LIVE. The fix-now pass (F1–F4) is committed in the main checkout (`0a1f6ff`) and went live at the 16:05Z routine restart, verified (§5 BX0). Its zero-copy pass (O-BX12d) is the second BX0 commit and goes live at the 00:10Z restart (§12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
 
 **What this adds.** A second live arm, `VenueId::Binance = 1`, next to Hyperliquid. It sits behind the same two-switch interlock (`--exec` + `--arm-live`), the same risk gate and the same E-laws.
 
@@ -1069,6 +1069,76 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
 
 **Size:** about 500 src + 500 test.
 
+**BX5 record (2026-09-26, branch `binance`).**
+- **Built** (`crates/core-net`):
+  - `https_conn.rs` (new):
+    - `ReqWire`: one connection's request templates, each rendered ONCE at boot into its own region of one wire buffer. The body form (POST, PUT, DELETE) is `HttpsPost`'s old layout, `[pad | head | digits | CRLF CRLF | body]`. The query form (GET) is `METHOD path?`, then the window, then a header tail copied from its master per request. Extra header lines (`X-MBX-APIKEY`) belong to the template and are checked at boot: RFC 9110 names, no CR/LF, at most 4.
+    - `parse_answer`: the pure answer judge.
+    - `HttpsConn`: the non-blocking keep-alive client on its OWNER's `mio` poll.
+      - `start` stages the request and writes it, or dials first. `on_event` advances on each readiness event; `on_tick` enforces the request deadline.
+      - One request is in flight at a time. Before reuse, a one-byte probe retires a connection the peer closed while idle.
+      - `left_host` is set before the write. `Busy` is returned when a request is already in flight. `set_addr` takes an address resolved elsewhere.
+      - `window_mut` is empty while a dial is pending.
+  - `https_post.rs`: `HttpsPost` is now `HttpsConn`'s blocking one-template form. The API is the same and the wire bytes are identical (a full-string test pins them). Gate 72 is unchanged at 2 allocations per post.
+  - `ws_conn.rs` (new):
+    - `WsFramer`, the socket-free half:
+      - Data frames are handed out in place as spans.
+      - A ping is echoed straight from rx into tx.
+      - A text frame is masked straight into tx from its parts.
+      - A fragmented, masked or oversize frame is refused.
+    - `WsConn`, the non-blocking TLS WebSocket on the owner's poll:
+      - It dials, runs TLS, then the upgrade, which checks `Sec-WebSocket-Accept`.
+      - Everything queued goes out in ONE write per flush.
+      - It enforces the establishment deadline and the idle law.
+      - After a full window it reads on (mio is edge-triggered). Breaking that read-on makes the burst test fail, which proves the test catches it.
+  - `subs.rs`: `ReqIds` allocates request ids over `PendingTable`, skipping an id whose slot is still busy. `PendingTable::take_expired` is new.
+- **Departures from the text above:**
+  1. **One client, two ways to drive it** (§13.3 item 11): `HttpsPost` was generalised and gained a non-blocking form. No second client was added.
+  2. **The WS API helper is transport-level** (`WsConn`, `WsFramer`, `ReqIds`). The Binance JSON — `session.logon`, `userDataStream.subscribe`, `order.place`, the answer scanner — is BX6's `wsapi.rs`.
+  3. **`Keepalive::poll_client_heartbeat` is not used.** Binance's WS API pings the client; `WsConn` echoes the pings and enforces an idle limit.
+  4. **An incomplete TLS close is handled** (the focused risk review): a FIN without `close_notify`.
+     - A Content-Length or chunked answer read whole is now delivered (RFC 9112 §9.8). Before BX5 it was discarded as `Disconnected, left_host: true`, a false in-doubt.
+     - A close-delimited answer counts only after a close that a read confirmed clean.
+     - This changes `HttpsPost` for HYPARB. `docs/risk-policy.md` records it under "BX5".
+- **Copies** (all marked):
+  - A query-form request's header tail, per request: at most 1 101 B, about 141 B for a Binance GET. COLD ONLY.
+  - The body form's head move when the digit count changes, as before.
+  - The boot renders.
+  - Each host, once per process: interned, so a dial clones a pointer and not a `String`.
+- **Gates** (Mac, final tree, 05:26–05:28Z):
+  - clippy clean.
+  - nextest: 3 201 run, 3 201 passed, 6 skipped.
+  - alloc: 77/77, 2 ignored (the child-process helpers), with a fresh `Compiling bench` in the log.
+    - Gate 74a: staging, the answer judge, the framer and the ids, at 0 B/op, including their refusal paths.
+    - Gate 74b: `HttpsConn`'s cycle at exactly 2 allocations per request.
+    - Gate 74c: `WsConn`'s round at exactly 2 allocations per round, against a child-process rustls WebSocket node. Splitting the flush into two writes makes it fail.
+    - Gate 72 still passes.
+  - `make copy-audit`: `hits=31 baselined=31 new=0 paid=0`.
+  - `make license-check` OK.
+  - Tests: TLS loopback, 13 HTTPS and 9 WebSocket; each unclean-close fix breaks its test when disabled. Unit tests and proptests for every new parser. Fuzz targets `https_answer` and `ws_framer` (results in §12).
+- **Reviewers** (Opus 5.5 subagents acting as the agents, read-only):
+  - `zero-copy-auditor`: PASS, one should-fix: state that the tail copy is cold-only at the copy site. Done.
+  - `alloc-auditor`: PASS, one should-fix: a gate on `WsConn`'s socket half. That is gate 74c.
+  - `risk-reviewer` (a focused pass, because the change reaches HYPARB's live client): NEEDS-DOCS. Written: risk-policy "BX5".
+  - Every should-fix and nit was acted on:
+    - the clean close is confirmed by a read;
+    - a close-delimited answer cut by our own buffer is `Overflow`;
+    - the dial-window guard;
+    - `reresolve` is crate-private;
+    - hosts are interned;
+    - `Tmpl` shrank to 36 B;
+    - an unknown template index is refused;
+    - the numeric bounds are stated.
+  - **Escalated to the E-lane, not fixed here:** `exec_hyperliquid::HlHttp` still maps a bare-FIN `UnexpectedEof` to `Disconnected`, which is conservative. The H9c lines of risk-policy overstate it.
+- **Carried to BX6:**
+  - Every order request (place, cancel, amend) uses a body-form template; the query form is cold only. BX6's live smoke proves DELETE-with-body: the docs allow it, but it has not been seen live.
+  - `WsConn` has no `left_host`. A WS API request is maybe-sent from `flush` onward. Frames queued but never flushed are dropped by `connect`, so they were not sent.
+  - No transport enforces a cap: every order enters through `RoutedDispatcher`'s risk gate.
+  - DNS is resolved on a cold thread and handed in with `set_addr`. Reconnect by reusing the object; never call `new()` after boot.
+  - The "2 allocations per request" of gates 74b and 74c is the loopback's number (gate 74b's doc says why). The end-to-end gateway gate is BX6's.
+  - Log the `#[repr(u8)]` error kinds, never `to_string()`.
+- **Size:** about 2 150 source lines, docs included (`https_post.rs` shrank by 400), and 2 450 test lines. The plan's 500 + 500 predates the non-blocking requirement and two review rounds.
+
 ### BX6: `crates/exec-binance` core
 
 This phase is offline: loopback only.
@@ -1420,6 +1490,11 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - The plan re-read against the base; the deltas are §13 (authoritative where it disagrees with §1–§10).
   - The K-items re-checked against Binance's docs; K1, K5, K8, K17 closed by docs, K3 and K13 partly (options and PM are IoC-only), K15 mostly; K19 and K20 added (§13.5).
   - Git: the worktree creation only (O-BX15 and the operator's word of 2026-09-26). The engine was never touched.
+- **2026-09-26, BX4 committed** (`ce2ee4a`, branch `binance`): `crates/signer-ed25519`, `core_crypto::base64_encode_pct`, bench gate 73. It also carries §13. Record in §5 BX4.
+- **2026-09-26, BX5 built** (branch `binance`). What was built: `HttpsConn` (non-blocking keep-alive HTTPS with templates), `HttpsPost` as its blocking form, `WsConn`/`WsFramer`, and `ReqIds`. The record is in §5 BX5.
+  - HYPARB's `HttpsPost` now delivers a whole answer after a close without `close_notify` (risk-policy "BX5"). It reaches the engine only through merge, release build and restart.
+  - Fuzz, 120 s each on the Mac: `https_answer` 11.86 M runs and `ws_framer` 8.47 M runs, no crash.
+  - Git: one commit `BX5:`, explicit paths. The engine was never touched.
 
 ---
 

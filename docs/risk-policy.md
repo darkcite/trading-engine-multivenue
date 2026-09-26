@@ -5792,3 +5792,68 @@ exactly as `exec-smoke.sh` does.
   keep-alive"). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
   is rustls' unbuffered API (`UnbufferedClientConnection`) — a core-net
   transport decision for the operator, not a HYPARB-lane change.
+
+### BX5: `HttpsPost` became the blocking form of `HttpsConn` (2026-09-26)
+
+`core_net::HttpsPost`, HYPARB's JSON-RPC write arm and `/info` client,
+now runs the protocol of the new non-blocking `core_net::HttpsConn`,
+which is the Binance lane's REST client. The wire bytes are unchanged
+(pinned byte for byte), and so are the API and the `left_host` points
+(set before the write). Gate 72 still measures exactly 2 allocations per
+post.
+
+**One behaviour changed: the incomplete TLS close.** When a peer ends a
+connection with a bare TCP FIN and no `close_notify`, rustls returns
+`UnexpectedEof` on the read after the buffered answer. Before BX5 that
+read error discarded the answer and returned `Disconnected, left_host:
+true`. For the write arm that was a false `MaybeSent`: a 30 s receipt
+timeout, a wallet quarantine and, for a receipt, a lost answer. Now:
+
+* **An answer its own framing proves whole is delivered**, and the
+  connection retires. "Whole" means `Content-Length` was reached or the
+  terminating chunk was seen. RFC 9112 §9.8 says so, and TLS
+  authenticates every record, so a FIN can only cut bytes off the end;
+  it cannot change them. The arm's scanners and its mapping are
+  unchanged: answers that were thrown away reach the branches they
+  would have reached on a clean close.
+* **A close-delimited answer (no length of its own) counts only after a
+  close that a read CONFIRMED clean.**
+  * After an `Ok(0)`, one more read asks rustls, whose reader answers
+    `Ok(0)` only after `close_notify` and `UnexpectedEof` otherwise.
+  * A bare FIN ends as `Disconnected, left_host: true`.
+  * A close-delimited answer that our own buffer cut ends as `Overflow`.
+  * `TlsTransport::read`'s pull-through, which BX5 did not change,
+    returns `Ok(0)` at TCP EOF without making that distinction. That
+    happens every time an answer is larger than rustls' 16 KiB
+    plaintext wave. The confirming read closes the gap for `HttpsConn`.
+    The other `TlsTransport` users, the WS ingress streams, reconnect
+    on either result, and their frames are self-delimiting.
+* **Pinned by** `https_conn_loopback::`:
+  * `an_answer_proven_whole_survives_a_close_without_close_notify`
+  * `a_chunked_answer_proven_whole_survives_a_close_without_close_notify`
+  * `a_close_delimited_answer_needs_a_clean_close`
+  * `a_large_close_delimited_answer_needs_a_clean_close_too`
+  * `a_close_delimited_answer_cut_by_our_own_buffer_overflows`
+
+  The first and the fourth fail when their fix is disabled.
+* **`HlHttp` is unchanged.** It is the E-lane's slot-3 `/exchange` arm.
+  It still maps a bare-FIN `UnexpectedEof` to `Disconnected`: a false
+  `sent_unanswered`, which errs on the conservative side. "The live
+  arm's stale keep-alive (H9c)" above ("or arrives with the FIN … the
+  answer is kept") overstates it for that case. The E-lane decides;
+  BX5 changes nothing there.
+* **It reaches the armed engine only** through a merge to `main`, a
+  release build and an `exec-smoke`-gated restart.
+
+**Order-state rules for the Binance gateway (BX6)**, recorded now
+because the transport makes them:
+* **`WsConn` has no `left_host`.** A WS API request is maybe-sent from
+  the moment `flush` is called. Frames that were queued but never
+  flushed when the session died were not sent (`connect` drops them).
+* **`HttpsConn::window_mut` is empty while a dial is pending**, so a
+  render cannot rewrite a request that has not been sent. `Busy`
+  means nothing was written.
+* **DNS is never resolved on the gateway thread.** `reresolve` is
+  crate-private; addresses come in through `set_addr`.
+* **No transport enforces a cap.** Every order enters through
+  `RoutedDispatcher`'s risk gate.

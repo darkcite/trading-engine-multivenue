@@ -399,3 +399,17 @@ path   = "fuzz_targets/evm_exec_response.rs"
 test   = false
 doc    = false
 bench  = false
+
+[[bin]]
+name   = "https_answer"
+path   = "fuzz_targets/https_answer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ws_framer"
+path   = "fuzz_targets/ws_framer.rs"
+test   = false
+doc    = false
+bench  = false

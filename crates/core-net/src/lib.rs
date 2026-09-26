@@ -37,11 +37,13 @@ pub mod backoff;
 pub mod boot_http;
 pub mod error;
 pub mod http1;
+pub mod https_conn;
 pub mod https_post;
 pub mod iobuf;
 pub mod keepalive;
 pub mod subs;
 pub mod transport;
+pub mod ws_conn;
 pub mod ws_frame;
 pub mod ws_handshake;
 
@@ -53,18 +55,23 @@ pub use keepalive::{
 };
 pub use subs::{
     queue_masked_binary_frame, queue_masked_binary_frame_parts, queue_masked_text_frame,
-    queue_masked_text_frame_parts, PendingErr, PendingReq, PendingTable, ReqKind, SubErr, SubId,
-    SubTable,
+    queue_masked_text_frame_parts, PendingErr, PendingReq, PendingTable, ReqIds, ReqKind, SubErr,
+    SubId, SubTable,
 };
 
 pub use http1::{
     chunked_body, dechunk_in_place, head_says_close, read_response, write_get_request, BodyFraming,
     ChunkedBody, DechunkResult, HttpErr, HttpResult,
 };
-pub use https_post::{parse_https_url, HttpsPost, PostErr, PostErrKind, MAX_BODY_CAP};
+pub use https_conn::{
+    ConnCfg, HttpsConn, Method, Params, PostErr, PostErrKind, Progress, ReqSpec, ReqWire,
+    MAX_BODY_CAP,
+};
+pub use https_post::{parse_https_url, HttpsPost};
 pub use transport::{
     PlainTcpTransport, Status, TestBuffer, TestTransport, TlsTransport, Transport,
 };
+pub use ws_conn::{WsCfg, WsConn, WsErr, WsFramer, WsNext, WsProgress};
 pub use ws_frame::{
     ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_binary_frame_parts,
     ws_write_ping, ws_write_pong, ws_write_text_frame, ws_write_text_frame_parts, PayloadSpan,
