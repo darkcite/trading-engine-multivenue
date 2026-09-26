@@ -24,8 +24,21 @@
 #     (`btcusdt`, `BTC-USDT-SWAP`, `BTC-PERPETUAL`, `BTC`); Binance symbols
 #     match case-insensitively.
 #   * An UNUSABLE file (not TOML, unknown key, unknown tf, empty list, a
-#     non-table) is reported on stderr and IGNORED WHOLE — a typo can only
-#     widen a fetch back to §9.5, never silently narrow another lane.
+#     non-table, a bad `extra` or `backfill_1m_h`) is reported on stderr and
+#     IGNORED WHOLE — a typo can only widen a fetch back to §9.5, never
+#     silently narrow another lane.
+#
+# TWO MORE LANE KEYS (HAR W1, 2026-09-26).
+#   * `extra = ["<sym>", …]` — instruments the universe does NOT name, fetched
+#     by that lane exactly like its own (the same bases, budget and store
+#     laws), under the lane's descriptor: `[hyperliquid] extra = ["xyz:SP500"]`
+#     is `hyperliquid:xyz:SP500`. The engine never sees them (this file is the
+#     worker's). A lane the universe lacks is created; a symbol it already
+#     names is not doubled. Distinct, non-empty strings; `[<lane>.instruments]`
+#     narrows them like any other instrument.
+#   * `backfill_1m_h = <hours>` — that lane's 1 m backfill for an EMPTY series
+#     (1..8760), over `CLAUDE_WORKER_CANDLES_BACKFILL_1M_H` and the 48 h
+#     default. An existing series gap-fills from its newest row as always.
 #
 # Lane names = the candles lane names: binance · binance-usdm · okx · deribit ·
 # hyperliquid · bybit · bybit-linear · mexc · mexc-perp.
@@ -43,3 +56,29 @@ tfs = ["1m", "1h", "1d"]
 # The xsd research-breadth targets: hourly member ⇒ 1h + 1d only. One line per
 # instrument; the xsd authoring lane writes this block from its universe.
 # cotiusdt = ["1h", "1d"]
+
+# HAR W1 — the ten `xyz` perps (HL dex `xyz`), accrued for the long-tenor HAR
+# (`har.toml` fallbacks read `hyperliquid:xyz:<U>`). They cannot go in
+# universe.toml: the engine's HL coin table is full (`HL_MAX_COINS`). HL serves
+# only the newest ~5 000 minutes at 1 m (~3.5 days; older 1 m is gone for
+# good), so the first cycle reaches back 96 h: with 1 000-minute pages, a
+# backfill of 100 h or more would start with a page that ends before the
+# oldest served minute — an empty page, which ends the walk. The first cycle
+# is ~90 pages; the HL lane is paced to half of HL's per-IP weight minute
+# (`CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN`, 600), so it takes ~6 minutes.
+# [hyperliquid]
+# extra = ["xyz:SP500", "xyz:NVDA", "xyz:AAPL", "xyz:MSFT", "xyz:META",
+#          "xyz:MU", "xyz:SNDK", "xyz:SPCX", "xyz:BABA", "xyz:BOT"]
+# backfill_1m_h = 96
+#
+# [hyperliquid.instruments]
+# "xyz:SP500" = ["1m", "1h"]
+# "xyz:NVDA" = ["1m", "1h"]
+# "xyz:AAPL" = ["1m", "1h"]
+# "xyz:MSFT" = ["1m", "1h"]
+# "xyz:META" = ["1m", "1h"]
+# "xyz:MU" = ["1m", "1h"]
+# "xyz:SNDK" = ["1m", "1h"]
+# "xyz:SPCX" = ["1m", "1h"]
+# "xyz:BABA" = ["1m", "1h"]
+# "xyz:BOT" = ["1m", "1h"]

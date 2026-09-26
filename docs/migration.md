@@ -6,6 +6,58 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `candles.toml`: `extra` instruments and a lane's `backfill_1m_h` (HAR W1)
+
+**What changed**
+
+- Two lane keys in the candles lane's policy file (`~/multivenue/candles.toml`,
+  worker-only; grammar in `candles.toml.example`):
+  - `extra = ["<sym>", …]` — instruments the universe does not name,
+    fetched by that lane like its own under the lane's descriptor
+    (`[hyperliquid] extra = ["xyz:SP500"]` → `hyperliquid:xyz:SP500`); a lane
+    the universe lacks is created, a symbol it already names is not doubled;
+  - `backfill_1m_h = <1..8760>` — that lane's 1 m backfill for an EMPTY
+    series, over `CLAUDE_WORKER_CANDLES_BACKFILL_1M_H` and the 48 h default.
+- A malformed value of either ignores the whole file (the file's standing
+  law: a typo only widens back to §9.5).
+- The candles cycle reads the policy before its "no candle-lane instruments"
+  exit, so a universe with no lane can still run `extra` lanes.
+- `claude_worker.candles` builds every lane from one table (`LANE_FORMS`);
+  the lanes read from `universe.toml` are unchanged.
+- The HL lane is PACED to half of HL's per-IP weight minute (1 200, shared
+  with the engine on this host): a rolling-minute budget,
+  `CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN` (default 600), booked per page at
+  HL's published weights (`candleSnapshot`: 20 + 1 per 60 candles). Before,
+  a fresh store's first HL cycle (and W1's — ~90 pages, ~3 300 weight) could
+  spend the IP's minute two or three times over.
+
+**Why**
+
+- HAR W1: the ten `xyz` perps (HL dex `xyz`) do not fit the engine's HL
+  coin table, and HL keeps only the newest ~5 000 minutes at 1 m — accrual
+  must start in the worker, from the first cycle's 96 h reach.
+
+**Impact**
+
+- None until the live `candles.toml` names an `extra` (the example's W1
+  block, after this branch reaches `main`). Then ~20 more HL
+  `candleSnapshot` calls an hour (ten coins × 1 m + 1 h), inside the lane's
+  demand-sized budget.
+- The pacing: a steady hourly cycle (~900 HL weight with the extras) takes
+  about a minute longer; W1's first cycle about six minutes. The worker
+  serialisation guard is held that much longer.
+
+**Migration steps**
+
+1. After the merge: uncomment the example's W1 block into
+   `~/multivenue/candles.toml`; the next hourly cycle backfills 96 h of 1 m
+   and 90 d of 1 h for each coin.
+
+**Rollback**
+
+- Remove the block (the rows already stored stay; nothing reads them but
+  the HAR seed).
+
 ## 2026-09-26 — the healthy-session backoff in core-net; Hypercall and MEXC reconnect by it (O-HC16)
 
 **What changed**

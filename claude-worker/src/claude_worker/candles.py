@@ -39,6 +39,15 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
   Derived tfs follow their bases (no 1 m ⇒ no 5 m/15 m; 4 h still
   derives from 1 h). An unusable policy file is reported and IGNORED
   (best-effort law) — never a narrower fetch by accident.
+  Two more lane keys (HAR W1, 2026-09-26): ``extra = [...]`` — instruments
+  the universe does not name, fetched by that lane like its own (the
+  engine never subscribes them; ``[hyperliquid] extra = ["xyz:SP500"]``
+  is the descriptor ``hyperliquid:xyz:SP500``), a lane the universe lacks
+  included; and ``backfill_1m_h = N`` — that lane's 1 m backfill for an
+  EMPTY series, over ``CLAUDE_WORKER_CANDLES_BACKFILL_1M_H`` and the 48 h
+  default (§9.6). The HL lane is paced to HALF of HL's per-IP weight
+  minute (``CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN``, 600): the engine on
+  the same host keeps the other half.
 - **§9.6 gap-fill**: per (descriptor, tf): ``SELECT max(open_ts)`` →
   request ONLY the missing window (re-requesting the stored max bar
   itself, which may have been OPEN at the last cycle) → paginate
@@ -70,6 +79,7 @@ calls in tests — HTTP rides injectable ``get_fn``/``post_fn``.
 """
 
 import argparse
+import collections
 import collections.abc
 import datetime
 import json
@@ -196,18 +206,94 @@ class Lane(typing.NamedTuple):
     backward: bool
 
 
+class LaneForm(typing.NamedTuple):
+    """How a lane names its instruments: the venue, the descriptor
+    namespace (``<prefix>:<symbol as written>``), whether the request
+    form upper-cases the symbol (Binance), and the walk direction."""
+
+    venue: int
+    prefix: str
+    upper: bool
+    backward: bool
+
+
+#: Every candle lane, in lane order — the one table the universe's lanes
+#: and the policy's ``extra`` instruments are both built from. PM is
+#: deliberately absent (§9.7 capture lane, C5).
+LANE_FORMS: dict[str, LaneForm] = {
+    "binance": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance", True, False),
+    # WS5: dated delivery futures ride the SAME fapi lane + descriptor
+    # namespace as the perps (klines/ticker endpoints serve both).
+    "binance-usdm": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance-usdm", True, False),
+    "okx": LaneForm(claude_worker.frames.VENUE_OKX, "okx", False, True),
+    "deribit": LaneForm(claude_worker.frames.VENUE_DERIBIT, "deribit", False, False),
+    "hyperliquid": LaneForm(claude_worker.frames.VENUE_HYPERLIQUID, "hyperliquid", False, False),
+    # WS9: Bybit — one lane per category (the kline endpoint needs
+    # `category=`); symbols stay in the venue's UPPERCASE form.
+    "bybit": LaneForm(claude_worker.frames.VENUE_BYBIT, "bybit", False, False),
+    "bybit-linear": LaneForm(claude_worker.frames.VENUE_BYBIT, "bybit-linear", False, False),
+    # MX7: MEXC — one lane per class (different hosts AND endpoints);
+    # symbols stay in the venue's UPPERCASE form (`BTCUSDT` spot,
+    # `BTC_USDT` perp). xStocks / TradFi perps are ordinary rows.
+    "mexc": LaneForm(claude_worker.frames.VENUE_MEXC, "mexc", False, False),
+    "mexc-perp": LaneForm(claude_worker.frames.VENUE_MEXC, "mexc-perp", False, False),
+}
+
+
+def lane_target(lane_name: str, sym: str) -> LaneTarget:
+    """One instrument of lane ``lane_name`` (a ``LANE_FORMS`` key),
+    ``sym`` as written in universe.toml or the policy's ``extra``."""
+    form = LANE_FORMS[lane_name]
+    return LaneTarget(form.venue, f"{form.prefix}:{sym}", sym.upper() if form.upper else sym)
+
+
+def lane_of(lane_name: str, syms: collections.abc.Iterable[str]) -> Lane:
+    """Lane ``lane_name`` over ``syms`` (``LANE_FORMS`` key)."""
+    form = LANE_FORMS[lane_name]
+    return Lane(lane_name, form.venue, [lane_target(lane_name, s) for s in syms], form.backward)
+
+
+def with_extras(lanes: list[Lane], policy: TfPolicy) -> list[Lane]:
+    """The universe's lanes plus the policy's ``extra`` instruments
+    (HAR W1): appended to their lane after its own, one the universe
+    already names is not doubled, and a lane the universe lacks is
+    created (in ``LANE_FORMS`` order, after the universe's lanes).
+    The candles cycle alone reads them — never the engine."""
+    if not policy.extras:
+        return lanes
+    out: list[Lane] = []
+    seen: set[str] = set()
+    for lane in lanes:
+        seen.add(lane.name)
+        extra = policy.extras.get(lane.name, ())
+        have = {t.descriptor for t in lane.targets}
+        add = [t for t in (lane_target(lane.name, s) for s in extra) if t.descriptor not in have]
+        out.append(lane._replace(targets=lane.targets + add) if add else lane)
+    for name in LANE_FORMS:
+        if name in policy.extras and name not in seen:
+            out.append(lane_of(name, policy.extras[name]))
+    return out
+
+
 class TfPolicy(typing.NamedTuple):
     """Which §9.5 bases each lane / instrument fetches (module
     docstring, "Base-timeframe POLICY"). Keys of ``instruments`` are
     ``(lane name, venue symbol as written in universe.toml)``; values
-    are FETCHED_TFS keys in FETCHED_TFS order. Empty = the §9.5 law."""
+    are FETCHED_TFS keys in FETCHED_TFS order. ``extras``: per lane, the
+    instruments the universe does not name (venue-symbol form, file
+    order). ``backfill_1m_h``: per lane, the empty-series 1 m backfill
+    in hours. Empty = the §9.5 law."""
 
     lanes: dict[str, tuple[str, ...]]
     instruments: dict[tuple[str, str], tuple[str, ...]]
+    extras: dict[str, tuple[str, ...]]
+    backfill_1m_h: dict[str, int]
 
 
-DEFAULT_POLICY: TfPolicy = TfPolicy({}, {})
+DEFAULT_POLICY: TfPolicy = TfPolicy({}, {}, {}, {})
 ALL_TFS: tuple[str, ...] = tuple(FETCHED_TFS)
+#: ``backfill_1m_h`` bounds: an hour to a year of minutes.
+BACKFILL_1M_H_MAX: int = 8_760
 
 
 def _policy_tfs(raw: object) -> tuple[str, ...] | None:
@@ -221,6 +307,19 @@ def _policy_tfs(raw: object) -> tuple[str, ...] | None:
         return None
     chosen = {typing.cast(str, x) for x in items}
     return tuple(tf for tf in ALL_TFS if tf in chosen)
+
+
+def _policy_syms(raw: object) -> tuple[str, ...] | None:
+    """An ``extra`` value → its symbols in file order; ``None`` =
+    malformed (not a list, empty, a non-string or blank entry, or a
+    duplicate)."""
+    if not isinstance(raw, list):
+        return None
+    items = typing.cast(list[object], raw)
+    if not items or any(not isinstance(x, str) or not x.strip() or x != x.strip() for x in items):
+        return None
+    syms = tuple(typing.cast(str, x) for x in items)
+    return syms if len(set(syms)) == len(syms) else None
 
 
 def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
@@ -241,12 +340,25 @@ def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
         return DEFAULT_POLICY, f"not TOML ({e})"
     lanes: dict[str, tuple[str, ...]] = {}
     instruments: dict[tuple[str, str], tuple[str, ...]] = {}
+    extras: dict[str, tuple[str, ...]] = {}
+    backfill_1m_h: dict[str, int] = {}
     for lane_name, sec in obj.items():
         if not isinstance(sec, dict):
             return DEFAULT_POLICY, f"[{lane_name}] is not a table"
         section = typing.cast(dict[str, object], sec)
         for key, val in section.items():
-            if key == "tfs":
+            if key == "extra":
+                if lane_name not in LANE_FORMS:
+                    return DEFAULT_POLICY, f"[{lane_name}] extra: not a candle lane {sorted(LANE_FORMS)}"
+                syms = _policy_syms(val)
+                if syms is None:
+                    return DEFAULT_POLICY, f"[{lane_name}] extra must be a non-empty list of distinct symbols"
+                extras[lane_name] = syms
+            elif key == "backfill_1m_h":
+                if isinstance(val, bool) or not isinstance(val, int) or not 1 <= val <= BACKFILL_1M_H_MAX:
+                    return DEFAULT_POLICY, f"[{lane_name}] backfill_1m_h must be an integer 1..{BACKFILL_1M_H_MAX}"
+                backfill_1m_h[lane_name] = val
+            elif key == "tfs":
                 tfs = _policy_tfs(val)
                 if tfs is None:
                     return DEFAULT_POLICY, f"[{lane_name}] tfs must be a non-empty list of {list(ALL_TFS)}"
@@ -264,7 +376,7 @@ def read_tf_policy(path: pathlib.Path) -> tuple[TfPolicy, str | None]:
                     instruments[(lane_name, sym)] = tfs
             else:
                 return DEFAULT_POLICY, f"[{lane_name}] unknown key `{key}`"
-    return TfPolicy(lanes, instruments), None
+    return TfPolicy(lanes, instruments, extras, backfill_1m_h), None
 
 
 def tfs_for(policy: TfPolicy, lane: Lane, target: LaneTarget) -> tuple[str, ...]:
@@ -434,65 +546,23 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
             return []
         return [x for x in typing.cast(list[object], raw) if isinstance(x, str) and x]
 
-    frames = claude_worker.frames
     lanes: list[Lane] = []
-    spot = [
-        LaneTarget(frames.VENUE_BINANCE, f"binance:{s}", s.upper())
-        for s in str_list("binance", "spot")
-    ]
-    if spot:
-        lanes.append(Lane("binance", frames.VENUE_BINANCE, spot, backward=False))
-    # WS5: dated delivery futures ride the SAME fapi lane + descriptor
-    # namespace as the perps (klines/ticker endpoints serve both).
-    usdm = [
-        LaneTarget(frames.VENUE_BINANCE, f"binance-usdm:{s}", s.upper())
-        for s in str_list("binance", "usdm") + str_list("binance", "usdm_dated")
-    ]
-    if usdm:
-        lanes.append(Lane("binance-usdm", frames.VENUE_BINANCE, usdm, backward=False))
-    okx = [
-        LaneTarget(frames.VENUE_OKX, f"okx:{i}", i) for i in str_list("okx", "instruments")
-    ]
-    if okx:
-        lanes.append(Lane("okx", frames.VENUE_OKX, okx, backward=True))
-    deribit = [
-        LaneTarget(frames.VENUE_DERIBIT, f"deribit:{i}", i)
-        for i in str_list("deribit", "instruments")
-    ]
-    if deribit:
-        lanes.append(Lane("deribit", frames.VENUE_DERIBIT, deribit, backward=False))
-    hl = [
-        LaneTarget(frames.VENUE_HYPERLIQUID, f"hyperliquid:{c}", c)
-        for c in str_list("hyperliquid", "coins")
-    ]
-    if hl:
-        lanes.append(Lane("hyperliquid", frames.VENUE_HYPERLIQUID, hl, backward=False))
-    # WS9: Bybit — one lane per category (the kline endpoint needs
-    # `category=`); symbols stay in the venue's UPPERCASE form.
-    bybit_spot = [
-        LaneTarget(frames.VENUE_BYBIT, f"bybit:{s}", s) for s in str_list("bybit", "spot")
-    ]
-    if bybit_spot:
-        lanes.append(Lane("bybit", frames.VENUE_BYBIT, bybit_spot, backward=False))
-    bybit_linear = [
-        LaneTarget(frames.VENUE_BYBIT, f"bybit-linear:{s}", s)
-        for s in str_list("bybit", "linear")
-    ]
-    if bybit_linear:
-        lanes.append(Lane("bybit-linear", frames.VENUE_BYBIT, bybit_linear, backward=False))
-    # MX7: MEXC — one lane per class (different hosts AND endpoints);
-    # symbols stay in the venue's UPPERCASE form (`BTCUSDT` spot,
-    # `BTC_USDT` perp). xStocks / TradFi perps are ordinary rows.
-    mexc_spot = [
-        LaneTarget(frames.VENUE_MEXC, f"mexc:{s}", s) for s in str_list("mexc", "spot")
-    ]
-    if mexc_spot:
-        lanes.append(Lane("mexc", frames.VENUE_MEXC, mexc_spot, backward=False))
-    mexc_perp = [
-        LaneTarget(frames.VENUE_MEXC, f"mexc-perp:{s}", s) for s in str_list("mexc", "perp")
-    ]
-    if mexc_perp:
-        lanes.append(Lane("mexc-perp", frames.VENUE_MEXC, mexc_perp, backward=False))
+    # (lane, the universe.toml [section] key(s) it reads), in lane order.
+    sources: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+        ("binance", (("binance", "spot"),)),
+        ("binance-usdm", (("binance", "usdm"), ("binance", "usdm_dated"))),
+        ("okx", (("okx", "instruments"),)),
+        ("deribit", (("deribit", "instruments"),)),
+        ("hyperliquid", (("hyperliquid", "coins"),)),
+        ("bybit", (("bybit", "spot"),)),
+        ("bybit-linear", (("bybit", "linear"),)),
+        ("mexc", (("mexc", "spot"),)),
+        ("mexc-perp", (("mexc", "perp"),)),
+    )
+    for lane_name, keys in sources:
+        syms = [s for section, key in keys for s in str_list(section, key)]
+        if syms:
+            lanes.append(lane_of(lane_name, syms))
     return lanes
 
 
@@ -748,12 +818,71 @@ def _deribit_url(host: str, inst: str, tf: str, start_ms: int, end_ms: int) -> s
     )
 
 
+#: HL `/info` weights (HL's published IP rate limit: 1 200 weight a
+#: minute per IP, shared with the engine on the same host): a
+#: `candleSnapshot` weighs 20 plus 1 per 60 candles returned.
+HL_INFO_BASE_WEIGHT: int = 20
+HL_CANDLES_PER_WEIGHT: int = 60
+#: The heaviest page the lane asks for (`HL_PAGE_BARS` candles).
+HL_PAGE_WEIGHT_MAX: int = HL_INFO_BASE_WEIGHT + -(-HL_PAGE_BARS // HL_CANDLES_PER_WEIGHT)
+#: The lane's share of the IP's minute: HALF, the rest the engine's (its
+#: re-discovery reads, its boot, and a live slot's `/exchange`).
+HL_WEIGHT_PER_MIN_ENV: str = "CLAUDE_WORKER_CANDLES_HL_WEIGHT_PER_MIN"
+HL_WEIGHT_PER_MIN_DEFAULT: int = 600
+PACE_WINDOW_S: float = 60.0
+
+
+class WeightPacer:
+    """A rolling-minute weight budget for one host (HAR W1: the first
+    cycle of the ten `xyz` extras is ~90 pages — ~3 300 weight, near three
+    minutes of HL's per-IP limit, which the engine shares). ``acquire``
+    waits until the last minute's recorded weight leaves room for the
+    heaviest request; ``record`` books what a request actually weighed.
+    The clock and the sleep are injected (tests never sleep)."""
+
+    def __init__(
+        self,
+        per_min: int,
+        clock: collections.abc.Callable[[], float] = time.monotonic,
+        sleep: collections.abc.Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.per_min: int = per_min
+        self._clock = clock
+        self._sleep = sleep
+        self._booked: collections.deque[tuple[float, int]] = collections.deque()
+
+    def _spent(self, now: float) -> int:
+        while self._booked and self._booked[0][0] <= now - PACE_WINDOW_S:
+            self._booked.popleft()
+        return sum(w for _, w in self._booked)
+
+    def acquire(self, weight: int) -> float:
+        """Wait until ``weight`` more fits the rolling minute (an empty
+        minute always admits); returns the seconds waited."""
+        waited = 0.0
+        while True:
+            now = self._clock()
+            spent = self._spent(now)
+            if spent == 0 or spent + weight <= self.per_min:
+                return waited
+            pause = self._booked[0][0] + PACE_WINDOW_S - now
+            self._sleep(pause)
+            waited += pause
+
+    def record(self, weight: int) -> None:
+        """Book ``weight`` at now."""
+        self._booked.append((self._clock(), weight))
+
+
 class Http(typing.NamedTuple):
-    """Injectable transport pair (no live calls in tests)."""
+    """Injectable transport pair (no live calls in tests). ``hl_pace``
+    keeps the HL lane inside its share of the IP's minute (``None``: no
+    pacing — the tests' transports)."""
 
     get: collections.abc.Callable[[str], str | None]
     post: collections.abc.Callable[[str, str], str | None]
     hosts: dict[str, str]
+    hl_pace: WeightPacer | None = None
 
 
 def _fetch_forward_page(
@@ -811,10 +940,14 @@ def _fetch_forward_page(
             },
             separators=(",", ":"),
         )
+        if http.hl_pace is not None:
+            http.hl_pace.acquire(HL_PAGE_WEIGHT_MAX)
         raw = http.post(f"https://{http.hosts['hyperliquid']}/info", body)
-        if raw is None:
-            return None
-        parsed_hl = claude_worker.fetchers.parse_hl_candles(raw)
+        parsed_hl = None if raw is None else claude_worker.fetchers.parse_hl_candles(raw)
+        if http.hl_pace is not None:
+            # A refused or unusable answer still spent the base weight.
+            items = 0 if parsed_hl is None else len(parsed_hl[0])
+            http.hl_pace.record(HL_INFO_BASE_WEIGHT + items // HL_CANDLES_PER_WEIGHT)
         return None if parsed_hl is None else parsed_hl[0]
     raise ValueError(f"not a forward lane: {lane.name}")
 
@@ -822,10 +955,21 @@ def _fetch_forward_page(
 # ---- §9.6 gap-fill -------------------------------------------------------
 
 
-def backfill_start_ms(tf: str, now_ms: int, lane_name: str, env: collections.abc.Mapping[str, str]) -> int:
-    """Empty-store §9.6 backfill bound for one tf."""
+def backfill_start_ms(
+    tf: str,
+    now_ms: int,
+    lane_name: str,
+    env: collections.abc.Mapping[str, str],
+    hours_1m: int | None = None,
+) -> int:
+    """Empty-store §9.6 backfill bound for one tf. ``hours_1m`` is the
+    lane's ``backfill_1m_h`` (the policy file): it wins over the env
+    knob, which wins over the 48 h default."""
     if tf == "1m":
-        hours = int(env.get(BACKFILL_1M_H_ENV, "") or BACKFILL_1M_H_DEFAULT)
+        if hours_1m is not None:
+            hours = hours_1m
+        else:
+            hours = int(env.get(BACKFILL_1M_H_ENV, "") or BACKFILL_1M_H_DEFAULT)
         return now_ms - hours * MS_1H
     if tf == "1h":
         days = int(env.get(BACKFILL_1H_D_ENV, "") or BACKFILL_1H_D_DEFAULT)
@@ -875,11 +1019,13 @@ def fill_forward(
     now_ms: int,
     budget: claude_worker.features.RestBudget,
     env: collections.abc.Mapping[str, str],
+    hours_1m: int | None = None,
 ) -> FillStats:
-    """Forward §9.6 fill: page-by-page upsert, monotone frontier."""
+    """Forward §9.6 fill: page-by-page upsert, monotone frontier.
+    ``hours_1m``: the lane's ``backfill_1m_h`` (``backfill_start_ms``)."""
     tf_ms = FETCHED_TFS[tf]
     last = max_open_ts(conn, target.venue, target.descriptor, tf)
-    lo = last if last is not None else backfill_start_ms(tf, now_ms, lane.name, env)
+    lo = last if last is not None else backfill_start_ms(tf, now_ms, lane.name, env, hours_1m)
     pages = 0
     bars = 0
     stats = _ZERO_UPSERT
@@ -911,13 +1057,15 @@ def fill_okx_backward(
     now_ms: int,
     budget: claude_worker.features.RestBudget,
     env: collections.abc.Mapping[str, str],
+    hours_1m: int | None = None,
 ) -> FillStats:
     """OKX §9.6 fill: BACKWARD walk (``history-candles`` + ``after``),
     buffered, upserted only when the walk CONNECTS to the stored
-    frontier (hole-avoidance law in the module docs)."""
+    frontier (hole-avoidance law in the module docs). ``hours_1m``: the
+    lane's ``backfill_1m_h``."""
     tf_ms = FETCHED_TFS[tf]
     last = max_open_ts(conn, target.venue, target.descriptor, tf)
-    bound = last if last is not None else backfill_start_ms(tf, now_ms, "okx", env)
+    bound = last if last is not None else backfill_start_ms(tf, now_ms, "okx", env, hours_1m)
     buffered: list[claude_worker.fetchers.Candle] = []
     after = now_ms + tf_ms  # strictly newer than any bar we want
     pages = 0
@@ -1335,9 +1483,11 @@ def run_cycle(
     siblings (observed live 2026-08-22: okx ETH-USDT-SWAP's 29-page
     1m walk vs 27 remaining) — rotation lets every target lead a
     cycle eventually, so every backfill completes. ``policy`` narrows
-    the bases per lane / instrument (``tfs_for``); the default policy
-    is the §9.5 law and this function is then bit-identical to the
-    pre-policy lane."""
+    the bases per lane / instrument (``tfs_for``) and sets a lane's
+    empty-series 1 m backfill (``backfill_1m_h``); its ``extra``
+    instruments are already in ``lanes`` (``with_extras``). The default
+    policy is the §9.5 law and this function is then bit-identical to
+    the pre-policy lane."""
     demand: dict[str, int] = {}
     for lane in lanes:
         key = budget_key(lane.name)
@@ -1355,14 +1505,15 @@ def run_cycle(
         )
     for lane in lanes:
         budget = budgets[budget_key(lane.name)]
+        hours_1m = policy.backfill_1m_h.get(lane.name)
         rot = (now_ms // 3_600_000) % len(lane.targets) if lane.targets else 0
         rotated = lane.targets[rot:] + lane.targets[:rot]
         for target in rotated:
             for tf in tfs_for(policy, lane, target):
                 if lane.backward:
-                    st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env)
+                    st = fill_okx_backward(conn, http, target, tf, now_ms, budget, env, hours_1m)
                 else:
-                    st = fill_forward(conn, http, lane, target, tf, now_ms, budget, env)
+                    st = fill_forward(conn, http, lane, target, tf, now_ms, budget, env, hours_1m)
                 u = st.upsert
                 report(
                     f"candles: {target.descriptor} {tf}: pages={st.pages} bars={st.bars}"
@@ -1411,7 +1562,8 @@ def make_http(client: httpx.Client, env: collections.abc.Mapping[str, str]) -> H
         "hyperliquid": env.get(claude_worker.fetchers.HL_API_HOST_ENV, "")
         or claude_worker.fetchers.HL_API_HOST_DEFAULT,
     }
-    return Http(get=get, post=post, hosts=hosts)
+    per_min = int(env.get(HL_WEIGHT_PER_MIN_ENV, "") or HL_WEIGHT_PER_MIN_DEFAULT)
+    return Http(get=get, post=post, hosts=hosts, hl_pace=WeightPacer(per_min))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1446,9 +1598,6 @@ def main(argv: list[str] | None = None) -> int:
     if lanes is None:
         print(f"candles: unusable universe file {universe}", file=sys.stderr)
         return 1
-    if not lanes:
-        print(f"candles: no candle-lane instruments in {universe}", file=sys.stderr)
-        return 0
     policy_path = pathlib.Path(
         args.policy or env.get(POLICY_ENV, "") or DEFAULT_POLICY_PATH
     ).expanduser()
@@ -1461,9 +1610,15 @@ def main(argv: list[str] | None = None) -> int:
     elif policy != DEFAULT_POLICY:
         print(
             f"candles: policy {policy_path}: lanes={len(policy.lanes)}"
-            f" instruments={len(policy.instruments)}",
+            f" instruments={len(policy.instruments)}"
+            f" extra={sum(len(v) for v in policy.extras.values())}"
+            f" backfill_1m_h={len(policy.backfill_1m_h)}",
             file=sys.stderr,
         )
+    lanes = with_extras(lanes, policy)
+    if not lanes:
+        print(f"candles: no candle-lane instruments in {universe}", file=sys.stderr)
+        return 0
     conn = open_db(db_path)
     try:
         with httpx.Client() as client:

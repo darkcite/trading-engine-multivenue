@@ -1103,8 +1103,19 @@ def test_capture_and_derive_missing_root_skips(tmp_path: pathlib.Path) -> None:
 def test_main_no_lanes_and_unusable_universe(tmp_path: pathlib.Path) -> None:
     empty = tmp_path / "u.toml"
     empty.write_text("[polymarket]\nmarkets = []\n", encoding="utf-8")
+    # Hermetic: the policy is read before the no-lanes exit (its `extra`
+    # can add lanes), so never the operator's live candles.toml.
     rc = claude_worker.candles.main(
-        ["--universe", str(empty), "--db", str(tmp_path / "c.db"), "--now-ms", str(NOW)]
+        [
+            "--universe",
+            str(empty),
+            "--db",
+            str(tmp_path / "c.db"),
+            "--now-ms",
+            str(NOW),
+            "--policy",
+            str(tmp_path / "absent-policy.toml"),
+        ]
     )
     assert rc == 0
     rc2 = claude_worker.candles.main(
@@ -1200,7 +1211,7 @@ def test_run_cycle_policy_narrows_calls_and_demand(tmp_path: pathlib.Path) -> No
     base = http_none()
     http = claude_worker.candles.Http(get=get, post=base.post, hosts=base.hosts)
     lines: list[str] = []
-    policy = claude_worker.candles.TfPolicy({"binance-usdm": ("1h", "1d")}, {})
+    policy = claude_worker.candles.TfPolicy({"binance-usdm": ("1h", "1d")}, {}, {}, {})
     claude_worker.candles.run_cycle(conn, lanes, http, NOW, 1, {}, lines.append, policy)
     assert len(calls) == 2
     assert all("interval=1m" not in u for u in calls)
@@ -1247,3 +1258,307 @@ def test_main_reads_policy_and_reports(
     assert rc == 0
     err = typing.cast(typing.Any, capsys).readouterr().err
     assert "policy" in err and "ignored" in err
+
+
+# ---- HAR W1: `extra` instruments and the lane's 1 m backfill -------------
+
+#: The ten `xyz` perps the HAR H3 plan measured (HL dex `xyz`).
+XYZ_COINS = (
+    "xyz:SP500",
+    "xyz:NVDA",
+    "xyz:AAPL",
+    "xyz:MSFT",
+    "xyz:META",
+    "xyz:MU",
+    "xyz:SNDK",
+    "xyz:SPCX",
+    "xyz:BABA",
+    "xyz:BOT",
+)
+
+
+def hl_json(coin: str, candles: list[claude_worker.fetchers.Candle]) -> str:
+    """A ``candleSnapshot`` body (numerics as strings, the venue's form)."""
+    return json.dumps(
+        [
+            {
+                "t": c.ts_ms,
+                "T": c.ts_ms + MS_1M - 1,
+                "s": coin,
+                "i": "1m",
+                "o": str(c.open),
+                "h": str(c.high),
+                "l": str(c.low),
+                "c": str(c.close),
+                "v": str(c.volume),
+                "n": 1,
+            }
+            for c in candles
+        ]
+    )
+
+
+def xyz_policy_text() -> str:
+    names = ", ".join(f'"{c}"' for c in XYZ_COINS)
+    narrow = "".join(f'"{c}" = ["1m", "1h"]\n' for c in XYZ_COINS)
+    return f"[hyperliquid]\nextra = [{names}]\nbackfill_1m_h = 96\n[hyperliquid.instruments]\n{narrow}"
+
+
+def test_policy_reads_extra_and_backfill_1m_h(tmp_path: pathlib.Path) -> None:
+    """The W1 file: the ten `xyz` coins as extras of the HL lane, in file
+    order, narrowed to 1 m + 1 h by the instruments table, with a 96 h
+    first-cycle 1 m backfill."""
+    f = tmp_path / "candles.toml"
+    f.write_text(xyz_policy_text(), encoding="utf-8")
+    policy, problem = claude_worker.candles.read_tf_policy(f)
+    assert problem is None
+    assert policy.extras == {"hyperliquid": XYZ_COINS}
+    assert policy.backfill_1m_h == {"hyperliquid": 96}
+    assert policy.lanes == {}
+    (lane,) = claude_worker.candles.with_extras([], policy)
+    assert [t.descriptor for t in lane.targets] == [f"hyperliquid:{c}" for c in XYZ_COINS]
+    assert lane.targets[0].instrument == "xyz:SP500"
+    assert lane.venue == claude_worker.frames.VENUE_HYPERLIQUID and not lane.backward
+    for t in lane.targets:
+        assert claude_worker.candles.tfs_for(policy, lane, t) == ("1m", "1h")
+
+
+def test_the_example_file_parses_and_its_w1_block_is_the_w1_policy(tmp_path: pathlib.Path) -> None:
+    """`candles.toml.example` is the grammar's contract: the file as
+    shipped parses, and its commented W1 block, uncommented, is exactly
+    the W1 policy (the ten `xyz` coins, 96 h, 1 m + 1 h each)."""
+    example = pathlib.Path(__file__).resolve().parents[2] / "candles.toml.example"
+    policy, problem = claude_worker.candles.read_tf_policy(example)
+    assert problem is None
+    assert policy.extras == {} and policy.backfill_1m_h == {}
+    text = example.read_text(encoding="utf-8")
+    block = text[text.index("# [hyperliquid]\n") :]
+    live = "".join(line[2:] + "\n" if line.startswith("# ") else line + "\n" for line in block.splitlines())
+    f = tmp_path / "w1.toml"
+    f.write_text(live, encoding="utf-8")
+    w1, problem = claude_worker.candles.read_tf_policy(f)
+    assert problem is None, problem
+    assert w1.extras == {"hyperliquid": XYZ_COINS}
+    assert w1.backfill_1m_h == {"hyperliquid": 96}
+    assert w1.instruments == {("hyperliquid", c): ("1m", "1h") for c in XYZ_COINS}
+
+
+def test_policy_refuses_a_bad_extra_or_backfill_1m_h_whole(tmp_path: pathlib.Path) -> None:
+    """Either key malformed ⇒ the WHOLE file is ignored (the good lane
+    beside it included) with a reason: an `extra` that is not a
+    non-empty list of distinct, trimmed strings, one on a section that
+    is no candle lane, and a `backfill_1m_h` outside 1..8760 or not an
+    integer (a bool, a float, a string)."""
+    good = '[binance-usdm]\ntfs = ["1h"]\n'
+    cases = [
+        ('[hyperliquid]\nextra = "xyz:SP500"\n', "distinct symbols"),
+        ("[hyperliquid]\nextra = []\n", "distinct symbols"),
+        ('[hyperliquid]\nextra = ["xyz:SP500", "xyz:SP500"]\n', "distinct symbols"),
+        ('[hyperliquid]\nextra = ["", "xyz:MU"]\n', "distinct symbols"),
+        ('[hyperliquid]\nextra = [" xyz:MU"]\n', "distinct symbols"),
+        ("[hyperliquid]\nextra = [1]\n", "distinct symbols"),
+        ('[polymarket]\nextra = ["x"]\n', "not a candle lane"),
+        ("[hyperliquid]\nbackfill_1m_h = 0\n", "backfill_1m_h"),
+        ("[hyperliquid]\nbackfill_1m_h = -1\n", "backfill_1m_h"),
+        ("[hyperliquid]\nbackfill_1m_h = 8761\n", "backfill_1m_h"),
+        ('[hyperliquid]\nbackfill_1m_h = "96"\n', "backfill_1m_h"),
+        ("[hyperliquid]\nbackfill_1m_h = true\n", "backfill_1m_h"),
+        ("[hyperliquid]\nbackfill_1m_h = 1.5\n", "backfill_1m_h"),
+    ]
+    for text, needle in cases:
+        f = tmp_path / "p.toml"
+        f.write_text(good + text, encoding="utf-8")
+        policy, problem = claude_worker.candles.read_tf_policy(f)
+        assert policy == claude_worker.candles.DEFAULT_POLICY, text
+        assert problem is not None and needle in problem, (text, problem)
+    # The bounds themselves are accepted.
+    for h in (1, claude_worker.candles.BACKFILL_1M_H_MAX):
+        f = tmp_path / "p.toml"
+        f.write_text(f"[hyperliquid]\nbackfill_1m_h = {h}\n", encoding="utf-8")
+        assert claude_worker.candles.read_tf_policy(f)[0].backfill_1m_h == {"hyperliquid": h}
+
+
+def test_extras_join_their_lane_or_make_one() -> None:
+    """An extra joins its lane after the universe's own; one the universe
+    already names is not doubled; a lane the universe lacks is made from
+    the lane table (the OKX walk stays backward); each lane's symbol form
+    holds (Binance requests upper-case); no extras = the same lanes."""
+    lane_of = claude_worker.candles.lane_of
+    universe = [lane_of("binance", ["btcusdt"]), lane_of("hyperliquid", ["BTC"])]
+    policy = claude_worker.candles.TfPolicy(
+        {},
+        {},
+        {"hyperliquid": ("xyz:SP500", "BTC"), "okx": ("MU-USDT-SWAP",), "binance": ("ethusdt",)},
+        {},
+    )
+    assert claude_worker.candles.with_extras(universe, claude_worker.candles.DEFAULT_POLICY) is universe
+    by_name = {lane.name: lane for lane in claude_worker.candles.with_extras(universe, policy)}
+    assert list(by_name) == ["binance", "hyperliquid", "okx"]
+    assert [t.descriptor for t in by_name["hyperliquid"].targets] == [
+        "hyperliquid:BTC",
+        "hyperliquid:xyz:SP500",
+    ]
+    assert [(t.descriptor, t.instrument) for t in by_name["binance"].targets] == [
+        ("binance:btcusdt", "BTCUSDT"),
+        ("binance:ethusdt", "ETHUSDT"),
+    ]
+    okx = by_name["okx"]
+    assert okx.backward and okx.venue == claude_worker.frames.VENUE_OKX
+    assert okx.targets == [
+        claude_worker.candles.LaneTarget(claude_worker.frames.VENUE_OKX, "okx:MU-USDT-SWAP", "MU-USDT-SWAP")
+    ]
+    assert len(universe[1].targets) == 1, "the universe's lane is not mutated"
+
+
+def test_backfill_1m_h_wins_over_the_env_and_the_default() -> None:
+    """The lane's key, then the env knob, then 48 h — for 1 m only."""
+    f = claude_worker.candles.backfill_start_ms
+    env = {claude_worker.candles.BACKFILL_1M_H_ENV: "12"}
+    assert f("1m", NOW, "hyperliquid", {}, 96) == NOW - 96 * MS_1H
+    assert f("1m", NOW, "hyperliquid", env, 96) == NOW - 96 * MS_1H
+    assert f("1m", NOW, "hyperliquid", env) == NOW - 12 * MS_1H
+    assert f("1m", NOW, "hyperliquid", {}) == NOW - 48 * MS_1H
+    assert f("1h", NOW, "hyperliquid", {}, 96) == NOW - 90 * MS_1D
+    assert f("1d", NOW, "hyperliquid", {}, 96) == claude_worker.candles.HL_1D_FLOOR_MS
+
+
+def test_the_first_cycle_fetches_the_xyz_extras_from_the_lane_bound(tmp_path: pathlib.Path) -> None:
+    """W1 end to end on the injected transport: an EMPTY store's first
+    cycle asks `candleSnapshot` for each `xyz` coin from NOW − 96 h at
+    1 m (the ~5 000 minutes HL still serves), then 1 h — never 1 d —
+    and stores the bars under `hyperliquid:xyz:<U>`."""
+    conn = db(tmp_path)
+    f = tmp_path / "candles.toml"
+    f.write_text(xyz_policy_text(), encoding="utf-8")
+    policy, problem = claude_worker.candles.read_tf_policy(f)
+    assert problem is None
+    lanes = claude_worker.candles.with_extras([], policy)
+    first = NOW - 83 * MS_1H  # HL's oldest served minute
+    bodies: list[dict[str, typing.Any]] = []
+
+    def post(url: str, body: str) -> str:
+        assert url == "https://hl.test/info"
+        req = json.loads(body)["req"]
+        bodies.append(req)
+        if req["interval"] == "1m" and req["startTime"] <= first < req["endTime"]:
+            return hl_json(req["coin"], [mk_candle(first + k * MS_1M) for k in range(3)])
+        return "[]"
+
+    base = http_none()
+    http = claude_worker.candles.Http(get=base.get, post=post, hosts=base.hosts)
+    lines: list[str] = []
+    claude_worker.candles.run_cycle(conn, lanes, http, NOW, 1, {}, lines.append, policy)
+    by_coin: dict[str, list[dict[str, typing.Any]]] = {}
+    for req in bodies:
+        by_coin.setdefault(req["coin"], []).append(req)
+    assert set(by_coin) == set(XYZ_COINS)
+    for coin, reqs in by_coin.items():
+        assert reqs[0]["interval"] == "1m" and reqs[0]["startTime"] == NOW - 96 * MS_1H, coin
+        assert {r["interval"] for r in reqs} == {"1m", "1h"}, coin
+        rows = conn.execute(
+            "SELECT count(*) FROM candles WHERE venue = ? AND descriptor = ? AND tf = '1m'",
+            (claude_worker.frames.VENUE_HYPERLIQUID, f"hyperliquid:{coin}"),
+        ).fetchone()[0]
+        assert rows == 3, coin
+    assert sum("BUDGET" in line for line in lines) == 0
+
+
+def test_the_weight_pacer_keeps_a_rolling_minute_under_its_share() -> None:
+    """The pacer admits while the last minute's booked weight leaves room
+    for the next request, then waits for the oldest booking to age out;
+    an empty minute always admits (a request heavier than the share never
+    deadlocks)."""
+    t = [0.0]
+    slept: list[float] = []
+
+    def sleep(s: float) -> None:
+        slept.append(s)
+        t[0] += s
+
+    p = claude_worker.candles.WeightPacer(100, lambda: t[0], sleep)
+    assert p.acquire(37) == 0.0
+    p.record(37)
+    t[0] = 10.0
+    assert p.acquire(37) == 0.0
+    p.record(37)
+    t[0] = 20.0
+    assert p.acquire(37) == 40.0, "74 + 37 > 100: wait for the t=0 booking to age out"
+    assert slept == [40.0] and t[0] == 60.0
+    p.record(37)
+    t[0] = 200.0
+    heavy = claude_worker.candles.WeightPacer(10, lambda: t[0], sleep)
+    assert heavy.acquire(37) == 0.0, "an empty minute admits anything"
+
+
+def test_the_hl_lane_books_what_each_page_weighed(tmp_path: pathlib.Path) -> None:
+    """Each `candleSnapshot` waits for the heaviest page's room and books
+    20 + 1 per 60 candles it returned — a refused answer the base 20."""
+    conn = db(tmp_path)
+    lanes = [claude_worker.candles.lane_of("hyperliquid", ["xyz:MU"])]
+    policy = claude_worker.candles.TfPolicy({"hyperliquid": ("1m",)}, {}, {}, {})
+    booked: list[int] = []
+    asked: list[int] = []
+
+    class Spy(claude_worker.candles.WeightPacer):
+        def acquire(self, weight: int) -> float:
+            asked.append(weight)
+            return 0.0
+
+        def record(self, weight: int) -> None:
+            booked.append(weight)
+
+    answers = [hl_json("xyz:MU", [mk_candle(NOW - 48 * MS_1H + k * MS_1M) for k in range(125)]), None]
+    base = http_none()
+    http = claude_worker.candles.Http(
+        get=base.get,
+        post=lambda url, body: answers.pop(0),
+        hosts=base.hosts,
+        hl_pace=Spy(600),
+    )
+    claude_worker.candles.run_cycle(conn, lanes, http, NOW, 5, {}, lambda line: None, policy)
+    assert asked == [claude_worker.candles.HL_PAGE_WEIGHT_MAX] * 2
+    assert booked == [20 + 125 // 60, 20], "a full answer, then a refused one"
+
+
+def test_main_runs_the_extras_of_a_universe_without_lanes(
+    tmp_path: pathlib.Path,
+    capsys: object,
+    monkeypatch: object,
+) -> None:
+    """The policy is read before the no-lanes exit: a universe with no
+    candle lane still runs the `extra` lane, and the report says so."""
+    universe = tmp_path / "u.toml"
+    universe.write_text("[polymarket]\nmarkets = []\n", encoding="utf-8")
+    policy = tmp_path / "candles.toml"
+    policy.write_text('[hyperliquid]\nextra = ["xyz:SP500"]\n', encoding="utf-8")
+    coins: list[str] = []
+    base = http_none()
+
+    def post(url: str, body: str) -> str:
+        coins.append(json.loads(body)["req"]["coin"])
+        return "[]"
+
+    mp = typing.cast(typing.Any, monkeypatch)
+    mp.setattr(
+        claude_worker.candles,
+        "make_http",
+        lambda client, env: claude_worker.candles.Http(get=base.get, post=post, hosts=base.hosts),
+    )
+    mp.setenv("CLAUDE_WORKER_REPLAY_DIR", str(tmp_path / "no-logs"))
+    mp.setenv("CLAUDE_WORKER_MARKET_MAP", str(tmp_path / "no-map.json"))
+    rc = claude_worker.candles.main(
+        [
+            "--universe",
+            str(universe),
+            "--db",
+            str(tmp_path / "c.db"),
+            "--now-ms",
+            str(NOW),
+            "--policy",
+            str(policy),
+        ]
+    )
+    assert rc == 0
+    assert set(coins) == {"xyz:SP500"}
+    err = typing.cast(typing.Any, capsys).readouterr().err
+    assert "extra=1" in err
