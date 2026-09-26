@@ -40,9 +40,21 @@ use ingress_ai::AI_CMDS_FILE;
 /// `mexc` at MX2 — MEXC carries `venue_seq` but no §6.2 chain law
 /// (Q-MX1): it emits no `TradeGap`/`BookGap`, so no derivation arm).
 /// HYPARB H3b: `hyperevm` appended — its tape is `hyperevm-signals.pmlr`
-/// (pool events); its tick file is header-only.
-const VENUE_LABELS: [&str; 9] = [
-    "pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc", "hyperevm",
+/// (pool events); its tick file is header-only. HC1: `hypercall`
+/// appended — option quote ticks, index/trade/listing events; no
+/// `venue_seq` chain (the indicative feed carries none), so no
+/// derivation arm.
+const VENUE_LABELS: [&str; 10] = [
+    "pm",
+    "bn",
+    "okx",
+    "rpc",
+    "deribit",
+    "hl",
+    "bybit",
+    "mexc",
+    "hyperevm",
+    "hypercall",
 ];
 
 /// Inter-arrival histogram bucket upper bounds (ns, exclusive). The

@@ -84,12 +84,35 @@ def _dash_ddmmmyy(name: str) -> bool:
     return bool(sep) and bool(base) and _is_ddmmmyy(tail)
 
 
+def _is_decimal(s: str) -> bool:
+    """``123`` or ``2.5`` — digits, at most one interior point."""
+    int_part, sep, frac = s.partition(".")
+    if sep:
+        return _all_digits(int_part) and _all_digits(frac)
+    return _all_digits(s)
+
+
+def _all_digits(s: str) -> bool:
+    return bool(s) and s.isascii() and s.isdigit()
+
+
+def _hypercall(name: str) -> str | None:
+    """HC1: ``<UND>-<YYYYMMDD>-<STRIKE>-<C|P>`` (decimal strikes such as
+    ``BOT-20260925-2.5-C`` included) is an option; any other name ``None``."""
+    segs = name.split("-")
+    if (len(segs) == 4 and segs[0] and _is_digits(segs[1], 8) and _is_decimal(segs[2])
+            and segs[3] in ("C", "P")):
+        return "option"
+    return None
+
+
 #: Namespaces whose every descriptor is ONE class, whatever the name.
 #: MX7: MEXC xStocks (`AAPLXUSDT`) are ordinary spot rows and its TradFi /
 #: equity / FX / metal perps (`XAU_USDT`, `AAPLSTOCK_USDT`) ordinary perps
 #: (plan D6: no new class); MEXC lists no dated futures. HYPARB H3b: a
 #: HyperEVM pool (`hyperevm:0x<address>`) trades token0 against token1
-#: outright — spot.
+#: outright — spot. HC1: ``hypercall-idx:<UND>`` is the venue's settlement
+#: index, a capture-only price series — spot.
 _FIXED_CLASS_OF_NS: dict[str, str] = {
     "binance": "spot",
     "binance-opt": "option",
@@ -97,6 +120,7 @@ _FIXED_CLASS_OF_NS: dict[str, str] = {
     "mexc": "spot",
     "mexc-perp": "perp",
     "hyperevm": "spot",
+    "hypercall-idx": "spot",
 }
 
 
@@ -122,4 +146,6 @@ def class_of_descriptor(descriptor: str) -> str | None:
         return _hyperliquid(name)
     if ns == "bybit-linear":
         return "dated" if _dash_ddmmmyy(name) else "perp"
+    if ns == "hypercall":
+        return _hypercall(name)
     return None

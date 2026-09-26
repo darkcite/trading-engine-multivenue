@@ -107,11 +107,20 @@ pub(crate) const fn pmlr_version_accepted(version: u16) -> bool {
 
 /// Per-venue tick-capture file labels, in file-ordinal order (mirrors
 /// `audit_replay::VENUE_LABELS` — the cli spawn labels exactly;
-/// `bybit` appended at WS9, `mexc` at MX2, `hyperevm` at HYPARB H3b —
-/// append, never reorder).
+/// `bybit` appended at WS9, `mexc` at MX2, `hyperevm` at HYPARB H3b,
+/// `hypercall` at HC1 — append, never reorder).
 /// `pub(crate)`: `capture_catalog` reports in this fixed order.
-pub(crate) const VENUE_LABELS: [&str; 9] = [
-    "pm", "bn", "okx", "rpc", "deribit", "hl", "bybit", "mexc", "hyperevm",
+pub(crate) const VENUE_LABELS: [&str; 10] = [
+    "pm",
+    "bn",
+    "okx",
+    "rpc",
+    "deribit",
+    "hl",
+    "bybit",
+    "mexc",
+    "hyperevm",
+    "hypercall",
 ];
 
 /// Venue labels accepted by the §4.3/§4.4 model flags, mapped to the
@@ -120,7 +129,8 @@ pub(crate) const VENUE_LABELS: [&str; 9] = [
 /// present although MEXC is NOT tradeable (O-MX1) — its stale / fee /
 /// Δ columns still have to be settable, exactly as its capture is
 /// replayable; `fill::tradeable_venue_byte` is the execution gate.
-const MODEL_VENUE_LABELS: [(&str, VenueId); 8] = [
+/// `hypercall` (HC1) is present on the same terms (data-only, O-HC1).
+const MODEL_VENUE_LABELS: [(&str, VenueId); 9] = [
     ("pm", VenueId::Polymarket),
     ("bn", VenueId::Binance),
     ("okx", VenueId::Okx),
@@ -129,6 +139,7 @@ const MODEL_VENUE_LABELS: [(&str, VenueId); 8] = [
     ("bybit", VenueId::Bybit),
     ("mexc", VenueId::Mexc),
     ("hyperevm", VenueId::HyperEvm),
+    ("hypercall", VenueId::Hypercall),
 ];
 
 /// ns per millisecond. TEST-ONLY since X1: the §4.4 default table moved
@@ -450,6 +461,10 @@ impl Default for ModelParams {
             //       network (MX9): spot 82 + 131/2 → 150 ms, futures
             //       60 + 134/2 → 130 ms; one byte, the slower class
             //       binds → 150 ms. Data-only (O-MX1) anyway.
+            //   hyperevm: one block (0.983 s measured) → 1 000 ms.
+            //   hypercall — MEASURED 2026-09-25 21:05–21:15Z, same host
+            //       and network (HC0): quote-stamp feed 64 + 114/2 →
+            //       130 ms. Data-only (O-HC1) anyway.
             // Slot 5 = Ai is dead (0). Pre-2026-09-03 the table was
             // the §4.4 assumption (pm 200 / bn·okx·deribit·bybit 100 /
             // hl 600). RE-MEASURE ON EVERY DEPLOYMENT AND LOCATION.
@@ -804,7 +819,27 @@ pub enum RecPayload {
 /// (`--member hyparb`): every other replay merges byte for byte as it
 /// always did, which is what keeps `merged_records`, the IS/OOS
 /// boundary and every pooled VM number where they were.
-const POOL_SIGNAL_LORD: u8 = 56;
+const POOL_SIGNAL_LORD: u8 = LORD_REGIME + LORD_BAND;
+
+/// Width of one `lord` band — ONE ordinal per capture label, so the
+/// label count may never reach it (HC1: the tenth label, `hypercall`,
+/// pushed the old stride of 8 past its limit — `hyperevm`'s tick lord
+/// 8 was already `pm`'s event lord and its synthetic-mark lord 48 the
+/// regime lane's). The band ORDER is unchanged (ticks < events < depth
+/// < opt < synthetic marks < regime < pool signals), so every existing
+/// replay merges byte for byte: only the gaps widened.
+const LORD_BAND: u8 = 16;
+const _: () = assert!(VENUE_LABELS.len() <= LORD_BAND as usize);
+/// Funding / asset-ctx events: `LORD_EVENTS + vi`.
+const LORD_EVENTS: u8 = LORD_BAND;
+/// Depth snapshots: `LORD_DEPTH + vi`.
+const LORD_DEPTH: u8 = 2 * LORD_BAND;
+/// OptSummary records: `LORD_OPT + vi`.
+const LORD_OPT: u8 = 3 * LORD_BAND;
+/// D-7 synthetic option mark ticks: `LORD_SYNTH_MARK + vi`.
+const LORD_SYNTH_MARK: u8 = 4 * LORD_BAND;
+/// RG3 regime frames (one lane).
+const LORD_REGIME: u8 = 5 * LORD_BAND;
 /// The capture label whose signal file carries the pool events.
 const POOL_SIGNAL_LABEL: &str = "hyperevm";
 
@@ -910,9 +945,10 @@ struct RunSummary {
 /// dropped (see `RunSummary::dropped_foreign`). Manifest-less runs
 /// pass both maps empty (identity, the legacy law).
 ///
-/// Lane ordinals (`lord`): ticks = venue index, events = 8+vi,
-/// depth = 16+vi, opt = 24+vi, synthetic mark-ticks = 40+vi — ticks
-/// sort first at equal (ts, venue), preserving the book-before-
+/// Lane ordinals (`lord`, [`LORD_BAND`] wide): ticks = venue index,
+/// events = [`LORD_EVENTS`]+vi, depth = [`LORD_DEPTH`]+vi, opt =
+/// [`LORD_OPT`]+vi, synthetic mark-ticks = [`LORD_SYNTH_MARK`]+vi —
+/// ticks sort first at equal (ts, venue), preserving the book-before-
 /// analytics reading order.
 #[allow(clippy::too_many_arguments)]
 fn load_run(
@@ -1045,7 +1081,7 @@ fn load_run(
         recs.push(MergeKeyed {
             ts_ns: c.ts_ns,
             venue: c.venue,
-            lord: 48,
+            lord: LORD_REGIME,
             idx: i as u64,
             payload: RecPayload::Regime(c),
         });
@@ -1141,7 +1177,7 @@ fn load_run(
                 recs.push(MergeKeyed {
                     ts_ns: e.ts_ns,
                     venue: e.venue,
-                    lord: 8 + vi as u8,
+                    lord: LORD_EVENTS + vi as u8,
                     idx: i as u64,
                     payload: RecPayload::Event(ev),
                 });
@@ -1170,7 +1206,7 @@ fn load_run(
                 recs.push(MergeKeyed {
                     ts_ns: d.ts_ns,
                     venue: d.venue,
-                    lord: 16 + vi as u8,
+                    lord: LORD_DEPTH + vi as u8,
                     idx: i as u64,
                     payload: RecPayload::Depth(dp),
                 });
@@ -1201,7 +1237,7 @@ fn load_run(
                 recs.push(MergeKeyed {
                     ts_ns: o.ts_ns,
                     venue: o.venue,
-                    lord: 24 + vi as u8,
+                    lord: LORD_OPT + vi as u8,
                     idx: i as u64,
                     payload: RecPayload::Opt(op),
                 });
@@ -1276,7 +1312,7 @@ fn load_run(
                         recs.push(MergeKeyed {
                             ts_ns: op.ts_ns,
                             venue: op.venue,
-                            lord: 40 + vi as u8,
+                            lord: LORD_SYNTH_MARK + vi as u8,
                             idx: i as u64,
                             payload: RecPayload::Tick(t),
                         });
@@ -1310,7 +1346,7 @@ fn load_run(
     // no underlying: the timeline is only complete once this run's
     // OptSummary records have been read. Only REAL venue ticks are
     // touched (`lord < VENUE_LABELS.len()`); the synthetic mark ticks
-    // at lord 40+ were already denominated by `synth_mark_usd_1e6` and
+    // at `LORD_SYNTH_MARK`+ were already denominated by `synth_mark_usd_1e6` and
     // must not be converted twice.
     //
     // A quote with no underlying known at or before its instant is
@@ -3374,7 +3410,8 @@ mod tests {
         assert_eq!(p.fee_bps, [[(0, 0); INSTRUMENT_CLASSES]; VENUE_COUNT]);
         // The 2026-09-03 measurement (docs/venue-latency.md §3); slot 5
         // = Ai (dead, 0), slot 6 = Bybit, slot 7 = MEXC (measured
-        // 2026-09-23, MX9). A new deployment re-measures and
+        // 2026-09-23, MX9), slot 8 = HyperEVM (one block), slot 9 =
+        // Hypercall (measured 2026-09-25, HC0). A new deployment re-measures and
         // re-pins — this test exists so the table never drifts
         // silently.
         assert_eq!(
@@ -3388,10 +3425,14 @@ mod tests {
                 0,
                 60 * MS,
                 150 * MS,
-                1_000 * MS
+                1_000 * MS,
+                130 * MS
             ]
         );
         assert_eq!(p.stale_after_ms[VenueId::Mexc as usize], 400);
+        // HC0: Hypercall's Δ and stale threshold, measured on the Mac.
+        assert_eq!(p.stale_after_ms[VenueId::Hypercall as usize], 500);
+        assert_eq!(p.opt_fee[VenueId::Hypercall as usize], OptFee::OFF);
         // HYPARB: HyperEVM's Δ is one block; its pool state is stale
         // after 2.5 s (HZ head inter-arrival p99 2.28 s).
         assert_eq!(p.stale_after_ms[VenueId::HyperEvm as usize], 2_500);
@@ -3415,11 +3456,12 @@ mod tests {
         )
         .unwrap();
         // Global latency replaced every TRADEABLE slot (the Ai dead
-        // slot stays 0 — WS9), then deribit won on top. The MEXC slot
-        // takes it too (a Δ column exists; the venue is data-only).
+        // slot stays 0 — WS9), then deribit won on top. The MEXC and
+        // Hypercall slots take it too (a Δ column exists; both venues
+        // are data-only).
         assert_eq!(
             p.latency_ns,
-            [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000, 1_000, 1_000]
+            [1_000, 1_000, 1_000, 42, 1_000, 0, 1_000, 1_000, 1_000, 1_000]
         );
         // XSD-F: a bare `<venue>:` spec sets every class of the venue.
         assert_eq!(
@@ -3467,18 +3509,21 @@ mod tests {
         let text = render_fee_table_text(&p);
         assert!(
             text.ends_with(
-                " bybit=0:0 mexc=spot:0:5,perp:1:4,dated:1:4,option:1:4,prediction:1:4 hyperevm=0:0"
+                " bybit=0:0 mexc=spot:0:5,perp:1:4,dated:1:4,option:1:4,prediction:1:4 hyperevm=0:0 \
+                 hypercall=0:0"
             ),
             "{text}"
         );
         let json = render_fee_table_json(&p);
         assert!(
             json.ends_with(
-                ",\"mexc\":{\"spot\":[0,5],\"perp\":[1,4],\"dated\":[1,4],\"option\":[1,4],\"prediction\":[1,4]},\"hyperevm\":{\"spot\":[0,0],\"perp\":[0,0],\"dated\":[0,0],\"option\":[0,0],\"prediction\":[0,0]}}"
+                ",\"mexc\":{\"spot\":[0,5],\"perp\":[1,4],\"dated\":[1,4],\"option\":[1,4],\"prediction\":[1,4]},\"hyperevm\":{\"spot\":[0,0],\"perp\":[0,0],\"dated\":[0,0],\"option\":[0,0],\"prediction\":[0,0]},\"hypercall\":{\"spot\":[0,0],\"perp\":[0,0],\"dated\":[0,0],\"option\":[0,0],\"prediction\":[0,0]}}"
             ),
             "{json}"
         );
         assert_eq!(model_venue("mexc"), Some(7));
+        // HC1: settable like MEXC (data-only; the fill gate refuses it).
+        assert_eq!(model_venue("hypercall"), Some(9));
     }
 
     #[test]

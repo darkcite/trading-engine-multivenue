@@ -6,6 +6,85 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-25 — VenueId 9 = Hypercall; tick lane 7, opt lane 3; `VENUE_COUNT` 10 (HC1)
+
+**What changed**
+
+- `VenueId` gains `Hypercall = 9`, appended; the first unassigned byte is now
+  10. `core_types::VENUE_COUNT` goes 9 → 10, so every venue-indexed table
+  grows by one slot:
+  - `VenueId::stale_after_ms_defaults`: Hypercall 500 ms (HC0: the
+    quote-stamp feed-delay p99 was 447.6 ms);
+  - `core_fill::ACTIVATION_NS_DEFAULT` / `ModelParams`: Hypercall 130 ms
+    (HC0, `docs/venue-latency.md` §3);
+  - `core-config::exec::VENUE_NAMES`: `hypercall` = 9, reserved so an
+    artifact can name it — naming it arms nothing.
+- Engine lanes:
+  - `engine::NUM_TICK_LANES` 7 → 8: `tick_lane_of(Hypercall) = 7`, for
+    option BBO ticks off the indicative feed. Event lanes follow the tick
+    geometry, so there are 8 of them.
+  - `engine::NUM_OPT_LANES` 3 → 4: `opt_lane_of(Hypercall) = 3`, for the
+    REST `/options-summary` mark row.
+  - No depth lane and no fill lane: data-only, ruling O-HC1.
+  - The bin splits the three new rings and drops their producers (the
+    unspawned-venue shape). The ingress spawn is HC5.
+- Capture and harness labels:
+  - `hypercall` is appended to the capture `VENUE_LABELS` (backtest,
+    audit-replay, audit-pnl, capture-catalog). A run without Hypercall
+    files is read exactly as before.
+  - `hypercall` is appended to the model labels: `--fee-bps hypercall:…`,
+    `--latency-ns-venue hypercall:…`, `--stale-after-ms hypercall:…`.
+  - The rendered fee table gains a trailing `hypercall` entry: text
+    ` hypercall=0:0`, JSON `"hypercall":{…}` after `"hyperevm"`.
+  - Capture-catalog `venue_ticks` arrays have 10 entries.
+- The backtest merge's lane-ordinal bands are widened from a stride of 8 to
+  16 (`LORD_BAND`). Ticks = vi, events 16+vi, depth 32+vi, opt 48+vi,
+  synthetic marks 64+vi, regime 80, pool signals 96.
+  - At the stride of 8, the ninth label (`hyperevm`) already shared tick
+    lord 8 with `pm`'s events and synthetic lord 48 with the regime lane.
+    The tenth label would have broken the `(lord, idx)` injectivity the
+    sort's totality relies on.
+  - Band ORDER is unchanged, so every existing replay merges record for
+    record as before.
+- `clob-dispatcher::PaperMatcher` refuses venue byte 9 as `unroutable`
+  explicitly. Before HC1 the byte sat past the activation table's end and
+  the length check refused it; the new slot would otherwise have made it
+  routable. `backtest::fill::tradeable_venue_byte(9)` stays `false`.
+- Descriptor law, in Rust, Python and the shared
+  `descriptor-classes.tsv`:
+  - `hypercall:<UND>-<YYYYMMDD>-<STRIKE>-<C|P>` → `option`. Decimal strikes
+    are allowed; any other name → `none`.
+  - `hypercall-idx:<UND>` → `spot`: the settlement index, capture-only.
+
+**Why**
+
+- Hypercall integration, data-only (plan
+  `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
+  rulings O-HC1…O-HC10). HC1 is identity and lanes only. The venue is
+  present but unconfigured: no ingress thread, no `[hypercall]` section
+  yet (HC4 and HC5).
+
+**Impact**
+
+- **On-disk formats:** no PMLR bump. A new venue byte is not a slot-layout
+  change. No `hypercall-*.pmlr` file exists until HC5.
+- **Config keys:** `exec.toml` venue names accept `hypercall`; nothing arms
+  it. `--stale-after-ms` / `--fee-bps` / `--latency-ns-venue` accept the
+  `hypercall` label.
+- **Wire formats:** `VenueId` byte 9 is assigned.
+- **Memory:** three more preallocated rings (tick 1 MiB, event, opt) that
+  nothing produces into. The engine drains them empty: two atomic loads
+  per lane per iteration.
+
+**Migration steps**
+
+1. None. A boot with no `[hypercall]` section is the pre-HC1 boot in
+   behaviour.
+
+**Rollback**
+
+- Revert the HC1 commit. There is no data or config migration to undo.
+
 ## 2026-09-24 — `scripts/bin15-flip.sh`: slot 3 PAPER ⇄ LIVE in one command (BIN15 S7-L1)
 
 **What changed**

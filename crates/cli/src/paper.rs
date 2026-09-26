@@ -545,7 +545,7 @@ const _: () = {
 pub struct Rings {
     /// One tick ring per venue lane, indexed by `engine::tick_lane_of`
     /// (0 = Polymarket, 1 = Binance, 2 = OKX, 3 = Deribit,
-    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC). Lanes without a spawned
+    /// 4 = Hyperliquid, 5 = Bybit, 6 = MEXC, 7 = Hypercall). Lanes without a spawned
     /// ingress simply never see a producer push — the engine drains
     /// them empty.
     pub tick: [Arc<Ring<Tick, TICK_RING_SIZE>>; NUM_TICK_LANES],
@@ -584,9 +584,9 @@ pub struct Rings {
     pub depth: [Arc<Ring<DepthTopK, DEPTH_RING_SIZE>>; engine::NUM_DEPTH_LANES],
     /// VM2 V2: one options-summary ring per opt lane
     /// (`engine::opt_lane_of` order: 0 = OKX, 1 = Deribit,
-    /// 2 = Binance eapi). Producers ride into the three
-    /// options-capable spawns; without an options subscription the
-    /// lane reads empty forever (§3.3).
+    /// 2 = Binance eapi, 3 = Hypercall REST summary — HC1). Producers
+    /// ride into the options-capable spawns; without an options
+    /// subscription the lane reads empty forever (§3.3).
     pub opt: [Arc<Ring<OptSummary, OPT_RING_SIZE>>; engine::NUM_OPT_LANES],
 }
 
@@ -595,6 +595,7 @@ impl Rings {
     pub fn new() -> Self {
         Self {
             tick: [
+                Ring::new(),
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
@@ -616,9 +617,10 @@ impl Rings {
                 Ring::new(),
                 Ring::new(),
                 Ring::new(),
+                Ring::new(),
             ],
             depth: [Ring::new(), Ring::new()],
-            opt: [Ring::new(), Ring::new(), Ring::new()],
+            opt: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
         }
     }
 }
@@ -3884,8 +3886,9 @@ impl Observability {
 /// byte — the venue defaults (`VenueId::default_stale_after_ms`,
 /// docs/venue-time-capture-plan.md §2 doctrine 4) overridden by
 /// repeatable `--stale-after-ms <venue>:<ms>` specs (labels as the
-/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`). A
-/// zero disables the judgement for that venue (nothing is ever stale).
+/// harness flags: `pm`/`bn`/`okx`/`deribit`/`hl`/`bybit`/`mexc`/
+/// `hyperevm`/`hypercall`). A zero disables the judgement for that
+/// venue (nothing is ever stale).
 pub fn parse_stale_after_ms(specs: &[String]) -> Result<[u32; core_types::VENUE_COUNT], String> {
     let mut table = VenueId::stale_after_ms_defaults();
     for spec in specs {
@@ -9754,47 +9757,13 @@ mod tests {
     /// halves, dropping the producers (the "unspawned venue"
     /// shape). Returns engine-ready `Consumers`.
     fn split_all_consumers(rings: &Rings) -> Consumers {
-        let tick_lanes = {
-            let mut it = rings.tick.iter().map(|r| r.clone().split().1);
-            [
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-            ]
-        };
-        let fill_lanes = {
-            let mut it = rings.fill.iter().map(|r| r.clone().split().1);
-            [
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-            ]
-        };
-        let event_lanes = {
-            let mut it = rings.event.iter().map(|r| r.clone().split().1);
-            [
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-                it.next().unwrap(),
-            ]
-        };
-        let depth_lanes = {
-            let mut it = rings.depth.iter().map(|r| r.clone().split().1);
-            [it.next().unwrap(), it.next().unwrap()]
-        };
-        let opt_lanes = {
-            let mut it = rings.opt.iter().map(|r| r.clone().split().1);
-            [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()]
-        };
+        // Built over each lane array's own length (HC1: the eighth tick
+        // lane and fourth opt lane are not an edit here).
+        let tick_lanes = core::array::from_fn(|i| rings.tick[i].clone().split().1);
+        let fill_lanes = core::array::from_fn(|i| rings.fill[i].clone().split().1);
+        let event_lanes = core::array::from_fn(|i| rings.event[i].clone().split().1);
+        let depth_lanes = core::array::from_fn(|i| rings.depth[i].clone().split().1);
+        let opt_lanes = core::array::from_fn(|i| rings.opt[i].clone().split().1);
         Consumers {
             tick_lanes,
             event_lanes,

@@ -76,6 +76,10 @@ pub enum VenueId {
     /// AMM swaps judged by `core-fill` (paper) and, behind the O-H5/O-H12
     /// interlock, sent to TESTNET only.
     HyperEvm = 8,
+    /// HC1 (O-HC1): Hypercall — cash-settled options on HL oracles
+    /// (`ingress-hypercall`, public `indicative_market_data` WS + REST
+    /// `/options-summary`). Data-only: no exec arm until its own ruling.
+    Hypercall = 9,
 }
 
 impl VenueId {
@@ -99,6 +103,7 @@ impl VenueId {
             6 => Some(Self::Bybit),
             7 => Some(Self::Mexc),
             8 => Some(Self::HyperEvm),
+            9 => Some(Self::Hypercall),
             _ => None,
         }
     }
@@ -132,6 +137,12 @@ impl VenueId {
             // could have changed it; rounded up. Override:
             // `--stale-after-ms hyperevm:<ms>`.
             Self::HyperEvm => 2_500,
+            // HC0 (2026-09-25 21:05–21:15Z, the Mac; docs/venue-latency.md
+            // §3): the option quote tick carries the quote's own
+            // `timestamp` (plan D4), whose feed-delay p99 is 447.6 ms
+            // (n 10 159) — rounded up. (`published_at`, the wire leg
+            // alone, is 217.9.) Override: `--stale-after-ms hypercall:<ms>`.
+            Self::Hypercall => 500,
         }
     }
 
@@ -149,6 +160,7 @@ impl VenueId {
             Self::Bybit.default_stale_after_ms(),
             Self::Mexc.default_stale_after_ms(),
             Self::HyperEvm.default_stale_after_ms(),
+            Self::Hypercall.default_stale_after_ms(),
         ]
     }
 }
@@ -157,8 +169,8 @@ impl VenueId {
 /// the venue byte (stale thresholds, the fill model's fee / Δ / activation
 /// columns, the matcher's activation table). HYPARB (O-H11) introduced it
 /// when HyperEVM took byte 8: the next venue is ONE edit here plus its
-/// arms, not a sweep of literal `8`s.
-pub const VENUE_COUNT: usize = 9;
+/// arms, not a sweep of literal `8`s. HC1: Hypercall took byte 9.
+pub const VENUE_COUNT: usize = 10;
 const _: () = assert!(
     VenueId::from_u8(VENUE_COUNT as u8 - 1).is_some()
         && VenueId::from_u8(VENUE_COUNT as u8).is_none()
@@ -3222,7 +3234,11 @@ pub const fn funding_period_s(venue: VenueId) -> u32 {
     match venue {
         VenueId::Binance | VenueId::Okx | VenueId::Bybit | VenueId::Mexc => 28_800,
         VenueId::Hyperliquid => 3_600,
-        VenueId::Polymarket | VenueId::Deribit | VenueId::Ai | VenueId::HyperEvm => 0,
+        VenueId::Polymarket
+        | VenueId::Deribit
+        | VenueId::Ai
+        | VenueId::HyperEvm
+        | VenueId::Hypercall => 0,
     }
 }
 
@@ -3817,6 +3833,7 @@ mod tests {
             VenueId::Bybit,
             VenueId::Mexc,
             VenueId::HyperEvm,
+            VenueId::Hypercall,
         ];
         assert_eq!(all.len(), VENUE_COUNT);
         let mut i = 0;
@@ -3826,13 +3843,14 @@ mod tests {
         }
         assert_eq!(VenueId::Mexc.to_u8(), 7);
         assert_eq!(VenueId::HyperEvm.to_u8(), 8);
+        assert_eq!(VenueId::Hypercall.to_u8(), 9);
     }
 
     #[test]
     fn venue_id_rejects_unknown_bytes() {
-        // 6 became Bybit at WS9, 7 MEXC at MX2 and 8 HyperEvm at
-        // HYPARB — the first unassigned byte is now 9.
-        assert_eq!(VenueId::from_u8(9), None);
+        // 6 became Bybit at WS9, 7 MEXC at MX2, 8 HyperEvm at HYPARB
+        // and 9 Hypercall at HC1 — the first unassigned byte is now 10.
+        assert_eq!(VenueId::from_u8(10), None);
         assert_eq!(VenueId::from_u8(254), None);
         // 255 is the venue byte of SYMBOL_ID_NONE — must never decode.
         assert_eq!(VenueId::from_u8(255), None);
@@ -4039,6 +4057,8 @@ mod tests {
         assert_eq!(VenueId::Mexc.default_stale_after_ms(), 400);
         // HYPARB: HZ head inter-arrival p99 2 281 ms rounded up.
         assert_eq!(VenueId::HyperEvm.default_stale_after_ms(), 2_500);
+        // HC0: the quote-stamp feed-delay p99 447.6 ms rounded up.
+        assert_eq!(VenueId::Hypercall.default_stale_after_ms(), 500);
     }
 
     #[test]
@@ -5631,6 +5651,8 @@ mod vm2_v1_tests {
         assert_eq!(funding_print_divisor(VenueId::Ai), 1);
         assert_eq!(funding_print_divisor(VenueId::Bybit), 1);
         assert_eq!(funding_print_divisor(VenueId::Mexc), 1);
+        assert_eq!(funding_print_divisor(VenueId::HyperEvm), 1);
+        assert_eq!(funding_print_divisor(VenueId::Hypercall), 1);
     }
 
     #[test]
@@ -5647,6 +5669,9 @@ mod vm2_v1_tests {
         assert_eq!(funding_period_s(VenueId::Deribit), 0);
         assert_eq!(funding_period_s(VenueId::Polymarket), 0);
         assert_eq!(funding_period_s(VenueId::Ai), 0);
+        assert_eq!(funding_period_s(VenueId::HyperEvm), 0);
+        // HC1: options carry no funding.
+        assert_eq!(funding_period_s(VenueId::Hypercall), 0);
     }
 
     #[test]

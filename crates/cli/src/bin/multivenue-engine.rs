@@ -3149,6 +3149,9 @@ fn run(args: RunArgs) -> ExitCode {
     let (bybit_prod, bybit_lane_cons) = rings.tick[5].clone().split();
     // MX2: lane 6 = MEXC (VenueId 7, engine::tick_lane_of).
     let (mexc_prod, mexc_lane_cons) = rings.tick[6].clone().split();
+    // HC1: lane 7 = Hypercall (VenueId 9 — HyperEvm, 8, has no tick
+    // lane; engine::tick_lane_of).
+    let (hypercall_prod, hypercall_lane_cons) = rings.tick[7].clone().split();
     // WS10-A: venue-event lanes, tick-lane indexing. Producers ride
     // into the four funding-capable venue spawns; PM (0) and the
     // spare lane 4 producer for HL are dropped — HL carries premium
@@ -3159,6 +3162,7 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_event_prod, deribit_event_cons) = rings.event[3].clone().split();
     let (bybit_event_prod, bybit_event_cons) = rings.event[5].clone().split();
     let (mexc_event_prod, mexc_event_cons) = rings.event[6].clone().split();
+    let (hypercall_event_prod, hypercall_event_cons) = rings.event[7].clone().split();
     let (_pm_event_prod, pm_event_cons) = rings.event[0].clone().split();
     // VM2 V2: HL gained its event lane — funding rides AssetCtx.
     let (hl_event_prod, hl_event_cons) = rings.event[4].clone().split();
@@ -3170,6 +3174,7 @@ fn run(args: RunArgs) -> ExitCode {
         hl_event_cons,
         bybit_event_cons,
         mexc_event_cons,
+        hypercall_event_cons,
     ];
     // WS10-B: depth lanes (engine::depth_lane_of order — okx 0,
     // deribit 1). Producers ride into the two depth-capable spawns.
@@ -3177,12 +3182,18 @@ fn run(args: RunArgs) -> ExitCode {
     let (deribit_depth_prod, deribit_depth_cons) = rings.depth[1].clone().split();
     let depth_lane_cons = [okx_depth_cons, deribit_depth_cons];
     // VM2 V2: options-summary lanes (engine::opt_lane_of order —
-    // okx 0, deribit 1, binance 2). Producers ride into the three
-    // options-capable spawns.
+    // okx 0, deribit 1, binance 2, hypercall 3 — HC1). Producers ride
+    // into the options-capable spawns.
     let (okx_opt_prod, okx_opt_cons) = rings.opt[0].clone().split();
     let (deribit_opt_prod, deribit_opt_cons) = rings.opt[1].clone().split();
     let (bn_opt_prod, bn_opt_cons) = rings.opt[2].clone().split();
-    let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
+    let (hypercall_opt_prod, hypercall_opt_cons) = rings.opt[3].clone().split();
+    let opt_lane_cons = [
+        okx_opt_cons,
+        deribit_opt_cons,
+        bn_opt_cons,
+        hypercall_opt_cons,
+    ];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
     // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
@@ -3902,6 +3913,14 @@ fn run(args: RunArgs) -> ExitCode {
         drop(mexc_event_prod);
     }
 
+    // -- Hypercall (HC1: identity and lanes only; the ingress spawn is
+    // HC5). The three producers are dropped — permanently-empty rings
+    // (the unspawned-venue shape, §3.3), so this boot is the pre-HC1
+    // boot, bit for bit. --
+    drop(hypercall_prod);
+    drop(hypercall_event_prod);
+    drop(hypercall_opt_prod);
+
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
             Ok(rpc_ep) => {
@@ -4083,6 +4102,7 @@ fn run(args: RunArgs) -> ExitCode {
             hl_lane_cons,
             bybit_lane_cons,
             mexc_lane_cons,
+            hypercall_lane_cons,
         ],
         event_lanes: event_lane_cons,
         depth_lanes: depth_lane_cons,

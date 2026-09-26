@@ -1358,10 +1358,11 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
 
     // The lane arrays below are written out for the lane geometry
-    // (seven tick lanes since MX2 added MEXC at lane 6, after WS9's
-    // Bybit at lane 5; four fill lanes); break the build loudly if
-    // that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 4);
+    // (eight tick lanes since HC1 added Hypercall at lane 7, after
+    // MX2's MEXC at lane 6 and WS9's Bybit at lane 5; four opt lanes
+    // since HC1; four fill lanes); break the build loudly if that
+    // drifts.
+    const _: () = assert!(NUM_TICK_LANES == 8 && engine::NUM_OPT_LANES == 4 && NUM_FILL_LANES == 4);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1382,8 +1383,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // unused inside this test fixture.
     let _ = std::marker::PhantomData::<SubmitErr>;
 
-    // Lane arrays: seven tick lanes (Polymarket, Binance, OKX,
-    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2) + four fill lanes. Only
+    // Lane arrays: eight tick lanes (Polymarket, Binance, OKX,
+    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2, Hypercall — HC1)
+    // + four fill lanes. Only
     // lane 0 (Polymarket) gets a live producer here; the unused
     // producer halves stay alive until end of scope, and their lanes
     // simply read empty every iteration.
@@ -1394,11 +1396,12 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_t4p, t4) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t5p, t5) = Ring::<Tick, TICK_RING_SIZE>::new().split();
     let (_t6p, t6) = Ring::<Tick, TICK_RING_SIZE>::new().split();
-    // WS10-A: seven venue-event lanes ride in every engine. Lane 2
+    let (_t7p, t7) = Ring::<Tick, TICK_RING_SIZE>::new().split();
+    // WS10-A: eight venue-event lanes ride in every engine. Lane 2
     // (OKX) gets a live producer — the measured window below pushes
     // one funding ChannelEvent per iteration and the engine drains
     // it through `on_venue_event`, proving lane push + drain are
-    // 0 B/op; the other six read empty (two atomic loads each).
+    // 0 B/op; the other seven read empty (two atomic loads each).
     let (mut ev2_p, e2) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e0p, e0) =
@@ -1413,6 +1416,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     let (_e6p, e6) =
         Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
+    let (_e7p, e7) =
+        Ring::<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>::new().split();
     // WS10-B: two depth lanes; lane 0 (OKX) live — the measured
     // window pushes one DepthTopK per iteration and the engine
     // drains it through `on_depth` (192 B Copy slot, 0 B/op).
@@ -1424,6 +1429,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_o0p, o0) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o1p, o1) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_o2p, o2) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
+    let (_o3p, o3) = Ring::<core_types::OptSummary, { core_types::OPT_RING_SIZE }>::new().split();
     let (_sp, sc) = Ring::<core_types::Signal, SIGNAL_RING_SIZE>::new().split();
     let (_f0p, f0) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
@@ -1444,10 +1450,10 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let mut eng = Engine::new(
         NoopStrat,
         PaperDispatcher::new(),
-        [t0, t1, t2, t3, t4, t5, t6],
-        [e0, e1, e2, e3, e4, e5, e6],
+        [t0, t1, t2, t3, t4, t5, t6, t7],
+        [e0, e1, e2, e3, e4, e5, e6, e7],
         [d0, d1],
-        [o0, o1, o2],
+        [o0, o1, o2, o3],
         sc,
         [f0, f1, f2, f3],
         ai_c,
