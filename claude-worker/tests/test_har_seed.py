@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Anton (darkcite)
-"""har_seed -- the long-tenor HAR over candles.db (HAR H2).
+"""har_seed -- the long-tenor HAR over candles.db (HAR H2, H3.1).
 
-Pins the three properties that make the lanes trustworthy: the replay is
-the engine's law on exactly the stored closes, the seed file round-trips
-into an engine that forecasts and continues identically, and nothing at
-or after ``now`` is ever read.
+Pins the properties that make the lanes trustworthy: the replay is the
+engine's law on exactly the stored closes, the seed file round-trips into
+an engine that forecasts and continues identically, nothing at or after
+``now`` is ever read, the ordered fallbacks each fill only before the next
+newer source, and no return is ever formed across a source boundary.
 
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
 import pathlib
 import sqlite3
+
+import pytest
 
 import claude_worker.har_seed
 import claude_worker.vol_ref
@@ -163,10 +166,15 @@ def test_the_fallback_fills_only_before_the_primary(tmp_path: pathlib.Path) -> N
     now = _T0 + 60 * _DAY_MS
     conn = _db(tmp_path / "candles.db", {"binance:btcusdt": spot, "binance-usdm:btcusdt": usdm})
     engine, stats = claude_worker.har_seed.replay(
-        conn, "binance-usdm:btcusdt", now, days=60, fallback="binance:btcusdt"
+        conn, "binance-usdm:btcusdt", now, days=60, fallbacks=("binance:btcusdt",)
     )
     assert stats.from_fallback == 40 * 1440
     assert stats.minutes == 60 * 1440
+    assert stats.splices == 1
+    assert [(s.descriptor, s.minutes) for s in stats.spans] == [
+        ("binance:btcusdt", 40 * 1440),
+        ("binance-usdm:btcusdt", 20 * 1440),
+    ]
     assert engine.n_resident() == 59 and engine.is_warm()
     # The fallback's seed round-trips like any other.
     out = tmp_path / "fb.tsv"
@@ -229,3 +237,198 @@ def test_the_lanes_print_and_write(tmp_path: pathlib.Path, capsys) -> None:
     ]
     assert claude_worker.har_seed.main(argv) == 0
     assert "45 full day(s)" in capsys.readouterr().out
+
+
+def _fed_with_splices(spans: list[list[tuple[int, int]]]) -> claude_worker.vol_ref.LongVolEngine:
+    """The splice law by hand: each span's first minute only primes."""
+    e = claude_worker.vol_ref.LongVolEngine()
+    for k, closes in enumerate(spans):
+        if k > 0:
+            e.prev_px_1e6 = 0
+        for ts, px in closes:
+            e.on_minute_close_at(px, ts)
+    return e
+
+
+def test_the_fallbacks_fill_in_order_and_no_return_crosses_a_boundary(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Three sources of one path: the oldest from day 0, the middle one at
+    TEN TIMES the level from day 20 (the ``xyz`` index against SPY), the
+    feed from day 40. Each fills only before the next newer one's first
+    minute, and the level jump never enters a day's sum."""
+    path = _walk(60, 29)
+    oldest = path
+    middle = [(ts, px * 10) for ts, px in path if ts >= _T0 + 20 * _DAY_MS]
+    feed = [c for c in path if c[0] >= _T0 + 40 * _DAY_MS]
+    conn = _db(tmp_path / "candles.db", {"old:a": oldest, "mid:a": middle, "feed:a": feed})
+    now = _T0 + 60 * _DAY_MS
+    engine, stats = claude_worker.har_seed.replay(
+        conn, "feed:a", now, days=60, fallbacks=("mid:a", "old:a")
+    )
+    assert [(s.descriptor, s.minutes) for s in stats.spans] == [
+        ("old:a", 20 * 1440),
+        ("mid:a", 20 * 1440),
+        ("feed:a", 20 * 1440),
+    ]
+    assert (stats.splices, stats.from_fallback, stats.minutes) == (2, 40 * 1440, 60 * 1440)
+    by_hand = _fed_with_splices(
+        [
+            [c for c in oldest if c[0] < _T0 + 20 * _DAY_MS],
+            [c for c in middle if c[0] < _T0 + 40 * _DAY_MS],
+            feed,
+        ]
+    )
+    assert _forecasts(engine) == _forecasts(by_hand)
+    # A return is scale-free, so with no return across a boundary the one
+    # path's day sums are the single-source replay's, less one return on
+    # each boundary day.
+    single, _ = claude_worker.har_seed.replay(conn, "old:a", now, days=60)
+    days = {engine.day_at(i)[0]: engine.day_at(i)[1:] for i in range(engine.n_resident())}
+    ref = {single.day_at(i)[0]: single.day_at(i)[1:] for i in range(single.n_resident())}
+    for d, (sq, n) in days.items():
+        boundary = d in (_T0 + 20 * _DAY_MS, _T0 + 40 * _DAY_MS)
+        assert n == ref[d][1] - (1 if boundary else 0)
+        assert sq <= ref[d][0] and (boundary or sq == ref[d][0])
+
+
+def test_a_source_with_no_rows_passes_its_bound_on(tmp_path: pathlib.Path) -> None:
+    path = _walk(40, 31)
+    feed = [c for c in path if c[0] >= _T0 + 30 * _DAY_MS]
+    conn = _db(tmp_path / "candles.db", {"old:a": path, "feed:a": feed})
+    now = _T0 + 40 * _DAY_MS
+    engine, stats = claude_worker.har_seed.replay(
+        conn, "feed:a", now, days=40, fallbacks=("absent:a", "old:a")
+    )
+    assert [(s.descriptor, s.minutes) for s in stats.spans] == [
+        ("old:a", 30 * 1440),
+        ("feed:a", 10 * 1440),
+    ]
+    assert stats.splices == 1 and engine.is_warm()
+
+
+def _toml(path: pathlib.Path) -> pathlib.Path:
+    path.write_text(
+        '[[series]]\nname = "BTC"\nfeed = "binance-usdm:btcusdt"\nfallback = ["binance:btcusdt"]\n'
+        '[[series]]\nname = "ETH"\nfeed = "binance-usdm:ethusdt"\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_seed_out_har_toml_writes_every_series(tmp_path: pathlib.Path) -> None:
+    spot = _walk(50, 37)
+    usdm = [c for c in _walk(50, 41) if c[0] >= _T0 + 30 * _DAY_MS]
+    db = tmp_path / "candles.db"
+    _db(
+        db,
+        {
+            "binance:btcusdt": spot,
+            "binance-usdm:btcusdt": usdm,
+            "binance-usdm:ethusdt": _walk(50, 43),
+        },
+    ).close()
+    toml = _toml(tmp_path / "har.toml")
+    out_dir = tmp_path / "har"
+    now = _T0 + 50 * _DAY_MS
+    argv = [
+        "seed-out",
+        "--db",
+        str(db),
+        "--har-toml",
+        str(toml),
+        "--now-ms",
+        str(now),
+        "--out-dir",
+        str(out_dir),
+    ]
+    assert claude_worker.har_seed.main(argv) == 0
+    assert sorted(p.name for p in out_dir.iterdir()) == ["seed-BTC.tsv", "seed-ETH.tsv"]
+    btc = (out_dir / "seed-BTC.tsv").read_text(encoding="utf-8").splitlines()
+    assert btc[0].startswith("# har-seed.tsv v1 (HAR H3) -- BTC: feed binance-usdm:btcusdt")
+    spans = [line.split() for line in btc if line.startswith("# span ")]
+    assert [(s[2], int(s[5])) for s in spans] == [
+        ("binance:btcusdt", 30 * 1440),
+        ("binance-usdm:btcusdt", 20 * 1440),
+    ]
+    conn = sqlite3.connect(db)
+    engine, _ = claude_worker.har_seed.replay(
+        conn, "binance-usdm:btcusdt", now, fallbacks=("binance:btcusdt",)
+    )
+    assert _forecasts(_load(out_dir / "seed-BTC.tsv")) == _forecasts(engine)
+    # --series narrows; a series with no minutes writes nothing and fails the run.
+    (out_dir / "seed-ETH.tsv").unlink()
+    argv_eth = [*argv, "--series", "ETH"]
+    assert claude_worker.har_seed.main(argv_eth) == 0
+    assert (out_dir / "seed-ETH.tsv").exists()
+    empty = tmp_path / "empty.db"
+    _db(empty, {}).close()
+    argv[2] = str(empty)
+    before = (out_dir / "seed-BTC.tsv").read_bytes()
+    assert claude_worker.har_seed.main(argv) == 1
+    assert (out_dir / "seed-BTC.tsv").read_bytes() == before, "a failed cut keeps the last seed"
+
+
+def test_show_and_compare_har_toml(tmp_path: pathlib.Path, capsys) -> None:
+    spot = _walk(50, 47)
+    db = tmp_path / "candles.db"
+    _db(
+        db,
+        {
+            "binance:btcusdt": spot,
+            "binance-usdm:btcusdt": spot,
+            "binance-usdm:ethusdt": _walk(50, 53),
+        },
+    ).close()
+    toml = _toml(tmp_path / "har.toml")
+    now = str(_T0 + 50 * _DAY_MS)
+    assert (
+        claude_worker.har_seed.main(
+            ["show", "--db", str(db), "--har-toml", str(toml), "--now-ms", now]
+        )
+        == 0
+    )
+    shown = capsys.readouterr().out
+    assert "har-seed BTC: " in shown and "har-seed ETH: " in shown and shown.count("\n30d\t") == 2
+    assert (
+        claude_worker.har_seed.main(
+            ["compare", "--db", str(db), "--har-toml", str(toml), "--now-ms", now]
+        )
+        == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith(
+        "har-seed compare BTC binance-usdm:btcusdt vs binance:btcusdt: 50 full day(s)"
+    )
+    assert lines[0].endswith("median ln vol ratio +0.0000")
+    assert lines[1] == "har-seed compare ETH binance-usdm:ethusdt: no fallback"
+
+
+def test_the_store_is_read_never_created_or_written(tmp_path: pathlib.Path) -> None:
+    absent = tmp_path / "absent.db"
+    argv = ["show", "--db", str(absent), "--descriptor", "binance:btcusdt", "--now-ms", str(_T0)]
+    assert claude_worker.har_seed.main(argv) == 2
+    assert not absent.exists()
+    db = tmp_path / "candles.db"
+    _db(db, {"s": _walk(2, 59)}).close()
+    conn = claude_worker.har_seed.connect_store(db)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("DELETE FROM candles")
+    finally:
+        conn.close()
+
+
+def test_the_cli_refuses_mixed_selectors(tmp_path: pathlib.Path) -> None:
+    toml = _toml(tmp_path / "har.toml")
+    with pytest.raises(SystemExit):
+        claude_worker.har_seed.main(["show", "--har-toml", str(toml), "--fallback", "x:y"])
+    with pytest.raises(SystemExit):
+        claude_worker.har_seed.main(["show", "--har-toml", str(toml), "--descriptor", "x:y"])
+    with pytest.raises(SystemExit):
+        claude_worker.har_seed.main(["seed-out", "--descriptor", "x:y"])
+    with pytest.raises(SystemExit):
+        claude_worker.har_seed.main(["compare", "--descriptor", "x:y"])
+    bad = tmp_path / "bad.toml"
+    bad.write_text('[[series]]\nname = "x"\n', encoding="utf-8")
+    assert claude_worker.har_seed.main(["show", "--har-toml", str(bad)]) == 2
