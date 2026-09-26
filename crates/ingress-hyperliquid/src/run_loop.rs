@@ -260,7 +260,9 @@ pub struct Driver {
     /// BIN15 O2: rolling HIP-4 families. Empty ⇒ every path below is
     /// the pre-BIN15 one, bit for bit.
     families: HlFamilyTable,
-    /// Roll counters, shared with `/metrics`.
+    /// Roll counters and the O8 one-sided-`bbo` count, shared with
+    /// `/metrics` — a private, unpublished slot until
+    /// [`Self::set_families`] hands over the published one.
     roll_status: Arc<HlRollStatus>,
     /// BIN15 O2: the boot's monotonic↔wall anchor.
     ///
@@ -300,7 +302,9 @@ pub struct Driver {
     depth: Box<[DepthPair]>,
     /// Set once the post-upgrade subscribe frames have been queued.
     subscribed: bool,
-    /// Set once `found == expected` (staleness armed at that edge).
+    /// Set once every expected ack is in — `found & expected ==
+    /// expected`, and the same for the global bits (staleness armed at
+    /// that edge).
     verified: bool,
     /// VT2: this connection's venue-clock offset estimator + staleness
     /// judge for `bbo` (`time`, ms — block-paced, so the 700 ms default
@@ -360,7 +364,8 @@ impl Driver {
         }
     }
 
-    /// BIN15 O2: attach the rolling families and their counter slot.
+    /// BIN15 O2: attach the rolling families and the counter slot
+    /// `/metrics` reads (the rolls, and the O8 one-sided-`bbo` drop).
     ///
     /// Boot-time only, before the first connect. A driver that never
     /// gets this call has no families, takes no roll path and is
@@ -1125,8 +1130,11 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
 
 /// Post-drain health check for a `Steady` session.
 ///
-/// * Ack verification: once `found == expected`, marks the session
-///   verified and arms the staleness monitor. A session still
+/// * Ack verification: once every expected subscription is acked
+///   (`found & expected == expected` and the same for the global bits
+///   — masked, as a roll can ack rows the sweep never expected), marks
+///   the session verified and arms the staleness monitor, expired
+///   instances left out. A session still
 ///   unverified past the ack budget returns
 ///   `Some(`[`RunResult::Error`]`)` (fail-fast; no debug assert —
 ///   module doc).
@@ -1235,6 +1243,10 @@ enum Dispatch {
     VenueError,
     /// `bbo` push became the phase-1 tick.
     Bbo,
+    /// BIN15 O8: a HIP-4 outcome leg's one-sided `bbo` (its ask
+    /// `null`) — well-formed, dropped by policy, counted on its own
+    /// (`HlRollStatus::outcome_bbo_one_sided`), never as a rejection.
+    OutcomeBboOneSided,
     /// `l2Book` snapshot header (staleness food), plus — BIN15 O8 —
     /// the touch it yields for a HIP-4 outcome leg, whose `bbo` the
     /// venue publishes one-sided: `touch` says the phase-1 tick holds
@@ -1629,7 +1641,12 @@ fn handle_data_frame<C: Capture>(
                                     // Kept as a CONDITION rather than a
                                     // blanket skip so the moment the venue
                                     // publishes both sides, bbo resumes
-                                    // being the faster source.
+                                    // being the faster source. Counted on
+                                    // its own, not as a rejection: routed
+                                    // through `Nothing` it was ~1.5/s of
+                                    // `parse_errors_total` (probed
+                                    // 2026-09-26), each one tapped as a
+                                    // reject.
                                     Some(f)
                                         if f.ask_px_1e6 == 0
                                             && drv
@@ -1637,7 +1654,7 @@ fn handle_data_frame<C: Capture>(
                                                 .get(coin_idx)
                                                 .is_some_and(|(c, _)| is_outcome_coin(c)) =>
                                     {
-                                        Dispatch::Nothing
+                                        Dispatch::OutcomeBboOneSided
                                     }
                                     Some(f) => {
                                         // VT2: one parse-complete stamp
@@ -1848,6 +1865,10 @@ fn handle_data_frame<C: Capture>(
             capture.parse_reject(now_ns(), &drv.rx.filled()[reject_range]);
         }
         Dispatch::Quiet => {}
+        Dispatch::OutcomeBboOneSided => {
+            status.add_msgs(1);
+            drv.roll_status.inc_outcome_bbo_one_sided();
+        }
         Dispatch::SubAck { id, kind, bit } => {
             status.add_msgs(1);
             match bit {
@@ -2776,7 +2797,8 @@ mod tests {
     /// the same second had six asks, best `0.69`. Before this every
     /// outcome tick pinned `ask = 0`, so `Touch::actionable` was false
     /// on every reprice and bin15 skipped 2,938 times in 27 minutes
-    /// without submitting a single order.
+    /// without submitting a single order. The drop is counted on its
+    /// own, never as a parse error (2026-09-26).
     #[test]
     fn a_one_sided_outcome_bbo_is_dropped_and_l2book_carries_the_touch() {
         let mut t = TestTransport::with_capacity(8192);
@@ -2790,11 +2812,35 @@ mod tests {
             &mut t,
             br##"{"channel":"bbo","data":{"coin":"#330","time":1789252917210,"bbo":[{"px":"0.5","sz":"64.0","n":1},null]}}"##,
         );
-        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut NullCapture).unwrap();
+        let mut cap = CountingCapture::default();
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
         assert!(
             cons.try_pop_ref().is_none(),
             "a one-sided outcome touch must never reach the ring"
         );
+        // …and it is a well-formed frame dropped by policy, not a
+        // rejection: its own counter, no parse error, no reject tap —
+        // and no tick either, which would keep the last-tick age fresh
+        // and reset the backoff on frames the lane throws away.
+        assert_eq!(d.roll_status.outcome_bbo_one_sided(), 1);
+        assert_eq!(status.parse_errors_total(), 0);
+        assert_eq!(status.msgs_total(), 1);
+        assert_eq!(status.ticks_total(), 0);
+        assert_eq!(cap.ticks, 0);
+        assert_eq!(cap.rejects, 0, "a policy drop is never tapped as a reject");
+        assert_eq!(cap.raw_frames, 1, "still tapped raw, like every frame");
+
+        // A bbo with BOTH sides null is no drop but a parse failure: one
+        // rejection, one reject tap, the O8 count untouched.
+        inject_text(
+            &mut t,
+            br##"{"channel":"bbo","data":{"coin":"#330","time":1789252917211,"bbo":[null,null]}}"##,
+        );
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.parse_errors_total(), 1);
+        assert_eq!(cap.rejects, 1);
+        assert_eq!(d.roll_status.outcome_bbo_one_sided(), 1);
+        assert!(cons.try_pop_ref().is_none());
 
         // (2) The l2Book snapshot carries the real two-sided touch.
         inject_text(
@@ -2854,6 +2900,11 @@ mod tests {
             .expect("a two-sided outcome bbo is still a tick");
         assert_eq!(tick.bid_px.raw(), 510_000);
         assert_eq!(tick.ask_px.raw(), 680_000);
+        assert_eq!(
+            d.roll_status.outcome_bbo_one_sided(),
+            1,
+            "only the one-sided push was counted as dropped"
+        );
     }
 
     #[test]

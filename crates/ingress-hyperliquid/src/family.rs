@@ -931,18 +931,20 @@ mod tests {
 // ---------------------------------------------------------------
 
 /// Roll counters shared between the ingress thread (single writer)
-/// and the metrics reader.
+/// and the metrics reader — plus the one other HIP-4 venue fact
+/// counted here, the outcome legs' one-sided `bbo` drop (BIN15 O8).
 ///
 /// These could not go in `core_metrics::IngressStatus`: that slot is
-/// size-locked at 128 B (two cache lines, asserted), and it is
+/// size-locked at 192 B (three cache lines, asserted), and it is
 /// venue-generic by design. They are venue facts, so they get their
-/// own `Arc` — written from the roll path, read by `/metrics`.
+/// own `Arc` — written from the ingress thread, read by `/metrics`.
 #[derive(Debug, Default)]
 pub struct HlRollStatus {
     rolls_total: ::core::sync::atomic::AtomicU64,
     rolls_ignored_unmatched: ::core::sync::atomic::AtomicU64,
     family_ack_timeouts: ::core::sync::atomic::AtomicU64,
     families_dormant: ::core::sync::atomic::AtomicU64,
+    outcome_bbo_one_sided: ::core::sync::atomic::AtomicU64,
 }
 
 impl HlRollStatus {
@@ -955,7 +957,17 @@ impl HlRollStatus {
             rolls_ignored_unmatched: AtomicU64::new(0),
             family_ack_timeouts: AtomicU64::new(0),
             families_dormant: AtomicU64::new(0),
+            outcome_bbo_one_sided: AtomicU64::new(0),
         }
+    }
+
+    /// BIN15 O8: an outcome leg's `bbo` came one-sided (its ask `null`)
+    /// and was dropped by policy — a well-formed frame, not a parse
+    /// error (the leg's touch comes from its `l2Book`).
+    #[inline]
+    pub fn inc_outcome_bbo_one_sided(&self) {
+        self.outcome_bbo_one_sided
+            .fetch_add(1, ::core::sync::atomic::Ordering::Relaxed);
     }
 
     /// A family adopted a new instance.
@@ -1017,6 +1029,14 @@ impl HlRollStatus {
     #[must_use]
     pub fn families_dormant(&self) -> u64 {
         self.families_dormant
+            .load(::core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `engine_ingress_hyperliquid_outcome_bbo_one_sided_total`.
+    #[inline]
+    #[must_use]
+    pub fn outcome_bbo_one_sided(&self) -> u64 {
+        self.outcome_bbo_one_sided
             .load(::core::sync::atomic::Ordering::Relaxed)
     }
 }

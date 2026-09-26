@@ -3457,8 +3457,8 @@ operator's word: `7235201` built and restarted through the 0010 revive at
 and at the 09:15Z roll it settled 5796/5797 and adopted 5799/5800 in
 session — no reconnect, no ack timeout, no staleness trip. The lane counts
 ~1 parse reject a second, before and after that roll; the parse path and
-the subscription set are unchanged by this work, the reject tap is off,
-and which frames they are is open.
+the subscription set are unchanged by this work — they are BIN15 O8's
+one-sided outcome `bbo` drops (next section).
 
 Gates: clippy clean; nextest 3169 passed (5 skipped); alloc
 73/73 at 0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31
@@ -3466,6 +3466,64 @@ baselined=31 new=0 paid=0`, the baseline byte-identical (sha256
 `caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK. No live
 smoke exists for this lane, and what one would need to show — a reconnect
 across an expiry — is what the unit tests script. This work built no
+engine binary.
+
+### The one-sided outcome `bbo` is not a parse error (2026-09-26)
+
+On the operator's word (2026-09-26: "Fix it (own counter)", after the
+probe below).
+
+**What was wrong.** After the deploy above the lane counted 1–1.5 parse
+errors a second. A read-only probe carried the engine's exact 70
+subscriptions for 60 s (3 504 frames) and sorted every frame by the
+parser's rules: the only reject class was `bbo` pushes on HIP-4 outcome
+legs with the ask `null` — 1.57/s, against the engine's 1.45/s over the
+same window; trades, asset contexts, books and unknown channels, none.
+BIN15 O8 drops those pushes by policy (the leg's two-sided touch comes
+from its `l2Book`), but it dropped them through `Dispatch::Nothing`, the
+rejection path: each one counted in `parse_errors_total` and was tapped as
+a reject. No data was lost; the counter stopped meaning anything for this
+lane, and a real parse failure would have hidden in it.
+
+**What changed.** The drop has its own dispatch
+(`Dispatch::OutcomeBboOneSided`): it counts as a message — not a tick, so
+neither the last-tick age nor the backoff reset ever feeds on a dropped
+frame — and in `HlRollStatus::outcome_bbo_one_sided`, published as
+`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`;
+`parse_errors_total` and the reject tap are left to real rejections. The
+drop condition is unchanged: a two-sided outcome `bbo` is still a tick, a
+perp's is untouched, and a `bbo` with both sides `null` is still a parse
+failure. Docs: `HlRollStatus` (the slot `IngressStatus` could not take is
+192 B, three lines), the driver's `roll_status` and `verified`,
+`set_families`, and `session_health` (the masked ack check, both halves).
+
+**Proof.** `a_one_sided_outcome_bbo_is_dropped_and_l2book_carries_the_touch`
+now pins the count: the one-sided push leaves the ring empty, adds one to
+the new counter and to `msgs_total`, and no tick, parse error or reject
+tap (it is still tapped raw, like every frame); a both-`null` push is one
+parse error and one reject tap with the count untouched; the two-sided
+push is a tick and the count stays 1. Routed back through `Nothing`, the
+test fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES — the change is
+correct; `msgs_total` feeds only the metric mirror and `/state`, while the
+health tells read `ticks_total` and the venue clock, so counting the drop
+there masks nothing (MEXC's dropped quotes and HL's `RollUnmatched` count
+the same way). Acted on: the stale records, a `docs/migration.md` entry,
+the tick and both-`null` assertions, the doc nits, and the name — `one
+sided`, O8's own word, not `ask_null`, so a widened condition would not
+need a rename. Left open: the parse count is not zero after this — each
+mid-session roll's six unsubscribe echoes still land in `Nothing`
+(`parse_sub_response` takes only `"subscribe"`, though `lib.rs` calls the
+echo deliberately ignored), and so do frames in flight for the retired
+coins; the same class, its own change. Only a `null` ask is guarded, which
+is what the venue does (2026-09-12: 194 of 194 outcome ticks had a zero
+ask, none a zero bid).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc 73/73 at
+0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31
+new=0 paid=0`, the baseline byte-identical (sha256 `caf8a05e…`);
+license-check OK; `cargo +nightly fuzz build` OK. This work built no
 engine binary.
 
 ## E6 — the risk gate and the kill switches

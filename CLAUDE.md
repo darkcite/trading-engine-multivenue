@@ -241,9 +241,12 @@ in the script; `ai` = 48 is the floor every name includes).
   only after a session that lived 30 s (the seven loops sharing
   `should_reset_backoff`); `hyperliquid: run-loop returned` names each end
   (`err_site`, `io_kind`, `venue_code`, `lived_ms`, `acks`/`acks_expected`).
-  Open: `roll_health`'s second strike is unreachable (pre-existing); the
-  lane counts ~1 parse reject a second (the reject tap is off, so which
-  frames is unknown; parse path and subscriptions unchanged by the fix).
+  Its ~1.5/s "parse errors" were BIN15 O8's one-sided outcome `bbo` drops,
+  counted on their own from the next release build + restart
+  (`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`; risk-policy
+  "The one-sided outcome `bbo` is not a parse error"). Open:
+  `roll_health`'s second strike is unreachable (pre-existing); each roll's
+  unsubscribe echoes still count as parse errors.
 - **Gates at HEAD (the Hyperliquid reconnect-loop fix, 2026-09-26; Foundry
   and worker pytest as of the HYPARB merge):** nextest 3169 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
