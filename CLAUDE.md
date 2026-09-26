@@ -240,11 +240,21 @@ in the script; `ai` = 48 is the floor every name includes).
   and `hypercall_settle` (the shadow). Fees `[fees.hypercall] option =
   "0:0"` UNVERIFIED (O-HC7). Live smoke WITHOUT stopping the engine:
   `crates/cli/tests/hypercall_live_smoke.rs` (`#[ignore]`, `HC_SMOKE_SECS`
-  ≤ 900). The same branch carries **HAR H1/H2** — `core_vol::LongVolEngine`
+  ≤ 900). The same branch carries **HAR H1–H3** — `core_vol::LongVolEngine`
   (whole-day tenors 1–40 d, the empty-day law, the lifted
   `ols_fit_1e9`; bench gate 77; worker mirror `vol_ref.LongVolEngine`
-  pinned by `tests/fixtures/vol/long-1.*`; `claude_worker.har_seed`), no
-  owner until the H3 rulings — and the **scheduled-events feed** (O-HC8:
+  pinned by `tests/fixtures/vol/long-{1,2}.*`; `claude_worker.har_seed`),
+  owned since H3 by the ENGINE: `core_vol::LongVolSet` (≤ 12 series,
+  held by `StrategySet` in the regime's seat, day closes staggered one a
+  poll — ~38 µs each on the M4; bench gate 78; no member reads it) from
+  `~/multivenue/har.toml` (`core_config::har`; `--har`/`--har-dir`; NOT
+  passed by the wrapper — an absent default file is the pre-H3 engine),
+  restored at boot from `~/multivenue/har/seed-<NAME>.tsv` merged with the
+  engine's own `state-<NAME>.tsv` (`core_vol::merge_rows`), published as
+  `/state.har` + `engine_har_*`; the worker's `har_backfill` (every source
+  kept live, `--import-from`) and `har_seed` ride `candles-cycle.sh`
+  hourly when `har.toml` exists (`har/drift.json`: the dashboard's drift
+  alert) — and the **scheduled-events feed** (O-HC8:
   `news.toml [events]` → `scheduled-events.json` every news cycle; the
   reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
   is now 1, the floor root (it returned 2).
@@ -483,7 +493,8 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   state files), net (mio + rustls transport, WS framing, `IoBuf`,
   `Keepalive`), parse (byte scanners + the `pb` protobuf walker), simd,
   crypto (SHA-256/HMAC/base64), types (wire PODs, `SymbolId`, `VenueId`),
-  regime, vol (the HAR `VolEngine` and the whole-day `LongVolEngine`),
+  regime, vol (the HAR `VolEngine`, the whole-day `LongVolEngine` and its
+  engine owner `LongVolSet`),
   settle (the Hypercall settlement law), fill, latency, metrics (fixed
   registry, 512 counters).
 - `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm,hypercall}` —

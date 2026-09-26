@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Anton (darkcite)
-"""har_backfill -- 1 m history back to listing for the HAR H3 sources (H3.1).
+"""har_backfill -- 1 m history back to listing for the HAR H3 sources (H3.1, H3.6).
 
 A fake venue answers the three backward page shapes measured live on
 2026-09-26 (Binance ``endTime``, OKX ``after``, Bybit ``end``); no network.
 Pinned: an empty series walks down to its listing, an interrupted walk
-leaves no hole and the next run resumes, the up walk connects or writes
-nothing, each fallback stops at its newer source's first minute plus the
-overlap, a fallback behind a source that covers the horizon is not
-fetched, and only closed bars are ever stored.
+leaves no hole and the next run resumes, the up walk is FORWARD -- every
+page connects as it lands, so a page budget smaller than the gap still
+makes progress --, every fallback is kept LIVE to the last closed minute
+(H3.6, the ruling "keep fallbacks live"), ``--import-from`` copies the
+sources' rows without replacing any the store holds, and only closed bars
+are ever stored.
 
 Convention: full ``import x`` only. No ``from x import y``.
 """
@@ -147,70 +149,104 @@ def test_an_interrupted_walk_leaves_no_hole_and_the_next_run_resumes(
     assert _stored(conn, "okx:MU-USDT-SWAP") == hist[:-1]
 
 
-def test_the_up_walk_connects_or_writes_nothing(tmp_path: pathlib.Path) -> None:
+def test_the_up_walk_is_forward_and_every_page_connects(tmp_path: pathlib.Path) -> None:
+    """H3.6: a budget smaller than the gap still makes progress -- each page
+    starts right after the stored last minute, so it is kept as it lands
+    and the next run resumes from it (the hourly gap-fill's law)."""
     hist = _hist(_T0, _T0 + 2 * _DAY)
     conn = claude_worker.candles.open_db(tmp_path / "c.db")
     first_now = _T0 + _DAY
-    _bf(
-        conn,
-        _pager(FakeVenue({"BOTUSDT": hist})),
-        _series("bybit-linear:BOTUSDT", name="BOT"),
-        first_now,
-    )
+    bot = _series("bybit-linear:BOTUSDT", name="BOT")
+    _bf(conn, _pager(FakeVenue({"BOTUSDT": hist})), bot, first_now)
     assert _stored(conn, "bybit-linear:BOTUSDT")[-1][0] == first_now - _MIN
     later = _T0 + 2 * _DAY
-    # A budget that runs out before the walk reaches the store: nothing is written.
+    # One page of 1000 of the 1440 missing minutes: kept, contiguous.
     starved = FakeVenue({"BOTUSDT": hist})
-    reps = _bf(conn, _pager(starved, budget=1), _series("bybit-linear:BOTUSDT", name="BOT"), later)
-    assert reps[0].up_end == "stopped" and reps[0].up_rows == 0
-    assert _stored(conn, "bybit-linear:BOTUSDT")[-1][0] == first_now - _MIN
-    reps = _bf(
-        conn,
-        _pager(FakeVenue({"BOTUSDT": hist})),
-        _series("bybit-linear:BOTUSDT", name="BOT"),
-        later,
-    )
-    assert reps[0].up_end == "connected" and reps[0].up_rows == 1440
+    reps = _bf(conn, _pager(starved, budget=1), bot, later)
+    assert reps[0].up_end == "stopped" and reps[0].up_rows == 1000
+    kept = [b for b in hist if b[0] < first_now + 1000 * _MIN]
+    assert _stored(conn, "bybit-linear:BOTUSDT") == kept
+    # The next run resumes from the stored last minute: one page, connected.
+    venue = FakeVenue({"BOTUSDT": hist})
+    reps = _bf(conn, _pager(venue), bot, later)
+    assert reps[0].up_end == "connected" and reps[0].up_rows == 440
     assert _stored(conn, "bybit-linear:BOTUSDT") == [b for b in hist if b[0] < later]
+    ends = [
+        int(dict(urllib.parse.parse_qsl(urllib.parse.urlparse(u).query))["end"])
+        for u in venue.calls
+    ]
+    assert ends[0] == later - 1, "the last page's bound is the last closed minute"
 
 
-def test_each_fallback_stops_at_its_newer_source_plus_the_overlap(tmp_path: pathlib.Path) -> None:
+def test_a_minute_the_venue_never_had_stays_absent_and_the_walk_goes_on(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A venue gap inside a forward page is no hole of the walk's making:
+    the page reaches back past it, the cursor moves on, nothing refetches."""
+    full = _hist(_T0, _T0 + 3 * _DAY)
+    halt = (_T0 + _DAY + 100 * _MIN, _T0 + _DAY + 400 * _MIN)
+    hist = [b for b in full if not halt[0] <= b[0] < halt[1]]
+    conn = claude_worker.candles.open_db(tmp_path / "c.db")
+    mu = _series("okx:MU-USDT-SWAP", name="MU")
+    _bf(conn, _pager(FakeVenue({"MU-USDT-SWAP": hist})), mu, _T0 + _DAY)
+    reps = _bf(conn, _pager(FakeVenue({"MU-USDT-SWAP": hist})), mu, _T0 + 3 * _DAY)
+    assert reps[0].up_end == "connected"
+    assert _stored(conn, "okx:MU-USDT-SWAP") == [b for b in hist if b[0] < _T0 + 3 * _DAY]
+
+
+def test_every_fallback_is_kept_live_to_the_last_closed_minute(tmp_path: pathlib.Path) -> None:
+    """H3.6: the feed and each fallback, listing to the last closed minute --
+    the drift ``compare`` measures is a live number (the ruling "keep
+    fallbacks live"), and the next hour gap-fills all three."""
     now = _T0 + 20 * _DAY
-    feed = _hist(_T0 + 10 * _DAY, now, seed=2)
-    okx = _hist(_T0 + 4 * _DAY, now, seed=3)
-    bybit = _hist(_T0, now, seed=4)
+    feed = _hist(_T0 + 10 * _DAY, now + _DAY, seed=2)
+    okx = _hist(_T0 + 4 * _DAY, now + _DAY, seed=3)
+    bybit = _hist(_T0, now + _DAY, seed=4)
     venue = FakeVenue({"NVDAUSDT": feed, "NVDA-USDT-SWAP": okx, "BOT": bybit})
     conn = claude_worker.candles.open_db(tmp_path / "c.db")
     series = _series("binance-usdm:nvdausdt", "okx:NVDA-USDT-SWAP", "bybit-linear:BOT", name="NVDA")
-    reps = _bf(conn, _pager(venue), series, now, overlap_days=2)
+    reps = _bf(conn, _pager(venue), series, now)
     assert [r.down_end for r in reps] == ["listing", "listing", "listing"]
-    assert _stored(conn, "binance-usdm:nvdausdt") == feed[:-1]
-    assert _stored(conn, "okx:NVDA-USDT-SWAP") == [b for b in okx if b[0] < _T0 + 12 * _DAY]
-    assert _stored(conn, "bybit-linear:BOT") == [b for b in bybit if b[0] < _T0 + 6 * _DAY]
+    for descriptor, hist in (
+        ("binance-usdm:nvdausdt", feed),
+        ("okx:NVDA-USDT-SWAP", okx),
+        ("bybit-linear:BOT", bybit),
+    ):
+        assert _stored(conn, descriptor) == [b for b in hist if b[0] < now], descriptor
     lines = [claude_worker.har_backfill.report_line(r) for r in reps]
     assert lines[1].startswith(
-        "har-backfill NVDA okx:NVDA-USDT-SWAP: down +11520 (listing) up +0 (-)"
+        "har-backfill NVDA okx:NVDA-USDT-SWAP: down +23040 (listing) up +0 (-)"
     )
-    assert lines[1].endswith("stored 2026-01-05T00:00Z .. 2026-01-12T23:59Z")
+    assert lines[1].endswith("stored 2026-01-05T00:00Z .. 2026-01-20T23:59Z")
+    # An hour later: every source gap-fills forward, one page each.
+    later = now + 3_600_000
+    reps = _bf(conn, _pager(venue), series, later)
+    assert [(r.up_end, r.up_rows) for r in reps] == [("connected", 60)] * 3
+    assert [r.last_ts_ms for r in reps] == [later - _MIN] * 3
 
 
-def test_a_fallback_behind_a_source_covering_the_horizon_is_not_fetched(
+def test_a_fallback_behind_a_source_covering_the_horizon_is_fetched_too(
     tmp_path: pathlib.Path,
 ) -> None:
+    """H3.6: nothing is skipped for being "not needed" -- BTC spot stays
+    live behind the USDⓈ-M feed, each back to the same horizon."""
     now = _T0 + 12 * _DAY
     venue = FakeVenue({"BTCUSDT": _hist(_T0, now)})
     conn = claude_worker.candles.open_db(tmp_path / "c.db")
     series = _series("binance-usdm:btcusdt", "binance:btcusdt", name="BTC")
     reps = _bf(conn, _pager(venue), series, now, horizon_days=5)
-    assert reps[0].down_end == "horizon"
-    assert _stored(conn, "binance-usdm:btcusdt")[0][0] == _T0 + 7 * _DAY
-    assert reps[1].skipped == "not needed: binance-usdm:btcusdt covers the horizon"
-    assert not any("/api/v3/" in c for c in venue.calls)
+    assert [r.down_end for r in reps] == ["horizon", "horizon"]
+    assert [r.skipped for r in reps] == ["", ""]
+    for d in ("binance-usdm:btcusdt", "binance:btcusdt"):
+        assert _stored(conn, d)[0][0] == _T0 + 7 * _DAY and _stored(conn, d)[-1][0] == now - _MIN
+    assert any("/api/v3/" in c for c in venue.calls)
 
 
-def test_a_source_without_a_walker_still_bounds_the_next(tmp_path: pathlib.Path) -> None:
-    """``hypercall-idx:`` is capture-only: never walked, but its stored
-    first minute is where the next fallback stops."""
+def test_a_source_without_a_walker_is_skipped_and_its_fallback_still_walked(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``hypercall-idx:`` is capture-only: never walked; the fallback behind
+    it is walked to the last closed minute like any other."""
     now = _T0 + 10 * _DAY
     conn = claude_worker.candles.open_db(tmp_path / "c.db")
     idx = _hist(_T0 + 8 * _DAY, now - _MIN, seed=5)
@@ -220,12 +256,57 @@ def test_a_source_without_a_walker_still_bounds_the_next(tmp_path: pathlib.Path)
         [("hypercall-idx:SP500", t, c, now) for t, c in idx],
     )
     conn.commit()
-    venue = FakeVenue({"SPY-USDT-SWAP": _hist(_T0, now, seed=6)})
-    series = _series("hypercall-idx:SP500", "okx:SPY-USDT-SWAP")
-    reps = _bf(conn, _pager(venue), series, now, overlap_days=1)
+    okx = _hist(_T0, now, seed=6)
+    venue = FakeVenue({"SPY-USDT-SWAP": okx})
+    reps = _bf(conn, _pager(venue), _series("hypercall-idx:SP500", "okx:SPY-USDT-SWAP"), now)
     assert reps[0].skipped == "no backward REST walk for this venue"
     assert reps[0].first_ts_ms == _T0 + 8 * _DAY
-    assert _stored(conn, "okx:SPY-USDT-SWAP")[-1][0] == _T0 + 9 * _DAY - _MIN
+    assert _stored(conn, "okx:SPY-USDT-SWAP") == okx[:-1]
+
+
+def _mk_store(path: pathlib.Path, rows: dict[str, list[tuple[int, float]]], fetched: int) -> None:
+    conn = claude_worker.candles.open_db(path)
+    for d, hist in rows.items():
+        conn.executemany(
+            "INSERT INTO candles (venue,descriptor,tf,open_ts,o,h,l,c,v,source,fetched_ts)"
+            " VALUES (1,?,'1m',?,?,?,?,?,1.0,'rest',?)",
+            [(d, t, c, c, c, c, fetched) for t, c in hist],
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_import_copies_every_source_and_never_replaces_a_stored_row(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``--import-from``: the go-live dry run's rows for every ``har.toml``
+    source, ``INSERT OR IGNORE`` -- the store's closed bars are final."""
+    src = tmp_path / "dryrun.db"
+    feed = _hist(_T0, _T0 + _DAY, seed=2)
+    okx = _hist(_T0, _T0 + _DAY, seed=3)
+    other = _hist(_T0, _T0 + _MIN, seed=4)
+    _mk_store(src, {"binance-usdm:muusdt": feed, "okx:MU-USDT-SWAP": okx, "x:else": other}, 7)
+    conn = claude_worker.candles.open_db(tmp_path / "live.db")
+    mine = [(t, c + 1.0) for t, c in feed[:10]]
+    conn.executemany(
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,c,source,fetched_ts)"
+        " VALUES (1,'binance-usdm:muusdt','1m',?,?,'rest',9)",
+        mine,
+    )
+    conn.commit()
+    lines: list[str] = []
+    series = [_series("binance-usdm:muusdt", "okx:MU-USDT-SWAP", name="MU")]
+    added = claude_worker.har_backfill.import_rows(conn, src, series, lines.append)
+    assert added == (len(feed) - 10) + len(okx)
+    assert _stored(conn, "binance-usdm:muusdt") == mine + feed[10:], "the store's rows kept"
+    assert _stored(conn, "okx:MU-USDT-SWAP") == okx
+    assert _stored(conn, "x:else") == [], "only the har.toml sources"
+    head = f"har-backfill import MU binance-usdm:muusdt: +{len(feed) - 10} row(s) from {src}"
+    assert lines[0] == head
+    assert claude_worker.har_backfill.import_rows(conn, src, series, lines.append) == 0
+    with pytest.raises(FileNotFoundError):
+        claude_worker.har_backfill.import_rows(conn, tmp_path / "absent.db", series, lines.append)
+    assert not (tmp_path / "absent.db").exists(), "a missing store is never created"
 
 
 def test_the_page_requests_are_the_measured_shapes() -> None:
@@ -308,3 +389,14 @@ def test_main_reads_har_toml_and_reports(
     bad = tmp_path / "bad.toml"
     bad.write_text("[[series]]\n", encoding="utf-8")
     assert claude_worker.har_backfill.main(["--har-toml", str(bad), "--db", str(db)]) == 2
+    # --import-from runs first; a missing store refuses the run (2).
+    src = tmp_path / "dryrun.db"
+    _mk_store(src, {"binance-usdm:muusdt": _hist(_T0, _T0 + _DAY)}, 7)
+    db3 = tmp_path / "c3.db"
+    argv3 = ["--har-toml", str(toml), "--db", str(db3), "--now-ms", str(now), "--series", "MU"]
+    assert claude_worker.har_backfill.main([*argv3, "--import-from", str(src)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"har-backfill import MU binance-usdm:muusdt: +1441 row(s) from {src}"
+    assert out[1].startswith("har-backfill MU binance-usdm:muusdt: down +0 (listing) up +1439")
+    missing = tmp_path / "missing.db"
+    assert claude_worker.har_backfill.main([*argv3, "--import-from", str(missing)]) == 2

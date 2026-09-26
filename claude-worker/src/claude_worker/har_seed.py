@@ -19,7 +19,10 @@ module, never a worker verb):
   ``refresh``; format below). Written atomically, OUTSIDE git.
 - ``compare`` -- the per-day ``sum r^2`` agreement of two series over their
   overlap: the measurement a fallback must pass before its days are
-  trusted (plan H2).
+  trusted (plan H2). ``--json-out P`` also writes the measurements as one
+  JSON document, atomically -- ``candles-cycle.sh`` writes
+  ``~/multivenue/har/drift.json`` every hour over the last 14 days, the
+  dashboard's live drift alert (H3.6; the ruling "keep fallbacks live").
 
 Each lane takes one series (``--descriptor D`` with ``--fallback F``,
 repeatable) or every ``[[series]]`` of ``har.toml`` (``--har-toml P``,
@@ -66,6 +69,7 @@ Convention: full ``import x`` only. No ``from x import y``.
 import argparse
 import collections.abc
 import dataclasses
+import json
 import math
 import os
 import pathlib
@@ -91,6 +95,8 @@ SHOW_TENORS: tuple[int, ...] = (1, 7, 30)
 COMPARE_MIN_MINUTES: int = 1380
 #: Where ``seed-out --har-toml`` writes ``seed-<NAME>.tsv``.
 OUT_DIR_DEFAULT: str = "~/multivenue/har"
+#: ``compare --json-out``'s document version.
+DRIFT_VERSION: int = 1
 _DAY_MS: int = claude_worker.vol_ref.DAY_MS
 _MINUTE_MS: int = 60_000
 _NONE: int = claude_worker.vol_ref.LOG2_UNDEFINED
@@ -282,11 +288,35 @@ def compare(
 ) -> tuple[int, float, float]:
     """``(days, median, p90)`` of the per-day ``|ln(vol_a / vol_b)|`` over
     the days both series cover at least ``COMPARE_MIN_MINUTES`` of."""
-    ratios = sorted(abs(x) for x in day_log_ratios(conn, a, b, since_ms, until_ms))
+    d = measure(conn, (a, b), (since_ms, until_ms))
+    return (d.days, d.median_abs, d.p90_abs)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Drift:
+    """One ``(a, b)`` pair's agreement over a window."""
+
+    a: str
+    b: str
+    #: Full days both series cover (``COMPARE_MIN_MINUTES`` each).
+    days: int
+    #: Median and p90 of the per-day ``|ln(vol_a / vol_b)|``.
+    median_abs: float
+    p90_abs: float
+    #: The signed median: ``a``'s level of vol over ``b``'s.
+    median_signed: float
+
+
+def measure(conn: sqlite3.Connection, pair: tuple[str, str], window: tuple[int, int]) -> Drift:
+    """The agreement of ``pair`` over ``window = (since_ms, until_ms)`` --
+    :func:`compare` and the signed median from ONE read of each series."""
+    a, b = pair
+    signed = day_log_ratios(conn, a, b, *window)
+    ratios = sorted(abs(x) for x in signed)
     if not ratios:
-        return (0, 0.0, 0.0)
+        return Drift(a, b, 0, 0.0, 0.0, 0.0)
     p90 = ratios[min(len(ratios) - 1, int(len(ratios) * 0.9))]
-    return (len(ratios), statistics.median(ratios), p90)
+    return Drift(a, b, len(ratios), statistics.median(ratios), p90, statistics.median(signed))
 
 
 def compare_line(
@@ -295,14 +325,49 @@ def compare_line(
     """The lane's report line for one ``(a, b)`` pair over ``window =
     (since_ms, until_ms)``: the agreement, and the signed median -- the
     level offset of ``a`` over ``b`` (ruling 10 accepts it)."""
-    a, b = pair
-    signed = day_log_ratios(conn, a, b, *window)
-    n, med, p90 = compare(conn, a, b, *window)
-    offset = statistics.median(signed) if signed else 0.0
+    return drift_line(measure(conn, pair, window), label)
+
+
+def drift_line(d: Drift, label: str = "") -> str:
+    """:func:`compare_line`'s text for a measured pair."""
     return (
-        f"har-seed compare {label}{a} vs {b}: {n} full day(s),"
-        f" median |ln vol ratio| {med:.4f}, p90 {p90:.4f}, median ln vol ratio {offset:+.4f}"
+        f"har-seed compare {label}{d.a} vs {d.b}: {d.days} full day(s),"
+        f" median |ln vol ratio| {d.median_abs:.4f}, p90 {d.p90_abs:.4f},"
+        f" median ln vol ratio {d.median_signed:+.4f}"
     )
+
+
+def write_drift(
+    path: pathlib.Path,
+    now_ms: int,
+    window: tuple[int, int],
+    measured: list[tuple[str, Drift]],
+) -> None:
+    """``compare --json-out``: every ``(series, pair)`` measured, one JSON
+    document, atomic (tmp + rename) -- the dashboard never reads a torn
+    file. The amber rule is the reader's; this is data."""
+    doc = {
+        "v": DRIFT_VERSION,
+        "now_ms": now_ms,
+        "since_ms": window[0],
+        "until_ms": window[1],
+        "pairs": [
+            {
+                "series": label,
+                "a": d.a,
+                "b": d.b,
+                "days": d.days,
+                "median_abs": round(d.median_abs, 6),
+                "p90_abs": round(d.p90_abs, 6),
+                "median_signed": round(d.median_signed, 6),
+            }
+            for label, d in measured
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(doc, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def connect_store(db: pathlib.Path) -> sqlite3.Connection:
@@ -367,6 +432,7 @@ def _parser() -> argparse.ArgumentParser:
             p.add_argument("--out-dir", type=pathlib.Path, default=None)
         if lane == "compare":
             p.add_argument("--against", default=None)
+            p.add_argument("--json-out", type=pathlib.Path, default=None)
     return ap
 
 
@@ -384,15 +450,22 @@ def _refusal(args: argparse.Namespace) -> str | None:
 def _compare_lane(conn: sqlite3.Connection, args: argparse.Namespace, jobs: list[Job]) -> int:
     now = args.now_ms
     window = ((now // _DAY_MS - args.days) * _DAY_MS, now)
+    measured: list[tuple[str, Drift]] = []
     for job in jobs:
         if args.descriptor is not None:
-            print(compare_line(conn, (job.descriptor, args.against), window))
+            d = measure(conn, (job.descriptor, args.against), window)
+            measured.append((job.label, d))
+            print(drift_line(d))
             continue
         chain = (job.descriptor, *job.fallbacks)
         if len(chain) == 1:
             print(f"har-seed compare {job.label} {job.descriptor}: no fallback")
         for k in range(len(chain) - 1):
-            print(compare_line(conn, (chain[k], chain[k + 1]), window, f"{job.label} "))
+            d = measure(conn, (chain[k], chain[k + 1]), window)
+            measured.append((job.label, d))
+            print(drift_line(d, f"{job.label} "))
+    if args.json_out is not None:
+        write_drift(args.json_out.expanduser(), now, window, measured)
     return 0
 
 

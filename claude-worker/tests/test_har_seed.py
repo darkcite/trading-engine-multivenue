@@ -11,6 +11,7 @@ newer source, and no return is ever formed across a source boundary.
 Convention: full ``import x`` only. No ``from x import y``.
 """
 
+import json
 import pathlib
 import sqlite3
 
@@ -402,6 +403,42 @@ def test_show_and_compare_har_toml(tmp_path: pathlib.Path, capsys) -> None:
     )
     assert lines[0].endswith("median ln vol ratio +0.0000")
     assert lines[1] == "har-seed compare ETH binance-usdm:ethusdt: no fallback"
+
+
+def test_compare_json_out_is_the_dashboards_drift_file(tmp_path: pathlib.Path, capsys) -> None:
+    """H3.6: ``--json-out`` writes every measured pair -- the hourly
+    ``drift.json`` the dashboard's amber rule reads -- atomically, the same
+    numbers the lines print; a series with no fallback has no pair."""
+    spot = _walk(50, 47)
+    db = tmp_path / "candles.db"
+    _db(
+        db,
+        {
+            "binance:btcusdt": spot,
+            "binance-usdm:btcusdt": [(t, px * 2) for t, px in spot],
+            "binance-usdm:ethusdt": _walk(50, 53),
+        },
+    ).close()
+    toml = _toml(tmp_path / "har.toml")
+    out = tmp_path / "har" / "drift.json"
+    now = _T0 + 50 * _DAY_MS
+    argv = ["compare", "--db", str(db), "--har-toml", str(toml), "--now-ms", str(now)]
+    assert claude_worker.har_seed.main([*argv, "--days", "14", "--json-out", str(out)]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert doc["v"] == claude_worker.har_seed.DRIFT_VERSION == 1
+    assert (doc["now_ms"], doc["since_ms"], doc["until_ms"]) == (now, now - 14 * _DAY_MS, now)
+    assert len(doc["pairs"]) == 1, "ETH has no fallback, so no pair"
+    pair = doc["pairs"][0]
+    assert (pair["series"], pair["a"], pair["b"]) == (
+        "BTC",
+        "binance-usdm:btcusdt",
+        "binance:btcusdt",
+    )
+    # A constant level (x2) moves no return: the two agree exactly.
+    assert (pair["days"], pair["median_abs"], pair["p90_abs"]) == (14, 0.0, 0.0)
+    assert printed[0].startswith("har-seed compare BTC binance-usdm:btcusdt vs binance:btcusdt: 14")
+    assert not list(out.parent.glob("*.tmp")), "atomic: no tmp left behind"
 
 
 def test_the_store_is_read_never_created_or_written(tmp_path: pathlib.Path) -> None:

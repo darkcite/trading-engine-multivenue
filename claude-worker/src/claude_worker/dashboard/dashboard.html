@@ -45,6 +45,8 @@
   .rel { display:flex; gap:4px; }
   .rel div { flex:1; border:1px solid var(--line); border-radius:3px; padding:2px 4px; text-align:center; }
   .hash { color:var(--acc); }
+  .wk { display:inline-flex; gap:1px; align-items:flex-end; height:14px; vertical-align:-2px; }
+  .wk i { display:inline-block; width:4px; background:var(--acc); }
   .muted { color:var(--dim); }
   #err { color:var(--bad); }
 </style>
@@ -63,6 +65,7 @@
 </header>
 <main>
   <section id="s-regime" class="wide"><h2>Regime <small id="regime-sub"></small></h2><div id="regime"></div></section>
+  <section id="s-har" class="wide"><h2>Volatility (HAR, long) <small id="har-sub"></small></h2><div id="har"></div></section>
   <section id="s-strat"><h2>Strategies <small id="strat-sub"></small></h2><div id="strat"></div></section>
   <section id="s-pnl"><h2>P&amp;L <small id="pnl-sub"></small></h2><div id="pnl"></div></section>
   <section id="s-ruleset" class="wide"><h2>Ruleset <small id="ruleset-sub"></small></h2><div id="ruleset"></div></section>
@@ -556,6 +559,74 @@ function renderAi() {
   set('ai', parts.join('') || '<span class="muted">n/a</span>');
 }
 
+// ---- HAR H3: the long-tenor volatility — /state.har joined with the worker's har ----
+// Per series: σ̂ fit (raw fold, pairs beneath — plan law L2) at the nine panel
+// tenors, warm, days, the newest day's age, the source (and "via" the fallbacks
+// its seed spliced), the weekday profile chip, and the §7 alerts: red = the
+// newest closed day older than 26 h ("not recalibrating"); amber = warm with a
+// shown tenor unfitted, or a fallback drifting (median |ln vol ratio| > 0.10).
+const WEEKDAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+const HAR_TENORS = [1, 2, 3, 5, 7, 14, 21, 30, 40];
+function pct1e6(v) { return v ? `${(v / 1e4).toFixed(1)}%` : '<span class="dim">—</span>'; }
+function weekdayChip(r) {
+  const tip = WEEKDAYS.map((d, w) => `${d} ${(r.weekday_1e6[w] / 1e6).toFixed(2)} × mean day (${r.weekday_n[w]} d)`).join('\n');
+  return `<span class="wk" title="${esc(tip)}">` + r.weekday_1e6.map(v => `<i style="height:${Math.max(1, Math.min(14, Math.round(v / 1e6 * 7)))}px"></i>`).join('') + '</span>';
+}
+function renderHar() {
+  const EH = E && E.har, WH = W && W.har;
+  if ((!EH || !EH.configured) && (!WH || !WH.configured)) {
+    set('har-sub', WH && WH.error ? `<span class="bad">har.toml refused: ${esc(WH.error)}</span>` : 'off — no har.toml');
+    set('har', '<span class="muted">not configured</span>');
+    return;
+  }
+  const red = WH ? WH.red_day_age_s : 93600, amber = WH ? WH.amber_drift : 0.10;
+  const tenors = EH && EH.tenors_d ? EH.tenors_d : HAR_TENORS;
+  const eng = {}; if (EH) for (const r of EH.series) eng[r.name] = r;
+  const cfg = {}; if (WH && WH.series) for (const c of WH.series) cfg[c.name] = c;
+  const names = Object.keys(cfg).concat(Object.keys(eng).filter(k => !(k in cfg)));
+  const drift = {}; if (WH && WH.drift) for (const d of WH.drift.pairs) (drift[d.series] = drift[d.series] || []).push(d);
+  let reds = 0, ambers = 0;
+  const rows = names.map(name => {
+    const r = eng[name], c = cfg[name];
+    let src = c ? esc(c.feed) : '<span class="dim">not in har.toml</span>';
+    if (c && c.spans) {
+      const via = c.spans.filter(s => s.descriptor !== c.feed);
+      if (via.length) src += ` <span class="dim">via ${via.map(s => esc(s.descriptor)).join(', ')}</span>`;
+    }
+    const notes = (drift[name] || []).map(d => {
+      const hot = d.days > 0 && d.median_abs > amber;
+      if (hot) ambers++;
+      return `<span class="${hot ? 'warn' : 'dim'}" title="${esc(d.a)} vs ${esc(d.b)}: ${d.days} full day(s), median ln vol ratio ${d.median_signed >= 0 ? '+' : ''}${d.median_signed.toFixed(3)}">drift ${esc(d.b)} ${d.median_abs.toFixed(2)}</span>`;
+    });
+    if (!r) {
+      ambers++;
+      return [`<b>${esc(name)}</b>`, src, '<span class="warn">not in engine</span>', '', '', ...tenors.map(() => ''), '', notes.join(' ') || '<span class="dim">dropped at boot, or added since</span>'];
+    }
+    if (r.day_age_s > red) { reds++; notes.push(`<span class="bad">not recalibrating</span>`); }
+    const unfit = r.warm ? tenors.filter((t, k) => !r.fitted[k]) : [];
+    if (unfit.length) {
+      ambers++;
+      const pairs = Math.min(...unfit.map(t => r.pairs[tenors.indexOf(t)]));
+      notes.push(`<span class="warn">unfitted ${unfit.join(',')}d (≥ ${pairs}/60 pairs)</span>`);
+    }
+    return [
+      `<b>${esc(name)}</b>`, src,
+      r.warm ? '<span class="ok">warm</span>' : '<span class="warn">cold</span>',
+      `${r.days}${r.empty_days ? ` <span class="warn">(${r.empty_days} empty)</span>` : ''}`,
+      `<span class="${r.day_age_s > red ? 'bad' : ''}">${age(r.day_age_s)}</span>`,
+      ...tenors.map((t, k) => `${r.fitted[k] ? pct1e6(r.fit_1e6[k]) : '<span class="dim">—</span>'}<br><span class="dim">${pct1e6(r.raw_1e6[k])} · ${r.pairs[k]}${r.fit_beats_raw[k] ? ' ✓' : ''}</span>`),
+      weekdayChip(r),
+      notes.join(' ') || '<span class="dim">—</span>',
+    ];
+  });
+  const ns = v => !v ? '—' : v >= 1e6 ? `${(v / 1e6).toFixed(2)} ms` : `${(v / 1e3).toFixed(1)} µs`;
+  const head = EH ? `${EH.configured} series${EH.dropped ? ` · <span class="warn">${EH.dropped} dropped at boot</span>` : ''} · day closes ${EH.day_closes} (max ${ns(EH.day_close_ns_max)})` : '<span class="warn">engine n/a</span>';
+  const dage = WH && WH.drift_age_s !== null && WH.drift_age_s !== undefined ? `drift ${age(WH.drift_age_s)} old` : 'no drift.json';
+  set('har-sub', `${head} · ${dage}${reds ? ` · <span class="bad">${reds} red</span>` : ''}${ambers ? ` · <span class="warn">${ambers} amber</span>` : ''}`);
+  const headers = ['series', 'source', 'warm', 'days', 'day age', ...tenors.map(t => `${t}d fit / raw·pairs`), 'weekday', 'alerts'];
+  set('har', table(headers, rows, tenors.map((t, k) => 5 + k)) + '<div class="muted" style="margin-top:4px">σ annualised: fit on top, the raw fold and its pairs beneath (✓ = the fit beats the raw on a full QLIKE window). Weekday bars: that weekday\'s mean Σr² over the mean day.</div>');
+}
+
 // ---- positions ----
 function renderPositions() {
   if (!W || !W.positions) { set('positions', '<span class="muted">n/a</span>'); return; }
@@ -574,7 +645,7 @@ function renderConfig() {
 }
 
 function renderAll() {
-  renderBar(); renderRegime(); renderStrategies(); renderPnl(); renderRuleset(); renderLibrary(); renderRecent(); renderIngress(); renderLatency(); renderAi(); renderPositions(); renderNews(); renderConfig();
+  renderBar(); renderRegime(); renderHar(); renderStrategies(); renderPnl(); renderRuleset(); renderLibrary(); renderRecent(); renderIngress(); renderLatency(); renderAi(); renderPositions(); renderNews(); renderConfig();
 }
 async function pollEngine() {
   try { const r = await fetch('/api/engine/state', {cache: 'no-store'}); if (!r.ok) throw new Error(`engine ${r.status}`); E = await r.json(); engineErr = null; }

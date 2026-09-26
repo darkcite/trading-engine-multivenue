@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Anton (darkcite)
-"""har_backfill -- 1 m history for the HAR H3 sources (W1b, plan §12.4 / §13.5).
+"""har_backfill -- 1 m history for the HAR H3 sources (W1b, plan §12.4 / §13.5, H3.6).
 
 The long-tenor HAR needs whole UTC days: 30 to be warm, then 60 pairs per
 tenor to fit. The candles lane never goes backward (an empty series gets
@@ -18,25 +18,37 @@ HTTP 451 -- serialised under the worker guard like every other writer of
 the store, and it is idempotent: a second run fetches only what the first
 did not.
 
-Per source, two walks, both paging BACKWARD (measured 2026-09-26: Binance
-spot and USDⓈ-M ``klines`` with only ``endTime``, Bybit ``kline`` with only
-``end`` and OKX ``history-candles`` with ``after`` all answer the page just
-before the bound; before the listing they answer an empty page):
+Every source -- the feed AND each fallback -- is kept LIVE: stored from its
+listing (or the horizon) to the last CLOSED minute, and gap-filled forward
+every hour by ``candles-cycle.sh`` (the 2026-09-26 ruling "keep fallbacks
+live": the drift ``har_seed compare`` measures between a feed and its
+fallbacks is a live number, never one frozen at the overlap). Only closed
+bars are stored: every row this module writes is final.
 
-- **down**: from the stored first minute (or the upper bound, for an empty
-  series) to the listing or the horizon, whichever comes later. Each page
-  is upserted as it lands; each one ends where the stored series begins,
-  so an interrupted walk leaves no hole and the next run resumes from the
-  new first minute.
-- **up**: from the upper bound down to the stored last minute, buffered and
-  upserted only once it connects -- the lane's OKX hole-avoidance law. A
-  walk that stops short (budget, transport) is discarded whole.
+Per source, two walks. Every request asks for the page just BEFORE a bound
+(measured 2026-09-26: Binance spot and USDⓈ-M ``klines`` with only
+``endTime``, Bybit ``kline`` with only ``end`` and OKX ``history-candles``
+with ``after`` all answer that page; before the listing they answer an
+empty one):
 
-The upper bound is the last CLOSED minute for the feed, and for a fallback
-the previous source's first minute plus ``--overlap-days`` (the overlap
-``har_seed compare`` measures). A fallback whose previous source already
-covers the horizon is not needed and is not fetched. Only closed bars are
-stored: every row this module writes is final.
+- **down**: from the stored first minute (or the last closed minute, for
+  an empty series) to the listing or the horizon, whichever comes later.
+  Each page ends where the stored series begins.
+- **up**: FORWARD from the stored last minute to the last closed minute, a
+  page at a time: each request's bound is one page past the stored last
+  minute, so the page it answers starts right after it (H3.6 -- the hourly
+  gap-fill; H3.1 buffered a backward walk and wrote it only once it
+  connected, which a page budget smaller than the gap never completes).
+
+Either way every page connects to the store as it lands, so an interrupted
+walk (a page budget, a transport failure) leaves no hole and the next run
+resumes from what it stored. A page budget is spent in series order: after
+a long outage the first lagging sources catch up first, the rest the hours
+after (the go-live run is unbounded, so an hour's need is ~1 page a source).
+
+``--import-from DB`` first copies every source's 1 m rows from another
+store -- the go-live dry run's -- with ``INSERT OR IGNORE``: a row this
+store already holds is never replaced (its closed bars are final).
 
 Offline worker tool: allocation is fine. Convention: full ``import x``
 only. No ``from x import y``.
@@ -61,8 +73,16 @@ import claude_worker.har_config
 
 #: UTC days kept behind ``now``: ``har_seed``'s replay (240) plus slack.
 HORIZON_DAYS_DEFAULT: int = 250
-#: Days a fallback overlaps its newer source, for ``har_seed compare``.
-OVERLAP_DAYS_DEFAULT: int = 30
+#: Rows per ``INSERT OR IGNORE`` batch of ``--import-from``.
+IMPORT_BATCH: int = 10_000
+_IMPORT_SELECT: str = (
+    "SELECT venue,descriptor,tf,open_ts,o,h,l,c,v,n,source,fetched_ts"
+    " FROM candles WHERE descriptor=? AND tf=?"
+)
+_IMPORT_SELECT_PRE_C5: str = (
+    "SELECT venue,descriptor,tf,open_ts,o,h,l,c,v,NULL,source,fetched_ts"
+    " FROM candles WHERE descriptor=? AND tf=?"
+)
 #: Tries per page before the walk stops (resumable next run).
 TRIES: int = 4
 _MIN_MS: int = claude_worker.candles.MS_1M
@@ -181,6 +201,7 @@ class SourceReport:
     #: ``listing`` (the venue answered empty), ``horizon``, ``stopped``
     #: (budget or transport: resumable) or ``-`` (no down walk ran).
     down_end: str = "-"
+    #: ``connected`` (reached the last closed minute), ``stopped`` or ``-``.
     up_end: str = "-"
     first_ts_ms: int | None = None
     last_ts_ms: int | None = None
@@ -206,7 +227,6 @@ class Run:
     pager: Pager
     now_ms: int
     horizon_days: int = HORIZON_DAYS_DEFAULT
-    overlap_days: int = OVERLAP_DAYS_DEFAULT
 
     @property
     def closed_by(self) -> int:
@@ -255,22 +275,22 @@ class SourceWalk:
         self.rep.down_end = "horizon"
 
     def up(self, last_ms: int, until_ms: int) -> None:
-        """Fill ``(last_ms, until_ms)``: page down from ``until_ms`` until the
-        walk reaches the stored ``last_ms``, then upsert it whole."""
-        buffered: list[claude_worker.fetchers.Candle] = []
-        before_ms = until_ms
-        while True:
+        """Fill ``(last_ms, until_ms)`` FORWARD: each request's bound is one
+        page past the stored last minute, so the page covers every minute
+        right after it and is upserted as it lands (a minute the venue has
+        no bar for stays absent -- it was never there)."""
+        span = self.w.page_bars * _MIN_MS
+        cursor = last_ms
+        while cursor + _MIN_MS < until_ms:
+            before_ms = min(cursor + _MIN_MS + span, until_ms)
             page = self.run.pager.fetch_before(self.w, before_ms)
             if page is None:
                 self.rep.up_end = "stopped"
                 return
-            buffered = page + buffered
-            if not page or page[0].ts_ms <= last_ms:
-                break
-            before_ms = page[0].ts_ms
-        keep = [c for c in buffered if last_ms < c.ts_ms < until_ms]
-        if keep:
-            self.rep.up_rows += self._upsert(keep)
+            keep = [c for c in page if cursor < c.ts_ms < until_ms]
+            if keep:
+                self.rep.up_rows += self._upsert(keep)
+            cursor = before_ms - _MIN_MS
         self.rep.up_end = "connected"
 
 
@@ -295,25 +315,48 @@ def backfill_source(run: Run, series: str, descriptor: str, until_ms: int) -> So
 
 
 def backfill_series(run: Run, series: claude_worker.har_config.Series) -> list[SourceReport]:
-    """The feed, then each fallback up to the previous source's first
-    minute plus the overlap; a fallback behind a source that already
-    covers the horizon is skipped."""
-    out: list[SourceReport] = []
-    until_ms = run.closed_by
-    sources = series.sources()
-    for k, descriptor in enumerate(sources):
-        rep = backfill_source(run, series.name, descriptor, until_ms)
-        out.append(rep)
-        first = rep.first_ts_ms
-        if first is None:
-            until_ms = run.closed_by
-            continue
-        if first <= run.floor_ms:
-            why = f"not needed: {descriptor} covers the horizon"
-            out.extend(SourceReport(series.name, rest, skipped=why) for rest in sources[k + 1 :])
-            break
-        until_ms = min(run.closed_by, first + run.overlap_days * _DAY_MS)
-    return out
+    """The feed, then each fallback -- every one to the last closed minute
+    and back to its listing or the horizon (module doc: kept live)."""
+    return [backfill_source(run, series.name, d, run.closed_by) for d in series.sources()]
+
+
+def import_rows(
+    conn: sqlite3.Connection,
+    src_path: pathlib.Path,
+    series: list[claude_worker.har_config.Series],
+    report: collections.abc.Callable[[str], None],
+) -> int:
+    """Copy every source's 1 m rows from the store at ``src_path`` into
+    ``conn``, keeping every row ``conn`` holds (``INSERT OR IGNORE``);
+    returns the rows added. A missing file is an error, never a new empty
+    store, and the source is read under ``query_only``."""
+    if not src_path.is_file():
+        raise FileNotFoundError(f"no store to import from at {src_path}")
+    src = sqlite3.connect(src_path)
+    total = 0
+    try:
+        src.execute("PRAGMA query_only = 1")
+        cols = {row[1] for row in src.execute("PRAGMA table_info(candles)")}
+        # A pre-C5 store has no tick-count column: its rows carry NULL.
+        select = _IMPORT_SELECT if "n" in cols else _IMPORT_SELECT_PRE_C5
+        for s in series:
+            for d in s.sources():
+                cur = src.execute(select, (d, _TF))
+                before = conn.total_changes
+                while rows := cur.fetchmany(IMPORT_BATCH):
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO candles"
+                        " (venue,descriptor,tf,open_ts,o,h,l,c,v,n,source,fetched_ts)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        rows,
+                    )
+                conn.commit()
+                added = conn.total_changes - before
+                total += added
+                report(f"har-backfill import {s.name} {d}: +{added} row(s) from {src_path}")
+    finally:
+        src.close()
+    return total
 
 
 def _stamp(ts_ms: int | None) -> str:
@@ -350,6 +393,11 @@ def run_all(
     return complete
 
 
+def _say(line: str) -> None:
+    """A report line, flushed: the hourly lane's log shows progress live."""
+    print(line, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI shim (module surface only -- never a worker verb)."""
     ap = argparse.ArgumentParser(prog="claude_worker.har_backfill")
@@ -357,8 +405,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db", default=None)
     ap.add_argument("--series", action="append", default=None, help="only these names")
     ap.add_argument("--horizon-days", type=int, default=HORIZON_DAYS_DEFAULT)
-    ap.add_argument("--overlap-days", type=int, default=OVERLAP_DAYS_DEFAULT)
     ap.add_argument("--max-pages", type=int, default=None, help="page budget for this run")
+    ap.add_argument(
+        "--import-from",
+        type=pathlib.Path,
+        default=None,
+        help="first copy the sources' 1 m rows from this store (INSERT OR IGNORE)",
+    )
     ap.add_argument("--now-ms", type=int, default=None)
     args = ap.parse_args(argv)
     toml_path = (
@@ -380,11 +433,17 @@ def main(argv: list[str] | None = None) -> int:
     now = int(time.time() * 1000) if args.now_ms is None else args.now_ms
     conn = claude_worker.candles.open_db(db)
     try:
+        if args.import_from is not None:
+            try:
+                import_rows(conn, args.import_from.expanduser(), series, _say)
+            except (OSError, sqlite3.Error) as e:
+                print(f"har-backfill: import: {e}", file=sys.stderr)
+                return 2
         with httpx.Client() as client:
             http = claude_worker.candles.make_http(client, os.environ)
             pager = Pager(http, sleep=time.sleep, budget=args.max_pages)
-            run = Run(conn, pager, now, args.horizon_days, args.overlap_days)
-            complete = run_all(run, series, lambda line: print(line, flush=True))
+            run = Run(conn, pager, now, args.horizon_days)
+            complete = run_all(run, series, _say)
     finally:
         conn.close()
     return 0 if complete else 1
