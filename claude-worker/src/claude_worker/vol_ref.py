@@ -105,6 +105,7 @@ TENORS = {
 }
 
 I64_MAX = 2**63 - 1
+I64_MIN = -(2**63)
 U64_MASK = 2**64 - 1
 U64_BITS = 64
 
@@ -204,6 +205,46 @@ def qlike_1e9(ln_rv_1e9, ln_sigma_1e9):
         u = exp2_1e9(arg)
     u = min(u, I64_MAX)
     return u - ln_u - 1_000_000_000
+
+
+def ols_fit_1e9(xs, ys):
+    """``(a_1e9, b_1e9)`` -- the fit BOTH engines take (``core_vol::ols_fit_1e9``,
+    lifted out of ``VolEngine::refit`` at HAR H1; the V4 fixtures are the
+    proof it did not move).
+
+    ``None`` below ``MIN_PAIRS`` pairs, on a regressor with no spread or
+    less than ``X_SPREAD_MIN_1E9`` of it, or on a line outside i64. BIN15
+    P1b (F5): the slope is clamped BEFORE the intercept is formed, so
+    ``a`` belongs to the line the engine will use. Order-free.
+    """
+    n = len(xs)
+    if n < MIN_PAIRS:
+        return None
+    xbar = sum(xs) // n
+    ybar = sum(ys) // n
+    sxy = 0
+    sxx = 0
+    for x, y in zip(xs, ys, strict=True):
+        dx = x - xbar
+        dy = y - ybar
+        sxy += dx * dy
+        sxx += dx * dx
+    if sxx == 0 or sxx < n * X_SPREAD_MIN_1E9 * X_SPREAD_MIN_1E9:
+        return None
+    b = min(max((sxy * 1_000_000_000) // sxx, B_MIN_1E9), B_MAX_1E9)
+    a = ybar - (b * xbar) // 1_000_000_000
+    if not (I64_MIN <= a <= I64_MAX and I64_MIN <= b <= I64_MAX):
+        return None
+    return (a, b)
+
+
+def trailing_means_1e9(a, b):
+    """The floored means of two equally long trailing windows -- the QLIKE
+    tell's arithmetic, one body for both engines (``(0, 0)`` when empty)."""
+    n = len(a)
+    if n == 0:
+        return (0, 0)
+    return (sum(a) // n, sum(b) // n)
 
 
 class VolEngine:
@@ -449,8 +490,7 @@ class VolEngine:
         n = len(self.qlike_har_1e9)
         if n == 0:
             return (0, 0, 0, False)
-        iv = sum(self.qlike_iv_1e9) // n
-        har = sum(self.qlike_har_1e9) // n
+        iv, har = trailing_means_1e9(self.qlike_iv_1e9, self.qlike_har_1e9)
         return (n, iv, har, n == QLIKE_RING and har < iv)
 
     def _push_pair(self, x_1e9, y_1e9):
@@ -461,30 +501,411 @@ class VolEngine:
             self.pair_y_1e9.pop(0)
 
     def _refit(self):
-        n = len(self.pair_x_1e9)
-        if n < MIN_PAIRS:
+        fit = ols_fit_1e9(self.pair_x_1e9, self.pair_y_1e9)
+        if fit is None:
             self.fitted = False
             return
-        xbar = sum(self.pair_x_1e9) // n
-        ybar = sum(self.pair_y_1e9) // n
-        sxy = 0
-        sxx = 0
-        for i in range(n):
-            dx = self.pair_x_1e9[i] - xbar
-            dy = self.pair_y_1e9[i] - ybar
-            sxy += dx * dy
-            sxx += dx * dx
-        if sxx == 0:
-            self.fitted = False
+        self.a_1e9, self.b_1e9 = fit
+        self.fitted = True
+
+
+# --- the long tenors (HAR H1; Rust counterpart: crates/core-vol/src/long.rs) ---
+#
+# One ``sum r^2`` per UTC day instead of a minute ring; the fold over
+# (1, 7, 30) completed days in VolEngine's integer steps; every whole-day
+# tenor 1..=40 (O-HC5); pairs made by the clock at each day close,
+# overlapping, keyed by the target's first day; a rolling fit per tenor
+# (``ols_fit_1e9``) and a QLIKE tell of the raw fold against the fit AS
+# ARMED. The shared fixture ``tests/fixtures/vol/long-1.*`` pins this
+# class to the Rust bit for bit.
+
+DAY_MS = 86_400_000
+DAY_NS = DAY_MS * 1_000_000
+DAY_MINUTES = 1440
+DAY_RING = 64
+PAIR_RING_LONG = 128
+LONG_WINDOWS_DAYS = (1, 7, 30)
+LONG_WARM_DAYS = LONG_WINDOWS_DAYS[-1]
+LONG_TAU_DAYS_MAX = 40
+_YEAR_MIN_E18 = 525_960 * 10**18
+_MINUTE_MS = 60_000
+#: Restore bounds (``core_vol::long``): a log-vol within +/-100 in log, a
+#: day sum within 1e32 -- the writer can never produce anything outside.
+_LN_ABS_MAX_1E9 = 100_000_000_000
+_SUM_SQ_MAX = 10**32
+
+
+def annualiser_1e9(tau_min):
+    """``round(sqrt(525 960 / tau_min) * 1e9)``, exactly, in integers --
+    the law that reproduces ``ANNUALISE_15M/4H/8H_1E9``."""
+    k = math.isqrt(_YEAR_MIN_E18 // tau_min)
+    return k + 1 if 4 * _YEAR_MIN_E18 >= tau_min * (2 * k + 1) ** 2 else k
+
+
+ANNUALISE_LONG_1E9 = tuple(annualiser_1e9(d * DAY_MINUTES) for d in range(1, LONG_TAU_DAYS_MAX + 1))
+
+
+def long_tenor_of(tau_ns):
+    """``(tau_days, tau_min, annualise_1e9)`` for a whole day ``1..=40``,
+    else ``None``."""
+    if tau_ns <= 0 or tau_ns % DAY_NS:
+        return None
+    d = tau_ns // DAY_NS
+    if d > LONG_TAU_DAYS_MAX:
+        return None
+    return (d, d * DAY_MINUTES, ANNUALISE_LONG_1E9[d - 1])
+
+
+def _tix(tau_ns):
+    t = long_tenor_of(tau_ns)
+    return None if t is None else t[0] - 1
+
+
+class LongVolEngine:
+    """The long-tenor engine, mirroring ``core_vol::LongVolEngine``.
+
+    Offline code: the pair and QLIKE rings are chronological lists (the
+    order the Rust accessors lend them in); the day ring keeps the
+    Rust's slot arithmetic, because ``day_at`` and the arms depend on it.
+    """
+
+    def __init__(self):
+        self.cur_sq = 0
+        self.prev_px_1e6 = 0
+        self.cur_day_ts_ms = 0
+        self.last_min_ts_ms = 0
+        self.gaps = 0
+        self.refused = 0
+        self.cur_n = 0
+        self.dirty = False
+        self.n_days = 0
+        self.day_sq = [0] * DAY_RING
+        self.day_ts_ms = [0] * DAY_RING
+        self.day_n = [0] * DAY_RING
+        self.day_x = [[LOG2_UNDEFINED] * LONG_TAU_DAYS_MAX for _ in range(DAY_RING)]
+        self.day_fit = [[LOG2_UNDEFINED] * LONG_TAU_DAYS_MAX for _ in range(DAY_RING)]
+        self.a_1e9 = [0] * LONG_TAU_DAYS_MAX
+        self.b_1e9 = [0] * LONG_TAU_DAYS_MAX
+        self.fitted = [False] * LONG_TAU_DAYS_MAX
+        self.pairs = [[] for _ in range(LONG_TAU_DAYS_MAX)]
+        self.qlike = [[] for _ in range(LONG_TAU_DAYS_MAX)]
+
+    # -- the feed --------------------------------------------------
+
+    def on_minute_close_at(self, px_1e6, min_ts_ms):
+        """One 1-minute close x1e6 stamped with its minute (ms)."""
+        if px_1e6 <= 0 or min_ts_ms <= self.last_min_ts_ms:
+            self.refused += 1
             return
-        # BIN15 P1b (F5), mirroring ``core_vol::VolEngine::refit``: a
-        # regressor floor, then the slope clamp BEFORE the intercept is
-        # formed, so ``a`` belongs to the line the engine will use.
-        if sxx < n * X_SPREAD_MIN_1E9 * X_SPREAD_MIN_1E9:
-            self.fitted = False
+        if self.dirty:
+            self.refresh()
+        day_ts = min_ts_ms - min_ts_ms % DAY_MS
+        if day_ts != self.cur_day_ts_ms and not self._roll_to(day_ts):
+            self.refused += 1
             return
-        b = min(max((sxy * 1_000_000_000) // sxx, B_MIN_1E9), B_MAX_1E9)
-        a = ybar - (b * xbar) // 1_000_000_000
-        self.b_1e9 = b
-        self.a_1e9 = a
-        self.fitted = -(2**63) <= b <= I64_MAX and -(2**63) <= a <= I64_MAX
+        if self.last_min_ts_ms > 0 and min_ts_ms != self.last_min_ts_ms + _MINUTE_MS:
+            self.gaps += 1
+        if self.prev_px_1e6 > 0:
+            r = ret_bps_1e9(self.prev_px_1e6, px_1e6)
+            self.cur_sq += r * r
+            self.cur_n += 1
+        self.prev_px_1e6 = px_1e6
+        self.last_min_ts_ms = min_ts_ms
+
+    def _last_day_ts(self):
+        return self.day_ts_ms[(self.n_days - 1) % DAY_RING]
+
+    def _roll_to(self, day_ts):
+        if self.cur_day_ts_ms != 0:
+            self._close_day(self.cur_day_ts_ms, self.cur_sq, self.cur_n)
+        elif self.n_days > 0 and day_ts <= self._last_day_ts():
+            return False
+        if self.n_days > 0:
+            nxt = self._last_day_ts() + DAY_MS
+            if nxt < day_ts:
+                # The empty-day law: no return across an unobserved day.
+                self.prev_px_1e6 = 0
+            if (day_ts - nxt) // DAY_MS >= DAY_RING:
+                self.n_days = 0
+            else:
+                while nxt < day_ts:
+                    self._close_day(nxt, 0, 0)
+                    nxt += DAY_MS
+        self.cur_day_ts_ms = day_ts
+        self.cur_sq = 0
+        self.cur_n = 0
+        return True
+
+    def _close_day(self, day_ts, sq, n):
+        g = self.n_days
+        s = g % DAY_RING
+        self.day_ts_ms[s] = day_ts
+        self.day_sq[s] = sq
+        self.day_n[s] = n
+        self.n_days = g + 1
+        v = self._fold()
+        for t in range(LONG_TAU_DAYS_MAX):
+            tau = t + 1
+            if g >= tau:
+                self._settle(t, g - tau)
+            x, fit = self._arm(v, t)
+            self.day_x[s][t] = x
+            self.day_fit[s][t] = fit
+
+    def _settle(self, t, arm_g):
+        a = arm_g % DAY_RING
+        x = self.day_x[a][t]
+        if x == LOG2_UNDEFINED:
+            return
+        first = arm_g + 1
+        window = range(first, first + t + 1)
+        if any(self.day_n[g % DAY_RING] == 0 for g in window):
+            return
+        acc = sum(self.day_sq[g % DAY_RING] for g in window)
+        rv = isqrt_i64(acc)
+        if rv <= 0:
+            return
+        y = ln_1e9(rv)
+        if y == LOG2_UNDEFINED:
+            return
+        self._push_pair(t, self.day_ts_ms[first % DAY_RING], x, y)
+        fit = self.day_fit[a][t]
+        if fit != LOG2_UNDEFINED:
+            self._push_qlike(t, qlike_1e9(y, x), qlike_1e9(y, fit))
+        self._refit(t)
+
+    def _arm(self, v, t):
+        if v <= 0:
+            return (LOG2_UNDEFINED, LOG2_UNDEFINED)
+        har = isqrt_i64(v * (t + 1) * DAY_MINUTES)
+        if har <= 0:
+            return (LOG2_UNDEFINED, LOG2_UNDEFINED)
+        x = ln_1e9(har)
+        if x == LOG2_UNDEFINED:
+            return (LOG2_UNDEFINED, LOG2_UNDEFINED)
+        if self.fitted[t]:
+            return (x, self.a_1e9[t] + (self.b_1e9[t] * x) // 1_000_000_000)
+        return (x, LOG2_UNDEFINED)
+
+    def _fold(self):
+        if not self.is_warm():
+            return 0
+        mean_sq = 0
+        acc = 0
+        back = 0
+        for win in LONG_WINDOWS_DAYS:
+            while back < win:
+                acc += self.day_sq[(self.n_days - 1 - back) % DAY_RING]
+                back += 1
+            rv = isqrt_i64(acc)
+            mean_sq += rv * rv // (win * DAY_MINUTES)
+        return mean_sq // len(LONG_WINDOWS_DAYS)
+
+    def _push_pair(self, t, ts_ms, x, y):
+        self.pairs[t].append((ts_ms, x, y))
+        if len(self.pairs[t]) > PAIR_RING_LONG:
+            self.pairs[t].pop(0)
+
+    def _push_qlike(self, t, raw, fit):
+        self.qlike[t].append((raw, fit))
+        if len(self.qlike[t]) > QLIKE_RING:
+            self.qlike[t].pop(0)
+
+    def _refit(self, t):
+        fit = ols_fit_1e9([p[1] for p in self.pairs[t]], [p[2] for p in self.pairs[t]])
+        if fit is None:
+            self.fitted[t] = False
+            return
+        self.a_1e9[t], self.b_1e9[t] = fit
+        self.fitted[t] = True
+
+    # -- state and forecasts ---------------------------------------
+
+    def is_warm(self):
+        """The newest ``LONG_WARM_DAYS`` closed days resident and every one
+        OBSERVED (an empty day in the window is a hole)."""
+        if self.n_days < LONG_WARM_DAYS:
+            return False
+        return all(
+            self.day_n[(self.n_days - 1 - back) % DAY_RING] > 0 for back in range(LONG_WARM_DAYS)
+        )
+
+    def x_1e9(self, tau_ns):
+        """The regressor armed at the newest close -- the RAW forecast."""
+        t = _tix(tau_ns)
+        if t is None or self.n_days == 0:
+            return None
+        x = self.day_x[(self.n_days - 1) % DAY_RING][t]
+        return None if x == LOG2_UNDEFINED else x
+
+    def fit(self, tau_ns):
+        """``(a_1e9, b_1e9)`` of the tenor's rolling fit."""
+        t = _tix(tau_ns)
+        if t is None or not self.fitted[t]:
+            return None
+        return (self.a_1e9[t], self.b_1e9[t])
+
+    def ln_sigma_fit_1e9(self, tau_ns):
+        """``a + b*x/1e9`` x1e9."""
+        x = self.x_1e9(tau_ns)
+        f = self.fit(tau_ns)
+        if x is None or f is None:
+            return None
+        return f[0] + (f[1] * x) // 1_000_000_000
+
+    def sigma_ann_1e9(self, tau_ns, which):
+        """A forecast (``which`` in ``("raw", "fit")``) annualised x1e9."""
+        tenor = long_tenor_of(tau_ns)
+        if tenor is None:
+            return None
+        ln = self.x_1e9(tau_ns) if which == "raw" else self.ln_sigma_fit_1e9(tau_ns)
+        if ln is None:
+            return None
+        return VolEngine._annualised_1e9(ln, tenor[2])
+
+    def n_pairs(self, tau_ns):
+        """Pairs held for the tenor (0 off the grid)."""
+        t = _tix(tau_ns)
+        return 0 if t is None else len(self.pairs[t])
+
+    def qlike_counters(self, tau_ns):
+        """``(n, raw_mean_1e9, fit_mean_1e9, fit_beats_raw)``."""
+        t = _tix(tau_ns)
+        if t is None or not self.qlike[t]:
+            return (0, 0, 0, False)
+        rows = self.qlike[t]
+        raw, fit = trailing_means_1e9([r[0] for r in rows], [r[1] for r in rows])
+        n = len(rows)
+        return (n, raw, fit, n == QLIKE_RING and fit < raw)
+
+    # -- the writer's view -----------------------------------------
+
+    def n_resident(self):
+        """Closed days resident, at most ``DAY_RING``."""
+        return min(self.n_days, DAY_RING)
+
+    def _resident_g(self, i):
+        n = self.n_resident()
+        return None if i >= n else self.n_days - n + i
+
+    def day_at(self, i):
+        """``(day_ts_ms, sum_sq, n_min)`` of the i-th resident day."""
+        g = self._resident_g(i)
+        if g is None:
+            return None
+        s = g % DAY_RING
+        return (self.day_ts_ms[s], self.day_sq[s], self.day_n[s])
+
+    def open_day(self):
+        """``(day_ts_ms, sum_sq, n_min)`` of the open day, or ``None``."""
+        if self.cur_day_ts_ms == 0:
+            return None
+        return (self.cur_day_ts_ms, self.cur_sq, self.cur_n)
+
+    def arm_at(self, i, tau_ns):
+        """``(x, fit)`` armed at the close of the i-th resident day."""
+        t = _tix(tau_ns)
+        g = self._resident_g(i)
+        if t is None or g is None:
+            return None
+        x = self.day_x[g % DAY_RING][t]
+        if x == LOG2_UNDEFINED:
+            return None
+        return (x, self.day_fit[g % DAY_RING][t])
+
+    def pair_at(self, tau_ns, i):
+        """The tenor's i-th pair ``(target_ts_ms, x, y)``, oldest first."""
+        t = _tix(tau_ns)
+        if t is None or i >= len(self.pairs[t]):
+            return None
+        return self.pairs[t][i]
+
+    def qlike_at(self, tau_ns, i):
+        """The tenor's i-th QLIKE row ``(raw, fit)``, oldest first."""
+        t = _tix(tau_ns)
+        if t is None or i >= len(self.qlike[t]):
+            return None
+        return self.qlike[t][i]
+
+    # -- restore ---------------------------------------------------
+
+    def _contiguous(self, day_ts_ms):
+        return self.n_days == 0 or day_ts_ms == self._last_day_ts() + DAY_MS
+
+    def seed_day(self, day_ts_ms, sum_sq, n_min):
+        """Restore one CLOSED day (contiguous, before any open day)."""
+        if (
+            self.cur_day_ts_ms != 0
+            or day_ts_ms == 0
+            or day_ts_ms % DAY_MS
+            or not 0 <= sum_sq <= _SUM_SQ_MAX
+            or not self._contiguous(day_ts_ms)
+        ):
+            return False
+        s = self.n_days % DAY_RING
+        self.day_ts_ms[s] = day_ts_ms
+        self.day_sq[s] = sum_sq
+        self.day_n[s] = n_min
+        self.day_x[s] = [LOG2_UNDEFINED] * LONG_TAU_DAYS_MAX
+        self.day_fit[s] = [LOG2_UNDEFINED] * LONG_TAU_DAYS_MAX
+        self.n_days += 1
+        return True
+
+    def seed_open(self, day_ts_ms, sum_sq, n_min, last_min_ts_ms, prev_px_1e6):
+        """Restore the OPEN day and the feed's position."""
+        if (
+            self.cur_day_ts_ms != 0
+            or day_ts_ms == 0
+            or day_ts_ms % DAY_MS
+            or not 0 <= sum_sq <= _SUM_SQ_MAX
+            or prev_px_1e6 <= 0
+            or not day_ts_ms <= last_min_ts_ms < day_ts_ms + DAY_MS
+            or not self._contiguous(day_ts_ms)
+        ):
+            return False
+        self.cur_day_ts_ms = day_ts_ms
+        self.cur_sq = sum_sq
+        self.cur_n = n_min
+        self.last_min_ts_ms = last_min_ts_ms
+        self.prev_px_1e6 = prev_px_1e6
+        return True
+
+    def seed_arm(self, tau_ns, day_ts_ms, x_1e9, fit_1e9):
+        """Restore a tenor's arm at the close of a resident day."""
+        t = _tix(tau_ns)
+        in_range = 0 <= x_1e9 <= _LN_ABS_MAX_1E9 and (
+            fit_1e9 == LOG2_UNDEFINED or -_LN_ABS_MAX_1E9 <= fit_1e9 <= _LN_ABS_MAX_1E9
+        )
+        if t is None or not in_range:
+            return False
+        for i in range(self.n_resident()):
+            s = self._resident_g(i) % DAY_RING
+            if self.day_ts_ms[s] == day_ts_ms:
+                self.day_x[s][t] = x_1e9
+                self.day_fit[s][t] = fit_1e9
+                return True
+        return False
+
+    def seed_pair(self, tau_ns, target_ts_ms, x_1e9, y_1e9):
+        """Restore one pair, oldest first; no fit until ``refresh``."""
+        t = _tix(tau_ns)
+        if t is None or not (0 <= x_1e9 <= _LN_ABS_MAX_1E9 and 0 <= y_1e9 <= _LN_ABS_MAX_1E9):
+            return False
+        self._push_pair(t, target_ts_ms, x_1e9, y_1e9)
+        self.fitted[t] = False
+        self.dirty = True
+        return True
+
+    def seed_qlike(self, tau_ns, raw_1e9, fit_1e9):
+        """Restore one QLIKE row, oldest first."""
+        t = _tix(tau_ns)
+        if t is None or LOG2_UNDEFINED in (raw_1e9, fit_1e9):
+            return False
+        self._push_qlike(t, raw_1e9, fit_1e9)
+        return True
+
+    def refresh(self):
+        """Refit every tenor once after a restore."""
+        for t in range(LONG_TAU_DAYS_MAX):
+            self._refit(t)
+        self.dirty = False

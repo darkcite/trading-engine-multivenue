@@ -34,6 +34,54 @@ Each entry is atomic: one version bump per section. Do not batch.
 
 - Revert the commit.
 
+## 2026-09-26 — the long-tenor HAR in the worker: the parity mirror, the shared tape, `har_seed` (HAR H2)
+
+**What changed**
+
+- `claude_worker.vol_ref` gains `LongVolEngine` (+ `long_tenor_of`,
+  `ANNUALISE_LONG_1E9`, the day constants), the bit-exact mirror of
+  `core_vol::LongVolEngine`, and the lifted `ols_fit_1e9` /
+  `trailing_means_1e9` that its `VolEngine` now delegates to (the V4
+  fixtures stay byte-identical and green).
+- A shared tape, `claude-worker/tests/fixtures/vol/long-1.{input,expected}.tsv`:
+  ~210 days of a regime walk through the day clock, a hole, a short day,
+  two empty days, refusals, the fits and QLIKE windows filling, the 1 d
+  pair ring wrapping, a whole-ring silence that clears, and a restore
+  into a fresh engine (seeds accepted and refused, the withheld fit,
+  `refresh`, a live continuation). The expected rows are WRITTEN by
+  `crates/core-vol/tests/long_parity.rs` (`HAR_LONG_PARITY_WRITE=long-1`)
+  and replayed row by row by `tests/test_vol_ref_long.py`; a second
+  harness test fails if a regenerated tape stops exercising any branch.
+- `claude_worker.har_seed` (new module, `python -m …`, never a verb):
+  `show` (the forecast table per tenor, raw beside fit, annualised, with
+  the QLIKE tell), `seed-out` (the v1 seed rows `V`/`D`/`C`/`A`/`P`/`Q`
+  the H3 reader will apply in file order — the lookahead law holds:
+  nothing at or after `--now-ms` is read) and `compare` (the per-day
+  `Σ r²` agreement of two series — the measurement a `--fallback` must
+  pass before its days are trusted).
+
+**Why**
+
+- Plan phase H2: the engine's long-tenor numbers must be reproducible
+  offline to the bit, and the boot seed must be cut by the same law.
+
+**Impact**
+
+- None on the engine or any worker verb. The `candles-cycle.sh` /
+  `engine-wrapper.sh` seed hooks the plan lists for H2 are NOT added: they
+  would run for a `har.toml` that has no parser until H3 (whose feed
+  descriptor per series, `StrategySet` ownership and `/state.har` are
+  operator rulings).
+
+**Migration steps**
+
+1. None. To read the long tenors of a series today:
+   `python -m claude_worker.har_seed show --descriptor binance-usdm:btcusdt`.
+
+**Rollback**
+
+- Revert the `HAR:` H2 commit.
+
 ## 2026-09-26 — `core_vol::LongVolEngine`: the HAR over whole days, 1–40 d (HAR H1)
 
 **What changed**
