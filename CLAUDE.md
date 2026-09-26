@@ -277,6 +277,11 @@ in the script; `ai` = 48 is the floor every name includes).
   [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
   names `claude-opus-4-6` as the session model (the three review agents are
   pinned to `claude-opus-5-5` — ruling O-8, 2026-09-23).
+- **Reminder — upgrade to rustls 0.24 once 0.24.0 is released** (operator,
+  2026-09-26: the only rustls work we need). 0.24 decrypts records in
+  place — the fix for core-net's rustls RX copy and allocation per record
+  (gate 72). Today: pinned 0.23.38, only `0.24.0-dev.*` published;
+  `cargo info rustls@0.24.0` answers "could not find" until it is out.
 
 ## Standing operator laws (survive every archival)
 
