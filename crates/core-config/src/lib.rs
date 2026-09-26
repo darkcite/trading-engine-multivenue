@@ -31,6 +31,8 @@ use zeroize::Zeroize;
 
 pub mod bin15;
 pub mod exec;
+/// HAR H3: the long-tenor HAR series list (`har.toml`).
+pub mod har;
 /// HYPARB H5: the slot-0 member's parameter artifact (`hyparb.toml`).
 pub mod hyparb;
 pub mod icdp;

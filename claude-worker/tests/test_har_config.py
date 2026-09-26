@@ -173,3 +173,28 @@ def test_the_default_path_honours_the_env(
     )
     monkeypatch.setenv(claude_worker.har_config.PATH_ENV, str(tmp_path / "h.toml"))
     assert claude_worker.har_config.default_path() == tmp_path / "h.toml"
+
+
+def test_the_example_is_read_as_the_engine_reads_it() -> None:
+    """``har.toml.example`` is its parser's contract: the engine's test
+    parses it, and so must the worker's, to the same twelve series."""
+    example = pathlib.Path(__file__).resolve().parents[2] / "har.toml.example"
+    got = claude_worker.har_config.read(example)
+    assert [s.name for s in got] == [
+        "SP500",
+        "SPCX",
+        "MU",
+        "NVDA",
+        "MSFT",
+        "META",
+        "AAPL",
+        "BABA",
+        "SNDK",
+        "BOT",
+        "BTC",
+        "ETH",
+    ]
+    assert all(s.feed.startswith("binance-usdm:") for s in got)
+    assert got[0].fallback == ("okx:SPY-USDT-SWAP",)
+    assert got[7].fallback == ()
+    assert got[9].fallback == ("bybit-linear:BOTUSDT",)
