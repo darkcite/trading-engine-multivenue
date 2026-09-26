@@ -1,0 +1,20 @@
+[package]
+name         = "exec-gateway"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "Venue-agnostic order-gateway kit (XMM XH4a, O-XH13): the engine/gateway SPSC duplex with shared stats and latency trackers, an in-place in-flight table, a fixed-capacity deadline queue, the make-before-break reconnect machine and the loop's wait policy. Zero allocation after construction; no unsafe."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-latency = { workspace = true }
+core-net     = { workspace = true }
+core-ring    = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

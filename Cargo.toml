@@ -70,6 +70,9 @@ members = [
     "crates/clob-dispatcher",
     "crates/exec-router",
     "crates/exec-hyperliquid",
+    # XMM XH4a (O-XH13): the venue-agnostic order-gateway kit — reused by
+    # the Hyperliquid gateway (XH4b), MEXC (XM2) and Binance (BX6)
+    "crates/exec-gateway",
     "crates/signer-eip712",
     # HYPARB H7 (O-H7): chain-agnostic EIP-1559 render + sign
     "crates/signer-evm",
@@ -213,6 +216,7 @@ strategy-xsd          = { path = "crates/strategy-xsd" }
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }
 exec-hyperliquid = { path = "crates/exec-hyperliquid" }
+exec-gateway     = { path = "crates/exec-gateway" }
 signer-eip712   = { path = "crates/signer-eip712" }
 signer-evm      = { path = "crates/signer-evm" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }

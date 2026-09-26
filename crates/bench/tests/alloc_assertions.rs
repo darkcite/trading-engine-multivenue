@@ -10387,3 +10387,286 @@ fn long_vol_set_is_zero_alloc() {
     assert_eq!(allocs, 0, "long-tenor set allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "long-tenor set bytes should be zero: saw {bytes}");
 }
+
+/// **XMM XH4a gate 83 — the order-gateway kit is 0 B/op.** Built once
+/// (both rings, the stats block, the in-flight table, the deadline queue,
+/// the tx buffer — boot). Under the guard:
+///
+/// * **A — 10 000 turns of a gateway loop at load:** the engine pushes
+///   three 64 B commands a turn; the gateway pops them into one post
+///   claimed in place, arms a 30 ms TTL per command, frames a 3 000 B
+///   payload in place (the 16-bit length form of a signed post) and arms
+///   the post's 5 s timeout; each post's reply comes 200 turns later — so
+///   200 posts stay in flight — read back through `sent_ns` / `get_mut`
+///   / `get`, one event per item, the timeout cancelled; the TTLs fire as
+///   they come due; a make-before-break swap every 1 000 turns; the wait
+///   policy, every latency tracker and the gauges every turn; the engine
+///   drains its events in place.
+/// * **B — every refusal and cold path:** the command ring pushed until
+///   it refuses; the deadline queue armed until `TimerFull`, then
+///   cleared; the in-flight table walked with `id_at` and emptied; a
+///   connection death and its re-dial; a replacement whose drain outlives
+///   its budget and is retired; a quiet stretch in which the wait policy
+///   parks under the next deadline; and (release builds, where it is not
+///   a panic) a side duplex's event ring overflowed: counted and halted.
+#[test]
+fn exec_gateway_kit_is_zero_alloc() {
+    use core_net::{ws_frame_in_place, Backoff, WsOpcode, WS_CLIENT_HDR_MAX};
+    use exec_gateway::stats::{HALT_EVENT_RING_FULL, HALT_NONE};
+    use exec_gateway::{
+        duplex, Expired, Idle, Mbb, MbbAction, Pending, TimerFull, TimerId, TimerQueue,
+    };
+
+    #[derive(Copy, Clone)]
+    #[repr(C, align(64))]
+    struct Msg {
+        oid: u64,
+        t_ns: u64,
+        _pad: [u8; 48],
+    }
+    #[derive(Copy, Clone)]
+    struct Post {
+        n: usize,
+        oids: [u64; 39],
+    }
+    const MS: u64 = 1_000_000;
+    const TIMEOUT: u8 = 1;
+    const TTL: u8 = 2;
+    const IN_FLIGHT: u64 = 200;
+    let msg = |oid: u64, t_ns: u64| Msg {
+        oid,
+        t_ns,
+        _pad: [0; 48],
+    };
+
+    let (mut eng, mut gw) = duplex::<Msg, Msg, 1024, 4096>();
+    let (_side_eng, mut side_gw) = duplex::<Msg, Msg, 2, 8>();
+    let mut pending: Pending<Post, 256> = Pending::new(Post {
+        n: 0,
+        oids: [0; 39],
+    });
+    let mut timers: TimerQueue<1024> = TimerQueue::new();
+    let mut tids: [Option<TimerId>; 256] = [None; 256];
+    let mut mbb = Mbb::new(
+        Backoff::new(500 * MS, 8_000 * MS, 7),
+        30_000 * MS,
+        10_000 * MS,
+        5_000 * MS,
+    );
+    let mut idle = Idle::default();
+    let mut tx = vec![0u8; WS_CLIENT_HDR_MAX + 4_096];
+    let body = [b'x'; 3_000];
+    let stats = std::sync::Arc::clone(&gw.stats);
+    if let MbbAction::Dial(s) = mbb.poll(0) {
+        mbb.on_live(s, 0);
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut oid = 1u64;
+    let mut post_id = 1u64;
+    let mut expired = Expired {
+        deadline_ns: 0,
+        key: 0,
+        kind: 0,
+    };
+
+    // ---- A: steady traffic, 200 posts in flight --------------------
+    let mut turn = 0u64;
+    while turn < 10_000 {
+        let now = 1_000 * MS + turn * MS;
+        let mut k = 0;
+        while k < 3 {
+            assert!(eng.cmd.push(&msg(oid, now)));
+            oid += 1;
+            k += 1;
+        }
+        let post = pending.claim(post_id, now).expect("gate 83 claim");
+        post.n = 0;
+        let mut worked = false;
+        while let Some(c) = gw.cmd.pop() {
+            post.oids[post.n] = c.oid;
+            post.n += 1;
+            stats.push_to_write.record(now.saturating_sub(c.t_ns) + 1);
+            assert!(
+                timers.arm(now + 30 * MS, c.oid, TTL).is_ok(),
+                "gate 83: TTL queue full"
+            );
+            worked = true;
+        }
+        tx[WS_CLIENT_HDR_MAX..WS_CLIENT_HDR_MAX + body.len()].copy_from_slice(&body);
+        let start = ws_frame_in_place(
+            &mut tx,
+            WS_CLIENT_HDR_MAX,
+            WsOpcode::Text,
+            body.len(),
+            [1, 2, 3, 4],
+        )
+        .expect("gate 83 frame");
+        acc = acc.wrapping_add(u64::from(tx[start]));
+        stats.note_action_sent();
+        tids[(post_id & 255) as usize] = Some(
+            timers
+                .arm(now + 5_000 * MS, post_id, TIMEOUT)
+                .expect("gate 83 timeout"),
+        );
+        if post_id > IN_FLIGHT {
+            let old = post_id - IN_FLIGHT;
+            let sent = pending.sent_ns(old).expect("gate 83: in flight");
+            if let Some(p) = pending.get_mut(old) {
+                p.n = p.n.min(39);
+            }
+            let n = pending.get(old).map_or(0, |p| p.n);
+            let mut i = 0;
+            while i < n {
+                let o = pending.get(old).map_or(0, |p| p.oids[i]);
+                assert!(gw.evt.emit(&msg(o, now)));
+                i += 1;
+            }
+            assert!(pending.release(old));
+            let t = tids[(old & 255) as usize]
+                .take()
+                .expect("gate 83: its timeout");
+            assert!(timers.cancel(t));
+            stats.note_reply();
+            stats.post_rtt.record(now - sent);
+        }
+        stats.cancel_rtt.record(200 * MS + turn);
+        stats.fill_venue_to_local.record(120 * MS + turn);
+        post_id += 1;
+        while timers.pop_due(now, &mut expired) {
+            acc = acc.wrapping_add(expired.key ^ u64::from(expired.kind));
+        }
+        if turn % 1_000 == 999 {
+            mbb.request_replace();
+            if let MbbAction::Dial(s) = mbb.poll(now) {
+                mbb.on_live(s, now);
+                mbb.on_drained(s ^ 1, now);
+            }
+        }
+        mbb.note_healthy(now);
+        stats.set_gauges(pending.live() as u64, mbb.active().is_some());
+        acc = acc.wrapping_add(idle.timeout_ns(worked, now, timers.next_deadline()));
+        acc =
+            acc.wrapping_add(gw.evt.room() as u64 + eng.cmd.queued() as u64 + gw.cmd.len() as u64);
+        while let Some(ev) = eng.evt.pop() {
+            acc = acc.wrapping_add(ev.oid);
+        }
+        turn += 1;
+    }
+    let live_after_a = pending.live();
+
+    // ---- B: every refusal and cold path ----------------------------
+    let t0 = 20_000 * MS;
+    let mut refused = false;
+    while !refused {
+        refused = !eng.cmd.push(&msg(oid, t0));
+        oid += 1;
+    }
+    while let Some(c) = gw.cmd.pop() {
+        acc = acc.wrapping_add(c.oid);
+    }
+    while timers.arm(u64::MAX - 1, 7, TTL).is_ok() {
+        acc = acc.wrapping_add(1);
+    }
+    assert_eq!(
+        timers.arm(u64::MAX - 1, 7, TTL),
+        Err(TimerFull),
+        "full, and it says so"
+    );
+    timers.clear();
+    let mut s = 0usize;
+    while s < pending.capacity() {
+        if let Some(id) = pending.id_at(s) {
+            assert!(pending.release(id));
+        }
+        s += 1;
+    }
+    let a = mbb.active().expect("gate 83: a live connection");
+    mbb.on_down(a, t0);
+    match mbb.poll(t0 + 10_000 * MS) {
+        MbbAction::Dial(s) => mbb.on_live(s, t0 + 10_000 * MS),
+        other => panic!("gate 83: no re-dial ({other:?})"),
+    }
+    mbb.request_replace();
+    let old = mbb.active().expect("gate 83: re-dialled");
+    match mbb.poll(t0 + 11_000 * MS) {
+        MbbAction::Dial(s) => mbb.on_live(s, t0 + 11_000 * MS),
+        other => panic!("gate 83: no replacement dial ({other:?})"),
+    }
+    let retire = mbb.poll(t0 + 16_000 * MS);
+    if retire == MbbAction::Retire(old) {
+        mbb.on_down(old, t0 + 16_000 * MS);
+    }
+    let mut parked = 0u64;
+    let mut k = 0;
+    while k < 2_000 {
+        if idle.timeout_ns(false, t0, Some(t0 + 50_000)) > 0 {
+            parked += 1;
+        }
+        k += 1;
+    }
+    let side_halt = if cfg!(debug_assertions) {
+        HALT_EVENT_RING_FULL // debug: a lost event is a panic (exec-gateway's own test pins both)
+    } else {
+        let mut k = 0u64;
+        while k < 8 {
+            assert!(side_gw.evt.emit(&msg(k, t0)));
+            k += 1;
+        }
+        assert!(!side_gw.evt.emit(&msg(9, t0)));
+        side_gw.stats.halt_reason()
+    };
+
+    // Every read before the measurement closes.
+    let q50 = stats.post_rtt.quantile_ns(0.5);
+    let ring = stats.gateway_ring();
+    let cmds = stats.cmds();
+    let io = stats.io();
+    let timers_left = timers.len();
+    let live_left = pending.live();
+    let main_halt = stats.halt_reason();
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(
+        live_after_a, IN_FLIGHT as usize,
+        "200 posts in flight through phase A"
+    );
+    assert_eq!(mbb.swaps(), 11, "ten swaps in A, one in B");
+    assert_eq!(
+        retire,
+        MbbAction::Retire(old),
+        "the drain outlived its budget"
+    );
+    assert_eq!(
+        cmds,
+        (30_000 + 1_024, 1),
+        "the ring took 1 024 and refused the next"
+    );
+    assert_eq!(
+        ring,
+        (30_000 + 1_024, 0),
+        "every command popped, no event lost"
+    );
+    assert_eq!(io[0], 10_000, "one action a turn");
+    assert_eq!(
+        io[1],
+        10_000 - IN_FLIGHT,
+        "a reply for every post older than 200 turns"
+    );
+    assert!(q50 >= 200 * MS, "post RTT = 200 turns of 1 ms");
+    assert_eq!((timers_left, live_left), (0, 0));
+    assert!(parked > 0, "a quiet gateway parks");
+    assert_eq!(side_halt, HALT_EVENT_RING_FULL);
+    assert_eq!(main_halt, HALT_NONE);
+    assert_eq!(
+        allocs, 0,
+        "the gateway kit allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "the gateway kit bytes should be zero: saw {bytes}"
+    );
+}

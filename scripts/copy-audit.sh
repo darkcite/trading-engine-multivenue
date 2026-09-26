@@ -12,7 +12,8 @@
 # This script lists every byte-copy verb in the given crate directories
 # (default: the exec lane, core-net, core-ring, all nine ingress crates
 # (since the ZC pass of 2026-09-24) plus ingress-hypercall (born inside
-# the gate, HC3) and the HYPARB lane's AMM math and member) that has NO `COPY:` marker within the eight preceding lines,
+# the gate, HC3) and the HYPARB lane's AMM math and member; XMM's member and, since
+# XH4a, the order-gateway kit `crates/exec-gateway`) that has NO `COPY:` marker within the eight preceding lines,
 # and compares the list against the committed baseline
 # `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
@@ -76,6 +77,7 @@ if [ "$#" -eq 0 ]; then
            crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
            crates/ingress-hypercall \
            crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/core-fill crates/engine \
+           crates/exec-gateway \
            crates/cli/src/evm_shadow.rs \
            crates/cli/src/hyparb_live.rs
 fi

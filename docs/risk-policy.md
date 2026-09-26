@@ -6465,5 +6465,109 @@ engine gate driving the paper order-event pump.
   verb keeps the simulator's per-symbol clock, so the XH2 parity result
   stands.
 
-The laws XH-1…XH-7 (plan §10) are proposed for this file when their
-phase lands (XH3 paper member, XH4 execution).
+### Operator-confirmed deviations from plan v2 (Anton, 2026-09-26)
+
+Nine departures the build made from `xmm-hl-maker-plan-2026-09-26.md`
+v2, each logged when it was made, all confirmed by the operator at the
+end of session 2:
+
+1. Perp depth is captured top-5 (the existing `DepthTopK`), not top 20.
+2. Ring slots are 64 B (one cache line, the house law), not the plan's
+   40/32 B.
+3. The order-event lane drains after EVERY fill source (E6), not only
+   after the tick lanes.
+4. xmm has its own 32-order queue table in the paper matcher; the strict
+   members keep the shared 64-slot table.
+5. The parity gate runs on its own verb (`xmm-parity`), not `backtest
+   --member xmm`.
+6. 15 parity windows (2026-09-25), not 13; the sign rule applied as
+   ≥ 14/15.
+7. Hyperliquid has no per-order TTL: the XH4 gateway sends each order's
+   TTL cancel itself (`expiresAfter` only rejects a late action;
+   `scheduleCancel` is an account-wide cancel-all, ≤ 10 triggers a day).
+8. `[labels.xmm]` is carried and never consulted (the HORIZON law);
+   xmm's off switches are the XH-2 pulls, the caps and the XH4 arm's
+   halts.
+9. XH4's testnet battery starts before the XH3 bar is met; XH5's mainnet
+   probe waits for the bar.
+
+Proposed, for the operator to confirm:
+
+10. (with XH4h) The Hyperliquid arm's transport becomes a per-arm boot
+    choice that defaults to today's blocking path, so merging XH4 changes
+    nothing live until the operator flips it.
+11. (XH4a) No command-ring doorbell (the plan's XH4b row: "mio poll: WS
+    socket + command ring doorbell"): the gateway busy-polls while work
+    flows and then requests poller timeouts of at most 100 µs, so the
+    engine's push never makes a syscall; the wait this adds is measured
+    (`push_to_write`), and `park_ns = 0` removes it on a pinned core.
+
+### XH4a amendment (2026-09-26): the order-gateway kit — nothing wired, nothing armed
+
+`crates/exec-gateway` (O-XH13) holds the venue-agnostic half of the
+asynchronous gateway XH4 builds for every Hyperliquid strategy (O-XH7),
+reused by MEXC (XM2) and Binance (BX6): the engine ⇄ gateway duplex (one
+bounded SPSC ring each way, each end two disjoint handles), the shared
+stats block with its halt word and latency trackers, the in-flight post
+table, the deadline queue, the make-before-break reconnect machine and
+the gateway's wait policy. **No engine path uses it yet**; a live slot 6
+still refuses the boot, and nothing here changes live behaviour.
+
+**The laws it fixes for every gateway built on it (XG-1 … XG-5):**
+
+* **XG-1 — the engine's push is a ring write.** No syscall (deviation
+  11), no allocation, never blocking. A full command ring REFUSES the
+  command (counted): the caller fails a growing order closed; a refused
+  cancel stays the caller's to retry and its order keeps counting as
+  exposure. The halt and cancel-all path must never depend on ring room
+  (XH4b: an engine-written cancel-all word beside the ring).
+* **XG-2 — a lost event halts the arm.** Commands and events are 64 B
+  slots and the event ring holds at least four command rings
+  (const-asserted); the gateway stops popping commands while the event
+  ring lacks room for its in-flight worst case (XH4b). A full event ring
+  is still a bug: the drop is counted and the halt word set, then a
+  `debug_assert!` fails (tested in both builds). **The halt word is
+  advisory until it has readers:** the gateway enforces it itself from
+  XH4b, the engine reads it (and `/metrics` shows it) from XH4f.
+* **XG-3 — deadlines.** A GROWING command (place, modify) the gateway
+  cannot time out — its deadline queue full — is not sent. A cancel (TTL,
+  sticky, sweep) always goes out; its missing timeout is counted and
+  reconciliation is the backstop. The queue is sized so that a full queue
+  is a sizing bug, which halts the arm.
+* **XG-4 — make-before-break.** A replaced connection drains — no new
+  post; its in-flight replies still land — and is retired when empty or
+  when its drain budget runs out; a dial that never comes up is given up
+  after its budget. The reconnect backoff resets only after a session
+  that stayed up the healthy span (30 s, the ingress law of `7235201`)
+  and moved data (a matched reply or a pong).
+* **XG-5 — one halt registry.** Every halt reason of every gateway lives
+  in `exec_gateway::stats` (the kit owns 1–15, a venue gateway numbers
+  its own from 16); the first reason wins.
+
+core-net gains `ws_frame_in_place`: a client frame around a payload
+rendered in place behind reserved room — `WS_CLIENT_HDR_MAX` (14 B) fits
+every length; 8 B is exact for 126 ..= 65 535 B, every signed post, and
+leaves no gap before the frame — the signed order post's frame with no
+copy (the XH4b TX path). The mask destroys the plaintext: a REST
+fallback of the same post XORs it back, never renders it twice.
+
+**Open for XH4b** (the gateway that uses the kit): a post whose reply
+never comes (its deadline passes), comes malformed, or is stranded on a
+connection that died or was retired is E-5 "sent, unanswered" — never
+REJECTED (plan §5's "malformed reply → REJECTED" is superseded): its
+orders keep counting as exposure until `orderUpdates` or reconciliation
+resolves them, and it is never re-signed. A REST re-send of the same
+signed bytes (the WebSocket down) whose nonce the venue refuses means
+the WebSocket original may have landed: in doubt, never a reject.
+
+Gates (XH4a, 2026-09-26): alloc 87/87 in release (gate 83: the kit
+under load and on every refusal path, 0 B/op); clippy clean; copy-audit
+hits 31 = baseline, new 0 (`crates/exec-gateway` joins the default dirs,
+no hit); nextest 3452/3454 — the two reds are known isolation-disproven
+flakes, green alone (`hl_userws_loopback`'s oversized-frame test, and
+HC7's gate 80 in the debug profile under full-suite load); the existing
+members' replays byte-identical against main's binary.
+
+The laws XH-1…XH-7 (plan §10) are recorded here as their XH4 sub-phases
+land (the XH2/XH3 amendments carry the member's halves of XH-2, XH-4 and
+XH-6).

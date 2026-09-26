@@ -332,8 +332,9 @@ in the script; `ai` = 48 is the floor every name includes).
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known
-  isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc` and
-  `hl_outcome_meta_parsers_are_zero_alloc` (debug profile),
+  isolation-disproven flakes: `ai_exec_on_ai_is_zero_alloc`,
+  `hl_outcome_meta_parsers_are_zero_alloc` and
+  `settlement_window_and_median_of_means_are_zero_alloc` (debug profile),
   `scrape_hammer_all_succeed_without_conn_errors`,
   `hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
   (red under parallel load, green alone), `ws_frame_roundtrip_is_zero_alloc`
@@ -559,6 +560,9 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   the seqlock `/state` snapshot; `crates/tui`.
 - `crates/exec-router` + `crates/exec-hyperliquid` + `crates/signer-eip712`
   + `crates/clob-dispatcher` — the execution lane (see CURRENT STATE).
+  `crates/exec-gateway` — the venue-agnostic async order-gateway kit (XMM
+  XH4a: duplex rings, in-flight table, deadline queue, make-before-break;
+  nothing wired to it before XH4b).
   `crates/signer-evm` + `crates/exec-hyperevm` — HYPARB's HyperEVM write
   path: configuration arms TESTNET only (`EVM_ARM_CHAIN_IDS = [998]`,
   compile-time asserted); mainnet only through a `MainnetAuthority`
