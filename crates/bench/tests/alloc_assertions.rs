@@ -24,8 +24,8 @@ use core_alloc::{AllocGuard, CountingAllocator};
 static GLOBAL: CountingAllocator = CountingAllocator::new();
 
 use core_net::{
-    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_text_frame, TestTransport,
-    WsReadResult,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_text_frame,
+    ws_write_text_frame_rendered, TestTransport, WsReadResult,
 };
 use core_parse::scan_price_1e6;
 use core_ring::Ring;
@@ -98,13 +98,15 @@ fn guard_reports_zero_when_nothing_allocates() {
 // ---------------------------------------------------------------
 
 /// Round-trip a WebSocket text frame (write → read → unmask) 10_000
-/// times through the preallocated tx/rx buffers. The full core-net
-/// codec path must not allocate.
+/// times through the preallocated tx/rx buffers, the header-first render
+/// beside the plain writer. The full core-net codec path must not
+/// allocate.
 #[test]
 fn ws_frame_roundtrip_is_zero_alloc() {
     // Preallocated tx/rx buffers — single allocation each, outside the
     // measurement window.
     let mut tx = [0u8; 256];
+    let mut rendered = [0u8; 256];
     let mut rx = [0u8; 256];
     let payload: &[u8] = b"{\"u\":12345,\"s\":\"BTCUSDT\"}";
 
@@ -114,6 +116,8 @@ fn ws_frame_roundtrip_is_zero_alloc() {
     for i in 0..10_000u64 {
         let mask = ws_mask_from_counter(i);
         let n = ws_write_text_frame(&mut tx, payload, mask).unwrap();
+        let m = ws_write_text_frame_rendered(&mut rendered, mask, |p| p.put(payload)).unwrap();
+        assert!(rendered[..m] == tx[..n], "the rendered frame differs");
         // Copy the written bytes into rx so the read path operates on
         // its own mutable buffer (unmask is in-place).
         rx[..n].copy_from_slice(&tx[..n]);

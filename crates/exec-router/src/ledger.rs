@@ -784,14 +784,15 @@ impl Ledger {
             if self.rows[i].is_bound() {
                 if self.rows[i].family as usize == family && self.rows[i].venue == venue {
                     // A REPEAT of the roll that is already live binds
-                    // nothing: the venue re-sends `outcomeCreated` on
-                    // a reconnect and the ingress dedups it, but this
-                    // ledger is the risk gate's memory and does not
-                    // get to rely on a layer above — retiring the row
-                    // here would zero a real position and drop its
-                    // resting orders under a flat reading (the guard
-                    // `settle` already has, applied to `bind`; E7
-                    // review 2026-09-19).
+                    // nothing. The venue pushes `outcomeCreated` once
+                    // and replays none on a reconnect (probed
+                    // 2026-09-26), and the ingress dedups a repeat,
+                    // but this ledger is the risk gate's memory and
+                    // does not get to rely on a layer above —
+                    // retiring the row here would zero a real
+                    // position and drop its resting orders under a
+                    // flat reading (the guard `settle` already has,
+                    // applied to `bind`; E7 review 2026-09-19).
                     if self.rows[i].outcome == outcome && self.rows[i].settled == 0 {
                         return;
                     }
@@ -1390,8 +1391,9 @@ mod tests {
     }
 
     /// **A repeated CREATED frame for the LIVE instance binds nothing.**
-    /// The venue re-sends `outcomeCreated` on a reconnect; the ledger
-    /// must not zero a real position on it.
+    /// The venue pushes `outcomeCreated` once and replays none on a
+    /// reconnect (probed 2026-09-26), but should a repeat ever reach
+    /// the ledger, it must not zero a real position on it.
     #[test]
     fn a_repeated_created_frame_for_the_live_instance_keeps_the_position() {
         let mut l = bound();

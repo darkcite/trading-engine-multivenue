@@ -461,6 +461,11 @@ mod dispatcher_idle_tests {
 
 /// Endpoint config for a single WSS ingress. All strings are owned
 /// + boxed because they have to outlive the ingress thread.
+///
+/// It also carries the Hyperliquid `/info` endpoint (`path` =
+/// `/info`) that ingress re-reads between sessions — resolved at boot
+/// like the WS host, so the Hyperliquid ingress thread never runs a
+/// DNS lookup.
 #[derive(Debug, Clone)]
 pub struct WssEndpoint {
     /// Hostname (for SNI + the `Host:` header).
@@ -775,6 +780,7 @@ pub fn spawn_polymarket(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = pwl::run(
                     &mut transport,
@@ -803,6 +809,7 @@ pub fn spawn_polymarket(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, pwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -890,6 +897,7 @@ pub fn spawn_binance(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = bwl::run(
                     &mut transport,
@@ -918,6 +926,7 @@ pub fn spawn_binance(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, bwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -1625,6 +1634,7 @@ pub fn spawn_okx(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = owl::run(
                     &mut transport,
@@ -1664,6 +1674,7 @@ pub fn spawn_okx(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, owl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -1914,6 +1925,7 @@ pub fn spawn_deribit(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = dwl::run(
                     &mut transport,
@@ -1954,6 +1966,7 @@ pub fn spawn_deribit(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, dwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -2082,9 +2095,15 @@ pub fn build_hl_families(
 /// §4.3). There is no depth flag: `l2Book` is always subscribed —
 /// it feeds the §6.2 per-coin staleness monitor. See
 /// [`spawn_polymarket`] for the capture-open / fail-fast contract.
+///
+/// `info_ep` is the `/info` endpoint (`Config::hyperliquid_api_host`,
+/// resolved at boot like `ep`): a reconnect that retired a rolling
+/// family re-discovers its successor there
+/// ([`boot_discovery::fetch_hl_outcome_specs`]).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_hyperliquid(
     ep: WssEndpoint,
+    info_ep: WssEndpoint,
     tls_config: RustlsConfig,
     coins: ingress_hyperliquid::HlCoinTable,
     families: ingress_hyperliquid::family::HlFamilyTable,
@@ -2137,10 +2156,63 @@ pub fn spawn_hyperliquid(
             // XMM XH1: every parsed `trades` row also reaches the
             // engine's trade lane (the driver outlives reconnects).
             driver.set_trade_lane(trade_tx);
+            // VM2 V2: HL funding rides AssetCtx — the lane mask carries
+            // both bits (feature-engine law). BIN15 O2: with rolling
+            // families configured the lane also carries the roll and the
+            // MARK — a member cannot price a HIP-4 binary without the
+            // strike's reference, and cannot know which instance its
+            // slot holds without the roll.
+            let event_mask = if has_families {
+                EVENT_LANE_FUNDING
+                    | EVENT_LANE_ASSET_CTX
+                    | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
+                    | core_types::event_lane_bit(core_types::ChannelId::Mark)
+            } else {
+                EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
+            };
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
+            let mut last_rediscovery_ns: Option<u64> = None;
             while !shutdown_requested() {
                 status.set_state(IngressState::Connecting);
+                // Reconnect hygiene (2026-09-26): a family on a settled
+                // or expired instance is retired here — never
+                // re-subscribed (the venue drops the socket on it) — and
+                // its successor re-discovered over `/info`, because
+                // `outcomeMetaUpdates` replays nothing on subscribe.
+                // Before the socket opens, so the `/info` round trip
+                // never idles a fresh TLS session; at most once a
+                // minute, so a family whose deployer stopped creating
+                // instances cannot turn every reconnect into a fetch.
+                let retired = driver.reset_for_reconnect(now_ns());
+                if retired > 0 {
+                    tracing::warn!(
+                        retired,
+                        "hyperliquid: families on a settled/expired instance retired before resubscribing"
+                    );
+                }
+                let now = now_ns();
+                let due = match last_rediscovery_ns {
+                    Some(at) => now.saturating_sub(at) >= HL_REDISCOVERY_MIN_INTERVAL_NS,
+                    None => true,
+                };
+                if driver.families_awaiting() > 0 && due && !shutdown_requested() {
+                    last_rediscovery_ns = Some(now);
+                    let bound = rediscover_hl_families(
+                        &mut driver,
+                        &info_ep,
+                        &tls_config,
+                        &mut event_tx,
+                        event_mask,
+                        &status,
+                        &mut capture,
+                    );
+                    // The roll records must reach disk even if the
+                    // connect that follows fails.
+                    if bound > 0 {
+                        capture.mirror_now();
+                    }
+                }
                 let mut transport = match connect_tls(&ep, &server_name, &tls_config) {
                     Ok(t) => t,
                     Err(e) => {
@@ -2158,8 +2230,8 @@ pub fn spawn_hyperliquid(
                         return;
                     }
                 };
-                driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = hwl::run(
                     &mut transport,
@@ -2168,21 +2240,7 @@ pub fn spawn_hyperliquid(
                     ep.path.as_bytes(),
                     &mut producer,
                     &mut event_tx,
-                    // VM2 V2: HL funding rides AssetCtx — the lane
-                    // mask carries both bits (feature-engine law).
-                    // BIN15 O2: with rolling families configured the
-                    // lane also carries the roll and the MARK — a
-                    // member cannot price a HIP-4 binary without the
-                    // strike's reference, and cannot know which
-                    // instance its slot holds without the roll.
-                    if has_families {
-                        EVENT_LANE_FUNDING
-                            | EVENT_LANE_ASSET_CTX
-                            | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
-                            | core_types::event_lane_bit(core_types::ChannelId::Mark)
-                    } else {
-                        EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
-                    },
+                    event_mask,
                     &mut poll,
                     &mut events,
                     token,
@@ -2191,7 +2249,22 @@ pub fn spawn_hyperliquid(
                     &mut keepalive,
                     &mut capture,
                 );
-                tracing::info!(?res, "hyperliquid: run-loop returned");
+                let session_ns = now_ns().saturating_sub(session_start_ns);
+                // T1(a): name the end on the line the operator greps —
+                // `res=Disconnected` alone hid a 1.2 s reconnect loop
+                // for hours (2026-09-26).
+                let err = status.take_last_err();
+                let (acks, acks_expected) = driver.ack_progress();
+                tracing::info!(
+                    ?res,
+                    err_site = core_metrics::err_site_name(err.site),
+                    io_kind = core_metrics::io_kind_name(err.io_kind),
+                    venue_code = err.venue_code as i32,
+                    lived_ms = session_ns / 1_000_000,
+                    acks,
+                    acks_expected,
+                    "hyperliquid: run-loop returned"
+                );
                 capture.mirror_now();
                 if matches!(res, hwl::RunResult::Stopped) {
                     status.set_state(IngressState::Down);
@@ -2211,6 +2284,7 @@ pub fn spawn_hyperliquid(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    session_ns,
                     matches!(res, hwl::RunResult::IdleTimeout | hwl::RunResult::Stale),
                 ) {
                     backoff.reset();
@@ -2223,6 +2297,99 @@ pub fn spawn_hyperliquid(
             status.set_state(IngressState::Down);
         },
     ))
+}
+
+/// Minimum spacing of the between-session `/info` re-read
+/// ([`rediscover_hl_families`]): a family whose deployer stopped
+/// creating instances stays `awaiting` for good, and a connect-failure
+/// storm reconnects every ≤ 8 s — neither may turn into a fetch per
+/// attempt.
+const HL_REDISCOVERY_MIN_INTERVAL_NS: u64 = 60_000_000_000;
+
+/// Re-discover the live instance of every rolling family a reconnect
+/// retired (2026-09-26): one `/info {"type":"outcomeMeta"}` fetch —
+/// the boot's own request and parser — then
+/// [`hwl::Driver::rebind_dormant`], which binds without touching the
+/// wire and announces each adoption as a roll. Returns how many
+/// families were bound (the caller flushes their roll events).
+///
+/// Cold path: between sessions, only while a family awaits a
+/// successor, throttled by the caller. A failed fetch leaves the
+/// family awaiting; the venue's next `outcomeCreated` adopts it on a
+/// healthy session, and a later reconnect asks again.
+///
+/// One race remains, by construction: a successor created between
+/// this snapshot and the new session's `outcomeMetaUpdates` ack is
+/// missed until the family's NEXT instance — at most one 15-minute
+/// instance (a daily's successor is listed a day ahead).
+fn rediscover_hl_families<C: core_types::Capture>(
+    driver: &mut hwl::Driver,
+    info_ep: &WssEndpoint,
+    tls: &RustlsConfig,
+    event_tx: &mut Producer<ChannelEvent, EVENT_RING_SIZE>,
+    event_mask: u16,
+    status: &IngressStatus,
+    capture: &mut C,
+) -> usize {
+    let specs = match boot_discovery::fetch_hl_outcome_specs(tls, info_ep) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = e,
+                awaiting = driver.families_awaiting(),
+                "hyperliquid: successor re-discovery failed — retired families wait for the venue's next outcomeCreated"
+            );
+            return 0;
+        }
+    };
+    let bound = driver.rebind_dormant(&specs, event_tx, event_mask, status, capture);
+    tracing::info!(
+        bound,
+        awaiting = driver.families_awaiting(),
+        candidates = specs.len(),
+        "hyperliquid: successors re-discovered at reconnect"
+    );
+    if bound > 0 {
+        log_hl_families(driver.families());
+    }
+    bound
+}
+
+/// One line per rolling family — its instance, or that it has none.
+/// The boot binding and every reconnect re-discovery report through
+/// this, so both read the same in the log.
+pub fn log_hl_families(families: &ingress_hyperliquid::family::HlFamilyTable) {
+    let mut f = 0usize;
+    while f < families.len() {
+        let Some(row) = families.get(f) else {
+            break;
+        };
+        let underlying = core::str::from_utf8(row.underlying_bytes()).unwrap_or("?");
+        if row.dormant {
+            tracing::info!(
+                family = f,
+                underlying,
+                period_s = row.period_s,
+                sym_yes = row.sym[0],
+                sym_no = row.sym[1],
+                "hyperliquid: family dormant (no live instance)"
+            );
+        } else {
+            tracing::info!(
+                family = f,
+                underlying,
+                period_s = row.period_s,
+                sym_yes = row.sym[0],
+                sym_no = row.sym[1],
+                live = row.live.outcome,
+                strike_1e6 = row.live.strike_1e6,
+                expiry_ns = row.live.expiry_ns,
+                twap_s = row.live.twap_s,
+                "hyperliquid: family live"
+            );
+        }
+        f += 1;
+    }
 }
 
 /// Spawn the Polygon JSON-RPC ingress thread. See [`spawn_polymarket`]
@@ -2288,6 +2455,7 @@ pub fn spawn_rpc(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
 
                 let res = rwl::run(
                     &mut transport,
@@ -2313,6 +2481,7 @@ pub fn spawn_rpc(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, rwl::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -2426,6 +2595,7 @@ pub fn spawn_hyperevm(
                 };
                 driver.reset_for_reconnect(now_ns());
                 let ticks_before = status.ticks_total();
+                let session_start_ns = now_ns();
                 let res = hel::run(
                     &mut transport,
                     &mut driver,
@@ -2462,6 +2632,7 @@ pub fn spawn_hyperevm(
                 if should_reset_backoff(
                     status.ticks_total(),
                     ticks_before,
+                    now_ns().saturating_sub(session_start_ns),
                     matches!(res, hel::RunResult::IdleTimeout),
                 ) {
                     backoff.reset();
@@ -3633,6 +3804,11 @@ impl Observability {
             let ingress_hl_families_dormant = reg
                 .register_gauge("engine_ingress_hyperliquid_families_dormant")
                 .map_err(|_| "register engine_ingress_hyperliquid_families_dormant")?;
+            // BIN15 O8: outcome legs' one-sided `bbo` pushes, dropped by
+            // policy — their own count, out of `parse_errors_total`.
+            let ingress_hl_outcome_bbo_one_sided = reg
+                .register_gauge("engine_ingress_hyperliquid_outcome_bbo_one_sided_total")
+                .map_err(|_| "register engine_ingress_hyperliquid_outcome_bbo_one_sided_total")?;
             let ingress_bybit_state = reg
                 .register_gauge("engine_ingress_bybit_state")
                 .map_err(|_| "register engine_ingress_bybit_state")?;
@@ -3833,6 +4009,7 @@ impl Observability {
                 ingress_hl_rolls_ignored,
                 ingress_hl_family_ack_timeouts,
                 ingress_hl_families_dormant,
+                ingress_hl_outcome_bbo_one_sided,
                 ingress_bybit_state,
                 ingress_rpc_state,
                 ingress_mexc_state,
@@ -4139,6 +4316,8 @@ pub struct EngineCounters {
     pub ingress_hl_family_ack_timeouts: core_metrics::GaugeId,
     /// BIN15 O2: `engine_ingress_hyperliquid_families_dormant` (gauge).
     pub ingress_hl_families_dormant: core_metrics::GaugeId,
+    /// BIN15 O8: `engine_ingress_hyperliquid_outcome_bbo_one_sided_total`.
+    pub ingress_hl_outcome_bbo_one_sided: core_metrics::GaugeId,
     /// WS9: per-ingress state gauge, Bybit v5 public WS.
     pub ingress_bybit_state: core_metrics::GaugeId,
     /// Per-ingress state gauge: Polygon JSON-RPC.
@@ -7617,6 +7796,8 @@ where
                         .set(ing.hl_roll.family_ack_timeouts() as i64);
                     reg.gauge(ids.ingress_hl_families_dormant)
                         .set(ing.hl_roll.families_dormant() as i64);
+                    reg.gauge(ids.ingress_hl_outcome_bbo_one_sided)
+                        .set(ing.hl_roll.outcome_bbo_one_sided() as i64);
                     reg.gauge(ids.ingress_hyperliquid_state)
                         .set(ing.hyperliquid.state() as i64);
                     reg.gauge(ids.ingress_bybit_state)
@@ -7991,17 +8172,35 @@ fn sleep_backoff(b: &mut Backoff) {
     thread::sleep(delay);
 }
 
+/// A session must live this long, moving market data, before its end
+/// resets the reconnect backoff ([`should_reset_backoff`]).
+const HEALTHY_SESSION_MIN_NS: u64 = 30_000_000_000;
+
 /// T1(b) — the D8 intent, restored (outage 2026-08-27 §5.3): the
 /// reconnect schedule resets only when the session actually MOVED
-/// MARKET DATA (`ticks_total` advanced), or ended in a venue-quiet
+/// MARKET DATA (`ticks_total` advanced) for at least
+/// [`HEALTHY_SESSION_MIN_NS`], or ended in a venue-quiet
 /// idle/staleness trip (inherently rate-limited by the keepalive /
 /// staleness budget, so it cannot hammer). A session that only
 /// received its own subscribe rejection — the exact post-settlement
 /// failure that reconnected at ~1 Hz for 16 h/day — keeps
-/// escalating. One definition for all six venue loops.
+/// escalating.
+///
+/// The lifetime clause (2026-09-26): a Hyperliquid session that
+/// re-subscribed a settled HIP-4 coin got its snapshots and was then
+/// dropped by the venue within a second — ticks moved, so the backoff
+/// reset every time and the lane reconnected every ~1.2 s for hours
+/// (~48 connects/min against the venue's 30/min per IP). Whatever the
+/// cause, a session that dies young now escalates to the 8 s cap.
+/// One definition for every single-connection venue loop.
 #[inline]
-fn should_reset_backoff(ticks_after: u64, ticks_before: u64, venue_quiet_trip: bool) -> bool {
-    ticks_after > ticks_before || venue_quiet_trip
+fn should_reset_backoff(
+    ticks_after: u64,
+    ticks_before: u64,
+    session_ns: u64,
+    venue_quiet_trip: bool,
+) -> bool {
+    (ticks_after > ticks_before && session_ns >= HEALTHY_SESSION_MIN_NS) || venue_quiet_trip
 }
 
 /// T1(c) (outage 2026-08-27 finding F12): age in seconds of the
@@ -8075,6 +8274,11 @@ fn log_pin_outcome(thread_label: &str, core_id: usize) {
 /// thread spawns, and (OKX only) builds the discovery-gated
 /// [`ingress_okx::OkxSymbolTable`] `build_okx_symbol_table` now
 /// requires.
+///
+/// One exception runs after boot: [`fetch_hl_outcome_specs`](boot_discovery::fetch_hl_outcome_specs),
+/// the Hyperliquid ingress thread's between-session re-read of the
+/// live HIP-4 outcomes (2026-09-26 reconnect-loop fix) — cold,
+/// throttled, to an address resolved at boot, on a short deadline.
 ///
 /// BN + RPC deliberately have no discovery here: Binance discovery is
 /// out of Phase-8 scope (plan §6.1), and Polygon RPC has no
@@ -8775,6 +8979,57 @@ pub mod boot_discovery {
         Ok(out)
     }
 
+    /// The `/info` body that lists every live HIP-4 outcome.
+    const HL_OUTCOME_META_REQ: &[u8] = br#"{"type":"outcomeMeta"}"#;
+
+    /// Deadline for the between-session re-read: the ingress thread
+    /// waits on it with the lane dark, so it is kept far below the
+    /// boot's [`FETCH_TIMEOUT`].
+    const REDISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// The live HIP-4 outcome specs, re-read from
+    /// `/info {"type":"outcomeMeta"}` with the boot's own request and
+    /// parser.
+    ///
+    /// Reconnect-loop fix (2026-09-26): how the Hyperliquid ingress
+    /// re-discovers the successor of a rolling family it retired at a
+    /// reconnect — `outcomeMetaUpdates` replays nothing on subscribe,
+    /// so an `outcomeCreated` a dead session missed never comes back,
+    /// and without this a daily family would stay dark until the next
+    /// day's instance. Cold path: the ingress thread calls it between
+    /// sessions, only while a family awaits a successor, at most once a
+    /// minute — to `ep`'s boot-resolved address, so no DNS lookup runs
+    /// and every socket step is armed with what remains of
+    /// [`REDISCOVERY_TIMEOUT`].
+    pub fn fetch_hl_outcome_specs(
+        tls: &Arc<rustls::ClientConfig>,
+        ep: &super::WssEndpoint,
+    ) -> Result<Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>, &'static str> {
+        let mut buf = Vec::new();
+        let range = core_net::boot_http::https_post_at(
+            tls,
+            ep.addr,
+            &ep.host,
+            &ep.path,
+            USER_AGENT,
+            b"application/json",
+            HL_OUTCOME_META_REQ,
+            &mut buf,
+            MAX_BODY,
+            REDISCOVERY_TIMEOUT,
+        )
+        .map_err(|e| {
+            tracing::warn!(venue = "hl", request = "outcomeMeta", error = ?e, "re-discovery: fetch failed");
+            "hl: outcomeMeta fetch failed"
+        })?;
+        let mut d = HlDiscovery::new();
+        d.ingest_outcome_meta(&buf[range]).map_err(|e| {
+            tracing::warn!(venue = "hl", request = "outcomeMeta", error = ?e, "re-discovery: parse failed");
+            "hl: outcomeMeta parse failed"
+        })?;
+        Ok(d.outcome_specs())
+    }
+
     #[allow(clippy::type_complexity)]
     fn run_hl(
         cfg: &Config,
@@ -8791,7 +9046,7 @@ pub mod boot_discovery {
             ("meta", br#"{"type":"meta"}"#),
             ("spotMeta", br#"{"type":"spotMeta"}"#),
             ("perpDexs", br#"{"type":"perpDexs"}"#),
-            ("outcomeMeta", br#"{"type":"outcomeMeta"}"#),
+            ("outcomeMeta", HL_OUTCOME_META_REQ),
         ];
         for (i, (label, body)) in requests.iter().enumerate() {
             if i > 0 {
@@ -9739,21 +9994,29 @@ mod tests {
     }
 
     /// T1(b) (outage 2026-08-27 §5.3): the predicate that replaces
-    /// the msgs-based reset. Happy path: data moved ⇒ reset. Failure
-    /// mode: a rejection-only session (msgs moved, ticks did not)
-    /// must keep escalating; a venue-quiet idle/staleness trip is
-    /// rate-limited by construction and may reset.
+    /// the msgs-based reset. Happy path: data moved for a healthy
+    /// lifetime ⇒ reset. Failure modes: a rejection-only session (msgs
+    /// moved, ticks did not) must keep escalating, and so must a session
+    /// that moved data but died young (2026-09-26: HL snapshots, then
+    /// the venue's drop, every ~1.2 s); a venue-quiet idle/staleness
+    /// trip is rate-limited by construction and may reset.
     #[test]
-    fn backoff_resets_only_on_moved_data_or_quiet_trip() {
-        // Data moved ⇒ reset regardless of result class.
-        assert!(should_reset_backoff(10, 3, false));
+    fn backoff_resets_only_on_a_healthy_session_or_quiet_trip() {
+        let healthy = HEALTHY_SESSION_MIN_NS;
+        // Data moved for a healthy lifetime ⇒ reset.
+        assert!(should_reset_backoff(10, 3, healthy, false));
+        assert!(should_reset_backoff(10, 3, u64::MAX, false));
         // Rejection-only session: ticks unchanged ⇒ keep escalating.
-        assert!(!should_reset_backoff(3, 3, false));
+        assert!(!should_reset_backoff(3, 3, healthy, false));
         // The exact outage shape: rejection received every cycle,
         // never a tick — first cycle from zero included.
-        assert!(!should_reset_backoff(0, 0, false));
+        assert!(!should_reset_backoff(0, 0, healthy, false));
+        // The 2026-09-26 shape: snapshots moved, then the venue dropped
+        // the socket ~1 s in ⇒ keep escalating, however many ticks.
+        assert!(!should_reset_backoff(1_000, 3, 1_000_000_000, false));
+        assert!(!should_reset_backoff(10, 3, healthy - 1, false));
         // Venue-quiet idle/staleness trip ⇒ reset (budget-limited).
-        assert!(should_reset_backoff(3, 3, true));
+        assert!(should_reset_backoff(3, 3, 0, true));
     }
 
     /// T1(c): stamp-age helper degrades to -1, never panics, when

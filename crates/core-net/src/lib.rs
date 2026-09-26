@@ -55,8 +55,8 @@ pub use keepalive::{
 };
 pub use subs::{
     queue_masked_binary_frame, queue_masked_binary_frame_parts, queue_masked_text_frame,
-    queue_masked_text_frame_parts, PendingErr, PendingReq, PendingTable, ReqKind, SubErr, SubId,
-    SubTable,
+    queue_masked_text_frame_parts, queue_masked_text_frame_rendered, PendingErr, PendingReq,
+    PendingTable, ReqKind, SubErr, SubId, SubTable,
 };
 
 pub use http1::{
@@ -69,8 +69,9 @@ pub use transport::{
 };
 pub use ws_frame::{
     ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_binary_frame_parts,
-    ws_write_ping, ws_write_pong, ws_write_text_frame, ws_write_text_frame_parts, PayloadSpan,
-    WsFrameHeader, WsOpcode, WsReadResult, WsWriteErr,
+    ws_write_ping, ws_write_pong, ws_write_text_frame, ws_write_text_frame_parts,
+    ws_write_text_frame_rendered, PayloadSpan, WsFrameHeader, WsOpcode, WsPayload, WsReadResult,
+    WsWriteErr,
 };
 pub use ws_handshake::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,

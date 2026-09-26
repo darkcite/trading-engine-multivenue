@@ -183,7 +183,12 @@ in the script; `ai` = 48 is the floor every name includes).
   on the M4. The I-3 drain loops (risk-policy "The I-3 drain loops read
   past a full rx") share `core_net::drain`: a step whose read filled rx is
   driven again, as one that published or moved its state; at most 8 steps
-  per connection per poll, then a poll that does not sleep.
+  per connection per poll, then a poll that does not sleep. Batch
+  subscribes render straight into tx (2026-09-26, risk-policy "Batch
+  subscribes render straight into tx"): `core_net::queue_masked_text_frame_rendered`
+  counts the payload, writes the header, renders behind it and masks in
+  place — OKX, Deribit, Bybit, Polymarket and MEXC dropped their stack
+  scratches and the copy into tx; HyperEVM's request bodies stay copied.
 - **HYPARB — slot 0, MERGED to main 2026-09-23 (H0–H9d), DARK**
   (`docs/hyparb-build-plan.md` §16; risk-policy "HYPARB — slot 0"). The
   HyperEVM AMM ↔ HL Core arb: `crates/strategy-hyparb` over `core-amm`,
@@ -227,13 +232,35 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **Gates at HEAD (the I-3 drain loops, 2026-09-25; Foundry and worker
-  pytest as of the HYPARB merge):** nextest 3150 (5
+- **The Hyperliquid reconnect loop — fixed 2026-09-26 (`7235201`), LIVE
+  since the 09:03Z restart, verified at the 09:15Z roll** (risk-policy
+  "The Hyperliquid reconnect loop — dead HIP-4 instances"). The venue drops the whole socket (a bare FIN) on
+  a subscribe to a settled or unknown HIP-4 coin, and `outcomeMetaUpdates`
+  pushes a roll once and replays none to a later subscriber (both probed),
+  so a reconnect that re-subscribed a family's settled instance died every
+  ~1.2 s until a restart (15 190 times on 09-26 before the operator's
+  07:18Z revive). Now a reconnect retires dead instances and re-reads
+  `/info outcomeMeta` for their successors (to the address resolved at
+  boot — the HL thread never runs DNS; 3 s; at most once a minute);
+  staleness stops judging an instance at its expiry; the backoff resets
+  only after a session that lived 30 s (the seven loops sharing
+  `should_reset_backoff`); `hyperliquid: run-loop returned` names each end
+  (`err_site`, `io_kind`, `venue_code`, `lived_ms`, `acks`/`acks_expected`).
+  Its ~1.5/s "parse errors" were BIN15 O8's one-sided outcome `bbo` drops,
+  counted on their own from the next release build + restart
+  (`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`; risk-policy
+  "The one-sided outcome `bbo` is not a parse error"). Open:
+  `roll_health`'s second strike is unreachable (pre-existing); each roll's
+  unsubscribe echoes still count as parse errors.
+- **Gates at HEAD (the Hyperliquid reconnect-loop fix, 2026-09-26; Foundry
+  and worker pytest as of the HYPARB merge):** nextest 3169 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
   and `hyperevm_live_smoke` among them) · alloc 79/79 at the gates' pins
   (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
   child helper) · clippy clean · `make license-check` OK · `make
-  bench-check` OK (the M4 baseline, 2026-09-25) · `make
+  bench-check` OK at `4fec7ec` (the M4 baseline, 2026-09-25; not judged at
+  the D3 renders — its binary links none of the changed crates, and the
+  Mac ran at load 12–31) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all nine ingress crates and the HYPARB crates) ·
   Foundry 11 unit +
@@ -252,8 +279,8 @@ in the script; `ai` = 48 is the floor every name includes).
   `rpc_subscribe_envelope` 120 s and the seven ingress frame targets 60 s;
   ZC pass A: `cargo +nightly fuzz build` OK, Miri on core-ring clean
   (Stacked and Tree Borrows, `-Zmiri-many-seeds=0..16`)
-  · live smokes 60 s (the I-3 drain loops, 2026-09-25): MEXC and
-  Binance, 0 parse errors, 0 reconnects, 0 ring drops
+  · live smokes 60 s (the header-first subscribe renders, 2026-09-26):
+  MEXC and Binance, 0 parse errors, 0 reconnects, 0 ring drops
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known
@@ -275,6 +302,11 @@ in the script; `ai` = 48 is the floor every name includes).
   [labels] require = 1` is NOT flipped live; `.claude/settings.json` still
   names `claude-opus-4-6` as the session model (the three review agents are
   pinned to `claude-opus-5-5` — ruling O-8, 2026-09-23).
+- **Reminder — upgrade to rustls 0.24 once 0.24.0 is released** (operator,
+  2026-09-26: the only rustls work we need). 0.24 decrypts records in
+  place — the fix for core-net's rustls RX copy and allocation per record
+  (gate 72). Today: pinned 0.23.38, only `0.24.0-dev.*` published;
+  `cargo info rustls@0.24.0` answers "could not find" until it is out.
 
 ## Standing operator laws (survive every archival)
 

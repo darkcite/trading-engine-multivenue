@@ -96,7 +96,8 @@
 //! All parsing is in-place over `&[u8]` in the rx buffer. The one
 //! unavoidable copy per event is the 64-byte parsed POD copied into
 //! its SPSC ring slot by `try_push_ref` (the ring publish) — same as
-//! every ingress. Subscribe/ping frames render into fixed stack scratch.
+//! every ingress. Subscribe frames are masked into the tx buffer from
+//! their wire parts ([`subscription_parts`]); pings from their literal.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -1010,9 +1011,10 @@ pub enum CoinTableErr {
     TooLong,
     /// Coin empty.
     Empty,
-    /// BIN15 O2: [`HlCoinTable::rebind`] named a row that does not
-    /// exist. A programming error, not operator input — the family
-    /// table hands back the indices [`HlCoinTable::reserve`] returned.
+    /// BIN15 O2: [`HlCoinTable::rebind_outcome`] or
+    /// [`HlCoinTable::unbind`] named a row that does not exist. A
+    /// programming error, not operator input — the family table hands
+    /// back the indices [`HlCoinTable::reserve`] returned.
     NoSuchRow,
 }
 
@@ -1028,8 +1030,9 @@ pub enum CoinTableErr {
 /// as instances are created and settle.
 ///
 /// Ownership: [`Self::insert`] and [`Self::reserve`] are BOOT-time;
-/// [`Self::rebind`] is **ingress-thread only** (it runs inside the
-/// `outcomeMetaUpdates` arm). Everything else is a read.
+/// [`Self::rebind_outcome`] (the roll, inside the `outcomeMetaUpdates`
+/// arm) and [`Self::unbind`] (a reconnect retiring a dead instance)
+/// are **ingress-thread only**. Everything else is a read.
 pub struct HlCoinTable {
     rows: [(u8, [u8; HL_COIN_MAX], SymbolId); HL_MAX_COINS],
     len: usize,
@@ -1085,6 +1088,22 @@ impl HlCoinTable {
             return Err(CoinTableErr::TooLong);
         };
         row.0 = render_outcome_coin(dst, outcome, side) as u8;
+        Ok(())
+    }
+
+    /// Empty row `idx` again — the inverse of [`Self::rebind_outcome`].
+    /// Its `SymbolId` stays reserved; the coin it named is gone, so
+    /// [`Self::lookup`], [`expected_mask`] and the run loop's subscribe
+    /// sweep skip it, as they skip a row reserved for a dormant family.
+    /// **Ingress-thread only**, between sessions: a rolling instance
+    /// retired at a reconnect (`HlFamilyTable::retire`). Allocation-free.
+    pub fn unbind(&mut self, idx: usize) -> Result<(), CoinTableErr> {
+        if idx >= self.len {
+            return Err(CoinTableErr::NoSuchRow);
+        }
+        let row = &mut self.rows[idx];
+        row.0 = 0;
+        row.1 = [0; HL_COIN_MAX];
         Ok(())
     }
 
@@ -1183,7 +1202,8 @@ impl HlCoinTable {
     /// Whether row `idx` NAMES a venue instrument.
     ///
     /// A row that [`Self::reserve`] created for a dormant rolling
-    /// family names nothing until [`Self::rebind`] writes one, and is
+    /// family (or [`Self::unbind`] emptied again) names nothing until
+    /// [`Self::rebind_outcome`] writes one, and is
     /// skipped by [`Self::lookup`], [`expected_mask`] and the run
     /// loop's subscribe sweep for exactly that reason — it is not on
     /// the wire, so nothing about it can ever arrive.

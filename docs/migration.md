@@ -193,6 +193,66 @@ supervised restart and the post-boot checks.
   `hl-depth.pmlr` with perp rows reads fine on the old build, whose
   replay then merges them).
 
+## 2026-09-26 — HL: the one-sided outcome `bbo` drop counts on its own (`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`)
+
+**What changed**
+- A HIP-4 outcome leg's `bbo` with its ask `null` — BIN15 O8's policy
+  drop — is no longer a parse error: new gauge
+  `engine_ingress_hyperliquid_outcome_bbo_one_sided_total`; the frame
+  counts in `engine_ingress_hyperliquid_msgs_total` (never in
+  `…_ticks_total`) and is no longer tapped as a parse reject (it is still
+  tapped raw).
+
+**Impact**
+- Metrics: HL `…_parse_errors_total` falls by ≈ 1.5/s — its whole steady
+  rate on 2026-09-26 — and `…_msgs_total` rises by the same. It does not
+  go to zero: each mid-session roll still adds its unsubscribe echoes and
+  the frames in flight for the retired coins.
+- Captures: with the raw tap on, these frames stop appearing as rejects.
+
+**Migration steps**
+1. None: the routine restart of a binary built from this change.
+
+**Rollback**
+- Safe: an older binary counts them as parse errors again and the gauge
+  is gone.
+
+## 2026-09-26 — HL reconnect hygiene: lone `created` rolls, the `run-loop returned` fields, the healthy-session backoff (`7235201`)
+
+**What changed**
+- A reconnect retires a family on a settled or expired HIP-4 instance and
+  re-reads `/info outcomeMeta` for its successor. In captures such an
+  instance has no `settled` InstrumentRoll (its later push matches no
+  slot), and the re-discovered successor is a lone `created`, stamped when
+  adopted (`docs/wire-format.md`).
+- `hyperliquid: run-loop returned` gains `err_site`, `io_kind`,
+  `venue_code`, `lived_ms`, `acks`, `acks_expected`; core-metrics err sites
+  10 `peer-eof` and 11 `peer-close`.
+- The seven loops sharing `should_reset_backoff` (Polymarket, Binance,
+  OKX, Deribit, Hyperliquid, RPC, HyperEVM) reset their reconnect backoff
+  only after a session that moved data AND lived ≥ 30 s, or a venue-quiet
+  trip.
+- `HYPERLIQUID_API_HOST` is resolved once at boot (exit 1 if it does not
+  resolve) for the between-session re-read; boot discovery already
+  required it whenever HL is configured.
+
+**Impact**
+- Offline: a reader that pairs `settled` → `created` per slot sees a lone
+  `created` after a reconnect that retired an instance.
+  `backtest::binary::link_successors` links by created time and skips a
+  successor adopted later than `SUCCESSOR_MAX_LAG_NS` after the expiry, as
+  it does any capture gap.
+- Logs: greps on `run-loop returned res=` still match.
+- A venue that drops sessions young now sees reconnects climb 0.5 → 8 s
+  instead of ~1 s.
+
+**Migration steps**
+1. None: live since the 09:03Z restart of 2026-09-26.
+
+**Rollback**
+- Unsafe: an older binary re-subscribes dead instances on a reconnect —
+  the 1.2 s loop this fixed.
+
 ## 2026-09-24 — `scripts/bin15-flip.sh`: slot 3 PAPER ⇄ LIVE in one command (BIN15 S7-L1)
 
 **What changed**

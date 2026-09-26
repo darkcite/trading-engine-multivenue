@@ -1297,9 +1297,10 @@ every modify as a submit is the fail-closed choice with an existing
 precedent. **When the reduce-only bit is honoured (XH4), this is one of
 the sites to revisit.**
 
-**A repeated roll retires nothing.** The venue re-sends
-`outcomeCreated` on a reconnect snapshot and a replayed ring entry
-carries it too, so the handler compares the bound asset against the one
+**A repeated roll retires nothing.** A replayed ring entry carries one
+(the venue itself pushes `outcomeCreated` once and replays none on a
+reconnect — corrected 2026-09-26, probed; "The Hyperliquid reconnect
+loop" below), so the handler compares the bound asset against the one
 it is about to bind. Without that the queued asset is the very one the
 bind re-establishes as live, and the next idle would enumerate the
 account and cancel every quote on a LIVE leg — at the moment the member
@@ -2790,7 +2791,8 @@ tables (OKX families ≤ 384 B, Deribit DVOL ≤ 128 B, Polymarket ids ≤
 10 240 B); the variable-length batch subscribe renders (OKX ≤ 12 KiB,
 Deribit ≤ 16 KiB, Bybit ≤ 8 KiB, Polymarket ≤ 11 KiB — the frame length
 is unknown until the render ends; a header-first render is the
-operator's later pass, Q7); the rate-limited WARN lines (≤ 224 B, one a
+operator's later pass, Q7 — done 2026-09-26, "Batch subscribes render
+straight into tx", below); the rate-limited WARN lines (≤ 224 B, one a
 second — one `writev` rejected: a short writev splits the line);
 Deribit's ≤ 64 B memmem needle per subscribe result; the RPC signal
 payload's 8 B word encodes. On the auditor's flag (ruling Q12): the
@@ -2806,7 +2808,8 @@ escalated rustls copy, above), TX = 2 plus the serialiser's single
 write. Every cold finding and every flagged hidden move was acted on
 (above); its borderline notes — MEXC futures' per-(symbol, channel)
 subscribe render and the other remaining render markers as candidates
-for Q7's pass — stay open.
+for Q7's pass — stay open (closed 2026-09-26 by the header-first renders,
+below; HyperEVM's request bodies stay copied, re-marked).
 
 Gate after the pass: `hits=31 baselined=31 new=0 paid=0` over 21 dirs —
 the baseline byte-identical (sha256 `caf8a05e…`), the seven crates and
@@ -3205,6 +3208,328 @@ paid=0`; license-check OK; `cargo +nightly fuzz build` OK; live smokes
 60 s, the engine untouched — MEXC 31 195 messages (1 575 ticks), Binance
 92 037 (92 876 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
 This work built no engine binary.
+
+### Batch subscribes render straight into tx (2026-09-26)
+
+On the operator's word (2026-09-25: "finish what's left of our
+refactoring" — the in-place subscribe renders of plan Q7, the last of the
+three).
+
+**What was wrong.** A client frame's header carries its payload length in
+a 7-, 16- or 64-bit form (RFC 6455 §5.2), and a batch subscribe's length
+is unknown until it has been rendered. So OKX, Deribit, Bybit, Polymarket
+and MEXC rendered theirs into a stack scratch (OKX 12 KiB, Deribit
+16 KiB, Bybit 8 KiB, Polymarket 11 KiB, MEXC spot ~2.3 KiB and one
+~80 B futures frame per (symbol, channel)), and `queue_masked_text_frame`
+then copied it into tx behind the header and masked it: every subscribe
+byte written twice, and up to 16 KiB of stack per call. ZC pass B marked
+those copies (OKX K3, Deribit K8, Bybit K16, Polymarket K20/K21, MEXC's
+`push_bytes`) and left the header-first render to this pass.
+
+**What changed.** core-net's `ws_write_text_frame_rendered` (on tx:
+`queue_masked_text_frame_rendered`) takes a render in place of the
+payload. The render appends through a `WsPayload` and runs twice: a
+counting pass that writes nothing and sizes the payload, then — the
+header written at its minimal width — a writing pass into exactly the
+counted span of tx; the payload is then masked in place. A render must be
+a pure function of what it captured, and its `Fn` bound keeps it from
+mutating a capture: a writing pass that fails, runs past its count or
+stops short of it is `RenderDiverged` — a `debug_assert!` in debug builds;
+in release the error fails the session, which reconnects, and tx never
+advances over the torn frame. The venues' writers became renders — OKX
+`render_subscribe_batch`, Deribit `render_subscribe_all`, Bybit
+`render_subscribe`, Polymarket `render_market_subscribe` (its id-list
+check split out as `market_subscribe_ids_valid`, run first), MEXC
+`render_spot_subscribe` and `render_fut_subscribe` — and the scratches
+and their markers are gone. The one copy left — each literal fragment,
+symbol and id put once, straight into the frame — is marked once, in
+`WsPayload::put`. The parts writer builds its header from the same two
+helpers (`client_header_len`, `write_client_header`). A subscribe is now
+bounded by tx's free room rather than by a scratch; every venue's tx was
+already sized for its largest batch, since the copied frame had to fit
+there too (OKX's doc now counts its 160 args: ≤ 11.2 KiB in 16 KiB).
+Cold paths only: every render runs twice, at session start.
+
+HyperEVM's request bodies — the logs subscribe and every snapshot
+`eth_call` — still render into the driver's 8 KiB scratch and are copied
+into tx behind the header. Their marker said a header-first render needed
+a core-net API that did not exist; it is re-worded: the API exists (a
+binary twin is one opcode away), but it would trade that copy for a
+second run of every render on the warm read path, and `write_eth_call`'s
+calldata writer is a one-shot `FnOnce` into the request's tail, so every
+ABI encoder would need a counting mode.
+
+**Proof.** core-net: a rendered frame is byte-identical to the parts
+writer's in all three length forms, and reads back through
+`ws_read_frame` and unmasks to its payload at every length boundary (0,
+125, 126, 65 535 and 65 536 B) — a check independent of the header writer
+the two share, which both writers now also check against its length; one
+that does not fit fails `BufferTooSmall`, and a render that fails its
+counting pass returns its own error, both without writing a byte; a render
+that writes more, or less, on its writing pass than it counted is refused;
+`WsPayload` counts without writing and refuses a put past its span. On tx:
+a rendered frame is the plain frame of its bytes under the same mask
+counter, and a refused or diverging render leaves tx empty. The zero-alloc
+round trip (alloc gate) runs the rendered writer beside the plain one. The
+venues' exact-bytes tests run unchanged through a `WsPayload::writing`
+helper, and the run-loop tests that unmask the subscribe off the wire —
+all five venues, and MEXC's TLS loopback — see the same frames. A const
+assert pins that MEXC's `from_slot` names exactly `channels_per_symbol`
+slots per class (both subscribe loops walk `from_slot`; the ack
+bookkeeping counts the other).
+
+**The review** (a read-only subagent): PASS WITH NOTES — byte identity
+holds for all six renders, each render captures only shared references
+and `Copy` values, the header forms and the mask are right, and every call
+site borrows disjoint fields. Acted on: the `Fn` bound, the queue-level
+and boundary tests, the counting-pass test, the header check, the alloc
+gate, MEXC's const assert, Polymarket's render and id check made
+`pub(crate)` (the check guards the render) with its duplicated tests
+folded, Deribit's `push_bytes` moved beside the WARN lines that are its
+only callers, and the stale docs (the scratch wording in OKX, Deribit,
+Bybit and Hyperliquid — Hyperliquid's since pass B — OKX's `write_op` and
+its tx sizing, the `put` marker's bound). Left open:
+Deribit's subscribe-result check (`found_mask`) builds its needle apart
+from `render_channel_name`, and OKX, Deribit, Bybit and Polymarket size
+tx for their worst batch in docs, not in a const assert as MEXC does.
+
+Gates: clippy clean; nextest 3158 passed (5 skipped); alloc 73/73 at 0 B/op
+(fresh `Compiling bench`); core-net's tests in release (the torn-frame
+path) pass; `make copy-audit` `hits=31 baselined=31 new=0 paid=0`, the
+baseline byte-identical (sha256 `caf8a05e…`); license-check OK; `cargo
++nightly fuzz build` OK; live smokes 60 s, the engine untouched — MEXC
+30 814 messages (1 216 ticks; one spot `SUBSCRIPTION` for 5 symbols and
+21 futures frames, every channel confirmed: 0 sub-drops), Binance 34 118
+(34 943 ticks), 0 parse errors, 0 reconnects, 0 drops on every ring.
+`make bench-check` was not judged: the hot_path binary links none of the
+changed crates (`nm`: no core-net or ingress symbols), and at a load of
+12–31 (RustRover's background checks at ~550 % CPU, another session's
+build and tests beside the engine) two benches it does link read slow
+(latency-arb `on_tick` +61 %, `sign_order_full` +23 %) — to re-run on a
+quiet Mac. This work built no engine binary.
+
+### The Hyperliquid reconnect loop — dead HIP-4 instances (2026-09-26)
+
+On the operator's word (2026-09-26: "investigate why hyperliquid lane is
+reconnecting constantly", then "implement the fix and restart now").
+
+**What was wrong.** From 01:45:11Z the lane logged `hyperliquid: run-loop
+returned res=Disconnected` every ~1.24 s — 15 190 times by 07:13Z, 43 139
+since 09-19 — in episodes that began at a reconnect and ended only at a
+process restart. The venue answers a subscribe to a settled or unknown
+coin by dropping the whole socket: a bare FIN, no `error` frame, no Close
+(probed from the Mac: `l2Book` on the BTC 15-minute instance that expired
+at 00:15Z, or on `NOTACOIN`, EOF within 0.25 s; the engine's own 70
+subscriptions ran 20 s and 786 frames on the live instances, and died at
+1.2 s after 56 acks with the BTC family on its settled one). The engine
+re-subscribed exactly that: `perform_roll` keeps a settled instance bound
+until the next `outcomeCreated`, and `reset_for_reconnect` re-subscribed
+every binding. The successor could not arrive — each session died before
+`outcomeMetaUpdates`, subscribed last, was acknowledged, and that channel
+replays nothing (below) — so only boot discovery rebound. The backoff
+never grew: `should_reset_backoff` reset on any tick, and the perp
+snapshots arrived in a session's first 0.2 s. What started it: an
+instance expired, the venue settled it and listed its successor late, and
+the expired coin's silence — the staleness monitor let go of a coin only
+at `outcomeSettled` — tripped the whole session 10 s after the expiry
+(logged at 12:35:11 and 18:30:11Z on 09-25 and at 01:45:11Z; two other
+episodes began at a `res=Error`). During a loop the lane carried
+connect-time snapshots only, every BIN15 family was dark, and it opened
+~48 connections a minute against the venue's 30 per IP.
+
+**What changed.** A dead instance is never subscribed again.
+`perform_roll` flags a family whose instance settles (`HlFamily::settled`);
+`instance_dead` holds for a bound instance that settled or passed its WALL
+expiry; and `reset_for_reconnect` now ends by retiring every dead family
+(`HlFamilyTable::retire`: both coin rows unbound through the new
+`HlCoinTable::unbind`, the family dormant and `awaiting`), so the next
+subscribe sweep and the ack masks skip it; it returns the count, which
+the caller logs. On a live session a settled instance stays bound and
+subscribed as before — the venue keeps a subscription it already holds.
+Successors are re-discovered between sessions: while a family awaits
+one, the HL thread re-reads `/info {"type":"outcomeMeta"}` before the
+socket opens, at most once a minute — the boot's own request and parser
+(`boot_discovery::fetch_hl_outcome_specs`), sent with core-net's new
+`boot_http::https_post_at` to the address the engine resolved at boot
+(like the WS host's), so no DNS lookup runs on that thread and every
+socket step is armed with what remains of a 3 s deadline — and
+`Driver::rebind_dormant` binds every family naming no instance, the
+boot's dormant ones included, by the boot's rule (`best_live_spec`: the
+earliest-expiring instance still live), announcing each adoption as
+`perform_roll` announces a roll (`emit_roll_event`, now the one writer
+for the roll, the boot announcement and the re-discovery). A failed fetch
+leaves the family waiting for the venue's next `outcomeCreated`.
+Staleness stops judging an instance at its expiry: `session_health`
+unwatches the rows of every expired instance — right after `arm`, and
+again at each expiry (`next_expiry_ns`, one compare per iteration;
+`perform_roll` puts the successor on the schedule) — and its ack check is
+masked, since a roll can ack rows the sweep did not expect. The backoff
+resets only after a session that moved market data AND lived 30 s
+(`HEALTHY_SESSION_MIN_NS`), or a venue-quiet trip, in the seven venue
+loops that share `should_reset_backoff`: a silent-drop loop of any cause
+now climbs to the 8 s cap (≤ 7.5 connects a minute). And every end names
+itself on the T1(a) status triple: the run loop's error exits record site
+and io-kind (`session_err`), a peer Close `peer-close` with its code
+(1005 when it carried none), a bare EOF `peer-eof`, a missed ack deadline
+`subscribe-missing` with the count missing, a venue error frame
+`venue-error`; `run-loop returned` prints them with `lived_ms`, `acks`
+and `acks_expected`. core-metrics gains `ERR_SITE_PEER_EOF` (10) and
+`ERR_SITE_PEER_CLOSE` (11). A retired instance's later `outcomeSettled`
+matches no family, so the capture carries no `settled` for it, and its
+re-discovered successor arrives as a lone `created`
+(`docs/wire-format.md`).
+
+**Proof.** ingress-hyperliquid (162 tests): a reconnect never
+re-subscribes an expired instance (12 subscribes on the wire, none for
+`#2649`); a settled instance stays bound on its own session and is
+retired at the reconnect; staleness stops judging an instance at its
+expiry, and a mid-session roll puts the successor on the schedule;
+`rebind_dormant` adopts the live successor and announces it, or leaves
+the announcement to the boot's when that has not gone out; a boot binding
+dead before the first connect is announced exactly once; a retired family
+is off the wire and `bind` revives it; the end of a session is named on
+the status slot (Close 1008; a Close with no code → 1005; a bare EOF →
+`peer-eof`; the ack deadline → `subscribe-missing`, 9 missing). cli:
+`backoff_resets_only_on_a_healthy_session_or_quiet_trip`. core-net: a
+POST to a boot-resolved address does no lookup — the server name is under
+`.invalid` (RFC 6761), so a lookup fails `Resolve` before any connect
+(checked by mutation) — a closed port is refused (`Connect(ConnectionRefused)`),
+and a peer that accepts and stays silent is cut off by the deadline
+(300 ms), not by the peer (1.5 s). And the venue fact the fix rests on,
+probed at the 08:15Z and 08:30Z rolls: `outcomeMetaUpdates` pushes a roll
+once, live, and replays nothing to a later subscriber. A socket
+subscribed from 08:28:30Z got `outcomeSettled` for 5791 and 5790 at
+08:30:04Z and one `outcomeCreated` push for their successors 5792/5793 at
+08:30:06.6Z; sockets subscribed 14 s and 74 s after that push — and at
+08:15:30 and 08:16:30Z, after the 08:15Z roll — got the ack and nothing
+else, while `/info outcomeMeta` listed the successors by 08:16:10 and
+08:31:00Z. (A probe socket must ping: the venue closes one 60 s after the
+client's last message.) Five comments said the venue re-sends
+`outcomeCreated` on a reconnect — the run loop's roll dispatch, the TLS
+loopback test, `exec-router`'s ledger (twice), `exec-hyperliquid`'s
+exchange (twice) — as did "LAW E-8 — the roll takes its own quotes back"
+above; each now says what was measured, and the guards they explain stay:
+a replayed ring entry still carries a repeat, and an instance adopted from
+an `/info` snapshot can see its own push arrive after the session
+subscribed.
+
+**The review** (read-only subagents, two passes). The fix: PASS WITH
+NOTES — the loop is closed, and each new test fails without its part of
+the fix. Acted on: the post-boot use of `boot_http`, whose doc said boot
+only — throttled to one fetch a minute, run before the socket opens, on a
+3 s deadline, and documented; the one expiry-schedule write that matters
+(`perform_roll`'s) got its test, and the four dead ones went;
+`rebind_dormant` picks families by `live.outcome == 0`, not the `dormant`
+flag, which would re-announce a live instance once the second-strike bug
+below is fixed — and BIN15 would zero a position the ledger keeps; the
+masked ack check; one WALL clock for every judgement; the roll records
+mirrored to disk before the connect; the race documented; the family log
+shared with boot; the first-connect test; stale docs and `debug_assert!`s.
+The replay contradiction it found went to the probe above. The second
+pass, over what followed — the boot-resolved `/info` address and the
+comment corrections: PASS WITH NOTES — boot's own fetches behave exactly
+as before (the deadline starts before the lookup, `RequestTooLarge`
+before any I/O, the same errors), and nothing on the HL thread can reach
+DNS. Acted on: the failure tests for `https_post_at`, the E-8 paragraph,
+the deadline wording (each socket step is armed, not the call as one),
+the module title and error docs, `WssEndpoint`'s doc narrowed to the HL
+thread, the guard's remaining trigger, the wire-format note, and a
+duplicated `#[allow]` on `run`. Left open: `roll_health`'s retry sets
+`ack_deadline_ns = u64::MAX`, so its second strike (dormant) is
+unreachable — pre-existing, its own change; a successor listed between
+the `/info` snapshot and the new session's `outcomeMetaUpdates` ack is
+missed until the family's next instance (at most one 15-minute instance;
+a daily's successor is listed a day ahead); the `/info` host is resolved
+whenever HL is configured, families or not — boot discovery already
+posts to it then, so nothing new can fail; and the venue now acks
+`l2Book` with `"fast":false` (≈ one push per coin every 4–5 s against
+`bbo` at ~1/s in the probes) — unverified, not this change.
+
+**Operations.** The operator's restart at 07:18Z (the sanctioned 0010
+revive) rebound the live instances and ended the loop; the lane then ran
+clean through the 07:30–08:30Z rolls. At 08:32Z a venue-side incident —
+the probes' control socket dropped at 08:32:21Z, a fresh upgrade answered
+502, `/info` timed out — tripped the lane (`res=Stale` at 08:32:01Z) into
+26 more session ends in 102 s — the first 12 about 1.2 s apart, the rest
+5–7 s — until the 08:33Z daily restart stopped it. Under the new rule
+those 1.2 s gaps climb to the 8 s cap, and the new line says how each
+session ended; the old one could not tell this outage from the loop. That restart's boot
+discovery failed on the same outage (`spotMeta` Timeout, exit 1), and
+launchd's relaunch booted clean at 08:36:24Z (the 15-minute families on
+5792/5793, the dailies on 5755–5758; `vm_rows_active` 2). Deployed on the
+operator's word: `7235201` built and restarted through the 0010 revive at
+09:03Z (the old engine drained, exit 0); the new one booted at 09:05:11Z,
+and at the 09:15Z roll it settled 5796/5797 and adopted 5799/5800 in
+session — no reconnect, no ack timeout, no staleness trip. The lane counts
+~1 parse reject a second, before and after that roll; the parse path and
+the subscription set are unchanged by this work — they are BIN15 O8's
+one-sided outcome `bbo` drops (next section).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc
+73/73 at 0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31
+baselined=31 new=0 paid=0`, the baseline byte-identical (sha256
+`caf8a05e…`); license-check OK; `cargo +nightly fuzz build` OK. No live
+smoke exists for this lane, and what one would need to show — a reconnect
+across an expiry — is what the unit tests script. This work built no
+engine binary.
+
+### The one-sided outcome `bbo` is not a parse error (2026-09-26)
+
+On the operator's word (2026-09-26: "Fix it (own counter)", after the
+probe below).
+
+**What was wrong.** After the deploy above the lane counted 1–1.5 parse
+errors a second. A read-only probe carried the engine's exact 70
+subscriptions for 60 s (3 504 frames) and sorted every frame by the
+parser's rules: the only reject class was `bbo` pushes on HIP-4 outcome
+legs with the ask `null` — 1.57/s, against the engine's 1.45/s over the
+same window; trades, asset contexts, books and unknown channels, none.
+BIN15 O8 drops those pushes by policy (the leg's two-sided touch comes
+from its `l2Book`), but it dropped them through `Dispatch::Nothing`, the
+rejection path: each one counted in `parse_errors_total` and was tapped as
+a reject. No data was lost; the counter stopped meaning anything for this
+lane, and a real parse failure would have hidden in it.
+
+**What changed.** The drop has its own dispatch
+(`Dispatch::OutcomeBboOneSided`): it counts as a message — not a tick, so
+neither the last-tick age nor the backoff reset ever feeds on a dropped
+frame — and in `HlRollStatus::outcome_bbo_one_sided`, published as
+`engine_ingress_hyperliquid_outcome_bbo_one_sided_total`;
+`parse_errors_total` and the reject tap are left to real rejections. The
+drop condition is unchanged: a two-sided outcome `bbo` is still a tick, a
+perp's is untouched, and a `bbo` with both sides `null` is still a parse
+failure. Docs: `HlRollStatus` (the slot `IngressStatus` could not take is
+192 B, three lines), the driver's `roll_status` and `verified`,
+`set_families`, and `session_health` (the masked ack check, both halves).
+
+**Proof.** `a_one_sided_outcome_bbo_is_dropped_and_l2book_carries_the_touch`
+now pins the count: the one-sided push leaves the ring empty, adds one to
+the new counter and to `msgs_total`, and no tick, parse error or reject
+tap (it is still tapped raw, like every frame); a both-`null` push is one
+parse error and one reject tap with the count untouched; the two-sided
+push is a tick and the count stays 1. Routed back through `Nothing`, the
+test fails (checked by mutation).
+
+**The review** (a read-only subagent): PASS WITH NOTES — the change is
+correct; `msgs_total` feeds only the metric mirror and `/state`, while the
+health tells read `ticks_total` and the venue clock, so counting the drop
+there masks nothing (MEXC's dropped quotes and HL's `RollUnmatched` count
+the same way). Acted on: the stale records, a `docs/migration.md` entry,
+the tick and both-`null` assertions, the doc nits, and the name — `one
+sided`, O8's own word, not `ask_null`, so a widened condition would not
+need a rename. Left open: the parse count is not zero after this — each
+mid-session roll's six unsubscribe echoes still land in `Nothing`
+(`parse_sub_response` takes only `"subscribe"`, though `lib.rs` calls the
+echo deliberately ignored), and so do frames in flight for the retired
+coins; the same class, its own change. Only a `null` ask is guarded, which
+is what the venue does (2026-09-12: 194 of 194 outcome ticks had a zero
+ask, none a zero bid).
+
+Gates: clippy clean; nextest 3169 passed (5 skipped); alloc 73/73 at
+0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31 baselined=31
+new=0 paid=0`, the baseline byte-identical (sha256 `caf8a05e…`);
+license-check OK; `cargo +nightly fuzz build` OK. This work built no
+engine binary.
 
 ## E6 — the risk gate and the kill switches
 

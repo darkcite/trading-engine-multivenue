@@ -33,10 +33,10 @@ use std::io;
 
 use core_metrics::{IngressState, IngressStatus};
 use core_net::{
-    constant_time_eq, expected_accept, queue_masked_text_frame, read_server_handshake,
-    sec_websocket_key_from_seed, write_client_handshake, ws_mask_from_counter, ws_read_frame,
-    ws_unmask_in_place, ws_write_pong, Drained, HandshakeResult, IoBuf, RxFill, Status, Transport,
-    WsOpcode, WsReadResult,
+    constant_time_eq, expected_accept, queue_masked_text_frame, queue_masked_text_frame_rendered,
+    read_server_handshake, sec_websocket_key_from_seed, write_client_handshake,
+    ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_pong, Drained,
+    HandshakeResult, IoBuf, RxFill, Status, Transport, WsOpcode, WsReadResult,
 };
 use core_ring::Producer;
 use core_time::{now_ns, FeedClock, NsTs};
@@ -47,7 +47,8 @@ use core_types::{
 
 use crate::{
     classify, extract_topic_symbol, parse_orderbook1, parse_tickers, parse_trade_row,
-    write_subscribe, BybitChannel, BybitMsgKind, BybitSymbolTable, BYBIT_MAX_SYMBOLS, PING_PAYLOAD,
+    render_subscribe, BybitChannel, BybitMsgKind, BybitSymbolTable, BYBIT_MAX_SYMBOLS,
+    PING_PAYLOAD,
 };
 
 // ---------------------------------------------------------------
@@ -66,9 +67,6 @@ pub const TX_BUF_SIZE: usize = 16 * 1024;
 /// Tick-ring capacity. Must equal `engine::TICK_RING_SIZE` — the cli
 /// const-asserts the equality when wiring lanes (8a §3.3 pattern).
 pub const DEFAULT_TICK_RING_CAP: usize = 16_384;
-
-/// Stack scratch for one rendered subscribe batch.
-const SUBSCRIBE_SCRATCH: usize = 8 * 1024;
 
 /// Max `publicTrade` rows seq-buffered per push (accounting only —
 /// Bybit trades carry no venue seq; see the crate docs).
@@ -435,10 +433,10 @@ fn queue_subscribe_all(drv: &mut Driver) -> io::Result<()> {
     if drv.symbols.is_empty() {
         return Err(io::Error::other("bybit: no symbols configured"));
     }
-    let mut scratch = [0u8; SUBSCRIBE_SCRATCH];
-    let len = write_subscribe(&mut scratch, &drv.symbols, drv.want_tickers)
-        .ok_or_else(|| io::Error::other("bybit: subscribe scratch too small"))?;
-    queue_masked_text_frame(&mut drv.tx, &mut drv.mask_counter, &scratch[..len])?;
+    let (symbols, want_tickers) = (&drv.symbols, drv.want_tickers);
+    queue_masked_text_frame_rendered(&mut drv.tx, &mut drv.mask_counter, |p| {
+        render_subscribe(p, symbols, want_tickers)
+    })?;
     drv.subscribed = true;
     Ok(())
 }
