@@ -106,10 +106,10 @@ use core_net::{
 };
 use core_time::now_ns;
 use core_types::ORDER_EVENT_REASON_NONE;
-use exec_gateway::stats::HALT_TIMER_FULL;
+use exec_gateway::stats::{HALT_TIMER_FULL, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING};
 use exec_gateway::{
-    duplex, CmdRx, EngineEnd, EvtTx, Expired, GatewayEnd, GatewayStats, Idle, Mbb, MbbAction,
-    Pending, SlotState, TimerId, TimerQueue, HALT_NONE,
+    boxed_array, duplex, CmdRx, EngineEnd, EvtTx, Expired, GatewayEnd, GatewayStats, Idle, Mbb,
+    MbbAction, Pending, SlotState, TimerId, TimerQueue, HALT_NONE,
 };
 use mio::{Events, Poll};
 use rustls::pki_types::ServerName;
@@ -122,23 +122,29 @@ use crate::action::{
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
     HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE,
-    CMD_SCHEDULE_CANCEL,
+    CMD_READ_ORDERS, CMD_SCHEDULE_CANCEL,
 };
 use crate::event::{
     reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_FILLED,
     EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_FILL, EV_FILL_META, EV_GAP, EV_HALT,
-    EV_REJECTED, EV_SNAPSHOT, EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT,
-    GAP_UPDATES_UNREADABLE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY,
-    REASON_RATE_LIMIT, REASON_SETTLEMENT, REASON_TRANSPORT, SLOT_FOREIGN,
+    EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
+    EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT, GAP_UPDATES_UNREADABLE, READ_ORDERS,
+    READ_STATE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT,
+    REASON_SETTLEMENT, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
+use crate::json::{array_start, object_field, u64_field};
 use crate::msgpack::MsgPackErr;
 use crate::nonce::{now_ms, Nonce};
 use crate::orderupd::{scan_order_updates, OrderUpdate};
+use crate::recon::{
+    open_orders_request, perp_state_request, scan_open_orders, scan_perp_state, OpenOrder,
+    PerpPosition, MAX_OPEN_ORDERS,
+};
 use crate::request::{
     batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
-    schedule_cancel_json, update_leverage_json, ws_post_close, ws_post_open,
+    schedule_cancel_json, update_leverage_json, ws_info_open, ws_post_close, ws_post_open,
 };
 use crate::response::{
     scan, scan_items, HlResponse, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING,
@@ -146,7 +152,7 @@ use crate::response::{
 };
 use crate::sign::{sign_action, Network, Vault};
 use crate::userws::{scan_user_fills, TidRing, UserFill, SNAPSHOT_RING};
-use crate::wspost::{classify, WsIn};
+use crate::wspost::{classify, PostKind, WsIn};
 
 /// Command ring slots (engine → gateway).
 pub const CMD_RING: usize = 1024;
@@ -178,13 +184,44 @@ const TX_CAP: usize = 16 * 1024;
 const ROOM: usize = WS_CLIENT_HDR_MAX;
 const GROUPING: &[u8] = b"na";
 
-const CLASSES: usize = 5;
+const CLASSES: usize = 6;
 const CLASS_ALO: usize = 0;
 const CLASS_TAKER: usize = 1;
 const CLASS_MODIFY: usize = 2;
 const CLASS_CANCEL: usize = 3;
 /// One control action (leverage, scheduleCancel, noop), posted alone.
 const CLASS_CONTROL: usize = 4;
+/// One read (open orders, the perp sheet), posted alone, unsigned,
+/// WebSocket only (XH4d).
+const CLASS_READ: usize = 5;
+/// Perp positions one state read may carry.
+const MAX_POSITIONS: usize = 64;
+/// XG-2: the event room a read's answer needs (its rows and its end).
+const READ_RESERVE: usize = MAX_OPEN_ORDERS + 1;
+const _: () = assert!(MAX_POSITIONS <= MAX_OPEN_ORDERS);
+/// The slot byte of the gateway's own sweep read: never a strategy slot,
+/// never `SLOT_FOREIGN`; its rows stay inside the gateway.
+const SWEEP_SLOT: u8 = 0xFE;
+/// Sweep rounds (read, cancel ours, settle) before the sweep is stranded.
+const SWEEP_ROUNDS: u8 = 8;
+// The sweep's table indexes by mask.
+const _: () = assert!(MAX_OPEN_ORDERS.is_power_of_two());
+/// A round's settle before the re-read, and a failed read's retry.
+const SWEEP_SETTLE_NS: u64 = 1_000_000_000;
+/// The heartbeat's period: the gateway stamps its stats block this often
+/// while it turns, so the arm can tell a live socket from a dead thread
+/// whose `ws_up` gauge froze at 1 (at most ten stores a second: the line
+/// stays the gateway's).
+const BEAT_NS: u64 = 100_000_000;
+/// The sweep machine's phases.
+const SW_IDLE: u8 = 0;
+const SW_READ: u8 = 1;
+const SW_WAIT: u8 = 2;
+const SW_SETTLE: u8 = 3;
+/// The sweep read's outcome, as the router hands it over.
+const SWEEP_NONE: u8 = 0;
+const SWEEP_READ: u8 = 1;
+const SWEEP_FAILED: u8 = 2;
 
 /// `PostRec::conn` of a post that went by REST.
 const CONN_REST: u8 = 2;
@@ -350,6 +387,25 @@ pub struct GatewayCounters {
     pub dials: u64,
     /// Connections that went down.
     pub conn_drops: u64,
+    /// Reads answered (XH4d).
+    pub reads: u64,
+    /// Reads whose answer did not scan (XH4d).
+    pub reads_failed: u64,
+    /// Sweep rounds run (XH4d).
+    pub sweep_rounds: u64,
+    /// Cancels a sweep sent (XH4d).
+    pub sweep_cancels: u64,
+    /// Resting orders of ours a sweep could not cancel: their coin is not
+    /// in the coin map (XH4d).
+    pub sweep_unmapped: u64,
+}
+
+/// One resting order of ours a sweep read found: what its cancel takes.
+#[derive(Copy, Clone, Default)]
+struct SweepHit {
+    client_oid: u64,
+    asset: u32,
+    slot: u8,
 }
 
 /// One item of a post: what its answer events carry.
@@ -520,6 +576,7 @@ fn class_of(c: &HlCmd) -> Option<usize> {
         (CMD_PLACE, ALO) => Some(CLASS_ALO),
         (CMD_PLACE, IOC) => Some(CLASS_TAKER),
         _ if c.is_control() => Some(CLASS_CONTROL),
+        _ if c.is_read() => Some(CLASS_READ),
         _ => None,
     }
 }
@@ -535,10 +592,11 @@ const fn grows(kind: u8) -> bool {
 }
 
 /// Whether class `class`'s batch grows ([`grows`]); a control batch by
-/// its one command's kind.
+/// its one command's kind. A read never grows: it goes while halted (the
+/// reconciliation and the sweep after a halt need it).
 #[inline(always)]
 const fn growing(class: usize, control_kind: u8) -> bool {
-    class != CLASS_CANCEL && (class != CLASS_CONTROL || grows(control_kind))
+    class != CLASS_CANCEL && class != CLASS_READ && (class != CLASS_CONTROL || grows(control_kind))
 }
 
 /// A command's kind in an event's two `flags` bits: place, modify or
@@ -562,6 +620,20 @@ const fn fits(class: u8, status: u8) -> bool {
         status == ITEM_SUCCESS
     } else {
         status == ITEM_RESTING || status == ITEM_FILLED
+    }
+}
+
+/// A read's end event: the read command's correlation, `rows` in `aux`.
+#[inline(always)]
+fn read_end(item: &ItemRef, kind: u8, read: u8, rows: u64, now: u64) -> ExecEvent {
+    ExecEvent {
+        ts_ns: now,
+        client_oid: item.client_oid,
+        aux: rows,
+        kind,
+        reason: read,
+        slot: item.slot,
+        ..ExecEvent::default()
     }
 }
 
@@ -661,6 +733,13 @@ struct Router {
     answered: [u32; 2],
     /// Data moved (a matched answer or a pong) since the last settle.
     healthy: bool,
+    /// Read answers are scanned into these (XH4d).
+    open_rows: Box<[OpenOrder; MAX_OPEN_ORDERS]>,
+    positions: Box<[PerpPosition; MAX_POSITIONS]>,
+    /// The sweep read's orders of ours, and its outcome (`SWEEP_*`).
+    sweep_hits: Box<[SweepHit; MAX_OPEN_ORDERS]>,
+    sweep_n: usize,
+    sweep_outcome: u8,
 }
 
 impl Router {
@@ -685,16 +764,21 @@ impl Router {
             inflight_items: 0,
             answered: [0; 2],
             healthy: false,
+            open_rows: boxed_array(OpenOrder::default()),
+            positions: boxed_array(PerpPosition::default()),
+            sweep_hits: boxed_array(SweepHit::default()),
+            sweep_n: 0,
+            sweep_outcome: SWEEP_NONE,
         }
     }
 
     fn on_frame(&mut self, frame: &[u8], now: u64) {
         match classify(frame) {
-            Ok(WsIn::Post {
-                id,
-                action,
-                payload,
-            }) => self.on_answer(id, payload.of(frame), action, false, now),
+            Ok(WsIn::Post { kind, id, payload }) => match kind {
+                PostKind::Action => self.on_answer(id, payload.of(frame), true, false, now),
+                PostKind::Error => self.on_answer(id, payload.of(frame), false, false, now),
+                PostKind::Info => self.on_read_answer(id, payload.of(frame), now),
+            },
             Ok(WsIn::UserFills) => self.on_user_fills(frame, now),
             Ok(WsIn::OrderUpdates) => self.on_order_updates(frame, now),
             Ok(WsIn::Pong) => self.healthy = true,
@@ -718,6 +802,13 @@ impl Router {
         if !action {
             // Not the exchange's answer about the action: in doubt.
             self.fail_all(id, EV_UNANSWERED, reason_of_error(body), now);
+            return;
+        }
+        if class == CLASS_READ {
+            // A read answered as an action: in doubt (the sweep's own
+            // read fails its round).
+            self.counters.answers_mismatched += 1;
+            self.fail_all(id, EV_UNANSWERED, REASON_MALFORMED, now);
             return;
         }
         if class == CLASS_CONTROL {
@@ -784,6 +875,142 @@ impl Router {
         }
     }
 
+    /// A read's answer (XH4d): its rows as events, then `EV_READ_DONE` —
+    /// or `EV_READ_FAILED` when it does not scan. The gateway's own sweep
+    /// read keeps its rows (ours only) and emits nothing.
+    fn on_read_answer(&mut self, id: u64, body: &[u8], now: u64) {
+        let Some(rec) = self.pending.get(id) else {
+            self.stats.note_reply_unmatched();
+            return;
+        };
+        self.stats.note_reply();
+        if usize::from(rec.class) != CLASS_READ {
+            // A read's answer to a post that is no read: in doubt.
+            self.counters.answers_mismatched += 1;
+            self.fail_all(id, EV_UNANSWERED, REASON_MALFORMED, now);
+            return;
+        }
+        let item = rec.items[0];
+        let ok = if item.kind == CMD_READ_ORDERS {
+            self.read_orders(&item, body, now)
+        } else {
+            self.read_state(&item, body, now)
+        };
+        if ok {
+            self.counters.reads += 1;
+            self.healthy = true;
+        } else {
+            self.counters.reads_failed += 1;
+            if item.slot == SWEEP_SLOT {
+                self.sweep_outcome = SWEEP_FAILED;
+            } else {
+                let read = if item.kind == CMD_READ_ORDERS {
+                    READ_ORDERS
+                } else {
+                    READ_STATE
+                };
+                emit_to(
+                    &mut self.evt,
+                    &read_end(&item, EV_READ_FAILED, read, 0, now),
+                );
+            }
+        }
+        self.finish(id, now);
+    }
+
+    /// `{"type":"frontendOpenOrders","data":[…]}` → `EV_OPEN_ORDER` rows
+    /// (`aux` = the read command's client id) and `EV_READ_DONE`, or the
+    /// sweep's hits. `false`: it does not scan.
+    fn read_orders(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
+        let Some(a) = array_start(body, b"\"data\"") else {
+            return false;
+        };
+        let data = &body[a - 1..];
+        let Ok(n) = scan_open_orders(data, &mut self.open_rows[..]) else {
+            return false;
+        };
+        let n = n.min(self.open_rows.len());
+        if item.slot == SWEEP_SLOT {
+            let mut hits = 0usize;
+            let mut i = 0usize;
+            while i < n {
+                let r = &self.open_rows[i];
+                let (slot, client_oid) = owner(r.cloid);
+                if slot != SLOT_FOREIGN {
+                    // `hits` ≤ `i` < `n` ≤ the table: the mask folds the
+                    // check.
+                    self.sweep_hits[hits & (MAX_OPEN_ORDERS - 1)] = SweepHit {
+                        client_oid,
+                        asset: self.coins.asset(r.coin.of(data)),
+                        slot,
+                    };
+                    hits += 1;
+                }
+                i += 1;
+            }
+            self.sweep_n = hits;
+            self.sweep_outcome = SWEEP_READ;
+            return true;
+        }
+        let mut i = 0usize;
+        while i < n {
+            let r = &self.open_rows[i];
+            let (slot, client_oid) = owner(r.cloid);
+            let ev = ExecEvent {
+                ts_ns: now,
+                client_oid,
+                oid: r.oid,
+                aux: item.client_oid,
+                asset: self.coins.asset(r.coin.of(data)),
+                kind: EV_OPEN_ORDER,
+                slot,
+                ..ExecEvent::default()
+            };
+            emit_to(&mut self.evt, &ev);
+            i += 1;
+        }
+        emit_to(
+            &mut self.evt,
+            &read_end(item, EV_READ_DONE, READ_ORDERS, n as u64, now),
+        );
+        true
+    }
+
+    /// `{"type":"clearinghouseState","data":{…}}` → `EV_POSITION` rows and
+    /// `EV_READ_DONE` (the account value, the sheet's time). `false`: it
+    /// does not scan.
+    fn read_state(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
+        let Some((s, e)) = object_field(body, b"\"data\"") else {
+            return false;
+        };
+        let data = &body[s..e];
+        let Ok((value, n)) = scan_perp_state(data, &mut self.positions[..]) else {
+            return false;
+        };
+        let n = n.min(self.positions.len());
+        let mut i = 0usize;
+        while i < n {
+            let p = &self.positions[i];
+            let ev = ExecEvent {
+                ts_ns: now,
+                sz_1e8: p.szi_1e8,
+                aux: p.value_1e8.unsigned_abs(),
+                asset: self.coins.asset(p.coin.of(data)),
+                kind: EV_POSITION,
+                slot: item.slot,
+                client_oid: item.client_oid,
+                ..ExecEvent::default()
+            };
+            emit_to(&mut self.evt, &ev);
+            i += 1;
+        }
+        let mut end = read_end(item, EV_READ_DONE, READ_STATE, n as u64, now);
+        end.px_1e8 = value;
+        end.venue_ms = u64_field(data, b"\"time\"").unwrap_or(0);
+        emit_to(&mut self.evt, &end);
+        true
+    }
+
     /// A REST answer: HTTP `status` and its body.
     fn on_rest_answer(&mut self, id: u64, status: u16, body: &[u8], resend: bool, now: u64) {
         if (200..300).contains(&status) {
@@ -809,6 +1036,12 @@ impl Router {
         let Some(rec) = self.pending.get(id) else {
             return;
         };
+        if rec.items[0].slot == SWEEP_SLOT {
+            // The gateway's own sweep read: nothing to tell the arm.
+            self.sweep_outcome = SWEEP_FAILED;
+            self.finish(id, now);
+            return;
+        }
         let mut i = 0usize;
         while i < usize::from(rec.n) {
             emit_to(&mut self.evt, &rec.items[i].event(kind, reason, id, now));
@@ -832,7 +1065,7 @@ impl Router {
             self.answered[usize::from(conn)] += 1;
         }
         self.inflight_items -= usize::from(n);
-        if written != 0 {
+        if written != 0 && usize::from(class) != CLASS_READ {
             let rtt = now.saturating_sub(written);
             if usize::from(class) == CLASS_CANCEL {
                 self.stats.cancel_rtt.record(rtt);
@@ -997,6 +1230,16 @@ pub struct HlGateway {
     /// The pending replacement is for a socket that went silent: its
     /// `orderUpdates` since the silence began are lost.
     silent_replace: bool,
+    /// The account, for the reads' bodies (XH4d).
+    master: [u8; 20],
+    /// The sweep request being worked, its phase, its round, and when a
+    /// settling round re-reads (XH4d).
+    sweep_seq: u64,
+    sweep_phase: u8,
+    sweep_round: u8,
+    sweep_until: u64,
+    /// The last heartbeat stamp.
+    beat_ns: u64,
 }
 
 impl HlGateway {
@@ -1036,6 +1279,12 @@ impl HlGateway {
             poll,
             events: Events::with_capacity(16),
             master_hex: crate::config::hex20(&cfg.master),
+            master: cfg.master,
+            sweep_seq: 0,
+            sweep_phase: SW_IDLE,
+            sweep_round: 0,
+            sweep_until: 0,
+            beat_ns: 0,
             host: cfg.host,
             port: cfg.port,
             addr,
@@ -1091,12 +1340,17 @@ impl HlGateway {
         worked |= self.read_conns(now);
         worked |= self.drive_mbb(now);
         worked |= self.pump_commands(now);
+        worked |= self.sweep(now);
         worked |= self.expire(now);
         self.keepalive(now);
         self.settle(now);
         self.rt
             .stats
             .set_gauges(self.rt.pending.live() as u64, self.mbb.active().is_some());
+        if now.saturating_sub(self.beat_ns) >= BEAT_NS {
+            self.rt.stats.beat(now);
+            self.beat_ns = now;
+        }
         self.worked = worked;
     }
 
@@ -1297,12 +1551,18 @@ impl HlGateway {
 
     // ---- commands -----------------------------------------------------
 
+    /// XG-2: no room for one more command — every class's open batch, the
+    /// streams and a read's answer keep their room.
+    fn xg2_full(&self) -> bool {
+        let room_needed =
+            self.rt.inflight_items + MAX_ORDERS * CLASSES + STREAM_RESERVE + READ_RESERVE;
+        self.rt.pending.live() + CLASSES > MAX_IN_FLIGHT || self.rt.evt.room() < room_needed
+    }
+
     fn pump_commands(&mut self, now: u64) -> bool {
         let mut worked = false;
         loop {
-            let room_needed = self.rt.inflight_items + MAX_ORDERS * CLASSES + STREAM_RESERVE;
-            if self.rt.pending.live() + CLASSES > MAX_IN_FLIGHT || self.rt.evt.room() < room_needed
-            {
+            if self.xg2_full() {
                 break;
             }
             let c = match self.cmd.pop() {
@@ -1348,8 +1608,8 @@ impl HlGateway {
             self.refuse(c, REASON_LOCAL, now);
             return;
         };
-        if k == CLASS_CONTROL {
-            self.admit_control(c, now);
+        if k == CLASS_CONTROL || k == CLASS_READ {
+            self.admit_alone(c, k, now);
             return;
         }
         if (c.kind == CMD_CANCEL || c.kind == CMD_MODIFY) && self.names_open_item(c) {
@@ -1384,30 +1644,37 @@ impl HlGateway {
         self.rt.inflight_items += 1;
     }
 
-    /// A control command posts alone, after every open batch: nothing
-    /// admitted before it goes after it, and nothing after it before. It
-    /// carries the command's own `expiresAfter`, if any — the dead man's
-    /// posts do, so a late one cannot land after a later one (E-5).
-    fn admit_control(&mut self, c: &HlCmd, now: u64) {
+    /// A control command or a read posts alone, after every open batch:
+    /// nothing admitted before it goes after it, and nothing after it
+    /// before. A control post carries the command's own `expiresAfter`,
+    /// if any — the dead man's posts do, so a late one cannot land after
+    /// a later one (E-5); a read is unsigned and carries none.
+    fn admit_alone(&mut self, c: &HlCmd, k: usize, now: u64) {
         self.flush_open(now);
-        if !self.open(CLASS_CONTROL, now) {
+        if !self.open(k, now) {
             self.refuse(c, REASON_LOCAL, now);
             return;
         }
-        self.batches.control = ControlWire {
-            kind: c.kind,
-            is_cross: c.flags & CMD_FLAG_CROSS != 0,
-            asset: c.asset,
-            leverage: c.arg,
-            time: if c.time_ms == 0 {
-                None
-            } else {
-                Some(c.time_ms)
-            },
-        };
-        let h = &mut self.batches.head[CLASS_CONTROL];
+        if k == CLASS_CONTROL {
+            self.batches.control = ControlWire {
+                kind: c.kind,
+                is_cross: c.flags & CMD_FLAG_CROSS != 0,
+                asset: c.asset,
+                leverage: c.arg,
+                time: if c.time_ms == 0 {
+                    None
+                } else {
+                    Some(c.time_ms)
+                },
+            };
+        }
+        let h = &mut self.batches.head[k];
         h.n = 1;
-        h.min_exp = c.expires_after_ms;
+        h.min_exp = if k == CLASS_CONTROL {
+            c.expires_after_ms
+        } else {
+            0
+        };
         if let Some(rec) = self.rt.pending.get_mut(h.id) {
             rec.items[0] = ItemRef::of(c);
             rec.n = 1;
@@ -1418,6 +1685,11 @@ impl HlGateway {
     /// Refuse a command unsent.
     fn refuse(&mut self, c: &HlCmd, reason: u8, now: u64) {
         self.rt.counters.local_refusals += 1;
+        if c.slot == SWEEP_SLOT {
+            // The sweep's own read: its round fails; the arm hears nothing.
+            self.rt.sweep_outcome = SWEEP_FAILED;
+            return;
+        }
         let ev = ItemRef::of(c).event(EV_REJECTED, reason, 0, now);
         emit_to(&mut self.rt.evt, &ev);
     }
@@ -1519,6 +1791,9 @@ impl HlGateway {
     /// Encode, sign and render the post into the TX buffer. `None` = the
     /// clock, the signer or a buffer refused: nothing was sent.
     fn seal(&mut self, k: usize, h: &BatchHead) -> Option<Sealed> {
+        if k == CLASS_READ {
+            return self.seal_read(h);
+        }
         let n = h.n;
         let b = &*self.batches;
         let mp_n = match k {
@@ -1569,10 +1844,35 @@ impl HlGateway {
         })
     }
 
-    /// Write a sealed post on the live connection, or by REST.
+    /// A read (XH4d): the post head, the `/info` body rendered in place
+    /// after it, the tail — unsigned, no envelope, no REST twin.
+    fn seal_read(&mut self, h: &BatchHead) -> Option<Sealed> {
+        let kind = self.rt.pending.get(h.id)?.items[0].kind;
+        let tx = &mut self.tx[ROOM..];
+        let at = ws_info_open(tx, h.id).ok()?;
+        let body = if kind == CMD_READ_ORDERS {
+            open_orders_request(&mut tx[at..], &self.master)
+        } else {
+            perp_state_request(&mut tx[at..], &self.master)
+        }
+        .ok()?;
+        let ws_len = ws_post_close(tx, at + body).ok()?;
+        Some(Sealed {
+            env: ROOM + at,
+            env_len: 0,
+            ws_len,
+        })
+    }
+
+    /// Write a sealed post on the live connection, or by REST — a read
+    /// only on the live connection: with none it is refused, unsent.
     fn send(&mut self, k: usize, id: u64, s: Sealed, now: u64) {
         let active = match self.mbb.active() {
             Some(a) if self.conns[usize::from(a)].phase() == Phase::Ready => a,
+            _ if k == CLASS_READ => {
+                self.rt.fail_all(id, EV_REJECTED, REASON_TRANSPORT, now);
+                return;
+            }
             _ => {
                 self.post_rest(id, s, false);
                 return;
@@ -1589,7 +1889,7 @@ impl HlGateway {
                 Ok(t) => Some(t),
                 Err(_) => {
                     self.halt(HALT_TIMER_FULL, now);
-                    if growing(k, self.batches.control.kind) {
+                    if growing(k, self.batches.control.kind) || k == CLASS_READ {
                         self.rt.counters.local_refusals += 1;
                         self.rt.fail_all(id, EV_REJECTED, REASON_LOCAL, now);
                         return;
@@ -1613,13 +1913,21 @@ impl HlGateway {
         match self.conns[a].send(&self.tx[start..ROOM + s.ws_len]) {
             Ok(()) => {
                 self.conns[a].note_post();
-                self.rt.stats.note_action_sent();
+                if k != CLASS_READ {
+                    self.rt.stats.note_action_sent();
+                }
                 if let Some(rec) = self.rt.pending.get_mut(id) {
                     rec.conn = active;
                     rec.timer = timer;
                     rec.written_ns = written;
+                    // A read is no order: it feeds no order latency.
+                    let n = if k == CLASS_READ {
+                        0
+                    } else {
+                        usize::from(rec.n)
+                    };
                     let mut i = 0usize;
-                    while i < usize::from(rec.n) {
+                    while i < n {
                         self.rt
                             .stats
                             .push_to_write
@@ -1634,6 +1942,13 @@ impl HlGateway {
                 // XORs back; never re-signed.
                 if let Some(t) = timer {
                     let _ = self.rt.timers.cancel(t);
+                }
+                if k == CLASS_READ {
+                    // A read that may have left answers on the dead
+                    // socket only: in doubt, and the reader asks again.
+                    self.conn_down(active, now);
+                    self.rt.fail_all(id, EV_UNANSWERED, REASON_TRANSPORT, now);
+                    return;
                 }
                 ws_unmask_in_place(&mut self.tx[ROOM..ROOM + s.ws_len], mask);
                 self.conn_down(active, now);
@@ -1708,6 +2023,100 @@ impl HlGateway {
             }
         }
         worked
+    }
+
+    /// The sweep (XH4d, XG-1): a cancel-all the engine asks for through
+    /// the stats word, never through the command ring. A round reads the
+    /// account's open orders, cancels every one of this gateway's slots
+    /// by cloid, and settles before the next read; a read with none of
+    /// ours left is `SWEEP_CLEAR`, [`SWEEP_ROUNDS`] rounds without one
+    /// `SWEEP_STRANDED`. A newer request restarts it.
+    fn sweep(&mut self, now: u64) -> bool {
+        let req = self.rt.stats.sweep_requested();
+        if req != self.sweep_seq {
+            self.sweep_seq = req;
+            self.sweep_round = 0;
+            self.sweep_phase = SW_READ;
+            self.rt.stats.set_sweep(req, SWEEP_WORKING);
+        }
+        match self.sweep_phase {
+            SW_READ => {
+                // The read's own room: a pending slot and a read's events.
+                if self.rt.pending.live() + CLASSES > MAX_IN_FLIGHT {
+                    return false;
+                }
+                self.rt.sweep_outcome = SWEEP_NONE;
+                self.rt.counters.sweep_rounds += 1;
+                let c = HlCmd::read_orders(SWEEP_SLOT, 0).at(now);
+                self.admit_alone(&c, CLASS_READ, now);
+                self.flush_open(now);
+                self.sweep_phase = SW_WAIT;
+                true
+            }
+            SW_WAIT => match self.rt.sweep_outcome {
+                SWEEP_READ => {
+                    self.rt.sweep_outcome = SWEEP_NONE;
+                    self.sweep_cancel_ours(now);
+                    true
+                }
+                SWEEP_FAILED => {
+                    self.rt.sweep_outcome = SWEEP_NONE;
+                    self.sweep_next_round(now);
+                    true
+                }
+                _ => false,
+            },
+            SW_SETTLE if now >= self.sweep_until => {
+                self.sweep_phase = SW_READ;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A sweep read came back: clear if none of ours rests, else cancel
+    /// every one it can and settle.
+    fn sweep_cancel_ours(&mut self, now: u64) {
+        let n = self.rt.sweep_n.min(self.rt.sweep_hits.len());
+        let mut mine = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let h = self.rt.sweep_hits[i];
+            i += 1;
+            if h.slot >= 8 || self.slots & (1u8 << h.slot) == 0 {
+                continue;
+            }
+            mine += 1;
+            if h.asset == ASSET_UNKNOWN {
+                self.rt.counters.sweep_unmapped += 1;
+                continue;
+            }
+            if self.xg2_full() {
+                // XG-2 binds the sweep too: the rest goes next round.
+                continue;
+            }
+            self.rt.counters.sweep_cancels += 1;
+            self.admit(&HlCmd::cancel(h.slot, h.client_oid, h.asset).at(now), now);
+        }
+        if mine == 0 {
+            self.rt.stats.set_sweep(self.sweep_seq, SWEEP_CLEAR);
+            self.sweep_phase = SW_IDLE;
+            return;
+        }
+        self.flush_open(now);
+        self.sweep_next_round(now);
+    }
+
+    /// Settle, then read again — or give up after the last round.
+    fn sweep_next_round(&mut self, now: u64) {
+        self.sweep_round += 1;
+        if self.sweep_round >= SWEEP_ROUNDS {
+            self.rt.stats.set_sweep(self.sweep_seq, SWEEP_STRANDED);
+            self.sweep_phase = SW_IDLE;
+            return;
+        }
+        self.sweep_until = now.saturating_add(SWEEP_SETTLE_NS);
+        self.sweep_phase = SW_SETTLE;
     }
 
     /// Set the halt word (the first reason wins, XG-5) and tell the arm.

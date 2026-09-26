@@ -23,6 +23,10 @@
 //! | control | leverage, scheduleCancel and noop post alone, in the order they came between batches; `{"type":"default"}` is the ACK, `status:err` the refusal |
 //! | halted | a halted gateway refuses growth (a place, a leverage change) unsent; a cancel and a scheduleCancel still go |
 //! | refusals | a malformed or miscounted answer and the API layer's error are UNANSWERED; a refused action rejects every item |
+//! | reads | a read posts alone as `{"type":"info"}`; `frontendOpenOrders` rows (ours and a stranger's) and a `clearinghouseState` position come back as events, then the read's end (rows, account value, the sheet's time); an answer that does not scan is `EV_READ_FAILED` |
+//! | read, no socket | a read never goes REST: with no socket it is refused `TRANSPORT`, unsent |
+//! | sweep | the cancel-all word: a read, a cancelByCloid of this gateway's slots only (never another slot's, never a stranger's), a settle, a read with none left — `SWEEP_CLEAR`; the sweep's reads emit nothing, its cancels' answers reach the arm |
+//! | stranded | a sweep that never reads clear stops after 8 rounds `SWEEP_STRANDED`; a new request starts over |
 //!
 //! Offline path: this file MAY allocate.
 
@@ -31,14 +35,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use core_types::{ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_MARGIN};
-use exec_gateway::stats::HALT_VENUE_BASE;
+use exec_gateway::stats::{HALT_VENUE_BASE, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING};
 use exec_gateway::Idle;
 use exec_hyperliquid::cloid;
 use exec_hyperliquid::cmd::{HlCmd, CMD_CANCEL, CMD_PLACE};
 use exec_hyperliquid::event::{
     ExecEvent, EVF_BUY, EVF_CROSSED, EVF_RESTING, EV_ACK, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP,
-    EV_REJECTED, EV_SNAPSHOT, EV_UNANSWERED, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED,
-    REASON_NOT_READY, REASON_RATE_LIMIT, REASON_TRANSPORT,
+    EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
+    EV_UNANSWERED, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED,
+    REASON_NOT_READY, REASON_RATE_LIMIT, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use exec_hyperliquid::gateway::{hl_duplex, CoinMap, GatewayCfg, HlEngineEnd, HlGateway};
 use exec_hyperliquid::testvenue::{items_in, resting, Answer, Venue};
@@ -122,6 +127,28 @@ fn alo(client_oid: u64) -> HlCmd {
         Tif::Alo,
     )
 }
+
+/// A `frontendOpenOrders` row on ETH; ours when `cloid` names a slot.
+fn open_row(oid: u64, cloid: Option<(u8, u64)>) -> String {
+    let c = match cloid {
+        Some((slot, cid)) => format!(r#","cloid":"{}""#, cloid_hex(slot, cid)),
+        None => String::new(),
+    };
+    format!(
+        r#"{{"coin":"ETH","limitPx":"2500.0","oid":{oid},"origSz":"0.1","side":"B","sz":"0.1","timestamp":1790000000000,"isTrigger":false{c}}}"#
+    )
+}
+
+/// A read's answer: `frontendOpenOrders` with `rows`.
+fn open_orders(rows: &[String]) -> String {
+    format!(
+        r#"{{"type":"frontendOpenOrders","data":[{}]}}"#,
+        rows.join(",")
+    )
+}
+
+/// A read's answer: `clearinghouseState` — 1000.5 USD, 0.1 ETH worth 250.
+const SHEET: &str = r#"{"type":"clearinghouseState","data":{"marginSummary":{"accountValue":"1000.5","totalNtlPos":"250.0","totalRawUsd":"750.5","totalMarginUsed":"25.0"},"crossMarginSummary":{"accountValue":"1000.5","totalNtlPos":"250.0","totalRawUsd":"750.5","totalMarginUsed":"25.0"},"crossMaintenanceMarginUsed":"5.0","withdrawable":"975.5","assetPositions":[{"type":"oneWay","position":{"coin":"ETH","entryPx":"2500.0","szi":"0.1","positionValue":"250.0","unrealizedPnl":"0.0"}}],"time":1790000000000}}"#;
 
 fn fill_row(tid: u64, fee: &str, crossed: bool) -> String {
     format!(
@@ -625,6 +652,200 @@ fn a_halted_gateway_refuses_growth_unsent_but_still_cancels() {
     assert!(posts[1]
         .body
         .contains(r#""action":{"type":"scheduleCancel"}"#));
+}
+
+#[test]
+fn reads_answer_their_rows_then_their_end_and_an_unreadable_one_fails() {
+    let v = Venue::start();
+    let mut orders = 0usize;
+    v.policy(move |s| {
+        if s.body.contains("frontendOpenOrders") {
+            orders += 1;
+            if orders == 1 {
+                Answer::Info(open_orders(&[
+                    open_row(101, Some((SLOT, 7))),
+                    open_row(102, None),
+                ]))
+            } else {
+                Answer::Info(r#"{"type":"frontendOpenOrders","data":{"not":"a list"}}"#.into())
+            }
+        } else if s.body.contains("clearinghouseState") {
+            Answer::Info(SHEET.into())
+        } else {
+            Answer::Silent
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    assert!(eng.cmd.push(&HlCmd::read_orders(SLOT, 1)));
+    assert!(eng.cmd.push(&HlCmd::read_state(SLOT, 2)));
+    assert!(eng.cmd.push(&HlCmd::read_orders(SLOT, 3)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e,
+        EV_READ_DONE
+    ) + count(
+        e,
+        EV_READ_FAILED
+    ) >= 3));
+    let posts = v.posts();
+    assert_eq!(posts.len(), 3, "a read posts alone");
+    assert!(
+        posts[0].body.contains(r#""type":"info""#) && posts[0].body.contains("0xa5a5a5a5"),
+        "{}",
+        posts[0].body
+    );
+    let rows: Vec<&ExecEvent> = evs.iter().filter(|e| e.kind == EV_OPEN_ORDER).collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (
+            rows[0].slot,
+            rows[0].client_oid,
+            rows[0].oid,
+            rows[0].aux,
+            rows[0].asset
+        ),
+        (SLOT, 7, 101, 1, ETH)
+    );
+    assert_eq!((rows[1].slot, rows[1].oid), (SLOT_FOREIGN, 102));
+    let end = |cid: u64| {
+        *evs.iter()
+            .find(|e| e.client_oid == cid && (e.kind == EV_READ_DONE || e.kind == EV_READ_FAILED))
+            .unwrap()
+    };
+    let o = end(1);
+    assert_eq!(
+        (o.kind, o.reason, o.aux, o.slot),
+        (EV_READ_DONE, READ_ORDERS, 2, SLOT)
+    );
+    let pos = evs
+        .iter()
+        .find(|e| e.kind == EV_POSITION)
+        .expect("the position");
+    assert_eq!(
+        (pos.client_oid, pos.slot, pos.asset, pos.sz_1e8, pos.aux),
+        (2, SLOT, ETH, 10_000_000, 25_000_000_000)
+    );
+    let st = end(2);
+    assert_eq!(
+        (st.kind, st.reason, st.px_1e8, st.venue_ms),
+        (EV_READ_DONE, READ_STATE, 100_050_000_000, 1_790_000_000_000)
+    );
+    assert_eq!(end(3).kind, EV_READ_FAILED, "an answer that does not scan");
+    assert_eq!(
+        (count(&evs, EV_UNANSWERED), count(&evs, EV_REJECTED)),
+        (0, 0)
+    );
+    assert_eq!((gw.counters().reads, gw.counters().reads_failed), (2, 1));
+}
+
+#[test]
+fn a_read_with_no_socket_is_refused_never_sent_by_rest() {
+    let v = Venue::start();
+    v.policy(|_| Answer::Drop);
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    // The socket dies on the first post and no upgrade is taken again.
+    v.refuse_ws(true);
+    assert!(eng.cmd.push(&HlCmd::read_orders(SLOT, 1)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |g, e| !g.ws_live()
+        && count(e, EV_UNANSWERED) >= 1));
+    assert!(eng.cmd.push(&HlCmd::read_orders(SLOT, 2)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e,
+        EV_REJECTED
+    ) >= 1));
+    let r = evs.iter().find(|e| e.kind == EV_REJECTED).unwrap();
+    assert_eq!(
+        (r.client_oid, r.reason, r.cmd_kind()),
+        (2, REASON_TRANSPORT, 0)
+    );
+    assert!(
+        v.posts().iter().all(|p| p.conn != usize::MAX),
+        "a read never goes REST"
+    );
+}
+
+#[test]
+fn the_sweep_cancels_this_gateway_s_slots_only_and_reads_until_none_rest() {
+    let v = Venue::start();
+    let mut reads = 0usize;
+    v.policy(move |s| {
+        if s.body.contains("frontendOpenOrders") {
+            reads += 1;
+            // Another slot's order and a stranger's never leave.
+            let mut rows = vec![open_row(300, Some((3, 9))), open_row(301, None)];
+            if reads == 1 {
+                rows.push(open_row(101, Some((SLOT, 7))));
+            }
+            Answer::Info(open_orders(&rows))
+        } else {
+            Answer::Action(CANCEL_OK.into())
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let stats = Arc::clone(&eng.stats);
+    let asked = stats.request_sweep();
+    assert!(
+        drive(&mut gw, &mut eng, &mut evs, 10, |_, _| stats.sweep()
+            == (asked, SWEEP_CLEAR)),
+        "the sweep never read clear"
+    );
+    let posts = v.posts();
+    assert_eq!(posts.len(), 3, "[read] [cancel ours] [read]");
+    assert!(posts[0].body.contains("frontendOpenOrders"));
+    assert!(
+        posts[1].body.contains(&cloid_hex(SLOT, 7)) && !posts[1].body.contains(&cloid_hex(3, 9)),
+        "{}",
+        posts[1].body
+    );
+    assert!(posts[2].body.contains("frontendOpenOrders"));
+    let ack = evs
+        .iter()
+        .find(|e| e.kind == EV_ACK)
+        .expect("the cancel's answer reaches the arm");
+    assert_eq!(
+        (ack.client_oid, ack.slot, ack.cmd_kind()),
+        (7, SLOT, CMD_CANCEL)
+    );
+    assert_eq!(
+        count(&evs, EV_OPEN_ORDER) + count(&evs, EV_READ_DONE),
+        0,
+        "the sweep's reads are its own"
+    );
+    assert_eq!(
+        (gw.counters().sweep_rounds, gw.counters().sweep_cancels),
+        (2, 1)
+    );
+}
+
+#[test]
+fn a_sweep_that_never_reads_clear_is_stranded_and_a_new_request_starts_over() {
+    let v = Venue::start();
+    v.policy(|s| {
+        if s.body.contains("frontendOpenOrders") {
+            Answer::Info(open_orders(&[open_row(101, Some((SLOT, 7)))]))
+        } else {
+            Answer::Action(CANCEL_OK.into())
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let stats = Arc::clone(&eng.stats);
+    let asked = stats.request_sweep();
+    assert!(
+        drive(&mut gw, &mut eng, &mut evs, 20, |_, _| stats.sweep()
+            == (asked, SWEEP_STRANDED)),
+        "the sweep never gave up"
+    );
+    assert_eq!(gw.counters().sweep_rounds, 8);
+    let again = stats.request_sweep();
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| stats.sweep()
+        == (again, SWEEP_WORKING)));
 }
 
 #[test]

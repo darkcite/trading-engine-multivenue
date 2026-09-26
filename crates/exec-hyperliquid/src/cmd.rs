@@ -32,6 +32,13 @@ pub const CMD_LEVERAGE: u8 = 4;
 pub const CMD_SCHEDULE_CANCEL: u8 = 5;
 /// Control (XH4c): `noop` — spends a nonce.
 pub const CMD_NOOP: u8 = 6;
+/// Read (XH4d): the account's resting orders, over the WebSocket post
+/// channel (`frontendOpenOrders`); answered by `EV_OPEN_ORDER` rows and
+/// `EV_READ_DONE`.
+pub const CMD_READ_ORDERS: u8 = 7;
+/// Read (XH4d): the account's perp sheet (`clearinghouseState`);
+/// answered by `EV_POSITION` rows and `EV_READ_DONE`.
+pub const CMD_READ_STATE: u8 = 8;
 
 /// `flags`: reduce-only.
 pub const CMD_FLAG_REDUCE_ONLY: u8 = 1;
@@ -129,9 +136,15 @@ impl HlCmd {
     #[inline(always)]
     #[must_use]
     pub const fn replacing(mut self, prev_client_oid: u64) -> Self {
+        self.set_replacing(prev_client_oid);
+        self
+    }
+
+    /// [`Self::replacing`], in place: a modify of `prev_client_oid`.
+    #[inline(always)]
+    pub const fn set_replacing(&mut self, prev_client_oid: u64) {
         self.kind = CMD_MODIFY;
         self.prev_client_oid = prev_client_oid;
-        self
     }
 
     /// Cancel `client_oid` of `slot` on `asset`.
@@ -190,12 +203,44 @@ impl HlCmd {
         self.kind >= CMD_LEVERAGE && self.kind <= CMD_NOOP
     }
 
+    /// Read (XH4d): the account's resting orders. `client_oid` only
+    /// correlates the answer.
+    #[inline(always)]
+    #[must_use]
+    pub const fn read_orders(slot: u8, client_oid: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_READ_ORDERS;
+        c
+    }
+
+    /// Read (XH4d): the account's perp sheet.
+    #[inline(always)]
+    #[must_use]
+    pub const fn read_state(slot: u8, client_oid: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_READ_STATE;
+        c
+    }
+
+    /// A read (posted alone, unsigned, WebSocket only).
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_read(&self) -> bool {
+        self.kind == CMD_READ_ORDERS || self.kind == CMD_READ_STATE
+    }
+
     /// Reduce-only.
     #[inline(always)]
     #[must_use]
     pub const fn reduce_only(mut self) -> Self {
-        self.flags |= CMD_FLAG_REDUCE_ONLY;
+        self.set_reduce_only();
         self
+    }
+
+    /// [`Self::reduce_only`], in place.
+    #[inline(always)]
+    pub const fn set_reduce_only(&mut self) {
+        self.flags |= CMD_FLAG_REDUCE_ONLY;
     }
 
     /// Venue expiry, `ms` after signing.

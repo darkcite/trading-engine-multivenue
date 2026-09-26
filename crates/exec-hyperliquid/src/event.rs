@@ -17,6 +17,9 @@
 //! | [`EV_SNAPSHOT`] | `userFills` | the process's first snapshot was absorbed as history (`aux` = rows, `venue_ms` = its latest fill): the arm reads its boot reconciliation after it |
 //! | [`EV_GAP`] | the gateway | a stream may have lost rows (`aux` = `GAP_*`): the arm re-checks its open orders |
 //! | [`EV_HALT`] | the gateway | the gateway halted (`aux` = the halt reason) |
+//! | [`EV_OPEN_ORDER`] | a read (XH4d) | one resting order of the account: `asset`, `oid`, and `slot` / `client_oid` from its cloid ([`SLOT_FOREIGN`] when not ours) |
+//! | [`EV_POSITION`] | a read (XH4d) | one perp position: `asset`, `sz_1e8` = signed size, `aux` = its value at the venue's mark (USD ×1e8) |
+//! | [`EV_READ_DONE`] / [`EV_READ_FAILED`] | a read (XH4d) | the read's end (`reason` = [`READ_ORDERS`] / [`READ_STATE`], `aux` = rows, `px_1e8` = the account value and `venue_ms` its time for a state read) or its failure; `client_oid` / `slot` are the read command's |
 //!
 //! A post reply's `filled` is an [`EV_ACK`], never [`EV_FILLED`]: the
 //! venue's `filled` status arrives on `orderUpdates` and the trades on
@@ -63,6 +66,20 @@ pub const EV_HALT: u8 = 9;
 pub const EV_SNAPSHOT: u8 = 10;
 /// A stream may have lost rows (`aux` = `GAP_*`).
 pub const EV_GAP: u8 = 11;
+/// A read's row: one resting order of the account (XH4d).
+pub const EV_OPEN_ORDER: u8 = 12;
+/// A read's row: one perp position (XH4d).
+pub const EV_POSITION: u8 = 13;
+/// A read answered in full; its rows came before it (XH4d).
+pub const EV_READ_DONE: u8 = 14;
+/// A read that did not answer, or answered what does not scan: no rows
+/// of it count (XH4d).
+pub const EV_READ_FAILED: u8 = 15;
+
+/// A read's `reason`: the account's resting orders (`frontendOpenOrders`).
+pub const READ_ORDERS: u8 = 1;
+/// A read's `reason`: the account's perp sheet (`clearinghouseState`).
+pub const READ_STATE: u8 = 2;
 
 /// [`EV_GAP`]: a `userFills` frame did not scan.
 pub const GAP_FILLS_UNREADABLE: u64 = 1;

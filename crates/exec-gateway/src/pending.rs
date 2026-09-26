@@ -51,9 +51,9 @@ impl<T: Copy, const N: usize> Pending<T, N> {
             );
         }
         Self {
-            ids: boxed_array(0u64),
-            sent_ns: boxed_array(0u64),
-            slots: boxed_array(blank),
+            ids: crate::boxed_array(0u64),
+            sent_ns: crate::boxed_array(0u64),
+            slots: crate::boxed_array(blank),
             live: 0,
         }
     }
@@ -159,15 +159,6 @@ impl<T: Copy, const N: usize> Pending<T, N> {
     #[inline]
     pub const fn capacity(&self) -> usize {
         N
-    }
-}
-
-/// A `Box<[V; N]>` filled with `v`, built on the heap (a 256-slot table of
-/// 600 B records would not fit a gateway thread's stack as a temporary).
-fn boxed_array<V: Copy, const N: usize>(v: V) -> Box<[V; N]> {
-    match vec![v; N].into_boxed_slice().try_into() {
-        Ok(b) => b,
-        Err(_) => unreachable!("a vec of N elements converts to [V; N]"),
     }
 }
 

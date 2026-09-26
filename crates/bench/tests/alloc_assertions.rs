@@ -10849,15 +10849,471 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
     );
 }
 
+/// **XMM gate 86 (XH4d) — the gateway arm is 0 B/op.** The engine's half
+/// of the Hyperliquid gateway arm (`HlGatewayArm`, an `OrderDispatch`)
+/// against a scripted gateway end in-process (no socket: the gateway's
+/// own turn, reads included, is gate 84b's). Every round: a place (bids
+/// and asks), a modify of the last round's order on its own side, cancels,
+/// the cancel-all word every thousand; the script answers resting (the
+/// stream's `open` row first, every fourth), fills (the stream's `filled`
+/// first, the fill and its fee a round later — every seventh never: the
+/// join window), post-only crosses (the reply and the stream's row, every
+/// other one the row first), in-doubt verdicts (settled by a cancel after
+/// their 1 ms expiry), cancels that succeed (with the stream's `canceled`
+/// row, every other one first) or find nothing (gone, read again, then
+/// closed), sheets (every fifth failing; flat until the arm boots — a
+/// position holds the boot — then one position), orders reads that list
+/// the last sixteen accepted orders (listings, revivals, races) and every
+/// seventh one order the arm never placed (cancelled), a stream gap every
+/// 97 commands and another slot's resting row every 89, the gateway's
+/// heartbeat every answer; the halt signals and the cancel-all state;
+/// every out-queue drained as the engine does. Timers run on the real clock (1 ms windows): the warm-up
+/// runs until every path has run, and the window must run each again.
+#[test]
+fn hl_gateway_arm_is_zero_alloc() {
+    use clob_dispatcher::{CancelAllState, OrderDispatch};
+    use core_fill::ORDER_KIND_MAKER;
+    use core_types::{
+        CancelReq, ModifyReq, Order, OrderEvent, Side, ORDER_EVENT_CANCELED,
+        ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED,
+    };
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use exec_hyperliquid::arm::{ArmCfg, ArmCounters, HlGatewayArm, PerpBind, ARM_PERPS};
+    use exec_hyperliquid::cmd::{
+        CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_ORDERS, CMD_READ_STATE,
+    };
+    use exec_hyperliquid::deadman::DeadManCfg;
+    use exec_hyperliquid::event::{
+        ExecEvent, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_POST_ITEM, EVF_RESTING, EV_ACK,
+        EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_OPEN_ORDER, EV_POSITION,
+        EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
+        READ_ORDERS, READ_STATE, REASON_NOT_FOUND,
+    };
+    use exec_hyperliquid::gateway::HlGatewayEnd;
+    use exec_hyperliquid::hl_duplex;
+    use exec_hyperliquid::rules::PerpRules;
+
+    const SLOT: u8 = 6;
+    const SYM: u32 = 42;
+    const ASSET: u32 = 3;
+    const ROUNDS: u64 = 40_000;
+    const RECENT: usize = 16;
+
+    /// The scripted venue's memory: every buffer fixed.
+    struct Script {
+        n: u64,
+        /// Sheets and orders reads answered, each counted apart (every
+        /// fifth sheet fails, every seventh orders read lists a stranger
+        /// — whatever the arm's interleaving of the two).
+        sheets: u64,
+        orders: u64,
+        /// Orders answered resting lately (the orders read lists them).
+        recent: [u64; RECENT],
+        at: usize,
+        /// A fill held for the next answer (after its `filled` row).
+        held: Option<ExecEvent>,
+        replaced: u64,
+        modifies: u64,
+        /// The sheets are flat until the arm boots (a position in a bound
+        /// perp holds the boot: the member boots flat); then they carry one.
+        flat: bool,
+    }
+
+    /// The gateway's end: every command answered by the script.
+    fn answer(gw: &mut HlGatewayEnd, s: &mut Script) {
+        // The gateway's turn beats: the arm's stream is alive.
+        gw.stats.beat(core_time::now_ns());
+        if let Some(f) = s.held.take() {
+            assert!(gw.evt.emit(&f));
+            assert!(gw.evt.emit(&ExecEvent {
+                kind: EV_FILL_META,
+                px_1e8: -10,
+                flags: EVF_CROSSED,
+                ..f
+            }));
+        }
+        while let Some(p) = gw.cmd.pop() {
+            let c = *p;
+            s.n += 1;
+            let n = s.n;
+            let bits = if c.kind <= CMD_CANCEL { c.kind } else { 0 };
+            let item = ExecEvent {
+                client_oid: c.client_oid,
+                asset: c.asset,
+                slot: c.slot,
+                flags: EVF_POST_ITEM | (bits << EVF_CMD_SHIFT),
+                ..ExecEvent::default()
+            };
+            let row = ExecEvent {
+                client_oid: c.client_oid,
+                asset: c.asset,
+                slot: c.slot,
+                ..ExecEvent::default()
+            };
+            let end = ExecEvent {
+                client_oid: c.client_oid,
+                slot: c.slot,
+                kind: EV_READ_DONE,
+                ..ExecEvent::default()
+            };
+            match c.kind {
+                CMD_PLACE | CMD_MODIFY if n % 11 == 0 => {
+                    let reply = ExecEvent {
+                        kind: EV_REJECTED,
+                        reason: ORDER_EVENT_REASON_BAD_ALO_PX,
+                        ..item
+                    };
+                    let stream = ExecEvent {
+                        kind: EV_REJECTED,
+                        reason: ORDER_EVENT_REASON_BAD_ALO_PX,
+                        ..row
+                    };
+                    // Every other one the stream's row beats the reply.
+                    let (a, b) = if n % 22 == 0 {
+                        (stream, reply)
+                    } else {
+                        (reply, stream)
+                    };
+                    assert!(gw.evt.emit(&a));
+                    assert!(gw.evt.emit(&b));
+                }
+                CMD_PLACE | CMD_MODIFY if n % 13 == 0 => assert!(gw.evt.emit(&ExecEvent {
+                    kind: EV_UNANSWERED,
+                    ..item
+                })),
+                CMD_PLACE | CMD_MODIFY => {
+                    if n % 4 == 0 {
+                        assert!(gw.evt.emit(&ExecEvent {
+                            kind: EV_RESTING,
+                            ..row
+                        }));
+                    }
+                    assert!(gw.evt.emit(&ExecEvent {
+                        kind: EV_ACK,
+                        flags: item.flags | EVF_RESTING,
+                        oid: n,
+                        ..item
+                    }));
+                    s.recent[s.at % RECENT] = c.client_oid;
+                    s.at += 1;
+                    if n % 5 == 0 {
+                        assert!(gw.evt.emit(&ExecEvent {
+                            kind: EV_FILLED,
+                            ..row
+                        }));
+                        if n % 7 != 0 {
+                            s.held = Some(ExecEvent {
+                                kind: EV_FILL,
+                                px_1e8: c.px_1e8,
+                                sz_1e8: c.sz_1e8,
+                                venue_ms: n,
+                                flags: if c.is_buy != 0 { EVF_BUY } else { 0 },
+                                ..row
+                            });
+                        }
+                    }
+                }
+                CMD_CANCEL if n % 3 == 0 => assert!(gw.evt.emit(&ExecEvent {
+                    kind: EV_REJECTED,
+                    reason: REASON_NOT_FOUND,
+                    ..item
+                })),
+                CMD_CANCEL => {
+                    let ack = ExecEvent {
+                        kind: EV_ACK,
+                        ..item
+                    };
+                    let canceled = ExecEvent {
+                        kind: EV_CANCELED,
+                        reason: ORDER_EVENT_REASON_OTHER,
+                        ..row
+                    };
+                    // Every other one the stream's row beats the answer.
+                    let (a, b) = if n % 2 == 0 {
+                        (canceled, ack)
+                    } else {
+                        (ack, canceled)
+                    };
+                    assert!(gw.evt.emit(&a));
+                    assert!(gw.evt.emit(&b));
+                }
+                CMD_READ_STATE => {
+                    s.sheets += 1;
+                    if s.sheets % 5 == 0 {
+                        assert!(gw.evt.emit(&ExecEvent {
+                            kind: EV_READ_FAILED,
+                            reason: READ_STATE,
+                            ..end
+                        }));
+                    } else {
+                        if !s.flat {
+                            assert!(gw.evt.emit(&ExecEvent {
+                                kind: EV_POSITION,
+                                asset: ASSET,
+                                sz_1e8: 50_000_000,
+                                aux: 5_000_000_000,
+                                ..row
+                            }));
+                        }
+                        assert!(gw.evt.emit(&ExecEvent {
+                            reason: READ_STATE,
+                            px_1e8: 100_000_000_000,
+                            venue_ms: n,
+                            ..end
+                        }));
+                    }
+                }
+                CMD_READ_ORDERS => {
+                    s.orders += 1;
+                    let mut k = 0usize;
+                    while k < RECENT {
+                        if s.recent[k] != 0 {
+                            assert!(gw.evt.emit(&ExecEvent {
+                                kind: EV_OPEN_ORDER,
+                                client_oid: s.recent[k],
+                                aux: c.client_oid,
+                                asset: ASSET,
+                                slot: SLOT,
+                                ..ExecEvent::default()
+                            }));
+                        }
+                        k += 1;
+                    }
+                    if s.orders % 7 == 0 {
+                        // An order the arm never placed.
+                        assert!(gw.evt.emit(&ExecEvent {
+                            kind: EV_OPEN_ORDER,
+                            client_oid: (1 << 40) + n,
+                            aux: c.client_oid,
+                            asset: ASSET,
+                            slot: SLOT,
+                            ..ExecEvent::default()
+                        }));
+                    }
+                    assert!(gw.evt.emit(&ExecEvent {
+                        reason: READ_ORDERS,
+                        ..end
+                    }));
+                }
+                // The dead man's posts.
+                _ => assert!(gw.evt.emit(&ExecEvent {
+                    kind: EV_ACK,
+                    ..item
+                })),
+            }
+            if n % 97 == 0 {
+                assert!(gw.evt.emit(&ExecEvent {
+                    kind: EV_GAP,
+                    ..ExecEvent::default()
+                }));
+            }
+            if n % 89 == 0 {
+                // Another slot's order rests on the account.
+                assert!(gw.evt.emit(&ExecEvent {
+                    kind: EV_RESTING,
+                    client_oid: n,
+                    asset: ASSET,
+                    slot: 3,
+                    ..ExecEvent::default()
+                }));
+            }
+        }
+    }
+
+    fn drain(arm: &mut HlGatewayArm, s: &mut Script, acc: &mut u64) {
+        while let Some(f) = arm.try_next_fill() {
+            *acc ^= f.order_id;
+        }
+        let mut ev = OrderEvent::ZERO;
+        while arm.try_next_order_event(&mut ev) {
+            s.replaced += u64::from(
+                ev.kind == ORDER_EVENT_CANCELED && ev.reason == ORDER_EVENT_REASON_REPLACED,
+            );
+            *acc ^= ev.client_oid ^ u64::from(ev.kind);
+        }
+        while let Some((cid, _)) = arm.try_next_retired() {
+            *acc ^= cid;
+        }
+    }
+
+    fn quote(cid: u64, side: Side) -> Order {
+        let mut o = Order::new(
+            0,
+            core_types::VenueId::Hyperliquid,
+            SYM,
+            side,
+            ORDER_KIND_MAKER,
+            core_types::Price(100_000_000 + (cid % 7) as i64 * 10_000),
+            core_types::Qty(500_000),
+            cid,
+        )
+        .with_post_only();
+        o.strategy_id = SLOT;
+        o
+    }
+
+    fn side_of(r: u64) -> Side {
+        if r % 2 == 0 {
+            Side::Bid
+        } else {
+            Side::Ask
+        }
+    }
+
+    fn cancel_req(cid: u64) -> CancelReq {
+        let mut q = CancelReq::new(0, core_types::VenueId::Hyperliquid, SYM, cid);
+        q.strategy_id = SLOT;
+        q
+    }
+
+    fn round(arm: &mut HlGatewayArm, gw: &mut HlGatewayEnd, r: u64, s: &mut Script, acc: &mut u64) {
+        let cid = 10 * r + 10;
+        *acc ^= u64::from(arm.submit(&quote(cid, side_of(r))).is_ok());
+        if r % 3 == 1 {
+            // The last round's order, replaced on its own side.
+            let prev = 10 * (r - 1) + 10;
+            if arm
+                .modify(&ModifyReq::new(prev, quote(cid + 1, side_of(r - 1))))
+                .is_ok()
+            {
+                s.modifies += 1;
+            }
+        }
+        if r % 3 == 2 {
+            *acc ^= u64::from(arm.cancel(&cancel_req(10 * (r - 1) + 11)).is_ok());
+            *acc ^= u64::from(arm.cancel(&cancel_req(10 * (r - 2) + 10)).is_ok());
+        }
+        if r % 1_000 == 999 {
+            *acc ^= u64::from(arm.cancel_all().is_ok());
+            gw.stats.set_sweep(gw.stats.sweep_requested(), SWEEP_CLEAR);
+        }
+        answer(gw, s);
+        let _ = arm.on_idle();
+        drain(arm, s, acc);
+        let sig = arm.halt_signal();
+        *acc ^= sig.ws_gap_ns ^ u64::from(sig.alo_reject_permille);
+        *acc ^= arm.halt_signal_for(0).ws_gap_ns;
+        *acc ^= u64::from(arm.cancel_all_state() == CancelAllState::Clear);
+    }
+
+    /// The paths the window must run again, each counted.
+    fn paths(c: &ArmCounters, s: &Script) -> [u64; 11] {
+        [
+            c.fills,
+            c.alo_rejects,
+            c.doubt_settled,
+            c.reads,
+            c.reads_failed,
+            c.closed_unseen,
+            c.join_timeouts,
+            c.unknown_orders,
+            c.fees_1e8.unsigned_abs(),
+            s.replaced,
+            s.modifies,
+        ]
+    }
+
+    // ---- boot (NOT measured) ----
+    let bind = PerpBind {
+        sym: SYM,
+        asset: ASSET,
+        rules: PerpRules::new(4).expect("rules"),
+    };
+    let cfg = ArmCfg {
+        slot: SLOT,
+        perps: [bind; ARM_PERPS],
+        n_perps: 1,
+        expires_after_ms: 1,
+        post_timeout_ms: 5_000,
+        skew_ms: 0,
+        recon_ms: 1,
+        join_ms: 1,
+        gone_ms: 1,
+        shutdown_ms: 1_000,
+        own_account: true,
+        anchor_1e6: 0,
+        deadman: DeadManCfg::DEFAULT,
+    };
+    let (eng, mut gw) = hl_duplex();
+    let mut arm = HlGatewayArm::new(&cfg, eng).expect("the arm");
+    gw.stats.set_gauges(0, true);
+    let mut s = Script {
+        n: 0,
+        sheets: 0,
+        orders: 0,
+        recent: [0; RECENT],
+        at: 0,
+        held: None,
+        replaced: 0,
+        modifies: 0,
+        flat: true,
+    };
+    let mut acc = 0u64;
+    let _ = arm.on_idle();
+    answer(&mut gw, &mut s);
+    assert!(gw.evt.emit(&ExecEvent {
+        kind: EV_SNAPSHOT,
+        ..ExecEvent::default()
+    }));
+    let _ = arm.on_idle();
+    gw.stats.set_sweep(gw.stats.sweep_requested(), SWEEP_CLEAR);
+    let mut spins = 0u32;
+    while !arm.ready() {
+        let _ = arm.on_idle();
+        answer(&mut gw, &mut s);
+        spins += 1;
+        assert!(spins < 1_000_000, "gate 86: the arm never booted");
+    }
+    assert!(!arm.boot_position(), "gate 86: the seeding sheet was flat");
+    s.flat = false;
+
+    // Warm-up (NOT measured): until every path has run.
+    let mut r = 0u64;
+    while r < 2_000 || paths(arm.counters(), &s).contains(&0) {
+        round(&mut arm, &mut gw, r, &mut s, &mut acc);
+        r += 1;
+        assert!(
+            r < 2_000_000,
+            "gate 86: a path never ran: {:?}",
+            paths(arm.counters(), &s)
+        );
+    }
+
+    // ---- measurement window ----
+    let before = paths(arm.counters(), &s);
+    let g = AllocGuard::new();
+    let end = r + ROUNDS;
+    while r < end {
+        round(&mut arm, &mut gw, r, &mut s, &mut acc);
+        r += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let after = paths(arm.counters(), &s);
+    let mut k = 0usize;
+    while k < after.len() {
+        assert!(
+            after[k] > before[k],
+            "gate 86: path {k} did not run in the window: {before:?} → {after:?}"
+        );
+        k += 1;
+    }
+    assert_eq!(
+        allocs, 0,
+        "the HL gateway arm allocated {allocs} times ({bytes} B)"
+    );
+}
+
 /// Gate 84b's venue half: runs ONLY in the child process gate 84b spawns
 /// (it is `#[ignore]`d, and a no-op without `GATE84_VENUE_DIR`). A
 /// scripted Hyperliquid (`exec_hyperliquid::testvenue`, which sends the
 /// empty `userFills` snapshot on subscribe) that answers the ALO post
 /// with one resting status and one post-only cross, then pushes one
 /// `orderUpdates` row and one `userFills` row carrying our cloids — each
-/// its own TLS record — and answers the modify with a resting status and
-/// the cancel with `success`; it writes its port and certificate for the
-/// parent.
+/// its own TLS record — answers the modify with a resting status and the
+/// cancel with `success`, and the two reads (XH4d) with the account's
+/// open orders (one ours, one a stranger's) and its perp sheet (one
+/// position); it writes its port and certificate for the parent.
 #[test]
 #[ignore = "gate 84b's child process; never run on its own"]
 fn gate84_venue_helper() {
@@ -10872,6 +11328,20 @@ fn gate84_venue_helper() {
     let mut k = 0u64;
     v.policy(move |s| {
         k += 1;
+        if s.body.contains("frontendOpenOrders") {
+            let mut hex = [0u8; 34];
+            to_hex(&encode(6, k), &mut hex);
+            let c = String::from_utf8_lossy(&hex).to_string();
+            return Answer::Info(format!(
+                r#"{{"type":"frontendOpenOrders","data":[{{"coin":"ETH","limitPx":"2500.0","oid":{k},"origSz":"0.01","side":"B","sz":"0.01","timestamp":1,"isTrigger":false,"cloid":"{c}"}},{{"coin":"ETH","limitPx":"2600.0","oid":7,"origSz":"0.01","side":"A","sz":"0.01","timestamp":1,"isTrigger":false}}]}}"#
+            ));
+        }
+        if s.body.contains("clearinghouseState") {
+            return Answer::Info(
+                r#"{"type":"clearinghouseState","data":{"marginSummary":{"accountValue":"1000.5","totalNtlPos":"25.0","totalRawUsd":"975.5","totalMarginUsed":"2.5"},"crossMarginSummary":{"accountValue":"1000.5","totalNtlPos":"25.0","totalRawUsd":"975.5","totalMarginUsed":"2.5"},"crossMaintenanceMarginUsed":"0.5","withdrawable":"998.0","assetPositions":[{"type":"oneWay","position":{"coin":"ETH","entryPx":"2500.0","szi":"0.01","positionValue":"25.0","unrealizedPnl":"0.0"}}],"time":1790000000000}}"#
+                    .to_string(),
+            );
+        }
         if s.body.contains("cancelByCloid") {
             return Answer::Action(
                 r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#
@@ -10911,38 +11381,51 @@ fn gate84_venue_helper() {
 /// harness). Every round pushes two ALO places, an ALO modify and a
 /// cancel, which the gateway coalesces into THREE posts (the ALO batch,
 /// the batchModify, the cancelByCloid) — each encoded, signed, rendered
-/// and framed in place; the venue answers them (one item resting, one a
-/// post-only cross; the modify resting; the cancel `success`) and pushes
-/// an `orderUpdates` row and a `userFills` row carrying our cloids; the
-/// gateway maps every status onto its item, decodes the cloids, scans
-/// both streams, dedupes and emits — 3 ACKs, a BAD_ALO_PX rejection,
-/// RESTING, FILL and FILL_META. Pinned like gate 72: rustls 0.23's
-/// buffered API allocates one `Vec` per record it seals (the three posts)
-/// and one per application-data record it opens (three answers, two
-/// pushes) — exactly 8 per round while every inbound burst stays under
+/// and framed in place — and two reads (XH4d: the open orders, the
+/// sheet), each posted alone, unsigned; the venue answers them (one item
+/// resting, one a post-only cross; the modify resting; the cancel
+/// `success`; the reads' rows) and pushes an `orderUpdates` row and a
+/// `userFills` row carrying our cloids; the gateway maps every status
+/// onto its item, decodes the cloids, scans both streams and both reads
+/// in place, dedupes and emits — 3 ACKs, a BAD_ALO_PX rejection,
+/// RESTING, FILL, FILL_META, two open orders, a position and two read
+/// ends. Pinned like gate 72: rustls 0.23's buffered API allocates one
+/// `Vec` per record it seals (five posts) and one per application-data
+/// record it opens (five answers, two pushes) — exactly 12 per round
+/// while every inbound burst stays under
 /// rustls' 4 KiB receive window (a larger burst grows and shrinks that
 /// window: more). rustls' decrypted-record queue grows ONCE per
-/// connection, the first time five records wait in it together: the
+/// connection, the first time seven records wait in it together: the
 /// warm-up forces that (a round whose answers are all in before the
 /// gateway reads), so it never lands in the window by chance. Everything
 /// else in the round — admission, pending, deadlines,
 /// coalescing, msgpack, the signature, the JSON, the frame, the scans,
 /// the dedupe rings, the events — is 0 B: a regression in the gateway
-/// shows as a ninth. The residue goes with the rustls record-layer pass
+/// shows as a thirteenth. After the rounds, measured alone, one round of
+/// the cancel-all word's sweep (XH4d, XG-1): its own read (answered with
+/// one order of ours and a stranger's, scanned in place, emitting
+/// nothing), the cancel of ours by cloid, the cancel's answer back to the
+/// engine — exactly 4 allocations, rustls' again (two records sealed, two
+/// opened). The residue goes with the rustls record-layer pass
 /// (TL4/TL5b).
 #[test]
 fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     use exec_gateway::Idle;
     use exec_hyperliquid::event::{
-        ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_REJECTED, EV_RESTING, EV_SNAPSHOT,
+        ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE,
+        EV_REJECTED, EV_RESTING, EV_SNAPSHOT,
     };
     use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
     use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
 
     const ROUNDS: u64 = 300;
+    /// Signed posts a round (the reads are posted, unsigned, uncounted).
     const POSTS_PER_ROUND: u64 = 3;
-    const EVENTS_PER_ROUND: u64 = 7;
-    const RUSTLS_ALLOCS_PER_ROUND: u64 = 8;
+    const EVENTS_PER_ROUND: u64 = 12;
+    const RUSTLS_ALLOCS_PER_ROUND: u64 = 12;
+    /// One sweep round: the read and the cancel sealed, their answers
+    /// opened.
+    const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
     let dir = std::env::temp_dir().join(format!("mv-gate84-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("gate 84 dir");
     let mut child = std::process::Command::new(std::env::current_exe().expect("gate 84 exe"))
@@ -11021,6 +11504,8 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
                 .replacing(oid + 1_000_000),
             HlCmd::cancel(6, oid + 2_000_000, 1),
+            HlCmd::read_orders(6, oid + 3_000_000),
+            HlCmd::read_state(6, oid + 4_000_000),
         ];
         let mut j = 0usize;
         while j < cmds.len() {
@@ -11030,8 +11515,8 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         let mut got = 0u64;
         let t = std::time::Instant::now();
         if stall {
-            // Write the three posts, then let every answer and push
-            // arrive before the next read: rustls decrypts all five
+            // Write the posts, then let every answer and push arrive
+            // before the next read: rustls decrypts all seven
             // records at once and its record queue reaches its
             // high-water mark here, in the warm-up.
             while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
@@ -11068,11 +11553,37 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         r += 1;
     }
     let (allocs, bytes, _) = g.delta();
+    let window = kinds;
+    let posts = eng.stats.io()[0];
+
+    // The cancel-all word, measured alone: one sweep round — the read,
+    // the cancel of ours, its answer — then the sweep settles (1 s).
+    let (rounds0, cancels0) = (gw.counters().sweep_rounds, gw.counters().sweep_cancels);
+    let acks = kinds[usize::from(EV_ACK)];
+    let g = AllocGuard::new();
+    eng.stats.request_sweep();
+    let t = std::time::Instant::now();
+    while kinds[usize::from(EV_ACK)] == acks {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "gate 84: the sweep never cancelled ours"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            kinds[usize::from(e.kind & 15)] += 1;
+        }
+    }
+    let (sweep_allocs, sweep_bytes, _) = g.delta();
+    let sweep = (
+        gw.counters().sweep_rounds - rounds0,
+        gw.counters().sweep_cancels - cancels0,
+        eng.stats.io()[0] - posts,
+    );
 
     child.kill().ok();
     child.wait().ok();
     std::fs::remove_dir_all(&dir).ok();
-    let n = |k: u8| kinds[usize::from(k)] - warm[usize::from(k)];
+    let n = |k: u8| window[usize::from(k)] - warm[usize::from(k)];
     assert_eq!(n(EV_ACK), ROUNDS * 3, "the resting place, the modify and the cancel");
     assert_eq!(n(EV_REJECTED), ROUNDS, "the post-only cross, item by item");
     assert_eq!(n(EV_RESTING), ROUNDS, "every orderUpdates row routed");
@@ -11082,7 +11593,12 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         "every fill routed with its fee"
     );
     assert_eq!(
-        eng.stats.io()[0],
+        (n(EV_OPEN_ORDER), n(EV_POSITION), n(EV_READ_DONE)),
+        (2 * ROUNDS, ROUNDS, 2 * ROUNDS),
+        "both reads scanned in place, every row and every end"
+    );
+    assert_eq!(
+        posts,
         POSTS_PER_ROUND * (50 + ROUNDS),
         "three posts a round, no REST, no retry"
     );
@@ -11091,7 +11607,18 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         allocs,
         RUSTLS_ALLOCS_PER_ROUND * ROUNDS,
         "HL gateway round: {allocs} allocations ({bytes} B) over {ROUNDS} rounds — rustls' \
-         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_ROUND}/round (three sealed \
-         records out, five opened in); anything above is the gateway's"
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_ROUND}/round (five sealed \
+         records out, seven opened in); anything above is the gateway's"
+    );
+    assert_eq!(
+        sweep,
+        (1, 1, 1),
+        "one sweep round: its read, one cancel of ours (the one signed post)"
+    );
+    assert_eq!(
+        sweep_allocs, RUSTLS_ALLOCS_PER_SWEEP_ROUND,
+        "HL gateway sweep round: {sweep_allocs} allocations ({sweep_bytes} B) — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_SWEEP_ROUND} (two sealed, two \
+         opened); anything above is the gateway's"
     );
 }

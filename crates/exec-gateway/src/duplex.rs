@@ -100,7 +100,7 @@ pub fn duplex<C: Copy, E: Copy, const NC: usize, const NE: usize>(
     }
     let (cp, cc) = Ring::<C, NC>::new().split();
     let (ep, ec) = Ring::<E, NE>::new().split();
-    // COPY: the stats block, GATEWAY_STATS_SIZE (66 432 B), moved once per
+    // COPY: the stats block, GATEWAY_STATS_SIZE (66 688 B), moved once per
     // arm at boot from the booting thread's stack into its Arc — cold; the
     // kit forbids the `unsafe` an in-place build (`Arc::new_uninit`) needs.
     let stats = Arc::new(GatewayStats::new());

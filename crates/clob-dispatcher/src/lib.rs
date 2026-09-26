@@ -963,8 +963,18 @@ pub struct HaltSignal {
     /// gain (S7-L1, gap B: a book that was never flat was never
     /// judged). `0` otherwise.
     pub pnl_judged: u8,
+    /// XH4d: `1` when the arm's order gateway has halted (its halt
+    /// word): it places for nobody, and an event it could not deliver
+    /// may be lost, so the arm no longer knows what rests. Reported and
+    /// never thresholded — like the budget floor, no slot opts out.
+    pub gateway_halted: u8,
+    /// XH4d, XH-7: post-only crosses among the arm's last ALO answers,
+    /// permille (`0` until the window holds enough answers to mean
+    /// something). A cross is information, not a fault — it never
+    /// feeds `reject_streak` — until it is most of what the quotes meet.
+    pub alo_reject_permille: u16,
     /// Explicit padding.
-    _pad: [u8; 5],
+    _pad: [u8; 2],
     /// Nanoseconds since the last reconciliation that AGREED. `0` =
     /// never (the seeding interlock already refuses that case). Once
     /// an arm has agreed with the venue, a reconciler that stops
@@ -1003,7 +1013,9 @@ impl HaltSignal {
             budget_floor_breached: budget_floor_breached as u8,
             reconciled: reconciled as u8,
             pnl_judged: 0,
-            _pad: [0; 5],
+            gateway_halted: 0,
+            alo_reject_permille: 0,
+            _pad: [0; 2],
             recon_age_ns,
             pnl_delta_usd_1e6: 0,
         }
@@ -1018,9 +1030,28 @@ impl HaltSignal {
         self.pnl_delta_usd_1e6 = delta_usd_1e6;
         self
     }
+
+    /// XH4d: attach the arm's ALO window (XH-7), permille.
+    #[inline]
+    #[must_use]
+    pub const fn with_alo_reject_permille(mut self, permille: u16) -> Self {
+        self.alo_reject_permille = permille;
+        self
+    }
+
+    /// XH4d: attach whether the arm's order gateway has halted.
+    #[inline]
+    #[must_use]
+    pub const fn with_gateway_halted(mut self, halted: bool) -> Self {
+        self.gateway_halted = halted as u8;
+        self
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<HaltSignal>() == 48);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, gateway_halted) == 27);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, alo_reject_permille) == 28);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, recon_age_ns) == 32);
 
 /// Strategy slots [`ExecCounters`] reports on. Mirrors
 /// `exec_router::EXEC_SLOTS`; the two are asserted equal in

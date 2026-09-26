@@ -80,7 +80,7 @@ impl<const N: usize> TimerQueue<N> {
             order: 0,
             slot: 0,
         };
-        let mut free: Box<[u32; N]> = boxed(0u32);
+        let mut free: Box<[u32; N]> = crate::boxed_array(0u32);
         let mut i = 0usize;
         while i < N {
             // Slot 0 is handed out first.
@@ -88,12 +88,12 @@ impl<const N: usize> TimerQueue<N> {
             i += 1;
         }
         Self {
-            heap: boxed(blank),
+            heap: crate::boxed_array(blank),
             len: 0,
-            pos: boxed(NO_POS),
-            gen: boxed(0u64),
-            key: boxed(0u64),
-            kind: boxed(0u8),
+            pos: crate::boxed_array(NO_POS),
+            gen: crate::boxed_array(0u64),
+            key: crate::boxed_array(0u64),
+            kind: crate::boxed_array(0u8),
             free,
             free_len: N,
             next_order: 0,
@@ -252,13 +252,6 @@ impl<const N: usize> TimerQueue<N> {
 #[inline(always)]
 fn less(a: &HeapEnt, b: &HeapEnt) -> bool {
     (a.deadline_ns, a.order) < (b.deadline_ns, b.order)
-}
-
-fn boxed<V: Copy, const N: usize>(v: V) -> Box<[V; N]> {
-    match vec![v; N].into_boxed_slice().try_into() {
-        Ok(b) => b,
-        Err(_) => unreachable!("a vec of N elements converts to [V; N]"),
-    }
 }
 
 #[cfg(test)]

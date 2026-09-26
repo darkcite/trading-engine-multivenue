@@ -96,6 +96,7 @@
 
 pub mod action;
 pub mod anchor;
+pub mod arm;
 pub mod asset;
 pub mod budget;
 pub mod cloid;

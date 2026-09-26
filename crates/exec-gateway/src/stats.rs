@@ -78,12 +78,30 @@ impl Lat {
     }
 }
 
-/// Written by the ENGINE thread only.
+/// Written by the ENGINE thread only, on every push.
 #[repr(C, align(128))]
 struct EngineWritten {
     cmd_ring_full: AtomicU64,
     cmds_pushed: AtomicU64,
 }
+
+/// Written by the ENGINE thread only, rarely: the gateway reads it every
+/// turn, so it must not share a line with the per-push counters.
+#[repr(C, align(128))]
+struct EngineRare {
+    /// The last cancel-all (sweep) request's sequence number.
+    sweep_req: AtomicU64,
+}
+
+/// A sweep's state (XH4d, XG-1: a cancel-all never waits on ring room):
+/// the engine bumps the request word, the gateway publishes the state of
+/// the request it last took up. The values are `CancelAllState`'s.
+/// Nothing of the gateway's slots is resting — the venue said so.
+pub const SWEEP_CLEAR: u64 = 0;
+/// The sweep is under way.
+pub const SWEEP_WORKING: u64 = 1;
+/// The sweep spent its rounds and the venue never read clear: ask again.
+pub const SWEEP_STRANDED: u64 = 2;
 
 /// The halt word: written by the gateway (at most once per arm), read by
 /// the engine before every order.
@@ -104,7 +122,20 @@ struct GatewayWritten {
     rest_fallback_posts: AtomicU64,
     reconnects: AtomicU64,
     in_flight: AtomicU64,
+}
+
+/// Written by the GATEWAY thread only, rarely (on change; the heartbeat
+/// at most ten times a second): the engine reads it on every idle pass
+/// and halt poll, so it must not share a line with the per-post counters.
+#[repr(C, align(128))]
+struct GatewayLive {
     ws_up: AtomicU64,
+    /// The gateway's last heartbeat, engine-clock ns.
+    heartbeat_ns: AtomicU64,
+    /// The sweep request the state below is for.
+    sweep_seq: AtomicU64,
+    /// [`SWEEP_CLEAR`] / [`SWEEP_WORKING`] / [`SWEEP_STRANDED`].
+    sweep_state: AtomicU64,
 }
 
 /// Shared stats of one gateway (one venue account): built once at boot,
@@ -112,8 +143,10 @@ struct GatewayWritten {
 #[repr(C, align(128))]
 pub struct GatewayStats {
     eng: EngineWritten,
+    eng_rare: EngineRare,
     halt: HaltWord,
     gw: GatewayWritten,
+    live: GatewayLive,
     /// Command push (engine) → the frame carrying it written to the socket.
     pub push_to_write: Lat,
     /// Action written → the venue's reply to that post.
@@ -128,12 +161,14 @@ pub struct GatewayStats {
 /// booting thread's stack before it moves into its `Arc` (≈ 65 KiB; the
 /// kit has no `unsafe` to build it in place, and a boot thread's stack is
 /// 8 MiB). A size change is reviewed here.
-pub const GATEWAY_STATS_SIZE: usize = 66_432;
+pub const GATEWAY_STATS_SIZE: usize = 66_688;
 
 const _: () = assert!(core::mem::align_of::<GatewayStats>() == 128);
 const _: () = assert!(core::mem::size_of::<EngineWritten>() == 128);
+const _: () = assert!(core::mem::size_of::<EngineRare>() == 128);
 const _: () = assert!(core::mem::size_of::<HaltWord>() == 128);
 const _: () = assert!(core::mem::size_of::<GatewayWritten>() == 128);
+const _: () = assert!(core::mem::size_of::<GatewayLive>() == 128);
 const _: () = assert!(core::mem::size_of::<GatewayStats>() == GATEWAY_STATS_SIZE);
 
 impl GatewayStats {
@@ -145,6 +180,7 @@ impl GatewayStats {
                 cmd_ring_full: z(),
                 cmds_pushed: z(),
             },
+            eng_rare: EngineRare { sweep_req: z() },
             halt: HaltWord { reason: z() },
             gw: GatewayWritten {
                 evt_ring_full: z(),
@@ -156,7 +192,12 @@ impl GatewayStats {
                 rest_fallback_posts: z(),
                 reconnects: z(),
                 in_flight: z(),
+            },
+            live: GatewayLive {
                 ws_up: z(),
+                heartbeat_ns: z(),
+                sweep_seq: z(),
+                sweep_state: z(),
             },
             push_to_write: Lat::new(),
             post_rtt: Lat::new(),
@@ -175,6 +216,36 @@ impl GatewayStats {
     #[inline]
     pub(crate) fn note_cmd_ring_full(&self) {
         self.eng.cmd_ring_full.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Ask the gateway to sweep (cancel every order of its slots) —
+    /// engine only; never waits on ring room. Returns the request's
+    /// sequence number, which [`Self::sweep`] reports back.
+    #[inline]
+    pub fn request_sweep(&self) -> u64 {
+        self.eng_rare.sweep_req.fetch_add(1, Ordering::Release) + 1
+    }
+
+    /// The last sweep request (gateway side).
+    #[inline]
+    pub fn sweep_requested(&self) -> u64 {
+        self.eng_rare.sweep_req.load(Ordering::Acquire)
+    }
+
+    /// Publish the state of sweep request `seq` (gateway only): the state
+    /// first, then the sequence it belongs to, so a reader that sees the
+    /// sequence sees a state at least that new.
+    #[inline]
+    pub fn set_sweep(&self, seq: u64, state: u64) {
+        self.live.sweep_state.store(state, Ordering::Relaxed);
+        self.live.sweep_seq.store(seq, Ordering::Release);
+    }
+
+    /// `(the request the state is for, its state)`.
+    #[inline]
+    pub fn sweep(&self) -> (u64, u64) {
+        let seq = self.live.sweep_seq.load(Ordering::Acquire);
+        (seq, self.live.sweep_state.load(Ordering::Relaxed))
     }
 
     // --- gateway-written --------------------------------------------
@@ -246,9 +317,16 @@ impl GatewayStats {
         if self.gw.in_flight.load(Ordering::Relaxed) != in_flight {
             self.gw.in_flight.store(in_flight, Ordering::Relaxed);
         }
-        if self.gw.ws_up.load(Ordering::Relaxed) != up {
-            self.gw.ws_up.store(up, Ordering::Relaxed);
+        if self.live.ws_up.load(Ordering::Relaxed) != up {
+            self.live.ws_up.store(up, Ordering::Relaxed);
         }
+    }
+
+    /// The gateway's heartbeat (gateway only; the caller keeps it to its
+    /// period): a turn happened at `now_ns`, engine clock.
+    #[inline]
+    pub fn beat(&self, now_ns: u64) {
+        self.live.heartbeat_ns.store(now_ns, Ordering::Relaxed);
     }
 
     // --- readers (either thread, /metrics) ---------------------------
@@ -257,6 +335,18 @@ impl GatewayStats {
     #[inline]
     pub fn halt_reason(&self) -> u64 {
         self.halt.reason.load(Ordering::Relaxed)
+    }
+
+    /// Whether a WebSocket is up (the gauge).
+    #[inline]
+    pub fn ws_up(&self) -> bool {
+        self.live.ws_up.load(Ordering::Relaxed) != 0
+    }
+
+    /// The gateway's last heartbeat, engine-clock ns (0 = none yet).
+    #[inline]
+    pub fn heartbeat_ns(&self) -> u64 {
+        self.live.heartbeat_ns.load(Ordering::Relaxed)
     }
 
     /// Commands the engine pushed / the ring refused (full).
@@ -290,7 +380,7 @@ impl GatewayStats {
             g.rest_fallback_posts.load(Ordering::Relaxed),
             g.reconnects.load(Ordering::Relaxed),
             g.in_flight.load(Ordering::Relaxed),
-            g.ws_up.load(Ordering::Relaxed),
+            self.live.ws_up.load(Ordering::Relaxed),
         ]
     }
 }

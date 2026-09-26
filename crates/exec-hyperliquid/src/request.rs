@@ -368,6 +368,20 @@ pub fn ws_post_open(dst: &mut [u8], id: u64) -> Result<usize, MsgPackErr> {
     Ok(j.len)
 }
 
+/// **Open a WebSocket read** (XH4d): writes
+/// `{"method":"post","id":<id>,"request":{"type":"info","payload":` at the
+/// start of `dst` and returns the offset at which the caller renders the
+/// read's body in place (`recon::open_orders_request` /
+/// `perp_state_request`). Close with [`ws_post_close`]. Unsigned: a read
+/// spends no nonce and no address request.
+pub fn ws_info_open(dst: &mut [u8], id: u64) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"method\":\"post\",\"id\":")?;
+    j.u64(id)?;
+    j.put(b",\"request\":{\"type\":\"info\",\"payload\":")?;
+    Ok(j.len)
+}
+
 /// **Close a WebSocket post**: the post occupies `dst[..end]`, envelope
 /// included; appends the two closing braces and returns its length.
 pub fn ws_post_close(dst: &mut [u8], end: usize) -> Result<usize, MsgPackErr> {

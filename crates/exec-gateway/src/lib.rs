@@ -72,3 +72,15 @@ pub use mbb::{Mbb, MbbAction, SlotState};
 pub use pending::{Pending, PendingErr};
 pub use stats::{GatewayStats, Lat, HALT_EVENT_RING_FULL, HALT_NONE};
 pub use timer::{Expired, TimerFull, TimerId, TimerQueue};
+
+/// A `Box<[V; N]>` filled with `v`, built on the heap at boot (a table of
+/// hundreds of records would not fit a gateway or engine thread's stack
+/// as a temporary). The one copy: the pending table, the timer heap, and
+/// the Hyperliquid gateway's and arm's tables are built with it.
+#[must_use]
+pub fn boxed_array<V: Copy, const N: usize>(v: V) -> Box<[V; N]> {
+    match vec![v; N].into_boxed_slice().try_into() {
+        Ok(b) => b,
+        Err(_) => unreachable!("a vec of N elements converts to [V; N]"),
+    }
+}

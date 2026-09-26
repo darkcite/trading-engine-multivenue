@@ -45,6 +45,8 @@ pub enum Answer {
     Action(String),
     /// Answer `{"type":"error","payload":"<msg>"}` (REST: a status err).
     Error(String),
+    /// Answer a read (XH4d): `{"type":"info","payload":<json>}`.
+    Info(String),
     /// [`Answer::Action`], after a pause on that socket.
     Later(Duration, String),
     /// Never answer.
@@ -294,7 +296,7 @@ fn serve(mut sock: TcpStream, cfg: Arc<ServerConfig>, sh: &Shared) {
         sh.posts.lock().unwrap().push(seen.clone());
         let answer = (sh.policy.lock().unwrap())(&seen);
         let body = match answer {
-            Answer::Action(p) | Answer::Later(_, p) => p,
+            Answer::Action(p) | Answer::Later(_, p) | Answer::Info(p) => p,
             Answer::Error(m) => format!(r#"{{"status":"err","response":"{m}"}}"#),
             Answer::Silent | Answer::Drop => return,
         };
@@ -408,6 +410,7 @@ fn serve_ws(
                         Some(post_frame(id, "action", &p))
                     }
                     Answer::Error(m) => Some(post_frame(id, "error", &format!("\"{m}\""))),
+                    Answer::Info(p) => Some(post_frame(id, "info", &p)),
                     Answer::Silent => None,
                     Answer::Drop => return,
                 }

@@ -717,6 +717,10 @@ pub struct PerpPosition {
     pub coin: Span,
     /// Signed size, coin × 1e8 (negative = short).
     pub szi_1e8: i64,
+    /// `positionValue`: the position at the venue's mark, USD × 1e8 (0
+    /// when the row omits it) — the mark a reconciliation prices its
+    /// drift with (XH4d).
+    pub value_1e8: i64,
 }
 
 /// Scan a `clearinghouseState` body: `marginSummary.accountValue`
@@ -773,6 +777,7 @@ pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, us
         let row = &body[i..end];
         let coin = string_field(row, b"\"coin\"").ok_or(ScanErr::Malformed)?;
         let szi = decimal_field(row, b"\"szi\"").ok_or(ScanErr::Malformed)?;
+        let value = decimal_field(row, b"\"positionValue\"").unwrap_or(0);
         if n >= out.len() {
             return Err(ScanErr::Malformed);
         }
@@ -782,6 +787,7 @@ pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, us
                 end: coin.end + i as u32,
             },
             szi_1e8: szi,
+            value_1e8: value,
         };
         n += 1;
         i = end;

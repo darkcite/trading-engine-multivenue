@@ -29,13 +29,14 @@
 //!
 //! ## Layout
 //!
-//! `#[repr(C, align(64))]`, 640 bytes = ten cache lines, with
+//! `#[repr(C, align(64))]`, 704 bytes = eleven cache lines, with
 //! **both hot arrays in the first 16 bytes** so the per-submit lookup
 //! touches one line and never pointer-chases; the E6 clamps sit on
-//! lines 2–4 and the halt thresholds on lines 5–10, none of which a
+//! lines 2–4 and the halt thresholds on lines 5–11, none of which a
 //! paper submit ever reads. (512 B until E7's session bound grew
-//! `HaltLimits` 32 → 48 B; the halt table is read on the halt poll,
-//! never per submit, so the two extra lines cost nothing hot.)
+//! `HaltLimits` 32 → 48 B, 640 B until XH4d's ALO threshold grew it to
+//! 56 B; the halt table is read on the halt poll, never per submit, so
+//! the extra lines cost nothing hot.)
 
 use crate::mode::ExecMode;
 
@@ -197,7 +198,15 @@ pub struct HaltLimits {
     /// E7 session bound: spot-USDC loss under the anchor, USD ×1e6,
     /// at which the slot halts (judged flat only). `0` = no bound.
     pub pnl_loss_usd_1e6: i64,
+    /// XH4d, XH-7: post-only crosses among the arm's last ALO answers,
+    /// permille, at which the slot halts. `0` = off (XH4f maps
+    /// `halt_on_alo_reject_pct` here, ×10).
+    pub alo_reject_permille: u16,
+    /// Explicit padding.
+    _pad: [u8; 6],
 }
+
+const _: () = assert!(core::mem::size_of::<HaltLimits>() == 56);
 
 impl HaltLimits {
     /// Every threshold unset. Usable in `const`.
@@ -212,6 +221,8 @@ impl HaltLimits {
             asset_refusal_streak: 0,
             pnl_gain_usd_1e6: 0,
             pnl_loss_usd_1e6: 0,
+            alo_reject_permille: 0,
+            _pad: [0; 6],
         }
     }
 
@@ -234,6 +245,8 @@ impl HaltLimits {
             asset_refusal_streak,
             pnl_gain_usd_1e6: 0,
             pnl_loss_usd_1e6: 0,
+            alo_reject_permille: 0,
+            _pad: [0; 6],
         }
     }
 
@@ -244,6 +257,15 @@ impl HaltLimits {
     pub const fn with_pnl_bound(mut self, gain_usd_1e6: i64, loss_usd_1e6: i64) -> Self {
         self.pnl_gain_usd_1e6 = gain_usd_1e6;
         self.pnl_loss_usd_1e6 = loss_usd_1e6;
+        self
+    }
+
+    /// XH4d, XH-7: halt at `permille` post-only crosses among the arm's
+    /// last ALO answers; `0` = off.
+    #[inline]
+    #[must_use]
+    pub const fn with_alo_reject_permille(mut self, permille: u16) -> Self {
+        self.alo_reject_permille = permille;
         self
     }
 }
@@ -285,10 +307,14 @@ pub struct ExecRoute {
     /// mode branch has already resolved — sit on lines 2 and 3 where
     /// a paper boot never touches them.
     _pad: [u8; 8],
-    /// **E6 commit 3** — per-slot halt thresholds. 48 B each (32 B
-    /// before E7's session bound), eight of them: lines 5–10.
+    /// **E6 commit 3** — per-slot halt thresholds. 56 B each (32 B
+    /// before E7's session bound, 48 B before XH4d's ALO threshold),
+    /// eight of them: lines 5–11.
     halts: [HaltLimits; EXEC_SLOTS],
 }
+
+const _: () = assert!(core::mem::size_of::<ExecRoute>() == 704);
+const _: () = assert!(core::mem::offset_of!(ExecRoute, halts) == 256);
 
 impl Default for ExecRoute {
     #[inline]
@@ -548,9 +574,13 @@ mod tests {
     use core_types::{STRATEGY_ID_NONE, STRATEGY_SLOT_BIN15};
 
     #[test]
-    fn layout_is_ten_cache_lines_with_the_hot_arrays_first() {
-        assert_eq!(core::mem::size_of::<ExecRoute>(), 640, "ten cache lines");
-        assert_eq!(core::mem::size_of::<HaltLimits>(), 48, "HaltLimits is 48 B (E7)");
+    fn layout_is_eleven_cache_lines_with_the_hot_arrays_first() {
+        assert_eq!(core::mem::size_of::<ExecRoute>(), 704, "eleven cache lines");
+        assert_eq!(
+            core::mem::size_of::<HaltLimits>(),
+            56,
+            "HaltLimits is 56 B (XH4d)"
+        );
         assert_eq!(core::mem::size_of::<SlotCaps>(), 32, "SlotCaps is 32 B");
         assert_eq!(core::mem::align_of::<ExecRoute>(), 64);
         assert_eq!(

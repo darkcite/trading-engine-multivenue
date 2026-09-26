@@ -6515,6 +6515,28 @@ Proposed, for the operator to confirm:
     boot, the reduce-only mapping and the requote `expiresAfter`
     configuration. XH4c delivers their parts (the rules, the actions, the
     per-command expiry).
+15. (XH4d) The reconciler reads over the WebSocket post channel
+    (`{"type":"info"}`), not blocking REST `/info`: neither the engine nor
+    the gateway thread ever waits on a read, and the reads ride the
+    socket the orders do. A read never falls back to REST.
+16. (XH4d) Two halt reasons the plan does not name: `AloRejectRate`
+    (XH-7's threshold, `halt_on_alo_reject_pct`) and `GatewayHalt` (the
+    gateway's halt word — no threshold, like the budget floor).
+    `HaltLimits` grows 48 → 56 B and `ExecRoute` 640 → 704 B (the halt
+    table's lines, never read per submit).
+17. (XH4d) An order in doubt whose settling cancel finds nothing is
+    `REJECTED(EXPIRED)` (it can no longer land); one whose cancel succeeds
+    is `RESTING` then `CANCELED(OTHER)` — `CANCELED(CANCEL_REQUESTED)` when
+    the member had asked. A resting order the venue calls "not found", or
+    a read stops listing, is read again at once and waits `gone_ms` for
+    the stream to say how it ended (and for that read, if it is still in
+    flight or asked: its listing revives the order), then is
+    `CANCELED(OTHER)`.
+18. (XH4d) The arm's stream gap is 0 until a gateway socket was first up
+    (the router's documented "no observation") and then the time since
+    one was last up with a fresh gateway heartbeat (the `ws_up` gauge and
+    a 100 ms stamp) — not the time since the last event, which a quiet
+    account would read as a gap.
 
 ### XH4a amendment (2026-09-26): the order-gateway kit — nothing wired, nothing armed
 
@@ -6896,3 +6918,290 @@ switch for the day; a later clear settled an in-doubt arm) → REJECT (r2:
 an early in-doubt verdict could still let a late arm land after a clear;
 the first refused push parked the day) → APPROVE WITH NITS (r3) → nits
 applied → APPROVE (r4).
+
+### XH4d amendment (2026-09-26): order state, reconciliation, sweeps — the arm built, nothing wired, nothing armed
+
+`exec_hyperliquid::arm::HlGatewayArm`: the engine's half of a gateway arm,
+an `OrderDispatch` that never touches a socket. **No engine path uses it
+yet** (XH4f wires slot 6); the blocking arm is untouched; a live slot 6
+still refuses the boot. Shared changes: `HaltSignal` gains
+`gateway_halted` and `alo_reject_permille` in its padding (48 B kept,
+offsets const-asserted); `HaltLimits` gains `alo_reject_permille` (0 =
+off; 56 B, `ExecRoute` 704 B, both const-asserted); `HaltReason` gains
+`AloRejectRate` (10, `alo-reject-rate`) and `GatewayHalt` (11,
+`gateway-halt`); `PerpPosition` gains `value_1e8` (`positionValue`); the
+gateway stats block gains two rarely-written blocks — the engine's sweep
+request, and the gateway's `ws_up` gauge, heartbeat and sweep state — so
+neither thread's per-command counters share a line with a word the other
+reads every pass (66 688 B).
+
+**The gateway's reads (a sixth class, READ):** `frontendOpenOrders` and
+`clearinghouseState` as `{"method":"post","request":{"type":"info",…}}`,
+posted alone, WebSocket only — with no socket a read is refused
+`TRANSPORT` unsent (never REST); one whose deadline cannot be armed is
+refused unsent. The answer's `data` is scanned in place into
+`EV_OPEN_ORDER` rows (slot and client id from the cloid, `SLOT_FOREIGN`
+when not ours; `aux` = the read's id) or `EV_POSITION` rows (signed size;
+`aux` = |value| at the venue's mark), then one `EV_READ_DONE` (rows; for
+the sheet the account value and its time), or `EV_READ_FAILED` when it
+does not scan; a read answered as an action is in doubt (`MALFORMED`).
+Reads never grow (they go while halted) and feed no order latency. XG-2:
+six classes — the gateway stops popping at 95 posts in flight (was 96)
+and keeps a full read's 257 events in reserve; the arm keeps ONE read in
+flight (the reserve's premise).
+
+**The cancel-all word (XG-1, never behind ring room):** the engine bumps
+`GatewayStats::request_sweep`; the gateway's sweep reads the account's
+open orders (its own read, which emits nothing; refused or unreadable, it
+fails the round), cancels by cloid every order whose cloid slot is in the
+gateway's mask — never another slot's, never a stranger's (an unmapped
+coin is counted) — within XG-2's room (the rest go next round), settles
+1 s, reads again: none of ours → `SWEEP_CLEAR`; 8 rounds without that →
+`SWEEP_STRANDED`; a newer request restarts it. The state is published
+state-then-sequence. The sweep's cancels are answered to the arm like its
+own.
+
+**The arm — the paper vocabulary, live** (what xmm expects of any arm):
+- A place or modify rounds away from the touch and sizes down (LAW XH-4,
+  `PerpRules`), maps reduce-only to the wire bit, carries the
+  configured `expiresAfter` (> 0 by construction); a maker order must be
+  post-only (ALO), an IoC is IoC; another slot's order, cancel or modify,
+  an unbound symbol (the asset-refusal streak), a client id in use, or a
+  rule the venue would break is refused before the ring. 128 tracked.
+- `RESTING` once; a modify is the new `RESTING` then the old
+  `CANCELED(REPLACED)` (a replacement that lands by its end — a fill, a
+  `filled` row, a cancel — adds that end third; the out-queues keep room
+  for three); a refused modify is the new `REJECTED` — and if the stream
+  ended the original meanwhile (a venue that drops the original of a
+  refused modify), the old one's `CANCELED` follows, otherwise it rests on
+  and the member cancels it. Every end but a fill is a retirement. Fills
+  go out on the arm's own fill queue (lane 3 has one producer, the
+  operator arm): `order_id` = client id, attributed to the slot, origin
+  VENUE, 1e8 → 1e6; `FILLED` only once the fills cover the order (or the
+  join window passes — counted).
+- **Sticky cancel intent:** once asked, a cancel is the arm's to deliver
+  (a full ring or a refusal keeps it and re-sends it; the verb returns
+  `Ok`). "Not found" about an unanswered place is not an end: the cancel
+  is re-sent when the place lands. "Not found" about a resting order, or
+  a read that stops listing one, reads the orders again at once (a
+  listing brings it back) and waits `gone_ms` for the stream — and, when
+  an orders read issued since it was thought gone is in flight or asked
+  at the end of that wait, for that read: its listing revives the order,
+  its silence ends it — then `CANCELED(OTHER)` (counted). A cancel asked of
+  such an order (the member's or the cancel-all word's) still goes, and
+  every path that keeps a cancel (a full ring, a refusal, no answer)
+  leaves its gone wait running; a listing that brings it back re-sends a
+  cancel asked or kept that is not in flight.
+- **In doubt (E-5):** a place or modify the gateway could not settle
+  waits its `expiresAfter` and a skew from the verdict, then a cancel by
+  cloid settles it (deviation 17). A cancel asked meanwhile goes at once;
+  a "not found" before the doubt ends keeps it for the doubt's end.
+- **XH-7:** every ALO answer enters a 200-answer window; the post-only
+  crosses in it are reported in permille once it holds 50 (the reply item
+  is counted, never the `badAloPxRejected` row; a cross never feeds
+  `reject_streak`, and an acceptance resets both streaks).
+
+**Reconciliation, through the reads:** boot = the first snapshot → the
+sweep (asked again while Stranded) → the sheet → the orders → quoting
+(and the dead man's boot clear answered). Then the sheet and the orders
+every `recon_ms`, the orders at once after `EV_GAP` (an orders read in
+flight went before the gap: another follows it) or a "gone" inference —
+such a re-read goes before a periodic sheet unless the sheet is a whole
+period overdue (no storm of re-reads starves the drift and the P&L); a
+read that fails is asked again after a skew; one with no
+verdict past its post timeout and 5 s is abandoned. **A seeding sheet
+with a position in a bound perp holds the arm** — never ready, never
+reconciled — because the member boots flat and the router's ledger would
+be seeded over a position it never saw (XH5 rules: flatten at shutdown,
+or refuse such a boot). Positions are seeded from the first sheet (fills
+stamped at or before its time are in it; earlier-arrived later fills are
+booked on top). Drift = the worst |booked − venue| at the venue's mark
+(the last fill's price when the venue holds none; saturating), noted
+only when two sheets in a row disagree, kept as a high-water mark. **An
+order carrying the slot's byte the arm does not know is cancelled and,
+after boot, pins the drift unbounded — `ReconDrift` halts the slot until
+the operator clears it.** A listing is a race — ignored — only for an
+order the venue said ended in the last 30 s, or one the arm closed
+unseen when the read went before that close; a read issued after an
+unseen close that still lists the order found a live one. On the slot's
+own account a position in an unbound perp leaves the arm unreconciled; on
+a shared account it is another slot's. `reconciled` = booted, not held,
+the last sheet agreeing, the last orders read holding nothing unknown;
+its age runs from the last agreement, and an agreement needs both reads
+within two periods (a read that stops coming, starved or failing, shows
+as `ReconStale`).
+
+**The session's P&L (E7):** the anchor is the account value at the
+session's first sheet, restored at boot from the owner's state file per
+master (`ArmCfg::anchor_1e6`, XH4f reads it with `crate::anchor`), or
+taken at this boot's first sheet and offered to the owner to keep
+(`fresh_anchor_1e6`, on the slot's own account only, written off the
+engine thread to a state file of slot 6's own — never `crate::anchor`'s
+default path, BIN15's, whose one line a shared testnet master would
+overwrite; the `hyparb-equity-anchor.state` precedent) — a bound
+re-anchored per boot is a bound on nothing; the operator ends a session
+by deleting the file. Judged on the slot's own account only (a shared account's
+value is every slot's), from the first sheet of the boot on.
+
+**Cancel-all and shutdown:** `cancel_all` asks the sweep AND sends a
+cancel for every order the arm holds (one still in flight is cancelled
+when it lands); `cancel_all_state` is `Clear` only when the venue read
+clear AND no order the arm holds can still be on the book or land.
+**Shutdown keeps the dead man wanted** until that `Clear` (after boot, a
+cancel-all not read clear holds the switch like an order does, past the
+30 s hold) — the reads go on meanwhile — then drives it cleared until
+`quiescent()`; a Stranded sweep
+is asked again; at the bound (`shutdown_ms`, ≤ 30 s) a shutdown the
+venue never confirmed returns as it is, counted (`shutdown_unconfirmed`):
+the switch still armed — the venue cancels at its deadline — **only if
+the venue keeps a schedule for the account** (a bound reached with the
+sweep read clear but the switch's clear unanswered is counted apart,
+`shutdown_switch_held`: nothing of ours rests, but the switch may still
+fire on an empty book, a trigger spent): a parked switch (O-XH4: a
+fresh master not yet eligible, or the day's triggers spent — XH4c's For
+Anton (a)) or a shared account without exclusivity has none, and then
+nothing cancels what may rest until the next boot's sweep, which needs
+the socket. XH4f logs and alerts on the counter with the switch's
+availability and deadline. Fills that arrive after the engine stopped
+draining are counted (the venue's sheet holds them for the next boot).
+The arm's windows are bounded at boot (post timeout, read period, join
+and gone ≤ 60 s; shutdown ≤ 30 s).
+
+**What reaches the router (`HaltSignal`):** the stream gap (deviation
+18: 0 until a gateway socket was first up; then the time since one was
+last up WITH a gateway heartbeat under 2 s — the gateway stamps it every
+100 ms, so a dead gateway thread cannot hide behind a gauge frozen at
+1), the drift, both streaks, `reconciled` and its age, the P&L, the ALO
+rate, and `gateway_halted` from the gateway's halt word (an event can be
+lost — `HALT_EVENT_RING_FULL` means one was — the word cannot).
+`trigger_for` halts on `GatewayHalt` with no threshold, and on
+`AloRejectRate` at `alo_reject_permille` (0 = off until XH4f's key).
+**`budget_floor_breached` is always 0 from this arm until XH4e wires the
+budget governor** — XH4e must, before any live slot 6.
+
+**The dead man, driven by the arm (deviation 12):** wanted while the arm
+is booted, the account is the slot's own or read to hold no other slot's
+orders — a stream gap or another slot's resting row ends that until an
+orders read issued since says so again — and the arm holds an order or
+held one in the last 30 s (a requote gap must not cost a clear and a
+re-arm), or a cancel-all is not read clear. Another
+slot's order still in flight cannot be seen until it rests (the stream
+has no snapshot); the switch fires only when slot 6's own pushes stop,
+i.e. the whole engine stalled.
+
+**Obligations handed on:**
+- **XH4e:** the budget floor flag (above); **the day's spend**
+  (`venue_day_bought`) read from the venue before the router may seed
+  from this arm — until then `cap_day_usd_1e6` restarts at a full
+  allowance each boot (S7-L1 gap A), so XH4f must not route a live slot
+  through it before XH4e; the reads' IP weight (the venue weighs
+  `clearinghouseState` 2 and most other info requests 20 on REST; its
+  weighting of WebSocket-posted info is unmeasured — assume the REST
+  weights: ≈ 22 per 5 s at the default `recon_ms`), and the extra orders
+  reads a "gone" inference asks for; the sweep's cancels are address
+  requests.
+- **XH4f:** compose `ArmCfg` (the bound perps and their rules from
+  `HlDiscovery`; `expires_after_ms` = the requote expiry;
+  `post_timeout_ms` = the gateway's = the dead man's `answer_ms`;
+  `skew_ms` from the measured offset; `recon_ms`, `join_ms`, `gone_ms`,
+  `shutdown_ms`; `own_account`; `anchor_1e6` restored per master, and
+  `fresh_anchor_1e6` stored off the engine thread); map
+  `halt_on_alo_reject_pct` × 10 into `HaltLimits`; route slot 6's verbs,
+  fills, order events, retirements, idle, halt signal, cancel-all and
+  shutdown to the arm; its counters and the dead man's on `/metrics`;
+  carry XH2's open item — refuse growth while a perp holds a position
+  without a mark; pin the S7-L1 contract (the router seeds from an arm
+  that reports `reconciled` only once the day's spend is read) with a
+  guard or a boot test until XH4e implements `venue_day_bought`; keep the
+  fresh anchor in a state file of slot 6's own; log and alert on
+  `shutdown_unconfirmed` with the dead man's availability and deadline.
+- **XH4g (testnet):** whether a refused modify drops the original (the
+  arm handles both); whether a modified order's original gets an
+  `orderUpdates` `canceled` row; the gone and join windows against real
+  stream lag; whether a read can lag an acknowledged order (the re-read
+  and the unseen-close rule assume it can). **A bound perp must be slot
+  6's alone on the shared testnet account** (slots 0 and 3 trade on it):
+  pick perps they never touch, or the drift halts the slot by design; the
+  account must be flat in them at boot.
+- **XH4h:** a gateway sweeps every slot in its mask — arms that share a
+  gateway share its sweeps (each arm its own gateway, or a per-request
+  mask).
+- **For Anton:** (a) an unknown slot-6 order halts the slot until the
+  operator clears it — confirm (the alternative, cancel-and-continue,
+  trusts a book that just proved wrong); (b) the session P&L bound is not
+  judged on a shared account — confirm for testnet (mainnet slot 6 has
+  its own master); (c) a boot with a slot-6 position is held until XH5's
+  rule; (d) a shutdown that reaches its bound unconfirmed relies on the
+  dead man's schedule, which a parked switch or a shared account without
+  exclusivity does not have — confirm that XH4f's alert is the answer
+  (the process cannot outwait launchd's own stop).
+- **Debt noted (not XH4d's):** `request::Json::u64` renders a number's
+  digits through a 20-byte stack buffer before `put` (the read's post id
+  inherits it); `put`'s doc says no staging — a separate ticket.
+  `OrderDispatch::stats` returns its 96 B by value on every arm (a
+  `stats_into` ticket), and `RoutedDispatcher::new` takes the 704 B
+  `ExecRoute` by value at boot (E6) — cold, unmarked, a ticket.
+
+**Tests:** the arm (39): rounding and the fill-before-`FILLED` join; the
+join window; modify → `RESTING` + `CANCELED(REPLACED)`; a replacement
+that lands by a fill (three events in order); a refused modify
+(`REJECTED` alone, the cross counted, the predecessor cancellable); the
+venue's end of an original held for its modify's answer (both ways); a
+cancel that overtook its place; doubt settled both ways; a cancel asked
+in doubt; a read that stops listing a resting order (read again, then
+closed); "not found" read again and revived; a slow confirming read (a
+listing revives, silence ends); a cancel of an order thought gone, and
+an unanswered one (the gone wait kept); an order closed unseen and
+listed again (cancelled, drift pinned); an unknown order (cancelled,
+drift pinned, the account marked shared); a gap and another slot's
+resting row ending exclusivity; a gap during an orders read (another
+read, and only it restores exclusivity); a storm of re-reads never
+starving the sheet; an agreement needing a fresh sheet and a fresh
+orders read; drift on the
+second disagreeing sheet only; fills before the seeding sheet; a boot held by a bound
+position; the anchor restored and offered (and none offered on a shared
+account); the ALO permille; the sweep word; cancel-all `Clear` only once
+no held order can land; a cancel-all not read clear holding the switch
+past the hold; shutdown — swept then cleared, never confirmed (left
+armed, counted), a clear sweep whose switch clear goes unanswered
+(counted apart), Stranded (asked again); the signal (a stale heartbeat,
+the gateway halt, the P&L); a shared account; a failed read asked again;
+refusals before the ring; the stream beating the answer; bad
+configurations (the bounds included). The loopback (+4): reads (rows,
+ends, an unreadable answer), a read with no socket, the sweep (ours
+only, read until clear), Stranded after 8 rounds. The router (+2):
+`GatewayHalt` with every threshold unset, `AloRejectRate` at the
+operator's permille and never when unset, both words round-tripped. Gate
+84b now also posts and scans both reads every round (rustls' residue
+pinned at 12 a round) and measures one sweep round alone (4: its read
+and the cancel of ours, sealed and opened); gate 86 holds the arm at
+0 B/op over every path above, each run in the measured window (the
+stream's row before the answer every other time, another slot's resting
+row every 89 commands).
+
+**Gates (XH4d, 2026-09-26):** clippy `-D warnings` clean; nextest
+3562/3562; alloc 91/91 in release — gate 84b now also posts and scans
+both reads every round (rustls' residue measured at exactly 12 a round,
+was 8) and measures one sweep round alone (exactly 4), and gate 86 (new)
+holds the arm at 0 B/op over 40 000 rounds, each of its eleven paths run
+again inside the window (and in every repeated run); copy-audit hits 31 =
+baseline, new 0; license-check OK; the release binary builds; the
+existing members' replays (bin15, vrp, xsd, hyparb, icdp, vm, xmm)
+byte-identical against main's binary; rustfmt clean on the new file and
+the touched hunks. One known flake, pre-existing and not XH4d's:
+`hl_userws_loopback::a_frame_larger_than_the_buffer_is_refused_not_grown`
+("connect: BadFrame", failing intermittently since main's base; its
+`userws_conn` is untouched). Reviews: zero-copy APPROVE WITH NITS (r1,
+r2) → APPROVE (r3); alloc REJECT (r1: gate 86 never ran a successful
+modify; no gate over the reads and the sweep) → APPROVE WITH NITS (r2,
+r3) → nits applied (the size pin kept exact: the toolchain is pinned);
+risk REJECT (r1: shutdown cleared the dead man before the sweep and quit
+on Stranded; cancel-all Clear on the first empty read; the router seeded
+over an unseen position; the P&L anchor reset each boot; an inferred
+close ignored a later listing) → APPROVE WITH NITS (r2: a slow confirming
+read discarded; an unanswered cancel reset a gone wait; a gap mid-read;
+the switch's 30 s hold at shutdown; a silent bound) → nits applied, and
+the ones they raised (the shutdown counters, the re-read's priority, a
+starved sheet, a stale orders read) → APPROVE (r3). Found and fixed on
+the way: a cancel to an order thought gone wiped its gone wait (the row
+stranded, cancel-all never Clear).
