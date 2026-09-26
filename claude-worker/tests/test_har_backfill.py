@@ -34,12 +34,22 @@ _T0: int = 1_767_225_600_000
 
 class FakeVenue:
     """Answers backward pages over one minute history per instrument:
-    ``hist[instrument] = [(open_ts, close), ...]`` ascending."""
+    ``hist[instrument] = [(open_ts, close), ...]`` ascending. ``truncate``
+    caps every answer at that many bars -- a venue answering SHORT."""
 
-    def __init__(self, hist: dict[str, list[tuple[int, float]]], fail_after: int | None = None):
+    def __init__(
+        self,
+        hist: dict[str, list[tuple[int, float]]],
+        fail_after: int | None = None,
+        truncate: int | None = None,
+    ):
         self.hist = hist
         self.calls: list[str] = []
         self.fail_after = fail_after
+        self.truncate = truncate
+
+    def _cut(self, bars: list[tuple[int, float]]) -> list[tuple[int, float]]:
+        return bars if self.truncate is None else bars[-self.truncate :]
 
     def get(self, url: str) -> str | None:
         self.calls.append(url)
@@ -48,21 +58,25 @@ class FakeVenue:
         u = urllib.parse.urlparse(url)
         q = dict(urllib.parse.parse_qsl(u.query))
         if u.path in ("/fapi/v1/klines", "/api/v3/klines"):
-            bars = [b for b in self.hist[q["symbol"]] if b[0] <= int(q["endTime"])][
-                -int(q["limit"]) :
-            ]
+            bars = self._cut(
+                [b for b in self.hist[q["symbol"]] if b[0] <= int(q["endTime"])][-int(q["limit"]) :]
+            )
             return json.dumps(
                 [[t, str(c), str(c), str(c), str(c), "1.0", t + _MIN - 1] for t, c in bars]
             )
         if u.path == "/api/v5/market/history-candles":
-            bars = [b for b in self.hist[q["instId"]] if b[0] < int(q["after"])][-int(q["limit"]) :]
+            bars = self._cut(
+                [b for b in self.hist[q["instId"]] if b[0] < int(q["after"])][-int(q["limit"]) :]
+            )
             rows = [
                 [str(t), str(c), str(c), str(c), str(c), "1", "1", "1", "1"]
                 for t, c in reversed(bars)
             ]
             return json.dumps({"code": "0", "msg": "", "data": rows})
         if u.path == "/v5/market/kline":
-            bars = [b for b in self.hist[q["symbol"]] if b[0] <= int(q["end"])][-int(q["limit"]) :]
+            bars = self._cut(
+                [b for b in self.hist[q["symbol"]] if b[0] <= int(q["end"])][-int(q["limit"]) :]
+            )
             rows = [[str(t), str(c), str(c), str(c), str(c), "1", "1"] for t, c in reversed(bars)]
             return json.dumps({"retCode": 0, "retMsg": "OK", "result": {"list": rows}})
         raise AssertionError(f"unexpected url {url}")
@@ -149,40 +163,140 @@ def test_an_interrupted_walk_leaves_no_hole_and_the_next_run_resumes(
     assert _stored(conn, "okx:MU-USDT-SWAP") == hist[:-1]
 
 
-def test_the_up_walk_is_forward_and_every_page_connects(tmp_path: pathlib.Path) -> None:
-    """H3.6: a budget smaller than the gap still makes progress -- each page
-    starts right after the stored last minute, so it is kept as it lands
-    and the next run resumes from it (the hourly gap-fill's law)."""
+def _ends(venue: FakeVenue, key: str) -> list[int]:
+    return [
+        int(dict(urllib.parse.parse_qsl(urllib.parse.urlparse(u).query))[key]) for u in venue.calls
+    ]
+
+
+def test_the_up_walk_takes_the_newest_page_first(tmp_path: pathlib.Path) -> None:
+    """The hourly case is ONE page: the newest reaches back to the stored
+    last minute. A gap of a few pages is paged backward and written once it
+    connects -- a budget that stops it writes nothing, the next run
+    completes it."""
     hist = _hist(_T0, _T0 + 2 * _DAY)
     conn = claude_worker.candles.open_db(tmp_path / "c.db")
     first_now = _T0 + _DAY
     bot = _series("bybit-linear:BOTUSDT", name="BOT")
     _bf(conn, _pager(FakeVenue({"BOTUSDT": hist})), bot, first_now)
     assert _stored(conn, "bybit-linear:BOTUSDT")[-1][0] == first_now - _MIN
+    hour = FakeVenue({"BOTUSDT": hist})
+    reps = _bf(conn, _pager(hour), bot, first_now + 3_600_000)
+    assert (reps[0].up_end, reps[0].up_rows) == ("connected", 60)
+    assert _ends(hour, "end")[0] == first_now + 3_600_000 - 1, "the newest page first"
+    assert len([u for u in hour.calls]) == 2, "one up page, one proving the listing"
     later = _T0 + 2 * _DAY
-    # One page of 1000 of the 1440 missing minutes: kept, contiguous.
-    starved = FakeVenue({"BOTUSDT": hist})
-    reps = _bf(conn, _pager(starved, budget=1), bot, later)
-    assert reps[0].up_end == "stopped" and reps[0].up_rows == 1000
-    kept = [b for b in hist if b[0] < first_now + 1000 * _MIN]
-    assert _stored(conn, "bybit-linear:BOTUSDT") == kept
-    # The next run resumes from the stored last minute: one page, connected.
-    venue = FakeVenue({"BOTUSDT": hist})
-    reps = _bf(conn, _pager(venue), bot, later)
-    assert reps[0].up_end == "connected" and reps[0].up_rows == 440
+    # 1380 missing minutes, Bybit pages 1000: the newest page and one probe.
+    reps = _bf(conn, _pager(FakeVenue({"BOTUSDT": hist}), budget=1), bot, later)
+    assert (reps[0].up_end, reps[0].up_rows) == ("stopped", 0), "a probe cut short writes nothing"
+    reps = _bf(conn, _pager(FakeVenue({"BOTUSDT": hist})), bot, later)
+    assert (reps[0].up_end, reps[0].up_rows) == ("connected", 1380)
     assert _stored(conn, "bybit-linear:BOTUSDT") == [b for b in hist if b[0] < later]
-    ends = [
-        int(dict(urllib.parse.parse_qsl(urllib.parse.urlparse(u).query))["end"])
-        for u in venue.calls
+
+
+def test_a_source_that_stopped_printing_costs_one_page_and_starves_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The review's case: a fallback delisted 30 days ago sits ahead of the
+    BTC feed. Its newest page holds nothing newer than the store, so it
+    costs one page an hour -- never the whole budget -- and the feed behind
+    it still gap-fills."""
+    now = _T0 + 40 * _DAY
+    dead = _hist(_T0, _T0 + 10 * _DAY - _MIN, seed=3)
+    btc = _hist(_T0, now, seed=2)
+    conn = claude_worker.candles.open_db(tmp_path / "c.db")
+    series = _series("okx:SPCX-USDT-SWAP", "binance-usdm:btcusdt", name="X")
+    venue = FakeVenue({"SPCX-USDT-SWAP": dead, "BTCUSDT": btc})
+    _bf(conn, _pager(venue), series, now - 3_600_000)
+    venue.calls.clear()
+    reps = _bf(conn, _pager(venue, budget=4), series, now)
+    assert (reps[0].up_end, reps[0].up_rows) == ("connected", 0), "dark: one page, nothing new"
+    assert (reps[1].up_end, reps[1].up_rows) == ("connected", 60)
+    assert sum("history-candles" in u for u in venue.calls) == 2, "one up page + the listing's"
+    assert _stored(conn, "binance-usdm:btcusdt")[-1][0] == now - _MIN
+
+
+def test_the_feeds_go_first_so_a_lagging_fallback_never_holds_them_back(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A budget spent series by series would let MU's fallback, months
+    behind, take the hour before ETH's feed; spent feeds first, every feed
+    gap-fills and the fallback gets what is left."""
+    now = _T0 + 30 * _DAY
+    okx = _hist(_T0, now, seed=3)
+    mu = _hist(_T0, now, seed=2)
+    eth = _hist(_T0, now, seed=5)
+    conn = claude_worker.candles.open_db(tmp_path / "c.db")
+    series = [
+        _series("binance-usdm:muusdt", "okx:MU-USDT-SWAP", name="MU"),
+        _series("binance-usdm:ethusdt", name="ETH"),
     ]
-    assert ends[0] == later - 1, "the last page's bound is the last closed minute"
+    hist = {"MUUSDT": mu, "MU-USDT-SWAP": okx, "ETHUSDT": eth}
+    early = claude_worker.har_backfill.Run(conn, _pager(FakeVenue(hist)), _T0 + _DAY)
+    claude_worker.har_backfill.run_all(early, series, lambda line: None)
+    feeds = claude_worker.har_backfill.Run(conn, _pager(FakeVenue(hist)), now - 3_600_000)
+    for s in series:
+        claude_worker.har_backfill.backfill_source(feeds, s.name, s.feed, feeds.closed_by)
+    lines: list[str] = []
+    run = claude_worker.har_backfill.Run(conn, _pager(FakeVenue(hist), budget=6), now)
+    assert not claude_worker.har_backfill.run_all(run, series, lines.append)
+    assert [line.split(":")[0] for line in lines[:3]] == [
+        "har-backfill MU binance-usdm",
+        "har-backfill ETH binance-usdm",
+        "har-backfill MU okx",
+    ]
+    assert "up +60 (connected)" in lines[0] and "up +60 (connected)" in lines[1]
+    assert "(stopped)" in lines[2], "the fallback took what was left"
+
+
+def test_a_long_gap_walks_forward_and_a_share_caps_it(tmp_path: pathlib.Path) -> None:
+    """More bars than the newest page and its probes reach: the walk goes
+    FORWARD from the stored last minute, writing each page as it lands; a
+    per-source share stops it (``capped``) with what it wrote contiguous,
+    and the next source still gets its pages."""
+    now = _T0 + 10 * _DAY
+    okx = _hist(_T0, now, seed=3)
+    btc = _hist(_T0, now, seed=2)
+    conn = claude_worker.candles.open_db(tmp_path / "c.db")
+    series = _series("okx:MU-USDT-SWAP", "binance-usdm:btcusdt", name="MU")
+    _bf(conn, _pager(FakeVenue({"MU-USDT-SWAP": okx, "BTCUSDT": btc})), series, _T0 + _DAY)
+    venue = FakeVenue({"MU-USDT-SWAP": okx, "BTCUSDT": btc})
+    run = claude_worker.har_backfill.Run(conn, _pager(venue), now, per_source_pages=20)
+    reps = claude_worker.har_backfill.backfill_series(run, series)
+    # 20 pages: the newest, two probes (discarded), then 17 forward pages.
+    assert (reps[0].up_end, reps[0].up_rows) == ("capped", 17 * 100)
+    assert _stored(conn, "okx:MU-USDT-SWAP") == [b for b in okx if b[0] < _T0 + _DAY + 1700 * _MIN]
+    assert reps[1].up_end == "connected", "the share left the feed its pages"
+    assert _stored(conn, "binance-usdm:btcusdt")[-1][0] == now - _MIN
+    # A share too small for the probes walks forward at once: it still gains.
+    run = claude_worker.har_backfill.Run(conn, _pager(venue, budget=2), now)
+    reps = claude_worker.har_backfill.backfill_series(run, series)
+    assert (reps[0].up_end, reps[0].up_rows) == ("stopped", 100)
+    # Unbounded, the next run finishes the fallback.
+    reps = _bf(conn, _pager(FakeVenue({"MU-USDT-SWAP": okx, "BTCUSDT": btc})), series, now)
+    assert reps[0].up_end == "connected"
+    assert _stored(conn, "okx:MU-USDT-SWAP") == okx[:-1]
+
+
+def test_a_short_answer_is_repaged_never_a_hole(tmp_path: pathlib.Path) -> None:
+    """A venue that answers SHORT (fewer bars than the page's minutes, not
+    reaching back to the cursor) is re-paged below the answer's oldest bar:
+    the forward walk never jumps a stretch the venue does have bars for."""
+    now = _T0 + 3 * _DAY
+    okx = _hist(_T0, now, seed=3)
+    conn = claude_worker.candles.open_db(tmp_path / "c.db")
+    mu = _series("okx:MU-USDT-SWAP", name="MU")
+    _bf(conn, _pager(FakeVenue({"MU-USDT-SWAP": okx})), mu, _T0 + _DAY)
+    reps = _bf(conn, _pager(FakeVenue({"MU-USDT-SWAP": okx}, truncate=37)), mu, now)
+    assert reps[0].up_end == "connected"
+    assert _stored(conn, "okx:MU-USDT-SWAP") == okx[:-1], "every minute, no hole"
 
 
 def test_a_minute_the_venue_never_had_stays_absent_and_the_walk_goes_on(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A venue gap inside a forward page is no hole of the walk's making:
-    the page reaches back past it, the cursor moves on, nothing refetches."""
+    """A venue gap inside the fill is no hole of the walk's making: the
+    pages reach back past it, and nothing refetches it."""
     full = _hist(_T0, _T0 + 3 * _DAY)
     halt = (_T0 + _DAY + 100 * _MIN, _T0 + _DAY + 400 * _MIN)
     hist = [b for b in full if not halt[0] <= b[0] < halt[1]]
@@ -360,6 +474,43 @@ def test_a_failing_venue_is_retried_with_backoff_then_the_walk_stops(
     reps = _bf(conn, pager, _series("binance-usdm:spyusdt"), _T0 + _DAY)
     assert reps[0].down_end == "stopped" and reps[0].down_rows == 0
     assert (len(venue.calls), slept) == (claude_worker.har_backfill.TRIES, [2.0, 4.0, 8.0])
+
+
+def test_an_import_that_does_not_meet_the_store_is_bridged(tmp_path: pathlib.Path) -> None:
+    """The go-live hazard the review found: the candles lane fetched a newly
+    appended perp's last 48 h before the dry run's rows were imported, and
+    the two blocks do not meet. The ``--import-from`` run bridges every
+    interior hole with the up-walk, so no empty day is left behind."""
+    now = _T0 + 8 * _DAY
+    feed = _hist(_T0, now, seed=2)
+    src = tmp_path / "dryrun.db"
+    _mk_store(src, {"binance-usdm:muusdt": [b for b in feed if b[0] < _T0 + 2 * _DAY]}, 7)
+    conn = claude_worker.candles.open_db(tmp_path / "live.db")
+    lane = [b for b in feed if _T0 + 5 * _DAY <= b[0] < _T0 + 7 * _DAY]
+    conn.executemany(
+        "INSERT INTO candles (venue,descriptor,tf,open_ts,c,source,fetched_ts)"
+        " VALUES (1,'binance-usdm:muusdt','1m',?,?,'rest',9)",
+        lane,
+    )
+    conn.commit()
+    series = [_series("binance-usdm:muusdt", name="MU")]
+    claude_worker.har_backfill.import_rows(conn, src, series, lambda line: None)
+    holes = claude_worker.har_backfill.interior_holes(conn, "binance-usdm:muusdt")
+    assert holes == [(_T0 + 2 * _DAY - _MIN, _T0 + 5 * _DAY)]
+    lines: list[str] = []
+    run = claude_worker.har_backfill.Run(conn, _pager(FakeVenue({"MUUSDT": feed})), now)
+    assert claude_worker.har_backfill.run_all(run, series, lines.append, bridge=True)
+    assert lines[0] == (
+        "har-backfill bridge MU binance-usdm:muusdt: 2026-01-02T23:59Z .. 2026-01-06T00:00Z"
+        " +4320 (connected) conflicts=0"
+    )
+    assert _stored(conn, "binance-usdm:muusdt") == feed[:-1], "one contiguous series"
+    assert claude_worker.har_backfill.interior_holes(conn, "binance-usdm:muusdt") == []
+    # Without --import-from nothing scans for holes: the hourly run stays cheap.
+    lines.clear()
+    run = claude_worker.har_backfill.Run(conn, _pager(FakeVenue({"MUUSDT": feed})), now)
+    claude_worker.har_backfill.run_all(run, series, lines.append)
+    assert not any(line.startswith("har-backfill bridge") for line in lines)
 
 
 def test_main_reads_har_toml_and_reports(

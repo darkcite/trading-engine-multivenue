@@ -34,17 +34,32 @@ empty one):
 - **down**: from the stored first minute (or the last closed minute, for
   an empty series) to the listing or the horizon, whichever comes later.
   Each page ends where the stored series begins.
-- **up**: FORWARD from the stored last minute to the last closed minute, a
-  page at a time: each request's bound is one page past the stored last
-  minute, so the page it answers starts right after it (H3.6 -- the hourly
-  gap-fill; H3.1 buffered a backward walk and wrote it only once it
-  connected, which a page budget smaller than the gap never completes).
+- **up**: from the stored last minute to the last closed minute. The
+  NEWEST page first: when it reaches back to the stored last minute it is
+  the whole fill (the hourly case: one page), and when it holds nothing
+  newer the source has stopped printing (delisted, dark) and that one page
+  is all it costs. A gap of a few pages of bars is then paged backward and
+  written once it connects (a stretch the venue printed nothing in costs
+  nothing here: the venue skips empty time). A longer gap is walked
+  FORWARD a page at a time -- each request's bound one page past the stored
+  last minute, so the page starts right after it and is written as it
+  lands; a SHORT answer is re-paged below its oldest bar, so a truncated
+  page never becomes a hole.
 
-Either way every page connects to the store as it lands, so an interrupted
-walk (a page budget, a transport failure) leaves no hole and the next run
-resumes from what it stored. A page budget is spent in series order: after
-a long outage the first lagging sources catch up first, the rest the hours
-after (the go-live run is unbounded, so an hour's need is ~1 page a source).
+Either way the store only ever grows contiguously from its ends, so an
+interrupted walk (a page budget, a transport failure) leaves no hole and
+the next run resumes from what it stored. A page budget is spent on the
+FEEDS first (every series' feed, then every first fallback, and so on), and
+``--max-pages-per-source`` caps what one source may take of it in a run, so
+a source that lags far behind (or keeps paging a long stretch its venue
+printed nothing in) never starves the rest. A stretch of weeks a venue
+printed NOTHING in, followed by fresh bars, is more than a capped run's
+forward walk crosses: the hourly report says ``capped`` for that source, and
+one unbounded run (no ``--max-pages``) crosses it.
+
+After ``--import-from``, every walkable source's interior HOLES (a stretch
+of more than an hour with no stored minute) are bridged by the same up-walk:
+an imported block of history need not meet the rows the store already had.
 
 ``--import-from DB`` first copies every source's 1 m rows from another
 store -- the go-live dry run's -- with ``INSERT OR IGNORE``: a row this
@@ -75,6 +90,9 @@ import claude_worker.har_config
 HORIZON_DAYS_DEFAULT: int = 250
 #: Rows per ``INSERT OR IGNORE`` batch of ``--import-from``.
 IMPORT_BATCH: int = 10_000
+#: Backward pages the up-walk buffers after the newest one before it walks
+#: forward instead.
+PROBE_PAGES: int = 2
 _IMPORT_SELECT: str = (
     "SELECT venue,descriptor,tf,open_ts,o,h,l,c,v,n,source,fetched_ts"
     " FROM candles WHERE descriptor=? AND tf=?"
@@ -88,6 +106,9 @@ TRIES: int = 4
 _MIN_MS: int = claude_worker.candles.MS_1M
 _DAY_MS: int = claude_worker.candles.MS_1D
 _TF: str = "1m"
+#: A stretch with no stored minute longer than this, inside a source's
+#: stored span, is a hole the ``--import-from`` run bridges.
+BRIDGE_MIN_MS: int = 60 * _MIN_MS
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -199,9 +220,11 @@ class SourceReport:
     up_rows: int = 0
     conflicts: int = 0
     #: ``listing`` (the venue answered empty), ``horizon``, ``stopped``
-    #: (budget or transport: resumable) or ``-`` (no down walk ran).
+    #: (budget or transport), ``capped`` (the source's share of the run
+    #: spent) -- both resumable -- or ``-`` (no down walk ran).
     down_end: str = "-"
-    #: ``connected`` (reached the last closed minute), ``stopped`` or ``-``.
+    #: ``connected`` (reached the last closed minute), ``stopped``,
+    #: ``capped`` or ``-``.
     up_end: str = "-"
     first_ts_ms: int | None = None
     last_ts_ms: int | None = None
@@ -227,6 +250,8 @@ class Run:
     pager: Pager
     now_ms: int
     horizon_days: int = HORIZON_DAYS_DEFAULT
+    #: Pages one source may take in this run; ``None`` = unbounded.
+    per_source_pages: int | None = None
 
     @property
     def closed_by(self) -> int:
@@ -246,6 +271,34 @@ class SourceWalk:
     run: Run
     w: Walker
     rep: SourceReport
+    #: The pager's count when this source's walks began (its share).
+    start_pages: int = 0
+
+    def _fetch(self, before_ms: int) -> list[claude_worker.fetchers.Candle] | None:
+        """A page -- ``None`` once the source's share of the run is spent,
+        like the run's budget or the venue failing."""
+        cap = self.run.per_source_pages
+        if cap is not None and self.run.pager.pages - self.start_pages >= cap:
+            return None
+        return self.run.pager.fetch_before(self.w, before_ms)
+
+    def _room(self) -> int | None:
+        """Pages this source may still take in the run (``None``: unbounded)."""
+        left: list[int] = []
+        cap = self.run.per_source_pages
+        if cap is not None:
+            left.append(cap - (self.run.pager.pages - self.start_pages))
+        if self.run.pager.budget is not None:
+            left.append(self.run.pager.budget - self.run.pager.pages)
+        return min(left) if left else None
+
+    @property
+    def _halt(self) -> str:
+        """Why a walk stopped short: its share, or the run (budget, venue)."""
+        cap = self.run.per_source_pages
+        if cap is not None and self.run.pager.pages - self.start_pages >= cap:
+            return "capped"
+        return "stopped"
 
     def _upsert(self, bars: list[claude_worker.fetchers.Candle]) -> int:
         st = claude_worker.candles.upsert_rest(
@@ -259,9 +312,9 @@ class SourceWalk:
         upserting each page as it lands (it ends where the store begins)."""
         floor_ms = self.run.floor_ms
         while before_ms > floor_ms:
-            page = self.run.pager.fetch_before(self.w, before_ms)
+            page = self._fetch(before_ms)
             if page is None:
-                self.rep.down_end = "stopped"
+                self.rep.down_end = self._halt
                 return
             if not page:
                 self.rep.down_end = "listing"
@@ -275,23 +328,78 @@ class SourceWalk:
         self.rep.down_end = "horizon"
 
     def up(self, last_ms: int, until_ms: int) -> None:
-        """Fill ``(last_ms, until_ms)`` FORWARD: each request's bound is one
-        page past the stored last minute, so the page covers every minute
-        right after it and is upserted as it lands (a minute the venue has
-        no bar for stays absent -- it was never there)."""
+        """Fill ``(last_ms, until_ms)`` (module doc): the newest page, a short
+        buffered probe backward, else the forward walk."""
+        head = self._fetch(until_ms)
+        if head is None:
+            self.rep.up_end = self._halt
+            return
+        buffered = [c for c in head if last_ms < c.ts_ms < until_ms]
+        # A page holding a bar at or before the stored last minute (or no
+        # bar at all) covers everything after it: connected.
+        reached = len(buffered) < len(head) or not head
+        # Probe only when the run leaves room for the probes AND a forward
+        # page after them -- a share too small for both walks forward, so
+        # every page it takes is kept.
+        room = self._room()
+        limit = PROBE_PAGES if room is None or room > PROBE_PAGES else 0
+        probes = 0
+        while not reached and buffered[0].ts_ms > last_ms + _MIN_MS and probes < limit:
+            page = self._fetch(buffered[0].ts_ms)
+            if page is None:
+                self.rep.up_end = self._halt
+                return
+            older = [c for c in page if c.ts_ms > last_ms]
+            buffered = older + buffered
+            reached = len(older) < len(page) or not page
+            probes += 1
+        if reached or buffered[0].ts_ms <= last_ms + _MIN_MS:
+            if buffered:
+                self.rep.up_rows += self._upsert(buffered)
+            self.rep.up_end = "connected"
+            return
+        self._forward(last_ms, until_ms)
+
+    def _forward(self, last_ms: int, until_ms: int) -> None:
+        """Walk ``(last_ms, until_ms)`` FORWARD, a page of minutes at a time,
+        writing each window as it lands (resumable at any page)."""
         span = self.w.page_bars * _MIN_MS
         cursor = last_ms
         while cursor + _MIN_MS < until_ms:
             before_ms = min(cursor + _MIN_MS + span, until_ms)
-            page = self.run.pager.fetch_before(self.w, before_ms)
-            if page is None:
-                self.rep.up_end = "stopped"
+            bars = self._window(cursor, before_ms)
+            if bars is None:
+                self.rep.up_end = self._halt
                 return
-            keep = [c for c in page if cursor < c.ts_ms < until_ms]
-            if keep:
-                self.rep.up_rows += self._upsert(keep)
+            if bars:
+                self.rep.up_rows += self._upsert(bars)
             cursor = before_ms - _MIN_MS
         self.rep.up_end = "connected"
+
+    def _window(
+        self, cursor: int, before_ms: int
+    ) -> list[claude_worker.fetchers.Candle] | None:
+        """Every bar in ``(cursor, before_ms)`` -- at most one page of
+        minutes. A SHORT answer that stops above ``cursor`` is re-paged
+        below its oldest bar until the venue answers nothing newer than
+        ``cursor``: a truncated page never becomes a hole, and a stretch the
+        venue printed nothing in is one it has no bars for."""
+        out: list[claude_worker.fetchers.Candle] = []
+        bound = before_ms
+        while True:
+            page = self._fetch(bound)
+            if page is None:
+                return None
+            newer = [c for c in page if cursor < c.ts_ms < bound]
+            out = newer + out
+            if (
+                len(newer) < len(page)
+                or not newer
+                or len(page) >= self.w.page_bars
+                or newer[0].ts_ms <= cursor + _MIN_MS
+            ):
+                return out
+            bound = newer[0].ts_ms
 
 
 def backfill_source(run: Run, series: str, descriptor: str, until_ms: int) -> SourceReport:
@@ -301,7 +409,7 @@ def backfill_source(run: Run, series: str, descriptor: str, until_ms: int) -> So
     if w is None:
         rep.skipped = "no backward REST walk for this venue"
     else:
-        walk = SourceWalk(run, w, rep)
+        walk = SourceWalk(run, w, rep, run.pager.pages)
         first, last = _span(run.conn, descriptor)
         if first is None or last is None:
             walk.down(until_ms)
@@ -318,6 +426,49 @@ def backfill_series(run: Run, series: claude_worker.har_config.Series) -> list[S
     """The feed, then each fallback -- every one to the last closed minute
     and back to its listing or the horizon (module doc: kept live)."""
     return [backfill_source(run, series.name, d, run.closed_by) for d in series.sources()]
+
+
+def interior_holes(
+    conn: sqlite3.Connection, descriptor: str, min_ms: int = BRIDGE_MIN_MS
+) -> list[tuple[int, int]]:
+    """``(last_before, first_after)`` of every stretch longer than ``min_ms``
+    with no stored minute inside ``descriptor``'s stored span (by
+    descriptor alone, like :func:`_span`), oldest first."""
+    holes: list[tuple[int, int]] = []
+    prev: int | None = None
+    for (ts,) in conn.execute(
+        "SELECT open_ts FROM candles WHERE descriptor=? AND tf=? ORDER BY open_ts",
+        (descriptor, _TF),
+    ):
+        if prev is not None and ts - prev > min_ms:
+            holes.append((prev, ts))
+        prev = ts
+    return holes
+
+
+def bridge_series(run: Run, series: claude_worker.har_config.Series) -> list[SourceReport]:
+    """After ``--import-from``: walk every interior hole of every walkable
+    source with the up-walk over ``(last_before, first_after)`` -- one page
+    when the venue printed nothing there either."""
+    out: list[SourceReport] = []
+    for d in series.sources():
+        w = walker_for(d)
+        if w is None:
+            continue
+        for lo, hi in interior_holes(run.conn, d):
+            rep = SourceReport(series.name, d, first_ts_ms=lo, last_ts_ms=hi)
+            SourceWalk(run, w, rep, run.pager.pages).up(lo, hi)
+            out.append(rep)
+    return out
+
+
+def bridge_line(rep: SourceReport) -> str:
+    """One line per bridged hole."""
+    return (
+        f"har-backfill bridge {rep.series} {rep.descriptor}:"
+        f" {_stamp(rep.first_ts_ms)} .. {_stamp(rep.last_ts_ms)}"
+        f" +{rep.up_rows} ({rep.up_end}) conflicts={rep.conflicts}"
+    )
 
 
 def import_rows(
@@ -381,13 +532,28 @@ def run_all(
     run: Run,
     series: list[claude_worker.har_config.Series],
     report: collections.abc.Callable[[str], None],
+    bridge: bool = False,
 ) -> bool:
-    """Every series in order; ``False`` when a walk stopped short."""
+    """Every source, the FEEDS first -- the rows the seeds' newest days are
+    made of never wait behind a fallback catching up on a budget -- then
+    each rank of fallbacks, series order within a rank; after
+    ``--import-from`` (``bridge``) every interior hole before any walk.
+    ``False`` when a walk stopped short."""
     complete = True
-    for s in series:
-        for rep in backfill_series(run, s):
+    short = ("stopped", "capped")
+    for s in series if bridge else []:
+        for rep in bridge_series(run, s):
+            report(bridge_line(rep))
+            complete = complete and rep.up_end not in short
+    depth = max((len(s.sources()) for s in series), default=0)
+    for rank in range(depth):
+        for s in series:
+            sources = s.sources()
+            if rank >= len(sources):
+                continue
+            rep = backfill_source(run, s.name, sources[rank], run.closed_by)
             report(report_line(rep))
-            complete = complete and "stopped" not in (rep.down_end, rep.up_end)
+            complete = complete and rep.down_end not in short and rep.up_end not in short
     tail = "" if complete else " -- INCOMPLETE, rerun resumes"
     report(f"har-backfill: {run.pager.pages} page(s){tail}")
     return complete
@@ -406,6 +572,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--series", action="append", default=None, help="only these names")
     ap.add_argument("--horizon-days", type=int, default=HORIZON_DAYS_DEFAULT)
     ap.add_argument("--max-pages", type=int, default=None, help="page budget for this run")
+    ap.add_argument(
+        "--max-pages-per-source",
+        type=int,
+        default=None,
+        help="pages one source may take of this run",
+    )
     ap.add_argument(
         "--import-from",
         type=pathlib.Path,
@@ -442,8 +614,8 @@ def main(argv: list[str] | None = None) -> int:
         with httpx.Client() as client:
             http = claude_worker.candles.make_http(client, os.environ)
             pager = Pager(http, sleep=time.sleep, budget=args.max_pages)
-            run = Run(conn, pager, now, args.horizon_days)
-            complete = run_all(run, series, _say)
+            run = Run(conn, pager, now, args.horizon_days, args.max_pages_per_source)
+            complete = run_all(run, series, _say, bridge=args.import_from is not None)
     finally:
         conn.close()
     return 0 if complete else 1

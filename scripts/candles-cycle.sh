@@ -60,9 +60,11 @@ fi
 # on the artifact like vrp_seed (F27) -- no har.toml, no HAR, no noise.
 # One serialized window, three steps, each non-fatal:
 #  1. har_backfill: every har.toml source -- the feed AND each fallback --
-#     gap-filled FORWARD to the last closed minute (the ruling "keep
-#     fallbacks live"). The page budget bounds a catch-up after downtime;
-#     a walk it stops keeps every page it stored and resumes next hour.
+#     gap-filled to the last closed minute (the ruling "keep fallbacks
+#     live"; one page a source in the hourly case, one for a source that
+#     stopped printing). The page budget bounds a catch-up after downtime and
+#     the per-source share keeps one lagging source from starving the rest;
+#     a walk they stop keeps what it stored and resumes next hour.
 #  2. har_seed seed-out: every series' seed-<NAME>.tsv, atomically -- the
 #     boot's history wherever the engine's own state-<NAME>.tsv is absent
 #     or behind (the engine merges both at boot, core_vol::merge_rows).
@@ -72,7 +74,7 @@ if [ -f "$HOME/multivenue/har.toml" ]; then
   uv run python -m claude_worker.har_backfill \
     --har-toml "$HOME/multivenue/har.toml" \
     --db "$HOME/multivenue/worker/candles.db" \
-    --max-pages 400 ||
+    --max-pages 400 --max-pages-per-source 48 ||
     echo "candles-cycle: har_backfill failed or stopped short (non-fatal; next hour resumes)" >&2
   uv run python -m claude_worker.har_seed seed-out \
     --har-toml "$HOME/multivenue/har.toml" \
