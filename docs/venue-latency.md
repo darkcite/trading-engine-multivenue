@@ -30,7 +30,8 @@ for the requested minutes and measures, concurrently:
   `aggTrade` `E`/`T`, OKX `bbo-tbt` `ts`, Bybit `orderbook.1` `ts`/`cts`,
   Deribit `quote` `timestamp`, Hyperliquid `l2Book` `time`, MEXC spot
   `aggre.bookTicker` `sendTime` (protobuf, the probe's one binary
-  parser) and MEXC futures `depth.full` `ts`/`cts`. Binance SPOT
+  parser), MEXC futures `depth.full` `ts`/`cts` and Hypercall
+  `IndicativeMarketData` `published_at`/`timestamp` (HC0). Binance SPOT
   `bookTicker` carries no timestamp; it is recorded for lead-lag only and
   its delivery is read off the USDM stream (the two share the delay
   pattern — receive-time cross-correlation is symmetric between them).
@@ -40,7 +41,14 @@ for the requested minutes and measures, concurrently:
 - **clock offset** venue − host from the same requests (`server_time −
   (t_send + rtt/2)`), so feed delays are on the venue's clock and the
   host's NTP error cancels. macOS drifts 50–70 ms; never compare a raw
-  venue stamp to `time.time()`.
+  venue stamp to `time.time()`. A venue with no REST time endpoint
+  (Hypercall) answers an in-band WS `ClockSync` every 5 s instead; the
+  probe puts its send wall-clock ns in the nonce and takes the same
+  midpoint (`summary.json` `offset_source: "ws"`).
+
+One venue alone: `--venues hypercall` (comma list, table order). Golden
+frames for a new parser: `--raw-per-kind 40` keeps the first 40 raw
+messages of every message type in `<out>/<venue>.raw.ndjson`.
 
 Outputs: `<out>/summary.json`, `<out>/rest.json`, and `<out>/<venue>.ndjson`
 (one line per message: receive wall + `CLOCK_MONOTONIC_RAW` ns — the
@@ -141,6 +149,63 @@ hl 340, ai 0, bybit 60, mexc 150]` ms (slot 7 new). Stress for
 350 (applied 340). Re-calibrating them is outside the MEXC lane and is
 the operator's decision; the 2026-09-03 row stays the applied table for
 them.
+
+### 2026-09-25 — MacBook Pro M4, operator's home network, 10 min from 21:05Z (HC0)
+
+`python -m claude_worker.latency_probe --venues hypercall --minutes 10
+--rest-every-s 60 --rest-samples 15 --raw-per-kind 40`, taken to measure
+Hypercall (the tenth venue byte, plan
+`docs/research/hypercall/hypercall-integration-plan-2026-09-26.md` HC0).
+The universe was 20 instruments: the 5 strikes nearest the index on the
+nearest expiry outside the 2 h pre-expiry blackout, for BTC, ETH, SP500 and
+NVDA. The live engine was not touched: this is a standalone probe (the MEXC
+go-live precedent). Venue offset (venue − host) is **+92.9 ms**, the median
+of 117 in-band `ClockSync` midpoints. That is the same host-clock drift the
+MX9 run saw (+96…+108).
+
+| venue | REST edge | TCP ms | TLS ms | req RTT p50 / p90 / p99 ms | stream | feed delay p50 / p90 / p99 ms | n | **Δ** |
+|---|---|---|---|---|---|---|---|---|
+| **hypercall** | **api.hypercall.xyz** (Cloudflare 104.20.30.123) | **25.2** | **22.5** | **113.7 / 168.8 / 366.6** (`/health`, n 150) | **`IndicativeMarketData` `timestamp`** (the quote's own stamp) | **64.3 / 96.7 / 447.6** | **10 159** | **64.3 + 113.7/2 = 121.1 → 130** |
+| | | | | | `published_at` (the wire leg alone) | 57.3 / 87.5 / 217.9 | 10 159 | (57.3 + 56.9 = 114.2 → 120) |
+| | | | | | `IndexPriceUpdate` (newest entry stamp; 2 s cadence) | 590.5 / 1 014.5 / 1 167.0 | 300 | — |
+| | | | | | `ClockSynced` (≈ RTT/2, a cross-check) | 52.7 / 75.6 / 95.4 | 117 | — |
+
+- **Δ = 130 ms.** It is taken on the quote's own `timestamp`, because the
+  option tick carries that stamp as its venue time (plan D4). A tick is
+  only stale if the QUOTE is old, and a re-published old quote must not
+  look fresh.
+- **Stress Δ** (p90 feed + p90 RTT/2): 96.7 + 84.4 = 181.1 → **190 ms**.
+- **Stale default:** the same stamp's p99, 447.6, rounded up to **500 ms**
+  (`VenueId::default_stale_after_ms`).
+- The index lags its source by about 0.6 s at p50 (it stamps the HL oracle
+  observation it was built from). That is an index-age figure, not a wire
+  figure. HC7's settlement shadow reads HL `oraclePx` directly and never
+  this stream.
+- **Data-only (O-HC1).** No fill model executes a Hypercall order. The Δ
+  column exists because the table is venue-byte indexed.
+- **Applied the same day** to `core_fill::ACTIVATION_NS_DEFAULT` /
+  `ModelParams::default()`: Hypercall only, slot 9 = 130 ms. Stress for
+  `--latency-ns-venue`: hypercall 190 ms.
+
+**HC0 subscribe law (plan D3, CONFIRMED 2026-09-25 21:2xZ, Mac; probe
+`docs/research/hypercall/probes/hc_d3_subscribe_test.py`).** The O-HC2
+capped universe was 12 underlyings × 3 expiries × 8 strikes × {C, P} = 576
+symbols, subscribed to `indicative_market_data` on fresh sockets for 60 s
+each:
+
+| variant | result |
+|---|---|
+| (A) ONE `Subscribe` frame, 576 symbols | Survived 60 s. 403 msg/s, 184.5 KiB/s; 444 of 576 instruments streamed; first data after 128 ms. `num_providers` was 1 on 22 786 messages, 2 on 1 560 and **0 on 3**. |
+| (B) 3 frames of 192 | **Closed after 0.12 s.** Code 1008, `{"error":"slow_consumer","class":"replaceable_public","cause":"message_limit","recovery":"resubscribe"}` |
+| (C) 12 frames, one per underlying | **Closed after 0.12 s**, same close. |
+
+**The law:** the symbol set goes in exactly ONE `Subscribe` frame per
+channel, on connect and on every resubscribe. The 4-frame probe above
+(one frame each for `index_prices`, `trades`, `market_updates` and
+`indicative_market_data`) was never closed. **REST framing:** `/markets`
+(4 335 817 B, 927 ms), `/options-summary?currency=BTC` (541 121 B) and
+`/health` all answer with `Content-Length` and no `Transfer-Encoding` or
+`Content-Encoding`. HC2 and HC4 rely on that.
 
 ## 4. Findings that this measurement settled (2026-09-03)
 

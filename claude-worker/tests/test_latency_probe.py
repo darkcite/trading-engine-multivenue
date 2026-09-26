@@ -8,6 +8,7 @@ is the documented per-location calibration step)."""
 import json
 import os
 import pathlib
+import threading
 import typing
 
 import pytest
@@ -232,7 +233,7 @@ def test_percentiles_and_feed_delay_stats(tmp_path: pathlib.Path) -> None:
 def test_venue_table_is_the_engines_edge() -> None:
     names = [v.name for v in lp.VENUES]
     assert names == ["binance", "binance-usdm", "okx", "bybit", "deribit", "hyperliquid",
-                     "mexc", "mexc-perp", "polymarket"]
+                     "mexc", "mexc-perp", "polymarket", "hypercall"]
     hosts = {v.name: v.ws_url for v in lp.VENUES}
     assert "stream.binance.com" in hosts["binance"]
     assert "ws.okx.com" in hosts["okx"]
@@ -243,4 +244,142 @@ def test_venue_table_is_the_engines_edge() -> None:
     rest = {v.name: v.rest_host for v in lp.VENUES}
     assert (rest["mexc"], rest["mexc-perp"]) == ("api.mexc.com", "contract.mexc.com")
     assert hosts["polymarket"] == ""  # REST RTT only: the CLOB WS needs an asset id
+    # HC0: one host on both planes; no REST time endpoint -> the in-band
+    # ClockSync keepalive carries the offset, its nonce re-rendered per send.
+    assert hosts["hypercall"] == "wss://api.hypercall.xyz/ws"
+    assert rest["hypercall"] == "api.hypercall.xyz"
+    hc = next(v for v in lp.VENUES if v.name == "hypercall")
+    assert hc.time_ms_of is lp._t_none and hc.subscribe_fn is not None
+    assert hc.keepalive is not None and lp._NONCE_TOKEN in hc.keepalive
     assert os.path.basename(lp.__file__) == "latency_probe.py"
+
+
+# --- HC0: Hypercall -----------------------------------------------------------
+
+# Captured 2026-09-25 19:04-20:10Z (plan §1.3); the Trade body is the docs
+# example (no Trade arrived in any probe window).
+_HC_QUOTE = (
+    '{"type":"IndicativeMarketData","instrument":"SNDK-20260927-1948-P","best_bid":"165.1175",'
+    '"best_ask":"182.6095","indicative_bid_size":"11.568993","indicative_ask_size":"11.568993",'
+    '"num_providers":1,"rfq_provider_quotes":[{"wallet":"0xe55b0000000000000000000000000000e86e",'
+    '"bid_price":"165.1175","ask_price":"182.6095","max_bid_size":"11.568993",'
+    '"max_ask_size":"11.568993","updated_at":1790363969110}],"published_at":1790363969125,'
+    '"timestamp":1790363969110}')
+_HC_INDEX = (
+    '{"type":"IndexPriceUpdate","prices":[{"underlying":"AAPL","price":"340.3",'
+    '"timestamp":1790363640978},{"underlying":"BTC","price":"109330","timestamp":1790363641100}],'
+    '"timestamp":1790363640978}')
+
+
+def test_parse_hypercall_quote_index_trade_clock_and_listing() -> None:
+    (q,) = lp.parse_hypercall(_HC_QUOTE)
+    assert (q["stream"], q["venue_ts_ms"], q["venue_ts2_ms"]) == (
+        "indicative", 1790363969125.0, 1790363969110.0)
+    assert (q["bid"], q["ask"], q["sym"], q["providers"]) == (
+        165.1175, 182.6095, "SNDK-20260927-1948-P", 1)
+    (ix,) = lp.parse_hypercall(_HC_INDEX)
+    # ts = the NEWEST entry, ts2 = the frame's stamp (the OLDEST source).
+    assert (ix["stream"], ix["venue_ts_ms"], ix["venue_ts2_ms"], ix["n"]) == (
+        "index", 1790363641100.0, 1790363640978.0, 2)
+    (tr,) = lp.parse_hypercall('{"type":"Trade","symbol":"BTC-20261002-100000-C",'
+                               '"price":"0.0523","size":"5.0","side":"buy",'
+                               '"timestamp":1737331200000}')
+    assert (tr["stream"], tr["venue_ts_ms"], tr["px"], tr["side"]) == (
+        "trade", 1737331200000.0, 0.0523, "buy")
+    (cs,) = lp.parse_hypercall('{"type":"ClockSynced","nonce":"1790363641000000000",'
+                               '"server_at":1790363641341}')
+    assert (cs["stream"], cs["venue_ts_ms"], cs["sent_wall_ns"]) == (
+        "clocksync", 1790363641341.0, 1790363641000000000)
+    (mu,) = lp.parse_hypercall('{"type":"MarketUpdate","action":"Created","symbol":'
+                               '"MU-20261002-1080-P","strike":"1080","is_call":false,'
+                               '"underlying":"MU","expiry":1790971200,"timestamp":1790363000000}')
+    assert (mu["stream"], mu["action"], mu["sym"]) == (
+        "market_update", "Created", "MU-20261002-1080-P")
+    # A one-sided quote (best_bid null) is legal and keeps its stamps.
+    (one,) = lp.parse_hypercall('{"type":"IndicativeMarketData","instrument":"X","best_bid":null,'
+                                '"best_ask":"1.5","num_providers":1,"published_at":2,'
+                                '"timestamp":1}')
+    assert (one["bid"], one["ask"], one["venue_ts_ms"]) == (None, 1.5, 2.0)
+    for other in ('{"type":"Subscribed","channel":"index_prices"}',
+                  '{"type":"Error","message":"bad"}', '[1,2]', b"\x00\x01"):
+        assert lp.parse_hypercall(other) == []
+    # A foreign nonce (not our wall-clock ns) is kept as a stamp without a send time.
+    (foreign,) = lp.parse_hypercall('{"type":"ClockSynced","nonce":"probe-1","server_at":5}')
+    assert foreign["sent_wall_ns"] is None
+
+
+def _hc_row(name: str, expiry_ms: int, und: float) -> dict:
+    return {"instrument_name": name, "expiration_timestamp": expiry_ms, "underlying_price": und}
+
+
+def test_hypercall_pick_symbols_skips_the_blackout_and_takes_the_nearest_strikes() -> None:
+    now = 1_790_000_000_000
+    soon = now + 60 * 60 * 1000          # inside the 2 h pre-expiry blackout
+    near = now + 20 * 60 * 60 * 1000     # the nearest quotable expiry
+    far = now + 7 * 24 * 60 * 60 * 1000
+    rows = [
+        _hc_row("BOT-20260925-2.5-C", soon, 2.6),
+        _hc_row("BOT-20260926-2.5-C", near, 2.6),
+        _hc_row("BOT-20260926-2.5-P", near, 2.6),
+        _hc_row("BOT-20260926-3-C", near, 2.6),
+        _hc_row("BOT-20260926-1-P", near, 2.6),
+        _hc_row("BOT-20261003-2.6-C", far, 2.6),
+        {"instrument_name": "garbage", "expiration_timestamp": near, "underlying_price": 2.6},
+        {"instrument_name": "BOT-20260926-2-C", "expiration_timestamp": None,
+         "underlying_price": 2.6},
+    ]
+    picked = lp.hypercall_pick_symbols(rows, now, per_underlying=3)
+    assert picked == ["BOT-20260926-2.5-C", "BOT-20260926-2.5-P", "BOT-20260926-3-C"]
+    assert lp.hypercall_pick_symbols(rows[:1], now) == []
+
+
+def test_ws_clock_offsets_use_the_midpoint_rule(tmp_path: pathlib.Path) -> None:
+    nd = tmp_path / "hypercall.ndjson"
+    sent = 1_790_000_000_000 * lp.NS_PER_MS
+    rows = [
+        # sent at T, received at T+40 ms, venue stamped T+20+7 -> offset +7 ms
+        {"stream": "clocksync", "venue_ts_ms": 1_790_000_000_027.0, "sent_wall_ns": sent,
+         "t_recv_wall_ns": sent + 40 * lp.NS_PER_MS},
+        {"stream": "clocksync", "venue_ts_ms": 5.0, "sent_wall_ns": None,
+         "t_recv_wall_ns": sent},
+        {"stream": "indicative", "venue_ts_ms": 1.0, "t_recv_wall_ns": sent},
+    ]
+    with open(nd, "w", encoding="ascii") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    assert lp.ws_clock_offsets(nd) == [pytest.approx(7.0)]
+    assert lp.ws_clock_offsets(tmp_path / "missing.ndjson") == []
+
+
+def test_raw_kind_buckets_by_the_first_type_value() -> None:
+    assert lp.raw_kind(_HC_QUOTE) == "IndicativeMarketData"
+    assert lp.raw_kind('{"type" : "Subscribed","channel":"trades"}') == "Subscribed"
+    assert lp.raw_kind('{"stream":"btcusdt@aggTrade"}') == "other"
+    assert lp.raw_kind('{"type":5}') == "other"
+    assert lp.raw_kind(b"\x0a\x01") == "binary"
+
+
+def test_select_venues_filters_in_table_order_and_refuses_unknown_names() -> None:
+    assert lp.select_venues("") == lp.VENUES
+    assert [v.name for v in lp.select_venues("hypercall, okx")] == ["okx", "hypercall"]
+    with pytest.raises(ValueError, match="nope"):
+        lp.select_venues("okx,nope")
+
+
+def test_collector_renders_a_fresh_nonce_per_keepalive(tmp_path: pathlib.Path) -> None:
+    hc = next(v for v in lp.VENUES if v.name == "hypercall")
+    col = lp.Collector(hc, tmp_path, threading.Event(), raw_per_kind=1)
+    first = json.loads(col._keepalive_text())
+    assert first["type"] == "ClockSync" and first["nonce"].isdigit()
+    assert lp._NONCE_TOKEN not in col._keepalive_text()
+    # Golden-frame tap: the first N per kind, verbatim; binary never.
+    with open(col.raw_path, "w", encoding="utf-8") as raw:
+        col._tap(raw, _HC_QUOTE, 1)
+        col._tap(raw, _HC_QUOTE, 2)
+        col._tap(raw, _HC_INDEX, 3)
+        col._tap(raw, b"\x00", 4)
+    lines = [json.loads(x) for x in col.raw_path.read_text(encoding="utf-8").splitlines()]
+    assert [(x["kind"], x["t_recv_wall_ns"]) for x in lines] == [
+        ("IndicativeMarketData", 1), ("IndexPriceUpdate", 3)]
+    assert lines[0]["msg"] == _HC_QUOTE
+    assert col.raw_counts == {"IndicativeMarketData": 1, "IndexPriceUpdate": 1}
