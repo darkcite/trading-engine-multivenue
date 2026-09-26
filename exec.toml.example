@@ -52,7 +52,7 @@
 #   0  hyparb           4  ai-exec
 #   1  vrp              5  vm
 #   2  xsd              6  xmm (a LIVE slot 6 refuses until XMM XH4)
-#   3  bin15            7  (reserved)
+#   3  bin15            7  hcv (DARK: a LIVE slot 7 refuses, O-HC18)
 #
 #
 # THE THREE GRAMMAR LAWS

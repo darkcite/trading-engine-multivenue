@@ -59,6 +59,8 @@ members = [
     "crates/strategy-hyparb",
     # XMM XH1: the slot-6 member (strategy-icdp is unlinked, not deleted — O-XH1)
     "crates/strategy-xmm",
+    # HC11 (O-HC18): the slot-7 member, Hypercall S1 — DARK, paper only
+    "crates/strategy-hcv",
     "crates/strategy-bin15",
     "crates/strategy-rule-tree",
     "crates/strategy-set",
@@ -206,6 +208,7 @@ strategy-icdp         = { path = "crates/strategy-icdp" }
 strategy-latency-arb  = { path = "crates/strategy-latency-arb" }
 strategy-hyparb       = { path = "crates/strategy-hyparb" }
 strategy-xmm          = { path = "crates/strategy-xmm" }
+strategy-hcv          = { path = "crates/strategy-hcv" }
 strategy-bin15        = { path = "crates/strategy-bin15" }
 strategy-rule-tree    = { path = "crates/strategy-rule-tree" }
 strategy-set          = { path = "crates/strategy-set" }

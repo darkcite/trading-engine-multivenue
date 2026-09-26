@@ -10,8 +10,8 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
 spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
-MEXC (data-only), Hypercall options (data-only in the engine; the
-HC9 order arm runs as operator verbs only),
+MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
+PAPER only since HC11; the HC9 order arm runs as operator verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
 Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
@@ -19,7 +19,7 @@ the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 `claude-worker` Python process, and in-session) is an **offline strategy
 researcher** — never in the hot path.
 
-Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 127):
+Slots (`crates/strategy-set`, one enable bit each; `all` = `BUILT_MASK` 255):
 0 hyparb (HyperEVM ↔ HL Core arb, since HYPARB H0 2026-09-23 — lands DARK,
 O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
 `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
@@ -28,7 +28,11 @@ tables) · 6 xmm (HL post-only maker, since XMM XH1 2026-09-26; quotes on the
 queue law since XH2, paper only; `/state` `xmm` block, `engine_xmm_*`,
 `[labels.xmm]` and audit-pnl prints since XH3; boots only with
 `~/multivenue/xmm.toml`; `icdp` unlinked, its name refuses the boot,
-`backtest --member icdp` stays) · 7 open. Member timers run per
+`backtest --member icdp` stays) · 7 hcv (Hypercall S1 options vs the HAR
+σ̂, hedged on HL perps, since HC11 2026-09-26 — lands DARK, O-HC18: paper
+only on the held-quote law, in no configured mask; boots only with
+`~/multivenue/hcv.toml`; a live slot 7 refuses the boot; risk-policy
+"HYPERCALL — slot 7"). Member timers run per
 slot (each on its own period). The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
 in the script; `ai` = 48 is the floor every name includes).
@@ -263,7 +267,10 @@ in the script; `ai` = 48 is the floor every name includes).
   forward under O-HC17: `signer_eip712::hypercall`, every SDK type, 38
   SDK vectors byte-exact, gate 83; HC9 — the order arm
   `crates/exec-hypercall` — came forward under O-HC19 as the operator's
-  `hypercall-live` verbs, never armed by the engine; go-live is staged for a daily
+  `hypercall-live` verbs, never armed by the engine — its mainnet dust
+  PASSED 2026-09-26 after the nonce fix `84fc32b` (the nonce is wall ms);
+  HC10 bound the HIP-3 hedge perps; HC11 built slot 7, `strategy-hcv`,
+  DARK paper; go-live is staged for a daily
   restart the operator names — `[hypercall]` and the `fees.toml` lines
   just before it, `hypercall_history` scheduled, the HAR steps of the H3
   plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
@@ -305,12 +312,13 @@ in the script; `ai` = 48 is the floor every name includes).
   `news.toml [events]` → `scheduled-events.json` every news cycle; the
   reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
   is now 1, the floor root (it returned 2).
-- **Gates at HEAD (branch `hypercall`: B1–B5 of its 2026-09-26 plan after
-  the Hypercall merge onto XMM XH3; Foundry as of the HYPARB merge):**
-  nextest 3447 (6
+- **Gates at HEAD (branch `hypercall`: HC11, after HC8–HC10 on B1–B5 of its
+  2026-09-26 plan; Foundry as of the HYPARB merge):**
+  nextest 3565 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
-  87/87 at the gates' pins (0 B/op; gates 72 and 77b pin `HttpsPost` and
+  89/89 at the gates' pins (0 B/op; gate 85 is slot 7 over the
+  held-quote law; gates 72 and 77b pin `HttpsPost` and
   `HttpsReq` at exactly 2 per request — rustls; +1 ignored child
   helper) · clippy clean · `make license-check` OK · `make
   bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
@@ -319,7 +327,7 @@ in the script; `ai` = 48 is the floor every name includes).
   measured, not baselined) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all ten ingress crates, the HYPARB crates,
-  strategy-xmm, core-fill, the engine and the HAR state writer) ·
+  strategy-xmm, strategy-hcv, core-fill, the engine and the HAR state writer) ·
   Foundry 11 unit +
   5 mainnet-fork (session sandbox; forge is not on this Mac) ·
   worker pytest 1643 passed, 5 skipped (its one red,
@@ -505,8 +513,8 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   frame rides a run loop's `Dispatch` (each const-asserted ≤ 64 B); a
   top-K change gate flips a `core_types::DepthPair`, never copies.
   Enforced by `make copy-audit` (the exec lane, core-net, core-ring, all
-  ten ingress crates, the HYPARB crates, strategy-xmm, core-fill and the
-  engine; a RATCHET against
+  ten ingress crates, the HYPARB crates, strategy-xmm, strategy-hcv,
+  core-fill and the engine; a RATCHET against
   `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
   `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)
   and the `zero-copy-auditor` agent. A cold operator module may opt out with
@@ -567,7 +575,7 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 - `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm,hypercall}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
-- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,xmm}` — the composed
+- `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,xmm,hcv}` — the composed
   set and its members; `strategy-{latency-arb,cross-arb,ev,rule-tree,icdp}` are
   in-tree but unlinked/off. `book-builder`, `opt-registry`,
   `options-select`, `research-artifacts`.

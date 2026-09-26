@@ -184,6 +184,16 @@ fn full_snapshot() -> Box<EngineSnapshot> {
         r.fitted = u16::MAX;
         r.fit_beats_raw = u16::MAX;
     }
+    // HC11: the slot-7 block at its widest render.
+    s.boot.hcv_hash = [0xFF; 32];
+    let h = &mut s.hcv.counters;
+    h.judged = u64::MAX;
+    h.skip_event = u64::MAX;
+    h.har_updates = u64::MAX;
+    h.positions = i64::MIN;
+    h.vega_abs_usd_1e6 = i64::MIN;
+    h.pnl_usd_1e6 = i64::MIN;
+    h.day_pnl_usd_1e6 = i64::MIN;
     s
 }
 
@@ -240,6 +250,7 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
         "\"recent\":",
         "\"hyparb\":",
         "\"har\":",
+        "\"hcv\":",
     ] {
         assert_eq!(body.matches(key).count(), 1, "{key} must appear once");
     }
@@ -341,6 +352,34 @@ fn the_vrp_section_renders_the_campaign_and_its_counters() {
     let n = encode_state_json(&empty, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(body.contains("\"vrp\":{\"configured\":0,"));
+}
+
+/// HC11: the slot-7 block renders its identity and every counter, and
+/// the unconfigured default says so.
+#[test]
+fn the_hcv_block_renders_its_hash_and_counters() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    s.boot.hcv_hash = [0x5a; 32];
+    s.hcv.counters.sells = 3;
+    s.hcv.counters.skip_event = 11;
+    s.hcv.counters.pnl_usd_1e6 = -2_500_000;
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(
+        body.contains(concat!(
+            "\"hcv\":{\"configured\":1,",
+            "\"hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\",",
+            "\"judged\":0,\"sells\":3,\"buys\":0,"
+        )),
+        "hcv schema drift; got: {body}"
+    );
+    assert!(body.contains("\"skip_event\":11,"));
+    assert!(body.contains("\"pnl_usd_1e6\":-2500000,\"day_pnl_usd_1e6\":0}"));
+    let empty = Box::new(EngineSnapshot::empty());
+    let n = encode_state_json(&empty, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains("\"hcv\":{\"configured\":0,"));
 }
 
 /// The schema pin: a fixed small snapshot renders byte-exact. Any

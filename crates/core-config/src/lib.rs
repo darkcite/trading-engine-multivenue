@@ -33,6 +33,8 @@ pub mod bin15;
 pub mod exec;
 /// HAR H3: the long-tenor HAR series list (`har.toml`).
 pub mod har;
+/// HC11: `hcv.toml`, the slot-7 member's artifact.
+pub mod hcv;
 /// HYPARB H5: the slot-0 member's parameter artifact (`hyparb.toml`).
 pub mod hyparb;
 pub mod icdp;

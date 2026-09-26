@@ -1,0 +1,20 @@
+[package]
+name         = "strategy-hcv"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+authors.workspace      = true
+description  = "HCV slot-7 member (Hypercall S1): sells and buys near-ATM Hypercall options at a diffusive IV gap to the HAR forecast, hedges on Hyperliquid perps, books the venue's median-of-means settlement — DARK, paper only (O-HC18)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+core-types    = { workspace = true }
+core-fill     = { workspace = true }
+core-settle   = { workspace = true }
+core-ring     = { workspace = true }
+core-time     = { workspace = true }
+strategy-core = { workspace = true }

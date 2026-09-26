@@ -77,7 +77,8 @@ if [ "$#" -eq 0 ]; then
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \
            crates/ingress-polymarket crates/ingress-rpc crates/ingress-hyperevm \
            crates/ingress-hypercall crates/exec-hypercall \
-           crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/core-fill crates/engine \
+           crates/core-amm crates/strategy-hyparb crates/strategy-xmm crates/strategy-hcv \
+           crates/core-fill crates/engine \
            crates/cli/src/evm_shadow.rs \
            crates/cli/src/hyparb_live.rs \
            crates/cli/src/har_writer.rs

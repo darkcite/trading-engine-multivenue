@@ -6,6 +6,37 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — Strategy slot 7 = `hcv` (Hypercall S1, DARK); `hcv.toml`; the held-quote paper law; `/state.hcv`; `engine_hcv_*` (HC11)
+
+**What changed**
+
+- `crates/strategy-hcv` (new): the slot-7 member (risk-policy "HYPERCALL — slot 7").
+- `strategy-set`: slot 7 is built — `SLOT_HCV = 7`, `BIT_HCV = 128`, `BUILT_MASK` 127 → **255**; the names `hcv` (128), `ai+hcv` (176) and `ai+vrp+xsd+bin15+hyparb+xmm+hcv` (255). No slot is reserved any more: an `EnableStrategy` for slot 7 is honored, one past 7 is refused. The set hands slot 7 the HAR rows whenever one moves.
+- `core_config::hcv` + `hcv.toml.example` (every key required); `--hcv`, `--hcv-events`; the wrapper's allow-list takes the three names and `HCV_TOML` / `HCV_EVENTS`.
+- `core_fill::held` — the held-quote IoC law; `PaperMatcher` now MODELS Hypercall IoCs by it (they were unroutable). A stale Hypercall quote is no quote; a miss emits a `CANCELED`/`EXPIRED` order event.
+- The boot discovery keeps each configured HL perp's `szDecimals` (`hl_sz_decimals`).
+- `/state`: a new `hcv` object (`configured`, `hash`, 17 counters, 4 gauges); `slots[7]` is named `hcv` (was `reserved`); `BootInfo` carries `hcv_hash` (rendered inside `hcv`, so the pinned `boot` section is unchanged). Schema stays 2 — all additive.
+- `/metrics`: `engine_hcv_*` — 17 `_total` counters and 4 gauges (`positions`, `vega_abs_usd_1e6`, `pnl_usd_1e6`, `day_pnl_usd_1e6`).
+- `exec.toml`: slot 7's name is `hcv`; a live slot 7 refuses the boot (O-HC18). `audit-pnl` names slot 7 `hcv`.
+- The HC9 arm's nonce is the wall clock in ms (`84fc32b`, measured on mainnet) — the risk-policy entry is corrected.
+
+**Impact**
+
+- None on a configured mask: slot 7 is in none, and nothing reads `hcv.toml` unless the requested mask carries bit 7.
+- `--strategy all` now composes slot 7 too, so it needs `hcv.toml` as it needs `xmm.toml`: requested-but-absent refuses the boot (the F19 law).
+- Dashboards reading `slots[7].name` see `hcv`.
+
+**Migration steps** (go-live, the operator's; each after the ones before)
+
+1. The Hypercall go-live itself (`[hypercall]` live — O-HC12) and `har.toml` live (O-HC22); `[events]` is live since 12:03Z.
+2. Append the eight hedge coins to `[hyperliquid] coins` (O-HC20: `xyz:SP500`, `xyz:SPCX`, `xyz:MU`, `xyz:NVDA`, `xyz:MSFT`, `xyz:META`, `xyz:AAPL`, `xyz:SNDK`) — **append, never reorder**.
+3. `cp hcv.toml.example ~/multivenue/hcv.toml` (edit the knobs, if any).
+4. One `strategy.conf` line naming a mask with hcv; restart at a daily restart. `/state.hcv.configured` = 1 and the boot tell `hcv: artifact configured` confirm it.
+
+**Rollback**
+
+- Drop hcv from `STRATEGY=`; slot 7 is paper only, so nothing is open on any venue.
+
 ## 2026-09-26 — HIP-3 builder-dex perps: real asset ids and size decimals (HC10)
 
 **What changed**

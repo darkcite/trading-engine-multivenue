@@ -1,0 +1,58 @@
+# hcv.toml — the slot-7 HCV member (Hypercall volatility, S1; plan
+# hc9-hc11 §4; rulings O-HC18..O-HC23). The contract is the parser:
+# crates/core-config/src/hcv.rs. Integers only; every key is REQUIRED;
+# every bound refuses rather than clamps.
+#
+# DARK (O-HC18): the member is paper only and in no configured mask.
+# Turning it on is one line — `STRATEGY=…+hcv` in strategy.conf — once
+# this file sits at ~/multivenue/hcv.toml (the engine reads that path
+# itself); arming it live is a separate ruling (exec.toml refuses a live
+# slot 7).
+#
+# It reads: the Hypercall provider quotes, the Hyperliquid oracle of each
+# underlying (settlement's own source) and its hedge perp's touch, the
+# HAR set's σ̂ (har.toml live — O-HC22) and the news plane's
+# scheduled-events.json (the event law).
+
+[hcv]
+# --- what is traded (O-HC20: the hedgeable underlyings) --------------
+trade_sp500 = 1
+trade_spcx  = 1
+trade_mu    = 1
+trade_nvda  = 1
+trade_msft  = 1
+trade_meta  = 1
+trade_aapl  = 1
+trade_sndk  = 1
+trade_btc   = 1
+trade_eth   = 1
+
+# --- the decision (O-HC23) ---------------------------------------------
+theta_vol_1e6 = 50000          # act at a 5 vol-point diffusive gap
+atm_band_bps  = 500            # near-ATM only: |ln K/S| ≤ 5 %
+tenor_min_d   = 1              # tenors 1–40 days (the HAR set's range)
+tenor_max_d   = 40
+opt_size_step_1e6 = 1000       # option size step, 0.001 contracts
+
+# --- risk ----------------------------------------------------------------
+clip_usd_1e6        = 5000000      # $5 premium per order
+vega_cap_usd_1e6    = 20000000     # |net vega| per underlying, $ per vol point
+premium_cap_usd_1e6 = 50000000     # gross premium at stake
+day_loss_usd_1e6    = 20000000     # the day's marked-loss stop
+tail_loss_usd_1e6   = 20000000     # one-day 10σ stress loss cap
+kill = 0                           # 1 = no new risk (hedging continues)
+
+# --- the hedge (Hyperliquid perps) ---------------------------------------
+hedge_band_1e6    = 100000     # ±0.10 delta PER CONTRACT HELD (10 deltas)
+hedge_min_usd_1e6 = 10000000   # the venue's $10 minimum
+hedge_slip_bps    = 10         # an IoC crosses the touch by this much
+unwind_min        = 30         # the final 30 minutes: 30 one-minute slices
+
+# --- freshness, settlement, events, cadence --------------------------------
+quote_stale_ms   = 10000       # the Hypercall feed is dead: no quote of ANY instrument
+oracle_stale_ms  = 10000       # an oracle print is stale; the HL feed is dead
+settle_delay_ms  = 60000       # book the payoff a minute after expiry
+settle_order     = 0           # the HC7 gate's pick: 0 sorted, 1 time
+event_law        = 1           # an event inside the option's life = no trade
+events_stale_ms  = 7200000     # a calendar older than 2 h is unknown
+timer_ms         = 1000

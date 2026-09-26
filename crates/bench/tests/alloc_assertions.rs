@@ -10725,3 +10725,180 @@ fn hypercall_arm_render_sign_and_scan_is_zero_alloc() {
     assert_eq!(allocs, 0, "the Hypercall arm's per-order work allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "the Hypercall arm's per-order work bytes should be zero: saw {bytes}");
 }
+
+/// **HC11 gate 85 — the slot-7 member and the paper held-quote law are
+/// 0 B/op.** Two underlyings, a near-ATM chain, σ̂ pushed, a calendar by
+/// mailbox; the member's orders go into a `PaperMatcher` (Hypercall IoCs
+/// under the held-quote law, the hedges under the strict-cross IoC law)
+/// and its fills and order events come back — 2 400 one-second engine
+/// steps: the quote swings rich and cheap (sales, buy-backs, the caps),
+/// the hedge follows outside its band, a position injected at boot runs
+/// through the final window's TWAP to its median-of-means settlement, the
+/// calendar is replaced and the HAR view re-pushed mid-run. Everything is
+/// boxed at `configure` (the only allocations).
+#[test]
+fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
+    use clob_dispatcher::PaperMatcher;
+    use core_types::{make_symbol_id, ChannelEvent, ChannelId, Order, OrderEvent, Side};
+    use strategy_core::{Ctx, HarSeriesView, Strategy, SubmitErr, HAR_VIEW_TENORS};
+    use strategy_hcv::{HcvEvents, HcvOpt, HcvParams, HcvStrategy, HcvUnd};
+
+    struct PaperCtx<'a> {
+        m: &'a mut PaperMatcher,
+        now: u64,
+    }
+    impl Ctx for PaperCtx<'_> {
+        fn submit(&mut self, mut order: Order) -> Result<(), SubmitErr> {
+            order.strategy_id = 7;
+            self.m.submit(&order, self.now);
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    const T0_MS: u64 = 1_790_424_000_000;
+    const MONO0: u64 = 1_000_000_000_000;
+    const DAY: u64 = 86_400_000;
+    const STEPS: u64 = 2_400;
+    let ns = |ms: u64| MONO0 + ms * 1_000_000;
+    let sp = make_symbol_id(VenueId::Hyperliquid, 40);
+    let btc = make_symbol_id(VenueId::Hyperliquid, 1);
+    let opt = |k: u32| make_symbol_id(VenueId::Hypercall, 513 + k);
+    let s_sp: i64 = 6_600_000_000;
+    let s_btc: i64 = 110_000_000_000;
+    let mut options = Vec::new();
+    let mut k = 0u32;
+    while k < 6 {
+        let strike = s_sp - 100_000_000 + i64::from(k / 2) * 100_000_000;
+        options.push(HcvOpt { sym: opt(k), und: 0, call: k % 2 == 0, strike_1e6: strike, exp_ms: T0_MS + 7 * DAY });
+        k += 1;
+    }
+    options.push(HcvOpt { sym: opt(6), und: 1, call: true, strike_1e6: s_btc, exp_ms: T0_MS + 7 * DAY });
+    // Injected at boot: expires 15 minutes in — the final window and the
+    // settlement run inside the measured loop.
+    options.push(HcvOpt { sym: opt(7), und: 0, call: true, strike_1e6: s_sp, exp_ms: T0_MS + 15 * 60_000 });
+    let p = HcvParams {
+        und: vec![HcvUnd::new(b"SP500", sp, 2), HcvUnd::new(b"BTC", btc, 5)],
+        options,
+        theta_vol_1e6: 50_000,
+        atm_band_bps: 500,
+        tenor_min_d: 1,
+        tenor_max_d: 40,
+        clip_usd_1e6: 5_000_000,
+        vega_cap_usd_1e6: 20_000_000,
+        premium_cap_usd_1e6: 50_000_000,
+        day_loss_usd_1e6: 1_000_000_000,
+        tail_loss_usd_1e6: 1_000_000_000,
+        opt_size_step_1e6: 1_000,
+        hedge_band_1e6: 100_000,
+        hedge_min_usd_1e6: 10_000_000,
+        hedge_slip_bps: 10,
+        quote_stale_ms: 10_000,
+        oracle_stale_ms: 10_000,
+        unwind_min: 30,
+        settle_delay_ms: 60_000,
+        settle_order: strategy_hcv::BucketOrder::Sorted,
+        event_law: true,
+        events_stale_ms: 7_200_000,
+        kill: false,
+        timer_ms: 1_000,
+        anchor: core_time::WallAnchor::new(MONO0, T0_MS * 1_000_000),
+    };
+    // Boot (allocation allowed).
+    let mut s = HcvStrategy::new();
+    s.configure(&p).expect("gate 85 configure");
+    let mut rows = [HarSeriesView::default(); 2];
+    rows[0].name[..5].copy_from_slice(b"SP500");
+    rows[0].name_len = 5;
+    rows[1].name[..3].copy_from_slice(b"BTC");
+    rows[1].name_len = 3;
+    rows[0].warm = 1;
+    rows[1].warm = 1;
+    rows[0].raw_1e6 = [150_000; HAR_VIEW_TENORS];
+    rows[1].raw_1e6 = [450_000; HAR_VIEW_TENORS];
+    s.set_har_view(&rows);
+    let (mut tx, rx) = core_ring::Mailbox::new(Box::new(HcvEvents::new())).split();
+    s.install_events(rx);
+    let calendar = |gen_ms: u64| {
+        let mut c = HcvEvents::new();
+        c.generated_ms = gen_ms;
+        c.from_ms = gen_ms - 30 * DAY;
+        c.until_ms = gen_ms + 60 * DAY;
+        c.push(gen_ms + 20 * DAY, 0b01);
+        c
+    };
+    {
+        let mut f = tx.try_fill().expect("gate 85 mailbox");
+        *f = calendar(T0_MS - 60_000);
+        f.commit();
+    }
+    let mut m = Box::new(PaperMatcher::new());
+    {
+        let mut c = PaperCtx { m: &mut m, now: ns(0) };
+        s.on_fill(&core_types::Fill::new(ns(0), opt(7), Side::Bid, Price::from_raw(30_000_000), Qty::from_raw(1_000_000), 999), &mut c);
+    }
+    // Premiums at ~22 % (rich) and ~9 % (cheap) of a 7-day ATM SP500
+    // option; the BTC call at ~70 % / ~30 %.
+    let px_sp = |rich: bool| if rich { (80_000_000i64, 84_000_000i64) } else { (30_000_000i64, 33_000_000i64) };
+    let px_btc = |rich: bool| if rich { (4_250_000_000i64, 4_400_000_000i64) } else { (1_700_000_000i64, 1_850_000_000i64) };
+
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < STEPS {
+        let now = ns(i * 1_000);
+        let rich = (i / 40) % 2 == 0;
+        let drift = ((i * 7_919) % 2_001) as i64 * 100_000 - 100_000_000;
+        let (spx, bpx) = (s_sp + drift, s_btc + drift * 16);
+        let hl_sp = Tick::new_stamped(now, VenueId::Hyperliquid, sp, 0, Price::from_raw(spx - 500_000), Qty::from_raw(100_000_000), Price::from_raw(spx + 500_000), Qty::from_raw(100_000_000), 0, 0);
+        let hl_btc = Tick::new_stamped(now, VenueId::Hyperliquid, btc, 0, Price::from_raw(bpx - 1_000_000), Qty::from_raw(10_000_000), Price::from_raw(bpx + 1_000_000), Qty::from_raw(10_000_000), 0, 0);
+        m.observe_tick(&hl_sp, now);
+        m.observe_tick(&hl_btc, now);
+        {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_venue_event(&ChannelEvent::new(now, VenueId::Hyperliquid, ChannelId::Mark, sp, 0, 0, spx, spx), &mut c);
+            s.on_venue_event(&ChannelEvent::new(now, VenueId::Hyperliquid, ChannelId::Mark, btc, 0, 0, bpx, bpx), &mut c);
+            s.on_tick(&hl_sp, &mut c);
+            s.on_tick(&hl_btc, &mut c);
+        }
+        let mut k = 0u32;
+        while k < 7 {
+            let (b, a) = if k == 6 { px_btc(rich) } else { px_sp(rich) };
+            let q = Tick::new_stamped(now, VenueId::Hypercall, opt(k), 0, Price::from_raw(b), Qty::from_raw(1_000_000), Price::from_raw(a), Qty::from_raw(1_000_000), 0, 0);
+            m.observe_tick(&q, now);
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_tick(&q, &mut c);
+            k += 1;
+        }
+        {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_timer(now, &mut c);
+        }
+        while let Some(f) = m.try_next_fill() {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_fill(&f, &mut c);
+        }
+        let mut ev = OrderEvent::ZERO;
+        while m.try_next_order_event(&mut ev) {
+            let mut c = PaperCtx { m: &mut m, now };
+            s.on_order_event(&ev, &mut c);
+        }
+        if i % 600 == 300 {
+            if let Some(mut f) = tx.try_fill() {
+                *f = calendar(T0_MS + i * 1_000);
+                f.commit();
+            }
+            s.set_har_view(&rows);
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let k = s.counters();
+    assert!(k.sells > 0 && k.buys > 0, "both sides traded: {k:?}");
+    assert!(k.option_fills > 0 && k.hedges > 0 && k.hedge_fills > 0, "fills and hedges: {k:?}");
+    assert!(k.unwind_slices > 0 && k.settlements >= 1, "the final window and the settlement ran: {k:?}");
+    assert!(k.calendars >= 3 && k.skip_caps > 0, "calendars replaced, caps met: {k:?}");
+    assert_eq!(allocs, 0, "slot 7 over the held-quote law allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0);
+}

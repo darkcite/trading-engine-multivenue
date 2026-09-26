@@ -2289,6 +2289,10 @@ pub fn build_hl_families(
 /// resolved at boot like `ep`): a reconnect that retired a rolling
 /// family re-discovers its successor there
 /// ([`boot_discovery::fetch_hl_outcome_specs`]).
+///
+/// `mark_lane` (HC11): the MARK rides the event lane even without rolling
+/// families — slot 7 reads each underlying's `oraclePx` (`Mark.v1`), the
+/// price Hypercall settles on.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_hyperliquid(
     ep: WssEndpoint,
@@ -2298,6 +2302,7 @@ pub fn spawn_hyperliquid(
     families: ingress_hyperliquid::family::HlFamilyTable,
     roll_status: Arc<ingress_hyperliquid::family::HlRollStatus>,
     wall_anchor: core_time::WallAnchor,
+    mark_lane: bool,
     stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
@@ -2351,7 +2356,8 @@ pub fn spawn_hyperliquid(
             // MARK — a member cannot price a HIP-4 binary without the
             // strike's reference, and cannot know which instance its
             // slot holds without the roll.
-            let event_mask = if has_families {
+            // HC11: slot 7 reads the MARK too (`mark_lane`).
+            let mut event_mask = if has_families {
                 EVENT_LANE_FUNDING
                     | EVENT_LANE_ASSET_CTX
                     | core_types::event_lane_bit(core_types::ChannelId::InstrumentRoll)
@@ -2359,6 +2365,9 @@ pub fn spawn_hyperliquid(
             } else {
                 EVENT_LANE_FUNDING | EVENT_LANE_ASSET_CTX
             };
+            if mark_lane {
+                event_mask |= core_types::event_lane_bit(core_types::ChannelId::Mark);
+            }
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             let mut last_rediscovery_ns: Option<u64> = None;
@@ -3408,8 +3417,8 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / xmm
-/// when their artifacts resolve, slot 0 when `hyparb.toml` resolves
+/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / xmm /
+/// hcv when their artifacts resolve, slot 0 when `hyparb.toml` resolves
 /// (HYPARB H5 — the member is configured only by its own boot
 /// artifact; unconfigured it refuses `on_start`, so it never boots
 /// inert under a healthy-looking name),
@@ -3434,6 +3443,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     xsd: Option<&crate::xsd_boot::XsdBoot>,
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
     xmm: Option<&crate::xmm_boot::XmmBoot>,
+    hcv: Option<&crate::hcv_boot::HcvBoot>,
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
     har: Option<&crate::har_boot::HarBoot>,
@@ -3454,6 +3464,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if xmm.is_some() {
         configured |= strategy_set::BIT_XMM;
     }
+    if hcv.is_some() {
+        configured |= strategy_set::BIT_HCV;
+    }
     let mask = requested_mask & configured;
     if mask == 0 {
         return EngineLoopResult::Failed("engine_loop_set: no requested member is configured");
@@ -3467,6 +3480,10 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         // and the names of its perp rows, in row order (boot-only).
         obs.boot.xmm_hash = boot.hash;
         obs.boot.set_xmm_coins(boot.coins.join(",").as_bytes());
+    }
+    if let Some(boot) = hcv {
+        // HC11: the artifact's identity on `/state` (`boot.hcv_hash`).
+        obs.boot.hcv_hash = boot.hash;
     }
 
     let mut set = strategy_set::StrategySet::new(mask);
@@ -3703,6 +3720,51 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
     }
+    if let Some(boot) = hcv {
+        // HC11 (O-HC18): slot 7 — DARK, paper only (a live slot 7 refuses
+        // the boot in `exec_boot`). The wall anchor is taken HERE, once,
+        // right before the loop: every expiry the member compares is
+        // wall. The calendar arrives from the `hcv-events` thread by
+        // mailbox — the engine thread never opens the file; a reader that
+        // did not spawn leaves the member without one, and under the
+        // event law it then trades nothing (fail closed).
+        let mut params = boot.params.clone();
+        params.anchor = core_time::WallAnchor::now();
+        if let Err(e) = set.hcv_mut().configure(&params) {
+            tracing::error!(error = %e, "hcv: artifact refused");
+            return EngineLoopResult::Failed("hcv: artifact refused by the strategy");
+        }
+        let (tx, rx) = core_ring::Mailbox::new(Box::new(strategy_hcv::HcvEvents::new())).split();
+        set.hcv_mut().install_events(rx);
+        match crate::hcv_boot::HcvEventsReader::spawn(
+            boot.events_path.clone(),
+            boot.underlyings.clone(),
+            boot.known.clone(),
+            tx,
+        ) {
+            Ok(r) => obs.hcv_events = Some(r),
+            Err(e) => tracing::error!(
+                error = %e,
+                "hcv: the calendar reader did not spawn — under the event law slot 7 trades nothing"
+            ),
+        }
+        tracing::info!("{}", crate::hcv_boot::render_boot_tell(boot));
+        // O-HC22: σ̂ is the HAR set's — a traded underlying no `har.toml`
+        // series serves forecasts nothing and never trades. Told, not
+        // refused (the HAR service's failure isolation).
+        let mut i = 0usize;
+        while i < boot.underlyings.len() {
+            let name = boot.underlyings[i];
+            let served = har.is_some_and(|hb| hb.series.iter().any(|x| x.name == name));
+            if !served {
+                tracing::warn!(
+                    underlying = name,
+                    "hcv: no har.toml series serves this underlying — slot 7 never trades it (O-HC22)"
+                );
+            }
+            i += 1;
+        }
+    }
     if let Some(boot) = xsd {
         // XSD-3: the wall anchor is taken HERE, once — the member's hour
         // grid is UTC-aligned from this instant on (the icdp law). The
@@ -3869,6 +3931,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
         xmm = mask & strategy_set::BIT_XMM != 0,
+        hcv = mask & strategy_set::BIT_HCV != 0,
         "strategy-set: composed"
     );
     run_engine_loop(cons, disp, set, obs)
@@ -4199,6 +4262,7 @@ impl Observability {
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
             let xmm = register_xmm_metrics(&mut reg)?;
+            let hcv = register_hcv_metrics(&mut reg)?;
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
@@ -4308,6 +4372,7 @@ impl Observability {
                 strategy_enabled_mask,
                 vm,
                 xmm,
+                hcv,
                 vrp,
                 xsd,
                 bin15,
@@ -4466,6 +4531,11 @@ pub struct Observability {
     /// loop writes them itself (the pre-H3.7 path). **Taken** by the
     /// engine loop, stopped and joined before its shutdown write.
     pub har_writer: Option<crate::har_writer::HarWriter>,
+    /// HC11: slot 7's calendar reader (`hcv-events`) — it hands the
+    /// member each new `scheduled-events.json` through the mailbox the
+    /// set builder installed. Stopped and joined when this drops, at the
+    /// loop's end. `None` = no hcv member (or its spawn failed).
+    pub hcv_events: Option<crate::hcv_boot::HcvEventsReader>,
     /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
     /// (all-zero: no HAR service) — `/state.har.hash`.
     pub har_hash: [u8; 32],
@@ -4719,6 +4789,8 @@ pub struct EngineCounters {
     /// XMM XH3: the `engine_xmm_*` family (slot 6; it replaced the
     /// retired `engine_icdp_*_total` family).
     pub xmm: XmmMetricIds,
+    /// HC11: the `engine_hcv_*` family (slot 7).
+    pub hcv: HcvMetricIds,
     /// VRP V7: the `engine_vrp_*` family (slot 1).
     pub vrp: VrpMetricIds,
     /// XSD-3: the `engine_xsd_*` family (slot 2).
@@ -6154,6 +6226,134 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
     }
 }
 
+// ---------------------------------------------------------------
+// HC11 — slot-7 observability (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// The counter rows of the hcv family, in [`hcv_counter_values`] order
+/// — which is what pins the two together.
+const HCV_COUNTER_NAMES: [&str; 17] = [
+    "engine_hcv_judged_total",
+    "engine_hcv_sells_total",
+    "engine_hcv_buys_total",
+    "engine_hcv_option_fills_total",
+    "engine_hcv_hedges_total",
+    "engine_hcv_hedge_fills_total",
+    "engine_hcv_unwind_slices_total",
+    "engine_hcv_settlements_total",
+    "engine_hcv_settle_fallbacks_total",
+    "engine_hcv_skip_event_total",
+    "engine_hcv_skip_stale_total",
+    "engine_hcv_skip_forecast_total",
+    "engine_hcv_skip_caps_total",
+    "engine_hcv_skip_stopped_total",
+    "engine_hcv_ctx_refused_total",
+    "engine_hcv_calendars_total",
+    "engine_hcv_har_updates_total",
+];
+
+/// The gauge rows of the hcv family, in [`hcv_gauge_values`] order.
+const HCV_GAUGE_NAMES: [&str; 4] = [
+    "engine_hcv_positions",
+    "engine_hcv_vega_abs_usd_1e6",
+    "engine_hcv_pnl_usd_1e6",
+    "engine_hcv_day_pnl_usd_1e6",
+];
+
+/// `HcvCounters`' counter fields in [`HCV_COUNTER_NAMES`] order.
+// COPY: [u64; 17] (136 B) returned by value — cold, the 5 s /metrics
+// mirror; the xmm precedent (the POD is a struct, not an array).
+fn hcv_counter_values(c: &strategy_core::HcvCounters) -> [u64; 17] {
+    [
+        c.judged,
+        c.sells,
+        c.buys,
+        c.option_fills,
+        c.hedges,
+        c.hedge_fills,
+        c.unwind_slices,
+        c.settlements,
+        c.settle_fallbacks,
+        c.skip_event,
+        c.skip_stale,
+        c.skip_forecast,
+        c.skip_caps,
+        c.skip_stopped,
+        c.ctx_refused,
+        c.calendars,
+        c.har_updates,
+    ]
+}
+
+/// `HcvCounters`' gauge fields in [`HCV_GAUGE_NAMES`] order.
+fn hcv_gauge_values(c: &strategy_core::HcvCounters) -> [i64; 4] {
+    [c.positions, c.vega_abs_usd_1e6, c.pnl_usd_1e6, c.day_pnl_usd_1e6]
+}
+
+/// HC11: the `engine_hcv_*` family (slot 7) — what the member judged,
+/// did and skipped (by cause), and its book: positions, |vega|, the
+/// marked P&L and the day's.
+#[derive(Copy, Clone, Debug)]
+pub struct HcvMetricIds {
+    /// The counters, in [`HCV_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 17],
+    /// The gauges, in [`HCV_GAUGE_NAMES`] order.
+    pub gauges: [core_metrics::GaugeId; 4],
+}
+
+/// Register the hcv family. Boot-only.
+fn register_hcv_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<HcvMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 17];
+    let mut i = 0usize;
+    while i < HCV_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(HCV_COUNTER_NAMES[i])
+            .map_err(|_| "register hcv counter")?;
+        i += 1;
+    }
+    let mut gauges = [core_metrics::GaugeId::default(); 4];
+    let mut k = 0usize;
+    while k < HCV_GAUGE_NAMES.len() {
+        gauges[k] = reg
+            .register_gauge(HCV_GAUGE_NAMES[k])
+            .map_err(|_| "register hcv gauge")?;
+        k += 1;
+    }
+    Ok(HcvMetricIds { counters, gauges })
+}
+
+/// Mirror the hcv family: the counters as monotonic deltas of the
+/// member's cumulative ones, the gauges as levels. 5 s cadence — cold.
+fn mirror_hcv_metrics<S: strategy_core::StrategyCounters>(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &HcvMetricIds,
+    strat: &S,
+    last: &mut strategy_core::HcvCounters,
+) {
+    // COPY: the 168 B `HcvCounters` read into `cur`, then kept as the
+    // next delta's baseline — 5 s cadence, cold; a delta needs the
+    // previous value (the xmm precedent).
+    let mut cur = strategy_core::HcvCounters::default();
+    strat.hcv_counters(&mut cur);
+    let c = hcv_counter_values(&cur);
+    let l = hcv_counter_values(last);
+    let mut i = 0usize;
+    while i < c.len() {
+        reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
+        i += 1;
+    }
+    let g = hcv_gauge_values(&cur);
+    let mut k = 0usize;
+    while k < g.len() {
+        reg.gauge(ids.gauges[k]).set(g[k]);
+        k += 1;
+    }
+    // COPY: 168 B — the next delta's baseline (see above).
+    *last = cur;
+}
+
 /// HYPARB H6: coins carried by the per-coin gauges (the first N configured;
 /// `/state` carries all eight).
 pub const HYPARB_METRIC_COINS: usize = 4;
@@ -7456,6 +7656,8 @@ fn fill_snapshot<S, D>(
     // (a quote and the touch it was placed against can never disagree).
     Sc::xmm_counters(strat, &mut out.xmm.counters);
     out.xmm.n_perps = Sc::xmm_perps_view(strat, &mut out.xmm.perps);
+    // HC11: slot 7's counters and gauges.
+    Sc::hcv_counters(strat, &mut out.hcv.counters);
 
     // P6: slot 1. Both halves come from the same publish instant, so a
     // strike and the position held against it can never disagree.
@@ -8017,6 +8219,8 @@ where
     let mut vm_last = VmCountersSnapshot::default();
     // XMM XH3 slot-6 family delta snapshot (same bookkeeping).
     let mut xmm_last = strategy_core::XmmCounters::default();
+    // HC11 slot-7 family delta snapshot (same bookkeeping).
+    let mut hcv_last = strategy_core::HcvCounters::default();
     let mut vrp_last = strategy_core::VrpCounters::default();
     // VRP V8a: the persisted-state writer. The epoch starts at whatever
     // the member came up with, so a boot that changed nothing rewrites
@@ -8251,6 +8455,7 @@ where
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
                 mirror_xmm_metrics(reg, &ids.xmm, eng.strategy(), &mut xmm_last);
+                mirror_hcv_metrics(reg, &ids.hcv, eng.strategy(), &mut hcv_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
@@ -8916,6 +9121,12 @@ pub mod boot_discovery {
         /// of waiting for the next lifecycle push. Empty when the
         /// venue is off or no row parsed.
         pub hl_outcome_specs: Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
+        /// HC11: `(coin, szDecimals)` of every configured Hyperliquid
+        /// perp whose size decimals the venue stated — a native perp from
+        /// `meta`, a builder-dex perp from its dex's own meta (HC10); a
+        /// builder coin whose dex meta did not load is absent. Slot 7's
+        /// hedge law (lot and price) reads it; empty when HL is off.
+        pub hl_sz_decimals: Vec<(String, u8)>,
         /// Binance coverage (M1 exchangeInfo audit); `None` when the
         /// caller skipped it (legacy flag boots keep their historical
         /// zero-REST Binance behavior — config boots audit).
@@ -9583,6 +9794,7 @@ pub mod boot_discovery {
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
         out_specs: &mut Vec<ingress_hyperliquid::discovery::HlOutcomeSpec>,
+        out_sz: &mut Vec<(String, u8)>,
     ) -> Result<VenueCoverage, &'static str> {
         let (host, port) = split_host_port(&cfg.hyperliquid_api_host, 443)?;
         let mut d = HlDiscovery::new();
@@ -9660,6 +9872,17 @@ pub mod boot_discovery {
             match d.resolve(coin.as_bytes()) {
                 Some(info) => {
                     matched += 1;
+                    // HC11: the size decimals the venue stated (a native
+                    // perp's, or a builder perp's whose dex meta loaded —
+                    // its asset id is then real).
+                    let stated = match info.kind {
+                        ingress_hyperliquid::discovery::HlAssetKind::Perp => true,
+                        ingress_hyperliquid::discovery::HlAssetKind::BuilderDex => info.asset_id != 0,
+                        _ => false,
+                    };
+                    if stated {
+                        out_sz.push(((*coin).to_owned(), info.sz_decimals));
+                    }
                     // WS8 (gaps §2.5 tick/lot): the audit row now
                     // names the venue's size/price granularity for
                     // perps (lot step = 10^-szDecimals; price tick =
@@ -10025,6 +10248,7 @@ pub mod boot_discovery {
         };
 
         let mut hl_outcome_specs = Vec::new();
+        let mut hl_sz_decimals = Vec::new();
         let hl = match hl_spec.map(str::trim).filter(|s| !s.is_empty()) {
             Some(spec) => Some(run_hl(
                 cfg,
@@ -10033,6 +10257,7 @@ pub mod boot_discovery {
                 &mut buf,
                 &mut any_missing,
                 &mut hl_outcome_specs,
+                &mut hl_sz_decimals,
             )?),
             None => None,
         };
@@ -10121,6 +10346,7 @@ pub mod boot_discovery {
             deribit_options,
             hl,
             hl_outcome_specs,
+            hl_sz_decimals,
             bn,
             bn_options,
             bybit: bybit_cov,

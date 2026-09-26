@@ -78,6 +78,12 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "xmm",
     "ai+xmm",
     "ai+vrp+xsd+bin15+hyparb+xmm",
+    // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/hcv.toml`
+    // (or `--hcv`); in no configured mask until the operator names it.
+    "hcv",
+    "ai+hcv",
+    "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
 ];
 
 /// Top-level CLI.
@@ -1007,6 +1013,19 @@ struct RunArgs {
     /// (O-XH1): `backtest --member icdp` keeps its own `--icdp`.
     #[arg(long)]
     xmm: Option<PathBuf>,
+    /// HC11: the slot-7 parameter artifact (`~/multivenue/hcv.toml` by
+    /// default; `hcv.toml.example`). Read only when the requested mask
+    /// carries the hcv bit (`--strategy hcv` / `ai+hcv` / … / `all`); an
+    /// absent or unresolvable artifact refuses the boot with the bit set
+    /// (the icdp/F19 law). Paper only: a live slot 7 refuses (O-HC18).
+    #[arg(long)]
+    hcv: Option<PathBuf>,
+    /// HC11: the calendar slot 7's event law reads — the news lane's
+    /// `scheduled-events.json` (`~/multivenue/worker/news/…` by default;
+    /// name it when the worker runs with `CLAUDE_WORKER_NEWS_DIR`). Read
+    /// only when the requested mask carries the hcv bit.
+    #[arg(long)]
+    hcv_events: Option<PathBuf>,
     /// RG2: the regime detector's parameter artifact
     /// (`~/multivenue/regime.toml` by default; `docs/regime-and-dashboard-plan.md`
     /// §4.6). Set boots only. An ABSENT default file boots the detector
@@ -3964,6 +3983,9 @@ fn run(args: RunArgs) -> ExitCode {
             hl_families,
             statuses.hl_roll.clone(),
             hl_wall_anchor,
+            // HC11: slot 7 reads each underlying's oracle off the MARK.
+            strategy_set::mask_for_name(&args.strategy)
+                .is_some_and(|m| m & strategy_set::BIT_HCV != 0),
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
@@ -4620,6 +4642,44 @@ fn run(args: RunArgs) -> ExitCode {
                 join_reverse(handles);
                 return ExitCode::from(1);
             }
+            // HC11: slot 7's artifact — its hedges resolved against the
+            // SAME descriptor table (D-6 truth), their szDecimals from this
+            // boot's Hyperliquid discovery, its options this boot's
+            // Hypercall chain. Only when the bit is requested.
+            let hcv_boot = if cli::hcv_boot::hcv_wanted(requested) {
+                match cli::hcv_boot::load_hcv_boot(
+                    args.hcv.as_deref(),
+                    args.hcv_events.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                    &|coin: &str| {
+                        discovery
+                            .hl_sz_decimals
+                            .iter()
+                            .find(|(c, _)| c == coin)
+                            .map(|(_, sz)| *sz)
+                    },
+                    &discovery.hypercall_options,
+                    &boot.hypercall_options.underlyings,
+                ) {
+                    Ok(b) => b,
+                    Err(reason) => {
+                        error!(reason, "hcv: artifact refused — boot aborted");
+                        join_reverse(handles);
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                None
+            };
+            // The same law for slot 7.
+            if cli::hcv_boot::hcv_wanted(requested) && hcv_boot.is_none() {
+                error!(
+                    "hcv: requested by --strategy but the artifact is absent \
+                     (~/multivenue/hcv.toml or --hcv) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG2: the regime detector's artifact + seed, resolved
             // against the same descriptor table (D-6 truth). An absent
             // DEFAULT file is legal (unconfigured); an explicit path
@@ -4949,6 +5009,7 @@ fn run(args: RunArgs) -> ExitCode {
                         xsd_boot.as_ref(),
                         bin15_boot.as_ref(),
                         xmm_boot.as_ref(),
+                        hcv_boot.as_ref(),
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
                         har_boot.as_ref(),
@@ -5037,6 +5098,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
                                 xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
@@ -5062,6 +5124,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
                                 xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
@@ -5090,6 +5153,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
                                 xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
@@ -5126,6 +5190,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
                                 xmm_boot.as_ref(),
+                                hcv_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                                 har_boot.as_ref(),
@@ -5251,7 +5316,31 @@ mod strategy_name_pin {
                 "ai+xmm",
                 strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_XMM,
             ),
-            ("ai+vrp+xsd+bin15+hyparb+xmm", strategy_set::BUILT_MASK),
+            (
+                "ai+vrp+xsd+bin15+hyparb+xmm",
+                strategy_set::BUILT_MASK & !strategy_set::BIT_HCV,
+            ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// HC11 (O-HC18): the three slot-7 names resolve to bit 7, and the
+    /// widest one composes every slot.
+    #[test]
+    fn the_hcv_names_resolve() {
+        let want = [
+            ("hcv", strategy_set::BIT_HCV),
+            (
+                "ai+hcv",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_HCV,
+            ),
+            ("ai+vrp+xsd+bin15+hyparb+xmm+hcv", strategy_set::BUILT_MASK),
         ];
         let mut i = 0;
         while i < want.len() {

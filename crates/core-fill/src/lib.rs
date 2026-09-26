@@ -67,6 +67,9 @@
 
 pub mod amm;
 pub mod queue;
+/// HC11 (O-HC21): Hypercall's held-quote IoC law — the quote in force
+/// 2 s after submit decides.
+pub mod held;
 
 pub use amm::{amm_pool_index, AmmBook, AmmBookCounters, AmmObs, AmmVerdict, AMM_MAX_POOLS};
 pub use queue::{

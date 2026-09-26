@@ -72,6 +72,8 @@ core-fill            = { workspace = true }
 strategy-hyparb      = { workspace = true }
 # XMM XH1: the slot-6 member rides the set's trade / order-event / timer gate.
 strategy-xmm         = { workspace = true }
+# HC11 gate 85: the slot-7 member over the paper held-quote law.
+strategy-hcv         = { workspace = true }
 # HYPARB H7c gate 71: the EVM write path either side of the socket.
 # H9 gate 72: its `testnode` serves the HttpsPost cycle from a CHILD
 # process (a server thread here would allocate under the global count).

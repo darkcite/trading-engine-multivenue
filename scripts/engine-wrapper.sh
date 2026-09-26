@@ -144,6 +144,14 @@ fi
 # paper queue law; XH3 runs it in paper (the runbook: docs/risk-policy.md,
 # XMM "XH3 amendment" — every descriptor must resolve or the WHOLE boot
 # refuses). A live slot 6 refuses the boot until XH4.
+#
+# HC11 (2026-09-26): slot 7 is the hcv member — Hypercall S1, DARK: paper
+# only and in no configured mask (O-HC18). Its names (`hcv`, `ai+hcv`,
+# `ai+vrp+xsd+bin15+hyparb+xmm+hcv`) are here so switching it on is ONE
+# strategy.conf line. Its artifact is ~/multivenue/hcv.toml (absent with
+# the bit REQUESTED refuses the boot — the F19 law); its hedges must be in
+# universe.toml [hyperliquid] coins and its options in [hypercall]. A live
+# slot 7 refuses the boot (exec_boot).
 STRATEGY="ai"
 if [ -f "$HOME/multivenue/strategy.conf" ]; then
   . "$HOME/multivenue/strategy.conf"
@@ -174,7 +182,8 @@ case "$STRATEGY" in
   bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
   hyparb|ai+hyparb|ai+vrp+xsd+bin15+hyparb) ;;
   xmm|ai+xmm|ai+vrp+xsd+bin15+hyparb+xmm) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb, xmm, ai+xmm, ai+vrp+xsd+bin15+hyparb+xmm)" >&2; exit 78 ;;
+  hcv|ai+hcv|ai+vrp+xsd+bin15+hyparb+xmm+hcv) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb, xmm, ai+xmm, ai+vrp+xsd+bin15+hyparb+xmm, hcv, ai+hcv, ai+vrp+xsd+bin15+hyparb+xmm+hcv)" >&2; exit 78 ;;
 esac
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's
@@ -341,4 +350,30 @@ if [ -n "${XMM_TOML:-}" ]; then
   esac
   XMM_ARGS=(--xmm "$XMM_TOML")
 fi
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}"
+# HC11 (2026-09-26): slot 7's artifact and calendar, the XMM_TOML shape.
+# ~/multivenue/hcv.toml and the news lane's scheduled-events.json are the
+# defaults whenever STRATEGY carries hcv; HCV_TOML=<path> and
+# HCV_EVENTS=<path> in strategy.conf name others. Each must be a file,
+# and STRATEGY must carry hcv. Paper only: nothing here can arm slot 7.
+HCV_ARGS=()
+if [ -n "${HCV_TOML:-}${HCV_EVENTS:-}" ]; then
+  case "$STRATEGY" in
+    *hcv*) ;;
+    *) echo "engine-wrapper: refusing — HCV_TOML/HCV_EVENTS without hcv in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+fi
+if [ -n "${HCV_TOML:-}" ]; then
+  if [ ! -f "$HCV_TOML" ]; then
+    echo "engine-wrapper: refusing — HCV_TOML=$HCV_TOML is not a file" >&2
+    exit 78
+  fi
+  HCV_ARGS+=(--hcv "$HCV_TOML")
+fi
+if [ -n "${HCV_EVENTS:-}" ]; then
+  if [ ! -f "$HCV_EVENTS" ]; then
+    echo "engine-wrapper: refusing — HCV_EVENTS=$HCV_EVENTS is not a file" >&2
+    exit 78
+  fi
+  HCV_ARGS+=(--hcv-events "$HCV_EVENTS")
+fi
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}" "${HCV_ARGS[@]}"

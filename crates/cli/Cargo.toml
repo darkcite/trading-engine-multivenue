@@ -52,6 +52,8 @@ strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }
 # XMM XH1: the slot-6 member's params, built by `xmm_boot`.
 strategy-xmm         = { workspace = true }
+# HC11: the slot-7 member (Hypercall S1 — DARK, paper only).
+strategy-hcv         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }

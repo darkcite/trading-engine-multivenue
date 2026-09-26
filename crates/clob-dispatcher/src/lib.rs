@@ -1308,6 +1308,11 @@ pub struct PaperMatcher {
     /// Its own table (32 orders, 8 symbols): the queue member cannot
     /// crowd the strict-cross members' 64 slots, nor they its.
     queue: core_fill::QueueBook,
+    /// HC11 (O-HC21): Hypercall IoCs, judged by the held-quote law —
+    /// the provider's quote in force 2 s after submit
+    /// (`core_fill::held`). Its own table: the strict-cross members'
+    /// 64 slots are not shared with it.
+    held: core_fill::held::HeldBook,
     /// XMM XH2: order events waiting for [`Self::try_next_order_event`],
     /// FIFO.
     events: [core_types::OrderEvent; ORDER_EVENT_OUT],
@@ -1364,6 +1369,7 @@ impl PaperMatcher {
             seq: 0,
             amm: core_fill::AmmBook::new(),
             queue: core_fill::QueueBook::new(),
+            held: core_fill::held::HeldBook::new(),
             events: [EMPTY_ORDER_EVENT; ORDER_EVENT_OUT],
             ev_head: 0,
             ev_len: 0,
@@ -1418,10 +1424,37 @@ impl PaperMatcher {
         // order on it is ever modelled, exactly as the harness's
         // `tradeable_venue_byte` refuses it. Before MX2 the byte sat past
         // the table's end and was refused by the length check; this
-        // keeps that behaviour bit for bit. HC1 / O-HC1: Hypercall (venue
-        // byte 9) is data-only on the same terms — it too gained a slot
-        // (VENUE_COUNT 9 → 10) and is refused explicitly for the same
-        // reason.
+        // keeps that behaviour bit for bit.
+        //
+        // HC11 (O-HC21): a Hypercall (venue byte 9) IoC is judged by the
+        // held-quote law in its own table; anything else on Hypercall —
+        // a maker, which the venue cannot honour post-only — is
+        // unmodellable.
+        if venue == core_types::VenueId::Hypercall.to_u8() {
+            if order.kind == core_fill::ORDER_KIND_IOC && px > 0 && qty > 0 {
+                let o = core_fill::held::HeldOrder::new(
+                    now_ns.saturating_add(core_fill::held::HELD_DELAY_NS),
+                    order.sym,
+                    order.side,
+                    px,
+                    qty,
+                    order.client_oid,
+                    order.strategy_id,
+                    order.venue,
+                );
+                if self.held.submit(o) {
+                    self.counters.intake = self.counters.intake.wrapping_add(1);
+                } else if core_fill::held::held_index(order.sym).is_none() {
+                    self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+                } else {
+                    self.counters.rejected_open_cap =
+                        self.counters.rejected_open_cap.wrapping_add(1);
+                }
+            } else {
+                self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            }
+            return;
+        }
         //
         // HYPARB H2: HyperEVM (venue byte 8) takes AMM swaps on a known
         // pool slot and nothing else; every other venue takes makers and
@@ -1434,7 +1467,6 @@ impl PaperMatcher {
         };
         if venue as usize >= core_fill::ACTIVATION_NS_DEFAULT.len()
             || venue == core_types::VenueId::Mexc.to_u8()
-            || venue == core_types::VenueId::Hypercall.to_u8()
             || px <= 0
             || qty <= 0
             || !kind_ok
@@ -1626,6 +1658,19 @@ impl PaperMatcher {
     /// fill pass in emit order over one shared displayed-size budget.
     pub fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         let sym = tick.sym;
+        // HC11 (O-HC21): the held-quote law — every due Hypercall IoC is
+        // judged at the first record of ANY venue STAMPED at or after its
+        // due instant, against the quote held BEFORE this record is
+        // applied (so nothing after the instant leaks into the verdict);
+        // then a Hypercall quote becomes the one in force. The record's
+        // own stamp is the clock, not the drain instant: a quote stamped
+        // before the due instant but drained after it is still in force.
+        if self.held.pending_len() > 0 {
+            self.judge_held(tick.ts_ns, now_ns);
+        }
+        if core_types::symbol_venue_byte(sym) == core_types::VenueId::Hypercall.to_u8() {
+            self.held.on_quote(tick);
+        }
         // XMM XH2: the queue law's book. Every record of the symbol lands
         // what is due (a cancel or an expiry is never held back by a quiet
         // or degraded feed); only fresh two-sided evidence teaches it the
@@ -2057,6 +2102,51 @@ impl PaperMatcher {
         self.counters.fills = self.counters.fills.wrapping_add(1);
     }
 
+    /// HC11: judge the held-quote law's due IoCs (collected first: the
+    /// book and the fill ring are both `self`'s). A fill rides the fill
+    /// lane; a miss is an order event — `CANCELED`, reason `EXPIRED` — so
+    /// the member frees the instrument at the verdict instead of on a
+    /// timer.
+    fn judge_held(&mut self, stamp_ns: NsTs, now_ns: NsTs) {
+        let mut due = [(0u64, core_types::SYMBOL_ID_NONE, Side::Bid, 0u8, core_fill::Verdict::Cancel);
+            core_fill::held::HELD_PENDING];
+        let mut n = 0usize;
+        self.held.judge_due(stamp_ns, |o, v| {
+            if n < due.len() {
+                due[n] = (o.client_oid, o.sym, o.side, o.strategy_id, v);
+                n += 1;
+            }
+        });
+        let mut k = 0usize;
+        while k < n {
+            let (oid, sym, side, slot, v) = due[k];
+            match v {
+                core_fill::Verdict::Fill { px_1e6, qty_1e6 } => {
+                    self.push_fill_of(sym, side, oid, slot, px_1e6, qty_1e6, now_ns);
+                }
+                _ => {
+                    self.counters.ioc_canceled = self.counters.ioc_canceled.wrapping_add(1);
+                    self.push_event(
+                        now_ns,
+                        sym,
+                        oid,
+                        slot,
+                        core_types::ORDER_EVENT_CANCELED,
+                        core_types::ORDER_EVENT_REASON_EXPIRED,
+                    );
+                }
+            }
+            k += 1;
+        }
+    }
+
+    /// Hypercall IoCs pending under the held-quote law (tests, `/state`).
+    #[inline]
+    #[must_use]
+    pub const fn held_pending(&self) -> usize {
+        self.held.pending_len()
+    }
+
     /// Remove open slot `i`, shifting the tail left so emit order — the
     /// FIFO priority — is preserved.
     #[inline]
@@ -2077,7 +2167,8 @@ pub struct PaperDispatcher {
     /// X1: the matcher. Inline rather than boxed — the dispatcher is
     /// itself boot-constructed once by the engine, and its fixed arrays
     /// (≈ 60 KiB since XMM XH2: the strict table, the fill and
-    /// order-event rings, the AMM and queue books) are the same memory
+    /// order-event rings, the AMM and queue books; ≈ 93 KiB since HC11's
+    /// held-quote book, 1 024 quotes) are the same memory
     /// either way. It moves by value only at boot — handed on a few times
     /// before the loop starts (the boot's `engine_loop_set_full` →
     /// `run_engine_loop` → `Engine::new`, plus `RoutedDispatcher::new` on
@@ -2099,11 +2190,12 @@ impl PaperDispatcher {
         self.matcher.counters_snapshot()
     }
 
-    /// X1: orders the matcher is currently holding.
+    /// X1: orders the matcher is currently holding (HC11: the held-quote
+    /// law's pending IoCs included).
     #[inline]
     #[must_use]
     pub const fn open_orders(&self) -> usize {
-        self.matcher.open_len() + self.matcher.queue_len()
+        self.matcher.open_len() + self.matcher.queue_len() + self.matcher.held_pending()
     }
 
     /// Construct empty.
@@ -2227,7 +2319,7 @@ impl OrderDispatch for PaperDispatcher {
 
     #[inline]
     fn open_paper_orders(&self) -> usize {
-        self.matcher.open_len() + self.matcher.queue_len()
+        self.matcher.open_len() + self.matcher.queue_len() + self.matcher.held_pending()
     }
 }
 
@@ -2430,29 +2522,118 @@ mod tests {
         assert_eq!(m.open_len(), 0);
     }
 
-    /// HC1 / O-HC1: Hypercall gained an activation slot at VENUE_COUNT
-    /// 10 but is data-only — its order is refused as `unroutable`, exactly
-    /// as it was when the byte sat past the table's end.
+    /// HC11 (O-HC21): a Hypercall IoC is taken by the held-quote law (the
+    /// quote in force 2 s after submit decides); a Hypercall maker — the
+    /// venue has no post-only — and an index symbol are unroutable.
     #[test]
-    fn a_hypercall_order_is_unroutable_data_only() {
+    fn a_hypercall_ioc_fills_at_the_quote_held_two_seconds_later() {
         let mut m = PaperMatcher::new();
-        let sym = core_types::make_symbol_id(VenueId::Hypercall, 512);
-        for kind in [core_fill::ORDER_KIND_IOC, core_fill::ORDER_KIND_MAKER] {
-            let o = Order::new(
+        let opt = core_types::make_symbol_id(VenueId::Hypercall, 513);
+        let idx = core_types::make_symbol_id(VenueId::Hypercall, 3);
+        let tick = |bid: i64, ask: i64, ts: u64| {
+            Tick::new_stamped(
+                ts,
+                VenueId::Hypercall,
+                opt,
+                0,
+                Price::from_raw(bid),
+                Qty::from_raw(4_000_000),
+                Price::from_raw(ask),
+                Qty::from_raw(4_000_000),
+                0,
+                0,
+            )
+        };
+        let order = |kind, sym| {
+            let mut o = Order::new(
                 1_000,
                 VenueId::Hypercall,
                 sym,
                 Side::Bid,
                 kind,
-                Price::from_raw(1_000_000),
+                Price::from_raw(1_050_000),
                 Qty::from_raw(1_000_000),
-                1,
+                77,
             );
-            m.submit(&o, 1_000);
-        }
+            o.strategy_id = 7;
+            o
+        };
+        m.observe_tick(&tick(900_000, 1_100_000, 500), 500);
+        m.submit(&order(core_fill::ORDER_KIND_MAKER, opt), 1_000);
+        m.submit(&order(core_fill::ORDER_KIND_IOC, idx), 1_000);
         assert_eq!(m.counters.unroutable, 2);
-        assert_eq!(m.counters.intake, 0);
-        assert_eq!(m.open_len(), 0);
+        m.submit(&order(core_fill::ORDER_KIND_IOC, opt), 1_000);
+        assert_eq!((m.counters.intake, m.held_pending()), (1, 1));
+        // The quote improves inside the 2 s; a record before the due
+        // instant judges nothing.
+        m.observe_tick(&tick(950_000, 1_040_000, 1_000_000_000), 1_000_000_000);
+        assert!(m.try_next_fill().is_none());
+        // Due at 1_000 + 2 s: the record at that instant is judged against
+        // the quote in force BEFORE it (1.04), not its own (1.20).
+        // A quote stamped just BEFORE the due instant but drained after it
+        // is still the one in force: nothing is judged on it…
+        m.observe_tick(&tick(960_000, 1_030_000, 2_000_000_999), 2_000_005_000);
+        assert!(m.try_next_fill().is_none());
+        m.observe_tick(&tick(1_150_000, 1_200_000, 2_000_001_000), 2_000_006_000);
+        let f = m.try_next_fill().expect("filled at the held ask");
+        // …and the verdict reads it (1.03), not the next record's (1.20).
+        assert_eq!((f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id), (1_030_000, 1_000_000, 77, 7));
+        assert_eq!(f.origin, core_types::FILL_ORIGIN_PAPER);
+        assert_eq!(m.held_pending(), 0);
+        let mut ev = core_types::OrderEvent::ZERO;
+        assert!(!m.try_next_order_event(&mut ev), "a fill is no order event");
+        // Worse than the limit at the due instant: nothing — and the miss
+        // is told to the slot as an expiry.
+        m.submit(&order(core_fill::ORDER_KIND_IOC, opt), 3_000_000_000);
+        m.observe_tick(&tick(1_150_000, 1_200_000, 5_000_000_001), 5_000_000_001);
+        assert!(m.try_next_fill().is_none());
+        assert_eq!(m.counters.ioc_canceled, 1);
+        assert!(m.try_next_order_event(&mut ev));
+        assert_eq!(
+            (ev.kind, ev.reason, ev.client_oid, ev.strategy_id, ev.venue),
+            (
+                core_types::ORDER_EVENT_CANCELED,
+                core_types::ORDER_EVENT_REASON_EXPIRED,
+                77,
+                7,
+                VenueId::Hypercall.to_u8()
+            )
+        );
+    }
+
+    /// HC11: a Hypercall IoC waiting for its held-quote verdict is an open
+    /// paper order (the engine's shutdown drain and `/metrics` read it).
+    #[test]
+    fn a_held_ioc_counts_as_open_until_its_verdict() {
+        let mut d = PaperDispatcher::new();
+        let opt = core_types::make_symbol_id(VenueId::Hypercall, 513);
+        let mut o = Order::new(
+            1_000,
+            VenueId::Hypercall,
+            opt,
+            Side::Bid,
+            core_fill::ORDER_KIND_IOC,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            5,
+        );
+        o.strategy_id = 7;
+        OrderDispatch::submit(&mut d, &o).expect("the paper dispatcher takes it");
+        assert_eq!((OrderDispatch::open_paper_orders(&d), d.open_orders()), (1, 1));
+        let t = Tick::new_stamped(
+            2_000_001_000,
+            VenueId::Hypercall,
+            opt,
+            0,
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            Price::from_raw(0),
+            Qty::from_raw(0),
+            0,
+            0,
+        );
+        OrderDispatch::observe_tick(&mut d, &t, 2_000_001_000);
+        assert_eq!(OrderDispatch::open_paper_orders(&d), 0, "judged: a miss, gone");
     }
 
     /// One tick's displayed size cannot fill two orders twice, and the

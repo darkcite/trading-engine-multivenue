@@ -63,6 +63,9 @@ pub mod vrp_boot;
 pub mod xsd_boot;
 /// XMM XH1: the slot-6 member's boot (`xmm.toml` → `XmmParams`).
 pub mod xmm_boot;
+/// HC11: the slot-7 member's boot (`hcv.toml` → `HcvParams`) and its
+/// calendar reader thread.
+pub mod hcv_boot;
 
 pub use paper::{
     bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,

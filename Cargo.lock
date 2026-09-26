@@ -170,6 +170,7 @@ dependencies = [
  "strategy-core",
  "strategy-cross-arb",
  "strategy-ev",
+ "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-latency-arb",
@@ -369,6 +370,7 @@ dependencies = [
  "strategy-bin15",
  "strategy-core",
  "strategy-ev",
+ "strategy-hcv",
  "strategy-hyparb",
  "strategy-icdp",
  "strategy-rule-tree",
@@ -1994,6 +1996,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "strategy-hcv"
+version = "0.1.0"
+dependencies = [
+ "core-fill",
+ "core-ring",
+ "core-settle",
+ "core-time",
+ "core-types",
+ "strategy-core",
+]
+
+[[package]]
 name = "strategy-hyparb"
 version = "0.1.0"
 dependencies = [
@@ -2050,6 +2064,7 @@ dependencies = [
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",
+ "strategy-hcv",
  "strategy-hyparb",
  "strategy-vm",
  "strategy-vrp",

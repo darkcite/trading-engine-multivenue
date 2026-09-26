@@ -6549,7 +6549,151 @@ The arm's laws, which bind the verbs now and the engine later:
 * **The rate governor.** It enforces the Default tier as a SLIDING 60 s window on the monotonic clock, assuming one venue replica:
   * places stop at 90 % of 60 orders and 600 requests;
   * cancels are exits and pass up to 120 cancels and 600 requests, even during a 429 back-off (5 s; `Retry-After` is not read — `HttpsReq` returns no headers).
-* **Nonces.** `max(ms × 1000, last + 1)`, below 2^53 (the SDK's JS `Number`), never on a zero clock.
+* **Nonces.** The wall clock in ms — `max(now_ms, last + 1)` — below 2^53 (the SDK's JS `Number`), never on a zero clock. MEASURED: the venue bounds the nonce by its own command clock in ms; the first dust smoke, signed with `ms × 1000`, was refused "nonce … is outside time bounds for signer … (command_ts=<ms>)" with its signature accepted (fix `84fc32b`).
 
 - **Gates:** unit and TLS-loopback tests, fuzz `hypercall_response` and `hypercall_userws`, alloc gate 84 (render + sign + scans at 0 B/op), and `make copy-audit` over the crate.
 - **Deferred:** MMP, because SDK 0.1.0 has no `SetMmpConfig` field order. RFQ, because S1 routes `best_execution`.
+- **Mainnet proof, 2026-09-26 (operator, after the nonce fix):** `dust --symbol BTC-20260927-83000-P --confirm` PASS — an agent (`0x97f4…19ee`) signing for the owner wallet (`0x4479…5644`, $5 USDC), the `book_only` bid accepted (order 31965), cancelled by client id (`CANCELED`, nothing filled), 3 order updates on the private socket, the reconcile agreed before and after, 0 fills, 0 orphans. The owner and the signer are separate: the arm authenticates the socket and reads the portfolio as the OWNER, and signs as the agent the owner approved in the venue's app.
+
+## HYPERCALL — slot 7, the S1 member (HC11, rulings O-HC18..O-HC23, 2026-09-26): DARK, paper only
+
+`crates/strategy-hcv` (`HcvStrategy`) is slot 7 of the set. Its names are
+`hcv`, `ai+hcv` and `ai+vrp+xsd+bin15+hyparb+xmm+hcv`; `all` (`BUILT_MASK`
+= 255) composes it too, inert without its artifact.
+
+**DARK (O-HC18).** Paper only and in no configured mask: `strategy.conf` is
+untouched. `exec_boot` refuses a live slot 7 whatever venues it names, and
+the engine never arms the Hypercall order arm. Arming it is its own ruling,
+which must settle: an options row in the E6 ledger; a reconciled HL perp
+account for its hedges; `VenueSplit`; hedge-fill attribution by client id
+(paper matches the member's `client_oid`); and the R1 gate — the harness
+mirror (`backtest --member hcv`) is its prerequisite and is not built.
+
+**Boot.** Only with `~/multivenue/hcv.toml` (or `--hcv`); requested but
+absent refuses (the F19 law). Every traded underlying's hedge must resolve
+in the boot universe — `hyperliquid:xyz:<U>` for the eight equities, BTC and
+ETH native (O-HC20: `[hyperliquid] coins` gains the eight at go-live) — with
+the `szDecimals` the venue stated at this boot's discovery, or the boot
+refuses. The options are the boot's own Hypercall chain; an untraded
+underlying's (BABA, BOT) are counted in the tell. The wall anchor is taken
+right before the loop.
+
+**The decision (O-HC23, every knob in `hcv.toml`).** Per option whose quote
+or underlying moved, inside the policy — |ln K/S| ≤ 5 %, tenor 1–40 d, a
+live uncrossed provider quote, a fresh oracle and a live HL touch, a
+forecast, and the **event law**: an event of the underlying in (t, T] — or a
+calendar that is missing, older than 2 h, or does not vouch for (t, T] — is
+no trade:
+
+- `g_sell = σ_bid − σ̂(τ)`, `g_buy = σ̂(τ) − σ_ask` (Black–Scholes, r = 0,
+  the implied vol by bracketed Newton);
+- at `g ≥ θ` (5 vol points) ONE IoC at the quote — a sale at the bid, a
+  purchase at the ask — and **one IoC in flight per underlying** until its
+  verdict (its fill, the paper law's expiry event, or 5 s): every cap below
+  reads the book that verdict moves, and its new risk counts in the gross
+  premium meanwhile.
+
+**σ̂ (O-HC22).** The HAR set's rows, handed to slot 7 by the set whenever a
+row moves (law L4 lifted for slot 7 alone): the fit where fitted, the raw
+fold otherwise; a cold series forecasts nothing. Interpolated in total
+variance across the 1–40 d tenors, flat beyond them.
+
+**Sizing and the caps.** The displayed size and the clip ($5 of premium);
+then the gross-premium cap ($50 — the premium at stake is each position's
+ENTRY BASIS, plus the in-flight IoC's new risk at its limit), the
+per-underlying |net vega| cap ($20 a vol point) and the one-day 10σ stress:
+the size halves until the stress loss fits the tail cap ($20) or the trade
+lowers it. A **reduce** passes the premium cap (a reduce lowers the basis at
+stake) and never flips through zero, but NOT the vega and stress laws: net
+vega is not the position — selling one leg of a vega-neutral pair raises
+it — so a reduce may leave |net vega| and the stress no worse than the cap
+or than now, and is halved until it does.
+
+**Stops.** The day's marked P&L at or below −$20 stops new risk; `kill = 1`
+stops it at boot; per underlying, a stale or crossed provider quote, a stale
+oracle or a stale touch stops it (the dead-man). **Hedging continues under
+every stop, and so do reduces** (a buy-back of a short is closing risk).
+
+**The calendar fails closed.** A row naming an underlying outside `[hypercall]
+underlyings` (a misspelt "SPX" for "SP500") refuses the whole calendar — the
+last good one stays until it is older than 2 h, and then nothing trades.
+
+**Liveness, not age.** A tick is a BBO CHANGE (both ingresses' tick law): a
+quote the venue keeps re-pushing unchanged emits nothing. So a provider
+quote stands while the Hypercall FEED is alive (any instrument's tick within
+`quote_stale_ms`), and a hedge touch while the HL feed is (`oracle_stale_ms`);
+a quote or touch the ingress marked STALE is none; the oracle is judged by
+its own prints' age. Known gap, for R1 to measure: the Hypercall ingress
+emits nothing for a push with neither side, so a quote withdrawn on both
+sides at once stands in the member — and in the held-quote law — until its
+next change.
+
+**The hedge.** Never before a fill (the VRP F7 lesson). Per underlying the
+net delta — options at their mid IV (else σ̂), plus the perp — is kept
+inside **±0.10 per contract held**: O-HC23's "±0.10 delta" read per contract,
+so the band means the same on a $100 and a $100 000 underlying (read in raw
+underlying units it would never hedge BTC or ETH at these sizes — the
+reading awaits the operator's word). An IoC crosses the touch by 10 bps,
+rounded by the HL price law and the lot, never below $10 notional; its ttl
+is the member's own release (5 s), so the paper law expires a released hedge
+before its successor can fill beside it. A held option that cannot be
+priced (no live two-sided quote, no σ̂) leaves the delta unknown: the hedge
+is held, not traded on part of it. Over the final 30 minutes the options'
+delta decays in one-minute slices and every slice re-hedges, so the hedge's
+average exit tracks the settlement's average; a slice under $10 carries into
+the next; at T the option leaves the delta and the band, and the last
+slice's residual closes there.
+
+**Settlement (paper, in the member).** A `core_settle::SettleWindow` per
+held expiry, sampled on the 1 s sample-and-hold grid from T − 30 min − 5 s
+to T; at T + 60 s each position is booked at intrinsic on the median of
+means (`settle_order`, the HC7 gate's pick). A window under 90 % coverage —
+or none — counts in `settle_fallbacks` (no window: the last oracle).
+
+**Paper fills (O-HC21) — `core_fill::held`.** A Hypercall IoC is judged at
+submit + 2 s against the provider quote in force then (sample-and-hold: the
+due record's own quote is applied after), up to its displayed size. A stale
+quote is no quote; a miss is an order event (`CANCELED`, `EXPIRED`) back to
+the slot; a Hypercall maker is unmodellable. Only slot 7 emits Hypercall
+orders.
+
+**Money.** Premiums are USD per 1-unit contract; τ counts 365.25-day years
+(the HAR set's annualiser). The marked P&L is cash + options at their mid
+IV (else σ̂) + perps at the oracle — an expired position not yet booked at
+its intrinsic on the fixed settlement (else the oracle), never at a stale
+premium; the day's is that less its value at the first timer of the UTC
+day.
+
+**Observability.** `/state` `hcv` (configured, the artifact hash, 17
+counters, 4 gauges) and `slots[7]` named `hcv`; `engine_hcv_*` (17 counters,
+4 gauges); the boot tell `hcv: artifact configured …`. The calendar is read
+by the `hcv-events` thread on each change of `scheduled-events.json` and
+handed over a `core_ring::Mailbox` — the engine thread never opens the file.
+
+**Known gaps — each blocks switching slot 7 on (or is R1's to measure):**
+
+1. **The book is per session.** Nothing persists across the engine's three
+   daily restarts (00:10 / 08:30 / 16:05Z), and every position opens at
+   least a day before its expiry — so on the live paper engine no position
+   reaches its settlement, and each session starts flat with fresh headroom.
+   The book must persist (keyed by instrument name, strike, expiry and right —
+   the chain's ordinals are re-allocated every boot) before slot 7 goes into
+   any mask (HC11b).
+2. The final-window delta is the European delta scaled by the fraction of
+   the average still to come, not an average-price (Asian) delta on the
+   running mean's effective strike: R1 measures how well the TWAP tracks.
+3. No cost term: HL taker fees and funding are not booked, and Hypercall's
+   fee is `0:0` UNVERIFIED (O-HC7) — R1 carries both.
+4. A hedge residual under $10 cannot be closed (the venue minimum), and a
+   stale oracle held in a settlement window counts as coverage.
+
+- **Gates:** `strategy-hcv`'s 37 tests (the laws above and the independent
+  review's eight regressions), the set's slot-7 tests, alloc gate 85 (the
+  member over the held-quote law, 2 400 engine steps with fills, hedges, a
+  TWAP and a settlement, 0 B/op), `make copy-audit` over the crate.
+- **Review (2026-09-26, independent, Opus 5.5):** it found the caps blind to
+  the IoC in flight, reduces bypassing the vega and stress laws, stale-premium
+  marking of expired positions, a venue-blind option index, a residual hedge
+  after T, the day stop blocking buy-backs, paper hedge IoCs that never
+  expired, hedging on a partial delta, and a calendar that failed open on a
+  misspelt name — all fixed above; the per-session book is gap 1.

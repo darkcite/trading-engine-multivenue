@@ -4,7 +4,7 @@
 //! The `/state` snapshot POD (plan §6.1 sections: `boot`, `regime`,
 //! `slots`, `vm`, `xmm` (was `icdp` until schema 2), `ai`, `ingress`,
 //! `latency`, `recent`, `capture`; later additive sections: `vrp`, `hyparb`,
-//! `exec`, `har`). Every field is a plain integer, a fixed array or an
+//! `exec`, `har`, `hcv` (HC11)). Every field is a plain integer, a fixed array or an
 //! embedded `#[repr(C)]` POD from `core-types` / `strategy-core`;
 //! `Copy` throughout so the seqlock can copy it whole.
 //!
@@ -14,7 +14,8 @@
 
 use core_types::{Fill, Order};
 use strategy_core::{
-    HarCounters, HarSeriesView, HyparbCoinView, HyparbCounters, HyparbPoolView, RegimeCounters,
+    HarCounters, HarSeriesView, HcvCounters, HyparbCoinView, HyparbCounters, HyparbPoolView,
+    RegimeCounters,
     RegimeRelView, SlotCounters, VmRowView, VrpCounters, VrpSnapshotView, XmmCounters,
     XmmPerpView, HAR_VIEW_SERIES,
 };
@@ -31,7 +32,8 @@ pub const SNAPSHOT_SCHEMA: u32 = 2;
 pub const RECENT_ORDERS: usize = 64;
 /// Fills kept in the `recent` ring.
 pub const RECENT_FILLS: usize = 64;
-/// Strategy-set slots mirrored (the wire-stable slot map; 7 = reserved).
+/// Strategy-set slots mirrored (the wire-stable slot map; every slot
+/// is a member since HC11).
 pub const SNAPSHOT_SLOTS: usize = 8;
 /// Ingress lanes mirrored, in the cli's T1(c) order:
 /// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2 — appended, never
@@ -63,8 +65,11 @@ pub const RUN_DIR_MAX: usize = 160;
 /// was unlinked and `strategy-xmm` took the number the same day. The
 /// `icdp` block read zeros until XH3 replaced it with the `xmm` block
 /// ([`SNAPSHOT_SCHEMA`] 2).
+/// **Slot 7 was reserved until HC11 (2026-09-26)**: it is `strategy-hcv`
+/// since — no member ever stood there before, so no row changed meaning
+/// (the name, `"reserved"` → `"hcv"`, is additive).
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv",
 ];
 
 /// Ingress index → venue name (see [`SNAPSHOT_VENUES`]).
@@ -102,6 +107,9 @@ pub struct BootInfo {
     /// XMM XH3: SHA-256 of `xmm.toml` (all-zero when slot 6 is not
     /// configured).
     pub xmm_hash: [u8; 32],
+    /// HC11: SHA-256 of `hcv.toml` (all-zero when slot 7 is not
+    /// configured).
+    pub hcv_hash: [u8; 32],
     /// Process id.
     pub pid: u32,
     /// `--strategy` mask as requested (`mask_for_name`).
@@ -146,6 +154,7 @@ impl BootInfo {
         run_epoch_ns: 0,
         regime_hash: [0; 32],
         xmm_hash: [0; 32],
+        hcv_hash: [0; 32],
         pid: 0,
         requested_mask: 0,
         configured_mask: 0,
@@ -320,6 +329,15 @@ pub struct XmmSnapshot {
     pub _pad: u32,
     /// Perp rows, `[..n_perps]` live.
     pub perps: [XmmPerpView; SNAPSHOT_XMM_PERPS],
+}
+
+/// HC11: the slot-7 member (Hypercall S1 — DARK, paper only): its
+/// counters and gauges at one publish instant.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct HcvSnapshot {
+    /// The member's counters and gauges.
+    pub counters: HcvCounters,
 }
 
 /// P6: the VRP member (slot 1).
@@ -694,6 +712,8 @@ pub struct EngineSnapshot {
     pub vm: VmSnapshot,
     /// XMM XH3: the slot-6 member.
     pub xmm: XmmSnapshot,
+    /// HC11: the slot-7 member.
+    pub hcv: HcvSnapshot,
     /// The VRP member.
     pub vrp: VrpSnapshot,
     /// HYPARB H6: the slot-0 member.
@@ -737,6 +757,7 @@ impl EngineSnapshot {
             slots: [SlotCounters::default(); SNAPSHOT_SLOTS],
             vm: VmSnapshot::empty(),
             xmm: XmmSnapshot::default(),
+            hcv: HcvSnapshot::default(),
             vrp: VrpSnapshot::default(),
             hyparb: HyparbSnapshot::default(),
             har: HarSnapshot::default(),
@@ -788,7 +809,8 @@ mod tests {
         // (8 KB) + 256 row views (12 KB) dominate; anything past 32 KB is
         // a layout regression. HAR H3.5's `har` section (twelve 176 B
         // series rows + identity and counters) makes it 30,656 B at the
-        // Hypercall merge.
+        // Hypercall merge; HC11's `hcv` section and `boot.hcv_hash` add
+        // 200 B.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);

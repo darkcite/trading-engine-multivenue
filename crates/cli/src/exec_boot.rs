@@ -110,6 +110,13 @@ pub const HYPEREVM_SLOT: usize = 0;
 /// venue-wide cancel would pull bin15's quotes.
 pub const XMM_SLOT: usize = strategy_set::SLOT_XMM as usize;
 
+/// HC11 (O-HC18): slot 7 (`hcv`) is built DARK — paper only. A live slot
+/// 7 refuses the boot until its own live-arming ruling, whatever venues
+/// it names: the engine does not arm the Hypercall order arm (HC9), the
+/// E6 ledger has no options row, and the member's HL hedges would need
+/// their own reconciled account.
+pub const HCV_SLOT: usize = strategy_set::SLOT_HCV as usize;
+
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
 /// COMPILE time: a mismatch would silently truncate the per-slot arrays
@@ -121,7 +128,7 @@ const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "hcv",
 ];
 
 /// A resolved execution configuration.
@@ -358,6 +365,17 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                  arm of its own before XMM XH4 (its own Hyperliquid master account and \
                  gateway, rulings O-XH3/O-XH7) — refusing rather than arming it on slot 3's \
                  account, where its halt would cancel bin15's quotes"
+            ));
+        }
+
+        // HC11 (O-HC18): slot 7 is paper only until its own ruling
+        // ([`HCV_SLOT`]).
+        if mode == ExecMode::Live && slot == HCV_SLOT {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} is DARK — paper \
+                 only by ruling O-HC18. Arming it is its own live-arming ruling, which must \
+                 settle the E6 ledger's options row, its HL hedges' reconciled account and the \
+                 two-venue composition. Refusing the boot."
             ));
         }
 
@@ -684,6 +702,25 @@ mod tests {
         let p = write(&d, "exec-paper.toml", &paper);
         let boot = resolve(Some(&p), None).expect("a paper slot 6 is fine").expect("present");
         assert_eq!(boot.route.mode_at(XMM_SLOT), Some(ExecMode::Paper));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// HC11 (O-HC18): a live slot 7 refuses the boot — correctly named,
+    /// agreed by `--arm-live`, on any venue — while a PAPER slot 7 is an
+    /// ordinary artifact.
+    #[test]
+    fn a_live_slot_seven_refuses_it_is_dark() {
+        let d = tmp();
+        let seven = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.7]")
+            .replace("name = \"bin15\"", "name = \"hcv\"");
+        let p = write(&d, "exec.toml", &seven);
+        let e = resolve(Some(&p), Some("7")).expect_err("slot 7 is paper only");
+        assert!(e.contains("slot 7 (hcv)") && e.contains("O-HC18"), "{e}");
+        let paper = seven.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec-paper.toml", &paper);
+        let boot = resolve(Some(&p), None).expect("a paper slot 7 is fine").expect("present");
+        assert_eq!(boot.route.mode_at(HCV_SLOT), Some(ExecMode::Paper));
         let _ = std::fs::remove_dir_all(&d);
     }
 

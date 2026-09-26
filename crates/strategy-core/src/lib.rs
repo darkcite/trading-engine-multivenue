@@ -463,6 +463,14 @@ pub trait StrategyCounters {
         *out = XmmCounters::default();
     }
 
+    /// HC11: the slot-7 member's counters (`engine_hcv_*`, `/state`
+    /// `hcv`). Zeroes for every strategy but the set carrying a
+    /// configured hcv member.
+    #[inline]
+    fn hcv_counters(&self, out: &mut HcvCounters) {
+        *out = HcvCounters::default();
+    }
+
     /// XMM XH3: copy the per-perp view into `out` (`min(out.len())`
     /// rows), returning how many perps are CONFIGURED. Cold path (the
     /// 1 s publish); never allocates.
@@ -1307,6 +1315,56 @@ pub struct XmmCounters {
     pub stuck: u64,
 }
 const _: () = assert!(core::mem::size_of::<XmmCounters>() == 17 * 8);
+
+/// HC11: the slot-7 HCV member's counters and gauges (`engine_hcv_*`,
+/// `/state` `hcv`), written by the member crate. POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HcvCounters {
+    /// Instruments judged (a fresh quote inside the policy).
+    pub judged: u64,
+    /// Option sells sent.
+    pub sells: u64,
+    /// Option buys sent.
+    pub buys: u64,
+    /// Option fills received.
+    pub option_fills: u64,
+    /// Hedge IoCs sent.
+    pub hedges: u64,
+    /// Hedge fills received.
+    pub hedge_fills: u64,
+    /// Final-window unwind slices worked.
+    pub unwind_slices: u64,
+    /// Expiries booked at the replicated settlement.
+    pub settlements: u64,
+    /// …of which the window was too thin and the last oracle price stood.
+    pub settle_fallbacks: u64,
+    /// Skipped: an event inside the option's life, or no current calendar.
+    pub skip_event: u64,
+    /// Skipped: a stale provider quote, oracle or hedge touch.
+    pub skip_stale: u64,
+    /// Skipped: no HAR forecast for the tenor.
+    pub skip_forecast: u64,
+    /// Skipped: a cap (vega, premium, tail) left no size.
+    pub skip_caps: u64,
+    /// Skipped: the kill switch or the day's stop.
+    pub skip_stopped: u64,
+    /// Submits the ctx refused.
+    pub ctx_refused: u64,
+    /// Calendars taken from the reader.
+    pub calendars: u64,
+    /// HAR views taken from the set.
+    pub har_updates: u64,
+    /// Gauge: options held (non-zero positions).
+    pub positions: i64,
+    /// Gauge: Σ |net vega| over underlyings, USD per vol point ×1e6.
+    pub vega_abs_usd_1e6: i64,
+    /// Gauge: the marked P&L since boot, USD ×1e6.
+    pub pnl_usd_1e6: i64,
+    /// Gauge: the day's marked P&L, USD ×1e6.
+    pub day_pnl_usd_1e6: i64,
+}
+const _: () = assert!(core::mem::size_of::<HcvCounters>() == 21 * 8);
 
 /// XMM XH3: one quoted perp's row, read at one instant — the follower's
 /// touch, our two quotes on it, what the member holds and how old each

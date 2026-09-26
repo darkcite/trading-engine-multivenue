@@ -309,6 +309,62 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     }
     c.put(b"]}");
 
+    // --- hcv (HC11: slot 7, Hypercall S1 — DARK, paper only) ---
+    //
+    // Flat, like `xmm`'s counters; `configured` is the artifact's
+    // presence (its hash — rendered here, the `vrp` precedent, so the
+    // pinned `boot` section is unchanged), so an unconfigured member
+    // reads all zeros.
+    let hc = &s.hcv.counters;
+    c.key("hcv");
+    c.put(b"{\"configured\":");
+    c.u64(u64::from(s.boot.hcv_hash != [0u8; 32]));
+    c.key("hash");
+    c.hex(&s.boot.hcv_hash);
+    c.key("judged");
+    c.u64(hc.judged);
+    c.key("sells");
+    c.u64(hc.sells);
+    c.key("buys");
+    c.u64(hc.buys);
+    c.key("option_fills");
+    c.u64(hc.option_fills);
+    c.key("hedges");
+    c.u64(hc.hedges);
+    c.key("hedge_fills");
+    c.u64(hc.hedge_fills);
+    c.key("unwind_slices");
+    c.u64(hc.unwind_slices);
+    c.key("settlements");
+    c.u64(hc.settlements);
+    c.key("settle_fallbacks");
+    c.u64(hc.settle_fallbacks);
+    c.key("skip_event");
+    c.u64(hc.skip_event);
+    c.key("skip_stale");
+    c.u64(hc.skip_stale);
+    c.key("skip_forecast");
+    c.u64(hc.skip_forecast);
+    c.key("skip_caps");
+    c.u64(hc.skip_caps);
+    c.key("skip_stopped");
+    c.u64(hc.skip_stopped);
+    c.key("ctx_refused");
+    c.u64(hc.ctx_refused);
+    c.key("calendars");
+    c.u64(hc.calendars);
+    c.key("har_updates");
+    c.u64(hc.har_updates);
+    c.key("positions");
+    c.i64(hc.positions);
+    c.key("vega_abs_usd_1e6");
+    c.i64(hc.vega_abs_usd_1e6);
+    c.key("pnl_usd_1e6");
+    c.i64(hc.pnl_usd_1e6);
+    c.key("day_pnl_usd_1e6");
+    c.i64(hc.day_pnl_usd_1e6);
+    c.put(b"}");
+
     // --- exec (E6 c4) ---
     //
     // Additive. `halted` is an ARRAY of reason words rather than a
