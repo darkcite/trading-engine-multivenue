@@ -6,6 +6,33 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — Slot 7's book persists: `hcv-state.tsv`, `--hcv-state`; `/state.hcv` +4 rows; `engine_hcv_*` +4 (HC11b)
+
+**What changed**
+
+- `strategy_hcv::state` (new): the member's book — every held option BY CONTRACT (underlying, expiry, strike, right), with its entry basis and last price; the hedges (with the oracle they were written at); the cash; the UTC day and its opening mark; every live settlement window (its 1 s grid run-length encoded, or its fixed price) — is written to `hcv-state.tsv` and restored at boot (risk-policy "HYPERCALL — slot 7", "The book persists"). The grammar is version 1 (`V C D P H W S` rows); a file the member cannot read exactly — or whose values are implausible — refuses the boot, except a hedge residual under the venue's minimum on an underlying no longer traded, which is dropped and counted.
+- After a boot the book's mark is unknown until every held underlying's oracle arrives: the day does not roll and new risk stops meanwhile. A moved book the writer has not taken for 30 s stops new risk (`book_stale`). The boot writes the book once itself and refuses when it cannot.
+- **The file:** `--hcv-state <path>`; else `hcv-state.tsv` beside an explicit `--hcv`; else `~/multivenue/hcv-state.tsv` (the F22 law, now shared: `cli::state_file::resolve_state_path` / `read_state`, which VRP's boot also calls — `read_state` now refuses any read error but a missing file, where `Path::exists` read a stat error as a first boot).
+- **Off the engine thread:** the member hands its book to a mailbox at its timer whenever the book moved; the `hcv-state-writer` thread renders and writes it (atomic, fsynced). The H3.7 writer thread is generic now (`cli::persist::StateWriter`); `cli::har_writer` keeps the HAR side (`outbox`, `spawn`) and `HarWriter` is gone (the thread is `persist::StateWriter`). The shutdown joins the writer, then writes the live book once more.
+- **Orphans:** a held contract the booted chain no longer lists is carried by its terms (hedged and marked at σ̂, settled at expiry, never traded); at most 64.
+- `core_settle::SettleWindow`: `samples`, `next_index`, `last_ts_ms` and `restore` (the held price does not carry across an outage).
+- `StrategyCounters::render_hcv_state` (the shutdown's forced write, through the set).
+- `/state.hcv`: `restored` (counter) after `har_updates`, then `orphans`, `book_stale` and `marks_unknown` (gauges) last — 18 counters, 7 gauges. `/metrics`: `engine_hcv_restored_total`, `engine_hcv_orphans`, `engine_hcv_book_stale`, `engine_hcv_marks_unknown`. Schema stays 2 — additive.
+- `hcv.toml` is unchanged.
+
+**Impact**
+
+- None on a configured mask (slot 7 is in none). A boot with hcv requested now reads `hcv-state.tsv` when it exists and writes it from the first change on; a first boot has none.
+- A boot whose `hcv.toml` stops trading an underlying the book holds REFUSES — trade it again, or move the file aside (a position nobody hedges or settles is worse than a boot that asks for a hand).
+
+**Migration steps**
+
+1. None beyond HC11's. The first boot with slot 7 creates the file at its first fill (or the day's first timer).
+
+**Rollback**
+
+- Drop hcv from `STRATEGY=` (the file stays and is read again when slot 7 returns); moving `hcv-state.tsv` aside starts the book flat.
+
 ## 2026-09-26 — Strategy slot 7 = `hcv` (Hypercall S1, DARK); `hcv.toml`; the held-quote paper law; `/state.hcv`; `engine_hcv_*` (HC11)
 
 **What changed**

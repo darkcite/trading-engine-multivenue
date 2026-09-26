@@ -191,6 +191,13 @@ pub fn default_hcv_path() -> Result<String, super::ConfigError> {
     super::expand_tilde("~/multivenue/hcv.toml")
 }
 
+/// HC11b: the default book path, `~/multivenue/hcv-state.tsv` — the
+/// engine's own file (written by it, read back at boot; the F22 law puts it
+/// beside an explicit `--hcv` artifact instead).
+pub fn default_hcv_state_path() -> Result<String, super::ConfigError> {
+    super::expand_tilde("~/multivenue/hcv-state.tsv")
+}
+
 /// The default calendar path: the news lane's `scheduled-events.json`
 /// under the worker's default news directory (`claude_worker.news`
 /// `DEFAULT_NEWS_DIR` + `SCHEDULED_EVENTS_FILE`, ruling O-HC8). A worker

@@ -3,54 +3,30 @@
 
 //! # `har_writer` — the long-tenor state, written off the engine thread
 //!
-//! HAR H3.7. Until now each long-tenor series' `state-<NAME>.tsv` (~350 KiB
-//! for a fitted series) was rendered and written — create, write, fsync,
-//! rename — on the engine thread inside its 5 s report block, at each of
-//! the series' UTC day closes. Now the engine thread's whole share is one
-//! copy of the series' engine into a [`core_ring::Mailbox`] — at the
-//! close's own 1 s poll, only while the mailbox is FREE
+//! HAR H3.7. Until then each long-tenor series' `state-<NAME>.tsv` (~350
+//! KiB for a fitted series) was rendered and written — create, write,
+//! fsync, rename — on the engine thread inside its 5 s report block, at each
+//! of the series' UTC day closes. Now the engine thread's whole share is one
+//! copy of the series' engine into a [`core_ring::Mailbox`] — at the close's
+//! own 1 s poll, only while the mailbox is FREE
 //! (`StrategySet::offer_har_state`; the outbox is installed at boot by
-//! `StrategySet::install_har_outbox`) — and this module's thread does the
-//! rest:
+//! `StrategySet::install_har_outbox`) — and the writer thread does the rest.
 //!
-//! * one mailbox per series (`har.toml` order), each slot boxed once here
-//!   at boot ([`outbox`]);
-//! * a pass every [`PASS`] takes each FULL slot, renders it with
-//!   `core_vol::render_state_file` (the one renderer — the shutdown write
-//!   uses it too) into a reused buffer and writes it with
-//!   `state_file::write_atomic`; the guard's drop hands the slot back;
-//! * a failed write KEEPS the slot FULL (`Taken::keep`) and is retried
-//!   every [`RETRY_NS`]: the engine's offers are refused meanwhile (never
-//!   waited on), and the newest state follows at its first poll after the
-//!   retry succeeds — a file never goes backwards. One warning a minute
-//!   (F18's `warn_state_write`);
-//! * [`HarWriter::shutdown`] stops the thread and joins it. A slot still
-//!   FULL then is dropped unwritten: the engine loop's forced synchronous
-//!   write of every series, which runs next from the live engines (the
-//!   open day moves the state without moving the epoch), supersedes it.
-//!   The join comes first so a write in flight and the forced write never
-//!   share a path's temp file.
-//!
-//! No lock anywhere: the engine thread never waits on this one. Cold
-//! thread — the render buffer grows to the largest file once;
-//! `write_atomic` allocates its temp name per write, as it did on the
-//! engine thread.
+//! The thread is [`crate::persist::StateWriter`] (its laws: the pass,
+//! the kept slot and its retry, the shutdown's join before the forced
+//! write). This module is the HAR side of it: one mailbox per series
+//! (`har.toml` order), each slot boxed once here at boot ([`outbox`]), and
+//! the renderer — `core_vol::render_state_file` under each series' header
+//! name, the one renderer the shutdown's forced write uses too ([`spawn`]).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::JoinHandle;
+#[cfg(test)]
 use std::time::Duration;
 
 use core_ring::{Mailbox, MailboxRx, MailboxTx};
 use core_vol::LongStateSnap;
 
-/// Between two passes of the writer thread: a handed state waits at most
-/// this long (the file is for restarts — nothing reads it sooner).
-pub const PASS: Duration = Duration::from_millis(250);
-
-/// A failed write is retried this long after (F18's state-write cadence).
-pub const RETRY_NS: u64 = 5_000_000_000;
+use crate::persist::StateWriter;
 
 /// The outbox of `n` series: the engine's producers (for
 /// `StrategySet::install_har_outbox`) and the writer's consumers, index
@@ -69,108 +45,40 @@ pub fn outbox(n: usize) -> (Vec<MailboxTx<LongStateSnap>>, Vec<MailboxRx<LongSta
     (tx, rx)
 }
 
-/// The running state writer (module doc). Dropping it stops and joins it
-/// like [`HarWriter::shutdown`].
-pub struct HarWriter {
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+/// Spawn the writer thread (`har-state-writer`) over `rx`: series `i` is
+/// written to `paths[i]` under the header name `names[i]`. The three are in
+/// `har.toml` order and of one length.
+///
+/// # Errors
+///
+/// The thread could not be spawned — the caller keeps the pre-H3.7 write on
+/// the engine thread.
+pub fn spawn(rx: Vec<MailboxRx<LongStateSnap>>, names: Vec<String>, paths: Vec<PathBuf>) -> std::io::Result<StateWriter> {
+    debug_assert!(rx.len() == names.len() && rx.len() == paths.len());
+    StateWriter::spawn("har-state-writer", "har", rx, paths, render(names))
 }
 
-impl HarWriter {
-    /// Spawn the writer thread (`har-state-writer`) over `rx`: series `i`
-    /// is written to `paths[i]` under the header name `names[i]`. The three
-    /// are in `har.toml` order and of one length.
-    ///
-    /// # Errors
-    ///
-    /// The thread could not be spawned — the caller keeps the pre-H3.7
-    /// write on the engine thread.
-    pub fn spawn(
-        rx: Vec<MailboxRx<LongStateSnap>>,
-        names: Vec<String>,
-        paths: Vec<PathBuf>,
-    ) -> std::io::Result<Self> {
-        Self::spawn_with(rx, names, paths, PASS, RETRY_NS)
-    }
-
-    fn spawn_with(
-        rx: Vec<MailboxRx<LongStateSnap>>,
-        names: Vec<String>,
-        paths: Vec<PathBuf>,
-        pass: Duration,
-        retry_ns: u64,
-    ) -> std::io::Result<Self> {
-        debug_assert!(rx.len() == names.len() && rx.len() == paths.len());
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
-        let thread = std::thread::Builder::new()
-            .name("har-state-writer".into())
-            .spawn(move || run(rx, &names, &paths, &flag, pass, retry_ns))?;
-        Ok(Self {
-            stop,
-            thread: Some(thread),
-        })
-    }
-
-    /// Stop the thread and join it (module doc: what a FULL slot means
-    /// then).
-    pub fn shutdown(mut self) {
-        self.stop_and_join();
-    }
-
-    fn stop_and_join(&mut self) {
-        let Some(t) = self.thread.take() else {
-            return;
-        };
-        self.stop.store(true, Ordering::Release);
-        t.thread().unpark();
-        if t.join().is_err() {
-            tracing::error!("har: the state writer thread panicked");
+/// The series' renderer: `false` for an index no name was given for.
+fn render(names: Vec<String>) -> impl FnMut(usize, &LongStateSnap, &mut String) -> bool + Send + 'static {
+    move |i, slot, buf| match names.get(i) {
+        Some(name) => {
+            core_vol::render_state_file(name, &slot.engine, buf);
+            true
         }
+        None => false,
     }
 }
 
-impl Drop for HarWriter {
-    fn drop(&mut self) {
-        self.stop_and_join();
-    }
-}
-
-/// The writer thread: a pass over every mailbox, then a park until the
-/// next one (or the stop's unpark).
-fn run(
-    mut rx: Vec<MailboxRx<LongStateSnap>>,
-    names: &[String],
-    paths: &[PathBuf],
-    stop: &AtomicBool,
+/// [`spawn`] with the pass and the retry chosen.
+#[cfg(test)]
+fn spawn_with(
+    rx: Vec<MailboxRx<LongStateSnap>>,
+    names: Vec<String>,
+    paths: Vec<PathBuf>,
     pass: Duration,
     retry_ns: u64,
-) {
-    let n = rx.len().min(names.len()).min(paths.len());
-    let mut buf = String::new();
-    let mut retry_at = vec![0u64; n];
-    let mut warn_ns = 0u64;
-    while !stop.load(Ordering::Acquire) {
-        let now = core_time::now_ns();
-        let mut i = 0usize;
-        while i < n {
-            if now >= retry_at[i] {
-                if let Some(slot) = rx[i].try_take() {
-                    core_vol::render_state_file(&names[i], &slot.engine, &mut buf);
-                    match crate::state_file::write_atomic(&paths[i], &buf) {
-                        Ok(()) => retry_at[i] = 0,
-                        Err(reason) => {
-                            crate::paper::warn_state_write("har", &reason, &mut warn_ns, now);
-                            retry_at[i] = now.saturating_add(retry_ns);
-                            slot.keep();
-                        }
-                    }
-                }
-            }
-            i += 1;
-        }
-        std::thread::park_timeout(pass);
-    }
+) -> std::io::Result<StateWriter> {
+    StateWriter::spawn_with("har-state-writer", "har", rx, paths, render(names), pass, retry_ns)
 }
 
 #[cfg(test)]
@@ -228,7 +136,7 @@ mod tests {
         let d = tmp("lands");
         let paths = vec![d.join("state-BTC.tsv"), d.join("state-ETH.tsv")];
         let (mut tx, rx) = outbox(2);
-        let w = HarWriter::spawn_with(
+        let w = spawn_with(
             rx,
             vec!["BTC".into(), "ETH".into()],
             paths.clone(),
@@ -261,7 +169,7 @@ mod tests {
         let sub = d.join("not-yet");
         let path = sub.join("state-MU.tsv");
         let (mut tx, rx) = outbox(1);
-        let w = HarWriter::spawn_with(
+        let w = spawn_with(
             rx,
             vec!["MU".into()],
             vec![path.clone()],
@@ -291,7 +199,7 @@ mod tests {
         let d = tmp("stop");
         let path = d.join("missing").join("state-ETH.tsv");
         let (mut tx, rx) = outbox(1);
-        let w = HarWriter::spawn_with(
+        let w = spawn_with(
             rx,
             vec!["ETH".into()],
             vec![path.clone()],
@@ -306,7 +214,7 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(5), "the hour-long park was cut short");
         assert!(!path.exists());
         let (_tx, rx) = outbox(1);
-        drop(HarWriter::spawn_with(rx, vec!["X".into()], vec![d.join("x")], PASS, RETRY_NS).unwrap());
+        drop(spawn_with(rx, vec!["X".into()], vec![d.join("x")], crate::persist::PASS, crate::persist::RETRY_NS).unwrap());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

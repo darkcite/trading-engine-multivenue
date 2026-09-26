@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! HC11 boot: `hcv.toml` → `strategy_hcv::HcvParams`, and the calendar
-//! reader thread (`hcv-events`).
+//! HC11 boot: `hcv.toml` → `strategy_hcv::HcvParams`, the calendar reader
+//! thread (`hcv-events`) and (HC11b) the book's file — read here, written
+//! by the `hcv-state-writer` thread ([`spawn_state_writer`]).
 //!
 //! COPY-DOCTRINE: boot-only module plus one cold thread. The reader
 //! re-reads `scheduled-events.json` when its mtime moves (the news lane
@@ -30,6 +31,11 @@
 //! * **Present-and-unreadable refuses too**, and so does a hedge the boot
 //!   universe does not carry or whose size decimals the venue did not
 //!   state: a member that cannot hedge is a member selling naked options.
+//! * **The book's file follows the artifact** (F22): `--hcv-state`, else
+//!   `hcv-state.tsv` beside an explicit `--hcv`, else
+//!   `~/multivenue/hcv-state.tsv` — a smoke boot never reads or rewrites
+//!   the standing engine's book. Absent is a first boot; unreadable
+//!   refuses.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,8 +47,10 @@ use core_config::hcv::HcvFile;
 use core_ring::MailboxTx;
 use core_types::SymbolId;
 use exec_hypercall::json;
-use strategy_hcv::{BucketOrder, HcvEvents, HcvOpt, HcvParams, HcvUnd, HCV_MAX_EVENTS};
+use strategy_hcv::{BucketOrder, HcvEvents, HcvOpt, HcvParams, HcvStateSnap, HcvUnd, HCV_MAX_EVENTS};
 use tracing::{info, warn};
+
+use crate::persist::StateWriter;
 
 // The artifact's table is the member's: one statement of each bound.
 const _: () = assert!(core_config::hcv::HCV_UNDERLYINGS.len() <= strategy_hcv::HCV_MAX_UND);
@@ -79,6 +87,10 @@ pub struct HcvBoot {
     /// `[hypercall] underlyings` and the traded ones: a row naming anything
     /// else refuses the calendar (a misspelt event would pass the law).
     pub known: Vec<String>,
+    /// HC11b: where the book is written and read back (module doc).
+    pub state_path: PathBuf,
+    /// …its text at boot (`None`: no book yet — a first boot).
+    pub state: Option<String>,
 }
 
 /// Whether the operator asked for the member.
@@ -93,15 +105,18 @@ pub fn hcv_wanted(requested: u8) -> bool {
 ///
 /// * `artifact` — `--hcv`, or `None` for `~/multivenue/hcv.toml`.
 /// * `events` — `--hcv-events`, or `None` for the news lane's default.
+/// * `state` — `--hcv-state`, or `None` for the F22 law (module doc).
 /// * `resolve` — descriptor → `SymbolId` (the AI descriptor table).
 /// * `sz_decimals` — Hyperliquid coin → the `szDecimals` the venue
 ///   stated at this boot's discovery.
 /// * `options` — this boot's Hypercall chain.
 /// * `hypercall_underlyings` — `[hypercall] underlyings`, the calendar's
 ///   known names (with the traded ones).
+#[allow(clippy::too_many_arguments)]
 pub fn load_hcv_boot(
     artifact: Option<&Path>,
     events: Option<&Path>,
+    state: Option<&Path>,
     resolve: &dyn Fn(&str) -> Option<SymbolId>,
     sz_decimals: &dyn Fn(&str) -> Option<u8>,
     options: &[crate::paper::DiscoveredOption],
@@ -132,6 +147,10 @@ pub fn load_hcv_boot(
             known.push((*u).to_owned());
         }
     }
+    let state_path = crate::state_file::resolve_state_path(state, &path, explicit, "hcv-state.tsv", || {
+        core_config::hcv::default_hcv_state_path().map_err(|e| e.to_string())
+    })?;
+    let state = crate::state_file::read_state("hcv", &state_path)?;
     Ok(Some(HcvBoot {
         params,
         hash,
@@ -141,7 +160,27 @@ pub fn load_hcv_boot(
         skipped,
         events_path,
         known,
+        state_path,
+        state,
     }))
+}
+
+/// HC11b: the book's writer — one mailbox, its ~170 KiB slot boxed here
+/// (boot only), and the `hcv-state-writer` thread rendering each book the
+/// member hands over with `strategy_hcv::render_state` into `path`
+/// (`crate::persist`'s laws). Returns the member's end, for
+/// `HcvStrategy::install_state_outbox`.
+///
+/// # Errors
+///
+/// The thread could not be spawned.
+pub fn spawn_state_writer(path: PathBuf) -> std::io::Result<(MailboxTx<HcvStateSnap>, StateWriter)> {
+    let (tx, rx) = core_ring::Mailbox::new(HcvStateSnap::new_boxed()).split();
+    let writer = StateWriter::spawn("hcv-state-writer", "hcv", vec![rx], vec![path], |_, snap: &HcvStateSnap, buf: &mut String| {
+        strategy_hcv::render_state(snap, buf);
+        true
+    })?;
+    Ok((tx, writer))
 }
 
 /// The parsed artifact → the member's params, every hedge resolved and
@@ -255,7 +294,7 @@ pub fn render_boot_tell(boot: &HcvBoot) -> String {
     let p = &boot.params;
     format!(
         "hcv: artifact configured hash={hex} path={} underlyings={unds} options={} skipped={} \
-         events={} theta_vol_1e6={} atm_band_bps={} tenors={}..{}d clip_usd_1e6={} \
+         events={} state={} theta_vol_1e6={} atm_band_bps={} tenors={}..{}d clip_usd_1e6={} \
          vega_cap_usd_1e6={} premium_cap_usd_1e6={} day_loss_usd_1e6={} tail_loss_usd_1e6={} \
          hedge_band_1e6={} hedge_min_usd_1e6={} unwind_min={} settle_order={:?} event_law={} \
          kill={} phase=HC11(paper, DARK)",
@@ -263,6 +302,7 @@ pub fn render_boot_tell(boot: &HcvBoot) -> String {
         p.options.len(),
         boot.skipped,
         boot.events_path.display(),
+        boot.state_path.display(),
         p.theta_vol_1e6,
         p.atm_band_bps,
         p.tenor_min_d,
@@ -674,11 +714,105 @@ mod tests {
         assert!(build_params(&file, &resolve, &sz, &chain[2..]).is_err());
     }
 
+    /// The example against a two-option chain, resolved as a boot would.
+    fn example_params() -> HcvParams {
+        let file = core_config::hcv::parse(EXAMPLE).unwrap();
+        let resolve = |d: &str| match d {
+            "hyperliquid:xyz:SP500" => Some(make_symbol_id(VenueId::Hyperliquid, 40)),
+            "hyperliquid:BTC" => Some(make_symbol_id(VenueId::Hyperliquid, 1)),
+            _ => Some(make_symbol_id(VenueId::Hyperliquid, 99)),
+        };
+        let sz = |c: &str| if c == "BTC" { Some(5) } else { Some(2) };
+        build_params(&file, &resolve, &sz, &chain()).expect("builds").0
+    }
+
+    fn chain() -> Vec<crate::paper::DiscoveredOption> {
+        vec![
+            ("SP500-20261002-6600-C".into(), make_symbol_id(VenueId::Hypercall, 513), 6_600_000_000_000, 1_791_000_000_000, opt_registry::RIGHT_CALL),
+            ("BTC-20261002-110000-P".into(), make_symbol_id(VenueId::Hypercall, 514), 110_000_000_000_000, 1_791_000_000_000, opt_registry::RIGHT_PUT),
+        ]
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("hcv-boot-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// F22 for slot 7: an explicit artifact keeps its book beside it (a
+    /// smoke boot never touches the standing engine's), an explicit
+    /// `--hcv-state` wins, and the book is read back when it exists.
+    #[test]
+    fn the_book_follows_an_explicit_artifact_and_is_read_back() {
+        let d = tmp_dir("path");
+        let artifact = d.join("hcv.toml");
+        std::fs::write(&artifact, EXAMPLE).unwrap();
+        let resolve = |_: &str| Some(make_symbol_id(VenueId::Hyperliquid, 40));
+        let sz = |_: &str| Some(2);
+        let und = vec!["SP500".to_owned()];
+        let load = |state: Option<&Path>| load_hcv_boot(Some(&artifact), None, state, &resolve, &sz, &chain(), &und);
+        let b = load(None).unwrap().expect("configured");
+        assert_eq!((b.state_path.clone(), b.state.clone()), (d.join("hcv-state.tsv"), None), "a first boot");
+        assert!(render_boot_tell(&b).contains(&format!("state={}", d.join("hcv-state.tsv").display())));
+        std::fs::write(d.join("hcv-state.tsv"), "V\t1\n").unwrap();
+        assert_eq!(load(None).unwrap().unwrap().state.as_deref(), Some("V\t1\n"));
+        let other = d.join("elsewhere.tsv");
+        assert_eq!(load(Some(&other)).unwrap().unwrap().state_path, other);
+        // A book that exists but cannot be read refuses the boot.
+        std::fs::create_dir_all(d.join("dir-not-file.tsv")).unwrap();
+        assert!(load(Some(&d.join("dir-not-file.tsv"))).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The whole HC11b loop: the member hands its book at its timer, the
+    /// writer thread lands it, and a fresh member of the next boot reads
+    /// back the same book.
+    #[test]
+    fn the_writer_lands_the_book_and_the_next_boot_reads_it_back() {
+        use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+        struct Quiet;
+        impl Ctx for Quiet {
+            fn submit(&mut self, _: core_types::Order) -> Result<(), SubmitErr> {
+                Ok(())
+            }
+            fn now_ns(&self) -> u64 {
+                0
+            }
+        }
+        let d = tmp_dir("writer");
+        let path = d.join("hcv-state.tsv");
+        let mut p = example_params();
+        p.anchor = core_time::WallAnchor::new(0, 1_790_424_000_000 * 1_000_000);
+        let mut a = strategy_hcv::HcvStrategy::new();
+        a.configure(&p).unwrap();
+        let (tx, writer) = spawn_state_writer(path.clone()).expect("spawns");
+        a.install_state_outbox(tx);
+        let sym = p.options[0].sym;
+        let fill = core_types::Fill::new(1, sym, core_types::Side::Ask, core_types::Price::from_raw(80_000_000), core_types::Qty::from_raw(2_000_000), 7);
+        a.on_fill(&fill, &mut Quiet);
+        a.on_timer(1_000_000_000, &mut Quiet);
+        let mut want = String::new();
+        assert!(a.render_hcv_state(&mut want));
+        let t0 = std::time::Instant::now();
+        while std::fs::read_to_string(&path).ok().as_deref() != Some(want.as_str()) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the writer never landed the book");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        writer.shutdown();
+        let mut b = strategy_hcv::HcvStrategy::new();
+        b.configure(&p).unwrap();
+        let r = b.restore_state(&std::fs::read_to_string(&path).unwrap(), 1_790_424_001_000).expect("restores");
+        assert_eq!((r.positions, r.cash_usd_1e6), (1, 160_000_000));
+        assert_eq!(b.position_1e6(sym), -2_000_000);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn an_absent_default_is_none_an_absent_explicit_path_refuses() {
         let resolve = |_: &str| None;
         let sz = |_: &str| None;
-        let e = load_hcv_boot(Some(Path::new("/nonexistent/hcv.toml")), None, &resolve, &sz, &[], &[]).unwrap_err();
+        let e = load_hcv_boot(Some(Path::new("/nonexistent/hcv.toml")), None, None, &resolve, &sz, &[], &[]).unwrap_err();
         assert!(e.contains("no such file"), "{e}");
         assert!(hcv_wanted(strategy_set::BIT_HCV));
         assert!(hcv_wanted(strategy_set::BUILT_MASK));

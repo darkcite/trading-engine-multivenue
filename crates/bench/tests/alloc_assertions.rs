@@ -10734,8 +10734,10 @@ fn hypercall_arm_render_sign_and_scan_is_zero_alloc() {
 /// steps: the quote swings rich and cheap (sales, buy-backs, the caps),
 /// the hedge follows outside its band, a position injected at boot runs
 /// through the final window's TWAP to its median-of-means settlement, the
-/// calendar is replaced and the HAR view re-pushed mid-run. Everything is
-/// boxed at `configure` (the only allocations).
+/// calendar is replaced and the HAR view re-pushed mid-run — and (HC11b)
+/// every change to the book is handed to the writer's mailbox, grid and
+/// all, and taken back as the writer thread would. Everything is boxed at
+/// `configure` and at the outbox's install (the only allocations).
 #[test]
 fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
     use clob_dispatcher::PaperMatcher;
@@ -10821,6 +10823,9 @@ fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
     s.set_har_view(&rows);
     let (mut tx, rx) = core_ring::Mailbox::new(Box::new(HcvEvents::new())).split();
     s.install_events(rx);
+    let (book_tx, mut book_rx) = core_ring::Mailbox::new(strategy_hcv::HcvStateSnap::new_boxed()).split();
+    s.install_state_outbox(book_tx);
+    let mut books = 0u64;
     let calendar = |gen_ms: u64| {
         let mut c = HcvEvents::new();
         c.generated_ms = gen_ms;
@@ -10884,6 +10889,10 @@ fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
             let mut c = PaperCtx { m: &mut m, now };
             s.on_order_event(&ev, &mut c);
         }
+        // The writer's end: take the handed book, hand the slot back.
+        if let Some(b) = book_rx.try_take() {
+            books += u64::from(b.epoch != 0 && b.n_pos as usize <= strategy_hcv::state::HCV_SNAP_POSITIONS);
+        }
         if i % 600 == 300 {
             if let Some(mut f) = tx.try_fill() {
                 *f = calendar(T0_MS + i * 1_000);
@@ -10899,6 +10908,7 @@ fn hcv_member_and_the_held_quote_law_are_zero_alloc() {
     assert!(k.option_fills > 0 && k.hedges > 0 && k.hedge_fills > 0, "fills and hedges: {k:?}");
     assert!(k.unwind_slices > 0 && k.settlements >= 1, "the final window and the settlement ran: {k:?}");
     assert!(k.calendars >= 3 && k.skip_caps > 0, "calendars replaced, caps met: {k:?}");
+    assert!(books > 30, "the book was handed at its fills, bookings and window minutes: {books}");
     assert_eq!(allocs, 0, "slot 7 over the held-quote law allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0);
 }

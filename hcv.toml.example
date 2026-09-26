@@ -13,6 +13,12 @@
 # underlying (settlement's own source) and its hedge perp's touch, the
 # HAR set's σ̂ (har.toml live — O-HC22) and the news plane's
 # scheduled-events.json (the event law).
+#
+# Its book (HC11b) lives in hcv-state.tsv BESIDE this file's standing
+# copy (~/multivenue/hcv-state.tsv; --hcv-state names another): written by
+# the engine, read back at every boot. Stop trading an underlying the book
+# still holds and the boot refuses — trade it again, or move the file
+# aside.
 
 [hcv]
 # --- what is traded (O-HC20: the hedgeable underlyings) --------------

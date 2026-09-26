@@ -190,10 +190,14 @@ fn full_snapshot() -> Box<EngineSnapshot> {
     h.judged = u64::MAX;
     h.skip_event = u64::MAX;
     h.har_updates = u64::MAX;
+    h.restored = u64::MAX;
     h.positions = i64::MIN;
     h.vega_abs_usd_1e6 = i64::MIN;
     h.pnl_usd_1e6 = i64::MIN;
     h.day_pnl_usd_1e6 = i64::MIN;
+    h.orphans = i64::MIN;
+    h.book_stale = i64::MIN;
+    h.marks_unknown = i64::MIN;
     s
 }
 
@@ -363,6 +367,9 @@ fn the_hcv_block_renders_its_hash_and_counters() {
     s.hcv.counters.sells = 3;
     s.hcv.counters.skip_event = 11;
     s.hcv.counters.pnl_usd_1e6 = -2_500_000;
+    // HC11b: the restore and the orphans it carries.
+    s.hcv.counters.restored = 4;
+    s.hcv.counters.orphans = 1;
     let mut buf = vec![0u8; STATE_JSON_MAX];
     let n = encode_state_json(&s, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();
@@ -375,7 +382,8 @@ fn the_hcv_block_renders_its_hash_and_counters() {
         "hcv schema drift; got: {body}"
     );
     assert!(body.contains("\"skip_event\":11,"));
-    assert!(body.contains("\"pnl_usd_1e6\":-2500000,\"day_pnl_usd_1e6\":0}"));
+    assert!(body.contains("\"har_updates\":0,\"restored\":4,\"positions\":0,"));
+    assert!(body.contains("\"pnl_usd_1e6\":-2500000,\"day_pnl_usd_1e6\":0,\"orphans\":1,\"book_stale\":0,\"marks_unknown\":0}"));
     let empty = Box::new(EngineSnapshot::empty());
     let n = encode_state_json(&empty, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();

@@ -960,3 +960,497 @@ fn the_money_helpers_saturate() {
     assert_eq!(div_1e6(1, 0), 0);
     assert_eq!(div_1e6(i64::MAX, 1), i64::MAX);
 }
+
+// ---- HC11b: the book across a restart ------------------------------------------
+
+/// The fixture's chain numbered from `first`, as the next boot's discovery
+/// would number it.
+fn renumbered(first: u32) -> HcvParams {
+    let mut p = params();
+    let mut i = 0usize;
+    while i < p.options.len() {
+        p.options[i].sym = opt_sym(first + i as u32);
+        i += 1;
+    }
+    p
+}
+
+fn rendered(s: &HcvStrategy) -> String {
+    let mut t = String::new();
+    assert!(s.render_hcv_state(&mut t), "a configured member renders");
+    t
+}
+
+/// Every row kind but a window: short 3 SP500 calls at two prices, long
+/// half a BTC call, the SP500 hedge, the day's opening mark.
+fn traded_member() -> HcvStrategy {
+    let mut s = member();
+    let mut c = Rec::default();
+    feed_sp(&mut s, &mut c, S_SP, 0);
+    s.on_timer(ns(0), &mut c);
+    s.on_fill(&fill(opt_sym(0), Side::Ask, 80_000_000, 2_000_000, 1, 100), &mut c);
+    s.on_fill(&fill(opt_sym(0), Side::Ask, 82_000_000, 1_000_000, 2, 200), &mut c);
+    s.on_fill(&fill(opt_sym(4), Side::Bid, 2_000_000_000, 500_000, 3, 300), &mut c);
+    s.on_fill(&fill(SP_HEDGE, Side::Bid, S_SP, 1_500_000, 4, 400), &mut c);
+    s
+}
+
+fn is_blank(s: &HcvStrategy) -> bool {
+    let mut held = false;
+    let mut i = 0usize;
+    while i < s.n_opts {
+        held |= s.opts[i].pos_1e6 != 0;
+        i += 1;
+    }
+    !held && s.cash_usd_1e6() == 0 && s.hedge_position_1e6(0) == 0 && s.counters().restored == 0 && s.n_opts == 5
+}
+
+#[test]
+fn the_book_round_trips_by_contract_whatever_the_next_chain_numbers_it() {
+    let a = traded_member();
+    let text = rendered(&a);
+    // The next boot's discovery numbered the same chain differently.
+    let p2 = renumbered(40);
+    let mut b = member_with(&p2);
+    let r = b.restore_state(&text, T0_MS + 1_000).expect("restores");
+    let want = HcvRestored {
+        positions: 2,
+        hedges: 1,
+        cash_usd_1e6: a.cash_usd_1e6(),
+        ..HcvRestored::default()
+    };
+    assert_eq!(r, want);
+    assert_eq!(b.position_1e6(p2.options[0].sym), -3_000_000);
+    assert_eq!(b.position_1e6(opt_sym(0)), 0, "the old ordinal names nothing now");
+    assert_eq!(b.position_1e6(p2.options[4].sym), 500_000);
+    assert_eq!(b.opts[0].avg_px_1e6, 80_666_666, "the entry basis");
+    assert_eq!(b.opts[0].last_px_1e6, 82_000_000);
+    assert_eq!(b.hedge_position_1e6(0), 1_500_000);
+    assert_eq!(b.cash_usd_1e6(), 160_000_000 + 82_000_000 - 1_000_000_000 - 9_900_000_000);
+    assert_eq!((b.day, b.day_start_pnl_usd_1e6), (a.day, a.day_start_pnl_usd_1e6));
+    assert_eq!(b.gross_premium(), a.gross_premium(), "the premium cap reads the same book");
+    assert_eq!(b.counters().restored, 2);
+    assert_eq!(b.state_epoch, 0, "restoring is not a change");
+    // Written back once the feeds are in, the book reads the same (the
+    // marks come back with the feeds, never from the file).
+    b.on_venue_event(&mark(SP_HEDGE, S_SP, 1_000), &mut Rec::default());
+    assert_eq!(rendered(&b), text);
+    assert!(b.restore_state(&text, T0_MS).is_err(), "once per boot");
+}
+
+#[test]
+fn a_contract_the_new_chain_lacks_is_carried_hedged_and_settled_but_never_traded() {
+    let mut a = member();
+    let mut c = Rec::default();
+    let exp = DAY / 2;
+    a.on_fill(&fill(opt_sym(3), Side::Bid, 30_000_000, 1_000_000, 1, 0), &mut c);
+    let text = rendered(&a);
+    // The next chain lost it (its strike left the capped chain).
+    let mut p2 = params();
+    p2.options.remove(3);
+    let mut b = member_with(&p2);
+    let r = b.restore_state(&text, T0_MS + 1_000).expect("restores");
+    assert_eq!((r.positions, r.orphans), (1, 1));
+    assert_eq!(b.n_opts, 5, "the chain's four and the orphan");
+    assert_eq!(b.opts[4].cfg.sym, SYMBOL_ID_NONE);
+    // Carried: the gauges count it, its delta is hedged at σ̂ (no quote
+    // reaches it), and nothing is ever sent on it.
+    let mut c = Rec::default();
+    feed_sp(&mut b, &mut c, S_SP, 1_000);
+    b.on_timer(ns(1_000), &mut c);
+    assert_eq!((b.counters().positions, b.counters().orphans), (1, 1));
+    assert_eq!(c.orders.len(), 1, "the long call's delta, hedged");
+    assert_eq!((c.orders[0].sym, c.orders[0].side), (SP_HEDGE, Side::Ask));
+    // Sampled and settled at its expiry.
+    let mut seen = fill_hedges(&mut b, &mut c, 0, 1_500);
+    let mut t = exp - 31 * 60_000;
+    while t <= exp + 61_000 {
+        feed_sp(&mut b, &mut c, 6_700_000_000, t);
+        b.on_timer(ns(t), &mut c);
+        seen = fill_hedges(&mut b, &mut c, seen, t);
+        t += 1_000;
+    }
+    let k = b.counters();
+    assert_eq!((k.settlements, k.settle_fallbacks), (1, 0), "on its own window");
+    assert_eq!((b.opts[4].pos_1e6, k.orphans, k.positions), (0, 0, 0));
+    assert_eq!(b.hedge_position_1e6(0), 0, "the hedge left with it");
+    assert!(c.orders.iter().all(|o| o.sym == SP_HEDGE), "only ever hedged");
+}
+
+#[test]
+fn a_position_that_expired_while_the_engine_was_down_is_booked_at_the_first_oracle() {
+    let mut a = member();
+    let mut c = Rec::default();
+    a.on_fill(&fill(opt_sym(3), Side::Ask, 30_000_000, 2_000_000, 1, 0), &mut c);
+    let text = rendered(&a);
+    let mut b = member();
+    let back = DAY; // twelve hours after its expiry
+    let r = b.restore_state(&text, T0_MS + back).expect("restores");
+    assert_eq!((r.positions, r.expired, r.windows), (1, 1, 0));
+    feed_sp(&mut b, &mut c, 6_500_000_000, back);
+    b.on_timer(ns(back), &mut c);
+    assert_eq!(b.position_1e6(opt_sym(3)), 0);
+    assert_eq!((b.counters().settlements, b.counters().settle_fallbacks), (1, 1), "no window: counted");
+    // Short 2 calls struck at 6600, settling at 6500: the premium is kept.
+    assert_eq!(b.cash_usd_1e6(), 60_000_000);
+}
+
+/// Long 1 call through its final window; the engine goes down with ten
+/// minutes to go and is back a minute later.
+#[test]
+fn a_restart_inside_the_final_window_keeps_its_grid_and_holds_nothing_across_the_gap() {
+    let exp = DAY / 2;
+    let start = exp - 31 * 60_000;
+    let down = exp - 10 * 60_000;
+    // An oracle that moves every 3 s (HL's cadence); no hedge touch, so
+    // the member only samples.
+    let px = |t: u64| S_SP + ((t / 3_000) % 97) as i64 * 1_000_000;
+    let mut a = member();
+    let mut c = Rec::default();
+    a.on_fill(&fill(opt_sym(3), Side::Bid, 30_000_000, 1_000_000, 1, start), &mut c);
+    let mut t = start;
+    while t < down {
+        a.on_venue_event(&mark(SP_HEDGE, px(t), t), &mut c);
+        a.on_timer(ns(t), &mut c);
+        t += 1_000;
+    }
+    // COPY: the crashed process's grid (≤ 14.4 KiB), once — test-only (this
+    // file is the member's `#[cfg(test)]` module) — the window it lends
+    // goes on being written.
+    let kept = a.settle.iter().find(|x| x.live).expect("a window").window.samples().to_vec();
+    // Instants T−30 min + 1 s … the one before the last print (a print
+    // fills its instant at the next one).
+    assert_eq!(kept.len(), 1_198);
+    let text = rendered(&a);
+    let runs = text.lines().filter(|l| l.starts_with("S\t")).count();
+    assert!(runs > 0 && runs < kept.len(), "run-length: {runs} rows");
+    let mut b = member();
+    let back = down + 60_000;
+    let r = b.restore_state(&text, T0_MS + back).expect("restores");
+    assert_eq!((r.positions, r.windows), (1, 1));
+    let mut t = back;
+    while t <= exp + 61_000 {
+        b.on_venue_event(&mark(SP_HEDGE, px(t), t), &mut c);
+        b.on_timer(ns(t), &mut c);
+        t += 1_000;
+    }
+    let k = b.counters();
+    assert_eq!((k.settlements, k.settle_fallbacks), (1, 0), "29 minutes of 30 is the venue's estimate");
+    let w = &b.settle.iter().find(|x| x.exp_ms == T0_MS + exp).expect("the window").window;
+    let grid = w.samples();
+    // The dark minute is missing — not held — and so is the instant the
+    // last print before the crash was waiting to fill.
+    assert_eq!(grid.len(), GRID_POINTS - 61);
+    assert_eq!(grid[..kept.len()], kept[..]);
+    let mut scratch = [0i64; GRID_POINTS];
+    let s_t = core_settle::median_of_means(grid, BucketOrder::Sorted, &mut scratch).expect("a price");
+    assert_eq!(b.cash_usd_1e6(), -30_000_000 + (s_t - S_SP).max(0), "booked on that grid");
+}
+
+#[test]
+fn a_fixed_window_keeps_only_its_price() {
+    let exp = DAY / 2;
+    let mut a = member();
+    let mut c = Rec::default();
+    a.on_fill(&fill(opt_sym(3), Side::Bid, 30_000_000, 1_000_000, 1, 0), &mut c);
+    let mut t = exp - 60_000;
+    while t < exp - 50_000 {
+        a.on_venue_event(&mark(SP_HEDGE, S_SP, t), &mut c);
+        a.on_timer(ns(t), &mut c);
+        t += 1_000;
+    }
+    // Fixed, not yet booked (an oracle that has not come back, say).
+    let k = a.settle.iter().position(|x| x.live).expect("a window");
+    a.settle[k].px_1e6 = 6_650_000_000;
+    let text = rendered(&a);
+    assert!(!text.lines().any(|l| l.starts_with("S\t")), "no grid for a fixed price");
+    let mut b = member();
+    b.restore_state(&text, T0_MS + exp).expect("restores");
+    let s = b.settle.iter().find(|x| x.live).expect("the window");
+    assert_eq!((s.exp_ms, s.px_1e6, s.window.points()), (T0_MS + exp, 6_650_000_000, 0));
+    // Booked on the kept price once due.
+    feed_sp(&mut b, &mut c, 6_600_000_000, exp + 61_000);
+    b.on_timer(ns(exp + 61_000), &mut c);
+    assert_eq!(b.cash_usd_1e6(), -30_000_000 + 50_000_000);
+    assert_eq!(b.counters().settle_fallbacks, 0);
+}
+
+#[test]
+fn the_epoch_moves_only_with_what_outlives_the_process() {
+    let mut s = member();
+    let mut c = Rec::default();
+    feed_sp(&mut s, &mut c, S_SP, 0);
+    s.on_timer(ns(0), &mut c);
+    let e = s.state_epoch;
+    assert_eq!(e, 1, "the day's opening mark");
+    // Quotes, oracles and quiet timers are not state.
+    quote_call(&mut s, &mut c, 0.15, 0.17, 500);
+    feed_sp(&mut s, &mut c, S_SP + 1_000_000, 1_000);
+    s.on_timer(ns(1_000), &mut c);
+    assert_eq!(s.state_epoch, e);
+    // Fills are.
+    s.on_fill(&fill(opt_sym(3), Side::Bid, 30_000_000, 1_000_000, 1, 1_000), &mut c);
+    s.on_fill(&fill(SP_HEDGE, Side::Ask, S_SP, 500_000, 2, 1_000), &mut c);
+    assert_eq!(s.state_epoch, e + 2);
+    // A window opening is (T − 30 min − 5 s); a sample in the same minute
+    // is not; the first sample of the next minute is.
+    let open = DAY / 2 - 30 * 60_000 - 5_000;
+    let mut t = open;
+    while t < open + 5_000 {
+        feed_sp(&mut s, &mut c, S_SP, t);
+        s.on_timer(ns(t), &mut c);
+        t += 1_000;
+    }
+    assert_eq!(s.state_epoch, e + 3, "opened, then four samples inside its first minute");
+    feed_sp(&mut s, &mut c, S_SP, open + 5_000);
+    s.on_timer(ns(open + 5_000), &mut c);
+    assert_eq!(s.state_epoch, e + 4, "a new minute of the window");
+}
+
+#[test]
+fn the_book_leaves_by_mailbox_when_it_moved_and_a_held_slot_is_offered_again() {
+    let mut s = member();
+    let mut c = Rec::default();
+    let (tx, mut rx) = core_ring::Mailbox::new(HcvStateSnap::new_boxed()).split();
+    s.install_state_outbox(tx);
+    feed_sp(&mut s, &mut c, S_SP, 0);
+    s.on_timer(ns(0), &mut c);
+    assert_eq!(rx.try_take().expect("the day's mark, handed").n_pos, 0);
+    s.on_timer(ns(1_000), &mut c);
+    assert!(rx.try_take().is_none(), "nothing moved, nothing handed");
+    s.on_fill(&fill(opt_sym(0), Side::Ask, 80_000_000, 1_000_000, 1, 1_500), &mut c);
+    s.on_timer(ns(2_000), &mut c);
+    // The writer is slow: the slot is still FULL when the next fill lands.
+    s.on_fill(&fill(opt_sym(0), Side::Ask, 80_000_000, 1_000_000, 2, 2_500), &mut c);
+    s.on_timer(ns(3_000), &mut c);
+    {
+        let t = rx.try_take().expect("the first book");
+        assert_eq!((t.n_pos, t.pos[0].pos_1e6), (1, -1_000_000), "the older one");
+    }
+    s.on_timer(ns(4_000), &mut c);
+    let t = rx.try_take().expect("offered again: the newest");
+    assert_eq!((t.epoch, t.pos[0].pos_1e6), (s.state_epoch, -2_000_000));
+    // What the writer renders is what the shutdown's forced write renders.
+    let mut via_writer = String::new();
+    render_state(&t, &mut via_writer);
+    assert_eq!(via_writer, rendered(&s));
+}
+
+#[test]
+fn a_file_the_member_cannot_read_exactly_refuses_and_changes_nothing() {
+    let good = rendered(&traded_member());
+    let exp = T0_MS + 7 * DAY;
+    let p_row = format!("P\tSP500\t{exp}\t{S_SP}\tC\t1000000\t1\t1\n");
+    let win = |px: i64, n: u32, rows: &str| format!("{good}W\tSP500\t{exp}\t{px}\t{n}\t{n}\t{}\n{rows}", exp - 1);
+    let mut nine = good.clone();
+    let mut k = 0u64;
+    while k < 9 {
+        nine.push_str(&format!("W\tSP500\t{}\t0\t0\t0\t0\n", exp + k * DAY));
+        k += 1;
+    }
+    let mut orphans = good.clone();
+    let mut k = 0i64;
+    while k <= HCV_MAX_ORPHANS as i64 {
+        orphans.push_str(&format!("P\tSP500\t{exp}\t{}\tC\t1000000\t1\t1\n", 1_000_000 + k));
+        k += 1;
+    }
+    let first_p = good.lines().find(|l| l.starts_with("P\t")).expect("a P row");
+    let d_line = good.lines().find(|l| l.starts_with("D\t")).expect("a D row");
+    let bad: [(&str, String); 29] = [
+        ("a version it does not read", good.replace("V\t1\n", "V\t2\n")),
+        ("no V row", good.replace("V\t1\n", "")),
+        ("V after C", good.replace("V\t1\n", "").replace("D\t", "V\t1\nD\t")),
+        ("an unknown tag", format!("{good}Q\t1\n")),
+        ("a second C", format!("{good}C\t5\n")),
+        ("no D row", good.lines().filter(|l| !l.starts_with("D\t")).map(|l| format!("{l}\n")).collect()),
+        ("a contract twice", format!("{good}{first_p}\n")),
+        ("an untraded underlying", format!("{good}{}", p_row.replace("SP500", "BABA"))),
+        ("a bad right", format!("{good}{}", p_row.replace("\tC\t", "\tX\t"))),
+        ("a zero size", format!("{good}{}", p_row.replace("\t1000000\t", "\t0\t"))),
+        ("a hedge twice", format!("{good}H\tSP500\t5\t0\n")),
+        ("a run outside a window", format!("{good}S\t5\t1\n")),
+        ("a grid short at the end", win(0, 3, "S\t5\t2\n")),
+        ("a grid short before the next row", win(0, 3, "S\t5\t2\nH\tBTC\t1\n")),
+        ("a run past its window", win(0, 2, "S\t5\t3\n")),
+        ("a fixed window with a grid", win(6_600_000_000, 2, "S\t5\t2\n")),
+        ("a window twice", format!("{}{}", win(0, 0, ""), &win(0, 0, "")[good.len()..])),
+        ("more windows than the member samples", nine),
+        ("a field too many", good.replacen("C\t", "C\t0\t", 1)),
+        ("not an integer", good.replacen("C\t", "C\tabc", 1)),
+        ("more orphans than the member carries", orphans),
+        // Plausibility (HC11b review): nothing the arithmetic cannot carry.
+        ("a size of i64::MIN", format!("{good}{}", p_row.replace("\t1000000\t1\t1", "\t-9223372036854775808\t1\t1"))),
+        ("a size past 1e15", format!("{good}{}", p_row.replace("\t1000000\t1\t1", "\t1000000000000001\t1\t1"))),
+        ("a strike past 1e15", format!("{good}{}", p_row.replace(&format!("\t{S_SP}\t"), "\t1000000000000001\t"))),
+        ("an expiry past 2100", format!("{good}{}", p_row.replace(&format!("\t{exp}\t"), "\t4102444800001\t"))),
+        ("a hedge of i64::MIN", good.replacen("H\tSP500\t1500000\t", "H\tSP500\t-9223372036854775808\t", 1)),
+        ("an opening mark of i64::MIN", good.replace(d_line, "D\t1\t-9223372036854775808")),
+        ("a real hedge on an untraded underlying", format!("{good}H\tBABA\t1000000\t150000000\n")),
+        ("a window on an untraded underlying", format!("{good}W\tBABA\t{exp}\t0\t0\t0\t0\n")),
+    ];
+    for (why, text) in &bad {
+        let mut s = member();
+        let e = s.restore_state(text, T0_MS).expect_err(why);
+        assert!(is_blank(&s), "{why}: the member is unchanged ({e})");
+        assert!(!s.state_restored, "{why}");
+    }
+    // The line is named (the header's six comment lines, then V C D P P H).
+    let mut s = member();
+    let e = s.restore_state(&format!("{good}Q\t1\n"), T0_MS).unwrap_err();
+    assert_eq!(e.line, 13);
+    assert_eq!(e.to_string(), "hcv-state.tsv line 13: an unknown row tag");
+    let e = HcvStrategy::new().restore_state(&good, T0_MS).unwrap_err();
+    assert_eq!((e.line, e.to_string().as_str()), (0, "hcv-state.tsv: the book is restored after configure"));
+}
+
+// ---- HC11b review regressions ------------------------------------------------
+
+/// MAJOR: right after a restore no Hyperliquid Mark has arrived, and a hedge
+/// at a zero price is no mark. The day waits for a known one — and so does
+/// new risk; once every held underlying's oracle is in, the day rolls on it.
+#[test]
+fn an_unknown_mark_after_a_restore_holds_the_day_and_stops_new_risk() {
+    let mut a = member();
+    let mut c = Rec::default();
+    a.on_venue_event(&mark(BTC_HEDGE, S_BTC, 0), &mut c);
+    feed_sp(&mut a, &mut c, S_SP, 0);
+    a.on_timer(ns(0), &mut c);
+    // A short BTC hedge residual: +$11 000 of cash, −$11 000 at its mark.
+    a.on_fill(&fill(BTC_HEDGE, Side::Ask, S_BTC, 100_000, 1, 100), &mut c);
+    let text = rendered(&a);
+    // Back the next day: SP500's oracle and a rich quote arrive first.
+    let mut b = member();
+    b.restore_state(&text, T0_MS + DAY).expect("restores");
+    b.events = calendar(T0_MS + DAY - 60_000, &[]);
+    let mut c = Rec::default();
+    feed_sp(&mut b, &mut c, S_SP, DAY);
+    quote_call(&mut b, &mut c, 0.22, 0.24, DAY);
+    b.on_timer(ns(DAY), &mut c);
+    assert!(c.orders.is_empty(), "no new risk on an unknown mark: {:?}", c.orders);
+    assert_eq!(b.counters().skip_stopped, 1);
+    assert_eq!((b.day, b.day_start_pnl_usd_1e6), (a.day, a.day_start_pnl_usd_1e6), "the day waits");
+    assert_eq!(b.counters().pnl_usd_1e6, 0, "no mark published on an unknown one");
+    assert_eq!(b.counters().marks_unknown, 1, "BTC: a hedge and no oracle yet");
+    // BTC's oracle arrives: the mark is known, the day rolls on it and the
+    // sale goes.
+    b.on_venue_event(&mark(BTC_HEDGE, S_BTC, DAY + 1_000), &mut c);
+    feed_sp(&mut b, &mut c, S_SP, DAY + 1_000);
+    quote_call(&mut b, &mut c, 0.22, 0.24, DAY + 1_000);
+    b.on_timer(ns(DAY + 1_000), &mut c);
+    assert_eq!(b.day, (T0_MS + DAY) / DAY);
+    assert_eq!(b.day_start_pnl_usd_1e6, 0, "cash +11 000 against a hedge marked −11 000");
+    assert_eq!(b.counters().marks_unknown, 0);
+    assert_eq!(c.orders.iter().filter(|o| o.venue == VenueId::Hypercall as u8).count(), 1);
+}
+
+/// MINOR: an orphan with no σ̂ (its series went cold) no longer freezes its
+/// underlying's hedge while its expiry is quoted: it borrows the nearest
+/// quoted strike's implied vol. With nothing quoted, the hedge is held.
+#[test]
+fn an_orphan_without_a_forecast_is_priced_off_its_expirys_nearest_quote() {
+    let exp = DAY / 2;
+    let mut a = member();
+    let mut c = Rec::default();
+    a.on_fill(&fill(opt_sym(3), Side::Bid, 30_000_000, 1_000_000, 1, 0), &mut c);
+    let text = rendered(&a);
+    // The next chain lists the same expiry at another strike only.
+    let mut p2 = params();
+    p2.options[3].strike_1e6 = S_SP + 100_000_000;
+    let mut b = member_with(&p2);
+    b.restore_state(&text, T0_MS).expect("restores");
+    assert_eq!(b.counters().restored, 1);
+    b.set_har_view(&[]);
+    let mut c = Rec::default();
+    feed_sp(&mut b, &mut c, S_SP, 1_000);
+    b.on_timer(ns(1_000), &mut c);
+    assert!(c.orders.is_empty(), "nothing quoted and no σ̂: the hedge is held");
+    // The neighbour strike quotes (~20 % vol, 12 h).
+    let (bid, ask) = (
+        px_at(true, S_SP, S_SP + 100_000_000, 0.5, 0.19),
+        px_at(true, S_SP, S_SP + 100_000_000, 0.5, 0.21),
+    );
+    b.on_tick(&hc_tick(3, bid, ask, 2_000), &mut c);
+    feed_sp(&mut b, &mut c, S_SP, 2_000);
+    b.on_timer(ns(2_000), &mut c);
+    assert_eq!(c.orders.len(), 1, "the long call's delta, hedged at its neighbour's vol");
+    assert_eq!((c.orders[0].sym, c.orders[0].side), (SP_HEDGE, Side::Ask));
+    let (delta, _) = b.exposure(0, T0_MS + 2_000, ns(2_000)).expect("priced now");
+    assert!(delta > 400_000 && delta < 600_000, "an ATM call's delta: {delta}");
+    assert!(exp > 2_000);
+}
+
+/// MINOR: a hedge residual under the venue's minimum on an underlying
+/// hcv.toml no longer trades (one the member could never close) is
+/// dropped and counted; one above it still refuses the boot.
+#[test]
+fn a_dust_hedge_on_an_underlying_no_longer_traded_is_dropped_but_a_real_one_refuses() {
+    let good = rendered(&traded_member());
+    let mut s = member();
+    // 0.00005 BTC at $110 000: $5.50, under the $10 minimum.
+    let dust = format!("{good}H\tETH\t50\t110000000000\n");
+    let r = s.restore_state(&dust, T0_MS).expect("restores");
+    assert_eq!((r.hedges, r.hedges_dropped), (1, 1));
+    // The same size with no mark, or worth $11, refuses.
+    for bad in [format!("{good}H\tETH\t50\t0\n"), format!("{good}H\tETH\t100\t110000000000\n")] {
+        let mut s = member();
+        let e = s.restore_state(&bad, T0_MS).unwrap_err();
+        assert!(e.what.contains("a hedge on an underlying"), "{e}");
+    }
+}
+
+/// MINOR: a book the writer stops taking — its file falls behind — stops new
+/// risk after `HCV_BOOK_STALE_NS`; hedging goes on, and a taken book clears it.
+#[test]
+fn a_book_the_writer_stops_taking_stops_new_risk() {
+    let mut s = member();
+    let mut c = Rec::default();
+    let (tx, mut rx) = core_ring::Mailbox::new(HcvStateSnap::new_boxed()).split();
+    s.install_state_outbox(tx);
+    feed_sp(&mut s, &mut c, S_SP, 0);
+    s.on_timer(ns(0), &mut c);
+    // The writer took the day's mark, then stopped: the slot stays FULL.
+    drop(rx.try_take().expect("handed"));
+    s.on_fill(&fill(opt_sym(1), Side::Ask, 80_000_000, 1_000_000, 1, 500), &mut c);
+    s.on_timer(ns(1_000), &mut c);
+    s.on_fill(&fill(opt_sym(1), Side::Ask, 80_000_000, 1_000_000, 2, 1_500), &mut c);
+    let stale_at = 2_000 + HCV_BOOK_STALE_NS / 1_000_000;
+    s.on_timer(ns(2_000), &mut c);
+    assert!(!s.book_stale(ns(stale_at - 1)));
+    assert!(s.book_stale(ns(stale_at)));
+    // Rich quote after the stale point: no sale; the hedge still goes.
+    feed_sp(&mut s, &mut c, S_SP, stale_at);
+    quote_call(&mut s, &mut c, 0.22, 0.24, stale_at);
+    let n0 = c.orders.len();
+    s.on_timer(ns(stale_at), &mut c);
+    assert!(c.orders[n0..].iter().all(|o| o.venue == VenueId::Hyperliquid as u8), "hedges only");
+    assert_eq!(s.counters().book_stale, 1);
+    assert!(s.counters().skip_stopped >= 1);
+    // The writer takes it again: the newest book goes and the stop lifts.
+    drop(rx.try_take().expect("the first book"));
+    s.on_timer(ns(stale_at + 1_000), &mut c);
+    assert_eq!(rx.try_take().expect("the newest book").pos[0].pos_1e6, -2_000_000);
+    assert!(!s.book_stale(ns(stale_at + 1_000)));
+    s.on_timer(ns(stale_at + 2_000), &mut c);
+    assert_eq!(s.counters().book_stale, 0);
+}
+
+/// Re-verification: a restart before an underlying's first Mark writes back
+/// the mark the book was restored with — never 0 — so the residual rule
+/// still has its measure at the boot after; the live oracle replaces it.
+#[test]
+fn a_restored_hedge_keeps_its_mark_until_the_feed_brings_one() {
+    let a = traded_member();
+    let text = rendered(&a);
+    let h_row = format!("H\tSP500\t1500000\t{S_SP}\n");
+    assert!(text.contains(&h_row), "{text}");
+    let mut b = member();
+    b.restore_state(&text, T0_MS + 1_000).expect("restores");
+    assert!(rendered(&b).contains(&h_row), "the kept mark, before any oracle");
+    b.on_venue_event(&mark(SP_HEDGE, S_SP + 7_000_000, 2_000), &mut Rec::default());
+    assert!(rendered(&b).contains(&format!("H\tSP500\t1500000\t{}\n", S_SP + 7_000_000)), "the live one");
+    assert_eq!(b.und[0].oracle_1e6, S_SP + 7_000_000);
+    // A mark kept is never a mark for the P&L.
+    let mut c = member();
+    c.restore_state(&text, T0_MS + 1_000).expect("restores");
+    assert_eq!(c.marked_pnl(T0_MS + 1_000, ns(1_000)), None);
+}

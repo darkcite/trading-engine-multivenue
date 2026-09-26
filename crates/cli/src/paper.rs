@@ -3734,6 +3734,78 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             tracing::error!(error = %e, "hcv: artifact refused");
             return EngineLoopResult::Failed("hcv: artifact refused by the strategy");
         }
+        // HC11b: the book a previous process left — positions by contract,
+        // hedges, cash, the day's mark, open settlement windows. A file the
+        // member cannot read exactly is a position nobody would hedge or
+        // settle, so it refuses the boot (the VRP / XSD law).
+        if let Some(text) = boot.state.as_deref() {
+            let now_ms = params.anchor.wall_of(core_time::now_ns()) / 1_000_000;
+            match set.hcv_mut().restore_state(text, now_ms) {
+                Ok(r) => {
+                    tracing::info!(
+                        positions = r.positions,
+                        orphans = r.orphans,
+                        expired = r.expired,
+                        hedges = r.hedges,
+                        hedges_dropped = r.hedges_dropped,
+                        windows = r.windows,
+                        cash_usd_1e6 = r.cash_usd_1e6,
+                        path = %boot.state_path.display(),
+                        "hcv: book restored"
+                    );
+                    if r.orphans > 0 {
+                        tracing::warn!(
+                            orphans = r.orphans,
+                            "hcv: held contracts outside this boot's chain — carried by their terms \
+                             (hedged and marked at σ̂, settled at expiry), never traded until a chain \
+                             lists them again"
+                        );
+                    }
+                    if r.expired > 0 {
+                        tracing::warn!(
+                            expired = r.expired,
+                            "hcv: positions expired while the engine was down — booked at the first \
+                             timer, on their window if one was kept (else counted in settle_fallbacks)"
+                        );
+                    }
+                    if r.hedges_dropped > 0 {
+                        tracing::warn!(
+                            hedges_dropped = r.hedges_dropped,
+                            "hcv: hedge residuals under the venue's minimum on underlyings hcv.toml no \
+                             longer trades were dropped from the book"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(reason = %e, path = %boot.state_path.display(), "hcv: book refused");
+                    return EngineLoopResult::Failed("hcv: state file refused by the strategy");
+                }
+            }
+        }
+        // …and where it goes. The book is written once here, on the boot
+        // path, so a file it cannot write refuses the boot before anything
+        // trades; from then on the member hands every change to the writer
+        // thread at its timer (a writer that stops taking them stops new
+        // risk, `HCV_BOOK_STALE_NS`). A book that cannot persist must not
+        // trade, so a writer that did not spawn refuses the boot too.
+        let mut first = String::new();
+        if strategy_core::StrategyCounters::render_hcv_state(set.hcv(), &mut first) {
+            if let Err(reason) = crate::state_file::write_atomic(&boot.state_path, &first) {
+                tracing::error!(%reason, path = %boot.state_path.display(), "hcv: the book's file is not writable");
+                return EngineLoopResult::Failed("hcv: the book's file is not writable");
+            }
+        }
+        match crate::hcv_boot::spawn_state_writer(boot.state_path.clone()) {
+            Ok((tx, w)) => {
+                set.hcv_mut().install_state_outbox(tx);
+                obs.hcv_writer = Some(w);
+                obs.hcv_state_path = Some(boot.state_path.clone());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "hcv: the state writer did not spawn");
+                return EngineLoopResult::Failed("hcv: the state writer did not spawn");
+            }
+        }
         let (tx, rx) = core_ring::Mailbox::new(Box::new(strategy_hcv::HcvEvents::new())).split();
         set.hcv_mut().install_events(rx);
         match crate::hcv_boot::HcvEventsReader::spawn(
@@ -3846,7 +3918,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             // (logged, never a refusal — the boot's failure isolation).
             let (tx, rx) = crate::har_writer::outbox(hb.series.len());
             let names = hb.series.iter().map(|s| s.name.clone()).collect();
-            match crate::har_writer::HarWriter::spawn(rx, names, obs.har_state_paths.clone()) {
+            match crate::har_writer::spawn(rx, names, obs.har_state_paths.clone()) {
                 Ok(w) => {
                     set.install_har_outbox(tx);
                     obs.har_writer = Some(w);
@@ -4530,12 +4602,19 @@ pub struct Observability {
     /// outbox. `None` (no HAR service, or its spawn failed) = the engine
     /// loop writes them itself (the pre-H3.7 path). **Taken** by the
     /// engine loop, stopped and joined before its shutdown write.
-    pub har_writer: Option<crate::har_writer::HarWriter>,
+    pub har_writer: Option<crate::persist::StateWriter>,
     /// HC11: slot 7's calendar reader (`hcv-events`) — it hands the
     /// member each new `scheduled-events.json` through the mailbox the
     /// set builder installed. Stopped and joined when this drops, at the
     /// loop's end. `None` = no hcv member (or its spawn failed).
     pub hcv_events: Option<crate::hcv_boot::HcvEventsReader>,
+    /// HC11b: where slot 7's book is written — `None` = no hcv member, and
+    /// the engine writes nothing. Set by the set builder from the boot.
+    pub hcv_state_path: Option<std::path::PathBuf>,
+    /// HC11b: the thread that renders and writes that book — handed to it
+    /// by the member at its timer. **Taken** by the engine loop, stopped and
+    /// joined before the shutdown's forced write.
+    pub hcv_writer: Option<crate::persist::StateWriter>,
     /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
     /// (all-zero: no HAR service) — `/state.har.hash`.
     pub har_hash: [u8; 32],
@@ -6232,7 +6311,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
 
 /// The counter rows of the hcv family, in [`hcv_counter_values`] order
 /// — which is what pins the two together.
-const HCV_COUNTER_NAMES: [&str; 17] = [
+const HCV_COUNTER_NAMES: [&str; 18] = [
     "engine_hcv_judged_total",
     "engine_hcv_sells_total",
     "engine_hcv_buys_total",
@@ -6250,20 +6329,24 @@ const HCV_COUNTER_NAMES: [&str; 17] = [
     "engine_hcv_ctx_refused_total",
     "engine_hcv_calendars_total",
     "engine_hcv_har_updates_total",
+    "engine_hcv_restored_total",
 ];
 
 /// The gauge rows of the hcv family, in [`hcv_gauge_values`] order.
-const HCV_GAUGE_NAMES: [&str; 4] = [
+const HCV_GAUGE_NAMES: [&str; 7] = [
     "engine_hcv_positions",
     "engine_hcv_vega_abs_usd_1e6",
     "engine_hcv_pnl_usd_1e6",
     "engine_hcv_day_pnl_usd_1e6",
+    "engine_hcv_orphans",
+    "engine_hcv_book_stale",
+    "engine_hcv_marks_unknown",
 ];
 
 /// `HcvCounters`' counter fields in [`HCV_COUNTER_NAMES`] order.
-// COPY: [u64; 17] (136 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 18] (144 B) returned by value — cold, the 5 s /metrics
 // mirror; the xmm precedent (the POD is a struct, not an array).
-fn hcv_counter_values(c: &strategy_core::HcvCounters) -> [u64; 17] {
+fn hcv_counter_values(c: &strategy_core::HcvCounters) -> [u64; 18] {
     [
         c.judged,
         c.sells,
@@ -6282,30 +6365,41 @@ fn hcv_counter_values(c: &strategy_core::HcvCounters) -> [u64; 17] {
         c.ctx_refused,
         c.calendars,
         c.har_updates,
+        c.restored,
     ]
 }
 
 /// `HcvCounters`' gauge fields in [`HCV_GAUGE_NAMES`] order.
-fn hcv_gauge_values(c: &strategy_core::HcvCounters) -> [i64; 4] {
-    [c.positions, c.vega_abs_usd_1e6, c.pnl_usd_1e6, c.day_pnl_usd_1e6]
+fn hcv_gauge_values(c: &strategy_core::HcvCounters) -> [i64; 7] {
+    [
+        c.positions,
+        c.vega_abs_usd_1e6,
+        c.pnl_usd_1e6,
+        c.day_pnl_usd_1e6,
+        c.orphans,
+        c.book_stale,
+        c.marks_unknown,
+    ]
 }
 
 /// HC11: the `engine_hcv_*` family (slot 7) — what the member judged,
 /// did and skipped (by cause), and its book: positions, |vega|, the
-/// marked P&L and the day's.
+/// marked P&L and the day's; since HC11b what the boot restored, the
+/// orphans it carries, whether its file is behind the book, and how many
+/// held underlyings still wait for a mark.
 #[derive(Copy, Clone, Debug)]
 pub struct HcvMetricIds {
     /// The counters, in [`HCV_COUNTER_NAMES`] order.
-    pub counters: [core_metrics::CounterId; 17],
+    pub counters: [core_metrics::CounterId; 18],
     /// The gauges, in [`HCV_GAUGE_NAMES`] order.
-    pub gauges: [core_metrics::GaugeId; 4],
+    pub gauges: [core_metrics::GaugeId; 7],
 }
 
 /// Register the hcv family. Boot-only.
 fn register_hcv_metrics(
     reg: &mut core_metrics::MetricsRegistry,
 ) -> Result<HcvMetricIds, &'static str> {
-    let mut counters = [core_metrics::CounterId::default(); 17];
+    let mut counters = [core_metrics::CounterId::default(); 18];
     let mut i = 0usize;
     while i < HCV_COUNTER_NAMES.len() {
         counters[i] = reg
@@ -6313,7 +6407,7 @@ fn register_hcv_metrics(
             .map_err(|_| "register hcv counter")?;
         i += 1;
     }
-    let mut gauges = [core_metrics::GaugeId::default(); 4];
+    let mut gauges = [core_metrics::GaugeId::default(); 7];
     let mut k = 0usize;
     while k < HCV_GAUGE_NAMES.len() {
         gauges[k] = reg
@@ -6332,7 +6426,7 @@ fn mirror_hcv_metrics<S: strategy_core::StrategyCounters>(
     strat: &S,
     last: &mut strategy_core::HcvCounters,
 ) {
-    // COPY: the 168 B `HcvCounters` read into `cur`, then kept as the
+    // COPY: the 200 B `HcvCounters` read into `cur`, then kept as the
     // next delta's baseline — 5 s cadence, cold; a delta needs the
     // previous value (the xmm precedent).
     let mut cur = strategy_core::HcvCounters::default();
@@ -6350,7 +6444,7 @@ fn mirror_hcv_metrics<S: strategy_core::StrategyCounters>(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: 168 B — the next delta's baseline (see above).
+    // COPY: 200 B — the next delta's baseline (see above).
     *last = cur;
 }
 
@@ -8259,6 +8353,10 @@ where
     // shutdown's forced write.
     let har_writer = obs.har_writer.take();
     let har_on_loop = har_writer.is_none();
+    // HC11b: slot 7's book writer and path, for the shutdown's forced write
+    // (the member hands every other one to the writer at its timer).
+    let hcv_writer = obs.hcv_writer.take();
+    let hcv_state_path = obs.hcv_state_path.take();
     let mut har_state_epochs = [0u64; core_vol::LONG_SET_MAX];
     {
         let n = strategy_core::StrategyCounters::har_series(eng.strategy());
@@ -8734,6 +8832,21 @@ where
         now_ns(),
         true,
     );
+    // HC11b: slot 7's book, the same way — its writer joined first, then
+    // the live book written UNCONDITIONALLY (an open window's samples since
+    // its last minute move the book without moving the epoch).
+    if let Some(w) = hcv_writer {
+        w.shutdown();
+    }
+    if let Some(path) = hcv_state_path.as_deref() {
+        let mut buf = String::new();
+        if strategy_core::StrategyCounters::render_hcv_state(eng.strategy(), &mut buf) {
+            match crate::state_file::write_atomic(path, &buf) {
+                Ok(()) => tracing::info!(path = %path.display(), "hcv: book written at shutdown"),
+                Err(reason) => tracing::error!(%reason, path = %path.display(), "hcv: the shutdown's book write failed"),
+            }
+        }
+    }
     // S7-L1: what the live arm's shutdown sweep did — every resting
     // order of ours taken off the venue, or how many it could not
     // confirm (`u64::MAX`: the open orders could not be read).

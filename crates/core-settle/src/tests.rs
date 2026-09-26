@@ -164,6 +164,75 @@ fn refusals_leave_the_window_unchanged() {
     assert!(w.finish().is_empty());
 }
 
+/// HC11b: a window kept by a state file and rebuilt after a restart holds
+/// every point it had, holds NOTHING across the outage, and resumes at the
+/// first print after it.
+#[test]
+fn a_restored_window_keeps_its_points_and_holds_nothing_across_the_outage() {
+    const T: u64 = 1_790_366_400_000;
+    let t0 = T - SETTLE_WINDOW_MS;
+    let px = |k: u64| 1_000_000 + k as i64;
+    // Mid-second prints: after print k the grid has filled instants 0..k-1.
+    let mut kept = SettleWindow::new(T);
+    let mut k = 0u64;
+    while k <= 600 {
+        kept.push(t0 + k * 1_000 + 500, px(k)).unwrap();
+        k += 1;
+    }
+    assert_eq!((kept.points(), kept.next_index(), kept.last_ts_ms()), (600, 600, t0 + 600_500));
+    // The restart: a fresh window from what the file kept.
+    let mut r = SettleWindow::new(0);
+    r.restore(T, kept.next_index(), kept.last_ts_ms(), kept.samples()).unwrap();
+    assert_eq!(r.samples(), kept.samples());
+    assert_eq!((r.t_end_ms(), r.next_index(), r.last_ts_ms()), (T, 600, t0 + 600_500));
+    assert_eq!(r.push(t0 + 600_000, 5), Err(PushRefused::OutOfOrder), "the stamp survives");
+    // Two minutes dark, then prints every second to T — beside a window
+    // that never went down and held print 600 across the gap.
+    let mut held = kept.clone();
+    let mut k = 720u64;
+    while k < 1_800 {
+        r.push(t0 + k * 1_000 + 500, px(k)).unwrap();
+        held.push(t0 + k * 1_000 + 500, px(k)).unwrap();
+        k += 1;
+    }
+    // COPY: two finished grids (≤ 14.4 KiB each), once — test-only (this
+    // file is the crate's `#[cfg(test)]` module) — both windows lend them
+    // mutably-borrowed.
+    let (g_r, g_h) = (r.finish().to_vec(), held.finish().to_vec());
+    assert_eq!(g_h.len(), GRID_POINTS);
+    assert_eq!(g_r.len(), GRID_POINTS - 120, "instants 600..719 stayed empty");
+    assert_eq!(g_r[..600], g_h[..600]);
+    assert!(g_h[600..720].iter().all(|&x| x == px(600)), "the uninterrupted window held");
+    assert_eq!(g_r[600..], g_h[720..], "resumed at the first print after the outage");
+}
+
+#[test]
+fn a_restore_refuses_what_no_window_could_hold_and_leaves_it_unchanged() {
+    const T: u64 = 1_790_366_400_000;
+    let mut w = SettleWindow::new(T);
+    w.push(T - 10_500, 7).unwrap();
+    w.push(T - 9_500, 8).unwrap();
+    let grid = [7i64; 3];
+    let over = vec![1i64; GRID_POINTS + 1];
+    for (t_end, next, last, pts, why) in [
+        (T, 2u32, T - 1, &grid[..], "more points than instants filled"),
+        (T, GRID_POINTS as u32 + 1, T - 1, &over[..], "past the grid"),
+        (T, 3, T + 1, &grid[..], "a print after the expiry"),
+        (SETTLE_WINDOW_MS - 1, 3, 0, &grid[..], "no window ends there"),
+        (T, 3, T - 1, &[7, 0, 7][..], "a non-positive price"),
+    ] {
+        assert!(w.restore(t_end, next, last, pts).is_err(), "{why}");
+        // The first print advanced the grid to it (no price to hold yet),
+        // the second filled the instant between them.
+        assert_eq!((w.points(), w.next_index(), w.last_ts_ms()), (1, 1_790, T - 9_500), "{why}: unchanged");
+    }
+    // A consistent grid restores; the empty window of a fixed price does too.
+    w.restore(T, 3, T - 1, &grid).unwrap();
+    assert_eq!(w.samples(), &grid);
+    w.restore(T, GRID_POINTS as u32, T, &[]).unwrap();
+    assert_eq!(w.points(), 0);
+}
+
 proptest::proptest! {
     #[test]
     fn the_estimate_lies_within_the_samples_and_sorted_ignores_order(

@@ -53,6 +53,9 @@ pub mod hyparb_live;
 pub mod hyparb_rehearsal;
 pub mod options_manifest;
 pub mod paper;
+/// HC11b: a member's persisted state, rendered and written off the engine
+/// thread (the long-tenor series' and slot 7's book).
+pub mod persist;
 pub mod pinning;
 pub mod regime_boot;
 pub mod sigint;
@@ -63,8 +66,8 @@ pub mod vrp_boot;
 pub mod xsd_boot;
 /// XMM XH1: the slot-6 member's boot (`xmm.toml` → `XmmParams`).
 pub mod xmm_boot;
-/// HC11: the slot-7 member's boot (`hcv.toml` → `HcvParams`) and its
-/// calendar reader thread.
+/// HC11: the slot-7 member's boot (`hcv.toml` → `HcvParams`), its
+/// calendar reader thread and (HC11b) its book's file.
 pub mod hcv_boot;
 
 pub use paper::{

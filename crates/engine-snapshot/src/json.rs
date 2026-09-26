@@ -355,6 +355,8 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(hc.calendars);
     c.key("har_updates");
     c.u64(hc.har_updates);
+    c.key("restored");
+    c.u64(hc.restored);
     c.key("positions");
     c.i64(hc.positions);
     c.key("vega_abs_usd_1e6");
@@ -363,6 +365,12 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.i64(hc.pnl_usd_1e6);
     c.key("day_pnl_usd_1e6");
     c.i64(hc.day_pnl_usd_1e6);
+    c.key("orphans");
+    c.i64(hc.orphans);
+    c.key("book_stale");
+    c.i64(hc.book_stale);
+    c.key("marks_unknown");
+    c.i64(hc.marks_unknown);
     c.put(b"}");
 
     // --- exec (E6 c4) ---

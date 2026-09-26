@@ -1147,6 +1147,12 @@ impl StrategyCounters for StrategySet {
     fn hcv_counters(&self, out: &mut strategy_core::HcvCounters) {
         self.hcv.hcv_counters(out);
     }
+    /// HC11b: slot 7's book, for the shutdown's forced write — enabled or
+    /// not (a member switched off at runtime still holds its positions).
+    #[inline]
+    fn render_hcv_state(&self, out: &mut String) -> bool {
+        self.hcv.render_hcv_state(out)
+    }
     #[inline]
     fn hyparb_decision_log(&self) -> (&[strategy_core::HyparbDecision], u64) {
         self.hyparb.hyparb_decision_log()
@@ -3398,6 +3404,13 @@ mod tests {
         let mut k = strategy_core::HcvCounters::default();
         StrategyCounters::hcv_counters(&s, &mut k);
         assert_eq!((k.sells, k.option_fills), (1, 1));
+        // HC11b: the book reaches the shutdown's forced write through the
+        // set — by contract, with the position the fill made.
+        let mut text = String::new();
+        assert!(StrategyCounters::render_hcv_state(&s, &mut text));
+        let row = format!("P\tSP500\t{}\t6600000000\tC\t{}\t", t0_ms + 7 * DAY_MS, -o.qty.raw());
+        assert!(text.contains(&row), "{text}");
+        assert!(!StrategyCounters::render_hcv_state(&StrategySet::new(BIT_VM), &mut text), "no hcv member");
     }
 
     // ---- XMM XH1 ----------------------------------------------------

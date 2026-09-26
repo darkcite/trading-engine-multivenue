@@ -1026,6 +1026,14 @@ struct RunArgs {
     /// only when the requested mask carries the hcv bit.
     #[arg(long)]
     hcv_events: Option<PathBuf>,
+    /// HC11b: slot 7's book — the engine's OWN persisted positions (by
+    /// contract), hedges, cash, day mark and open settlement windows.
+    /// Default: `hcv-state.tsv` beside an explicit `--hcv`, else
+    /// `~/multivenue/hcv-state.tsv` (the F22 law: a smoke boot never reads or
+    /// rewrites the standing engine's book). A file the member cannot read
+    /// exactly refuses the boot.
+    #[arg(long)]
+    hcv_state: Option<PathBuf>,
     /// RG2: the regime detector's parameter artifact
     /// (`~/multivenue/regime.toml` by default; `docs/regime-and-dashboard-plan.md`
     /// §4.6). Set boots only. An ABSENT default file boots the detector
@@ -4650,6 +4658,7 @@ fn run(args: RunArgs) -> ExitCode {
                 match cli::hcv_boot::load_hcv_boot(
                     args.hcv.as_deref(),
                     args.hcv_events.as_deref(),
+                    args.hcv_state.as_deref(),
                     &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
                     &|coin: &str| {
                         discovery

@@ -6611,7 +6611,8 @@ or than now, and is halved until it does.
 
 **Stops.** The day's marked P&L at or below −$20 stops new risk; `kill = 1`
 stops it at boot; per underlying, a stale or crossed provider quote, a stale
-oracle or a stale touch stops it (the dead-man). **Hedging continues under
+oracle or a stale touch stops it (the dead-man); a mark not yet known (below)
+and a book whose file has fallen behind (below) stop it too. **Hedging continues under
 every stop, and so do reduces** (a buy-back of a short is closing risk).
 
 **The calendar fails closed.** A row naming an underlying outside `[hypercall]
@@ -6661,39 +6662,125 @@ orders.
 (the HAR set's annualiser). The marked P&L is cash + options at their mid
 IV (else σ̂) + perps at the oracle — an expired position not yet booked at
 its intrinsic on the fixed settlement (else the oracle), never at a stale
-premium; the day's is that less its value at the first timer of the UTC
-day.
+premium — since the book began (it persists, below); the day's is that less
+its value at the first timer of the UTC day that had a known mark. The mark
+is UNKNOWN while an underlying the book holds (an option or its hedge) has
+no oracle yet — after a boot, until its first Hyperliquid Mark: the day does
+not roll, the P&L gauges keep their last value, and new risk stops (the
+HC11b review found a restored hedge marked at a zero price lifting a
+tripped stop).
 
-**Observability.** `/state` `hcv` (configured, the artifact hash, 17
-counters, 4 gauges) and `slots[7]` named `hcv`; `engine_hcv_*` (17 counters,
-4 gauges); the boot tell `hcv: artifact configured …`. The calendar is read
-by the `hcv-events` thread on each change of `scheduled-events.json` and
-handed over a `core_ring::Mailbox` — the engine thread never opens the file.
+**The book persists (HC11b, `strategy_hcv::state`).** The engine restarts at
+00:10, 08:33 and 16:05Z and a position lives for days, so the book outlives
+the process in `hcv-state.tsv` (`--hcv-state`; else beside an explicit
+`--hcv`, else `~/multivenue/hcv-state.tsv` — the F22 law: a smoke boot never
+reads or rewrites the standing engine's book):
+
+- **What is kept:** every held option **by contract** — underlying,
+  expiry, strike, right; never by symbol, since the chain's ordinals are
+  re-allocated every boot — with its entry basis and last traded price; each
+  underlying's hedge position; the cash; the UTC day and its opening mark
+  (the day's stop carries across a restart); every live settlement window —
+  its 1 s grid run-length encoded, or its price once fixed.
+- **What is not:** IoCs in flight (the X1 law — the paper matcher's table
+  dies with the process; armed live, a fill that lands across a restart is
+  the reconcile's to carry — the live-arming ruling's), quotes, touches, the
+  oracle, σ̂, the calendar and the counters.
+- **Written off the engine thread (the H3.7 law).** A fill, a booking, a
+  window opened, fixed or freed, a window's sample in a new minute and the
+  UTC day move the member's state epoch; at its timer, while it moved, the
+  member copies the book into a `core_ring::Mailbox` and the
+  `hcv-state-writer` thread (`cli::persist`, shared with the HAR series)
+  renders and fsyncs it. A slot the writer still holds (a write in flight or
+  failing — retried every 5 s, one warning a minute) is offered again at the
+  next timer: the file never goes backwards. At shutdown the writer is joined
+  and the live book is written once more, unconditionally. **A book that
+  cannot persist must not grow:** the boot writes the book once itself and
+  refuses if it cannot, a writer that does not spawn refuses the boot, and a
+  moved book the writer has not taken for 30 s stops new risk
+  (`book_stale` = 1) until it takes one again — hedging and reduces go on.
+- **Restored at boot, fail closed.** After `configure`, before the first
+  event. A row the member cannot place — an underlying `hcv.toml` does not
+  trade, a malformed or extra field, an implausible value (any ×1e6
+  magnitude past 1e15, an expiry past 2100), an unknown tag, a duplicate, a
+  window's grid short of its points, more than eight windows — refuses the
+  boot (the VRP / XSD law), and the member is left unchanged. One exception:
+  a hedge residual under the venue's minimum (`hedge_min_usd`, judged at the
+  oracle the row was written with — the last one known, carried from the
+  restored book until the process's first Mark, so a restart never erases
+  it) on an underlying `hcv.toml` no longer trades — one the member could
+  never close — is dropped and counted in the tell. A file that exists but cannot be read (a directory it may not
+  search, bytes that are not UTF-8) refuses too: only a MISSING file is a
+  first boot.
+- **Orphans.** A held contract this boot's chain no longer lists (the capped
+  chain is ±4 strikes around the index, so a move can drop a held strike) is
+  carried by its terms — hedged and marked at σ̂ (no quote reaches it) or,
+  without σ̂, at the implied vol of its expiry's nearest quoted strike (the
+  same fallback serves any held option with neither), sampled and settled at
+  expiry — and never traded, until a later boot's chain lists it again. At
+  most 64; more refuses the boot.
+- **A restart inside the final window** keeps the grid it had and holds
+  NOTHING across the outage (sample-and-hold holds what was seen, never across
+  a gap): the dark instants are missing, not filled, so a long outage shows
+  as a thin window (`settle_fallbacks`). A position that expired while the
+  engine was down is booked at the first timer — on its window if one was
+  kept, else on the first oracle, counted.
+
+**Observability.** `/state` `hcv` (configured, the artifact hash, 18
+counters, 7 gauges — `restored`: positions the boot read back; `orphans`:
+positions carried outside the chain; `book_stale`: 1 while the file is
+behind the book; `marks_unknown`: held underlyings still waiting for their
+first oracle this process — while it is non-zero the mark is unknown and new
+risk stops) and `slots[7]` named `hcv`; `engine_hcv_*` (18 counters, 7
+gauges); the boot tells `hcv: artifact configured … state=<path>` and `hcv:
+book restored positions= orphans= expired= hedges= hedges_dropped= windows=
+cash_usd_1e6=` (a warning each for orphans, for positions that expired while
+down and for dropped residuals). The calendar is read by the `hcv-events`
+thread on each change of `scheduled-events.json` and handed over a
+`core_ring::Mailbox`; the book leaves by another — the engine thread never
+opens either file.
 
 **Known gaps — each blocks switching slot 7 on (or is R1's to measure):**
 
-1. **The book is per session.** Nothing persists across the engine's three
-   daily restarts (00:10 / 08:30 / 16:05Z), and every position opens at
-   least a day before its expiry — so on the live paper engine no position
-   reaches its settlement, and each session starts flat with fresh headroom.
-   The book must persist (keyed by instrument name, strike, expiry and right —
-   the chain's ordinals are re-allocated every boot) before slot 7 goes into
-   any mask (HC11b).
-2. The final-window delta is the European delta scaled by the fraction of
+1. The final-window delta is the European delta scaled by the fraction of
    the average still to come, not an average-price (Asian) delta on the
    running mean's effective strike: R1 measures how well the TWAP tracks.
-3. No cost term: HL taker fees and funding are not booked, and Hypercall's
+2. No cost term: HL taker fees and funding are not booked, and Hypercall's
    fee is `0:0` UNVERIFIED (O-HC7) — R1 carries both.
-4. A hedge residual under $10 cannot be closed (the venue minimum), and a
+3. A hedge residual under $10 cannot be closed (the venue minimum), and a
    stale oracle held in a settlement window counts as coverage.
+4. An orphan is marked and hedged at σ̂ (else its expiry's nearest quote),
+   not at a market it can no longer see, and cannot be reduced; a position
+   that expired while the engine was down is booked on the first oracle
+   rather than the venue's posted price.
 
-- **Gates:** `strategy-hcv`'s 37 tests (the laws above and the independent
-  review's eight regressions), the set's slot-7 tests, alloc gate 85 (the
-  member over the held-quote law, 2 400 engine steps with fills, hedges, a
-  TWAP and a settlement, 0 B/op), `make copy-audit` over the crate.
+- **Gates:** `strategy-hcv`'s 50 tests (the laws above, the independent
+  review's eight regressions, HC11b's eight — the round trip by contract
+  under a renumbered chain, the orphan hedged and settled but never traded,
+  a position expired while down, a restart inside the final window, a fixed
+  window, the epoch law, the mailbox hand-off and its retry, the refusals —
+  and its review's five: the unknown mark, the orphan's neighbour vol, the
+  dropped residual, the stale book, the kept mark),
+  `core-settle`'s window restore, the set's slot-7 tests, `cli`'s path law
+  and the writer-to-restore round trip, alloc gate 85 (the member over the
+  held-quote law, 2 400 engine steps with fills, hedges, a TWAP, a
+  settlement and every book hand-off, 0 B/op), `make copy-audit` over the
+  crate, `core-settle` and the writer thread.
 - **Review (2026-09-26, independent, Opus 5.5):** it found the caps blind to
   the IoC in flight, reduces bypassing the vega and stress laws, stale-premium
   marking of expired positions, a venue-blind option index, a residual hedge
   after T, the day stop blocking buy-backs, paper hedge IoCs that never
   expired, hedging on a partial delta, and a calendar that failed open on a
-  misspelt name — all fixed above; the per-session book is gap 1.
+  misspelt name — all fixed above; the per-session book it named is closed
+  by HC11b (the book persists, above).
+- **Review of HC11b (2026-09-26, independent, Opus 5.5, 19 min, each defect
+  reproduced by a probe):** MAJOR — right after a restore the day's opening
+  mark and its stop were judged with a hedge at a zero oracle (a tripped
+  stop lifted, and a sale went out). MINOR — an orphan without σ̂ froze its
+  underlying's hedge; a dust hedge on an underlying no longer traded refused
+  the boot; no plausibility bounds (`i64::MIN` sizes overflowed `abs`); a
+  book the writer could not write kept trading; a stat error read as a
+  first boot; two doc overclaims. All fixed above, each with a regression.
+  Its re-verification confirmed all six and found one regression — the
+  boot's own write erased every hedge's mark before the first oracle —
+  fixed: the last known mark is carried until the feed brings one.

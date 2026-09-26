@@ -285,6 +285,68 @@ impl SettleWindow {
         self.n as usize
     }
 
+    /// HC11b: the grid points written so far, in time order — what a state
+    /// file keeps of an open window.
+    #[inline]
+    #[must_use]
+    pub fn samples(&self) -> &[i64] {
+        &self.samples[..self.n as usize]
+    }
+
+    /// HC11b: the next grid index to fill ([`GRID_POINTS`] once the window
+    /// has run to `T`).
+    #[inline]
+    #[must_use]
+    pub const fn next_index(&self) -> u32 {
+        self.next
+    }
+
+    /// HC11b: the stamp of the last accepted print (0 = none yet).
+    #[inline]
+    #[must_use]
+    pub const fn last_ts_ms(&self) -> u64 {
+        self.last_ts_ms
+    }
+
+    /// HC11b: rebuild the window for expiry `t_end_ms` from what a state
+    /// file kept of it — the grid points written, the next grid index and
+    /// the last print's stamp.
+    ///
+    /// The held price does NOT carry: the process was down between the last
+    /// print and the next, and sample-and-hold holds what was seen, never
+    /// across an outage. The grid instants in between stay empty — they
+    /// count against [`Self::points`], which is how a consumer sees the gap.
+    ///
+    /// # Errors
+    ///
+    /// What is inconsistent; the window is unchanged.
+    pub fn restore(&mut self, t_end_ms: u64, next: u32, last_ts_ms: u64, samples: &[i64]) -> Result<(), &'static str> {
+        let n = samples.len();
+        if next as usize > GRID_POINTS || n > next as usize {
+            return Err("settle window: more points than grid instants");
+        }
+        if t_end_ms < SETTLE_WINDOW_MS || last_ts_ms > t_end_ms {
+            return Err("settle window: no window ends there, or a print after it");
+        }
+        let mut i = 0usize;
+        while i < n {
+            if samples[i] <= 0 {
+                return Err("settle window: a non-positive price");
+            }
+            i += 1;
+        }
+        // COPY: ≤ GRID_POINTS × 8 B (14.4 KiB) of persisted grid, once per
+        // window at boot — the window owns its fixed array — rejected: a
+        // window borrowing the state file's parse (it outlives the boot).
+        self.samples[..n].copy_from_slice(samples);
+        self.t_end_ms = t_end_ms;
+        self.last_ts_ms = last_ts_ms;
+        self.last_px = 0;
+        self.next = next;
+        self.n = n as u32;
+        Ok(())
+    }
+
     /// Close the window and apply the law. `None` when no price reached
     /// the window.
     pub fn settle_1e6(&mut self, order: BucketOrder, scratch: &mut [i64; GRID_POINTS]) -> Option<i64> {

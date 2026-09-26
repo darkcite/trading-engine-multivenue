@@ -31,8 +31,9 @@ queue law since XH2, paper only; `/state` `xmm` block, `engine_xmm_*`,
 `backtest --member icdp` stays) · 7 hcv (Hypercall S1 options vs the HAR
 σ̂, hedged on HL perps, since HC11 2026-09-26 — lands DARK, O-HC18: paper
 only on the held-quote law, in no configured mask; boots only with
-`~/multivenue/hcv.toml`; a live slot 7 refuses the boot; risk-policy
-"HYPERCALL — slot 7"). Member timers run per
+`~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
+in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
+risk-policy "HYPERCALL — slot 7"). Member timers run per
 slot (each on its own period). The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
 in the script; `ai` = 48 is the floor every name includes).
@@ -270,7 +271,8 @@ in the script; `ai` = 48 is the floor every name includes).
   `hypercall-live` verbs, never armed by the engine — its mainnet dust
   PASSED 2026-09-26 after the nonce fix `84fc32b` (the nonce is wall ms);
   HC10 bound the HIP-3 hedge perps; HC11 built slot 7, `strategy-hcv`,
-  DARK paper; go-live is staged for a daily
+  DARK paper, and HC11b made its book persist across restarts; go-live is
+  staged for a daily
   restart the operator names — `[hypercall]` and the `fees.toml` lines
   just before it, `hypercall_history` scheduled, the HAR steps of the H3
   plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
@@ -312,13 +314,14 @@ in the script; `ai` = 48 is the floor every name includes).
   `news.toml [events]` → `scheduled-events.json` every news cycle; the
   reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
   is now 1, the floor root (it returned 2).
-- **Gates at HEAD (branch `hypercall`: HC11, after HC8–HC10 on B1–B5 of its
+- **Gates at HEAD (branch `hypercall`: HC11b, after HC8–HC11 on B1–B5 of its
   2026-09-26 plan; Foundry as of the HYPARB merge):**
-  nextest 3565 (6
+  nextest 3583 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
   89/89 at the gates' pins (0 B/op; gate 85 is slot 7 over the
-  held-quote law; gates 72 and 77b pin `HttpsPost` and
+  held-quote law, its book handed to the writer's mailbox inside the
+  measured loop; gates 72 and 77b pin `HttpsPost` and
   `HttpsReq` at exactly 2 per request — rustls; +1 ignored child
   helper) · clippy clean · `make license-check` OK · `make
   bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
@@ -327,7 +330,8 @@ in the script; `ai` = 48 is the floor every name includes).
   measured, not baselined) · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all ten ingress crates, the HYPARB crates,
-  strategy-xmm, strategy-hcv, core-fill, the engine and the HAR state writer) ·
+  strategy-xmm, strategy-hcv, core-settle, core-fill, the engine and the
+  state writers — `har_writer` and the generic `persist` thread) ·
   Foundry 11 unit +
   5 mainnet-fork (session sandbox; forge is not on this Mac) ·
   worker pytest 1643 passed, 5 skipped (its one red,
@@ -514,7 +518,8 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   top-K change gate flips a `core_types::DepthPair`, never copies.
   Enforced by `make copy-audit` (the exec lane, core-net, core-ring, all
   ten ingress crates, the HYPARB crates, strategy-xmm, strategy-hcv,
-  core-fill and the engine; a RATCHET against
+  core-settle, core-fill, the engine and the state-writer threads; a
+  RATCHET against
   `scripts/copy-audit-baseline.txt` — only the operator grows the baseline;
   `scripts/copy-audit-selftest.sh` proves its `#[cfg(test)]` reading first)
   and the `zero-copy-auditor` agent. A cold operator module may opt out with

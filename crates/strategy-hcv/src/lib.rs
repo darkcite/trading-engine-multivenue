@@ -60,28 +60,39 @@
 //! dead-man). Hedging and reduces continue under every stop. Paper: the
 //! fill law is the held-quote law (`core_fill::held`, O-HC21).
 //!
-//! **Known gap (blocks switching it on):** the book lives in memory — the
-//! engine's daily restarts drop it, so it must persist before slot 7 goes
-//! into any mask (`docs/risk-policy.md`, "HYPERCALL — slot 7").
+//! **The book outlives the process (HC11b, [`state`]):** every held option
+//! by contract, the hedges, the cash, the day's opening mark and each open
+//! settlement window go to `hcv-state.tsv` — handed to the cli's writer
+//! thread by mailbox whenever they change — and come back at the next
+//! boot; a held contract the new chain no longer lists is carried by its
+//! terms (an orphan: hedged, marked and settled, never traded).
 //!
 //! ## Doctrine
 //!
 //! Zero allocation after [`HcvStrategy::configure`] (which boxes the
-//! tables once). The option math is f64 (`bs`); no `dyn`, no `String`.
-//! The engine thread never opens a file: the calendar arrives by mailbox.
+//! tables once) and the boot's [`HcvStrategy::restore_state`]. The option
+//! math is f64 (`bs`); no `dyn`, no `String` but the cold renderers'. The
+//! engine loop never opens a file: the calendar arrives by mailbox and the
+//! book leaves by one (the one write the engine thread makes itself is the
+//! shutdown's, after the loop).
 
 #![forbid(unsafe_code)]
 
 pub mod bs;
+pub mod state;
 
 use core_fill::held::{held_index, HELD_SYMS};
-use core_ring::MailboxRx;
+use core_ring::{MailboxRx, MailboxTx};
 pub use core_settle::BucketOrder;
 use core_settle::{SettleWindow, GRID_POINTS, SETTLE_WINDOW_MS};
 use core_time::WallAnchor;
 use core_types::{
     hl_px, ChannelEvent, ChannelId, Fill, NsTs, Order, OrderEvent, Price, Qty, Side, Signal,
-    SymbolId, Tick, VenueId,
+    SymbolId, Tick, VenueId, SYMBOL_ID_NONE,
+};
+pub use state::{
+    render_state, HcvRestored, HcvStateError, HcvStateSnap, HCV_BOOK_STALE_NS, HCV_MAX_ORPHANS,
+    HCV_STATE_VERSION,
 };
 use strategy_core::{
     Ctx, HarSeriesView, HcvCounters, Strategy, StrategyCounters, StrategyError, HAR_VIEW_TENORS,
@@ -232,7 +243,9 @@ impl HcvUnd {
 /// One option, from discovery.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HcvOpt {
-    /// Its engine symbol (a Hypercall option ordinal).
+    /// Its engine symbol (a Hypercall option ordinal). [`SYMBOL_ID_NONE`]
+    /// for an orphan the boot restored outside its chain (HC11b): no quote
+    /// reaches it and no order names it.
     pub sym: SymbolId,
     /// Index into the underlyings.
     pub und: u8,
@@ -247,7 +260,7 @@ pub struct HcvOpt {
 impl Default for HcvOpt {
     fn default() -> Self {
         Self {
-            sym: core_types::SYMBOL_ID_NONE,
+            sym: SYMBOL_ID_NONE,
             und: 0,
             call: false,
             strike_1e6: 0,
@@ -410,6 +423,11 @@ struct UndState {
     last_slice: u64,
     /// Options of this underlying with an IoC in flight (0 or 1).
     opt_pending: u32,
+    /// HC11b: the oracle the restored book was written with — written back
+    /// until this process's first Mark replaces it, so a restart never
+    /// erases the one measure a later boot judges a residual by. Never a
+    /// mark for the P&L (the marks come back with the feeds).
+    kept_mark_1e6: i64,
 }
 
 struct SettleSlot {
@@ -450,6 +468,20 @@ pub struct HcvStrategy {
     hc_alive_ns: u64,
     /// The newest Hyperliquid tick of any coin (the feed's liveness).
     hl_alive_ns: u64,
+    /// HC11b: moves whenever something that outlives the process changes
+    /// ([`state`]).
+    state_epoch: u64,
+    /// …as of the last book handed to the writer.
+    offered_epoch: u64,
+    /// When a moved book first found the writer's slot still held (0 = the
+    /// last offer went through) — [`state::HCV_BOOK_STALE_NS`] later, new
+    /// risk stops.
+    offer_blocked_ns: u64,
+    /// The writer's mailbox (installed at boot; none — replay, tests — hands
+    /// nothing).
+    state_tx: Option<MailboxTx<HcvStateSnap>>,
+    /// The boot read the book back (once).
+    state_restored: bool,
 }
 
 impl Default for HcvStrategy {
@@ -486,6 +518,11 @@ impl HcvStrategy {
             dropped: 0,
             hc_alive_ns: 0,
             hl_alive_ns: 0,
+            state_epoch: 0,
+            offered_epoch: 0,
+            offer_blocked_ns: 0,
+            state_tx: None,
+            state_restored: false,
         }
     }
 
@@ -690,8 +727,10 @@ impl HcvStrategy {
             && Self::fresh(self.hl_alive_ns, now_ns, ms)
     }
 
-    /// An option's greeks at its mid IV (a live two-sided quote), else
-    /// at σ̂; `None` when neither exists (or the option has expired).
+    /// An option's greeks at its mid IV (a live two-sided quote), else at
+    /// σ̂, else — no quote of its own and no forecast: an orphan whose
+    /// series went cold, say — at the mid IV of its expiry's nearest quoted
+    /// strike; `None` when none exists (or the option has expired).
     fn greeks(&self, i: usize, now_ms: u64, now_ns: NsTs) -> Option<bs::Greeks> {
         let o = &self.opts[i];
         let u = o.cfg.und as usize;
@@ -700,19 +739,54 @@ impl HcvStrategy {
             return None;
         }
         let tau_ms = (o.cfg.exp_ms - now_ms) as f64;
-        let k = o.cfg.strike_1e6 as f64 / 1e6;
-        let p = self.p.as_deref()?;
-        let two_sided = o.bid_1e6 > 0 && o.ask_1e6 > 0 && o.bid_1e6 <= o.ask_1e6;
-        let mid_iv = if two_sided && self.quote_live(o, now_ns, p.quote_stale_ms) {
-            bs::implied_vol(o.cfg.call, s, k, tau_ms / YEAR_MS, (o.bid_1e6 + o.ask_1e6) as f64 / 2e6)
-        } else {
-            None
-        };
-        let sig = match mid_iv {
+        let tau_y = tau_ms / YEAR_MS;
+        let ms = self.p.as_deref()?.quote_stale_ms;
+        let sig = match self.mid_iv(i, s, tau_y, now_ns, ms) {
             Some(v) => v,
-            None => self.sigma_hat(u, tau_ms / DAY_MS_F)?,
+            None => match self.sigma_hat(u, tau_ms / DAY_MS_F) {
+                Some(v) => v,
+                None => self.mid_iv(self.nearest_quoted(i, now_ns, ms)?, s, tau_y, now_ns, ms)?,
+            },
         };
-        bs::price(o.cfg.call, s, k, tau_ms / YEAR_MS, sig)
+        bs::price(o.cfg.call, s, o.cfg.strike_1e6 as f64 / 1e6, tau_y, sig)
+    }
+
+    /// Option `j`'s implied vol at its mid — a live, two-sided, uncrossed
+    /// quote only.
+    fn mid_iv(&self, j: usize, s: f64, tau_y: f64, now_ns: NsTs, ms: u32) -> Option<f64> {
+        let o = &self.opts[j];
+        if o.bid_1e6 <= 0 || o.ask_1e6 <= 0 || o.bid_1e6 > o.ask_1e6 || !self.quote_live(o, now_ns, ms) {
+            return None;
+        }
+        let k = o.cfg.strike_1e6 as f64 / 1e6;
+        bs::implied_vol(o.cfg.call, s, k, tau_y, (o.bid_1e6 + o.ask_1e6) as f64 / 2e6)
+    }
+
+    /// The row of option `i`'s underlying and expiry, other than `i`, whose
+    /// strike is nearest `i`'s among those quoting two live sides.
+    fn nearest_quoted(&self, i: usize, now_ns: NsTs, ms: u32) -> Option<usize> {
+        let c = &self.opts[i].cfg;
+        let mut best = None;
+        let mut gap = i64::MAX;
+        let mut j = 0usize;
+        while j < self.n_opts {
+            let q = &self.opts[j];
+            if j != i
+                && q.cfg.und == c.und
+                && q.cfg.exp_ms == c.exp_ms
+                && q.bid_1e6 > 0
+                && q.ask_1e6 >= q.bid_1e6
+                && self.quote_live(q, now_ns, ms)
+            {
+                let d = (q.cfg.strike_1e6 - c.strike_1e6).abs();
+                if d < gap {
+                    gap = d;
+                    best = Some(j);
+                }
+            }
+            j += 1;
+        }
+        best
     }
 
     /// The settlement price fixed for `(u, exp)`, once its window closed.
@@ -732,14 +806,22 @@ impl HcvStrategy {
     /// live option at its greeks' price, an expired one not yet booked at
     /// its intrinsic on the fixed settlement (else the oracle), never at
     /// a stale premium.
-    fn marked_pnl(&self, now_ms: u64, now_ns: NsTs) -> i64 {
+    ///
+    /// `None` while an underlying the book holds — an option or its hedge —
+    /// has no oracle yet: right after a boot, before its first Hyperliquid
+    /// Mark, a hedge at a zero price is no mark, and neither the day's
+    /// opening mark nor its stop is ever judged on one (HC11b review).
+    fn marked_pnl(&self, now_ms: u64, now_ns: NsTs) -> Option<i64> {
         let mut v = self.cash_usd_1e6 as f64;
         let mut i = 0usize;
         while i < self.n_opts {
             let o = &self.opts[i];
             if o.pos_1e6 != 0 {
+                let u = o.cfg.und as usize;
+                if self.und[u].oracle_1e6 <= 0 {
+                    return None;
+                }
                 let mark = if o.cfg.exp_ms <= now_ms {
-                    let u = o.cfg.und as usize;
                     let s_t = self.fixed_settlement(u, o.cfg.exp_ms).unwrap_or(self.und[u].oracle_1e6);
                     intrinsic_1e6(&o.cfg, s_t) as f64
                 } else {
@@ -754,10 +836,16 @@ impl HcvStrategy {
         }
         let mut u = 0usize;
         while u < self.n_und {
-            v += self.und[u].hedge_pos_1e6 as f64 / 1e6 * self.und[u].oracle_1e6 as f64;
+            let st = &self.und[u];
+            if st.hedge_pos_1e6 != 0 {
+                if st.oracle_1e6 <= 0 {
+                    return None;
+                }
+                v += st.hedge_pos_1e6 as f64 / 1e6 * st.oracle_1e6 as f64;
+            }
             u += 1;
         }
-        v as i64
+        Some(v as i64)
     }
 
     /// Underlying `u`: (net delta in underlying units ×1e6 with the final
@@ -903,8 +991,11 @@ impl HcvStrategy {
 
     /// Sample the oracle into each held expiry's window (1 s grid,
     /// sample-and-hold — `core_settle`'s law), from just before the
-    /// window opens until expiry.
+    /// window opens until expiry. A window opened, and a sample in a new
+    /// minute, move the state epoch: a restart inside the window loses at
+    /// most the minute under way ([`state`]).
     fn sample_settlement(&mut self, now_ms: u64) {
+        let mut moved = false;
         let mut i = 0usize;
         while i < self.n_opts {
             let at = i;
@@ -941,13 +1032,18 @@ impl HcvStrategy {
                 s.px_1e6 = 0;
                 s.window.reset(exp);
                 slot = free;
+                moved = true;
             }
             let px = self.und[u].oracle_1e6;
             let s = &mut self.settle[slot];
             if px > 0 && s.last_sample_ms != now_ms {
+                moved |= s.last_sample_ms / MINUTE_MS != now_ms / MINUTE_MS;
                 let _ = s.window.push(now_ms, px);
                 s.last_sample_ms = now_ms;
             }
+        }
+        if moved {
+            self.bump_state();
         }
     }
 
@@ -959,6 +1055,8 @@ impl HcvStrategy {
         let Some(p) = self.p.as_deref() else { return };
         let delay = u64::from(p.settle_delay_ms);
         let order = p.settle_order;
+        // Every fix, booking and freeing below outlives the process.
+        let mut moved = false;
         // Fix each due window's price, once.
         let mut k = 0usize;
         while k < self.settle.len() {
@@ -971,6 +1069,7 @@ impl HcvStrategy {
                 if s.window.points() < HCV_SETTLE_FULL_POINTS {
                     self.counters.settle_fallbacks = self.counters.settle_fallbacks.wrapping_add(1);
                 }
+                moved = true;
             }
             k += 1;
         }
@@ -1014,6 +1113,7 @@ impl HcvStrategy {
             self.opts[at].pos_1e6 = 0;
             self.opts[at].avg_px_1e6 = 0;
             self.counters.settlements = self.counters.settlements.wrapping_add(1);
+            moved = true;
         }
         // Free the windows whose expiry holds nothing any more.
         let mut k = 0usize;
@@ -1029,9 +1129,13 @@ impl HcvStrategy {
                 }
                 if !held {
                     self.settle[k].live = false;
+                    moved = true;
                 }
             }
             k += 1;
+        }
+        if moved {
+            self.bump_state();
         }
     }
 
@@ -1059,7 +1163,9 @@ impl HcvStrategy {
             // 1 s timer — cold; a borrow could not outlive the `&mut self`
             // calls below (the submit, the counters).
             let o = self.opts[k];
-            if !o.dirty || o.pending_oid != 0 {
+            // An orphan (HC11b) has no quote and no symbol to send: never
+            // judged, only carried.
+            if !o.dirty || o.pending_oid != 0 || o.cfg.sym == SYMBOL_ID_NONE {
                 continue;
             }
             let u = o.cfg.und as usize;
@@ -1319,13 +1425,27 @@ impl HcvStrategy {
         }
     }
 
-    fn publish_gauges(&mut self, now_ms: u64, now_ns: NsTs, pnl: i64) {
+    fn publish_gauges(&mut self, now_ms: u64, now_ns: NsTs, pnl: Option<i64>, book_stale: bool) {
         let mut n = 0i64;
+        let mut orphans = 0i64;
+        // Underlyings the book holds (an option or its hedge), by bit.
+        let mut held_und = 0u16;
         let mut i = 0usize;
         while i < self.n_opts {
-            n += i64::from(self.opts[i].pos_1e6 != 0);
+            let held = self.opts[i].pos_1e6 != 0;
+            n += i64::from(held);
+            orphans += i64::from(held && self.opts[i].cfg.sym == SYMBOL_ID_NONE);
+            held_und |= u16::from(held) << self.opts[i].cfg.und;
             i += 1;
         }
+        let mut unknown = 0i64;
+        let mut u = 0usize;
+        while u < self.n_und {
+            let held = held_und & (1u16 << u) != 0 || self.und[u].hedge_pos_1e6 != 0;
+            unknown += i64::from(held && self.und[u].oracle_1e6 <= 0);
+            u += 1;
+        }
+        self.counters.marks_unknown = unknown;
         let mut vabs = 0i64;
         let mut u = 0usize;
         while u < self.n_und {
@@ -1335,9 +1455,14 @@ impl HcvStrategy {
             u += 1;
         }
         self.counters.positions = n;
+        self.counters.orphans = orphans;
         self.counters.vega_abs_usd_1e6 = vabs;
-        self.counters.pnl_usd_1e6 = pnl;
-        self.counters.day_pnl_usd_1e6 = pnl.saturating_sub(self.day_start_pnl_usd_1e6);
+        // An unknown mark leaves the last known one on the gauges.
+        if let Some(v) = pnl {
+            self.counters.pnl_usd_1e6 = v;
+            self.counters.day_pnl_usd_1e6 = v.saturating_sub(self.day_start_pnl_usd_1e6);
+        }
+        self.counters.book_stale = i64::from(book_stale);
     }
 }
 
@@ -1383,6 +1508,19 @@ impl StrategyCounters for HcvStrategy {
 
     fn hcv_counters(&self, out: &mut HcvCounters) {
         *out = self.counters;
+    }
+
+    fn render_hcv_state(&self, out: &mut String) -> bool {
+        if !self.configured {
+            return false;
+        }
+        // ALLOC: one snapshot box (~170 KiB) — the shutdown's forced write,
+        // once per process and off every hot path (the writer thread's
+        // renders read the mailbox slot instead).
+        let mut snap = HcvStateSnap::new_boxed();
+        self.fill_state(&mut snap);
+        render_state(&snap, out);
+        true
     }
 }
 
@@ -1483,6 +1621,7 @@ impl Strategy for HcvStrategy {
             }
             self.cash_usd_1e6 = self.cash_usd_1e6.saturating_add(if buy { -flow } else { flow });
             self.counters.option_fills = self.counters.option_fills.wrapping_add(1);
+            self.bump_state();
             return;
         }
         if let Some(u) = self.und_of_hedge(fill.sym) {
@@ -1494,6 +1633,7 @@ impl Strategy for HcvStrategy {
             // The hedge's cash flow; its position is marked at the oracle.
             self.cash_usd_1e6 = self.cash_usd_1e6.saturating_add(if buy { -flow } else { flow });
             self.counters.hedge_fills = self.counters.hedge_fills.wrapping_add(1);
+            self.bump_state();
         }
     }
 
@@ -1537,16 +1677,32 @@ impl Strategy for HcvStrategy {
         self.sample_settlement(now_ms);
         self.settle_expired(now_ms);
         let pnl = self.marked_pnl(now_ms, now_ns);
+        // The day rolls on a known mark only: a book whose marks are not
+        // all in yet keeps yesterday's until they are.
         let day = now_ms / DAY_MS;
-        if day != self.day {
-            self.day = day;
-            self.day_start_pnl_usd_1e6 = pnl;
+        if let Some(v) = pnl {
+            if day != self.day {
+                self.day = day;
+                self.day_start_pnl_usd_1e6 = v;
+                self.bump_state();
+            }
         }
         let (kill, day_loss) = self.p.as_deref().map_or((true, 0), |p| (p.kill, p.day_loss_usd_1e6));
-        let stopped = kill || pnl.saturating_sub(self.day_start_pnl_usd_1e6) <= -day_loss;
+        // New risk stops on the kill, on the day's loss, on a mark not yet
+        // known, and on a book the writer has not taken for
+        // `HCV_BOOK_STALE_NS` (it could not be restored).
+        let book_stale = self.book_stale(now_ns);
+        let day_stop = match pnl {
+            Some(v) => v.saturating_sub(self.day_start_pnl_usd_1e6) <= -day_loss,
+            None => true,
+        };
+        let stopped = kill || day_stop || book_stale;
         self.decide(now_ns, now_ms, stopped, ctx);
         self.hedge(now_ns, now_ms, ctx);
-        self.publish_gauges(now_ms, now_ns, pnl);
+        self.publish_gauges(now_ms, now_ns, pnl, book_stale);
+        // HC11b: whatever of the above outlives the process leaves by the
+        // writer's mailbox (the fills in between moved the epoch too).
+        self.offer_state(now_ns);
     }
 
     fn timer_period_ns(&self) -> u64 {

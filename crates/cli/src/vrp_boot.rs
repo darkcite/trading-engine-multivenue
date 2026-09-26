@@ -402,7 +402,7 @@ pub fn load_vrp_boot(
     // state — a second process writing the file that says what the
     // standing engine is holding.
     let state_path = resolve_state_path(state_path, &path, explicit)?;
-    let state = read_state(&state_path)?;
+    let state = crate::state_file::read_state("vrp", &state_path)?;
     // W3: the rolling window is the ONE thing with two sources, and
     // reconciling them needs both series in hand before any of them is
     // pushed — which is why it happens here and not in the member's
@@ -480,39 +480,15 @@ pub fn default_state_path() -> Result<String, String> {
     core_config::vrp::default_state_path().map_err(|e| e.to_string())
 }
 
-/// F22: where this boot's state file lives.
-///
-/// * `Some(p)` — an explicit `--vrp-state`: that file, whatever else.
-/// * `None` with an EXPLICIT `--vrp <path>` — `vrp-state.tsv` beside
-///   that artifact. A smoke boot on its own `vrp.toml` must not read
-///   and rewrite the standing engine's state, and "beside the artifact"
-///   is the rule that needs no second flag to be safe.
-/// * `None` with the default artifact — the default state path.
+/// F22: where this boot's state file lives — `crate::state_file`'s law
+/// (`--vrp-state`, else `vrp-state.tsv` beside an explicit `--vrp`, else the
+/// default path).
 pub fn resolve_state_path(
     state_path: Option<&Path>,
     artifact: &Path,
     artifact_explicit: bool,
 ) -> Result<PathBuf, String> {
-    if let Some(p) = state_path {
-        return Ok(p.to_path_buf());
-    }
-    if artifact_explicit {
-        if let Some(dir) = artifact.parent() {
-            return Ok(dir.join("vrp-state.tsv"));
-        }
-    }
-    Ok(PathBuf::from(default_state_path()?))
-}
-
-/// Read the state file. An absent file is `Ok(None)` — a first boot has
-/// no history, which is normal and not an error.
-pub fn read_state(path: &Path) -> Result<Option<String>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    std::fs::read_to_string(path)
-        .map(Some)
-        .map_err(|e| format!("vrp: {}: {e}", path.display()))
+    crate::state_file::resolve_state_path(state_path, artifact, artifact_explicit, "vrp-state.tsv", default_state_path)
 }
 
 /// Write the state file atomically — a temp file beside it, then a

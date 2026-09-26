@@ -471,6 +471,16 @@ pub trait StrategyCounters {
         *out = HcvCounters::default();
     }
 
+    /// HC11b: render the slot-7 member's book into `out` (cleared first) —
+    /// the shutdown's forced write, once the state writer is joined (the
+    /// writer thread renders every other one). `false` = no configured hcv
+    /// member, and nothing is written. Cold path: it boxes its own snapshot.
+    #[inline]
+    fn render_hcv_state(&self, out: &mut String) -> bool {
+        let _ = out;
+        false
+    }
+
     /// XMM XH3: copy the per-perp view into `out` (`min(out.len())`
     /// rows), returning how many perps are CONFIGURED. Cold path (the
     /// 1 s publish); never allocates.
@@ -1355,16 +1365,31 @@ pub struct HcvCounters {
     pub calendars: u64,
     /// HAR views taken from the set.
     pub har_updates: u64,
+    /// HC11b: held options the boot restored from the state file.
+    pub restored: u64,
     /// Gauge: options held (non-zero positions).
     pub positions: i64,
     /// Gauge: Σ |net vega| over underlyings, USD per vol point ×1e6.
     pub vega_abs_usd_1e6: i64,
-    /// Gauge: the marked P&L since boot, USD ×1e6.
+    /// Gauge: the book's marked P&L — its cash plus every position at its
+    /// mark — since the book began (HC11b: it persists across restarts),
+    /// USD ×1e6.
     pub pnl_usd_1e6: i64,
     /// Gauge: the day's marked P&L, USD ×1e6.
     pub day_pnl_usd_1e6: i64,
+    /// HC11b gauge: options held outside this boot's chain — carried by
+    /// their terms (hedged and marked at σ̂, settled at expiry), never
+    /// traded.
+    pub orphans: i64,
+    /// HC11b gauge: 1 while the book's file is behind the book — the writer
+    /// has not taken a moved book for 30 s — and new risk is stopped.
+    pub book_stale: i64,
+    /// HC11b gauge: underlyings the book holds (an option or a hedge) with
+    /// no oracle yet this process — while it is non-zero the book's mark is
+    /// unknown and new risk is stopped.
+    pub marks_unknown: i64,
 }
-const _: () = assert!(core::mem::size_of::<HcvCounters>() == 21 * 8);
+const _: () = assert!(core::mem::size_of::<HcvCounters>() == 25 * 8);
 
 /// XMM XH3: one quoted perp's row, read at one instant — the follower's
 /// touch, our two quotes on it, what the member holds and how old each
@@ -2536,6 +2561,17 @@ mod tests {
         let mut rows = [XmmPerpView::default(); 2];
         assert_eq!(s.xmm_perps_view(&mut rows), 0);
         assert_eq!(rows, [XmmPerpView::default(); 2]);
+        // HC11b (slot 7): zero counters, and no book to write — the buffer
+        // is left untouched.
+        let mut h = HcvCounters {
+            restored: 3,
+            ..HcvCounters::default()
+        };
+        s.hcv_counters(&mut h);
+        assert_eq!(h, HcvCounters::default());
+        let mut text = String::from("kept");
+        assert!(!s.render_hcv_state(&mut text));
+        assert_eq!(text, "kept");
     }
 
     #[test]

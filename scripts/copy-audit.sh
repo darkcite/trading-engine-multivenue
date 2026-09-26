@@ -14,7 +14,9 @@
 # (since the ZC pass of 2026-09-24) plus ingress-hypercall (born inside
 # the gate, HC3), the HYPARB lane's AMM math and member, and the threads
 # the engine hands work to — the EVM shadow, the HYPARB live arm and the
-# HAR state writer (HAR H3.7)) that has NO `COPY:` marker within the eight preceding lines,
+# state writers (HAR H3.7; HC11b's generic `persist` thread and the
+# slot-7 settlement law it persists, `core-settle`)) that has NO `COPY:`
+# marker within the eight preceding lines,
 # and compares the list against the committed baseline
 # `scripts/copy-audit-baseline.txt`. It is a RATCHET:
 #
@@ -81,7 +83,8 @@ if [ "$#" -eq 0 ]; then
            crates/core-fill crates/engine \
            crates/cli/src/evm_shadow.rs \
            crates/cli/src/hyparb_live.rs \
-           crates/cli/src/har_writer.rs
+           crates/cli/src/har_writer.rs \
+           crates/cli/src/persist.rs crates/core-settle
 fi
 
 # Bracket expressions, not backslash escapes: an awk `-v` value has its
