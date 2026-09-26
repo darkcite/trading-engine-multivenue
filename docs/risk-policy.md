@@ -6408,7 +6408,10 @@ engine gate driving the paper order-event pump.
   3. Place `xmm.toml`, then edit `strategy.conf` LAST, outside the quiet
      windows; restart supervised rather than waiting for 00:10/08:30/
      16:05Z.
-  4. After the boot: the tell `xmm: artifact configured … phase=XH3(paper)`;
+  4. Restart `com.multivenue.dashboard` with the engine: it reads its page
+     once at start, and the page before XH3 stops rendering its later
+     panels on `/state` v2 (the page since XH3 reads v1 and v2).
+     After the boot: the tell `xmm: artifact configured … phase=XH3(paper)`;
      `/state` `xmm.configured = 1`, `boot.xmm_coins = BTC,ETH,SOL,XRP`;
      `engine_xmm_perps 4`; `engine_xmm_placed_total` and
      `engine_paper_matcher_queue_rested_total` rising; `stuck`,
