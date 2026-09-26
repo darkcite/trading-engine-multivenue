@@ -6,6 +6,37 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — HIP-3 builder-dex perps: real asset ids and size decimals (HC10)
+
+**What changed**
+
+- `ingress_hyperliquid::discovery`:
+  - `perpDexs` keeps each dex's index;
+  - `HlDiscovery::ingest_dex_meta` reads a builder dex's own `{"type":"meta","dex":…}`;
+  - a `dex:COIN` coin resolves to `100_000 + dex_idx × 10_000 + index` with that meta's `szDecimals` (`builder_asset_id`, `dex_of`, `has_dex`).
+  - A coin its dex's meta does not list no longer resolves. A dex whose meta was not ingested stays name-validated at asset 0, as before.
+- **The engine's HL boot discovery** also fetches the meta of every builder dex a configured coin names. It fetches only dexes the venue's own `perpDexs` listed, 250 ms apart like the other discovery requests. A failed fetch is a warning; market data addresses coins by string.
+- `exec_hyperliquid::asset`: `BUILDER_BASE`, `SPOT_BASE`, `AssetKind`, `kind_of`, `is_perp_id`. The mirrored id law is held together with the ingress one by the cli test `builder_asset_ids_agree`.
+- The HYPARB binder (`cli::hyparb_live`) binds a builder-dex coin by its derived id (never id 0).
+- `core_types::hl_px`: the HL perp price law (five significant figures, `6 − szDecimals` decimals, integers always legal), its rounding, and the size step.
+- `tests/fixtures/hl/vectors.tsv`: two HIP-3 order rows (asset `110_002` IoC buy, `110_009` ALO reduce-only sell) from the official `hyperliquid-python-sdk` 0.24.0.
+  - The 27 older rows regenerate byte-identical.
+  - The header now names the SDK version.
+  - `VECTOR_ROWS` is 29.
+- The `hl_info` fuzz target drives `ingest_dex_meta`.
+
+**Impact**
+
+- None at runtime today: no `xyz:` coin is in the live `[hyperliquid] coins`. At go-live (O-HC20: the eight hedge coins appended), the boot adds one `/info` request (the `xyz` meta) and logs each hedge coin's asset id and `szDecimals`.
+
+**Migration steps**
+
+1. None. The go-live's `[hyperliquid] coins` append is the operator's (O-HC20).
+
+**Rollback**
+
+- Remove the `xyz:` coins from `[hyperliquid] coins`.
+
 ## 2026-09-26 — `crates/exec-hypercall`: the Hypercall order arm and its operator verbs (HC9, O-HC19)
 
 **What changed**

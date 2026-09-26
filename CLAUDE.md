@@ -72,7 +72,7 @@ in the script; `ai` = 48 is the floor every name includes).
   `Order.strategy_id`, `RoutedDispatcher`, the E6 risk gate: per-order /
   open-orders / day / instance caps, the venue-fill ledger, six sticky halts
   incl. recon-STALE, `exec.HALT`) + `crates/exec-hyperliquid` (msgpack +
-  EIP-712 `Agent` signing pinned by 27 SDK vectors, mio+rustls `/exchange`
+  EIP-712 `Agent` signing pinned by 29 SDK vectors (two HIP-3 rows since HC10), mio+rustls `/exchange`
   arm with the request body rendered in place, `userFills` WS pumped from
   `on_idle` on the engine thread, reconciliation, address-budget governor,
   LAW E-8 sweeps). Armed ONLY by the two-switch interlock `--exec

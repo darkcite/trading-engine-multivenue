@@ -1686,13 +1686,50 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
     let mut disc = ingress_hyperliquid::discovery::HlDiscovery::new();
     disc.ingest_meta(&meta)
         .map_err(|e| format!("hyperliquid meta: {e:?}"))?;
+    // HC10: a builder-dex coin (`xyz:NVDA`) binds by its dex's own meta
+    // — `perpDexs` for the dex's index, then that dex's universe.
+    if spec.coins.iter().any(|c| c.name.contains(':')) {
+        let dexs = info_once(&hl_cfg.host, br#"{"type":"perpDexs"}"#, tls.clone())?;
+        disc.ingest_perp_dexs(&dexs)
+            .map_err(|e| format!("hyperliquid perpDexs: {e:?}"))?;
+        let mut done: Vec<&[u8]> = Vec::new();
+        for cs in &spec.coins {
+            let Some(dx) = ingress_hyperliquid::discovery::dex_of(cs.name.as_bytes()) else {
+                continue;
+            };
+            if done.contains(&dx) {
+                continue;
+            }
+            // COPY: the dex name (≤ 16 B) into a String once per builder
+            // dex at boot — it names the request and any refusal; cold.
+            let dname = String::from_utf8_lossy(dx).into_owned();
+            if !disc.has_dex(dx) {
+                return Err(format!("coin {}: the venue lists no dex {dname:?}", cs.name));
+            }
+            let req = format!(r#"{{"type":"meta","dex":"{dname}"}}"#);
+            let body = info_once(&hl_cfg.host, req.as_bytes(), tls.clone())?;
+            disc.ingest_dex_meta(dx, &body)
+                .map_err(|e| format!("hyperliquid meta dex {dname}: {e:?}"))?;
+            done.push(dx);
+        }
+    }
     let mut coins: Vec<LiveCoin> = Vec::new();
     let mut c = 0usize;
     while c < spec.coins.len() {
         let cs = &spec.coins[c];
+        // A native perp or (HC10) a builder-dex perp whose id the dex's
+        // meta derived — never a name-validated id 0, never a spot or
+        // outcome id.
         let info = disc
             .resolve(cs.name.as_bytes())
-            .filter(|a| a.kind == ingress_hyperliquid::discovery::HlAssetKind::Perp)
+            .filter(|a| {
+                matches!(
+                    a.kind,
+                    ingress_hyperliquid::discovery::HlAssetKind::Perp
+                        | ingress_hyperliquid::discovery::HlAssetKind::BuilderDex
+                ) && exec_hyperliquid::asset::is_perp_id(a.asset_id)
+                    && (a.kind == ingress_hyperliquid::discovery::HlAssetKind::Perp || a.asset_id != 0)
+            })
             .ok_or_else(|| format!("coin {}: not a Hyperliquid perp", cs.name))?;
         let venue_lot = i64::try_from(pow10(6u8.saturating_sub(info.sz_decimals))).unwrap_or(0);
         if info.sz_decimals > 6 || cs.lot_1e6 != venue_lot {
@@ -1883,6 +1920,36 @@ pub fn state_dir(exec_toml: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// HC10: the builder-dex asset-id law exists twice — the market-data
+    /// crate derives ids, the exec crate classifies them (neither may
+    /// depend on the other) — and this holds the two together.
+    #[test]
+    fn builder_asset_ids_agree() {
+        let mut dex = 1u32;
+        while dex < 10_000 {
+            let mut index = 0u32;
+            while index < 10_000 {
+                match ingress_hyperliquid::discovery::builder_asset_id(dex, index) {
+                    Some(id) => {
+                        assert_eq!(id, exec_hyperliquid::asset::BUILDER_BASE + dex * 10_000 + index);
+                        assert_eq!(
+                            exec_hyperliquid::asset::kind_of(id),
+                            exec_hyperliquid::asset::AssetKind::BuilderPerp
+                        );
+                        assert!(exec_hyperliquid::asset::is_perp_id(id));
+                    }
+                    None => assert!(
+                        u64::from(exec_hyperliquid::asset::BUILDER_BASE) + u64::from(dex) * 10_000 + u64::from(index)
+                            >= u64::from(exec_hyperliquid::asset::ASSET_BASE)
+                    ),
+                }
+                index += 2_503;
+            }
+            dex += 997;
+        }
+        assert_eq!(ingress_hyperliquid::discovery::builder_asset_id(0, 1), None);
+    }
+
     use super::*;
 
     fn order(side: Side, qty: i64, px: i64) -> Order {

@@ -139,7 +139,9 @@ pub fn status<W: Write>(arm: &mut HcExchange, out: &mut W) -> Verdict {
 }
 
 /// `simulate` (read-only): a bid of `qty_1e6` at `px_1e6` on the
-/// table's first row. PASS: HTTP 200 and `"success":true`.
+/// table's first row. PASS: HTTP 200, `"success":true` and the venue's
+/// `data.admissible` true — its own verdict on whether it would take the
+/// order (a wallet with no funds reads `false` with its reason).
 pub fn simulate<W: Write>(arm: &mut HcExchange, px_1e6: i64, qty_1e6: i64, out: &mut W) -> Verdict {
     let Some((sym, name)) = arm.table().get(0) else {
         say(out, "no instrument (--symbol)");
@@ -148,12 +150,26 @@ pub fn simulate<W: Write>(arm: &mut HcExchange, px_1e6: i64, qty_1e6: i64, out: 
     let name = String::from_utf8_lossy(name).into_owned();
     match arm.simulate(sym, true, px_1e6, qty_1e6) {
         Ok((http, body)) => {
-            let success = crate::json::root(body)
-                .and_then(|r| crate::json::field_in(body, &r, b"success"))
+            let root = crate::json::root(body);
+            let success = root
+                .as_ref()
+                .and_then(|r| crate::json::field_in(body, r, b"success"))
                 .and_then(|v| v.as_bool(body))
                 == Some(true);
+            let data = root.as_ref().and_then(|r| crate::json::field_in(body, r, b"data"));
+            let admissible = data
+                .as_ref()
+                .and_then(|d| crate::json::field_in(body, d, b"admissible"))
+                .and_then(|v| v.as_bool(body))
+                == Some(true);
+            let reason = data
+                .as_ref()
+                .and_then(|d| crate::json::field_in(body, d, b"rejection_reason"))
+                .map(|v| String::from_utf8_lossy(v.bytes(body)).into_owned())
+                .unwrap_or_default();
             say(out, &format!("POST /risk/simulate/orders ({name}, buy {:.6} @ {:.6}) → {http}: {}", qty_1e6 as f64 / 1e6, px_1e6 as f64 / 1e6, clip(body)));
-            if http == 200 && success {
+            say(out, &format!("simulate: admissible {admissible}{}", if reason.is_empty() { String::new() } else { format!(" — {reason}") }));
+            if http == 200 && success && admissible {
                 Verdict::Pass
             } else {
                 Verdict::Fail

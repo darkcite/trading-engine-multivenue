@@ -515,7 +515,7 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 27 known-answer vectors the official
+  the binary reproduces all 29 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
   from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify` —
   demanding the SDK's exact msgpack. **This is the half that covers LAW

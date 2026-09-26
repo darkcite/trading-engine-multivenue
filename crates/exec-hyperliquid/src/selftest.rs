@@ -29,7 +29,7 @@
 //!
 //! ## Two checks, and they cover different halves
 //!
-//! 1. **The chain, over all 27 rows.** For every vector, recompute the
+//! 1. **The chain, over all 29 rows.** For every vector, recompute the
 //!    connection id, the `Agent` EIP-712 digest and the 65-byte
 //!    signature from the SDK's *recorded* msgpack. This covers keccak,
 //!    the domain separator, the nonce/vault/expiry framing and
@@ -75,12 +75,13 @@ const TEST_KEY: [u8; 32] = [
 /// sends, not a round number that would hide an arithmetic bug.
 const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
 
-/// The fixture's row count, EXACTLY. The header says "all 27", so the
-/// gate asserts 27 — a `>= 20` (the first cut) let five rows vanish
+/// The fixture's row count, EXACTLY. The header says "all 29", so the
+/// gate asserts 29 — a `>= 20` (the first cut) let five rows vanish
 /// with both gates still green, which is a claim the code did not
 /// test. Regenerating the fixture with more vectors moves this number
-/// on purpose (S7-L1 moved it from 25 for the two request-weight rows).
-pub const VECTOR_ROWS: u32 = 27;
+/// on purpose (S7-L1 moved it from 25 for the two request-weight rows;
+/// HC10 to 29 for the two HIP-3 builder-perp rows).
+pub const VECTOR_ROWS: u32 = 29;
 
 /// Why the binary failed to certify itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,7 +208,7 @@ pub fn run() -> Result<SelfTestReport, SelfTestErr> {
     }
 
     if rows != VECTOR_ROWS {
-        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 27 vectors"));
+        return Err(SelfTestErr::Fixture("the fixture does not hold exactly the 29 vectors"));
     }
 
     let encoders = check_encoders()?;

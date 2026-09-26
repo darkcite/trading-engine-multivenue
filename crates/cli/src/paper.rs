@@ -9614,6 +9614,36 @@ pub mod boot_discovery {
             })?;
         }
 
+        // HC10: the own meta of every builder dex a configured coin
+        // names (`xyz:NVDA` → `{"type":"meta","dex":"xyz"}`), so those
+        // coins resolve to real asset ids and szDecimals. Only a dex the
+        // venue's own `perpDexs` listed is asked for; a failed fetch
+        // leaves its coins name-validated (market data addresses them by
+        // string — nothing here trades).
+        let mut dexes: Vec<&[u8]> = Vec::new();
+        for coin in spec.split(',').map(str::trim) {
+            if let Some(dx) = ingress_hyperliquid::discovery::dex_of(coin.as_bytes()) {
+                if d.has_dex(dx) && !dexes.contains(&dx) {
+                    dexes.push(dx);
+                }
+            }
+        }
+        for dx in &dexes {
+            std::thread::sleep(Duration::from_millis(250));
+            let dname = String::from_utf8_lossy(dx);
+            let body = format!(r#"{{"type":"meta","dex":"{dname}"}}"#);
+            match post(tls, host, port, "/info", body.as_bytes(), buf) {
+                Ok(range) => {
+                    if let Err(e) = d.ingest_dex_meta(dx, &buf[range]) {
+                        tracing::error!(venue = "hl", dex = %dname, error = ?e, "discovery: dex meta parse failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(venue = "hl", dex = %dname, error = ?e, "discovery: dex meta fetch failed — its coins stay name-validated");
+                }
+            }
+        }
+
         // BIN15 O2: hand the parsed outcome economics back before the
         // discovery table is dropped — the rolling families' boot
         // binding reads this instead of waiting a whole period for the

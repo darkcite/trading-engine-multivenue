@@ -28,14 +28,16 @@
 //! checks `side < sideSpecs.len()` as captured from the wire instead
 //! of assuming binary outcomes.
 //!
-//! **Builder-dex asset ids are not derived in v1** ([`HlAssetInfo::asset_id`]
-//! is 0 for [`HlAssetKind::BuilderDex`]): the `idx` term needs the
-//! per-dex universe (`{"type":"meta","dex":"<name>"}`), which v1 does
-//! not fetch. A configured `dex:COIN` coin therefore validates only
-//! that the dex name exists — sufficient for Stage 1, because
-//! market-data subscriptions address markets by coin *string*, never
-//! by asset id. Asset ids matter to order placement (8j), which will
-//! fetch per-dex meta when builder-dex execution lands.
+//! **Builder-dex asset ids are derived since HC10** from the dex's
+//! position in `perpDexs` (`dex_idx`; the native dex is the leading
+//! `null`, slot 0 — `xyz` measured 1 on 2026-09-25) and the coin's
+//! position in that dex's own universe (`{"type":"meta","dex":"<name>"}`,
+//! [`HlDiscovery::ingest_dex_meta`]), with the dex meta's `szDecimals`.
+//! The boot fetches the meta of every builder dex a configured coin
+//! names; a coin its dex's meta does not list does not resolve. A dex
+//! whose meta was NOT ingested still validates by name only, with asset
+//! id 0 — market data addresses coins by string, never by id — and no
+//! order may be bound to it ([`HlAssetInfo::asset_id`] 0 is no asset).
 //!
 //! ## Allocation note (doctrine)
 //!
@@ -98,6 +100,36 @@ pub const HL_DISCOVERY_SPOT_CAP: usize = 4096;
 /// Dex-name storage width. Live names are short (`xyz`, `vntls`, …).
 const DEX_NAME_MAX: usize = 16;
 
+/// Hard cap on builder-dex universe rows over every ingested dex meta.
+pub const HL_DISCOVERY_BUILDER_CAP: usize = 2048;
+
+/// A HIP-3 builder-dex perp's asset id: `100_000 + dex_idx × 10_000 +
+/// index` (module docs). `None` off the scheme: the native dex (0), an
+/// index past the dex's 10 000-wide block, or an id into the HIP-4
+/// range. `exec_hyperliquid::asset` mirrors the law (a test there holds
+/// the two in agreement — the exec crate may not depend on this one).
+#[must_use]
+pub const fn builder_asset_id(dex_idx: u32, index: u32) -> Option<u32> {
+    if dex_idx == 0 || index >= 10_000 {
+        return None;
+    }
+    let id = 100_000u64 + dex_idx as u64 * 10_000 + index as u64;
+    if id >= 100_000_000 {
+        return None;
+    }
+    Some(id as u32)
+}
+
+/// The dex half of a `dex:COIN` coin (`None` for any other form).
+#[must_use]
+pub fn dex_of(coin: &[u8]) -> Option<&[u8]> {
+    let colon = memchr::memchr(b':', coin)?;
+    if colon == 0 || colon + 1 >= coin.len() {
+        return None;
+    }
+    Some(&coin[..colon])
+}
+
 /// Largest accepted `outcome` id: keeps the derived asset id
 /// `100_000_000 + 10*outcome + side` (side ≤ 9) inside `u32`.
 const OUTCOME_ID_MAX: u64 = ((u32::MAX - 100_000_000 - 9) / 10) as u64;
@@ -128,8 +160,9 @@ pub enum HlAssetKind {
     Perp,
     /// Spot pair (`spotMeta.universe` row; `@{idx}` coin).
     Spot,
-    /// HIP-3 builder-dex perp (`dex:COIN` coin) — name-validated
-    /// only in v1; asset id underived (module docs).
+    /// HIP-3 builder-dex perp (`dex:COIN` coin) — its asset id and
+    /// `szDecimals` from the dex's own meta (HC10); asset id 0 when that
+    /// meta was not ingested (module docs).
     BuilderDex,
     /// HIP-4 outcome market (`#<enc>` coin).
     Outcome,
@@ -138,17 +171,17 @@ pub enum HlAssetKind {
 /// One resolved coin, from [`HlDiscovery::resolve`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct HlAssetInfo {
-    /// Venue asset id per the module-docs scheme. **0 for
-    /// [`HlAssetKind::BuilderDex`]** — underivable without the
-    /// per-dex universe, which v1 does not fetch (module docs).
+    /// Venue asset id per the module-docs scheme. **0 for a
+    /// [`HlAssetKind::BuilderDex`] coin whose dex meta was not
+    /// ingested** (module docs) — no order may be bound to it.
     pub asset_id: u32,
     /// Asset class.
     pub kind: HlAssetKind,
-    /// `szDecimals` from `meta.universe` for native perps; **0 for
-    /// every other kind**: spot universe rows do not carry it (it
-    /// lives on the uncaptured `spotMeta.tokens`), builder-dex meta
-    /// is unfetched in v1, and outcome rows have no size decimals on
-    /// this wire shape.
+    /// `szDecimals` from `meta.universe` for native perps and from
+    /// the dex's meta for builder-dex perps (HC10); **0 for every other
+    /// kind**: spot universe rows do not carry it (it lives on the
+    /// uncaptured `spotMeta.tokens`) and outcome rows have no size
+    /// decimals on this wire shape.
     pub sz_decimals: u8,
 }
 
@@ -164,6 +197,9 @@ impl HlAssetInfo {
     pub fn max_price_decimals(&self) -> Option<u8> {
         match self.kind {
             HlAssetKind::Perp => Some(6u8.saturating_sub(self.sz_decimals)),
+            HlAssetKind::BuilderDex if self.asset_id != 0 => {
+                Some(6u8.saturating_sub(self.sz_decimals))
+            }
             _ => None,
         }
     }
@@ -182,9 +218,16 @@ pub struct HlDiscovery {
     /// Spot universe `index` values seen. Resolve does a linear
     /// scan — boot only.
     spots: Vec<u32>,
-    /// Builder-dex names: (name bytes, valid len). Null slots are
-    /// counted by the ingest return value but not stored.
-    dexs: Vec<([u8; DEX_NAME_MAX], u8)>,
+    /// Builder-dex names: (name bytes, valid len, `dex_idx` = the
+    /// entry's position in `perpDexs`, null slots included). Null
+    /// slots are counted by the ingest return value but not stored.
+    dexs: Vec<([u8; DEX_NAME_MAX], u8, u16)>,
+    /// HC10: builder-dex perps from each ingested dex meta: (`dex_idx`,
+    /// the coin WITHOUT its `dex:` prefix, valid len, `szDecimals`,
+    /// position in that dex's universe).
+    builder: Vec<(u16, [u8; HL_COIN_MAX], u8, u8, u16)>,
+    /// HC10: the `dex_idx` of every dex whose meta was ingested.
+    dex_meta_seen: Vec<u16>,
     /// HIP-4 outcomes: (outcome id, side count from `sideSpecs`,
     /// parsed description). BIN15 O2 added the third member — the
     /// rolling families adopt their live instance from it at boot.
@@ -198,6 +241,8 @@ impl HlDiscovery {
             perps: Vec::with_capacity(HL_DISCOVERY_PERPS_CAP),
             spots: Vec::with_capacity(HL_DISCOVERY_SPOT_CAP),
             dexs: Vec::with_capacity(HL_DISCOVERY_DEXS_CAP),
+            builder: Vec::with_capacity(HL_DISCOVERY_BUILDER_CAP),
+            dex_meta_seen: Vec::with_capacity(HL_DISCOVERY_DEXS_CAP),
             outcomes: Vec::with_capacity(HL_DISCOVERY_OUTCOMES_CAP),
         }
     }
@@ -334,11 +379,13 @@ impl HlDiscovery {
                     if added as usize >= HL_DISCOVERY_DEXS_CAP {
                         return Err(HlDiscoveryErr::TooMany);
                     }
-                    let (row, end) = parse_dex_row(body, i)?;
+                    let ((name, len), end) = parse_dex_row(body, i)?;
                     if self.dexs.len() >= HL_DISCOVERY_DEXS_CAP {
                         return Err(HlDiscoveryErr::TooMany);
                     }
-                    self.dexs.push(row);
+                    // `added` counts null slots too: it IS the entry's
+                    // position — the asset-id scheme's `dex_idx`.
+                    self.dexs.push((name, len, added as u16));
                     added += 1;
                     i = skip_ws(body, end);
                     if i < body.len() && body[i] == b',' {
@@ -349,6 +396,91 @@ impl HlDiscovery {
             }
         }
         Ok(added)
+    }
+
+    /// HC10: parse `{"type":"meta","dex":"<dex>"}` — a builder dex's own
+    /// universe — into the table. `dex` must be a name
+    /// [`Self::ingest_perp_dexs`] stored. Each row's position is its
+    /// `index` in the asset-id scheme, so call once per dex per boot.
+    /// Row names may carry the `dex:` prefix (the venue's spelling) or
+    /// not; they are stored without it. Returns the rows added.
+    ///
+    /// # Errors
+    ///
+    /// [`HlDiscoveryErr::BadRow`] for a dex `perpDexs` did not list (or
+    /// a row off its contract), `Envelope`/`Truncated` for a body that
+    /// is not a meta, `TooMany` past [`HL_DISCOVERY_BUILDER_CAP`].
+    pub fn ingest_dex_meta(&mut self, dex: &[u8], body: &[u8]) -> Result<u32, HlDiscoveryErr> {
+        let dex_idx = self.dex_idx(dex).ok_or(HlDiscoveryErr::BadRow)?;
+        if self.dex_meta_seen.contains(&dex_idx) {
+            return Err(HlDiscoveryErr::BadRow);
+        }
+        let pos = find_field(body, b"\"universe\":").ok_or(HlDiscoveryErr::Envelope)?;
+        let mut i = skip_ws(body, pos);
+        if i >= body.len() || body[i] != b'[' {
+            return Err(HlDiscoveryErr::Envelope);
+        }
+        i += 1;
+        let mut added = 0u32;
+        loop {
+            i = skip_ws(body, i);
+            if i >= body.len() {
+                return Err(HlDiscoveryErr::Truncated);
+            }
+            match body[i] {
+                b']' => break,
+                b'{' => {
+                    let ((name, len, sz), end) = parse_meta_row(body, i)?;
+                    if self.builder.len() >= HL_DISCOVERY_BUILDER_CAP || added >= 10_000 {
+                        return Err(HlDiscoveryErr::TooMany);
+                    }
+                    let full = &name[..len as usize];
+                    let bare = if full.len() > dex.len() + 1
+                        && &full[..dex.len()] == dex
+                        && full[dex.len()] == b':'
+                    {
+                        &full[dex.len() + 1..]
+                    } else {
+                        full
+                    };
+                    let mut row = [0u8; HL_COIN_MAX];
+                    // COPY: ≤ 24 B coin name into its builder row, once per
+                    // row at boot — the row outlives the dex meta body
+                    // (as `parse_meta_row`'s own copy).
+                    row[..bare.len()].copy_from_slice(bare);
+                    self.builder.push((dex_idx, row, bare.len() as u8, sz, added as u16));
+                    added += 1;
+                    i = skip_ws(body, end);
+                    if i < body.len() && body[i] == b',' {
+                        i += 1;
+                    }
+                }
+                _ => return Err(HlDiscoveryErr::BadRow),
+            }
+        }
+        self.dex_meta_seen.push(dex_idx);
+        Ok(added)
+    }
+
+    /// Did `perpDexs` list the builder dex `dex`? (The boot fetches the
+    /// meta only of dexes the venue named — a configured name is never
+    /// rendered into a request unless the venue itself listed it.)
+    #[must_use]
+    pub fn has_dex(&self, dex: &[u8]) -> bool {
+        self.dex_idx(dex).is_some()
+    }
+
+    /// The `dex_idx` of a stored builder dex.
+    fn dex_idx(&self, dex: &[u8]) -> Option<u16> {
+        let mut k = 0;
+        while k < self.dexs.len() {
+            let (name, len, idx) = &self.dexs[k];
+            if *len as usize == dex.len() && &name[..*len as usize] == dex {
+                return Some(*idx);
+            }
+            k += 1;
+        }
+        None
     }
 
     /// Parse a `{"type":"outcomeMeta"}` body into the table. Returns
@@ -466,18 +598,28 @@ impl HlDiscovery {
                     if dex.is_empty() || rest.is_empty() {
                         return None;
                     }
+                    let dex_idx = self.dex_idx(dex)?;
+                    if !self.dex_meta_seen.contains(&dex_idx) {
+                        // Name-validated only (module docs).
+                        return Some(HlAssetInfo {
+                            asset_id: 0,
+                            kind: HlAssetKind::BuilderDex,
+                            sz_decimals: 0,
+                        });
+                    }
                     let mut k = 0;
-                    while k < self.dexs.len() {
-                        let (name, len) = &self.dexs[k];
-                        if *len as usize == dex.len() && &name[..*len as usize] == dex {
+                    while k < self.builder.len() {
+                        let (d, name, len, sz, index) = &self.builder[k];
+                        if *d == dex_idx && *len as usize == rest.len() && &name[..*len as usize] == rest {
                             return Some(HlAssetInfo {
-                                asset_id: 0,
+                                asset_id: builder_asset_id(u32::from(dex_idx), u32::from(*index))?,
                                 kind: HlAssetKind::BuilderDex,
-                                sz_decimals: 0,
+                                sz_decimals: *sz,
                             });
                         }
                         k += 1;
                     }
+                    // The dex's own universe does not list it.
                     None
                 } else {
                     let mut k = 0;
@@ -1588,6 +1730,43 @@ mod tests {
         );
         assert!(d.resolve(b"vntls:UBER").is_some());
         assert_eq!(d.resolve(b"nope:AAPL"), None);
+    }
+
+    /// HC10: a dex's own meta gives its coins real asset ids and size
+    /// decimals — `100_000 + dex_idx × 10_000 + index` — with or without
+    /// the `dex:` prefix on the row names; a coin the dex does not list
+    /// does not resolve; a dex whose meta was not ingested stays
+    /// name-validated at asset 0.
+    #[test]
+    fn a_dex_meta_derives_builder_asset_ids_and_size_decimals() {
+        let mut d = HlDiscovery::new();
+        d.ingest_perp_dexs(PERP_DEXS).expect("dexs");
+        let xyz = br#"{"universe":[{"szDecimals":4,"name":"xyz:XYZ100","maxLeverage":20,"onlyIsolated":true},{"szDecimals":3,"name":"xyz:TSLA","maxLeverage":10},{"szDecimals":3,"name":"NVDA","maxLeverage":10}],"marginTables":[[1,{"description":"","marginTiers":[]}]],"collateralToken":0}"#;
+        assert_eq!(d.ingest_dex_meta(b"xyz", xyz), Ok(3));
+        let nvda = d.resolve(b"xyz:NVDA").expect("listed");
+        assert_eq!(nvda, HlAssetInfo { asset_id: 110_002, kind: HlAssetKind::BuilderDex, sz_decimals: 3 });
+        assert_eq!(nvda.max_price_decimals(), Some(3));
+        assert_eq!(d.resolve(b"xyz:XYZ100").unwrap().asset_id, 110_000);
+        assert_eq!(d.resolve(b"xyz:AAPL"), None, "the dex's universe does not list it");
+        // vntls (dex_idx 2): meta not ingested → name-validated, asset 0.
+        let v = d.resolve(b"vntls:UBER").expect("dex exists");
+        assert_eq!((v.asset_id, v.max_price_decimals()), (0, None));
+        // A dex perpDexs did not list, and a second ingest, refuse.
+        assert_eq!(d.ingest_dex_meta(b"nope", xyz), Err(HlDiscoveryErr::BadRow));
+        assert_eq!(d.ingest_dex_meta(b"xyz", xyz), Err(HlDiscoveryErr::BadRow));
+        assert_eq!(dex_of(b"xyz:NVDA"), Some(&b"xyz"[..]));
+        assert_eq!(dex_of(b"BTC"), None);
+        assert_eq!(dex_of(b":X"), None);
+    }
+
+    #[test]
+    fn the_builder_asset_id_scheme_is_bounded() {
+        assert_eq!(builder_asset_id(1, 0), Some(110_000));
+        assert_eq!(builder_asset_id(1, 9_999), Some(119_999));
+        assert_eq!(builder_asset_id(0, 5), None, "the native dex is not a builder dex");
+        assert_eq!(builder_asset_id(1, 10_000), None);
+        assert_eq!(builder_asset_id(9_990, 0), None, "never into the HIP-4 range");
+        assert_eq!(builder_asset_id(9_989, 9_999), Some(99_999_999));
     }
 
     #[test]

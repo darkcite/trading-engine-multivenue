@@ -16,6 +16,8 @@
 //! * `resolve()` is then called on a subslice of the remainder —
 //!   this exercises the `BTC` / `@N` / `dex:COIN` / `#enc` coin-string
 //!   forms against whatever the ingest call populated.
+//! * HC10: a builder dex's own meta (`ingest_dex_meta`) over a fixed
+//!   `perpDexs`: every id it derives stays on the builder scheme.
 //! * `counts()` / `universe_total()` must stay consistent:
 //!   `perps + spots + outcomes*2 == universe_total()` always holds by
 //!   construction (builder dexs are excluded from the total — see the
@@ -66,6 +68,20 @@ fuzz_target!(|data: &[u8]| {
     let _ = ingest_selected(&mut d, selector, rest);
     let _ = d.resolve(&rest[..key_len]);
     assert_consistent(&d);
+
+    // HC10: a dex's own meta over a known `perpDexs` — any builder id it
+    // derives is on the scheme (a builder perp, never a HIP-4 or spot
+    // id), and a dex the venue did not list is refused.
+    let mut d3 = ingress_hyperliquid::discovery::HlDiscovery::new();
+    if d3.ingest_perp_dexs(br#"[null,{"name":"xyz"}]"#).is_ok() {
+        let _ = d3.ingest_dex_meta(b"xyz", rest);
+        if let Some(info) = d3.resolve(&rest[..key_len]) {
+            if info.kind == ingress_hyperliquid::discovery::HlAssetKind::BuilderDex && info.asset_id != 0 {
+                assert!((110_000..120_000).contains(&info.asset_id), "{}", info.asset_id);
+            }
+        }
+        assert!(d3.ingest_dex_meta(b"nope", rest).is_err());
+    }
 
     // Multi-body accumulation: split the remainder and feed both
     // halves to the same selected ingest fn on a fresh table.

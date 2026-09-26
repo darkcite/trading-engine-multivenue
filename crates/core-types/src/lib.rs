@@ -38,6 +38,11 @@ pub use regime::{
 /// Instrument fee class (XSD-F, statarb doc 08 §4): the second index of
 /// the harness fee table beside [`VenueId`].
 pub mod instrument_class;
+
+/// HC10: Hyperliquid's perp price and size law (five significant figures,
+/// `6 − szDecimals` decimals, the size step) — shared by the member that
+/// sizes a hedge and the arm that sends it.
+pub mod hl_px;
 pub use instrument_class::{InstrumentClass, ALL_CLASSES, INSTRUMENT_CLASSES};
 
 // ---------------------------------------------------------------
