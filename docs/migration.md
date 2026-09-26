@@ -6,6 +6,53 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `crates/core-settle`: the Hypercall settlement law, replicated; the settlement shadow (HC7)
+
+**What changed**
+
+- `crates/core-settle` (new, no dependencies): the law Hypercall settles
+  by, and the window that feeds it.
+  - `SettleWindow`: a 1 s sample-and-hold grid over `[T − 30 min, T]`
+    (1 800 points; a price from before the window carries in; a print
+    stamped after `T`, out of order or non-positive is refused).
+  - `median_of_means(samples, order, scratch)`: trim ⌊5 % · n⌋ from each
+    tail, ⌊√n′⌋ buckets of ⌊n′/k⌋ (the last takes the rest), the median of
+    the bucket means. `BucketOrder::{Sorted, Time}` both, because the
+    venue's docs do not say which and the first measurement did not
+    separate them.
+  - Fixed point ×1e6, `i128` sums, `select_nth_unstable` at every trim
+    and bucket boundary (no full sort), stack-only. Bench gate 76: a
+    window filled, closed and settled under both orders, 20 expiries,
+    0 B/op.
+- `claude_worker.hypercall_settle` (new module, never a verb): the
+  Python MIRROR of the law (pinned bit for bit against the Rust tests'
+  table) and the shadow — for every expiry `hc_payouts` pins, the
+  captured index Marks (`hypercall-events.pmlr`) over the window, the law
+  under both orders, `settle_err_bps` per expiry, and the HC7 gate line
+  per order (median |err| ≤ 1 bp and max ≤ 3 bp over ≥ 20 consecutive
+  full-coverage expiries on ≥ 3 underlyings).
+
+**Why**
+
+- HC7 of the Hypercall plan: paper settlement of a held Hypercall option
+  must use the venue's own law, and the gate must choose the bucket
+  order from data before any member books with it.
+
+**Impact**
+
+- None on the engine: nothing books with the law until the gate passes
+  and a member is ruled in (HC11).
+
+**Migration steps**
+
+1. None. To accumulate gate evidence: keep `[hypercall]` capturing
+   (HC5), run `hypercall_history` with the provider wallets (HC6), then
+   `python -m claude_worker.hypercall_settle`.
+
+**Rollback**
+
+- Revert the HC7 commit.
+
 ## 2026-09-26 — worker lanes for Hypercall: the research-store puller, the fee table (HC6)
 
 **What changed**

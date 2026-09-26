@@ -9315,3 +9315,46 @@ fn hypercall_run_loop_steady_state_is_zero_alloc() {
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
+
+/// **HC7 gate 76 — the settlement replicator is 0 B/op.** A 30-minute
+/// window of oracle prints (one every 700 ms, a trending walk with
+/// spikes, starting before the window so a price carries in), the grid
+/// closed at `T`, and the median-of-means under BOTH bucket orders —
+/// then the window reset and refilled for the next expiry, 20 times.
+/// The window and the scratch are boot-boxed (the only allocations).
+#[test]
+fn settlement_window_and_median_of_means_are_zero_alloc() {
+    use core_settle::{BucketOrder, SettleWindow, GRID_POINTS, SETTLE_WINDOW_MS};
+    const T0: u64 = 1_790_366_400_000;
+    let mut w = Box::new(SettleWindow::new(T0));
+    let mut scratch = Box::new([0i64; GRID_POINTS]);
+
+    let g = AllocGuard::new();
+    let mut acc: i64 = 0;
+    let mut e = 0u64;
+    while e < 20 {
+        let t_end = T0 + e * 86_400_000;
+        w.reset(t_end);
+        let mut ts = t_end - SETTLE_WINDOW_MS - 5_000;
+        let mut px: i64 = 224_000_000;
+        let mut i = 0u64;
+        while ts <= t_end {
+            px += ((i * 7_919) % 95_001) as i64 - 40_000;
+            let spike = if i % 211 == 7 { 3_000_000 } else { 0 };
+            if w.push(ts, px + spike).is_err() {
+                acc = acc.wrapping_add(1);
+            }
+            ts += 700;
+            i += 1;
+        }
+        acc = acc.wrapping_add(w.points() as i64);
+        acc = acc.wrapping_add(w.settle_1e6(BucketOrder::Sorted, &mut scratch).unwrap_or(0));
+        acc = acc.wrapping_add(w.settle_1e6(BucketOrder::Time, &mut scratch).unwrap_or(0));
+        e += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(w.points(), GRID_POINTS, "a full grid every expiry");
+    assert_eq!(allocs, 0, "settlement replicator allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0);
+}

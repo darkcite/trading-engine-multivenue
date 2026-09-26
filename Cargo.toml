@@ -31,6 +31,8 @@ members = [
     "crates/ingress-hyperevm",
     # HC3: Hypercall options — indicative quote-provider WS + REST summary
     "crates/ingress-hypercall",
+    # HC7: the Hypercall settlement law (median-of-means), replicated
+    "crates/core-settle",
     # shared boot-only options-chain selection law (M2 close extraction)
     "crates/options-select",
     # VRP V1: option sym -> (expiry, strike, right, contract size) table
@@ -185,6 +187,7 @@ ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }
 ingress-hyperevm   = { path = "crates/ingress-hyperevm" }
 ingress-hypercall  = { path = "crates/ingress-hypercall" }
+core-settle        = { path = "crates/core-settle" }
 options-select     = { path = "crates/options-select" }
 opt-registry       = { path = "crates/opt-registry" }
 

@@ -34,6 +34,8 @@ ingress-hyperliquid  = { workspace = true }
 ingress-mexc         = { workspace = true }
 # HC3 gates 74/75: the Hypercall parsers and run loop.
 ingress-hypercall    = { workspace = true }
+# HC7 gate 76: the settlement window and the median-of-means law.
+core-settle          = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 core-net             = { workspace = true }
