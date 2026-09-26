@@ -151,6 +151,7 @@ dependencies = [
  "ingress-ai",
  "ingress-binance",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",
@@ -975,6 +976,24 @@ name = "ingress-deribit"
 version = "0.1.0"
 dependencies = [
  "book-builder",
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio 0.8.11",
+ "options-select",
+ "proptest",
+ "rcgen",
+ "rustls",
+]
+
+[[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
  "core-metrics",
  "core-net",
  "core-parse",

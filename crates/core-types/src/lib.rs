@@ -1389,6 +1389,23 @@ pub enum ChannelId {
     /// | 48..56 | family index in the boot `rolling` list |
     /// | 56..64 | 0 = created, 1 = settled |
     InstrumentRoll = 13,
+    /// HC3: ONE quote provider's side of a Hypercall indicative quote —
+    /// the per-provider detail behind the venue's `best_bid`/`best_ask`
+    /// (which can be CROSSED when providers disagree: measured
+    /// 2026-09-25, 5 % of two-sided pushes, every one a two-provider
+    /// frame). Emitted only for frames with ≥ 2 providers (a one-provider
+    /// frame's detail IS the tick). `sym` = the option; `venue_time_ms`
+    /// = the provider's `updated_at`; `v0` = price ×1e6 (USD per 1-unit
+    /// contract); `v1` = max size ×1e6 (contracts); `venue_seq` packs
+    /// the identity:
+    ///
+    /// | bits | field |
+    /// |---|---|
+    /// | 0..8 | provider index within the frame |
+    /// | 8 | side: 0 = bid, 1 = ask |
+    /// | 16..24 | `num_providers` of the frame |
+    /// | 32..64 | the provider wallet's LOW 32 bits (last 8 hex digits) |
+    ProviderQuote = 14,
 }
 
 impl ChannelId {
@@ -1410,6 +1427,7 @@ impl ChannelId {
             11 => Some(Self::SubDrop),
             12 => Some(Self::VolIndex),
             13 => Some(Self::InstrumentRoll),
+            14 => Some(Self::ProviderQuote),
             _ => None,
         }
     }
@@ -1432,6 +1450,7 @@ impl ChannelId {
             Self::SubDrop => "sub_drop",
             Self::VolIndex => "vol_index",
             Self::InstrumentRoll => "instrument_roll",
+            Self::ProviderQuote => "provider_quote",
         }
     }
 }
@@ -4255,6 +4274,7 @@ mod channel_event_tests {
             ChannelId::SubDrop,
             ChannelId::VolIndex,
             ChannelId::InstrumentRoll,
+            ChannelId::ProviderQuote,
         ];
         let mut i = 0;
         while i < all.len() {
@@ -4263,7 +4283,10 @@ mod channel_event_tests {
             assert!(!c.as_str().is_empty());
             i += 1;
         }
-        assert_eq!(ChannelId::from_u8(14), None);
+        // HC3: 14 = ProviderQuote; the first unassigned byte is 15 (the
+        // last one a u16 event-lane mask can still express).
+        assert_eq!(ChannelId::ProviderQuote as u8, 14);
+        assert_eq!(ChannelId::from_u8(15), None);
         assert_eq!(ChannelId::from_u8(255), None);
     }
 

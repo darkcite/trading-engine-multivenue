@@ -282,6 +282,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ingress-hypercall"
+version = "0.1.0"
+dependencies = [
+ "core-metrics",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "memchr",
+ "mio",
+ "options-select",
+]
+
+[[package]]
 name = "ingress-hyperevm"
 version = "0.1.0"
 dependencies = [
@@ -448,6 +463,7 @@ dependencies = [
  "ingress-binance",
  "ingress-bybit",
  "ingress-deribit",
+ "ingress-hypercall",
  "ingress-hyperevm",
  "ingress-hyperliquid",
  "ingress-mexc",

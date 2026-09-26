@@ -61,7 +61,8 @@ copy-audit:
 	# Offline, ~1 s. The zero-COPY gate beside the zero-ALLOCATION one
 	# (operator ruling 2026-09-19): every byte-copy verb in the exec lane,
 	# core-net, core-ring, all nine ingress crates (binance since BX0, the
-	# other eight since the 2026-09-24 ZC pass) and the HYPARB crates
+	# other eight since the 2026-09-24 ZC pass), ingress-hypercall (born
+	# inside the gate, HC3) and the HYPARB crates
 	# either carries a `// COPY:` justification within
 	# the eight lines above it, or is in
 	# scripts/copy-audit-baseline.txt

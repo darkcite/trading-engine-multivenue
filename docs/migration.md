@@ -6,6 +6,77 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `crates/ingress-hypercall`: the Hypercall market-data ingress, data-only (HC3)
+
+**What changed**
+
+- New crate `crates/ingress-hypercall` (ruling O-HC1: no keys, no exec
+  arm). Not spawned yet: the bin wiring is HC5, so nothing changes at
+  runtime.
+  - ONE public WebSocket, one thread: `ClockSync` at connect, then one
+    `Subscribe` per channel — `indicative_market_data` naming the whole
+    universe in ONE frame (the D3 law: 3 or 12 frames were closed 1008
+    within 0.12 s, measured 2026-09-25), plus `index_prices`, `trades`,
+    `market_updates`.
+  - A slow-consumer close (1008 + a reason JSON) is counted by cause and
+    torn down; the reconnect re-subscribes in one frame and asks the
+    REST poller for a full snapshot round (quotes that changed in the
+    gap are not replayed).
+  - A REST poller thread (`GET /options-summary?currency=<U>` over the
+    HC2 `HttpsReq`, staggered, default 300 s per underlying) hands its
+    `OptSummary` rows over an SPSC ring; the ingress thread captures them
+    and pushes them onto opt lane 3 — every file and lane keeps one
+    writer.
+  - The capture law — BBO-change ticks (one-sided and crossed quotes
+    kept), `Trade`, `Mark` on the index syms, `ProviderQuote` (14) for
+    multi-provider quotes, the summary rows — is `docs/wire-format.md`
+    "Hypercall (HC3)".
+  - The drain loop judges progress by frames CONSUMED, not ticks
+    published (the I-3 gap of the tick-judged loops), capped at 64 steps
+    per iteration.
+  - `discovery`: the one-pass `/markets` scan and the capped-chain
+    selection (the M2 law via `options-select`, plus the provider's 2 h
+    pre-expiry blackout) as pure functions over a trimmed real body; the
+    boot wires them at HC4.
+- `core_types::ChannelId::ProviderQuote = 14` (NEW, additive): one side
+  of one market-maker's indicative quote, for a quote with ≥ 2 providers.
+  `venue_seq` packs the provider's index, the side, the provider count
+  and the wallet's low 32 bits (`docs/wire-format.md`, the
+  `ChannelEvent` table). `ChannelId::from_u8(14)` now resolves.
+- Parsers fill in place (the poison law) with in-place object/array
+  walkers; the subscribe frame is serialised from parts straight into
+  the masked tx buffer; the poller's rows are read in place in the
+  handoff slot.
+- Gates:
+  - bench gate 74: every Hypercall parser, the lookup, the subscribe
+    parts and the summary scan, 0 B/op;
+  - bench gate 75: the run loop's steady state (real handshake, then
+    300 rounds of the measured wire mix incl. a server Ping and the
+    handoff) with a real `PmlrCapture`, 0 B/op;
+  - fuzz targets `hypercall_ws_frame`, `hypercall_markets`,
+    `hypercall_summary` (poisoned start);
+  - `make copy-audit` covers the crate (new = 0).
+
+**Why**
+
+- HC3 of the Hypercall plan: the venue's public market data — option
+  premia and IV on 12 underlyings incl. tokenised equities — as a
+  capture/research lane (O-HC1).
+
+**Impact**
+
+- **On-disk formats:** none until HC5 spawns the ingress (then the
+  `hypercall-*` capture files, the label reserved at HC1).
+- **API:** additive (a new crate).
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the HC3 commit.
+
 ## 2026-09-25 — core-net: any-method HTTP/1.1 heads and `HttpsReq`; `HttpsPost` on the shared keep-alive engine (HC2)
 
 **What changed**

@@ -32,6 +32,8 @@ ingress-deribit      = { workspace = true }
 ingress-hyperliquid  = { workspace = true }
 # MX8: the MEXC spot-PB + futures-JSON parsers and run loop.
 ingress-mexc         = { workspace = true }
+# HC3 gates 74/75: the Hypercall parsers and run loop.
+ingress-hypercall    = { workspace = true }
 ingress-okx          = { workspace = true }
 ingress-rpc          = { workspace = true }
 core-net             = { workspace = true }

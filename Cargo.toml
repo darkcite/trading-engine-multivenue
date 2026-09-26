@@ -29,6 +29,8 @@ members = [
     "crates/ingress-rpc",
     # HYPARB H3: HyperEVM pool events + in-session pool snapshots
     "crates/ingress-hyperevm",
+    # HC3: Hypercall options — indicative quote-provider WS + REST summary
+    "crates/ingress-hypercall",
     # shared boot-only options-chain selection law (M2 close extraction)
     "crates/options-select",
     # VRP V1: option sym -> (expiry, strike, right, contract size) table
@@ -182,6 +184,7 @@ ingress-okx        = { path = "crates/ingress-okx" }
 ingress-polymarket = { path = "crates/ingress-polymarket" }
 ingress-rpc        = { path = "crates/ingress-rpc" }
 ingress-hyperevm   = { path = "crates/ingress-hyperevm" }
+ingress-hypercall  = { path = "crates/ingress-hypercall" }
 options-select     = { path = "crates/options-select" }
 opt-registry       = { path = "crates/opt-registry" }
 
