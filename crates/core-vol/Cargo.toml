@@ -13,3 +13,6 @@ path = "src/lib.rs"
 
 [dependencies]
 core-regime = { workspace = true }
+# HAR H3.3: the set's clock (`WallAnchor`) and its feed (`Tick`, `SymbolId`).
+core-time   = { workspace = true }
+core-types  = { workspace = true }

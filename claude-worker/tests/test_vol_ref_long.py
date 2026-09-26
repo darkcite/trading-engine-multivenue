@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Anton (darkcite)
-"""vol_ref.LongVolEngine -- the Python half of the long-tenor parity (HAR H1/H2).
+"""vol_ref.LongVolEngine -- the Python half of the long-tenor parity (HAR H1/H2, H3.3).
 
 ``tests/fixtures/vol/long-<n>.{input,expected}.tsv`` are the SAME files
 ``crates/core-vol/tests/long_parity.rs`` consumes; the expected rows are
@@ -15,7 +15,7 @@ import pathlib
 import claude_worker.vol_ref
 
 _DIR: pathlib.Path = pathlib.Path(__file__).resolve().parent / "fixtures" / "vol"
-_FIXTURES: tuple[str, ...] = ("long-1",)
+_FIXTURES: tuple[str, ...] = ("long-1", "long-2")
 _NONE: int = claude_worker.vol_ref.LOG2_UNDEFINED
 _U64: int = (1 << 64) - 1
 _LCG_MUL: int = 6_364_136_223_846_793_005
@@ -114,6 +114,9 @@ def _emit(e: claude_worker.vol_ref.LongVolEngine, f: list[str], out: list[str]) 
     elif op == "E":
         for d in f[1:]:
             out.append(_tenor_row(len(out), e, int(d)))
+    elif op == "K":
+        prof, n_days = e.weekday_profile_1e6()
+        out.append(f"{len(out)}\tK\t{','.join(map(str, prof))}\t{','.join(map(str, n_days))}")
     else:
         out.append(f"{len(out)}\t{op}\t{1 if _seed(e, f) else 0}")
 
@@ -142,7 +145,7 @@ def _replay(name: str) -> list[str]:
             e = claude_worker.vol_ref.LongVolEngine()
         elif op == "F":
             e.refresh()
-        elif op in {"W", "O", "A", "P", "Q", "S", "D", "E"}:
+        elif op in {"W", "O", "A", "P", "Q", "S", "D", "E", "K"}:
             _emit(e, f, out)
         else:
             raise AssertionError(f"{name}: unknown op {op!r}")

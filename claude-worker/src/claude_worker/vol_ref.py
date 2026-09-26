@@ -533,6 +533,9 @@ _MINUTE_MS = 60_000
 #: day sum within 1e32 -- the writer can never produce anything outside.
 _LN_ABS_MAX_1E9 = 100_000_000_000
 _SUM_SQ_MAX = 10**32
+#: HAR H3.3: the weekday profile's width, and ``i128::MAX`` (its saturation).
+WEEKDAYS = 7
+_I128_MAX = 2**127 - 1
 
 
 def annualiser_1e9(tau_min):
@@ -559,6 +562,11 @@ def long_tenor_of(tau_ns):
 def _tix(tau_ns):
     t = long_tenor_of(tau_ns)
     return None if t is None else t[0] - 1
+
+
+def weekday_of(ts_ms):
+    """The UTC weekday, Monday = 0 ... Sunday = 6 (1970-01-01 was a Thursday)."""
+    return (ts_ms // DAY_MS + 3) % WEEKDAYS
 
 
 class LongVolEngine:
@@ -777,6 +785,39 @@ class LongVolEngine:
         raw, fit = trailing_means_1e9([r[0] for r in rows], [r[1] for r in rows])
         n = len(rows)
         return (n, raw, fit, n == QLIKE_RING and fit < raw)
+
+    # -- the weekday profile (HAR H3.3) ------------------------------
+
+    def weekday_profile_1e6(self):
+        """``([ratio_1e6] * 7, [observed_days] * 7)``, Monday first: per UTC
+        weekday the mean ``sum r^2`` of its OBSERVED resident days over the
+        mean of every observed day (``core_vol::LongVolEngine::
+        weekday_profile_1e6``, bit for bit: floored means, the product
+        saturating to ``i64::MAX`` past ``i128``, zeros without a mean)."""
+        sums = [0] * WEEKDAYS
+        cnt = [0] * WEEKDAYS
+        total = 0
+        n_obs = 0
+        n = self.n_resident()
+        for i in range(n):
+            s = (self.n_days - n + i) % DAY_RING
+            if self.day_n[s] > 0:
+                w = weekday_of(self.day_ts_ms[s])
+                sums[w] = min(sums[w] + self.day_sq[s], _I128_MAX)
+                cnt[w] += 1
+                total = min(total + self.day_sq[s], _I128_MAX)
+                n_obs += 1
+        out = [0] * WEEKDAYS
+        if n_obs == 0:
+            return out, cnt
+        mean = total // n_obs
+        if mean <= 0:
+            return out, cnt
+        for w in range(WEEKDAYS):
+            if cnt[w] > 0:
+                v = (sums[w] // cnt[w]) * 1_000_000
+                out[w] = I64_MAX if v > _I128_MAX else min(v // mean, I64_MAX)
+        return out, cnt
 
     # -- the writer's view -----------------------------------------
 

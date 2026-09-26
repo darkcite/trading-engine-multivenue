@@ -100,6 +100,17 @@ pub const DAY_NS: u64 = DAY_MS * 1_000_000;
 /// denominator).
 pub const DAY_MINUTES: u32 = 1440;
 
+/// Days in a week — the weekday profile's width.
+pub const WEEKDAYS: usize = 7;
+
+/// The UTC weekday of an instant, Monday = 0 … Sunday = 6 (1970-01-01, day
+/// 0 of the epoch, was a Thursday — index 3).
+#[inline]
+#[must_use]
+pub const fn weekday_of(ts_ms: u64) -> usize {
+    ((ts_ms / DAY_MS + 3) % WEEKDAYS as u64) as usize
+}
+
 /// Completed UTC days retained. 64 > 40 + 1: the arm made
 /// [`LONG_TAU_DAYS_MAX`] closes ago and the target it settles against
 /// are both still resident when the newest day is written, and so is
@@ -697,6 +708,71 @@ impl LongVolEngine {
             fit_mean_1e9: fit,
             fit_beats_raw: n == QLIKE_RING && fit < raw,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The weekday profile (HAR H3.3 — the ruling "publish a profile")
+    // -----------------------------------------------------------------
+
+    /// The day clock's shape over the resident closed days: per UTC
+    /// weekday ([`weekday_of`], Monday = 0), the mean `Σ r²` of its
+    /// OBSERVED days over the mean of every observed day, ×1e6 — `1e6` is
+    /// an average day, a closed-market Saturday of an equity perp sits far
+    /// below it — and the observed days each mean is over (`0`: none, and
+    /// the ratio is `0`). A description, never an input: the fold and the
+    /// pairs are untouched by it (the equities' weekends are in their
+    /// `Σ r²` as the `xyz` market trades them).
+    ///
+    /// The integer law (the Python mirror's, bit for bit): `m_w = ⌊S_w /
+    /// N_w⌋`, `m = ⌊S / N⌋`, `p_w = ⌊m_w · 1e6 / m⌋`, every term
+    /// non-negative; a product past `i128` saturates to `i64::MAX`, and a
+    /// zero `m` (no observed day, or every one flat) leaves every ratio 0.
+    #[must_use]
+    pub fn weekday_profile_1e6(&self) -> ([i64; WEEKDAYS], [u32; WEEKDAYS]) {
+        let mut sum = [0i128; WEEKDAYS];
+        let mut cnt = [0u32; WEEKDAYS];
+        let mut total: i128 = 0;
+        let mut n_obs: u32 = 0;
+        let n = self.n_resident();
+        let mut i = 0usize;
+        while i < n {
+            let s = slot(self.n_days - n as u64 + i as u64);
+            if self.day_n[s] > 0 {
+                let w = weekday_of(self.day_ts_ms[s]);
+                sum[w] = sum[w].saturating_add(self.day_sq[s]);
+                cnt[w] += 1;
+                total = total.saturating_add(self.day_sq[s]);
+                n_obs += 1;
+            }
+            i += 1;
+        }
+        let mut out = [0i64; WEEKDAYS];
+        if n_obs == 0 {
+            return (out, cnt);
+        }
+        let mean = total / n_obs as i128;
+        if mean <= 0 {
+            return (out, cnt);
+        }
+        let mut w = 0usize;
+        while w < WEEKDAYS {
+            if cnt[w] > 0 {
+                let mw = sum[w] / cnt[w] as i128;
+                out[w] = match mw.checked_mul(1_000_000) {
+                    Some(v) => {
+                        let r = v / mean;
+                        if r > i64::MAX as i128 {
+                            i64::MAX
+                        } else {
+                            r as i64
+                        }
+                    }
+                    None => i64::MAX,
+                };
+            }
+            w += 1;
+        }
+        (out, cnt)
     }
 
     // -----------------------------------------------------------------

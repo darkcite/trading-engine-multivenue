@@ -78,11 +78,16 @@
 
 pub mod fx;
 mod long;
+mod long_set;
 
 pub use long::{
-    long_tenor_of, LongForecast, LongQlike, LongTenor, LongVolEngine, ANNUALISE_LONG_1E9,
-    DAY_MINUTES, DAY_MS, DAY_NS, DAY_RING, LONG_TAU_DAYS_MAX, LONG_WARM_DAYS, LONG_WINDOWS_DAYS,
-    PAIR_RING_LONG,
+    long_tenor_of, weekday_of, LongForecast, LongQlike, LongTenor, LongVolEngine,
+    ANNUALISE_LONG_1E9, DAY_MINUTES, DAY_MS, DAY_NS, DAY_RING, LONG_TAU_DAYS_MAX, LONG_WARM_DAYS,
+    LONG_WINDOWS_DAYS, PAIR_RING_LONG, WEEKDAYS,
+};
+pub use long_set::{
+    LongSeries, LongSetCounters, LongSetErr, LongVolSet, DAY_CLOSES_PER_POLL, LONG_SET_CAP,
+    LONG_SET_MAX, LONG_SET_NAME_MAX,
 };
 
 /// 1-minute return ring. 1536 > 1440 by a whole 96 minutes, so the

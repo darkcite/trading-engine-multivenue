@@ -85,6 +85,7 @@ use core_regime::{
 };
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::REL_UNKNOWN;
+use core_vol::LongVolSet;
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, RegimeLabelSet, RegimeWord,
     RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_PROFILES, STRATEGY_SLOT_AI_EXEC,
@@ -309,10 +310,18 @@ pub struct StrategySet {
     regime_declared_total: u64,
     /// RG2: gate edges fanned out (`on_regime` calls).
     regime_gate_changes: u64,
+    /// HAR H3.3: the long-tenor HAR series (boot-boxed; inert until the
+    /// cli configures it from `har.toml` — one branch per tick and per
+    /// poll, so a boot without the file is the pre-H3 set, bit for bit).
+    /// Beside the regime detector, in the same seat and on the same
+    /// timer; no member reads it (plan law L4).
+    har: Box<LongVolSet>,
 }
 
 /// RG2: the set's timer cadence once a detector is configured — the
 /// regime rolls once per wall minute, the timer polls for the boundary.
+/// HAR H3.3: a configured long-tenor set arms the same poll (its minute
+/// rolls and its staggered day closes ride it).
 pub const REGIME_TIMER_NS: u64 = 1_000_000_000;
 
 impl StrategySet {
@@ -342,7 +351,21 @@ impl StrategySet {
             regime_gates: [RegimeGate::OPEN_UNKNOWN; 8],
             regime_declared_total: 0,
             regime_gate_changes: 0,
+            har: Box::new(LongVolSet::new()),
         }
+    }
+
+    // ---- HAR H3.3: the long-tenor HAR series --------------------------
+
+    /// The long-tenor HAR series (readers: `/state`, the state writer).
+    pub fn har(&self) -> &LongVolSet {
+        &self.har
+    }
+
+    /// Boot only: configure the series (`core_vol::LongVolSet::configure`)
+    /// and restore their state. Nothing on the engine loop calls this.
+    pub fn har_mut(&mut self) -> &mut LongVolSet {
+        &mut self.har
     }
 
     // ---- RG2: regime detector (plan §4.2) ----------------------------
@@ -1027,6 +1050,8 @@ impl Strategy for StrategySet {
         // RG2: the detector sees every fresh tick first (one probe +
         // one store for members, one probe for everything else).
         self.regime.on_tick(tick);
+        // HAR H3.3: so does the long-tenor set (one branch while inert).
+        self.har.on_tick(tick);
         if self.enabled & BIT_HYPARB != 0 {
             self.hyparb
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
@@ -1360,6 +1385,9 @@ impl Strategy for StrategySet {
         } else if self.regime.minutes_judged() != minutes_before {
             self.push_regime_views();
         }
+        // HAR H3.3: the long-tenor minute roll and its staggered day
+        // closes (one branch while inert).
+        self.har.on_timer(now_ns);
         if self.enabled & BIT_HYPARB != 0 {
             self.hyparb
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
@@ -1394,9 +1422,10 @@ impl Strategy for StrategySet {
     /// engine's timer arming is stable across runtime Enable/Disable;
     /// `on_timer` itself fans out to enabled members only). All seven
     /// members currently return `u64::MAX` (disabled); a configured
-    /// regime detector arms the 1 s [`REGIME_TIMER_NS`] poll.
+    /// regime detector or long-tenor set arms the 1 s
+    /// [`REGIME_TIMER_NS`] poll.
     fn timer_period_ns(&self) -> u64 {
-        let mut min = if self.regime.is_configured() {
+        let mut min = if self.regime.is_configured() || self.har.is_configured() {
             REGIME_TIMER_NS
         } else {
             u64::MAX
@@ -1433,6 +1462,9 @@ impl Strategy for StrategySet {
     }
 
     fn on_stop<C: Ctx>(&mut self, ctx: &mut C) {
+        // HAR H3.3: a minute still held by the stagger goes in before
+        // the shutdown state write.
+        self.har.drain_held();
         // Stop is unconditional — even disabled members get the
         // teardown callback (they may hold capture-worthy state some
         // day; today all six are no-ops).
@@ -2683,5 +2715,36 @@ mod tests {
             assert_eq!(mask & !BUILT_MASK, 0, "{name} composes an unbuilt slot");
             i += 1;
         }
+    }
+
+    /// HAR H3.3: the long-tenor set rides the set's tick and timer, arms
+    /// the 1 s poll only once configured, and drains at stop.
+    #[test]
+    fn the_long_tenor_set_is_inert_until_configured_then_fed() {
+        use core_vol::{LongSeries, LongSetCounters};
+        const MIN: NsTs = 60_000_000_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        assert_eq!(s.timer_period_ns(), u64::MAX, "no har.toml: no poll");
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+        s.on_timer(10 * MIN, &mut c);
+        assert_eq!(s.har().counters(), LongSetCounters::default());
+        let anchor = WallAnchor::new(0, 1_767_225_600_000_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"BTC", feed }], anchor, 0)
+            .unwrap();
+        assert_eq!(s.timer_period_ns(), REGIME_TIMER_NS);
+        // One quote in minute 0 (the helper stamps ts 0), the roll at 1 min.
+        s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+        s.on_timer(MIN, &mut c);
+        let e = s.har().engine(0).unwrap();
+        assert_eq!(e.last_min_ts_ms(), 1_767_225_600_000);
+        assert_eq!(e.prev_px_1e6(), 100_000_001);
+        assert_eq!(s.har().counters().closes, 1);
+        s.on_stop(&mut c);
+        assert_eq!(s.har().held(0), None);
     }
 }

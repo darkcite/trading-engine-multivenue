@@ -541,6 +541,8 @@ name = "core-vol"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-time",
+ "core-types",
 ]
 
 [[package]]
@@ -2019,6 +2021,7 @@ dependencies = [
  "core-regime",
  "core-time",
  "core-types",
+ "core-vol",
  "strategy-ai-exec",
  "strategy-bin15",
  "strategy-core",

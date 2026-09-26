@@ -9426,3 +9426,102 @@ fn long_vol_is_zero_alloc() {
     assert_eq!(allocs, 0, "long-tenor engine allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "long-tenor engine bytes should be zero: saw {bytes}");
 }
+
+/// **HAR H3.3 gate 78 — the long-tenor SET is 0 B/op.** Twelve series
+/// (the Hypercall underlyings) configured and warmed by 35 unmeasured days
+/// (the boxes are the only allocation — boot). Under the guard, two more
+/// UTC days of the engine loop's traffic: every minute a fresh quote of
+/// all twelve feeds among stale, one-sided and stranger ticks, the 1 s
+/// poll's rolls, and at each UTC boundary the STAGGERED day close — one
+/// series per poll, eleven held and released — with every forecast, the
+/// weekday profile and the counters read once an hour.
+#[test]
+fn long_vol_set_is_zero_alloc() {
+    use core_time::WallAnchor;
+    use core_types::{make_symbol_id, TICK_FLAG_STALE};
+    use core_vol::{LongForecast, LongSeries, LongVolSet, DAY_NS, LONG_SET_MAX, LONG_TAU_DAYS_MAX};
+    const MIN_NS: u64 = 60_000_000_000;
+    const SEC_NS: u64 = 1_000_000_000;
+    const NAMES: [&[u8]; LONG_SET_MAX] = [
+        b"SP500", b"SPCX", b"MU", b"NVDA", b"MSFT", b"META", b"AAPL", b"BABA", b"SNDK", b"BOT",
+        b"BTC", b"ETH",
+    ];
+    fn quote(ts: u64, sym: SymbolId, px: i64, flags: u8) -> Tick {
+        let mut t = Tick::new(
+            ts,
+            VenueId::Binance,
+            sym,
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(1),
+            Price::from_raw(px + 2),
+            Qty::from_raw(1),
+        );
+        t.flags = flags;
+        t
+    }
+    let feeds: [SymbolId; LONG_SET_MAX] =
+        core::array::from_fn(|i| make_symbol_id(VenueId::Binance, 300 + i as u32));
+    let stranger = make_symbol_id(VenueId::Binance, 999);
+    let series: [LongSeries<'_>; LONG_SET_MAX] =
+        core::array::from_fn(|i| LongSeries { name: NAMES[i], feed: feeds[i] });
+    let mut set = Box::new(LongVolSet::new());
+    set.configure(&series, WallAnchor::new(0, 1_767_225_600_000_000_000), 0)
+        .expect("gate 78 configure");
+    let mut s: u64 = 20_260_926;
+    let mut px = [79_000_000_000i64; LONG_SET_MAX];
+    let mut run = |set: &mut LongVolSet, from_day: u64, to_day: u64, acc: &mut i64| {
+        let mut m = from_day * 1440;
+        while m < to_day * 1440 {
+            let t0 = m * MIN_NS;
+            let mut p = 0u64;
+            while p < 13 {
+                set.on_timer(t0 + p * SEC_NS);
+                p += 1;
+            }
+            let mut i = 0usize;
+            while i < LONG_SET_MAX {
+                let v = long_vol_px(&mut s, &mut px[i], m / 1440 + i as u64);
+                set.on_tick(&quote(t0 + 20 * SEC_NS, feeds[i], v, 0));
+                set.on_tick(&quote(t0 + 21 * SEC_NS, feeds[i], 1, TICK_FLAG_STALE));
+                set.on_tick(&quote(t0 + 22 * SEC_NS, feeds[i], 0, 0));
+                i += 1;
+            }
+            set.on_tick(&quote(t0 + 23 * SEC_NS, stranger, 5, 0));
+            if m % 60 == 0 {
+                let mut k = 0usize;
+                while k < set.len() {
+                    let e = set.engine(k).expect("gate 78 engine");
+                    let mut d = 1u64;
+                    while d <= LONG_TAU_DAYS_MAX as u64 {
+                        let t = d * DAY_NS;
+                        *acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Raw).unwrap_or(0));
+                        *acc = acc.wrapping_add(e.sigma_ann_1e9(t, LongForecast::Fit).unwrap_or(0));
+                        *acc = acc.wrapping_add(e.qlike_counters(t).fit_mean_1e9);
+                        d += 1;
+                    }
+                    let (prof, n) = set.profile(k).expect("gate 78 profile");
+                    *acc = acc.wrapping_add(prof[0]).wrapping_add(n[6] as i64);
+                    k += 1;
+                }
+                *acc = acc.wrapping_add(set.counters().day_closes as i64);
+            }
+            m += 1;
+        }
+    };
+    let mut acc: i64 = 0;
+    run(&mut set, 0, 35, &mut acc);
+    assert!(set.engine(0).expect("gate 78").is_warm(), "the gate must measure WARM engines");
+    let before = set.counters();
+
+    let g = AllocGuard::new();
+    run(&mut set, 35, 37, &mut acc);
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let after = set.counters();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(after.day_closes - before.day_closes, 2 * LONG_SET_MAX as u64, "two staggered boundaries");
+    assert_eq!(after.held - before.held, 2 * (LONG_SET_MAX as u64 - 1), "the stagger held");
+    assert_eq!(allocs, 0, "long-tenor set allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "long-tenor set bytes should be zero: saw {bytes}");
+}

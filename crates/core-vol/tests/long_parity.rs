@@ -29,6 +29,8 @@
 //! D                        row D i ts sq n, one per resident day
 //! E tau_days…              row E tau x a b ln_fit sig_raw sig_fit
 //!                          n_pairs q_n q_raw q_fit beats last_pair last_arm
+//! K                        row K p_mon,…,p_sun n_mon,…,n_sun — the weekday
+//!                          profile (HAR H3.3)
 //! ```
 //!
 //! Test-only code: allocation and `unwrap` are fine here.
@@ -39,7 +41,7 @@ const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../claude-worker/tests/fixtures/vol/"
 );
-const FIXTURES: [&str; 1] = ["long-1"];
+const FIXTURES: [&str; 2] = ["long-1", "long-2"];
 
 fn opt(v: Option<i64>) -> String {
     v.map_or_else(|| "-".to_owned(), |x| x.to_string())
@@ -177,6 +179,15 @@ fn run(name: &str) -> Vec<String> {
                     out.push(r);
                 }
             }
+            "K" => {
+                let (p, n) = e.weekday_profile_1e6();
+                let join = |v: &[String]| v.join(",");
+                out.push(format!(
+                    "{row}\tK\t{}\t{}",
+                    join(&p.map(|x| x.to_string())),
+                    join(&n.map(|x| x.to_string()))
+                ));
+            }
             other => panic!("{name}: unknown op {other:?}"),
         }
     }
@@ -279,4 +290,23 @@ fn the_tape_exercises_every_branch_it_claims_to() {
         }),
         "a short day"
     );
+}
+
+/// `long-2` must show the shape it was written for: weekdays trade,
+/// weekends barely move, the hole day is not a weekday, and a fresh
+/// engine profiles to zeros.
+#[test]
+fn the_profile_tape_shows_the_weekend() {
+    let rows = run("long-2");
+    let k: Vec<Vec<i64>> = rows
+        .iter()
+        .map(|r| r.split('\t').collect::<Vec<_>>())
+        .filter(|c| c[1] == "K")
+        .map(|c| c[2].split(',').map(|x| x.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(k[0], [0; 7], "an empty engine");
+    let full = &k[6];
+    assert!(full[..5].iter().all(|&p| p > 1_200_000), "{full:?}");
+    assert!(full[5..].iter().all(|&p| p < 100_000), "{full:?}");
+    assert_eq!(k[8], [0; 7], "a fresh engine after `N`");
 }
