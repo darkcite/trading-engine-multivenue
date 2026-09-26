@@ -227,9 +227,9 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
-- **The Hyperliquid reconnect loop — fixed 2026-09-26, live at the next
-  release build + restart** (risk-policy "The Hyperliquid reconnect loop —
-  dead HIP-4 instances"). The venue drops the whole socket (a bare FIN) on
+- **The Hyperliquid reconnect loop — fixed 2026-09-26 (`7235201`), LIVE
+  since the 09:03Z restart, verified at the 09:15Z roll** (risk-policy
+  "The Hyperliquid reconnect loop — dead HIP-4 instances"). The venue drops the whole socket (a bare FIN) on
   a subscribe to a settled or unknown HIP-4 coin, and `outcomeMetaUpdates`
   pushes a roll once and replays none to a later subscriber (both probed),
   so a reconnect that re-subscribed a family's settled instance died every
@@ -241,8 +241,9 @@ in the script; `ai` = 48 is the floor every name includes).
   only after a session that lived 30 s (the seven loops sharing
   `should_reset_backoff`); `hyperliquid: run-loop returned` names each end
   (`err_site`, `io_kind`, `venue_code`, `lived_ms`, `acks`/`acks_expected`).
-  Until that build runs, a restart is the only cure for a loop. Open:
-  `roll_health`'s second strike is unreachable (pre-existing).
+  Open: `roll_health`'s second strike is unreachable (pre-existing); the
+  lane counts ~1 parse reject a second (the reject tap is off, so which
+  frames is unknown; parse path and subscriptions unchanged by the fix).
 - **Gates at HEAD (the Hyperliquid reconnect-loop fix, 2026-09-26; Foundry
   and worker pytest as of the HYPARB merge):** nextest 3169 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`

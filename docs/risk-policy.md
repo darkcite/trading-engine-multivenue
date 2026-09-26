@@ -3451,8 +3451,14 @@ those 1.2 s gaps climb to the 8 s cap, and the new line says how each
 session ended; the old one could not tell this outage from the loop. That restart's boot
 discovery failed on the same outage (`spotMeta` Timeout, exit 1), and
 launchd's relaunch booted clean at 08:36:24Z (the 15-minute families on
-5792/5793, the dailies on 5755–5758; `vm_rows_active` 2). The fix is not
-deployed: a loop can recur at any expiry until a build of it runs.
+5792/5793, the dailies on 5755–5758; `vm_rows_active` 2). Deployed on the
+operator's word: `7235201` built and restarted through the 0010 revive at
+09:03Z (the old engine drained, exit 0); the new one booted at 09:05:11Z,
+and at the 09:15Z roll it settled 5796/5797 and adopted 5799/5800 in
+session — no reconnect, no ack timeout, no staleness trip. The lane counts
+~1 parse reject a second, before and after that roll; the parse path and
+the subscription set are unchanged by this work, the reject tap is off,
+and which frames they are is open.
 
 Gates: clippy clean; nextest 3169 passed (5 skipped); alloc
 73/73 at 0 B/op (fresh `Compiling bench`); `make copy-audit` `hits=31
