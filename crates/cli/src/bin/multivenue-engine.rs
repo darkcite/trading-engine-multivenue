@@ -3234,6 +3234,11 @@ fn run(args: RunArgs) -> ExitCode {
         .chain(boot.allocated.mexc_perp.iter())
         .map(|i| i.sym)
         .collect();
+    // O-HC17: every Hypercall option the boot selected is addressable by
+    // AI rulesets (signal / reference legs — orders on it stay
+    // unroutable); the `hypercall-idx:<U>` index syms stay out (caps 0).
+    let hypercall_option_syms: Vec<core_types::SymbolId> =
+        discovery.hypercall_options.iter().map(|o| o.1).collect();
     let ai_universe = cli::build_ai_universe(
         &pm_syms,
         &bn_syms,
@@ -3241,6 +3246,7 @@ fn run(args: RunArgs) -> ExitCode {
         deribit_boot.as_ref().map(|(t, _)| t),
         hl_boot.as_ref().map(|(t, _f, _e, _i)| t),
         &mexc_syms,
+        &hypercall_option_syms,
     );
     // VM2 V4 (D-6): the live descriptor→(sym, caps) table for the v2
     // grammar's stage-time resolution — same allocation truth as the

@@ -2897,9 +2897,14 @@ fn mirror_ai_capture_metrics(metrics: &CaptureMetrics, capture: &AiCmdCapture) {
 /// every SymbolId the boot wired into a venue ingress — the PM/BN
 /// pair flags plus each discovery-gated venue table, plus (MX6,
 /// operator ruling Q-MX6) every MEXC instrument the boot allocated
-/// (spot + perp; Bybit stays out by its own WS9 precedent) — **sorted
-/// strict-ascending and deduped** (binary-searched per §4.2 rule-6
-/// check; `RulesetSidePath::new` debug-asserts the ordering).
+/// (spot + perp; Bybit stays out by its own WS9 precedent), plus
+/// (ruling O-HC17) every Hypercall option the boot selected — its
+/// `hypercall-idx:<U>` index syms stay out (capture-only `Mark`s, caps
+/// 0: nothing could read them) — **sorted strict-ascending and
+/// deduped** (binary-searched per §4.2 rule-6 check;
+/// `RulesetSidePath::new` debug-asserts the ordering). Data-only venues
+/// (MEXC, Hypercall) enter as signal or reference legs: an order on one
+/// stays unroutable in the paper matcher and the harness.
 ///
 /// Universe membership is a boot-time fact: a symbol that later
 /// loses its feed still validates — the row just never triggers
@@ -2913,6 +2918,7 @@ pub fn build_ai_universe(
     deribit: Option<&ingress_deribit::DeribitSymbolTable>,
     hl: Option<&ingress_hyperliquid::HlCoinTable>,
     mexc_syms: &[SymbolId],
+    hypercall_option_syms: &[SymbolId],
 ) -> Arc<[u32]> {
     let mut v: Vec<u32> = Vec::with_capacity(
         polymarket_syms.len()
@@ -2920,11 +2926,13 @@ pub fn build_ai_universe(
             + okx.map_or(0, |t| t.len())
             + deribit.map_or(0, |t| t.len())
             + hl.map_or(0, |t| t.len())
-            + mexc_syms.len(),
+            + mexc_syms.len()
+            + hypercall_option_syms.len(),
     );
     v.extend_from_slice(polymarket_syms);
     v.extend_from_slice(binance_syms);
     v.extend_from_slice(mexc_syms);
+    v.extend_from_slice(hypercall_option_syms);
     if let Some(t) = okx {
         let mut i = 0usize;
         while let Some((_, sym, _)) = t.get(i) {
@@ -10865,13 +10873,16 @@ mod tests {
         let hl = build_hl_coin_table("BTC,ETH").unwrap();
 
         let mexc = [make_symbol_id(VenueId::Mexc, 1), make_symbol_id(VenueId::Mexc, 513)];
-        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc);
+        let hc = [make_symbol_id(VenueId::Hypercall, 513), make_symbol_id(VenueId::Hypercall, 514)];
+        let u = build_ai_universe(&[42], &[7], Some(&okx), Some(&deribit), Some(&hl), &mexc, &hc);
         let expect: Vec<u32> = {
             let mut v = vec![
                 42,
                 7,
                 make_symbol_id(VenueId::Mexc, 1),
                 make_symbol_id(VenueId::Mexc, 513),
+                make_symbol_id(VenueId::Hypercall, 513),
+                make_symbol_id(VenueId::Hypercall, 514),
                 make_symbol_id(VenueId::Okx, 1),
                 make_symbol_id(VenueId::Okx, 2),
                 make_symbol_id(VenueId::Deribit, 1),
@@ -10896,16 +10907,22 @@ mod tests {
     #[test]
     fn ai_universe_dedups_and_handles_absent_venues() {
         // PM and BN misconfigured to the same id: one survivor.
-        let u = build_ai_universe(&[7], &[7], None, None, None, &[]);
+        let u = build_ai_universe(&[7], &[7], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[7]);
 
         // No optional venues: exactly the sorted pair.
-        let u = build_ai_universe(&[42], &[7], None, None, None, &[]);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[7, 42]);
 
         // M1 multi-market: every PM token + every BN sym flows in.
-        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[]);
+        let u = build_ai_universe(&[42, 2, 3], &[7, 16_777_218], None, None, None, &[], &[]);
         assert_eq!(&u[..], &[2, 3, 7, 42, 16_777_218]);
+
+        // O-HC17: the Hypercall options sort among the rest, a duplicate
+        // collapses; the caller passes no index sym.
+        let o = make_symbol_id(VenueId::Hypercall, 600);
+        let u = build_ai_universe(&[42], &[7], None, None, None, &[], &[o, o]);
+        assert_eq!(&u[..], &[7, 42, o]);
     }
 
     #[test]

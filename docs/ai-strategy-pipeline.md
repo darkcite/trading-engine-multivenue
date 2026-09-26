@@ -373,7 +373,13 @@ On success the table is stamped `epoch = self.epoch + 1` and copied once, scratc
 
 **The boot universe** rule 6 checks symbols against is `cli::build_ai_universe`: the PM and BN pair
 syms, the OKX / Deribit / Hyperliquid discovery tables and — since 2026-09-23 (ruling Q-MX6) — every
-MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Rule 10
+MEXC instrument the boot allocated, spot and perp; Bybit stays out by its WS9 precedent. Since
+2026-09-26 (ruling O-HC17) it also holds every Hypercall option the boot selected
+(`hypercall:<U>-<YYYYMMDD>-<K>-<C|P>`, caps `CAP_OPT | CAP_PRICE`, HC4); the `hypercall-idx:<U>`
+index syms stay out — capture-only `Mark`s, caps 0, nothing could read them. Both data-only venues
+enter as signal or reference legs: an order on one is `unroutable` in the paper matcher and the
+harness. (The v2 grammar resolves descriptors through the `DescriptorTable`, which already carried
+Hypercall since HC4; the snapshot is the v1 arm's sym universe.) Rule 10
 reads the per-descriptor channel caps, mirrored Rust↔Python (`caps_of_descriptor`): `mexc:<SYM>`
 (spot, xStocks included) → `CAP_PRICE`; `mexc-perp:<SYM>` (every MEXC perp, TradFi included) →
 `CAP_PRICE | CAP_FUNDING`. MEXC has no depth or options lane, so no depth or option feature validates

@@ -260,8 +260,9 @@ in the script; `ai` = 48 is the floor every name includes).
   rulings O-HC1..O-HC10: no keys, no exec arm; HC8–HC11 each a separate
   ruling after the research's R1 gate; go-live is staged for a daily
   restart the operator names — `[hypercall]` and the `fees.toml` lines
-  just before it, `hypercall_history` scheduled, `[events]` pasted, the
-  HAR steps of the H3 plan §15). `VenueId::Hypercall = 9`, tick
+  just before it, `hypercall_history` scheduled, the HAR steps of the H3
+  plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
+  `VenueId::Hypercall = 9`, tick
   lane 7, `crates/ingress-hypercall` (one public WS: the one-frame
   indicative subscribe, quotes kept crossed or one-sided as published,
   per-provider sides on `ChannelId::ProviderQuote` = 14, index `Mark`s
@@ -269,7 +270,9 @@ in the script; `ai` = 48 is the floor every name includes).
   an SPSC handoff; the I-3 drain, `core_net::drain`, since the merge),
   capture label `hypercall`, `/state` ingress row 10,
   `[hypercall]` in universe.toml (all 12 underlyings, E 3 × K 8 × {C,P}
-  ≤ 1 024 instruments). `crates/core-settle`
+  ≤ 1 024 instruments); its options are in the AI boot universe (O-HC17:
+  signal and reference legs, orders unroutable; the index syms stay out).
+  `crates/core-settle`
   replicates the venue's settlement (median-of-means over a 1 s
   sample-and-hold grid, both bucket orders until the HC7 gate picks one;
   bench gate 80); worker lanes `hypercall_history` (the research store)

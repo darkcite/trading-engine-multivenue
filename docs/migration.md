@@ -6,6 +6,31 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — Hypercall options in the AI boot universe (O-HC17)
+
+**What changed**
+
+- `cli::build_ai_universe` takes the Hypercall option syms the boot
+  selected (`discovery.hypercall_options`); the `hypercall-idx:<U>` index
+  syms stay out (capture-only `Mark`s, caps 0).
+- The v1 ruleset grammar's rule 6 now admits them; the v2 grammar already
+  resolved `hypercall:` descriptors through the `DescriptorTable` (HC4).
+
+**Impact**
+
+- None until `[hypercall]` is configured live (O-HC12): an empty chain adds
+  nothing. Then `ai: ruleset boot-universe snapshot built symbols=` grows by
+  the chain's size. An order leg on a Hypercall option stays `unroutable`
+  in the paper matcher and the harness (HC1) — the Q-MX6 shape.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the commit.
+
 ## 2026-09-26 — `candles.toml`: `extra` instruments and a lane's `backfill_1m_h` (HAR W1)
 
 **What changed**
