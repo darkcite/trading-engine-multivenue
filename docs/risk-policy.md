@@ -515,11 +515,12 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 27 known-answer vectors the official
+  the binary reproduces all 36 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
-  from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify` —
-  demanding the SDK's exact msgpack. **This is the half that covers LAW
-  E-3 for orders.**
+  from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify`,
+  `reserveRequestWeight` (S7-L1) and the XH4c control actions
+  `updateLeverage`, `scheduleCancel`, `noop` — demanding the SDK's exact
+  msgpack. **This is the half that covers LAW E-3 for orders.**
 - **Venue** (two signed POSTs): the venue verifies a good signature and
   rejects a corrupted one.
 
@@ -6501,6 +6502,19 @@ Proposed, for the operator to confirm:
     flows and then requests poller timeouts of at most 100 µs, so the
     engine's push never makes a syscall; the wait this adds is measured
     (`push_to_write`), and `park_ns = 0` removes it on a pinned core.
+12. (XH4c) The dead-man switch is driven from the ARM, not the gateway
+    (plan §8.11: "the gateway arms it"): a gateway that re-armed on its own
+    would keep a stalled engine's schedule alive (its TTL cancels would
+    still fire; the switch would not). `DeadMan` is thread-agnostic, so
+    XH4f wires whichever driver is confirmed.
+13. (XH4c) The switch's horizon defaults to 20 s, not the plan's 15 s: at
+    15 s one lost push fires it (one of the day's 10 triggers, and a
+    cancel-all); 15 s stays the configurable floor, 30 s (E-8) the ceiling.
+14. (XH4c) Four pieces of the XH4c row are composed at XH4f, where the arm
+    exists: the perp asset binding (`HlDiscovery`), `updateLeverage` at
+    boot, the reduce-only mapping and the requote `expiresAfter`
+    configuration. XH4c delivers their parts (the rules, the actions, the
+    per-command expiry).
 
 ### XH4a amendment (2026-09-26): the order-gateway kit — nothing wired, nothing armed
 
@@ -6692,3 +6706,193 @@ against main's binary. Reviews: zero-copy and alloc APPROVE WITH NITS,
 risk REJECT (r1: a refused REST re-send read as REJECTED; the first
 snapshot could absorb our own fills; a silent socket kept taking posts
 for 45 s) → fixed (r2) → all three APPROVE WITH NITS → nits applied (r3).
+
+### XH4c amendment (2026-09-26): the perp pieces — local rules, three control actions, the dead-man switch — nothing wired, nothing armed
+
+Offline pieces the arm composes at XH4f. **No engine path changes**; the
+blocking arm is untouched; a live slot 6 still refuses the boot.
+
+**LAW XH-4, the local rules (`exec_hyperliquid::rules::PerpRules`) —
+never a venue reject.** Perps: an integer price is always valid;
+otherwise at most 5 significant figures AND at most `6 − szDecimals`
+decimals — in 1e8 one tick per price level, `10^(8 − d)` with
+`d = min(6 − szDecimals, 4 − ⌊log10 px⌋)` clamped at 0; a size is a
+multiple of the lot `10^−szDecimals`; notional ≥ $10. `round_px` rounds
+away from the touch (a bid down, an ask up) and its result always passes
+`check` (tested over every `szDecimals` 0–6 against a geometric sweep of
+prices, and across a power of ten); `round_sz_down` never rounds a size
+up. The arm refuses or rounds BEFORE it pushes (XH4f). The binding (asset
+index and `szDecimals` per coin) is `ingress_hyperliquid::discovery::
+HlDiscovery` over `/info meta` at boot — the hyparb pattern; no second
+parser.
+
+**Three actions** (encoders and their JSON twins, key order per the
+SDK): `updateLeverage` (`type asset isCross leverage` — O-XH6, at boot),
+`scheduleCancel` (`type` [`time`] — the key ABSENT, not null, to
+clear), `noop` (`type`). **`noop` cannot do the plan's job** (invalidate
+an in-flight post's nonce): the gateway signs every post with a fresh
+nonce, and cancelling one needs a `noop` signed with THAT nonce — not
+built; the action exists, the optimisation does not.
+
+**The gateway's fifth class, control:**
+- A control command posts ALONE, after every batch opened before it;
+  nothing admitted after it goes before it. One dispatch renders both its
+  msgpack and its JSON, so the signed and the sent bytes cannot name
+  different actions; a kind with no action is refused locally, never
+  sent as a `noop`. It carries the command's own `expiresAfter` (the dead
+  man's posts do).
+- Its only acceptance is `{"type":"default"}` (`HlOk::is_default`);
+  `"status":"err"` → REJECTED (UNANSWERED on a re-send, E-5); an
+  item-shaped answer does not fit a post with no items → UNANSWERED
+  (malformed, counted as mismatched); unreadable → UNANSWERED. Its events
+  carry command bits 0 — the arm correlates by client id (the id is not
+  sent).
+- **Growth is a place, a modify or a leverage change — a reduce-only
+  place included** (XH1: no member relies on the bit for an exit):
+  refused unsent while halted and before the first snapshot.
+  `scheduleCancel` and `noop` never grow: they go while halted — a
+  dead-man clear or push must never wait on the halt it backs up — and
+  under XG-3 they go untimed like a cancel (counted with the cancels).
+- XG-2 keeps one open batch per class in reserve: with five classes the
+  gateway stops popping commands at 96 posts in flight (was 97) and keeps
+  5 × 39 event slots for the open batches' answers.
+
+**The venue half of LAW XH-1 — the dead-man switch
+(`exec_hyperliquid::deadman::DeadMan`).** Pure state, no I/O, no
+allocation (gate 85); 256 B, cache-laid.
+- While slot 6 may have orders resting and the account is known to hold
+  no other slot's orders (`want`), a cancel-all is kept scheduled 20 s
+  ahead and pushed every 5 s. When the pushes stop — a dead process, a
+  lost venue, or (driven from the arm, proposed deviation 12) a stalled
+  engine thread — the venue cancels every open order of the account at
+  the deadline.
+- **Boot:** the first post is a clear, whatever `want` says, and nothing
+  is armed before the venue has answered it (`settled()`). A refused boot
+  clear takes the longest schedule any process sets (30 s from now) as
+  held and retries until it passes (counted as a trigger).
+- **Eligibility is probed, never assumed** (plan §8.11): the first arm of
+  a UTC day whose eligibility is unknown is the probe. No single refused
+  arm — probe or push — is read as ineligibility (an expired or late post
+  is refused too): the arms back off an answer the first time (a push
+  still lands before the held deadline: no trigger spent), a minute the
+  second, and the third refusal in a row parks the switch until 00:00 UTC
+  — an ineligible account costs three probes a day, and one a restart
+  that finds it unknown. A clear still goes at once. **A refusal that is
+  not about the action is never counted:** a post that never left the
+  host (the gateway's own refusal, a REST send that failed before the
+  request left, a full ring) is retried after 5 s; the venue's rate limit
+  backs every post off a minute.
+- **Ordering (E-5):** one post in flight; every post expires 5 s (the
+  answer bound, the gateway's post timeout) after it is signed. A post is
+  signed before its verdict, and the gateway reports a post in doubt at
+  its timeout OR EARLY (a socket that died under it, the API layer's
+  error, a REST failure after the request left), so after a verdict in
+  doubt the switch posts nothing for an answer + the 2 s skew allowance:
+  its next post is then the last one the venue can apply, and that
+  answer settles what is held. Until then an in-doubt arm's deadline is
+  kept as possibly held — and cleared if the switch is no longer wanted.
+  After a timeout the next push goes 12 s after the lost one was due, so
+  the 20 s horizon survives one lost push.
+- **Triggers are counted by the clock, conservatively** (a deadline
+  possibly held that passes unmoved counts as one); at the cap (the
+  venue's 10 a day, configurable lower) the switch parks until 00:00 UTC;
+  a schedule the venue accepted after the cap is cleared.
+- A flapping `want` costs at most one arm per push period (a fresh arm
+  waits a period after the last post); a clear goes at once.
+- **Timing, validated at construction:** 15 s ≤ horizon ≤ 30 s — the
+  floor is a period + an answer + the venue's 5 s lead (the plan's value,
+  at which one lost push fires the switch), the ceiling E-8's 30 s quote
+  life; the default 20 s survives one lost push (proposed deviation 13);
+  `expiresAfter` ≤ 65 535 ms; skew ≤ 5 s; back-off ≥ an answer.
+- **What it is not:** a substitute for the sweep (XH4d) or for the
+  gateway-sent TTL cancel (XH4f). **O-XH4 stands:** until the account is
+  eligible, slot 6 quotes without it, on the engine TTL, the caps and the
+  boot sweep; the testnet account has traded little, so a refusal there
+  is the expected outcome and is recorded, not a fault.
+
+**Vectors:** `vectors.tsv` regenerated from `hyperliquid-python-sdk`
+0.24.0 in a throwaway venv under `target/`: the 27 existing rows came
+back byte-identical; 9 new — `updateLeverage` cross and isolated,
+`scheduleCancel` set and cleared, `noop`, a 39-item ALO `order` (one IP
+request), the 40th item alone (the split), a 39-item `batchModify` by
+cloid and a 39-item `cancelByCloid`; `encode_order` refuses 40 items. The
+release binary's self-test (the pre-restart gate): 36 rows, 8 action
+types rebuilt from inputs (was 27 and 5).
+
+**Obligations handed on:**
+- **XH4d:** the open-orders read at boot and after every `EV_GAP` — the
+  dead man's `want` depends on it (below).
+- **XH4e:** every control post is one ADDRESS request and is never
+  exempted as a cancel (whether `scheduleCancel` draws on the cancel
+  allowance is unmeasured — plan §11 Q2 — so assume not). At a 5 s period
+  the switch alone posts ≈ 17 280 a quoting day: the governor parks it
+  before the budget floor (the budget is a cliff, not a rate — exhausted
+  means one request per 10 s). A stale `expiresAfter` rejection costs 5×.
+- **XH4f:**
+  - The boot order: the first snapshot; the dead man settled;
+    `updateLeverage` per perp (O-XH6: cross margin, 3×) — **a perp quotes
+    only after ITS leverage ACK; a refused or in-doubt change keeps that
+    perp dark** — then quoting.
+  - The binding composed from `HlDiscovery` (asset index; `szDecimals` →
+    `PerpRules`; `CoinMap`); `expiresAfter` on requotes from the arm's
+    configuration; `ORDER_FLAG_REDUCE_ONLY` → `CMD_FLAG_REDUCE_ONLY`.
+  - The dead man: its driver (deviation 12); `answer_ms` asserted equal
+    to the gateway's post timeout at boot; a client-id range reserved for
+    control commands (the switch's, leverage's and noop's); `want` = slot
+    6 may have orders resting AND the account is known to hold no other
+    slot's orders — always so on an account of slot 6's own; on the
+    shared testnet account only after the boot open-orders read and again
+    after each `EV_GAP`'s re-check, other slots' in-flight orders counted
+    (`orderUpdates` has no snapshot and cannot say it alone); at
+    shutdown, after the sweep, it is driven with `want` false until
+    `quiescent()` (nothing out, nothing the venue may still hold); its
+    `skew_ms` from the measured venue clock offset, the boot refused above
+    it; it is driven with the clock the gateway signs `expiresAfter` with
+    (`nonce::now_ms`), or their difference is added to `skew_ms`; its
+    counters on `/metrics`.
+  - Alloc: gate 84b gains one `scheduleCancel` a round once control
+    posts are wired (posts 3 → 4 a round, rustls' records 8 → 10
+    expected); the 256 B `DeadMan` is moved once into the arm's boot state
+    (marked `// COPY:`).
+  - **Reduce-only:** only the wire bit is handed on. The five places XH1
+    lists that ignore it still do, and XH1's "no member may rely on it for
+    an exit" stands; a reduce-only place is growth.
+- **XH4g:** whether the venue exempts a reduce-only close from the $10
+  minimum (if it does, `check` must not block that exit);
+  `scheduleCancel`'s refusal wordings (eligibility, the trigger cap, the
+  lead, an expired action).
+- **For Anton:** (a) under O-XH4, may slot 6 keep quoting on MAINNET when
+  the switch is SPENT (10 triggers) or parked after three arms refused in
+  a row (probes or pushes), or must it pull? (b) may a reduce-only exit
+  pass a halt (today it is growth and refused)?
+
+**Tests:** `rules` (every rule, happy and refused; the sweep); `deadman`
+(12 scripts: timing validation, the boot clear and its refusal, probe and
+push cadence, three refused probes parking until the 00:00 UTC re-probe,
+refused pushes (an answer's back-off spends no trigger, a minute's does,
+the third in a row parks, a clear still goes), never-left and rate-limit
+retries, clear
+at once and a flapping `want`, the wait after early and timeout verdicts
+in doubt, triggers and the cap, acceptance after the cap, foreign events,
+`quiescent`); the control class (classes, growth, command bits, the
+one dispatch, the answer table); the loopback's `control` script ([ALO]
+[leverage] [ALO] [scheduleCancel] [noop] → five posts in that order, the
+default ACK, the venue's refusal, the command's `expiresAfter`) and the
+extended `halted` script (a place and a leverage change refused; a cancel
+and a dead-man clear posted); gate 58 now encodes, renders and wraps the
+three control actions; gate 85 holds the dead man and the rules at
+0 B/op.
+
+**Gates (XH4c, 2026-09-26):** clippy `-D warnings` clean; nextest
+3515/3515; alloc 90/90 in release — gate 58 now also encodes, renders and
+wraps the three control actions, and gate 85 (new) holds `DeadMan` and
+`PerpRules` at 0 B/op over a scripted 55 h; copy-audit hits 31 =
+baseline, new 0; license-check OK; the release binary builds; the
+existing members' replays (bin15, vrp, xsd, hyparb, icdp, vm, xmm)
+byte-identical against main's binary; rustfmt clean on the new files and
+the touched hunks. Reviews: zero-copy and alloc PASS WITH NITS (r1) →
+PASS (r2); risk REJECT (r1: a failure that never left the host parked the
+switch for the day; a later clear settled an in-doubt arm) → REJECT (r2:
+an early in-doubt verdict could still let a late arm land after a clear;
+the first refused push parked the day) → APPROVE WITH NITS (r3) → nits
+applied → APPROVE (r4).

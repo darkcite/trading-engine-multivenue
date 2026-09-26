@@ -20,7 +20,8 @@
 //! | dropped | a socket that dies strands its posts (UNANSWERED), the gateway redials and reports the gap |
 //! | rest | with no socket left a post goes to `/exchange` — the envelope alone — and is answered |
 //! | swap | make-before-break: the old socket's in-flight answer still lands, new posts use the new socket |
-//! | halted | a halted gateway refuses growth unsent; a cancel still goes |
+//! | control | leverage, scheduleCancel and noop post alone, in the order they came between batches; `{"type":"default"}` is the ACK, `status:err` the refusal |
+//! | halted | a halted gateway refuses growth (a place, a leverage change) unsent; a cancel and a scheduleCancel still go |
 //! | refusals | a malformed or miscounted answer and the API layer's error are UNANSWERED; a refused action rejects every item |
 //!
 //! Offline path: this file MAY allocate.
@@ -47,6 +48,7 @@ const SLOT: u8 = 6;
 const ETH: u32 = 1;
 const CANCEL_OK: &str =
     r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#;
+const DEFAULT_OK: &str = r#"{"status":"ok","response":{"type":"default"}}"#;
 
 fn gateway(v: &Venue, post_timeout_ns: u64) -> (HlGateway, HlEngineEnd) {
     let (eng, gw_end) = hl_duplex();
@@ -513,23 +515,116 @@ fn make_before_break_lands_the_old_sockets_answer_and_moves_new_posts() {
 }
 
 #[test]
+fn control_actions_post_alone_in_the_order_they_came() {
+    let v = Venue::start();
+    v.policy(|s| {
+        if s.body.contains(r#""type":"order""#) {
+            Answer::Action(resting(items_in(&s.body), 50))
+        } else if s.body.contains(r#""type":"scheduleCancel""#) {
+            Answer::Action(
+                r#"{"status":"err","response":"Cannot set scheduled cancel time until enough volume traded. Required: $1000000. Traded: $12.5."}"#
+                    .into(),
+            )
+        } else {
+            Answer::Action(DEFAULT_OK.into())
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    assert!(eng.cmd.push(&alo(1)));
+    assert!(eng.cmd.push(&HlCmd::leverage(SLOT, 2, ETH, true, 3)));
+    assert!(eng.cmd.push(&alo(3)));
+    assert!(eng
+        .cmd
+        .push(&HlCmd::schedule_cancel(SLOT, 4, 1_789_000_005_000).expiring_after(5_000)));
+    assert!(eng.cmd.push(&HlCmd::noop(SLOT, 5)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e, EV_ACK
+    ) + count(
+        e,
+        EV_REJECTED
+    ) >= 5));
+    let posts = v.posts();
+    assert_eq!(
+        posts.len(),
+        5,
+        "[ALO 1] [leverage] [ALO 3] [scheduleCancel] [noop]"
+    );
+    assert!(posts[0].body.contains(&cloid_hex(SLOT, 1)) && items_in(&posts[0].body) == 1);
+    assert!(posts[1]
+        .body
+        .contains(r#""action":{"type":"updateLeverage","asset":1,"isCross":true,"leverage":3}"#));
+    assert!(posts[2].body.contains(&cloid_hex(SLOT, 3)) && items_in(&posts[2].body) == 1);
+    assert!(posts[3]
+        .body
+        .contains(r#""action":{"type":"scheduleCancel","time":1789000005000}"#));
+    assert!(
+        posts[3].body.contains(r#""expiresAfter":"#) && !posts[1].body.contains("expiresAfter"),
+        "a control post carries its command's own expiresAfter"
+    );
+    assert!(posts[4].body.contains(r#""action":{"type":"noop"}"#));
+    let of = |oid: u64| *evs.iter().rfind(|e| e.client_oid == oid).unwrap();
+    let lev = of(2);
+    assert_eq!(
+        (lev.kind, lev.cmd_kind(), lev.slot, lev.asset),
+        (EV_ACK, 0, SLOT, ETH)
+    );
+    assert_eq!(
+        of(4).kind,
+        EV_REJECTED,
+        "the venue's refusal of a first send is final"
+    );
+    assert_eq!(of(5).kind, EV_ACK);
+    assert_eq!(
+        of(3).oid,
+        50,
+        "the place after a control post answered on its own"
+    );
+    assert_eq!(count(&evs, EV_UNANSWERED), 0);
+}
+
+#[test]
 fn a_halted_gateway_refuses_growth_unsent_but_still_cancels() {
     let v = Venue::start();
-    v.policy(|_| Answer::Action(CANCEL_OK.into()));
+    v.policy(|s| {
+        if s.body.contains("cancelByCloid") {
+            Answer::Action(CANCEL_OK.into())
+        } else {
+            Answer::Action(DEFAULT_OK.into())
+        }
+    });
     let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
     let mut evs = Vec::new();
     live(&mut gw, &mut eng, &mut evs);
     eng.stats.halt(HALT_VENUE_BASE);
     assert!(eng.cmd.push(&alo(1)));
     assert!(eng.cmd.push(&HlCmd::cancel(SLOT, 1, ETH)));
+    assert!(eng.cmd.push(&HlCmd::leverage(SLOT, 2, ETH, false, 5)));
+    assert!(eng.cmd.push(&HlCmd::schedule_cancel(SLOT, 3, 0)));
     assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
         e, EV_ACK
-    ) >= 1));
-    let rej = evs.iter().find(|e| e.kind == EV_REJECTED).unwrap();
-    assert_eq!((rej.client_oid, rej.reason), (1, REASON_HALTED));
+    ) >= 2));
+    let refused: Vec<(u64, u8)> = evs
+        .iter()
+        .filter(|e| e.kind == EV_REJECTED)
+        .map(|e| (e.client_oid, e.reason))
+        .collect();
+    assert_eq!(
+        refused,
+        [(1, REASON_HALTED), (2, REASON_HALTED)],
+        "a place and a leverage change grow"
+    );
     let posts = v.posts();
-    assert_eq!(posts.len(), 1, "only the cancel left the host");
+    assert_eq!(
+        posts.len(),
+        2,
+        "only the cancel and the dead-man clear left the host"
+    );
     assert!(posts[0].body.contains("cancelByCloid"));
+    assert!(posts[1]
+        .body
+        .contains(r#""action":{"type":"scheduleCancel"}"#));
 }
 
 #[test]

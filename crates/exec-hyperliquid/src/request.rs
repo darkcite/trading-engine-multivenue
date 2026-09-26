@@ -226,6 +226,47 @@ pub fn reserve_weight_json(dst: &mut [u8], weight: u64) -> Result<usize, MsgPack
     Ok(j.len)
 }
 
+/// `{"type":"updateLeverage","asset":…,"isCross":…,"leverage":…}` as JSON
+/// — the twin of [`crate::action::encode_update_leverage`].
+pub fn update_leverage_json(
+    dst: &mut [u8],
+    asset: u32,
+    is_cross: bool,
+    leverage: u32,
+) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"updateLeverage\",\"asset\":")?;
+    j.u64(u64::from(asset))?;
+    j.put(if is_cross {
+        b",\"isCross\":true,\"leverage\":" as &[u8]
+    } else {
+        b",\"isCross\":false,\"leverage\":" as &[u8]
+    })?;
+    j.u64(u64::from(leverage))?;
+    j.put(b"}")?;
+    Ok(j.len)
+}
+
+/// `{"type":"scheduleCancel"[,"time":…]}` as JSON — the twin of
+/// [`crate::action::encode_schedule_cancel`].
+pub fn schedule_cancel_json(dst: &mut [u8], time_ms: Option<u64>) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"scheduleCancel\"")?;
+    if let Some(t) = time_ms {
+        j.put(b",\"time\":")?;
+        j.u64(t)?;
+    }
+    j.put(b"}")?;
+    Ok(j.len)
+}
+
+/// `{"type":"noop"}` as JSON — the twin of [`crate::action::encode_noop`].
+pub fn noop_json(dst: &mut [u8]) -> Result<usize, MsgPackErr> {
+    let mut j = Json::new(dst);
+    j.put(b"{\"type\":\"noop\"}")?;
+    Ok(j.len)
+}
+
 /// **Open the request envelope in place.** Writes `{"action":` at the
 /// start of `dst` and returns the offset at which the caller renders
 /// the action JSON DIRECTLY into `dst` (`order_json(&mut dst[n..], …)`

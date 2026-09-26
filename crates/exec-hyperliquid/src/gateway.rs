@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! engine ──HlCmd ring──▶ gateway ──WS post──▶ venue
-//!    ▲                     │  coalesce ALO │ taker │ modify │ cancel, ≤ 39 per action
+//!    ▲                     │  coalesce ALO │ taker │ modify │ cancel, ≤ 39 per action; control alone
 //!    └──ExecEvent ring─────┘  msgpack → sign → envelope → frame, in the TX buffer
 //! ```
 //!
@@ -21,17 +21,21 @@
 //!
 //! **Admission.** A command is refused unsent ([`EV_REJECTED`]) when its
 //! slot is not one this gateway serves, its kind or time-in-force is not
-//! one it carries (ALO and IoC places, ALO modifies, cancels), the halt
-//! word is set (growth only, [`REASON_HALTED`]; cancels still go), or —
-//! growth only — the process's first `userFills` snapshot has not been
+//! one it carries (ALO and IoC places, ALO modifies, cancels, and the
+//! control actions `updateLeverage`, `scheduleCancel`, `noop`), the halt
+//! word is set (growth only — a place, a modify, a leverage change —
+//! [`REASON_HALTED`]; cancels, `scheduleCancel` and `noop` still go), or
+//! — growth only — the process's first `userFills` snapshot has not been
 //! absorbed yet ([`REASON_NOT_READY`]): a fill of ours can never be
 //! mistaken for history.
 //!
-//! **Coalescing (XH-3).** Four classes, never mixed in one action: ALO
-//! places, IoC places, ALO modifies (LAW E-7), cancels by cloid; at most
-//! [`MAX_ORDERS`] items (39: one IP request). Batches post in the order
-//! they opened; a full batch posts every open batch; a cancel or modify
-//! whose target is still in an open batch posts every open batch first.
+//! **Coalescing (XH-3).** Five classes, never mixed in one action: ALO
+//! places, IoC places, ALO modifies (LAW E-7), cancels by cloid — at most
+//! [`MAX_ORDERS`] items (39: one IP request) — and control actions, one
+//! per post, each after every batch opened before it. Batches post in the
+//! order they opened; a full batch posts every open batch; a cancel or
+//! modify whose target is still in an open batch posts every open batch
+//! first.
 //! On ONE socket, therefore, nothing overtakes the order it names. Across
 //! sockets (a make-before-break swap, the REST fallback) and after an
 //! unanswered post there is no such guarantee, and the venue documents no
@@ -112,11 +116,14 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 
 use crate::action::{
-    encode_batch_modify, encode_cancel_by_cloid, encode_order, CancelByCloidWire, ModifyWire,
-    OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
+    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_schedule_cancel,
+    encode_update_leverage, CancelByCloidWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 use crate::cloid::{decode, Owner};
-use crate::cmd::{HlCmd, CMD_CANCEL, CMD_MODIFY, CMD_PLACE};
+use crate::cmd::{
+    HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE,
+    CMD_SCHEDULE_CANCEL,
+};
 use crate::event::{
     reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_FILLED,
     EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_FILL, EV_FILL_META, EV_GAP, EV_HALT,
@@ -126,14 +133,16 @@ use crate::event::{
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
+use crate::msgpack::MsgPackErr;
 use crate::nonce::{now_ms, Nonce};
 use crate::orderupd::{scan_order_updates, OrderUpdate};
 use crate::request::{
-    batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, order_json,
-    ws_post_close, ws_post_open,
+    batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
+    schedule_cancel_json, update_leverage_json, ws_post_close, ws_post_open,
 };
 use crate::response::{
-    scan_items, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING, ITEM_SUCCESS,
+    scan, scan_items, HlResponse, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING,
+    ITEM_SUCCESS,
 };
 use crate::sign::{sign_action, Network, Vault};
 use crate::userws::{scan_user_fills, TidRing, UserFill, SNAPSHOT_RING};
@@ -169,11 +178,13 @@ const TX_CAP: usize = 16 * 1024;
 const ROOM: usize = WS_CLIENT_HDR_MAX;
 const GROUPING: &[u8] = b"na";
 
-const CLASSES: usize = 4;
+const CLASSES: usize = 5;
 const CLASS_ALO: usize = 0;
 const CLASS_TAKER: usize = 1;
 const CLASS_MODIFY: usize = 2;
 const CLASS_CANCEL: usize = 3;
+/// One control action (leverage, scheduleCancel, noop), posted alone.
+const CLASS_CONTROL: usize = 4;
 
 /// `PostRec::conn` of a post that went by REST.
 const CONN_REST: u8 = 2;
@@ -332,7 +343,8 @@ pub struct GatewayCounters {
     pub ws_errors: u64,
     /// Commands refused before the socket.
     pub local_refusals: u64,
-    /// Cancels posted without a deadline (XG-3).
+    /// Posts that cannot grow — cancels, `scheduleCancel`, `noop` — sent
+    /// without a deadline (XG-3).
     pub cancels_untimed: u64,
     /// Dials started.
     pub dials: u64,
@@ -388,7 +400,7 @@ impl ItemRef {
             kind,
             reason,
             slot: self.slot,
-            flags: EVF_POST_ITEM | ((self.kind & 3) << EVF_CMD_SHIFT) | side,
+            flags: EVF_POST_ITEM | (cmd_bits(self.kind) << EVF_CMD_SHIFT) | side,
             ..ExecEvent::default()
         }
     }
@@ -424,13 +436,42 @@ struct BatchHead {
     min_exp: u16,
 }
 
-/// The four class batches' items, as the encoders take them.
+/// A control action's arguments, resolved once at admission.
+#[derive(Copy, Clone, Default)]
+struct ControlWire {
+    kind: u8,
+    is_cross: bool,
+    asset: u32,
+    leverage: u32,
+    /// `scheduleCancel`'s time; `None` clears.
+    time: Option<u64>,
+}
+
+/// A control action into `dst`: its msgpack, or (`json`) its JSON twin —
+/// one dispatch for both, so the signed bytes and the sent bytes can never
+/// name different actions. A kind with no action is refused (the post is
+/// refused locally; `class_of` admits none), never sent as a `noop`.
+fn encode_control(c: &ControlWire, dst: &mut [u8], json: bool) -> Result<usize, MsgPackErr> {
+    match (c.kind, json) {
+        (CMD_LEVERAGE, false) => encode_update_leverage(dst, c.asset, c.is_cross, c.leverage),
+        (CMD_LEVERAGE, true) => update_leverage_json(dst, c.asset, c.is_cross, c.leverage),
+        (CMD_SCHEDULE_CANCEL, false) => encode_schedule_cancel(dst, c.time),
+        (CMD_SCHEDULE_CANCEL, true) => schedule_cancel_json(dst, c.time),
+        (CMD_NOOP, false) => encode_noop(dst),
+        (CMD_NOOP, true) => noop_json(dst),
+        // Not a buffer overflow: the refusal `seal` needs, before signing.
+        _ => Err(MsgPackErr::Overflow),
+    }
+}
+
+/// The class batches' items, as the encoders take them.
 struct Batches {
     head: [BatchHead; CLASSES],
     alo: [OrderWire; MAX_ORDERS],
     taker: [OrderWire; MAX_ORDERS],
     modify: [ModifyWire; MAX_ORDERS],
     cancel: [CancelByCloidWire; MAX_ORDERS],
+    control: ControlWire,
 }
 
 const BLANK_ORDER: OrderWire = OrderWire::new(0, false, 0, 0, Tif::Gtc);
@@ -451,6 +492,7 @@ impl Batches {
                 asset: 0,
                 cloid: [0u8; 16],
             }; MAX_ORDERS],
+            control: ControlWire::default(),
         }
     }
 }
@@ -477,7 +519,36 @@ fn class_of(c: &HlCmd) -> Option<usize> {
         (CMD_MODIFY, ALO) => Some(CLASS_MODIFY),
         (CMD_PLACE, ALO) => Some(CLASS_ALO),
         (CMD_PLACE, IOC) => Some(CLASS_TAKER),
+        _ if c.is_control() => Some(CLASS_CONTROL),
         _ => None,
+    }
+}
+
+/// A command that can add exposure: a place, a modify or a leverage
+/// change — a reduce-only place included (XH1: no member relies on the
+/// bit for an exit). The halt and the snapshot gate refuse it, and XG-3
+/// will not send it untimed; cancels, `scheduleCancel` and `noop` always
+/// go.
+#[inline(always)]
+const fn grows(kind: u8) -> bool {
+    kind == CMD_PLACE || kind == CMD_MODIFY || kind == CMD_LEVERAGE
+}
+
+/// Whether class `class`'s batch grows ([`grows`]); a control batch by
+/// its one command's kind.
+#[inline(always)]
+const fn growing(class: usize, control_kind: u8) -> bool {
+    class != CLASS_CANCEL && (class != CLASS_CONTROL || grows(control_kind))
+}
+
+/// A command's kind in an event's two `flags` bits: place, modify or
+/// cancel; 0 for a control command (the arm knows which by its client id).
+#[inline(always)]
+const fn cmd_bits(kind: u8) -> u8 {
+    if kind <= CMD_CANCEL {
+        kind
+    } else {
+        0
     }
 }
 
@@ -639,14 +710,18 @@ impl Router {
     /// re-send of a WebSocket original that may have landed — only a
     /// per-item answer settles it.
     fn on_answer(&mut self, id: u64, body: &[u8], action: bool, resend: bool, now: u64) {
-        if self.pending.get(id).is_none() {
+        let Some(class) = self.pending.get(id).map(|r| usize::from(r.class)) else {
             self.stats.note_reply_unmatched();
             return;
-        }
+        };
         self.stats.note_reply();
         if !action {
             // Not the exchange's answer about the action: in doubt.
             self.fail_all(id, EV_UNANSWERED, reason_of_error(body), now);
+            return;
+        }
+        if class == CLASS_CONTROL {
+            self.on_control_answer(id, body, resend, now);
             return;
         }
         match scan_items(body, &mut self.items) {
@@ -678,6 +753,33 @@ impl Router {
                 self.fail_all(id, EV_UNANSWERED, reason, now);
             }
             Ok(ItemsReply::Refused { reason, .. }) => self.fail_all(id, EV_REJECTED, reason, now),
+            Err(_) => self.fail_all(id, EV_UNANSWERED, REASON_MALFORMED, now),
+        }
+    }
+
+    /// A control action's answer. Accepted is `{"type":"default"}` and
+    /// nothing else; `"status":"err"` is the venue's refusal (in doubt on
+    /// a re-send, E-5); an item-shaped answer does not fit a post that has
+    /// no items, and it and anything unreadable are in doubt.
+    fn on_control_answer(&mut self, id: u64, body: &[u8], resend: bool, now: u64) {
+        match scan(body) {
+            Ok(HlResponse::Ok(ok)) if ok.is_default() => {
+                let Some(rec) = self.pending.get(id) else {
+                    return;
+                };
+                let ev = rec.items[0].event(EV_ACK, ORDER_EVENT_REASON_NONE, id, now);
+                emit_to(&mut self.evt, &ev);
+                self.healthy = true;
+                self.finish(id, now);
+            }
+            Ok(HlResponse::Err { msg }) => {
+                let kind = if resend { EV_UNANSWERED } else { EV_REJECTED };
+                self.fail_all(id, kind, reason_of_error(msg.of(body)), now);
+            }
+            Ok(HlResponse::Ok(_)) => {
+                self.counters.answers_mismatched += 1;
+                self.fail_all(id, EV_UNANSWERED, REASON_MALFORMED, now);
+            }
             Err(_) => self.fail_all(id, EV_UNANSWERED, REASON_MALFORMED, now),
         }
     }
@@ -943,7 +1045,7 @@ impl HlGateway {
             sk,
             network: cfg.network,
             nonce: Nonce::new(),
-            // COPY: the ≈ 7.6 KiB batch arrays, built on the stack and
+            // COPY: the ≈ 7.7 KiB batch arrays, built on the stack and
             // moved to the heap once at boot — rejected: an unsafe
             // in-place initialisation (as the dedupe rings).
             batches: Box::new(Batches::new()),
@@ -1228,7 +1330,7 @@ impl HlGateway {
 
     /// Put one command into its class batch, or refuse it unsent.
     fn admit(&mut self, c: &HlCmd, now: u64) {
-        let growth = c.kind != CMD_CANCEL;
+        let growth = grows(c.kind);
         let refusal = if c.slot >= 8 || self.slots & (1u8 << c.slot) == 0 {
             Some(REASON_LOCAL)
         } else if growth && self.rt.stats.halt_reason() != HALT_NONE {
@@ -1246,7 +1348,11 @@ impl HlGateway {
             self.refuse(c, REASON_LOCAL, now);
             return;
         };
-        if (!growth || c.kind == CMD_MODIFY) && self.names_open_item(c) {
+        if k == CLASS_CONTROL {
+            self.admit_control(c, now);
+            return;
+        }
+        if (c.kind == CMD_CANCEL || c.kind == CMD_MODIFY) && self.names_open_item(c) {
             self.flush_open(now);
         }
         if self.batches.head[k].n == MAX_ORDERS {
@@ -1274,6 +1380,37 @@ impl HlGateway {
         if let Some(rec) = self.rt.pending.get_mut(h.id) {
             rec.items[i] = ItemRef::of(c);
             rec.n = h.n as u8;
+        }
+        self.rt.inflight_items += 1;
+    }
+
+    /// A control command posts alone, after every open batch: nothing
+    /// admitted before it goes after it, and nothing after it before. It
+    /// carries the command's own `expiresAfter`, if any — the dead man's
+    /// posts do, so a late one cannot land after a later one (E-5).
+    fn admit_control(&mut self, c: &HlCmd, now: u64) {
+        self.flush_open(now);
+        if !self.open(CLASS_CONTROL, now) {
+            self.refuse(c, REASON_LOCAL, now);
+            return;
+        }
+        self.batches.control = ControlWire {
+            kind: c.kind,
+            is_cross: c.flags & CMD_FLAG_CROSS != 0,
+            asset: c.asset,
+            leverage: c.arg,
+            time: if c.time_ms == 0 {
+                None
+            } else {
+                Some(c.time_ms)
+            },
+        };
+        let h = &mut self.batches.head[CLASS_CONTROL];
+        h.n = 1;
+        h.min_exp = c.expires_after_ms;
+        if let Some(rec) = self.rt.pending.get_mut(h.id) {
+            rec.items[0] = ItemRef::of(c);
+            rec.n = 1;
         }
         self.rt.inflight_items += 1;
     }
@@ -1366,7 +1503,7 @@ impl HlGateway {
             return;
         }
         self.batches.head[k].n = 0;
-        if k != CLASS_CANCEL && self.rt.stats.halt_reason() != HALT_NONE {
+        if growing(k, self.batches.control.kind) && self.rt.stats.halt_reason() != HALT_NONE {
             self.rt.fail_all(h.id, EV_REJECTED, REASON_HALTED, now);
             return;
         }
@@ -1388,7 +1525,8 @@ impl HlGateway {
             CLASS_ALO => encode_order(&mut self.mp, &b.alo[..n], GROUPING),
             CLASS_TAKER => encode_order(&mut self.mp, &b.taker[..n], GROUPING),
             CLASS_MODIFY => encode_batch_modify(&mut self.mp, &b.modify[..n]),
-            _ => encode_cancel_by_cloid(&mut self.mp, &b.cancel[..n]),
+            CLASS_CANCEL => encode_cancel_by_cloid(&mut self.mp, &b.cancel[..n]),
+            _ => encode_control(&b.control, &mut self.mp, false),
         }
         .ok()?;
         let ms = now_ms();
@@ -1418,7 +1556,8 @@ impl HlGateway {
             CLASS_ALO => order_json(&mut tx[at..], &b.alo[..n], GROUPING),
             CLASS_TAKER => order_json(&mut tx[at..], &b.taker[..n], GROUPING),
             CLASS_MODIFY => batch_modify_json(&mut tx[at..], &b.modify[..n]),
-            _ => cancel_by_cloid_json(&mut tx[at..], &b.cancel[..n]),
+            CLASS_CANCEL => cancel_by_cloid_json(&mut tx[at..], &b.cancel[..n]),
+            _ => encode_control(&b.control, &mut tx[at..], true),
         }
         .ok()?;
         let env_len = envelope_close(&mut tx[pfx..], head + aj, nonce, &sig, None, expires).ok()?;
@@ -1450,7 +1589,7 @@ impl HlGateway {
                 Ok(t) => Some(t),
                 Err(_) => {
                     self.halt(HALT_TIMER_FULL, now);
-                    if k != CLASS_CANCEL {
+                    if growing(k, self.batches.control.kind) {
                         self.rt.counters.local_refusals += 1;
                         self.rt.fail_all(id, EV_REJECTED, REASON_LOCAL, now);
                         return;
@@ -1722,7 +1861,8 @@ mod tests {
         );
     }
 
-    /// A router with one post in flight: `n` ALO places (or one cancel).
+    /// A router with one post in flight: `n` ALO places, cancels, or
+    /// leverage changes (a control post carries one).
     fn router_with_post(class: usize, n: usize) -> (Router, HlEngineEnd, u64) {
         let (eng, gw) = hl_duplex();
         let mut rt = Router::new(gw.evt, gw.stats, CoinMap::new());
@@ -1737,6 +1877,8 @@ mod tests {
         while i < n {
             let c = if class == CLASS_CANCEL {
                 HlCmd::cancel(6, 10 + i as u64, 1)
+            } else if class == CLASS_CONTROL {
+                HlCmd::leverage(6, 10 + i as u64, 1, true, 3)
             } else {
                 HlCmd::place(6, 10 + i as u64, 1, true, 1, 1, Tif::Alo)
             };
@@ -1853,6 +1995,140 @@ mod tests {
         assert_eq!(
             (e[0].kind, e[0].aux, e[1].kind, e[1].aux),
             (EV_GAP, GAP_FILLS_UNREADABLE, EV_GAP, GAP_UPDATES_UNREADABLE)
+        );
+    }
+
+    #[test]
+    fn control_commands_are_their_own_class_and_only_leverage_grows() {
+        let lev = HlCmd::leverage(6, 1, 0, true, 3);
+        let sched = HlCmd::schedule_cancel(6, 2, 1_789_000_005_000);
+        assert_eq!(class_of(&lev), Some(CLASS_CONTROL));
+        assert_eq!(class_of(&sched), Some(CLASS_CONTROL));
+        assert_eq!(class_of(&HlCmd::noop(6, 3)), Some(CLASS_CONTROL));
+        assert!(grows(CMD_PLACE) && grows(CMD_MODIFY) && grows(CMD_LEVERAGE));
+        assert!(!grows(CMD_CANCEL) && !grows(CMD_SCHEDULE_CANCEL) && !grows(CMD_NOOP));
+        assert!(growing(CLASS_CONTROL, CMD_LEVERAGE));
+        assert!(!growing(CLASS_CONTROL, CMD_SCHEDULE_CANCEL));
+        assert!(!growing(CLASS_CONTROL, CMD_NOOP));
+        assert!(growing(CLASS_ALO, 0) && growing(CLASS_TAKER, 0) && growing(CLASS_MODIFY, 0));
+        assert!(!growing(CLASS_CANCEL, CMD_LEVERAGE), "a cancel never grows");
+        assert_eq!(
+            (
+                cmd_bits(CMD_PLACE),
+                cmd_bits(CMD_MODIFY),
+                cmd_bits(CMD_CANCEL)
+            ),
+            (CMD_PLACE, CMD_MODIFY, CMD_CANCEL)
+        );
+        assert_eq!(cmd_bits(CMD_LEVERAGE), 0);
+        assert_eq!(
+            cmd_bits(CMD_SCHEDULE_CANCEL),
+            0,
+            "5 & 3 would read as a place"
+        );
+        assert_eq!(ItemRef::of(&sched).event(EV_ACK, 0, 9, 1).cmd_kind(), 0);
+    }
+
+    #[test]
+    fn one_dispatch_encodes_each_control_action_and_refuses_any_other_kind() {
+        let mut buf = [0u8; 128];
+        let mut w = ControlWire {
+            kind: CMD_SCHEDULE_CANCEL,
+            ..ControlWire::default()
+        };
+        let n = encode_control(&w, &mut buf, true).unwrap();
+        assert_eq!(&buf[..n], br#"{"type":"scheduleCancel"}"#);
+        w.time = Some(1_789_000_005_000);
+        let n = encode_control(&w, &mut buf, true).unwrap();
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"scheduleCancel","time":1789000005000}"#
+        );
+        assert!(encode_control(&w, &mut buf, false).is_ok());
+        let lev = ControlWire {
+            kind: CMD_LEVERAGE,
+            is_cross: true,
+            asset: 1,
+            leverage: 3,
+            time: None,
+        };
+        let n = encode_control(&lev, &mut buf, true).unwrap();
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"updateLeverage","asset":1,"isCross":true,"leverage":3}"#
+        );
+        assert!(encode_control(&lev, &mut buf, false).is_ok());
+        let noop = ControlWire {
+            kind: CMD_NOOP,
+            ..ControlWire::default()
+        };
+        let n = encode_control(&noop, &mut buf, true).unwrap();
+        assert_eq!(&buf[..n], br#"{"type":"noop"}"#);
+        let odd = ControlWire {
+            kind: 9,
+            ..ControlWire::default()
+        };
+        assert!(
+            encode_control(&odd, &mut buf, false).is_err(),
+            "never a noop by default"
+        );
+        assert!(encode_control(&odd, &mut buf, true).is_err());
+    }
+
+    #[test]
+    fn a_control_answer_is_the_default_shape_a_refusal_or_in_doubt() {
+        let default = br#"{"status":"ok","response":{"type":"default"}}"#;
+        let (mut rt, mut eng, id) = router_with_post(CLASS_CONTROL, 1);
+        rt.on_answer(id, default, true, false, 5);
+        let e = drained(&mut eng);
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            (
+                e[0].kind,
+                e[0].client_oid,
+                e[0].asset,
+                e[0].cmd_kind(),
+                e[0].aux
+            ),
+            (EV_ACK, 10, 1, 0, id)
+        );
+        assert!(rt.healthy);
+        assert!(rt.pending.get(id).is_none(), "released");
+        assert_eq!(rt.inflight_items, 0);
+
+        let refused = br#"{"status":"err","response":"Cannot set scheduled cancel time until enough volume traded."}"#;
+        let (mut rt, mut eng, id) = router_with_post(CLASS_CONTROL, 1);
+        rt.on_answer(id, refused, true, false, 5);
+        assert_eq!(drained(&mut eng)[0].kind, EV_REJECTED, "the venue's no");
+        let (mut rt, mut eng, id) = router_with_post(CLASS_CONTROL, 1);
+        rt.on_answer(id, refused, true, true, 5);
+        assert_eq!(
+            drained(&mut eng)[0].kind,
+            EV_UNANSWERED,
+            "on a re-send the original may have landed"
+        );
+
+        let success =
+            br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#;
+        let (mut rt, mut eng, id) = router_with_post(CLASS_CONTROL, 1);
+        rt.on_answer(id, success, true, false, 5);
+        let e = drained(&mut eng)[0];
+        assert_eq!((e.kind, e.reason), (EV_UNANSWERED, REASON_MALFORMED));
+        assert_eq!(
+            rt.counters.answers_mismatched, 1,
+            "items for a post without any"
+        );
+
+        let (mut rt, mut eng, id) = router_with_post(CLASS_CONTROL, 1);
+        rt.on_answer(id, br#"{"status":"ok"}"#, true, false, 5);
+        assert_eq!(drained(&mut eng)[0].reason, REASON_MALFORMED);
+
+        let (mut rt, mut eng, id) = router_with_post(CLASS_CONTROL, 1);
+        rt.on_rest_answer(id, 200, default, false, 5);
+        assert_eq!(
+            drained(&mut eng)[0].kind,
+            EV_ACK,
+            "the REST answer reads the same"
         );
     }
 }

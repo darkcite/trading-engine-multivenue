@@ -24,9 +24,19 @@ pub const CMD_PLACE: u8 = 1;
 pub const CMD_MODIFY: u8 = 2;
 /// Cancel an order by its client id.
 pub const CMD_CANCEL: u8 = 3;
+/// Control (XH4c): `updateLeverage` for `asset` — `arg` × leverage,
+/// cross when [`CMD_FLAG_CROSS`] (O-XH6, at boot).
+pub const CMD_LEVERAGE: u8 = 4;
+/// Control (XH4c): `scheduleCancel` at `time_ms` (venue wall ms); 0
+/// clears it. The venue's dead-man switch, account-wide.
+pub const CMD_SCHEDULE_CANCEL: u8 = 5;
+/// Control (XH4c): `noop` — spends a nonce.
+pub const CMD_NOOP: u8 = 6;
 
 /// `flags`: reduce-only.
 pub const CMD_FLAG_REDUCE_ONLY: u8 = 1;
+/// `flags` ([`CMD_LEVERAGE`]): cross margin (vs isolated).
+pub const CMD_FLAG_CROSS: u8 = 1 << 1;
 
 /// One command. See the module docs.
 #[repr(C, align(64))]
@@ -58,7 +68,12 @@ pub struct HlCmd {
     pub flags: u8,
     /// Strategy slot: the cloid's third byte (LAW E-9).
     pub slot: u8,
-    _pad: [u8; 13],
+    _pad: u8,
+    /// [`CMD_LEVERAGE`]: the leverage, a whole number.
+    pub arg: u32,
+    /// [`CMD_SCHEDULE_CANCEL`]: the venue wall time to cancel at, ms; 0
+    /// clears the schedule.
+    pub time_ms: u64,
 }
 
 const _: () = assert!(core::mem::size_of::<HlCmd>() == 64);
@@ -75,6 +90,8 @@ const _: () = assert!(offset_of!(HlCmd, is_buy) == 47);
 const _: () = assert!(offset_of!(HlCmd, tif) == 48);
 const _: () = assert!(offset_of!(HlCmd, flags) == 49);
 const _: () = assert!(offset_of!(HlCmd, slot) == 50);
+const _: () = assert!(offset_of!(HlCmd, arg) == 52);
+const _: () = assert!(offset_of!(HlCmd, time_ms) == 56);
 
 impl HlCmd {
     /// Place `sz_1e8` at `px_1e8` on `asset` for `slot`, as `client_oid`.
@@ -102,7 +119,9 @@ impl HlCmd {
             tif: tif as u8,
             flags: 0,
             slot,
-            _pad: [0; 13],
+            _pad: 0,
+            arg: 0,
+            time_ms: 0,
         }
     }
 
@@ -122,6 +141,53 @@ impl HlCmd {
         let mut c = Self::place(slot, client_oid, asset, false, 0, 0, Tif::Gtc);
         c.kind = CMD_CANCEL;
         c
+    }
+
+    /// Control: set `asset`'s leverage to `leverage` ×, cross or
+    /// isolated. `client_oid` only correlates the answer (it is not sent).
+    #[inline(always)]
+    #[must_use]
+    pub const fn leverage(
+        slot: u8,
+        client_oid: u64,
+        asset: u32,
+        is_cross: bool,
+        leverage: u32,
+    ) -> Self {
+        let mut c = Self::place(slot, client_oid, asset, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_LEVERAGE;
+        c.arg = leverage;
+        if is_cross {
+            c.flags = CMD_FLAG_CROSS;
+        }
+        c
+    }
+
+    /// Control: schedule the account's cancel-all at `time_ms` (venue
+    /// wall ms), or clear it with 0.
+    #[inline(always)]
+    #[must_use]
+    pub const fn schedule_cancel(slot: u8, client_oid: u64, time_ms: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_SCHEDULE_CANCEL;
+        c.time_ms = time_ms;
+        c
+    }
+
+    /// Control: a `noop` (spends a nonce).
+    #[inline(always)]
+    #[must_use]
+    pub const fn noop(slot: u8, client_oid: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_NOOP;
+        c
+    }
+
+    /// A control command (leverage, scheduleCancel, noop): posted alone.
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_control(&self) -> bool {
+        self.kind >= CMD_LEVERAGE && self.kind <= CMD_NOOP
     }
 
     /// Reduce-only.
@@ -243,6 +309,26 @@ mod tests {
         assert_eq!(x.kind, CMD_CANCEL);
         assert_eq!(x.cancel_wire().cloid, cloid::encode(6, 43));
         assert_eq!(x.cancel_wire().asset, 3);
+    }
+
+    #[test]
+    fn control_commands_carry_their_arguments() {
+        let l = HlCmd::leverage(6, 9, 1, true, 3);
+        assert_eq!(
+            (l.kind, l.asset, l.arg, l.flags),
+            (CMD_LEVERAGE, 1, 3, CMD_FLAG_CROSS)
+        );
+        assert!(l.is_control());
+        let i = HlCmd::leverage(6, 9, 1, false, 10);
+        assert_eq!(i.flags & CMD_FLAG_CROSS, 0);
+        let s = HlCmd::schedule_cancel(6, 10, 1_789_000_005_000);
+        assert_eq!(
+            (s.kind, s.time_ms),
+            (CMD_SCHEDULE_CANCEL, 1_789_000_005_000)
+        );
+        assert!(HlCmd::noop(6, 11).is_control());
+        assert!(!HlCmd::cancel(6, 1, 0).is_control());
+        assert!(!HlCmd::place(6, 1, 0, true, 1, 1, Tif::Alo).is_control());
     }
 
     #[test]

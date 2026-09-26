@@ -162,6 +162,21 @@ impl HlOk {
         self.errors == 0 && self.statuses > 0
     }
 
+    /// The `{"type":"default"}` acceptance, and only it: one status and
+    /// no item of any kind. The one acceptance an action without items
+    /// has (XH4c: `updateLeverage`, `scheduleCancel`, `noop`) — a reply
+    /// with items does not fit such a post.
+    #[inline]
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.statuses == 1
+            && self.errors == 0
+            && self.oid == 0
+            && !self.any_filled
+            && !self.any_resting
+            && !self.any_success
+    }
+
     /// Every error item was an IoC miss and nothing rested or filled:
     /// the venue processed the order and it did not trade. Distinct
     /// from [`Self::accepted`] (nothing traded) and from a refusal
@@ -765,6 +780,14 @@ mod tests {
         };
         assert!(o.accepted());
         assert_eq!(o.oid, 0);
+        assert!(o.is_default());
+        // XH4c: a control action's acceptance is THIS shape and no other.
+        for b in [RESTING, FILLED, ITEM_ERR, IOC_MISS, CANCEL_OK, CANCEL_ERR] {
+            let HlResponse::Ok(o) = scan(b).unwrap() else {
+                panic!()
+            };
+            assert!(!o.is_default(), "{o:?}");
+        }
     }
 
     #[test]

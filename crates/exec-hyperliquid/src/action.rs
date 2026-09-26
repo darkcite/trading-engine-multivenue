@@ -19,6 +19,10 @@
 //! | cancel | `type`, `cancels`; item `a`, `o` |
 //! | cancelByCloid | `type`, `cancels`; item `asset`, `cloid` |
 //! | batchModify | `type`, `modifies`; item `oid`, `order` |
+//! | reserveRequestWeight | `type`, `weight` |
+//! | updateLeverage | `type`, `asset`, `isCross`, `leverage` |
+//! | scheduleCancel | `type`, then `time` only if set (absent clears) |
+//! | noop | `type` |
 //!
 //! Note `cancel` keys its asset `a` while `cancelByCloid` keys the same
 //! field `asset`. That is not a typo here — it is the SDK's own
@@ -346,6 +350,57 @@ pub fn encode_reserve_weight(dst: &mut [u8], weight: u64) -> Result<usize, MsgPa
     w.str_bytes(b"reserveRequestWeight")?;
     w.str_bytes(b"weight")?;
     w.uint(weight)?;
+    Ok(w.len())
+}
+
+/// `{"type":"updateLeverage","asset":…,"isCross":…,"leverage":…}` — the
+/// perp arm sets its leverage at boot (O-XH6). Key order per the SDK's
+/// `Exchange.update_leverage`.
+#[inline]
+pub fn encode_update_leverage(
+    dst: &mut [u8],
+    asset: u32,
+    is_cross: bool,
+    leverage: u32,
+) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(4)?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"updateLeverage")?;
+    w.str_bytes(b"asset")?;
+    w.uint(u64::from(asset))?;
+    w.str_bytes(b"isCross")?;
+    w.bool(is_cross)?;
+    w.str_bytes(b"leverage")?;
+    w.uint(u64::from(leverage))?;
+    Ok(w.len())
+}
+
+/// `{"type":"scheduleCancel"[,"time":…]}` — the venue's dead-man switch:
+/// at `time_ms` every open order of the ACCOUNT is cancelled; `None`
+/// clears it. Account-wide, so on an account shared between slots it is
+/// armed only while no other slot has orders (XH4 ruling). The `time`
+/// key is absent, not null, when clearing — as the SDK writes it.
+#[inline]
+pub fn encode_schedule_cancel(dst: &mut [u8], time_ms: Option<u64>) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(if time_ms.is_some() { 2 } else { 1 })?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"scheduleCancel")?;
+    if let Some(t) = time_ms {
+        w.str_bytes(b"time")?;
+        w.uint(t)?;
+    }
+    Ok(w.len())
+}
+
+/// `{"type":"noop"}` — spends a nonce and does nothing.
+#[inline]
+pub fn encode_noop(dst: &mut [u8]) -> Result<usize, MsgPackErr> {
+    let mut w = Writer::new(dst);
+    w.map_header(1)?;
+    w.str_bytes(b"type")?;
+    w.str_bytes(b"noop")?;
     Ok(w.len())
 }
 

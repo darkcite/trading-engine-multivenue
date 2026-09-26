@@ -7235,9 +7235,13 @@ fn hl_action_encode_sign() {
 #[test]
 fn hl_exchange_encode_and_scan_are_zero_alloc() {
     use exec_hyperliquid::action::{
-        encode_cancel, encode_order, encode_reserve_weight, CancelWire, OrderWire, Tif, MAX_ACTION,
+        encode_cancel, encode_noop, encode_order, encode_reserve_weight, encode_schedule_cancel,
+        encode_update_leverage, CancelWire, OrderWire, Tif, MAX_ACTION,
     };
-    use exec_hyperliquid::request::{cancel_json, envelope, order_json, reserve_weight_json};
+    use exec_hyperliquid::request::{
+        cancel_json, envelope, noop_json, order_json, reserve_weight_json, schedule_cancel_json,
+        update_leverage_json,
+    };
     use exec_hyperliquid::response::{scan, HlResponse};
 
     const HIP4_YES: u32 = 100_000_000 + 10 * 3253;
@@ -7284,6 +7288,28 @@ fn hl_exchange_encode_and_scan_are_zero_alloc() {
         // S7-L1: the request-weight top-up, the same three steps.
         let n = encode_reserve_weight(&mut mp, 5_000).unwrap();
         let m = reserve_weight_json(&mut aj, 5_000).unwrap();
+        let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
+        acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
+
+        // XH4c: the perp arm's control actions, the same three steps —
+        // the dead man's scheduleCancel in both shapes, with its
+        // `expiresAfter`.
+        let n = encode_update_leverage(&mut mp, 1, true, 3).unwrap();
+        let m = update_leverage_json(&mut aj, 1, true, 3).unwrap();
+        let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
+        acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
+        let time = if i % 2 == 0 {
+            Some(1_789_000_005_000)
+        } else {
+            None
+        };
+        let n = encode_schedule_cancel(&mut mp, time).unwrap();
+        let m = schedule_cancel_json(&mut aj, time).unwrap();
+        let expires = Some(1_789_000_000_000 + u64::from(i));
+        let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, expires).unwrap();
+        acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
+        let n = encode_noop(&mut mp).unwrap();
+        let m = noop_json(&mut aj).unwrap();
         let e = envelope(&mut body, &aj[..m], i as u64, &sig, None, None).unwrap();
         acc = acc.wrapping_add(n).wrapping_add(m).wrapping_add(e);
 
@@ -10709,6 +10735,117 @@ fn hl_gateway_engine_half_is_zero_alloc() {
     assert_eq!(
         allocs, 0,
         "the HL gateway's engine half allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// **XMM gate 85 (XH4c) — the dead-man switch and the perp rules are
+/// 0 B/op.** Both run on the engine thread from XH4f, the switch on
+/// every arm tick: `DeadMan::poll/on_event/unsent` over a scripted 55 h
+/// (the boot clear, the probe, pushes every 5 s, clears, a full ring, a
+/// local refusal, answers in doubt, the rate limit's back-off, a stall
+/// through a deadline, the venue's refusal, two 00:00 UTC rolls), and
+/// `PerpRules::{tick_1e8, round_px, round_sz_down, check}` over a
+/// geometric price sweep at every `szDecimals`.
+#[test]
+fn hl_deadman_and_perp_rules_are_zero_alloc() {
+    use exec_hyperliquid::deadman::{DeadMan, DeadManCfg};
+    use exec_hyperliquid::event::{
+        ExecEvent, EVF_POST_ITEM, EV_ACK, EV_REJECTED, EV_UNANSWERED, REASON_LOCAL,
+        REASON_RATE_LIMIT, REASON_TRANSPORT,
+    };
+    use exec_hyperliquid::rules::{PerpRules, Round};
+    use exec_hyperliquid::HlCmd;
+
+    // One verdict per post: a cycle of acceptances, a local refusal and a
+    // verdict in doubt; every ninth post a full ring instead; the rate
+    // limit once (its minute's back-off lets a deadline pass: a trigger)
+    // and the venue's refusal of an arm once (its arms back off an answer).
+    const CYCLE: [(u8, u8); 8] = [
+        (EV_ACK, 0),
+        (EV_ACK, 0),
+        (EV_ACK, 0),
+        (EV_REJECTED, REASON_LOCAL),
+        (EV_ACK, 0),
+        (EV_UNANSWERED, REASON_TRANSPORT),
+        (EV_ACK, 0),
+        (EV_ACK, 0),
+    ];
+    // 2026-09-26 00:00:00 UTC.
+    const DAY0_MS: u64 = 1_790_380_800_000;
+
+    let mut dm = DeadMan::new(DeadManCfg::DEFAULT, 6, 1 << 40).expect("the default timing");
+    let mut scratch = HlCmd::noop(0, 0);
+    let mut rules = [PerpRules::new(0).expect("0"); 7];
+    let mut sz = 1u8;
+    while sz <= 6 {
+        rules[usize::from(sz)] = PerpRules::new(sz).expect("sz");
+        sz += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut posts = 0u32;
+    let mut tick = 0u64;
+    while tick < 200_000 {
+        let now = DAY0_MS + tick * 1_000;
+        // Day 1, ticks 100 000 .. 100 030: the engine stalls through a
+        // deadline (day 0 is parked from post 400 on).
+        let stalled = (100_000..100_030).contains(&tick);
+        let want = tick % 97 != 0;
+        if !stalled && dm.poll(now, tick, want, &mut scratch) {
+            posts += 1;
+            if posts % 9 == 0 {
+                dm.unsent(now);
+            } else {
+                let (kind, reason) = match posts {
+                    300 => (EV_REJECTED, REASON_RATE_LIMIT),
+                    400 => (EV_REJECTED, 0),
+                    _ => CYCLE[(posts % 8) as usize],
+                };
+                let ev = ExecEvent {
+                    kind,
+                    reason,
+                    slot: scratch.slot,
+                    client_oid: scratch.client_oid,
+                    flags: EVF_POST_ITEM,
+                    ..ExecEvent::default()
+                };
+                acc ^= u64::from(dm.on_event(&ev, now + 30));
+            }
+        }
+        acc ^= dm.deadline_ms();
+        tick += 1;
+    }
+
+    let mut k = 0usize;
+    while k < rules.len() {
+        let r = rules[k];
+        let mut px = 7i64;
+        while px < 500_000_000_000_000 {
+            acc ^= r.tick_1e8(px) as u64;
+            if let Some(p) = r.round_px(px, Round::Down) {
+                acc ^= p as u64;
+            }
+            if let Some(p) = r.round_px(px, Round::Up) {
+                acc ^= p as u64;
+            }
+            acc ^= r.round_sz_down(px) as u64;
+            acc ^= u64::from(r.check(px, r.lot_1e8() * 1_000).is_ok());
+            px = px * 3 + 1;
+        }
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let c = *dm.counters();
+    assert!(
+        c.accepted > 1_000 && c.triggers >= 1 && c.refused == 1 && c.unsent > 0,
+        "the script reached the paths it names: {c:?}"
+    );
+    assert!(c.in_doubt > 0 && c.rate_limited == 1 && c.clears > 0);
+    assert_eq!(
+        allocs, 0,
+        "the dead-man switch / perp rules allocated {allocs} times ({bytes} B)"
     );
 }
 

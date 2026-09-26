@@ -191,6 +191,41 @@ case(
 case("reserve_weight", {"type": "reserveRequestWeight", "weight": 5000}, 26, True)
 case("reserve_weight_testnet", {"type": "reserveRequestWeight", "weight": 1}, 27, False)
 
+# --- XH4c: the perp arm's control actions -----------------------------
+# The SDK's own dict shapes (`Exchange.update_leverage`,
+# `Exchange.schedule_cancel` — `time` absent, not null, when clearing —
+# and `Exchange.noop`), signed by its L1 chain like every row above.
+case("update_leverage_cross", {"type": "updateLeverage", "asset": 1, "isCross": True, "leverage": 3}, 28, False)
+case("update_leverage_isolated", {"type": "updateLeverage", "asset": 0, "isCross": False, "leverage": 10}, 29, True)
+case("schedule_cancel_at", {"type": "scheduleCancel", "time": 1789000005000}, 30, False)
+case("schedule_cancel_clear", {"type": "scheduleCancel"}, 31, False)
+case("noop", {"type": "noop"}, 32, False)
+
+
+# --- XH4c: the gateway's 39-item actions and the split at 39 ----------
+# An action weighs 1 + n // 40 IP requests, so 39 items is the largest
+# weight-1 action; the XH4b coalescer puts a 40th into its own action.
+def mm_cloid(i):
+    """The E-9 cloid of slot 6, client id 1000 + i."""
+    return "0x4d5606" + "00" * 5 + format(1000 + i, "016x")
+
+
+MM_WIRES = [wire(1, i % 2 == 0, 2500.0 + i * 0.5, 0.01, False, "Alo", mm_cloid(i)) for i in range(40)]
+case("order_batch_39_alo", order_action(MM_WIRES[:39]), 33, False)
+case("order_split_tail", order_action(MM_WIRES[39:]), 34, False)
+case(
+    "batch_modify_39",
+    {"type": "batchModify", "modifies": [{"oid": mm_cloid(100 + i), "order": MM_WIRES[i]} for i in range(39)]},
+    35,
+    False,
+)
+case(
+    "cancel_by_cloid_39",
+    {"type": "cancelByCloid", "cancels": [{"asset": 1, "cloid": mm_cloid(i)} for i in range(39)]},
+    36,
+    False,
+)
+
 out = []
 for c in CASES:
     packed = msgpack.packb(c["action"])

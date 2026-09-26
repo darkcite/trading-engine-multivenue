@@ -20,7 +20,7 @@
 #
 # TWO FORMS
 #   exec-smoke.sh --offline   the offline self-test alone: reproduce the
-#                             27 SDK known-answer vectors and rebuild one
+#                             36 SDK known-answer vectors and rebuild one
 #                             action per TYPE from inputs. No network, no
 #                             credentials. This is the CI form — CI has no
 #                             testnet key and should not have one — and it

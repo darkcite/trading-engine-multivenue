@@ -25,9 +25,11 @@
 //! whose only purpose is to make (4) reproducible.
 
 use exec_hyperliquid::action::{
-    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order,
-    encode_reserve_weight, CancelByCloidWire, CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
+    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_noop, encode_order,
+    encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
+    CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
+use exec_hyperliquid::cloid::encode as mm_cloid_of;
 use exec_hyperliquid::sign::{connection_id, Network, Vault};
 use signer_eip712::hyperliquid as hl;
 
@@ -357,6 +359,69 @@ fn every_vector_reproduces_byte_for_byte() {
     let n = encode_reserve_weight(&mut buf, 1).unwrap();
     check(&r, "reserve_weight_testnet", &buf[..n]);
     seen.push("reserve_weight_testnet");
+
+    // --- XH4c: the perp arm's control actions ---------------------------
+    let n = encode_update_leverage(&mut buf, 1, true, 3).unwrap();
+    check(&r, "update_leverage_cross", &buf[..n]);
+    seen.push("update_leverage_cross");
+    let n = encode_update_leverage(&mut buf, 0, false, 10).unwrap();
+    check(&r, "update_leverage_isolated", &buf[..n]);
+    seen.push("update_leverage_isolated");
+    let n = encode_schedule_cancel(&mut buf, Some(1_789_000_005_000)).unwrap();
+    check(&r, "schedule_cancel_at", &buf[..n]);
+    seen.push("schedule_cancel_at");
+    let n = encode_schedule_cancel(&mut buf, None).unwrap();
+    check(&r, "schedule_cancel_clear", &buf[..n]);
+    seen.push("schedule_cancel_clear");
+    let n = encode_noop(&mut buf).unwrap();
+    check(&r, "noop", &buf[..n]);
+    seen.push("noop");
+
+    // --- XH4c: 39 items (one weight-1 action) and the split at 39 --------
+    let mm = |i: u64| mm_cloid_of(6, 1_000 + i);
+    let wires: Vec<OrderWire> = (0..40u64)
+        .map(|i| {
+            OrderWire::new(
+                1,
+                i % 2 == 0,
+                250_000_000_000 + i as i64 * 50_000_000,
+                1_000_000,
+                Tif::Alo,
+            )
+            .with_cloid(mm(i))
+        })
+        .collect();
+    assert_eq!(MAX_ORDERS, 39);
+    assert!(
+        encode_order(&mut buf, &wires, b"na").is_err(),
+        "40 items is two actions"
+    );
+    let n = encode_order(&mut buf, &wires[..39], b"na").unwrap();
+    check(&r, "order_batch_39_alo", &buf[..n]);
+    seen.push("order_batch_39_alo");
+    let n = encode_order(&mut buf, &wires[39..], b"na").unwrap();
+    check(&r, "order_split_tail", &buf[..n]);
+    seen.push("order_split_tail");
+    let modifies: Vec<ModifyWire> = (0..39u64)
+        .map(|i| ModifyWire {
+            order: wires[i as usize],
+            oid: 0,
+            oid_cloid: mm(100 + i),
+            oid_is_cloid: true,
+        })
+        .collect();
+    let n = encode_batch_modify(&mut buf, &modifies).unwrap();
+    check(&r, "batch_modify_39", &buf[..n]);
+    seen.push("batch_modify_39");
+    let cancels: Vec<CancelByCloidWire> = (0..39u64)
+        .map(|i| CancelByCloidWire {
+            asset: 1,
+            cloid: mm(i),
+        })
+        .collect();
+    let n = encode_cancel_by_cloid(&mut buf, &cancels).unwrap();
+    check(&r, "cancel_by_cloid_39", &buf[..n]);
+    seen.push("cancel_by_cloid_39");
 
     // Every fixture row must have been exercised: a row nobody checks
     // is a vector that proves nothing.

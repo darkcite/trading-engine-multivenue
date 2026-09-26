@@ -10,7 +10,7 @@
 //! | kind | source | meaning |
 //! |---|---|---|
 //! | [`EV_ACK`] | a post reply item | accepted; `flags` says resting / filled (`oid`, and `px`/`sz` = average price / total size when filled) |
-//! | [`EV_REJECTED`] | a post reply item, `orderUpdates`, or the gateway | refused, `reason` says why; [`REASON_HALTED`], [`REASON_NOT_READY`] and [`REASON_LOCAL`] never left the host |
+//! | [`EV_REJECTED`] | a post reply item, `orderUpdates`, or the gateway | refused, `reason` says why; [`REASON_HALTED`], [`REASON_NOT_READY`] and [`REASON_LOCAL`] never left the host, and neither did a REST send refused with [`REASON_TRANSPORT`] (it failed before the request left) |
 //! | [`EV_UNANSWERED`] | the gateway | sent and not settled — a timeout, a socket that died under it, an answer that does not scan or does not fit, the venue API layer's error, a refused re-send: LAW E-5 "sent, unanswered", in doubt, never re-signed; `reason` carries what the venue said, if anything |
 //! | [`EV_RESTING`] / [`EV_CANCELED`] / [`EV_FILLED`] | `orderUpdates` | the order's status changed (`sz` = remaining size) |
 //! | [`EV_FILL`] + [`EV_FILL_META`] | `userFills` | one trade, then its fee (signed, rebates negative) and the crossed flag; `aux` = tid on both |
@@ -82,7 +82,9 @@ pub const EVF_SNAPSHOT: u8 = 1 << 2;
 /// `flags`: the event is about an item of a post — its answer, its
 /// refusal, or its being unanswered — not a stream row.
 pub const EVF_POST_ITEM: u8 = 1 << 3;
-/// `flags` bits 4–5: the item's command kind (`CMD_*`), post items only.
+/// `flags` bits 4–5: the item's command kind (`CMD_*`: place, modify,
+/// cancel), post items only; 0 for a control post's item (leverage,
+/// scheduleCancel, noop — the arm correlates those by client id).
 pub const EVF_CMD_SHIFT: u8 = 4;
 /// `flags`: the reply said the order rests.
 pub const EVF_RESTING: u8 = 1 << 6;
@@ -189,7 +191,8 @@ const _: () = assert!(offset_of!(ExecEvent, slot) == 62);
 const _: () = assert!(offset_of!(ExecEvent, flags) == 63);
 
 impl ExecEvent {
-    /// The post item's command kind (`CMD_*`), or 0 for a stream event.
+    /// The post item's command kind (`CMD_*`: place, modify, cancel), or
+    /// 0 for a stream event or a control post's item.
     #[inline(always)]
     #[must_use]
     pub const fn cmd_kind(&self) -> u8 {

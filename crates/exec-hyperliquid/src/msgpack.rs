@@ -108,7 +108,7 @@ impl<'a> Writer<'a> {
             return Err(MsgPackErr::Overflow);
         }
         // COPY: the serialiser's own write — caller literals (keys,
-        // ≤ COIN_MAX coin names, 32 B cloid hex) into the boot-owned
+        // ≤ COIN_MAX coin names, 34 B cloid hex) into the boot-owned
         // action buffer that is keccak'd and sent. The wire bytes have
         // to exist contiguously somewhere; this is that place, written
         // once. There is no second buffer downstream of it.
