@@ -149,6 +149,28 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
         self.b.observe_amm(sym, payload, now_ns);
     }
 
+    /// XMM XH2: both arms see every print, like every tick.
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        self.a.observe_trade(print, now_ns);
+        self.b.observe_trade(print, now_ns);
+    }
+
+    /// XMM XH2: arm A's order events first, then B's — the fill order.
+    /// Forwarded now so the XH4 gateway's events cannot vanish into a
+    /// defaulted `false` behind this wrapper.
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.a.try_next_order_event(out) || self.b.try_next_order_event(out)
+    }
+
+    /// XMM XH2: both arms learn the queue law's instruments.
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        self.a.track_queue_sym(sym);
+        self.b.track_queue_sym(sym);
+    }
+
     /// Both arms, unconditionally — neither may starve the other.
     #[inline]
     fn on_idle(&mut self) -> bool {

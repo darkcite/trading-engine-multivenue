@@ -540,13 +540,20 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 match trades.try_pop_ref() {
                     Some(t) => {
                         consumed += 1;
+                        let now = now_ns();
+                        // XMM XH2: the dispatcher sees the print FIRST,
+                        // as it sees a tick first — a PAPER one judges
+                        // its post-only makers by the queue law, and the
+                        // fills it produced are pumped at the END of the
+                        // iteration. A live dispatcher does nothing.
+                        self.disp.observe_trade(&t, now);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
                             order_capture: self.order_capture.as_mut(),
                             recent_orders: &mut self.recent_orders,
                             lifecycle: &mut self.lifecycle,
-                            now: now_ns(),
+                            now,
                         };
                         self.strat.on_trade(&t, &mut ctx);
                         self.trades_dispatched = self.trades_dispatched.wrapping_add(1);
@@ -702,6 +709,30 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 }
                 None => break,
             }
+            i += 1;
+        }
+
+        // --- dispatcher order-event pump (XMM XH2) ---
+        // The paper arm's order events (the queue law's RESTING,
+        // REJECTED, CANCELED, FILLED) — after the fill pump, so a member
+        // sees a fill before the FILLED it causes, and before the lane
+        // below for the same reason the lane is where it is. Budgeted
+        // like every other source; a dispatcher without events returns
+        // `false` at once.
+        let mut ev = OrderEvent::ZERO;
+        let mut i = 0;
+        while i < max_per_ring && self.disp.try_next_order_event(&mut ev) {
+            consumed += 1;
+            let mut ctx = EngineCtx {
+                disp: &mut self.disp,
+                decide_lat: &self.decide_lat,
+                order_capture: self.order_capture.as_mut(),
+                recent_orders: &mut self.recent_orders,
+                lifecycle: &mut self.lifecycle,
+                now: now_ns(),
+            };
+            self.strat.on_order_event(&ev, &mut ctx);
+            self.order_events_dispatched = self.order_events_dispatched.wrapping_add(1);
             i += 1;
         }
 
@@ -1249,6 +1280,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         &self.disp
     }
 
+    /// Borrow the dispatcher mutably — boot only (XMM XH2: the queue
+    /// law's instruments are tracked on the engine's own dispatcher).
+    #[inline]
+    pub fn dispatcher_mut(&mut self) -> &mut D {
+        &mut self.disp
+    }
+
     /// Borrow the strategy (for paper-mode stats reads).
     #[inline]
     pub fn strategy(&self) -> &S {
@@ -1653,6 +1691,58 @@ mod tests {
         assert_eq!(eng.strategy().trades, 3);
         assert_eq!(eng.strategy().last_trade_tid, 3, "ring order");
         assert_eq!(eng.strategy().ticks_at_first_trade, 2, "tick lanes first");
+    }
+
+    /// XMM XH2: the paper dispatcher sees a print before `on_trade`, and
+    /// the queue law's order events reach `on_order_event` after the
+    /// fill pump of the same iteration.
+    #[test]
+    fn paper_queue_fills_and_order_events_reach_the_member() {
+        let (mut eng, mut tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut trp, trc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        eng.set_trade_lane(trc);
+        eng.start().unwrap();
+        let sym = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
+        eng.dispatcher_mut().track_queue_sym(sym);
+        // Emitted at 0: it lands at the first book after Δ_hl, and the
+        // engine clock is far past that.
+        let mut o = Order::new(
+            0,
+            VenueId::Hyperliquid,
+            sym,
+            core_types::Side::Bid,
+            0,
+            Price::from_raw(187_000_000),
+            Qty::from_raw(1_000_000),
+            5,
+        )
+        .with_post_only();
+        o.strategy_id = 6;
+        eng.dispatcher_mut().submit(&o).unwrap();
+        let book = Tick::new(
+            0,
+            VenueId::Hyperliquid,
+            sym,
+            1,
+            Price::from_raw(187_000_000),
+            Qty::from_raw(0),
+            Price::from_raw(188_000_000),
+            Qty::from_raw(1_000_000),
+        );
+        assert!(tp[VenueId::Hyperliquid as usize].try_push_ref(&book));
+        // A seller takes 1.0 at 187: nothing shown ahead, so it is ours.
+        assert!(trp.try_push_ref(&mk_trade(1)));
+        eng.tick(16);
+        assert_eq!(eng.fills_dispatched, 1, "the queue fill is pumped");
+        assert_eq!(eng.order_events_dispatched, 2, "RESTING, then FILLED");
+        assert_eq!(
+            eng.strategy().last_order_event,
+            (core_types::ORDER_EVENT_FILLED, core_types::ORDER_EVENT_REASON_NONE)
+        );
+        assert_eq!(eng.dispatcher().open_orders(), 0);
+        // Failure mode: a dispatcher with nothing to say costs one call.
+        assert_eq!(eng.tick(16), 0);
+        assert_eq!(eng.order_events_dispatched, 2);
     }
 
     /// The trade lane obeys the per-lane budget, and a backlog drains

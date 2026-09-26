@@ -20,6 +20,7 @@ frozen-surface amendment with this ruling cited in the pin tests).
 | ---------------------------- | --------- | ------------------------------------ |
 | max open orders per symbol   | 8         | `cli::backtest::fill` (paper model)  |
 | max total open orders        | 64        | `cli::backtest::fill` (paper model)  |
+| xmm queue orders (XMM XH2)   | 32 total, 8 symbols | `core_fill::queue` — a SEPARATE table for post-only makers on Hyperliquid, in the paper matcher and the harness; no per-symbol cap of its own (the member holds ≤ 4 per perp: two sides, each with a modify in flight). Combined paper capacity is 96 |
 | max net notional per symbol  | $20 000   | rule 7 + gates (RiskGate at 8i)      |
 | max net notional total       | $100 000  | rule 7 + gates (2× book gross)       |
 | max single-order notional    | $10 000   | rule 7 + VM clamp + gates            |
@@ -5944,6 +5945,100 @@ O-XH1…O-XH15). `strategy-icdp` is UNLINKED from the set (its crate and
 * **Regime:** slot 6 takes no label yet; with `[labels] require = 1` an
   enabled xmm refuses the boot (fail-closed). `[labels.icdp]` refuses at
   the grammar.
+
+### XH2 amendment (2026-09-26): the policy and the queue law — PAPER only
+
+* **The member now quotes** (`maker_enabled = 1`): post-only orders at the
+  Hyperliquid touch, sized `clip ÷ px` down to the venue lot (never under
+  $10); a requote is a modify (E-7); the LEAD rule and the 500 ms gate
+  pull or hold the side about to be picked off. Every order carries the
+  TTL `lifetime_ms` (E-8, ≤ 30 s). **Still no `strategy.conf` names it,
+  and a live slot 6 still refuses the boot** — XH2 arms nothing; XH3
+  enables it on paper.
+* **Hard caps in the member** (rule 6), on PROJECTED exposure — the E6
+  rule "the clamp projects": every order the member has out (sent,
+  resting, cancelling, and a modify's predecessor, counted at the
+  replacement's size) is counted as if it filled. A side whose
+  worst-case exposure would pass `inv_cap_usd_1e6`, the gross past
+  `gross_inv_cap_usd_1e6` or the resting notional past
+  `resting_cap_usd_1e6` is not quoted; an order that does not raise its
+  perp's worst case always is. A requote's replacement is checked with
+  its predecessor still counted (both can fill in the race).
+* **Safety pulls (XH-2), the member's half:** a leader silent for
+  `lead_stale_ms` or a follower for `follower_stale_ms`, or either one's
+  last update flagged stale by its ingress, cancels both sides and places
+  nothing — on the next update, and on a 100 ms timer when the feeds
+  themselves are silent. A stale-flagged leader tick refreshes nothing
+  (no reference price, no LEAD trigger, no gate history). The halt,
+  ACK-RTT and congestion pulls are the XH4 arm's.
+* **The gate fails closed on lost history:** a burst of leader updates
+  that overwrites the gate's ring (8 192 samples per perp, ≈ 16 k
+  updates/s over the 500 ms window) closes the gate for that decision
+  and is counted (`gate_overflow`, must stay 0); history never received
+  (the first half-second) leaves it open, as the simulator does.
+* **LAW E-8, the member's half:** the member cancels its own order at
+  its TTL (`expiry_cancels`), whoever else expires it; the paper model
+  expires it at the same instant. **XH4 precondition:** Hyperliquid has
+  no per-order TTL — its limit TIFs are `Alo`, `Ioc` and `Gtc` (no GTD);
+  `expiresAfter` only rejects an ACTION processed after that instant and
+  never ends a resting order; `scheduleCancel` is an account-wide
+  cancel-all dead-man's switch (≥ 5 s ahead, ≤ 10 triggers per UTC day).
+  On this venue the TTL is therefore an engine-sent cancel: the XH4
+  gateway sends it itself at each order's expiry, whatever the member
+  does, and `scheduleCancel` is at most a coarse account-level backstop,
+  never the TTL.
+* **A lost order event cannot wedge a side:** a side waiting on its
+  order's final event for 10 s (or resting 10 s past its TTL) is released,
+  a best-effort cancel goes out for what it held (the order and a
+  modify's predecessor), and it is counted (`stuck`, must stay 0). In
+  paper a long Hyperliquid outage can trip it without an event being
+  lost — read `stuck` next to the feed's health.
+* **Departures from E5 for queue orders** (the paper matcher and the
+  harness, post-only makers on Hyperliquid only):
+  * `Ok` from a cancel means the cancel was SENT: it lands at the first
+    record at or after `CancelReq.ts_ns + Δ_hl`, ahead of that block's
+    prints — the order can still fill until then, and its `CANCELED` (or
+    `FILLED`) event is the answer. So `CancelReq.ts_ns` sets when a
+    queue cancel lands; stamp it from `ctx.now_ns()`.
+  * A modify of an order no longer held is `NoSuchOrder` and places
+    nothing (fail-closed; whether the venue ever places the replacement
+    is not measured). A replacement whose predecessor filled or was
+    cancelled while the modify flew is REJECTED on landing
+    (`stale_modify`) — one quote decision cannot fill twice. A modify
+    against a full table is `QueueFull`, the old order untouched ("a
+    refused modify changes NOTHING"). The replacement inherits the old
+    order's expiry (E-7).
+  * A refused replacement hands the side back to its predecessor, which
+    the member then cancels; the side is free only on the predecessor's
+    final event. A modify the arm refuses is followed by a cancel, never
+    retried on every update.
+* **The paper model is the queue law** for post-only makers on
+  Hyperliquid (`core_fill::queue`): an order that would cross on arrival
+  is REJECTED (`BAD_ALO_PX` — information, not a fault, XH-7); a resting
+  one fills only from prints, after the displayed size ahead of it. Every
+  other member's order keeps the strict-cross law, unchanged.
+* **Per-slot timers, re-reviewed:** with xmm enabled the set's timer runs
+  every 100 ms; each member's own `timer_due` gate still fires it on its
+  own period (a 1 s member now fires every 1.0–1.1 s).
+
+**Open before XH3 enables xmm:**
+* `audit-pnl` does not replay trade prints, so a slot-6 queue order can
+  never fill there — its shadow P&L would read flat until it does.
+* The member's counters reach `/metrics` — at least `stuck`,
+  `gate_overflow`, `unmatched` and `ctx_refused`, each of which must
+  stay 0; until then they print only in the harness lines.
+
+**Open for XH4:** a position with no follower mark yet counts $0 in the
+projected gross (`exposure()` prices at the follower mid, 0 until the
+first fresh Hyperliquid book). Unreachable in paper — every fill needs a
+quote and every quote a touch — but reachable once XH4 seeds positions
+from the venue at boot: XH4 refuses every growing order while any perp
+holds a position without a mark.
+
+Gates (XH2, 2026-09-26): alloc 79/79 at 0 B/op (+1 ignored helper),
+incl. gates 74 (queue law), 75/75b/75c (the member, its fail-safe
+branches included), 76 (the paper dispatcher's queue path) and the
+engine gate driving the paper order-event pump.
 
 The laws XH-1…XH-7 (plan §10) are proposed for this file when their
 phase lands (XH3 paper member, XH4 execution).

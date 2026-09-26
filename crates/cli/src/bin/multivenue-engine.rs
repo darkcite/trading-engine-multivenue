@@ -110,6 +110,12 @@ enum Cmd {
     /// stderr; exit 0 only when a trustworthy report was printed.
     /// H1 slice: hold-model accounting — the §4 fill model lands in H2.
     Backtest(BacktestArgs),
+    /// XMM XH2 parity gate (plan §7.3): replay ONE window of one capture
+    /// run through the xmm member on the queue law, on the XMM
+    /// simulator's venue clock and S1 latencies, and write one TSV row
+    /// per (perp, side) beside the simulator's for the comparison.
+    /// Research only; the frozen `backtest` argv is untouched.
+    XmmParity(XmmParityArgs),
     /// Offline M3 capture catalog (mvp-plan §4-M3): walks a replay
     /// root (or one `run-<epoch_ns>` dir) and reports per-run wall
     /// spans, per-venue tick coverage, UTC-day continuity (gap map,
@@ -570,6 +576,35 @@ struct AuditPnlArgs {
     /// the first run directory's own `regime-seed.tsv`, else warm live).
     #[arg(long)]
     regime_seed: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct XmmParityArgs {
+    /// The `run-<epoch_ns>` directory holding the window.
+    #[arg(long)]
+    replay_dir: PathBuf,
+    /// The parity artifact (`xmm.toml` shape, production pulls off).
+    #[arg(long)]
+    xmm: PathBuf,
+    /// Window start, venue-clock ns (the simulator's `utc_lo_ns`).
+    #[arg(long)]
+    lo_ns: u64,
+    /// Window end, venue-clock ns (`utc_hi_ns`).
+    #[arg(long)]
+    hi_ns: u64,
+    /// The window's label (`W01`, …), echoed into the rows.
+    #[arg(long)]
+    win: String,
+    /// Output TSV path.
+    #[arg(long)]
+    out: PathBuf,
+    /// Seconds of both feeds watched before the window (the gate's
+    /// history).
+    #[arg(long, default_value_t = 60)]
+    preroll_s: u64,
+    /// The simulator's tail: no decision in the window's last seconds.
+    #[arg(long, default_value_t = 90)]
+    tail_s: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -1048,6 +1083,10 @@ fn main() -> ExitCode {
         Cmd::Backtest(args) => {
             init_tracing_stderr();
             backtest(args)
+        }
+        Cmd::XmmParity(args) => {
+            init_tracing_stderr();
+            xmm_parity(args)
         }
         Cmd::CaptureCatalog(args) => {
             // stderr tracing for the same reason as the backtest arm:
@@ -2126,6 +2165,44 @@ fn audit_pnl(args: AuditPnlArgs) -> ExitCode {
         }
         Err(e) => {
             eprintln!("audit-pnl: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// XMM XH2 parity arm: one JSON line on stdout (the replay's own tally
+/// and the member's, its must-stay-0 counters included), the rows in
+/// `--out`; any failure prints its reason to stderr and exits nonzero.
+fn xmm_parity(args: XmmParityArgs) -> ExitCode {
+    let spec = cli::backtest::xmm_parity::ParitySpec {
+        run_dir: args.replay_dir,
+        xmm: args.xmm,
+        lo_ns: args.lo_ns,
+        hi_ns: args.hi_ns,
+        win: args.win,
+        out: args.out,
+        preroll_ns: args.preroll_s.saturating_mul(1_000_000_000),
+        tail_ns: args.tail_s.saturating_mul(1_000_000_000),
+        lat: cli::backtest::xmm_parity::ParityLatency::S1,
+    };
+    match cli::backtest::xmm_parity::run(&spec) {
+        Ok(s) => {
+            let m = s.member;
+            println!(
+                "{{\"win\":\"{}\",\"records\":{},\"no_venue_time\":{},\"placed\":{},\"fills\":{},\"rows\":{},\
+                 \"member\":{{\"placed\":{},\"modifies\":{},\"lead_cancels\":{},\"requote_cancels\":{},\
+                 \"pull_cancels\":{},\"expiry_cancels\":{},\"gated\":{},\"gate_overflow\":{},\"capped\":{},\
+                 \"rejected_alo\":{},\"rejected_other\":{},\"canceled\":{},\"filled\":{},\"fills\":{},\
+                 \"unmatched\":{},\"ctx_refused\":{},\"stuck\":{}}}}}",
+                spec.win, s.records, s.no_venue_time, s.placed, s.fills, s.rows,
+                m.placed, m.modifies, m.lead_cancels, m.requote_cancels, m.pull_cancels, m.expiry_cancels,
+                m.gated, m.gate_overflow, m.capped, m.rejected_alo, m.rejected_other, m.canceled, m.filled,
+                m.fills, m.unmatched, m.ctx_refused, m.stuck
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xmm-parity: {e}");
             ExitCode::from(1)
         }
     }

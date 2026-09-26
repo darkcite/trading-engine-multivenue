@@ -497,9 +497,40 @@ pub trait OrderDispatch {
     #[inline]
     fn observe_amm(&mut self, _sym: SymbolId, _payload: &[u8; 40], _now_ns: NsTs) {}
 
+    /// XMM XH2: show the dispatcher one trade print, so a PAPER one can
+    /// judge its post-only makers on a queue venue by the queue law
+    /// (`core_fill::queue`): prints consume the queue ahead, then fill.
+    ///
+    /// Defaulted to nothing for the reason [`Self::observe_tick`] is.
+    #[inline]
+    fn observe_trade(&mut self, _print: &core_types::TradePrint, _now_ns: NsTs) {}
+
+    /// XMM XH2: write the next order event (`RESTING`, `REJECTED`,
+    /// `CANCELED`, `FILLED`) about an order this dispatcher models into
+    /// `out` and say so — into the caller's storage rather than returned
+    /// inside an `Option` (128 B by value; `OrderEvent` has no niche), the
+    /// `TradePrint::read_trade_event` shape. The paper arm emits the
+    /// events the live gateway (XH4) will, so a member's order state
+    /// machine runs the same in both. Defaulted to none: an arm with no
+    /// order events has nothing to say.
+    #[inline]
+    fn try_next_order_event(&mut self, _out: &mut core_types::OrderEvent) -> bool {
+        false
+    }
+
+    /// XMM XH2: track the touch of `sym` for the queue law, so the first
+    /// post-only order placed on it meets a known book. Boot calls it
+    /// for every instrument a queue member may trade. Defaulted to
+    /// nothing: a live arm learns its queue from the venue.
+    #[inline]
+    fn track_queue_sym(&mut self, _sym: SymbolId) {}
+
     /// X1: what the paper matcher has done. All zeros for a dispatcher
     /// that does not model fills, which is how `/metrics` reads for a
     /// live boot.
+    // COPY: `MatcherCounters` (176 B, size-pinned) crosses the trait by
+    // value on the 5 s metrics cadence only — cold, and a reference
+    // would pin the matcher's borrow across the mirror.
     #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
         MatcherCounters::default()
@@ -1154,7 +1185,23 @@ pub struct MatcherCounters {
     /// HYPARB H2: AMM swaps canceled because their pool was not
     /// judgeable (never snapshotted, stale after a gap, edge-bound).
     pub amm_not_live: u64,
+    /// XMM XH2: post-only orders the queue law took (also in `intake`).
+    pub queue_placed: u64,
+    /// XMM XH2: queue orders that landed and rest.
+    pub queue_rested: u64,
+    /// XMM XH2: queue orders rejected on landing for crossing
+    /// (`BAD_ALO_PX`) — information, not a fault (XH-7).
+    pub queue_rejected_alo: u64,
+    /// XMM XH2: queue orders cancelled — requested, replaced or expired.
+    pub queue_canceled: u64,
+    /// XMM XH2: queue fills (also in `fills`).
+    pub queue_fills: u64,
+    /// XMM XH2: order events dropped because the event ring was full
+    /// between two pumps. Must stay 0: the engine pumps every iteration.
+    pub order_events_overflow: u64,
 }
+
+const _: () = assert!(::core::mem::size_of::<MatcherCounters>() == 176);
 
 /// One order the paper matcher is holding.
 #[repr(C)]
@@ -1244,7 +1291,7 @@ pub struct PaperMatcher {
     open: [Pending; core_fill::MAX_OPEN_TOTAL],
     open_len: usize,
     /// Fills waiting for [`Self::try_next_fill`], FIFO.
-    out: [Fill; core_fill::MAX_OPEN_TOTAL],
+    out: [Fill; FILL_OUT],
     out_head: usize,
     out_len: usize,
     /// Activation Δ by model venue byte ([`core_fill::ACTIVATION_NS_DEFAULT`]
@@ -1256,9 +1303,44 @@ pub struct PaperMatcher {
     /// signals ([`Self::observe_amm`]) — `core_fill::AmmBook`, the same
     /// book the harness replays.
     amm: core_fill::AmmBook,
+    /// XMM XH2: post-only makers on a queue venue, judged by the queue
+    /// law — `core_fill::QueueBook`, the same book the harness replays.
+    /// Its own table (32 orders, 8 symbols): the queue member cannot
+    /// crowd the strict-cross members' 64 slots, nor they its.
+    queue: core_fill::QueueBook,
+    /// XMM XH2: order events waiting for [`Self::try_next_order_event`],
+    /// FIFO.
+    events: [core_types::OrderEvent; ORDER_EVENT_OUT],
+    ev_head: usize,
+    ev_len: usize,
     /// What the matcher did.
     pub counters: MatcherCounters,
 }
+
+/// XMM XH2: the paper matcher's order-event ring. One engine iteration
+/// drains many ticks and prints before it pumps, and one queue call can
+/// emit three events per queue order, so the ring holds several calls'
+/// worth; an overflow is counted (`order_events_overflow`), never
+/// silent.
+const ORDER_EVENT_OUT: usize = 256;
+
+/// The paper matcher's fill ring. X1 sized it at [`core_fill::MAX_OPEN_TOTAL`]
+/// ("one tick can produce at most that many fills"); XMM XH2's prints
+/// can partially fill a queue order once per print, and one iteration
+/// drains many prints before the pump, so it is four times that. The
+/// size changes nothing until the old ring would have overflowed.
+const FILL_OUT: usize = 4 * core_fill::MAX_OPEN_TOTAL;
+
+const EMPTY_ORDER_EVENT: core_types::OrderEvent = core_types::OrderEvent::new(
+    0,
+    core_types::VenueId::Hyperliquid,
+    core_types::SYMBOL_ID_NONE,
+    0,
+    core_types::STRATEGY_ID_NONE,
+    core_types::ORDER_EVENT_NONE,
+    core_types::ORDER_EVENT_REASON_NONE,
+    0,
+);
 
 impl Default for PaperMatcher {
     fn default() -> Self {
@@ -1275,12 +1357,16 @@ impl PaperMatcher {
         Self {
             open: [EMPTY_PENDING; core_fill::MAX_OPEN_TOTAL],
             open_len: 0,
-            out: [EMPTY_FILL; core_fill::MAX_OPEN_TOTAL],
+            out: [EMPTY_FILL; FILL_OUT],
             out_head: 0,
             out_len: 0,
             activation_ns: d,
             seq: 0,
             amm: core_fill::AmmBook::new(),
+            queue: core_fill::QueueBook::new(),
+            events: [EMPTY_ORDER_EVENT; ORDER_EVENT_OUT],
+            ev_head: 0,
+            ev_len: 0,
             counters: MatcherCounters {
                 intake: 0,
                 rejected_open_cap: 0,
@@ -1298,6 +1384,12 @@ impl PaperMatcher {
                 amm_canceled: 0,
                 amm_partial: 0,
                 amm_not_live: 0,
+                queue_placed: 0,
+                queue_rested: 0,
+                queue_rejected_alo: 0,
+                queue_canceled: 0,
+                queue_fills: 0,
+                order_events_overflow: 0,
             },
         }
     }
@@ -1344,6 +1436,13 @@ impl PaperMatcher {
             || !kind_ok
         {
             self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            return;
+        }
+        // XMM XH2: a post-only maker on a queue venue is judged by the
+        // queue law, in its own table. No order before XH2 carried the
+        // flag, so every other path below is untouched.
+        if core_fill::judged_by_queue(venue, order.kind, order.flags) {
+            self.submit_queue(order, venue, now_ns);
             return;
         }
         let mut sym_count = 0usize;
@@ -1428,10 +1527,7 @@ impl PaperMatcher {
     pub fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
         let i = match self.find_resting(req.client_oid, req.strategy_id) {
             Resting::One(i) => i,
-            Resting::None => {
-                self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
-                return Err(DispatchError::NoSuchOrder);
-            }
+            Resting::None => return self.cancel_queue(req),
             Resting::Many => {
                 self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
                 return Err(DispatchError::AmbiguousOrder);
@@ -1487,10 +1583,7 @@ impl PaperMatcher {
     pub fn modify(&mut self, req: &ModifyReq, now_ns: NsTs) -> Result<(), DispatchError> {
         let i = match self.find_resting(req.prev_client_oid(), req.order().strategy_id) {
             Resting::One(i) => i,
-            Resting::None => {
-                self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
-                return Err(DispatchError::NoSuchOrder);
-            }
+            Resting::None => return self.modify_queue(req, now_ns),
             Resting::Many => {
                 self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
                 return Err(DispatchError::AmbiguousOrder);
@@ -1529,6 +1622,19 @@ impl PaperMatcher {
     /// fill pass in emit order over one shared displayed-size budget.
     pub fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
         let sym = tick.sym;
+        // XMM XH2: the queue law's book. Every record of the symbol lands
+        // what is due (a cancel or an expiry is never held back by a quiet
+        // or degraded feed); only fresh two-sided evidence teaches it the
+        // touch. One table lookup for any other venue.
+        if core_fill::queue_venue(core_types::symbol_venue_byte(sym)) {
+            let touch = if core_fill::is_fill_evidence(tick) {
+                core_fill::Touch::of(tick)
+            } else {
+                core_fill::Touch::default()
+            };
+            self.queue.on_book(sym, touch, now_ns);
+            self.drain_queue();
+        }
         let mut i = 0usize;
         while i < self.open_len {
             if self.open[i].ident.sym == sym
@@ -1667,37 +1773,282 @@ impl PaperMatcher {
         self.amm.counters
     }
 
+    /// XMM XH2: track `sym`'s touch for the queue law (see
+    /// [`OrderDispatch::track_queue_sym`]). A ninth symbol is refused
+    /// and counted with the open-cap refusals: its orders will be too.
+    pub fn track_queue_sym(&mut self, sym: SymbolId) {
+        if self.queue.track(sym).is_err() {
+            self.counters.rejected_open_cap = self.counters.rejected_open_cap.wrapping_add(1);
+        }
+    }
+
+    /// XMM XH2: one trade print for the queue law — the prints of a
+    /// queue venue consume the queue ahead of our post-only makers and
+    /// fill them. One table lookup for any other venue.
+    pub fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        if !core_fill::queue_venue(core_types::symbol_venue_byte(print.sym)) {
+            return;
+        }
+        let sell = print.aggressor == core_types::TRADE_AGGRESSOR_SELL;
+        self.queue.on_print(print.sym, print.px_1e6, print.qty_1e6, sell, now_ns);
+        self.drain_queue();
+    }
+
+    /// XMM XH2: write the next order event into `out`, FIFO; `false`
+    /// when there is none.
+    pub fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        if self.ev_len == 0 {
+            return false;
+        }
+        // COPY: one 64 B slot out of the ring into the caller's scratch —
+        // the event must outlive the slot, because the member is handed it
+        // through a ctx that holds `&mut` this dispatcher.
+        *out = self.events[self.ev_head];
+        self.ev_head = (self.ev_head + 1) % ORDER_EVENT_OUT;
+        self.ev_len -= 1;
+        true
+    }
+
+    /// XMM XH2: queue orders held (pending or resting).
+    #[inline]
+    #[must_use]
+    pub const fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// The counters, with the queue law's own folded in.
+    #[must_use]
+    pub const fn counters_snapshot(&self) -> MatcherCounters {
+        let q = self.queue.counters;
+        let mut c = self.counters;
+        c.queue_placed = q.placed;
+        c.queue_rested = q.rested;
+        c.queue_rejected_alo = q.rejected_alo;
+        c.queue_canceled = q.canceled;
+        c.queue_fills = q.fills;
+        c
+    }
+
+    /// XMM XH2: take a post-only maker into the queue law. It lands at
+    /// the first record of its symbol at or after `now + Δ_venue`; its
+    /// TTL is a cancel scheduled at `emit + ttl`. A refusal (the table
+    /// or its symbols are full) is counted and ANSWERED — the member
+    /// waits on an event for every post-only order it sends.
+    fn submit_queue(&mut self, order: &Order, venue: u8, now_ns: NsTs) {
+        let expiry = core_fill::expiry_at(order.ts_ns, order.ttl_ns);
+        let p = core_fill::QueuePlace {
+            client_oid: order.client_oid,
+            sym: order.sym,
+            side: order.side,
+            slot: order.strategy_id,
+            px_1e6: order.px.raw(),
+            qty_1e6: order.qty.raw(),
+            ready_ns: now_ns.saturating_add(self.activation_ns[venue as usize]),
+            expiry_ns: if expiry == 0 { core_fill::QUEUE_NEVER } else { expiry },
+        };
+        match self.queue.place(&p) {
+            Ok(()) => self.counters.intake = self.counters.intake.wrapping_add(1),
+            Err(_) => {
+                self.counters.rejected_open_cap = self.counters.rejected_open_cap.wrapping_add(1);
+                self.push_event(
+                    now_ns,
+                    order.sym,
+                    order.client_oid,
+                    order.strategy_id,
+                    core_types::ORDER_EVENT_REJECTED,
+                    core_types::ORDER_EVENT_REASON_OTHER,
+                );
+            }
+        }
+    }
+
+    /// XMM XH2: a cancel that found nothing in the strict table. A queue
+    /// order of that slot and id gets a cancel that lands at the first
+    /// record at or after `ts + Δ_venue` — ahead of that block's prints —
+    /// and `Ok` says the cancel was SENT: the order may still fill before
+    /// it lands, and its `CANCELED` (or `FILLED`) event is the answer.
+    fn cancel_queue(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        let o = match self.queue.lookup(req.client_oid, req.strategy_id) {
+            Ok(o) => o,
+            Err(core_fill::QueueRefusal::Ambiguous) => return self.ambiguous(),
+            Err(_) => return self.no_such(),
+        };
+        if o.sym != req.sym || core_types::symbol_venue_byte(o.sym) != req.venue {
+            self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
+            return Err(DispatchError::IdentityMismatch);
+        }
+        let venue = core_types::symbol_venue_byte(o.sym) as usize;
+        let at = req.ts_ns.saturating_add(self.activation_ns[venue]);
+        match self.queue.cancel(req.client_oid, req.strategy_id, at) {
+            Ok(()) => {
+                self.counters.cancels = self.counters.cancels.wrapping_add(1);
+                Ok(())
+            }
+            Err(_) => self.no_such(),
+        }
+    }
+
+    /// XMM XH2: a modify that found nothing in the strict table. On a
+    /// queue order it is the venue's modify: a cancel of the old order
+    /// and a new post-only order, both landing at `now + Δ_venue`, the
+    /// new one at the BACK of its queue and inheriting the old one's
+    /// expiry (E-7). Fail-closed: an old order no longer held is
+    /// `NoSuchOrder` and places nothing, and one that leaves the book
+    /// while the modify flies gets its replacement REJECTED on landing
+    /// (`core_fill::queue`). A full table is `QueueFull`, the old order
+    /// untouched.
+    fn modify_queue(&mut self, req: &ModifyReq, now_ns: NsTs) -> Result<(), DispatchError> {
+        let new = req.order();
+        let venue = core_types::symbol_venue_byte(new.sym);
+        let queued = core_fill::judged_by_queue(venue, new.kind, new.flags);
+        match self.queue.lookup(req.prev_client_oid(), new.strategy_id) {
+            Ok(o) => {
+                if !queued || o.sym != new.sym || o.side != new.side {
+                    self.counters.identity_mismatch = self.counters.identity_mismatch.wrapping_add(1);
+                    return Err(DispatchError::IdentityMismatch);
+                }
+            }
+            Err(core_fill::QueueRefusal::Ambiguous) => return self.ambiguous(),
+            // Fail-closed: the venue does not modify an order that is no
+            // longer on its book, so nothing is placed.
+            Err(_) => return self.no_such(),
+        }
+        let px = new.px.raw();
+        let qty = new.qty.raw();
+        if px <= 0 || qty <= 0 {
+            self.counters.unroutable = self.counters.unroutable.wrapping_add(1);
+            return Err(DispatchError::Unroutable);
+        }
+        let expiry = core_fill::expiry_at(new.ts_ns, new.ttl_ns);
+        let p = core_fill::QueuePlace {
+            client_oid: new.client_oid,
+            sym: new.sym,
+            side: new.side,
+            slot: new.strategy_id,
+            px_1e6: px,
+            qty_1e6: qty,
+            ready_ns: now_ns.saturating_add(self.activation_ns[venue as usize]),
+            expiry_ns: if expiry == 0 { core_fill::QUEUE_NEVER } else { expiry },
+        };
+        match self.queue.modify(req.prev_client_oid(), &p) {
+            Ok(()) => {
+                self.counters.modifies = self.counters.modifies.wrapping_add(1);
+                Ok(())
+            }
+            Err(_) => {
+                // The table is full: refused whole, and the old order is
+                // left exactly as it was — "a refused modify changes
+                // NOTHING" (E5). Said to the caller, not swallowed.
+                self.counters.rejected_open_cap = self.counters.rejected_open_cap.wrapping_add(1);
+                Err(DispatchError::QueueFull)
+            }
+        }
+    }
+
+    #[inline]
+    fn no_such(&mut self) -> Result<(), DispatchError> {
+        self.counters.no_such_order = self.counters.no_such_order.wrapping_add(1);
+        Err(DispatchError::NoSuchOrder)
+    }
+
+    #[inline]
+    fn ambiguous(&mut self) -> Result<(), DispatchError> {
+        self.counters.ambiguous_order = self.counters.ambiguous_order.wrapping_add(1);
+        Err(DispatchError::AmbiguousOrder)
+    }
+
+    /// Move the queue law's events out: a fill into the fill ring (the
+    /// engine pumps fills BEFORE order events, so a member sees a fill
+    /// before the `FILLED` it causes), everything else into the event
+    /// ring.
+    fn drain_queue(&mut self) {
+        while let Some(e) = self.queue.try_next_event() {
+            if e.kind == core_fill::QUEUE_EVENT_FILL {
+                self.push_fill_of(e.sym, e.side, e.client_oid, e.slot, e.px_1e6, e.qty_1e6, e.t_ns);
+            } else {
+                self.push_event(e.t_ns, e.sym, e.client_oid, e.slot, e.kind, e.reason);
+            }
+        }
+    }
+
+    #[inline]
+    fn push_event(
+        &mut self,
+        ts_ns: NsTs,
+        sym: SymbolId,
+        client_oid: u64,
+        strategy_id: u8,
+        kind: u8,
+        reason: u8,
+    ) {
+        if self.ev_len >= ORDER_EVENT_OUT {
+            debug_assert!(false, "paper matcher order-event ring overflowed");
+            self.counters.order_events_overflow = self.counters.order_events_overflow.wrapping_add(1);
+            return;
+        }
+        let venue = match core_types::VenueId::from_u8(core_types::symbol_venue_byte(sym)) {
+            Some(v) => v,
+            None => core_types::VenueId::Hyperliquid,
+        };
+        let slot = (self.ev_head + self.ev_len) % ORDER_EVENT_OUT;
+        self.events[slot] =
+            core_types::OrderEvent::new(ts_ns, venue, sym, client_oid, strategy_id, kind, reason, 0);
+        self.ev_len += 1;
+    }
+
     /// Pop the next modelled fill, FIFO.
     pub fn try_next_fill(&mut self) -> Option<Fill> {
         if self.out_len == 0 {
             return None;
         }
         let f = self.out[self.out_head];
-        self.out_head = (self.out_head + 1) % core_fill::MAX_OPEN_TOTAL;
+        self.out_head = (self.out_head + 1) % FILL_OUT;
         self.out_len -= 1;
         Some(f)
     }
 
     #[inline]
     fn push_fill(&mut self, o: &Pending, px_1e6: i64, qty_1e6: i64, now_ns: NsTs) {
-        if self.out_len >= core_fill::MAX_OPEN_TOTAL {
-            // The engine pumps every iteration and one tick can produce
-            // at most MAX_OPEN_TOTAL fills, so this is unreachable —
+        self.push_fill_of(
+            o.ident.sym,
+            o.ident.side,
+            o.client_oid,
+            o.ident.strategy_id,
+            px_1e6,
+            qty_1e6,
+            now_ns,
+        );
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn push_fill_of(
+        &mut self,
+        sym: SymbolId,
+        side: Side,
+        client_oid: u64,
+        strategy_id: u8,
+        px_1e6: i64,
+        qty_1e6: i64,
+        now_ns: NsTs,
+    ) {
+        if self.out_len >= FILL_OUT {
+            // The engine pumps every iteration, so this is unreachable —
             // which is exactly why it is counted rather than trusted.
             debug_assert!(false, "paper matcher out ring overflowed");
             self.counters.out_overflow = self.counters.out_overflow.wrapping_add(1);
             return;
         }
-        let slot = (self.out_head + self.out_len) % core_fill::MAX_OPEN_TOTAL;
+        let slot = (self.out_head + self.out_len) % FILL_OUT;
         self.out[slot] = Fill::new(
             now_ns,
-            o.ident.sym,
-            o.ident.side,
+            sym,
+            side,
             Price::from_raw(px_1e6),
             Qty::from_raw(qty_1e6),
-            o.client_oid,
+            client_oid,
         )
-        .with_attribution(o.ident.strategy_id, core_types::FILL_ORIGIN_PAPER);
+        .with_attribution(strategy_id, core_types::FILL_ORIGIN_PAPER);
         self.out_len += 1;
         self.counters.fills = self.counters.fills.wrapping_add(1);
     }
@@ -1720,8 +2071,13 @@ impl PaperMatcher {
 pub struct PaperDispatcher {
     stats: DispatchStats,
     /// X1: the matcher. Inline rather than boxed — the dispatcher is
-    /// itself boot-constructed once by the engine, and ~8 KiB of
-    /// fixed arrays inside it is the same memory either way.
+    /// itself boot-constructed once by the engine, and its fixed arrays
+    /// (≈ 60 KiB since XMM XH2: the strict table, the fill and
+    /// order-event rings, the AMM and queue books) are the same memory
+    /// either way. It moves by value only at boot — handed on a few times
+    /// before the loop starts (the boot's `engine_loop_set_full` →
+    /// `run_engine_loop` → `Engine::new`, plus `RoutedDispatcher::new` on
+    /// an armed boot), never after.
     matcher: PaperMatcher,
 }
 
@@ -1736,14 +2092,14 @@ impl PaperDispatcher {
     #[inline]
     #[must_use]
     pub const fn matcher_counters(&self) -> MatcherCounters {
-        self.matcher.counters
+        self.matcher.counters_snapshot()
     }
 
     /// X1: orders the matcher is currently holding.
     #[inline]
     #[must_use]
     pub const fn open_orders(&self) -> usize {
-        self.matcher.open_len()
+        self.matcher.open_len() + self.matcher.queue_len()
     }
 
     /// Construct empty.
@@ -1846,13 +2202,28 @@ impl OrderDispatch for PaperDispatcher {
     }
 
     #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        self.matcher.observe_trade(print, now_ns);
+    }
+
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.matcher.try_next_order_event(out)
+    }
+
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        self.matcher.track_queue_sym(sym);
+    }
+
+    #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
-        self.matcher.counters
+        self.matcher.counters_snapshot()
     }
 
     #[inline]
     fn open_paper_orders(&self) -> usize {
-        self.matcher.open_len()
+        self.matcher.open_len() + self.matcher.queue_len()
     }
 }
 
@@ -2742,5 +3113,326 @@ mod tests {
             );
             assert_eq!(d.matcher.amm_book_counters().snapshots, 1);
         }
+    }
+
+    // ---------------- XMM XH2: the queue law on the paper arm ----------------
+
+    const HL_PERP: SymbolId = 0x0400_0005;
+    /// Δ_hl is 340 ms.
+    const HL_DELTA: NsTs = 340_000_000;
+    const XMM_SLOT: u8 = 6;
+
+    fn hl_order(side: Side, px: i64, qty: i64, oid: u64, ts: NsTs) -> Order {
+        let mut o = Order::new(
+            ts,
+            VenueId::Hyperliquid,
+            HL_PERP,
+            side,
+            core_fill::ORDER_KIND_MAKER,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        )
+        .with_post_only();
+        o.strategy_id = XMM_SLOT;
+        o
+    }
+
+    fn hl_tick(bid: i64, bid_q: i64, ask: i64, ask_q: i64) -> Tick {
+        Tick::new(
+            1_000,
+            VenueId::Hyperliquid,
+            HL_PERP,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(bid_q),
+            Price::from_raw(ask),
+            Qty::from_raw(ask_q),
+        )
+    }
+
+    fn hl_print(px: i64, qty: i64, sell: bool) -> core_types::TradePrint {
+        core_types::TradePrint::new(
+            0,
+            VenueId::Hyperliquid,
+            HL_PERP,
+            7,
+            0,
+            px,
+            qty,
+            if sell { core_types::TRADE_AGGRESSOR_SELL } else { core_types::TRADE_AGGRESSOR_BUY },
+        )
+    }
+
+    /// A matcher tracking `HL_PERP` whose book is 100 (2 shown) / 101.
+    fn hl_matcher() -> PaperMatcher {
+        let mut m = PaperMatcher::new();
+        m.track_queue_sym(HL_PERP);
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 101_000_000, 2_000_000), 0);
+        m
+    }
+
+    fn next_event(m: &mut PaperMatcher) -> Option<core_types::OrderEvent> {
+        let mut e = core_types::OrderEvent::ZERO;
+        if m.try_next_order_event(&mut e) {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    fn next_event_of<D: OrderDispatch>(d: &mut D) -> Option<core_types::OrderEvent> {
+        let mut e = core_types::OrderEvent::ZERO;
+        if d.try_next_order_event(&mut e) {
+            Some(e)
+        } else {
+            None
+        }
+    }
+
+    fn event_kinds(m: &mut PaperMatcher) -> Vec<(u64, u8, u8)> {
+        let mut v = Vec::new();
+        while let Some(e) = next_event(m) {
+            assert_eq!((e.strategy_id, e.sym, e.venue), (XMM_SLOT, HL_PERP, VenueId::Hyperliquid as u8));
+            v.push((e.client_oid, e.kind, e.reason));
+        }
+        v
+    }
+
+    #[test]
+    fn a_post_only_hl_maker_joins_the_queue_and_fills_from_prints() {
+        let mut m = hl_matcher();
+        m.submit(&hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000), 1_000);
+        assert_eq!((m.open_len(), m.queue_len(), m.counters.intake), (0, 1, 1));
+        // Before Δ nothing lands; the first book at or after it does.
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 101_000_000, 2_000_000), HL_DELTA);
+        assert!(event_kinds(&mut m).is_empty());
+        m.observe_tick(&hl_tick(100_000_000, 3_000_000, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        assert_eq!(event_kinds(&mut m), [(9, core_types::ORDER_EVENT_RESTING, 0)]);
+        // A seller takes 2.5: 2 ahead, then half of ours — at OUR price.
+        m.observe_trade(&hl_print(100_000_000, 2_500_000, true), 500_000_000);
+        let f = m.try_next_fill().expect("a queue fill");
+        assert_eq!((f.px.raw(), f.qty.raw(), f.order_id, f.strategy_id), (100_000_000, 500_000, 9, XMM_SLOT));
+        assert_eq!(f.ts_ns, 500_000_000);
+        assert!(event_kinds(&mut m).is_empty(), "a partial fill is no order event");
+        m.observe_trade(&hl_print(100_000_000, 9_000_000, true), 600_000_000);
+        assert_eq!(m.try_next_fill().map(|f| f.qty.raw()), Some(500_000));
+        assert_eq!(event_kinds(&mut m), [(9, core_types::ORDER_EVENT_FILLED, 0)]);
+        assert_eq!(m.queue_len(), 0);
+        let c = m.counters_snapshot();
+        assert_eq!((c.queue_placed, c.queue_rested, c.queue_fills, c.fills), (1, 1, 2, 2));
+    }
+
+    #[test]
+    fn a_plain_hl_maker_keeps_the_strict_cross_law() {
+        let mut m = hl_matcher();
+        let mut o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        o.flags = 0;
+        m.submit(&o, 1_000);
+        assert_eq!((m.open_len(), m.queue_len()), (1, 0));
+        m.observe_tick(&hl_tick(100_000_000, 3_000_000, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        m.observe_trade(&hl_print(99_000_000, 9_000_000, true), 500_000_000);
+        assert!(m.try_next_fill().is_none(), "prints are the queue law's evidence only");
+        assert!(next_event(&mut m).is_none());
+    }
+
+    #[test]
+    fn a_crossing_post_only_order_is_rejected_bad_alo_px_as_an_event() {
+        let mut m = hl_matcher();
+        m.submit(&hl_order(Side::Bid, 101_000_000, 1_000_000, 9, 1_000), 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 3_000_000, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        assert_eq!(
+            event_kinds(&mut m),
+            [(9, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_BAD_ALO_PX)]
+        );
+        assert_eq!(m.counters_snapshot().queue_rejected_alo, 1);
+        assert_eq!(m.queue_len(), 0);
+    }
+
+    #[test]
+    fn a_queue_cancel_lands_after_delta_ahead_of_that_blocks_prints() {
+        let mut m = hl_matcher();
+        // Nothing shown at 100 when it lands, so nothing is ahead.
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), 500);
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        m.submit(&o, 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), HL_DELTA + 1_000);
+        event_kinds(&mut m);
+        let at = 400_000_000;
+        assert_eq!(m.cancel(&CancelReq::of(&o, at)), Ok(()));
+        assert_eq!(m.counters.cancels, 1);
+        // Before the cancel lands the order still fills …
+        m.observe_trade(&hl_print(100_000_000, 400_000, true), at + HL_DELTA - 1);
+        assert_eq!(m.try_next_fill().map(|f| f.qty.raw()), Some(400_000));
+        // … and the print of the block it lands in does not.
+        m.observe_trade(&hl_print(100_000_000, 9_000_000, true), at + HL_DELTA);
+        assert!(m.try_next_fill().is_none());
+        assert_eq!(
+            event_kinds(&mut m),
+            [(9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)]
+        );
+    }
+
+    #[test]
+    fn a_stale_or_one_sided_tick_still_lands_a_queue_cancel() {
+        let mut m = hl_matcher();
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), 500);
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        m.submit(&o, 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), HL_DELTA + 1_000);
+        event_kinds(&mut m);
+        m.cancel(&CancelReq::of(&o, 400_000_000)).expect("sent");
+        // A one-sided book lands it; it teaches the law no touch.
+        m.observe_tick(&hl_tick(0, 0, 101_000_000, 2_000_000), 400_000_000 + HL_DELTA);
+        assert_eq!(
+            event_kinds(&mut m),
+            [(9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)]
+        );
+    }
+
+    #[test]
+    fn a_queue_cancel_of_nothing_or_of_another_market_is_refused() {
+        let mut m = hl_matcher();
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        assert_eq!(m.cancel(&CancelReq::of(&o, 5)), Err(DispatchError::NoSuchOrder));
+        m.submit(&o, 1_000);
+        let mut other = o;
+        other.sym = 0x0400_0006;
+        assert_eq!(m.cancel(&CancelReq::of(&other, 5)), Err(DispatchError::IdentityMismatch));
+        m.submit(&hl_order(Side::Ask, 101_000_000, 1_000_000, 9, 1_000), 1_000);
+        assert_eq!(m.cancel(&CancelReq::of(&o, 5)), Err(DispatchError::AmbiguousOrder));
+        let c = m.counters_snapshot();
+        assert_eq!((c.no_such_order, c.identity_mismatch, c.ambiguous_order), (1, 1, 1));
+        assert_eq!(m.queue_len(), 2, "nothing was cancelled");
+    }
+
+    #[test]
+    fn a_queue_modify_replaces_and_a_lost_race_places_nothing() {
+        let mut m = hl_matcher();
+        let o = hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000);
+        m.submit(&o, 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 102_000_000, 2_000_000), HL_DELTA + 1_000);
+        event_kinds(&mut m);
+        let at = 400_000_000;
+        let new = hl_order(Side::Bid, 101_000_000, 1_000_000, 10, at);
+        assert_eq!(m.modify(&ModifyReq::new(9, new), at), Ok(()));
+        m.observe_tick(&hl_tick(100_000_000, 2_000_000, 102_000_000, 2_000_000), at + HL_DELTA);
+        assert_eq!(
+            event_kinds(&mut m),
+            [
+                (10, core_types::ORDER_EVENT_RESTING, 0),
+                (9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_REPLACED),
+            ]
+        );
+        assert_eq!(m.counters.modifies, 1);
+        // Fail-closed: the old id is gone now, so a modify of it is
+        // refused and places nothing.
+        let again = hl_order(Side::Bid, 100_000_000, 1_000_000, 11, at + HL_DELTA);
+        assert_eq!(
+            m.modify(&ModifyReq::new(9, again), at + HL_DELTA),
+            Err(DispatchError::NoSuchOrder)
+        );
+        assert_eq!((m.queue_len(), m.counters.no_such_order), (1, 1));
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_modify_and_leaves_the_old_order() {
+        let mut m = hl_matcher();
+        let mut oid = 1u64;
+        while m.queue_len() < core_fill::QUEUE_MAX_ORDERS {
+            m.submit(&hl_order(Side::Bid, 99_000_000, 1_000_000, oid, 1_000), 1_000);
+            oid += 1;
+        }
+        let new = hl_order(Side::Bid, 99_500_000, 1_000_000, 100, 5_000);
+        assert_eq!(m.modify(&ModifyReq::new(1, new), 5_000), Err(DispatchError::QueueFull));
+        let o = m.queue.get(1, XMM_SLOT).expect("the old order is untouched");
+        assert_eq!(o.cancel_ns, core_fill::QUEUE_NEVER);
+        assert!(next_event(&mut m).is_none(), "said to the caller, not as an event");
+    }
+
+    #[test]
+    fn a_queue_modify_that_changes_side_or_drops_the_flag_is_refused() {
+        let mut m = hl_matcher();
+        m.submit(&hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000), 1_000);
+        let flip = hl_order(Side::Ask, 102_000_000, 1_000_000, 10, 5);
+        assert_eq!(m.modify(&ModifyReq::new(9, flip), 5), Err(DispatchError::IdentityMismatch));
+        let mut plain = hl_order(Side::Bid, 99_000_000, 1_000_000, 10, 5);
+        plain.flags = 0;
+        assert_eq!(m.modify(&ModifyReq::new(9, plain), 5), Err(DispatchError::IdentityMismatch));
+        // A plain modify of nothing is the strict table's answer, as before XH2.
+        assert_eq!(m.modify(&ModifyReq::new(77, plain), 5), Err(DispatchError::NoSuchOrder));
+        assert_eq!(m.queue_len(), 1);
+    }
+
+    #[test]
+    fn prints_of_other_venues_and_untracked_books_do_nothing() {
+        let mut m = PaperMatcher::new();
+        let mut p = hl_print(100_000_000, 1_000_000, true);
+        p.sym = DERIBIT_PERP;
+        m.observe_trade(&p, 5);
+        m.observe_trade(&hl_print(100_000_000, 1_000_000, true), 5);
+        m.observe_tick(&hl_tick(100_000_000, 1, 101_000_000, 1), 5);
+        assert!(m.try_next_fill().is_none());
+        assert!(next_event(&mut m).is_none());
+        // Placing tracks the symbol itself, but the first arrival then
+        // meets no book: it rests unchecked.
+        m.submit(&hl_order(Side::Bid, 105_000_000, 1_000_000, 9, 1_000), 1_000);
+        m.observe_tick(&hl_tick(100_000_000, 1, 101_000_000, 1), AFTER_DELTA + 60_000_000);
+        assert_eq!(event_kinds(&mut m), [(9, core_types::ORDER_EVENT_RESTING, 0)]);
+    }
+
+    #[test]
+    fn a_full_queue_answers_with_a_rejected_event() {
+        let mut m = hl_matcher();
+        let mut oid = 1u64;
+        while m.queue_len() < core_fill::QUEUE_MAX_ORDERS {
+            m.submit(&hl_order(Side::Bid, 99_000_000, 1_000_000, oid, 1_000), 1_000);
+            oid += 1;
+        }
+        m.submit(&hl_order(Side::Bid, 99_000_000, 1_000_000, oid, 1_000), 1_000);
+        assert_eq!(
+            event_kinds(&mut m),
+            [(oid, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_OTHER)]
+        );
+        assert_eq!(m.counters.rejected_open_cap, 1);
+    }
+
+    #[test]
+    fn the_paper_dispatcher_forwards_the_queue_law() {
+        let mut d = PaperDispatcher::new();
+        d.track_queue_sym(HL_PERP);
+        d.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), 0);
+        d.submit(&hl_order(Side::Bid, 100_000_000, 1_000_000, 9, 1_000)).expect("paper submit");
+        assert_eq!(d.open_paper_orders(), 1);
+        assert_eq!(d.open_orders(), 1);
+        d.observe_tick(&hl_tick(100_000_000, 0, 101_000_000, 2_000_000), AFTER_DELTA + 60_000_000);
+        d.observe_trade(&hl_print(100_000_000, 1_000_000, true), 500_000_000);
+        assert_eq!(d.try_next_fill().map(|f| f.qty.raw()), Some(1_000_000));
+        assert_eq!(next_event_of(&mut d).map(|e| e.kind), Some(core_types::ORDER_EVENT_RESTING));
+        assert_eq!(next_event_of(&mut d).map(|e| e.kind), Some(core_types::ORDER_EVENT_FILLED));
+        assert!(next_event_of(&mut d).is_none());
+        assert_eq!(OrderDispatch::matcher_counters(&d).queue_fills, 1);
+        assert_eq!(d.matcher_counters().queue_placed, 1);
+    }
+
+    #[test]
+    fn the_trait_defaults_carry_no_queue_law() {
+        struct Deaf;
+        impl OrderDispatch for Deaf {
+            fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+                Ok(())
+            }
+            fn try_next_fill(&mut self) -> Option<Fill> {
+                None
+            }
+            fn stats(&self) -> DispatchStats {
+                DispatchStats::default()
+            }
+        }
+        let mut d = Deaf;
+        d.track_queue_sym(HL_PERP);
+        d.observe_trade(&hl_print(100_000_000, 1_000_000, true), 5);
+        assert!(next_event_of(&mut d).is_none());
+        assert_eq!(d.matcher_counters(), MatcherCounters::default());
     }
 }

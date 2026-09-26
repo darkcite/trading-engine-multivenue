@@ -1351,7 +1351,7 @@ fn rule_tree_on_signal_is_zero_alloc() {
 /// while latency is sampled.
 #[test]
 fn engine_tick_with_latency_record_is_zero_alloc() {
-    use clob_dispatcher::PaperDispatcher;
+    use clob_dispatcher::{OrderDispatch, PaperDispatcher};
     use engine::{
         Engine, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
     };
@@ -1462,6 +1462,13 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     );
     eng.set_trade_lane(tr_c);
     eng.set_order_event_lane(oe_c);
+    // XMM XH2: the paper arm's queue law on a tracked Hyperliquid perp —
+    // each iteration a post-only bid lands on the print that goes
+    // through it, so the dispatcher's order-event pump runs its `true`
+    // arm (RESTING, FILLED) and the fill pump its queue fill, inside the
+    // measured window.
+    let hl_sym = core_types::make_symbol_id(VenueId::Hyperliquid, 1);
+    eng.dispatcher_mut().track_queue_sym(hl_sym);
     eng.start().unwrap();
 
     // Prime + drain a few ticks outside the measurement window.
@@ -1506,13 +1513,26 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             0,
         )));
         assert!(d0_p.try_push_ref(&core_types::DepthTopK::EMPTY));
+        let mut bid = core_types::Order::new(
+            0,
+            VenueId::Hyperliquid,
+            hl_sym,
+            core_types::Side::Bid,
+            0,
+            Price::from_raw(100_000_000),
+            Qty::from_raw(1_000_000),
+            u64::from(i) + 1,
+        )
+        .with_post_only();
+        bid.strategy_id = 6;
+        eng.dispatcher_mut().submit(&bid).unwrap();
         assert!(tr_p.try_push_ref(&core_types::TradePrint::new(
             (i as u64) * 1000,
             VenueId::Hyperliquid,
-            1,
+            hl_sym,
             u64::from(i),
             0,
-            100_000_000,
+            99_900_000,
             1_000_000,
             core_types::TRADE_AGGRESSOR_SELL,
         )));
@@ -1526,14 +1546,19 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             core_types::ORDER_EVENT_REASON_NONE,
             0,
         )));
-        eng.tick(1);
+        // Budget 2: one record per lane, and the paper arm's two events.
+        eng.tick(2);
         acc = acc.wrapping_add(eng.ingest_p50_ns());
     }
     std::hint::black_box(acc);
     assert_eq!(eng.events_dispatched, 10_000, "event lane drained");
     assert_eq!(eng.depths_dispatched, 10_000, "depth lane drained");
     assert_eq!(eng.trades_dispatched, 10_000, "trade lane drained");
-    assert_eq!(eng.order_events_dispatched, 10_000, "order-event lane drained");
+    assert_eq!(
+        eng.order_events_dispatched, 30_000,
+        "the lane's 10 000, and the paper arm's RESTING + FILLED per bid"
+    );
+    assert_eq!(eng.fills_dispatched, 10_000, "one queue fill per bid");
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
@@ -3116,8 +3141,8 @@ fn strategy_set_fanout_is_zero_alloc() {
 /// **XMM gate 73 (XH1)** — the set's new paths after boot: the trade
 /// fan-out, the order-event router (a slot-6 event routed, a slot-7 one
 /// counted unrouted) and the per-slot timer gate (hyparb's 1 s period
-/// firing on every other call, xmm's `u64::MAX` never) — allocate
-/// nothing.
+/// firing on every other call; xmm's 100 ms safety timer, XH2, on every
+/// call with no feed to judge) — allocate nothing.
 #[test]
 fn xmm_slot_trade_order_event_and_slot_timers_are_zero_alloc() {
     use core_types::{Order, OrderEvent, TradePrint, SYMBOL_ID_NONE};
@@ -3170,6 +3195,7 @@ fn xmm_slot_trade_order_event_and_slot_timers_are_zero_alloc() {
         xp.perps[0] = strategy_xmm::XmmPerp {
             hl_sym: core_types::make_symbol_id(VenueId::Hyperliquid, 5),
             lead_sym: core_types::make_symbol_id(VenueId::Binance, 9),
+            lot_1e6: 10_000,
         };
         xp.n_perps = 1;
         xp.maker_enabled = 1;
@@ -3234,12 +3260,624 @@ fn xmm_slot_trade_order_event_and_slot_timers_are_zero_alloc() {
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(set.enabled_mask(), BIT_HYPARB | BIT_XMM);
     assert_eq!(set.order_events_unrouted(), CYCLES, "slot 7 is nobody's");
-    assert_eq!(ctx.submitted, 0, "xmm is dark at XH1; hyparb observes only");
+    assert_eq!(ctx.submitted, 0, "no feed reached xmm; hyparb observes only");
     assert_eq!(
         allocs, 0,
         "xmm slot paths allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0, "xmm slot paths bytes should be zero: saw {bytes}");
+}
+
+/// **XMM gate 74 (XH2)** — the queue law after boot: placements landing
+/// against the book, prints consuming the queue ahead and then filling,
+/// a modify, a requested cancel and the event drain — allocate nothing.
+#[test]
+fn xmm_queue_law_place_land_fill_modify_cancel_are_zero_alloc() {
+    use core_fill::{QueueBook, QueuePlace, Touch, QUEUE_NEVER};
+    use core_types::Side;
+
+    const U: i64 = 1_000_000;
+    const CYCLES: u64 = 10_000;
+    let sym = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let book = Touch {
+        bid_1e6: 100 * U,
+        ask_1e6: 101 * U,
+        bid_qty_1e6: 2 * U,
+        ask_qty_1e6: 2 * U,
+    };
+    // Boot (allocation allowed).
+    let mut q = QueueBook::new();
+    q.track(sym).expect("gate 74 track");
+    q.on_book(sym, book, 0);
+
+    let mut kinds = 0u64;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        let t = (i + 1) * 1_000;
+        let oid = i * 4;
+        let bid = QueuePlace {
+            client_oid: oid + 1,
+            sym,
+            side: Side::Bid,
+            slot: 6,
+            px_1e6: 100 * U,
+            qty_1e6: U,
+            ready_ns: t,
+            expiry_ns: QUEUE_NEVER,
+        };
+        let ask = QueuePlace {
+            client_oid: oid + 2,
+            side: Side::Ask,
+            px_1e6: 101 * U,
+            expiry_ns: t + 500,
+            ..bid
+        };
+        q.place(&bid).expect("gate 74 bid");
+        q.place(&ask).expect("gate 74 ask");
+        q.on_book(sym, book, t); // both land, 2 shown ahead of each
+        q.on_print(sym, 100 * U, 3 * U, true, t + 100); // 2 ahead, then our 1: FILLED
+        let requote = QueuePlace {
+            client_oid: oid + 3,
+            px_1e6: 102 * U,
+            ready_ns: t + 200,
+            expiry_ns: QUEUE_NEVER,
+            ..ask
+        };
+        q.modify(oid + 2, &requote).expect("gate 74 modify");
+        q.on_book(sym, book, t + 200); // the new ask lands, the old one is replaced
+        q.cancel(oid + 3, 6, t + 300).expect("gate 74 cancel");
+        q.on_print(sym, 101 * U, U, false, t + 300); // the cancel lands ahead of the print
+        while let Some(e) = q.try_next_event() {
+            kinds += u64::from(e.kind);
+        }
+        i += 1;
+    }
+    std::hint::black_box(kinds);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(q.is_empty(), "every cycle ends flat");
+    assert_eq!(q.counters.filled, CYCLES);
+    assert_eq!(q.counters.canceled, 2 * CYCLES);
+    assert_eq!(q.counters.out_overflow, 0);
+    assert_eq!(allocs, 0, "queue law allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "queue law bytes should be zero: saw {bytes}");
+}
+
+/// **XMM gate 75 (XH2)** — the member's hot paths after `on_start`:
+/// leader and follower updates (placements at the touch, the gate's ring
+/// lookups), the LEAD cancel, order events, fills and the safety timer
+/// — allocate nothing. (The gate's history rings are allocated once, in
+/// `configure`.)
+#[test]
+fn xmm_member_place_lead_cancel_events_fills_are_zero_alloc() {
+    use core_types::{CancelReq, Fill, Order, OrderEvent, Side, ORDER_EVENT_CANCELED,
+        ORDER_EVENT_FILLED, ORDER_EVENT_RESTING};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// Remembers the last two client ids it was handed, in fixed slots.
+    struct OidCtx {
+        now: u64,
+        oids: [u64; 2],
+        n: usize,
+        cancels: u64,
+    }
+    impl Ctx for OidCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            self.oids[self.n & 1] = o.client_oid;
+            self.n += 1;
+            Ok(())
+        }
+        fn cancel(&mut self, _r: CancelReq) -> Result<(), SubmitErr> {
+            self.cancels += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let bn = core_types::make_symbol_id(VenueId::Binance, 9);
+    // Boot (allocation allowed).
+    let mut xp = strategy_xmm::XmmParams::EMPTY;
+    xp.perps[0] = strategy_xmm::XmmPerp {
+        hl_sym: hl,
+        lead_sym: bn,
+        lot_1e6: 10_000,
+    };
+    xp.n_perps = 1;
+    xp.maker_enabled = 1;
+    xp.theta_bps_1e6 = 500_000;
+    // A 1 ms window: the gate's ring lookups run every placement, and
+    // the flat leader a step earlier leaves both sides open.
+    xp.gate_window_ms = 1;
+    xp.lifetime_ms = 30_000;
+    xp.lead_stale_ms = 300;
+    xp.follower_stale_ms = 2_000;
+    xp.rtt_pull_ms = 1_500;
+    xp.requote_min_ms = 250;
+    xp.clip_usd_1e6 = 15_000_000;
+    xp.inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.gross_inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.resting_cap_usd_1e6 = 1_000_000_000_000;
+    let mut m = strategy_xmm::XmmStrategy::new();
+    m.configure(&xp).expect("gate 75 params");
+    let t0: u64 = 1_000_000_000_000;
+    let mut ctx = OidCtx {
+        now: t0,
+        oids: [0; 2],
+        n: 0,
+        cancels: 0,
+    };
+    m.on_start(&mut ctx).expect("gate 75 start");
+    let book = |sym: u32, bid: i64, ask: i64| {
+        Tick::new(
+            0,
+            if sym == hl { VenueId::Hyperliquid } else { VenueId::Binance },
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let lead_flat = book(bn, 99_990_000, 100_010_000);
+    let lead_down = book(bn, 99_980_000, 100_000_000);
+    let fol = book(hl, 99_990_000, 100_010_000);
+    let ev = |oid: u64, kind: u8| OrderEvent::new(0, VenueId::Hyperliquid, hl, oid, 6, kind, 0, 0);
+
+    const CYCLES: u64 = 10_000;
+    const STEP: u64 = 10_000_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        ctx.now = t0 + i * 8 * STEP;
+        m.on_tick(&lead_flat, &mut ctx);
+        ctx.now += STEP;
+        m.on_tick(&fol, &mut ctx); // both sides placed at the touch
+        let (bid, ask) = (ctx.oids[0], ctx.oids[1]);
+        m.on_order_event(&ev(bid, ORDER_EVENT_RESTING), &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_RESTING), &mut ctx);
+        ctx.now += STEP;
+        m.on_tick(&lead_down, &mut ctx); // −1 bp: the LEAD rule pulls the bid
+        let f = Fill::new(ctx.now, hl, Side::Ask, Price::from_raw(100_010_000), Qty::from_raw(140_000), ask);
+        m.on_fill(&f, &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_FILLED), &mut ctx);
+        m.on_order_event(&ev(bid, ORDER_EVENT_CANCELED), &mut ctx);
+        m.on_timer(ctx.now, &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.cancels);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = m.counters();
+    assert_eq!(c.placed, 2 * CYCLES, "both sides every cycle");
+    assert_eq!(c.lead_cancels, CYCLES, "the bid pulled every cycle");
+    assert_eq!((c.filled, c.canceled, c.stuck), (CYCLES, CYCLES, 0));
+    assert_eq!(allocs, 0, "xmm member allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "xmm member bytes should be zero: saw {bytes}");
+}
+
+/// **XMM gate 75b (XH2)** — the member's other hot branches: a requote
+/// by MODIFY (the touch moved past `requote_min`), the replaced order's
+/// end, a stale-flagged leader tick that pulls both sides, and the
+/// safety timer's pass — allocate nothing.
+#[test]
+fn xmm_member_requote_replaced_and_stale_pull_are_zero_alloc() {
+    use core_types::{CancelReq, Order, OrderEvent, ORDER_EVENT_CANCELED, ORDER_EVENT_RESTING};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// Remembers the last ids it was handed in fixed slots: placements
+    /// by side, the latest modify's new id.
+    struct ModCtx {
+        now: u64,
+        placed: [u64; 2],
+        n: usize,
+        modified: u64,
+        cancels: u64,
+    }
+    impl Ctx for ModCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            self.placed[self.n & 1] = o.client_oid;
+            self.n += 1;
+            Ok(())
+        }
+        fn cancel(&mut self, _r: CancelReq) -> Result<(), SubmitErr> {
+            self.cancels += 1;
+            Ok(())
+        }
+        fn modify(&mut self, _prev: u64, o: Order) -> Result<(), SubmitErr> {
+            self.modified = o.client_oid;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let bn = core_types::make_symbol_id(VenueId::Binance, 9);
+    let mut xp = strategy_xmm::XmmParams::EMPTY;
+    xp.perps[0] = strategy_xmm::XmmPerp {
+        hl_sym: hl,
+        lead_sym: bn,
+        lot_1e6: 10_000,
+    };
+    xp.n_perps = 1;
+    xp.maker_enabled = 1;
+    xp.theta_bps_1e6 = 500_000;
+    xp.gate_window_ms = 1;
+    xp.lifetime_ms = 30_000;
+    xp.lead_stale_ms = 300;
+    xp.follower_stale_ms = 2_000;
+    xp.rtt_pull_ms = 1_500;
+    xp.requote_min_ms = 250;
+    xp.clip_usd_1e6 = 15_000_000;
+    xp.inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.gross_inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.resting_cap_usd_1e6 = 1_000_000_000_000;
+    let mut m = strategy_xmm::XmmStrategy::new();
+    m.configure(&xp).expect("gate 75b params");
+    let t0: u64 = 1_000_000_000_000;
+    let mut ctx = ModCtx {
+        now: t0,
+        placed: [0; 2],
+        n: 0,
+        modified: 0,
+        cancels: 0,
+    };
+    m.on_start(&mut ctx).expect("gate 75b start");
+    let book = |sym: u32, bid: i64, ask: i64, stale: bool| {
+        let mut t = Tick::new(
+            0,
+            if sym == hl { VenueId::Hyperliquid } else { VenueId::Binance },
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        );
+        if stale {
+            t.flags |= core_types::TICK_FLAG_STALE;
+        }
+        t
+    };
+    let lead = book(bn, 99_990_000, 100_010_000, false);
+    let lead_stale = book(bn, 99_990_000, 100_010_000, true);
+    let fol = book(hl, 99_990_000, 100_010_000, false);
+    let fol_up = book(hl, 99_995_000, 100_010_000, false);
+    let ev = |oid: u64, kind: u8, reason: u8| {
+        OrderEvent::new(0, VenueId::Hyperliquid, hl, oid, 6, kind, reason, 0)
+    };
+
+    const CYCLES: u64 = 10_000;
+    const MS: u64 = 1_000_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        ctx.now = t0 + i * 1_000 * MS;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol, &mut ctx); // both sides placed
+        let (bid, ask) = (ctx.placed[0], ctx.placed[1]);
+        m.on_order_event(&ev(bid, ORDER_EVENT_RESTING, 0), &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_RESTING, 0), &mut ctx);
+        ctx.now += 300 * MS;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol_up, &mut ctx); // the bid touch rose: MODIFY
+        let new = ctx.modified;
+        m.on_order_event(&ev(bid, ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_REPLACED), &mut ctx);
+        m.on_order_event(&ev(new, ORDER_EVENT_RESTING, 0), &mut ctx);
+        ctx.now += 10 * MS;
+        m.on_tick(&lead_stale, &mut ctx); // a stale leader pulls both
+        m.on_timer(ctx.now, &mut ctx);
+        m.on_order_event(&ev(new, ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED), &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED), &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.cancels);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = m.counters();
+    assert_eq!(c.modifies, CYCLES, "one requote by modify per cycle");
+    assert_eq!(c.pull_cancels, 2 * CYCLES, "the stale leader pulled both sides");
+    assert_eq!((c.stuck, c.unmatched), (0, 0));
+    assert_eq!(allocs, 0, "xmm member branches allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "xmm member branches bytes should be zero: saw {bytes}");
+}
+
+/// **XMM gate 75c (XH2)** — the member's fail-safe branches: a refused
+/// replacement handing the side back to its predecessor (and the blind
+/// cancel that sends it), the member's own TTL cancel (LAW E-8), the
+/// stuck watchdog's release and blind cancels, and the gate failing
+/// closed on a leader burst that overwrote its history — allocate
+/// nothing.
+#[test]
+fn xmm_member_refused_replacement_ttl_stuck_and_gate_overflow_are_zero_alloc() {
+    use core_types::{CancelReq, Order, OrderEvent, ORDER_EVENT_CANCELED, ORDER_EVENT_REJECTED,
+        ORDER_EVENT_RESTING};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// Remembers the last ids it was handed in fixed slots: placements
+    /// by side, the latest modify's new id.
+    struct ModCtx {
+        now: u64,
+        placed: [u64; 2],
+        n: usize,
+        modified: u64,
+        cancels: u64,
+    }
+    impl Ctx for ModCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            self.placed[self.n & 1] = o.client_oid;
+            self.n += 1;
+            Ok(())
+        }
+        fn cancel(&mut self, _r: CancelReq) -> Result<(), SubmitErr> {
+            self.cancels += 1;
+            Ok(())
+        }
+        fn modify(&mut self, _prev: u64, o: Order) -> Result<(), SubmitErr> {
+            self.modified = o.client_oid;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let bn = core_types::make_symbol_id(VenueId::Binance, 9);
+    let mut xp = strategy_xmm::XmmParams::EMPTY;
+    xp.perps[0] = strategy_xmm::XmmPerp {
+        hl_sym: hl,
+        lead_sym: bn,
+        lot_1e6: 10_000,
+    };
+    xp.n_perps = 1;
+    xp.maker_enabled = 1;
+    xp.theta_bps_1e6 = 500_000;
+    xp.gate_window_ms = 1;
+    // A 1 s TTL, and feeds that stay fresh for 2 s: the timer's TTL and
+    // watchdog branches run, its stale pull never does.
+    xp.lifetime_ms = 1_000;
+    xp.lead_stale_ms = 2_000;
+    xp.follower_stale_ms = 2_000;
+    xp.rtt_pull_ms = 1_500;
+    xp.requote_min_ms = 250;
+    xp.clip_usd_1e6 = 15_000_000;
+    xp.inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.gross_inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.resting_cap_usd_1e6 = 1_000_000_000_000;
+    let mut m = strategy_xmm::XmmStrategy::new();
+    m.configure(&xp).expect("gate 75c params");
+    let t0: u64 = 1_000_000_000_000;
+    let mut ctx = ModCtx {
+        now: t0,
+        placed: [0; 2],
+        n: 0,
+        modified: 0,
+        cancels: 0,
+    };
+    m.on_start(&mut ctx).expect("gate 75c start");
+    let book = |sym: u32, bid: i64, ask: i64| {
+        Tick::new(
+            0,
+            if sym == hl { VenueId::Hyperliquid } else { VenueId::Binance },
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let lead = book(bn, 99_990_000, 100_010_000);
+    let fol = book(hl, 99_990_000, 100_010_000);
+    let fol_up = book(hl, 99_995_000, 100_010_000);
+    let ev = |oid: u64, kind: u8, reason: u8| {
+        OrderEvent::new(0, VenueId::Hyperliquid, hl, oid, 6, kind, reason, 0)
+    };
+
+    const CYCLES: u64 = 10_000;
+    const MS: u64 = 1_000_000;
+    const SEC: u64 = 1_000 * MS;
+    // Every 625th cycle (16 in all) a leader burst one past the gate's
+    // 8 192-sample ring lands inside one 1 ms gate window.
+    const BURST_EVERY: u64 = 625;
+    const BURST: u64 = 8_193;
+    let g = AllocGuard::new();
+    let mut bursts = 0u64;
+    let mut i = 0u64;
+    while i < CYCLES {
+        let t = t0 + i * 20 * SEC;
+        ctx.now = t;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol, &mut ctx); // both sides placed
+        let (bid, ask) = (ctx.placed[0], ctx.placed[1]);
+        m.on_order_event(&ev(bid, ORDER_EVENT_RESTING, 0), &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_RESTING, 0), &mut ctx);
+        ctx.now = t + 300 * MS;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol_up, &mut ctx); // the bid requoted by MODIFY ...
+        let new = ctx.modified;
+        // ... whose replacement is refused: the predecessor is the
+        // side's order again, and is cancelled blind.
+        m.on_order_event(&ev(new, ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_OTHER), &mut ctx);
+        m.on_order_event(&ev(bid, ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED), &mut ctx);
+        ctx.now = t + 1_200 * MS;
+        m.on_timer(ctx.now, &mut ctx); // the ask's TTL: the member cancels it
+        m.on_order_event(&ev(ask, ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_EXPIRED), &mut ctx);
+        // Placed again, and no event ever comes: the member's TTL cancel
+        // at +1 s, the watchdog's release (and blind cancels) 10 s later.
+        let mut sec = 2u64;
+        while sec <= 14 {
+            ctx.now = t + sec * SEC;
+            m.on_tick(&lead, &mut ctx);
+            m.on_tick(&fol, &mut ctx);
+            m.on_timer(ctx.now, &mut ctx);
+            sec += 1;
+        }
+        if i % BURST_EVERY == 0 {
+            let tb = t + 15 * SEC;
+            let mut j = 0u64;
+            while j < BURST {
+                ctx.now = tb + j * 100;
+                m.on_tick(&lead, &mut ctx);
+                j += 1;
+            }
+            ctx.now = tb + BURST * 100;
+            m.on_tick(&fol, &mut ctx); // both sides: history lost, gated
+            bursts += 1;
+        }
+        i += 1;
+    }
+    std::hint::black_box(ctx.cancels);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = m.counters();
+    assert_eq!(c.placed, 4 * CYCLES, "two placements per side per cycle");
+    assert_eq!((c.modifies, c.rejected_other), (CYCLES, CYCLES), "one refused replacement per cycle");
+    assert_eq!(c.requote_cancels, CYCLES, "the predecessor cancelled after its refused replacement");
+    assert_eq!(c.expiry_cancels, 3 * CYCLES, "the member's own TTL cancels");
+    assert_eq!(c.stuck, 2 * CYCLES, "the watchdog released both sides");
+    assert_eq!(c.gate_overflow, 2 * bursts, "the gate failed closed on both sides");
+    assert_eq!((c.pull_cancels, c.unmatched, c.ctx_refused), (0, 0, 0));
+    assert_eq!(allocs, 0, "xmm fail-safe branches allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "xmm fail-safe branches bytes should be zero: saw {bytes}");
+}
+
+/// **XMM gate 76 (XH2)** — the paper dispatcher's queue path after boot:
+/// post-only submits (one crossing → `BAD_ALO_PX`), landing on a book, a
+/// partial fill and FILLED from prints, a modify, a refused modify of a
+/// vanished order, a cancel landed by a stale book, a replacement
+/// REJECTED on landing because its predecessor filled in flight, a modify
+/// refused by a full table, and both pumps — allocate nothing.
+#[test]
+fn paper_dispatcher_queue_path_is_zero_alloc() {
+    use clob_dispatcher::{OrderDispatch, PaperDispatcher};
+    use core_types::{CancelReq, ModifyReq, Order, OrderEvent, Side, TradePrint};
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let order = |side: Side, px: i64, oid: u64, ts: u64| {
+        let mut o = Order::new(
+            ts,
+            VenueId::Hyperliquid,
+            hl,
+            side,
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(2_000_000),
+            oid,
+        )
+        .with_post_only();
+        o.strategy_id = 6;
+        o
+    };
+    let book = |bid: i64, ask: i64, stale: bool| {
+        let mut t = Tick::new(
+            0,
+            VenueId::Hyperliquid,
+            hl,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(0),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        );
+        if stale {
+            t.flags |= core_types::TICK_FLAG_STALE;
+        }
+        t
+    };
+    let print = |px: i64, qty: i64| {
+        TradePrint::new(0, VenueId::Hyperliquid, hl, 1, 0, px, qty, core_types::TRADE_AGGRESSOR_SELL)
+    };
+    // Boot (allocation allowed).
+    let mut d = PaperDispatcher::new();
+    d.track_queue_sym(hl);
+    d.observe_tick(&book(100_000_000, 101_000_000, false), 0);
+    const DELTA: u64 = 340_000_000;
+    const CYCLES: u64 = 10_000;
+    const TABLE: u64 = core_fill::QUEUE_MAX_ORDERS as u64;
+    let mut ev = OrderEvent::ZERO;
+    let mut kinds = 0u64;
+    let mut stale_rejects = 0u64;
+    let mut full = 0u64;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        let t = (i + 1) * 16 * DELTA;
+        let oid = i * 64;
+        d.submit(&order(Side::Bid, 100_000_000, oid + 1, t)).unwrap();
+        d.submit(&order(Side::Bid, 101_000_000, oid + 2, t)).unwrap(); // crosses the ask
+        d.submit(&order(Side::Ask, 102_000_000, oid + 3, t)).unwrap();
+        d.observe_tick(&book(100_000_000, 101_000_000, false), t + DELTA);
+        d.observe_trade(&print(100_000_000, 1_000_000), t + DELTA + 1); // partial
+        d.observe_trade(&print(100_000_000, 5_000_000), t + DELTA + 2); // the rest: FILLED
+        let requote = order(Side::Ask, 101_500_000, oid + 4, t + 2 * DELTA);
+        d.modify(&ModifyReq::new(oid + 3, requote)).unwrap();
+        let _ = d.modify(&ModifyReq::new(oid + 1, order(Side::Bid, 99_000_000, oid + 5, t + 2 * DELTA)));
+        d.observe_tick(&book(100_000_000, 101_000_000, false), t + 3 * DELTA);
+        d.cancel(&CancelReq::of(&requote, t + 3 * DELTA)).unwrap();
+        d.observe_tick(&book(100_000_000, 101_000_000, true), t + 4 * DELTA + 1);
+        // A modify whose predecessor fills while it flies: the
+        // replacement is REJECTED on landing (fail-closed).
+        d.submit(&order(Side::Bid, 100_000_000, oid + 6, t + 5 * DELTA)).unwrap();
+        d.observe_tick(&book(100_000_000, 101_000_000, false), t + 6 * DELTA);
+        let late = order(Side::Bid, 99_500_000, oid + 7, t + 6 * DELTA + 1);
+        d.modify(&ModifyReq::new(oid + 6, late)).unwrap();
+        d.observe_trade(&print(100_000_000, 5_000_000), t + 6 * DELTA + 2);
+        d.observe_tick(&book(100_000_000, 101_000_000, false), t + 7 * DELTA + 2);
+        // A full table: a modify needs a free row, so it is refused whole.
+        let mut k = 0u64;
+        while k < TABLE {
+            d.submit(&order(Side::Bid, 90_000_000, oid + 8 + k, t + 8 * DELTA)).unwrap();
+            k += 1;
+        }
+        d.observe_tick(&book(100_000_000, 101_000_000, false), t + 9 * DELTA);
+        let refused = order(Side::Bid, 91_000_000, oid + 8 + TABLE, t + 9 * DELTA + 1);
+        if d.modify(&ModifyReq::new(oid + 8, refused)).is_err() {
+            full += 1;
+        }
+        k = 0;
+        while k < TABLE {
+            let o = order(Side::Bid, 90_000_000, oid + 8 + k, t + 9 * DELTA + 2);
+            d.cancel(&CancelReq::of(&o, t + 9 * DELTA + 2)).unwrap();
+            k += 1;
+        }
+        d.observe_tick(&book(100_000_000, 101_000_000, false), t + 11 * DELTA);
+        while let Some(f) = d.try_next_fill() {
+            kinds = kinds.wrapping_add(f.qty.raw() as u64);
+        }
+        while d.try_next_order_event(&mut ev) {
+            kinds = kinds.wrapping_add(u64::from(ev.kind));
+            if ev.kind == core_types::ORDER_EVENT_REJECTED && ev.reason == core_types::ORDER_EVENT_REASON_OTHER {
+                stale_rejects += 1;
+            }
+        }
+        i += 1;
+    }
+    std::hint::black_box(kinds);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = d.matcher_counters();
+    assert_eq!(c.queue_rejected_alo, CYCLES, "one crossing bid per cycle");
+    assert_eq!(c.queue_fills, 3 * CYCLES, "a partial, the rest, and the in-flight predecessor");
+    assert_eq!(
+        c.queue_canceled,
+        (2 + TABLE) * CYCLES,
+        "the replaced ask, its cancelled requote, and the full table"
+    );
+    assert_eq!(stale_rejects, CYCLES, "the in-flight replacement, rejected on landing");
+    assert_eq!(full, CYCLES, "the full table's modify, refused");
+    assert_eq!(c.no_such_order, CYCLES, "the vanished bid's modify, refused");
+    assert_eq!((c.out_overflow, c.order_events_overflow), (0, 0));
+    assert_eq!(d.open_paper_orders(), 0, "every cycle ends flat");
+    assert_eq!(allocs, 0, "paper queue path allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "paper queue path bytes should be zero: saw {bytes}");
 }
 
 /// Phase 8f item 6: the engine-thread fills capture

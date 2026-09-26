@@ -1106,7 +1106,29 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         self.paper.observe_amm(sym, payload, now_ns);
     }
 
+    /// XMM XH2: every trade print reaches the paper matcher, ungated,
+    /// for the same reason every tick does — the queue law's fills come
+    /// from prints. The live arm learns its fills from the venue.
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        self.paper.observe_trade(print, now_ns);
+    }
+
+    /// XMM XH2: the paper arm's order events first, then the live arm's
+    /// (the XH4 gateway's) — the `try_next_fill` order.
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.paper.try_next_order_event(out) || self.live.try_next_order_event(out)
+    }
+
+    /// XMM XH2: the queue law's instruments are the paper arm's to track.
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        self.paper.track_queue_sym(sym);
+    }
+
     /// LAW E-2 — the paper arm's numbers, never the live arm's.
+    // COPY: 176 B by value, the metrics cadence only (the trait's note).
     #[inline]
     fn matcher_counters(&self) -> MatcherCounters {
         self.paper.matcher_counters()

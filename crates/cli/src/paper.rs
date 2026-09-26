@@ -3053,7 +3053,7 @@ fn configure_rule_tree<const N: usize>(
 #[allow(clippy::too_many_arguments)]
 pub fn engine_loop_set_full<D: OrderDispatch>(
     cons: Consumers,
-    disp: D,
+    mut disp: D,
     obs: Observability,
     requested_mask: u8,
     vrp: Option<&crate::vrp_boot::VrpBoot>,
@@ -3311,6 +3311,13 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         if let Err(e) = set.xmm_mut().configure(&boot.params) {
             tracing::error!(error = %e, "xmm: artifact refused");
             return EngineLoopResult::Failed("xmm: artifact refused by the strategy");
+        }
+        // XMM XH2: the queue law tracks the member's perps from boot, so
+        // the first post-only order on each meets a known book.
+        let mut i = 0usize;
+        while i < boot.params.n_perps as usize {
+            disp.track_queue_sym(boot.params.perps[i].hl_sym);
+            i += 1;
         }
         tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
     }
@@ -4980,6 +4987,14 @@ pub struct PaperMatcherMetricIds {
     /// HYPARB H6: `engine_paper_matcher_amm_{fills,canceled,partial,
     /// not_live}_total` — the AMM fill law's verdicts (H2), in that order.
     pub amm: [core_metrics::CounterId; 4],
+    /// XMM XH2: `engine_paper_matcher_queue_{placed,rested,rejected_alo,
+    /// canceled,fills}_total` — the queue law's own tally, in that order —
+    /// and `engine_paper_matcher_order_events_overflow_total` (must stay 0).
+    pub queue: [core_metrics::CounterId; 6],
+    /// XMM XH2: `engine_set_order_events_unrouted_total` — order events
+    /// that reached the set for a slot not enabled or not built, or
+    /// attributed to none. Counted, never fanned out.
+    pub order_events_unrouted: core_metrics::CounterId,
 }
 
 /// Register the paper-matcher family. Boot-only.
@@ -5013,8 +5028,19 @@ fn register_paper_matcher_metrics(
         one("engine_paper_matcher_amm_partial_total")?,
         one("engine_paper_matcher_amm_not_live_total")?,
     ];
+    let queue = [
+        one("engine_paper_matcher_queue_placed_total")?,
+        one("engine_paper_matcher_queue_rested_total")?,
+        one("engine_paper_matcher_queue_rejected_alo_total")?,
+        one("engine_paper_matcher_queue_canceled_total")?,
+        one("engine_paper_matcher_queue_fills_total")?,
+        one("engine_paper_matcher_order_events_overflow_total")?,
+    ];
+    let order_events_unrouted = one("engine_set_order_events_unrouted_total")?;
     Ok(PaperMatcherMetricIds {
         amm,
+        queue,
+        order_events_unrouted,
         intake,
         fills,
         ioc_canceled,
@@ -5306,12 +5332,14 @@ fn mirror_paper_matcher_metrics(
     ids: &PaperMatcherMetricIds,
     cur: clob_dispatcher::MatcherCounters,
     open_orders: usize,
-    fills_unrouted: u64,
+    unrouted: [u64; 2],
     lifecycle: engine::LifecycleCounters,
     last: &mut clob_dispatcher::MatcherCounters,
-    last_unrouted: &mut u64,
+    last_unrouted: &mut [u64; 2],
     last_lifecycle: &mut engine::LifecycleCounters,
 ) {
+    // `unrouted` = [fills, order events] the set could not route.
+    let fills_unrouted = unrouted[0];
     reg.counter(ids.intake)
         .inc(cur.intake.saturating_sub(last.intake));
     reg.counter(ids.fills)
@@ -5327,7 +5355,9 @@ fn mirror_paper_matcher_metrics(
     reg.counter(ids.out_overflow)
         .inc(cur.out_overflow.saturating_sub(last.out_overflow));
     reg.counter(ids.fills_unrouted)
-        .inc(fills_unrouted.saturating_sub(*last_unrouted));
+        .inc(fills_unrouted.saturating_sub(last_unrouted[0]));
+    reg.counter(ids.order_events_unrouted)
+        .inc(unrouted[1].saturating_sub(last_unrouted[1]));
     reg.counter(ids.cancels)
         .inc(cur.cancels.saturating_sub(last.cancels));
     reg.counter(ids.modifies)
@@ -5347,6 +5377,19 @@ fn mirror_paper_matcher_metrics(
         .inc(cur.amm_partial.saturating_sub(last.amm_partial));
     reg.counter(ids.amm[3])
         .inc(cur.amm_not_live.saturating_sub(last.amm_not_live));
+    // XMM XH2: the queue law's verdicts.
+    reg.counter(ids.queue[0])
+        .inc(cur.queue_placed.saturating_sub(last.queue_placed));
+    reg.counter(ids.queue[1])
+        .inc(cur.queue_rested.saturating_sub(last.queue_rested));
+    reg.counter(ids.queue[2])
+        .inc(cur.queue_rejected_alo.saturating_sub(last.queue_rejected_alo));
+    reg.counter(ids.queue[3])
+        .inc(cur.queue_canceled.saturating_sub(last.queue_canceled));
+    reg.counter(ids.queue[4])
+        .inc(cur.queue_fills.saturating_sub(last.queue_fills));
+    reg.counter(ids.queue[5])
+        .inc(cur.order_events_overflow.saturating_sub(last.order_events_overflow));
     // E5: the engine-level tally, which counts verbs on BOTH arms —
     // the matcher family above sees only the paper one, so a live
     // slot's cancels would otherwise be invisible here.
@@ -5366,7 +5409,7 @@ fn mirror_paper_matcher_metrics(
             .saturating_sub(last_lifecycle.modifies_err));
     reg.gauge(ids.open_orders).set(open_orders as i64);
     *last = cur;
-    *last_unrouted = fills_unrouted;
+    *last_unrouted = unrouted;
     *last_lifecycle = lifecycle;
 }
 
@@ -7302,7 +7345,7 @@ where
     // X1: the paper matcher's delta snapshot.
     let mut matcher_last = clob_dispatcher::MatcherCounters::default();
     let mut lifecycle_last = engine::LifecycleCounters::default();
-    let mut fills_unrouted_last: u64 = 0;
+    let mut fills_unrouted_last: [u64; 2] = [0; 2];
     // E1: the router's previous snapshot, for the monotonic deltas.
     let mut exec_last = clob_dispatcher::ExecCounters::default();
     // F18/F21: ONE call site for every member's persisted state, so a
@@ -7495,7 +7538,10 @@ where
                     &ids.paper_matcher,
                     clob_dispatcher::OrderDispatch::matcher_counters(eng.dispatcher()),
                     clob_dispatcher::OrderDispatch::open_paper_orders(eng.dispatcher()),
-                    strategy_core::StrategyCounters::fills_unrouted(eng.strategy()),
+                    [
+                        strategy_core::StrategyCounters::fills_unrouted(eng.strategy()),
+                        strategy_core::StrategyCounters::order_events_unrouted(eng.strategy()),
+                    ],
                     eng.lifecycle_counters(),
                     &mut matcher_last,
                     &mut fills_unrouted_last,

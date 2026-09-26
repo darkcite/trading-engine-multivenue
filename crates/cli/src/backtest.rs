@@ -54,6 +54,7 @@ pub mod member;
 pub mod opt;
 pub mod regime;
 pub mod stale;
+pub mod xmm_parity;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;

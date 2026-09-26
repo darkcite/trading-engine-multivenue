@@ -271,10 +271,12 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
             }
             RecPayload::Trade(p) => {
                 // XMM XH1: the trade lane, merged for `--member xmm` only.
+                // XH2: the model sees the print first — the engine's
+                // order — so the queue law's fills land in the scratch.
                 let mut print = *p;
                 print.ts_ns = rec.wall_ns;
+                engine.on_trade(&print, rec.virt_ns, rec.wall_ns, &mut fills_scratch);
                 strat.on_trade(&print, ctx);
-                fills_scratch.clear();
             }
             RecPayload::Depth(d) => {
                 let mut depth = *d;
@@ -324,6 +326,18 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
                 f.client_oid,
             );
             strat.on_fill(&fill, ctx);
+            while consumed < ctx.orders().len() {
+                let order = ctx.orders()[consumed];
+                engine.intake(&order, rec.virt_ns);
+                consumed += 1;
+            }
+        }
+        // XMM XH2: the model's order events AFTER the record's fills —
+        // the engine pumps fills before order events, so a member sees a
+        // fill before the FILLED it causes. Only the queue law emits any.
+        let mut ev = core_types::OrderEvent::ZERO;
+        while engine.pop_order_event(&mut ev) {
+            strat.on_order_event(&ev, ctx);
             while consumed < ctx.orders().len() {
                 let order = ctx.orders()[consumed];
                 engine.intake(&order, rec.virt_ns);
@@ -978,12 +992,45 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     params.clip_usd_1e6,
                     params.ab_mode,
                 );
+                // XH2: the queue law tracks the quoted perps from the first
+                // record, as the boot does on the engine's dispatcher.
+                let mut k = 0usize;
+                while k < params.n_perps as usize {
+                    engine.track_queue_sym(params.perps[k].hl_sym);
+                    k += 1;
+                }
                 let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
                 let hl_trades: u64 = run_summaries.iter().map(|r| r.hl_trades).sum();
+                let q = engine.queue_replay();
+                let m = strat.counters();
                 let counters = format!(
-                    "member: xmm phase=XH1(dark) hl_trades={hl_trades} orders_emitted={} \
+                    "member: xmm hl_trades={hl_trades} orders_emitted={} queue_placed={} \
+                     queue_rested={} queue_rejected_alo={} queue_stale_modify={} queue_canceled={} \
+                     queue_fills={} queue_filled={} order_events={} queue_open_at_end={} \
+                     modifies={} lead_cancels={} requote_cancels={} pull_cancels={} expiry_cancels={} \
+                     gated={} gate_overflow={} capped={} unmatched={} ctx_refused={} stuck={} \
                      regime=not-replayed(v1)",
                     out.orders_emitted,
+                    q.book.placed,
+                    q.book.rested,
+                    q.book.rejected_alo,
+                    q.book.stale_modify,
+                    q.book.canceled,
+                    q.fills,
+                    q.book.filled,
+                    q.events,
+                    q.open_at_end,
+                    m.modifies,
+                    m.lead_cancels,
+                    m.requote_cancels,
+                    m.pull_cancels,
+                    m.expiry_cancels,
+                    m.gated,
+                    m.gate_overflow,
+                    m.capped,
+                    m.unmatched,
+                    m.ctx_refused,
+                    m.stuck,
                 );
                 (hash_hex, line, out, counters)
             }

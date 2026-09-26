@@ -88,17 +88,22 @@ pub struct XmmCoin {
     /// The Binance USDⓈ-M stream symbol — the leader is
     /// `binance-usdm:<lead>`.
     pub lead: &'static str,
+    /// The venue's size lot ×1e6 — `10^(6 − szDecimals)` from
+    /// Hyperliquid's `/info` `meta` universe (venue-checked 2026-09-26:
+    /// BTC 5, ETH 4, SOL 2, XRP 0, ADA 0, LTC 2, DOGE 0). The live arm
+    /// re-checks it against the venue at its own boot (XH4).
+    pub lot_1e6: i64,
 }
 
 /// The perps XMM measured (plan §1.1), in key order.
 pub const XMM_COINS: [XmmCoin; 7] = [
-    XmmCoin { key: "quote_btc", hl_coin: "BTC", lead: "btcusdt" },
-    XmmCoin { key: "quote_eth", hl_coin: "ETH", lead: "ethusdt" },
-    XmmCoin { key: "quote_sol", hl_coin: "SOL", lead: "solusdt" },
-    XmmCoin { key: "quote_xrp", hl_coin: "XRP", lead: "xrpusdt" },
-    XmmCoin { key: "quote_ada", hl_coin: "ADA", lead: "adausdt" },
-    XmmCoin { key: "quote_ltc", hl_coin: "LTC", lead: "ltcusdt" },
-    XmmCoin { key: "quote_doge", hl_coin: "DOGE", lead: "dogeusdt" },
+    XmmCoin { key: "quote_btc", hl_coin: "BTC", lead: "btcusdt", lot_1e6: 10 },
+    XmmCoin { key: "quote_eth", hl_coin: "ETH", lead: "ethusdt", lot_1e6: 100 },
+    XmmCoin { key: "quote_sol", hl_coin: "SOL", lead: "solusdt", lot_1e6: 10_000 },
+    XmmCoin { key: "quote_xrp", hl_coin: "XRP", lead: "xrpusdt", lot_1e6: 1_000_000 },
+    XmmCoin { key: "quote_ada", hl_coin: "ADA", lead: "adausdt", lot_1e6: 1_000_000 },
+    XmmCoin { key: "quote_ltc", hl_coin: "LTC", lead: "ltcusdt", lot_1e6: 10_000 },
+    XmmCoin { key: "quote_doge", hl_coin: "DOGE", lead: "dogeusdt", lot_1e6: 1_000_000 },
 ];
 
 const _: () = assert!(XMM_COINS.len() <= XMM_MAX_PERPS);
@@ -376,6 +381,9 @@ mod tests {
             let c = XMM_COINS[i];
             assert_eq!(c.key, format!("quote_{}", c.hl_coin.to_lowercase()));
             assert_eq!(c.lead, format!("{}usdt", c.hl_coin.to_lowercase()));
+            // A lot is a positive power of ten ×1e6 (szDecimals 0..=6).
+            assert!(c.lot_1e6 > 0 && c.lot_1e6 <= 1_000_000);
+            assert_eq!(1_000_000 % c.lot_1e6, 0, "{} lot", c.hl_coin);
             assert!(XMM_KEYS.contains(&c.key));
             i += 1;
         }

@@ -325,6 +325,14 @@ pub trait StrategyCounters {
         0
     }
 
+    /// XMM XH2: order events that reached the strategy SET for a slot
+    /// that is not enabled or not built, or attributed to no slot —
+    /// counted, never fanned out (the X1 law).
+    #[inline]
+    fn order_events_unrouted(&self) -> u64 {
+        0
+    }
+
     /// VRP V8a: render that state. `false` = there is nothing to
     /// persist (no VRP member, or it is unconfigured), and the cli
     /// leaves the file alone.

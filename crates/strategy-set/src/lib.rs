@@ -888,6 +888,10 @@ impl StrategyCounters for StrategySet {
         self.fills_unrouted
     }
     #[inline]
+    fn order_events_unrouted(&self) -> u64 {
+        self.order_events_unrouted
+    }
+    #[inline]
     fn render_vrp_state(&self, out: &mut String) -> bool {
         StrategyCounters::render_vrp_state(&self.vrp, out)
     }
@@ -2893,6 +2897,7 @@ mod tests {
         p.perps[0] = strategy_xmm::XmmPerp {
             hl_sym: XMM_HL,
             lead_sym: make_symbol_id(VenueId::Binance, 5),
+            lot_1e6: 10_000,
         };
         p.n_perps = 1;
         p.maker_enabled = 1;
@@ -2927,7 +2932,7 @@ mod tests {
     /// cli never puts it in the configured mask without its artifact);
     /// configured it starts and, at XH1, stays dark — no order, no timer.
     #[test]
-    fn xmm_slot_refuses_unconfigured_and_is_dark_configured() {
+    fn xmm_slot_refuses_unconfigured_and_quotes_once_it_has_both_feeds() {
         let mut s = StrategySet::new(BIT_XMM);
         assert!(matches!(
             s.on_start(&mut ctx()),
@@ -2937,12 +2942,23 @@ mod tests {
         s.xmm_mut().configure(&xmm_params()).expect("xmm params");
         let mut c = ctx();
         assert!(s.on_start(&mut c).is_ok());
+        // XH2: no leader yet — the follower and the tape alone place nothing.
         s.on_tick(&tick(VenueId::Hyperliquid, XMM_HL, 185_990_000, 186_000_000), &mut c);
         s.on_trade(&print(1), &mut c);
         s.on_timer(c.now, &mut c);
         assert_eq!(c.submitted, 0);
-        assert_eq!(s.orders_emitted(), 0);
-        assert_eq!(s.timer_period_ns(), s_timer_without_xsd(), "xmm arms no timer at XH1");
+        // With its leader fresh, both sides go out at the touch.
+        let lead = make_symbol_id(VenueId::Binance, 5);
+        s.on_tick(&tick(VenueId::Binance, lead, 185_980_000, 186_010_000), &mut c);
+        s.on_tick(&tick(VenueId::Hyperliquid, XMM_HL, 185_990_000, 186_000_000), &mut c);
+        assert_eq!(c.submitted, 2);
+        assert_eq!(s.orders_emitted(), 2);
+        assert_eq!(
+            s.timer_period_ns(),
+            strategy_xmm::XMM_TIMER_NS,
+            "xmm's safety timer is the set's shortest"
+        );
+        assert!(s.timer_period_ns() < s_timer_without_xsd());
     }
 
     /// A print reaches every enabled member and changes nothing for the
@@ -2995,6 +3011,8 @@ mod tests {
         assert_eq!(s.order_events_unrouted(), 2, "slot 7 is not built");
         s.on_order_event(&ev(core_types::STRATEGY_ID_NONE), &mut c);
         assert_eq!(s.order_events_unrouted(), 3, "an unattributed event is never fanned out");
+        // XMM XH2: the same count through the trait the metrics read.
+        assert_eq!(StrategyCounters::order_events_unrouted(&s), 3);
         assert_eq!(c.submitted, 0);
     }
 

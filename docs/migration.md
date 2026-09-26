@@ -6,6 +6,42 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — The queue law; `ORDER_FLAG_POST_ONLY`; paper order events; the xmm policy; `xmm-parity` (XMM XH2)
+
+**What changed**
+
+- `Order.flags` bit 1 = `ORDER_FLAG_POST_ONLY` (byte 14 — every older
+  `Order` reads 0). A maker carrying it on Hyperliquid is judged by the
+  queue law (`core_fill::queue`) in BOTH the engine's paper matcher and
+  the harness; every other order keeps the strict-cross law. Only the
+  xmm member sets it, so no existing member's paper fills move.
+- The paper matcher emits order events (`RESTING`, `REJECTED`,
+  `CANCELED`, `FILLED`) for queue orders — the order-event lane's first
+  producer — pumped after the fill pump. The exec router forwards trade
+  prints to the paper arm (`observe_trade`).
+- `/metrics` gains `engine_paper_matcher_queue_{placed,rested,
+  rejected_alo,canceled,fills}_total`,
+  `engine_paper_matcher_order_events_overflow_total` (must stay 0) and
+  `engine_set_order_events_unrouted_total`.
+  `engine_paper_matcher_open_orders` now counts queue orders too.
+- `MatcherCounters` gains six fields (repr(C); no size assert; not on
+  any wire).
+- The paper matcher's fill ring is 256 (was 64); behaviour is unchanged
+  until the old ring would have overflowed.
+- `strategy-xmm` implements the LEAD θ policy (plan §5.2); with
+  `maker_enabled = 1` it places post-only orders and arms a 100 ms safety
+  timer. `XmmPerp` gains `lot_1e6` (from the HL `szDecimals` table in
+  `core_config::xmm::XMM_COINS`); `XmmParams` gains three research-only
+  fields (`sim_parity`, `quote_from_ns`, `quote_until_ns`) that
+  `xmm.toml` cannot set.
+- New verb `multivenue-engine xmm-parity` (research: the XH2 parity
+  replay). The frozen `backtest` argv and outputs are unchanged.
+
+**Operator action**: none. No `strategy.conf` names xmm until XH3.
+
+**Rollback**: revert the XH2 commit; nothing on disk changes format
+(the flag bit was padding).
+
 ## 2026-09-26 — Strategy slot 6 = `xmm`; `icdp` unlinked; the trade and order-event lanes; `Order.flags`; HL perp depth captured (XMM XH1)
 
 **What changed**

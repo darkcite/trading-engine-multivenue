@@ -125,13 +125,17 @@ a v2 root is an upper bound.** Metrics:
 Engine-side delay per venue: `docs/venue-latency.md` §5. Capture windows
 for research are ≤ 2 h by law (VT plan §6.1).
 
-**Slot 6 — `strategy-xmm` (XMM XH1, 2026-09-26; DARK).** The
+**Slot 6 — `strategy-xmm` (XMM XH1/XH2, 2026-09-26; paper only).** The
 Binance-led post-only market maker on Hyperliquid perps (plan
 `xmm-hl-maker-plan-2026-09-26.md`, rulings O-XH1…O-XH15). Parameters come
 from `~/multivenue/xmm.toml` (`--xmm <path>`; `xmm.toml.example` is the
-probe); a requested xmm bit with no artifact refuses the boot. At XH1 the
-member is configured and places nothing; its engine lanes (trade prints,
-order events) and `backtest --member xmm` are in place.
+probe); a requested xmm bit with no artifact refuses the boot. Since XH2
+the member runs the LEAD θ policy (post-only at the touch, the LEAD
+cancel, the 500 ms gate, hard caps, stale-feed pulls), judged on paper by
+the queue law (`core_fill::queue`: queue ahead, prints, post-only
+rejects) in both the engine's paper matcher and `backtest --member xmm`;
+`multivenue-engine xmm-parity` replays one window on the XMM simulator's
+clock for the parity gate. A live slot 6 refuses the boot until XH4.
 
 **`strategy-icdp` (ICDP I1–I7, 2026-09-03) — unlinked at XMM XH1.** Its
 crate, tests and `backtest --member icdp --icdp <path>` stay; no engine

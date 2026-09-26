@@ -35,6 +35,11 @@ const _: () =
     assert!(core_config::xmm::XMM_LIFETIME_MAX_MS == strategy_xmm::XMM_LIFETIME_MAX_MS as i64);
 const _: () = assert!(core_config::xmm::XMM_MIN_CLIP_USD_1E6 == strategy_xmm::XMM_MIN_CLIP_USD_1E6);
 const _: () = assert!(core_config::xmm::XMM_AB_MODE_MAX == strategy_xmm::XMM_AB_MODE_MAX as i64);
+// XMM XH2: the queue law's tables hold every order the member can have
+// out — each perp tracked, and two sides × (an order + a modify's
+// predecessor) per perp — so an eighth perp can never meet a full table.
+const _: () = assert!(strategy_xmm::XMM_MAX_PERPS <= core_fill::QUEUE_MAX_SYMS);
+const _: () = assert!(4 * strategy_xmm::XMM_MAX_PERPS <= core_fill::QUEUE_MAX_ORDERS);
 
 /// Everything slot 6 needs to be configured.
 #[derive(Debug, Clone)]
@@ -116,7 +121,11 @@ pub fn build_params(
                 coin.key
             )
         })?;
-        p.perps[n] = XmmPerp { hl_sym, lead_sym };
+        p.perps[n] = XmmPerp {
+            hl_sym,
+            lead_sym,
+            lot_1e6: coin.lot_1e6,
+        };
         n += 1;
         coins.push(coin.hl_coin);
     }
@@ -216,6 +225,7 @@ mod tests {
             XmmPerp {
                 hl_sym: make_symbol_id(VenueId::Hyperliquid, 5),
                 lead_sym: make_symbol_id(VenueId::Binance, 102),
+                lot_1e6: 10_000,
             }
         );
         assert_eq!(boot.params.perps[4], XmmPerp::EMPTY);

@@ -93,6 +93,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 
 use core_types::{symbol_venue_byte, InstrumentClass, Order, Side, Tick, SYMBOL_ID_NONE};
 
@@ -855,6 +856,38 @@ pub struct FillEngine {
     amm: Box<core_fill::AmmBook>,
     /// HYPARB H2 — see [`FillEngine::amm_replay`].
     amm_replay: AmmReplay,
+    /// XMM XH2: post-only makers on a queue venue, judged by the queue
+    /// law — the SAME `core_fill::QueueBook` the engine's paper matcher
+    /// keeps. Boxed: 7 KiB of fixed arrays.
+    queue: Box<core_fill::QueueBook>,
+    /// XMM XH2: the §3.4 bucket of each held queue order, by
+    /// `(slot, client id)` (the book keeps no bucket of its own).
+    queue_oos: BTreeMap<(u8, u64), bool>,
+    /// XMM XH2: order events for the member, FIFO — the driver hands
+    /// them over after the record's fills ([`Self::pop_order_event`]).
+    order_events: VecDeque<core_types::OrderEvent>,
+    /// XMM XH2 — see [`FillEngine::queue_replay`].
+    queue_replay: QueueReplay,
+    /// XMM XH2 parity: the queue law's travel time for the verb being
+    /// taken, when the caller gives it ([`Self::intake_delayed`]).
+    queue_delay: Option<u64>,
+}
+
+/// XMM XH2: what the queue law did in this replay.
+///
+/// Not in [`ModelOutcome`] (the frozen schema-1 line), for the reason
+/// [`AmmReplay`] is not; the queue fills themselves ARE in the outcome.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueueReplay {
+    /// The queue book's own tally.
+    pub book: core_fill::QueueCounters,
+    /// Queue fills booked (whole or partial).
+    pub fills: u64,
+    /// Order events handed to the member.
+    pub events: u64,
+    /// Queue orders held when read (at the end of a replay: the ones
+    /// still open, which `canceled_end` also counts).
+    pub open_at_end: u64,
 }
 
 /// HYPARB H2: what the AMM arm did in this replay.
@@ -968,6 +1001,11 @@ impl FillEngine {
             ttl_expired: 0,
             amm: Box::new(core_fill::AmmBook::new()),
             amm_replay: AmmReplay::default(),
+            queue: Box::new(core_fill::QueueBook::new()),
+            queue_oos: BTreeMap::new(),
+            order_events: VecDeque::new(),
+            queue_replay: QueueReplay::default(),
+            queue_delay: None,
         }
     }
 
@@ -1102,7 +1140,7 @@ impl FillEngine {
     /// it.
     pub fn intake(&mut self, order: &Order, emit_virt: u64) {
         match order.verb {
-            core_types::ORDER_VERB_CANCEL => self.intake_cancel(order),
+            core_types::ORDER_VERB_CANCEL => self.intake_cancel(order, emit_virt),
             core_types::ORDER_VERB_MODIFY => self.intake_modify(order, emit_virt),
             // PLACE, and anything a future wire version adds that
             // this build does not know. An unknown verb is NOT
@@ -1123,13 +1161,31 @@ impl FillEngine {
     /// paper arm and this one agree under the same replay. Refusals
     /// are COUNTED and not surfaced: this function replays a verb the
     /// engine already performed, so there is no caller to tell.
-    fn intake_cancel(&mut self, order: &Order) {
+    fn intake_cancel(&mut self, order: &Order, emit_virt: u64) {
         match self.find_resting(order.prev_client_oid, order.strategy_id) {
             Some(i) => {
                 self.remove_open(i);
                 self.lifecycle.cancels += 1;
             }
-            None => self.lifecycle.missed += 1,
+            None => self.intake_queue_cancel(order, emit_virt),
+        }
+    }
+
+    /// XMM XH2: a cancel that found nothing in the strict table. On a
+    /// queue order it lands at the first record at or after
+    /// `emit + Δ_venue`, ahead of that block's prints — the paper
+    /// matcher's `cancel_queue`, against this table.
+    fn intake_queue_cancel(&mut self, order: &Order, emit_virt: u64) {
+        let prev = order.prev_client_oid;
+        match self.queue.lookup(prev, order.strategy_id) {
+            Ok(o) => {
+                let at = emit_virt.saturating_add(self.queue_delay_of(model_venue_byte(o.sym)));
+                match self.queue.cancel(prev, order.strategy_id, at) {
+                    Ok(()) => self.lifecycle.cancels += 1,
+                    Err(_) => self.lifecycle.missed += 1,
+                }
+            }
+            Err(_) => self.lifecycle.missed += 1,
         }
     }
 
@@ -1143,7 +1199,7 @@ impl FillEngine {
     /// table's own fields.
     fn intake_modify(&mut self, order: &Order, emit_virt: u64) {
         let Some(i) = self.find_resting(order.prev_client_oid, order.strategy_id) else {
-            self.lifecycle.missed += 1;
+            self.intake_queue_modify(order, emit_virt);
             return;
         };
         let px = order.px.raw();
@@ -1165,6 +1221,223 @@ impl FillEngine {
         self.open[i].t_active_ns =
             emit_virt.saturating_add(self.params.latency_ns[o.venue as usize]);
         self.lifecycle.modifies += 1;
+    }
+
+    /// XMM XH2: a modify that found nothing in the strict table — the
+    /// paper matcher's `modify_queue`: on a queue order, a cancel of the
+    /// old one and the new order landing together at `emit + Δ_venue`,
+    /// the new one at the back of its queue. Fail-closed: an old order
+    /// no longer held places nothing (a `REJECTED` answers the member),
+    /// and a full table refuses the new order and keeps the old one.
+    fn intake_queue_modify(&mut self, order: &Order, emit_virt: u64) {
+        let venue_byte = model_venue_byte(order.sym);
+        let queued = core_fill::judged_by_queue(venue_byte, order.kind, order.flags);
+        match self.queue.lookup(order.prev_client_oid, order.strategy_id) {
+            Ok(o) => {
+                if !queued || o.sym != order.sym || o.side != order.side
+                    || order.px.raw() <= 0 || order.qty.raw() <= 0
+                {
+                    self.lifecycle.refused += 1;
+                    return;
+                }
+                let p = self.queue_place_of(order, emit_virt, venue_byte);
+                match self.queue.modify(order.prev_client_oid, &p) {
+                    Ok(()) => {
+                        self.lifecycle.modifies += 1;
+                        self.queue_oos
+                            .insert((order.strategy_id, order.client_oid), emit_virt >= self.boundary_virt_ns);
+                    }
+                    Err(_) => {
+                        self.rejected_total_cap += 1;
+                        self.push_order_event(
+                            emit_virt,
+                            order.sym,
+                            order.client_oid,
+                            order.strategy_id,
+                            core_types::ORDER_EVENT_REJECTED,
+                            core_types::ORDER_EVENT_REASON_OTHER,
+                        );
+                    }
+                }
+            }
+            Err(_) if queued => {
+                // Fail-closed, as the paper matcher: the venue does not
+                // modify an order no longer on its book. The member was
+                // told Ok by the replay's ctx, so the venue's answer
+                // reaches it as an event.
+                self.lifecycle.missed += 1;
+                self.push_order_event(
+                    emit_virt,
+                    order.sym,
+                    order.client_oid,
+                    order.strategy_id,
+                    core_types::ORDER_EVENT_REJECTED,
+                    core_types::ORDER_EVENT_REASON_OTHER,
+                );
+            }
+            Err(_) => self.lifecycle.missed += 1,
+        }
+    }
+
+    /// XMM XH2: the queue law's placement for `order` emitted at
+    /// `emit_virt`: it lands at the first record of its symbol at or
+    /// after `emit + Δ_venue`; its TTL is a cancel at `emit + ttl`.
+    fn queue_place_of(&self, order: &Order, emit_virt: u64, venue_byte: u8) -> core_fill::QueuePlace {
+        let expiry = core_fill::expiry_at(emit_virt, order.ttl_ns);
+        core_fill::QueuePlace {
+            client_oid: order.client_oid,
+            sym: order.sym,
+            side: order.side,
+            slot: order.strategy_id,
+            px_1e6: order.px.raw(),
+            qty_1e6: order.qty.raw(),
+            ready_ns: emit_virt.saturating_add(self.queue_delay_of(venue_byte)),
+            expiry_ns: if expiry == 0 { core_fill::QUEUE_NEVER } else { expiry },
+        }
+    }
+
+    /// The queue law's travel time for a verb on `venue_byte`: the one
+    /// [`Self::intake_delayed`] gave, else `Δ_venue`.
+    #[inline]
+    fn queue_delay_of(&self, venue_byte: u8) -> u64 {
+        match self.queue_delay {
+            Some(d) => d,
+            None => self.params.latency_ns[venue_byte as usize],
+        }
+    }
+
+    /// XMM XH2 parity: [`Self::intake`] with the queue law's travel time
+    /// given for this one verb — the parity replay's latency is the
+    /// TRIGGER's (leader → follower, or follower → follower), which the
+    /// simulator applies and a per-venue `Δ` cannot express. The
+    /// strict-cross table ignores it (no strict order rides a parity
+    /// replay).
+    pub fn intake_delayed(&mut self, order: &Order, emit_virt: u64, delay_ns: u64) {
+        self.queue_delay = Some(delay_ns);
+        self.intake(order, emit_virt);
+        self.queue_delay = None;
+    }
+
+    /// XMM XH2: track `sym`'s touch for the queue law from the start of
+    /// the replay (the boot's `track_queue_sym`), so the first order on
+    /// it meets a known book.
+    pub fn track_queue_sym(&mut self, sym: u32) {
+        if self.queue.track(sym).is_err() {
+            self.rejected_total_cap += 1;
+        }
+    }
+
+    /// XMM XH2: one trade print for the queue law — the prints of a
+    /// queue venue consume the queue ahead of our post-only makers and
+    /// fill them. Other venues' prints do nothing.
+    pub fn on_trade(
+        &mut self,
+        print: &core_types::TradePrint,
+        virt_ns: u64,
+        wall_ns: u64,
+        out: &mut Vec<SynthFill>,
+    ) {
+        out.clear();
+        if !core_fill::queue_venue(model_venue_byte(print.sym)) {
+            return;
+        }
+        let sell = print.aggressor == core_types::TRADE_AGGRESSOR_SELL;
+        self.queue
+            .on_print(print.sym, print.px_1e6, print.qty_1e6, sell, virt_ns);
+        self.drain_queue(wall_ns, out);
+    }
+
+    /// XMM XH2: write the next order event for the member into `out`,
+    /// FIFO — the engine's `try_next_order_event` shape; `false` when
+    /// there is none.
+    pub fn pop_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        match self.order_events.pop_front() {
+            Some(e) => {
+                *out = e;
+                self.queue_replay.events += 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// XMM XH2: what the queue law did in this replay.
+    #[must_use]
+    pub fn queue_replay(&self) -> QueueReplay {
+        let mut r = self.queue_replay;
+        r.book = self.queue.counters;
+        r.open_at_end = self.queue.len() as u64;
+        r
+    }
+
+    /// XMM XH2: research switch for the parity gate — the XMM
+    /// simulator's arrival rule (`core_fill::QueueBook::parity_sim`).
+    pub fn set_queue_parity_sim(&mut self, on: bool) {
+        self.queue.parity_sim = on;
+    }
+
+    /// Move the queue law's events out: a fill is booked like any maker
+    /// fill (our limit, the maker fee) and lands in `out`, everything
+    /// else waits for the member in `order_events`.
+    fn drain_queue(&mut self, wall_ns: u64, out: &mut Vec<SynthFill>) {
+        while let Some(e) = self.queue.try_next_event() {
+            if e.kind == core_fill::QUEUE_EVENT_FILL {
+                let oos = self.queue_oos.get(&(e.slot, e.client_oid)).copied().unwrap_or(false);
+                let venue = model_venue_byte(e.sym);
+                let o = OpenOrder {
+                    seq: 0,
+                    t_active_ns: 0,
+                    expiry_ns: 0,
+                    sym: e.sym,
+                    side: e.side,
+                    kind: ORDER_KIND_MAKER,
+                    venue,
+                    oos,
+                    px_1e6: e.px_1e6,
+                    remaining_1e6: e.qty_1e6,
+                    client_oid: e.client_oid,
+                    strategy_id: e.slot,
+                };
+                let mark = match self.marks_1e6.get(&e.sym) {
+                    Some(&m) => m,
+                    None => e.px_1e6,
+                };
+                let opening = self.is_opening_fill(e.sym, e.side);
+                let maker_bps = self.fee_rate_for(venue, e.sym, opening).0;
+                self.book_fill(&o, e.px_1e6, e.qty_1e6, maker_bps, mark, wall_ns, out);
+                self.queue_replay.fills += 1;
+                continue;
+            }
+            if e.kind != core_types::ORDER_EVENT_RESTING {
+                self.queue_oos.remove(&(e.slot, e.client_oid));
+            }
+            self.push_order_event(wall_ns, e.sym, e.client_oid, e.slot, e.kind, e.reason);
+        }
+    }
+
+    fn push_order_event(
+        &mut self,
+        ts_ns: u64,
+        sym: u32,
+        client_oid: u64,
+        strategy_id: u8,
+        kind: u8,
+        reason: u8,
+    ) {
+        let venue = match core_types::VenueId::from_u8(symbol_venue_byte(sym)) {
+            Some(v) => v,
+            None => core_types::VenueId::Hyperliquid,
+        };
+        self.order_events.push_back(core_types::OrderEvent::new(
+            ts_ns,
+            venue,
+            sym,
+            client_oid,
+            strategy_id,
+            kind,
+            reason,
+            0,
+        ));
     }
 
     /// E5: index of `strategy_id`'s resting order carrying
@@ -1240,6 +1513,12 @@ impl FillEngine {
             self.prediction_grid_refused += 1;
             return;
         }
+        // XMM XH2: a post-only maker on a queue venue goes to the queue
+        // law, in its own table — the paper matcher's branch, here.
+        if core_fill::judged_by_queue(venue_byte, order.kind, order.flags) {
+            self.intake_queue_place(order, emit_virt, venue_byte);
+            return;
+        }
         let mut sym_count = 0usize;
         let mut i = 0usize;
         while i < self.open_len {
@@ -1284,6 +1563,35 @@ impl FillEngine {
         let sym_now = (sym_count + 1) as u64;
         if sym_now > self.peak_open_per_sym {
             self.peak_open_per_sym = sym_now;
+        }
+    }
+
+    /// XMM XH2: take a post-only maker into the queue law. A refusal
+    /// (its table or symbols full) is counted and answered with a
+    /// `REJECTED` event, as the paper matcher answers it.
+    fn intake_queue_place(&mut self, order: &Order, emit_virt: u64, venue_byte: u8) {
+        let oos = emit_virt >= self.boundary_virt_ns;
+        let p = self.queue_place_of(order, emit_virt, venue_byte);
+        match self.queue.place(&p) {
+            Ok(()) => {
+                if oos {
+                    self.orders_oos += 1;
+                } else {
+                    self.orders_is += 1;
+                }
+                self.queue_oos.insert((order.strategy_id, order.client_oid), oos);
+            }
+            Err(_) => {
+                self.rejected_total_cap += 1;
+                self.push_order_event(
+                    emit_virt,
+                    order.sym,
+                    order.client_oid,
+                    order.strategy_id,
+                    core_types::ORDER_EVENT_REJECTED,
+                    core_types::ORDER_EVENT_REASON_OTHER,
+                );
+            }
         }
     }
 
@@ -1361,6 +1669,22 @@ impl FillEngine {
         if wall_ns >= self.binary_due_ns {
             self.binary_pass(wall_ns);
         }
+        // ---- (0c) XMM XH2: the queue law's clock ----
+        // ANY record of a queue venue's symbol lands what is due — a
+        // stale or one-sided book too, so a cancel or an expiry is never
+        // held back by a degraded feed; only fresh two-sided evidence
+        // teaches the law the touch. A book fills nothing (prints do,
+        // [`Self::on_trade`]), and one table lookup is all it costs any
+        // other venue.
+        if core_fill::queue_venue(model_venue_byte(sym)) {
+            let touch = if !tick.is_stale() && tick.bid_px.raw() > 0 && tick.ask_px.raw() > 0 {
+                core_fill::Touch::of(tick)
+            } else {
+                core_fill::Touch::default()
+            };
+            self.queue.on_book(sym, touch, virt_ns);
+            self.drain_queue(wall_ns, out);
+        }
         if tick.is_stale() {
             self.stale_ticks_skipped += 1;
             return;
@@ -1384,6 +1708,7 @@ impl FillEngine {
                 self.dd.sample(self.oos.equity_1e12());
             }
         }
+
 
         // ---- (b′) D-7 mark-fill pass (VM2 V5) ----
         // Registered options syms: every active resting order fills
@@ -2143,7 +2468,8 @@ impl FillEngine {
         // expired contract is cash, not an open position marked at a
         // mid that no longer means anything.
         self.settle_expired();
-        self.canceled_end = self.open_len as u64;
+        // XMM XH2: queue orders still held end the window like any other.
+        self.canceled_end = self.open_len as u64 + self.queue.len() as u64;
         self.open_len = 0;
         ModelOutcome {
             oos_net_1e12: self.oos.equity_1e12(),
@@ -4725,5 +5051,252 @@ mod tests {
         e.intake(&o, 1_000);
         assert_eq!(e.open_orders().len(), 1);
         assert_eq!(e.lifecycle(), LifecycleReplay::default());
+    }
+
+    // ---------------- XMM XH2: the queue law in the harness ----------------
+
+    const HL_D: u64 = 340_000_000;
+
+    fn hl_perp() -> u32 {
+        make_symbol_id(VenueId::Hyperliquid, 5)
+    }
+
+    fn hl_book(bid: i64, bid_q: i64, ask: i64, ask_q: i64) -> Tick {
+        Tick::new(
+            0,
+            VenueId::Hyperliquid,
+            hl_perp(),
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(bid_q),
+            Price::from_raw(ask),
+            Qty::from_raw(ask_q),
+        )
+    }
+
+    fn hl_print(px: i64, qty: i64, sell: bool) -> core_types::TradePrint {
+        core_types::TradePrint::new(
+            0,
+            VenueId::Hyperliquid,
+            hl_perp(),
+            1,
+            0,
+            px,
+            qty,
+            if sell { core_types::TRADE_AGGRESSOR_SELL } else { core_types::TRADE_AGGRESSOR_BUY },
+        )
+    }
+
+    fn post_only(side: Side, px: i64, qty: i64, oid: u64) -> Order {
+        let mut o = Order::new(
+            0,
+            VenueId::Hyperliquid,
+            hl_perp(),
+            side,
+            ORDER_KIND_MAKER,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        )
+        .with_post_only();
+        o.strategy_id = 6;
+        o
+    }
+
+    /// A harness tracking the perp, its book 100 (2 shown) / 101.
+    fn hl_engine() -> FillEngine {
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        e.track_queue_sym(hl_perp());
+        let mut out = Vec::new();
+        e.on_record(&hl_book(100_000_000, 2_000_000, 101_000_000, 1_000_000), 0, 0, &mut out);
+        e
+    }
+
+    fn no_event(e: &mut FillEngine) -> bool {
+        let mut x = core_types::OrderEvent::ZERO;
+        !e.pop_order_event(&mut x)
+    }
+
+    fn event_kinds(e: &mut FillEngine) -> Vec<(u64, u8, u8)> {
+        let mut v = Vec::new();
+        let mut x = core_types::OrderEvent::ZERO;
+        while e.pop_order_event(&mut x) {
+            v.push((x.client_oid, x.kind, x.reason));
+        }
+        v
+    }
+
+    #[test]
+    fn a_post_only_hl_maker_is_filled_by_prints_through_its_queue() {
+        let mut e = hl_engine();
+        let mut out = Vec::new();
+        e.intake(&post_only(Side::Bid, 100_000_000, 1_000_000, 9), 1);
+        e.on_record(&hl_book(100_000_000, 5_000_000, 101_000_000, 1_000_000), HL_D + 1, HL_D + 1, &mut out);
+        assert!(out.is_empty(), "a book fills nothing");
+        assert_eq!(event_kinds(&mut e), [(9, core_types::ORDER_EVENT_RESTING, 0)]);
+        // A seller takes 2.5: the 2 shown ahead, then half of ours.
+        e.on_trade(&hl_print(100_000_000, 2_500_000, true), HL_D + 10, HL_D + 10, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].px_1e6, out[0].qty_1e6, out[0].client_oid), (100_000_000, 500_000, 9));
+        assert_eq!(out[0].side, Side::Bid);
+        assert!(no_event(&mut e), "a partial fill is no order event");
+        // A print THROUGH 100 fills the rest.
+        e.on_trade(&hl_print(99_000_000, 1, true), HL_D + 20, HL_D + 20, &mut out);
+        assert_eq!(out.len(), 1, "the scratch holds this print's fills only");
+        assert_eq!(out[0].qty_1e6, 500_000);
+        assert_eq!(event_kinds(&mut e), [(9, core_types::ORDER_EVENT_FILLED, 0)]);
+        let q = e.queue_replay();
+        assert_eq!((q.book.placed, q.book.rested, q.fills, q.book.filled), (1, 1, 2, 1));
+        assert_eq!((q.events, q.open_at_end), (2, 0));
+        let o = e.finish();
+        assert_eq!((o.fills_total, o.canceled_end, o.orders_oos), (2, 0, 1));
+    }
+
+    #[test]
+    fn a_plain_hl_maker_and_other_venues_prints_are_untouched_by_the_queue_law() {
+        let mut e = hl_engine();
+        let mut out = Vec::new();
+        let mut plain = post_only(Side::Bid, 100_000_000, 1_000_000, 9);
+        plain.flags = 0;
+        e.intake(&plain, 1);
+        assert_eq!(e.open_orders().len(), 1, "strict-cross table, as before XH2");
+        e.on_trade(&hl_print(99_000_000, 9_000_000, true), HL_D + 10, HL_D + 10, &mut out);
+        assert!(out.is_empty());
+        let mut p = hl_print(99_000_000, 9_000_000, true);
+        p.sym = make_symbol_id(VenueId::Binance, 1);
+        out.push(SynthFill {
+            sym: 0,
+            side: Side::Bid,
+            px_1e6: 1,
+            qty_1e6: 1,
+            fee_1e12: 0,
+            oos: false,
+            client_oid: 0,
+        });
+        e.on_trade(&p, HL_D + 20, HL_D + 20, &mut out);
+        assert!(out.is_empty(), "the scratch is cleared even when nothing fills");
+        assert!(no_event(&mut e));
+        assert_eq!(e.queue_replay(), QueueReplay::default());
+    }
+
+    #[test]
+    fn a_queue_cancel_lands_after_delta_and_a_cancel_of_nothing_is_missed() {
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        e.track_queue_sym(hl_perp());
+        let mut out = Vec::new();
+        e.on_record(&hl_book(100_000_000, 0, 101_000_000, 1_000_000), 0, 0, &mut out);
+        let o = post_only(Side::Bid, 100_000_000, 1_000_000, 9);
+        e.intake(&o, 1);
+        e.on_record(&hl_book(100_000_000, 0, 101_000_000, 1_000_000), HL_D + 1, HL_D + 1, &mut out);
+        event_kinds(&mut e);
+        let at = 1_000_000_000;
+        e.intake(&core_types::CancelReq::of(&o, at).as_record(), at);
+        assert_eq!(e.lifecycle().cancels, 1);
+        e.on_trade(&hl_print(100_000_000, 400_000, true), at + HL_D - 1, at + HL_D - 1, &mut out);
+        assert_eq!(out.len(), 1, "it still fills before the cancel lands");
+        e.on_trade(&hl_print(100_000_000, 9_000_000, true), at + HL_D, at + HL_D, &mut out);
+        assert!(out.is_empty(), "the cancel beats the prints of its block");
+        assert_eq!(
+            event_kinds(&mut e),
+            [(9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)]
+        );
+        // Failure mode: the order is gone; a second cancel names nothing.
+        e.intake(&core_types::CancelReq::of(&o, at + HL_D).as_record(), at + HL_D);
+        assert_eq!(e.lifecycle().missed, 1);
+    }
+
+    #[test]
+    fn a_queue_modify_replaces_a_lost_race_places_nothing_and_a_side_flip_is_refused() {
+        let mut e = hl_engine();
+        let mut out = Vec::new();
+        e.intake(&post_only(Side::Bid, 100_000_000, 1_000_000, 9), 1);
+        e.on_record(&hl_book(100_000_000, 2_000_000, 102_000_000, 1_000_000), HL_D + 1, HL_D + 1, &mut out);
+        event_kinds(&mut e);
+        let at = 1_000_000_000;
+        let new = post_only(Side::Bid, 101_000_000, 1_000_000, 10);
+        e.intake(&core_types::ModifyReq::new(9, new).as_record(), at);
+        e.on_record(&hl_book(100_000_000, 2_000_000, 102_000_000, 1_000_000), at + HL_D, at + HL_D, &mut out);
+        assert_eq!(
+            event_kinds(&mut e),
+            [
+                (10, core_types::ORDER_EVENT_RESTING, 0),
+                (9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_REPLACED),
+            ]
+        );
+        assert_eq!(e.lifecycle().modifies, 1);
+        // Fail-closed: the old id is gone, so nothing is placed and the
+        // member hears the venue's refusal.
+        e.intake(&core_types::ModifyReq::new(9, post_only(Side::Bid, 100_000_000, 1_000_000, 11)).as_record(), at);
+        assert_eq!(e.lifecycle().missed, 1);
+        assert_eq!(e.queue_replay().book.placed, 2);
+        assert_eq!(
+            event_kinds(&mut e),
+            [(11, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_OTHER)]
+        );
+        // Failure mode: a modify that flips the side describes another order.
+        e.intake(&core_types::ModifyReq::new(10, post_only(Side::Ask, 103_000_000, 1_000_000, 12)).as_record(), at);
+        assert_eq!(e.lifecycle().refused, 1);
+        let o = e.finish();
+        assert_eq!(o.canceled_end, 1, "the queue order still held ends the window");
+    }
+
+    #[test]
+    fn a_stale_or_one_sided_record_still_lands_a_cancel() {
+        let mut e = FillEngine::new(ModelParams::default(), 0);
+        e.track_queue_sym(hl_perp());
+        let mut out = Vec::new();
+        e.on_record(&hl_book(100_000_000, 0, 101_000_000, 1_000_000), 0, 0, &mut out);
+        let o = post_only(Side::Bid, 100_000_000, 1_000_000, 9);
+        e.intake(&o, 1);
+        e.on_record(&hl_book(100_000_000, 0, 101_000_000, 1_000_000), HL_D + 1, HL_D + 1, &mut out);
+        event_kinds(&mut e);
+        e.intake(&core_types::CancelReq::of(&o, 1_000).as_record(), 1_000);
+        let mut stale = hl_book(90_000_000, 5_000_000, 91_000_000, 5_000_000);
+        stale.flags |= core_types::TICK_FLAG_STALE;
+        e.on_record(&stale, 1_000 + HL_D, 1_000 + HL_D, &mut out);
+        assert_eq!(
+            event_kinds(&mut e),
+            [(9, core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)]
+        );
+        // The stale book taught the law nothing: a bid at 100.5 does not
+        // cross its 91 ask.
+        e.intake(&post_only(Side::Bid, 100_500_000, 1_000_000, 10), 2_000);
+        e.on_record(&hl_book(100_000_000, 0, 101_000_000, 1_000_000), 2_000 + HL_D, 2_000 + HL_D, &mut out);
+        assert_eq!(event_kinds(&mut e), [(10, core_types::ORDER_EVENT_RESTING, 0)]);
+    }
+
+    #[test]
+    fn the_parity_switch_drops_an_order_whose_price_left_the_touch() {
+        let mut e = hl_engine();
+        e.set_queue_parity_sim(true);
+        let mut out = Vec::new();
+        e.intake(&post_only(Side::Ask, 101_000_000, 1_000_000, 9), 1);
+        e.on_record(&hl_book(100_000_000, 2_000_000, 102_000_000, 1_000_000), HL_D + 1, HL_D + 1, &mut out);
+        assert_eq!(
+            event_kinds(&mut e),
+            [(9, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_OTHER)]
+        );
+        assert_eq!(e.queue_replay().book.dropped_touch, 1);
+        // Off, the same arrival joins as a new level ahead of 102.
+        let mut f = hl_engine();
+        f.intake(&post_only(Side::Ask, 101_000_000, 1_000_000, 9), 1);
+        f.on_record(&hl_book(100_000_000, 2_000_000, 102_000_000, 1_000_000), HL_D + 1, HL_D + 1, &mut out);
+        assert_eq!(event_kinds(&mut f), [(9, core_types::ORDER_EVENT_RESTING, 0)]);
+    }
+
+    #[test]
+    fn a_full_queue_table_answers_with_a_rejected_event() {
+        let mut e = hl_engine();
+        let mut oid = 1u64;
+        while e.queue_replay().book.placed < core_fill::QUEUE_MAX_ORDERS as u64 {
+            e.intake(&post_only(Side::Bid, 99_000_000, 1_000_000, oid), 1);
+            oid += 1;
+        }
+        e.intake(&post_only(Side::Bid, 99_000_000, 1_000_000, oid), 1);
+        assert_eq!(
+            event_kinds(&mut e),
+            [(oid, core_types::ORDER_EVENT_REJECTED, core_types::ORDER_EVENT_REASON_OTHER)]
+        );
+        assert!(no_event(&mut e));
     }
 }

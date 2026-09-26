@@ -855,7 +855,7 @@ pub struct Order {
     /// Order-type tag (0=post-only limit; extend over time).
     pub kind: u8,
     /// **XMM XH1 — bit flags about the order itself**, see
-    /// [`ORDER_FLAG_REDUCE_ONLY`].
+    /// [`ORDER_FLAG_REDUCE_ONLY`] and [`ORDER_FLAG_POST_ONLY`].
     ///
     /// Wire-additive: this byte was the first of two explicit zeroed
     /// padding bytes, so every Order persisted before XH1 reads as "no
@@ -948,6 +948,18 @@ pub const STRATEGY_ID_NONE: u8 = 0xFF;
 /// before XH1 meant.
 pub const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
 
+/// [`Order::flags`] bit 1 (XMM XH2): the order must only ever REST — the
+/// venue's post-only time in force (Hyperliquid `Alo`). An order that
+/// would cross when it arrives is rejected (`BAD_ALO_PX`), never filled
+/// as a taker.
+///
+/// It also selects the paper fill law: a post-only maker on a queue venue
+/// (`core_fill::queue_venue`, Hyperliquid) is judged by the queue law
+/// (`core_fill::queue`), everything else by the strict-cross law as
+/// before. No member placed an order with this bit before XH2, so none
+/// changes behaviour.
+pub const ORDER_FLAG_POST_ONLY: u8 = 1 << 1;
+
 impl Order {
     /// Construct an Order without naming the private padding fields.
     /// `strategy_id` starts [`STRATEGY_ID_NONE`]; the strategy-set's
@@ -1005,6 +1017,23 @@ impl Order {
     #[must_use]
     pub const fn is_reduce_only(&self) -> bool {
         self.flags & ORDER_FLAG_REDUCE_ONLY != 0
+    }
+
+    /// The same order marked [`ORDER_FLAG_POST_ONLY`] (XMM XH2).
+    /// Builder-style, like [`Self::with_reduce_only`]; every other field
+    /// is untouched.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_post_only(mut self) -> Self {
+        self.flags |= ORDER_FLAG_POST_ONLY;
+        self
+    }
+
+    /// Did the member mark this order post-only?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_post_only(&self) -> bool {
+        self.flags & ORDER_FLAG_POST_ONLY != 0
     }
 }
 
@@ -1765,6 +1794,20 @@ pub struct OrderEvent {
 }
 
 impl OrderEvent {
+    /// The zeroed event — kind `ORDER_EVENT_NONE`, attributed to no slot:
+    /// the scratch a consumer hands `try_next_order_event` to fill.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        client_oid: 0,
+        venue_time_ms: 0,
+        sym: SYMBOL_ID_NONE,
+        venue: 0,
+        strategy_id: STRATEGY_ID_NONE,
+        kind: ORDER_EVENT_NONE,
+        reason: ORDER_EVENT_REASON_NONE,
+        _pad: [0; 32],
+    };
+
     /// Construct an event without naming the private padding.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
@@ -4141,6 +4184,36 @@ mod tests {
             (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid)
         );
         assert_eq!((r.venue, r.strategy_id, r.verb), (o.venue, o.strategy_id, o.verb));
+    }
+
+    #[test]
+    fn order_post_only_is_opt_in_and_independent_of_reduce_only() {
+        let o = Order::new(
+            5,
+            VenueId::Hyperliquid,
+            make_symbol_id(VenueId::Hyperliquid, 3),
+            Side::Bid,
+            0,
+            Price::from_raw(99_000_000),
+            Qty::from_raw(150_000),
+            78,
+        );
+        // Failure mode first: a plain order is NOT post-only, and the
+        // reduce-only bit does not imply it.
+        assert!(!o.is_post_only());
+        assert!(!o.with_reduce_only().is_post_only());
+        let p = o.with_post_only();
+        assert!(p.is_post_only());
+        assert!(!p.is_reduce_only());
+        assert_eq!(p.flags, ORDER_FLAG_POST_ONLY);
+        // Both bits compose, and the builder is idempotent.
+        let both = p.with_reduce_only().with_post_only();
+        assert_eq!(both.flags, ORDER_FLAG_POST_ONLY | ORDER_FLAG_REDUCE_ONLY);
+        assert!(both.is_post_only() && both.is_reduce_only());
+        assert_eq!(
+            (p.ts_ns, p.sym, p.side, p.kind, p.px, p.qty, p.client_oid, p.ttl_ns),
+            (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid, o.ttl_ns)
+        );
     }
 
     #[test]

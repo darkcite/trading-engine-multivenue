@@ -42,6 +42,12 @@
 //!   record's fill evidence is read: the bar has closed, and a fill now
 //!   would belong to the next one. `ttl_ns == 0` never expires.
 //!
+//! * **Post-only makers on a queue venue (XMM XH2)** — an order flagged
+//!   [`core_types::ORDER_FLAG_POST_ONLY`] on a venue where
+//!   [`queue_venue`] holds (Hyperliquid) — are judged by the queue law
+//!   instead of strict cross: module [`queue`] states it, and
+//!   [`judged_by_queue`] is the one selector both consumers call.
+//!
 //! ## Doctrine
 //!
 //! * **No allocation, no floats, no panics.** Every function here is a
@@ -60,8 +66,13 @@
 #![deny(missing_docs)]
 
 pub mod amm;
+pub mod queue;
 
 pub use amm::{amm_pool_index, AmmBook, AmmBookCounters, AmmObs, AmmVerdict, AMM_MAX_POOLS};
+pub use queue::{
+    QueueBook, QueueCounters, QueueEvent, QueueOrder, QueuePlace, QueueRefusal, QUEUE_AHEAD_UNKNOWN,
+    QUEUE_EVENT_FILL, QUEUE_MAX_ORDERS, QUEUE_MAX_SYMS, QUEUE_NEVER, QUEUE_OUT_CAP,
+};
 
 use core_types::{Side, Tick};
 
@@ -117,6 +128,44 @@ pub const ACTIVATION_NS_DEFAULT: [u64; core_types::VENUE_COUNT] = [
     150 * MS, // mexc (spot binds; futures 130)
     1_000 * MS, // hyperevm — ONE BLOCK (0.983 s measured, rounded up)
 ];
+
+/// Venues whose post-only makers are judged by the queue law (module
+/// [`queue`]), per model venue byte. Only Hyperliquid: it is the one
+/// venue whose trade prints the engine and the harness replay, and a
+/// queue without prints can never fill. Every other venue keeps strict
+/// cross whatever the order's flags say (MEXC joins with its own prints,
+/// plan §7.2).
+pub const QUEUE_VENUE: [bool; core_types::VENUE_COUNT] = [
+    false, // pm
+    false, // bn
+    false, // okx
+    false, // deribit
+    true,  // hl
+    false, // ai (dead)
+    false, // bybit
+    false, // mexc (data-only)
+    false, // hyperevm (AMM law)
+];
+
+/// Whether post-only makers on model venue byte `venue` are judged by
+/// the queue law. An unknown byte is not a queue venue.
+#[inline]
+#[must_use]
+pub const fn queue_venue(venue: u8) -> bool {
+    let v = venue as usize;
+    v < core_types::VENUE_COUNT && QUEUE_VENUE[v]
+}
+
+/// The one selector both consumers call: an order is judged by the queue
+/// law iff it is a maker ([`ORDER_KIND_MAKER`]) flagged
+/// [`core_types::ORDER_FLAG_POST_ONLY`] on a [`queue_venue`]. Anything
+/// else — every order any member placed before XH2 — keeps the law it
+/// had.
+#[inline]
+#[must_use]
+pub const fn judged_by_queue(venue: u8, kind: u8, flags: u8) -> bool {
+    kind == ORDER_KIND_MAKER && flags & core_types::ORDER_FLAG_POST_ONLY != 0 && queue_venue(venue)
+}
 
 /// The two sides of a book at one instant, ×1e6.
 #[repr(C)]
@@ -538,5 +587,32 @@ mod tests {
             ACTIVATION_NS_DEFAULT[VenueId::HyperEvm as usize],
             1_000 * MS
         );
+    }
+
+    #[test]
+    fn queue_venue_is_hyperliquid_only_and_unknown_bytes_are_not() {
+        assert!(queue_venue(VenueId::Hyperliquid as u8));
+        // Failure modes: every other venue, and a byte past the table.
+        let mut v = 0u8;
+        while (v as usize) < core_types::VENUE_COUNT {
+            assert_eq!(queue_venue(v), v == VenueId::Hyperliquid as u8, "venue byte {v}");
+            v += 1;
+        }
+        assert!(!queue_venue(core_types::VENUE_COUNT as u8));
+        assert!(!queue_venue(u8::MAX));
+    }
+
+    #[test]
+    fn judged_by_queue_needs_maker_post_only_and_a_queue_venue() {
+        let hl = VenueId::Hyperliquid as u8;
+        let po = core_types::ORDER_FLAG_POST_ONLY;
+        assert!(judged_by_queue(hl, ORDER_KIND_MAKER, po));
+        assert!(judged_by_queue(hl, ORDER_KIND_MAKER, po | core_types::ORDER_FLAG_REDUCE_ONLY));
+        // Failure modes: each of the three conditions alone flips it.
+        assert!(!judged_by_queue(hl, ORDER_KIND_MAKER, 0), "a plain maker keeps strict cross");
+        assert!(!judged_by_queue(hl, ORDER_KIND_MAKER, core_types::ORDER_FLAG_REDUCE_ONLY));
+        assert!(!judged_by_queue(hl, ORDER_KIND_IOC, po), "an IoC never rests");
+        assert!(!judged_by_queue(VenueId::Binance as u8, ORDER_KIND_MAKER, po));
+        assert!(!judged_by_queue(VenueId::HyperEvm as u8, ORDER_KIND_AMM_SWAP, po));
     }
 }

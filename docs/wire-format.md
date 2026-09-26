@@ -158,7 +158,7 @@ reader-compat surface.
 |      8 |     4 | sym         | `u32` SymbolId | venue-namespaced                |
 |     12 |     1 | side        | `u8`           | `Side`                          |
 |     13 |     1 | kind        | `u8`           | 0=Limit, 1=IoC, 2=Market (rsv.) |
-|     14 |     1 | flags       | `u8`           | **XMM XH1 (2026-09-26)**: bit 0 = `ORDER_FLAG_REDUCE_ONLY` (the exec arm that honours it is XH4's; until then nothing sets it). Wire-additive: it was the first `_pad0` byte, explicit zeroed, so every Order persisted before XH1 reads as no flags |
+|     14 |     1 | flags       | `u8`           | **XMM XH1 (2026-09-26)**: bit 0 = `ORDER_FLAG_REDUCE_ONLY` (the exec arm that honours it is XH4's; until then nothing sets it). **XMM XH2 (2026-09-26)**: bit 1 = `ORDER_FLAG_POST_ONLY` — the venue's post-only TIF (Hyperliquid `Alo`); on a queue venue (Hyperliquid) a maker carrying it is judged by the queue law (`core_fill::queue`) in the paper matcher and the harness. Only xmm sets it. Wire-additive: it was the first `_pad0` byte, explicit zeroed, so every Order persisted before XH1 reads as no flags |
 |     15 |     1 | _pad0       | `u8`           | explicit, zeroed                |
 |     16 |     8 | px          | `i64` Price    |                                 |
 |     24 |     8 | qty         | `i64` Qty      |                                 |
