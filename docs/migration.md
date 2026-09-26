@@ -6,6 +6,75 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `[hypercall]` universe section, boot discovery, manifests, the descriptor caps (HC4)
+
+**What changed**
+
+- `universe.toml` gains an optional `[hypercall]` section
+  (`universe.toml.example`; parser `core-config::universe`):
+  - `underlyings` — Hypercall's own names, UPPERCASE `[A-Z0-9]`,
+    1..=12 bytes (`SP500`, `SPCX`, `BTC`, …);
+  - `expiries` / `strikes` — the shared M2 options-policy law (E 1..=4,
+    K even 2..=32, defaults 2 / 8) under this section's own key names;
+  - `summary_every_s` — each underlying's REST `/options-summary` period,
+    60..=3600, default 300;
+  - `underlyings × expiries × strikes × 2 ≤ 1024`: the universe must fit
+    the ONE indicative subscribe frame (the venue's D3 law).
+  - Allocation: each underlying's settlement index is
+    `hypercall-idx:<U>` at ordinal `i + 1` of venue byte 9
+    (`AllocatedUniverse::hypercall_idx`). The options are
+    boot-discovered and take ordinals from `OPT_ORDINAL_BASE` (513 up)
+    in selection order — they reshuffle every boot, like Deribit's.
+- `core-config::Config`: `HYPERCALL_WS_HOST` and `HYPERCALL_REST_HOST`
+  (both default `api.hypercall.xyz`; `.env.example`).
+- Boot discovery (`cli::boot_discovery::run_all`) gains the Hypercall arm
+  when `underlyings` is non-empty: ONE `GET /markets` (≈ 4.3 MB, body cap
+  32 MiB), one forward scan, then the capped chain per underlying — the
+  nearest series OUTSIDE the provider's 2 h pre-expiry blackout × the K
+  strikes nearest the venue's index. A configured underlying the venue
+  does not list refuses the boot; one that selects nothing marks it
+  `any_missing` (fatal live, a warning in paper).
+- Manifests and the live descriptor table carry the venue:
+  - `options-manifest.tsv`: `hypercall\t<sym>\t<instrument>` rows;
+  - `instrument-manifest.tsv`: `hypercall-idx:<U>` rows after the
+    `mexc-perp:` block, `hypercall:<instrument>` rows last;
+  - the ruleset `DescriptorTable` gets the same rows (its membership is
+    the manifest's by construction).
+- The capability string law (`ingress_ai::caps_of_descriptor` and its
+  pinned Python mirror `claude_worker.channel_map.caps_of_descriptor`):
+  `hypercall:` options → `OPT|PRICE`; `hypercall-idx:` → none (the index
+  has no tick and no summary, so no ruleset feature can read it).
+- `opt-registry` is UNCHANGED: a Hypercall-keyed registry (and a
+  premium-denomination field) belongs to the first consumer that needs
+  one — the HC11 member, on its own ruling — not to a data-only lane.
+
+**Why**
+
+- HC4 of the Hypercall plan (rulings O-HC1…O-HC10): the O-HC2 universe
+  (12 underlyings × E3 × K8 × {C,P} = 576) is chosen at boot the way the
+  M2 law chooses Deribit's chain, and every offline consumer resolves
+  its reshuffled ordinals through the manifests.
+
+**Impact**
+
+- **Config keys:** one optional section and two optional env keys. A
+  file without `[hypercall]` (or with `underlyings = []`) parses to the
+  pre-HC4 universe bit for bit; no discovery runs.
+- **On-disk formats:** manifest rows appear only with the section.
+- **API:** `boot_discovery::run_all`, `options_manifest::render`,
+  `render_instruments` and `build_descriptor_entries` each gain a
+  Hypercall parameter.
+
+**Migration steps**
+
+1. None. Do NOT enable `[hypercall]` before HC5: until the ingress is
+   spawned, discovery would run and the manifests would name instruments
+   nothing captures.
+
+**Rollback**
+
+- Revert the HC4 commit.
+
 ## 2026-09-26 — `crates/ingress-hypercall`: the Hypercall market-data ingress, data-only (HC3)
 
 **What changed**

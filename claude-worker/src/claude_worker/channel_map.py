@@ -85,6 +85,12 @@ def caps_of_descriptor(desc: str) -> int:
         if name.startswith("#"):
             return CAP_PRICE
         return CAP_PRICE | CAP_FUNDING
+    if venue == "hypercall":
+        # HC4: every `hypercall:` name is an option (BBO tick + REST
+        # summary); the settlement index carries neither.
+        return CAP_OPT | CAP_PRICE if is_opt else 0
+    if venue == "hypercall-idx":
+        return 0
     return CAP_PRICE
 
 

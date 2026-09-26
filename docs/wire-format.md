@@ -592,7 +592,7 @@ shadow-P&L) resolve option syms through this file. UTF-8 text, one
 line per selected instrument,
 `<venue_label>\t<sym_u32_decimal>\t<instrument_name>\n`, where
 `venue_label` is the venue's capture-file prefix (`deribit`, `okx`,
-`bn`); no header line; present only when the boot selected ≥ 1
+`bn`, `hypercall` since HC4); no header line; present only when the boot selected ≥ 1
 option instrument (absence = options-less or pre-M2-close run).
 Readers parse strictly and skip-and-count malformed lines.
 
@@ -687,6 +687,10 @@ file keeps one writer. The per-venue law (`crates/ingress-hypercall`):
   FRACTION (0.52 → 520 000 000 — Hypercall, unlike Deribit, does not
   send percent), `underlying_px_1e9`, `open_interest_1e6` contracts and
   the four greeks. `ts_ns` = the poll's receive instant.
+- Descriptors (`instrument-manifest.tsv` / `options-manifest.tsv`):
+  `hypercall:<instrument>` (e.g. `hypercall:BTC-20261002-100000-C`) and
+  `hypercall-idx:<U>` for the index syms; the options manifest's label
+  is `hypercall`.
 
 ## Replay log
 

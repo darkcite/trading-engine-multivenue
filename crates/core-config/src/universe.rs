@@ -104,6 +104,31 @@ pub const MEXC_PERP_ORDINAL_BASE: u32 = 512;
 /// ≤ 10 futures sockets.
 pub const MEXC_LIST_MAX: usize = 128;
 
+/// HC4: cap on the Hypercall universe, `underlyings × expiries ×
+/// strikes × 2`. MIRRORS `ingress_hypercall::HC_MAX_INSTRUMENTS` (the
+/// symbol table the ONE indicative subscribe frame names — the venue's
+/// D3 law); this crate cannot depend on an ingress crate, so the number
+/// lives twice and the boot's own table insert refuses anything this
+/// check let through.
+pub const HC_INSTRUMENTS_MAX: u32 = 1024;
+
+/// HC4: longest Hypercall underlying name (`SP500`, `SNDK`, …). MIRRORS
+/// `ingress_hypercall::HC_UNDERLYING_MAX`.
+pub const HC_UNDERLYING_LEN_MAX: usize = 12;
+
+/// HC4: default `[hypercall] summary_every_s` — each underlying's REST
+/// `/options-summary` refresh period. MIRRORS
+/// `ingress_hypercall::rest::DEFAULT_SUMMARY_EVERY_S`.
+pub const HC_SUMMARY_EVERY_S_DEFAULT: u32 = 300;
+
+/// HC4: bounds on `summary_every_s`. The bodies are large (SNDK's was
+/// 4.8 MB on 2026-09-25): below a minute the poller would spend its
+/// life downloading; above an hour the mark row is too stale to judge
+/// the WS quotes against.
+pub const HC_SUMMARY_EVERY_S_MIN: u32 = 60;
+/// Upper bound on `summary_every_s`.
+pub const HC_SUMMARY_EVERY_S_MAX: u32 = 3600;
+
 /// HYPARB H3b: cap on `[hyperevm] pools` — the HyperEVM ingress's pool
 /// table (`ingress_hyperevm::HYPEREVM_MAX_POOLS`) and the AMM book
 /// (`core_fill::AMM_MAX_POOLS`); the cli const-asserts all three agree.
@@ -435,6 +460,16 @@ pub struct Universe {
     /// HYPARB H3b: `[hyperevm] pools` — pool entries in file order
     /// (grammar on [`HyperEvmPool`]); ordinal `i + 1` of venue byte 8.
     pub hyperevm_pools: Vec<String>,
+    /// HC4: `[hypercall] underlyings` / `expiries` / `strikes` — the
+    /// O-HC2 capped chain per underlying, boot-DISCOVERED from `/markets`
+    /// (see [`OptionsPolicy`]; underlyings are Hypercall's names, e.g.
+    /// `"SP500"`, `"BTC"`). Each underlying also names its settlement
+    /// index, `hypercall-idx:<U>` at ordinal `i + 1`.
+    pub hypercall: OptionsPolicy,
+    /// HC4: `[hypercall] summary_every_s` — the REST poller's refresh
+    /// period per underlying ([`HC_SUMMARY_EVERY_S_DEFAULT`] when the
+    /// key is absent; 0 while the lane is off).
+    pub hypercall_summary_every_s: u32,
     /// `[pairs] map` — latency-arb pairs as
     /// `(pm market index, binance spot index)`, both 0-based file
     /// order. Empty = the default pair (0,0) is injected at
@@ -510,6 +545,11 @@ pub struct AllocatedUniverse {
     /// HYPARB H3b: the parsed pool entries, index-parallel to
     /// [`Self::hyperevm`].
     pub hyperevm_pools: Vec<HyperEvmPool>,
+    /// HC4: the Hypercall settlement indices (`hypercall-idx:<U>`,
+    /// `Spot` class, capture-only), ordinal `i + 1` in `underlyings`
+    /// order. The options are boot-discovered and allocated by the cli
+    /// from [`OPT_ORDINAL_BASE`].
+    pub hypercall_idx: Vec<Instrument>,
     /// Latency-arb pairs as `(pm YES-token sym, bn spot sym)`.
     pub pairs: Vec<(SymbolId, SymbolId)>,
 }
@@ -548,6 +588,7 @@ enum Section {
     Bybit,
     Mexc,
     HyperEvm,
+    Hypercall,
     Pairs,
 }
 
@@ -579,6 +620,10 @@ enum Slot {
     MexcSpot,
     MexcPerp,
     HyperEvmPools,
+    HcUnderlyings,
+    HcExpiries,
+    HcStrikes,
+    HcSummaryEveryS,
     PairsMap,
 }
 
@@ -604,6 +649,9 @@ enum ElemKind {
     /// BIN15 O2: a rolling-family key, `<out|native>:<COIN>:<15m|1d>`.
     HlRolling,
     OptUnderlying,
+    /// HC4: a Hypercall underlying (`SP500`, `BTC` — UPPERCASE
+    /// `[A-Z0-9]`, 1..=[`HC_UNDERLYING_LEN_MAX`]).
+    HcUnderlying,
     PairRef,
 }
 
@@ -645,6 +693,10 @@ struct Builder {
     mexc_spot: Option<Vec<String>>,
     mexc_perp: Option<Vec<String>>,
     hyperevm_pools: Option<Vec<String>>,
+    hc_underlyings: Option<Vec<String>>,
+    hc_expiries: Option<u32>,
+    hc_strikes: Option<u32>,
+    hc_summary_every_s: Option<u32>,
     pairs_map: Option<Vec<String>>,
 }
 
@@ -688,6 +740,7 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
                 "bybit" => Section::Bybit,
                 "mexc" => Section::Mexc,
                 "hyperevm" => Section::HyperEvm,
+                "hypercall" => Section::Hypercall,
                 "pairs" => Section::Pairs,
                 other => {
                     return Err(err(line_no, format!("unknown section `[{other}]`")));
@@ -730,7 +783,10 @@ pub fn parse(src: &str) -> Result<Universe, UniverseError> {
             | Slot::OkxOptExpiries
             | Slot::OkxOptStrikes
             | Slot::DeribitOptExpiries
-            | Slot::DeribitOptStrikes => {
+            | Slot::DeribitOptStrikes
+            | Slot::HcExpiries
+            | Slot::HcStrikes
+            | Slot::HcSummaryEveryS => {
                 let v = parse_uint(key, value, line_no)?;
                 store_int(&mut b, slot, v, line_no)?;
             }
@@ -810,6 +866,10 @@ fn slot_for(section: Section, key: &str) -> Option<Slot> {
         (Section::Mexc, "spot") => Some(Slot::MexcSpot),
         (Section::Mexc, "perp") => Some(Slot::MexcPerp),
         (Section::HyperEvm, "pools") => Some(Slot::HyperEvmPools),
+        (Section::Hypercall, "underlyings") => Some(Slot::HcUnderlyings),
+        (Section::Hypercall, "expiries") => Some(Slot::HcExpiries),
+        (Section::Hypercall, "strikes") => Some(Slot::HcStrikes),
+        (Section::Hypercall, "summary_every_s") => Some(Slot::HcSummaryEveryS),
         (Section::Pairs, "map") => Some(Slot::PairsMap),
         _ => None,
     }
@@ -837,6 +897,7 @@ fn elem_kind(slot: Slot) -> ElemKind {
         Slot::BnOptUnderlyings | Slot::OkxOptUnderlyings | Slot::DeribitOptUnderlyings => {
             ElemKind::OptUnderlying
         }
+        Slot::HcUnderlyings => ElemKind::HcUnderlying,
         Slot::PairsMap => ElemKind::PairRef,
         Slot::OkxDepth
         | Slot::DeribitDepth
@@ -845,7 +906,10 @@ fn elem_kind(slot: Slot) -> ElemKind {
         | Slot::OkxOptExpiries
         | Slot::OkxOptStrikes
         | Slot::DeribitOptExpiries
-        | Slot::DeribitOptStrikes => {
+        | Slot::DeribitOptStrikes
+        | Slot::HcExpiries
+        | Slot::HcStrikes
+        | Slot::HcSummaryEveryS => {
             unreachable!("bool/int slots have no elements")
         }
     }
@@ -972,6 +1036,7 @@ fn validate_elem(kind: ElemKind, s: &str, line_no: usize) -> Result<(), Universe
         ElemKind::OptUnderlying => {
             validate_name(s, OPT_UNDERLYING_LEN_MAX, "options underlying", line_no)
         }
+        ElemKind::HcUnderlying => validate_hc_underlying(s, line_no),
         ElemKind::PairRef => validate_pair_ref(s, line_no).map(|_| ()),
     }
 }
@@ -1161,6 +1226,23 @@ fn validate_hl_rolling(s: &str, line_no: usize) -> Result<(), UniverseError> {
     Ok(())
 }
 
+/// HC4: Hypercall underlyings are its own UPPERCASE names (`SP500`,
+/// `SPCX`, `BTC`) — the `/markets` `underlying` field and the instrument
+/// names' first segment carry them verbatim, and `-` would split a name.
+fn validate_hc_underlying(s: &str, line_no: usize) -> Result<(), UniverseError> {
+    let ok = !s.is_empty()
+        && s.len() <= HC_UNDERLYING_LEN_MAX
+        && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            line_no,
+            format!("bad Hypercall underlying `{s}` (want UPPERCASE [A-Z0-9], 1..={HC_UNDERLYING_LEN_MAX})"),
+        ))
+    }
+}
+
 fn validate_name(s: &str, max: usize, what: &str, line_no: usize) -> Result<(), UniverseError> {
     let ok = !s.is_empty()
         && s.len() <= max
@@ -1290,6 +1372,11 @@ fn store_array(
                 return Err(dup("pools"));
             }
         }
+        Slot::HcUnderlyings => {
+            if b.hc_underlyings.replace(items).is_some() {
+                return Err(dup("underlyings"));
+            }
+        }
         Slot::PairsMap => {
             if b.pairs_map.replace(items).is_some() {
                 return Err(dup("map"));
@@ -1302,7 +1389,10 @@ fn store_array(
         | Slot::OkxOptExpiries
         | Slot::OkxOptStrikes
         | Slot::DeribitOptExpiries
-        | Slot::DeribitOptStrikes => {
+        | Slot::DeribitOptStrikes
+        | Slot::HcExpiries
+        | Slot::HcStrikes
+        | Slot::HcSummaryEveryS => {
             unreachable!("bool/int slots never store arrays")
         }
     }
@@ -1379,6 +1469,21 @@ fn store_int(b: &mut Builder, slot: Slot, v: u32, line_no: usize) -> Result<(), 
         Slot::BnOptStrikes => {
             if b.bn_opt_strikes.replace(v).is_some() {
                 return Err(err(line_no, "duplicate key `options_strikes`"));
+            }
+        }
+        Slot::HcExpiries => {
+            if b.hc_expiries.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `expiries`"));
+            }
+        }
+        Slot::HcStrikes => {
+            if b.hc_strikes.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `strikes`"));
+            }
+        }
+        Slot::HcSummaryEveryS => {
+            if b.hc_summary_every_s.replace(v).is_some() {
+                return Err(err(line_no, "duplicate key `summary_every_s`"));
             }
         }
         _ => unreachable!("non-integer slots never store integers"),
@@ -1515,22 +1620,72 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
     // Options policies (M2.1 deribit, M2.2 okx) — one law, per venue.
     let deribit_options = finalize_options_policy(
         "Deribit",
+        "options_",
         b.deribit_opt_underlyings.unwrap_or_default(),
         b.deribit_opt_expiries,
         b.deribit_opt_strikes,
     )?;
     let okx_options = finalize_options_policy(
         "OKX",
+        "options_",
         b.okx_opt_underlyings.unwrap_or_default(),
         b.okx_opt_expiries,
         b.okx_opt_strikes,
     )?;
     let bn_options = finalize_options_policy(
         "Binance",
+        "options_",
         b.bn_opt_underlyings.unwrap_or_default(),
         b.bn_opt_expiries,
         b.bn_opt_strikes,
     )?;
+    // HC4: the same law under the section's own key names, plus the
+    // one-frame subscribe's table cap and the poller cadence.
+    let hypercall = finalize_options_policy(
+        "Hypercall",
+        "",
+        b.hc_underlyings.unwrap_or_default(),
+        b.hc_expiries,
+        b.hc_strikes,
+    )?;
+    let hc_rows = hypercall.underlyings.len() as u32 * hypercall.per_underlying_cap();
+    if hc_rows > HC_INSTRUMENTS_MAX {
+        return Err(err(
+            0,
+            format!(
+                "Hypercall universe {} underlyings × {} expiries × {} strikes × 2 = {hc_rows} \
+                 instruments exceeds the one-frame subscribe cap {HC_INSTRUMENTS_MAX}",
+                hypercall.underlyings.len(),
+                hypercall.expiries,
+                hypercall.strikes
+            ),
+        ));
+    }
+    if hypercall.underlyings.is_empty() && b.hc_summary_every_s.is_some() {
+        return Err(err(
+            0,
+            "Hypercall `summary_every_s` set but `underlyings` is empty — remove the knob or \
+             configure underlyings",
+        ));
+    }
+    // 0 while the lane is off, so a file without `[hypercall]` parses to
+    // the pre-HC4 universe bit for bit.
+    let hypercall_summary_every_s = if hypercall.enabled() {
+        b.hc_summary_every_s.unwrap_or(HC_SUMMARY_EVERY_S_DEFAULT)
+    } else {
+        0
+    };
+    if hypercall.enabled()
+        && !(HC_SUMMARY_EVERY_S_MIN..=HC_SUMMARY_EVERY_S_MAX).contains(&hypercall_summary_every_s)
+    {
+        return Err(err(
+            0,
+            format!(
+                "Hypercall `summary_every_s` {hypercall_summary_every_s} out of range \
+                 {HC_SUMMARY_EVERY_S_MIN}..={HC_SUMMARY_EVERY_S_MAX}"
+            ),
+        ));
+    }
 
     // Pairs: re-parse (validated per element already), range-check.
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -1581,6 +1736,8 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
         mexc_spot,
         mexc_perp,
         hyperevm_pools,
+        hypercall,
+        hypercall_summary_every_s,
         pairs,
     })
 }
@@ -1589,9 +1746,12 @@ fn finalize(b: Builder) -> Result<Universe, UniverseError> {
 /// integer knobs are meaningless without underlyings (fail-fast);
 /// underlyings dup-checked and capped; E 1..=[`OPT_EXPIRIES_MAX`];
 /// K EVEN, 2..=[`OPT_STRIKES_MAX`]. Defaults apply when the integer
-/// keys are absent.
+/// keys are absent. `key` is the section's key prefix — `options_` in
+/// a mixed venue's section, empty in `[hypercall]` (options-only) — so
+/// every message names the key the operator actually wrote.
 fn finalize_options_policy(
     venue: &str,
+    key: &str,
     underlyings: Vec<String>,
     expiries_key: Option<u32>,
     strikes_key: Option<u32>,
@@ -1606,8 +1766,8 @@ fn finalize_options_policy(
         return Err(err(
             0,
             format!(
-                "{venue} `options_expiries`/`options_strikes` set but \
-                 `options_underlyings` is empty — remove the knobs or configure underlyings"
+                "{venue} `{key}expiries`/`{key}strikes` set but \
+                 `{key}underlyings` is empty — remove the knobs or configure underlyings"
             ),
         ));
     }
@@ -1616,14 +1776,14 @@ fn finalize_options_policy(
     if expiries == 0 || expiries > OPT_EXPIRIES_MAX {
         return Err(err(
             0,
-            format!("{venue} `options_expiries` {expiries} out of range 1..={OPT_EXPIRIES_MAX}"),
+            format!("{venue} `{key}expiries` {expiries} out of range 1..={OPT_EXPIRIES_MAX}"),
         ));
     }
     if !(2..=OPT_STRIKES_MAX).contains(&strikes) || strikes % 2 != 0 {
         return Err(err(
             0,
             format!(
-                "{venue} `options_strikes` {strikes} must be EVEN and in 2..={OPT_STRIKES_MAX} \
+                "{venue} `{key}strikes` {strikes} must be EVEN and in 2..={OPT_STRIKES_MAX} \
                  (K/2 strikes each side of ATM)"
             ),
         ));
@@ -1842,6 +2002,17 @@ pub fn allocate_with_anchors(
         });
         out.hyperevm_pools.push(pool);
     }
+    // HC4: one settlement-index sym per Hypercall underlying, ordinal
+    // i + 1 of venue byte 9 (the options sit above, from
+    // OPT_ORDINAL_BASE, allocated by the cli after discovery).
+    for i in 0..u.hypercall.underlyings.len() {
+        let name = u.hypercall.underlyings[i].clone();
+        out.hypercall_idx.push(Instrument {
+            sym: make_symbol_id(VenueId::Hypercall, i as u32 + 1),
+            descriptor: format!("hypercall-idx:{name}"),
+            name,
+        });
+    }
 
     // Universe-wide duplicate-id check (fail fast, name both sides).
     let mut all: Vec<(SymbolId, &str)> = Vec::new();
@@ -1861,6 +2032,7 @@ pub fn allocate_with_anchors(
         &out.mexc_spot,
         &out.mexc_perp,
         &out.hyperevm,
+        &out.hypercall_idx,
     ] {
         for inst in group {
             all.push((inst.sym, inst.descriptor.as_str()));
@@ -2281,6 +2453,81 @@ map = ["0:0", "1:1"]
         // The D9 law: any list is ≤ VENUE_LIST_MAX < the perp base.
         const { assert!(VENUE_LIST_MAX < MEXC_PERP_ORDINAL_BASE as usize) };
         const { assert!(MEXC_LIST_MAX <= VENUE_LIST_MAX) };
+    }
+
+    #[test]
+    fn hypercall_section_parses_allocates_and_validates() {
+        // HC4 (O-HC2): all twelve underlyings, E3 × K8 — 576 options,
+        // discovered at boot; the file allocates only the indices.
+        let src = "[hypercall]\nunderlyings = [\"SP500\", \"SPCX\", \"MU\", \"NVDA\", \"MSFT\", \"META\", \
+                   \"AAPL\", \"BABA\", \"SNDK\", \"BOT\", \"BTC\", \"ETH\"]\nexpiries = 3\nstrikes = 8\n\
+                   summary_every_s = 600\n";
+        let u = parse(src).unwrap();
+        assert!(u.hypercall.enabled());
+        assert_eq!(u.hypercall.underlyings.len(), 12);
+        assert_eq!((u.hypercall.expiries, u.hypercall.strikes), (3, 8));
+        assert_eq!(u.hypercall.underlyings.len() as u32 * u.hypercall.per_underlying_cap(), 576);
+        assert_eq!(u.hypercall_summary_every_s, 600);
+        let a = allocate(&u).unwrap();
+        assert_eq!(a.hypercall_idx.len(), 12);
+        assert_eq!(a.hypercall_idx[0].sym, make_symbol_id(VenueId::Hypercall, 1));
+        assert_eq!(a.hypercall_idx[0].descriptor, "hypercall-idx:SP500");
+        assert_eq!(a.hypercall_idx[11].sym, make_symbol_id(VenueId::Hypercall, 12));
+        assert_eq!(a.hypercall_idx[11].name, "ETH");
+        // The index block stays below the options' ordinal base.
+        const { assert!((HC_INSTRUMENTS_MAX as usize) <= 1024 && OPT_UNDERLYINGS_MAX < OPT_ORDINAL_BASE as usize) };
+        // Defaults: the shared law's E/K, the poller's period.
+        let d = parse("[hypercall]\nunderlyings = [\"BTC\"]\n").unwrap();
+        assert_eq!((d.hypercall.expiries, d.hypercall.strikes), (OPT_EXPIRIES_DEFAULT, OPT_STRIKES_DEFAULT));
+        assert_eq!(d.hypercall_summary_every_s, HC_SUMMARY_EVERY_S_DEFAULT);
+        // Venue namespacing: Hypercall `BTC` never collides with HL's.
+        let both = "[hyperliquid]\ncoins = [\"BTC\"]\n[hypercall]\nunderlyings = [\"BTC\"]\n";
+        let a2 = allocate(&parse(both).unwrap()).unwrap();
+        assert_ne!(a2.hl[0].sym, a2.hypercall_idx[0].sym);
+        // Names are the venue's own: UPPERCASE [A-Z0-9], ≤ 12 bytes.
+        for bad in ["btc", "SP-500", "ABCDEFGHIJKLM", ""] {
+            let e = parse(&format!("[hypercall]\nunderlyings = [\"{bad}\"]\n")).unwrap_err();
+            assert!(e.msg.contains("bad Hypercall underlying"), "{bad}: {e}");
+        }
+        // The shared policy law, under THIS section's key names.
+        let e = parse("[hypercall]\nexpiries = 2\n").unwrap_err();
+        assert!(e.msg.contains("Hypercall") && e.msg.contains("`underlyings`"), "{e}");
+        assert!(!e.msg.contains("options_"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\"]\nstrikes = 7\n").unwrap_err();
+        assert!(e.msg.contains("`strikes` 7 must be EVEN"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\"]\nexpiries = 5\n").unwrap_err();
+        assert!(e.msg.contains("`expiries` 5 out of range"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\", \"BTC\"]\n").unwrap_err();
+        assert!(e.msg.contains("duplicate Hypercall options underlying"), "{e}");
+        // The poller cadence: bounded, and meaningless without the lane.
+        for (v, ok) in [(59u32, false), (60, true), (3600, true), (3601, false)] {
+            let r = parse(&format!("[hypercall]\nunderlyings = [\"BTC\"]\nsummary_every_s = {v}\n"));
+            assert_eq!(r.is_ok(), ok, "summary_every_s = {v}: {r:?}");
+        }
+        let e = parse("[hypercall]\nsummary_every_s = 300\n").unwrap_err();
+        assert!(e.msg.contains("`summary_every_s` set but `underlyings` is empty"), "{e}");
+        // The one-frame subscribe cap: 16 × 4 × 8 × 2 = 1024 fits, one
+        // more strike pair does not.
+        let mut sixteen = String::from("[hypercall]\nunderlyings = [");
+        for i in 0..16 {
+            if i > 0 {
+                sixteen.push(',');
+            }
+            sixteen.push_str(&format!("\"U{i}\""));
+        }
+        sixteen.push_str("]\nexpiries = 4\n");
+        assert!(parse(&format!("{sixteen}strikes = 8\n")).is_ok());
+        let e = parse(&format!("{sixteen}strikes = 10\n")).unwrap_err();
+        assert!(e.msg.contains("exceeds the one-frame subscribe cap 1024"), "{e}");
+        // Other sections' key names are unknown here.
+        let e = parse("[hypercall]\noptions_underlyings = [\"BTC\"]\n").unwrap_err();
+        assert!(e.msg.contains("unknown key"), "{e}");
+        let e = parse("[hypercall]\nunderlyings = [\"BTC\"]\nunderlyings = [\"ETH\"]\n").unwrap_err();
+        assert!(e.msg.contains("duplicate key `underlyings`"), "{e}");
+        // An empty section is the pre-HC4 universe, bit for bit.
+        let empty = parse("[hypercall]\nunderlyings = []\n").unwrap();
+        assert_eq!(empty, Universe::default());
+        assert_eq!(allocate(&empty).unwrap(), AllocatedUniverse::default());
     }
 
     #[test]

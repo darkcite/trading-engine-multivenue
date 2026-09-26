@@ -8102,6 +8102,17 @@ pub mod boot_discovery {
         /// per LIVE configured perp, in `[mexc] perp` order — the
         /// Funding events' `v1` clock. Empty when no perp is live.
         pub mexc_funding: Vec<(String, ingress_mexc::discovery::MexcFundingSeed)>,
+        /// HC4: Hypercall coverage — `configured` underlyings,
+        /// `matched` = those that selected a chain, `universe` = the
+        /// candidate rows `/markets` listed for them. `None` when
+        /// `[hypercall]` is off.
+        pub hypercall: Option<VenueCoverage>,
+        /// HC4: the selected Hypercall capped chain (O-HC2), in the
+        /// DETERMINISTIC allocation order (underlyings in config order;
+        /// per underlying: expiry asc → strike asc → call before put;
+        /// ordinals from [`OPT_ORDINAL_BASE`]) with the venue's own
+        /// terms. Empty when the lane is off.
+        pub hypercall_options: Vec<super::DiscoveredOption>,
     }
 
     // -----------------------------------------------------------
@@ -9036,6 +9047,7 @@ pub mod boot_discovery {
         bn_options_policy: &OptionsPolicy,
         bybit: Option<(&[String], &[String])>,
         mexc: Option<(&[String], &[String])>,
+        hypercall_policy: &OptionsPolicy,
         polymarket_asset_ids: &[String],
     ) -> Result<Outcome, &'static str> {
         let mut buf: Vec<u8> = Vec::new();
@@ -9167,6 +9179,15 @@ pub mod boot_discovery {
             _ => (None, Vec::new()),
         };
 
+        // HC4: ONE /markets pass + the O-HC2 capped chain.
+        let (hypercall, hypercall_options) = if hypercall_policy.enabled() {
+            let (cov, opts) =
+                run_hypercall(cfg, tls_config, hypercall_policy, &mut buf, &mut any_missing)?;
+            (Some(cov), opts)
+        } else {
+            (None, Vec::new())
+        };
+
         let pm = run_pm(
             cfg,
             tls_config,
@@ -9190,7 +9211,140 @@ pub mod boot_discovery {
             bybit: bybit_cov,
             mexc: mexc_cov,
             mexc_funding,
+            hypercall,
+            hypercall_options,
         })
+    }
+
+    /// HC4: the Hypercall boot discovery. ONE `GET /markets` — every
+    /// listed instrument, ≈ 4.3 MB (927 ms from the Mac, 2026-09-25) —
+    /// scanned in one forward pass (`ingress_hypercall::discovery`),
+    /// then the O-HC2 capped chain per configured underlying: the
+    /// nearest `expiries` series OUTSIDE the provider's pre-expiry
+    /// quoting blackout × the `strikes` nearest the venue's index.
+    ///
+    /// A configured underlying the venue does not list is FATAL (a typo
+    /// must never boot a silently smaller universe — the Deribit-combo
+    /// precedent); one that is listed but selects nothing (every series
+    /// inside the blackout) marks the boot `any_missing`. Options take
+    /// ordinals from [`OPT_ORDINAL_BASE`] in selection order; the
+    /// indices below them are the config file's.
+    fn run_hypercall(
+        cfg: &Config,
+        tls: &Arc<rustls::ClientConfig>,
+        policy: &OptionsPolicy,
+        buf: &mut Vec<u8>,
+        any_missing: &mut bool,
+    ) -> Result<(VenueCoverage, Vec<super::DiscoveredOption>), &'static str> {
+        use ingress_hypercall::discovery::{
+            parse_markets, select_universe, DiscoveryErr, DEFAULT_BLACKOUT_MS, MARKETS_MAX_BODY,
+            MARKETS_PATH,
+        };
+        let (host, port) = split_host_port(&cfg.hypercall_rest_host, 443)?;
+        let range = core_net::boot_http::https_get(
+            tls,
+            host,
+            port,
+            MARKETS_PATH,
+            USER_AGENT,
+            buf,
+            MARKETS_MAX_BODY,
+            FETCH_TIMEOUT,
+        )
+        .map_err(|e| {
+            tracing::error!(venue = "hypercall", error = ?e, "discovery: /markets fetch failed");
+            "hypercall: /markets fetch failed"
+        })?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let unds: Vec<&[u8]> = policy.underlyings.iter().map(|u| u.as_bytes()).collect();
+        let m = parse_markets(&buf[range], &unds, now_ms, DEFAULT_BLACKOUT_MS).map_err(|e| {
+            let underlying = match e {
+                DiscoveryErr::NotListed(i) => policy.underlyings.get(i).map_or("?", String::as_str),
+                _ => "",
+            };
+            tracing::error!(venue = "hypercall", error = %e, underlying, "discovery: /markets refused");
+            match e {
+                DiscoveryErr::NotListed(_) => {
+                    "hypercall: a configured underlying is not listed — fix [hypercall] underlyings"
+                }
+                DiscoveryErr::TooManyUnderlyings => "hypercall: too many underlyings configured",
+                DiscoveryErr::Malformed => "hypercall: /markets body is not a markets answer",
+            }
+        })?;
+        let sel = select_universe(&m, unds.len(), policy.expiries, policy.strikes);
+        let mut per_und = vec![0u32; unds.len()];
+        let mut out: Vec<super::DiscoveredOption> = Vec::with_capacity(sel.len());
+        for (k, row) in sel.iter().enumerate() {
+            let name = core::str::from_utf8(row.name())
+                .map_err(|_| "hypercall: non-utf8 option instrument name")?;
+            let sym = make_symbol_id(VenueId::Hypercall, OPT_ORDINAL_BASE + k as u32 + 1);
+            if let Some(n) = per_und.get_mut(row.underlying as usize) {
+                *n += 1;
+            }
+            out.push((
+                name.to_string(),
+                sym,
+                row.strike_1e9,
+                row.exp_ms,
+                if row.call {
+                    opt_registry::RIGHT_CALL
+                } else {
+                    opt_registry::RIGHT_PUT
+                },
+            ));
+        }
+        let mut matched = 0u32;
+        for (i, u) in policy.underlyings.iter().enumerate() {
+            let selected = per_und[i];
+            if selected == 0 {
+                *any_missing = true;
+                tracing::error!(
+                    venue = "hypercall",
+                    underlying = %u,
+                    reason = "no_chain",
+                    "discovery: options underlying selected no instruments"
+                );
+            } else {
+                matched += 1;
+            }
+            tracing::info!(
+                venue = "hypercall",
+                underlying = %u,
+                index_px_1e9 = m.index_1e9[i],
+                expiries = policy.expiries,
+                strikes = policy.strikes,
+                selected,
+                "discovery: options chain"
+            );
+        }
+        if out.len() > ingress_hypercall::HC_MAX_INSTRUMENTS {
+            tracing::error!(
+                venue = "hypercall",
+                selected = out.len(),
+                cap = ingress_hypercall::HC_MAX_INSTRUMENTS,
+                "discovery: selected chain exceeds the one-frame subscribe cap"
+            );
+            return Err("hypercall: selected chain exceeds HC_MAX_INSTRUMENTS — shrink \
+                 [hypercall] underlyings/expiries/strikes");
+        }
+        tracing::info!(
+            venue = "hypercall",
+            candidates = m.rows.len(),
+            refused = m.refused,
+            selected = out.len(),
+            "discovery: hypercall universe"
+        );
+        Ok((
+            VenueCoverage {
+                configured: unds.len() as u32,
+                matched,
+                universe: m.rows.len() as u32,
+            },
+            out,
+        ))
     }
 
     /// MX6: the MEXC boot audit. Spot: ONE `GET /api/v3/exchangeInfo`

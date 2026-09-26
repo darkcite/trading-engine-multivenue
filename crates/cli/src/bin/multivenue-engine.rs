@@ -2835,6 +2835,7 @@ fn run(args: RunArgs) -> ExitCode {
         &boot.bn_options,
         bybit_discovery_arg,
         mexc_discovery_arg,
+        &boot.hypercall_options,
         &pm_ids,
     ) {
         Ok(o) => o,
@@ -2866,6 +2867,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     if !options_manifest.is_empty() {
         let manifest_path = run_dir.join(cli::options_manifest::OPTIONS_MANIFEST_FILE);
@@ -2877,7 +2879,8 @@ fn run(args: RunArgs) -> ExitCode {
             path = %manifest_path.display(),
             rows = discovery.deribit_options.len()
                 + discovery.okx_options.len()
-                + discovery.bn_options.len(),
+                + discovery.bn_options.len()
+                + discovery.hypercall_options.len(),
             "capture: options manifest written"
         );
     }
@@ -2889,6 +2892,7 @@ fn run(args: RunArgs) -> ExitCode {
         &discovery.deribit_options,
         &discovery.okx_options,
         &discovery.bn_options,
+        &discovery.hypercall_options,
     );
     {
         let manifest_path = run_dir.join(cli::options_manifest::INSTRUMENT_MANIFEST_FILE);
@@ -3117,6 +3121,7 @@ fn run(args: RunArgs) -> ExitCode {
             &discovery.deribit_options,
             &discovery.okx_options,
             &discovery.bn_options,
+            &discovery.hypercall_options,
             boot.okx_depth,
             boot.deribit_depth,
         ),
