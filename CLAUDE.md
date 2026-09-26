@@ -223,9 +223,9 @@ in the script; `ai` = 48 is the floor every name includes).
 - **Gates at HEAD (the cached-index ring, 2026-09-25; Foundry and worker
   pytest as of the HYPARB merge):** nextest 3131 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
-  and `hyperevm_live_smoke` among them) · alloc 73/73 at the gates' pins
-  (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +1 ignored
-  child helper) · clippy clean · `make license-check` OK · `make
+  and `hyperevm_live_smoke` among them) · alloc 81/81 at the gates' pins
+  (0 B/op; gate 72 pins `HttpsPost` at exactly 2 — rustls; +2 ignored
+  child helpers) · clippy clean · `make license-check` OK · `make
   copy-audit` new=0 (self-test OK; 31 baselined over the exec lane,
   core-net, core-ring, all nine ingress crates and the HYPARB crates) ·
   Foundry 11 unit +

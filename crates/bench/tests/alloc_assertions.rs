@@ -1359,9 +1359,9 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
 
     // The lane arrays below are written out for the lane geometry
     // (seven tick lanes since MX2 added MEXC at lane 6, after WS9's
-    // Bybit at lane 5; four fill lanes); break the build loudly if
-    // that drifts.
-    const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 4);
+    // Bybit at lane 5; five fill lanes since BX3 gave Binance lane 4);
+    // break the build loudly if that drifts.
+    const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 5);
 
     struct NoopStrat;
     impl StrategyCounters for NoopStrat {}
@@ -1383,7 +1383,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let _ = std::marker::PhantomData::<SubmitErr>;
 
     // Lane arrays: seven tick lanes (Polymarket, Binance, OKX,
-    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2) + four fill lanes. Only
+    // Deribit, Hyperliquid, Bybit — WS9, MEXC — MX2) + five fill lanes. Only
     // lane 0 (Polymarket) gets a live producer here; the unused
     // producer halves stay alive until end of scope, and their lanes
     // simply read empty every iteration.
@@ -1429,6 +1429,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f4p, f4) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     // Phase 8f: the AI lane rides in every engine; producer-dropped
     // here so it reads empty (two atomic loads per iteration inside
     // the measured window — part of the real tick cost).
@@ -1449,7 +1450,7 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         [d0, d1],
         [o0, o1, o2],
         sc,
-        [f0, f1, f2, f3],
+        [f0, f1, f2, f3, f4],
         ai_c,
         std::sync::Arc::new(AiIngressStatus::new()),
         tbl_c,
@@ -9445,5 +9446,644 @@ fn ws_conn_session_round_allocates_only_rustls_record_buffers() {
         "WsConn round: {allocs} allocations ({bytes} B) over {ROUNDS} rounds — rustls' buffered \
          API accounts for exactly {RUSTLS_ALLOCS_PER_ROUND}/round (one sealed record out, one \
          decrypted record in); anything above is ours"
+    );
+}
+
+/// **BX3 gate 75 — the router's retirement drain (F9).**
+///
+/// An arm reports every accepted order that ended without a (further)
+/// fill as a `Retired`; the router drains at most `RETIRED_DRAIN_MAX`
+/// of them per `on_idle`, releases each one's resting row and counts it
+/// by `why`. It runs on the engine thread every idle moment, so it must
+/// be allocation-free in the steady state — including the poll where
+/// the bound fires, which is every poll here: the arm queues a burst of
+/// 100 a poll from a preallocated ring, every `why` code and two
+/// undefined ones in turn.
+#[test]
+fn routed_retired_drain_steady_state() {
+    use clob_dispatcher::{DispatchError, HaltSignal, OrderDispatch, PaperDispatcher, Retired};
+    use core_types::{CancelReq, Fill, ModifyReq, Order};
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, RoutedDispatcher, SlotCaps, RETIRED_DRAIN_MAX,
+    };
+
+    const SLOT: u8 = 3;
+    const RING: usize = 256;
+    const BURST: usize = 100;
+    const POLLS: u64 = 1_000;
+
+    /// A fixed ring of retirements, refilled by a burst each idle.
+    struct Arm {
+        ring: [Retired; RING],
+        head: usize,
+        len: usize,
+        polls: u64,
+    }
+    impl OrderDispatch for Arm {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+        }
+        fn try_next_retired(&mut self) -> Option<Retired> {
+            if self.len == 0 {
+                return None;
+            }
+            let r = self.ring[self.head];
+            self.head = (self.head + 1) % RING;
+            self.len -= 1;
+            Some(r)
+        }
+        fn on_idle(&mut self) -> bool {
+            self.polls += 1;
+            let mut k = 0usize;
+            while k < BURST && self.len < RING {
+                let tail = (self.head + self.len) % RING;
+                let n = self.polls * BURST as u64 + k as u64;
+                self.ring[tail] = Retired::new(n, SLOT, (n % 8) as u8);
+                self.len += 1;
+                k += 1;
+            }
+            false
+        }
+    }
+
+    // Boot-time construction — outside the window.
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[core_types::VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+        )
+        .expect("boot: slot 3 live");
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        Arm {
+            ring: [Retired::default(); RING],
+            head: 0,
+            len: 0,
+            polls: 0,
+        },
+        core_time::WallAnchor::new(1_789_776_001_000_000_000, 1_789_776_001_000_000_000),
+    );
+    // One poll outside the window: the seeding edge.
+    d.on_idle();
+
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < POLLS {
+        std::hint::black_box(d.on_idle());
+        std::hint::black_box(d.retired().total());
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    // The bound fired on every poll: the arm always held more.
+    assert_eq!(d.retired().total(), (POLLS + 1) * RETIRED_DRAIN_MAX as u64);
+    let mut w = 0usize;
+    while w < 6 {
+        assert!(d.retired().by_why[w] > 0, "why {w} never drained");
+        w += 1;
+    }
+    assert!(
+        d.retired().by_why[clob_dispatcher::RETIRED_WHY_UNKNOWN] > 0,
+        "the undefined codes were counted"
+    );
+    assert_eq!(
+        allocs, 0,
+        "gate 75: the retirement drain allocated {allocs} times ({bytes} B) over {POLLS} polls"
+    );
+}
+
+/// **BX3 gate 76 — two live arms split by venue, under the HYPARB split.**
+///
+/// The engine's BX3 shape: `SlotSplit<VenueSplit<Hl, Bn>, HyparbLive>`
+/// behind the router, with the legacy anchor aliased to Binance. Inside
+/// the window every verb reaches each arm by its route venue (Hyperliquid
+/// ids, native Binance ids and the aliased anchor), the idle poll merges
+/// the signal of a slot both venue arms trade, and ticks, venue events
+/// and option summaries fan out to all three arms. Zero allocations.
+#[test]
+fn venuesplit_route_steady_state() {
+    use clob_dispatcher::{
+        DispatchError, HaltSignal, OrderDispatch, PaperDispatcher, RouteAliases,
+    };
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, OptSummary, Order, Price, Qty, Side,
+        Tick, VenueId,
+    };
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, RoutedDispatcher, SlotCaps, SlotSplit,
+        VenueSplit, LAW_LINEAR, LAW_SPOT,
+    };
+
+    const T0: u64 = 1_789_776_001_000_000_000;
+    const BN: u8 = VenueId::Binance as u8;
+    const HL: u8 = VenueId::Hyperliquid as u8;
+    const EVM: u8 = VenueId::HyperEvm as u8;
+
+    /// Accepts every verb and counts what reached it.
+    #[derive(Default)]
+    struct Count {
+        verbs: u64,
+        idles: u64,
+        events: u64,
+        ticks: u64,
+        opts: u64,
+    }
+    impl OrderDispatch for Count {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            self.verbs += 1;
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            self.verbs += 1;
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            self.verbs += 1;
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn observe_tick(&mut self, _t: &Tick, _now: core_types::NsTs) {
+            self.ticks += 1;
+        }
+        fn on_venue_event(&mut self, _e: &ChannelEvent) {
+            self.events += 1;
+        }
+        fn on_opt_summary(&mut self, _s: &OptSummary) {
+            self.opts += 1;
+        }
+        fn on_idle(&mut self) -> bool {
+            self.idles += 1;
+            false
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+        }
+    }
+
+    // Boot-time construction — outside the window.
+    let caps = SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64);
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(3, ExecMode::Live, &[HL], caps, HaltLimits::none())
+        .expect("slot 3");
+    route
+        .set_slot(2, ExecMode::Live, &[BN], caps, HaltLimits::none())
+        .expect("slot 2");
+    route
+        .set_slot(5, ExecMode::Live, &[HL, BN], caps, HaltLimits::none())
+        .expect("slot 5");
+    route
+        .set_slot(0, ExecMode::Live, &[EVM, HL], caps, HaltLimits::none())
+        .expect("slot 0");
+    let aliases = RouteAliases::NONE.with(7, BN).expect("alias");
+    let venue = VenueSplit::new(BN, Count::default(), Count::default(), &route);
+    let live = SlotSplit::new(0, venue, Count::default());
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        live,
+        core_time::WallAnchor::new(T0, T0),
+    );
+    d.set_route_aliases(aliases);
+    let lin = core_types::make_symbol_id(VenueId::Binance, 600);
+    d.bind_instrument(&InstrumentSpec::new(7, LAW_SPOT, 0, 0, 0))
+        .expect("anchor row");
+    d.bind_instrument(&InstrumentSpec::new(lin, LAW_LINEAR, 0, 0, 0))
+        .expect("linear row");
+    d.on_idle(); // the seeding edge
+
+    let mk = |slot: u8, venue: u8, sym: core_types::SymbolId, oid: u64| {
+        let mut o = Order::new(
+            T0,
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            0,
+            Price::from_raw(1_000_000),
+            Qty::from_raw(1_000_000),
+            oid,
+        );
+        o.venue = venue;
+        o.strategy_id = slot;
+        o
+    };
+    let tick = Tick::new(
+        T0,
+        VenueId::Binance,
+        lin,
+        1,
+        Price::from_raw(1_000_000),
+        Qty::from_raw(1_000_000),
+        Price::from_raw(1_001_000),
+        Qty::from_raw(1_000_000),
+    );
+    let ev = ChannelEvent::new(T0, VenueId::Binance, ChannelId::Funding, lin, 1, 0, 1, 1);
+    let opt = OptSummary::new(T0, VenueId::Binance, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    let g = AllocGuard::new();
+    let mut refused = 0u64;
+    let mut i = 0u64;
+    while i < 10_000 {
+        let oid = 1_000_000 + i * 4;
+        let (slot, venue, sym) = match i % 5 {
+            0 => (3u8, HL, 4096 + (i as u32 & 63)),
+            1 => (2u8, BN, lin),
+            2 => (5u8, 0u8, 7u32),
+            3 => (5u8, HL, 4200 + (i as u32 & 63)),
+            _ => (0u8, EVM, core_types::make_symbol_id(VenueId::HyperEvm, 1)),
+        };
+        let o = mk(slot, venue, sym, oid);
+        if d.submit(&o).is_err() {
+            refused += 1;
+        }
+        let mut rep = o;
+        rep.client_oid = oid + 1;
+        if d.modify(&ModifyReq::new(oid, rep)).is_err() {
+            refused += 1;
+        }
+        if d.cancel(&CancelReq::of(&rep, T0)).is_err() {
+            refused += 1;
+        }
+        d.observe_tick(&tick, T0);
+        if i % 8 == 0 {
+            d.on_idle();
+        }
+        if i % 16 == 0 {
+            d.on_venue_event(&ev);
+        }
+        if i % 32 == 0 {
+            d.on_opt_summary(&opt);
+        }
+        std::hint::black_box(d.exec_counters().live_submits);
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    let s = d.live();
+    let (hl, bn, evm) = (s.a().a(), s.a().b(), s.b());
+    assert_eq!(refused, 0, "every verb was routed and accepted");
+    assert!(
+        hl.verbs > 0 && bn.verbs > 0 && evm.verbs > 0,
+        "a venue arm saw no verb"
+    );
+    assert_eq!(hl.verbs, 3 * 4_000, "Hyperliquid: slots 3 and 5");
+    assert_eq!(
+        bn.verbs,
+        3 * 4_000,
+        "Binance: slot 2 native and the slot-5 anchor"
+    );
+    assert_eq!(evm.verbs, 3 * 2_000, "HYPARB: slot 0");
+    assert!(hl.idles > 0 && bn.idles > 0 && evm.idles > 0);
+    assert!(hl.events > 0 && bn.events > 0 && evm.events > 0);
+    assert!(hl.ticks > 0 && bn.ticks > 0 && evm.ticks > 0);
+    assert!(hl.opts > 0 && bn.opts > 0 && evm.opts > 0);
+    assert_eq!(
+        allocs, 0,
+        "gate 76: the venue split allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// Boot a router with one live Binance slot and a full instrument table:
+/// 64 rows of each law (spot, linear, inverse, option — half the options
+/// writable calls, half non-writable puts). Shared by gates 77 and 78.
+fn bx3_instrument_router<L: clob_dispatcher::OrderDispatch>(
+    live: L,
+    caps: exec_router::SlotCaps,
+) -> exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L> {
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, RoutedDispatcher, INST_CALL,
+        INST_WRITABLE, LAW_INVERSE, LAW_LINEAR, LAW_OPTION, LAW_SPOT, LEDGER_INSTRUMENTS,
+    };
+    const T0: u64 = 1_789_776_001_000_000_000;
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            3,
+            ExecMode::Live,
+            &[core_types::VenueId::Binance.to_u8()],
+            caps,
+            HaltLimits::none(),
+        )
+        .expect("slot 3 on Binance");
+    let mut d = RoutedDispatcher::new(
+        route,
+        clob_dispatcher::PaperDispatcher::new(),
+        live,
+        core_time::WallAnchor::new(T0, T0),
+    );
+    d.mark_ledger_seeded();
+    let mut k = 0u32;
+    while k < LEDGER_INSTRUMENTS as u32 {
+        let sym = core_types::make_symbol_id(core_types::VenueId::Binance, 5_000 + k);
+        let spec = match k % 4 {
+            0 => InstrumentSpec::new(sym, LAW_SPOT, 0, 0, 0),
+            1 => InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0),
+            2 => InstrumentSpec::new(sym, LAW_INVERSE, 0, 100_000_000, 0),
+            _ if k % 8 == 3 => InstrumentSpec::new(
+                sym,
+                LAW_OPTION,
+                INST_WRITABLE | INST_CALL,
+                1_000_000,
+                100_000_000_000,
+            ),
+            _ => InstrumentSpec::new(sym, LAW_OPTION, 0, 1_000_000_000, 84_000),
+        };
+        d.bind_instrument(&spec).expect("bind");
+        k += 1;
+    }
+    d
+}
+
+/// **BX3 gate 77 — the ledger's instrument rows on the order and fill
+/// paths.** A full table (256 rows, every law): orders of every law
+/// through the probe and the four clamps — the law refusals (`Short`,
+/// `Unpriced`) and every clamp fire inside the window — venue fills that
+/// open, grow, reduce and cross positions, settlements, and a modify and
+/// a cancel per order. Zero allocations.
+#[test]
+fn ledger_instrument_rows_steady_state() {
+    use clob_dispatcher::{DispatchError, OrderDispatch};
+    use core_types::{
+        CancelReq, Fill, ModifyReq, OptSummary, Order, Price, Qty, Side, VenueId,
+        FILL_FLAG_SETTLEMENT, FILL_ORIGIN_VENUE,
+    };
+    use exec_router::{SlotCaps, LEDGER_INSTRUMENTS};
+
+    const T0: u64 = 1_789_776_001_000_000_000;
+    const E6: i64 = 1_000_000;
+
+    struct Yes;
+    impl OrderDispatch for Yes {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+    }
+
+    // Tight enough that every clamp fires; loose enough that most pass.
+    let caps = SlotCaps::new(50_000 * E6, 2_000_000 * E6, 50_000_000 * E6, 64);
+    let mut d = bx3_instrument_router(Yes, caps);
+    // Half the writable calls get an index; the rest stay unpriced.
+    let mut k = 0u32;
+    while k < LEDGER_INSTRUMENTS as u32 {
+        if k % 16 == 3 {
+            let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+            let s = OptSummary::new(
+                T0,
+                VenueId::Binance,
+                sym,
+                core_types::OPT_SUMMARY_FLAG_MARK_PX,
+                400 * E6 * 1_000,
+                0,
+                100_000 * E6 * 1_000,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            d.on_opt_summary(&s);
+        }
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut placed = 0u64;
+    let mut refused = 0u64;
+    let mut i = 0u64;
+    while i < 20_000 {
+        let k = (i % LEDGER_INSTRUMENTS as u64) as u32;
+        let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+        let buy = (i / 3) % 3 != 0;
+        let qty = (1 + (i % 7) as i64) * E6;
+        let px = if i % 97 == 0 {
+            0
+        } else {
+            (100 + (i % 900) as i64) * E6
+        };
+        let oid = 10_000_000 + i * 2;
+        let mut o = Order::new(
+            T0 + i,
+            VenueId::Binance,
+            sym,
+            if buy { Side::Bid } else { Side::Ask },
+            0,
+            Price::from_raw(px),
+            Qty::from_raw(qty),
+            oid,
+        );
+        o.strategy_id = 3;
+        match d.submit(&o) {
+            Ok(()) => placed += 1,
+            Err(DispatchError::RiskRefused) => refused += 1,
+            Err(e) => panic!("unexpected dispatch error {e:?}"),
+        }
+        let mut rep = o;
+        rep.client_oid = oid + 1;
+        let _ = d.modify(&ModifyReq::new(oid, rep));
+        let _ = d.cancel(&CancelReq::of(&rep, T0 + i));
+        // A venue fill on the row — some opening, some crossing — and
+        // now and then a settlement.
+        let mut f = Fill::new(
+            T0 + i,
+            sym,
+            if buy { Side::Bid } else { Side::Ask },
+            Price::from_raw(if px > 0 { px } else { 100 * E6 }),
+            Qty::from_raw(qty),
+            oid,
+        )
+        .with_attribution(3, FILL_ORIGIN_VENUE);
+        if i % 211 == 0 {
+            f = f.with_flags(FILL_FLAG_SETTLEMENT);
+        }
+        d.on_fill_booked(&f);
+        std::hint::black_box(d.ledger().slot_exposure_1e6(3));
+        std::hint::black_box(d.ledger().slot_day_turnover_1e6(3));
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    let c = d.counters();
+    assert!(placed > 0, "no order was ever accepted");
+    assert!(refused > 0);
+    assert!(c.refused_short > 0, "the Short law never fired");
+    assert!(c.refused_unpriced > 0, "the Unpriced law never fired");
+    assert!(c.refused_max_order > 0, "clamp 1 never fired");
+    assert!(c.refused_cap_instance > 0, "clamp 3 never fired");
+    assert!(d.ledger().counters().fills_booked > 0);
+    assert_eq!(
+        allocs, 0,
+        "gate 77: the instrument rows allocated {allocs} times ({bytes} B)"
+    );
+}
+
+/// **BX3 gate 78 — the ledger's price feed.** Venue `Mark` events on
+/// bound and unbound ids, interleaved with the rolls the family rows
+/// bind from and with option summaries — with and without a mark, on
+/// bound options and on another venue's ids. Each mark re-prices its
+/// row for every slot and keeps the aggregate exact. Zero allocations.
+#[test]
+fn ledger_price_feed_steady_state() {
+    use clob_dispatcher::{DispatchError, OrderDispatch};
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, OptSummary, Order, Price, Qty, Side,
+        VenueId, FILL_ORIGIN_VENUE,
+    };
+    use exec_router::{SlotCaps, LEDGER_INSTRUMENTS};
+
+    const T0: u64 = 1_789_776_001_000_000_000;
+    const E6: i64 = 1_000_000;
+
+    struct Yes;
+    impl OrderDispatch for Yes {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+    }
+
+    let caps = SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, 64);
+    let mut d = bx3_instrument_router(Yes, caps);
+    // A position on every row, so every re-price moves the aggregate.
+    let mut k = 0u32;
+    while k < LEDGER_INSTRUMENTS as u32 {
+        let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+        let f = Fill::new(
+            T0,
+            sym,
+            Side::Bid,
+            Price::from_raw(100 * E6),
+            Qty::from_raw(E6),
+            1,
+        )
+        .with_attribution(3, FILL_ORIGIN_VENUE);
+        d.on_fill_booked(&f);
+        k += 1;
+    }
+    let before = d.ledger().instrument_exposure_1e6(3);
+
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 50_000 {
+        let k = (i % (LEDGER_INSTRUMENTS as u64 + 16)) as u32;
+        let sym = core_types::make_symbol_id(VenueId::Binance, 5_000 + k);
+        match i % 4 {
+            0 | 1 => {
+                let m = ChannelEvent::new(
+                    T0 + i,
+                    VenueId::Binance,
+                    ChannelId::Mark,
+                    sym,
+                    i,
+                    0,
+                    (100 + (i % 50) as i64) * E6,
+                    (100 + (i % 51) as i64) * E6,
+                );
+                d.on_venue_event(&m);
+            }
+            2 => {
+                let s = OptSummary::new(
+                    T0 + i,
+                    if i % 8 == 2 {
+                        VenueId::Deribit
+                    } else {
+                        VenueId::Binance
+                    },
+                    sym,
+                    if i % 3 == 0 {
+                        0
+                    } else {
+                        core_types::OPT_SUMMARY_FLAG_MARK_PX
+                    },
+                    (300 + (i % 70) as i64) * E6 * 1_000,
+                    0,
+                    (90_000 + (i % 20_000) as i64) * E6 * 1_000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                d.on_opt_summary(&s);
+            }
+            _ => {
+                let roll = ChannelEvent::new(
+                    T0 + i,
+                    VenueId::Hyperliquid,
+                    ChannelId::InstrumentRoll,
+                    (4u32 << 24) | (100 + (i as u32 & 15) * 2),
+                    core_types::pack_roll_seq(
+                        1_000 + (i as u32 & 15),
+                        60,
+                        (i & 15) as usize,
+                        false,
+                    ),
+                    0,
+                    0,
+                    0,
+                );
+                d.on_venue_event(&roll);
+            }
+        }
+        std::hint::black_box(d.ledger().instrument_exposure_1e6(3));
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    assert_ne!(
+        d.ledger().instrument_exposure_1e6(3),
+        before,
+        "the marks never re-priced a row"
+    );
+    assert_eq!(
+        allocs, 0,
+        "gate 78: the price feed allocated {allocs} times ({bytes} B)"
     );
 }

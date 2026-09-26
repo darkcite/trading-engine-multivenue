@@ -1589,7 +1589,7 @@ fn exec_watch(scope: exec_hyperliquid::Scope, secs: u64) -> ExitCode {
         }
     };
     let tls = TlsTransport::default_client_config();
-    let mut ws = match UserWs::new(&cfg.host, 443, tls, &cfg.master_addr) {
+    let mut ws = match UserWs::new(&cfg.host, cfg.port(), tls, &cfg.master_addr) {
         Ok(w) => w,
         Err(e) => {
             error!("{e}");
@@ -2330,18 +2330,10 @@ fn boot_operator_hl_arm(
             hl_cfg.host
         ));
     }
-    // The tightest floor across the live HL slots this arm trades: the
-    // budget is a property of the ADDRESS (slot 0's is its own).
-    let floor = eb
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live())
-        .map(|(_, s)| s.request_budget_floor)
-        .filter(|f| *f > 0)
-        .min()
-        .and_then(|f| u64::try_from(f).ok())
-        .unwrap_or(0);
+    // The address's numbers, from the live slots THIS arm trades
+    // (`ExecBoot::hl_address_numbers`: the highest floor, O-BX27; the
+    // lowest top-up weight and day ceiling, S7-L1).
+    let (floor, topup_weight, topup_day_max) = eb.hl_address_numbers();
     let budget_path = eb
         .path
         .parent()
@@ -2361,32 +2353,7 @@ fn boot_operator_hl_arm(
     // order (2026-09-19).
     arm.seed_budget_from_venue();
     // S7-L1 (gap E): the request-weight top-up is a property of the
-    // ADDRESS, like the floor — the most conservative of the live slots'
-    // numbers (slot 0's address is its own). Each slot's own day ceiling
-    // holds at least its own weight (the parser refuses less), so the two
-    // minima never arm a top-up that cannot fire.
-    let topup_weight = eb
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live() && s.request_topup_weight > 0
-        })
-        .map(|(_, s)| s.request_topup_weight)
-        .min()
-        .and_then(|w| u64::try_from(w).ok())
-        .unwrap_or(0);
-    let topup_day_max = eb
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(i, s)| {
-            *i != cli::exec_boot::HYPEREVM_SLOT && s.is_live() && s.request_topup_day_max > 0
-        })
-        .map(|(_, s)| s.request_topup_day_max)
-        .min()
-        .and_then(|w| u64::try_from(w).ok())
-        .unwrap_or(0);
+    // ADDRESS, like the floor (numbers above).
     arm.set_topup(topup_weight, topup_day_max);
     // S7-L1 (gaps A, C): this arm's seeding waits for the venue's day
     // spend and for a read of the account that finds nothing of ours
@@ -2481,11 +2448,17 @@ fn boot_hyparb_live_arm(
 /// `set_halt_path` before any halt can fire: the writer is a no-op
 /// without it, and a halt that leaves no file is cleared by the 00:10Z
 /// restart and resumes trading into whatever tripped it, unattended.
+///
+/// **BX3** — the route aliases are set here too, before the first order
+/// can exist, so every boot shape routes the Binance anchor the same way
+/// (`cli::exec_boot::route_aliases`).
 fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
     exec_dispatcher: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
     eb: &cli::exec_boot::ExecBoot,
     halt_mask: u8,
+    aliases: clob_dispatcher::RouteAliases,
 ) {
+    exec_dispatcher.set_route_aliases(aliases);
     exec_dispatcher.set_halt_path(cli::exec_boot::halt_file_path(&eb.path));
     // **E6 commit 4 — read back what the last run halted.** Before
     // anything else touches the table: a slot the last run stopped
@@ -3216,7 +3189,11 @@ fn run(args: RunArgs) -> ExitCode {
         let (_f1p, f1) = rings.fill[1].clone().split();
         let (_f2p, f2) = rings.fill[2].clone().split();
         let (f3p, f3) = rings.fill[3].clone().split();
-        (Some(f3p), [f0, f1, f2, f3])
+        // BX3: lane 4 is the Binance gateway's (plan §3.1). No arm
+        // produces on it before BX6, so its producer is dropped here and
+        // the engine reads it empty.
+        let (_f4p, f4) = rings.fill[4].clone().split();
+        (Some(f3p), [f0, f1, f2, f3, f4])
     };
     // AI command lane (Phase 8f). The producer half feeds the
     // `ingress-ai` thread (spawned below, gated on
@@ -4650,6 +4627,24 @@ fn run(args: RunArgs) -> ExitCode {
                 // rather than by care.
                 Some(eb) => {
                     cli::exec_boot::log_boot_tell(&eb);
+                    // **BX3 — the route alias** (plan §3.2 item 4): Binance
+                    // spot[0]'s flat legacy id routes to Binance. Built
+                    // before any arm boots, so a refusal opens no socket.
+                    let bn_anchor = boot.allocated.bn_spot.first().map(|i| i.sym);
+                    let aliases = match cli::exec_boot::route_aliases(bn_anchor) {
+                        Ok(a) => a,
+                        Err(reason) => {
+                            error!(%reason, "exec: route alias refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    };
+                    if let Some(sym) = bn_anchor.filter(|_| !aliases.is_empty()) {
+                        info!(
+                            sym,
+                            "exec: route alias — the Binance spot anchor routes to binance"
+                        );
+                    }
                     // **HYPARB L5 — slot 0's own live arm** (O-HL1/O-HL3):
                     // real swaps on HyperEVM mainnet and real hedges from
                     // the slot's own Hyperliquid account, authorised only
@@ -4705,7 +4700,7 @@ fn run(args: RunArgs) -> ExitCode {
                         (Some(arm), None) => {
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                             info!(
                                 live = %live_line,
                                 "running strategy-set with LIVE slots — real orders will be \
@@ -4729,7 +4724,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                             info!(
                                 live = %live_line,
                                 "running strategy-set with LIVE slots on TWO arms (slot 0 on its \
@@ -4756,7 +4751,7 @@ fn run(args: RunArgs) -> ExitCode {
                             );
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                             info!(
                                 live = %live_line,
                                 "running strategy-set with slot 0 LIVE on its own wallet — real \
@@ -4792,7 +4787,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 exec_router::NullLiveDispatcher::new(),
                                 anchor,
                             );
-                            wire_exec_halts(&mut d, &eb, halt_mask);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                             info!(
                                 "running strategy-set PAPER (exec artifact present, nothing \
                                  armed) — no orders will be submitted"

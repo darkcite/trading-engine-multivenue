@@ -156,6 +156,57 @@ impl ExecBoot {
         self.live_mask & (1 << HYPEREVM_SLOT) != 0
     }
 
+    /// **The operator Hyperliquid arm's address numbers**, `(floor,
+    /// topup_weight, topup_day_max)`, from the live slots that arm trades
+    /// — the predicate of [`Self::hl_arm_needed`]: every live slot but
+    /// slot 0 (whose address is its own) whose route names hyperliquid.
+    /// A slot on another venue has no say in this address's budget (BX3
+    /// risk review: from BX6 a Binance-only slot is live beside it).
+    ///
+    /// * the floor is the HIGHEST any of them asks for (O-BX27): the
+    ///   address stops placing at the most conservative floor;
+    /// * the top-up weight and day ceiling are the LOWEST non-zero of
+    ///   each (S7-L1): the least spending any of them allows. Each slot's
+    ///   own ceiling holds at least its own weight (the parser refuses
+    ///   less), so the two minima never arm a top-up that cannot fire.
+    ///
+    /// `0` for a number no such slot states. Cold; boot.
+    #[must_use]
+    pub fn hl_address_numbers(&self) -> (u64, u64, u64) {
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let mut floor = 0i64;
+        let mut weight = i64::MAX;
+        let mut day_max = i64::MAX;
+        for s in &self.slots {
+            if s.slot == HYPEREVM_SLOT
+                || s.slot >= EXEC_SLOTS
+                || self.live_mask & (1u8 << s.slot) == 0
+                || !self.route.venue_allowed(s.slot as u8, hl)
+            {
+                continue;
+            }
+            floor = floor.max(s.request_budget_floor);
+            if s.request_topup_weight > 0 {
+                weight = weight.min(s.request_topup_weight);
+            }
+            if s.request_topup_day_max > 0 {
+                day_max = day_max.min(s.request_topup_day_max);
+            }
+        }
+        let unset_is_zero = |v: i64| {
+            if v == i64::MAX {
+                0
+            } else {
+                u64::try_from(v).unwrap_or(0)
+            }
+        };
+        (
+            u64::try_from(floor).unwrap_or(0),
+            unset_is_zero(weight),
+            unset_is_zero(day_max),
+        )
+    }
+
     /// Does a live slot OTHER than slot 0 trade Hyperliquid — i.e. is
     /// the operator's Hyperliquid arm (`HlExchange` on the
     /// `HYPERLIQUID_*` account) needed? Slot 0 hedges from its own
@@ -372,12 +423,19 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             for v in &s.venues {
                 if !LIVE_ARM_VENUES.contains(v) {
                     let vname = core_config::exec::venue_name_from_id(*v).unwrap_or("?");
+                    // BX3: name the phase that supplies the arm, so the
+                    // refusal is a schedule and not a mystery.
+                    let when = if *v == core_types::VenueId::Binance as u8 {
+                        " Binance's live arm arrives with BX6 (docs/binance-exec-plan.md)."
+                    } else {
+                        ""
+                    };
                     return Err(format!(
                         "exec: slot {slot} ({slot_name}) is marked live for venue `{vname}`, \
                          but this binary has NO live execution arm for it (the arms compiled \
                          in are hyperliquid, and hyperevm for slot 0). Slot {slot} can only be \
                          \"paper\" or \"off\" on that venue. Refusing the boot rather than \
-                         trading it on paper under a live label."
+                         trading it on paper under a live label.{when}"
                     ));
                 }
             }
@@ -423,6 +481,39 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         live_mask: artifact_mask,
         slots,
     }))
+}
+
+/// **BX3 — the boot-fixed route aliases** (plan §3.2 item 4, §13.2 F10).
+///
+/// Members stamp `Order::venue` from the symbol's venue byte, and
+/// Binance spot\[0\] carries the M1 legacy FLAT id
+/// (`core_config::universe::LEGACY_BN_ANCHOR_SYM`, 7 — venue byte 0,
+/// Polymarket) or whatever `--binance-sym-id` gave it. Unaliased, its
+/// orders route as that byte, and a live slot whose mask names Binance
+/// refuses them `NoLiveRoute`. The alias is the one correction, by full
+/// `SymbolId`, read by the router's `venue_allowed` and by
+/// `exec_router::VenueSplit` only — the order bytes, `ExecRoute`, the
+/// ledger, captures and the backtest model never see it.
+///
+/// `bn_anchor` is the allocated spot\[0\] id; `None` (no Binance spot in
+/// this universe) and a namespaced Binance id (its byte already routes
+/// it) both give the empty table.
+///
+/// # Errors
+/// The table refused the entry (`SYMBOL_ID_NONE` as the anchor). Fatal:
+/// a boot without its alias would route the anchor wrongly, silently.
+pub fn route_aliases(
+    bn_anchor: Option<core_types::SymbolId>,
+) -> Result<clob_dispatcher::RouteAliases, String> {
+    let bn = core_types::VenueId::Binance as u8;
+    match bn_anchor {
+        Some(sym) if core_types::symbol_venue_byte(sym) != bn => {
+            clob_dispatcher::RouteAliases::NONE
+                .with(sym, bn)
+                .map_err(|e| format!("exec: the Binance anchor {sym} cannot be aliased: {e:?}"))
+        }
+        _ => Ok(clob_dispatcher::RouteAliases::NONE),
+    }
 }
 
 /// `3 (bin15)` / `3 (bin15), 5 (vm)` — for the interlock's message.
@@ -503,17 +594,37 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         ));
         let gain = s.map_or(0, |s| s.halt_on_gain_usd_1e6) / 1_000_000;
         let loss = s.map_or(0, |s| s.halt_on_loss_usd_1e6) / 1_000_000;
+        // BX3: each venue's own numbers, only where the slot names the
+        // venue — the Hyperliquid address budget where hyperliquid is
+        // named (the arm reads it only from those slots), the margin halt
+        // where binance is (the key is refused anywhere else). A
+        // Hyperliquid slot's line is therefore unchanged.
+        let hl_budget = if vmask & (1u16 << core_types::VenueId::Hyperliquid as u8) != 0 {
+            format!(
+                " budget_floor={} topup={}/{}",
+                s.map_or(0, |s| s.request_budget_floor),
+                s.map_or(0, |s| s.request_topup_weight),
+                s.map_or(0, |s| s.request_topup_day_max),
+            )
+        } else {
+            String::new()
+        };
+        let margin = if vmask & (1u16 << core_types::VenueId::Binance as u8) != 0 {
+            format!(
+                " margin_ratio_1e6={}",
+                s.map_or(0, |s| s.halt_on_margin_ratio_1e6)
+            )
+        } else {
+            String::new()
+        };
         lines.push(format!(
             "exec: slot {slot} HALTS reject_streak={} asset_refusals={} recon_drift=${drift} \
-             recon_stale_ms={} ws_gap_ms={} budget_floor={} topup={}/{} \
-             session_bound=+${gain}/-${loss} halt_file={}",
+             recon_stale_ms={} ws_gap_ms={}{hl_budget} \
+             session_bound=+${gain}/-${loss}{margin} halt_file={}",
             s.map_or(0, |s| s.halt_on_reject_streak),
             s.map_or(0, |s| s.halt_on_asset_refusal_streak),
             s.map_or(0, |s| s.halt_on_recon_stale_ms),
             s.map_or(0, |s| s.halt_on_ws_gap_ms),
-            s.map_or(0, |s| s.request_budget_floor),
-            s.map_or(0, |s| s.request_topup_weight),
-            s.map_or(0, |s| s.request_topup_day_max),
             halt_file_path(&boot.path).display(),
         ));
     }
@@ -579,6 +690,26 @@ mod tests {
             (b.slot(3).halt_on_gain_usd_1e6, b.slot(3).halt_on_loss_usd_1e6),
             (15_000_000, 5_000_000)
         );
+        // BX3: the margin halt ships COMMENTED OUT — it is refused on a
+        // slot that does not name binance — and the template states the
+        // recipe for a Binance slot: name the venue, uncomment the key.
+        assert_eq!(s3.halt_on_margin_ratio_1e6, 0);
+        let bn = live
+            .replacen("venues = [\"hyperliquid\"]", "venues = [\"binance\"]", 1)
+            .replacen(
+                "# halt_on_margin_ratio_1e6 = 600000",
+                "halt_on_margin_ratio_1e6 = 600000",
+                1,
+            );
+        let b = core_config::exec::parse(&bn).expect("the template's Binance recipe parses");
+        assert_eq!(b.slot(3).halt_on_margin_ratio_1e6, 600_000);
+        let e = core_config::exec::parse(&live.replacen(
+            "venues = [\"hyperliquid\"]",
+            "venues = [\"binance\"]",
+            1,
+        ))
+        .expect_err("a live Binance slot without the key");
+        assert!(e.to_string().contains("halt_on_margin_ratio_1e6"), "{e}");
     }
 
     #[test]
@@ -726,6 +857,118 @@ mod tests {
         std::fs::remove_dir_all(&d).ok();
     }
 
+    /// **BX3 risk review, O-BX27** — the HL arm's address numbers come
+    /// only from the live slots it trades: the highest floor, the lowest
+    /// top-up weight and ceiling. Slot 0 (its own address), a paper slot
+    /// and a live slot on another venue have no say — each holds the
+    /// number that would win. Break-and-watch: dropping any one of the
+    /// three filters moves the result, and so does the pre-BX3 `min` for
+    /// the floor.
+    #[test]
+    fn the_hl_address_numbers_come_from_the_slots_the_arm_trades() {
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let bn = core_types::VenueId::Binance as u8;
+        let caps = SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64);
+        let mut route = ExecRoute::all_paper();
+        let mut slots = Vec::new();
+        let mut live_mask = 0u8;
+        for (slot, venue, floor, weight, day_max, live) in [
+            (0usize, hl, 9_000i64, 1i64, 1i64, true),
+            (2, bn, 9_500, 1_000, 10_000, true),
+            (3, hl, 2_000, 5_000, 30_000, true),
+            (4, hl, 3_000, 6_000, 20_000, true),
+            (5, hl, 8_000, 1, 1, false),
+        ] {
+            let mode = if live {
+                ExecMode::Live
+            } else {
+                ExecMode::Paper
+            };
+            route
+                .set_slot(slot, mode, &[venue], caps, HaltLimits::none())
+                .unwrap();
+            let mut s = core_config::exec::ExecSlot::paper_default(slot);
+            s.venues = vec![venue];
+            s.request_budget_floor = floor;
+            s.request_topup_weight = weight;
+            s.request_topup_day_max = day_max;
+            if live {
+                s.mode = String::from("live");
+                live_mask |= 1u8 << slot;
+            }
+            slots.push(s);
+        }
+        let boot = ExecBoot {
+            route,
+            hash: [0u8; 32],
+            path: PathBuf::from("/tmp/exec.toml"),
+            enabled: true,
+            live_mask,
+            slots,
+        };
+        assert_eq!(boot.hl_address_numbers(), (3_000, 5_000, 20_000));
+    }
+
+    /// **BX3** — Binance has no live arm until BX6. A live slot naming it
+    /// (with the margin key its artifact law requires) refuses the boot
+    /// with the standing message and names the phase; the same slot on
+    /// paper resolves, because paper never needs an arm.
+    #[test]
+    fn a_live_binance_slot_is_refused_until_its_arm_exists() {
+        let d = tmp();
+        let bn = MINIMAL_LIVE
+            .replace("[\"hyperliquid\"]", "[\"binance\"]")
+            .replace(
+                "request_budget_floor = 2000\n",
+                "halt_on_margin_ratio_1e6 = 600000\n",
+            );
+        let p = write(&d, "exec.toml", &bn);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("NO live execution arm"), "{e}");
+        assert!(e.contains("`binance`"), "must name the venue: {e}");
+        assert!(
+            e.contains("BX6"),
+            "must name the phase that supplies the arm: {e}"
+        );
+        // The artifact's own law comes first: no margin key, no boot.
+        let bare = MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"binance\"]");
+        let p = write(&d, "no-margin.toml", &bare);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("halt_on_margin_ratio_1e6"), "{e}");
+        let p = write(
+            &d,
+            "paper.toml",
+            &bn.replace("mode = \"live\"", "mode = \"paper\""),
+        );
+        let b = resolve(Some(&p), None).unwrap().unwrap();
+        assert!(!b.any_live());
+        assert_eq!(b.slots[3].halt_on_margin_ratio_1e6, 600_000);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **BX3** — the alias exists only for a flat anchor: the legacy 7
+    /// (and a flat `--binance-sym-id`) routes to Binance; a namespaced
+    /// Binance anchor, or no Binance spot at all, needs none.
+    #[test]
+    fn the_route_alias_covers_only_a_flat_binance_anchor() {
+        let bn = core_types::VenueId::Binance as u8;
+        let a = route_aliases(Some(core_config::universe::LEGACY_BN_ANCHOR_SYM)).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(
+            a.route_venue(7, 0),
+            bn,
+            "the legacy anchor routes to Binance"
+        );
+        assert_eq!(a.route_venue(8, 0), 0, "and nothing else does");
+        let flat = route_aliases(Some(1234)).unwrap();
+        assert_eq!(flat.route_venue(1234, 0), bn);
+        let native = core_types::make_symbol_id(core_types::VenueId::Binance, 1);
+        assert!(route_aliases(Some(native)).unwrap().is_empty());
+        assert!(route_aliases(None).unwrap().is_empty());
+        let e = route_aliases(Some(core_types::SYMBOL_ID_NONE)).unwrap_err();
+        assert!(e.contains("NoneSym"), "{e}");
+    }
+
     #[test]
     fn enabled_zero_disarms_and_therefore_needs_no_arm_live() {
         let d = tmp();
@@ -794,6 +1037,8 @@ mod tests {
             R::ReconStale,
             R::PnlGain,
             R::PnlLoss,
+            R::VenueLock,
+            R::MarginRisk,
         ];
         assert_eq!(
             all.len(),
@@ -810,6 +1055,34 @@ mod tests {
         // A byte from a newer binary is named, not panicked on and not
         // silently rendered as `none`.
         assert_eq!(engine_snapshot::halt_reason_word(200), "unknown");
+    }
+
+    /// **BX3 (F9):** `/state` spells the retirement `why` from its own
+    /// copy of the codes, for the same reason. Pinned here: the words
+    /// cover exactly the defined codes, in code order, and the unknown
+    /// bucket is the router's.
+    #[test]
+    fn the_retirement_words_match_the_codes_state_publishes() {
+        let codes = [
+            (clob_dispatcher::RETIRED_REJECTED, "rejected"),
+            (clob_dispatcher::RETIRED_EXPIRED, "expired"),
+            (clob_dispatcher::RETIRED_CANCELED_VENUE, "canceled_venue"),
+            (clob_dispatcher::RETIRED_CANCELED_TTL, "canceled_ttl"),
+            (clob_dispatcher::RETIRED_CANCELED_MEMBER, "canceled_member"),
+            (clob_dispatcher::RETIRED_FILLED, "filled"),
+        ];
+        assert_eq!(codes.len(), engine_snapshot::RETIRED_WHY_WORDS.len());
+        for (code, word) in codes {
+            assert_eq!(engine_snapshot::RETIRED_WHY_WORDS[code as usize], word);
+        }
+        assert_eq!(
+            engine_snapshot::RETIRED_WHY_UNKNOWN,
+            clob_dispatcher::RETIRED_WHY_UNKNOWN
+        );
+        assert_eq!(
+            core::mem::size_of_val(&engine_snapshot::ExecSnapshot::default().retired),
+            core::mem::size_of_val(&clob_dispatcher::ExecCounters::default().retired)
+        );
     }
 
     /// Slot numbers get reassigned; a stale artifact must not arm the
@@ -947,6 +1220,30 @@ mod tests {
         for n in ["reject_streak=5", "asset_refusals=3", "$5", "300000", "30000", "2000"] {
             assert!(lines[2].contains(n), "missing {n} in: {}", lines[2]);
         }
+
+        // BX3: a slot naming binance also states its margin halt — and
+        // only such a slot, so the Hyperliquid line above is unchanged.
+        let bn = core_types::VenueId::Binance as u8;
+        let mut boot = boot;
+        boot.route
+            .set_slot(
+                3,
+                ExecMode::Live,
+                &[bn],
+                SlotCaps::new(100_000_000, 1_000_000_000, 30_000_000_000, 64),
+                HaltLimits::none(),
+            )
+            .unwrap();
+        boot.slots[0].venues = vec![bn];
+        boot.slots[0].halt_on_margin_ratio_1e6 = 600_000;
+        let lines = render_boot_tell(&boot);
+        assert_eq!(
+            lines[2],
+            "exec: slot 3 HALTS reject_streak=5 asset_refusals=3 recon_drift=$5 \
+             recon_stale_ms=300000 ws_gap_ms=30000 \
+             session_bound=+$0/-$0 margin_ratio_1e6=600000 halt_file=/tmp/exec.HALT",
+            "no Hyperliquid budget on a Binance-only slot"
+        );
     }
 
     #[test]

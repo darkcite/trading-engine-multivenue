@@ -555,9 +555,10 @@ pub struct Rings {
     /// pool lane (`Engine::set_pool_lane`). Permanently empty when the
     /// ingress is not spawned.
     pub hyperevm_signal: Arc<Ring<Signal, { engine::POOL_RING_SIZE }>>,
-    /// One fill ring per execution lane (`engine::fill_lane_of`).
-    /// Live dispatchers gain producers in Phase 8j; until then the
-    /// engine's dispatcher fill pump (D3) is the only fill source.
+    /// One fill ring per execution lane (`engine::fill_lane_of`): the
+    /// Hyperliquid arm produces on lane 3, the Binance gateway on lane
+    /// 4 (BX3; its producer is taken at BX6). A lane nothing produces on
+    /// reads empty.
     pub fill: [Arc<Ring<Fill, FILL_RING_SIZE>>; NUM_FILL_LANES],
     /// AI command ring (Phase 8f §4.3). Producer half goes to the
     /// `ingress-ai` thread when `AI_INGRESS_HMAC_KEY` is configured;
@@ -605,7 +606,13 @@ impl Rings {
             ],
             rpc_signal: Ring::new(),
             hyperevm_signal: Ring::new(),
-            fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
+            fill: [
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+                Ring::new(),
+            ],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
             event: [
@@ -2813,9 +2820,10 @@ pub struct Consumers {
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// HYPARB H3b: HyperEVM pool-event consumer (the engine's pool lane).
     pub hyperevm_signal: Consumer<Signal, { engine::POOL_RING_SIZE }>,
-    /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
-    /// arrive with the venue dispatchers in Phase 8j; paper-mode
-    /// fills flow through the engine's dispatcher pump (D3).
+    /// Fill-lane consumers (`engine::fill_lane_of` order): lane 3 the
+    /// Hyperliquid arm's, lane 4 the Binance gateway's (BX3; produced
+    /// from BX6). Paper-mode fills flow through the engine's dispatcher
+    /// pump (D3).
     pub fill_lanes: [Consumer<Fill, FILL_RING_SIZE>; NUM_FILL_LANES],
     /// AI command lane consumer (Phase 8f). Reads empty forever when
     /// `ingress-ai` is not spawned (producer dropped).
@@ -4288,8 +4296,9 @@ pub struct ExecMetricIds {
     /// `engine_exec_refused_off_total`
     pub refused_off: core_metrics::CounterId,
     /// `engine_exec_refused_risk_total` (E6) — requests the RISK GATE
-    /// refused, ALL six reasons summed (max_order, cap_instance,
-    /// cap_day, open_orders, unseeded, halted). Only the max_order
+    /// refused, ALL eight reasons summed (max_order, cap_instance,
+    /// cap_day, open_orders, unseeded, halted, and BX3's short and
+    /// unpriced). Only the max_order
     /// share means "the member's ledger and the operator's number
     /// disagreed"; the rest are the clamp working. An alert belongs on
     /// the router's `refused_max_order` (in `/state`), not here.
@@ -4313,6 +4322,17 @@ pub struct ExecMetricIds {
     /// few seconds after a boot and zero after; still climbing means
     /// the arm never reached the venue.
     pub refused_unseeded: core_metrics::CounterId,
+    /// `engine_exec_refused_unpriced_total` (BX3) — live requests on a
+    /// Binance instrument row the gate could not price: a non-positive
+    /// price, a Binance-routed order with no instrument row, a short
+    /// option with no index. Refused rather than measured as zero. `short` (BX3's other
+    /// law refusal) registers with the first boot that can move it —
+    /// a live Binance slot, BX6; until then `/state` carries it.
+    pub refused_unpriced: core_metrics::CounterId,
+    /// `engine_exec_retired_total` (BX3, F9) — accepted orders the arm
+    /// reported ended without a (further) fill, every `why` summed;
+    /// `/state` spells them by `why`.
+    pub retired: core_metrics::CounterId,
     /// `engine_exec_halts_total` (E6 c4) — halt EDGES. **The alarm.**
     pub halts: core_metrics::CounterId,
     /// `engine_exec_cancel_all_failures_total` (E6 c4) — cancel-all
@@ -5163,6 +5183,8 @@ fn register_exec_metrics(
     let refused_risk = one("engine_exec_refused_risk_total")?;
     let refused_halted = one("engine_exec_refused_halted_total")?;
     let refused_unseeded = one("engine_exec_refused_unseeded_total")?;
+    let refused_unpriced = one("engine_exec_refused_unpriced_total")?;
+    let retired = one("engine_exec_retired_total")?;
     let halts = one("engine_exec_halts_total")?;
     let cancel_all_failures = one("engine_exec_cancel_all_failures_total")?;
     let cancel_all_stranded = one("engine_exec_cancel_all_stranded_total")?;
@@ -5219,6 +5241,8 @@ fn register_exec_metrics(
         refused_risk,
         refused_halted,
         refused_unseeded,
+        refused_unpriced,
+        retired,
         halts,
         cancel_all_failures,
         cancel_all_stranded,
@@ -5256,6 +5280,16 @@ fn mirror_exec_metrics(
         .inc(cur.refused_halted.saturating_sub(last.refused_halted));
     reg.counter(ids.refused_unseeded)
         .inc(cur.refused_unseeded.saturating_sub(last.refused_unseeded));
+    reg.counter(ids.refused_unpriced)
+        .inc(cur.refused_unpriced.saturating_sub(last.refused_unpriced));
+    let mut retired_cur = 0u64;
+    let mut retired_last = 0u64;
+    for i in 0..clob_dispatcher::RETIRED_WHY_SLOTS {
+        retired_cur = retired_cur.saturating_add(cur.retired[i]);
+        retired_last = retired_last.saturating_add(last.retired[i]);
+    }
+    reg.counter(ids.retired)
+        .inc(retired_cur.saturating_sub(retired_last));
     reg.counter(ids.halts)
         .inc(cur.halts.saturating_sub(last.halts));
     reg.counter(ids.cancel_all_failures)
@@ -6874,6 +6908,10 @@ fn fill_snapshot<S, D>(
     ex.arm_budget_remaining = ec.arm.budget_remaining;
     ex.arm_pnl_anchor_usd_1e6 = ec.arm.pnl_anchor_usd_1e6;
     ex.arm_session_pnl_usd_1e6 = ec.arm.session_pnl_usd_1e6;
+    // BX3: the instrument laws' refusals and the retirements by `why`.
+    ex.refused_short = ec.refused_short;
+    ex.refused_unpriced = ec.refused_unpriced;
+    ex.retired = ec.retired;
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -7191,8 +7229,8 @@ where
     // Phase 8a lane engine: five tick lanes + one signal lane + four
     // fill lanes. The signal lane is bound to the RPC ring — the D2
     // disposition for Stage 1 (per §3.3).
-    // Fills flow from the dispatcher pump (D3) until 8j wires the
-    // per-venue fill-lane producers.
+    // Paper fills flow from the dispatcher pump (D3); a live arm's
+    // venue fills ride its own fill lane (3 Hyperliquid, 4 Binance).
     let Consumers {
         tick_lanes,
         event_lanes,
@@ -9913,6 +9951,7 @@ mod tests {
                 it.next().unwrap(),
                 it.next().unwrap(),
                 it.next().unwrap(),
+                it.next().unwrap(),
             ]
         };
         let event_lanes = {
@@ -11302,6 +11341,9 @@ mod tests {
             // E6 commit 4 — the halt family.
             "engine_exec_refused_halted_total",
             "engine_exec_refused_unseeded_total",
+            // BX3.
+            "engine_exec_refused_unpriced_total",
+            "engine_exec_retired_total",
             "engine_exec_halts_total",
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",
@@ -11350,6 +11392,8 @@ mod tests {
             "engine_exec_refused_risk_total",
             "engine_exec_refused_halted_total",
             "engine_exec_refused_unseeded_total",
+            "engine_exec_refused_unpriced_total",
+            "engine_exec_retired_total",
             "engine_exec_halts_total",
             "engine_exec_cancel_all_failures_total",
             "engine_exec_cancel_all_stranded_total",

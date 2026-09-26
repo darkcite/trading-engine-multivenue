@@ -240,8 +240,8 @@ fn pump<const N: usize>(
         while let Some(f) = arm.try_next_fill() {
             fills.push(f);
         }
-        while let Some((oid, _)) = arm.try_next_retired() {
-            retired.push(oid);
+        while let Some(r) = arm.try_next_retired() {
+            retired.push(r.client_oid);
         }
         if done(arm, fills, retired) {
             return true;

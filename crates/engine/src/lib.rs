@@ -166,9 +166,12 @@ pub const fn opt_lane_of(venue: VenueId) -> Option<usize> {
     }
 }
 
-/// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid.
-/// Binance is market-data-only, so it has no fill lane.
-pub const NUM_FILL_LANES: usize = 4;
+/// Number of fill lanes: Polymarket, OKX, Deribit, Hyperliquid, and
+/// (BX3) Binance — whose fills are produced on its gateway thread and
+/// cross to the engine on lane 4, the SPSC ring that crossing needs
+/// (plan §3.1). Until the Binance arm exists (BX6) nothing produces on
+/// it, and the drain reads it empty.
+pub const NUM_FILL_LANES: usize = 5;
 
 /// Per-iteration drain budget for the AI command lane (Phase 8f §4.3).
 ///
@@ -181,7 +184,7 @@ pub const NUM_FILL_LANES: usize = 4;
 pub const AI_DRAIN_BUDGET: usize = 8;
 
 /// Fill-lane index for an execution venue. `None` for venues that
-/// cannot produce fills (Binance = data-only, Ai = command feed).
+/// cannot produce fills (Ai = command feed, and the data-only venues).
 /// Cold-path helper for dispatcher wiring — not used in the drain
 /// loop, which walks all lanes unconditionally.
 #[inline]
@@ -191,13 +194,15 @@ pub const fn fill_lane_of(venue: VenueId) -> Option<usize> {
         VenueId::Okx => Some(1),
         VenueId::Deribit => Some(2),
         VenueId::Hyperliquid => Some(3),
+        // BX3: the Binance gateway thread's fills (plan §3.1).
+        VenueId::Binance => Some(4),
         // WS9: Bybit is market-data-only in Stage 2 (order
         // submission is Stage-3, gaps-doc §7) — no fill lane yet.
         // MX2: MEXC is data-only by operator ruling O-MX1 — no exec
         // arm, no fill lane.
         // HYPARB: AMM fills are PAPER fills (the matcher's judge); the
         // O-H12 testnet sends are a shadow and never reach the book.
-        VenueId::Binance | VenueId::Ai | VenueId::Bybit | VenueId::Mexc | VenueId::HyperEvm => None,
+        VenueId::Ai | VenueId::Bybit | VenueId::Mexc | VenueId::HyperEvm => None,
     }
 }
 
@@ -744,6 +749,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                     Some(o) => {
                         consumed += 1;
                         let now = now_ns();
+                        // BX3: the dispatcher FIRST, as for a venue event
+                        // — the router's ledger prices its option rows
+                        // from this summary, and a member handed it may
+                        // submit in this very call.
+                        // `an_opt_summary_reaches_the_dispatcher_before_the_strategy`
+                        // holds this.
+                        self.disp.on_opt_summary(&o);
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
@@ -1553,7 +1565,8 @@ mod tests {
         let (p1, c1) = Ring::<Fill, FILL_RING_SIZE>::new().split();
         let (p2, c2) = Ring::<Fill, FILL_RING_SIZE>::new().split();
         let (p3, c3) = Ring::<Fill, FILL_RING_SIZE>::new().split();
-        ([p0, p1, p2, p3], [c0, c1, c2, c3])
+        let (p4, c4) = Ring::<Fill, FILL_RING_SIZE>::new().split();
+        ([p0, p1, p2, p3, p4], [c0, c1, c2, c3, c4])
     }
 
     /// Build an engine plus producer halves for every lane. Tick
@@ -1660,6 +1673,12 @@ mod tests {
         busy: bool,
     }
     impl OrderDispatch for IdleCounter {
+        fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
         fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
             Ok(())
         }
@@ -2138,6 +2157,12 @@ mod tests {
     }
 
     impl OrderDispatch for OneFillDispatcher {
+        fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
         fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
             Ok(())
         }
@@ -2199,8 +2224,10 @@ mod tests {
         assert_eq!(fill_lane_of(VenueId::Okx), Some(1));
         assert_eq!(fill_lane_of(VenueId::Deribit), Some(2));
         assert_eq!(fill_lane_of(VenueId::Hyperliquid), Some(3));
-        assert_eq!(fill_lane_of(VenueId::Binance), None);
+        assert_eq!(fill_lane_of(VenueId::Binance), Some(4));
         assert_eq!(fill_lane_of(VenueId::Ai), None);
+        // HYPARB: AMM fills are paper fills — never a lane.
+        assert_eq!(fill_lane_of(VenueId::HyperEvm), None);
         assert_eq!(fill_lane_of(VenueId::Bybit), None);
         // MX2 / O-MX1: MEXC is data-only — never a fill lane.
         assert_eq!(fill_lane_of(VenueId::Mexc), None);
@@ -2436,6 +2463,12 @@ mod tests {
         log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
     }
     impl OrderDispatch for OrderWitness {
+        fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
         fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
             self.log.borrow_mut().push("submit");
             Ok(())
@@ -2455,6 +2488,95 @@ mod tests {
         fn observe_amm(&mut self, _sym: core_types::SymbolId, _p: &[u8; 40], _now: NsTs) {
             self.log.borrow_mut().push("dispatcher-amm");
         }
+        fn on_opt_summary(&mut self, _s: &core_types::OptSummary) {
+            self.log.borrow_mut().push("dispatcher-opt");
+        }
+    }
+
+    /// A member that SUBMITS on an options summary.
+    struct SubmitsOnOpt {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+    impl strategy_core::StrategyCounters for SubmitsOnOpt {}
+    impl Strategy for SubmitsOnOpt {
+        fn on_start<C: Ctx>(&mut self, _ctx: &mut C) -> Result<(), StrategyError> {
+            Ok(())
+        }
+        fn on_tick<C: Ctx>(&mut self, _t: &Tick, _ctx: &mut C) {}
+        fn on_signal<C: Ctx>(&mut self, _s: &Signal, _ctx: &mut C) {}
+        fn on_fill<C: Ctx>(&mut self, _f: &Fill, _ctx: &mut C) {}
+        fn on_timer<C: Ctx>(&mut self, _now: NsTs, _ctx: &mut C) {}
+        fn timer_period_ns(&self) -> u64 {
+            0
+        }
+        fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
+        fn on_venue_event<C: Ctx>(&mut self, _e: &ChannelEvent, _ctx: &mut C) {}
+        fn on_opt_summary<C: Ctx>(&mut self, _o: &core_types::OptSummary, ctx: &mut C) {
+            self.log.borrow_mut().push("strategy");
+            let o = Order::new(
+                1,
+                VenueId::Binance,
+                5,
+                Side::Bid,
+                0,
+                Price::from_raw(1),
+                Qty::from_raw(1),
+                19_419,
+            );
+            let _ = ctx.submit(o);
+        }
+    }
+
+    /// **BX3 — the ledger prices an option row from the summary BEFORE
+    /// the member can act on it**, the ordering a venue event has.
+    /// Break-and-watch: swapping the two calls in the opt-lane drain
+    /// puts "strategy" first.
+    #[test]
+    fn an_opt_summary_reaches_the_dispatcher_before_the_strategy() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_tp, tc) = split_tick_lanes();
+        let (_ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (mut op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitsOnOpt {
+                log: std::rc::Rc::clone(&log),
+            },
+            OrderWitness {
+                log: std::rc::Rc::clone(&log),
+            },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let s = core_types::OptSummary::new(
+            1,
+            VenueId::Binance,
+            5,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            1_000_000_000,
+            0,
+            80_000_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        assert!(op[0].try_push_ref(&s));
+        eng.tick(16);
+        assert_eq!(*log.borrow(), vec!["dispatcher-opt", "strategy", "submit"]);
     }
 
     /// A member that only logs the signals it is handed.
@@ -2690,6 +2812,12 @@ mod tests {
             left: usize,
         }
         impl OrderDispatch for PumpWitness {
+            fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+                Err(DispatchError::Unsupported)
+            }
+            fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+                Err(DispatchError::Unsupported)
+            }
             fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
                 self.log.borrow_mut().push("submit");
                 Ok(())
@@ -2808,6 +2936,12 @@ mod tests {
     /// means a refused submit is NEVER staged.
     struct RefuseAllDispatcher;
     impl OrderDispatch for RefuseAllDispatcher {
+        fn cancel(&mut self, _r: &core_types::CancelReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
+        fn modify(&mut self, _r: &core_types::ModifyReq) -> Result<(), DispatchError> {
+            Err(DispatchError::Unsupported)
+        }
         fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
             Err(DispatchError::QueueFull)
         }

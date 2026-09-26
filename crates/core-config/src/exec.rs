@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 17] = [
+const SLOT_KEYS: [&str; 18] = [
     "mode",
     "name",
     "venues",
@@ -96,6 +96,7 @@ const SLOT_KEYS: [&str; 17] = [
     "halt_on_recon_stale_ms",
     "halt_on_gain_usd_1e6",
     "halt_on_loss_usd_1e6",
+    "halt_on_margin_ratio_1e6",
 ];
 
 /// Venue spellings the `venues` array accepts, and the `VenueId` byte
@@ -239,6 +240,14 @@ pub struct ExecSlot {
     /// (S7-L1): at cost, an open position's premium never reads as a
     /// loss, and a book that is never flat is still bounded.
     pub halt_on_loss_usd_1e6: i64,
+    /// **BX3 (D6, O-BX18)** — the margin ratio (maintenance margin over
+    /// margin balance or equity, ×1e6) at which the Binance arm reports
+    /// `MarginRisk` and the slot halts sticky. Only a slot that names
+    /// binance may set it; a live one must (`1..=`
+    /// [`MARGIN_RATIO_MAX_1E6`]). `0` = unset. The arm holds it per slot
+    /// (a side table outside the router's pinned route) and judges it
+    /// on every `ACCOUNT_UPDATE` / `MARGIN_CALL` and at recon (BX6).
+    pub halt_on_margin_ratio_1e6: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
 }
@@ -266,6 +275,7 @@ impl ExecSlot {
             halt_on_recon_stale_ms: 0,
             halt_on_gain_usd_1e6: 0,
             halt_on_loss_usd_1e6: 0,
+            halt_on_margin_ratio_1e6: 0,
             line: 0,
         }
     }
@@ -280,6 +290,13 @@ impl ExecSlot {
 /// **S7-L1** — the largest `request_topup_weight` a slot may write:
 /// 100 000 requests, $50 at the venue's 0.0005 USDC a request.
 pub const REQUEST_TOPUP_WEIGHT_MAX: i64 = 100_000;
+
+/// **BX3 (O-BX26)** — the highest `halt_on_margin_ratio_1e6` a slot may
+/// set: just under the venue's 80 % margin call. From BX6 any
+/// `MARGIN_CALL` raises `MarginRisk` (plan BX-20), so a threshold at or
+/// past it could never fire first — and one sampled toward the 95 %
+/// liquidation could never beat it.
+pub const MARGIN_RATIO_MAX_1E6: i64 = 799_999;
 
 /// **S7-L1** — the smallest non-zero `request_topup_weight`: 1 000
 /// requests, $0.50. A purchase is itself a request, so a tiny weight
@@ -485,8 +502,10 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         halt_on_recon_stale_ms: opt_int(kv, "halt_on_recon_stale_ms", 0)?,
         halt_on_gain_usd_1e6: opt_int(kv, "halt_on_gain_usd_1e6", 0)?,
         halt_on_loss_usd_1e6: opt_int(kv, "halt_on_loss_usd_1e6", 0)?,
+        halt_on_margin_ratio_1e6: opt_int(kv, "halt_on_margin_ratio_1e6", 0)?,
         line,
     };
+    let names = |venue: &str| venue_id_from_name(venue).is_some_and(|id| s.venues.contains(&id));
 
     // A live slot with no venue can never dispatch anything — it would
     // refuse every order it emitted with `NoLiveRoute` and look like a
@@ -563,13 +582,6 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
             ("halt_on_ws_gap_ms", s.halt_on_ws_gap_ms),
             ("halt_on_asset_refusal_streak", s.halt_on_asset_refusal_streak),
             ("halt_on_recon_stale_ms", s.halt_on_recon_stale_ms),
-            // Not a threshold the router compares against — the ARM
-            // owns this one, and reports a flag. It is required for
-            // the same reason all the same: at `0` the budget trigger
-            // fires only at TOTAL exhaustion, which is a kill switch
-            // that waits until the address is already bricked. `0`
-            // would be a floor with no room under it.
-            ("request_budget_floor", s.request_budget_floor),
         ] {
             if v == 0 {
                 return Err(err(format!(
@@ -579,6 +591,47 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
                 )));
             }
         }
+    }
+    // Not a threshold the router compares against — the Hyperliquid ARM
+    // owns this one, and reports a flag. It is required for the same
+    // reason all the same: at `0` the budget trigger fires only at TOTAL
+    // exhaustion, which is a kill switch that waits until the address is
+    // already bricked. **Only a slot that trades Hyperliquid has that
+    // address budget** (BX3, plan §3.12): a Binance-only slot is governed
+    // by its own arm's windows instead.
+    if s.is_live() && names("hyperliquid") && s.request_budget_floor == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` on hyperliquid needs a non-zero \
+             `request_budget_floor` — `0` means UNSET here, never \"unlimited\", and a \
+             halt trigger with no headroom never fires in time"
+        )));
+    }
+
+    // BX3 (D6, O-BX18, O-BX26): the margin halt. A ratio is a Binance
+    // account's, so only a slot that names binance can set one; at or
+    // past the venue's 80 % margin call (which halts on its own) it could
+    // never fire first; and a live Binance slot must state it — `0` means
+    // UNSET, and a margin halt that is unset never fires.
+    if s.halt_on_margin_ratio_1e6 != 0 && !names("binance") {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `halt_on_margin_ratio_1e6` is a Binance margin \
+             halt, but the slot's `venues` does not name binance"
+        )));
+    }
+    // (`opt_int` has already refused a negative one.)
+    if s.halt_on_margin_ratio_1e6 > MARGIN_RATIO_MAX_1E6 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `halt_on_margin_ratio_1e6 = {}` exceeds \
+             {MARGIN_RATIO_MAX_1E6} — at or past the venue's 80 % margin call, which halts \
+             the slot on its own, this halt could never fire first",
+            s.halt_on_margin_ratio_1e6
+        )));
+    }
+    if s.is_live() && names("binance") && s.halt_on_margin_ratio_1e6 == 0 {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `mode = \"live\"` on binance needs a non-zero \
+             `halt_on_margin_ratio_1e6` — `0` means UNSET here, never \"unlimited\""
+        )));
     }
 
     // S7-L1 (gap E): a top-up is money the arm spends on its own, so
@@ -1111,5 +1164,53 @@ mode = "paper"
         let f = parse(&src).expect("the committed example must parse");
         // The example ships SAFE: nothing armed.
         assert_eq!(f.live_mask(), 0, "exec.toml.example must not arm anything");
+    }
+
+    /// A live Binance slot, every required key but the margin halt (and
+    /// no budget floor: that is Hyperliquid's).
+    const LIVE_BINANCE: &str = "[exec]\n[exec.slot.2]\nmode = \"live\"\nname = \"xsd\"\n\
+         venues = [\"binance\"]\nmax_order_usd_1e6 = 100000000\n\
+         cap_instance_usd_1e6 = 1000000000\ncap_day_usd_1e6 = 30000000000\n\
+         max_open_orders = 64\nhalt_on_reject_streak = 5\n\
+         halt_on_recon_drift_usd_1e6 = 5000000\nhalt_on_ws_gap_ms = 30000\n\
+         halt_on_asset_refusal_streak = 3\nhalt_on_recon_stale_ms = 300000\n";
+
+    /// BX3 (D6, O-BX18): a Binance key, a bounded ratio, required live.
+    #[test]
+    fn the_margin_halt_is_a_bounded_binance_key_required_on_a_live_binance_slot() {
+        let paper = |venue: &str, v: &str| {
+            format!(
+                "[exec]\n[exec.slot.2]\nmode = \"paper\"\nvenues = [\"{venue}\"]\n\
+                 halt_on_margin_ratio_1e6 = {v}\n"
+            )
+        };
+        let f = parse(&paper("binance", "600000")).unwrap();
+        assert_eq!(f.slot(2).halt_on_margin_ratio_1e6, 600_000);
+        assert!(parse(&paper("binance", "799999")).is_ok());
+        expect_err(&paper("binance", "800000"), "80 % margin call");
+        expect_err(&paper("binance", "-1"), ">= 0");
+        expect_err(&paper("hyperliquid", "600000"), "does not name binance");
+        expect_err(LIVE_BINANCE, "halt_on_margin_ratio_1e6");
+        let live = format!("{LIVE_BINANCE}halt_on_margin_ratio_1e6 = 600000\n");
+        let f = parse(&live).unwrap();
+        assert_eq!(
+            f.slot(2).request_budget_floor,
+            0,
+            "no floor on a Binance-only slot"
+        );
+        assert_eq!(f.live_mask(), 1 << 2);
+    }
+
+    /// BX3: the address budget floor is Hyperliquid's — still required on
+    /// every live slot that trades it, alone or beside another venue.
+    #[test]
+    fn the_budget_floor_is_required_wherever_hyperliquid_is_live() {
+        let no_floor = MINIMAL_LIVE.replace("request_budget_floor = 2000\n", "");
+        expect_err(&no_floor, "request_budget_floor");
+        let both = no_floor.replace(
+            "venues = [\"hyperliquid\"]",
+            "venues = [\"hyperliquid\", \"binance\"]\nhalt_on_margin_ratio_1e6 = 600000",
+        );
+        expect_err(&both, "request_budget_floor");
     }
 }

@@ -359,6 +359,7 @@ dependencies = [
  "mio 0.8.11",
  "opt-registry",
  "proptest",
+ "rcgen",
  "research-artifacts",
  "rustls",
  "rustls-pki-types",

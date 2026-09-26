@@ -146,6 +146,13 @@ open, stop ingesting rules) on any of the following:
    rejections on a live slot ⇒ sticky per-slot halt.
 8. **(E6, NOT YET ENFORCED)** reconciliation drift between our position and
    the venue's above `halt_on_recon_drift_usd_1e6` ⇒ sticky per-slot halt.
+9. **(BX3, DARK until BX6)** the venue restricted a Binance account
+   (`VenueLock`) ⇒ sticky halt of every slot whose venues name binance.
+10. **(BX3, DARK until BX6)** a Binance account's margin ratio reached a
+    slot's own `halt_on_margin_ratio_1e6` (`MarginRisk`) ⇒ sticky halt of
+    that slot; a `MARGIN_CALL` ⇒ of every slot whose venues name binance.
+    Neither 9 nor 10 can fire before BX6 builds the Binance arm — "BX3"
+    below.
 
 Triggers 7 and 8 are PARSED from `exec.toml` today (E1) and enforced by
 nothing. E6 adds the enforcement, cancel-all-on-halt and the
@@ -3372,6 +3379,11 @@ Those are different quantities, deliberately:
   how much was committed, and selling a position back does not
   un-commit it. A ledger that netted sells off would let a member
   round-trip an unbounded notional under a fixed cap.
+  **BX3:** that is the family rows' rule. On a Binance instrument row
+  (a signed law: linear, inverse, a short option) a sell can OPEN a
+  position, so the day cap counts the part of any order — buy or sell —
+  that increases the position's magnitude, at the law's price; a
+  reducing order adds nothing. See "BX3" below.
 * `cap_instance_usd` — NET EXPOSURE, `|yes − no|` per outcome, summed
   across outcomes. Money actually at stake rather than money spent.
 
@@ -3563,6 +3575,14 @@ fill, which cannot happen, and it would strangle the maker. bin15's
 own ledger reserves notional at submit and self-limits in the healthy
 case; this gate's job is the unhealthy one, and there it bounds
 exposure at that product.
+
+**BX3 — exits never widen the bound.** On a Binance instrument row an
+order is an exit only if it and every working order of the slot on the
+same instrument and side cannot cross zero, and an exit PLACE still
+counts against `max_open_orders` (O-BX25). N working exits of a whole
+position are one exit; the rest meet every clamp. So the worst case
+above holds on Binance rows too, except for the residuals "BX3" below
+names (the two anomalous table states, and its BX6 obligations 1–3).
 
 Two related shapes, both by design and both worth an operator
 knowing:
@@ -4105,6 +4125,17 @@ once the answer is no, the size of the next order is beside the point.
 `trigger_for` evaluates them in that order and returns the FIRST one
 that fires.
 
+**BX3 (2026-09-26)** adds two venue VERDICTS, evaluated before all of
+the above and with no threshold of their own:
+
+| trigger | fires when | threshold key |
+|---|---|---|
+| `VenueLock` (10) | the venue restricted the account | *(none — the arm's flag)* |
+| `MarginRisk` (11) | margin ratio ≥ the slot's number, or any `MARGIN_CALL` | `halt_on_margin_ratio_1e6` (the arm judges it, O-BX18) |
+
+Only a Binance arm sets either, so neither can fire before BX6; a slot
+reads them only when its venues name binance (O-BX8). See "BX3" below.
+
 **The order only breaks ties inside one poll.** `on_idle` runs every
 2 ms and the latch is sticky, so whichever condition crosses its
 threshold first *in time* is the one recorded, whatever the order
@@ -4351,7 +4382,11 @@ never fires.
 `request_budget_floor` joins them. It is not a threshold the router
 compares against — the arm owns it and reports a flag — but at `0` the
 budget trigger fires only at TOTAL exhaustion, which is a kill switch
-that waits until the address is already bricked.
+that waits until the address is already bricked. **BX3:** it is
+Hyperliquid's address budget, so it is required only on a live slot
+whose venues name hyperliquid — every slot that can be live today — and
+the arm reads it only from the live slots it trades (the HIGHEST of
+them, O-BX27).
 
 This broke ten existing fixture tests, which is the correct outcome: a
 fixture that armed a live slot without a kill switch was describing a
@@ -5437,6 +5472,9 @@ arm that trades the operator's Hyperliquid slots — the boot turns on
   member in a position is not a risk control. `cap_instance` still
   judges it — selling one leg of an outcome whose other leg is also
   held raises the net exposure — and `cap_day` never counted sells.
+  (BX3: this is the family rows' exemption. On a Binance instrument row
+  an exit is judged net of the slot's working orders and still needs a
+  free open-order place — "BX3" below.)
 - **(E) The address request budget ran out in about half a day under
   full parity**, after which the floor halts the slot.
   `request_topup_weight` / `request_topup_day_max` (both or neither;
@@ -5857,3 +5895,220 @@ because the transport makes them:
   crate-private; addresses come in through `set_addr`.
 * **No transport enforces a cap.** Every order enters through
   `RoutedDispatcher`'s risk gate.
+
+### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
+
+Built on branch `binance` (plan §5 BX3; rulings O-BX17…O-BX27 and D8).
+**No live slot can name Binance yet:** `LIVE_ARM_VENUES` is unchanged
+(hyperliquid, hyperevm), and a live slot naming binance refuses the
+boot and names BX6. Every rule below binds the day an arm exists; it
+reaches the engine only through a merge to `main`, a release build and
+a restart.
+
+**A Hyperliquid-only boot is unchanged** (with today's one live
+Hyperliquid slot). With no instrument row bound the ledger's instrument
+probe returns before any work; the alias matches only the anchor, whose
+orders were and remain `NoLiveRoute` on every live slot; the Hyperliquid
+arm never raises the new flags; its boot tell is byte-identical
+(pinned). Two things differ only in shapes that do not run today: with
+two or more live Hyperliquid slots the address floor is now the highest
+of theirs (O-BX27, a tightening), and HYPARB's retirements drain at most
+64 a poll (more than it can produce).
+
+#### New kill switches: `VenueLock` (10) and `MarginRisk` (11)
+
+* Venue verdicts, no threshold, tested FIRST by `trigger_for`.
+  `VenueLock`: the venue restricted the account (for example
+  `RISK_LEVEL_CHANGE → REDUCE_ONLY`, O-BX10a). `MarginRisk`: the arm
+  judged the account's margin ratio at or past the slot's
+  `halt_on_margin_ratio_1e6`, or a `MARGIN_CALL` arrived (BX-20).
+  Sticky like every halt; a cancel still passes; nothing is flattened
+  (O-BX9).
+* Words `venue-lock` and `margin-risk` in `exec.HALT` and `/state`. An
+  older binary reads either word as `operator`: still halted.
+* No arm sets either before BX6; the Hyperliquid arm never does.
+* **Per-slot coverage (O-BX8, O-BX17).** A slot reads the signal of the
+  arm(s) that trade it, fixed at construction from its venue mask, so a
+  Binance verdict never reaches a Hyperliquid-only slot. A slot on both
+  venues reads the merge — the worse of each observation: the MAX of
+  the streaks, drift, stream gap and reconciliation age; the OR of the
+  flags that halt; the AND of `reconciled` and `pnl_judged`; the SUM of
+  the session P&L. Such a slot is seeded, and its session bound judged,
+  only when BOTH arms say so, and one venue's gain offsets the other's
+  loss in the bound.
+* A halt's cancel-all reaches every live arm (O-BX8); its confirmation
+  is the least settled of theirs (Working > Stranded > Clear).
+
+#### `halt_on_margin_ratio_1e6` — declared, NOT yet enforced
+
+* Allowed only on a slot whose `venues` names binance; required non-zero
+  on a live one; at most 799 999 (O-BX26: just under the venue's 80 %
+  margin call, which halts the slot on its own from BX6, BX-20; the venue
+  liquidates at 95 %). The plan's example is 600 000.
+* Parsed and validated now; printed in the boot tell's HALTS line of a
+  Binance slot; in `exec.toml.example` (commented) and the template
+  test.
+* **Not enforced until BX6:** the per-slot side table (O-BX18) and its
+  reader, the Binance arm, do not exist yet. A live Binance slot cannot
+  boot before then.
+
+#### `request_budget_floor` is Hyperliquid's
+
+* Required non-zero only on a live slot whose venues name hyperliquid
+  (amends E6 commit 4 above). Every slot that can be live today names
+  it, so nothing widens today.
+* The Hyperliquid arm's address numbers come only from the live slots
+  it trades — every live slot but slot 0 whose route names hyperliquid:
+  the HIGHEST floor (O-BX27; the code took the lowest, which made no
+  difference with one live slot), the LOWEST top-up weight and day
+  ceiling (S7-L1). A slot on another venue has no say, and the boot
+  tell prints the address numbers only on a slot naming hyperliquid.
+
+#### How an order on a Binance instrument row is judged
+
+Every Binance instrument the boot binds (BX6, from discovery; none is
+bound today) is a ledger row with a law — SPOT, LINEAR, INVERSE,
+OPTION — and every slot's signed position on it. An order is
+judged by its row's law, **all at one price**: the row is priced alike
+on both sides of every comparison, so a price move can never make a
+reducing order read as an increase.
+
+* **Exposure.** SPOT and LINEAR `|pos| × P`; INVERSE `|pos| × face`;
+  OPTION long `|pos| × mark` (the premium is per contract, D8); OPTION
+  short `|pos| × IM`, with IM per contract
+  `max(10 %·I, 15 %·I − OTM)·unit + mark` — Binance's short-selling
+  formula (D8). A short with no index yet is priced at the strike.
+* **The one price P.** A spot or linear row being traded: a buy at its
+  own price; a SELL at the higher of its limit and the row's reference,
+  the mark else the last fill (O-BX24 — a marketable sell fills at or
+  above its limit, so its limit alone understates what a short-opening
+  sell adds). An option row at its mark and index; the order's price
+  drives only clamp 1's premium, the turnover and — before the first
+  mark — the mark's stand-in (for a sell, again the higher of limit and
+  last fill). Other rows at their own prices: the mark, else the last
+  fill (O-BX22).
+* **Clamp 1 (`max_order`)** in the law's units: the notional (spot,
+  linear), the face (inverse), the premium of an option buy, the IM a
+  sell adds when it opens or grows a short (O-BX21).
+* **Clamp 3 (`cap_instance`)** compares the slot's exposure across every
+  venue — the family rows plus the instrument rows — before and after.
+* **Clamp 4 (`cap_day`)** adds the part of any order, buy or sell, that
+  increases the position's magnitude, at the law's price (the family
+  rows still count buys only). A settlement zeroes the row and adds no
+  turnover.
+* **Refusals.** `Short`: a spot sell past the holding net of the slot's
+  working sells, or a short on an option row not bound writable (from
+  the contract's `nakedSell`; the account's Long & Short mode is the
+  venue's own check, BX-18).
+  `Unpriced`: a non-positive limit (spot, linear, option), a short
+  option with no index yet, or a Binance-routed order on an instrument
+  no row was bound for (F8, closed at the router). Hyperliquid orders
+  never reach these; their arm refuses a non-positive price itself.
+* **Exits (risk review; O-BX25).** An order is an EXIT only if it
+  opposes the position and, with every working order of the slot on the
+  same instrument and side, cannot cross zero — N working exits of the
+  whole position are one exit. An order that opposes the position is
+  judged from the position those working orders would leave (its worst
+  case); a modify is judged beside every OTHER working order. An exit
+  is never refused by the money clamps (1, 3, 4), but a new exit PLACE
+  still needs a free open-order place (clamp 2): the resting table is
+  shared by every slot. A member at its count cancels or requotes (a
+  modify is exempt, E-7). **The stated worst case,
+  `cap_instance + max_open_orders × max_order`, holds on Binance rows —
+  an exit never widens it — except for the residuals named here: the two
+  anomalous states below and BX6 obligations 1–3.** The family rows keep
+  S7-L1's (D).
+* Two anomalous states loosen the exit test, and both are counted where
+  an operator reads them. `resting_ambiguous` (two rows under one key; a
+  modify's exclusion drops both): by one order. `resting_full`: every
+  order placed while the shared table is full goes untracked, so its
+  quantity is missing from the working sum — bounded by the slot's
+  `max_open_orders`, because the count still rises.
+
+#### Retirement (F9)
+
+* An arm reports an accepted order that ended without a (further) fill
+  as a `Retired` record: rejected, expired, canceled by the venue, by
+  TTL or by the member, filled; any other code counts as unknown. The
+  router drains at most 64 per idle poll, releases each order's resting
+  row and counts it by `why` (`/state` `exec.retired`;
+  `engine_exec_retired_total`).
+* Release is idempotent: an absent row is a no-op. A retirement drained
+  before the order's last fill moves no money ledger — exposure and
+  turnover come from fills alone — but the resting count AND the exit
+  test's working quantity are early by that order (BX6 obligation 1).
+* The Binance arm must retire an order only on a venue-confirmed
+  terminal state (a BX6 requirement). HYPARB's arm, today, retires a
+  hedge IoC after a fixed delay and a swap that was refused, unsent or
+  unconfirmed; on the family path only the open-order count reads the
+  row, so nothing else moves.
+
+#### The route alias
+
+The M1 legacy anchor (`binance:btcusdt`, flat id 7, whose venue byte
+reads Polymarket) routes to Binance by a boot-fixed alias, matched by
+the full id. Only the router's venue check and the venue split read it
+— never `ExecRoute`, the ledger, captures or the backtest model. The
+router owns the one table and hands it down to the split, so the venue
+an order was allowed by and the arm it reaches cannot disagree — while
+every composite forwards the hand-down hook (BX6 obligation 4). Today
+every anchor order from a live slot is still `NoLiveRoute`.
+
+#### Also recorded
+
+* **O-BX19:** `OrderDispatch::cancel` and `modify` are required — a
+  forgotten override no longer compiles (the shape of BX0-F3). The
+  composition test drives the real Hyperliquid arm through
+  `RoutedDispatcher<Paper, SlotSplit<VenueSplit<HlExchange, …>, …>>`
+  against a scripted TLS venue.
+* **O-BX20:** exec-hyperliquid's test-only `loopback` feature
+  (`HlConfig::with_port`) refuses any port but 443 on the real hosts.
+  A build without test targets never enables it; `--all-targets`,
+  `--tests` and clippy `--all-targets` do (resolver 2 unifies the
+  dev-dependency's feature), so a `cargo test --release -p cli` would
+  relink `target/release/multivenue-engine` with it compiled in — inert,
+  since nothing outside tests calls it — and G0 already requires a fresh
+  release build before any live boot.
+
+#### BX6 obligations (recorded now)
+
+1. **A retirement can arrive before its fill.** The engine runs members
+   before it drains the fill lanes, so a retirement drained in the same
+   iteration frees the resting row a tick early. BX6 pushes fills
+   first and retires one idle later — or the router stops releasing on
+   `FILLED`, which the fill releases anyway (a lost fill then leaves the
+   row counted: fail closed).
+2. **A queued arm's cancel or modify `Ok` means "queued".** The router
+   releases or renames the row on `Ok`, before the venue confirms; a
+   venue-refused cancel would leave a working order uncounted. BX6
+   applies them on confirmation (`CANCELED_MEMBER`), or records the
+   one-order residual here.
+3. **`Clear` on an IoC-only product** must also mean nothing of ours is
+   in flight (plan §3.8's confirmed no-op); otherwise `clear_resting`
+   drops in-flight IoC exits from the working count.
+4. **The defaulted `set_route_aliases` hook** has BX0-F3's shape: a
+   future composite that forgets to forward keeps an empty table (the
+   failure is loud — Hyperliquid refuses the order and counts asset
+   refusals). BX6 asserts at boot that the split's table equals the
+   router's, and builds the split from the router's own route — its
+   per-slot coverage comes from the route it is built with.
+5. **A two-venue slot whose second arm never judges P&L** has no
+   session bound: BX6 refuses that boot.
+6. **The Binance Mark producer**, with staleness and sanity checks on
+   mark and index, before BX7/BX9. Until then spot and linear rows are
+   priced at their last fill and inverse rows at their face; option rows
+   already take mark and index from the live options lane, unchecked.
+7. **Bind the armed set from discovery** (more than 256 rows refuses the
+   boot); Binance fills carry the engine id; the boot checks that no
+   non-Binance instrument carries the alias id.
+8. **Day-spend adoption for Binance slots** (the S7-L1 gap A analogue):
+   the Binance arm reports the day's turnover through
+   `venue_day_bought` (merged per O-BX17 for a two-venue slot) and
+   reports `reconciled` only after that read — for the signed laws,
+   "bought" is the increasing part on either side. Without it every
+   restart hands a Binance slot a fresh `cap_day`.
+9. **Arming precondition.** Binance joins `LIVE_ARM_VENUES` only in the
+   phase that also lands the O-BX18 side table and its reader, the
+   `VenueLock` and `MarginRisk` producers, and obligations 1–4 and 8 —
+   otherwise the boot tell would print a `margin_ratio_1e6` that nothing
+   enforces.

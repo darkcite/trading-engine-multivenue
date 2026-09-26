@@ -36,9 +36,9 @@ use std::sync::Arc;
 use strategy_set::{StrategySet, BIT_VM};
 
 // The lane arrays below are written out for the lane geometry (seven
-// tick lanes since MX2 added MEXC after WS9's Bybit); break the build
-// loudly if that drifts.
-const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 4);
+// tick lanes since MX2 added MEXC after WS9's Bybit; five fill lanes
+// since BX3 gave Binance lane 4); break the build loudly if that drifts.
+const _: () = assert!(NUM_TICK_LANES == 7 && NUM_FILL_LANES == 5);
 
 /// Raw Polymarket SymbolId (venue byte 0) — the boot-universe shape
 /// `build_ai_universe` produces for `--polymarket-sym-id`.
@@ -174,6 +174,7 @@ fn harness(tag: &str) -> Harness {
     let (_f1p, f1) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f2p, f2) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (_f3p, f3) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
+    let (_f4p, f4) = Ring::<core_types::Fill, FILL_RING_SIZE>::new().split();
     let (ai_prod, ai_cons) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
 
     let mut eng = Engine::new(
@@ -184,7 +185,7 @@ fn harness(tag: &str) -> Harness {
         [d0, d1],
         [o0, o1, o2],
         sc,
-        [f0, f1, f2, f3],
+        [f0, f1, f2, f3, f4],
         ai_cons,
         Arc::clone(&status),
         table_cons,

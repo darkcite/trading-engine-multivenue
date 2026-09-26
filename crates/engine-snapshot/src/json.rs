@@ -319,6 +319,27 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.i64(ex.arm_pnl_anchor_usd_1e6);
     c.key("arm_session_pnl_usd_1e6");
     c.i64(ex.arm_session_pnl_usd_1e6);
+    // BX3: the instrument laws' two refusals and the retirements by
+    // `why`, spelled. Additive.
+    c.key("refused_short");
+    c.u64(ex.refused_short);
+    c.key("refused_unpriced");
+    c.u64(ex.refused_unpriced);
+    c.key("retired");
+    c.byte(b'{');
+    let mut i = 0usize;
+    while i < crate::RETIRED_WHY_WORDS.len() {
+        if i > 0 {
+            c.byte(b',');
+        }
+        c.quoted(crate::RETIRED_WHY_WORDS[i].as_bytes());
+        c.byte(b':');
+        c.u64(ex.retired[i]);
+        i += 1;
+    }
+    c.key("unknown");
+    c.u64(ex.retired[crate::RETIRED_WHY_UNKNOWN]);
+    c.byte(b'}');
     c.key("halted");
     c.put(b"[");
     let mut i = 0usize;
@@ -1131,6 +1152,27 @@ mod tests {
             "hyperevm must follow mexc (append, never reorder)"
         );
         assert!(body.contains("\"heartbeat_age_s\":-1"));
+    }
+
+    /// BX3: the exec object carries the two instrument-law refusals and
+    /// every retirement `why` by word — `unknown` from its own bucket.
+    #[test]
+    fn the_exec_object_spells_the_retirements() {
+        let mut s = EngineSnapshot::empty();
+        s.exec.refused_short = 3;
+        s.exec.refused_unpriced = 4;
+        s.exec.retired = [10, 11, 12, 13, 14, 15, 0, 17];
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"refused_short\":3,\"refused_unpriced\":4,\"retired\":{\"rejected\":10,\
+                 \"expired\":11,\"canceled_venue\":12,\"canceled_ttl\":13,\
+                 \"canceled_member\":14,\"filled\":15,\"unknown\":17},\"halted\":["
+            ),
+            "{body}"
+        );
     }
 
     #[test]

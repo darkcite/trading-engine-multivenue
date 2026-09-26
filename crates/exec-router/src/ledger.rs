@@ -118,6 +118,270 @@ pub const LEDGER_RESTING: usize = 512;
 /// a disagreement every midnight.
 const DAY_NS: u64 = 86_400_000_000_000;
 
+// -----------------------------------------------------------------
+// BX3 — instrument rows (plan §3.5, D8, O-BX21, O-BX22)
+// -----------------------------------------------------------------
+
+/// **BX3 — instrument rows the ledger can hold**, one per venue
+/// instrument bound at boot (Binance spot, USDⓈ-M, COIN-M, options),
+/// beside the family rows. The armed set of every product fits; a boot
+/// that would bind more refuses (BX6's duty, `InstrumentBindErr::Full`).
+pub const LEDGER_INSTRUMENTS: usize = 256;
+// `inst_find` masks its index with `LEDGER_INSTRUMENTS - 1`.
+const _: () = assert!(LEDGER_INSTRUMENTS.is_power_of_two());
+
+/// Instrument law: spot, bStock, equity. Base units ×1e6, never short
+/// (no margin): a sell past the holding is refused.
+pub const LAW_SPOT: u8 = 1;
+/// Instrument law: a linear perpetual, dated future or TradFi perp. Base
+/// units ×1e6, signed.
+pub const LAW_LINEAR: u8 = 2;
+/// Instrument law: an inverse (COIN-M) contract. CONTRACTS ×1e6,
+/// signed; exposure is contracts × the contract's USD face, whatever the
+/// price.
+pub const LAW_INVERSE: u8 = 3;
+/// Instrument law: a European option. CONTRACTS ×1e6, signed; a short
+/// only where the venue lets this account write it.
+pub const LAW_OPTION: u8 = 4;
+
+/// Instrument flag: an option this account may write (`nakedSell`).
+pub const INST_WRITABLE: u8 = 1 << 0;
+/// Instrument flag: a call (a put otherwise). Options only.
+pub const INST_CALL: u8 = 1 << 1;
+
+/// **One row's exposure for one slot is clamped here**, USD ×1e6 (about
+/// $18 bn). Every sum over [`LEDGER_INSTRUMENTS`] rows then fits an
+/// `i64` exactly, so the per-slot aggregate is kept by exact adds and
+/// subtracts and cannot drift from a full recompute. No cap is near it,
+/// so a clamped row still refuses whatever a true one would.
+pub const INST_EXPOSURE_MAX: i64 = i64::MAX / 512;
+
+/// What the boot binds one instrument row from (BX6: from discovery).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct InstrumentSpec {
+    /// The engine id the instrument's orders and fills carry.
+    pub sym: SymbolId,
+    /// `LAW_*`.
+    pub law: u8,
+    /// `INST_*` (options only).
+    pub flags: u8,
+    _pad: [u8; 2],
+    /// Option: underlying units per contract ×1e6 (the eapi `unit`).
+    /// Inverse: the contract's USD face ×1e6 (`contractSize`). Else 0.
+    pub unit_1e6: i64,
+    /// Option: the strike ×1e6 (per underlying unit). Else 0.
+    pub strike_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<InstrumentSpec>() == 24);
+
+impl InstrumentSpec {
+    /// One instrument's binding.
+    #[must_use]
+    pub const fn new(sym: SymbolId, law: u8, flags: u8, unit_1e6: i64, strike_1e6: i64) -> Self {
+        Self {
+            sym,
+            law,
+            flags,
+            _pad: [0; 2],
+            unit_1e6,
+            strike_1e6,
+        }
+    }
+}
+
+/// Why [`Ledger::bind_instrument`] refused. Boot-only; the boot refuses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InstrumentBindErr {
+    /// [`LEDGER_INSTRUMENTS`] rows are bound already.
+    Full,
+    /// That id is bound already.
+    Duplicate,
+    /// The spec breaks its law: a `NONE` id, an unknown law, no unit on
+    /// an inverse or option row, no strike on an option, or an option
+    /// flag on a row that is not an option.
+    BadSpec,
+}
+
+/// One bound instrument: its law, its prices and every slot's signed
+/// position and exposure. `#[repr(C)]`, exactly 192 B — three lines, the
+/// positions and the cached exposures each one line of their own.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct InstrumentRow {
+    sym: SymbolId,
+    law: u8,
+    flags: u8,
+    _pad0: [u8; 2],
+    /// See [`InstrumentSpec::unit_1e6`].
+    unit_1e6: i64,
+    /// See [`InstrumentSpec::strike_1e6`].
+    strike_1e6: i64,
+    /// The venue's mark, ×1e6 (per contract on an option); 0 = none yet.
+    mark_1e6: i64,
+    /// An option's underlying index ×1e6; 0 = none yet.
+    index_1e6: i64,
+    /// The last venue fill's price ×1e6; 0 = none yet.
+    last_px_1e6: i64,
+    _pad1: [u8; 16],
+    /// Index = slot. Signed position ×1e6 (base units, or contracts).
+    pos_1e6: [i64; EXEC_SLOTS],
+    /// Index = slot. Exposure at the row's own prices, USD ×1e6 —
+    /// the term this row contributes to [`Ledger::inst_exposure_1e6`].
+    exp_1e6: [i64; EXEC_SLOTS],
+}
+
+const _: () = assert!(core::mem::size_of::<InstrumentRow>() == 192);
+const _: () = assert!(core::mem::align_of::<InstrumentRow>() == 64);
+const _: () = assert!(core::mem::offset_of!(InstrumentRow, pos_1e6) == 64);
+const _: () = assert!(core::mem::offset_of!(InstrumentRow, exp_1e6) == 128);
+
+impl InstrumentRow {
+    const FREE: Self = Self {
+        sym: SYMBOL_ID_NONE,
+        law: 0,
+        flags: 0,
+        _pad0: [0; 2],
+        unit_1e6: 0,
+        strike_1e6: 0,
+        mark_1e6: 0,
+        index_1e6: 0,
+        last_px_1e6: 0,
+        _pad1: [0; 16],
+        pos_1e6: [0; EXEC_SLOTS],
+        exp_1e6: [0; EXEC_SLOTS],
+    };
+
+    /// A long's (or a linear position's) price between orders: the mark
+    /// once one arrived, else the last fill's price (O-BX22).
+    #[inline]
+    const fn px_ctx(&self) -> i64 {
+        if self.mark_1e6 > 0 {
+            self.mark_1e6
+        } else {
+            self.last_px_1e6
+        }
+    }
+
+    /// One slot's exposure at the row's OWN prices — the aggregate's
+    /// term. A short option with no index yet is priced at the strike
+    /// (the at-the-money IM); the order path never OPENS one without an
+    /// index ([`Ledger::probe_instrument`]).
+    fn exposure_ctx(&self, pos: i64) -> i64 {
+        let mag = pos.saturating_abs();
+        match self.law {
+            LAW_SPOT | LAW_LINEAR => mul_1e6(mag, self.px_ctx()),
+            LAW_INVERSE => mul_1e6(mag, self.unit_1e6),
+            LAW_OPTION => {
+                if pos >= 0 {
+                    mul_1e6(mag, self.px_ctx())
+                } else {
+                    let index = if self.index_1e6 > 0 {
+                        self.index_1e6
+                    } else {
+                        self.strike_1e6
+                    };
+                    let im = short_im_per_contract(
+                        index,
+                        self.strike_1e6,
+                        self.px_ctx(),
+                        self.unit_1e6,
+                        self.flags & INST_CALL != 0,
+                    );
+                    mul_1e6(mag, im)
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// `a × b / 1e6` (both ×1e6 → ×1e6), in `i128`, clamped to
+/// `[0, INST_EXPOSURE_MAX]`: the operands here are magnitudes.
+#[inline]
+fn mul_1e6(a: i64, b: i64) -> i64 {
+    let p = (a as i128).saturating_mul(b as i128) / 1_000_000;
+    if p <= 0 {
+        0
+    } else if p >= INST_EXPOSURE_MAX as i128 {
+        INST_EXPOSURE_MAX
+    } else {
+        p as i64
+    }
+}
+
+/// **The venue's initial margin for ONE short option contract**, USD
+/// ×1e6 — Binance's formula verbatim (D8):
+/// `max(10 %·I, 15 %·I − OTM)·unit + M`, with the index `I` and strike
+/// `K` per unit of the underlying, `unit` underlying units per contract
+/// and the mark `M` per contract. OTM is `max(K − I, 0)` for a call and
+/// `max(I − K, 0)` for a put.
+#[inline]
+fn short_im_per_contract(index: i64, strike: i64, mark: i64, unit: i64, call: bool) -> i64 {
+    let i = index as i128;
+    let k = strike as i128;
+    let otm = if call { k - i } else { i - k };
+    let otm = if otm > 0 { otm } else { 0 };
+    let floor = i / 10;
+    let rate = 3 * i / 20 - otm;
+    let per_unit = if rate > floor { rate } else { floor };
+    let per_unit = if per_unit > 0 { per_unit } else { 0 };
+    let m = if mark > 0 { mark as i128 } else { 0 };
+    let v = per_unit.saturating_mul(unit as i128) / 1_000_000 + m;
+    if v >= INST_EXPOSURE_MAX as i128 {
+        INST_EXPOSURE_MAX
+    } else {
+        v as i64
+    }
+}
+
+/// Why an instrument law refused an order ([`InstProbe::refusal`]).
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum InstRefusal {
+    /// The law allows it.
+    #[default]
+    None = 0,
+    /// A spot sell past the holding, or a short on a non-writable option.
+    Short = 1,
+    /// A price at or below zero, a short option with no index, a zero or
+    /// negative quantity.
+    Unpriced = 2,
+}
+
+/// **What the risk gate learns about one order on an instrument row** —
+/// every number at ONE price (plan §3.5's one-price rule): the touched
+/// row is priced at the order's price (spot, linear), at its mark and
+/// index (option) or at its face (inverse) on BOTH sides of the
+/// comparison, so a price move can never make a reducing order read as
+/// an increase. 40 B, returned by value.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstProbe {
+    /// A law refusal, or `None`.
+    pub refusal: InstRefusal,
+    /// The order opposes the position and is no larger than what is left
+    /// of it once every working order on its side has filled: it only
+    /// reduces risk however they all fill, and no money clamp may refuse
+    /// it (O-BX25: a new exit still needs a free open-order place).
+    pub exit: bool,
+    /// Clamp 1's measure (O-BX21), USD ×1e6: the notional (spot,
+    /// linear), the face (inverse), the premium (option buy) or the IM
+    /// the order adds (a sell that opens or grows an option short).
+    pub measure_1e6: i64,
+    /// The slot's exposure now: every other row at its own prices, this
+    /// one at the one price.
+    pub current_1e6: i64,
+    /// The slot's exposure as the order would leave it.
+    pub projected_1e6: i64,
+    /// The day turnover it would add: the part of the quantity that
+    /// increases the position's magnitude, at the law's price.
+    pub turnover_add_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<InstProbe>() == 40);
+
 /// One FAMILY's current instance, and the per-slot position in it.
 ///
 /// `#[repr(C)]` and exactly 192 B — three cache lines. A fill touches
@@ -227,10 +491,29 @@ struct RestingOrder {
     slot: u8,
     /// `1` when the row holds an order.
     live: u8,
-    _pad: [u8; 2],
+    /// **BX3** — [`RESTING_BUY`] or [`RESTING_SELL`]: what the order does
+    /// to the position if it fills. The instrument exit test sums the
+    /// working quantity on one side ([`Ledger::probe_instrument`]).
+    side: u8,
+    _pad: [u8; 1],
 }
 
 const _: () = assert!(core::mem::size_of::<RestingOrder>() == 24);
+
+/// [`RestingOrder::side`] of a buy.
+const RESTING_BUY: u8 = 1;
+/// [`RestingOrder::side`] of a sell.
+const RESTING_SELL: u8 = 2;
+
+/// The resting side byte of an order.
+#[inline(always)]
+const fn resting_side(buy: bool) -> u8 {
+    if buy {
+        RESTING_BUY
+    } else {
+        RESTING_SELL
+    }
+}
 
 impl RestingOrder {
     #[inline]
@@ -241,7 +524,8 @@ impl RestingOrder {
             sym: SYMBOL_ID_NONE,
             slot: 0,
             live: 0,
-            _pad: [0; 2],
+            side: 0,
+            _pad: [0; 1],
         }
     }
 }
@@ -370,6 +654,19 @@ pub struct Ledger {
     /// 3's orders, nor the reverse.
     seeded: u8,
     counters: LedgerCounters,
+    /// **BX3** — bound instrument ids, sorted ascending; the free tail
+    /// is [`SYMBOL_ID_NONE`] (`u32::MAX`), which sorts last.
+    inst_keys: [SymbolId; LEDGER_INSTRUMENTS],
+    /// **BX3** — the rows, in `inst_keys`' order.
+    inst: [InstrumentRow; LEDGER_INSTRUMENTS],
+    /// **BX3** — rows bound. `0` on every boot without a Binance slot, and
+    /// then every instrument lookup is one compare.
+    inst_n: u32,
+    /// **BX3** — index = slot: Σ over instrument rows of their cached
+    /// exposure (`InstrumentRow::exp_1e6`). Exact by construction
+    /// ([`INST_EXPOSURE_MAX`]); added to the family sum wherever the
+    /// slot's exposure is read.
+    inst_exposure_1e6: [i64; EXEC_SLOTS],
 }
 
 // **No `Default`.** A `Ledger` needs the boot's monotonic→wall
@@ -397,6 +694,10 @@ impl Ledger {
             anchor,
             seeded: 0,
             counters: LedgerCounters::default(),
+            inst_keys: [SYMBOL_ID_NONE; LEDGER_INSTRUMENTS],
+            inst: [InstrumentRow::FREE; LEDGER_INSTRUMENTS],
+            inst_n: 0,
+            inst_exposure_1e6: [0; EXEC_SLOTS],
         }
     }
 
@@ -459,8 +760,24 @@ impl Ledger {
     /// A slot at or above [`EXEC_SLOTS`] reports `0`: it can never be
     /// `Live` (`ExecRoute::mode` resolves every out-of-range id to
     /// `Paper`), so there is no clamp for it to answer.
+    ///
+    /// **BX3** — plus the slot's instrument rows, each at its own prices
+    /// (`inst_exposure_1e6`; zero when none is bound), so one
+    /// `cap_instance` spans a slot's every venue.
     #[must_use]
     pub fn slot_exposure_1e6(&self, slot: usize) -> i64 {
+        if slot >= EXEC_SLOTS {
+            return 0;
+        }
+        self.family_exposure_1e6(slot)
+            .saturating_add(self.inst_exposure_1e6[slot])
+    }
+
+    /// The family rows' share of [`Self::slot_exposure_1e6`].
+    fn family_exposure_1e6(&self, slot: usize) -> i64 {
+        // The guard lives HERE, not only in the callers: it is what lets
+        // the per-slot indexing below compile without bounds checks
+        // whether or not this is inlined.
         if slot >= EXEC_SLOTS {
             return 0;
         }
@@ -536,7 +853,8 @@ impl Ledger {
         if !hit && buy {
             total = total.saturating_add(qty_1e6);
         }
-        total
+        // BX3: the slot's instrument rows, unchanged by a family order.
+        total.saturating_add(self.inst_exposure_1e6[slot])
     }
 
     /// One leg after a fill or a projected order, and **whether the
@@ -922,6 +1240,404 @@ impl Ledger {
     }
 
     // -----------------------------------------------------------------
+    // BX3 — instrument rows
+    // -----------------------------------------------------------------
+
+    /// **Bind one instrument row.** Boot-only: a sorted insert, so the
+    /// order path's lookup is a fixed eight-step search.
+    ///
+    /// # Errors
+    /// [`InstrumentBindErr`] — the table is full, the id is bound
+    /// already, or the spec breaks its law. The boot refuses on any.
+    pub fn bind_instrument(&mut self, spec: &InstrumentSpec) -> Result<(), InstrumentBindErr> {
+        let option = spec.law == LAW_OPTION;
+        let bad = spec.sym == SYMBOL_ID_NONE
+            || spec.law < LAW_SPOT
+            || spec.law > LAW_OPTION
+            || ((spec.law == LAW_INVERSE || option) && spec.unit_1e6 <= 0)
+            || (option && spec.strike_1e6 <= 0)
+            || (!option && (spec.flags != 0 || spec.strike_1e6 != 0));
+        if bad {
+            return Err(InstrumentBindErr::BadSpec);
+        }
+        if self.inst_find(spec.sym).is_some() {
+            return Err(InstrumentBindErr::Duplicate);
+        }
+        let n = self.inst_n as usize;
+        if n >= LEDGER_INSTRUMENTS {
+            return Err(InstrumentBindErr::Full);
+        }
+        let mut at = n;
+        while at > 0 && self.inst_keys[at - 1] > spec.sym {
+            // COPY: one 192 B row and its 4 B key, one place right, per
+            // row after the insertion point — boot-only, at most 255 rows
+            // for one bind — rejected: an unsorted table, whose lookup on
+            // the order path would be a linear scan of 256 rows.
+            self.inst_keys[at] = self.inst_keys[at - 1];
+            self.inst[at] = self.inst[at - 1];
+            at -= 1;
+        }
+        self.inst_keys[at] = spec.sym;
+        self.inst[at] = InstrumentRow {
+            sym: spec.sym,
+            law: spec.law,
+            flags: spec.flags,
+            unit_1e6: spec.unit_1e6,
+            strike_1e6: spec.strike_1e6,
+            ..InstrumentRow::FREE
+        };
+        self.inst_n += 1;
+        Ok(())
+    }
+
+    /// Instrument rows bound. Cold.
+    #[inline]
+    #[must_use]
+    pub const fn instruments_bound(&self) -> u32 {
+        self.inst_n
+    }
+
+    /// **The row bound for `sym`.** One compare when nothing is bound
+    /// (every boot without a Binance slot); otherwise a branchless lower
+    /// bound over the fixed, sorted key array — eight steps for 256.
+    #[inline]
+    #[must_use]
+    fn inst_find(&self, sym: SymbolId) -> Option<usize> {
+        if self.inst_n == 0 || sym == SYMBOL_ID_NONE {
+            return None;
+        }
+        let mut base = 0usize;
+        let mut size = LEDGER_INSTRUMENTS;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            // SAFETY: `base + size <= LEDGER_INSTRUMENTS` holds before
+            // every step (it starts equal, and each step moves `base` up
+            // by at most `half` while `size` shrinks by exactly `half`),
+            // so `mid = base + half < base + size <= LEDGER_INSTRUMENTS`.
+            let key = unsafe { *self.inst_keys.get_unchecked(mid) };
+            if key <= sym {
+                base = mid;
+            }
+            size -= half;
+        }
+        // `base < LEDGER_INSTRUMENTS` already (the invariant above); the
+        // mask says so to the compiler, so every `self.inst[i]` a caller
+        // indexes with the result carries no bounds check.
+        let i = base & (LEDGER_INSTRUMENTS - 1);
+        if self.inst_keys[i] == sym {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `sym` has an instrument row. The router's routing test.
+    #[inline]
+    #[must_use]
+    pub fn has_instrument(&self, sym: SymbolId) -> bool {
+        self.inst_find(sym).is_some()
+    }
+
+    /// A slot's signed position on an instrument, ×1e6, or `None` when
+    /// no row is bound for it. Cold; `/state` and tests.
+    #[must_use]
+    pub fn instrument_position_1e6(&self, slot: usize, sym: SymbolId) -> Option<i64> {
+        if slot >= EXEC_SLOTS {
+            return None;
+        }
+        self.inst_find(sym).map(|i| self.inst[i].pos_1e6[slot])
+    }
+
+    /// The instrument rows' share of a slot's exposure, USD ×1e6. Cold.
+    #[inline]
+    #[must_use]
+    pub fn instrument_exposure_1e6(&self, slot: usize) -> i64 {
+        if slot >= EXEC_SLOTS {
+            return 0;
+        }
+        self.inst_exposure_1e6[slot]
+    }
+
+    /// **Judge one order on an instrument row by its law** — the numbers
+    /// the router's clamps compare, all at one price (see [`InstProbe`]).
+    /// `px` is the order's price ×1e6 (per contract on an option);
+    /// `exclude` is the resting order a modify replaces (`None` for a
+    /// fresh order).
+    ///
+    /// **Judged from the worst position the slot's working orders allow**
+    /// (BX3 risk review). An order that opposes the position is judged
+    /// as if every working order on its side had filled first — they
+    /// reduce the same position, and on a signed law N working exits of
+    /// the whole position would otherwise each read as an exit and, all
+    /// filled, flip it by (N−1)× with no clamp measuring the flip. An
+    /// order that does not oppose the position is judged from the filled
+    /// position itself: working orders that reduce can only help it, and
+    /// ones that increase are bounded by `max_open_orders × max_order`,
+    /// the stated worst case.
+    #[must_use]
+    pub fn probe_instrument(
+        &self,
+        sym: SymbolId,
+        slot: usize,
+        qty_1e6: i64,
+        buy: bool,
+        px_1e6: i64,
+        exclude: Option<u64>,
+    ) -> Option<InstProbe> {
+        let i = self.inst_find(sym)?;
+        let mut p = InstProbe::default();
+        if slot >= EXEC_SLOTS || qty_1e6 <= 0 {
+            p.refusal = InstRefusal::Unpriced;
+            return Some(p);
+        }
+        let r = &self.inst[i];
+        let filled = r.pos_1e6[slot];
+        let pos = if (filled > 0 && !buy) || (filled < 0 && buy) {
+            let working = self.working_1e6(slot, sym, buy, exclude);
+            if buy {
+                filled.saturating_add(working)
+            } else {
+                filled.saturating_sub(working)
+            }
+        } else {
+            filled
+        };
+        let mag = pos.saturating_abs();
+        let opposes = (pos > 0 && !buy) || (pos < 0 && buy);
+        if opposes && qty_1e6 <= mag {
+            // Reduces the position without crossing zero, however the
+            // working orders on its side fill. Every law is monotone in
+            // the magnitude within a sign, so no clamp can read it as an
+            // increase — and it is never priced, so an exit needs no
+            // mark, no index and no price.
+            p.exit = true;
+            return Some(p);
+        }
+        let inc = if opposes { qty_1e6 - mag } else { qty_1e6 };
+        let next = if buy {
+            pos.saturating_add(qty_1e6)
+        } else {
+            pos.saturating_sub(qty_1e6)
+        };
+        // **O-BX24 — the one price a SELL is judged at: the higher of its
+        // limit and the row's reference** (the mark, else the last fill).
+        // A marketable sell fills at or above its limit, so a low limit
+        // alone would understate what a short-opening sell adds — by as
+        // much as the venue's price band allows. A buy keeps its own
+        // price: it fills at or below it. Used on both sides of every
+        // comparison below, so the one-price rule holds. A non-positive
+        // LIMIT is refused before this, whatever the reference.
+        let px_at = if buy { px_1e6 } else { px_1e6.max(r.px_ctx()) };
+        let (e_now, e_next, measure, turnover) = match r.law {
+            LAW_SPOT | LAW_LINEAR => {
+                if r.law == LAW_SPOT && next < 0 {
+                    p.refusal = InstRefusal::Short;
+                    return Some(p);
+                }
+                if px_1e6 <= 0 {
+                    p.refusal = InstRefusal::Unpriced;
+                    return Some(p);
+                }
+                (
+                    mul_1e6(mag, px_at),
+                    mul_1e6(next.saturating_abs(), px_at),
+                    mul_1e6(qty_1e6, px_at),
+                    mul_1e6(inc, px_at),
+                )
+            }
+            LAW_INVERSE => (
+                mul_1e6(mag, r.unit_1e6),
+                mul_1e6(next.saturating_abs(), r.unit_1e6),
+                mul_1e6(qty_1e6, r.unit_1e6),
+                mul_1e6(inc, r.unit_1e6),
+            ),
+            LAW_OPTION => {
+                if px_1e6 <= 0 {
+                    p.refusal = InstRefusal::Unpriced;
+                    return Some(p);
+                }
+                // The long side's one price: the mark, or — before the
+                // first summary — the order's own price (O-BX24: a sell's
+                // is the higher of its limit and the last fill), never
+                // zero (a zero would read a first long as no exposure).
+                let m = if r.mark_1e6 > 0 { r.mark_1e6 } else { px_at };
+                let opens_short = !buy && next < 0;
+                if opens_short {
+                    if r.flags & INST_WRITABLE == 0 {
+                        p.refusal = InstRefusal::Short;
+                        return Some(p);
+                    }
+                    if r.index_1e6 <= 0 {
+                        p.refusal = InstRefusal::Unpriced;
+                        return Some(p);
+                    }
+                }
+                // The short IM, only where a short is on either side of
+                // the order (two i128 divides a pure long never needs).
+                let im = if pos < 0 || next < 0 {
+                    let index = if r.index_1e6 > 0 {
+                        r.index_1e6
+                    } else {
+                        r.strike_1e6
+                    };
+                    short_im_per_contract(
+                        index,
+                        r.strike_1e6,
+                        m,
+                        r.unit_1e6,
+                        r.flags & INST_CALL != 0,
+                    )
+                } else {
+                    0
+                };
+                let e_now = if pos >= 0 {
+                    mul_1e6(mag, m)
+                } else {
+                    mul_1e6(mag, im)
+                };
+                let e_next = if next >= 0 {
+                    mul_1e6(next, m)
+                } else {
+                    mul_1e6(next.saturating_abs(), im)
+                };
+                // O-BX21: a buy is measured by its premium, a sell that
+                // opens or grows a short by the IM it adds.
+                let measure = if buy {
+                    mul_1e6(qty_1e6, px_1e6)
+                } else {
+                    mul_1e6(inc, im)
+                };
+                (e_now, e_next, measure, mul_1e6(inc, px_at))
+            }
+            _ => {
+                p.refusal = InstRefusal::Unpriced;
+                return Some(p);
+            }
+        };
+        let others = self
+            .family_exposure_1e6(slot)
+            .saturating_add(self.inst_exposure_1e6[slot] - r.exp_1e6[slot]);
+        p.measure_1e6 = measure;
+        p.current_1e6 = others.saturating_add(e_now);
+        p.projected_1e6 = others.saturating_add(e_next);
+        p.turnover_add_1e6 = turnover;
+        Some(p)
+    }
+
+    /// Re-price one row for every slot and keep the aggregate exact.
+    fn refresh_instrument(&mut self, i: usize) {
+        let r = &mut self.inst[i];
+        let mut s = 0usize;
+        while s < EXEC_SLOTS {
+            // A flat slot with nothing cached has nothing to re-price —
+            // and skipping it skips the i128 divides a mark would
+            // otherwise cost every slot on every row.
+            if r.pos_1e6[s] == 0 && r.exp_1e6[s] == 0 {
+                s += 1;
+                continue;
+            }
+            let e = r.exposure_ctx(r.pos_1e6[s]);
+            self.inst_exposure_1e6[s] = self.inst_exposure_1e6[s] - r.exp_1e6[s] + e;
+            r.exp_1e6[s] = e;
+            s += 1;
+        }
+    }
+
+    /// **The price feed — a venue `Mark`** (`v0` = mark ×1e6): a spot,
+    /// linear or inverse row's mark. Options take theirs from
+    /// [`Self::on_opt_summary`]. Unbound ids and a non-positive mark are
+    /// ignored.
+    pub fn on_mark(&mut self, sym: SymbolId, mark_1e6: i64) {
+        let Some(i) = self.inst_find(sym) else {
+            return;
+        };
+        if self.inst[i].law == LAW_OPTION || mark_1e6 <= 0 {
+            return;
+        }
+        self.inst[i].mark_1e6 = mark_1e6;
+        self.refresh_instrument(i);
+    }
+
+    /// **The price feed — an options summary**: an option row's mark (when
+    /// the summary carries one) and its underlying's index, both ×1e9 on
+    /// the lane, ×1e6 here.
+    pub fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
+        let Some(i) = self.inst_find(summary.sym) else {
+            return;
+        };
+        if self.inst[i].law != LAW_OPTION {
+            return;
+        }
+        let r = &mut self.inst[i];
+        let mut moved = false;
+        if summary.flags & core_types::OPT_SUMMARY_FLAG_MARK_PX != 0 && summary.mark_px_1e9 > 0 {
+            r.mark_1e6 = summary.mark_px_1e9 / 1_000;
+            moved = true;
+        }
+        if summary.underlying_px_1e9 > 0 {
+            r.index_1e6 = summary.underlying_px_1e9 / 1_000;
+            moved = true;
+        }
+        if moved {
+            self.refresh_instrument(i);
+        }
+    }
+
+    /// **Book one venue fill on an instrument row.** The position moves by
+    /// the fill (a spot row floors at zero and reports it); the day
+    /// turnover adds the INCREASING part at the law's price; a
+    /// settlement (options expiry, delivery) zeroes the slot's position,
+    /// adds no turnover and matches no resting order.
+    fn book_instrument_fill(&mut self, i: usize, fill: &Fill, slot: usize) {
+        let qty = fill.qty.raw();
+        let px = fill.px.raw();
+        let buy = fill.side == core_types::Side::Bid;
+        let settlement = fill.is_settlement();
+        let r = &mut self.inst[i];
+        if settlement {
+            r.pos_1e6[slot] = 0;
+        } else {
+            let pos = r.pos_1e6[slot];
+            let mag = pos.saturating_abs();
+            let opposes = (pos > 0 && !buy) || (pos < 0 && buy);
+            let inc = if opposes {
+                if qty > mag {
+                    qty - mag
+                } else {
+                    0
+                }
+            } else {
+                qty
+            };
+            let mut next = if buy {
+                pos.saturating_add(qty)
+            } else {
+                pos.saturating_sub(qty)
+            };
+            if r.law == LAW_SPOT && next < 0 {
+                next = 0;
+                self.counters.sells_below_zero = self.counters.sells_below_zero.saturating_add(1);
+            }
+            r.pos_1e6[slot] = next;
+            if px > 0 {
+                r.last_px_1e6 = px;
+            }
+            let add = if r.law == LAW_INVERSE {
+                mul_1e6(inc, r.unit_1e6)
+            } else {
+                mul_1e6(inc, px)
+            };
+            self.day_turnover_1e6[slot] = self.day_turnover_1e6[slot].saturating_add(add);
+        }
+        self.refresh_instrument(i);
+        self.counters.fills_booked = self.counters.fills_booked.saturating_add(1);
+        if !settlement {
+            self.consume_resting(fill.order_id, slot, qty);
+        }
+    }
+
+    // -----------------------------------------------------------------
     // writing — fills
     // -----------------------------------------------------------------
 
@@ -941,6 +1657,11 @@ impl Ledger {
         let slot = fill.strategy_id as usize;
         if slot >= EXEC_SLOTS {
             self.counters.fills_unattributed = self.counters.fills_unattributed.saturating_add(1);
+            return;
+        }
+        // BX3: an instrument row books by its law.
+        if let Some(i) = self.inst_find(fill.sym) {
+            self.book_instrument_fill(i, fill, slot);
             return;
         }
         let qty = fill.qty.raw();
@@ -1066,7 +1787,14 @@ impl Ledger {
     // -----------------------------------------------------------------
 
     /// A live submit was accepted by the arm. Starts tracking it.
-    pub fn on_submit(&mut self, client_oid: u64, slot: usize, sym: SymbolId, qty_1e6: i64) {
+    pub fn on_submit(
+        &mut self,
+        client_oid: u64,
+        slot: usize,
+        sym: SymbolId,
+        qty_1e6: i64,
+        buy: bool,
+    ) {
         if slot >= EXEC_SLOTS {
             return;
         }
@@ -1112,7 +1840,8 @@ impl Ledger {
             sym,
             slot: slot as u8,
             live: 1,
-            _pad: [0; 2],
+            side: resting_side(buy),
+            _pad: [0; 1],
         };
         self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
     }
@@ -1155,12 +1884,14 @@ impl Ledger {
         slot: usize,
         sym: SymbolId,
         qty_1e6: i64,
+        buy: bool,
     ) {
         match self.find(prev_client_oid, slot) {
             Found::One(i) => {
                 self.resting[i].client_oid = client_oid;
                 self.resting[i].remaining_1e6 = qty_1e6;
                 self.resting[i].sym = sym;
+                self.resting[i].side = resting_side(buy);
             }
             // The arm accepted a modify of an order the ledger is not
             // holding. Tracking the replacement is the conservative
@@ -1174,7 +1905,7 @@ impl Ledger {
             // leaking one place in a shared table per unmatched
             // modify, which is the very condition that makes the table
             // fill.
-            Found::None => self.on_submit(client_oid, slot, sym, qty_1e6),
+            Found::None => self.on_submit(client_oid, slot, sym, qty_1e6, buy),
             // **Two rows under one key: leave the table alone.** Same
             // ruling as `consume_resting`, and it has to be the same
             // one: adding a THIRD row under an already-ambiguous key
@@ -1182,6 +1913,36 @@ impl Ledger {
             // guess". `find` counts it.
             Found::Many => {}
         }
+    }
+
+    /// **BX3 (risk review) — what `slot` has WORKING on `sym` on one side**,
+    /// ×1e6: the remaining quantity of its resting orders there, less the
+    /// order a modify replaces (`exclude`). The instrument exit test reads
+    /// it: N working exits of the whole position are one exit, not N.
+    ///
+    /// One pass over the table by reference, like [`Self::find`]; asked
+    /// only for an order that opposes a position on an instrument row.
+    fn working_1e6(&self, slot: usize, sym: SymbolId, buy: bool, exclude: Option<u64>) -> i64 {
+        let side = resting_side(buy);
+        let (skip, skip_oid) = match exclude {
+            Some(oid) => (true, oid),
+            None => (false, 0),
+        };
+        let mut total = 0i64;
+        let mut i = 0usize;
+        while i < LEDGER_RESTING {
+            let r = &self.resting[i];
+            i += 1;
+            if r.live == 1
+                && r.slot as usize == slot
+                && r.sym == sym
+                && r.side == side
+                && !(skip && r.client_oid == skip_oid)
+            {
+                total = total.saturating_add(r.remaining_1e6.max(0));
+            }
+        }
+        total
     }
 
     /// Resolve `(client_oid, slot)` against the resting table.
@@ -1420,7 +2181,7 @@ mod tests {
     fn a_settle_drops_the_resting_orders_and_leaves_the_position_to_the_fill() {
         let mut l = bound();
         l.book_fill(&fill(T0, sym(100), true, 900_000, 5_000_000, 1));
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_exposure_1e6(SLOT), 5_000_000);
 
         l.settle(VENUE, FAM, 20_182);
@@ -1771,8 +2532,8 @@ mod tests {
     #[test]
     fn a_submit_counts_and_a_cancel_uncounts() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(12, SLOT, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(12, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 2);
         l.on_cancel(11, SLOT);
         assert_eq!(l.slot_resting(SLOT), 1);
@@ -1784,8 +2545,8 @@ mod tests {
         // share oid 11 routinely. Keying on the oid alone is the exact
         // defect the E5 commit-3 review found in the paper matcher.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(11, SLOT + 1, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT + 1, sym(100), 5_000_000, true);
         l.on_cancel(11, SLOT + 1);
         assert_eq!(l.slot_resting(SLOT), 1, "the other slot's cancel took mine");
         assert_eq!(l.slot_resting(SLOT + 1), 0);
@@ -1794,8 +2555,8 @@ mod tests {
     #[test]
     fn a_modify_keeps_the_count_and_moves_the_id() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_modify(11, 12, SLOT, sym(100), 7_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_modify(11, 12, SLOT, sym(100), 7_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 1, "LAW E-7: replaced in place");
         // The replacement's fills must match: the OLD id no longer does.
         l.book_fill(&fill(T0, sym(100), true, 500_000, 7_000_000, 11));
@@ -1808,7 +2569,7 @@ mod tests {
     #[test]
     fn a_full_fill_retires_the_order_and_a_partial_one_does_not() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
         l.book_fill(&fill(T0, sym(100), true, 500_000, 2_000_000, 11));
         assert_eq!(l.slot_resting(SLOT), 1, "3 contracts still working");
         l.book_fill(&fill(T0, sym(100), true, 500_000, 3_000_000, 11));
@@ -1818,8 +2579,8 @@ mod tests {
     #[test]
     fn an_ambiguous_key_leaves_the_count_alone_and_says_so() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 2);
         l.book_fill(&fill(T0, sym(100), true, 500_000, 5_000_000, 11));
         assert_eq!(l.counters().resting_ambiguous, 1);
@@ -1831,8 +2592,8 @@ mod tests {
         // The separation the module docs claim, asserted. A defect in
         // order matching must not be able to blind the caps.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
         l.book_fill(&fill(T0, sym(100), true, 500_000, 5_000_000, 11));
         assert_eq!(l.counters().resting_ambiguous, 1);
         assert_eq!(l.slot_exposure_1e6(SLOT), 5_000_000);
@@ -1847,8 +2608,8 @@ mod tests {
         // `max_open_orders` would eventually refuse everything for
         // ever.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(12, SLOT, sym(101), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(12, SLOT, sym(101), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 2);
         l.settle(VENUE, FAM, 20_182);
         assert_eq!(l.slot_resting(SLOT), 0);
@@ -1859,8 +2620,8 @@ mod tests {
         let mut l = Ledger::new(anchor());
         l.bind(VENUE, 0, 1, sym(100));
         l.bind(VENUE, 1, 2, sym(200));
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(12, SLOT, sym(200), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(12, SLOT, sym(200), 5_000_000, true);
         l.settle(VENUE, 0, 1);
         assert_eq!(l.slot_resting(SLOT), 1);
     }
@@ -1869,10 +2630,10 @@ mod tests {
     fn the_resting_table_refuses_rather_than_overwriting_when_full() {
         let mut l = bound();
         for i in 0..LEDGER_RESTING {
-            l.on_submit(i as u64 + 1, SLOT, sym(100), 1);
+            l.on_submit(i as u64 + 1, SLOT, sym(100), 1, true);
         }
         assert_eq!(l.slot_resting(SLOT), LEDGER_RESTING as u32);
-        l.on_submit(999_999, SLOT, sym(100), 1);
+        l.on_submit(999_999, SLOT, sym(100), 1, true);
         assert_eq!(l.counters().resting_full, 1);
         // No ROW was taken from an existing order — the first one is
         // still there to be cancelled. (The COUNT rises anyway, which
@@ -1884,7 +2645,7 @@ mod tests {
     #[test]
     fn an_out_of_range_slot_answers_zero_rather_than_reading_past_the_array() {
         let mut l = bound();
-        l.on_submit(11, EXEC_SLOTS, sym(100), 5_000_000);
+        l.on_submit(11, EXEC_SLOTS, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(EXEC_SLOTS), 0);
         assert_eq!(l.slot_exposure_1e6(EXEC_SLOTS), 0);
         assert_eq!(l.slot_day_turnover_1e6(EXEC_SLOTS), 0);
@@ -2026,10 +2787,10 @@ mod tests {
         // `on_modify` did, because it could not tell ABSENT from
         // AMBIGUOUS.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
-        l.on_submit(11, SLOT, sym(100), 5_000_000);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 2);
-        l.on_modify(11, 12, SLOT, sym(100), 5_000_000);
+        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 2, "a third row was created");
         assert_eq!(l.counters().resting_ambiguous, 1);
     }
@@ -2042,7 +2803,7 @@ mod tests {
         // E-8 cancel-all — ever retires it: one place leaked out of a
         // shared table per unmatched modify, for the life of the boot.
         let mut l = bound();
-        l.on_modify(11, 12, SLOT, sym(100), 5_000_000);
+        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 1);
         l.settle(VENUE, FAM, 20_182);
         assert_eq!(l.slot_resting(SLOT), 0, "the phantom row survived the roll");
@@ -2056,9 +2817,9 @@ mod tests {
         // on.
         let mut l = bound();
         for i in 0..LEDGER_RESTING {
-            l.on_submit(i as u64 + 1, SLOT, sym(100), 1);
+            l.on_submit(i as u64 + 1, SLOT, sym(100), 1, true);
         }
-        l.on_submit(999_999, SLOT, sym(100), 1);
+        l.on_submit(999_999, SLOT, sym(100), 1, true);
         assert_eq!(l.counters().resting_full, 1);
         assert_eq!(
             l.slot_resting(SLOT),
@@ -2095,7 +2856,533 @@ mod tests {
         // LOW — a count that under-reports is a clamp that lets
         // through the order it exists to stop.
         let mut l = bound();
-        l.on_modify(11, 12, SLOT, sym(100), 5_000_000);
+        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true);
         assert_eq!(l.slot_resting(SLOT), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // BX3 — instrument rows
+    // -----------------------------------------------------------------
+
+    /// A Binance-namespace id.
+    const fn bn(ord: u32) -> SymbolId {
+        (1u32 << core_types::SYMBOL_VENUE_SHIFT) | ord
+    }
+    const E6: i64 = 1_000_000;
+    const SPOT: SymbolId = bn(1);
+    const LIN: SymbolId = bn(2);
+    const INV: SymbolId = bn(3);
+    /// BTC call, strike 100 000, unit 1, writable.
+    const CALL: SymbolId = bn(4);
+    /// DOGE put, strike 0.084, unit 1 000, not writable.
+    const PUT: SymbolId = bn(5);
+
+    /// A seeded ledger with one row per law.
+    fn inst() -> Ledger {
+        let mut l = Ledger::new(anchor());
+        l.mark_seeded();
+        l.bind_instrument(&InstrumentSpec::new(SPOT, LAW_SPOT, 0, 0, 0))
+            .unwrap();
+        l.bind_instrument(&InstrumentSpec::new(LIN, LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        l.bind_instrument(&InstrumentSpec::new(INV, LAW_INVERSE, 0, 100 * E6, 0))
+            .unwrap();
+        l.bind_instrument(&InstrumentSpec::new(
+            CALL,
+            LAW_OPTION,
+            INST_WRITABLE | INST_CALL,
+            E6,
+            100_000 * E6,
+        ))
+        .unwrap();
+        l.bind_instrument(&InstrumentSpec::new(PUT, LAW_OPTION, 0, 1_000 * E6, 84_000))
+            .unwrap();
+        l
+    }
+
+    fn summary(s: SymbolId, mark_1e6: i64, index_1e6: i64) -> core_types::OptSummary {
+        core_types::OptSummary::new(
+            T0,
+            core_types::VenueId::Binance,
+            s,
+            if mark_1e6 > 0 {
+                core_types::OPT_SUMMARY_FLAG_MARK_PX
+            } else {
+                0
+            },
+            mark_1e6 * 1_000,
+            0,
+            index_1e6 * 1_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    /// Deterministic xorshift for the randomised properties below.
+    fn rng(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    #[test]
+    fn bind_instrument_refuses_duplicates_bad_specs_and_the_257th() {
+        let mut l = Ledger::new(anchor());
+        let bad = [
+            InstrumentSpec::new(SYMBOL_ID_NONE, LAW_SPOT, 0, 0, 0),
+            InstrumentSpec::new(bn(9), 0, 0, 0, 0),
+            InstrumentSpec::new(bn(9), 5, 0, 0, 0),
+            InstrumentSpec::new(bn(9), LAW_INVERSE, 0, 0, 0),
+            InstrumentSpec::new(bn(9), LAW_OPTION, 0, E6, 0),
+            InstrumentSpec::new(bn(9), LAW_OPTION, 0, 0, E6),
+            InstrumentSpec::new(bn(9), LAW_LINEAR, INST_WRITABLE, 0, 0),
+            InstrumentSpec::new(bn(9), LAW_SPOT, 0, 0, E6),
+        ];
+        for b in bad {
+            assert_eq!(
+                l.bind_instrument(&b),
+                Err(InstrumentBindErr::BadSpec),
+                "{b:?}"
+            );
+        }
+        l.bind_instrument(&InstrumentSpec::new(bn(9), LAW_SPOT, 0, 0, 0))
+            .unwrap();
+        assert_eq!(
+            l.bind_instrument(&InstrumentSpec::new(bn(9), LAW_LINEAR, 0, 0, 0)),
+            Err(InstrumentBindErr::Duplicate)
+        );
+        let mut k = 10u32;
+        while l.instruments_bound() < LEDGER_INSTRUMENTS as u32 {
+            l.bind_instrument(&InstrumentSpec::new(bn(k), LAW_LINEAR, 0, 0, 0))
+                .unwrap();
+            k += 1;
+        }
+        assert_eq!(
+            l.bind_instrument(&InstrumentSpec::new(bn(k), LAW_LINEAR, 0, 0, 0)),
+            Err(InstrumentBindErr::Full)
+        );
+    }
+
+    #[test]
+    fn the_branchless_search_agrees_with_a_linear_scan() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut round = 0;
+        while round < 40 {
+            let mut l = Ledger::new(anchor());
+            let n = (rng(&mut x) % LEDGER_INSTRUMENTS as u64) as usize;
+            let mut bound: Vec<SymbolId> = Vec::new();
+            while bound.len() < n {
+                let id = (rng(&mut x) % 5_000) as u32 + 1;
+                if l.bind_instrument(&InstrumentSpec::new(id, LAW_LINEAR, 0, 0, 0))
+                    .is_ok()
+                {
+                    bound.push(id);
+                }
+            }
+            let mut q = 0;
+            while q < 2_000 {
+                let id = (rng(&mut x) % 5_200) as u32;
+                assert_eq!(l.has_instrument(id), bound.contains(&id), "id {id}");
+                q += 1;
+            }
+            for id in &bound {
+                assert!(l.has_instrument(*id));
+            }
+            assert!(!l.has_instrument(SYMBOL_ID_NONE));
+            round += 1;
+        }
+    }
+
+    #[test]
+    fn an_unbound_ledger_reads_exactly_as_before() {
+        let mut l = bound();
+        l.book_fill(&fill(T0, sym(100), true, 500_000, 3 * E6, 1));
+        let before = (
+            l.slot_exposure_1e6(SLOT),
+            l.projected_exposure_1e6(SLOT, sym(100), E6, true),
+            l.slot_day_turnover_1e6(SLOT),
+        );
+        l.on_mark(bn(1), 5 * E6);
+        l.on_opt_summary(&summary(bn(4), E6, E6));
+        assert_eq!(l.probe_instrument(sym(100), SLOT, E6, true, E6, None), None);
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 0);
+        assert_eq!(
+            (
+                l.slot_exposure_1e6(SLOT),
+                l.projected_exposure_1e6(SLOT, sym(100), E6, true),
+                l.slot_day_turnover_1e6(SLOT),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn a_spot_sell_beyond_the_holding_is_refused_as_short() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, SPOT, true, 100 * E6, 2 * E6, 1));
+        let p = l
+            .probe_instrument(SPOT, SLOT, 3 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert_eq!(p.refusal, InstRefusal::Short);
+        let p = l
+            .probe_instrument(SPOT, SLOT, 2 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(
+            p.exit && p.refusal == InstRefusal::None,
+            "selling the holding is an exit"
+        );
+        // A fill that oversells anyway floors at zero and is reported.
+        l.book_fill(&fill(T0, SPOT, false, 100 * E6, 3 * E6, 2));
+        assert_eq!(l.instrument_position_1e6(SLOT, SPOT), Some(0));
+        assert_eq!(l.counters().sells_below_zero, 1);
+    }
+
+    /// **BX3 risk review — working exits of the whole position are ONE
+    /// exit.** Each further sell is judged from the position the working
+    /// ones would leave: flat, so it opens a short and meets every clamp.
+    /// A requote of the working exit is judged beside the OTHER orders
+    /// only; buys working on the far side change nothing for a sell; a
+    /// partial fill moves quantity from working into the position; a
+    /// spot sell past the holding net of working sells is a short.
+    /// Break-and-watch: judging from the filled position alone reads the
+    /// second sell as an exit — both filled, the position flips 5 → −5
+    /// with no clamp measuring it.
+    #[test]
+    fn concurrent_exits_are_judged_from_the_position_they_leave() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 100 * E6, 5 * E6, 1));
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(p.exit, "the first full-size sell is an exit");
+        l.on_submit(21, SLOT, LIN, 5 * E6, false);
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(!p.exit, "a second one would flip the position");
+        assert_eq!((p.current_1e6, p.projected_1e6), (0, 500 * E6));
+        assert_eq!(p.turnover_add_1e6, 500 * E6);
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, false, 99 * E6, Some(21))
+            .unwrap();
+        assert!(p.exit, "a requote of the working exit is still one");
+        l.on_submit(22, SLOT, LIN, 3 * E6, true);
+        let p = l
+            .probe_instrument(LIN, SLOT, 2 * E6, false, 100 * E6, Some(21))
+            .unwrap();
+        assert!(p.exit, "working buys do not reduce what a sell may close");
+        // 2 of the working exit fill: long 3, 3 still working to sell.
+        l.book_fill(&fill(T0, LIN, false, 100 * E6, 2 * E6, 21));
+        assert_eq!(l.instrument_position_1e6(SLOT, LIN), Some(3 * E6));
+        let p = l
+            .probe_instrument(LIN, SLOT, E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(!p.exit);
+        assert_eq!(p.turnover_add_1e6, 100 * E6, "all of it opens the short");
+        // Another slot's working orders are its own.
+        let p = l
+            .probe_instrument(LIN, SLOT + 1, E6, true, 100 * E6, None)
+            .unwrap();
+        assert!(!p.exit && p.turnover_add_1e6 == 100 * E6);
+        // Spot: a working sell of the whole holding leaves nothing to sell.
+        l.book_fill(&fill(T0, SPOT, true, 100 * E6, 2 * E6, 3));
+        l.on_submit(31, SLOT, SPOT, 2 * E6, false);
+        let p = l
+            .probe_instrument(SPOT, SLOT, E6, false, 100 * E6, None)
+            .unwrap();
+        assert_eq!(p.refusal, InstRefusal::Short);
+        l.on_cancel(31, SLOT);
+        let p = l
+            .probe_instrument(SPOT, SLOT, E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(p.exit, "cancelled, it no longer counts");
+    }
+
+    /// **O-BX24 — a sell is judged at the higher of its limit and the
+    /// row's reference.** A marketable sell at a low limit fills at the
+    /// market, so it is measured there: flat, a sell of 5 limited at $10
+    /// under a $100 mark opens $500 of short, not $50. A buy keeps its own
+    /// price; with no reference yet a sell has only its limit; the last
+    /// fill stands in for a missing mark. Break-and-watch: pricing the
+    /// sell at its limit reads $50 on every measure.
+    #[test]
+    fn a_sell_is_judged_at_the_higher_of_its_limit_and_the_reference() {
+        let mut l = inst();
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, false, 10 * E6, None)
+            .unwrap();
+        assert_eq!(p.measure_1e6, 50 * E6, "no reference yet: the limit");
+        l.on_mark(LIN, 100 * E6);
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, false, 10 * E6, None)
+            .unwrap();
+        assert_eq!(
+            (p.measure_1e6, p.projected_1e6, p.turnover_add_1e6),
+            (500 * E6, 500 * E6, 500 * E6)
+        );
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, false, 120 * E6, None)
+            .unwrap();
+        assert_eq!(p.measure_1e6, 600 * E6, "a limit above the mark is its own");
+        let p = l
+            .probe_instrument(LIN, SLOT, 5 * E6, true, 10 * E6, None)
+            .unwrap();
+        assert_eq!(p.measure_1e6, 50 * E6, "a buy fills at or below its limit");
+        // An option with no mark: the last fill stands in for it.
+        l.on_opt_summary(&summary(CALL, 0, 100_000 * E6));
+        l.book_fill(&fill(T0, CALL, true, 400 * E6, E6, 1));
+        let low = l
+            .probe_instrument(CALL, SLOT, 3 * E6, false, E6, None)
+            .unwrap();
+        let at = l
+            .probe_instrument(CALL, SLOT, 3 * E6, false, 400 * E6, None)
+            .unwrap();
+        assert_eq!(low, at, "a $1 limit is judged at the $400 last fill");
+    }
+
+    /// Long 5, sell 8: only the 3 that open the short are turnover.
+    /// Break-and-watch: counting the whole quantity makes it 8.
+    #[test]
+    fn turnover_counts_only_the_increasing_part() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 10 * E6, 5 * E6, 1));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 50 * E6);
+        let p = l
+            .probe_instrument(LIN, SLOT, 8 * E6, false, 10 * E6, None)
+            .unwrap();
+        assert!(!p.exit);
+        assert_eq!(p.turnover_add_1e6, 30 * E6);
+        assert_eq!(p.measure_1e6, 80 * E6, "clamp 1 still sees the whole order");
+        l.book_fill(&fill(T0, LIN, false, 10 * E6, 8 * E6, 2));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 80 * E6);
+        assert_eq!(l.instrument_position_1e6(SLOT, LIN), Some(-3 * E6));
+    }
+
+    #[test]
+    fn a_settlement_zeroes_the_row_and_adds_no_turnover() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, CALL, true, 500 * E6, 2 * E6, 1));
+        let turnover = l.slot_day_turnover_1e6(SLOT);
+        let resting = l.slot_resting(SLOT);
+        let s = fill(T0, CALL, false, 0, 2 * E6, 9).with_flags(core_types::FILL_FLAG_SETTLEMENT);
+        l.book_fill(&s);
+        assert_eq!(l.instrument_position_1e6(SLOT, CALL), Some(0));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), turnover);
+        assert_eq!(l.slot_resting(SLOT), resting);
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 0);
+    }
+
+    #[test]
+    fn a_short_option_with_no_index_is_refused_until_one_arrives() {
+        let mut l = inst();
+        let p = l
+            .probe_instrument(CALL, SLOT, E6, false, 500 * E6, None)
+            .unwrap();
+        assert_eq!(p.refusal, InstRefusal::Unpriced);
+        l.on_opt_summary(&summary(CALL, 500 * E6, 100_000 * E6));
+        let p = l
+            .probe_instrument(CALL, SLOT, E6, false, 500 * E6, None)
+            .unwrap();
+        assert_eq!(p.refusal, InstRefusal::None);
+        // ATM: 15 % of the index plus the mark, per contract.
+        assert_eq!(p.measure_1e6, 15_000 * E6 + 500 * E6);
+        // A buy-back of an existing short needs no index at all.
+        let mut l = inst();
+        l.book_fill(&fill(T0, CALL, false, 500 * E6, E6, 1));
+        let p = l
+            .probe_instrument(CALL, SLOT, E6, true, 500 * E6, None)
+            .unwrap();
+        assert!(p.exit && p.refusal == InstRefusal::None);
+    }
+
+    #[test]
+    fn a_non_writable_option_cannot_be_shorted() {
+        let mut l = inst();
+        l.on_opt_summary(&summary(PUT, 10 * E6, 100_000));
+        let p = l
+            .probe_instrument(PUT, SLOT, E6, false, 10 * E6, None)
+            .unwrap();
+        assert_eq!(p.refusal, InstRefusal::Short);
+        // Buying it is fine, and selling what was bought is an exit.
+        let p = l
+            .probe_instrument(PUT, SLOT, E6, true, 10 * E6, None)
+            .unwrap();
+        assert_eq!(p.refusal, InstRefusal::None);
+        l.book_fill(&fill(T0, PUT, true, 10 * E6, E6, 1));
+        let p = l
+            .probe_instrument(PUT, SLOT, E6, false, 10 * E6, None)
+            .unwrap();
+        assert!(p.exit);
+    }
+
+    /// Binance's short-option IM (D8): OTM on either side lowers it to
+    /// the 10 % floor; the unit scales the index term, not the mark.
+    #[test]
+    fn option_im_follows_the_venue_formula() {
+        let (i, m) = (100_000 * E6, 500 * E6);
+        assert_eq!(
+            short_im_per_contract(i, 100_000 * E6, m, E6, true),
+            15_000 * E6 + m
+        );
+        assert_eq!(
+            short_im_per_contract(i, 110_000 * E6, m, E6, true),
+            10_000 * E6 + m
+        );
+        assert_eq!(
+            short_im_per_contract(i, 90_000 * E6, m, E6, false),
+            10_000 * E6 + m
+        );
+        assert_eq!(
+            short_im_per_contract(i, 97_000 * E6, m, E6, true),
+            15_000 * E6 + m
+        );
+        assert_eq!(
+            short_im_per_contract(i, 103_000 * E6, m, E6, true),
+            12_000 * E6 + m
+        );
+        // DOGE: unit 1 000, index 0.1, mark 16 per contract.
+        let im = short_im_per_contract(100_000, 84_000, 16 * E6, 1_000 * E6, true);
+        assert_eq!(im, 15 * E6 + 16 * E6);
+    }
+
+    /// COIN-M: contracts × face, whatever the price.
+    #[test]
+    fn inverse_exposure_ignores_price() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, INV, true, 80_000 * E6, 3 * E6, 1));
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 300 * E6);
+        l.on_mark(INV, 120_000 * E6);
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 300 * E6);
+        let p = l
+            .probe_instrument(INV, SLOT, 2 * E6, true, 1, None)
+            .unwrap();
+        assert_eq!((p.current_1e6, p.projected_1e6), (300 * E6, 500 * E6));
+        assert_eq!(p.measure_1e6, 200 * E6);
+    }
+
+    /// Before the first summary a long is priced at its own order, never
+    /// at zero — zero would read a first long as no exposure at all.
+    #[test]
+    fn a_first_long_option_with_no_mark_is_priced_at_the_order() {
+        let l = inst();
+        let p = l
+            .probe_instrument(CALL, SLOT, 2 * E6, true, 700 * E6, None)
+            .unwrap();
+        assert_eq!(p.projected_1e6, 1_400 * E6);
+        assert_eq!(p.measure_1e6, 1_400 * E6);
+    }
+
+    #[test]
+    fn a_mark_reprices_the_rows_exposure() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 100 * E6, 2 * E6, 1));
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 200 * E6, "the last fill");
+        l.on_mark(LIN, 150 * E6);
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 300 * E6);
+        assert_eq!(
+            l.slot_exposure_1e6(SLOT),
+            300 * E6,
+            "part of the slot's sum"
+        );
+        l.on_mark(LIN, 0);
+        assert_eq!(
+            l.instrument_exposure_1e6(SLOT),
+            300 * E6,
+            "a zero mark is ignored"
+        );
+    }
+
+    /// Every exit on every signed law is recognised whatever the prices,
+    /// and a crossing order never reads as an increase of what it
+    /// reduced: the touched row is priced at one price on both sides.
+    /// Break-and-watch: pricing `current` at the cached mark and
+    /// `projected` at the order price fails the crossing check.
+    #[test]
+    fn a_reducing_order_is_never_refused_on_any_signed_law() {
+        let mut x = 0xD1B5_4A32_D192_ED03u64;
+        let mut n = 0;
+        while n < 20_000 {
+            let mut l = inst();
+            l.on_opt_summary(&summary(CALL, 400 * E6, 100_000 * E6));
+            let syms = [SPOT, LIN, INV, CALL];
+            let s = syms[(rng(&mut x) % 4) as usize];
+            let open = (rng(&mut x) % 50 + 1) as i64 * E6;
+            let long = s == SPOT || rng(&mut x) & 1 == 0;
+            let fpx = (rng(&mut x) % 100_000 + 1) as i64 * E6;
+            l.book_fill(&fill(T0, s, long, fpx, open, 1));
+            l.on_mark(s, (rng(&mut x) % 100_000 + 1) as i64 * E6);
+            let px = (rng(&mut x) % 100_000 + 1) as i64 * E6;
+            let q = (rng(&mut x) % (open as u64 / E6 as u64) + 1) as i64 * E6;
+            let p = l.probe_instrument(s, SLOT, q, !long, px, None).unwrap();
+            assert!(p.exit, "an exit on {s:#x}: open {open} q {q}");
+            assert_eq!(p.refusal, InstRefusal::None);
+            if s == LIN || s == INV {
+                let over = open + (rng(&mut x) % 2 + 1) as i64 * E6;
+                if over < 2 * open {
+                    let p = l.probe_instrument(s, SLOT, over, !long, px, None).unwrap();
+                    assert!(
+                        p.projected_1e6 <= p.current_1e6,
+                        "a crossing that shrinks the magnitude read as an increase"
+                    );
+                }
+            }
+            n += 1;
+        }
+    }
+
+    /// The per-slot aggregate is exact: after any mix of fills, marks and
+    /// summaries on any rows and slots it equals a full recompute.
+    #[test]
+    fn the_instrument_aggregate_matches_a_full_recompute() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut l = inst();
+        let syms = [SPOT, LIN, INV, CALL, PUT];
+        let mut step = 0;
+        while step < 50_000 {
+            let s = syms[(rng(&mut x) % 5) as usize];
+            match rng(&mut x) % 4 {
+                0 | 1 => {
+                    let mut f = fill(
+                        T0,
+                        s,
+                        rng(&mut x) & 1 == 0,
+                        (rng(&mut x) % 200_000 + 1) as i64 * E6,
+                        (rng(&mut x) % 20 + 1) as i64 * E6,
+                        step,
+                    );
+                    f.strategy_id = (rng(&mut x) % EXEC_SLOTS as u64) as u8;
+                    l.book_fill(&f);
+                }
+                2 => l.on_mark(s, (rng(&mut x) % 200_000) as i64 * E6),
+                _ => l.on_opt_summary(&summary(
+                    s,
+                    (rng(&mut x) % 2_000) as i64 * E6,
+                    (rng(&mut x) % 200_000) as i64 * E6,
+                )),
+            }
+            let mut slot = 0usize;
+            while slot < EXEC_SLOTS {
+                let mut sum = 0i64;
+                let mut i = 0usize;
+                while i < l.inst_n as usize {
+                    let r = &l.inst[i];
+                    let e = r.exposure_ctx(r.pos_1e6[slot]);
+                    assert_eq!(r.exp_1e6[slot], e, "a stale cached term");
+                    sum += e;
+                    i += 1;
+                }
+                assert_eq!(
+                    l.instrument_exposure_1e6(slot),
+                    sum,
+                    "step {step} slot {slot}"
+                );
+                slot += 1;
+            }
+            step += 1;
+        }
     }
 }

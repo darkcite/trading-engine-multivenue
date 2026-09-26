@@ -1,6 +1,6 @@
 # Binance Execution Plan (BX0–BX14): fix-now pass first; then spot, USDⓈ-M + COIN-M futures (incl. TradFi stock perps), European options (long + short BTC/ETH), bStocks, Binance Stocks
 
-**Status: v2.1, 2026-09-26 — BX1 OPEN (its keyed probes wait on keys); BX4 committed (`ce2ee4a`), BX5 built (§5 records)** on branch `binance` (worktree `~/trading-engine-multivenue-binance`, base `5f2140f`). **§13, the BX1 refresh, is authoritative wherever it differs from §1–§10.** v2, 2026-09-23 — BX0 LIVE. The fix-now pass (F1–F4) is committed in the main checkout (`0a1f6ff`) and went live at the 16:05Z routine restart, verified (§5 BX0). Its zero-copy pass (O-BX12d) is the second BX0 commit and goes live at the 00:10Z restart (§12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
+**Status: v2.1, 2026-09-26 — BX1 OPEN (its keyed probes wait on keys); BX4 (`ce2ee4a`), BX5 and BX2's public half committed; BX3 built, dark until BX6 (§5 records)** on branch `binance` (worktree `~/trading-engine-multivenue-binance`, base `5f2140f`). **§13, the BX1 refresh, is authoritative wherever it differs from §1–§10.** v2, 2026-09-23 — BX0 LIVE. The fix-now pass (F1–F4) is committed in the main checkout (`0a1f6ff`) and went live at the 16:05Z routine restart, verified (§5 BX0). Its zero-copy pass (O-BX12d) is the second BX0 commit and goes live at the 00:10Z restart (§12). BX1–BX14 are not started. v1 was written the same day at the operator's ask ("draft execution for binance spot, futures, options, stocks"). v2 records **20 operator rulings**, collected in five AskUserQuestion rounds, plus the instruction to make the fix-now pass the **first step**; three more (O-BX12b–d) followed the BX0 build.
 
 **What this adds.** A second live arm, `VenueId::Binance = 1`, next to Hyperliquid. It sits behind the same two-switch interlock (`--exec` + `--arm-live`), the same risk gate and the same E-laws.
 
@@ -46,9 +46,20 @@
 | **O-BX12b** | After the BX0 build: **the session edits the live `.env`**, one line only, to `BINANCE_EAPI_WS_HOST=fstream.binance.com`. No other line is read or changed; the secrets law otherwise stands. | BX0 F2 goes live at the restart |
 | **O-BX12c** | **F3's test substitution is accepted**: the arm-level trait tests plus the router's spy-arm tests stand in for the router-level loopback test, which moves to BX3. | BX0 F3; BX3 |
 | **O-BX12d** | **Commit BX0.** **Fix every pre-existing zero-copy finding in `ingress-binance`**, and put the crate in `make copy-audit`'s scope. | BX0, a second commit |
-| **O-BX14** | The merge order against HYPARB is decided **when BX3 (router) starts**. | BX3 |
+| **O-BX14** | The merge order against HYPARB is decided **when BX3 (router) starts**. **Ruled at BX3's start (2026-09-26): settled.** HYPARB merged on 2026-09-24 and `binance` sits on it, so BX3 builds on the branch. Main's newer commits (six ZC commits, none in the router) are merged into `binance` later, at a quiet point the operator names. | BX3 |
 | **O-BX15** | BX1 onward is built in a **separate worktree and branch**, following HYPARB: `~/trading-engine-multivenue-binance` on branch `binance`, merged at a quiet point the operator names. | process |
 | **O-BX16** | The Binance Stocks arm is a **full arm with a lifecycle battery, and no member uses it**. | BX10 |
+| **O-BX17** | *(BX3's start, 2026-09-26.)* The Binance arm composes as **`SlotSplit<VenueSplit<Hl, Bn>, HyparbLive>`**; the battery uses `VenueSplit<Null, Bn>`. `VenueSplit` routes by the order's route venue. Its halt merge takes the **max** of the streaks, drift, gap and recon age; the **OR** of the floor, `venue_lock` and `margin_risk`; the **AND** of `reconciled` and `pnl_judged`; and the **sum** of `pnl_delta`. `cancel_all` fans out, and `cancel_all_state` keeps the landed precedence **Working > Stranded > Clear**. | BX3 (§13.3 item 1) |
+| **O-BX18** | *(BX3's start.)* `halt_on_margin_ratio_1e6` lives in a **per-slot side table** (`[i64; 8]`) outside `ExecRoute`, handed to the Binance arm at boot. The arm judges it on `ACCOUNT_UPDATE` / `MARGIN_CALL` and at recon. `HaltSignal` carries only the `margin_risk` flag and stays 48 B. | BX3 (§13.3 item 6) |
+| **O-BX19** | *(BX3's start.)* The F3 guard is **both**: `OrderDispatch::cancel` / `modify` become required methods with no default, **and** BX3 adds the router + real-arm composition test (`RoutedDispatcher<Paper, VenueSplit<…>>` against scripted venues, with the ledger's retire and rename asserted). | BX3 (carried from BX0) |
+| **O-BX20** | *(BX3, second round.)* `exec-hyperliquid` gains a **test-only `loopback` feature**: `HlConfig::with_port(u16)`, which refuses any port other than 443 on the mainnet and testnet hosts. Only `cli`'s dev-dependencies enable it, so the deploy build never has it. It exists for O-BX19's composition test against the real `HlExchange`. | BX3 |
+| **O-BX21** | *(BX3.)* On an option, the per-order clamp (`max_order`) measures **the exposure the order adds, in its law's units, at one price**: the premium (quantity × price) for a buy, and the venue IM for a sell that opens or grows a short. This keeps it consistent with `cap_instance`, and a deep-OTM short cannot slip past `max_order` on a tiny premium. | BX3 ledger |
+| **O-BX22** | *(BX3.)* Between fills, a slot's **other** spot holdings are priced at their **last fill price**; the order's own row always uses the order price (the one-price rule). The tick mid is revisited at BX8. | BX3 ledger; BX8 |
+| **O-BX23** | *(BX3.)* CLAUDE.md's alloc-count line is updated in the BX3 commit, and only that line. | BX3 |
+| **O-BX24** | *(BX3, risk review.)* A **sell** on a Binance instrument row is judged at **the higher of its limit and the row's reference** (the mark, else the last fill), on both sides of every comparison; a buy keeps its own price. A marketable sell fills at or above its limit, so its limit alone understates what a short-opening sell adds. Amends O-BX22 for sells only. | BX3 ledger |
+| **O-BX25** | *(BX3, risk review.)* An **exit** on an instrument row skips the three money clamps (`max_order`, `cap_instance`, `cap_day`), but a new exit **PLACE still counts against `max_open_orders`**; a modify stays exempt (E-7). The resting table is shared by every slot. Amends BX3's first cut, in which an exit skipped all four clamps. | BX3 router |
+| **O-BX26** | *(BX3, risk review.)* `halt_on_margin_ratio_1e6` is capped at **799 999**, just under the venue's 80 % margin call: from BX6 any `MARGIN_CALL` raises `MarginRisk` (BX-20), so a threshold at or above it could never fire first. | BX3 config |
+| **O-BX27** | *(BX3, risk review.)* The Hyperliquid arm's address floor is the **highest** `request_budget_floor` among the live slots it trades (the code took the lowest while its comment said "tightest"). Its top-up weight and day ceiling stay the lowest. | BX3 cli |
 | **K12** | Account eligibility: **all products are enabled** for this account (spot, USDⓈ-M/COIN-M, European options, Binance Stocks). | closed |
 
 **Defaulted, not asked:**
@@ -65,6 +76,7 @@
 | **D4** | TradFi sessions (`tradingSchedule`, `tradingSession`) are **observed and journaled** as a gauge, never gated. | O-BX11 |
 | **D5** | For Binance Stocks, `equity_session` (RTH / EXTENDED / 24H), `equity_tokenize` and `equity_quote` are **required artifact keys with no default**. The battery exercises all sessions. | O-BX16: no member exists to choose them |
 | **D6** | A **margin halt**, `MarginRisk = 11`, is added. The arm computes each product's margin ratio itself, because `RISK_LEVEL_CHANGE` is sent only to VIP and market-maker accounts. `MARGIN_CALL` is an immediate observation. | O-BX10 (writing) and futures leverage make margin the binding risk |
+| **D8** | *(BX3.)* **Option prices are per contract.** eapi quotes the premium per contract, while the index and the strike are per unit of the underlying. Live example: DOGE, unit 1 000, trades at 2.80–25.12 on a 0.084 strike. So premium terms carry no `unit`: a long's exposure is `abs(pos) × mark`, and an order's premium is `qty × price`. Only the index term of the short IM carries `unit`: `[max(10 %·I, 15 %·I − OTM)·unit + mark]·abs(pos)`, which is Binance's short-selling FAQ formula, verbatim. §3.5's long row `pos × unit × mark` is corrected accordingly; at unit 1 (BTC and ETH) the two readings agree. | the eapi live rows (§13.5); Binance's options short-selling FAQ |
 
 ---
 
@@ -1106,6 +1118,65 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
 
 **Carried from BX0 (risk-reviewer, 2026-09-23).** `LiveSet` must forward `cancel` and `modify` to the arm that owns the order — F3 was exactly a forgotten override hidden behind a trait default of `Unsupported`. BX3 either makes `OrderDispatch::cancel`/`modify` REQUIRED methods (no default, so a forgotten override stops compiling) or adds the router + real-arm composition test BX0 substituted: `RoutedDispatcher<Paper, LiveSet<…>>` against scripted venues, with the ledger's retire and rename asserted.
 
+**BX3 record (2026-09-26, branch `binance`): router, ledger, lanes — DARK until BX6.**
+- **Built:**
+  - `clob-dispatcher`:
+    - `cancel` and `modify` are REQUIRED (O-BX19); `LiveDispatcher` and `QueuedDispatcher` answer `Unsupported` explicitly, and every test dispatcher states both.
+    - `Retired` (16 B: `client_oid`, `slot`, `why`), `why` = REJECTED 0, EXPIRED 1, CANCELED_VENUE 2, CANCELED_TTL 3, CANCELED_MEMBER 4, FILLED 5; `RETIRED_WHY_SLOTS` 8, an undefined code counted in bucket 7. `try_next_retired` returns it.
+    - `HaltSignal` gains `venue_lock` and `margin_risk` (@27/@28, 48 B, offsets pinned), `with_venue` and `merged` (O-BX17: max / OR / AND / sum, symmetric).
+    - `RouteAlias` (8 B) × 4 = `RouteAliases` (32 B); `route_venue` is four unrolled full-id compares.
+    - Defaulted hooks `on_opt_summary` and `set_route_aliases` (the router hands its alias table down; composites forward it).
+    - `ExecCounters` 568 → 648 B: `refused_short`, `refused_unpriced`, `retired[8]`.
+  - `exec-router`:
+    - `VenueSplit<A, B>` (new `venue_split.rs`): each order to the arm of its route venue; each slot's halt coverage fixed at construction from its venue mask (a-only, b-only, or both → `HaltSignal::merged`); shared fills and retirements (a first), idle work, events and summaries; `cancel_all` fans out, its state is the least settled; per-slot day spend merged.
+    - The router: the alias in every venue check (submit, cancel on Off and Live, modify); the bounded retire drain (≤ 64 per `on_idle`, `RetireCounters`); Mark events to the ledger; option summaries to paper, live and ledger; the instrument law before the family clamps (`probe_instrument` + `judge_instrument`); a Binance-routed order with no row refused `Unpriced` (F8).
+    - `HaltReason::VenueLock = 10`, `MarginRisk = 11`, tested first by `trigger_for`.
+    - Ledger instrument rows (§3.5 as corrected by D8 and the rulings): `LEDGER_INSTRUMENTS` 256; `InstrumentRow` 192 B (align 64, `pos_1e6` @64, `exp_1e6` @128); sorted keys and a branchless eight-step lower bound; the laws SPOT / LINEAR / INVERSE / OPTION with the short IM of D8; the one-price rule; O-BX21's measure; O-BX24's sell price; exits judged net of the slot's working orders on their side (risk review) and counted by `max_open_orders` (O-BX25); refusals `Short` and `Unpriced`; an exact per-slot aggregate (rows clamped at `INST_EXPOSURE_MAX`); the price feed (Mark, `OptSummary`); booking, settlement included. `RestingOrder` carries the order's side (24 B, pinned).
+  - `engine`: fill lane 4 is Binance's (`NUM_FILL_LANES` 5); option summaries reach the dispatcher before the strategy.
+  - `core-config`: `halt_on_margin_ratio_1e6` (SLOT_KEYS 18): only on a slot naming binance, at most 799 999 (O-BX26), required on a live one; `request_budget_floor` required only where a live slot names hyperliquid.
+  - `cli`:
+    - `exec_boot::route_aliases` and its wiring through `wire_exec_halts` at all four boot shapes;
+    - `ExecBoot::hl_address_numbers` (the live slots the HL arm trades; highest floor O-BX27, lowest top-ups);
+    - the boot tell prints the HL budget only on a slot naming hyperliquid and the margin halt only on one naming binance (the HL line byte-identical, pinned); a live Binance slot's refusal names BX6;
+    - fill lane 4's ring; `/metrics` `engine_exec_refused_unpriced_total` and `engine_exec_retired_total`; `/state` `exec.refused_short`, `exec.refused_unpriced` and `exec.retired{…}` by word.
+  - `engine-snapshot`: twelve halt words; `RETIRED_WHY_WORDS`; the new `ExecSnapshot` fields and JSON keys (additive).
+  - `exec-hyperliquid`: the test-only `loopback` feature (O-BX20); `HlConfig::port()`, which every dial of the host now uses except HYPARB's boot-time `/info` read (`info_once`, which dials 443 itself — inert, since the port is 443 in every build that is not a test).
+  - `cli/tests/exec_composition_loopback.rs` (O-BX19): the real `HlExchange` inside `RoutedDispatcher<Paper, SlotSplit<VenueSplit<HlExchange, ScriptedBn>, SpyArm>>` against a scripted TLS venue — submit, modify (the router's row renamed), cancel, the anchor through the router's alias, slot 0, and a Binance retirement, all through the trait.
+  - `exec.toml.example`: the commented Binance margin block, the floor's scope, the exits and worst-case text.
+- **Departures from the text above (§13.3 included):**
+  1. **No `LiveSet` / `MaybeArm`:** O-BX17's `SlotSplit<VenueSplit<…>>` instead, with `NullLiveDispatcher` as the absent arm. The gate is `venuesplit_route_steady_state`, not `liveset_route_steady_state`.
+  2. **No `halt_signal_venue` hook:** coverage is fixed at construction from each slot's venue mask (O-BX8 by construction).
+  3. **`LIVE_ARM_VENUES` does not gain Binance:** there is no arm. A live Binance slot refuses the boot and names BX6.
+  4. **Only `halt_on_margin_ratio_1e6` is parsed.** `[exec.binance]`, `max_symbols` and `min_maker_ttl_ms` are refused as an unknown section and unknown keys until BX6/BX7 give them a reader; O-BX18's side table and its reader are BX6's.
+  5. **The Binance Mark producer is BX6's ruling point** (members would start seeing the events); BX3 builds and tests the consumer on synthetic events.
+  6. **Exits (risk review, O-BX25):** an order on an instrument row is an exit only if it and every working order of the slot on its side cannot cross zero; an exit skips the money clamps, and a PLACE still counts against `max_open_orders`. This amends BX3's first cut, in which an exit (judged from the filled position alone) skipped all four clamps.
+  7. **O-BX24:** a sell is priced at the higher of its limit and the row's reference.
+  8. **D8** corrects §3.5's long option row (`|pos| × mark`, no `unit`).
+  9. **One alias table:** the router owns it and hands it down (`set_route_aliases`); `VenueSplit::new` takes none.
+  10. **`request_budget_floor`** is required only on live Hyperliquid slots (§3.12, §13.3-6), and the HL arm reads it only from the slots it trades.
+  11. **`/metrics`:** `engine_exec_refused_short_total` and per-`why` retirement names register with the first boot that can move them (BX6); `/state` carries all of them now.
+- **Measurements:** none; BX3 touches no venue.
+- **Copies:** one new `// COPY:`, `bind_instrument`'s boot-time sorted insert. `ExecCounters` by value grows to 648 B (the router's COPY note updated; cold). `make copy-audit`: `hits=31 baselined=31 new=0 paid=0`.
+- **Gates** (Mac, final tree):
+  - clippy clean;
+  - nextest: 3 279 run, 3 279 passed, 7 skipped (BX2 closed at 3 227). One pre-existing flake in an intermediate full run: `ingress-okx` `okx_tls_loopback_idle_timeout_sends_literal_ping` hung past 300 s and was killed; it passed alone in 0.15 s and in both final full runs. BX3 does not touch `ingress-okx`;
+  - alloc: 81/81 at 0 B/op, 2 ignored (the gate 72 and 74 child helpers), with a fresh `Compiling bench` in the last run that changed a crate the bench builds (the final run changed only a `cli` test); BX3 adds gates 75–78 (`routed_retired_drain_steady_state`, `venuesplit_route_steady_state`, `ledger_instrument_rows_steady_state`, `ledger_price_feed_steady_state`), and gate 77 runs the working-quantity exit test inside its window;
+  - `make copy-audit`: new=0, after its self-test;
+  - `make license-check` OK; `make license-deps` OK, THIRD-PARTY-NOTICES.md regenerated unchanged (Cargo.lock gains only `cli`'s dev-dependency edge to `rcgen`; no new crate);
+  - no new parser, so no fuzz target; the ledger's randomized properties stand in (every reducing order recognised on every signed law, the aggregate equal to a full recompute, the branchless search equal to a linear scan).
+- **Break-and-watch** (each confirmed failing with its guard removed): the merged signal answered for every slot; an unbounded retire drain; a route alias applied to its neighbour; exits priced at the mark instead of one price; the opt summary delivered after the strategy; the required `cancel`/`modify` (E0046); the composition test with `ledger.on_modify` dropped and with `VenueSplit`'s modify misrouted; two concurrent full-size exits with the working quantity forced to zero (ledger and router); a sell priced at its limit (O-BX24); the exit tested before the open-order count (O-BX25); the router keeping its alias table to itself; the whole quantity counted as turnover; an option sell measured by its premium (O-BX21); each of `hl_address_numbers`' three slot filters dropped, and the pre-BX3 `min` for the floor.
+- **Reviewers** (subagents acting as the agents, read-only):
+  - **`risk-reviewer`, round 1: BLOCK.** Concurrent exits on a signed law could flip a position unmeasured. Four FIX items: sells priced at a low limit (→ O-BX24); Hyperliquid address keys read from non-HL slots (→ `hl_address_numbers`); two alias tables only asked to agree (→ one owner); the margin key missing from the example, the tell and the pinned test. Plus DOC items. The four rulings O-BX24…O-BX27 were asked and given.
+  - **Round 2: NEEDS-DOCS.** The BLOCK was resolved and no new hole found in the router; the arm-side residual windows became BX6 obligations 1–4.
+  - **Round 3 (the risk-policy entry): NEEDS-DOCS** — seven overstated sentences, two missing BX6 obligations (8 and 9), six precision items and the missing plan rows. All applied.
+  - **Round 4: NEEDS-DOCS on this record only** (four precision items, the break-and-watch list, this history, a wrong row reference, the status line). Applied; the risk-policy entry approved as written.
+  - **`alloc-auditor` (Opus 5.5), round 1: FAIL** — `InstProbe` without `#[repr(C)]` and an exact pin. Borderlines taken: the slot guard back in `family_exposure_1e6`, `inst_find`'s index masked, flat slots skipped on a reprice, the short IM computed only where a short is involved. **Round 2: PASS.**
+- **Carried to BX6** (risk-policy "BX3", obligations 1–9, plus):
+  - the boot-shape monomorphizations (one engine loop per `SlotSplit` / `VenueSplit` shape), decided before BX6;
+  - the retire drain's worst case (64 × 512 row compares) and its a-before-b order; the exit path's table pass (512 rows by reference) — both measured before BX6 makes them hot, with per-row working sums as the O(1) alternative;
+  - `engine_exec_refused_short_total` and the per-`why` retirement metrics.
+- **Size:** Rust about 2 200 source lines and 2 900 test lines.
+
 ### BX4: Signing and keys
 
 - **New crate `signer-ed25519`**, backed by `ring` (O-BX5).
@@ -1585,6 +1656,11 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - Fuzz on the final tree, 151 s each: `binance_exchange_info` 3.77 M runs and `binance_eapi` 4.14 M runs, no crash. The COIN-M live smoke is green (45 s).
   - CLAUDE.md gained the COIN-M line on the operator's word.
   - Git: one commit `BX2:`, explicit paths. The engine was never touched.
+- **2026-09-26, BX3 built** (branch `binance`): router, ledger, lanes — dark until BX6. The record is in §5 BX3.
+  - Rulings at the start (O-BX14 settled, O-BX17…O-BX23, D8) and four from the risk review (O-BX24…O-BX27).
+  - `risk-reviewer`: BLOCK, then NEEDS-DOCS with the BLOCK resolved, then the risk-policy entry "BX3" checked. `alloc-auditor`: FAIL, then PASS.
+  - Docs: `docs/risk-policy.md` ("BX3" and six dated amendments), `exec.toml.example`, this plan, CLAUDE.md's alloc-count line (O-BX23).
+  - Git: one commit `BX3:`, explicit paths. The engine was never touched.
 
 ---
 

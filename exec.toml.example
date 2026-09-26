@@ -182,6 +182,12 @@ venues = ["hyperliquid"]
 # same position. The worst case with every quote working is
 # cap_instance_usd + max_open_orders × max_order_usd, not
 # cap_instance_usd. The three numbers multiply — set them together.
+# The money clamps never refuse an exit, and an exit never widens that
+# bound: on a Binance instrument (BX3) an order counts as an exit only if
+# it and every working order on its side together cannot cross zero (the
+# residuals are named in docs/risk-policy.md, "BX3"). On Binance an exit
+# still needs a free open-order place (O-BX25) — at a full count, cancel
+# or requote first.
 #
 # These caps are PER SLOT, not global. `max_open_orders = 64` here is
 # eight slots at 64 = 512 live orders across the table (that is what
@@ -221,7 +227,9 @@ cap_instance_usd_1e6 = 1000000000
 # per USDC of lifetime volume, and an exhausted address falls to ONE
 # request every 10 seconds. Stop placing when the remaining budget
 # drops below this, so a bad fill rate cannot brick the address.
-# Consumed by the budget governor in E4.
+# Consumed by the budget governor in E4. REQUIRED (non-zero) on a live
+# slot whose `venues` names hyperliquid (BX3); the Hyperliquid arm reads
+# it, and the top-up keys below, only from the live slots it trades.
 request_budget_floor = 2000
 
 # OPTIONAL (S7-L1): buy request weight before the floor is reached.
@@ -295,6 +303,24 @@ halt_on_recon_stale_ms = 300000
 # USD x1e6. 15000000 = +$15 halts; 5000000 = -$5 halts.
 # halt_on_gain_usd_1e6 = 15000000
 # halt_on_loss_usd_1e6 = 5000000
+
+# ---- the MARGIN HALT (BX3, Binance slots only) -------------------------
+#
+# A slot whose `venues` names binance must state it when live, and no
+# other slot may state it at all (the parser refuses both mistakes).
+# The margin ratio (maintenance margin over margin balance or adjusted
+# equity, x1e6) at or above which the Binance arm latches `margin-risk`:
+# a sticky halt like the five above (a cancel still passes; nothing is
+# flattened for you). The venue calls margin at 80 % — and any margin
+# call halts the slot on its own — and liquidates at 95 %, so the parser
+# refuses 800000 and up: a threshold there could never fire first.
+# 600000 = 60 % (the plan's D6 example).
+#
+# DECLARED, NOT YET ENFORCED: Binance's live arm and the reader of this
+# number arrive with BX6 (docs/binance-exec-plan.md); until then a live
+# slot naming binance refuses the boot. To arm one then: name the venue
+# above (venues = ["binance"]) and uncomment:
+# halt_on_margin_ratio_1e6 = 600000
 
 
 # Slot 1 — vrp. Explicit is better than default: writing it down means

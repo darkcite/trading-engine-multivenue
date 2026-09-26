@@ -28,6 +28,7 @@
 
 use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, HaltSignal, LiveArmCounters, OrderDispatch,
+    Retired,
 };
 use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, SymbolId, Tick};
 
@@ -81,7 +82,7 @@ impl<A: OrderDispatch, B: OrderDispatch> SlotSplit<A, B> {
 /// The least settled of two confirmations: a sweep still draining
 /// waits; an arm that gave up is asked again; clear only when both are.
 #[inline]
-const fn least_settled(a: CancelAllState, b: CancelAllState) -> CancelAllState {
+pub(crate) const fn least_settled(a: CancelAllState, b: CancelAllState) -> CancelAllState {
     match (a, b) {
         (CancelAllState::Working, _) | (_, CancelAllState::Working) => CancelAllState::Working,
         (CancelAllState::Stranded, _) | (_, CancelAllState::Stranded) => CancelAllState::Stranded,
@@ -126,7 +127,7 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
     }
 
     #[inline]
-    fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+    fn try_next_retired(&mut self) -> Option<Retired> {
         match self.a.try_next_retired() {
             Some(r) => Some(r),
             None => self.b.try_next_retired(),
@@ -167,6 +168,18 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
     fn on_fill_booked(&mut self, fill: &Fill) {
         self.a.on_fill_booked(fill);
         self.b.on_fill_booked(fill);
+    }
+
+    #[inline]
+    fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
+        self.a.on_opt_summary(summary);
+        self.b.on_opt_summary(summary);
+    }
+
+    /// BX3: the router's alias table, to both arms.
+    fn set_route_aliases(&mut self, aliases: clob_dispatcher::RouteAliases) {
+        self.a.set_route_aliases(aliases);
+        self.b.set_route_aliases(aliases);
     }
 
     #[inline]
@@ -227,7 +240,7 @@ mod tests {
         seen: Vec<u64>,
         cancelled: Vec<u64>,
         fills: Vec<Fill>,
-        retired: Vec<(u64, u8)>,
+        retired: Vec<Retired>,
         day: Option<(u64, i64)>,
         shutdowns: u32,
         sig: HaltSignal,
@@ -252,7 +265,7 @@ mod tests {
         fn try_next_fill(&mut self) -> Option<Fill> {
             self.fills.pop()
         }
-        fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+        fn try_next_retired(&mut self) -> Option<Retired> {
             self.retired.pop()
         }
         fn on_shutdown(&mut self) {
@@ -343,10 +356,12 @@ mod tests {
     #[test]
     fn retirements_come_from_both_arms() {
         let mut s = split();
-        s.a_mut().retired.push((5, 3));
-        s.b_mut().retired.push((6, 0));
-        assert_eq!(s.try_next_retired(), Some((5, 3)));
-        assert_eq!(s.try_next_retired(), Some((6, 0)));
+        let expired = clob_dispatcher::RETIRED_EXPIRED;
+        let rejected = clob_dispatcher::RETIRED_REJECTED;
+        s.a_mut().retired.push(Retired::new(5, 3, expired));
+        s.b_mut().retired.push(Retired::new(6, 0, rejected));
+        assert_eq!(s.try_next_retired(), Some(Retired::new(5, 3, expired)));
+        assert_eq!(s.try_next_retired(), Some(Retired::new(6, 0, rejected)));
         assert_eq!(s.try_next_retired(), None);
     }
 
