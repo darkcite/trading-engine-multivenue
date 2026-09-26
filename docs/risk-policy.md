@@ -3228,7 +3228,34 @@ drain, not end to end. Not changed: its reconnect is internal (one
 its backoff; the 30 s healthy-session law (`7235201`) binds the seven
 outer spawn loops. Gates: nextest 3424 (6 skipped); alloc 86/86;
 clippy clean; copy-audit new=0; license OK; worker pytest unchanged.
-Live smoke, the engine untouched: at the go-live (the freshly built test binary waits on LuLu; 2026-09-26 11:36Z its boot `GET /markets` timed out while curl fetched the same 4.3 MB in 1.7 s).
+Live smoke, the engine untouched (2026-09-26 12:00Z, ruling O-HC13: the
+operator allowed the freshly built test binary in LuLu, which had held its
+11:36Z boot `GET /markets` — curl fetched the same 4.3 MB in 1.7 s): `GET
+/markets` 4.34 MB in 1.8 s, 32 instruments; 90 s — 2 342 messages, 1 494
+ticks, 0 parse errors, 0 reconnects, 0 ring drops, 0 opt-ring drops, one
+subscribe, no venue close, 880 provider sides, the poller 6 ok / 0 err /
+48 rows, clock-sync RTT 98 ms.
+
+**The internal reconnects join the healthy-session law (2026-09-26,
+ruling O-HC16).** The law — reset the backoff only after a session that
+moved market data AND lived `HEALTHY_SESSION_MIN_NS` (30 s), or one that
+ended in a venue-quiet trip — lived in `cli/src/paper.rs` for the seven
+outer spawn loops; Hypercall's `HcConn` and MEXC's `run_multi` slots
+reconnect internally and reset on any confirmed subscription, so a
+session that confirmed and then died young — the 2026-09-26 HL shape —
+reset them every time. The law moved to core-net unchanged
+(`core_net::{HEALTHY_SESSION_MIN_NS, should_reset_backoff}`, its test with
+it; the seven loops call it from there) and both crates reset through it:
+Hypercall with the venue's `ticks_total` recorded at session start (one
+connection, so the venue's count is the session's); MEXC per slot, with
+`Driver::session_ticks` — the ticks THIS connection published, cleared by
+`reset_for_reconnect` — because the venue's status is shared by every slot
+on the thread. The keepalive's `Reconnect` (inbound silence) is the quiet
+trip; every other end (a transport error, the venue's close, the
+establishment budget, a failed ping) is not. Proof, per crate: a session
+that moved data and died young escalates; one that lived 30 s moving data
+resets; the quiet trip resets; pairs confirmed without data escalate;
+MEXC: another slot's data does not reset this one.
 
 ### Batch subscribes render straight into tx (2026-09-26)
 
@@ -3387,7 +3414,9 @@ again at each expiry (`next_expiry_ns`, one compare per iteration;
 masked, since a roll can ack rows the sweep did not expect. The backoff
 resets only after a session that moved market data AND lived 30 s
 (`HEALTHY_SESSION_MIN_NS`), or a venue-quiet trip, in the seven venue
-loops that share `should_reset_backoff`: a silent-drop loop of any cause
+loops that share `should_reset_backoff` (in core-net since O-HC16, which
+extended it to the Hypercall and MEXC internal reconnects — "Hypercall
+joins" above): a silent-drop loop of any cause
 now climbs to the 8 s cap (≤ 7.5 connects a minute). And every end names
 itself on the T1(a) status triple: the run loop's error exits record site
 and io-kind (`session_err`), a peer Close `peer-close` with its code

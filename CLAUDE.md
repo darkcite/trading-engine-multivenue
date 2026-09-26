@@ -244,8 +244,9 @@ in the script; `ai` = 48 is the floor every name includes).
   `/info outcomeMeta` for their successors (to the address resolved at
   boot — the HL thread never runs DNS; 3 s; at most once a minute);
   staleness stops judging an instance at its expiry; the backoff resets
-  only after a session that lived 30 s (the seven loops sharing
-  `should_reset_backoff`); `hyperliquid: run-loop returned` names each end
+  only after a session that lived 30 s (`core_net::should_reset_backoff`:
+  the seven outer loops, and since O-HC16 the Hypercall and MEXC internal
+  reconnects — MEXC per slot); `hyperliquid: run-loop returned` names each end
   (`err_site`, `io_kind`, `venue_code`, `lived_ms`, `acks`/`acks_expected`).
   Its ~1.5/s "parse errors" were BIN15 O8's one-sided outcome `bbo` drops,
   counted on their own from the next release build + restart
@@ -330,8 +331,8 @@ in the script; `ai` = 48 is the floor every name includes).
   `http1_response` 60 s each clean (also at HC3)
   · live smokes 60 s (the header-first subscribe renders, 2026-09-26):
   MEXC and Binance, 0 parse errors, 0 reconnects, 0 ring drops;
-  Hypercall 90 s (HC5, before the merge), 0 parse errors, 0 reconnects,
-  0 ring drops
+  Hypercall 90 s (the merged content, 2026-09-26 12:00Z), 1 494 ticks,
+  0 parse errors, 0 reconnects, 0 ring drops
   (LuLu on this Mac blocks a freshly built binary's outbound connections
   until the operator allows it — a smoke's boot-REST `Timeout` is LuLu,
   not the code). Known

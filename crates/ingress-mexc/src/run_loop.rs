@@ -235,6 +235,11 @@ pub struct Driver {
     establish_budget_ns: u64,
     /// WS2 drop-log rate limiter (process-lifetime, operator budget).
     drop_log_last_ns: u64,
+    /// O-HC16: ticks THIS connection published since its session began
+    /// (cleared by [`Self::reset_for_reconnect`]) — the per-slot half of
+    /// the healthy-session law, since the venue's `IngressStatus` is
+    /// shared by every slot on the thread.
+    session_ticks: u64,
     /// Drops swallowed by the rate limit since the last line.
     drop_log_suppressed: u32,
     /// VT2: THIS connection's venue-clock offset estimator + staleness
@@ -278,6 +283,7 @@ impl Driver {
             ever_confirmed: false,
             establish_budget_ns: core_net::ESTABLISH_BUDGET_NS,
             drop_log_last_ns: 0,
+            session_ticks: 0,
             drop_log_suppressed: 0,
             feed_clock: FeedClock::new(VenueId::Mexc.default_stale_after_ms()),
             _not_sync: ::core::marker::PhantomData,
@@ -381,8 +387,16 @@ impl Driver {
             i += 1;
         }
         self.subscribed = false;
+        self.session_ticks = 0;
         // VT2: a new connection is a new offset; the threshold stays.
         self.feed_clock.reset();
+    }
+
+    /// Ticks this connection published since its session began (O-HC16).
+    #[inline]
+    #[must_use]
+    pub const fn session_ticks(&self) -> u64 {
+        self.session_ticks
     }
 }
 
@@ -1281,6 +1295,7 @@ fn handle_data_frame<C: Capture>(
                 && scan.ask_qty_1e6 > 0
             {
                 status.add_ticks(1);
+                drv.session_ticks = drv.session_ticks.wrapping_add(1);
                 let tick = Tick::new_stamped(
                     now,
                     VenueId::Mexc,
@@ -1314,6 +1329,7 @@ fn handle_data_frame<C: Capture>(
         Dispatch::Trades { row, channel, scan } => {
             status.add_msgs(scan.parsed as u64);
             status.add_ticks(scan.parsed as u64);
+            drv.session_ticks = drv.session_ticks.wrapping_add(scan.parsed as u64);
             let mut r = 0;
             while r < scan.rejected {
                 status.inc_parse_errors();
@@ -1334,6 +1350,7 @@ fn handle_data_frame<C: Capture>(
             let frame = &ticker;
             status.add_msgs(1);
             status.add_ticks(1);
+            drv.session_ticks = drv.session_ticks.wrapping_add(1);
             note_confirmed(drv, row, MexcChannel::FutTicker);
             let ts_ms = frame.venue_time_ms;
             // §6.5 capture, presence-gated per field group.
@@ -1518,13 +1535,22 @@ impl<'a, T: Transport> MexcConn<'a, T> {
         }
     }
 
-    /// Tear down + schedule the next dial. A session that CONFIRMED
-    /// subscriptions resets the backoff (the caller passes
-    /// `ticks_moved`).
-    fn kill(&mut self, now: NsTs, status: &IngressStatus, ticks_moved: bool) {
+    /// Tear down + schedule the next dial. The backoff resets only by
+    /// the healthy-session law (O-HC16, `core_net::should_reset_backoff`),
+    /// per slot: THIS connection moved market data
+    /// ([`Driver::session_ticks`]) and lived 30 s, or it ended in the
+    /// keepalive's silence trip (`quiet_trip`, rate-limited by the silence
+    /// itself). A session that confirmed its pairs and died young keeps
+    /// escalating (the old `sub_count() > 0` reset did not).
+    fn kill(&mut self, now: NsTs, status: &IngressStatus, quiet_trip: bool) {
         if self.transport.take().is_some() {
             status.inc_reconnects();
-            if ticks_moved {
+            if core_net::should_reset_backoff(
+                self.drv.session_ticks,
+                0,
+                now.saturating_sub(self.session_start_ns),
+                quiet_trip,
+            ) {
                 self.backoff.reset();
             }
         }
@@ -1631,11 +1657,7 @@ pub fn run_multi<T: Transport, C: Capture>(
             ) {
                 Drained::Idle => {}
                 Drained::Capped => repoll_now = true,
-                Drained::Closed => {
-                    let moved = c.drv.sub_count() > 0;
-                    c.kill(now_ns(), status, moved);
-                }
-                Drained::Failed(_) => c.kill(now_ns(), status, false),
+                Drained::Closed | Drained::Failed(_) => c.kill(now_ns(), status, false),
             }
         }
 
@@ -1694,10 +1716,8 @@ pub fn run_multi<T: Transport, C: Capture>(
                         c.kill(now, status, false);
                     }
                 }
-                core_net::KeepaliveAction::Reconnect => {
-                    let moved = c.drv.sub_count() > 0;
-                    c.kill(now, status, moved);
-                }
+                // The venue went quiet: the law's quiet trip.
+                core_net::KeepaliveAction::Reconnect => c.kill(now, status, true),
                 core_net::KeepaliveAction::None => {}
             }
         }
@@ -2795,6 +2815,76 @@ mod tests {
         t.inject_incoming(&big);
         let e = drive(&mut t, &mut s, &mut prod, &status, &mut NullCapture).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    // ---- the healthy-session law, per slot (O-HC16) -------------------------
+
+    /// A slot's published ticks are ITS session's: counted per driver,
+    /// cleared when the next session begins.
+    #[test]
+    fn a_driver_counts_the_ticks_of_its_own_session() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady(MexcClass::Spot);
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let frame = enc::wrapper(enc::CHANNEL_BOOK, b"BTCUSDT", 315, &enc::book_body());
+        t.inject_incoming(&binary(&frame));
+        drive(&mut t, &mut d, &mut prod, &status, &mut NullCapture).unwrap();
+        assert_eq!((d.session_ticks(), status.ticks_total()), (1, 1));
+        d.reset_for_reconnect(7);
+        assert_eq!(d.session_ticks(), 0, "a new session starts from nothing");
+        assert_eq!(status.ticks_total(), 1, "the venue's count is not the slot's");
+    }
+
+    /// The internal reconnect resets a slot's backoff only by the law:
+    /// THIS slot moved data and lived 30 s, or the keepalive's silence
+    /// trip ended it. Data moved by the other slots on the thread (the
+    /// venue-wide status) and pairs confirmed without data do not reset
+    /// it; a young session keeps escalating however much it moved.
+    #[test]
+    fn a_slot_resets_its_backoff_only_after_a_healthy_session_or_a_quiet_trip() {
+        const S: NsTs = 1_000_000_000;
+        let status = IngressStatus::new();
+        let mut conn = MexcConn::<TestTransport>::new(
+            Driver::new(1, MexcClass::Futures, fut_symbols()),
+            crate::FUT_WS_HOST,
+            b"/edge",
+            core_net::Keepalive::new(core_net::KeepaliveCfg {
+                ping_interval_ns: u64::MAX / 4,
+                idle_timeout_ns: u64::MAX / 2,
+            }),
+            core_net::Backoff::default_for_ingress(3),
+        );
+        // One session: began at `t0`, THIS slot published `ticks`, the
+        // other slots `others`, and it ends at `t0 + lived`.
+        let session = |conn: &mut MexcConn<'_, TestTransport>, t0: NsTs, ticks: u64, others: u64, lived: NsTs, quiet: bool| {
+            conn.transport = Some(TestTransport::with_capacity(64));
+            conn.drv.reset_for_reconnect(t0);
+            conn.session_start_ns = t0;
+            conn.drv.session_ticks = ticks;
+            status.add_ticks(ticks + others);
+            conn.kill(t0 + lived, &status, quiet);
+            conn.backoff.attempt()
+        };
+        assert_eq!(session(&mut conn, 10 * S, 0, 0, S, false), 1, "the first failure");
+        assert_eq!(session(&mut conn, 20 * S, 900, 0, S, false), 2, "data, died young: escalates");
+        assert_eq!(session(&mut conn, 30 * S, 0, 5_000, 60 * S, false), 3, "the others' data is not ours");
+        assert_eq!(session(&mut conn, 100 * S, 1, 0, 30 * S, false), 1, "healthy: reset, then this failure");
+        assert_eq!(session(&mut conn, 200 * S, 0, 0, 2 * S, false), 2);
+        assert_eq!(session(&mut conn, 300 * S, 0, 0, 90 * S, true), 1, "the quiet trip resets");
+        // Every pair confirmed, no tick this session: the old reset, gone.
+        conn.transport = Some(TestTransport::with_capacity(64));
+        conn.drv.reset_for_reconnect(400 * S);
+        conn.session_start_ns = 400 * S;
+        let n = conn.drv.symbols.len();
+        let mut i = 0;
+        while i < n {
+            conn.drv.rows[i].confirmed = u8::MAX;
+            i += 1;
+        }
+        assert!(conn.drv.sub_count() > 0);
+        conn.kill(460 * S, &status, false);
+        assert_eq!(conn.backoff.attempt(), 2, "confirmed, no data: escalates");
     }
 
     // ---- run_multi -------------------------------------------------------

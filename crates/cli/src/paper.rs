@@ -43,7 +43,7 @@ pub use clob_dispatcher::{LiveDispatcher, LiveDispatcherErr};
 use core_io::{PmlrCapture, TapCfg, TapMode};
 use core_io::{SlotCapture, SlotKind};
 use core_metrics::{GaugeId, IngressState, IngressStatus, MetricsRegistry};
-use core_net::{Backoff, Keepalive, KeepaliveCfg, TlsTransport};
+use core_net::{should_reset_backoff, Backoff, Keepalive, KeepaliveCfg, TlsTransport};
 use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
@@ -8722,42 +8722,11 @@ fn new_poll() -> io::Result<(mio::Poll, mio::Events, mio::Token)> {
 
 /// Sleep for the next capped-exponential delay (D8). The schedule
 /// lives in the caller's per-thread [`Backoff`]; a healthy session
-/// resets it (see the spawn loops).
+/// resets it (`core_net::should_reset_backoff`, see the spawn loops).
 fn sleep_backoff(b: &mut Backoff) {
     let delay = Duration::from_nanos(b.next_delay_ns());
     tracing::debug!(?delay, attempt = b.attempt(), "reconnect backoff");
     thread::sleep(delay);
-}
-
-/// A session must live this long, moving market data, before its end
-/// resets the reconnect backoff ([`should_reset_backoff`]).
-const HEALTHY_SESSION_MIN_NS: u64 = 30_000_000_000;
-
-/// T1(b) — the D8 intent, restored (outage 2026-08-27 §5.3): the
-/// reconnect schedule resets only when the session actually MOVED
-/// MARKET DATA (`ticks_total` advanced) for at least
-/// [`HEALTHY_SESSION_MIN_NS`], or ended in a venue-quiet
-/// idle/staleness trip (inherently rate-limited by the keepalive /
-/// staleness budget, so it cannot hammer). A session that only
-/// received its own subscribe rejection — the exact post-settlement
-/// failure that reconnected at ~1 Hz for 16 h/day — keeps
-/// escalating.
-///
-/// The lifetime clause (2026-09-26): a Hyperliquid session that
-/// re-subscribed a settled HIP-4 coin got its snapshots and was then
-/// dropped by the venue within a second — ticks moved, so the backoff
-/// reset every time and the lane reconnected every ~1.2 s for hours
-/// (~48 connects/min against the venue's 30/min per IP). Whatever the
-/// cause, a session that dies young now escalates to the 8 s cap.
-/// One definition for every single-connection venue loop.
-#[inline]
-fn should_reset_backoff(
-    ticks_after: u64,
-    ticks_before: u64,
-    session_ns: u64,
-    venue_quiet_trip: bool,
-) -> bool {
-    (ticks_after > ticks_before && session_ns >= HEALTHY_SESSION_MIN_NS) || venue_quiet_trip
 }
 
 /// T1(c) (outage 2026-08-27 finding F12): age in seconds of the
@@ -10702,32 +10671,6 @@ mod tests {
             bn_options_path(&["BTCUSDT".to_string()]),
             "/market/stream?streams=btcusdt@optionMarkPrice"
         );
-    }
-
-    /// T1(b) (outage 2026-08-27 §5.3): the predicate that replaces
-    /// the msgs-based reset. Happy path: data moved for a healthy
-    /// lifetime ⇒ reset. Failure modes: a rejection-only session (msgs
-    /// moved, ticks did not) must keep escalating, and so must a session
-    /// that moved data but died young (2026-09-26: HL snapshots, then
-    /// the venue's drop, every ~1.2 s); a venue-quiet idle/staleness
-    /// trip is rate-limited by construction and may reset.
-    #[test]
-    fn backoff_resets_only_on_a_healthy_session_or_quiet_trip() {
-        let healthy = HEALTHY_SESSION_MIN_NS;
-        // Data moved for a healthy lifetime ⇒ reset.
-        assert!(should_reset_backoff(10, 3, healthy, false));
-        assert!(should_reset_backoff(10, 3, u64::MAX, false));
-        // Rejection-only session: ticks unchanged ⇒ keep escalating.
-        assert!(!should_reset_backoff(3, 3, healthy, false));
-        // The exact outage shape: rejection received every cycle,
-        // never a tick — first cycle from zero included.
-        assert!(!should_reset_backoff(0, 0, healthy, false));
-        // The 2026-09-26 shape: snapshots moved, then the venue dropped
-        // the socket ~1 s in ⇒ keep escalating, however many ticks.
-        assert!(!should_reset_backoff(1_000, 3, 1_000_000_000, false));
-        assert!(!should_reset_backoff(10, 3, healthy - 1, false));
-        // Venue-quiet idle/staleness trip ⇒ reset (budget-limited).
-        assert!(should_reset_backoff(3, 3, 0, true));
     }
 
     /// T1(c): stamp-age helper degrades to -1, never panics, when

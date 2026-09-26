@@ -53,7 +53,9 @@ pub mod transport;
 pub mod ws_frame;
 pub mod ws_handshake;
 
-pub use backoff::{Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS};
+pub use backoff::{
+    should_reset_backoff, Backoff, BACKOFF_BASE_NS, BACKOFF_CAP_NS, HEALTHY_SESSION_MIN_NS,
+};
 pub use drain::{fill_rx, poll_timeout, Drained, RxFill, DRAIN_STEP_CAP, POLL_IDLE};
 pub use error::{NetworkErr, NetworkErrKind, NetworkSource};
 pub use iobuf::IoBuf;

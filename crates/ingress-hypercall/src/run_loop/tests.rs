@@ -396,13 +396,52 @@ fn a_kill_after_a_slow_consumer_close_requests_a_snapshot() {
     conn.transport = Some(TestTransport::with_capacity(64));
     let status = IngressStatus::new();
     let counters = HcCounters::new();
-    conn.kill(1, &status, &counters);
+    conn.kill(1, &status, &counters, false);
     assert_eq!(counters.snapshot_req.load(Ordering::Acquire), 1);
     // A plain close (no slow-consumer reason) does not.
     conn.drv.last_close = Some(HcCloseCause::Other);
     conn.transport = Some(TestTransport::with_capacity(64));
-    conn.kill(2, &status, &counters);
+    conn.kill(2, &status, &counters, false);
     assert_eq!(counters.snapshot_req.load(Ordering::Acquire), 1);
+}
+
+/// O-HC16: the internal reconnect resets its backoff only by the
+/// healthy-session law. A session that moved data but died young keeps
+/// escalating; one that lived 30 s moving data resets; the keepalive's
+/// 60 s-silence trip resets (rate-limited by the silence itself); a
+/// session that confirmed its subscribe but moved no data — the old reset
+/// rule's `sub_count() > 0` — keeps escalating.
+#[test]
+fn the_backoff_resets_only_after_a_healthy_session_or_a_quiet_trip() {
+    const S: NsTs = 1_000_000_000;
+    let status = IngressStatus::new();
+    let counters = HcCounters::new();
+    let mut conn = HcConn::<TestTransport>::new(steady(), b"h", core_net::Backoff::default_for_ingress(3));
+    // One session: began at `t0` with the venue's count as it stood, then
+    // `ticks` moved, and it ends at `t0 + lived` — the attempt after it.
+    let session = |conn: &mut HcConn<'_, TestTransport>, t0: NsTs, ticks: u64, lived: NsTs, quiet: bool| {
+        conn.transport = Some(TestTransport::with_capacity(64));
+        conn.session_start_ns = t0;
+        conn.ticks_at_start = status.ticks_total();
+        status.add_ticks(ticks);
+        conn.kill(t0 + lived, &status, &counters, quiet);
+        conn.backoff.attempt()
+    };
+    assert_eq!(session(&mut conn, 10 * S, 0, S, false), 1, "the first failure");
+    assert_eq!(session(&mut conn, 20 * S, 500, S, false), 2, "data, died young: escalates");
+    assert_eq!(session(&mut conn, 30 * S, 1, 30 * S, false), 1, "healthy: reset, then this failure");
+    assert_eq!(session(&mut conn, 90 * S, 0, 5 * S, false), 2);
+    assert_eq!(session(&mut conn, 100 * S, 0, 61 * S, true), 1, "the quiet trip resets");
+    // Confirmed (an ack and a quote this session) but no tick counted:
+    // the old `sub_count() > 0` reset — gone.
+    conn.drv.acks = 1;
+    conn.drv.quoted_this_session = true;
+    assert!(conn.drv.sub_count() > 0);
+    assert_eq!(session(&mut conn, 200 * S, 0, 60 * S, false), 2, "confirmed, no data: escalates");
+    // A slot already down schedules without counting a reconnect.
+    let before = status.reconnects_total();
+    conn.kill(300 * S, &status, &counters, true);
+    assert_eq!((status.reconnects_total(), conn.backoff.attempt()), (before, 3));
 }
 
 #[test]

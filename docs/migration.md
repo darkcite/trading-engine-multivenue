@@ -6,6 +6,40 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — the healthy-session backoff in core-net; Hypercall and MEXC reconnect by it (O-HC16)
+
+**What changed**
+
+- `core_net::{HEALTHY_SESSION_MIN_NS, should_reset_backoff}` — moved from
+  `cli/src/paper.rs` unchanged; the seven outer spawn loops call it from
+  core-net.
+- `ingress-hypercall`: the internal reconnect (`HcConn`) resets its
+  backoff only after a session that moved market data (the venue's
+  `ticks_total` against its value at session start) AND lived ≥ 30 s, or
+  that ended in the keepalive's 60 s-silence trip. Before: any confirmed
+  subscription reset it.
+- `ingress-mexc`: the same law per `run_multi` slot, over the new
+  `Driver::session_ticks` (the ticks that connection published this
+  session); the keepalive's silence trip is the quiet trip. Before: a
+  confirmed pair reset it on a venue close or a keepalive trip.
+
+**Impact**
+
+- A Hypercall or MEXC venue that drops sessions young now sees those
+  reconnects climb 0.5 → 8 s (≤ 7.5 connects a minute per connection),
+  as the seven outer loops have since `7235201`. A healthy session's end
+  still redials after ~0.5 s. `engine_ingress_{hypercall,mexc}_reconnects_total`
+  count as before.
+
+**Migration steps**
+
+1. None. Live at the first release build + restart after the branch
+   merges (MEXC is live; Hypercall is not yet configured).
+
+**Rollback**
+
+- Revert the commit.
+
 ## 2026-09-26 — the long-tenor state files are written off the engine thread (HAR H3.7)
 
 **What changed**
