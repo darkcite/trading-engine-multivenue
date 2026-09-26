@@ -77,8 +77,10 @@ fund_p70_1e9 = 0
 
 # ---- RG8 (operator ruling 2026-09-05): labels are enforced everywhere ----
 # `require = 1` makes the engine REFUSE to boot an ENABLED signal-carrying
-# coded member (hyparb, vrp, xsd, rule_tree, icdp) whose label is
-# still ANY — label it below or leave it out of the mask. ai_exec is
+# coded member (hyparb, vrp, xsd, rule_tree, xmm) whose label is
+# still ANY — label it below or leave it out of the mask. xmm (slot 6
+# since XMM XH1) takes no label yet, so under `require = 1` it cannot
+# boot enabled until its gate lands. ai_exec is
 # exempt (its intents carry the lane's own label) and the vm's rows are
 # held to the law upstream (every row of a staged table must carry
 # `regimes`; the worker's parser, library, composer and the earned-label
@@ -89,7 +91,7 @@ require = 1
 
 # ---- optional overrides of the coded members' regime labels (§4.2) ----
 # One `[labels.<member>]` table per coded member (hyparb, vrp, xsd,
-# rule_tree, ai_exec, icdp): `off = "soft" | "hard"` and up to
+# rule_tree, ai_exec): `off = "soft" | "hard"` and up to
 # four product terms `term1..term4`, each a list of label strings in the
 # §3.3 grammar `[fast:|slow:]dim:(*|!v|v1|v2…)` (∃-semantics across
 # terms; `rel:` is not allowed here — coded members are not per-symbol).
@@ -98,7 +100,7 @@ require = 1
 # [labels.hyparb]
 # off = "soft"
 # term1 = ["fast:vol:!high"]
-# [labels.icdp]
+# [labels.xsd]
 # off = "soft"
 # term1 = ["fast:shape:trend", "slow:trend:bull|neutral"]
 # term2 = ["fast:shape:trend", "slow:trend:bear"]

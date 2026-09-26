@@ -174,6 +174,7 @@ dependencies = [
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
 ]
 
@@ -369,6 +370,7 @@ dependencies = [
  "strategy-set",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
  "tracing",
  "tracing-subscriber",
@@ -1995,9 +1997,9 @@ dependencies = [
  "strategy-bin15",
  "strategy-core",
  "strategy-hyparb",
- "strategy-icdp",
  "strategy-vm",
  "strategy-vrp",
+ "strategy-xmm",
  "strategy-xsd",
 ]
 
@@ -2023,6 +2025,14 @@ dependencies = [
  "core-types",
  "core-vol",
  "opt-registry",
+ "strategy-core",
+]
+
+[[package]]
+name = "strategy-xmm"
+version = "0.1.0"
+dependencies = [
+ "core-types",
  "strategy-core",
 ]
 

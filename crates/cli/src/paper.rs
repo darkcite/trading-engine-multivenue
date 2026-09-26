@@ -48,9 +48,9 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    RuleTableSlot, Signal, SymbolId, Tick, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
+    RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
     EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
-    RULE_TABLE_RING_SLOTS,
+    RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
     Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
@@ -555,6 +555,11 @@ pub struct Rings {
     /// pool lane (`Engine::set_pool_lane`). Permanently empty when the
     /// ingress is not spawned.
     pub hyperevm_signal: Arc<Ring<Signal, { engine::POOL_RING_SIZE }>>,
+    /// XMM XH1: the trade-print ring — the Hyperliquid ingress's
+    /// `trades` rows, feeding the engine's trade lane
+    /// (`Engine::set_trade_lane`). Permanently empty when the ingress is
+    /// not spawned.
+    pub trade: Arc<Ring<TradePrint, TRADE_RING_SIZE>>,
     /// One fill ring per execution lane (`engine::fill_lane_of`).
     /// Live dispatchers gain producers in Phase 8j; until then the
     /// engine's dispatcher fill pump (D3) is the only fill source.
@@ -605,6 +610,7 @@ impl Rings {
             ],
             rpc_signal: Ring::new(),
             hyperevm_signal: Ring::new(),
+            trade: Ring::new(),
             fill: [Ring::new(), Ring::new(), Ring::new(), Ring::new()],
             ai: Ring::new(),
             ruleset_tables: Ring::new(),
@@ -2087,6 +2093,7 @@ pub fn spawn_hyperliquid(
     stale_after_ms: u32,
     mut producer: Producer<Tick, TICK_RING_SIZE>,
     mut event_tx: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    trade_tx: Producer<TradePrint, TRADE_RING_SIZE>,
     status: Arc<IngressStatus>,
     core_id: usize,
     run_dir: &Path,
@@ -2127,6 +2134,9 @@ pub fn spawn_hyperliquid(
             // path in the driver exactly as it was before BIN15.
             let has_families = !families.is_empty();
             driver.set_families(families, roll_status, wall_anchor);
+            // XMM XH1: every parsed `trades` row also reaches the
+            // engine's trade lane (the driver outlives reconnects).
+            driver.set_trade_lane(trade_tx);
             let mut keepalive = Keepalive::new(HL_KEEPALIVE);
             let mut backoff = Backoff::default_for_ingress(core_id as u64 + 1);
             while !shutdown_requested() {
@@ -2801,6 +2811,9 @@ pub struct Consumers {
     pub rpc_signal: Consumer<Signal, SIGNAL_RING_SIZE>,
     /// HYPARB H3b: HyperEVM pool-event consumer (the engine's pool lane).
     pub hyperevm_signal: Consumer<Signal, { engine::POOL_RING_SIZE }>,
+    /// XMM XH1: trade-print consumer (the engine's trade lane). Reads
+    /// empty forever when the Hyperliquid ingress is not spawned.
+    pub trades: Consumer<TradePrint, TRADE_RING_SIZE>,
     /// Fill-lane consumers (`engine::fill_lane_of` order). Producers
     /// arrive with the venue dispatchers in Phase 8j; paper-mode
     /// fills flow through the engine's dispatcher pump (D3).
@@ -3021,7 +3034,7 @@ fn configure_rule_tree<const N: usize>(
 
 /// Phase 8f item 7: run the composed [`strategy_set::StrategySet`].
 /// The initial mask enables exactly the members whose configuration
-/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / icdp
+/// was provided — vrp when `vrp.toml` resolves, xsd / bin15 / xmm
 /// when their artifacts resolve, slot 0 when `hyparb.toml` resolves
 /// (HYPARB H5 — the member is configured only by its own boot
 /// artifact; unconfigured it refuses `on_start`, so it never boots
@@ -3046,7 +3059,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     vrp: Option<&crate::vrp_boot::VrpBoot>,
     xsd: Option<&crate::xsd_boot::XsdBoot>,
     bin15: Option<&crate::bin15_boot::Bin15Boot>,
-    icdp: Option<&strategy_icdp::IcdpParams>,
+    xmm: Option<&crate::xmm_boot::XmmBoot>,
     regime: Option<&RegimeBoot>,
     hyparb: Option<&crate::hyparb_boot::HyparbBoot>,
 ) -> EngineLoopResult {
@@ -3063,8 +3076,8 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     if bin15.is_some() {
         configured |= strategy_set::BIT_BIN15;
     }
-    if icdp.is_some() {
-        configured |= strategy_set::BIT_ICDP;
+    if xmm.is_some() {
+        configured |= strategy_set::BIT_XMM;
     }
     let mask = requested_mask & configured;
     if mask == 0 {
@@ -3292,25 +3305,14 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         }
         tracing::info!("{}", crate::hyparb_boot::render_boot_tell(boot));
     }
-    if let Some(params) = icdp {
-        // ICDP I2/I4: the wall anchor is taken HERE, once, right
-        // before the engine loop starts — the bar grid is UTC-aligned
-        // from this instant on; replay rebuilds the same anchor from
-        // the harness rebase (core_time::WallAnchor docs).
-        let anchor = core_time::WallAnchor::now();
-        if let Err(e) = set.icdp_mut().configure(anchor, params) {
-            tracing::error!(error = %e, "icdp: artifact refused");
-            return EngineLoopResult::Failed("icdp: artifact refused by the strategy");
+    if let Some(boot) = xmm {
+        // XMM XH1: the member validates and stores its artifact. It is
+        // DARK until XH3 — no order, no timer — so the boot tell says so.
+        if let Err(e) = set.xmm_mut().configure(&boot.params) {
+            tracing::error!(error = %e, "xmm: artifact refused");
+            return EngineLoopResult::Failed("xmm: artifact refused by the strategy");
         }
-        let h = set.icdp().params_hash();
-        tracing::info!(
-            hash = %format_hex32(h),
-            instruments = set.icdp().instruments(),
-            tf_ns = params.tf_ns,
-            delta_ns = params.delta_ns,
-            anchor_wall_ns = anchor.wall_ns,
-            "icdp: artifact configured"
-        );
+        tracing::info!("{}", crate::xmm_boot::render_boot_tell(boot));
     }
     if let Some(boot) = xsd {
         // XSD-3: the wall anchor is taken HERE, once — the member's hour
@@ -3447,7 +3449,7 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         bin15 = mask & strategy_set::BIT_BIN15 != 0,
         ai_exec = mask & strategy_set::BIT_AI_EXEC != 0,
         vm = mask & strategy_set::BIT_VM != 0,
-        icdp = mask & strategy_set::BIT_ICDP != 0,
+        xmm = mask & strategy_set::BIT_XMM != 0,
         "strategy-set: composed"
     );
     run_engine_loop(cons, disp, set, obs)
@@ -3486,7 +3488,7 @@ pub struct RegimeBoot {
 }
 
 /// RG8: the coded members the `[labels] require` law covers — the ones
-/// that carry their OWN signal (slots 0–3 + icdp). `ai-exec` (slot 4) is
+/// that carry their OWN signal (slots 0–3 + xmm, slot 6). `ai-exec` (slot 4) is
 /// exempt: it carries the worker's intent lanes, which gate themselves
 /// through `regime_allows()` (their `REGIME_LABEL`); the vm (slot 5) is
 /// held to the law upstream — every row of a staged table must be
@@ -3496,7 +3498,7 @@ const REQUIRE_LABEL_SLOTS: [u8; 5] = [
     strategy_set::SLOT_VRP,
     strategy_set::SLOT_XSD,
     strategy_set::SLOT_BIN15,
-    strategy_set::SLOT_ICDP,
+    strategy_set::SLOT_XMM,
 ];
 
 /// RG8: the first enabled, label-required slot whose label set is ANY —
@@ -3924,6 +3926,7 @@ fn register_ingress_counters(
         sub_drops: one("sub_drops")?,
         event_ring_drops: one("event_ring_drops")?,
         depth_ring_drops: one("depth_ring_drops")?,
+        trade_ring_drops: one("trade_ring_drops")?,
         stale_ticks: one("stale_ticks")?,
         seq_regressions: one("seq_regressions")?,
         feed_delay_ema_ms: reg
@@ -4406,6 +4409,10 @@ pub struct IngressCounterIds {
     /// WS10-B: depth-lane pushes refused by a full ring
     /// (`engine_ingress_<venue>_depth_ring_drops_total`).
     pub depth_ring_drops: core_metrics::CounterId,
+    /// XMM XH1: trade-lane pushes refused by a full ring
+    /// (`engine_ingress_<venue>_trade_ring_drops_total`; the print is
+    /// still captured).
+    pub trade_ring_drops: core_metrics::CounterId,
     /// VT2: ticks the ingress judged stale
     /// (`engine_ingress_<venue>_stale_ticks_total`).
     pub stale_ticks: core_metrics::CounterId,
@@ -7112,6 +7119,7 @@ struct IngressCountersSnapshot {
     sub_drops: u64,
     event_ring_drops: u64,
     depth_ring_drops: u64,
+    trade_ring_drops: u64,
     stale_ticks: u64,
     seq_regressions: u64,
 }
@@ -7137,6 +7145,7 @@ fn mirror_ingress_counters(
         sub_drops: st.sub_drops_total(),
         event_ring_drops: st.event_ring_drops_total(),
         depth_ring_drops: st.depth_ring_drops_total(),
+        trade_ring_drops: st.trade_ring_drops_total(),
         stale_ticks: st.stale_ticks_total(),
         seq_regressions: st.seq_regressions_total(),
     };
@@ -7162,6 +7171,8 @@ fn mirror_ingress_counters(
         .inc(cur.event_ring_drops.saturating_sub(last.event_ring_drops));
     reg.counter(ids.depth_ring_drops)
         .inc(cur.depth_ring_drops.saturating_sub(last.depth_ring_drops));
+    reg.counter(ids.trade_ring_drops)
+        .inc(cur.trade_ring_drops.saturating_sub(last.trade_ring_drops));
     reg.counter(ids.stale_ticks)
         .inc(cur.stale_ticks.saturating_sub(last.stale_ticks));
     reg.counter(ids.seq_regressions)
@@ -7188,6 +7199,7 @@ where
         opt_lanes,
         rpc_signal,
         hyperevm_signal,
+        trades,
         fill_lanes,
         ai_cmds,
         ai_status,
@@ -7210,6 +7222,9 @@ where
     // HYPARB H3b: the pool-event lane (empty forever when the HyperEVM
     // ingress is not spawned).
     eng.set_pool_lane(hyperevm_signal);
+    // XMM XH1: the trade lane (empty forever when the Hyperliquid
+    // ingress is not spawned).
+    eng.set_trade_lane(trades);
     // Phase 8f: the fills capture is opened by the bin (per-run
     // capture directory) and rides in via Observability; the engine
     // thread owns it from here.
@@ -9802,6 +9817,7 @@ mod tests {
             opt_lanes,
             rpc_signal: rings.rpc_signal.clone().split().1,
             hyperevm_signal: rings.hyperevm_signal.clone().split().1,
+            trades: rings.trade.clone().split().1,
             fill_lanes,
             ai_cmds: rings.ai.clone().split().1,
             ai_status: Arc::new(AiIngressStatus::new()),
@@ -11082,18 +11098,32 @@ mod tests {
         // The AI-only mask (ai-exec + vm) is exempt — nothing to label at boot.
         let ai = strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM;
         assert_eq!(unlabelled_required_slot(&set, ai, true), None);
-        // ai+icdp: icdp is a signal member ⇒ refused until labelled.
-        let ai_icdp = ai | strategy_set::BIT_ICDP;
-        assert_eq!(
-            unlabelled_required_slot(&set, ai_icdp, true),
-            Some(strategy_set::SLOT_ICDP)
-        );
         let mut b = RegimeLabelBuilder::new();
         b.add(b"fast:shape:trend").unwrap();
         let label = core_types::RegimeLabelSet::from_terms(&[b.finish()], core_types::REGIME_OFF_SOFT)
             .unwrap();
-        assert!(set.set_regime_label(strategy_set::SLOT_ICDP, label));
-        assert_eq!(unlabelled_required_slot(&set, ai_icdp, true), None);
+        // ai+bin15: bin15 is a signal member ⇒ refused until labelled.
+        let ai_bin15 = ai | strategy_set::BIT_BIN15;
+        assert_eq!(
+            unlabelled_required_slot(&set, ai_bin15, true),
+            Some(strategy_set::SLOT_BIN15)
+        );
+        assert!(set.set_regime_label(strategy_set::SLOT_BIN15, label));
+        assert_eq!(unlabelled_required_slot(&set, ai_bin15, true), None);
+        // XMM XH1: ai+xmm — xmm carries its own signal (the Binance lead)
+        // but takes NO label at XH1 (it does not gate on the regime yet),
+        // so with the law on a boot that enables it refuses: fail-closed
+        // until XH3 decides xmm's regime behaviour.
+        let ai_xmm = ai | strategy_set::BIT_XMM;
+        assert_eq!(
+            unlabelled_required_slot(&set, ai_xmm, true),
+            Some(strategy_set::SLOT_XMM)
+        );
+        assert!(!set.set_regime_label(strategy_set::SLOT_XMM, label));
+        assert_eq!(
+            unlabelled_required_slot(&set, ai_xmm, true),
+            Some(strategy_set::SLOT_XMM)
+        );
     }
 
     /// Boot-surface pin: `Observability::build(true)` registers

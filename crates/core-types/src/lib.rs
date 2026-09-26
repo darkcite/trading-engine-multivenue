@@ -854,8 +854,15 @@ pub struct Order {
     pub side: Side,
     /// Order-type tag (0=post-only limit; extend over time).
     pub kind: u8,
-    /// Reserved.
-    _pad0: [u8; 2],
+    /// **XMM XH1 — bit flags about the order itself**, see
+    /// [`ORDER_FLAG_REDUCE_ONLY`].
+    ///
+    /// Wire-additive: this byte was the first of two explicit zeroed
+    /// padding bytes, so every Order persisted before XH1 reads as "no
+    /// flags" — which is what every one of them was.
+    pub flags: u8,
+    /// Reserved. Always zero.
+    _pad0: u8,
     /// Limit price.
     pub px: Price,
     /// Quantity.
@@ -929,6 +936,18 @@ pub const ORDER_VERB_MODIFY: u8 = 2;
 /// `Order.strategy_id` value meaning "no strategy attribution".
 pub const STRATEGY_ID_NONE: u8 = 0xFF;
 
+/// [`Order::flags`] bit 0 (XMM XH1): the order may only REDUCE the
+/// slot's position on its instrument — the venue's reduce-only flag.
+///
+/// It exists so an exit can be told from an entry by the order itself:
+/// `docs/risk-policy.md` records twice (`mode = "off"`, and the budget
+/// floor's modify rule) that `Order` carried no reduce-only bit, so the
+/// router could not exempt an exit from a cap. The execution arm that
+/// honours it is XH4's; until then nothing sets it and nothing reads it
+/// on the order path, and a zero byte means exactly what every Order
+/// before XH1 meant.
+pub const ORDER_FLAG_REDUCE_ONLY: u8 = 1 << 0;
+
 impl Order {
     /// Construct an Order without naming the private padding fields.
     /// `strategy_id` starts [`STRATEGY_ID_NONE`]; the strategy-set's
@@ -949,7 +968,8 @@ impl Order {
             sym,
             side,
             kind,
-            _pad0: [0; 2],
+            flags: 0,
+            _pad0: 0,
             px,
             qty,
             client_oid,
@@ -968,6 +988,23 @@ impl Order {
     pub const fn with_ttl_ns(mut self, ttl_ns: u64) -> Self {
         self.ttl_ns = ttl_ns;
         self
+    }
+
+    /// The same order marked [`ORDER_FLAG_REDUCE_ONLY`] (XMM XH1).
+    /// Builder-style, like [`Self::with_ttl_ns`]; every other field is
+    /// untouched.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_reduce_only(mut self) -> Self {
+        self.flags |= ORDER_FLAG_REDUCE_ONLY;
+        self
+    }
+
+    /// Did the member mark this order reduce-only?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_reduce_only(&self) -> bool {
+        self.flags & ORDER_FLAG_REDUCE_ONLY != 0
     }
 }
 
@@ -1490,6 +1527,301 @@ impl ChannelEvent {
         }
     }
 }
+
+// ---------------------------------------------------------------
+// XMM XH1 — the trade lane and the order-event lane
+// ---------------------------------------------------------------
+
+/// Capacity of the trade-print SPSC lane (XMM XH1, plan §6). One ring,
+/// fed today by the Hyperliquid ingress; the MEXC maker plan reuses the
+/// lane. 16 384 × 64 B = 1 MiB — the tick lanes' geometry, because a
+/// sweep bursts prints harder than it moves quotes. Power of two, like
+/// every `core-ring` capacity.
+pub const TRADE_RING_SIZE: usize = 16_384;
+
+/// Capacity of the order-event SPSC lane (XMM XH1). Order events run at
+/// the ORDER rate — a place, a cancel, a reject — never per tick, so
+/// the fill lanes' 1 024 slots carry the same headroom.
+pub const ORDER_EVENT_RING_SIZE: usize = 1024;
+
+/// [`TradePrint::aggressor`]: the taker BOUGHT — the print lifted the
+/// ask (Hyperliquid side `"B"`). What it consumes is resting ASK size
+/// at its price.
+pub const TRADE_AGGRESSOR_BUY: u8 = 0;
+/// [`TradePrint::aggressor`]: the taker SOLD — the print hit the bid
+/// (Hyperliquid side `"A"`). What it consumes is resting BID size at
+/// its price.
+pub const TRADE_AGGRESSOR_SELL: u8 = 1;
+
+/// One public trade print (XMM XH1): the venue's tape, carried into the
+/// engine on its own lane so a maker can watch its queue being eaten.
+///
+/// The capture keeps recording prints as [`ChannelEvent`]s
+/// (`ChannelId::Trade`, `v1` signed by side) — this is the ENGINE-side
+/// carrier, never a capture slot, and it is lossless against that row:
+/// the offline harness rebuilds the same print from it
+/// ([`TradePrint::read_trade_event`]).
+///
+/// Content is 50 B; the slot is one cache line like every ring slot
+/// (`#[repr(C, align(64))]`, the house law), with the rest explicit
+/// zeroed padding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub struct TradePrint {
+    /// When the ingress thread finished parsing the print — engine
+    /// monotonic ns, the ordering key, exactly as on [`Tick`].
+    pub ts_ns: NsTs,
+    /// Venue timestamp of the trade in ms (venue clock); 0 = unknown.
+    /// DATA, not a clock — `ts_ns` orders.
+    pub venue_time_ms: u64,
+    /// Trade price ×1e6.
+    pub px_1e6: i64,
+    /// Trade size ×1e6 in the venue's base units (Hyperliquid: coins).
+    /// Always positive — the direction is [`Self::aggressor`].
+    pub qty_1e6: i64,
+    /// The venue's trade id (Hyperliquid `tid`); 0 = none. Consumers
+    /// dedupe on it: a venue may re-send recent prints on a resubscribe.
+    pub tid: u64,
+    /// Venue-namespaced symbol.
+    pub sym: SymbolId,
+    /// Producing venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// [`TRADE_AGGRESSOR_BUY`] or [`TRADE_AGGRESSOR_SELL`].
+    pub aggressor: u8,
+    /// Explicit padding (the slot is one cache line). Always zero.
+    _pad: [u8; 18],
+}
+
+impl TradePrint {
+    /// Construct a print without naming the private padding.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        tid: u64,
+        venue_time_ms: u64,
+        px_1e6: i64,
+        qty_1e6: i64,
+        aggressor: u8,
+    ) -> Self {
+        Self {
+            ts_ns,
+            venue_time_ms,
+            px_1e6,
+            qty_1e6,
+            tid,
+            sym,
+            venue: venue as u8,
+            aggressor,
+            _pad: [0; 18],
+        }
+    }
+
+    /// The zeroed print — size 0, so never a trade: the start value
+    /// an out-parameter reader ([`Self::read_trade_event`]) fills.
+    pub const ZERO: Self = Self {
+        ts_ns: 0,
+        venue_time_ms: 0,
+        px_1e6: 0,
+        qty_1e6: 0,
+        tid: 0,
+        sym: 0,
+        venue: 0,
+        aggressor: 0,
+        _pad: [0; 18],
+    };
+
+    /// Rebuild a print from its capture row, INTO `out`: a
+    /// [`ChannelId::Trade`] event (`venue_seq` = tid, `v0` = px ×1e6,
+    /// `v1` = size ×1e6 NEGATED for a sell print). `false`, with `out`
+    /// untouched, for any other channel, an unknown venue byte, or a
+    /// zero size — a row that says nothing traded is not a print.
+    ///
+    /// The `parse_trade` shape: the 64 B print is written once, into
+    /// the caller's storage, rather than returned by value inside an
+    /// `Option` (128 B on the stack).
+    #[inline]
+    #[must_use]
+    pub const fn read_trade_event(ev: &ChannelEvent, out: &mut Self) -> bool {
+        if ev.channel != ChannelId::Trade as u8 || ev.v1 == 0 || ev.v1 == i64::MIN {
+            return false;
+        }
+        let venue = match VenueId::from_u8(ev.venue) {
+            Some(v) => v,
+            None => return false,
+        };
+        let (qty_1e6, aggressor) = if ev.v1 < 0 {
+            (-ev.v1, TRADE_AGGRESSOR_SELL)
+        } else {
+            (ev.v1, TRADE_AGGRESSOR_BUY)
+        };
+        *out = Self::new(
+            ev.ts_ns,
+            venue,
+            ev.sym,
+            ev.venue_seq,
+            ev.venue_time_ms,
+            ev.v0,
+            qty_1e6,
+            aggressor,
+        );
+        true
+    }
+}
+
+/// [`OrderEvent::kind`] 0: no event — a zeroed slot. Never produced; a
+/// consumer that reads it is reading a slot nobody wrote.
+pub const ORDER_EVENT_NONE: u8 = 0;
+/// [`OrderEvent::kind`]: the order RESTS on the book — for a post-only
+/// order, the venue's ACK (LAW E-5: the answer to the place), or the
+/// paper model's activation.
+pub const ORDER_EVENT_RESTING: u8 = 1;
+/// [`OrderEvent::kind`]: the order was REFUSED and never rested;
+/// [`OrderEvent::reason`] says why (a crossing post-only order is
+/// `ORDER_EVENT_REASON_BAD_ALO_PX` — information, not a fault, law
+/// XH-7).
+pub const ORDER_EVENT_REJECTED: u8 = 2;
+/// [`OrderEvent::kind`]: the order LEFT the book without filling in
+/// full; [`OrderEvent::reason`] says who took it off.
+pub const ORDER_EVENT_CANCELED: u8 = 3;
+/// [`OrderEvent::kind`]: the order FILLED in full and is done. The fill
+/// itself rides the fill lane (LAW E-5: the stream is the FILL) — this
+/// is only the order's end of life.
+pub const ORDER_EVENT_FILLED: u8 = 4;
+
+/// [`OrderEvent::reason`]: none given (every `RESTING` and `FILLED`).
+pub const ORDER_EVENT_REASON_NONE: u8 = 0;
+/// [`OrderEvent::reason`]: our own cancel took effect.
+pub const ORDER_EVENT_REASON_CANCEL_REQUESTED: u8 = 1;
+/// [`OrderEvent::reason`]: a MODIFY retired this order (LAW E-7 — the
+/// replacement carries a fresh client id and its own events).
+pub const ORDER_EVENT_REASON_REPLACED: u8 = 2;
+/// [`OrderEvent::reason`]: the order's lifetime ran out (the engine TTL,
+/// or the venue's `expiresAfter`).
+pub const ORDER_EVENT_REASON_EXPIRED: u8 = 3;
+/// [`OrderEvent::reason`]: a post-only order would have crossed the
+/// touch (Hyperliquid `badAloPxRejected`).
+pub const ORDER_EVENT_REASON_BAD_ALO_PX: u8 = 4;
+/// [`OrderEvent::reason`]: self-trade prevention took the order.
+pub const ORDER_EVENT_REASON_SELF_TRADE: u8 = 5;
+/// [`OrderEvent::reason`]: margin — insufficient, or a margin cancel.
+pub const ORDER_EVENT_REASON_MARGIN: u8 = 6;
+/// [`OrderEvent::reason`]: the instrument is at its open-interest cap.
+pub const ORDER_EVENT_REASON_OPEN_INTEREST_CAP: u8 = 7;
+/// [`OrderEvent::reason`]: the venue's dead-man (`scheduleCancel`)
+/// fired.
+pub const ORDER_EVENT_REASON_SCHEDULED_CANCEL: u8 = 8;
+/// [`OrderEvent::reason`]: a reduce-only order would have increased the
+/// position.
+pub const ORDER_EVENT_REASON_REDUCE_ONLY: u8 = 9;
+/// [`OrderEvent::reason`]: the price or size is off the venue's grid.
+pub const ORDER_EVENT_REASON_TICK_OR_LOT: u8 = 10;
+/// [`OrderEvent::reason`]: below the venue's minimum notional.
+pub const ORDER_EVENT_REASON_MIN_NOTIONAL: u8 = 11;
+/// [`OrderEvent::reason`]: any other venue reason — the gateway counts
+/// the venue's own text.
+pub const ORDER_EVENT_REASON_OTHER: u8 = 255;
+
+/// One change in an order's venue-side state (XMM XH1): it rests, it
+/// was refused, it left the book, it is done.
+///
+/// The live gateway (XH4) turns Hyperliquid `orderUpdates` into these;
+/// the paper model (XH2) emits the same events, so a member's order
+/// state machine runs identically in both. Routed by
+/// [`Self::strategy_id`] to the slot that placed the order ALONE — the
+/// fill law (X1), never a fan-out.
+///
+/// Content is 32 B; the slot is one cache line like every ring slot,
+/// with the rest explicit zeroed padding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub struct OrderEvent {
+    /// When the event was observed — engine monotonic ns (the paper
+    /// model's clock, or the gateway's receipt).
+    pub ts_ns: NsTs,
+    /// The client id of the order the event is about (LAW E-9's durable
+    /// name; the engine never learns a venue oid).
+    pub client_oid: u64,
+    /// Venue timestamp of the change in ms; 0 = unknown (paper).
+    pub venue_time_ms: u64,
+    /// The order's instrument.
+    pub sym: SymbolId,
+    /// The order's venue ([`VenueId`] as raw byte).
+    pub venue: u8,
+    /// The slot that placed the order ([`Order::strategy_id`]);
+    /// [`STRATEGY_ID_NONE`] = not ours to attribute — counted, never
+    /// delivered.
+    pub strategy_id: u8,
+    /// [`ORDER_EVENT_RESTING`] / [`ORDER_EVENT_REJECTED`] /
+    /// [`ORDER_EVENT_CANCELED`] / [`ORDER_EVENT_FILLED`].
+    pub kind: u8,
+    /// `ORDER_EVENT_REASON_*`.
+    pub reason: u8,
+    /// Explicit padding (the slot is one cache line). Always zero.
+    _pad: [u8; 32],
+}
+
+impl OrderEvent {
+    /// Construct an event without naming the private padding.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        ts_ns: NsTs,
+        venue: VenueId,
+        sym: SymbolId,
+        client_oid: u64,
+        strategy_id: u8,
+        kind: u8,
+        reason: u8,
+        venue_time_ms: u64,
+    ) -> Self {
+        Self {
+            ts_ns,
+            client_oid,
+            venue_time_ms,
+            sym,
+            venue: venue as u8,
+            strategy_id,
+            kind,
+            reason,
+            _pad: [0; 32],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<TradePrint>() == 64);
+const _: () = assert!(core::mem::align_of::<TradePrint>() == 64);
+const _: () = assert!(core::mem::size_of::<OrderEvent>() == 64);
+const _: () = assert!(core::mem::align_of::<OrderEvent>() == 64);
+
+// Both layouts are pinned in `docs/wire-format.md` — every offset
+// asserted build-breaking, the AiCmd way, so the doc cannot drift.
+const _: () = {
+    assert!(::core::mem::offset_of!(TradePrint, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(TradePrint, venue_time_ms) == 8);
+    assert!(::core::mem::offset_of!(TradePrint, px_1e6) == 16);
+    assert!(::core::mem::offset_of!(TradePrint, qty_1e6) == 24);
+    assert!(::core::mem::offset_of!(TradePrint, tid) == 32);
+    assert!(::core::mem::offset_of!(TradePrint, sym) == 40);
+    assert!(::core::mem::offset_of!(TradePrint, venue) == 44);
+    assert!(::core::mem::offset_of!(TradePrint, aggressor) == 45);
+    assert!(::core::mem::offset_of!(TradePrint, _pad) == 46);
+    assert!(::core::mem::offset_of!(OrderEvent, ts_ns) == 0);
+    assert!(::core::mem::offset_of!(OrderEvent, client_oid) == 8);
+    assert!(::core::mem::offset_of!(OrderEvent, venue_time_ms) == 16);
+    assert!(::core::mem::offset_of!(OrderEvent, sym) == 24);
+    assert!(::core::mem::offset_of!(OrderEvent, venue) == 28);
+    assert!(::core::mem::offset_of!(OrderEvent, strategy_id) == 29);
+    assert!(::core::mem::offset_of!(OrderEvent, kind) == 30);
+    assert!(::core::mem::offset_of!(OrderEvent, reason) == 31);
+    assert!(::core::mem::offset_of!(OrderEvent, _pad) == 32);
+    assert!(TRADE_RING_SIZE.is_power_of_two());
+    assert!(ORDER_EVENT_RING_SIZE.is_power_of_two());
+};
 
 // ---------------------------------------------------------------
 // DepthTopK — L2 top-of-book depth carrier (WS10-B)
@@ -3769,6 +4101,207 @@ mod tests {
         assert_eq!(::core::mem::align_of::<Order>(), 64);
     }
 
+    /// XMM XH1: the reduce-only bit took the first byte of the old
+    /// two-byte pad after `kind`. Every field around it keeps its
+    /// offset, so every Order ever captured still reads the same — and
+    /// reads as "no flags".
+    #[test]
+    fn order_flags_take_the_first_pad_byte_and_nothing_else_moves() {
+        assert_eq!(::core::mem::offset_of!(Order, kind), 13);
+        assert_eq!(::core::mem::offset_of!(Order, flags), 14);
+        assert_eq!(::core::mem::offset_of!(Order, px), 16);
+        assert_eq!(::core::mem::offset_of!(Order, client_oid), 32);
+        assert_eq!(::core::mem::offset_of!(Order, venue), 40);
+        assert_eq!(::core::mem::offset_of!(Order, ttl_ns), 48);
+        assert_eq!(::core::mem::offset_of!(Order, prev_client_oid), 56);
+    }
+
+    #[test]
+    fn order_reduce_only_is_opt_in_and_touches_nothing_else() {
+        let o = Order::new(
+            5,
+            VenueId::Hyperliquid,
+            make_symbol_id(VenueId::Hyperliquid, 3),
+            Side::Ask,
+            0,
+            Price::from_raw(101_000_000),
+            Qty::from_raw(150_000),
+            77,
+        );
+        // Failure mode first: a plain order is NOT reduce-only.
+        assert_eq!(o.flags, 0);
+        assert!(!o.is_reduce_only());
+        let r = o.with_reduce_only();
+        assert!(r.is_reduce_only());
+        assert_eq!(r.flags, ORDER_FLAG_REDUCE_ONLY);
+        // Idempotent, and every other field is untouched.
+        assert_eq!(r.with_reduce_only().flags, ORDER_FLAG_REDUCE_ONLY);
+        assert_eq!(
+            (r.ts_ns, r.sym, r.side, r.kind, r.px, r.qty, r.client_oid),
+            (o.ts_ns, o.sym, o.side, o.kind, o.px, o.qty, o.client_oid)
+        );
+        assert_eq!((r.venue, r.strategy_id, r.verb), (o.venue, o.strategy_id, o.verb));
+    }
+
+    #[test]
+    fn trade_print_and_order_event_are_one_cache_line() {
+        assert_eq!(::core::mem::size_of::<TradePrint>(), 64);
+        assert_eq!(::core::mem::align_of::<TradePrint>(), 64);
+        assert_eq!(::core::mem::size_of::<OrderEvent>(), 64);
+        assert_eq!(::core::mem::align_of::<OrderEvent>(), 64);
+        assert!(TRADE_RING_SIZE.is_power_of_two());
+        assert!(ORDER_EVENT_RING_SIZE.is_power_of_two());
+    }
+
+    #[test]
+    fn trade_print_new_sets_every_field() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 4);
+        let p = TradePrint::new(
+            9,
+            VenueId::Hyperliquid,
+            sym,
+            123_456,
+            1_790_000_000_000,
+            187_420_000,
+            2_500_000,
+            TRADE_AGGRESSOR_SELL,
+        );
+        assert_eq!(p.ts_ns, 9);
+        assert_eq!(p.venue, VenueId::Hyperliquid.to_u8());
+        assert_eq!(p.sym, sym);
+        assert_eq!(p.tid, 123_456);
+        assert_eq!(p.venue_time_ms, 1_790_000_000_000);
+        assert_eq!(p.px_1e6, 187_420_000);
+        assert_eq!(p.qty_1e6, 2_500_000);
+        assert_eq!(p.aggressor, TRADE_AGGRESSOR_SELL);
+        assert_ne!(TRADE_AGGRESSOR_BUY, TRADE_AGGRESSOR_SELL);
+    }
+
+    /// The capture row → print map is lossless in both directions of
+    /// the side convention (`v1` negative = a sell print).
+    #[test]
+    fn trade_print_rebuilds_from_its_capture_row() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 2);
+        let sell = ChannelEvent::new(
+            11,
+            VenueId::Hyperliquid,
+            ChannelId::Trade,
+            sym,
+            42,
+            1_790_000_000_123,
+            3_120_500_000,
+            -1_500_000,
+        );
+        let mut p = TradePrint::ZERO;
+        assert!(TradePrint::read_trade_event(&sell, &mut p), "a trade row is a print");
+        assert_eq!(
+            p,
+            TradePrint::new(
+                11,
+                VenueId::Hyperliquid,
+                sym,
+                42,
+                1_790_000_000_123,
+                3_120_500_000,
+                1_500_000,
+                TRADE_AGGRESSOR_SELL,
+            )
+        );
+        let buy = ChannelEvent::new(12, VenueId::Hyperliquid, ChannelId::Trade, sym, 43, 0, 7, 9);
+        let mut b = TradePrint::ZERO;
+        assert!(TradePrint::read_trade_event(&buy, &mut b), "a buy row is a print");
+        assert_eq!((b.qty_1e6, b.aggressor), (9, TRADE_AGGRESSOR_BUY));
+    }
+
+    #[test]
+    fn trade_print_refuses_rows_that_are_not_prints() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 2);
+        let mut out = TradePrint::ZERO;
+        // Another channel.
+        let book = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Book, sym, 0, 0, 5, 5);
+        assert!(!TradePrint::read_trade_event(&book, &mut out));
+        // A zero size says nothing traded.
+        let zero = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Trade, sym, 1, 0, 5, 0);
+        assert!(!TradePrint::read_trade_event(&zero, &mut out));
+        // `i64::MIN` has no positive magnitude — refused, never wrapped.
+        let min = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Trade, sym, 1, 0, 5, i64::MIN);
+        assert!(!TradePrint::read_trade_event(&min, &mut out));
+        // An unknown venue byte is a corrupt row.
+        let mut bad = ChannelEvent::new(1, VenueId::Hyperliquid, ChannelId::Trade, sym, 1, 0, 5, 1);
+        bad.venue = 250;
+        assert!(!TradePrint::read_trade_event(&bad, &mut out));
+        // A refusal writes nothing: the zeroed print is still zero.
+        assert_eq!(out, TradePrint::ZERO);
+        assert_eq!(out.qty_1e6, 0, "ZERO is no trade");
+    }
+
+    #[test]
+    fn order_event_new_sets_every_field() {
+        let sym = make_symbol_id(VenueId::Hyperliquid, 1);
+        let e = OrderEvent::new(
+            3,
+            VenueId::Hyperliquid,
+            sym,
+            0xABCD,
+            6,
+            ORDER_EVENT_REJECTED,
+            ORDER_EVENT_REASON_BAD_ALO_PX,
+            1_790_000_000_999,
+        );
+        assert_eq!(e.ts_ns, 3);
+        assert_eq!(e.venue, VenueId::Hyperliquid.to_u8());
+        assert_eq!(e.sym, sym);
+        assert_eq!(e.client_oid, 0xABCD);
+        assert_eq!(e.strategy_id, 6);
+        assert_eq!(e.kind, ORDER_EVENT_REJECTED);
+        assert_eq!(e.reason, ORDER_EVENT_REASON_BAD_ALO_PX);
+        assert_eq!(e.venue_time_ms, 1_790_000_000_999);
+    }
+
+    /// The kind and reason vocabularies are wire values: distinct,
+    /// append-only, and 0 is the "nothing written" value for both.
+    #[test]
+    fn order_event_vocabulary_is_distinct_and_zero_means_none() {
+        let kinds = [
+            ORDER_EVENT_NONE,
+            ORDER_EVENT_RESTING,
+            ORDER_EVENT_REJECTED,
+            ORDER_EVENT_CANCELED,
+            ORDER_EVENT_FILLED,
+        ];
+        let reasons = [
+            ORDER_EVENT_REASON_NONE,
+            ORDER_EVENT_REASON_CANCEL_REQUESTED,
+            ORDER_EVENT_REASON_REPLACED,
+            ORDER_EVENT_REASON_EXPIRED,
+            ORDER_EVENT_REASON_BAD_ALO_PX,
+            ORDER_EVENT_REASON_SELF_TRADE,
+            ORDER_EVENT_REASON_MARGIN,
+            ORDER_EVENT_REASON_OPEN_INTEREST_CAP,
+            ORDER_EVENT_REASON_SCHEDULED_CANCEL,
+            ORDER_EVENT_REASON_REDUCE_ONLY,
+            ORDER_EVENT_REASON_TICK_OR_LOT,
+            ORDER_EVENT_REASON_MIN_NOTIONAL,
+            ORDER_EVENT_REASON_OTHER,
+        ];
+        let mut i = 0usize;
+        while i < kinds.len() {
+            assert_eq!(kinds[i], i as u8, "kinds are dense from 0");
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < reasons.len() {
+            let mut j = i + 1;
+            while j < reasons.len() {
+                assert_ne!(reasons[i], reasons[j]);
+                j += 1;
+            }
+            i += 1;
+        }
+        assert_eq!(ORDER_EVENT_NONE, 0);
+        assert_eq!(ORDER_EVENT_REASON_NONE, 0);
+    }
+
     #[test]
     fn tick_mid_and_spread_are_correct() {
         let t = Tick::new(
@@ -3920,13 +4453,17 @@ mod tests {
         // Signal: 8+4+1+1+2+40+8 = 64.
         // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin;
         //       E4: +flags, which took the last explicit pad byte).
-        // Order: 8+4+1+1+2+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
-        //        +strategy_id; E5: +verb, +prev_client_oid, both out
-        //        of the explicit padding).
+        // Order: 8+4+1+1+1+1+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
+        //        +strategy_id; E5: +verb, +prev_client_oid; XMM XH1:
+        //        +flags — all out of the explicit padding).
+        // TradePrint: 8+8+8+8+8+4+1+1+18 = 64 (XMM XH1).
+        // OrderEvent: 8+8+8+4+1+1+1+1+32 = 64 (XMM XH1).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);
         assert_eq!(::core::mem::size_of::<Signal>(), 64);
         assert_eq!(::core::mem::size_of::<Fill>(), 64);
         assert_eq!(::core::mem::size_of::<Order>(), 64);
+        assert_eq!(::core::mem::size_of::<TradePrint>(), 64);
+        assert_eq!(::core::mem::size_of::<OrderEvent>(), 64);
     }
 
     #[test]

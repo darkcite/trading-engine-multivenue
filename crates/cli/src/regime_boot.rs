@@ -65,7 +65,8 @@ fn coded_member_slot(name: &str) -> Option<u8> {
         // member that no longer sits there.
         "bin15" => strategy_set::SLOT_BIN15,
         "ai_exec" => strategy_set::SLOT_AI_EXEC,
-        "icdp" => strategy_set::SLOT_ICDP,
+        // XMM XH1 (2026-09-26): slot 6 is xmm, which takes no label
+        // yet; `icdp` is GONE as a label name for the same reason `ev` is.
         _ => return None,
     })
 }
@@ -276,8 +277,11 @@ mod tests {
             set: RegimeLabelSet::ANY,
         });
         assert!(resolve_regime_file(&f, b"x", &resolver, false).is_err());
+        // XMM XH1: slot 6's old name labels nothing.
         f.labels[0].member = "icdp".to_owned();
+        assert!(resolve_regime_file(&f, b"x", &resolver, false).is_err());
+        f.labels[0].member = "ai_exec".to_owned();
         let r = resolve_regime_file(&f, b"x", &resolver, false).unwrap();
-        assert_eq!(r.labels[0].0, strategy_set::SLOT_ICDP);
+        assert_eq!(r.labels[0].0, strategy_set::SLOT_AI_EXEC);
     }
 }

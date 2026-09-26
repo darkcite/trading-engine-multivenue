@@ -1224,3 +1224,220 @@ fn member_bin15_refuses_a_permuted_family_list() {
     assert!(msg.contains("crossed forms are refused"), "{msg}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------
+// XMM XH1 — `backtest --member xmm`
+// ---------------------------------------------------------------
+//
+// One synthetic Hyperliquid run: BTC ticks, two BTC trade prints, one
+// AssetCtx row, one print the trade lane's constructor refuses (no
+// size), and two depth rows — the BTC perp's (research capture since
+// XH1) and a HIP-4 leg's. The member is dark at XH1, so what the arm
+// pins is the plumbing: the artifact resolves against the manifest the
+// boot would use, the prints reach the member as the live trade lane
+// carries them (and only for `--member xmm`), perp depth reaches no
+// replay, and nothing is placed.
+
+/// 2026-09-26T00:00:00Z.
+const XMM_EPOCH_NS: u64 = 1_790_380_800_000_000_000;
+const XMM_EXAMPLE: &str = include_str!("../../../xmm.toml.example");
+
+fn xmm_hl_btc() -> u32 {
+    core_types::make_symbol_id(VenueId::Hyperliquid, 0)
+}
+
+fn xmm_bn_btc() -> u32 {
+    core_types::make_symbol_id(VenueId::Binance, 9)
+}
+
+fn xmm_hl_leg() -> u32 {
+    core_types::make_symbol_id(VenueId::Hyperliquid, 7)
+}
+
+fn xmm_depth(at_ms: u64, sym: u32) -> core_types::DepthTopK {
+    let mut bids = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+    bids[0] = core_types::DepthLevel {
+        px_1e6: 400_000,
+        qty_1e6: 1_000_000,
+    };
+    let mut asks = [core_types::DepthLevel::EMPTY; core_types::DEPTH_K];
+    asks[0] = core_types::DepthLevel {
+        px_1e6: 600_000,
+        qty_1e6: 1_000_000,
+    };
+    core_types::DepthTopK::new(
+        XMM_EPOCH_NS + at_ms * 1_000_000,
+        VenueId::Hyperliquid,
+        sym,
+        0,
+        bids,
+        asks,
+    )
+}
+
+fn xmm_event(
+    at_ms: u64,
+    channel: core_types::ChannelId,
+    seq: u64,
+    v0: i64,
+    v1: i64,
+) -> core_types::ChannelEvent {
+    core_types::ChannelEvent::new(
+        XMM_EPOCH_NS + at_ms * 1_000_000,
+        VenueId::Hyperliquid,
+        channel,
+        xmm_hl_btc(),
+        seq,
+        XMM_EPOCH_NS / 1_000_000 + at_ms,
+        v0,
+        v1,
+    )
+}
+
+/// BTC only: the probe's other three perps are not in this manifest.
+fn xmm_btc_only() -> String {
+    XMM_EXAMPLE
+        .replace("quote_eth = 1", "quote_eth = 0")
+        .replace("quote_sol = 1", "quote_sol = 0")
+        .replace("quote_xrp = 1", "quote_xrp = 0")
+}
+
+fn build_xmm_capture(root: &Path, artifact: &str) -> (PathBuf, PathBuf) {
+    let run = root.join(format!("run-{XMM_EPOCH_NS}"));
+    std::fs::create_dir_all(&run).expect("mkdir run");
+    std::fs::write(
+        run.join("instrument-manifest.tsv"),
+        format!(
+            "{}\thyperliquid:BTC\n{}\tbinance-usdm:btcusdt\n{}\thyperliquid:#330\n",
+            xmm_hl_btc(),
+            xmm_bn_btc(),
+            xmm_hl_leg()
+        ),
+    )
+    .expect("manifest");
+    let events = [
+        // A sell-aggressor print: the capture signs the size by side.
+        xmm_event(1_000, core_types::ChannelId::Trade, 11, 100_000_000_000, -2_000_000),
+        xmm_event(1_500, core_types::ChannelId::AssetCtx, 0, 100_000_000_000, 0),
+        // No size: the lane's constructor refuses it, so it is no print.
+        xmm_event(2_000, core_types::ChannelId::Trade, 12, 100_010_000_000, 0),
+        xmm_event(2_500, core_types::ChannelId::Trade, 13, 100_010_000_000, 3_000_000),
+    ];
+    let mut w = PmlrWriter::open(run.join("hl-events.pmlr"), SlotKind::Event, XMM_EPOCH_NS)
+        .expect("open events");
+    for e in &events {
+        w.append(e).expect("append event");
+    }
+    w.flush().expect("flush events");
+    let mut w = PmlrWriter::open(run.join("hl-depth.pmlr"), SlotKind::Depth, XMM_EPOCH_NS)
+        .expect("open depth");
+    w.append(&xmm_depth(1_100, xmm_hl_btc())).expect("append perp depth");
+    w.append(&xmm_depth(1_300, xmm_hl_leg())).expect("append leg depth");
+    w.flush().expect("flush depth");
+    let mut w = PmlrWriter::open(run.join("hl-ticks.pmlr"), SlotKind::Tick, XMM_EPOCH_NS)
+        .expect("open ticks");
+    for (i, at_ms) in [0u64, 1_200, 2_200, 3_000].iter().enumerate() {
+        let t = Tick::new(
+            XMM_EPOCH_NS + at_ms * 1_000_000,
+            VenueId::Hyperliquid,
+            xmm_hl_btc(),
+            i as u32 + 1,
+            Price::from_raw(99_990_000_000),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(100_010_000_000),
+            Qty::from_raw(1_000_000),
+        );
+        w.append(&t).expect("append tick");
+    }
+    w.flush().expect("flush ticks");
+    let toml = root.join("xmm.toml");
+    std::fs::write(&toml, artifact).expect("write xmm.toml");
+    (root.to_path_buf(), toml)
+}
+
+fn xmm_cfg(replay: &Path, toml: &Path) -> BacktestConfig {
+    let mut cfg = member_cfg(replay, toml);
+    cfg.fee_bps = vec!["hl:0:0".to_owned()];
+    cfg.stale_after_ms = vec!["hl:0".to_owned()];
+    cfg.member = Some(MemberSpec {
+        kind: MemberKind::Xmm,
+        params: toml.to_path_buf(),
+        table: None,
+        seed: None,
+        vrp_seed: None,
+        bin15_seed_dir: None,
+        hyparb_universe: None,
+    });
+    cfg
+}
+
+#[test]
+fn xmm_member_is_dark_and_the_trade_lane_is_merged_for_it_only() {
+    let root = unique_root("xmm");
+    let artifact = xmm_btc_only();
+    let (replay, toml) = build_xmm_capture(&root, &artifact);
+    let cfg = xmm_cfg(&replay, &toml);
+    let out = run_member(&cfg, cfg.member.as_ref().unwrap()).expect("member run");
+    let hash = core_crypto::sha256(artifact.as_bytes());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    assert!(
+        out.schema1.starts_with(&format!("{{\"schema_version\":1,\"ruleset_hash\":\"{hex}\",")),
+        "schema1: {}",
+        out.schema1
+    );
+    assert!(out.summary.contains("member: xmm params="), "{}", out.summary);
+    assert!(out.summary.contains(" coins=BTC "), "{}", out.summary);
+    // Two prints; the sizeless row is not one.
+    assert!(out.summary.contains(" hl_trades=2 "), "{}", out.summary);
+    // XH1 is dark: nothing is placed, nothing fills.
+    assert!(out.summary.contains(" orders_emitted=0 "), "{}", out.summary);
+    assert_eq!(out.stats.fills_total, 0, "{}", out.summary);
+    assert_eq!(out.stats.vm_orders_emitted, 0, "{}", out.summary);
+    // The HIP-4 leg's depth replays; the perp's is research capture.
+    assert_eq!(out.stats.merged_depths, 1, "{}", out.summary);
+
+    // Another member over the SAME root merges no print: its record
+    // count is the ticks, the AssetCtx row and the leg's depth — exactly
+    // what the same root replayed before XH1.
+    let mut other = member_cfg(&replay, &root.join("icdp.toml"));
+    other.fee_bps = vec!["hl:0:0".to_owned()];
+    other.stale_after_ms = vec!["hl:0".to_owned()];
+    std::fs::write(
+        root.join("icdp.toml"),
+        ICDP_TOML.replace("binance:btcusdt", "hyperliquid:BTC"),
+    )
+    .expect("write icdp.toml");
+    let icdp = run_member(&other, other.member.as_ref().unwrap()).expect("icdp run");
+    assert_eq!(icdp.stats.merged_records + 2, out.stats.merged_records, "{}", icdp.summary);
+    assert_eq!(icdp.stats.merged_depths, 1, "{}", icdp.summary);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn xmm_member_refuses_a_leader_the_manifest_does_not_carry() {
+    let root = unique_root("xmm-no-leader");
+    // XRP is quoted, and neither its perp nor its leader was captured.
+    let artifact = xmm_btc_only().replace("quote_xrp = 0", "quote_xrp = 1");
+    let (replay, toml) = build_xmm_capture(&root, &artifact);
+    let cfg = xmm_cfg(&replay, &toml);
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("an unresolvable perp must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("hyperliquid:XRP") && msg.contains("quote_xrp"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn xmm_member_refuses_a_malformed_artifact() {
+    let root = unique_root("xmm-bad");
+    let artifact = xmm_btc_only().replace("skew_kappa_1e6 = 0", "skew_kappa_1e6 = 5");
+    let (replay, toml) = build_xmm_capture(&root, &artifact);
+    let cfg = xmm_cfg(&replay, &toml);
+    let msg = match run_member(&cfg, cfg.member.as_ref().unwrap()) {
+        Ok(_) => panic!("a refused knob must refuse the run"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(msg.contains("--xmm") && msg.contains("skew_kappa_1e6"), "{msg}");
+    let _ = std::fs::remove_dir_all(&root);
+}

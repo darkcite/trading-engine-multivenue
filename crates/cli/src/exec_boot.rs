@@ -103,6 +103,13 @@ pub const LIVE_ARM_VENUES: &[u8] = &[
 /// hedge without its AMM leg, is a one-legged arb.
 pub const HYPEREVM_SLOT: usize = 0;
 
+/// XMM XH1: slot 6 (`xmm`) has NO live arm of its own until XH4 gives it
+/// its own Hyperliquid master account and gateway (rulings O-XH3,
+/// O-XH7). Until then a live slot 6 refuses the boot: armed today it
+/// would share slot 3's Hyperliquid arm, where a slot-6 halt's
+/// venue-wide cancel would pull bin15's quotes.
+pub const XMM_SLOT: usize = strategy_set::SLOT_XMM as usize;
+
 /// Three crates name their own slot count and the dependency graph
 /// forbids them importing each other's. Assert all three agree at
 /// COMPILE time: a mismatch would silently truncate the per-slot arrays
@@ -114,7 +121,7 @@ const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "reserved",
 ];
 
 /// A resolved execution configuration.
@@ -341,6 +348,16 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                  than arming a member the artifact did not mean. Fix the artifact's `name`, \
                  or the slot number, whichever is stale.",
                 s.name
+            ));
+        }
+
+        // XMM XH1: no live arm for slot 6 before XH4 ([`XMM_SLOT`]).
+        if mode == ExecMode::Live && slot == XMM_SLOT {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} has no live \
+                 arm of its own before XMM XH4 (its own Hyperliquid master account and \
+                 gateway, rulings O-XH3/O-XH7) — refusing rather than arming it on slot 3's \
+                 account, where its halt would cancel bin15's quotes"
             ));
         }
 
@@ -633,6 +650,25 @@ mod tests {
         let d = std::env::temp_dir().join(format!("exec-boot-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// XMM XH1: a live slot 6 refuses the boot until XH4 gives xmm its
+    /// own arm — even correctly named and agreed by `--arm-live` — while
+    /// a PAPER slot 6 is an ordinary artifact.
+    #[test]
+    fn a_live_slot_six_refuses_until_its_own_arm_exists() {
+        let d = tmp();
+        let six = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.6]")
+            .replace("name = \"bin15\"", "name = \"xmm\"");
+        let p = write(&d, "exec.toml", &six);
+        let e = resolve(Some(&p), Some("6")).expect_err("no live arm for slot 6 before XH4");
+        assert!(e.contains("slot 6 (xmm)") && e.contains("XH4"), "{e}");
+        let paper = six.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec-paper.toml", &paper);
+        let boot = resolve(Some(&p), None).expect("a paper slot 6 is fine").expect("present");
+        assert_eq!(boot.route.mode_at(XMM_SLOT), Some(ExecMode::Paper));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

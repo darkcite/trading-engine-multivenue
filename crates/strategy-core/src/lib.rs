@@ -32,9 +32,9 @@
 use core_time::NsTs;
 use core_types::regime::REL_UNKNOWN;
 use core_types::{
-    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, OptSummary, Order, RegimeLabelSet,
-    RegimeWord, RuleTableV2, Signal, SymbolId, Tick, VenueId, REGIME_OFF_HARD, REGIME_OFF_SOFT,
-    REGIME_PROFILES, SYMBOL_ID_NONE,
+    AiCmd, CancelReq, ChannelEvent, DepthTopK, Fill, OptSummary, Order, OrderEvent,
+    RegimeLabelSet, RegimeWord, RuleTableV2, Signal, SymbolId, Tick, TradePrint, VenueId,
+    REGIME_OFF_HARD, REGIME_OFF_SOFT, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 /// Error type returned from `Strategy::on_start`. Startup errors are
@@ -1739,6 +1739,31 @@ pub trait Strategy: StrategyCounters {
         let _ = (opt, ctx);
     }
 
+    /// Called once per [`TradePrint`] popped from the trade lane (XMM
+    /// XH1): the venue's public tape — fed today by the Hyperliquid
+    /// ingress. A maker reads its queue being consumed from it.
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged; `strategy-set` forwards it to enabled members
+    /// like `on_tick`. Monomorphized — no `dyn`.
+    #[inline]
+    fn on_trade<C: Ctx>(&mut self, trade: &TradePrint, ctx: &mut C) {
+        let _ = (trade, ctx);
+    }
+
+    /// Called once per [`OrderEvent`] about an order this member placed
+    /// (XMM XH1): it rests, it was refused, it left the book, it is
+    /// done. The paper model and the live gateway emit the same events,
+    /// so a member's order state machine runs identically in both.
+    ///
+    /// Defaulted to a no-op so every existing strategy compiles and
+    /// behaves unchanged. `strategy-set` routes each event to the slot
+    /// named by its `strategy_id` ALONE — the fill law, never a fan-out.
+    #[inline]
+    fn on_order_event<C: Ctx>(&mut self, event: &OrderEvent, ctx: &mut C) {
+        let _ = (event, ctx);
+    }
+
     /// Periodic timer. `now_ns` is the current timestamp; the engine
     /// calls this at roughly the interval returned by `timer_period_ns`.
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C);
@@ -1992,6 +2017,63 @@ mod tests {
         s.on_start(&mut ctx).unwrap();
         let d = DepthTopK::EMPTY;
         s.on_depth(&d, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
+    }
+
+    #[test]
+    fn on_trade_defaults_to_noop() {
+        // XMM XH1 default: a delivered print touches neither strategy
+        // state nor the Ctx — every member that exists today is
+        // unchanged by the new lane.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let p = TradePrint::new(
+            1,
+            core_types::VenueId::Hyperliquid,
+            7,
+            9,
+            1_790_000_000_000,
+            187_000_000,
+            1_000_000,
+            core_types::TRADE_AGGRESSOR_BUY,
+        );
+        s.on_trade(&p, &mut ctx);
+        assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
+        assert_eq!(ctx.submitted, 0, "default hook must not submit");
+    }
+
+    #[test]
+    fn on_order_event_defaults_to_noop() {
+        // XMM XH1 default: even a terminal event about an order the
+        // strategy never placed is inert through the default hook.
+        let mut ctx = NoopCtx {
+            submitted: 0,
+            now: 0,
+        };
+        let mut s = NoopStrat {
+            started: false,
+            ticks: 0,
+        };
+        s.on_start(&mut ctx).unwrap();
+        let e = OrderEvent::new(
+            1,
+            core_types::VenueId::Hyperliquid,
+            7,
+            42,
+            6,
+            core_types::ORDER_EVENT_REJECTED,
+            core_types::ORDER_EVENT_REASON_BAD_ALO_PX,
+            0,
+        );
+        s.on_order_event(&e, &mut ctx);
         assert_eq!(s.ticks, 0, "default hook must not touch strategy state");
         assert_eq!(ctx.submitted, 0, "default hook must not submit");
     }

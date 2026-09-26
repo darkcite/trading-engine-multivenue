@@ -56,8 +56,6 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "ai",
     "ai-exec",
     "vm",
-    "icdp",
-    "ai+icdp",
     "vrp",
     "ai+vrp",
     "xsd",
@@ -74,6 +72,12 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "hyparb",
     "ai+hyparb",
     "ai+vrp+xsd+bin15+hyparb",
+    // XMM XH1 (O-XH1): slot 6. Resolves, but refuses the boot as "no
+    // requested member is configured" without `~/multivenue/xmm.toml`
+    // (or `--xmm`); `icdp` and `ai+icdp` are gone with the unlink.
+    "xmm",
+    "ai+xmm",
+    "ai+vrp+xsd+bin15+hyparb+xmm",
 ];
 
 /// Top-level CLI.
@@ -576,7 +580,8 @@ struct BacktestArgs {
     ruleset: Option<PathBuf>,
     /// Tier 3 (statarb doc 08 §6.2): drive a CODED member through the
     /// harness instead of the ruleset VM — `icdp` (with `--icdp <toml>`;
-    /// default `~/multivenue/icdp.toml`), `xsd`, `vrp`, `bin15`.
+    /// default `~/multivenue/icdp.toml` — unlinked from the set at XMM
+    /// XH1, still driven here), `xsd`, `vrp`, `bin15`, `hyparb`, `xmm`.
     /// Additive: the frozen worker argv never passes it.
     #[arg(long)]
     member: Option<String>,
@@ -611,6 +616,11 @@ struct BacktestArgs {
     /// `~/multivenue/hyparb.toml`).
     #[arg(long, requires = "member")]
     hyparb: Option<PathBuf>,
+    /// `--member xmm`: the parameter artifact (`xmm.toml`; default
+    /// `~/multivenue/xmm.toml`); descriptors resolve against the
+    /// capture's newest manifest.
+    #[arg(long, requires = "member")]
+    xmm: Option<PathBuf>,
     /// `--member hyparb`: the `universe.toml` whose `[hyperevm] pools`
     /// names the pools (default `~/multivenue/universe.toml` — the list
     /// is append-only, so the live file names every pool an older
@@ -909,13 +919,14 @@ struct RunArgs {
     /// with `--evm-testnet`; never the inverse. Shouted in the ARMED tell.
     #[arg(long, default_value_t = false, requires = "evm_testnet")]
     evm_hybrid: bool,
-    /// ICDP I5: the slot-6 parameter artifact (`~/multivenue/icdp.toml`
-    /// by default). Read only when the requested mask carries the icdp
-    /// bit (`--strategy icdp` / `ai+icdp` / `all`); an absent or
+    /// XMM XH1: the slot-6 parameter artifact (`~/multivenue/xmm.toml`
+    /// by default). Read only when the requested mask carries the xmm
+    /// bit (`--strategy xmm` / `ai+xmm` / … / `all`); an absent or
     /// unresolvable artifact refuses the boot with the bit set — never
-    /// a silent no-op.
+    /// a silent no-op (the icdp/F19 law). `--icdp` left with the unlink
+    /// (O-XH1): `backtest --member icdp` keeps its own `--icdp`.
     #[arg(long)]
-    icdp: Option<PathBuf>,
+    xmm: Option<PathBuf>,
     /// RG2: the regime detector's parameter artifact
     /// (`~/multivenue/regime.toml` by default; `docs/regime-and-dashboard-plan.md`
     /// §4.6). Set boots only. An ABSENT default file boots the detector
@@ -2153,7 +2164,7 @@ fn backtest(args: BacktestArgs) -> ExitCode {
         Some(name) => {
             let Some(kind) = cli::backtest::member::MemberKind::parse(name) else {
                 eprintln!(
-                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb)"
+                    "backtest: unknown --member {name:?} (known: icdp, xsd, vrp, bin15, hyparb, xmm)"
                 );
                 return ExitCode::from(1);
             };
@@ -2204,6 +2215,16 @@ fn backtest(args: BacktestArgs) -> ExitCode {
                         Ok(p) => PathBuf::from(p),
                         Err(e) => {
                             eprintln!("backtest: --member hyparb needs --hyparb <toml>: {e}");
+                            return ExitCode::from(1);
+                        }
+                    },
+                },
+                cli::backtest::member::MemberKind::Xmm => match args.xmm.clone() {
+                    Some(p) => p,
+                    None => match core_config::xmm::default_xmm_path() {
+                        Ok(p) => PathBuf::from(p),
+                        Err(e) => {
+                            eprintln!("backtest: --member xmm needs --xmm <toml>: {e}");
                             return ExitCode::from(1);
                         }
                     },
@@ -3185,6 +3206,10 @@ fn run(args: RunArgs) -> ExitCode {
     let opt_lane_cons = [okx_opt_cons, deribit_opt_cons, bn_opt_cons];
     let (rpc_prod, rpc_cons) = rings.rpc_signal.clone().split();
     let (hyperevm_prod, hyperevm_cons) = rings.hyperevm_signal.clone().split();
+    // XMM XH1: the trade lane — Hyperliquid prints, pushed by the HL
+    // ingress thread after their capture. Dropped with the HL producers
+    // when no coin is subscribed (the unspawned-venue shape, §3.3).
+    let (trade_prod, trade_cons) = rings.trade.clone().split();
     // E7: lane 3 (`engine::fill_lane_of(Hyperliquid)`) finally has a
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
@@ -3716,6 +3741,7 @@ fn run(args: RunArgs) -> ExitCode {
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
+            trade_prod,
             statuses.hyperliquid.clone(),
             7,
             &run_dir,
@@ -3737,6 +3763,7 @@ fn run(args: RunArgs) -> ExitCode {
         // empty ring (the unspawned-venue shape, §3.3).
         drop(hl_prod);
         drop(hl_event_prod);
+        drop(trade_prod);
     }
 
     // WS9: Bybit — spot + linear connection slots on ONE thread
@@ -4089,6 +4116,7 @@ fn run(args: RunArgs) -> ExitCode {
         opt_lanes: opt_lane_cons,
         rpc_signal: rpc_cons,
         hyperevm_signal: hyperevm_cons,
+        trades: trade_cons,
         fill_lanes: fill_lane_cons,
         ai_cmds: ai_lane_cons,
         ai_status,
@@ -4254,8 +4282,8 @@ fn run(args: RunArgs) -> ExitCode {
             // "every built member the given flags can boot" —
             // hyparb only when `hyparb.toml` resolves (H5), bin15 only
             // when its artifact resolves, vrp only when
-            // `vrp.toml` resolves (VRP V7: slot 1), icdp only when its
-            // artifact resolves (slot 2 is vacant — XSD-S),
+            // `vrp.toml` resolves (VRP V7: slot 1), xmm only when its
+            // artifact resolves (slot 6 — XMM XH1),
             // ai-exec and vm unconditionally (neither has boot
             // config; items 8 / 8g-6) (members without config boot
             // inert; see engine_loop_set_full docs). `ai-exec` (item
@@ -4267,15 +4295,18 @@ fn run(args: RunArgs) -> ExitCode {
             // live arm.
             let requested =
                 strategy_set::mask_for_name(name).expect("matched names are valid mask names");
-            // ICDP I5: resolve the artifact against the SAME
+            // XMM XH1: slot 6's artifact, resolved against the SAME
             // descriptor table the ruleset validator uses (D-6 truth).
             // Only when the bit is requested — `--strategy ai` never
             // touches the file.
-            let icdp_params = if requested & strategy_set::BIT_ICDP != 0 {
-                match load_icdp_params(args.icdp.as_deref(), &ai_descriptors) {
-                    Ok(p) => Some(p),
+            let xmm_boot = if cli::xmm_boot::xmm_wanted(requested) {
+                match cli::xmm_boot::load_xmm_boot(
+                    args.xmm.as_deref(),
+                    &|d: &str| ai_descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym),
+                ) {
+                    Ok(b) => b,
                     Err(reason) => {
-                        error!(reason, "icdp: artifact refused — boot aborted");
+                        error!(reason, "xmm: artifact refused — boot aborted");
                         join_reverse(handles);
                         return ExitCode::from(1);
                     }
@@ -4283,6 +4314,17 @@ fn run(args: RunArgs) -> ExitCode {
             } else {
                 None
             };
+            // F19 / the icdp law: requested-but-absent REFUSES. Booting
+            // `ai+xmm` silently as `ai` is how an operator comes to watch
+            // a member that was never there.
+            if cli::xmm_boot::xmm_wanted(requested) && xmm_boot.is_none() {
+                error!(
+                    "xmm: requested by --strategy but the artifact is absent \
+                     (~/multivenue/xmm.toml or --xmm) — boot aborted"
+                );
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
             // RG2: the regime detector's artifact + seed, resolved
             // against the same descriptor table (D-6 truth). An absent
             // DEFAULT file is legal (unconfigured); an explicit path
@@ -4594,7 +4636,7 @@ fn run(args: RunArgs) -> ExitCode {
                         vrp_boot.as_ref(),
                         xsd_boot.as_ref(),
                         bin15_boot.as_ref(),
-                        icdp_params.as_ref(),
+                        xmm_boot.as_ref(),
                         regime_boot.as_ref(),
                         hyparb_boot.as_ref(),
                     )
@@ -4681,7 +4723,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 vrp_boot.as_ref(),
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
+                                xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                             )
@@ -4705,7 +4747,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 vrp_boot.as_ref(),
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
+                                xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                             )
@@ -4732,7 +4774,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 vrp_boot.as_ref(),
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
+                                xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                             )
@@ -4767,7 +4809,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 vrp_boot.as_ref(),
                                 xsd_boot.as_ref(),
                                 bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
+                                xmm_boot.as_ref(),
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                             )
@@ -4805,53 +4847,6 @@ fn run(args: RunArgs) -> ExitCode {
     exit_code
 }
 
-/// ICDP I5: read `icdp.toml`, resolve every descriptor against the boot
-/// universe, build the POD artifact the strategy consumes, hash the
-/// exact bytes (logged + stamped by the strategy). Boot-only.
-fn load_icdp_params(
-    path: Option<&std::path::Path>,
-    descriptors: &ingress_ai::DescriptorTable,
-) -> Result<strategy_icdp::IcdpParams, String> {
-    let owned;
-    let path: &std::path::Path = match path {
-        Some(p) => p,
-        None => {
-            owned = core_config::icdp::default_icdp_path().map_err(|e| e.to_string())?;
-            std::path::Path::new(&owned)
-        }
-    };
-    let (file, bytes) = core_config::icdp::load(path).map_err(|e| e.to_string())?;
-    let mut params = strategy_icdp::IcdpParams::EMPTY;
-    params.tf_ns = file.tf_ms.saturating_mul(1_000_000);
-    params.delta_ns = file.delta_ms.saturating_mul(1_000_000);
-    params.n = file.instruments.len();
-    params.hash = core_crypto::sha256(&bytes);
-    for (i, inst) in file.instruments.iter().enumerate() {
-        let (sym, _caps) = descriptors
-            .resolve(inst.descriptor.as_bytes())
-            .ok_or_else(|| format!("icdp: `{}` is not in the boot universe", inst.descriptor))?;
-        params.syms[i] = strategy_icdp::IcdpSymParams {
-            sym,
-            mu: inst.mu,
-            inv_sd: inst.inv_sd,
-            w: inst.w,
-            b: inst.b,
-            thr: inst.thr,
-            notional_1e6: inst.notional_usd_1e6,
-            spread_cap_1e9: inst.spread_cap_1e9,
-            entry_slip_1e9: inst.entry_slip_1e9,
-            exit_slip_1e9: inst.exit_slip_1e9,
-        };
-        info!(
-            descriptor = %inst.descriptor,
-            sym,
-            notional_usd_1e6 = inst.notional_usd_1e6,
-            thr_1e9 = inst.thr,
-            "icdp: instrument resolved"
-        );
-    }
-    Ok(params)
-}
 #[cfg(test)]
 mod strategy_name_pin {
     //! BIN15 O5: the regression pin for the arm/mask drift recorded on
@@ -4914,6 +4909,32 @@ mod strategy_name_pin {
                     | strategy_set::BIT_BIN15
                     | strategy_set::BIT_HYPARB,
             ),
+        ];
+        let mut i = 0;
+        while i < want.len() {
+            let (name, mask) = want[i];
+            assert!(super::STRATEGY_SET_NAMES.contains(&name), "{name}");
+            assert_eq!(strategy_set::mask_for_name(name), Some(mask), "{name}");
+            i += 1;
+        }
+    }
+
+    /// XMM XH1 (O-XH1): `icdp` and `ai+icdp` are gone as names — the
+    /// old wrapper line refuses the boot instead of composing a different
+    /// member — and the three slot-6 names resolve to bit 6.
+    #[test]
+    fn icdp_is_refused_and_the_xmm_names_resolve() {
+        assert_eq!(strategy_set::mask_for_name("icdp"), None);
+        assert_eq!(strategy_set::mask_for_name("ai+icdp"), None);
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"icdp"));
+        assert!(!super::STRATEGY_SET_NAMES.contains(&"ai+icdp"));
+        let want = [
+            ("xmm", strategy_set::BIT_XMM),
+            (
+                "ai+xmm",
+                strategy_set::BIT_AI_EXEC | strategy_set::BIT_VM | strategy_set::BIT_XMM,
+            ),
+            ("ai+vrp+xsd+bin15+hyparb+xmm", strategy_set::BUILT_MASK),
         ];
         let mut i = 0;
         while i < want.len() {

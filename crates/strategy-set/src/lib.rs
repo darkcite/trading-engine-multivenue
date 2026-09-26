@@ -22,7 +22,7 @@
 //! | 3 | `strategy-bin15` | built (BIN15 O4b, 2026-09-12 — **was `strategy-rule-tree`**, unlinked the same day) — configured only when `~/multivenue/bin15.toml` + its seeds resolve |
 //! | 4 | `strategy-ai-exec` | built (item 8) |
 //! | 5 | `strategy-vm` | built (8g item 6) |
-//! | 6 | `strategy-icdp` | built (ICDP I4, 2026-09-03) — configured only when `~/multivenue/icdp.toml` resolves |
+//! | 6 | `strategy-xmm` | built (XMM XH1, 2026-09-26 — **was `strategy-icdp`**, unlinked the same day, O-XH1; lands DARK until XH3) — configured only when `~/multivenue/xmm.toml` resolves |
 //!
 //! Slot 7 is the only reserved value: no member exists behind it, no
 //! bit constant is defined (the cli cannot express it via
@@ -30,6 +30,26 @@
 //! refused (counted). Slot 2 changed hands on 2026-09-12:
 //! `strategy-cross-arb` was unlinked (the crate stays in the workspace
 //! — the `strategy-ev` precedent) and `strategy-xsd` took the number.
+//! Slot 6 changed hands on 2026-09-26 the same way: `strategy-icdp`
+//! stays in the workspace (and `backtest --member icdp` still drives
+//! it); nothing in the set links it.
+//!
+//! ## Timers are per slot (XMM XH1)
+//!
+//! The engine calls [`Strategy::on_timer`] at the set's
+//! [`Strategy::timer_period_ns`] — the smallest period of any built
+//! member. Each member is then called only when ITS OWN period has
+//! elapsed since its own last call, so a fast member no longer runs
+//! everyone's timer at its rate. Every member that existed before XH1
+//! has a 1 s period or an empty `on_timer`, so each fires exactly when
+//! it fired before.
+//!
+//! ## Trades and order events (XMM XH1)
+//!
+//! [`Strategy::on_trade`] fans out to enabled members like `on_tick`.
+//! [`Strategy::on_order_event`] goes to the slot that placed the order
+//! ALONE — the X1 fill law — and an event for a disabled, unbuilt or
+//! unattributed slot is counted, never delivered.
 //!
 //! ## AI command routing (`on_ai`, §7)
 //!
@@ -86,9 +106,9 @@ use core_regime::{
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::REL_UNKNOWN;
 use core_types::{
-    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, RegimeLabelSet, RegimeWord,
-    RuleTableV2, Signal, Tick, REGIME_OFF_HARD, REGIME_PROFILES, STRATEGY_SLOT_AI_EXEC,
-    STRATEGY_SLOT_VM,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, OrderEvent, RegimeLabelSet,
+    RegimeWord, RuleTableV2, Signal, Tick, TradePrint, REGIME_OFF_HARD, REGIME_PROFILES,
+    STRATEGY_SLOT_AI_EXEC, STRATEGY_SLOT_VM,
 };
 use strategy_ai_exec::AiExec;
 use strategy_core::{
@@ -101,9 +121,9 @@ use strategy_core::{
 const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
 use strategy_bin15::Bin15Strategy;
 use strategy_hyparb::HyparbStrategy;
-use strategy_icdp::IcdpStrategy;
 use strategy_vm::VmStrategy;
 use strategy_vrp::VrpStrategy;
+use strategy_xmm::XmmStrategy;
 use strategy_xsd::XsdStrategy;
 
 // ---------------------------------------------------------------
@@ -156,9 +176,17 @@ pub const SLOT_AI_EXEC: u8 = STRATEGY_SLOT_AI_EXEC;
 /// Slot index of the vm member (wire value pinned in `core-types` —
 /// `RulesetStage`/`RulesetCommit` shape enforcement depends on it).
 pub const SLOT_VM: u8 = STRATEGY_SLOT_VM;
-/// Slot index of the icdp member (ICDP I4; `docs/wire-format.md`
-/// `Order.strategy_id` 6 = icdp).
-pub const SLOT_ICDP: u8 = 6;
+/// Slot index of the xmm member (XMM XH1, ruling O-XH1).
+///
+/// **The third swap boundary.** Slot 6 was `strategy-icdp` (ICDP I4,
+/// 2026-09-03) until 2026-09-26; icdp is UNLINKED — the crate stays in
+/// the workspace and `backtest --member icdp` still drives it, but
+/// nothing in the set links it and no mask name reaches it. The NUMBER
+/// is wire-stable — `Order.strategy_id` 6 and `AiCmd::strategy_id` 6
+/// still mean "slot 6" — so a capture taken before XH1 carries icdp
+/// rows under this slot and one taken after carries xmm rows.
+/// `docs/migration.md` records the boundary.
+pub const SLOT_XMM: u8 = 6;
 
 /// Enable-mask bit for the hyparb member (slot 0 — see [`SLOT_HYPARB`]).
 pub const BIT_HYPARB: u8 = 1 << SLOT_HYPARB;
@@ -174,12 +202,12 @@ pub const BIT_BIN15: u8 = 1 << SLOT_BIN15;
 pub const BIT_AI_EXEC: u8 = 1 << SLOT_AI_EXEC;
 /// Enable-mask bit for the vm member (8g item 6).
 pub const BIT_VM: u8 = 1 << SLOT_VM;
-/// Enable-mask bit for the icdp member (ICDP I4).
-pub const BIT_ICDP: u8 = 1 << SLOT_ICDP;
+/// Enable-mask bit for the xmm member (slot 6 — see [`SLOT_XMM`]).
+pub const BIT_XMM: u8 = 1 << SLOT_XMM;
 
 /// Every built member's bit (slots 0–6).
 pub const BUILT_MASK: u8 =
-    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_ICDP;
+    BIT_HYPARB | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_AI_EXEC | BIT_VM | BIT_XMM;
 
 /// Ai-exec capacity inside the set (design §7 sketch `AiExec<64>` —
 /// sizes the fair table, book table and cooldown gate alike).
@@ -231,11 +259,18 @@ pub const MASK_TABLE: &[(&str, u8)] = &[
     // strategies disabled at boot; the engine executes only what
     // the AI command plane pushes — ai-exec intents + VM rulesets).
     ("ai", BIT_AI_EXEC | BIT_VM),
-    // ICDP I4: the operator opts the intrabar member in beside
-    // the AI lanes (paper only — the wrapper refuses it without
-    // `--paper`); `icdp` alone boots it bare.
-    ("icdp", BIT_ICDP),
-    ("ai+icdp", BIT_AI_EXEC | BIT_VM | BIT_ICDP),
+    // XMM XH1 (2026-09-26, O-XH1): slot 6 is the xmm member; `icdp`
+    // and `ai+icdp` are GONE as names — an operator who types the old
+    // one gets a boot refusal, not a different strategy than the one
+    // asked for. The member boots only with its artifact
+    // (`~/multivenue/xmm.toml`), paper only; the last name is the live
+    // set plus xmm, for the XH3 paper run.
+    ("xmm", BIT_XMM),
+    ("ai+xmm", BIT_AI_EXEC | BIT_VM | BIT_XMM),
+    (
+        "ai+vrp+xsd+bin15+hyparb+xmm",
+        BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB | BIT_XMM,
+    ),
     // VRP V7: slot 1 is the VRP member. `ev` is GONE as a name —
     // an operator who types it must get a boot refusal, not a
     // different strategy than the one they asked for.
@@ -280,7 +315,7 @@ pub struct StrategySet {
     bin15: Bin15Strategy,
     ai_exec: AiExec<SET_AI_EXEC_SLOTS>,
     vm: VmStrategy,
-    icdp: IcdpStrategy,
+    xmm: XmmStrategy,
     /// Runtime enable mask (bits per the slot map). Only built bits
     /// are ever set — Enable of a reserved slot is refused.
     enabled: u8,
@@ -296,6 +331,14 @@ pub struct StrategySet {
     /// X1: fills stamped for a slot that is not enabled, or not built.
     /// Mirrored to `engine_set_fills_unrouted_total`.
     fills_unrouted: u64,
+    /// XMM XH1: order events for a slot that is not enabled, not built,
+    /// or not attributed — counted, never delivered.
+    order_events_unrouted: u64,
+    /// XMM XH1: when each slot's `on_timer` last ran (per-slot gating —
+    /// module docs).
+    timer_last_ns: [NsTs; 8],
+    /// XMM XH1: when the regime detector's timer last ran.
+    regime_timer_last_ns: NsTs,
     /// RG2: the regime detector (boot-boxed; inert until
     /// [`Self::configure_regime`] — every word UNKNOWN, every gate open
     /// for the unconstrained members that exist today).
@@ -331,12 +374,15 @@ impl StrategySet {
             bin15: Bin15Strategy::new(),
             ai_exec: AiExec::new(),
             vm: VmStrategy::new(),
-            icdp: IcdpStrategy::new(),
+            xmm: XmmStrategy::new(),
             enabled: m,
             initial: m,
             halted: false,
             enable_refused: 0,
             fills_unrouted: 0,
+            order_events_unrouted: 0,
+            timer_last_ns: [0; 8],
+            regime_timer_last_ns: 0,
             regime: RegimeState::new_boxed(),
             regime_labels: [RegimeLabelSet::ANY; 8],
             regime_gates: [RegimeGate::OPEN_UNKNOWN; 8],
@@ -386,7 +432,7 @@ impl StrategySet {
             SLOT_XSD => self.xsd.set_regime_label(set),
             SLOT_BIN15 => self.bin15.set_regime_label(set),
             SLOT_AI_EXEC => self.ai_exec.set_regime_label(set),
-            SLOT_ICDP => self.icdp.set_regime_label(set),
+            SLOT_XMM => self.xmm.set_regime_label(set),
             _ => false,
         };
         if ok {
@@ -428,7 +474,7 @@ impl StrategySet {
         self.regime_labels[SLOT_BIN15 as usize] = self.bin15.regime_label();
         self.regime_labels[SLOT_AI_EXEC as usize] = self.ai_exec.regime_label();
         self.regime_labels[SLOT_VM as usize] = RegimeLabelSet::ANY; // rows gate themselves (RG3)
-        self.regime_labels[SLOT_ICDP as usize] = self.icdp.regime_label();
+        self.regime_labels[SLOT_XMM as usize] = self.xmm.regime_label();
         self.regime_labels[7] = RegimeLabelSet::ANY;
     }
 
@@ -510,9 +556,9 @@ impl StrategySet {
             SLOT_VM => self
                 .vm
                 .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_ICDP => self
-                .icdp
-                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_ICDP)),
+            SLOT_XMM => self
+                .xmm
+                .on_regime(gate, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
             _ => {}
         }
     }
@@ -562,9 +608,9 @@ impl StrategySet {
                 .ai_exec
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
             SLOT_VM => self.vm.on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
-            SLOT_ICDP => self
-                .icdp
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_ICDP)),
+            SLOT_XMM => self
+                .xmm
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
             // Slot 7 is not built. A fill stamped with it is a bug
             // upstream, not a member to deliver to.
             _ => self.fills_unrouted = self.fills_unrouted.wrapping_add(1),
@@ -578,6 +624,60 @@ impl StrategySet {
     #[must_use]
     pub const fn fills_unrouted(&self) -> u64 {
         self.fills_unrouted
+    }
+
+    /// XMM XH1: deliver an order event to exactly one enabled slot —
+    /// the [`Self::route_fill_to_slot`] law.
+    #[inline(always)]
+    fn route_order_event_to_slot<C: Ctx>(&mut self, slot: u8, event: &OrderEvent, ctx: &mut C) {
+        match slot {
+            SLOT_HYPARB => self
+                .hyparb
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB)),
+            SLOT_VRP => self
+                .vrp
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VRP)),
+            SLOT_XSD => self
+                .xsd
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XSD)),
+            SLOT_BIN15 => self
+                .bin15
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_BIN15)),
+            SLOT_AI_EXEC => self
+                .ai_exec
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC)),
+            SLOT_VM => self
+                .vm
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM)),
+            SLOT_XMM => self
+                .xmm
+                .on_order_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XMM)),
+            // Slot 7 is not built — the caller's mask check keeps it
+            // out, and this arm counts it if that ever changes.
+            _ => self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1),
+        }
+    }
+
+    /// XMM XH1: order events that reached the set for a slot that is not
+    /// enabled, not built, or not attributed. Non-zero means an order
+    /// outlived a `DisableStrategy`, or an event is not ours.
+    #[inline]
+    #[must_use]
+    pub const fn order_events_unrouted(&self) -> u64 {
+        self.order_events_unrouted
+    }
+
+    /// XMM XH1: the per-slot timer gate — true, and the slot's clock
+    /// advanced, when `period` has elapsed since the slot last ran.
+    /// `u64::MAX` never fires (a member with no timer).
+    #[inline(always)]
+    fn timer_due(last_ns: &mut NsTs, period: u64, now_ns: NsTs) -> bool {
+        if period != u64::MAX && now_ns.saturating_sub(*last_ns) >= period {
+            *last_ns = now_ns;
+            true
+        } else {
+            false
+        }
     }
 
     /// Configure the VRP member (boot-only).
@@ -632,17 +732,11 @@ impl StrategySet {
         &mut self.vm
     }
 
-    /// Read the icdp member (counters, params hash).
+    /// Configure the xmm member (boot-only: `configure` with the
+    /// resolved artifact).
     #[inline]
-    pub fn icdp(&self) -> &IcdpStrategy {
-        &self.icdp
-    }
-
-    /// Configure the icdp member (boot-only: `configure` with the wall
-    /// anchor + the resolved artifact).
-    #[inline]
-    pub fn icdp_mut(&mut self) -> &mut IcdpStrategy {
-        &mut self.icdp
+    pub fn xmm_mut(&mut self) -> &mut XmmStrategy {
+        &mut self.xmm
     }
 
     /// Set-level `EnableStrategy` handling. See module docs.
@@ -659,7 +753,7 @@ impl StrategySet {
             SLOT_BIN15 => BIT_BIN15,
             SLOT_AI_EXEC => BIT_AI_EXEC,
             SLOT_VM => BIT_VM,
-            SLOT_ICDP => BIT_ICDP,
+            SLOT_XMM => BIT_XMM,
             // Reserved slot (7): no member behind it — refuse and
             // count.
             _ => {
@@ -700,7 +794,7 @@ impl StrategyCounters for StrategySet {
             + self.bin15.orders_emitted()
             + self.ai_exec.orders_emitted()
             + self.vm.orders_emitted()
-            + self.icdp.orders_emitted()
+            + self.xmm.orders_emitted()
     }
     #[inline]
     fn orders_dropped(&self) -> u64 {
@@ -710,7 +804,7 @@ impl StrategyCounters for StrategySet {
             + self.bin15.orders_dropped()
             + self.ai_exec.orders_dropped()
             + self.vm.orders_dropped()
-            + self.icdp.orders_dropped()
+            + self.xmm.orders_dropped()
     }
     #[inline]
     fn strategy_kind(&self) -> &'static str {
@@ -766,10 +860,6 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vm_regime_hard_exits(&self) -> u64 {
         self.vm.regime_hard_exits
-    }
-    #[inline]
-    fn icdp_counters(&self) -> strategy_core::IcdpCounters {
-        self.icdp.icdp_counters()
     }
     /// VRP V7: slot 1's observables.
     #[inline]
@@ -898,7 +988,7 @@ impl StrategyCounters for StrategySet {
             SLOT_BIN15 => (self.bin15.orders_emitted(), self.bin15.orders_dropped()),
             SLOT_AI_EXEC => (self.ai_exec.orders_emitted(), self.ai_exec.orders_dropped()),
             SLOT_VM => (self.vm.orders_emitted(), self.vm.orders_dropped()),
-            SLOT_ICDP => (self.icdp.orders_emitted(), self.icdp.orders_dropped()),
+            SLOT_XMM => (self.xmm.orders_emitted(), self.xmm.orders_dropped()),
             _ => return SlotCounters::default(),
         };
         let label = self.regime_labels[slot as usize];
@@ -915,18 +1005,6 @@ impl StrategyCounters for StrategySet {
     #[inline]
     fn vm_rows_view(&self, out: &mut [VmRowView]) -> u32 {
         self.vm.rows_view(out)
-    }
-    #[inline]
-    fn icdp_params_hash(&self) -> [u8; 32] {
-        if self.icdp.is_configured() {
-            *self.icdp.params_hash()
-        } else {
-            [0; 32]
-        }
-    }
-    #[inline]
-    fn icdp_instruments(&self) -> u32 {
-        self.icdp.instruments() as u32
     }
     /// The detector's per-symbol REL state (its view minus the words).
     fn regime_rel_view(&self) -> RegimeRelView {
@@ -1015,9 +1093,9 @@ impl Strategy for StrategySet {
         if self.initial & BIT_VM != 0 {
             self.vm.on_start(&mut StampCtx::new(&mut *ctx, SLOT_VM))?;
         }
-        if self.initial & BIT_ICDP != 0 {
-            self.icdp
-                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_ICDP))?;
+        if self.initial & BIT_XMM != 0 {
+            self.xmm
+                .on_start(&mut StampCtx::new(&mut *ctx, SLOT_XMM))?;
         }
         Ok(())
     }
@@ -1051,9 +1129,9 @@ impl Strategy for StrategySet {
             self.vm
                 .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_tick(tick, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
@@ -1083,9 +1161,9 @@ impl Strategy for StrategySet {
             self.vm
                 .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_signal(signal, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
@@ -1128,9 +1206,9 @@ impl Strategy for StrategySet {
             self.vm
                 .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_venue_event(event, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
@@ -1162,9 +1240,9 @@ impl Strategy for StrategySet {
             self.vm
                 .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_depth(depth, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
@@ -1196,10 +1274,62 @@ impl Strategy for StrategySet {
             self.vm
                 .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_opt_summary(opt, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
+    }
+
+    /// XMM XH1: trade prints fan out to enabled members exactly like
+    /// ticks — same mask gate, same slot stamping. Every member but
+    /// xmm inherits the default no-op.
+    #[inline(always)]
+    fn on_trade<C: Ctx>(&mut self, trade: &TradePrint, ctx: &mut C) {
+        if self.enabled & BIT_HYPARB != 0 {
+            self.hyparb
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
+        }
+        if self.enabled & BIT_VRP != 0 {
+            self.vrp
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
+        }
+        if self.enabled & BIT_XSD != 0 {
+            self.xsd
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
+        }
+        if self.enabled & BIT_BIN15 != 0 {
+            self.bin15
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
+        }
+        if self.enabled & BIT_AI_EXEC != 0 {
+            self.ai_exec
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
+        }
+        if self.enabled & BIT_VM != 0 {
+            self.vm
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_VM));
+        }
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_trade(trade, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
+        }
+    }
+
+    /// XMM XH1: an order event goes to the slot that placed the order
+    /// ALONE — the X1 fill law, and stricter: an event is never fanned
+    /// out, because an event about slot 3's order handed to slot 6 would
+    /// move slot 6's order state machine for an order it never sent. An
+    /// event for a disabled, unbuilt or unattributed
+    /// (`STRATEGY_ID_NONE`) slot is counted (`order_events_unrouted`),
+    /// never delivered.
+    #[inline(always)]
+    fn on_order_event<C: Ctx>(&mut self, event: &OrderEvent, ctx: &mut C) {
+        let slot = event.strategy_id;
+        if slot >= 8 || self.enabled & (1u8 << slot) == 0 {
+            self.order_events_unrouted = self.order_events_unrouted.wrapping_add(1);
+            return;
+        }
+        self.route_order_event_to_slot(slot, event, ctx);
     }
 
     /// X1: an ATTRIBUTED fill goes to its slot ALONE.
@@ -1253,9 +1383,9 @@ impl Strategy for StrategySet {
             self.vm
                 .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_fill(fill, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
@@ -1328,9 +1458,9 @@ impl Strategy for StrategySet {
         if self.enabled & BIT_VM != 0 {
             self.vm.on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0 {
+            self.xmm
+                .on_ai(cmd, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
@@ -1348,52 +1478,113 @@ impl Strategy for StrategySet {
         self.vm.receive_table_v2(table);
     }
 
+    /// XMM XH1: each timer client runs on ITS OWN period (module docs,
+    /// "Timers are per slot"): the regime detector every
+    /// [`REGIME_TIMER_NS`] once configured, and each enabled member when
+    /// its own `timer_period_ns` has elapsed since its own last call.
+    ///
+    /// Before XH1 every enabled member ran on every call, at the set's
+    /// minimum period. The members that existed then all run a 1 s
+    /// period or an empty `on_timer` (hyparb, xsd and bin15 when
+    /// configured; vrp, ai-exec and vm never), and without xmm the set's
+    /// own period is that same 1 s — so a member's clock equals the
+    /// engine's and each fires exactly when it did. A `u64::MAX` member
+    /// is no longer called at all, which its empty body cannot notice.
     #[inline(always)]
     fn on_timer<C: Ctx>(&mut self, now_ns: NsTs, ctx: &mut C) {
         // RG2: roll the minute clock (nothing until a boundary) and
         // re-judge the gates only when an effective word changed.
         // RG3: a roll that changed no word may still have moved a
         // member's REL — the vm's `rel:` rows get the view anyway.
-        let minutes_before = self.regime.minutes_judged();
-        if self.regime.on_timer(now_ns) != 0 {
-            self.refresh_gates(ctx);
-        } else if self.regime.minutes_judged() != minutes_before {
-            self.push_regime_views();
+        // An unconfigured detector's timer is a no-op, so it arms none.
+        let regime_period = if self.regime.is_configured() {
+            REGIME_TIMER_NS
+        } else {
+            u64::MAX
+        };
+        if Self::timer_due(&mut self.regime_timer_last_ns, regime_period, now_ns) {
+            let minutes_before = self.regime.minutes_judged();
+            if self.regime.on_timer(now_ns) != 0 {
+                self.refresh_gates(ctx);
+            } else if self.regime.minutes_judged() != minutes_before {
+                self.push_regime_views();
+            }
         }
-        if self.enabled & BIT_HYPARB != 0 {
+        if self.enabled & BIT_HYPARB != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_HYPARB as usize],
+                self.hyparb.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.hyparb
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_HYPARB));
         }
-        if self.enabled & BIT_VRP != 0 {
+        if self.enabled & BIT_VRP != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_VRP as usize],
+                self.vrp.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.vrp
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VRP));
         }
-        if self.enabled & BIT_XSD != 0 {
+        if self.enabled & BIT_XSD != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_XSD as usize],
+                self.xsd.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.xsd
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XSD));
         }
-        if self.enabled & BIT_BIN15 != 0 {
+        if self.enabled & BIT_BIN15 != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_BIN15 as usize],
+                self.bin15.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.bin15
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_BIN15));
         }
-        if self.enabled & BIT_AI_EXEC != 0 {
+        if self.enabled & BIT_AI_EXEC != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_AI_EXEC as usize],
+                self.ai_exec.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.ai_exec
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         }
-        if self.enabled & BIT_VM != 0 {
+        if self.enabled & BIT_VM != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_VM as usize],
+                self.vm.timer_period_ns(),
+                now_ns,
+            )
+        {
             self.vm
                 .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_VM));
         }
-        if self.enabled & BIT_ICDP != 0 {
-            self.icdp
-                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        if self.enabled & BIT_XMM != 0
+            && Self::timer_due(
+                &mut self.timer_last_ns[SLOT_XMM as usize],
+                self.xmm.timer_period_ns(),
+                now_ns,
+            )
+        {
+            self.xmm
+                .on_timer(now_ns, &mut StampCtx::new(&mut *ctx, SLOT_XMM));
         }
     }
 
     /// Minimum over the BUILT members (mask-independent so the
     /// engine's timer arming is stable across runtime Enable/Disable;
-    /// `on_timer` itself fans out to enabled members only). All seven
-    /// members currently return `u64::MAX` (disabled); a configured
+    /// `on_timer` gates each member on its own period). A configured
     /// regime detector arms the 1 s [`REGIME_TIMER_NS`] poll.
     fn timer_period_ns(&self) -> u64 {
         let mut min = if self.regime.is_configured() {
@@ -1425,7 +1616,7 @@ impl Strategy for StrategySet {
         if v < min {
             min = v;
         }
-        let v = self.icdp.timer_period_ns();
+        let v = self.xmm.timer_period_ns();
         if v < min {
             min = v;
         }
@@ -1445,7 +1636,7 @@ impl Strategy for StrategySet {
         self.ai_exec
             .on_stop(&mut StampCtx::new(&mut *ctx, SLOT_AI_EXEC));
         self.vm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_VM));
-        self.icdp.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_ICDP));
+        self.xmm.on_stop(&mut StampCtx::new(&mut *ctx, SLOT_XMM));
     }
 }
 
@@ -1608,7 +1799,14 @@ mod tests {
         assert_eq!(mask_for_name("ai+vrp+xsd"), Some(54));
         assert_eq!(mask_for_name("ai"), Some(48));
         assert_eq!(mask_for_name("ai+vrp"), Some(50));
-        assert_eq!(mask_for_name("ai+icdp"), Some(112));
+        // XMM XH1 (O-XH1): slot 6 is the xmm member; `icdp` and
+        // `ai+icdp` are gone as NAMES and refuse the boot.
+        assert_eq!(mask_for_name("icdp"), None);
+        assert_eq!(mask_for_name("ai+icdp"), None);
+        assert_eq!(mask_for_name("xmm"), Some(BIT_XMM));
+        assert_eq!(mask_for_name("xmm"), Some(64), "slot 6's bit is wire-stable across the swap");
+        assert_eq!(mask_for_name("ai+xmm"), Some(112));
+        assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb+xmm"), Some(127));
         assert_eq!(mask_for_name("bin15"), Some(BIT_BIN15));
         assert_eq!(mask_for_name("rule-tree"), None, "the old name is GONE");
         assert_eq!(
@@ -1643,8 +1841,8 @@ mod tests {
         assert_eq!(s.enabled_mask(), 0, "reserved bit 7 cleared");
         let s = StrategySet::new(BIT_XSD);
         assert_eq!(s.enabled_mask(), BIT_XSD, "slot 2 is built now (XSD-3)");
-        let s = StrategySet::new(BIT_ICDP);
-        assert_eq!(s.enabled_mask(), BIT_ICDP, "slot 6 is built now (ICDP I4)");
+        let s = StrategySet::new(BIT_XMM);
+        assert_eq!(s.enabled_mask(), BIT_XMM, "slot 6 is built (xmm since XMM XH1)");
         let s = StrategySet::new(BIT_AI_EXEC);
         assert_eq!(s.enabled_mask(), BIT_AI_EXEC, "slot 4 is built now");
         let s = StrategySet::new(BIT_VM);
@@ -1870,7 +2068,7 @@ mod tests {
     }
 
     /// Migrated from slot 5 in 8g item 6 (§8) and from slot 6 in ICDP
-    /// I4: the only reserved slot is 7 (probed twice: reserved + an
+    /// I4 (slot 6 is xmm since XMM XH1): the only reserved slot is 7 (probed twice: reserved + an
     /// out-of-range id).
     #[test]
     fn enable_reserved_or_unknown_slot_refused() {
@@ -1882,13 +2080,13 @@ mod tests {
         assert_eq!(s.enabled_mask(), 0);
         assert_eq!(s.enable_refused_total(), 2);
         assert!(!s.is_halted(), "reserved-slot refusal is not a halt");
-        // Slot 6 enables (an unconfigured icdp member is inert: it
-        // registers nothing and never fires); slot 2 likewise (XSD-3: an
+        // Slot 6 enables (an unconfigured xmm member is inert: it never
+        // fires and arms no timer — XMM XH1); slot 2 likewise (XSD-3: an
         // unconfigured xsd member maps no sym and arms no timer).
-        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_ICDP), &mut c);
-        assert_eq!(s.enabled_mask(), BIT_ICDP);
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XMM), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_XMM);
         s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_XSD), &mut c);
-        assert_eq!(s.enabled_mask(), BIT_ICDP | BIT_XSD);
+        assert_eq!(s.enabled_mask(), BIT_XMM | BIT_XSD);
         assert_eq!(s.enable_refused_total(), 2);
         assert_eq!(s.timer_period_ns(), s_timer_without_xsd(), "an unconfigured xsd arms no timer");
     }
@@ -2682,6 +2880,186 @@ mod tests {
             let (name, mask) = MASK_TABLE[i];
             assert_eq!(mask & !BUILT_MASK, 0, "{name} composes an unbuilt slot");
             i += 1;
+        }
+    }
+
+    // ---- XMM XH1 ----------------------------------------------------
+
+    const XMM_HL: SymbolId = make_symbol_id(VenueId::Hyperliquid, 2);
+
+    /// A valid probe-shaped artifact: one perp and its leader.
+    fn xmm_params() -> strategy_xmm::XmmParams {
+        let mut p = strategy_xmm::XmmParams::EMPTY;
+        p.perps[0] = strategy_xmm::XmmPerp {
+            hl_sym: XMM_HL,
+            lead_sym: make_symbol_id(VenueId::Binance, 5),
+        };
+        p.n_perps = 1;
+        p.maker_enabled = 1;
+        p.theta_bps_1e6 = 500_000;
+        p.gate_window_ms = 500;
+        p.lifetime_ms = 30_000;
+        p.lead_stale_ms = 300;
+        p.follower_stale_ms = 2_000;
+        p.rtt_pull_ms = 1_500;
+        p.requote_min_ms = 250;
+        p.clip_usd_1e6 = 15_000_000;
+        p.inv_cap_usd_1e6 = 150_000_000;
+        p.gross_inv_cap_usd_1e6 = 400_000_000;
+        p.resting_cap_usd_1e6 = 300_000_000;
+        p
+    }
+
+    fn print(tid: u64) -> TradePrint {
+        TradePrint::new(
+            1,
+            VenueId::Hyperliquid,
+            XMM_HL,
+            tid,
+            0,
+            186_000_000,
+            2_000_000,
+            core_types::TRADE_AGGRESSOR_SELL,
+        )
+    }
+
+    /// Slot 6 is a REAL member: unconfigured it refuses the boot (the
+    /// cli never puts it in the configured mask without its artifact);
+    /// configured it starts and, at XH1, stays dark — no order, no timer.
+    #[test]
+    fn xmm_slot_refuses_unconfigured_and_is_dark_configured() {
+        let mut s = StrategySet::new(BIT_XMM);
+        assert!(matches!(
+            s.on_start(&mut ctx()),
+            Err(StrategyError::Config(_))
+        ));
+        let mut s = StrategySet::new(BIT_XMM);
+        s.xmm_mut().configure(&xmm_params()).expect("xmm params");
+        let mut c = ctx();
+        assert!(s.on_start(&mut c).is_ok());
+        s.on_tick(&tick(VenueId::Hyperliquid, XMM_HL, 185_990_000, 186_000_000), &mut c);
+        s.on_trade(&print(1), &mut c);
+        s.on_timer(c.now, &mut c);
+        assert_eq!(c.submitted, 0);
+        assert_eq!(s.orders_emitted(), 0);
+        assert_eq!(s.timer_period_ns(), s_timer_without_xsd(), "xmm arms no timer at XH1");
+    }
+
+    /// A print reaches every enabled member and changes nothing for the
+    /// members that existed before XH1: the probe emits exactly its one
+    /// order with or without the tape.
+    #[test]
+    fn a_trade_print_changes_no_existing_member() {
+        let mut quiet = StrategySet::new(PROBE_BIT);
+        let mut cq = ctx();
+        quiet.on_start(&mut cq).unwrap();
+        feed_probe(&mut quiet, &mut cq);
+
+        let mut taped = StrategySet::new(PROBE_BIT);
+        let mut ct = ctx();
+        taped.on_start(&mut ct).unwrap();
+        taped.on_trade(&print(1), &mut ct);
+        feed_probe(&mut taped, &mut ct);
+        taped.on_trade(&print(2), &mut ct);
+
+        assert_eq!((cq.submitted, ct.submitted), (1, 1));
+        assert_eq!(quiet.orders_emitted(), taped.orders_emitted());
+        assert_eq!(taped.enabled_mask(), PROBE_BIT);
+    }
+
+    /// An order event reaches its own enabled slot alone; an event for
+    /// a disabled slot, for slot 7, or unattributed is counted and never
+    /// delivered — never fanned out.
+    #[test]
+    fn an_order_event_reaches_only_its_own_slot_or_is_counted() {
+        let mut s = StrategySet::new(PROBE_BIT);
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        let ev = |slot: u8| {
+            OrderEvent::new(
+                1,
+                VenueId::Hyperliquid,
+                XMM_HL,
+                5,
+                slot,
+                core_types::ORDER_EVENT_CANCELED,
+                core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED,
+                0,
+            )
+        };
+        s.on_order_event(&ev(PROBE_SLOT), &mut c);
+        assert_eq!(s.order_events_unrouted(), 0, "an enabled slot's event is delivered");
+        s.on_order_event(&ev(SLOT_VRP), &mut c);
+        assert_eq!(s.order_events_unrouted(), 1, "a disabled slot's event is counted");
+        s.on_order_event(&ev(7), &mut c);
+        assert_eq!(s.order_events_unrouted(), 2, "slot 7 is not built");
+        s.on_order_event(&ev(core_types::STRATEGY_ID_NONE), &mut c);
+        assert_eq!(s.order_events_unrouted(), 3, "an unattributed event is never fanned out");
+        assert_eq!(c.submitted, 0);
+    }
+
+    /// The per-slot gate: fires at its period and not before, advances
+    /// only when it fires, never fires for `u64::MAX`, and never for a
+    /// clock that went backwards.
+    #[test]
+    fn timer_due_fires_on_its_own_period_only() {
+        let mut last: NsTs = 0;
+        assert!(StrategySet::timer_due(&mut last, 1_000, 1_000));
+        assert_eq!(last, 1_000);
+        assert!(!StrategySet::timer_due(&mut last, 1_000, 1_999));
+        assert_eq!(last, 1_000, "a miss leaves the clock");
+        assert!(StrategySet::timer_due(&mut last, 1_000, 2_000));
+        assert_eq!(last, 2_000);
+        let mut never: NsTs = 0;
+        assert!(!StrategySet::timer_due(&mut never, u64::MAX, u64::MAX));
+        assert_eq!(never, 0);
+        let mut ahead: NsTs = 5_000;
+        assert!(!StrategySet::timer_due(&mut ahead, 1_000, 4_000));
+        assert_eq!(ahead, 5_000);
+    }
+
+    /// Through the set, each member runs on its own period whatever the
+    /// call cadence: a 1 s member called every 250 ms runs once a second,
+    /// and a member with no timer never runs. At the pre-XH1 cadence
+    /// (calls ≥ 1 s apart) the 1 s member runs on EVERY call — exactly
+    /// what it did before per-slot gating.
+    #[test]
+    fn per_slot_timers_run_each_member_on_its_own_period() {
+        const S: u64 = 1_000_000_000;
+        let mut s = hyparb_set();
+        let mut c = ctx();
+        s.on_start(&mut c).unwrap();
+        s.on_ai(&ai_cmd(AiCmdKind::EnableStrategy, SLOT_AI_EXEC), &mut c);
+        assert_eq!(s.enabled_mask(), BIT_HYPARB | BIT_AI_EXEC);
+        let mut runs = [0u64; 3];
+        let mut n = 0usize;
+        let mut t = S;
+        while t <= 3 * S {
+            let before = s.timer_last_ns[SLOT_HYPARB as usize];
+            s.on_timer(t, &mut c);
+            if s.timer_last_ns[SLOT_HYPARB as usize] != before {
+                runs[n] = t;
+                n += 1;
+            }
+            t += S / 4;
+        }
+        assert_eq!((n, runs), (3, [S, 2 * S, 3 * S]), "once a second, not four times");
+        assert_eq!(
+            s.timer_last_ns[SLOT_AI_EXEC as usize], 0,
+            "a member with no timer is never run"
+        );
+
+        let mut s = hyparb_set();
+        s.on_start(&mut c).unwrap();
+        let mut k = 1u64;
+        while k <= 4 {
+            s.on_timer(k * (S + 1), &mut c);
+            assert_eq!(
+                s.timer_last_ns[SLOT_HYPARB as usize],
+                k * (S + 1),
+                "the pre-XH1 cadence runs the 1 s member on every call"
+            );
+            k += 1;
         }
     }
 }

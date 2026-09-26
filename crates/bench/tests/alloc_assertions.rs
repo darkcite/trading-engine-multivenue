@@ -1440,6 +1440,12 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     // path is gate 35's seam).
     let (_tblp, tbl_c) =
         Ring::<core_types::RuleTableSlot, { core_types::RULE_TABLE_RING_SLOTS }>::new().split();
+    // XMM XH1: the trade and order-event lanes, both live — one print
+    // and one order event per iteration ride the same 0 B/op assertion.
+    let (mut tr_p, tr_c) =
+        Ring::<core_types::TradePrint, { core_types::TRADE_RING_SIZE }>::new().split();
+    let (mut oe_p, oe_c) =
+        Ring::<core_types::OrderEvent, { core_types::ORDER_EVENT_RING_SIZE }>::new().split();
 
     let mut eng = Engine::new(
         NoopStrat,
@@ -1454,6 +1460,8 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         std::sync::Arc::new(AiIngressStatus::new()),
         tbl_c,
     );
+    eng.set_trade_lane(tr_c);
+    eng.set_order_event_lane(oe_c);
     eng.start().unwrap();
 
     // Prime + drain a few ticks outside the measurement window.
@@ -1498,12 +1506,34 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
             0,
         )));
         assert!(d0_p.try_push_ref(&core_types::DepthTopK::EMPTY));
+        assert!(tr_p.try_push_ref(&core_types::TradePrint::new(
+            (i as u64) * 1000,
+            VenueId::Hyperliquid,
+            1,
+            u64::from(i),
+            0,
+            100_000_000,
+            1_000_000,
+            core_types::TRADE_AGGRESSOR_SELL,
+        )));
+        assert!(oe_p.try_push_ref(&core_types::OrderEvent::new(
+            (i as u64) * 1000,
+            VenueId::Hyperliquid,
+            1,
+            u64::from(i),
+            6,
+            core_types::ORDER_EVENT_RESTING,
+            core_types::ORDER_EVENT_REASON_NONE,
+            0,
+        )));
         eng.tick(1);
         acc = acc.wrapping_add(eng.ingest_p50_ns());
     }
     std::hint::black_box(acc);
     assert_eq!(eng.events_dispatched, 10_000, "event lane drained");
     assert_eq!(eng.depths_dispatched, 10_000, "depth lane drained");
+    assert_eq!(eng.trades_dispatched, 10_000, "trade lane drained");
+    assert_eq!(eng.order_events_dispatched, 10_000, "order-event lane drained");
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert_eq!(
@@ -2554,6 +2584,11 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // trip inside the measurement window.
     let mut driver = hwl::Driver::new(0x0D0Du64, coins, u64::MAX / 4, u64::MAX / 4);
     hwl::note_transport_ready(&mut driver, core_net::Status::Ready);
+    // XMM XH1: the trade lane, attached — every `trades` row in the
+    // measured window is captured AND pushed as a print.
+    let (trade_tx, mut trade_rx) =
+        Ring::<core_types::TradePrint, { core_types::TRADE_RING_SIZE }>::new().split();
+    driver.set_trade_lane(trade_tx);
     // Health telemetry sink — relaxed atomics only; built outside
     // the measurement window.
     // VM2 V2: hoisted throwaway HL event lane (same rationale).
@@ -2641,7 +2676,12 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // before the guard.
     const CYCLES: usize = 199; // 9 acks + 5 × 199 = 1 004 frames
     const BBO_BTC: &[u8] = br#"{"channel":"bbo","data":{"coin":"BTC","time":1708622398623,"bbo":[{"px":"64437.0","sz":"1.4491","n":2},{"px":"64438.0","sz":"0.541","n":3}]}}"#;
-    const L2_BTC: &[u8] = br#"{"channel":"l2Book","data":{"coin":"BTC","time":1677700000000,"levels":[[{"px":"19900.0","sz":"1.0","n":1},{"px":"19899.0","sz":"2.5","n":2}],[{"px":"20100.0","sz":"1.0","n":1}]]}}"#;
+    // XMM XH1: two DEEP perp books (7 levels a side, past `DEPTH_K`),
+    // alternated so every cycle's perp `l2Book` is a CHANGED top-K: the
+    // perp depth path — walk, skip past K, change gate, capture — runs
+    // its commit branch inside the measured window, every cycle.
+    const L2_BTC_A: &[u8] = br#"{"channel":"l2Book","data":{"coin":"BTC","time":1677700000000,"levels":[[{"px":"64437.0","sz":"1.0","n":1},{"px":"64436.0","sz":"2.0","n":2},{"px":"64435.0","sz":"3.0","n":3},{"px":"64434.0","sz":"4.0","n":4},{"px":"64433.0","sz":"5.0","n":5},{"px":"64432.0","sz":"6.0","n":6},{"px":"64431.0","sz":"7.0","n":7}],[{"px":"64438.0","sz":"1.5","n":1},{"px":"64439.0","sz":"2.5","n":2},{"px":"64440.0","sz":"3.5","n":3},{"px":"64441.0","sz":"4.5","n":4},{"px":"64442.0","sz":"5.5","n":5},{"px":"64443.0","sz":"6.5","n":6},{"px":"64444.0","sz":"7.5","n":7}]]}}"#;
+    const L2_BTC_B: &[u8] = br#"{"channel":"l2Book","data":{"coin":"BTC","time":1677700000001,"levels":[[{"px":"64437.0","sz":"1.5","n":1},{"px":"64436.0","sz":"2.5","n":2},{"px":"64435.0","sz":"3.5","n":3},{"px":"64434.0","sz":"4.5","n":4},{"px":"64433.0","sz":"5.5","n":5},{"px":"64432.0","sz":"6.5","n":6},{"px":"64431.0","sz":"7.5","n":7}],[{"px":"64438.0","sz":"1.5","n":1},{"px":"64439.0","sz":"2.5","n":2},{"px":"64440.0","sz":"3.5","n":3},{"px":"64441.0","sz":"4.5","n":4},{"px":"64442.0","sz":"5.5","n":5},{"px":"64443.0","sz":"6.5","n":6},{"px":"64444.0","sz":"7.5","n":7}]]}}"#;
     const TRADES_BTC: &[u8] = br#"{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"1.0","sz":"1.0","hash":"0x1","time":1000,"tid":1},{"coin":"BTC","side":"A","px":"1.1","sz":"2.0","hash":"0x2","time":1001,"tid":2}]}"#;
     const BBO_HIP4: &[u8] = br##"{"channel":"bbo","data":{"coin":"#330","time":1723600000001,"bbo":[{"px":"0.4","sz":"100.0","n":1},{"px":"0.6","sz":"50.0","n":1}]}}"##;
     const L2_HIP4: &[u8] = br##"{"channel":"l2Book","data":{"coin":"#330","time":1723600000002,"levels":[[{"px":"0.4","sz":"100.0","n":1}],[{"px":"0.6","sz":"50.0","n":1}]]}}"##;
@@ -2674,9 +2714,9 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     for ack in ACKS {
         push_text_frame(&mut stream, ack);
     }
-    for _ in 0..CYCLES {
+    for c in 0..CYCLES {
         push_text_frame(&mut stream, BBO_BTC);
-        push_text_frame(&mut stream, L2_BTC);
+        push_text_frame(&mut stream, if c % 2 == 0 { L2_BTC_A } else { L2_BTC_B });
         push_text_frame(&mut stream, TRADES_BTC);
         push_text_frame(&mut stream, BBO_HIP4);
         push_text_frame(&mut stream, L2_HIP4);
@@ -2732,13 +2772,19 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     //
     // BIN15 O8: two bbo frames plus the HIP-4 coin's `l2Book`, which
     // now carries that leg's touch because the venue publishes its
-    // `bbo` one-sided. `L2_BTC` still yields no tick — a perp's touch
-    // comes from bbo alone, so no perp number moved.
+    // `bbo` one-sided. The BTC books still yield no tick — a perp's
+    // touch comes from bbo alone, so no perp number moved.
     let mut acc: i64 = 0;
     let mut popped: usize = 0;
     while let Some(t) = cons.try_pop_ref().as_deref().copied() {
         acc = acc.wrapping_add(t.bid_px.raw());
         popped += 1;
+    }
+    // XMM XH1: the prints, TWO per cycle (the two BTC `trades` rows).
+    let mut prints: usize = 0;
+    while let Some(p) = trade_rx.try_pop_ref().as_deref().copied() {
+        acc = acc.wrapping_add(p.qty_1e6);
+        prints += 1;
     }
     std::hint::black_box(acc);
 
@@ -2748,6 +2794,8 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     // `l2Book` touch (BIN15 O8), every ack verified, every frame
     // counted, no losses, no staleness trips.
     assert_eq!(popped, 3 * CYCLES);
+    assert_eq!(prints, 2 * CYCLES);
+    assert_eq!(status.trade_ring_drops_total(), 0);
     assert!(driver.is_verified());
     // 9 acks + per cycle: bbo(1) + l2Book(1) + trades rows(2) +
     // bbo(1) + l2Book(1) = 6. WS Pings are activity, not messages.
@@ -2765,6 +2813,9 @@ fn hl_run_loop_steady_state_is_zero_alloc() {
     assert_eq!(capture.io_errors(), 0);
     assert_eq!(capture.tap_dropped(), 0);
     assert!(capture.ticks_written() > 0);
+    // XMM XH1: one depth row per cycle for the alternating BTC books,
+    // plus the HIP-4 leg's first (and only changed) snapshot.
+    assert_eq!(capture.depths_written(), CYCLES as u64 + 1);
     drop(capture);
     let _ = std::fs::remove_dir_all(&cap_dir);
 }
@@ -3060,6 +3111,135 @@ fn strategy_set_fanout_is_zero_alloc() {
         bytes, 0,
         "strategy-set fan-out bytes should be zero: saw {bytes}"
     );
+}
+
+/// **XMM gate 73 (XH1)** — the set's new paths after boot: the trade
+/// fan-out, the order-event router (a slot-6 event routed, a slot-7 one
+/// counted unrouted) and the per-slot timer gate (hyparb's 1 s period
+/// firing on every other call, xmm's `u64::MAX` never) — allocate
+/// nothing.
+#[test]
+fn xmm_slot_trade_order_event_and_slot_timers_are_zero_alloc() {
+    use core_types::{Order, OrderEvent, TradePrint, SYMBOL_ID_NONE};
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+    use strategy_set::{StrategySet, BIT_HYPARB, BIT_XMM, SLOT_XMM};
+
+    struct CountCtx {
+        submitted: u64,
+        now: u64,
+    }
+    impl Ctx for CountCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            self.submitted += 1;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    // Boot (allocation allowed): hyparb as in the fan-out gate, so a
+    // member with a real (1 s) timer rides the set; xmm on one perp.
+    let mut set = StrategySet::new(BIT_HYPARB | BIT_XMM);
+    {
+        let mut hp = strategy_hyparb::HyparbParams::EMPTY;
+        hp.coins[0] = strategy_hyparb::CoinParams {
+            perp_sym: core_types::make_symbol_id(VenueId::Hyperliquid, 5),
+            spot_sym: SYMBOL_ID_NONE,
+            lot_1e6: 10_000,
+            min_notional_usd_1e6: 10_000_000,
+        };
+        hp.n_coins = 1;
+        hp.pools[0] = strategy_hyparb::PoolParams {
+            sym: core_types::make_symbol_id(VenueId::HyperEvm, 1),
+            coin0: 0,
+            coin1: strategy_hyparb::COIN_USD,
+            trade: false,
+            max_notional_usd_1e6: 1_000_000,
+        };
+        hp.n_pools = 1;
+        hp.lag_ns = 1;
+        hp.basis_window_ns = 1;
+        hp.max_order_usd_1e6 = 1;
+        hp.cap_day_usd_1e6 = 1;
+        hp.inventory_cap_usd_1e6 = 1;
+        set.hyparb_mut()
+            .configure(hp, core_time::WallAnchor::new(0, 0))
+            .expect("gate hyparb params");
+        let mut xp = strategy_xmm::XmmParams::EMPTY;
+        xp.perps[0] = strategy_xmm::XmmPerp {
+            hl_sym: core_types::make_symbol_id(VenueId::Hyperliquid, 5),
+            lead_sym: core_types::make_symbol_id(VenueId::Binance, 9),
+        };
+        xp.n_perps = 1;
+        xp.maker_enabled = 1;
+        xp.theta_bps_1e6 = 500_000;
+        xp.gate_window_ms = 500;
+        xp.lifetime_ms = 30_000;
+        xp.lead_stale_ms = 300;
+        xp.follower_stale_ms = 2_000;
+        xp.rtt_pull_ms = 1_500;
+        xp.requote_min_ms = 250;
+        xp.clip_usd_1e6 = 15_000_000;
+        xp.inv_cap_usd_1e6 = 150_000_000;
+        xp.gross_inv_cap_usd_1e6 = 400_000_000;
+        xp.resting_cap_usd_1e6 = 300_000_000;
+        set.xmm_mut().configure(&xp).expect("gate xmm params");
+    }
+    let t0: u64 = 100_000_000_000_000_000;
+    let mut ctx = CountCtx {
+        submitted: 0,
+        now: t0,
+    };
+    set.on_start(&mut ctx).unwrap();
+
+    let print = TradePrint::new(
+        t0,
+        VenueId::Hyperliquid,
+        core_types::make_symbol_id(VenueId::Hyperliquid, 5),
+        1,
+        0,
+        100_000_000_000,
+        1_000_000,
+        core_types::TRADE_AGGRESSOR_BUY,
+    );
+    let routed = OrderEvent::new(
+        t0,
+        VenueId::Hyperliquid,
+        core_types::make_symbol_id(VenueId::Hyperliquid, 5),
+        7,
+        SLOT_XMM,
+        core_types::ORDER_EVENT_CANCELED,
+        core_types::ORDER_EVENT_REASON_EXPIRED,
+        0,
+    );
+    let mut unrouted = routed;
+    unrouted.strategy_id = 7;
+
+    const CYCLES: u64 = 10_000;
+    // Half a second a cycle: hyparb's 1 s period is due every other call.
+    const STEP_NS: u64 = 500_000_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        ctx.now = t0 + (i + 1) * STEP_NS;
+        set.on_trade(&print, &mut ctx);
+        set.on_order_event(&routed, &mut ctx);
+        set.on_order_event(&unrouted, &mut ctx);
+        set.on_timer(ctx.now, &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.submitted);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(set.enabled_mask(), BIT_HYPARB | BIT_XMM);
+    assert_eq!(set.order_events_unrouted(), CYCLES, "slot 7 is nobody's");
+    assert_eq!(ctx.submitted, 0, "xmm is dark at XH1; hyparb observes only");
+    assert_eq!(
+        allocs, 0,
+        "xmm slot paths allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0, "xmm slot paths bytes should be zero: saw {bytes}");
 }
 
 /// Phase 8f item 6: the engine-thread fills capture
@@ -4115,7 +4295,8 @@ fn vm_feature_engine_paths_are_zero_alloc() {
     assert_eq!(bytes, 0, "feature-engine bytes should be zero: saw {bytes}");
 }
 
-/// ICDP I3 gate (40): the slot-6 strategy's whole tick path — foreign
+/// ICDP I3 gate (40): the icdp strategy's whole tick path (slot 6 until
+/// XMM XH1 unlinked it; the crate and its offline arm stay) — foreign
 /// syms, in-bar feature updates, stale ticks, the decision (features +
 /// composite + IoC entry), the bar roll (IoC exit), the 256-tick sweep
 /// — is 0 B/op after `configure`. Eight instruments (the D4 v1 count),

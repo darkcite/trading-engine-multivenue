@@ -57,6 +57,8 @@ pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;
 pub mod xsd_boot;
+/// XMM XH1: the slot-6 member's boot (`xmm.toml` → `XmmParams`).
+pub mod xmm_boot;
 
 pub use paper::{
     bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,

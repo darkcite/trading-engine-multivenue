@@ -125,7 +125,17 @@ a v2 root is an upper bound.** Metrics:
 Engine-side delay per venue: `docs/venue-latency.md` §5. Capture windows
 for research are ≤ 2 h by law (VT plan §6.1).
 
-**Slot 6 — `strategy-icdp` (ICDP I1–I7, 2026-09-03; paper only).** The
+**Slot 6 — `strategy-xmm` (XMM XH1, 2026-09-26; DARK).** The
+Binance-led post-only market maker on Hyperliquid perps (plan
+`xmm-hl-maker-plan-2026-09-26.md`, rulings O-XH1…O-XH15). Parameters come
+from `~/multivenue/xmm.toml` (`--xmm <path>`; `xmm.toml.example` is the
+probe); a requested xmm bit with no artifact refuses the boot. At XH1 the
+member is configured and places nothing; its engine lanes (trade prints,
+order events) and `backtest --member xmm` are in place.
+
+**`strategy-icdp` (ICDP I1–I7, 2026-09-03) — unlinked at XMM XH1.** Its
+crate, tests and `backtest --member icdp --icdp <path>` stay; no engine
+path composes it and `--strategy ai+icdp` refuses the boot. The
 intrabar candle-direction member: a UTC bar grid (`core_time::BarClock`),
 L1 features from every tick, an offline-fitted linear composite, IoC
 taker intents (`Order.kind = 1`, `ttl_ns` = the bar's remaining life) —

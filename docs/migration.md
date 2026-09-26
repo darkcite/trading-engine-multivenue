@@ -6,6 +6,102 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — Strategy slot 6 = `xmm`; `icdp` unlinked; the trade and order-event lanes; `Order.flags`; HL perp depth captured (XMM XH1)
+
+**What changed**
+
+- Slot 6 of `crates/strategy-set` is the `strategy-xmm` member
+  (`SLOT_XMM` / `BIT_XMM`, still bit 6 = 64). `strategy-icdp` is
+  UNLINKED, not deleted (ruling O-XH1): it stays in the workspace with its
+  own tests, its bench alloc gate and `backtest --member icdp --icdp …`,
+  but no engine path composes it. Slot 7 stays free.
+- Mask names: `xmm` (64), `ai+xmm` (112) and
+  `ai+vrp+xsd+bin15+hyparb+xmm` (127) are new; `icdp` and `ai+icdp` are
+  GONE — `--strategy icdp` refuses the boot ("unknown --strategy value").
+  `run --icdp` is gone; `run --xmm <path>` names the artifact (default
+  `~/multivenue/xmm.toml`). A requested xmm bit with no artifact REFUSES
+  the boot (the F19 law).
+- New artifact `~/multivenue/xmm.toml` (single `[xmm]` section, 22
+  integer keys, every one required; `xmm.toml.example` is the probe;
+  money-cap ceilings clip $10 000 · per perp $5 000 000 · gross
+  $20 000 000 · resting $1 000 000). The member is DARK at XH1:
+  configured, it places nothing.
+- `exec.toml`: a LIVE slot 6 refuses the boot until XH4 gives xmm its own
+  Hyperliquid arm (O-XH3/O-XH7) — it would otherwise share slot 3's.
+- **Per-slot timers.** `StrategySet::on_timer` runs each member only
+  when ITS OWN `timer_period_ns()` has elapsed since its own last call
+  (and the regime detector on its own 1 s); a fast member timer no
+  longer speeds up everyone's. Identical for every existing member: each
+  has a 1 s period or an empty `on_timer` (`u64::MAX`).
+- **Trade lane.** `ingress-hyperliquid` pushes every parsed print onto a
+  new engine lane (`TradePrint`, `Ring<_, 16384>`, drained after the
+  tick lanes → `Strategy::on_trade`, default no-op). The capture is
+  unchanged (`ChannelId::Trade` rows are written first); a full lane
+  drops the print and counts it.
+- **Order-event lane.** `OrderEvent` (`Ring<_, 1024>`, drained after the
+  fill lanes and the dispatcher's fill pump — E6: a fill waiting in the
+  same iteration is booked first → `Strategy::on_order_event`, default
+  no-op), routed to the
+  placing slot ALONE (the X1 fill law); an out-of-range or disabled slot
+  is counted in `StrategySet::order_events_unrouted`. No producer yet
+  (XH2's paper model, XH4's gateway).
+- **`Order.flags` @14** (was the first `_pad0` byte): bit 0 =
+  `ORDER_FLAG_REDUCE_ONLY`. Nothing sets it before XH4.
+- **Hyperliquid perp depth** is written to `hl-depth.pmlr` (top-5,
+  change-gated, the outcome legs' law) as research capture for the
+  queue-ahead study. `backtest` drops HL depth rows whose descriptor
+  classes as a perp, so no replay merges them.
+- `backtest --member xmm [--xmm <path>]`: the member on the frozen fill
+  law, with the HL trade prints merged ONLY for that member.
+- `regime.toml`: `[labels.icdp]` is refused at the grammar ("unknown
+  coded member"), exactly as `[labels.ev]` / `[labels.cross_arb]` /
+  `[labels.latency_arb]` are. Slot 6 takes no label yet: with
+  `[labels] require = 1` an enabled xmm REFUSES the boot (fail-closed)
+  until its gate is wired.
+- Slot-6 labels: `/state` `slots[6].name`, `audit-pnl`
+  `strategies[].label` for `strategy_id 6`, `exec_boot::SLOT_NAMES[6]`
+  and the dashboard read `xmm`. The `/state` `icdp` object stays on the
+  wire, reading zeros, until XH3 replaces it (the worker reads it).
+- Metric `engine_ingress_<venue>_trade_ring_drops_total` (one per
+  ingress; only Hyperliquid can move it).
+- `scripts/engine-wrapper.sh`: the allow-list drops `icdp` / `ai+icdp`
+  and gains the three xmm names; optional `XMM_TOML=<path>` in
+  `strategy.conf` passes `--xmm` (not a file, or no xmm in `STRATEGY`,
+  REFUSES — exit 78).
+
+**Why**
+
+- XMM-HL (plan v2, rulings O-XH1…O-XH15): the Binance-led post-only
+  maker takes slot 6. A label, mask or audit row evidenced for icdp must
+  never silently apply to a different member.
+
+**Impact**
+
+- On-disk formats: `Order` gains a flags byte in former padding
+  (wire-additive: every older Order reads as no flags). `hl-depth.pmlr`
+  gains perp rows (additive; older captures have none). The slot NUMBER
+  is wire-stable: rows under `strategy_id 6` in a capture taken BEFORE
+  2026-09-26 are icdp paper rows wearing the `xmm` label.
+- Replays: every existing member's merge is unchanged — trade prints
+  merge only for `--member xmm`, perp depth for nobody.
+- Config keys: `regime.toml [labels.icdp]` refuses the boot; an
+  `exec.toml` marking slot 6 live refuses the boot.
+
+**Migration steps**
+
+1. `~/multivenue/strategy.conf`: if `STRATEGY` names `icdp` or
+   `ai+icdp`, change it (e.g. to `ai`) BEFORE the restart onto this
+   build — the wrapper refuses those names (O-XH1: the operator removes
+   icdp). The live file checked 2026-09-26 names no icdp mask.
+2. A `regime.toml` carrying `[labels.icdp]` drops the section.
+3. Nothing enables xmm: it stays out of `strategy.conf` until XH3.
+
+**Rollback**
+
+- Revert the XH1 commit; no data or config migration to undo (an
+  `hl-depth.pmlr` with perp rows reads fine on the old build, whose
+  replay then merges them).
+
 ## 2026-09-24 — `scripts/bin15-flip.sh`: slot 3 PAPER ⇄ LIVE in one command (BIN15 S7-L1)
 
 **What changed**

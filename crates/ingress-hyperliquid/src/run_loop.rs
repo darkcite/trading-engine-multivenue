@@ -62,8 +62,8 @@ use core_ring::Producer;
 use core_time::{now_ns, FeedClock, WallAnchor};
 use core_types::{
     Capture, ChannelEvent, ChannelId, DepthLevel, DepthPair, DepthTopK, EVENT_RING_SIZE, Price, Qty,
-    Tick,
-    VenueId, DEPTH_K, TICK_FLAG_STALE,
+    Tick, TradePrint, VenueId, DEPTH_K, TICK_FLAG_STALE, TRADE_AGGRESSOR_BUY,
+    TRADE_AGGRESSOR_SELL, TRADE_RING_SIZE,
 };
 
 use crate::discovery::{parse_outcome_spec, HlOutcomeSpec};
@@ -262,8 +262,8 @@ pub struct Driver {
     /// five levels did not move (the venue re-sends the whole book on
     /// a 5.3 s timer; 59 % of pushes change nothing) writes nothing; a
     /// changed one becomes the last snapshot by a row flip, never a
-    /// 192 B copy. Boot-owned, one pair per [`HL_MAX_COINS`] slot; only
-    /// outcome coins ever touch theirs.
+    /// 192 B copy. Boot-owned, one pair per [`HL_MAX_COINS`] slot;
+    /// outcome and (XMM XH1) perp coins touch theirs, spot coins never.
     depth: Box<[DepthPair]>,
     /// Set once the post-upgrade subscribe frames have been queued.
     subscribed: bool,
@@ -277,6 +277,11 @@ pub struct Driver {
     /// [`HlStaleness`] monitor, which watches `l2Book` cadence per coin
     /// and kills the session — this one flags individual ticks.
     feed_clock: FeedClock,
+    /// XMM XH1: the engine's trade-print lane, attached by
+    /// [`Self::set_trade_lane`] (boot). `None` = prints are captured and
+    /// go nowhere else — every driver before XH1, and every test that
+    /// does not attach one.
+    trade_tx: Option<Producer<TradePrint, TRADE_RING_SIZE>>,
     /// `!Sync` marker — see struct doc.
     _not_sync: ::core::marker::PhantomData<::core::cell::UnsafeCell<()>>,
 }
@@ -322,8 +327,18 @@ impl Driver {
             subscribed: false,
             verified: false,
             feed_clock: FeedClock::new(VenueId::Hyperliquid.default_stale_after_ms()),
+            trade_tx: None,
             _not_sync: ::core::marker::PhantomData,
         }
+    }
+
+    /// XMM XH1: attach the engine's trade-print lane (boot-only). From
+    /// here every parsed `trades` row is pushed to the engine as well as
+    /// captured; a full ring drops the print and bumps
+    /// `IngressStatus::trade_ring_drops`. The driver outlives reconnects,
+    /// so the lane is attached once per process.
+    pub fn set_trade_lane(&mut self, tx: Producer<TradePrint, TRADE_RING_SIZE>) {
+        self.trade_tx = Some(tx);
     }
 
     /// BIN15 O2: attach the rolling families and their counter slot.
@@ -1133,7 +1148,19 @@ fn drain_ws_frames<C: Capture>(
 /// trade `tid`, `venue_time_ms` from the venue `time`, `v0` = px ×1e6,
 /// `v1` = sz ×1e6 (HL sz is base-coin units) negated for side `'A'`
 /// (ask/sell prints).
-fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeScan {
+///
+/// XMM XH1: with a trade lane attached, the same row is also pushed to
+/// the engine as a [`TradePrint`] (the capture row's lossless twin —
+/// `TradePrint::read_trade_event` rebuilds it offline). The capture
+/// comes first, as for ticks: a print the ring refuses is still on the
+/// tape, and counted in `trade_ring_drops`.
+fn scan_trades<C: Capture>(
+    payload: &[u8],
+    sym: u32,
+    capture: &mut C,
+    mut trade_tx: Option<&mut Producer<TradePrint, TRADE_RING_SIZE>>,
+    status: &IngressStatus,
+) -> TradeScan {
     const MARKER: &[u8] = b"\"coin\":\"";
     let mut scan = TradeScan {
         rows_parsed: 0,
@@ -1149,8 +1176,9 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
         if parse_trade(&payload[row_start..row_end], sym, &mut t) {
             scan.rows_parsed += 1;
             let signed_qty = if t.side == 1 { -t.qty_1e6 } else { t.qty_1e6 };
+            let now = now_ns();
             capture.event(&ChannelEvent::new(
-                now_ns(),
+                now,
                 VenueId::Hyperliquid,
                 ChannelId::Trade,
                 sym,
@@ -1159,6 +1187,26 @@ fn scan_trades<C: Capture>(payload: &[u8], sym: u32, capture: &mut C) -> TradeSc
                 t.px_1e6,
                 signed_qty,
             ));
+            if let Some(tx) = trade_tx.as_deref_mut() {
+                let aggressor = if t.side == 1 {
+                    TRADE_AGGRESSOR_SELL
+                } else {
+                    TRADE_AGGRESSOR_BUY
+                };
+                let print = TradePrint::new(
+                    now,
+                    VenueId::Hyperliquid,
+                    sym,
+                    t.tid,
+                    t.ts_ns / 1_000_000,
+                    t.px_1e6,
+                    t.qty_1e6,
+                    aggressor,
+                );
+                if !tx.try_push_ref(&print) {
+                    status.inc_trade_ring_drops();
+                }
+            }
         } else {
             scan.rows_rejected += 1;
             // Tap the exact rejected row slice — the §6.5 raw-tap
@@ -1416,17 +1464,23 @@ fn handle_data_frame<C: Capture>(
                                 }
                             },
                             HlChannel::L2Book => {
-                                let outcome = drv
+                                let (outcome, perp) = drv
                                     .coins
                                     .get(coin_idx)
-                                    .is_some_and(|(c, _)| is_outcome_coin(c));
+                                    .map_or((false, false), |(c, _)| {
+                                        // The perps are the coins that carry
+                                        // an `activeAssetCtx` (not `#`, not `@`).
+                                        (is_outcome_coin(c), coin_wants_asset_ctx(c))
+                                    });
                                 // WS10-B for outcome legs (2026-09-19): one
                                 // walk yields the header AND lifts the top-K
                                 // of both sides straight into the slot's
-                                // spare depth row; every other coin needs
-                                // only the header.
+                                // spare depth row. XMM XH1: perps too — their
+                                // top-K is the queue-ahead research tape
+                                // (plan §6); spot coins need only the header.
+                                let deep = outcome || perp;
                                 let mut f = crate::HlL2BookFrame::ZERO;
-                                let parsed = if outcome {
+                                let parsed = if deep {
                                     let spare = drv.depth[coin_idx].spare_mut();
                                     parse_l2book_depth(payload, sym, now_ns(), spare, &mut f)
                                 } else {
@@ -1455,7 +1509,7 @@ fn handle_data_frame<C: Capture>(
                                     // whole book every 5.3 s whether or
                                     // not it moved. A changed walk becomes
                                     // the last snapshot by the row flip.
-                                    if outcome {
+                                    if deep {
                                         let pair = &mut drv.depth[coin_idx];
                                         let (snap, last) = pair.spare_and_last();
                                         if snap.bids != last.bids || snap.asks != last.asks {
@@ -1499,7 +1553,13 @@ fn handle_data_frame<C: Capture>(
                                 }
                             },
                             HlChannel::Trades => Dispatch::Trades {
-                                scan: scan_trades(payload, sym, capture),
+                                scan: scan_trades(
+                                    payload,
+                                    sym,
+                                    capture,
+                                    drv.trade_tx.as_mut(),
+                                    status,
+                                ),
                             },
                             HlChannel::ActiveAssetCtx => {
                                 let mut f = crate::HlAssetCtxFrame::ZERO;
@@ -2410,12 +2470,13 @@ mod tests {
 
     /// WS10-B for outcome legs (2026-09-19): an outcome coin's `l2Book`
     /// push writes its top-K into the depth capture ONLY when the top-K
-    /// changed (the venue re-sends the book on a 5.3 s timer); a perp's
-    /// `l2Book` writes no depth (its ladder is not this crate's, and no
-    /// existing venue number moves); a malformed level row behind a
+    /// changed (the venue re-sends the book on a 5.3 s timer). XMM XH1:
+    /// a perp's `l2Book` now writes its top-K under the same change gate
+    /// (the queue-ahead research tape, plan §6) — per coin, so the perp
+    /// never disturbs the outcome slot; a malformed level row behind a
     /// valid header is counted and not half-captured.
     #[test]
-    fn hip4_l2book_depth_is_captured_on_change_only() {
+    fn l2book_depth_is_captured_on_change_only_for_outcomes_and_perps() {
         let mut t = TestTransport::with_capacity(16384);
         let mut d = steady_driver();
         let status = IngressStatus::new();
@@ -2452,18 +2513,82 @@ mod tests {
             DepthLevel { px_1e6: 480_000, qty_1e6: 10_000_000 }
         );
 
-        // A perp's l2Book: header event as before, no depth.
+        // XMM XH1: a perp's l2Book writes its top-K too — its first
+        // snapshot is a change from nothing — and no touch tick (a
+        // perp's touch rides `bbo`). The outcome books above each left a
+        // touch tick; drain them so the ring holds only what PERP adds.
+        while cons.try_pop_ref().is_some() {}
         inject_text(&mut t, PERP);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
-        assert_eq!(cap.depths, 2, "perps carry no depth from this crate");
+        assert_eq!(cap.depths, 3, "a perp's first snapshot is a change");
+        let snap = cap.last_depth.as_ref().expect("captured");
+        assert_eq!(snap.sym, SYM_BTC);
+        assert_eq!(snap.bids[0], DepthLevel { px_1e6: 1_000_000, qty_1e6: 1_000_000 });
+        assert_eq!(snap.asks[0], DepthLevel { px_1e6: 2_000_000, qty_1e6: 1_000_000 });
+        assert!(cons.try_pop_ref().is_none(), "a perp's l2Book is not a touch");
+        // The same perp book again: the gate holds for perps too.
+        inject_text(&mut t, PERP);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.depths, 3, "an unchanged perp top-K writes nothing");
 
         // Back to book A: a change again, and the gate is per coin —
         // the perp in between did not disturb the outcome slot.
         inject_text(&mut t, SNAP_A);
         drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
-        assert_eq!(cap.depths, 3);
+        assert_eq!(cap.depths, 4);
         assert_eq!(status.parse_errors_total(), 0);
         while cons.try_pop_ref().is_some() {}
+    }
+
+    /// XMM XH1: with a trade lane attached every parsed `trades` row is
+    /// pushed to the engine as the capture row's lossless twin (size
+    /// positive, direction in `aggressor`), AFTER the capture; a full
+    /// lane drops the print — still captured — and counts it. Without a
+    /// lane (every driver before XH1) nothing is pushed or counted.
+    #[test]
+    fn trades_reach_the_trade_lane_and_a_full_lane_counts_its_drops() {
+        let mut t = TestTransport::with_capacity(16384);
+        let mut d = steady_driver();
+        let status = IngressStatus::new();
+        let (mut prod, _cons) = ring_pair();
+        let mut cap = CountingCapture::default();
+        const TRADES: &[u8] = br#"{"channel":"trades","data":[{"coin":"BTC","side":"A","px":"64437.5","sz":"0.25","hash":"0x1","time":1789252941000,"tid":71},{"coin":"BTC","side":"B","px":"64438.0","sz":"1.5","hash":"0x2","time":1789252941001,"tid":72}]}"#;
+
+        // No lane: captured, nothing pushed, nothing counted.
+        inject_text(&mut t, TRADES);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.events, 2);
+        assert_eq!(status.trade_ring_drops_total(), 0);
+
+        let (tp, mut tc) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        d.set_trade_lane(tp);
+        inject_text(&mut t, TRADES);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(cap.events, 4, "captured exactly as before");
+        let a = *tc.try_pop_ref().expect("the sell print");
+        assert_eq!(
+            (a.sym, a.tid, a.px_1e6, a.qty_1e6, a.aggressor, a.venue_time_ms),
+            (SYM_BTC, 71, 64_437_500_000, 250_000, TRADE_AGGRESSOR_SELL, 1_789_252_941_000)
+        );
+        assert_eq!(a.venue, VenueId::Hyperliquid as u8);
+        let b = *tc.try_pop_ref().expect("the buy print");
+        assert_eq!((b.tid, b.qty_1e6, b.aggressor), (72, 1_500_000, TRADE_AGGRESSOR_BUY));
+        assert!(tc.try_pop_ref().is_none());
+
+        // A full lane: the prints are dropped, counted, still captured.
+        let (tp, _tc_full) = Ring::<TradePrint, TRADE_RING_SIZE>::new().split();
+        d.set_trade_lane(tp);
+        let filler = a;
+        let mut pushed = 0usize;
+        while d.trade_tx.as_mut().expect("attached").try_push_ref(&filler) {
+            pushed += 1;
+        }
+        assert_eq!(pushed, TRADE_RING_SIZE);
+        inject_text(&mut t, TRADES);
+        drive_one(&mut t, &mut d, b"h", b"/", &mut prod, &status, &mut cap).unwrap();
+        assert_eq!(status.trade_ring_drops_total(), 2);
+        assert_eq!(cap.events, 6, "a dropped print is still on the tape");
+        assert_eq!(status.ring_drops_total(), 0, "tick loss is a different number");
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub mod regime;
 pub mod universe;
 /// VRP V4: the VRP member's parameter artifact (`vrp.toml`) + seed rows.
 pub mod vrp;
+/// XMM XH1: the slot-6 member's parameter artifact (`xmm.toml`).
+pub mod xmm;
 pub mod xsd;
 
 // ---------------------------------------------------------------

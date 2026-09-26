@@ -62,8 +62,9 @@ use std::path::{Path, PathBuf};
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, DepthTopK, FeatId, Fill, InstrumentClass,
-    OptSummary, Order, Price, Qty, RegimeTerm, RuleTableV2, Signal, Tick, VenueId, AI_SIDE_NONE,
-    INSTRUMENT_CLASSES, REGIME_OFF_SOFT, STRATEGY_SLOT_VM, SYMBOL_ID_NONE, VENUE_COUNT,
+    OptSummary, Order, Price, Qty, RegimeTerm, RuleTableV2, Signal, Tick, TradePrint, VenueId,
+    AI_SIDE_NONE, INSTRUMENT_CLASSES, REGIME_OFF_SOFT, STRATEGY_SLOT_VM, SYMBOL_ID_NONE,
+    VENUE_COUNT,
 };
 use ingress_ai::{validate_ruleset, DescriptorTable, RulesetReject};
 use strategy_core::{Ctx, Strategy, SubmitErr};
@@ -796,6 +797,35 @@ pub enum RecPayload {
     /// HYPARB H6: a HyperEVM pool-event signal (`hyperevm-signals.pmlr`)
     /// — merged ONLY for `--member hyparb` (see [`POOL_SIGNAL_LORD`]).
     Signal(Signal),
+    /// XMM XH1: a Hyperliquid trade print, rebuilt from its captured
+    /// `Trade` row (`hl-events.pmlr`) — merged ONLY for `--member xmm`
+    /// (see [`MergeLanes`]).
+    Trade(TradePrint),
+}
+
+/// The lanes a replay merges beyond the ones every replay carries.
+///
+/// Each is loaded ONLY for the member that reads it: every other replay
+/// merges byte for byte as it always did, which is what keeps
+/// `merged_records`, the IS/OOS boundary and every pooled VM number
+/// where they were.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct MergeLanes {
+    /// HYPARB H6: the pool-event tape (`--member hyparb`).
+    pub(crate) pool_signals: bool,
+    /// XMM XH1: Hyperliquid trade prints (`--member xmm`) — the live
+    /// trade lane's content. They ride the events file's own lane
+    /// ordinal and index, so they keep their arrival order against the
+    /// ctx rows around them.
+    pub(crate) hl_trades: bool,
+}
+
+impl MergeLanes {
+    /// The lanes every replay carries, and nothing else (the VM path).
+    pub(crate) const NONE: Self = Self {
+        pool_signals: false,
+        hl_trades: false,
+    };
 }
 
 /// HYPARB H6: lane ordinal of the pool-event signals — after every
@@ -889,6 +919,8 @@ struct RunSummary {
     regime_cmds_dropped: u64,
     /// HYPARB H6: pool-event signals loaded (0 unless requested).
     pool_signals: u64,
+    /// XMM XH1: Hyperliquid trade prints loaded (0 unless requested).
+    hl_trades: u64,
     /// BIN15 S2: `(venue_time − ts, first sampled stamp)` over the run's
     /// first Hyperliquid stamps ([`clock::VenueOffsetFit::fit`]); `None`
     /// = the old anchor law.
@@ -923,7 +955,8 @@ fn load_run(
     opt_out: &mut opt::OptLoadOut,
     stale_after_ms: [u32; VENUE_COUNT],
     binary_underlyings: &BTreeSet<u32>,
-    pool_signals: bool,
+    sym_class: &BTreeMap<u32, InstrumentClass>,
+    lanes: MergeLanes,
 ) -> Result<(Vec<MergeKeyed>, RunSummary), HarnessError> {
     let mut recs: Vec<MergeKeyed> = Vec::new();
     let mut venue_records = [0u64; VENUE_LABELS.len()];
@@ -1054,7 +1087,7 @@ fn load_run(
     // universe's `[hyperevm]` ordinals — append-only, so identity across
     // runs (they carry no manifest row to remap through).
     let mut pool_signal_count = 0u64;
-    if pool_signals {
+    if lanes.pool_signals {
         let path = run.path.join(format!("{POOL_SIGNAL_LABEL}-signals.pmlr"));
         if path.is_file() {
             let reader = PmlrReader::<Signal>::open(&path).map_err(|e: io::Error| {
@@ -1082,6 +1115,7 @@ fn load_run(
             }
         }
     }
+    let mut hl_trades = 0u64;
     // VM2 V5: non-tick channels — absent files are normal (older
     // captures, unspawned lanes); headers cross-check like ticks.
     for (vi, label) in VENUE_LABELS.iter().enumerate() {
@@ -1119,10 +1153,16 @@ fn load_run(
                 // HIP-4 instrument has an empty set here and merges
                 // byte for byte as it always did.
                 let is_mark = e.channel == ChannelId::Mark as u8;
+                // XMM XH1: a Hyperliquid `Trade` row, ONLY when asked —
+                // rows every other replay skips, so its merge is unmoved.
+                let is_hl_trade = lanes.hl_trades
+                    && e.channel == ChannelId::Trade as u8
+                    && e.venue == VenueId::Hyperliquid as u8;
                 let keep = e.channel == ChannelId::Funding as u8
                     || e.channel == ChannelId::AssetCtx as u8
                     || e.channel == ChannelId::InstrumentRoll as u8
-                    || is_mark;
+                    || is_mark
+                    || is_hl_trade;
                 if !keep {
                     continue;
                 }
@@ -1136,6 +1176,22 @@ fn load_run(
                 // Post-remap, because the set is keyed on the newest
                 // manifest's ordinals like everything else downstream.
                 if is_mark && !binary_underlyings.contains(&ev.sym) {
+                    continue;
+                }
+                if is_hl_trade {
+                    // The lane's own reader judges the row: one it
+                    // refuses (no size, the MIN sentinel) is no print.
+                    let mut print = TradePrint::ZERO;
+                    if TradePrint::read_trade_event(&ev, &mut print) {
+                        recs.push(MergeKeyed {
+                            ts_ns: e.ts_ns,
+                            venue: e.venue,
+                            lord: 8 + vi as u8,
+                            idx: i as u64,
+                            payload: RecPayload::Trade(print),
+                        });
+                        hl_trades += 1;
+                    }
                     continue;
                 }
                 recs.push(MergeKeyed {
@@ -1167,6 +1223,16 @@ fn load_run(
                     Some(s) => s,
                     None => continue,
                 };
+                // XMM XH1: Hyperliquid PERP depth is research capture (the
+                // queue-ahead study) — no live lane carries it, so no
+                // replay merges it either, and a root captured after XH1
+                // replays exactly as one captured before. Post-remap: the
+                // class is keyed on the newest manifest's ordinals.
+                if d.venue == VenueId::Hyperliquid as u8
+                    && sym_class.get(&dp.sym) == Some(&InstrumentClass::Perp)
+                {
+                    continue;
+                }
                 recs.push(MergeKeyed {
                     ts_ns: d.ts_ns,
                     venue: d.venue,
@@ -1369,6 +1435,7 @@ fn load_run(
             regime_cmds,
             regime_cmds_dropped,
             pool_signals: pool_signal_count,
+            hl_trades,
             venue_fit: hl_clock_fit.fit(),
             wall_tell: clock::ClockTell::Silent,
         },
@@ -1387,7 +1454,7 @@ fn load_and_merge(
     opt_out: &mut opt::OptLoadOut,
     sym_class: &mut BTreeMap<u32, InstrumentClass>,
     binary_underlying: &mut BTreeMap<u32, u32>,
-    pool_signals: bool,
+    lanes: MergeLanes,
 ) -> Result<(Vec<MergedRec>, Vec<RunSummary>), HarnessError> {
     // VM2 V5 (§6 replay half): per-run sym remap through the
     // manifest join — each run's `<sym>\t<descriptor>` rows joined
@@ -1454,7 +1521,8 @@ fn load_and_merge(
             opt_out,
             stale_after_ms,
             &binary_underlyings,
-            pool_signals,
+            sym_class,
+            lanes,
         )?;
         summary.opt_registry_refused = registry_refused;
         if recs.is_empty() {
@@ -1488,6 +1556,7 @@ fn load_and_merge(
                 RecPayload::Opt(o) => o.ts_ns = virt_ns,
                 RecPayload::Regime(c) => c.ts_ns = virt_ns,
                 RecPayload::Signal(g) => g.ts_ns = virt_ns,
+                RecPayload::Trade(p) => p.ts_ns = virt_ns,
             }
             merged.push(MergedRec {
                 payload,
@@ -2071,7 +2140,7 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
         &mut opt_out,
         &mut sym_class,
         &mut binary_underlying,
-        false,
+        MergeLanes::NONE,
     )?;
     let universe = derive_universe(&merged);
 
@@ -2378,9 +2447,9 @@ pub fn run(cfg: &BacktestConfig) -> Result<BacktestOutput, HarnessError> {
                 }
                 fills_scratch.clear();
             }
-            // The VM path never loads the pool lane (`load_and_merge`'s
-            // `pool_signals` is false here).
-            RecPayload::Signal(_) => fills_scratch.clear(),
+            // The VM path never loads the member-only lanes
+            // (`load_and_merge` runs with `MergeLanes::NONE` here).
+            RecPayload::Signal(_) | RecPayload::Trade(_) => fills_scratch.clear(),
         }
         while consumed < ctx.orders().len() {
             let order = ctx.orders()[consumed];

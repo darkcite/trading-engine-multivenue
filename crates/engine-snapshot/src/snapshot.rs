@@ -51,8 +51,12 @@ pub const RUN_DIR_MAX: usize = 160;
 /// took the number the same day.
 /// **Slot 3 changed meaning on 2026-09-12 (BIN15 O4b)**: it was
 /// `rule-tree`.
+/// **Slot 6 changed meaning on 2026-09-26 (XMM XH1)**: `strategy-icdp`
+/// was unlinked and `strategy-xmm` took the number the same day. The
+/// `icdp` block below stays on the wire, reading zeros, until the xmm
+/// block replaces it (XH3) — a schema change the worker reads in step.
 pub const SLOT_NAMES: [&str; SNAPSHOT_SLOTS] = [
-    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "icdp", "reserved",
+    "hyparb", "vrp", "xsd", "bin15", "ai-exec", "vm", "xmm", "reserved",
 ];
 
 /// Ingress index → venue name (see [`SNAPSHOT_VENUES`]).
@@ -745,8 +749,8 @@ mod tests {
         let long = [b'x'; RUN_DIR_MAX + 40];
         b.set_run_dir(&long);
         assert_eq!(b.run_dir().len(), RUN_DIR_MAX);
-        b.set_strategy_name(b"ai+icdp");
-        assert_eq!(b.strategy_name(), b"ai+icdp");
+        b.set_strategy_name(b"ai+xmm");
+        assert_eq!(b.strategy_name(), b"ai+xmm");
         let mut s = EngineSnapshot::empty();
         s.set_strategy_kind(b"set");
         assert_eq!(s.strategy_kind(), b"set");

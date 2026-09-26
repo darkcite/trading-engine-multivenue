@@ -308,9 +308,9 @@ impl<T: Copy, const N: usize> Producer<T, N> {
             // on every lane but depth (192 B `DepthTopK`) and the ruleset table
             // (32 832 B, operator cadence) — the designed ring-slot publish: the
             // slot IS the message the consumer reads in place — rejected: a
-            // claimed slot built in place (the ingress lanes capture `T` before
-            // the push, the depth gate keeps its row; the other producers are
-            // ≤ 64 B warm or operator cadence — not worth a second push path).
+            // claimed slot built in place (most ingress lanes capture `T` first,
+            // the depth gate keeps its row; the rest — the HL trade print among
+            // them — are ≤ 64 B warm or operator cadence: no second push path).
             ::core::ptr::copy_nonoverlapping(src, dst, 1);
         }
         let next = head.wrapping_add(1);

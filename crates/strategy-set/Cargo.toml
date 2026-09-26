@@ -18,8 +18,8 @@ core-types           = { workspace = true }
 strategy-ai-exec     = { workspace = true }
 strategy-core        = { workspace = true }
 strategy-hyparb      = { workspace = true }
-strategy-icdp        = { workspace = true }
 strategy-bin15       = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }
+strategy-xmm         = { workspace = true }

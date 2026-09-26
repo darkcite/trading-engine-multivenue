@@ -365,8 +365,10 @@ funding requirement.
 ### `off` is a STOP, and it stops exits too
 
 `mode = "off"` refuses EVERY order from the slot, entries and **exits**
-alike: `Order` carries no reduce-only bit today, so the dispatcher cannot
-tell them apart. It also does not cancel orders already resting.
+alike: the dispatcher cannot tell them apart. (`Order.flags` bit 0,
+`ORDER_FLAG_REDUCE_ONLY`, exists since XMM XH1 — but nothing sets or
+honours it before XH4; see "XMM — slot 6" below.) It also does not
+cancel orders already resting.
 
 This is a deliberate, documented **exception** to the standing law above
 that a cap never blocks an exit. `off` is not a cap — it is an operator
@@ -1286,11 +1288,12 @@ Arm B reprices ~333 times per instance, so a modify routed to
 which is the address-budget exhaustion the governor exists to prevent.
 **One case this gets wrong, deliberately**: a modify that REDUCES
 exposure — smaller size, or a price further from the market — is
-arguably an exit and is refused at the floor anyway. `Order` carries no
-reduce-only bit, which is the same limitation already recorded for
-`mode = "off"`, so treating every modify as a submit is the fail-closed
-choice with an existing precedent. **When the reduce-only bit lands
-with E6, this is one of the sites to revisit.**
+arguably an exit and is refused at the floor anyway. No reduce-only bit
+is honoured — the same limitation already recorded for `mode = "off"`
+(the bit itself exists since XMM XH1, unread until XH4) — so treating
+every modify as a submit is the fail-closed choice with an existing
+precedent. **When the reduce-only bit is honoured (XH4), this is one of
+the sites to revisit.**
 
 **A repeated roll retires nothing.** The venue re-sends
 `outcomeCreated` on a reconnect snapshot and a replayed ring entry
@@ -5890,3 +5893,57 @@ exactly as `exec-smoke.sh` does.
   keep-alive"). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
   is rustls' unbuffered API (`UnbufferedClientConnection`) — a core-net
   transport decision for the operator, not a HYPARB-lane change.
+
+## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
+
+Slot 6 is `xmm` (`crates/strategy-xmm`, plan
+`docs/research/xmm/xmm-hl-maker-plan-2026-09-26.md`, rulings
+O-XH1…O-XH15). `strategy-icdp` is UNLINKED from the set (its crate and
+`backtest --member icdp` stay); `icdp` / `ai+icdp` refuse the boot.
+
+**XH1 widens nothing and arms nothing.**
+
+* **The member places nothing.** Configured from `~/multivenue/xmm.toml`
+  (a requested bit with no artifact refuses the boot — the F19 law), it
+  implements no order path: every callback is a no-op and its timer is
+  off. No `strategy.conf` names it.
+* **A live slot 6 refuses the boot** (`cli::exec_boot::XMM_SLOT`), even
+  correctly named and agreed by `--arm-live`, until XH4 gives xmm its own
+  Hyperliquid master account and gateway (O-XH3, O-XH7). Armed on today's
+  arm it would share slot 3's account, where a slot-6 halt's venue-wide
+  cancel would pull bin15's quotes. Lifting this refusal is XH4's own
+  entry here (the "no phase may arm without its own entry" rule above).
+* **`Order.flags` bit 0 = `ORDER_FLAG_REDUCE_ONLY`** (byte 14, former
+  padding — every older `Order` reads 0). **Nothing honours it before
+  XH4:** not `risk_check`, not `mode = "off"`, not the budget floor, not
+  the Hyperliquid order (sent reduce-only = false), and it is not part of
+  `OrderIdentity`. No member may rely on it for an exit until XH4's entry
+  here says otherwise.
+* **The member's caps (`xmm.toml`, the XH5 probe values, O-XH5):** clip
+  $15, per perp $150, gross $400, resting $300. Parse-time ceilings bound
+  them at the largest configuration the plan names — clip $10 000, per
+  perp $5 000 000, gross $20 000 000, resting $1 000 000; the clip's
+  ceiling also refuses a probe clip written at ×1e9. Raising a ceiling is
+  a scale step (XH7): a code change with its entry here. The caps' boot
+  cross-check against `exec.toml` slot 6 (E6: a mismatch refuses) lands
+  with the slot's arm (XH4).
+* **Two new engine lanes, no new submission path.** Trade prints
+  (`on_trade`) and order events (`on_order_event`) reach members with
+  the same `EngineCtx` as ticks, so anything a member submits from them
+  passes the same router and `risk_check`. Order events route to the
+  placing slot ALONE (the X1 fill law); an unattributed or disabled slot
+  is counted, never fanned out. They drain AFTER every fill source, so a
+  fill waiting in the same iteration is booked (E6) before a member can
+  act on an order event. No producer exists before XH2 (paper) / XH4
+  (live).
+* **Per-slot timers.** Each member's `on_timer` runs on its own period.
+  Every existing member has a 1 s period or an empty `on_timer`, so each
+  fires exactly as before (bin15's LAW E-8 sweep and day roll, hyparb's
+  timer pass). **Re-review at XH3**: once xmm has a period under 1 s, the
+  1 s members run every 1 s to 1 s + p.
+* **Regime:** slot 6 takes no label yet; with `[labels] require = 1` an
+  enabled xmm refuses the boot (fail-closed). `[labels.icdp]` refuses at
+  the grammar.
+
+The laws XH-1…XH-7 (plan §10) are proposed for this file when their
+phase lands (XH3 paper member, XH4 execution).

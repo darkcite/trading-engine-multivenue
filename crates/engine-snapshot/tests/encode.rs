@@ -297,7 +297,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
     s.boot.boot_wall_ns = 1_699_999_994_000_000_000;
     s.boot.pid = 4242;
     s.boot.set_git_sha(b"3ee1b8b");
-    s.boot.set_strategy_name(b"ai+icdp");
+    s.boot.set_strategy_name(b"ai+xmm");
     s.boot.set_run_dir(b"/tmp/run-1");
     s.boot.requested_mask = 112;
     s.boot.configured_mask = 113;
@@ -316,7 +316,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
         "\"now\":{\"mono_ns\":\"10000000000\",\"wall_ns\":\"1700000000000000000\",\"uptime_s\":6},",
         "\"boot\":{\"pid\":4242,\"git_sha\":\"3ee1b8b\",\"binary_mtime_ns\":\"0\",",
         "\"boot_wall_ns\":\"1699999994000000000\",\"run_epoch_ns\":\"0\",\"run_dir\":\"/tmp/run-1\",",
-        "\"strategy\":\"ai+icdp\",\"strategy_kind\":\"set\",\"paper\":1,\"requested_mask\":112,",
+        "\"strategy\":\"ai+xmm\",\"strategy_kind\":\"set\",\"paper\":1,\"requested_mask\":112,",
         "\"configured_mask\":113,\"enabled_mask\":112,\"halted\":0,",
         "\"ruleset_hash\":\"00000000000000000000000000000000\",",
         "\"ruleset_staged_hash\":\"00000000000000000000000000000000\",",
@@ -342,7 +342,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
          \"label_terms\":0,\"label_off\":0,\"orders_emitted\":0,\"orders_dropped\":0},"
     ));
     assert!(body.contains(
-        "{\"slot\":6,\"name\":\"icdp\",\"configured\":1,\"enabled\":1,\"gate\":0,"
+        "{\"slot\":6,\"name\":\"xmm\",\"configured\":1,\"enabled\":1,\"gate\":0,"
     ));
     assert!(body.ends_with(
         "\"recent\":{\"orders_total\":0,\"orders\":[],\"fills_total\":0,\"fills\":[]}}"

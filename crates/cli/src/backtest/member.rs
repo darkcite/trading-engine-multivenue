@@ -68,14 +68,15 @@ use super::fill::{
 use super::{
     derive_universe, discover_runs, hex_lower, load_and_merge, manifest_descriptor_table,
     parse_model_params, parse_split, render_detail, render_schema1, BacktestConfig,
-    BacktestCtx, BacktestOutput, HarnessError, HarnessStats, MergedRec, RecPayload,
+    BacktestCtx, BacktestOutput, HarnessError, HarnessStats, MergeLanes, MergedRec, RecPayload,
     RegimeReport, ReportValues, RunSummary,
 };
 
 /// The coded members the arm can drive.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MemberKind {
-    /// Slot 6, `crates/strategy-icdp` — params from `icdp.toml`.
+    /// `crates/strategy-icdp` — params from `icdp.toml`. Unlinked from
+    /// the set at XMM XH1 (slot 6 is xmm's); the offline arm stays.
     Icdp,
     /// Slot 2, `crates/strategy-xsd` — params from `xsd.toml`, the
     /// table from `xsd-table.tsv`, an optional seed (XSD-3).
@@ -92,6 +93,10 @@ pub enum MemberKind {
     /// pools from the universe's `[hyperevm]` list, the pool events from
     /// the capture's `hyperevm-signals.pmlr` (HYPARB H6).
     Hyparb,
+    /// Slot 6, `crates/strategy-xmm` — params from `xmm.toml`, each
+    /// quoted perp and its Binance leader resolved against the capture's
+    /// newest manifest (XMM XH1: the member is dark — it places nothing).
+    Xmm,
 }
 
 impl MemberKind {
@@ -103,6 +108,7 @@ impl MemberKind {
             "vrp" => Some(Self::Vrp),
             "bin15" => Some(Self::Bin15),
             "hyparb" => Some(Self::Hyparb),
+            "xmm" => Some(Self::Xmm),
             _ => None,
         }
     }
@@ -115,6 +121,7 @@ impl MemberKind {
             Self::Vrp => "vrp",
             Self::Bin15 => "bin15",
             Self::Hyparb => "hyparb",
+            Self::Xmm => "xmm",
         }
     }
 }
@@ -125,7 +132,7 @@ pub struct MemberSpec {
     /// Which member.
     pub kind: MemberKind,
     /// Its parameter artifact (`--icdp <path>` for icdp, `--xsd <path>`
-    /// for xsd).
+    /// for xsd, `--xmm <path>` for xmm).
     pub params: PathBuf,
     /// xsd only: `--xsd-table <path>` (default `~/multivenue/xsd-table.tsv`).
     pub table: Option<PathBuf>,
@@ -260,6 +267,13 @@ fn drive_with<S: Strategy, O: FnMut(&MergedRec, &S)>(
                 let mut ev = *e;
                 ev.ts_ns = rec.wall_ns;
                 strat.on_venue_event(&ev, ctx);
+                fills_scratch.clear();
+            }
+            RecPayload::Trade(p) => {
+                // XMM XH1: the trade lane, merged for `--member xmm` only.
+                let mut print = *p;
+                print.ts_ns = rec.wall_ns;
+                strat.on_trade(&print, ctx);
                 fills_scratch.clear();
             }
             RecPayload::Depth(d) => {
@@ -812,7 +826,10 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
         &mut opt_out,
         &mut sym_class,
         &mut binary_underlying,
-        spec.kind == MemberKind::Hyparb,
+        MergeLanes {
+            pool_signals: spec.kind == MemberKind::Hyparb,
+            hl_trades: spec.kind == MemberKind::Xmm,
+        },
     )?;
     let universe = derive_universe(&merged);
     let descriptors = manifest_descriptor_table(&runs);
@@ -926,6 +943,46 @@ pub fn run_member(cfg: &BacktestConfig, spec: &MemberSpec) -> Result<BacktestOut
                     c.skipped_stale_dec,
                     c.skipped_prev,
                     c.caps_rejected,
+                    out.orders_emitted,
+                );
+                (hash_hex, line, out, counters)
+            }
+            MemberKind::Xmm => {
+                // The boot's own builder, offline: every quoted perp and
+                // its leader resolve against the capture's newest manifest,
+                // so the harness refuses exactly the artifacts the boot does.
+                let (file, bytes) = core_config::xmm::load(&spec.params).map_err(|e| {
+                    HarnessError::Usage(format!("--xmm {}: {e}", spec.params.display()))
+                })?;
+                let hash_hex = hex_lower(&core_crypto::sha256(&bytes));
+                let (params, coins) = crate::xmm_boot::build_params(&file, &|d: &str| {
+                    descriptors.resolve(d.as_bytes()).map(|(sym, _)| sym)
+                })
+                .map_err(HarnessError::Usage)?;
+                let mut strat = strategy_xmm::XmmStrategy::new();
+                strat
+                    .configure(&params)
+                    .map_err(|e| HarnessError::Usage(format!("xmm: configure refused: {e}")))?;
+                strat
+                    .on_start(&mut ctx)
+                    .map_err(|e| HarnessError::Internal(format!("xmm on_start failed: {e}")))?;
+                let line = format!(
+                    "member: xmm params={} hash={} coins={} maker_enabled={} theta_bps_1e6={} \
+                     lifetime_ms={} clip_usd_1e6={} ab_mode={} anchor=wall (identity)",
+                    spec.params.display(),
+                    hash_hex,
+                    coins.join(","),
+                    params.maker_enabled,
+                    params.theta_bps_1e6,
+                    params.lifetime_ms,
+                    params.clip_usd_1e6,
+                    params.ab_mode,
+                );
+                let out = drive(&mut strat, &mut ctx, &mut engine, &merged, boundary_virt);
+                let hl_trades: u64 = run_summaries.iter().map(|r| r.hl_trades).sum();
+                let counters = format!(
+                    "member: xmm phase=XH1(dark) hl_trades={hl_trades} orders_emitted={} \
+                     regime=not-replayed(v1)",
                     out.orders_emitted,
                 );
                 (hash_hex, line, out, counters)
@@ -1884,6 +1941,10 @@ mod tests {
         assert_eq!(MemberKind::Icdp.label(), "icdp");
         assert_eq!(MemberKind::Xsd.label(), "xsd");
         assert_eq!(MemberKind::Vrp.label(), "vrp");
+        // XMM XH1: slot 6's member is drivable offline; icdp stays too.
+        assert_eq!(MemberKind::parse("xmm"), Some(MemberKind::Xmm));
+        assert_eq!(MemberKind::Xmm.label(), "xmm");
+        assert_eq!(MemberKind::parse("XMM"), None);
     }
 
     #[test]

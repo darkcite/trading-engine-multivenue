@@ -72,6 +72,52 @@ a v2 file replays under the v2 law — never stale.
 |     16 |    40 | payload  | `[u8; 40]`     | opaque; interpretation by source       |
 |     56 |     8 | _pad1    | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)  |
 
+### `TradePrint` — 64 bytes (XMM XH1, 2026-09-26; the trade lane, never captured)
+
+One public trade print, carried from `ingress-hyperliquid` to the engine
+on the trade lane (`Ring<TradePrint, 16384>`, engine `on_trade`, drained
+after the tick lanes). The capture keeps recording prints as
+`ChannelEvent` rows (`ChannelId::Trade`, `v1` signed by side) — this slot
+is the ENGINE carrier, lossless against that row
+(`TradePrint::read_trade_event`), which is how `backtest --member xmm`
+rebuilds the lane. A full ring drops the print and counts it
+(`trade_ring_drops`); the capture row is written first either way.
+
+| offset | bytes | field         | type           | notes                                        |
+| -----: | ----: | ------------- | -------------- | -------------------------------------------- |
+|      0 |     8 | ts_ns         | `u64` NsTs     | ingress parse-complete, monotonic ns         |
+|      8 |     8 | venue_time_ms | `u64`          | venue trade time ms; 0 = unknown (data, not a clock) |
+|     16 |     8 | px_1e6        | `i64`          | trade price ×1e6                             |
+|     24 |     8 | qty_1e6       | `i64`          | size ×1e6, always > 0 (direction = `aggressor`) |
+|     32 |     8 | tid           | `u64`          | venue trade id; 0 = none; consumers dedupe on it |
+|     40 |     4 | sym           | `u32` SymbolId |                                              |
+|     44 |     1 | venue         | `u8` VenueId   |                                              |
+|     45 |     1 | aggressor     | `u8`           | 0 = BUY (lifted the ask, HL `B`), 1 = SELL (hit the bid, HL `A`) |
+|     46 |    18 | _pad          | `[u8; 18]`     | explicit, zeroed (one cache line, the ring-slot law) |
+
+### `OrderEvent` — 64 bytes (XMM XH1, 2026-09-26; the order-event lane, never captured)
+
+One change in an order's venue-side state (`Ring<OrderEvent, 1024>`,
+engine `on_order_event`, drained after every fill source — the fill
+lanes and the dispatcher pump — so a fill waiting in the same iteration is
+booked before a member can act on an order event, LAW E6). Routed by
+`strategy_id` to the placing slot ALONE — the X1 fill law; an event whose
+slot is out of range or not enabled is counted
+(`StrategySet::order_events_unrouted`), never fanned out. XH1 adds the
+lane; the paper model (XH2) and the live gateway (XH4) are its producers.
+
+| offset | bytes | field         | type           | notes                                        |
+| -----: | ----: | ------------- | -------------- | -------------------------------------------- |
+|      0 |     8 | ts_ns         | `u64` NsTs     | observed, monotonic ns                       |
+|      8 |     8 | client_oid    | `u64`          | the order's client id (LAW E-9's durable name) |
+|     16 |     8 | venue_time_ms | `u64`          | venue time of the change; 0 = unknown (paper) |
+|     24 |     4 | sym           | `u32` SymbolId |                                              |
+|     28 |     1 | venue         | `u8` VenueId   |                                              |
+|     29 |     1 | strategy_id   | `u8`           | the placing slot; `0xFF` = not attributable (counted, never delivered) |
+|     30 |     1 | kind          | `u8`           | 1 RESTING (a post-only ACK) · 2 REJECTED · 3 CANCELED · 4 FILLED (terminal); 0 never produced |
+|     31 |     1 | reason        | `u8`           | 0 none · 1 cancel requested · 2 replaced · 3 expired · 4 bad ALO px · 5 self-trade · 6 margin · 7 open-interest cap · 8 scheduled cancel · 9 reduce-only · 10 tick or lot · 11 min notional · 255 other |
+|     32 |    32 | _pad          | `[u8; 32]`     | explicit, zeroed                             |
+
 ### `Fill` — 64 bytes (layout amended X1, pre-first-capture — see docs/migration.md)
 
 `engine-fills.pmlr` has been HEADER-ONLY for the whole life of paper
@@ -112,12 +158,13 @@ reader-compat surface.
 |      8 |     4 | sym         | `u32` SymbolId | venue-namespaced                |
 |     12 |     1 | side        | `u8`           | `Side`                          |
 |     13 |     1 | kind        | `u8`           | 0=Limit, 1=IoC, 2=Market (rsv.) |
-|     14 |     2 | _pad0       | `[u8; 2]`      | explicit, zeroed                |
+|     14 |     1 | flags       | `u8`           | **XMM XH1 (2026-09-26)**: bit 0 = `ORDER_FLAG_REDUCE_ONLY` (the exec arm that honours it is XH4's; until then nothing sets it). Wire-additive: it was the first `_pad0` byte, explicit zeroed, so every Order persisted before XH1 reads as no flags |
+|     15 |     1 | _pad0       | `u8`           | explicit, zeroed                |
 |     16 |     8 | px          | `i64` Price    |                                 |
 |     24 |     8 | qty         | `i64` Qty      |                                 |
 |     32 |     8 | client_oid  | `u64`          | engine-assigned, monotonic      |
 |     40 |     1 | venue       | `u8` VenueId   | routing target (v2+; garbage in v1) |
-|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=vrp [VRP V7 2026-09-10 — was ev] 2=xsd [XSD-S/XSD-3 2026-09-12 — was cross-arb] 3=rule-tree 4=ai-exec 5=vm 6=icdp — ICDP I4, 2026-09-03: the intrabar member; its intents are `kind = 1` IoC with `ttl_ns` = the bar's remaining life), stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
+|     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=vrp [VRP V7 2026-09-10 — was ev] 2=xsd [XSD-S/XSD-3 2026-09-12 — was cross-arb] 3=rule-tree 4=ai-exec 5=vm 6=icdp — ICDP I4, 2026-09-03: the intrabar member; its intents are `kind = 1` IoC with `ttl_ns` = the bar's remaining life). **Today's map: 0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec · 5 vm · 6 xmm (XMM XH1, 2026-09-26 — icdp unlinked; rows under 6 before that date are icdp's) · 7 free.** Stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
 |     42 |     1 | verb        | `u8`           | **E5 (2026-09-19)**: which LIFECYCLE verb this record is — 0=PLACE, 1=CANCEL, 2=MODIFY. Wire-additive: every Order persisted before E5 carries 0 here (the byte was explicit zeroed padding), and 0 is PLACE, which is what every one of them was. The verb rides the Order slot rather than a second file because a cancel is meaningless apart from the place it refers to, and two streams would let a replay apply it first — the same argument §7 of the exec plan gives for the `ExecCmd` union ring, and the field meanings are deliberately identical. A reader that does not know a verb byte MUST drop the record, never treat it as a place |
 |     43 |     5 | _pad1       | `[u8; 5]`      | explicit, zeroed                |
 |     48 |     8 | ttl_ns      | `u64`          | I1 (2026-09-03): time-to-live relative to `ts_ns`; 0 = none. A MODEL field — the offline fill law (`backtest::fill`) cancels the order at the first record of its sym at/after `ts_ns + ttl_ns` (an IoC that meets no fresh tick before its emitting bar closes is a cancel); no engine cancel path reads it (Stage-3). Wire-additive: every Order persisted before I1 carries 0 here (the bytes were explicit zeroed padding) |
@@ -232,8 +279,11 @@ per-venue depth ring (`Ring<DepthTopK, 4096>`, engine `on_depth`) AND
 into `<venue>-depth.pmlr`. **Hyperliquid (2026-09-19): HIP-4 outcome
 legs only** — the top-K of each `l2Book` snapshot (a full book the
 venue pushes on a ~5.3 s timer per coin; no ladder, no diffs) lands in
-`hl-depth.pmlr` under the same change gate; there is no HL depth ring
-and perps write nothing here (their touch stays `bbo`-sourced). **First non-64-byte PMLR kind: slot size
+`hl-depth.pmlr` under the same change gate; there is no HL depth ring.
+**XMM XH1 (2026-09-26): perps write here too** — the same top-5 of each
+perp `l2Book`, change-gated, as research capture for the queue-ahead
+study (their touch stays `bbo`-sourced). No lane carries it, so no replay
+merges it: `backtest` drops HL rows whose descriptor classes as a perp. **First non-64-byte PMLR kind: slot size
 is KIND-determined since WS10-B — kinds 0–6 stay 64 B, kind 7 is
 192 B (three cache lines; still a 64-multiple, so mmap'd access
 stays aligned).** On a venue seq-chain break the ladder clears and a
@@ -246,7 +296,7 @@ ascending; slots past the book's real depth are all-zero.
 | -----: | ----: | ----- | ------------------- | ------------------------------------ |
 |      0 |     8 | ts_ns | `u64` NsTs          | ingress apply-complete time          |
 |      8 |     4 | sym   | `u32` SymbolId      |                                      |
-|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1; Hyperliquid (outcome legs) since 2026-09-19 |
+|     12 |     1 | venue | `u8` VenueId        | Okx / Deribit in v1; Hyperliquid (outcome legs) since 2026-09-19, and perps since 2026-09-26 (XMM XH1) |
 |     13 |     1 | k     | `u8`                | always 5 (`DEPTH_K`)                 |
 |     14 |     1 | flags | `u8`                | bit0 = STALE (book resyncing)        |
 |     15 |     1 | _pad0 | `u8`                | explicit, zeroed                     |

@@ -427,7 +427,7 @@ to enabled members in slot order:
 | 3 | 8 | `rule-tree` |
 | 4 | 16 | `ai-exec` — the s4 Intent lane |
 | 5 | 32 | `vm` — the ruleset VM |
-| 6 | 64 | `icdp` — the intrabar candle-direction member (ICDP I3, 2026-09-03; configured only when `~/multivenue/icdp.toml` resolves) |
+| 6 | 64 | `xmm` — the HL post-only maker (XMM XH1, 2026-09-26 — was `icdp`, the intrabar candle-direction member, now unlinked; configured only when `~/multivenue/xmm.toml` resolves; DARK at XH1) |
 
 `--strategy all` requests 127, but slots 1/2/3 need `vrp.toml` / `xsd.toml`+`xsd-table.tsv` / `--rules-path`,
 which the launchd wrapper does not pass. **Since the operator ruling of 2026-09-02 the wrapper boots

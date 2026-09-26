@@ -130,15 +130,18 @@ fi
 # Operator ruling 2026-09-02: AI-pushed lanes only (ai-exec + vm,
 # mask 48) — Rust-coded strategies disabled at boot.
 #
-# ICDP I4 (2026-09-03): the operator opts the slot-6 intrabar member in
-# by writing `STRATEGY=ai+icdp` or `STRATEGY=ai+vrp` to
-# ~/multivenue/strategy.conf (KEY=VALUE,
-# sourced; absent ⇒ `ai`). Paper only — `icdp` never boots without
-# `--paper` (belt and braces: no live dispatcher exists, and the plan's
-# I4 law says the wrapper refuses it regardless). The artifact
-# (~/multivenue/icdp.toml) must resolve, or the engine refuses the boot
-# and KeepAlive relaunches — check the launchd log, then fix the file
-# or drop the mask back to `ai`.
+# ICDP I4 (2026-09-03): the operator opts a coded member in by writing
+# e.g. `STRATEGY=ai+vrp` to ~/multivenue/strategy.conf (KEY=VALUE,
+# sourced; absent ⇒ `ai`). A member's artifact must resolve, or the
+# engine refuses the boot and KeepAlive relaunches — check the launchd
+# log, then fix the file or drop the mask back to `ai`.
+#
+# XMM XH1 (2026-09-26): slot 6 is the xmm member (`xmm`, `ai+xmm`,
+# `ai+vrp+xsd+bin15+hyparb+xmm`); `icdp` and `ai+icdp` are GONE (the
+# engine refuses them too — the crate keeps only its offline backtest).
+# Its artifact is ~/multivenue/xmm.toml, and an absent one with the bit
+# REQUESTED refuses the boot (the F19 law). The member is DARK at XH1 —
+# it places nothing — and nothing edits strategy.conf for it.
 STRATEGY="ai"
 if [ -f "$HOME/multivenue/strategy.conf" ]; then
   . "$HOME/multivenue/strategy.conf"
@@ -165,10 +168,11 @@ fi
 # boots slot 0 only with its artifact (~/multivenue/hyparb.toml) and the
 # pool ingress — see the HYPARB block at the end.
 case "$STRATEGY" in
-  ai|ai+icdp|icdp|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
+  ai|ai+vrp|vrp|ai+xsd|ai+vrp+xsd|xsd) ;;
   bin15|ai+bin15|ai+vrp+bin15|ai+xsd+bin15|ai+vrp+xsd+bin15) ;;
   hyparb|ai+hyparb|ai+vrp+xsd+bin15+hyparb) ;;
-  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+icdp, icdp, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb)" >&2; exit 78 ;;
+  xmm|ai+xmm|ai+vrp+xsd+bin15+hyparb+xmm) ;;
+  *) echo "engine-wrapper: refusing STRATEGY=$STRATEGY (allowed: ai, ai+vrp, vrp, ai+xsd, ai+vrp+xsd, xsd, bin15, ai+bin15, ai+vrp+bin15, ai+xsd+bin15, ai+vrp+xsd+bin15, hyparb, ai+hyparb, ai+vrp+xsd+bin15+hyparb, xmm, ai+xmm, ai+vrp+xsd+bin15+hyparb+xmm)" >&2; exit 78 ;;
 esac
 
 # XSD-1 (2026-09-12, measured live): a launchd agent inherits macOS's
@@ -317,4 +321,22 @@ elif [ -n "${HYPARB_TOML:-}${EVM_TESTNET:-}" ]; then
   echo "engine-wrapper: refusing — HYPARB_TOML needs EVM_TESTNET=1 (the testnet shadow) or HYPARB_LIVE=1 (live mode), and EVM_TESTNET needs HYPARB_TOML (got HYPARB_TOML='${HYPARB_TOML:-}' EVM_TESTNET='${EVM_TESTNET:-}')" >&2
   exit 78
 fi
-exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}"
+# XMM XH1 (2026-09-26): slot 6's artifact. ~/multivenue/xmm.toml is the
+# default whenever STRATEGY carries xmm (absent => the ENGINE refuses the
+# boot, the F19 law); XMM_TOML=<path> in strategy.conf names another one.
+# It must be a file, and STRATEGY must carry xmm — a key for a member the
+# mask does not boot is a misconfiguration and REFUSES (exit 78), the
+# HYPARB_TOML shape. Paper only: nothing here can arm slot 6.
+XMM_ARGS=()
+if [ -n "${XMM_TOML:-}" ]; then
+  if [ ! -f "$XMM_TOML" ]; then
+    echo "engine-wrapper: refusing — XMM_TOML=$XMM_TOML is not a file" >&2
+    exit 78
+  fi
+  case "$STRATEGY" in
+    *xmm*) ;;
+    *) echo "engine-wrapper: refusing — XMM_TOML without xmm in STRATEGY=$STRATEGY" >&2; exit 78 ;;
+  esac
+  XMM_ARGS=(--xmm "$XMM_TOML")
+fi
+exec ./target/release/multivenue-engine run --paper --strategy "$STRATEGY" "${EXEC_ARGS[@]}" "${HYPARB_ARGS[@]}" "${XMM_ARGS[@]}"

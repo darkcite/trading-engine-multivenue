@@ -139,6 +139,11 @@ pub const AUDIT_PNL_VERSION: u32 = 2;
 /// hyparb member: rows under slot 0 in a capture taken BEFORE that date
 /// are latency-arb rows wearing this label (it was OFF in every wrapper
 /// mask, so a live capture carries none).
+///
+/// **Slot 6 changed meaning on 2026-09-26 (XMM XH1).** `strategy-icdp`
+/// was unlinked (it keeps its offline `backtest --member icdp`) and the
+/// slot is the xmm member: rows under slot 6 in a capture taken BEFORE
+/// that date are icdp paper rows wearing this label.
 fn strategy_label(id: u8) -> &'static str {
     match id {
         0 => "hyparb",
@@ -152,7 +157,7 @@ fn strategy_label(id: u8) -> &'static str {
         3 => "bin15",
         4 => "ai-exec",
         5 => "vm",
-        6 => "icdp",
+        6 => "xmm",
         0xFF => "unattributed",
         _ => "unknown",
     }

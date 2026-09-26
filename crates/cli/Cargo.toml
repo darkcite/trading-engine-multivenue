@@ -50,6 +50,8 @@ strategy-set         = { workspace = true }
 strategy-vm          = { workspace = true }
 strategy-vrp         = { workspace = true }
 strategy-xsd         = { workspace = true }
+# XMM XH1: the slot-6 member's params, built by `xmm_boot`.
+strategy-xmm         = { workspace = true }
 core-crypto          = { workspace = true }
 research-artifacts   = { workspace = true }
 clob-dispatcher      = { workspace = true }
