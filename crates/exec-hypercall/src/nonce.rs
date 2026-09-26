@@ -3,23 +3,25 @@
 
 //! The signing nonce.
 //!
-//! The venue wants a nonce **unique per wallet**; gaps are allowed and
-//! order is not required (plan §1.5). The SDK carries it as a JS
-//! `Number`, so it must stay below 2^53. `ms × 1000` plus a per-ms
-//! counter is both: ~1.8e15 today, a thousand nonces per millisecond,
-//! and a restart — seconds later on the wall clock — starts past every
-//! nonce the previous boot issued. A clock that steps backwards cannot
-//! repeat one: the counter only moves forward within a process.
+//! The venue wants a nonce **unique per signer** and **inside time
+//! bounds of its own command clock, in milliseconds** — measured on
+//! mainnet 2026-09-26 (the HC9 dust): `ms × 1000` was refused as
+//! "nonce … is outside time bounds for signer … (command_ts=<ms>)",
+//! the signature itself accepted. So the nonce IS the wall clock in ms,
+//! bumped by one when a second nonce falls in the same millisecond (or
+//! the clock steps back). The bump can run ahead of the clock only by
+//! the burst it absorbs — the venue's own rate limit (≤ 600 writes a
+//! minute per wallet) keeps that far below a millisecond a write, so a
+//! restart seconds later still starts past every nonce the previous boot
+//! issued. The SDK carries it as a JS `Number`: below 2^53 (~1.8e12
+//! today — no ceiling in sight).
 //!
 //! Single writer: it lives in the arm and is `&mut`.
-
-/// Nonces per millisecond before the counter borrows from the next.
-pub const PER_MS: u64 = 1_000;
 
 /// The JS safe-integer ceiling the SDK's `Number(nonce)` imposes.
 pub const NONCE_MAX: u64 = (1u64 << 53) - 1;
 
-/// A strictly increasing nonce anchored on the wall clock.
+/// A strictly increasing nonce: the wall clock in ms.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct HcNonce {
     last: u64,
@@ -41,9 +43,8 @@ impl HcNonce {
         if now_ms == 0 {
             return None;
         }
-        let base = now_ms.checked_mul(PER_MS)?;
-        let n = if base > self.last {
-            base
+        let n = if now_ms > self.last {
+            now_ms
         } else {
             self.last.checked_add(1)?
         };
@@ -77,35 +78,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_takes_the_clock_and_counts_inside_a_millisecond() {
+    fn it_is_the_clock_in_ms_and_bumps_inside_a_millisecond() {
         let mut n = HcNonce::new();
-        assert_eq!(n.next(1_000), Some(1_000_000));
-        assert_eq!(n.next(1_000), Some(1_000_001));
-        assert_eq!(n.next(1_001), Some(1_001_000));
+        assert_eq!(n.next(1_000), Some(1_000));
+        assert_eq!(n.next(1_000), Some(1_001), "a second nonce in the same ms");
+        assert_eq!(n.next(1_000), Some(1_002));
+        assert_eq!(n.next(1_005), Some(1_005), "the clock again once it passes the bumps");
     }
 
     #[test]
     fn a_backwards_clock_never_repeats_one() {
         let mut n = HcNonce::new();
-        assert_eq!(n.next(5_000), Some(5_000_000));
-        assert_eq!(n.next(4_000), Some(5_000_001));
-        assert_eq!(n.next(6_000), Some(6_000_000));
+        assert_eq!(n.next(5_000), Some(5_000));
+        assert_eq!(n.next(4_000), Some(5_001));
+        assert_eq!(n.next(6_000), Some(6_000));
     }
 
     #[test]
     fn a_zero_clock_and_the_ceiling_refuse() {
         let mut n = HcNonce::new();
         assert_eq!(n.next(0), None);
-        assert_eq!(n.next(NONCE_MAX / PER_MS + 1), None);
+        assert_eq!(n.next(NONCE_MAX + 1), None);
         assert_eq!(n.last(), 0, "a refusal issues nothing");
+        assert_eq!(n.next(NONCE_MAX), Some(NONCE_MAX));
+        assert_eq!(n.next(NONCE_MAX), None, "no bump past the ceiling");
     }
 
     #[test]
-    fn today_is_well_inside_the_safe_integer_range() {
+    fn today_the_nonce_is_the_venues_command_clock() {
+        // The mainnet refusal named `command_ts` in ms: the nonce must sit
+        // on that scale, within a clock skew of it.
         let ms = now_ms();
         assert!(ms > 1_767_225_600_000, "the clock reads {ms}");
         let mut n = HcNonce::new();
         let v = n.next(ms).unwrap();
-        assert!(v < NONCE_MAX / 2, "{v}");
+        assert_eq!(v, ms);
+        assert!(v < 10_000_000_000_000, "ms, not µs: {v}");
     }
 }
