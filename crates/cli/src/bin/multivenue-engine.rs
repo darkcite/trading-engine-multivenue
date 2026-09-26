@@ -2524,6 +2524,29 @@ fn wire_exec_halts<L: clob_dispatcher::OrderDispatch>(
     }
 }
 
+/// **BX6 — a Binance shape's last boot steps**, after `wire_exec_halts`:
+/// the ledger binds every instrument the arm bound, under the same engine
+/// ids (obligation 7), and the venue split routes by the router's own
+/// alias table (obligation 4: `split_aliases` is what the split holds).
+fn finish_bn_boot<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    split_aliases: clob_dispatcher::RouteAliases,
+    specs: &[exec_router::InstrumentSpec],
+) -> Result<(), String> {
+    if split_aliases != *d.route_aliases() {
+        return Err(String::from(
+            "the venue split's alias table is not the router's (obligation 4) — an order could \
+             be allowed for one venue and reach another arm",
+        ));
+    }
+    for spec in specs {
+        d.bind_instrument(spec)
+            .map_err(|e| format!("the ledger refused Binance instrument {}: {e:?}", spec.sym))?;
+    }
+    info!(instruments = specs.len(), "exec: binance instruments bound in the ledger");
+    Ok(())
+}
+
 fn boot_live_dispatcher(
     cfg: &Config,
     tls_config: std::sync::Arc<rustls::ClientConfig>,
@@ -3184,16 +3207,16 @@ fn run(args: RunArgs) -> ExitCode {
     // producer — the live arm's user-event pump. Until E7 every lane's
     // producer was dropped here, so the E6 exposure ledger and the
     // `on_fill_booked` ordering were reachable only from tests.
-    let (mut hl_fill_prod, fill_lane_cons) = {
+    let (mut hl_fill_prod, mut bn_fill_prod, fill_lane_cons) = {
         let (_f0p, f0) = rings.fill[0].clone().split();
         let (_f1p, f1) = rings.fill[1].clone().split();
         let (_f2p, f2) = rings.fill[2].clone().split();
         let (f3p, f3) = rings.fill[3].clone().split();
-        // BX3: lane 4 is the Binance gateway's (plan §3.1). No arm
-        // produces on it before BX6, so its producer is dropped here and
-        // the engine reads it empty.
-        let (_f4p, f4) = rings.fill[4].clone().split();
-        (Some(f3p), [f0, f1, f2, f3, f4])
+        // BX3/BX6: lane 4 is the Binance gateway's (plan §3.1). Its
+        // producer goes to the gateway when a Binance slot is armed, and
+        // is dropped (the engine reads the lane empty) otherwise.
+        let (f4p, f4) = rings.fill[4].clone().split();
+        (Some(f3p), Some(f4p), [f0, f1, f2, f3, f4])
     };
     // AI command lane (Phase 8f). The producer half feeds the
     // `ingress-ai` thread (spawned below, gated on
@@ -3276,8 +3299,15 @@ fn run(args: RunArgs) -> ExitCode {
                 .unwrap_or(exec_router::ExecMode::Paper)
                 .as_u8();
         }
-        m
+        cli::ExecObs {
+            modes: m,
+            binance: b.binance_slot().is_some(),
+        }
     });
+    // BX6: a live slot names binance — its arm reads the marks (O-BX29).
+    let bn_armed = exec_boot
+        .as_ref()
+        .is_some_and(|b| b.binance_slot().is_some());
     let enable_metrics = args.metrics || args.tui;
     let obs = match Observability::build(enable_metrics, exec_modes) {
         // RG6: the `/state` boot identity (pid, anchor, binary link
@@ -3518,6 +3548,14 @@ fn run(args: RunArgs) -> ExitCode {
             epoch_ns,
             raw_tap_cfg.bn,
             capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_bn)),
+            // BX6 (O-BX29): the marks ride the lane — flagged for the
+            // dispatcher alone — only when a Binance arm will read them.
+            if bn_armed {
+                core_types::EVENT_LANE_FUNDING
+                    | core_types::event_lane_bit(core_types::ChannelId::Mark)
+            } else {
+                core_types::EVENT_LANE_FUNDING
+            },
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -4688,27 +4726,82 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         None
                     };
+                    // **BX6 — the Binance arm** (obligations 4, 7, 9): the one
+                    // live slot naming binance, fed by fill lane 4, its
+                    // instruments bound from the boot discovery's rows, its
+                    // gateway BOOTED (the BX-19 assertions held, the orphans
+                    // swept, the day read) before any member can order.
+                    let bn_arm = if eb.binance_slot().is_some() {
+                        let Some(f4p) = bn_fill_prod.take() else {
+                            error!("exec: fill lane 4 producer already taken — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        };
+                        let alias = bn_anchor
+                            .filter(|_| !aliases.is_empty())
+                            .unwrap_or(core_types::SYMBOL_ID_NONE);
+                        if let Err(reason) =
+                            cli::exec_boot::check_alias_unique(alias, &boot.allocated)
+                        {
+                            error!(%reason, "exec: binance arm refused — boot aborted");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                        let usdm: Vec<core_config::universe::Instrument> = boot
+                            .allocated
+                            .bn_usdm
+                            .iter()
+                            .chain(boot.allocated.bn_dated.iter())
+                            .cloned()
+                            .collect();
+                        let md_hosts = [
+                            cfg.binance_fut_ws_host.as_str(),
+                            cfg.binance_fut_rest_host.as_str(),
+                        ];
+                        let spec = cli::bn_live::BnSpec {
+                            eb: &eb,
+                            rows: &discovery.bn_fapi_rows,
+                            usdm: &usdm,
+                            alias,
+                            md_hosts: &md_hosts,
+                            run_dir: &run_dir,
+                        };
+                        match cli::bn_live::boot_binance_arm(
+                            &spec,
+                            TlsTransport::default_client_config(),
+                            f4p,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                handles.push(b.handle);
+                                Some((b.arm, b.specs))
+                            }
+                            Err(reason) => {
+                                error!(%reason, "exec: binance arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
-                    // the loop from its own arm; the halt wiring is one
-                    // generic helper. Nothing armed keeps the refusing
-                    // stub, so LAW E-1 stays true by construction.
+                    // the loop from its own arm — enumerated, eight (O-BX30);
+                    // the halt wiring is one generic helper. Nothing armed
+                    // keeps the refusing stub, so LAW E-1 stays true by
+                    // construction. A Binance shape splits by route venue
+                    // (`VenueSplit`), built from the router's own route.
                     let anchor = core_time::WallAnchor::now();
                     let paper = clob_dispatcher::PaperDispatcher::new();
                     let live_line = cli::exec_boot::render_slot_mask(eb.live_mask);
-                    match (hl_arm, hyparb_live) {
-                        (Some(arm), None) => {
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            info!(
-                                live = %live_line,
-                                "running strategy-set with LIVE slots — real orders will be \
-                                 submitted"
-                            );
+                    let bn_venue = core_types::VenueId::Binance as u8;
+                    macro_rules! enter_loop {
+                        ($d:expr, $what:expr) => {{
+                            info!(live = %live_line, "{}", $what);
                             engine_loop_set_full(
                                 cons,
-                                d,
+                                $d,
                                 obs,
                                 requested,
                                 vrp_boot.as_ref(),
@@ -4718,32 +4811,39 @@ fn run(args: RunArgs) -> ExitCode {
                                 regime_boot.as_ref(),
                                 hyparb_boot.as_ref(),
                             )
+                        }};
+                    }
+                    macro_rules! finish_bn {
+                        ($d:expr, $split_aliases:expr, $specs:expr) => {
+                            if let Err(reason) = finish_bn_boot(&mut $d, $split_aliases, &$specs) {
+                                error!(%reason, "exec: binance arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        };
+                    }
+                    const REAL: &str = "running strategy-set with LIVE slots — real orders will be \
+                                        submitted";
+                    match (hl_arm, bn_arm, hyparb_live) {
+                        (Some(arm), None, None) => {
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            enter_loop!(d, REAL)
                         }
-                        (Some(arm), Some(live)) => {
+                        (Some(arm), None, Some(live)) => {
                             let split =
                                 exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
                             wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            info!(
-                                live = %live_line,
+                            enter_loop!(
+                                d,
                                 "running strategy-set with LIVE slots on TWO arms (slot 0 on its \
                                  own wallet) — real orders will be submitted"
-                            );
-                            engine_loop_set_full(
-                                cons,
-                                d,
-                                obs,
-                                requested,
-                                vrp_boot.as_ref(),
-                                xsd_boot.as_ref(),
-                                bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
-                                regime_boot.as_ref(),
-                                hyparb_boot.as_ref(),
                             )
                         }
-                        (None, Some(live)) => {
+                        (None, None, Some(live)) => {
                             let split = exec_router::SlotSplit::new(
                                 cli::hyparb_live::SLOT,
                                 exec_router::NullLiveDispatcher::new(),
@@ -4752,25 +4852,13 @@ fn run(args: RunArgs) -> ExitCode {
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
                             wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            info!(
-                                live = %live_line,
+                            enter_loop!(
+                                d,
                                 "running strategy-set with slot 0 LIVE on its own wallet — real \
                                  orders will be submitted"
-                            );
-                            engine_loop_set_full(
-                                cons,
-                                d,
-                                obs,
-                                requested,
-                                vrp_boot.as_ref(),
-                                xsd_boot.as_ref(),
-                                bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
-                                regime_boot.as_ref(),
-                                hyparb_boot.as_ref(),
                             )
                         }
-                        (None, None) => {
+                        (None, None, None) => {
                             // Nothing armed: the refusing stub, so a live
                             // slot on a venue with no arm cannot exist here
                             // (already refused by `exec_boot::resolve`).
@@ -4788,21 +4876,75 @@ fn run(args: RunArgs) -> ExitCode {
                                 anchor,
                             );
                             wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            info!(
+                            enter_loop!(
+                                d,
                                 "running strategy-set PAPER (exec artifact present, nothing \
                                  armed) — no orders will be submitted"
+                            )
+                        }
+                        (None, Some((bn, specs)), None) => {
+                            let split = exec_router::VenueSplit::new(
+                                bn_venue,
+                                exec_router::NullLiveDispatcher::new(),
+                                bn,
+                                &eb.route,
                             );
-                            engine_loop_set_full(
-                                cons,
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(d, REAL)
+                        }
+                        (Some(arm), Some((bn, specs)), None) => {
+                            let split =
+                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(
                                 d,
-                                obs,
-                                requested,
-                                vrp_boot.as_ref(),
-                                xsd_boot.as_ref(),
-                                bin15_boot.as_ref(),
-                                icdp_params.as_ref(),
-                                regime_boot.as_ref(),
-                                hyparb_boot.as_ref(),
+                                "running strategy-set with LIVE slots on TWO venue arms \
+                                 (hyperliquid, binance) — real orders will be submitted"
+                            )
+                        }
+                        (None, Some((bn, specs)), Some(live)) => {
+                            let venues = exec_router::VenueSplit::new(
+                                bn_venue,
+                                exec_router::NullLiveDispatcher::new(),
+                                bn,
+                                &eb.route,
+                            );
+                            let split =
+                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, venues, live);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().a().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with LIVE slots on TWO arms (binance; slot 0 \
+                                 on its own wallet) — real orders will be submitted"
+                            )
+                        }
+                        (Some(arm), Some((bn, specs)), Some(live)) => {
+                            let venues =
+                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
+                            let split =
+                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, venues, live);
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            let split_aliases = *d.live().a().aliases();
+                            finish_bn!(d, split_aliases, specs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with LIVE slots on THREE arms (hyperliquid, \
+                                 binance; slot 0 on its own wallet) — real orders will be \
+                                 submitted"
                             )
                         }
                     }

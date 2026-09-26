@@ -224,7 +224,10 @@ struct InstrumentRow {
     index_1e6: i64,
     /// The last venue fill's price ×1e6; 0 = none yet.
     last_px_1e6: i64,
-    _pad1: [u8; 16],
+    /// Monotonic ns the mark arrived (BX6: a mark that stops arriving
+    /// stops pricing, [`Ledger::expire_marks`]); 0 = none.
+    mark_ns: u64,
+    _pad1: [u8; 8],
     /// Index = slot. Signed position ×1e6 (base units, or contracts).
     pos_1e6: [i64; EXEC_SLOTS],
     /// Index = slot. Exposure at the row's own prices, USD ×1e6 —
@@ -248,7 +251,8 @@ impl InstrumentRow {
         mark_1e6: 0,
         index_1e6: 0,
         last_px_1e6: 0,
-        _pad1: [0; 16],
+        mark_ns: 0,
+        _pad1: [0; 8],
         pos_1e6: [0; EXEC_SLOTS],
         exp_1e6: [0; EXEC_SLOTS],
     };
@@ -585,7 +589,20 @@ pub struct LedgerCounters {
     pub resting_unmatched: u64,
     /// Day-cap epochs crossed (00:00Z rollovers observed).
     pub day_rollovers: u64,
+    /// **BX6 (obligation 6)** — marks refused by the sanity law: no index,
+    /// or a mark more than [`MARK_INDEX_MAX_DEV_1E6`] away from it.
+    pub marks_refused: u64,
+    /// **BX6** — marks dropped for staleness ([`MARK_STALE_NS`]): the row
+    /// is priced at its last fill until a fresh one arrives.
+    pub marks_expired: u64,
 }
+
+/// **BX6 (BX3 obligation 6)** — a mark further than this from its index
+/// (×1e6 of the index: 10 %) is refused, never priced.
+pub const MARK_INDEX_MAX_DEV_1E6: i64 = 100_000;
+/// **BX6** — a mark older than this (30 s; the venue pushes one every 1–3
+/// s) no longer prices its row.
+pub const MARK_STALE_NS: u64 = 30_000_000_000;
 
 /// What `(client_oid, slot)` matched in the resting table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1544,19 +1561,46 @@ impl Ledger {
         }
     }
 
-    /// **The price feed — a venue `Mark`** (`v0` = mark ×1e6): a spot,
-    /// linear or inverse row's mark. Options take theirs from
-    /// [`Self::on_opt_summary`]. Unbound ids and a non-positive mark are
-    /// ignored.
-    pub fn on_mark(&mut self, sym: SymbolId, mark_1e6: i64) {
+    /// **The price feed — a venue `Mark`** (`v0` = mark ×1e6, `v1` = the
+    /// index ×1e6, `ts_ns` when it was read): a spot, linear or inverse
+    /// row's mark. Options take theirs from [`Self::on_opt_summary`].
+    /// Unbound ids are ignored. **BX6 (obligation 6): the sanity law** — a
+    /// mark with no index, a non-positive one, or one further than
+    /// [`MARK_INDEX_MAX_DEV_1E6`] from its index is refused and counted;
+    /// the row keeps its previous price.
+    pub fn on_mark(&mut self, sym: SymbolId, mark_1e6: i64, index_1e6: i64, ts_ns: u64) {
         let Some(i) = self.inst_find(sym) else {
             return;
         };
-        if self.inst[i].law == LAW_OPTION || mark_1e6 <= 0 {
+        if self.inst[i].law == LAW_OPTION {
+            return;
+        }
+        let dev = (mark_1e6 as i128 - index_1e6 as i128).abs();
+        if mark_1e6 <= 0 || index_1e6 <= 0 || dev * 1_000_000 > MARK_INDEX_MAX_DEV_1E6 as i128 * index_1e6 as i128 {
+            self.counters.marks_refused = self.counters.marks_refused.saturating_add(1);
             return;
         }
         self.inst[i].mark_1e6 = mark_1e6;
+        self.inst[i].mark_ns = ts_ns;
         self.refresh_instrument(i);
+    }
+
+    /// **BX6 (obligation 6): the staleness law** — a mark older than
+    /// [`MARK_STALE_NS`] at `now_ns` stops pricing its row (the last fill
+    /// prices it, O-BX22) until a fresh one arrives. The router calls this
+    /// once a second.
+    pub fn expire_marks(&mut self, now_ns: u64) {
+        let n = self.inst_n as usize;
+        let mut i = 0;
+        while i < n {
+            let r = &self.inst[i];
+            if r.law != LAW_OPTION && r.mark_1e6 > 0 && now_ns.saturating_sub(r.mark_ns) > MARK_STALE_NS {
+                self.inst[i].mark_1e6 = 0;
+                self.counters.marks_expired = self.counters.marks_expired.saturating_add(1);
+                self.refresh_instrument(i);
+            }
+            i += 1;
+        }
     }
 
     /// **The price feed — an options summary**: an option row's mark (when
@@ -2900,6 +2944,27 @@ mod tests {
         l
     }
 
+    /// BX6 (obligation 6): a mark with no index, or too far from it, is
+    /// refused and counted; a stale one stops pricing (the last fill
+    /// prices the row again) until a fresh one arrives.
+    #[test]
+    fn marks_are_sane_and_fresh_or_they_do_not_price() {
+        let mut l = Ledger::new(anchor());
+        l.bind_instrument(&InstrumentSpec::new(LIN, LAW_LINEAR, 0, E6, 0)).unwrap();
+        let i = l.inst_find(LIN).unwrap();
+        l.on_mark(LIN, 100 * E6, 0, 1);
+        l.on_mark(LIN, 100 * E6, 89 * E6, 1);
+        assert_eq!((l.inst[i].mark_1e6, l.counters().marks_refused), (0, 2));
+        l.on_mark(LIN, 100 * E6, 91 * E6, 5);
+        assert_eq!(l.inst[i].mark_1e6, 100 * E6, "9 % from the index is sane");
+        l.expire_marks(5 + MARK_STALE_NS);
+        assert_eq!(l.inst[i].mark_1e6, 100 * E6, "not stale yet");
+        l.expire_marks(6 + MARK_STALE_NS);
+        assert_eq!((l.inst[i].mark_1e6, l.counters().marks_expired), (0, 1));
+        l.on_mark(LIN, 101 * E6, 101 * E6, 7 + MARK_STALE_NS);
+        assert_eq!(l.inst[i].mark_1e6, 101 * E6, "a fresh mark prices again");
+    }
+
     fn summary(s: SymbolId, mark_1e6: i64, index_1e6: i64) -> core_types::OptSummary {
         core_types::OptSummary::new(
             T0,
@@ -3006,7 +3071,7 @@ mod tests {
             l.projected_exposure_1e6(SLOT, sym(100), E6, true),
             l.slot_day_turnover_1e6(SLOT),
         );
-        l.on_mark(bn(1), 5 * E6);
+        l.on_mark(bn(1), 5 * E6, 5 * E6, 1);
         l.on_opt_summary(&summary(bn(4), E6, E6));
         assert_eq!(l.probe_instrument(sym(100), SLOT, E6, true, E6, None), None);
         assert_eq!(l.instrument_exposure_1e6(SLOT), 0);
@@ -3116,7 +3181,7 @@ mod tests {
             .probe_instrument(LIN, SLOT, 5 * E6, false, 10 * E6, None)
             .unwrap();
         assert_eq!(p.measure_1e6, 50 * E6, "no reference yet: the limit");
-        l.on_mark(LIN, 100 * E6);
+        l.on_mark(LIN, 100 * E6, 100 * E6, 1);
         let p = l
             .probe_instrument(LIN, SLOT, 5 * E6, false, 10 * E6, None)
             .unwrap();
@@ -3255,7 +3320,7 @@ mod tests {
         let mut l = inst();
         l.book_fill(&fill(T0, INV, true, 80_000 * E6, 3 * E6, 1));
         assert_eq!(l.instrument_exposure_1e6(SLOT), 300 * E6);
-        l.on_mark(INV, 120_000 * E6);
+        l.on_mark(INV, 120_000 * E6, 120_000 * E6, 1);
         assert_eq!(l.instrument_exposure_1e6(SLOT), 300 * E6);
         let p = l
             .probe_instrument(INV, SLOT, 2 * E6, true, 1, None)
@@ -3281,14 +3346,14 @@ mod tests {
         let mut l = inst();
         l.book_fill(&fill(T0, LIN, true, 100 * E6, 2 * E6, 1));
         assert_eq!(l.instrument_exposure_1e6(SLOT), 200 * E6, "the last fill");
-        l.on_mark(LIN, 150 * E6);
+        l.on_mark(LIN, 150 * E6, 150 * E6, 1);
         assert_eq!(l.instrument_exposure_1e6(SLOT), 300 * E6);
         assert_eq!(
             l.slot_exposure_1e6(SLOT),
             300 * E6,
             "part of the slot's sum"
         );
-        l.on_mark(LIN, 0);
+        l.on_mark(LIN, 0, 0, 1);
         assert_eq!(
             l.instrument_exposure_1e6(SLOT),
             300 * E6,
@@ -3314,7 +3379,7 @@ mod tests {
             let long = s == SPOT || rng(&mut x) & 1 == 0;
             let fpx = (rng(&mut x) % 100_000 + 1) as i64 * E6;
             l.book_fill(&fill(T0, s, long, fpx, open, 1));
-            l.on_mark(s, (rng(&mut x) % 100_000 + 1) as i64 * E6);
+            l.on_mark(s, (rng(&mut x) % 100_000 + 1) as i64 * E6, (rng(&mut x) % 100_000 + 1) as i64 * E6, 1);
             let px = (rng(&mut x) % 100_000 + 1) as i64 * E6;
             let q = (rng(&mut x) % (open as u64 / E6 as u64) + 1) as i64 * E6;
             let p = l.probe_instrument(s, SLOT, q, !long, px, None).unwrap();
@@ -3357,7 +3422,10 @@ mod tests {
                     f.strategy_id = (rng(&mut x) % EXEC_SLOTS as u64) as u8;
                     l.book_fill(&f);
                 }
-                2 => l.on_mark(s, (rng(&mut x) % 200_000) as i64 * E6),
+                2 => {
+                    let m = (rng(&mut x) % 200_000) as i64 * E6;
+                    l.on_mark(s, m, m, 1);
+                }
                 _ => l.on_opt_summary(&summary(
                     s,
                     (rng(&mut x) % 2_000) as i64 * E6,

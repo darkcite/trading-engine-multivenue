@@ -56,6 +56,10 @@ use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
 /// next idle moment, and the arm's own queue is what holds them.
 pub const RETIRED_DRAIN_MAX: usize = 64;
 
+/// How often the ledger's marks are checked for staleness (BX6, BX3
+/// obligation 6).
+pub const MARK_SWEEP_NS: u64 = 1_000_000_000;
+
 /// How often `exec.HALT` is checked on the idle path. One second: an
 /// operator reaching for a kill switch waits a second, and the engine
 /// thread does one `stat` per second rather than five hundred.
@@ -89,6 +93,8 @@ pub struct RoutedDispatcher<P: OrderDispatch, L: OrderDispatch> {
     /// check reads (the legacy anchor → Binance). `NONE` until
     /// [`Self::set_route_aliases`].
     aliases: RouteAliases,
+    /// Monotonic ns of the next mark staleness sweep (BX6).
+    mark_sweep_ns: u64,
     /// **BX3 (F9)** — the retirements drained, by `why`.
     retired: RetireCounters,
     /// **E6 commit 3** — the per-slot sticky halt.
@@ -162,6 +168,7 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             live,
             counters: RouteCounters::new(),
             aliases: RouteAliases::NONE,
+            mark_sweep_ns: 0,
             retired: RetireCounters::default(),
             halt: HaltState::new(),
             halt_path: None,
@@ -1157,7 +1164,9 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 }
                 self.counters.on_cancel_on_off();
                 let r = self.live.cancel(req);
-                if r.is_ok() {
+                // BX6 (BX3 obligation 2): a queued arm's `Ok` means QUEUED —
+                // the row is released on its confirmed retirement instead.
+                if r.is_ok() && !self.live.verbs_confirm_later(req.sym, venue, req.strategy_id) {
                     self.ledger
                         .on_cancel(req.client_oid, req.strategy_id as usize);
                 }
@@ -1170,7 +1179,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                     return Err(DispatchError::NoLiveRoute);
                 }
                 let r = self.live.cancel(req);
-                if r.is_ok() {
+                if r.is_ok() && !self.live.verbs_confirm_later(req.sym, venue, req.strategy_id) {
                     self.ledger
                         .on_cancel(req.client_oid, req.strategy_id as usize);
                 }
@@ -1204,7 +1213,10 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 // replacement is measured exactly as a fresh order is.
                 self.risk_check(req.order(), venue, RiskVerb::Replace(req.prev_client_oid()))?;
                 let r = self.live.modify(req);
-                if r.is_ok() {
+                // BX6 (BX3 obligation 2): for a queued arm the row is renamed
+                // on the arm's confirmed `Renamed`, never on `Ok`.
+                let o = req.order();
+                if r.is_ok() && !self.live.verbs_confirm_later(o.sym, venue, o.strategy_id) {
                     self.ledger.on_modify(
                         req.prev_client_oid(),
                         req.order().client_oid,
@@ -1306,6 +1318,23 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             drained += 1;
             self.ledger.on_cancel(r.client_oid, r.slot as usize);
             self.retired.count(r.why);
+        }
+        // BX6 (BX3 obligation 2): modifies a queued arm confirmed rename
+        // their rows now, at most `RETIRED_DRAIN_MAX` a poll.
+        let mut renamed = 0usize;
+        while renamed < RETIRED_DRAIN_MAX {
+            let Some(n) = self.live.try_next_renamed() else {
+                break;
+            };
+            renamed += 1;
+            self.ledger.on_modify(n.prev_client_oid, n.client_oid, n.slot as usize, n.sym, n.qty_1e6, n.buy != 0);
+        }
+        // BX6 (obligation 6): a mark that stopped arriving stops pricing
+        // (checked once a second; the ledger falls back to the last fill).
+        let now = core_time::now_ns();
+        if now >= self.mark_sweep_ns {
+            self.mark_sweep_ns = now + MARK_SWEEP_NS;
+            self.ledger.expire_marks(now);
         }
 
         // **E6 commit 3 — the halt machine runs HERE, not on the
@@ -1411,7 +1440,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         // linear and inverse rows (plan §3.5). One compare when no
         // instrument is bound.
         if event.channel == core_types::ChannelId::Mark as u8 {
-            self.ledger.on_mark(event.sym, event.v0);
+            self.ledger.on_mark(event.sym, event.v0, event.v1, event.ts_ns);
             return;
         }
         if event.channel != core_types::ChannelId::InstrumentRoll as u8 {
@@ -1489,8 +1518,9 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             *h = self.halt.reason(slot) as u8;
         }
         let l = self.ledger.counters();
-        // COPY: ExecCounters (648 B by repr(C) layout, const-asserted —
-        // the 272 B LiveArmCounters ride inside) returned by value across
+        let bn = self.live.venue_arm_counters(core_types::VenueId::Binance as u8);
+        // COPY: ExecCounters (936 B by repr(C) layout, const-asserted —
+        // two 272 B LiveArmCounters ride inside) returned by value across
         // the OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics
         // (+ once at the drain) —
         // it is COMPOSED here from the router, the halt state, the
@@ -1500,6 +1530,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         ExecCounters {
             configured: 1,
             modes,
+            arm_bn_present: u8::from(bn.is_some()),
             live_submits: c.live_submits,
             paper_submits: c.paper_submits,
             refused_off: c.refused_off,
@@ -1527,12 +1558,20 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             ledger_settles_unmatched: l.settles_unmatched,
             retired: self.retired.by_why,
             arm: self.live.arm_counters(),
+            ledger_marks_refused: l.marks_refused,
+            ledger_marks_expired: l.marks_expired,
+            arm_bn: bn.unwrap_or_default(),
         }
     }
 
     #[inline]
     fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
         self.live.arm_counters()
+    }
+
+    #[inline]
+    fn venue_arm_counters(&self, venue: u8) -> Option<clob_dispatcher::LiveArmCounters> {
+        self.live.venue_arm_counters(venue)
     }
 
     /// **S7-L1** — both arms; only the live one has anything resting
@@ -2639,6 +2678,12 @@ mod tests {
         day_bought: Option<(u64, i64)>,
         /// Orders the arm says ended without a fill (HYPARB L5).
         retired: Vec<(u64, u8)>,
+        /// BX6: the arm's cancel / modify `Ok` means QUEUED.
+        confirm_later: bool,
+        /// BX6: modifies the venue confirmed (`try_next_renamed`).
+        renamed: Vec<clob_dispatcher::Renamed>,
+        /// BX6: the `why` of the next retirements (EXPIRED if unset).
+        retire_why: Option<u8>,
     }
 
     /// `clob_dispatcher::HaltSignal` under a short name, so the test
@@ -2653,9 +2698,16 @@ mod tests {
             Ok(())
         }
         fn try_next_retired(&mut self) -> Option<clob_dispatcher::Retired> {
-            self.retired.pop().map(|(oid, slot)| {
-                clob_dispatcher::Retired::new(oid, slot, clob_dispatcher::RETIRED_EXPIRED)
-            })
+            let why = self.retire_why.unwrap_or(clob_dispatcher::RETIRED_EXPIRED);
+            self.retired
+                .pop()
+                .map(|(oid, slot)| clob_dispatcher::Retired::new(oid, slot, why))
+        }
+        fn verbs_confirm_later(&self, _sym: core_types::SymbolId, _venue: u8, _slot: u8) -> bool {
+            self.confirm_later
+        }
+        fn try_next_renamed(&mut self) -> Option<clob_dispatcher::Renamed> {
+            self.renamed.pop()
         }
         fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
             self.cancelled.push(req.client_oid);
@@ -3981,6 +4033,67 @@ mod tests {
             1,
             "and it reaches the surfaces"
         );
+    }
+
+    /// BX6 (BX3 obligation 2): a queued arm's cancel `Ok` releases nothing;
+    /// the confirmed `CANCELED_MEMBER` does. A refused cancel (no
+    /// retirement) leaves the working order counted. Break-and-watch:
+    /// releasing on `Ok` drops the count to 0 at the cancel.
+    #[test]
+    fn a_confirm_later_cancel_releases_on_the_retirement_only() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.live_mut().a_mut().confirm_later = true;
+        d.on_idle();
+        let o = order(3, VenueId::Hyperliquid, 9);
+        assert!(d.submit(&o).is_ok());
+        assert!(d.cancel(&CancelReq::of(&o, T0)).is_ok());
+        assert_eq!(d.ledger().slot_resting(3), 1, "queued, not done");
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1, "the venue has not confirmed");
+        d.live_mut().a_mut().retire_why = Some(clob_dispatcher::RETIRED_CANCELED_MEMBER);
+        d.live_mut().a_mut().retired.push((9, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 0);
+        let member = clob_dispatcher::RETIRED_CANCELED_MEMBER as usize;
+        assert_eq!(d.retired().by_why[member], 1);
+        // The other arm of the split still releases on `Ok`.
+        d.live_mut().a_mut().confirm_later = false;
+        let o2 = order(3, VenueId::Hyperliquid, 10);
+        assert!(d.submit(&o2).is_ok());
+        assert!(d.cancel(&CancelReq::of(&o2, T0)).is_ok());
+        assert_eq!(d.ledger().slot_resting(3), 0, "a synchronous arm's Ok is done");
+    }
+
+    /// BX6 (BX3 obligation 2): a queued arm's modify `Ok` renames nothing;
+    /// the confirmed `Renamed` renames and resizes the row, so the fills
+    /// of the new id consume it. Break-and-watch: renaming on `Ok` makes
+    /// the old id's fill unmatched.
+    #[test]
+    fn a_confirm_later_modify_renames_on_the_confirmation_only() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.live_mut().a_mut().confirm_later = true;
+        d.on_idle();
+        let o = order(3, VenueId::Hyperliquid, 9);
+        assert!(d.submit(&o).is_ok());
+        let mut repl = order(3, VenueId::Hyperliquid, 11);
+        repl.qty = Qty::from_raw(500_000);
+        assert!(d.modify(&ModifyReq::new(9, repl)).is_ok());
+        assert_eq!(d.live().a().modified, vec![(9, 11)]);
+        assert_eq!(d.ledger().slot_resting(3), 1);
+        // The venue confirms: the row becomes 11's (resized), once.
+        d.live_mut().a_mut().renamed.push(clob_dispatcher::Renamed::new(9, 11, 500_000, o.sym, 3, true));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1);
+        d.live_mut().a_mut().retired.push((9, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1, "the row is 11's now; 9 is gone");
+        d.live_mut().a_mut().retired.push((11, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 0);
     }
 
     /// BX3 (F9): one poll drains at most `RETIRED_DRAIN_MAX`; the rest

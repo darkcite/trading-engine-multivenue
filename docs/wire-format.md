@@ -580,6 +580,46 @@ carries the stream and then sends nothing.
   row). Instrument names and syms resolve through
   `options-manifest.tsv` / `instrument-manifest.tsv` as before.
 
+BX6, appended 2026-09-26 — **the Binance execution journal,
+`binance-exec.pmlr`** (PMLR `slot_kind = 8`, `SlotKind::Exec`), one per
+run in the run directory, written by the arm's cold `bn-journal` thread
+from an SPSC ring (1 024 records; a full ring drops a record and counts
+it, `GW_JOURNAL_DROPPED`). A 64 B header, then 64 B `ExecRecord` slots
+(`core_types::ExecRecord`, `#[repr(C, align(64))]`):
+
+| offset | field | type | meaning |
+|---|---|---|---|
+| 0 | `ts_ns` | u64 | monotonic ns of the observation |
+| 8 | `wall_ms` | u64 | wall ms on the gateway's venue clock |
+| 16 | `client_oid` | u64 | the member's order id (0 if none) |
+| 24 | `venue_oid` | u64 | the venue's order id (0 if none) |
+| 32 | `a` | i64 | by kind |
+| 40 | `b` | i64 | by kind |
+| 48 | `c` | i64 | by kind |
+| 56 | `code` | i32 | by kind |
+| 60 | `row` | u16 | the arm's instrument row |
+| 62 | `kind` | u8 | below |
+| 63 | `slot` | u8 | the strategy slot |
+
+| kind | name | `a` | `b` | `c` | `code` |
+|---|---|---|---|---|---|
+| 1 | ACK | 0 | 0 | 0 | 0 (`venue_oid` set) |
+| 2 | REJECT | filled ×1e6 (0 when refused locally) | quantity ×1e6 (likewise) | 0 | the venue's code (negative) or the gateway's own (9 001…9 008) |
+| 3 | FILL | price ×1e6 | quantity ×1e6, signed by side | commission ×1e6 | bits: 1 maker · 2 LOST (never reached lane 4; nothing booked) · 4 UNSEEN (booked without its trade: from a status answer or a cumulative `z`, at the implied average, commission 0 — exclude from fee and markout work) |
+| 4 | ENDED | filled ×1e6 | quantity ×1e6 | 0 | the `RETIRED_*` reason |
+| 5 | RECON | drift USD ×1e6 | unseen legs | foreign orders | 1 if reconciled |
+| 6 | MARGIN | ratio ×1e6 | equity USD ×1e6 | 1 on a `MARGIN_CALL` | 0 |
+| 7 | VENUE | 0 | 0 | 0 | the budget or lock code |
+| 8 | SWEEP | orders left | cancels sent | 0 | 0 |
+| 9 | ANCHOR | the E7 session anchor, equity USD ×1e6 | 0 | 0 | 0 |
+
+A FILL's `client_oid` is the member's id, or 0 for a liquidation, ADL,
+settlement or older-epoch fill. An ANCHOR record is also persisted by
+the writer to `binance-pnl-anchor.state` beside `exec.toml`: one line
+`<tag>\t<equity ×1e6>\t<unix s>`, the tag the first 8 bytes of SHA-256
+of the API key in hex (never the key); retried every second until the
+store succeeds.
+
 ### Options manifest — `options-manifest.tsv` (M2 close)
 
 Per-run sidecar written ONCE by the bin at boot, after discovery,

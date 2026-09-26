@@ -688,15 +688,19 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                         // in. `a_roll_binds_before_the_strategy_can_act`
                         // holds this.
                         self.disp.on_venue_event(&e);
-                        let mut ctx = EngineCtx {
-                            disp: &mut self.disp,
-                            decide_lat: &self.decide_lat,
-                            order_capture: self.order_capture.as_mut(),
-                            recent_orders: &mut self.recent_orders,
-                            lifecycle: &mut self.lifecycle,
-                            now,
-                        };
-                        self.strat.on_venue_event(&e, &mut ctx);
+                        // BX6 (O-BX29): an execution-only event (a Binance
+                        // mark) reaches the dispatcher, never a member.
+                        if e.flags & core_types::EVENT_FLAG_EXEC_ONLY == 0 {
+                            let mut ctx = EngineCtx {
+                                disp: &mut self.disp,
+                                decide_lat: &self.decide_lat,
+                                order_capture: self.order_capture.as_mut(),
+                                recent_orders: &mut self.recent_orders,
+                                lifecycle: &mut self.lifecycle,
+                                now,
+                            };
+                            self.strat.on_venue_event(&e, &mut ctx);
+                        }
                         self.events_dispatched = self.events_dispatched.wrapping_add(1);
                     }
                     None => break,
@@ -2930,6 +2934,44 @@ mod tests {
             vec!["dispatcher", "strategy", "submit"],
             "the dispatcher must be bound BEFORE a member can submit into the instance"
         );
+    }
+
+    /// BX6 (O-BX29): an execution-only event — a Binance mark — reaches the
+    /// dispatcher and NEVER a member; an unflagged one reaches both.
+    #[test]
+    fn an_exec_only_event_reaches_the_dispatcher_alone() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (_tp, tc) = split_tick_lanes();
+        let (mut ep, ec) = split_event_lanes();
+        let (_dp, dc) = split_depth_lanes();
+        let (_op, oc) = split_opt_lanes();
+        let (_sp, sc) = Ring::<Signal, SIGNAL_RING_SIZE>::new().split();
+        let (_fp, fc) = split_fill_lanes();
+        let (_ap, ac) = Ring::<AiCmd, AI_RING_SIZE>::new().split();
+        let (_tblp, tblc) = Ring::<RuleTableSlot, RULE_TABLE_RING_SLOTS>::new().split();
+        let mut eng = Engine::new(
+            SubmitsOnRoll { log: std::rc::Rc::clone(&log) },
+            OrderWitness { log: std::rc::Rc::clone(&log) },
+            tc,
+            ec,
+            dc,
+            oc,
+            sc,
+            fc,
+            ac,
+            Arc::new(AiIngressStatus::new()),
+            tblc,
+        );
+        eng.start().unwrap();
+        let lane = tick_lane_of(VenueId::Binance).unwrap();
+        let mark = ChannelEvent::new(1, VenueId::Binance, core_types::ChannelId::Mark, 513, 0, 0, 65_000_000_000, 65_000_000_000);
+        assert!(ep[lane].try_push_ref(&mark.with_flags(core_types::EVENT_FLAG_EXEC_ONLY)));
+        eng.tick(16);
+        assert_eq!(*log.borrow(), vec!["dispatcher"], "a member never sees an execution-only event");
+        assert!(ep[lane].try_push_ref(&mark));
+        eng.tick(16);
+        // The member (which submits on any event it sees) sees this one.
+        assert_eq!(*log.borrow(), vec!["dispatcher", "dispatcher", "strategy", "submit"]);
     }
 
     /// Dispatcher that refuses everything — capture-what-was-accepted

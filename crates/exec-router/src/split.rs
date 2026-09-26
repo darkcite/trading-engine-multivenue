@@ -134,6 +134,24 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
         }
     }
 
+    /// BX6 (obligation 2): the arm the order routes to answers — by the
+    /// slot, exactly as `cancel` and `modify` route.
+    #[inline]
+    fn verbs_confirm_later(&self, sym: SymbolId, venue: u8, strategy_id: u8) -> bool {
+        if strategy_id == self.slot {
+            self.b.verbs_confirm_later(sym, venue, strategy_id)
+        } else {
+            self.a.verbs_confirm_later(sym, venue, strategy_id)
+        }
+    }
+
+    fn try_next_renamed(&mut self) -> Option<clob_dispatcher::Renamed> {
+        match self.a.try_next_renamed() {
+            Some(r) => Some(r),
+            None => self.b.try_next_renamed(),
+        }
+    }
+
     fn stats(&self) -> DispatchStats {
         self.a.stats().merged(self.b.stats())
     }
@@ -209,6 +227,14 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
 
     fn arm_counters(&self) -> LiveArmCounters {
         self.a.arm_counters()
+    }
+
+    /// BX6: whichever arm trades `venue` (`a` asked first).
+    fn venue_arm_counters(&self, venue: u8) -> Option<LiveArmCounters> {
+        match self.a.venue_arm_counters(venue) {
+            Some(c) => Some(c),
+            None => self.b.venue_arm_counters(venue),
+        }
     }
 
     /// Both arms take their own orders off the venue on the way out.

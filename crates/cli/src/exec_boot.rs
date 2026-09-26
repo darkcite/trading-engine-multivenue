@@ -93,9 +93,26 @@ use tracing::info;
 /// slot 0 only ([`HYPEREVM_SLOT`]) and only together with Hyperliquid:
 /// its live arm (`cli::hyparb_live`) swaps on HyperEVM mainnet and
 /// hedges on Hyperliquid from the slot's own wallet.
+///
+/// **BX6 (obligation 9): `VenueId::Binance`**, for USDⓈ-M × classic (the
+/// products and modes this binary's gateway speaks; every other one is
+/// refused naming its phase), for at most ONE live slot (BX-7 as built),
+/// in the same commit as the O-BX18 side table and its reader, the
+/// `VenueLock` and `MarginRisk` producers and obligations 1–4 and 8.
 pub const LIVE_ARM_VENUES: &[u8] = &[
     core_types::VenueId::Hyperliquid as u8,
     core_types::VenueId::HyperEvm as u8,
+    core_types::VenueId::Binance as u8,
+];
+
+/// **BX6 (obligation 5)** — the venues whose live arm judges the E7
+/// session bound (reports an equity anchor and a delta). A slot two arms
+/// trade has its bound judged only when BOTH can (`HaltSignal::merged`
+/// ANDs `pnl_judged` and SUMS the deltas), so a bounded slot spanning an
+/// arm outside this set would never halt on it: refused at boot.
+pub const PNL_JUDGING_VENUES: &[u8] = &[
+    core_types::VenueId::Hyperliquid as u8,
+    core_types::VenueId::Binance as u8,
 ];
 
 /// The one slot with a live HyperEVM arm: `hyparb`. It is live on BOTH
@@ -141,6 +158,9 @@ pub struct ExecBoot {
     /// arm can read the budget floor without re-parsing. Cold; a
     /// `Vec` is fine at boot.
     pub slots: Vec<core_config::exec::ExecSlot>,
+    /// **BX6** — `[exec.binance]`, when the artifact has one (a live slot
+    /// naming binance cannot boot without it).
+    pub binance: Option<core_config::exec::ExecBinance>,
 }
 
 impl ExecBoot {
@@ -205,6 +225,15 @@ impl ExecBoot {
             unset_is_zero(weight),
             unset_is_zero(day_max),
         )
+    }
+
+    /// **BX6** — the one live slot whose route names Binance (BX-7 as
+    /// built: `resolve` refuses a second), which owns every bound row.
+    #[must_use]
+    pub fn binance_slot(&self) -> Option<usize> {
+        let bn = core_types::VenueId::Binance as u8;
+        (0..EXEC_SLOTS)
+            .find(|&s| self.live_mask & (1u8 << s) != 0 && self.route.venue_allowed(s as u8, bn))
     }
 
     /// Does a live slot OTHER than slot 0 trade Hyperliquid — i.e. is
@@ -423,19 +452,12 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             for v in &s.venues {
                 if !LIVE_ARM_VENUES.contains(v) {
                     let vname = core_config::exec::venue_name_from_id(*v).unwrap_or("?");
-                    // BX3: name the phase that supplies the arm, so the
-                    // refusal is a schedule and not a mystery.
-                    let when = if *v == core_types::VenueId::Binance as u8 {
-                        " Binance's live arm arrives with BX6 (docs/binance-exec-plan.md)."
-                    } else {
-                        ""
-                    };
                     return Err(format!(
                         "exec: slot {slot} ({slot_name}) is marked live for venue `{vname}`, \
                          but this binary has NO live execution arm for it (the arms compiled \
-                         in are hyperliquid, and hyperevm for slot 0). Slot {slot} can only be \
-                         \"paper\" or \"off\" on that venue. Refusing the boot rather than \
-                         trading it on paper under a live label.{when}"
+                         in are hyperliquid, binance (USDⓈ-M, classic), and hyperevm for slot \
+                         0). Slot {slot} can only be \"paper\" or \"off\" on that venue. \
+                         Refusing the boot rather than trading it on paper under a live label."
                     ));
                 }
             }
@@ -472,6 +494,8 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         // budget governor reads `request_budget_floor` from here.
         slots.push(s);
     }
+    check_binance(&slots, artifact_mask, file.binance.as_ref())?;
+    check_pnl_judged(&slots, artifact_mask)?;
 
     Ok(Some(ExecBoot {
         route,
@@ -480,7 +504,122 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         enabled: file.enabled,
         live_mask: artifact_mask,
         slots,
+        binance: file.binance,
     }))
+}
+
+/// **BX6** — what this binary's Binance arm can serve: at most one live
+/// slot (BX-7 as built — the one owner of every bound row), and only the
+/// products and account modes its gateway speaks (USDⓈ-M × classic);
+/// anything else is refused naming the phase that builds it.
+fn check_binance(
+    slots: &[core_config::exec::ExecSlot],
+    live_mask: u8,
+    section: Option<&core_config::exec::ExecBinance>,
+) -> Result<(), String> {
+    let bn = core_types::VenueId::Binance as u8;
+    let live: Vec<usize> = slots
+        .iter()
+        .filter(|s| s.slot < EXEC_SLOTS && live_mask & (1u8 << s.slot) != 0 && s.venues.contains(&bn))
+        .map(|s| s.slot)
+        .collect();
+    if live.is_empty() {
+        return Ok(());
+    }
+    if live.len() > 1 {
+        return Err(format!(
+            "exec: slots {live:?} are all marked live on binance; this binary's Binance arm has \
+             ONE owner slot (BX-7 as built: the owner books every venue-originated fill and \
+             holds every bound row). Arm one of them."
+        ));
+    }
+    let Some(b) = section else {
+        return Err(String::from("exec: a live binance slot needs an [exec.binance] section"));
+    };
+    if b.account_scope != "dedicated" {
+        return Err(format!(
+            "exec: [exec.binance] account_scope `{}` is not armable in this binary: on a shared \
+             account a foreign fill on an owned instrument is only counted (O-BX2a wants a halt) \
+             and the sweep's REST fallback cancels every order on a symbol. Use a dedicated \
+             account.",
+            b.account_scope
+        ));
+    }
+    // One failed reconciliation must not read as a stale one.
+    let owner = slots.iter().find(|s| s.slot == live[0]);
+    let stale_ms = owner.map_or(0, |s| s.halt_on_recon_stale_ms);
+    if stale_ms != 0 && b.recon_every_ms.saturating_mul(2) > stale_ms {
+        return Err(format!(
+            "exec: [exec.binance] recon_every_ms = {} is more than half of slot {}'s \
+             halt_on_recon_stale_ms = {stale_ms} — one late cycle would halt the slot as stale",
+            b.recon_every_ms, live[0]
+        ));
+    }
+    // The REST weight (§3.9): there is no run-time REQUEST_WEIGHT governor
+    // (a BX6 departure), so the worst steady load is judged here — the
+    // dead-man on every symbol, a reconciliation and margin re-reads at
+    // their fastest — against the arm's share of the IP's budget.
+    let max_symbols = owner.map_or(0, |s| s.max_symbols);
+    let weight = exec_binance::gov::arm_weight_per_min(
+        u64::try_from(max_symbols).unwrap_or(0),
+        u64::try_from(b.heartbeat_ms).unwrap_or(0),
+        u64::try_from(b.recon_every_ms).unwrap_or(0),
+    );
+    if weight > exec_binance::gov::ARM_WEIGHT_MAX_PER_MIN {
+        return Err(format!(
+            "exec: [exec.binance] heartbeat_ms = {} with slot {}'s max_symbols = {max_symbols} and \
+             recon_every_ms = {} weighs up to {weight} per minute — over the arm's {} of the IP's \
+             {} (each symbol's dead-man costs {} a heartbeat). Raise heartbeat_ms or lower \
+             max_symbols.",
+            b.heartbeat_ms,
+            live[0],
+            b.recon_every_ms,
+            exec_binance::gov::ARM_WEIGHT_MAX_PER_MIN,
+            exec_binance::gov::IP_WEIGHT_PER_MIN,
+            exec_binance::gov::W_COUNTDOWN
+        ));
+    }
+    let mode = exec_binance::mode::AccountMode::from_word(&b.account_mode)
+        .ok_or_else(|| format!("exec: [exec.binance] account_mode `{}` is unknown", b.account_mode))?;
+    for word in &b.products {
+        let product = exec_binance::inst::PRODUCT_WORDS
+            .iter()
+            .position(|w| w == word)
+            .and_then(|i| u8::try_from(i).ok())
+            .ok_or_else(|| format!("exec: [exec.binance] product `{word}` is unknown"))?;
+        if let Err(phase) = exec_binance::mode::built(product, mode) {
+            return Err(format!(
+                "exec: [exec.binance] arms `{word}` in account mode `{}`, which this binary's \
+                 Binance gateway does not speak yet — it arrives with {phase}. Refusing the boot \
+                 rather than trading a product the arm cannot sweep or reconcile.",
+                b.account_mode
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// **BX6 (obligation 5)** — a live slot with a session bound, traded by
+/// two arms, needs both to judge it ([`PNL_JUDGING_VENUES`]); otherwise
+/// the merged signal never reports it judged and the bound never fires.
+fn check_pnl_judged(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> Result<(), String> {
+    let bn = core_types::VenueId::Binance as u8;
+    for s in slots {
+        let bounded = s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0;
+        let two_arms = s.venues.contains(&bn) && s.venues.iter().any(|v| *v != bn);
+        if s.slot >= EXEC_SLOTS || live_mask & (1u8 << s.slot) == 0 || !bounded || !two_arms {
+            continue;
+        }
+        if let Some(v) = s.venues.iter().find(|v| !PNL_JUDGING_VENUES.contains(v)) {
+            return Err(format!(
+                "exec: slot {} has a session bound and is traded by two arms, but venue `{}`'s \
+                 arm never judges one — the bound could never fire. Drop the bound or the venue.",
+                s.slot,
+                core_config::exec::venue_name_from_id(*v).unwrap_or("?")
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// **BX3 — the boot-fixed route aliases** (plan §3.2 item 4, §13.2 F10).
@@ -514,6 +653,53 @@ pub fn route_aliases(
         }
         _ => Ok(clob_dispatcher::RouteAliases::NONE),
     }
+}
+
+/// **BX6 (obligation 7)** — the route alias sends every order on its id
+/// to Binance, so no instrument of the universe but the anchor itself
+/// (Binance spot\[0\]) may carry that id: another venue's market under
+/// it would be traded on Binance. `SYMBOL_ID_NONE` (no alias) passes.
+///
+/// # Errors
+/// The id is carried by another instrument; the message names it.
+pub fn check_alias_unique(
+    alias: core_types::SymbolId,
+    u: &core_config::universe::AllocatedUniverse,
+) -> Result<(), String> {
+    if alias == core_types::SYMBOL_ID_NONE {
+        return Ok(());
+    }
+    let refuse = |what: &str| {
+        Err(format!(
+            "exec: the Binance route alias {alias} is also the id of {what} — its orders would \
+             be sent to Binance (obligation 7). Give the Binance anchor its own id."
+        ))
+    };
+    if let Some(t) = u.pm_tokens.iter().find(|t| t.sym == alias) {
+        return refuse(&format!("polymarket token {}", t.token_id));
+    }
+    let lists: [&[core_config::universe::Instrument]; 14] = [
+        &u.bn_usdm,
+        &u.bn_dated,
+        &u.bn_coinm,
+        &u.bn_coinm_dated,
+        &u.okx,
+        &u.deribit,
+        &u.deribit_combos,
+        &u.hl,
+        &u.bybit_spot,
+        &u.bybit_linear,
+        &u.mexc_spot,
+        &u.mexc_perp,
+        &u.hyperevm,
+        u.bn_spot.get(1..).unwrap_or(&[]),
+    ];
+    for list in lists {
+        if let Some(i) = list.iter().find(|i| i.sym == alias) {
+            return refuse(&i.descriptor);
+        }
+    }
+    Ok(())
 }
 
 /// `3 (bin15)` / `3 (bin15), 5 (vm)` — for the interlock's message.
@@ -628,6 +814,29 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
             halt_file_path(&boot.path).display(),
         ));
     }
+    // BX6: the Binance arm's own knobs, on the one slot that owns it.
+    if let (Some(slot), Some(b)) = (boot.binance_slot(), boot.binance.as_ref()) {
+        let s = boot.slots.iter().find(|s| s.slot == slot);
+        lines.push(format!(
+            "exec: binance arm owner=slot {slot} network={} account={}/{} products=[{}] \
+             stp={} recv_window_ms={} countdown_ms={} heartbeat_ms={} recon_every_ms={} \
+             orders_frac_1e6={} qtr_frac_1e6={} max_symbols={} min_maker_ttl_ms={} spin={}",
+            b.network,
+            b.account_mode,
+            b.account_scope,
+            b.products.join(","),
+            b.stp_mode,
+            b.recv_window_ms,
+            b.countdown_ms,
+            b.heartbeat_ms,
+            b.recon_every_ms,
+            b.orders_frac_1e6,
+            b.qtr_frac_1e6,
+            s.map_or(0, |s| s.max_symbols),
+            s.map_or(0, |s| s.min_maker_ttl_ms),
+            u8::from(b.spin),
+        ));
+    }
     lines
 }
 
@@ -694,15 +903,32 @@ mod tests {
         // slot that does not name binance — and the template states the
         // recipe for a Binance slot: name the venue, uncomment the key.
         assert_eq!(s3.halt_on_margin_ratio_1e6, 0);
-        let bn = live
+        // BX6: the recipe is the key plus the `[exec.binance]` block, both
+        // uncommented — and the result must also RESOLVE (a gateway this
+        // binary has, the one owner slot).
+        let mut in_block = false;
+        let mut bn = String::new();
+        for l in live
             .replacen("venues = [\"hyperliquid\"]", "venues = [\"binance\"]", 1)
             .replacen(
                 "# halt_on_margin_ratio_1e6 = 600000",
                 "halt_on_margin_ratio_1e6 = 600000",
                 1,
-            );
+            )
+            .lines()
+        {
+            in_block |= l == "# [exec.binance]";
+            bn.push_str(if in_block { l.strip_prefix("# ").unwrap_or(l) } else { l });
+            bn.push('\n');
+        }
         let b = core_config::exec::parse(&bn).expect("the template's Binance recipe parses");
         assert_eq!(b.slot(3).halt_on_margin_ratio_1e6, 600_000);
+        assert_eq!(b.binance.as_ref().map(|b| b.products.clone()), Some(vec![String::from("usdm")]));
+        let d = tmp();
+        let p = write(&d, "exec.toml", &bn);
+        let eb = resolve(Some(&p), Some("3")).expect("the Binance recipe boots").unwrap();
+        assert_eq!(eb.binance_slot(), Some(3));
+        std::fs::remove_dir_all(&d).ok();
         let e = core_config::exec::parse(&live.replacen(
             "venues = [\"hyperliquid\"]",
             "venues = [\"binance\"]",
@@ -850,7 +1076,8 @@ mod tests {
             LIVE_ARM_VENUES,
             &[
                 core_types::VenueId::Hyperliquid as u8,
-                core_types::VenueId::HyperEvm as u8
+                core_types::VenueId::HyperEvm as u8,
+                core_types::VenueId::Binance as u8,
             ]
         );
         assert!(b.hl_arm_needed() && !b.hyparb_live());
@@ -905,45 +1132,155 @@ mod tests {
             enabled: true,
             live_mask,
             slots,
+            binance: None,
         };
         assert_eq!(boot.hl_address_numbers(), (3_000, 5_000, 20_000));
     }
 
-    /// **BX3** — Binance has no live arm until BX6. A live slot naming it
-    /// (with the margin key its artifact law requires) refuses the boot
-    /// with the standing message and names the phase; the same slot on
-    /// paper resolves, because paper never needs an arm.
+    /// The smallest valid `[exec.binance]` (core-config's own fixture).
+    const BN_SECTION: &str = "[exec.binance]\nnetwork = \"mainnet\"\naccount_mode = \"classic\"\n\
+         account_scope = \"dedicated\"\nproducts = [\"usdm\"]\nstp_mode = \"EXPIRE_MAKER\"\n";
+
+    /// Slot 3 live on binance, with the margin key its artifact law wants.
+    fn bn_live() -> String {
+        MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"binance\"]").replace(
+            "request_budget_floor = 2000\n",
+            "halt_on_margin_ratio_1e6 = 600000\n",
+        )
+    }
+
+    /// **BX6 (obligation 9)** — Binance has a live arm now: a live slot
+    /// naming it resolves with its `[exec.binance]` section and becomes the
+    /// arm's one owner; without the section, with a product or a mode the
+    /// gateway does not speak, or with a second live Binance slot, the
+    /// boot refuses and names why. Paper never needs an arm.
     #[test]
-    fn a_live_binance_slot_is_refused_until_its_arm_exists() {
+    fn a_live_binance_slot_resolves_with_its_section_and_nothing_else_does() {
         let d = tmp();
-        let bn = MINIMAL_LIVE
-            .replace("[\"hyperliquid\"]", "[\"binance\"]")
-            .replace(
-                "request_budget_floor = 2000\n",
-                "halt_on_margin_ratio_1e6 = 600000\n",
-            );
-        let p = write(&d, "exec.toml", &bn);
+        let p = write(&d, "exec.toml", &format!("{}{BN_SECTION}", bn_live()));
+        let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+        assert_eq!(b.binance_slot(), Some(3));
+        assert_eq!(b.binance.as_ref().map(|b| b.products.clone()), Some(vec![String::from("usdm")]));
+        assert!(!b.hl_arm_needed(), "a Binance-only slot needs no Hyperliquid arm");
+        assert!(LIVE_ARM_VENUES.contains(&(core_types::VenueId::Binance as u8)));
+        // No section: the artifact's own law refuses first.
+        let p = write(&d, "bare.toml", &bn_live());
         let e = resolve(Some(&p), Some("3")).unwrap_err();
-        assert!(e.contains("NO live execution arm"), "{e}");
-        assert!(e.contains("`binance`"), "must name the venue: {e}");
-        assert!(
-            e.contains("BX6"),
-            "must name the phase that supplies the arm: {e}"
-        );
-        // The artifact's own law comes first: no margin key, no boot.
-        let bare = MINIMAL_LIVE.replace("[\"hyperliquid\"]", "[\"binance\"]");
-        let p = write(&d, "no-margin.toml", &bare);
+        assert!(e.contains("[exec.binance]"), "{e}");
+        // A product this gateway does not speak names its phase.
+        for (from, to, phase) in [
+            ("products = [\"usdm\"]", "products = [\"spot\"]", "BX8"),
+            ("products = [\"usdm\"]", "products = [\"usdm\", \"coinm\"]", "BX7"),
+            ("account_mode = \"classic\"", "account_mode = \"pm\"", "BX7"),
+        ] {
+            let src = format!("{}{}", bn_live(), BN_SECTION.replace(from, to));
+            let p = write(&d, "unbuilt.toml", &src);
+            let e = resolve(Some(&p), Some("3")).unwrap_err();
+            assert!(e.contains(phase), "{to}: {e}");
+        }
+        // A shared account is not armable in this binary (its foreign-fill
+        // halt is not built).
+        let shared = BN_SECTION.replace("\"dedicated\"", "\"shared\"") + "owned_usdm = [\"BTCUSDT\"]\n";
+        let p = write(&d, "shared.toml", &format!("{}{shared}", bn_live()));
         let e = resolve(Some(&p), Some("3")).unwrap_err();
-        assert!(e.contains("halt_on_margin_ratio_1e6"), "{e}");
-        let p = write(
-            &d,
-            "paper.toml",
-            &bn.replace("mode = \"live\"", "mode = \"paper\""),
+        assert!(e.contains("account_scope `shared`"), "{e}");
+        // A reconciliation cadence one late cycle from a stale halt.
+        let slow = format!("{}{BN_SECTION}recon_every_ms = 200000\n", bn_live());
+        let p = write(&d, "slow.toml", &slow);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("more than half"), "{e}");
+        // A dead-man heavier than the arm's share of the IP's weight (S5).
+        let heavy = format!("{}{BN_SECTION}heartbeat_ms = 1000\n", bn_live());
+        let p = write(&d, "heavy.toml", &heavy);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("weighs up to"), "{e}");
+        // A second live Binance slot.
+        let two = format!(
+            "{}{}{BN_SECTION}",
+            bn_live(),
+            bn_live()
+                .replace("[exec]\n", "")
+                .replace("[exec.slot.3]", "[exec.slot.4]")
+                .replace("\"bin15\"", "\"ai-exec\"")
         );
+        let p = write(&d, "two.toml", &two);
+        let e = resolve(Some(&p), Some("3,4")).unwrap_err();
+        assert!(e.contains("ONE owner slot"), "{e}");
+        // Paper never needs an arm.
+        let p = write(&d, "paper.toml", &bn_live().replace("mode = \"live\"", "mode = \"paper\""));
         let b = resolve(Some(&p), None).unwrap().unwrap();
-        assert!(!b.any_live());
+        assert!(!b.any_live() && b.binance_slot().is_none());
         assert_eq!(b.slots[3].halt_on_margin_ratio_1e6, 600_000);
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **BX6 (obligation 5)** — a bounded slot two arms trade needs both to
+    /// judge the bound. Every venue with a live arm today does, so the check
+    /// is proved on a venue that has no judging arm. Break-and-watch:
+    /// without the check the okx slot passes.
+    #[test]
+    fn a_bounded_two_arm_slot_needs_both_arms_to_judge_it() {
+        let bn = core_types::VenueId::Binance as u8;
+        let hl = core_types::VenueId::Hyperliquid as u8;
+        let okx = core_types::VenueId::Okx as u8;
+        let mut s = core_config::exec::ExecSlot::paper_default(3);
+        s.mode = String::from("live");
+        s.halt_on_loss_usd_1e6 = 5_000_000;
+        s.venues = vec![hl, bn];
+        assert!(check_pnl_judged(&[s.clone()], 1 << 3).is_ok());
+        s.venues = vec![okx, bn];
+        let e = check_pnl_judged(&[s.clone()], 1 << 3).unwrap_err();
+        assert!(e.contains("okx"), "{e}");
+        s.halt_on_loss_usd_1e6 = 0;
+        assert!(check_pnl_judged(&[s.clone()], 1 << 3).is_ok(), "no bound, nothing to judge");
+        s.halt_on_loss_usd_1e6 = 5_000_000;
+        assert!(check_pnl_judged(&[s], 0).is_ok(), "a paper slot is never judged");
+        for v in LIVE_ARM_VENUES {
+            assert!(
+                PNL_JUDGING_VENUES.contains(v) || *v == core_types::VenueId::HyperEvm as u8,
+                "venue {v} has a live arm that never judges the bound"
+            );
+        }
+    }
+
+    /// **BX6** — the Binance arm's knobs reach the boot tell, on its owner.
+    #[test]
+    fn the_boot_tell_names_the_binance_arms_knobs() {
+        let d = tmp();
+        let p = write(&d, "exec.toml", &format!("{}{BN_SECTION}", bn_live()));
+        let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+        let tell = render_boot_tell(&b);
+        let line = tell.iter().find(|l| l.starts_with("exec: binance arm")).expect("a Binance line");
+        assert!(line.contains("owner=slot 3 network=mainnet account=classic/dedicated products=[usdm]"), "{line}");
+        assert!(line.contains("stp=EXPIRE_MAKER recv_window_ms=1000 countdown_ms=30000 heartbeat_ms=10000"), "{line}");
+        assert!(line.contains("max_symbols=20 min_maker_ttl_ms=5000"), "{line}");
+        let hl = write(&d, "hl.toml", MINIMAL_LIVE);
+        let b = resolve(Some(&hl), Some("3")).unwrap().unwrap();
+        assert!(render_boot_tell(&b).iter().all(|l| !l.contains("binance arm")));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **BX6 (obligation 7)** — the alias id is the anchor's alone: another
+    /// venue's instrument under it refuses; the anchor itself, and no
+    /// alias at all, pass. Break-and-watch: skipping the Binance spot tail
+    /// passes a second spot instrument under the anchor's id.
+    #[test]
+    fn the_alias_id_is_the_anchors_alone() {
+        use core_config::universe::{AllocatedUniverse, Instrument};
+        let i = |sym, d: &str| Instrument { sym, name: String::from("x"), descriptor: String::from(d) };
+        let mut u = AllocatedUniverse {
+            bn_spot: vec![i(7, "binance:btcusdt")],
+            hl: vec![i(0x0400_0001, "hyperliquid:BTC")],
+            ..AllocatedUniverse::default()
+        };
+        assert!(check_alias_unique(7, &u).is_ok());
+        assert!(check_alias_unique(core_types::SYMBOL_ID_NONE, &u).is_ok());
+        u.okx = vec![i(7, "okx:BTC-USDT")];
+        let e = check_alias_unique(7, &u).unwrap_err();
+        assert!(e.contains("okx:BTC-USDT") && e.contains("obligation 7"), "{e}");
+        u.okx.clear();
+        u.bn_spot.push(i(7, "binance:ethusdt"));
+        assert!(check_alias_unique(7, &u).unwrap_err().contains("binance:ethusdt"));
     }
 
     /// **BX3** — the alias exists only for a flat anchor: the legacy 7
@@ -1191,6 +1528,7 @@ mod tests {
             enabled: true,
             live_mask: 0b0000_1000,
             slots: vec![slot],
+            binance: None,
         };
         let lines = render_boot_tell(&boot);
         assert_eq!(lines.len(), 3, "header + caps + halts");

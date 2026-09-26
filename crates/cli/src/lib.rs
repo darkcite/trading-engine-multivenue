@@ -38,6 +38,7 @@ pub mod audit_pnl;
 pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
+pub mod bn_live;
 pub mod capture_catalog;
 pub mod evm_live;
 pub mod evm_shadow;
@@ -69,7 +70,7 @@ pub use paper::{
     spawn_bybit, spawn_deribit, spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx,
     spawn_polymarket, spawn_rpc, split_host_port, state_writer, AiIngressCounterIds,
     AiIngressStatus, BinanceConnSpec, BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers,
-    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, IngressCounterIds,
+    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, ExecObs, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
     RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };

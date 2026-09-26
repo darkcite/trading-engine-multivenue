@@ -10,7 +10,7 @@
 # few lines), the way an `unsafe` block carries `// SAFETY:`.
 #
 # This script lists every byte-copy verb in the given crate directories
-# (default: the exec lane incl. the Binance signer (BX4), core-net,
+# (default: the exec lane incl. the Binance signer (BX4) and arm (BX6), core-net,
 # core-ring, all nine ingress crates
 # (since the ZC pass of 2026-09-24) and the HYPARB lane's AMM math and
 # member) that has NO `COPY:` marker within the eight preceding lines,
@@ -71,7 +71,8 @@ if [ "${1:-}" = "--update-baseline" ]; then
 fi
 if [ "$#" -eq 0 ]; then
     set -- crates/exec-router crates/exec-hyperliquid crates/signer-eip712 \
-           crates/signer-evm crates/signer-ed25519 crates/exec-hyperevm crates/clob-dispatcher \
+           crates/signer-evm crates/signer-ed25519 crates/exec-binance crates/exec-hyperevm \
+           crates/clob-dispatcher crates/cli/src/bn_live.rs \
            crates/core-net \
            crates/core-ring crates/ingress-binance crates/ingress-okx crates/ingress-deribit \
            crates/ingress-hyperliquid crates/ingress-mexc crates/ingress-bybit \

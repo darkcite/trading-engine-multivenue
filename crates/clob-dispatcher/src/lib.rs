@@ -472,6 +472,29 @@ pub trait OrderDispatch {
         None
     }
 
+    /// **BX6 (BX3 obligation 2) — does this arm confirm a cancel or a
+    /// modify LATER?** A queued arm's `cancel` / `modify` `Ok` means
+    /// "queued", not "done": the venue may still refuse it. For such an
+    /// arm the router neither releases a cancelled order's resting row on
+    /// `Ok` (it releases on the confirmed [`RETIRED_CANCELED_MEMBER`]) nor
+    /// renames a modified one (it renames on the arm's [`Renamed`]).
+    /// Asked per order, by its route: a composite answers for the arm the
+    /// order reaches. Defaulted to `false` — an arm whose `Ok` IS the
+    /// venue's answer (the Hyperliquid arm, the paper matcher).
+    #[inline]
+    fn verbs_confirm_later(&self, _sym: SymbolId, _venue: u8, _strategy_id: u8) -> bool {
+        false
+    }
+
+    /// **BX6 (BX3 obligation 2) — a modify the venue confirmed**, for an
+    /// arm that [`OrderDispatch::verbs_confirm_later`]: the router renames
+    /// and resizes the resting row now. Drained by the router like
+    /// retirements (at most 64 per idle poll). Defaulted to none.
+    #[inline]
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
+        None
+    }
+
     /// Snapshot of dispatch counters.
     fn stats(&self) -> DispatchStats;
 
@@ -744,6 +767,19 @@ pub trait OrderDispatch {
         LiveArmCounters::default()
     }
 
+    /// **BX6 — one venue's live arm**, where a composition holds
+    /// several: `Some` from the arm that trades route venue `venue`, `None`
+    /// from everything else (the default). [`Self::arm_counters`] answers
+    /// the flat, first arm; this reaches the others (`/state`
+    /// `exec.arms.binance`). Cold: the 1 s publish.
+    // COPY: LiveArmCounters (272 B) in an Option by value — cold, once a
+    // second; composed by the arm on demand, so there is nothing to
+    // borrow — rejected: an out-param through every composite.
+    #[inline]
+    fn venue_arm_counters(&self, _venue: u8) -> Option<LiveArmCounters> {
+        None
+    }
+
     /// **S7-L1 — the engine is stopping: take every resting order of
     /// ours off the venue, NOW.**
     ///
@@ -876,7 +912,10 @@ pub struct LiveArmCounters {
 // and the byte bounds those comments state have drifted twice. Pinned.
 const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
 // BX3: + `refused_short`, `refused_unpriced` and `retired[8]` (80 B).
-const _: () = assert!(core::mem::size_of::<ExecCounters>() == 648);
+// BX6: + the two mark counters and the Binance arm's block (16 + 272 B;
+// `arm_bn_present` rides in padding).
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 936);
+const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).
@@ -909,6 +948,48 @@ impl Retired {
 }
 
 const _: () = assert!(core::mem::size_of::<Retired>() == 16);
+
+/// **BX6 (BX3 obligation 2) — a modify the venue confirmed**, as a
+/// confirm-later arm tells the router ([`OrderDispatch::try_next_renamed`]):
+/// the resting row of `prev_client_oid` becomes `client_oid` at
+/// `qty_1e6`. 32 B, `Copy`, moved by value (under the 64 B bound).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Renamed {
+    /// The id the member replaced.
+    pub prev_client_oid: u64,
+    /// The id it replaced it with.
+    pub client_oid: u64,
+    /// The confirmed quantity ×1e6.
+    pub qty_1e6: i64,
+    /// The instrument (the engine's id).
+    pub sym: SymbolId,
+    /// The strategy slot.
+    pub slot: u8,
+    /// 1 for a buy.
+    pub buy: u8,
+    /// Explicit padding.
+    _pad: [u8; 2],
+}
+
+impl Renamed {
+    /// One confirmed modify.
+    #[inline]
+    #[must_use]
+    pub const fn new(prev_client_oid: u64, client_oid: u64, qty_1e6: i64, sym: SymbolId, slot: u8, buy: bool) -> Self {
+        Self {
+            prev_client_oid,
+            client_oid,
+            qty_1e6,
+            sym,
+            slot,
+            buy: buy as u8,
+            _pad: [0; 2],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Renamed>() == 32);
 
 /// [`Retired::why`]: the venue refused the order after accepting it (a
 /// reverted swap, a post-acceptance reject).
@@ -1309,6 +1390,9 @@ pub struct ExecCounters {
     pub configured: u8,
     /// Per-slot `ExecMode as u8`. Only meaningful when `configured`.
     pub modes: [u8; EXEC_COUNTER_SLOTS],
+    /// **BX6** — `1` when [`Self::arm_bn`] holds a Binance arm's numbers.
+    /// (Sits in what was padding: no offset after it moves.)
+    pub arm_bn_present: u8,
     /// Orders routed to the live arm.
     pub live_submits: u64,
     /// Orders routed to the paper matcher.
@@ -1397,6 +1481,14 @@ pub struct ExecCounters {
     pub retired: [u64; RETIRED_WHY_SLOTS],
     /// The live arm's own numbers. Zeroed when there is no arm.
     pub arm: LiveArmCounters,
+    /// **BX6 (obligation 6)** — venue marks the ledger refused as
+    /// insane (a mark off its index by more than the law allows).
+    pub ledger_marks_refused: u64,
+    /// Rows whose mark went stale and stopped pricing.
+    pub ledger_marks_expired: u64,
+    /// **BX6** — the Binance arm's own numbers (`/state`
+    /// `exec.arms.binance`), valid when [`Self::arm_bn_present`].
+    pub arm_bn: LiveArmCounters,
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as

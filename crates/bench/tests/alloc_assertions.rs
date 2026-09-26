@@ -471,7 +471,7 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     let event_ring: std::sync::Arc<
         Ring<core_types::ChannelEvent, { core_types::EVENT_RING_SIZE }>,
     > = Ring::new();
-    let (mut etx, _erx) = event_ring.split();
+    let (mut etx, mut erx) = event_ring.split();
     let depth_ring: std::sync::Arc<Ring<core_types::DepthTopK, { core_types::DEPTH_RING_SIZE }>> =
         Ring::new();
     let (_dtx, _drx) = depth_ring.split();
@@ -653,6 +653,51 @@ fn binance_run_loop_steady_state_is_zero_alloc() {
     // unselected one never did.
     assert_eq!(rows, 2_000, "a tick per selected row per push");
     assert_eq!(summaries, 2_000, "a summary per selected row per push");
+
+    // ---- BX6 (O-BX29): the mark slot with the Mark bit ARMED (boot NOT
+    // measured) — the armed engine's mask: every mark is captured, then
+    // flagged in place and pushed onto the venue-event lane ----
+    let armed = core_types::EVENT_LANE_FUNDING | core_types::event_lane_bit(core_types::ChannelId::Mark);
+    let mut mdriver = bwl::Driver::new_mark_price(0xBA09u64, sym);
+    bwl::note_transport_ready(&mut mdriver, core_net::Status::Ready);
+    let mut mtransport = TestTransport::with_capacity(128 * 1024);
+    for step in 0..2 {
+        if step == 1 {
+            let _ = mtransport.drain_outgoing(&mut scratch);
+            let n = bn_upgrade_reply(0xBA09u64, &mut resp);
+            mtransport.inject_incoming(&resp[..n]);
+        }
+        bwl::drive_one(&mut mtransport, &mut mdriver, b"h", b"/", &mut prod, &mut etx, armed, &mut otx, &status, &mut capture)
+            .unwrap();
+    }
+    assert_eq!(mdriver.state(), bwl::State::Steady);
+    let mpayload: &[u8] = br#"{"e":"markPriceUpdate","E":1790000000000,"s":"BTCUSDT","p":"65000.10","i":"64998.20","P":"64999.00","r":"0.00010000","T":1790006400000}"#;
+    assert!(mpayload.len() > 125);
+    let mut mark_frame = [0u8; 512];
+    mark_frame[0] = 0x81;
+    mark_frame[1] = 126;
+    mark_frame[2..4].copy_from_slice(&(mpayload.len() as u16).to_be_bytes());
+    mark_frame[4..4 + mpayload.len()].copy_from_slice(mpayload);
+    let mark_len = 4 + mpayload.len();
+    let g3 = AllocGuard::new();
+    let (mut marks, mut fundings) = (0u64, 0u64);
+    for _ in 0..1_000u32 {
+        assert_eq!(mtransport.inject_incoming(&mark_frame[..mark_len]), mark_len);
+        bwl::drive_one(&mut mtransport, &mut mdriver, b"h", b"/", &mut prod, &mut etx, armed, &mut otx, &status, &mut capture)
+            .unwrap();
+        while let Some(ev) = erx.try_pop_ref() {
+            if ev.channel == core_types::ChannelId::Mark as u8 {
+                assert_eq!(ev.flags, core_types::EVENT_FLAG_EXEC_ONLY);
+                marks += 1;
+            } else {
+                fundings += 1;
+            }
+        }
+    }
+    let (allocs, bytes, _deallocs) = g3.delta();
+    assert_eq!(allocs, 0, "the armed Binance mark lane allocated {allocs} times ({bytes} B)");
+    assert_eq!((marks, fundings), (1_000, 1_000), "every mark flagged onto the lane, then its funding");
+
     assert_eq!(status.parse_errors_total(), 0);
     assert!(!capture.is_disabled());
     assert_eq!(capture.io_errors(), 0);
@@ -10086,4 +10131,482 @@ fn ledger_price_feed_steady_state() {
         allocs, 0,
         "gate 78: the price feed allocated {allocs} times ({bytes} B)"
     );
+}
+
+/// BX6 gates 79–80: two USDⓈ-M rows as discovery reports them.
+const BX6_FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.10","maxPrice":"4529764","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"1000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"100"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]},{"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","minPrice":"0.01","maxPrice":"300000","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","maxQty":"10000","minQty":"0.001"},{"filterType":"MAX_NUM_ORDERS","limit":200},{"filterType":"MIN_NOTIONAL","notional":"20"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":"4"}]}]}"#;
+
+/// **BX6 gate 79 — the Binance arm on the engine thread, in the engine's
+/// own shape**: `RoutedDispatcher<Paper, VenueSplit<NullLive, BnArm>>`
+/// with the anchor aliased to Binance and both rows bound in the ledger.
+///
+/// Every verb passes the router's risk gate, the split and the arm (the
+/// alias-first row, the BX-5 quantization, the order budget, QTR,
+/// breadth, the per-row cap) onto the command ring; the router's idle
+/// hook drains the gateway's events through the arm and takes its
+/// confirm-later retirements and renames into the ledger, sweeps the
+/// stale marks and reads the arm's counters. Inside the window: IoC and
+/// maker places on both sides of the aliased anchor and a native row —
+/// accepted, and once the venue's order budget is spent, refused —
+/// cancels, modifies, EVERY event kind the gateway sends, the marks (one
+/// of them stale: the sweep expires it), `/state`'s counters and, last,
+/// a venue lock that halts the slot and the sweep that clears it. Zero
+/// allocations.
+#[test]
+fn binance_arm_steady_state() {
+    use clob_dispatcher::{
+        CancelAllState, OrderDispatch, PaperDispatcher, RouteAliases, RETIRED_CANCELED_MEMBER,
+        RETIRED_EXPIRED, RETIRED_FILLED,
+    };
+    use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
+    use core_types::{CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, Side};
+    use exec_binance::arm::{ArmKnobs, BnArm};
+    use exec_binance::cmd::{
+        BnCmd, BnEvt, CMD_RING, EVT_ACK, EVT_BUDGET, EVT_CANCEL_FAILED, EVT_DAY, EVT_F_CLOCK_OK,
+        EVT_F_DEADMAN_OK, EVT_F_IOC, EVT_F_ORDER_UP, EVT_F_RECONCILED, EVT_F_SWEEP_DONE,
+        EVT_F_USER_UP, EVT_LOCK, EVT_MARGIN, EVT_MODIFIED, EVT_MODIFY_FAILED, EVT_POSITION,
+        EVT_RECON, EVT_REJECT, EVT_RETIRED, EVT_RING, EVT_SCAN_FAIL, EVT_STATUS, EVT_SWEEP,
+        EVT_TALLY, VERB_CANCEL, VERB_CANCEL_ALL, VERB_MODIFY, VERB_PLACE,
+    };
+    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::margin::{MarginBook, SLOTS};
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, RoutedDispatcher,
+        SlotCaps, VenueSplit, LAW_LINEAR,
+    };
+
+    const SLOT: u8 = 2;
+    const ALIAS: SymbolId = 7;
+    const N: u64 = 4_000;
+
+    // Boot-time construction — outside the window.
+    let mut disc = ingress_binance::discovery::BnDiscovery::new();
+    disc.ingest_body(BX6_FAPI).expect("gate 79 discovery");
+    let (mut t, mut w) = InstTable::new(ALIAS);
+    let eth = core_types::make_symbol_id(VenueId::Binance, 514);
+    let rows = [(ALIAS, &b"BTCUSDT"[..]), (eth, &b"ETHUSDT"[..])];
+    for (sym, name) in rows {
+        let row = disc.find(name).expect("gate 79 row");
+        t.bind(&mut w, &BindSpec { sym, product: PRODUCT_USDM, row, owned: true, maker_ok: true })
+            .expect("gate 79 bind");
+    }
+    let (cmd_tx, mut cmd_rx) = Ring::<BnCmd, CMD_RING>::new().split();
+    let (mut evt_tx, evt_rx) = Ring::<BnEvt, EVT_RING>::new().split();
+    let mut lim = [0i64; SLOTS];
+    lim[SLOT as usize] = 600_000;
+    let mut prod = [0u8; SLOTS];
+    prod[SLOT as usize] = 1 << PRODUCT_USDM;
+    let arm = BnArm::new(
+        cmd_tx,
+        evt_rx,
+        t,
+        ArmKnobs {
+            orders_frac_1e6: 1_000_000,
+            qtr_frac_1e6: 1_000_000,
+            owner_slot: SLOT,
+            max_symbols: 20,
+            min_maker_ttl_ns: 5_000_000_000,
+            margin: MarginBook::new(lim, prod),
+            anchor: core_time::WallAnchor::now(),
+        },
+    );
+    let bn = VenueId::Binance.to_u8();
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            SLOT as usize,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(i64::MAX, i64::MAX, i64::MAX, 1_024),
+            HaltLimits::none(),
+        )
+        .expect("gate 79 route");
+    let split = VenueSplit::new(bn, NullLiveDispatcher::new(), arm, &route);
+    let mut d = RoutedDispatcher::new(route, PaperDispatcher::new(), split, core_time::WallAnchor::now());
+    d.set_route_aliases(RouteAliases::NONE.with(ALIAS, bn).expect("gate 79 alias"));
+    for sym in [ALIAS, eth] {
+        d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0)).expect("gate 79 ledger row");
+    }
+    let healthy = |now: u64| {
+        let mut s = BnEvt::new(EVT_STATUS, now);
+        s.flags = EVT_F_ORDER_UP | EVT_F_USER_UP | EVT_F_CLOCK_OK | EVT_F_DEADMAN_OK;
+        s
+    };
+    let t0 = core_time::now_ns();
+    let mut r = BnEvt::new(EVT_RECON, t0);
+    r.flags = EVT_F_RECONCILED;
+    let mut day = BnEvt::new(EVT_DAY, t0);
+    day.slot = SLOT;
+    day.a = (t0 / 86_400_000_000_000) as i64;
+    assert!(evt_tx.try_push_ref(&healthy(t0)) && evt_tx.try_push_ref(&r) && evt_tx.try_push_ref(&day));
+    d.on_idle();
+    d.on_idle();
+    assert!(d.ledger().is_slot_seeded(SLOT as usize), "gate 79: the slot is seeded from the arm's day");
+    // A mark already stale when the window opens: the router's next sweep
+    // (once a second) expires it inside the window.
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let old = core_time::now_ns().saturating_sub(exec_router::ledger::MARK_STALE_NS + 1_000_000_000);
+    d.on_venue_event(&ChannelEvent::new(old, VenueId::Binance, ChannelId::Mark, eth, 0, 0, 3_000_000_000, 3_000_000_000));
+    let expired_before = d.ledger().counters().marks_expired;
+
+    // The venue's side keeps what a real one knows: a refused modify's new
+    // id names the order still resting under its previous one.
+    let mut aborted = [(0u64, 0u64); 16];
+    let mut aborted_at = 0usize;
+
+    let g = AllocGuard::new();
+    // The sweep is due: the stale mark stops pricing its row.
+    d.on_idle();
+    let (mut ok, mut refused, mut polls) = (0u64, 0u64, 0u64);
+    let mut i = 0u64;
+    while i < N {
+        let now = core_time::now_ns();
+        if i % 32 == 0 {
+            let _ = evt_tx.try_push_ref(&healthy(now));
+            for sym in [ALIAS, eth] {
+                let px = if sym == ALIAS { 65_000_000_000 } else { 3_000_000_000 };
+                d.on_venue_event(&ChannelEvent::new(now, VenueId::Binance, ChannelId::Mark, sym, i, 0, px, px + 10_000));
+            }
+        }
+        // The gateway's cold reports, one kind in turn.
+        if i % 64 == 16 {
+            let mut e = match (i / 64) % 6 {
+                0 => BnEvt::new(EVT_MARGIN, now),
+                1 => BnEvt::new(EVT_BUDGET, now),
+                2 => BnEvt::new(EVT_TALLY, now),
+                3 => BnEvt::new(EVT_POSITION, now),
+                4 => BnEvt::new(EVT_RECON, now),
+                _ => BnEvt::new(EVT_DAY, now),
+            };
+            e.product = PRODUCT_USDM;
+            e.slot = SLOT;
+            e.why = (i / 64 % 5) as u8;
+            e.a = if e.kind == EVT_MARGIN { 100_000 } else { (i & 7) as i64 };
+            e.b = 1_000_000_000;
+            e.c = 1_000_000_000;
+            e.flags = if e.kind == EVT_RECON { EVT_F_RECONCILED } else { 0 };
+            if e.kind == EVT_BUDGET {
+                // Already past: an observation, not a floor.
+                e.a = 1;
+            }
+            if e.kind == EVT_DAY {
+                e.a = (now / 86_400_000_000_000) as i64;
+            }
+            let _ = evt_tx.try_push_ref(&e);
+        }
+        let btc = i & 4 == 0;
+        let buy = i & 1 == 0;
+        let maker = i & 2 == 0;
+        // Off the tick and off the step: the quantization has work to do.
+        let (sym, px, qty) = if btc {
+            (ALIAS, 65_000_000_000 + (i % 100) as i64 * 100_000 + 37, 2_345)
+        } else {
+            (eth, 3_000_000_000 + (i % 100) as i64 * 10_000 + 3, 12_345)
+        };
+        let side = if buy { Side::Bid } else { Side::Ask };
+        let kind = if maker { ORDER_KIND_MAKER } else { ORDER_KIND_IOC };
+        let mut o = Order::new(now, VenueId::Binance, sym, side, kind, Price::from_raw(px), Qty::from_raw(qty), 10_000 + i);
+        o.strategy_id = SLOT;
+        o.ttl_ns = if maker { 6_000_000_000 } else { 0 };
+        if d.submit(&o).is_ok() {
+            ok += 1;
+            if maker && i % 8 < 4 {
+                let _ = d.cancel(&CancelReq::of(&o, now));
+            } else if maker {
+                let mut repl = o;
+                repl.client_oid = 1_000_000 + i;
+                repl.qty = Qty::from_raw(qty + 1_000);
+                let _ = d.modify(&ModifyReq::new(o.client_oid, repl));
+                let _ = d.cancel(&CancelReq::of(&repl, now));
+            }
+        } else {
+            refused += 1;
+        }
+        // The gateway's side: every command answered in order — now and
+        // then refused (a reject, a failed cancel, a failed modify).
+        while let Some(gc) = cmd_rx.try_pop_ref() {
+            let c: BnCmd = *gc;
+            drop(gc);
+            let e = match c.verb {
+                // An IoC refused (a maker's refusal would meet its cancel).
+                VERB_PLACE if i % 97 == 1 && c.kind != ORDER_KIND_MAKER => {
+                    let mut x = BnEvt::order(EVT_REJECT, now, c.client_oid, c.row, c.slot);
+                    x.code = -2019;
+                    x
+                }
+                VERB_PLACE if c.kind == ORDER_KIND_MAKER => BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot),
+                VERB_PLACE => {
+                    let _ = evt_tx.try_push_ref(&BnEvt::order(EVT_ACK, now, c.client_oid, c.row, c.slot));
+                    let mut x = BnEvt::order(EVT_RETIRED, now, c.client_oid, c.row, c.slot);
+                    x.why = if i % 3 == 0 { RETIRED_FILLED } else { RETIRED_EXPIRED };
+                    x.flags = EVT_F_IOC;
+                    x
+                }
+                VERB_MODIFY if i % 13 == 0 => {
+                    aborted[aborted_at & 15] = (c.client_oid, c.prev_client_oid);
+                    aborted_at += 1;
+                    let mut x = BnEvt::order(EVT_MODIFY_FAILED, now, c.client_oid, c.row, c.slot);
+                    x.a = c.prev_client_oid as i64;
+                    x.code = -1000;
+                    x
+                }
+                VERB_MODIFY => {
+                    let mut x = BnEvt::order(EVT_MODIFIED, now, c.client_oid, c.row, c.slot);
+                    x.a = c.prev_client_oid as i64;
+                    x.b = c.qty_1e6;
+                    x.c = c.px_1e6;
+                    x.side = c.side;
+                    x
+                }
+                VERB_CANCEL => {
+                    if i % 11 == 0 {
+                        let mut f = BnEvt::order(EVT_CANCEL_FAILED, now, c.client_oid, c.row, c.slot);
+                        f.code = -1000;
+                        let _ = evt_tx.try_push_ref(&f);
+                    }
+                    // The order ends under the id it rests by.
+                    let mut oid = c.client_oid;
+                    let mut k = 0;
+                    while k < aborted.len() {
+                        if aborted[k].0 == oid && oid != 0 {
+                            oid = aborted[k].1;
+                            aborted[k] = (0, 0);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    let mut x = BnEvt::order(EVT_RETIRED, now, oid, c.row, c.slot);
+                    x.why = RETIRED_CANCELED_MEMBER;
+                    x
+                }
+                _ => BnEvt::new(0, now),
+            };
+            let _ = evt_tx.try_push_ref(&e);
+        }
+        polls += d.on_idle() as u64;
+        if i % 256 == 0 {
+            std::hint::black_box(d.exec_counters());
+        }
+        i += 1;
+    }
+    // Last: a venue lock and a frame that did not scan halt the slot; the
+    // router asks for the sweep and the gateway confirms it clear.
+    let now = core_time::now_ns();
+    let _ = evt_tx.try_push_ref(&BnEvt::new(EVT_LOCK, now));
+    let _ = evt_tx.try_push_ref(&BnEvt::new(EVT_SCAN_FAIL, now));
+    let mut swept = 0u32;
+    let mut k = 0;
+    while k < 8 {
+        d.on_idle();
+        while let Some(gc) = cmd_rx.try_pop_ref() {
+            let verb = gc.verb;
+            drop(gc);
+            if verb == VERB_CANCEL_ALL {
+                swept += 1;
+                let mut s = BnEvt::new(EVT_SWEEP, core_time::now_ns());
+                s.flags = EVT_F_SWEEP_DONE;
+                let _ = evt_tx.try_push_ref(&s);
+            }
+        }
+        k += 1;
+    }
+    let state = d.live().cancel_all_state();
+    let (allocs, bytes, _) = g.delta();
+
+    assert!(ok > 100 && refused > 0, "both halves of the gate ran: {ok} accepted, {refused} refused");
+    assert!(polls > 100, "the idle hook drained events: {polls}");
+    let c = d.exec_counters();
+    assert!(c.arm_bn.submitted > 100 && c.arm_bn.rejected > 0, "{:?}", c.arm_bn);
+    assert!(d.ledger().counters().marks_expired > expired_before, "the stale mark was swept");
+    assert_eq!((swept, state), (1, CancelAllState::Clear), "the lock halted the slot and the sweep cleared it");
+    assert_eq!(allocs, 0, "gate 79: the Binance arm allocated {allocs} times ({bytes} B)");
+}
+
+/// **BX6 gate 80 — the Binance gateway's order path either side of the
+/// socket.** Everything the gateway thread does per order that is not
+/// the transport (gate 74c measures `WsConn` itself): the client id
+/// classified; `order.place`, `order.cancel`, `order.modify`,
+/// `order.status` and `v2/account.status` rendered — their numbers and
+/// client ids IN the frame — and masked by core-net's own writer into a
+/// send window; the answers and user events scanned in place and their
+/// rows found; the open-order table (insert, rename, remove), the TTL
+/// wheel, the trade-id and ended rings and the clock; the dead-man's
+/// signed query rendered and signed in its window, its answer and a
+/// refusal scanned; and — at their own cadence — the reconciliation's
+/// scans and judges. Zero allocations.
+#[test]
+fn binance_gateway_render_and_scan_steady_state() {
+    use exec_binance::cid::CidPrefix;
+    use exec_binance::clock::VenueClock;
+    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::oot::{EndedRing, Oot, TidRing};
+    use exec_binance::recon::{day_increasing_1e6, judge_positions, scan_um_account, Leg, PosRow, Verdict};
+    use exec_binance::rest::{scan_countdown, scan_error, scan_orders, scan_trades, OrderRow, QueryWriter, TradeRow};
+    use exec_binance::ttl::TtlWheel;
+    use exec_binance::userstream::{scan_user_event, UserEvent};
+    use exec_binance::wsapi::{
+        queue_account, queue_cancel, queue_modify, queue_place, queue_status, scan_answer, FrameSink,
+        Part, Place, WsAnswer, WsStatic,
+    };
+
+    const N: u64 = 20_000;
+    const PLACED: &[u8] = br#"{"id":17,"status":200,"result":{"orderId":8001,"symbol":"BTCUSDT","status":"NEW","clientOrderId":"mv6512ab0f2000000000000006500000","price":"65000.0","avgPrice":"0.00","origQty":"0.002","executedQty":"0","cumQuote":"0","timeInForce":"GTX","type":"LIMIT","side":"BUY","updateTime":1790000000000},"rateLimits":[{"rateLimitType":"ORDERS","interval":"SECOND","intervalNum":10,"limit":300,"count":1}]}"#;
+    const REFUSED: &[u8] = br#"{"id":18,"status":400,"error":{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected."}}"#;
+    const UPDATE: &[u8] = br#"{"e":"ORDER_TRADE_UPDATE","E":1790000000123,"T":1790000000120,"o":{"s":"BTCUSDT","c":"mv6512ab0f2000000000000006500000","S":"BUY","o":"LIMIT","f":"IOC","q":"0.002","p":"65000.0","ap":"64999.9","sp":"0","x":"TRADE","X":"FILLED","i":8001,"l":"0.002","z":"0.002","L":"64999.9","N":"USDT","n":"0.06499990","T":1790000000120,"t":9001,"b":"0","a":"0","m":false,"R":false,"wt":"CONTRACT_PRICE","ot":"LIMIT","ps":"BOTH","cp":false,"rp":"0","pP":false,"si":0,"ss":0,"V":"EXPIRE_MAKER","pm":"NONE","gtd":0}}"#;
+    const LITE: &[u8] = br#"{"e":"TRADE_LITE","E":1790000000121,"T":1790000000120,"s":"BTCUSDT","q":"0.002","p":"65000.0","m":false,"c":"mv6512ab0f2000000000000006500000","S":"BUY","L":"64999.9","l":"0.002","t":9001,"i":8001}"#;
+    const OPEN: &[u8] = br#"[{"avgPrice":"0.00","clientOrderId":"mv6512ab0f2000000000000006500000","cumQuote":"0","executedQty":"0","orderId":8001,"origQty":"0.002","price":"60000.0","side":"BUY","status":"NEW","symbol":"BTCUSDT","timeInForce":"GTX","type":"LIMIT","updateTime":1790000000000},{"avgPrice":"0.00","clientOrderId":"web_stranger_1","cumQuote":"0","executedQty":"0","orderId":7002,"origQty":"0.001","price":"90000.0","side":"SELL","status":"NEW","symbol":"BTCUSDT","timeInForce":"GTC","type":"LIMIT","updateTime":1790000000000}]"#;
+    const TRADES: &[u8] = br#"[{"buyer":true,"commission":"0.032","commissionAsset":"USDT","id":501,"maker":false,"orderId":4001,"price":"64000.0","qty":"0.001","quoteQty":"64.0","realizedPnl":"0","side":"BUY","positionSide":"BOTH","symbol":"BTCUSDT","time":1790000000001},{"buyer":false,"commission":"0.032","commissionAsset":"USDT","id":502,"maker":false,"orderId":4002,"price":"64100.0","qty":"0.001","quoteQty":"64.1","realizedPnl":"0.1","side":"SELL","positionSide":"BOTH","symbol":"BTCUSDT","time":1790000000002}]"#;
+    const ACCOUNT: &[u8] = br#"{"id":19,"status":200,"result":{"totalInitialMargin":"1.00","totalMaintMargin":"0.52","totalWalletBalance":"1000.00","totalMarginBalance":"1000.00","availableBalance":"999.00","assets":[{"asset":"USDT","walletBalance":"1000.00"}],"positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0.003","unrealizedProfit":"0.00","notional":"195.00","updateTime":1790000000000}]}}"#;
+
+    const COUNTDOWN: &[u8] = br#"{"symbol":"BTCUSDT","countdownTime":"30000"}"#;
+    const REST_REFUSED: &[u8] = br#"{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}"#;
+
+    /// The send window, as `WsConn`'s: one preallocated buffer, each frame
+    /// written and masked by core-net's own in-place writer.
+    struct Window {
+        buf: [u8; 4_096],
+        n: usize,
+        mask: u64,
+    }
+    impl FrameSink for Window {
+        fn queue_parts(&mut self, parts: &[Part<'_>]) -> Result<(), core_net::WsErr> {
+            self.mask = self.mask.wrapping_add(1);
+            let m = core_net::ws_mask_from_counter(self.mask);
+            self.n = core_net::ws_write_text_frame_with(&mut self.buf, parts, m).map_err(|_| core_net::WsErr::Overflow)?;
+            Ok(())
+        }
+    }
+
+    // Boot-time construction — outside the window.
+    let prefix = CidPrefix::new(0x6512_ab0f);
+    let st = WsStatic::new("EXPIRE_MAKER", 5_000);
+    let signer = signer_ed25519::Ed25519Signer::from_seed(&[0x5a; 32]).expect("gate 80 signer");
+    let mut disc = ingress_binance::discovery::BnDiscovery::new();
+    disc.ingest_body(BX6_FAPI).expect("gate 80 discovery");
+    let (mut table, mut wire) = InstTable::new(7);
+    for (sym, name) in [(7, &b"BTCUSDT"[..]), (core_types::make_symbol_id(VenueId::Binance, 514), &b"ETHUSDT"[..])] {
+        let row = disc.find(name).expect("gate 80 row");
+        table
+            .bind(&mut wire, &BindSpec { sym, product: PRODUCT_USDM, row, owned: true, maker_ok: true })
+            .expect("gate 80 bind");
+    }
+    let mut win = Window { buf: [0; 4_096], n: 0, mask: 0x6512 };
+    let mut rest_win = [0u8; 1_024];
+    let mut oot = Oot::new();
+    let mut ttl = TtlWheel::new(core_time::now_ns());
+    let mut tids = TidRing::<256>::new();
+    let mut ended = EndedRing::new();
+    let mut clock = VenueClock::new(core_time::WallAnchor::now());
+    let mut orders = [OrderRow::default(); 16];
+    let mut trades = [TradeRow::default(); 16];
+    let mut pos = [PosRow::default(); 8];
+    let mut legs = [Leg::default(); 2];
+    legs[0].owned = true;
+    let mut a = WsAnswer::default();
+    let mut ev = UserEvent::default();
+
+    let g = AllocGuard::new();
+    let (mut rendered, mut expired) = (0usize, 0u64);
+    let mut i = 0u64;
+    while i < N {
+        let now = core_time::now_ns();
+        let ts = 1_790_000_000_000 + i;
+        let side = (i & 1) as u8;
+        // The client ids the venue reports, classified.
+        std::hint::black_box(prefix.classify(b"mv6512ab0f2000000000000006500000"));
+        std::hint::black_box(prefix.classify(b"web_stranger_1"));
+        // The order session's requests, the client id rendered in place.
+        let px = 65_000_000_000 + (i % 100) as i64 * 100_000;
+        let cid = Part::Cid(&prefix, 2, 0x65 + i);
+        let mut o = Place {
+            symbol: wire.row(0).symbol(),
+            side,
+            maker: i & 2 == 0,
+            qty_1e6: 2_000,
+            qty_dec: 3,
+            px_1e6: px,
+            px_dec: 1,
+            cid,
+            ts_ms: ts,
+        };
+        queue_place(&mut win, 17 + i, &st, &o).expect("gate 80 place");
+        rendered += win.n;
+        queue_cancel(&mut win, 18 + i, &st, b"BTCUSDT", cid, ts).expect("gate 80 cancel");
+        o.qty_1e6 = 3_000;
+        queue_modify(&mut win, 19 + i, &st, &o).expect("gate 80 modify");
+        queue_status(&mut win, 20 + i, &st, b"BTCUSDT", cid, ts).expect("gate 80 status");
+        // A ghost's cancel, by the venue's own id.
+        queue_cancel(&mut win, 21 + i, &st, b"BTCUSDT", Part::Lit(b"mv65110000200000000000000004d00000"), ts)
+            .expect("gate 80 ghost cancel");
+        queue_account(&mut win, 22 + i, &st, ts).expect("gate 80 account");
+        rendered += win.n;
+        // Their answers and the user stream.
+        scan_answer(PLACED, &mut a).expect("gate 80 answer");
+        std::hint::black_box(a.venue_oid);
+        scan_answer(REFUSED, &mut a).expect("gate 80 refusal");
+        std::hint::black_box(a.code);
+        scan_user_event(UPDATE, &mut ev).expect("gate 80 update");
+        std::hint::black_box(prefix.classify(ev.cid.get(UPDATE)));
+        std::hint::black_box(wire.find(PRODUCT_USDM, ev.symbol.get(UPDATE)));
+        scan_user_event(LITE, &mut ev).expect("gate 80 lite");
+        std::hint::black_box(tids.seen_or_record(0, 9_000 + (i & 511)));
+        // The open-order table and the TTL wheel.
+        let ix = oot
+            .insert(2, 1_000 + i, 0, side, (i & 1) as u8, px, 2_000, now)
+            .expect("gate 80 insert");
+        ttl.insert(ix, now + 5_000_000_000);
+        assert!(oot.add_pending(ix, 2_000_000 + i, px, 3_000, now));
+        oot.confirm_rename(ix);
+        std::hint::black_box(oot.by_current(2, 2_000_000 + i));
+        ttl.remove(ix);
+        if i % 16 == 0 {
+            ttl.insert(ix, now);
+            while let Some(x) = ttl.pop_expired(now + 8_000_000) {
+                expired += (x == ix) as u64;
+            }
+        }
+        // S7: the place path's question, then the end and a late trade.
+        std::hint::black_box(ended.holds(2, 1_000 + i));
+        ended.record(2, 1_000 + i, now, 2_000, 2_000 * px as i128, i & 8 == 0);
+        if let Some(k) = ended.find(2, 1_000 + i) {
+            ended.add_filled(k, 1, px as i128);
+            ended.set_status_booked(k);
+            std::hint::black_box((ended.filled_1e6(k), ended.status_booked(k)));
+            // S1: a quantity booked without its trades, at the implied average.
+            std::hint::black_box(exec_binance::gateway::implied_px_1e6(2_002, px, ended.quote_1e12(k), 1));
+        }
+        oot.remove(ix);
+        // The clock.
+        std::hint::black_box(clock.sample(now, now + 40_000, 1_790_000_000_000 + i));
+        std::hint::black_box(clock.venue_ms(now));
+        // The dead-man's signed query, in its window.
+        let mut q = QueryWriter::new(&mut rest_win);
+        q.put(b"symbol=").put(b"BTCUSDT").put(b"&countdownTime=").uint(30_000);
+        q.put(b"&recvWindow=").uint(5_000).put(b"&timestamp=").uint(ts);
+        rendered += q.sign(&signer).expect("gate 80 sign");
+        std::hint::black_box(scan_countdown(COUNTDOWN).is_ok());
+        std::hint::black_box(scan_error(REST_REFUSED));
+        // The reconciliation, at its own cadence.
+        if i % 64 == 0 {
+            let n = scan_orders(OPEN, &mut orders).expect("gate 80 open orders");
+            std::hint::black_box(prefix.classify(orders[n - 1].cid.get(OPEN)));
+            let n = scan_trades(TRADES, &mut trades).expect("gate 80 trades");
+            std::hint::black_box(day_increasing_1e6(&mut trades[..n], 0, false, 0));
+            scan_answer(ACCOUNT, &mut a).expect("gate 80 account answer");
+            let snap = scan_um_account(ACCOUNT, a.result, &mut pos).expect("gate 80 account");
+            legs[0].venue_1e6 = pos[0].amt_1e6;
+            legs[0].booked_1e6 = snap.n_pos as i64 * 3_000;
+            let mut v = Verdict::default();
+            judge_positions(&mut legs, &mut v);
+            std::hint::black_box(v.reconciled());
+            std::hint::black_box(ended.ended_since(2, 1_000 + i, now));
+        }
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+
+    assert!(rendered > 0 && expired == N.div_ceil(16), "{rendered} B rendered, {expired} expired");
+    assert!(oot.is_empty());
+    std::hint::black_box(&table);
+    assert_eq!(allocs, 0, "gate 80: the gateway's render and scan allocated {allocs} times ({bytes} B)");
 }

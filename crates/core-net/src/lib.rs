@@ -74,8 +74,9 @@ pub use transport::{
 pub use ws_conn::{WsCfg, WsConn, WsErr, WsFramer, WsNext, WsProgress};
 pub use ws_frame::{
     ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_binary_frame_parts,
-    ws_write_ping, ws_write_pong, ws_write_text_frame, ws_write_text_frame_parts, PayloadSpan,
-    WsFrameHeader, WsOpcode, WsReadResult, WsWriteErr,
+    ws_write_ping, ws_write_pong, ws_write_text_frame, ws_write_text_frame_parts,
+    ws_write_text_frame_with, PayloadSpan, WsFrameHeader, WsOpcode, WsPart, WsReadResult,
+    WsWriteErr,
 };
 pub use ws_handshake::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,

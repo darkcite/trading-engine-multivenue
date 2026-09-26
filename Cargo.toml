@@ -71,6 +71,8 @@ members = [
     "crates/exec-hyperevm",
     # BX4 (O-BX5): the Binance arm's Ed25519 request signatures, on ring
     "crates/signer-ed25519",
+    # BX6: the Binance execution arm (engine half + gateway thread)
+    "crates/exec-binance",
 
     # --- engine + UI ---
     "crates/engine",
@@ -218,6 +220,7 @@ exec-hyperliquid = { path = "crates/exec-hyperliquid" }
 signer-eip712   = { path = "crates/signer-eip712" }
 signer-evm      = { path = "crates/signer-evm" }
 signer-ed25519  = { path = "crates/signer-ed25519" }
+exec-binance    = { path = "crates/exec-binance" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }
 
 engine          = { path = "crates/engine" }

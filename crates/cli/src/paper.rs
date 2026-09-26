@@ -1050,6 +1050,9 @@ pub fn bn_options_path(underlyings: &[String]) -> String {
 /// Spawn the M1 multi-symbol Binance ingress thread: N single-stream
 /// connections (ONE per instrument — the parser stays byte-frozen),
 /// ONE thread, ONE producer (single-writer law), one `"bn"` capture.
+/// `event_mask` is the lane's event set: `EVENT_LANE_FUNDING`, plus
+/// **BX6 (O-BX29)** the `Mark` bit when a Binance arm is armed — the
+/// marks then ride the event lane flagged for the dispatcher alone.
 /// `ingress_binance::run_multi` owns the in-thread reconnect pacing
 /// (one dial per poll iteration, jittered per-slot backoff). See
 /// [`spawn_polymarket`] for the capture-open / fail-fast contract.
@@ -1067,6 +1070,7 @@ pub fn spawn_binance_multi(
     epoch_ns: u64,
     tap_cfg: TapCfg,
     capture_metrics: CaptureMetrics,
+    event_mask: u16,
 ) -> io::Result<JoinHandle<()>> {
     let mut capture = GaugedCapture::new(
         PmlrCapture::open(run_dir, "bn", epoch_ns, tap_cfg)?,
@@ -1152,7 +1156,7 @@ pub fn spawn_binance_multi(
                 &mut conns,
                 &mut producer,
                 &mut event_tx,
-                EVENT_LANE_FUNDING,
+                event_mask,
                 &mut opt_tx,
                 &mut poll,
                 &mut events,
@@ -3557,10 +3561,7 @@ impl Observability {
     /// `exec.toml` is in force, `None` when there is no `--exec`.
     /// `None` registers NOTHING, which is what keeps `/metrics`
     /// byte-identical to a pre-E1 binary's on an unconfigured boot.
-    pub fn build(
-        enable_metrics: bool,
-        exec_modes: Option<[u8; clob_dispatcher::EXEC_COUNTER_SLOTS]>,
-    ) -> Result<Self, &'static str> {
+    pub fn build(enable_metrics: bool, exec_modes: Option<ExecObs>) -> Result<Self, &'static str> {
         let mut out = Observability::default();
         if enable_metrics {
             let mut reg = core_metrics::MetricsRegistry::new();
@@ -3791,7 +3792,7 @@ impl Observability {
             // NOTHING, which is what keeps `/metrics` byte-identical.
             let exec = match exec_modes.as_ref() {
                 None => None,
-                Some(m) => Some(register_exec_metrics(&mut reg, m)?),
+                Some(spec) => Some(register_exec_metrics(&mut reg, spec)?),
             };
             let fills_capture = {
                 let io_errors = reg
@@ -3981,6 +3982,17 @@ impl LatencyDump {
             interval_ns: seconds.saturating_mul(1_000_000_000),
         })
     }
+}
+
+/// What the exec metric family registers (E1): the per-slot modes, and
+/// **BX6** whether a Binance arm is armed (its router counters register
+/// only then).
+#[derive(Copy, Clone, Debug)]
+pub struct ExecObs {
+    /// Per-slot `ExecMode as u8`.
+    pub modes: [u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+    /// A live slot names binance.
+    pub binance: bool,
 }
 
 /// Optional observability surfaces wired around the engine loop.
@@ -4377,7 +4389,40 @@ pub struct ExecMetricIds {
     /// Fixed array rather than a `Vec` so [`MetricIds`] stays `Copy`,
     /// which the engine loop relies on.
     pub slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS],
+    /// **BX6** — registered with the first boot that can move them (a
+    /// live Binance slot, plan §5 BX3 item 11): `None` otherwise.
+    pub bn: Option<ExecBnMetricIds>,
 }
+
+/// **BX6** — the router counters only a Binance boot can move.
+#[derive(Copy, Clone, Debug)]
+pub struct ExecBnMetricIds {
+    /// `engine_exec_refused_short_total` — refused by an instrument law
+    /// (a spot sell past the holding; a short option that is not
+    /// writable).
+    pub refused_short: core_metrics::CounterId,
+    /// `engine_exec_retired_<why>_total`, in [`RETIRED_METRIC_NAMES`]
+    /// order — `engine_exec_retired_total` split by `why`.
+    pub retired: [core_metrics::CounterId; RETIRED_METRIC_NAMES.len()],
+    /// `engine_exec_ledger_marks_refused_total` — venue marks refused as
+    /// insane (obligation 6).
+    pub marks_refused: core_metrics::CounterId,
+    /// `engine_exec_ledger_marks_expired_total` — rows whose mark went
+    /// stale.
+    pub marks_expired: core_metrics::CounterId,
+}
+
+/// **BX6** — the per-`why` retirement counters, index = the `RETIRED_*`
+/// code (6 is never counted); `unknown` is the last slot.
+const RETIRED_METRIC_NAMES: [&str; 7] = [
+    "engine_exec_retired_rejected_total",
+    "engine_exec_retired_expired_total",
+    "engine_exec_retired_canceled_venue_total",
+    "engine_exec_retired_canceled_ttl_total",
+    "engine_exec_retired_canceled_member_total",
+    "engine_exec_retired_filled_total",
+    "engine_exec_retired_unknown_total",
+];
 
 /// E1: one live slot's metric handles.
 ///
@@ -5168,8 +5213,9 @@ fn live_arm_counter_values(a: &clob_dispatcher::LiveArmCounters) -> [u64; 30] {
 
 fn register_exec_metrics(
     reg: &mut core_metrics::MetricsRegistry,
-    modes: &[u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
+    spec: &ExecObs,
 ) -> Result<ExecMetricIds, &'static str> {
+    let modes = &spec.modes;
     let configured = reg
         .register_gauge("engine_exec_configured")
         .map_err(|_| "register engine_exec_configured")?;
@@ -5232,7 +5278,28 @@ fn register_exec_metrics(
                 .map_err(|_| "register exec slot gauge")?,
         });
     }
+    let bn = if spec.binance {
+        let mut retired_by = [core_metrics::CounterId::default(); RETIRED_METRIC_NAMES.len()];
+        for (i, name) in RETIRED_METRIC_NAMES.iter().enumerate() {
+            retired_by[i] = reg.register_counter(name).map_err(|_| "register exec retired")?;
+        }
+        Some(ExecBnMetricIds {
+            refused_short: reg
+                .register_counter("engine_exec_refused_short_total")
+                .map_err(|_| "register engine_exec_refused_short_total")?,
+            retired: retired_by,
+            marks_refused: reg
+                .register_counter("engine_exec_ledger_marks_refused_total")
+                .map_err(|_| "register engine_exec_ledger_marks_refused_total")?,
+            marks_expired: reg
+                .register_counter("engine_exec_ledger_marks_expired_total")
+                .map_err(|_| "register engine_exec_ledger_marks_expired_total")?,
+        })
+    } else {
+        None
+    };
     Ok(ExecMetricIds {
+        bn,
         configured,
         live_submits,
         paper_submits,
@@ -5326,6 +5393,24 @@ fn mirror_exec_metrics(
     reg.gauge(ids.pnl_anchor).set(cur.arm.pnl_anchor_usd_1e6);
     reg.gauge(ids.session_pnl).set(cur.arm.session_pnl_usd_1e6);
     reg.gauge(ids.seeded).set(i64::from(cur.seeded));
+    if let Some(bn) = ids.bn.as_ref() {
+        reg.counter(bn.refused_short)
+            .inc(cur.refused_short.saturating_sub(last.refused_short));
+        for (i, id) in bn.retired.iter().enumerate() {
+            // The last name is `unknown`: the dispatcher's own last slot.
+            let why = if i + 1 == RETIRED_METRIC_NAMES.len() {
+                clob_dispatcher::RETIRED_WHY_UNKNOWN
+            } else {
+                i
+            };
+            reg.counter(*id)
+                .inc(cur.retired[why].saturating_sub(last.retired[why]));
+        }
+        reg.counter(bn.marks_refused)
+            .inc(cur.ledger_marks_refused.saturating_sub(last.ledger_marks_refused));
+        reg.counter(bn.marks_expired)
+            .inc(cur.ledger_marks_expired.saturating_sub(last.ledger_marks_expired));
+    }
     for (s, slot) in ids.slots.iter().enumerate() {
         let Some(slot) = slot else { continue };
         reg.gauge(slot.mode).set(i64::from(cur.modes[s]));
@@ -6912,6 +6997,35 @@ fn fill_snapshot<S, D>(
     ex.refused_short = ec.refused_short;
     ex.refused_unpriced = ec.refused_unpriced;
     ex.retired = ec.retired;
+    // BX6: the mark law, and the Binance arm when there is one.
+    ex.ledger_marks_refused = ec.ledger_marks_refused;
+    ex.ledger_marks_expired = ec.ledger_marks_expired;
+    let bn = &ec.arm_bn;
+    ex.arms_binance = engine_snapshot::ArmSnapshot {
+        present: ec.arm_bn_present,
+        submitted: bn.submitted,
+        rejected: bn.rejected,
+        ioc_missed: bn.ioc_missed,
+        refused_local: bn.refused_local,
+        refused_stale: bn.refused_stale,
+        sent_unanswered: bn.sent_unanswered,
+        fills_booked: bn.fills_booked,
+        fills_unresolved: bn.fills_unresolved,
+        fills_foreign: bn.fills_foreign,
+        fills_dropped: bn.fills_dropped,
+        fills_unowned: bn.fills_unowned,
+        recon_ok: bn.recon_ok,
+        recon_failed: bn.recon_failed,
+        recon_drift_legs: bn.recon_drift_legs,
+        recon_unseen_legs: bn.recon_unseen_legs,
+        sweep_left: bn.sweep_left,
+        sweep_stalled: bn.sweep_stalled,
+        cancel_all_unqueued: bn.cancel_all_unqueued,
+        ws_reconnects: bn.ws_reconnects,
+        ws_connect_failures: bn.ws_connect_failures,
+        pnl_anchor_usd_1e6: bn.pnl_anchor_usd_1e6,
+        session_pnl_usd_1e6: bn.session_pnl_usd_1e6,
+    };
 
     let st = eng.ai_status();
     let a = &mut out.ai;
@@ -8170,6 +8284,11 @@ pub mod boot_discovery {
         /// caller skipped it (legacy flag boots keep their historical
         /// zero-REST Binance behavior — config boots audit).
         pub bn: Option<VenueCoverage>,
+        /// **BX6** — the USDⓈ-M rows (perpetual and dated) the audit
+        /// matched, `(configured name, row)` in configuration order: the
+        /// live Binance arm binds its instrument table from these, never
+        /// from a second fetch. Empty when the audit did not run.
+        pub bn_fapi_rows: Vec<(String, BnSymbolRow)>,
         /// M2.4: the selected Binance eapi options chain — `(symbol,
         /// sym)` in deterministic allocation order (base
         /// [`BN_OPT_ORDINAL_BASE`]), the OKX shape. The bin builds the
@@ -8882,6 +9001,7 @@ pub mod boot_discovery {
         lists: BnLists<'_>,
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
+        fapi_rows: &mut Vec<(String, BnSymbolRow)>,
     ) -> Result<VenueCoverage, &'static str> {
         let mut matched = 0u32;
         let mut universe = 0u32;
@@ -8964,6 +9084,19 @@ pub mod boot_discovery {
             }
             for sym in dated {
                 matched += audit_bn_symbol(&d, dated_market, sym, true, any_missing);
+            }
+            if page == "fapi" {
+                // BX6: the rows the live arm binds from (208 B each, boot).
+                for (sym, is_dated) in perps.iter().map(|s| (s, false)).chain(dated.iter().map(|s| (s, true))) {
+                    let (up, up_len) = upper_symbol(sym);
+                    if let Ok(row) = bn_row_audit(d.find(&up[..up_len]), is_dated) {
+                        // COPY: one discovery row (208 B) per configured
+                        // USDⓈ-M symbol, once at boot — the page's table
+                        // is dropped when this loop ends; keeping the whole
+                        // table for a few rows was rejected.
+                        fapi_rows.push((sym.clone(), *row));
+                    }
+                }
             }
             universe += d.universe_trading();
         }
@@ -9268,6 +9401,7 @@ pub mod boot_discovery {
             None => None,
         };
 
+        let mut bn_fapi_rows = Vec::new();
         let bn = match binance {
             Some(lists) if !lists.is_empty() => Some(run_bn(
                 cfg,
@@ -9275,6 +9409,7 @@ pub mod boot_discovery {
                 lists,
                 &mut buf,
                 &mut any_missing,
+                &mut bn_fapi_rows,
             )?),
             _ => None,
         };
@@ -9338,6 +9473,7 @@ pub mod boot_discovery {
             hl,
             hl_outcome_specs,
             bn,
+            bn_fapi_rows,
             bn_options,
             bybit: bybit_cov,
             mexc: mexc_cov,
@@ -11326,7 +11462,7 @@ mod tests {
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         modes[3] = 1;
         modes[6] = 2;
-        let obs = Observability::build(true, Some(modes)).unwrap();
+        let obs = Observability::build(true, Some(ExecObs { modes, binance: false })).unwrap();
         let reg = obs.metrics.as_ref().unwrap();
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).unwrap();
@@ -11365,8 +11501,51 @@ mod tests {
             "engine_exec_slot6_mode",
             "engine_exec_slot6_refused_total",
             "engine_exec_slot6_halted",
+            // BX6: only a Binance boot can move these.
+            "engine_exec_refused_short_total",
+            "engine_exec_retired_filled_total",
+            "engine_exec_ledger_marks_refused_total",
         ] {
             assert!(!text.contains(absent), "must NOT register {absent}");
+        }
+    }
+
+    /// **BX6** — a boot with a live Binance slot registers the router
+    /// counters only it can move (plan §5 BX3 item 11), and mirrors them:
+    /// the per-`why` retirements from their own slots (`unknown` from the
+    /// dispatcher's last), the short refusals and the mark law's two.
+    #[test]
+    fn a_binance_boot_registers_and_mirrors_its_router_counters() {
+        let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        modes[3] = 1;
+        let obs = Observability::build(true, Some(ExecObs { modes, binance: true })).unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let ids = obs.counter_ids.as_ref().and_then(|i| i.exec.as_ref()).expect("the exec family");
+        let cur = clob_dispatcher::ExecCounters {
+            refused_short: 2,
+            retired: [1, 2, 3, 4, 5, 6, 0, 9],
+            ledger_marks_refused: 7,
+            ledger_marks_expired: 8,
+            ..clob_dispatcher::ExecCounters::default()
+        };
+        let mut last = clob_dispatcher::ExecCounters::default();
+        mirror_exec_metrics(reg, ids, cur, &mut last);
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        for (name, v) in [
+            ("engine_exec_refused_short_total", 2),
+            ("engine_exec_retired_rejected_total", 1),
+            ("engine_exec_retired_canceled_member_total", 5),
+            ("engine_exec_retired_filled_total", 6),
+            ("engine_exec_retired_unknown_total", 9),
+            ("engine_exec_ledger_marks_refused_total", 7),
+            ("engine_exec_ledger_marks_expired_total", 8),
+        ] {
+            assert!(text.contains(&format!("{name} {v}\n")), "{name} {v}: {text}");
+        }
+        for n in RETIRED_METRIC_NAMES {
+            assert!(n.len() <= core_metrics::NAME_MAX);
         }
     }
 

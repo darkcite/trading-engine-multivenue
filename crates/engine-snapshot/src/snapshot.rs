@@ -615,6 +615,68 @@ pub struct ExecSnapshot {
     /// E7 session bound: spot USDC minus the anchor at the last
     /// reconciliation (USD ×1e6, signed; 0 while not anchored).
     pub arm_session_pnl_usd_1e6: i64,
+    /// **BX6 (obligation 6)** — venue marks the ledger refused as insane.
+    pub ledger_marks_refused: u64,
+    /// Rows whose mark went stale and stopped pricing.
+    pub ledger_marks_expired: u64,
+    /// **BX6** — the Binance arm (`exec.arms.binance`; rendered only
+    /// when `present`).
+    pub arms_binance: ArmSnapshot,
+}
+
+/// **BX6 — one venue arm's numbers** in `/state` `exec.arms.<venue>`:
+/// what it sent, what came back, what it booked, and what its
+/// reconciliation said. Mirrors the fields of the dispatcher's
+/// `LiveArmCounters` that mean something on every venue.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArmSnapshot {
+    /// `1` when the arm exists in this boot.
+    pub present: u8,
+    /// Orders the arm accepted onto its wire.
+    pub submitted: u64,
+    /// Refusals the venue returned.
+    pub rejected: u64,
+    /// IoCs that ended without a fill.
+    pub ioc_missed: u64,
+    /// Orders the arm refused before the wire (every local reason).
+    pub refused_local: u64,
+    /// Orders refused because the gateway was not ready.
+    pub refused_stale: u64,
+    /// Requests whose answer never came (in doubt, BX-11).
+    pub sent_unanswered: u64,
+    /// Fills booked onto the lane.
+    pub fills_booked: u64,
+    /// Fills of ours the arm could no longer match to an order.
+    pub fills_unresolved: u64,
+    /// Fills on orders the engine did not place (BX-8).
+    pub fills_foreign: u64,
+    /// Fills held back because the lane was full.
+    pub fills_dropped: u64,
+    /// Fills on an instrument no row was bound for.
+    pub fills_unowned: u64,
+    /// Reconciliations that agreed / that failed.
+    pub recon_ok: u64,
+    /// See [`Self::recon_ok`].
+    pub recon_failed: u64,
+    /// Legs that disagreed at the last reconciliation (a level).
+    pub recon_drift_legs: u64,
+    /// Venue legs no booked position explains (a level).
+    pub recon_unseen_legs: u64,
+    /// Orders a sweep left resting (a level).
+    pub sweep_left: u64,
+    /// Sweeps that gave up.
+    pub sweep_stalled: u64,
+    /// Cancel-alls the command ring would not take.
+    pub cancel_all_unqueued: u64,
+    /// Socket reconnects.
+    pub ws_reconnects: u64,
+    /// Socket failures.
+    pub ws_connect_failures: u64,
+    /// E7 session bound: the equity anchor (USD ×1e6; 0 = none yet).
+    pub pnl_anchor_usd_1e6: i64,
+    /// E7 session bound: equity minus the anchor (USD ×1e6, signed).
+    pub session_pnl_usd_1e6: i64,
 }
 
 /// The whole snapshot — see the module docs and plan §6.1.

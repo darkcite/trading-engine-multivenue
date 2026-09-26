@@ -58,8 +58,8 @@ use crate::https_conn::{static_server_name, MAX_HOST, MAX_PATH};
 use crate::iobuf::IoBuf;
 use crate::transport::{Status, TlsTransport, Transport};
 use crate::ws_frame::{
-    ws_mask_from_counter, ws_read_frame, ws_write_pong, ws_write_text_frame_parts, PayloadSpan,
-    WsOpcode, WsReadResult,
+    ws_mask_from_counter, ws_read_frame, ws_write_pong, ws_write_text_frame_with, PayloadSpan,
+    WsOpcode, WsPart, WsReadResult,
 };
 use crate::ws_handshake::{
     constant_time_eq, expected_accept, read_server_handshake, sec_websocket_key_from_seed,
@@ -257,9 +257,17 @@ impl WsFramer {
 
     /// Mask one text frame — the concatenation of `parts` — straight
     /// into the send window.
+    #[inline]
     pub fn queue_text(&mut self, parts: &[&[u8]]) -> Result<(), WsErr> {
+        self.queue_text_with(parts)
+    }
+
+    /// Mask one text frame whose parts render themselves straight into
+    /// the send window ([`WsPart`]: nothing is staged first).
+    #[inline]
+    pub fn queue_text_with<P: WsPart>(&mut self, parts: &[P]) -> Result<(), WsErr> {
         let mask = next_mask(&mut self.mask_ctr);
-        match ws_write_text_frame_parts(self.tx.free_mut(), parts, mask) {
+        match ws_write_text_frame_with(self.tx.free_mut(), parts, mask) {
             Ok(n) => {
                 self.tx.advance(n);
                 Ok(())
@@ -353,7 +361,10 @@ pub struct WsConn {
     addr: SocketAddr,
     /// Interned for the process's life (`https_conn::static_server_name`).
     host: &'static str,
-    path: Box<str>,
+    /// The request path, in a fixed buffer so a new path (BX6: a new
+    /// listenKey) never allocates ([`Self::set_path`]).
+    path: [u8; MAX_PATH],
+    path_len: usize,
     server_name: ServerName<'static>,
     tls_config: Arc<ClientConfig>,
     /// Successful TLS handshakes over the connection's life.
@@ -394,6 +405,11 @@ impl WsConn {
             .next()
             .ok_or(WsErr::Dns)?;
         let (host, server_name) = static_server_name(host).ok_or(WsErr::BadEndpoint)?;
+        let mut path_buf = [0u8; MAX_PATH];
+        // COPY: the path (≤ MAX_PATH B) into the session's own buffer — once
+        // at boot; the caller's string is not kept — borrowing it was
+        // rejected (a `'static` path could not follow a new listenKey).
+        path_buf[..p.len()].copy_from_slice(p);
         Ok(Self {
             phase: WsPhase::Down,
             eof: false,
@@ -409,9 +425,9 @@ impl WsConn {
             seed,
             addr,
             host,
-            // The path (≤ MAX_PATH B), once at boot, rendered into every
-            // handshake.
-            path: path.into(),
+            // The path (≤ MAX_PATH B), rendered into every handshake.
+            path: path_buf,
+            path_len: p.len(),
             server_name,
             tls_config,
             dials: 0,
@@ -454,6 +470,25 @@ impl WsConn {
     #[inline]
     pub fn set_addr(&mut self, addr: SocketAddr) {
         self.addr = addr;
+    }
+
+    /// **BX6** — the path the next [`Self::connect`] upgrades to (a
+    /// user-data stream's new listenKey). Only while the session is down;
+    /// the same checks as [`Self::new`]. Never allocates.
+    pub fn set_path(&mut self, path: &str) -> Result<(), WsErr> {
+        let p = path.as_bytes();
+        if self.phase != WsPhase::Down
+            || p.first() != Some(&b'/')
+            || p.len() > MAX_PATH
+            || !visible(p)
+        {
+            return Err(WsErr::BadEndpoint);
+        }
+        // COPY: the new path (≤ MAX_PATH B) into the fixed buffer — cold,
+        // once per new listenKey — the handshake is rendered from it.
+        self.path[..p.len()].copy_from_slice(p);
+        self.path_len = p.len();
+        Ok(())
     }
 
     /// Drop the socket; the next [`Self::connect`] starts a new session.
@@ -567,11 +602,20 @@ impl WsConn {
 
     /// Mask one text frame into the send window; it leaves with the
     /// next [`Self::flush`].
+    #[inline]
     pub fn queue_text(&mut self, parts: &[&[u8]]) -> Result<(), WsErr> {
+        self.queue_text_with(parts)
+    }
+
+    /// Mask one text frame whose parts render themselves straight into
+    /// the send window ([`WsPart`]); it leaves with the next
+    /// [`Self::flush`].
+    #[inline]
+    pub fn queue_text_with<P: WsPart>(&mut self, parts: &[P]) -> Result<(), WsErr> {
         if self.phase != WsPhase::Open {
             return Err(WsErr::Disconnected);
         }
-        self.framer.queue_text(parts)
+        self.framer.queue_text_with(parts)
     }
 
     /// Frames (or pongs) are queued and a socket is there to take them.
@@ -650,7 +694,7 @@ impl WsConn {
                 let n = match write_client_handshake(
                     self.framer.tx.free_mut(),
                     self.host.as_bytes(),
-                    self.path.as_bytes(),
+                    &self.path[..self.path_len],
                     &self.sec_key,
                 ) {
                     Ok(n) => n,
@@ -916,6 +960,27 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    /// BX6: a new listenKey is a new path, taken only while the session
+    /// is down, checked like the first, never allocated.
+    #[test]
+    fn set_path_takes_a_new_path_only_while_down() {
+        let tls = crate::TlsTransport::default_client_config();
+        let cfg = WsCfg {
+            rx_cap: MIN_WINDOW,
+            tx_cap: MIN_WINDOW,
+            establish_ns: 1,
+            idle_ns: 1,
+        };
+        let mut w = WsConn::new("localhost", 1, "/ws/a", tls, cfg, Token(1), 5).expect("localhost resolves");
+        assert!(w.set_path("/ws/bb").is_ok());
+        assert_eq!(&w.path[..w.path_len], b"/ws/bb");
+        assert_eq!(w.set_path("ws/no-slash"), Err(WsErr::BadEndpoint));
+        assert_eq!(w.set_path("/a b"), Err(WsErr::BadEndpoint));
+        let long = "/".repeat(MAX_PATH + 1);
+        assert_eq!(w.set_path(&long), Err(WsErr::BadEndpoint));
+        assert_eq!(&w.path[..w.path_len], b"/ws/bb", "a refused path changes nothing");
     }
 
     #[test]

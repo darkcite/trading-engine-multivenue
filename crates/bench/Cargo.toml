@@ -53,6 +53,8 @@ strategy-cross-arb   = { workspace = true }
 exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
 exec-hyperliquid     = { workspace = true }
+# BX6 gates 79-80: the Binance arm, and the gateway's render and scan.
+exec-binance         = { workspace = true }
 signer-eip712        = { workspace = true }
 # HYPARB H1 gate 63: the AMM walk + arb solve.
 core-amm             = { workspace = true }

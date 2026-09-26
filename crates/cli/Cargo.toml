@@ -61,6 +61,9 @@ exec-hyperliquid     = { workspace = true }
 # HYPARB H8: the HyperEVM write path, TESTNET ONLY (O-H5) — the shadow of
 # each paper AMM decision (O-H12) and the `evm-testnet` operator verbs.
 exec-hyperevm        = { workspace = true }
+# BX6: the engine's live Binance arm (`BnArm` + its gateway thread;
+# LIVE_ARM_VENUES), USDⓈ-M × classic.
+exec-binance         = { workspace = true }
 signer-eip712        = { workspace = true }
 zeroize              = { workspace = true }
 book-builder         = { workspace = true }
