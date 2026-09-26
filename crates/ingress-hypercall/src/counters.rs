@@ -86,7 +86,8 @@ pub struct HcWsCounters {
     pub quote_publish_lag_ms: AtomicU64,
     /// Instruments with at least one two-sided tick this process (gauge).
     pub quoted_instruments: AtomicU64,
-    /// Max providers seen on one quote this minute-ish (gauge).
+    /// Most providers seen on one quote (gauge; a process-lifetime
+    /// high-water mark).
     pub providers_max: AtomicU64,
     /// The index's age on the VENUE clock (ms, gauge): the freshest
     /// quote `published_at` minus the newest index entry's source stamp

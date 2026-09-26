@@ -6,6 +6,83 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — the Hypercall ingress is spawned: two threads, `/state` row 10, `--raw-tap hypercall`, the venue metrics (HC5)
+
+**What changed**
+
+- `cli::spawn_hypercall` (paper.rs) runs the HC3 crate whenever the HC4
+  discovery selected a chain:
+  - `ingress-hypercall` owns the public socket, the tick lane 7 / event
+    / opt lane 3 producers and the `"hypercall"` capture (+ the raw-tap
+    venue byte 9);
+  - `hypercall-poller` runs the REST `/options-summary` cycle on its own
+    thread (a request may block up to its deadline) and hands its rows
+    to the ingress thread over an SPSC ring. It resolves its host on its
+    own thread: a DNS failure ends the poller and leaves the quotes
+    running.
+  - The bin builds the universe table from the discovered chain and the
+    index table from `allocated.hypercall_idx`; the staleness threshold
+    is the venue default (500 ms) or `--stale-after-ms hypercall:<ms>`.
+  - Hypercall events stay capture-only: the event-lane mask is the v1
+    law (`EVENT_LANE_FUNDING`) and the venue has no funding.
+- `/state`: `SNAPSHOT_VENUES` 9 → 10; `hypercall` is the tenth ingress
+  row, appended after `hyperevm` (append, never reorder). The TUI's
+  ingress panel grows one row (derived).
+- `--raw-tap` accepts `hypercall` (and `all` includes it).
+- Metrics (`/metrics`):
+  - the standard per-venue set — `engine_ingress_hypercall_state`,
+    `_last_tick_age_seconds`, the 13 §6.4 counters + `_feed_delay_ema_ms`,
+    `_capture_{io_errors,records}`, `_coverage_configured`, and
+    `engine_ingress_hypercall_options_selected`;
+  - the venue family, 31 gauges mirrored from `HcCounters`
+    (`cli::HC_METRIC_NAMES`): closes by slow-consumer cause, subscribe
+    sets, one-sided / empty / crossed quotes, provider sides, ClockSyncs,
+    listings by action, foreign trades, venue errors, the publish-lag /
+    quoted-instruments / providers-max / index-age / clock-RTT gauges,
+    snapshot requests, and the poller's ok / err / rows / foreign rows /
+    snapshots / handoff drops / last round.
+  - A worst-case boot (every exec slot live) still fits the fixed
+    registry (a test builds it).
+- `crates/cli/tests/hypercall_live_smoke.rs` (`#[ignore]`): discovery,
+  then the production spawn against the REAL venue for a bounded window,
+  WITHOUT the engine (the MX9 shape — nothing binds 9191 or `ai.sock`).
+  Run from the Cowork container on 2026-09-26 (4 underlyings × E1 × K4,
+  90 s): 2 402 messages, 1 947 BBO ticks + 176 index Marks, 0 parse
+  errors, 0 reconnects, one subscribe set, 688 provider sides, 6 polls
+  → 48 summary rows, the capture holding every tick. The container's
+  egress re-signs TLS, so that run passed `HC_SMOKE_CA_BUNDLE` (test-only;
+  the engine trusts only the compiled-in roots).
+
+**Why**
+
+- HC5 of the Hypercall plan: the venue captures once `[hypercall]` is
+  configured.
+
+**Impact**
+
+- **On-disk formats:** a boot with `[hypercall]` writes
+  `hypercall-{ticks,events,opt-summary,signals,depth}.pmlr` (the uniform
+  file set; signals and depth header-only).
+- **`/state`:** one more ingress row (the array is append-only; readers
+  that index the first nine are unaffected).
+- **`/metrics`:** ~50 new names; nothing renamed.
+- **Threads:** two more when enabled.
+
+**Migration steps**
+
+1. To enable (the operator's step, at a restart he chooses — the session
+   never restarts the engine): add `[hypercall]` to
+   `~/multivenue/universe.toml` (O-HC2: the twelve underlyings,
+   `expiries = 3`, `strikes = 8`), `cargo build --release -p cli`, run the
+   live smoke (above) standalone first, then restart. After the restart:
+   `vm_rows_active ≥ 1` on `/state` (the restart law) and
+   `engine_ingress_hypercall_options_selected` = the selected chain.
+
+**Rollback**
+
+- Remove `[hypercall]` (the pre-HC5 boot, bit for bit), or revert the HC5
+  commit.
+
 ## 2026-09-26 — `[hypercall]` universe section, boot discovery, manifests, the descriptor caps (HC4)
 
 **What changed**

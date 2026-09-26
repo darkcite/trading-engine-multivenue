@@ -1130,6 +1130,10 @@ mod tests {
             mexc < hev,
             "hyperevm must follow mexc (append, never reorder)"
         );
+        let hc = body
+            .find("\"venue\":\"hypercall\"")
+            .expect("hypercall ingress row");
+        assert!(hev < hc, "hypercall must follow hyperevm (append, never reorder)");
         assert!(body.contains("\"heartbeat_age_s\":-1"));
     }
 

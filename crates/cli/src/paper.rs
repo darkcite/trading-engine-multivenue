@@ -67,6 +67,7 @@ use ingress_binance::run_loop as bwl;
 use ingress_bybit::run_loop as ywl;
 use ingress_deribit::run_loop as dwl;
 use ingress_hyperevm::run_loop as hel;
+use ingress_hypercall::run_loop as hcl;
 use ingress_hyperliquid::run_loop as hwl;
 use ingress_mexc::run_loop as mxl;
 use ingress_okx::run_loop as owl;
@@ -538,6 +539,7 @@ const _: () = {
     assert!(hwl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(ywl::DEFAULT_TICK_RING_CAP == TICK_RING_SIZE);
     assert!(mxl::TICK_RING_CAP == TICK_RING_SIZE);
+    assert!(hcl::TICK_RING_CAP == TICK_RING_SIZE);
     assert!(rwl::DEFAULT_SIGNAL_RING_CAP == SIGNAL_RING_SIZE);
 };
 
@@ -661,6 +663,12 @@ pub struct IngressStatusSet {
     /// logs + in-session snapshots). Down unless `--hyperevm-path` and
     /// `[hyperevm] pools` are both given.
     pub hyperevm: Arc<IngressStatus>,
+    /// HC5: the Hypercall WSS thread (one public socket; data-only,
+    /// O-HC1). Down unless `[hypercall]` selected a chain at boot.
+    pub hypercall: Arc<IngressStatus>,
+    /// HC5: the Hypercall venue counters (WS + REST poller). Venue-
+    /// specific, so they ride beside the generic slot, like `hl_roll`.
+    pub hc: Arc<ingress_hypercall::HcCounters>,
     /// BIN15 O2: the Hyperliquid ROLL counters. Venue-specific, so
     /// they could not live in the size-locked generic
     /// [`IngressStatus`] slot; they ride here so the metrics
@@ -669,7 +677,8 @@ pub struct IngressStatusSet {
 }
 
 impl IngressStatusSet {
-    /// Allocate all nine slots + the HL roll counters (boot only).
+    /// Allocate all ten slots + the HL roll and Hypercall counters (boot
+    /// only).
     pub fn new() -> Self {
         Self {
             polymarket: Arc::new(IngressStatus::new()),
@@ -681,6 +690,8 @@ impl IngressStatusSet {
             rpc: Arc::new(IngressStatus::new()),
             mexc: Arc::new(IngressStatus::new()),
             hyperevm: Arc::new(IngressStatus::new()),
+            hypercall: Arc::new(IngressStatus::new()),
+            hc: Arc::new(ingress_hypercall::HcCounters::new()),
             hl_roll: Arc::new(ingress_hyperliquid::family::HlRollStatus::new()),
         }
     }
@@ -1422,6 +1433,182 @@ pub fn spawn_mexc(
             status.set_state(IngressState::Down);
         },
     ))
+}
+
+/// HC5: everything [`spawn_hypercall`] moves onto the Hypercall threads,
+/// built by the bin from the HC4 discovery outcome.
+pub struct HypercallSpec {
+    /// WS host (`HYPERCALL_WS_HOST`); the path is `/ws`.
+    pub ws_host: String,
+    /// REST host (`HYPERCALL_REST_HOST`) — the `/options-summary` poller.
+    pub rest_host: String,
+    /// The universe: every selected option, `name → sym` (its clone
+    /// goes to the poller).
+    pub symbols: ingress_hypercall::HcSymbolTable,
+    /// Underlying → its `hypercall-idx:<U>` sym (the index `Mark`s).
+    pub underlyings: ingress_hypercall::HcUnderlyings,
+    /// The underlyings the poller refreshes, in config order.
+    pub summary_underlyings: Vec<String>,
+    /// Each underlying's refresh period (`[hypercall] summary_every_s`).
+    pub summary_every_s: u32,
+    /// VT2 staleness threshold (venue default or `--stale-after-ms`).
+    pub stale_after_ms: u32,
+}
+
+/// HC5: spawn the Hypercall ingress (data-only, ruling O-HC1) — TWO
+/// threads over ONE capture: `ingress-hypercall` owns the public
+/// socket, the tick / event / opt producers and the `"hypercall"`
+/// capture; `hypercall-poller` runs the REST `/options-summary` cycle
+/// (a request may block up to its deadline — never on the socket's
+/// thread) and hands its rows to the ingress thread over an SPSC ring,
+/// so every file and every lane keeps ONE writer (plan §3 HC3).
+///
+/// The poller resolves its host on its own thread: a DNS failure there
+/// ends the poller (an error line, `polls_err` flat) and leaves the
+/// quote stream running.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_hypercall(
+    spec: HypercallSpec,
+    tls_config: RustlsConfig,
+    mut ticks: Producer<Tick, TICK_RING_SIZE>,
+    mut events: Producer<ChannelEvent, EVENT_RING_SIZE>,
+    mut opts: Producer<OptSummary, OPT_RING_SIZE>,
+    status: Arc<IngressStatus>,
+    counters: Arc<ingress_hypercall::HcCounters>,
+    core_id: usize,
+    run_dir: &Path,
+    epoch_ns: u64,
+    tap_cfg: TapCfg,
+    capture_metrics: CaptureMetrics,
+) -> io::Result<[JoinHandle<()>; 2]> {
+    let mut capture = GaugedCapture::new(
+        PmlrCapture::open(run_dir, "hypercall", epoch_ns, tap_cfg)?,
+        capture_metrics,
+    );
+    if tap_cfg.mode != TapMode::Off {
+        capture.set_tap_venue_byte(run_dir, "hypercall", VenueId::Hypercall.to_u8())?;
+    }
+    let (handoff_tx, mut handoff_rx) =
+        Ring::<OptSummary, { hcl::HANDOFF_RING_CAP }>::new().split();
+    // Boot-time copy of the universe for the poller (its own thread).
+    let poller_symbols = spec.symbols.clone();
+    let poller_counters = counters.clone();
+    let rest_host = spec.rest_host;
+    let summary_underlyings = spec.summary_underlyings;
+    let every_s = spec.summary_every_s;
+    let poller_tls = tls_config.clone();
+    let poller = spawn_or_die(
+        thread::Builder::new().name("hypercall-poller".into()),
+        "hypercall-poller",
+        move || {
+            let http = match core_net::HttpsReq::new(
+                &rest_host,
+                443,
+                poller_tls,
+                ingress_hypercall::rest::REST_HEAD_CAP,
+                0,
+                ingress_hypercall::rest::REST_RESP_CAP,
+            ) {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::error!(error = ?e, host = %rest_host, "hypercall: poller client failed — no summary rows this run");
+                    return;
+                }
+            };
+            let names: Vec<&[u8]> = summary_underlyings.iter().map(|u| u.as_bytes()).collect();
+            let Some(mut p) = ingress_hypercall::rest::Poller::new(
+                http,
+                poller_symbols,
+                &names,
+                every_s,
+                handoff_tx,
+                poller_counters,
+            ) else {
+                tracing::error!(underlyings = names.len(), every_s, "hypercall: poller refused its targets");
+                return;
+            };
+            tracing::info!(host = %rest_host, underlyings = names.len(), every_s, "hypercall: poller running");
+            ingress_hypercall::rest::run_poller(&mut p, &SHUTDOWN);
+            tracing::info!("hypercall: poller returned");
+        },
+    );
+    let ingress = spawn_or_die(
+        thread::Builder::new().name("ingress-hypercall".into()),
+        "ingress-hypercall",
+        move || {
+            log_pin_outcome("hypercall", core_id);
+            let ep = match WssEndpoint::resolve(&spec.ws_host, 443, "/ws") {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!(error = ?e, host = %spec.ws_host, "hypercall: DNS failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let name = match TlsTransport::server_name_from_host(&ep.host) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hypercall: bad server name");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let (mut poll, mut mio_events, _token) = match new_poll() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = ?e, "hypercall: mio init failed");
+                    status.set_state(IngressState::Down);
+                    return;
+                }
+            };
+            let mut drv = hcl::Driver::new(now_ns(), spec.symbols, spec.underlyings);
+            drv.set_stale_after_ms(spec.stale_after_ms);
+            let mut conn = hcl::HcConn::new(
+                drv,
+                ep.host.as_bytes(),
+                Backoff::default_for_ingress(core_id as u64 + 1),
+            );
+            let mut lanes = hcl::Lanes {
+                ticks: &mut ticks,
+                events: &mut events,
+                // The v1 venue-event lane law: only funding flows —
+                // Hypercall has none, so its events are capture-only.
+                event_mask: EVENT_LANE_FUNDING,
+                opts: &mut opts,
+            };
+            status.set_state(IngressState::Connecting);
+            let res = hcl::run(
+                &mut conn,
+                &mut lanes,
+                &mut handoff_rx,
+                &mut poll,
+                &mut mio_events,
+                &SHUTDOWN,
+                &status,
+                &counters,
+                &mut capture,
+                || match connect_tls(&ep, &name, &tls_config) {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        tracing::warn!(error = ?e, host = %ep.host, "hypercall: connect failed");
+                        None
+                    }
+                },
+            );
+            // T1(a): name any recorded session error on the exit line.
+            let err = status.take_last_err();
+            tracing::info!(
+                ?res,
+                err_site = core_metrics::err_site_name(err.site),
+                io_kind = core_metrics::io_kind_name(err.io_kind),
+                venue_code = err.venue_code as i32,
+                "hypercall: run-loop returned"
+            );
+            capture.mirror_now();
+            status.set_state(IngressState::Down);
+        },
+    );
+    Ok([ingress, poller])
 }
 
 /// Build the boot-time OKX `instId → SymbolId` table from the
@@ -2695,6 +2882,9 @@ pub struct RawTapConfig {
     pub mexc: TapCfg,
     /// HYPARB H3b: tap config for the HyperEVM ingress.
     pub hyperevm: TapCfg,
+    /// HC5: tap config for the Hypercall ingress (every WS text
+    /// payload; the REST poller's bodies are not tapped).
+    pub hypercall: TapCfg,
 }
 
 /// Parse `--raw-tap <CSV|all>` + `--raw-tap-mode <rejects|all>` +
@@ -2702,7 +2892,7 @@ pub struct RawTapConfig {
 /// absent/empty ⇒ every venue gets [`TapCfg::off`] (default: none).
 /// `raw_tap` equal (after trim) to the literal `all` enables every
 /// venue; otherwise it's a comma-separated list of venue labels
-/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`), trimmed, non-empty, no
+/// (`pm`/`bn`/`okx`/`rpc`/`deribit`/`hl`/`bybit`/`mexc`/`hyperevm`/`hypercall`), trimmed, non-empty, no
 /// duplicates. Every enabled venue shares the same `mode` +
 /// `budget_mb` (×1 MiB → `TapCfg::budget_bytes`). Unknown venue
 /// labels and a bad `--raw-tap-mode` value both fail fast at parse —
@@ -2733,6 +2923,7 @@ pub fn parse_raw_tap_flags(
         bybit: TapCfg::off(),
         mexc: TapCfg::off(),
         hyperevm: TapCfg::off(),
+        hypercall: TapCfg::off(),
     };
 
     let spec = match raw_tap.map(str::trim).filter(|s| !s.is_empty()) {
@@ -2750,10 +2941,11 @@ pub fn parse_raw_tap_flags(
         cfg.bybit = enabled_cfg;
         cfg.mexc = enabled_cfg;
         cfg.hyperevm = enabled_cfg;
+        cfg.hypercall = enabled_cfg;
         return Ok(cfg);
     }
 
-    let mut seen: [&str; 9] = [""; 9];
+    let mut seen: [&str; 10] = [""; 10];
     for (n_seen, item) in spec.split(',').enumerate() {
         let label = item.trim();
         if label.is_empty() {
@@ -2776,6 +2968,7 @@ pub fn parse_raw_tap_flags(
             "bybit" => cfg.bybit = enabled_cfg,
             "mexc" => cfg.mexc = enabled_cfg,
             "hyperevm" => cfg.hyperevm = enabled_cfg,
+            "hypercall" => cfg.hypercall = enabled_cfg,
             _ => return Err("--raw-tap: unknown venue label"),
         }
     }
@@ -3631,6 +3824,9 @@ impl Observability {
             let ingress_hyperevm_state = reg
                 .register_gauge("engine_ingress_hyperevm_state")
                 .map_err(|_| "register engine_ingress_hyperevm_state")?;
+            let ingress_hypercall_state = reg
+                .register_gauge("engine_ingress_hypercall_state")
+                .map_err(|_| "register engine_ingress_hypercall_state")?;
             // T1(c) (outage 2026-08-27 §5.5): per-venue last-TICK age
             // in seconds. `*_state` lies on a 1 Hz-churning lane (a
             // sampler nearly always catches it mid-cycle at Up) and
@@ -3660,6 +3856,8 @@ impl Observability {
                     .map_err(|_| "register engine_ingress_mexc_last_tick_age_seconds")?,
                 reg.register_gauge("engine_ingress_hyperevm_last_tick_age_seconds")
                     .map_err(|_| "register engine_ingress_hyperevm_last_tick_age_seconds")?,
+                reg.register_gauge("engine_ingress_hypercall_last_tick_age_seconds")
+                    .map_err(|_| "register engine_ingress_hypercall_last_tick_age_seconds")?,
             ];
             // T1(c) / F12: age of the newest launchd restart-lane
             // slot stamp — the restart lane failing silently for 28 h
@@ -3707,6 +3905,7 @@ impl Observability {
             let ingress_rpc = register_ingress_counters(&mut reg, "rpc")?;
             let ingress_mexc = register_ingress_counters(&mut reg, "mexc")?;
             let ingress_hyperevm = register_ingress_counters(&mut reg, "hyperevm")?;
+            let ingress_hypercall = register_ingress_counters(&mut reg, "hypercall")?;
 
             // §6.5 capture-health gauges, one pair per spawnable
             // ingress thread (short capture-venue labels — see
@@ -3724,6 +3923,7 @@ impl Observability {
             let capture_rpc = register_capture_gauges(&mut reg, "rpc")?;
             let capture_mexc = register_capture_gauges(&mut reg, "mexc")?;
             let capture_hyperevm = register_capture_gauges(&mut reg, "hyperevm")?;
+            let capture_hypercall = register_capture_gauges(&mut reg, "hypercall")?;
 
             // §6.1 boot-discovery coverage gauges — PM/OKX/Deribit/HL
             // + Binance since M1 (exchangeInfo audit); RPC alone has
@@ -3735,6 +3935,7 @@ impl Observability {
             let coverage_binance = register_coverage_gauge(&mut reg, "bn")?;
             let coverage_bybit = register_coverage_gauge(&mut reg, "bybit")?;
             let coverage_mexc = register_coverage_gauge(&mut reg, "mexc")?;
+            let coverage_hypercall = register_coverage_gauge(&mut reg, "hypercall")?;
             // M2.1/M2.2: how many capped-chain option instruments
             // this boot selected + subscribed (0 = options lane off).
             let deribit_options_selected = reg
@@ -3746,6 +3947,12 @@ impl Observability {
             let binance_options_selected = reg
                 .register_gauge("engine_ingress_binance_options_selected")
                 .map_err(|_| "register engine_ingress_binance_options_selected")?;
+            let hypercall_options_selected = reg
+                .register_gauge("engine_ingress_hypercall_options_selected")
+                .map_err(|_| "register engine_ingress_hypercall_options_selected")?;
+            // HC5: the venue's own family (the slow-consumer law, quote
+            // shapes, the poller) — gauges mirrored from its atomics.
+            let hypercall = register_hypercall_metrics(&mut reg)?;
 
             // Phase-8f AI family: §4.4 counters + heartbeat-age gauge
             // (mirrored centrally from the shared status slot), the
@@ -3823,6 +4030,7 @@ impl Observability {
                 ingress_rpc_state,
                 ingress_mexc_state,
                 ingress_hyperevm_state,
+                ingress_hypercall_state,
                 ingress_last_tick_age,
                 restart_stamp_age,
                 max_tick_age_ns,
@@ -3836,6 +4044,7 @@ impl Observability {
                 ingress_rpc,
                 ingress_mexc,
                 ingress_hyperevm,
+                ingress_hypercall,
                 capture_pm,
                 capture_bn,
                 capture_okx,
@@ -3845,6 +4054,7 @@ impl Observability {
                 capture_rpc,
                 capture_mexc,
                 capture_hyperevm,
+                capture_hypercall,
                 coverage_pm,
                 coverage_okx,
                 coverage_deribit,
@@ -3852,9 +4062,12 @@ impl Observability {
                 coverage_binance,
                 coverage_bybit,
                 coverage_mexc,
+                coverage_hypercall,
                 deribit_options_selected,
                 okx_options_selected,
                 binance_options_selected,
+                hypercall_options_selected,
+                hypercall,
                 ingress_ai,
                 capture_ai,
                 fills_capture,
@@ -4133,10 +4346,13 @@ pub struct EngineCounters {
     pub ingress_mexc_state: core_metrics::GaugeId,
     /// HYPARB H3b: per-ingress state gauge, HyperEVM pool events.
     pub ingress_hyperevm_state: core_metrics::GaugeId,
+    /// HC5: per-ingress state gauge, Hypercall public WS.
+    pub ingress_hypercall_state: core_metrics::GaugeId,
     /// T1(c): per-venue last-tick-age gauges in seconds
     /// (`engine_ingress_<venue>_last_tick_age_seconds`; -1 = no tick
     /// since boot). Order: pm, bn, okx, deribit, hl, bybit, rpc, mexc,
-    /// hyperevm (the `SNAPSHOT_VENUES` / `ingress_lanes` order).
+    /// hyperevm, hypercall (the `SNAPSHOT_VENUES` / `ingress_lanes`
+    /// order).
     pub ingress_last_tick_age: [core_metrics::GaugeId; SNAPSHOT_VENUES],
     /// T1(c)/F12: newest restart-lane slot-stamp age in seconds
     /// (`engine_restart_stamp_age_seconds`; -1 = unreadable).
@@ -4167,6 +4383,8 @@ pub struct EngineCounters {
     pub ingress_mexc: IngressCounterIds,
     /// HYPARB H3b: §6.4 counters, HyperEVM pool events.
     pub ingress_hyperevm: IngressCounterIds,
+    /// HC5: §6.4 loss-accounting counters, Hypercall thread.
+    pub ingress_hypercall: IngressCounterIds,
     /// §6.5 capture-health gauges, Polymarket thread.
     pub capture_pm: CaptureGaugeIds,
     /// §6.5 capture-health gauges, Binance thread.
@@ -4185,6 +4403,9 @@ pub struct EngineCounters {
     pub capture_mexc: CaptureGaugeIds,
     /// HYPARB H3b: capture-health gauges, HyperEVM.
     pub capture_hyperevm: CaptureGaugeIds,
+    /// HC5: capture-health gauges, Hypercall (its REST rows included —
+    /// the ingress thread writes them).
+    pub capture_hypercall: CaptureGaugeIds,
     /// §6.1 boot-discovery coverage gauge, Polymarket (always runs).
     pub coverage_pm: GaugeId,
     /// §6.1 boot-discovery coverage gauge, OKX (0 when unconfigured).
@@ -4200,6 +4421,10 @@ pub struct EngineCounters {
     /// M2.4: same for the Binance eapi lane
     /// (`engine_ingress_binance_options_selected`).
     pub binance_options_selected: GaugeId,
+    /// HC5: same for Hypercall (`engine_ingress_hypercall_options_selected`).
+    pub hypercall_options_selected: GaugeId,
+    /// HC5: the Hypercall venue family ([`register_hypercall_metrics`]).
+    pub hypercall: HcMetricIds,
     /// §6.1 boot-discovery coverage gauge, Hyperliquid (0 when
     /// unconfigured).
     pub coverage_hyperliquid: GaugeId,
@@ -4212,6 +4437,9 @@ pub struct EngineCounters {
     /// MX6: boot-discovery coverage gauge, MEXC exchangeInfo +
     /// contract/detail audit (0 when the `[mexc]` section is empty).
     pub coverage_mexc: GaugeId,
+    /// HC5: boot-discovery coverage gauge, Hypercall `/markets`
+    /// (configured underlyings; 0 when `[hypercall]` is off).
+    pub coverage_hypercall: GaugeId,
     /// Phase-8f AI ingress family (`engine_ingress_ai_*` + the engine
     /// drain-site counter + heartbeat-age gauge).
     pub ingress_ai: AiIngressCounterIds,
@@ -6715,7 +6943,7 @@ pub fn state_writer(
 
 /// The ingress status slots in the T1(c) / `VENUE_NAMES` order:
 /// pm, bn, okx, deribit, hl, bybit, rpc, mexc (MX2, appended),
-/// hyperevm (HYPARB H3b, appended).
+/// hyperevm (HYPARB H3b, appended), hypercall (HC5, appended).
 #[inline]
 fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
     [
@@ -6728,6 +6956,7 @@ fn ingress_lanes(ing: &IngressStatusSet) -> [&IngressStatus; SNAPSHOT_VENUES] {
         &ing.rpc,
         &ing.mexc,
         &ing.hyperevm,
+        &ing.hypercall,
     ]
 }
 
@@ -7099,6 +7328,110 @@ fn register_coverage_gauge(
         .map_err(|_| "register coverage_configured gauge")
 }
 
+/// HC5: the Hypercall venue family, in [`HC_METRIC_NAMES`] order —
+/// every value is a GAUGE mirrored from the venue's own atomics
+/// (`ingress_hypercall::HcCounters`; the `_total` ones are monotonic by
+/// construction, the BIN15 roll-gauge precedent), so the mirror is a
+/// plain store per value, no delta bookkeeping.
+#[derive(Copy, Clone, Debug)]
+pub struct HcMetricIds {
+    /// One gauge per [`HC_METRIC_NAMES`] entry.
+    pub gauges: [GaugeId; HC_METRICS],
+}
+
+/// Size of the Hypercall family.
+pub const HC_METRICS: usize = 31;
+
+/// The Hypercall family's names — the ORDER is [`hc_metric_values`]'
+/// (pinned by a test). Closes by cause follow `HcCloseCause::ALL`.
+pub const HC_METRIC_NAMES: [&str; HC_METRICS] = [
+    "engine_ingress_hypercall_closes_message_limit_total",
+    "engine_ingress_hypercall_closes_byte_limit_total",
+    "engine_ingress_hypercall_closes_queue_age_total",
+    "engine_ingress_hypercall_closes_write_timeout_total",
+    "engine_ingress_hypercall_closes_slow_other_total",
+    "engine_ingress_hypercall_closes_other_total",
+    "engine_ingress_hypercall_subscribes_total",
+    "engine_ingress_hypercall_one_sided_quotes_total",
+    "engine_ingress_hypercall_empty_quotes_total",
+    "engine_ingress_hypercall_crossed_quotes_total",
+    "engine_ingress_hypercall_provider_quotes_total",
+    "engine_ingress_hypercall_clock_syncs_total",
+    "engine_ingress_hypercall_listings_created_total",
+    "engine_ingress_hypercall_listings_expired_total",
+    "engine_ingress_hypercall_listings_deleted_total",
+    "engine_ingress_hypercall_listings_other_total",
+    "engine_ingress_hypercall_foreign_trades_total",
+    "engine_ingress_hypercall_venue_errors_total",
+    "engine_ingress_hypercall_quote_publish_lag_ms",
+    "engine_ingress_hypercall_quoted_instruments",
+    "engine_ingress_hypercall_providers_max",
+    "engine_ingress_hypercall_index_age_ms",
+    "engine_ingress_hypercall_clock_rtt_ms",
+    "engine_ingress_hypercall_snapshot_requests_total",
+    "engine_ingress_hypercall_rest_polls_ok_total",
+    "engine_ingress_hypercall_rest_polls_err_total",
+    "engine_ingress_hypercall_rest_opt_rows_total",
+    "engine_ingress_hypercall_rest_foreign_rows_total",
+    "engine_ingress_hypercall_rest_snapshots_total",
+    "engine_ingress_hypercall_rest_handoff_drops_total",
+    "engine_ingress_hypercall_rest_last_round_ms",
+];
+
+/// Register the Hypercall family (boot-only).
+fn register_hypercall_metrics(reg: &mut MetricsRegistry) -> Result<HcMetricIds, &'static str> {
+    let mut gauges = [GaugeId::default(); HC_METRICS];
+    let mut i = 0usize;
+    while i < HC_METRICS {
+        gauges[i] = reg
+            .register_gauge(HC_METRIC_NAMES[i])
+            .map_err(|_| "register hypercall gauge")?;
+        i += 1;
+    }
+    Ok(HcMetricIds { gauges })
+}
+
+/// The Hypercall family's current values, in [`HC_METRIC_NAMES`] order.
+/// Relaxed loads — statistics, never a synchronization point.
+#[must_use]
+pub fn hc_metric_values(c: &ingress_hypercall::HcCounters) -> [u64; HC_METRICS] {
+    use ingress_hypercall::counters::get;
+    let (w, r) = (&c.ws, &c.rest);
+    [
+        get(&w.closes[0]),
+        get(&w.closes[1]),
+        get(&w.closes[2]),
+        get(&w.closes[3]),
+        get(&w.closes[4]),
+        get(&w.closes[5]),
+        get(&w.subscribes),
+        get(&w.one_sided_quotes),
+        get(&w.empty_quotes),
+        get(&w.crossed_quotes),
+        get(&w.provider_quotes),
+        get(&w.clock_syncs),
+        get(&w.listings[0]),
+        get(&w.listings[1]),
+        get(&w.listings[2]),
+        get(&w.listings[3]),
+        get(&w.foreign_trades),
+        get(&w.venue_errors),
+        get(&w.quote_publish_lag_ms),
+        get(&w.quoted_instruments),
+        get(&w.providers_max),
+        get(&w.index_age_ms),
+        get(&w.clock_rtt_ms),
+        get(&c.snapshot_req),
+        get(&r.polls_ok),
+        get(&r.polls_err),
+        get(&r.opt_rows),
+        get(&r.foreign_rows),
+        get(&r.snapshots),
+        get(&r.handoff_drops),
+        get(&r.last_round_ms),
+    ]
+}
+
 /// Last-mirrored cumulative values for one ingress — the registry
 /// wants monotonic increments, the status slot exposes cumulative
 /// totals; the delta lives here.
@@ -7241,10 +7574,10 @@ where
     let mut last_signals = 0u64;
     let mut last_orders = 0u64;
     // Last-mirrored snapshots for the §6.4 ingress counters
-    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm) so
-    // registry counters get monotonic deltas. Append-only: existing
-    // indices are load-bearing, new venues go at the end.
-    let mut ingress_last = [IngressCountersSnapshot::default(); 9];
+    // (pm, bn, okx, rpc, deribit, hyperliquid, bybit, mexc, hyperevm,
+    // hypercall) so registry counters get monotonic deltas. Append-only:
+    // existing indices are load-bearing, new venues go at the end.
+    let mut ingress_last = [IngressCountersSnapshot::default(); 10];
     // T1(c): last-tick-age derivation state per venue —
     // (ticks_total last seen, wall ns when it last advanced);
     // wall ns 0 = never ticked. Order pairs with
@@ -7530,6 +7863,16 @@ where
                         .set(ing.mexc.state() as i64);
                     reg.gauge(ids.ingress_hyperevm_state)
                         .set(ing.hyperevm.state() as i64);
+                    reg.gauge(ids.ingress_hypercall_state)
+                        .set(ing.hypercall.state() as i64);
+                    // HC5: the venue family — plain stores (see
+                    // `HcMetricIds`).
+                    let hc = hc_metric_values(&ing.hc);
+                    let mut k = 0usize;
+                    while k < HC_METRICS {
+                        reg.gauge(ids.hypercall.gauges[k]).set(hc[k] as i64);
+                        k += 1;
+                    }
                     // §6.4 loss accounting: mirror the per-thread
                     // cumulative counters into the registry as
                     // monotonic deltas (D4: ring_drops included).
@@ -7576,6 +7919,12 @@ where
                         &ids.ingress_hyperevm,
                         &ing.hyperevm,
                         &mut ingress_last[8],
+                    );
+                    mirror_ingress_counters(
+                        reg,
+                        &ids.ingress_hypercall,
+                        &ing.hypercall,
+                        &mut ingress_last[9],
                     );
 
                     // T1(c): per-venue last-tick age from the stamps
@@ -10132,6 +10481,69 @@ mod tests {
     ///
     /// HYPARB H6: the family's size is pinned — `RegErr::Full` is a
     /// refused boot, and the registry is shared by every family.
+    /// HC5: the Hypercall family is 31 gauges, every name distinct and
+    /// within `NAME_MAX`, and the value order IS the name order (the
+    /// mirror is positional). A worst-case boot — every exec slot live —
+    /// still fits the fixed registry with the new venue's ~50 rows.
+    #[test]
+    fn the_hypercall_family_is_31_gauges_in_value_order() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let (c0, g0) = (reg.counters_len(), reg.gauges_len());
+        let ids = register_hypercall_metrics(&mut reg).expect("register hypercall");
+        assert_eq!(reg.counters_len() - c0, 0, "gauges only");
+        assert_eq!(reg.gauges_len() - g0, HC_METRICS);
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for n in HC_METRIC_NAMES {
+            assert!(n.starts_with("engine_ingress_hypercall_"), "{n}");
+            assert!(n.len() <= core_metrics::NAME_MAX, "{n} is {} bytes", n.len());
+            assert!(seen.insert(n), "duplicate {n}");
+        }
+        // Positional: poke one distinct value into each source and read
+        // it back at its name's index.
+        let c = ingress_hypercall::HcCounters::new();
+        let mut k = 0u64;
+        for x in c.ws.closes.iter() {
+            k += 1;
+            x.store(k, Ordering::Relaxed);
+        }
+        c.ws.subscribes.store(7, Ordering::Relaxed);
+        c.ws.crossed_quotes.store(10, Ordering::Relaxed);
+        c.ws.listings[1].store(14, Ordering::Relaxed);
+        c.ws.clock_rtt_ms.store(23, Ordering::Relaxed);
+        c.snapshot_req.store(24, Ordering::Relaxed);
+        c.rest.handoff_drops.store(30, Ordering::Relaxed);
+        c.rest.last_round_ms.store(31, Ordering::Relaxed);
+        let v = hc_metric_values(&c);
+        assert_eq!(&v[..6], &[1, 2, 3, 4, 5, 6], "closes in HcCloseCause::ALL order");
+        let at = |name: &str| HC_METRIC_NAMES.iter().position(|n| *n == name).expect(name);
+        for (i, cause) in ingress_hypercall::HcCloseCause::ALL.iter().enumerate() {
+            assert_eq!(at(&format!("engine_ingress_hypercall_closes_{}_total", cause.label())), i);
+        }
+        assert_eq!(v[at("engine_ingress_hypercall_subscribes_total")], 7);
+        assert_eq!(v[at("engine_ingress_hypercall_crossed_quotes_total")], 10);
+        assert_eq!(v[at("engine_ingress_hypercall_listings_expired_total")], 14);
+        assert_eq!(v[at("engine_ingress_hypercall_clock_rtt_ms")], 23);
+        assert_eq!(v[at("engine_ingress_hypercall_snapshot_requests_total")], 24);
+        assert_eq!(v[at("engine_ingress_hypercall_rest_handoff_drops_total")], 30);
+        assert_eq!(v[at("engine_ingress_hypercall_rest_last_round_ms")], 31);
+        assert_eq!(ids.gauges.len(), HC_METRICS);
+        // The whole registry, worst case, still fits.
+        let obs = Observability::build(true, Some([1u8; clob_dispatcher::EXEC_COUNTER_SLOTS]))
+            .expect("every family fits the fixed registry");
+        let reg = obs.metrics.as_ref().unwrap();
+        assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
+        assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(text.contains("engine_ingress_hypercall_state"));
+        assert!(text.contains("engine_ingress_hypercall_last_tick_age_seconds"));
+        assert!(text.contains("engine_ingress_hypercall_msgs_total"));
+        assert!(text.contains("engine_ingress_hypercall_capture_records"));
+        assert!(text.contains("engine_ingress_hypercall_coverage_configured"));
+        assert!(text.contains("engine_ingress_hypercall_options_selected"));
+    }
+
     #[test]
     fn the_hyparb_family_is_27_counters_and_36_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
@@ -10887,6 +11299,7 @@ mod tests {
             cfg.bybit,
             cfg.mexc,
             cfg.hyperevm,
+            cfg.hypercall,
         ] {
             assert_eq!(c.mode, TapMode::All);
             assert_eq!(c.budget_bytes, want_bytes);
@@ -10911,6 +11324,7 @@ mod tests {
             cfg.bybit,
             cfg.mexc,
             cfg.hyperevm,
+            cfg.hypercall,
         ] {
             assert_eq!(c.mode, TapMode::Off);
             assert_eq!(c.budget_bytes, 0);
@@ -10921,7 +11335,7 @@ mod tests {
     #[test]
     fn raw_tap_flags_every_known_venue_label_accepted() {
         let cfg = parse_raw_tap_flags(
-            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm"),
+            Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall"),
             "all",
             1,
         )
@@ -10936,6 +11350,7 @@ mod tests {
             cfg.bybit,
             cfg.mexc,
             cfg.hyperevm,
+            cfg.hypercall,
         ] {
             assert_eq!(c.mode, TapMode::All);
         }
@@ -10975,16 +11390,16 @@ mod tests {
         );
     }
 
-    /// More than nine comma-separated labels trips the defensive
-    /// capacity guard — there are only nine capture labels (WS9 added
-    /// bybit, MX6 mexc, HYPARB H3b hyperevm), so this branch is a pure
-    /// defense-in-depth backstop reached here by listing all nine plus a
-    /// tenth item.
+    /// More than ten comma-separated labels trips the defensive
+    /// capacity guard — there are only ten capture labels (WS9 added
+    /// bybit, MX6 mexc, HYPARB H3b hyperevm, HC5 hypercall), so this
+    /// branch is a pure defense-in-depth backstop reached here by
+    /// listing all ten plus an eleventh item.
     #[test]
     fn raw_tap_flags_rejects_more_labels_than_known_venues() {
         assert_eq!(
             parse_raw_tap_flags(
-                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,pm2"),
+                Some("pm,bn,okx,rpc,deribit,hl,bybit,mexc,hyperevm,hypercall,pm2"),
                 "rejects",
                 64
             )

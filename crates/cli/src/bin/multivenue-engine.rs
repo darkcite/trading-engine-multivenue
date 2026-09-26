@@ -3355,6 +3355,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.bybit.map(|c| c.configured).unwrap_or(0) as i64);
         reg.gauge(ids.coverage_mexc)
             .set(discovery.mexc.map(|c| c.configured).unwrap_or(0) as i64);
+        reg.gauge(ids.coverage_hypercall)
+            .set(discovery.hypercall.map(|c| c.configured).unwrap_or(0) as i64);
         // M2.1/M2.2/M2.4: capped options chain sizes this boot
         // (0 = lane off).
         reg.gauge(ids.deribit_options_selected)
@@ -3363,6 +3365,8 @@ fn run(args: RunArgs) -> ExitCode {
             .set(discovery.okx_options.len() as i64);
         reg.gauge(ids.binance_options_selected)
             .set(discovery.bn_options.len() as i64);
+        reg.gauge(ids.hypercall_options_selected)
+            .set(discovery.hypercall_options.len() as i64);
     }
 
     // Per-venue (registry, gauge-ids) pair for the §6.5 capture
@@ -3918,13 +3922,73 @@ fn run(args: RunArgs) -> ExitCode {
         drop(mexc_event_prod);
     }
 
-    // -- Hypercall (HC1: identity and lanes only; the ingress spawn is
-    // HC5). The three producers are dropped — permanently-empty rings
-    // (the unspawned-venue shape, §3.3), so this boot is the pre-HC1
-    // boot, bit for bit. --
-    drop(hypercall_prod);
-    drop(hypercall_event_prod);
-    drop(hypercall_opt_prod);
+    // -- Hypercall (HC5; data-only, ruling O-HC1): ONE public socket on
+    // its own thread (core 11, past HyperEVM's 10) + the REST poller
+    // thread, whenever `[hypercall]` selected a chain at boot. The
+    // universe is the HC4 discovery outcome; the index syms are the
+    // config file's. --
+    if !discovery.hypercall_options.is_empty() {
+        let mut symbols = ingress_hypercall::HcSymbolTable::new();
+        for (name, sym, ..) in &discovery.hypercall_options {
+            if let Err(e) = symbols.insert(name.as_bytes(), *sym) {
+                error!(?e, instrument = %name, "hypercall: table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let mut underlyings = ingress_hypercall::HcUnderlyings::new();
+        for inst in &boot.allocated.hypercall_idx {
+            if let Err(e) = underlyings.insert(inst.name.as_bytes(), inst.sym) {
+                error!(?e, underlying = %inst.name, "hypercall: index table build failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+        let stale = stale_after_ms[core_types::VenueId::Hypercall as usize];
+        info!(
+            instruments = discovery.hypercall_options.len(),
+            underlyings = boot.allocated.hypercall_idx.len(),
+            summary_every_s = boot.hypercall_summary_every_s,
+            stale_after_ms = stale,
+            "hypercall: starting ingress + poller threads"
+        );
+        let spec = cli::HypercallSpec {
+            ws_host: cfg.hypercall_ws_host.clone(),
+            rest_host: cfg.hypercall_rest_host.clone(),
+            symbols,
+            underlyings,
+            summary_underlyings: boot.hypercall_options.underlyings.clone(),
+            summary_every_s: boot.hypercall_summary_every_s,
+            stale_after_ms: stale,
+        };
+        match cli::spawn_hypercall(
+            spec,
+            tls_config.clone(),
+            hypercall_prod,
+            hypercall_event_prod,
+            hypercall_opt_prod,
+            statuses.hypercall.clone(),
+            statuses.hc.clone(),
+            11,
+            &run_dir,
+            epoch_ns,
+            raw_tap_cfg.hypercall,
+            capture_metrics_for(obs.counter_ids.as_ref().map(|c| c.capture_hypercall)),
+        ) {
+            Ok(hs) => handles.extend(hs),
+            Err(e) => {
+                error!(error = ?e, "hypercall: capture open failed");
+                join_reverse(handles);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        // The unspawned-venue shape (§3.3): permanently-empty rings, so a
+        // boot without `[hypercall]` is the pre-HC5 boot, bit for bit.
+        drop(hypercall_prod);
+        drop(hypercall_event_prod);
+        drop(hypercall_opt_prod);
+    }
 
     if let Some(polygon_path) = args.polygon_path {
         match WssEndpoint::resolve(&cfg.alchemy_host, 443, &polygon_path) {
