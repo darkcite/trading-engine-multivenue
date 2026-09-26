@@ -760,6 +760,7 @@ def test_budget_key_is_per_host():
     assert claude_worker.candles.budget_key("okx") == "okx"
     assert claude_worker.candles.budget_key("mexc") == "mexc"
     assert claude_worker.candles.budget_key("mexc-perp") == "mexc-perp"
+    assert claude_worker.candles.budget_key("binance-coinm") == "binance-coinm"  # BX2: dapi
 
 
 def test_run_cycle_budgets_per_host_and_demand_sized(tmp_path: pathlib.Path) -> None:
@@ -1258,6 +1259,68 @@ def test_main_reads_policy_and_reports(
     assert rc == 0
     err = typing.cast(typing.Any, capsys).readouterr().err
     assert "policy" in err and "ignored" in err
+
+
+# ---- BX2: the COIN-M lane ------------------------------------------------
+
+#: BX2, measured live 2026-09-26: one `GET dapi.binance.com/dapi/v1/klines
+#: ?symbol=BTCUSD_PERP&interval=1m` row, verbatim — fapi's shape; column 5
+#: is CONTRACTS (100 USD each on BTC), column 7 the coin volume.
+DAPI_KLINE_BTC = (
+    '[[1790400480000,"83904.0","83904.0","83881.6","83881.6","2327",'
+    '1790400539999,"2.77364849",56,"0","0","0"]]'
+)
+
+
+def test_coinm_lists_build_one_dapi_lane(tmp_path: pathlib.Path) -> None:
+    """BX2: `coinm` + `coinm_dated` become ONE `binance-coinm` lane — the
+    venue-case symbol, its own host and so its own budget."""
+    p = tmp_path / "universe.toml"
+    p.write_text(
+        '[binance]\nspot = ["btcusdt"]\ncoinm = ["btcusd_perp"]\n'
+        'coinm_dated = ["btcusd_261225"]\n',
+        encoding="utf-8",
+    )
+    lanes = claude_worker.candles.read_universe_lanes(p)
+    assert lanes is not None
+    by_name = {lane.name: lane for lane in lanes}
+    assert set(by_name) == {"binance", "binance-coinm"}
+    coinm = by_name["binance-coinm"]
+    assert [(t.descriptor, t.instrument) for t in coinm.targets] == [
+        ("binance-coinm:btcusd_perp", "BTCUSD_PERP"),
+        ("binance-coinm:btcusd_261225", "BTCUSD_261225"),
+    ]
+    assert coinm.venue == claude_worker.frames.VENUE_BINANCE
+    assert not coinm.backward
+
+
+def test_coinm_lane_reads_dapi_klines_on_its_own_host(tmp_path: pathlib.Path) -> None:
+    conn = db(tmp_path)
+    target = claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_BINANCE, "binance-coinm:btcusd_perp", "BTCUSD_PERP"
+    )
+    lane = claude_worker.candles.Lane("binance-coinm", target.venue, [target], backward=False)
+    urls: list[str] = []
+
+    def get(url: str) -> str:
+        urls.append(url)
+        return DAPI_KLINE_BTC
+
+    base = http_none()
+    hosts = dict(base.hosts)
+    hosts["binance-coinm"] = "bnd.test"
+    http = claude_worker.candles.Http(get=get, post=base.post, hosts=hosts)
+    now = 1_790_400_600_000
+    st = claude_worker.candles.fill_forward(conn, http, lane, target, "1m", now, budget(10), {})
+    assert not st.failed
+    assert urls[0].startswith(
+        "https://bnd.test/dapi/v1/klines?symbol=BTCUSD_PERP&interval=1m&startTime="
+    )
+    row = conn.execute(
+        "SELECT o, h, l, c, v FROM candles WHERE descriptor = ? AND tf = '1m'",
+        ("binance-coinm:btcusd_perp",),
+    ).fetchone()
+    assert row == (83904.0, 83904.0, 83881.6, 83881.6, 2327.0), "v stays in contracts"
 
 
 # ---- HAR W1: `extra` instruments and the lane's 1 m backfill -------------

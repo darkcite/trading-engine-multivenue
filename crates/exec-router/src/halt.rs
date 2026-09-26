@@ -3,7 +3,8 @@
 
 //! **E6 commit 3 — the sticky halt.**
 //!
-//! Six triggers, one latch per slot, and no way out but an operator.
+//! Eight triggers (BX3 added the venue's two verdicts), one latch per
+//! slot, and no way out but an operator.
 //!
 //! ## What halts, and why each one (in `trigger_for`'s order)
 //!
@@ -16,6 +17,14 @@
 //! | reconciliation stale | `halt_on_recon_stale_ms` | the reconciler has not AGREED with the venue for this long — the safety net is dark |
 //! | user-event stream gap | `halt_on_ws_gap_ms` | LAW E-5 — the WS is the FILL, so a gap is trading blind |
 //!
+//! **BX3** — two venue VERDICTS are tested first, with no threshold: the
+//! venue restricted the account (`VenueLock`), or the arm judged its
+//! margin ratio at or past the slot's `halt_on_margin_ratio_1e6`
+//! (`MarginRisk`, O-BX18: the arm holds the number and reports only the
+//! flag). No arm sets either before BX6. The E7 session bound
+//! (`pnl-gain` / `pnl-loss`) is an operator's stopping rule on the same
+//! latch, not a fault detector.
+//!
 //! **The day cap is NOT here**, and the plan listed it. Reaching
 //! `cap_day_usd` is the clamp working, and it clears itself at
 //! 00:00Z; a sticky halt on it would stop the engine for good every
@@ -23,14 +32,16 @@
 //! five mean "something is wrong"; that one means "today is done".
 //! Operator ruling, 2026-09-19.
 //!
-//! ## Venue-wide sensors, per-slot thresholds
+//! ## Arm-wide sensors, per-slot thresholds
 //!
-//! Every trigger above is a property of the ARM — the socket, the
+//! Every trigger above is a property of an ARM — the socket, the
 //! budget, the reconciler — not of any one member. Each live slot
-//! compares that one signal against ITS OWN numbers, so a slot with a
+//! compares the signal of the arm(s) that trade it
+//! (`OrderDispatch::halt_signal_for`; a slot on two venues reads both,
+//! merged — BX3, O-BX17) against ITS OWN numbers, so a slot with a
 //! tighter threshold halts first and a slot on another venue is
-//! untouched. That is what "per-slot refusal, venue-wide cancel"
-//! means in code.
+//! untouched (O-BX8). That is what "per-slot refusal, venue-wide
+//! cancel" means in code.
 //!
 //! ## Sticky
 //!
@@ -80,14 +91,24 @@ pub enum HaltReason {
     /// No reconciliation has AGREED with the venue for
     /// `halt_on_recon_stale_ms`.
     ReconStale = 7,
-    /// E7 session bound: the account's spot USDC reached the anchor
-    /// plus `halt_on_gain_usd_1e6` while flat. The operator's
-    /// stopping rule, not a fault — but sticky like every halt, so
-    /// "run until" means until.
+    /// E7 session bound: the account's equity at cost reached the
+    /// anchor plus `halt_on_gain_usd_1e6` (judged whether or not the
+    /// book is flat since S7-L1). The operator's stopping rule, not a
+    /// fault — but sticky like every halt, so "run until" means until.
     PnlGain = 8,
-    /// E7 session bound: the account's spot USDC fell to the anchor
-    /// minus `halt_on_loss_usd_1e6` while flat.
+    /// E7 session bound: the account's equity at cost fell to the
+    /// anchor minus `halt_on_loss_usd_1e6`.
     PnlLoss = 9,
+    /// **BX3** The venue imposed a restriction on the account (a 418
+    /// ban, reduce-only, a region lock, the options `REDUCE_ONLY` risk
+    /// level, a fired dead-man, a mode or permission change). Not
+    /// `BudgetFloor`, which means OUR governor hit its floor — naming a
+    /// venue restriction the same way would be the defect shape E6
+    /// recorded, a name describing a different property than it tests.
+    VenueLock = 10,
+    /// **BX3 (D6)** The arm judged a margin ratio at or past the slot's
+    /// `halt_on_margin_ratio_1e6`, or saw a `MARGIN_CALL`.
+    MarginRisk = 11,
 }
 
 impl HaltReason {
@@ -105,6 +126,8 @@ impl HaltReason {
             HaltReason::ReconStale => "recon-stale",
             HaltReason::PnlGain => "pnl-gain",
             HaltReason::PnlLoss => "pnl-loss",
+            HaltReason::VenueLock => "venue-lock",
+            HaltReason::MarginRisk => "margin-risk",
         }
     }
 
@@ -128,6 +151,8 @@ impl HaltReason {
             "recon-stale" => HaltReason::ReconStale,
             "pnl-gain" => HaltReason::PnlGain,
             "pnl-loss" => HaltReason::PnlLoss,
+            "venue-lock" => HaltReason::VenueLock,
+            "margin-risk" => HaltReason::MarginRisk,
             _ => HaltReason::Operator,
         }
     }
@@ -256,6 +281,17 @@ pub fn parse_halt_file(text: &str) -> [HaltReason; EXEC_SLOTS] {
 /// cheapest and most specific comes first.
 #[must_use]
 pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
+    // BX3: the venue's own verdicts FIRST. Neither has a per-slot
+    // threshold here (the lock is the venue's decision; the margin
+    // threshold is the arm's, O-BX18), and both come before the reject
+    // streak because a locked account produces a streak of rejects as
+    // its symptom — the reason to read is the lock.
+    if sig.venue_lock != 0 {
+        return HaltReason::VenueLock;
+    }
+    if sig.margin_risk != 0 {
+        return HaltReason::MarginRisk;
+    }
     if lim.reject_streak > 0 && sig.reject_streak >= lim.reject_streak {
         return HaltReason::RejectStreak;
     }
@@ -875,6 +911,11 @@ mod tests {
             HaltReason::WsGap,
             HaltReason::AssetRefusals,
             HaltReason::Operator,
+            HaltReason::ReconStale,
+            HaltReason::PnlGain,
+            HaltReason::PnlLoss,
+            HaltReason::VenueLock,
+            HaltReason::MarginRisk,
         ];
         let mut i = 0usize;
         while i < all.len() {
@@ -888,7 +929,49 @@ mod tests {
                 j += 1;
             }
             assert!(!all[i].as_str().is_empty());
+            // Every word reads back as its reason (`none` excepted: it
+            // is never written to the file).
+            if all[i] != HaltReason::None {
+                assert_eq!(HaltReason::from_word(all[i].as_str()), all[i]);
+            }
             i += 1;
         }
+    }
+
+    /// BX3: the venue's verdicts halt with their own reason, and ahead
+    /// of the reject streak a lock produces as its symptom.
+    #[test]
+    fn a_venue_lock_or_margin_risk_halts_before_the_streak_it_causes() {
+        let lim = HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000);
+        let base = HaltSignal::new(1_000_000, 0, 9, 0, false, true, 1_000_000);
+        assert_eq!(trigger_for(&base, &lim), HaltReason::RejectStreak);
+        assert_eq!(
+            trigger_for(&base.with_venue(true, false), &lim),
+            HaltReason::VenueLock
+        );
+        assert_eq!(
+            trigger_for(&base.with_venue(false, true), &lim),
+            HaltReason::MarginRisk
+        );
+        assert_eq!(
+            trigger_for(&base.with_venue(true, true), &lim),
+            HaltReason::VenueLock
+        );
+        let quiet = HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000);
+        assert_eq!(trigger_for(&quiet, &lim), HaltReason::None);
+    }
+
+    /// BX3: both new words survive `exec.HALT`'s round trip.
+    #[test]
+    fn the_venue_verdicts_survive_the_halt_file() {
+        let mut reasons = [HaltReason::None; EXEC_SLOTS];
+        reasons[2] = HaltReason::VenueLock;
+        reasons[5] = HaltReason::MarginRisk;
+        let mut buf = [0u8; HALT_FILE_MAX];
+        let n = render_halt_file(&mut buf, &reasons);
+        let text = core::str::from_utf8(&buf[..n]).unwrap();
+        let back = parse_halt_file(text);
+        assert_eq!(back[2], HaltReason::VenueLock);
+        assert_eq!(back[5], HaltReason::MarginRisk);
     }
 }

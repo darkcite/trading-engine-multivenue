@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clob_dispatcher::{DispatchError, OrderDispatch};
+use clob_dispatcher::{DispatchError, OrderDispatch, Retired, RETIRED_CANCELED_MEMBER};
 use core_config::SecretKeyBytes;
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_net::{expected_accept, ws_read_frame, ws_unmask_in_place, WsReadResult};
@@ -377,7 +377,11 @@ fn lifecycle_place_fill_cancel_reconcile() {
     req.strategy_id = 7;
     a.cancel(&req).expect("cancel accepted");
     assert_eq!(a.live_orders(), 0);
-    assert_eq!(a.try_next_retired(), Some((900, 7)), "the unfilled rest leaves the resting count");
+    assert_eq!(
+        a.try_next_retired(),
+        Some(Retired::new(900, 7, RETIRED_CANCELED_MEMBER)),
+        "the unfilled rest leaves the resting count"
+    );
 
     let r = a.reconcile().expect("reconcile");
     assert!(r.agreed, "{r:?}");

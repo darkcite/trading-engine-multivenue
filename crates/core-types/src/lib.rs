@@ -1369,6 +1369,55 @@ unsafe impl AsBytes for DepthTopK {}
 const _: () = assert!(core::mem::size_of::<DepthTopK>() == 192);
 const _: () = assert!(core::mem::align_of::<DepthTopK>() == 64);
 
+/// **BX6 — one execution-journal record** (`binance-exec.pmlr`): an ACK, a
+/// refusal with its code, a fill with its commission, a cancel or expiry
+/// with its reason, a reconciliation verdict, a margin sample. The kind
+/// and the meaning of `a` / `b` / `c` belong to the arm that writes it
+/// (`exec_binance::journal`). 64 B, no heap, no destructor.
+#[repr(C, align(64))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecRecord {
+    /// Monotonic ns at the observation.
+    pub ts_ns: NsTs,
+    /// Wall ms (the venue's clock where the arm measured it).
+    pub wall_ms: u64,
+    /// The member's client id (0 if none).
+    pub client_oid: u64,
+    /// The venue's order id (0 if none).
+    pub venue_oid: u64,
+    /// Kind-specific.
+    pub a: i64,
+    /// Kind-specific.
+    pub b: i64,
+    /// Kind-specific.
+    pub c: i64,
+    /// The venue code (0 if none).
+    pub code: i32,
+    /// The arm's instrument row.
+    pub row: u16,
+    /// The arm's record kind.
+    pub kind: u8,
+    /// The strategy slot.
+    pub slot: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<ExecRecord>() == 64);
+const _: () = assert!(core::mem::align_of::<ExecRecord>() == 64);
+// Every field is named and the named fields fill all 64 bytes, with no
+// gap between them.
+const _: () = assert!(core::mem::offset_of!(ExecRecord, c) == 48);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, code) == 56);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, row) == 60);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, kind) == 62);
+const _: () = assert!(core::mem::offset_of!(ExecRecord, slot) == 63);
+
+// SAFETY: ExecRecord is `#[repr(C, align(64))]`, `#[derive(Copy)]`, all
+// fields plain integers whose sizes sum to exactly 64 bytes (the const
+// asserts above) in declaration order with no gap (each field's offset is
+// a multiple of its alignment) — no compiler-inserted padding, every byte
+// initialized.
+unsafe impl AsBytes for ExecRecord {}
+
 // ---------------------------------------------------------------
 // ChannelEvent — non-tick channel capture slot (Phase 8e, §6.5)
 // ---------------------------------------------------------------
@@ -1549,8 +1598,11 @@ pub struct ChannelEvent {
     pub venue: u8,
     /// Channel tag ([`ChannelId`] as raw byte).
     pub channel: u8,
+    /// `EVENT_FLAG_*` (BX6). Zero on every event but a Binance mark for the
+    /// execution arm.
+    pub flags: u8,
     /// Reserved. Always zero.
-    _pad0: [u8; 2],
+    _pad0: u8,
     /// Venue-provided sequence (full width — OKX `seqId`, Deribit
     /// `change_id`/`trade_seq`); 0 where the channel carries none.
     pub venue_seq: u64,
@@ -1583,7 +1635,8 @@ impl ChannelEvent {
             sym,
             venue: venue as u8,
             channel: channel as u8,
-            _pad0: [0; 2],
+            flags: 0,
+            _pad0: 0,
             venue_seq,
             venue_time_ms,
             v0,
@@ -1591,7 +1644,22 @@ impl ChannelEvent {
             _pad1: [0; 16],
         }
     }
+
+    /// The event with `flags` set.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_flags(mut self, flags: u8) -> Self {
+        self.flags = flags;
+        self
+    }
 }
+
+/// **BX6 (O-BX29) — [`ChannelEvent::flags`]: for the execution side only.**
+/// The engine hands such an event to the dispatcher (the router and its
+/// ledger, the live arms) and NEVER to a member: a Binance mark prices the
+/// ledger's rows and bounds the arm's price band, and no member decides on
+/// it (O-BX6: no member trades Binance live).
+pub const EVENT_FLAG_EXEC_ONLY: u8 = 1 << 0;
 
 // ---------------------------------------------------------------
 // XMM XH1 — the trade lane and the order-event lane

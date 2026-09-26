@@ -146,6 +146,7 @@ dependencies = [
  "dhat",
  "engine",
  "engine-snapshot",
+ "exec-binance",
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
@@ -160,9 +161,12 @@ dependencies = [
  "ingress-okx",
  "ingress-polymarket",
  "ingress-rpc",
+ "mio 0.8.11",
  "opt-registry",
+ "rcgen",
  "research-artifacts",
  "rustls",
+ "signer-ed25519",
  "signer-eip712",
  "signer-evm",
  "strategy-ai-exec",
@@ -344,6 +348,7 @@ dependencies = [
  "core-vol",
  "engine",
  "engine-snapshot",
+ "exec-binance",
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
@@ -363,6 +368,7 @@ dependencies = [
  "mio 0.8.11",
  "opt-registry",
  "proptest",
+ "rcgen",
  "research-artifacts",
  "rustls",
  "rustls-pki-types",
@@ -752,6 +758,31 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exec-binance"
+version = "0.1.0"
+dependencies = [
+ "clob-dispatcher",
+ "core-config",
+ "core-crypto",
+ "core-fill",
+ "core-io",
+ "core-net",
+ "core-parse",
+ "core-ring",
+ "core-time",
+ "core-types",
+ "exec-binance",
+ "exec-router",
+ "ingress-binance",
+ "mio 0.8.11",
+ "proptest",
+ "rcgen",
+ "ring",
+ "rustls",
+ "signer-ed25519",
 ]
 
 [[package]]
@@ -1910,6 +1941,16 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "signer-ed25519"
+version = "0.1.0"
+dependencies = [
+ "core-crypto",
+ "libc",
+ "proptest",
+ "ring",
 ]
 
 [[package]]

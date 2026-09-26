@@ -186,6 +186,12 @@ venues = ["hyperliquid"]
 # same position. The worst case with every quote working is
 # cap_instance_usd + max_open_orders × max_order_usd, not
 # cap_instance_usd. The three numbers multiply — set them together.
+# The money clamps never refuse an exit, and an exit never widens that
+# bound: on a Binance instrument (BX3) an order counts as an exit only if
+# it and every working order on its side together cannot cross zero (the
+# residuals are named in docs/risk-policy.md, "BX3"). On Binance an exit
+# still needs a free open-order place (O-BX25) — at a full count, cancel
+# or requote first.
 #
 # These caps are PER SLOT, not global. `max_open_orders = 64` here is
 # eight slots at 64 = 512 live orders across the table (that is what
@@ -225,7 +231,9 @@ cap_instance_usd_1e6 = 1000000000
 # per USDC of lifetime volume, and an exhausted address falls to ONE
 # request every 10 seconds. Stop placing when the remaining budget
 # drops below this, so a bad fill rate cannot brick the address.
-# Consumed by the budget governor in E4.
+# Consumed by the budget governor in E4. REQUIRED (non-zero) on a live
+# slot whose `venues` names hyperliquid (BX3); the Hyperliquid arm reads
+# it, and the top-up keys below, only from the live slots it trades.
 request_budget_floor = 2000
 
 # OPTIONAL (S7-L1): buy request weight before the floor is reached.
@@ -300,6 +308,30 @@ halt_on_recon_stale_ms = 300000
 # halt_on_gain_usd_1e6 = 15000000
 # halt_on_loss_usd_1e6 = 5000000
 
+# ---- the MARGIN HALT (BX3, Binance slots only) -------------------------
+#
+# A slot whose `venues` names binance must state it when live, and no
+# other slot may state it at all (the parser refuses both mistakes).
+# The margin ratio (maintenance margin over margin balance or adjusted
+# equity, x1e6) at or above which the Binance arm latches `margin-risk`:
+# a sticky halt like the five above (a cancel still passes; nothing is
+# flattened for you). The venue calls margin at 80 % — and any margin
+# call halts the slot on its own — and liquidates at 95 %, so the parser
+# refuses 800000 and up: a threshold there could never fire first.
+# 600000 = 60 % (the plan's D6 example).
+#
+# ENFORCED since BX6: the Binance arm reads the ratio at every
+# reconciliation and on the venue's MARGIN_CALL / ACCOUNT_UPDATE. To arm a
+# Binance slot: name the venue above (venues = ["binance"]), uncomment
+# this key, and uncomment the [exec.binance] block at the end of this file.
+# halt_on_margin_ratio_1e6 = 600000
+#
+# Two more keys for a Binance slot, with their defaults (BX6): how many
+# instruments it may hold working orders or a position on at once
+# (1..=49), and the shortest maker TTL a member may ask for (>= 5000 ms).
+# max_symbols = 20
+# min_maker_ttl_ms = 5000
+
 
 # Slot 1 — vrp. Explicit is better than default: writing it down means
 # a reader of this file knows the slot was considered, not forgotten.
@@ -346,3 +378,50 @@ mode = "paper"
 # halt_on_recon_stale_ms = 120000
 # halt_on_gain_usd_1e6 = 50000000
 # halt_on_loss_usd_1e6 = 20000000
+
+
+# ---- [exec.binance] — the Binance arm (BX6) -----------------------------
+#
+# REQUIRED when a live slot names binance (the parser refuses the boot
+# without it). This binary's gateway speaks USD-M futures x the classic
+# account only: a `products` word other than "usdm", or an
+# `account_mode` other than "classic", refuses the boot naming the phase
+# that builds it (BX7 COIN-M / PM / PM Pro, BX8 spot, BX9 options, BX10
+# Binance Stocks). At most ONE live slot may name binance — it owns every
+# bound instrument (BX-7).
+#
+# The key comes from .env: BINANCE_API_KEY and BINANCE_ED25519_SEED (the
+# names only — never a value in this file). Before any order the boot
+# asserts one-way mode, single-asset margin, `account_mode`, and a key
+# that trades futures and cannot withdraw (BX-19); any miss refuses.
+#
+# `network` is "mainnet": market data and orders on one network (BX-16).
+# `account_scope` is "dedicated": this binary refuses "shared" (its
+# foreign-fill halt is not built). `recv_window_ms` is the stale-order
+# guard (1000; at most 5000, the venue's default). The dead-man
+# (O-BX13): `countdownCancelAll` with `countdown_ms` (at least twice the
+# heartbeat), re-armed every `heartbeat_ms` for each instrument with a
+# maker resting — and only while the order session can cancel: if the
+# engine or its order session goes quiet, the venue cancels the makers.
+# After a 429 or 418 the arm sends nothing for 60 s, or until the ban the
+# venue names ends (at most 3 days). `recon_every_ms` is at most half the
+# slot's `halt_on_recon_stale_ms`. The worst-case REST weight of the
+# dead-man on `max_symbols` instruments (10 per heartbeat each), a
+# reconciliation every `recon_every_ms` and the margin re-reads must stay
+# within the arm's 1 440 of the IP's 2 400 a minute, or the boot refuses
+# (the defaults weigh 1 309).
+# `orders_frac_1e6` / `qtr_frac_1e6`: the share of each venue order
+# window and quantitative-rule threshold the arm may use.
+# [exec.binance]
+# network = "mainnet"
+# account_mode = "classic"
+# account_scope = "dedicated"
+# products = ["usdm"]
+# stp_mode = "EXPIRE_TAKER"
+# recv_window_ms = 1000
+# countdown_ms = 30000
+# heartbeat_ms = 10000
+# recon_every_ms = 60000
+# orders_frac_1e6 = 800000
+# qtr_frac_1e6 = 800000
+# spin = 1

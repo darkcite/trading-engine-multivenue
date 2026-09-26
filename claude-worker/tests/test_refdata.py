@@ -506,3 +506,21 @@ def test_main_unusable_universe_exits_1(tmp_path: pathlib.Path) -> None:
         ["--universe", str(missing), "--db", str(tmp_path / "c.db"), "--now-ms", str(NOW)]
     )
     assert rc == 1
+
+
+def test_coinm_lane_is_reported_and_skipped(tmp_path: pathlib.Path) -> None:
+    """BX2: no v1 fetcher for dapi's 24 h body (module docs) — the lane is
+    reported and skipped: no request, no row, never a crash."""
+    conn = db(tmp_path)
+    target = claude_worker.candles.LaneTarget(
+        claude_worker.frames.VENUE_BINANCE, "binance-coinm:btcusd_perp", "BTCUSD_PERP"
+    )
+    lane = claude_worker.candles.Lane(
+        "binance-coinm", claude_worker.frames.VENUE_BINANCE, [target], backward=False
+    )
+    http, calls = http_map({})
+    lines: list[str] = []
+    claude_worker.refdata.run_cycle(conn, [lane], http, NOW, 30, lines.append)
+    assert calls == []
+    assert all_rows(conn) == []
+    assert lines == ["refdata: binance-coinm: targets=1 skipped (no v1 lane)"]

@@ -40,8 +40,9 @@
 #     (1..8760), over `CLAUDE_WORKER_CANDLES_BACKFILL_1M_H` and the 48 h
 #     default. An existing series gap-fills from its newest row as always.
 #
-# Lane names = the candles lane names: binance · binance-usdm · okx · deribit ·
-# hyperliquid · bybit · bybit-linear · mexc · mexc-perp.
+# Lane names = the candles lane names: binance · binance-usdm · binance-coinm
+# (BX2: `[binance] coinm` + `coinm_dated` on dapi, volume in contracts) · okx ·
+# deribit · hyperliquid · bybit · bybit-linear · mexc · mexc-perp.
 #
 # Consumers that READ 1m from candles.db today (keep their instruments at the
 # full law): the regime seed (`regime.toml [breadth] members`), the ICDP

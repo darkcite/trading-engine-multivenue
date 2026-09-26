@@ -25,8 +25,15 @@
 //!
 //! HC2 generalises the request side — any [`http1::Method`], any target,
 //! extra headers ([`http1::write_request_head`]) — and adds
-//! [`HttpsReq`], a keep-alive client for one host and any request,
-//! sharing [`HttpsPost`]'s connection engine (`https_conn`).
+//! [`HttpsReq`], a keep-alive client for one host and any request, on
+//! the blocking engine HC2 moved out of the pre-BX5 [`HttpsPost`]
+//! (`https_keepalive`).
+//!
+//! BX5 adds [`HttpsConn`] — one non-blocking keep-alive HTTPS connection
+//! whose requests are boot-rendered templates, driven by its owner's poll
+//! (the Binance arm's REST); [`HttpsPost`] is now its blocking form — and
+//! [`WsConn`] / [`WsFramer`], the non-blocking WebSocket session. Moving
+//! `HttpsReq` onto `HttpsConn` (one engine) is a recorded follow-up.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -43,13 +50,15 @@ pub mod boot_http;
 pub mod drain;
 pub mod error;
 pub mod http1;
-mod https_conn;
+pub mod https_conn;
+mod https_keepalive;
 pub mod https_post;
 pub mod https_req;
 pub mod iobuf;
 pub mod keepalive;
 pub mod subs;
 pub mod transport;
+pub mod ws_conn;
 pub mod ws_frame;
 pub mod ws_handshake;
 
@@ -65,7 +74,7 @@ pub use keepalive::{
 pub use subs::{
     queue_masked_binary_frame, queue_masked_binary_frame_parts, queue_masked_text_frame,
     queue_masked_text_frame_parts, queue_masked_text_frame_rendered, PendingErr, PendingReq,
-    PendingTable, ReqKind, SubErr, SubId, SubTable,
+    PendingTable, ReqIds, ReqKind, SubErr, SubId, SubTable,
 };
 
 pub use http1::{
@@ -73,15 +82,20 @@ pub use http1::{
     write_get_request, write_request, write_request_head, BodyFraming, ChunkedBody, DechunkResult,
     Header, HttpErr, HttpResult, Method, ReqHead,
 };
-pub use https_post::{parse_https_url, HttpsPost, PostErr, PostErrKind, MAX_BODY_CAP};
+pub use https_conn::{
+    ConnCfg, HttpsConn, Params, PostErr, PostErrKind, Progress, ReqSpec, ReqWire, MAX_BODY_CAP,
+};
+pub use https_post::{parse_https_url, HttpsPost};
 pub use https_req::{HttpsReq, REQ_USER_AGENT};
 pub use transport::{
     PlainTcpTransport, Status, TestBuffer, TestTransport, TlsTransport, Transport,
 };
+pub use ws_conn::{WsCfg, WsConn, WsErr, WsFramer, WsNext, WsProgress};
 pub use ws_frame::{
     ws_mask_from_counter, ws_read_frame, ws_unmask_in_place, ws_write_binary_frame_parts,
     ws_write_ping, ws_write_pong, ws_write_text_frame, ws_write_text_frame_parts,
-    ws_write_text_frame_rendered, PayloadSpan, WsFrameHeader, WsOpcode, WsPayload, WsReadResult,
+    ws_write_text_frame_rendered, ws_write_text_frame_with, PayloadSpan, WsFrameHeader, WsOpcode,
+    WsPart, WsPayload, WsReadResult,
     WsWriteErr,
 };
 pub use ws_handshake::{

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, HaltSignal, LiveArmCounters, OrderDispatch,
+    Retired, RETIRED_CANCELED_MEMBER, RETIRED_EXPIRED, RETIRED_FILLED, RETIRED_REJECTED,
 };
 use core_fill::ORDER_KIND_IOC;
 use core_net::{HttpsReq, Method, PostErr};
@@ -54,6 +55,24 @@ pub const MAX_ORDERS: usize = 64;
 pub const FILL_Q: usize = 128;
 /// Retirements waiting for [`OrderDispatch::try_next_retired`].
 pub const RETIRED_Q: usize = 64;
+
+/// The router's code ([`Retired::why`]) for an order that stopped working
+/// with `status` (the BX3 `Retired` shape, met at the 2026-09-26 merge): a
+/// refusal after acceptance is `REJECTED`; a `CANCELED` the arm's own
+/// cancel answer did not already retire is an IoC's unfilled remainder —
+/// the engine's one order shape here — so `EXPIRED` (the venue's status
+/// does not say who took an order off). A member's cancel is retired where
+/// its answer is read, as `CANCELED_MEMBER`.
+const fn retired_why(status: response::Status) -> u8 {
+    match status {
+        response::Status::Rejected => RETIRED_REJECTED,
+        response::Status::Filled => RETIRED_FILLED,
+        response::Status::Acked
+        | response::Status::Open
+        | response::Status::PartiallyFilled
+        | response::Status::Canceled => RETIRED_EXPIRED,
+    }
+}
 /// Request head window.
 pub const HEAD_CAP: usize = 1024;
 /// Request body window.
@@ -180,7 +199,7 @@ struct Book {
     fills: [Fill; FILL_Q],
     f_head: usize,
     f_len: usize,
-    retired: [(u64, u8); RETIRED_Q],
+    retired: [Retired; RETIRED_Q],
     r_head: usize,
     r_len: usize,
     fill_ids: FillIds,
@@ -237,12 +256,12 @@ impl Book {
         n
     }
 
-    fn retire(&mut self, client_oid: u64) {
+    fn retire(&mut self, client_oid: u64, why: u8) {
         if self.r_len >= RETIRED_Q {
             return;
         }
         let at = (self.r_head + self.r_len) % RETIRED_Q;
-        self.retired[at] = (client_oid, self.slot);
+        self.retired[at] = Retired::new(client_oid, self.slot, why);
         self.r_len += 1;
     }
 
@@ -306,7 +325,7 @@ impl Book {
                     }
                 }
                 if let Some(oid) = retire {
-                    self.retire(oid);
+                    self.retire(oid, retired_why(u.status));
                 }
             }
             Msg::Bad => self.counters.msgs_bad = self.counters.msgs_bad.wrapping_add(1),
@@ -457,7 +476,7 @@ impl HcExchange {
                 fills: [EMPTY_FILL; FILL_Q],
                 f_head: 0,
                 f_len: 0,
-                retired: [(0, 0); RETIRED_Q],
+                retired: [Retired::new(0, 0, 0); RETIRED_Q],
                 r_head: 0,
                 r_len: 0,
                 fill_ids: FillIds::new(),
@@ -698,7 +717,7 @@ impl HcExchange {
             live: a.status.is_working(),
         };
         if !a.status.is_working() && a.filled_1e6 < order.qty.raw() {
-            self.book.retire(order.client_oid);
+            self.book.retire(order.client_oid, retired_why(a.status));
         }
     }
 
@@ -741,7 +760,7 @@ impl HcExchange {
                     r.live = false;
                     r.filled_1e6 = r.filled_1e6.max(a.filled_1e6);
                     if r.filled_1e6 < r.qty_1e6 {
-                        self.book.retire(client_oid);
+                        self.book.retire(client_oid, RETIRED_CANCELED_MEMBER);
                     }
                 }
                 Ok(a)
@@ -1119,7 +1138,7 @@ impl OrderDispatch for HcExchange {
         Some(f)
     }
 
-    fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+    fn try_next_retired(&mut self) -> Option<Retired> {
         let b = &mut self.book;
         if b.r_len == 0 {
             return None;
@@ -1244,7 +1263,7 @@ mod tests {
             fills: [EMPTY_FILL; FILL_Q],
             f_head: 0,
             f_len: 0,
-            retired: [(0, 0); RETIRED_Q],
+            retired: [Retired::new(0, 0, 0); RETIRED_Q],
             r_head: 0,
             r_len: 0,
             fill_ids: FillIds::new(),
@@ -1296,7 +1315,7 @@ mod tests {
         assert!(b.rows[3].live);
         b.on_payload(br#"{"type":"OrderUpdate","order_id":77,"status":"CANCELED","filled_size":"0.4"}"#, &t);
         assert!(!b.rows[3].live);
-        assert_eq!((b.r_len, b.retired[0]), (1, (5, 7)));
+        assert_eq!((b.r_len, b.retired[0]), (1, Retired::new(5, 7, RETIRED_EXPIRED)));
     }
 
     #[test]

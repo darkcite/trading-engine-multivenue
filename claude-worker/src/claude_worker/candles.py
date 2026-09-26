@@ -14,7 +14,7 @@ BINDING laws (docs/mvp-completion-plan.md §9, verbatim inheritance):
 - **§9.4 store**: SQLite WAL, ONE table, PK ``(venue, descriptor,
   tf, open_ts)``. ``descriptor`` is the venue instrument string in
   the worker map-name convention (``binance:btcusdt``,
-  ``binance-usdm:btcusdt``, ``okx:BTC-USDT``,
+  ``binance-usdm:btcusdt``, ``binance-coinm:btcusd_perp``, ``okx:BTC-USDT``,
   ``deribit:BTC-PERPETUAL``, ``hyperliquid:BTC``, a PM token id) —
   NEVER a bare SymbolId (ids reshuffle across boots). Columns
   ``o,h,l,c,v``, ``source`` ∈ ``rest|derived|capture``,
@@ -111,6 +111,18 @@ BN_REST_HOST_ENV: str = "BINANCE_REST_HOST"
 BN_REST_HOST_DEFAULT: str = "api.binance.com"
 BN_FUT_REST_HOST_ENV: str = "BINANCE_FUT_REST_HOST"
 BN_FUT_REST_HOST_DEFAULT: str = "fapi.binance.com"
+# BX2: COIN-M REST host (mirrors the engine's BINANCE_COINM_REST_HOST).
+BN_COINM_REST_HOST_ENV: str = "BINANCE_COINM_REST_HOST"
+BN_COINM_REST_HOST_DEFAULT: str = "dapi.binance.com"
+#: The two Binance futures kline endpoints, by lane. BX2 (measured live
+#: 2026-09-26): dapi's ``/dapi/v1/klines`` rows are fapi's shape; the
+#: volume column is CONTRACTS (100 USD on BTC, 10 USD on the others — the
+#: raw venue unit, the MEXC-perp precedent); ``startTime=0`` walks from
+#: the listing on both.
+_BN_FUT_KLINES: dict[str, str] = {
+    "binance-usdm": "/fapi/v1/klines",
+    "binance-coinm": "/dapi/v1/klines",
+}
 # WS9: Bybit REST host (mirrors the engine's BYBIT_REST_HOST).
 BYBIT_REST_HOST_ENV: str = "BYBIT_REST_HOST"
 BYBIT_REST_HOST_DEFAULT: str = "api.bybit.com"
@@ -225,6 +237,9 @@ LANE_FORMS: dict[str, LaneForm] = {
     # WS5: dated delivery futures ride the SAME fapi lane + descriptor
     # namespace as the perps (klines/ticker endpoints serve both).
     "binance-usdm": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance-usdm", True, False),
+    # BX2: COIN-M perps and delivery futures — one dapi lane, one
+    # `binance-coinm:` namespace (its own REST host, so its own budget).
+    "binance-coinm": LaneForm(claude_worker.frames.VENUE_BINANCE, "binance-coinm", True, False),
     "okx": LaneForm(claude_worker.frames.VENUE_OKX, "okx", False, True),
     "deribit": LaneForm(claude_worker.frames.VENUE_DERIBIT, "deribit", False, False),
     "hyperliquid": LaneForm(claude_worker.frames.VENUE_HYPERLIQUID, "hyperliquid", False, False),
@@ -551,6 +566,7 @@ def read_universe_lanes(universe_path: pathlib.Path) -> list[Lane] | None:
     sources: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         ("binance", (("binance", "spot"),)),
         ("binance-usdm", (("binance", "usdm"), ("binance", "usdm_dated"))),
+        ("binance-coinm", (("binance", "coinm"), ("binance", "coinm_dated"))),
         ("okx", (("okx", "instruments"),)),
         ("deribit", (("deribit", "instruments"),)),
         ("hyperliquid", (("hyperliquid", "coins"),)),
@@ -897,9 +913,11 @@ def _fetch_forward_page(
             return None
         parsed = parse_binance_klines(raw)
         return None if parsed is None else parsed[0]
-    if lane.name == "binance-usdm":
+    if lane.name in _BN_FUT_KLINES:
         raw = http.get(
-            _bn_url(http.hosts["binance-usdm"], "/fapi/v1/klines", target.instrument, tf, lo_ms)
+            _bn_url(
+                http.hosts[lane.name], _BN_FUT_KLINES[lane.name], target.instrument, tf, lo_ms
+            )
         )
         if raw is None:
             return None
@@ -1552,6 +1570,7 @@ def make_http(client: httpx.Client, env: collections.abc.Mapping[str, str]) -> H
     hosts = {
         "binance": env.get(BN_REST_HOST_ENV, "") or BN_REST_HOST_DEFAULT,
         "binance-usdm": env.get(BN_FUT_REST_HOST_ENV, "") or BN_FUT_REST_HOST_DEFAULT,
+        "binance-coinm": env.get(BN_COINM_REST_HOST_ENV, "") or BN_COINM_REST_HOST_DEFAULT,
         "bybit": env.get(BYBIT_REST_HOST_ENV, "") or BYBIT_REST_HOST_DEFAULT,
         "mexc": env.get(MEXC_REST_HOST_ENV, "") or MEXC_REST_HOST_DEFAULT,
         "mexc-perp": env.get(MEXC_FUT_REST_HOST_ENV, "") or MEXC_FUT_REST_HOST_DEFAULT,

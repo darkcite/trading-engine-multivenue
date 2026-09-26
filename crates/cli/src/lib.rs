@@ -38,6 +38,7 @@ pub mod audit_pnl;
 pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
+pub mod bn_live;
 pub mod capture_catalog;
 pub mod evm_live;
 pub mod evm_shadow;
@@ -71,7 +72,7 @@ pub mod xmm_boot;
 pub mod hcv_boot;
 
 pub use paper::{
-    bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
+    bn_coinm_specs, bn_options_path, bn_usdm_specs, boot_discovery, boot_info, build_ai_universe,
     build_deribit_symbol_table, build_hl_coin_table, build_hl_families, build_okx_symbol_table,
     engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full, engine_loop_set_full,
     extend_deribit_table_with_combos, extend_deribit_table_with_options,
@@ -82,8 +83,8 @@ pub use paper::{
     spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc, split_host_port,
     state_writer, AiIngressCounterIds,
     AiIngressStatus, BinanceConnSpec, BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers,
-    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, HcMetricIds, HypercallSpec,
-    IngressCounterIds,
+    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds,
+    HypercallSpec, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
     RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };

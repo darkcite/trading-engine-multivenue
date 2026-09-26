@@ -159,6 +159,10 @@ pub enum ConfigErr {
     /// The key could not be locked into its own page. Refused rather
     /// than continuing with a swappable key.
     Locking(i32),
+    /// **BX3 (O-BX20)** — a loopback port asked of a real host, where
+    /// only 443 exists. Test builds only (`loopback`).
+    #[cfg(feature = "loopback")]
+    PortOnRealHost(u16),
     /// **The host and the source name different networks.**
     HostSourceMismatch {
         /// The host that was configured.
@@ -193,6 +197,11 @@ impl core::fmt::Display for ConfigErr {
                 "hl config: the agent key is not a valid secp256k1 private key (it must be \
                  non-zero and below the curve order)"
             ),
+            #[cfg(feature = "loopback")]
+            ConfigErr::PortOnRealHost(port) => write!(
+                f,
+                "hl config: port {port} asked of a real Hyperliquid host — it serves 443 only"
+            ),
             ConfigErr::HostSourceMismatch {
                 host,
                 source,
@@ -225,7 +234,14 @@ pub struct HlConfig {
     pub master_addr: [u8; 20],
     /// The agent's own address, derived from the key at construction.
     pub agent_addr: [u8; 20],
+    /// The port every connection to `host` dials. 443, fixed at
+    /// construction; only the test-only `loopback` feature's
+    /// [`HlConfig::with_port`] moves it, and never on a real host.
+    port: u16,
 }
+
+/// The port a Hyperliquid host serves.
+pub const HTTPS_PORT: u16 = 443;
 
 impl HlConfig {
     /// Build from explicit values, applying the host/source interlock.
@@ -285,7 +301,32 @@ impl HlConfig {
             agent_key,
             master_addr,
             agent_addr,
+            port: HTTPS_PORT,
         })
+    }
+
+    /// The port every connection to [`Self::host`] dials: 443 outside a
+    /// `loopback` test build.
+    #[inline]
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// **BX3 (O-BX20) — TEST-ONLY: dial `port` instead of 443**, so the
+    /// real arm can run against a scripted TLS venue on loopback.
+    ///
+    /// # Errors
+    /// [`ConfigErr::PortOnRealHost`] for any port but 443 on the mainnet
+    /// or testnet host — the feature cannot point a real key at a real
+    /// host through an unexpected door.
+    #[cfg(feature = "loopback")]
+    pub fn with_port(mut self, port: u16) -> Result<Self, ConfigErr> {
+        if port != HTTPS_PORT && (self.host == HOST_MAINNET || self.host == HOST_TESTNET) {
+            return Err(ConfigErr::PortOnRealHost(port));
+        }
+        self.port = port;
+        Ok(self)
     }
 
     /// Read from the process environment.
@@ -354,6 +395,7 @@ impl core::fmt::Debug for HlConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("HlConfig")
             .field("host", &self.host)
+            .field("port", &self.port)
             .field("network", &self.network)
             .field("agent_addr", &hex20(&self.agent_addr))
             .field("master_addr", &hex20(&self.master_addr))
@@ -447,6 +489,37 @@ mod tests {
         let c = HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR).expect("local");
         assert_eq!(c.network, Network::Testnet);
         assert!(!c.is_testnet(), "a local double is not the testnet venue");
+    }
+
+    /// BX3 (O-BX20): every host dials 443 unless a `loopback` test build
+    /// moves a LOCAL host's port.
+    #[test]
+    fn the_port_is_443_by_construction() {
+        for host in [HOST_MAINNET, HOST_TESTNET, "localhost"] {
+            let src = if host == HOST_MAINNET { 'a' } else { 'b' };
+            let c = HlConfig::new(Scope::Testnet, host, src, KEY, ADDR).expect("cfg");
+            assert_eq!(c.port(), HTTPS_PORT, "{host}");
+        }
+    }
+
+    /// BX3 (O-BX20): the test-only port moves a local double and nothing
+    /// else — the mainnet and testnet hosts serve 443 only.
+    #[cfg(feature = "loopback")]
+    #[test]
+    fn a_loopback_port_is_refused_on_a_real_host() {
+        let local = HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR).expect("local");
+        assert_eq!(local.with_port(8443).expect("a local double").port(), 8443);
+        for (host, src) in [(HOST_MAINNET, 'a'), (HOST_TESTNET, 'b')] {
+            let real = HlConfig::new(Scope::Live, host, src, KEY, ADDR).expect("real");
+            let e = real.with_port(8443).unwrap_err();
+            assert_eq!(e, ConfigErr::PortOnRealHost(8443), "{host}");
+            assert!(e.to_string().contains("443 only"), "{e}");
+            let real = HlConfig::new(Scope::Live, host, src, KEY, ADDR).expect("real");
+            assert_eq!(
+                real.with_port(HTTPS_PORT).expect("443 stands").port(),
+                HTTPS_PORT
+            );
+        }
     }
 
     #[test]

@@ -39,15 +39,26 @@
 //! the loop and costs no code here. `try_next_fill` therefore forwards
 //! the **paper arm only**.
 
-use crate::counters::{RiskRefusal, RouteCounters};
+use crate::counters::{RetireCounters, RiskRefusal, RouteCounters};
 use crate::halt::{trigger_for, CancelPhase, HaltReason, HaltState};
-use crate::ledger::Ledger;
+use crate::ledger::{InstProbe, InstRefusal, InstrumentBindErr, InstrumentSpec, Ledger};
 use crate::mode::ExecMode;
-use crate::route::{ExecRoute, EXEC_SLOTS};
+use crate::route::{ExecRoute, SlotCaps, EXEC_SLOTS};
 use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
+    RouteAliases,
 };
 use core_types::{CancelReq, Fill, ModifyReq, NsTs, Order, Side, SymbolId, Tick};
+
+/// **BX3 (F9)** — retirements the router drains per `on_idle`. A bound,
+/// so one arm's burst (a venue cancelling a whole book, a TTL wheel
+/// turning over) cannot hold the engine thread: the rest wait for the
+/// next idle moment, and the arm's own queue is what holds them.
+pub const RETIRED_DRAIN_MAX: usize = 64;
+
+/// How often the ledger's marks are checked for staleness (BX6, BX3
+/// obligation 6).
+pub const MARK_SWEEP_NS: u64 = 1_000_000_000;
 
 /// How often `exec.HALT` is checked on the idle path. One second: an
 /// operator reaching for a kill switch waits a second, and the engine
@@ -78,6 +89,14 @@ pub struct RoutedDispatcher<P: OrderDispatch, L: OrderDispatch> {
     paper: P,
     live: L,
     counters: RouteCounters,
+    /// **BX3** — the boot-fixed route aliases every `venue_allowed`
+    /// check reads (the legacy anchor → Binance). `NONE` until
+    /// [`Self::set_route_aliases`].
+    aliases: RouteAliases,
+    /// Monotonic ns of the next mark staleness sweep (BX6).
+    mark_sweep_ns: u64,
+    /// **BX3 (F9)** — the retirements drained, by `why`.
+    retired: RetireCounters,
     /// **E6 commit 3** — the per-slot sticky halt.
     halt: HaltState,
     /// **E6 commit 3** — where to write `exec.HALT` so an auto-halt
@@ -148,6 +167,9 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             paper,
             live,
             counters: RouteCounters::new(),
+            aliases: RouteAliases::NONE,
+            mark_sweep_ns: 0,
+            retired: RetireCounters::default(),
             halt: HaltState::new(),
             halt_path: None,
             halt_file_seen: None,
@@ -159,6 +181,41 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
             halt_file_adopted: 0,
             ledger: Box::new(Ledger::new(anchor)),
         }
+    }
+
+    /// **BX3** — route by this alias table from now on, and hand it down
+    /// to the live arm ([`OrderDispatch::set_route_aliases`]): a
+    /// `VenueSplit` routes by the table the router allowed the order by,
+    /// because there is only the one. Boot-only.
+    #[inline]
+    pub fn set_route_aliases(&mut self, aliases: RouteAliases) {
+        self.aliases = aliases;
+        self.live.set_route_aliases(aliases);
+    }
+
+    /// **BX3** — the alias table in force. Cold; boot tell and tests.
+    #[inline]
+    #[must_use]
+    pub const fn route_aliases(&self) -> &RouteAliases {
+        &self.aliases
+    }
+
+    /// **BX3** — bind one instrument row in the ledger (plan §3.5).
+    /// Boot-only; the boot refuses on any `Err` (BX6 binds the armed
+    /// set from discovery).
+    ///
+    /// # Errors
+    /// See [`Ledger::bind_instrument`].
+    #[inline]
+    pub fn bind_instrument(&mut self, spec: &InstrumentSpec) -> Result<(), InstrumentBindErr> {
+        self.ledger.bind_instrument(spec)
+    }
+
+    /// **BX3 (F9)** — the retirements drained so far, by `why`. Cold.
+    #[inline]
+    #[must_use]
+    pub const fn retired(&self) -> &RetireCounters {
+        &self.retired
     }
 
     /// **E6 commit 3** — the per-slot halt state. Cold; `/state`,
@@ -745,7 +802,23 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// notional too would mean assuming both sides of a two-sided
     /// quote fill, which cannot happen and would strangle the maker —
     /// so this is a stated bound, not an oversight.
-    fn risk_check(&mut self, order: &Order, verb: RiskVerb) -> Result<(), DispatchError> {
+    ///
+    /// Exits never widen it. On a family row (Hyperliquid) an exit is a
+    /// sell no larger than the holding, and the venue cannot oversell a
+    /// binary leg. On a Binance instrument row (BX3) an order is an exit
+    /// only if it AND every working order on its side cannot cross zero
+    /// ([`Ledger::probe_instrument`]): N working exits of the whole
+    /// position are one exit, and the rest are judged by every clamp —
+    /// and an exit PLACE still counts against `max_open_orders`
+    /// (O-BX25), so the shared resting table stays bounded per slot.
+    /// The residuals (two anomalous table states, three BX6 obligations)
+    /// are named in `docs/risk-policy.md`, "BX3".
+    fn risk_check(
+        &mut self,
+        order: &Order,
+        venue: u8,
+        verb: RiskVerb,
+    ) -> Result<(), DispatchError> {
         let slot = order.strategy_id as usize;
         let Some(caps) = self.route.caps_at(slot) else {
             // No such slot. The caller's own `mode()` lookup masks the
@@ -809,6 +882,33 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         let px = order.px.raw();
         let qty = order.qty.raw();
         let buy = order.side == Side::Bid;
+
+        // ---- BX3: an instrument row is judged by its law -------------
+        //
+        // A bound instrument (Binance) carries its own law — spot,
+        // linear, inverse, option — and its own measures; the family
+        // clamps below are Hyperliquid's and see it only through the
+        // exposure sum. One compare when no instrument is bound, which
+        // is every boot without a Binance slot.
+        // A modify is judged beside every OTHER working order, never
+        // beside the one it replaces.
+        let exclude = match verb {
+            RiskVerb::Place => None,
+            RiskVerb::Replace(prev) => Some(prev),
+        };
+        if let Some(p) = self
+            .ledger
+            .probe_instrument(order.sym, slot, qty, buy, px, exclude)
+        {
+            return self.judge_instrument(order, verb, &caps, p);
+        }
+        // A Binance-routed order on an id no row was bound for has no law
+        // to be judged by, and no exposure the ledger could count: refused
+        // (plan §13.2 F8, closed at the router for this venue).
+        if venue == core_types::VenueId::Binance as u8 {
+            return self.refuse(order.strategy_id, RiskRefusal::Unpriced);
+        }
+
         let notional_1e6 =
             i64::try_from((px as i128).saturating_mul(qty as i128) / 1_000_000)
                 .unwrap_or(i64::MAX);
@@ -902,6 +1002,59 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         Ok(())
     }
 
+    /// **BX3 — the four clamps on an instrument row**, read off the law's
+    /// [`InstProbe`] (all at one price). A law refusal first; an exit
+    /// then passes the three MONEY clamps, because it can only reduce what
+    /// they bound — but a new exit still needs a free open-order place
+    /// (O-BX25): the resting table is shared by every slot, and many
+    /// small exits must not fill it. A member at its count cancels or
+    /// requotes (a modify is exempt, LAW E-7). Clamp 1 measures in the
+    /// law's units (O-BX21); clamp 4 adds only the part of the order that
+    /// increases the position.
+    fn judge_instrument(
+        &mut self,
+        order: &Order,
+        verb: RiskVerb,
+        caps: &SlotCaps,
+        p: InstProbe,
+    ) -> Result<(), DispatchError> {
+        let slot = order.strategy_id as usize;
+        match p.refusal {
+            InstRefusal::None => {}
+            InstRefusal::Short => return self.refuse(order.strategy_id, RiskRefusal::Short),
+            InstRefusal::Unpriced => return self.refuse(order.strategy_id, RiskRefusal::Unpriced),
+        }
+        // ---- 2. how many are already working (a PLACE only, LAW E-7) --
+        // Before the exit test: it binds exits too (O-BX25).
+        if matches!(verb, RiskVerb::Place) && self.ledger.slot_resting(slot) >= caps.max_open_orders
+        {
+            return self.refuse(order.strategy_id, RiskRefusal::OpenOrders);
+        }
+        if p.exit {
+            return Ok(());
+        }
+        // ---- 1. this one order ---------------------------------------
+        if p.measure_1e6 > caps.max_order_usd_1e6 {
+            return self.refuse(order.strategy_id, RiskRefusal::MaxOrder);
+        }
+        // ---- 3. what it would leave at stake --------------------------
+        self.ledger.observe_mono_clock(order.ts_ns);
+        if p.projected_1e6 > caps.cap_instance_usd_1e6 && p.projected_1e6 > p.current_1e6 {
+            return self.refuse(order.strategy_id, RiskRefusal::CapInstance);
+        }
+        // ---- 4. what it would add to today's turnover -----------------
+        if p.turnover_add_1e6 > 0
+            && self
+                .ledger
+                .slot_day_turnover_1e6(slot)
+                .saturating_add(p.turnover_add_1e6)
+                > caps.cap_day_usd_1e6
+        {
+            return self.refuse(order.strategy_id, RiskRefusal::CapDay);
+        }
+        Ok(())
+    }
+
     /// Count one refusal and name it. Never inlined into four copies
     /// of the same two lines.
     #[inline]
@@ -919,8 +1072,10 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
 enum RiskVerb {
     /// A fresh order.
     Place,
-    /// A modify — LAW E-7, one resting order swapped for another.
-    Replace,
+    /// A modify — LAW E-7, one resting order swapped for another. Carries
+    /// the replaced order's client id: the instrument exit test counts
+    /// every OTHER working order on the side (BX3).
+    Replace(u64),
 }
 
 impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L> {
@@ -944,12 +1099,13 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 Err(DispatchError::SlotDisabled)
             }
             ExecMode::Live => {
-                if !self.route.venue_allowed(order.strategy_id, order.venue) {
+                let venue = self.aliases.route_venue(order.sym, order.venue);
+                if !self.route.venue_allowed(order.strategy_id, venue) {
                     // LAW E-1. NOT `self.paper.submit(order)`.
                     self.counters.on_refused_no_route(order.strategy_id);
                     return Err(DispatchError::NoLiveRoute);
                 }
-                self.risk_check(order, RiskVerb::Place)?;
+                self.risk_check(order, venue, RiskVerb::Place)?;
                 self.counters.on_live_submit(order.strategy_id);
                 let r = self.live.submit(order);
                 if r.is_ok() {
@@ -963,6 +1119,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                         order.strategy_id as usize,
                         order.sym,
                         order.qty.raw(),
+                        order.side == Side::Bid,
                     );
                 }
                 r
@@ -1000,25 +1157,29 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             // slot whose artifact names no venue has nowhere to send
             // it and is refused as before.
             ExecMode::Off => {
-                if !self.route.venue_allowed(req.strategy_id, req.venue) {
+                let venue = self.aliases.route_venue(req.sym, req.venue);
+                if !self.route.venue_allowed(req.strategy_id, venue) {
                     self.counters.on_refused_off(req.strategy_id);
                     return Err(DispatchError::SlotDisabled);
                 }
                 self.counters.on_cancel_on_off();
                 let r = self.live.cancel(req);
-                if r.is_ok() {
+                // BX6 (BX3 obligation 2): a queued arm's `Ok` means QUEUED —
+                // the row is released on its confirmed retirement instead.
+                if r.is_ok() && !self.live.verbs_confirm_later(req.sym, venue, req.strategy_id) {
                     self.ledger
                         .on_cancel(req.client_oid, req.strategy_id as usize);
                 }
                 r
             }
             ExecMode::Live => {
-                if !self.route.venue_allowed(req.strategy_id, req.venue) {
+                let venue = self.aliases.route_venue(req.sym, req.venue);
+                if !self.route.venue_allowed(req.strategy_id, venue) {
                     self.counters.on_refused_no_route(req.strategy_id);
                     return Err(DispatchError::NoLiveRoute);
                 }
                 let r = self.live.cancel(req);
-                if r.is_ok() {
+                if r.is_ok() && !self.live.verbs_confirm_later(req.sym, venue, req.strategy_id) {
                     self.ledger
                         .on_cancel(req.client_oid, req.strategy_id as usize);
                 }
@@ -1041,7 +1202,8 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 Err(DispatchError::SlotDisabled)
             }
             ExecMode::Live => {
-                if !self.route.venue_allowed(req.order().strategy_id, req.order().venue) {
+                let venue = self.aliases.route_venue(req.order().sym, req.order().venue);
+                if !self.route.venue_allowed(req.order().strategy_id, venue) {
                     self.counters.on_refused_no_route(req.order().strategy_id);
                     return Err(DispatchError::NoLiveRoute);
                 }
@@ -1049,15 +1211,19 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 // alone leaves the cap reachable by repricing upward
                 // — the hole the E5 commit-4b review named. The
                 // replacement is measured exactly as a fresh order is.
-                self.risk_check(req.order(), RiskVerb::Replace)?;
+                self.risk_check(req.order(), venue, RiskVerb::Replace(req.prev_client_oid()))?;
                 let r = self.live.modify(req);
-                if r.is_ok() {
+                // BX6 (BX3 obligation 2): for a queued arm the row is renamed
+                // on the arm's confirmed `Renamed`, never on `Ok`.
+                let o = req.order();
+                if r.is_ok() && !self.live.verbs_confirm_later(o.sym, venue, o.strategy_id) {
                     self.ledger.on_modify(
                         req.prev_client_oid(),
                         req.order().client_oid,
                         req.order().strategy_id as usize,
                         req.order().sym,
                         req.order().qty.raw(),
+                        req.order().side == Side::Bid,
                     );
                 }
                 r
@@ -1161,12 +1327,36 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         let a = self.paper.on_idle();
         let b = self.live.on_idle();
 
-        // HYPARB L5: orders the arm accepted that ended without a
-        // (further) fill leave the resting count — a reverted swap is
-        // not working anywhere, and counting it would stall the slot
-        // at `max_open_orders`. Bounded by what the arm queued.
-        while let Some((oid, slot)) = self.live.try_next_retired() {
-            self.ledger.on_cancel(oid, slot as usize);
+        // HYPARB L5, BX3 (F9): orders the arm accepted that ended
+        // without a (further) fill leave the resting count — a reverted
+        // swap or an expired IoC is not working anywhere, and counting
+        // it would stall the slot at `max_open_orders`. At most
+        // `RETIRED_DRAIN_MAX` a poll; each is counted by its `why`.
+        let mut drained = 0usize;
+        while drained < RETIRED_DRAIN_MAX {
+            let Some(r) = self.live.try_next_retired() else {
+                break;
+            };
+            drained += 1;
+            self.ledger.on_cancel(r.client_oid, r.slot as usize);
+            self.retired.count(r.why);
+        }
+        // BX6 (BX3 obligation 2): modifies a queued arm confirmed rename
+        // their rows now, at most `RETIRED_DRAIN_MAX` a poll.
+        let mut renamed = 0usize;
+        while renamed < RETIRED_DRAIN_MAX {
+            let Some(n) = self.live.try_next_renamed() else {
+                break;
+            };
+            renamed += 1;
+            self.ledger.on_modify(n.prev_client_oid, n.client_oid, n.slot as usize, n.sym, n.qty_1e6, n.buy != 0);
+        }
+        // BX6 (obligation 6): a mark that stopped arriving stops pricing
+        // (checked once a second; the ledger falls back to the last fill).
+        let now = core_time::now_ns();
+        if now >= self.mark_sweep_ns {
+            self.mark_sweep_ns = now + MARK_SWEEP_NS;
+            self.ledger.expire_marks(now);
         }
 
         // **E6 commit 3 — the halt machine runs HERE, not on the
@@ -1268,6 +1458,13 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         self.paper.on_venue_event(event);
         self.live.on_venue_event(event);
 
+        // BX3: the ledger's price feed — a venue mark prices the spot,
+        // linear and inverse rows (plan §3.5). One compare when no
+        // instrument is bound.
+        if event.channel == core_types::ChannelId::Mark as u8 {
+            self.ledger.on_mark(event.sym, event.v0, event.v1, event.ts_ns);
+            return;
+        }
         if event.channel != core_types::ChannelId::InstrumentRoll as u8 {
             return;
         }
@@ -1295,6 +1492,24 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             core_types::ROLL_KIND_SETTLED => self.ledger.settle(event.venue, family, outcome),
             _ => self.ledger.refuse_roll(),
         }
+    }
+
+    /// **BX3** — an options summary: the arms first (the paper matcher
+    /// and the live arm may price from it), in the order
+    /// `on_venue_event` keeps.
+    #[inline]
+    fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
+        self.paper.on_opt_summary(summary);
+        self.live.on_opt_summary(summary);
+        // BX3: the option rows' mark and index.
+        self.ledger.on_opt_summary(summary);
+    }
+
+    /// **BX3** — the same act as the inherent setter: a router reached
+    /// through the trait still owns its table and hands it down.
+    #[inline]
+    fn set_route_aliases(&mut self, aliases: RouteAliases) {
+        RoutedDispatcher::set_route_aliases(self, aliases);
     }
 
     /// **E6** — book the fill into the ledger the clamps read.
@@ -1325,8 +1540,9 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             *h = self.halt.reason(slot) as u8;
         }
         let l = self.ledger.counters();
-        // COPY: ExecCounters (568 B by repr(C) layout, const-asserted —
-        // the 272 B LiveArmCounters ride inside) returned by value across
+        let bn = self.live.venue_arm_counters(core_types::VenueId::Binance as u8);
+        // COPY: ExecCounters (936 B by repr(C) layout, const-asserted —
+        // two 272 B LiveArmCounters ride inside) returned by value across
         // the OrderDispatch boundary, 1/s for /state + 1/5 s for /metrics
         // (+ once at the drain) —
         // it is COMPOSED here from the router, the halt state, the
@@ -1336,6 +1552,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         ExecCounters {
             configured: 1,
             modes,
+            arm_bn_present: u8::from(bn.is_some()),
             live_submits: c.live_submits,
             paper_submits: c.paper_submits,
             refused_off: c.refused_off,
@@ -1344,6 +1561,8 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             cancel_on_off: c.cancel_on_off,
             refused_halted: c.refused_halted,
             refused_unseeded: c.refused_unseeded,
+            refused_short: c.refused_short,
+            refused_unpriced: c.refused_unpriced,
             halts: self.halt.halts,
             cancel_all_failures: self.halt.cancel_all_failures,
             cancel_all_stranded: self.halt.cancel_all_stranded,
@@ -1359,13 +1578,22 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
             ledger_resting_full: l.resting_full,
             ledger_resting_ambiguous: l.resting_ambiguous,
             ledger_settles_unmatched: l.settles_unmatched,
+            retired: self.retired.by_why,
             arm: self.live.arm_counters(),
+            ledger_marks_refused: l.marks_refused,
+            ledger_marks_expired: l.marks_expired,
+            arm_bn: bn.unwrap_or_default(),
         }
     }
 
     #[inline]
     fn arm_counters(&self) -> clob_dispatcher::LiveArmCounters {
         self.live.arm_counters()
+    }
+
+    #[inline]
+    fn venue_arm_counters(&self, venue: u8) -> Option<clob_dispatcher::LiveArmCounters> {
+        self.live.venue_arm_counters(venue)
     }
 
     /// **S7-L1** — both arms; only the live one has anything resting
@@ -2472,6 +2700,12 @@ mod tests {
         day_bought: Option<(u64, i64)>,
         /// Orders the arm says ended without a fill (HYPARB L5).
         retired: Vec<(u64, u8)>,
+        /// BX6: the arm's cancel / modify `Ok` means QUEUED.
+        confirm_later: bool,
+        /// BX6: modifies the venue confirmed (`try_next_renamed`).
+        renamed: Vec<clob_dispatcher::Renamed>,
+        /// BX6: the `why` of the next retirements (EXPIRED if unset).
+        retire_why: Option<u8>,
     }
 
     /// `clob_dispatcher::HaltSignal` under a short name, so the test
@@ -2485,8 +2719,17 @@ mod tests {
             self.seen.push(order.client_oid);
             Ok(())
         }
-        fn try_next_retired(&mut self) -> Option<(u64, u8)> {
-            self.retired.pop()
+        fn try_next_retired(&mut self) -> Option<clob_dispatcher::Retired> {
+            let why = self.retire_why.unwrap_or(clob_dispatcher::RETIRED_EXPIRED);
+            self.retired
+                .pop()
+                .map(|(oid, slot)| clob_dispatcher::Retired::new(oid, slot, why))
+        }
+        fn verbs_confirm_later(&self, _sym: core_types::SymbolId, _venue: u8, _slot: u8) -> bool {
+            self.confirm_later
+        }
+        fn try_next_renamed(&mut self) -> Option<clob_dispatcher::Renamed> {
+            self.renamed.pop()
         }
         fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
             self.cancelled.push(req.client_oid);
@@ -2621,6 +2864,18 @@ mod tests {
     #[test]
     fn a_reject_streak_halts_cancels_and_refuses() {
         assert_trigger(|s| s.reject_streak = 5, crate::halt::HaltReason::RejectStreak);
+    }
+
+    /// BX3: a venue-imposed restriction halts the slot like any trigger.
+    #[test]
+    fn a_venue_lock_halts_cancels_and_refuses() {
+        assert_trigger(|s| s.venue_lock = 1, crate::halt::HaltReason::VenueLock);
+    }
+
+    /// BX3 (D6): the arm's margin verdict halts the slot.
+    #[test]
+    fn a_margin_risk_halts_cancels_and_refuses() {
+        assert_trigger(|s| s.margin_risk = 1, crate::halt::HaltReason::MarginRisk);
     }
 
     #[test]
@@ -3455,5 +3710,433 @@ mod tests {
         d.live_mut().b_mut().retired.push((8, 0));
         d.on_idle();
         assert_eq!(d.ledger().slot_resting(3), 1);
+    }
+
+    /// BX3: the route alias applies to the anchor's full id and nothing
+    /// else — a neighbouring id with the same (Polymarket) byte is still
+    /// refused, and a native Binance id routes by its own byte.
+    #[test]
+    fn the_alias_applies_only_to_the_anchor() {
+        let bn = VenueId::Binance.to_u8();
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            2,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d =
+            RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        d.set_route_aliases(clob_dispatcher::RouteAliases::NONE.with(7, bn).unwrap());
+        let native = core_types::make_symbol_id(VenueId::Binance, 3073);
+        d.bind_instrument(&InstrumentSpec::new(7, crate::LAW_SPOT, 0, 0, 0))
+            .unwrap();
+        d.bind_instrument(&InstrumentSpec::new(native, crate::LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        d.live_mut().sig = healthy();
+        d.on_idle();
+        let at = |sym: core_types::SymbolId, venue: u8, oid: u64| {
+            let mut o = order(2, VenueId::Binance, oid);
+            o.sym = sym;
+            o.venue = venue;
+            o
+        };
+        assert!(
+            d.submit(&at(7, 0, 1)).is_ok(),
+            "the anchor routes to Binance"
+        );
+        assert_eq!(d.submit(&at(8, 0, 2)), Err(DispatchError::NoLiveRoute));
+        assert!(d.submit(&at(native, bn, 3)).is_ok());
+        assert_eq!(d.live().seen, [1, 3]);
+        // A Binance id no row was bound for has no law to be judged by.
+        let unbound = core_types::make_symbol_id(VenueId::Binance, 3074);
+        assert_eq!(
+            d.submit(&at(unbound, bn, 4)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_unpriced, 1);
+        assert_eq!(
+            d.exec_counters().refused_unpriced,
+            1,
+            "and it reaches the surfaces"
+        );
+        // A cancel of the anchor's order follows the same alias.
+        assert!(d.cancel(&CancelReq::of(&at(7, 0, 1), 1)).is_ok());
+        assert_eq!(d.route_aliases().len(), 1);
+    }
+
+    /// **BX3 risk review — one alias table.** The router hands its table
+    /// down to a `VenueSplit` (`OrderDispatch::set_route_aliases`), so the
+    /// venue an order was allowed by and the arm it reaches cannot
+    /// disagree. Break-and-watch: a router that keeps the table to itself
+    /// sends the anchor — allowed as Binance — to the Hyperliquid arm.
+    #[test]
+    fn the_router_hands_its_alias_table_down_to_the_split() {
+        let bn = VenueId::Binance.to_u8();
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            2,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let split = crate::VenueSplit::new(bn, SpyHalt::default(), SpyHalt::default(), &r);
+        let mut d = RoutedDispatcher::new(r, PaperDispatcher::new(), split, test_anchor());
+        assert!(
+            d.live().aliases().is_empty(),
+            "the split starts with none of its own"
+        );
+        d.set_route_aliases(clob_dispatcher::RouteAliases::NONE.with(7, bn).unwrap());
+        assert_eq!(d.live().aliases(), d.route_aliases());
+        d.bind_instrument(&InstrumentSpec::new(7, crate::LAW_SPOT, 0, 0, 0))
+            .unwrap();
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        let mut o = order(2, VenueId::Polymarket, 1);
+        o.sym = 7;
+        assert!(d.submit(&o).is_ok());
+        assert_eq!(d.live().b().seen, [1], "the anchor reached the Binance arm");
+        assert!(d.live().a().seen.is_empty());
+        // Through the trait, too: the same act.
+        OrderDispatch::set_route_aliases(&mut d, clob_dispatcher::RouteAliases::NONE);
+        assert!(d.live().aliases().is_empty() && d.route_aliases().is_empty());
+    }
+
+    /// **BX3 — a Binance order is judged by its instrument's law**: the
+    /// order clamp in the law's units (O-BX21: a short option by the IM
+    /// it adds, not its premium), an exit never refused, and the day cap
+    /// fed by the increasing part only.
+    #[test]
+    fn an_instrument_order_is_judged_by_its_law() {
+        const E6: i64 = 1_000_000;
+        let bn = VenueId::Binance.to_u8();
+        let spot = core_types::make_symbol_id(VenueId::Binance, 2);
+        let lin = core_types::make_symbol_id(VenueId::Binance, 600);
+        let call = core_types::make_symbol_id(VenueId::Binance, 1100);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[bn],
+            // max_order $1 000, cap_instance $5 000, cap_day $3 000.
+            SlotCaps::new(1_000 * E6, 5_000 * E6, 3_000 * E6, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d =
+            RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        d.bind_instrument(&InstrumentSpec::new(spot, crate::LAW_SPOT, 0, 0, 0))
+            .unwrap();
+        d.bind_instrument(&InstrumentSpec::new(lin, crate::LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        d.bind_instrument(&InstrumentSpec::new(
+            call,
+            crate::LAW_OPTION,
+            crate::INST_WRITABLE | crate::INST_CALL,
+            E6,
+            100_000 * E6,
+        ))
+        .unwrap();
+        d.live_mut().sig = healthy();
+        d.on_idle();
+        let bn_order = |oid: u64, sym: core_types::SymbolId, buy: bool, px: i64, qty: i64| {
+            let mut o = leg_order(oid, sym, buy, px, qty);
+            o.venue = bn;
+            o
+        };
+
+        // Linear: $500 passes, $2 000 is over max_order.
+        assert!(d.submit(&bn_order(1, lin, true, 100 * E6, 5 * E6)).is_ok());
+        assert_eq!(
+            d.submit(&bn_order(2, lin, true, 100 * E6, 20 * E6)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_max_order, 1);
+        d.on_fill_booked(&venue_fill(lin, true, 100 * E6, 5 * E6, 1));
+        assert_eq!(
+            d.ledger()
+                .instrument_position_1e6(STRATEGY_SLOT_BIN15 as usize, lin),
+            Some(5 * E6)
+        );
+        // An exit passes every clamp, whatever its price.
+        assert!(d
+            .submit(&bn_order(3, lin, false, 1_000_000 * E6, 5 * E6))
+            .is_ok());
+
+        // O-BX21: a one-contract short with $400 of premium adds $15 400 of
+        // IM at the money — over max_order. Break-and-watch: measuring the
+        // premium lets it through.
+        let s = core_types::OptSummary::new(
+            T0,
+            VenueId::Binance,
+            call,
+            core_types::OPT_SUMMARY_FLAG_MARK_PX,
+            400_000_000_000,
+            0,
+            100_000_000_000_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        d.on_opt_summary(&s);
+        assert_eq!(
+            d.submit(&bn_order(4, call, false, 400 * E6, E6)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_max_order, 2);
+        // Buying the call is measured by its premium: $400 passes.
+        assert!(d.submit(&bn_order(5, call, true, 400 * E6, E6)).is_ok());
+
+        // The day cap: $500 of linear buys are booked; another $2 400
+        // passes, the $600 after it would cross $3 000.
+        d.on_fill_booked(&venue_fill(lin, true, 100 * E6, 5 * E6, 6));
+        assert!(d.submit(&bn_order(7, lin, true, 100 * E6, 9 * E6)).is_ok());
+        d.on_fill_booked(&venue_fill(lin, true, 100 * E6, 9 * E6, 7));
+        assert_eq!(
+            d.ledger()
+                .slot_day_turnover_1e6(STRATEGY_SLOT_BIN15 as usize),
+            1_900 * E6
+        );
+        assert!(d.submit(&bn_order(8, lin, true, 100 * E6, 10 * E6)).is_ok());
+        d.on_fill_booked(&venue_fill(lin, true, 100 * E6, 10 * E6, 8));
+        assert_eq!(
+            d.submit(&bn_order(9, lin, true, 100 * E6, 2 * E6)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_cap_day, 1);
+
+        // Spot: a sell past the holding is a short the venue cannot
+        // carry — refused `Short`, and the surfaces carry the reason.
+        assert_eq!(
+            d.submit(&bn_order(10, spot, false, 100 * E6, E6)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_short, 1);
+        let e = d.exec_counters();
+        assert_eq!((e.refused_short, e.refused_unpriced), (1, 0));
+        assert_eq!(e.refused_risk, 4, "max_order ×2, cap_day, short");
+    }
+
+    /// **BX3 risk review — a second full-size exit is judged by the
+    /// clamps.** Long 5 at $100 on a linear row, over its $400
+    /// `cap_instance`: the first sell of 5 is an exit and passes over the
+    /// cap; the second, judged from the flat the first would leave, would
+    /// open a $500 short and is refused. A requote of the working exit is
+    /// still an exit, and once it is cancelled a full-size sell is an exit
+    /// again. Break-and-watch: judging from the filled position alone
+    /// passes the second sell — both filled, 5 → −5 unmeasured.
+    #[test]
+    fn a_second_full_size_exit_is_judged_by_the_clamps() {
+        const E6: i64 = 1_000_000;
+        let bn = VenueId::Binance.to_u8();
+        let lin = core_types::make_symbol_id(VenueId::Binance, 600);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(1_000 * E6, 400 * E6, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d =
+            RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        d.bind_instrument(&InstrumentSpec::new(lin, crate::LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        d.live_mut().sig = healthy();
+        d.on_idle();
+        d.on_fill_booked(&venue_fill(lin, true, 100 * E6, 5 * E6, 1));
+        let sell = |oid: u64, px: i64| {
+            let mut o = leg_order(oid, lin, false, px, 5 * E6);
+            o.venue = bn;
+            o
+        };
+        assert!(
+            d.submit(&sell(2, 100 * E6)).is_ok(),
+            "an exit, over the cap or not"
+        );
+        assert_eq!(
+            d.submit(&sell(3, 100 * E6)),
+            Err(DispatchError::RiskRefused)
+        );
+        assert_eq!(d.counters().refused_cap_instance, 1);
+        assert!(
+            d.modify(&ModifyReq::new(2, sell(4, 99 * E6))).is_ok(),
+            "a requote stays one"
+        );
+        assert!(d.cancel(&CancelReq::of(&sell(4, 99 * E6), T0)).is_ok());
+        assert!(
+            d.submit(&sell(5, 100 * E6)).is_ok(),
+            "cancelled, the next is an exit"
+        );
+        assert_eq!(d.counters().refused_risk, 1);
+    }
+
+    /// **O-BX25 — an exit PLACE still needs a free open-order place.**
+    /// The resting table is shared by every slot, so exits count against
+    /// `max_open_orders` like any PLACE; the money clamps never see them.
+    /// A member at its count cancels, then exits — or requotes a resting
+    /// exit, which LAW E-7 exempts. Break-and-watch: testing the exit
+    /// before the count lets the sell through at a full table.
+    #[test]
+    fn an_exit_place_still_needs_a_free_open_order_place() {
+        const E6: i64 = 1_000_000;
+        let bn = VenueId::Binance.to_u8();
+        let lin = core_types::make_symbol_id(VenueId::Binance, 600);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            STRATEGY_SLOT_BIN15 as usize,
+            ExecMode::Live,
+            &[bn],
+            SlotCaps::new(1_000 * E6, 5_000 * E6, i64::MAX, 1),
+            halt_limits(),
+        )
+        .unwrap();
+        let mut d =
+            RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        d.bind_instrument(&InstrumentSpec::new(lin, crate::LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        d.live_mut().sig = healthy();
+        d.on_idle();
+        d.on_fill_booked(&venue_fill(lin, true, 100 * E6, 5 * E6, 1));
+        let at = |oid: u64, buy: bool, px: i64, qty: i64| {
+            let mut o = leg_order(oid, lin, buy, px, qty);
+            o.venue = bn;
+            o
+        };
+        assert!(
+            d.submit(&at(2, true, 100 * E6, E6)).is_ok(),
+            "one working buy"
+        );
+        assert_eq!(
+            d.submit(&at(3, false, 100 * E6, 5 * E6)),
+            Err(DispatchError::RiskRefused),
+            "an exit at a full count"
+        );
+        assert_eq!(d.counters().refused_open_orders, 1);
+        assert!(d
+            .cancel(&CancelReq::of(&at(2, true, 100 * E6, E6), T0))
+            .is_ok());
+        assert!(
+            d.submit(&at(4, false, 100 * E6, 5 * E6)).is_ok(),
+            "a place freed"
+        );
+        assert!(
+            d.modify(&ModifyReq::new(4, at(5, false, 99 * E6, 5 * E6)))
+                .is_ok(),
+            "a requote of the resting exit at the count"
+        );
+    }
+
+    /// BX3 (F9): a retirement releases the order's resting row and is
+    /// counted by its `why`.
+    #[test]
+    fn a_retirement_releases_the_resting_row_and_counts_its_why() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        assert!(d.submit(&order(3, VenueId::Hyperliquid, 9)).is_ok());
+        assert_eq!(d.ledger().slot_resting(3), 1);
+        d.live_mut().a_mut().retired.push((9, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 0);
+        let expired = clob_dispatcher::RETIRED_EXPIRED as usize;
+        assert_eq!(d.retired().by_why[expired], 1);
+        assert_eq!(d.retired().total(), 1);
+        assert_eq!(
+            d.exec_counters().retired[expired],
+            1,
+            "and it reaches the surfaces"
+        );
+    }
+
+    /// BX6 (BX3 obligation 2): a queued arm's cancel `Ok` releases nothing;
+    /// the confirmed `CANCELED_MEMBER` does. A refused cancel (no
+    /// retirement) leaves the working order counted. Break-and-watch:
+    /// releasing on `Ok` drops the count to 0 at the cancel.
+    #[test]
+    fn a_confirm_later_cancel_releases_on_the_retirement_only() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.live_mut().a_mut().confirm_later = true;
+        d.on_idle();
+        let o = order(3, VenueId::Hyperliquid, 9);
+        assert!(d.submit(&o).is_ok());
+        assert!(d.cancel(&CancelReq::of(&o, T0)).is_ok());
+        assert_eq!(d.ledger().slot_resting(3), 1, "queued, not done");
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1, "the venue has not confirmed");
+        d.live_mut().a_mut().retire_why = Some(clob_dispatcher::RETIRED_CANCELED_MEMBER);
+        d.live_mut().a_mut().retired.push((9, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 0);
+        let member = clob_dispatcher::RETIRED_CANCELED_MEMBER as usize;
+        assert_eq!(d.retired().by_why[member], 1);
+        // The other arm of the split still releases on `Ok`.
+        d.live_mut().a_mut().confirm_later = false;
+        let o2 = order(3, VenueId::Hyperliquid, 10);
+        assert!(d.submit(&o2).is_ok());
+        assert!(d.cancel(&CancelReq::of(&o2, T0)).is_ok());
+        assert_eq!(d.ledger().slot_resting(3), 0, "a synchronous arm's Ok is done");
+    }
+
+    /// BX6 (BX3 obligation 2): a queued arm's modify `Ok` renames nothing;
+    /// the confirmed `Renamed` renames and resizes the row, so the fills
+    /// of the new id consume it. Break-and-watch: renaming on `Ok` makes
+    /// the old id's fill unmatched.
+    #[test]
+    fn a_confirm_later_modify_renames_on_the_confirmation_only() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.live_mut().a_mut().confirm_later = true;
+        d.on_idle();
+        let o = order(3, VenueId::Hyperliquid, 9);
+        assert!(d.submit(&o).is_ok());
+        let mut repl = order(3, VenueId::Hyperliquid, 11);
+        repl.qty = Qty::from_raw(500_000);
+        assert!(d.modify(&ModifyReq::new(9, repl)).is_ok());
+        assert_eq!(d.live().a().modified, vec![(9, 11)]);
+        assert_eq!(d.ledger().slot_resting(3), 1);
+        // The venue confirms: the row becomes 11's (resized), once.
+        d.live_mut().a_mut().renamed.push(clob_dispatcher::Renamed::new(9, 11, 500_000, o.sym, 3, true));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1);
+        d.live_mut().a_mut().retired.push((9, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 1, "the row is 11's now; 9 is gone");
+        d.live_mut().a_mut().retired.push((11, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 0);
+    }
+
+    /// BX3 (F9): one poll drains at most `RETIRED_DRAIN_MAX`; the rest
+    /// wait in the arm for the next idle moment, and none is lost.
+    /// Break-and-watch: an unbounded drain takes all 150 in one poll.
+    #[test]
+    fn the_retired_drain_takes_at_most_64_a_poll() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        let mut k = 0u64;
+        while k < 150 {
+            d.live_mut().a_mut().retired.push((1_000 + k, 3));
+            k += 1;
+        }
+        d.on_idle();
+        assert_eq!(d.retired().total(), RETIRED_DRAIN_MAX as u64);
+        d.on_idle();
+        assert_eq!(d.retired().total(), 2 * RETIRED_DRAIN_MAX as u64);
+        d.on_idle();
+        assert_eq!(d.retired().total(), 150);
+        assert!(d.live().a().retired.is_empty());
     }
 }

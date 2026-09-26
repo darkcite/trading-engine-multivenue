@@ -431,6 +431,40 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.i64(ex.arm_pnl_anchor_usd_1e6);
     c.key("arm_session_pnl_usd_1e6");
     c.i64(ex.arm_session_pnl_usd_1e6);
+    // BX3: the instrument laws' two refusals and the retirements by
+    // `why`, spelled. Additive.
+    c.key("refused_short");
+    c.u64(ex.refused_short);
+    c.key("refused_unpriced");
+    c.u64(ex.refused_unpriced);
+    c.key("retired");
+    c.byte(b'{');
+    let mut i = 0usize;
+    while i < crate::RETIRED_WHY_WORDS.len() {
+        if i > 0 {
+            c.byte(b',');
+        }
+        c.quoted(crate::RETIRED_WHY_WORDS[i].as_bytes());
+        c.byte(b':');
+        c.u64(ex.retired[i]);
+        i += 1;
+    }
+    c.key("unknown");
+    c.u64(ex.retired[crate::RETIRED_WHY_UNKNOWN]);
+    c.byte(b'}');
+    // BX6: the mark law's two counters, and each venue arm that exists.
+    c.key("ledger_marks_refused");
+    c.u64(ex.ledger_marks_refused);
+    c.key("ledger_marks_expired");
+    c.u64(ex.ledger_marks_expired);
+    if ex.arms_binance.present != 0 {
+        c.key("arms");
+        c.byte(b'{');
+        c.quoted(b"binance");
+        c.byte(b':');
+        arm_json(&mut c, &ex.arms_binance);
+        c.byte(b'}');
+    }
     c.key("halted");
     c.put(b"[");
     let mut i = 0usize;
@@ -1114,6 +1148,55 @@ fn ingress(c: &mut Cursor<'_>, name: &[u8], g: &IngressSnapshot, mono_ns: u64) {
     c.put(b"}");
 }
 
+/// BX6: one venue arm's object in `exec.arms`.
+fn arm_json(c: &mut Cursor<'_>, a: &crate::ArmSnapshot) {
+    c.put(b"{\"submitted\":");
+    c.u64(a.submitted);
+    c.key("rejected");
+    c.u64(a.rejected);
+    c.key("ioc_missed");
+    c.u64(a.ioc_missed);
+    c.key("refused_local");
+    c.u64(a.refused_local);
+    c.key("refused_stale");
+    c.u64(a.refused_stale);
+    c.key("sent_unanswered");
+    c.u64(a.sent_unanswered);
+    c.key("fills_booked");
+    c.u64(a.fills_booked);
+    c.key("fills_unresolved");
+    c.u64(a.fills_unresolved);
+    c.key("fills_foreign");
+    c.u64(a.fills_foreign);
+    c.key("fills_dropped");
+    c.u64(a.fills_dropped);
+    c.key("fills_unowned");
+    c.u64(a.fills_unowned);
+    c.key("recon_ok");
+    c.u64(a.recon_ok);
+    c.key("recon_failed");
+    c.u64(a.recon_failed);
+    c.key("recon_drift_legs");
+    c.u64(a.recon_drift_legs);
+    c.key("recon_unseen_legs");
+    c.u64(a.recon_unseen_legs);
+    c.key("sweep_left");
+    c.u64(a.sweep_left);
+    c.key("sweep_stalled");
+    c.u64(a.sweep_stalled);
+    c.key("cancel_all_unqueued");
+    c.u64(a.cancel_all_unqueued);
+    c.key("ws_reconnects");
+    c.u64(a.ws_reconnects);
+    c.key("ws_connect_failures");
+    c.u64(a.ws_connect_failures);
+    c.key("pnl_anchor_usd_1e6");
+    c.i64(a.pnl_anchor_usd_1e6);
+    c.key("session_pnl_usd_1e6");
+    c.i64(a.session_pnl_usd_1e6);
+    c.put(b"}");
+}
+
 fn recent_orders<const N: usize>(c: &mut Cursor<'_>, r: &RecentRing<Order, N>, mono_ns: u64) {
     c.put(b"[");
     let n = r.len();
@@ -1413,6 +1496,55 @@ mod tests {
             .expect("hypercall ingress row");
         assert!(hev < hc, "hypercall must follow hyperevm (append, never reorder)");
         assert!(body.contains("\"heartbeat_age_s\":-1"));
+    }
+
+    /// BX3: the exec object carries the two instrument-law refusals and
+    /// every retirement `why` by word — `unknown` from its own bucket.
+    #[test]
+    fn the_exec_object_spells_the_retirements() {
+        let mut s = EngineSnapshot::empty();
+        s.exec.refused_short = 3;
+        s.exec.refused_unpriced = 4;
+        s.exec.retired = [10, 11, 12, 13, 14, 15, 0, 17];
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"refused_short\":3,\"refused_unpriced\":4,\"retired\":{\"rejected\":10,\
+                 \"expired\":11,\"canceled_venue\":12,\"canceled_ttl\":13,\
+                 \"canceled_member\":14,\"filled\":15,\"unknown\":17},\
+                 \"ledger_marks_refused\":0,\"ledger_marks_expired\":0,\"halted\":["
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("\"arms\""), "no Binance arm, no arms object");
+    }
+
+    /// BX6: a boot with a Binance arm publishes `exec.arms.binance`,
+    /// before `halted`; the mark law's counters ride beside the ledger's.
+    #[test]
+    fn the_exec_object_carries_the_binance_arm() {
+        let mut s = EngineSnapshot::empty();
+        s.exec.ledger_marks_refused = 2;
+        s.exec.ledger_marks_expired = 1;
+        s.exec.arms_binance.present = 1;
+        s.exec.arms_binance.submitted = 7;
+        s.exec.arms_binance.fills_booked = 5;
+        s.exec.arms_binance.pnl_anchor_usd_1e6 = 1_000_000_000;
+        s.exec.arms_binance.session_pnl_usd_1e6 = -2_500_000;
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains("\"ledger_marks_refused\":2,\"ledger_marks_expired\":1,\"arms\":{\"binance\":{\"submitted\":7,"),
+            "{body}"
+        );
+        assert!(body.contains("\"fills_booked\":5,"), "{body}");
+        assert!(
+            body.contains("\"pnl_anchor_usd_1e6\":1000000000,\"session_pnl_usd_1e6\":-2500000}},\"halted\":["),
+            "{body}"
+        );
     }
 
     #[test]

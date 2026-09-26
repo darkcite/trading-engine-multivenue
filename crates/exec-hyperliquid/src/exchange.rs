@@ -771,9 +771,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         floor: u64,
     ) -> Result<Self, crate::config::ConfigErr> {
         let sk = cfg.secret_key()?;
-        let http = HlHttp::new(&cfg.host, 443, tls.clone())
+        let http = HlHttp::new(&cfg.host, cfg.port(), tls.clone())
             .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
-        let ws = UserWs::new(&cfg.host, 443, tls, &cfg.master_addr)
+        let ws = UserWs::new(&cfg.host, cfg.port(), tls, &cfg.master_addr)
             .map_err(|_| crate::config::ConfigErr::BadHex("HYPERLIQUID host"))?;
         let budget = budget::load(&budget_path, cfg.master_addr, floor);
         let budget_source = if budget == AddressBudget::cold(cfg.master_addr, floor) {

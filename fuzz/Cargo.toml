@@ -14,6 +14,9 @@ cargo-fuzz = true
 
 [dependencies]
 exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
+# bn_cid / bn_wsapi_frame / bn_user_event / bn_rest_body / bn_account /
+# bn_mode: the BX6 arm's scanners and boot assertions.
+exec-binance     = { path = "../crates/exec-binance" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
 
@@ -400,6 +403,62 @@ bench  = false
 [[bin]]
 name   = "evm_exec_response"
 path   = "fuzz_targets/evm_exec_response.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "https_answer"
+path   = "fuzz_targets/https_answer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "ws_framer"
+path   = "fuzz_targets/ws_framer.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_cid"
+path   = "fuzz_targets/bn_cid.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_wsapi_frame"
+path   = "fuzz_targets/bn_wsapi_frame.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_user_event"
+path   = "fuzz_targets/bn_user_event.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_rest_body"
+path   = "fuzz_targets/bn_rest_body.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_account"
+path   = "fuzz_targets/bn_account.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_mode"
+path   = "fuzz_targets/bn_mode.rs"
 test   = false
 doc    = false
 bench  = false

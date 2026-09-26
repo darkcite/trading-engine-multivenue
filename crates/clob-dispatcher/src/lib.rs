@@ -79,10 +79,11 @@ pub enum DispatchError {
     /// reader of the tape.
     NoLiveRoute,
     /// E5: this dispatcher does not implement the verb that was
-    /// called. The default [`OrderDispatch::cancel`] and
-    /// [`OrderDispatch::modify`] bodies return it, so a dispatcher
-    /// that has not been taught to take an order back refuses loudly
-    /// rather than returning `Ok` and doing nothing.
+    /// called. A dispatcher that cannot take an order back returns it
+    /// from its [`OrderDispatch::cancel`] / [`OrderDispatch::modify`]
+    /// — both REQUIRED since BX3 (O-BX19), so that answer is always
+    /// written down, never inherited — and refuses loudly rather than
+    /// returning `Ok` and doing nothing.
     Unsupported,
     /// E5: no resting order carries that client id. Already filled,
     /// already expired, or already taken back — a RACE, not a
@@ -438,39 +439,59 @@ pub trait OrderDispatch {
     /// means it was already gone. The difference is the whole point
     /// of the method returning a `Result` at all.
     ///
-    /// Defaulted to [`DispatchError::Unsupported`] rather than
-    /// `Ok(())`: a dispatcher that cannot cancel must say so, because
-    /// a silent success here is a strategy believing a live quote was
-    /// pulled while the venue still holds it.
-    #[inline]
-    fn cancel(&mut self, _req: &CancelReq) -> Result<(), DispatchError> {
-        Err(DispatchError::Unsupported)
-    }
+    /// **Required — no default (BX3, O-BX19).** Until BX3 this was
+    /// defaulted to [`DispatchError::Unsupported`], and BX0-F3 was
+    /// exactly that default hiding a composed arm that never forwarded
+    /// the verb: every cancel reached nothing and said so only as a
+    /// refusal nobody expected. A dispatcher that cannot cancel now
+    /// writes `Err(Unsupported)` itself, and a composition that forgets
+    /// to forward does not compile.
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError>;
 
     /// **E5, LAW E-7 — replace a resting order in place.**
     ///
     /// Price, size and client id may change; the five fields of
     /// [`core_types::OrderIdentity`] may not, and
     /// `req.order().ts_ns`/`ttl_ns` are ignored (the modified order
-    /// keeps the original's expiry). Defaulted like `cancel`, for the
+    /// keeps the original's expiry). Required like `cancel`, for the
     /// same reason.
-    #[inline]
-    fn modify(&mut self, _req: &ModifyReq) -> Result<(), DispatchError> {
-        Err(DispatchError::Unsupported)
-    }
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError>;
 
     /// Pop the next fill, if any.
     fn try_next_fill(&mut self) -> Option<Fill>;
 
-    /// **HYPARB L5 — an accepted order that ended without a (further)
-    /// fill**, as `(client_oid, slot)`: a swap that reverted or was
-    /// never mined, the unfilled remainder of an IoC. The router
-    /// retires its resting row, or `max_open_orders` would count
-    /// orders that no longer exist and stall the slot. Defaulted to
-    /// none: an arm whose orders end only by fill or by the member's
-    /// own cancel has nothing to say here.
+    /// **HYPARB L5, BX3 (F9) — an accepted order that ended without a
+    /// (further) fill**, as a [`Retired`]: a swap that reverted or was
+    /// never mined, the unfilled remainder of an IoC, a venue cancel.
+    /// The router retires its resting row, or `max_open_orders` would
+    /// count orders that no longer exist and stall the slot, and counts
+    /// the `why`. Defaulted to none: an arm whose orders end only by
+    /// fill or by the member's own cancel has nothing to say here.
     #[inline]
-    fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+    fn try_next_retired(&mut self) -> Option<Retired> {
+        None
+    }
+
+    /// **BX6 (BX3 obligation 2) — does this arm confirm a cancel or a
+    /// modify LATER?** A queued arm's `cancel` / `modify` `Ok` means
+    /// "queued", not "done": the venue may still refuse it. For such an
+    /// arm the router neither releases a cancelled order's resting row on
+    /// `Ok` (it releases on the confirmed [`RETIRED_CANCELED_MEMBER`]) nor
+    /// renames a modified one (it renames on the arm's [`Renamed`]).
+    /// Asked per order, by its route: a composite answers for the arm the
+    /// order reaches. Defaulted to `false` — an arm whose `Ok` IS the
+    /// venue's answer (the Hyperliquid arm, the paper matcher).
+    #[inline]
+    fn verbs_confirm_later(&self, _sym: SymbolId, _venue: u8, _strategy_id: u8) -> bool {
+        false
+    }
+
+    /// **BX6 (BX3 obligation 2) — a modify the venue confirmed**, for an
+    /// arm that [`OrderDispatch::verbs_confirm_later`]: the router renames
+    /// and resizes the resting row now. Drained by the router like
+    /// retirements (at most 64 per idle poll). Defaulted to none.
+    #[inline]
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
         None
     }
 
@@ -601,6 +622,32 @@ pub trait OrderDispatch {
     /// the only hook that actually reaches the live arm today.
     #[inline]
     fn on_venue_event(&mut self, _event: &core_types::ChannelEvent) {}
+
+    /// **BX3 — an options summary the engine drained** (mark, index,
+    /// greeks, from the options lanes).
+    ///
+    /// Defaulted to a no-op like [`Self::on_venue_event`]; the one
+    /// reader is the router's ledger, which prices its option rows —
+    /// the long's premium at risk and the short's venue IM — from the
+    /// mark and the index (plan §3.5). Called on the engine thread
+    /// BEFORE the strategy sees the same summary, for the same reason
+    /// as the venue event: a member handed a summary may submit in the
+    /// same call, and the ledger must already have priced it.
+    #[inline]
+    fn on_opt_summary(&mut self, _summary: &core_types::OptSummary) {}
+
+    /// **BX3 — the router's boot-fixed route aliases, handed down.**
+    ///
+    /// An arm that routes by venue (`exec_router::VenueSplit`) must route
+    /// by the SAME table the router allowed each order by — a table that
+    /// differed would send an order the router allowed as Binance to the
+    /// Hyperliquid arm, which refuses it (LAW E-4) into the asset-refusal
+    /// streak that halts Hyperliquid slots. So the router is the one
+    /// owner: it pushes its table down here at boot, and a composite
+    /// forwards it to each of its arms. Every other arm ignores it.
+    /// Boot-only.
+    #[inline]
+    fn set_route_aliases(&mut self, _aliases: RouteAliases) {}
 
     /// **E6 — a fill was BOOKED into the engine.**
     ///
@@ -751,6 +798,19 @@ pub trait OrderDispatch {
         LiveArmCounters::default()
     }
 
+    /// **BX6 — one venue's live arm**, where a composition holds
+    /// several: `Some` from the arm that trades route venue `venue`, `None`
+    /// from everything else (the default). [`Self::arm_counters`] answers
+    /// the flat, first arm; this reaches the others (`/state`
+    /// `exec.arms.binance`). Cold: the 1 s publish.
+    // COPY: LiveArmCounters (272 B) in an Option by value — cold, once a
+    // second; composed by the arm on demand, so there is nothing to
+    // borrow — rejected: an out-param through every composite.
+    #[inline]
+    fn venue_arm_counters(&self, _venue: u8) -> Option<LiveArmCounters> {
+        None
+    }
+
     /// **S7-L1 — the engine is stopping: take every resting order of
     /// ours off the venue, NOW.**
     ///
@@ -882,7 +942,250 @@ pub struct LiveArmCounters {
 // VALUE (`// COPY:` at `exec_router::RoutedDispatcher::exec_counters`),
 // and the byte bounds those comments state have drifted twice. Pinned.
 const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
-const _: () = assert!(core::mem::size_of::<ExecCounters>() == 568);
+// BX3: + `refused_short`, `refused_unpriced` and `retired[8]` (80 B).
+// BX6: + the two mark counters and the Binance arm's block (16 + 272 B;
+// `arm_bn_present` rides in padding).
+const _: () = assert!(core::mem::size_of::<ExecCounters>() == 936);
+const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
+
+/// **BX3 (F9) — an accepted order that ended without a (further) fill**,
+/// as the arm tells the router ([`OrderDispatch::try_next_retired`]).
+/// 16 B, `Copy`, moved by value (under the 64 B bound).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retired {
+    /// The member's client id of the order that ended.
+    pub client_oid: u64,
+    /// Its strategy slot.
+    pub slot: u8,
+    /// Why it ended: a `RETIRED_*` code.
+    pub why: u8,
+    /// Explicit padding.
+    _pad: [u8; 6],
+}
+
+impl Retired {
+    /// One retirement.
+    #[inline]
+    #[must_use]
+    pub const fn new(client_oid: u64, slot: u8, why: u8) -> Self {
+        Self {
+            client_oid,
+            slot,
+            why,
+            _pad: [0; 6],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Retired>() == 16);
+
+/// **BX6 (BX3 obligation 2) — a modify the venue confirmed**, as a
+/// confirm-later arm tells the router ([`OrderDispatch::try_next_renamed`]):
+/// the resting row of `prev_client_oid` becomes `client_oid` at
+/// `qty_1e6`. 32 B, `Copy`, moved by value (under the 64 B bound).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Renamed {
+    /// The id the member replaced.
+    pub prev_client_oid: u64,
+    /// The id it replaced it with.
+    pub client_oid: u64,
+    /// The confirmed quantity ×1e6.
+    pub qty_1e6: i64,
+    /// The instrument (the engine's id).
+    pub sym: SymbolId,
+    /// The strategy slot.
+    pub slot: u8,
+    /// 1 for a buy.
+    pub buy: u8,
+    /// Explicit padding.
+    _pad: [u8; 2],
+}
+
+impl Renamed {
+    /// One confirmed modify.
+    #[inline]
+    #[must_use]
+    pub const fn new(prev_client_oid: u64, client_oid: u64, qty_1e6: i64, sym: SymbolId, slot: u8, buy: bool) -> Self {
+        Self {
+            prev_client_oid,
+            client_oid,
+            qty_1e6,
+            sym,
+            slot,
+            buy: buy as u8,
+            _pad: [0; 2],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Renamed>() == 32);
+
+/// [`Retired::why`]: the venue refused the order after accepting it (a
+/// reverted swap, a post-acceptance reject).
+pub const RETIRED_REJECTED: u8 = 0;
+/// It expired: an IoC's unfilled remainder, a post-only that would have
+/// taken, a price-range expiry, a DAY order's end.
+pub const RETIRED_EXPIRED: u8 = 1;
+/// The venue cancelled it: self-trade prevention, a liquidation, a
+/// modify the venue turned into a cancel.
+pub const RETIRED_CANCELED_VENUE: u8 = 2;
+/// The gateway's own TTL cancelled it.
+pub const RETIRED_CANCELED_TTL: u8 = 3;
+/// The member's cancel, as the venue confirmed it.
+pub const RETIRED_CANCELED_MEMBER: u8 = 4;
+/// It filled completely.
+pub const RETIRED_FILLED: u8 = 5;
+/// Buckets the router counts retirements in: one per code above, and
+/// the last for a code no arm should send.
+pub const RETIRED_WHY_SLOTS: usize = 8;
+/// The bucket an undefined `why` is counted in.
+pub const RETIRED_WHY_UNKNOWN: usize = RETIRED_WHY_SLOTS - 1;
+
+/// **BX3 — a route alias**: an order on `sym` routes to `venue`, whatever
+/// venue byte its id carries. The one entry today is the M1 legacy
+/// anchor (`binance:btcusdt` is the flat id 7, whose byte reads 0 =
+/// Polymarket; plan §13.2 F10). 8 B; `venue == ROUTE_ALIAS_EMPTY`
+/// marks an unused entry.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RouteAlias {
+    /// The full id the alias matches (never a bare ordinal).
+    pub sym: SymbolId,
+    /// The venue byte it routes to.
+    pub venue: u8,
+    /// Explicit padding.
+    _pad: [u8; 3],
+}
+
+/// [`RouteAlias::venue`] of an unused entry.
+pub const ROUTE_ALIAS_EMPTY: u8 = 0xFF;
+/// Aliases one table holds.
+pub const ROUTE_ALIASES_MAX: usize = 4;
+
+/// Why [`RouteAliases::with`] refused an entry. Boot-only; fatal.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RouteAliasErr {
+    /// `SYMBOL_ID_NONE` is not an instrument.
+    NoneSym,
+    /// [`ROUTE_ALIAS_EMPTY`] is not a venue.
+    BadVenue,
+    /// That sym already has an alias.
+    Duplicate,
+    /// Every entry is taken.
+    Full,
+}
+
+/// **BX3 — the boot-fixed alias table** every router-side lookup of an
+/// order's route venue consults: the router's `venue_allowed` check and
+/// `exec_router::VenueSplit`'s arm choice. Built once at boot and copied
+/// by value into each (32 B). Never consulted by `ExecRoute`, the
+/// ledger, captures or the backtest model — the order bytes are
+/// untouched.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RouteAliases {
+    entries: [RouteAlias; ROUTE_ALIASES_MAX],
+}
+
+impl RouteAliases {
+    /// No alias: every order routes by its own venue byte.
+    pub const NONE: Self = Self {
+        entries: [RouteAlias {
+            sym: core_types::SYMBOL_ID_NONE,
+            venue: ROUTE_ALIAS_EMPTY,
+            _pad: [0; 3],
+        }; ROUTE_ALIASES_MAX],
+    };
+
+    /// Boot: the table with one more alias.
+    ///
+    /// # Errors
+    /// [`RouteAliasErr`] — a `NONE` sym, the empty venue, a sym already
+    /// aliased, or a full table.
+    pub const fn with(mut self, sym: SymbolId, venue: u8) -> Result<Self, RouteAliasErr> {
+        if sym == core_types::SYMBOL_ID_NONE {
+            return Err(RouteAliasErr::NoneSym);
+        }
+        if venue == ROUTE_ALIAS_EMPTY {
+            return Err(RouteAliasErr::BadVenue);
+        }
+        let mut i = 0usize;
+        while i < ROUTE_ALIASES_MAX {
+            if self.entries[i].venue != ROUTE_ALIAS_EMPTY && self.entries[i].sym == sym {
+                return Err(RouteAliasErr::Duplicate);
+            }
+            i += 1;
+        }
+        let mut i = 0usize;
+        while i < ROUTE_ALIASES_MAX {
+            if self.entries[i].venue == ROUTE_ALIAS_EMPTY {
+                self.entries[i] = RouteAlias {
+                    sym,
+                    venue,
+                    _pad: [0; 3],
+                };
+                return Ok(self);
+            }
+            i += 1;
+        }
+        Err(RouteAliasErr::Full)
+    }
+
+    /// **The venue an order on `sym` stamped `venue` routes to. Hot
+    /// path:** four full-id compares, unrolled, no branch the steady
+    /// state mispredicts; an empty entry never matches.
+    #[inline(always)]
+    #[must_use]
+    pub fn route_venue(&self, sym: SymbolId, venue: u8) -> u8 {
+        let e = &self.entries;
+        let mut v = venue;
+        if e[0].sym == sym && e[0].venue != ROUTE_ALIAS_EMPTY {
+            v = e[0].venue;
+        }
+        if e[1].sym == sym && e[1].venue != ROUTE_ALIAS_EMPTY {
+            v = e[1].venue;
+        }
+        if e[2].sym == sym && e[2].venue != ROUTE_ALIAS_EMPTY {
+            v = e[2].venue;
+        }
+        if e[3].sym == sym && e[3].venue != ROUTE_ALIAS_EMPTY {
+            v = e[3].venue;
+        }
+        v
+    }
+
+    /// Aliases in the table. Cold; boot tell.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        let mut n = 0usize;
+        let mut i = 0usize;
+        while i < ROUTE_ALIASES_MAX {
+            n += (self.entries[i].venue != ROUTE_ALIAS_EMPTY) as usize;
+            i += 1;
+        }
+        n
+    }
+
+    /// No alias at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Default for RouteAliases {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<RouteAlias>() == 8);
+const _: () = assert!(core::mem::size_of::<RouteAliases>() == 32);
+// Four unrolled compares in `route_venue`: the table cannot grow
+// without that body growing too.
+const _: () = assert!(ROUTE_ALIASES_MAX == 4);
 
 /// **What the venue has told us about a requested cancel-all.**
 ///
@@ -963,8 +1266,19 @@ pub struct HaltSignal {
     /// gain (S7-L1, gap B: a book that was never flat was never
     /// judged). `0` otherwise.
     pub pnl_judged: u8,
+    /// **BX3** `1` when the venue has imposed a restriction on this
+    /// arm's account: a 418 ban, a reduce-only or region lock, the
+    /// options `REDUCE_ONLY` risk level, a fired dead-man, an account
+    /// mode or permission change mid-session. The router halts on it
+    /// (`VenueLock`); no threshold, like the budget floor.
+    pub venue_lock: u8,
+    /// **BX3 (D6, O-BX18)** `1` when the arm judged a margin ratio at or
+    /// past the slot's `halt_on_margin_ratio_1e6`, or saw a
+    /// `MARGIN_CALL`. The arm holds the per-slot threshold and reports
+    /// the verdict; the router halts on it (`MarginRisk`).
+    pub margin_risk: u8,
     /// Explicit padding.
-    _pad: [u8; 5],
+    _pad: [u8; 3],
     /// Nanoseconds since the last reconciliation that AGREED. `0` =
     /// never (the seeding interlock already refuses that case). Once
     /// an arm has agreed with the venue, a reconciler that stops
@@ -1003,7 +1317,9 @@ impl HaltSignal {
             budget_floor_breached: budget_floor_breached as u8,
             reconciled: reconciled as u8,
             pnl_judged: 0,
-            _pad: [0; 5],
+            venue_lock: 0,
+            margin_risk: 0,
+            _pad: [0; 3],
             recon_age_ns,
             pnl_delta_usd_1e6: 0,
         }
@@ -1018,9 +1334,70 @@ impl HaltSignal {
         self.pnl_delta_usd_1e6 = delta_usd_1e6;
         self
     }
+
+    /// BX3: attach the venue's verdicts — a restriction it imposed, and
+    /// the arm's margin judgement.
+    #[inline]
+    #[must_use]
+    pub const fn with_venue(mut self, venue_lock: bool, margin_risk: bool) -> Self {
+        self.venue_lock = venue_lock as u8;
+        self.margin_risk = margin_risk as u8;
+        self
+    }
+
+    /// **BX3 (O-BX17) — one slot's signal from two arms that both
+    /// trade it.** The worse of each observation: the MAX of the
+    /// streaks, the drift, the stream gap and the reconciliation age;
+    /// the OR of the flags that trip a halt; the AND of the two that
+    /// permit trading (`reconciled`, `pnl_judged`) — a slot is seeded,
+    /// and its session bound judged, only when both arms can say so; the
+    /// SUM of the session P&L. Symmetric: `a.merged(b) == b.merged(a)`.
+    #[inline]
+    #[must_use]
+    pub const fn merged(self, o: Self) -> Self {
+        const fn max_u64(a: u64, b: u64) -> u64 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        const fn max_i64(a: i64, b: i64) -> i64 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        const fn max_u32(a: u32, b: u32) -> u32 {
+            if a > b {
+                a
+            } else {
+                b
+            }
+        }
+        Self {
+            ws_gap_ns: max_u64(self.ws_gap_ns, o.ws_gap_ns),
+            recon_drift_usd_1e6: max_i64(self.recon_drift_usd_1e6, o.recon_drift_usd_1e6),
+            reject_streak: max_u32(self.reject_streak, o.reject_streak),
+            asset_refusal_streak: max_u32(self.asset_refusal_streak, o.asset_refusal_streak),
+            budget_floor_breached: ((self.budget_floor_breached | o.budget_floor_breached) != 0)
+                as u8,
+            reconciled: ((self.reconciled != 0) & (o.reconciled != 0)) as u8,
+            pnl_judged: ((self.pnl_judged != 0) & (o.pnl_judged != 0)) as u8,
+            venue_lock: ((self.venue_lock | o.venue_lock) != 0) as u8,
+            margin_risk: ((self.margin_risk | o.margin_risk) != 0) as u8,
+            _pad: [0; 3],
+            recon_age_ns: max_u64(self.recon_age_ns, o.recon_age_ns),
+            pnl_delta_usd_1e6: self.pnl_delta_usd_1e6.saturating_add(o.pnl_delta_usd_1e6),
+        }
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<HaltSignal>() == 48);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, venue_lock) == 27);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, margin_risk) == 28);
+const _: () = assert!(core::mem::offset_of!(HaltSignal, recon_age_ns) == 32);
 
 /// Strategy slots [`ExecCounters`] reports on. Mirrors
 /// `exec_router::EXEC_SLOTS`; the two are asserted equal in
@@ -1044,6 +1421,9 @@ pub struct ExecCounters {
     pub configured: u8,
     /// Per-slot `ExecMode as u8`. Only meaningful when `configured`.
     pub modes: [u8; EXEC_COUNTER_SLOTS],
+    /// **BX6** — `1` when [`Self::arm_bn`] holds a Binance arm's numbers.
+    /// (Sits in what was padding: no offset after it moves.)
+    pub arm_bn_present: u8,
     /// Orders routed to the live arm.
     pub live_submits: u64,
     /// Orders routed to the paper matcher.
@@ -1055,7 +1435,8 @@ pub struct ExecCounters {
     pub refused_no_route: u64,
     /// **E6: refused by the risk gate** — the SUM of every clamp's
     /// refusals (`max_order_usd`, `cap_instance_usd`, `cap_day_usd`,
-    /// `max_open_orders`, the seeding interlock, the halt latch).
+    /// `max_open_orders`, the seeding interlock, the halt latch and,
+    /// since BX3, the instrument laws' `short` and `unpriced`).
     /// Only the `max_order_usd` share still means "the member and the
     /// operator disagreed"; the rest mean the operator's ceiling was
     /// reached, which is the clamp working. An alert belongs on
@@ -1075,6 +1456,14 @@ pub struct ExecCounters {
     /// boot and zero thereafter; a value that keeps climbing means
     /// the arm never reached the venue.
     pub refused_unseeded: u64,
+    /// **BX3 — refused by an instrument law**: a spot sell past the
+    /// holding, or a short on an option that is not writable. A subset
+    /// of `refused_risk`.
+    pub refused_short: u64,
+    /// **BX3 — refused as unpriceable on a Binance instrument row**: a
+    /// non-positive price, a Binance-routed order with no instrument
+    /// row, or a short option with no index. A subset of `refused_risk`.
+    pub refused_unpriced: u64,
     /// Halt edges — slots that went from running to halted.
     pub halts: u64,
     /// Cancel-all requests the arm would not accept.
@@ -1117,8 +1506,20 @@ pub struct ExecCounters {
     pub ledger_resting_ambiguous: u64,
     /// Settle frames that matched no bound row.
     pub ledger_settles_unmatched: u64,
+    /// **BX3 (F9) — retirements drained, by `why`** (index = the
+    /// `RETIRED_*` code; [`RETIRED_WHY_UNKNOWN`] counts every undefined
+    /// code, and index 6 is never counted).
+    pub retired: [u64; RETIRED_WHY_SLOTS],
     /// The live arm's own numbers. Zeroed when there is no arm.
     pub arm: LiveArmCounters,
+    /// **BX6 (obligation 6)** — venue marks the ledger refused as
+    /// insane (a mark off its index by more than the law allows).
+    pub ledger_marks_refused: u64,
+    /// Rows whose mark went stale and stopped pricing.
+    pub ledger_marks_expired: u64,
+    /// **BX6** — the Binance arm's own numbers (`/state`
+    /// `exec.arms.binance`), valid when [`Self::arm_bn_present`].
+    pub arm_bn: LiveArmCounters,
 }
 
 /// X1 counters — what the matcher did, mirrored to `/metrics` as
@@ -2975,31 +3376,87 @@ mod tests {
         assert_eq!(f.qty.raw(), 1_000_000, "still the old size");
     }
 
-    /// A dispatcher that has not been taught the verbs must SAY so.
-    /// `Ok(())` as a default would be a strategy believing a quote
-    /// was pulled that nothing ever pulled.
+    /// BX3: an alias reroutes exactly its own full id; an empty entry
+    /// never matches; the table refuses what it cannot hold.
     #[test]
-    fn the_default_lifecycle_verbs_refuse_rather_than_silently_succeed() {
-        struct Deaf;
-        impl OrderDispatch for Deaf {
-            fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
-                Ok(())
-            }
-            fn try_next_fill(&mut self) -> Option<Fill> {
-                None
-            }
-            fn stats(&self) -> DispatchStats {
-                DispatchStats::default()
-            }
-        }
-        let mut d = Deaf;
+    fn a_route_alias_reroutes_only_its_own_id() {
+        let t = RouteAliases::NONE.with(7, 1).unwrap();
+        assert_eq!(t.route_venue(7, 0), 1, "the anchor routes to its alias");
+        assert_eq!(t.route_venue(8, 0), 0, "a neighbour keeps its own byte");
+        assert_eq!(t.route_venue(core_types::SYMBOL_ID_NONE, 3), 3);
+        assert_eq!(
+            RouteAliases::NONE.route_venue(core_types::SYMBOL_ID_NONE, 3),
+            3
+        );
+        assert_eq!(t.len(), 1);
+        assert!(RouteAliases::NONE.is_empty());
+        assert_eq!(t.with(7, 4), Err(RouteAliasErr::Duplicate));
+        assert_eq!(
+            RouteAliases::NONE.with(core_types::SYMBOL_ID_NONE, 1),
+            Err(RouteAliasErr::NoneSym)
+        );
+        assert_eq!(
+            RouteAliases::NONE.with(9, ROUTE_ALIAS_EMPTY),
+            Err(RouteAliasErr::BadVenue)
+        );
+        let full = RouteAliases::NONE
+            .with(1, 1)
+            .and_then(|t| t.with(2, 1))
+            .and_then(|t| t.with(3, 1))
+            .and_then(|t| t.with(4, 1))
+            .unwrap();
+        assert_eq!(full.with(5, 1), Err(RouteAliasErr::Full));
+        assert_eq!(full.route_venue(4, 0), 1, "the last slot matches too");
+    }
+
+    /// BX3 (O-BX17): one slot's signal from two arms is the worse of
+    /// each observation, and the merge is symmetric and idempotent.
+    #[test]
+    fn a_merged_signal_is_the_worse_of_both_arms() {
+        let a = HaltSignal::new(5, 100, 3, 1, false, true, 7)
+            .with_pnl(true, -10)
+            .with_venue(false, true);
+        let b = HaltSignal::new(9, 50, 1, 4, true, false, 2)
+            .with_pnl(true, 4)
+            .with_venue(true, false);
+        let m = a.merged(b);
+        assert_eq!(m, b.merged(a), "symmetric");
+        assert_eq!(
+            (m.ws_gap_ns, m.recon_drift_usd_1e6, m.recon_age_ns),
+            (9, 100, 7)
+        );
+        assert_eq!((m.reject_streak, m.asset_refusal_streak), (3, 4));
+        assert_eq!(
+            (m.budget_floor_breached, m.venue_lock, m.margin_risk),
+            (1, 1, 1)
+        );
+        assert_eq!(m.reconciled, 0, "seeded only when both arms reconciled");
+        assert_eq!(m.pnl_judged, 1);
+        assert_eq!(m.pnl_delta_usd_1e6, -6);
+        let r = HaltSignal::new(1, 2, 0, 0, false, true, 3).with_pnl(true, 5);
+        let mut idem = r.merged(r);
+        idem.pnl_delta_usd_1e6 = r.pnl_delta_usd_1e6;
+        assert_eq!(idem, r, "idempotent but for the P&L sum");
+        assert_eq!(
+            HaltSignal::default().merged(HaltSignal::default()),
+            HaltSignal::default()
+        );
+    }
+
+    /// A dispatcher that cannot take an order back must SAY so. The
+    /// trait no longer supplies that answer (BX3, O-BX19): the queued
+    /// dispatcher's ring carries orders only, so its verbs refuse, and
+    /// they refuse in writing.
+    #[test]
+    fn a_queued_dispatcher_refuses_a_lifecycle_verb_rather_than_swallowing_it() {
+        let (mut q, _worker) = crate::QueuedDispatcher::new(PaperDispatcher::new());
         let o = maker(100_000_000, 1_000_000, 1, 0);
         assert_eq!(
-            d.cancel(&CancelReq::of(&o, 1_000)),
+            q.cancel(&CancelReq::of(&o, 1_000)),
             Err(DispatchError::Unsupported)
         );
         assert_eq!(
-            d.modify(&ModifyReq::new(1, o)),
+            q.modify(&ModifyReq::new(1, o)),
             Err(DispatchError::Unsupported)
         );
     }
@@ -3631,6 +4088,14 @@ mod tests {
         impl OrderDispatch for Deaf {
             fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
                 Ok(())
+            }
+            // BX3 (O-BX19): no default — a dispatcher that cannot cancel
+            // or modify says so itself.
+            fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+                Err(DispatchError::Unsupported)
+            }
+            fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+                Err(DispatchError::Unsupported)
             }
             fn try_next_fill(&mut self) -> Option<Fill> {
                 None

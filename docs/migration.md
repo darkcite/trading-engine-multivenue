@@ -6,6 +6,77 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — Binance COIN-M market data: `[binance] coinm` / `coinm_dated`, the `binance-coinm:` namespace, `BINANCE_COINM_WS_HOST` / `BINANCE_COINM_REST_HOST` (BX2)
+
+**What changed**
+- `universe.toml [binance]` gains two OPTIONAL lists: `coinm`
+  (`<coin>usd_perp`, ordinals from 3072) and `coinm_dated`
+  (`<coin>usd_<yymmdd>`, from 3584). A name must match its list's suffix
+  and carry the `usd` quote; one name in `usdm_dated` and a COIN-M list is
+  refused. Absent or empty lists = the pre-BX2 boot, bit for bit (no REST
+  call, no socket, no manifest row).
+- Boot discovery fetches `GET /dapi/v1/exchangeInfo` on
+  `BINANCE_COINM_REST_HOST` (default `dapi.binance.com`) when either list
+  is set: every name must be listed and TRADING, a `coinm_dated` name a
+  dated class. Each instrument gets two sockets on `BINANCE_COINM_WS_HOST`
+  (default `dstream.binance.com`): `/ws/<sym>@bookTicker` (the tick lane)
+  and `/market/ws/<sym>@markPrice` (capture-only `Mark` / `Funding`) — the
+  USDⓈ-M path law, measured on dstream (K10).
+- Descriptors are `binance-coinm:<sym>` (VenueId 1, `bn` capture files).
+  Class: `_perp` → perp, six digits → dated (`core-config`
+  `instrument_class`, the worker mirror and the shared fixture);
+  capabilities PRICE | FUNDING (`ingress_ai::caps_of_descriptor` and
+  `channel_map`); fees: the `bn` perp/dated rows.
+- Quantities are CONTRACTS (100 USD of face on BTC, 10 USD on the
+  others): the tick lane's sizes and the worker candle `v` column.
+- Worker: candles gain a `binance-coinm` lane (`/dapi/v1/klines`, its own
+  per-host budget); funding takes the `_PERP` names on
+  `/dapi/v1/fundingRate`, and its budgets are now per REST host (the
+  candles law) so COIN-M cannot be starved by a broad usdm list; refdata
+  reports the lane as skipped (no v1 fetcher); the seed, bartest and
+  universe-proposal tables know the namespace.
+- `--binance-symbol` replaces `[binance] spot` only; `usdm`, `usdm_dated`,
+  `coinm` and `coinm_dated` stay as configured.
+
+**Operator action**
+- None to keep today's boot. To capture COIN-M, add the lists, check the
+  wrapper's descriptor budget (two per instrument, inside the 8 192 the
+  wrapper sets) and restart the engine at a quiet moment.
+
+## 2026-09-26 — Binance discovery keeps the venue's rules; the boot audit reads each product's own page; the options chain skips closed series (BX2, F11)
+
+**What changed**
+- `BnSymbolRow` keeps the lifecycle status (`status` or COIN-M's
+  `contractStatus`), the tick and step, min/max quantity, min notional,
+  the percent-price band per side, the open-order cap, the wire
+  precisions, COIN-M's contract size (the inverse flag), the underlying
+  type, the TradFi flag and spot's permission groups. `EapiOptionRow`
+  keeps `unit`, the scales, the filters, the status, the TradFi flag and
+  its underlying's `nakedSell` (`optionContracts`). The boot logs every
+  resolved instrument's rules at debug (`discovery: bn instrument rules`).
+- A `maxQty` past the ×1e9 grid saturates (a LOWER cap) instead of
+  refusing the page: live USDⓈ-M `1000SATSUSDT` says `60000000000`,
+  which would have refused the whole fapi page. Every other value still
+  refuses its row when it overflows.
+- The audit resolves each configured name against ITS product's page
+  (spot probes, fapi, dapi): a `usdm` name listed on spot only is now
+  `not_found` instead of passing on the spot row.
+- The eapi capped chain selects `TRADING` series only: a
+  `CLOSED_MARKET` series before its expiry (live: the TradFi `XAU` /
+  `XAG` Oct-02 week) no longer selects.
+- Stricter readings, none met on today's pages: a row that states its
+  lifecycle twice (`status` and `contractStatus`, or either one twice)
+  is refused rather than read last-wins; a filter value is judged only
+  on the filter type that keeps it (a `MARKET_LOT_SIZE` or
+  `ICEBERG_PARTS` value can no longer refuse a row); an underlying that
+  `optionContracts` lists both `nakedSell: true` and `false` reads as
+  `false`; a body that ends after a key or its colon is a truncation.
+
+**Operator action**
+- None. A boot whose options chain selected a closed series now logs
+  fewer instruments for that underlying; one whose `usdm` list named a
+  spot-only symbol now reports it missing (paper continues, live refuses).
+
 ## 2026-09-26 — Slot 7's book persists: `hcv-state.tsv`, `--hcv-state`; `/state.hcv` +4 rows; `engine_hcv_*` +4 (HC11b)
 
 **What changed**

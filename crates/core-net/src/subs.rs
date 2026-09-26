@@ -176,9 +176,95 @@ impl<K: ReqKind, const N: usize> PendingTable<K, N> {
             i += 1;
         }
     }
+
+    /// Take the first request (by slot) that has waited `max_age_ns` or
+    /// longer at `now_ns`, freeing its slot — an answer that never came.
+    /// O(N); a timer's work, not an event's. `max_age_ns == 0` takes
+    /// every request, one per call: the drain of a dead connection,
+    /// whose requests are all in doubt.
+    pub fn take_expired(&mut self, now_ns: u64, max_age_ns: u64) -> Option<PendingReq<K>> {
+        let mut i = 0;
+        while i < N {
+            let s = self.slots[i];
+            if s.is_used() && now_ns.saturating_sub(s.created_at_ns) >= max_age_ns {
+                self.slots[i] = PendingReq::empty();
+                return Some(s);
+            }
+            i += 1;
+        }
+        None
+    }
 }
 
 impl<K: ReqKind, const N: usize> Default for PendingTable<K, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------
+// ReqIds
+// ---------------------------------------------------------------
+
+/// Request ids for a request/response session over one connection (a
+/// WebSocket API): monotonic from 1, each recorded in a
+/// [`PendingTable`] until its answer. An id whose slot still holds an
+/// older unanswered request is SKIPPED — never reused, never colliding
+/// — so an endpoint that answers out of order costs gaps, not
+/// confusion.
+pub struct ReqIds<K: ReqKind, const N: usize> {
+    next: u64,
+    table: PendingTable<K, N>,
+}
+
+impl<K: ReqKind, const N: usize> ReqIds<K, N> {
+    /// No request in flight; the first id is 1. Boot-time.
+    pub fn new() -> Self {
+        Self {
+            next: 1,
+            table: PendingTable::new(),
+        }
+    }
+
+    /// The next id, recorded as `kind` at `now_ns`. `None` when all `N`
+    /// slots are waiting for answers: the session's back-pressure.
+    #[inline]
+    pub fn issue(&mut self, kind: K, now_ns: u64) -> Option<u64> {
+        let mut tries = 0;
+        while tries < N {
+            let id = self.next;
+            // Never 0 (reserved), even after a wrap no session lives to see.
+            self.next = self.next.wrapping_add(1).max(1);
+            if self.table.is_free(id) {
+                let r = self.table.record(id, kind, now_ns);
+                debug_assert!(r.is_ok(), "a free slot refused its id");
+                return Some(id);
+            }
+            tries += 1;
+        }
+        None
+    }
+
+    /// The answer to `id` arrived: its request, freed. `None` for an id
+    /// not in flight (late, duplicate or foreign — count, don't crash).
+    #[inline]
+    pub fn answer(&mut self, id: u64) -> Option<PendingReq<K>> {
+        self.table.complete(id)
+    }
+
+    /// [`PendingTable::take_expired`].
+    #[inline]
+    pub fn take_expired(&mut self, now_ns: u64, max_age_ns: u64) -> Option<PendingReq<K>> {
+        self.table.take_expired(now_ns, max_age_ns)
+    }
+
+    /// Requests waiting for answers (O(N) — metrics/tests).
+    pub fn in_flight(&self) -> usize {
+        self.table.count()
+    }
+}
+
+impl<K: ReqKind, const N: usize> Default for ReqIds<K, N> {
     fn default() -> Self {
         Self::new()
     }
@@ -423,6 +509,50 @@ mod tests {
         t.clear();
         assert_eq!(t.count(), 0);
         assert!(t.complete(1).is_none());
+    }
+
+    #[test]
+    fn expired_requests_are_taken_oldest_age_first_by_slot() {
+        let mut t: PendingTable<TestKind, 8> = PendingTable::new();
+        t.record(1, TestKind::Poll, 100).unwrap();
+        t.record(2, TestKind::Subscribe, 300).unwrap();
+        assert!(t.take_expired(350, 300).is_none(), "neither has waited 300");
+        let r = t.take_expired(400, 300).expect("id 1 waited 300");
+        assert_eq!((r.id, r.kind), (1, TestKind::Poll));
+        assert!(t.take_expired(400, 300).is_none());
+        // max_age 0 drains everything, one per call.
+        t.record(9, TestKind::Poll, 400).unwrap();
+        let mut n = 0;
+        while t.take_expired(400, 0).is_some() {
+            n += 1;
+        }
+        assert_eq!((n, t.count()), (2, 0));
+    }
+
+    #[test]
+    fn req_ids_skip_busy_slots_and_never_issue_zero() {
+        let mut ids: ReqIds<TestKind, 4> = ReqIds::new();
+        let mut i = 0;
+        while i < 4 {
+            assert_eq!(ids.issue(TestKind::Poll, 0), Some(i + 1));
+            i += 1;
+        }
+        assert_eq!(ids.issue(TestKind::Poll, 0), None, "all four in flight");
+        // Answer 2 out of order: its slot (2 & 3) is the only free one.
+        assert_eq!(ids.answer(2).map(|r| r.id), Some(2));
+        // The refused call spent ids 5–8; 9 → slot 1 busy; 10 → slot 2 free.
+        assert_eq!(ids.issue(TestKind::Subscribe, 5), Some(10));
+        assert!(ids.answer(2).is_none(), "an answered id is gone");
+        assert!(ids.answer(99).is_none(), "a foreign id is ignored");
+        assert_eq!(ids.in_flight(), 4);
+        let mut drained = 0;
+        while ids.take_expired(u64::MAX, 0).is_some() {
+            drained += 1;
+        }
+        assert_eq!((drained, ids.in_flight()), (4, 0));
+        ids.next = u64::MAX;
+        assert_eq!(ids.issue(TestKind::Poll, 0), Some(u64::MAX));
+        assert_eq!(ids.issue(TestKind::Poll, 0), Some(1), "the wrap skips 0");
     }
 
     #[test]

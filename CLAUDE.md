@@ -9,7 +9,7 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
-spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
+spot/USDM/COIN-M, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
 MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
 PAPER only since HC11; the HC9 order arm runs as operator verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
@@ -319,11 +319,11 @@ in the script; `ai` = 48 is the floor every name includes).
   nextest 3583 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
-  89/89 at the gates' pins (0 B/op; gate 85 is slot 7 over the
+  99/99 at the gates' pins (0 B/op; gate 85 is slot 7 over the
   held-quote law, its book handed to the writer's mailbox inside the
   measured loop; gates 72 and 77b pin `HttpsPost` and
-  `HttpsReq` at exactly 2 per request — rustls; +1 ignored child
-  helper) · clippy clean · `make license-check` OK · `make
+  `HttpsReq` at exactly 2 per request — rustls; +2 ignored child
+  helpers) · clippy clean · `make license-check` OK · `make
   bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
   samples within 15 % at load ~10; `vol/long_day_close_warm`,
   `vol/long_state_copy_warm` and `signer/hypercall_place_order` are
@@ -492,7 +492,10 @@ ordinals; the worker map keeps the OLD sym for a reordered name by design.
 Polymarket: `clobTokenIds` from the Gamma lane, `"<yes>:<no>"` pairs, ≤ 6
 tokens (token 7 collides with anchor id 7). Binance: lowercase stream
 symbols, one socket per symbol (254 at the current universe — the wrapper
-raises the launchd fd soft limit to 8192). MEXC: spot UPPERCASE
+raises the launchd fd soft limit to 8192). COIN-M (BX2): `coinm`
+`<coin>usd_perp` (ordinals from 3072), `coinm_dated` `<coin>usd_<yymmdd>`
+(from 3584), `binance-coinm:` descriptors, two sockets each on dstream;
+sizes are contracts (100 USD of face on BTC, 10 on the others). MEXC: spot UPPERCASE
 (`BTCUSDT`), perp `BASE_QUOTE` (`BTC_USDT`), perp ordinals from 512. After
 a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
 

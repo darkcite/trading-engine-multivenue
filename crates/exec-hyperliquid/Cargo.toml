@@ -30,5 +30,14 @@ core-types    = { workspace = true }
 mio           = { workspace = true }
 rustls        = { workspace = true }
 
+[features]
+# **BX3 (O-BX20) — TEST-ONLY.** `HlConfig::with_port`, so a test can put
+# the real arm in front of a scripted TLS venue on a loopback port. The
+# real hosts refuse any port but 443 even with it on. Enabled only as a
+# dev-dependency feature (cli's composition test), so resolver 2 leaves
+# it off in every `cargo build`; without it the port is 443, fixed at
+# construction.
+loopback = []
+
 [dev-dependencies]
 rcgen = { workspace = true }

@@ -877,9 +877,14 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
 
     /// A swap that ended without a fill, else a hedge IoC whose fills
     /// have had their time to land (its remainder, if any, is gone).
-    fn try_next_retired(&mut self) -> Option<(u64, u8)> {
+    fn try_next_retired(&mut self) -> Option<clob_dispatcher::Retired> {
         if let Some(oid) = self.retired.try_pop_ref() {
-            return Some((*oid, SLOT));
+            // The chain ended the swap: reverted, or never mined.
+            return Some(clob_dispatcher::Retired::new(
+                *oid,
+                SLOT,
+                clob_dispatcher::RETIRED_REJECTED,
+            ));
         }
         let now = core_time::now_ns();
         let mut i = 0usize;
@@ -887,7 +892,12 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
             let (oid, due) = self.hedge_due[i];
             if oid != 0 && due <= now {
                 self.hedge_due[i] = (0, 0);
-                return Some((oid, SLOT));
+                // The hedge IoC's time is up: its remainder is gone.
+                return Some(clob_dispatcher::Retired::new(
+                    oid,
+                    SLOT,
+                    clob_dispatcher::RETIRED_EXPIRED,
+                ));
             }
             i += 1;
         }
@@ -1755,7 +1765,7 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
         });
         c += 1;
     }
-    let info = core_net::HttpsPost::new(&hl_cfg.host, 443, "/info", tls, 128, INFO_RESP)
+    let info = core_net::HttpsPost::new(&hl_cfg.host, hl_cfg.port(), "/info", tls, 128, INFO_RESP)
         .map_err(|e| format!("{}/info: {e}", hl_cfg.host))?;
 
     // 5. The anchor.

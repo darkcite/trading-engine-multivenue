@@ -11,7 +11,8 @@
 //! renders its prefix once, a Hypercall client talks to one host across
 //! many paths and methods (cancel = `DELETE` with a JSON body, replace =
 //! `PUT`, reconcile = `GET`), so the head is rendered per request. The
-//! connection underneath is the SAME engine (`crate::https_conn`): one
+//! connection underneath is the blocking keep-alive engine HC2 moved out
+//! of the pre-BX5 `HttpsPost` (`crate::https_keepalive`): one
 //! synchronous request/response cycle on the caller's own worker thread
 //! (never the engine loop — a cycle may block up to
 //! [`crate::https_post::REQ_DEADLINE`]), `Content-Length` and `chunked`
@@ -49,7 +50,7 @@ use std::time::Instant;
 use rustls::ClientConfig;
 
 use crate::http1::{request_head_len, write_request_head, Header, HttpErr, Method, ReqHead};
-use crate::https_conn::KeepAlive;
+use crate::https_keepalive::KeepAlive;
 use crate::https_post::{PostErr, PostErrKind, MAX_BODY_CAP, REQ_DEADLINE};
 
 /// The `User-Agent` every request carries (a bare request is refused by
@@ -62,7 +63,7 @@ const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 /// A keep-alive HTTPS connection to one host, any method and target.
 pub struct HttpsReq {
     /// The connection, its dial / reuse / retire law and the response
-    /// buffer (`crate::https_conn`).
+    /// buffer (`crate::https_keepalive`).
     conn: KeepAlive,
     /// `[ head window | body window ]` — module doc.
     wire: Box<[u8]>,

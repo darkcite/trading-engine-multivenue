@@ -111,7 +111,7 @@ pub fn run(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_on(cfg, &mut http, spec)
 }
 
@@ -772,7 +772,7 @@ pub fn run_fill(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_fill_on(cfg, &mut http, spec)
 }
 
@@ -1309,7 +1309,7 @@ pub fn run_requote(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_requote_on(cfg, &mut http, spec)
 }
 
@@ -1670,7 +1670,7 @@ pub fn run_sweep(
     if !cfg.is_testnet() {
         return Err(SmokeErr::NotTestnet(cfg.host.clone()));
     }
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     run_sweep_on(cfg, &mut http, spec)
 }
 
@@ -1906,12 +1906,11 @@ pub fn run_recon(
     }
     let stage = "recon";
 
-    let mut ws = crate::UserWs::new(&cfg.host, 443, Arc::clone(&tls), &cfg.master_addr).map_err(
-        |e| SmokeErr::Lifecycle {
+    let mut ws = crate::UserWs::new(&cfg.host, cfg.port(), Arc::clone(&tls), &cfg.master_addr)
+        .map_err(|e| SmokeErr::Lifecycle {
             stage,
             msg: format!("user-event socket: {e:?}"),
-        },
-    )?;
+        })?;
     ws.connect().map_err(|e| SmokeErr::Lifecycle {
         stage,
         msg: format!("subscribe: {e:?}"),
@@ -1989,7 +1988,7 @@ pub fn run_recon(
         });
     }
 
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
     let mut req = [0u8; crate::recon::MAX_STATE_REQ];
     let n = crate::recon::spot_state_request(&mut req, &cfg.master_addr)
         .map_err(|_| SmokeErr::Encode)?;

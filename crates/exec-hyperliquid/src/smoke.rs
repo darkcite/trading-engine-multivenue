@@ -338,7 +338,7 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let st = crate::selftest::run().map_err(SmokeErr::SelfTest)?;
 
     let sk = cfg.secret_key().map_err(SmokeErr::Config)?;
-    let mut http = HlHttp::new(&cfg.host, 443, tls).map_err(SmokeErr::Http)?;
+    let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
 
     let cancels = [CancelWire {
         asset,

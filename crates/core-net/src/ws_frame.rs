@@ -349,6 +349,52 @@ pub fn ws_write_text_frame(
     ws_write_frame(dst, WsOpcode::Text, payload, mask)
 }
 
+/// **One payload part that renders itself straight into the frame**
+/// (BX6: the Binance order requests' numbers and client ids). Its length
+/// is known before it is written, so the header goes first and the part
+/// is written once, in place — never staged in a scratch and copied in.
+/// Monomorphized ([`ws_write_text_frame_with`] is generic), never `dyn`.
+pub trait WsPart {
+    /// The bytes [`WsPart::write_to`] writes.
+    fn part_len(&self) -> usize;
+    /// Write exactly [`WsPart::part_len`] bytes into `dst`, which is that
+    /// long, and return how many were written (the serialiser checks it in
+    /// debug: a short write would leave stale tx bytes on the wire).
+    fn write_to(&self, dst: &mut [u8]) -> usize;
+}
+
+impl WsPart for &[u8] {
+    #[inline(always)]
+    fn part_len(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn write_to(&self, dst: &mut [u8]) -> usize {
+        // COPY: one payload part (≤ the frame's payload in all) into the
+        // final wire buffer — the serialiser's own write: WebSocket masks
+        // the payload on the wire and the caller's bytes are not ours to
+        // mutate — rejected: masking the caller's buffer in place (not
+        // ours) or staging the parts in a scratch first (a second copy).
+        dst.copy_from_slice(self);
+        self.len()
+    }
+}
+
+/// Serialize a single-fragment client text frame whose payload is the
+/// concatenation of `parts`, each RENDERING ITSELF straight into `dst`
+/// ([`WsPart`]): a number's digits or an id are written once, in the
+/// frame. Same contract as [`ws_write_text_frame`]: `FIN=1`, masked,
+/// zero-alloc.
+#[inline]
+pub fn ws_write_text_frame_with<P: WsPart>(
+    dst: &mut [u8],
+    parts: &[P],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    ws_write_frame_with(dst, WsOpcode::Text, parts, mask)
+}
+
 /// Serialize a single-fragment client text frame whose payload is the
 /// concatenation of `parts`, each written straight into `dst` — a
 /// caller never assembles the payload anywhere first (BX0: the Binance
@@ -401,8 +447,7 @@ fn ws_write_frame(
     ws_write_frame_parts(dst, opcode, &[payload], mask)
 }
 
-/// The one frame serialiser: the payload is the concatenation of
-/// `parts`, each written straight into place.
+/// The byte-parts serialiser: [`ws_write_frame_with`] over `&[u8]`.
 #[inline]
 fn ws_write_frame_parts(
     dst: &mut [u8],
@@ -410,10 +455,22 @@ fn ws_write_frame_parts(
     parts: &[&[u8]],
     mask: [u8; 4],
 ) -> Result<usize, WsWriteErr> {
+    ws_write_frame_with(dst, opcode, parts, mask)
+}
+
+/// The one frame serialiser: the payload is the concatenation of
+/// `parts`, each written straight into place ([`WsPart`]).
+#[inline]
+fn ws_write_frame_with<P: WsPart>(
+    dst: &mut [u8],
+    opcode: WsOpcode,
+    parts: &[P],
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
     let mut plen = 0usize;
     let mut k = 0usize;
     while k < parts.len() {
-        plen += parts[k].len();
+        plen += parts[k].part_len();
         k += 1;
     }
     let total = client_header_len(plen) + plen;
@@ -423,21 +480,16 @@ fn ws_write_frame_parts(
     let cursor = write_client_header(dst, opcode, plen, mask);
     debug_assert_eq!(cursor, client_header_len(plen), "header vs its length");
 
-    // Copy the payload parts, then XOR-mask them in place in one pass.
-    // Copy-then-mask (rather than streaming through a scratch) because
-    // `dst` is the caller's preallocated tx buffer and the final write
-    // must go out masked.
+    // Each part writes itself into place, then the payload is XOR-masked
+    // in place in one pass: `dst` is the caller's preallocated tx buffer
+    // and the final write must go out masked.
     let mut at = cursor;
     let mut k = 0usize;
     while k < parts.len() {
-        let p = parts[k];
-        // COPY: each payload part into the final wire buffer, the frame's
-        // payload in all — the serialiser's own write: WebSocket masks
-        // the payload on the wire and the caller's bytes are not ours to
-        // mutate — rejected: masking the caller's buffer in place (not
-        // ours) or staging the parts in a scratch first (a second copy).
-        dst[at..at + p.len()].copy_from_slice(p);
-        at += p.len();
+        let n = parts[k].part_len();
+        let wrote = parts[k].write_to(&mut dst[at..at + n]);
+        debug_assert!(wrote == n, "a part wrote other than its length");
+        at += n;
         k += 1;
     }
     ws_unmask_in_place(&mut dst[cursor..cursor + plen], mask);
@@ -931,6 +983,64 @@ mod tests {
         assert_eq!(
             ws_write_text_frame_parts(&mut tiny, &[b"abc", b"defg"], mask),
             Err(WsWriteErr::BufferTooSmall)
+        );
+    }
+
+    /// A part that renders an integer's digits itself.
+    #[derive(Copy, Clone)]
+    enum TestPart<'a> {
+        Lit(&'a [u8]),
+        Num(u64),
+    }
+
+    impl WsPart for TestPart<'_> {
+        fn part_len(&self) -> usize {
+            match *self {
+                TestPart::Lit(b) => b.len(),
+                TestPart::Num(v) => v.checked_ilog10().map_or(1, |l| l as usize + 1),
+            }
+        }
+        fn write_to(&self, dst: &mut [u8]) -> usize {
+            match *self {
+                TestPart::Lit(b) => dst.copy_from_slice(b),
+                TestPart::Num(mut v) => {
+                    let mut i = dst.len();
+                    loop {
+                        i -= 1;
+                        dst[i] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                        if v == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            dst.len()
+        }
+    }
+
+    /// BX6: a frame whose parts render themselves in place is byte-
+    /// identical to the frame of the rendered text, across the length
+    /// classes' edges (the header is written before any part, from the
+    /// parts' own lengths).
+    #[test]
+    fn self_rendering_parts_frame_like_their_text() {
+        let mask = [0x5au8, 0x01, 0xfe, 0x33];
+        for pad in [0usize, 100, 110, 115, 116, 117, 118, 119, 120, 1_000] {
+            let filler = vec![b'x'; pad];
+            let parts = [TestPart::Lit(b"{\"id\":"), TestPart::Num(pad as u64 * 977), TestPart::Lit(&filler), TestPart::Num(0)];
+            let text = format!("{{\"id\":{}{}0", pad * 977, "x".repeat(pad));
+            let mut a = vec![0u8; text.len() + 14];
+            let mut b = vec![0u8; text.len() + 14];
+            let na = ws_write_text_frame(&mut a, text.as_bytes(), mask).unwrap();
+            let nb = ws_write_text_frame_with(&mut b, &parts, mask).unwrap();
+            assert_eq!(a[..na], b[..nb], "pad {pad}");
+        }
+        let mut tiny = [0u8; 8];
+        assert_eq!(
+            ws_write_text_frame_with(&mut tiny, &[TestPart::Num(12_345)], mask),
+            Err(WsWriteErr::BufferTooSmall),
+            "refused whole, never truncated"
         );
     }
 

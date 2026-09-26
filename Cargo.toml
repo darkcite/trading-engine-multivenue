@@ -80,6 +80,10 @@ members = [
     "crates/signer-evm",
     # HYPARB H7c: the HyperEVM write path, testnet only (O-H5)
     "crates/exec-hyperevm",
+    # BX4 (O-BX5): the Binance arm's Ed25519 request signatures, on ring
+    "crates/signer-ed25519",
+    # BX6: the Binance execution arm (engine half + gateway thread)
+    "crates/exec-binance",
 
     # --- engine + UI ---
     "crates/engine",
@@ -123,6 +127,15 @@ phf          = { version = "0.11", features = ["macros"] }
 # Explicit, minimal deps — not `ethers` or `alloy`.
 secp256k1   = { version = "0.29", features = ["recovery", "lowmemory"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# --- Ed25519 (signer-ed25519, BX4) ---
+# Ruling O-BX5: Ed25519 from `ring` -- already in the graph as rustls' crypto
+# provider (0.17.14, `Apache-2.0 AND ISC`), a direct dependency of
+# signer-ed25519 alone. No default features asked for — key expansion and
+# signing need neither `alloc` nor `std` — but rustls' own `ring` features
+# unify into the one build, so `ring/alloc` is on regardless: bench gate 86
+# (signing at 0 B/op) is the guarantee, not this flag.
+ring = { version = "0.17", default-features = false }
 
 # --- http/2 client (clob-dispatcher) ---
 # hyper + rustls only, no reqwest.
@@ -222,6 +235,8 @@ exec-hyperliquid = { path = "crates/exec-hyperliquid" }
 exec-hypercall  = { path = "crates/exec-hypercall" }
 signer-eip712   = { path = "crates/signer-eip712" }
 signer-evm      = { path = "crates/signer-evm" }
+signer-ed25519  = { path = "crates/signer-ed25519" }
+exec-binance    = { path = "crates/exec-binance" }
 exec-hyperevm   = { path = "crates/exec-hyperevm" }
 
 engine          = { path = "crates/engine" }
