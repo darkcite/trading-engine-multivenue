@@ -34,6 +34,59 @@ Each entry is atomic: one version bump per section. Do not batch.
 
 - Revert the commit.
 
+## 2026-09-26 — the scheduled-events feed on the news/event plane (O-HC8)
+
+**What changed**
+
+- `news.toml [events]` (new, optional; `news.toml.example` documents it):
+  `horizon_days` (45), `lookback_days` (120), `macro` (the underlyings
+  FOMC and BLS releases apply to) and `scheduled` — one inline table per
+  dated event: `at` (ISO-8601 with its zone), `kind` (`earnings` |
+  `lockup` | `macro` | `other`), `underlyings` (the `[hypercall]`
+  spelling), `label`, `confirmed` (0 = an estimated date; default 1).
+  A malformed table refuses the registry whole, like every other table.
+- `claude_worker.news.scheduled` (new): every `news cycle` now also
+  writes `scheduled-events.json` beside `calendar.json` — the events in
+  `[now − lookback, now + horizon]`, each tagged with the underlyings it
+  moves: the `[events] scheduled` entries, plus the Fed calendar's FOMC
+  statements (one per UTC day, placed at the earliest row that states
+  its time) and `[calendar] bls_releases` as `macro` on `[events]
+  macro`. Every source's events at one instant and of one kind are ONE
+  event (underlyings united, details joined, confirmed only if every part
+  was): the event law sums a jump per event and must not count one twice.
+  The module is also the READER: `load_feed(path)` → a `Feed` that keeps
+  the window it vouches for (an absent, reshaped or other-version file
+  covers nothing), and `events_in(feed, underlying, t, T)` — the S1 event
+  law's `(t, T]`, or `None` (UNKNOWN, not empty) outside the window.
+- `claude_worker.news.detect`: the Fed and BLS readings are lifted into
+  `fed_rows(registry, store)` and `bls_rows(registry)`, which the 7-day
+  calendar and the feed both take (the calendar's output is unchanged;
+  its tests are untouched and green) — and `_fed_at` now dates a meeting
+  whose day range crosses a month end (`"30-1"`) in the NEXT month. The
+  cycle's detail line gains `scheduled=<n>` (`-1`: the write failed).
+
+**Why**
+
+- Operator ruling O-HC8: the S1 event law's calendar (earnings, CPI/FOMC,
+  lock-ups) comes from the news/event plane as ONE scheduled-events feed
+  that R1 and any future member both read.
+
+**Impact**
+
+- None on the engine (nothing reads the feed yet). One more small file
+  write per cycle. An absent `[events]` table writes a feed that carries
+  nothing.
+
+**Migration steps**
+
+1. Add `[events]` to `~/multivenue/news.toml` (the operator's file) with
+   `macro` and the dated events of the Hypercall underlyings; the next
+   cycle writes the feed.
+
+**Rollback**
+
+- Revert the commit; delete `~/multivenue/worker/news/scheduled-events.json`.
+
 ## 2026-09-26 — the long-tenor HAR in the worker: the parity mirror, the shared tape, `har_seed` (HAR H2)
 
 **What changed**

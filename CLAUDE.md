@@ -10,8 +10,9 @@ the STANDING laws only — history lives in `docs/arch/` (see "Where to look").
 A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
 spot/USDM, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
-MEXC (data-only), Polymarket CLOB, Polygon RPC, plus a boot-selected options
-ladder. Strategies are composed at boot from an 8-slot set and may trade
+MEXC (data-only), Hypercall options (data-only, branch `hypercall`),
+Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
+Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
 the target**. v1 runs on a MacBook Pro M4 on free-tier APIs. Claude (via the
 `claude-worker` Python process, and in-session) is an **offline strategy
@@ -221,6 +222,32 @@ in the script; `ai` = 48 is the floor every name includes).
   allocating (3 per drain loop, every TLS socket); a wrapping chunk size
   in `http1::walk_chunks` no longer aborts the process (every venue's
   boot REST).
+- **HYPERCALL — the eighth market-data venue, DATA-ONLY, on branch
+  `hypercall` (worktree `~/trading-engine-multivenue-hypercall`), NOT
+  merged** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
+  rulings O-HC1..O-HC10: no keys, no exec arm; HC8–HC11 each a separate
+  ruling after the research's R1 gate). `VenueId::Hypercall = 9`, tick
+  lane 7, `crates/ingress-hypercall` (one public WS: the one-frame
+  indicative subscribe, quotes kept crossed or one-sided as published,
+  per-provider sides on `ChannelId::ProviderQuote` = 14, index `Mark`s
+  on `hypercall-idx:<U>`; a REST `/options-summary` poller thread over
+  an SPSC handoff), capture label `hypercall`, `/state` ingress row 10,
+  `[hypercall]` in universe.toml (all 12 underlyings, E 3 × K 8 × {C,P}
+  ≤ 1 024 instruments). `crates/core-settle`
+  replicates the venue's settlement (median-of-means over a 1 s
+  sample-and-hold grid, both bucket orders until the HC7 gate picks one;
+  bench gate 76); worker lanes `hypercall_history` (the research store)
+  and `hypercall_settle` (the shadow). Fees `[fees.hypercall] option =
+  "0:0"` UNVERIFIED (O-HC7). Live smoke WITHOUT stopping the engine:
+  `crates/cli/tests/hypercall_live_smoke.rs` (`#[ignore]`, `HC_SMOKE_SECS`
+  ≤ 900). The same branch carries **HAR H1/H2** — `core_vol::LongVolEngine`
+  (whole-day tenors 1–40 d, the empty-day law, the lifted
+  `ols_fit_1e9`; bench gate 77; worker mirror `vol_ref.LongVolEngine`
+  pinned by `tests/fixtures/vol/long-1.*`; `claude_worker.har_seed`), no
+  owner until the H3 rulings — and the **scheduled-events feed** (O-HC8:
+  `news.toml [events]` → `scheduled-events.json` every news cycle; the
+  reader `claude_worker.news.scheduled`). `core_regime::math::isqrt_i128(2)`
+  is now 1, the floor root (it returned 2).
 - **Gates at HEAD (the cached-index ring, 2026-09-25; Foundry and worker
   pytest as of the HYPARB merge):** nextest 3131 (5
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`
@@ -456,8 +483,10 @@ a restart run `claude-worker fetch` once; `unresolved=0` is the done-tell.
   state files), net (mio + rustls transport, WS framing, `IoBuf`,
   `Keepalive`), parse (byte scanners + the `pb` protobuf walker), simd,
   crypto (SHA-256/HMAC/base64), types (wire PODs, `SymbolId`, `VenueId`),
-  regime, vol, fill, latency, metrics (fixed registry, 512 counters).
-- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm}` —
+  regime, vol (the HAR `VolEngine` and the whole-day `LongVolEngine`),
+  settle (the Hypercall settlement law), fill, latency, metrics (fixed
+  registry, 512 counters).
+- `crates/ingress-{polymarket,binance,okx,deribit,hyperliquid,bybit,mexc,rpc,hyperevm,hypercall}` —
   one thread per source, `discovery.rs` = boot REST; `crates/ingress-ai` —
   the UDS+HMAC command plane and the ruleset validator.
 - `crates/strategy-{set,core,hyparb,vm,ai-exec,vrp,xsd,bin15,icdp}` — the composed
