@@ -95,8 +95,10 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.hex(&s.vm.active_hash);
     c.key("ruleset_staged_hash");
     c.hex(&s.vm.staged_hash);
-    c.key("icdp_hash");
-    c.hex(&s.icdp.hash);
+    c.key("xmm_hash");
+    c.hex(&b.xmm_hash);
+    c.key("xmm_coins");
+    c.text(b.xmm_coins());
     c.key("regime_hash");
     c.hex(&b.regime_hash);
     c.key("regime_configured");
@@ -221,45 +223,88 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     }
     c.put(b"]}");
 
-    // --- icdp ---
-    let ic = &s.icdp;
-    c.key("icdp");
+    // --- xmm (XMM XH3; schema 2 — it replaced `icdp`) ---
+    //
+    // The counters sit flat in the object (the hyparb precedent); one row
+    // per quoted perp, its feed ages against this publish's clock.
+    let xm = &s.xmm;
+    let xc = &xm.counters;
+    c.key("xmm");
     c.put(b"{\"configured\":");
-    c.u64(u64::from(ic.instruments > 0));
-    c.key("hash");
-    c.hex(&ic.hash);
-    c.key("instruments");
-    c.u64(u64::from(ic.instruments));
-    let cnt = &ic.counters;
-    c.key("decisions");
-    c.u64(cnt.decisions);
-    c.key("signals");
-    c.u64(cnt.signals);
-    c.key("intents");
-    c.u64(cnt.intents);
-    c.key("exits");
-    c.u64(cnt.exits);
-    c.key("exit_on_stale");
-    c.u64(cnt.exit_on_stale);
-    c.key("skipped_spread");
-    c.u64(cnt.skipped_spread);
-    c.key("skipped_stale_open");
-    c.u64(cnt.skipped_stale_open);
-    c.key("skipped_stale_dec");
-    c.u64(cnt.skipped_stale_dec);
-    c.key("skipped_prev");
-    c.u64(cnt.skipped_prev);
-    c.key("late_bars");
-    c.u64(cnt.late_bars);
-    c.key("caps_rejected");
-    c.u64(cnt.caps_rejected);
-    c.key("rolls");
-    c.u64(cnt.rolls);
-    c.key("regime_blocked");
-    c.u64(cnt.regime_blocked);
-    c.key("regime_exits");
-    c.u64(cnt.regime_exits);
-    c.put(b"}");
+    c.u64(u64::from(xm.n_perps > 0));
+    c.key("n_perps");
+    c.u64(u64::from(xm.n_perps));
+    c.key("placed");
+    c.u64(xc.placed);
+    c.key("modifies");
+    c.u64(xc.modifies);
+    c.key("lead_cancels");
+    c.u64(xc.lead_cancels);
+    c.key("requote_cancels");
+    c.u64(xc.requote_cancels);
+    c.key("pull_cancels");
+    c.u64(xc.pull_cancels);
+    c.key("expiry_cancels");
+    c.u64(xc.expiry_cancels);
+    c.key("gated");
+    c.u64(xc.gated);
+    c.key("gate_overflow");
+    c.u64(xc.gate_overflow);
+    c.key("capped");
+    c.u64(xc.capped);
+    c.key("rejected_alo");
+    c.u64(xc.rejected_alo);
+    c.key("rejected_other");
+    c.u64(xc.rejected_other);
+    c.key("canceled");
+    c.u64(xc.canceled);
+    c.key("filled");
+    c.u64(xc.filled);
+    c.key("fills");
+    c.u64(xc.fills);
+    c.key("unmatched");
+    c.u64(xc.unmatched);
+    c.key("ctx_refused");
+    c.u64(xc.ctx_refused);
+    c.key("stuck");
+    c.u64(xc.stuck);
+    c.key("perps");
+    c.put(b"[");
+    let np = (xm.n_perps as usize).min(crate::SNAPSHOT_XMM_PERPS);
+    let mut i = 0usize;
+    while i < np {
+        let r = &xm.perps[i];
+        if i > 0 {
+            c.put(b",");
+        }
+        c.put(b"{\"hl_sym\":");
+        c.u64(u64::from(r.hl_sym));
+        c.key("lead_sym");
+        c.u64(u64::from(r.lead_sym));
+        c.key("pos_1e6");
+        c.i64(r.pos_1e6);
+        c.key("touch_bid_1e6");
+        c.i64(r.touch_bid_1e6);
+        c.key("touch_ask_1e6");
+        c.i64(r.touch_ask_1e6);
+        c.key("bid_px_1e6");
+        c.i64(r.bid_px_1e6);
+        c.key("ask_px_1e6");
+        c.i64(r.ask_px_1e6);
+        c.key("bid_state");
+        c.u64(u64::from(r.bid_state));
+        c.key("ask_state");
+        c.u64(u64::from(r.ask_state));
+        c.key("stale_flags");
+        c.u64(u64::from(r.stale_flags));
+        c.key("lead_age_ms");
+        c.age_ms(s.mono_ns, r.lead_rx_ns);
+        c.key("fol_age_ms");
+        c.age_ms(s.mono_ns, r.fol_rx_ns);
+        c.put(b"}");
+        i += 1;
+    }
+    c.put(b"]}");
 
     // --- exec (E6 c4) ---
     //
@@ -1056,6 +1101,17 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// Whole milliseconds from `stamp` to `now`; `-1` when `stamp == 0`
+    /// (never) — the maker's feeds go stale in hundreds of ms.
+    #[inline]
+    fn age_ms(&mut self, now: u64, stamp: u64) {
+        if stamp == 0 {
+            self.put(b"-1");
+        } else {
+            self.u64(now.saturating_sub(stamp) / 1_000_000);
+        }
+    }
+
     #[inline]
     fn finish(self) -> Result<usize, JsonOverflow> {
         if self.overflow {
@@ -1114,7 +1170,7 @@ mod tests {
         let mut buf = vec![0u8; STATE_JSON_MAX];
         let n = encode_state_json(&s, &mut buf).unwrap();
         let body = core::str::from_utf8(&buf[..n]).unwrap();
-        assert!(body.starts_with("{\"v\":1,\"seq\":0,"), "{body}");
+        assert!(body.starts_with("{\"v\":2,\"seq\":0,"), "{body}");
         assert!(body.ends_with("\"fills\":[]}}"), "{body}");
         assert!(body.contains("\"slots\":[{\"slot\":0,\"name\":\"hyparb\""));
         assert!(body.contains("\"venue\":\"rpc\""));

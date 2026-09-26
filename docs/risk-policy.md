@@ -110,7 +110,8 @@ laws, enforced in `crates/core-regime` (the detector), `crates/strategy-set`
 - **Entries only.** A closed gate blocks ENTRIES; it never blocks an
   exit and never flips a table. `off = soft` lets the position drain by
   its own exit law; `off = hard` flattens on the flip
-  (`engine_vm_regime_hard_exits_total`, `engine_icdp_regime_exits_total`).
+  (`engine_vm_regime_hard_exits_total`; icdp's `engine_icdp_regime_exits_total`
+  was retired with its member at XMM XH3).
 - **Fail closed.** UNKNOWN words (warm-up, a declaration that expired,
   a venue-dark FUND dimension) close every LABELLED row/member; an
   unlabelled row is bit-identical to pre-RG0 behaviour.
@@ -6021,7 +6022,7 @@ O-XH1…O-XH15). `strategy-icdp` is UNLINKED from the set (its crate and
   every 100 ms; each member's own `timer_due` gate still fires it on its
   own period (a 1 s member now fires every 1.0–1.1 s).
 
-**Open before XH3 enables xmm:**
+**Open before XH3 enables xmm** (both closed by the XH3 amendment below):
 * `audit-pnl` does not replay trade prints, so a slot-6 queue order can
   never fill there — its shadow P&L would read flat until it does.
 * The member's counters reach `/metrics` — at least `stuck`,
@@ -6039,6 +6040,81 @@ Gates (XH2, 2026-09-26): alloc 79/79 at 0 B/op (+1 ignored helper),
 incl. gates 74 (queue law), 75/75b/75c (the member, its fail-safe
 branches included), 76 (the paper dispatcher's queue path) and the
 engine gate driving the paper order-event pump.
+
+### XH3 amendment (2026-09-26): the member on the live paper engine
+
+* **Observability (the XH2 open items, closed).** `/metrics` carries the
+  member's 17 counters (`engine_xmm_*_total` — `stuck`, `gate_overflow`,
+  `unmatched` and `ctx_refused` must stay 0; the pulls by reason are
+  `lead_cancels`, `requote_cancels`, `pull_cancels`, `expiry_cancels`;
+  a modify or cancel of an order the venue already ended is a race, not
+  a refusal, and is not counted in `ctx_refused`),
+  `engine_xmm_perps` and the first four perps' positions. `/state`
+  (schema 2) carries them plus one row per perp: the touch, our two
+  quotes and their states, the position, each feed's age. `audit-pnl`
+  replays the queue venue's prints — only for a run with a post-only
+  maker in it, and only inside its ticks, so every other run reports
+  exactly as before — and slot 6's shadow P&L is the queue law's, not
+  flat. Caveats: a regime-bucketed audit replay can hold a queue order
+  whose cancel landed in another bucket (its own TTL, ≤ 30 s, ends it
+  there); an audit engine is born at its first intent, so that first
+  queue order meets no known book (conservative: an unknown queue).
+* **Regime: carried, never consulted.** `[labels.xmm]` is accepted so
+  `[labels] require = 1` can boot the member enabled; the label never
+  gates it (the HORIZON law, bin15's precedent — a quote that lives
+  seconds and is scored on a 5 s markout is not a cell of a 4–8 h
+  lane). Its off switches are the XH-2 pulls, the caps and (XH4) the
+  arm's halts.
+* **Enabling is paper only** (`STRATEGY=…+xmm` in `strategy.conf` and
+  `~/multivenue/xmm.toml` — the probe: $15 clip, ±$150 per perp, $400
+  gross, $300 resting, θ 0.5 bp). A live slot 6 still refuses the boot
+  (XH4). The set's timer runs every 100 ms with xmm enabled; each
+  member's own period still gates it (1 s members fire every 1.0–1.1 s).
+  **The runbook, in this order:**
+  1. The build: merge, then the release build the wrapper execs
+     (`cargo build --release -p cli`; check the binary's mtime). An
+     older binary or wrapper refuses `+xmm`.
+  2. Pre-flight — every descriptor must resolve, or `xmm_boot` refuses
+     the WHOLE boot (and an unattended daily restart would then take
+     every member down in a KeepAlive loop): `hyperliquid:{BTC,ETH,SOL,
+     XRP}` and `binance-usdm:{btc,eth,sol,xrp}usdt` in `universe.toml`;
+     `backtest --member xmm --xmm ~/multivenue/xmm.toml` on the current
+     run's ≤ 2 h window resolves them with the boot's own code.
+  3. Place `xmm.toml`, then edit `strategy.conf` LAST, outside the quiet
+     windows; restart supervised rather than waiting for 00:10/08:30/
+     16:05Z.
+  4. After the boot: the tell `xmm: artifact configured … phase=XH3(paper)`;
+     `/state` `xmm.configured = 1`, `boot.xmm_coins = BTC,ETH,SOL,XRP`;
+     `engine_xmm_perps 4`; `engine_xmm_placed_total` and
+     `engine_paper_matcher_queue_rested_total` rising; `stuck`,
+     `gate_overflow`, `unmatched`, `ctx_refused` at 0; every other
+     member back (`vm_rows_active ≥ 1`, as after any restart).
+  5. Rollback: `STRATEGY` back to the previous name, restart.
+  6. Arming later (`EXEC_TOML`/`ARM_LIVE`): `exec.toml` must leave slot 6
+     absent or `paper` — `off` refuses every xmm order, `live` refuses
+     the boot. Under `[labels] require = 1` both `[labels.xmm]` and
+     `[labels.bin15]` are then needed.
+* **The XH3 bar (plan §9)** — measured on the live paper engine, never
+  on hours: ≥ 2,000 paper fills over ≥ 6 windows; `stuck`,
+  `gate_overflow`, `unmatched` and `ctx_refused` all 0; requote rate
+  ≤ 1.25 × the XH0(c) model; pulls reported by reason; the paper 5 s
+  markout inside the XMM CUR back-of-queue CI per perp; clean through
+  the 00:10, 08:30 and 16:05Z restarts. In paper a `stuck` needs ≥ 10 s
+  with no Hyperliquid record at all — of ANY symbol, since a block is the
+  venue's (below): each one is read against the ingress health, and one
+  no outage explains fails the bar. XH4's testnet battery does not wait
+  on the bar (operator, 2026-09-26: "through XH4 on testnet"); XH5's
+  mainnet probe does.
+* **The queue law's block is the venue's (XH3).** Hyperliquid processes a
+  cancel in the next block whether or not that perp's book changes, so
+  off the parity switch any record of the venue (any symbol, tracked or
+  not) lands what is due on every tracked perp of that venue, against
+  its last known book: a quiet book never holds a pull or a TTL cancel
+  back (before, a perp quiet for 12 s — the 2 s follower pull, then the
+  10 s watchdog — read as `stuck` with no outage anywhere). The paper
+  matcher, `backtest --member xmm` and `audit-pnl` follow; the parity
+  verb keeps the simulator's per-symbol clock, so the XH2 parity result
+  stands.
 
 The laws XH-1…XH-7 (plan §10) are proposed for this file when their
 phase lands (XH3 paper member, XH4 execution).

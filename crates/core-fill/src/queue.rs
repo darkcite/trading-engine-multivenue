@@ -34,6 +34,13 @@
 //!   what is due — a stale or one-sided book too (its touch is not
 //!   learnt) — so a cancel or an expiry is never held back by a quiet
 //!   or degraded feed.
+//! * **A block is the venue's (XMM XH3).** Hyperliquid processes a
+//!   cancel in the next block whether or not that perp's book changes,
+//!   so any record of the venue — any of its symbols, tracked or not —
+//!   also lands what is due on every OTHER tracked symbol of that venue,
+//!   against that symbol's last known book. A quiet book never holds a
+//!   cancel back. The parity switch keeps the simulator's per-symbol
+//!   clock (only the record's own symbol advances).
 //! * **Order inside a block.** Placements, then cancels, then the block's
 //!   prints: Hyperliquid sequences non-crossing ALO actions and cancels
 //!   ahead of IOC/GTC in a block, so a cancel that lands in a block beats
@@ -499,6 +506,7 @@ impl QueueBook {
     /// comes to its price. Under [`Self::parity_sim`] the touch is taken
     /// first, so an arrival meets this record's own touch.
     pub fn on_book(&mut self, sym: u32, touch: Touch, t_ns: u64) {
+        self.advance_venue(sym, t_ns);
         let Some(k) = self.sym_index(sym) else {
             return;
         };
@@ -541,6 +549,7 @@ impl QueueBook {
         sell_aggressor: bool,
         t_ns: u64,
     ) {
+        self.advance_venue(sym, t_ns);
         if self.sym_index(sym).is_none() {
             return;
         }
@@ -612,6 +621,26 @@ impl QueueBook {
         self.out_head = (self.out_head + 1) % QUEUE_OUT_CAP;
         self.out_len -= 1;
         Some(e)
+    }
+
+    /// XMM XH3: a record of `record_sym` at `t_ns` is a block of its whole
+    /// venue — land what is due on every OTHER tracked symbol of that
+    /// venue (against its last known book). Off under the parity switch
+    /// (the simulator's per-symbol clock). At most 8 symbols × 32 orders.
+    #[inline]
+    fn advance_venue(&mut self, record_sym: u32, t_ns: u64) {
+        if self.parity_sim || self.len == 0 {
+            return;
+        }
+        let venue = core_types::symbol_venue_byte(record_sym);
+        let mut k = 0usize;
+        while k < self.n_syms {
+            let sym = self.syms[k].sym;
+            if sym != record_sym && core_types::symbol_venue_byte(sym) == venue {
+                self.advance(sym, t_ns);
+            }
+            k += 1;
+        }
     }
 
     /// Land everything of `sym` due at or before `t_ns`: placements
@@ -1346,6 +1375,56 @@ mod tests {
         b.place(&order(oid, Side::Bid, 100, 1, 20)).expect("placed");
         b.on_book(SYM, touch(100, 0, 101, 0), 20); // the 97th
         b
+    }
+
+    /// XMM XH3: a quiet perp's cancel lands at the next record of ANY
+    /// symbol of its venue (the block is the venue's) — tracked or not —
+    /// but never at another venue's record; its landing meets its own
+    /// last known book.
+    #[test]
+    fn off_parity_a_quiet_symbols_due_actions_land_at_any_record_of_its_venue() {
+        let other: u32 = SYM + 1; // same venue byte (0)
+        let untracked: u32 = SYM + 2;
+        let foreign: u32 = (7 << 24) | SYM; // another venue
+        let mut b = book_with(touch(100, 5, 101, 5));
+        assert_eq!(b.track(other), Ok(()));
+        b.on_book(other, touch(50, 1, 51, 1), 0);
+        assert_eq!(b.place(&order(1, Side::Bid, 100, 1, 10)), Ok(()));
+        // SYM is quiet: the placement lands at the other symbol's record,
+        // against SYM's own book (a bid AT its touch: 5 ahead).
+        b.on_book(other, touch(50, 1, 51, 1), 10);
+        let ev = drain(&mut b);
+        assert_eq!(kinds(&ev), vec![(1, ORDER_EVENT_RESTING, ORDER_EVENT_REASON_NONE, 0)]);
+        assert_eq!(b.get(1, SLOT).map(|o| o.ahead_1e6), Some(5 * U));
+        // A cancel due at 20: another venue's record lands nothing …
+        assert_eq!(b.cancel(1, SLOT, 20), Ok(()));
+        b.on_book(foreign, touch(1, 1, 2, 1), 25);
+        assert!(drain(&mut b).is_empty());
+        // … an untracked symbol of the same venue lands it.
+        b.on_book(untracked, touch(1, 1, 2, 1), 25);
+        let ev = drain(&mut b);
+        assert_eq!(kinds(&ev), vec![(1, ORDER_EVENT_CANCELED, ORDER_EVENT_REASON_CANCEL_REQUESTED, 0)]);
+        assert!(b.is_empty());
+        // A print of another symbol is a record of the block too.
+        assert_eq!(b.place(&order(2, Side::Ask, 101, 1, 30)), Ok(()));
+        b.on_print(other, 50 * U, U, true, 30);
+        assert_eq!(kinds(&drain(&mut b)), vec![(2, ORDER_EVENT_RESTING, ORDER_EVENT_REASON_NONE, 0)]);
+    }
+
+    /// Under the parity switch the simulator's per-symbol clock holds: a
+    /// quiet symbol's due actions wait for its OWN record.
+    #[test]
+    fn under_parity_a_quiet_symbols_due_actions_wait_for_its_own_record() {
+        let other: u32 = SYM + 1;
+        let mut b = book_with(touch(100, 5, 101, 5));
+        b.parity_sim = true;
+        assert_eq!(b.track(other), Ok(()));
+        assert_eq!(b.place(&order(1, Side::Bid, 100, 1, 10)), Ok(()));
+        b.on_book(other, touch(50, 1, 51, 1), 10);
+        b.on_print(other, 50 * U, U, true, 11);
+        assert!(drain(&mut b).is_empty(), "no record of SYM yet");
+        b.on_book(SYM, touch(100, 5, 101, 5), 12);
+        assert_eq!(kinds(&drain(&mut b)), vec![(1, ORDER_EVENT_RESTING, ORDER_EVENT_REASON_NONE, 0)]);
     }
 
     #[cfg(debug_assertions)]

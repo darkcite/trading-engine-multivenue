@@ -85,8 +85,8 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrReader, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, Price, Qty, Side, Tick,
-    VenueId, REGIME_PROFILES, SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, OptSummary, Order, OrderEvent, Price, Qty,
+    Side, Tick, TradePrint, VenueId, REGIME_PROFILES, SYMBOL_ID_NONE,
 };
 
 use crate::backtest::fill::{usd_1e12_to_1e6_ceil, usd_1e12_to_1e6_floor};
@@ -199,10 +199,14 @@ pub struct AuditPnlConfig {
 /// declarations land between ticks and fills — the detector sees them
 /// before the intents of the same instant are bucketed).
 const CLASS_TICK: u8 = 0;
-const CLASS_REGIME: u8 = 1;
-const CLASS_FILL: u8 = 2;
-const CLASS_COMMIT: u8 = 3;
-const CLASS_ORDER: u8 = 4;
+/// XMM XH3: a queue venue's trade print — after the books of its
+/// instant (the engine's trade lane runs after the tick lanes), before
+/// anything else. Renumbering the classes below it keeps their order.
+const CLASS_TRADE: u8 = 1;
+const CLASS_REGIME: u8 = 2;
+const CLASS_FILL: u8 = 3;
+const CLASS_COMMIT: u8 = 4;
+const CLASS_ORDER: u8 = 5;
 
 #[derive(Copy, Clone, Debug)]
 enum Payload {
@@ -214,6 +218,9 @@ enum Payload {
     Funding(ChannelEvent),
     /// RG3: a captured `SetRegime` frame.
     Regime(AiCmd),
+    /// XMM XH3: a queue venue's trade print (sym dense) — what fills a
+    /// post-only maker under the queue law.
+    Trade(TradePrint),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -483,6 +490,10 @@ struct RunLoad {
     funding_events: u64,
     regime_cmds: u64,
     regime_cmds_dropped: u64,
+    /// XMM XH3: queue-venue trade prints loaded (the queue law's input)
+    /// and the post-only placements they can fill.
+    trades: u64,
+    queue_orders: u64,
     /// BIN15 S2: `(venue_time − ts, first sampled stamp)` over the run's
     /// first Hyperliquid stamps — the SAME fit and law as `backtest`
     /// (`backtest::clock`); `None` = the old anchor law (or a refused fit).
@@ -766,6 +777,11 @@ fn load_run_events(
         for (i, o) in reader.records().iter().enumerate() {
             let mut order = *o;
             order.sym = resolve(o.sym, interner, &mut load)?;
+            if o.verb == core_types::ORDER_VERB_PLACE
+                && core_fill::judged_by_queue(core_types::symbol_venue_byte(o.sym), o.kind, o.flags)
+            {
+                load.queue_orders += 1;
+            }
             evs.push(Ev {
                 ts_ns: o.ts_ns,
                 class: CLASS_ORDER,
@@ -822,6 +838,14 @@ fn load_run_events(
         .map(|e| e.ts_ns)
         .min()
         .unwrap_or(0);
+    // XMM XH3: the run's last tick — a print past it can fill nothing
+    // this surface would still mark, and must not move the window's end.
+    let tick_last = evs
+        .iter()
+        .filter(|e| e.class == CLASS_TICK)
+        .map(|e| e.ts_ns)
+        .max()
+        .unwrap_or(0);
     for (lord_off, label) in VENUE_LABELS.iter().enumerate() {
         let path = run.path.join(format!("{label}-events.pmlr"));
         let Some(reader) = open_checked::<ChannelEvent>(&path, SlotKind::Event, run.epoch_ns)?
@@ -829,6 +853,36 @@ fn load_run_events(
             continue;
         };
         for (i, e) in reader.records().iter().enumerate() {
+            // XMM XH3: a queue venue's prints fill its post-only makers
+            // (`core_fill::queue`); without them a slot-6 order could
+            // never fill here and its shadow P&L would read flat. Loaded
+            // only for a run that HAS such an order (the order file is
+            // read above), and only inside its ticks — so every other
+            // run, and every other member's window, reports exactly as
+            // before.
+            if e.channel == ChannelId::Trade as u8 {
+                if load.queue_orders == 0
+                    || !core_fill::queue_venue(e.venue)
+                    || e.sym == SYMBOL_ID_NONE
+                    || e.ts_ns < tick_anchor
+                    || e.ts_ns > tick_last
+                {
+                    continue;
+                }
+                let mut p = TradePrint::ZERO;
+                if TradePrint::read_trade_event(e, &mut p) {
+                    p.sym = resolve(e.sym, interner, &mut load)?;
+                    evs.push(Ev {
+                        ts_ns: p.ts_ns,
+                        class: CLASS_TRADE,
+                        lord: 100 + lord_off as u8,
+                        idx: i as u64,
+                        payload: Payload::Trade(p),
+                    });
+                    load.trades += 1;
+                }
+                continue;
+            }
             let keep =
                 e.channel == ChannelId::Funding as u8 || e.channel == ChannelId::AssetCtx as u8;
             if !keep || e.sym == SYMBOL_ID_NONE {
@@ -1080,6 +1134,7 @@ fn load_and_merge_events(
                 Payload::Tick(ref mut t) => t.ts_ns = base + delta,
                 Payload::Funding(ref mut f) => f.ts_ns = base + delta,
                 Payload::Regime(ref mut c) => c.ts_ns = base + delta,
+                Payload::Trade(ref mut p) => p.ts_ns = base + delta,
                 _ => {}
             }
             merged.push(MergedEv {
@@ -1205,6 +1260,14 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             report(&format!(
                 "audit-pnl: run-{}: opt-synth-ticks={} (D-7 mark books)",
                 l.epoch_ns, l.opt_synth_ticks
+            ));
+        }
+        // XMM XH3: emitted only when a post-only maker traded, so a run
+        // without one reports exactly as before.
+        if l.queue_orders > 0 {
+            report(&format!(
+                "audit-pnl: run-{}: queue-orders={} queue-prints={} (post-only makers                  fill from prints after the displayed queue — core_fill::queue)",
+                l.epoch_ns, l.queue_orders, l.trades
             ));
         }
         // VRP V2a: emitted only when it fires, so a run carrying no
@@ -1373,6 +1436,28 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
         }
     }
 
+    // XMM XH3: every sym a post-only maker ever placed on under the queue
+    // law, tracked by every engine from its birth (the boot's
+    // `track_queue_sym`), so an engine built at its first intent still
+    // meets a known book for the orders after it. Ascending — a
+    // deterministic order.
+    let queue_syms: std::collections::BTreeSet<u32> = merged
+        .iter()
+        .filter_map(|ev| match &ev.payload {
+            Payload::Order(o)
+                if o.verb == core_types::ORDER_VERB_PLACE
+                    && core_fill::judged_by_queue(
+                        core_types::symbol_venue_byte(o.sym),
+                        o.kind,
+                        o.flags,
+                    ) =>
+            {
+                Some(o.sym)
+            }
+            _ => None,
+        })
+        .collect();
+
     // Engines: per strategy_id, plus per (vm, hash128). ModelParams
     // fields are Copy arrays — rebuild per engine (derive-agnostic).
     let mk_engine = || {
@@ -1441,6 +1526,9 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             &bin_out.underlying_of,
             window_end_ns,
         );
+        for sym in &queue_syms {
+            e.track_queue_sym(*sym);
+        }
         e
     };
     let mut engines: BTreeMap<u8, FillEngine> = BTreeMap::new();
@@ -1481,6 +1569,7 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
     let wall_first = merged[0].wall_ns;
     let wall_last = merged[merged.len() - 1].wall_ns;
     let mut scratch = Vec::new();
+    let mut order_event = OrderEvent::ZERO;
 
     for ev in &merged {
         let day = ev.wall_ns / DAY_NS;
@@ -1520,6 +1609,19 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             Payload::Funding(f) => {
                 if let Some(rg) = regime.as_mut() {
                     rg.on_event(f);
+                }
+            }
+            // XMM XH3: prints consume the queue ahead of the post-only
+            // makers and fill them (every engine: the law is venue-wide).
+            Payload::Trade(p) => {
+                for eng in engines.values_mut() {
+                    eng.on_trade(p, ev.virt_ns, ev.wall_ns, &mut scratch);
+                }
+                for eng in vm_hash_engines.values_mut() {
+                    eng.on_trade(p, ev.virt_ns, ev.wall_ns, &mut scratch);
+                }
+                for eng in regime_engines.values_mut() {
+                    eng.on_trade(p, ev.virt_ns, ev.wall_ns, &mut scratch);
                 }
             }
             Payload::Regime(c) => {
@@ -1573,6 +1675,18 @@ pub fn run(cfg: &AuditPnlConfig, report: &mut dyn FnMut(&str)) -> Result<String,
             Payload::Commit(h) => {
                 active_hash = Some(*h);
             }
+        }
+        // XMM XH3: the queue law's order events answer a member this
+        // surface does not run — drained as they come, so they never
+        // pile up across a day of intents.
+        for eng in engines.values_mut() {
+            while eng.pop_order_event(&mut order_event) {}
+        }
+        for eng in vm_hash_engines.values_mut() {
+            while eng.pop_order_event(&mut order_event) {}
+        }
+        for eng in regime_engines.values_mut() {
+            while eng.pop_order_event(&mut order_event) {}
         }
     }
     // Final day snapshot.

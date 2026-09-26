@@ -162,7 +162,7 @@ pub fn render_boot_tell(boot: &XmmBoot) -> String {
         "xmm: artifact configured hash={hex} path={} coins={} maker_enabled={} theta_bps_1e6={} \
          gate_window_ms={} lifetime_ms={} clip_usd_1e6={} inv_cap_usd_1e6={} \
          gross_inv_cap_usd_1e6={} resting_cap_usd_1e6={} lead_stale_ms={} follower_stale_ms={} \
-         rtt_pull_ms={} requote_min_ms={} alo_priority_1e8={} ab_mode={} phase=XH1(dark)",
+         rtt_pull_ms={} requote_min_ms={} alo_priority_1e8={} ab_mode={} phase=XH3(paper)",
         boot.path.display(),
         boot.coins.join(","),
         p.maker_enabled,

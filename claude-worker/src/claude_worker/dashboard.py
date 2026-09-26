@@ -16,8 +16,8 @@ single-threaded, READ-ONLY. Routes:
                              from the fills tail of the CURRENT run (the
                              ``positions`` verb's code path, marks carried at
                              cost), the config snapshot (``strategy.conf``,
-                             ``fees.toml``, ``regime.toml``, ``icdp.toml`` hash +
-                             instruments, ``universe.toml`` summary) and the Data
+                             ``fees.toml``, ``regime.toml``, ``xmm.toml`` hash +
+                             quoted perps, ``universe.toml`` summary) and the Data
                              volume's free space. **Never ``.env``.**
 - ``/api/engine/state``, ``/api/engine/metrics`` → same-origin proxies to the
                              engine's 9191 (no CORS, one page); 502 when the
@@ -691,16 +691,31 @@ def _universe_summary(path: pathlib.Path) -> dict[str, object] | None:
     return out
 
 
+def _xmm_summary(path: pathlib.Path) -> dict[str, object]:
+    """``xmm.toml`` (slot 6 since XMM XH1): its hash and the perps it quotes
+    (``quote_<coin> = 1``, upper-cased, sorted). Absent or unparseable → no
+    perps; the hash says which (``None`` = absent)."""
+    text = _read_text(path, limit=1 << 20)
+    quoted: list[str] = []
+    if text is not None:
+        try:
+            section = tomllib.loads(text).get("xmm", {})
+        except ValueError:
+            section = {}
+        if isinstance(section, dict):
+            quoted = sorted(
+                k[len("quote_"):].upper() for k, v in section.items() if k.startswith("quote_") and v == 1
+            )
+    return {"hash": _sha256_file(path), "quoted": quoted}
+
+
 def config_section(inputs: Inputs) -> dict[str, object]:
     d = inputs.multivenue_dir
-    icdp = d / "icdp.toml"
-    icdp_text = _read_text(icdp, limit=1 << 20)
-    icdp_instruments = icdp_text.count("[[instrument]]") if icdp_text else 0
     return {
         "strategy_conf": _read_text(d / "strategy.conf"),
         "fees_toml": _read_text(d / "fees.toml"),
         "regime_toml": _read_text(d / "regime.toml"),
-        "icdp": {"hash": _sha256_file(icdp), "instruments": icdp_instruments},
+        "xmm": _xmm_summary(d / "xmm.toml"),
         "universe": _universe_summary(d / "universe.toml"),
         "retention_conf": _read_text(d / "retention.conf"),
     }

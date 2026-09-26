@@ -1044,3 +1044,139 @@ fn a_root_with_no_hip4_instrument_says_nothing_and_changes_nothing() {
     assert!(json.contains("\"net_usd\":\"1.0\""), "json: {json}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A sell print on Hyperliquid (`v1` negative = the seller aggressed).
+fn hl_sell_print(ts: u64, sym: u32, tid: u64, px_1e6: i64, qty_1e6: i64) -> core_types::ChannelEvent {
+    core_types::ChannelEvent::new(
+        ts,
+        VenueId::Hyperliquid,
+        core_types::ChannelId::Trade,
+        sym,
+        tid,
+        0,
+        px_1e6,
+        -qty_1e6,
+    )
+}
+
+/// XMM XH3: a post-only maker on Hyperliquid (slot 6) fills in the audit
+/// from the prints AFTER the displayed queue ahead of it — before XH3
+/// audit-pnl read no prints, so such an order could never fill and slot
+/// 6's shadow P&L read flat. The queue line fires only for a run with a
+/// post-only maker in it.
+#[test]
+fn a_post_only_maker_fills_from_prints_after_the_displayed_queue() {
+    let root = tmp_root("xmm-queue");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(HL_BTC, "hyperliquid:BTC")]);
+    let land = 2_000 + HL_DELTA + 10;
+    // 100.00 / 100.01 with 100 displayed on each side; a later book for
+    // the mark-out.
+    write_ticks(
+        &dir,
+        "hl",
+        EPOCH_1,
+        &[
+            hl_tick(1_000, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land + 5_000_000_000, HL_BTC, 100_000_000, 100_010_000),
+        ],
+    );
+    // One post-only bid joining the touch: 100 ahead of it.
+    let mut o = hl_order(2_000, HL_BTC, Side::Bid, 100_000_000, 1_000_000, 21).with_post_only();
+    o.strategy_id = 6;
+    write_orders(&dir, EPOCH_1, &[o]);
+    // 60 traded at our price: the queue ahead shrinks to 40, nothing for
+    // us. Then 41: the last 40 ahead, and 1 — all of ours.
+    write_events(
+        &dir,
+        EPOCH_1,
+        &[
+            hl_sell_print(land + 1_000_000, HL_BTC, 1, 100_000_000, 60_000_000),
+            hl_sell_print(land + 2_000_000, HL_BTC, 2, 100_000_000, 41_000_000),
+        ],
+    );
+    let (json, lines) = run_report(&root);
+    let q = lines
+        .iter()
+        .find(|l| l.contains("queue-orders="))
+        .unwrap_or_else(|| panic!("no queue line: {lines:#?}"));
+    assert!(q.contains("queue-orders=1 queue-prints=2"), "{q}");
+    assert!(
+        json.contains("\"strategy_id\":6,\"label\":\"xmm\",\"origin\":1,\"orders\":1,\"fills\":1"),
+        "json: {json}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    // The same run with prints that never clear the queue ahead: no fill.
+    let root = tmp_root("xmm-queue-short");
+    let dir = run_dir(&root, EPOCH_1);
+    manifest(&dir, &[(HL_BTC, "hyperliquid:BTC")]);
+    write_ticks(
+        &dir,
+        "hl",
+        EPOCH_1,
+        &[
+            hl_tick(1_000, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land, HL_BTC, 100_000_000, 100_010_000),
+            hl_tick(land + 5_000_000_000, HL_BTC, 100_000_000, 100_010_000),
+        ],
+    );
+    write_orders(&dir, EPOCH_1, &[o]);
+    write_events(
+        &dir,
+        EPOCH_1,
+        &[hl_sell_print(land + 1_000_000, HL_BTC, 1, 100_000_000, 99_000_000)],
+    );
+    let (json, _) = run_report(&root);
+    assert!(
+        json.contains("\"strategy_id\":6,\"label\":\"xmm\",\"origin\":1,\"orders\":1,\"fills\":0"),
+        "json: {json}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// XMM XH3: prints load ONLY for a run with a post-only maker, and only
+/// inside its ticks — a run without one (here slot 3's plain order and a
+/// print 5 s after the last tick) reports byte-for-byte as it did.
+#[test]
+fn prints_change_nothing_for_a_run_without_a_post_only_maker() {
+    let report = |with_print: bool| {
+        let root = tmp_root(if with_print { "xmm-noq-print" } else { "xmm-noq-bare" });
+        let dir = run_dir(&root, EPOCH_1);
+        manifest(&dir, &[(HL_BTC, "hyperliquid:BTC")]);
+        write_ticks(
+            &dir,
+            "hl",
+            EPOCH_1,
+            &[
+                hl_tick(1_000, HL_BTC, 100_000_000, 100_010_000),
+                hl_tick(2_000 + HL_DELTA + 10, HL_BTC, 99_990_000, 100_000_000),
+                hl_tick(3_000_000_000, HL_BTC, 100_000_000, 100_010_000),
+            ],
+        );
+        write_orders(
+            &dir,
+            EPOCH_1,
+            &[hl_order(2_000, HL_BTC, Side::Bid, 100_000_000, 1_000_000, 31)],
+        );
+        if with_print {
+            write_events(
+                &dir,
+                EPOCH_1,
+                &[
+                    hl_sell_print(1_500, HL_BTC, 1, 100_000_000, 5_000_000),
+                    hl_sell_print(8_000_000_000, HL_BTC, 2, 100_000_000, 5_000_000),
+                ],
+            );
+        }
+        let (json, lines) = run_report(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        (json, lines)
+    };
+    let (bare, bare_lines) = report(false);
+    let (with, with_lines) = report(true);
+    assert_eq!(bare, with, "the JSON (window, days, rows) must not move");
+    assert_eq!(bare_lines, with_lines, "nor the stderr surface");
+    assert!(!with_lines.iter().any(|l| l.contains("queue-orders=")));
+}

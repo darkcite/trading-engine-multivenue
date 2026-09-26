@@ -221,11 +221,35 @@ function renderStrategies() {
     return [s.slot, esc(s.name), s.configured ? 'yes' : '<span class="dim">no</span>', s.enabled ? '<span class="ok">on</span>' : '<span class="dim">off</span>',
       `<span class="${s.gate === 0 ? 'ok' : s.gate === 2 ? 'bad' : 'warn'}">${GATE[s.gate]}</span>${s.label_terms ? ` <span class="dim">(${s.label_terms} terms, ${s.label_off ? 'hard' : 'soft'})</span>` : ''}`,
       n(s.orders_emitted, 0), n(s.orders_dropped, 0),
-      s.name === 'vm' ? n(E.vm.fires, 0) : s.name === 'icdp' ? n(E.icdp.signals, 0) : '<span class="dim">—</span>',
+      s.name === 'vm' ? n(E.vm.fires, 0) : s.name === 'xmm' && E.xmm ? n(E.xmm.placed, 0) : '<span class="dim">—</span>',
       p ? n(p.fills, 0) : '<span class="dim">—</span>', ladder];
   });
   set('strat-sub', `${E.boot.strategy_kind} · latest report ${W && W.pnl && W.pnl.latest ? esc(W.pnl.latest.day) : '—'}`);
-  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]));
+  set('strat', table(['slot','member','cfg','on','gate','orders','drop','fires','fills','net @0/1/tier'], rows, [5,6,7,8]) + xmmBlock());
+}
+
+// ---- xmm (slot 6, XMM XH3; /state schema 2 — tolerant of an older engine) ----
+const QSTATE = ['—', 'sent', 'resting', 'cancelling'];
+function xmmBlock() {
+  const X = E.xmm;
+  if (!X) return `<div class="muted" style="margin-top:6px">xmm: <span class="dim">n/a (engine /state v${esc(String(E.v))})</span></div>`;
+  if (!X.configured) return '<div class="muted" style="margin-top:6px">xmm: <span class="dim">unconfigured</span></div>';
+  const coins = (E.boot.xmm_coins || '').split(',');
+  const must0 = v => v ? `<span class="bad">${n(v, 0)}</span>` : '0';
+  const px = v => v ? n(v / 1e6, 6) : '<span class="dim">—</span>';
+  const ageMs = v => v < 0 ? '<span class="dim">never</span>' : `${v} ms`;
+  const kv = `<div class="kv" style="margin-top:6px"><div>xmm ${short(E.boot.xmm_hash || '')}</div><div>placed ${n(X.placed, 0)} · modifies ${n(X.modifies, 0)} · fills ${n(X.fills, 0)} (orders filled ${n(X.filled, 0)}, canceled ${n(X.canceled, 0)})</div>` +
+    `<div>cancels lead / requote / pull / expiry</div><div>${n(X.lead_cancels, 0)} / ${n(X.requote_cancels, 0)} / ${n(X.pull_cancels, 0)} / ${n(X.expiry_cancels, 0)}</div>` +
+    `<div>held back: gated / capped</div><div>${n(X.gated, 0)} / ${n(X.capped, 0)}</div>` +
+    `<div>rejected: alo / other</div><div>${n(X.rejected_alo, 0)} / ${n(X.rejected_other, 0)}</div>` +
+    `<div>must stay 0: stuck / gate overflow / unmatched / refused</div><div>${must0(X.stuck)} / ${must0(X.gate_overflow)} / ${must0(X.unmatched)} / ${must0(X.ctx_refused)}</div></div>`;
+  const rows = (X.perps || []).map((r, i) => [
+    esc(coins[i] || '0x' + r.hl_sym.toString(16)), n(r.pos_1e6 / 1e6, 6),
+    `${px(r.touch_bid_1e6)} / ${px(r.touch_ask_1e6)}`,
+    `${QSTATE[r.bid_state] || r.bid_state} ${px(r.bid_px_1e6)}`,
+    `${QSTATE[r.ask_state] || r.ask_state} ${px(r.ask_px_1e6)}`,
+    `${ageMs(r.lead_age_ms)} / ${ageMs(r.fol_age_ms)}${r.stale_flags ? ' <span class="warn">stale</span>' : ''}`]);
+  return kv + table(['perp', 'position', 'touch bid / ask', 'our bid', 'our ask', 'leader / follower age'], rows, [1]);
 }
 
 // ---- P&L ----
@@ -545,10 +569,9 @@ function renderLatency() {
 function renderAi() {
   const parts = [];
   if (E) {
-    const A = E.ai, I = E.icdp;
+    const A = E.ai;
     set('ai-sub', `cmds ${A.cmds} · staged ${A.ruleset_staged} committed ${A.ruleset_committed} rejected ${A.ruleset_rejected} · hb ${age(A.heartbeat_age_s)}`);
-    parts.push(`<div class="kv"><div>hmac / protocol / malformed</div><div>${A.hmac_fail} / ${A.protocol_err} / ${A.malformed}</div><div>seq gap / regress</div><div>${A.seq_gap} / ${A.seq_regress}</div><div>ring drops / expired / rejected conns</div><div>${A.ring_drops} / ${A.expired} / ${A.rejected_conns}</div><div>drain malformed / enable refused</div><div>${A.drain_malformed} / ${A.enable_refused}</div><div>table push fail</div><div>${A.table_push_fail}</div>` +
-      `<div>icdp</div><div>${I.configured ? `${short(I.hash)} ${I.instruments} instr · decisions ${I.decisions} signals ${I.signals} intents ${I.intents} exits ${I.exits} · skipped spread ${I.skipped_spread} stale-open ${I.skipped_stale_open} stale-dec ${I.skipped_stale_dec} prev ${I.skipped_prev} late ${I.late_bars} caps ${I.caps_rejected} · rolls ${I.rolls} · regime blocked ${I.regime_blocked} exits ${I.regime_exits}` : '<span class="dim">unconfigured</span>'}</div></div>`);
+    parts.push(`<div class="kv"><div>hmac / protocol / malformed</div><div>${A.hmac_fail} / ${A.protocol_err} / ${A.malformed}</div><div>seq gap / regress</div><div>${A.seq_gap} / ${A.seq_regress}</div><div>ring drops / expired / rejected conns</div><div>${A.ring_drops} / ${A.expired} / ${A.rejected_conns}</div><div>drain malformed / enable refused</div><div>${A.drain_malformed} / ${A.enable_refused}</div><div>table push fail</div><div>${A.table_push_fail}</div></div>`);
   }
   if (W && W.events) {
     parts.push(`<div class="muted" style="margin-top:6px">ledger tail (${W.events.length})</div>` + table(['ts','kind','detail'], W.events.slice().reverse().slice(0, 40).map(e => [tsLocal(e.ts > 1e14 ? e.ts / 1e6 : e.ts > 1e11 ? e.ts : e.ts * 1000), esc(e.kind), `<span title="${esc(e.detail)}">${esc(e.detail.slice(0, 120))}</span>`])));
@@ -570,7 +593,7 @@ function renderConfig() {
   const C = W.config;
   const block = (name, text) => `<div><div class="muted">${esc(name)}</div><pre>${text === null || text === undefined ? '<span class="dim">(absent)</span>' : esc(text)}</pre></div>`;
   const uni = C.universe ? Object.keys(C.universe).map(v => `${v}: ${Object.keys(C.universe[v]).map(k => `${k} ${C.universe[v][k]}`).join(', ')}`).join('\n') : null;
-  set('config', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px">${block('strategy.conf', C.strategy_conf)}${block('fees.toml', C.fees_toml)}${block('icdp.toml', C.icdp && C.icdp.hash ? `sha256 ${C.icdp.hash}\ninstruments ${C.icdp.instruments}` : null)}${block('universe.toml (entries per list)', uni)}${block('retention.conf', C.retention_conf)}${block('regime.toml', C.regime_toml)}</div>`);
+  set('config', `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px">${block('strategy.conf', C.strategy_conf)}${block('fees.toml', C.fees_toml)}${block('xmm.toml', C.xmm && C.xmm.hash ? `sha256 ${C.xmm.hash}\nquoted ${(C.xmm.quoted || []).join(', ') || '—'}` : null)}${block('universe.toml (entries per list)', uni)}${block('retention.conf', C.retention_conf)}${block('regime.toml', C.regime_toml)}</div>`);
 }
 
 function renderAll() {

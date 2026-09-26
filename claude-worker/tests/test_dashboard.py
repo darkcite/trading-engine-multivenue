@@ -147,13 +147,13 @@ def _worker_dir(tmp_path: pathlib.Path) -> claude_worker.dashboard.Inputs:
     (replay / "run-1700000000000000000").mkdir(parents=True)
     mv = tmp_path / "multivenue"
     mv.mkdir()
-    (mv / "strategy.conf").write_text("STRATEGY=ai+icdp\n", encoding="utf-8")
+    (mv / "strategy.conf").write_text("STRATEGY=ai+xmm\n", encoding="utf-8")
     (mv / "fees.toml").write_text('[fees]\npm = "0:350"\n', encoding="utf-8")
     (mv / "universe.toml").write_text(
         '[binance]\nspot = ["btcusdt"]\nusdm = ["btcusdt", "ethusdt"]\n', encoding="utf-8"
     )
-    (mv / "icdp.toml").write_text(
-        "[[instrument]]\ndescriptor = 'a'\n[[instrument]]\ndescriptor = 'b'\n", encoding="utf-8"
+    (mv / "xmm.toml").write_text(
+        "[xmm]\nmaker_enabled = 1\nquote_btc = 1\nquote_sol = 1\nquote_xrp = 0\n", encoding="utf-8"
     )
     (mv / ".env").write_text("ANTHROPIC_API_KEY=sk-ant-secret\n", encoding="utf-8")
     return claude_worker.dashboard.Inputs(
@@ -217,8 +217,9 @@ def test_worker_payload_shape(tmp_path: pathlib.Path) -> None:
     assert doc["positions"]["run_dir"].endswith("run-1700000000000000000")
     assert doc["positions"]["positions"] == [] and doc["positions"]["fills"] == 0
     # config snapshot — and NEVER the .env.
-    assert doc["config"]["strategy_conf"] == "STRATEGY=ai+icdp\n"
-    assert doc["config"]["icdp"]["instruments"] == 2
+    assert doc["config"]["strategy_conf"] == "STRATEGY=ai+xmm\n"
+    assert doc["config"]["xmm"]["quoted"] == ["BTC", "SOL"]
+    assert len(doc["config"]["xmm"]["hash"]) == 64
     assert doc["config"]["universe"] == {"binance": {"spot": 1, "usdm": 2}}
     assert doc["config"]["regime_toml"] is None
     flat = json.dumps(doc)
@@ -303,7 +304,7 @@ def test_main_once_prints_the_document(
     assert code == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["v"] == 1 and doc["db"]["path"] == str(inputs.db_path)
-    assert doc["config"]["strategy_conf"] == "STRATEGY=ai+icdp\n"
+    assert doc["config"]["strategy_conf"] == "STRATEGY=ai+xmm\n"
     assert doc["pnl"]["latest"]["day"] == "2026-09-04"
 
 
@@ -726,3 +727,16 @@ def test_news_red_rules_name_a_dead_source_and_an_invalid_policy(
     assert news["policy"]["valid"] is False
     modes = news["policy"]["modes"]
     assert set(modes.values()) == {claude_worker.news.actions.MODE_OFF}
+
+
+def test_the_xmm_summary_reads_the_quoted_perps_and_survives_absence(tmp_path):
+    # XMM XH3: the config panel's slot-6 block (it replaced icdp.toml).
+    assert claude_worker.dashboard._xmm_summary(tmp_path / "xmm.toml") == {"hash": None, "quoted": []}
+    bad = tmp_path / "bad.toml"
+    bad.write_text("[xmm\nquote_btc = 1\n", encoding="utf-8")
+    assert claude_worker.dashboard._xmm_summary(bad)["quoted"] == []
+    ok = tmp_path / "ok.toml"
+    ok.write_text("[xmm]\nquote_eth = 1\nquote_btc = 1\nquote_ada = 0\n", encoding="utf-8")
+    summary = claude_worker.dashboard._xmm_summary(ok)
+    assert summary["quoted"] == ["BTC", "ETH"]
+    assert len(summary["hash"]) == 64

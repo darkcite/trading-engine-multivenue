@@ -3087,6 +3087,12 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
     let mut obs = obs;
     obs.boot.requested_mask = requested_mask;
     obs.boot.configured_mask = configured;
+    if let Some(boot) = xmm {
+        // XMM XH3: the artifact's identity on `/state` (`boot.xmm_hash`)
+        // and the names of its perp rows, in row order (boot-only).
+        obs.boot.xmm_hash = boot.hash;
+        obs.boot.set_xmm_coins(boot.coins.join(",").as_bytes());
+    }
 
     let mut set = strategy_set::StrategySet::new(mask);
     if let Some(boot) = vrp {
@@ -3306,8 +3312,9 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
         tracing::info!("{}", crate::hyparb_boot::render_boot_tell(boot));
     }
     if let Some(boot) = xmm {
-        // XMM XH1: the member validates and stores its artifact. It is
-        // DARK until XH3 — no order, no timer — so the boot tell says so.
+        // XMM XH1: the member validates and stores its artifact. It
+        // quotes on the paper queue law since XH2 (a live slot 6 refuses
+        // the boot until XH4).
         if let Err(e) = set.xmm_mut().configure(&boot.params) {
             tracing::error!(error = %e, "xmm: artifact refused");
             return EngineLoopResult::Failed("xmm: artifact refused by the strategy");
@@ -3767,7 +3774,7 @@ impl Observability {
                 .register_gauge("engine_strategy_enabled_mask")
                 .map_err(|_| "register engine_strategy_enabled_mask")?;
             let vm = register_vm_metrics(&mut reg)?;
-            let icdp = register_icdp_metrics(&mut reg)?;
+            let xmm = register_xmm_metrics(&mut reg)?;
             let vrp = register_vrp_metrics(&mut reg)?;
             let xsd = register_xsd_metrics(&mut reg)?;
             let bin15 = register_bin15_metrics(&mut reg)?;
@@ -3868,7 +3875,7 @@ impl Observability {
                 orders_capture,
                 strategy_enabled_mask,
                 vm,
-                icdp,
+                xmm,
                 vrp,
                 xsd,
                 bin15,
@@ -4242,8 +4249,9 @@ pub struct EngineCounters {
     /// Phase-8g §9 vm-member family (`engine_vm_*`), mirrored
     /// centrally on the 5 s cadence.
     pub vm: VmMetricIds,
-    /// ICDP I4: the `engine_icdp_*_total` family (slot 6).
-    pub icdp: IcdpMetricIds,
+    /// XMM XH3: the `engine_xmm_*` family (slot 6; it replaced the
+    /// retired `engine_icdp_*_total` family).
+    pub xmm: XmmMetricIds,
     /// VRP V7: the `engine_vrp_*` family (slot 1).
     pub vrp: VrpMetricIds,
     /// XSD-3: the `engine_xsd_*` family (slot 2).
@@ -5545,111 +5553,136 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
 }
 
 // ---------------------------------------------------------------
-// ICDP I4 — slot-6 observability (5 s mirror, cold path)
+// XMM XH3 — slot-6 observability (5 s mirror, cold path)
 // ---------------------------------------------------------------
 
-/// Registry handles for the ICDP family (`engine_icdp_*_total`),
-/// mirrored like the vm family through the `StrategyCounters`
-/// default accessor `icdp_counters` (zeros on every boot without a
-/// configured slot-6 member).
-#[derive(Copy, Clone, Debug)]
-pub struct IcdpMetricIds {
-    /// `engine_icdp_decisions_total`
-    pub decisions: core_metrics::CounterId,
-    /// `engine_icdp_signals_total`
-    pub signals: core_metrics::CounterId,
-    /// `engine_icdp_intents_total`
-    pub intents: core_metrics::CounterId,
-    /// `engine_icdp_exits_total`
-    pub exits: core_metrics::CounterId,
-    /// `engine_icdp_exit_on_stale_total`
-    pub exit_on_stale: core_metrics::CounterId,
-    /// `engine_icdp_skipped_spread_total`
-    pub skipped_spread: core_metrics::CounterId,
-    /// `engine_icdp_skipped_stale_open_total`
-    pub skipped_stale_open: core_metrics::CounterId,
-    /// `engine_icdp_skipped_stale_dec_total`
-    pub skipped_stale_dec: core_metrics::CounterId,
-    /// `engine_icdp_skipped_prev_total`
-    pub skipped_prev: core_metrics::CounterId,
-    /// `engine_icdp_late_bars_total`
-    pub late_bars: core_metrics::CounterId,
-    /// `engine_icdp_caps_rejected_total`
-    pub caps_rejected: core_metrics::CounterId,
-    /// `engine_icdp_rolls_total`
-    pub rolls: core_metrics::CounterId,
-    /// `engine_icdp_regime_blocked_total` (RG2)
-    pub regime_blocked: core_metrics::CounterId,
-    /// `engine_icdp_regime_exits_total` (RG2)
-    pub regime_exits: core_metrics::CounterId,
+/// XMM XH3: perps carried by the per-perp gauges (the first N
+/// configured; `/state` carries all eight).
+pub const XMM_METRIC_PERPS: usize = 4;
+
+/// The counter rows of the xmm family, in [`xmm_counter_values`] order
+/// — which is what pins the two together.
+const XMM_COUNTER_NAMES: [&str; 17] = [
+    "engine_xmm_placed_total",
+    "engine_xmm_modifies_total",
+    "engine_xmm_lead_cancels_total",
+    "engine_xmm_requote_cancels_total",
+    "engine_xmm_pull_cancels_total",
+    "engine_xmm_expiry_cancels_total",
+    "engine_xmm_gated_total",
+    "engine_xmm_gate_overflow_total",
+    "engine_xmm_capped_total",
+    "engine_xmm_rejected_alo_total",
+    "engine_xmm_rejected_other_total",
+    "engine_xmm_canceled_total",
+    "engine_xmm_filled_total",
+    "engine_xmm_fills_total",
+    "engine_xmm_unmatched_total",
+    "engine_xmm_ctx_refused_total",
+    "engine_xmm_stuck_total",
+];
+
+/// `XmmCounters`' fields in [`XMM_COUNTER_NAMES`] order.
+// COPY: [u64; 17] (136 B) returned by value — cold, the 5 s /metrics
+// mirror; the fields are visited once in the name order — a borrowed
+// view would need the struct to be an array, which the POD is not.
+fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; 17] {
+    [
+        c.placed,
+        c.modifies,
+        c.lead_cancels,
+        c.requote_cancels,
+        c.pull_cancels,
+        c.expiry_cancels,
+        c.gated,
+        c.gate_overflow,
+        c.capped,
+        c.rejected_alo,
+        c.rejected_other,
+        c.canceled,
+        c.filled,
+        c.fills,
+        c.unmatched,
+        c.ctx_refused,
+        c.stuck,
+    ]
 }
 
-/// Register the ICDP family. Boot-only.
-fn register_icdp_metrics(
+/// XMM XH3: the `engine_xmm_*` family (slot 6) — what the member did
+/// (the XH3 bar reads `stuck`, the pulls by reason and the requote
+/// rate from here), how many perps it quotes, and each perp's position.
+#[derive(Copy, Clone, Debug)]
+pub struct XmmMetricIds {
+    /// The counters, in [`XMM_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; 17],
+    /// `engine_xmm_perps` — perps configured (0 = the member is off).
+    pub perps: core_metrics::GaugeId,
+    /// `engine_xmm_p{k}_pos_1e6` — the signed position on the k-th
+    /// configured perp, base × 1e6.
+    pub pos: [core_metrics::GaugeId; XMM_METRIC_PERPS],
+}
+
+/// Register the xmm family. Boot-only.
+fn register_xmm_metrics(
     reg: &mut core_metrics::MetricsRegistry,
-) -> Result<IcdpMetricIds, &'static str> {
-    let mut one = |name: &str| -> Result<core_metrics::CounterId, &'static str> {
-        reg.register_counter(name)
-            .map_err(|_| "register icdp counter")
-    };
-    Ok(IcdpMetricIds {
-        decisions: one("engine_icdp_decisions_total")?,
-        signals: one("engine_icdp_signals_total")?,
-        intents: one("engine_icdp_intents_total")?,
-        exits: one("engine_icdp_exits_total")?,
-        exit_on_stale: one("engine_icdp_exit_on_stale_total")?,
-        skipped_spread: one("engine_icdp_skipped_spread_total")?,
-        skipped_stale_open: one("engine_icdp_skipped_stale_open_total")?,
-        skipped_stale_dec: one("engine_icdp_skipped_stale_dec_total")?,
-        skipped_prev: one("engine_icdp_skipped_prev_total")?,
-        late_bars: one("engine_icdp_late_bars_total")?,
-        caps_rejected: one("engine_icdp_caps_rejected_total")?,
-        rolls: one("engine_icdp_rolls_total")?,
-        regime_blocked: one("engine_icdp_regime_blocked_total")?,
-        regime_exits: one("engine_icdp_regime_exits_total")?,
+) -> Result<XmmMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); 17];
+    let mut i = 0usize;
+    while i < XMM_COUNTER_NAMES.len() {
+        counters[i] = reg
+            .register_counter(XMM_COUNTER_NAMES[i])
+            .map_err(|_| "register xmm counter")?;
+        i += 1;
+    }
+    let perps = reg
+        .register_gauge("engine_xmm_perps")
+        .map_err(|_| "register xmm gauge")?;
+    let mut pos = [core_metrics::GaugeId::default(); XMM_METRIC_PERPS];
+    let mut k = 0usize;
+    while k < XMM_METRIC_PERPS {
+        pos[k] = reg
+            .register_gauge(&format!("engine_xmm_p{k}_pos_1e6"))
+            .map_err(|_| "register xmm gauge")?;
+        k += 1;
+    }
+    Ok(XmmMetricIds {
+        counters,
+        perps,
+        pos,
     })
 }
 
-/// Mirror the ICDP family as monotonic deltas of the cumulative
-/// strategy counters. 5 s cadence — cold path.
-fn mirror_icdp_metrics<S: strategy_core::StrategyCounters>(
+/// Mirror the xmm family: the counters as monotonic deltas of the
+/// member's cumulative ones, the gauges as levels. 5 s cadence — cold
+/// path (the perp rows are read into a stack buffer, never allocated).
+fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
     reg: &core_metrics::MetricsRegistry,
-    ids: &IcdpMetricIds,
+    ids: &XmmMetricIds,
     strat: &S,
-    last: &mut strategy_core::IcdpCounters,
+    last: &mut strategy_core::XmmCounters,
 ) {
-    let cur = strat.icdp_counters();
-    reg.counter(ids.decisions)
-        .inc(cur.decisions.saturating_sub(last.decisions));
-    reg.counter(ids.signals)
-        .inc(cur.signals.saturating_sub(last.signals));
-    reg.counter(ids.intents)
-        .inc(cur.intents.saturating_sub(last.intents));
-    reg.counter(ids.exits)
-        .inc(cur.exits.saturating_sub(last.exits));
-    reg.counter(ids.exit_on_stale)
-        .inc(cur.exit_on_stale.saturating_sub(last.exit_on_stale));
-    reg.counter(ids.skipped_spread)
-        .inc(cur.skipped_spread.saturating_sub(last.skipped_spread));
-    reg.counter(ids.skipped_stale_open).inc(
-        cur.skipped_stale_open
-            .saturating_sub(last.skipped_stale_open),
-    );
-    reg.counter(ids.skipped_stale_dec)
-        .inc(cur.skipped_stale_dec.saturating_sub(last.skipped_stale_dec));
-    reg.counter(ids.skipped_prev)
-        .inc(cur.skipped_prev.saturating_sub(last.skipped_prev));
-    reg.counter(ids.late_bars)
-        .inc(cur.late_bars.saturating_sub(last.late_bars));
-    reg.counter(ids.caps_rejected)
-        .inc(cur.caps_rejected.saturating_sub(last.caps_rejected));
-    reg.counter(ids.rolls)
-        .inc(cur.rolls.saturating_sub(last.rolls));
-    reg.counter(ids.regime_blocked)
-        .inc(cur.regime_blocked.saturating_sub(last.regime_blocked));
-    reg.counter(ids.regime_exits)
-        .inc(cur.regime_exits.saturating_sub(last.regime_exits));
+    // COPY: the 136 B `XmmCounters` read into `cur`, then kept as the
+    // next delta's baseline (`*last = cur`) — 5 s cadence, cold; a delta
+    // needs the previous value, so one copy survives either way.
+    let mut cur = strategy_core::XmmCounters::default();
+    strat.xmm_counters(&mut cur);
+    let c = xmm_counter_values(&cur);
+    let l = xmm_counter_values(last);
+    let mut i = 0usize;
+    while i < c.len() {
+        reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
+        i += 1;
+    }
+    // COPY: 136 B — the next delta's baseline (see above).
     *last = cur;
+    let mut rows = [strategy_core::XmmPerpView::default(); XMM_METRIC_PERPS];
+    let n = strat.xmm_perps_view(&mut rows);
+    reg.gauge(ids.perps).set(i64::from(n));
+    let mut k = 0usize;
+    while k < XMM_METRIC_PERPS {
+        reg.gauge(ids.pos[k]).set(if (k as u32) < n { rows[k].pos_1e6 } else { 0 });
+        k += 1;
+    }
 }
 
 /// HYPARB H6: coins carried by the per-coin gauges (the first N configured;
@@ -6822,7 +6855,8 @@ fn fill_snapshot<S, D>(
         .boot
         .boot_wall_ns
         .wrapping_add(now.wrapping_sub(obs.boot.boot_mono_ns));
-    out.boot = obs.boot;
+    // `out.boot` was stored once when the scratch was boxed: the boot
+    // identity never changes, so it is not re-copied every second.
     out.set_strategy_kind(Sc::strategy_kind(strat).as_bytes());
     out.halted = u8::from(Sc::is_halted(strat));
     out.enabled_mask = Sc::enabled_mask(strat) as u8;
@@ -6863,9 +6897,10 @@ fn fill_snapshot<S, D>(
     v.regime_blocked = Sc::vm_regime_blocked(strat);
     v.regime_hard_exits = Sc::vm_regime_hard_exits(strat);
 
-    out.icdp.hash = Sc::icdp_params_hash(strat);
-    out.icdp.instruments = Sc::icdp_instruments(strat);
-    out.icdp.counters = Sc::icdp_counters(strat);
+    // XMM XH3: slot 6 — counters and perp rows from ONE publish instant
+    // (a quote and the touch it was placed against can never disagree).
+    Sc::xmm_counters(strat, &mut out.xmm.counters);
+    out.xmm.n_perps = Sc::xmm_perps_view(strat, &mut out.xmm.perps);
 
     // P6: slot 1. Both halves come from the same publish instant, so a
     // strike and the position held against it can never disagree.
@@ -7287,10 +7322,13 @@ where
     // RG6: the 1 s `/state` publish gate + the boot-boxed scratch the
     // loop fills before each seqlock copy (one allocation, here).
     let mut next_state = now_ns() + SNAPSHOT_PERIOD_NS;
-    let mut state_scratch: Option<Box<EngineSnapshot>> = obs
-        .state
-        .as_ref()
-        .map(|_| Box::new(EngineSnapshot::empty()));
+    let mut state_scratch: Option<Box<EngineSnapshot>> = obs.state.as_ref().map(|_| {
+        let mut s = Box::new(EngineSnapshot::empty());
+        // The boot identity (416 B since XMM XH3) is fixed for the
+        // process: stored here once, never re-copied per publish.
+        s.boot = obs.boot;
+        s
+    });
     let mut state_seq = 0u64;
     let mut last_ticks = 0u64;
     let mut last_signals = 0u64;
@@ -7311,8 +7349,8 @@ where
     let mut ai_last = AiCountersSnapshot::default();
     // Phase-8g §9 vm-family delta snapshot (same bookkeeping).
     let mut vm_last = VmCountersSnapshot::default();
-    // ICDP I4 slot-6 family delta snapshot (same bookkeeping).
-    let mut icdp_last = strategy_core::IcdpCounters::default();
+    // XMM XH3 slot-6 family delta snapshot (same bookkeeping).
+    let mut xmm_last = strategy_core::XmmCounters::default();
     let mut vrp_last = strategy_core::VrpCounters::default();
     // VRP V8a: the persisted-state writer. The epoch starts at whatever
     // the member came up with, so a boot that changed nothing rewrites
@@ -7513,7 +7551,7 @@ where
                 reg.gauge(ids.strategy_enabled_mask)
                     .set(strategy_core::StrategyCounters::enabled_mask(eng.strategy()) as i64);
                 mirror_vm_metrics(reg, &ids.vm, eng.strategy(), &mut vm_last);
-                mirror_icdp_metrics(reg, &ids.icdp, eng.strategy(), &mut icdp_last);
+                mirror_xmm_metrics(reg, &ids.xmm, eng.strategy(), &mut xmm_last);
                 mirror_vrp_metrics(reg, &ids.vrp, eng.strategy(), &mut vrp_last);
                 mirror_xsd_metrics(reg, &ids.xsd, eng.strategy(), &mut xsd_last);
                 mirror_bin15_metrics(reg, &ids.bin15, eng.strategy(), &mut bin15_last);
@@ -10100,6 +10138,88 @@ mod tests {
         }
     }
 
+    /// XMM XH3: the slot-6 family — 17 counters (the member's, in name
+    /// order) and 1 + 4 gauges; every name distinct, none reused.
+    #[test]
+    fn the_xmm_family_is_17_counters_and_5_gauges() {
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let before_c = reg.counters_len();
+        let before_g = reg.gauges_len();
+        let ids = register_xmm_metrics(&mut reg).expect("register xmm");
+        assert_eq!(reg.counters_len() - before_c, 17, "the counter block");
+        assert_eq!(reg.gauges_len() - before_g, 1 + XMM_METRIC_PERPS, "perps + positions");
+        assert!(register_xmm_metrics(&mut reg).is_err(), "a second registration collides");
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for n in XMM_COUNTER_NAMES {
+            assert!(n.starts_with("engine_xmm_") && n.ends_with("_total"), "{n}");
+            assert!(seen.insert(n), "duplicate {n}");
+        }
+        reg.gauge(ids.pos[3]).set(-7);
+        assert_eq!(reg.gauge(ids.pos[3]).get(), -7);
+    }
+
+    /// XMM XH3: the mirror publishes DELTAS of the member's cumulative
+    /// counters and LEVELS for the gauges; perps the member does not
+    /// quote read zero; an unconfigured member publishes zeros.
+    #[test]
+    fn the_xmm_mirror_publishes_deltas_and_levels() {
+        struct Fake {
+            c: strategy_core::XmmCounters,
+            rows: [strategy_core::XmmPerpView; 2],
+            n: u32,
+        }
+        impl strategy_core::StrategyCounters for Fake {
+            fn orders_emitted(&self) -> u64 {
+                0
+            }
+            fn orders_dropped(&self) -> u64 {
+                0
+            }
+            fn strategy_kind(&self) -> &'static str {
+                "fake"
+            }
+            fn xmm_counters(&self, out: &mut strategy_core::XmmCounters) {
+                *out = self.c;
+            }
+            fn xmm_perps_view(&self, out: &mut [strategy_core::XmmPerpView]) -> u32 {
+                let m = out.len().min(self.rows.len());
+                out[..m].copy_from_slice(&self.rows[..m]);
+                self.n
+            }
+        }
+        let mut reg = core_metrics::MetricsRegistry::new();
+        let ids = register_xmm_metrics(&mut reg).expect("register");
+        let mut last = strategy_core::XmmCounters::default();
+        let mut f = Fake {
+            c: strategy_core::XmmCounters::default(),
+            rows: [strategy_core::XmmPerpView::default(); 2],
+            n: 2,
+        };
+        f.c.placed = 9;
+        f.c.pull_cancels = 4;
+        f.c.stuck = 1;
+        f.rows[0].pos_1e6 = 150_000;
+        f.rows[1].pos_1e6 = -20_000;
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[0]).get(), 9, "placed");
+        assert_eq!(reg.counter(ids.counters[4]).get(), 4, "pull_cancels");
+        assert_eq!(reg.counter(ids.counters[16]).get(), 1, "stuck");
+        assert_eq!(reg.gauge(ids.perps).get(), 2);
+        assert_eq!((reg.gauge(ids.pos[0]).get(), reg.gauge(ids.pos[1]).get()), (150_000, -20_000));
+        assert_eq!(reg.gauge(ids.pos[2]).get(), 0, "a perp not quoted reads zero");
+        // The same cumulative counters again add nothing; a move adds
+        // exactly the move.
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[0]).get(), 9);
+        f.c.placed = 12;
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!(reg.counter(ids.counters[0]).get(), 12);
+        // An unconfigured member: the gauges fall to zero.
+        f.n = 0;
+        mirror_xmm_metrics(&reg, &ids, &f, &mut last);
+        assert_eq!((reg.gauge(ids.perps).get(), reg.gauge(ids.pos[0]).get()), (0, 0));
+    }
+
     /// HYPARB H8: the shadow family's size is pinned too, and its mirror
     /// publishes deltas and levels — and nothing at all with no shadow.
     #[test]
@@ -11156,20 +11276,16 @@ mod tests {
         );
         assert!(set.set_regime_label(strategy_set::SLOT_BIN15, label));
         assert_eq!(unlabelled_required_slot(&set, ai_bin15, true), None);
-        // XMM XH1: ai+xmm — xmm carries its own signal (the Binance lead)
-        // but takes NO label at XH1 (it does not gate on the regime yet),
-        // so with the law on a boot that enables it refuses: fail-closed
-        // until XH3 decides xmm's regime behaviour.
+        // XMM XH3: ai+xmm — xmm carries its own signal (the Binance lead),
+        // so with the law on it is refused until labelled; its label is
+        // carried (never consulted — the HORIZON law) and satisfies it.
         let ai_xmm = ai | strategy_set::BIT_XMM;
         assert_eq!(
             unlabelled_required_slot(&set, ai_xmm, true),
             Some(strategy_set::SLOT_XMM)
         );
-        assert!(!set.set_regime_label(strategy_set::SLOT_XMM, label));
-        assert_eq!(
-            unlabelled_required_slot(&set, ai_xmm, true),
-            Some(strategy_set::SLOT_XMM)
-        );
+        assert!(set.set_regime_label(strategy_set::SLOT_XMM, label));
+        assert_eq!(unlabelled_required_slot(&set, ai_xmm, true), None);
     }
 
     /// Boot-surface pin: `Observability::build(true)` registers

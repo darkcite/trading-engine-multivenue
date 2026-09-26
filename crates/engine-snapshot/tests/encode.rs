@@ -67,9 +67,29 @@ fn full_snapshot() -> Box<EngineSnapshot> {
             -1,
         );
     }
-    s.icdp.hash = [0xFF; 32];
-    s.icdp.instruments = u32::MAX;
-    s.icdp.counters.decisions = u64::MAX;
+    // XMM XH3: every perp row at its widest render.
+    s.boot.xmm_hash = [0xFF; 32];
+    s.boot.set_xmm_coins(&[b'"'; 48]); // worst case: every byte escapes
+    s.xmm.n_perps = u32::MAX;
+    s.xmm.counters.placed = u64::MAX;
+    s.xmm.counters.stuck = u64::MAX;
+    for r in s.xmm.perps.iter_mut() {
+        *r = strategy_core::XmmPerpView {
+            pos_1e6: i64::MIN,
+            touch_bid_1e6: i64::MIN,
+            touch_ask_1e6: i64::MIN,
+            bid_px_1e6: i64::MIN,
+            ask_px_1e6: i64::MIN,
+            lead_rx_ns: 1,
+            fol_rx_ns: 1,
+            hl_sym: u32::MAX,
+            lead_sym: u32::MAX,
+            bid_state: u8::MAX,
+            ask_state: u8::MAX,
+            stale_flags: u8::MAX,
+            _pad: [0; 5],
+        };
+    }
     s.ai.cmds = u64::MAX;
     s.ai.last_heartbeat_ns = 1;
     for g in s.ingress.iter_mut() {
@@ -186,7 +206,7 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
         "\"regime\":",
         "\"slots\":",
         "\"vm\":",
-        "\"icdp\":",
+        "\"xmm\":",
         "\"ai\":",
         "\"ingress\":",
         "\"capture\":",
@@ -206,6 +226,12 @@ fn full_snapshot_fits_the_budget_and_is_balanced() {
         body.matches("\"perp_depth_usd_1e6\":").count(),
         engine_snapshot::SNAPSHOT_HYPARB_COINS
     );
+    // XMM XH3: the perp rows are capped at the snapshot's own.
+    assert_eq!(
+        body.matches("\"touch_bid_1e6\":").count(),
+        engine_snapshot::SNAPSHOT_XMM_PERPS
+    );
+    assert!(!body.contains("\"icdp"), "schema 2 retired the icdp block");
     assert_eq!(body.matches("\"ttl_ns\":").count(), RECENT_ORDERS);
     assert_eq!(body.matches("\"oid\":").count(), RECENT_ORDERS + RECENT_FILLS);
     // The run_dir made of quotes escaped every byte.
@@ -312,7 +338,7 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
     let n = encode_state_json(&s, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();
     let expected_head = concat!(
-        "{\"v\":1,\"seq\":3,",
+        "{\"v\":2,\"seq\":3,",
         "\"now\":{\"mono_ns\":\"10000000000\",\"wall_ns\":\"1700000000000000000\",\"uptime_s\":6},",
         "\"boot\":{\"pid\":4242,\"git_sha\":\"3ee1b8b\",\"binary_mtime_ns\":\"0\",",
         "\"boot_wall_ns\":\"1699999994000000000\",\"run_epoch_ns\":\"0\",\"run_dir\":\"/tmp/run-1\",",
@@ -320,7 +346,8 @@ fn fixed_snapshot_renders_byte_exact_header_sections() {
         "\"configured_mask\":113,\"enabled_mask\":112,\"halted\":0,",
         "\"ruleset_hash\":\"00000000000000000000000000000000\",",
         "\"ruleset_staged_hash\":\"00000000000000000000000000000000\",",
-        "\"icdp_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",",
+        "\"xmm_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",",
+        "\"xmm_coins\":\"\",",
         "\"regime_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",",
         "\"regime_configured\":0},",
         "\"counters\":{\"iterations\":5,\"ticks\":6,\"signals\":0,\"fills\":0,\"events\":0,",
@@ -418,4 +445,63 @@ fn the_hyparb_section_renders_counters_pools_and_coins() {
     ));
     assert!(body.contains("\"perp_sym\":83886085"));
     assert!(body.contains("\"perp_pos_1e6\":-1000000"));
+}
+
+/// XMM XH3 (schema 2): the `xmm` object — counters flat, one row per
+/// configured perp (never more than it has), feed ages in ms against the
+/// publish clock, `-1` for a feed never heard.
+#[test]
+fn the_xmm_section_renders_counters_and_perp_rows() {
+    let mut s = Box::new(EngineSnapshot::empty());
+    s.mono_ns = 5_000_000_000;
+    s.boot.xmm_hash = [0xAB; 32];
+    s.boot.set_xmm_coins(b"BTC,SOL");
+    s.xmm.n_perps = 2;
+    s.xmm.counters.placed = 7;
+    s.xmm.counters.fills = 3;
+    s.xmm.counters.stuck = 0;
+    s.xmm.perps[0] = strategy_core::XmmPerpView {
+        pos_1e6: -50_000,
+        touch_bid_1e6: 100_000_000,
+        touch_ask_1e6: 100_010_000,
+        bid_px_1e6: 100_000_000,
+        ask_px_1e6: 0,
+        lead_rx_ns: 4_750_000_000,
+        fol_rx_ns: 0,
+        hl_sym: 0x0500_0002,
+        lead_sym: 0x0100_0005,
+        bid_state: 2,
+        ask_state: 0,
+        stale_flags: 1,
+        _pad: [0; 5],
+    };
+    // A row past n_perps is never rendered.
+    s.xmm.perps[2].hl_sym = 99;
+    let mut buf = vec![0u8; STATE_JSON_MAX];
+    let n = encode_state_json(&s, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains(&format!(
+        "\"xmm_hash\":\"{}\",\"xmm_coins\":\"BTC,SOL\"",
+        "ab".repeat(32)
+    )));
+    assert!(body.contains(concat!(
+        "\"xmm\":{\"configured\":1,\"n_perps\":2,\"placed\":7,\"modifies\":0,",
+        "\"lead_cancels\":0,\"requote_cancels\":0,\"pull_cancels\":0,\"expiry_cancels\":0,",
+        "\"gated\":0,\"gate_overflow\":0,\"capped\":0,\"rejected_alo\":0,\"rejected_other\":0,",
+        "\"canceled\":0,\"filled\":0,\"fills\":3,\"unmatched\":0,\"ctx_refused\":0,\"stuck\":0,",
+        "\"perps\":[{\"hl_sym\":83886082,\"lead_sym\":16777221,\"pos_1e6\":-50000,",
+        "\"touch_bid_1e6\":100000000,\"touch_ask_1e6\":100010000,\"bid_px_1e6\":100000000,",
+        "\"ask_px_1e6\":0,\"bid_state\":2,\"ask_state\":0,\"stale_flags\":1,",
+        "\"lead_age_ms\":250,\"fol_age_ms\":-1},"
+    )));
+    assert_eq!(body.matches("\"touch_bid_1e6\":").count(), 2);
+    assert!(!body.contains("\"hl_sym\":99"));
+    assert_balanced(body.as_bytes());
+
+    // Unconfigured: the object is there, empty.
+    let e = EngineSnapshot::empty();
+    let n = encode_state_json(&e, &mut buf).unwrap();
+    let body = core::str::from_utf8(&buf[..n]).unwrap();
+    assert!(body.contains("\"xmm\":{\"configured\":0,\"n_perps\":0,\"placed\":0,"));
+    assert!(body.contains("\"stuck\":0,\"perps\":[]}"));
 }

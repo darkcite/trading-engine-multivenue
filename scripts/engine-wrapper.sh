@@ -140,8 +140,10 @@ fi
 # `ai+vrp+xsd+bin15+hyparb+xmm`); `icdp` and `ai+icdp` are GONE (the
 # engine refuses them too — the crate keeps only its offline backtest).
 # Its artifact is ~/multivenue/xmm.toml, and an absent one with the bit
-# REQUESTED refuses the boot (the F19 law). The member is DARK at XH1 —
-# it places nothing — and nothing edits strategy.conf for it.
+# REQUESTED refuses the boot (the F19 law). Since XH2 it quotes on the
+# paper queue law; XH3 runs it in paper (the runbook: docs/risk-policy.md,
+# XMM "XH3 amendment" — every descriptor must resolve or the WHOLE boot
+# refuses). A live slot 6 refuses the boot until XH4.
 STRATEGY="ai"
 if [ -f "$HOME/multivenue/strategy.conf" ]; then
   . "$HOME/multivenue/strategy.conf"

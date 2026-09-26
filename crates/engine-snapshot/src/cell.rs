@@ -85,6 +85,9 @@ impl<T: Copy> SnapshotCell<T> {
         // copy, but the version bracket makes them discard any copy
         // that overlapped it (see `Sync` impl note). The pointer is
         // valid, aligned, and owned by `self`.
+        // COPY: the whole `T` once per publish (the engine snapshot:
+        // 28,352 B at XMM XH3, ≤ 32 KiB pinned) — the seqlock's design,
+        // plan §8: readers copy out under the version bracket.
         unsafe { *self.data.get() = *s };
         // Exit the write section: publish the copy to any reader
         // that observes the new even version.
@@ -93,7 +96,7 @@ impl<T: Copy> SnapshotCell<T> {
 
     /// Read the most recent snapshot by value. Lock-free: retries
     /// only while a write is in flight (the writer publishes once per
-    /// second and copies ≤ 24 KB — retries are vanishingly rare).
+    /// second and copies ≈ 28 KB — retries are vanishingly rare).
     /// Never allocates. For a large `T` prefer [`Self::read_into`].
     pub fn read(&self) -> T {
         loop {
@@ -124,7 +127,7 @@ impl<T: Copy> SnapshotCell<T> {
 
     /// Read the most recent snapshot into `out` (same protocol as
     /// [`Self::read`]; the caller owns the destination — the shape
-    /// for the ≈ 24 KB engine snapshot on the server thread).
+    /// for the ≈ 28 KB engine snapshot on the server thread).
     pub fn read_into(&self, out: &mut T) {
         loop {
             let seq1 = self.seq.load(Ordering::Acquire);
@@ -135,6 +138,8 @@ impl<T: Copy> SnapshotCell<T> {
             // SAFETY: see `read` — same racing volatile copy, same
             // discard-on-revalidation law; `out` is a valid, aligned,
             // exclusively borrowed destination.
+            // COPY: the whole `T` per read (≈ 28 KB for the engine
+            // snapshot), the seqlock's reader half — see `publish`.
             unsafe { *out = core::ptr::read_volatile(self.data.get()) };
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == seq1 {

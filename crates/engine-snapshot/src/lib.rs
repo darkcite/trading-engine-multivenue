@@ -8,10 +8,10 @@
 //! engine thread.
 //!
 //! * [`EngineSnapshot`] — ONE `#[repr(C, align(64))]` `Copy` POD
-//!   (≈ 24 KB) holding every dashboard-facing datum: boot identity,
+//!   (≈ 28 KB) holding every dashboard-facing datum: boot identity,
 //!   loop counters, latency percentiles, the regime detector's
 //!   observables, per-slot strategy counters, the vm's active table
-//!   row-by-row, the icdp member, the AI plane, per-venue ingress
+//!   row-by-row, the xmm member, the AI plane, per-venue ingress
 //!   health, capture health and the last 64 orders + 64 fills.
 //! * [`SnapshotCell`] — the single-writer **seqlock** (generic over
 //!   its POD; the `tui` crate's Phase-8a cell, generalized). The
@@ -53,8 +53,8 @@ pub use cell::SnapshotCell;
 pub use json::{encode_state_json, JsonOverflow, STATE_JSON_MAX};
 pub use snapshot::{
     halt_reason_word, AiSnapshot, BootInfo, CaptureSnapshot, EngineSnapshot, ExecSnapshot,
-    HyparbSnapshot, IcdpSnapshot, IngressSnapshot, LatencySnapshot, LoopCounters, RecentRing,
-    VmSnapshot, BOOT_TEXT_MAX, HALT_REASON_WORDS, RECENT_FILLS, RECENT_ORDERS, RUN_DIR_MAX,
+    HyparbSnapshot, IngressSnapshot, LatencySnapshot, LoopCounters, RecentRing, VmSnapshot,
+    XmmSnapshot, BOOT_TEXT_MAX, HALT_REASON_WORDS, RECENT_FILLS, RECENT_ORDERS, RUN_DIR_MAX,
     SLOT_NAMES, SNAPSHOT_HYPARB_COINS, SNAPSHOT_HYPARB_POOLS, SNAPSHOT_SCHEMA, SNAPSHOT_SLOTS,
-    SNAPSHOT_VENUES, VENUE_NAMES,
+    SNAPSHOT_VENUES, SNAPSHOT_XMM_PERPS, VENUE_NAMES,
 };

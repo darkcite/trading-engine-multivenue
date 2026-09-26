@@ -6,6 +6,61 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — `/state` schema 2: `xmm` replaces `icdp`; `engine_xmm_*`; `[labels.xmm]`; audit-pnl reads the queue venue's prints (XMM XH3)
+
+**What changed**
+
+- `/state` `"v"` is **2**. The `icdp` object and `boot.icdp_hash` are
+  GONE (slot 6 has been xmm since XH1; they read zeros). New: the `xmm`
+  object (`configured`, `n_perps`, the member's 17 counters flat, and
+  `perps[]` — one row per quoted perp: `hl_sym`, `lead_sym`, `pos_1e6`,
+  the follower touch, our bid/ask price and state (0 none, 1 sent,
+  2 resting, 3 cancelling), `stale_flags`, and the leader's / follower's
+  age in ms, `-1` = never), `boot.xmm_hash` (sha256 of `xmm.toml`) and
+  `boot.xmm_coins` (the row names, `"BTC,ETH,SOL,XRP"`).
+- `/metrics`: the 14 `engine_icdp_*_total` counters are GONE; new
+  `engine_xmm_{placed,modifies,lead_cancels,requote_cancels,pull_cancels,
+  expiry_cancels,gated,gate_overflow,capped,rejected_alo,rejected_other,
+  canceled,filled,fills,unmatched,ctx_refused,stuck}_total`,
+  `engine_xmm_perps` and `engine_xmm_p{0..3}_pos_1e6`.
+- `regime.toml`: `[labels.xmm]` parses (the label is carried and never
+  consulted — the HORIZON law, bin15's precedent), so `[labels]
+  require = 1` can boot xmm enabled. The same list now names `bin15`
+  (which the boot always mapped) and no longer `rule_tree` (which it
+  never could): `[labels.bin15]` parses; `[labels.rule_tree]` is refused
+  at the grammar instead of at resolve — the same refusal, earlier.
+- `audit-pnl` reads the queue venue's trade prints (`hl-events.pmlr`
+  `Trade` rows) for a run with a post-only maker in it — only inside that
+  run's ticks — and every engine tracks the syms a post-only maker
+  placed on, so slot-6 queue orders fill there by the queue law (before,
+  never). Such a run prints one more stderr line
+  (`queue-orders=… queue-prints=…`); every other run reports byte for
+  byte as before, and the stdout JSON shape is unchanged
+  (`audit_pnl_version` stays 2).
+- The queue law (`core_fill::queue`, post-only makers on Hyperliquid —
+  only xmm): off the parity switch, a record of ANY symbol of the venue
+  lands what is due on every tracked perp (the block is the venue's), so
+  a quiet book no longer holds a cancel back. The paper matcher,
+  `backtest --member xmm` and `audit-pnl` follow; `xmm-parity` keeps the
+  simulator's per-symbol clock.
+- The dashboard (`dashboard.html`) shows an xmm block under the slot
+  table and `xmm.toml` in the config panel (the worker's
+  `config.xmm = {hash, quoted}` replaced `config.icdp`); it renders an
+  older engine's `/state` v1 as "n/a".
+- The xmm boot tell says `phase=XH3(paper)`; `/state` `slots[6].
+  orders_dropped` now reads the member's refused sends.
+
+**Operator action**: none required. To run xmm in paper, follow the
+runbook in `docs/risk-policy.md` (XMM, "XH3 amendment"): the release
+build first; the pre-flight that every descriptor resolves (an
+unresolvable one refuses the WHOLE boot); `~/multivenue/xmm.toml` (copy
+`xmm.toml.example`, the probe); `+xmm` in `STRATEGY` last (the allowed
+name is `ai+vrp+xsd+bin15+hyparb+xmm`), outside the quiet windows; a
+supervised restart and the post-boot checks.
+
+**Rollback**: revert the XH3 commit. A `/state` reader that required
+`icdp` must read `"v"` first; the dashboard reads either.
+
 ## 2026-09-26 — The queue law; `ORDER_FLAG_POST_ONLY`; paper order events; the xmm policy; `xmm-parity` (XMM XH2)
 
 **What changed**

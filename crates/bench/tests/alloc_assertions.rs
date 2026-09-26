@@ -3430,6 +3430,9 @@ fn xmm_member_place_lead_cancel_events_fills_are_zero_alloc() {
 
     const CYCLES: u64 = 10_000;
     const STEP: u64 = 10_000_000;
+    let mut seen = strategy_core::XmmCounters::default();
+    let mut rows = [strategy_core::XmmPerpView::default(); strategy_xmm::XMM_MAX_PERPS];
+    let mut viewed = 0u64;
     let g = AllocGuard::new();
     let mut i = 0u64;
     while i < CYCLES {
@@ -3447,15 +3450,23 @@ fn xmm_member_place_lead_cancel_events_fills_are_zero_alloc() {
         m.on_order_event(&ev(ask, ORDER_EVENT_FILLED), &mut ctx);
         m.on_order_event(&ev(bid, ORDER_EVENT_CANCELED), &mut ctx);
         m.on_timer(ctx.now, &mut ctx);
+        // XMM XH3: what the 1 s `/state` publish and the 5 s metrics
+        // mirror read from the member.
+        strategy_core::StrategyCounters::xmm_counters(&m, &mut seen);
+        viewed = viewed.wrapping_add(u64::from(strategy_core::StrategyCounters::xmm_perps_view(
+            &m, &mut rows,
+        )));
         i += 1;
     }
     std::hint::black_box(ctx.cancels);
+    std::hint::black_box((seen, rows, viewed));
 
     let (allocs, bytes, _deallocs) = g.delta();
     let c = m.counters();
     assert_eq!(c.placed, 2 * CYCLES, "both sides every cycle");
     assert_eq!(c.lead_cancels, CYCLES, "the bid pulled every cycle");
     assert_eq!((c.filled, c.canceled, c.stuck), (CYCLES, CYCLES, 0));
+    assert_eq!((seen, viewed), (c, CYCLES), "the accessors read the member");
     assert_eq!(allocs, 0, "xmm member allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "xmm member bytes should be zero: saw {bytes}");
 }
@@ -5443,8 +5454,9 @@ fn regime_on_tick_and_minute_roll_are_zero_alloc() {
 }
 
 /// RG6 gate 43 (`docs/regime-and-dashboard-plan.md` §7): the `/state`
-/// path — a FULL `EngineSnapshot` (256 vm rows, 64 + 64 recents, every
-/// text field at capacity) published into the seqlock, read back into
+/// path — a FULL `EngineSnapshot` (256 vm rows, 64 + 64 recents, the
+/// eight xmm perp rows since XMM XH3, every text field at capacity)
+/// published into the seqlock, read back into
 /// the server thread's scratch and encoded as JSON into a 256 KiB
 /// response buffer, 1 000 times — allocates nothing. Truncation is a
 /// test failure (the encoder refuses, never truncates).
@@ -5453,9 +5465,9 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
     use core_types::{Fill, Order, Price, Qty, Side, VenueId, RULE_TABLE_ROWS};
     use engine_snapshot::{
         encode_state_json, EngineSnapshot, SnapshotCell, RECENT_FILLS, RECENT_ORDERS,
-        RUN_DIR_MAX,
+        RUN_DIR_MAX, SNAPSHOT_XMM_PERPS,
     };
-    use strategy_core::VmRowView;
+    use strategy_core::{VmRowView, XmmPerpView};
 
     // Boot-time construction (allocation sanctioned): the cell, the
     // engine-side scratch, the server-side scratch, the response buf.
@@ -5463,6 +5475,29 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
     let mut scratch = Box::new(EngineSnapshot::empty());
     scratch.boot.set_git_sha(&[b'f'; 48]);
     scratch.boot.set_run_dir(&[b'r'; RUN_DIR_MAX]);
+    // XMM XH3: the xmm block at its widest — every coin byte escapes,
+    // all eight rows at full width, both `age_ms` arms (one feed never
+    // heard).
+    scratch.boot.xmm_hash = [0xFF; 32];
+    scratch.boot.set_xmm_coins(&[b'"'; 48]);
+    scratch.xmm.n_perps = SNAPSHOT_XMM_PERPS as u32;
+    for (i, r) in scratch.xmm.perps.iter_mut().enumerate() {
+        *r = XmmPerpView {
+            pos_1e6: i64::MIN,
+            touch_bid_1e6: i64::MIN,
+            touch_ask_1e6: i64::MIN,
+            bid_px_1e6: i64::MIN,
+            ask_px_1e6: i64::MIN,
+            lead_rx_ns: if i == 0 { 0 } else { 1 },
+            fol_rx_ns: 1,
+            hl_sym: u32::MAX,
+            lead_sym: u32::MAX,
+            bid_state: u8::MAX,
+            ask_state: u8::MAX,
+            stale_flags: u8::MAX,
+            _pad: [0; 5],
+        };
+    }
     scratch.set_strategy_kind(b"set");
     scratch.vm.rows_active = RULE_TABLE_ROWS as u32;
     for (i, r) in scratch.vm.rows.iter_mut().enumerate() {
@@ -5516,6 +5551,10 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
 
     let (allocs, bytes, _deallocs) = g.delta();
     assert!(acc > 0);
+    let n = encode_state_json(&server_scratch, &mut resp).expect("fits");
+    let body = core::str::from_utf8(&resp[..n]).expect("utf-8");
+    assert_eq!(body.matches("\"touch_bid_1e6\":").count(), SNAPSHOT_XMM_PERPS);
+    assert!(body.contains("\"lead_age_ms\":-1"), "the never-heard arm ran");
     assert_eq!(
         allocs, 0,
         "/state publish+read+encode allocated {allocs} times ({bytes} B)"

@@ -908,6 +908,16 @@ impl StrategyCounters for StrategySet {
     fn hyparb_coins_view(&self, out: &mut [strategy_core::HyparbCoinView]) -> u32 {
         self.hyparb.hyparb_coins_view(out)
     }
+    /// XMM XH3: slot 6's counters and per-perp rows (`/metrics`,
+    /// `/state`). An unconfigured member reports zeros and no rows.
+    #[inline]
+    fn xmm_counters(&self, out: &mut strategy_core::XmmCounters) {
+        self.xmm.xmm_counters(out);
+    }
+    #[inline]
+    fn xmm_perps_view(&self, out: &mut [strategy_core::XmmPerpView]) -> u32 {
+        self.xmm.xmm_perps_view(out)
+    }
     #[inline]
     fn hyparb_decision_log(&self) -> (&[strategy_core::HyparbDecision], u64) {
         self.hyparb.hyparb_decision_log()

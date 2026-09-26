@@ -62,8 +62,8 @@ impl From<IcdpError> for RegimeConfigError {
 /// One `[labels.<member>]` override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelOverride {
-    /// The coded member's name (`hyparb`, `vrp`, `xsd`, `rule_tree`,
-    /// `ai_exec`).
+    /// The coded member's name (`hyparb`, `vrp`, `xsd`, `bin15`,
+    /// `ai_exec`, `xmm`).
     pub member: String,
     /// The parsed label set.
     pub set: RegimeLabelSet,
@@ -152,10 +152,16 @@ const PROFILE_KEYS: [&str; 22] = [
 /// slot 0 is `hyparb`.**
 ///
 /// **XMM XH1 (2026-09-26): `icdp` is GONE the same way.** Slot 6 is
-/// `xmm`, which takes no label yet: it joins this list when its gate is
-/// wired, and until then `[labels] require = 1` refuses to boot it
-/// enabled (fail-closed).
-const MEMBER_NAMES: [&str; 5] = ["hyparb", "vrp", "xsd", "rule_tree", "ai_exec"];
+/// `xmm`.
+///
+/// **XMM XH3 (2026-09-26): `xmm` joins the list** — its label is carried
+/// (so `[labels] require = 1` can boot it enabled) and never consulted
+/// (the HORIZON law, bin15's precedent). The same change repairs a
+/// BIN15 O4b leftover: this list still named `rule_tree` (which the boot
+/// could never resolve) and not `bin15` (which it maps), so
+/// `[labels.bin15]` was refused here and `require = 1` could never boot
+/// bin15 enabled.
+const MEMBER_NAMES: [&str; 6] = ["hyparb", "vrp", "xsd", "bin15", "ai_exec", "xmm"];
 
 type Kv = Vec<(String, Value, usize)>;
 
@@ -740,21 +746,26 @@ mod tests {
         assert!(err.0.contains("unknown coded member"), "{}", err.0);
     }
 
-    /// XMM XH1 (2026-09-26): slot 6 is `xmm` and takes no label yet, so
-    /// `[labels.icdp]` is refused at the grammar for the same reason
-    /// `[labels.ev]` is — and so is `[labels.xmm]`, until its gate exists.
+    /// XMM XH1/XH3 (2026-09-26): slot 6 is `xmm`, so `[labels.icdp]` is
+    /// refused at the grammar for the same reason `[labels.ev]` is, and
+    /// `[labels.xmm]` parses (XH3). `rule_tree` is gone the same way and
+    /// `bin15` — which the boot always mapped — finally parses too.
     #[test]
-    fn slot_six_takes_no_label_and_icdp_is_refused() {
+    fn slot_six_is_xmm_icdp_and_rule_tree_are_refused_bin15_parses() {
         let with = |member: &str| {
             format!(
                 "{EXAMPLE}\n[labels.{member}]\noff = \"soft\"\nterm1 = [\"fast:shape:trend\"]\n"
             )
         };
-        for gone in ["icdp", "xmm"] {
-            let err = parse(&with(gone)).expect_err("slot 6 takes no label at XH1");
+        for gone in ["icdp", "rule_tree"] {
+            let err = parse(&with(gone)).expect_err("a retired name is refused");
             assert!(err.0.contains("unknown coded member"), "{gone}: {}", err.0);
         }
-        assert!(parse(&with("ai_exec")).is_ok(), "the other names are untouched");
+        for name in ["xmm", "bin15", "ai_exec"] {
+            let ok = parse(&with(name)).unwrap_or_else(|e| panic!("[labels.{name}]: {}", e.0));
+            assert_eq!(ok.labels.len(), 1);
+            assert_eq!(ok.labels[0].member, name);
+        }
     }
 
     #[test]

@@ -411,6 +411,24 @@ pub trait StrategyCounters {
         0
     }
 
+    /// XMM XH3: the slot-6 member's counters (`engine_xmm_*_total`,
+    /// `/state` `xmm`), written into `out` — the snapshot's own field on
+    /// the 1 s publish, so nothing is returned by value. Zeroes for every
+    /// strategy but the set carrying a configured xmm member.
+    #[inline]
+    fn xmm_counters(&self, out: &mut XmmCounters) {
+        *out = XmmCounters::default();
+    }
+
+    /// XMM XH3: copy the per-perp view into `out` (`min(out.len())`
+    /// rows), returning how many perps are CONFIGURED. Cold path (the
+    /// 1 s publish); never allocates.
+    #[inline]
+    fn xmm_perps_view(&self, out: &mut [XmmPerpView]) -> u32 {
+        let _ = out;
+        0
+    }
+
     /// HYPARB H8/H9: the member's AMM decision log, BORROWED — a ring of
     /// [`HYPARB_DECISION_LOG`] entries indexed by `seq %
     /// HYPARB_DECISION_LOG` (an entry whose `seq` is not the one its slot
@@ -1194,6 +1212,94 @@ pub struct HyparbDecision {
     pub _pad: [u8; 3],
 }
 const _: () = assert!(core::mem::size_of::<HyparbDecision>() == 48);
+
+/// XMM (slot 6) counters — what the member did, cumulatively
+/// (`engine_xmm_*_total`, `/state` `xmm`, the harness lines). Defined
+/// HERE for the reason [`IcdpCounters`] is: the cli never names a
+/// member crate. POD.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XmmCounters {
+    /// Post-only orders placed (fresh placements, not modifies).
+    pub placed: u64,
+    /// Requotes sent as a modify (E-7).
+    pub modifies: u64,
+    /// Cancels sent by the LEAD rule.
+    pub lead_cancels: u64,
+    /// Cancels sent to requote (the parity switch, a requote the gate
+    /// or the caps would not re-place, a modify the arm refused, or a
+    /// refused replacement's predecessor).
+    pub requote_cancels: u64,
+    /// Cancels sent by a safety pull (a stale leader or follower).
+    pub pull_cancels: u64,
+    /// Cancels the member sent itself at its order's TTL (LAW E-8's
+    /// member half; the venue's or the paper model's expiry normally
+    /// lands first).
+    pub expiry_cancels: u64,
+    /// Placements the gate held back.
+    pub gated: u64,
+    /// Placements held back because the leader's history overflowed the
+    /// gate window (fail-closed; must stay 0 at the ring's size).
+    pub gate_overflow: u64,
+    /// Placements a cap held back.
+    pub capped: u64,
+    /// Orders the venue rejected for crossing (`BAD_ALO_PX`) —
+    /// information, not a fault (XH-7).
+    pub rejected_alo: u64,
+    /// Orders rejected for any other reason.
+    pub rejected_other: u64,
+    /// Orders that ended cancelled (requested, replaced or expired).
+    pub canceled: u64,
+    /// Orders that ended filled.
+    pub filled: u64,
+    /// Fills received.
+    pub fills: u64,
+    /// Fills or events naming no order of ours (a race, or a bug when
+    /// large).
+    pub unmatched: u64,
+    /// Submits, cancels or modifies the ctx refused.
+    pub ctx_refused: u64,
+    /// Sides released after waiting 10 s on a final event (a
+    /// best-effort cancel goes out for what they held). Must stay 0.
+    pub stuck: u64,
+}
+const _: () = assert!(core::mem::size_of::<XmmCounters>() == 17 * 8);
+
+/// XMM XH3: one quoted perp's row, read at one instant — the follower's
+/// touch, our two quotes on it, what the member holds and how old each
+/// feed is (the `/state` `xmm.perps` array).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XmmPerpView {
+    /// Signed position from the member's own fills, base × 1e6.
+    pub pos_1e6: i64,
+    /// The follower's (Hyperliquid) bid, × 1e6 (0 = no fresh book yet).
+    pub touch_bid_1e6: i64,
+    /// The follower's ask, × 1e6 (0 = no fresh book yet).
+    pub touch_ask_1e6: i64,
+    /// Our bid's price, × 1e6 (0 = no bid).
+    pub bid_px_1e6: i64,
+    /// Our ask's price, × 1e6 (0 = no ask).
+    pub ask_px_1e6: i64,
+    /// Engine-monotonic ns of the leader's last fresh update (0 = none).
+    pub lead_rx_ns: u64,
+    /// Engine-monotonic ns of the follower's last update (0 = none).
+    pub fol_rx_ns: u64,
+    /// The Hyperliquid perp.
+    pub hl_sym: u32,
+    /// Its Binance USDⓈ-M leader.
+    pub lead_sym: u32,
+    /// Our bid: 0 none, 1 sent, 2 resting, 3 cancelling.
+    pub bid_state: u8,
+    /// Our ask, as `bid_state`.
+    pub ask_state: u8,
+    /// Bit 0: the follower's last update was flagged stale; bit 1: the
+    /// leader's.
+    pub stale_flags: u8,
+    /// Padding.
+    pub _pad: [u8; 5],
+}
+const _: () = assert!(core::mem::size_of::<XmmPerpView>() == 72);
 
 /// BIN15 counters (`engine_bin15_*`), mirrored by the cli's generic 5 s
 /// block. Defined HERE for the reason [`IcdpCounters`] is.
@@ -2158,6 +2264,16 @@ mod tests {
         let mut out = [XsdPositionView::default(); 2];
         assert_eq!(s.xsd_positions_view(&mut out), 0);
         assert_eq!(out, [XsdPositionView::default(); 2]);
+        // XMM (slot 6): zero counters, and the view buffer untouched.
+        let mut c = XmmCounters {
+            placed: 9,
+            ..XmmCounters::default()
+        };
+        s.xmm_counters(&mut c);
+        assert_eq!(c, XmmCounters::default());
+        let mut rows = [XmmPerpView::default(); 2];
+        assert_eq!(s.xmm_perps_view(&mut rows), 0);
+        assert_eq!(rows, [XmmPerpView::default(); 2]);
     }
 
     #[test]

@@ -541,7 +541,7 @@ Proven live 2026-08-30: 1,669 frames, 52 funding descriptors, `cmds_total` 1674,
 | `parity` | `python -m claude_worker.parity --window-h 48` | `engine-orders.pmlr` only | s4-vs-s5 verdict (§10) |
 | `audit-replay` | `multivenue-engine audit-replay --dir run-<ns>` | the whole run dir | cadence/integrity verdicts + the full AI-command chain |
 | `/metrics` | `127.0.0.1:9191/metrics` | live counters | `engine_vm_*`, `engine_ai_ruleset_*`, `engine_ingress_ai_*`, `engine_regime_*` |
-| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 1` — boot / regime words + per-row gate bytes / slots / vm rows / icdp / ai / ingress / recent orders + fills |
+| `/state` | `127.0.0.1:9191/state` (RG6) | the 1 s engine snapshot | JSON `v: 2` — boot / regime words + per-row gate bytes / slots / vm rows / xmm (was icdp until v2) / ai / ingress / recent orders + fills |
 | dashboard | `http://127.0.0.1:9292/` (`python -m claude_worker.dashboard`) | `/state` + `/metrics` proxied, `state.db`, reports, regime history, configs | the read-only operator page (no controls) |
 | `regime soak` | `python -m claude_worker.regime soak` (RG7) | the regime history + the runs' complete ≤ 2 h windows + the nightly reports | the pooled soak verdict (`~/multivenue/worker/regime/soak-<utc>.json`) |
 

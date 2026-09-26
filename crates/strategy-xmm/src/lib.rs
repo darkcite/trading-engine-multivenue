@@ -52,7 +52,10 @@ use core_types::{
     ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REJECTED,
     ORDER_EVENT_RESTING, SYMBOL_ID_NONE,
 };
-use strategy_core::{Ctx, Strategy, StrategyCounters, StrategyError, SubmitErr};
+use strategy_core::{Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr};
+/// The member's counters and per-perp view live in `strategy-core` (the
+/// cli mirrors them without naming this crate).
+pub use strategy_core::{XmmCounters, XmmPerpView};
 
 /// Perps one artifact may configure (plan §5.1: fixed arrays of at most
 /// eight). Mirrored by `core_config::xmm::XMM_MAX_PERPS`.
@@ -290,53 +293,6 @@ impl XmmParams {
     }
 }
 
-/// What the member did, cumulatively (the harness lines, and `/metrics`
-/// and `/state` from XH3).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct XmmCounters {
-    /// Post-only orders placed (fresh placements, not modifies).
-    pub placed: u64,
-    /// Requotes sent as a modify (E-7).
-    pub modifies: u64,
-    /// Cancels sent by the LEAD rule.
-    pub lead_cancels: u64,
-    /// Cancels sent to requote (the parity switch, a requote the gate or
-    /// the caps would not re-place, or a modify the arm refused).
-    pub requote_cancels: u64,
-    /// Cancels sent by a safety pull (a stale leader or follower).
-    pub pull_cancels: u64,
-    /// Cancels the member sent itself at its order's TTL (LAW E-8's
-    /// member half; the venue's or the paper model's expiry normally
-    /// lands first).
-    pub expiry_cancels: u64,
-    /// Placements the gate held back.
-    pub gated: u64,
-    /// Placements held back because the leader's history overflowed the
-    /// gate window (fail-closed; must stay 0 at the ring's size).
-    pub gate_overflow: u64,
-    /// Placements a cap held back.
-    pub capped: u64,
-    /// Orders the venue rejected for crossing (`BAD_ALO_PX`) — information,
-    /// not a fault (XH-7).
-    pub rejected_alo: u64,
-    /// Orders rejected for any other reason.
-    pub rejected_other: u64,
-    /// Orders that ended cancelled (requested, replaced or expired).
-    pub canceled: u64,
-    /// Orders that ended filled.
-    pub filled: u64,
-    /// Fills received.
-    pub fills: u64,
-    /// Fills or events naming no order of ours (a race, or a bug when
-    /// large).
-    pub unmatched: u64,
-    /// Submits, cancels or modifies the ctx refused.
-    pub ctx_refused: u64,
-    /// Sides released after waiting [`XMM_STUCK_NS`] on a final event
-    /// (a best-effort cancel goes out for what they held). Must stay 0.
-    pub stuck: u64,
-}
-
 /// One side's order. The FIRST fields are the hot ones. One cache line.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
@@ -515,6 +471,9 @@ pub struct XmmStrategy {
     seq: u32,
     orders_emitted: u64,
     counters: XmmCounters,
+    /// XH3: the label the set stamps (`regime.toml [labels.xmm]`),
+    /// carried and never consulted — see [`Strategy::on_regime`] below.
+    regime_label: core_types::RegimeLabelSet,
 }
 
 impl Default for XmmStrategy {
@@ -561,6 +520,7 @@ impl XmmStrategy {
                 ctx_refused: 0,
                 stuck: 0,
             },
+            regime_label: core_types::RegimeLabelSet::ANY,
         }
     }
 
@@ -863,11 +823,15 @@ impl XmmStrategy {
         }
         let oid = self.next_oid();
         let o = self.order(k, s, px, qty, oid, now);
-        if ctx.modify(prev, o).is_err() {
-            // Refused (a full table, or the order already gone and its
-            // final event on its way): nothing was replaced. Cancel what
-            // rests rather than retry on every update.
-            self.counters.ctx_refused += 1;
+        if let Err(e) = ctx.modify(prev, o) {
+            // Nothing was replaced. The order already gone (its final
+            // event on its way) is a race, exactly as `cancel` treats it;
+            // anything else is a refusal and counted. Either way the
+            // member cancels what may rest rather than retry on every
+            // update.
+            if !matches!(e, SubmitErr::NoSuchOrder) {
+                self.counters.ctx_refused += 1;
+            }
             self.cancel(k, s, now, WHY_REQUOTE, ctx);
             return;
         }
@@ -1060,8 +1024,48 @@ impl StrategyCounters for XmmStrategy {
         self.orders_emitted
     }
 
+    /// What the member wanted to send and the ctx refused (submits,
+    /// cancels, modifies) — the slot's `orders_dropped` on `/state`.
+    fn orders_dropped(&self) -> u64 {
+        self.counters.ctx_refused
+    }
+
     fn strategy_kind(&self) -> &'static str {
         "xmm"
+    }
+
+    fn xmm_counters(&self, out: &mut XmmCounters) {
+        // COPY: 136 B (`XmmCounters`, pinned 17 × 8) into the caller's own
+        // field — the 1 s `/state` publish and the 5 s mirror; the snapshot
+        // must own its counters (nothing is borrowed across the seqlock).
+        *out = self.counters;
+    }
+
+    fn xmm_perps_view(&self, out: &mut [XmmPerpView]) -> u32 {
+        let n = self.n();
+        let m = if out.len() < n { out.len() } else { n };
+        let mut k = 0usize;
+        while k < m {
+            let i = &self.inst[k];
+            let (b, a) = (&i.quotes[BID], &i.quotes[ASK]);
+            out[k] = XmmPerpView {
+                pos_1e6: i.pos_1e6,
+                touch_bid_1e6: i.f_bid,
+                touch_ask_1e6: i.f_ask,
+                bid_px_1e6: if b.state == ST_IDLE { 0 } else { b.px_1e6 },
+                ask_px_1e6: if a.state == ST_IDLE { 0 } else { a.px_1e6 },
+                lead_rx_ns: i.l_rx_ns,
+                fol_rx_ns: i.f_rx_ns,
+                hl_sym: self.params.perps[k].hl_sym,
+                lead_sym: self.params.perps[k].lead_sym,
+                bid_state: b.state,
+                ask_state: a.state,
+                stale_flags: u8::from(i.f_stale) | (u8::from(i.l_stale) << 1),
+                _pad: [0; 5],
+            };
+            k += 1;
+        }
+        n as u32
     }
 }
 
@@ -1232,6 +1236,27 @@ impl Strategy for XmmStrategy {
         }
     }
 
+    /// The regime word is accepted and NOT consulted — the HORIZON law
+    /// (bin15's precedent): the regime lane is measured on 4 h–8 h
+    /// horizons, and a quote that lives for seconds and is scored on a
+    /// 5 s markout is not one of its cells. The XH-2 pulls, the caps and
+    /// the arm's halts are this member's off switches.
+    fn on_regime<C: Ctx>(&mut self, _gate: RegimeGate, _ctx: &mut C) {}
+
+    /// The label the set stamps, CARRIED so `regime.toml [labels.xmm]`
+    /// behaves like every other coded member's (and satisfies
+    /// `[labels] require = 1`) — never consulted, per the HORIZON law.
+    #[inline]
+    fn regime_label(&self) -> core_types::RegimeLabelSet {
+        self.regime_label
+    }
+
+    #[inline]
+    fn set_regime_label(&mut self, set: core_types::RegimeLabelSet) -> bool {
+        self.regime_label = set;
+        true
+    }
+
     fn on_stop<C: Ctx>(&mut self, _ctx: &mut C) {}
 }
 
@@ -1283,6 +1308,8 @@ mod tests {
         modifies: Vec<(u64, Order)>,
         refuse: bool,
         refuse_modify: bool,
+        /// The venue has already ended every order a modify names.
+        gone: bool,
     }
 
     impl Ctx for Rec {
@@ -1303,6 +1330,9 @@ mod tests {
         fn modify(&mut self, prev: u64, order: Order) -> Result<(), SubmitErr> {
             if self.refuse || self.refuse_modify {
                 return Err(SubmitErr::Unsupported);
+            }
+            if self.gone {
+                return Err(SubmitErr::NoSuchOrder);
             }
             self.modifies.push((prev, order));
             Ok(())
@@ -1750,6 +1780,26 @@ mod tests {
         assert_eq!(s.quote_states(0).0, ST_CANCELING);
     }
 
+    /// A modify of an order the venue already ended (its final event in
+    /// flight) is a race, not a refusal — `ctx_refused` must stay 0 in
+    /// normal flow; the member still cancels and waits for the event.
+    #[test]
+    fn a_modify_of_an_order_already_gone_is_a_race_not_a_refusal() {
+        let (mut s, mut c) = started(&valid());
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        let bid = c.placed[0].client_oid;
+        s.on_order_event(&event(bid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.now += 300 * MS;
+        s.on_tick(&tick(BN, 99_990_000, 100_010_000), &mut c);
+        c.gone = true;
+        s.on_tick(&tick(HL, 100_005_000, ASK_PX), &mut c);
+        assert_eq!(s.counters().ctx_refused, 0);
+        assert_eq!(s.counters().requote_cancels, 1);
+        assert_eq!(s.quote_states(0).0, ST_CANCELING);
+        s.on_order_event(&event(bid, ORDER_EVENT_CANCELED, 3), &mut c);
+        assert_eq!(s.quote_states(0).0, ST_IDLE);
+    }
+
     #[test]
     fn the_member_takes_back_its_own_order_at_the_ttl() {
         let mut p = valid();
@@ -1784,5 +1834,87 @@ mod tests {
         s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
         assert!(c.placed.is_empty(), "no history ⇒ closed, not open");
         assert_eq!(s.counters().gate_overflow, 2);
+    }
+
+    #[test]
+    fn the_perps_view_reads_the_touch_our_quotes_and_the_position() {
+        let (mut s, mut c) = started(&valid());
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        let bid = c.placed[0].client_oid;
+        s.on_order_event(&event(bid, ORDER_EVENT_RESTING, 0), &mut c);
+        let f = Fill::new(c.now, HL, Side::Bid, Price::from_raw(BID_PX), Qty::from_raw(50_000), bid);
+        s.on_fill(&f, &mut c);
+        let mut rows = [XmmPerpView::default(); XMM_MAX_PERPS];
+        assert_eq!(s.xmm_perps_view(&mut rows), 2, "every configured perp is reported");
+        let r = rows[0];
+        assert_eq!((r.hl_sym, r.lead_sym), (HL, BN));
+        assert_eq!((r.touch_bid_1e6, r.touch_ask_1e6), (BID_PX, ASK_PX));
+        assert_eq!((r.bid_state, r.ask_state), (ST_RESTING, ST_PENDING));
+        assert_eq!((r.bid_px_1e6, r.ask_px_1e6), (BID_PX, ASK_PX));
+        assert_eq!(r.pos_1e6, 50_000);
+        assert_eq!((r.lead_rx_ns, r.fol_rx_ns), (c.now, c.now));
+        assert_eq!(r.stale_flags, 0);
+        // The second perp has no book yet: no quotes, no touch.
+        assert_eq!((rows[1].bid_state, rows[1].touch_bid_1e6, rows[1].bid_px_1e6), (ST_IDLE, 0, 0));
+        assert_eq!(rows[2], XmmPerpView::default(), "rows past n_perps untouched");
+        // A short buffer gets what fits; the count still says how many.
+        let mut one = [XmmPerpView::default(); 1];
+        assert_eq!(s.xmm_perps_view(&mut one), 2);
+        assert_eq!(one[0], r);
+        // Through the trait, as the cli reads it.
+        let mut c = XmmCounters::default();
+        StrategyCounters::xmm_counters(&s, &mut c);
+        assert_eq!(c, s.counters());
+        assert_eq!(c.fills, 1);
+    }
+
+    #[test]
+    fn an_unconfigured_member_reports_no_rows_and_stale_flags_show() {
+        let s = XmmStrategy::new();
+        let mut rows = [XmmPerpView::default(); 2];
+        assert_eq!(s.xmm_perps_view(&mut rows), 0);
+        assert_eq!(rows, [XmmPerpView::default(); 2]);
+        let mut c = XmmCounters::default();
+        s.xmm_counters(&mut c);
+        assert_eq!(c, XmmCounters::default());
+
+        let (mut s, mut c) = started(&valid());
+        let mut stale = tick(HL, BID_PX, ASK_PX);
+        stale.flags |= core_types::TICK_FLAG_STALE;
+        s.on_tick(&stale, &mut c);
+        let mut lead = tick(BN, 99_990_000, 100_010_000);
+        lead.flags |= core_types::TICK_FLAG_STALE;
+        s.on_tick(&lead, &mut c);
+        let mut rows = [XmmPerpView::default(); 1];
+        s.xmm_perps_view(&mut rows);
+        assert_eq!(rows[0].stale_flags, 0b11, "follower bit 0, leader bit 1");
+    }
+
+    #[test]
+    fn the_regime_label_is_carried_and_never_consulted() {
+        let (mut s, mut c) = started(&valid());
+        assert_eq!(s.regime_label(), core_types::RegimeLabelSet::ANY);
+        let label = core_types::RegimeLabelSet::from_terms(&[], core_types::REGIME_OFF_HARD)
+            .expect("an empty hard-off set is well formed");
+        assert!(s.set_regime_label(label), "xmm accepts the boot override");
+        assert_eq!(s.regime_label(), label);
+        // A hard-closed gate neither pulls nor blocks (the HORIZON law).
+        s.on_regime(
+            RegimeGate::new([core_types::RegimeWord::UNKNOWN; 4], false, core_types::REGIME_OFF_HARD),
+            &mut c,
+        );
+        assert!(c.cancels.is_empty());
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        assert_eq!(c.placed.len(), 2, "quotes go out whatever the regime says");
+    }
+
+    #[test]
+    fn orders_dropped_is_what_the_ctx_refused() {
+        let (mut s, mut c) = started(&valid());
+        c.refuse = true;
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        assert_eq!(s.counters().ctx_refused, 2);
+        assert_eq!(StrategyCounters::orders_dropped(&s), 2);
+        assert_eq!(StrategyCounters::orders_emitted(&s), 0);
     }
 }

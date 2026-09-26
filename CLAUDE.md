@@ -23,9 +23,10 @@ O-H8; boots only with `~/multivenue/hyparb.toml` + the pool ingress, H5;
 `latency-arb` unlinked, its name refuses the boot) · 1 vrp ·
 2 xsd · 3 bin15 · 4 ai-exec (AI door 1, intents) · 5 ruleset VM (AI door 2,
 tables) · 6 xmm (HL post-only maker, since XMM XH1 2026-09-26; quotes on the
-queue law since XH2, paper only — no `strategy.conf` names it before XH3;
-boots only with `~/multivenue/xmm.toml`; `icdp` unlinked, its name refuses
-the boot, `backtest --member icdp` stays) · 7 open. Member timers run per
+queue law since XH2, paper only; `/state` `xmm` block, `engine_xmm_*`,
+`[labels.xmm]` and audit-pnl prints since XH3; boots only with
+`~/multivenue/xmm.toml`; `icdp` unlinked, its name refuses the boot,
+`backtest --member icdp` stays) · 7 open. Member timers run per
 slot (each on its own period). The engine boots the mask named in
 `~/multivenue/strategy.conf` through `scripts/engine-wrapper.sh` (allow-list
 in the script; `ai` = 48 is the floor every name includes).

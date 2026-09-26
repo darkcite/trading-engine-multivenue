@@ -65,8 +65,10 @@ fn coded_member_slot(name: &str) -> Option<u8> {
         // member that no longer sits there.
         "bin15" => strategy_set::SLOT_BIN15,
         "ai_exec" => strategy_set::SLOT_AI_EXEC,
-        // XMM XH1 (2026-09-26): slot 6 is xmm, which takes no label
-        // yet; `icdp` is GONE as a label name for the same reason `ev` is.
+        // XMM XH1 (2026-09-26): slot 6 is xmm; `icdp` is GONE as a label
+        // name for the same reason `ev` is. XH3: xmm carries its label
+        // (never consulted — the HORIZON law), so `require = 1` can boot it.
+        "xmm" => strategy_set::SLOT_XMM,
         _ => return None,
     })
 }

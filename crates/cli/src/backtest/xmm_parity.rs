@@ -4,8 +4,9 @@
 //! # XMM XH2 parity replay (plan §7.3) — `multivenue-engine xmm-parity`
 //!
 //! The parity gate compares the member on the queue law against the
-//! XMM simulator (`tools_xmm_sim.py`, S1, LEAD θ, back of the queue) on
-//! the same windows. The simulator is not the engine's clock: it runs on
+//! XMM simulator (a git-excluded research one-shot — see
+//! `docs/arch/research-tools-exclusion-plan.md`; S1, LEAD θ, back of the
+//! queue) on the same windows. The simulator is not the engine's clock: it runs on
 //! each venue's own clock (venue ms, θ = 0 on 2026-09-25) with latencies
 //! applied by the TRIGGER of an action. So this replay does the same,
 //! and nothing else in the harness does:
@@ -59,8 +60,8 @@ use crate::backtest::{discover_runs, BacktestCtx, HarnessError, ModelParams, Run
 
 const MS: u64 = 1_000_000;
 
-/// The simulator's S1 latencies, ns (`tools_xmm_lib` / `tools_xlat_lib`:
-/// DPUB, NET, DPROC, DENTRY at scenario index 1).
+/// The simulator's S1 latencies, ns (its research libraries' DPUB, NET,
+/// DPROC, DENTRY at scenario index 1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ParityLatency {
     /// How late the member perceives a leader record: `info` =
