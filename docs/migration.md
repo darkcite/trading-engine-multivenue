@@ -6,6 +6,75 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-25 — core-net: any-method HTTP/1.1 heads and `HttpsReq`; `HttpsPost` on the shared keep-alive engine (HC2)
+
+**What changed**
+
+- `core_net::http1` gains ONE head writer for every request:
+  - `Method` (`Get`/`Post`/`Put`/`Delete`, `#[repr(u8)]`), `Header<'a> =
+    (&[u8], &[u8])` and `ReqHead`: method, host, origin-form target, UA,
+    optional `Content-Type`, extra headers, keep-alive.
+  - `request_head_len` sizes the head; `write_request_head` renders it;
+    `write_request` renders the head, then the body.
+  - `Content-Length` goes on every method but a bodiless `GET`. A `DELETE`
+    may carry a body; Hypercall cancels with one.
+  - `write_get_request` / `write_post_request` are thin wrappers and emit
+    the same bytes as before (pinned by their golden tests).
+  - `HttpErr::BadHead` is new: a CR / LF / NUL in any field (header
+    injection), a target that is not visible-ASCII `/…`, an empty host, or
+    a bad header name. Refused, never rewritten. A proptest proves no field
+    can smuggle a line in.
+- `core_net::HttpsReq` is new: a keep-alive HTTPS client for ONE host and
+  ANY request.
+  - `request(method, target, extra, body_len) -> (status, body_range)`.
+    The body is rendered in place (`body_mut`); the head is rendered per
+    request flush against it; ONE contiguous slice goes out in ONE write.
+  - The User-Agent is `multivenue-engine/1` and every request sends
+    `Accept-Encoding: identity`.
+- `crate::https_conn::KeepAlive` (private) now holds the connection engine
+  that used to live inside `HttpsPost`, **moved unchanged**: the dial, the
+  idle-close probe before reuse, the one-exchange cycle, the retire rules
+  and the `left_host` law. `HttpsPost` and `HttpsReq` both run on it.
+  `HttpsPost`'s public API, wire bytes and allocation profile are
+  unchanged: gate 72 is still exactly 2 per post, and its loopback suite
+  and the HYPARB arm loopback pass untouched.
+- `PostErrKind::BadRequest` is new (`HttpsReq` only): a head refused
+  before any byte left, `left_host == false`.
+- New alloc gates:
+  - 73a: the head writer is 0 B/op.
+  - 73b: the `HttpsReq` keep-alive cycle is exactly 2 allocations per
+    request, gate 72's rustls record residue.
+- New TLS loopback `core-net/tests/https_req_tls_loopback.rs` covers:
+  - every method on one connection, and extra headers verbatim;
+  - no `Content-Length` on a bodiless GET;
+  - idle close and announced close;
+  - chunked framing;
+  - a 600 KB answer over many records, and `Overflow` when it does not fit;
+  - refusals that never dial.
+
+**Why**
+
+- Hypercall's REST surface spans many paths and methods on one host. The
+  data plane needs a runtime `GET /options-summary?currency=<U>` (HC3). The
+  exec plane will need `PUT` replace, `DELETE` cancel with a JSON body, and
+  signed `X-Hypercall-*` headers on MMP reads (HC9).
+- `HttpsPost` is POST-only with a boot-fixed path. `boot_http::https_get`
+  is boot-only and blocking.
+
+**Impact**
+
+- **On-disk / config / wire formats:** none.
+- **API:** additive. `HttpErr` and `PostErrKind` each gain a variant.
+  Nothing outside core-net matched either exhaustively.
+
+**Migration steps**
+
+1. None.
+
+**Rollback**
+
+- Revert the HC2 commit.
+
 ## 2026-09-25 — VenueId 9 = Hypercall; tick lane 7, opt lane 3; `VENUE_COUNT` 10 (HC1)
 
 **What changed**

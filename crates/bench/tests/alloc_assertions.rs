@@ -8859,3 +8859,146 @@ fn https_post_keep_alive_cycle_allocates_only_rustls_record_buffers() {
          out, one decrypted record in); anything above is ours"
     );
 }
+
+/// **HC2 gate 73a — the generic HTTP/1.1 head writer is 0 B/op.** Every
+/// Hypercall REST head — a `GET` with a query, a signed `DELETE` with
+/// two extra headers — is sized and rendered into a caller-owned buffer
+/// without touching the heap.
+#[test]
+fn http1_request_head_writer_is_zero_alloc() {
+    use core_net::{request_head_len, write_request_head, Header, Method, ReqHead};
+    let extra: [Header<'_>; 2] = [
+        (b"X-Hypercall-Expires-At-Ms", b"1790371200000"),
+        (b"X-Hypercall-Signature", b"0x1b2c3d4e5f"),
+    ];
+    let heads = [
+        ReqHead {
+            method: Method::Get,
+            host: b"api.hypercall.xyz",
+            target: b"/options-summary?currency=BTC&include_rfq_provider_quotes=true",
+            user_agent: core_net::REQ_USER_AGENT,
+            content_type: None,
+            extra: &[],
+            keep_alive: true,
+        },
+        ReqHead {
+            method: Method::Delete,
+            host: b"api.hypercall.xyz",
+            target: b"/order",
+            user_agent: core_net::REQ_USER_AGENT,
+            content_type: Some(b"application/json"),
+            extra: &extra,
+            keep_alive: true,
+        },
+    ];
+    let mut buf = [0u8; 512];
+    // Warm-up outside the window.
+    let _ = write_request_head(&mut buf, &heads[0], 0);
+    let g = AllocGuard::new();
+    let mut acc = 0usize;
+    let mut i = 0usize;
+    while i < 10_000 {
+        let h = &heads[i & 1];
+        let body_len = (i & 1) * 57;
+        let n = request_head_len(h, body_len).expect("sized");
+        let w = write_request_head(&mut buf, h, body_len).expect("rendered");
+        acc = acc.wrapping_add(n ^ w ^ usize::from(buf[w - 1]));
+        i += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "http1 head writer allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(bytes, 0);
+}
+
+/// **HC2 gate 73b — `HttpsReq`'s keep-alive cycle, as allocations per
+/// request: exactly gate 72's two.** `HttpsReq` renders its head per
+/// request (any method, any target) flush against the body already in
+/// place and writes ONE contiguous slice ONCE, over the same connection
+/// engine as `HttpsPost` (`core_net::https_conn`). rustls' buffered API
+/// seals one record out and decrypts one in; a regression in our render
+/// or in the shared engine shows as a third. Same child-process server
+/// as gate 72 (the counting allocator is process-global).
+#[test]
+fn https_req_keep_alive_cycle_allocates_only_rustls_record_buffers() {
+    const REQS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_REQ: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate73-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 73 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 73 exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 73 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 73 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 73: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 73 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 73 anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let mut h = core_net::HttpsReq::new("localhost", port, cfg, 1024, 8192, 16 * 1024)
+        .expect("gate 73 client");
+    let n = exec_hyperevm::rpc::write_chain_id(h.body_mut(), 1).expect("gate 73 body");
+    let extra: [core_net::Header<'_>; 1] = [(b"X-Gate", b"73")];
+    let mut i = 0;
+    while i < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        let (status, _) = h
+            .request(core_net::Method::Post, b"/evm", &extra, n)
+            .expect("gate 73 warm-up");
+        assert_eq!(status, 200);
+        i += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut k = 0u64;
+    while k < REQS {
+        let (status, r) = h
+            .request(core_net::Method::Post, b"/evm", &extra, n)
+            .expect("gate 73 request");
+        acc = acc.wrapping_add(u64::from(status) + (r.end - r.start) as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(h.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(h.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_REQ * REQS,
+        "HttpsReq cycle: {allocs} allocations ({bytes} B) over {REQS} requests — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_REQ}/request (one sealed record \
+         out, one decrypted record in); anything above is ours"
+    );
+}
