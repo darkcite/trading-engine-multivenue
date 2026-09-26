@@ -400,9 +400,14 @@ hard-coded `--paper`, not the flag's own design.
   `.env` only". The managed fleet has sourced `~/multivenue/.env` since
   the launchd lane existed, so the old wording described a setup that
   had not been true for some time.)*
-- Boot-time: the key is `mlock`'d into its own page (see
-  `crates/core-config::SecretKeyBytes`).
-- Drop: the key page is zeroized and `munlock`'d.
+- Boot-time: the key is `mlock`'d (see
+  `crates/core-config::SecretKeyBytes`): a 32 B heap box, so the lock
+  covers the heap page the box sits on, which it may SHARE with other
+  allocations, another key included — not a page of its own (corrected
+  2026-09-26 by the BX4 review; the BX4 bullet below).
+- Drop: the key's 32 B are zeroized and `munlock`'d — which, where locks
+  do not stack (Linux), unlocks that whole page for anything else locked
+  on it.
 - Debug: the `Secrets` struct has a custom `Debug` impl that redacts the
   key. Any code that formats or logs the key without redaction fails the
   `risk-reviewer` subagent check.
@@ -415,6 +420,38 @@ hard-coded `--paper`, not the flag's own design.
 - **HYPARB (H8) adds the HyperEVM testnet wallets** — the same
   `SecretKeyBytes`, read through `from_hex_env`; see "HYPARB — slot 0"
   below for which variable and why it may be the E3 testnet key.
+- **BX4 adds the Binance Ed25519 key** (`crates/signer-ed25519`, ruling
+  O-BX5: `ring`). The seed arrives through the same
+  `SecretKeyBytes::from_hex_env` (`BINANCE_ED25519_SEED`). `ring` expands
+  it ONCE, at boot, into its keypair form (96 B: the secret scalar, the
+  nonce prefix, the public key), and that expansion lives in a page of its
+  own — page-aligned and page-sized, so no `munlock` of a neighbour can
+  unlock it (`mlock` does not stack) — `mlock`'d, and overwritten with
+  volatile zero writes on drop before `munlock` and free; `ring`'s type
+  zeroizes nothing itself. The NAMED temporary the expansion is returned
+  into is wiped too; `ring`'s own stack frames (its SHA-512 buffers the
+  seed there), a return slot the compiler does not elide and a register
+  spill are not — the same stated limit as the environment block below.
+  `Debug` prints `<redacted>`; an error carries an errno or a vector
+  index, never a key byte. `signer_ed25519::self_test()` runs RFC 8032's
+  known answers through the signer itself — both renders compared with
+  literals from outside the crate — and refuses on one corrupted byte or
+  an empty table (LAW BX-3). **BX6's boot must call it before building
+  the real signer and refuse the boot on `Err`, never warn** — no boot
+  calls it yet. **This is a second locked-memory implementation beside
+  `SecretKeyBytes`** — one more than the paragraph above allows — because
+  the 96 B expansion does not fit the 32 B type. Whether the page type
+  moves into `core-config` and `SecretKeyBytes` adopts it is an open
+  operator question (BX4, 2026-09-26). The hazard it would close is
+  reachable today, outside this lane: `cli::evm_live::check_wallet_env`
+  (`crates/cli/src/evm_live.rs:416-427`) builds a temporary
+  `SecretKeyBytes` of slot 3's agent key and drops it while HYPARB's
+  mainnet boot holds `HYPEREVM_MAINNET_KEY` live
+  (`crates/cli/src/hyparb_live.rs:1480-1483`); on Linux that drop can
+  unlock the live key's page. macOS counts user wirings per map entry
+  (XNU), so the Mac fleet is likely unaffected — not verified. Until the
+  question is ruled, BX6 keeps the seed's `SecretKeyBytes` alive for the
+  life of the process. Nothing builds a signer from the environment yet.
 - The intermediate hex `String` the environment hands us is zeroized
   after parsing. Without that, the key sits in freed heap for the life
   of the process.

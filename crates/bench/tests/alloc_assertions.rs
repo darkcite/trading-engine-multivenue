@@ -8853,3 +8853,49 @@ fn https_post_keep_alive_cycle_allocates_only_rustls_record_buffers() {
          out, one decrypted record in); anything above is ours"
     );
 }
+
+/// **BX4 gate 73 — the Ed25519 sign + base64 render (`signer-ed25519`).**
+///
+/// Binance's WS API logon and every REST order request (options,
+/// Portfolio Margin, Binance Stocks) carry one Ed25519 signature, written
+/// as base64 (WS API) or percent-encoded base64 (REST) straight into the
+/// request's wire buffer. `ring` signs into its own return value on the
+/// stack; the render writes into the caller's buffer. The whole path must
+/// be 0 B/op. Boot is pinned too, the way gate 72 pins `HttpsPost`: a
+/// signer costs exactly one allocation (its page), and the self-test one
+/// per known answer — so a `ring` bump that starts allocating in
+/// `from_seed_unchecked`, or a keypair moved into a `Box`, fails here.
+#[test]
+fn ed25519_sign_and_render_are_zero_alloc() {
+    use signer_ed25519::{Ed25519Signer, RFC8032, SIG_B64_LEN, SIG_B64_PCT_MAX};
+    let g = AllocGuard::new();
+    let signer = Ed25519Signer::from_seed(&[0x42; 32]).expect("gate 73 key");
+    let (boot_allocs, boot_bytes, _) = g.delta();
+    assert_eq!(boot_allocs, 1, "from_seed: exactly one page ({boot_bytes} B)");
+    let g = AllocGuard::new();
+    signer_ed25519::self_test().expect("gate 73 self-test");
+    let (st_allocs, _, _) = g.delta();
+    assert_eq!(st_allocs as usize, RFC8032.len(), "self_test: one page per known answer");
+    // A REST order query's worth of payload.
+    let mut payload = [0x61u8; 200];
+    let mut b64 = [0u8; SIG_B64_LEN];
+    let mut pct = [0u8; SIG_B64_PCT_MAX];
+    signer.sign_b64(&payload, &mut b64); // warm-up
+
+    let g = AllocGuard::new();
+    let mut acc: u64 = 0;
+    let mut n = 0u64;
+    while n < 2_000 {
+        payload[..8].copy_from_slice(&n.to_le_bytes());
+        acc = acc.wrapping_add(signer.sign_b64(&payload, &mut b64) as u64);
+        acc = acc.wrapping_add(signer.sign_b64_pct(&payload, &mut pct) as u64);
+        acc = acc.wrapping_add(u64::from(b64[0]) + u64::from(pct[0]));
+        n += 1;
+    }
+    std::hint::black_box(acc);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert!(acc != 0, "the gate must measure real work");
+    assert_eq!(allocs, 0, "signer-ed25519 sign/render allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "signer-ed25519 hot bytes should be zero: saw {bytes}");
+}

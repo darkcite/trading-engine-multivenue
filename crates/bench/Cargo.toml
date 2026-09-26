@@ -58,6 +58,8 @@ signer-eip712        = { workspace = true }
 core-amm             = { workspace = true }
 # HYPARB H7 gate 64: the EVM sign + hash + hex render.
 signer-evm           = { workspace = true }
+# BX4 gate 73: the Ed25519 sign + base64 render.
+signer-ed25519       = { workspace = true }
 # HYPARB H3 gate 66: the HyperEVM ingress session after the handshake.
 ingress-hyperevm     = { workspace = true }
 # HYPARB H2 gate 67: the AMM fill law on the paper matcher.

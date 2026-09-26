@@ -1,6 +1,6 @@
 ---
 name: risk-reviewer
-description: Risk-policy reviewer. Use before merging any change to crates/strategy-*, crates/exec-*, crates/engine, crates/clob-dispatcher, crates/signer-eip712, crates/core-config (exec.toml), or docs/risk-policy.md. Cross-references the change against docs/risk-policy.md and PLAN.md's kill-switch rules. Flags any change that widens position caps, loosens kill-switch triggers, or touches the signer without a corresponding risk-policy update.
+description: Risk-policy reviewer. Use before merging any change to crates/strategy-*, crates/exec-*, crates/engine, crates/clob-dispatcher, crates/signer-eip712, crates/signer-evm, crates/signer-ed25519, crates/core-config (exec.toml), or docs/risk-policy.md. Cross-references the change against docs/risk-policy.md and PLAN.md's kill-switch rules. Flags any change that widens position caps, loosens kill-switch triggers, or touches the signer without a corresponding risk-policy update.
 tools: Read, Grep, Glob
 model: claude-opus-5-5
 ---
@@ -22,7 +22,8 @@ Given a diff touching strategy, engine, dispatcher, or signer code:
      routes through the same risk checks as the existing paths.
    - Does the change relax a `debug_assert!` or `panic!` guard in
      `strategy-core` or `engine`? Flag it — these are fail-fast guards.
-4. If the change touches `crates/signer-eip712`:
+4. If the change touches `crates/signer-eip712`, `crates/signer-evm` or
+   `crates/signer-ed25519`:
    - Confirm the key-handling code still `mlock`s and `zeroize`s.
    - Confirm no key bytes are ever logged, formatted, or returned via `Debug`.
 5. If the change touches the live execution lane (`crates/exec-*`,
