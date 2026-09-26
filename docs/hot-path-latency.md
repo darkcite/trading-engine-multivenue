@@ -335,11 +335,29 @@ and a QLIKE score.
   **37.6 µs** median per series (CI 37.4–37.8 µs), warm — every ring full,
   every tenor fitted. (The ~63 µs the H1/H3.3 docs quoted was the review
   host's, not the M4's; both module docs now carry the M4 figure.)
-- **Twelve at once would be ~0.45 ms** at 00:00Z — the minute a BIN15
+- **Twelve at once would be ~0.45 ms** at 00:01Z — the minute stamped
+  00:00Z is delivered at its close, 00:01:00Z, the minute a BIN15
   quarter-hour also turns. The set STAGGERS them: at most one series crosses
   a day per 1 s poll (`DAY_CLOSES_PER_POLL`), the others hold their first
   new-day minute and release it one a poll, so the loop never pays more
-  than one close (~38 µs) at once and all twelve are through by 00:00:12Z.
+  than one close (~38 µs) at once and all twelve run 00:01:00–00:01:12Z
+  (H3.7 corrected the "by 00:00:12Z" this line first said).
+- **The state file leaves the loop (H3.7).** Until H3.7 the 5 s report
+  block after a close rendered that series' `state-<NAME>.tsv` (~350 KiB
+  fitted) and ran create/write/fsync/rename on the engine thread — a text
+  render and a disk round trip, twelve times a UTC day (not measured here).
+  Now the close's own poll copies
+  the engine whole into the series' `core_ring::Mailbox`
+  (`LongVolEngine::copy_to`, ~201 KiB, the one designed copy) and the
+  `har-state-writer` thread (`cli::har_writer`) renders and writes it. The
+  loop never waits: a mailbox the writer still holds (a write in flight, or
+  failing and retried every 5 s) refuses the offer, retried at the next
+  poll. **Measured on the M4 Pro** (`cargo bench -p bench --bench hot_path
+  -- vol/long_state_copy_warm`, 2026-09-26, beside the live engine,
+  niced): **2.56 µs** median per series (CI 2.55–2.59 µs), both 201 KiB in
+  cache — the live slot is written once a UTC day, so its first touch also
+  pays the cache misses the bench does not; the close it follows measured
+  38.3 µs in the same run.
 - **Per minute:** one `on_minute_close_at` per quoting series (tens of ns);
   **per tick:** one open-addressing probe of the feed map; **per 1 s
   publish:** a copy of the cached `/state.har` rows (rebuilt only at a
@@ -349,7 +367,9 @@ and a QLIKE score.
   engine thread itself; the bench number is the floor to compare against.
 - Allocation: none after configure (bench gate 82,
   `long_vol_set_is_zero_alloc`: 12 series, two staggered UTC boundaries,
-  0 B/op).
+  0 B/op — since H3.7 also through the `StrategySet` that holds them: the
+  `/state.har` rows, the gauges' law and every state handed through its
+  mailbox and taken back, 0 B/op).
 
 Files referenced in this report:
 - `crates/engine/src/lib.rs`

@@ -14,7 +14,8 @@
 //!   (`claude_worker.har_seed seed-out --har-toml`): the feed spliced onto
 //!   its fallbacks, the whole 240-day history replayed;
 //! * `state-<NAME>.tsv` — the engine's own rows, written at each of the
-//!   series' UTC day closes and at shutdown (`paper::write_har_state`).
+//!   series' UTC day closes by the state writer thread (`har_writer`,
+//!   H3.7) and at shutdown on the engine thread (`paper::write_har_state`).
 //!
 //! The two are merged by `core_vol::merge_rows` (the §6 day-merge law) and
 //! applied through the engine's `seed_*` entry points; one refresh follows

@@ -285,7 +285,10 @@ in the script; `ai` = 48 is the floor every name includes).
   `~/multivenue/har.toml` (`core_config::har`; `--har`/`--har-dir`; NOT
   passed by the wrapper — an absent default file is the pre-H3 engine),
   restored at boot from `~/multivenue/har/seed-<NAME>.tsv` merged with the
-  engine's own `state-<NAME>.tsv` (`core_vol::merge_rows`), published as
+  engine's own `state-<NAME>.tsv` (`core_vol::merge_rows`; written OFF the
+  engine thread since H3.7 — each close copies the engine into a
+  `core_ring::Mailbox`, the `har-state-writer` thread renders and fsyncs,
+  `cli::har_writer`), published as
   `/state.har` + `engine_har_*`; the worker's `har_backfill` (every source
   kept live, `--import-from`) and `har_seed` ride `candles-cycle.sh`
   hourly when `har.toml` exists (`har/drift.json`: the dashboard's drift

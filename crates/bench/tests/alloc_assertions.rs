@@ -5465,7 +5465,8 @@ fn regime_on_tick_and_minute_roll_are_zero_alloc() {
 
 /// RG6 gate 43 (`docs/regime-and-dashboard-plan.md` §7): the `/state`
 /// path — a FULL `EngineSnapshot` (256 vm rows, 64 + 64 recents, the
-/// eight xmm perp rows since XMM XH3, every text field at capacity)
+/// eight xmm perp rows since XMM XH3, the twelve `har` rows since HAR
+/// H3.7, every text field at capacity)
 /// published into the seqlock, read back into
 /// the server thread's scratch and encoded as JSON into a 256 KiB
 /// response buffer, 1 000 times — allocates nothing. Truncation is a
@@ -5477,7 +5478,10 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
         encode_state_json, EngineSnapshot, SnapshotCell, RECENT_FILLS, RECENT_ORDERS,
         RUN_DIR_MAX, SNAPSHOT_XMM_PERPS,
     };
-    use strategy_core::{VmRowView, XmmPerpView};
+    use strategy_core::{
+        HarCounters, HarSeriesView, VmRowView, XmmPerpView, HAR_VIEW_NAME_MAX, HAR_VIEW_SERIES,
+        HAR_VIEW_TENORS, HAR_VIEW_WEEKDAYS,
+    };
 
     // Boot-time construction (allocation sanctioned): the cell, the
     // engine-side scratch, the server-side scratch, the response buf.
@@ -5506,6 +5510,46 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
             ask_state: u8::MAX,
             stale_flags: u8::MAX,
             _pad: [0; 5],
+        };
+    }
+    // HAR H3.7: the `har` block at its widest — all twelve rows, every
+    // name byte a control byte (six out per byte), every number at its
+    // widest, and a wall clock that makes each `day_age_s` a real age
+    // (eleven digits) rather than the `-1` of a series that never closed.
+    scratch.wall_ns = u64::MAX;
+    scratch.har.hash = [0xFF; 32];
+    scratch.har.n = HAR_VIEW_SERIES as u32;
+    scratch.har.dropped = u32::MAX;
+    scratch.har.counters = HarCounters {
+        minutes_rolled: u64::MAX,
+        closes: u64::MAX,
+        day_closes: u64::MAX,
+        held: u64::MAX,
+        forced: u64::MAX,
+        day_close_ns_max: u64::MAX,
+        day_close_ns_last: u64::MAX,
+        epoch: u64::MAX,
+    };
+    for r in scratch.har.series.iter_mut() {
+        *r = HarSeriesView {
+            last_min_ms: u64::MAX,
+            newest_day_ms: 1_000_000_000_000,
+            gaps: u64::MAX,
+            epoch: u64::MAX,
+            feed: u32::MAX,
+            open_minutes: u32::MAX,
+            raw_1e6: [i32::MIN; HAR_VIEW_TENORS],
+            fit_1e6: [i32::MIN; HAR_VIEW_TENORS],
+            weekday_1e6: [i32::MIN; HAR_VIEW_WEEKDAYS],
+            weekday_n: [u8::MAX; HAR_VIEW_WEEKDAYS],
+            pairs: [u8::MAX; HAR_VIEW_TENORS],
+            name: [0x01; HAR_VIEW_NAME_MAX],
+            name_len: HAR_VIEW_NAME_MAX as u8,
+            warm: u8::MAX,
+            days: u8::MAX,
+            empty_days: u8::MAX,
+            fitted: u16::MAX,
+            fit_beats_raw: u16::MAX,
         };
     }
     scratch.set_strategy_kind(b"set");
@@ -5565,6 +5609,13 @@ fn state_snapshot_publish_read_encode_is_zero_alloc() {
     let body = core::str::from_utf8(&resp[..n]).expect("utf-8");
     assert_eq!(body.matches("\"touch_bid_1e6\":").count(), SNAPSHOT_XMM_PERPS);
     assert!(body.contains("\"lead_age_ms\":-1"), "the never-heard arm ran");
+    assert_eq!(body.matches("\"weekday_n\":").count(), HAR_VIEW_SERIES, "every har row encoded");
+    assert_eq!(
+        body.matches("\\u0001").count(),
+        HAR_VIEW_SERIES * HAR_VIEW_NAME_MAX,
+        "every har name byte escaped"
+    );
+    assert!(body.contains("\"day_age_s\":17446657673"), "a real age, not -1");
     assert_eq!(
         allocs, 0,
         "/state publish+read+encode allocated {allocs} times ({bytes} B)"
@@ -10297,11 +10348,25 @@ fn long_vol_is_zero_alloc() {
 /// poll's rolls, and at each UTC boundary the STAGGERED day close — one
 /// series per poll, eleven held and released — with every forecast, the
 /// weekday profile and the counters read once an hour.
+///
+/// **HAR H3.7, the second half — the set as the engine holds it.** The
+/// same traffic through a `StrategySet` with the twelve series and the
+/// state writer's outbox installed (twelve boxed mailboxes — boot): its
+/// own 1 s HAR timer, the `/state.har` rows rebuilt at each close, every
+/// series' state copied whole into its mailbox at its close and taken
+/// back (the writer thread's side, here on one thread), and once an hour
+/// `har_series_view` + `har_counters` + `har_gauges` — the report
+/// block's `/state.har` and `engine_har_*` reads.
 #[test]
 fn long_vol_set_is_zero_alloc() {
     use core_time::WallAnchor;
-    use core_types::{make_symbol_id, TICK_FLAG_STALE};
-    use core_vol::{LongForecast, LongSeries, LongVolSet, DAY_NS, LONG_SET_MAX, LONG_TAU_DAYS_MAX};
+    use core_types::{make_symbol_id, Order, TICK_FLAG_STALE};
+    use core_vol::{
+        LongForecast, LongSeries, LongStateSnap, LongVolSet, DAY_NS, LONG_SET_MAX,
+        LONG_TAU_DAYS_MAX,
+    };
+    use strategy_core::{Ctx, HarSeriesView, Strategy, StrategyCounters, SubmitErr, HAR_VIEW_SERIES};
+    use strategy_set::{StrategySet, BIT_AI_EXEC};
     const MIN_NS: u64 = 60_000_000_000;
     const SEC_NS: u64 = 1_000_000_000;
     const NAMES: [&[u8]; LONG_SET_MAX] = [
@@ -10386,4 +10451,98 @@ fn long_vol_set_is_zero_alloc() {
     assert_eq!(after.held - before.held, 2 * (LONG_SET_MAX as u64 - 1), "the stagger held");
     assert_eq!(allocs, 0, "long-tenor set allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "long-tenor set bytes should be zero: saw {bytes}");
+
+    // ---- H3.7: the second half, through the `StrategySet` ----
+    struct NowCtx(u64);
+    impl Ctx for NowCtx {
+        fn submit(&mut self, _o: Order) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.0
+        }
+    }
+    const WALL0_MS: u64 = 1_767_225_600_000;
+    let mut ctx = NowCtx(0);
+    let mut sset = Box::new(StrategySet::new(BIT_AI_EXEC));
+    sset.on_start(&mut ctx).expect("gate 82 on_start");
+    sset.har_mut()
+        .configure(&series, WallAnchor::new(0, WALL0_MS * 1_000_000), 0)
+        .expect("gate 82 set configure");
+    let mut tx = Vec::with_capacity(LONG_SET_MAX);
+    let mut rx = Vec::with_capacity(LONG_SET_MAX);
+    let mut k = 0usize;
+    while k < LONG_SET_MAX {
+        let (t, r) = core_ring::Mailbox::new(Box::new(LongStateSnap::new())).split();
+        tx.push(t);
+        rx.push(r);
+        k += 1;
+    }
+    sset.install_har_outbox(tx);
+    let mut rows = [HarSeriesView::default(); HAR_VIEW_SERIES];
+    let (mut s2, mut px2) = (20_260_927u64, [79_000_000_000i64; LONG_SET_MAX]);
+    let mut run_set = |sset: &mut StrategySet,
+                       rx: &mut [core_ring::MailboxRx<LongStateSnap>],
+                       from_day: u64,
+                       to_day: u64,
+                       acc: &mut i64,
+                       handed: &mut u64| {
+        let mut m = from_day * 1440;
+        while m < to_day * 1440 {
+            let t0 = m * MIN_NS;
+            let mut p = 0u64;
+            while p < 13 {
+                sset.on_timer(t0 + p * SEC_NS, &mut ctx);
+                p += 1;
+            }
+            let mut i = 0usize;
+            while i < LONG_SET_MAX {
+                let v = long_vol_px(&mut s2, &mut px2[i], m / 1440 + i as u64);
+                sset.on_tick(&quote(t0 + 20 * SEC_NS, feeds[i], v, 0), &mut ctx);
+                sset.on_tick(&quote(t0 + 21 * SEC_NS, feeds[i], 1, TICK_FLAG_STALE), &mut ctx);
+                sset.on_tick(&quote(t0 + 22 * SEC_NS, feeds[i], 0, 0), &mut ctx);
+                i += 1;
+            }
+            sset.on_tick(&quote(t0 + 23 * SEC_NS, stranger, 5, 0), &mut ctx);
+            // The writer's side: take every handed state, read it, free it.
+            let mut j = 0usize;
+            while j < rx.len() {
+                if let Some(snap) = rx[j].try_take() {
+                    *acc = acc.wrapping_add(snap.epoch as i64);
+                    *acc = acc.wrapping_add(snap.engine.last_min_ts_ms() as i64);
+                    *handed += 1;
+                }
+                j += 1;
+            }
+            if m % 60 == 0 {
+                let n = StrategyCounters::har_series_view(&*sset, &mut rows);
+                let c = StrategyCounters::har_counters(&*sset);
+                let g = strategy_core::har_gauges(&rows, n, &c, WALL0_MS + m * 60_000);
+                *acc = acc
+                    .wrapping_add(g.warm)
+                    .wrapping_add(g.day_age_max_s)
+                    .wrapping_add(rows[LONG_SET_MAX - 1].fit_1e6[0] as i64);
+            }
+            m += 1;
+        }
+    };
+    let mut handed = 0u64;
+    run_set(&mut sset, &mut rx, 0, 35, &mut acc, &mut handed);
+    assert!(sset.har().engine(0).expect("gate 82 set").is_warm(), "WARM engines, again");
+    assert_eq!(handed, 34 * LONG_SET_MAX as u64, "every close of the warm-up handed");
+    let before = sset.har().counters();
+
+    let g = AllocGuard::new();
+    let mut handed = 0u64;
+    run_set(&mut sset, &mut rx, 35, 37, &mut acc, &mut handed);
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let after = sset.har().counters();
+    assert_eq!(after.day_closes - before.day_closes, 2 * LONG_SET_MAX as u64, "two staggered boundaries");
+    assert_eq!(handed, 2 * LONG_SET_MAX as u64, "every close handed through its mailbox");
+    let n = StrategyCounters::har_series_view(&*sset, &mut rows);
+    let gauges = strategy_core::har_gauges(&rows, n, &StrategyCounters::har_counters(&*sset), WALL0_MS);
+    assert_eq!((gauges.configured, gauges.warm), (LONG_SET_MAX as i64, LONG_SET_MAX as i64));
+    assert_eq!(allocs, 0, "the set's HAR path allocated {allocs} times ({bytes} B)");
+    assert_eq!(bytes, 0, "the set's HAR path bytes should be zero: saw {bytes}");
 }

@@ -6,6 +6,62 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-09-26 — the long-tenor state files are written off the engine thread (HAR H3.7)
+
+**What changed**
+
+- A new thread, `har-state-writer` (`cli::har_writer`), is spawned at boot
+  when `har.toml` configures the long-tenor set. At each series' UTC day
+  close the engine thread copies that series' engine whole (~201 KiB,
+  `core_vol::LongVolEngine::copy_to`) into the series' mailbox — one
+  `core_ring::Mailbox` per series, new in core-ring: a single-slot SPSC
+  hand-off by ownership, filled and read in place, never waiting — at the
+  close's own 1 s poll. The writer renders `state-<NAME>.tsv` and runs
+  create/write/fsync/rename. The engine loop no longer renders or fsyncs a
+  HAR state in its 5 s report block.
+- The file is unchanged — path, header, rows: one renderer,
+  `core_vol::render_state_file`, serves the writer and the shutdown write.
+- A failed write keeps the state and is retried every 5 s (the F18 warning,
+  `kind="har"`, once a minute); the engine's offers are refused meanwhile,
+  never waited on, and the newest state follows the first retry that lands
+  — a file never goes backwards.
+- Shutdown: the writer is stopped and joined, then the forced synchronous
+  write of every series runs on the engine thread as before (a state the
+  writer still held is superseded by it).
+- The writer failing to spawn is an error log (`har: the state writer
+  thread did not spawn`) and the pre-H3.7 write on the engine loop — never
+  a refusal.
+- `engine_har_*` are computed by `strategy_core::har_gauges` (values
+  unchanged; bench gate 82 now runs it).
+- `docs/hot-path-latency.md`: the staggered day closes run
+  00:01:00–00:01:12Z (the minute stamped 00:00Z is delivered at its close),
+  not "by 00:00:12Z".
+
+**Why**
+
+- Ruling O-HC15 (H3.7): the render and the fsync — a disk round trip —
+  ran on the engine thread twelve times a UTC day. The hand-off that
+  replaces them costs the loop 2.56 µs per close, warm (bench
+  `vol/long_state_copy_warm` on the M4).
+
+**Impact**
+
+- One more thread, parked 250 ms between passes; the twelve mailbox slots
+  are ~2.4 MiB of heap boxed at boot. A boot without `har.toml` spawns
+  nothing and boxes nothing. Nothing on disk changes.
+
+**Migration steps**
+
+1. None. Live at the first release build + restart after the branch
+   merges, and only on a boot that finds a `har.toml` (`~/multivenue/har.toml`
+   or `--har`; none is live yet — the HAR go-live steps of the H3 plan §15
+   are staged with O-HC12).
+
+**Rollback**
+
+- Revert the commit; the files it writes are the files the engine loop
+  wrote before.
+
 ## 2026-09-26 — `/state` schema 2: `xmm` replaces `icdp`; `engine_xmm_*`; `[labels.xmm]`; audit-pnl reads the queue venue's prints (XMM XH3)
 
 **What changed**

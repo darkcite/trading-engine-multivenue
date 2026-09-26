@@ -45,6 +45,8 @@ pub mod evm_testnet;
 pub mod exec_boot;
 /// HAR H3.4: `har.toml` + the seeds + the engine's own state → the long-tenor set.
 pub mod har_boot;
+/// HAR H3.7: the long-tenor state files, rendered and written off the engine thread.
+pub mod har_writer;
 /// HYPARB H5: `hyparb.toml` → the slot-0 member's params.
 pub mod hyparb_boot;
 pub mod hyparb_live;

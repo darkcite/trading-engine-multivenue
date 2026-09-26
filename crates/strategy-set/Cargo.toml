@@ -13,6 +13,9 @@ path = "src/lib.rs"
 
 [dependencies]
 core-regime          = { workspace = true }
+# HAR H3.7: the state writer's mailboxes (each series' state leaves the
+# engine thread at its day close).
+core-ring            = { workspace = true }
 core-time            = { workspace = true }
 core-types           = { workspace = true }
 # HAR H3.3: the long-tenor HAR series the set owns.

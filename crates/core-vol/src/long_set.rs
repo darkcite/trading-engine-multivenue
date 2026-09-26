@@ -158,6 +158,35 @@ pub struct LongSetCounters {
     pub epoch: u64,
 }
 
+/// HAR H3.7: one series' state as the state writer receives it — the
+/// engine copied whole ([`LongVolEngine::copy_to`]) and the epoch it was
+/// copied at. ~201 KiB: boxed once at boot (a mailbox slot) and filled in
+/// place from then on.
+#[repr(C, align(64))]
+pub struct LongStateSnap {
+    /// The series' state epoch at the copy ([`LongVolSet::series_epoch`]).
+    pub epoch: u64,
+    /// The series' engine, copied whole.
+    pub engine: LongVolEngine,
+}
+
+impl LongStateSnap {
+    /// An empty snapshot: epoch 0, a zeroed engine.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            epoch: 0,
+            engine: LongVolEngine::new(),
+        }
+    }
+}
+
+impl Default for LongStateSnap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The long-tenor HAR series of one engine (module doc).
 #[repr(C, align(64))]
 pub struct LongVolSet {
@@ -590,6 +619,18 @@ impl LongVolSet {
             return 0;
         }
         self.series_epoch[i & MASK]
+    }
+
+    /// HAR H3.7: copy series `i`'s engine and its epoch into `dst` — the
+    /// state writer's snapshot, one ~201 KiB copy per series per day close.
+    /// `false` = no such series (`dst` untouched). Never allocates.
+    pub fn snapshot_series(&self, i: usize, dst: &mut LongStateSnap) -> bool {
+        let Some(e) = self.engine(i) else {
+            return false;
+        };
+        e.copy_to(&mut dst.engine);
+        dst.epoch = self.series_epoch(i);
+        true
     }
 
     /// Series `i`'s engine.

@@ -2022,6 +2022,7 @@ name = "strategy-set"
 version = "0.1.0"
 dependencies = [
  "core-regime",
+ "core-ring",
  "core-time",
  "core-types",
  "core-vol",

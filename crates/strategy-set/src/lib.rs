@@ -107,7 +107,8 @@ use core_regime::{
 };
 use core_time::{NsTs, WallAnchor};
 use core_types::regime::REL_UNKNOWN;
-use core_vol::{LongForecast, LongSetCounters, LongVolSet, DAY_NS};
+use core_ring::MailboxTx;
+use core_vol::{LongForecast, LongSetCounters, LongStateSnap, LongVolSet, DAY_NS};
 use core_types::{
     AiCmd, AiCmdKind, ChannelEvent, ChannelId, Fill, Order, OrderEvent, RegimeLabelSet,
     RegimeWord, RuleTableV2, Signal, Tick, TradePrint, REGIME_OFF_HARD, REGIME_PROFILES,
@@ -128,6 +129,7 @@ const _: () = assert!(REGIME_REL_SYMS == REGIME_MAX_SYMS);
 const _: () = assert!(HAR_VIEW_SERIES == core_vol::LONG_SET_MAX);
 const _: () = assert!(HAR_VIEW_NAME_MAX == core_vol::LONG_SET_NAME_MAX);
 const _: () = assert!(HAR_VIEW_WEEKDAYS == core_vol::WEEKDAYS);
+const _: () = assert!(strategy_core::HAR_DAY_MS == core_vol::DAY_MS);
 const _: () = assert!(HAR_VIEW_TENORS_D[HAR_VIEW_TENORS - 1] as usize <= core_vol::LONG_TAU_DAYS_MAX);
 const _: () = assert!(
     core::mem::size_of::<HarCounters>() == core::mem::size_of::<LongSetCounters>()
@@ -382,6 +384,12 @@ pub struct StrategySet {
     /// When the long-tenor set's timer last ran: its own clock on the
     /// regime's 1 s period (XMM XH1's per-slot timers).
     har_timer_last_ns: NsTs,
+    /// HAR H3.7: one mailbox per series to the cli's state-writer thread
+    /// (`har.toml` order). Empty = no writer: the cli writes the state on
+    /// the engine thread instead (the pre-H3.7 path). Boot-only.
+    har_out: Vec<MailboxTx<LongStateSnap>>,
+    /// HAR H3.7: the epoch each series' state was last handed to the writer.
+    har_offered: [u64; HAR_VIEW_SERIES],
 }
 
 /// RG2: the set's timer cadence once a detector is configured — the
@@ -424,6 +432,8 @@ impl StrategySet {
             har_view: Box::new([HarSeriesView::default(); HAR_VIEW_SERIES]),
             har_view_epoch: [u64::MAX; HAR_VIEW_SERIES],
             har_timer_last_ns: 0,
+            har_out: Vec::new(),
+            har_offered: [0; HAR_VIEW_SERIES],
         }
     }
 
@@ -438,6 +448,46 @@ impl StrategySet {
     /// and restore their state. Nothing on the engine loop calls this.
     pub fn har_mut(&mut self) -> &mut LongVolSet {
         &mut self.har
+    }
+
+    /// HAR H3.7, boot only: from now on hand each series' state to the
+    /// cli's state-writer thread through `out` (one mailbox per series,
+    /// `har.toml` order), at each of its day closes — instead of the cli's
+    /// render and fsync on the engine thread. The epochs the restore left
+    /// count as handed: a boot that changed nothing writes nothing.
+    pub fn install_har_outbox(&mut self, out: Vec<MailboxTx<LongStateSnap>>) {
+        debug_assert_eq!(out.len(), self.har.len(), "one mailbox per configured series");
+        let mut i = 0usize;
+        while i < HAR_VIEW_SERIES {
+            self.har_offered[i] = self.har.series_epoch(i);
+            i += 1;
+        }
+        self.har_out = out;
+    }
+
+    /// HAR H3.7: hand the state of every series whose epoch moved (its day
+    /// close, or the restore) to the writer — one ~201 KiB copy into its
+    /// mailbox, the engine thread's whole share of the write. A mailbox the
+    /// writer still holds (a write in flight, or failing) is tried again at
+    /// the next poll, so the newest state follows. Nothing without a writer.
+    #[inline]
+    fn offer_har_state(&mut self) {
+        let n = self.har.len().min(self.har_out.len()).min(HAR_VIEW_SERIES);
+        let mut i = 0usize;
+        while i < n {
+            let e = self.har.series_epoch(i);
+            if e != self.har_offered[i] {
+                if let Some(tx) = self.har_out.get_mut(i) {
+                    if let Some(mut slot) = tx.try_fill() {
+                        if self.har.snapshot_series(i, &mut slot) {
+                            self.har_offered[i] = e;
+                            slot.commit();
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
     }
 
     /// HAR H3.5: rebuild the cached `/state.har` row of every series whose
@@ -972,21 +1022,10 @@ impl StrategyCounters for StrategySet {
         self.har.series_epoch(i)
     }
     fn render_har_series(&self, i: usize, out: &mut String) -> bool {
-        use std::fmt::Write as _;
         let (Some(name), Some(e)) = (self.har.name(i), self.har.engine(i)) else {
             return false;
         };
-        out.clear();
-        let name = core::str::from_utf8(name).unwrap_or("?");
-        // A `String` sink cannot fail.
-        let _ = writeln!(
-            out,
-            "# har-state.tsv v{} (HAR H3) -- {name}: the engine's own long-tenor state,\n\
-             # written at each of its UTC day closes and at shutdown; merged at boot with\n\
-             # seed-{name}.tsv (core_vol::merge_rows). Never tracked by git.",
-            core_vol::ROWS_VERSION
-        );
-        let _ = e.write_rows(out);
+        core_vol::render_state_file(core::str::from_utf8(name).unwrap_or("?"), e, out);
         true
     }
     /// HAR H3.5: the set's counters, field for field.
@@ -1669,6 +1708,7 @@ impl Strategy for StrategySet {
         if Self::timer_due(&mut self.har_timer_last_ns, har_period, now_ns) {
             self.har.on_timer(now_ns);
             self.refresh_har_view();
+            self.offer_har_state();
         }
         if self.enabled & BIT_HYPARB != 0
             && Self::timer_due(
@@ -3418,5 +3458,97 @@ mod tests {
         assert_eq!((out[0].days, out[0].raw_1e6), (40, v.raw_1e6), "no day closed");
         // A short buffer takes what fits and still reports the count.
         assert_eq!(StrategyCounters::har_series_view(&s, &mut []), 1);
+    }
+
+    /// HAR H3.7: with the writer's outbox installed the set hands a series'
+    /// state at each of its day closes — the engine copied whole, with its
+    /// epoch, while the cli writes nothing on the loop. A mailbox the writer
+    /// still holds is refused, and the newest state follows at the first
+    /// poll after it is handed back; a boot's epoch counts as handed.
+    #[test]
+    fn the_set_hands_each_day_close_to_the_state_writer() {
+        use core_vol::{LongSeries, LongStateSnap};
+        const MIN: NsTs = 60_000_000_000;
+        const DAY_MIN: u64 = 1_440;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let anchor = WallAnchor::new(0, 1_767_225_600_000_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"BTC", feed }], anchor, 0)
+            .unwrap();
+        let (tx, mut rx) = core_ring::Mailbox::new(Box::new(LongStateSnap::new())).split();
+        s.install_har_outbox(vec![tx]);
+        // One quote a minute, the poll at every minute's end, through
+        // minute `until` (exclusive).
+        let mut m = 0u64;
+        let mut run = |s: &mut StrategySet, c: &mut CountCtx, until: u64| {
+            while m < until {
+                let px = 100_000_000 + ((m * 7_919) % 4_001) as i64;
+                s.on_tick(&tick(VenueId::Binance, feed, px, px + 2), c);
+                s.on_timer((m + 1) * MIN, c);
+                m += 1;
+            }
+        };
+        run(&mut s, &mut c, DAY_MIN);
+        assert!(rx.try_take().is_none(), "no day closed: nothing handed");
+        // The first minute of day 1 closes day 0: its state is handed.
+        run(&mut s, &mut c, DAY_MIN + 1);
+        assert_eq!(s.har().series_epoch(0), 1);
+        let (mut want, mut got) = (String::new(), String::new());
+        {
+            let snap = rx.try_take().expect("handed at the close");
+            assert_eq!(snap.epoch, 1);
+            core_vol::render_state_file("BTC", &snap.engine, &mut got);
+        }
+        assert!(StrategyCounters::render_har_series(&s, 0, &mut want));
+        assert_eq!(got, want, "the engine copied whole");
+        // Day 1's close is handed, and the writer keeps it (a write that
+        // failed, to be retried) while day 2 closes: that close is refused,
+        // and nothing is lost.
+        run(&mut s, &mut c, 2 * DAY_MIN + 1);
+        assert_eq!(s.har().series_epoch(0), 2);
+        rx.try_take().expect("epoch 2 handed").keep();
+        run(&mut s, &mut c, 3 * DAY_MIN + 1);
+        assert_eq!(s.har().series_epoch(0), 3);
+        assert_eq!(rx.try_take().expect("still the held one").epoch, 2, "refused while held");
+        // Handed back (the drop above): the next poll hands the newest.
+        run(&mut s, &mut c, 3 * DAY_MIN + 2);
+        assert_eq!(rx.try_take().expect("the newest follows").epoch, 3);
+        run(&mut s, &mut c, 3 * DAY_MIN + 3);
+        assert!(rx.try_take().is_none(), "nothing moved since");
+    }
+
+    /// HAR H3.7: the restore's epoch counts as handed — a boot that changed
+    /// nothing hands (and so writes) nothing — and the first day close after
+    /// it is handed with the next epoch.
+    #[test]
+    fn a_restored_state_is_not_handed_again_at_boot() {
+        use core_vol::{LongSeries, LongStateSnap};
+        const MIN: NsTs = 60_000_000_000;
+        let feed = make_symbol_id(VenueId::Binance, 100);
+        let mut s = StrategySet::new(BIT_AI_EXEC);
+        let mut c = ctx();
+        c.now = 0;
+        s.on_start(&mut c).unwrap();
+        let anchor = WallAnchor::new(0, 1_767_225_600_000_000_000);
+        s.har_mut()
+            .configure(&[LongSeries { name: b"BTC", feed }], anchor, 0)
+            .unwrap();
+        s.har_mut().restored();
+        assert_eq!(s.har().series_epoch(0), 1, "the restore's epoch");
+        let (tx, mut rx) = core_ring::Mailbox::new(Box::new(LongStateSnap::new())).split();
+        s.install_har_outbox(vec![tx]);
+        s.on_timer(REGIME_TIMER_NS, &mut c);
+        assert!(rx.try_take().is_none(), "the restore is already on disk");
+        let mut m = 0u64;
+        while m <= 1_440 {
+            s.on_tick(&tick(VenueId::Binance, feed, 100_000_000, 100_000_002), &mut c);
+            s.on_timer((m + 1) * MIN, &mut c);
+            m += 1;
+        }
+        assert_eq!(rx.try_take().expect("the first close").epoch, 2);
     }
 }

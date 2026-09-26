@@ -380,8 +380,10 @@ fn bench_signer_sign_order(c: &mut Criterion) {
 // -----------------------------------------------------------------
 // 11. HAR H3.5 — the long-tenor day close: one warm `LongVolEngine`'s
 //     close law over the whole 1–40 d grid, what ONE series costs the
-//     engine thread at 00:00Z (`core_vol::LongVolSet` staggers the twelve
-//     one a poll). `docs/hot-path-latency.md` "Addendum 2026-09-26".
+//     engine thread at 00:01Z (`core_vol::LongVolSet` staggers the twelve
+//     one a poll). HAR H3.7 — and the state hand-off that follows it at
+//     the same poll: the warm engine copied whole into the state writer's
+//     mailbox. `docs/hot-path-latency.md` "Addendum 2026-09-26".
 // -----------------------------------------------------------------
 
 /// A ±10 bps-a-minute xorshift walk — every day observed, every ring
@@ -419,6 +421,15 @@ fn bench_long_vol_day_close(c: &mut Criterion) {
             e.on_minute_close_at(long_vol_step(&mut s, &mut px), DAY0 + day * DAY_MS);
             day += 1;
             black_box(e.x_1e9(DAY_NS));
+        });
+    });
+    // H3.7: the engine thread's whole share of a series' state write — the
+    // warm engine copied into its (boxed) mailbox slot.
+    let mut dst = Box::new(LongVolEngine::new());
+    c.bench_function("vol/long_state_copy_warm", |b| {
+        b.iter(|| {
+            black_box(&*e).copy_to(&mut dst);
+            black_box(&*dst);
         });
     });
 }

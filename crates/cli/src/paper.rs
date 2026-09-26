@@ -3770,6 +3770,22 @@ pub fn engine_loop_set_full<D: OrderDispatch>(
             // H3.5: the file's identity and what it lost, for `/state.har`.
             obs.har_hash = hb.hash;
             obs.har_dropped = hb.dropped.len().min(u32::MAX as usize) as u32;
+            // H3.7: the state leaves the engine thread — one copy into a
+            // mailbox at each day close, the render and the fsync on the
+            // writer thread. A spawn failure keeps the write on the loop
+            // (logged, never a refusal — the boot's failure isolation).
+            let (tx, rx) = crate::har_writer::outbox(hb.series.len());
+            let names = hb.series.iter().map(|s| s.name.clone()).collect();
+            match crate::har_writer::HarWriter::spawn(rx, names, obs.har_state_paths.clone()) {
+                Ok(w) => {
+                    set.install_har_outbox(tx);
+                    obs.har_writer = Some(w);
+                }
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "har: the state writer thread did not spawn — the engine loop writes the state"
+                ),
+            }
         }
     }
     // RG2 (plan §4.2–§4.3): the regime detector — configure, apply the
@@ -4436,6 +4452,12 @@ pub struct Observability {
     /// order. Empty = no HAR service, and the engine writes nothing. Set
     /// by the set builder from the boot bundle.
     pub har_state_paths: Vec<std::path::PathBuf>,
+    /// HAR H3.7: the thread that renders and writes those files — each
+    /// series' state handed to it at its day close through the set's
+    /// outbox. `None` (no HAR service, or its spawn failed) = the engine
+    /// loop writes them itself (the pre-H3.7 path). **Taken** by the
+    /// engine loop, stopped and joined before its shutdown write.
+    pub har_writer: Option<crate::har_writer::HarWriter>,
     /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
     /// (all-zero: no HAR service) — `/state.har.hash`.
     pub har_hash: [u8; 32],
@@ -5897,7 +5919,7 @@ fn write_vrp_state_if_changed<S: strategy_core::StrategyCounters>(
 /// F18: a failing state write repeats every 5 s for as long as the
 /// cause lasts — a full disk lasts hours. One line a minute per writer
 /// says the same thing and leaves the log readable.
-fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
+pub(crate) fn warn_state_write(kind: &str, reason: &str, last_warn_ns: &mut u64, now: u64) {
     const STATE_WARN_PERIOD_NS: u64 = 60_000_000_000;
     if *last_warn_ns != 0 && now.saturating_sub(*last_warn_ns) < STATE_WARN_PERIOD_NS {
         return;
@@ -7262,26 +7284,13 @@ fn mirror_har_metrics<S: strategy_core::StrategyCounters>(
     rows: &mut [strategy_core::HarSeriesView],
     wall_ms: u64,
 ) {
-    let n = strat.har_series_view(rows) as usize;
-    let m = n.min(rows.len());
-    let mut warm = 0i64;
-    let mut age_max: i64 = -1;
-    let mut i = 0usize;
-    while i < m {
-        let r = &rows[i];
-        warm += i64::from(r.warm);
-        if r.newest_day_ms != 0 {
-            let closed_ms = r.newest_day_ms.saturating_add(core_vol::DAY_MS);
-            let age = (wall_ms.saturating_sub(closed_ms) / 1_000).min(i64::MAX as u64) as i64;
-            age_max = age_max.max(age);
-        }
-        i += 1;
-    }
-    reg.gauge(ids.configured).set(n as i64);
-    reg.gauge(ids.warm).set(warm);
-    reg.gauge(ids.day_age_max_s).set(age_max);
-    reg.gauge(ids.day_close_ns_max)
-        .set(strat.har_counters().day_close_ns_max.min(i64::MAX as u64) as i64);
+    let n = strat.har_series_view(rows);
+    // H3.7: one law, `strategy_core::har_gauges` (alloc gate 82 runs it).
+    let g = strategy_core::har_gauges(rows, n, &strat.har_counters(), wall_ms);
+    reg.gauge(ids.configured).set(g.configured);
+    reg.gauge(ids.warm).set(g.warm);
+    reg.gauge(ids.day_age_max_s).set(g.day_age_max_s);
+    reg.gauge(ids.day_close_ns_max).set(g.day_close_ns_max);
 }
 
 // ---------------------------------------------------------------
@@ -8033,6 +8042,11 @@ where
     // restore's (a boot that changed nothing rewrites nothing); the buffer
     // is reused for every series.
     let har_state_paths = std::mem::take(&mut obs.har_state_paths);
+    // H3.7: with the writer thread running, the loop only hands the states
+    // (the set's outbox, in `on_timer`) and writes none of them until the
+    // shutdown's forced write.
+    let har_writer = obs.har_writer.take();
+    let har_on_loop = har_writer.is_none();
     let mut har_state_epochs = [0u64; core_vol::LONG_SET_MAX];
     {
         let n = strategy_core::StrategyCounters::har_series(eng.strategy());
@@ -8074,15 +8088,17 @@ where
                 &mut xsd_state_warn_ns,
                 now_ns(),
             );
-            write_har_state(
-                &har_state_paths,
-                eng.strategy(),
-                &mut har_state_epochs,
-                &mut har_state_buf,
-                &mut har_state_warn_ns,
-                now_ns(),
-                false,
-            );
+            if har_on_loop {
+                write_har_state(
+                    &har_state_paths,
+                    eng.strategy(),
+                    &mut har_state_epochs,
+                    &mut har_state_buf,
+                    &mut har_state_warn_ns,
+                    now_ns(),
+                    false,
+                );
+            }
         }};
     }
     let mut regime_last = strategy_core::RegimeCounters::default();
@@ -8487,6 +8503,12 @@ where
     // Unconditional, and a no-op on an unchanged epoch.
     flush_member_state!();
     eng.stop();
+    // H3.7: the state writer stops and is joined FIRST — a write in flight
+    // and the forced write below must never share a path's temp file. A
+    // state it still held is superseded by that write.
+    if let Some(w) = har_writer {
+        w.shutdown();
+    }
     // HAR H3.4: after `on_stop` delivered any minute the day-close stagger
     // still held, every series' state is written UNCONDITIONALLY — its
     // open day moves the state without moving the epoch.

@@ -1693,6 +1693,59 @@ const _: () = assert!(core::mem::size_of::<HarSeriesView>() == 176);
 const _: () = assert!(core::mem::size_of::<HarCounters>() == 64);
 const _: () = assert!(HAR_VIEW_TENORS <= 16, "fitted / fit_beats_raw are u16 masks");
 
+/// A UTC day, ms — `core_vol::DAY_MS` (a const assert in `strategy-set`
+/// pins the two together).
+pub const HAR_DAY_MS: u64 = 86_400_000;
+
+/// HAR H3.7: the `engine_har_*` gauges, as one law the cli mirrors and the
+/// alloc gate measures. POD.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct HarGauges {
+    /// `engine_har_series_configured`.
+    pub configured: i64,
+    /// `engine_har_series_warm`: series whose fold forecasts.
+    pub warm: i64,
+    /// `engine_har_day_age_max_s`: seconds since the stalest series'
+    /// newest closed day ENDED (`-1` = no series has closed a day).
+    pub day_age_max_s: i64,
+    /// `engine_har_day_close_ns_max`: the costliest day close since boot.
+    pub day_close_ns_max: i64,
+}
+
+/// HAR H3.7: the gauges from the set's rows — `configured` series, the
+/// first `min(configured, rows.len())` rows read — and its counters, at
+/// `wall_ms`. Never allocates.
+#[must_use]
+pub fn har_gauges(
+    rows: &[HarSeriesView],
+    configured: u32,
+    counters: &HarCounters,
+    wall_ms: u64,
+) -> HarGauges {
+    let m = (configured as usize).min(rows.len());
+    let mut warm = 0i64;
+    let mut age_max: i64 = -1;
+    let mut i = 0usize;
+    while i < m {
+        let r = &rows[i];
+        warm += i64::from(r.warm);
+        if r.newest_day_ms != 0 {
+            let closed_ms = r.newest_day_ms.saturating_add(HAR_DAY_MS);
+            let age = (wall_ms.saturating_sub(closed_ms) / 1_000).min(i64::MAX as u64) as i64;
+            if age > age_max {
+                age_max = age;
+            }
+        }
+        i += 1;
+    }
+    HarGauges {
+        configured: i64::from(configured),
+        warm,
+        day_age_max_s: age_max,
+        day_close_ns_max: counters.day_close_ns_max.min(i64::MAX as u64) as i64,
+    }
+}
+
 // ---------------------------------------------------------------
 // risk — the venue-aware notional caps (`docs/risk-policy.md`)
 // ---------------------------------------------------------------
@@ -2531,5 +2584,36 @@ mod tests {
         gate.record_emit(0, 42);
         assert_eq!(gate.last_emit_ns(0), 42);
         assert_eq!(gate.last_emit_ns(99), 0, "OOB returns 0");
+    }
+
+    /// HAR H3.7: the gauge law — warm series counted, the STALEST newest
+    /// closed day's age (a day ends at the next midnight), `-1` before any
+    /// close, rows past `configured` ignored, the counter saturated.
+    #[test]
+    fn har_gauges_read_the_stalest_day_and_only_the_configured_rows() {
+        let day = HAR_DAY_MS;
+        let mut rows = [HarSeriesView::default(); 3];
+        rows[0].warm = 1;
+        rows[0].newest_day_ms = 10 * day;
+        rows[1].newest_day_ms = 8 * day;
+        rows[2].warm = 1;
+        rows[2].newest_day_ms = day; // past `configured`: never read
+        let c = HarCounters {
+            day_close_ns_max: u64::MAX,
+            ..HarCounters::default()
+        };
+        let now = 11 * day + 5_000;
+        let g = har_gauges(&rows, 2, &c, now);
+        assert_eq!((g.configured, g.warm), (2, 1));
+        assert_eq!(g.day_age_max_s, (2 * day + 5_000) as i64 / 1_000, "series 1: day 8 ended at day 9");
+        assert_eq!(g.day_close_ns_max, i64::MAX, "saturated, never negative");
+
+        // Nothing closed yet: the age is -1; a clock behind the close is 0.
+        let fresh = [HarSeriesView::default(); 2];
+        assert_eq!(har_gauges(&fresh, 2, &HarCounters::default(), now).day_age_max_s, -1);
+        assert_eq!(har_gauges(&rows, 1, &c, 0).day_age_max_s, 0);
+        // More series configured than rows handed: only the rows count.
+        assert_eq!(har_gauges(&rows[..1], 12, &c, now).configured, 12);
+        assert_eq!(har_gauges(&rows[..1], 12, &c, now).warm, 1);
     }
 }
