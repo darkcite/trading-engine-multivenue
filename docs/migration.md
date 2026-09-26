@@ -957,7 +957,10 @@ supervised restart and the post-boot checks.
    missing one charges the harness default.
 2. Optional: schedule `python -m claude_worker.hypercall_history` beside
    the funding lane, with the provider wallets in
-   `CLAUDE_WORKER_HC_WALLETS` (the research vault names them).
+   `CLAUDE_WORKER_HC_WALLETS` (the research vault names them). **Done at
+   the go-live (2026-09-26, O-HC29):** `scripts/candles-cycle.sh` runs it
+   hourly, guarded on `[hypercall]` in `universe.toml`; the payouts lane
+   skips until the wallets are in `.env`.
 
 **Rollback**
 
