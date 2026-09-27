@@ -43,7 +43,7 @@ use crate::counters::{RetireCounters, RiskRefusal, RouteCounters};
 use crate::halt::{trigger_for, CancelPhase, HaltReason, HaltState};
 use crate::ledger::{InstProbe, InstRefusal, InstrumentBindErr, InstrumentSpec, Ledger};
 use crate::mode::ExecMode;
-use crate::route::{ExecRoute, SlotCaps, EXEC_SLOTS};
+use crate::route::{ExecRoute, PerpLimits, SlotCaps, EXEC_SLOTS};
 use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, ExecCounters, MatcherCounters, OrderDispatch,
     RouteAliases,
@@ -162,6 +162,11 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// cannot be fed to a wall-clock epoch directly.
     #[inline]
     pub fn new(route: ExecRoute, paper: P, live: L, anchor: core_time::WallAnchor) -> Self {
+        // COPY: boot, once — `route` (832 B, `Copy`) moved in by value,
+        // and the ledger (≈ 80 KiB, its tables inline) built on the stack
+        // and moved into its box; rejected: building the ledger in place
+        // (`Box::new_uninit` and unsafe field-wise writes) for a cold
+        // one-time move off every hot path.
         Self {
             route,
             paper,
@@ -892,20 +897,26 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         // is every boot without a Binance slot.
         // A modify is judged beside every OTHER working order, never
         // beside the one it replaces.
-        let exclude = match verb {
-            RiskVerb::Place => None,
-            RiskVerb::Replace(prev) => Some(prev),
+        let exclude = verb.replaced();
+        // XH4e: a perp slot's own clamps — all zero, and so no perp slot,
+        // unless the operator set them.
+        let perp = self.route.perp_at(slot).unwrap_or_default();
+        let probe = if perp.is_set() {
+            self.ledger
+                .probe_perp(order.sym, slot, qty, buy, px, exclude)
+        } else {
+            self.ledger
+                .probe_instrument(order.sym, slot, qty, buy, px, exclude)
         };
-        if let Some(p) = self
-            .ledger
-            .probe_instrument(order.sym, slot, qty, buy, px, exclude)
-        {
-            return self.judge_instrument(order, verb, &caps, p);
+        if let Some(p) = probe {
+            return self.judge_instrument(order, verb, &caps, &perp, &p);
         }
         // A Binance-routed order on an id no row was bound for has no law
         // to be judged by, and no exposure the ledger could count: refused
-        // (plan §13.2 F8, closed at the router for this venue).
-        if venue == core_types::VenueId::Binance as u8 {
+        // (plan §13.2 F8, closed at the router for this venue). XH4e: so is
+        // a perp slot's — its orders must never fall to the HIP-4 family
+        // clamps below, which read a perp as a $1 outcome leg.
+        if venue == core_types::VenueId::Binance as u8 || perp.is_set() {
             return self.refuse(order.strategy_id, RiskRefusal::Unpriced);
         }
 
@@ -1011,12 +1022,18 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     /// requotes (a modify is exempt, LAW E-7). Clamp 1 measures in the
     /// law's units (O-BX21); clamp 4 adds only the part of the order that
     /// increases the position.
+    ///
+    /// **XH4e — a perp slot** ([`PerpLimits`]) adds three: no growth while
+    /// a position has no mark (XH2-C), the per-perp inventory counting the
+    /// working orders, and the resting notional — each an increase over
+    /// its cap, never a reduction (the "never trap" rule of clamp 3).
     fn judge_instrument(
         &mut self,
         order: &Order,
         verb: RiskVerb,
         caps: &SlotCaps,
-        p: InstProbe,
+        perp: &PerpLimits,
+        p: &InstProbe,
     ) -> Result<(), DispatchError> {
         let slot = order.strategy_id as usize;
         match p.refusal {
@@ -1033,9 +1050,30 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
         if p.exit {
             return Ok(());
         }
+        // ---- XH4e (XH2-C): no mark, no growth ---------------------------
+        // A perp slot holding a position no mark prices cannot know its
+        // exposure: only exits (above) pass until a mark does.
+        if perp.is_set() && self.ledger.unmarked_positions(slot) > 0 {
+            return self.refuse(order.strategy_id, RiskRefusal::Unpriced);
+        }
         // ---- 1. this one order ---------------------------------------
         if p.measure_1e6 > caps.max_order_usd_1e6 {
             return self.refuse(order.strategy_id, RiskRefusal::MaxOrder);
+        }
+        // ---- XH4e: the perp's inventory, its working orders included ---
+        // (a perp slot's probe carries it: `probe_perp`, one pass).
+        if perp.cap_perp_usd_1e6 > 0
+            && p.inventory_next_1e6 > perp.cap_perp_usd_1e6
+            && p.inventory_next_1e6 > p.inventory_now_1e6
+        {
+            return self.refuse(order.strategy_id, RiskRefusal::CapPerp);
+        }
+        // ---- XH4e: what the slot has resting -----------------------------
+        if perp.max_resting_usd_1e6 > 0
+            && p.resting_next_1e6 > perp.max_resting_usd_1e6
+            && p.resting_next_1e6 > self.ledger.resting_usd_1e6(slot)
+        {
+            return self.refuse(order.strategy_id, RiskRefusal::MaxResting);
         }
         // ---- 3. what it would leave at stake --------------------------
         self.ledger.observe_mono_clock(order.ts_ns);
@@ -1076,6 +1114,18 @@ enum RiskVerb {
     /// the replaced order's client id: the instrument exit test counts
     /// every OTHER working order on the side (BX3).
     Replace(u64),
+}
+
+impl RiskVerb {
+    /// The order a modify replaces: every measure that counts the slot's
+    /// working orders leaves it out.
+    #[inline]
+    const fn replaced(self) -> Option<u64> {
+        match self {
+            Self::Place => None,
+            Self::Replace(prev) => Some(prev),
+        }
+    }
 }
 
 impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L> {
@@ -1120,6 +1170,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                         order.sym,
                         order.qty.raw(),
                         order.side == Side::Bid,
+                        order.px.raw(),
                     );
                 }
                 r
@@ -1216,15 +1267,27 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 // BX6 (BX3 obligation 2): for a queued arm the row is renamed
                 // on the arm's confirmed `Renamed`, never on `Ok`.
                 let o = req.order();
-                if r.is_ok() && !self.live.verbs_confirm_later(o.sym, venue, o.strategy_id) {
-                    self.ledger.on_modify(
-                        req.prev_client_oid(),
-                        req.order().client_oid,
-                        req.order().strategy_id as usize,
-                        req.order().sym,
-                        req.order().qty.raw(),
-                        req.order().side == Side::Bid,
-                    );
+                if r.is_ok() {
+                    if self.live.verbs_confirm_later(o.sym, venue, o.strategy_id) {
+                        // XH4e: counted at the larger size and the higher
+                        // price of the two until then.
+                        self.ledger.on_modify_asked(
+                            req.prev_client_oid(),
+                            o.strategy_id as usize,
+                            o.qty.raw(),
+                            o.px.raw(),
+                        );
+                    } else {
+                        self.ledger.on_modify(
+                            req.prev_client_oid(),
+                            o.client_oid,
+                            o.strategy_id as usize,
+                            o.sym,
+                            o.qty.raw(),
+                            o.side == Side::Bid,
+                            o.px.raw(),
+                        );
+                    }
                 }
                 r
             }
@@ -1349,7 +1412,16 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 break;
             };
             renamed += 1;
-            self.ledger.on_modify(n.prev_client_oid, n.client_oid, n.slot as usize, n.sym, n.qty_1e6, n.buy != 0);
+            // XH4e: a `Renamed` carries no price — the one the modify asked.
+            self.ledger.on_modify(
+                n.prev_client_oid,
+                n.client_oid,
+                n.slot as usize,
+                n.sym,
+                n.qty_1e6,
+                n.buy != 0,
+                0,
+            );
         }
         // BX6 (obligation 6): a mark that stopped arriving stops pricing
         // (checked once a second; the ledger falls back to the last fill).
@@ -3804,6 +3876,87 @@ mod tests {
         // Through the trait, too: the same act.
         OrderDispatch::set_route_aliases(&mut d, clob_dispatcher::RouteAliases::NONE);
         assert!(d.live().aliases().is_empty() && d.route_aliases().is_empty());
+    }
+
+    /// **XH4e — a perp slot's clamps** (plan §8.8): an order on an unbound
+    /// id is refused; while a position has no mark only exits pass
+    /// (XH2-C); the per-perp inventory counts the working orders on the
+    /// order's side; the resting notional bounds what the slot has
+    /// working, and a modify that lowers it passes. A slot that sets no
+    /// `PerpLimits` is judged as before (the BX tests).
+    #[test]
+    fn a_perp_slot_is_judged_by_its_marks_inventory_and_resting() {
+        const E6: i64 = 1_000_000;
+        let hl = VenueId::Hyperliquid.to_u8();
+        let slot = STRATEGY_SLOT_BIN15 as usize;
+        let btc = core_types::make_symbol_id(VenueId::Hyperliquid, 900);
+        let eth = core_types::make_symbol_id(VenueId::Hyperliquid, 901);
+        let bare = core_types::make_symbol_id(VenueId::Hyperliquid, 902);
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            slot,
+            ExecMode::Live,
+            &[hl],
+            // max_order $40, gross $400, day $5 000, 16 orders.
+            SlotCaps::new(40 * E6, 400 * E6, 5_000 * E6, 16),
+            halt_limits(),
+        )
+        .unwrap();
+        // Per perp $150, resting $100.
+        r.set_perp_limits(slot, PerpLimits::new(150 * E6, 100 * E6))
+            .unwrap();
+        let mut d =
+            RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        d.bind_instrument(&InstrumentSpec::new(btc, crate::LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        d.bind_instrument(&InstrumentSpec::new(eth, crate::LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        d.live_mut().sig = healthy();
+        d.on_idle();
+        let refused = Err(DispatchError::RiskRefused);
+
+        // An unbound id never falls to the HIP-4 family clamps.
+        assert_eq!(d.submit(&leg_order(1, bare, true, 10 * E6, E6)), refused);
+        assert_eq!(d.counters().refused_unpriced, 1);
+
+        // XH2-C: long 1 BTC and no mark — growth anywhere is refused, an
+        // exit passes (and rests: 0.5 × $101).
+        d.on_fill_booked(&venue_fill(btc, true, 100 * E6, E6, 1));
+        assert_eq!(d.submit(&leg_order(2, eth, true, 10 * E6, E6)), refused);
+        assert_eq!(d.counters().refused_unpriced, 2);
+        assert!(d.submit(&leg_order(3, btc, false, 101 * E6, E6 / 2)).is_ok());
+        d.on_venue_event(&core_types::ChannelEvent::new(
+            T0,
+            VenueId::Hyperliquid,
+            core_types::ChannelId::Mark,
+            btc,
+            0,
+            0,
+            100 * E6,
+            100 * E6,
+        ));
+        assert!(d.submit(&leg_order(4, eth, true, 10 * E6, E6)).is_ok());
+        assert_eq!(d.ledger().resting_usd_1e6(slot), 60_500_000);
+
+        // Per perp: long 1 + a working 0.3 → $130; another 0.3 → $160.
+        assert!(d
+            .submit(&leg_order(5, btc, true, 100 * E6, 3 * E6 / 10))
+            .is_ok());
+        assert_eq!(
+            d.submit(&leg_order(6, btc, true, 100 * E6, 3 * E6 / 10)),
+            refused
+        );
+        assert_eq!(d.counters().refused_cap_perp, 1);
+
+        // Resting: $90.50 working; an ETH buy of 3 at $10 would be $120.50.
+        assert_eq!(d.submit(&leg_order(7, eth, true, 10 * E6, 3 * E6)), refused);
+        assert_eq!(d.counters().refused_max_resting, 1);
+        // A modify that lowers it passes: ETH 1 at $10 → 1 at $9.
+        assert!(d
+            .modify(&ModifyReq::new(4, leg_order(8, eth, true, 9 * E6, E6)))
+            .is_ok());
+        assert_eq!(d.ledger().resting_usd_1e6(slot), 89_500_000);
+        assert_eq!(d.counters().refused_risk, 4);
     }
 
     /// **BX3 — a Binance order is judged by its instrument's law**: the

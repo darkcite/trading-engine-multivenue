@@ -68,9 +68,9 @@
 use core::mem::{align_of, offset_of, size_of};
 
 use crate::cmd::HlCmd;
+use crate::dayspend::DAY_MS;
 use crate::event::{
-    ExecEvent, EVF_POST_ITEM, EV_ACK, EV_REJECTED, EV_UNANSWERED, REASON_HALTED, REASON_LOCAL,
-    REASON_NOT_READY, REASON_RATE_LIMIT, REASON_TRANSPORT,
+    never_left, ExecEvent, EVF_POST_ITEM, EV_ACK, EV_REJECTED, EV_UNANSWERED, REASON_RATE_LIMIT,
 };
 
 /// The venue's minimum lead: a scheduled time at least 5 s after its now.
@@ -87,8 +87,6 @@ pub const MAX_TRIGGERS_PER_DAY: u8 = 10;
 /// Arms refused in a row — probes or pushes — that park the switch until
 /// the next UTC day (fewer back off).
 pub const REFUSALS_TO_PARK: u8 = 3;
-
-const DAY_MS: u64 = 86_400_000;
 
 /// The switch's timing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -552,22 +550,14 @@ impl DeadMan {
     }
 }
 
-/// A refusal of a post that never left the host: the gateway's own
-/// (slot, class, halt, snapshot gate), or a REST send that failed before
-/// the request left.
-#[inline(always)]
-const fn never_left(reason: u8) -> bool {
-    reason == REASON_LOCAL
-        || reason == REASON_HALTED
-        || reason == REASON_NOT_READY
-        || reason == REASON_TRANSPORT
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cmd::CMD_SCHEDULE_CANCEL;
-    use crate::event::{EVF_CMD_SHIFT, EV_RESTING};
+    use crate::event::{
+        EVF_CMD_SHIFT, EV_RESTING, REASON_HALTED, REASON_LOCAL, REASON_NOT_READY, REASON_THROTTLED,
+        REASON_TRANSPORT,
+    };
 
     /// 2026-09-26 12:00:00 UTC, ms.
     const NOON: u64 = 1_790_424_000_000;
@@ -886,12 +876,13 @@ mod tests {
         let mut d = booted(DeadManCfg::DEFAULT);
         let mut now = NOON;
         let mut i = 0;
-        while i < 4 {
+        while i < 5 {
             let reason = [
                 REASON_LOCAL,
                 REASON_TRANSPORT,
                 REASON_HALTED,
                 REASON_NOT_READY,
+                REASON_THROTTLED,
             ][i];
             let arm = polled(&mut d, now, 1, true).expect("arm");
             assert!(d.on_event(&verdict(&arm, EV_REJECTED, reason), now + 1));
@@ -927,7 +918,7 @@ mod tests {
                 d.counters().rate_limited,
                 d.counters().arms
             ),
-            (5, 1, 1),
+            (6, 1, 1),
             "only the rate-limited arm left the host"
         );
     }

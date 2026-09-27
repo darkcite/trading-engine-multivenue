@@ -27,7 +27,8 @@
 //! [`REASON_HALTED`]; cancels, `scheduleCancel` and `noop` still go), or
 //! — growth only — the process's first `userFills` snapshot has not been
 //! absorbed yet ([`REASON_NOT_READY`]): a fill of ours can never be
-//! mistaken for history.
+//! mistaken for history; or — growth only — the gateway runs at 80 % of a
+//! rate share ([`REASON_THROTTLED`], XH4e, below).
 //!
 //! **Coalescing (XH-3).** Five classes, never mixed in one action: ALO
 //! places, IoC places, ALO modifies (LAW E-7), cancels by cloid — at most
@@ -82,6 +83,19 @@
 //! had gone silent are [`EV_GAP`]: `orderUpdates` has no snapshot, so the
 //! arm re-checks its open orders.
 //!
+//! **Rates (XH4e).** Every post is charged to a one-minute window of the
+//! venue's IP weight — an action 1 + ⌊n/40⌋, a read its REST weight
+//! (`clearinghouseState` 2, the others 20, `userFillsByTime` 1 more per
+//! 20 rows it returns) — and every WebSocket frame (posts, pings, pongs,
+//! subscribes) to a window of its messages, each against this gateway's
+//! share ([`IP_WEIGHT_SHARE`], [`WS_MSG_SHARE`]: the host's other HL
+//! clients share the venue's per-IP limits). At 80 % of either share,
+//! growth is refused unsent ([`REASON_THROTTLED`]); cancels, control
+//! actions, reads and pings still go. The congestion word
+//! (`GatewayStats::congestion`) says how close it runs: busy (60 % of a
+//! share, 60 posts in flight, or answers averaging 1 s), throttled, or
+//! rate-limited by the venue in the last 10 s.
+//!
 //! **Copies** (house law): the msgpack encoding and the JSON rendering
 //! (transforms, in place); the 64 B command out of its ring slot and each
 //! 64 B event into its slot; the ≤ 125 B pong echo (rx → control
@@ -106,10 +120,13 @@ use core_net::{
 };
 use core_time::now_ns;
 use core_types::ORDER_EVENT_REASON_NONE;
-use exec_gateway::stats::{HALT_TIMER_FULL, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING};
+use exec_gateway::stats::{
+    CONGESTION_BUSY, CONGESTION_NONE, CONGESTION_RATE_LIMITED, CONGESTION_THROTTLED,
+    HALT_TIMER_FULL, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING,
+};
 use exec_gateway::{
     boxed_array, duplex, CmdRx, EngineEnd, EvtTx, Expired, GatewayEnd, GatewayStats, Idle, Mbb,
-    MbbAction, Pending, SlotState, TimerId, TimerQueue, HALT_NONE,
+    MbbAction, Pending, RateWindow, SlotState, TimerId, TimerQueue, HALT_NONE,
 };
 use mio::{Events, Poll};
 use rustls::pki_types::ServerName;
@@ -119,18 +136,20 @@ use crate::action::{
     encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_schedule_cancel,
     encode_update_leverage, CancelByCloidWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
+use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
-    HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE,
-    CMD_READ_ORDERS, CMD_SCHEDULE_CANCEL,
+    HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE, CMD_READ_DAY,
+    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
 };
 use crate::event::{
     reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_FILLED,
     EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_FILL, EV_FILL_META, EV_GAP, EV_HALT,
     EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
-    EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT, GAP_UPDATES_UNREADABLE, READ_ORDERS,
-    READ_STATE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT,
-    REASON_SETTLEMENT, REASON_TRANSPORT, SLOT_FOREIGN,
+    EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT, GAP_UPDATES_UNREADABLE, READ_DAY,
+    READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED,
+    REASON_NOT_READY, REASON_RATE_LIMIT, REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT,
+    SLOT_FOREIGN,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
@@ -139,8 +158,8 @@ use crate::msgpack::MsgPackErr;
 use crate::nonce::{now_ms, Nonce};
 use crate::orderupd::{scan_order_updates, OrderUpdate};
 use crate::recon::{
-    open_orders_request, perp_state_request, scan_open_orders, scan_perp_state, OpenOrder,
-    PerpPosition, MAX_OPEN_ORDERS,
+    fills_by_time_request, open_orders_request, perp_state_request, scan_open_orders,
+    scan_perp_state, OpenOrder, PerpPosition, MAX_OPEN_ORDERS,
 };
 use crate::request::{
     batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
@@ -151,7 +170,7 @@ use crate::response::{
     ITEM_SUCCESS,
 };
 use crate::sign::{sign_action, Network, Vault};
-use crate::userws::{scan_user_fills, TidRing, UserFill, SNAPSHOT_RING};
+use crate::userws::{scan_user_fills, sum_fill_rows, TidRing, UserFill, SNAPSHOT_RING};
 use crate::wspost::{classify, PostKind, WsIn};
 
 /// Command ring slots (engine → gateway).
@@ -213,6 +232,27 @@ const SWEEP_SETTLE_NS: u64 = 1_000_000_000;
 /// whose `ws_up` gauge froze at 1 (at most ten stores a second: the line
 /// stays the gateway's).
 const BEAT_NS: u64 = 100_000_000;
+/// XH4e — this gateway's share of the venue's IP weight a minute (the
+/// venue allows 1 200 per IP; the blocking arm and the ingress share it).
+pub const IP_WEIGHT_SHARE: u32 = 400;
+/// XH4e — its share of the venue's WebSocket messages a minute (2 000 per
+/// IP).
+pub const WS_MSG_SHARE: u32 = 1_000;
+/// XH4e — growth is refused unsent at this % of either share.
+const THROTTLE_PCT: u64 = 80;
+/// XH4e — the congestion word reads busy from this % of either share …
+const BUSY_PCT: u64 = 60;
+/// … or with this many posts in flight (of [`MAX_IN_FLIGHT`]) …
+const BUSY_IN_FLIGHT: usize = 60;
+/// … or once the answers take this long on average.
+const BUSY_RTT_NS: u64 = 1_000_000_000;
+/// XH4e — a venue rate-limit answer marks the word this long.
+const RATE_LIMITED_NS: u64 = 10_000_000_000;
+/// XH4e — a read's IP weight: the venue's REST weights (its weighting of
+/// WebSocket-posted info is unmeasured), `clearinghouseState` 2, the
+/// others 20.
+const READ_WEIGHT: u32 = 20;
+const STATE_READ_WEIGHT: u32 = 2;
 /// The sweep machine's phases.
 const SW_IDLE: u8 = 0;
 const SW_READ: u8 = 1;
@@ -276,6 +316,12 @@ pub struct GatewayCfg {
     pub post_timeout_ns: u64,
     /// The idle policy.
     pub idle: Idle,
+    /// XH4e: this gateway's share of the venue's IP weight a minute
+    /// ([`IP_WEIGHT_SHARE`] in production; > 0).
+    pub ip_weight_per_min: u32,
+    /// XH4e: its share of the venue's WebSocket messages a minute
+    /// ([`WS_MSG_SHARE`] in production; > 0).
+    pub ws_msgs_per_min: u32,
 }
 
 /// Why the gateway could not be built.
@@ -289,6 +335,8 @@ pub enum GatewayErr {
     Poll,
     /// The REST fallback client could not be built.
     Http,
+    /// XH4e: a rate share of 0 — the gateway could grow nothing.
+    Rates,
 }
 
 /// Coins the gateway resolves to asset ids for the streams (perps: the
@@ -398,6 +446,8 @@ pub struct GatewayCounters {
     /// Resting orders of ours a sweep could not cancel: their coin is not
     /// in the coin map (XH4d).
     pub sweep_unmapped: u64,
+    /// Growing commands refused unsent at 80 % of a rate share (XH4e).
+    pub throttled: u64,
 }
 
 /// One resting order of ours a sweep read found: what its cancel takes.
@@ -412,7 +462,10 @@ struct SweepHit {
 #[derive(Copy, Clone)]
 struct ItemRef {
     client_oid: u64,
+    /// A modify's replaced id; a day read's start time, ms (XH4e).
     prev: u64,
+    /// The engine's push stamp (an order's push-to-write latency); a day
+    /// read's end time, ms (XH4e: a read feeds no latency).
     ts_ns: u64,
     asset: u32,
     slot: u8,
@@ -623,6 +676,17 @@ const fn fits(class: u8, status: u8) -> bool {
     }
 }
 
+/// A read command's `EV_READ_*` code.
+#[inline(always)]
+const fn read_code(kind: u8) -> u8 {
+    match kind {
+        CMD_READ_ORDERS => READ_ORDERS,
+        CMD_READ_LIMIT => READ_LIMIT,
+        CMD_READ_DAY => READ_DAY,
+        _ => READ_STATE,
+    }
+}
+
 /// A read's end event: the read command's correlation, `rows` in `aux`.
 #[inline(always)]
 fn read_end(item: &ItemRef, kind: u8, read: u8, rows: u64, now: u64) -> ExecEvent {
@@ -740,6 +804,13 @@ struct Router {
     sweep_hits: Box<[SweepHit; MAX_OPEN_ORDERS]>,
     sweep_n: usize,
     sweep_outcome: u8,
+    /// XH4e: the post RTT's moving average (1/8 per answer) and the last
+    /// venue rate-limit answer — the congestion word's inputs.
+    rtt_ewma_ns: u64,
+    rate_limited_ns: u64,
+    /// XH4e: IP weight answers added (`userFillsByTime`: 1 per 20 rows),
+    /// charged at the gateway's next turn.
+    read_weight: u32,
 }
 
 impl Router {
@@ -769,6 +840,9 @@ impl Router {
             sweep_hits: boxed_array(SweepHit::default()),
             sweep_n: 0,
             sweep_outcome: SWEEP_NONE,
+            rtt_ewma_ns: 0,
+            rate_limited_ns: 0,
+            read_weight: 0,
         }
     }
 
@@ -834,6 +908,9 @@ impl Router {
                 let mut i = 0usize;
                 while i < m {
                     let ev = answer_event(&rec.items[i], &self.items[i], id, now);
+                    if ev.reason == REASON_RATE_LIMIT {
+                        self.rate_limited_ns = now;
+                    }
                     emit_to(&mut self.evt, &ev);
                     i += 1;
                 }
@@ -891,10 +968,11 @@ impl Router {
             return;
         }
         let item = rec.items[0];
-        let ok = if item.kind == CMD_READ_ORDERS {
-            self.read_orders(&item, body, now)
-        } else {
-            self.read_state(&item, body, now)
+        let ok = match item.kind {
+            CMD_READ_ORDERS => self.read_orders(&item, body, now),
+            CMD_READ_LIMIT => self.read_limit(&item, body, now),
+            CMD_READ_DAY => self.read_day(&item, body, now),
+            _ => self.read_state(&item, body, now),
         };
         if ok {
             self.counters.reads += 1;
@@ -904,14 +982,9 @@ impl Router {
             if item.slot == SWEEP_SLOT {
                 self.sweep_outcome = SWEEP_FAILED;
             } else {
-                let read = if item.kind == CMD_READ_ORDERS {
-                    READ_ORDERS
-                } else {
-                    READ_STATE
-                };
                 emit_to(
                     &mut self.evt,
-                    &read_end(&item, EV_READ_FAILED, read, 0, now),
+                    &read_end(&item, EV_READ_FAILED, read_code(item.kind), 0, now),
                 );
             }
         }
@@ -1011,6 +1084,41 @@ impl Router {
         true
     }
 
+    /// `userRateLimit` (XH4e) → one `EV_READ_DONE` (`READ_LIMIT`): `aux` =
+    /// `nRequestsUsed`, `px_1e8` = `cumVlm` (USD ×1e8), `sz_1e8` =
+    /// `nRequestsSurplus` (`budget::scan_rate_limit`'s rules). `false`: it
+    /// does not scan.
+    fn read_limit(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
+        let Some((used, vlm_1e6, surplus)) = scan_rate_limit(body) else {
+            return false;
+        };
+        let mut end = read_end(item, EV_READ_DONE, READ_LIMIT, used, now);
+        end.px_1e8 = vlm_1e6.saturating_mul(100);
+        end.sz_1e8 = i64::try_from(surplus).unwrap_or(i64::MAX);
+        emit_to(&mut self.evt, &end);
+        true
+    }
+
+    /// `userFillsByTime` (XH4e) → one `EV_READ_DONE` (`READ_DAY`): `aux` =
+    /// rows, `px_1e8` = Σ |px × sz| of the read slot's rows (USD ×1e8),
+    /// `sz_1e8` = the rows whose time ran backward, `venue_ms` = the latest
+    /// row's time — summed in place, no row table. The venue weighs the
+    /// answer 1 more per 20 rows. `false`: it does not scan.
+    fn read_day(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
+        let Ok((rows, sum_1e8, last_ms, back)) = sum_fill_rows(body, item.slot) else {
+            return false;
+        };
+        self.read_weight = self
+            .read_weight
+            .saturating_add(u32::try_from(rows / 20).unwrap_or(u32::MAX));
+        let mut end = read_end(item, EV_READ_DONE, READ_DAY, rows, now);
+        end.px_1e8 = sum_1e8;
+        end.sz_1e8 = i64::try_from(back).unwrap_or(i64::MAX);
+        end.venue_ms = last_ms;
+        emit_to(&mut self.evt, &end);
+        true
+    }
+
     /// A REST answer: HTTP `status` and its body.
     fn on_rest_answer(&mut self, id: u64, status: u16, body: &[u8], resend: bool, now: u64) {
         if (200..300).contains(&status) {
@@ -1033,6 +1141,9 @@ impl Router {
 
     /// One event of `kind` per item of post `id`, then release it.
     fn fail_all(&mut self, id: u64, kind: u8, reason: u8, now: u64) {
+        if reason == REASON_RATE_LIMIT {
+            self.rate_limited_ns = now;
+        }
         let Some(rec) = self.pending.get(id) else {
             return;
         };
@@ -1072,6 +1183,8 @@ impl Router {
             } else {
                 self.stats.post_rtt.record(rtt);
             }
+            // XH4e: the congestion word's moving average.
+            self.rtt_ewma_ns = self.rtt_ewma_ns - self.rtt_ewma_ns / 8 + rtt / 8;
         }
         let _ = self.pending.release(id);
     }
@@ -1240,7 +1353,22 @@ pub struct HlGateway {
     sweep_until: u64,
     /// The last heartbeat stamp.
     beat_ns: u64,
+    /// XH4e: the last minute's IP weight and WebSocket messages, and this
+    /// gateway's shares of each.
+    ip: RateWindow,
+    ws: RateWindow,
+    ip_cap: u64,
+    ws_cap: u64,
+    /// Frames both connections had written at the last charge.
+    frames: u64,
 }
+
+// The gateway's inline state — what `new` moves to its thread once (its
+// tables are on the heap): 7 936 B released, 8 000 B with debug assertions
+// (mio 0.8's debug-only selector ids in its `Poll`s and `TcpStream`s) —
+// held under 8 KiB: a bound, not a pin, so a rustls or mio bump does not
+// break the build while the struct stays small.
+const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
 
 impl HlGateway {
     /// Boot: resolve, allocate every buffer, hold the signing key. No
@@ -1254,6 +1382,9 @@ impl HlGateway {
         sk: secp256k1::SecretKey,
         coins: CoinMap,
     ) -> Result<Self, GatewayErr> {
+        if cfg.ip_weight_per_min == 0 || cfg.ws_msgs_per_min == 0 {
+            return Err(GatewayErr::Rates);
+        }
         let addr = resolve(&cfg.host, cfg.port)?;
         let server_name = TlsTransport::server_name_from_host(&cfg.host)
             .map_err(|_| GatewayErr::BadServerName)?;
@@ -1262,9 +1393,9 @@ impl HlGateway {
         let poll = Poll::new().map_err(|_| GatewayErr::Poll)?;
         let GatewayEnd { cmd, evt, stats } = end;
         // COPY: the ≤ 1.4 KiB coin table moves into place once at boot,
-        // and the gateway itself (a few KiB, its tables on the heap)
-        // moves to its thread once — rejected: boxing each, which buys
-        // nothing at boot.
+        // and the gateway itself (≤ 8 KiB, const-asserted; its tables on
+        // the heap) moves to its thread once — rejected: boxing each,
+        // which buys nothing at boot.
         Ok(Self {
             rt: Router::new(evt, stats, coins),
             cmd,
@@ -1285,6 +1416,11 @@ impl HlGateway {
             sweep_round: 0,
             sweep_until: 0,
             beat_ns: 0,
+            ip: RateWindow::new(),
+            ws: RateWindow::new(),
+            ip_cap: u64::from(cfg.ip_weight_per_min),
+            ws_cap: u64::from(cfg.ws_msgs_per_min),
+            frames: 0,
             host: cfg.host,
             port: cfg.port,
             addr,
@@ -1339,6 +1475,7 @@ impl HlGateway {
         }
         worked |= self.read_conns(now);
         worked |= self.drive_mbb(now);
+        self.charge_frames(now);
         worked |= self.pump_commands(now);
         worked |= self.sweep(now);
         worked |= self.expire(now);
@@ -1348,6 +1485,10 @@ impl HlGateway {
             .stats
             .set_gauges(self.rt.pending.live() as u64, self.mbb.active().is_some());
         if now.saturating_sub(self.beat_ns) >= BEAT_NS {
+            // XH4e: the congestion word with the heartbeat — at most ten
+            // stores a second on the line the engine polls; it is advisory
+            // (`admit` judges the throttle itself, command by command).
+            self.publish_congestion(now);
             self.rt.stats.beat(now);
             self.beat_ns = now;
         }
@@ -1549,6 +1690,66 @@ impl HlGateway {
         }
     }
 
+    // ---- rates (XH4e) ------------------------------------------------
+
+    /// Charge the message window with every frame both connections wrote
+    /// since the last charge (posts, pings, pongs, subscribes) and the IP
+    /// window with the weight answers added; move both to `now`.
+    fn charge_frames(&mut self, now: u64) {
+        let f = self.conns[0].frames() + self.conns[1].frames();
+        self.ws.add(
+            now,
+            u32::try_from(f.saturating_sub(self.frames)).unwrap_or(u32::MAX),
+        );
+        self.frames = f;
+        let w = self.rt.read_weight;
+        self.rt.read_weight = 0;
+        self.ip.add(now, w);
+    }
+
+    /// Charge the IP window with post `id`'s weight: an action 1 + ⌊n/40⌋
+    /// (n its items), a read its REST weight.
+    fn charge_ip(&mut self, id: u64, now: u64) {
+        let w = match self.rt.pending.get(id) {
+            Some(rec) if usize::from(rec.class) == CLASS_READ => {
+                if rec.items[0].kind == CMD_READ_STATE {
+                    STATE_READ_WEIGHT
+                } else {
+                    READ_WEIGHT
+                }
+            }
+            Some(rec) => 1 + u32::from(rec.n) / 40,
+            None => 1,
+        };
+        self.ip.add(now, w);
+    }
+
+    /// Either window at [`THROTTLE_PCT`] of its share.
+    fn throttled(&self) -> bool {
+        self.ip.at_least(self.ip_cap, THROTTLE_PCT) || self.ws.at_least(self.ws_cap, THROTTLE_PCT)
+    }
+
+    /// The congestion word: the worst of a venue rate-limit answer in the
+    /// last 10 s, growth throttled, and busy.
+    fn publish_congestion(&mut self, now: u64) {
+        let limited = self.rt.rate_limited_ns != 0
+            && now.saturating_sub(self.rt.rate_limited_ns) < RATE_LIMITED_NS;
+        let level = if limited {
+            CONGESTION_RATE_LIMITED
+        } else if self.throttled() {
+            CONGESTION_THROTTLED
+        } else if self.ip.at_least(self.ip_cap, BUSY_PCT)
+            || self.ws.at_least(self.ws_cap, BUSY_PCT)
+            || self.rt.pending.live() >= BUSY_IN_FLIGHT
+            || self.rt.rtt_ewma_ns >= BUSY_RTT_NS
+        {
+            CONGESTION_BUSY
+        } else {
+            CONGESTION_NONE
+        };
+        self.rt.stats.set_congestion(level);
+    }
+
     // ---- commands -----------------------------------------------------
 
     /// XG-2: no room for one more command — every class's open batch, the
@@ -1597,6 +1798,10 @@ impl HlGateway {
             Some(REASON_HALTED)
         } else if growth && !self.rt.snapshot_absorbed {
             Some(REASON_NOT_READY)
+        } else if growth && self.throttled() {
+            // XH4e: the rates keep their room for cancels and reads.
+            self.rt.counters.throttled += 1;
+            Some(REASON_THROTTLED)
         } else {
             None
         };
@@ -1677,6 +1882,12 @@ impl HlGateway {
         };
         if let Some(rec) = self.rt.pending.get_mut(h.id) {
             rec.items[0] = ItemRef::of(c);
+            if c.kind == CMD_READ_DAY {
+                // The day read's start rides where a modify's target would,
+                // its end where an order's push stamp would.
+                rec.items[0].prev = c.time_ms;
+                rec.items[0].ts_ns = c.prev_client_oid;
+            }
             rec.n = 1;
         }
         self.rt.inflight_items += 1;
@@ -1847,13 +2058,18 @@ impl HlGateway {
     /// A read (XH4d): the post head, the `/info` body rendered in place
     /// after it, the tail — unsigned, no envelope, no REST twin.
     fn seal_read(&mut self, h: &BatchHead) -> Option<Sealed> {
-        let kind = self.rt.pending.get(h.id)?.items[0].kind;
+        let (kind, start_ms, end_ms) = {
+            let item = &self.rt.pending.get(h.id)?.items[0];
+            (item.kind, item.prev, item.ts_ns)
+        };
         let tx = &mut self.tx[ROOM..];
         let at = ws_info_open(tx, h.id).ok()?;
-        let body = if kind == CMD_READ_ORDERS {
-            open_orders_request(&mut tx[at..], &self.master)
-        } else {
-            perp_state_request(&mut tx[at..], &self.master)
+        let (dst, master) = (&mut tx[at..], &self.master);
+        let body = match kind {
+            CMD_READ_ORDERS => open_orders_request(dst, master),
+            CMD_READ_LIMIT => rate_limit_request(dst, master),
+            CMD_READ_DAY => fills_by_time_request(dst, master, start_ms, end_ms),
+            _ => perp_state_request(dst, master),
         }
         .ok()?;
         let ws_len = ws_post_close(tx, at + body).ok()?;
@@ -1899,6 +2115,7 @@ impl HlGateway {
                 }
             };
         let a = usize::from(active);
+        self.charge_ip(id, now);
         let mask = self.conns[a].next_mask();
         let Ok(start) = ws_frame_in_place(&mut self.tx, ROOM, WsOpcode::Text, s.ws_len, mask)
         else {
@@ -1961,6 +2178,7 @@ impl HlGateway {
     fn post_rest(&mut self, id: u64, s: Sealed, resend: bool) {
         self.rt.stats.note_rest_fallback();
         let written = now_ns();
+        self.charge_ip(id, written);
         if let Some(rec) = self.rt.pending.get_mut(id) {
             rec.conn = CONN_REST;
             rec.written_ns = written;
@@ -2079,6 +2297,7 @@ impl HlGateway {
     fn sweep_cancel_ours(&mut self, now: u64) {
         let n = self.rt.sweep_n.min(self.rt.sweep_hits.len());
         let mut mine = 0usize;
+        let mut sent = 0u64;
         let mut i = 0usize;
         while i < n {
             let h = self.rt.sweep_hits[i];
@@ -2096,8 +2315,12 @@ impl HlGateway {
                 continue;
             }
             self.rt.counters.sweep_cancels += 1;
+            sent += 1;
             self.admit(&HlCmd::cancel(h.slot, h.client_oid, h.asset).at(now), now);
         }
+        // XH4e: the round's cancels, which the engine charges to the
+        // address — one add a round.
+        self.rt.stats.note_sweep_cancels(sent);
         if mine == 0 {
             self.rt.stats.set_sweep(self.sweep_seq, SWEEP_CLEAR);
             self.sweep_phase = SW_IDLE;
@@ -2169,8 +2392,10 @@ mod tests {
         );
         assert_eq!(class_of(&cmd(CMD_CANCEL, Tif::Gtc)), Some(CLASS_CANCEL));
         let mut odd = cmd(CMD_PLACE, Tif::Alo);
-        odd.kind = 9;
+        odd.kind = CMD_READ_DAY + 1;
         assert_eq!(class_of(&odd), None);
+        assert_eq!(class_of(&HlCmd::read_limit(6, 1)), Some(CLASS_READ));
+        assert_eq!(class_of(&HlCmd::read_day(6, 1, 0, 0)), Some(CLASS_READ));
         let mut bad_tif = cmd(CMD_PLACE, Tif::Alo);
         bad_tif.tif = 7;
         assert_eq!(class_of(&bad_tif), None, "an unknown tif is never a Gtc");
@@ -2304,6 +2529,83 @@ mod tests {
             v.push(*e);
         }
         v
+    }
+
+    /// A router with one read of `c`'s kind in flight, as post 5.
+    fn router_with_read(c: &HlCmd) -> (Router, HlEngineEnd) {
+        let (eng, gw) = hl_duplex();
+        let mut rt = Router::new(gw.evt, gw.stats, CoinMap::new());
+        let rec = rt.pending.claim(5, 1).expect("claim");
+        rec.class = CLASS_READ as u8;
+        rec.conn = CONN_REST;
+        rec.timer = None;
+        rec.written_ns = 1;
+        rec.n = 1;
+        rec.items[0] = ItemRef::of(c);
+        rt.inflight_items = 1;
+        (rt, eng)
+    }
+
+    /// XH4e: the budget read's answer is one end carrying the venue's
+    /// figures; the day read's is one end carrying its slot's sum, and its
+    /// rows add IP weight (1 per 20); a read of either that does not scan
+    /// fails with its own code.
+    #[test]
+    fn the_budget_and_day_reads_answer_one_end_each() {
+        let limit = br#"{"type":"userRateLimit","data":{"cumVlm":"1500.5","nRequestsUsed":2890,"nRequestsCap":11500,"nRequestsSurplus":7}}"#;
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_limit(6, 1));
+        rt.on_read_answer(5, limit, 9);
+        let ev = drained(&mut eng);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            (ev[0].kind, ev[0].reason, ev[0].client_oid, ev[0].aux),
+            (EV_READ_DONE, READ_LIMIT, 1, 2_890)
+        );
+        assert_eq!((ev[0].px_1e8, ev[0].sz_1e8), (150_050_000_000, 7));
+
+        let mut hex = [0u8; 34];
+        let n = crate::cloid::to_hex(&crate::cloid::encode(6, 7), &mut hex);
+        let cloid = String::from_utf8(hex[..n].to_vec()).unwrap();
+        let mut rows = Vec::new();
+        let mut t = 0u64;
+        while t < 40 {
+            rows.push(format!(
+                r#"{{"coin":"ETH","px":"10.0","sz":"1.0","side":"B","time":{},"tid":{t},"oid":{t},"cloid":"{cloid}"}}"#,
+                1_000 + t
+            ));
+            t += 1;
+        }
+        let day = format!(
+            r#"{{"type":"userFillsByTime","data":[{}]}}"#,
+            rows.join(",")
+        );
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_day(6, 2, 1_000, 2_000));
+        rt.on_read_answer(5, day.as_bytes(), 9);
+        let ev = drained(&mut eng);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(
+            (
+                ev[0].kind,
+                ev[0].reason,
+                ev[0].aux,
+                ev[0].px_1e8,
+                ev[0].sz_1e8,
+                ev[0].venue_ms
+            ),
+            (EV_READ_DONE, READ_DAY, 40, 40_000_000_000, 0, 1_039)
+        );
+        assert_eq!(rt.read_weight, 2, "1 per 20 rows");
+
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_day(6, 3, 1_000, 2_000));
+        rt.on_read_answer(5, br#"{"type":"userFillsByTime","data":{}}"#, 9);
+        let ev = drained(&mut eng);
+        assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_DAY));
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_limit(6, 4));
+        rt.on_read_answer(5, br#"{"nRequestsUsed":1}"#, 9);
+        let ev = drained(&mut eng);
+        assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_LIMIT));
+        assert_eq!(read_code(CMD_READ_ORDERS), READ_ORDERS);
+        assert_eq!(read_code(CMD_READ_STATE), READ_STATE);
     }
 
     #[test]

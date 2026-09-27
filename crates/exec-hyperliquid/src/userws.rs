@@ -358,81 +358,132 @@ pub fn scan_user_fills(
     }
     let is_snapshot = bool_field(body, b"\"isSnapshot\"").unwrap_or(false);
 
-    let arr = array_start(body, b"\"fills\"").ok_or(ScanErr::Malformed)?;
-    let mut i = arr;
+    let mut i = array_start(body, b"\"fills\"").ok_or(ScanErr::Malformed)?;
     let mut n = 0usize;
-    loop {
-        i = skip_ws(body, i);
-        if i >= body.len() {
-            return Err(ScanErr::Malformed);
-        }
-        match body[i] {
-            b']' => return Ok((n, is_snapshot)),
-            b',' => {
-                i += 1;
-                continue;
-            }
-            b'{' => {}
-            _ => return Err(ScanErr::Malformed),
-        }
-        let end = object_end(body, i).ok_or(ScanErr::Malformed)?;
-        let obj = &body[i..end];
-
-        let coin = string_field(obj, b"\"coin\"").ok_or(ScanErr::Malformed)?;
-        let px = decimal_field(obj, b"\"px\"").ok_or(ScanErr::Malformed)?;
-        let sz = decimal_field(obj, b"\"sz\"").ok_or(ScanErr::Malformed)?;
-        let tid = u64_field(obj, b"\"tid\"").ok_or(ScanErr::Malformed)?;
-        // MANDATORY, like `tid`. A defaulted 0 is not a missing value
-        // here — it collides with `PendingLeg::default().oid`, and
-        // `strategy_bin15::book_fill` matches on `oid` alone, so a row
-        // without one would book against the first family with an
-        // empty pending leg. The routing key cannot be optional when
-        // `coin`, `px`, `sz` and `side` are not.
-        let oid = u64_field(obj, b"\"oid\"").ok_or(ScanErr::Malformed)?;
-        let time_ms = u64_field(obj, b"\"time\"").unwrap_or(0);
-        // Fee is optional on the wire; absent means we measured none,
-        // which is a stated default and NOT a licence to assume zero
-        // fees in general (plan §6.5: measure, do not read).
-        let fee = decimal_field(obj, b"\"fee\"").unwrap_or(0);
-        let side = string_field(obj, b"\"side\"").ok_or(ScanErr::Malformed)?;
-        // An unrecognised side is REFUSED, not defaulted. Defaulting
-        // to Ask would silently book a buy as a sell, and every other
-        // field in this scanner fails closed.
-        let is_buy = match side.of(obj) {
-            b"B" => true,
-            b"A" => false,
-            _ => return Err(ScanErr::Malformed),
-        };
-        let cloid = string_field(obj, b"\"cloid\"").and_then(|s| from_hex(s.of(obj)));
-        // `dir` is descriptive on the wire ("Buy", "Sell",
-        // "Settlement", "Open Long", ...), so an unknown value is NOT
-        // a refusal — only the settlement case is load-bearing here.
-        let is_settlement = string_field(obj, b"\"dir\"")
-            .is_some_and(|d| d.of(obj) == b"Settlement");
-        let crossed = bool_field(obj, b"\"crossed\"").unwrap_or(false);
-
+    while let Some((start, end)) = next_row(body, &mut i)? {
         if n >= out.len() {
             return Err(ScanErr::Malformed);
         }
-        out[n] = UserFill {
-            tid,
-            oid,
-            cloid,
-            coin: Span {
-                start: coin.start + i as u32,
-                end: coin.end + i as u32,
-            },
-            px_1e8: px,
-            sz_1e8: sz,
-            fee_1e8: fee,
-            time_ms,
-            is_buy,
-            is_settlement,
-            crossed,
-        };
+        fill_row(body, start, end, &mut out[n])?;
         n += 1;
-        i = end;
     }
+    Ok((n, is_snapshot))
+}
+
+/// **XH4e — the day's spend from a `userFillsByTime` answer**, scanned in
+/// place with no row table: `(rows, Σ |px × sz| of the rows whose cloid
+/// carries `slot` (USD ×1e8), the latest row's time ms, the rows earlier
+/// than a row before them — 0 for a page in time order)`.
+///
+/// # Errors
+/// No `data` array, or a row that does not scan — never "no fills": a
+/// day read that failed must not read as a day that bought nothing.
+pub fn sum_fill_rows(body: &[u8], slot: u8) -> Result<(u64, i64, u64, u64), ScanErr> {
+    let mut i = array_start(body, b"\"data\"").ok_or(ScanErr::Malformed)?;
+    let (mut rows, mut sum, mut last, mut back) = (0u64, 0i128, 0u64, 0u64);
+    // One row at a time, on the stack: no row table.
+    let mut f = UserFill::default();
+    while let Some((start, end)) = next_row(body, &mut i)? {
+        fill_row(body, start, end, &mut f)?;
+        rows += 1;
+        back += u64::from(f.time_ms < last);
+        last = last.max(f.time_ms);
+        if let Owner::Ours { strategy_id, .. } = owner_of(&f) {
+            if strategy_id == slot {
+                sum += (i128::from(f.px_1e8) * i128::from(f.sz_1e8)).abs() / 100_000_000;
+            }
+        }
+    }
+    Ok((rows, i64::try_from(sum).unwrap_or(i64::MAX), last, back))
+}
+
+/// The next object of the row array `*i` walks: its span, or `None` at
+/// the closing `]`. `*i` moves past it.
+///
+/// # Errors
+/// A truncated array, or anything in it that is not an object.
+#[inline]
+fn next_row(body: &[u8], i: &mut usize) -> Result<Option<(usize, usize)>, ScanErr> {
+    loop {
+        *i = skip_ws(body, *i);
+        if *i >= body.len() {
+            return Err(ScanErr::Malformed);
+        }
+        match body[*i] {
+            b']' => return Ok(None),
+            b',' => *i += 1,
+            b'{' => {
+                let start = *i;
+                let end = object_end(body, start).ok_or(ScanErr::Malformed)?;
+                *i = end;
+                return Ok(Some((start, end)));
+            }
+            _ => return Err(ScanErr::Malformed),
+        }
+    }
+}
+
+/// One fill row — the object at `body[i..end]` — in the venue's own
+/// terms, written into `out`, the caller's slot (one store per field, no
+/// temporary): the one row parser the stream ([`scan_user_fills`]) and the
+/// day read ([`sum_fill_rows`]) share. A refused row leaves `out` as it
+/// was.
+///
+/// # Errors
+/// A mandatory field missing, or a side that is neither.
+#[inline(always)]
+fn fill_row(body: &[u8], i: usize, end: usize, out: &mut UserFill) -> Result<(), ScanErr> {
+    let obj = &body[i..end];
+
+    let coin = string_field(obj, b"\"coin\"").ok_or(ScanErr::Malformed)?;
+    let px = decimal_field(obj, b"\"px\"").ok_or(ScanErr::Malformed)?;
+    let sz = decimal_field(obj, b"\"sz\"").ok_or(ScanErr::Malformed)?;
+    let tid = u64_field(obj, b"\"tid\"").ok_or(ScanErr::Malformed)?;
+    // MANDATORY, like `tid`. A defaulted 0 is not a missing value
+    // here — it collides with `PendingLeg::default().oid`, and
+    // `strategy_bin15::book_fill` matches on `oid` alone, so a row
+    // without one would book against the first family with an
+    // empty pending leg. The routing key cannot be optional when
+    // `coin`, `px`, `sz` and `side` are not.
+    let oid = u64_field(obj, b"\"oid\"").ok_or(ScanErr::Malformed)?;
+    let time_ms = u64_field(obj, b"\"time\"").unwrap_or(0);
+    // Fee is optional on the wire; absent means we measured none,
+    // which is a stated default and NOT a licence to assume zero
+    // fees in general (plan §6.5: measure, do not read).
+    let fee = decimal_field(obj, b"\"fee\"").unwrap_or(0);
+    let side = string_field(obj, b"\"side\"").ok_or(ScanErr::Malformed)?;
+    // An unrecognised side is REFUSED, not defaulted. Defaulting
+    // to Ask would silently book a buy as a sell, and every other
+    // field in this scanner fails closed.
+    let is_buy = match side.of(obj) {
+        b"B" => true,
+        b"A" => false,
+        _ => return Err(ScanErr::Malformed),
+    };
+    let cloid = string_field(obj, b"\"cloid\"").and_then(|s| from_hex(s.of(obj)));
+    // `dir` is descriptive on the wire ("Buy", "Sell",
+    // "Settlement", "Open Long", ...), so an unknown value is NOT
+    // a refusal — only the settlement case is load-bearing here.
+    let is_settlement = string_field(obj, b"\"dir\"")
+        .is_some_and(|d| d.of(obj) == b"Settlement");
+    let crossed = bool_field(obj, b"\"crossed\"").unwrap_or(false);
+    *out = UserFill {
+        tid,
+        oid,
+        cloid,
+        coin: Span {
+            start: coin.start + i as u32,
+            end: coin.end + i as u32,
+        },
+        px_1e8: px,
+        sz_1e8: sz,
+        fee_1e8: fee,
+        time_ms,
+        is_buy,
+        is_settlement,
+        crossed,
+    };
+    Ok(())
 }
 
 /// Is this frame a `userFills` message at all?
@@ -1093,12 +1144,69 @@ mod tests {
         );
     }
 
+    /// XH4e: the day read sums |px × sz| of its slot's rows in place —
+    /// another slot's and a stranger's rows are counted as rows, not as
+    /// spend — and a read that does not scan is an error, never zero.
+    #[test]
+    fn a_day_read_sums_its_slot_s_rows_in_place() {
+        let hex = |slot: u8, cid: u64| {
+            let mut out = [0u8; 34];
+            let n = crate::cloid::to_hex(&crate::cloid::encode(slot, cid), &mut out);
+            String::from_utf8(out[..n].to_vec()).unwrap()
+        };
+        let row = |px: &str, sz: &str, side: &str, time: u64, tid: u64, cloid: &str| {
+            format!(
+                r#"{{"coin":"BTC","px":"{px}","sz":"{sz}","side":"{side}","time":{time},"tid":{tid},"oid":{tid}{cloid}}}"#
+            )
+        };
+        let ours = format!(r#","cloid":"{}""#, hex(6, 7));
+        let theirs = format!(r#","cloid":"{}""#, hex(3, 9));
+        let body = format!(
+            r#"{{"type":"userFillsByTime","data":[{},{},{},{}]}}"#,
+            row("100.0", "0.5", "B", 1_000, 1, &ours),
+            row("10.0", "2.0", "A", 3_000, 2, &ours),
+            row("100.0", "9.0", "B", 2_000, 3, &theirs),
+            row("100.0", "9.0", "B", 2_500, 4, ""),
+        );
+        assert_eq!(
+            sum_fill_rows(body.as_bytes(), 6).ok(),
+            Some((4, 7_000_000_000, 3_000, 2)),
+            "$50 + $20, four rows, the latest at 3 000 — two earlier than a row before them"
+        );
+        let forward = format!(
+            r#"{{"type":"userFillsByTime","data":[{},{}]}}"#,
+            row("100.0", "0.5", "B", 1_000, 1, &ours),
+            row("10.0", "2.0", "A", 1_000, 2, &ours),
+        );
+        assert_eq!(
+            sum_fill_rows(forward.as_bytes(), 6).ok(),
+            Some((2, 7_000_000_000, 1_000, 0)),
+            "equal times run forward"
+        );
+        assert_eq!(sum_fill_rows(br#"{"data":[]}"#, 6).ok(), Some((0, 0, 0, 0)));
+        assert!(sum_fill_rows(br#"{"data":[{"coin":"BTC"}]}"#, 6).is_err());
+        assert!(sum_fill_rows(br#"{"data":[1]}"#, 6).is_err());
+        assert!(sum_fill_rows(br#"{"nodata":1}"#, 6).is_err());
+    }
+
+    /// Every truncation of a good body and 20 000 random ones: the
+    /// stream's scan and (XH4e) the day read's sum return, never panic.
     #[test]
     fn the_scanner_never_panics_on_arbitrary_bytes() {
         let mut out = [UserFill::default(); 4];
         let good = frame_with(&ours_hex(), true);
         for k in 0..good.len() {
             let _ = scan_user_fills(&good[..k], &mut out);
+        }
+        // The day read's shape: the same rows under `data`.
+        let day = format!(
+            r#"{{"type":"userFillsByTime","data":[{{"coin":"BTC","px":"100.5","sz":"0.25","side":"B","time":7,"tid":1,"oid":1,"cloid":"{}"}},{{"coin":"BTC","px":"99","sz":"1","side":"A","time":8,"tid":2,"oid":2}}]}}"#,
+            ours_hex()
+        );
+        let day = day.as_bytes();
+        assert!(sum_fill_rows(day, 3).is_ok(), "the whole body scans");
+        for k in 0..day.len() {
+            let _ = sum_fill_rows(&day[..k], 3);
         }
         let mut x: u64 = 0xDEAD_BEEF_CAFE_F00D;
         for _ in 0..20_000 {
@@ -1110,6 +1218,7 @@ mod tests {
                 *b = x as u8;
             }
             let _ = scan_user_fills(&buf, &mut out);
+            let _ = sum_fill_rows(&buf, 3);
         }
     }
 }

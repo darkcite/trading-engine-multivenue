@@ -40,8 +40,9 @@ pub const VENUE_PAGE_MAX: usize = 2000;
 /// `,"startTime":`, twenty digits and the brace.
 pub const MAX_DAY_REQ: usize = 128;
 
-/// The `/info` request head.
-const HEAD: &[u8] = br#"{"type":"userFillsByTime","user":"0x"#;
+/// The `/info` request head (the gateway arm's day read renders it too:
+/// `recon::fills_by_time_request`).
+pub(crate) const HEAD: &[u8] = br#"{"type":"userFillsByTime","user":"0x"#;
 
 /// The key that follows the address.
 const START_KEY: &[u8] = br#","startTime":"#;
@@ -59,7 +60,7 @@ pub fn fills_since_request(
     // The shared per-user render ends `…0x<hex>"}`: keep the quote,
     // continue the object where its brace was.
     let n = crate::recon::user_info_request(out, HEAD, master)?;
-    let tail = start_ms.checked_ilog10().map_or(1, |d| d as usize + 1);
+    let tail = crate::recon::digits(start_ms);
     let mut i = n - 1;
     if out.len() < i + START_KEY.len() + tail + 1 {
         return Err(ScanErr::Malformed);
@@ -70,14 +71,7 @@ pub fn fills_since_request(
     out[i..i + START_KEY.len()].copy_from_slice(START_KEY);
     i += START_KEY.len();
     // The digits, written in place from the right.
-    let mut v = start_ms;
-    let mut k = i + tail;
-    while k > i {
-        k -= 1;
-        out[k] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    i += tail;
+    i = crate::recon::put_digits(out, i, start_ms, tail);
     out[i] = b'}';
     Ok(i + 1)
 }

@@ -10,7 +10,7 @@
 //! | kind | source | meaning |
 //! |---|---|---|
 //! | [`EV_ACK`] | a post reply item | accepted; `flags` says resting / filled (`oid`, and `px`/`sz` = average price / total size when filled) |
-//! | [`EV_REJECTED`] | a post reply item, `orderUpdates`, or the gateway | refused, `reason` says why; [`REASON_HALTED`], [`REASON_NOT_READY`] and [`REASON_LOCAL`] never left the host, and neither did a REST send refused with [`REASON_TRANSPORT`] (it failed before the request left) |
+//! | [`EV_REJECTED`] | a post reply item, `orderUpdates`, or the gateway | refused, `reason` says why; [`REASON_HALTED`], [`REASON_NOT_READY`], [`REASON_THROTTLED`] and [`REASON_LOCAL`] never left the host, and neither did a REST send refused with [`REASON_TRANSPORT`] (it failed before the request left) |
 //! | [`EV_UNANSWERED`] | the gateway | sent and not settled — a timeout, a socket that died under it, an answer that does not scan or does not fit, the venue API layer's error, a refused re-send: LAW E-5 "sent, unanswered", in doubt, never re-signed; `reason` carries what the venue said, if anything |
 //! | [`EV_RESTING`] / [`EV_CANCELED`] / [`EV_FILLED`] | `orderUpdates` | the order's status changed (`sz` = remaining size) |
 //! | [`EV_FILL`] + [`EV_FILL_META`] | `userFills` | one trade, then its fee (signed, rebates negative) and the crossed flag; `aux` = tid on both |
@@ -19,7 +19,7 @@
 //! | [`EV_HALT`] | the gateway | the gateway halted (`aux` = the halt reason) |
 //! | [`EV_OPEN_ORDER`] | a read (XH4d) | one resting order of the account: `asset`, `oid`, and `slot` / `client_oid` from its cloid ([`SLOT_FOREIGN`] when not ours) |
 //! | [`EV_POSITION`] | a read (XH4d) | one perp position: `asset`, `sz_1e8` = signed size, `aux` = its value at the venue's mark (USD ×1e8) |
-//! | [`EV_READ_DONE`] / [`EV_READ_FAILED`] | a read (XH4d) | the read's end (`reason` = [`READ_ORDERS`] / [`READ_STATE`], `aux` = rows, `px_1e8` = the account value and `venue_ms` its time for a state read) or its failure; `client_oid` / `slot` are the read command's |
+//! | [`EV_READ_DONE`] / [`EV_READ_FAILED`] | a read (XH4d, XH4e) | the read's end (`reason` = [`READ_ORDERS`] / [`READ_STATE`] / [`READ_LIMIT`] / [`READ_DAY`]; `aux` = rows, `px_1e8` = the account value and `venue_ms` its time for a state read; the budget and day reads' fields at their constants — a day page's `sz_1e8` counts the rows whose time ran backward) or its failure; `client_oid` / `slot` are the read command's |
 //!
 //! A post reply's `filled` is an [`EV_ACK`], never [`EV_FILLED`]: the
 //! venue's `filled` status arrives on `orderUpdates` and the trades on
@@ -80,6 +80,14 @@ pub const EV_READ_FAILED: u8 = 15;
 pub const READ_ORDERS: u8 = 1;
 /// A read's `reason`: the account's perp sheet (`clearinghouseState`).
 pub const READ_STATE: u8 = 2;
+/// A read's `reason` (XH4e): the address request budget
+/// (`userRateLimit`) — `aux` = `nRequestsUsed`, `px_1e8` = `cumVlm` (USD
+/// ×1e8), `sz_1e8` = `nRequestsSurplus`.
+pub const READ_LIMIT: u8 = 3;
+/// A read's `reason` (XH4e): a page of the account's fills
+/// (`userFillsByTime`) — `aux` = rows, `px_1e8` = Σ |px × sz| of the read
+/// slot's rows (USD ×1e8), `venue_ms` = the latest row's time.
+pub const READ_DAY: u8 = 4;
 
 /// [`EV_GAP`]: a `userFills` frame did not scan.
 pub const GAP_FILLS_UNREADABLE: u64 = 1;
@@ -128,6 +136,23 @@ pub const REASON_LOCAL: u8 = 18;
 pub const REASON_SETTLEMENT: u8 = 19;
 /// A growing command before the first `userFills` snapshot was absorbed.
 pub const REASON_NOT_READY: u8 = 20;
+/// XH4e: a growing command refused unsent — the gateway runs at 80 % of
+/// its share of the venue's IP weight or WebSocket messages a minute.
+pub const REASON_THROTTLED: u8 = 21;
+
+/// A refusal the gateway gave before the post left the host — its own
+/// (slot, class, halt, snapshot gate, rate shares) or a REST send that
+/// failed before the request left: no venue reject, and no address
+/// request (XH4e: the arm's budget takes it back). One rule for the arm
+/// and the dead man.
+#[inline(always)]
+#[must_use]
+pub(crate) const fn never_left(reason: u8) -> bool {
+    matches!(
+        reason,
+        REASON_LOCAL | REASON_HALTED | REASON_NOT_READY | REASON_THROTTLED | REASON_TRANSPORT
+    )
+}
 
 // The gateway's reasons share the byte with core-types' order-event
 // reasons: those must stay below 12 (or be 255).
@@ -267,6 +292,32 @@ mod tests {
         };
         assert_eq!(e.cmd_kind(), 2);
         assert_eq!(ExecEvent::default().cmd_kind(), 0);
+    }
+
+    /// XH4e: one rule for the arm's refund and the dead man's retry — the
+    /// gateway's own refusals and a REST send that failed before it left
+    /// never left the host; no other reason byte is one of them.
+    #[test]
+    fn never_left_holds_for_the_gateway_s_refusals_only() {
+        let unsent = [
+            REASON_LOCAL,
+            REASON_HALTED,
+            REASON_NOT_READY,
+            REASON_THROTTLED,
+            REASON_TRANSPORT,
+        ];
+        let mut i = 0;
+        while i < unsent.len() {
+            assert!(never_left(unsent[i]), "reason {}", unsent[i]);
+            i += 1;
+        }
+        let mut n = 0u32;
+        let mut r = 0u16;
+        while r <= u16::from(u8::MAX) {
+            n += u32::from(never_left(r as u8));
+            r += 1;
+        }
+        assert_eq!(n, 5, "those five of the 256 reason bytes, no other");
     }
 
     #[test]

@@ -42,8 +42,16 @@ pub enum RiskRefusal {
     /// priced), a short option with no index yet (the venue's IM formula
     /// needs one), or a Binance-routed order on an instrument no row was
     /// bound for. Hyperliquid orders never reach it: their arm refuses a
-    /// non-positive price itself, as before.
+    /// non-positive price itself, as before. **XH4e:** also a perp slot's
+    /// order on an unbound id, and a perp slot's growing order while one
+    /// of its positions has no mark (XH2-C).
     Unpriced,
+    /// **XH4e** — a perp slot's per-perp inventory, working orders
+    /// included (`PerpLimits::cap_perp_usd_1e6`).
+    CapPerp,
+    /// **XH4e** — a perp slot's resting notional
+    /// (`PerpLimits::max_resting_usd_1e6`).
+    MaxResting,
 }
 
 /// Router counters. `Copy` POD; every field saturates rather than
@@ -132,6 +140,12 @@ pub struct RouteCounters {
     /// **BX3** — refused because the order could not be priced under its
     /// instrument's law (see [`RiskRefusal::Unpriced`]).
     pub refused_unpriced: u64,
+    /// **XH4e** — refused by a perp slot's per-perp inventory cap
+    /// ([`RiskRefusal::CapPerp`]). Published with slot 6's block (XH4f).
+    pub refused_cap_perp: u64,
+    /// **XH4e** — refused by a perp slot's resting-notional cap
+    /// ([`RiskRefusal::MaxResting`]). Published with slot 6's block (XH4f).
+    pub refused_max_resting: u64,
     /// **E7 review ruling** — cancels routed to the live arm from an
     /// `Off` slot. Not a refusal: `off` stops PLACING, and a cancel is
     /// the one verb that can only reduce risk, so it passes (the halt
@@ -169,6 +183,8 @@ impl RouteCounters {
             refused_halted: 0,
             refused_short: 0,
             refused_unpriced: 0,
+            refused_cap_perp: 0,
+            refused_max_resting: 0,
             cancel_on_off: 0,
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
@@ -239,6 +255,8 @@ impl RouteCounters {
             RiskRefusal::Halted => &mut self.refused_halted,
             RiskRefusal::Short => &mut self.refused_short,
             RiskRefusal::Unpriced => &mut self.refused_unpriced,
+            RiskRefusal::CapPerp => &mut self.refused_cap_perp,
+            RiskRefusal::MaxResting => &mut self.refused_max_resting,
         };
         *field = field.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);
@@ -331,8 +349,9 @@ mod tests {
     #[test]
     fn counters_are_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<RouteCounters>(), 64);
-        // Four lines: 14 aggregates + two per-slot arrays of 8 = 30
-        // u64 = 240 B, rounded up. Growing past 256 is a decision.
+        // Four lines, full: 16 aggregates + two per-slot arrays of 8 = 32
+        // u64 = 256 B. Growing past it is a decision (XH4e's XH2-C
+        // refusals share `refused_unpriced` rather than take it).
         assert_eq!(core::mem::size_of::<RouteCounters>(), 256);
     }
 

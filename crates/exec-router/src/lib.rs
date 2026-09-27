@@ -79,7 +79,9 @@ pub use ledger::{
 };
 pub use mode::ExecMode;
 pub use null::NullLiveDispatcher;
-pub use route::{ExecRoute, ExecRouteErr, HaltLimits, SlotCaps, EXEC_SLOTS, EXEC_VENUES};
+pub use route::{
+    ExecRoute, ExecRouteErr, HaltLimits, PerpLimits, SlotCaps, EXEC_SLOTS, EXEC_VENUES,
+};
 pub use routed::{RoutedDispatcher, RETIRED_DRAIN_MAX};
 pub use split::SlotSplit;
 pub use venue_split::{VenueSplit, SERVES_A, SERVES_B};

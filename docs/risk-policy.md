@@ -7188,6 +7188,12 @@ Proposed, for the operator to confirm:
     one was last up with a fresh gateway heartbeat (the `ws_up` gauge and
     a 100 ms stamp) — not the time since the last event, which a quiet
     account would read as a gap.
+19. (XH4e) The per-perp inventory cap is its own key,
+    `cap_perp_usd_1e6`, not Appendix B's `cap_instance_usd_1e6 = 150 per
+    perp`: after BX3, `cap_instance` on an instrument row is the slot's
+    projected GROSS exposure. Slot 6 therefore carries `cap_instance`
+    $400 (O-XH5's gross), `cap_perp_usd_1e6` $150 (O-XH5's per perp) and
+    `max_resting_usd_1e6` $300 (O-XH5's resting).
 
 ### XH4a amendment (2026-09-26): the order-gateway kit — nothing wired, nothing armed
 
@@ -7892,6 +7898,298 @@ cancel — its real end is not known). **For Anton:** BX6 built its gateway mach
 `exec-binance` rather than on the `exec-gateway` kit (the pending table,
 the deadline queue, the duplex): two order-gateway cores now — converge
 them before MEXC (XM2) builds a third.
+
+### XH4e amendment (2026-09-26): the perp ledger and the budget governor — nothing wired, nothing armed
+
+The E6 ledger learned perps from BX3/BX6 (instrument rows, `LAW_LINEAR`:
+signed positions per slot, marks with the sanity and 30 s staleness laws,
+the one-price probe, the exit rule over the working orders, and the clip,
+gross and day clamps); XH4e adds what a maker slot needs on top of it,
+and the gateway arm's half of the budget governor (maker plan §8.7–8.8).
+Slots 0–5 and 7 are judged exactly as before; nothing is wired (XH4f).
+
+**Router — perp slots (`PerpLimits`, per slot, 0 = unset; `ExecRoute`
+704 → 832 B).** A slot that sets `cap_perp_usd_1e6` and
+`max_resting_usd_1e6` is a perp slot — both or neither:
+`ExecRoute::set_perp_limits` refuses a pair that sets one without the
+other, or a negative one (`PerpLimitsPartial`) — and on it:
+- an order on an id with no instrument row, or on a row that is not
+  linear, is refused `Unpriced` — a perp order never falls to the HIP-4
+  family clamps;
+- **XH2-C, no mark, no growth:** while any linear row holds a position of
+  the slot that no mark prices (none yet, or older than the ledger's 30 s
+  `MARK_STALE_NS`), every order that is not an exit is refused `Unpriced`.
+  The ledger keeps the count exact per slot — one bit per row and slot,
+  set and cleared wherever a position or a mark changes (a fill, a mark,
+  an expiry, a settlement);
+- **per-perp inventory, working orders included:** |the position + every
+  order working on the order's side (less the one a modify replaces) +
+  the order|, at the cap's one price — the higher of the order's limit
+  and the row's reference (the mark, else the last fill), either side:
+  the held position is worth at least its mark whatever a bid below it
+  says — over `cap_perp_usd_1e6` and larger than the same without the
+  order → `CapPerp`;
+- **resting notional:** Σ remaining × limit over the slot's working
+  orders; a place or modify that takes it over `max_resting_usd_1e6` and
+  raises it → `MaxResting`.
+
+Exits pass both money clamps (O-BX25) and count in the resting sum. The
+order of the clamps: the law, the open-order count, the exit, XH2-C, the
+clip, the per-perp inventory, the resting notional, the gross
+(`cap_instance`), the day. A perp slot's order is probed in ONE pass over
+the resting table (`Ledger::probe_perp`: the exit test's working orders,
+the inventory's and the replaced order's resting term together;
+`InstProbe` 40 → 64 B, one line, still returned by value). The ledger
+keeps each resting row's price in arrays beside the 24 B rows (whose
+full-table scans are unchanged) and the per-slot sum exactly (a property
+test against a recompute); a queued arm's modify counts at the larger of
+its two sizes and the higher of its two prices in the resting sum (which
+only a perp slot reads) and, on a perp slot, in the working orders its
+exit test and inventory add — until its `Renamed`, then at what it asked
+(a refused one keeps them until the row goes); every other slot's exit
+test counts the remaining quantity exactly as BX3 ruled (a pinned test);
+an order the table could not hold keeps its notional for good, as it
+keeps its count (fail closed). The refusals count in
+`RouteCounters.refused_cap_perp` /
+`refused_max_resting` (and in `refused_risk`); XH2-C's count in
+`refused_unpriced` — `RouteCounters` is full at 256 B and growing it is
+the decision its layout test pins — so XH4f publishes slot 6's
+`unmarked_positions` as a gauge: the alertable signal of a dead mark feed.
+
+**The ledger after a refused modify — closed by XH4f's queued-arm
+contract.** While this arm answers `verbs_confirm_later` false, the
+router renames a resting row at a modify's `Ok`; a modify the gateway or
+the venue refuses after that closes the replacement, and the router's
+`on_cancel` of it drops the predecessor — still resting at the venue,
+released by the arm — from the open-order count, the resting sum and the
+working orders until the member's cancel lands: one clip per side in
+transition, more often under throttling. XH4d's merge note already hands
+XH4f the contract that closes it (the arm answers `verbs_confirm_later`
+true, a modify's landing emits `Renamed`, a refusal leaves the
+predecessor's row as it was); the asked size held above is what lets that
+contract count a queued size increase, and XH4f releases a refused queued
+modify's hold when its replacement's retirement arrives (the replacement's
+cloid kept beside the hold) — until then the hold stays until the row's
+next modify or its end, the conservative way. Nothing is wired before it.
+
+**Gateway — the rates.** Every post charges a one-minute window of the
+venue's IP weight — an action 1 + ⌊n/40⌋, `clearinghouseState` 2, the
+other reads 20 (the venue's REST weights: its weighting of WebSocket-posted
+info is unmeasured), `userFillsByTime` 1 more per 20 rows — and every
+WebSocket frame (posts, pings, pongs, subscribes) a window of its
+messages, against the gateway's shares (`IP_WEIGHT_SHARE` 400 of the
+venue's 1 200 a minute per IP, which the blocking arm and the ingress
+share; `WS_MSG_SHARE` 1 000 of 2 000). At 80 % of either share, growth
+(a place, a modify, a leverage change — a reduce-only place included, as
+XH1 rules for the halt and the snapshot gate: no member relies on the bit
+for an exit) is refused unsent, `REASON_THROTTLED` — it never left, so it
+is no reject, feeds no streak and is taken back from the address budget;
+cancels, control actions, reads and pings still go. The congestion word
+(`GatewayStats::congestion`, published with the gateway's heartbeat: at
+most ten stores a second on the line the engine polls): 0; 1 busy (60 %
+of a share, 60 posts in flight, or a post-RTT moving average of 1 s); 2
+throttled; 3 a venue rate-limit answer in the last 10 s. The arm reports
+it (`congestion()`). A sweep round's cancels reach the engine as one add.
+
+**The arithmetic, for XH4f.** At XH4d's read defaults the orders read
+(20) and the sheet (2) every 5 s are 264 IP weight a minute, and the
+budget read at a 60 s period 20 more: 71 % of the 400 share. The word
+then reads busy for good, and the throttle line (320) leaves ≈ 36 a
+minute for every action, the switch's 12 re-arms and each gone re-read —
+below a maker's requote rate — while a boot's day pages (≤ 120 each)
+throttle growth outright, XH4f's `updateLeverage` included. XH4f
+therefore sizes `recon_ms` (the orders read may run slower than the
+sheet) and the shares together — or XH4g measures the WebSocket info
+weights first — and retries a leverage change refused `THROTTLED`.
+
+**Arm — the address budget.** Read from the venue (`userRateLimit`, a
+WebSocket-posted read) after the boot's orders read and every `limit_ms`
+(≤ 10 min); between reads the arm counts one address request per item it
+pushes — a place, a modify, a cancel, a control post (never exempted as a
+cancel: whether `scheduleCancel` draws on the cancel allowance is
+unmeasured) — and per cancel of the gateway's own sweeps (its stats
+word), and takes one back for each of its own — a place, a modify, a
+cancel, the switch's post — the gateway refused unsent (a read is no
+address request; no other control post is the arm's). Every count errs
+high but one: the requests unanswered when a read goes (places and
+modifies sent or in doubt, cancels sent, the switch's post) and every one
+pushed while it is in flight are added on top of its answer (some may
+count twice) — the exception, untracked by rows, is the cancels still in
+flight as a read goes of a sweep round (at most one round: inside the
+floor's headroom, which holds two cancels per order the arm can hold) and
+of the unknown orders an orders read found (one each; after boot any
+unknown order also halts the slot, its drift pinned), under-counted until
+the next read states them — and no fill is credited between reads — the
+last read may already count a fill that arrives after it; the next read
+states the volume (≈ 4 requests a minute at the probe's rate). The arm is
+not ready before the first answer; **growth is refused** (`SlotDisabled`,
+counted `refused_budget`; no halt) **once no read has answered for three
+`limit_ms`**, until one does. **At or below `budget_floor`** (at least
+`MIN_BUDGET_FLOOR` = 2 × 128 + 64 = 320 — every order the arm can hold
+cancelled twice over and 64 re-arms — or the boot refuses the arm,
+`ArmErr::Budget`): places and modifies are refused (`SlotDisabled`, the
+blocking arm's answer), `budget_floor_breached` is 1 — the router's
+`BudgetFloor` halt: cancel-all, sticky — and **the dead man stays armed
+while the arm holds an order or the cancel-all is not read clear** (the
+floor is the headroom for exactly that cleanup; LAW XH-1), then parks at
+once, the requote hold skipped (its re-arms alone cost ≈ 17 280 requests
+a quoting day). A shutdown at the floor keeps the switch armed until the
+venue reads clear, as every shutdown does. Cancels are never refused; the
+venue's separate cancel allowance, min(cap + 100 000, 2 × cap), is
+modelled (`AddressBudget::cancel_remaining`) and reported. **The shared
+address:** on the testnet account slots 0 and 3 spend from the same
+address unseen by this arm between reads — the next read states it (the
+staleness bound only fires when reads stop answering); on mainnet slot 6
+trades from its own master (O-XH5).
+**Deferred, for Anton:** top-ups (`reserveRequestWeight`, the blocking
+arm's S7-L1 path) on the gateway arm — the probe earns ≈ 1 request per $1
+traded; XH5 decides. A stale `expiresAfter` rejection's 5× charge is not
+modelled (the venue's wording is unmeasured; the next read corrects the
+count).
+
+**Arm — the day's spend (S7-L1 gap A; the XH4d amendment's XH4e
+obligation).** Read once, after the first budget answer:
+`userFillsByTime` from 00:00Z, page after page — each from the last one's
+latest row, inclusive (a row on the boundary counts twice, the
+conservative way), a read period later and never while the gateway's
+rates read throttled, and every page ending at the time the first page
+went (`endTime`, taken again each time the first page is asked: later
+fills are the live ledger's, and on a shared account other slots' new
+fills cannot keep the read moving) — until a page adds nothing past its
+start (a short page is not taken as the end: the venue's 2 000-row page
+is documented, not measured) — and the rows whose cloid carries the slot
+summed as |px × sz|: an upper bound on the day's increasing turnover (the
+venue's `startPosition` is account-wide on the shared testnet account).
+**The day reads spent** (fail closed, every sum saturating; counted
+`day_unreadable`) once the rows read **plus every fill the account took
+after `endTime`** reach 10 000 — the venue serves only an account's
+10 000 most recent fills, counted to the moment it answers, so fills
+after `endTime` (other slots' on a shared account) push the day's first
+rows toward the edge unseen by the pages (risk r3): the arm counts each
+one the user stream brings, any slot's or a stranger's (one with no time
+counts too), and judges the sum at every page, the page that adds nothing
+included (it answers a read period after the last page with rows: the
+fills that raced that page are in by then) — or once a stream gap that
+may have lost fills (not an `orderUpdates` frame) falls while the read
+holds its `endTime` (a page answered, or the first in flight: before
+that, the first page asked again takes a new `endTime` and what the gap
+lost comes back as rows), or the read needs more than 20 pages, meets a
+full page that cannot move past its start, or a page whose rows ran
+backward in time (the scan counts them in place: a venue answering the
+newest rows first would leave a gap the next page's start skips, so such
+a page fails closed instead of open; the order is unmeasured — XH4g
+measures it before any live slot 6). What the count cannot see: a fill
+stamped after `endTime` that reached the arm — or was lost to a gap —
+before the first page was asked (the host's clock behind the venue's:
+milliseconds of fills), or one the stream brings more than a read period
+late — the boundary rows, at least one a page and counted twice, err the
+other way. A failed budget or day read is
+asked again a read period later (each is 20 IP weight or more; a read
+that keeps failing retries for ever and `reconciled` waits — fail
+closed). `reconciled` waits for the day, so the router — which adopts the
+arm's `venue_day_bought` before it seeds — never restarts the slot's day
+cap at a full allowance. XH4f's S7-L1 pin becomes a test of that. **A
+full page's size:** ≈ 0.8 MB of real-length rows (a loopback test: 2 000
+rows with a cloid, a hash and a builder fee, in one frame, fit the post
+connection's 1 MiB receive buffer and sum in place, the connection kept);
+a page past 1 MiB would drop the post connection (`BadFrame`, its posts
+in doubt) — XH4g measures a real page and, if one nears the bound, pages
+by a narrower `endTime`. **Its rustls cost:** a full page is ≈ 50 TLS
+records and a burst past rustls' 4 KiB receive window (it grows and
+shrinks: more allocations than a short read's — gate 96b pins 4 for two
+short reads), up to ≈ 250 records for the read's 10 000-row bound, once a
+boot and before `reconciled` — off the trading path; it joins the rustls
+record-layer residue (TL4/TL5b), and XH4g counts one real page. **For
+Anton:** Appendix B calls slot 6's `cap_day_usd_1e6` ($5 000) a reporting
+bound, but the router ENFORCES it (clamp 4, the increasing part of every
+fill); at the paper rate (≈ 17 fills an hour of ≈ $15) a busy day reaches
+it, a restart sooner (the venue's figure counts both sides). XH4f sets it
+from the XH3 bar's fill rate, or the router gets a report-only mode.
+
+**Fill stamps.** A venue fill's `ts_ns` is the venue's time × 1e6 (wall),
+as the blocking arm stamps one; XH4d stamped the gateway's monotonic
+clock, which the ledger's day epoch would have read as wall time.
+
+**Obligations handed on:**
+- **XH4f:** slot 6's `PerpLimits` from two new `exec.toml` keys (the
+  grammar, `exec.toml.example`, the boot tell and the pinned test;
+  deviation 19) — the boot refuses a live slot 6 unless BOTH are > 0 (the
+  router refuses a partial pair too); bind slot 6's perps as `LAW_LINEAR`
+  instrument rows — disjoint from slot 0's hedge perps, since the router
+  judges every slot's order on a bound id by its law; feed Hyperliquid
+  marks (`activeAssetCtx`: `markPx`, and `oraclePx` as the index) through
+  BX6's `Mark` channel **stamped on the monotonic clock**
+  (`core_time::now_ns()`, as BX6's lane stamps them: `expire_marks` reads
+  a monotonic now, so a wall-stamped mark would never go stale and XH2-C's
+  expiry half would be silently off) — without marks XH2-C refuses every
+  growing order once slot 6 holds a position; the queued-arm contract
+  (XH4d's merge note; it closes the refused-modify gap above) and the
+  release of a refused queued modify's hold when its replacement's
+  retirement arrives (the replacement's cloid kept beside the hold);
+  `ArmCfg.budget_floor` from `request_budget_floor` (≥ `MIN_BUDGET_FLOOR`)
+  and `limit_ms`; the gateway's shares and `recon_ms`, sized together (the
+  arithmetic above; `recon_ms` at least 1 s — the day read's last page
+  waits one read period for the stream to bring the fills that raced the
+  page before it); leverage changes sent through the arm (charged to
+  its budget) or charged by their sender, a `THROTTLED` one retried; the
+  member's congestion pull and its requote cap; `/metrics` for
+  `refused_cap_perp`, `refused_max_resting`, slot 6's
+  `unmarked_positions` (a gauge), the budget (`budget()`,
+  `cancel_remaining`), `throttled`, `refunded`, `limit_reads`,
+  `day_pages`, `day_unreadable`, the resting sum (`resting_usd_1e6`), the
+  rate windows (`RateWindow::sum`) and the gateway's `throttled` — each of
+  these public items has no production caller until then (the checklist
+  the allocation review asked for); an allocation gate driving slot 6
+  through the router — XH2-C refusing, a mark arriving, `CapPerp` and
+  `MaxResting` refusing, a queued modify's asked hold (the perp half of
+  the probe is 0 B by inspection and runs only once `PerpLimits` is set).
+- **XH4g (testnet):** the shares against the host's real Hyperliquid
+  traffic; the WebSocket info weights; the stale-expiry rejection's
+  wording; `userFillsByTime`'s page size, which end of a range over 2 000
+  rows a page is cut at (the next page starts at a page's latest row, so
+  the oldest end is assumed: a cut at the newest, in time order, would
+  skip rows unseen), its bytes against `MAX_WS_BUF`, its order within a
+  page, its `endTime` and the venue's 10 000-fill retention, counted to the
+  moment it answers (the day read's spent rule rests on both).
+
+**Reviews:** r1 — zero-copy APPROVE WITH NITS, allocation APPROVE WITH
+NITS, risk REJECT (MAJOR: the dead man parked at the budget floor while
+orders rested — an engine stall or a Stranded sweep in the halt's window
+left them with no venue switch) → the fixes above, every MINOR and NIT
+applied or answered here (not done: a reduce-only exemption from the
+throttle, XH1; a separate XH2-C counter, `RouteCounters` full; the
+pre-existing `Json::u64` scratch, its own ticket in the XH4d amendment);
+r2 — zero-copy, allocation and risk APPROVE WITH NITS (risk's on the
+condition that the queued-size hold's reach be stated) → the hold kept
+off every non-perp slot's exit test (pinned), the day read's `endTime`
+and its time-order check, the refund kept to the arm's own posts, the
+floor's flat-and-Working and shutdown cases pinned, one `never_left`
+rule for the arm and the dead man, the `HlGateway` bound, the probe by
+reference, the docs (not done: carrying a sweep round's in-flight
+cancels into a read — above; proving the park branch in gate 98's window
+— boolean, gate 97 covers the clear); r3 — zero-copy APPROVE, allocation
+and risk APPROVE WITH NITS (risk's on the condition that its N1 land: a
+shared account's fills after `endTime` could push the day's first rows out
+of the venue's 10 000 unseen, the more so for a first page retried with
+its old `endTime`) → every fill after `endTime` counted with the rows and
+judged at every page, a stream gap during the read spending the day,
+`endTime` taken again at each ask of the first page (all pinned); the
+unknown orders' cancels in the under-count; the page's cut end on XH4g's
+list; the hold's release on XH4f's; `never_left` pinned (a truth-table
+test, THROTTLED in the dead man's retry test); `DAY_MS`, the page size
+and the digit writer shared with `dayspend` (the dead man's `DAY_MS`
+too); the docs; r4 — zero-copy APPROVE, allocation and risk APPROVE WITH
+NITS, no condition (N1 closed as built) → the gap's spend kept to a read
+holding its `endTime` and to gaps that may lose fills, a fill with no
+time counted, the post-gap page's test made to fail without its guard,
+`never_left` swept over all 256 reason bytes, the `userFillsByTime` head
+shared with `dayspend`, `recon_ms` ≥ 1 s on XH4f's list, the docs; r5 —
+zero-copy APPROVE, allocation and risk APPROVE WITH NITS (risk: pin the
+first page in flight before merge, no further round) → the gap's spend
+pinned wherever the read holds its `endTime` (the first page in flight
+on a `userFills` frame that did not scan, between pages on a reconnect,
+a later page in flight on a gap of no stated kind), the residual's twin
+stated (a fill lost to a gap before the first page was asked), the docs.
 
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 

@@ -27,6 +27,8 @@
 //! | read, no socket | a read never goes REST: with no socket it is refused `TRANSPORT`, unsent |
 //! | sweep | the cancel-all word: a read, a cancelByCloid of this gateway's slots only (never another slot's, never a stranger's), a settle, a read with none left — `SWEEP_CLEAR`; the sweep's reads emit nothing, its cancels' answers reach the arm |
 //! | stranded | a sweep that never reads clear stops after 8 rounds `SWEEP_STRANDED`; a new request starts over |
+//! | rates | XH4e: the budget and day reads post as `info` (the day's start in place) and answer one end each; past 80 % of the IP share growth is refused `THROTTLED` unsent while a cancel still goes, and the congestion word says `THROTTLED` |
+//! | full page | XH4e: a full day page — 2 000 real-length rows, ≈ 0.8 MB in one frame — fits the receive buffer (`MAX_WS_BUF`) and is summed in place; the connection holds |
 //!
 //! Offline path: this file MAY allocate.
 
@@ -35,17 +37,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use core_types::{ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_MARGIN};
-use exec_gateway::stats::{HALT_VENUE_BASE, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING};
+use exec_gateway::stats::{
+    CONGESTION_THROTTLED, HALT_VENUE_BASE, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING,
+};
 use exec_gateway::Idle;
 use exec_hyperliquid::cloid;
 use exec_hyperliquid::cmd::{HlCmd, CMD_CANCEL, CMD_PLACE};
 use exec_hyperliquid::event::{
     ExecEvent, EVF_BUY, EVF_CROSSED, EVF_RESTING, EV_ACK, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP,
     EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
-    EV_UNANSWERED, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED,
-    REASON_NOT_READY, REASON_RATE_LIMIT, REASON_TRANSPORT, SLOT_FOREIGN,
+    EV_UNANSWERED, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL,
+    REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_THROTTLED, REASON_TRANSPORT,
+    SLOT_FOREIGN,
 };
-use exec_hyperliquid::gateway::{hl_duplex, CoinMap, GatewayCfg, HlEngineEnd, HlGateway};
+use exec_hyperliquid::gateway::{
+    hl_duplex, CoinMap, GatewayCfg, HlEngineEnd, HlGateway, IP_WEIGHT_SHARE, WS_MSG_SHARE,
+};
 use exec_hyperliquid::testvenue::{items_in, resting, Answer, Venue};
 use exec_hyperliquid::{Network, Tif};
 
@@ -56,6 +63,11 @@ const CANCEL_OK: &str =
 const DEFAULT_OK: &str = r#"{"status":"ok","response":{"type":"default"}}"#;
 
 fn gateway(v: &Venue, post_timeout_ns: u64) -> (HlGateway, HlEngineEnd) {
+    gateway_with(v, post_timeout_ns, IP_WEIGHT_SHARE)
+}
+
+/// A gateway with an IP-weight share of `ip` a minute (XH4e).
+fn gateway_with(v: &Venue, post_timeout_ns: u64, ip: u32) -> (HlGateway, HlEngineEnd) {
     let (eng, gw_end) = hl_duplex();
     let mut coins = CoinMap::new();
     assert!(coins.insert(b"ETH", ETH));
@@ -68,6 +80,8 @@ fn gateway(v: &Venue, post_timeout_ns: u64) -> (HlGateway, HlEngineEnd) {
         slots: 1 << SLOT,
         post_timeout_ns,
         idle: Idle::new(0, 1_000_000),
+        ip_weight_per_min: ip,
+        ws_msgs_per_min: WS_MSG_SHARE,
     };
     let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("key");
     let gw = HlGateway::new(cfg, gw_end, sk, coins).expect("gateway");
@@ -737,6 +751,154 @@ fn reads_answer_their_rows_then_their_end_and_an_unreadable_one_fails() {
         (0, 0)
     );
     assert_eq!((gw.counters().reads, gw.counters().reads_failed), (2, 1));
+}
+
+/// XH4e: the budget and day reads post as `info` — the day's start
+/// rendered in place — and answer one end each; two reads (weight 40) put
+/// the gateway past 80 % of an IP share of 25, so growth is refused
+/// `THROTTLED` unsent while a cancel still goes, and the congestion word
+/// says so.
+#[test]
+fn over_its_rate_share_growth_is_throttled_and_the_new_reads_answer() {
+    let v = Venue::start();
+    v.policy(|s| {
+        if s.body.contains("userRateLimit") {
+            Answer::Info(
+                r#"{"type":"userRateLimit","data":{"cumVlm":"1500.5","nRequestsUsed":2890,"nRequestsCap":11500,"nRequestsSurplus":7}}"#
+                    .into(),
+            )
+        } else if s.body.contains("userFillsByTime") {
+            Answer::Info(format!(
+                r#"{{"type":"userFillsByTime","data":[{},{}]}}"#,
+                fill_row(1, "0.01", false),
+                fill_row(2, "0.01", true)
+            ))
+        } else if s.body.contains("cancelByCloid") {
+            Answer::Action(CANCEL_OK.into())
+        } else {
+            Answer::Silent
+        }
+    });
+    let (mut gw, mut eng) = gateway_with(&v, 5_000_000_000, 25);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    assert!(eng.cmd.push(&HlCmd::read_limit(SLOT, 1)));
+    assert!(eng.cmd.push(&HlCmd::read_day(
+        SLOT,
+        2,
+        1_790_000_000_000,
+        1_790_000_600_000
+    )));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e,
+        EV_READ_DONE
+    ) >= 2));
+    let posts = v.posts();
+    assert!(
+        posts[1]
+            .body
+            .contains(r#""startTime":1790000000000,"endTime":1790000600000}"#),
+        "{}",
+        posts[1].body
+    );
+    let end = |cid: u64| {
+        *evs.iter()
+            .find(|e| e.client_oid == cid && e.kind == EV_READ_DONE)
+            .unwrap()
+    };
+    let l = end(1);
+    assert_eq!(
+        (l.reason, l.aux, l.px_1e8, l.sz_1e8),
+        (READ_LIMIT, 2_890, 150_050_000_000, 7)
+    );
+    let d = end(2);
+    assert_eq!(
+        (d.reason, d.aux, d.px_1e8, d.venue_ms),
+        (READ_DAY, 2, 50_010_000_000, 1_700_000_000_000),
+        "two rows of 0.1 at 2 500.5"
+    );
+    assert!(eng.cmd.push(&alo(3)));
+    assert!(eng.cmd.push(&HlCmd::cancel(SLOT, 4, ETH)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| e
+        .iter()
+        .any(|x| x.client_oid == 4 && x.kind == EV_ACK)));
+    let refused: Vec<(u64, u8)> = evs
+        .iter()
+        .filter(|e| e.kind == EV_REJECTED)
+        .map(|e| (e.client_oid, e.reason))
+        .collect();
+    assert_eq!(refused, [(3, REASON_THROTTLED)]);
+    assert_eq!(gw.counters().throttled, 1);
+    // The word goes with the heartbeat (≤ 100 ms).
+    let t = std::time::Instant::now();
+    while eng.stats.congestion() != CONGESTION_THROTTLED
+        && t.elapsed() < std::time::Duration::from_secs(2)
+    {
+        gw.turn();
+    }
+    assert_eq!(eng.stats.congestion(), CONGESTION_THROTTLED);
+    assert_eq!(v.posts().len(), 3, "the place never left the host");
+}
+
+/// XH4e: a full page of the day's fills — the venue's 2 000 rows, each as
+/// long as a real one with a cloid, a hash and a builder fee (≈ 0.4 KiB:
+/// ≈ 0.8 MB in one frame) — fits the post connection's receive buffer and
+/// is summed in place: one end, 2 000 rows, the latest time, the
+/// connection kept. XH4g measures the venue's real page against the same
+/// bound.
+#[test]
+fn a_full_day_page_is_one_frame_summed_in_place() {
+    let hash = format!("0x{}", "ab".repeat(32));
+    let ours = cloid_hex(SLOT, 7);
+    let mut rows = String::with_capacity(2_000 * 440);
+    let mut k = 0u64;
+    while k < 2_000 {
+        if k > 0 {
+            rows.push(',');
+        }
+        rows.push_str(&format!(
+            r#"{{"coin":"ETH","px":"109663.25","sz":"0.00013","side":"B","time":{},"startPosition":"-0.00261","dir":"Close Short","closedPnl":"0.004836","hash":"{hash}","oid":{},"crossed":false,"fee":"0.006357","tid":{},"cloid":"{ours}","builderFee":"0.001234","feeToken":"USDC","twapId":null}}"#,
+            1_790_000_000_000 + k,
+            110_939_869_658 + k,
+            1_063_627_418_003_425 + k
+        ));
+        k += 1;
+    }
+    let page = format!(r#"{{"type":"userFillsByTime","data":[{rows}]}}"#);
+    assert!(
+        page.len() > 780_000 && page.len() < exec_hyperliquid::MAX_WS_BUF,
+        "a full page of real-length rows: {} B",
+        page.len()
+    );
+    let v = Venue::start();
+    v.policy(move |s| {
+        if s.body.contains("userFillsByTime") {
+            Answer::Info(page.clone())
+        } else {
+            Answer::Silent
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    assert!(eng.cmd.push(&HlCmd::read_day(
+        SLOT,
+        1,
+        1_790_000_000_000,
+        1_790_000_600_000
+    )));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 10, |_, e| e.iter().any(
+        |x| x.client_oid == 1 && (x.kind == EV_READ_DONE || x.kind == EV_READ_FAILED)
+    )));
+    let d = *evs.iter().find(|e| e.client_oid == 1).unwrap();
+    assert_eq!(
+        (d.kind, d.reason, d.aux, d.sz_1e8, d.venue_ms),
+        (EV_READ_DONE, READ_DAY, 2_000, 0, 1_790_000_001_999),
+        "one end: every row, in time order, the latest time"
+    );
+    assert!(d.px_1e8 > 0, "our rows summed");
+    assert!(gw.ws_live() && gw.swaps() == 0, "the connection held");
+    assert_eq!(count(&evs, EV_GAP), 0);
 }
 
 #[test]

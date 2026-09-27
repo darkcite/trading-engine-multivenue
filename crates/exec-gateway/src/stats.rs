@@ -103,6 +103,18 @@ pub const SWEEP_WORKING: u64 = 1;
 /// The sweep spent its rounds and the venue never read clear: ask again.
 pub const SWEEP_STRANDED: u64 = 2;
 
+/// XH4e — the congestion word ([`GatewayStats::congestion`]): the rates
+/// have room.
+pub const CONGESTION_NONE: u64 = 0;
+/// Busy: a rate window over 60 % of its share, most of the in-flight
+/// bound used, or the venue's answers slow.
+pub const CONGESTION_BUSY: u64 = 1;
+/// Throttled: a rate window at 80 % of its share — growth is refused
+/// unsent; cancels, reads and pings still go.
+pub const CONGESTION_THROTTLED: u64 = 2;
+/// The venue answered a rate-limit error in the last 10 s.
+pub const CONGESTION_RATE_LIMITED: u64 = 3;
+
 /// The halt word: written by the gateway (at most once per arm), read by
 /// the engine before every order.
 #[repr(C, align(128))]
@@ -124,9 +136,11 @@ struct GatewayWritten {
     in_flight: AtomicU64,
 }
 
-/// Written by the GATEWAY thread only, rarely (on change; the heartbeat
-/// at most ten times a second): the engine reads it on every idle pass
-/// and halt poll, so it must not share a line with the per-post counters.
+/// Written by the GATEWAY thread only, rarely: the sweep words when a
+/// request changes, the heartbeat and (XH4e) the congestion word at most
+/// ten times a second, the sweep's cancel count once a sweep round. The
+/// engine reads it on every idle pass and halt poll, so it must not share
+/// a line with the per-post counters.
 #[repr(C, align(128))]
 struct GatewayLive {
     ws_up: AtomicU64,
@@ -136,6 +150,14 @@ struct GatewayLive {
     sweep_seq: AtomicU64,
     /// [`SWEEP_CLEAR`] / [`SWEEP_WORKING`] / [`SWEEP_STRANDED`].
     sweep_state: AtomicU64,
+    /// XH4e: `CONGESTION_*` — how close the gateway runs to its share of
+    /// the venue's rate limits (advisory: the gateway enforces the
+    /// throttle itself); published with the heartbeat.
+    congestion: AtomicU64,
+    /// XH4e: cancels the gateway's own sweeps sent, ever — address
+    /// requests the engine charges to its budget by the delta; one add a
+    /// sweep round.
+    sweep_cancels: AtomicU64,
 }
 
 /// Shared stats of one gateway (one venue account): built once at boot,
@@ -198,6 +220,8 @@ impl GatewayStats {
                 heartbeat_ns: z(),
                 sweep_seq: z(),
                 sweep_state: z(),
+                congestion: z(),
+                sweep_cancels: z(),
             },
             push_to_write: Lat::new(),
             post_rtt: Lat::new(),
@@ -329,6 +353,24 @@ impl GatewayStats {
         self.live.heartbeat_ns.store(now_ns, Ordering::Relaxed);
     }
 
+    /// XH4e: publish the congestion level, `CONGESTION_*` (gateway only,
+    /// with its heartbeat; stored on change).
+    #[inline]
+    pub fn set_congestion(&self, level: u64) {
+        if self.live.congestion.load(Ordering::Relaxed) != level {
+            self.live.congestion.store(level, Ordering::Relaxed);
+        }
+    }
+
+    /// XH4e: a sweep round sent `n` cancels (gateway only; one add a
+    /// round, none for an empty one).
+    #[inline]
+    pub fn note_sweep_cancels(&self, n: u64) {
+        if n > 0 {
+            self.live.sweep_cancels.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     // --- readers (either thread, /metrics) ---------------------------
 
     /// The halt reason, [`HALT_NONE`] while running.
@@ -347,6 +389,18 @@ impl GatewayStats {
     #[inline]
     pub fn heartbeat_ns(&self) -> u64 {
         self.live.heartbeat_ns.load(Ordering::Relaxed)
+    }
+
+    /// XH4e: the congestion level, `CONGESTION_*`.
+    #[inline]
+    pub fn congestion(&self) -> u64 {
+        self.live.congestion.load(Ordering::Relaxed)
+    }
+
+    /// XH4e: cancels the gateway's sweeps sent, ever.
+    #[inline]
+    pub fn sweep_cancels(&self) -> u64 {
+        self.live.sweep_cancels.load(Ordering::Relaxed)
     }
 
     /// Commands the engine pushed / the ring refused (full).

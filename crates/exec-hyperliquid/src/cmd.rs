@@ -39,6 +39,13 @@ pub const CMD_READ_ORDERS: u8 = 7;
 /// Read (XH4d): the account's perp sheet (`clearinghouseState`);
 /// answered by `EV_POSITION` rows and `EV_READ_DONE`.
 pub const CMD_READ_STATE: u8 = 8;
+/// Read (XH4e): the address request budget (`userRateLimit`); answered by
+/// `EV_READ_DONE` alone.
+pub const CMD_READ_LIMIT: u8 = 9;
+/// Read (XH4e): the account's fills from `time_ms` to `prev_client_oid`
+/// (`userFillsByTime`'s `startTime` and `endTime`, venue wall ms), summed
+/// in place for the command's slot; answered by `EV_READ_DONE` alone.
+pub const CMD_READ_DAY: u8 = 10;
 
 /// `flags`: reduce-only.
 pub const CMD_FLAG_REDUCE_ONLY: u8 = 1;
@@ -55,6 +62,8 @@ pub struct HlCmd {
     /// The order's client id (the low 8 bytes of its cloid, LAW E-9).
     pub client_oid: u64,
     /// [`CMD_MODIFY`]: the client id of the order being replaced.
+    /// [`CMD_READ_DAY`]: the last fill time read (the read's end), venue
+    /// wall ms.
     pub prev_client_oid: u64,
     /// Limit price, 1e8.
     pub px_1e8: i64,
@@ -79,7 +88,8 @@ pub struct HlCmd {
     /// [`CMD_LEVERAGE`]: the leverage, a whole number.
     pub arg: u32,
     /// [`CMD_SCHEDULE_CANCEL`]: the venue wall time to cancel at, ms; 0
-    /// clears the schedule.
+    /// clears the schedule. [`CMD_READ_DAY`]: the first fill time read,
+    /// venue wall ms.
     pub time_ms: u64,
 }
 
@@ -222,11 +232,32 @@ impl HlCmd {
         c
     }
 
+    /// Read (XH4e): the address request budget.
+    #[inline(always)]
+    #[must_use]
+    pub const fn read_limit(slot: u8, client_oid: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_READ_LIMIT;
+        c
+    }
+
+    /// Read (XH4e): the account's fills from `start_ms` to `end_ms` (venue
+    /// wall ms, both inclusive), summed for `slot`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn read_day(slot: u8, client_oid: u64, start_ms: u64, end_ms: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_READ_DAY;
+        c.time_ms = start_ms;
+        c.prev_client_oid = end_ms;
+        c
+    }
+
     /// A read (posted alone, unsigned, WebSocket only).
     #[inline(always)]
     #[must_use]
     pub const fn is_read(&self) -> bool {
-        self.kind == CMD_READ_ORDERS || self.kind == CMD_READ_STATE
+        self.kind >= CMD_READ_ORDERS && self.kind <= CMD_READ_DAY
     }
 
     /// Reduce-only.

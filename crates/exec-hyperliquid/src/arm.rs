@@ -74,7 +74,48 @@
 //! dead gateway thread cannot hide behind a frozen gauge), the drift high
 //! water, the streaks, `reconciled`, the reconciliation age, the P&L, the
 //! ALO rate, and the gateway's halt word (read from the stats block: an
-//! event can be lost, the word cannot). The budget floor is XH4e's.
+//! event can be lost, the word cannot), and the budget floor.
+//!
+//! **The address budget (XH4e, maker plan §8.7)** is read from the venue
+//! (`userRateLimit`) after the boot's orders read and every `limit_ms`;
+//! between reads the arm counts one address request per item it pushes —
+//! a place, a modify, a cancel, a control post (never exempted as a
+//! cancel) — and per cancel of the gateway's own sweeps (its stats word),
+//! and takes one back for each the gateway refused unsent. Every count
+//! errs high: the requests unanswered when a read goes and every one
+//! pushed while it is in flight are added on top of its answer (some may
+//! count twice), and no fill is credited between reads (the next read
+//! states the volume they earned). The arm is not ready before the first
+//! answer, and growth is refused once no read has answered for
+//! [`LIMIT_STALE_PERIODS`] periods. At or below `budget_floor` (at least
+//! [`MIN_BUDGET_FLOOR`]) places and modifies are refused and the router's
+//! `BudgetFloor` halts the slot; the dead man stays armed while the arm
+//! holds an order or the halt's cancel-all is not read clear — the floor
+//! is the headroom for exactly that cleanup — and parks once the arm is
+//! flat and the venue reads clear (its re-arms alone cost ≈ 17 280
+//! requests a quoting day).
+//!
+//! **The day's spend (XH4e, S7-L1 gap A)** is read once, after the first
+//! budget read: the slot's own fills since 00:00Z (`userFillsByTime`,
+//! page after page — each from the last one's latest row, a read period
+//! later, never while the gateway's rates read throttled — until a page
+//! adds nothing past its start: the venue's page size is not taken on
+//! trust), summed as |px × sz| — an upper bound on the day's increasing
+//! turnover — and handed to the router
+//! ([`OrderDispatch::venue_day_bought`]); the arm reports `reconciled`
+//! only once it is read, so the router's day cap never restarts at a full
+//! allowance on a boot. Every page ends at the time the first page went
+//! (taken again each time it is asked; later fills are the live ledger's),
+//! so the pages converge. The venue serves an account's 10 000 most recent
+//! fills, counted to the moment it answers: a read whose rows plus the
+//! account's fills since its end (any slot's, as the stream brings them)
+//! reach them — or that meets a stream gap which may have lost fills
+//! while it holds its end, needs more than [`DAY_PAGES_MAX`] pages, meets
+//! a full page that cannot move, or a page whose rows ran backward in time
+//! (its next start could skip some) — reads the day spent (fail closed). A
+//! failed budget or day read is asked again a read period later. A fill is
+//! stamped with the venue's time (wall), as the blocking arm stamps it:
+//! the router's day epoch is wall time.
 //!
 //! Engine thread, 0 B/op after boot (gate 98): fixed tables, fixed
 //! queues, linear scans over at most [`ARM_ORDERS`] rows.
@@ -92,17 +133,20 @@ use core_types::{
     ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED, ORDER_EVENT_REJECTED,
     ORDER_EVENT_RESTING,
 };
-use exec_gateway::stats::{SWEEP_CLEAR, SWEEP_STRANDED};
+use exec_gateway::stats::{CONGESTION_THROTTLED, SWEEP_CLEAR, SWEEP_STRANDED};
 use exec_gateway::{boxed_array, HALT_NONE};
 
 use crate::action::Tif;
+use crate::budget::AddressBudget;
 use crate::cmd::{HlCmd, CMD_CANCEL};
+use crate::dayspend::{DAY_MS, VENUE_PAGE_MAX};
 use crate::deadman::{DeadMan, DeadManCfg};
 use crate::event::{
-    ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM, EV_ACK, EV_CANCELED,
-    EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE,
-    EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED, READ_ORDERS, READ_STATE,
-    REASON_HALTED, REASON_LOCAL, REASON_NOT_FOUND, REASON_NOT_READY, REASON_TRANSPORT,
+    never_left, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM, EV_ACK,
+    EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION,
+    EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
+    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_NOT_FOUND,
+    REASON_THROTTLED,
 };
 use crate::gateway::HlEngineEnd;
 use crate::nonce::now_ms;
@@ -157,6 +201,33 @@ const MAX_WINDOW_MS: u64 = 60_000;
 /// The largest shutdown bound a boot takes, ms: the engine's stop never
 /// waits on the venue longer.
 const MAX_SHUTDOWN_MS: u64 = 30_000;
+/// XH4e — the longest the budget goes unread, ms (between reads the arm
+/// counts its own requests).
+const MAX_LIMIT_MS: u64 = 600_000;
+/// XH4e — the venue's page of `userFillsByTime` ([`VENUE_PAGE_MAX`]: as
+/// documented, unmeasured) in a day page's row count: a full page that
+/// cannot move past its start leaves rows unread.
+const DAY_PAGE: u64 = VENUE_PAGE_MAX as u64;
+/// XH4e — the venue serves an account's 10 000 most recent fills, counted
+/// to the moment it answers: a day read whose rows plus the account's
+/// fills since its end reach them may have lost the day's start, and the
+/// day reads spent.
+const DAY_ROWS_MAX: u32 = 10_000;
+/// XH4e — the most pages a day read takes (its cost: up to 120 IP weight a
+/// page); a read that needs more reads the day spent.
+const DAY_PAGES_MAX: u8 = 20;
+/// XH4e — what a day the arm could not read to its start reports, USD
+/// ×1e8: spent (every sum the router adds it to saturates).
+const DAY_SPENT_1E8: i64 = i64::MAX;
+/// XH4e — a budget no read has answered for this many `limit_ms` is
+/// stale: growth is refused until one does (the count alone drifts —
+/// another user of the address, a request the venue counted unseen).
+const LIMIT_STALE_PERIODS: u64 = 3;
+/// XH4e — the fewest requests a `budget_floor` may keep: at the floor the
+/// arm still cancels every order it can hold twice over (its own cancel
+/// and the gateway sweep's) and keeps the dead man armed through the
+/// cleanup — 64 re-arms, five minutes of them at the default period.
+pub const MIN_BUDGET_FLOOR: u64 = 2 * ARM_ORDERS as u64 + 64;
 /// Arm-internal client ids (the dead man's posts and the reads): never
 /// cloids; their post items carry command bits 0, an order's never do.
 const DEADMAN_OID_BASE: u64 = 1 << 63;
@@ -251,6 +322,13 @@ pub struct ArmCfg {
     pub anchor_1e6: i64,
     /// The dead-man switch's timing.
     pub deadman: DeadManCfg,
+    /// XH4e: the address budget's floor, requests (the exec.toml
+    /// `request_budget_floor`, at least [`MIN_BUDGET_FLOOR`]): at or below
+    /// it places and modifies are refused, the router halts the slot, and
+    /// the dead man parks once nothing of ours can rest.
+    pub budget_floor: u64,
+    /// XH4e: the budget is read from the venue this often, ms (≤ 10 min).
+    pub limit_ms: u64,
 }
 
 /// Why an arm cannot be built.
@@ -260,12 +338,15 @@ pub enum ArmErr {
     Slot,
     /// No perps, more than [`ARM_PERPS`], or one bound twice.
     Perps,
-    /// A zero expiry, post timeout, read period, join, gone or shutdown
-    /// window, or one above its bound (60 s; the shutdown 30 s); a skew
-    /// above 5 s; a dead-man answer that is not the post timeout.
+    /// A zero expiry, post timeout, read period, join, gone, shutdown or
+    /// budget period, or one above its bound (60 s; the shutdown 30 s; the
+    /// budget 10 min); a skew above 5 s; a dead-man answer that is not the
+    /// post timeout.
     Timing,
     /// The dead-man timing does not hold.
     DeadMan,
+    /// XH4e: a budget floor below [`MIN_BUDGET_FLOOR`].
+    Budget,
 }
 
 /// What the arm has seen (its `/metrics` block, XH4f).
@@ -326,6 +407,24 @@ pub struct ArmCounters {
     /// Out-queue entries lost to a full queue (the room checks make it a
     /// bug).
     pub dropped: u64,
+    /// Places and modifies refused at the budget floor, or while the
+    /// budget is stale (XH4e).
+    pub refused_budget: u64,
+    /// Places and modifies the gateway refused unsent over its rate
+    /// shares (XH4e: `REASON_THROTTLED`; never a venue reject).
+    pub throttled: u64,
+    /// Budget reads answered (XH4e).
+    pub limit_reads: u64,
+    /// Pages of the day's fills read (XH4e).
+    pub day_pages: u64,
+    /// Days read spent because their start may be unread (XH4e): the
+    /// venue's 10 000 reached (the rows read plus the account's fills since
+    /// the read's end), a stream gap while the read held its end, the page
+    /// bound, a full page that cannot move, or rows out of time order.
+    pub day_unreadable: u64,
+    /// Requests taken back from the budget: the gateway refused them
+    /// before they left (XH4e).
+    pub refunded: u64,
 }
 
 /// One tracked order. One cache line.
@@ -525,11 +624,34 @@ pub struct HlGatewayArm {
     deadman: DeadMan,
     /// The dead man's command, built in place.
     scratch: HlCmd,
+    // XH4e: the address budget (the venue's figures at the last read and
+    // every request since), whether one was read, the next read, the
+    // requests pushed while one is in flight, the sweep cancels charged.
+    budget: AddressBudget,
+    limit_ok: bool,
+    limit_due_ns: u64,
+    limit_sent: u64,
+    sweep_charged: u64,
+    // XH4e: the day's spend — every page's end (venue ms, taken at each
+    // ask of the first page; its UTC day is the day read), the next page's
+    // start, when it goes, the sum so far (USD ×1e8), done.
+    day_until_ms: u64,
+    day_from_ms: u64,
+    day_due_ns: u64,
+    day_bought_1e8: i64,
+    day_done: bool,
+    /// Day pages read, and the rows toward the venue's 10 000: the rows
+    /// read plus the account's fills since the end (the bounds end the
+    /// read spent).
+    day_pages_read: u8,
+    day_rows: u32,
+    /// When the budget goes stale: three periods after the last answer.
+    limit_stale_ns: u64,
 }
 
-// The arm's inline state, 1 344 B — what `new` moves into its owner (the
+// The arm's inline state, 1 536 B — what `new` moves into its owner (the
 // tables are boxed).
-const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_344);
+const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_536);
 
 /// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
 /// reports: a post-only cross, or an order in doubt that never landed,
@@ -584,17 +706,22 @@ impl HlGatewayArm {
             || window(cfg.gone_ms)
             || cfg.shutdown_ms == 0
             || cfg.shutdown_ms > MAX_SHUTDOWN_MS
+            || cfg.limit_ms == 0
+            || cfg.limit_ms > MAX_LIMIT_MS
             || cfg.skew_ms > MAX_SKEW_MS
             || cfg.deadman.answer_ms != cfg.post_timeout_ms
         {
             return Err(ArmErr::Timing);
         }
+        if cfg.budget_floor < MIN_BUDGET_FLOOR {
+            return Err(ArmErr::Budget);
+        }
         let deadman =
             DeadMan::new(cfg.deadman, cfg.slot, DEADMAN_OID_BASE).map_err(|_| ArmErr::DeadMan)?;
-        // COPY: the arm's inline state — 1 344 B, const-asserted (the
-        // configuration ≈ 0.3 KiB, the dead man 256 B, counters, the
-        // stats, the ring end, the scratch command, the queue heads and
-        // words) — moved at boot into the owner, cold;
+        // COPY: the arm's inline state — 1 536 B, const-asserted (the
+        // configuration ≈ 0.3 KiB, the dead man 256 B, the address budget
+        // 64 B, counters, the stats, the ring end, the scratch command,
+        // the queue heads and words) — moved at boot into the owner, cold;
         // rejected: boxing the arm (every verb would chase a pointer). Its
         // tables are boxed here, never moved.
         Ok(Self {
@@ -654,6 +781,22 @@ impl HlGatewayArm {
             hold_until_ns: 0,
             deadman,
             scratch: HlCmd::noop(cfg.slot, 0),
+            // The arm keeps no budget state file — the venue's read is the
+            // budget's only source — so the address a file is checked
+            // against is unused.
+            budget: AddressBudget::cold([0; 20], cfg.budget_floor),
+            limit_ok: false,
+            limit_due_ns: 0,
+            limit_sent: 0,
+            sweep_charged: 0,
+            day_until_ms: 0,
+            day_from_ms: 0,
+            day_due_ns: 0,
+            day_bought_1e8: 0,
+            day_done: false,
+            day_pages_read: 0,
+            day_rows: 0,
+            limit_stale_ns: 0,
         })
     }
 
@@ -676,11 +819,53 @@ impl HlGatewayArm {
     }
 
     /// Booted (the sweep, the sheet, the orders), the seeding sheet flat in
-    /// every bound perp, and the dead man's boot clear answered: the arm
-    /// takes orders.
+    /// every bound perp, the dead man's boot clear answered and the budget
+    /// read (XH4e): the arm takes orders.
     #[must_use]
     pub const fn ready(&self) -> bool {
-        self.boot == BOOT_DONE && !self.boot_held && self.deadman.settled()
+        self.boot == BOOT_DONE && !self.boot_held && self.deadman.settled() && self.limit_ok
+    }
+
+    /// XH4e: the address budget as the arm models it — the venue's figures
+    /// at the last read plus every request since; `None` before the first
+    /// read.
+    #[must_use]
+    pub const fn budget(&self) -> Option<&AddressBudget> {
+        if self.limit_ok {
+            Some(&self.budget)
+        } else {
+            None
+        }
+    }
+
+    /// XH4e: the budget at or below its floor — the router's `BudgetFloor`
+    /// halt; places and modifies refused; the dead man parked once nothing
+    /// of ours can rest. Never before the first read: nothing is known, and
+    /// nothing is sent.
+    #[must_use]
+    pub fn budget_floor_breached(&self) -> bool {
+        self.limit_ok && self.budget.may_submit().is_err()
+    }
+
+    /// XH4e: no budget read has answered for [`LIMIT_STALE_PERIODS`]
+    /// periods since the first — growth is refused (no halt: the next read
+    /// that answers lifts it).
+    #[inline]
+    fn budget_stale(&self, now: u64) -> bool {
+        self.limit_ok && now > self.limit_stale_ns
+    }
+
+    /// XH4e: growth refused — the budget at its floor, or stale.
+    #[inline]
+    fn budget_refuses(&self, now: u64) -> bool {
+        self.budget_floor_breached() || self.budget_stale(now)
+    }
+
+    /// XH4e: the gateway's congestion word (`exec_gateway::stats::
+    /// CONGESTION_*`) — the member's pull reads it (XH4f).
+    #[must_use]
+    pub fn congestion(&self) -> u64 {
+        self.end.stats.congestion()
     }
 
     /// The seeding sheet held a position in a bound perp: the arm is held
@@ -827,6 +1012,22 @@ impl HlGatewayArm {
         live
     }
 
+    /// XH4e: address requests pushed and not answered yet — places and
+    /// modifies sent or in doubt, cancels sent, the dead man's post: each
+    /// may or may not be in the figure a budget read about to go states.
+    fn unanswered(&self) -> u64 {
+        let n = self.n_rows.min(ARM_ORDERS);
+        let mut k = u64::from(self.deadman.in_flight());
+        let mut i = 0usize;
+        while i < n {
+            let r = &self.rows[i];
+            k += u64::from(r.state == ST_SENT || r.state == ST_DOUBT)
+                + u64::from(r.cancel == CX_SENT);
+            i += 1;
+        }
+        k
+    }
+
     /// Room on every out-queue for one more step.
     #[inline]
     fn room(&self) -> bool {
@@ -963,6 +1164,7 @@ impl HlGatewayArm {
             .cmd
             .push(&HlCmd::cancel(self.cfg.slot, self.rows[i].client_oid, asset).at(now))
         {
+            self.charge(1);
             self.rows[i].cancel = CX_SENT;
             // A row thought gone keeps its gone wait (or its hold for a
             // modify): its cancel is best effort, the wait ends it.
@@ -985,6 +1187,30 @@ impl HlGatewayArm {
         if self.rows[i].state != ST_GONE {
             self.rows[i].due_ns = due;
         }
+    }
+
+    /// XH4e: `n` address requests left the arm — each place, modify,
+    /// cancel and control post is one, a control post never exempted as a
+    /// cancel — counted against the budget and, while a budget read is in
+    /// flight, added on top of its answer.
+    #[inline]
+    fn charge(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.budget
+            .on_action_sent(u32::try_from(n).unwrap_or(u32::MAX));
+        self.limit_sent = self.limit_sent.saturating_add(n);
+    }
+
+    /// XH4e: `n` requests the arm charged never left — the gateway refused
+    /// them unsent: taken back, from a budget read's carry too.
+    #[inline]
+    fn refund(&mut self, n: u64) {
+        self.budget
+            .on_action_unsent(u32::try_from(n).unwrap_or(u32::MAX));
+        self.limit_sent = self.limit_sent.saturating_sub(n);
+        self.counters.refunded += n;
     }
 
     fn alo_note(&mut self, bad: bool) {
@@ -1021,6 +1247,17 @@ impl HlGatewayArm {
 
     fn on_event(&mut self, e: &ExecEvent, now: u64) {
         let post = e.flags & EVF_POST_ITEM != 0;
+        if post
+            && e.kind == EV_REJECTED
+            && e.slot == self.cfg.slot
+            && never_left(e.reason)
+            && (e.cmd_kind() != 0 || e.client_oid & READ_OID_BASE == DEADMAN_OID_BASE)
+        {
+            // XH4e: a request this arm charged — a place, a modify, a
+            // cancel, the dead man's post — refused unsent. A read is no
+            // address request, and no other control post is the arm's.
+            self.refund(1);
+        }
         if post && e.cmd_kind() == 0 {
             self.on_internal(e, now);
             return;
@@ -1047,6 +1284,13 @@ impl HlGatewayArm {
                 // flight went before the gap: it cannot say).
                 self.reread = true;
                 self.lose_exclusive(now);
+                // XH4e: fills past a day read's end among them — while the
+                // read holds its end, its count toward the venue's 10 000
+                // may be short: spent (an `orderUpdates` frame carries no
+                // fill; a first page asked again takes a new end).
+                if e.aux != GAP_UPDATES_UNREADABLE && self.day_holds_end() {
+                    self.day_spent();
+                }
             }
             EV_OPEN_ORDER => self.on_open_order(e, now),
             EV_POSITION => self.on_position(e),
@@ -1107,13 +1351,13 @@ impl HlGatewayArm {
 
     /// A post item the gateway or the venue refused.
     fn on_refused(&mut self, e: &ExecEvent, now: u64) {
-        let never_left = matches!(
-            e.reason,
-            REASON_LOCAL | REASON_HALTED | REASON_NOT_READY | REASON_TRANSPORT
-        );
+        let unsent = never_left(e.reason);
+        if e.reason == REASON_THROTTLED {
+            self.counters.throttled += 1;
+        }
         if e.cmd_kind() == CMD_CANCEL {
             if let Some(i) = self.answered(e, now) {
-                self.cancel_refused(i, e.reason, never_left, now);
+                self.cancel_refused(i, e.reason, unsent, now);
             }
             return;
         }
@@ -1127,7 +1371,7 @@ impl HlGatewayArm {
         let Some(i) = self.answered(e, now) else {
             return;
         };
-        if !never_left && !alo_cross {
+        if !unsent && !alo_cross {
             self.counters.rejects += 1;
             self.reject_streak += 1;
             if self.rows[i].bits & RB_ALO != 0 {
@@ -1139,8 +1383,8 @@ impl HlGatewayArm {
         self.release(prev, now);
     }
 
-    fn cancel_refused(&mut self, i: usize, reason: u8, never_left: bool, now: u64) {
-        if never_left || reason != REASON_NOT_FOUND {
+    fn cancel_refused(&mut self, i: usize, reason: u8, unsent: bool, now: u64) {
+        if unsent || reason != REASON_NOT_FOUND {
             self.want_cancel(i, now.saturating_add(CANCEL_RETRY_NS));
             return;
         }
@@ -1270,6 +1514,16 @@ impl HlGatewayArm {
     /// `userFills`: one trade. Booked, handed to the engine, joined with
     /// its order.
     fn on_fill(&mut self, e: &ExecEvent, now: u64) {
+        // XH4e: the volume a fill earns the address is not credited here —
+        // the last budget read may already count a fill that arrives after
+        // it; the next read states it. A fill past a day read's end — any
+        // slot's, a stranger's, one with no time — takes one of the venue's
+        // 10 000 places: it counts with the day's rows.
+        self.day_rows = self.day_rows.saturating_add(u32::from(
+            self.day_until_ms != 0
+                && !self.day_done
+                && (e.venue_ms == 0 || e.venue_ms > self.day_until_ms),
+        ));
         if e.slot != self.cfg.slot {
             self.counters.fills_foreign += 1;
             return;
@@ -1282,8 +1536,10 @@ impl HlGatewayArm {
         self.book(p, if buy { e.sz_1e8 } else { -e.sz_1e8 }, e.venue_ms);
         self.perps[p].last_px_1e8 = e.px_1e8;
         let side = if buy { Side::Bid } else { Side::Ask };
+        // XH4e: the venue's time, wall — as the blocking arm stamps a venue
+        // fill; the router's day epoch reads it as wall time.
         let f = Fill::new(
-            e.ts_ns,
+            e.venue_ms.saturating_mul(1_000_000),
             self.cfg.perps[p].sym,
             side,
             Price(e.px_1e8 / WIRE_PER_ENGINE),
@@ -1336,10 +1592,11 @@ impl HlGatewayArm {
 
     fn issue_read(&mut self, kind: u8, now: u64) -> bool {
         let oid = READ_OID_BASE + self.read_seq + 1;
-        let c = if kind == READ_ORDERS {
-            HlCmd::read_orders(self.cfg.slot, oid)
-        } else {
-            HlCmd::read_state(self.cfg.slot, oid)
+        let c = match kind {
+            READ_ORDERS => HlCmd::read_orders(self.cfg.slot, oid),
+            READ_LIMIT => HlCmd::read_limit(self.cfg.slot, oid),
+            READ_DAY => HlCmd::read_day(self.cfg.slot, oid, self.day_from_ms, self.day_until_ms),
+            _ => HlCmd::read_state(self.cfg.slot, oid),
         };
         if !self.end.cmd.push(&c.at(now)) {
             self.counters.ring_full += 1;
@@ -1349,34 +1606,123 @@ impl HlGatewayArm {
         self.read_oid = oid;
         self.read_kind = kind;
         self.read_ns = now;
-        if kind == READ_ORDERS {
-            self.epoch = self.epoch.wrapping_add(1);
-            self.reread = false;
-            self.others = false;
-            self.unknown_this_read = 0;
-        } else {
-            self.unknown_positions = 0;
-            let n = self.cfg.n_perps.min(ARM_PERPS);
-            let mut p = 0usize;
-            while p < n {
-                self.perps[p].venue_1e8 = 0;
-                self.perps[p].value_1e8 = 0;
-                p += 1;
+        match kind {
+            READ_ORDERS => {
+                self.epoch = self.epoch.wrapping_add(1);
+                self.reread = false;
+                self.others = false;
+                self.unknown_this_read = 0;
             }
+            READ_STATE => {
+                self.unknown_positions = 0;
+                let n = self.cfg.n_perps.min(ARM_PERPS);
+                let mut p = 0usize;
+                while p < n {
+                    self.perps[p].venue_1e8 = 0;
+                    self.perps[p].value_1e8 = 0;
+                    p += 1;
+                }
+            }
+            // XH4e: what the venue may not have counted yet goes on top of
+            // its answer.
+            READ_LIMIT => self.limit_sent = self.unanswered(),
+            _ => {}
         }
         true
     }
 
-    /// The read in flight failed: ask again after a skew.
+    /// The read in flight failed: the sheet and the orders are asked again
+    /// after a skew; the budget and the day (XH4e: 20 IP weight or more
+    /// each) a read period later.
     fn read_failed(&mut self, now: u64) {
         self.counters.reads_failed += 1;
         let retry = now.saturating_add(self.cfg.skew_ms * NS_PER_MS);
-        if self.read_kind == READ_ORDERS {
-            self.next_orders_ns = retry;
-        } else {
-            self.next_state_ns = retry;
+        let slow = now.saturating_add(self.cfg.recon_ms.max(self.cfg.skew_ms) * NS_PER_MS);
+        match self.read_kind {
+            READ_ORDERS => self.next_orders_ns = retry,
+            READ_LIMIT => self.limit_due_ns = slow,
+            READ_DAY => self.day_due_ns = slow,
+            _ => self.next_state_ns = retry,
         }
         self.read_oid = 0;
+    }
+
+    /// XH4e: the budget as the venue states it (`nRequestsUsed`, `cumVlm`,
+    /// `nRequestsSurplus`), plus every request unanswered when the read
+    /// went and every one pushed since — some may be counted twice, the
+    /// conservative way.
+    fn limit_done(&mut self, e: &ExecEvent, now: u64) {
+        self.budget = AddressBudget::from_venue(
+            [0; 20],
+            self.cfg.budget_floor,
+            e.aux,
+            e.px_1e8 / WIRE_PER_ENGINE,
+            u64::try_from(e.sz_1e8).unwrap_or(0),
+        );
+        let since = self.limit_sent;
+        self.charge(since);
+        self.limit_ok = true;
+        self.limit_stale_ns =
+            now.saturating_add(LIMIT_STALE_PERIODS * self.cfg.limit_ms * NS_PER_MS);
+        self.counters.limit_reads += 1;
+        self.limit_due_ns = now.saturating_add(self.cfg.limit_ms * NS_PER_MS);
+    }
+
+    /// XH4e: one page of the day's fills — the read slot's |px × sz| (USD
+    /// ×1e8) added. A page that adds nothing past its start ends the read
+    /// (a short page is not the end: the venue's page size is unmeasured);
+    /// any other is followed a read period later by the next, from its
+    /// latest row's time, inclusive — a row on the boundary counts twice,
+    /// the conservative way. The read ends spent at rows out of time order,
+    /// a full page that cannot move, [`DAY_PAGES_MAX`] pages, or rows plus
+    /// the account's fills since its end (`on_fill`) at the venue's 10 000
+    /// — the page that adds nothing judged too: it answers a read period
+    /// after the last page with rows, so the fills that raced that one are
+    /// in. A page answered after a gap spent the day adds nothing.
+    fn day_page(&mut self, e: &ExecEvent, now: u64) {
+        self.counters.day_pages += 1;
+        if self.day_done {
+            return;
+        }
+        self.day_bought_1e8 = self.day_bought_1e8.saturating_add(e.px_1e8.max(0));
+        self.day_pages_read += 1;
+        self.day_rows = self
+            .day_rows
+            .saturating_add(u32::try_from(e.aux).unwrap_or(u32::MAX));
+        let moved = e.venue_ms > self.day_from_ms;
+        let ordered = e.sz_1e8 == 0;
+        let reached = self.day_rows >= DAY_ROWS_MAX;
+        if ordered && !moved && e.aux < DAY_PAGE && !reached {
+            // Nothing past its start: the day is read.
+            self.day_done = true;
+            return;
+        }
+        if !ordered || !moved || reached || self.day_pages_read >= DAY_PAGES_MAX {
+            // Rows out of time order (the next start could skip some), a
+            // full page that cannot move, the venue's 10 000 reached, or
+            // the read's page bound: the day's start may be past reach.
+            self.day_spent();
+            return;
+        }
+        self.day_from_ms = e.venue_ms;
+        self.day_due_ns = now.saturating_add(self.cfg.recon_ms * NS_PER_MS);
+    }
+
+    /// XH4e: the day's start may be past reach — the day reads spent
+    /// (every sum the router adds it to saturates: fail closed), and the
+    /// read ends.
+    fn day_spent(&mut self) {
+        self.counters.day_unreadable += 1;
+        self.day_bought_1e8 = DAY_SPENT_1E8;
+        self.day_done = true;
+    }
+
+    /// XH4e: the day read holds its end — a page answered, or the first in
+    /// flight. Before that, what a gap lost comes back as rows: the first
+    /// page, asked again, takes a new end (the clock-skew residual aside).
+    fn day_holds_end(&self) -> bool {
+        !self.day_done
+            && (self.day_pages_read > 0 || (self.read_oid != 0 && self.read_kind == READ_DAY))
     }
 
     /// One resting order of the account.
@@ -1438,13 +1784,16 @@ impl HlGatewayArm {
         if self.boot == BOOT_DONE {
             self.counters.unknown_orders += 1;
         }
-        if e.asset != ASSET_UNKNOWN
-            && !self
+        if e.asset != ASSET_UNKNOWN {
+            if self
                 .end
                 .cmd
                 .push(&HlCmd::cancel(self.cfg.slot, e.client_oid, e.asset).at(now))
-        {
-            self.counters.ring_full += 1;
+            {
+                self.charge(1);
+            } else {
+                self.counters.ring_full += 1;
+            }
         }
     }
 
@@ -1468,19 +1817,25 @@ impl HlGatewayArm {
         if self.read_oid == 0 || e.slot != self.cfg.slot || e.client_oid != self.read_oid {
             return;
         }
-        if e.kind == EV_READ_FAILED {
+        if e.kind == EV_READ_FAILED || e.reason != self.read_kind {
+            // An end of another kind answers no read of this one.
             self.read_failed(now);
             return;
         }
         self.read_oid = 0;
         self.counters.reads += 1;
         let next = now.saturating_add(self.cfg.recon_ms * NS_PER_MS);
-        if self.read_kind == READ_ORDERS {
-            self.orders_done(now);
-            self.next_orders_ns = next;
-        } else {
-            self.state_done(e.px_1e8, e.venue_ms, now);
-            self.next_state_ns = next;
+        match self.read_kind {
+            READ_ORDERS => {
+                self.orders_done(now);
+                self.next_orders_ns = next;
+            }
+            READ_LIMIT => self.limit_done(e, now),
+            READ_DAY => self.day_page(e, now),
+            _ => {
+                self.state_done(e.px_1e8, e.venue_ms, now);
+                self.next_state_ns = next;
+            }
         }
     }
 
@@ -1606,6 +1961,12 @@ impl HlGatewayArm {
         if self.stream_alive(now) {
             self.up_ns = now;
         }
+        // XH4e: the gateway's own sweep cancels are this address's too.
+        let swept = self.end.stats.sweep_cancels();
+        if swept > self.sweep_charged {
+            self.charge(swept - self.sweep_charged);
+            self.sweep_charged = swept;
+        }
         worked |= self.boot_step(now);
         worked |= self.recon_step(now);
         worked |= self.row_timers(now);
@@ -1668,6 +2029,32 @@ impl HlGatewayArm {
         if self.boot != BOOT_STATE && now >= self.next_orders_ns {
             return self.issue_read(READ_ORDERS, now);
         }
+        // XH4e: after the boot's sheet and orders, the budget (and every
+        // `limit_ms`), then the day's spend, page by page, once.
+        if self.boot == BOOT_DONE {
+            if now >= self.limit_due_ns {
+                return self.issue_read(READ_LIMIT, now);
+            }
+            // A page — 20 IP weight and one more per 20 rows — never goes
+            // while the gateway's rates read throttled.
+            if self.limit_ok
+                && !self.day_done
+                && now >= self.day_due_ns
+                && self.end.stats.congestion() < CONGESTION_THROTTLED
+            {
+                if self.day_pages_read == 0 {
+                    // Every page ends here: fills after it are the live
+                    // ledger's, and the pages converge. Taken at each ask
+                    // of the first page: a retry reads the fills since the
+                    // failed ask as rows, and the count past the old end
+                    // goes.
+                    self.day_until_ms = now_ms();
+                    self.day_from_ms = self.day_until_ms / DAY_MS * DAY_MS;
+                    self.day_rows = 0;
+                }
+                return self.issue_read(READ_DAY, now);
+            }
+        }
         false
     }
 
@@ -1717,7 +2104,8 @@ impl HlGatewayArm {
     /// The dead man: wanted while the arm is booted, the account is the
     /// slot's (or read to hold no other slot's orders since), and the arm
     /// holds or lately held an order — or a cancel-all is not read clear
-    /// (a Stranded sweep may leave ours on the book).
+    /// (a Stranded sweep may leave ours on the book). At the budget floor
+    /// (XH4e) only while it holds one or the cancel-all is not clear.
     fn deadman_step(&mut self, now: u64) -> bool {
         let want = self.deadman_wanted(now);
         self.drive_deadman(want, now)
@@ -1726,13 +2114,19 @@ impl HlGatewayArm {
     fn deadman_wanted(&mut self, now: u64) -> bool {
         // After boot (whose own sweep reads clear before it ends), a
         // cancel-all not read clear holds the switch like an order does.
-        if self.n_rows > 0
-            || (self.boot == BOOT_DONE && self.cancel_all_state() != CancelAllState::Clear)
-        {
+        let holding = self.n_rows > 0
+            || (self.boot == BOOT_DONE && self.cancel_all_state() != CancelAllState::Clear);
+        if holding {
             self.hold_until_ns = now.saturating_add(WANT_HOLD_NS);
         }
         let alone = self.cfg.own_account || self.exclusive;
-        self.boot == BOOT_DONE && alone && now < self.hold_until_ns
+        // XH4e: at the budget floor the switch parks — its re-arms would
+        // spend what is left — but only once nothing of ours can rest:
+        // while an order is held or the halt's cancel-all is not read clear
+        // it stays armed (the floor keeps the headroom for exactly that
+        // cleanup); flat and read clear, it parks at once, hold or not.
+        let parked = !holding && self.budget_floor_breached();
+        self.boot == BOOT_DONE && alone && now < self.hold_until_ns && !parked
     }
 
     /// The account may hold another slot's order from `now`: not the
@@ -1760,6 +2154,7 @@ impl HlGatewayArm {
             return false;
         }
         if self.end.cmd.push(&self.scratch) {
+            self.charge(1);
             return true;
         }
         self.counters.ring_full += 1;
@@ -1780,8 +2175,13 @@ impl HlGatewayArm {
         } else {
             self.drift_hw_1e6
         };
-        let reconciled =
-            self.boot == BOOT_DONE && !self.boot_held && self.state_ok && self.orders_ok;
+        // XH4e: and the day's spend read (S7-L1 gap A: the router seeds
+        // from this — its day cap must not restart at a full allowance).
+        let reconciled = self.boot == BOOT_DONE
+            && !self.boot_held
+            && self.state_ok
+            && self.orders_ok
+            && self.day_done;
         let age = if self.last_agree_ns == 0 {
             0
         } else {
@@ -1792,7 +2192,7 @@ impl HlGatewayArm {
             drift,
             self.reject_streak,
             self.asset_refusal_streak,
-            false,
+            self.budget_floor_breached(),
             reconciled,
             age,
         )
@@ -1894,6 +2294,12 @@ impl OrderDispatch for HlGatewayArm {
         if !self.ready() {
             return self.refuse(DispatchError::Disconnected);
         }
+        let now = now_ns();
+        if self.budget_refuses(now) {
+            // XH4e: the blocking arm's answer at its floor.
+            self.counters.refused_budget += 1;
+            return self.refuse_local(DispatchError::SlotDisabled);
+        }
         if self.n_rows >= ARM_ORDERS {
             return self.refuse(DispatchError::QueueFull);
         }
@@ -1913,7 +2319,8 @@ impl OrderDispatch for HlGatewayArm {
             self.counters.ring_full += 1;
             return self.refuse(DispatchError::QueueFull);
         }
-        self.track(&c, p, now_ns());
+        self.charge(1);
+        self.track(&c, p, now);
         Ok(())
     }
 
@@ -1962,6 +2369,11 @@ impl OrderDispatch for HlGatewayArm {
         {
             return self.refuse(DispatchError::IdentityMismatch);
         }
+        let now = now_ns();
+        if self.budget_refuses(now) {
+            self.counters.refused_budget += 1;
+            return self.refuse_local(DispatchError::SlotDisabled);
+        }
         if self.n_rows >= ARM_ORDERS {
             return self.refuse(DispatchError::QueueFull);
         }
@@ -1976,8 +2388,9 @@ impl OrderDispatch for HlGatewayArm {
             self.counters.ring_full += 1;
             return self.refuse(DispatchError::QueueFull);
         }
+        self.charge(1);
         self.rows[i].bits |= RB_REPLACING;
-        self.track(&c, perp, now_ns());
+        self.track(&c, perp, now);
         Ok(())
     }
 
@@ -2014,6 +2427,19 @@ impl OrderDispatch for HlGatewayArm {
             self.signal(now_ns())
         } else {
             HaltSignal::default()
+        }
+    }
+
+    /// XH4e (S7-L1 gap A): the slot's fills since 00:00Z as the venue
+    /// lists them, once read — `(UTC day, Σ |px × sz| USD ×1e6)`.
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        if self.day_done && slot == usize::from(self.cfg.slot) {
+            Some((
+                self.day_until_ms / DAY_MS,
+                self.day_bought_1e8 / WIRE_PER_ENGINE,
+            ))
+        } else {
+            None
         }
     }
 
@@ -2105,10 +2531,15 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::cmd::{CMD_MODIFY, CMD_PLACE, CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL};
-    use crate::event::{EVF_CMD_SHIFT, EVF_RESTING, SLOT_FOREIGN};
+    use crate::cmd::{
+        CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_STATE,
+        CMD_SCHEDULE_CANCEL,
+    };
+    use crate::event::{
+        EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT, SLOT_FOREIGN,
+    };
     use crate::gateway::{hl_duplex, HlGatewayEnd};
-    use exec_gateway::stats::SWEEP_WORKING;
+    use exec_gateway::stats::{CONGESTION_NONE, SWEEP_WORKING};
     use exec_gateway::HALT_EVENT_RING_FULL;
 
     const SLOT: u8 = 6;
@@ -2137,6 +2568,8 @@ mod tests {
             own_account: true,
             anchor_1e6: 0,
             deadman: DeadManCfg::DEFAULT,
+            budget_floor: 2_000,
+            limit_ms: 600_000,
         }
     }
 
@@ -2203,10 +2636,11 @@ mod tests {
     }
 
     fn read_end(c: &HlCmd, account_1e8: i64, venue_ms: u64) -> ExecEvent {
-        let read = if c.kind == CMD_READ_ORDERS {
-            READ_ORDERS
-        } else {
-            READ_STATE
+        let read = match c.kind {
+            CMD_READ_ORDERS => READ_ORDERS,
+            CMD_READ_LIMIT => READ_LIMIT,
+            CMD_READ_DAY => READ_DAY,
+            _ => READ_STATE,
         };
         ExecEvent {
             client_oid: c.client_oid,
@@ -2321,16 +2755,49 @@ mod tests {
         (arm, v, t, st)
     }
 
+    /// The budget read's end: `used` requests of a fresh address's 10 000.
+    fn limit_end(c: &HlCmd, used: u64) -> ExecEvent {
+        ExecEvent {
+            aux: used,
+            ..read_end(c, 0, 0)
+        }
+    }
+
+    /// A day page's end: `rows` rows summing `sum_1e8`, the last at
+    /// `last_ms`.
+    fn day_end(c: &HlCmd, rows: u64, sum_1e8: i64, last_ms: u64) -> ExecEvent {
+        ExecEvent {
+            aux: rows,
+            ..read_end(c, sum_1e8, last_ms)
+        }
+    }
+
     /// Answer the sheet (account 1 000 USD at venue ms 1, flat) and the
-    /// orders.
-    fn booted_with(c: &ArmCfg) -> (HlGatewayArm, Venue, u64) {
+    /// orders; up to the budget read, issued.
+    fn to_budget(c: &ArmCfg) -> (HlGatewayArm, Venue, u64, HlCmd) {
         let (mut arm, mut v, t, st) = to_sheet(c);
         v.send(read_end(&st, 1_000 * E8, 1));
         let _ = arm.idle(t);
         let od = v.take(CMD_READ_ORDERS).expect("the orders after the sheet");
         v.send(read_end(&od, 0, 0));
         let _ = arm.idle(t);
+        assert!(!arm.ready(), "not before the budget");
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget after the orders");
+        (arm, v, t, lim)
+    }
+
+    /// Booted: the budget answered (100 requests used), the day read (no
+    /// fills).
+    fn booted_with(c: &ArmCfg) -> (HlGatewayArm, Venue, u64) {
+        let (mut arm, mut v, t, lim) = to_budget(c);
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
         assert!(arm.ready());
+        let day = v
+            .take(CMD_READ_DAY)
+            .expect("the day's spend after the budget");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t);
         (arm, v, t)
     }
 
@@ -3454,5 +3921,593 @@ mod tests {
             HlGatewayArm::new(&c, hl_duplex().0).err(),
             Some(ArmErr::Timing)
         );
+        let mut c = cfg();
+        c.limit_ms = 600_001;
+        assert_eq!(
+            HlGatewayArm::new(&c, hl_duplex().0).err(),
+            Some(ArmErr::Timing),
+            "the budget is read at least every ten minutes"
+        );
+        let mut c = cfg();
+        c.budget_floor = MIN_BUDGET_FLOOR - 1;
+        assert_eq!(
+            HlGatewayArm::new(&c, hl_duplex().0).err(),
+            Some(ArmErr::Budget),
+            "the floor keeps a cleanup's headroom"
+        );
+    }
+
+    // --- XH4e -------------------------------------------------------
+
+    /// The budget is read after the boot's orders and every `limit_ms`;
+    /// between reads each item the arm pushes is one request (a place, a
+    /// modify, a cancel, a control post), a sweep's cancels are charged by
+    /// the gateway's word, one refused unsent is taken back, and no fill is
+    /// credited (the next read states the volume); the requests unanswered
+    /// when a read goes and those pushed while it is in flight are added on
+    /// top of its answer.
+    #[test]
+    fn the_budget_is_read_charged_per_item_and_read_again() {
+        let (mut arm, mut v, t) = booted();
+        assert_eq!(arm.budget().expect("read").remaining(), 9_900);
+        v.gw.stats.note_sweep_cancels(2);
+        let _ = arm.idle(t);
+        assert_eq!(arm.budget().unwrap().remaining(), 9_898, "the sweep's two");
+        // $1 000 traded: nothing credited until a read states it.
+        v.send(ExecEvent {
+            slot: 3,
+            ..fill(99, true, 1_000 * E8, E8, 3)
+        });
+        let _ = arm.pump(t);
+        assert_eq!(arm.budget().unwrap().remaining(), 9_898, "no fill credit");
+        arm.submit(&quote(1, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        arm.cancel(&cancel_req(1)).expect("cancel");
+        assert_eq!(
+            arm.budget().unwrap().remaining(),
+            9_896,
+            "a place and a cancel"
+        );
+        // A place the gateway refused unsent is taken back.
+        arm.submit(&quote(2, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        let _ = v.take(CMD_PLACE);
+        let p = v.take(CMD_PLACE).expect("the second place");
+        assert_eq!(arm.budget().unwrap().remaining(), 9_895);
+        v.send(item(&p, EV_REJECTED, REASON_THROTTLED, 0));
+        let _ = arm.pump(t);
+        assert_eq!(
+            (arm.budget().unwrap().remaining(), arm.counters().refunded),
+            (9_896, 1),
+            "it never left"
+        );
+        // Ten minutes on, after the periodic reads: the budget again. A
+        // place unanswered when it goes, and one pushed while it is in
+        // flight, count on top of its answer.
+        let (mut arm, mut v, t) = booted();
+        let later = t + 600 * S;
+        arm.submit(&quote(2, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        recon(&mut arm, &mut v, later, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("read again");
+        arm.submit(&quote(3, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        let carried = arm.limit_sent;
+        assert!(carried >= 2, "the place unanswered and the one in flight");
+        v.send(limit_end(&lim, 500));
+        let _ = arm.pump(later);
+        assert_eq!(
+            arm.budget().unwrap().remaining(),
+            10_000 - 500 - carried as i64
+        );
+        assert_eq!(arm.counters().limit_reads, 2);
+    }
+
+    /// At or below the floor: places and modifies are refused (the blocking
+    /// arm's `SlotDisabled`), the signal breaches the floor (the router's
+    /// `BudgetFloor`), cancels still go — and the dead man stays armed while
+    /// an order is held or the halt's cancel-all is not read clear, then
+    /// parks at once.
+    #[test]
+    fn at_the_budget_floor_growth_stops_and_the_dead_man_parks_once_flat_and_clear() {
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        assert!(!arm.budget_floor_breached(), "nothing known is no breach");
+        assert_eq!(arm.signal(t).budget_floor_breached, 0);
+        v.send(limit_end(&lim, 7_000));
+        let _ = arm.idle(t);
+        let day = v.take(CMD_READ_DAY).expect("the day");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t);
+        let _ = rested(&mut arm, &mut v, t, 1);
+        assert!(arm.deadman_wanted(t), "an order rests");
+        // 999 more requests: 10 000 − 7 000 − 1 − 999 = 2 000, the floor.
+        arm.charge(999);
+        assert!(arm.budget_floor_breached());
+        assert_eq!(arm.signal(t).budget_floor_breached, 1);
+        assert_eq!(
+            arm.submit(&quote(2, Side::Bid, 100_000_000, 500_000)),
+            Err(DispatchError::SlotDisabled)
+        );
+        assert_eq!(
+            arm.modify(&ModifyReq::new(1, quote(3, Side::Bid, 99_000_000, 500_000))),
+            Err(DispatchError::SlotDisabled)
+        );
+        assert_eq!(arm.counters().refused_budget, 2);
+        assert!(arm.deadman_wanted(t), "an order still rests: armed");
+        // The router's halt: cancel-all — working until the venue reads
+        // clear and the order's cancel is answered.
+        arm.cancel_all().expect("cancel-all");
+        let x = v.take(CMD_CANCEL).expect("a cancel always goes");
+        assert!(arm.deadman_wanted(t), "the sweep is working");
+        v.gw.stats
+            .set_sweep(v.gw.stats.sweep_requested(), SWEEP_CLEAR);
+        assert!(arm.deadman_wanted(t), "read clear, but ours is still held");
+        v.send(item(&x, EV_ACK, 0, 0));
+        let _ = arm.idle(t);
+        assert_eq!(
+            (arm.open_orders(), arm.cancel_all_state()),
+            (0, CancelAllState::Clear)
+        );
+        assert!(
+            !arm.deadman_wanted(t),
+            "flat and read clear: parked at once, inside the hold"
+        );
+    }
+
+    /// XH4e: at the floor with nothing held, a cancel-all the venue has not
+    /// read clear — working or stranded — keeps the switch armed; only a
+    /// clear read parks it.
+    #[test]
+    fn at_the_floor_a_cancel_all_not_read_clear_keeps_the_switch_armed() {
+        let (mut arm, v, t) = booted();
+        arm.charge(8_000);
+        assert!(arm.budget_floor_breached());
+        assert!(!arm.deadman_wanted(t), "flat and clear: parked");
+        arm.cancel_all().expect("cancel-all");
+        assert!(arm.deadman_wanted(t), "the sweep is working");
+        v.gw.stats
+            .set_sweep(v.gw.stats.sweep_requested(), SWEEP_STRANDED);
+        assert!(arm.deadman_wanted(t), "stranded: ours may rest");
+        v.gw.stats
+            .set_sweep(v.gw.stats.sweep_requested(), SWEEP_CLEAR);
+        assert!(!arm.deadman_wanted(t), "read clear: parked");
+    }
+
+    /// XH4e: a shutdown at the budget floor keeps the switch armed while
+    /// the venue never reads clear — the floor never clears it early.
+    #[test]
+    fn a_shutdown_at_the_floor_the_venue_never_confirms_leaves_the_switch_armed() {
+        let (mut arm, v) = armed(&quick());
+        arm.charge(8_000);
+        assert!(arm.budget_floor_breached());
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = responder(v, |_| SWEEP_WORKING, true, Arc::clone(&stop));
+        arm.on_shutdown();
+        stop.store(true, Ordering::Relaxed);
+        let v = h.join().expect("the responder");
+        assert!(
+            v.cmds
+                .iter()
+                .all(|c| c.kind != CMD_SCHEDULE_CANCEL || c.time_ms != 0),
+            "never cleared"
+        );
+        assert_ne!(arm.deadman().deadline_ms(), 0, "the venue holds a deadline");
+        assert_eq!(arm.counters().shutdown_unconfirmed, 1);
+    }
+
+    /// The day's spend is read after the budget, page by page — a full
+    /// page followed from its last row's time — and only then does the
+    /// arm report `reconciled` and the router get the day: the slot's
+    /// fills since 00:00Z, ×1e6.
+    #[test]
+    fn the_day_is_read_page_by_page_before_the_arm_reconciles() {
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        assert!(arm.ready());
+        let p1 = v.take(CMD_READ_DAY).expect("the first page");
+        let midnight = now_ms() / DAY_MS * DAY_MS;
+        assert_eq!(p1.time_ms, midnight, "from 00:00Z");
+        assert!(
+            p1.prev_client_oid >= midnight && p1.prev_client_oid <= now_ms(),
+            "to the time the read began"
+        );
+        assert_eq!(arm.signal(t).reconciled, 0, "not before the day is read");
+        assert_eq!(arm.venue_day_bought(usize::from(SLOT)), None);
+        v.send(day_end(&p1, DAY_PAGE, 300 * E8, midnight + 5_000));
+        let _ = arm.idle(t);
+        assert!(
+            v.take(CMD_READ_DAY).is_none(),
+            "the next page a read period on"
+        );
+        v.gw.stats.set_congestion(CONGESTION_THROTTLED);
+        recon(&mut arm, &mut v, t + 5 * S, None, &[]);
+        assert!(
+            v.take(CMD_READ_DAY).is_none(),
+            "never while the rates read throttled"
+        );
+        v.gw.stats.set_congestion(CONGESTION_NONE);
+        let _ = arm.idle(t + 5 * S);
+        let p2 = v.take(CMD_READ_DAY).expect("a full page asks for the next");
+        assert_eq!(p2.time_ms, midnight + 5_000, "from its latest row");
+        assert_eq!(
+            p2.prev_client_oid, p1.prev_client_oid,
+            "every page ends where the first did"
+        );
+        // A short page is not the end: it moved past its start.
+        v.send(day_end(&p2, 3, 20 * E8, midnight + 6_000));
+        let _ = arm.idle(t + 5 * S);
+        assert_eq!(arm.signal(t).reconciled, 0, "not yet");
+        recon(&mut arm, &mut v, t + 10 * S, None, &[]);
+        let p3 = v.take(CMD_READ_DAY).expect("until a page adds nothing");
+        assert_eq!(p3.time_ms, midnight + 6_000);
+        // The boundary row again (counted twice: the conservative way).
+        v.send(day_end(&p3, 1, 5 * E8, midnight + 6_000));
+        let _ = arm.idle(t + 10 * S);
+        assert_eq!(arm.signal(t).reconciled, 1);
+        assert_eq!(
+            arm.venue_day_bought(usize::from(SLOT)),
+            Some((midnight / DAY_MS, 325_000_000))
+        );
+        assert_eq!(
+            arm.venue_day_bought(3),
+            None,
+            "another slot's day is its own"
+        );
+        assert_eq!(
+            (arm.counters().day_pages, arm.counters().day_unreadable),
+            (3, 0)
+        );
+        assert!(v.take(CMD_READ_DAY).is_none(), "read once");
+    }
+
+    /// A venue fill is stamped with the venue's time (wall), as the
+    /// blocking arm stamps one: the router's day epoch reads it as wall.
+    #[test]
+    fn a_fill_is_stamped_with_the_venue_s_time() {
+        let (mut arm, mut v, t) = booted();
+        let _ = rested(&mut arm, &mut v, t, 5);
+        v.send(fill(5, true, 100 * E8, E8 / 2, 1_790_000_000_123));
+        let _ = arm.idle(t);
+        let f = arm.try_next_fill().expect("the fill");
+        assert_eq!(f.ts_ns, 1_790_000_000_123_000_000);
+    }
+
+    /// A place the gateway refused over its rate shares never left: no
+    /// venue reject, no streak — and it is counted.
+    #[test]
+    fn a_throttled_place_is_no_reject() {
+        let (mut arm, mut v, t) = booted();
+        arm.submit(&quote(9, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        let c = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&c, EV_REJECTED, REASON_THROTTLED, 0));
+        let _ = arm.idle(t);
+        assert_eq!(
+            events(&mut arm),
+            [(9, ORDER_EVENT_REJECTED, REASON_THROTTLED)]
+        );
+        assert_eq!(
+            (
+                arm.counters().throttled,
+                arm.reject_streak,
+                arm.counters().refunded
+            ),
+            (1, 0, 1)
+        );
+    }
+
+    /// XH4e: a budget no read has answered for three periods refuses growth
+    /// — no halt, no floor — until a read answers.
+    #[test]
+    fn a_budget_unread_for_three_periods_refuses_growth_until_a_read_answers() {
+        let mut c = cfg();
+        c.limit_ms = 10_000;
+        let (mut arm, mut v, t) = booted_with(&c);
+        assert!(
+            !arm.budget_stale(t + 30 * S),
+            "three periods is not past them"
+        );
+        assert!(arm.budget_stale(t + 30 * S + 1));
+        // Three periods past the last answer (every read failed since).
+        arm.limit_stale_ns = now_ns().saturating_sub(S);
+        assert_eq!(
+            arm.submit(&quote(1, Side::Bid, 100_000_000, 500_000)),
+            Err(DispatchError::SlotDisabled)
+        );
+        assert_eq!(arm.counters().refused_budget, 1);
+        assert_eq!(arm.signal(t).budget_floor_breached, 0, "stale is no floor");
+        // The next read answers: growth again.
+        recon(&mut arm, &mut v, t + 10 * S, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("the periodic budget read");
+        v.send(limit_end(&lim, 200));
+        let _ = arm.idle(t + 10 * S);
+        arm.submit(&quote(2, Side::Bid, 100_000_000, 500_000))
+            .expect("growth once a read answers");
+    }
+
+    /// XH4e: a failed budget or day read is asked again a read period
+    /// later, not after a skew — each is 20 IP weight or more.
+    #[test]
+    fn a_failed_budget_or_day_read_is_asked_again_a_read_period_later() {
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        v.send(ExecEvent {
+            kind: EV_READ_FAILED,
+            ..limit_end(&lim, 0)
+        });
+        let _ = arm.idle(t);
+        let _ = arm.idle(t + 4 * S);
+        assert!(v.take(CMD_READ_LIMIT).is_none(), "not after a skew");
+        recon(&mut arm, &mut v, t + 5 * S, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("a read period later");
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t + 5 * S);
+        let day = v.take(CMD_READ_DAY).expect("the day after the budget");
+        v.send(ExecEvent {
+            kind: EV_READ_FAILED,
+            ..day_end(&day, 0, 0, 0)
+        });
+        let _ = arm.idle(t + 5 * S);
+        let _ = arm.idle(t + 9 * S);
+        assert!(v.take(CMD_READ_DAY).is_none(), "not after a skew");
+        recon(&mut arm, &mut v, t + 10 * S, None, &[]);
+        assert!(v.take(CMD_READ_DAY).is_some(), "a read period later");
+        assert_eq!(arm.counters().reads_failed, 2);
+    }
+
+    /// XH4e: the venue serves an account's 10 000 most recent fills — a
+    /// read that reaches them may have lost the day's start: the day reads
+    /// spent (fail closed), and the arm reconciles on it. So does a full
+    /// page that cannot move past its start.
+    #[test]
+    fn a_day_past_the_venue_s_ten_thousand_fills_reads_spent() {
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let mut at = t;
+        let mut k = 0u32;
+        while k < DAY_ROWS_MAX / DAY_PAGE as u32 {
+            if k > 0 {
+                at += 5 * S;
+                recon(&mut arm, &mut v, at, None, &[]);
+            }
+            let p = v.take(CMD_READ_DAY).expect("a page");
+            v.send(day_end(&p, DAY_PAGE, E8, p.time_ms + 1_000));
+            let _ = arm.idle(at);
+            k += 1;
+        }
+        assert_eq!(
+            (arm.counters().day_pages, arm.counters().day_unreadable),
+            (5, 1)
+        );
+        assert_eq!(arm.signal(at).reconciled, 1);
+        assert_eq!(
+            arm.venue_day_bought(usize::from(SLOT)).map(|d| d.1),
+            Some(DAY_SPENT_1E8 / WIRE_PER_ENGINE)
+        );
+        assert!(v.take(CMD_READ_DAY).is_none(), "read no further");
+        // A page whose rows ran backward in time: its next start could skip
+        // rows — spent.
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let p = v.take(CMD_READ_DAY).expect("the first page");
+        v.send(ExecEvent {
+            sz_1e8: 1,
+            ..day_end(&p, 40, E8, p.time_ms + 1_000)
+        });
+        let _ = arm.idle(t);
+        assert_eq!(arm.counters().day_unreadable, 1);
+        assert_eq!(
+            arm.venue_day_bought(usize::from(SLOT)).map(|d| d.1),
+            Some(DAY_SPENT_1E8 / WIRE_PER_ENGINE)
+        );
+        // A full page all at its start cannot move: spent.
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let p = v.take(CMD_READ_DAY).expect("the first page");
+        v.send(day_end(&p, DAY_PAGE, E8, p.time_ms));
+        let _ = arm.idle(t);
+        assert_eq!(arm.counters().day_unreadable, 1);
+        assert_eq!(
+            arm.venue_day_bought(usize::from(SLOT)).map(|d| d.1),
+            Some(DAY_SPENT_1E8 / WIRE_PER_ENGINE)
+        );
+    }
+
+    /// XH4e (risk r3 N1): the venue keeps an account's 10 000 most recent
+    /// fills, counted to the moment it answers — past the read's end. Every
+    /// fill the stream brings after the end, any slot's, counts with the
+    /// rows read, judged at the page that adds nothing too: rows and later
+    /// fills at 10 000 read spent, one fewer reads done. A fill at or
+    /// before the end is the pages' own; one with no time counts.
+    #[test]
+    fn the_account_s_fills_after_the_read_s_end_count_toward_the_venue_s_ten_thousand() {
+        let mut later = 1u64;
+        while later <= 2 {
+            let (mut arm, mut v, t, lim) = to_budget(&cfg());
+            v.send(limit_end(&lim, 100));
+            let _ = arm.idle(t);
+            let mut p = v.take(CMD_READ_DAY).expect("the first page");
+            let end = p.prev_client_oid;
+            let mut k = 0u64;
+            while k < 2 + later {
+                // Another slot's fills: before the end, at it, then past
+                // it — the first with no time (counted: fail closed).
+                let at_ms = match k {
+                    0 => end - 1,
+                    1 => end,
+                    2 => 0,
+                    _ => end + 1,
+                };
+                v.send(ExecEvent {
+                    slot: 3,
+                    ..fill(70 + k, k % 2 == 0, E8, E8, at_ms)
+                });
+                k += 1;
+            }
+            // 9 997 rows in five pages, then the boundary row again.
+            let mut at = t;
+            k = 0;
+            while k < 6 {
+                if k > 0 {
+                    at += 5 * S;
+                    recon(&mut arm, &mut v, at, None, &[]);
+                    p = v.take(CMD_READ_DAY).expect("a page");
+                }
+                let (rows, last) = match k {
+                    0..=3 => (DAY_PAGE, p.time_ms + 1_000),
+                    4 => (DAY_PAGE - 3, p.time_ms + 1_000),
+                    _ => (1, p.time_ms),
+                };
+                v.send(day_end(&p, rows, E8, last));
+                let _ = arm.idle(at);
+                k += 1;
+            }
+            let spent = later == 2;
+            let want = if spent { DAY_SPENT_1E8 } else { 6 * E8 };
+            assert_eq!(arm.signal(at).reconciled, 1);
+            assert_eq!(
+                (arm.counters().day_pages, arm.counters().day_unreadable),
+                (6, u64::from(spent)),
+                "{later} fill(s) past the end"
+            );
+            assert_eq!(
+                arm.venue_day_bought(usize::from(SLOT)).map(|d| d.1),
+                Some(want / WIRE_PER_ENGINE)
+            );
+            later += 1;
+        }
+    }
+
+    /// XH4e (risk r3 N1, r4): a first page asked again takes a new end —
+    /// the fills since the failed ask are rows of it, the count past the
+    /// old end goes, and a gap before it loses nothing the read counts —
+    /// while a stream gap once the read holds its end (a page answered, or
+    /// the first in flight) reads the day spent: fills past the end may be
+    /// lost. An `orderUpdates` frame that did not scan carries no fill. A
+    /// page answered after the spend adds nothing.
+    #[test]
+    fn a_first_page_asked_again_takes_a_new_end_and_a_gap_spends_the_day() {
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let p = v.take(CMD_READ_DAY).expect("the first page");
+        let first_end = p.prev_client_oid;
+        v.send(ExecEvent {
+            slot: 3,
+            ..fill(70, true, E8, E8, first_end + 1)
+        });
+        v.send(ExecEvent {
+            kind: EV_READ_FAILED,
+            ..day_end(&p, 0, 0, 0)
+        });
+        let _ = arm.idle(t);
+        assert_eq!(arm.day_rows, 1, "a fill past the end counts");
+        // A gap before the first page is asked again: not spent.
+        v.send(ExecEvent {
+            kind: EV_GAP,
+            aux: GAP_RECONNECT,
+            ..ExecEvent::default()
+        });
+        let _ = arm.idle(t);
+        let od = v.take(CMD_READ_ORDERS).expect("the gap's re-read");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        assert_eq!(arm.counters().day_unreadable, 0, "nothing counted lost");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        recon(&mut arm, &mut v, t + 5 * S, None, &[]);
+        let p = v
+            .take(CMD_READ_DAY)
+            .expect("asked again a read period later");
+        assert!(p.prev_client_oid > first_end, "a new end");
+        assert_eq!(
+            p.time_ms,
+            p.prev_client_oid / DAY_MS * DAY_MS,
+            "from 00:00Z"
+        );
+        assert_eq!(arm.day_rows, 0, "that fill is a row of it now");
+        v.send(day_end(&p, 3, 20 * E8, p.time_ms + 1_000));
+        let _ = arm.idle(t + 5 * S);
+        // An `orderUpdates` frame that did not scan: no fill lost.
+        v.send(ExecEvent {
+            kind: EV_GAP,
+            aux: GAP_UPDATES_UNREADABLE,
+            ..ExecEvent::default()
+        });
+        let _ = arm.idle(t + 5 * S);
+        let od = v.take(CMD_READ_ORDERS).expect("the gap's re-read");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t + 5 * S);
+        assert_eq!(arm.counters().day_unreadable, 0, "no fill lost");
+        recon(&mut arm, &mut v, t + 10 * S, None, &[]);
+        let p = v.take(CMD_READ_DAY).expect("the next page");
+        v.send(ExecEvent {
+            kind: EV_GAP,
+            aux: GAP_RECONNECT,
+            ..ExecEvent::default()
+        });
+        let _ = arm.idle(t + 10 * S);
+        assert_eq!(
+            arm.venue_day_bought(usize::from(SLOT)).map(|d| d.1),
+            Some(DAY_SPENT_1E8 / WIRE_PER_ENGINE),
+            "a gap while the read holds its end: spent"
+        );
+        // The page in flight across the gap answers — one that would read
+        // spent itself (full, all at its start): it adds nothing.
+        v.send(day_end(&p, DAY_PAGE, 5 * E8, p.time_ms));
+        let _ = arm.idle(t + 10 * S);
+        assert_eq!(
+            (
+                arm.counters().day_pages,
+                arm.counters().day_unreadable,
+                arm.counters().reads_failed
+            ),
+            (2, 1, 1)
+        );
+    }
+
+    /// XH4e (r5): the read holds its end from the first page's ask to its
+    /// own end — the first page in flight, between pages, a later page in
+    /// flight — and a gap that may have lost fills spends the day at each:
+    /// a `userFills` frame that did not scan, a reconnect, one of no stated
+    /// kind. The page in flight then answers done-shaped: nothing changes.
+    #[test]
+    fn a_gap_spends_the_day_wherever_the_read_holds_its_end() {
+        let mut case = 0usize;
+        while case < 3 {
+            let (mut arm, mut v, t, lim) = to_budget(&cfg());
+            v.send(limit_end(&lim, 100));
+            let _ = arm.idle(t);
+            let mut p = v.take(CMD_READ_DAY).expect("the first page");
+            let mut at = t;
+            if case > 0 {
+                v.send(day_end(&p, 3, 20 * E8, p.time_ms + 1_000));
+                let _ = arm.idle(t);
+            }
+            if case == 2 {
+                at += 5 * S;
+                recon(&mut arm, &mut v, at, None, &[]);
+                p = v.take(CMD_READ_DAY).expect("the next page");
+            }
+            v.send(ExecEvent {
+                kind: EV_GAP,
+                aux: [GAP_FILLS_UNREADABLE, GAP_RECONNECT, 0][case],
+                ..ExecEvent::default()
+            });
+            let _ = arm.idle(at);
+            if case != 1 {
+                v.send(day_end(&p, 0, 0, 0));
+                let _ = arm.idle(at);
+            }
+            assert_eq!(arm.counters().day_unreadable, 1, "case {case}");
+            assert_eq!(
+                arm.venue_day_bought(usize::from(SLOT)).map(|d| d.1),
+                Some(DAY_SPENT_1E8 / WIRE_PER_ENGINE),
+                "case {case}"
+            );
+            case += 1;
+        }
     }
 }

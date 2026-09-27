@@ -13148,8 +13148,15 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// the last sixteen accepted orders (listings, revivals, races) and every
 /// seventh one order the arm never placed (cancelled), a stream gap every
 /// 97 commands and another slot's resting row every 89, the gateway's
-/// heartbeat every answer; the halt signals and the cancel-all state;
-/// every out-queue drained as the engine does. Timers run on the real clock (1 ms windows): the warm-up
+/// heartbeat every answer; XH4e: the budget read every 2 ms (every ninth
+/// failing, every thirteenth answering a figure under the floor — growth
+/// refused until the next read lifts it; every place, modify and cancel
+/// charged, the sweep's cancels by the gateway's word), every
+/// seventeenth place or modify refused `THROTTLED` (taken back from the
+/// budget), and, after the boot — its own window — the day's spend (a
+/// page that moves, then one that adds nothing past its start); the halt
+/// signals and the cancel-all state; every out-queue drained as the
+/// engine does. Timers run on the real clock (1 ms windows): the warm-up
 /// runs until every path has run, and the window must run each again.
 #[test]
 fn hl_gateway_arm_is_zero_alloc() {
@@ -13162,14 +13169,15 @@ fn hl_gateway_arm_is_zero_alloc() {
     use exec_gateway::stats::SWEEP_CLEAR;
     use exec_hyperliquid::arm::{ArmCfg, ArmCounters, HlGatewayArm, PerpBind, ARM_PERPS};
     use exec_hyperliquid::cmd::{
-        CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_ORDERS, CMD_READ_STATE,
+        CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
+        CMD_READ_STATE,
     };
     use exec_hyperliquid::deadman::DeadManCfg;
     use exec_hyperliquid::event::{
         ExecEvent, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_POST_ITEM, EVF_RESTING, EV_ACK,
         EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_OPEN_ORDER, EV_POSITION,
         EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
-        READ_ORDERS, READ_STATE, REASON_NOT_FOUND,
+        READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_NOT_FOUND, REASON_THROTTLED,
     };
     use exec_hyperliquid::gateway::HlGatewayEnd;
     use exec_hyperliquid::hl_duplex;
@@ -13199,6 +13207,9 @@ fn hl_gateway_arm_is_zero_alloc() {
         /// The sheets are flat until the arm boots (a position in a bound
         /// perp holds the boot: the member boots flat); then they carry one.
         flat: bool,
+        /// XH4e: budget reads and day pages answered.
+        limits: u64,
+        days: u64,
     }
 
     /// The gateway's end: every command answered by the script.
@@ -13239,6 +13250,13 @@ fn hl_gateway_arm_is_zero_alloc() {
                 ..ExecEvent::default()
             };
             match c.kind {
+                // XH4e: refused unsent over the rate shares — never left,
+                // no row; the arm takes its request back.
+                CMD_PLACE | CMD_MODIFY if n % 17 == 0 => assert!(gw.evt.emit(&ExecEvent {
+                    kind: EV_REJECTED,
+                    reason: REASON_THROTTLED,
+                    ..item
+                })),
                 CMD_PLACE | CMD_MODIFY if n % 11 == 0 => {
                     let reply = ExecEvent {
                         kind: EV_REJECTED,
@@ -13377,6 +13395,42 @@ fn hl_gateway_arm_is_zero_alloc() {
                         ..end
                     }));
                 }
+                CMD_READ_LIMIT => {
+                    s.limits += 1;
+                    if s.limits % 9 == 0 {
+                        assert!(gw.evt.emit(&ExecEvent {
+                            kind: EV_READ_FAILED,
+                            reason: READ_LIMIT,
+                            ..end
+                        }));
+                    } else {
+                        // 100 requests used of a $1M address's 1 010 000 —
+                        // every 13th read 1 009 000: the floor (2 000)
+                        // breached, and lifted by the next read.
+                        assert!(gw.evt.emit(&ExecEvent {
+                            reason: READ_LIMIT,
+                            aux: if s.limits % 13 == 0 { 1_009_000 } else { 100 },
+                            px_1e8: 100_000_000_000_000,
+                            ..end
+                        }));
+                    }
+                }
+                CMD_READ_DAY => {
+                    s.days += 1;
+                    // A full page that moves, then one that adds nothing
+                    // past its start: two pages.
+                    assert!(gw.evt.emit(&ExecEvent {
+                        reason: READ_DAY,
+                        aux: if s.days == 1 { 2_000 } else { 3 },
+                        px_1e8: 1_000,
+                        venue_ms: if s.days == 1 {
+                            c.time_ms + 1
+                        } else {
+                            c.time_ms
+                        },
+                        ..end
+                    }));
+                }
                 // The dead man's posts.
                 _ => assert!(gw.evt.emit(&ExecEvent {
                     kind: EV_ACK,
@@ -13467,6 +13521,9 @@ fn hl_gateway_arm_is_zero_alloc() {
         }
         if r % 1_000 == 999 {
             *acc ^= u64::from(arm.cancel_all().is_ok());
+            // The sweep's cancels, as the gateway notes them: the arm
+            // charges them to the address.
+            gw.stats.note_sweep_cancels(3);
             gw.stats.set_sweep(gw.stats.sweep_requested(), SWEEP_CLEAR);
         }
         answer(gw, s);
@@ -13479,7 +13536,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
 
     /// The paths the window must run again, each counted.
-    fn paths(c: &ArmCounters, s: &Script) -> [u64; 11] {
+    fn paths(c: &ArmCounters, s: &Script) -> [u64; 15] {
         [
             c.fills,
             c.alo_rejects,
@@ -13492,6 +13549,10 @@ fn hl_gateway_arm_is_zero_alloc() {
             c.fees_1e8.unsigned_abs(),
             s.replaced,
             s.modifies,
+            c.limit_reads,
+            c.throttled,
+            c.refunded,
+            c.refused_budget,
         ]
     }
 
@@ -13515,6 +13576,8 @@ fn hl_gateway_arm_is_zero_alloc() {
         own_account: true,
         anchor_1e6: 0,
         deadman: DeadManCfg::DEFAULT,
+        budget_floor: 2_000,
+        limit_ms: 2,
     };
     let (eng, mut gw) = hl_duplex();
     let mut arm = HlGatewayArm::new(&cfg, eng).expect("the arm");
@@ -13529,6 +13592,8 @@ fn hl_gateway_arm_is_zero_alloc() {
         replaced: 0,
         modifies: 0,
         flat: true,
+        limits: 0,
+        days: 0,
     };
     let mut acc = 0u64;
     let _ = arm.on_idle();
@@ -13548,6 +13613,32 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
     assert!(!arm.boot_position(), "gate 98: the seeding sheet was flat");
     s.flat = false;
+    // XH4e: the day's spend, read once a boot — a full page, then the next
+    // a read period later. The arm is ready, so this is after init: its
+    // own measured window.
+    assert_eq!(
+        arm.counters().day_pages,
+        0,
+        "gate 98: no day page answered before its window"
+    );
+    let g = AllocGuard::new();
+    while arm.venue_day_bought(usize::from(SLOT)).is_none() {
+        let _ = arm.on_idle();
+        answer(&mut gw, &mut s);
+        spins += 1;
+        assert!(spins < 1_000_000, "gate 98: the day was never read");
+    }
+    let (day_allocs, day_bytes, _) = g.delta();
+    assert_eq!(s.days, 2, "gate 98: a page that moved asks for the next");
+    assert_eq!(
+        arm.counters().day_pages,
+        2,
+        "gate 98: both pages in the window"
+    );
+    assert_eq!(
+        day_allocs, 0,
+        "the HL gateway arm's day read allocated {day_allocs} times ({day_bytes} B)"
+    );
 
     // Warm-up (NOT measured): until every path has run.
     let mut r = 0u64;
@@ -13618,6 +13709,20 @@ fn gate96_venue_helper() {
                 r#"{{"type":"frontendOpenOrders","data":[{{"coin":"ETH","limitPx":"2500.0","oid":{k},"origSz":"0.01","side":"B","sz":"0.01","timestamp":1,"isTrigger":false,"cloid":"{c}"}},{{"coin":"ETH","limitPx":"2600.0","oid":7,"origSz":"0.01","side":"A","sz":"0.01","timestamp":1,"isTrigger":false}}]}}"#
             ));
         }
+        if s.body.contains("userRateLimit") {
+            return Answer::Info(
+                r#"{"type":"userRateLimit","data":{"cumVlm":"1500.5","nRequestsUsed":2890,"nRequestsCap":11500,"nRequestsSurplus":7}}"#
+                    .to_string(),
+            );
+        }
+        if s.body.contains("userFillsByTime") {
+            let mut hex = [0u8; 34];
+            to_hex(&encode(6, k), &mut hex);
+            let c = String::from_utf8_lossy(&hex).to_string();
+            return Answer::Info(format!(
+                r#"{{"type":"userFillsByTime","data":[{{"coin":"ETH","px":"2500","sz":"0.01","side":"B","time":1700000000001,"dir":"Open Long","oid":{k},"crossed":false,"fee":"0.0001","tid":{k},"cloid":"{c}"}},{{"coin":"ETH","px":"2500","sz":"0.01","side":"A","time":1700000000002,"dir":"Close Long","oid":{k},"crossed":true,"fee":"0.0001","tid":{k},"cloid":"{c}"}}]}}"#
+            ));
+        }
         if s.body.contains("clearinghouseState") {
             return Answer::Info(
                 r#"{"type":"clearinghouseState","data":{"marginSummary":{"accountValue":"1000.5","totalNtlPos":"25.0","totalRawUsd":"975.5","totalMarginUsed":"2.5"},"crossMarginSummary":{"accountValue":"1000.5","totalNtlPos":"25.0","totalRawUsd":"975.5","totalMarginUsed":"2.5"},"crossMaintenanceMarginUsed":"0.5","withdrawable":"998.0","assetPositions":[{"type":"oneWay","position":{"coin":"ETH","entryPx":"2500.0","szi":"0.01","positionValue":"25.0","unrealizedPnl":"0.0"}}],"time":1790000000000}}"#
@@ -13683,19 +13788,23 @@ fn gate96_venue_helper() {
 /// else in the round — admission, pending, deadlines,
 /// coalescing, msgpack, the signature, the JSON, the frame, the scans,
 /// the dedupe rings, the events — is 0 B: a regression in the gateway
-/// shows as a thirteenth. After the rounds, measured alone, one round of
-/// the cancel-all word's sweep (XH4d, XG-1): its own read (answered with
-/// one order of ours and a stranger's, scanned in place, emitting
-/// nothing), the cancel of ours by cloid, the cancel's answer back to the
-/// engine — exactly 4 allocations, rustls' again (two records sealed, two
-/// opened). The residue goes with the rustls record-layer pass
-/// (TL4/TL5b).
+/// shows as a thirteenth. After the rounds, measured alone, XH4e's two
+/// reads: the address budget (`userRateLimit`) and the day's fills
+/// (`userFillsByTime`, its rows summed in place — no row table), each
+/// posted alone, unsigned, and answered by one end — exactly 4
+/// allocations, rustls' again (two records sealed, two opened); no sweep
+/// has been asked yet, so none can land in that window. Then, measured
+/// alone, one round of the cancel-all word's sweep (XH4d, XG-1): its own
+/// read (answered with one order of ours and a stranger's, scanned in
+/// place, emitting nothing), the cancel of ours by cloid, the cancel's
+/// answer back to the engine — exactly 4 again. The residue goes with the
+/// rustls record-layer pass (TL4/TL5b).
 #[test]
 fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     use exec_gateway::Idle;
     use exec_hyperliquid::event::{
         ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE,
-        EV_REJECTED, EV_RESTING, EV_SNAPSHOT,
+        EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT,
     };
     use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
     use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
@@ -13708,6 +13817,8 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     /// One sweep round: the read and the cancel sealed, their answers
     /// opened.
     const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
+    /// XH4e: the budget and day reads — each sealed, each answer opened.
+    const RUSTLS_ALLOCS_PER_BUDGET_READS: u64 = 4;
     let dir = std::env::temp_dir().join(format!("mv-gate96-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("gate 96 dir");
     let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
@@ -13755,6 +13866,9 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         slots: 1 << 6,
         post_timeout_ns: 5_000_000_000,
         idle: Idle::new(0, 200_000),
+        // The gate measures allocations: its rounds must never throttle.
+        ip_weight_per_min: u32::MAX,
+        ws_msgs_per_min: u32::MAX,
     };
     let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("gate 96 key");
     let mut gw = HlGateway::new(cfg, gw_end, sk, coins).expect("gate 96 gateway");
@@ -13838,6 +13952,43 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     let window = kinds;
     let posts = eng.stats.io()[0];
 
+    // XH4e, measured alone — before any sweep is asked, so no sweep round
+    // can land in the window: the budget read and the day read, each
+    // posted alone, unsigned; their answers scanned in place into one end
+    // each.
+    let sweeps0 = gw.counters().sweep_rounds;
+    let mut ends = [(0u8, 0u64, 0i64); 2];
+    let mut ne = 0usize;
+    let g = AllocGuard::new();
+    assert!(eng.cmd.push(&HlCmd::read_limit(6, 9_000_001)));
+    assert!(eng.cmd.push(&HlCmd::read_day(
+        6,
+        9_000_002,
+        1_700_000_000_000,
+        1_700_000_600_000
+    )));
+    let t = std::time::Instant::now();
+    while ne < 2 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "gate 96: the budget and day reads never answered"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            if e.kind == EV_READ_DONE && ne < 2 {
+                ends[ne] = (e.reason, e.aux, e.px_1e8);
+                ne += 1;
+            }
+            kinds[usize::from(e.kind & 15)] += 1;
+        }
+    }
+    let (read_allocs, read_bytes, _) = g.delta();
+    assert_eq!(
+        gw.counters().sweep_rounds,
+        sweeps0,
+        "gate 96: no sweep round in the reads' window"
+    );
+
     // The cancel-all word, measured alone: one sweep round — the read,
     // the cancel of ours, its answer — then the sweep settles (1 s).
     let (rounds0, cancels0) = (gw.counters().sweep_rounds, gw.counters().sweep_cancels);
@@ -13902,5 +14053,19 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         "HL gateway sweep round: {sweep_allocs} allocations ({sweep_bytes} B) — rustls' \
          buffered API accounts for exactly {RUSTLS_ALLOCS_PER_SWEEP_ROUND} (two sealed, two \
          opened); anything above is the gateway's"
+    );
+    assert_eq!(
+        ends,
+        [
+            (READ_LIMIT, 2_890, 150_050_000_000),
+            (READ_DAY, 2, 5_000_000_000)
+        ],
+        "the budget's figures; the day's two rows of ours, $50"
+    );
+    assert_eq!(
+        read_allocs, RUSTLS_ALLOCS_PER_BUDGET_READS,
+        "HL gateway budget and day reads: {read_allocs} allocations ({read_bytes} B) — \
+         rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_BUDGET_READS} (two \
+         sealed, two opened); anything above is the gateway's"
     );
 }

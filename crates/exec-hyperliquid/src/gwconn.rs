@@ -86,6 +86,9 @@ pub struct GwConn {
     rx: IoBuf,
     ctl: Box<[u8; CTL_CAP]>,
     mask_ctr: u64,
+    /// WebSocket frames written, ever (XH4e: the gateway's message
+    /// window charges them).
+    frames: u64,
     posts: u32,
     last_rx_ns: u64,
     keepalive: Keepalive,
@@ -105,6 +108,7 @@ impl GwConn {
             rx: IoBuf::with_capacity(MAX_WS_BUF),
             ctl: Box::new([0u8; CTL_CAP]),
             mask_ctr: u64::from(slot) << 56,
+            frames: 0,
             posts: 0,
             last_rx_ns: 0,
             keepalive: Keepalive::new(keepalive),
@@ -138,11 +142,21 @@ impl GwConn {
         self.posts = self.posts.saturating_sub(n);
     }
 
-    /// The next frame mask (RFC 6455 §5.3: a fresh key per frame).
+    /// The next frame mask (RFC 6455 §5.3: a fresh key per frame). Every
+    /// frame this connection writes takes one, so it is also the frame
+    /// count (XH4e).
     #[inline]
     pub fn next_mask(&mut self) -> [u8; 4] {
         self.mask_ctr = self.mask_ctr.wrapping_add(1);
+        self.frames += 1;
         ws_mask_from_counter(self.mask_ctr)
+    }
+
+    /// WebSocket frames written on this connection, ever (XH4e).
+    #[inline]
+    #[must_use]
+    pub const fn frames(&self) -> u64 {
+        self.frames
     }
 
     /// Start a dial: TCP connect + TLS setup, registered for readiness.
@@ -314,8 +328,7 @@ impl GwConn {
                     if span.end - span.start > 125 {
                         return Err(ConnErr::BadFrame);
                     }
-                    self.mask_ctr = self.mask_ctr.wrapping_add(1);
-                    let mask = ws_mask_from_counter(self.mask_ctr);
+                    let mask = self.next_mask();
                     // The echo goes straight from rx into ctl — two
                     // disjoint buffers, no scratch.
                     let n = ws_write_pong(
