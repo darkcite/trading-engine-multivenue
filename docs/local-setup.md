@@ -571,7 +571,8 @@ wall time; it resumes exactly where the last one stopped, because a run with no
 index object is invisible to every reader. **Run it through
 `scripts/archive-run.py`, never `python -m claude_worker.archive`**: every
 worker lane's overlap guard is `pgrep -f 'claude[-_]worke[r]'`, and the boot
-recommit gives up after five minutes of it, leaving `vm_rows_active 0`.
+recommit gives up after thirty minutes of it (five until 2026-09-27),
+leaving `vm_rows_active 0`.
 
 Verify one run round-trips before trusting the lane with deletion:
 
