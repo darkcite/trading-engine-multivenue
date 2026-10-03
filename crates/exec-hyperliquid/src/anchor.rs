@@ -260,14 +260,20 @@ pub enum Kept {
 /// itself reconciled — so the router lets the slot quote — only once it
 /// reads the anchor kept. **A store that fails halts the gateway**
 /// ([`HALT_ANCHOR_UNKEPT`]): the slot never quotes on an anchor a restart
-/// would lose.
+/// would lose. XMM XH5c-2: the stamp it stored the anchor under
+/// ([`Self::set_unix_s`]) ties the session's top-up spend to it
+/// (`crate::topup::TopupKeeper::anchored_at`).
 pub struct AnchorKeeper {
     slot: Arc<AnchorSlot>,
     path: std::path::PathBuf,
     master: [u8; 20],
     stats: Arc<GatewayStats>,
+    set_unix_s: u64,
     done: bool,
 }
+
+// 72 B: moved once, at boot, into the gateway's thread (noted there).
+const _: () = assert!(core::mem::size_of::<AnchorKeeper>() == 72);
 
 impl AnchorKeeper {
     /// Boot: keep what `slot` hands over in `path`, for `master`; halt
@@ -284,6 +290,7 @@ impl AnchorKeeper {
             path,
             master,
             stats,
+            set_unix_s: 0,
             done: false,
         }
     }
@@ -308,6 +315,7 @@ impl AnchorKeeper {
         };
         match store(&self.path, a) {
             Ok(()) => {
+                self.set_unix_s = a.set_unix_s;
                 self.slot.mark_kept(usd_1e6);
                 Kept::Stored(usd_1e6)
             }
@@ -322,6 +330,13 @@ impl AnchorKeeper {
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// XMM XH5c-2: the stamp the anchor was stored under (its line's
+    /// `set_unix_s`); `0` until it is stored.
+    #[must_use]
+    pub const fn set_unix_s(&self) -> u64 {
+        self.set_unix_s
     }
 }
 
@@ -425,13 +440,16 @@ mod tests {
         assert_eq!(k.turn(), Kept::Idle, "nothing handed over");
         slot.publish(1_000_000_000);
         assert!(!slot.is_kept(1_000_000_000), "not before the store");
+        assert_eq!(k.set_unix_s(), 0, "no stamp before the store");
         assert_eq!(k.turn(), Kept::Stored(1_000_000_000));
         assert!(slot.is_kept(1_000_000_000));
         assert!(!slot.is_kept(999), "kept is the value published");
         assert_eq!(k.path(), p.as_path());
-        assert_eq!(
-            load_own(&p, ADDR).expect("read").map(|a| a.usdc_1e6),
-            Some(1_000_000_000)
+        let a = load_own(&p, ADDR).expect("read").expect("stored");
+        assert_eq!(a.usdc_1e6, 1_000_000_000);
+        assert!(
+            k.set_unix_s() > 0 && k.set_unix_s() == a.set_unix_s,
+            "XH5c-2: the stamp stored"
         );
         assert_eq!(k.turn(), Kept::Idle, "once a session");
         assert_eq!(gw.stats.halt_reason(), exec_gateway::HALT_NONE);
@@ -452,6 +470,7 @@ mod tests {
         assert_eq!(gw.stats.halt_reason(), HALT_ANCHOR_UNKEPT);
         assert!(!slot.is_kept(5_000_000));
         assert_eq!(slot.pending(), Some(5_000_000), "never marked kept");
+        assert_eq!(k.set_unix_s(), 0, "no stamp: nothing stored");
         assert_eq!(k.turn(), Kept::Idle, "one try: the gateway is halted");
         std::fs::remove_dir_all(&dir).ok();
     }

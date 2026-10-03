@@ -22,8 +22,9 @@
 //! **Admission.** A command is refused unsent ([`EV_REJECTED`]) when its
 //! slot is not one this gateway serves, its kind or time-in-force is not
 //! one it carries (ALO and IoC places, ALO modifies, cancels, and the
-//! control actions `updateLeverage`, `scheduleCancel`, `noop`), the halt
-//! word is set (growth only — a place, a modify, a leverage change —
+//! control actions `updateLeverage`, `scheduleCancel`, `noop` and — XMM
+//! XH5c — `reserveRequestWeight`), the halt word is set (growth only — a
+//! place, a modify, a leverage change, a weight purchase —
 //! [`REASON_HALTED`]; cancels, `scheduleCancel` and `noop` still go), or
 //! — growth only — the process's first `userFills` snapshot has not been
 //! absorbed yet ([`REASON_NOT_READY`]): a fill of ours can never be
@@ -217,7 +218,8 @@ const CLASS_ALO: usize = 0;
 const CLASS_TAKER: usize = 1;
 const CLASS_MODIFY: usize = 2;
 const CLASS_CANCEL: usize = 3;
-/// One control action (leverage, scheduleCancel, noop), posted alone.
+/// One control action (leverage, scheduleCancel, noop, a weight purchase),
+/// posted alone.
 const CLASS_CONTROL: usize = 4;
 /// One read (open orders, the perp sheet), posted alone, unsigned,
 /// WebSocket only (XH4d).

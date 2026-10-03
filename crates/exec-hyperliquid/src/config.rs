@@ -452,15 +452,38 @@ impl core::fmt::Debug for HlConfig {
     }
 }
 
-/// `0x` + 40 lowercase hex.
+/// The bytes [`hex20_into`] writes: `0x` + 40 hex.
+pub const HEX20_LEN: usize = 42;
+
+/// `0x` + 40 lowercase hex, as a `String` — cold: the boot's tells and
+/// refusals, the restores' address compares, the blocking arm's lines, the
+/// anchor keeper's line (once a session, on slot 6's gateway thread). One
+/// allocation and no copy: [`hex20_into`] renders into the String's own
+/// buffer (the `vec!` macro's shape: a boxed array, then its `Vec`).
 #[must_use]
 pub fn hex20(a: &[u8; 20]) -> String {
-    let mut s = String::with_capacity(42);
-    s.push_str("0x");
-    for b in a {
-        s.push_str(&format!("{b:02x}"));
+    let mut buf = Box::new([0u8; HEX20_LEN]);
+    hex20_into::<HEX20_LEN>(a, &mut buf);
+    // `0x` and lowercase hex are ASCII: the empty fallback is never taken.
+    String::from_utf8(<[u8]>::into_vec(buf)).unwrap_or_default()
+}
+
+/// **XMM XH5c-2** — `0x` + 40 lowercase hex written in place into the
+/// first [`HEX20_LEN`] bytes of `out`, an array at least that long (a
+/// shorter one fails the build): 0 B, never a panic. Slot 6's top-up
+/// keeper renders its state line with it after init; [`hex20`] is its
+/// `String`.
+pub fn hex20_into<const N: usize>(a: &[u8; 20], out: &mut [u8; N]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    const { assert!(N >= HEX20_LEN, "hex20_into writes 42 B") };
+    out[0] = b'0';
+    out[1] = b'x';
+    let mut i = 0usize;
+    while i < a.len() {
+        out[2 + 2 * i] = HEX[usize::from(a[i] >> 4)];
+        out[3 + 2 * i] = HEX[usize::from(a[i] & 0x0F)];
+        i += 1;
     }
-    s
 }
 
 fn hex_nibble(c: u8) -> Option<u8> {
@@ -773,6 +796,12 @@ mod tests {
             "0x0000000000000000000000000000000000000000"
         );
         assert_eq!(hex20(&ADDR), "0x2222222222222222222222222222222222222222");
+        // XMM XH5c-2: rendered in place, the same bytes.
+        let mut out = [0u8; 64];
+        let a: [u8; 20] = core::array::from_fn(|i| (i as u8).wrapping_mul(37));
+        hex20_into(&a, &mut out);
+        assert_eq!(&out[..HEX20_LEN], hex20(&a).as_bytes());
+        assert_eq!(out[HEX20_LEN], 0, "nothing past the 42 B");
     }
 
     /// XMM XH5b (O-XH5): slot 6's own accounts read keys and masters of

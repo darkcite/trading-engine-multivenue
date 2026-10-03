@@ -14100,11 +14100,21 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// seventh listing no USDC — both refused, the arm's `spot_failed`);
 /// XH5b-2: the boot's anchor handed to a real keeper that stores it just
 /// before the window, whose first pass reads it kept, and in every round of
-/// it that keeper's pass (done) and one nothing is handed to; the halt
-/// signals and the
-/// cancel-all state; every out-queue drained as the
-/// engine does. Timers run on the real clock (1 ms windows): the warm-up
-/// runs until every path has run, and the window must run each again.
+/// it that keeper's pass (done) and one nothing is handed to; XMM XH5c-2:
+/// top-ups armed (1 000 requests a purchase, no day's max) — they start
+/// with the anchor kept, in the window — every seventh budget read inside
+/// the band (never while a purchase awaits its confirming read), decided,
+/// its state stored by a REAL top-up keeper turned every round (the line
+/// in place, a temp file, an fsync, a rename), the purchase built in place
+/// and answered accepted (the next reads answer the full headroom, which
+/// shows it; its price charged once a sheet issued after it and its spot
+/// half land) or, every third, refused `THROTTLED` (never left: the day's
+/// charge returned; decided again, its state the one stored — kept with no
+/// write) — the window runs until each has run — then, measured alone, a
+/// venue refusal stops them and the stop is stored; the halt signals and
+/// the cancel-all state; every out-queue drained as the engine does.
+/// Timers run on the real clock (1 ms windows): the warm-up runs until
+/// every path has run, and the window must run each again.
 #[test]
 fn hl_gateway_arm_is_zero_alloc() {
     use clob_dispatcher::{CancelAllState, OrderDispatch};
@@ -14116,9 +14126,10 @@ fn hl_gateway_arm_is_zero_alloc() {
     use exec_gateway::stats::SWEEP_CLEAR;
     use exec_hyperliquid::anchor::{AnchorKeeper, AnchorSlot, Kept};
     use exec_hyperliquid::arm::{ArmCfg, ArmCounters, HlGatewayArm, PerpBind, ARM_PERPS};
+    use exec_hyperliquid::budget::TopupGovernor;
     use exec_hyperliquid::cmd::{
         CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
-        CMD_READ_SPOT, CMD_READ_STATE,
+        CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE,
     };
     use exec_hyperliquid::deadman::DeadManCfg;
     use exec_hyperliquid::event::{
@@ -14131,6 +14142,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     use exec_hyperliquid::gateway::HlGatewayEnd;
     use exec_hyperliquid::hl_duplex;
     use exec_hyperliquid::rules::PerpRules;
+    use exec_hyperliquid::topup::{Topped, TopupKeeper, TopupSlot};
 
     const SLOT: u8 = 6;
     const SYM: u32 = 42;
@@ -14162,6 +14174,14 @@ fn hl_gateway_arm_is_zero_alloc() {
         /// XH5b-1: spot sheets answered (every sixth failing, every seventh
         /// listing no USDC: the arm counts both `spot_failed`).
         spots: u64,
+        /// XMM XH5c-2: the weight bought (the reads' surplus), the
+        /// purchases answered, the reads kept out of the band and off the
+        /// floor while a purchase awaits its confirming read, and whether
+        /// the venue refuses the next one (the stop's window).
+        surplus: u64,
+        reserves: u64,
+        calm: u8,
+        refuse: bool,
     }
 
     /// The gateway's end: every command answered by the script.
@@ -14358,11 +14378,27 @@ fn hl_gateway_arm_is_zero_alloc() {
                     } else {
                         // 100 requests used of a $1M address's 1 010 000 —
                         // every 13th read 1 009 000: the floor (2 000)
-                        // breached, and lifted by the next read.
+                        // breached, and lifted by the next read. XMM
+                        // XH5c-2: every seventh read 2 500 left — inside the
+                        // band (2 000, 3 000]. The weight bought rides the
+                        // surplus (the grant) and `used` follows it, so each
+                        // read states the headroom it names; the band and
+                        // the floor never while a purchase awaits its
+                        // confirming read (the full headroom shows it).
+                        let calm = s.calm > 0;
+                        s.calm = s.calm.saturating_sub(1);
+                        let left = if !calm && s.limits % 13 == 0 {
+                            1_000
+                        } else if !calm && s.limits % 7 == 0 {
+                            2_500
+                        } else {
+                            1_009_900
+                        };
                         assert!(gw.evt.emit(&ExecEvent {
                             reason: READ_LIMIT,
-                            aux: if s.limits % 13 == 0 { 1_009_000 } else { 100 },
+                            aux: 1_010_000 + s.surplus - left,
                             px_1e8: 100_000_000_000_000,
+                            sz_1e8: s.surplus as i64,
                             ..end
                         }));
                     }
@@ -14395,6 +14431,28 @@ fn hl_gateway_arm_is_zero_alloc() {
                         px_1e8: if listed { 50_000_000_000 } else { 0 },
                         sz_1e8: i64::from(listed),
                         ..end
+                    }));
+                }
+                // XMM XH5c-2: a weight purchase — every third refused
+                // unsent (throttled: the day's charge returned), else
+                // accepted: its weight in the surplus from here on, the
+                // next two reads calm; in the stop's window, refused by the
+                // venue.
+                CMD_RESERVE => {
+                    s.reserves += 1;
+                    let (kind, reason) = if s.refuse {
+                        (EV_REJECTED, ORDER_EVENT_REASON_OTHER)
+                    } else if s.reserves % 3 == 0 {
+                        (EV_REJECTED, REASON_THROTTLED)
+                    } else {
+                        s.surplus += u64::from(c.arg);
+                        s.calm = 2;
+                        (EV_ACK, 0)
+                    };
+                    assert!(gw.evt.emit(&ExecEvent {
+                        kind,
+                        reason,
+                        ..item
                     }));
                 }
                 // The dead man's posts.
@@ -14558,6 +14616,14 @@ fn hl_gateway_arm_is_zero_alloc() {
     // before the window, whose first pass reads it kept.
     let keep = std::sync::Arc::new(AnchorSlot::new());
     arm.keep_anchor_in(std::sync::Arc::clone(&keep));
+    // XMM XH5c-2: top-ups armed — 1 000 requests a purchase, no day's max —
+    // their state handed to a real `TopupKeeper` (built before the window).
+    let topup_slot = std::sync::Arc::new(TopupSlot::new());
+    arm.set_topup(
+        TopupGovernor::restored(0, 0, 0).armed(1_000, u64::MAX),
+        Some(std::sync::Arc::clone(&topup_slot)),
+    )
+    .expect("gate 98: top-ups on the slot's own account");
     gw.stats.set_gauges(0, true);
     let mut s = Script {
         n: 0,
@@ -14572,6 +14638,10 @@ fn hl_gateway_arm_is_zero_alloc() {
         limits: 0,
         days: 0,
         spots: 0,
+        surplus: 0,
+        reserves: 0,
+        calm: 0,
+        refuse: false,
     };
     let mut acc = 0u64;
     let _ = arm.on_idle();
@@ -14652,13 +14722,41 @@ fn hl_gateway_arm_is_zero_alloc() {
         matches!(keeper.turn(), Kept::Stored(_)),
         "gate 98: the boot's worth was handed over and stored"
     );
+    // XMM XH5c-2: the top-up keeper, the anchor's stamp handed to it as the
+    // gateway's loop does; nothing handed over before the anchor is kept.
+    let mut topup_keeper = TopupKeeper::new(
+        std::sync::Arc::clone(&topup_slot),
+        dir.join("xmm-topup-testnet.state"),
+        [0x66; 20],
+        0,
+    )
+    .expect("gate 98: the top-up keeper");
+    topup_keeper.anchored_at(keeper.set_unix_s());
+    assert_eq!(
+        topup_keeper.turn(),
+        Topped::Idle,
+        "gate 98: no top-up before the anchor is kept"
+    );
     let before = paths(arm.counters(), &s);
     let g = AllocGuard::new();
     let end = r + ROUNDS;
-    while r < end {
+    // XMM XH5c-2: and on until a purchase was seen, one refused unsent, and
+    // a decision's state was kept with no write.
+    let mut unchanged = 0u64;
+    while r < end
+        || arm.counters().topup_ok == 0
+        || arm.counters().topup_unsent == 0
+        || unchanged == 0
+    {
         round(&mut arm, &mut gw, r, &mut s, &mut acc);
         assert!(keeper.turn() == Kept::Idle && idle_keeper.turn() == Kept::Idle);
+        match topup_keeper.turn() {
+            Topped::Failed(_) => panic!("gate 98: the top-up state could not be stored"),
+            Topped::Unchanged => unchanged += 1,
+            Topped::Idle | Topped::Stored(_) => {}
+        }
         r += 1;
+        assert!(r < end + 2_000_000, "gate 98: the top-ups never ran");
     }
     std::hint::black_box(acc);
     let (allocs, bytes, _) = g.delta();
@@ -14675,11 +14773,60 @@ fn hl_gateway_arm_is_zero_alloc() {
         allocs, 0,
         "the HL gateway arm allocated {allocs} times ({bytes} B)"
     );
+    let c = arm.counters();
+    assert!(
+        c.topup_ok > 0 && c.topup_unsent > 0 && c.topup_failed == 0 && s.reserves > 0,
+        "gate 98: top-ups seen and refused unsent, never stopped: {} seen, {} unsent, {} \
+         stopped",
+        c.topup_ok,
+        c.topup_unsent,
+        c.topup_failed
+    );
+    eprintln!(
+        "gate 98: {} rounds; top-ups {} seen, {} refused unsent, {} purchases answered, {} \
+         decisions kept with no write",
+        r - (end - ROUNDS),
+        c.topup_ok,
+        c.topup_unsent,
+        s.reserves,
+        unchanged
+    );
     let mut rep = clob_dispatcher::GatewayArmReport::default();
     assert!(arm.gateway_arm_report(0, &mut rep));
     assert_eq!(
         rep.anchor_kept, 1,
         "gate 98: the window read the anchor kept"
+    );
+    assert!(
+        rep.topup_weight == 1_000 && rep.topup_cost_usd_1e6 > 0,
+        "gate 98: the spend of the purchases seen"
+    );
+
+    // XMM XH5c-2, measured alone: a purchase the venue refuses stops the
+    // top-ups, and the stop — the day spent — is stored.
+    s.refuse = true;
+    let mut stored = None;
+    let g = AllocGuard::new();
+    while arm.counters().topup_failed == 0 || stored.is_none() {
+        round(&mut arm, &mut gw, r, &mut s, &mut acc);
+        if let Topped::Stored(st) = topup_keeper.turn() {
+            if arm.counters().topup_failed > 0 {
+                stored = Some(st);
+            }
+        }
+        r += 1;
+        assert!(r < end + 4_000_000, "gate 98: the top-ups never stopped");
+    }
+    std::hint::black_box(acc);
+    let (stop_allocs, stop_bytes, _) = g.delta();
+    assert_eq!(
+        stored.map(|st| (st.used, st.cost_1e6 > 0)),
+        Some((u64::MAX, true)),
+        "gate 98: the stop stored as the day spent, with the session's spend"
+    );
+    assert_eq!(
+        stop_allocs, 0,
+        "the HL gateway arm's top-up stop allocated {stop_allocs} times ({stop_bytes} B)"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -14749,6 +14896,10 @@ fn gate96_venue_helper() {
                     .to_string(),
             );
         }
+        // XMM XH5c-2: a weight purchase — a control action's answer.
+        if s.body.contains("reserveRequestWeight") {
+            return Answer::Action(r#"{"status":"ok","response":{"type":"default"}}"#.to_string());
+        }
         if s.body.contains("batchModify") {
             return Answer::Action(format!(
                 r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":{k}}}}}]}}}}}}"#
@@ -14814,7 +14965,11 @@ fn gate96_venue_helper() {
 /// next beat past it the gateway's own TTL cancel of the resting one —
 /// untimed, its success read `EXPIRED` — with the RTT window published at
 /// every beat inside the window (pinned by `hl_gateway_loopback`): exactly
-/// 6, rustls' (two sealed, four opened). Then, measured
+/// 6, rustls' (two sealed, four opened). XMM XH5c-2, measured alone: one
+/// weight purchase (`reserveRequestWeight`, a control action — encoded,
+/// signed, rendered and framed in place, posted alone), its `default`
+/// answer read back as the arm's acknowledgement: exactly 2, rustls' (one
+/// sealed, one opened). Then, measured
 /// alone, one round of the cancel-all word's sweep (XH4d, XG-1): its own
 /// read (answered with one order of ours and a stranger's, scanned in
 /// place, emitting nothing), the cancel of ours by cloid, the cancel's
@@ -14844,6 +14999,11 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     /// XH4f: the places' post and the TTL cancel sealed; the places'
     /// answer, the two pushes and the cancel's answer opened.
     const RUSTLS_ALLOCS_PER_TTL: u64 = 6;
+    /// XMM XH5c-2: the purchase sealed, its answer opened.
+    const RUSTLS_ALLOCS_PER_RESERVE: u64 = 2;
+    /// XMM XH5c-2: the purchase's client id (the arm's range: bit 63 set,
+    /// bit 62 clear, bit 60).
+    const RESERVE_OID: u64 = (1 << 63) | (1 << 60) | 1;
     let dir = std::env::temp_dir().join(format!("mv-gate96-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("gate 96 dir");
     let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
@@ -15056,6 +15216,32 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         eng.stats.io()[0] - ttl_posts0,
         gw.counters().sweep_rounds - sweeps0,
     );
+
+    // XMM XH5c-2, measured alone — still before any sweep is asked: one
+    // weight purchase, posted alone and signed; its answer the arm's ACK.
+    let reserve_posts0 = eng.stats.io()[0];
+    let mut bought = 0u64;
+    let g = AllocGuard::new();
+    assert!(eng.cmd.push(&HlCmd::reserve(6, RESERVE_OID, 10_000)));
+    let t = std::time::Instant::now();
+    while bought == 0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "gate 96: the weight purchase never answered"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            if e.kind == EV_ACK && e.client_oid == RESERVE_OID {
+                bought += 1;
+            }
+            kinds[usize::from(e.kind & 15)] += 1;
+        }
+    }
+    let (reserve_allocs, reserve_bytes, _) = g.delta();
+    let reserve = (
+        eng.stats.io()[0] - reserve_posts0,
+        gw.counters().sweep_rounds - sweeps0,
+    );
     let posts_before_sweep = eng.stats.io()[0];
 
     // The cancel-all word, measured alone: one sweep round — the read,
@@ -15153,5 +15339,16 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         "HL gateway TTL: {ttl_allocs} allocations ({ttl_bytes} B) — rustls' buffered API \
          accounts for exactly {RUSTLS_ALLOCS_PER_TTL} (two sealed, four opened); anything \
          above is the gateway's"
+    );
+    assert_eq!(
+        reserve,
+        (1, 0),
+        "one weight purchase, posted alone; no sweep"
+    );
+    assert_eq!(
+        reserve_allocs, RUSTLS_ALLOCS_PER_RESERVE,
+        "HL gateway weight purchase: {reserve_allocs} allocations ({reserve_bytes} B) — \
+         rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_RESERVE} (one sealed, \
+         one opened); anything above is the gateway's"
     );
 }

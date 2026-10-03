@@ -6115,9 +6115,9 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 68;
+const HLGW_COUNTERS: usize = 71;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
-const HLGW_GAUGES: usize = 32;
+const HLGW_GAUGES: usize = 35;
 
 /// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
 /// — which is what pins the two together.
@@ -6153,6 +6153,9 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_refused_leverage_total",
     "engine_exec_hlgw_spot_reads_total",
     "engine_exec_hlgw_spot_failed_total",
+    "engine_exec_hlgw_topup_ok_total",
+    "engine_exec_hlgw_topup_failed_total",
+    "engine_exec_hlgw_topup_unsent_total",
     "engine_exec_hlgw_deadman_arms_total",
     "engine_exec_hlgw_deadman_clears_total",
     "engine_exec_hlgw_deadman_accepted_total",
@@ -6193,7 +6196,7 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 68] (544 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 71] (568 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6230,6 +6233,9 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.refused_leverage,
         r.spot_reads,
         r.spot_failed,
+        r.topup_ok,
+        r.topup_failed,
+        r.topup_unsent,
         r.dm_arms,
         r.dm_clears,
         r.dm_accepted,
@@ -6304,11 +6310,15 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_anchor_kept",
     "engine_exec_hlgw_worth_usd_1e6",
     "engine_exec_hlgw_session_pnl_usd_1e6",
+    "engine_exec_hlgw_topup_weight",
+    "engine_exec_hlgw_topup_day_used",
+    "engine_exec_hlgw_topup_cost_usd_1e6",
 ];
 
 /// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
-/// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
-// COPY: [i64; 32] (256 B) returned by value — cold, as above.
+/// level past `i64::MAX` — a heartbeat not yet seen, a top-up day read as
+/// spent (XMM XH5c-2) — reads −1.
+// COPY: [i64; 35] (280 B) returned by value — cold, as above.
 fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6344,6 +6354,9 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.anchor_kept),
         r.worth_usd_1e6,
         r.session_pnl_usd_1e6,
+        g(r.topup_weight),
+        g(r.topup_day_used),
+        r.topup_cost_usd_1e6,
     ]
 }
 
@@ -6386,7 +6399,7 @@ fn register_hlgw_metrics(
     let last_shutdown_unconfirmed = reg
         .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
         .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
-    // COPY: the 404 B id block ((68 + 32 + 1) × 4 B), returned by value once
+    // COPY: the 428 B id block ((71 + 35 + 1) × 4 B), returned by value once
     // at boot — rejected: an out-param for a one-time move.
     Ok(ExecHlgwMetricIds {
         counters,
@@ -6417,7 +6430,7 @@ fn mirror_hlgw_metrics(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: the 68 totals (544 B) kept as the next delta's baseline — 5 s
+    // COPY: the 71 totals (568 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -13692,6 +13705,12 @@ mod tests {
             anchor_kept: 5,
             worth_usd_1e6: 988,
             session_pnl_usd_1e6: -12,
+            topup_ok: 4,
+            topup_failed: 1,
+            topup_unsent: 6,
+            topup_weight: 10_000,
+            topup_day_used: u64::MAX,
+            topup_cost_usd_1e6: 5_000_000,
             ..clob_dispatcher::GatewayArmReport::default()
         };
         mirror_hlgw_metrics(reg, ids, &cur, &mut last);
@@ -13717,6 +13736,12 @@ mod tests {
             ("engine_exec_hlgw_anchor_kept", "5"),
             ("engine_exec_hlgw_worth_usd_1e6", "988"),
             ("engine_exec_hlgw_session_pnl_usd_1e6", "-12"),
+            ("engine_exec_hlgw_topup_ok_total", "4"),
+            ("engine_exec_hlgw_topup_failed_total", "1"),
+            ("engine_exec_hlgw_topup_unsent_total", "6"),
+            ("engine_exec_hlgw_topup_weight", "10000"),
+            ("engine_exec_hlgw_topup_day_used", "-1"),
+            ("engine_exec_hlgw_topup_cost_usd_1e6", "5000000"),
             ("engine_exec_hlgw_last_shutdown_unconfirmed", "0"),
         ] {
             assert!(

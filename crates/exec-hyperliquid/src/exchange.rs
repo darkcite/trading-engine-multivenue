@@ -815,7 +815,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let (topup_day, topup_used, topup_cost_1e6) = budget::restore_topup(
             &topup_path,
             cfg.master_addr,
-            crate::nonce::now_ms() / crate::dayspend::DAY_MS,
+            crate::dayspend::utc_day(),
             anchor_set_s,
         );
         Ok(Self {
@@ -1295,7 +1295,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             self.counters.topup_failed = self.counters.topup_failed.wrapping_add(1);
             return;
         }
-        let today = crate::nonce::now_ms() / crate::dayspend::DAY_MS;
+        let today = crate::dayspend::utc_day();
         if !self
             .topup
             .wants(self.budget.remaining(), self.budget.floor(), today)

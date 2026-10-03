@@ -5602,7 +5602,7 @@ fn run(args: RunArgs) -> ExitCode {
                         ) => {
                             // COPY: boot, once — the shape's arms move by
                             // value into their splits and the router (KiB;
-                            // the gateway arms' 1 664 B noted at their
+                            // the gateway arms' 1 792 B noted at their
                             // boots). Rejected: boxing (every verb would
                             // chase a pointer).
                             match xmm_arm {

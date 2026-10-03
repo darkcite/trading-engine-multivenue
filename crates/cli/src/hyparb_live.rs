@@ -1957,7 +1957,7 @@ fn gateway_hedge(
     }
     cfg.n_perps = resolved.len();
     let (eng, gw_end) = hl_duplex();
-    // COPY: boot, once — the 1 664 B arm out of `new`'s `Result`, through
+    // COPY: boot, once — the 1 792 B arm out of `new`'s `Result`, through
     // the maker's, into `HyparbLive` and `LiveBoot` (as `xmm_live`'s, noted
     // there). Rejected: as there.
     let arm = HlGatewayArm::new(&cfg, eng).map_err(|e| format!("slot 0's gateway arm: {e:?}"))?;
@@ -1978,7 +1978,7 @@ fn gateway_hedge(
     gw.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
         String::from("slot 0's gateway: more agent addresses than the nonce streams hold")
     })?);
-    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None, None)?;
+    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None, None, None)?;
     Ok((arm, Some((handle, stop))))
 }
 

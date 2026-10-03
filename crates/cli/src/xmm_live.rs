@@ -23,8 +23,12 @@
 //! restored at boot, or taken at the first complete worth and stored by
 //! the gateway's thread before the slot's first quote — a store that fails
 //! halts the slot; and the venue must bind its API wallet to its master
-//! ([`check_agent_binding`], one boot read). The rules by account are
-//! [`check_account_rules`]. The
+//! ([`check_agent_binding`], one boot read). **On its own account it may
+//! buy request weight (XH5c-2):** `request_topup_weight` /
+//! `request_topup_day_max`, refused on the shared account, the day's usage
+//! and the session's spend kept beside the exec artifact, one file a network
+//! ([`topup_path`]), each purchase's state stored by the gateway's thread
+//! before it leaves. The rules by account are [`check_account_rules`]. The
 //! arm binds the member's perps from the exchange host's `/info meta` —
 //! their asset ids and size rules, the member's lots checked against the
 //! venue's — sets each one's leverage before it takes orders (O-XH6:
@@ -43,7 +47,8 @@
 //! on a boot abort) — or, once the process-wide shutdown is seen,
 //! [`GATEWAY_GRACE_NS`] after it at most. Cold module: the boot, and the
 //! gateway thread's loop (`run_gateway`: two loads, the anchor keeper's
-//! load until it acts, and a turn a pass, 0 B).
+//! load until it acts, the top-up keeper's two — its store at most twice a
+//! purchase, 0 B — and a turn a pass, 0 B).
 //!
 //! XH4g: the binding ([`bind_perps`]), the arm's configuration
 //! ([`arm_cfg`]) and the gateway's thread ([`spawn_gateway`]) are shared
@@ -59,11 +64,13 @@ use std::thread::JoinHandle;
 use core_config::exec::ExecSlot;
 use exec_hyperliquid::anchor::{load_own, AnchorKeeper, AnchorSlot, Kept, PnlAnchor};
 use exec_hyperliquid::arm::{ArmCfg, HlGatewayArm, PerpBind, ARM_PERPS};
+use exec_hyperliquid::budget::{restore_topup, TopupGovernor, TOPUP_PRICE_1E6};
 use exec_hyperliquid::config::{
     agent_addr_from_env, env_is_set, hex20, master_from_env, ConfigErr, ENV_AGENT_KEY,
     ENV_MASTER_ADDR, ENV_T_AGENT_KEY, ENV_T_MASTER_ADDR, ENV_XMM_T_AGENT_KEY,
     ENV_XMM_T_MASTER_ADDR, HOST_MAINNET, HOST_TESTNET,
 };
+use exec_hyperliquid::dayspend::utc_day;
 use exec_hyperliquid::deadman::DeadManCfg;
 use exec_hyperliquid::gateway::{
     hl_duplex, read_weight_per_min, CoinMap, GatewayCfg, HlGateway, IP_WEIGHT_SHARE,
@@ -71,6 +78,7 @@ use exec_hyperliquid::gateway::{
 };
 use exec_hyperliquid::recon::{scan_user_role, user_role_request, Role};
 use exec_hyperliquid::rules::PerpRules;
+use exec_hyperliquid::topup::{Topped, TopupKeeper, TopupSlot};
 use exec_hyperliquid::{HlConfig, Network, NonceStreams, Scope};
 use exec_router::{InstrumentSpec, LAW_LINEAR};
 use ingress_hyperliquid::discovery::{HlAssetKind, HlDiscovery};
@@ -151,6 +159,18 @@ pub fn anchor_path(exec_toml: &Path, network: Network) -> PathBuf {
     })
 }
 
+/// **XMM XH5c-2** — where slot 6's own account keeps its top-ups' state (the
+/// UTC day, the weight bought on it, the session's spend and its anchor —
+/// the blocking arm's line): beside the exec artifact, one file a network,
+/// never the blocking arm's `exec-topup.state` (whose master is another).
+#[must_use]
+pub fn topup_path(exec_toml: &Path, network: Network) -> PathBuf {
+    exec_toml.with_file_name(match network {
+        Network::Testnet => "xmm-topup-testnet.state",
+        Network::Mainnet => "xmm-topup-mainnet.state",
+    })
+}
+
 /// An arm reading every `recon_ms` (the spot sheet with each perp sheet
 /// when `own`) keeps its periodic reads under 40 % of the gateway's IP
 /// share.
@@ -189,6 +209,11 @@ pub const fn stale_periods(own: bool) -> u64 {
 /// account's worth (XH5b-1) on an account of its own — which must state its
 /// loss bound (O-XH5: the probe's −$50) — and never on the shared one,
 /// whose worth is every slot's (refused there: it could never be judged).
+/// XH5c-2: top-ups on an account of its own alone — the shared account's
+/// requests are its blocking arm's to buy (one governor a master's day) —
+/// and one purchase priced at most a quarter of the loss bound: until a
+/// purchase is inside the worth its price reads as a loss, and one must
+/// never end a session alone.
 ///
 /// # Errors
 /// The first rule `s` breaks, named.
@@ -229,6 +254,26 @@ pub fn check_account_rules(s: &ExecSlot, own: bool) -> Result<(), String> {
             "slot 6 on its own account states no session loss bound (halt_on_loss_usd_1e6) — \
              the probe's is −$50 (O-XH5); its own account is where the bound is judged (XMM \
              XH5b-2)",
+        ));
+    }
+    if !own && s.request_topup_weight != 0 {
+        return Err(String::from(
+            "slot 6 on the shared testnet account states top-ups (request_topup_weight), but \
+             that account's requests are its blocking arm's to buy (S7-L1) — drop them, or give \
+             slot 6 its own account (HYPERLIQUID_XMM_TESTNET_*, XMM XH5c-2)",
+        ));
+    }
+    let price = s.request_topup_weight.saturating_mul(TOPUP_PRICE_1E6);
+    if own && price.saturating_mul(4) > s.halt_on_loss_usd_1e6 {
+        return Err(format!(
+            "slot 6's top-up of {} requests costs ${}.{:06}, over a quarter of its session loss \
+             bound (${}.{:06}): until a purchase is inside the worth its price reads as a loss, \
+             and one must never end a session alone — lower request_topup_weight (XMM XH5c-2)",
+            s.request_topup_weight,
+            price / 1_000_000,
+            price % 1_000_000,
+            s.halt_on_loss_usd_1e6 / 1_000_000,
+            s.halt_on_loss_usd_1e6 % 1_000_000,
         ));
     }
     Ok(())
@@ -524,6 +569,57 @@ pub fn tell_account(tell: &mut String, network: Network, own: Option<&OwnTell<'_
     };
 }
 
+/// **XMM XH5c-2 — the boot tell's top-ups** (cold, pure): armed — the
+/// weight a purchase and its price, the day's max and its price, the day's
+/// usage restored (or read as spent), the file — or none; on an account of
+/// its own, the session's spend restored (added back).
+pub fn tell_topup(tell: &mut String, gov: Option<&TopupGovernor>, file: &Path) {
+    if let Some(g) = gov.filter(|g| g.cost_1e6() > 0) {
+        let _ = write!(
+            tell,
+            "; the session's top-up spend ${}.{:06} restored (added back to its P&L, Q-XH5-2)",
+            g.cost_1e6() / 1_000_000,
+            g.cost_1e6() % 1_000_000,
+        );
+    }
+    let Some(g) = gov.filter(|g| g.weight() > 0) else {
+        tell.push_str(
+            "; no top-ups (the address budget is what the traded volume funds; the floor halts \
+             the slot)",
+        );
+        return;
+    };
+    let price = |w: u64| w.saturating_mul(TOPUP_PRICE_1E6.unsigned_abs());
+    let (one, day) = (price(g.weight()), price(g.day_max()));
+    let _ = write!(
+        tell,
+        "; top-ups of {} requests (${}.{:06}), at most {} a UTC day (${}.{:06}) — ",
+        g.weight(),
+        one / 1_000_000,
+        one % 1_000_000,
+        g.day_max(),
+        day / 1_000_000,
+        day % 1_000_000,
+    );
+    let _ = if g.used() == u64::MAX {
+        write!(
+            tell,
+            "today read as SPENT ({} could not be read: no purchase before 00:00Z)",
+            file.display()
+        )
+    } else {
+        write!(
+            tell,
+            "{} bought today (the state in {})",
+            g.used(),
+            file.display()
+        )
+    };
+    tell.push_str(
+        "; each purchase's state stored by the gateway's thread before it leaves (XMM XH5c-2)",
+    );
+}
+
 /// What the boot needs.
 pub struct XmmSpec<'a> {
     /// The resolved artifact (slot 6 live on the gateway).
@@ -671,6 +767,24 @@ pub fn boot_xmm_arm(
     } else {
         None
     };
+    // XMM XH5c-2: the top-ups — on its own account (`check_account_rules`
+    // refused them on the shared one): the day's usage and the session's
+    // spend restored from their file (the spend only under the anchor
+    // restored — and added back whether or not the artifact arms top-ups
+    // now), armed with the artifact's keys (none: off, and no keeper); the
+    // keeper takes a fresh anchor's stamp when its keeper stores it.
+    let topup_file = topup_path(&spec.eb.path, network);
+    let topup = if own {
+        let anchor_s = restored.map_or(0, |a| a.set_unix_s);
+        let (day, used, cost) = restore_topup(&topup_file, hl.master_addr, utc_day(), anchor_s);
+        let gov = TopupGovernor::restored(day, used, cost).armed(
+            u64::try_from(s.request_topup_weight).unwrap_or(0),
+            u64::try_from(s.request_topup_day_max).unwrap_or(0),
+        );
+        Some((gov, anchor_s))
+    } else {
+        None
+    };
     let p = &xmm.params;
     let n = usize::from(p.n_perps);
     if n == 0 || n > ARM_PERPS || n != xmm.coins.len() {
@@ -713,6 +827,7 @@ pub fn boot_xmm_arm(
         anchor_file: &anchor_file,
     };
     tell_account(&mut tell, network, own.then_some(&own_tell));
+    tell_topup(&mut tell, topup.as_ref().map(|t| &t.0), &topup_file);
     let _ = write!(
         tell,
         "; {n} perp(s) bound ({}); leverage {LEVERAGE}x cross; reads every {recon_ms} ms, the \
@@ -740,7 +855,7 @@ pub fn boot_xmm_arm(
     } else {
         None
     };
-    // COPY: boot, once — the 1 664 B arm moves out of `new`'s `Result`, into
+    // COPY: boot, once — the 1 792 B arm moves out of `new`'s `Result`, into
     // `XmmLive`, the binary's tuple, the `SlotSplit` and the router (it stays
     // inline there, for the verbs' direct calls). Rejected: boxing the arm
     // (every verb would chase a pointer).
@@ -749,6 +864,28 @@ pub fn boot_xmm_arm(
         arm.keep_anchor_in(slot);
         keeper
     });
+    // XMM XH5c-2: the governor in the arm; armed (a weight above 0), its
+    // hand-over to a keeper on the gateway's thread (a weight past the
+    // purchase's `u32`, and a temp path too long for a 0 B store, refused).
+    // Off, the governor alone carries the restored spend's add-back: no
+    // keeper, nothing stored.
+    let topup_keeper = match topup {
+        Some((gov, anchor_s)) if gov.weight() > 0 => {
+            let slot = Arc::new(TopupSlot::new());
+            arm.set_topup(gov, Some(Arc::clone(&slot)))
+                .map_err(|e| format!("slot 6's top-ups: {e:?}"))?;
+            Some(
+                TopupKeeper::new(slot, topup_file, hl.master_addr, anchor_s)
+                    .map_err(|e| format!("slot 6's top-up state: {e}"))?,
+            )
+        }
+        Some((gov, _)) => {
+            arm.set_topup(gov, None)
+                .map_err(|e| format!("slot 6's top-ups: {e:?}"))?;
+            None
+        }
+        None => None,
+    };
     let sk = hl
         .secret_key()
         .map_err(|e| format!("slot 6's API wallet key: {e}"))?;
@@ -761,7 +898,7 @@ pub fn boot_xmm_arm(
     gw.share_nonce(nonces.stream(&hl.agent_addr).ok_or_else(|| {
         String::from("slot 6's gateway: more agent addresses than the nonce streams hold")
     })?);
-    let (handle, stop) = spawn_gateway(gw, "hl-gw-xmm", Some(GATEWAY_CORE), keeper)?;
+    let (handle, stop) = spawn_gateway(gw, "hl-gw-xmm", Some(GATEWAY_CORE), keeper, topup_keeper)?;
     Ok(XmmLive {
         arm,
         handle,
@@ -944,8 +1081,9 @@ const BLANK_PERP: PerpBind = PerpBind {
 };
 
 /// Start `gw` on its own thread `name` (pinned to `core` when given), with
-/// slot 6's anchor `keeper` on an account of its own (XMM XH5b-2): it turns
-/// until the returned [`GatewayStop`] is released.
+/// slot 6's anchor `keeper` (XMM XH5b-2) and top-up keeper `topup` (XMM
+/// XH5c-2) on an account of its own: it turns until the returned
+/// [`GatewayStop`] is released.
 ///
 /// # Errors
 /// The thread could not be spawned.
@@ -954,13 +1092,15 @@ pub fn spawn_gateway(
     name: &'static str,
     core: Option<usize>,
     mut keeper: Option<AnchorKeeper>,
+    mut topup: Option<TopupKeeper>,
 ) -> Result<(JoinHandle<()>, GatewayStop), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let owner = Arc::clone(&stop);
-    // COPY: boot, once — the ≤ 8 KiB gateway and the anchor keeper (64 B),
-    // taken by value, move into the thread's closure (which `Builder::spawn`
-    // boxes). Rejected: building the gateway on its own thread, which would
-    // need a handshake to report its boot errors.
+    // COPY: boot, once — the ≤ 8 KiB gateway, the anchor keeper (72 B) and
+    // the top-up keeper (120 B), taken by value, move into the thread's
+    // closure (which `Builder::spawn` boxes). Rejected: building the gateway
+    // on its own thread, which would need a handshake to report its boot
+    // errors.
     let handle = std::thread::Builder::new()
         .name(String::from(name))
         .spawn(move || {
@@ -970,7 +1110,7 @@ pub fn spawn_gateway(
                     Err(e) => info!(thread = name, ?e, "thread not pinned; continuing"),
                 }
             }
-            run_gateway(&mut gw, &owner, &mut keeper);
+            run_gateway(&mut gw, &owner, &mut keeper, &mut topup);
             info!(thread = name, "the gateway stopped");
         })
         .map_err(|e| format!("spawn {name}: {e}"))?;
@@ -980,8 +1120,18 @@ pub fn spawn_gateway(
 /// Turn the gateway until its owner releases it — or, once the
 /// process-wide shutdown is seen, until [`GATEWAY_GRACE_NS`] after it. XMM
 /// XH5b-2: the anchor keeper's pass goes ahead of each turn (one load until
-/// it acts, once a session).
-fn run_gateway(gw: &mut HlGateway, owner: &AtomicBool, keeper: &mut Option<AnchorKeeper>) {
+/// it acts, once a session); XMM XH5c-2: then the top-up keeper's (two
+/// loads until the arm hands a state over, then its store, 0 B), which
+/// takes the fresh anchor's stamp in the pass its keeper stored it — so
+/// every state the arm hands over once it reads the anchor kept carries it
+/// — and, once released, its last pass: a hand-over from the arm's last
+/// shutdown pass is stored too.
+fn run_gateway(
+    gw: &mut HlGateway,
+    owner: &AtomicBool,
+    keeper: &mut Option<AnchorKeeper>,
+    topup: &mut Option<TopupKeeper>,
+) {
     let mut since = 0u64;
     while !owner.load(Ordering::Acquire) {
         if crate::sigint::shutdown_requested() {
@@ -992,29 +1142,56 @@ fn run_gateway(gw: &mut HlGateway, owner: &AtomicBool, keeper: &mut Option<Ancho
                 break;
             }
         }
-        if let Some(k) = keeper.as_mut() {
-            keep_anchor(k);
+        let stamped = keeper.as_mut().and_then(keep_anchor);
+        if let Some(t) = topup.as_mut() {
+            if let Some(s) = stamped {
+                t.anchored_at(s);
+            }
+            keep_topup(t);
         }
         gw.turn();
     }
+    if let Some(t) = topup.as_mut() {
+        keep_topup(t);
+    }
 }
 
-/// XMM XH5b-2 — one keeper pass, told: the anchor kept, or the gateway
-/// halted on a store that failed.
-fn keep_anchor(k: &mut AnchorKeeper) {
+/// XMM XH5b-2 — one anchor keeper pass, told: the anchor kept (its stamp,
+/// XH5c-2's), or the gateway halted on a store that failed.
+fn keep_anchor(k: &mut AnchorKeeper) -> Option<u64> {
     match k.turn() {
-        Kept::Idle => {}
-        Kept::Stored(usd_1e6) => info!(
-            anchor_usd_1e6 = usd_1e6,
-            path = %k.path().display(),
-            "xmm: the session anchor is KEPT — slot 6's bound outlives the process (E7)"
-        ),
-        Kept::Failed(e) => error!(
+        Kept::Idle => None,
+        Kept::Stored(usd_1e6) => {
+            info!(
+                anchor_usd_1e6 = usd_1e6,
+                path = %k.path().display(),
+                "xmm: the session anchor is KEPT — slot 6's bound outlives the process (E7)"
+            );
+            Some(k.set_unix_s())
+        }
+        Kept::Failed(e) => {
+            error!(
+                error = %e,
+                path = %k.path().display(),
+                "xmm: the session anchor could NOT be kept — slot 6's gateway HALTS (XMM XH5b-2: \
+                 never a quote on an anchor a restart would lose)"
+            );
+            None
+        }
+    }
+}
+
+/// XMM XH5c-2 — one top-up keeper pass: a state stored says nothing (the
+/// arm's counters do; 0 B); a store that failed is told, once — the slot
+/// buys no more requests.
+fn keep_topup(t: &mut TopupKeeper) {
+    if let Topped::Failed(e) = t.turn() {
+        error!(
             error = %e,
-            path = %k.path().display(),
-            "xmm: the session anchor could NOT be kept — slot 6's gateway HALTS (XMM XH5b-2: \
-             never a quote on an anchor a restart would lose)"
-        ),
+            path = %t.path().display(),
+            "xmm: the top-up state could NOT be stored — slot 6 buys no more requests (XMM \
+             XH5c-2: never a purchase a restart would not count)"
+        );
     }
 }
 
@@ -1023,10 +1200,11 @@ mod tests {
     use super::{
         anchor_path, arm_cfg, bind_perps, check_account_rules, check_agent_binding, check_network,
         check_own_account, check_perp_overlap, identities_with, md_network, read_weight_per_min,
-        recon_ms_for, scope_for, tell_account, Identity, OwnTell, PerpAsk, PerpBinding, LIMIT_MS,
-        OTHER_KEYS, OTHER_MASTERS, OWN_RECON_MS, RECON_MS,
+        recon_ms_for, scope_for, tell_account, tell_topup, topup_path, Identity, OwnTell, PerpAsk,
+        PerpBinding, LIMIT_MS, OTHER_KEYS, OTHER_MASTERS, OWN_RECON_MS, RECON_MS,
     };
     use exec_hyperliquid::anchor::PnlAnchor;
+    use exec_hyperliquid::budget::{TopupGovernor, TOPUP_STATE_PATH};
     use exec_hyperliquid::config::{ConfigErr, HOST_MAINNET, HOST_TESTNET};
     use exec_hyperliquid::recon::Role;
     use exec_hyperliquid::{Network, Scope};
@@ -1250,6 +1428,84 @@ mod tests {
         assert_eq!(recon_ms_for(false), RECON_MS);
         assert_eq!(read_weight_per_min(OWN_RECON_MS, LIMIT_MS, true), 68);
         assert_eq!(read_weight_per_min(RECON_MS, LIMIT_MS, false), 152);
+    }
+
+    /// XMM XH5c-2: top-ups are an own account's alone — the shared account's
+    /// requests are its blocking arm's to buy.
+    #[test]
+    fn top_ups_are_an_own_account_s_alone() {
+        let mut s = core_config::exec::ExecSlot::paper_default(6);
+        s.halt_on_recon_stale_ms = 180_000;
+        s.request_topup_weight = 10_000;
+        s.request_topup_day_max = 100_000;
+        let e = check_account_rules(&s, false).expect_err("top-ups on the shared account");
+        assert!(
+            e.contains("request_topup_weight") && e.contains("XH5c-2"),
+            "{e}"
+        );
+        s.halt_on_loss_usd_1e6 = 50_000_000;
+        assert_eq!(check_account_rules(&s, true), Ok(()));
+        // One purchase priced at most a quarter of the loss bound: the
+        // probe's $5 against −$50 passes; $12.50 is the edge.
+        s.request_topup_weight = 25_000;
+        assert_eq!(check_account_rules(&s, true), Ok(()));
+        s.request_topup_weight = 25_001;
+        let e = check_account_rules(&s, true).expect_err("over a quarter of the bound");
+        assert!(
+            e.contains("over a quarter") && e.contains("$12.500500"),
+            "{e}"
+        );
+    }
+
+    /// XMM XH5c-2: the top-up state sits beside the exec artifact, one a
+    /// network — never the blocking arm's file.
+    #[test]
+    fn the_top_up_file_sits_beside_the_exec_artifact_one_a_network() {
+        let toml = std::path::Path::new("/x/multivenue/exec.toml");
+        assert_eq!(
+            topup_path(toml, Network::Testnet),
+            std::path::Path::new("/x/multivenue/xmm-topup-testnet.state")
+        );
+        let main = topup_path(toml, Network::Mainnet);
+        assert_eq!(
+            main,
+            std::path::Path::new("/x/multivenue/xmm-topup-mainnet.state")
+        );
+        assert_ne!(
+            main.file_name(),
+            Some(std::ffi::OsStr::new(TOPUP_STATE_PATH))
+        );
+    }
+
+    /// XMM XH5c-2: the tell names the top-ups — the weight and its price,
+    /// the day's max and its price, the day's usage restored or read as
+    /// spent, the file — or none.
+    #[test]
+    fn the_tell_names_the_top_ups() {
+        let file = std::path::Path::new("/x/xmm-topup-mainnet.state");
+        let mut t = String::new();
+        let g = TopupGovernor::restored(20_730, 20_000, 0).armed(10_000, 100_000);
+        tell_topup(&mut t, Some(&g), file);
+        assert!(
+            t.contains("top-ups of 10000 requests ($5.000000)")
+                && t.contains("at most 100000 a UTC day ($50.000000)")
+                && t.contains("20000 bought today (the state in /x/xmm-topup-mainnet.state)"),
+            "{t}"
+        );
+        let spent = TopupGovernor::restored(20_730, u64::MAX, 0).armed(10_000, 100_000);
+        let mut t = String::new();
+        tell_topup(&mut t, Some(&spent), file);
+        assert!(t.contains("today read as SPENT"), "{t}");
+        let mut t = String::new();
+        tell_topup(&mut t, None, file);
+        assert!(t.contains("no top-ups"), "{t}");
+        let off = TopupGovernor::restored(20_730, 0, 2_500_000);
+        let mut t = String::new();
+        tell_topup(&mut t, Some(&off), file);
+        assert!(
+            t.contains("spend $2.500000 restored") && t.contains("no top-ups"),
+            "an own account with no keys: the spend still added back — {t}"
+        );
     }
 
     /// XMM XH5b-2: the anchor file sits beside the exec artifact, one a

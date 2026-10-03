@@ -887,7 +887,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 816 B report never crosses by value.
+    /// 864 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -1085,6 +1085,17 @@ pub struct GatewayArmReport {
     pub spot_reads: u64,
     /// Spot reads that failed (XMM XH5b-2).
     pub spot_failed: u64,
+    /// Top-ups seen on the venue: their price charged to the session's
+    /// spend (XMM XH5c-2).
+    pub topup_ok: u64,
+    /// Top-up stops: a purchase the venue refused or the next read did not
+    /// show, a state that could not be stored, an answer for no purchase in
+    /// flight (XMM XH5c-2).
+    pub topup_failed: u64,
+    /// Purchases that never left (refused unsent, a full ring, abandoned
+    /// before they left: a newer read out of the band, the slot's halt, the
+    /// shutdown): never bought, the day's charge returned (XMM XH5c-2).
+    pub topup_unsent: u64,
     // --- counters: the dead man ---
     /// Arms that left the host, probes included.
     pub dm_arms: u64,
@@ -1234,15 +1245,26 @@ pub struct GatewayArmReport {
     /// The account's worth, USD ×1e6: the perp sheet's value plus the spot
     /// sheet's USDC (0 off an own account, or before both halves landed).
     pub worth_usd_1e6: i64,
-    /// The session's P&L, USD ×1e6: the worth less the anchor (0 until
+    /// The session's P&L, USD ×1e6: the worth less the anchor, plus the
+    /// session's top-up spend (XMM XH5c-2, Q-XH5-2's add-back; 0 until
     /// judged).
     pub session_pnl_usd_1e6: i64,
+    /// The weight one top-up buys (`0`: off, stopped, or the buying ended —
+    /// the slot's halt, the shutdown) (XMM XH5c-2).
+    pub topup_weight: u64,
+    /// The weight bought — or possibly bought — on the UTC day counted
+    /// (`u64::MAX`: a state the boot could not read, the day spent).
+    pub topup_day_used: u64,
+    /// The session's top-up spend, USD ×1e6 — added back to its P&L,
+    /// bounded by the day's max instead.
+    pub topup_cost_usd_1e6: i64,
 }
 
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
 // XH5a: + `refused_foreign_row` (95). XMM XH5b-2: + the spot reads' two
-// counters and the own account's five levels (102).
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 816);
+// counters and the own account's five levels (102). XMM XH5c-2: + the
+// top-ups' three counters and three levels (108).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 864);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

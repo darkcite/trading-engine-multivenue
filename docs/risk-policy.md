@@ -9516,6 +9516,225 @@ stored far ahead kept top-ups off until the clock caught up — read as
 today spent; XH5c-2's list completed); round 3 — risk and zero-copy
 APPROVE.
 
+### XH5c-2 amendment (2026-10-03): the gateway arm's top-ups — decided at a budget read, stored before they leave
+
+The second part of XH5c (plan §3.3 item 1; A-S6-16), built to the XH5c-1
+amendment's "For XH5c-2" list. Nothing is armed: slot 6 buys requests only
+on its own account, when its `exec.toml` slot states the top-up keys, in a
+run the operator arms (XH5e's checklist; the probe's 10 000 a purchase, $5,
+and 100 000 a UTC day, $50 — O-XH9).
+
+- **Decided at a budget read, stored before it leaves.** At a budget read
+  (`limit_done`, the venue's figure applied) with no purchase in flight —
+  on the slot's own account, its session anchor durable, top-ups armed —
+  `TopupGovernor::take` decides one inside the band `(floor, floor +
+  weight]` and the day's max, and charges the day in the same step. The
+  governor's state (the UTC day, the weight bought on it, the session's
+  spend) goes to a `TopupKeeper` on the gateway's thread through a
+  `TopupSlot` (one 128 B granule; one hand-over at a time: the arm writes
+  only once the last one is stored, the keeper reads only after the
+  version that publishes it), which stores it in the slot's own file —
+  `xmm-topup-{testnet,mainnet}.state` beside the exec artifact, never the
+  blocking arm's `exec-topup.state`; the blocking arm's line — tied to the
+  session's anchor (`set_unix_s`: the restored one's, or the fresh one's,
+  handed over by its keeper in the pass it was stored). Only once the arm
+  reads that hand-over kept does the purchase leave: `HlCmd::reserve` built
+  in place in the arm's scratch command (the dead man's, one at a time on
+  the engine thread) and pushed by reference — the ring slot its one copy —
+  one address request. A restart never forgets a purchase that may have
+  left: the day's max holds across processes (`restore_topup` at boot,
+  read into one line's room: no file, a fresh day; an unreadable, overlong
+  or foreign one, today spent). A newer read that leaves a decision still
+  waiting for its keeper out of the band abandons it before it leaves.
+- **The answer, by its own range.** `TOPUP_OID_BASE = (1<<63)|(1<<60)`,
+  the purchases' count in the low 60 bits — bit 63 set, bit 62 clear: the
+  never-left rule refunds its request — routed ahead of `stray` and matched
+  exactly to the purchase in flight.
+  - *Refused before it left* (halted, not ready, throttled — or a full
+    ring at the push): never bought, its price never charged, its request
+    refunded, and the day's charge returned in memory
+    (`TopupGovernor::refund_day`): a throttled minute never spends the
+    day's max on nothing. Decided again at a later read — its state then
+    the one stored, which the keeper marks kept with no write.
+  - *Accepted, or in doubt (unanswered; its request carried as one
+    unanswered until it is seen):* judged at the next budget read ISSUED
+    after the answer — by the read's own number, never a clock — on the
+    headroom apart from what traded volume earned
+    (`AddressBudget::remaining_unearned`: a minute's volume is never read
+    as a purchase): half its weight must show (`confirms`). Not seen: the
+    top-ups stop. Seen: its price (the weight × 0.0005 USDC) is charged to
+    the session's spend once a perp sheet issued after the answer, with its
+    spot half, has landed too — the worth then carries the price; for one
+    answered in doubt, a sheet issued after the read that showed it (it may
+    have landed after a sheet issued since its answer) — and the state is
+    handed over again (no wait; owed and retried a pass at a time while the
+    keeper still stores another).
+  - *Refused by the venue:* they stop. *An answer in the range for no
+    purchase in flight* (the arm's own count gone wrong): they stop.
+  - A stop is `TopupGovernor::stop` after a forward roll to today — none
+    more from this process, and the day it happens on read as spent once
+    its state is stored — counted (`topup_failed`) and handed over.
+- **A halted slot buys nothing more:** the router's sweep of the slot
+  (`cancel_slot`, asked of a halted slot alone, XH5a) and the shutdown end
+  the buying (`topup_end`) — no decision at a read answered after it; a
+  purchase decided and not sent never leaves (abandoned: the day's charge
+  returned). The accounting goes on: a purchase that left is still carried,
+  judged and charged, its spend or a stop handed over — a hand-over owed
+  goes again each shutdown pass, the shutdown waiting for its keeper within
+  its bound, and the gateway's thread gives the top-up keeper one last pass
+  once released. The report's weight reads 0 once the buying ended. The
+  gateway's own halt refuses the purchase unsent as before.
+- **A state its keeper cannot store is never bought:** the slot is marked
+  failed (once; the gateway's thread logs it) and the arm stops. No
+  gateway halt: not buying is the safe direction, and the floor halts the
+  slot when the budget runs dry.
+- **Q-XH5-2's add-back:** the session P&L is the worth less the anchor
+  PLUS the session's spend — the purchases seen on the venue AND inside the
+  worth alone (one not seen, or seen before a sheet carries it, reads as a
+  loss: the safe direction) — so the −$50 bound is the trading's and the
+  day's max is the purchases'. No purchase before the anchor is durable: a
+  price paid before it would be inside it. The spend restored at boot is
+  added back whether or not the artifact still arms top-ups. One purchase
+  is priced at most a quarter of the loss bound (`check_account_rules`):
+  until it is inside the worth its price reads as a loss, and one must
+  never end a session alone.
+- **The weight narrowed by refusal:** `HlGatewayArm::set_topup` refuses a
+  weight past the purchase command's `u32` (`ArmErr::Topup`), an account
+  not the slot's own, and top-ups armed with no keeper; the push converts
+  by `u32::try_from` and stops on a failure — never a truncation. Slot 6's
+  boot builds the keeper only when the artifact arms top-ups (a weight
+  above 0): off, the governor alone carries the restored spend's add-back,
+  and nothing is stored (the temp-path rule does not apply).
+- **0 B after boot, on both threads, on the success path.** The arm's step
+  is gate 98's, with a REAL keeper storing inside its window: the keeper
+  writes its line in place (`TopupState::write_line`, its master rendered
+  by `config::hex20_into` into the line itself — `hex20` renders into its
+  String's own buffer with it, no copy) through
+  `core_io::write_atomic_at`, its temp name taken at boot
+  (`core_io::tmp_path`, one allocation; `write_atomic` calls it — one
+  durable write); a temp path of 256 B or more refuses the boot (std builds
+  a C path on the stack under 384 B). The blocking arm's store writes the
+  same line in place. The control post is gate 96b's: exactly rustls' two
+  records. A failed store formats its error once, and is the last.
+- **`exec.toml`:** `request_topup_weight` / `request_topup_day_max` are
+  legal on a gateway slot under the general rules (both or neither;
+  1 000–100 000 a purchase; at most 1 000 000 a day, and at least one
+  purchase) — XH4f's "the gateway arm buys none before XH5" refusal goes.
+  Slot 6's boot refuses them on the shared account (`check_account_rules`:
+  that account's requests are its blocking arm's to buy — one governor a
+  master's day).
+- **`/metrics`:** `engine_exec_hlgw_topup_{ok,failed,unsent}_total` and
+  `engine_exec_hlgw_topup_{weight,day_used,cost_usd_1e6}` (counters 68 →
+  71, levels 32 → 35; a day read as spent shows −1; `unsent` counts the
+  purchases that never left — refused unsent, a full ring, or abandoned: a
+  newer read out of the band, the halt, the shutdown); `GatewayArmReport`
+  816 → 864 B (108 words); `session_pnl_usd_1e6` carries the add-back. The
+  arm 1 664 → 1 792 B; the anchor keeper 64 → 72 B (its stamp); the top-up
+  keeper 120 B. The boot tell names the top-ups — the weight and the day's
+  max, both priced, the day's usage restored (or read as spent), the file
+  — or "no top-ups", and a restored spend.
+- **One definition each:** the UTC day (`dayspend::utc_day`, both arms'
+  top-ups), the state line, the temp name, the master's hex.
+- **Residuals.**
+  - *A store on the gateway's thread:* the temp write, the fsync
+    (`F_FULLFSYNC` on macOS) and the rename run between two gateway turns —
+    the sockets wait that long, a few ms, at most twice a purchase (the
+    pre-charge, then the spend or the stop; a decision again after a
+    refusal is kept with no write): ten purchases a day at the probe's
+    values.
+  - *The file can lag a step:* a spend or a stop the keeper cannot take at
+    once is owed and retried each pass — the shutdown waits for it within
+    its bound — but a crash, or a keeper still busy at the shutdown's bound
+    (no counter marks that one), loses it: a restart then reads the last
+    pre-charge (the day's usage with every purchase decided — the safe way)
+    with the spend short (a loss on the bound — the safe way) and no stop
+    (top-ups resume within the day's max).
+  - *No `expiresAfter` on the purchase* (the SDK vector carries none; the
+    venue's handling of one on `reserveRequestWeight` is unproven): a
+    purchase in doubt may land after the read that judged it — the top-ups
+    stop and its price is never added back (the safe way) — or after
+    00:00Z, counted on the day it was decided (the venue's next day may
+    hold one weight over the max).
+  - *A rename not yet durable:* `write_atomic` syncs the file, not its
+    directory (E4's helper, every state file's); a power loss right after a
+    store can bring back the last line — one purchase forgotten, one weight
+    over the day's max at most.
+  - *Seen on the venue, the price waits for the worth:* the price reads as
+    a loss from the first sheet that carries it until both the budget read
+    and a sheet issued after the answer (after that read, for one in doubt)
+    land (≤ a read period or two) — the boot's quarter-of-the-bound rule
+    keeps that from ending a session.
+- **For XH5c-3:** the RTT word without REST samples (their own histogram),
+  `rtt_pull_ms` 2 000 for the probe, the IP share kept at 400, and the
+  harness's `lead_stale_ms` 300-vs-500 re-check.
+
+**Tests:** the arm — a purchase decided inside the band (nothing above it),
+handed over and sent only once stored (one `reserveRequestWeight`, its
+range, its weight, one request), seen at the next read and inside the worth
+(the spend, the add-back, the report), seen before a sheet carries it (no
+add-back until one does), refused unsent (refunded, the day returned,
+decided again), not seen and refused by the venue (stopped, the stop handed
+over as the day spent, nothing more decided), in doubt (carried, judged by
+the next read, its request kept, charged only once a sheet issued after the
+read that showed it lands), a read issued before the answer (judges
+nothing; the purchase carried), a newer read out of the band (abandoned
+before it left), a keeper that failed (nothing sent), a keeper still
+storing (the spend owed, handed over later — during the shutdown too, which
+waits for its keeper), an answer for no purchase (stopped, never `stray`),
+a stop on a later day (that day spent), a halted slot (a decision
+abandoned, the day returned, nothing decided after; a purchase that left
+still judged and charged, its spend handed over, the weight reported 0),
+the day's max, the arming (the shared account, a weight past `u32` and
+top-ups armed with no keeper refused; off with none accepted; nothing
+before the anchor is kept), the shutdown (nothing decided, nothing sent);
+the keeper — the hand-over stored under its anchor and restored, one at a
+time, the state already stored kept with no write, a failed store keeping
+nothing more, a temp path too long refused; the line written in place = the
+state line (the widest figures), the blocking arm's store in place; the
+restore read into one line's room (an overlong file spent); the forward
+roll; `refund_day`; the headroom apart from volume; `hex20_into` (in place,
+the bytes `hex20` returns); `core_io::write_atomic_at` and `tmp_path`; the
+anchor keeper's stamp; the shared account refused, the quarter-of-the-bound
+rule and the file a network (`xmm_live`); the tell (armed, spent, none, a
+restored spend); the artifact's top-up keys on a gateway slot; `/metrics`'
+rows.
+
+**Gates (the committed tree):** clippy 0; nextest 4 182/4 182; alloc 108
+(+3 ignored) at 0 B, compiled fresh — gate 98's window ran ≈ 90 000 rounds
+with purchases seen, one refused unsent and a decision kept with no write;
+copy-audit 31, new=0; license OK (661); release OK; replay 7× IDENTICAL;
+rustfmt clean on every touched hunk. Round 3's run had one debug-nextest
+alloc flake in a test this cut does not touch
+(`icdp_on_tick_decision_and_roll_are_zero_alloc`, the process-global
+counter): the release gate passed, and eight debug re-runs passed.
+
+**Reviews:** four rounds, risk APPROVE.
+- *Round 1:* zero-copy REQUEST CHANGES — the keeper's store built its line
+  as a `String` (`from_utf8_lossy(..).into_owned()` on the gateway's
+  thread): now written in place; allocation and risk APPROVE WITH NITS — a
+  temp path of 256 B or more (std's rename would allocate: refused at
+  boot), a refused purchase re-stored each minute (the keeper skips an
+  unchanged state), the add-back on a budget read rather than a worth that
+  carries the price (the worth gate), a halted slot still buying (the halt
+  ends the buying), volume read as a purchase (`remaining_unearned`), the
+  in-doubt carry, a stale decision sent (abandoned), the restored spend
+  with top-ups off (kept), a stop that could be lost (owed and retried).
+- *Round 2:* all three APPROVE WITH NITS — an in-doubt purchase's price
+  added back before a worth carried it (the read that shows it moves the
+  mark), the halt stopping the accounting too (`topup_off`: only the buying
+  ends), the shutdown never retrying an owed hand-over, the keeper built
+  with top-ups off (only when armed), `hex20_into`'s panic path and
+  `hex20`'s copy (typed; no copy), stale notes.
+- *Round 3:* zero-copy APPROVE; risk and allocation APPROVE WITH NITS — an
+  owed hand-over lost when the shutdown ends first (it now waits, within
+  its bound), the report's weight after the buying ended (0).
+- *Round 4:* risk and zero-copy APPROVE; allocation APPROVE WITH NITS (this
+  paragraph's wrapping — taken).
+- *Declined, as residuals above:* `expiresAfter` on the purchase; a
+  parent-directory fsync in the shared `write_atomic`; a counter for a
+  hand-over still owed at the shutdown's bound (optional); a heap-free
+  restore compare (boot only; the three restores compare one way).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

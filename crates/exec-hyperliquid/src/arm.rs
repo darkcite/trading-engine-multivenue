@@ -103,6 +103,28 @@
 //! flat and the venue reads clear (its re-arms alone cost ≈ 17 280
 //! requests a quoting day).
 //!
+//! **Top-ups (XMM XH5c-2: S7-L1's policy, one governor for both arms)** —
+//! on the slot's own account, armed at boot ([`HlGatewayArm::set_topup`]),
+//! once the session's anchor is durable: at a budget read with no purchase
+//! in flight the band rule decides a `reserveRequestWeight`
+//! ([`TopupGovernor::take`]: inside `(floor, floor + weight]` and the
+//! day's max — the day charged with the decision); the governor's state
+//! goes to its keeper on the gateway's thread ([`crate::topup`]), and the
+//! purchase leaves only once it is stored — built in place, pushed by
+//! reference, one address request, its answer routed by its own client-id
+//! range. Refused before it left: its request taken back and the day's
+//! charge returned — never bought, decided again at a later read (one a
+//! newer read leaves out of the band before it left is abandoned so).
+//! Accepted or in doubt: the next budget read issued after the answer must
+//! show half its weight apart from what volume earned; once a perp sheet
+//! issued after the answer — after the read that showed it, for one in
+//! doubt: the worth that carries the price — has landed too, its price is
+//! the session's spend, which the session P&L adds back (Q-XH5-2: bounded
+//! by the day's max instead). A purchase not seen, a venue refusal or a
+//! state its keeper could not store stops the top-ups (handed over as the
+//! day spent). A halted slot (its sweep asked) and the shutdown buy
+//! nothing more; a purchase that left is still judged and charged.
+//!
 //! **The day's spend (XH4e, S7-L1 gap A)** is read once, after the first
 //! budget read: the slot's own fills since 00:00Z (`userFillsByTime`,
 //! page after page — each from the last one's latest row, a read period
@@ -149,9 +171,9 @@ use exec_gateway::{boxed_array, HALT_NONE};
 
 use crate::action::Tif;
 use crate::anchor::AnchorSlot;
-use crate::budget::AddressBudget;
+use crate::budget::{AddressBudget, TopupGovernor};
 use crate::cmd::{HlCmd, CMD_CANCEL};
-use crate::dayspend::{DAY_MS, VENUE_PAGE_MAX};
+use crate::dayspend::{utc_day, DAY_MS, VENUE_PAGE_MAX};
 use crate::deadman::{DeadMan, DeadManCfg};
 use crate::event::{
     never_left, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM, EV_ACK,
@@ -163,6 +185,7 @@ use crate::event::{
 use crate::gateway::{pw, HlEngineEnd};
 use crate::nonce::now_ms;
 use crate::rules::{PerpRules, Round};
+use crate::topup::{Keep, TopupSlot};
 use crate::ttl::TTL_MAX_MS;
 
 /// Orders one arm tracks at once (xmm rests at most 16: four perps, two
@@ -241,14 +264,29 @@ const LIMIT_STALE_PERIODS: u64 = 3;
 /// and the gateway sweep's) and keeps the dead man armed through the
 /// cleanup — 64 re-arms, five minutes of them at the default period.
 pub const MIN_BUDGET_FLOOR: u64 = 2 * ARM_ORDERS as u64 + 64;
-/// Arm-internal client ids (the dead man's posts and the reads): never
-/// cloids; their post items carry command bits 0, an order's never do.
+/// Arm-internal client ids (the dead man's posts, the reads, the leverage
+/// posts and the top-ups' purchases): never cloids; their post items carry
+/// command bits 0, an order's never do.
 const DEADMAN_OID_BASE: u64 = 1 << 63;
 const READ_OID_BASE: u64 = (1 << 63) | (1 << 62);
 /// XH4f (O-XH6): a perp's leverage post, the perp's index in the low bits.
 /// Under `READ_OID_BASE` it reads as the arm's own control post (refunded
 /// when refused unsent), and the dead man matches its own id exactly.
 const LEVERAGE_OID_BASE: u64 = (1 << 63) | (1 << 61);
+/// XMM XH5c-2: a top-up's purchase (`reserveRequestWeight`), the purchases'
+/// count in the low bits ([`TOPUP_SEQ_MASK`]). Bit 63 set, bit 62 clear:
+/// the arm's own control post (refunded when refused unsent); bit 60 its
+/// range's own (the leverage range's bit 61 clear).
+const TOPUP_OID_BASE: u64 = (1 << 63) | (1 << 60);
+/// The low bits a purchase's count takes.
+const TOPUP_SEQ_MASK: u64 = (1 << 60) - 1;
+// The four ranges never meet: the dead man's ids stay far under bit 60.
+const _: () = assert!(
+    TOPUP_OID_BASE & !TOPUP_SEQ_MASK == TOPUP_OID_BASE
+        && LEVERAGE_OID_BASE & !TOPUP_SEQ_MASK != TOPUP_OID_BASE
+        && READ_OID_BASE & !TOPUP_SEQ_MASK != TOPUP_OID_BASE
+        && TOPUP_OID_BASE & READ_OID_BASE == DEADMAN_OID_BASE
+);
 /// XH4f: the highest leverage an arm sets (the venue's own ceiling on its
 /// largest perps).
 pub const MAX_LEVERAGE: u8 = 50;
@@ -296,6 +334,17 @@ const RB_ENDED: u8 = 1 << 4;
 /// Thought gone, and an orders read issued since did not list it: its
 /// gone wait alone ends it.
 const RB_UNLISTED: u8 = 1 << 5;
+// XMM XH5c-2: a top-up's phases.
+/// None in flight: a budget read may decide one.
+const TU_IDLE: u8 = 0;
+/// Decided, the day charged, its state handed to the keeper: it leaves
+/// once stored.
+const TU_STORING: u8 = 1;
+/// Pushed: its answer awaited.
+const TU_SENT: u8 = 2;
+/// Accepted, or in doubt: the next budget read issued after the answer
+/// judges it, and its price waits for a worth that carries it.
+const TU_SEEN: u8 = 3;
 // Boot phases.
 const BOOT_SNAPSHOT: u8 = 0;
 const BOOT_SWEEP: u8 = 1;
@@ -385,6 +434,9 @@ pub enum ArmErr {
     Budget,
     /// XH4f: a leverage above [`MAX_LEVERAGE`].
     Leverage,
+    /// XMM XH5c-2: top-ups armed on an account not the slot's own, or a
+    /// weight past the purchase command's `u32` (refused, never truncated).
+    Topup,
 }
 
 /// What the arm has seen (its `/metrics` block, XH4f).
@@ -473,6 +525,18 @@ pub struct ArmCounters {
     pub leverage_dark: u64,
     /// Places and modifies refused on a dark perp (XH4f).
     pub refused_leverage: u64,
+    /// XMM XH5c-2: top-ups seen on the venue — their price charged to the
+    /// session's spend.
+    pub topup_ok: u64,
+    /// XMM XH5c-2: top-up stops — a purchase the venue refused or the next
+    /// read did not show, a state its keeper could not store, an answer for
+    /// no purchase in flight.
+    pub topup_failed: u64,
+    /// XMM XH5c-2: purchases that never left — refused unsent (halted, not
+    /// ready, throttled), a full ring, or abandoned before they left (a
+    /// newer read out of the band, the slot's halt, the shutdown): never
+    /// bought, the day's charge returned.
+    pub topup_unsent: u64,
 }
 
 /// XH4g: the reconciliation as the arm last read it ([`HlGatewayArm::recon_view`]).
@@ -725,7 +789,9 @@ pub struct HlGatewayArm {
     sweep_asked: u64,
     hold_until_ns: u64,
     deadman: DeadMan,
-    /// The dead man's command, built in place.
+    /// The dead man's command, and a top-up's purchase (XMM XH5c-2), each
+    /// built in place — one at a time, on the engine thread — and pushed
+    /// by reference.
     scratch: HlCmd,
     // XH4e: the address budget (the venue's figures at the last read and
     // every request since), whether one was read, the next read, the
@@ -756,13 +822,39 @@ pub struct HlGatewayArm {
     lev_ok: u16,
     lev_dark: u16,
     lev_due_ns: u64,
+    // XMM XH5c-2: the top-ups — the governor (the policy, the day's count,
+    // the session's spend), the keeper's hand-over (`None`: not armed), the
+    // phase, the hand-over's version, the purchases' count (the id's low
+    // bits), the headroom apart from volume a purchase was decided at, its
+    // read mark (the reads issued when it was answered — a later one judges
+    // it — or, answered in doubt, the read that showed it: a sheet issued
+    // later carries it), the last perp sheet's read number (its spot half
+    // pairs with it); whether the purchase in flight was answered in doubt,
+    // was seen on the venue, is inside the worth; whether a hand-over is
+    // owed to the keeper; whether the halt or the shutdown ended the buying
+    // (the accounting goes on).
+    topup: TopupGovernor,
+    topup_keep: Option<Arc<TopupSlot>>,
+    topup_phase: u8,
+    topup_ver: u64,
+    topup_seq: u64,
+    topup_before: i64,
+    topup_mark: u64,
+    topup_sheet: u64,
+    topup_doubt: bool,
+    topup_shown: bool,
+    topup_in_worth: bool,
+    topup_owed: bool,
+    topup_off: bool,
 }
 
-// The arm's inline state, 1 664 B — what `new` moves into its owner (the
+// The arm's inline state, 1 792 B — what `new` moves into its owner (the
 // tables are boxed); XH5b-1's spot half and its counter (32 B) took one more
 // 64 B line; XH5b-2's kept flag, its keeper's handle (the anchor word itself
-// lives behind it) and `spot_failed` (17 B) fit that line's padding.
-const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_664);
+// lives behind it) and `spot_failed` (17 B) fit that line's padding; XMM
+// XH5c-2's top-ups — the governor (40 B), the keeper's handle, the phase,
+// five words, five flags and three counters (118 B) — took two more lines.
+const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_792);
 
 /// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
 /// reports: a post-only cross, or an order in doubt that never landed,
@@ -835,10 +927,11 @@ impl HlGatewayArm {
         }
         let deadman =
             DeadMan::new(cfg.deadman, cfg.slot, DEADMAN_OID_BASE).map_err(|_| ArmErr::DeadMan)?;
-        // COPY: the arm's inline state — 1 664 B, const-asserted (the
+        // COPY: the arm's inline state — 1 792 B, const-asserted (the
         // configuration ≈ 0.3 KiB, the dead man 256 B, the address budget
-        // 64 B, counters, the stats, the ring end, the scratch command,
-        // the queue heads and words) — moved at boot into the owner, cold;
+        // 64 B, the top-up governor 40 B, counters, the stats, the ring end,
+        // the scratch command, the queue heads and words) — moved at boot
+        // into the owner, cold;
         // rejected: boxing the arm (every verb would chase a pointer). Its
         // tables are boxed here, never moved.
         Ok(Self {
@@ -924,6 +1017,20 @@ impl HlGatewayArm {
             lev_ok: 0,
             lev_dark: 0,
             lev_due_ns: 0,
+            // Off until the boot arms it (`set_topup`).
+            topup: TopupGovernor::default(),
+            topup_keep: None,
+            topup_phase: TU_IDLE,
+            topup_ver: 0,
+            topup_seq: 0,
+            topup_before: 0,
+            topup_mark: 0,
+            topup_sheet: 0,
+            topup_doubt: false,
+            topup_shown: false,
+            topup_in_worth: false,
+            topup_owed: false,
+            topup_off: false,
         })
     }
 
@@ -1028,6 +1135,34 @@ impl HlGatewayArm {
     /// safe direction). A restored anchor needs none.
     pub fn keep_anchor_in(&mut self, slot: Arc<AnchorSlot>) {
         self.keep = Some(slot);
+    }
+
+    /// **XMM XH5c-2 — boot: the top-ups' governor** `gov` — restored from
+    /// the slot's state file ([`crate::budget::restore_topup`]) and armed
+    /// with the artifact's weight and day max — and, armed (a weight above
+    /// 0), `keep`: where their state goes to its keeper
+    /// (`topup::TopupKeeper`, on the gateway's thread). Off (weight 0), no
+    /// keeper: the governor carries the restored spend's add-back alone. On
+    /// the slot's own account alone: the shared one's requests are its
+    /// blocking arm's to buy. A weight past the purchase command's `u32` is
+    /// refused, never truncated; armed with no keeper, refused.
+    ///
+    /// # Errors
+    /// [`ArmErr::Topup`].
+    pub fn set_topup(
+        &mut self,
+        gov: TopupGovernor,
+        keep: Option<Arc<TopupSlot>>,
+    ) -> Result<(), ArmErr> {
+        if !self.cfg.own_account
+            || u32::try_from(gov.weight()).is_err()
+            || (gov.weight() > 0 && keep.is_none())
+        {
+            return Err(ArmErr::Topup);
+        }
+        self.topup = gov;
+        self.topup_keep = keep;
+        Ok(())
     }
 
     /// XH4g: the reconciliation as last read — when each read was answered,
@@ -1170,11 +1305,15 @@ impl HlGatewayArm {
     }
 
     /// XH4e: address requests pushed and not answered yet — places and
-    /// modifies sent or in doubt, cancels sent, the dead man's post: each
-    /// may or may not be in the figure a budget read about to go states.
+    /// modifies sent or in doubt, cancels sent, the dead man's post, a
+    /// top-up's purchase sent, or answered in doubt and not seen yet (XMM
+    /// XH5c-2): each may or may not be in the figure a budget read about to
+    /// go states.
     fn unanswered(&self) -> u64 {
         let n = self.n_rows.min(ARM_ORDERS);
-        let mut k = u64::from(self.deadman.in_flight());
+        let purchase = self.topup_phase == TU_SENT
+            || (self.topup_phase == TU_SEEN && self.topup_doubt && !self.topup_shown);
+        let mut k = u64::from(self.deadman.in_flight()) + u64::from(purchase);
         let mut i = 0usize;
         while i < n {
             let r = &self.rows[i];
@@ -1434,7 +1573,8 @@ impl HlGatewayArm {
             && (e.cmd_kind() != 0 || e.client_oid & READ_OID_BASE == DEADMAN_OID_BASE)
         {
             // XH4e: a request this arm charged — a place, a modify, a
-            // cancel, the dead man's post — refused unsent. A read is no
+            // cancel, the dead man's post, a leverage post (XH4f), a
+            // top-up's purchase (XMM XH5c-2) — refused unsent. A read is no
             // address request, and no other control post is the arm's.
             self.refund(1);
         }
@@ -1762,7 +1902,8 @@ impl HlGatewayArm {
         }
     }
 
-    /// The arm's own posts (the dead man's and the reads): command bits 0.
+    /// The arm's own posts (the dead man's, the reads, the leverage posts and
+    /// the top-ups' purchases): command bits 0.
     fn on_internal(&mut self, e: &ExecEvent, now: u64) {
         if self.deadman.on_event(e, now_ms()) {
             return;
@@ -1774,6 +1915,11 @@ impl HlGatewayArm {
         }
         if e.slot == self.cfg.slot && e.client_oid & !(ARM_PERPS as u64 - 1) == LEVERAGE_OID_BASE {
             self.leverage_answer(e, now);
+            return;
+        }
+        // XMM XH5c-2: a purchase's answer, by its own range — never stray.
+        if e.slot == self.cfg.slot && e.client_oid & !TOPUP_SEQ_MASK == TOPUP_OID_BASE {
+            self.topup_answer(e);
             return;
         }
         self.counters.stray += 1;
@@ -1838,6 +1984,238 @@ impl HlGatewayArm {
                 self.lev_dark |= bit;
                 self.counters.leverage_dark += 1;
             }
+        }
+    }
+
+    // --- top-ups (XMM XH5c-2) ---------------------------------------
+
+    /// The purchase in flight's client id: its own range, its count.
+    #[inline]
+    const fn topup_oid(&self) -> u64 {
+        TOPUP_OID_BASE | (self.topup_seq & TOPUP_SEQ_MASK)
+    }
+
+    /// **A budget read's top-up step** (`read`: the read's number, counted
+    /// from the boot). A purchase answered before this read went is judged
+    /// on it — on the headroom apart from what volume earned
+    /// ([`AddressBudget::remaining_unearned`]), so a minute's volume is never
+    /// read as a purchase: seen — half its weight shows over the figure it
+    /// was decided at ([`TopupGovernor::confirms`]) — its price waits for a
+    /// worth that carries it ([`Self::topup_charge`]): for one answered in
+    /// doubt, which may have landed after a sheet issued since its answer,
+    /// a sheet issued after THIS read (served after it landed); not seen,
+    /// the top-ups stop. A purchase decided and not sent yet (its keeper
+    /// slow) that this newer read leaves out of the band never leaves. With
+    /// none in flight, the band rule decides ([`Self::topup_decide`]). One
+    /// step a read.
+    fn topup_on_read(&mut self, read: u64) {
+        match self.topup_phase {
+            TU_SEEN if !self.topup_shown && read > self.topup_mark => {
+                if self
+                    .topup
+                    .confirms(self.topup_before, self.budget.remaining_unearned())
+                {
+                    self.topup_shown = true;
+                    if self.topup_doubt {
+                        self.topup_mark = read;
+                        self.topup_in_worth = false;
+                    }
+                    self.topup_charge();
+                } else {
+                    self.stop_topups();
+                }
+            }
+            TU_STORING if !self.topup_in_band() => self.topup_unsent(),
+            TU_IDLE => self.topup_decide(),
+            _ => {}
+        }
+    }
+
+    /// The headroom a purchase is for: over the floor, at most one weight
+    /// above it (the band rule's own figures, [`TopupGovernor::above_band`]).
+    fn topup_in_band(&self) -> bool {
+        let (remaining, floor) = (self.budget.remaining(), self.budget.floor());
+        remaining > i64::try_from(floor).unwrap_or(i64::MAX)
+            && !self.topup.above_band(remaining, floor)
+    }
+
+    /// A complete worth landed — the spot half of perp sheet `sheet` (its
+    /// read number). Issued past a purchase's mark (its answer — or, in
+    /// doubt, the read that showed it), the sheet carries the price: the
+    /// add-back may follow ([`Self::topup_charge`]).
+    fn topup_on_worth(&mut self, sheet: u64) {
+        if self.topup_phase == TU_SEEN && sheet > self.topup_mark {
+            self.topup_in_worth = true;
+            self.topup_charge();
+        }
+    }
+
+    /// The purchase seen on the venue AND inside the worth: only then is its
+    /// price the session's spend — the add-back (Q-XH5-2) never lands on a
+    /// worth that does not carry the price — and the state handed over for
+    /// the next boot. Before, the price reads as a loss (the safe way; the
+    /// boot keeps one price under a quarter of the loss bound).
+    fn topup_charge(&mut self) {
+        if !(self.topup_shown && self.topup_in_worth) {
+            return;
+        }
+        self.topup.charge_cost();
+        self.counters.topup_ok += 1;
+        self.topup_phase = TU_IDLE;
+        self.topup_hand_over();
+    }
+
+    /// Decide a purchase — armed, on the slot's own account, its anchor
+    /// durable (the price is added back against THAT anchor: one paid
+    /// before it would be in it already), the buying not ended (the halt,
+    /// the shutdown: [`Self::topup_end`]), inside the band and the day's
+    /// max ([`TopupGovernor::take`], the day charged with the decision) —
+    /// and hand the state to the keeper: the purchase leaves once it is
+    /// stored ([`Self::topup_step`]). The keeper still storing the last
+    /// state: the day's charge returned, decided again at the next read; a
+    /// keeper that failed: the top-ups stop.
+    fn topup_decide(&mut self) {
+        let Some(keep) = &self.topup_keep else {
+            return;
+        };
+        if !self.cfg.own_account || !self.anchor_kept || self.topup_off {
+            return;
+        }
+        if !self
+            .topup
+            .take(self.budget.remaining(), self.budget.floor(), utc_day())
+        {
+            return;
+        }
+        let handed = keep.publish(&self.topup.state(0));
+        match handed {
+            Ok(v) => {
+                self.topup_ver = v;
+                self.topup_before = self.budget.remaining_unearned();
+                // This state is the newest: it supersedes one owed.
+                self.topup_owed = false;
+                self.topup_phase = TU_STORING;
+            }
+            Err(Keep::Failed) => self.stop_topups(),
+            Err(_) => self.topup.refund_day(),
+        }
+    }
+
+    /// A purchase handed over leaves once its keeper has stored the state —
+    /// built in place in the scratch command (the dead man's; one at a time
+    /// on this thread) and pushed by reference (the ring slot its one copy),
+    /// charged as one address request. A keeper that failed stops the
+    /// top-ups: nothing is bought unrecorded. A full ring leaves it unsent
+    /// ([`Self::topup_unsent`]). A hand-over owed (a spend or a stop the
+    /// keeper could not take at once) goes again, a pass at a time.
+    fn topup_step(&mut self, now: u64) -> bool {
+        if self.topup_owed && self.topup_phase != TU_STORING {
+            self.topup_hand_over();
+        }
+        if self.topup_phase != TU_STORING {
+            return false;
+        }
+        let kept = match &self.topup_keep {
+            Some(k) => k.kept(self.topup_ver),
+            None => Keep::Failed,
+        };
+        match kept {
+            Keep::Pending => false,
+            Keep::Failed => {
+                self.stop_topups();
+                true
+            }
+            Keep::Stored => {
+                // Narrowed by refusal, never truncated (the arming refused a
+                // weight past `u32`).
+                let Ok(weight) = u32::try_from(self.topup.weight()) else {
+                    self.stop_topups();
+                    return true;
+                };
+                self.topup_seq = self.topup_seq.wrapping_add(1);
+                self.scratch = HlCmd::reserve(self.cfg.slot, self.topup_oid(), weight).at(now);
+                if self.end.cmd.push(&self.scratch) {
+                    self.charge(1);
+                    self.topup_phase = TU_SENT;
+                } else {
+                    self.counters.ring_full += 1;
+                    self.topup_unsent();
+                }
+                true
+            }
+        }
+    }
+
+    /// The purchase's answer (its own client-id range; never `stray`).
+    /// Refused before it left — its request already taken back by the
+    /// never-left rule: [`Self::topup_unsent`]. Accepted, or in doubt (its
+    /// request carried until it is seen): judged at the next budget read
+    /// issued after this answer, charged once a worth carries it. Refused by
+    /// the venue: the top-ups stop. An answer in the range for no purchase
+    /// in flight is the arm's own count gone wrong: they stop too. After a
+    /// halt or once the shutdown began, the same: only the buying ended
+    /// ([`Self::topup_end`]) — a purchase that left is still judged and
+    /// charged, and its spend handed over.
+    fn topup_answer(&mut self, e: &ExecEvent) {
+        if self.topup_phase != TU_SENT || e.client_oid != self.topup_oid() {
+            self.stop_topups();
+            return;
+        }
+        match e.kind {
+            EV_REJECTED if never_left(e.reason) => self.topup_unsent(),
+            EV_ACK | EV_UNANSWERED => {
+                self.topup_mark = self.read_seq;
+                self.topup_doubt = e.kind == EV_UNANSWERED;
+                self.topup_shown = false;
+                self.topup_in_worth = false;
+                self.topup_phase = TU_SEEN;
+            }
+            _ => self.stop_topups(),
+        }
+    }
+
+    /// The purchase never left (refused unsent, a full ring, abandoned — a
+    /// newer read out of the band, the halt, the shutdown): never bought,
+    /// its price never charged — the day's charge returned, decided again
+    /// at a later read unless the buying ended.
+    fn topup_unsent(&mut self) {
+        self.topup.refund_day();
+        self.counters.topup_unsent += 1;
+        self.topup_phase = TU_IDLE;
+    }
+
+    /// **The buying ends** — the router halted the slot (its sweep asked)
+    /// or the shutdown began: nothing more decided; a purchase decided and
+    /// not sent never leaves ([`Self::topup_unsent`]). The accounting goes
+    /// on: a purchase sent or seen is still judged and charged, its spend
+    /// or a stop handed over.
+    fn topup_end(&mut self) {
+        self.topup_off = true;
+        if self.topup_phase == TU_STORING {
+            self.topup_unsent();
+        }
+    }
+
+    /// No more top-ups from this process — nor, once the state is stored,
+    /// for the rest of the UTC day it happens on ([`TopupGovernor::roll`],
+    /// then [`TopupGovernor::stop`]): counted, and handed over.
+    fn stop_topups(&mut self) {
+        self.topup.roll(utc_day());
+        self.topup.stop();
+        self.topup_phase = TU_IDLE;
+        self.counters.topup_failed += 1;
+        self.topup_hand_over();
+    }
+
+    /// The state handed to the keeper with no wait — a spend seen, a stop —
+    /// for the next boot. A keeper still storing the last hand-over takes
+    /// nothing yet: the state is owed, and goes again at the next pass
+    /// ([`Self::topup_step`]); until it does, the file is a step behind — the
+    /// day's usage at its last pre-charge, the spend short (the safe way). A
+    /// keeper that failed takes nothing, ever.
+    fn topup_hand_over(&mut self) {
+        if let Some(k) = &self.topup_keep {
+            self.topup_owed = k.publish(&self.topup.state(0)) == Err(Keep::Pending);
         }
     }
 
@@ -1925,6 +2303,8 @@ impl HlGatewayArm {
             now.saturating_add(LIMIT_STALE_PERIODS * self.cfg.limit_ms * NS_PER_MS);
         self.counters.limit_reads += 1;
         self.limit_due_ns = now.saturating_add(self.cfg.limit_ms * NS_PER_MS);
+        // XMM XH5c-2: the venue's own figure in hand — the top-up's step.
+        self.topup_on_read(e.client_oid.wrapping_sub(READ_OID_BASE));
     }
 
     /// XH4e: one page of the day's fills — the read slot's |px × sz| (USD
@@ -2096,6 +2476,9 @@ impl HlGatewayArm {
             READ_DAY => self.day_page(e, now),
             READ_SPOT => self.spot_done(e.px_1e8, now),
             _ => {
+                // XMM XH5c-2: the sheet's number — its spot half pairs with
+                // it.
+                self.topup_sheet = e.client_oid.wrapping_sub(READ_OID_BASE);
                 self.state_done(e.px_1e8, e.venue_ms, now);
                 self.next_state_ns = next;
             }
@@ -2224,6 +2607,8 @@ impl HlGatewayArm {
             }
         }
         self.note_agreement(now);
+        // XMM XH5c-2: a complete worth — a purchase's price may be in it.
+        self.topup_on_worth(self.topup_sheet);
     }
 
     /// XH5b-1 — the account's worth, USD ×1e8: the perp sheet's value plus
@@ -2282,6 +2667,7 @@ impl HlGatewayArm {
         }
         worked |= self.boot_step(now);
         worked |= self.leverage_step(now);
+        worked |= self.topup_step(now);
         worked |= self.recon_step(now);
         worked |= self.row_timers(now);
         worked |= self.deadman_step(now);
@@ -2532,12 +2918,16 @@ impl HlGatewayArm {
     }
 
     /// E7: the session's P&L, USD ×1e6 — judged on the slot's own account
-    /// once its worth is complete (XH5b-1); unjudged, it reads 0.
+    /// once its worth is complete (XH5b-1); unjudged, it reads 0. XMM
+    /// XH5c-2 (Q-XH5-2): the worth less the anchor PLUS the session's
+    /// top-up spend — a purchase seen on the venue is the day's max's to
+    /// bound, not the loss bound's; one not seen is never added back.
     #[inline]
     const fn session_pnl(&self) -> (bool, i64) {
         let judged = self.anchored && self.seeded && self.cfg.own_account && self.spot_ns != 0;
         let delta = if judged {
-            self.worth_1e8().saturating_sub(self.anchor_1e8) / WIRE_PER_ENGINE
+            (self.worth_1e8().saturating_sub(self.anchor_1e8) / WIRE_PER_ENGINE)
+                .saturating_add(self.topup.cost_1e6())
         } else {
             0
         };
@@ -2843,7 +3233,7 @@ impl OrderDispatch for HlGatewayArm {
         } else {
             0
         };
-        // COPY: the 816 B report written once into the caller's block —
+        // COPY: the 864 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -2879,6 +3269,9 @@ impl OrderDispatch for HlGatewayArm {
             refused_leverage: c.refused_leverage,
             spot_reads: c.spot_reads,
             spot_failed: c.spot_failed,
+            topup_ok: c.topup_ok,
+            topup_failed: c.topup_failed,
+            topup_unsent: c.topup_unsent,
             dm_arms: d.arms,
             dm_clears: d.clears,
             dm_accepted: d.accepted,
@@ -2955,6 +3348,14 @@ impl OrderDispatch for HlGatewayArm {
             anchor_kept: u64::from(self.anchor_kept),
             worth_usd_1e6: worth,
             session_pnl_usd_1e6: session_pnl,
+            // The buying ended (the halt, the shutdown): 0, as off.
+            topup_weight: if self.topup_off {
+                0
+            } else {
+                self.topup.weight()
+            },
+            topup_day_used: self.topup.used(),
+            topup_cost_usd_1e6: self.topup.cost_1e6(),
         };
         true
     }
@@ -3003,6 +3404,10 @@ impl OrderDispatch for HlGatewayArm {
     /// request.
     fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
         if slot == self.cfg.slot {
+            // XMM XH5c-2: the router asks this of a HALTED slot alone (its
+            // sweep, XH5a) — a halted slot buys nothing more (a purchase
+            // that left is still judged and charged).
+            self.topup_end();
             return self.cancel_all();
         }
         Ok(())
@@ -3016,6 +3421,12 @@ impl OrderDispatch for HlGatewayArm {
     }
 
     fn on_shutdown(&mut self) {
+        // XMM XH5c-2: the shutdown buys nothing — no top-up decided at a
+        // read answered during it, none sent; a purchase that left is still
+        // judged and charged, and a hand-over owed goes again each pass —
+        // the shutdown waits for it, within its bound (the keeper turns
+        // until the gateway is released).
+        self.topup_end();
         // The dead man stays armed until nothing of ours can rest; only
         // then is it cleared. At the bound, not confirmed clear: return
         // with it armed — the venue cancels at its deadline.
@@ -3026,6 +3437,9 @@ impl OrderDispatch for HlGatewayArm {
             let _ = self.pump(now);
             // The reads go on (a re-read decides orders thought gone).
             let _ = self.recon_step(now);
+            if self.topup_owed {
+                self.topup_hand_over();
+            }
             // Nobody drains after the stop: fills are counted (the venue's
             // sheet holds them for the next boot), the rest dropped.
             self.counters.shutdown_fills += self.fills.clear() as u64;
@@ -3036,7 +3450,7 @@ impl OrderDispatch for HlGatewayArm {
             match self.cancel_all_state() {
                 CancelAllState::Clear => {
                     let _ = self.drive_deadman(false, now);
-                    if self.deadman.quiescent(now_ms()) {
+                    if self.deadman.quiescent(now_ms()) && !self.topup_owed {
                         return;
                     }
                 }
@@ -3049,10 +3463,12 @@ impl OrderDispatch for HlGatewayArm {
                 }
             }
             if now >= deadline {
-                if self.cancel_all_state() == CancelAllState::Clear {
-                    self.counters.shutdown_switch_held += 1;
-                } else {
+                // Clear with the switch parked: only a hand-over still owed
+                // held the bound (the top-up file lags a step).
+                if self.cancel_all_state() != CancelAllState::Clear {
                     self.counters.shutdown_unconfirmed += 1;
+                } else if !self.deadman.quiescent(now_ms()) {
+                    self.counters.shutdown_switch_held += 1;
                 }
                 return;
             }
@@ -3067,9 +3483,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::budget::{TopupState, TOPUP_PRICE_1E6};
     use crate::cmd::{
         CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT,
-        CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+        CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE, CMD_SCHEDULE_CANCEL,
     };
     use crate::event::{
         EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT, SLOT_FOREIGN,
@@ -5808,5 +6225,586 @@ mod tests {
             "the age runs from the last agreement with a fresh spot half"
         );
         assert_eq!(sig.pnl_judged, 1, "judged on the last worth read");
+    }
+
+    // --- XMM XH5c-2: the top-ups ----------------------------------------
+
+    /// Top-ups of 1 000 requests a purchase, at most `day_max` a UTC day.
+    fn gov(day_max: u64) -> TopupGovernor {
+        TopupGovernor::restored(now_ms() / DAY_MS, 0, 0).armed(1_000, day_max)
+    }
+
+    /// The next budget read at `at` — after the periodic reads — answered
+    /// with `used` requests of a fresh address's 10 000 and `surplus`
+    /// reserved beyond use (the venue's own netting of a purchase).
+    fn budget_at(arm: &mut HlGatewayArm, v: &mut Venue, at: u64, used: u64, surplus: i64) {
+        recon(arm, v, at, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget read");
+        v.send(ExecEvent {
+            sz_1e8: surplus,
+            ..limit_end(&lim, used)
+        });
+        let _ = arm.idle(at);
+    }
+
+    /// Booted with top-ups armed (`day_max`), a budget read inside the band
+    /// `(2 000, 3 000]` answered (2 600 left), its hand-over stored by the
+    /// keeper (emulated) and the purchase pushed — still in the ring.
+    fn topped_up(day_max: u64) -> (HlGatewayArm, Venue, Arc<TopupSlot>, u64) {
+        let (mut arm, mut v, t) = booted();
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(day_max), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + 600 * S;
+        budget_at(&mut arm, &mut v, at, 7_400, 0);
+        let (ver, _) = slot.pending().expect("handed over");
+        slot.mark_kept(ver);
+        let _ = arm.idle(at);
+        (arm, v, slot, at)
+    }
+
+    /// A top-up is decided at a budget read inside the band — the day
+    /// charged and handed to the keeper — leaves only once stored (one
+    /// `reserveRequestWeight`, its own client id, the weight, one address
+    /// request) and is judged at the next read issued after its answer:
+    /// seen, its price is the session's spend, added back to the P&L
+    /// (Q-XH5-2), and the state handed over again; never `stray`.
+    #[test]
+    fn a_top_up_is_decided_stored_then_bought_and_seen_at_the_next_read() {
+        let (mut arm, mut v, t) = booted();
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + 600 * S;
+        budget_at(&mut arm, &mut v, at, 5_000, 0);
+        assert!(slot.pending().is_none(), "above the band: nothing decided");
+        let at = at + 600 * S;
+        budget_at(&mut arm, &mut v, at, 7_400, 0);
+        assert!(
+            v.take(CMD_RESERVE).is_none(),
+            "never before its state is stored"
+        );
+        let (ver, st) = slot.pending().expect("decided and handed over");
+        assert_eq!(
+            (st.day, st.used, st.cost_1e6),
+            (now_ms() / DAY_MS, 1_000, 0),
+            "the day charged with the decision"
+        );
+        slot.mark_kept(ver);
+        let before = arm.budget().expect("read").remaining();
+        let _ = arm.idle(at);
+        let c = v.take(CMD_RESERVE).expect("the purchase, once stored");
+        assert_eq!(
+            (c.slot, c.arg, c.client_oid & !TOPUP_SEQ_MASK),
+            (SLOT, 1_000, TOPUP_OID_BASE)
+        );
+        assert_eq!(
+            arm.budget().expect("read").remaining(),
+            before - 1,
+            "one address request"
+        );
+        let _ = arm.idle(at);
+        assert!(v.take(CMD_RESERVE).is_none(), "one purchase");
+        v.send(item(&c, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        budget_at(&mut arm, &mut v, at + 600 * S, 7_400, 1_000);
+        let k = arm.counters();
+        assert_eq!(
+            (k.topup_ok, k.topup_failed, k.topup_unsent, k.stray),
+            (1, 0, 0, 0)
+        );
+        assert_eq!(arm.topup.cost_1e6(), 1_000 * TOPUP_PRICE_1E6);
+        let (_, st) = slot.pending().expect("the spend handed over");
+        assert_eq!((st.used, st.cost_1e6), (1_000, 500_000));
+        assert_eq!(
+            arm.session_pnl(),
+            (true, 500_000),
+            "the worth unchanged here: the spend added back"
+        );
+        let mut r = GatewayArmReport::default();
+        assert!(arm.gateway_arm_report(at, &mut r));
+        assert_eq!(
+            (
+                r.topup_ok,
+                r.topup_weight,
+                r.topup_day_used,
+                r.topup_cost_usd_1e6,
+                r.session_pnl_usd_1e6
+            ),
+            (1, 1_000, 1_000, 500_000, 500_000)
+        );
+    }
+
+    /// A purchase refused before it left (throttled) is never bought — its
+    /// request taken back, the day's charge returned, no spend — and the
+    /// next read inside the band decides again; never `stray`.
+    #[test]
+    fn a_purchase_refused_before_it_left_is_never_bought() {
+        let (mut arm, mut v, slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        let refunded = arm.counters().refunded;
+        let before = arm.budget().expect("read").remaining();
+        v.send(item(&c, EV_REJECTED, REASON_THROTTLED, 0));
+        let _ = arm.idle(at);
+        let k = arm.counters();
+        assert_eq!(k.refunded, refunded + 1, "its request taken back");
+        assert_eq!(arm.budget().expect("read").remaining(), before + 1);
+        assert_eq!(
+            (k.topup_unsent, k.topup_ok, k.topup_failed, k.stray),
+            (1, 0, 0, 0)
+        );
+        assert_eq!(
+            (arm.topup.used(), arm.topup.cost_1e6()),
+            (0, 0),
+            "the day's charge returned, nothing spent"
+        );
+        let later = at + 600 * S;
+        budget_at(&mut arm, &mut v, later, 7_400, 0);
+        let (ver, st) = slot.pending().expect("decided again");
+        assert_eq!(st.used, 1_000);
+        slot.mark_kept(ver);
+        let _ = arm.idle(later);
+        assert!(v.take(CMD_RESERVE).is_some(), "bought this time");
+    }
+
+    /// An accepted purchase the next read does not show stops the top-ups
+    /// (seen on the venue, or no more): nothing charged, the stop handed
+    /// over as the day spent, and no later read decides one.
+    #[test]
+    fn a_purchase_the_next_read_does_not_show_stops_the_top_ups() {
+        let (mut arm, mut v, slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        v.send(item(&c, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        budget_at(&mut arm, &mut v, at + 600 * S, 7_400, 0);
+        let k = arm.counters();
+        assert_eq!((k.topup_ok, k.topup_failed, k.stray), (0, 1, 0));
+        assert_eq!(
+            (arm.topup.weight(), arm.topup.cost_1e6()),
+            (0, 0),
+            "stopped, nothing charged"
+        );
+        let (ver, st) = slot.pending().expect("the stop handed over");
+        assert_eq!(st.used, 10_000, "the day reads as spent");
+        slot.mark_kept(ver);
+        budget_at(&mut arm, &mut v, at + 1_200 * S, 7_400, 0);
+        assert!(slot.pending().is_none(), "nothing more decided");
+        assert!(v.take(CMD_RESERVE).is_none());
+    }
+
+    /// A purchase the venue refused stops the top-ups (its request stays
+    /// charged: it left); one in doubt is carried as a request unanswered
+    /// until the next read judges it — seen, its price charged once a sheet
+    /// issued after THAT read lands: it may have landed after the sheet
+    /// issued since its answer.
+    #[test]
+    fn a_venue_refusal_stops_and_a_purchase_in_doubt_is_judged_by_the_next_read() {
+        let (mut arm, mut v, _slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        let refunded = arm.counters().refunded;
+        v.send(item(&c, EV_REJECTED, ORDER_EVENT_REASON_OTHER, 0));
+        let _ = arm.idle(at);
+        assert_eq!(
+            (
+                arm.counters().topup_failed,
+                arm.topup.weight(),
+                arm.counters().refunded
+            ),
+            (1, 0, refunded)
+        );
+        let (mut arm, mut v, _slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        let refunded = arm.counters().refunded;
+        v.send(item(&c, EV_UNANSWERED, 0, 0));
+        let _ = arm.idle(at);
+        assert_eq!(
+            arm.counters().refunded,
+            refunded,
+            "in doubt: it may have left"
+        );
+        let later = at + 600 * S;
+        recon(&mut arm, &mut v, later, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget read");
+        assert_eq!(arm.limit_sent, 1, "carried while in doubt");
+        v.send(ExecEvent {
+            sz_1e8: 1_000,
+            ..limit_end(&lim, 7_400)
+        });
+        let _ = arm.idle(later);
+        assert_eq!(
+            (arm.counters().topup_ok, arm.topup.cost_1e6()),
+            (0, 0),
+            "seen — the sheet issued since its answer may predate a late landing"
+        );
+        assert!(arm.topup_shown && !arm.topup_in_worth);
+        recon(&mut arm, &mut v, later + 6 * S, None, &[]);
+        assert_eq!(
+            (arm.counters().topup_ok, arm.topup.cost_1e6()),
+            (1, 500_000),
+            "the sheet issued after the read that showed it, with its spot half"
+        );
+    }
+
+    /// A budget read that went before the purchase's answer judges nothing
+    /// — its figure may predate the purchase, which it carries as one
+    /// request unanswered — and the next one does.
+    #[test]
+    fn a_read_issued_before_the_answer_judges_nothing() {
+        let (mut arm, mut v, _slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        let later = at + 600 * S;
+        recon(&mut arm, &mut v, later, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget read, in flight");
+        assert_eq!(arm.limit_sent, 1, "the purchase carried");
+        v.send(item(&c, EV_ACK, 0, 0));
+        v.send(ExecEvent {
+            sz_1e8: 1_000,
+            ..limit_end(&lim, 7_400)
+        });
+        let _ = arm.idle(later);
+        assert_eq!(
+            (arm.counters().topup_ok, arm.counters().topup_failed),
+            (0, 0),
+            "not judged"
+        );
+        budget_at(&mut arm, &mut v, later + 600 * S, 7_400, 1_000);
+        assert_eq!(arm.counters().topup_ok, 1, "the next read judges it");
+    }
+
+    /// A state its keeper could not store is never bought: the top-ups stop.
+    #[test]
+    fn a_state_its_keeper_could_not_store_is_never_bought() {
+        let (mut arm, mut v, t) = booted();
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + 600 * S;
+        budget_at(&mut arm, &mut v, at, 7_400, 0);
+        assert!(slot.pending().is_some(), "handed over");
+        slot.mark_failed();
+        let _ = arm.idle(at);
+        assert!(v.take(CMD_RESERVE).is_none(), "nothing bought unrecorded");
+        assert_eq!((arm.counters().topup_failed, arm.topup.weight()), (1, 0));
+    }
+
+    /// An answer in the purchase range for no purchase in flight is the
+    /// arm's own count gone wrong: the top-ups stop; never `stray`.
+    #[test]
+    fn an_answer_for_no_purchase_in_flight_stops_the_top_ups() {
+        let (mut arm, mut v, _slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        let mut other = c;
+        other.client_oid = c.client_oid + 1;
+        v.send(item(&other, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        assert_eq!(
+            (
+                arm.counters().topup_failed,
+                arm.counters().stray,
+                arm.topup.weight()
+            ),
+            (1, 0, 0)
+        );
+    }
+
+    /// The day's max binds: at a max of one purchase, the next read inside
+    /// the band decides nothing.
+    #[test]
+    fn the_day_s_max_binds() {
+        let (mut arm, mut v, slot, at) = topped_up(1_000);
+        let c = v.take(CMD_RESERVE).expect("the day's one purchase");
+        v.send(item(&c, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        budget_at(&mut arm, &mut v, at + 600 * S, 7_400, 1_000);
+        assert_eq!(arm.counters().topup_ok, 1);
+        let (ver, _) = slot.pending().expect("the spend handed over");
+        slot.mark_kept(ver);
+        budget_at(&mut arm, &mut v, at + 1_200 * S, 8_400, 1_000);
+        assert!(slot.pending().is_none(), "the day's max");
+        assert!(v.take(CMD_RESERVE).is_none());
+    }
+
+    /// Top-ups arm on the slot's own account alone, with a weight the
+    /// purchase command carries (narrowed by refusal, never truncated) and a
+    /// keeper (off, the governor alone), and decide nothing before the
+    /// session's anchor is durable.
+    #[test]
+    fn top_ups_arm_on_an_own_account_alone_and_wait_for_the_anchor() {
+        let slot = Arc::new(TopupSlot::new());
+        let mut shared = cfg();
+        shared.own_account = false;
+        let (eng, _gw) = hl_duplex();
+        let mut arm = HlGatewayArm::new(&shared, eng).expect("arm");
+        assert_eq!(
+            arm.set_topup(gov(10_000), Some(Arc::clone(&slot))),
+            Err(ArmErr::Topup),
+            "the shared account's requests are its blocking arm's to buy"
+        );
+        let (eng, _gw) = hl_duplex();
+        let mut arm = HlGatewayArm::new(&cfg(), eng).expect("arm");
+        let wide = TopupGovernor::restored(0, 0, 0);
+        assert_eq!(
+            arm.set_topup(
+                wide.armed(u64::from(u32::MAX) + 1, u64::MAX),
+                Some(Arc::clone(&slot))
+            ),
+            Err(ArmErr::Topup),
+            "past u32: refused, never truncated"
+        );
+        assert!(arm
+            .set_topup(
+                wide.armed(u64::from(u32::MAX), u64::MAX),
+                Some(Arc::clone(&slot))
+            )
+            .is_ok());
+        assert_eq!(
+            arm.set_topup(gov(10_000), None),
+            Err(ArmErr::Topup),
+            "armed with no keeper"
+        );
+        assert!(
+            arm.set_topup(TopupGovernor::restored(0, 0, 500_000), None)
+                .is_ok(),
+            "off: the governor alone, for the restored spend's add-back"
+        );
+        let (mut arm, mut v, t) = booted_unkept();
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        budget_at(&mut arm, &mut v, t + 600 * S, 7_400, 0);
+        assert!(!arm.anchor_kept);
+        assert!(
+            slot.pending().is_none(),
+            "no price before the anchor it is added back against is durable"
+        );
+    }
+
+    /// The shutdown buys nothing: a budget read inside the band answered
+    /// during it decides nothing, and nothing is handed over or sent.
+    #[test]
+    fn the_shutdown_buys_nothing() {
+        let (mut arm, mut v, t) = booted();
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + 600 * S;
+        recon(&mut arm, &mut v, at, None, &[]);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget read");
+        v.send(limit_end(&lim, 7_400));
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = responder(v, |_| SWEEP_CLEAR, true, Arc::clone(&stop));
+        arm.on_shutdown();
+        stop.store(true, Ordering::Relaxed);
+        let v = h.join().expect("the responder");
+        assert_eq!(arm.counters().limit_reads, 2, "the read was answered");
+        assert!(slot.pending().is_none(), "nothing decided");
+        assert!(
+            v.cmds.iter().all(|c| c.kind != CMD_RESERVE),
+            "nothing bought"
+        );
+    }
+
+    /// The add-back waits for a worth that carries the price: a budget read
+    /// that shows the purchase before any perp sheet issued after it charges
+    /// nothing; the next sheet and its spot half do.
+    #[test]
+    fn the_add_back_waits_for_a_worth_that_carries_the_price() {
+        let mut cf = cfg();
+        cf.limit_ms = 1_000;
+        let (mut arm, mut v, t) = booted_with(&cf);
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + S;
+        let _ = arm.idle(at);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget read");
+        v.send(limit_end(&lim, 7_400));
+        let _ = arm.idle(at);
+        let (ver, _) = slot.pending().expect("decided");
+        slot.mark_kept(ver);
+        let _ = arm.idle(at);
+        let buy = v.take(CMD_RESERVE).expect("the purchase");
+        v.send(item(&buy, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        let at2 = at + S;
+        let _ = arm.idle(at2);
+        let lim = v.take(CMD_READ_LIMIT).expect("the next budget read");
+        v.send(ExecEvent {
+            sz_1e8: 1_000,
+            ..limit_end(&lim, 7_400)
+        });
+        let _ = arm.idle(at2);
+        assert_eq!(
+            (arm.counters().topup_ok, arm.topup.cost_1e6()),
+            (0, 0),
+            "seen on the venue, not inside the worth yet"
+        );
+        assert_eq!(arm.session_pnl(), (true, 0), "no add-back yet");
+        recon(&mut arm, &mut v, at2 + 5 * S, None, &[]);
+        assert_eq!(
+            (arm.counters().topup_ok, arm.topup.cost_1e6()),
+            (1, 500_000),
+            "the sheet after it, with its spot half"
+        );
+    }
+
+    /// A halted slot buys nothing more: the router's sweep of the slot
+    /// (`cancel_slot`) ends the buying — a purchase decided is never sent
+    /// (the day's charge returned), a later read inside the band decides
+    /// none — while a purchase that left is still judged and charged, its
+    /// spend handed over.
+    #[test]
+    fn a_halted_slot_buys_nothing_more() {
+        let (mut arm, mut v, t) = booted();
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + 600 * S;
+        budget_at(&mut arm, &mut v, at, 7_400, 0);
+        let (ver, _) = slot.pending().expect("decided");
+        arm.cancel_slot(SLOT).expect("the halt's sweep");
+        assert_eq!(
+            (arm.counters().topup_unsent, arm.topup.used()),
+            (1, 0),
+            "abandoned, the day returned"
+        );
+        slot.mark_kept(ver);
+        let _ = arm.idle(at);
+        assert!(v.take(CMD_RESERVE).is_none(), "never sent");
+        budget_at(&mut arm, &mut v, at + 600 * S, 7_400, 0);
+        assert!(slot.pending().is_none(), "nothing decided");
+        assert!(v.take(CMD_RESERVE).is_none());
+        // A purchase that left before the halt: judged and charged.
+        let (mut arm, mut v, slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        arm.cancel_slot(SLOT).expect("the halt's sweep");
+        v.send(item(&c, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        budget_at(&mut arm, &mut v, at + 600 * S, 7_400, 1_000);
+        assert_eq!(
+            (arm.counters().topup_ok, arm.topup.cost_1e6()),
+            (1, 500_000),
+            "its price is the session's spend"
+        );
+        let (ver, st) = slot.pending().expect("the spend handed over");
+        assert_eq!(st.cost_1e6, 500_000);
+        slot.mark_kept(ver);
+        budget_at(&mut arm, &mut v, at + 1_200 * S, 8_400, 1_000);
+        assert!(slot.pending().is_none(), "nothing more decided");
+        assert!(v.take(CMD_RESERVE).is_none());
+        let mut r = GatewayArmReport::default();
+        assert!(arm.gateway_arm_report(at, &mut r));
+        assert_eq!(
+            (r.topup_ok, r.topup_weight, r.topup_cost_usd_1e6),
+            (1, 0, 500_000),
+            "the buying ended: the weight reads 0, the spend stays"
+        );
+    }
+
+    /// A purchase decided whose keeper is slow, and that a newer budget read
+    /// leaves out of the band, never leaves: the day's charge returned.
+    #[test]
+    fn a_decision_a_newer_read_leaves_out_of_the_band_never_leaves() {
+        let mut cf = cfg();
+        cf.limit_ms = 1_000;
+        let (mut arm, mut v, t) = booted_with(&cf);
+        let slot = Arc::new(TopupSlot::new());
+        arm.set_topup(gov(10_000), Some(Arc::clone(&slot)))
+            .expect("armed");
+        let at = t + S;
+        let _ = arm.idle(at);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget read");
+        v.send(limit_end(&lim, 7_400));
+        let _ = arm.idle(at);
+        let (ver, _) = slot.pending().expect("decided, its keeper slow");
+        let at2 = at + S;
+        let _ = arm.idle(at2);
+        let lim = v.take(CMD_READ_LIMIT).expect("a newer budget read");
+        v.send(limit_end(&lim, 5_000));
+        let _ = arm.idle(at2);
+        assert_eq!(
+            (arm.counters().topup_unsent, arm.topup.used()),
+            (1, 0),
+            "abandoned, the day returned"
+        );
+        slot.mark_kept(ver);
+        let _ = arm.idle(at2);
+        assert!(v.take(CMD_RESERVE).is_none(), "never sent");
+    }
+
+    /// A spend the keeper cannot take at once (it still stores another
+    /// hand-over) is owed, and goes at a later pass.
+    #[test]
+    fn a_hand_over_the_keeper_cannot_take_at_once_goes_later() {
+        let (mut arm, mut v, slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        v.send(item(&c, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        let busy = slot
+            .publish(&TopupState::default())
+            .expect("another hand-over takes the keeper");
+        let later = at + 600 * S;
+        budget_at(&mut arm, &mut v, later, 7_400, 1_000);
+        assert_eq!(arm.counters().topup_ok, 1, "seen, inside the worth");
+        assert!(arm.topup_owed, "its spend is owed");
+        slot.mark_kept(busy);
+        let _ = arm.idle(later);
+        let (_, st) = slot.pending().expect("the spend, handed over");
+        assert_eq!(st.cost_1e6, 500_000);
+        assert!(!arm.topup_owed);
+    }
+
+    /// A hand-over owed when the shutdown begins goes during it — the
+    /// shutdown waits for its keeper (busy a while here), within its bound.
+    #[test]
+    fn a_hand_over_owed_goes_during_the_shutdown() {
+        let (mut arm, mut v, slot, at) = topped_up(10_000);
+        let c = v.take(CMD_RESERVE).expect("the purchase");
+        v.send(item(&c, EV_ACK, 0, 0));
+        let _ = arm.idle(at);
+        let busy = slot
+            .publish(&TopupState::default())
+            .expect("another hand-over takes the keeper");
+        budget_at(&mut arm, &mut v, at + 600 * S, 7_400, 1_000);
+        assert!(arm.topup_owed, "its spend is owed");
+        let keeper = Arc::clone(&slot);
+        let k = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            keeper.mark_kept(busy);
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let h = responder(v, |_| SWEEP_CLEAR, true, Arc::clone(&stop));
+        arm.on_shutdown();
+        stop.store(true, Ordering::Relaxed);
+        let _ = h.join().expect("the responder");
+        k.join().expect("the keeper");
+        assert!(!arm.topup_owed, "handed over during the shutdown");
+        let (_, st) = slot.pending().expect("the spend, handed over");
+        assert_eq!(st.cost_1e6, 500_000);
+        let n = arm.counters();
+        assert_eq!(
+            (n.shutdown_switch_held, n.shutdown_unconfirmed),
+            (0, 0),
+            "nothing held at the bound"
+        );
+    }
+
+    /// A stop spends the UTC day it happens on — not the day the governor
+    /// counted last.
+    #[test]
+    fn a_stop_spends_the_day_it_happens_on() {
+        let (mut arm, mut v, t) = booted();
+        let slot = Arc::new(TopupSlot::new());
+        let today = utc_day();
+        arm.set_topup(
+            TopupGovernor::restored(today - 1, 5_000, 0).armed(1_000, 10_000),
+            Some(Arc::clone(&slot)),
+        )
+        .expect("armed");
+        let none = HlCmd::reserve(SLOT, TOPUP_OID_BASE | 7, 1_000);
+        v.send(item(&none, EV_ACK, 0, 0));
+        let _ = arm.idle(t);
+        let (_, st) = slot.pending().expect("the stop, handed over");
+        assert_eq!((st.day, st.used), (today, 10_000));
+        assert_eq!((arm.counters().topup_failed, arm.counters().stray), (1, 0));
     }
 }

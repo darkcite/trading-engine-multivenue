@@ -123,6 +123,7 @@ pub mod sign;
 pub mod smoke;
 #[cfg(feature = "testvenue")]
 pub mod testvenue;
+pub mod topup;
 pub mod ttl;
 pub mod userws;
 pub mod userws_conn;
