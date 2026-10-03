@@ -46,6 +46,10 @@ pub const CMD_READ_LIMIT: u8 = 9;
 /// (`userFillsByTime`'s `startTime` and `endTime`, venue wall ms), summed
 /// in place for the command's slot; answered by `EV_READ_DONE` alone.
 pub const CMD_READ_DAY: u8 = 10;
+/// Read (XMM XH5b-1): the account's spot sheet (`spotClearinghouseState`)
+/// — the USDC half of an account's worth; answered by `EV_READ_DONE`
+/// alone. The last read: [`HlCmd::is_read`] ends here.
+pub const CMD_READ_SPOT: u8 = 11;
 
 /// `flags`: reduce-only.
 pub const CMD_FLAG_REDUCE_ONLY: u8 = 1;
@@ -255,11 +259,20 @@ impl HlCmd {
         c
     }
 
+    /// Read (XMM XH5b-1): the account's spot sheet.
+    #[inline(always)]
+    #[must_use]
+    pub const fn read_spot(slot: u8, client_oid: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_READ_SPOT;
+        c
+    }
+
     /// A read (posted alone, unsigned, WebSocket only).
     #[inline(always)]
     #[must_use]
     pub const fn is_read(&self) -> bool {
-        self.kind >= CMD_READ_ORDERS && self.kind <= CMD_READ_DAY
+        self.kind >= CMD_READ_ORDERS && self.kind <= CMD_READ_SPOT
     }
 
     /// Reduce-only.
@@ -417,5 +430,23 @@ mod tests {
         let c = HlCmd::place(0, 1, 0, true, 1, 1, Tif::Ioc);
         assert_eq!(c.order_wire().tif, Tif::Ioc as u8);
         assert_eq!(c.expiring_after(750).expires_after_ms, 750);
+    }
+
+    /// XH5b-1: the spot sheet is the last read — every read kind is one,
+    /// nothing past it.
+    #[test]
+    fn every_read_kind_is_a_read_and_none_past_the_spot_sheet() {
+        let s = HlCmd::read_spot(6, 9);
+        assert_eq!((s.kind, s.slot, s.client_oid), (CMD_READ_SPOT, 6, 9));
+        assert!(s.is_read() && !s.is_control());
+        assert!(HlCmd::read_orders(6, 1).is_read());
+        assert!(HlCmd::read_state(6, 1).is_read());
+        assert!(HlCmd::read_limit(6, 1).is_read());
+        assert!(HlCmd::read_day(6, 1, 0, 0).is_read());
+        let mut past = s;
+        past.kind = CMD_READ_SPOT + 1;
+        assert!(!past.is_read());
+        assert!(!HlCmd::noop(6, 1).is_read());
+        assert!(!HlCmd::cancel(6, 1, 0).is_read());
     }
 }

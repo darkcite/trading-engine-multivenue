@@ -19,7 +19,7 @@
 //! | [`EV_HALT`] | the gateway | the gateway halted (`aux` = the halt reason) |
 //! | [`EV_OPEN_ORDER`] | a read (XH4d) | one resting order of the account: `asset`, `oid`, and `slot` / `client_oid` from its cloid ([`SLOT_FOREIGN`] when not ours) |
 //! | [`EV_POSITION`] | a read (XH4d) | one perp position: `asset`, `sz_1e8` = signed size, `aux` = its value at the venue's mark (USD ×1e8) |
-//! | [`EV_READ_DONE`] / [`EV_READ_FAILED`] | a read (XH4d, XH4e) | the read's end (`reason` = [`READ_ORDERS`] / [`READ_STATE`] / [`READ_LIMIT`] / [`READ_DAY`]; `aux` = rows, `px_1e8` = the account value and `venue_ms` its time for a state read; the budget and day reads' fields at their constants — a day page's `sz_1e8` counts the rows whose time ran backward) or its failure; `client_oid` / `slot` are the read command's |
+//! | [`EV_READ_DONE`] / [`EV_READ_FAILED`] | a read (XH4d, XH4e, XH5b-1) | the read's end (`reason` = [`READ_ORDERS`] / [`READ_STATE`] / [`READ_LIMIT`] / [`READ_DAY`] / [`READ_SPOT`]; `aux` = rows, `px_1e8` = the account value and `venue_ms` its time for a state read; the budget, day and spot reads' fields at their constants — a day page's `sz_1e8` counts the rows whose time ran backward) or its failure; `client_oid` / `slot` are the read command's |
 //!
 //! A post reply's `filled` is an [`EV_ACK`], never [`EV_FILLED`]: the
 //! venue's `filled` status arrives on `orderUpdates` and the trades on
@@ -88,6 +88,11 @@ pub const READ_LIMIT: u8 = 3;
 /// (`userFillsByTime`) — `aux` = rows, `px_1e8` = Σ |px × sz| of the read
 /// slot's rows (USD ×1e8), `venue_ms` = the latest row's time.
 pub const READ_DAY: u8 = 4;
+/// A read's `reason` (XMM XH5b-1): the account's spot sheet
+/// (`spotClearinghouseState`) — `aux` = rows, `px_1e8` = the USDC `total`
+/// (USD ×1e8), `sz_1e8` = 1 when the sheet lists USDC (0, and `px_1e8` 0,
+/// when it lists none).
+pub const READ_SPOT: u8 = 5;
 
 /// [`EV_GAP`]: a `userFills` frame did not scan.
 pub const GAP_FILLS_UNREADABLE: u64 = 1;

@@ -1936,7 +1936,7 @@ fn gateway_hedge(
     }
     cfg.n_perps = resolved.len();
     let (eng, gw_end) = hl_duplex();
-    // COPY: boot, once — the 1 600 B arm out of `new`'s `Result`, through
+    // COPY: boot, once — the 1 664 B arm out of `new`'s `Result`, through
     // the maker's, into `HyparbLive` and `LiveBoot` (as `xmm_live`'s, noted
     // there). Rejected: as there.
     let arm = HlGatewayArm::new(&cfg, eng).map_err(|e| format!("slot 0's gateway arm: {e:?}"))?;

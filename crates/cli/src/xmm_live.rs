@@ -65,12 +65,21 @@ pub const RECON_MS: u64 = 10_000;
 const _: () = assert!(RECON_MS >= 1_000);
 /// The address budget is read this often, ms.
 pub const LIMIT_MS: u64 = 60_000;
+/// Slot 6's account is its own (`ArmCfg::own_account`): false — the shared
+/// E3 testnet account — until XH5b-2 gives it one. [`arm_cfg`] and the
+/// read-weight pin below read it.
+pub const OWN_ACCOUNT: bool = false;
 // The periodic reads stay under 40 % of the IP share, so the congestion
 // word (busy at 60 %) and the throttle (80 %) are the actions' to move — at
 // XH4d's 5 s the reads alone were 71 %, busy for good (the XH4e
 // amendment's arithmetic). XH4g measures the venue's weighting of
-// WebSocket-posted reads and re-sizes both.
-const _: () = assert!(read_weight_per_min(RECON_MS, LIMIT_MS) * 100 <= IP_WEIGHT_SHARE as u64 * 40);
+// WebSocket-posted reads and re-sizes both. XH5b-1: the spot sheet counts
+// on an account of slot 6's own ([`OWN_ACCOUNT`]) — at 10 s it would take
+// the reads to 164 a minute, past 40 %: XH5b-2 cannot turn the own account
+// on without XH5c's 30 s (68).
+const _: () = assert!(
+    read_weight_per_min(RECON_MS, LIMIT_MS, OWN_ACCOUNT) * 100 <= IP_WEIGHT_SHARE as u64 * 40
+);
 /// The arm's shutdown bound, ms: the sweep confirmed, then the dead man
 /// cleared.
 pub const SHUTDOWN_MS: u64 = 10_000;
@@ -250,7 +259,7 @@ pub fn boot_xmm_arm(
         bind_perps(b, &asks, &mut cfg, &mut bound)
     })??;
     let (eng, gw_end) = hl_duplex();
-    // COPY: boot, once — the 1 600 B arm moves out of `new`'s `Result`, into
+    // COPY: boot, once — the 1 664 B arm moves out of `new`'s `Result`, into
     // `XmmLive`, the binary's tuple, the `SlotSplit` and the router (it stays
     // inline there, for the verbs' direct calls). Rejected: boxing the arm
     // (every verb would chase a pointer).
@@ -405,7 +414,7 @@ pub const fn arm_cfg(slot: u8, expires_after_ms: u16, recon_ms: u64, budget_floo
         join_ms: JOIN_MS,
         gone_ms: GONE_MS,
         shutdown_ms: SHUTDOWN_MS,
-        own_account: false,
+        own_account: OWN_ACCOUNT,
         anchor_1e6: 0,
         deadman: DeadManCfg::DEFAULT,
         budget_floor,

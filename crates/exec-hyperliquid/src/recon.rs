@@ -56,7 +56,7 @@ use core_parse::{find_field, skip_ws};
 /// So this is deliberately far above anything observed: overflow is
 /// correctly an error (a position nobody saw reconciles by not being
 /// there), which makes an undersized buffer a self-inflicted outage.
-/// 256 rows is 6 KiB.
+/// 256 rows is 8 KiB (32 B a row, pinned below [`SpotBalance`]).
 pub const MAX_SPOT_BALANCES: usize = 256;
 
 // Real headroom above what the venue has actually been observed to
@@ -86,6 +86,10 @@ pub struct SpotBalance {
     /// the row has none (the quote token, a husk).
     pub entry_ntl_1e8: i64,
 }
+
+// The reconciler's table: 256 rows of 32 B, 8 KiB (the gateway boxes one,
+// XH5b-1).
+const _: () = assert!(core::mem::size_of::<[SpotBalance; MAX_SPOT_BALANCES]>() == 8_192);
 
 impl SpotBalance {
     /// Total minus what is already committed to resting orders.
@@ -501,10 +505,10 @@ fn user_info_open(
     // COPY: ≤ 64 B request literal + 40 hex chars into the caller's final
     // body — the RENDER of the `/info` request, once per request at its
     // caller's cadence (e.g. the gateway arm's sheet and orders every read
-    // period, its budget every `limit_ms`, a day page a read period apart,
-    // a sweep round's read; the blocking arm's and HYPARB's reads); the
-    // body must exist once. Rejected: nothing — the render's own write
-    // into its final buffer, no staging between.
+    // period, its spot sheet after each perp sheet, its budget every
+    // `limit_ms`, a day page a read period apart, a sweep round's read; the
+    // blocking arm's and HYPARB's reads); the body must exist once.
+    // Rejected: nothing — the render's own write, no staging between.
     out[..head.len()].copy_from_slice(head);
     let mut i = head.len();
     for b in master {

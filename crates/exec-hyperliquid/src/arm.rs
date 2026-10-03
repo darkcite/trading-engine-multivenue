@@ -57,10 +57,16 @@
 //! the slot's byte that the arm does not know is cancelled and, after
 //! boot, pins the drift unbounded** (the router's `ReconDrift` halts the
 //! slot) — including one the arm closed by inference that a read issued
-//! after that close still lists. The session's P&L anchor is restored
-//! from the owner's state file (E7: a bound re-anchored per boot is a
-//! bound on nothing) or taken at the first sheet and offered to the owner
-//! to keep; it is judged on the slot's own account only.
+//! after that close still lists. **The account's worth (XH5b-1)** is the
+//! perp sheet's `accountValue` plus the spot sheet's USDC `total` — spot
+//! USDC margins the perps (XH4g measured `accountValue` at $0 on E3): on
+//! the slot's own account the spot sheet (`spotClearinghouseState`) is
+//! read right after each perp sheet, and the slot is reconciled, its
+//! agreement fresh and its P&L judged only with both halves landed. The
+//! session's P&L anchor is restored from the owner's state file (E7: a
+//! bound re-anchored per boot is a bound on nothing) or taken at the
+//! first complete worth and offered to the owner to keep; it is judged on
+//! the slot's own account only.
 //!
 //! **Cancel-all** marks every order it holds for cancel and asks the
 //! gateway's sweep; `Clear` means the venue read clear AND no order the
@@ -146,8 +152,8 @@ use crate::event::{
     never_left, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM, EV_ACK,
     EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION,
     EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
-    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_IOC_MISS,
-    REASON_NOT_FOUND, REASON_THROTTLED,
+    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
+    REASON_IOC_MISS, REASON_NOT_FOUND, REASON_THROTTLED,
 };
 use crate::gateway::{pw, HlEngineEnd};
 use crate::nonce::now_ms;
@@ -320,7 +326,8 @@ pub struct ArmCfg {
     pub post_timeout_ms: u64,
     /// The venue's clock against ours, ms (≤ 5 s).
     pub skew_ms: u64,
-    /// The sheet and the orders are read this often, ms.
+    /// The sheet and the orders are read this often, ms — and the spot
+    /// sheet with them on an account of the slot's own (XH5b-1).
     pub recon_ms: u64,
     /// `FILLED` waits this long for its fills, ms.
     pub join_ms: u64,
@@ -333,11 +340,13 @@ pub struct ArmCfg {
     pub shutdown_ms: u64,
     /// The account holds only this slot's orders and positions (slot 6's
     /// own master): the dead man needs no read to know it, unbound
-    /// positions are strangers, and the account value is the slot's P&L.
+    /// positions are strangers, and the account's worth — the perp sheet's
+    /// value plus the spot sheet's USDC (XH5b-1) — is the slot's P&L.
     pub own_account: bool,
-    /// The session's P&L anchor restored from the owner's state file,
-    /// account value USD ×1e6; 0 = none (the first sheet anchors, and
-    /// [`HlGatewayArm::fresh_anchor_1e6`] offers it for keeping).
+    /// The session's P&L anchor restored from the owner's state file, the
+    /// account's worth USD ×1e6; 0 = none (the first complete worth
+    /// anchors, and [`HlGatewayArm::fresh_anchor_1e6`] offers it for
+    /// keeping).
     pub anchor_1e6: i64,
     /// The dead-man switch's timing.
     pub deadman: DeadManCfg,
@@ -439,6 +448,8 @@ pub struct ArmCounters {
     pub throttled: u64,
     /// Budget reads answered (XH4e).
     pub limit_reads: u64,
+    /// Spot sheets answered with their USDC row (XH5b-1).
+    pub spot_reads: u64,
     /// Pages of the day's fills read (XH4e).
     pub day_pages: u64,
     /// Days read spent because their start may be unread (XH4e): the
@@ -679,6 +690,13 @@ pub struct HlGatewayArm {
     last_agree_ns: u64,
     anchor_1e8: i64,
     account_1e8: i64,
+    /// XH5b-1: the spot sheet's USDC `total` — the worth's second half on
+    /// the slot's own account — and when it was last read (0 = never); the
+    /// next spot read (`u64::MAX`: none due — one goes right after each
+    /// perp sheet).
+    spot_1e8: i64,
+    spot_ns: u64,
+    next_spot_ns: u64,
     anchored: bool,
     /// The anchor was taken this boot (the owner keeps it).
     fresh_anchor: bool,
@@ -725,9 +743,10 @@ pub struct HlGatewayArm {
     lev_due_ns: u64,
 }
 
-// The arm's inline state, 1 600 B — what `new` moves into its owner (the
-// tables are boxed).
-const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_600);
+// The arm's inline state, 1 664 B — what `new` moves into its owner (the
+// tables are boxed); XH5b-1's spot half and its counter (32 B) took one more
+// 64 B line.
+const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_664);
 
 /// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
 /// reports: a post-only cross, or an order in doubt that never landed,
@@ -800,7 +819,7 @@ impl HlGatewayArm {
         }
         let deadman =
             DeadMan::new(cfg.deadman, cfg.slot, DEADMAN_OID_BASE).map_err(|_| ArmErr::DeadMan)?;
-        // COPY: the arm's inline state — 1 600 B, const-asserted (the
+        // COPY: the arm's inline state — 1 664 B, const-asserted (the
         // configuration ≈ 0.3 KiB, the dead man 256 B, the address budget
         // 64 B, counters, the stats, the ring end, the scratch command,
         // the queue heads and words) — moved at boot into the owner, cold;
@@ -854,6 +873,9 @@ impl HlGatewayArm {
             last_agree_ns: 0,
             anchor_1e8: cfg.anchor_1e6.saturating_mul(WIRE_PER_ENGINE),
             account_1e8: 0,
+            spot_1e8: 0,
+            spot_ns: 0,
+            next_spot_ns: u64::MAX,
             anchored: cfg.anchor_1e6 > 0,
             fresh_anchor: false,
             done_ids: boxed_array(0),
@@ -980,9 +1002,9 @@ impl HlGatewayArm {
         self.boot_held
     }
 
-    /// The session anchor this boot took (account value USD ×1e6), for the
-    /// owner to keep off the engine thread (E7) in a state file of the
-    /// slot's own; `None` when it was restored, not taken yet, or the
+    /// The session anchor this boot took (the account's worth USD ×1e6),
+    /// for the owner to keep off the engine thread (E7) in a state file of
+    /// the slot's own; `None` when it was restored, not taken yet, or the
     /// account is shared (its P&L is never judged there).
     #[must_use]
     pub const fn fresh_anchor_1e6(&self) -> Option<i64> {
@@ -1812,6 +1834,7 @@ impl HlGatewayArm {
             READ_ORDERS => HlCmd::read_orders(self.cfg.slot, oid),
             READ_LIMIT => HlCmd::read_limit(self.cfg.slot, oid),
             READ_DAY => HlCmd::read_day(self.cfg.slot, oid, self.day_from_ms, self.day_until_ms),
+            READ_SPOT => HlCmd::read_spot(self.cfg.slot, oid),
             _ => HlCmd::read_state(self.cfg.slot, oid),
         };
         if !self.end.cmd.push(&c.at(now)) {
@@ -1848,8 +1871,9 @@ impl HlGatewayArm {
     }
 
     /// The read in flight failed: the sheet and the orders are asked again
-    /// after a skew; the budget and the day (XH4e: 20 IP weight or more
-    /// each) a read period later.
+    /// after a skew; the spot sheet with the next perp sheet (XH5b-1: one a
+    /// sheet, so it never storms, whatever the skew); the budget and the
+    /// day (XH4e: 20 IP weight or more each) a read period later.
     fn read_failed(&mut self, now: u64) {
         self.counters.reads_failed += 1;
         let retry = now.saturating_add(self.cfg.skew_ms * NS_PER_MS);
@@ -1858,6 +1882,7 @@ impl HlGatewayArm {
             READ_ORDERS => self.next_orders_ns = retry,
             READ_LIMIT => self.limit_due_ns = slow,
             READ_DAY => self.day_due_ns = slow,
+            READ_SPOT => self.next_spot_ns = u64::MAX,
             _ => self.next_state_ns = retry,
         }
         self.read_oid = 0;
@@ -2033,7 +2058,10 @@ impl HlGatewayArm {
         if self.read_oid == 0 || e.slot != self.cfg.slot || e.client_oid != self.read_oid {
             return;
         }
-        if e.kind == EV_READ_FAILED || e.reason != self.read_kind {
+        // XH5b-1: a spot sheet that lists no USDC answers nothing — nothing
+        // to anchor or judge (`recon::account_view`'s rule), never a $0 half.
+        let no_worth = self.read_kind == READ_SPOT && e.sz_1e8 == 0;
+        if e.kind == EV_READ_FAILED || e.reason != self.read_kind || no_worth {
             // An end of another kind answers no read of this one.
             self.read_failed(now);
             return;
@@ -2048,6 +2076,7 @@ impl HlGatewayArm {
             }
             READ_LIMIT => self.limit_done(e, now),
             READ_DAY => self.day_page(e, now),
+            READ_SPOT => self.spot_done(e.px_1e8, now),
             _ => {
                 self.state_done(e.px_1e8, e.venue_ms, now);
                 self.next_state_ns = next;
@@ -2091,10 +2120,11 @@ impl HlGatewayArm {
     fn state_done(&mut self, account_1e8: i64, venue_ms: u64, now: u64) {
         self.account_1e8 = account_1e8;
         self.sheet_ns = now;
-        if !self.anchored {
-            self.anchor_1e8 = account_1e8;
-            self.anchored = true;
-            self.fresh_anchor = true;
+        // XH5b-1: the worth's spot half is read next, and the anchor waits
+        // for it; a shared account's worth is every slot's — never read,
+        // never anchored.
+        if self.cfg.own_account {
+            self.next_spot_ns = now;
         }
         let n = self.cfg.n_perps.min(ARM_PERPS);
         if !self.seeded {
@@ -2155,13 +2185,42 @@ impl HlGatewayArm {
         }
     }
 
-    /// Both reads agree and each ended within two periods: the
-    /// agreement's clock restarts. A read that stops coming (starved or
-    /// failing) shows as `ReconStale`, never as an old agreement.
+    /// XH5b-1 — the spot sheet answered: the worth's USDC half. The first
+    /// complete worth anchors the session when no anchor was restored — a
+    /// positive one only: an unfunded account has nothing to anchor (the
+    /// blocking arm's E7 rule), and the first reconciliation waits.
+    fn spot_done(&mut self, usdc_1e8: i64, now: u64) {
+        self.spot_1e8 = usdc_1e8;
+        self.spot_ns = now;
+        self.next_spot_ns = u64::MAX;
+        self.counters.spot_reads += 1;
+        if !self.anchored && self.worth_1e8() > 0 {
+            self.anchor_1e8 = self.worth_1e8();
+            self.anchored = true;
+            self.fresh_anchor = true;
+        }
+        self.note_agreement(now);
+    }
+
+    /// XH5b-1 — the account's worth, USD ×1e8: the perp sheet's value plus
+    /// the spot sheet's USDC (saturating: a hostile body scans to
+    /// ±`i64::MAX`).
+    #[inline(always)]
+    const fn worth_1e8(&self) -> i64 {
+        self.account_1e8.saturating_add(self.spot_1e8)
+    }
+
+    /// Both reads agree and each ended within two periods — on the slot's
+    /// own account the worth's spot half too (XH5b-1): the agreement's
+    /// clock restarts. A read that stops coming (starved or failing) shows
+    /// as `ReconStale`, never as an old agreement.
     fn note_agreement(&mut self, now: u64) {
         let fresh = 2 * self.cfg.recon_ms * NS_PER_MS;
+        let spot_fresh = !self.cfg.own_account
+            || (self.spot_ns != 0 && now.saturating_sub(self.spot_ns) <= fresh);
         if self.state_ok
             && self.orders_ok
+            && spot_fresh
             && now.saturating_sub(self.sheet_ns) <= fresh
             && now.saturating_sub(self.orders_ns) <= fresh
         {
@@ -2225,7 +2284,8 @@ impl HlGatewayArm {
     }
 
     /// Reads on their cadence, one at a time: the sheet then the orders
-    /// at boot, both after it.
+    /// at boot, both after it; on the slot's own account the spot sheet
+    /// right after each perp sheet (XH5b-1).
     fn recon_step(&mut self, now: u64) -> bool {
         if self.boot < BOOT_STATE {
             return false;
@@ -2237,6 +2297,12 @@ impl HlGatewayArm {
                 return true;
             }
             return false;
+        }
+        // XH5b-1: the worth's spot half, one answer after the sheet it pairs
+        // with: once a sheet — a failed one waits for the next sheet — so it
+        // starves no other read.
+        if now >= self.next_spot_ns {
+            return self.issue_read(READ_SPOT, now);
         }
         // A re-read (a "gone" inference, a gap) goes before a periodic
         // sheet — it decides orders thought gone — unless the sheet is a
@@ -2401,15 +2467,28 @@ impl HlGatewayArm {
         };
         // XH4e: and the day's spend read (S7-L1 gap A: the router seeds
         // from this — its day cap must not restart at a full allowance).
+        // XH5b-1: and, on the slot's own account, the worth's spot half and
+        // an anchor — the session bound is judged from the first
+        // reconciliation on.
+        let worth_known = !self.cfg.own_account || (self.spot_ns != 0 && self.anchored);
         let reconciled = self.boot == BOOT_DONE
             && !self.boot_held
             && self.state_ok
             && self.orders_ok
-            && self.day_done;
+            && self.day_done
+            && worth_known;
         let age = if self.last_agree_ns == 0 {
             0
         } else {
             now.saturating_sub(self.last_agree_ns).max(1)
+        };
+        // E7: the session bound, judged on the slot's own account once its
+        // worth is complete (XH5b-1); unjudged, the reading is 0.
+        let judged = self.anchored && self.seeded && self.cfg.own_account && self.spot_ns != 0;
+        let delta = if judged {
+            self.worth_1e8().saturating_sub(self.anchor_1e8) / WIRE_PER_ENGINE
+        } else {
+            0
         };
         HaltSignal::new(
             gap,
@@ -2420,10 +2499,7 @@ impl HlGatewayArm {
             reconciled,
             age,
         )
-        .with_pnl(
-            self.anchored && self.seeded && self.cfg.own_account,
-            (self.account_1e8 - self.anchor_1e8) / WIRE_PER_ENGINE,
-        )
+        .with_pnl(judged, delta)
         .with_alo_reject_permille(self.alo_reject_permille())
         .with_gateway_halted(self.end.stats.halt_reason() != HALT_NONE)
     }
@@ -2940,7 +3016,7 @@ mod tests {
     use super::*;
     use crate::cmd::{
         CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT,
-        CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+        CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
     };
     use crate::event::{
         EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT, SLOT_FOREIGN,
@@ -3048,12 +3124,15 @@ mod tests {
             CMD_READ_ORDERS => READ_ORDERS,
             CMD_READ_LIMIT => READ_LIMIT,
             CMD_READ_DAY => READ_DAY,
+            CMD_READ_SPOT => READ_SPOT,
             _ => READ_STATE,
         };
         ExecEvent {
             client_oid: c.client_oid,
             venue_ms,
             px_1e8: account_1e8,
+            // XH5b-1: a spot sheet that lists USDC.
+            sz_1e8: i64::from(c.kind == CMD_READ_SPOT),
             kind: EV_READ_DONE,
             reason: read,
             slot: c.slot,
@@ -3193,12 +3272,29 @@ mod tests {
         }
     }
 
-    /// Answer the sheet (account 1 000 USD at venue ms 1, flat) and the
-    /// orders; up to the budget read, issued.
+    /// XH5b-1: the worth's spot half, read right after a sheet on the
+    /// slot's own account — answered with `usdc_1e8` (none on a shared
+    /// account).
+    fn spot(arm: &mut HlGatewayArm, v: &mut Venue, at: u64, usdc_1e8: i64) {
+        if !arm.cfg.own_account {
+            return;
+        }
+        let _ = arm.idle(at);
+        let sp = v
+            .take(CMD_READ_SPOT)
+            .expect("the spot sheet after the perp one");
+        v.send(read_end(&sp, usdc_1e8, 0));
+        let _ = arm.idle(at);
+    }
+
+    /// Answer the sheet (account 1 000 USD at venue ms 1, flat), its spot
+    /// half on the slot's own account ($0 USDC) and the orders; up to the
+    /// budget read, issued.
     fn to_budget(c: &ArmCfg) -> (HlGatewayArm, Venue, u64, HlCmd) {
         let (mut arm, mut v, t, st) = to_sheet(c);
         v.send(read_end(&st, 1_000 * E8, 1));
         let _ = arm.idle(t);
+        spot(&mut arm, &mut v, t, 0);
         let od = v.take(CMD_READ_ORDERS).expect("the orders after the sheet");
         v.send(read_end(&od, 0, 0));
         let _ = arm.idle(t);
@@ -3240,8 +3336,9 @@ mod tests {
         c
     }
 
-    /// The periodic sheet then orders read at `at`, answered (the sheet
-    /// with `pos`, the orders listing `listed`).
+    /// The periodic sheet, its spot half ($0 USDC: the worth unchanged)
+    /// and the orders read at `at`, answered (the sheet with `pos`, the
+    /// orders listing `listed`).
     fn recon(
         arm: &mut HlGatewayArm,
         v: &mut Venue,
@@ -3256,6 +3353,7 @@ mod tests {
         }
         v.send(read_end(&st, 1_000 * E8, 2));
         let _ = arm.idle(at);
+        spot(arm, v, at, 0);
         let od = v.take(CMD_READ_ORDERS).expect("the orders");
         let mut k = 0usize;
         while k < listed.len() {
@@ -3924,6 +4022,7 @@ mod tests {
         let st = v.take(CMD_READ_STATE).expect("the sheet");
         v.send(read_end(&st, 1_000 * E8, 2));
         let _ = arm.idle(t + 5 * S);
+        spot(&mut arm, &mut v, t + 5 * S, 0);
         let od = v.take(CMD_READ_ORDERS).expect("the orders");
         v.send(open_order(&od, SLOT, 999));
         v.send(open_order(&od, SLOT_FOREIGN, 0));
@@ -4007,6 +4106,7 @@ mod tests {
         v.send(position(&st, E8 / 2, 50 * E8 as u64));
         v.send(read_end(&st, 1_000 * E8, 1));
         let _ = arm.idle(t);
+        spot(&mut arm, &mut v, t, 0);
         let od = v.take(CMD_READ_ORDERS).expect("the orders");
         v.send(read_end(&od, 0, 0));
         let _ = arm.idle(t);
@@ -4252,6 +4352,11 @@ mod tests {
         let _ = arm.idle(t);
         assert_eq!(arm.unknown_positions, 0, "another slot's perp");
         assert_eq!(arm.signal(t).pnl_judged, 0);
+        assert!(
+            v.take(CMD_READ_SPOT).is_none(),
+            "XH5b-1: a shared account's worth is every slot's — never read"
+        );
+        assert!(v.take(CMD_READ_ORDERS).is_some(), "the orders at once");
         assert_eq!(
             arm.fresh_anchor_1e6(),
             None,
@@ -4433,6 +4538,7 @@ mod tests {
         let st = v.take(CMD_READ_STATE).expect("the sheet");
         v.send(read_end(&st, 1_000 * E8, 2));
         let _ = arm.idle(t + 5 * S);
+        spot(&mut arm, &mut v, t + 5 * S, 0);
         let od = v.take(CMD_READ_ORDERS).expect("the orders");
         v.send(ExecEvent {
             kind: EV_GAP,
@@ -4492,6 +4598,9 @@ mod tests {
                 sheets += 1;
                 v.send(read_end(&st, 1_000 * E8, 2));
             }
+            if let Some(sp) = v.take(CMD_READ_SPOT) {
+                v.send(read_end(&sp, 0, 0));
+            }
             if let Some(od) = v.take(CMD_READ_ORDERS) {
                 v.send(ExecEvent {
                     kind: EV_GAP,
@@ -4540,6 +4649,9 @@ mod tests {
             let _ = arm.idle(at);
             if let Some(st) = v.take(CMD_READ_STATE) {
                 v.send(read_end(&st, 1_000 * E8, 2));
+            }
+            if let Some(sp) = v.take(CMD_READ_SPOT) {
+                v.send(read_end(&sp, 0, 0));
             }
             if let Some(od) = v.take(CMD_READ_ORDERS) {
                 v.send(ExecEvent {
@@ -5208,6 +5320,7 @@ mod tests {
             !r.orders_ok && r.orders_ns == 0,
             "the orders not read yet: {r:?}"
         );
+        spot(&mut arm, &mut v, t, 0);
         let od = v.take(CMD_READ_ORDERS).expect("the orders after the sheet");
         v.send(read_end(&od, 0, 0));
         let _ = arm.idle(t);
@@ -5238,5 +5351,293 @@ mod tests {
         );
         let r = arm.recon_view();
         assert!(!r.state_ok && r.drift_hw_1e6 > 0, "two sheets: {r:?}");
+    }
+
+    /// XH5b-1: on the slot's own account the worth is the perp sheet's
+    /// value plus the spot sheet's USDC. The spot read goes right after
+    /// the sheet, before the orders; the anchor waits for it, and so does
+    /// the reconciliation. A later period's P&L moves with both halves.
+    #[test]
+    fn the_worth_adds_the_spot_usdc_and_the_anchor_waits_for_it() {
+        let (mut arm, mut v, t, st) = to_sheet(&cfg());
+        v.send(read_end(&st, 0, 1));
+        let _ = arm.idle(t);
+        assert!(!arm.anchored, "half a worth anchors nothing");
+        assert!(v.take(CMD_READ_ORDERS).is_none(), "the spot half first");
+        let sp = v
+            .take(CMD_READ_SPOT)
+            .expect("the spot sheet after the perp one");
+        assert_eq!(sp.slot, SLOT);
+        v.send(read_end(&sp, 1_000 * E8, 0));
+        let _ = arm.idle(t);
+        assert_eq!(
+            arm.fresh_anchor_1e6(),
+            Some(1_000_000_000),
+            "$0 on the perps (spot margins them) and $1 000 USDC"
+        );
+        let od = v.take(CMD_READ_ORDERS).expect("the orders after it");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget");
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let day = v.take(CMD_READ_DAY).expect("the day");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t);
+        let sig = arm.signal(t);
+        assert_eq!(
+            (sig.reconciled, sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, 1, 0)
+        );
+        // A period on: $2 of unrealised gain on the perp sheet, then $3
+        // less USDC (a loss settled to spot).
+        let at = t + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the sheet");
+        v.send(read_end(&st, 2 * E8, 2));
+        let _ = arm.idle(at);
+        assert_eq!(
+            arm.signal(at).pnl_delta_usd_1e6,
+            2_000_000,
+            "the last spot half until the next one lands"
+        );
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half again");
+        v.send(read_end(&sp, 997 * E8, 0));
+        let _ = arm.idle(at);
+        assert_eq!(arm.signal(at).pnl_delta_usd_1e6, -1_000_000);
+    }
+
+    /// XH5b-1: a restored anchor is never judged against half a worth —
+    /// the perp half alone would read the whole spot balance as a loss.
+    #[test]
+    fn a_restored_anchor_is_not_judged_on_half_a_worth() {
+        let mut c = cfg();
+        c.anchor_1e6 = 1_000_000_000;
+        let (mut arm, mut v, t, st) = to_sheet(&c);
+        v.send(read_end(&st, 0, 1));
+        let _ = arm.idle(t);
+        assert_eq!(
+            arm.signal(t).pnl_judged,
+            0,
+            "the perp half alone would read −$1 000"
+        );
+        let sp = v.take(CMD_READ_SPOT).expect("the spot sheet");
+        v.send(read_end(&sp, 990 * E8, 0));
+        let _ = arm.idle(t);
+        let sig = arm.signal(t);
+        assert_eq!((sig.pnl_judged, sig.pnl_delta_usd_1e6), (1, -10_000_000));
+        assert_eq!(arm.fresh_anchor_1e6(), None, "restored, not taken");
+    }
+
+    /// XH5b-1: a failed spot read — an end of another kind, or no answer
+    /// past the post timeout and its grace — waits for the next perp
+    /// sheet: one spot read a sheet, so it never storms, at skew 0 too; the
+    /// orders go meanwhile.
+    #[test]
+    fn a_failed_spot_read_waits_for_the_next_sheet() {
+        let mut c = cfg();
+        c.skew_ms = 0;
+        let (mut arm, mut v, t) = booted_with(&c);
+        let at = t + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the sheet");
+        v.send(read_end(&st, 1_000 * E8, 2));
+        let _ = arm.idle(at);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half");
+        v.send(ExecEvent {
+            reason: READ_STATE,
+            ..read_end(&sp, 0, 0)
+        });
+        let _ = arm.idle(at);
+        let od = v.take(CMD_READ_ORDERS).expect("the orders meanwhile");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(at + 1);
+        assert!(
+            v.take(CMD_READ_SPOT).is_none(),
+            "not before the next sheet, skew 0 or not"
+        );
+        let at = at + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the next sheet");
+        v.send(read_end(&st, 1_000 * E8, 3));
+        let _ = arm.idle(at);
+        assert!(v.take(CMD_READ_SPOT).is_some(), "asked again with it");
+        // Unanswered past the post timeout and its grace.
+        let _ = arm.idle(at + 5 * S + READ_GRACE_NS + 1);
+        assert_eq!(arm.counters().reads_failed, 2);
+        assert!(
+            v.take(CMD_READ_SPOT).is_none(),
+            "again only with the sheet after"
+        );
+    }
+
+    /// XH5b-1: a spot sheet that lists no USDC answers nothing — never a
+    /// $0 half to anchor on (`account_view`'s rule): a failed read.
+    #[test]
+    fn a_spot_sheet_without_usdc_is_a_failed_read() {
+        let (mut arm, mut v, t, st) = to_sheet(&cfg());
+        v.send(read_end(&st, 600 * E8, 1));
+        let _ = arm.idle(t);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot sheet");
+        v.send(ExecEvent {
+            sz_1e8: 0,
+            ..read_end(&sp, 0, 0)
+        });
+        let _ = arm.idle(t);
+        assert!(!arm.anchored, "never a $600 anchor on half a worth");
+        assert_eq!(
+            (arm.counters().reads_failed, arm.counters().spot_reads),
+            (1, 0)
+        );
+        assert_eq!(arm.fresh_anchor_1e6(), None);
+    }
+
+    /// XH5b-1: the router's first-reconciliation latch waits for the worth
+    /// — a boot whose spot read fails reads the sheet, the orders, the
+    /// budget and the day, and still reports nothing reconciled, no
+    /// agreement and nothing judged until a spot half lands.
+    #[test]
+    fn the_first_reconciliation_waits_for_the_spot_half() {
+        let (mut arm, mut v, t, st) = to_sheet(&cfg());
+        v.send(read_end(&st, 0, 1));
+        let _ = arm.idle(t);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot sheet");
+        v.send(ExecEvent {
+            kind: EV_READ_FAILED,
+            ..read_end(&sp, 0, 0)
+        });
+        let _ = arm.idle(t);
+        let od = v.take(CMD_READ_ORDERS).expect("the orders");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget");
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let day = v.take(CMD_READ_DAY).expect("the day");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t);
+        let sig = arm.signal(t);
+        assert_eq!(
+            (
+                sig.reconciled,
+                sig.recon_age_ns,
+                sig.pnl_judged,
+                sig.pnl_delta_usd_1e6
+            ),
+            (0, 0, 0, 0),
+            "no worth: nothing reconciled, no agreement, nothing judged"
+        );
+        assert_eq!(arm.fresh_anchor_1e6(), None);
+        let at = t + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the next sheet");
+        v.send(read_end(&st, 0, 2));
+        let _ = arm.idle(at);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half with it");
+        v.send(read_end(&sp, 1_000 * E8, 0));
+        let _ = arm.idle(at);
+        let sig = arm.signal(at);
+        assert_eq!((sig.reconciled, sig.pnl_judged), (1, 1));
+        assert_eq!(arm.fresh_anchor_1e6(), Some(1_000_000_000));
+    }
+
+    /// XH5b-1: a $0 worth anchors nothing (an unfunded account, the
+    /// blocking arm's E7 rule) — no first reconciliation, nothing judged or
+    /// offered — until a positive worth lands.
+    #[test]
+    fn a_zero_worth_anchors_nothing_until_the_account_is_funded() {
+        let (mut arm, mut v, t, st) = to_sheet(&cfg());
+        v.send(read_end(&st, 0, 1));
+        let _ = arm.idle(t);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot sheet");
+        v.send(read_end(&sp, 0, 0));
+        let _ = arm.idle(t);
+        assert!(!arm.anchored, "$0 and $0: nothing to anchor");
+        assert_eq!(arm.fresh_anchor_1e6(), None);
+        let od = v.take(CMD_READ_ORDERS).expect("the orders");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget");
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let day = v.take(CMD_READ_DAY).expect("the day");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t);
+        let sig = arm.signal(t);
+        assert_eq!(
+            (sig.reconciled, sig.pnl_judged),
+            (0, 0),
+            "no anchor: no first reconciliation"
+        );
+        // Funded: the next complete worth anchors.
+        let at = t + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the next sheet");
+        v.send(read_end(&st, 0, 2));
+        let _ = arm.idle(at);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half");
+        v.send(read_end(&sp, 500 * E8, 0));
+        let _ = arm.idle(at);
+        assert_eq!(arm.fresh_anchor_1e6(), Some(500_000_000));
+        let sig = arm.signal(at);
+        assert_eq!(
+            (sig.reconciled, sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, 1, 0)
+        );
+    }
+
+    /// XH5b-1: the spot half goes ahead of a pending re-read, which goes
+    /// one answer later.
+    #[test]
+    fn the_spot_half_goes_ahead_of_a_pending_re_read() {
+        let (mut arm, mut v, t) = booted();
+        let at = t + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the sheet");
+        v.send(ExecEvent {
+            kind: EV_GAP,
+            ..ExecEvent::default()
+        });
+        v.send(read_end(&st, 1_000 * E8, 2));
+        let _ = arm.idle(at);
+        assert!(arm.reread, "the gap asks for a re-read");
+        assert!(v.take(CMD_READ_ORDERS).is_none(), "not yet");
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half first");
+        v.send(read_end(&sp, 0, 0));
+        let _ = arm.idle(at);
+        assert!(v.take(CMD_READ_ORDERS).is_some(), "then the re-read");
+    }
+
+    /// XH5b-1: the agreement needs the worth's spot half fresh, as it
+    /// needs the sheet and the orders — a spot read that keeps failing
+    /// ages it (the router's `ReconStale`), while the P&L stays judged on
+    /// the last worth read.
+    #[test]
+    fn an_agreement_needs_a_fresh_spot_half() {
+        let (mut arm, mut v, t) = booted();
+        // Every spot read fails from here; the sheets and the orders go on.
+        let mut at = t + 5 * S;
+        while at < t + 30 * S {
+            let _ = arm.idle(at);
+            if let Some(st) = v.take(CMD_READ_STATE) {
+                v.send(read_end(&st, 1_000 * E8, 2));
+            }
+            if let Some(sp) = v.take(CMD_READ_SPOT) {
+                v.send(ExecEvent {
+                    kind: EV_READ_FAILED,
+                    ..read_end(&sp, 0, 0)
+                });
+            }
+            if let Some(od) = v.take(CMD_READ_ORDERS) {
+                v.send(read_end(&od, 0, 0));
+            }
+            at += S;
+        }
+        let sig = arm.signal(at);
+        assert!(
+            sig.recon_age_ns >= 15 * S,
+            "the age runs from the last agreement with a fresh spot half"
+        );
+        assert_eq!(sig.pnl_judged, 1, "judged on the last worth read");
     }
 }

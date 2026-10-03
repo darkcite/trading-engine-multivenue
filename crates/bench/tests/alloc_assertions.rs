@@ -14095,8 +14095,10 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// charged, the sweep's cancels by the gateway's word), every
 /// seventeenth place or modify refused `THROTTLED` (taken back from the
 /// budget), and, after the boot — its own window — the day's spend (a
-/// page that moves, then one that adds nothing past its start); the halt
-/// signals and the cancel-all state; every out-queue drained as the
+/// page that moves, then one that adds nothing past its start); XH5b-1:
+/// the spot sheet after each sheet ($500 USDC; every sixth failing, every
+/// seventh listing no USDC — both refused); the halt signals and the
+/// cancel-all state; every out-queue drained as the
 /// engine does. Timers run on the real clock (1 ms windows): the warm-up
 /// runs until every path has run, and the window must run each again.
 #[test]
@@ -14111,14 +14113,15 @@ fn hl_gateway_arm_is_zero_alloc() {
     use exec_hyperliquid::arm::{ArmCfg, ArmCounters, HlGatewayArm, PerpBind, ARM_PERPS};
     use exec_hyperliquid::cmd::{
         CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
-        CMD_READ_STATE,
+        CMD_READ_SPOT, CMD_READ_STATE,
     };
     use exec_hyperliquid::deadman::DeadManCfg;
     use exec_hyperliquid::event::{
         ExecEvent, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_POST_ITEM, EVF_RESTING, EV_ACK,
         EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_OPEN_ORDER, EV_POSITION,
         EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
-        READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_NOT_FOUND, REASON_THROTTLED,
+        READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE, REASON_NOT_FOUND,
+        REASON_THROTTLED,
     };
     use exec_hyperliquid::gateway::HlGatewayEnd;
     use exec_hyperliquid::hl_duplex;
@@ -14151,6 +14154,10 @@ fn hl_gateway_arm_is_zero_alloc() {
         /// XH4e: budget reads and day pages answered.
         limits: u64,
         days: u64,
+        /// XH5b-1: spot sheets answered, and those the arm must refuse
+        /// (every sixth failing, every seventh listing no USDC).
+        spots: u64,
+        spot_refused: u64,
     }
 
     /// The gateway's end: every command answered by the script.
@@ -14372,6 +14379,21 @@ fn hl_gateway_arm_is_zero_alloc() {
                         ..end
                     }));
                 }
+                // XH5b-1: the worth's spot half, $500 USDC — every sixth
+                // failing, every seventh listing no USDC.
+                CMD_READ_SPOT => {
+                    s.spots += 1;
+                    let failed = s.spots % 6 == 0;
+                    let listed = s.spots % 7 != 0;
+                    s.spot_refused += u64::from(failed || !listed);
+                    assert!(gw.evt.emit(&ExecEvent {
+                        kind: if failed { EV_READ_FAILED } else { EV_READ_DONE },
+                        reason: READ_SPOT,
+                        px_1e8: if listed { 50_000_000_000 } else { 0 },
+                        sz_1e8: i64::from(listed),
+                        ..end
+                    }));
+                }
                 // The dead man's posts.
                 _ => assert!(gw.evt.emit(&ExecEvent {
                     kind: EV_ACK,
@@ -14481,7 +14503,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
 
     /// The paths the window must run again, each counted.
-    fn paths(c: &ArmCounters, s: &Script) -> [u64; 15] {
+    fn paths(c: &ArmCounters, s: &Script) -> [u64; 17] {
         [
             c.fills,
             c.alo_rejects,
@@ -14498,6 +14520,8 @@ fn hl_gateway_arm_is_zero_alloc() {
             c.throttled,
             c.refunded,
             c.refused_budget,
+            c.spot_reads,
+            s.spot_refused,
         ]
     }
 
@@ -14540,6 +14564,8 @@ fn hl_gateway_arm_is_zero_alloc() {
         flat: true,
         limits: 0,
         days: 0,
+        spots: 0,
+        spot_refused: 0,
     };
     let mut acc = 0u64;
     let _ = arm.on_idle();
@@ -14655,6 +14681,13 @@ fn gate96_venue_helper() {
                 r#"{{"type":"frontendOpenOrders","data":[{{"coin":"ETH","limitPx":"2500.0","oid":{k},"origSz":"0.01","side":"B","sz":"0.01","timestamp":1,"isTrigger":false,"cloid":"{c}"}},{{"coin":"ETH","limitPx":"2600.0","oid":7,"origSz":"0.01","side":"A","sz":"0.01","timestamp":1,"isTrigger":false}}]}}"#
             ));
         }
+        // XH5b-1: the spot sheet.
+        if s.body.contains("spotClearinghouseState") {
+            return Answer::Info(
+                r#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"USDC","token":0,"total":"250.25","hold":"0.0","entryNtl":"0.0"},{"coin":"HYPE","token":150,"total":"1.5","hold":"0.0","entryNtl":"40.0"}]}}"#
+                    .to_string(),
+            );
+        }
         if s.body.contains("userRateLimit") {
             return Answer::Info(
                 r#"{"type":"userRateLimit","data":{"cumVlm":"1500.5","nRequestsUsed":2890,"nRequestsCap":11500,"nRequestsSurplus":7}}"#
@@ -14736,9 +14769,10 @@ fn gate96_venue_helper() {
 /// the dedupe rings, the events — is 0 B: a regression in the gateway
 /// shows as a thirteenth. After the rounds, measured alone, XH4e's two
 /// reads: the address budget (`userRateLimit`) and the day's fills
-/// (`userFillsByTime`, its rows summed in place — no row table), each
-/// posted alone, unsigned, and answered by one end — exactly 4
-/// allocations, rustls' again (two records sealed, two opened); no sweep
+/// (`userFillsByTime`, its rows summed in place — no row table), and
+/// XH5b-1's spot sheet (`spotClearinghouseState`, scanned into a fixed
+/// table), each posted alone, unsigned, and answered by one end — exactly
+/// 6 allocations, rustls' again (three records sealed, three opened); no sweep
 /// has been asked yet, so none can land in that window. XH4f (D9), measured
 /// alone: two ALO places carrying a 50 ms TTL (one post: one rests, one
 /// crosses; the helper pushes an `orderUpdates` row and a fill), then at the
@@ -14756,7 +14790,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     use exec_gateway::Idle;
     use exec_hyperliquid::event::{
         ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE,
-        EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT,
+        EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_SPOT,
     };
     use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
     use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
@@ -14769,8 +14803,9 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     /// One sweep round: the read and the cancel sealed, their answers
     /// opened.
     const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
-    /// XH4e: the budget and day reads — each sealed, each answer opened.
-    const RUSTLS_ALLOCS_PER_BUDGET_READS: u64 = 4;
+    /// XH4e: the budget and day reads, and XH5b-1's spot sheet — each
+    /// sealed, each answer opened.
+    const RUSTLS_ALLOCS_PER_ACCOUNT_READS: u64 = 6;
     /// XH4f: the places' post and the TTL cancel sealed; the places'
     /// answer, the two pushes and the cancel's answer opened.
     const RUSTLS_ALLOCS_PER_TTL: u64 = 6;
@@ -14915,11 +14950,11 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     let posts = eng.stats.io()[0];
 
     // XH4e, measured alone — before any sweep is asked, so no sweep round
-    // can land in the window: the budget read and the day read, each
-    // posted alone, unsigned; their answers scanned in place into one end
-    // each.
+    // can land in the window: the budget read, the day read and XH5b-1's
+    // spot sheet, each posted alone, unsigned; their answers scanned in
+    // place into one end each.
     let sweeps0 = gw.counters().sweep_rounds;
-    let mut ends = [(0u8, 0u64, 0i64); 2];
+    let mut ends = [(0u8, 0u64, 0i64); 3];
     let mut ne = 0usize;
     let g = AllocGuard::new();
     assert!(eng.cmd.push(&HlCmd::read_limit(6, 9_000_001)));
@@ -14929,15 +14964,16 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         1_700_000_000_000,
         1_700_000_600_000
     )));
+    assert!(eng.cmd.push(&HlCmd::read_spot(6, 9_000_003)));
     let t = std::time::Instant::now();
-    while ne < 2 {
+    while ne < 3 {
         assert!(
             t.elapsed() < std::time::Duration::from_secs(5),
-            "gate 96: the budget and day reads never answered"
+            "gate 96: the budget, day and spot reads never answered"
         );
         gw.turn();
         while let Some(e) = eng.evt.pop() {
-            if e.kind == EV_READ_DONE && ne < 2 {
+            if e.kind == EV_READ_DONE && ne < 3 {
                 ends[ne] = (e.reason, e.aux, e.px_1e8);
                 ne += 1;
             }
@@ -15060,15 +15096,17 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         ends,
         [
             (READ_LIMIT, 2_890, 150_050_000_000),
-            (READ_DAY, 2, 5_000_000_000)
+            (READ_DAY, 2, 5_000_000_000),
+            (READ_SPOT, 2, 25_025_000_000)
         ],
-        "the budget's figures; the day's two rows of ours, $50"
+        "the budget's figures; the day's two rows of ours, $50; the spot sheet's USDC, \
+         $250.25 over two rows"
     );
     assert_eq!(
-        read_allocs, RUSTLS_ALLOCS_PER_BUDGET_READS,
-        "HL gateway budget and day reads: {read_allocs} allocations ({read_bytes} B) — \
-         rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_BUDGET_READS} (two \
-         sealed, two opened); anything above is the gateway's"
+        read_allocs, RUSTLS_ALLOCS_PER_ACCOUNT_READS,
+        "HL gateway budget, day and spot reads: {read_allocs} allocations ({read_bytes} B) \
+         — rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_ACCOUNT_READS} \
+         (three sealed, three opened); anything above is the gateway's"
     );
     assert_eq!(
         ttl,

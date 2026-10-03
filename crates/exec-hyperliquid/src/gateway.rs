@@ -85,8 +85,9 @@
 //!
 //! **Rates (XH4e).** Every post is charged to a one-minute window of the
 //! venue's IP weight — an action 1 + ⌊n/40⌋, a read its REST weight
-//! (`clearinghouseState` 2, the others 20, `userFillsByTime` 1 more per
-//! 20 rows it returns) — and every WebSocket frame (posts, pings, pongs,
+//! (`clearinghouseState` and `spotClearinghouseState` 2, the others 20,
+//! `userFillsByTime` 1 more per 20 rows it returns) — and every WebSocket
+//! frame (posts, pings, pongs,
 //! subscribes) to a window of its messages, each against this gateway's
 //! share ([`IP_WEIGHT_SHARE`], [`WS_MSG_SHARE`]: the host's other HL
 //! clients share the venue's per-IP limits). At 80 % of either share,
@@ -142,7 +143,7 @@ use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
     HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE, CMD_READ_DAY,
-    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
 };
 use crate::event::REASON_NOT_FOUND;
 use crate::event::{
@@ -150,9 +151,9 @@ use crate::event::{
     EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_CANCELED, EV_FILL,
     EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED,
     EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT,
-    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED,
-    REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_SETTLEMENT,
-    REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
+    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
+    REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT,
+    REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
@@ -162,7 +163,8 @@ use crate::nonce::{now_ms, NonceSource, SharedNonce};
 use crate::orderupd::{scan_order_updates, OrderUpdate};
 use crate::recon::{
     fills_by_time_request, open_orders_request, perp_state_request, scan_open_orders,
-    scan_perp_state, OpenOrder, PerpPosition, MAX_OPEN_ORDERS,
+    scan_perp_state, scan_spot_state, spot_state_request, OpenOrder, PerpPosition, SpotBalance,
+    MAX_OPEN_ORDERS, MAX_SPOT_BALANCES,
 };
 use crate::request::{
     batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
@@ -253,22 +255,37 @@ const BUSY_RTT_NS: u64 = 1_000_000_000;
 /// XH4e — a venue rate-limit answer marks the word this long.
 const RATE_LIMITED_NS: u64 = 10_000_000_000;
 /// XH4e — a read's IP weight: the venue's REST weights (its weighting of
-/// WebSocket-posted info is unmeasured), `clearinghouseState` 2, the
-/// others 20.
+/// WebSocket-posted info is unmeasured), `clearinghouseState` and
+/// `spotClearinghouseState` (XH5b-1) 2, the others 20.
 const READ_WEIGHT: u32 = 20;
 const STATE_READ_WEIGHT: u32 = 2;
 
+/// A read command's IP weight (see [`READ_WEIGHT`]).
+#[inline(always)]
+const fn read_ip_weight(kind: u8) -> u32 {
+    if kind == CMD_READ_STATE || kind == CMD_READ_SPOT {
+        STATE_READ_WEIGHT
+    } else {
+        READ_WEIGHT
+    }
+}
+
 /// XH4f — the IP weight a minute an arm's periodic reads spend: the sheet
-/// and the orders every `recon_ms`, the budget every `limit_ms` (the XH4e
-/// amendment's arithmetic, pinned where an arm is composed). Zero periods
-/// read as unbounded.
+/// and the orders every `recon_ms` — and the spot sheet with them when
+/// `spot` (an account of the slot's own, XH5b-1) — the budget every
+/// `limit_ms` (the XH4e amendment's arithmetic, pinned where an arm is
+/// composed). Zero periods read as unbounded.
 #[must_use]
-pub const fn read_weight_per_min(recon_ms: u64, limit_ms: u64) -> u64 {
+pub const fn read_weight_per_min(recon_ms: u64, limit_ms: u64, spot: bool) -> u64 {
     if recon_ms == 0 || limit_ms == 0 {
         return u64::MAX;
     }
-    (60_000 / recon_ms) * (READ_WEIGHT + STATE_READ_WEIGHT) as u64
-        + (60_000 / limit_ms) * READ_WEIGHT as u64
+    let mut period = read_ip_weight(CMD_READ_STATE) + read_ip_weight(CMD_READ_ORDERS);
+    if spot {
+        period += read_ip_weight(CMD_READ_SPOT);
+    }
+    (60_000 / recon_ms) * period as u64
+        + (60_000 / limit_ms) * read_ip_weight(CMD_READ_LIMIT) as u64
 }
 /// The sweep machine's phases.
 const SW_IDLE: u8 = 0;
@@ -783,6 +800,7 @@ const fn read_code(kind: u8) -> u8 {
         CMD_READ_ORDERS => READ_ORDERS,
         CMD_READ_LIMIT => READ_LIMIT,
         CMD_READ_DAY => READ_DAY,
+        CMD_READ_SPOT => READ_SPOT,
         _ => READ_STATE,
     }
 }
@@ -916,6 +934,8 @@ struct Router {
     /// Read answers are scanned into these (XH4d).
     open_rows: Box<[OpenOrder; MAX_OPEN_ORDERS]>,
     positions: Box<[PerpPosition; MAX_POSITIONS]>,
+    /// XH5b-1: the spot sheet's rows (8 KiB, boxed once).
+    spot_rows: Box<[SpotBalance; MAX_SPOT_BALANCES]>,
     /// The sweep read's orders of ours, and its outcome (`SWEEP_*`).
     sweep_hits: Box<[SweepHit; MAX_OPEN_ORDERS]>,
     sweep_n: usize,
@@ -962,6 +982,7 @@ impl Router {
             healthy: false,
             open_rows: boxed_array(OpenOrder::default()),
             positions: boxed_array(PerpPosition::default()),
+            spot_rows: boxed_array(SpotBalance::default()),
             sweep_hits: boxed_array(SweepHit::default()),
             sweep_n: 0,
             sweep_outcome: SWEEP_NONE,
@@ -1124,6 +1145,7 @@ impl Router {
             CMD_READ_ORDERS => self.read_orders(&item, body, now),
             CMD_READ_LIMIT => self.read_limit(&item, body, now),
             CMD_READ_DAY => self.read_day(&item, body, now),
+            CMD_READ_SPOT => self.read_spot(&item, body, now),
             _ => self.read_state(&item, body, now),
         };
         if ok {
@@ -1232,6 +1254,39 @@ impl Router {
         let mut end = read_end(item, EV_READ_DONE, READ_STATE, n as u64, now);
         end.px_1e8 = value;
         end.venue_ms = u64_field(data, b"\"time\"").unwrap_or(0);
+        emit_to(&mut self.evt, &end);
+        true
+    }
+
+    /// XH5b-1 — `{"type":"spotClearinghouseState","data":{…}}` → one
+    /// `EV_READ_DONE` (`READ_SPOT`): `px_1e8` = the USDC `total` (USD ×1e8),
+    /// `sz_1e8` = 1 when the sheet lists USDC — 0 when it lists none, which
+    /// the arm refuses as no worth (`recon::account_view`'s rule: nothing to
+    /// anchor) — `aux` = the rows, scanned in place into a fixed table.
+    /// `false`: it does not scan (more rows than the table holds included).
+    fn read_spot(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
+        let Some((s, e)) = object_field(body, b"\"data\"") else {
+            return false;
+        };
+        let data = &body[s..e];
+        let Ok(n) = scan_spot_state(data, &mut self.spot_rows[..]) else {
+            return false;
+        };
+        let n = n.min(self.spot_rows.len());
+        let mut usdc_1e8 = 0i64;
+        let mut listed = false;
+        let mut i = 0usize;
+        while i < n {
+            let b = &self.spot_rows[i];
+            if b.coin.of(data) == b"USDC" {
+                usdc_1e8 = b.total_1e8;
+                listed = true;
+            }
+            i += 1;
+        }
+        let mut end = read_end(item, EV_READ_DONE, READ_SPOT, n as u64, now);
+        end.px_1e8 = usdc_1e8;
+        end.sz_1e8 = i64::from(listed);
         emit_to(&mut self.evt, &end);
         true
     }
@@ -1550,7 +1605,8 @@ pub struct HlGateway {
 // tables are on the heap): 7 936 B released at XH4e, 8 000 B with debug
 // assertions (mio 0.8's debug-only selector ids in its `Poll`s and
 // `TcpStream`s), a few words more since XH4f's two boxed Router tables and
-// two counters, one more since XH4h's `NonceSource` — held under 8 KiB: a
+// two counters, one more since XH4h's `NonceSource`, one more since XH5b-1's
+// spot table — held under 8 KiB: a
 // bound, not a pin, so a rustls or mio
 // bump does not break the build while the struct stays small.
 const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
@@ -1923,13 +1979,7 @@ impl HlGateway {
     /// (n its items), a read its REST weight.
     fn charge_ip(&mut self, id: u64, now: u64) {
         let w = match self.rt.pending.get(id) {
-            Some(rec) if usize::from(rec.class) == CLASS_READ => {
-                if rec.items[0].kind == CMD_READ_STATE {
-                    STATE_READ_WEIGHT
-                } else {
-                    READ_WEIGHT
-                }
-            }
+            Some(rec) if usize::from(rec.class) == CLASS_READ => read_ip_weight(rec.items[0].kind),
             Some(rec) => 1 + u32::from(rec.n) / 40,
             None => 1,
         };
@@ -2330,6 +2380,7 @@ impl HlGateway {
             CMD_READ_ORDERS => open_orders_request(dst, master),
             CMD_READ_LIMIT => rate_limit_request(dst, master),
             CMD_READ_DAY => fills_by_time_request(dst, master, start_ms, end_ms),
+            CMD_READ_SPOT => spot_state_request(dst, master),
             _ => perp_state_request(dst, master),
         }
         .ok()?;
@@ -2689,12 +2740,25 @@ mod tests {
     }
 
     /// XH4f: the reads' steady weight — XH4d's 5 s periods alone were 71 %
-    /// of the share (busy for good); 10 s leaves them at 38 %.
+    /// of the share (busy for good); 10 s leaves them at 38 %. XH5b-1: the
+    /// spot sheet adds 2 a period — 164 at 10 s (41 %), 68 at XH5c's 30 s.
     #[test]
     fn the_periodic_reads_weigh_what_the_amendment_says() {
-        assert_eq!(read_weight_per_min(5_000, 60_000), 284);
-        assert_eq!(read_weight_per_min(10_000, 60_000), 152);
-        assert_eq!(read_weight_per_min(0, 60_000), u64::MAX);
+        assert_eq!(read_weight_per_min(5_000, 60_000, false), 284);
+        assert_eq!(read_weight_per_min(10_000, 60_000, false), 152);
+        assert_eq!(read_weight_per_min(10_000, 60_000, true), 164);
+        assert_eq!(read_weight_per_min(30_000, 60_000, true), 68);
+        assert_eq!(read_weight_per_min(0, 60_000, true), u64::MAX);
+        assert_eq!(
+            (
+                read_ip_weight(CMD_READ_STATE),
+                read_ip_weight(CMD_READ_SPOT),
+                read_ip_weight(CMD_READ_ORDERS),
+                read_ip_weight(CMD_READ_LIMIT),
+                read_ip_weight(CMD_READ_DAY)
+            ),
+            (2, 2, 20, 20, 20)
+        );
     }
 
     #[test]
@@ -2714,10 +2778,11 @@ mod tests {
         );
         assert_eq!(class_of(&cmd(CMD_CANCEL, Tif::Gtc)), Some(CLASS_CANCEL));
         let mut odd = cmd(CMD_PLACE, Tif::Alo);
-        odd.kind = CMD_READ_DAY + 1;
+        odd.kind = CMD_READ_SPOT + 1;
         assert_eq!(class_of(&odd), None);
         assert_eq!(class_of(&HlCmd::read_limit(6, 1)), Some(CLASS_READ));
         assert_eq!(class_of(&HlCmd::read_day(6, 1, 0, 0)), Some(CLASS_READ));
+        assert_eq!(class_of(&HlCmd::read_spot(6, 1)), Some(CLASS_READ));
         let mut bad_tif = cmd(CMD_PLACE, Tif::Alo);
         bad_tif.tif = 7;
         assert_eq!(class_of(&bad_tif), None, "an unknown tif is never a Gtc");
@@ -2928,6 +2993,50 @@ mod tests {
         assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_LIMIT));
         assert_eq!(read_code(CMD_READ_ORDERS), READ_ORDERS);
         assert_eq!(read_code(CMD_READ_STATE), READ_STATE);
+    }
+
+    /// XH5b-1: the spot sheet's answer is one end carrying the USDC
+    /// `total` — on the venue's own testnet body, $999 over fourteen rows,
+    /// USDC listed; a sheet that lists no USDC says so; one that does not
+    /// scan fails with its own code.
+    #[test]
+    fn the_spot_read_answers_one_end_with_the_usdc_total() {
+        let body = format!(
+            r#"{{"type":"spotClearinghouseState","data":{}}}"#,
+            include_str!("../tests/fixtures/hl/spot_state_testnet.json").trim()
+        );
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_spot(6, 1));
+        rt.on_read_answer(5, body.as_bytes(), 9);
+        let ev = drained(&mut eng);
+        assert_eq!(ev.len(), 1, "no rows: one end");
+        assert_eq!(
+            (
+                ev[0].kind,
+                ev[0].reason,
+                ev[0].client_oid,
+                ev[0].aux,
+                ev[0].px_1e8
+            ),
+            (EV_READ_DONE, READ_SPOT, 1, 14, 99_900_000_000)
+        );
+        assert_eq!(ev[0].sz_1e8, 1, "USDC listed");
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_spot(6, 2));
+        rt.on_read_answer(
+            5,
+            br#"{"type":"spotClearinghouseState","data":{"balances":[]}}"#,
+            9,
+        );
+        let ev = drained(&mut eng);
+        assert_eq!(
+            (ev[0].kind, ev[0].reason, ev[0].px_1e8, ev[0].sz_1e8),
+            (EV_READ_DONE, READ_SPOT, 0, 0),
+            "no USDC listed: said so, for the arm to refuse"
+        );
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_spot(6, 3));
+        rt.on_read_answer(5, br#"{"type":"spotClearinghouseState","data":{}}"#, 9);
+        let ev = drained(&mut eng);
+        assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_SPOT));
+        assert_eq!(read_code(CMD_READ_SPOT), READ_SPOT);
     }
 
     #[test]

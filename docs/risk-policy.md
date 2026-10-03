@@ -9038,6 +9038,131 @@ single-slot overrides stay explicit; `VenueSplit` asks both arms;
 `sweep_one_pending`'s 36 B snapshot stays (pinned); the reject-streak
 residual above.
 
+### XH5b-1 amendment (2026-10-03): the account's worth — perp value plus spot USDC
+
+The first half of XH5b (plan §3.2 item 3; the cut is split in two,
+session-5 assumption A-S5-15).
+
+- **What changes.** On an account of slot 6's own (`own_account`), the
+  gateway arm reads the spot sheet right after each perp sheet:
+  `spotClearinghouseState`, a new gateway read (`CMD_READ_SPOT`, IP weight
+  2) answered by one `EV_READ_DONE` that carries the USDC `total` and
+  whether the sheet lists USDC at all, scanned in place into a fixed
+  256-row table (8 KiB, pinned). **The account's worth is the perp sheet's
+  `accountValue` plus that USDC.** Spot USDC margins the perps (XH4g
+  measured `accountValue` at $0 on E3), so USDC moving between the two
+  halves moves neither the worth nor the session P&L.
+- **Fail-closed rules.**
+  - A spot sheet that lists no USDC row is a failed read, never a $0 half
+    (`account_view`'s rule: nothing to anchor) — no anchor, no judgement,
+    the agreement ages. An own account must therefore list USDC on its
+    spot sheet; a zero balance listed is a legitimate $0 half.
+  - The anchor, when none was restored, is the first COMPLETE worth — never
+    half of one — and a positive one: a $0 worth (an unfunded account)
+    anchors nothing, the blocking arm's E7 rule, and the slot's first
+    reconciliation waits for an anchor.
+  - The P&L is judged, and the slot reconciled, only once the spot half has
+    landed. A restored anchor is never judged against the perp half alone,
+    which would read the whole spot balance as a loss; and the router
+    refuses the slot's live places until its first reconciliation, so the
+    slot never quotes before its worth is known. Unjudged, the signal's P&L
+    reads 0.
+  - The agreement (`ReconStale`'s clock) needs the spot half fresh within
+    two read periods, as it needs the sheet and the orders: a spot read that
+    keeps failing halts the slot as a stale reconciliation.
+  - One spot read per perp sheet, ahead of the other reads. A failed one —
+    a failure, an end of another kind, no answer, no USDC row — waits for
+    the next perp sheet: it never storms, whatever the skew, and delays a
+    pending re-read by one answer at most.
+- **The shared account judges nothing new:** no spot read and no bound, as
+  before; and no anchor is taken there any more (it was never judged nor
+  offered for keeping).
+- **Residuals.**
+  - *Two reads, not one.* The halves are read one answer apart, not
+    atomically. USDC that moves between them inside that gap — a class
+    transfer, or, on a spot-margined account, a reducing fill's realised
+    P&L, its fee or a funding payment settling to spot — misreads the worth
+    by its amount for one reconciliation: as a loss (the bound may halt —
+    fail-closed), or as a gain that hides a loss of that size for one
+    reconciliation. The settlements are small against the bound (a $15
+    clip); XH5e's runbooks forbid transfers while slot 6 is live.
+  - *A stale spot half.* While spot reads fail, the P&L stays judged on the
+    last spot half — blind to realised losses that settle to spot since —
+    until `ReconStale` halts the slot: up to two read periods plus
+    `halt_on_recon_stale_ms`. XH5b-2 sizes `halt_on_recon_stale_ms` with
+    this window in mind.
+  - *Other spot tokens* are outside the worth (USDC only): the probe's HYPE
+    for the ALO priority fee (XH5d) is spent outside the bound, which XH5d
+    bounds by its own cap.
+  - Top-ups (`reserveRequestWeight`, XH5c) are paid from the perp balance
+    and read as a real spend; Q-XH5-2's add-back is XH5c's.
+- **For XH5e — the pre-arm check.** The sum assumes no dollar is in both
+  halves: measured flat on E3, whose spot USDC margins the perps, but
+  margin in use could sit in both (`accountValue` counts margin; the spot
+  `total` counts `hold`), and a flat check cannot see it. The runbook
+  therefore opens a small position on the own account, reads both sheets,
+  and requires the worth ≈ the USDC funded − fees + the position's
+  unrealised P&L, logging `marginSummary.totalMarginUsed` against the spot
+  USDC `hold`: a residual of half the margin in use or more aborts the
+  arming. The account is funded in full before its first boot, and no
+  deposit or withdrawal is made while a session's anchor stands: the first
+  positive worth anchors, so funding in steps would anchor at the first step
+  and read the rest as gain (a new session starts by deleting XH5b-2's
+  anchor file).
+- **Not in this cut (XH5b-2):** the XMM scopes and their refusals,
+  `own_account` on them, the anchor file, the mainnet guard behind the
+  interlock, and the session-bound refusal kept only on the shared account.
+  The composition still runs slot 6 on the shared E3 account
+  (`cli::xmm_live::OWN_ACCOUNT` false), so no spot read is issued yet.
+  `read_weight_per_min` takes the spot read as a flag (2 a period), and
+  `xmm_live`'s 40 % pin reads it from `OWN_ACCOUNT`: at `RECON_MS` 10 s the
+  spot read would take the reads to 164 a minute, past 40 % of the share
+  (160), so XH5b-2 cannot turn the own account on without XH5c's 30 s (68).
+  XH5b-2 also owes: an own-account floor for `halt_on_recon_stale_ms` of
+  four read periods, since a failed spot read waits a whole period (the
+  boot's floor of two would halt on two failed spot reads in a row);
+  `spot_reads` and the refused spot reads on `/metrics` (moving the
+  `GatewayArmReport` pin and `HLGW_COUNTERS`); and, once the scope sets
+  `own_account` at boot, a boot-time check of `read_weight_per_min` against
+  the share (the const pin then covers the default only).
+
+**Tests:** the gateway — the spot read's one end on the venue's own
+testnet body ($999 over fourteen rows, USDC listed), a sheet with no USDC
+saying so, one that does not scan failing with its own code; the read
+weights by kind; the steady weight with and without the spot read; the
+read kinds ending at the spot sheet. The arm — the worth sums the halves
+and moves with both; the spot read goes before the orders and the anchor
+waits for it; a restored anchor is not judged on half a worth; a $0 worth
+anchors nothing until the account is funded; a sheet without USDC is a
+failed read (no anchor); a failed spot read — an end of
+another kind, a timeout — waits for the next perp sheet, at skew 0 too;
+the first reconciliation waits for the spot half (the sheet, the orders,
+the budget and the day read: nothing reconciled, no agreement, nothing
+judged); the spot half goes ahead of a pending re-read; an agreement needs
+a fresh spot half; a shared account reads no spot sheet. Alloc gate 98
+(spot reads every sheet — every sixth failing, every seventh listing no
+USDC — the arm's answered spot reads and the refused ones each a path the
+window must run) and gate 96b (the real gateway's spot read beside the
+budget and day reads: its pin moves 4 → 6, three records sealed and three
+opened, rustls' alone — the XH4e entry's "4 for two short reads" is
+superseded).
+
+**Gates (the committed tree):** clippy 0; nextest 4 129/4 129; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — zero-copy and allocation APPROVE WITH NITS (stale
+size and weight notes, the request render's COPY note, gate 98's paths
+counted on the arm's side, gate 96b's comment, the 40 % pin's flag — all
+taken), risk REQUEST CHANGES (a sheet without USDC anchored and judged as
+$0, the XH5e check blind to margin counted twice, the latch untested, the
+residuals, a retry with no floor — all taken; other spot tokens documented
+outside the worth); round 2 — zero-copy APPROVE, allocation and risk
+APPROVE WITH NITS (the zero-worth anchor and the check's tolerance —
+taken; `/metrics`, the own-account stale floor and a boot-time weight
+check — XH5b-2's, above); round 3 — allocation and zero-copy APPROVE, risk
+APPROVE WITH NITS (funding in full before the first boot — taken).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
