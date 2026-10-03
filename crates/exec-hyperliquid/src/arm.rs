@@ -146,8 +146,8 @@ use crate::event::{
     never_left, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM, EV_ACK,
     EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION,
     EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
-    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_NOT_FOUND,
-    REASON_THROTTLED,
+    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_IOC_MISS,
+    REASON_NOT_FOUND, REASON_THROTTLED,
 };
 use crate::gateway::{pw, HlEngineEnd};
 use crate::nonce::now_ms;
@@ -1517,7 +1517,11 @@ impl HlGatewayArm {
         let Some(i) = self.answered(e, now) else {
             return;
         };
-        if !unsent && !alo_cross {
+        // E7-F2, as the blocking arm (`response.rs`): an IoC that found
+        // nothing to take is a miss, not a venue fault — a run of them
+        // must not latch the reject-streak halt (XMM XH4h-3).
+        let ioc_miss = e.reason == REASON_IOC_MISS;
+        if !unsent && !alo_cross && !ioc_miss {
             self.counters.rejects += 1;
             self.reject_streak += 1;
             if self.rows[i].bits & RB_ALO != 0 {
@@ -3627,6 +3631,26 @@ mod tests {
         assert!(retired(&mut arm).is_empty());
         assert_eq!(renamed(&mut arm), [(1, 2)]);
         assert_eq!(arm.open_orders(), 1);
+    }
+
+    /// XH4h-3 (E7-F2): an IoC that could not match ends REJECTED with its
+    /// reason, retired — and moves neither `rejects` nor the streak.
+    #[test]
+    fn an_ioc_miss_is_no_reject_streak() {
+        let (mut arm, mut v, t) = booted();
+        let mut o = quote(9, Side::Bid, 100_000_000, 500_000);
+        o.kind = ORDER_KIND_IOC;
+        o.flags = 0;
+        arm.submit(&o).expect("submit");
+        let c = v.take(CMD_PLACE).expect("the IoC");
+        v.send(item(&c, EV_REJECTED, REASON_IOC_MISS, 0));
+        let _ = arm.idle(t);
+        assert_eq!(
+            events(&mut arm),
+            [(9, ORDER_EVENT_REJECTED, REASON_IOC_MISS)]
+        );
+        assert_eq!(retired(&mut arm), [9]);
+        assert_eq!((arm.counters().rejects, arm.reject_streak), (0, 0));
     }
 
     #[test]

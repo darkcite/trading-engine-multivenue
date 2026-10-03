@@ -283,6 +283,10 @@ struct EvmLiveArgs {
     /// unfundable swap only; nothing is sent to either venue.
     #[arg(long, default_value_t = false)]
     no_trade: bool,
+    /// `arm-smoke` (XMM XH4h-3): X's hedges through the Hyperliquid
+    /// WebSocket gateway instead of the blocking arm — TESTNET only.
+    #[arg(long, default_value_t = false)]
+    gateway: bool,
     /// `arm-smoke`: also check this exec.toml arms slot 0 with
     /// `--arm-live` (the engine's own interlock, run without the engine).
     #[arg(long)]
@@ -1444,6 +1448,7 @@ fn evm_live(args: EvmLiveArgs) -> ExitCode {
                     &args.coin,
                     p,
                     args.no_trade,
+                    args.gateway,
                     tls,
                 )
                 .map(|(r, ok)| (head + &r, ok)),
@@ -2799,7 +2804,10 @@ fn boot_hyparb_live_arm(
     hb: Option<&cli::hyparb_boot::HyparbBoot>,
     universe: &core_config::universe::AllocatedUniverse,
     nonces: &mut exec_hyperliquid::NonceStreams,
-) -> Result<cli::hyparb_live::LiveBoot<{ engine::FILL_RING_SIZE }>, String> {
+) -> Result<
+    cli::hyparb_live::LiveBoot<cli::hyparb_live::BlockingHedge<{ engine::FILL_RING_SIZE }>>,
+    String,
+> {
     let hb = hb.ok_or("slot 0 is armed live but no hyparb artifact is booted")?;
     let authority = exec_hyperevm::MainnetAuthority::armed_engine(
         hb.mode == core_config::hyparb::HyparbMode::Live,

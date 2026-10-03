@@ -130,7 +130,8 @@ pub const HYPEREVM_SLOT: usize = 0;
 /// gateway (`transport = "gateway"`, XH4f, deviation 10) — never on the
 /// operator's blocking arm, where its requests would spend slot 3's
 /// address and its sweeps reach slot 3's orders — and the gateway is
-/// slot 6's alone until XH4h moves the other Hyperliquid slots to it.
+/// slot 6's alone in an engine (XH4h-3: slot 0's hedges run on it in the
+/// HYPARB rehearsal on testnet; slot 3 waits for XH4i's outcome arm).
 pub const XMM_SLOT: usize = strategy_set::SLOT_XMM as usize;
 
 /// HC11 (O-HC18): slot 7 (`hcv`) is built DARK — paper only. A live slot
@@ -473,10 +474,16 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                  would cancel bin15's quotes"
             ));
         }
+        // XMM XH4h-3: slot 0's hedges run on the gateway in the HYPARB
+        // rehearsal (testnet) only — the engine's slot 0 is mainnet-only and
+        // the gateway testnet-only until XH5; slot 3 waits for XH4i's
+        // outcome arm.
         if gateway && slot != XMM_SLOT {
             return Err(format!(
                 "exec: slot {slot} ({slot_name}) names `transport = \"gateway\"`, which is slot \
-                 {XMM_SLOT}'s alone until XMM XH4h moves the other Hyperliquid slots to it"
+                 {XMM_SLOT}'s alone in an engine: slot 0's hedges run on the gateway only in the \
+                 HYPARB rehearsal on testnet (`evm-live arm-smoke --gateway`, XMM XH4h-3) until \
+                 XH5, and slot 3 waits for the outcome arm (XH4i)"
             ));
         }
 
@@ -1195,7 +1202,10 @@ mod tests {
             .replace("name = \"xmm\"", "name = \"bin15\"");
         let p = write(&d, "exec-gw3.toml", &three);
         let e = resolve(Some(&p), Some("3")).expect_err("slot 3 keeps its blocking arm");
-        assert!(e.contains("slot 6") && e.contains("XH4h"), "{e}");
+        assert!(
+            e.contains("slot 6") && e.contains("XH4h-3") && e.contains("XH4i"),
+            "{e}"
+        );
         let paper = blocking.replacen("mode = \"live\"", "mode = \"paper\"", 1);
         let p = write(&d, "exec-paper.toml", &paper);
         let boot = resolve(Some(&p), None)

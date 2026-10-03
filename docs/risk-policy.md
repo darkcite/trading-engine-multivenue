@@ -8800,6 +8800,70 @@ fires first).
 premise — fixed: live members only; VRP added; the runtime-symbol gap and
 the deviations recorded); risk round 2 APPROVE.
 
+### XH4h-3 amendment (2026-10-03): slot 0's hedge arm per transport — the gateway on testnet, in the rehearsal
+
+The plan's cut 3 (transport plumbing, one gateway per arm in the engine) is
+re-scoped: the engine's slot 0 is mainnet-only (`MainnetAuthority`), the
+gateway is testnet-only until XH5, and D2 keeps a live gateway slot alone —
+so a second gateway arm in an engine could not boot, and its composition
+would be dead code. What lands instead:
+
+- **`HedgeArm`** (`cli::hyparb_live`): slot 0's Hyperliquid hedge arm as a
+  type parameter of `HyparbLive` — static dispatch, nothing per order. Two
+  implementations: `BlockingHedge` (X's `HlExchange` and its fill ring —
+  the engine's, unchanged: the same verbs, the same 5 s local retirement of
+  a hedge IoC, no order events, no renames, no shutdown reaching it, as
+  before) and `HlGatewayArm` (its own retirements by the queued contract,
+  its order events and renames drained so its out-queues never stall its
+  pump, its shutdown).
+- `HyparbLive`'s `reconciled` now also needs the hedge arm to take orders
+  (the gateway arm's boot; the blocking arm at once), and its halt signal
+  carries the gateway's halt word; `verbs_confirm_later` follows the arm.
+- **`boot_hyparb_live_gateway`** — the same boot (keys, EVM arm, pools, the
+  coins resolved against `meta`, the anchor, the worker) with an
+  `HlGatewayArm` on slot 0 and its own unpinned `hl-gw-hyparb` thread, its
+  nonce from the agent's stream (S3). TESTNET only; native perps only (a
+  builder-dex perp on the gateway is refused — not built); the shared E3
+  account is not X's (`own_account` false), and X's leverage is left as it
+  is (`leverage` 0).
+- **The rehearsal** `evm-live arm-smoke --gateway` (testnet) runs the same
+  five steps over the gateway arm, drains the arm's queues as the engine
+  does, and — on every path after the boot, an early stop included — ends
+  with the arm's shutdown and the gateway thread's release (a boot that
+  fails after the gateway thread started leaves it to the process's exit).
+  Like every E3 signer it never runs beside another process on that agent:
+  its dead man's `scheduleCancel` is account-wide.
+- **An IoC miss is no reject streak on the gateway arm** (E7-F2, as the
+  blocking arm's `response.rs`): "could not immediately match" ends the
+  order `REJECTED` with `REASON_IOC_MISS`, retired, and moves neither
+  `rejects` nor `reject_streak` — HYPARB's touch-priced hedges miss
+  routinely, and five in a row would latch the sticky halt. Slot 6's IoCs
+  gain the same (pinned: `an_ioc_miss_is_no_reject_streak`).
+- The engine: `transport = "gateway"` stays slot 6's alone; the refusal on
+  any other slot names the rehearsal (slot 0) and XH4i (slot 3).
+
+**H5 (adopt the venue's positions at boot) is not built**: until Anton
+confirms it, the gateway arm holds its boot over a position in a bound perp
+(fail closed).
+
+**The testnet record (XH4h-4, 2026-10-03, the committed code).**
+`evm-live arm-smoke --network testnet --coin ETH --gateway` (11:35:55Z):
+**PASS** — seeded once X's account was read AND the gateway arm was ready
+(equity $1 882.39, drift $0, recon age 1.96 s); the unfundable swap
+refused locally; an executor swap on chain 998 filled from its receipt; the
+ETH hedge round trip through the gateway — an IoC buy of 0.0042 at 2 680.7
+and an IoC sell of 0.0042 at 2 680.6 — filled from `userFills`; both IoCs
+retired by the gateway arm; settled flat, drift $0, reject streak 0; the
+gateway stopped at the end. The blocking transport, the same smoke
+(11:36:44Z, the regression): **PASS** (its session filter dropped 8 earlier
+sessions' snapshot fills, as designed).
+
+**Reviews:** risk round 1 APPROVE WITH NITS (the IoC miss counted as a
+reject on the gateway arm; the rehearsal's early stops skipping the
+gateway's end; three texts — all fixed above), round 2 APPROVE; zero-copy
+APPROVE WITH NITS (two boot-time `COPY:` notes, added), allocation
+APPROVE.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

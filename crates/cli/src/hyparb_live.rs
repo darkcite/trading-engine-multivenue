@@ -19,7 +19,10 @@
 //!   swap the executor could not fund is refused before it leaves (the
 //!   worker's own account of the executor's balances, `avail_1e6`).
 //! * **The hedge leg** (an IoC on a Hyperliquid perp) goes to X's own
-//!   `HlExchange`. X signs as itself, and its `userFills` are the fills.
+//!   hedge arm ([`HedgeArm`], XMM XH4h-3): the blocking `HlExchange` (the
+//!   engine's) or, on testnet in the rehearsal, the WebSocket gateway's
+//!   `HlGatewayArm` ([`boot_hyparb_live_gateway`]). X signs as itself, and
+//!   its `userFills` are the fills.
 //!
 //! ## What the router reads (slot 0 only, via `halt_signal_for`)
 //!
@@ -36,7 +39,8 @@
 //!   an IoC miss — so it is counted (`swap_misses`) and moves no streak.
 //! * Retirements (`try_next_retired`): a swap that ended without a fill,
 //!   and every hedge IoC once its fills have had `HEDGE_RETIRE_NS` to
-//!   land, leave the router's resting count.
+//!   land (the blocking arm; the gateway arm retires its own IoCs on its
+//!   answer and its fills), leave the router's resting count.
 //! * **The P&L bound (O-HL5).** It is judged only while the arm is flat
 //!   ([`HyparbLive::pnl_flat`]): nothing is in flight and the last
 //!   reconciliation came after the last activity. `pnl_delta_usd_1e6` is
@@ -66,7 +70,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use clob_dispatcher::{CancelAllState, DispatchError, DispatchStats, HaltSignal, OrderDispatch};
+use clob_dispatcher::{
+    CancelAllState, DispatchError, DispatchStats, HaltSignal, OrderDispatch, Renamed, Retired,
+};
 use core_ring::{Consumer, Producer, Ring};
 use core_types::{
     CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Price, Qty, Side, SymbolId, Tick,
@@ -80,6 +86,9 @@ use exec_hyperevm::calldata::{
 use exec_hyperevm::nonce::WalletState;
 use exec_hyperevm::rpc::TokenMove;
 use exec_hyperevm::{MainnetAuthority, Network};
+use exec_hyperliquid::arm::{HlGatewayArm, PerpBind};
+use exec_hyperliquid::gateway::{hl_duplex, CoinMap, GatewayCfg, HlGateway};
+use exec_hyperliquid::rules::PerpRules;
 use exec_hyperliquid::{HlConfig, HlExchange, NonceStreams, PerpPosition, SpotBalance};
 use rustls::ClientConfig;
 use tracing::{info, warn};
@@ -500,11 +509,156 @@ impl LiveShared {
 // The engine-thread arm
 // ---------------------------------------------------------------
 
-/// Slot 0's live `OrderDispatch` (module doc).
-pub struct HyparbLive<const FILL_N: usize> {
+/// **XMM XH4h-3 — slot 0's Hyperliquid hedge arm, per transport**: X's
+/// blocking [`HlExchange`] ([`BlockingHedge`], the engine's — the default)
+/// or the WebSocket gateway's [`HlGatewayArm`] (testnet, the rehearsal,
+/// until XMM XH5). [`HyparbLive`] drives either through `OrderDispatch`
+/// and these few differences; static dispatch, nothing per order.
+pub trait HedgeArm: OrderDispatch {
+    /// [`HyparbLive`] retires each hedge IoC itself once its fills have had
+    /// [`HEDGE_RETIRE_NS`] (the blocking arm) — or the arm retires it (the
+    /// gateway's queued contract: its answer and its fills decide).
+    const SELF_RETIRES: bool;
+    /// The next hedge fill.
+    fn hedge_fill(&mut self) -> Option<Fill>;
+    /// The next retirement the arm decided (none when [`Self::SELF_RETIRES`]).
+    fn hedge_retired(&mut self) -> Option<Retired>;
+    /// The next order event the arm emitted — drained, or the gateway arm's
+    /// out-queue fills and its pump stops (none from the blocking arm, as
+    /// before XH4h).
+    fn hedge_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool;
+    /// The next rename (a landed modify; none from the blocking arm, as
+    /// before XH4h).
+    fn hedge_renamed(&mut self) -> Option<Renamed>;
+    /// The arm takes orders (the gateway arm's own boot: snapshot, sweep,
+    /// sheet, orders, budget).
+    fn hedge_ready(&self) -> bool;
+    /// The engine's shutdown, as this arm takes it.
+    fn hedge_shutdown(&mut self);
+}
+
+/// X's blocking arm and the ring its fills land in.
+pub struct BlockingHedge<const N: usize> {
+    arm: HlExchange<N>,
+    fills: Consumer<Fill, N>,
+}
+
+impl<const N: usize> OrderDispatch for BlockingHedge<N> {
+    #[inline]
+    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        self.arm.submit(order)
+    }
+
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        self.arm.cancel(req)
+    }
+
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        self.arm.modify(req)
+    }
+
+    /// The fill leaves its slot by value (64 B): the trait hands an owned
+    /// `Fill`.
+    #[inline]
+    fn try_next_fill(&mut self) -> Option<Fill> {
+        self.fills.try_pop_ref().map(|f| *f)
+    }
+
+    fn stats(&self) -> DispatchStats {
+        self.arm.stats()
+    }
+
+    #[inline]
+    fn on_idle(&mut self) -> bool {
+        self.arm.on_idle()
+    }
+
+    fn halt_signal(&self) -> HaltSignal {
+        self.arm.halt_signal()
+    }
+
+    fn cancel_all(&mut self) -> Result<(), DispatchError> {
+        self.arm.cancel_all()
+    }
+
+    fn cancel_all_state(&self) -> CancelAllState {
+        self.arm.cancel_all_state()
+    }
+}
+
+impl<const N: usize> HedgeArm for BlockingHedge<N> {
+    const SELF_RETIRES: bool = true;
+
+    #[inline]
+    fn hedge_fill(&mut self) -> Option<Fill> {
+        self.try_next_fill()
+    }
+
+    #[inline]
+    fn hedge_retired(&mut self) -> Option<Retired> {
+        None
+    }
+
+    #[inline]
+    fn hedge_order_event(&mut self, _out: &mut core_types::OrderEvent) -> bool {
+        false
+    }
+
+    #[inline]
+    fn hedge_renamed(&mut self) -> Option<Renamed> {
+        None
+    }
+
+    #[inline]
+    fn hedge_ready(&self) -> bool {
+        true
+    }
+
+    /// Unchanged from before XH4h: the engine's shutdown of slot 0 does not
+    /// reach X's blocking arm.
+    #[inline]
+    fn hedge_shutdown(&mut self) {}
+}
+
+impl HedgeArm for HlGatewayArm {
+    const SELF_RETIRES: bool = false;
+
+    #[inline]
+    fn hedge_fill(&mut self) -> Option<Fill> {
+        self.try_next_fill()
+    }
+
+    #[inline]
+    fn hedge_retired(&mut self) -> Option<Retired> {
+        self.try_next_retired()
+    }
+
+    #[inline]
+    fn hedge_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.try_next_order_event(out)
+    }
+
+    #[inline]
+    fn hedge_renamed(&mut self) -> Option<Renamed> {
+        self.try_next_renamed()
+    }
+
+    #[inline]
+    fn hedge_ready(&self) -> bool {
+        self.ready()
+    }
+
+    fn hedge_shutdown(&mut self) {
+        self.on_shutdown();
+    }
+}
+
+/// Slot 0's live `OrderDispatch` (module doc), over its hedge arm `H`.
+pub struct HyparbLive<H: HedgeArm> {
     book: LiveBook,
-    hl: HlExchange<FILL_N>,
-    hl_fills: Consumer<Fill, FILL_N>,
+    hl: H,
     swaps: Producer<SwapReq, SWAP_RING>,
     amm_fills: Consumer<Fill, AMM_FILL_RING>,
     retired: Consumer<u64, RETIRE_RING>,
@@ -553,7 +707,7 @@ fn unix_ns() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-impl<const FILL_N: usize> HyparbLive<FILL_N> {
+impl<H: HedgeArm> HyparbLive<H> {
     /// The pool index `sym` trades as, if any.
     #[inline]
     fn pool_of(&self, sym: SymbolId) -> Option<usize> {
@@ -817,7 +971,7 @@ fn mul_1e6(a: i64, b: i64) -> i64 {
     i64::try_from((a as i128 * b as i128) / 1_000_000).unwrap_or(i64::MAX)
 }
 
-impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
+impl<H: HedgeArm> OrderDispatch for HyparbLive<H> {
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
         if order.venue == VenueId::HyperEvm.to_u8() && order.kind == core_fill::ORDER_KIND_AMM_SWAP
         {
@@ -827,7 +981,7 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
             let now = core_time::now_ns();
             self.last_activity_ns = now;
             self.hl.submit(order)?;
-            if order.kind == core_fill::ORDER_KIND_IOC {
+            if H::SELF_RETIRES && order.kind == core_fill::ORDER_KIND_IOC {
                 self.retire_later(order.client_oid, now.saturating_add(HEDGE_RETIRE_NS));
             }
             return Ok(());
@@ -859,9 +1013,9 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
             return Some(*f);
         }
         let f = loop {
-            let f = self.hl_fills.try_pop_ref()?;
+            let f = self.hl.hedge_fill()?;
             if from_this_session(f.ts_ns, self.boot_unix_ns) {
-                break *f;
+                break f;
             }
             self.stale_fills = self.stale_fills.wrapping_add(1);
         };
@@ -885,6 +1039,10 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
                 SLOT,
                 clob_dispatcher::RETIRED_REJECTED,
             ));
+        }
+        if !H::SELF_RETIRES {
+            // The gateway arm retires its own IoCs (its queued contract).
+            return self.hl.hedge_retired();
         }
         let now = core_time::now_ns();
         let mut i = 0usize;
@@ -950,13 +1108,35 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
             rejects,
             h.asset_refusal_streak,
             h.budget_floor_breached != 0,
-            reads > 0,
+            // Seeded once X's account is read AND the hedge arm takes
+            // orders (the gateway arm's boot; the blocking arm at once).
+            reads > 0 && self.hl.hedge_ready(),
             age,
         )
         .with_pnl(
             self.pnl_flat(),
             self.equity_1e6.saturating_sub(self.anchor_1e6),
         )
+        .with_gateway_halted(h.gateway_halted != 0)
+    }
+
+    /// The gateway arm's order events (drained, so its pump never stalls on
+    /// a full queue); none from the blocking arm.
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.hl.hedge_order_event(out)
+    }
+
+    /// The gateway arm's renames (a landed modify); none from the blocking
+    /// arm.
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
+        self.hl.hedge_renamed()
+    }
+
+    /// The gateway arm confirms its verbs later (its queued contract); the
+    /// blocking arm answers at once.
+    fn verbs_confirm_later(&self, sym: SymbolId, venue: u8, strategy_id: u8) -> bool {
+        venue == VenueId::Hyperliquid.to_u8()
+            && self.hl.verbs_confirm_later(sym, venue, strategy_id)
     }
 
     fn cancel_all(&mut self) -> Result<(), DispatchError> {
@@ -965,6 +1145,10 @@ impl<const FILL_N: usize> OrderDispatch for HyparbLive<FILL_N> {
 
     fn cancel_all_state(&self) -> CancelAllState {
         self.hl.cancel_all_state()
+    }
+
+    fn on_shutdown(&mut self) {
+        self.hl.hedge_shutdown();
     }
 }
 
@@ -1464,11 +1648,13 @@ pub struct LiveSpec<'a> {
 }
 
 /// A booted live arm.
-pub struct LiveBoot<const FILL_N: usize> {
+pub struct LiveBoot<H: HedgeArm> {
     /// The arm the router trades slot 0 through.
-    pub arm: HyparbLive<FILL_N>,
+    pub arm: HyparbLive<H>,
     /// The `hyparb-live` thread.
     pub handle: JoinHandle<()>,
+    /// The gateway's thread and its owner (the gateway transport only).
+    pub gateway: Option<GatewayThread>,
     /// One line for the boot log.
     pub tell: String,
 }
@@ -1587,7 +1773,181 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
     spec: &LiveSpec<'_>,
     tls: Arc<ClientConfig>,
     nonces: &mut NonceStreams,
-) -> Result<LiveBoot<FILL_N>, String> {
+) -> Result<LiveBoot<BlockingHedge<FILL_N>>, String> {
+    boot_with(spec, tls, nonces, blocking_hedge::<FILL_N>)
+}
+
+/// **XMM XH4h-3 — slot 0 on the WebSocket gateway**: the same boot, X's
+/// hedges through an [`HlGatewayArm`] and its own gateway thread
+/// (`hl-gw-hyparb`, unpinned). TESTNET only — the rehearsal — until XMM XH5
+/// takes the gateway to mainnet; native perps only (a builder-dex perp on
+/// the gateway is not built); the testnet account is the shared E3 one, so
+/// the arm does not own it (`own_account` false) and leaves its leverage
+/// as it is.
+///
+/// # Errors
+/// As [`boot_hyparb_live`], and mainnet, a builder-dex coin, or the
+/// gateway's own boot.
+pub fn boot_hyparb_live_gateway(
+    spec: &LiveSpec<'_>,
+    tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
+) -> Result<LiveBoot<HlGatewayArm>, String> {
+    if !matches!(spec.net, LiveNet::Testnet) {
+        return Err(String::from(
+            "hyparb live: the gateway transport is TESTNET-only until XMM XH5",
+        ));
+    }
+    boot_with(spec, tls, nonces, gateway_hedge)
+}
+
+/// One hedge coin resolved against the venue's meta (step 4).
+#[derive(Clone, Copy)]
+struct ResolvedCoin {
+    asset: u32,
+    sz_decimals: u8,
+    builder: bool,
+}
+
+/// The gateway's thread and its owner.
+pub type GatewayThread = (JoinHandle<()>, crate::xmm_live::GatewayStop);
+
+/// A hedge arm's maker: the spec, X's configuration, the resolved coins (in
+/// `spec.coins` order), the client TLS, the nonce streams.
+type MakeHedge<H> = fn(
+    &LiveSpec<'_>,
+    &HlConfig,
+    &[ResolvedCoin],
+    Arc<ClientConfig>,
+    &mut NonceStreams,
+) -> Result<(H, Option<GatewayThread>), String>;
+
+/// The blocking arm (the engine's): X's [`HlExchange`], its nonce from the
+/// agent's stream before its first signed action, the budget read, every
+/// perp bound in its asset table.
+fn blocking_hedge<const FILL_N: usize>(
+    spec: &LiveSpec<'_>,
+    hl_cfg: &HlConfig,
+    resolved: &[ResolvedCoin],
+    tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
+) -> Result<(BlockingHedge<FILL_N>, Option<GatewayThread>), String> {
+    let (fill_prod, fills) = Ring::<Fill, FILL_N>::new().split();
+    // COPY: boot, once — X's `HlExchange` (≥ 64 KiB inline: its 4 096-id
+    // trade ring) moves out of `new`'s `Result`, into `BlockingHedge`, out
+    // through the maker's `Result`, into `HyparbLive` and `LiveBoot`.
+    // Rejected: boxing it — a pointer chase on every verb.
+    let mut hl = HlExchange::new(
+        hl_cfg,
+        tls,
+        fill_prod,
+        spec.state_dir
+            .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH),
+        spec.budget_floor,
+    )
+    .map_err(|e| format!("hyperliquid arm for X: {e}"))?;
+    // XH4h S3: X's agent's one nonce stream, before the first signed action.
+    hl.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
+        String::from("hyperliquid arm for X: more agent addresses than the nonce streams hold")
+    })?);
+    hl.seed_budget_from_venue();
+    let mut c = 0usize;
+    while c < resolved.len() {
+        let cs = &spec.coins[c];
+        hl.assets_mut()
+            .bind(cs.perp_sym, resolved[c].asset, 0, cs.name.as_bytes())
+            .map_err(|e| format!("coin {}: bind: {e:?}", cs.name))?;
+        c += 1;
+    }
+    Ok((BlockingHedge { arm: hl, fills }, None))
+}
+
+/// `expiresAfter` of the gateway arm's hedge posts, ms.
+const GATEWAY_EXPIRES_MS: u16 = 10_000;
+
+/// The gateway arm (XH4h-3, testnet): slot 0's [`HlGatewayArm`] over the
+/// resolved perps and its gateway thread, the gateway's nonce from the
+/// agent's stream before its first post.
+fn gateway_hedge(
+    spec: &LiveSpec<'_>,
+    hl_cfg: &HlConfig,
+    resolved: &[ResolvedCoin],
+    tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
+) -> Result<(HlGatewayArm, Option<GatewayThread>), String> {
+    let mut cfg = crate::xmm_live::arm_cfg(
+        SLOT,
+        GATEWAY_EXPIRES_MS,
+        crate::xmm_live::RECON_MS,
+        spec.budget_floor,
+    );
+    // X's leverage stays as it is; the shared testnet account is not X's.
+    cfg.leverage = 0;
+    cfg.own_account = false;
+    let mut coins = CoinMap::new();
+    let mut c = 0usize;
+    while c < resolved.len() {
+        let (cs, r) = (&spec.coins[c], resolved[c]);
+        if r.builder {
+            return Err(format!(
+                "coin {}: a builder-dex perp on the gateway is not built (XMM XH4h-3)",
+                cs.name
+            ));
+        }
+        let rules = PerpRules::new(r.sz_decimals).ok_or_else(|| {
+            format!(
+                "coin {}: szDecimals {} has no size rules",
+                cs.name, r.sz_decimals
+            )
+        })?;
+        cfg.perps[c] = PerpBind {
+            sym: cs.perp_sym,
+            asset: r.asset,
+            rules,
+        };
+        if !coins.insert(cs.name.as_bytes(), r.asset) {
+            return Err(format!(
+                "coin {}: the gateway's coin map refused it",
+                cs.name
+            ));
+        }
+        c += 1;
+    }
+    cfg.n_perps = resolved.len();
+    let (eng, gw_end) = hl_duplex();
+    // COPY: boot, once — the 1 600 B arm out of `new`'s `Result`, through
+    // the maker's, into `HyparbLive` and `LiveBoot` (as `xmm_live`'s, noted
+    // there). Rejected: as there.
+    let arm = HlGatewayArm::new(&cfg, eng).map_err(|e| format!("slot 0's gateway arm: {e:?}"))?;
+    let sk = hl_cfg
+        .secret_key()
+        .map_err(|e| format!("the testnet agent's key: {e}"))?;
+    let gcfg = GatewayCfg::production(
+        hl_cfg.host.clone(),
+        tls,
+        hl_cfg.network,
+        hl_cfg.master_addr,
+        cfg.slot,
+    );
+    // COPY: boot, once — the gateway out of `new`'s `Result` (then into
+    // `spawn_gateway`, noted there). Rejected: as there.
+    let mut gw =
+        HlGateway::new(gcfg, gw_end, sk, coins).map_err(|e| format!("slot 0's gateway: {e:?}"))?;
+    gw.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
+        String::from("slot 0's gateway: more agent addresses than the nonce streams hold")
+    })?);
+    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None)?;
+    Ok((arm, Some((handle, stop))))
+}
+
+/// The boot both transports share: X's keys, the EVM arm, the pools, the
+/// coins resolved, the hedge arm `make` builds, the anchor, the worker.
+fn boot_with<H: HedgeArm>(
+    spec: &LiveSpec<'_>,
+    tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
+    make: MakeHedge<H>,
+) -> Result<LiveBoot<H>, String> {
     if spec.pools.is_empty() || spec.pools.len() > MAX_LIVE_POOLS {
         return Err(format!(
             "hyparb live: 1..={MAX_LIVE_POOLS} traded pools (got {})",
@@ -1696,21 +2056,6 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
     // 4. X's Hyperliquid arm, its perps bound.
     std::fs::create_dir_all(&spec.state_dir)
         .map_err(|e| format!("{}: {e}", spec.state_dir.display()))?;
-    let (fill_prod, hl_fills) = Ring::<Fill, FILL_N>::new().split();
-    let mut hl = HlExchange::new(
-        &hl_cfg,
-        tls.clone(),
-        fill_prod,
-        spec.state_dir
-            .join(exec_hyperliquid::budget::DEFAULT_STATE_PATH),
-        spec.budget_floor,
-    )
-    .map_err(|e| format!("hyperliquid arm for X: {e}"))?;
-    // XH4h S3: X's agent's one nonce stream, before the first signed action.
-    hl.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
-        String::from("hyperliquid arm for X: more agent addresses than the nonce streams hold")
-    })?);
-    hl.seed_budget_from_venue();
     let meta = info_once(&hl_cfg.host, br#"{"type":"meta"}"#, tls.clone())?;
     let mut disc = ingress_hyperliquid::discovery::HlDiscovery::new();
     disc.ingest_meta(&meta)
@@ -1742,6 +2087,7 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
             done.push(dx);
         }
     }
+    let mut resolved: Vec<ResolvedCoin> = Vec::with_capacity(spec.coins.len());
     let mut coins: Vec<LiveCoin> = Vec::new();
     let mut c = 0usize;
     while c < spec.coins.len() {
@@ -1767,9 +2113,11 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
                 cs.name, cs.lot_1e6, info.sz_decimals, venue_lot
             ));
         }
-        hl.assets_mut()
-            .bind(cs.perp_sym, info.asset_id, 0, cs.name.as_bytes())
-            .map_err(|e| format!("coin {}: bind: {e:?}", cs.name))?;
+        resolved.push(ResolvedCoin {
+            asset: info.asset_id,
+            sz_decimals: info.sz_decimals,
+            builder: info.kind == ingress_hyperliquid::discovery::HlAssetKind::BuilderDex,
+        });
         let mut name = [0u8; 16];
         let nb = cs.name.as_bytes();
         if nb.len() > name.len() {
@@ -1784,6 +2132,7 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
         });
         c += 1;
     }
+    let (hl, gateway) = make(spec, &hl_cfg, &resolved, tls.clone(), nonces)?;
     let info = core_net::HttpsPost::new(&hl_cfg.host, hl_cfg.port(), "/info", tls, 128, INFO_RESP)
         .map_err(|e| format!("{}/info: {e}", hl_cfg.host))?;
 
@@ -1851,7 +2200,6 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
         arm: HyparbLive {
             book,
             hl,
-            hl_fills,
             swaps: swap_prod,
             amm_fills,
             retired,
@@ -1876,6 +2224,7 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
             stale_fills: 0,
         },
         handle,
+        gateway,
         tell,
     })
 }
