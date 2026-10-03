@@ -103,8 +103,10 @@ exec-hyperevm        = { workspace = true, features = ["testnode"] }
 # of a scripted TLS venue (tests/exec_composition_loopback.rs). Test-only:
 # resolver 2 turns it on only in builds that build the dev-dependencies
 # (`cargo test`), so `cargo build` of the engine never has it, and no
-# code outside tests calls `with_port`.
-exec-hyperliquid     = { workspace = true, features = ["loopback"] }
+# code outside tests calls `with_port`. XMM XH4g: `testvenue`, the
+# scripted rustls Hyperliquid the battery's loopback test runs against
+# (tests/xmm_battery_loopback.rs) — test-only the same way.
+exec-hyperliquid     = { workspace = true, features = ["loopback", "testvenue"] }
 # BX3: the scripted venue's self-signed certificate.
 rcgen                = { workspace = true }
 # XMM XH4f: the sweep word the composition test's scripted gateway end sets.

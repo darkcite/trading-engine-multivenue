@@ -29,6 +29,11 @@
 //! on a boot abort) — or, once the process-wide shutdown is seen,
 //! [`GATEWAY_GRACE_NS`] after it at most. Cold module: the boot, and the
 //! gateway thread's loop (`run_gateway`: two loads and a turn a pass, 0 B).
+//!
+//! XH4g: the binding ([`bind_perps`]), the arm's configuration
+//! ([`arm_cfg`]) and the gateway's thread ([`spawn_gateway`]) are shared
+//! with the testnet battery (`crate::xmm_battery`), which composes the same
+//! arm and gateway in-process — one composition, two owners.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,11 +217,6 @@ pub fn boot_xmm_arm(spec: &XmmSpec<'_>, tls: Arc<ClientConfig>) -> Result<XmmLiv
             spec.md_ws_host, hl.host
         ));
     }
-    let mut disc = HlDiscovery::new();
-    crate::hyparb_live::info_with(&hl.host, br#"{"type":"meta"}"#, Arc::clone(&tls), |b| {
-        disc.ingest_meta(b)
-    })?
-    .map_err(|e| format!("hyperliquid meta: {e:?}"))?;
     let p = &xmm.params;
     let n = usize::from(p.n_perps);
     if n == 0 || n > ARM_PERPS || n != xmm.coins.len() {
@@ -225,90 +225,41 @@ pub fn boot_xmm_arm(spec: &XmmSpec<'_>, tls: Arc<ClientConfig>) -> Result<XmmLiv
             xmm.coins.len()
         ));
     }
-    let blank = PerpBind {
-        sym: core_types::SYMBOL_ID_NONE,
-        asset: 0,
-        rules: PerpRules::new(0).ok_or_else(|| String::from("perp rules"))?,
-    };
-    let mut perps = [blank; ARM_PERPS];
-    let mut coins = CoinMap::new();
-    let mut specs = Vec::with_capacity(n);
+    let mut asks = Vec::with_capacity(n);
     for (i, coin) in xmm.coins.iter().enumerate() {
-        let info = disc
-            .resolve(coin.as_bytes())
-            .filter(|a| {
-                a.kind == HlAssetKind::Perp && exec_hyperliquid::asset::is_perp_id(a.asset_id)
-            })
-            .ok_or_else(|| format!("xmm coin {coin}: not a native Hyperliquid perp here"))?;
-        // The member's lot is the venue's size step (1e6 = 1e8 / 100).
-        let lot_1e6 = p.perps[i].lot_1e6;
-        let rules = PerpRules::new(info.sz_decimals)
-            .filter(|r| lot_1e6.checked_mul(100) == Some(r.lot_1e8()))
-            .ok_or_else(|| {
-                format!(
-                    "xmm coin {coin}: lot_1e6 {lot_1e6} is not the venue's size step \
-                     (szDecimals {})",
-                    info.sz_decimals
-                )
-            })?;
-        perps[i] = PerpBind {
+        asks.push(PerpAsk {
+            coin,
             sym: p.perps[i].hl_sym,
-            asset: info.asset_id,
-            rules,
-        };
-        if !coins.insert(coin.as_bytes(), info.asset_id) {
-            return Err(format!(
-                "xmm coin {coin}: the gateway's coin map refused it"
-            ));
-        }
-        specs.push(InstrumentSpec::new(p.perps[i].hl_sym, LAW_LINEAR, 0, 0, 0));
+            lot_1e6: Some(p.perps[i].lot_1e6),
+        });
     }
-    let cfg = ArmCfg {
-        slot: XMM_SLOT as u8,
-        perps,
-        n_perps: n,
-        expires_after_ms: u16::try_from(p.lifetime_ms)
-            .map_err(|_| format!("xmm.toml lifetime_ms {} exceeds 65 535", p.lifetime_ms))?,
-        post_timeout_ms: POST_TIMEOUT_NS / 1_000_000,
-        skew_ms: SKEW_MS,
-        recon_ms: RECON_MS,
-        join_ms: JOIN_MS,
-        gone_ms: GONE_MS,
-        shutdown_ms: SHUTDOWN_MS,
-        own_account: false,
-        anchor_1e6: 0,
-        deadman: DeadManCfg::DEFAULT,
-        budget_floor: u64::try_from(s.request_budget_floor).unwrap_or(0),
-        limit_ms: LIMIT_MS,
-        leverage: LEVERAGE,
-    };
+    let expires_after_ms = u16::try_from(p.lifetime_ms)
+        .map_err(|_| format!("xmm.toml lifetime_ms {} exceeds 65 535", p.lifetime_ms))?;
+    let mut cfg = arm_cfg(
+        XMM_SLOT as u8,
+        expires_after_ms,
+        RECON_MS,
+        u64::try_from(s.request_budget_floor).unwrap_or(0),
+    );
+    let mut bound = PerpBinding::new(n);
+    crate::hyparb_live::info_with(&hl.host, META_REQ, Arc::clone(&tls), |b| {
+        bind_perps(b, &asks, &mut cfg, &mut bound)
+    })??;
     let (eng, gw_end) = hl_duplex();
     // COPY: boot, once — the 1 600 B arm moves out of `new`'s `Result`, into
     // `XmmLive`, the binary's tuple, the `SlotSplit` and the router (it stays
-    // inline there, for the verbs' direct calls); the ≤ 8 KiB gateway out of
-    // its `Result` and into its thread's closure. Rejected: building the
-    // gateway on its own thread, which would need a handshake to report its
-    // boot errors.
+    // inline there, for the verbs' direct calls). Rejected: boxing the arm
+    // (every verb would chase a pointer).
     let arm = HlGatewayArm::new(&cfg, eng).map_err(|e| format!("slot 6's arm: {e:?}"))?;
     let sk = hl
         .secret_key()
         .map_err(|e| format!("the testnet agent's key: {e}"))?;
     let gcfg = GatewayCfg::production(hl.host.clone(), tls, hl.network, hl.master_addr, cfg.slot);
-    let mut gw =
-        HlGateway::new(gcfg, gw_end, sk, coins).map_err(|e| format!("slot 6's gateway: {e:?}"))?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let owner = Arc::clone(&stop);
-    let handle = std::thread::Builder::new()
-        .name(String::from("hl-gw-xmm"))
-        .spawn(move || {
-            match crate::pinning::pin_current_thread_to_core(GATEWAY_CORE) {
-                Ok(()) => info!(thread = "hl-gw-xmm", core = GATEWAY_CORE, "thread pinned"),
-                Err(e) => info!(thread = "hl-gw-xmm", ?e, "thread not pinned; continuing"),
-            }
-            run_gateway(&mut gw, &owner);
-            info!("xmm: the gateway stopped");
-        })
-        .map_err(|e| format!("xmm: spawn hl-gw-xmm: {e}"))?;
+    // COPY: boot, once — the ≤ 8 KiB gateway out of `new`'s `Result` (then
+    // into `spawn_gateway`, noted there). Rejected: as there.
+    let gw = HlGateway::new(gcfg, gw_end, sk, bound.coins)
+        .map_err(|e| format!("slot 6's gateway: {e:?}"))?;
+    let (handle, stop) = spawn_gateway(gw, "hl-gw-xmm", Some(GATEWAY_CORE))?;
     let tell = format!(
         "xmm: LIVE ARM ARMED — the Hyperliquid gateway, TESTNET, slot 6 on the shared E3 account \
          (own_account=false); {n} perp(s) bound ({}); leverage {LEVERAGE}x cross; reads every \
@@ -321,10 +272,177 @@ pub fn boot_xmm_arm(spec: &XmmSpec<'_>, tls: Arc<ClientConfig>) -> Result<XmmLiv
     Ok(XmmLive {
         arm,
         handle,
-        stop: GatewayStop(stop),
-        specs,
+        stop,
+        specs: bound.specs,
         tell,
     })
+}
+
+/// The `/info` body that reads the perp universe.
+pub const META_REQ: &[u8] = br#"{"type":"meta"}"#;
+
+/// One perp a gateway arm is asked to bind: the venue's coin name, the
+/// engine symbol, and — for a member — its lot, which must be the venue's
+/// size step (`None`: the venue's step is taken as it is, XH4g's battery).
+pub struct PerpAsk<'a> {
+    /// The venue's coin name (`"BTC"`).
+    pub coin: &'a str,
+    /// The engine symbol.
+    pub sym: u32,
+    /// The member's lot ×1e6, checked against the venue's `szDecimals`.
+    pub lot_1e6: Option<i64>,
+}
+
+/// What a gateway arm's binding hands on besides the arm's own table (which
+/// [`bind_perps`] writes into the configuration in place): the gateway's
+/// coin map and the router's `LAW_LINEAR` rows (XH4f; shared with XH4g's
+/// battery).
+pub struct PerpBinding {
+    /// Coin → asset id, for the gateway's streams.
+    pub coins: CoinMap,
+    /// The perps as `LAW_LINEAR` rows, for the ledger.
+    pub specs: Vec<InstrumentSpec>,
+}
+
+impl PerpBinding {
+    /// Empty, with room for `n` rows. Boot-time.
+    #[must_use]
+    pub fn new(n: usize) -> Self {
+        Self {
+            coins: CoinMap::new(),
+            specs: Vec::with_capacity(n),
+        }
+    }
+}
+
+/// Bind `asks` from the exchange host's `/info meta` answer, parsed in place
+/// in the boot client's buffer: each coin's asset id and size rules (a
+/// member's lot checked against the venue's step) written into `cfg`'s perp
+/// table in place, the coin map and the rows into `out`.
+///
+/// # Errors
+/// An unreadable meta, no perp or more than [`ARM_PERPS`], a coin that is
+/// not a native perp here, a lot that is not the venue's step, a coin the
+/// map refuses.
+pub fn bind_perps(
+    meta: &[u8],
+    asks: &[PerpAsk<'_>],
+    cfg: &mut ArmCfg,
+    out: &mut PerpBinding,
+) -> Result<(), String> {
+    let mut disc = HlDiscovery::new();
+    disc.ingest_meta(meta)
+        .map_err(|e| format!("hyperliquid meta: {e:?}"))?;
+    let n = asks.len();
+    if n == 0 || n > ARM_PERPS {
+        return Err(format!(
+            "{n} perp(s) asked; the gateway arm binds 1..={ARM_PERPS}"
+        ));
+    }
+    for (i, ask) in asks.iter().enumerate() {
+        let coin = ask.coin;
+        let info = disc
+            .resolve(coin.as_bytes())
+            .filter(|a| {
+                a.kind == HlAssetKind::Perp && exec_hyperliquid::asset::is_perp_id(a.asset_id)
+            })
+            .ok_or_else(|| format!("coin {coin}: not a native Hyperliquid perp here"))?;
+        let rules = PerpRules::new(info.sz_decimals).ok_or_else(|| {
+            format!(
+                "coin {coin}: szDecimals {} has no size rules",
+                info.sz_decimals
+            )
+        })?;
+        // A member's lot is the venue's size step (1e6 = 1e8 / 100).
+        if let Some(lot) = ask.lot_1e6 {
+            if lot.checked_mul(100) != Some(rules.lot_1e8()) {
+                return Err(format!(
+                    "xmm coin {coin}: lot_1e6 {lot} is not the venue's size step (szDecimals {})",
+                    info.sz_decimals
+                ));
+            }
+        }
+        cfg.perps[i] = PerpBind {
+            sym: ask.sym,
+            asset: info.asset_id,
+            rules,
+        };
+        if !out.coins.insert(coin.as_bytes(), info.asset_id) {
+            return Err(format!("coin {coin}: the gateway's coin map refused it"));
+        }
+        out.specs
+            .push(InstrumentSpec::new(ask.sym, LAW_LINEAR, 0, 0, 0));
+    }
+    cfg.n_perps = n;
+    Ok(())
+}
+
+/// A gateway arm's configuration as the composition sizes it — no perp bound
+/// yet ([`bind_perps`] writes them in place): the shared E3 account
+/// (`own_account = false`), the timing knobs above, the dead man's defaults,
+/// [`LEVERAGE`]× cross.
+#[must_use]
+pub const fn arm_cfg(slot: u8, expires_after_ms: u16, recon_ms: u64, budget_floor: u64) -> ArmCfg {
+    ArmCfg {
+        slot,
+        perps: [BLANK_PERP; ARM_PERPS],
+        n_perps: 0,
+        expires_after_ms,
+        post_timeout_ms: POST_TIMEOUT_NS / 1_000_000,
+        skew_ms: SKEW_MS,
+        recon_ms,
+        join_ms: JOIN_MS,
+        gone_ms: GONE_MS,
+        shutdown_ms: SHUTDOWN_MS,
+        own_account: false,
+        anchor_1e6: 0,
+        deadman: DeadManCfg::DEFAULT,
+        budget_floor,
+        limit_ms: LIMIT_MS,
+        leverage: LEVERAGE,
+    }
+}
+
+/// An unbound perp row of [`arm_cfg`]'s table.
+const BLANK_PERP: PerpBind = PerpBind {
+    sym: core_types::SYMBOL_ID_NONE,
+    asset: 0,
+    rules: match PerpRules::new(0) {
+        Some(r) => r,
+        None => panic!("szDecimals 0 has rules"),
+    },
+};
+
+/// Start `gw` on its own thread `name` (pinned to `core` when given): it
+/// turns until the returned [`GatewayStop`] is released.
+///
+/// # Errors
+/// The thread could not be spawned.
+pub fn spawn_gateway(
+    mut gw: HlGateway,
+    name: &'static str,
+    core: Option<usize>,
+) -> Result<(JoinHandle<()>, GatewayStop), String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let owner = Arc::clone(&stop);
+    // COPY: boot, once — the ≤ 8 KiB gateway, taken by value, moves into its
+    // thread's closure (which `Builder::spawn` boxes). Rejected: building the
+    // gateway on its own thread, which would need a handshake to report its
+    // boot errors.
+    let handle = std::thread::Builder::new()
+        .name(String::from(name))
+        .spawn(move || {
+            if let Some(core) = core {
+                match crate::pinning::pin_current_thread_to_core(core) {
+                    Ok(()) => info!(thread = name, core, "thread pinned"),
+                    Err(e) => info!(thread = name, ?e, "thread not pinned; continuing"),
+                }
+            }
+            run_gateway(&mut gw, &owner);
+            info!(thread = name, "the gateway stopped");
+        })
+        .map_err(|e| format!("spawn {name}: {e}"))?;
+    Ok((handle, GatewayStop(stop)))
 }
 
 /// Turn the gateway until its owner releases it — or, once the
@@ -341,5 +459,43 @@ fn run_gateway(gw: &mut HlGateway, owner: &AtomicBool) {
             }
         }
         gw.turn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arm_cfg, bind_perps, PerpAsk, PerpBinding};
+
+    const META: &[u8] = br#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40},{"name":"ETH","szDecimals":4,"maxLeverage":25}]}"#;
+
+    const fn ask(coin: &str, sym: u32, lot_1e6: Option<i64>) -> PerpAsk<'_> {
+        PerpAsk { coin, sym, lot_1e6 }
+    }
+
+    /// A refused binding: its error, and the table left unbound.
+    fn refused(meta: &[u8], asks: &[PerpAsk<'_>]) -> String {
+        let mut cfg = arm_cfg(6, 10_000, 10_000, 320);
+        let mut out = PerpBinding::new(asks.len());
+        let r = bind_perps(meta, asks, &mut cfg, &mut out);
+        assert_eq!(cfg.n_perps, 0, "a refused binding sets no count");
+        r.expect_err("refused")
+    }
+
+    #[test]
+    fn bind_perps_writes_the_table_in_place_and_refuses_what_it_cannot_bind() {
+        // BTC: szDecimals 5, a step of 1e-5 — a member lot of 10 ×1e6.
+        let mut cfg = arm_cfg(6, 10_000, 10_000, 320);
+        let mut out = PerpBinding::new(2);
+        let asks = [ask("BTC", 7, Some(10)), ask("ETH", 8, None)];
+        assert_eq!(bind_perps(META, &asks, &mut cfg, &mut out), Ok(()));
+        assert_eq!(cfg.n_perps, 2);
+        assert_eq!((cfg.perps[0].sym, cfg.perps[0].asset), (7, 0));
+        assert_eq!((cfg.perps[1].sym, cfg.perps[1].asset), (8, 1));
+        assert_eq!(out.specs.len(), 2);
+
+        assert!(refused(META, &[ask("BTC", 7, Some(100))]).contains("not the venue's size step"));
+        assert!(refused(META, &[ask("XRP", 7, None)]).contains("not a native Hyperliquid perp"));
+        assert!(refused(META, &[]).contains("perp(s) asked"));
+        let _ = refused(b"{", &[ask("BTC", 7, None)]);
     }
 }

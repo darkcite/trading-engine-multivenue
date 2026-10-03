@@ -456,6 +456,23 @@ pub struct ArmCounters {
     pub refused_leverage: u64,
 }
 
+/// XH4g: the reconciliation as the arm last read it ([`HlGatewayArm::recon_view`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconView {
+    /// When the perp sheet was last answered (monotonic ns; 0 = never).
+    pub sheet_ns: u64,
+    /// When the open orders were last answered (monotonic ns; 0 = never).
+    pub orders_ns: u64,
+    /// The last sheet agreed with the book in every bound perp, and held no
+    /// position the arm cannot place.
+    pub state_ok: bool,
+    /// The last orders read found no order of the slot the arm does not hold.
+    pub orders_ok: bool,
+    /// The drift high water, USD ×1e6 (a disagreement that survived two
+    /// sheets).
+    pub drift_hw_1e6: i64,
+}
+
 /// One tracked order. One cache line.
 #[repr(C, align(64))]
 #[derive(Copy, Clone, Debug, Default)]
@@ -973,6 +990,21 @@ impl HlGatewayArm {
             Some(self.anchor_1e8 / WIRE_PER_ENGINE)
         } else {
             None
+        }
+    }
+
+    /// XH4g: the reconciliation as last read — when each read was answered,
+    /// whether each agreed, the drift high water. The testnet battery's view
+    /// (a read answered a post timeout after an acknowledgement was issued
+    /// after it); the router reads [`HaltSignal`].
+    #[must_use]
+    pub const fn recon_view(&self) -> ReconView {
+        ReconView {
+            sheet_ns: self.sheet_ns,
+            orders_ns: self.orders_ns,
+            state_ok: self.state_ok,
+            orders_ok: self.orders_ok,
+            drift_hw_1e6: self.drift_hw_1e6,
         }
     }
 
@@ -5114,5 +5146,53 @@ mod tests {
             );
             case += 1;
         }
+    }
+
+    /// XH4g: the reconciliation's view — nothing before the first sheet;
+    /// then each read's answer time and verdict; a disagreement that
+    /// survives two sheets is the drift high water.
+    #[test]
+    fn recon_view_follows_each_read_and_the_drift() {
+        let c = cfg();
+        let (mut arm, mut v, t, st) = to_sheet(&c);
+        assert_eq!(arm.recon_view(), ReconView::default(), "nothing read yet");
+        v.send(read_end(&st, 1_000 * E8, 1));
+        let _ = arm.idle(t);
+        let r = arm.recon_view();
+        assert!(r.state_ok && r.sheet_ns == t, "{r:?}");
+        assert!(
+            !r.orders_ok && r.orders_ns == 0,
+            "the orders not read yet: {r:?}"
+        );
+        let od = v.take(CMD_READ_ORDERS).expect("the orders after the sheet");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        let r = arm.recon_view();
+        assert!(
+            r.orders_ok && r.orders_ns == t && r.drift_hw_1e6 == 0,
+            "{r:?}"
+        );
+
+        // A position the book never booked: one sheet disagrees, a second
+        // makes it the drift.
+        let (mut arm, mut v, t) = booted();
+        recon(
+            &mut arm,
+            &mut v,
+            t + 5 * S,
+            Some((E8, 100 * E8 as u64)),
+            &[],
+        );
+        let r = arm.recon_view();
+        assert!(!r.state_ok && r.drift_hw_1e6 == 0, "one sheet: {r:?}");
+        recon(
+            &mut arm,
+            &mut v,
+            t + 10 * S,
+            Some((E8, 100 * E8 as u64)),
+            &[],
+        );
+        let r = arm.recon_view();
+        assert!(!r.state_ok && r.drift_hw_1e6 > 0, "two sheets: {r:?}");
     }
 }

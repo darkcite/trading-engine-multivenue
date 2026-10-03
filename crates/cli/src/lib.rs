@@ -65,6 +65,8 @@ pub mod universe_boot;
 /// VRP V5: the VRP member's boot artifacts (`vrp.toml` + `vrp-seed.tsv`).
 pub mod vrp_boot;
 pub mod xsd_boot;
+/// XMM XH4g: the testnet battery (`exec-smoke --hl-perp --lifecycle`).
+pub mod xmm_battery;
 /// XMM XH1: the slot-6 member's boot (`xmm.toml` → `XmmParams`).
 pub mod xmm_boot;
 /// XMM XH4f: slot 6's live arm — the Hyperliquid gateway, booted (testnet).

@@ -392,6 +392,67 @@ struct ExecSmokeArgs {
     #[arg(long, default_value_t = false)]
     sell: bool,
 
+    /// **XMM XH4g — the testnet battery.** With `--lifecycle`: slot 6's
+    /// Hyperliquid gateway arm and its gateway, composed in-process as the
+    /// engine composes them, driven through ALO places, modifies (a price,
+    /// a size, a crossing one), cancels, `BadAloPx`, gateway TTLs, sweeps,
+    /// IoC round trips and reconciliations on the PERPS of `--coins` —
+    /// after phases A and B, on the testnet host only. Prices come from
+    /// the venue's mids at `--rest-bps` / `--cross-bps`; each order's
+    /// notional is `--usd` (≤ $80). Exit codes 30–39 (`xmm_battery`).
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "lifecycle",
+        conflicts_with = "dry_run"
+    )]
+    hl_perp: bool,
+
+    /// XH4g: the perps (comma-separated venue names).
+    #[arg(long, default_value = "BTC,ETH,SOL,XRP", requires = "hl_perp")]
+    coins: String,
+
+    /// XH4g: lifecycle cycles (the bar: 20).
+    #[arg(long, default_value_t = 20, requires = "hl_perp")]
+    cycles: u32,
+
+    /// XH4g: IoC round trips (an open and its reduce-only close).
+    #[arg(long, default_value_t = 3, requires = "hl_perp")]
+    fill_pairs: u32,
+
+    /// XH4g: each order's notional, USD (12 ..= 80).
+    #[arg(long, default_value_t = 15, requires = "hl_perp")]
+    usd: i64,
+
+    /// XH4g: a resting quote's distance behind the mid, bps.
+    #[arg(long, default_value_t = 500, requires = "hl_perp")]
+    rest_bps: i64,
+
+    /// XH4g: a crossing order's distance through the mid, bps.
+    #[arg(long, default_value_t = 300, requires = "hl_perp")]
+    cross_bps: i64,
+
+    /// XH4g: the TTL phase's lifetime, ms.
+    #[arg(long, default_value_t = 2_000, requires = "hl_perp")]
+    ttl_ms: u64,
+
+    /// XH4g: a sweep every this many cycles.
+    #[arg(long, default_value_t = 5, requires = "hl_perp")]
+    sweep_every: u32,
+
+    /// XH4g: stall past the dead man's deadline once (spends one of the
+    /// venue's ten daily `scheduleCancel` triggers).
+    #[arg(long, default_value_t = false, requires = "hl_perp")]
+    stall: bool,
+
+    /// XH4g: slot-6 orders resting at the start are a run that did not
+    /// end — let the arm's boot cancel them, on the run's perps only (one on
+    /// another coin holds the boot, and the flat read then finds it: exit
+    /// 38). Without this they refuse the run: they could be another slot-6
+    /// signer's.
+    #[arg(long, default_value_t = false, requires = "hl_perp")]
+    sweep_first: bool,
+
     /// Show exactly what phase C WOULD send, and send nothing.
     ///
     /// Phase C is the only thing here that can create state on a
@@ -1509,7 +1570,10 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     // Validate phase C's arguments BEFORE any network work. An
     // operator who forgot --px should learn that now, not after two
     // venue round-trips have already run.
-    if args.lifecycle && (args.px.is_none() || args.px2.is_none() || args.sz.is_none()) {
+    if args.lifecycle
+        && !args.hl_perp
+        && (args.px.is_none() || args.px2.is_none() || args.sz.is_none())
+    {
         error!("exec-smoke: --lifecycle needs --px, --px2 and --sz (all 1e8-scaled)");
         eprintln!(
             "exec-smoke: e.g. --lifecycle --asset 100032530 --px 1000000 --px2 2000000 --sz 1000000000\n\
@@ -1653,6 +1717,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
                 "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
                  corrupted one"
             );
+            if args.lifecycle && args.hl_perp {
+                return exec_hl_perp(&cfg, &args);
+            }
             if args.lifecycle {
                 return exec_lifecycle(&cfg, &args);
             }
@@ -2258,6 +2325,71 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
             ExitCode::from(e.code() as u8)
         }
     }
+}
+
+/// XMM XH4g: the testnet battery on slot 6's gateway arm
+/// (`cli::xmm_battery`). Runs only after phases A and B, like phase C,
+/// and only against the testnet host.
+fn exec_hl_perp(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --hl-perp: the battery runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let spec = cli::xmm_battery::BatterySpec {
+        coins: args
+            .coins
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+        cycles: args.cycles,
+        fill_pairs: args.fill_pairs,
+        usd: args.usd,
+        rest_bps: args.rest_bps,
+        cross_bps: args.cross_bps,
+        ttl_ms: args.ttl_ms,
+        sweep_every: args.sweep_every,
+        recon_ms: cli::xmm_live::RECON_MS,
+        stall: args.stall,
+        sweep_first: args.sweep_first,
+    };
+    if let Err(e) = spec.validate() {
+        error!("exec-smoke --hl-perp: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let sk = match cfg.secret_key() {
+        Ok(k) => k,
+        Err(e) => {
+            error!("exec-smoke --hl-perp: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let gcfg = exec_hyperliquid::GatewayCfg::production(
+        cfg.host.clone(),
+        TlsTransport::default_client_config(),
+        cfg.network,
+        cfg.master_addr,
+        cli::exec_boot::XMM_SLOT as u8,
+    );
+    info!(
+        host = %cfg.host,
+        coins = %args.coins,
+        cycles = args.cycles,
+        fill_pairs = args.fill_pairs,
+        usd = args.usd,
+        stall = args.stall,
+        "exec-smoke: XH4g — the testnet battery on slot 6's gateway arm"
+    );
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all and
+    // the flat read — never mid-run with quotes left resting.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --hl-perp: the signal handler: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let report = cli::xmm_battery::run(&spec, gcfg, sk);
+    cli::xmm_battery::log_report(&report);
+    println!("{}", report.to_json());
+    ExitCode::from(report.exit)
 }
 
 fn exec_lifecycle(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {

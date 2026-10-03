@@ -9,8 +9,9 @@
 //! application ping, answers every post by the test's [`Policy`] on the
 //! socket it came on, pushes stream frames to every live socket (as the
 //! venue does to both subscribed connections during a make-before-break
-//! swap), and serves `POST /exchange` for the REST fallback. Every
-//! connection gets its own thread.
+//! swap), and serves `POST /exchange` for the REST fallback and `POST
+//! /info` for reads ([`REST_INFO`], XMM XH4g). Every connection gets its
+//! own thread.
 //!
 //! COPY-DOCTRINE: test fixture; allocates and copies freely.
 
@@ -31,12 +32,18 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig, Stream};
 /// One post the venue received.
 #[derive(Clone, Debug)]
 pub struct Seen {
-    /// The WebSocket connection it came on (0, 1, … in accept order), or
-    /// `usize::MAX` for a REST post.
+    /// The WebSocket connection it came on (0, 1, … in accept order),
+    /// `usize::MAX` for a REST post, or [`REST_INFO`] for a REST `/info`
+    /// read.
     pub conn: usize,
     /// The post as sent: the WebSocket post, or the REST body.
     pub body: String,
 }
+
+/// [`Seen::conn`] of a REST `/info` read (XMM XH4g: the battery's reads;
+/// its answer is the policy's payload, as the venue's `/info` answers the
+/// data alone).
+pub const REST_INFO: usize = usize::MAX - 1;
 
 /// What the venue does with one post.
 #[derive(Clone, Debug)]
@@ -275,7 +282,11 @@ fn serve(mut sock: TcpStream, cfg: Arc<ServerConfig>, sh: &Shared) {
             serve_ws(&mut conn, &mut sock, &mut buf, len - head_end, &head, sh);
             return;
         }
-        assert!(head.starts_with("POST /exchange"), "request line: {head:?}");
+        let info = head.starts_with("POST /info");
+        assert!(
+            info || head.starts_with("POST /exchange"),
+            "request line: {head:?}"
+        );
         let cl: usize = head
             .lines()
             .find_map(|l| {
@@ -292,7 +303,7 @@ fn serve(mut sock: TcpStream, cfg: Arc<ServerConfig>, sh: &Shared) {
             }
         }
         let seen = Seen {
-            conn: usize::MAX,
+            conn: if info { REST_INFO } else { usize::MAX },
             body: String::from_utf8_lossy(&buf[head_end..head_end + cl]).to_string(),
         };
         sh.posts.lock().unwrap().push(seen.clone());
