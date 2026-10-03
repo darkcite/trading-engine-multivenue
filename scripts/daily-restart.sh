@@ -404,9 +404,12 @@ if [ "$rotate" = 1 ] && [ -f "$HOME/multivenue/xsd.toml" ] && [ -f "$HOME/multiv
     (
       cd "$REPO_DIR/claude-worker" || exit 0
       export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-      status="$(uv run python -m claude_worker.xsd_author status --table "$HOME/multivenue/xsd-table.tsv" 2>/dev/null)"
-      echo "daily-restart: $status" >&2
-      case "$status" in
+      # xsd_status, NOT status: zsh's $status is read-only (it is $?), and
+      # assigning it killed this subshell at every 0010 slot until
+      # 2026-09-27 (restart.log: "read-only variable: status").
+      xsd_status="$(uv run python -m claude_worker.xsd_author status --table "$HOME/multivenue/xsd-table.tsv" 2>/dev/null)"
+      echo "daily-restart: $xsd_status" >&2
+      case "$xsd_status" in
         *rotation_due=yes*|*"table absent"*)
           echo "daily-restart: xsd table rotation — re-running the screen" >&2
           uv run python -m claude_worker.xsd_author author \

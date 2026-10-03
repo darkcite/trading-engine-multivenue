@@ -35,12 +35,16 @@ fi
 # module's own --wait-sock-seconds does the precise waiting.
 sleep 10
 
-# (b) worker-serialization wait: bounded at ~5 min, 5 s cadence.
+# (b) worker-serialization wait: bounded at ~30 min, 5 s cadence. It
+# was ~5 min until 2026-09-27: the hourly candles cycle outgrew it once
+# the HAR lanes and hypercall_history joined (the Hypercall go-live),
+# and a boot that landed in it gave up — vm_rows_active 0 until the
+# next boot (seen at the 2026-09-26 21:15Z restart).
 i=0
 while pgrep -f 'claude[-_]worke[r]' >/dev/null 2>&1; do
   i=$((i + 1))
-  if [ "$i" -ge 60 ]; then
-    echo "recommit: worker busy > 5 min — giving up (next boot retries)" >&2
+  if [ "$i" -ge 360 ]; then
+    echo "recommit: worker busy > 30 min — giving up (next boot retries)" >&2
     exit 0
   fi
   sleep 5

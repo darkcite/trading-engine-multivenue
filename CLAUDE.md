@@ -11,7 +11,8 @@ A pure-Rust, zero-allocation, zero-copy, single-writer, lock-free engine that
 executes systematic strategies across a multivenue universe — Binance
 spot/USDM/COIN-M, OKX, Deribit, Hyperliquid (incl. HIP-4 outcome markets), Bybit,
 MEXC (data-only), Hypercall options (slot 7's S1 member trades them in
-PAPER only since HC11; the HC9 order arm runs as operator verbs only),
+PAPER since the 2026-09-26 go-live; the HC9 order arm runs as operator
+verbs only),
 Polymarket CLOB, Polygon RPC, plus a boot-selected options ladder.
 Strategies are composed at boot from an 8-slot set and may trade
 **any subset** of that universe; **Polymarket is one venue among several, not
@@ -29,8 +30,9 @@ queue law since XH2, paper only; `/state` `xmm` block, `engine_xmm_*`,
 `[labels.xmm]` and audit-pnl prints since XH3; boots only with
 `~/multivenue/xmm.toml`; `icdp` unlinked, its name refuses the boot,
 `backtest --member icdp` stays) · 7 hcv (Hypercall S1 options vs the HAR
-σ̂, hedged on HL perps, since HC11 2026-09-26 — lands DARK, O-HC18: paper
-only on the held-quote law, in no configured mask; boots only with
+σ̂, hedged on HL perps, since HC11 2026-09-26 — PAPER only on the
+held-quote law; in the live mask since the go-live, 2026-09-26 20:15Z
+(O-HC25; it landed DARK, O-HC18); boots only with
 `~/multivenue/hcv.toml`; a live slot 7 refuses the boot; its book persists
 in `hcv-state.tsv` by contract since HC11b, written off the engine thread;
 risk-policy "HYPERCALL — slot 7"). Member timers run per
@@ -260,9 +262,9 @@ in the script; `ai` = 48 is the floor every name includes).
   "The one-sided outcome `bbo` is not a parse error"). Open:
   `roll_health`'s second strike is unreachable (pre-existing); each roll's
   unsubscribe echoes still count as parse errors.
-- **HYPERCALL — the eighth market-data venue, DATA-ONLY, MERGED to main
-  2026-09-26 (branch `hypercall`: HC0–HC7, HAR H1–H3, O-HC8), NOT yet
-  configured live** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
+- **HYPERCALL — the eighth market-data venue, MERGED to main 2026-09-26
+  (branch `hypercall`: HC0–HC7, HAR H1–H3, O-HC8), LIVE since the 20:15Z
+  restart of 2026-09-26 — the data, the HAR set and slot 7 in PAPER** (vault `docs/research/hypercall/hypercall-integration-plan-2026-09-26.md`,
   rulings O-HC1..O-HC10: no keys, no exec arm; HC9–HC11 each a separate
   ruling after the research's R1 gate — HC8, the sign-only signer, came
   forward under O-HC17: `signer_eip712::hypercall`, every SDK type, 38
@@ -271,11 +273,22 @@ in the script; `ai` = 48 is the floor every name includes).
   `hypercall-live` verbs, never armed by the engine — its mainnet dust
   PASSED 2026-09-26 after the nonce fix `84fc32b` (the nonce is wall ms);
   HC10 bound the HIP-3 hedge perps; HC11 built slot 7, `strategy-hcv`,
-  DARK paper, and HC11b made its book persist across restarts; go-live is
-  staged for a daily
-  restart the operator names — `[hypercall]` and the `fees.toml` lines
-  just before it, `hypercall_history` scheduled, the HAR steps of the H3
-  plan §15; `[events]` is live since 2026-09-26 12:03Z, O-HC14).
+  DARK paper, and HC11b made its book persist across restarts. **The
+  go-live** (rulings O-HC25..O-HC29; runbook and log: vault
+  `docs/research/hypercall/hypercall-golive-2026-09-26.md`) put into
+  `~/multivenue`: `[hypercall]` (12 underlyings, 576 instruments), the
+  `fees.toml` hypercall lines, the 8 `xyz:` hedge coins (HL coin table
+  32/32), 7 TradFi USDM feeds, the W1 block, `har.toml` + 12 warm
+  seeds, `hcv.toml` and `STRATEGY=…+hcv`; `hypercall_history` rides
+  `candles-cycle.sh` hourly (`0a7303a`; its payouts lane waits for
+  `CLAUDE_WORKER_HC_WALLETS`); `[events]` is live since 2026-09-26
+  12:03Z, O-HC14. Slot 7's book restore is proven live (the 21:15Z
+  restart, 4 positions). OPEN — plan HC11c, the operator's ruling: at
+  the switch-on slot 7 spent its $50 premium cap in ~40 s on weekend
+  quotes 11–19 vol points wide — it buys at the ask and sells at the
+  bid against σ̂ but marks at the mid, so the $20 day stop tripped on
+  the spread; that stop is a level, not a latch; σ̂ ignores the HAR
+  set's weekday profile).
   `VenueId::Hypercall = 9`, tick
   lane 7, `crates/ingress-hypercall` (one public WS: the one-frame
   indicative subscribe, quotes kept crossed or one-sided as published,
@@ -299,7 +312,7 @@ in the script; `ai` = 48 is the floor every name includes).
   pinned by `tests/fixtures/vol/long-{1,2}.*`; `claude_worker.har_seed`),
   owned since H3 by the ENGINE: `core_vol::LongVolSet` (≤ 12 series,
   held by `StrategySet` in the regime's seat on its own 1 s timer, day
-  closes staggered one a poll — ~38 µs each on the M4; bench gate 82; no member reads it) from
+  closes staggered one a poll — ~38 µs each on the M4; bench gate 82; slot 7 reads its forecasts, O-HC22) from
   `~/multivenue/har.toml` (`core_config::har`; `--har`/`--har-dir`; NOT
   passed by the wrapper — an absent default file is the pre-H3 engine),
   restored at boot from `~/multivenue/har/seed-<NAME>.tsv` merged with the
