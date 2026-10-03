@@ -350,6 +350,7 @@ dependencies = [
  "engine",
  "engine-snapshot",
  "exec-binance",
+ "exec-gateway",
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",

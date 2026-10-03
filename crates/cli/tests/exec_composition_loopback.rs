@@ -27,6 +27,12 @@
 //! row resting, and the retirement leaves slot 2's; route
 //! `VenueSplit::modify` to `a` unconditionally → the Binance modify
 //! reaches `HlExchange`, which refuses the unbound symbol (LAW E-4).
+//!
+//! **XMM XH4f** ([`slot_six`]): slot 6 outermost on its own arm — the
+//! Hyperliquid gateway's engine half — through the same router: the
+//! queued contract (a landed modify renames the row, a cancel releases it
+//! on the arm's retirement, a refused modify's hold goes with its
+//! replacement's), XH2-C and the venue's day spend (S7-L1).
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -527,4 +533,403 @@ fn every_verb_reaches_the_arm_of_its_route_venue_and_the_ledger_follows() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **XMM XH4f — slot 6 outermost, on its own arm.** The Hyperliquid
+/// gateway's engine half (`HlGatewayArm`) behind `SlotSplit(6,
+/// NullLiveDispatcher, arm)` — the shape the engine boots for slot 6
+/// alone — with the gateway's end scripted in-process (the gateway's own
+/// turn is its loopback tests' and gate 96b's), driven through the router
+/// as the engine drives it: `on_idle`, the verbs, fills taken and booked.
+mod slot_six {
+    use super::*;
+    use core_types::{
+        ChannelEvent, ChannelId, EXEC_BLOCKED_UNSEEDED, ORDER_EVENT_REASON_BAD_ALO_PX,
+        ORDER_EVENT_REASON_OTHER,
+    };
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use exec_hyperliquid::arm::{ArmCfg, HlGatewayArm, PerpBind, ARM_PERPS};
+    use exec_hyperliquid::cmd::{
+        CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
+        CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+    };
+    use exec_hyperliquid::deadman::DeadManCfg;
+    use exec_hyperliquid::event::{
+        EVF_BUY, EVF_CMD_SHIFT, EVF_POST_ITEM, EVF_RESTING, EV_ACK, EV_CANCELED, EV_FILL,
+        EV_READ_DONE, EV_REJECTED, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE,
+    };
+    use exec_hyperliquid::gateway::{hl_duplex, HlGatewayEnd};
+    use exec_hyperliquid::rules::PerpRules;
+    use exec_hyperliquid::{ExecEvent, HlCmd};
+    use exec_router::{NullLiveDispatcher, PerpLimits};
+
+    const SLOT: u8 = 6;
+    const ASSET: u32 = 3;
+    const E6: i64 = 1_000_000;
+    const E8: i64 = 100_000_000;
+    const DAY_MS: u64 = 86_400_000;
+
+    type Slot6 = RoutedDispatcher<PaperDispatcher, SlotSplit<NullLiveDispatcher, HlGatewayArm>>;
+
+    /// The gateway's end, scripted: commands pulled into a list the test
+    /// takes from, events injected as the gateway builds them.
+    struct Gw {
+        end: HlGatewayEnd,
+        cmds: Vec<HlCmd>,
+    }
+
+    impl Gw {
+        /// The first command of `kind` the arm pushed, taken.
+        fn take(&mut self, kind: u8) -> HlCmd {
+            while let Some(c) = self.end.cmd.pop() {
+                self.cmds.push(*c);
+            }
+            let Some(i) = self.cmds.iter().position(|c| c.kind == kind) else {
+                let seen: Vec<u8> = self.cmds.iter().map(|c| c.kind).collect();
+                panic!("no command {kind} among {seen:?}");
+            };
+            self.cmds.remove(i)
+        }
+
+        fn send(&mut self, e: ExecEvent) {
+            assert!(self.end.evt.emit(&e), "event ring full");
+        }
+
+        /// A post item's verdict.
+        fn item(&mut self, c: &HlCmd, kind: u8, reason: u8, flags: u8) {
+            let bits = if c.kind <= CMD_CANCEL { c.kind } else { 0 };
+            self.send(ExecEvent {
+                client_oid: c.client_oid,
+                asset: c.asset,
+                kind,
+                reason,
+                slot: c.slot,
+                flags: EVF_POST_ITEM | (bits << EVF_CMD_SHIFT) | flags,
+                ..ExecEvent::default()
+            });
+        }
+
+        /// A read's end: the sheet's account value or the day's sum in
+        /// `px_1e8`, the budget's requests used or the day's rows in `aux`.
+        fn read_end(&mut self, c: &HlCmd, px_1e8: i64, aux: u64, venue_ms: u64) {
+            let read = match c.kind {
+                CMD_READ_ORDERS => READ_ORDERS,
+                CMD_READ_LIMIT => READ_LIMIT,
+                CMD_READ_DAY => READ_DAY,
+                _ => READ_STATE,
+            };
+            self.send(ExecEvent {
+                client_oid: c.client_oid,
+                venue_ms,
+                px_1e8,
+                aux,
+                kind: EV_READ_DONE,
+                reason: read,
+                slot: c.slot,
+                ..ExecEvent::default()
+            });
+        }
+
+        /// An `orderUpdates` row.
+        fn row(&mut self, kind: u8, cid: u64, reason: u8) {
+            self.send(ExecEvent {
+                client_oid: cid,
+                asset: ASSET,
+                kind,
+                reason,
+                slot: SLOT,
+                ..ExecEvent::default()
+            });
+        }
+
+        /// A `userFills` row, a buy.
+        fn bought(&mut self, cid: u64, px_1e8: i64, sz_1e8: i64, venue_ms: u64) {
+            self.send(ExecEvent {
+                client_oid: cid,
+                venue_ms,
+                px_1e8,
+                sz_1e8,
+                asset: ASSET,
+                kind: EV_FILL,
+                slot: SLOT,
+                flags: EVF_BUY,
+                ..ExecEvent::default()
+            });
+        }
+    }
+
+    fn quote(cid: u64, sym: SymbolId, px_1e6: i64, qty_1e6: i64) -> Order {
+        let mut o = Order::new(
+            core_time::now_ns(),
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            core_fill::ORDER_KIND_MAKER,
+            Price::from_raw(px_1e6),
+            Qty::from_raw(qty_1e6),
+            cid,
+        )
+        .with_post_only();
+        o.strategy_id = SLOT;
+        o
+    }
+
+    /// The engine's side of the fills: taken, then booked back.
+    fn book_fills(d: &mut Slot6) -> usize {
+        let mut n = 0;
+        while let Some(f) = d.try_next_fill() {
+            d.on_fill_booked(&f);
+            n += 1;
+        }
+        n
+    }
+
+    fn wall_ms() -> u64 {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after 1970");
+        u64::try_from(t.as_millis()).expect("ms")
+    }
+
+    /// | step | asserts |
+    /// |---|---|
+    /// | boot | the arm boots through the router's idle (the dead man's clear, the snapshot, the sweep, the sheet, the orders, the budget, the day); no order before |
+    /// | the day (S7-L1) | until it is read the slot is unseeded — its health says so, a place is refused; the venue's day spend then seeds the router's ledger through the split — slot 6's alone |
+    /// | place | reaches the arm, rests, books the router's row |
+    /// | modify | a landed modify RENAMES the row (the queued contract) |
+    /// | cancel | the replacement's cancel releases the row only on the arm's retirement — the rename, observed |
+    /// | refused modify | its asked size is held while unanswered; the hold goes with its replacement's retirement, the original rests on |
+    /// | XH2-C | a fill leaves a position no mark prices: growth refused; a mark lets it through |
+    /// | a replacement ending with its landing | the landing and the end in one pump: the rename drains before the retirement — no phantom row |
+    #[test]
+    fn slot_six_rides_its_gateway_arm_outermost_and_the_ledger_keeps_the_queued_contract() {
+        let hl = VenueId::Hyperliquid as u8;
+        let sym = make_symbol_id(VenueId::Hyperliquid, 950);
+        let bind = PerpBind {
+            sym,
+            asset: ASSET,
+            rules: PerpRules::new(4).expect("rules"),
+        };
+        let cfg = ArmCfg {
+            slot: SLOT,
+            perps: [bind; ARM_PERPS],
+            n_perps: 1,
+            expires_after_ms: 5_000,
+            post_timeout_ms: 5_000,
+            skew_ms: 2_000,
+            recon_ms: 5_000,
+            join_ms: 1_000,
+            gone_ms: 3_000,
+            shutdown_ms: 300,
+            own_account: false,
+            anchor_1e6: 0,
+            deadman: DeadManCfg::DEFAULT,
+            budget_floor: 2_000,
+            limit_ms: 600_000,
+            leverage: 0,
+        };
+        let (eng, end) = hl_duplex();
+        let arm = HlGatewayArm::new(&cfg, eng).expect("arm");
+        let mut gw = Gw {
+            end,
+            cmds: Vec::new(),
+        };
+        // Slot 6 live: order $100, gross $1 000, day $5 000, 16 orders;
+        // per perp $150, resting $200 (deviation 19's pair).
+        let mut route = ExecRoute::all_paper();
+        route
+            .set_slot(
+                SLOT as usize,
+                ExecMode::Live,
+                &[hl],
+                SlotCaps::new(100 * E6, 1_000 * E6, 5_000 * E6, 16),
+                HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+            )
+            .expect("slot 6");
+        route
+            .set_perp_limits(SLOT as usize, PerpLimits::new(150 * E6, 200 * E6))
+            .expect("the perp pair");
+        let mut d: Slot6 = RoutedDispatcher::new(
+            route,
+            PaperDispatcher::new(),
+            SlotSplit::new(SLOT, NullLiveDispatcher::new(), arm),
+            core_time::WallAnchor::now(),
+        );
+        // `finish_xmm_boot`: the member's perp as a LAW_LINEAR row.
+        d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0))
+            .expect("row");
+        let slot = SLOT as usize;
+
+        // --- The boot, through the router's idle.
+        gw.end.stats.set_gauges(0, true);
+        gw.end.stats.beat(core_time::now_ns());
+        d.on_idle();
+        let clear = gw.take(CMD_SCHEDULE_CANCEL);
+        gw.item(&clear, EV_ACK, 0, 0);
+        assert_eq!(
+            d.submit(&quote(99, sym, 100 * E6, E6 / 2)),
+            Err(DispatchError::RiskRefused),
+            "no order before the boot: the unseeded ledger refuses it before the arm is asked"
+        );
+        gw.send(ExecEvent {
+            kind: EV_SNAPSHOT,
+            ..ExecEvent::default()
+        });
+        d.on_idle();
+        let asked = gw.end.stats.sweep_requested();
+        gw.end.stats.set_sweep(asked, SWEEP_CLEAR);
+        d.on_idle();
+        let sheet = gw.take(CMD_READ_STATE);
+        gw.read_end(&sheet, 1_000 * E8, 0, 1);
+        d.on_idle();
+        let orders = gw.take(CMD_READ_ORDERS);
+        gw.read_end(&orders, 0, 0, 0);
+        d.on_idle();
+        let budget = gw.take(CMD_READ_LIMIT);
+        gw.read_end(&budget, 0, 100, 0);
+        d.on_idle();
+
+        // --- S7-L1: the day's spend — one page, two rows, $300, ending
+        // where it began — reaches the router through the split.
+        let day = gw.take(CMD_READ_DAY);
+        assert_eq!(d.live().venue_day_bought(slot), None, "not before its read");
+        // S7-L1, end to end: until the day is read the router's ledger is
+        // unseeded for slot 6 — its health says so, and a place is refused.
+        assert!(!d.ledger().is_slot_seeded(slot), "unseeded before the day");
+        assert_ne!(
+            d.exec_health(SLOT, core_time::now_ns()).blocked & EXEC_BLOCKED_UNSEEDED,
+            0
+        );
+        assert_eq!(
+            d.submit(&quote(98, sym, 100 * E6, E6 / 2)),
+            Err(DispatchError::RiskRefused),
+            "an unseeded slot places nothing"
+        );
+        gw.read_end(&day, 300 * E8, 2, day.time_ms);
+        d.on_idle();
+        assert!(
+            d.ledger().is_slot_seeded(slot),
+            "seeded once the day is read"
+        );
+        assert_eq!(
+            d.live().venue_day_bought(slot),
+            Some((day.time_ms / DAY_MS, 300 * E6))
+        );
+        assert_eq!(
+            d.live().venue_day_bought(3),
+            None,
+            "another slot's day is its own"
+        );
+        assert_eq!(d.ledger().slot_day_turnover_1e6(slot), 300 * E6, "adopted");
+
+        // --- A place rests: the router's row.
+        assert_eq!(d.submit(&quote(1, sym, 100 * E6, E6 / 2)), Ok(()));
+        let place = gw.take(CMD_PLACE);
+        assert_eq!(
+            (place.slot, place.asset, place.client_oid),
+            (SLOT, ASSET, 1)
+        );
+        gw.item(&place, EV_ACK, 0, EVF_RESTING);
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(slot), 1);
+        assert_eq!(d.ledger().resting_usd_1e6(slot), 50 * E6);
+
+        // --- A landed modify renames the row (1 → 2) ...
+        let q2 = quote(2, sym, 99 * E6, E6 / 2);
+        assert_eq!(d.modify(&ModifyReq::new(1, q2)), Ok(()));
+        let m = gw.take(CMD_MODIFY);
+        assert_eq!((m.client_oid, m.prev_client_oid), (2, 1));
+        gw.item(&m, EV_ACK, 0, EVF_RESTING);
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(slot), 1, "renamed, not added");
+        // ... and the replacement's cancel releases it on the arm's
+        // retirement only — which names 2, so the rename is observed.
+        assert_eq!(d.cancel(&CancelReq::of(&q2, core_time::now_ns())), Ok(()));
+        let c = gw.take(CMD_CANCEL);
+        assert_eq!(c.client_oid, 2);
+        assert_eq!(
+            d.ledger().slot_resting(slot),
+            1,
+            "a queued arm's cancel waits for its end"
+        );
+        gw.item(&c, EV_ACK, 0, 0);
+        gw.row(EV_CANCELED, 2, ORDER_EVENT_REASON_OTHER);
+        d.on_idle();
+        d.on_idle();
+        assert_eq!(
+            d.ledger().slot_resting(slot),
+            0,
+            "released by the retirement of 2"
+        );
+
+        // --- A refused modify: the asked size held while unanswered, the
+        // hold gone with the replacement's retirement.
+        assert_eq!(d.submit(&quote(3, sym, 100 * E6, E6 / 2)), Ok(()));
+        let place = gw.take(CMD_PLACE);
+        gw.item(&place, EV_ACK, 0, EVF_RESTING);
+        d.on_idle();
+        assert_eq!(
+            d.modify(&ModifyReq::new(3, quote(4, sym, 100 * E6, E6))),
+            Ok(())
+        );
+        assert_eq!(
+            d.ledger().resting_usd_1e6(slot),
+            100 * E6,
+            "held at the asked size"
+        );
+        let m = gw.take(CMD_MODIFY);
+        gw.item(&m, EV_REJECTED, ORDER_EVENT_REASON_BAD_ALO_PX, 0);
+        d.on_idle();
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(slot), 1, "the original rests on");
+        assert_eq!(
+            d.ledger().resting_usd_1e6(slot),
+            50 * E6,
+            "the hold went with 4's retirement"
+        );
+
+        // --- XH2-C: a fill leaves a position no mark prices — growth is
+        // refused until a mark arrives.
+        gw.bought(3, 100 * E8, E8 / 4, wall_ms());
+        d.on_idle();
+        assert_eq!(book_fills(&mut d), 1);
+        let grow = quote(5, sym, 100 * E6, E6 / 10);
+        assert_eq!(d.submit(&grow), Err(DispatchError::RiskRefused));
+        assert_eq!(d.counters().refused_unpriced, 1);
+        d.on_venue_event(&ChannelEvent::new(
+            core_time::now_ns(),
+            VenueId::Hyperliquid,
+            ChannelId::Mark,
+            sym,
+            0,
+            0,
+            100 * E6,
+            100 * E6,
+        ));
+        assert_eq!(d.submit(&grow), Ok(()));
+        assert_eq!(gw.take(CMD_PLACE).client_oid, 5);
+
+        // --- A replacement that ends with its landing, both in one pump
+        // before the next idle (risk r1): the rename drains before the
+        // retirement — no phantom row.
+        assert_eq!(d.ledger().slot_resting(slot), 2, "3 and 5");
+        assert_eq!(
+            d.modify(&ModifyReq::new(3, quote(6, sym, 99 * E6, E6 / 2))),
+            Ok(())
+        );
+        let m = gw.take(CMD_MODIFY);
+        gw.item(&m, EV_ACK, 0, EVF_RESTING);
+        gw.row(EV_CANCELED, 6, ORDER_EVENT_REASON_OTHER);
+        assert_eq!(
+            book_fills(&mut d),
+            0,
+            "the engine's fill drain pumps the arm"
+        );
+        d.on_idle();
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(slot), 1, "5 alone — no phantom 6");
+        for s in 0..8usize {
+            assert!(!d.halt().reason(s).is_halted(), "slot {s} halted");
+        }
+    }
 }

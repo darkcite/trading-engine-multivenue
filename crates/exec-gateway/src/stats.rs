@@ -154,10 +154,27 @@ struct GatewayLive {
     /// the venue's rate limits (advisory: the gateway enforces the
     /// throttle itself); published with the heartbeat.
     congestion: AtomicU64,
-    /// XH4e: cancels the gateway's own sweeps sent, ever — address
-    /// requests the engine charges to its budget by the delta; one add a
-    /// sweep round.
+    /// XH4e: cancels the gateway sent on its own — its sweeps' and (XH4f)
+    /// its TTLs' — ever: address requests the engine charges to its budget
+    /// by the delta; one add a sweep round or a TTL beat.
     sweep_cancels: AtomicU64,
+    /// XH4f: the worst post round trip of the recent window
+    /// ([`crate::RttWindow::worst`]), ns (0 = none); published with the
+    /// heartbeat.
+    rtt_worst_ns: AtomicU64,
+}
+
+/// Words a venue gateway may publish ([`GatewayStats::publish`]).
+pub const PUBLISHED_WORDS: usize = 32;
+
+/// XH4f — the words a venue gateway publishes for `/metrics`: its own
+/// counters and gauges, numbered by the venue. Written by the GATEWAY
+/// thread only, with its heartbeat (stored on change); read by the
+/// `/metrics` publisher alone — granules of their own, so the engine's
+/// per-order and idle reads never share a line with them.
+#[repr(C, align(128))]
+struct Published {
+    words: [AtomicU64; PUBLISHED_WORDS],
 }
 
 /// Shared stats of one gateway (one venue account): built once at boot,
@@ -169,6 +186,7 @@ pub struct GatewayStats {
     halt: HaltWord,
     gw: GatewayWritten,
     live: GatewayLive,
+    published: Published,
     /// Command push (engine) → the frame carrying it written to the socket.
     pub push_to_write: Lat,
     /// Action written → the venue's reply to that post.
@@ -183,7 +201,7 @@ pub struct GatewayStats {
 /// booting thread's stack before it moves into its `Arc` (≈ 65 KiB; the
 /// kit has no `unsafe` to build it in place, and a boot thread's stack is
 /// 8 MiB). A size change is reviewed here.
-pub const GATEWAY_STATS_SIZE: usize = 66_688;
+pub const GATEWAY_STATS_SIZE: usize = 66_944;
 
 const _: () = assert!(core::mem::align_of::<GatewayStats>() == 128);
 const _: () = assert!(core::mem::size_of::<EngineWritten>() == 128);
@@ -191,6 +209,7 @@ const _: () = assert!(core::mem::size_of::<EngineRare>() == 128);
 const _: () = assert!(core::mem::size_of::<HaltWord>() == 128);
 const _: () = assert!(core::mem::size_of::<GatewayWritten>() == 128);
 const _: () = assert!(core::mem::size_of::<GatewayLive>() == 128);
+const _: () = assert!(core::mem::size_of::<Published>() == 256);
 const _: () = assert!(core::mem::size_of::<GatewayStats>() == GATEWAY_STATS_SIZE);
 
 impl GatewayStats {
@@ -222,6 +241,10 @@ impl GatewayStats {
                 sweep_state: z(),
                 congestion: z(),
                 sweep_cancels: z(),
+                rtt_worst_ns: z(),
+            },
+            published: Published {
+                words: [const { AtomicU64::new(0) }; PUBLISHED_WORDS],
             },
             push_to_write: Lat::new(),
             post_rtt: Lat::new(),
@@ -362,12 +385,34 @@ impl GatewayStats {
         }
     }
 
-    /// XH4e: a sweep round sent `n` cancels (gateway only; one add a
-    /// round, none for an empty one).
+    /// XH4f: publish the recent window's worst post round trip, ns
+    /// (gateway only, with its heartbeat; stored on change).
+    #[inline]
+    pub fn set_rtt_worst(&self, ns: u64) {
+        if self.live.rtt_worst_ns.load(Ordering::Relaxed) != ns {
+            self.live.rtt_worst_ns.store(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// XH4e: a sweep round (XH4f: or a TTL beat) sent `n` cancels of the
+    /// gateway's own (gateway only; one add, none for an empty one).
     #[inline]
     pub fn note_sweep_cancels(&self, n: u64) {
         if n > 0 {
             self.live.sweep_cancels.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// XH4f: publish word `i` of the venue's numbering (gateway only, with
+    /// its heartbeat; stored on change). An index past [`PUBLISHED_WORDS`]
+    /// is a numbering bug: asserted in debug builds, ignored in release.
+    #[inline]
+    pub fn publish(&self, i: usize, v: u64) {
+        debug_assert!(i < PUBLISHED_WORDS, "published word {i}");
+        if let Some(w) = self.published.words.get(i) {
+            if w.load(Ordering::Relaxed) != v {
+                w.store(v, Ordering::Relaxed);
+            }
         }
     }
 
@@ -397,10 +442,26 @@ impl GatewayStats {
         self.live.congestion.load(Ordering::Relaxed)
     }
 
-    /// XH4e: cancels the gateway's sweeps sent, ever.
+    /// XH4f: the recent window's worst post round trip, ns (0 = none).
+    #[inline]
+    pub fn rtt_worst_ns(&self) -> u64 {
+        self.live.rtt_worst_ns.load(Ordering::Relaxed)
+    }
+
+    /// XH4e: cancels the gateway sent on its own — its sweeps' and (XH4f)
+    /// its TTLs' — ever.
     #[inline]
     pub fn sweep_cancels(&self) -> u64 {
         self.live.sweep_cancels.load(Ordering::Relaxed)
+    }
+
+    /// XH4f: word `i` as last published (0 = never, or past the table).
+    #[inline]
+    pub fn published(&self, i: usize) -> u64 {
+        self.published
+            .words
+            .get(i)
+            .map_or(0, |w| w.load(Ordering::Relaxed))
     }
 
     /// Commands the engine pushed / the ring refused (full).
@@ -499,5 +560,19 @@ mod tests {
         s.set_gauges(5, true);
         s.set_gauges(0, false);
         assert_eq!(s.io()[6..], [0, 0]);
+    }
+
+    #[test]
+    fn a_published_word_reads_back_and_its_granules_are_their_own() {
+        let s = GatewayStats::new();
+        assert_eq!(s.published(3), 0, "never published");
+        s.publish(3, 42);
+        s.publish(PUBLISHED_WORDS - 1, 7);
+        assert_eq!((s.published(3), s.published(PUBLISHED_WORDS - 1)), (42, 7));
+        assert_eq!(s.published(PUBLISHED_WORDS), 0, "past the table");
+        let p = core::ptr::addr_of!(s.published) as usize;
+        let l = core::ptr::addr_of!(s.live) as usize;
+        assert_eq!(p % 128, 0);
+        assert!(p.abs_diff(l) >= 128);
     }
 }

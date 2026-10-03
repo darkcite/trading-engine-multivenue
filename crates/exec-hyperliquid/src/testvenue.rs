@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_net::{expected_accept, ws_read_frame, ws_unmask_in_place, WsOpcode, WsReadResult};
 use rcgen::generate_simple_self_signed;
@@ -47,7 +47,9 @@ pub enum Answer {
     Error(String),
     /// Answer a read (XH4d): `{"type":"info","payload":<json>}`.
     Info(String),
-    /// [`Answer::Action`], after a pause on that socket.
+    /// [`Answer::Action`], this much later — the socket keeps streaming
+    /// meanwhile (pushes and other posts' answers go out first), as a real
+    /// venue's stream rows can come before a post's answer (XMM XH4f).
     Later(Duration, String),
     /// Never answer.
     Silent,
@@ -355,10 +357,24 @@ fn serve_ws(
     let idx = sh.ws_conns.fetch_add(1, Ordering::SeqCst);
     let (ptx, prx) = mpsc::channel::<Vec<u8>>();
     sh.push.0.lock().unwrap().push(ptx);
+    // `Answer::Later` answers, written when due (the loop turns every 5 ms).
+    let mut later: Vec<(Instant, String)> = Vec::new();
     loop {
         while let Ok(f) = prx.try_recv() {
             if !write(conn, sock, &server_frame(0x1, &f)) {
                 return;
+            }
+        }
+        let now = Instant::now();
+        let mut k = 0;
+        while k < later.len() {
+            if later[k].0 <= now {
+                let (_, f) = later.remove(k);
+                if !write(conn, sock, &server_frame(0x1, f.as_bytes())) {
+                    return;
+                }
+            } else {
+                k += 1;
             }
         }
         while let WsReadResult::Frame { header, payload } = ws_read_frame(&buf[..len]) {
@@ -406,8 +422,8 @@ fn serve_ws(
                 match answer {
                     Answer::Action(p) => Some(post_frame(id, "action", &p)),
                     Answer::Later(d, p) => {
-                        thread::sleep(d);
-                        Some(post_frame(id, "action", &p))
+                        later.push((Instant::now() + d, post_frame(id, "action", &p)));
+                        None
                     }
                     Answer::Error(m) => Some(post_frame(id, "error", &format!("\"{m}\""))),
                     Answer::Info(p) => Some(post_frame(id, "info", &p)),

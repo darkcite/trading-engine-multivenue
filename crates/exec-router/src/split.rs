@@ -274,6 +274,26 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
             self.a.venue_day_bought(slot)
         }
     }
+
+    /// XMM XH4f: each slot's health, from the arm that trades it.
+    #[inline]
+    fn exec_health(&self, slot: u8, now_ns: NsTs) -> core_types::ExecHealth {
+        if slot == self.slot {
+            self.b.exec_health(slot, now_ns)
+        } else {
+            self.a.exec_health(slot, now_ns)
+        }
+    }
+
+    /// XMM XH4f (D11): the gateway arm's report, from whichever arm holds
+    /// one — the split slot's first.
+    fn gateway_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::GatewayArmReport,
+    ) -> bool {
+        self.b.gateway_arm_report(now_ns, out) || self.a.gateway_arm_report(now_ns, out)
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +315,9 @@ mod tests {
         cancel_all_calls: u32,
         cancel_all_err: bool,
         state: u8,
+        health: core_types::ExecHealth,
+        /// A gateway arm's `pushed` (0 = no gateway arm).
+        gw: u64,
     }
 
     impl OrderDispatch for Arm {
@@ -321,6 +344,21 @@ mod tests {
         }
         fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
             self.day
+        }
+        fn exec_health(&self, _slot: u8, _now_ns: NsTs) -> core_types::ExecHealth {
+            self.health
+        }
+        fn gateway_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::GatewayArmReport,
+        ) -> bool {
+            if self.gw == 0 {
+                return false;
+            }
+            out.present = 1;
+            out.pushed = self.gw;
+            true
         }
         fn stats(&self) -> DispatchStats {
             DispatchStats::default()
@@ -388,6 +426,38 @@ mod tests {
         assert_eq!(s.halt_signal_for(0).reject_streak, 1);
         assert_eq!(s.halt_signal_for(0).pnl_delta_usd_1e6, -9);
         assert_eq!(s.halt_signal().reject_streak, 7, "slot-agnostic = a");
+    }
+
+    /// XMM XH4f: slot 6's health is its own arm's, never another slot's.
+    #[test]
+    fn each_slot_reads_its_own_arm_s_health() {
+        use core_types::{ExecHealth, EXEC_BLOCKED_NOT_READY, EXEC_CONGESTION_BUSY};
+        let mut s = split();
+        s.a_mut().health = ExecHealth::new(0, EXEC_CONGESTION_BUSY, 50);
+        s.b_mut().health = ExecHealth::new(EXEC_BLOCKED_NOT_READY, 0, 0);
+        assert_eq!(
+            s.exec_health(3, 1),
+            ExecHealth::new(0, EXEC_CONGESTION_BUSY, 50)
+        );
+        assert_eq!(
+            s.exec_health(0, 1),
+            ExecHealth::new(EXEC_BLOCKED_NOT_READY, 0, 0)
+        );
+    }
+
+    /// XMM XH4f (D11): the gateway arm's report from whichever arm holds
+    /// one — the split slot's first.
+    #[test]
+    fn the_gateway_arm_s_report_comes_from_the_arm_that_holds_one() {
+        let mut s = split();
+        let mut r = clob_dispatcher::GatewayArmReport::default();
+        assert!(!s.gateway_arm_report(1, &mut r), "neither arm holds one");
+        s.a_mut().gw = 3;
+        assert!(s.gateway_arm_report(1, &mut r));
+        assert_eq!(r.pushed, 3);
+        s.b_mut().gw = 6;
+        assert!(s.gateway_arm_report(1, &mut r));
+        assert_eq!(r.pushed, 6, "the split slot's arm first");
     }
 
     #[test]

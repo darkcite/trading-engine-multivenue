@@ -119,14 +119,16 @@ use core_net::{
     WS_CLIENT_HDR_MAX,
 };
 use core_time::now_ns;
-use core_types::ORDER_EVENT_REASON_NONE;
+use core_types::{
+    ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_EXPIRED, ORDER_EVENT_REASON_NONE,
+};
 use exec_gateway::stats::{
     CONGESTION_BUSY, CONGESTION_NONE, CONGESTION_RATE_LIMITED, CONGESTION_THROTTLED,
     HALT_TIMER_FULL, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING,
 };
 use exec_gateway::{
     boxed_array, duplex, CmdRx, EngineEnd, EvtTx, Expired, GatewayEnd, GatewayStats, Idle, Mbb,
-    MbbAction, Pending, RateWindow, SlotState, TimerId, TimerQueue, HALT_NONE,
+    MbbAction, Pending, RateWindow, RttWindow, SlotState, TimerId, TimerQueue, HALT_NONE,
 };
 use mio::{Events, Poll};
 use rustls::pki_types::ServerName;
@@ -142,14 +144,15 @@ use crate::cmd::{
     HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE, CMD_READ_DAY,
     CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
 };
+use crate::event::REASON_NOT_FOUND;
 use crate::event::{
-    reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_FILLED,
-    EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_FILL, EV_FILL_META, EV_GAP, EV_HALT,
-    EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
-    EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT, GAP_UPDATES_UNREADABLE, READ_DAY,
-    READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL, REASON_MALFORMED,
-    REASON_NOT_READY, REASON_RATE_LIMIT, REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT,
-    SLOT_FOREIGN,
+    never_left, reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED,
+    EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_CANCELED, EV_FILL,
+    EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED,
+    EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT,
+    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED,
+    REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_SETTLEMENT,
+    REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
@@ -170,6 +173,7 @@ use crate::response::{
     ITEM_SUCCESS,
 };
 use crate::sign::{sign_action, Network, Vault};
+use crate::ttl::{TtlTable, TTL_CANCEL_MARK};
 use crate::userws::{scan_user_fills, sum_fill_rows, TidRing, UserFill, SNAPSHOT_RING};
 use crate::wspost::{classify, PostKind, WsIn};
 
@@ -253,6 +257,19 @@ const RATE_LIMITED_NS: u64 = 10_000_000_000;
 /// others 20.
 const READ_WEIGHT: u32 = 20;
 const STATE_READ_WEIGHT: u32 = 2;
+
+/// XH4f — the IP weight a minute an arm's periodic reads spend: the sheet
+/// and the orders every `recon_ms`, the budget every `limit_ms` (the XH4e
+/// amendment's arithmetic, pinned where an arm is composed). Zero periods
+/// read as unbounded.
+#[must_use]
+pub const fn read_weight_per_min(recon_ms: u64, limit_ms: u64) -> u64 {
+    if recon_ms == 0 || limit_ms == 0 {
+        return u64::MAX;
+    }
+    (60_000 / recon_ms) * (READ_WEIGHT + STATE_READ_WEIGHT) as u64
+        + (60_000 / limit_ms) * READ_WEIGHT as u64
+}
 /// The sweep machine's phases.
 const SW_IDLE: u8 = 0;
 const SW_READ: u8 = 1;
@@ -322,6 +339,36 @@ pub struct GatewayCfg {
     /// XH4e: its share of the venue's WebSocket messages a minute
     /// ([`WS_MSG_SHARE`] in production; > 0).
     pub ws_msgs_per_min: u32,
+}
+
+impl GatewayCfg {
+    /// XH4f: one arm's gateway in production — the post timeout, the idle
+    /// policy and the rate shares at their defaults, the slot mask that
+    /// arm's one slot.
+    #[must_use]
+    pub fn production(
+        host: String,
+        tls: Arc<ClientConfig>,
+        network: Network,
+        master: [u8; 20],
+        slot: u8,
+    ) -> Self {
+        Self {
+            host,
+            port: crate::config::HTTPS_PORT,
+            tls,
+            network,
+            master,
+            slots: 1u8 << (slot & 7),
+            post_timeout_ns: POST_TIMEOUT_NS,
+            idle: Idle::new(
+                exec_gateway::idle::SPIN_POLLS_DEFAULT,
+                exec_gateway::idle::PARK_NS_DEFAULT,
+            ),
+            ip_weight_per_min: IP_WEIGHT_SHARE,
+            ws_msgs_per_min: WS_MSG_SHARE,
+        }
+    }
 }
 
 /// Why the gateway could not be built.
@@ -404,7 +451,7 @@ impl CoinMap {
 }
 
 /// The gateway's own counters (the stats granules carry the shared
-/// ones; `/metrics` publishes these from XH4f).
+/// ones); published at its heartbeat for `/metrics` ([`pw`], XH4f).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct GatewayCounters {
     /// Fills emitted.
@@ -448,6 +495,59 @@ pub struct GatewayCounters {
     pub sweep_unmapped: u64,
     /// Growing commands refused unsent at 80 % of a rate share (XH4e).
     pub throttled: u64,
+    /// TTL cancels sent (XH4f, D9).
+    pub ttl_cancels: u64,
+    /// Orders whose TTL the full table could not keep (XH4f).
+    pub ttl_full: u64,
+}
+
+/// XH4f (D11) — the words this gateway publishes at its heartbeat
+/// ([`GatewayStats::publish`]) for its arm's report: its own counters, then
+/// its rate windows' sums. One numbering, written here by name and read by
+/// the arm by name.
+pub mod pw {
+    /// [`super::GatewayCounters::fills`].
+    pub const FILLS: usize = 0;
+    /// [`super::GatewayCounters::fills_scan_failed`].
+    pub const FILLS_SCAN_FAILED: usize = 1;
+    /// [`super::GatewayCounters::updates`].
+    pub const UPDATES: usize = 2;
+    /// [`super::GatewayCounters::updates_ignored`].
+    pub const UPDATES_IGNORED: usize = 3;
+    /// [`super::GatewayCounters::updates_scan_failed`].
+    pub const UPDATES_SCAN_FAILED: usize = 4;
+    /// [`super::GatewayCounters::answers_unreadable`].
+    pub const ANSWERS_UNREADABLE: usize = 5;
+    /// [`super::GatewayCounters::answers_mismatched`].
+    pub const ANSWERS_MISMATCHED: usize = 6;
+    /// [`super::GatewayCounters::ws_errors`].
+    pub const WS_ERRORS: usize = 7;
+    /// [`super::GatewayCounters::local_refusals`].
+    pub const LOCAL_REFUSALS: usize = 8;
+    /// [`super::GatewayCounters::cancels_untimed`].
+    pub const CANCELS_UNTIMED: usize = 9;
+    /// [`super::GatewayCounters::dials`].
+    pub const DIALS: usize = 10;
+    /// [`super::GatewayCounters::conn_drops`].
+    pub const CONN_DROPS: usize = 11;
+    /// [`super::GatewayCounters::sweep_rounds`].
+    pub const SWEEP_ROUNDS: usize = 12;
+    /// [`super::GatewayCounters::sweep_unmapped`].
+    pub const SWEEP_UNMAPPED: usize = 13;
+    /// [`super::GatewayCounters::throttled`].
+    pub const THROTTLED: usize = 14;
+    /// [`super::GatewayCounters::ttl_cancels`].
+    pub const TTL_CANCELS: usize = 15;
+    /// [`super::GatewayCounters::ttl_full`].
+    pub const TTL_FULL: usize = 16;
+    /// The IP-weight window's sum (the last minute).
+    pub const RATE_IP: usize = 17;
+    /// The WebSocket-message window's sum (the last minute).
+    pub const RATE_WS: usize = 18;
+    /// Words published.
+    pub const N: usize = 19;
+    // The last word and the count move together, inside the granule.
+    const _: () = assert!(RATE_WS + 1 == N && N <= exec_gateway::stats::PUBLISHED_WORDS);
 }
 
 /// One resting order of ours a sweep read found: what its cancel takes.
@@ -751,10 +851,26 @@ fn gateway_event(kind: u8, aux: u64, venue_ms: u64, now_ns: u64) -> ExecEvent {
     }
 }
 
+/// XH4f (D9): whether a TTL cancel's refusal uses up one of its tries — a
+/// venue refusal does, account-level ones included (one the venue repeats
+/// every time stays bounded); one that never left this host
+/// ([`never_left`]) or met the venue's rate limit (not processed) does not.
+#[inline]
+const fn ttl_try_counts(reason: u8) -> bool {
+    !never_left(reason) && reason != REASON_RATE_LIMIT
+}
+
 /// The event an answer's status makes of an item.
 #[inline]
 fn answer_event(r: &ItemRef, s: &ItemStatus, id: u64, now_ns: u64) -> ExecEvent {
-    let mut ev = r.event(EV_ACK, ORDER_EVENT_REASON_NONE, id, now_ns);
+    // XH4f (D9): a TTL cancel's success reads EXPIRED — the arm closes the
+    // order as the TTL's.
+    let why = if r.kind == CMD_CANCEL && r.prev == TTL_CANCEL_MARK {
+        ORDER_EVENT_REASON_EXPIRED
+    } else {
+        ORDER_EVENT_REASON_NONE
+    };
+    let mut ev = r.event(EV_ACK, why, id, now_ns);
     match s.kind {
         ITEM_RESTING => {
             ev.oid = s.oid;
@@ -811,6 +927,11 @@ struct Router {
     /// XH4e: IP weight answers added (`userFillsByTime`: 1 per 20 rows),
     /// charged at the gateway's next turn.
     read_weight: u32,
+    /// XH4f: the recent answered posts' round trips — the member's pull
+    /// window, published with the heartbeat.
+    rtt: Box<RttWindow>,
+    /// XH4f (D9): the orders the gateway cancels at their TTL.
+    ttl: Box<TtlTable>,
 }
 
 impl Router {
@@ -824,11 +945,15 @@ impl Router {
             items: [ItemStatus::default(); MAX_ORDERS],
             fills: vec![UserFill::default(); SNAPSHOT_RING].into_boxed_slice(),
             updates: vec![OrderUpdate::default(); MAX_UPDATES].into_boxed_slice(),
-            // COPY: two 64 KiB dedupe rings built on the stack and moved
-            // to the heap, once at boot — rejected: an unsafe in-place
-            // initialisation of a type whose fields are private.
+            // COPY: two 64 KiB dedupe rings, and (XH4f) the 1 088 B RTT
+            // window and the 3 088 B TTL table (both const-asserted), built
+            // on the stack and moved to the heap, once at boot — rejected:
+            // an unsafe in-place initialisation of types whose fields are
+            // private.
             tids: Box::new(TidRing::new()),
             seen_updates: Box::new(TidRing::new()),
+            rtt: Box::new(RttWindow::new()),
+            ttl: Box::new(TtlTable::new()),
             snapshot_absorbed: false,
             coins,
             counters: GatewayCounters::default(),
@@ -907,9 +1032,36 @@ impl Router {
                 }
                 let mut i = 0usize;
                 while i < m {
-                    let ev = answer_event(&rec.items[i], &self.items[i], id, now);
+                    let r = &rec.items[i];
+                    let ev = answer_event(r, &self.items[i], id, now);
                     if ev.reason == REASON_RATE_LIMIT {
                         self.rate_limited_ns = now;
+                    }
+                    // XH4f (D9): a cancel that succeeded — the arm's or the
+                    // TTL's — ends the TTL. A not-found ends nothing: about
+                    // an order still in flight on another socket it does not
+                    // mean gone (the row waits for the order's end; a late
+                    // landing sends the TTL cancel again). A TTL cancel the
+                    // venue refused otherwise goes again — any refusal but
+                    // the rate limit counts toward its tries — so the TTL holds
+                    // through an engine stall past its first try. A refused
+                    // place or modify never rested; a landed modify ends its
+                    // original (its replacement inherited the deadline).
+                    if r.kind == CMD_CANCEL {
+                        if ev.kind == EV_ACK {
+                            let _ = self.ttl.forget(r.slot, r.client_oid);
+                        } else if r.prev == TTL_CANCEL_MARK {
+                            if ev.reason == REASON_NOT_FOUND {
+                                self.ttl.missed(r.slot, r.client_oid);
+                            } else {
+                                let counted = ttl_try_counts(ev.reason);
+                                self.ttl.retry(r.slot, r.client_oid, now, counted);
+                            }
+                        }
+                    } else if ev.kind == EV_REJECTED {
+                        let _ = self.ttl.forget(r.slot, r.client_oid);
+                    } else if r.kind == CMD_MODIFY {
+                        let _ = self.ttl.forget(r.slot, r.prev);
                     }
                     emit_to(&mut self.evt, &ev);
                     i += 1;
@@ -1155,7 +1307,22 @@ impl Router {
         }
         let mut i = 0usize;
         while i < usize::from(rec.n) {
-            emit_to(&mut self.evt, &rec.items[i].event(kind, reason, id, now));
+            let r = &rec.items[i];
+            // XH4f (D9): a TTL cancel refused or unanswered goes again — a
+            // venue refusal counts toward its tries; a doubt, one that never
+            // left this host and the rate limit never do (the
+            // arm's own cancel leaves the TTL running); a refused place or
+            // modify never rested; an unanswered one waits for its order's
+            // end row.
+            if r.kind == CMD_CANCEL {
+                if r.prev == TTL_CANCEL_MARK {
+                    let counted = kind == EV_REJECTED && ttl_try_counts(reason);
+                    self.ttl.retry(r.slot, r.client_oid, now, counted);
+                }
+            } else if kind == EV_REJECTED {
+                let _ = self.ttl.forget(r.slot, r.client_oid);
+            }
+            emit_to(&mut self.evt, &r.event(kind, reason, id, now));
             i += 1;
         }
         self.finish(id, now);
@@ -1185,6 +1352,8 @@ impl Router {
             }
             // XH4e: the congestion word's moving average.
             self.rtt_ewma_ns = self.rtt_ewma_ns - self.rtt_ewma_ns / 8 + rtt / 8;
+            // XH4f: the member's pull window.
+            self.rtt.record(now, rtt);
         }
         let _ = self.pending.release(id);
     }
@@ -1288,6 +1457,20 @@ impl Router {
                 self.counters.updates_ignored += 1;
             } else if self.seen_updates.admit(update_key(u)) {
                 let (slot, client_oid) = owner(u.cloid);
+                // XH4f (D9): an order's end drops its TTL; a plain `canceled`
+                // row after its TTL cancel went is the TTL's (EXPIRED) — a
+                // venue-specific end (margin, self-trade, the dead man's
+                // schedule …) keeps its reason. An order seen resting after
+                // its TTL cancel went may have landed late (`TtlTable::seen`).
+                let mut reason = u.reason;
+                if u.kind == EV_RESTING {
+                    self.ttl.seen(slot, client_oid);
+                } else if self.ttl.forget(slot, client_oid) == Some(true)
+                    && u.kind == EV_CANCELED
+                    && u.reason == ORDER_EVENT_REASON_CANCEL_REQUESTED
+                {
+                    reason = ORDER_EVENT_REASON_EXPIRED;
+                }
                 let ev = ExecEvent {
                     ts_ns: now,
                     venue_ms: u.status_ms,
@@ -1298,7 +1481,7 @@ impl Router {
                     aux: 0,
                     asset: self.coins.asset(u.coin.of(frame)),
                     kind: u.kind,
-                    reason: u.reason,
+                    reason,
                     slot,
                     flags: if u.is_buy { EVF_BUY } else { 0 },
                 };
@@ -1363,11 +1546,12 @@ pub struct HlGateway {
     frames: u64,
 }
 
-// The gateway's inline state — what `new` moves to its thread once (its
-// tables are on the heap): 7 936 B released, 8 000 B with debug assertions
-// (mio 0.8's debug-only selector ids in its `Poll`s and `TcpStream`s) —
-// held under 8 KiB: a bound, not a pin, so a rustls or mio bump does not
-// break the build while the struct stays small.
+// The gateway's inline state — what `new` returns and its thread takes (its
+// tables are on the heap): 7 936 B released at XH4e, 8 000 B with debug
+// assertions (mio 0.8's debug-only selector ids in its `Poll`s and
+// `TcpStream`s), a few words more since XH4f's two boxed Router tables and
+// two counters — held under 8 KiB: a bound, not a pin, so a rustls or mio
+// bump does not break the build while the struct stays small.
 const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
 
 impl HlGateway {
@@ -1394,7 +1578,8 @@ impl HlGateway {
         let GatewayEnd { cmd, evt, stats } = end;
         // COPY: the ≤ 1.4 KiB coin table moves into place once at boot,
         // and the gateway itself (≤ 8 KiB, const-asserted; its tables on
-        // the heap) moves to its thread once — rejected: boxing each,
+        // the heap) moves a few times at boot — out of this `Result`, into
+        // its thread's closure and the spawn — rejected: boxing each,
         // which buys nothing at boot.
         Ok(Self {
             rt: Router::new(evt, stats, coins),
@@ -1485,10 +1670,21 @@ impl HlGateway {
             .stats
             .set_gauges(self.rt.pending.live() as u64, self.mbb.active().is_some());
         if now.saturating_sub(self.beat_ns) >= BEAT_NS {
+            // XH4f (D9): the TTLs that ended since the last beat.
+            self.fire_ttls(now);
+            // XH4f: the rate windows move with the clock, not only with
+            // spend (XH4e moved them on spend alone): a quiet second leaves
+            // them before the congestion word and the throttle read them.
+            self.ip.advance(now);
+            self.ws.advance(now);
             // XH4e: the congestion word with the heartbeat — at most ten
             // stores a second on the line the engine polls; it is advisory
             // (`admit` judges the throttle itself, command by command).
             self.publish_congestion(now);
+            // XH4f: the recent answers' worst round trip, with it.
+            self.rt.stats.set_rtt_worst(self.rt.rtt.worst(now));
+            // XH4f (D11): the counters and the windows, for `/metrics`.
+            self.publish_counters();
             self.rt.stats.beat(now);
             self.beat_ns = now;
         }
@@ -1750,6 +1946,32 @@ impl HlGateway {
         self.rt.stats.set_congestion(level);
     }
 
+    /// XH4f (D11): publish the gateway's own counters and its rate windows'
+    /// sums for the arm's report ([`pw`]), each stored on change.
+    fn publish_counters(&self) {
+        let c = &self.rt.counters;
+        let s = &self.rt.stats;
+        s.publish(pw::FILLS, c.fills);
+        s.publish(pw::FILLS_SCAN_FAILED, c.fills_scan_failed);
+        s.publish(pw::UPDATES, c.updates);
+        s.publish(pw::UPDATES_IGNORED, c.updates_ignored);
+        s.publish(pw::UPDATES_SCAN_FAILED, c.updates_scan_failed);
+        s.publish(pw::ANSWERS_UNREADABLE, c.answers_unreadable);
+        s.publish(pw::ANSWERS_MISMATCHED, c.answers_mismatched);
+        s.publish(pw::WS_ERRORS, c.ws_errors);
+        s.publish(pw::LOCAL_REFUSALS, c.local_refusals);
+        s.publish(pw::CANCELS_UNTIMED, c.cancels_untimed);
+        s.publish(pw::DIALS, c.dials);
+        s.publish(pw::CONN_DROPS, c.conn_drops);
+        s.publish(pw::SWEEP_ROUNDS, c.sweep_rounds);
+        s.publish(pw::SWEEP_UNMAPPED, c.sweep_unmapped);
+        s.publish(pw::THROTTLED, c.throttled);
+        s.publish(pw::TTL_CANCELS, c.ttl_cancels);
+        s.publish(pw::TTL_FULL, c.ttl_full);
+        s.publish(pw::RATE_IP, self.ip.sum());
+        s.publish(pw::RATE_WS, self.ws.sum());
+    }
+
     // ---- commands -----------------------------------------------------
 
     /// XG-2: no room for one more command — every class's open batch, the
@@ -1847,6 +2069,23 @@ impl HlGateway {
             rec.n = h.n as u8;
         }
         self.rt.inflight_items += 1;
+        // XH4f (D9): a place's TTL runs from its admission; a modify's
+        // replacement inherits its original's. The arm's own cancel ends it
+        // only once it succeeds (`on_answer`): one that fails leaves the TTL
+        // to cancel the order.
+        let kept = match c.kind {
+            CMD_PLACE if c.time_ms != 0 => {
+                self.rt
+                    .ttl
+                    .track(c.slot, c.client_oid, c.asset, now, c.time_ms)
+            }
+            CMD_MODIFY => self
+                .rt
+                .ttl
+                .inherit(c.slot, c.prev_client_oid, c.client_oid, c.asset),
+            _ => true,
+        };
+        self.rt.counters.ttl_full += u64::from(!kept);
     }
 
     /// A control command or a read posts alone, after every open batch:
@@ -1899,6 +2138,12 @@ impl HlGateway {
         if c.slot == SWEEP_SLOT {
             // The sweep's own read: its round fails; the arm hears nothing.
             self.rt.sweep_outcome = SWEEP_FAILED;
+            return;
+        }
+        if c.kind == CMD_CANCEL && c.prev_client_oid == TTL_CANCEL_MARK {
+            // XH4f (D9): the TTL's own cancel: again at the next beat; the
+            // arm hears nothing of it.
+            self.rt.ttl.unsend(c.slot, c.client_oid);
             return;
         }
         let ev = ItemRef::of(c).event(EV_REJECTED, reason, 0, now);
@@ -2342,6 +2587,31 @@ impl HlGateway {
         self.sweep_phase = SW_SETTLE;
     }
 
+    /// XH4f (D9): cancel every tracked order whose TTL ended — untimed
+    /// (`cancelByCloid`, XG-3), marked so its answers read `EXPIRED`. XG-2
+    /// binds them as it binds the sweep: the rest go at the next beat. The
+    /// engine charges them to the address with the sweeps' (one add a beat).
+    fn fire_ttls(&mut self, now: u64) {
+        let mut sent = 0u64;
+        self.rt.ttl.rewind();
+        while !self.xg2_full() {
+            let Some((slot, client_oid, asset)) = self.rt.ttl.next_due(now) else {
+                break;
+            };
+            let mut c = HlCmd::cancel(slot, client_oid, asset).at(now);
+            c.prev_client_oid = TTL_CANCEL_MARK;
+            self.admit(&c, now);
+            // Admitted, not refused unsent (`refuse` re-arms that): out.
+            self.rt.ttl.went(slot, client_oid);
+            sent += 1;
+        }
+        if sent > 0 {
+            self.rt.counters.ttl_cancels += sent;
+            self.rt.stats.note_sweep_cancels(sent);
+            self.flush_open(now);
+        }
+    }
+
     /// Set the halt word (the first reason wins, XG-5) and tell the arm.
     fn halt(&mut self, reason: u64, now: u64) {
         if self.rt.stats.halt_reason() == HALT_NONE {
@@ -2363,6 +2633,33 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, GatewayErr> {
 
 #[cfg(test)]
 mod tests {
+    /// XH4f (D9, alloc r4): a TTL cancel's refusal uses up a try unless it
+    /// never left this host or met the rate limit — those six of the 256
+    /// reason bytes, no other.
+    #[test]
+    fn a_ttl_try_counts_but_for_the_five_never_left_reasons_and_the_rate_limit() {
+        let free = [
+            super::REASON_LOCAL,
+            super::REASON_HALTED,
+            super::REASON_NOT_READY,
+            super::REASON_THROTTLED,
+            super::REASON_TRANSPORT,
+            super::REASON_RATE_LIMIT,
+        ];
+        let mut i = 0;
+        while i < free.len() {
+            assert!(!super::ttl_try_counts(free[i]), "reason {}", free[i]);
+            i += 1;
+        }
+        let mut n = 0u32;
+        let mut r = 0u16;
+        while r <= u16::from(u8::MAX) {
+            n += u32::from(!super::ttl_try_counts(r as u8));
+            r += 1;
+        }
+        assert_eq!(n, 6, "those six of the 256 reason bytes, no other");
+    }
+
     use super::*;
     use core_types::ORDER_EVENT_REASON_BAD_ALO_PX;
 
@@ -2373,6 +2670,15 @@ mod tests {
             CMD_CANCEL => HlCmd::cancel(6, 1, 0),
             _ => c,
         }
+    }
+
+    /// XH4f: the reads' steady weight — XH4d's 5 s periods alone were 71 %
+    /// of the share (busy for good); 10 s leaves them at 38 %.
+    #[test]
+    fn the_periodic_reads_weigh_what_the_amendment_says() {
+        assert_eq!(read_weight_per_min(5_000, 60_000), 284);
+        assert_eq!(read_weight_per_min(10_000, 60_000), 152);
+        assert_eq!(read_weight_per_min(0, 60_000), u64::MAX);
     }
 
     #[test]

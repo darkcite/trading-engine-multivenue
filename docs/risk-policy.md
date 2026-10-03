@@ -8191,6 +8191,288 @@ on a `userFills` frame that did not scan, between pages on a reconnect,
 a later page in flight on a gap of no stated kind), the residual's twin
 stated (a fill lost to a gap before the first page was asked), the docs.
 
+### XH4f amendment (2026-09-27): slot 6 wired to its gateway arm — TESTNET only, the fleet stays paper
+
+XH4f wires slot 6 (the xmm maker) to the Hyperliquid WebSocket gateway
+arm XH4b–XH4e built (maker plan §8, XH4 plan row XH4f). A live gateway
+slot 6 boots only against TESTNET, with the E3 testnet agent, and only
+as the only live slot of its engine (XH4g's battery): the launchd engine
+stays paper, slots 0–5 and 7 are judged and routed exactly as before, and
+every default (a paper slot, the blocking arm, a member that reads no
+health) leaves paper runs and the seven members' replays byte-identical.
+
+**The artifact (D1, D3, D4; deviation 19).** A per-slot `transport =
+"blocking" | "gateway"` (default `blocking`: today's path unless flipped,
+deviation 10). `gateway` is accepted on slot 6 only (XH4h widens it) and
+only with `venues = ["hyperliquid"]`; a LIVE gateway slot needs both perp
+keys > 0 (`cap_perp_usd_1e6`, `max_resting_usd_1e6` — the router's
+`PerpLimits`), `halt_on_alo_reject_pct` in 1..=100 (× 10 into the ALO
+halt's permille), `request_budget_floor` ≥ 320 (`MIN_BUDGET_FLOOR`,
+const-asserted against the grammar's mirror) and no top-up keys (none
+before XH5). The boot tell names the transport and the three keys on a
+gateway slot only. `exec_boot` refuses a live slot 6 on the blocking
+arm (XH1's refusal, narrowed), and a live gateway slot 6 **runs alone**:
+- beside any other live slot — **A-XH4f-1**: until XH4h shares one nonce
+  per agent address (S3, deferred there) the gateway is the process's
+  only Hyperliquid signer (two nonce streams on one agent collide, and
+  the venue refuses the loser — possibly a cancel); and **D2**: the
+  router's halt cancel-all is global, so a testnet halt of slot 6 would
+  pull any other live slot's quotes (a mainnet Binance slot's included),
+  and theirs slot 6's;
+- with a session bound (`halt_on_gain/loss_usd_1e6`): the gateway arm
+  judges no P&L on the shared testnet account, so the bound could never
+  fire (XH5 gives slot 6 its own account).
+
+The boot also refuses: no xmm member in `--strategy`; the member's caps
+outside the slot's clamps (clip ≤ `max_order`, per-perp inventory ≤
+`cap_perp`, resting ≤ `max_resting`, gross ≤ `cap_instance`); a
+`halt_on_recon_stale_ms` below two read periods; an exchange config that
+is not the testnet venue (`HlConfig::is_testnet`: the host and the
+network) or a market-data host that is not testnet (LAW E-4; D3 — mainnet
+needs slot 6's own master, O-XH5, and comes with XH5). Credentials:
+`HlConfig::from_env(Scope::Testnet)` (Anton's ruling: the E3 testnet
+agent, shared with slots 0 and 3), `own_account = false`.
+
+**The composition (`cli::xmm_live`).** One `/info meta` on the exchange
+host, parsed in place in the boot client's buffer → `HlDiscovery` → each
+member perp's asset id, its `PerpRules` (the member's lot checked against
+the venue's `szDecimals`), the `CoinMap` and a `LAW_LINEAR` instrument
+row. The arm and its gateway are paired (the post timeout = the dead
+man's `answer_ms`, every bound asset in the coin map, the dead man's skew
+= the arm's, asserted); the gateway runs on the pinned thread `hl-gw-xmm`
+(core 12). The engine composes `SlotSplit(6, NullLive, arm)` — slot 6 on
+its arm, outermost; every other combination with a gateway fails closed
+(the Binance + slot 6 shape comes back when D2 is ruled) — binds the rows
+through the BX6 path, turns the mark lane on (the router prices slot 6's
+perps off Hyperliquid marks, XH2-C — so a gateway-live engine's members
+also see HL marks they did not before; paper and replays are unchanged),
+and releases the gateway's stop after the engine loop returned (the arm's
+`on_shutdown` pumps the gateway inside the engine's drain) or on a boot
+abort — once the process-wide shutdown is seen, the gateway turns 18 s
+more at most (above the arm's 10 s shutdown bound, under the 20 s join
+grace; const-asserted).
+
+**The timing knobs** — constants in `cli::xmm_live` until XH4g measures
+them: the sheet and orders reads every **10 s** (`recon_ms`, twice XH4d's
+5 s — the XH4e amendment's arithmetic, const-asserted at the composition
+as the periodic reads under 40 % of the IP share: at 10 s the two reads
+weigh 132 IP weight a minute and the budget read, every 60 s, 20 more —
+38 % of the 400 share, so the congestion word reads busy only once
+actions, the dead man's re-arms among them, pass 88 a minute and growth
+throttles past 168; at 5 s the reads alone were 71 %, busy for good); the
+budget every 60 s; the shutdown bound 10 s; the join 1 s and the gone
+wait 3 s (XH4d's tested values); the skew 2 s (the dead man's, asserted);
+leverage 3× cross (O-XH6); `expires_after_ms` = the member's
+`lifetime_ms` (≤ 30 s, the xmm.toml grammar's bound, E-8).
+
+**The queued-arm contract (closes XH4e's refused-modify gap).** The arm
+answers `verbs_confirm_later` for its slot: a cancel's or a modify's `Ok`
+means queued. A modify that lands emits `Renamed(prev, new, qty, …)` — the
+router renames the row and the asked size becomes its size — and never
+the predecessor's retirement; a fill that ends an order retires it
+`FILLED`. Retirements are released a poll behind their orders' fills and
+only once the engine has taken every fill queued (the engine books a fill
+before its row is released) — the fills the arm has taken: a `canceled`
+row closes its order at once, so a partial fill whose `userFills` frame
+comes after that row (another channel, the same block) is booked after
+the release — the resting sum drops before the position rises, by each
+such order's unbooked part, for the moment between the two frames (r2:
+stated, not joined). The router drains **renames before
+retirements** — a replacement that ended by the poll its landing arrived
+in (a cancel, a fill, a TTL answered with the landing) finds its row under
+its new id; drained the other way, its retirement found no row and the
+rename revived one the venue no longer held (a phantom in the open-order
+count and the resting sum; r1 MAJOR) — and takes no retirement in a poll
+whose renames reached the drain's cap. `Ledger::on_retired` releases the
+row, or drops a live row's asked hold when the retirement is its asked
+replacement's — for every queued arm, BX6's refused modifies included. A
+refused modify leaves the predecessor's row as it was.
+
+**Leverage (D10, O-XH6).** Once the seeding sheet has read every bound
+perp flat, and before `ready()`, the arm sets each one's leverage (3×,
+cross) through its own budget — never before: on the shared account a
+bound perp may hold another slot's position, the boot holds then, and a
+held boot sends none (r1). A perp quotes only after ITS acknowledgement;
+a refusal that never left the host (throttled, a full ring) is retried a
+read period later; a venue refusal or an unanswered post leaves that perp
+**dark** — every place and modify on it refused locally
+(`refused_leverage`; a dark perp never quoted, so slot 6 holds nothing on
+it), cancels pass.
+
+**Execution health and the member's pulls (D7, D8).**
+`core_types::ExecHealth` (8 B: blocked bits, the congestion word, the
+recent window's worst post round trip in ms) through a defaulted
+`OrderDispatch::exec_health(slot, now)` and `Ctx::exec_health()`: a paper
+slot is healthy, an `off` slot blocked, a live slot the router's word (a
+latched halt, an unseeded ledger) merged with its arm's (not ready, the
+budget refusing growth, congestion, the RTT). The gateway keeps the RTT
+window (64 samples ≤ 30 s old; the worst is the p99 of so few) and
+publishes it with its heartbeat. The member, after its staleness checks:
+blocked → cancel both sides and hold; RTT over `rtt_pull_ms` → pull;
+congestion throttled or worse → pull; busy → the requote floor × 4. LEAD
+cancels are untouched (XH-5). Five new member counters (22).
+
+**TTL at the gateway (D9 — survives an engine stall).** The arm stamps a
+place's TTL (≤ 30 s) into the command; the gateway tracks it at admission
+(128 dense 24 B rows; a full table counts `ttl_full` and the member's own
+expiry cancel remains), a modify's replacement inherits the original's
+deadline and the original's row goes when it lands. A cancel that
+succeeded — the arm's own or the TTL's — the order's end row, or a
+refused place or modify drops a row; the arm's own cancel no longer drops
+it at admission, so a cancel that fails leaves the TTL to cancel the
+order. **A not-found drops nothing** (r2): about an order still in flight
+— a place or a modify in doubt, landing over another socket or the REST
+fallback after the cancel — it does not mean gone (XH4d's sticky intent),
+so the row stays for the order's end row. Its order seen resting once that
+cancel was answered (a late landing) has the cancel go again at the next
+beat; seen while the cancel is out, the answer decides — a not-found sends
+it again, a success ends it, and nothing goes meanwhile (r3). At the
+heartbeat (one pass over the table) an
+expired row is sent an UNTIMED `cancelByCloid` (XG-3: a cancel always
+goes), charged to the address budget with the sweeps' cancels; its
+acknowledgement reads `EXPIRED` and the arm retires the order
+`RETIRED_CANCELED_TTL` (an end row that arrives before the acknowledgement
+reads `EXPIRED` too — the row remembers that its TTL cancel went, whatever
+went again since (r3); one after it, the venue's own reason). A TTL cancel
+refused unsent goes again at the next beat; one the venue refused (the
+order not gone) goes again 1 s later, three venue refusals at most —
+account-level ones included, so a refusal the venue repeats every time
+stays bounded (r1, r4); one left in doubt (a dropped socket, a lost
+answer), one that never
+left this host (a REST dial that failed) and one the venue's rate limit
+turned away go again 1 s later too and never use up a try — a transport
+outage does not end the TTL (r2, r3).
+**Residual (r2):** past three refusals, or after a not-found, the row
+waits, sent, for the order's end row or a late landing (seen during its
+last refused try or after it — r4), and is dropped
+60 s past its last deadline (a retry moves the deadline); nothing at the
+gateway cancels that order again on its own. While the engine runs the
+arm acts on each TTL answer as its own cancel's (a refusal: its cancel
+again; a not-found: its sticky intent); in an engine stall only the dead
+man cancels — armed while the account is the slot's own or a read finds no
+other slot's orders on it, the shared E3 account included (its cancel is
+account-wide; XH4g's obligations). **Known:** a TTL cancel answered in
+doubt also reaches the arm as its own cancel's doubt — the arm sends a
+cancel of its own (one more); the order's end reads `EXPIRED` unless that
+cancel of the arm's is acknowledged before the order's end row arrives. Only
+a plain `canceled` end becomes `EXPIRED`: a venue-specific one (margin,
+self-trade, reduce-only, the open-interest cap, the dead man's schedule)
+keeps its reason (r4).
+
+**The rate windows move with the clock.** XH4e's windows advanced only
+when something was spent, so after a burst the throttle and the congestion
+word could hold on a stale sum until the next spend; the gateway now
+advances both at its heartbeat (≤ 100 ms stale).
+
+**Metrics and the shutdown alert (D11).** The arm's numbers cross in a
+pinned 752 B `GatewayArmReport` through a defaulted
+`OrderDispatch::gateway_arm_report(now, out)` (an out-param; `ExecCounters`
+keeps its 936 B), ONE a second (the engine loop takes it for `/state` and
+the 5 s `/metrics` mirror reads the latest): the arm's counters and the
+dead man's, the gateway's shared words and — a new 256 B granule of
+`GatewayStats` the gateway writes at its heartbeat, by name (`pw::*`) —
+its own counters and its rate windows' sums, the budget and cancel
+headroom, the latencies (post RTT p50/p99/max, push to write, cancel RTT,
+fill lag), and the router's words for the slot (`refused_cap_perp`,
+`refused_max_resting`, `unmarked_positions`, the resting notional, the
+merged health). `/metrics`: the `engine_exec_hlgw_*` family (65 counters,
+28 gauges), registered only when slot 6 is live on the gateway (with BX6's
+per-`why` retirements and mark counters); `core_metrics` grows to 640
+counters and 512 gauges (147 520 B, built on the booting thread's stack;
+the worst case — every slot live, both arms — measures 518 and 407).
+`/state`: `exec.arms.hyperliquid_gw`. **The shutdown tell**
+(`xmm-gateway-shutdown.tell`, beside the exec artifact) is written at
+boot and removed only by a confirmed shutdown: a shutdown that reaches its
+bound with orders of ours possibly resting rewrites it with the dead
+man's availability and deadline and an ERROR line; a kill during the
+drain, a crash or an abort leaves it as it was written at boot (r1). A
+tell that cannot be written at boot stops the boot before the members
+start, while nothing can have been sent (r2). The
+next boot reads it back as `engine_exec_hlgw_last_shutdown_unconfirmed`
+and an ERROR line — XH4d's For Anton (d): the process cannot outwait
+launchd's own stop, so the alert is the answer.
+
+**The engine must drain the arm.** The arm stops taking the gateway's
+events while its out-queues (order events, fills, renames, retirements)
+lack room — the engine's per-loop drain is what keeps it moving (gate 99
+found it).
+
+**Gates.** 75d (the member's pulls and the busy requote, 0 B); 96b (a TTL
+window: exactly the rustls record buffers); 99 (slot 6 through the router
+as the engine composes it — the leverage set at boot, place, modify landed
+or refused (the resting sum checked after each: the rename, or the hold's
+drop), fills booked, `CapPerp` and `MaxResting` refusing, the health read,
+the operator's report over trackers holding samples, cancel and
+retirement, a stale mark twice: XH2-C refusing until a fresh one — 0 B);
+the composition loopback test (slot 6 outermost over an in-process gateway
+end: S7-L1 end to end — unseeded, its health saying so and a place
+refused, until the day's read seeds it — a rename, not an add; a
+replacement ending with its landing in one pump; the queued contract).
+
+**Not done here:** S3's shared nonce (XH4h; A-XH4f-1 until then); the
+hedge-coin overlap rule (XH4h — dead while slot 6 runs alone); the P&L
+anchor file and the session bound (XH5: on a shared account the account
+value is not slot 6's P&L); top-ups (XH5).
+
+**Obligations handed on:**
+- **XH4g (testnet, its own engine instance, slot 6 its only live slot):**
+  no other signer of the E3 agent while the battery runs — the exec smoke,
+  the arm smoke, another engine (A-XH4f-1 is enforced in-process only) —
+  and `scheduleCancel` is account-wide (the dead man cancels every order
+  on the shared account); the shares and `recon_ms` against the host's
+  real traffic and the venue's weighting of WebSocket-posted reads; the
+  RTT distribution (`rtt_pull_ms`); the skew; the leverage answers'
+  wording; a refused modify's behaviour; the gone and join windows; the
+  day read's page facts (XH4e's list); every `engine_exec_hlgw_*` number
+  read once against the venue; the `HYPERLIQUID_TESTNET_MASTER_ADDR`
+  import in the battery's wrapper; the bound perps flat and slot 6's alone
+  on the shared account.
+- **XH4h:** one nonce stream per agent address (S3) and then lifting
+  A-XH4f-1; the hedge-coin overlap rule; BIN15/HYPARB onto the gateway (a
+  gateway sweeps every slot in its mask).
+
+**For Anton:** (a) D2 — the router's halt cancel-all is GLOBAL; until you
+rule it (keep it, or a per-slot sweep), a live gateway slot 6 runs alone;
+(b) A-XH4f-1 as above; (c) a gateway-live engine's members see
+Hyperliquid marks on the event lane — confirm, or rule an exec-only mark
+bit; (d) `cap_day` is enforced, not report-only (the XH3 bar sizes it).
+
+**Reviews:** r1 — zero-copy APPROVE WITH NITS, allocation APPROVE WITH
+NITS, risk REJECT (MAJOR: renames drained after retirements left a
+phantom row when a replacement ended in the poll of its landing) → the
+drain order and its cap rule (pinned in the router, the composition test);
+the leverage after a flat seeding sheet; the TTL's retries and its cancel
+dropping a row only on success; the tell from boot; a gateway slot alone
+and with no session bound; S7-L1 pinned end to end; retirements behind
+queued fills; `is_testnet`; the TTL table's clamped loops and one-pass
+scan; gate 99 with the leverage, sampled trackers and the rename/hold
+checks; gate 96b's TTL at 50 ms; the published words by name; one report
+a second; the registry's real sizes pinned; the docs. r2 — all three
+APPROVE WITH NITS → a not-found drops no TTL row and a late landing fires
+the TTL cancel again (pinned in the loopback test); a doubt never uses up
+a TTL try; the residual stated; a tell that cannot be written aborts the
+boot; the fill after a `canceled` row stated; the report filled only
+when read; gate 99 counts its landed renames; the notes (the tell read's
+copy, `info_once`'s, `pw`'s count pinned, the slot-6 example's two
+refusals, `xmm_live`'s doc). r3 — zero-copy APPROVE, allocation and risk
+APPROVE WITH NITS → the TTL row keeps FIRED/OUT/SEEN bits in its spare
+byte: an `open` row while the TTL cancel is out waits for its answer (no
+second cancel; pinned in the loopback test with a late answer), the end
+reads `EXPIRED` whatever went again since; a refusal that never left the
+host or met the rate limit uses up no try; a place left in doubt whose
+TTL cancel found nothing, landing late, is cancelled again (pinned); the
+dead man's reach and the partial-fill window restated. r4 — allocation and
+risk APPROVE WITH NITS (zero-copy's r3 APPROVE stands: r4 and r5 move no
+bytes) → a landing seen during the last refused try sends the TTL cancel
+once more; only a plain `canceled` end reads `EXPIRED`; the counting rule
+stated as coded (every venue refusal but the rate limit) and pinned over
+the 256 reason bytes; the Known note's order of the arm's acknowledgement.
+r5 (risk confirmation) — APPROVE WITH NITS, every r4 item closed, no
+further round asked → an end row while the TTL cancel is out pinned in the
+loopback test (a plain `canceled` reads `EXPIRED`, the dead man's
+`scheduledCancel` keeps its reason); the TTL table's docs say "plain
+`canceled`".
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

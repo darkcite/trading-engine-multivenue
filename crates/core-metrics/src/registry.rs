@@ -13,13 +13,19 @@ use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 /// one exec slot armed, and the exec lane's ledger + live-arm rows
 /// (the numbers the E7 ramp's bars are stated in) needed ~30 more.
 /// A `RegErr::Full` is a refused boot, and the place to discover it
-/// is not the first live boot. 16 KiB more of boot-time zero-init.
-pub const MAX_COUNTERS: usize = 512;
+/// is not the first live boot. 32 KiB more of boot-time zero-init (a
+/// counter is 128 B: see [`Counter`]).
+/// 512 → 640 at XMM XH4f (2026-09-27): slot 6's gateway family
+/// (`engine_exec_hlgw_*`, 65 counters) on a worst case — every slot
+/// live, both arms — measured at 453; 518 with it. 16 KiB more.
+pub const MAX_COUNTERS: usize = 640;
 /// Maximum number of gauges per registry. 128 → 384 in Phase 8a:
 /// per-bucket tick-age gauges (one per `engine::SYM_BUCKETS`),
 /// per-venue ingress state + coverage gauges, and headroom for the
-/// Phase-8e completeness harness.
-pub const MAX_GAUGES: usize = 384;
+/// Phase-8e completeness harness. 384 → 512 at XMM XH4f: the same
+/// family's 28 gauges on a worst case measured at 379 (407 with it) — a
+/// gateway boot alone overflowed 384. 16 KiB more (a gauge is 128 B).
+pub const MAX_GAUGES: usize = 512;
 /// Maximum metric-name length (bytes). 63 ASCII + a NUL terminator
 /// keeps `[u8; 64]` aligned on cache lines.
 pub const NAME_MAX: usize = 63;
@@ -140,9 +146,18 @@ pub struct MetricsRegistry {
     n_gauges: u32,
 }
 
+// Pinned: the registry is built on its booting thread's stack, and every
+// size above is stated in these units.
+const _: () = assert!(core::mem::size_of::<Counter>() == 128);
+const _: () = assert!(core::mem::size_of::<Gauge>() == 128);
+const _: () = assert!(core::mem::size_of::<MetricsRegistry>() == 147_520);
+
 impl MetricsRegistry {
-    /// Build an empty registry. ~56 KiB of zero-init data (512 counters
-    /// + 384 gauges, one cache line each).
+    /// Build an empty registry: 144 KiB of zero-init data (640 counters and
+    /// 512 gauges, 128 B each — a 64 B name, its length and the value,
+    /// padded to two cache lines by the 64 B alignment), built on the
+    /// caller's stack (a 2 MiB test thread holds it; a 4 096-row trial did
+    /// not).
     pub fn new() -> Self {
         // We can't use `[Counter::empty(); 64]` because `Counter`
         // contains an `AtomicU64` which is `!Copy`. Fall back to

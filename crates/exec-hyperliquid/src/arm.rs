@@ -121,8 +121,9 @@
 //! queues, linear scans over at most [`ARM_ORDERS`] rows.
 
 use clob_dispatcher::{
-    CancelAllState, DispatchError, DispatchStats, HaltSignal, OrderDispatch, Retired,
-    RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_VENUE, RETIRED_EXPIRED, RETIRED_REJECTED,
+    CancelAllState, DispatchError, DispatchStats, GatewayArmReport, HaltSignal, OrderDispatch,
+    Renamed, Retired, RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_TTL, RETIRED_CANCELED_VENUE,
+    RETIRED_EXPIRED, RETIRED_FILLED, RETIRED_REJECTED,
 };
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_time::now_ns;
@@ -148,9 +149,10 @@ use crate::event::{
     GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_NOT_FOUND,
     REASON_THROTTLED,
 };
-use crate::gateway::HlEngineEnd;
+use crate::gateway::{pw, HlEngineEnd};
 use crate::nonce::now_ms;
 use crate::rules::{PerpRules, Round};
+use crate::ttl::TTL_MAX_MS;
 
 /// Orders one arm tracks at once (xmm rests at most 16: four perps, two
 /// sides, and a modify's predecessor each).
@@ -171,7 +173,7 @@ const PUMP_MAX: usize = 256;
 /// The most one gateway event or one row timer puts on an out-queue: a
 /// modify's replacement that lands by its end (a fill, a `filled` row, a
 /// cancel) is its `RESTING`, the predecessor's `CANCELED(REPLACED)` and
-/// its own end — and two retirements.
+/// its own end — one rename (XH4f) and one retirement.
 const STEP_ROOM: usize = 3;
 /// Ids the arm finished lately (one `u64` holds whether each end was
 /// inferred).
@@ -232,9 +234,26 @@ pub const MIN_BUDGET_FLOOR: u64 = 2 * ARM_ORDERS as u64 + 64;
 /// cloids; their post items carry command bits 0, an order's never do.
 const DEADMAN_OID_BASE: u64 = 1 << 63;
 const READ_OID_BASE: u64 = (1 << 63) | (1 << 62);
+/// XH4f (O-XH6): a perp's leverage post, the perp's index in the low bits.
+/// Under `READ_OID_BASE` it reads as the arm's own control post (refunded
+/// when refused unsent), and the dead man matches its own id exactly.
+const LEVERAGE_OID_BASE: u64 = (1 << 63) | (1 << 61);
+/// XH4f: the highest leverage an arm sets (the venue's own ceiling on its
+/// largest perps).
+pub const MAX_LEVERAGE: u8 = 50;
 /// Wire 1e8 per engine 1e6.
 const WIRE_PER_ENGINE: i64 = 100;
 const NS_PER_MS: u64 = 1_000_000;
+
+// XH4f: the member reads the gateway's congestion word as its own.
+const _: () = assert!(
+    exec_gateway::stats::CONGESTION_NONE == core_types::EXEC_CONGESTION_NONE as u64
+        && exec_gateway::stats::CONGESTION_BUSY == core_types::EXEC_CONGESTION_BUSY as u64
+        && exec_gateway::stats::CONGESTION_THROTTLED
+            == core_types::EXEC_CONGESTION_THROTTLED as u64
+        && exec_gateway::stats::CONGESTION_RATE_LIMITED
+            == core_types::EXEC_CONGESTION_RATE_LIMITED as u64
+);
 
 // Row states.
 /// Pushed; not answered yet.
@@ -329,6 +348,9 @@ pub struct ArmCfg {
     pub budget_floor: u64,
     /// XH4e: the budget is read from the venue this often, ms (≤ 10 min).
     pub limit_ms: u64,
+    /// XH4f (O-XH6): every bound perp's leverage, cross margin, set before
+    /// the arm takes orders (≤ [`MAX_LEVERAGE`]); `0` = the venue's, unset.
+    pub leverage: u8,
 }
 
 /// Why an arm cannot be built.
@@ -347,6 +369,8 @@ pub enum ArmErr {
     DeadMan,
     /// XH4e: a budget floor below [`MIN_BUDGET_FLOOR`].
     Budget,
+    /// XH4f: a leverage above [`MAX_LEVERAGE`].
+    Leverage,
 }
 
 /// What the arm has seen (its `/metrics` block, XH4f).
@@ -425,6 +449,11 @@ pub struct ArmCounters {
     /// Requests taken back from the budget: the gateway refused them
     /// before they left (XH4e).
     pub refunded: u64,
+    /// XH4f (O-XH6): perps whose leverage the venue refused or never
+    /// answered — dark: growth on them is refused.
+    pub leverage_dark: u64,
+    /// Places and modifies refused on a dark perp (XH4f).
+    pub refused_leverage: u64,
 }
 
 /// One tracked order. One cache line.
@@ -456,11 +485,14 @@ struct Row {
 const _: () = assert!(core::mem::size_of::<Row>() == 64);
 const _: () = assert!(core::mem::align_of::<Row>() == 64);
 
-/// A fixed out-queue.
+/// A fixed out-queue. XH4f: `ready` holds back what was pushed since the
+/// last [`Out::release`] from [`Out::pop_released`] (the retirements a
+/// poll behind their orders' fills).
 struct Out<T: Copy> {
     buf: Box<[T; OUT]>,
     head: usize,
     len: usize,
+    ready: usize,
 }
 
 impl<T: Copy> Out<T> {
@@ -469,7 +501,24 @@ impl<T: Copy> Out<T> {
             buf: boxed_array(blank),
             head: 0,
             len: 0,
+            ready: 0,
         }
+    }
+
+    /// Everything pushed so far becomes poppable by [`Out::pop_released`].
+    #[inline(always)]
+    fn release(&mut self) {
+        self.ready = self.len;
+    }
+
+    /// The next released entry.
+    #[inline(always)]
+    fn pop_released(&mut self) -> Option<T> {
+        if self.ready == 0 {
+            return None;
+        }
+        self.ready -= 1;
+        self.pop()
     }
 
     #[inline(always)]
@@ -483,8 +532,8 @@ impl<T: Copy> Out<T> {
         if self.len == OUT {
             return false;
         }
-        // COPY: one entry (a 64 B order event or fill, a 16 B retirement)
-        // into its slot — the queue IS the hand-over: one gateway event
+        // COPY: one entry (a 64 B order event or fill, a 32 B rename, a
+        // 16 B retirement) into its slot — the queue IS the hand-over: one gateway event
         // makes up to three entries, and a FILLED waits across the
         // engine's separate fill and event drains (the join); rejected: a
         // queue of references (these are new values, not the gateway's).
@@ -514,9 +563,10 @@ impl<T: Copy> Out<T> {
         if self.len == 0 {
             return None;
         }
-        // COPY: one entry (a 64 B fill, a 16 B retirement) returned by
-        // value — the trait's `try_next_fill` / `try_next_retired` return
-        // owned values (a fill's `Option` has a niche: 64 B).
+        // COPY: one entry (a 64 B fill, a 32 B rename, a 16 B retirement)
+        // returned by value — the trait's `try_next_fill` /
+        // `try_next_renamed` / `try_next_retired` (through `pop_released`)
+        // return owned values (a fill's `Option` has a niche: 64 B).
         let v = self.buf[self.head & (OUT - 1)];
         self.head = (self.head + 1) & (OUT - 1);
         self.len -= 1;
@@ -529,6 +579,7 @@ impl<T: Copy> Out<T> {
         let n = self.len;
         self.head = 0;
         self.len = 0;
+        self.ready = 0;
         n
     }
 }
@@ -555,6 +606,8 @@ pub struct HlGatewayArm {
     events: Out<OrderEvent>,
     fills: Out<Fill>,
     retired: Out<Retired>,
+    /// XH4f: the modifies that landed, for the router's rename.
+    renamed: Out<Renamed>,
     counters: ArmCounters,
     stats: DispatchStats,
     // XH-7 and the streaks.
@@ -647,11 +700,17 @@ pub struct HlGatewayArm {
     day_rows: u32,
     /// When the budget goes stale: three periods after the last answer.
     limit_stale_ns: u64,
+    // XH4f (O-XH6): each bound perp's leverage (bit = perp) — asked, set,
+    // dark — and when a leverage refused unsent is asked again.
+    lev_sent: u16,
+    lev_ok: u16,
+    lev_dark: u16,
+    lev_due_ns: u64,
 }
 
-// The arm's inline state, 1 536 B — what `new` moves into its owner (the
+// The arm's inline state, 1 600 B — what `new` moves into its owner (the
 // tables are boxed).
-const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_536);
+const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_600);
 
 /// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
 /// reports: a post-only cross, or an order in doubt that never landed,
@@ -669,6 +728,9 @@ const fn retired_why(kind: u8, reason: u8) -> u8 {
     } else if reason == ORDER_EVENT_REASON_CANCEL_REQUESTED || reason == ORDER_EVENT_REASON_REPLACED
     {
         RETIRED_CANCELED_MEMBER
+    } else if reason == ORDER_EVENT_REASON_EXPIRED {
+        // XH4f (D9): the gateway's TTL cancelled it.
+        RETIRED_CANCELED_TTL
     } else {
         RETIRED_CANCELED_VENUE
     }
@@ -716,9 +778,12 @@ impl HlGatewayArm {
         if cfg.budget_floor < MIN_BUDGET_FLOOR {
             return Err(ArmErr::Budget);
         }
+        if cfg.leverage > MAX_LEVERAGE {
+            return Err(ArmErr::Leverage);
+        }
         let deadman =
             DeadMan::new(cfg.deadman, cfg.slot, DEADMAN_OID_BASE).map_err(|_| ArmErr::DeadMan)?;
-        // COPY: the arm's inline state — 1 536 B, const-asserted (the
+        // COPY: the arm's inline state — 1 600 B, const-asserted (the
         // configuration ≈ 0.3 KiB, the dead man 256 B, the address budget
         // 64 B, counters, the stats, the ring end, the scratch command,
         // the queue heads and words) — moved at boot into the owner, cold;
@@ -732,6 +797,7 @@ impl HlGatewayArm {
             events: Out::new(OrderEvent::ZERO),
             fills: Out::new(Fill::new(0, 0, Side::Bid, Price(0), Qty(0), 0)),
             retired: Out::new(Retired::default()),
+            renamed: Out::new(Renamed::default()),
             counters: ArmCounters::default(),
             stats: DispatchStats::default(),
             alo: boxed_array(0),
@@ -797,6 +863,10 @@ impl HlGatewayArm {
             day_pages_read: 0,
             day_rows: 0,
             limit_stale_ns: 0,
+            lev_sent: 0,
+            lev_ok: 0,
+            lev_dark: 0,
+            lev_due_ns: 0,
         })
     }
 
@@ -823,7 +893,24 @@ impl HlGatewayArm {
     /// read (XH4e): the arm takes orders.
     #[must_use]
     pub const fn ready(&self) -> bool {
-        self.boot == BOOT_DONE && !self.boot_held && self.deadman.settled() && self.limit_ok
+        self.boot == BOOT_DONE
+            && !self.boot_held
+            && self.deadman.settled()
+            && self.limit_ok
+            && self.leverage_settled()
+    }
+
+    /// XH4f (O-XH6): every bound perp's leverage set or dark — or none is
+    /// asked.
+    #[must_use]
+    const fn leverage_settled(&self) -> bool {
+        self.cfg.leverage == 0 || (self.lev_ok | self.lev_dark) == self.perps_mask()
+    }
+
+    /// One bit per bound perp.
+    #[inline]
+    const fn perps_mask(&self) -> u16 {
+        ((1u32 << self.cfg.n_perps) - 1) as u16
     }
 
     /// XH4e: the address budget as the arm models it — the venue's figures
@@ -862,7 +949,8 @@ impl HlGatewayArm {
     }
 
     /// XH4e: the gateway's congestion word (`exec_gateway::stats::
-    /// CONGESTION_*`) — the member's pull reads it (XH4f).
+    /// CONGESTION_*`) — the member's pull reads it through
+    /// [`OrderDispatch::exec_health`] (XH4f).
     #[must_use]
     pub fn congestion(&self) -> u64 {
         self.end.stats.congestion()
@@ -1034,6 +1122,7 @@ impl HlGatewayArm {
         self.events.room() >= STEP_ROOM
             && self.fills.room() >= STEP_ROOM
             && self.retired.room() >= STEP_ROOM
+            && self.renamed.room() >= STEP_ROOM
     }
 
     #[inline]
@@ -1087,8 +1176,14 @@ impl HlGatewayArm {
         self.close_as(i, kind, reason, now, false);
     }
 
+    /// XH4f: the router's row ends with its fills — a retirement as
+    /// filled, which the router takes a poll after them.
     fn filled(&mut self, i: usize, now: u64) {
         self.emit(i, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_NONE, now);
+        let r = Retired::new(self.rows[i].client_oid, self.cfg.slot, RETIRED_FILLED);
+        if !self.retired.push(r) {
+            self.counters.dropped += 1;
+        }
         self.remove(i, now, false);
     }
 
@@ -1102,8 +1197,10 @@ impl HlGatewayArm {
     }
 
     /// The order is (or was) on the venue: a post-only order's `RESTING`
-    /// once, then — a modify — its predecessor's `CANCELED(REPLACED)`.
-    /// Returns the row's index, which closing the predecessor may move.
+    /// once, then — a modify — its predecessor's `CANCELED(REPLACED)` and
+    /// (XH4f, the queued-arm contract) the router's rename of its row at
+    /// the replacement's size: no retirement of the predecessor. Returns
+    /// the row's index, which removing the predecessor may move.
     fn landed(&mut self, i: usize, now: u64) -> usize {
         let st = self.rows[i].state;
         if st == ST_SENT || st == ST_DOUBT {
@@ -1119,10 +1216,24 @@ impl HlGatewayArm {
             return i;
         }
         self.rows[i].prev = 0;
+        // The rename goes even when the predecessor ended first: the
+        // router then tracks the replacement (it IS working).
+        let n = Renamed::new(
+            prev,
+            self.rows[i].client_oid,
+            self.rows[i].qty_1e8 / WIRE_PER_ENGINE,
+            self.bind(i).sym,
+            self.cfg.slot,
+            self.rows[i].bits & RB_ASK == 0,
+        );
+        if !self.renamed.push(n) {
+            self.counters.dropped += 1;
+        }
         let Some(p) = self.find(prev) else {
             return i;
         };
-        self.close(p, ORDER_EVENT_CANCELED, ORDER_EVENT_REASON_REPLACED, now);
+        self.emit(p, ORDER_EVENT_CANCELED, ORDER_EVENT_REASON_REPLACED, now);
+        self.remove(p, now, false);
         // The swap-remove moved the last row into `p`.
         if i == self.n_rows {
             p
@@ -1307,7 +1418,7 @@ impl HlGatewayArm {
             return;
         };
         if e.cmd_kind() == CMD_CANCEL {
-            self.cancel_done(i, now);
+            self.cancel_done(i, e.reason, now);
             return;
         }
         self.reject_streak = 0;
@@ -1333,14 +1444,17 @@ impl HlGatewayArm {
         }
     }
 
-    /// A cancel succeeded: the order was on the venue until now.
-    fn cancel_done(&mut self, i: usize, now: u64) {
+    /// A cancel succeeded: the order was on the venue until now. `why`:
+    /// the answer's reason — `EXPIRED` for the gateway's TTL cancel (XH4f).
+    fn cancel_done(&mut self, i: usize, why: u8, now: u64) {
         if self.rows[i].state == ST_FILLING {
             // Filled first; its FILLED comes.
             return;
         }
         self.counters.doubt_settled += u64::from(self.rows[i].state == ST_DOUBT);
-        let reason = if self.rows[i].bits & RB_ASKED != 0 {
+        let reason = if why == ORDER_EVENT_REASON_EXPIRED {
+            ORDER_EVENT_REASON_EXPIRED
+        } else if self.rows[i].bits & RB_ASKED != 0 {
             ORDER_EVENT_REASON_CANCEL_REQUESTED
         } else {
             ORDER_EVENT_REASON_OTHER
@@ -1585,7 +1699,73 @@ impl HlGatewayArm {
             self.read_failed(now);
             return;
         }
+        if e.slot == self.cfg.slot && e.client_oid & !(ARM_PERPS as u64 - 1) == LEVERAGE_OID_BASE {
+            self.leverage_answer(e, now);
+            return;
+        }
         self.counters.stray += 1;
+    }
+
+    /// XH4f (O-XH6): once the seeding sheet has read every bound perp flat,
+    /// each one's leverage goes (cross, charged as an address request); one
+    /// refused unsent goes again a read period later. Not before: on a
+    /// shared account a bound perp may hold another slot's position — the
+    /// boot holds then, and a leverage change would reach that position.
+    fn leverage_step(&mut self, now: u64) -> bool {
+        if self.cfg.leverage == 0
+            || self.boot < BOOT_ORDERS
+            || self.boot_held
+            || now < self.lev_due_ns
+            || (self.lev_sent | self.lev_ok | self.lev_dark) == self.perps_mask()
+        {
+            return false;
+        }
+        let mut worked = false;
+        let mut p = 0usize;
+        while p < self.cfg.n_perps.min(ARM_PERPS) {
+            let bit = 1u16 << p;
+            if (self.lev_sent | self.lev_ok | self.lev_dark) & bit == 0 {
+                let c = HlCmd::leverage(
+                    self.cfg.slot,
+                    LEVERAGE_OID_BASE | p as u64,
+                    self.cfg.perps[p].asset,
+                    true,
+                    u32::from(self.cfg.leverage),
+                );
+                if !self.end.cmd.push(&c.at(now)) {
+                    self.counters.ring_full += 1;
+                    return worked;
+                }
+                self.charge(1);
+                self.lev_sent |= bit;
+                worked = true;
+            }
+            p += 1;
+        }
+        worked
+    }
+
+    /// XH4f (O-XH6): a perp's leverage answered. Set; refused unsent (never
+    /// left: asked again a read period later); refused by the venue or
+    /// unanswered: dark — growth on that perp is refused, since the venue's
+    /// leverage is not the one the caps were sized for.
+    fn leverage_answer(&mut self, e: &ExecEvent, now: u64) {
+        let bit = 1u16 << (e.client_oid & (ARM_PERPS as u64 - 1));
+        if self.lev_sent & bit == 0 {
+            self.counters.stray += 1;
+            return;
+        }
+        self.lev_sent &= !bit;
+        match e.kind {
+            EV_ACK => self.lev_ok |= bit,
+            EV_REJECTED if never_left(e.reason) => {
+                self.lev_due_ns = now.saturating_add(self.cfg.recon_ms * NS_PER_MS);
+            }
+            _ => {
+                self.lev_dark |= bit;
+                self.counters.leverage_dark += 1;
+            }
+        }
     }
 
     // --- reads ------------------------------------------------------
@@ -1957,6 +2137,13 @@ impl HlGatewayArm {
 
     /// One idle pass at `now`.
     fn idle(&mut self, now: u64) -> bool {
+        // XH4f (the queued-arm contract): what the last pass retired goes
+        // to the router now — a poll after the fills it pushed with it, and
+        // only once the engine has taken every fill queued (one left past
+        // the engine's drain batch would book after its row was released).
+        if self.fills.len == 0 {
+            self.retired.release();
+        }
         let mut worked = self.pump(now);
         if self.stream_alive(now) {
             self.up_ns = now;
@@ -1968,6 +2155,7 @@ impl HlGatewayArm {
             self.sweep_charged = swept;
         }
         worked |= self.boot_step(now);
+        worked |= self.leverage_step(now);
         worked |= self.recon_step(now);
         worked |= self.row_timers(now);
         worked |= self.deadman_step(now);
@@ -2311,10 +2499,16 @@ impl OrderDispatch for HlGatewayArm {
             self.asset_refusal_streak += 1;
             return self.refuse_local(DispatchError::Unroutable);
         };
+        if self.lev_dark & (1u16 << p) != 0 {
+            self.counters.refused_leverage += 1;
+            return self.refuse_local(DispatchError::SlotDisabled);
+        }
         let mut c = HlCmd::noop(self.cfg.slot, 0);
         if !self.order_cmd(order, p, 0, &mut c) {
             return self.refuse_local(DispatchError::Unroutable);
         }
+        // XH4f (D9): the order's TTL (LAW E-8), which the gateway keeps.
+        c.time_ms = (order.ttl_ns / NS_PER_MS).min(TTL_MAX_MS);
         if !self.end.cmd.push(&c) {
             self.counters.ring_full += 1;
             return self.refuse(DispatchError::QueueFull);
@@ -2374,6 +2568,10 @@ impl OrderDispatch for HlGatewayArm {
             self.counters.refused_budget += 1;
             return self.refuse_local(DispatchError::SlotDisabled);
         }
+        if self.lev_dark & (1u16 << perp) != 0 {
+            self.counters.refused_leverage += 1;
+            return self.refuse_local(DispatchError::SlotDisabled);
+        }
         if self.n_rows >= ARM_ORDERS {
             return self.refuse(DispatchError::QueueFull);
         }
@@ -2407,7 +2605,20 @@ impl OrderDispatch for HlGatewayArm {
     }
 
     fn try_next_retired(&mut self) -> Option<Retired> {
-        self.retired.pop()
+        self.retired.pop_released()
+    }
+
+    /// XH4f (the queued-arm contract): the gateway arm's cancel and modify
+    /// `Ok` mean queued — the router releases a row on its retirement and
+    /// renames it on its `Renamed`. The arm serves one slot.
+    #[inline]
+    fn verbs_confirm_later(&self, _sym: core_types::SymbolId, _venue: u8, strategy_id: u8) -> bool {
+        strategy_id == self.cfg.slot
+    }
+
+    #[inline]
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
+        self.renamed.pop()
     }
 
     fn stats(&self) -> DispatchStats {
@@ -2441,6 +2652,145 @@ impl OrderDispatch for HlGatewayArm {
         } else {
             None
         }
+    }
+
+    /// XH4f (D7): slot 6's health as the arm knows it — not booted, its
+    /// budget refusing growth, the gateway's congestion word and its recent
+    /// answers' worst round trip. Another slot's is not the arm's to judge.
+    fn exec_health(&self, slot: u8, now_ns: u64) -> core_types::ExecHealth {
+        if slot != self.cfg.slot {
+            return core_types::ExecHealth::HEALTHY;
+        }
+        let blocked = (u8::from(!self.ready()) * core_types::EXEC_BLOCKED_NOT_READY)
+            | (u8::from(self.budget_refuses(now_ns)) * core_types::EXEC_BLOCKED_BUDGET);
+        core_types::ExecHealth::new(
+            blocked,
+            u8::try_from(self.congestion()).unwrap_or(u8::MAX),
+            u32::try_from(self.end.stats.rtt_worst_ns() / NS_PER_MS).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// XH4f (D11): the arm's numbers — its counters and the dead man's, the
+    /// gateway's shared words and the ones it publishes at its heartbeat,
+    /// the budget, the latencies. The router adds its words for the slot.
+    /// Cold: once a second (the quantiles walk their trackers).
+    fn gateway_arm_report(&self, now_ns: u64, out: &mut GatewayArmReport) -> bool {
+        let c = &self.counters;
+        let d = self.deadman.counters();
+        let s = &*self.end.stats;
+        let [actions_sent, replies, replies_unmatched, post_timeouts, rest_fallback_posts, reconnects, in_flight, ws_up] =
+            s.io();
+        let beat = s.heartbeat_ns();
+        let (budget_known, budget_remaining, budget_cancel_remaining) = match self.budget() {
+            Some(b) => (1, b.remaining(), b.cancel_remaining()),
+            None => (0, 0, 0),
+        };
+        // COPY: the 752 B report written once into the caller's block —
+        // cold, once a second; the out-param keeps it off the return path.
+        *out = GatewayArmReport {
+            present: 1,
+            slot: u64::from(self.cfg.slot),
+            pushed: c.pushed,
+            events: c.events,
+            refused_local: c.refused_local,
+            ring_full: c.ring_full,
+            fills: c.fills,
+            fills_foreign: c.fills_foreign,
+            fills_unresolved: c.fills_unresolved,
+            fills_crossed: c.fills_crossed,
+            stray: c.stray,
+            alo_rejects: c.alo_rejects,
+            rejects: c.rejects,
+            doubt_settled: c.doubt_settled,
+            closed_unseen: c.closed_unseen,
+            join_timeouts: c.join_timeouts,
+            unknown_orders: c.unknown_orders,
+            reads: c.reads,
+            reads_failed: c.reads_failed,
+            preseed_dropped: c.preseed_dropped,
+            shutdown_fills: c.shutdown_fills,
+            shutdown_unconfirmed: c.shutdown_unconfirmed,
+            shutdown_switch_held: c.shutdown_switch_held,
+            dropped: c.dropped,
+            refused_budget: c.refused_budget,
+            throttled: c.throttled,
+            limit_reads: c.limit_reads,
+            day_pages: c.day_pages,
+            day_unreadable: c.day_unreadable,
+            refunded: c.refunded,
+            refused_leverage: c.refused_leverage,
+            dm_arms: d.arms,
+            dm_clears: d.clears,
+            dm_accepted: d.accepted,
+            dm_refused: d.refused,
+            dm_rate_limited: d.rate_limited,
+            dm_in_doubt: d.in_doubt,
+            dm_unsent: d.unsent,
+            dm_triggers: d.triggers,
+            dm_stray: d.stray,
+            actions_sent,
+            replies,
+            replies_unmatched,
+            post_timeouts,
+            rest_fallback_posts,
+            reconnects,
+            evt_ring_full: s.gateway_ring().1,
+            own_cancels: s.sweep_cancels(),
+            gw_fills: s.published(pw::FILLS),
+            gw_fills_scan_failed: s.published(pw::FILLS_SCAN_FAILED),
+            gw_updates: s.published(pw::UPDATES),
+            gw_updates_ignored: s.published(pw::UPDATES_IGNORED),
+            gw_updates_scan_failed: s.published(pw::UPDATES_SCAN_FAILED),
+            gw_answers_unreadable: s.published(pw::ANSWERS_UNREADABLE),
+            gw_answers_mismatched: s.published(pw::ANSWERS_MISMATCHED),
+            gw_ws_errors: s.published(pw::WS_ERRORS),
+            gw_local_refusals: s.published(pw::LOCAL_REFUSALS),
+            gw_cancels_untimed: s.published(pw::CANCELS_UNTIMED),
+            gw_dials: s.published(pw::DIALS),
+            gw_conn_drops: s.published(pw::CONN_DROPS),
+            gw_sweep_rounds: s.published(pw::SWEEP_ROUNDS),
+            gw_sweep_unmapped: s.published(pw::SWEEP_UNMAPPED),
+            gw_throttled: s.published(pw::THROTTLED),
+            gw_ttl_cancels: s.published(pw::TTL_CANCELS),
+            gw_ttl_full: s.published(pw::TTL_FULL),
+            // The router's (`RoutedDispatcher` adds them).
+            refused_cap_perp: 0,
+            refused_max_resting: 0,
+            ready: u64::from(self.ready()),
+            open_orders: self.n_rows as u64,
+            in_flight,
+            ws_up,
+            halt_reason: s.halt_reason(),
+            heartbeat_age_ms: if beat == 0 {
+                u64::MAX
+            } else {
+                now_ns.saturating_sub(beat) / NS_PER_MS
+            },
+            congestion: s.congestion(),
+            rtt_worst_ns: s.rtt_worst_ns(),
+            post_rtt_p50_ns: s.post_rtt.quantile_ns(0.5),
+            post_rtt_p99_ns: s.post_rtt.quantile_ns(0.99),
+            post_rtt_max_ns: s.post_rtt.max_ns(),
+            push_to_write_p99_ns: s.push_to_write.quantile_ns(0.99),
+            cancel_rtt_p99_ns: s.cancel_rtt.quantile_ns(0.99),
+            fill_lag_p99_ns: s.fill_venue_to_local.quantile_ns(0.99),
+            budget_known,
+            budget_remaining,
+            budget_cancel_remaining,
+            rate_ip_sum: s.published(pw::RATE_IP),
+            rate_ws_sum: s.published(pw::RATE_WS),
+            fees_1e8: c.fees_1e8,
+            leverage_dark: u64::from(self.lev_dark.count_ones()),
+            // `Availability` is `repr(u8)`: 0 unknown … 3 exhausted.
+            dm_availability: self.deadman.availability() as u64,
+            dm_deadline_ms: self.deadman.deadline_ms(),
+            dm_triggers_today: u64::from(self.deadman.triggers_today()),
+            health_blocked: u64::from(self.exec_health(self.cfg.slot, now_ns).blocked),
+            // The router's.
+            unmarked_positions: 0,
+            resting_usd_1e6: 0,
+        };
+        true
     }
 
     fn cancel_all(&mut self) -> Result<(), DispatchError> {
@@ -2496,6 +2846,7 @@ impl OrderDispatch for HlGatewayArm {
             self.counters.shutdown_fills += self.fills.clear() as u64;
             let _ = self.events.clear();
             let _ = self.retired.clear();
+            let _ = self.renamed.clear();
             let _ = self.row_timers(now);
             match self.cancel_all_state() {
                 CancelAllState::Clear => {
@@ -2532,8 +2883,8 @@ mod tests {
 
     use super::*;
     use crate::cmd::{
-        CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_STATE,
-        CMD_SCHEDULE_CANCEL,
+        CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT,
+        CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
     };
     use crate::event::{
         EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT, SLOT_FOREIGN,
@@ -2570,6 +2921,7 @@ mod tests {
             deadman: DeadManCfg::DEFAULT,
             budget_floor: 2_000,
             limit_ms: 600_000,
+            leverage: 0,
         }
     }
 
@@ -2707,11 +3059,24 @@ mod tests {
         out
     }
 
+    /// The retirements, as the router's next poll takes them (XH4f: the
+    /// arm holds each a poll behind its order's fills).
     fn retired(arm: &mut HlGatewayArm) -> Vec<u64> {
+        arm.retired.release();
         let mut out = Vec::new();
         while let Some(r) = arm.try_next_retired() {
             assert_eq!(r.slot, SLOT);
             out.push(r.client_oid);
+        }
+        out
+    }
+
+    /// XH4f: the renames, `(prev, new)`.
+    fn renamed(arm: &mut HlGatewayArm) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        while let Some(n) = arm.try_next_renamed() {
+            assert_eq!(n.slot, SLOT);
+            out.push((n.prev_client_oid, n.client_oid));
         }
         out
     }
@@ -2943,11 +3308,250 @@ mod tests {
             events(&mut arm),
             [(7, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_NONE)]
         );
+        assert_eq!(retired(&mut arm), [7], "a fill's end retires its row");
+        assert_eq!(arm.open_orders(), 0);
+    }
+
+    /// XH4f (O-XH6): with a leverage configured, each bound perp's goes
+    /// once the seeding sheet read it flat — cross, charged — and the arm
+    /// takes no order before it is answered; one refused unsent goes again
+    /// a read period later; one the venue refuses leaves the perp dark and
+    /// its growth refused.
+    #[test]
+    fn each_perp_s_leverage_is_set_before_the_arm_takes_orders() {
+        let mut c = cfg();
+        c.leverage = 3;
+        let (mut arm, mut v, t, lim) = to_budget(&c);
+        let lev = v
+            .take(CMD_LEVERAGE)
+            .expect("the leverage, after the seeding sheet");
+        assert_eq!(
+            (lev.asset, lev.arg, lev.flags & CMD_FLAG_CROSS),
+            (ASSET, 3, CMD_FLAG_CROSS)
+        );
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        assert!(!arm.ready(), "not before its leverage is answered");
+        v.send(item(&lev, EV_REJECTED, REASON_THROTTLED, 0));
+        let _ = arm.idle(t);
+        assert!(v.take(CMD_LEVERAGE).is_none(), "not at once");
+        assert_eq!(arm.counters().refunded, 1, "it never left");
+        let _ = arm.idle(t + 5 * S);
+        let lev = v.take(CMD_LEVERAGE).expect("a read period later");
+        v.send(item(&lev, EV_ACK, 0, 0));
+        let _ = arm.idle(t + 5 * S);
+        assert!(arm.ready());
+        assert_eq!(arm.counters().stray, 0);
+        // A venue refusal: dark.
+        let (mut arm, mut v, t, lim) = to_budget(&c);
+        let lev = v.take(CMD_LEVERAGE).expect("the leverage");
+        v.send(limit_end(&lim, 100));
+        v.send(item(&lev, EV_REJECTED, ORDER_EVENT_REASON_OTHER, 0));
+        let _ = arm.idle(t);
+        assert!(arm.ready(), "settled: dark");
+        assert_eq!(
+            arm.submit(&quote(1, Side::Bid, 100_000_000, 500_000)),
+            Err(DispatchError::SlotDisabled)
+        );
+        assert_eq!(
+            (
+                arm.counters().leverage_dark,
+                arm.counters().refused_leverage
+            ),
+            (1, 1)
+        );
+        assert_eq!(
+            HlGatewayArm::new(
+                &ArmCfg {
+                    leverage: MAX_LEVERAGE + 1,
+                    ..cfg()
+                },
+                hl_duplex().0
+            )
+            .err(),
+            Some(ArmErr::Leverage)
+        );
+    }
+
+    /// XH4f (the queued-arm contract): slot 6's verbs confirm later; a
+    /// retirement reaches the router a poll behind the fills of its order,
+    /// as filled; a landed modify renames the router's row at the
+    /// replacement's size instead of retiring the original.
+    #[test]
+    fn the_arm_keeps_the_queued_arm_contract() {
+        let (mut arm, mut v, t) = booted();
+        let hl = VenueId::Hyperliquid as u8;
+        assert!(arm.verbs_confirm_later(SYM, hl, SLOT));
+        assert!(!arm.verbs_confirm_later(SYM, hl, 3), "one slot's arm");
+        let _ = rested(&mut arm, &mut v, t, 7);
+        v.send(fill(7, true, 10_012_000_000, 50_000_000, 2));
+        v.send(row(EV_FILLED, 7, 0));
+        let _ = arm.idle(t);
+        assert!(arm.try_next_fill().is_some());
+        assert!(arm.try_next_retired().is_none(), "a poll behind its fills");
+        let _ = arm.idle(t);
+        let r = arm.try_next_retired().expect("the next poll");
+        assert_eq!((r.client_oid, r.why), (7, RETIRED_FILLED));
+        assert_eq!(
+            events(&mut arm),
+            [(7, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_NONE)]
+        );
+        let _ = rested(&mut arm, &mut v, t, 1);
+        arm.modify(&ModifyReq::new(1, quote(2, Side::Bid, 99_000_000, 700_000)))
+            .expect("modify");
+        let m = v.take(CMD_MODIFY).expect("the modify");
+        v.send(item(&m, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        let n = arm.try_next_renamed().expect("the rename");
+        assert_eq!(
+            (
+                n.prev_client_oid,
+                n.client_oid,
+                n.qty_1e6,
+                n.sym,
+                n.slot,
+                n.buy
+            ),
+            (1, 2, 700_000, SYM, SLOT, 1)
+        );
         assert!(
             retired(&mut arm).is_empty(),
-            "a fill's end is no retirement"
+            "the original is renamed, not retired"
         );
-        assert_eq!(arm.open_orders(), 0);
+    }
+
+    /// XH4f (D9): the order's TTL rides to the gateway (clamped at 30 s),
+    /// and the gateway's TTL cancel closes it `CANCELED(EXPIRED)`, retired
+    /// as the TTL's.
+    #[test]
+    fn a_place_carries_its_ttl_and_the_gateway_s_ttl_cancel_retires_it_as_the_ttl_s() {
+        let (mut arm, mut v, t) = booted();
+        arm.submit(&quote(7, Side::Bid, 100_000_000, 500_000).with_ttl_ns(90 * S))
+            .expect("submit");
+        let c = v.take(CMD_PLACE).expect("the place");
+        assert_eq!(c.time_ms, crate::ttl::TTL_MAX_MS, "clamped at 30 s");
+        v.send(item(&c, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        let _ = events(&mut arm);
+        let ttl_cancel = HlCmd::cancel(SLOT, 7, ASSET);
+        v.send(item(&ttl_cancel, EV_ACK, ORDER_EVENT_REASON_EXPIRED, 0));
+        let _ = arm.idle(t);
+        assert_eq!(
+            events(&mut arm),
+            [(7, ORDER_EVENT_CANCELED, ORDER_EVENT_REASON_EXPIRED)]
+        );
+        let _ = arm.idle(t);
+        let r = arm.try_next_retired().expect("retired");
+        assert_eq!((r.client_oid, r.why), (7, RETIRED_CANCELED_TTL));
+        arm.submit(&quote(8, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        assert_eq!(
+            v.take(CMD_PLACE).map(|c| c.time_ms),
+            Some(0),
+            "no TTL: none"
+        );
+    }
+
+    /// XH4f (D7): the arm's word on slot 6 — not booted until the budget
+    /// is read, the budget below its floor, the gateway's congestion and
+    /// its answers' worst round trip; another slot's is not its to judge.
+    #[test]
+    fn the_arm_s_health_is_its_boot_its_budget_and_the_gateway_s_words() {
+        use core_types::{
+            ExecHealth, EXEC_BLOCKED_BUDGET, EXEC_BLOCKED_NOT_READY, EXEC_CONGESTION_THROTTLED,
+        };
+        let (mut arm, mut v, t, lim) = to_budget(&cfg());
+        assert_eq!(arm.exec_health(SLOT, t).blocked, EXEC_BLOCKED_NOT_READY);
+        // 9 000 of 10 000 used: 1 000 left, under the 2 000 floor.
+        v.send(limit_end(&lim, 9_000));
+        let _ = arm.idle(t);
+        assert_eq!(arm.exec_health(SLOT, t).blocked, EXEC_BLOCKED_BUDGET);
+        let (arm, v, t) = booted();
+        assert_eq!(arm.exec_health(SLOT, t), ExecHealth::HEALTHY);
+        v.gw.stats.set_congestion(CONGESTION_THROTTLED);
+        v.gw.stats.set_rtt_worst(1_700 * NS_PER_MS + 1);
+        assert_eq!(
+            arm.exec_health(SLOT, t),
+            ExecHealth::new(0, EXEC_CONGESTION_THROTTLED, 1_700)
+        );
+        assert_eq!(
+            arm.exec_health(3, t),
+            ExecHealth::HEALTHY,
+            "slot 3's is not ours"
+        );
+    }
+
+    /// XH4f (D11): the report reads the arm's counters, its budget and the
+    /// gateway's words — shared, and published at its heartbeat; the
+    /// router's are left to the router.
+    #[test]
+    fn the_arm_s_report_reads_its_counters_its_budget_and_the_gateway_s_words() {
+        let (mut arm, mut v, t) = booted();
+        let _ = rested(&mut arm, &mut v, t, 8);
+        v.gw.stats.publish(pw::THROTTLED, 3);
+        v.gw.stats.publish(pw::RATE_WS, 9);
+        v.gw.stats.note_post_timeout();
+        let mut r = GatewayArmReport::default();
+        assert!(arm.gateway_arm_report(t + 5 * NS_PER_MS, &mut r));
+        assert_eq!((r.present, r.slot, r.ready), (1, u64::from(SLOT), 1));
+        assert!(r.pushed >= 1 && r.pushed == arm.counters().pushed);
+        assert_eq!(r.open_orders, 1);
+        let left = arm.budget().map_or(i64::MIN, AddressBudget::remaining);
+        assert_eq!((r.budget_known, r.budget_remaining), (1, left));
+        assert_eq!(
+            (r.gw_throttled, r.rate_ws_sum, r.post_timeouts),
+            (3, 9, 1),
+            "the throttled word, the WebSocket window, a shared counter"
+        );
+        assert_eq!((r.ws_up, r.heartbeat_age_ms), (1, 5));
+        assert_eq!(
+            (r.refused_cap_perp, r.unmarked_positions, r.resting_usd_1e6),
+            (0, 0, 0),
+            "the router's words"
+        );
+    }
+
+    /// XH4f (risk r1): the leverage waits for the seeding sheet to read the
+    /// bound perps flat — on a shared account one may hold another slot's
+    /// position, and a held boot changes nothing on it.
+    #[test]
+    fn the_leverage_waits_for_the_seeding_sheet_to_read_the_perps_flat() {
+        let mut c = cfg();
+        c.leverage = 3;
+        let (mut arm, mut v, t, st) = to_sheet(&c);
+        assert!(v.take(CMD_LEVERAGE).is_none(), "not before the sheet");
+        v.send(position(&st, E8 / 2, 50 * E8 as u64));
+        v.send(read_end(&st, 1_000 * E8, 1));
+        let _ = arm.idle(t);
+        assert!(arm.boot_position());
+        let _ = arm.idle(t + 60 * S);
+        assert!(v.take(CMD_LEVERAGE).is_none(), "a held boot sends none");
+    }
+
+    /// XH4f (risk r1): a retirement waits while fills are queued — the
+    /// engine books an order's fills before its row is released.
+    #[test]
+    fn a_retirement_waits_while_fills_are_queued() {
+        let (mut arm, mut v, t) = booted();
+        let _ = rested(&mut arm, &mut v, t, 8);
+        v.send(ExecEvent {
+            client_oid: 8,
+            venue_ms: 1_790_000_000_000,
+            px_1e8: 100 * E8,
+            sz_1e8: E8 / 200,
+            asset: ASSET,
+            kind: EV_FILL,
+            slot: SLOT,
+            flags: EVF_BUY,
+            ..ExecEvent::default()
+        });
+        v.send(row(EV_CANCELED, 8, ORDER_EVENT_REASON_CANCEL_REQUESTED));
+        let _ = arm.idle(t);
+        let _ = arm.idle(t);
+        assert!(arm.try_next_retired().is_none(), "a fill is still queued");
+        assert!(arm.try_next_fill().is_some());
+        let _ = arm.idle(t);
+        assert_eq!(arm.try_next_retired().map(|r| r.client_oid), Some(8));
     }
 
     #[test]
@@ -2988,7 +3592,8 @@ mod tests {
                 (1, ORDER_EVENT_CANCELED, ORDER_EVENT_REASON_REPLACED)
             ]
         );
-        assert_eq!(retired(&mut arm), [1]);
+        assert!(retired(&mut arm).is_empty());
+        assert_eq!(renamed(&mut arm), [(1, 2)]);
         assert_eq!(arm.open_orders(), 1);
     }
 

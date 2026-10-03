@@ -3655,6 +3655,182 @@ fn xmm_member_requote_replaced_and_stale_pull_are_zero_alloc() {
     assert_eq!(bytes, 0, "xmm member branches bytes should be zero: saw {bytes}");
 }
 
+/// **XMM gate 75d (XH4f)** — the member's health branches (D8): a
+/// blocked live path pulling both sides and holding, answers slower than
+/// `rtt_pull_ms` pulling, a throttled arm pulling on the timer's pass, and
+/// a busy arm's requote deferred then sent — allocate nothing.
+#[test]
+fn xmm_member_health_pulls_and_busy_requotes_are_zero_alloc() {
+    use core_types::{
+        CancelReq, ExecHealth, Order, OrderEvent, EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_BUSY,
+        EXEC_CONGESTION_THROTTLED, ORDER_EVENT_CANCELED, ORDER_EVENT_RESTING,
+    };
+    use strategy_core::{Ctx, Strategy, SubmitErr};
+
+    /// Answers the health word the script sets; remembers the last ids.
+    struct HealthCtx {
+        now: u64,
+        placed: [u64; 2],
+        n: usize,
+        modified: u64,
+        cancels: u64,
+        health: ExecHealth,
+    }
+    impl Ctx for HealthCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            self.placed[self.n & 1] = o.client_oid;
+            self.n += 1;
+            Ok(())
+        }
+        fn cancel(&mut self, _r: CancelReq) -> Result<(), SubmitErr> {
+            self.cancels += 1;
+            Ok(())
+        }
+        fn modify(&mut self, _prev: u64, o: Order) -> Result<(), SubmitErr> {
+            self.modified = o.client_oid;
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+        fn exec_health(&self) -> ExecHealth {
+            self.health
+        }
+    }
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let bn = core_types::make_symbol_id(VenueId::Binance, 9);
+    let mut xp = strategy_xmm::XmmParams::EMPTY;
+    xp.perps[0] = strategy_xmm::XmmPerp {
+        hl_sym: hl,
+        lead_sym: bn,
+        lot_1e6: 10_000,
+    };
+    xp.n_perps = 1;
+    xp.maker_enabled = 1;
+    xp.theta_bps_1e6 = 500_000;
+    xp.gate_window_ms = 1;
+    xp.lifetime_ms = 30_000;
+    xp.lead_stale_ms = 300;
+    xp.follower_stale_ms = 2_000;
+    xp.rtt_pull_ms = 1_500;
+    xp.requote_min_ms = 250;
+    xp.clip_usd_1e6 = 15_000_000;
+    xp.inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.gross_inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.resting_cap_usd_1e6 = 1_000_000_000_000;
+    let mut m = strategy_xmm::XmmStrategy::new();
+    m.configure(&xp).expect("gate 75d params");
+    let t0: u64 = 1_000_000_000_000;
+    let mut ctx = HealthCtx {
+        now: t0,
+        placed: [0; 2],
+        n: 0,
+        modified: 0,
+        cancels: 0,
+        health: ExecHealth::HEALTHY,
+    };
+    m.on_start(&mut ctx).expect("gate 75d start");
+    let book = |sym: u32, bid: i64, ask: i64| {
+        Tick::new(
+            0,
+            if sym == hl {
+                VenueId::Hyperliquid
+            } else {
+                VenueId::Binance
+            },
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        )
+    };
+    let lead = book(bn, 99_990_000, 100_010_000);
+    let fol = book(hl, 99_990_000, 100_010_000);
+    let fol_up = book(hl, 99_995_000, 100_010_000);
+    let ev = |oid: u64, kind: u8, reason: u8| {
+        OrderEvent::new(0, VenueId::Hyperliquid, hl, oid, 6, kind, reason, 0)
+    };
+    let done = core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED;
+    let blocked = ExecHealth::new(EXEC_BLOCKED_BUDGET, 0, 0);
+    let slow = ExecHealth::new(0, 0, 1_600);
+    let throttled = ExecHealth::new(0, EXEC_CONGESTION_THROTTLED, 0);
+    let busy = ExecHealth::new(0, EXEC_CONGESTION_BUSY, 0);
+
+    const CYCLES: u64 = 10_000;
+    const MS: u64 = 1_000_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        ctx.now = t0 + i * 10_000 * MS;
+        ctx.health = ExecHealth::HEALTHY;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol, &mut ctx); // both sides placed
+        let (bid, ask) = (ctx.placed[0], ctx.placed[1]);
+        m.on_order_event(&ev(bid, ORDER_EVENT_RESTING, 0), &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_RESTING, 0), &mut ctx);
+        // Busy: the bid touch rose 300 ms on — deferred; 1 050 ms on — sent.
+        ctx.health = busy;
+        ctx.now += 300 * MS;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol_up, &mut ctx);
+        ctx.now += 750 * MS;
+        m.on_tick(&lead, &mut ctx);
+        m.on_tick(&fol_up, &mut ctx); // MODIFY
+        let new = ctx.modified;
+        m.on_order_event(
+            &ev(
+                bid,
+                ORDER_EVENT_CANCELED,
+                core_types::ORDER_EVENT_REASON_REPLACED,
+            ),
+            &mut ctx,
+        );
+        m.on_order_event(&ev(new, ORDER_EVENT_RESTING, 0), &mut ctx);
+        // The cycle's pull: blocked, slow or throttled (the timer's pass).
+        ctx.now += 10 * MS;
+        match i % 3 {
+            0 => {
+                ctx.health = blocked;
+                m.on_tick(&fol_up, &mut ctx);
+            }
+            1 => {
+                ctx.health = slow;
+                m.on_tick(&fol_up, &mut ctx);
+            }
+            _ => {
+                ctx.health = throttled;
+                m.on_timer(ctx.now, &mut ctx);
+            }
+        }
+        m.on_order_event(&ev(new, ORDER_EVENT_CANCELED, done), &mut ctx);
+        m.on_order_event(&ev(ask, ORDER_EVENT_CANCELED, done), &mut ctx);
+        i += 1;
+    }
+    std::hint::black_box(ctx.cancels);
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let c = m.counters();
+    assert_eq!((c.modifies, c.busy_deferred), (CYCLES, CYCLES));
+    assert_eq!(
+        c.blocked_cancels + c.rtt_cancels + c.congestion_cancels,
+        2 * CYCLES,
+        "each cycle's pull took both sides"
+    );
+    assert!(c.blocked_cancels > 0 && c.rtt_cancels > 0 && c.congestion_cancels > 0);
+    assert_eq!((c.stuck, c.unmatched, c.pull_cancels), (0, 0, 0));
+    assert_eq!(
+        allocs, 0,
+        "xmm health branches allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "xmm health branches bytes should be zero: saw {bytes}"
+    );
+}
+
 /// **XMM gate 75c (XH2)** — the member's fail-safe branches: a refused
 /// replacement handing the side back to its predecessor (and the blind
 /// cancel that sends it), the member's own TTL cancel (LAW E-8), the
@@ -12979,6 +13155,407 @@ fn exec_gateway_kit_is_zero_alloc() {
     );
 }
 
+/// **XMM gate 99 (XH4f) — slot 6 through the router is 0 B/op.** The
+/// engine's shape for slot 6 (`RoutedDispatcher<PaperDispatcher,
+/// SlotSplit<NullLiveDispatcher, HlGatewayArm>>`) over a scripted gateway end
+/// in-process, driven as the engine drives it. Every round: a quote (bids and
+/// asks by turn) placed, answered resting (the ledger's row); a modify asking
+/// twice its size (the asked hold) — landed every other round (the router's
+/// rename) or refused crossing (the hold dropped with the replacement's
+/// retirement); every third round a fill, taken and booked back (a position);
+/// a per-perp cap and a resting cap refusing (`CapPerp`, `MaxResting`); the
+/// live order cancelled and released on its retirement; the member-facing
+/// health read; the members' order events taken; every 500 rounds the
+/// operator's report (the engine loop takes one a second), its latency
+/// trackers holding samples. The arm sets its perp's leverage at boot, as in
+/// production. Every 2 000 rounds a stale mark, which the router's sweep
+/// expires: growth is refused while a position has no mark (XH2-C) until a
+/// fresh one arrives. The window runs until each path has run in it.
+#[test]
+fn xmm_slot_six_through_the_router_is_zero_alloc() {
+    use clob_dispatcher::{OrderDispatch, PaperDispatcher};
+    use core_fill::ORDER_KIND_MAKER;
+    use core_types::{
+        CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, Side, ORDER_EVENT_REASON_BAD_ALO_PX,
+        ORDER_EVENT_REASON_CANCEL_REQUESTED,
+    };
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use exec_hyperliquid::arm::{ArmCfg, HlGatewayArm, PerpBind, ARM_PERPS};
+    use exec_hyperliquid::cmd::{
+        HlCmd, CMD_CANCEL, CMD_LEVERAGE, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT,
+        CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+    };
+    use exec_hyperliquid::deadman::DeadManCfg;
+    use exec_hyperliquid::event::{
+        ExecEvent, EVF_BUY, EVF_CMD_SHIFT, EVF_POST_ITEM, EVF_RESTING, EV_ACK, EV_CANCELED,
+        EV_FILL, EV_READ_DONE, EV_REJECTED, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS,
+        READ_STATE,
+    };
+    use exec_hyperliquid::gateway::HlGatewayEnd;
+    use exec_hyperliquid::hl_duplex;
+    use exec_hyperliquid::rules::PerpRules;
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, InstrumentSpec, NullLiveDispatcher, PerpLimits,
+        RoutedDispatcher, SlotCaps, SlotSplit, LAW_LINEAR,
+    };
+
+    const SLOT: u8 = 6;
+    const ASSET: u32 = 3;
+    const E6: i64 = 1_000_000;
+    const E8: i64 = 100_000_000;
+    const ROUNDS: u64 = 20_000;
+
+    /// The first command of `kind` in the ring; the arm's others (the dead
+    /// man's, the reads') are left unanswered — in doubt, as a slow venue
+    /// leaves them.
+    fn take(end: &mut HlGatewayEnd, kind: u8) -> HlCmd {
+        loop {
+            match end.cmd.pop() {
+                Some(c) if c.kind == kind => return *c,
+                Some(_) => {}
+                None => panic!("gate 99: the arm sent no command {kind}"),
+            }
+        }
+    }
+    /// The first commands of `a` and of `b`, in whichever order the arm
+    /// pushed them.
+    fn take_two(end: &mut HlGatewayEnd, a: u8, b: u8) -> (HlCmd, HlCmd) {
+        let (mut x, mut y) = (None, None);
+        while x.is_none() || y.is_none() {
+            match end.cmd.pop() {
+                Some(c) if c.kind == a && x.is_none() => x = Some(*c),
+                Some(c) if c.kind == b && y.is_none() => y = Some(*c),
+                Some(_) => {}
+                None => panic!("gate 99: the arm sent no command {a} or {b}"),
+            }
+        }
+        (x.expect("a"), y.expect("b"))
+    }
+    fn item(c: &HlCmd, kind: u8, reason: u8, flags: u8) -> ExecEvent {
+        let bits = if c.kind <= CMD_CANCEL { c.kind } else { 0 };
+        ExecEvent {
+            client_oid: c.client_oid,
+            asset: c.asset,
+            kind,
+            reason,
+            slot: c.slot,
+            flags: EVF_POST_ITEM | (bits << EVF_CMD_SHIFT) | flags,
+            ..ExecEvent::default()
+        }
+    }
+    fn read_end(c: &HlCmd, px_1e8: i64, aux: u64, venue_ms: u64) -> ExecEvent {
+        let read = match c.kind {
+            CMD_READ_ORDERS => READ_ORDERS,
+            CMD_READ_LIMIT => READ_LIMIT,
+            CMD_READ_DAY => READ_DAY,
+            _ => READ_STATE,
+        };
+        ExecEvent {
+            client_oid: c.client_oid,
+            venue_ms,
+            px_1e8,
+            aux,
+            kind: EV_READ_DONE,
+            reason: read,
+            slot: c.slot,
+            ..ExecEvent::default()
+        }
+    }
+    fn quote(cid: u64, sym: u32, side: Side, qty_1e6: i64) -> Order {
+        let mut o = Order::new(
+            core_time::now_ns(),
+            core_types::VenueId::Hyperliquid,
+            sym,
+            side,
+            ORDER_KIND_MAKER,
+            core_types::Price::from_raw(100 * E6),
+            core_types::Qty::from_raw(qty_1e6),
+            cid,
+        )
+        .with_post_only();
+        o.strategy_id = SLOT;
+        o
+    }
+    fn mark(sym: u32, ts_ns: u64) -> ChannelEvent {
+        ChannelEvent::new(
+            ts_ns,
+            core_types::VenueId::Hyperliquid,
+            ChannelId::Mark,
+            sym,
+            0,
+            0,
+            100 * E6,
+            100 * E6,
+        )
+    }
+
+    let sym = core_types::make_symbol_id(core_types::VenueId::Hyperliquid, 950);
+    let bind = PerpBind {
+        sym,
+        asset: ASSET,
+        rules: PerpRules::new(4).expect("gate 99 rules"),
+    };
+    let cfg = ArmCfg {
+        slot: SLOT,
+        perps: [bind; ARM_PERPS],
+        n_perps: 1,
+        expires_after_ms: 5_000,
+        post_timeout_ms: 5_000,
+        skew_ms: 2_000,
+        recon_ms: 60_000,
+        join_ms: 1_000,
+        gone_ms: 3_000,
+        shutdown_ms: 300,
+        own_account: false,
+        anchor_1e6: 0,
+        deadman: DeadManCfg::DEFAULT,
+        budget_floor: 2_000,
+        limit_ms: 600_000,
+        leverage: 3,
+    };
+    let (eng, mut end) = hl_duplex();
+    let arm = HlGatewayArm::new(&cfg, eng).expect("gate 99 arm");
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(
+            usize::from(SLOT),
+            ExecMode::Live,
+            &[core_types::VenueId::Hyperliquid as u8],
+            // Order $1 000, gross $10 000, day unbounded, 16 orders.
+            SlotCaps::new(1_000 * E6, 10_000 * E6, i64::MAX, 16),
+            HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+        )
+        .expect("gate 99 slot");
+    // Per perp $150, resting $100.
+    route
+        .set_perp_limits(usize::from(SLOT), PerpLimits::new(150 * E6, 100 * E6))
+        .expect("gate 99 perp pair");
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        SlotSplit::new(SLOT, NullLiveDispatcher::new(), arm),
+        core_time::WallAnchor::now(),
+    );
+    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0))
+        .expect("gate 99 row");
+    d.mark_ledger_seeded();
+
+    // The boot, through the router's idle, as in the engine.
+    end.stats.set_gauges(0, true);
+    end.stats.beat(core_time::now_ns());
+    d.on_idle();
+    let clear = take(&mut end, CMD_SCHEDULE_CANCEL);
+    assert!(end.evt.emit(&item(&clear, EV_ACK, 0, 0)));
+    assert!(end.evt.emit(&ExecEvent {
+        kind: EV_SNAPSHOT,
+        ..ExecEvent::default()
+    }));
+    d.on_idle();
+    end.stats
+        .set_sweep(end.stats.sweep_requested(), SWEEP_CLEAR);
+    d.on_idle();
+    let c = take(&mut end, CMD_READ_STATE);
+    assert!(end.evt.emit(&read_end(&c, 1_000 * E8, 0, 1)));
+    d.on_idle();
+    // The sheet read the perp flat: its leverage goes beside the orders read.
+    let (c, lev) = take_two(&mut end, CMD_READ_ORDERS, CMD_LEVERAGE);
+    assert!(end.evt.emit(&read_end(&c, 0, 0, 0)));
+    assert!(end.evt.emit(&item(&lev, EV_ACK, 0, 0)));
+    d.on_idle();
+    // The budget: $10 M traded, 100 used — room for every round's requests.
+    let c = take(&mut end, CMD_READ_LIMIT);
+    assert!(end.evt.emit(&read_end(&c, 10_000_000 * E8, 100, 0)));
+    d.on_idle();
+    let c = take(&mut end, CMD_READ_DAY);
+    assert!(end.evt.emit(&read_end(&c, 0, 0, c.time_ms)));
+    d.on_idle();
+    d.on_venue_event(&mark(sym, core_time::now_ns()));
+
+    let mut fills = 0u64;
+    let mut events = 0u64;
+    let mut order_ev = core_types::OrderEvent::ZERO;
+    let mut pos = 0i64;
+    let mut marks_needed = 0u64;
+    let mut refused = 0u64;
+    let mut health = 0u64;
+    let mut report = clob_dispatcher::GatewayArmReport::default();
+    let mut reports = 0u64;
+    let expired0 = d.exec_counters().ledger_marks_expired;
+    let risk0 = d.exec_counters().refused_risk;
+    // A post-only crossing (BAD_ALO_PX) retires its replacement EXPIRED.
+    let crossed0 = d.exec_counters().retired[usize::from(clob_dispatcher::RETIRED_EXPIRED)];
+    let (mut crossed, mut landed) = (0u64, 0u64);
+    // The report's quantiles walk trackers that hold samples, as a live
+    // gateway's do.
+    let mut k = 1u64;
+    while k <= 64 {
+        end.stats.post_rtt.record(k * 1_000_000);
+        end.stats.cancel_rtt.record(k * 1_000_000);
+        end.stats.push_to_write.record(k * 1_000);
+        end.stats.fill_venue_to_local.record(k * 2_000_000);
+        k += 1;
+    }
+    let window = std::time::Instant::now();
+    let g = AllocGuard::new();
+    let mut r = 0u64;
+    loop {
+        let now = core_time::now_ns();
+        end.stats.beat(now);
+        let side = if r % 2 == 0 { Side::Bid } else { Side::Ask };
+        let first = 4 * r + 1;
+        // A quote placed and resting.
+        if d.submit(&quote(first, sym, side, E6 / 10)).is_err() {
+            // XH2-C: a position no mark prices — a fresh mark, again.
+            marks_needed += 1;
+            d.on_venue_event(&mark(sym, now));
+            let again = d.submit(&quote(first, sym, side, E6 / 10));
+            assert!(
+                again.is_ok(),
+                "gate 99 round {r}: {again:?} resting {} rows {} pos {pos} marks {marks_needed} {:?}",
+                d.ledger().resting_usd_1e6(usize::from(SLOT)),
+                d.ledger().slot_resting(usize::from(SLOT)),
+                d.counters()
+            );
+        }
+        let c = take(&mut end, CMD_PLACE);
+        assert!(end.evt.emit(&item(&c, EV_ACK, 0, EVF_RESTING)));
+        d.on_idle();
+        let placed = d.ledger().resting_usd_1e6(usize::from(SLOT));
+        // A modify asking twice the size: landed, or refused crossing.
+        let mut live = first;
+        let repl = quote(first + 1, sym, side, E6 / 5);
+        if d.modify(&ModifyReq::new(first, repl)).is_ok() {
+            let m = take(&mut end, CMD_MODIFY);
+            if r % 2 == 0 {
+                assert!(end.evt.emit(&item(&m, EV_ACK, 0, EVF_RESTING)));
+                live = first + 1;
+                landed += 1;
+            } else {
+                assert!(end
+                    .evt
+                    .emit(&item(&m, EV_REJECTED, ORDER_EVENT_REASON_BAD_ALO_PX, 0)));
+                crossed += 1;
+            }
+            d.on_idle();
+            d.on_idle();
+            // The rename landed the asked size ($10 more); the refusal's
+            // retirement dropped the hold.
+            let want = if live == first {
+                placed
+            } else {
+                placed + 10 * E6
+            };
+            assert_eq!(
+                d.ledger().resting_usd_1e6(usize::from(SLOT)),
+                want,
+                "gate 99 round {r}: the rename, or the hold's drop"
+            );
+        }
+        // Every third round a fill on it, booked back as the engine does.
+        if r % 3 == 0 {
+            assert!(end.evt.emit(&ExecEvent {
+                client_oid: live,
+                venue_ms: 1_790_000_000_000 + r,
+                px_1e8: 100 * E8,
+                sz_1e8: E8 / 20,
+                asset: ASSET,
+                kind: EV_FILL,
+                slot: SLOT,
+                flags: if side == Side::Bid { EVF_BUY } else { 0 },
+                ..ExecEvent::default()
+            }));
+            pos += if side == Side::Bid { E6 / 20 } else { -E6 / 20 };
+            d.on_idle();
+            while let Some(f) = d.try_next_fill() {
+                d.on_fill_booked(&f);
+                fills += 1;
+            }
+        }
+        // The perp's caps, on the side the position grows: $160 over the
+        // per-perp $150; $99 over the resting $100 beside what rests (≥ $5).
+        let grow = if pos >= 0 { Side::Bid } else { Side::Ask };
+        assert!(
+            d.submit(&quote(first + 2, sym, grow, 16 * E6 / 10))
+                .is_err(),
+            "gate 99: the per-perp cap let $160 through"
+        );
+        assert!(
+            d.submit(&quote(first + 3, sym, grow, 99 * E6 / 100))
+                .is_err(),
+            "gate 99: the resting cap let $99 through"
+        );
+        refused += 2;
+        // The member reads its health.
+        health += u64::from(d.exec_health(SLOT, now).blocked == 0);
+        // XH4f (D11): the operator's report, through the whole composition.
+        if r % 500 == 0 {
+            assert!(d.gateway_arm_report(now, &mut report));
+            reports += 1;
+        }
+        // The live order cancelled and released on its retirement.
+        assert!(d
+            .cancel(&CancelReq::of(&quote(live, sym, side, E6), now))
+            .is_ok());
+        let x = take(&mut end, CMD_CANCEL);
+        assert!(end.evt.emit(&item(&x, EV_ACK, 0, 0)));
+        assert!(end.evt.emit(&ExecEvent {
+            client_oid: live,
+            asset: ASSET,
+            kind: EV_CANCELED,
+            reason: ORDER_EVENT_REASON_CANCEL_REQUESTED,
+            slot: SLOT,
+            ..ExecEvent::default()
+        }));
+        d.on_idle();
+        d.on_idle();
+        // The members' order events, taken as the engine takes them.
+        while d.try_next_order_event(&mut order_ev) {
+            events += 1;
+        }
+        // Every 2 000 rounds a stale mark: the router's sweep expires it.
+        if r % 2_000 == 1_999 {
+            d.on_venue_event(&mark(sym, now.saturating_sub(31_000_000_000)));
+        }
+        r += 1;
+        // Until each path has run: the rounds, and two XH2-C cycles (the
+        // router sweeps its marks once a second).
+        if r >= ROUNDS && marks_needed > 1 {
+            break;
+        }
+        assert!(
+            window.elapsed() < std::time::Duration::from_secs(20),
+            "gate 99: no mark expired twice in 20 s ({marks_needed})"
+        );
+    }
+    let (allocs, bytes, _) = g.delta();
+    let e = d.exec_counters();
+    let rc = *d.counters();
+    assert_eq!(
+        d.ledger().slot_resting(usize::from(SLOT)),
+        0,
+        "every row released"
+    );
+    assert!(fills > 0 && refused >= 2 * r && health > 0 && events > 2 * r);
+    assert!(
+        e.refused_risk - risk0 >= 2 * r,
+        "the router refused every cap probe"
+    );
+    assert!(
+        crossed > 0
+            && e.retired[usize::from(clob_dispatcher::RETIRED_EXPIRED)] - crossed0 == crossed,
+        "every crossing modify's replacement retired in the window"
+    );
+    assert!(landed > 0, "renames drained in the window");
+    assert!(reports > 0 && report.present == 1 && report.refused_cap_perp > 0);
+    assert!(report.post_rtt_p99_ns > 0 && report.leverage_dark == 0);
+    assert!(rc.refused_cap_perp > 0 && rc.refused_max_resting > 0);
+    assert!(rc.refused_unpriced >= marks_needed && e.ledger_marks_expired > expired0);
+    assert_eq!(
+        allocs, 0,
+        "slot 6 through the router allocated {allocs} times ({bytes} B) over {r} rounds"
+    );
+}
+
 /// **XMM gate 96a (XH4b) — the HL gateway's ENGINE half is 0 B/op.**
 /// XG-1: an arm's submit is one `HlCmd` ring write and its answers are
 /// `ExecEvent` ring reads — no syscall, no allocation, never blocking.
@@ -13470,6 +14047,10 @@ fn hl_gateway_arm_is_zero_alloc() {
         while let Some(r) = arm.try_next_retired() {
             *acc ^= r.client_oid ^ u64::from(r.why);
         }
+        // XH4f: a landed modify's rename (the queued-arm contract).
+        while let Some(n) = arm.try_next_renamed() {
+            *acc ^= n.client_oid ^ n.prev_client_oid;
+        }
     }
 
     fn quote(cid: u64, side: Side) -> Order {
@@ -13578,6 +14159,7 @@ fn hl_gateway_arm_is_zero_alloc() {
         deadman: DeadManCfg::DEFAULT,
         budget_floor: 2_000,
         limit_ms: 2,
+        leverage: 0,
     };
     let (eng, mut gw) = hl_duplex();
     let mut arm = HlGatewayArm::new(&cfg, eng).expect("the arm");
@@ -13793,7 +14375,13 @@ fn gate96_venue_helper() {
 /// (`userFillsByTime`, its rows summed in place — no row table), each
 /// posted alone, unsigned, and answered by one end — exactly 4
 /// allocations, rustls' again (two records sealed, two opened); no sweep
-/// has been asked yet, so none can land in that window. Then, measured
+/// has been asked yet, so none can land in that window. XH4f (D9), measured
+/// alone: two ALO places carrying a 50 ms TTL (one post: one rests, one
+/// crosses; the helper pushes an `orderUpdates` row and a fill), then at the
+/// next beat past it the gateway's own TTL cancel of the resting one —
+/// untimed, its success read `EXPIRED` — with the RTT window published at
+/// every beat inside the window (pinned by `hl_gateway_loopback`): exactly
+/// 6, rustls' (two sealed, four opened). Then, measured
 /// alone, one round of the cancel-all word's sweep (XH4d, XG-1): its own
 /// read (answered with one order of ours and a stranger's, scanned in
 /// place, emitting nothing), the cancel of ours by cloid, the cancel's
@@ -13819,6 +14407,9 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
     /// XH4e: the budget and day reads — each sealed, each answer opened.
     const RUSTLS_ALLOCS_PER_BUDGET_READS: u64 = 4;
+    /// XH4f: the places' post and the TTL cancel sealed; the places'
+    /// answer, the two pushes and the cancel's answer opened.
+    const RUSTLS_ALLOCS_PER_TTL: u64 = 6;
     let dir = std::env::temp_dir().join(format!("mv-gate96-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("gate 96 dir");
     let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
@@ -13888,52 +14479,53 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     // One round: two ALO places, a modify and a cancel of orders from no
     // open batch — three posts; their answers and the two pushes back.
     let mut oid = 0u64;
-    let mut round = |gw: &mut HlGateway,
-                     eng: &mut HlEngineEnd,
-                     kinds: &mut [u64; 16],
-                     stall: bool| {
-        oid += 3;
-        let sent = eng.stats.io()[0];
-        let cmds = [
-            HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo),
-            HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo),
-            HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
-                .replacing(oid + 1_000_000),
-            HlCmd::cancel(6, oid + 2_000_000, 1),
-            HlCmd::read_orders(6, oid + 3_000_000),
-            HlCmd::read_state(6, oid + 4_000_000),
-        ];
-        let mut j = 0usize;
-        while j < cmds.len() {
-            assert!(eng.cmd.push(&cmds[j]));
-            j += 1;
-        }
-        let mut got = 0u64;
-        let t = std::time::Instant::now();
-        if stall {
-            // Write the posts, then let every answer and push arrive
-            // before the next read: rustls decrypts all seven
-            // records at once and its record queue reaches its
-            // high-water mark here, in the warm-up.
-            while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
-                assert!(t.elapsed() < std::time::Duration::from_secs(5), "gate 96: posts not written");
+    let mut round =
+        |gw: &mut HlGateway, eng: &mut HlEngineEnd, kinds: &mut [u64; 16], stall: bool| {
+            oid += 3;
+            let sent = eng.stats.io()[0];
+            let cmds = [
+                HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo),
+                HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo),
+                HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
+                    .replacing(oid + 1_000_000),
+                HlCmd::cancel(6, oid + 2_000_000, 1),
+                HlCmd::read_orders(6, oid + 3_000_000),
+                HlCmd::read_state(6, oid + 4_000_000),
+            ];
+            let mut j = 0usize;
+            while j < cmds.len() {
+                assert!(eng.cmd.push(&cmds[j]));
+                j += 1;
+            }
+            let mut got = 0u64;
+            let t = std::time::Instant::now();
+            if stall {
+                // Write the posts, then let every answer and push arrive
+                // before the next read: rustls decrypts all seven
+                // records at once and its record queue reaches its
+                // high-water mark here, in the warm-up.
+                while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
+                    assert!(
+                        t.elapsed() < std::time::Duration::from_secs(5),
+                        "gate 96: posts not written"
+                    );
+                    gw.turn();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            while got < EVENTS_PER_ROUND {
+                assert!(
+                    t.elapsed() < std::time::Duration::from_secs(5),
+                    "gate 96: a round stalled at {got}/{EVENTS_PER_ROUND} events"
+                );
                 gw.turn();
+                while let Some(e) = eng.evt.pop() {
+                    let ev: &ExecEvent = &e;
+                    kinds[usize::from(ev.kind & 15)] += 1;
+                    got += 1;
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        while got < EVENTS_PER_ROUND {
-            assert!(
-                t.elapsed() < std::time::Duration::from_secs(5),
-                "gate 96: a round stalled at {got}/{EVENTS_PER_ROUND} events"
-            );
-            gw.turn();
-            while let Some(e) = eng.evt.pop() {
-                let ev: &ExecEvent = &e;
-                kinds[usize::from(ev.kind & 15)] += 1;
-                got += 1;
-            }
-        }
-    };
+        };
     let mut w = 0;
     while w < 50 {
         // The handshake's tail, session tickets and rustls' queues growing
@@ -13989,6 +14581,42 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         "gate 96: no sweep round in the reads' window"
     );
 
+    // XH4f (D9), measured alone — still before any sweep is asked: two ALO
+    // places with a 50 ms TTL — the crossing one refused well inside it —
+    // the resting one's TTL cancel at the beat after it.
+    let (ttl_posts0, ttl0) = (eng.stats.io()[0], gw.counters().ttl_cancels);
+    let mut ttl_places = [
+        HlCmd::place(6, 8_000_001, 1, true, 250_000_000_000, 1_000_000, Tif::Alo),
+        HlCmd::place(6, 8_000_002, 1, false, 251_000_000_000, 1_000_000, Tif::Alo),
+    ];
+    ttl_places[0].time_ms = 50;
+    ttl_places[1].time_ms = 50;
+    let mut expired = 0u64;
+    let g = AllocGuard::new();
+    assert!(eng.cmd.push(&ttl_places[0]));
+    assert!(eng.cmd.push(&ttl_places[1]));
+    let t = std::time::Instant::now();
+    while expired == 0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "gate 96: the TTL never fired"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            if e.kind == EV_ACK && e.reason == core_types::ORDER_EVENT_REASON_EXPIRED {
+                expired += 1;
+            }
+            kinds[usize::from(e.kind & 15)] += 1;
+        }
+    }
+    let (ttl_allocs, ttl_bytes, _) = g.delta();
+    let ttl = (
+        gw.counters().ttl_cancels - ttl0,
+        eng.stats.io()[0] - ttl_posts0,
+        gw.counters().sweep_rounds - sweeps0,
+    );
+    let posts_before_sweep = eng.stats.io()[0];
+
     // The cancel-all word, measured alone: one sweep round — the read,
     // the cancel of ours, its answer — then the sweep settles (1 s).
     let (rounds0, cancels0) = (gw.counters().sweep_rounds, gw.counters().sweep_cancels);
@@ -14010,14 +14638,18 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     let sweep = (
         gw.counters().sweep_rounds - rounds0,
         gw.counters().sweep_cancels - cancels0,
-        eng.stats.io()[0] - posts,
+        eng.stats.io()[0] - posts_before_sweep,
     );
 
     child.kill().ok();
     child.wait().ok();
     std::fs::remove_dir_all(&dir).ok();
     let n = |k: u8| window[usize::from(k)] - warm[usize::from(k)];
-    assert_eq!(n(EV_ACK), ROUNDS * 3, "the resting place, the modify and the cancel");
+    assert_eq!(
+        n(EV_ACK),
+        ROUNDS * 3,
+        "the resting place, the modify and the cancel"
+    );
     assert_eq!(n(EV_REJECTED), ROUNDS, "the post-only cross, item by item");
     assert_eq!(n(EV_RESTING), ROUNDS, "every orderUpdates row routed");
     assert_eq!(
@@ -14067,5 +14699,16 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         "HL gateway budget and day reads: {read_allocs} allocations ({read_bytes} B) — \
          rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_BUDGET_READS} (two \
          sealed, two opened); anything above is the gateway's"
+    );
+    assert_eq!(
+        ttl,
+        (1, 2, 0),
+        "one TTL cancel: the places' post and the cancel's, no sweep"
+    );
+    assert_eq!(
+        ttl_allocs, RUSTLS_ALLOCS_PER_TTL,
+        "HL gateway TTL: {ttl_allocs} allocations ({ttl_bytes} B) — rustls' buffered API \
+         accounts for exactly {RUSTLS_ALLOCS_PER_TTL} (two sealed, four opened); anything \
+         above is the gateway's"
     );
 }

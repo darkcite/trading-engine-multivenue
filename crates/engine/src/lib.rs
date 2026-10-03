@@ -1567,6 +1567,13 @@ impl<'a, D: OrderDispatch> Ctx for EngineCtx<'a, D> {
     fn now_ns(&self) -> NsTs {
         self.now
     }
+
+    /// XMM XH4f (D7): slot `slot`'s health from the dispatcher, at the
+    /// callback's clock.
+    #[inline(always)]
+    fn exec_health_of(&self, slot: u8) -> core_types::ExecHealth {
+        self.disp.exec_health(slot, self.now)
+    }
 }
 
 #[cfg(test)]

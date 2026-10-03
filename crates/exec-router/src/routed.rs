@@ -163,8 +163,9 @@ impl<P: OrderDispatch, L: OrderDispatch> RoutedDispatcher<P, L> {
     #[inline]
     pub fn new(route: ExecRoute, paper: P, live: L, anchor: core_time::WallAnchor) -> Self {
         // COPY: boot, once — `route` (832 B, `Copy`) moved in by value,
-        // and the ledger (≈ 80 KiB, its tables inline) built on the stack
-        // and moved into its box; rejected: building the ledger in place
+        // and the ledger (82 368 B, pinned in `ledger.rs`, its tables
+        // inline) built on the stack and moved into its box; rejected:
+        // building the ledger in place
         // (`Box::new_uninit` and unsafe field-wise writes) for a cold
         // one-time move off every hot path.
         Self {
@@ -1273,6 +1274,7 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                         // price of the two until then.
                         self.ledger.on_modify_asked(
                             req.prev_client_oid(),
+                            o.client_oid,
                             o.strategy_id as usize,
                             o.qty.raw(),
                             o.px.raw(),
@@ -1390,22 +1392,14 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
         let a = self.paper.on_idle();
         let b = self.live.on_idle();
 
-        // HYPARB L5, BX3 (F9): orders the arm accepted that ended
-        // without a (further) fill leave the resting count — a reverted
-        // swap or an expired IoC is not working anywhere, and counting
-        // it would stall the slot at `max_open_orders`. At most
-        // `RETIRED_DRAIN_MAX` a poll; each is counted by its `why`.
-        let mut drained = 0usize;
-        while drained < RETIRED_DRAIN_MAX {
-            let Some(r) = self.live.try_next_retired() else {
-                break;
-            };
-            drained += 1;
-            self.ledger.on_cancel(r.client_oid, r.slot as usize);
-            self.retired.count(r.why);
-        }
         // BX6 (BX3 obligation 2): modifies a queued arm confirmed rename
-        // their rows now, at most `RETIRED_DRAIN_MAX` a poll.
+        // their rows now, at most `RETIRED_DRAIN_MAX` a poll. XMM XH4f:
+        // BEFORE the retirements — an arm emits a rename before its
+        // replacement's own end, and a replacement that ended by this poll
+        // (a cancel, a fill or a TTL answered with the landing) must find
+        // its row under its new id: the other way round its retirement
+        // found no row, and the rename then revived one the venue no longer
+        // held (a phantom in the open-order count and the resting sum).
         let mut renamed = 0usize;
         while renamed < RETIRED_DRAIN_MAX {
             let Some(n) = self.live.try_next_renamed() else {
@@ -1422,6 +1416,23 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
                 n.buy != 0,
                 0,
             );
+        }
+        // HYPARB L5, BX3 (F9): orders the arm accepted that ended
+        // without a (further) fill leave the resting count — a reverted
+        // swap or an expired IoC is not working anywhere, and counting
+        // it would stall the slot at `max_open_orders`. At most
+        // `RETIRED_DRAIN_MAX` a poll; each is counted by its `why`. XMM
+        // XH4f: none while renames may be left over (the cap reached) —
+        // a retirement never overtakes its row's rename.
+        let mut drained = 0usize;
+        while renamed < RETIRED_DRAIN_MAX && drained < RETIRED_DRAIN_MAX {
+            let Some(r) = self.live.try_next_retired() else {
+                break;
+            };
+            drained += 1;
+            // XH4f: a refused queued modify's replacement drops its hold.
+            self.ledger.on_retired(r.client_oid, r.slot as usize);
+            self.retired.count(r.why);
         }
         // BX6 (obligation 6): a mark that stopped arriving stops pricing
         // (checked once a second; the ledger falls back to the last fill).
@@ -1680,6 +1691,48 @@ impl<P: OrderDispatch, L: OrderDispatch> OrderDispatch for RoutedDispatcher<P, L
     #[inline]
     fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
         self.live.venue_day_bought(slot)
+    }
+
+    /// **XMM XH4f (D7) — a slot's execution health.** A paper slot's is
+    /// healthy (the paper matcher has no venue to be unwell); an `off`
+    /// slot's is blocked; a live slot's is the router's word — a latched
+    /// halt, a ledger its arm has not seeded — and its arm's, the worse
+    /// of each. Read on the member's tick: a few loads.
+    #[inline]
+    fn exec_health(&self, slot: u8, now_ns: NsTs) -> core_types::ExecHealth {
+        match self.route.mode(slot) {
+            ExecMode::Paper => core_types::ExecHealth::HEALTHY,
+            ExecMode::Off => core_types::ExecHealth::new(core_types::EXEC_BLOCKED_OFF, 0, 0),
+            ExecMode::Live => {
+                let s = usize::from(slot);
+                let blocked = (u8::from(self.halt.is_halted(s)) * core_types::EXEC_BLOCKED_HALTED)
+                    | (u8::from(!self.ledger.is_slot_seeded(s))
+                        * core_types::EXEC_BLOCKED_UNSEEDED);
+                core_types::ExecHealth::new(blocked, 0, 0)
+                    .worst(self.live.exec_health(slot, now_ns))
+            }
+        }
+    }
+
+    /// **XMM XH4f (D11)** — the gateway arm's report, with the router's
+    /// words for the arm's slot: the perp clamps' refusals, the positions
+    /// XH2-C finds unmarked, the resting notional, and the slot's health as
+    /// the member reads it (the router's word and the arm's). Cold.
+    fn gateway_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::GatewayArmReport,
+    ) -> bool {
+        if !self.live.gateway_arm_report(now_ns, out) {
+            return false;
+        }
+        let slot = u8::try_from(out.slot).unwrap_or(u8::MAX);
+        out.refused_cap_perp = self.counters.refused_cap_perp;
+        out.refused_max_resting = self.counters.refused_max_resting;
+        out.unmarked_positions = u64::from(self.ledger.unmarked_positions(usize::from(slot)));
+        out.resting_usd_1e6 = self.ledger.resting_usd_1e6(usize::from(slot));
+        out.health_blocked = u64::from(self.exec_health(slot, now_ns).blocked);
+        true
     }
 }
 
@@ -2778,6 +2831,10 @@ mod tests {
         renamed: Vec<clob_dispatcher::Renamed>,
         /// BX6: the `why` of the next retirements (EXPIRED if unset).
         retire_why: Option<u8>,
+        /// XMM XH4f: the arm's health word.
+        health: core_types::ExecHealth,
+        /// XMM XH4f (D11): a gateway arm's slot — its report answers.
+        gw_slot: Option<u8>,
     }
 
     /// `clob_dispatcher::HaltSignal` under a short name, so the test
@@ -2827,6 +2884,26 @@ mod tests {
             } else {
                 None
             }
+        }
+        fn exec_health(&self, _slot: u8, _now_ns: NsTs) -> core_types::ExecHealth {
+            self.health
+        }
+        fn gateway_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::GatewayArmReport,
+        ) -> bool {
+            let Some(slot) = self.gw_slot else {
+                return false;
+            };
+            *out = clob_dispatcher::GatewayArmReport {
+                present: 1,
+                slot: u64::from(slot),
+                pushed: 5,
+                health_blocked: u64::from(self.health.blocked),
+                ..clob_dispatcher::GatewayArmReport::default()
+            };
+            true
         }
         fn cancel_all(&mut self) -> Result<(), DispatchError> {
             self.cancel_all_calls += 1;
@@ -2931,6 +3008,95 @@ mod tests {
         // goes through the risk gate at all.
         let c = core_types::CancelReq::of(&leg_order(1, SYM_YES, true, 500_000, 1_000_000), T0);
         assert!(d.cancel(&c).is_ok(), "a halted slot must be able to flatten");
+    }
+
+    /// **XMM XH4f (D11) — the gateway arm's report** reaches the surface
+    /// with the slot's health as the member reads it — the router's halt
+    /// merged with the arm's word; no gateway arm, no report (and `out`
+    /// untouched).
+    #[test]
+    fn the_gateway_arm_s_report_carries_the_slot_s_health_as_the_member_reads_it() {
+        use core_types::{ExecHealth, EXEC_BLOCKED_BUDGET, EXEC_BLOCKED_HALTED};
+        let slot = STRATEGY_SLOT_BIN15;
+        let mut d = haltable();
+        let mut r = clob_dispatcher::GatewayArmReport::default();
+        assert!(!d.gateway_arm_report(T0, &mut r), "no gateway arm");
+        assert_eq!(r, clob_dispatcher::GatewayArmReport::default(), "untouched");
+        d.live_mut().gw_slot = Some(slot);
+        d.live_mut().health = ExecHealth::new(EXEC_BLOCKED_BUDGET, 0, 0);
+        assert!(d.gateway_arm_report(T0, &mut r));
+        assert_eq!((r.present, r.slot, r.pushed), (1, u64::from(slot), 5));
+        assert_eq!(r.health_blocked, u64::from(EXEC_BLOCKED_BUDGET));
+        d.live_mut().sig.reject_streak = 5;
+        d.on_idle();
+        assert!(d.gateway_arm_report(T0, &mut r));
+        assert_eq!(
+            r.health_blocked,
+            u64::from(EXEC_BLOCKED_HALTED | EXEC_BLOCKED_BUDGET),
+            "the router's halt, merged"
+        );
+    }
+
+    /// **XMM XH4f (D7) — a slot's health**: a live slot's is the router's
+    /// word (a latched halt, an unseeded ledger) and its arm's, the worse
+    /// of each; a paper slot's is healthy whatever the arm says; an `off`
+    /// slot's is blocked.
+    #[test]
+    fn a_slot_s_health_is_the_router_s_word_and_its_arm_s() {
+        use core_types::{
+            ExecHealth, EXEC_BLOCKED_BUDGET, EXEC_BLOCKED_HALTED, EXEC_BLOCKED_OFF,
+            EXEC_BLOCKED_UNSEEDED, EXEC_CONGESTION_BUSY,
+        };
+        let slot = STRATEGY_SLOT_BIN15;
+        let mut d = haltable();
+        assert_eq!(
+            d.exec_health(slot, T0),
+            ExecHealth::HEALTHY,
+            "seeded, the arm well"
+        );
+        d.live_mut().health = ExecHealth::new(EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_BUSY, 800);
+        assert_eq!(
+            d.exec_health(slot, T0),
+            ExecHealth::new(EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_BUSY, 800)
+        );
+        assert_eq!(
+            d.exec_health(0, T0),
+            ExecHealth::HEALTHY,
+            "a paper slot is modelled"
+        );
+        d.live_mut().sig.reject_streak = 5;
+        d.on_idle();
+        assert!(d.halt().is_halted(slot as usize));
+        assert_eq!(
+            d.exec_health(slot, T0),
+            ExecHealth::new(
+                EXEC_BLOCKED_HALTED | EXEC_BLOCKED_BUDGET,
+                EXEC_CONGESTION_BUSY,
+                800
+            )
+        );
+
+        // An unseeded live slot, and an off one.
+        let mut r = ExecRoute::all_paper();
+        r.set_slot(
+            usize::from(slot),
+            ExecMode::Live,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        r.set_slot(
+            1,
+            ExecMode::Off,
+            &[VenueId::Hyperliquid.to_u8()],
+            SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+            halt_limits(),
+        )
+        .unwrap();
+        let d = RoutedDispatcher::new(r, PaperDispatcher::new(), SpyHalt::default(), test_anchor());
+        assert_eq!(d.exec_health(slot, T0).blocked, EXEC_BLOCKED_UNSEEDED);
+        assert_eq!(d.exec_health(1, T0).blocked, EXEC_BLOCKED_OFF);
     }
 
     #[test]
@@ -3957,6 +4123,17 @@ mod tests {
             .is_ok());
         assert_eq!(d.ledger().resting_usd_1e6(slot), 89_500_000);
         assert_eq!(d.counters().refused_risk, 4);
+
+        // XMM XH4f (D11): the gateway arm's report carries the clamps'
+        // refusals and the ledger's figures for its slot.
+        d.live_mut().gw_slot = Some(slot as u8);
+        let mut rep = clob_dispatcher::GatewayArmReport::default();
+        assert!(d.gateway_arm_report(T0, &mut rep));
+        assert_eq!((rep.refused_cap_perp, rep.refused_max_resting), (1, 1));
+        assert_eq!(
+            (rep.unmarked_positions, rep.resting_usd_1e6),
+            (0, 89_500_000)
+        );
     }
 
     /// **BX3 — a Binance order is judged by its instrument's law**: the
@@ -4269,6 +4446,64 @@ mod tests {
         d.live_mut().a_mut().retired.push((11, 3));
         d.on_idle();
         assert_eq!(d.ledger().slot_resting(3), 0);
+    }
+
+    /// XMM XH4f (risk r1): a replacement that ended by the poll its
+    /// modify's confirmation arrived in — a cancel, a fill or a TTL
+    /// answered with the landing — finds its row under its new id: the
+    /// renames drain first. Break-and-watch: retirements first leave a
+    /// phantom row 11 resting.
+    #[test]
+    fn a_replacement_that_ends_with_its_confirmation_leaves_no_row() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.live_mut().a_mut().confirm_later = true;
+        d.on_idle();
+        let o = order(3, VenueId::Hyperliquid, 9);
+        assert!(d.submit(&o).is_ok());
+        let mut repl = order(3, VenueId::Hyperliquid, 11);
+        repl.qty = Qty::from_raw(500_000);
+        assert!(d.modify(&ModifyReq::new(9, repl)).is_ok());
+        d.live_mut()
+            .a_mut()
+            .renamed
+            .push(clob_dispatcher::Renamed::new(
+                9, 11, 500_000, o.sym, 3, true,
+            ));
+        d.live_mut().a_mut().retired.push((11, 3));
+        d.on_idle();
+        assert_eq!(d.ledger().slot_resting(3), 0, "no phantom 11");
+    }
+
+    /// XMM XH4f: a poll that took `RETIRED_DRAIN_MAX` renames (more may be
+    /// left) takes no retirement — the next one does, after the renames.
+    #[test]
+    fn a_full_rename_drain_holds_the_retirements_a_poll() {
+        let mut d = two_arms();
+        d.live_mut().a_mut().sig = healthy();
+        d.live_mut().b_mut().sig = healthy();
+        d.on_idle();
+        let mut k = 0u64;
+        while k < RETIRED_DRAIN_MAX as u64 {
+            d.live_mut()
+                .a_mut()
+                .renamed
+                .push(clob_dispatcher::Renamed::new(
+                    2_000 + k,
+                    3_000 + k,
+                    1,
+                    1,
+                    3,
+                    true,
+                ));
+            k += 1;
+        }
+        d.live_mut().a_mut().retired.push((77, 3));
+        d.on_idle();
+        assert_eq!(d.retired().total(), 0, "held behind a full rename drain");
+        d.on_idle();
+        assert_eq!(d.retired().total(), 1);
     }
 
     /// BX3 (F9): one poll drains at most `RETIRED_DRAIN_MAX`; the rest

@@ -64,6 +64,7 @@ pub mod idle;
 pub mod mbb;
 pub mod pending;
 pub mod rate;
+pub mod rtt;
 pub mod stats;
 pub mod timer;
 
@@ -72,6 +73,7 @@ pub use idle::Idle;
 pub use mbb::{Mbb, MbbAction, SlotState};
 pub use pending::{Pending, PendingErr};
 pub use rate::{RateWindow, RATE_WINDOW_S};
+pub use rtt::{RttWindow, RTT_MAX_AGE_NS, RTT_WINDOW};
 pub use stats::{GatewayStats, Lat, HALT_EVENT_RING_FULL, HALT_NONE};
 pub use timer::{Expired, TimerFull, TimerId, TimerQueue};
 

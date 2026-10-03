@@ -271,6 +271,17 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(xc.ctx_refused);
     c.key("stuck");
     c.u64(xc.stuck);
+    // XMM XH4f (D8): the health pulls.
+    c.key("blocked_cancels");
+    c.u64(xc.blocked_cancels);
+    c.key("rtt_cancels");
+    c.u64(xc.rtt_cancels);
+    c.key("congestion_cancels");
+    c.u64(xc.congestion_cancels);
+    c.key("health_held");
+    c.u64(xc.health_held);
+    c.key("busy_deferred");
+    c.u64(xc.busy_deferred);
     c.key("perps");
     c.put(b"[");
     let np = (xm.n_perps as usize).min(crate::SNAPSHOT_XMM_PERPS);
@@ -457,12 +468,25 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(ex.ledger_marks_refused);
     c.key("ledger_marks_expired");
     c.u64(ex.ledger_marks_expired);
-    if ex.arms_binance.present != 0 {
+    // XMM XH4f (D11): and slot 6's gateway arm, beside it.
+    let bn = ex.arms_binance.present != 0;
+    let gw = ex.arms_hyperliquid_gw.present != 0;
+    if bn || gw {
         c.key("arms");
         c.byte(b'{');
-        c.quoted(b"binance");
-        c.byte(b':');
-        arm_json(&mut c, &ex.arms_binance);
+        if bn {
+            c.quoted(b"binance");
+            c.byte(b':');
+            arm_json(&mut c, &ex.arms_binance);
+        }
+        if gw {
+            if bn {
+                c.byte(b',');
+            }
+            c.quoted(b"hyperliquid_gw");
+            c.byte(b':');
+            gateway_arm_json(&mut c, &ex.arms_hyperliquid_gw);
+        }
         c.byte(b'}');
     }
     c.key("halted");
@@ -1197,6 +1221,76 @@ fn arm_json(c: &mut Cursor<'_>, a: &crate::ArmSnapshot) {
     c.put(b"}");
 }
 
+/// XMM XH4f (D11): slot 6's gateway arm — its words spelled, a heartbeat
+/// not yet seen as `-1`.
+fn gateway_arm_json(c: &mut Cursor<'_>, g: &crate::GatewayArmSnapshot) {
+    c.put(b"{\"slot\":");
+    c.u64(u64::from(g.slot));
+    c.key("ready");
+    c.u64(u64::from(g.ready));
+    c.key("ws_up");
+    c.u64(u64::from(g.ws_up));
+    c.key("congestion");
+    c.quoted(crate::congestion_word(g.congestion).as_bytes());
+    c.key("health_blocked");
+    c.u64(g.health_blocked);
+    c.key("halt_reason");
+    c.u64(g.halt_reason);
+    c.key("open_orders");
+    c.u64(g.open_orders);
+    c.key("in_flight");
+    c.u64(g.in_flight);
+    c.key("heartbeat_age_ms");
+    c.i64(i64::try_from(g.heartbeat_age_ms).unwrap_or(-1));
+    c.key("rtt_worst_ns");
+    c.u64(g.rtt_worst_ns);
+    c.key("pushed");
+    c.u64(g.pushed);
+    c.key("rejects");
+    c.u64(g.rejects);
+    c.key("alo_rejects");
+    c.u64(g.alo_rejects);
+    c.key("refused_local");
+    c.u64(g.refused_local);
+    c.key("refused_budget");
+    c.u64(g.refused_budget);
+    c.key("refused_leverage");
+    c.u64(g.refused_leverage);
+    c.key("throttled");
+    c.u64(g.throttled);
+    c.key("fills");
+    c.u64(g.fills);
+    c.key("fills_crossed");
+    c.u64(g.fills_crossed);
+    c.key("fees_1e8");
+    c.i64(g.fees_1e8);
+    c.key("unknown_orders");
+    c.u64(g.unknown_orders);
+    c.key("day_unreadable");
+    c.u64(g.day_unreadable);
+    c.key("post_timeouts");
+    c.u64(g.post_timeouts);
+    c.key("reconnects");
+    c.u64(g.reconnects);
+    c.key("ttl_cancels");
+    c.u64(g.ttl_cancels);
+    c.key("budget_known");
+    c.u64(u64::from(g.budget_known));
+    c.key("budget_remaining");
+    c.i64(g.budget_remaining);
+    c.key("leverage_dark");
+    c.u64(u64::from(g.leverage_dark));
+    c.key("deadman");
+    c.put(b"{\"availability\":");
+    c.quoted(crate::deadman_availability_word(g.dm_availability).as_bytes());
+    c.key("deadline_ms");
+    c.u64(g.dm_deadline_ms);
+    c.byte(b'}');
+    c.key("shutdown_unconfirmed");
+    c.u64(g.shutdown_unconfirmed);
+    c.byte(b'}');
+}
+
 fn recent_orders<const N: usize>(c: &mut Cursor<'_>, r: &RecentRing<Order, N>, mono_ns: u64) {
     c.put(b"[");
     let n = r.len();
@@ -1545,6 +1639,51 @@ mod tests {
             body.contains("\"pnl_anchor_usd_1e6\":1000000000,\"session_pnl_usd_1e6\":-2500000}},\"halted\":["),
             "{body}"
         );
+    }
+
+    /// XMM XH4f (D11): slot 6's gateway arm rides in `exec.arms` — alone,
+    /// or after the Binance arm — its words spelled and a heartbeat not yet
+    /// seen as `-1`.
+    #[test]
+    fn the_exec_object_carries_the_gateway_arm() {
+        let mut s = EngineSnapshot::empty();
+        let g = &mut s.exec.arms_hyperliquid_gw;
+        g.present = 1;
+        g.slot = 6;
+        g.ready = 1;
+        g.congestion = 2;
+        g.heartbeat_age_ms = u64::MAX;
+        g.budget_remaining = -4;
+        g.dm_availability = 1;
+        g.dm_deadline_ms = 1_790_000_000_000;
+        let mut buf = vec![0u8; STATE_JSON_MAX];
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains(
+                "\"arms\":{\"hyperliquid_gw\":{\"slot\":6,\"ready\":1,\"ws_up\":0,\
+                 \"congestion\":\"throttled\","
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\"heartbeat_age_ms\":-1,"), "{body}");
+        assert!(body.contains("\"budget_remaining\":-4,"), "{body}");
+        assert!(
+            body.contains(
+                "\"deadman\":{\"availability\":\"eligible\",\"deadline_ms\":1790000000000},\
+                 \"shutdown_unconfirmed\":0}},\"halted\":["
+            ),
+            "{body}"
+        );
+        s.exec.arms_binance.present = 1;
+        let n = encode_state_json(&s, &mut buf).unwrap();
+        let body = core::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            body.contains("\"session_pnl_usd_1e6\":0},\"hyperliquid_gw\":{\"slot\":6,"),
+            "both arms: {body}"
+        );
+        assert_eq!(crate::congestion_word(9), "unknown");
+        assert_eq!(crate::deadman_availability_word(3), "exhausted");
     }
 
     #[test]

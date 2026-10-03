@@ -368,6 +368,31 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for VenueSplit<A, B> {
             _ => None,
         }
     }
+
+    /// XMM XH4f: a slot's health from the arm that trades it — the worse
+    /// of both for a slot on both venues; none for a slot neither trades.
+    #[inline]
+    fn exec_health(&self, slot: u8, now_ns: NsTs) -> core_types::ExecHealth {
+        match self.serves(slot as usize) {
+            SERVES_A => self.a.exec_health(slot, now_ns),
+            SERVES_B => self.b.exec_health(slot, now_ns),
+            3 => self
+                .a
+                .exec_health(slot, now_ns)
+                .worst(self.b.exec_health(slot, now_ns)),
+            _ => core_types::ExecHealth::HEALTHY,
+        }
+    }
+
+    /// XMM XH4f (D11): the gateway arm's report, from whichever arm holds
+    /// one (`a` asked first).
+    fn gateway_arm_report(
+        &self,
+        now_ns: NsTs,
+        out: &mut clob_dispatcher::GatewayArmReport,
+    ) -> bool {
+        self.a.gateway_arm_report(now_ns, out) || self.b.gateway_arm_report(now_ns, out)
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +424,9 @@ mod tests {
         queue_syms: u32,
         /// Order events to hand out, by client id (popped from the back).
         events: Vec<u64>,
+        health: core_types::ExecHealth,
+        /// A gateway arm's `pushed` (0 = no gateway arm).
+        gw: u64,
     }
 
     impl OrderDispatch for Arm {
@@ -432,6 +460,21 @@ mod tests {
         }
         fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
             self.day
+        }
+        fn exec_health(&self, _slot: u8, _now_ns: NsTs) -> core_types::ExecHealth {
+            self.health
+        }
+        fn gateway_arm_report(
+            &self,
+            _now_ns: NsTs,
+            out: &mut clob_dispatcher::GatewayArmReport,
+        ) -> bool {
+            if self.gw == 0 {
+                return false;
+            }
+            out.present = 1;
+            out.pushed = self.gw;
+            true
         }
         fn cancel_all(&mut self) -> Result<(), DispatchError> {
             self.cancel_all_calls += 1;
@@ -601,6 +644,44 @@ mod tests {
         s.a_mut().day = None;
         assert_eq!(s.venue_day_bought(5), Some((20_001, 1)));
         assert_eq!(s.venue_day_bought(0), None);
+    }
+
+    /// XMM XH4f: each slot's health from the arm that trades it; a slot on
+    /// both venues reads the worse of each.
+    #[test]
+    fn each_slot_reads_its_arm_s_health_and_a_shared_slot_the_worse() {
+        use core_types::{ExecHealth, EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_THROTTLED};
+        let mut s = split();
+        s.a_mut().health = ExecHealth::new(EXEC_BLOCKED_BUDGET, 0, 900);
+        s.b_mut().health = ExecHealth::new(0, EXEC_CONGESTION_THROTTLED, 40);
+        assert_eq!(
+            s.exec_health(3, 1),
+            ExecHealth::new(EXEC_BLOCKED_BUDGET, 0, 900)
+        );
+        assert_eq!(
+            s.exec_health(2, 1),
+            ExecHealth::new(0, EXEC_CONGESTION_THROTTLED, 40)
+        );
+        assert_eq!(
+            s.exec_health(5, 1),
+            ExecHealth::new(EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_THROTTLED, 900)
+        );
+        assert_eq!(s.exec_health(0, 1), ExecHealth::HEALTHY);
+    }
+
+    /// XMM XH4f (D11): the gateway arm's report from whichever arm holds
+    /// one, `a` first.
+    #[test]
+    fn the_gateway_arm_s_report_comes_from_the_arm_that_holds_one() {
+        let mut s = split();
+        let mut r = clob_dispatcher::GatewayArmReport::default();
+        assert!(!s.gateway_arm_report(1, &mut r), "neither arm holds one");
+        s.b_mut().gw = 6;
+        assert!(s.gateway_arm_report(1, &mut r));
+        assert_eq!(r.pushed, 6);
+        s.a_mut().gw = 3;
+        assert!(s.gateway_arm_report(1, &mut r));
+        assert_eq!(r.pushed, 3, "a first");
     }
 
     /// XMM XH2 through this wrapper (the forwards the merge added): both

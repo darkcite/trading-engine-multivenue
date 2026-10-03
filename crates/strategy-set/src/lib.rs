@@ -1313,6 +1313,16 @@ impl<'a, C: Ctx> Ctx for StampCtx<'a, C> {
     fn now_ns(&self) -> NsTs {
         self.inner.now_ns()
     }
+    /// XMM XH4f: the member reads its OWN slot's health — the slot this
+    /// wrapper stamps.
+    #[inline(always)]
+    fn exec_health(&self) -> core_types::ExecHealth {
+        self.inner.exec_health_of(self.slot)
+    }
+    #[inline(always)]
+    fn exec_health_of(&self, slot: u8) -> core_types::ExecHealth {
+        self.inner.exec_health_of(slot)
+    }
 }
 
 impl Strategy for StrategySet {

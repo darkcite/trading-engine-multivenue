@@ -747,6 +747,10 @@ pub struct Ledger {
     /// **XH4e** — the size that modify asked, held with its price: until
     /// the confirmation the order may rest at either size; `0` = none.
     resting_qty_asked_1e6: [i64; LEDGER_RESTING],
+    /// **XH4f** — the client id of the replacement that modify named, kept
+    /// with the hold: its retirement (the modify refused) drops the hold;
+    /// `0` = none.
+    resting_asked_oid: [u64; LEDGER_RESTING],
     /// **XH4e** — index = slot: Σ over its resting rows of the larger of
     /// the row's two sizes × the higher of its two prices, USD ×1e6
     /// (exact: every term is clamped to [`INST_EXPOSURE_MAX`]), plus the
@@ -761,6 +765,9 @@ pub struct Ledger {
 // epoch and would look exactly like a day cap that never rolls.
 // `Ledger::new` takes the anchor so that forgetting it is a compile
 // error rather than a cap that quietly stops resetting.
+
+// XMM XH4f: the router's boot move of it states this size (routed.rs).
+const _: () = assert!(core::mem::size_of::<Ledger>() == 82_368);
 
 impl Ledger {
     /// An empty, UNSEEDED ledger: nothing bound, nothing held,
@@ -788,6 +795,7 @@ impl Ledger {
             resting_px_1e6: [0; LEDGER_RESTING],
             resting_px_asked_1e6: [0; LEDGER_RESTING],
             resting_qty_asked_1e6: [0; LEDGER_RESTING],
+            resting_asked_oid: [0; LEDGER_RESTING],
             resting_usd_1e6: [0; EXEC_SLOTS],
         }
     }
@@ -2070,6 +2078,7 @@ impl Ledger {
         self.resting_px_1e6[free] = px_1e6;
         self.resting_px_asked_1e6[free] = 0;
         self.resting_qty_asked_1e6[free] = 0;
+        self.resting_asked_oid[free] = 0;
         self.resting_reterm(free, 0);
         self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
     }
@@ -2090,6 +2099,7 @@ impl Ledger {
         self.resting_px_1e6 = [0; LEDGER_RESTING];
         self.resting_px_asked_1e6 = [0; LEDGER_RESTING];
         self.resting_qty_asked_1e6 = [0; LEDGER_RESTING];
+        self.resting_asked_oid = [0; LEDGER_RESTING];
         self.resting_usd_1e6 = [0; EXEC_SLOTS];
     }
 
@@ -2102,6 +2112,38 @@ impl Ledger {
     pub fn on_cancel(&mut self, client_oid: u64, slot: usize) {
         if let Found::One(i) = self.find(client_oid, slot) {
             self.release(i);
+        }
+    }
+
+    /// **XH4f — a retirement**: an arm's confirmed end of `client_oid`.
+    /// Its row goes ([`Self::on_cancel`]); an id no row holds may be a
+    /// refused queued modify's replacement — the row whose hold names it
+    /// drops the hold, at its own size and price again (the original
+    /// rests on). One pass over the table by reference, as `locate`.
+    pub fn on_retired(&mut self, client_oid: u64, slot: usize) {
+        match self.find(client_oid, slot) {
+            Found::One(i) => self.release(i),
+            Found::Many => {}
+            Found::None => {
+                if client_oid == 0 {
+                    return;
+                }
+                let mut i = 0usize;
+                while i < LEDGER_RESTING {
+                    if self.resting_asked_oid[i] == client_oid
+                        && self.resting[i].live == 1
+                        && self.resting[i].slot as usize == slot
+                    {
+                        let old = self.resting_term(i);
+                        self.resting_asked_oid[i] = 0;
+                        self.resting_px_asked_1e6[i] = 0;
+                        self.resting_qty_asked_1e6[i] = 0;
+                        self.resting_reterm(i, old);
+                        return;
+                    }
+                    i += 1;
+                }
+            }
         }
     }
 
@@ -2138,6 +2180,7 @@ impl Ledger {
                 }
                 self.resting_px_asked_1e6[i] = 0;
                 self.resting_qty_asked_1e6[i] = 0;
+                self.resting_asked_oid[i] = 0;
                 self.resting_reterm(i, old);
             }
             // The arm accepted a modify of an order the ledger is not
@@ -2168,10 +2211,12 @@ impl Ledger {
     /// the larger of its two sizes and the higher of its two prices — in
     /// the resting notional and in the working orders a perp's inventory
     /// adds — since the order may rest at either. A modify the arm then
-    /// refuses leaves them held until the row goes (the conservative way).
+    /// refuses drops them with its replacement's retirement (XH4f:
+    /// [`Self::on_retired`] by `client_oid`, the replacement's id).
     pub fn on_modify_asked(
         &mut self,
         prev_client_oid: u64,
+        client_oid: u64,
         slot: usize,
         qty_1e6: i64,
         px_1e6: i64,
@@ -2182,6 +2227,7 @@ impl Ledger {
             let old = self.resting_term(i);
             self.resting_qty_asked_1e6[i] = qty_1e6;
             self.resting_px_asked_1e6[i] = px_1e6;
+            self.resting_asked_oid[i] = client_oid;
             self.resting_reterm(i, old);
         }
     }
@@ -2320,6 +2366,7 @@ impl Ledger {
         self.resting_px_1e6[i] = 0;
         self.resting_px_asked_1e6[i] = 0;
         self.resting_qty_asked_1e6[i] = 0;
+        self.resting_asked_oid[i] = 0;
         if slot < EXEC_SLOTS {
             self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_sub(1);
             self.resting_usd_1e6[slot] = self.resting_usd_1e6[slot].saturating_sub(old);
@@ -3847,7 +3894,7 @@ mod tests {
         l.on_mark(LIN, 100 * E6, 100 * E6, 5);
         // A working sell of 6, modified (queued) to 9.
         l.on_submit(11, SLOT, LIN, 6 * E6, false, 101 * E6);
-        l.on_modify_asked(11, SLOT, 9 * E6, 101 * E6);
+        l.on_modify_asked(11, 12, SLOT, 9 * E6, 101 * E6);
         // A sell of 3: 10 − 6 = 4 still to exit — an exit, as before…
         let p = l
             .probe_instrument(LIN, SLOT, 3 * E6, false, 100 * E6, None)
@@ -3871,6 +3918,34 @@ mod tests {
         assert!(!p.exit);
     }
 
+    /// **XH4f — a refused queued modify's hold goes with its replacement's
+    /// retirement**: the original counts at its own size and price again;
+    /// another id's or another slot's retirement drops nothing.
+    #[test]
+    fn a_refused_queued_modify_s_hold_goes_with_its_replacement_s_retirement() {
+        let mut l = inst();
+        l.on_submit(11, SLOT, LIN, 2 * E6, true, 100 * E6);
+        l.on_modify_asked(11, 12, SLOT, 3 * E6, 110 * E6);
+        assert_eq!(l.resting_usd_1e6(SLOT), 330 * E6, "held");
+        l.on_retired(99, SLOT);
+        assert_eq!(l.resting_usd_1e6(SLOT), 330 * E6, "another id: nothing");
+        l.on_retired(12, SLOT + 1);
+        assert_eq!(l.resting_usd_1e6(SLOT), 330 * E6, "another slot's: nothing");
+        l.on_retired(12, SLOT);
+        assert_eq!(
+            l.resting_usd_1e6(SLOT),
+            200 * E6,
+            "the replacement refused: the original as it was"
+        );
+        assert!(
+            matches!(l.locate(11, SLOT), Found::One(_)),
+            "the original rests on"
+        );
+        l.on_retired(11, SLOT);
+        assert_eq!(l.resting_usd_1e6(SLOT), 0, "the original's own end");
+        assert_eq!(l.locate(11, SLOT), Found::None);
+    }
+
     /// **XH4e — a queued arm's modify counts at the larger of its two sizes
     /// and the higher of its two prices until the arm confirms it**, then
     /// at what it asked; a modify's projection swaps the replaced order's
@@ -3881,7 +3956,7 @@ mod tests {
         let mut l = inst();
         l.on_submit(11, SLOT, LIN, 2 * E6, true, 100 * E6);
         assert_eq!(l.resting_usd_1e6(SLOT), 200 * E6);
-        l.on_modify_asked(11, SLOT, 2 * E6, 110 * E6);
+        l.on_modify_asked(11, 12, SLOT, 2 * E6, 110 * E6);
         assert_eq!(l.resting_usd_1e6(SLOT), 220 * E6, "either price may rest");
         l.on_modify(11, 12, SLOT, LIN, 2 * E6, true, 0);
         assert_eq!(
@@ -3889,7 +3964,7 @@ mod tests {
             220 * E6,
             "the asked price, confirmed"
         );
-        l.on_modify_asked(12, SLOT, 3 * E6, 90 * E6);
+        l.on_modify_asked(12, 13, SLOT, 3 * E6, 90 * E6);
         assert_eq!(
             l.resting_usd_1e6(SLOT),
             330 * E6,
@@ -3957,7 +4032,16 @@ mod tests {
                 }
                 3 if !live.is_empty() => {
                     let k = pick % live.len();
-                    l.on_modify_asked(live[k].0, live[k].1, qty, px);
+                    l.on_modify_asked(live[k].0, oid, live[k].1, qty, px);
+                    oid += 1;
+                }
+                // XH4f: the asked replacement refused — its retirement.
+                7 if !live.is_empty() => {
+                    let (o, s) = live[pick % live.len()];
+                    if let Found::One(i) = l.locate(o, s) {
+                        let asked = l.resting_asked_oid[i];
+                        l.on_retired(asked, s);
+                    }
                 }
                 4 if !live.is_empty() => {
                     let k = pick % live.len();
@@ -3971,7 +4055,11 @@ mod tests {
                 }
                 5 if !live.is_empty() => {
                     let (o, s) = live.swap_remove(pick % live.len());
-                    l.on_cancel(o, s);
+                    if pick % 2 == 0 {
+                        l.on_cancel(o, s);
+                    } else {
+                        l.on_retired(o, s);
+                    }
                 }
                 6 if pick == 0 => {
                     l.clear_resting();

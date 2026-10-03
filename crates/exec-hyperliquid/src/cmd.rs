@@ -89,7 +89,9 @@ pub struct HlCmd {
     pub arg: u32,
     /// [`CMD_SCHEDULE_CANCEL`]: the venue wall time to cancel at, ms; 0
     /// clears the schedule. [`CMD_READ_DAY`]: the first fill time read,
-    /// venue wall ms.
+    /// venue wall ms. [`CMD_PLACE`] (XH4f): the order's TTL, ms — the
+    /// gateway cancels it that long after admitting it unless it ended
+    /// first (`crate::ttl`); 0 = none. A modify inherits its original's.
     pub time_ms: u64,
 }
 

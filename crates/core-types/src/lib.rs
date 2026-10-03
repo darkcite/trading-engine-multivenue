@@ -1971,6 +1971,84 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------
+// ExecHealth — a live slot's execution health (XMM XH4f)
+// ---------------------------------------------------------------
+
+/// [`ExecHealth::blocked`]: the router latched a halt on the slot.
+pub const EXEC_BLOCKED_HALTED: u8 = 1;
+/// [`ExecHealth::blocked`]: the slot is `off` — every submit refused.
+pub const EXEC_BLOCKED_OFF: u8 = 1 << 1;
+/// [`ExecHealth::blocked`]: the router's ledger is not seeded yet — every
+/// live place refused until the arm's reconciler reports.
+pub const EXEC_BLOCKED_UNSEEDED: u8 = 1 << 2;
+/// [`ExecHealth::blocked`]: the slot's arm has not booted (its snapshot,
+/// sweep, sheet, orders, budget and leverage).
+pub const EXEC_BLOCKED_NOT_READY: u8 = 1 << 3;
+/// [`ExecHealth::blocked`]: the arm's request budget is at its floor or
+/// unread too long — growth refused.
+pub const EXEC_BLOCKED_BUDGET: u8 = 1 << 4;
+
+/// [`ExecHealth::congestion`]: the arm's rates have room.
+pub const EXEC_CONGESTION_NONE: u8 = 0;
+/// Busy: a rate window over 60 % of its share, most of the in-flight
+/// bound used, or the venue's answers slow.
+pub const EXEC_CONGESTION_BUSY: u8 = 1;
+/// Throttled: growth is refused unsent; cancels still go.
+pub const EXEC_CONGESTION_THROTTLED: u8 = 2;
+/// The venue answered a rate-limit error in the last 10 s.
+pub const EXEC_CONGESTION_RATE_LIMITED: u8 = 3;
+
+/// **XMM XH4f (D7) — a live slot's execution health, as its member reads
+/// it** (`strategy_core::Ctx::exec_health`): the router's word and its
+/// arm's on whether a quote can be kept at the venue. 8 B POD. A paper
+/// slot, a replay, and every arm and ctx not taught it read
+/// [`ExecHealth::HEALTHY`] (the zeroed word, also `Default`) — so no
+/// paper member behaves differently.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecHealth {
+    /// `EXEC_BLOCKED_*` bits: any set, nothing the member places can rest.
+    pub blocked: u8,
+    /// `EXEC_CONGESTION_*`: how close the arm runs to the venue's rate
+    /// limits.
+    pub congestion: u8,
+    _pad: u16,
+    /// The worst post round trip in the arm's recent window, ms (0 = no
+    /// sample).
+    pub rtt_ms: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<ExecHealth>() == 8);
+
+impl ExecHealth {
+    /// Nothing blocked, no congestion, no round trip measured.
+    pub const HEALTHY: Self = Self::new(0, EXEC_CONGESTION_NONE, 0);
+
+    /// A health word, the padding zeroed.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(blocked: u8, congestion: u8, rtt_ms: u32) -> Self {
+        Self {
+            blocked,
+            congestion,
+            _pad: 0,
+            rtt_ms,
+        }
+    }
+
+    /// The worse of two words — a router's and its arm's, or two arms'.
+    #[inline(always)]
+    #[must_use]
+    pub fn worst(self, other: Self) -> Self {
+        Self::new(
+            self.blocked | other.blocked,
+            self.congestion.max(other.congestion),
+            self.rtt_ms.max(other.rtt_ms),
+        )
+    }
+}
+
+// ---------------------------------------------------------------
 // DepthTopK — L2 top-of-book depth carrier (WS10-B)
 // ---------------------------------------------------------------
 
@@ -4151,6 +4229,25 @@ mod roll_codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XMM XH4f: the worse of two health words — every blocked bit, the
+    /// higher congestion, the slower round trip; healthy is the identity.
+    #[test]
+    fn the_worse_health_word_keeps_every_blocked_bit_and_the_worst_figures() {
+        let router = ExecHealth::new(EXEC_BLOCKED_HALTED, EXEC_CONGESTION_NONE, 0);
+        let arm = ExecHealth::new(EXEC_BLOCKED_BUDGET, EXEC_CONGESTION_THROTTLED, 1_700);
+        assert_eq!(
+            router.worst(arm),
+            ExecHealth::new(
+                EXEC_BLOCKED_HALTED | EXEC_BLOCKED_BUDGET,
+                EXEC_CONGESTION_THROTTLED,
+                1_700
+            )
+        );
+        assert_eq!(arm.worst(router), router.worst(arm));
+        assert_eq!(ExecHealth::HEALTHY.worst(arm), arm);
+        assert_eq!(ExecHealth::HEALTHY, ExecHealth::new(0, 0, 0));
+    }
 
     #[test]
     fn tick_size_is_one_cache_line() {

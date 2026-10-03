@@ -841,6 +841,29 @@ pub trait OrderDispatch {
     fn venue_day_bought(&self, _slot: usize) -> Option<(u64, i64)> {
         None
     }
+
+    /// **XMM XH4f (D7) — slot `slot`'s execution health** at `now_ns`
+    /// (engine clock): the router's word (halted, off, unseeded) and its
+    /// arm's (not booted, its budget, its congestion, its answers' round
+    /// trip). A member reads it through its ctx to pull or slow its
+    /// quotes. Defaulted healthy: the paper matcher, and every arm not
+    /// taught it. A few loads — read on a member's tick.
+    #[inline]
+    fn exec_health(&self, _slot: u8, _now_ns: NsTs) -> core_types::ExecHealth {
+        core_types::ExecHealth::HEALTHY
+    }
+
+    /// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers**, when
+    /// the composition holds one: `true` with `out` filled — by the arm,
+    /// and by the router with its words for the arm's slot — `false` from
+    /// everything else (the default; `out` untouched). `now_ns` is the
+    /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
+    /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
+    /// 752 B report never crosses by value.
+    #[inline]
+    fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
+        false
+    }
 }
 
 /// **E7 — the live arm's operator numbers**, carried across the
@@ -947,6 +970,226 @@ const _: () = assert!(core::mem::size_of::<LiveArmCounters>() == 272);
 // `arm_bn_present` rides in padding).
 const _: () = assert!(core::mem::size_of::<ExecCounters>() == 936);
 const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
+
+/// **XMM XH4f (D11) — the Hyperliquid gateway arm's numbers** (slot 6's
+/// `exec_hyperliquid::arm::HlGatewayArm`), filled through
+/// [`OrderDispatch::gateway_arm_report`] for `/metrics`
+/// (`engine_exec_hlgw_*`) and `/state` (`exec.arms.hyperliquid_gw`): the
+/// arm's counters and the dead man's, the gateway's (its shared words and
+/// the ones it publishes at its heartbeat), the budget, the rates and the
+/// latencies, and the router's words for the arm's slot. Counters are
+/// totals since boot; the fields after [`Self::refused_max_resting`] are
+/// levels. [`ExecCounters`] keeps its pinned 936 B.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayArmReport {
+    /// `1` when an arm filled the report.
+    pub present: u64,
+    /// The arm's slot.
+    pub slot: u64,
+    // --- counters: the arm ---
+    /// Places and modifies pushed.
+    pub pushed: u64,
+    /// Order events sent to the engine.
+    pub events: u64,
+    /// Submits and modifies refused before the ring (another slot, an
+    /// unbound symbol, a rule, a kind, a client id in use).
+    pub refused_local: u64,
+    /// Pushes the command ring refused (full).
+    pub ring_full: u64,
+    /// Fills sent to the engine.
+    pub fills: u64,
+    /// Fills of another slot (tape only).
+    pub fills_foreign: u64,
+    /// Fills on an asset the arm does not bind.
+    pub fills_unresolved: u64,
+    /// Fills that crossed (taker) — a post-only maker expects none.
+    pub fills_crossed: u64,
+    /// Answers about an order the arm does not hold.
+    pub stray: u64,
+    /// Post-only crosses the venue refused.
+    pub alo_rejects: u64,
+    /// Other venue refusals of places and modifies.
+    pub rejects: u64,
+    /// Orders in doubt settled by their cancel.
+    pub doubt_settled: u64,
+    /// Orders that ended unseen (the gone wait ran out).
+    pub closed_unseen: u64,
+    /// `FILLED` sent before its fills covered the order.
+    pub join_timeouts: u64,
+    /// Unknown orders of the slot a read found after boot.
+    pub unknown_orders: u64,
+    /// Reads answered (the sheet, the orders).
+    pub reads: u64,
+    /// Reads that failed.
+    pub reads_failed: u64,
+    /// Fills before the seeding sheet that did not fit its hold.
+    pub preseed_dropped: u64,
+    /// Fills after the engine stopped draining (the venue's sheet holds
+    /// them for the next boot).
+    pub shutdown_fills: u64,
+    /// Shutdowns that reached their bound with orders of ours possibly
+    /// resting — only the dead man's schedule, if the venue keeps one,
+    /// cancels them.
+    pub shutdown_unconfirmed: u64,
+    /// Shutdowns that reached their bound with the dead man's clear
+    /// unconfirmed (a trigger may be spent on an empty book).
+    pub shutdown_switch_held: u64,
+    /// Out-queue entries lost to a full queue (a bug).
+    pub dropped: u64,
+    /// Places and modifies refused at the budget floor, or while the
+    /// budget is stale.
+    pub refused_budget: u64,
+    /// Places and modifies the gateway refused unsent over its rate shares.
+    pub throttled: u64,
+    /// Budget reads answered.
+    pub limit_reads: u64,
+    /// Pages of the day's fills read.
+    pub day_pages: u64,
+    /// Days read spent because their start may be unread.
+    pub day_unreadable: u64,
+    /// Requests taken back from the budget (refused before they left).
+    pub refunded: u64,
+    /// Places and modifies refused on a perp whose leverage is dark.
+    pub refused_leverage: u64,
+    // --- counters: the dead man ---
+    /// Arms that left the host, probes included.
+    pub dm_arms: u64,
+    /// Clears that left the host.
+    pub dm_clears: u64,
+    /// Posts the venue accepted.
+    pub dm_accepted: u64,
+    /// Posts the venue refused.
+    pub dm_refused: u64,
+    /// Posts the venue's rate limit turned away.
+    pub dm_rate_limited: u64,
+    /// Posts answered in doubt.
+    pub dm_in_doubt: u64,
+    /// Posts that never left the host.
+    pub dm_unsent: u64,
+    /// Deadlines that passed unmoved (each a trigger).
+    pub dm_triggers: u64,
+    /// Verdicts of a kind a post never gets.
+    pub dm_stray: u64,
+    // --- counters: the gateway's shared words ---
+    /// Signed posts written.
+    pub actions_sent: u64,
+    /// Replies matched to their post.
+    pub replies: u64,
+    /// Replies for a post the table does not hold.
+    pub replies_unmatched: u64,
+    /// Posts whose reply never came inside its deadline.
+    pub post_timeouts: u64,
+    /// Posts sent over the REST fallback.
+    pub rest_fallback_posts: u64,
+    /// Connection swaps and re-dials.
+    pub reconnects: u64,
+    /// Events the gateway could not deliver (a full ring: the arm halts).
+    pub evt_ring_full: u64,
+    /// Cancels the gateway sent on its own (its sweeps' and its TTLs').
+    pub own_cancels: u64,
+    // --- counters: the gateway's own, published at its heartbeat ---
+    /// Fills the gateway emitted.
+    pub gw_fills: u64,
+    /// `userFills` frames that did not scan.
+    pub gw_fills_scan_failed: u64,
+    /// `orderUpdates` rows emitted.
+    pub gw_updates: u64,
+    /// `orderUpdates` rows with a status the gateway does not report.
+    pub gw_updates_ignored: u64,
+    /// `orderUpdates` frames that did not scan.
+    pub gw_updates_scan_failed: u64,
+    /// Post answers that could not be attributed.
+    pub gw_answers_unreadable: u64,
+    /// Answers that miscount their items or carry an impossible status.
+    pub gw_answers_mismatched: u64,
+    /// `{"channel":"error"}` frames.
+    pub gw_ws_errors: u64,
+    /// Commands refused before the socket.
+    pub gw_local_refusals: u64,
+    /// Posts that cannot grow, sent without a deadline (XG-3).
+    pub gw_cancels_untimed: u64,
+    /// Dials started.
+    pub gw_dials: u64,
+    /// Connections that went down.
+    pub gw_conn_drops: u64,
+    /// Sweep rounds run.
+    pub gw_sweep_rounds: u64,
+    /// Resting orders a sweep could not cancel (their coin unmapped).
+    pub gw_sweep_unmapped: u64,
+    /// Growing commands refused unsent at 80 % of a rate share.
+    pub gw_throttled: u64,
+    /// TTL cancels sent.
+    pub gw_ttl_cancels: u64,
+    /// Orders whose TTL the full table could not keep.
+    pub gw_ttl_full: u64,
+    // --- counters: the router, for the arm's slot ---
+    /// Orders the router refused over a perp slot's `cap_perp_usd_1e6`.
+    pub refused_cap_perp: u64,
+    /// Orders the router refused over a perp slot's `max_resting_usd_1e6`.
+    pub refused_max_resting: u64,
+    // --- gauges ---
+    /// `1` while the arm takes orders.
+    pub ready: u64,
+    /// Orders the arm tracks.
+    pub open_orders: u64,
+    /// Posts in flight.
+    pub in_flight: u64,
+    /// `1` while the WebSocket is up.
+    pub ws_up: u64,
+    /// The gateway's halt reason (`exec_gateway::stats::HALT_*`; 0 =
+    /// running).
+    pub halt_reason: u64,
+    /// Since the gateway's last heartbeat, ms (`u64::MAX` = none yet).
+    pub heartbeat_age_ms: u64,
+    /// The congestion word (`exec_gateway::stats::CONGESTION_*`).
+    pub congestion: u64,
+    /// The recent window's worst post round trip, ns.
+    pub rtt_worst_ns: u64,
+    /// Post round trips since boot: p50, ns.
+    pub post_rtt_p50_ns: u64,
+    /// Post round trips since boot: p99, ns.
+    pub post_rtt_p99_ns: u64,
+    /// Post round trips since boot: the longest, ns.
+    pub post_rtt_max_ns: u64,
+    /// Command push → its frame written, p99, ns.
+    pub push_to_write_p99_ns: u64,
+    /// Cancel written → its reply, p99, ns.
+    pub cancel_rtt_p99_ns: u64,
+    /// A fill's venue time → its local receipt, p99, ns.
+    pub fill_lag_p99_ns: u64,
+    /// `1` once the budget has been read.
+    pub budget_known: u64,
+    /// The address budget's headroom, requests (negative = past the
+    /// venue's cliff).
+    pub budget_remaining: i64,
+    /// The headroom cancels still have.
+    pub budget_cancel_remaining: i64,
+    /// The IP-weight window's sum (the last minute).
+    pub rate_ip_sum: u64,
+    /// The WebSocket-message window's sum (the last minute).
+    pub rate_ws_sum: u64,
+    /// Fees since boot, USD ×1e8 (signed; rebates negative).
+    pub fees_1e8: i64,
+    /// Perps whose leverage is dark (growth refused).
+    pub leverage_dark: u64,
+    /// The dead man's availability today: 0 unknown, 1 eligible,
+    /// 2 refused, 3 exhausted (parked until the next UTC day).
+    pub dm_availability: u64,
+    /// The deadline the venue may hold, venue ms (0 = none).
+    pub dm_deadline_ms: u64,
+    /// The dead man's triggers counted today.
+    pub dm_triggers_today: u64,
+    /// The slot's `EXEC_BLOCKED_*` bits — the router's word and the arm's.
+    pub health_blocked: u64,
+    /// The slot's positions without a fresh mark (XH2-C refuses growth).
+    pub unmarked_positions: u64,
+    /// The slot's resting notional, USD ×1e6.
+    pub resting_usd_1e6: i64,
+}
+
+// XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 752);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

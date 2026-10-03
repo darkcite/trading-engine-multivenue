@@ -29,6 +29,13 @@
 //! | stranded | a sweep that never reads clear stops after 8 rounds `SWEEP_STRANDED`; a new request starts over |
 //! | rates | XH4e: the budget and day reads post as `info` (the day's start in place) and answer one end each; past 80 % of the IP share growth is refused `THROTTLED` unsent while a cancel still goes, and the congestion word says `THROTTLED` |
 //! | full page | XH4e: a full day page — 2 000 real-length rows, ≈ 0.8 MB in one frame — fits the receive buffer (`MAX_WS_BUF`) and is summed in place; the connection holds |
+//! | ttl | XH4f (D9): an order's TTL ends at the gateway — an untimed `cancelByCloid` at the next beat, its success read `EXPIRED`; a replacement inherits its original's deadline; the arm's own successful cancel leaves nothing to fire |
+//! | not found | XH4f (D9): a not-found ends no TTL — the arm's own cancel's leaves the order's TTL to fire; the TTL's own leaves its row, and a late landing fires it again |
+//! | ttl races | XH4f (D9): an order seen resting while its TTL cancel is out waits for that cancel's answer (one cancel); a place left in doubt whose TTL cancel found nothing is cancelled when it lands late |
+//! | ttl ends | XH4f (D9): an end while the TTL cancel is out — a plain `canceled` reads `EXPIRED`, the dead man's `scheduledCancel` keeps its reason |
+//!
+//! `Answer::Later` defers a post's answer without pausing the socket: the
+//! TTL races above see their stream rows while the cancel is still out.
 //!
 //! Offline path: this file MAY allocate.
 
@@ -36,7 +43,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use core_types::{ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_MARGIN};
+use core_types::{
+    ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_EXPIRED,
+    ORDER_EVENT_REASON_MARGIN, ORDER_EVENT_REASON_SCHEDULED_CANCEL,
+};
 use exec_gateway::stats::{
     CONGESTION_THROTTLED, HALT_VENUE_BASE, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING,
 };
@@ -47,11 +57,11 @@ use exec_hyperliquid::event::{
     ExecEvent, EVF_BUY, EVF_CROSSED, EVF_RESTING, EV_ACK, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP,
     EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
     EV_UNANSWERED, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL,
-    REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_THROTTLED, REASON_TRANSPORT,
-    SLOT_FOREIGN,
+    REASON_MALFORMED, REASON_NOT_FOUND, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_THROTTLED,
+    REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use exec_hyperliquid::gateway::{
-    hl_duplex, CoinMap, GatewayCfg, HlEngineEnd, HlGateway, IP_WEIGHT_SHARE, WS_MSG_SHARE,
+    hl_duplex, pw, CoinMap, GatewayCfg, HlEngineEnd, HlGateway, IP_WEIGHT_SHARE, WS_MSG_SHARE,
 };
 use exec_hyperliquid::testvenue::{items_in, resting, Answer, Venue};
 use exec_hyperliquid::{Network, Tif};
@@ -283,6 +293,381 @@ fn coalesced_places_are_one_post_answered_item_by_item_and_the_streams_route() {
     let filled = evs.iter().find(|e| e.kind == EV_FILLED).unwrap();
     assert_eq!((filled.client_oid, filled.oid, filled.asset), (1, 101, ETH));
     assert_eq!(gw.counters().fills, 1);
+    // XH4f: the answered posts' worst round trip went out with the
+    // heartbeat — measured, and inside the post timeout.
+    let w = eng.stats.rtt_worst_ns();
+    assert!(w > 0 && w < 5_000_000_000, "{w}");
+    // XH4f (D11): and its own counters, for the arm's report — as of that
+    // heartbeat.
+    let dials = eng.stats.published(pw::DIALS);
+    let fills = eng.stats.published(pw::FILLS);
+    assert!(
+        dials >= 1 && fills <= gw.counters().fills,
+        "{dials} {fills}"
+    );
+}
+
+/// XH4f (D9): an order's TTL ends at the gateway — an untimed
+/// `cancelByCloid` goes on its own at the next beat and its success reads
+/// `EXPIRED`, charged with the sweeps'; a replacement inherits its
+/// original's deadline (the original's TTL ends as the modify lands); the
+/// arm's own cancel before the TTL leaves nothing to fire; an end row
+/// after the TTL cancel's answer reads as the venue said.
+#[test]
+fn a_ttl_ends_at_the_gateway_and_its_cancel_reads_expired() {
+    let v = Venue::start();
+    v.policy(|s| {
+        if s.body.contains("cancelByCloid") {
+            // One success per cancel: two TTLs may end in one beat.
+            let n = s.body.matches(r#""cloid":"#).count();
+            let st = vec![r#""success""#; n].join(",");
+            Answer::Action(format!(
+                r#"{{"status":"ok","response":{{"type":"cancel","data":{{"statuses":[{st}]}}}}}}"#
+            ))
+        } else {
+            Answer::Action(resting(items_in(&s.body), 300))
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let ttl = |mut c: HlCmd, ms: u64| {
+        c.time_ms = ms;
+        c
+    };
+    let acks = |e: &[ExecEvent]| count(e, EV_ACK);
+    // 1: its TTL fires. 2: the arm cancels it first. 3 → 4: a modify's
+    // replacement fires at 3's deadline.
+    for (i, cmd) in [
+        ttl(alo(1), 300),
+        ttl(alo(2), 300),
+        ttl(alo(3), 300),
+        alo(4).replacing(3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(eng.cmd.push(&cmd));
+        assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| acks(e) > i));
+    }
+    assert!(eng.cmd.push(&HlCmd::cancel(SLOT, 2, ETH)));
+    let expired = |e: &ExecEvent| {
+        e.kind == EV_ACK && e.cmd_kind() == CMD_CANCEL && e.reason == ORDER_EVENT_REASON_EXPIRED
+    };
+    let fired_both = drive(&mut gw, &mut eng, &mut evs, 5, |_, e| {
+        e.iter().filter(|x| expired(x)).count() >= 2
+    });
+    let seen: Vec<(u8, u8, u8, u64)> = evs
+        .iter()
+        .map(|x| (x.kind, x.cmd_kind(), x.reason, x.client_oid))
+        .collect();
+    assert!(fired_both, "{:?} {seen:?}", gw.counters());
+    let _ = drive(&mut gw, &mut eng, &mut evs, 1, |_, _| false);
+    let mut fired: Vec<u64> = evs
+        .iter()
+        .filter(|x| expired(x))
+        .map(|x| x.client_oid)
+        .collect();
+    fired.sort_unstable();
+    assert_eq!(
+        fired,
+        [1, 4],
+        "2 was cancelled by its arm first, 3 replaced"
+    );
+    let posts = v.posts();
+    let ttl_posts: Vec<&String> = posts
+        .iter()
+        .map(|p| &p.body)
+        .filter(|b| b.contains("cancelByCloid") && !b.contains(&cloid_hex(SLOT, 2)))
+        .collect();
+    assert!(!ttl_posts.is_empty());
+    assert!(
+        ttl_posts.iter().all(|b| !b.contains("expiresAfter")),
+        "a TTL cancel is untimed (XG-3)"
+    );
+    assert_eq!(gw.counters().ttl_cancels, 2);
+    assert_eq!(eng.stats.sweep_cancels(), 2, "charged with the sweeps'");
+    // The end rows: the TTL's read EXPIRED; the arm's own, as the venue said.
+    let upd = |cid: u64| {
+        format!(
+            r#"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"ETH","side":"B","limitPx":"2500.0","sz":"0.1","oid":{},"timestamp":1,"origSz":"0.1","cloid":"{}"}},"status":"canceled","statusTimestamp":1700000000002}}]}}"#,
+            300 + cid,
+            cloid_hex(SLOT, cid)
+        )
+    };
+    v.push_all(&upd(2));
+    v.push_all(&upd(1));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| e
+        .iter()
+        .filter(|x| x.kind == exec_hyperliquid::event::EV_CANCELED)
+        .count()
+        >= 2));
+    let end = |cid: u64| {
+        evs.iter()
+            .find(|x| x.kind == exec_hyperliquid::event::EV_CANCELED && x.client_oid == cid)
+            .map(|x| x.reason)
+    };
+    assert_eq!(end(2), Some(ORDER_EVENT_REASON_CANCEL_REQUESTED));
+    assert_eq!(
+        end(1),
+        Some(ORDER_EVENT_REASON_CANCEL_REQUESTED),
+        "its TTL row went with the ACK"
+    );
+}
+
+/// XH4f (D9, risk r2): a not-found ends no TTL. The arm's own cancel
+/// answered not-found (its order still in flight on another socket, say)
+/// leaves the order's TTL to fire; the TTL's own cancel answered not-found
+/// leaves its row, and the order seen resting after it — a late landing —
+/// has the cancel go again at the next beat.
+#[test]
+fn a_not_found_ends_no_ttl_and_a_late_landing_fires_it_again() {
+    const NOT_FOUND: &str = r#"{"error":"Order was never placed, already canceled, or filled."}"#;
+    let v = Venue::start();
+    let (c1, c2) = (cloid_hex(SLOT, 1), cloid_hex(SLOT, 2));
+    let (first1, first2) = (AtomicBool::new(true), AtomicBool::new(true));
+    v.policy(move |s| {
+        if s.body.contains("cancelByCloid") {
+            // Each order's first cancel finds nothing — 1's is its TTL's
+            // (not landed yet), 2's the arm's own; the rest succeed.
+            let st: Vec<&str> = s
+                .body
+                .split(r#""cloid":""#)
+                .skip(1)
+                .map(|item| {
+                    let gone = if item.starts_with(&c1) {
+                        first1.swap(false, Ordering::SeqCst)
+                    } else {
+                        item.starts_with(&c2) && first2.swap(false, Ordering::SeqCst)
+                    };
+                    if gone {
+                        NOT_FOUND
+                    } else {
+                        r#""success""#
+                    }
+                })
+                .collect();
+            Answer::Action(format!(
+                r#"{{"status":"ok","response":{{"type":"cancel","data":{{"statuses":[{}]}}}}}}"#,
+                st.join(",")
+            ))
+        } else {
+            Answer::Action(resting(items_in(&s.body), 300))
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let ttl = |mut c: HlCmd, ms: u64| {
+        c.time_ms = ms;
+        c
+    };
+    let acks = |e: &[ExecEvent]| count(e, EV_ACK);
+    // 1's TTL ends at 300 ms, 2's at 900 ms: their cancels go apart.
+    for (i, cmd) in [ttl(alo(1), 300), ttl(alo(2), 900)].into_iter().enumerate() {
+        assert!(eng.cmd.push(&cmd));
+        assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| acks(e) > i));
+    }
+    let not_found = |e: &[ExecEvent], cid: u64| {
+        e.iter()
+            .any(|x| x.kind == EV_REJECTED && x.reason == REASON_NOT_FOUND && x.client_oid == cid)
+    };
+    assert!(eng.cmd.push(&HlCmd::cancel(SLOT, 2, ETH)));
+    assert!(
+        drive(&mut gw, &mut eng, &mut evs, 5, |_, e| not_found(e, 2)),
+        "the arm's own cancel of 2: not found"
+    );
+    assert!(
+        drive(&mut gw, &mut eng, &mut evs, 5, |_, e| not_found(e, 1)),
+        "1's TTL cancel: not found"
+    );
+    // 1 lands late: the venue's open row for it.
+    v.push_all(&format!(
+        r#"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"ETH","side":"B","limitPx":"2500.0","sz":"0.1","oid":301,"timestamp":1,"origSz":"0.1","cloid":"{}"}},"status":"open","statusTimestamp":1700000000001}}]}}"#,
+        cloid_hex(SLOT, 1)
+    ));
+    let expired = |x: &ExecEvent| {
+        x.kind == EV_ACK && x.cmd_kind() == CMD_CANCEL && x.reason == ORDER_EVENT_REASON_EXPIRED
+    };
+    let both = drive(&mut gw, &mut eng, &mut evs, 5, |_, e| {
+        e.iter().filter(|x| expired(x)).count() >= 2
+    });
+    assert!(both, "{:?}", gw.counters());
+    let mut fired: Vec<u64> = evs
+        .iter()
+        .filter(|x| expired(x))
+        .map(|x| x.client_oid)
+        .collect();
+    fired.sort_unstable();
+    assert_eq!(
+        fired,
+        [1, 2],
+        "2's TTL outlived its arm's not-found; 1's went again on its landing"
+    );
+    assert_eq!(gw.counters().ttl_cancels, 3, "1's twice, 2's once");
+}
+
+/// XH4f (D9, risk r3): the TTL cancel's two races. An order seen resting
+/// while its TTL cancel is out waits for that cancel's answer — a success
+/// ends it with ONE cancel, none at the next beat meanwhile. A place left in
+/// doubt (never answered) whose TTL cancel found nothing is cancelled again
+/// when it lands late, its end read `EXPIRED`.
+#[test]
+fn a_ttl_cancel_waits_out_its_answer_and_a_doubtful_place_landing_late_is_cancelled() {
+    const NOT_FOUND: &str = r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":[{"error":"Order was never placed, already canceled, or filled."}]}}}"#;
+    let v = Venue::start();
+    let (c3, c4) = (cloid_hex(SLOT, 3), cloid_hex(SLOT, 4));
+    let first3 = AtomicBool::new(true);
+    v.policy(move |s| {
+        if s.body.contains("cancelByCloid") {
+            if s.body.contains(&c4) {
+                // 4's TTL cancel: a success, answered late.
+                Answer::Later(Duration::from_millis(400), CANCEL_OK.into())
+            } else if s.body.contains(&c3) && first3.swap(false, Ordering::SeqCst) {
+                // 3's first TTL cancel finds nothing: its place is in doubt.
+                Answer::Action(NOT_FOUND.into())
+            } else {
+                Answer::Action(CANCEL_OK.into())
+            }
+        } else if s.body.contains(&c3) {
+            // 3's place: never answered — it lands later.
+            Answer::Silent
+        } else {
+            Answer::Action(resting(items_in(&s.body), 300))
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 1_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let ttl = |mut c: HlCmd, ms: u64| {
+        c.time_ms = ms;
+        c
+    };
+    let open = |cid: u64| {
+        format!(
+            r#"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"ETH","side":"B","limitPx":"2500.0","sz":"0.1","oid":{},"timestamp":1,"origSz":"0.1","cloid":"{}"}},"status":"open","statusTimestamp":{}}}]}}"#,
+            300 + cid,
+            cloid_hex(SLOT, cid),
+            1_700_000_000_000 + cid
+        )
+    };
+    let expired = |e: &[ExecEvent], cid: u64| {
+        e.iter().any(|x| {
+            x.kind == EV_ACK
+                && x.cmd_kind() == CMD_CANCEL
+                && x.reason == ORDER_EVENT_REASON_EXPIRED
+                && x.client_oid == cid
+        })
+    };
+    let cancels_of = |c: &str| {
+        v.posts()
+            .iter()
+            .filter(|p| p.body.contains("cancelByCloid") && p.body.contains(c))
+            .count()
+    };
+
+    // 4 rests; its TTL cancel goes at 300 ms, answered 400 ms later; its
+    // open row arrives while the cancel is out.
+    let c4 = cloid_hex(SLOT, 4);
+    let acked = |e: &[ExecEvent]| count(e, EV_ACK) >= 1;
+    let sent4 = || cancels_of(&c4) >= 1;
+    assert!(eng.cmd.push(&ttl(alo(4), 300)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| acked(e)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| sent4()));
+    v.push_all(&open(4));
+    let done4 = drive(&mut gw, &mut eng, &mut evs, 5, |_, e| expired(e, 4));
+    assert!(done4, "4: its TTL cancel's success {:?}", gw.counters());
+    let _ = drive(&mut gw, &mut eng, &mut evs, 1, |_, _| false);
+    assert_eq!(cancels_of(&c4), 1, "the open row waited for the answer");
+
+    // 3's place is never answered (in doubt); its TTL cancel at 1.5 s finds
+    // nothing; then it lands — the cancel goes again.
+    assert!(eng.cmd.push(&ttl(alo(3), 1_500)));
+    let doubt = |e: &[ExecEvent]| {
+        e.iter()
+            .any(|x| x.kind == EV_UNANSWERED && x.client_oid == 3)
+    };
+    let in_doubt = drive(&mut gw, &mut eng, &mut evs, 5, |_, e| doubt(e));
+    assert!(in_doubt, "3: in doubt");
+    let missed = |e: &[ExecEvent]| {
+        e.iter()
+            .any(|x| x.kind == EV_REJECTED && x.reason == REASON_NOT_FOUND && x.client_oid == 3)
+    };
+    assert!(
+        drive(&mut gw, &mut eng, &mut evs, 5, |_, e| missed(e)),
+        "3's TTL cancel: not found"
+    );
+    v.push_all(&open(3));
+    let done3 = drive(&mut gw, &mut eng, &mut evs, 5, |_, e| expired(e, 3));
+    assert!(done3, "3 landed late: cancelled again {:?}", gw.counters());
+    assert_eq!(gw.counters().ttl_cancels, 3, "4's once, 3's twice");
+}
+
+/// XH4f (D9, risk r5): an end row while the order's TTL cancel is out —
+/// a plain `canceled` reads `EXPIRED` (the TTL's), a venue-specific one
+/// (here the dead man's `scheduledCancel`) keeps its reason.
+#[test]
+fn an_end_while_the_ttl_cancel_is_out_is_the_ttl_s_only_when_plain() {
+    let v = Venue::start();
+    v.policy(|s| {
+        if s.body.contains("cancelByCloid") {
+            // Both TTL cancels, answered late: the end rows come first.
+            let n = s.body.matches(r#""cloid":"#).count();
+            let st = vec![r#""success""#; n].join(",");
+            Answer::Later(
+                Duration::from_millis(600),
+                format!(
+                    r#"{{"status":"ok","response":{{"type":"cancel","data":{{"statuses":[{st}]}}}}}}"#
+                ),
+            )
+        } else {
+            Answer::Action(resting(items_in(&s.body), 300))
+        }
+    });
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    let ttl = |mut c: HlCmd| {
+        c.time_ms = 300;
+        c
+    };
+    assert!(eng.cmd.push(&ttl(alo(5))));
+    assert!(eng.cmd.push(&ttl(alo(6))));
+    let acked = |e: &[ExecEvent]| count(e, EV_ACK) >= 2;
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| acked(e)));
+    let out = || v.posts().iter().any(|p| p.body.contains("cancelByCloid"));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| out()));
+    let row = |cid: u64, status: &str| {
+        format!(
+            r#"{{"order":{{"coin":"ETH","side":"B","limitPx":"2500.0","sz":"0.1","oid":{},"timestamp":1,"origSz":"0.1","cloid":"{}"}},"status":"{status}","statusTimestamp":{}}}"#,
+            300 + cid,
+            cloid_hex(SLOT, cid),
+            1_700_000_000_000 + cid
+        )
+    };
+    v.push_all(&format!(
+        r#"{{"channel":"orderUpdates","data":[{},{}]}}"#,
+        row(5, "canceled"),
+        row(6, "scheduledCancel")
+    ));
+    let ended = |e: &[ExecEvent]| count(e, exec_hyperliquid::event::EV_CANCELED) >= 2;
+    let both = drive(&mut gw, &mut eng, &mut evs, 5, |_, e| ended(e));
+    assert!(both, "{:?}", gw.counters());
+    let end = |cid: u64| {
+        evs.iter()
+            .find(|x| x.kind == exec_hyperliquid::event::EV_CANCELED && x.client_oid == cid)
+            .map(|x| x.reason)
+    };
+    assert_eq!(
+        end(5),
+        Some(ORDER_EVENT_REASON_EXPIRED),
+        "a plain end: the TTL's"
+    );
+    assert_eq!(
+        end(6),
+        Some(ORDER_EVENT_REASON_SCHEDULED_CANCEL),
+        "the dead man's end keeps its reason"
+    );
 }
 
 #[test]

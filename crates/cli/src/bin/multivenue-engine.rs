@@ -2796,11 +2796,41 @@ fn finish_bn_boot<L: clob_dispatcher::OrderDispatch>(
              be allowed for one venue and reach another arm",
         ));
     }
+    bind_ledger_rows(d, specs, "Binance instrument")?;
+    info!(
+        instruments = specs.len(),
+        "exec: binance instruments bound in the ledger"
+    );
+    Ok(())
+}
+
+/// **XMM XH4f — slot 6's last boot step**, after `wire_exec_halts`: the
+/// ledger binds the gateway arm's perps as `LAW_LINEAR` rows under the
+/// member's engine ids — the rows the router's perp clamps price (XH2-C,
+/// `CapPerp`, `MaxResting`).
+fn finish_xmm_boot<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    specs: &[exec_router::InstrumentSpec],
+) -> Result<(), String> {
+    bind_ledger_rows(d, specs, "xmm perp")?;
+    info!(
+        instruments = specs.len(),
+        "exec: xmm perps bound in the ledger"
+    );
+    Ok(())
+}
+
+/// Bind an arm's instrument rows in the ledger, every one or the boot
+/// stops (BX6 obligation 7; XMM XH4f).
+fn bind_ledger_rows<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    specs: &[exec_router::InstrumentSpec],
+    what: &str,
+) -> Result<(), String> {
     for spec in specs {
         d.bind_instrument(spec)
-            .map_err(|e| format!("the ledger refused Binance instrument {}: {e:?}", spec.sym))?;
+            .map_err(|e| format!("the ledger refused {what} {}: {e:?}", spec.sym))?;
     }
-    info!(instruments = specs.len(), "exec: binance instruments bound in the ledger");
     Ok(())
 }
 
@@ -3603,6 +3633,7 @@ fn run(args: RunArgs) -> ExitCode {
         cli::ExecObs {
             modes: m,
             binance: b.binance_slot().is_some(),
+            gateway: b.gateway_live().is_some(),
         }
     });
     // BX6: a live slot names binance — its arm reads the marks (O-BX29).
@@ -3640,10 +3671,16 @@ fn run(args: RunArgs) -> ExitCode {
         .latency_dump_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}/latency", cfg.log_dir)));
-    let obs = obs.with_latency_dump(LatencyDump::from_secs(
+    let mut obs = obs.with_latency_dump(LatencyDump::from_secs(
         latency_dump_dir.clone(),
         args.latency_dump_secs,
     ));
+    // XMM XH4f (D11): slot 6's gateway-arm tell, when slot 6 is live on the
+    // gateway.
+    obs.xmm_gateway_tell = exec_boot
+        .as_ref()
+        .filter(|b| b.gateway_live().is_some())
+        .map(|b| cli::xmm_live::shutdown_tell_path(&b.path));
     if args.latency_dump_secs > 0 {
         info!(
             secs = args.latency_dump_secs,
@@ -4044,9 +4081,13 @@ fn run(args: RunArgs) -> ExitCode {
             hl_families,
             statuses.hl_roll.clone(),
             hl_wall_anchor,
-            // HC11: slot 7 reads each underlying's oracle off the MARK.
+            // HC11: slot 7 reads each underlying's oracle off the MARK;
+            // XMM XH4f: the router prices slot 6's perps off it (XH2-C).
             strategy_set::mask_for_name(&args.strategy)
-                .is_some_and(|m| m & strategy_set::BIT_HCV != 0),
+                .is_some_and(|m| m & strategy_set::BIT_HCV != 0)
+                || exec_boot
+                    .as_ref()
+                    .is_some_and(|b| b.gateway_live().is_some()),
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
@@ -4594,6 +4635,9 @@ fn run(args: RunArgs) -> ExitCode {
         return ExitCode::from(1);
     }
     let strategy_choice = args.strategy.as_str();
+    // XMM XH4f: slot 6's gateway thread's owner — set when its arm boots,
+    // released after the loop (or on a boot abort past that point).
+    let mut xmm_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
@@ -5210,9 +5254,43 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         None
                     };
+                    // **XMM XH4f — slot 6's own arm, the Hyperliquid
+                    // gateway** (TESTNET until XH5): the member's perps
+                    // bound from the exchange host's meta, their leverage
+                    // set before it takes orders, its thread released only
+                    // after the loop (the arm's shutdown pumps it in the
+                    // drain). `resolve` made it the process's only
+                    // Hyperliquid signer. Booted last: no refusal after it
+                    // but the shapes' own.
+                    let xmm_arm = if eb.gateway_live().is_some() {
+                        let spec = cli::xmm_live::XmmSpec {
+                            eb: &eb,
+                            xmm: xmm_boot.as_ref(),
+                            md_ws_host: &cfg.hyperliquid_ws_host,
+                        };
+                        match cli::xmm_live::boot_xmm_arm(
+                            &spec,
+                            TlsTransport::default_client_config(),
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                xmm_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some((b.arm, b.specs))
+                            }
+                            Err(reason) => {
+                                error!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
-                    // the loop from its own arm — enumerated, eight (O-BX30);
+                    // the loop from its own arm — enumerated, eight (O-BX30),
+                    // and XMM XH4f's two with slot 6 outermost (`SlotSplit`);
                     // the halt wiring is one generic helper. Nothing armed
                     // keeps the refusing stub, so LAW E-1 stays true by
                     // construction. A Binance shape splits by route venue
@@ -5240,25 +5318,66 @@ fn run(args: RunArgs) -> ExitCode {
                             )
                         }};
                     }
+                    // A refusal past the arms' boot: slot 6's gateway (if
+                    // any) is released first, so the join never waits out
+                    // its grace.
+                    macro_rules! abort_boot {
+                        ($($log:tt)*) => {{
+                            error!($($log)*);
+                            if let Some(s) = &xmm_stop {
+                                s.release();
+                            }
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }};
+                    }
                     macro_rules! finish_bn {
                         ($d:expr, $split_aliases:expr, $specs:expr) => {
                             if let Err(reason) = finish_bn_boot(&mut $d, $split_aliases, &$specs) {
-                                error!(%reason, "exec: binance arm refused — boot aborted");
-                                join_reverse(handles);
-                                return ExitCode::from(1);
+                                abort_boot!(%reason, "exec: binance arm refused — boot aborted");
+                            }
+                        };
+                    }
+                    macro_rules! finish_xmm {
+                        ($d:expr, $specs:expr) => {
+                            if let Err(reason) = finish_xmm_boot(&mut $d, &$specs) {
+                                abort_boot!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
                             }
                         };
                     }
                     const REAL: &str = "running strategy-set with LIVE slots — real orders will be \
                                         submitted";
-                    match (hl_arm, bn_arm, hyparb_live) {
-                        (Some(arm), None, None) => {
+                    match (hl_arm, bn_arm, hyparb_live, xmm_arm) {
+                        // XMM XH4f: slot 6 on its own arm, outermost.
+                        (None, None, None, Some((xmm, xspecs))) => {
+                            let split = exec_router::SlotSplit::new(
+                                cli::exec_boot::XMM_SLOT as u8,
+                                exec_router::NullLiveDispatcher::new(),
+                                xmm,
+                            );
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            finish_xmm!(d, xspecs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with slot 6 LIVE on the Hyperliquid gateway \
+                                 (TESTNET) — real testnet orders will be submitted"
+                            )
+                        }
+                        // `exec_boot::resolve` refuses slot 6's gateway beside
+                        // any other live slot (XH4h shares the nonce; D2's
+                        // global halt): refused here too, never composed.
+                        (_, _, _, Some(_)) => abort_boot!(
+                            "exec: slot 6's gateway beside another live arm — boot aborted"
+                        ),
+                        (Some(arm), None, None, None) => {
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
                             wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                             enter_loop!(d, REAL)
                         }
-                        (Some(arm), None, Some(live)) => {
+                        (Some(arm), None, Some(live), None) => {
                             let split =
                                 exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
                             let mut d =
@@ -5270,7 +5389,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  own wallet) — real orders will be submitted"
                             )
                         }
-                        (None, None, Some(live)) => {
+                        (None, None, Some(live), None) => {
                             let split = exec_router::SlotSplit::new(
                                 cli::hyparb_live::SLOT,
                                 exec_router::NullLiveDispatcher::new(),
@@ -5285,7 +5404,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  orders will be submitted"
                             )
                         }
-                        (None, None, None) => {
+                        (None, None, None, None) => {
                             // Nothing armed: the refusing stub, so a live
                             // slot on a venue with no arm cannot exist here
                             // (already refused by `exec_boot::resolve`).
@@ -5309,7 +5428,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  armed) — no orders will be submitted"
                             )
                         }
-                        (None, Some((bn, specs)), None) => {
+                        (None, Some((bn, specs)), None, None) => {
                             let split = exec_router::VenueSplit::new(
                                 bn_venue,
                                 exec_router::NullLiveDispatcher::new(),
@@ -5323,7 +5442,7 @@ fn run(args: RunArgs) -> ExitCode {
                             finish_bn!(d, split_aliases, specs);
                             enter_loop!(d, REAL)
                         }
-                        (Some(arm), Some((bn, specs)), None) => {
+                        (Some(arm), Some((bn, specs)), None, None) => {
                             let split =
                                 exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
                             let mut d =
@@ -5337,7 +5456,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  (hyperliquid, binance) — real orders will be submitted"
                             )
                         }
-                        (None, Some((bn, specs)), Some(live)) => {
+                        (None, Some((bn, specs)), Some(live), None) => {
                             let venues = exec_router::VenueSplit::new(
                                 bn_venue,
                                 exec_router::NullLiveDispatcher::new(),
@@ -5357,7 +5476,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  on its own wallet) — real orders will be submitted"
                             )
                         }
-                        (Some(arm), Some((bn, specs)), Some(live)) => {
+                        (Some(arm), Some((bn, specs)), Some(live), None) => {
                             let venues =
                                 exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
                             let split =
@@ -5396,6 +5515,11 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- Reverse-order join (ingress threads first, then obs) --
+    // XMM XH4f: the loop returned, so slot 6's arm is done with its
+    // gateway (its shutdown ran in the drain): release the thread.
+    if let Some(s) = &xmm_stop {
+        s.release();
+    }
     join_reverse(handles);
     for h in obs_handles.into_iter().rev() {
         let name = h.thread().name().unwrap_or("<obs>").to_string();

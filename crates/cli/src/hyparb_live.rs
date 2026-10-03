@@ -1522,6 +1522,22 @@ pub(crate) fn info_once(
     body: &[u8],
     tls: Arc<ClientConfig>,
 ) -> Result<Vec<u8>, String> {
+    // COPY: the boot's answer out of the client (≤ 1 MiB, once a boot read)
+    // — slot 0's reads (`meta`, `perpDexs`, a builder dex's meta) and the
+    // rehearsal's each parse it once and drop it, so the copy is avoidable:
+    // kept as it was before XMM XH4f, which moves only its own read onto
+    // `info_with` (in place); moving these is slot 0's change.
+    info_with(host, body, tls, |b| b.to_vec())
+}
+
+/// One boot `/info` post, its answer handed to `f` in place (XMM XH4f: the
+/// gateway arm parses `meta` inside the client's buffer).
+pub(crate) fn info_with<T>(
+    host: &str,
+    body: &[u8],
+    tls: Arc<ClientConfig>,
+    f: impl FnOnce(&[u8]) -> T,
+) -> Result<T, String> {
     let mut http = core_net::HttpsPost::new(host, 443, "/info", tls, 256, META_RESP)
         .map_err(|e| format!("{host}/info: {e}"))?;
     let b = http.body_mut();
@@ -1537,9 +1553,7 @@ pub(crate) fn info_once(
     if status != 200 {
         return Err(format!("{host}/info: http status {status}"));
     }
-    // COPY: the boot's `meta` answer out of the client (≤ 1 MiB, once) —
-    // rejected: holding the client alive past boot for one parse.
-    Ok(http.resp()[r].to_vec())
+    Ok(f(&http.resp()[r]))
 }
 
 /// One address-returning view, at boot.

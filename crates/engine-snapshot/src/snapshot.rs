@@ -620,6 +620,34 @@ pub fn halt_reason_word(v: u8) -> &'static str {
     }
 }
 
+/// XMM XH4f: the congestion word (`core_types::EXEC_CONGESTION_*`),
+/// spelled.
+const CONGESTION_WORDS: [&str; 4] = ["none", "busy", "throttled", "rate_limited"];
+const _: () =
+    assert!(CONGESTION_WORDS.len() == core_types::EXEC_CONGESTION_RATE_LIMITED as usize + 1);
+
+/// XMM XH4f: the dead-man switch's availability today
+/// (`exec_hyperliquid::deadman::Availability`, `repr(u8)`), spelled — the
+/// cli, which sees both crates, pins the order.
+const DEADMAN_AVAILABILITY_WORDS: [&str; 4] = ["unknown", "eligible", "refused", "exhausted"];
+
+/// The word for `v` in `table`, `"unknown"` past it.
+fn word(table: &[&'static str], v: u8) -> &'static str {
+    table.get(usize::from(v)).copied().unwrap_or("unknown")
+}
+
+/// XMM XH4f: the word for a congestion byte, `"unknown"` past the table.
+#[must_use]
+pub fn congestion_word(v: u8) -> &'static str {
+    word(&CONGESTION_WORDS, v)
+}
+
+/// XMM XH4f: the word for an availability byte, `"unknown"` past the table.
+#[must_use]
+pub fn deadman_availability_word(v: u8) -> &'static str {
+    word(&DEADMAN_AVAILABILITY_WORDS, v)
+}
+
 /// **E6 commit 4 — what the execution router is refusing, and why.**
 ///
 /// `/metrics` answers this for a monitoring system; this answers it
@@ -713,6 +741,9 @@ pub struct ExecSnapshot {
     /// **BX6** — the Binance arm (`exec.arms.binance`; rendered only
     /// when `present`).
     pub arms_binance: ArmSnapshot,
+    /// **XMM XH4f (D11)** — slot 6's Hyperliquid gateway arm
+    /// (`exec.arms.hyperliquid_gw`; rendered only when `present`).
+    pub arms_hyperliquid_gw: GatewayArmSnapshot,
 }
 
 /// **BX6 — one venue arm's numbers** in `/state` `exec.arms.<venue>`:
@@ -769,6 +800,84 @@ pub struct ArmSnapshot {
     /// E7 session bound: equity minus the anchor (USD ×1e6, signed).
     pub session_pnl_usd_1e6: i64,
 }
+
+/// **XMM XH4f (D11) — slot 6's Hyperliquid gateway arm** in `/state`
+/// `exec.arms.hyperliquid_gw`: whether it takes orders, what it sent and
+/// what came back, the budget, the rates, the dead man and its shutdown.
+/// The operator's subset of the dispatcher's `GatewayArmReport` —
+/// `/metrics` (`engine_exec_hlgw_*`) carries all of it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayArmSnapshot {
+    /// `1` when the arm exists in this boot.
+    pub present: u8,
+    /// The arm's slot.
+    pub slot: u8,
+    /// `1` while the arm takes orders.
+    pub ready: u8,
+    /// `1` while the WebSocket is up.
+    pub ws_up: u8,
+    /// The congestion word (0 none, 1 busy, 2 throttled, 3 rate-limited).
+    pub congestion: u8,
+    /// `1` once the budget has been read.
+    pub budget_known: u8,
+    /// The dead man's availability (0 unknown, 1 eligible, 2 refused,
+    /// 3 exhausted).
+    pub dm_availability: u8,
+    /// Perps whose leverage is dark (growth refused).
+    pub leverage_dark: u8,
+    /// The slot's `EXEC_BLOCKED_*` bits (the router's word and the arm's).
+    pub health_blocked: u64,
+    /// The gateway's halt reason (0 = running).
+    pub halt_reason: u64,
+    /// Orders the arm tracks.
+    pub open_orders: u64,
+    /// Posts in flight.
+    pub in_flight: u64,
+    /// Since the gateway's last heartbeat, ms (`u64::MAX` = none yet,
+    /// rendered `-1`).
+    pub heartbeat_age_ms: u64,
+    /// The recent window's worst post round trip, ns.
+    pub rtt_worst_ns: u64,
+    /// Places and modifies pushed.
+    pub pushed: u64,
+    /// Venue refusals other than post-only crosses.
+    pub rejects: u64,
+    /// Post-only crosses the venue refused.
+    pub alo_rejects: u64,
+    /// Refused before the ring.
+    pub refused_local: u64,
+    /// Refused at the budget floor, or while the budget is stale.
+    pub refused_budget: u64,
+    /// Refused on a perp whose leverage is dark.
+    pub refused_leverage: u64,
+    /// Refused unsent over the gateway's rate shares.
+    pub throttled: u64,
+    /// Fills sent to the engine.
+    pub fills: u64,
+    /// Fills that crossed (taker) — a post-only maker expects none.
+    pub fills_crossed: u64,
+    /// Fees since boot, USD ×1e8 (signed; rebates negative).
+    pub fees_1e8: i64,
+    /// Unknown orders of the slot a read found after boot.
+    pub unknown_orders: u64,
+    /// Days read spent because their start may be unread.
+    pub day_unreadable: u64,
+    /// Posts whose reply never came inside its deadline.
+    pub post_timeouts: u64,
+    /// Connection swaps and re-dials.
+    pub reconnects: u64,
+    /// TTL cancels the gateway sent.
+    pub ttl_cancels: u64,
+    /// The address budget's headroom, requests.
+    pub budget_remaining: i64,
+    /// The deadline the venue may hold, venue ms (0 = none).
+    pub dm_deadline_ms: u64,
+    /// Shutdowns that reached their bound unconfirmed.
+    pub shutdown_unconfirmed: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<GatewayArmSnapshot>() == 200);
 
 /// The whole snapshot — see the module docs and plan §6.1.
 #[derive(Copy, Clone)]
@@ -906,7 +1015,7 @@ mod tests {
         // a layout regression. HAR H3.5's `har` section (twelve 176 B
         // series rows + identity and counters) makes it 30,656 B at the
         // Hypercall merge; HC11's `hcv` section and `boot.hcv_hash` add
-        // 200 B.
+        // 200 B, XMM XH4f's `exec.arms.hyperliquid_gw` 200 B more.
         let n = core::mem::size_of::<EngineSnapshot>();
         assert!(n <= 32 * 1024, "EngineSnapshot grew to {n} B");
         assert_eq!(core::mem::size_of::<VmRowView>(), 48);

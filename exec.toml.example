@@ -51,7 +51,7 @@
 # ----------------------------------------
 #   0  hyparb           4  ai-exec
 #   1  vrp              5  vm
-#   2  xsd              6  xmm (a LIVE slot 6 refuses until XMM XH4)
+#   2  xsd              6  xmm (LIVE only on its gateway arm, XMM XH4f)
 #   3  bin15            7  hcv (DARK: a LIVE slot 7 refuses, O-HC18)
 #
 #
@@ -378,6 +378,46 @@ mode = "paper"
 # halt_on_recon_stale_ms = 120000
 # halt_on_gain_usd_1e6 = 50000000
 # halt_on_loss_usd_1e6 = 20000000
+
+
+# ---- [exec.slot.6] — xmm, the Hyperliquid post-only maker (XMM XH4f) ---
+#
+# Slot 6 is live ONLY on its own arm, the Hyperliquid WebSocket gateway
+# (`transport = "gateway"`; every other slot keeps the blocking arm until
+# XMM XH4h). The gateway is TESTNET-only until XMM XH5 gives slot 6 its
+# own master account (O-XH5). A gateway slot names hyperliquid alone and
+# states its perp pair (deviation 19): `cap_perp_usd_1e6`, the per-perp
+# inventory with its working orders, and `max_resting_usd_1e6`, the
+# resting notional — both or neither; `halt_on_alo_reject_pct`, its
+# post-only rejection halt over the last 200 answers (XH-7); an address
+# floor of at least 320; and no top-up keys (none before XH5). A live
+# gateway slot 6 is the ONLY live slot of its engine — an engine of its
+# own (XH4g's battery): it shares the E3 agent's nonce with no other
+# Hyperliquid signer until XMM XH4h, and a halt's cancel-all reaches every
+# arm the engine holds (D2) — and states no session bound
+# (`halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6`: on the shared E3
+# account the account value is not slot 6's P&L; XMM XH5).
+# `cap_instance_usd_1e6` is the slot's gross over its perps. The numbers
+# are the maker plan's Appendix B (the XH3 bar sizes `cap_day`):
+[exec.slot.6]
+mode = "paper"
+# mode = "live"
+# name = "xmm"
+# venues = ["hyperliquid"]
+# transport = "gateway"
+# max_order_usd_1e6 = 20000000
+# max_open_orders = 16
+# cap_day_usd_1e6 = 5000000000
+# cap_instance_usd_1e6 = 400000000
+# cap_perp_usd_1e6 = 150000000
+# max_resting_usd_1e6 = 300000000
+# request_budget_floor = 2000
+# halt_on_reject_streak = 5
+# halt_on_recon_drift_usd_1e6 = 20000000
+# halt_on_ws_gap_ms = 5000
+# halt_on_asset_refusal_streak = 3
+# halt_on_recon_stale_ms = 180000
+# halt_on_alo_reject_pct = 20
 
 
 # ---- [exec.binance] — the Binance arm (BX6) -----------------------------
