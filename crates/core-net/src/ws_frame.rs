@@ -669,6 +669,62 @@ where
 }
 
 // ---------------------------------------------------------------
+// A frame around a payload rendered in place (XMM XH4a)
+// ---------------------------------------------------------------
+
+/// The most header a client frame needs, 14 B: the two fixed bytes, the
+/// 8-byte extended length and the 4-byte mask key. A payload rendered at
+/// `buf[WS_CLIENT_HDR_MAX..]` can always be framed where it lies.
+pub const WS_CLIENT_HDR_MAX: usize = 14;
+
+/// Frame a client payload that was rendered IN PLACE at
+/// `buf[room..room + plen]`: the header goes right-aligned into the `room`
+/// bytes reserved in front of it (the shortest length form, RFC 6455
+/// §5.2) and the payload is masked where it lies. Returns the frame's
+/// first byte: the frame is `buf[start..room + plen]`, ready for the
+/// socket.
+///
+/// `room = WS_CLIENT_HDR_MAX` fits every length. A writer that knows its
+/// payload's length form can reserve exactly that header — 8 B for
+/// 126 ..= 65 535 B, every signed order post — and then `start` is 0: no
+/// gap in front of the frame for an `IoBuf`-style window to skip.
+///
+/// The one-pass alternative to [`ws_write_text_frame_rendered`] for a
+/// writer that learns its payload's length only by rendering it (a signed
+/// order action, XMM XH4): no counting pass, no second render and no copy
+/// — each payload byte is written once, by the render; then the mask is an
+/// in-place XOR. The mask destroys the plaintext: a sender that must send
+/// the same payload unmasked (a REST fallback) XORs it back with the same
+/// key rather than render it again. `FIN=1`, masked, zero-alloc.
+///
+/// # Errors
+/// [`WsWriteErr::BufferTooSmall`] when `room` cannot hold this length's
+/// header or `buf` is shorter than `room + plen`; nothing is written.
+#[inline]
+pub fn ws_frame_in_place(
+    buf: &mut [u8],
+    room: usize,
+    opcode: WsOpcode,
+    plen: usize,
+    mask: [u8; 4],
+) -> Result<usize, WsWriteErr> {
+    debug_assert!(
+        !opcode.is_control() || plen <= 125,
+        "a control frame carries <= 125 bytes"
+    );
+    let hdr = client_header_len(plen);
+    let end = match plen.checked_add(room) {
+        Some(e) if e <= buf.len() && hdr <= room => e,
+        _ => return Err(WsWriteErr::BufferTooSmall),
+    };
+    let start = room - hdr;
+    let wrote = write_client_header(&mut buf[start..room], opcode, plen, mask);
+    debug_assert_eq!(wrote, hdr, "the header ends where the payload begins");
+    ws_unmask_in_place(&mut buf[room..end], mask);
+    Ok(start)
+}
+
+// ---------------------------------------------------------------
 // Mask-key draw helper
 // ---------------------------------------------------------------
 
@@ -758,6 +814,103 @@ mod tests {
             ws_unmask_in_place(&mut dst[payload.start..payload.end], header.mask);
             assert_eq!(&dst[payload.start..payload.end], &body[..], "len = {len}");
         }
+    }
+
+    // ---- Frames around a payload rendered in place (XMM XH4a) ----
+
+    #[test]
+    fn an_in_place_frame_is_byte_identical_to_the_payload_writer_in_every_length_form() {
+        let mask = [0x3C, 0xC3, 0x5A, 0xA5];
+        for len in [0usize, 1, 125, 126, 65_535, 65_536] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+            let mut want = vec![0u8; WS_CLIENT_HDR_MAX + len];
+            let w = ws_write_text_frame(&mut want, &body, mask).unwrap();
+            let mut buf = vec![0xEEu8; WS_CLIENT_HDR_MAX + len];
+            buf[WS_CLIENT_HDR_MAX..].copy_from_slice(&body);
+            let start =
+                ws_frame_in_place(&mut buf, WS_CLIENT_HDR_MAX, WsOpcode::Text, len, mask).unwrap();
+            assert_eq!(&buf[start..], &want[..w], "len = {len}");
+            assert!(
+                buf[..start].iter().all(|&b| b == 0xEE),
+                "nothing written before the frame"
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_the_headers_room_frames_at_byte_zero_and_less_is_refused() {
+        let mask = [0x0F, 0xF0, 0x55, 0xAA];
+        let body: Vec<u8> = (0..3_000u32).map(|i| (i % 249) as u8).collect();
+        let mut want = vec![0u8; WS_CLIENT_HDR_MAX + body.len()];
+        let w = ws_write_text_frame(&mut want, &body, mask).unwrap();
+        // A signed post (126 ..= 65 535 B) needs 2 + 2 + 4 bytes of header.
+        let mut buf = vec![0u8; 8 + body.len()];
+        buf[8..].copy_from_slice(&body);
+        let start = ws_frame_in_place(&mut buf, 8, WsOpcode::Text, body.len(), mask).unwrap();
+        assert_eq!(start, 0, "no gap in front of the frame");
+        assert_eq!(&buf[..], &want[..w]);
+        // The same payload with room for the 7-bit form's header only.
+        let mut short = vec![3u8; 6 + body.len()];
+        assert_eq!(
+            ws_frame_in_place(&mut short, 6, WsOpcode::Text, body.len(), mask),
+            Err(WsWriteErr::BufferTooSmall)
+        );
+        assert!(short.iter().all(|&b| b == 3), "nothing written");
+    }
+
+    #[test]
+    fn an_in_place_binary_frame_reads_back_and_unmasks() {
+        let mask = [1, 2, 3, 4];
+        let body = b"{\"method\":\"post\",\"id\":7}";
+        let mut buf = vec![0u8; WS_CLIENT_HDR_MAX + body.len()];
+        buf[WS_CLIENT_HDR_MAX..].copy_from_slice(body);
+        let start = ws_frame_in_place(
+            &mut buf,
+            WS_CLIENT_HDR_MAX,
+            WsOpcode::Binary,
+            body.len(),
+            mask,
+        )
+        .unwrap();
+        assert_eq!(
+            start,
+            WS_CLIENT_HDR_MAX - 6,
+            "the 7-bit form: 2 + 4 header bytes"
+        );
+        let WsReadResult::Frame { header, payload } = ws_read_frame(&buf[start..]) else {
+            panic!("not a frame");
+        };
+        assert!(header.fin && header.masked && header.opcode == WsOpcode::Binary);
+        let at = start + payload.start;
+        ws_unmask_in_place(&mut buf[at..start + payload.end], header.mask);
+        assert_eq!(&buf[at..start + payload.end], &body[..]);
+    }
+
+    #[test]
+    fn an_in_place_frame_that_does_not_fit_writes_nothing_and_fails() {
+        let mut buf = [7u8; WS_CLIENT_HDR_MAX + 9];
+        assert_eq!(
+            ws_frame_in_place(
+                &mut buf,
+                WS_CLIENT_HDR_MAX,
+                WsOpcode::Text,
+                10,
+                [9, 9, 9, 9]
+            ),
+            Err(WsWriteErr::BufferTooSmall)
+        );
+        assert_eq!(buf, [7u8; WS_CLIENT_HDR_MAX + 9]);
+        assert_eq!(
+            ws_frame_in_place(
+                &mut buf,
+                WS_CLIENT_HDR_MAX,
+                WsOpcode::Text,
+                usize::MAX,
+                [9, 9, 9, 9]
+            ),
+            Err(WsWriteErr::BufferTooSmall),
+            "a length that overflows is refused, not wrapped"
+        );
     }
 
     #[test]

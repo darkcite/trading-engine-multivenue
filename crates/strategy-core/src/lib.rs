@@ -156,6 +156,23 @@ pub trait Ctx {
     /// Current wall-clock nanoseconds — cheaper than hitting the clock
     /// again from inside a strategy callback.
     fn now_ns(&self) -> NsTs;
+
+    /// **XMM XH4f (D7) — the calling member's live-path health**: the
+    /// set's per-member wrapper (`strategy_set::StampCtx`) answers for
+    /// its slot through [`Self::exec_health_of`]. Defaulted healthy —
+    /// every paper, replay and test ctx — so no paper member behaves
+    /// differently.
+    #[inline]
+    fn exec_health(&self) -> core_types::ExecHealth {
+        core_types::ExecHealth::HEALTHY
+    }
+
+    /// The engine's half of [`Self::exec_health`]: slot `slot`'s health,
+    /// from the dispatcher at the callback's clock. Defaulted healthy.
+    #[inline]
+    fn exec_health_of(&self, _slot: u8) -> core_types::ExecHealth {
+        core_types::ExecHealth::HEALTHY
+    }
 }
 
 /// Optional dashboard-facing counters every strategy can expose.
@@ -1323,8 +1340,23 @@ pub struct XmmCounters {
     /// Sides released after waiting 10 s on a final event (a
     /// best-effort cancel goes out for what they held). Must stay 0.
     pub stuck: u64,
+    /// XH4f (D8): cancels sent because the live path was blocked (a
+    /// halt, the slot off, the ledger unseeded, the arm not booted, its
+    /// request budget).
+    pub blocked_cancels: u64,
+    /// XH4f (D8): cancels sent because the venue's answers were slower
+    /// than `rtt_pull_ms`.
+    pub rtt_cancels: u64,
+    /// XH4f (D8): cancels sent because the arm was throttled or
+    /// rate-limited.
+    pub congestion_cancels: u64,
+    /// XH4f (D8): follower updates the health word held (nothing placed
+    /// or requoted).
+    pub health_held: u64,
+    /// XH4f (D8): requotes a busy arm deferred (its floor ×4).
+    pub busy_deferred: u64,
 }
-const _: () = assert!(core::mem::size_of::<XmmCounters>() == 17 * 8);
+const _: () = assert!(core::mem::size_of::<XmmCounters>() == 22 * 8);
 
 /// HC11: the slot-7 HCV member's counters and gauges (`engine_hcv_*`,
 /// `/state` `hcv`), written by the member crate. POD.

@@ -20,7 +20,7 @@
 #
 # TWO FORMS
 #   exec-smoke.sh --offline   the offline self-test alone: reproduce the
-#                             27 SDK known-answer vectors and rebuild one
+#                             36 SDK known-answer vectors and rebuild one
 #                             action per TYPE from inputs. No network, no
 #                             credentials. This is the CI form — CI has no
 #                             testnet key and should not have one — and it
@@ -52,6 +52,15 @@
 #   23  the OFFLINE self-test failed — this binary's own encoders no
 #       longer reproduce the venue SDK's bytes. No network needed to
 #       diagnose it and no venue to blame: the fault is in the artifact.
+#   30-39 XMM XH4g, `--hl-perp --lifecycle` (the testnet battery on slot
+#       6's gateway arm; pinned by `xmm_battery::tests`): 30 the account
+#       check (funds, the budget, slot-6 orders resting without
+#       --sweep-first) or the tap (it missed rows, or saw rows not of
+#       slot 6), 31 the boot, 32 a cycle, 33 BadAloPx, 34 a TTL, 35 a
+#       sweep, 36 the reconciliations or a halt, 37 the fills, 38
+#       something LEFT ON THE ACCOUNT (loudest), 39 the dead man's stall.
+#       A SIGINT/SIGTERM ends the battery short (cancel-all, a flat
+#       read): the wrapper waits for it rather than dying first.
 # The diagnostics start at 20 because clap exits 2 on any argument
 # error: a release binary too old to have the arm would otherwise have
 # reported itself as a signing failure.
@@ -81,7 +90,10 @@ if ! "$BIN" exec-smoke --help >/dev/null 2>&1; then
 fi
 
 # The operator's secrets live in ~/multivenue/.env (mode 0600) and the
-# engine wrapper sources them the same way. The BINARY never opens this
+# engine wrapper sources them the same way. `set -a` exports every one —
+# the testnet agent key AND HYPERLIQUID_TESTNET_MASTER_ADDR, which the
+# battery's reads, its user streams and its gateway subscribe for (the
+# binary refuses to start without it). The BINARY never opens this
 # file: code that read the operator's secrets would be one refactor
 # away from logging them.
 ENV_FILE="${MULTIVENUE_ENV_FILE:-$HOME/multivenue/.env}"
@@ -100,16 +112,22 @@ fi
 # overstates what it proved is worse than one that proves less.
 offline=0
 dry=0
+hlperp=0
 for a in "$@"; do
+  [ "$a" = "--hl-perp" ] && hlperp=1
   [ "$a" = "--offline" ] && offline=1
   # A dry run reaches no venue either, and must not inherit the
   # message that says one verified us. Same rule as --offline.
   [ "$a" = "--dry-run" ] && dry=1
 done
 
-# One line of JSON on stdout for CI; the human report on stderr.
+# One line of JSON on stdout for CI; the human report on stderr. A
+# Ctrl-C reaches the binary too (its handler ends the battery short);
+# the wrapper ignores it so it still reads the code and says it.
+trap ':' INT TERM
 "$BIN" exec-smoke "$@"
 rc=$?
+trap - INT TERM
 
 case "$rc" in
   0)  if [ "$dry" = 1 ]; then
@@ -123,6 +141,12 @@ case "$rc" in
   21) echo "exec-smoke: *** PHASE B FAILED *** a corrupted signature was accepted — nothing this run reports is meaningful" >&2 ;;
   22) echo "exec-smoke: venue unreachable — failing CLOSED (an unproven binary is unproven whatever the reason)" >&2 ;;
   23) echo "exec-smoke: *** OFFLINE SELF-TEST FAILED *** this binary does not reproduce the venue SDK's bytes — do not ship it" >&2 ;;
-  *) echo "exec-smoke: could not run (exit $rc)" >&2 ;;
+  38) echo "exec-smoke: *** XH4g: THE BATTERY LEFT A POSITION OR AN ORDER ON THE TESTNET ACCOUNT *** — clear it before the next run (the arm holds a boot over a position)" >&2 ;;
+  3[0-79]) echo "exec-smoke: XH4g battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
+  *) echo "exec-smoke: could not run (exit $rc)" >&2
+     # 1 (refused before anything was sent) and 2 (clap) left nothing.
+     if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+       echo "exec-smoke: *** the XH4g battery ended abnormally — slot-6 orders or a position may remain on the TESTNET account; the next battery's account check refuses while slot 6's orders rest: clear them first ***" >&2
+     fi ;;
 esac
 exit $rc

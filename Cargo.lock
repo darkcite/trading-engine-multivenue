@@ -147,6 +147,7 @@ dependencies = [
  "engine",
  "engine-snapshot",
  "exec-binance",
+ "exec-gateway",
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
@@ -349,6 +350,7 @@ dependencies = [
  "engine",
  "engine-snapshot",
  "exec-binance",
+ "exec-gateway",
  "exec-hypercall",
  "exec-hyperevm",
  "exec-hyperliquid",
@@ -786,6 +788,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "exec-gateway"
+version = "0.1.0"
+dependencies = [
+ "core-latency",
+ "core-net",
+ "core-ring",
+ "proptest",
+]
+
+[[package]]
 name = "exec-hypercall"
 version = "0.1.0"
 dependencies = [
@@ -832,7 +844,10 @@ dependencies = [
  "core-net",
  "core-parse",
  "core-ring",
+ "core-time",
  "core-types",
+ "exec-gateway",
+ "exec-hyperliquid",
  "mio 0.8.11",
  "rcgen",
  "rustls",

@@ -59,6 +59,10 @@ pub const INITIAL_BUFFER: u64 = 10_000;
 /// USDC (1e6) of volume that earns one request.
 const USDC_PER_REQUEST_1E6: i64 = 1_000_000;
 
+/// XH4e — what the venue's separate CANCEL allowance adds to the request
+/// cap: min(cap + 100 000, 2 × cap) ([`AddressBudget::cancel_remaining`]).
+const CANCEL_EXTRA: i64 = 100_000;
+
 /// Why a submit was refused.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -199,6 +203,22 @@ impl AddressBudget {
         Ok(())
     }
 
+    /// **XH4e — requests the venue's separate cancel allowance leaves**:
+    /// min(cap + 100 000, 2 × cap) − spent, the cap being the allowance
+    /// [`Self::remaining`] counts against. Reported, never used to refuse:
+    /// a cancel always goes (below). The venue's netting of reserved
+    /// weight into this allowance is unmeasured; the grant carries it.
+    #[must_use]
+    pub fn cancel_remaining(&self) -> i64 {
+        let cap = i64::try_from(self.initial_buffer)
+            .unwrap_or(i64::MAX)
+            .saturating_add(self.traded_usdc_1e6 / USDC_PER_REQUEST_1E6);
+        let spent = i64::try_from(self.spent_requests).unwrap_or(i64::MAX);
+        cap.saturating_add(CANCEL_EXTRA)
+            .min(cap.saturating_mul(2))
+            .saturating_sub(spent)
+    }
+
     /// Cancels are always permitted. See the module docs: a halted
     /// engine must be able to flatten.
     #[inline(always)]
@@ -219,6 +239,15 @@ impl AddressBudget {
         self.spent_requests = self
             .spent_requests
             .saturating_add(u64::from(items.max(1)));
+    }
+
+    /// **XH4e — `items` requests counted by [`Self::on_action_sent`] never
+    /// left the host** (the gateway refused them unsent: throttled, halted,
+    /// not ready): taken back, so a refused burst cannot walk the count to
+    /// the floor. Saturating, like the charge.
+    #[inline(always)]
+    pub fn on_action_unsent(&mut self, items: u32) {
+        self.spent_requests = self.spent_requests.saturating_sub(u64::from(items));
     }
 
     /// A venue fill was observed. `notional_usdc_1e6` must come from
@@ -780,6 +809,58 @@ mod tests {
         store(&p, &b2).expect("store");
         assert_eq!(load(&p, ADDR, 250), b2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// XH4e: the cancel allowance is the smaller of the cap plus 100 000
+    /// and twice the cap, less what the address spent — past the order
+    /// cliff, cancels still have room.
+    #[test]
+    fn the_cancel_allowance_is_the_smaller_of_cap_plus_100k_and_twice_cap() {
+        let b = AddressBudget::from_venue(ADDR, 0, 12_000, 5_000_000_000, 0);
+        // cap = 10 000 + 5 000 = 15 000: twice it (30 000) is the smaller.
+        assert_eq!(b.remaining(), 3_000);
+        assert_eq!(b.cancel_remaining(), 18_000);
+        let b = AddressBudget::from_venue(ADDR, 0, 250_000, 190_000_000_000, 0);
+        // cap = 200 000: plus 100 000 is the smaller.
+        assert_eq!(b.remaining(), -50_000, "past the order cliff");
+        assert_eq!(b.cancel_remaining(), 50_000, "cancels still go");
+        let b = AddressBudget::restored(ADDR, 0, u64::MAX, i64::MAX);
+        assert!(b.cancel_remaining() <= 0, "no wrap");
+    }
+
+    /// XH4e: a request refused unsent is taken back — never below zero.
+    #[test]
+    fn a_request_that_never_left_is_taken_back() {
+        let mut b = AddressBudget::from_venue(ADDR, 0, 500, 0, 0);
+        b.on_action_sent(3);
+        b.on_action_unsent(1);
+        assert_eq!(b.spent(), 502);
+        let mut z = AddressBudget::from_venue(ADDR, 0, 0, 0, 0);
+        z.on_action_unsent(5);
+        assert_eq!(z.spent(), 0, "saturating");
+    }
+
+    /// XH4e: the budget read's scan runs every `limit_ms` on the gateway's
+    /// steady path — every truncation of a good answer and 20 000 random
+    /// ones return, never panic.
+    #[test]
+    fn the_rate_limit_scan_never_panics_on_arbitrary_bytes() {
+        let good = br#"{"cumVlm":"2854574.593578","nRequestsUsed":2890,"nRequestsCap":2864574,"nRequestsSurplus":0}"#;
+        assert!(scan_rate_limit(good).is_some());
+        for k in 0..good.len() {
+            let _ = scan_rate_limit(&good[..k]);
+        }
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            let mut buf = [0u8; 96];
+            for b in buf.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
+            let _ = scan_rate_limit(&buf);
+        }
     }
 
     /// Hostile figures from a venue row must not panic the fill path.

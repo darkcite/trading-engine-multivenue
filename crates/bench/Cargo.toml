@@ -56,7 +56,7 @@ strategy-cross-arb   = { workspace = true }
 # E1 gate 53: the execution router's hot path.
 exec-router          = { workspace = true }
 # E2 gate 54: the Hyperliquid encode+sign path.
-exec-hyperliquid     = { workspace = true }
+exec-hyperliquid     = { workspace = true, features = ["testvenue"] }
 # BX6 gates 92-93: the Binance arm, and the gateway's render and scan.
 exec-binance         = { workspace = true }
 signer-eip712        = { workspace = true }
@@ -74,6 +74,9 @@ ingress-hyperevm     = { workspace = true }
 core-fill            = { workspace = true }
 # HYPARB H4 gate 68: the slot-0 member — decision, carry, hedge, timer.
 strategy-hyparb      = { workspace = true }
+# XMM XH4a gate 95: the order-gateway kit (duplex, in-flight table,
+# deadline queue, reconnect machine, wait policy, latency trackers).
+exec-gateway         = { workspace = true }
 # XMM XH1: the slot-6 member rides the set's trade / order-event / timer gate.
 strategy-xmm         = { workspace = true }
 # HC11 gate 85: the slot-7 member over the paper held-quote law.

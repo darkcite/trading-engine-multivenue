@@ -396,7 +396,7 @@ The signing key bytes live in a single `mlock`'d page and are zeroized on drop. 
 
 ### 7.3 Signer implementation
 - `secp256k1` (libsecp256k1-sys) for signing. Hand-rolled EIP-712 typed-data hash, no `ethers`/`alloy` full stacks.
-- Nonce manager: single-threaded monotonic `u64` per API key.
+- Nonce manager: a monotonic `u64` per signer; one stream per agent address shared by a process's signers of that agent (XMM XH4h S3, a lock-free compare-and-swap).
 - Zeroization via the `zeroize` crate; `mlock` on the key page.
 
 ### 7.4 CLOB REST dispatcher

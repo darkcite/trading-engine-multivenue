@@ -67,6 +67,67 @@ fn full_snapshot() -> Box<EngineSnapshot> {
             -1,
         );
     }
+    // BX6 and XMM XH4f: both venue arms, every number at its widest (a
+    // heartbeat never seen renders `-1`; the widest age is i64's).
+    s.exec.arms_binance = engine_snapshot::ArmSnapshot {
+        present: 1,
+        submitted: u64::MAX,
+        rejected: u64::MAX,
+        ioc_missed: u64::MAX,
+        refused_local: u64::MAX,
+        refused_stale: u64::MAX,
+        sent_unanswered: u64::MAX,
+        fills_booked: u64::MAX,
+        fills_unresolved: u64::MAX,
+        fills_foreign: u64::MAX,
+        fills_dropped: u64::MAX,
+        fills_unowned: u64::MAX,
+        recon_ok: u64::MAX,
+        recon_failed: u64::MAX,
+        recon_drift_legs: u64::MAX,
+        recon_unseen_legs: u64::MAX,
+        sweep_left: u64::MAX,
+        sweep_stalled: u64::MAX,
+        cancel_all_unqueued: u64::MAX,
+        ws_reconnects: u64::MAX,
+        ws_connect_failures: u64::MAX,
+        pnl_anchor_usd_1e6: i64::MIN,
+        session_pnl_usd_1e6: i64::MIN,
+    };
+    s.exec.arms_hyperliquid_gw = engine_snapshot::GatewayArmSnapshot {
+        present: 1,
+        slot: u8::MAX,
+        ready: u8::MAX,
+        ws_up: u8::MAX,
+        congestion: u8::MAX,
+        budget_known: u8::MAX,
+        dm_availability: u8::MAX,
+        leverage_dark: u8::MAX,
+        health_blocked: u64::MAX,
+        halt_reason: u64::MAX,
+        open_orders: u64::MAX,
+        in_flight: u64::MAX,
+        rtt_worst_ns: u64::MAX,
+        pushed: u64::MAX,
+        rejects: u64::MAX,
+        alo_rejects: u64::MAX,
+        refused_local: u64::MAX,
+        refused_budget: u64::MAX,
+        refused_leverage: u64::MAX,
+        throttled: u64::MAX,
+        fills: u64::MAX,
+        fills_crossed: u64::MAX,
+        unknown_orders: u64::MAX,
+        day_unreadable: u64::MAX,
+        post_timeouts: u64::MAX,
+        reconnects: u64::MAX,
+        ttl_cancels: u64::MAX,
+        dm_deadline_ms: u64::MAX,
+        shutdown_unconfirmed: u64::MAX,
+        heartbeat_age_ms: i64::MAX as u64,
+        fees_1e8: i64::MIN,
+        budget_remaining: i64::MIN,
+    };
     // XMM XH3: every perp row at its widest render.
     s.boot.xmm_hash = [0xFF; 32];
     s.boot.set_xmm_coins(&[b'"'; 48]); // worst case: every byte escapes
@@ -569,6 +630,8 @@ fn the_xmm_section_renders_counters_and_perp_rows() {
         "\"lead_cancels\":0,\"requote_cancels\":0,\"pull_cancels\":0,\"expiry_cancels\":0,",
         "\"gated\":0,\"gate_overflow\":0,\"capped\":0,\"rejected_alo\":0,\"rejected_other\":0,",
         "\"canceled\":0,\"filled\":0,\"fills\":3,\"unmatched\":0,\"ctx_refused\":0,\"stuck\":0,",
+        "\"blocked_cancels\":0,\"rtt_cancels\":0,\"congestion_cancels\":0,\"health_held\":0,",
+        "\"busy_deferred\":0,",
         "\"perps\":[{\"hl_sym\":83886082,\"lead_sym\":16777221,\"pos_1e6\":-50000,",
         "\"touch_bid_1e6\":100000000,\"touch_ask_1e6\":100010000,\"bid_px_1e6\":100000000,",
         "\"ask_px_1e6\":0,\"bid_state\":2,\"ask_state\":0,\"stale_flags\":1,",
@@ -583,7 +646,7 @@ fn the_xmm_section_renders_counters_and_perp_rows() {
     let n = encode_state_json(&e, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(body.contains("\"xmm\":{\"configured\":0,\"n_perps\":0,\"placed\":0,"));
-    assert!(body.contains("\"stuck\":0,\"perps\":[]}"));
+    assert!(body.contains("\"busy_deferred\":0,\"perps\":[]}"));
 }
 
 /// HAR H3.5: the `har` object — additive, so a `contains` pin. The raw

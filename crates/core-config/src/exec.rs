@@ -78,7 +78,7 @@ const EXEC_KEYS: [&str; 1] = ["enabled"];
 
 /// Keys an `[exec.slot.<n>]` section accepts. Every one is optional;
 /// every one is KNOWN (law 1).
-const SLOT_KEYS: [&str; 20] = [
+const SLOT_KEYS: [&str; 24] = [
     "mode",
     "name",
     "venues",
@@ -99,6 +99,10 @@ const SLOT_KEYS: [&str; 20] = [
     "halt_on_margin_ratio_1e6",
     "max_symbols",
     "min_maker_ttl_ms",
+    "transport",
+    "cap_perp_usd_1e6",
+    "max_resting_usd_1e6",
+    "halt_on_alo_reject_pct",
 ];
 
 /// Keys the `[exec.binance]` section accepts (BX6, plan §3.12).
@@ -290,6 +294,26 @@ pub struct ExecSlot {
     /// Only a slot that names binance may set it; at least
     /// [`BN_MIN_MAKER_TTL_MS`], which is also the default.
     pub min_maker_ttl_ms: i64,
+    /// **XMM XH4f (deviation 10)** — the Hyperliquid order transport:
+    /// [`TRANSPORT_BLOCKING`] (the default: the operator's arm on the
+    /// engine thread, today's path) or [`TRANSPORT_GATEWAY`] (the
+    /// WebSocket gateway arm on its own thread). A gateway slot trades
+    /// Hyperliquid alone; which slot may name it is the boot's rule.
+    pub transport: String,
+    /// **XMM XH4e/XH4f (deviation 19)** — the per-perp inventory clamp,
+    /// USD ×1e6: the position plus the orders working on the order's side
+    /// plus the order (`exec_router::PerpLimits`). With
+    /// `max_resting_usd_1e6` both or neither; a gateway slot's only; a
+    /// live gateway slot must set both. `0` = unset.
+    pub cap_perp_usd_1e6: i64,
+    /// **XMM XH4e/XH4f (deviation 19)** — the resting-notional clamp, USD
+    /// ×1e6, over the slot's working orders. `0` = unset.
+    pub max_resting_usd_1e6: i64,
+    /// **XMM XH4d/XH4f (XH-7)** — the post-only rejection rate, percent of
+    /// the last 200 ALO answers, at which the slot halts sticky (the
+    /// route's `alo_reject_permille` is this × 10). A gateway slot's only;
+    /// a live one must set it (1..=[`ALO_REJECT_PCT_MAX`]). `0` = unset.
+    pub halt_on_alo_reject_pct: i64,
     /// Line the section header sat on, for error messages.
     pub line: usize,
 }
@@ -320,6 +344,10 @@ impl ExecSlot {
             halt_on_margin_ratio_1e6: 0,
             max_symbols: BN_MAX_SYMBOLS_DEFAULT,
             min_maker_ttl_ms: BN_MIN_MAKER_TTL_MS,
+            transport: String::from(TRANSPORT_BLOCKING),
+            cap_perp_usd_1e6: 0,
+            max_resting_usd_1e6: 0,
+            halt_on_alo_reject_pct: 0,
             line: 0,
         }
     }
@@ -359,6 +387,20 @@ pub const REQUEST_TOPUP_WEIGHT_MIN: i64 = 1_000;
 /// **S7-L1** — the largest `request_topup_day_max`: 1 000 000
 /// requests, $500 a day at the same price.
 pub const REQUEST_TOPUP_DAY_MAX: i64 = 1_000_000;
+
+/// **XMM XH4f (deviation 10)** — `transport`: the operator's blocking
+/// Hyperliquid arm on the engine thread (the default, today's path).
+pub const TRANSPORT_BLOCKING: &str = "blocking";
+/// **XMM XH4f (deviation 10)** — `transport`: the Hyperliquid WebSocket
+/// gateway arm on its own thread.
+pub const TRANSPORT_GATEWAY: &str = "gateway";
+/// `exec_hyperliquid::arm::MIN_BUDGET_FLOOR`, mirrored (`core-config` must
+/// not depend on `exec-hyperliquid`; `cli::exec_boot` const-asserts the two
+/// agree): every order the gateway arm can hold cancelled twice over and
+/// 64 re-arms of its dead man.
+pub const GATEWAY_BUDGET_FLOOR_MIN: i64 = 320;
+/// **XH-7** — `halt_on_alo_reject_pct` is a percent.
+pub const ALO_REJECT_PCT_MAX: i64 = 100;
 
 /// `exec_router::LEDGER_RESTING`, mirrored.
 ///
@@ -747,6 +789,21 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         None => String::new(),
     };
 
+    // `transport` — XMM XH4f (deviation 10): optional, default today's arm.
+    let transport = match kv.iter().find(|(k, _, _)| k == "transport") {
+        Some((_, Value::Str(s), ln)) => {
+            if s != TRANSPORT_BLOCKING && s != TRANSPORT_GATEWAY {
+                return Err(err(format!(
+                    "line {ln}: `transport` must be \"{TRANSPORT_BLOCKING}\" or \
+                     \"{TRANSPORT_GATEWAY}\" (saw \"{s}\")"
+                )));
+            }
+            s.clone()
+        }
+        Some((_, _, ln)) => return Err(err(format!("line {ln}: `transport` must be a string"))),
+        None => String::from(TRANSPORT_BLOCKING),
+    };
+
     // `venues` — optional, default empty.
     let mut venues: Vec<u8> = Vec::new();
     match kv.iter().find(|(k, _, _)| k == "venues") {
@@ -808,6 +865,10 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         halt_on_margin_ratio_1e6: opt_int(kv, "halt_on_margin_ratio_1e6", 0)?,
         max_symbols: opt_int(kv, "max_symbols", BN_MAX_SYMBOLS_DEFAULT)?,
         min_maker_ttl_ms: opt_int(kv, "min_maker_ttl_ms", BN_MIN_MAKER_TTL_MS)?,
+        transport,
+        cap_perp_usd_1e6: opt_int(kv, "cap_perp_usd_1e6", 0)?,
+        max_resting_usd_1e6: opt_int(kv, "max_resting_usd_1e6", 0)?,
+        halt_on_alo_reject_pct: opt_int(kv, "halt_on_alo_reject_pct", 0)?,
         line,
     };
     let names = |venue: &str| venue_id_from_name(venue).is_some_and(|id| s.venues.contains(&id));
@@ -1013,6 +1074,64 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
              table fills and the clamp stops counting.",
             s.max_open_orders
         )));
+    }
+
+    // XMM XH4f (deviation 10): the gateway transport is the Hyperliquid
+    // WebSocket arm — one address's sweeps, budget and dead man — so a
+    // gateway slot names hyperliquid alone; the perp clamps (deviation 19,
+    // both or neither) and the post-only rejection halt (XH-7) are its
+    // own; and a live one states all three, an address floor the arm
+    // accepts, and no top-up (the gateway arm buys none before XH5).
+    let gateway = s.transport == TRANSPORT_GATEWAY;
+    if gateway && !(s.venues.len() == 1 && names("hyperliquid")) {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `transport = \"gateway\"` is the Hyperliquid gateway \
+             arm — the slot's `venues` must be [\"hyperliquid\"] alone"
+        )));
+    }
+    if (s.cap_perp_usd_1e6 == 0) != (s.max_resting_usd_1e6 == 0) {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `cap_perp_usd_1e6` and `max_resting_usd_1e6` are one \
+             perp slot's pair — write both, or neither"
+        )));
+    }
+    if !gateway && (s.cap_perp_usd_1e6 != 0 || s.halt_on_alo_reject_pct != 0) {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `cap_perp_usd_1e6`, `max_resting_usd_1e6` and \
+             `halt_on_alo_reject_pct` are the gateway arm's — the slot needs \
+             `transport = \"gateway\"`"
+        )));
+    }
+    if s.halt_on_alo_reject_pct > ALO_REJECT_PCT_MAX {
+        return Err(err(format!(
+            "slot {slot} at line {line}: `halt_on_alo_reject_pct = {}` exceeds \
+             {ALO_REJECT_PCT_MAX} — a percent of the last 200 post-only answers",
+            s.halt_on_alo_reject_pct
+        )));
+    }
+    if s.is_live() && gateway {
+        if s.cap_perp_usd_1e6 == 0 || s.halt_on_alo_reject_pct == 0 {
+            return Err(err(format!(
+                "slot {slot} at line {line}: `mode = \"live\"` on the gateway needs a non-zero \
+                 `cap_perp_usd_1e6`, `max_resting_usd_1e6` and `halt_on_alo_reject_pct` — `0` \
+                 means UNSET here, never \"unlimited\""
+            )));
+        }
+        if s.request_budget_floor < GATEWAY_BUDGET_FLOOR_MIN {
+            return Err(err(format!(
+                "slot {slot} at line {line}: `request_budget_floor = {}` — the gateway arm needs \
+                 at least {GATEWAY_BUDGET_FLOOR_MIN} (every order it can hold cancelled twice \
+                 over and 64 re-arms of its dead man)",
+                s.request_budget_floor
+            )));
+        }
+        if s.request_topup_weight != 0 {
+            return Err(err(format!(
+                "slot {slot} at line {line}: `request_topup_weight` is the blocking arm's \
+                 top-up (S7-L1); the gateway arm buys none before XMM XH5 — remove the \
+                 top-up keys"
+            )));
+        }
     }
 
     Ok(s)
@@ -1615,6 +1734,81 @@ mode = "paper"
             "[exec]\n[exec.slot.3]\nmode = \"paper\"\nvenues = [\"hyperliquid\"]\nmax_symbols = 5\n",
             "are the Binance arm's",
         );
+    }
+
+    /// XMM XH4f (deviations 10, 19; XH-7): the gateway transport carries
+    /// the perp slot's pair and the post-only rejection halt — its own,
+    /// required live, refused anywhere else.
+    #[test]
+    fn the_gateway_transport_carries_the_perp_clamps_and_the_alo_halt() {
+        let gw = format!(
+            "{MINIMAL_LIVE}transport = \"gateway\"\ncap_perp_usd_1e6 = 150000000\n\
+             max_resting_usd_1e6 = 300000000\nhalt_on_alo_reject_pct = 20\n"
+        );
+        let f = parse(&gw).unwrap();
+        let s = f.slot(3);
+        assert_eq!(
+            (
+                s.transport.as_str(),
+                s.cap_perp_usd_1e6,
+                s.max_resting_usd_1e6,
+                s.halt_on_alo_reject_pct
+            ),
+            (TRANSPORT_GATEWAY, 150_000_000, 300_000_000, 20)
+        );
+        assert_eq!(
+            parse(MINIMAL_LIVE).unwrap().slot(3).transport,
+            TRANSPORT_BLOCKING
+        );
+        expect_err(&gw.replace("\"gateway\"", "\"ws\""), "`transport` must be");
+        expect_err(
+            &gw.replace("halt_on_alo_reject_pct = 20\n", ""),
+            "halt_on_alo_reject_pct",
+        );
+        expect_err(
+            &gw.replace(
+                "halt_on_alo_reject_pct = 20",
+                "halt_on_alo_reject_pct = 101",
+            ),
+            "exceeds 100",
+        );
+        expect_err(
+            &gw.replace("max_resting_usd_1e6 = 300000000\n", ""),
+            "both, or neither",
+        );
+        expect_err(
+            &gw.replace(
+                "cap_perp_usd_1e6 = 150000000\nmax_resting_usd_1e6 = 300000000\n",
+                "",
+            ),
+            "cap_perp_usd_1e6",
+        );
+        expect_err(
+            &gw.replace("request_budget_floor = 2000", "request_budget_floor = 319"),
+            "at least 320",
+        );
+        expect_err(
+            &format!("{gw}request_topup_weight = 10000\nrequest_topup_day_max = 100000\n"),
+            "top-up",
+        );
+        expect_err(
+            &gw.replace(
+                "venues = [\"hyperliquid\"]",
+                "venues = [\"hyperliquid\", \"binance\"]\nhalt_on_margin_ratio_1e6 = 600000",
+            ),
+            "alone",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}cap_perp_usd_1e6 = 1\nmax_resting_usd_1e6 = 1\n"),
+            "transport = \"gateway\"",
+        );
+        expect_err(
+            &format!("{MINIMAL_LIVE}halt_on_alo_reject_pct = 20\n"),
+            "transport = \"gateway\"",
+        );
+        let paper =
+            "[exec]\n[exec.slot.6]\nmode = \"paper\"\ntransport = \"gateway\"\nvenues = [\"hyperliquid\"]\n";
+        assert_eq!(parse(paper).unwrap().slot(6).transport, TRANSPORT_GATEWAY);
     }
 
     /// BX3: the address budget floor is Hyperliquid's — still required on

@@ -227,7 +227,12 @@ struct InstrumentRow {
     /// Monotonic ns the mark arrived (BX6: a mark that stops arriving
     /// stops pricing, [`Ledger::expire_marks`]); 0 = none.
     mark_ns: u64,
-    _pad1: [u8; 8],
+    /// **XH4e (XH2-C)** — bit `s`: slot `s` holds a position on this
+    /// LINEAR row and no mark prices it (none yet, or expired). Kept by
+    /// [`Ledger::refresh_instrument`], counted per slot in
+    /// `Ledger::inst_unmarked`.
+    unmarked: u8,
+    _pad1: [u8; 7],
     /// Index = slot. Signed position ×1e6 (base units, or contracts).
     pos_1e6: [i64; EXEC_SLOTS],
     /// Index = slot. Exposure at the row's own prices, USD ×1e6 —
@@ -239,6 +244,8 @@ const _: () = assert!(core::mem::size_of::<InstrumentRow>() == 192);
 const _: () = assert!(core::mem::align_of::<InstrumentRow>() == 64);
 const _: () = assert!(core::mem::offset_of!(InstrumentRow, pos_1e6) == 64);
 const _: () = assert!(core::mem::offset_of!(InstrumentRow, exp_1e6) == 128);
+// XH4e: `InstrumentRow::unmarked` holds one bit per slot.
+const _: () = assert!(EXEC_SLOTS <= 8);
 
 impl InstrumentRow {
     const FREE: Self = Self {
@@ -252,7 +259,8 @@ impl InstrumentRow {
         index_1e6: 0,
         last_px_1e6: 0,
         mark_ns: 0,
-        _pad1: [0; 8],
+        unmarked: 0,
+        _pad1: [0; 7],
         pos_1e6: [0; EXEC_SLOTS],
         exp_1e6: [0; EXEC_SLOTS],
     };
@@ -265,6 +273,34 @@ impl InstrumentRow {
             self.mark_1e6
         } else {
             self.last_px_1e6
+        }
+    }
+
+    /// **O-BX24 — the one price an order is judged at**: a buy at its
+    /// own limit (it fills at or below it), a sell at the higher of its
+    /// limit and the row's reference (a marketable sell fills at or above
+    /// its limit, so a low limit alone would understate what it adds).
+    #[inline]
+    const fn one_price(&self, buy: bool, px_1e6: i64) -> i64 {
+        if buy {
+            px_1e6
+        } else {
+            self.cap_price(px_1e6)
+        }
+    }
+
+    /// **XH4e — the per-perp cap's one price**: the higher of the order's
+    /// limit and the row's reference, either side. The held position is
+    /// worth at least its mark whatever a bid below it says, so a buy's own
+    /// limit would understate the inventory; one price on both sides of the
+    /// comparison (O-BX24's sell rule, for both).
+    #[inline]
+    const fn cap_price(&self, px_1e6: i64) -> i64 {
+        let reference = self.px_ctx();
+        if px_1e6 >= reference {
+            px_1e6
+        } else {
+            reference
         }
     }
 
@@ -359,7 +395,8 @@ pub enum InstRefusal {
 /// row is priced at the order's price (spot, linear), at its mark and
 /// index (option) or at its face (inverse) on BOTH sides of the
 /// comparison, so a price move can never make a reducing order read as
-/// an increase. 40 B, returned by value.
+/// an increase. 64 B — one cache line, the by-value bound — returned by
+/// value.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct InstProbe {
@@ -382,9 +419,22 @@ pub struct InstProbe {
     /// The day turnover it would add: the part of the quantity that
     /// increases the position's magnitude, at the law's price.
     pub turnover_add_1e6: i64,
+    /// **XH4e — a perp slot's order only** ([`Ledger::probe_perp`]; `0`
+    /// otherwise): the per-perp inventory — |the position + every order
+    /// working on the order's side, less the one a modify replaces| —
+    /// without the order, at the cap's one price (the higher of the limit
+    /// and the row's reference, either side), USD ×1e6.
+    pub inventory_now_1e6: i64,
+    /// … and with the order.
+    pub inventory_next_1e6: i64,
+    /// **XH4e** — the slot's resting notional as the order would leave it:
+    /// the sum now, less the replaced order's term (when the table holds
+    /// its key exactly once — [`Ledger::on_modify`]'s reading), plus
+    /// qty × limit. USD ×1e6.
+    pub resting_next_1e6: i64,
 }
 
-const _: () = assert!(core::mem::size_of::<InstProbe>() == 40);
+const _: () = assert!(core::mem::size_of::<InstProbe>() == 64);
 
 /// One FAMILY's current instance, and the per-slot position in it.
 ///
@@ -684,6 +734,29 @@ pub struct Ledger {
     /// ([`INST_EXPOSURE_MAX`]); added to the family sum wherever the
     /// slot's exposure is read.
     inst_exposure_1e6: [i64; EXEC_SLOTS],
+    /// **XH4e (XH2-C)** — index = slot: linear rows on which the slot
+    /// holds a position no mark prices (the rows' `unmarked` bits).
+    inst_unmarked: [u16; EXEC_SLOTS],
+    /// **XH4e** — the limit price ×1e6 of the order in `resting[i]`; `0`
+    /// = none. Parallel to `resting`, so its 24 B rows — and every
+    /// full-table scan of them — are unchanged.
+    resting_px_1e6: [i64; LEDGER_RESTING],
+    /// **XH4e** — the price a queued (confirm-later) arm's modify ASKED
+    /// for `resting[i]`, held until the arm confirms it; `0` = none.
+    resting_px_asked_1e6: [i64; LEDGER_RESTING],
+    /// **XH4e** — the size that modify asked, held with its price: until
+    /// the confirmation the order may rest at either size; `0` = none.
+    resting_qty_asked_1e6: [i64; LEDGER_RESTING],
+    /// **XH4f** — the client id of the replacement that modify named, kept
+    /// with the hold: its retirement (the modify refused) drops the hold;
+    /// `0` = none.
+    resting_asked_oid: [u64; LEDGER_RESTING],
+    /// **XH4e** — index = slot: Σ over its resting rows of the larger of
+    /// the row's two sizes × the higher of its two prices, USD ×1e6
+    /// (exact: every term is clamped to [`INST_EXPOSURE_MAX`]), plus the
+    /// notional of every order the table could not hold — never released,
+    /// like its count.
+    resting_usd_1e6: [i64; EXEC_SLOTS],
 }
 
 // **No `Default`.** A `Ledger` needs the boot's monotonic→wall
@@ -692,6 +765,9 @@ pub struct Ledger {
 // epoch and would look exactly like a day cap that never rolls.
 // `Ledger::new` takes the anchor so that forgetting it is a compile
 // error rather than a cap that quietly stops resetting.
+
+// XMM XH4f: the router's boot move of it states this size (routed.rs).
+const _: () = assert!(core::mem::size_of::<Ledger>() == 82_368);
 
 impl Ledger {
     /// An empty, UNSEEDED ledger: nothing bound, nothing held,
@@ -715,6 +791,12 @@ impl Ledger {
             inst: [InstrumentRow::FREE; LEDGER_INSTRUMENTS],
             inst_n: 0,
             inst_exposure_1e6: [0; EXEC_SLOTS],
+            inst_unmarked: [0; EXEC_SLOTS],
+            resting_px_1e6: [0; LEDGER_RESTING],
+            resting_px_asked_1e6: [0; LEDGER_RESTING],
+            resting_qty_asked_1e6: [0; LEDGER_RESTING],
+            resting_asked_oid: [0; LEDGER_RESTING],
+            resting_usd_1e6: [0; EXEC_SLOTS],
         }
     }
 
@@ -1377,6 +1459,47 @@ impl Ledger {
         self.inst_exposure_1e6[slot]
     }
 
+    /// **XH4e (XH2-C)** — linear rows on which `slot` holds a position no
+    /// mark prices. A perp slot grows nothing while it is non-zero.
+    #[inline]
+    #[must_use]
+    pub fn unmarked_positions(&self, slot: usize) -> u16 {
+        if slot >= EXEC_SLOTS {
+            return 0;
+        }
+        self.inst_unmarked[slot]
+    }
+
+    /// **XH4e** — the slot's resting notional, USD ×1e6.
+    #[inline]
+    #[must_use]
+    pub fn resting_usd_1e6(&self, slot: usize) -> i64 {
+        if slot >= EXEC_SLOTS {
+            return 0;
+        }
+        self.resting_usd_1e6[slot]
+    }
+
+    /// **XH4e — [`Self::probe_instrument`] for a perp slot's order**, with
+    /// the numbers its two extra clamps compare, from the same one pass
+    /// over the resting table (plan §8.8): the per-perp inventory without
+    /// and with the order and the resting notional as it would leave it
+    /// ([`InstProbe`]'s last three). A perp slot is judged on linear rows
+    /// only: any other law is `Unpriced`.
+    #[inline]
+    #[must_use]
+    pub fn probe_perp(
+        &self,
+        sym: SymbolId,
+        slot: usize,
+        qty_1e6: i64,
+        buy: bool,
+        px_1e6: i64,
+        exclude: Option<u64>,
+    ) -> Option<InstProbe> {
+        self.probe(sym, slot, qty_1e6, buy, px_1e6, exclude, true)
+    }
+
     /// **Judge one order on an instrument row by its law** — the numbers
     /// the router's clamps compare, all at one price (see [`InstProbe`]).
     /// `px` is the order's price ×1e6 (per contract on an option);
@@ -1403,24 +1526,49 @@ impl Ledger {
         px_1e6: i64,
         exclude: Option<u64>,
     ) -> Option<InstProbe> {
+        self.probe(sym, slot, qty_1e6, buy, px_1e6, exclude, false)
+    }
+
+    /// The probe itself; `perp` adds a perp slot's numbers (XH4e) — one
+    /// pass over the resting table either way, and none when nothing asks.
+    #[inline]
+    fn probe(
+        &self,
+        sym: SymbolId,
+        slot: usize,
+        qty_1e6: i64,
+        buy: bool,
+        px_1e6: i64,
+        exclude: Option<u64>,
+        perp: bool,
+    ) -> Option<InstProbe> {
         let i = self.inst_find(sym)?;
         let mut p = InstProbe::default();
-        if slot >= EXEC_SLOTS || qty_1e6 <= 0 {
+        if slot >= EXEC_SLOTS || qty_1e6 <= 0 || (perp && self.inst[i].law != LAW_LINEAR) {
             p.refusal = InstRefusal::Unpriced;
             return Some(p);
         }
         let r = &self.inst[i];
         let filled = r.pos_1e6[slot];
-        let pos = if (filled > 0 && !buy) || (filled < 0 && buy) {
-            let working = self.working_1e6(slot, sym, buy, exclude);
-            if buy {
-                filled.saturating_add(working)
-            } else {
-                filled.saturating_sub(working)
-            }
+        let against = (filled > 0 && !buy) || (filled < 0 && buy);
+        // One pass: the working orders on the order's side (the exit test's
+        // when the order opposes the position; a perp's inventory's always)
+        // and the replaced order's resting term.
+        let (working, held, replaced) = if against || perp {
+            self.working_on(slot, sym, buy, exclude)
         } else {
-            filled
+            (0, 0, 0)
         };
+        // The position as every working order on the order's side leaves it
+        // — a perp slot's with a queued modify at its larger size (XH4e);
+        // every other slot's exactly as BX3 ruled.
+        let side_working = if perp { held } else { working };
+        let worked = if buy {
+            filled.saturating_add(side_working)
+        } else {
+            filled.saturating_sub(side_working)
+        };
+        let pos = if against { worked } else { filled };
         let mag = pos.saturating_abs();
         let opposes = (pos > 0 && !buy) || (pos < 0 && buy);
         if opposes && qty_1e6 <= mag {
@@ -1446,7 +1594,7 @@ impl Ledger {
         // price: it fills at or below it. Used on both sides of every
         // comparison below, so the one-price rule holds. A non-positive
         // LIMIT is refused before this, whatever the reference.
-        let px_at = if buy { px_1e6 } else { px_1e6.max(r.px_ctx()) };
+        let px_at = r.one_price(buy, px_1e6);
         let (e_now, e_next, measure, turnover) = match r.law {
             LAW_SPOT | LAW_LINEAR => {
                 if r.law == LAW_SPOT && next < 0 {
@@ -1540,24 +1688,56 @@ impl Ledger {
         p.current_1e6 = others.saturating_add(e_now);
         p.projected_1e6 = others.saturating_add(e_next);
         p.turnover_add_1e6 = turnover;
+        if perp {
+            // XH4e: the inventory counts the working orders on the order's
+            // side whichever way the order faces, at the cap's one price;
+            // the resting notional takes the order in place of the one it
+            // replaces.
+            let next = if buy {
+                worked.saturating_add(qty_1e6)
+            } else {
+                worked.saturating_sub(qty_1e6)
+            };
+            let cap_px = r.cap_price(px_1e6);
+            p.inventory_now_1e6 = mul_1e6(worked.saturating_abs(), cap_px);
+            p.inventory_next_1e6 = mul_1e6(next.saturating_abs(), cap_px);
+            p.resting_next_1e6 = self.resting_usd_1e6[slot]
+                .saturating_sub(replaced)
+                .saturating_add(mul_1e6(qty_1e6, px_1e6));
+        }
         Some(p)
     }
 
-    /// Re-price one row for every slot and keep the aggregate exact.
+    /// Re-price one row for every slot and keep the aggregates exact: the
+    /// exposure sum and (XH4e, XH2-C) the count of linear positions no
+    /// mark prices. Every position or mark change passes here.
     fn refresh_instrument(&mut self, i: usize) {
         let r = &mut self.inst[i];
+        let bare = r.law == LAW_LINEAR && r.mark_1e6 <= 0;
         let mut s = 0usize;
         while s < EXEC_SLOTS {
-            // A flat slot with nothing cached has nothing to re-price —
-            // and skipping it skips the i128 divides a mark would
-            // otherwise cost every slot on every row.
-            if r.pos_1e6[s] == 0 && r.exp_1e6[s] == 0 {
+            let bit = 1u8 << s;
+            // A flat slot with nothing cached and nothing counted has
+            // nothing to re-price — and skipping it skips the i128
+            // divides a mark would otherwise cost every slot on every row.
+            if r.pos_1e6[s] == 0 && r.exp_1e6[s] == 0 && r.unmarked & bit == 0 {
                 s += 1;
                 continue;
             }
             let e = r.exposure_ctx(r.pos_1e6[s]);
             self.inst_exposure_1e6[s] = self.inst_exposure_1e6[s] - r.exp_1e6[s] + e;
             r.exp_1e6[s] = e;
+            let unmarked = bare && r.pos_1e6[s] != 0;
+            if unmarked != (r.unmarked & bit != 0) {
+                r.unmarked ^= bit;
+                if unmarked {
+                    self.inst_unmarked[s] += 1;
+                } else {
+                    // The bit was set, so the count holds it.
+                    debug_assert!(self.inst_unmarked[s] > 0);
+                    self.inst_unmarked[s] -= 1;
+                }
+            }
             s += 1;
         }
     }
@@ -1823,7 +2003,9 @@ impl Ledger {
         if rem <= 0 {
             self.release(found);
         } else {
+            let old = self.resting_term(found);
             self.resting[found].remaining_1e6 = rem;
+            self.resting_reterm(found, old);
         }
     }
 
@@ -1831,7 +2013,8 @@ impl Ledger {
     // writing — the order lifecycle
     // -----------------------------------------------------------------
 
-    /// A live submit was accepted by the arm. Starts tracking it.
+    /// A live submit was accepted by the arm. Starts tracking it, at its
+    /// limit `px_1e6` (XH4e: the resting notional; `0` = unknown).
     pub fn on_submit(
         &mut self,
         client_oid: u64,
@@ -1839,6 +2022,7 @@ impl Ledger {
         sym: SymbolId,
         qty_1e6: i64,
         buy: bool,
+        px_1e6: i64,
     ) {
         if slot >= EXEC_SLOTS {
             return;
@@ -1877,6 +2061,9 @@ impl Ledger {
             // for — not a configuration error.
             self.counters.resting_full = self.counters.resting_full.saturating_add(1);
             self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
+            // XH4e: its notional too, for good — the same reading.
+            self.resting_usd_1e6[slot] =
+                self.resting_usd_1e6[slot].saturating_add(mul_1e6(qty_1e6, px_1e6));
             return;
         }
         self.resting[free] = RestingOrder {
@@ -1888,6 +2075,11 @@ impl Ledger {
             side: resting_side(buy),
             _pad: [0; 1],
         };
+        self.resting_px_1e6[free] = px_1e6;
+        self.resting_px_asked_1e6[free] = 0;
+        self.resting_qty_asked_1e6[free] = 0;
+        self.resting_asked_oid[free] = 0;
+        self.resting_reterm(free, 0);
         self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
     }
 
@@ -1904,6 +2096,11 @@ impl Ledger {
     pub fn clear_resting(&mut self) {
         self.resting = [RestingOrder::free(); LEDGER_RESTING];
         self.resting_by_slot = [0; EXEC_SLOTS];
+        self.resting_px_1e6 = [0; LEDGER_RESTING];
+        self.resting_px_asked_1e6 = [0; LEDGER_RESTING];
+        self.resting_qty_asked_1e6 = [0; LEDGER_RESTING];
+        self.resting_asked_oid = [0; LEDGER_RESTING];
+        self.resting_usd_1e6 = [0; EXEC_SLOTS];
     }
 
     /// A live cancel was accepted by the arm. Stops tracking it.
@@ -1918,10 +2115,46 @@ impl Ledger {
         }
     }
 
+    /// **XH4f — a retirement**: an arm's confirmed end of `client_oid`.
+    /// Its row goes ([`Self::on_cancel`]); an id no row holds may be a
+    /// refused queued modify's replacement — the row whose hold names it
+    /// drops the hold, at its own size and price again (the original
+    /// rests on). One pass over the table by reference, as `locate`.
+    pub fn on_retired(&mut self, client_oid: u64, slot: usize) {
+        match self.find(client_oid, slot) {
+            Found::One(i) => self.release(i),
+            Found::Many => {}
+            Found::None => {
+                if client_oid == 0 {
+                    return;
+                }
+                let mut i = 0usize;
+                while i < LEDGER_RESTING {
+                    if self.resting_asked_oid[i] == client_oid
+                        && self.resting[i].live == 1
+                        && self.resting[i].slot as usize == slot
+                    {
+                        let old = self.resting_term(i);
+                        self.resting_asked_oid[i] = 0;
+                        self.resting_px_asked_1e6[i] = 0;
+                        self.resting_qty_asked_1e6[i] = 0;
+                        self.resting_reterm(i, old);
+                        return;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
     /// A live modify was accepted by the arm. **The count does not
     /// change** — LAW E-7 says a requote is one order replaced in
     /// place — but the id and the size both do, and a ledger that
     /// kept the old id would fail to match the replacement's fills.
+    ///
+    /// **XH4e — and the price.** `px_1e6` is the replacement's limit; `0`
+    /// means "the price the modify asked" ([`Self::on_modify_asked`]: a
+    /// queued arm's `Renamed` carries none), else the row keeps its own.
     pub fn on_modify(
         &mut self,
         prev_client_oid: u64,
@@ -1930,13 +2163,25 @@ impl Ledger {
         sym: SymbolId,
         qty_1e6: i64,
         buy: bool,
+        px_1e6: i64,
     ) {
         match self.find(prev_client_oid, slot) {
             Found::One(i) => {
+                let old = self.resting_term(i);
                 self.resting[i].client_oid = client_oid;
                 self.resting[i].remaining_1e6 = qty_1e6;
                 self.resting[i].sym = sym;
                 self.resting[i].side = resting_side(buy);
+                let asked = self.resting_px_asked_1e6[i];
+                if px_1e6 > 0 {
+                    self.resting_px_1e6[i] = px_1e6;
+                } else if asked > 0 {
+                    self.resting_px_1e6[i] = asked;
+                }
+                self.resting_px_asked_1e6[i] = 0;
+                self.resting_qty_asked_1e6[i] = 0;
+                self.resting_asked_oid[i] = 0;
+                self.resting_reterm(i, old);
             }
             // The arm accepted a modify of an order the ledger is not
             // holding. Tracking the replacement is the conservative
@@ -1950,7 +2195,7 @@ impl Ledger {
             // leaking one place in a shared table per unmatched
             // modify, which is the very condition that makes the table
             // fill.
-            Found::None => self.on_submit(client_oid, slot, sym, qty_1e6, buy),
+            Found::None => self.on_submit(client_oid, slot, sym, qty_1e6, buy, px_1e6),
             // **Two rows under one key: leave the table alone.** Same
             // ruling as `consume_resting`, and it has to be the same
             // one: adding a THIRD row under an already-ambiguous key
@@ -1960,34 +2205,80 @@ impl Ledger {
         }
     }
 
+    /// **XH4e — a queued (confirm-later) arm accepted a modify of
+    /// `prev_client_oid` to `qty_1e6` at `px_1e6`.** Until the arm confirms
+    /// it (`Renamed` → [`Self::on_modify`] with no price) the row counts at
+    /// the larger of its two sizes and the higher of its two prices — in
+    /// the resting notional and in the working orders a perp's inventory
+    /// adds — since the order may rest at either. A modify the arm then
+    /// refuses drops them with its replacement's retirement (XH4f:
+    /// [`Self::on_retired`] by `client_oid`, the replacement's id).
+    pub fn on_modify_asked(
+        &mut self,
+        prev_client_oid: u64,
+        client_oid: u64,
+        slot: usize,
+        qty_1e6: i64,
+        px_1e6: i64,
+    ) {
+        // `locate`, not `find`: the confirmation's `on_modify` counts an
+        // ambiguous key, once.
+        if let Found::One(i) = self.locate(prev_client_oid, slot) {
+            let old = self.resting_term(i);
+            self.resting_qty_asked_1e6[i] = qty_1e6;
+            self.resting_px_asked_1e6[i] = px_1e6;
+            self.resting_asked_oid[i] = client_oid;
+            self.resting_reterm(i, old);
+        }
+    }
+
     /// **BX3 (risk review) — what `slot` has WORKING on `sym` on one side**,
-    /// ×1e6: the remaining quantity of its resting orders there, less the
-    /// order a modify replaces (`exclude`). The instrument exit test reads
-    /// it: N working exits of the whole position are one exit, not N.
+    /// ×1e6, less the order a modify replaces (`exclude`): the remaining
+    /// quantity of its resting orders there (the exit test's, as BX3 ruled)
+    /// and (XH4e) the same with a queued modify at the larger of its two
+    /// sizes (a perp slot's) — **and (XH4e) that replaced order's resting
+    /// term**, `0` unless the table holds its key exactly once (the reading
+    /// [`Self::on_modify`] takes). N working exits of the whole position
+    /// are one exit, not N.
     ///
     /// One pass over the table by reference, like [`Self::find`]; asked
-    /// only for an order that opposes a position on an instrument row.
-    fn working_1e6(&self, slot: usize, sym: SymbolId, buy: bool, exclude: Option<u64>) -> i64 {
+    /// for an order that opposes a position on an instrument row, and for
+    /// every order of a perp slot.
+    fn working_on(
+        &self,
+        slot: usize,
+        sym: SymbolId,
+        buy: bool,
+        exclude: Option<u64>,
+    ) -> (i64, i64, i64) {
         let side = resting_side(buy);
         let (skip, skip_oid) = match exclude {
             Some(oid) => (true, oid),
             None => (false, 0),
         };
-        let mut total = 0i64;
+        let (mut total, mut held) = (0i64, 0i64);
+        let mut hit = LEDGER_RESTING;
+        let mut hits = 0u32;
         let mut i = 0usize;
         while i < LEDGER_RESTING {
             let r = &self.resting[i];
-            i += 1;
-            if r.live == 1
-                && r.slot as usize == slot
-                && r.sym == sym
-                && r.side == side
-                && !(skip && r.client_oid == skip_oid)
-            {
-                total = total.saturating_add(r.remaining_1e6.max(0));
+            if r.live == 1 && r.slot as usize == slot {
+                if skip && r.client_oid == skip_oid {
+                    hits += 1;
+                    hit = i;
+                } else if r.sym == sym && r.side == side {
+                    total = total.saturating_add(r.remaining_1e6.max(0));
+                    held = held.saturating_add(self.resting_qty(i));
+                }
             }
+            i += 1;
         }
-        total
+        let replaced = if hits == 1 {
+            self.resting_term(hit)
+        } else {
+            0
+        };
+        (total, held, replaced)
     }
 
     /// Resolve `(client_oid, slot)` against the resting table.
@@ -1999,6 +2290,17 @@ impl Ledger {
     /// distinction, which is how the two cases came to share a branch
     /// that was right for only one of them.
     fn find(&mut self, client_oid: u64, slot: usize) -> Found {
+        let found = self.locate(client_oid, slot);
+        if found == Found::Many {
+            self.counters.resting_ambiguous = self.counters.resting_ambiguous.saturating_add(1);
+        }
+        found
+    }
+
+    /// [`Self::find`] without the count, for a question asked before the
+    /// verb that counts it (XH4e: a modify's projection, a queued
+    /// modify's asked price).
+    fn locate(&self, client_oid: u64, slot: usize) -> Found {
         if slot >= EXEC_SLOTS {
             return Found::None;
         }
@@ -2018,8 +2320,6 @@ impl Ledger {
             i += 1;
         }
         if n > 1 {
-            self.counters.resting_ambiguous =
-                self.counters.resting_ambiguous.saturating_add(1);
             return Found::Many;
         }
         if n == 0 {
@@ -2028,12 +2328,48 @@ impl Ledger {
         Found::One(found)
     }
 
+    /// **XH4e** — what `resting[i]` may still fill: its remaining quantity,
+    /// or a queued modify's asked size when that is larger.
+    #[inline]
+    fn resting_qty(&self, i: usize) -> i64 {
+        self.resting[i]
+            .remaining_1e6
+            .max(self.resting_qty_asked_1e6[i])
+            .max(0)
+    }
+
+    /// **XH4e** — what `resting[i]` adds to its slot's resting notional:
+    /// [`Self::resting_qty`] × the higher of its price and a queued
+    /// modify's asked price, clamped like every exposure term.
+    #[inline]
+    fn resting_term(&self, i: usize) -> i64 {
+        let px = self.resting_px_1e6[i].max(self.resting_px_asked_1e6[i]);
+        mul_1e6(self.resting_qty(i), px)
+    }
+
+    /// **XH4e** — `resting[i]` changed from a term of `old`: move its
+    /// slot's sum by the difference.
+    #[inline]
+    fn resting_reterm(&mut self, i: usize, old: i64) {
+        let slot = self.resting[i].slot as usize & (EXEC_SLOTS - 1);
+        let new = self.resting_term(i);
+        self.resting_usd_1e6[slot] = self.resting_usd_1e6[slot]
+            .saturating_sub(old)
+            .saturating_add(new);
+    }
+
     #[inline]
     fn release(&mut self, i: usize) {
         let slot = self.resting[i].slot as usize;
+        let old = self.resting_term(i);
         self.resting[i] = RestingOrder::free();
+        self.resting_px_1e6[i] = 0;
+        self.resting_px_asked_1e6[i] = 0;
+        self.resting_qty_asked_1e6[i] = 0;
+        self.resting_asked_oid[i] = 0;
         if slot < EXEC_SLOTS {
             self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_sub(1);
+            self.resting_usd_1e6[slot] = self.resting_usd_1e6[slot].saturating_sub(old);
         }
     }
 }
@@ -2227,7 +2563,7 @@ mod tests {
     fn a_settle_drops_the_resting_orders_and_leaves_the_position_to_the_fill() {
         let mut l = bound();
         l.book_fill(&fill(T0, sym(100), true, 900_000, 5_000_000, 1));
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_exposure_1e6(SLOT), 5_000_000);
 
         l.settle(VENUE, FAM, 20_182);
@@ -2578,8 +2914,8 @@ mod tests {
     #[test]
     fn a_submit_counts_and_a_cancel_uncounts() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(12, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(12, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 2);
         l.on_cancel(11, SLOT);
         assert_eq!(l.slot_resting(SLOT), 1);
@@ -2591,8 +2927,8 @@ mod tests {
         // share oid 11 routinely. Keying on the oid alone is the exact
         // defect the E5 commit-3 review found in the paper matcher.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(11, SLOT + 1, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(11, SLOT + 1, sym(100), 5_000_000, true, 0);
         l.on_cancel(11, SLOT + 1);
         assert_eq!(l.slot_resting(SLOT), 1, "the other slot's cancel took mine");
         assert_eq!(l.slot_resting(SLOT + 1), 0);
@@ -2601,8 +2937,8 @@ mod tests {
     #[test]
     fn a_modify_keeps_the_count_and_moves_the_id() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_modify(11, 12, SLOT, sym(100), 7_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_modify(11, 12, SLOT, sym(100), 7_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 1, "LAW E-7: replaced in place");
         // The replacement's fills must match: the OLD id no longer does.
         l.book_fill(&fill(T0, sym(100), true, 500_000, 7_000_000, 11));
@@ -2615,7 +2951,7 @@ mod tests {
     #[test]
     fn a_full_fill_retires_the_order_and_a_partial_one_does_not() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
         l.book_fill(&fill(T0, sym(100), true, 500_000, 2_000_000, 11));
         assert_eq!(l.slot_resting(SLOT), 1, "3 contracts still working");
         l.book_fill(&fill(T0, sym(100), true, 500_000, 3_000_000, 11));
@@ -2625,8 +2961,8 @@ mod tests {
     #[test]
     fn an_ambiguous_key_leaves_the_count_alone_and_says_so() {
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 2);
         l.book_fill(&fill(T0, sym(100), true, 500_000, 5_000_000, 11));
         assert_eq!(l.counters().resting_ambiguous, 1);
@@ -2638,8 +2974,8 @@ mod tests {
         // The separation the module docs claim, asserted. A defect in
         // order matching must not be able to blind the caps.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
         l.book_fill(&fill(T0, sym(100), true, 500_000, 5_000_000, 11));
         assert_eq!(l.counters().resting_ambiguous, 1);
         assert_eq!(l.slot_exposure_1e6(SLOT), 5_000_000);
@@ -2654,8 +2990,8 @@ mod tests {
         // `max_open_orders` would eventually refuse everything for
         // ever.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(12, SLOT, sym(101), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(12, SLOT, sym(101), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 2);
         l.settle(VENUE, FAM, 20_182);
         assert_eq!(l.slot_resting(SLOT), 0);
@@ -2666,8 +3002,8 @@ mod tests {
         let mut l = Ledger::new(anchor());
         l.bind(VENUE, 0, 1, sym(100));
         l.bind(VENUE, 1, 2, sym(200));
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(12, SLOT, sym(200), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(12, SLOT, sym(200), 5_000_000, true, 0);
         l.settle(VENUE, 0, 1);
         assert_eq!(l.slot_resting(SLOT), 1);
     }
@@ -2676,10 +3012,10 @@ mod tests {
     fn the_resting_table_refuses_rather_than_overwriting_when_full() {
         let mut l = bound();
         for i in 0..LEDGER_RESTING {
-            l.on_submit(i as u64 + 1, SLOT, sym(100), 1, true);
+            l.on_submit(i as u64 + 1, SLOT, sym(100), 1, true, 0);
         }
         assert_eq!(l.slot_resting(SLOT), LEDGER_RESTING as u32);
-        l.on_submit(999_999, SLOT, sym(100), 1, true);
+        l.on_submit(999_999, SLOT, sym(100), 1, true, 0);
         assert_eq!(l.counters().resting_full, 1);
         // No ROW was taken from an existing order — the first one is
         // still there to be cancelled. (The COUNT rises anyway, which
@@ -2691,7 +3027,7 @@ mod tests {
     #[test]
     fn an_out_of_range_slot_answers_zero_rather_than_reading_past_the_array() {
         let mut l = bound();
-        l.on_submit(11, EXEC_SLOTS, sym(100), 5_000_000, true);
+        l.on_submit(11, EXEC_SLOTS, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(EXEC_SLOTS), 0);
         assert_eq!(l.slot_exposure_1e6(EXEC_SLOTS), 0);
         assert_eq!(l.slot_day_turnover_1e6(EXEC_SLOTS), 0);
@@ -2833,10 +3169,10 @@ mod tests {
         // `on_modify` did, because it could not tell ABSENT from
         // AMBIGUOUS.
         let mut l = bound();
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
-        l.on_submit(11, SLOT, sym(100), 5_000_000, true);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
+        l.on_submit(11, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 2);
-        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true);
+        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 2, "a third row was created");
         assert_eq!(l.counters().resting_ambiguous, 1);
     }
@@ -2849,7 +3185,7 @@ mod tests {
         // E-8 cancel-all — ever retires it: one place leaked out of a
         // shared table per unmatched modify, for the life of the boot.
         let mut l = bound();
-        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true);
+        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 1);
         l.settle(VENUE, FAM, 20_182);
         assert_eq!(l.slot_resting(SLOT), 0, "the phantom row survived the roll");
@@ -2863,9 +3199,9 @@ mod tests {
         // on.
         let mut l = bound();
         for i in 0..LEDGER_RESTING {
-            l.on_submit(i as u64 + 1, SLOT, sym(100), 1, true);
+            l.on_submit(i as u64 + 1, SLOT, sym(100), 1, true, 0);
         }
-        l.on_submit(999_999, SLOT, sym(100), 1, true);
+        l.on_submit(999_999, SLOT, sym(100), 1, true, 0);
         assert_eq!(l.counters().resting_full, 1);
         assert_eq!(
             l.slot_resting(SLOT),
@@ -2902,7 +3238,7 @@ mod tests {
         // LOW — a count that under-reports is a clamp that lets
         // through the order it exists to stop.
         let mut l = bound();
-        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true);
+        l.on_modify(11, 12, SLOT, sym(100), 5_000_000, true, 0);
         assert_eq!(l.slot_resting(SLOT), 1);
     }
 
@@ -3126,7 +3462,7 @@ mod tests {
             .probe_instrument(LIN, SLOT, 5 * E6, false, 100 * E6, None)
             .unwrap();
         assert!(p.exit, "the first full-size sell is an exit");
-        l.on_submit(21, SLOT, LIN, 5 * E6, false);
+        l.on_submit(21, SLOT, LIN, 5 * E6, false, 0);
         let p = l
             .probe_instrument(LIN, SLOT, 5 * E6, false, 100 * E6, None)
             .unwrap();
@@ -3137,7 +3473,7 @@ mod tests {
             .probe_instrument(LIN, SLOT, 5 * E6, false, 99 * E6, Some(21))
             .unwrap();
         assert!(p.exit, "a requote of the working exit is still one");
-        l.on_submit(22, SLOT, LIN, 3 * E6, true);
+        l.on_submit(22, SLOT, LIN, 3 * E6, true, 0);
         let p = l
             .probe_instrument(LIN, SLOT, 2 * E6, false, 100 * E6, Some(21))
             .unwrap();
@@ -3157,7 +3493,7 @@ mod tests {
         assert!(!p.exit && p.turnover_add_1e6 == 100 * E6);
         // Spot: a working sell of the whole holding leaves nothing to sell.
         l.book_fill(&fill(T0, SPOT, true, 100 * E6, 2 * E6, 3));
-        l.on_submit(31, SLOT, SPOT, 2 * E6, false);
+        l.on_submit(31, SLOT, SPOT, 2 * E6, false, 0);
         let p = l
             .probe_instrument(SPOT, SLOT, E6, false, 100 * E6, None)
             .unwrap();
@@ -3402,7 +3738,9 @@ mod tests {
     }
 
     /// The per-slot aggregate is exact: after any mix of fills, marks and
-    /// summaries on any rows and slots it equals a full recompute.
+    /// summaries on any rows and slots it equals a full recompute — and so
+    /// is XH4e's count of linear positions no mark prices (marks expire
+    /// here too).
     #[test]
     fn the_instrument_aggregate_matches_a_full_recompute() {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -3428,6 +3766,8 @@ mod tests {
                     let m = (rng(&mut x) % 200_000) as i64 * E6;
                     l.on_mark(s, m, m, 1);
                 }
+                // XH4e: every mark goes stale at once, now and then.
+                3 if rng(&mut x) % 8 == 0 => l.expire_marks(2 + MARK_STALE_NS),
                 _ => l.on_opt_summary(&summary(
                     s,
                     (rng(&mut x) % 2_000) as i64 * E6,
@@ -3437,12 +3777,16 @@ mod tests {
             let mut slot = 0usize;
             while slot < EXEC_SLOTS {
                 let mut sum = 0i64;
+                let mut unmarked = 0u16;
                 let mut i = 0usize;
                 while i < l.inst_n as usize {
                     let r = &l.inst[i];
                     let e = r.exposure_ctx(r.pos_1e6[slot]);
                     assert_eq!(r.exp_1e6[slot], e, "a stale cached term");
                     sum += e;
+                    let bare = r.law == LAW_LINEAR && r.pos_1e6[slot] != 0 && r.mark_1e6 <= 0;
+                    assert_eq!(r.unmarked & (1 << slot) != 0, bare, "a stale unmarked bit");
+                    unmarked += u16::from(bare);
                     i += 1;
                 }
                 assert_eq!(
@@ -3450,7 +3794,294 @@ mod tests {
                     sum,
                     "step {step} slot {slot}"
                 );
+                assert_eq!(
+                    l.unmarked_positions(slot),
+                    unmarked,
+                    "step {step} slot {slot}"
+                );
                 slot += 1;
+            }
+            step += 1;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // XH4e — perp slots
+    // -----------------------------------------------------------------
+
+    /// **XH4e (XH2-C)** — a linear position no mark prices is counted from
+    /// its first fill until a mark arrives, again once the mark is stale,
+    /// and no longer once the slot is flat; other slots and other laws are
+    /// never counted.
+    #[test]
+    fn a_linear_position_with_no_mark_is_counted_until_one_prices_it() {
+        let mut l = inst();
+        assert_eq!(l.unmarked_positions(SLOT), 0);
+        l.book_fill(&fill(T0, LIN, true, 100 * E6, 2 * E6, 1));
+        l.book_fill(&fill(T0, SPOT, true, 100 * E6, 2 * E6, 2));
+        assert_eq!(l.unmarked_positions(SLOT), 1, "the linear row only");
+        assert_eq!(l.unmarked_positions(SLOT + 1), 0);
+        l.on_mark(LIN, 100 * E6, 100 * E6, 5);
+        assert_eq!(l.unmarked_positions(SLOT), 0, "a mark prices it");
+        l.expire_marks(6 + MARK_STALE_NS);
+        assert_eq!(l.unmarked_positions(SLOT), 1, "a stale mark does not");
+        l.book_fill(&fill(T0, LIN, false, 100 * E6, 2 * E6, 3));
+        assert_eq!(l.unmarked_positions(SLOT), 0, "flat is nothing to price");
+        l.book_fill(&fill(T0, LIN, false, 100 * E6, E6, 4));
+        assert_eq!(
+            l.unmarked_positions(SLOT),
+            1,
+            "a short counts as a long does"
+        );
+        assert_eq!(l.unmarked_positions(EXEC_SLOTS), 0);
+    }
+
+    /// **XH4e — a perp's inventory counts the working orders on the
+    /// order's side** (plan §8.8): the position, plus every working order
+    /// on that side but the one a modify replaces, plus the order — at the
+    /// cap's one price, the higher of the limit and the mark on either
+    /// side. A perp slot is judged on linear rows only.
+    #[test]
+    fn a_perp_s_inventory_counts_the_working_orders_on_the_order_s_side() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 100 * E6, 2 * E6, 1));
+        l.on_mark(LIN, 100 * E6, 100 * E6, 5);
+        l.on_submit(11, SLOT, LIN, 3 * E6, true, 99 * E6);
+        l.on_submit(12, SLOT, LIN, E6, false, 101 * E6);
+        let inv = |slot: usize, qty: i64, buy: bool, px: i64, x: Option<u64>| {
+            l.probe_perp(LIN, slot, qty, buy, px, x)
+                .map(|p| (p.inventory_now_1e6, p.inventory_next_1e6))
+        };
+        // A buy of 1: long 2 + 3 working → $500; + 1 → $600.
+        assert_eq!(
+            inv(SLOT, E6, true, 100 * E6, None),
+            Some((500 * E6, 600 * E6))
+        );
+        // A bid below the mark values the inventory at the mark.
+        assert_eq!(
+            inv(SLOT, E6, true, 90 * E6, None),
+            Some((500 * E6, 600 * E6))
+        );
+        // A modify of the working buy leaves it out: 2 → 3.
+        assert_eq!(
+            inv(SLOT, E6, true, 100 * E6, Some(11)),
+            Some((200 * E6, 300 * E6))
+        );
+        // A sell of 4 limited at 90 is judged at the 100 mark: 2 − 1 = 1 → −3.
+        assert_eq!(
+            inv(SLOT, 4 * E6, false, 90 * E6, None),
+            Some((100 * E6, 300 * E6))
+        );
+        // Another slot's orders are its own.
+        assert_eq!(inv(SLOT + 1, E6, true, 100 * E6, None), Some((0, 100 * E6)));
+        // Another law is refused for a perp slot; an unbound id has no row.
+        assert_eq!(
+            l.probe_perp(SPOT, SLOT, E6, true, 100 * E6, None)
+                .map(|p| p.refusal),
+            Some(InstRefusal::Unpriced)
+        );
+        assert_eq!(l.probe_perp(bn(99), SLOT, E6, true, 100 * E6, None), None);
+    }
+
+    /// **XH4e — a queued modify's asked size counts for a perp slot only**:
+    /// any other slot's exit test is exactly as BX3 ruled (the remaining
+    /// quantity); a perp slot's exit test and inventory count the larger
+    /// size until the confirmation.
+    #[test]
+    fn a_queued_size_increase_counts_for_a_perp_slot_only() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 100 * E6, 10 * E6, 1));
+        l.on_mark(LIN, 100 * E6, 100 * E6, 5);
+        // A working sell of 6, modified (queued) to 9.
+        l.on_submit(11, SLOT, LIN, 6 * E6, false, 101 * E6);
+        l.on_modify_asked(11, 12, SLOT, 9 * E6, 101 * E6);
+        // A sell of 3: 10 − 6 = 4 still to exit — an exit, as before…
+        let p = l
+            .probe_instrument(LIN, SLOT, 3 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(p.exit, "another slot's exit test is unchanged");
+        // …a perp slot counts the asked 9: 10 − 9 = 1 < 3, no exit; its
+        // inventory runs 1 → −2 at the mark.
+        let p = l
+            .probe_perp(LIN, SLOT, 3 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(!p.exit, "a perp slot counts the larger size");
+        assert_eq!(
+            (p.inventory_now_1e6, p.inventory_next_1e6),
+            (100 * E6, 200 * E6)
+        );
+        // Confirmed at 9: both read 9.
+        l.on_modify(11, 12, SLOT, LIN, 9 * E6, false, 0);
+        let p = l
+            .probe_instrument(LIN, SLOT, 3 * E6, false, 100 * E6, None)
+            .unwrap();
+        assert!(!p.exit);
+    }
+
+    /// **XH4f — a refused queued modify's hold goes with its replacement's
+    /// retirement**: the original counts at its own size and price again;
+    /// another id's or another slot's retirement drops nothing.
+    #[test]
+    fn a_refused_queued_modify_s_hold_goes_with_its_replacement_s_retirement() {
+        let mut l = inst();
+        l.on_submit(11, SLOT, LIN, 2 * E6, true, 100 * E6);
+        l.on_modify_asked(11, 12, SLOT, 3 * E6, 110 * E6);
+        assert_eq!(l.resting_usd_1e6(SLOT), 330 * E6, "held");
+        l.on_retired(99, SLOT);
+        assert_eq!(l.resting_usd_1e6(SLOT), 330 * E6, "another id: nothing");
+        l.on_retired(12, SLOT + 1);
+        assert_eq!(l.resting_usd_1e6(SLOT), 330 * E6, "another slot's: nothing");
+        l.on_retired(12, SLOT);
+        assert_eq!(
+            l.resting_usd_1e6(SLOT),
+            200 * E6,
+            "the replacement refused: the original as it was"
+        );
+        assert!(
+            matches!(l.locate(11, SLOT), Found::One(_)),
+            "the original rests on"
+        );
+        l.on_retired(11, SLOT);
+        assert_eq!(l.resting_usd_1e6(SLOT), 0, "the original's own end");
+        assert_eq!(l.locate(11, SLOT), Found::None);
+    }
+
+    /// **XH4e — a queued arm's modify counts at the larger of its two sizes
+    /// and the higher of its two prices until the arm confirms it**, then
+    /// at what it asked; a modify's projection swaps the replaced order's
+    /// term; an order the table could not hold keeps its notional for
+    /// good, like its count.
+    #[test]
+    fn a_queued_modify_is_priced_high_until_confirmed_and_an_untracked_order_stays() {
+        let mut l = inst();
+        l.on_submit(11, SLOT, LIN, 2 * E6, true, 100 * E6);
+        assert_eq!(l.resting_usd_1e6(SLOT), 200 * E6);
+        l.on_modify_asked(11, 12, SLOT, 2 * E6, 110 * E6);
+        assert_eq!(l.resting_usd_1e6(SLOT), 220 * E6, "either price may rest");
+        l.on_modify(11, 12, SLOT, LIN, 2 * E6, true, 0);
+        assert_eq!(
+            l.resting_usd_1e6(SLOT),
+            220 * E6,
+            "the asked price, confirmed"
+        );
+        l.on_modify_asked(12, 13, SLOT, 3 * E6, 90 * E6);
+        assert_eq!(
+            l.resting_usd_1e6(SLOT),
+            330 * E6,
+            "the larger size at the higher price"
+        );
+        l.on_modify(12, 13, SLOT, LIN, E6, true, 0);
+        assert_eq!(l.resting_usd_1e6(SLOT), 90 * E6);
+        // A perp slot's probe: a modify swaps the replaced order's term
+        // (90 − 90 + 2 × 50); a place adds its own.
+        let next = |x: Option<u64>| {
+            l.probe_perp(LIN, SLOT, 2 * E6, true, 50 * E6, x)
+                .map(|p| p.resting_next_1e6)
+        };
+        assert_eq!(next(Some(13)), Some(100 * E6));
+        assert_eq!(next(None), Some(190 * E6));
+        l.on_cancel(13, SLOT);
+        assert_eq!(l.resting_usd_1e6(SLOT), 0);
+        let mut i = 0u64;
+        while i < LEDGER_RESTING as u64 {
+            l.on_submit(100 + i, SLOT, LIN, E6, true, E6);
+            i += 1;
+        }
+        l.on_submit(99_999, SLOT, LIN, 5 * E6, true, 10 * E6);
+        assert_eq!(l.counters().resting_full, 1);
+        assert_eq!(l.resting_usd_1e6(SLOT), (LEDGER_RESTING as i64 + 50) * E6);
+        i = 0;
+        while i < LEDGER_RESTING as u64 {
+            l.on_cancel(100 + i, SLOT);
+            i += 1;
+        }
+        assert_eq!(l.resting_usd_1e6(SLOT), 50 * E6, "fail closed");
+        l.clear_resting();
+        assert_eq!(l.resting_usd_1e6(SLOT), 0, "a venue-wide cancel clears it");
+    }
+
+    /// **XH4e — the resting notional is exact**: after any mix of submits,
+    /// modifies (priced, asked, confirmed), fills, cancels and clears it
+    /// equals a full recompute, per slot.
+    #[test]
+    fn the_resting_notional_matches_a_full_recompute() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut l = inst();
+        let mut live: Vec<(u64, usize)> = Vec::new();
+        let mut oid = 1u64;
+        let mut step = 0u64;
+        while step < 20_000 {
+            let slot = SLOT + (rng(&mut x) % 2) as usize;
+            let px = (rng(&mut x) % 1_000 + 1) as i64 * E6;
+            let qty = (rng(&mut x) % 10 + 1) as i64 * E6;
+            let buy = rng(&mut x) & 1 == 0;
+            let pick = (rng(&mut x) % 256) as usize;
+            match rng(&mut x) % 8 {
+                0 | 1 if live.len() < 200 => {
+                    l.on_submit(oid, slot, LIN, qty, buy, px);
+                    live.push((oid, slot));
+                    oid += 1;
+                }
+                2 if !live.is_empty() => {
+                    let k = pick % live.len();
+                    let (prev, s) = live[k];
+                    let p = if pick % 3 == 0 { 0 } else { px };
+                    l.on_modify(prev, oid, s, LIN, qty, buy, p);
+                    live[k] = (oid, s);
+                    oid += 1;
+                }
+                3 if !live.is_empty() => {
+                    let k = pick % live.len();
+                    l.on_modify_asked(live[k].0, oid, live[k].1, qty, px);
+                    oid += 1;
+                }
+                // XH4f: the asked replacement refused — its retirement.
+                7 if !live.is_empty() => {
+                    let (o, s) = live[pick % live.len()];
+                    if let Found::One(i) = l.locate(o, s) {
+                        let asked = l.resting_asked_oid[i];
+                        l.on_retired(asked, s);
+                    }
+                }
+                4 if !live.is_empty() => {
+                    let k = pick % live.len();
+                    let (o, s) = live[k];
+                    let mut f = fill(T0, LIN, buy, px, (pick % 6 + 1) as i64 * E6, o);
+                    f.strategy_id = s as u8;
+                    l.book_fill(&f);
+                    if l.locate(o, s) == Found::None {
+                        live.swap_remove(k);
+                    }
+                }
+                5 if !live.is_empty() => {
+                    let (o, s) = live.swap_remove(pick % live.len());
+                    if pick % 2 == 0 {
+                        l.on_cancel(o, s);
+                    } else {
+                        l.on_retired(o, s);
+                    }
+                }
+                6 if pick == 0 => {
+                    l.clear_resting();
+                    live.clear();
+                }
+                _ => {}
+            }
+            let mut sums = [0i64; EXEC_SLOTS];
+            let mut i = 0usize;
+            while i < LEDGER_RESTING {
+                let r = &l.resting[i];
+                if r.live == 1 {
+                    let p = l.resting_px_1e6[i].max(l.resting_px_asked_1e6[i]);
+                    let q = r.remaining_1e6.max(l.resting_qty_asked_1e6[i]).max(0);
+                    sums[r.slot as usize] += mul_1e6(q, p);
+                }
+                i += 1;
+            }
+            let mut s = 0usize;
+            while s < EXEC_SLOTS {
+                assert_eq!(l.resting_usd_1e6(s), sums[s], "step {step} slot {s}");
+                s += 1;
             }
             step += 1;
         }

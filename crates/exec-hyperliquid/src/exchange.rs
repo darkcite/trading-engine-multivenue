@@ -9,7 +9,8 @@
 //!
 //! It runs on the dispatcher worker thread and nowhere else. That is
 //! not a style choice — the fill lane needs exactly ONE writer, and
-//! the worker already owns the HTTP socket, the nonce and the budget.
+//! the worker already owns the HTTP socket and the budget, and draws the
+//! nonce (its agent's one stream since XH4h S3).
 //! A second thread for the user-event stream would need a lock around
 //! all of it, on the path that books fills.
 //!
@@ -53,7 +54,7 @@ use crate::budget::{self, AddressBudget};
 use crate::cloid::encode as encode_cloid;
 use crate::config::HlConfig;
 use crate::http::{HlHttp, MAX_REQ_BODY};
-use crate::nonce::Nonce;
+use crate::nonce::{NonceSource, SharedNonce};
 use crate::request::{envelope_close, envelope_open, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Network, Vault};
@@ -584,7 +585,7 @@ pub struct HlExchange<const FILL_N: usize> {
     ws: UserWs,
     sk: secp256k1::SecretKey,
     network: Network,
-    nonce: Nonce,
+    nonce: NonceSource,
     budget: AddressBudget,
     /// Where `budget` came from at boot — for the boot tell.
     budget_source: BudgetSource,
@@ -805,7 +806,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             ws,
             sk,
             network: cfg.network,
-            nonce: Nonce::new(),
+            nonce: NonceSource::own(),
             budget,
             budget_source,
             seen: TidRing::new(),
@@ -862,6 +863,21 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             topup_next_at: Instant::now(),
             topup_path,
         })
+    }
+
+    /// **XMM XH4h S3.** Sign with nonces from `stream`, the agent
+    /// address's one stream in this process, so this arm never draws a
+    /// nonce another signer of the same agent drew (the gateway's thread,
+    /// another arm). Boot: right after [`HlExchange::new`], before the
+    /// first signed action (the boot sweep is one).
+    pub fn share_nonce(&mut self, stream: Arc<SharedNonce>) {
+        self.nonce.share(stream);
+    }
+
+    /// Whether this arm draws its nonces from a shared stream (S3).
+    #[must_use]
+    pub const fn nonce_shared(&self) -> bool {
+        self.nonce.is_shared()
     }
 
     /// The asset table. **Bound by a roll event, never derived**

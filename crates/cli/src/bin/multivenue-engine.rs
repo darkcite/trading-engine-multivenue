@@ -283,6 +283,10 @@ struct EvmLiveArgs {
     /// unfundable swap only; nothing is sent to either venue.
     #[arg(long, default_value_t = false)]
     no_trade: bool,
+    /// `arm-smoke` (XMM XH4h-3): X's hedges through the Hyperliquid
+    /// WebSocket gateway instead of the blocking arm — TESTNET only.
+    #[arg(long, default_value_t = false)]
+    gateway: bool,
     /// `arm-smoke`: also check this exec.toml arms slot 0 with
     /// `--arm-live` (the engine's own interlock, run without the engine).
     #[arg(long)]
@@ -391,6 +395,67 @@ struct ExecSmokeArgs {
     /// safely BELOW the market); for `--fill` it crosses the bid.
     #[arg(long, default_value_t = false)]
     sell: bool,
+
+    /// **XMM XH4g — the testnet battery.** With `--lifecycle`: slot 6's
+    /// Hyperliquid gateway arm and its gateway, composed in-process as the
+    /// engine composes them, driven through ALO places, modifies (a price,
+    /// a size, a crossing one), cancels, `BadAloPx`, gateway TTLs, sweeps,
+    /// IoC round trips and reconciliations on the PERPS of `--coins` —
+    /// after phases A and B, on the testnet host only. Prices come from
+    /// the venue's mids at `--rest-bps` / `--cross-bps`; each order's
+    /// notional is `--usd` (≤ $80). Exit codes 30–39 (`xmm_battery`).
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "lifecycle",
+        conflicts_with = "dry_run"
+    )]
+    hl_perp: bool,
+
+    /// XH4g: the perps (comma-separated venue names).
+    #[arg(long, default_value = "BTC,ETH,SOL,XRP", requires = "hl_perp")]
+    coins: String,
+
+    /// XH4g: lifecycle cycles (the bar: 20).
+    #[arg(long, default_value_t = 20, requires = "hl_perp")]
+    cycles: u32,
+
+    /// XH4g: IoC round trips (an open and its reduce-only close).
+    #[arg(long, default_value_t = 3, requires = "hl_perp")]
+    fill_pairs: u32,
+
+    /// XH4g: each order's notional, USD (12 ..= 80).
+    #[arg(long, default_value_t = 15, requires = "hl_perp")]
+    usd: i64,
+
+    /// XH4g: a resting quote's distance behind the mid, bps.
+    #[arg(long, default_value_t = 500, requires = "hl_perp")]
+    rest_bps: i64,
+
+    /// XH4g: a crossing order's distance through the mid, bps.
+    #[arg(long, default_value_t = 300, requires = "hl_perp")]
+    cross_bps: i64,
+
+    /// XH4g: the TTL phase's lifetime, ms.
+    #[arg(long, default_value_t = 2_000, requires = "hl_perp")]
+    ttl_ms: u64,
+
+    /// XH4g: a sweep every this many cycles.
+    #[arg(long, default_value_t = 5, requires = "hl_perp")]
+    sweep_every: u32,
+
+    /// XH4g: stall past the dead man's deadline once (spends one of the
+    /// venue's ten daily `scheduleCancel` triggers).
+    #[arg(long, default_value_t = false, requires = "hl_perp")]
+    stall: bool,
+
+    /// XH4g: slot-6 orders resting at the start are a run that did not
+    /// end — let the arm's boot cancel them, on the run's perps only (one on
+    /// another coin holds the boot, and the flat read then finds it: exit
+    /// 38). Without this they refuse the run: they could be another slot-6
+    /// signer's.
+    #[arg(long, default_value_t = false, requires = "hl_perp")]
+    sweep_first: bool,
 
     /// Show exactly what phase C WOULD send, and send nothing.
     ///
@@ -1383,6 +1448,7 @@ fn evm_live(args: EvmLiveArgs) -> ExitCode {
                     &args.coin,
                     p,
                     args.no_trade,
+                    args.gateway,
                     tls,
                 )
                 .map(|(r, ok)| (head + &r, ok)),
@@ -1509,7 +1575,10 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     // Validate phase C's arguments BEFORE any network work. An
     // operator who forgot --px should learn that now, not after two
     // venue round-trips have already run.
-    if args.lifecycle && (args.px.is_none() || args.px2.is_none() || args.sz.is_none()) {
+    if args.lifecycle
+        && !args.hl_perp
+        && (args.px.is_none() || args.px2.is_none() || args.sz.is_none())
+    {
         error!("exec-smoke: --lifecycle needs --px, --px2 and --sz (all 1e8-scaled)");
         eprintln!(
             "exec-smoke: e.g. --lifecycle --asset 100032530 --px 1000000 --px2 2000000 --sz 1000000000\n\
@@ -1653,6 +1722,9 @@ fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
                 "exec-smoke: PASSED — the venue verified this binary's signature and rejected a \
                  corrupted one"
             );
+            if args.lifecycle && args.hl_perp {
+                return exec_hl_perp(&cfg, &args);
+            }
             if args.lifecycle {
                 return exec_lifecycle(&cfg, &args);
             }
@@ -2260,6 +2332,71 @@ fn exec_requote(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitC
     }
 }
 
+/// XMM XH4g: the testnet battery on slot 6's gateway arm
+/// (`cli::xmm_battery`). Runs only after phases A and B, like phase C,
+/// and only against the testnet host.
+fn exec_hl_perp(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
+    if !cfg.is_testnet() {
+        error!("exec-smoke --hl-perp: the battery runs on TESTNET only");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let spec = cli::xmm_battery::BatterySpec {
+        coins: args
+            .coins
+            .split(',')
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect(),
+        cycles: args.cycles,
+        fill_pairs: args.fill_pairs,
+        usd: args.usd,
+        rest_bps: args.rest_bps,
+        cross_bps: args.cross_bps,
+        ttl_ms: args.ttl_ms,
+        sweep_every: args.sweep_every,
+        recon_ms: cli::xmm_live::RECON_MS,
+        stall: args.stall,
+        sweep_first: args.sweep_first,
+    };
+    if let Err(e) = spec.validate() {
+        error!("exec-smoke --hl-perp: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let sk = match cfg.secret_key() {
+        Ok(k) => k,
+        Err(e) => {
+            error!("exec-smoke --hl-perp: {e}");
+            return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+        }
+    };
+    let gcfg = exec_hyperliquid::GatewayCfg::production(
+        cfg.host.clone(),
+        TlsTransport::default_client_config(),
+        cfg.network,
+        cfg.master_addr,
+        cli::exec_boot::XMM_SLOT as u8,
+    );
+    info!(
+        host = %cfg.host,
+        coins = %args.coins,
+        cycles = args.cycles,
+        fill_pairs = args.fill_pairs,
+        usd = args.usd,
+        stall = args.stall,
+        "exec-smoke: XH4g — the testnet battery on slot 6's gateway arm"
+    );
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all and
+    // the flat read — never mid-run with quotes left resting.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --hl-perp: the signal handler: {e}");
+        return ExitCode::from(exec_hyperliquid::EXIT_FAILED as u8);
+    }
+    let report = cli::xmm_battery::run(&spec, gcfg, sk);
+    cli::xmm_battery::log_report(&report);
+    println!("{}", report.to_json());
+    ExitCode::from(report.exit)
+}
+
 fn exec_lifecycle(cfg: &exec_hyperliquid::HlConfig, args: &ExecSmokeArgs) -> ExitCode {
     // Checked at entry, before any network work; this is the
     // unwrap-free restatement of that.
@@ -2568,6 +2705,7 @@ fn boot_operator_hl_arm(
     eb: &cli::exec_boot::ExecBoot,
     md_ws_host: &str,
     f3p: core_ring::Producer<core_types::Fill, { engine::FILL_RING_SIZE }>,
+    nonces: &mut exec_hyperliquid::NonceStreams,
 ) -> Result<exec_hyperliquid::HlExchange<{ engine::FILL_RING_SIZE }>, String> {
     let hl_cfg = exec_hyperliquid::HlConfig::from_env(exec_hyperliquid::Scope::Live).map_err(|e| {
         format!("slot(s) LIVE on hyperliquid but the arm cannot be configured: {e}")
@@ -2605,6 +2743,11 @@ fn boot_operator_hl_arm(
         floor,
     )
     .map_err(|e| e.to_string())?;
+    // XMM XH4h S3: the agent's one nonce stream in this process, before the
+    // first signed action (the boot sweep below).
+    arm.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
+        String::from("the operator's arm: more agent addresses than the nonce streams hold")
+    })?);
     // E7-F1: the address budget is the venue's number, read once here;
     // the cold assumption halted the first mainnet boot before its first
     // order (2026-09-19).
@@ -2660,7 +2803,11 @@ fn boot_hyparb_live_arm(
     eb: &cli::exec_boot::ExecBoot,
     hb: Option<&cli::hyparb_boot::HyparbBoot>,
     universe: &core_config::universe::AllocatedUniverse,
-) -> Result<cli::hyparb_live::LiveBoot<{ engine::FILL_RING_SIZE }>, String> {
+    nonces: &mut exec_hyperliquid::NonceStreams,
+) -> Result<
+    cli::hyparb_live::LiveBoot<cli::hyparb_live::BlockingHedge<{ engine::FILL_RING_SIZE }>>,
+    String,
+> {
     let hb = hb.ok_or("slot 0 is armed live but no hyparb artifact is booted")?;
     let authority = exec_hyperevm::MainnetAuthority::armed_engine(
         hb.mode == core_config::hyparb::HyparbMode::Live,
@@ -2694,7 +2841,7 @@ fn boot_hyparb_live_arm(
         state_dir: cli::hyparb_live::state_dir(&eb.path),
         budget_floor: floor,
     };
-    cli::hyparb_live::boot_hyparb_live(&spec, TlsTransport::default_client_config())
+    cli::hyparb_live::boot_hyparb_live(&spec, TlsTransport::default_client_config(), nonces)
 }
 
 /// **E6 commit 3/4 — the halt machine, wired.** Shared by both
@@ -2796,11 +2943,41 @@ fn finish_bn_boot<L: clob_dispatcher::OrderDispatch>(
              be allowed for one venue and reach another arm",
         ));
     }
+    bind_ledger_rows(d, specs, "Binance instrument")?;
+    info!(
+        instruments = specs.len(),
+        "exec: binance instruments bound in the ledger"
+    );
+    Ok(())
+}
+
+/// **XMM XH4f — slot 6's last boot step**, after `wire_exec_halts`: the
+/// ledger binds the gateway arm's perps as `LAW_LINEAR` rows under the
+/// member's engine ids — the rows the router's perp clamps price (XH2-C,
+/// `CapPerp`, `MaxResting`).
+fn finish_xmm_boot<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    specs: &[exec_router::InstrumentSpec],
+) -> Result<(), String> {
+    bind_ledger_rows(d, specs, "xmm perp")?;
+    info!(
+        instruments = specs.len(),
+        "exec: xmm perps bound in the ledger"
+    );
+    Ok(())
+}
+
+/// Bind an arm's instrument rows in the ledger, every one or the boot
+/// stops (BX6 obligation 7; XMM XH4f).
+fn bind_ledger_rows<L: clob_dispatcher::OrderDispatch>(
+    d: &mut exec_router::RoutedDispatcher<clob_dispatcher::PaperDispatcher, L>,
+    specs: &[exec_router::InstrumentSpec],
+    what: &str,
+) -> Result<(), String> {
     for spec in specs {
         d.bind_instrument(spec)
-            .map_err(|e| format!("the ledger refused Binance instrument {}: {e:?}", spec.sym))?;
+            .map_err(|e| format!("the ledger refused {what} {}: {e:?}", spec.sym))?;
     }
-    info!(instruments = specs.len(), "exec: binance instruments bound in the ledger");
     Ok(())
 }
 
@@ -3603,6 +3780,7 @@ fn run(args: RunArgs) -> ExitCode {
         cli::ExecObs {
             modes: m,
             binance: b.binance_slot().is_some(),
+            gateway: b.gateway_live().is_some(),
         }
     });
     // BX6: a live slot names binance — its arm reads the marks (O-BX29).
@@ -3640,10 +3818,16 @@ fn run(args: RunArgs) -> ExitCode {
         .latency_dump_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("{}/latency", cfg.log_dir)));
-    let obs = obs.with_latency_dump(LatencyDump::from_secs(
+    let mut obs = obs.with_latency_dump(LatencyDump::from_secs(
         latency_dump_dir.clone(),
         args.latency_dump_secs,
     ));
+    // XMM XH4f (D11): slot 6's gateway-arm tell, when slot 6 is live on the
+    // gateway.
+    obs.xmm_gateway_tell = exec_boot
+        .as_ref()
+        .filter(|b| b.gateway_live().is_some())
+        .map(|b| cli::xmm_live::shutdown_tell_path(&b.path));
     if args.latency_dump_secs > 0 {
         info!(
             secs = args.latency_dump_secs,
@@ -4044,9 +4228,13 @@ fn run(args: RunArgs) -> ExitCode {
             hl_families,
             statuses.hl_roll.clone(),
             hl_wall_anchor,
-            // HC11: slot 7 reads each underlying's oracle off the MARK.
+            // HC11: slot 7 reads each underlying's oracle off the MARK;
+            // XMM XH4f: the router prices slot 6's perps off it (XH2-C).
             strategy_set::mask_for_name(&args.strategy)
-                .is_some_and(|m| m & strategy_set::BIT_HCV != 0),
+                .is_some_and(|m| m & strategy_set::BIT_HCV != 0)
+                || exec_boot
+                    .as_ref()
+                    .is_some_and(|b| b.gateway_live().is_some()),
             stale_after_ms[core_types::VenueId::Hyperliquid as usize],
             hl_prod,
             hl_event_prod,
@@ -4594,6 +4782,9 @@ fn run(args: RunArgs) -> ExitCode {
         return ExitCode::from(1);
     }
     let strategy_choice = args.strategy.as_str();
+    // XMM XH4f: slot 6's gateway thread's owner — set when its arm boots,
+    // released after the loop (or on a boot abort past that point).
+    let mut xmm_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
@@ -5113,8 +5304,63 @@ fn run(args: RunArgs) -> ExitCode {
                     // the slot's own Hyperliquid account, authorised only
                     // by all three switches (checked above, and again by
                     // `MainnetAuthority::armed_engine`).
+                    // **XMM XH4h S3 — one nonce stream per agent address**:
+                    // every Hyperliquid signer below asks for its agent's
+                    // stream before its first signed action.
+                    let mut nonces = exec_hyperliquid::NonceStreams::new();
+                    // **XMM XH4h-2 — the hedge-coin overlap rule**, before
+                    // any arm boots: no perp slot 6's gateway binds may be
+                    // another LIVE member's perp (a paper member is no
+                    // claim — dead while D2 keeps slot 6 alone).
+                    if let (Some(_), Some(xb)) = (eb.gateway_live(), xmm_boot.as_ref()) {
+                        let live = |slot: u8| eb.live_mask & (1u8 << slot) != 0;
+                        let n = usize::from(xb.params.n_perps).min(xb.coins.len());
+                        let bound: Vec<(&str, core_types::SymbolId)> = xb.coins[..n]
+                            .iter()
+                            .zip(xb.params.perps[..n].iter())
+                            .map(|(c, p)| (*c, p.hl_sym))
+                            .collect();
+                        let hyparb_perps: Vec<core_types::SymbolId> = hyparb_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_HYPARB))
+                            .map(|b| {
+                                b.params.coins[..b.params.n_coins]
+                                    .iter()
+                                    .map(|c| c.perp_sym)
+                                    .filter(|s| *s != core_types::SYMBOL_ID_NONE)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let hcv_perps: Vec<core_types::SymbolId> = hcv_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_HCV))
+                            .map(|b| b.params.und.iter().map(|u| u.hedge_sym).collect())
+                            .unwrap_or_default();
+                        let vrp_hedge: Vec<core_types::SymbolId> = vrp_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_VRP))
+                            .map(|b| vec![b.hedge_sym])
+                            .unwrap_or_default();
+                        if let Err(reason) = cli::xmm_live::check_perp_overlap(
+                            &bound,
+                            &[
+                                (strategy_set::SLOT_HYPARB, "hyparb", &hyparb_perps),
+                                (strategy_set::SLOT_VRP, "vrp", &vrp_hedge),
+                                (strategy_set::SLOT_HCV, "hcv", &hcv_perps),
+                            ],
+                        ) {
+                            error!(%reason, "xmm: the hedge-coin overlap rule refused the boot");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
                     let hyparb_live = if eb.hyparb_live() {
-                        match boot_hyparb_live_arm(&eb, hyparb_boot.as_ref(), &boot.allocated) {
+                        match boot_hyparb_live_arm(
+                            &eb,
+                            hyparb_boot.as_ref(),
+                            &boot.allocated,
+                            &mut nonces,
+                        ) {
                             Ok(b) => {
                                 warn!("{}", b.tell);
                                 obs.hyparb_live_status = Some(b.arm.shared().clone());
@@ -5140,7 +5386,8 @@ fn run(args: RunArgs) -> ExitCode {
                             join_reverse(handles);
                             return ExitCode::from(1);
                         };
-                        match boot_operator_hl_arm(&eb, &cfg.hyperliquid_ws_host, f3p) {
+                        match boot_operator_hl_arm(&eb, &cfg.hyperliquid_ws_host, f3p, &mut nonces)
+                        {
                             Ok(a) => Some(a),
                             Err(reason) => {
                                 error!(reason, "exec: hyperliquid arm refused — boot aborted");
@@ -5210,9 +5457,53 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         None
                     };
+                    // **XMM XH4f — slot 6's own arm, the Hyperliquid
+                    // gateway** (TESTNET until XH5): the member's perps
+                    // bound from the exchange host's meta, their leverage
+                    // set before it takes orders, its thread released only
+                    // after the loop (the arm's shutdown pumps it in the
+                    // drain). `resolve` made it the engine's only live
+                    // slot (D2); it draws from its agent's nonce stream
+                    // (XH4h S3). Booted last: no refusal after it but the
+                    // shapes' own.
+                    let xmm_arm = if eb.gateway_live().is_some() {
+                        let spec = cli::xmm_live::XmmSpec {
+                            eb: &eb,
+                            xmm: xmm_boot.as_ref(),
+                            md_ws_host: &cfg.hyperliquid_ws_host,
+                        };
+                        match cli::xmm_live::boot_xmm_arm(
+                            &spec,
+                            TlsTransport::default_client_config(),
+                            &mut nonces,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                xmm_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some((b.arm, b.specs))
+                            }
+                            Err(reason) => {
+                                error!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if nonces.signers() != 0 {
+                        info!(
+                            agents = nonces.agents(),
+                            signers = nonces.signers(),
+                            "exec: Hyperliquid nonce streams — one per agent address (XMM XH4h \
+                             S3): every signer of one agent draws from one stream"
+                        );
+                    }
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
-                    // the loop from its own arm — enumerated, eight (O-BX30);
+                    // the loop from its own arm — enumerated, eight (O-BX30),
+                    // and XMM XH4f's two with slot 6 outermost (`SlotSplit`);
                     // the halt wiring is one generic helper. Nothing armed
                     // keeps the refusing stub, so LAW E-1 stays true by
                     // construction. A Binance shape splits by route venue
@@ -5240,25 +5531,66 @@ fn run(args: RunArgs) -> ExitCode {
                             )
                         }};
                     }
+                    // A refusal past the arms' boot: slot 6's gateway (if
+                    // any) is released first, so the join never waits out
+                    // its grace.
+                    macro_rules! abort_boot {
+                        ($($log:tt)*) => {{
+                            error!($($log)*);
+                            if let Some(s) = &xmm_stop {
+                                s.release();
+                            }
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }};
+                    }
                     macro_rules! finish_bn {
                         ($d:expr, $split_aliases:expr, $specs:expr) => {
                             if let Err(reason) = finish_bn_boot(&mut $d, $split_aliases, &$specs) {
-                                error!(%reason, "exec: binance arm refused — boot aborted");
-                                join_reverse(handles);
-                                return ExitCode::from(1);
+                                abort_boot!(%reason, "exec: binance arm refused — boot aborted");
+                            }
+                        };
+                    }
+                    macro_rules! finish_xmm {
+                        ($d:expr, $specs:expr) => {
+                            if let Err(reason) = finish_xmm_boot(&mut $d, &$specs) {
+                                abort_boot!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
                             }
                         };
                     }
                     const REAL: &str = "running strategy-set with LIVE slots — real orders will be \
                                         submitted";
-                    match (hl_arm, bn_arm, hyparb_live) {
-                        (Some(arm), None, None) => {
+                    match (hl_arm, bn_arm, hyparb_live, xmm_arm) {
+                        // XMM XH4f: slot 6 on its own arm, outermost.
+                        (None, None, None, Some((xmm, xspecs))) => {
+                            let split = exec_router::SlotSplit::new(
+                                cli::exec_boot::XMM_SLOT as u8,
+                                exec_router::NullLiveDispatcher::new(),
+                                xmm,
+                            );
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            finish_xmm!(d, xspecs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with slot 6 LIVE on the Hyperliquid gateway \
+                                 (TESTNET) — real testnet orders will be submitted"
+                            )
+                        }
+                        // `exec_boot::resolve` refuses slot 6's gateway beside
+                        // any other live slot (XH4h shares the nonce; D2's
+                        // global halt): refused here too, never composed.
+                        (_, _, _, Some(_)) => abort_boot!(
+                            "exec: slot 6's gateway beside another live arm — boot aborted"
+                        ),
+                        (Some(arm), None, None, None) => {
                             let mut d =
                                 exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
                             wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                             enter_loop!(d, REAL)
                         }
-                        (Some(arm), None, Some(live)) => {
+                        (Some(arm), None, Some(live), None) => {
                             let split =
                                 exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
                             let mut d =
@@ -5270,7 +5602,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  own wallet) — real orders will be submitted"
                             )
                         }
-                        (None, None, Some(live)) => {
+                        (None, None, Some(live), None) => {
                             let split = exec_router::SlotSplit::new(
                                 cli::hyparb_live::SLOT,
                                 exec_router::NullLiveDispatcher::new(),
@@ -5285,7 +5617,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  orders will be submitted"
                             )
                         }
-                        (None, None, None) => {
+                        (None, None, None, None) => {
                             // Nothing armed: the refusing stub, so a live
                             // slot on a venue with no arm cannot exist here
                             // (already refused by `exec_boot::resolve`).
@@ -5309,7 +5641,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  armed) — no orders will be submitted"
                             )
                         }
-                        (None, Some((bn, specs)), None) => {
+                        (None, Some((bn, specs)), None, None) => {
                             let split = exec_router::VenueSplit::new(
                                 bn_venue,
                                 exec_router::NullLiveDispatcher::new(),
@@ -5323,7 +5655,7 @@ fn run(args: RunArgs) -> ExitCode {
                             finish_bn!(d, split_aliases, specs);
                             enter_loop!(d, REAL)
                         }
-                        (Some(arm), Some((bn, specs)), None) => {
+                        (Some(arm), Some((bn, specs)), None, None) => {
                             let split =
                                 exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
                             let mut d =
@@ -5337,7 +5669,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  (hyperliquid, binance) — real orders will be submitted"
                             )
                         }
-                        (None, Some((bn, specs)), Some(live)) => {
+                        (None, Some((bn, specs)), Some(live), None) => {
                             let venues = exec_router::VenueSplit::new(
                                 bn_venue,
                                 exec_router::NullLiveDispatcher::new(),
@@ -5357,7 +5689,7 @@ fn run(args: RunArgs) -> ExitCode {
                                  on its own wallet) — real orders will be submitted"
                             )
                         }
-                        (Some(arm), Some((bn, specs)), Some(live)) => {
+                        (Some(arm), Some((bn, specs)), Some(live), None) => {
                             let venues =
                                 exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
                             let split =
@@ -5396,6 +5728,11 @@ fn run(args: RunArgs) -> ExitCode {
     };
 
     // -- Reverse-order join (ingress threads first, then obs) --
+    // XMM XH4f: the loop returned, so slot 6's arm is done with its
+    // gateway (its shutdown ran in the drain): release the thread.
+    if let Some(s) = &xmm_stop {
+        s.release();
+    }
     join_reverse(handles);
     for h in obs_handles.into_iter().rev() {
         let name = h.thread().name().unwrap_or("<obs>").to_string();

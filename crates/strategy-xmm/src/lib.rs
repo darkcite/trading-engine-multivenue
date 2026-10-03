@@ -48,9 +48,10 @@
 #![deny(missing_docs)]
 
 use core_types::{
-    CancelReq, Fill, NsTs, Order, OrderEvent, Price, Qty, Side, Signal, SymbolId, Tick, VenueId,
-    ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REJECTED,
-    ORDER_EVENT_RESTING, SYMBOL_ID_NONE,
+    CancelReq, ExecHealth, Fill, NsTs, Order, OrderEvent, Price, Qty, Side, Signal, SymbolId, Tick,
+    VenueId, EXEC_CONGESTION_BUSY, EXEC_CONGESTION_THROTTLED, ORDER_EVENT_CANCELED,
+    ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REJECTED, ORDER_EVENT_RESTING,
+    SYMBOL_ID_NONE,
 };
 use strategy_core::{Ctx, RegimeGate, Strategy, StrategyCounters, StrategyError, SubmitErr};
 /// The member's counters and per-perp view live in `strategy-core` (the
@@ -108,6 +109,15 @@ const WHY_LEAD: usize = 0;
 const WHY_REQUOTE: usize = 1;
 const WHY_PULL: usize = 2;
 const WHY_EXPIRY: usize = 3;
+/// XH4f (D8): the live path's health — blocked, slow answers, congestion.
+const WHY_BLOCKED: usize = 4;
+const WHY_RTT: usize = 5;
+const WHY_CONGESTION: usize = 6;
+
+/// XH4f (D8): a busy arm's requote floor is `requote_min_ms` times this —
+/// fewer modifies while the rates run hot (fixed: every `xmm.toml` key is
+/// required, and a new one is an operator edit).
+const BUSY_REQUOTE_FACTOR: u64 = 4;
 
 /// One quoted perp: the follower it quotes and the leader it watches.
 #[repr(C)]
@@ -519,6 +529,11 @@ impl XmmStrategy {
                 unmatched: 0,
                 ctx_refused: 0,
                 stuck: 0,
+                blocked_cancels: 0,
+                rtt_cancels: 0,
+                congestion_cancels: 0,
+                health_held: 0,
+                busy_deferred: 0,
             },
             regime_label: core_types::RegimeLabelSet::ANY,
         }
@@ -799,8 +814,9 @@ impl XmmStrategy {
         self.orders_emitted += 1;
     }
 
-    /// Rule 2: the touch left our resting price.
-    fn requote<C: Ctx>(&mut self, k: usize, s: usize, now: NsTs, ctx: &mut C) {
+    /// Rule 2: the touch left our resting price. XH4f (D8): a busy arm
+    /// (`h`) waits four floors between requotes.
+    fn requote<C: Ctx>(&mut self, k: usize, s: usize, now: NsTs, h: ExecHealth, ctx: &mut C) {
         if self.params.sim_parity == 1 {
             self.cancel(k, s, now, WHY_REQUOTE, ctx);
             return;
@@ -809,7 +825,14 @@ impl XmmStrategy {
             let q = &self.inst[k].quotes[s];
             (q.since_ns, q.oid)
         };
-        if now.saturating_sub(since) < self.requote_min_ns {
+        let age = now.saturating_sub(since);
+        if age < self.requote_min_ns {
+            return;
+        }
+        if h.congestion == EXEC_CONGESTION_BUSY
+            && age < self.requote_min_ns.saturating_mul(BUSY_REQUOTE_FACTOR)
+        {
+            self.counters.busy_deferred += 1;
             return;
         }
         let (px, l_sum) = self.touch_and_lead(k, s);
@@ -875,6 +898,9 @@ impl XmmStrategy {
             WHY_LEAD => self.counters.lead_cancels += 1,
             WHY_REQUOTE => self.counters.requote_cancels += 1,
             WHY_EXPIRY => self.counters.expiry_cancels += 1,
+            WHY_BLOCKED => self.counters.blocked_cancels += 1,
+            WHY_RTT => self.counters.rtt_cancels += 1,
+            WHY_CONGESTION => self.counters.congestion_cancels += 1,
             _ => self.counters.pull_cancels += 1,
         }
     }
@@ -889,9 +915,28 @@ impl XmmStrategy {
         }
     }
 
-    fn pull<C: Ctx>(&mut self, k: usize, now: NsTs, ctx: &mut C) {
-        self.cancel(k, BID, now, WHY_PULL, ctx);
-        self.cancel(k, ASK, now, WHY_PULL, ctx);
+    /// Cancel both sides of perp `k`, counted by `why`.
+    fn pull<C: Ctx>(&mut self, k: usize, now: NsTs, why: usize, ctx: &mut C) {
+        self.cancel(k, BID, now, why, ctx);
+        self.cancel(k, ASK, now, why, ctx);
+    }
+
+    /// XH4f (D8): why the live path's health pulls the quotes — blocked
+    /// (a halt, the slot off, the ledger unseeded, the arm not booted, its
+    /// request budget), the venue's answers slower than `rtt_pull_ms`, or
+    /// the arm throttled or rate-limited — or `None`. Paper and replays
+    /// read healthy: never. LEAD cancels are untouched (XH-5).
+    #[inline(always)]
+    fn health_pull(&self, h: ExecHealth) -> Option<usize> {
+        if h.blocked != 0 {
+            Some(WHY_BLOCKED)
+        } else if h.rtt_ms > self.params.rtt_pull_ms {
+            Some(WHY_RTT)
+        } else if h.congestion >= EXEC_CONGESTION_THROTTLED {
+            Some(WHY_CONGESTION)
+        } else {
+            None
+        }
     }
 
     fn on_follower<C: Ctx>(&mut self, k: usize, t: &Tick, now: NsTs, ctx: &mut C) {
@@ -917,7 +962,15 @@ impl XmmStrategy {
             return;
         }
         if self.stale(k, now) {
-            self.pull(k, now, ctx);
+            self.pull(k, now, WHY_PULL, ctx);
+            return;
+        }
+        // XH4f (D8): the live path's health — pull and hold while it says
+        // so.
+        let h = ctx.exec_health();
+        if let Some(why) = self.health_pull(h) {
+            self.pull(k, now, why, ctx);
+            self.counters.health_held += 1;
             return;
         }
         if bid <= 0 || ask <= 0 || bid >= ask {
@@ -932,7 +985,7 @@ impl XmmStrategy {
             let touch = if s == BID { bid } else { ask };
             match state {
                 ST_IDLE => self.try_place(k, s, now, ctx),
-                ST_RESTING if px != touch => self.requote(k, s, now, ctx),
+                ST_RESTING if px != touch => self.requote(k, s, now, h, ctx),
                 _ => {}
             }
             s += 1;
@@ -945,7 +998,7 @@ impl XmmStrategy {
             // feed a strategy signal"): it refreshes nothing, and pulls.
             self.inst[k].l_stale = true;
             if self.maker_on() {
-                self.pull(k, now, ctx);
+                self.pull(k, now, WHY_PULL, ctx);
             }
             return;
         }
@@ -1192,10 +1245,14 @@ impl Strategy for XmmStrategy {
             return;
         }
         let rest_limit = self.lifetime_ns.saturating_add(XMM_STUCK_NS);
+        // XH4f (D8): a quiet follower still pulls on the health word.
+        let health = self.health_pull(ctx.exec_health());
         let mut k = 0usize;
         while k < self.n() {
             if self.stale(k, now_ns) {
-                self.pull(k, now_ns, ctx);
+                self.pull(k, now_ns, WHY_PULL, ctx);
+            } else if let Some(why) = health {
+                self.pull(k, now_ns, why, ctx);
             }
             let mut s = 0usize;
             while s < 2 {
@@ -1310,6 +1367,8 @@ mod tests {
         refuse_modify: bool,
         /// The venue has already ended every order a modify names.
         gone: bool,
+        /// XH4f: the live path's health word the ctx answers.
+        health: ExecHealth,
     }
 
     impl Ctx for Rec {
@@ -1339,6 +1398,9 @@ mod tests {
         }
         fn now_ns(&self) -> NsTs {
             self.now
+        }
+        fn exec_health(&self) -> ExecHealth {
+            self.health
         }
     }
 
@@ -1690,6 +1752,72 @@ mod tests {
         assert_eq!(s.quote_states(0), (ST_IDLE, ST_IDLE));
         // The pulls, then a best-effort cancel for each released order.
         assert_eq!(c.cancels.iter().filter(|r| r.as_record().verb == ORDER_VERB_CANCEL).count(), 4);
+    }
+
+    /// XH4f (D8): a blocked live path pulls both sides and holds —
+    /// nothing placed while it says so; healthy again, the member quotes.
+    #[test]
+    fn a_blocked_live_path_pulls_both_sides_and_holds() {
+        let (mut s, mut c) = started(&valid());
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        assert_eq!(c.placed.len(), 2);
+        let (bid, ask) = (c.placed[0].client_oid, c.placed[1].client_oid);
+        s.on_order_event(&event(bid, ORDER_EVENT_RESTING, 0), &mut c);
+        s.on_order_event(&event(ask, ORDER_EVENT_RESTING, 0), &mut c);
+        c.health = ExecHealth::new(core_types::EXEC_BLOCKED_HALTED, 0, 0);
+        c.now += 10 * MS;
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        assert_eq!(c.cancels.len(), 2);
+        assert_eq!(
+            (s.counters().blocked_cancels, s.counters().health_held),
+            (2, 1)
+        );
+        let done = ORDER_EVENT_REASON_CANCEL_REQUESTED;
+        s.on_order_event(&event(bid, ORDER_EVENT_CANCELED, done), &mut c);
+        s.on_order_event(&event(ask, ORDER_EVENT_CANCELED, done), &mut c);
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        assert_eq!(c.placed.len(), 2, "held while blocked");
+        assert_eq!(s.counters().health_held, 2);
+        assert_eq!(s.counters().pull_cancels, 0, "not a stale-feed pull");
+        c.health = ExecHealth::HEALTHY;
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        assert_eq!(c.placed.len(), 4, "healthy again: both sides quoted");
+    }
+
+    /// XH4f (D8): a busy arm requotes four floors apart (the deferrals
+    /// counted); answers slower than `rtt_pull_ms` pull (at it, not); a
+    /// throttled arm pulls on the timer's pass too.
+    #[test]
+    fn a_busy_arm_requotes_four_floors_apart_and_slow_or_throttled_ones_pull() {
+        let lead = tick(BN, 99_990_000, 100_010_000);
+        let up = tick(HL, 100_005_000, ASK_PX);
+        let (mut s, mut c) = started(&valid());
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        let bid = c.placed[0].client_oid;
+        s.on_order_event(&event(bid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.health = ExecHealth::new(0, EXEC_CONGESTION_BUSY, 0);
+        c.now += 300 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&up, &mut c);
+        assert!(c.modifies.is_empty(), "300 ms: past the floor, under four");
+        assert_eq!(s.counters().busy_deferred, 1);
+        c.now += 750 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&up, &mut c);
+        assert_eq!(c.modifies.len(), 1, "1 050 ms: past four floors");
+        c.health = ExecHealth::new(0, 0, 1_500);
+        s.on_tick(&up, &mut c);
+        assert_eq!(s.counters().rtt_cancels, 0, "at rtt_pull_ms: no pull");
+        c.health = ExecHealth::new(0, 0, 1_501);
+        s.on_tick(&up, &mut c);
+        assert_eq!(s.counters().rtt_cancels, 2);
+
+        let (mut s, mut c) = started(&valid());
+        s.on_tick(&tick(HL, BID_PX, ASK_PX), &mut c);
+        c.health = ExecHealth::new(0, EXEC_CONGESTION_THROTTLED, 0);
+        s.on_timer(c.now, &mut c);
+        assert_eq!(s.counters().congestion_cancels, 2);
+        assert_eq!(s.counters().health_held, 0, "the timer holds no update");
     }
 
     #[test]

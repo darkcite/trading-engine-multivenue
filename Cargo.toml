@@ -72,6 +72,9 @@ members = [
     "crates/clob-dispatcher",
     "crates/exec-router",
     "crates/exec-hyperliquid",
+    # XMM XH4a (O-XH13): the venue-agnostic order-gateway kit — used by
+    # the Hyperliquid gateway (XH4b), meant for MEXC (XM2); BX6 built its own
+    "crates/exec-gateway",
     # HC9 (O-HC19): the Hypercall order arm — operator verbs only until
     # slot 7's live-arming ruling (plan hc9-hc11 §1)
     "crates/exec-hypercall",
@@ -232,6 +235,7 @@ strategy-xsd          = { path = "crates/strategy-xsd" }
 clob-dispatcher = { path = "crates/clob-dispatcher" }
 exec-router     = { path = "crates/exec-router" }
 exec-hyperliquid = { path = "crates/exec-hyperliquid" }
+exec-gateway     = { path = "crates/exec-gateway" }
 exec-hypercall  = { path = "crates/exec-hypercall" }
 signer-eip712   = { path = "crates/signer-eip712" }
 signer-evm      = { path = "crates/signer-evm" }

@@ -51,6 +51,11 @@
 //! | `…"statuses":["success"]` | cancel accepted |
 //! | `…"statuses":[{"error":"<msg>"}]` | THIS item refused |
 
+use core_parse::skip_ws;
+
+use crate::event::reason_of_error;
+use crate::json::{decimal_field, object_end, string_field, u64_field};
+
 /// Why a response could not be understood.
 // `#[repr(...)]` on every wire-adjacent POD, matching `action.rs`'s
 // `OrderWire`/`CancelWire`/`Tif`: a deterministic layout is the house
@@ -157,6 +162,21 @@ impl HlOk {
         self.errors == 0 && self.statuses > 0
     }
 
+    /// The `{"type":"default"}` acceptance, and only it: one status and
+    /// no item of any kind. The one acceptance an action without items
+    /// has (XH4c: `updateLeverage`, `scheduleCancel`, `noop`) — a reply
+    /// with items does not fit such a post.
+    #[inline]
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.statuses == 1
+            && self.errors == 0
+            && self.oid == 0
+            && !self.any_filled
+            && !self.any_resting
+            && !self.any_success
+    }
+
     /// Every error item was an IoC miss and nothing rested or filled:
     /// the venue processed the order and it did not trade. Distinct
     /// from [`Self::accepted`] (nothing traded) and from a refusal
@@ -190,7 +210,7 @@ pub enum HlResponse {
 
 /// Find `needle` in `hay` starting at `from`.
 #[inline]
-fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
@@ -207,7 +227,7 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 /// Step over whitespace and a single `:`.
 #[inline]
-fn after_colon(buf: &[u8], mut i: usize) -> Option<usize> {
+pub(crate) fn after_colon(buf: &[u8], mut i: usize) -> Option<usize> {
     while i < buf.len() && (buf[i] == b' ' || buf[i] == b'\t') {
         i += 1;
     }
@@ -227,7 +247,7 @@ fn after_colon(buf: &[u8], mut i: usize) -> Option<usize> {
 /// Escapes are not decoded — the span is raw. That is deliberate: the
 /// only consumer is a log line, and decoding would need a buffer.
 #[inline]
-fn read_string(buf: &[u8], i: usize) -> Option<(Span, usize)> {
+pub(crate) fn read_string(buf: &[u8], i: usize) -> Option<(Span, usize)> {
     if i >= buf.len() || buf[i] != b'"' {
         return None;
     }
@@ -386,6 +406,209 @@ pub fn scan(body: &[u8]) -> Result<HlResponse, ScanErr> {
         return Err(ScanErr::Malformed);
     }
     Ok(HlResponse::Ok(out))
+}
+
+/// A reply item: the order rests (`oid`).
+pub const ITEM_RESTING: u8 = 1;
+/// A reply item: the order traded (`oid`, total size, average price).
+pub const ITEM_FILLED: u8 = 2;
+/// A reply item: the bare `"success"` (a cancel).
+pub const ITEM_SUCCESS: u8 = 3;
+/// A reply item: `{"error":…}` (`reason`, `msg`).
+pub const ITEM_ERROR: u8 = 4;
+
+/// One entry of a reply's `statuses`, in place (XH4b): the i-th entry
+/// answers the i-th item of the action, so a coalesced post maps back
+/// to its commands exactly.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct ItemStatus {
+    /// `ITEM_*`.
+    pub kind: u8,
+    /// [`ITEM_ERROR`]: the reason, by the venue's wording
+    /// ([`crate::event::reason_of_error`]).
+    pub reason: u8,
+    /// Venue order id ([`ITEM_RESTING`], [`ITEM_FILLED`]).
+    pub oid: u64,
+    /// [`ITEM_FILLED`]: total size, 1e8.
+    pub total_sz_1e8: i64,
+    /// [`ITEM_FILLED`]: average price, 1e8.
+    pub avg_px_1e8: i64,
+    /// [`ITEM_ERROR`]: the message, relative to the scanned body.
+    pub msg: Span,
+}
+
+/// What a reply said, item by item.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ItemsReply {
+    /// `{"status":"ok",…}`: `out[..n]` holds the statuses in item order.
+    Items(usize),
+    /// `{"status":"err","response":"<msg>"}`: the whole action refused.
+    Refused {
+        /// The reason, by the venue's wording.
+        reason: u8,
+        /// The message, relative to the scanned body.
+        msg: Span,
+    },
+}
+
+/// Scan an `/exchange` reply ITEM BY ITEM — the per-item twin of
+/// [`scan`], which aggregates and stays the blocking arm's. Nothing is
+/// copied: spans index into `body`.
+///
+/// # Errors
+/// A shape this scanner does not know — an unknown entry, an entry
+/// without its `oid`, an empty or unterminated `statuses`, more entries
+/// than `out` holds. **Never an acceptance, and never a rejection
+/// either:** the caller cannot know what the venue did (LAW E-5, "sent,
+/// unanswered").
+pub fn scan_items(body: &[u8], out: &mut [ItemStatus]) -> Result<ItemsReply, ScanErr> {
+    let (status, _) = string_value(body, b"\"status\"", 0).ok_or(ScanErr::Malformed)?;
+    let status = status.of(body);
+    if status == b"err" {
+        let msg = string_value(body, b"\"response\"", 0)
+            .map(|(s, _)| s)
+            .unwrap_or_default();
+        return Ok(ItemsReply::Refused {
+            reason: reason_of_error(msg.of(body)),
+            msg,
+        });
+    }
+    if status != b"ok" {
+        return Err(ScanErr::Malformed);
+    }
+    let sts = find(body, b"\"statuses\"", 0).ok_or(ScanErr::Malformed)?;
+    let mut i = after_colon(body, sts + b"\"statuses\"".len()).ok_or(ScanErr::Malformed)?;
+    if i >= body.len() || body[i] != b'[' {
+        return Err(ScanErr::Malformed);
+    }
+    i += 1;
+    let mut n = 0usize;
+    let mut want_value = true;
+    loop {
+        i = skip_ws(body, i);
+        if i >= body.len() {
+            return Err(ScanErr::Malformed);
+        }
+        match body[i] {
+            // `[]`, or a trailing comma, answers nothing.
+            b']' if want_value => return Err(ScanErr::Malformed),
+            b']' => return Ok(ItemsReply::Items(n)),
+            b',' if want_value => return Err(ScanErr::Malformed),
+            b',' => {
+                want_value = true;
+                i += 1;
+            }
+            _ if !want_value || n >= out.len() => return Err(ScanErr::Malformed),
+            _ => {
+                let (item, next) = scan_item(body, i)?;
+                out[n] = item;
+                n += 1;
+                want_value = false;
+                i = next;
+            }
+        }
+    }
+}
+
+/// One `statuses` entry starting at `i`: the item and the index just
+/// past it.
+fn scan_item(body: &[u8], i: usize) -> Result<(ItemStatus, usize), ScanErr> {
+    let mut item = ItemStatus::default();
+    if body[i] == b'"' {
+        let (word, next) = read_string(body, i).ok_or(ScanErr::Malformed)?;
+        if word.of(body) != b"success" {
+            return Err(ScanErr::Malformed);
+        }
+        item.kind = ITEM_SUCCESS;
+        return Ok((item, next));
+    }
+    if body[i] != b'{' {
+        return Err(ScanErr::Malformed);
+    }
+    let end = object_end(body, i).ok_or(ScanErr::Malformed)?;
+    let obj = &body[i..end];
+    let (key, _) = read_string(obj, skip_ws(obj, 1)).ok_or(ScanErr::Malformed)?;
+    match key.of(obj) {
+        b"resting" => {
+            item.kind = ITEM_RESTING;
+            item.oid = u64_field(obj, b"\"oid\"").ok_or(ScanErr::Malformed)?;
+        }
+        b"filled" => {
+            item.kind = ITEM_FILLED;
+            item.oid = u64_field(obj, b"\"oid\"").ok_or(ScanErr::Malformed)?;
+            item.total_sz_1e8 = decimal_field(obj, b"\"totalSz\"").ok_or(ScanErr::Malformed)?;
+            item.avg_px_1e8 = decimal_field(obj, b"\"avgPx\"").ok_or(ScanErr::Malformed)?;
+        }
+        b"error" => {
+            let m = string_field(obj, b"\"error\"").ok_or(ScanErr::Malformed)?;
+            item.kind = ITEM_ERROR;
+            item.msg = Span {
+                start: m.start + i as u32,
+                end: m.end + i as u32,
+            };
+            item.reason = reason_of_error(item.msg.of(body));
+        }
+        _ => return Err(ScanErr::Malformed),
+    }
+    Ok((item, end))
+}
+
+#[cfg(test)]
+mod item_tests {
+    use super::*;
+    use crate::event::{REASON_NOT_FOUND, REASON_RATE_LIMIT};
+    use core_types::ORDER_EVENT_REASON_BAD_ALO_PX;
+
+    #[test]
+    fn a_coalesced_order_reply_maps_item_by_item() {
+        let body = br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":77,"cloid":"0x4d56060000000000000000000000002a"}},{"filled":{"totalSz":"0.02","avgPx":"1891.4","oid":78}},{"error":"Post only order would have immediately matched, bbo was 1.0@1.1. asset=0"}]}}}"#;
+        let mut out = [ItemStatus::default(); 4];
+        assert_eq!(scan_items(body, &mut out), Ok(ItemsReply::Items(3)));
+        assert_eq!((out[0].kind, out[0].oid), (ITEM_RESTING, 77));
+        assert_eq!((out[1].kind, out[1].oid), (ITEM_FILLED, 78));
+        assert_eq!(out[1].total_sz_1e8, 2_000_000);
+        assert_eq!(out[1].avg_px_1e8, 189_140_000_000);
+        assert_eq!(out[2].kind, ITEM_ERROR);
+        assert_eq!(out[2].reason, ORDER_EVENT_REASON_BAD_ALO_PX);
+        assert!(out[2].msg.of(body).starts_with(b"Post only order"));
+    }
+
+    #[test]
+    fn a_cancel_reply_and_a_refusal() {
+        let body = br#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success", {"error":"Order was never placed, already canceled, or filled. asset=3"}]}}}"#;
+        let mut out = [ItemStatus::default(); 2];
+        assert_eq!(scan_items(body, &mut out), Ok(ItemsReply::Items(2)));
+        assert_eq!(out[0].kind, ITEM_SUCCESS);
+        assert_eq!((out[1].kind, out[1].reason), (ITEM_ERROR, REASON_NOT_FOUND));
+        let err = br#"{"status":"err","response":"Too many cumulative requests sent (1301 > 1200)"}"#;
+        let Ok(ItemsReply::Refused { reason, msg }) = scan_items(err, &mut out) else {
+            panic!("not a refusal");
+        };
+        assert_eq!(reason, REASON_RATE_LIMIT);
+        assert!(msg.of(err).starts_with(b"Too many"));
+    }
+
+    #[test]
+    fn every_unknown_shape_is_malformed_never_an_answer() {
+        let mut out = [ItemStatus::default(); 1];
+        let cases: [&[u8]; 9] = [
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[]}}}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":1}},]}}}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":["waiting"]}}}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"queued":{"oid":1}}]}}}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"cloid":"0x00"}}]}}}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":1}},{"resting":{"oid":2}}]}}}"#,
+            br#"{"status":"maybe","response":{}}"#,
+            br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":1}}"#,
+            br#"{"status":"ok","response":{"type":"default"}}"#,
+        ];
+        let mut i = 0usize;
+        while i < cases.len() {
+            assert_eq!(scan_items(cases[i], &mut out), Err(ScanErr::Malformed), "case {i}");
+            i += 1;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +780,14 @@ mod tests {
         };
         assert!(o.accepted());
         assert_eq!(o.oid, 0);
+        assert!(o.is_default());
+        // XH4c: a control action's acceptance is THIS shape and no other.
+        for b in [RESTING, FILLED, ITEM_ERR, IOC_MISS, CANCEL_OK, CANCEL_ERR] {
+            let HlResponse::Ok(o) = scan(b).unwrap() else {
+                panic!()
+            };
+            assert!(!o.is_default(), "{o:?}");
+        }
     }
 
     #[test]

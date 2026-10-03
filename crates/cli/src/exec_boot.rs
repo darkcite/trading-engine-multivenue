@@ -41,7 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
-use exec_router::{ExecMode, ExecRoute, HaltLimits, SlotCaps, EXEC_SLOTS};
+use exec_router::{ExecMode, ExecRoute, HaltLimits, PerpLimits, SlotCaps, EXEC_SLOTS};
 
 /// **E6 — the mirrored constants, held in agreement.**
 ///
@@ -69,6 +69,12 @@ const _: () = assert!(
     core_config::exec::MAX_OPEN_ORDERS_PER_SLOT
         == exec_router::LEDGER_RESTING / EXEC_SLOTS,
     "the per-slot open-order share no longer divides the resting table"
+);
+/// XMM XH4f: the gateway slot's floor the parser demands is the one the
+/// gateway arm accepts (`ArmErr::Budget` below it).
+const _: () = assert!(
+    core_config::exec::GATEWAY_BUDGET_FLOOR_MIN as u64 == exec_hyperliquid::arm::MIN_BUDGET_FLOOR,
+    "core_config::exec::GATEWAY_BUDGET_FLOOR_MIN is out of step with the gateway arm's floor"
 );
 use tracing::info;
 
@@ -120,11 +126,12 @@ pub const PNL_JUDGING_VENUES: &[u8] = &[
 /// hedge without its AMM leg, is a one-legged arb.
 pub const HYPEREVM_SLOT: usize = 0;
 
-/// XMM XH1: slot 6 (`xmm`) has NO live arm of its own until XH4 gives it
-/// its own Hyperliquid master account and gateway (rulings O-XH3,
-/// O-XH7). Until then a live slot 6 refuses the boot: armed today it
-/// would share slot 3's Hyperliquid arm, where a slot-6 halt's
-/// venue-wide cancel would pull bin15's quotes.
+/// XMM: slot 6 (`xmm`) is live only on its own arm, the Hyperliquid
+/// gateway (`transport = "gateway"`, XH4f, deviation 10) — never on the
+/// operator's blocking arm, where its requests would spend slot 3's
+/// address and its sweeps reach slot 3's orders — and the gateway is
+/// slot 6's alone in an engine (XH4h-3: slot 0's hedges run on it in the
+/// HYPARB rehearsal on testnet; slot 3 waits for XH4i's outcome arm).
 pub const XMM_SLOT: usize = strategy_set::SLOT_XMM as usize;
 
 /// HC11 (O-HC18): slot 7 (`hcv`) is built DARK — paper only. A live slot
@@ -190,6 +197,21 @@ impl ExecBoot {
         self.live_mask & (1 << HYPEREVM_SLOT) != 0
     }
 
+    /// XMM XH4f: does slot `slot` name the gateway transport?
+    #[must_use]
+    pub fn gateway_slot(&self, slot: usize) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.slot == slot && s.transport == core_config::exec::TRANSPORT_GATEWAY)
+    }
+
+    /// XMM XH4f: the live slot on the Hyperliquid gateway arm, if one is
+    /// armed (slot 6 only — the boot refuses any other).
+    #[must_use]
+    pub fn gateway_live(&self) -> Option<usize> {
+        (self.live_mask & (1u8 << XMM_SLOT) != 0 && self.gateway_slot(XMM_SLOT)).then_some(XMM_SLOT)
+    }
+
     /// **The operator Hyperliquid arm's address numbers**, `(floor,
     /// topup_weight, topup_day_max)`, from the live slots that arm trades
     /// — the predicate of [`Self::hl_arm_needed`]: every live slot but
@@ -216,6 +238,7 @@ impl ExecBoot {
                 || s.slot >= EXEC_SLOTS
                 || self.live_mask & (1u8 << s.slot) == 0
                 || !self.route.venue_allowed(s.slot as u8, hl)
+                || self.gateway_slot(s.slot)
             {
                 continue;
             }
@@ -250,10 +273,11 @@ impl ExecBoot {
             .find(|&s| self.live_mask & (1u8 << s) != 0 && self.route.venue_allowed(s as u8, bn))
     }
 
-    /// Does a live slot OTHER than slot 0 trade Hyperliquid — i.e. is
-    /// the operator's Hyperliquid arm (`HlExchange` on the
-    /// `HYPERLIQUID_*` account) needed? Slot 0 hedges from its own
-    /// account and never counts here.
+    /// Does a live slot OTHER than slot 0 trade Hyperliquid on the
+    /// blocking transport — i.e. is the operator's Hyperliquid arm
+    /// (`HlExchange` on the `HYPERLIQUID_*` account) needed? Slot 0 hedges
+    /// from its own account and a gateway slot (XMM XH4f) from its own arm:
+    /// neither counts here.
     #[must_use]
     pub fn hl_arm_needed(&self) -> bool {
         let hl = core_types::VenueId::Hyperliquid as u8;
@@ -262,6 +286,7 @@ impl ExecBoot {
             if slot != HYPEREVM_SLOT
                 && self.live_mask & (1u8 << slot) != 0
                 && self.route.venue_allowed(slot as u8, hl)
+                && !self.gateway_slot(slot)
             {
                 return true;
             }
@@ -438,13 +463,27 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
             ));
         }
 
-        // XMM XH1: no live arm for slot 6 before XH4 ([`XMM_SLOT`]).
-        if mode == ExecMode::Live && slot == XMM_SLOT {
+        // XMM XH4f: slot 6 is live only on its own gateway arm, and the
+        // gateway is slot 6's alone ([`XMM_SLOT`]).
+        let gateway = s.transport == core_config::exec::TRANSPORT_GATEWAY;
+        if mode == ExecMode::Live && slot == XMM_SLOT && !gateway {
             return Err(format!(
-                "exec: slot {slot} ({slot_name}) is marked live, but slot {slot} has no live \
-                 arm of its own before XMM XH4 (its own Hyperliquid master account and \
-                 gateway, rulings O-XH3/O-XH7) — refusing rather than arming it on slot 3's \
-                 account, where its halt would cancel bin15's quotes"
+                "exec: slot {slot} ({slot_name}) is marked live on the blocking transport; slot \
+                 {slot} trades only through its own arm, the Hyperliquid gateway — write \
+                 `transport = \"gateway\"` (XMM XH4f), never slot 3's account, where its halt \
+                 would cancel bin15's quotes"
+            ));
+        }
+        // XMM XH4h-3: slot 0's hedges run on the gateway in the HYPARB
+        // rehearsal (testnet) only — the engine's slot 0 is mainnet-only and
+        // the gateway testnet-only until XH5; slot 3 waits for XH4i's
+        // outcome arm.
+        if gateway && slot != XMM_SLOT {
+            return Err(format!(
+                "exec: slot {slot} ({slot_name}) names `transport = \"gateway\"`, which is slot \
+                 {XMM_SLOT}'s alone in an engine: slot 0's hedges run on the gateway only in the \
+                 HYPARB rehearsal on testnet (`evm-live arm-smoke --gateway`, XMM XH4h-3) until \
+                 XH5, and slot 3 waits for the outcome arm (XH4i)"
             ));
         }
 
@@ -537,7 +576,19 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
                 )
                 // E7: the operator's session bound ("run until it
                 // either earns +X or loses Y"); 0/0 = off.
-                .with_pnl_bound(s.halt_on_gain_usd_1e6, s.halt_on_loss_usd_1e6),
+                .with_pnl_bound(s.halt_on_gain_usd_1e6, s.halt_on_loss_usd_1e6)
+                // XMM XH4f (XH-7): the gateway slot's ALO halt, percent
+                // → permille (the parser bounds it at 100); 0 = off.
+                .with_alo_reject_permille(
+                    u16::try_from(s.halt_on_alo_reject_pct * 10).unwrap_or(u16::MAX),
+                ),
+            )
+            .map_err(|e| format!("exec: slot {slot}: {e}"))?;
+        // XMM XH4f (deviation 19): the perp slot's pair — none elsewhere.
+        route
+            .set_perp_limits(
+                slot,
+                PerpLimits::new(s.cap_perp_usd_1e6, s.max_resting_usd_1e6),
             )
             .map_err(|e| format!("exec: slot {slot}: {e}"))?;
         // Keep every parsed number, not just the EIGHT the hot table
@@ -548,7 +599,7 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
     check_binance(&slots, artifact_mask, file.binance.as_ref())?;
     check_pnl_judged(&slots, artifact_mask)?;
 
-    Ok(Some(ExecBoot {
+    let boot = ExecBoot {
         route,
         hash,
         path,
@@ -556,7 +607,9 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         live_mask: artifact_mask,
         slots,
         binance: file.binance,
-    }))
+    };
+    check_gateway_alone(&boot)?;
+    Ok(Some(boot))
 }
 
 /// **BX6** — what this binary's Binance arm can serve: at most one live
@@ -646,6 +699,41 @@ fn check_binance(
                 b.account_mode
             ));
         }
+    }
+    Ok(())
+}
+
+/// **XMM XH4f — a live gateway slot 6 runs alone** (refused before any arm
+/// boots):
+/// - the router's halt cancel-all is global (D2, for Anton): a testnet halt
+///   of slot 6 would pull any other live slot's quotes, and theirs slot 6's
+///   — so until D2 is ruled the gateway slot is its engine's only live slot
+///   (XH4h S3 lifted the rule's other reason, A-XH4f-1: every signer of one
+///   agent address now draws from one nonce stream);
+/// - its session bound could never fire: the gateway arm judges no P&L on
+///   the shared testnet account (XH5 gives slot 6 its own).
+fn check_gateway_alone(boot: &ExecBoot) -> Result<(), String> {
+    let Some(g) = boot.gateway_live() else {
+        return Ok(());
+    };
+    if boot.live_mask != 1u8 << g {
+        return Err(String::from(
+            "exec: slot 6 is live on the Hyperliquid gateway beside another live slot — the \
+             router's halt cancel-all is global (XMM XH4f D2, the operator's to rule): run \
+             slot 6 in an engine of its own, the others paper",
+        ));
+    }
+    if boot
+        .slots
+        .iter()
+        .any(|s| s.slot == g && (s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0))
+    {
+        return Err(String::from(
+            "exec: slot 6 on the Hyperliquid gateway states a session bound \
+             (halt_on_gain/loss_usd_1e6), but the gateway arm judges no P&L on the shared \
+             testnet account — the bound could never fire: drop it (XMM XH5 gives slot 6 its \
+             own account)",
+        ));
     }
     Ok(())
 }
@@ -821,9 +909,29 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         let day = s.map_or(0, |s| s.cap_day_usd_1e6) / 1_000_000;
         let inst = s.map_or(0, |s| s.cap_instance_usd_1e6) / 1_000_000;
         let drift = s.map_or(0, |s| s.halt_on_recon_drift_usd_1e6) / 1_000_000;
+        // XMM XH4f: a gateway slot's transport, perp pair and ALO halt —
+        // only on its lines, so every other slot's lines are unchanged.
+        let gw = boot.gateway_slot(slot);
+        let perp = if gw {
+            format!(
+                " transport=gateway perp=${} resting=${}",
+                s.map_or(0, |s| s.cap_perp_usd_1e6) / 1_000_000,
+                s.map_or(0, |s| s.max_resting_usd_1e6) / 1_000_000,
+            )
+        } else {
+            String::new()
+        };
+        let alo = if gw {
+            format!(
+                " alo_reject_pct={}",
+                s.map_or(0, |s| s.halt_on_alo_reject_pct)
+            )
+        } else {
+            String::new()
+        };
         lines.push(format!(
             "exec: slot {slot} LIVE name={slot_name} venue={venues} \
-             caps-ENFORCED order=${} open={} day=${day} instance=${inst} \
+             caps-ENFORCED order=${} open={} day=${day} instance=${inst}{perp} \
              (the risk gate clamps every live submit and modify; \
              worst case with every quote working = instance + open x order)",
             boot.route.max_order_usd_1e6_at(slot).unwrap_or(0) / 1_000_000,
@@ -856,7 +964,7 @@ pub fn render_boot_tell(boot: &ExecBoot) -> Vec<String> {
         };
         lines.push(format!(
             "exec: slot {slot} HALTS reject_streak={} asset_refusals={} recon_drift=${drift} \
-             recon_stale_ms={} ws_gap_ms={}{hl_budget} \
+             recon_stale_ms={} ws_gap_ms={}{hl_budget}{alo} \
              session_bound=+${gain}/-${loss}{margin} halt_file={}",
             s.map_or(0, |s| s.halt_on_reject_streak),
             s.map_or(0, |s| s.halt_on_asset_refusal_streak),
@@ -1043,22 +1151,163 @@ mod tests {
         d
     }
 
-    /// XMM XH1: a live slot 6 refuses the boot until XH4 gives xmm its
-    /// own arm — even correctly named and agreed by `--arm-live` — while
-    /// a PAPER slot 6 is an ordinary artifact.
+    /// The smallest live gateway slot 6 (XMM XH4f).
+    fn gw_six() -> String {
+        MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.6]")
+            .replace("name = \"bin15\"", "name = \"xmm\"")
+            + "transport = \"gateway\"\ncap_perp_usd_1e6 = 150000000\n\
+               max_resting_usd_1e6 = 300000000\nhalt_on_alo_reject_pct = 20\n"
+    }
+
+    /// XMM XH4f (deviation 10): slot 6 is live only on its own arm, the
+    /// Hyperliquid gateway — never on the operator's blocking arm — and
+    /// the gateway is slot 6's alone. Its clamps reach the route (the perp
+    /// pair, the ALO permille); the operator's arm neither boots for it
+    /// nor counts its floor; both switches still arm it.
     #[test]
-    fn a_live_slot_six_refuses_until_its_own_arm_exists() {
+    fn a_live_slot_six_resolves_only_on_its_gateway_arm() {
         let d = tmp();
-        let six = MINIMAL_LIVE
+        let blocking = MINIMAL_LIVE
             .replace("[exec.slot.3]", "[exec.slot.6]")
             .replace("name = \"bin15\"", "name = \"xmm\"");
-        let p = write(&d, "exec.toml", &six);
-        let e = resolve(Some(&p), Some("6")).expect_err("no live arm for slot 6 before XH4");
-        assert!(e.contains("slot 6 (xmm)") && e.contains("XH4"), "{e}");
-        let paper = six.replacen("mode = \"live\"", "mode = \"paper\"", 1);
+        let p = write(&d, "exec.toml", &blocking);
+        let e = resolve(Some(&p), Some("6")).expect_err("never on the blocking arm");
+        assert!(
+            e.contains("slot 6 (xmm)") && e.contains("transport = \"gateway\""),
+            "{e}"
+        );
+        let p = write(&d, "exec-gw.toml", &gw_six());
+        let boot = resolve(Some(&p), Some("6"))
+            .expect("the gateway resolves")
+            .expect("present");
+        assert_eq!(boot.route.mode_at(XMM_SLOT), Some(ExecMode::Live));
+        assert_eq!(
+            boot.route.perp_at(XMM_SLOT),
+            Some(PerpLimits::new(150_000_000, 300_000_000))
+        );
+        assert_eq!(
+            boot.route.halts_at(XMM_SLOT).map(|h| h.alo_reject_permille),
+            Some(200)
+        );
+        assert_eq!(boot.gateway_live(), Some(XMM_SLOT));
+        assert!(!boot.hl_arm_needed(), "the operator's arm is not slot 6's");
+        assert_eq!(boot.hl_address_numbers(), (0, 0, 0));
+        assert!(
+            resolve(Some(&p), None).is_err(),
+            "the artifact alone arms nothing"
+        );
+        let three = gw_six()
+            .replace("[exec.slot.6]", "[exec.slot.3]")
+            .replace("name = \"xmm\"", "name = \"bin15\"");
+        let p = write(&d, "exec-gw3.toml", &three);
+        let e = resolve(Some(&p), Some("3")).expect_err("slot 3 keeps its blocking arm");
+        assert!(
+            e.contains("slot 6") && e.contains("XH4h-3") && e.contains("XH4i"),
+            "{e}"
+        );
+        let paper = blocking.replacen("mode = \"live\"", "mode = \"paper\"", 1);
         let p = write(&d, "exec-paper.toml", &paper);
-        let boot = resolve(Some(&p), None).expect("a paper slot 6 is fine").expect("present");
+        let boot = resolve(Some(&p), None)
+            .expect("a paper slot 6 is fine")
+            .expect("present");
         assert_eq!(boot.route.mode_at(XMM_SLOT), Some(ExecMode::Paper));
+        assert_eq!(boot.gateway_live(), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// XMM XH4f D2 (XH4h S3 lifted A-XH4f-1, the nonce): while the halt's
+    /// cancel-all is global, a live slot 3 on the operator's arm beside the
+    /// gateway slot refuses the boot — for D2 alone; the same slot 3 paper
+    /// resolves.
+    #[test]
+    fn the_gateway_slot_runs_alone_while_d2_stands() {
+        let d = tmp();
+        let both = format!("{MINIMAL_LIVE}{}", gw_six().replacen("[exec]\n", "", 1));
+        let p = write(&d, "exec.toml", &both);
+        let e = resolve(Some(&p), Some("3,6")).expect_err("another live slot beside it");
+        assert!(
+            e.contains("D2") && e.contains("engine of its own") && !e.contains("nonce"),
+            "{e}"
+        );
+        let p = write(
+            &d,
+            "exec-paper3.toml",
+            &both.replacen("mode = \"live\"", "mode = \"paper\"", 1),
+        );
+        let boot = resolve(Some(&p), Some("6"))
+            .expect("slot 3 paper: the gateway slot is the only live slot")
+            .expect("present");
+        assert_eq!(boot.gateway_live(), Some(XMM_SLOT));
+        assert!(!boot.hl_arm_needed());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// XMM XH4f (risk r1): the gateway slot runs alone — beside a live
+    /// Binance slot the global halt cancel-all (D2) would reach across —
+    /// and states no session bound (the gateway arm judges none on the
+    /// shared testnet account).
+    #[test]
+    fn the_gateway_slot_runs_alone_and_states_no_session_bound() {
+        let d = tmp();
+        let with_bn = format!(
+            "{}{}{BN_SECTION}",
+            bn_live(),
+            gw_six().replacen("[exec]\n", "", 1)
+        );
+        let p = write(&d, "exec-bn.toml", &with_bn);
+        let e = resolve(Some(&p), Some("3,6")).expect_err("a live Binance slot beside it");
+        assert!(e.contains("D2") && e.contains("engine of its own"), "{e}");
+        let bounded = format!("{}halt_on_loss_usd_1e6 = 5000000\n", gw_six());
+        let p = write(&d, "exec-pnl.toml", &bounded);
+        let e = resolve(Some(&p), Some("6")).expect_err("a bound that could never fire");
+        assert!(e.contains("session bound") && e.contains("XH5"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// XMM XH4f: the template's slot-6 section is the recipe for a live
+    /// gateway slot — uncomment its keys, drop the paper line — and it
+    /// resolves under `--arm-live 6`; the tell names the gateway's clamps
+    /// on slot 6's lines alone.
+    #[test]
+    fn the_template_s_slot_six_recipe_resolves_on_the_gateway() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exec.toml.example"),
+        )
+        .expect("exec.toml.example must ship with the repo");
+        let mut six = false;
+        let mut out = String::new();
+        for l in src.lines() {
+            if l.starts_with("[exec.slot.") || l.starts_with("# ---- [exec.") {
+                six = l == "[exec.slot.6]";
+            }
+            if six && l == "mode = \"paper\"" {
+                continue;
+            }
+            out.push_str(if six {
+                l.strip_prefix("# ").unwrap_or(l)
+            } else {
+                l
+            });
+            out.push('\n');
+        }
+        let d = tmp();
+        let p = write(&d, "exec.toml", &out);
+        let boot = resolve(Some(&p), Some("6"))
+            .expect("the slot-6 recipe boots")
+            .expect("present");
+        assert_eq!(boot.gateway_live(), Some(XMM_SLOT));
+        let tell = render_boot_tell(&boot);
+        assert!(
+            tell.iter().any(|l| l.starts_with("exec: slot 6 LIVE")
+                && l.contains("transport=gateway perp=$150 resting=$300")),
+            "{tell:?}"
+        );
+        assert!(
+            tell.iter()
+                .any(|l| l.starts_with("exec: slot 6 HALTS") && l.contains("alo_reject_pct=20")),
+            "{tell:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1481,6 +1730,8 @@ mod tests {
             R::PnlLoss,
             R::VenueLock,
             R::MarginRisk,
+            R::AloRejectRate,
+            R::GatewayHalt,
         ];
         assert_eq!(
             all.len(),

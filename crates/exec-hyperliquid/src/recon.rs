@@ -478,14 +478,33 @@ pub(crate) fn user_info_request(
     master: &[u8; 20],
 ) -> Result<usize, ScanErr> {
     const TAIL: &[u8] = br#""}"#;
-    let n = head.len() + 40 + TAIL.len();
-    if out.len() < n {
+    let i = user_info_open(out, head, master, TAIL.len())?;
+    // COPY: the 2 B closing literal of the render `user_info_open` began,
+    // into the same final body (a literal is written by a copy); rejected:
+    // nothing — this IS the render, once per request.
+    out[i..i + TAIL.len()].copy_from_slice(TAIL);
+    Ok(i + TAIL.len())
+}
+
+/// `<head><40 hex>` into `out` with `room` more bytes free behind it —
+/// the part every per-user request shares. Returns where it ends.
+fn user_info_open(
+    out: &mut [u8],
+    head: &[u8],
+    master: &[u8; 20],
+    room: usize,
+) -> Result<usize, ScanErr> {
+    let n = head.len() + 40;
+    if out.len() < n + room {
         return Err(ScanErr::Malformed);
     }
-    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's
-    // boot-owned body — the RENDER of the `/info` request (once per
-    // reconcile / sweep / boot, ≥ seconds apart); the body must exist
-    // once.
+    // COPY: ≤ 64 B request literal + 40 hex chars into the caller's final
+    // body — the RENDER of the `/info` request, once per request at its
+    // caller's cadence (e.g. the gateway arm's sheet and orders every read
+    // period, its budget every `limit_ms`, a day page a read period apart,
+    // a sweep round's read; the blocking arm's and HYPARB's reads); the
+    // body must exist once. Rejected: nothing — the render's own write
+    // into its final buffer, no staging between.
     out[..head.len()].copy_from_slice(head);
     let mut i = head.len();
     for b in master {
@@ -493,9 +512,66 @@ pub(crate) fn user_info_request(
         out[i + 1] = HEX[usize::from(b & 0x0F)];
         i += 2;
     }
-    // COPY: the 2 B closing literal of the same render.
-    out[i..i + TAIL.len()].copy_from_slice(TAIL);
     Ok(n)
+}
+
+/// **XH4e — the day's fills**: render
+/// `{"type":"userFillsByTime","user":"0x<40 hex>","startTime":<ms>,"endTime":<ms>}`
+/// once, into the caller's buffer, the digits written in place.
+///
+/// # Errors
+/// `out` is shorter than the render.
+pub fn fills_by_time_request(
+    out: &mut [u8],
+    master: &[u8; 20],
+    start_ms: u64,
+    end_ms: u64,
+) -> Result<usize, ScanErr> {
+    const START: &[u8] = br#"","startTime":"#;
+    const END: &[u8] = br#","endTime":"#;
+    let (ds, de) = (digits(start_ms), digits(end_ms));
+    let i = user_info_open(
+        out,
+        crate::dayspend::HEAD,
+        master,
+        START.len() + ds + END.len() + de + 1,
+    )?;
+    // COPY: the 14 B key literal of the render `user_info_open` began, into
+    // the same final body (the digits follow in place, backwards);
+    // rejected: nothing — this IS the render.
+    out[i..i + START.len()].copy_from_slice(START);
+    let i = put_digits(out, i + START.len(), start_ms, ds);
+    // COPY: the 11 B key literal of the same render, into the same final
+    // body; rejected: nothing — this IS the render.
+    out[i..i + END.len()].copy_from_slice(END);
+    let i = put_digits(out, i + END.len(), end_ms, de);
+    out[i] = b'}';
+    Ok(i + 1)
+}
+
+/// The number of decimal digits of `v` (1 for 0) — the day reads' renders
+/// (this module's and `dayspend`'s).
+#[inline]
+pub(crate) const fn digits(mut v: u64) -> usize {
+    let mut n = 1usize;
+    while v >= 10 {
+        v /= 10;
+        n += 1;
+    }
+    n
+}
+
+/// `v`'s `n` decimal digits written at `out[at..at + n]`, backwards, in
+/// place (no staging); returns where they end.
+#[inline]
+pub(crate) fn put_digits(out: &mut [u8], at: usize, mut v: u64, n: usize) -> usize {
+    let mut k = at + n;
+    while k > at {
+        k -= 1;
+        out[k] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    at + n
 }
 
 /// Scan a `frontendOpenOrders` answer.
@@ -717,6 +793,10 @@ pub struct PerpPosition {
     pub coin: Span,
     /// Signed size, coin × 1e8 (negative = short).
     pub szi_1e8: i64,
+    /// `positionValue`: the position at the venue's mark, USD × 1e8 (0
+    /// when the row omits it) — the mark a reconciliation prices its
+    /// drift with (XH4d).
+    pub value_1e8: i64,
 }
 
 /// Scan a `clearinghouseState` body: `marginSummary.accountValue`
@@ -773,6 +853,7 @@ pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, us
         let row = &body[i..end];
         let coin = string_field(row, b"\"coin\"").ok_or(ScanErr::Malformed)?;
         let szi = decimal_field(row, b"\"szi\"").ok_or(ScanErr::Malformed)?;
+        let value = decimal_field(row, b"\"positionValue\"").unwrap_or(0);
         if n >= out.len() {
             return Err(ScanErr::Malformed);
         }
@@ -782,6 +863,7 @@ pub fn scan_perp_state(body: &[u8], out: &mut [PerpPosition]) -> Result<(i64, us
                 end: coin.end + i as u32,
             },
             szi_1e8: szi,
+            value_1e8: value,
         };
         n += 1;
         i = end;
@@ -1400,5 +1482,22 @@ mod tests {
         assert_eq!(drift_qty_to_usd_1e6(i64::MAX), i64::MAX);
         assert_eq!(drift_qty_to_usd_1e6(i64::MIN), i64::MIN);
         assert!(drift_qty_to_usd_1e6(i64::MAX) > 5_000_000, "still halts");
+    }
+
+    /// XH4e: the day read renders its start and end times in place, and a
+    /// buffer one byte short is refused.
+    #[test]
+    fn the_fills_by_time_request_renders_its_start_and_end_in_place() {
+        let mut out = [0u8; 160];
+        let n = fills_by_time_request(&mut out, &[0xAB; 20], 1_790_380_800_000, 1_790_401_234_567)
+            .unwrap();
+        let want = format!(
+            r#"{{"type":"userFillsByTime","user":"0x{}","startTime":1790380800000,"endTime":1790401234567}}"#,
+            "ab".repeat(20)
+        );
+        assert_eq!(&out[..n], want.as_bytes());
+        let n = fills_by_time_request(&mut out, &[0; 20], 0, 9).unwrap();
+        assert!(out[..n].ends_with(br#""startTime":0,"endTime":9}"#));
+        assert!(fills_by_time_request(&mut out[..n - 1], &[0; 20], 0, 9).is_err());
     }
 }

@@ -4390,6 +4390,9 @@ impl Observability {
                 CaptureGaugeIds { io_errors, records }
             };
 
+            // COPY: the registry (147 520 B, pinned in core-metrics) moved
+            // from this stack into its `Arc`, once at boot — rejected: an
+            // unsafe in-place build for a cold one-time move.
             out.metrics = Some(Arc::new(reg));
             out.counter_ids = Some(EngineCounters {
                 ticks,
@@ -4581,6 +4584,10 @@ pub struct ExecObs {
     pub modes: [u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
     /// A live slot names binance.
     pub binance: bool,
+    /// **XMM XH4f** — slot 6 is live on the Hyperliquid gateway: the
+    /// `engine_exec_hlgw_*` family registers (and the router counters its
+    /// marks and retirements move).
+    pub gateway: bool,
 }
 
 /// Optional observability surfaces wired around the engine loop.
@@ -4647,6 +4654,12 @@ pub struct Observability {
     /// by the member at its timer. **Taken** by the engine loop, stopped and
     /// joined before the shutdown's forced write.
     pub hcv_writer: Option<crate::persist::StateWriter>,
+    /// **XMM XH4f (D11)** — where slot 6's gateway arm tells a shutdown that
+    /// reached its bound unconfirmed; `None` = slot 6 is not live on the
+    /// gateway. Set by the binary from the exec artifact; **taken** by the
+    /// engine loop, which reads it back at boot (a gauge and an ERROR line)
+    /// and writes or removes it at shutdown.
+    pub xmm_gateway_tell: Option<std::path::PathBuf>,
     /// HAR H3.5: SHA-256 of the `har.toml` the set was configured from
     /// (all-zero: no HAR service) — `/state.har.hash`.
     pub har_hash: [u8; 32],
@@ -4929,7 +4942,8 @@ pub struct EngineCounters {
 /// E1: the execution router's metric family. Boot-only.
 ///
 /// `core-metrics` registers FIXED names — there is no label mechanism
-/// (`MAX_COUNTERS = 512` since E7 — 256 before —, `MAX_GAUGES = 384`, `NAME_MAX = 63`), so the
+/// (`MAX_COUNTERS = 640` since XMM XH4f — 512 at E7, 256 before —, `MAX_GAUGES = 512` — 384
+/// before XH4f —, `NAME_MAX = 63`), so the
 /// per-slot names are generated as whole strings at boot, one
 /// `register_counter` call each, and never formatted again. The
 /// per-slot family is registered for LIVE slots ONLY: an all-paper
@@ -5028,8 +5042,13 @@ pub struct ExecMetricIds {
     /// which the engine loop relies on.
     pub slots: [Option<ExecSlotMetricIds>; clob_dispatcher::EXEC_COUNTER_SLOTS],
     /// **BX6** — registered with the first boot that can move them (a
-    /// live Binance slot, plan §5 BX3 item 11): `None` otherwise.
+    /// live Binance slot, plan §5 BX3 item 11; XMM XH4f: or slot 6 live on
+    /// the gateway — its marks and its retirements by `why`): `None`
+    /// otherwise.
     pub bn: Option<ExecBnMetricIds>,
+    /// **XMM XH4f (D11)** — slot 6's gateway arm (`engine_exec_hlgw_*`),
+    /// registered only when slot 6 is live on the gateway.
+    pub hlgw: Option<ExecHlgwMetricIds>,
 }
 
 /// **BX6** — the router counters only a Binance boot can move.
@@ -5939,7 +5958,7 @@ fn register_exec_metrics(
                 .map_err(|_| "register exec slot gauge")?,
         });
     }
-    let bn = if spec.binance {
+    let bn = if spec.binance || spec.gateway {
         let mut retired_by = [core_metrics::CounterId::default(); RETIRED_METRIC_NAMES.len()];
         for (i, name) in RETIRED_METRIC_NAMES.iter().enumerate() {
             retired_by[i] = reg.register_counter(name).map_err(|_| "register exec retired")?;
@@ -5959,8 +5978,14 @@ fn register_exec_metrics(
     } else {
         None
     };
+    let hlgw = if spec.gateway {
+        Some(register_hlgw_metrics(reg)?)
+    } else {
+        None
+    };
     Ok(ExecMetricIds {
         bn,
+        hlgw,
         configured,
         live_submits,
         paper_submits,
@@ -6083,6 +6108,353 @@ fn mirror_exec_metrics(
             .inc(cur.refused_by_slot[s].saturating_sub(last.refused_by_slot[s]));
     }
     *last = cur;
+}
+
+// ---------------------------------------------------------------
+// XMM XH4f (D11) — slot 6's gateway arm (5 s mirror, cold path)
+// ---------------------------------------------------------------
+
+/// The hlgw family's counters.
+const HLGW_COUNTERS: usize = 65;
+/// The hlgw family's level gauges (the tell's gauge is registered apart).
+const HLGW_GAUGES: usize = 27;
+
+/// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
+/// — which is what pins the two together.
+const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
+    "engine_exec_hlgw_pushed_total",
+    "engine_exec_hlgw_events_total",
+    "engine_exec_hlgw_refused_local_total",
+    "engine_exec_hlgw_ring_full_total",
+    "engine_exec_hlgw_fills_total",
+    "engine_exec_hlgw_fills_foreign_total",
+    "engine_exec_hlgw_fills_unresolved_total",
+    "engine_exec_hlgw_fills_crossed_total",
+    "engine_exec_hlgw_stray_total",
+    "engine_exec_hlgw_alo_rejects_total",
+    "engine_exec_hlgw_rejects_total",
+    "engine_exec_hlgw_doubt_settled_total",
+    "engine_exec_hlgw_closed_unseen_total",
+    "engine_exec_hlgw_join_timeouts_total",
+    "engine_exec_hlgw_unknown_orders_total",
+    "engine_exec_hlgw_reads_total",
+    "engine_exec_hlgw_reads_failed_total",
+    "engine_exec_hlgw_preseed_dropped_total",
+    "engine_exec_hlgw_shutdown_fills_total",
+    "engine_exec_hlgw_shutdown_unconfirmed_total",
+    "engine_exec_hlgw_shutdown_switch_held_total",
+    "engine_exec_hlgw_dropped_total",
+    "engine_exec_hlgw_refused_budget_total",
+    "engine_exec_hlgw_throttled_total",
+    "engine_exec_hlgw_limit_reads_total",
+    "engine_exec_hlgw_day_pages_total",
+    "engine_exec_hlgw_day_unreadable_total",
+    "engine_exec_hlgw_refunded_total",
+    "engine_exec_hlgw_refused_leverage_total",
+    "engine_exec_hlgw_deadman_arms_total",
+    "engine_exec_hlgw_deadman_clears_total",
+    "engine_exec_hlgw_deadman_accepted_total",
+    "engine_exec_hlgw_deadman_refused_total",
+    "engine_exec_hlgw_deadman_rate_limited_total",
+    "engine_exec_hlgw_deadman_in_doubt_total",
+    "engine_exec_hlgw_deadman_unsent_total",
+    "engine_exec_hlgw_deadman_triggers_total",
+    "engine_exec_hlgw_deadman_stray_total",
+    "engine_exec_hlgw_actions_sent_total",
+    "engine_exec_hlgw_replies_total",
+    "engine_exec_hlgw_replies_unmatched_total",
+    "engine_exec_hlgw_post_timeouts_total",
+    "engine_exec_hlgw_rest_fallback_posts_total",
+    "engine_exec_hlgw_reconnects_total",
+    "engine_exec_hlgw_evt_ring_full_total",
+    "engine_exec_hlgw_own_cancels_total",
+    "engine_exec_hlgw_gateway_fills_total",
+    "engine_exec_hlgw_gateway_fills_scan_failed_total",
+    "engine_exec_hlgw_gateway_updates_total",
+    "engine_exec_hlgw_gateway_updates_ignored_total",
+    "engine_exec_hlgw_gateway_updates_scan_failed_total",
+    "engine_exec_hlgw_gateway_answers_unreadable_total",
+    "engine_exec_hlgw_gateway_answers_mismatched_total",
+    "engine_exec_hlgw_gateway_ws_errors_total",
+    "engine_exec_hlgw_gateway_local_refusals_total",
+    "engine_exec_hlgw_gateway_cancels_untimed_total",
+    "engine_exec_hlgw_gateway_dials_total",
+    "engine_exec_hlgw_gateway_conn_drops_total",
+    "engine_exec_hlgw_gateway_sweep_rounds_total",
+    "engine_exec_hlgw_gateway_sweep_unmapped_total",
+    "engine_exec_hlgw_gateway_throttled_total",
+    "engine_exec_hlgw_gateway_ttl_cancels_total",
+    "engine_exec_hlgw_gateway_ttl_full_total",
+    "engine_exec_hlgw_refused_cap_perp_total",
+    "engine_exec_hlgw_refused_max_resting_total",
+];
+
+/// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
+// COPY: [u64; 65] (520 B) returned by value — cold, the 5 s /metrics
+// mirror (then kept as the next delta's baseline); the fields are visited
+// once in the name order — a borrowed view would need the report to be an
+// array, which the POD is not.
+fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUNTERS] {
+    [
+        r.pushed,
+        r.events,
+        r.refused_local,
+        r.ring_full,
+        r.fills,
+        r.fills_foreign,
+        r.fills_unresolved,
+        r.fills_crossed,
+        r.stray,
+        r.alo_rejects,
+        r.rejects,
+        r.doubt_settled,
+        r.closed_unseen,
+        r.join_timeouts,
+        r.unknown_orders,
+        r.reads,
+        r.reads_failed,
+        r.preseed_dropped,
+        r.shutdown_fills,
+        r.shutdown_unconfirmed,
+        r.shutdown_switch_held,
+        r.dropped,
+        r.refused_budget,
+        r.throttled,
+        r.limit_reads,
+        r.day_pages,
+        r.day_unreadable,
+        r.refunded,
+        r.refused_leverage,
+        r.dm_arms,
+        r.dm_clears,
+        r.dm_accepted,
+        r.dm_refused,
+        r.dm_rate_limited,
+        r.dm_in_doubt,
+        r.dm_unsent,
+        r.dm_triggers,
+        r.dm_stray,
+        r.actions_sent,
+        r.replies,
+        r.replies_unmatched,
+        r.post_timeouts,
+        r.rest_fallback_posts,
+        r.reconnects,
+        r.evt_ring_full,
+        r.own_cancels,
+        r.gw_fills,
+        r.gw_fills_scan_failed,
+        r.gw_updates,
+        r.gw_updates_ignored,
+        r.gw_updates_scan_failed,
+        r.gw_answers_unreadable,
+        r.gw_answers_mismatched,
+        r.gw_ws_errors,
+        r.gw_local_refusals,
+        r.gw_cancels_untimed,
+        r.gw_dials,
+        r.gw_conn_drops,
+        r.gw_sweep_rounds,
+        r.gw_sweep_unmapped,
+        r.gw_throttled,
+        r.gw_ttl_cancels,
+        r.gw_ttl_full,
+        r.refused_cap_perp,
+        r.refused_max_resting,
+    ]
+}
+
+/// The gauge rows of the hlgw family, in [`hlgw_gauge_values`] order.
+const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
+    "engine_exec_hlgw_ready",
+    "engine_exec_hlgw_open_orders",
+    "engine_exec_hlgw_in_flight",
+    "engine_exec_hlgw_ws_up",
+    "engine_exec_hlgw_halt_reason",
+    "engine_exec_hlgw_heartbeat_age_ms",
+    "engine_exec_hlgw_congestion",
+    "engine_exec_hlgw_rtt_worst_ns",
+    "engine_exec_hlgw_post_rtt_p50_ns",
+    "engine_exec_hlgw_post_rtt_p99_ns",
+    "engine_exec_hlgw_post_rtt_max_ns",
+    "engine_exec_hlgw_push_to_write_p99_ns",
+    "engine_exec_hlgw_cancel_rtt_p99_ns",
+    "engine_exec_hlgw_fill_lag_p99_ns",
+    "engine_exec_hlgw_budget_known",
+    "engine_exec_hlgw_budget_remaining",
+    "engine_exec_hlgw_budget_cancel_remaining",
+    "engine_exec_hlgw_rate_ip_sum",
+    "engine_exec_hlgw_rate_ws_sum",
+    "engine_exec_hlgw_fees_1e8",
+    "engine_exec_hlgw_leverage_dark",
+    "engine_exec_hlgw_deadman_availability",
+    "engine_exec_hlgw_deadman_deadline_ms",
+    "engine_exec_hlgw_deadman_triggers_today",
+    "engine_exec_hlgw_health_blocked",
+    "engine_exec_hlgw_unmarked_positions",
+    "engine_exec_hlgw_resting_usd_1e6",
+];
+
+/// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
+/// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
+// COPY: [i64; 27] (216 B) returned by value — cold, as above.
+fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
+    let g = |v: u64| i64::try_from(v).unwrap_or(-1);
+    [
+        g(r.ready),
+        g(r.open_orders),
+        g(r.in_flight),
+        g(r.ws_up),
+        g(r.halt_reason),
+        g(r.heartbeat_age_ms),
+        g(r.congestion),
+        g(r.rtt_worst_ns),
+        g(r.post_rtt_p50_ns),
+        g(r.post_rtt_p99_ns),
+        g(r.post_rtt_max_ns),
+        g(r.push_to_write_p99_ns),
+        g(r.cancel_rtt_p99_ns),
+        g(r.fill_lag_p99_ns),
+        g(r.budget_known),
+        r.budget_remaining,
+        r.budget_cancel_remaining,
+        g(r.rate_ip_sum),
+        g(r.rate_ws_sum),
+        r.fees_1e8,
+        g(r.leverage_dark),
+        g(r.dm_availability),
+        g(r.dm_deadline_ms),
+        g(r.dm_triggers_today),
+        g(r.health_blocked),
+        g(r.unmarked_positions),
+        r.resting_usd_1e6,
+    ]
+}
+
+/// **XMM XH4f (D11)** — the `engine_exec_hlgw_*` family: slot 6's gateway
+/// arm — its counters and the dead man's, the gateway's, the budget, the
+/// rates, the latencies and the router's words for the slot. Registered
+/// only when slot 6 is live on the gateway.
+#[derive(Copy, Clone, Debug)]
+pub struct ExecHlgwMetricIds {
+    /// The counters, in [`HLGW_COUNTER_NAMES`] order.
+    pub counters: [core_metrics::CounterId; HLGW_COUNTERS],
+    /// The level gauges, in [`HLGW_GAUGE_NAMES`] order.
+    pub gauges: [GaugeId; HLGW_GAUGES],
+    /// `engine_exec_hlgw_last_shutdown_unconfirmed` — `1` when the last
+    /// shutdown's tell was on disk at this boot: that shutdown reached its
+    /// bound with orders of slot 6's possibly resting.
+    pub last_shutdown_unconfirmed: GaugeId,
+}
+
+/// Register the hlgw family. Boot-only.
+fn register_hlgw_metrics(
+    reg: &mut core_metrics::MetricsRegistry,
+) -> Result<ExecHlgwMetricIds, &'static str> {
+    let mut counters = [core_metrics::CounterId::default(); HLGW_COUNTERS];
+    let mut i = 0usize;
+    while i < HLGW_COUNTERS {
+        counters[i] = reg
+            .register_counter(HLGW_COUNTER_NAMES[i])
+            .map_err(|_| "register hlgw counter")?;
+        i += 1;
+    }
+    let mut gauges = [GaugeId::default(); HLGW_GAUGES];
+    let mut k = 0usize;
+    while k < HLGW_GAUGES {
+        gauges[k] = reg
+            .register_gauge(HLGW_GAUGE_NAMES[k])
+            .map_err(|_| "register hlgw gauge")?;
+        k += 1;
+    }
+    let last_shutdown_unconfirmed = reg
+        .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
+        .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
+    Ok(ExecHlgwMetricIds {
+        counters,
+        gauges,
+        last_shutdown_unconfirmed,
+    })
+}
+
+/// Mirror the hlgw family: the counters as monotonic deltas of the arm's
+/// totals (`last`: the previous mirror's), the gauges as levels. 5 s
+/// cadence — cold path.
+fn mirror_hlgw_metrics(
+    reg: &core_metrics::MetricsRegistry,
+    ids: &ExecHlgwMetricIds,
+    cur: &clob_dispatcher::GatewayArmReport,
+    last: &mut [u64; HLGW_COUNTERS],
+) {
+    let c = hlgw_counter_values(cur);
+    let mut i = 0usize;
+    while i < HLGW_COUNTERS {
+        reg.counter(ids.counters[i])
+            .inc(c[i].saturating_sub(last[i]));
+        i += 1;
+    }
+    let g = hlgw_gauge_values(cur);
+    let mut k = 0usize;
+    while k < HLGW_GAUGES {
+        reg.gauge(ids.gauges[k]).set(g[k]);
+        k += 1;
+    }
+    // COPY: the 65 totals (520 B) kept as the next delta's baseline — 5 s
+    // cadence, cold; a delta needs the previous value.
+    *last = c;
+}
+
+/// **XMM XH4f (D11) — the gateway arm's shutdown, told.** Unconfirmed — it
+/// reached its bound with orders of slot 6's possibly resting, which only
+/// the dead man's schedule, if the venue keeps one, cancels (the process
+/// cannot outwait launchd's own stop): an ERROR line with the switch's
+/// availability and deadline, and the tell written, which the next boot
+/// reads back as `engine_exec_hlgw_last_shutdown_unconfirmed`. Confirmed:
+/// the tell removed. Cold: once, at shutdown.
+fn gateway_shutdown_tell(path: &Path, r: &clob_dispatcher::GatewayArmReport) {
+    if r.shutdown_unconfirmed == 0 {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "exec: the gateway arm's shutdown confirmed — the last one's tell removed"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "exec: the gateway arm's old tell could not be removed"
+            ),
+        }
+        return;
+    }
+    // `r.dm_availability` is `Availability as u8` (0..=3).
+    let deadman = engine_snapshot::deadman_availability_word(
+        u8::try_from(r.dm_availability).unwrap_or(u8::MAX),
+    );
+    tracing::error!(
+        open_orders = r.open_orders,
+        deadman,
+        deadman_deadline_ms = r.dm_deadline_ms,
+        switch_held = r.shutdown_switch_held,
+        path = %path.display(),
+        "exec: the gateway arm's shutdown reached its bound UNCONFIRMED — the venue may \
+         still hold slot 6's orders, and only the dead man's schedule cancels them"
+    );
+    let wall_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let body = format!(
+        "wall_ms={wall_ms} open_orders={} deadman={deadman} deadman_deadline_ms={} \
+         switch_held={}\n",
+        r.open_orders, r.dm_deadline_ms, r.shutdown_switch_held
+    );
+    if let Err(reason) = crate::state_file::write_atomic(path, &body) {
+        tracing::error!(
+            %reason,
+            path = %path.display(),
+            "exec: the gateway arm's tell could not be written"
+        );
+    }
 }
 
 /// X1: mirror the matcher's counters as monotonic deltas.
@@ -6311,9 +6683,12 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
 /// configured; `/state` carries all eight).
 pub const XMM_METRIC_PERPS: usize = 4;
 
+/// The xmm family's counters.
+const XMM_COUNTERS: usize = 22;
+
 /// The counter rows of the xmm family, in [`xmm_counter_values`] order
 /// — which is what pins the two together.
-const XMM_COUNTER_NAMES: [&str; 17] = [
+const XMM_COUNTER_NAMES: [&str; XMM_COUNTERS] = [
     "engine_xmm_placed_total",
     "engine_xmm_modifies_total",
     "engine_xmm_lead_cancels_total",
@@ -6331,13 +6706,18 @@ const XMM_COUNTER_NAMES: [&str; 17] = [
     "engine_xmm_unmatched_total",
     "engine_xmm_ctx_refused_total",
     "engine_xmm_stuck_total",
+    "engine_xmm_blocked_cancels_total",
+    "engine_xmm_rtt_cancels_total",
+    "engine_xmm_congestion_cancels_total",
+    "engine_xmm_health_held_total",
+    "engine_xmm_busy_deferred_total",
 ];
 
 /// `XmmCounters`' fields in [`XMM_COUNTER_NAMES`] order.
-// COPY: [u64; 17] (136 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 22] (176 B) returned by value — cold, the 5 s /metrics
 // mirror; the fields are visited once in the name order — a borrowed
 // view would need the struct to be an array, which the POD is not.
-fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; 17] {
+fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; XMM_COUNTERS] {
     [
         c.placed,
         c.modifies,
@@ -6356,6 +6736,11 @@ fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; 17] {
         c.unmatched,
         c.ctx_refused,
         c.stuck,
+        c.blocked_cancels,
+        c.rtt_cancels,
+        c.congestion_cancels,
+        c.health_held,
+        c.busy_deferred,
     ]
 }
 
@@ -6365,7 +6750,7 @@ fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; 17] {
 #[derive(Copy, Clone, Debug)]
 pub struct XmmMetricIds {
     /// The counters, in [`XMM_COUNTER_NAMES`] order.
-    pub counters: [core_metrics::CounterId; 17],
+    pub counters: [core_metrics::CounterId; XMM_COUNTERS],
     /// `engine_xmm_perps` — perps configured (0 = the member is off).
     pub perps: core_metrics::GaugeId,
     /// `engine_xmm_p{k}_pos_1e6` — the signed position on the k-th
@@ -6377,7 +6762,7 @@ pub struct XmmMetricIds {
 fn register_xmm_metrics(
     reg: &mut core_metrics::MetricsRegistry,
 ) -> Result<XmmMetricIds, &'static str> {
-    let mut counters = [core_metrics::CounterId::default(); 17];
+    let mut counters = [core_metrics::CounterId::default(); XMM_COUNTERS];
     let mut i = 0usize;
     while i < XMM_COUNTER_NAMES.len() {
         counters[i] = reg
@@ -6412,7 +6797,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
     strat: &S,
     last: &mut strategy_core::XmmCounters,
 ) {
-    // COPY: the 136 B `XmmCounters` read into `cur`, then kept as the
+    // COPY: the 176 B `XmmCounters` read into `cur`, then kept as the
     // next delta's baseline (`*last = cur`) — 5 s cadence, cold; a delta
     // needs the previous value, so one copy survives either way.
     let mut cur = strategy_core::XmmCounters::default();
@@ -6424,7 +6809,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
         reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
         i += 1;
     }
-    // COPY: 136 B — the next delta's baseline (see above).
+    // COPY: 176 B — the next delta's baseline (see above).
     *last = cur;
     let mut rows = [strategy_core::XmmPerpView::default(); XMM_METRIC_PERPS];
     let n = strat.xmm_perps_view(&mut rows);
@@ -7822,6 +8207,7 @@ fn fill_snapshot<S, D>(
     tick_age: &[(u64, u64); SNAPSHOT_VENUES],
     now: NsTs,
     seq: u64,
+    gw: Option<&clob_dispatcher::GatewayArmReport>,
 ) where
     S: strategy_core::Strategy,
     D: OrderDispatch,
@@ -7968,6 +8354,45 @@ fn fill_snapshot<S, D>(
         ws_connect_failures: bn.ws_connect_failures,
         pnl_anchor_usd_1e6: bn.pnl_anchor_usd_1e6,
         session_pnl_usd_1e6: bn.session_pnl_usd_1e6,
+    };
+    // XMM XH4f (D11): slot 6's gateway arm, when the composition holds one
+    // (the loop's one report a second).
+    ex.arms_hyperliquid_gw = match gw {
+        Some(gw) => engine_snapshot::GatewayArmSnapshot {
+            present: 1,
+            slot: u8::try_from(gw.slot).unwrap_or(u8::MAX),
+            ready: u8::from(gw.ready != 0),
+            ws_up: u8::from(gw.ws_up != 0),
+            congestion: u8::try_from(gw.congestion).unwrap_or(u8::MAX),
+            budget_known: u8::from(gw.budget_known != 0),
+            dm_availability: u8::try_from(gw.dm_availability).unwrap_or(u8::MAX),
+            leverage_dark: u8::try_from(gw.leverage_dark).unwrap_or(u8::MAX),
+            health_blocked: gw.health_blocked,
+            halt_reason: gw.halt_reason,
+            open_orders: gw.open_orders,
+            in_flight: gw.in_flight,
+            heartbeat_age_ms: gw.heartbeat_age_ms,
+            rtt_worst_ns: gw.rtt_worst_ns,
+            pushed: gw.pushed,
+            rejects: gw.rejects,
+            alo_rejects: gw.alo_rejects,
+            refused_local: gw.refused_local,
+            refused_budget: gw.refused_budget,
+            refused_leverage: gw.refused_leverage,
+            throttled: gw.throttled,
+            fills: gw.fills,
+            fills_crossed: gw.fills_crossed,
+            fees_1e8: gw.fees_1e8,
+            unknown_orders: gw.unknown_orders,
+            day_unreadable: gw.day_unreadable,
+            post_timeouts: gw.post_timeouts,
+            reconnects: gw.reconnects,
+            ttl_cancels: gw.gw_ttl_cancels,
+            budget_remaining: gw.budget_remaining,
+            dm_deadline_ms: gw.dm_deadline_ms,
+            shutdown_unconfirmed: gw.shutdown_unconfirmed,
+        },
+        None => engine_snapshot::GatewayArmSnapshot::default(),
     };
 
     let st = eng.ai_status();
@@ -8439,6 +8864,54 @@ where
     if let Some(cap) = obs.orders_capture.take() {
         eng.set_order_capture(cap);
     }
+    // XMM XH4f (D11): slot 6's gateway-arm tell — what the last run left
+    // unconfirmed, read back once (a gauge and an ERROR line); then written
+    // anew: it stands until THIS run's shutdown confirms (`gateway_shutdown_
+    // tell`), so a kill during the drain, a crash or an abort leaves it.
+    // Before the members start: a tell that cannot be written stops the
+    // boot while nothing can have been sent (the arm's boot runs in the
+    // loop's idle) — a run with no tell would go untold (risk r2).
+    let xmm_gw_tell = obs.xmm_gateway_tell.take();
+    if let Some(path) = xmm_gw_tell.as_deref() {
+        let left = path.exists();
+        if left {
+            // COPY: the last run's tell, ≤ 256 B, read(2) once a boot into a
+            // fixed stack buffer (kernel → user); rejected: `read_to_string`'s
+            // heap copy.
+            let mut said = [0u8; 256];
+            let n = std::fs::File::open(path)
+                .and_then(|mut f| std::io::Read::read(&mut f, &mut said))
+                .unwrap_or(0);
+            tracing::error!(
+                path = %path.display(),
+                last = %core::str::from_utf8(&said[..n]).unwrap_or("?").trim(),
+                "exec: the gateway arm's LAST run ended without a confirmed shutdown — check \
+                 the venue for slot 6's orders, and its fills since"
+            );
+        }
+        if let Err(reason) = crate::state_file::write_atomic(
+            path,
+            "running — no confirmed shutdown yet (a kill, a crash or an abort leaves this)\n",
+        ) {
+            tracing::error!(
+                %reason,
+                path = %path.display(),
+                "exec: the gateway arm's tell could not be written — boot aborted"
+            );
+            return EngineLoopResult::Failed(
+                "xmm: the gateway arm's shutdown tell could not be written",
+            );
+        }
+        if let (Some(reg), Some(gw)) = (
+            obs.metrics.as_ref(),
+            obs.counter_ids
+                .as_ref()
+                .and_then(|i| i.exec.as_ref())
+                .and_then(|e| e.hlgw.as_ref()),
+        ) {
+            reg.gauge(gw.last_shutdown_unconfirmed).set(i64::from(left));
+        }
+    }
     if let Err(e) = eng.start() {
         tracing::error!(error = ?e, "engine on_start failed");
         return EngineLoopResult::Failed("engine_loop: on_start failed");
@@ -8538,6 +9011,18 @@ where
     let mut fills_unrouted_last: [u64; 2] = [0; 2];
     // E1: the router's previous snapshot, for the monotonic deltas.
     let mut exec_last = clob_dispatcher::ExecCounters::default();
+    // XMM XH4f (D11): the gateway arm's report of the last second, and the
+    // totals the mirror last published. Filled only when read: `/state`
+    // on, or the hlgw family registered (a gateway boot's `/metrics`).
+    let gw_read = obs.state.is_some()
+        || obs
+            .counter_ids
+            .as_ref()
+            .and_then(|i| i.exec.as_ref())
+            .is_some_and(|e| e.hlgw.is_some());
+    let mut gw_report = clob_dispatcher::GatewayArmReport::default();
+    let mut gw_ok = false;
+    let mut hlgw_last = [0u64; HLGW_COUNTERS];
     // F18/F21: ONE call site for every member's persisted state, so a
     // third member cannot be added to one of the two places and not the
     // other. A macro rather than a closure because it borrows `eng`
@@ -8621,6 +9106,16 @@ where
             eng.drive_dispatcher_idle();
         });
         if now >= next_state {
+            // XMM XH4f (D11): slot 6's gateway arm — ONE report a second
+            // (its quantiles walk the gateway's trackers), and only when
+            // read: `/state` shows it now, the 5 s `/metrics` mirror takes
+            // the latest.
+            gw_ok = gw_read
+                && clob_dispatcher::OrderDispatch::gateway_arm_report(
+                    eng.dispatcher(),
+                    now,
+                    &mut gw_report,
+                );
             // T1(c): per-venue last-tick stamps, refreshed on the 1 s
             // cadence (the 5 s block below reads them for the age
             // gauges; the snapshot reads them for `last_tick_age_s`).
@@ -8631,7 +9126,15 @@ where
             // and publish it into the seqlock — one POD copy.
             if let (Some(cell), Some(scratch)) = (obs.state.as_ref(), state_scratch.as_mut()) {
                 state_seq = state_seq.wrapping_add(1);
-                fill_snapshot(scratch, &eng, &obs, &tick_age_track, now, state_seq);
+                fill_snapshot(
+                    scratch,
+                    &eng,
+                    &obs,
+                    &tick_age_track,
+                    now,
+                    state_seq,
+                    gw_ok.then_some(&gw_report),
+                );
                 cell.publish(scratch);
             }
             next_state = now + SNAPSHOT_PERIOD_NS;
@@ -8773,6 +9276,11 @@ where
                         clob_dispatcher::OrderDispatch::exec_counters(eng.dispatcher()),
                         &mut exec_last,
                     );
+                    // XMM XH4f (D11): slot 6's gateway arm (the second's
+                    // report, above).
+                    if let (Some(hl), true) = (ex.hlgw.as_ref(), gw_ok) {
+                        mirror_hlgw_metrics(reg, hl, &gw_report, &mut hlgw_last);
+                    }
                 }
 
                 // Per-ingress connection state — real per-thread
@@ -9021,6 +9529,13 @@ where
             left = ec.arm.sweep_all_left,
             "exec: shutdown sweep of resting orders done"
         );
+    }
+    // XMM XH4f (D11): slot 6's gateway arm — its shutdown told.
+    if let Some(path) = xmm_gw_tell.as_deref() {
+        let mut gw = clob_dispatcher::GatewayArmReport::default();
+        if clob_dispatcher::OrderDispatch::gateway_arm_report(eng.dispatcher(), now_ns(), &mut gw) {
+            gateway_shutdown_tell(path, &gw);
+        }
     }
     let total = EngineLoopResult::Done(EngineLoopStats {
         iterations: eng.iterations,
@@ -11743,10 +12258,13 @@ mod tests {
         let worst = ExecObs {
             modes: [1u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
             binance: true,
+            gateway: true,
         };
         let obs = Observability::build(true, Some(worst)).expect("every family fits the fixed registry");
         let reg = obs.metrics.as_ref().unwrap();
         assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
+        // XMM XH4f: 518 counters and 407 gauges here — slot 6's gateway
+        // family (65 + 28) took the worst case past 512 / 384.
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -11838,15 +12356,20 @@ mod tests {
         }
     }
 
-    /// XMM XH3: the slot-6 family — 17 counters (the member's, in name
-    /// order) and 1 + 4 gauges; every name distinct, none reused.
+    /// XMM XH3: the slot-6 family — 22 counters (the member's, in name
+    /// order; XH4f's five health pulls included) and 1 + 4 gauges; every
+    /// name distinct, none reused.
     #[test]
-    fn the_xmm_family_is_17_counters_and_5_gauges() {
+    fn the_xmm_family_is_22_counters_and_5_gauges() {
         let mut reg = core_metrics::MetricsRegistry::new();
         let before_c = reg.counters_len();
         let before_g = reg.gauges_len();
         let ids = register_xmm_metrics(&mut reg).expect("register xmm");
-        assert_eq!(reg.counters_len() - before_c, 17, "the counter block");
+        assert_eq!(
+            reg.counters_len() - before_c,
+            XMM_COUNTERS,
+            "the counter block"
+        );
         assert_eq!(reg.gauges_len() - before_g, 1 + XMM_METRIC_PERPS, "perps + positions");
         assert!(register_xmm_metrics(&mut reg).is_err(), "a second registration collides");
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -11898,12 +12421,18 @@ mod tests {
         f.c.placed = 9;
         f.c.pull_cancels = 4;
         f.c.stuck = 1;
+        f.c.busy_deferred = 3;
         f.rows[0].pos_1e6 = 150_000;
         f.rows[1].pos_1e6 = -20_000;
         mirror_xmm_metrics(&reg, &ids, &f, &mut last);
         assert_eq!(reg.counter(ids.counters[0]).get(), 9, "placed");
         assert_eq!(reg.counter(ids.counters[4]).get(), 4, "pull_cancels");
         assert_eq!(reg.counter(ids.counters[16]).get(), 1, "stuck");
+        assert_eq!(
+            reg.counter(ids.counters[21]).get(),
+            3,
+            "busy_deferred (XH4f)"
+        );
         assert_eq!(reg.gauge(ids.perps).get(), 2);
         assert_eq!((reg.gauge(ids.pos[0]).get(), reg.gauge(ids.pos[1]).get()), (150_000, -20_000));
         assert_eq!(reg.gauge(ids.pos[2]).get(), 0, "a perp not quoted reads zero");
@@ -13042,7 +13571,15 @@ mod tests {
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         modes[3] = 1;
         modes[6] = 2;
-        let obs = Observability::build(true, Some(ExecObs { modes, binance: false })).unwrap();
+        let obs = Observability::build(
+            true,
+            Some(ExecObs {
+                modes,
+                binance: false,
+                gateway: false,
+            }),
+        )
+        .unwrap();
         let reg = obs.metrics.as_ref().unwrap();
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).unwrap();
@@ -13090,6 +13627,140 @@ mod tests {
         }
     }
 
+    /// **XMM XH4f (D11)** — a boot with slot 6 live on the gateway registers
+    /// the `engine_exec_hlgw_*` family (and the router counters its marks and
+    /// retirements move); the mirror publishes deltas and levels, a
+    /// heartbeat not yet seen as −1.
+    #[test]
+    fn a_gateway_boot_registers_the_hlgw_family_and_mirrors_deltas_and_levels() {
+        let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
+        modes[6] = 1;
+        let obs = Observability::build(
+            true,
+            Some(ExecObs {
+                modes,
+                binance: false,
+                gateway: true,
+            }),
+        )
+        .unwrap();
+        let reg = obs.metrics.as_ref().unwrap();
+        let ex = obs
+            .counter_ids
+            .as_ref()
+            .and_then(|i| i.exec.as_ref())
+            .expect("the exec family");
+        assert!(ex.bn.is_some(), "its marks and its retirements by why");
+        let ids = ex.hlgw.as_ref().expect("the hlgw family");
+        let mut last = [0u64; HLGW_COUNTERS];
+        let mut cur = clob_dispatcher::GatewayArmReport {
+            present: 1,
+            slot: 6,
+            pushed: 5,
+            refused_max_resting: 2,
+            gw_ttl_full: 1,
+            heartbeat_age_ms: u64::MAX,
+            budget_remaining: -3,
+            rate_ws_sum: 11,
+            dm_availability: 3,
+            resting_usd_1e6: 7,
+            ..clob_dispatcher::GatewayArmReport::default()
+        };
+        mirror_hlgw_metrics(reg, ids, &cur, &mut last);
+        cur.pushed = 8;
+        mirror_hlgw_metrics(reg, ids, &cur, &mut last);
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = reg.encode_prometheus(&mut buf).unwrap();
+        let text = std::str::from_utf8(&buf[..n]).unwrap();
+        for (name, v) in [
+            ("engine_exec_hlgw_pushed_total", "8"),
+            ("engine_exec_hlgw_refused_max_resting_total", "2"),
+            ("engine_exec_hlgw_gateway_ttl_full_total", "1"),
+            ("engine_exec_hlgw_heartbeat_age_ms", "-1"),
+            ("engine_exec_hlgw_budget_remaining", "-3"),
+            ("engine_exec_hlgw_rate_ws_sum", "11"),
+            ("engine_exec_hlgw_deadman_availability", "3"),
+            ("engine_exec_hlgw_resting_usd_1e6", "7"),
+            ("engine_exec_hlgw_last_shutdown_unconfirmed", "0"),
+        ] {
+            assert!(
+                text.contains(&format!("{name} {v}\n")),
+                "{name} {v}: {text}"
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for n in HLGW_COUNTER_NAMES {
+            assert!(
+                n.starts_with("engine_exec_hlgw_") && n.ends_with("_total"),
+                "{n}"
+            );
+            assert!(n.len() <= core_metrics::NAME_MAX && seen.insert(n), "{n}");
+        }
+        for n in HLGW_GAUGE_NAMES {
+            assert!(
+                n.starts_with("engine_exec_hlgw_") && !n.ends_with("_total"),
+                "{n}"
+            );
+            assert!(n.len() <= core_metrics::NAME_MAX && seen.insert(n), "{n}");
+        }
+    }
+
+    /// **XMM XH4f** — `/state`'s words for the gateway arm's numbers follow
+    /// the numberings they spell: the dead man's `Availability` (`repr(u8)`)
+    /// and the congestion word.
+    #[test]
+    fn the_gateway_arm_s_words_follow_their_numberings() {
+        use exec_hyperliquid::deadman::Availability;
+        for (a, w) in [
+            (Availability::Unknown, "unknown"),
+            (Availability::Eligible, "eligible"),
+            (Availability::Refused, "refused"),
+            (Availability::Exhausted, "exhausted"),
+        ] {
+            assert_eq!(engine_snapshot::deadman_availability_word(a as u8), w);
+        }
+        for (c, w) in [
+            (core_types::EXEC_CONGESTION_NONE, "none"),
+            (core_types::EXEC_CONGESTION_BUSY, "busy"),
+            (core_types::EXEC_CONGESTION_THROTTLED, "throttled"),
+            (core_types::EXEC_CONGESTION_RATE_LIMITED, "rate_limited"),
+        ] {
+            assert_eq!(engine_snapshot::congestion_word(c), w);
+        }
+    }
+
+    /// **XMM XH4f (D11)** — an unconfirmed gateway shutdown writes the tell
+    /// (what the next boot reads back as a gauge); a confirmed one removes
+    /// it, and is quiet when there is none.
+    #[test]
+    fn an_unconfirmed_gateway_shutdown_is_told_and_a_clean_one_clears_the_tell() {
+        let dir = std::env::temp_dir().join(format!("xmm-tell-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("xmm-gateway-shutdown.tell");
+        let _ = std::fs::remove_file(&path);
+        let mut r = clob_dispatcher::GatewayArmReport {
+            present: 1,
+            slot: 6,
+            shutdown_unconfirmed: 1,
+            open_orders: 2,
+            dm_availability: 1,
+            dm_deadline_ms: 42,
+            ..clob_dispatcher::GatewayArmReport::default()
+        };
+        gateway_shutdown_tell(&path, &r);
+        let said = std::fs::read_to_string(&path).expect("the tell");
+        assert!(
+            said.contains("open_orders=2 deadman=eligible deadman_deadline_ms=42"),
+            "{said}"
+        );
+        r.shutdown_unconfirmed = 0;
+        gateway_shutdown_tell(&path, &r);
+        assert!(!path.exists(), "a clean shutdown clears it");
+        gateway_shutdown_tell(&path, &r);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     /// **BX6** — a boot with a live Binance slot registers the router
     /// counters only it can move (plan §5 BX3 item 11), and mirrors them:
     /// the per-`why` retirements from their own slots (`unknown` from the
@@ -13098,7 +13769,15 @@ mod tests {
     fn a_binance_boot_registers_and_mirrors_its_router_counters() {
         let mut modes = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         modes[3] = 1;
-        let obs = Observability::build(true, Some(ExecObs { modes, binance: true })).unwrap();
+        let obs = Observability::build(
+            true,
+            Some(ExecObs {
+                modes,
+                binance: true,
+                gateway: false,
+            }),
+        )
+        .unwrap();
         let reg = obs.metrics.as_ref().unwrap();
         let ids = obs.counter_ids.as_ref().and_then(|i| i.exec.as_ref()).expect("the exec family");
         let cur = clob_dispatcher::ExecCounters {

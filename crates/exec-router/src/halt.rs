@@ -109,6 +109,13 @@ pub enum HaltReason {
     /// **BX3 (D6)** The arm judged a margin ratio at or past the slot's
     /// `halt_on_margin_ratio_1e6`, or saw a `MARGIN_CALL`.
     MarginRisk = 11,
+    /// XH4d, XH-7: post-only crosses reached `halt_on_alo_reject_pct`
+    /// of the arm's last ALO answers — the quotes are priced into a
+    /// book that is not there.
+    AloRejectRate = 12,
+    /// XH4d: the arm's order gateway halted (its halt word). No
+    /// threshold: it places for nobody and may have lost an event.
+    GatewayHalt = 13,
 }
 
 impl HaltReason {
@@ -128,6 +135,8 @@ impl HaltReason {
             HaltReason::PnlLoss => "pnl-loss",
             HaltReason::VenueLock => "venue-lock",
             HaltReason::MarginRisk => "margin-risk",
+            HaltReason::AloRejectRate => "alo-reject-rate",
+            HaltReason::GatewayHalt => "gateway-halt",
         }
     }
 
@@ -153,6 +162,8 @@ impl HaltReason {
             "pnl-loss" => HaltReason::PnlLoss,
             "venue-lock" => HaltReason::VenueLock,
             "margin-risk" => HaltReason::MarginRisk,
+            "alo-reject-rate" => HaltReason::AloRejectRate,
+            "gateway-halt" => HaltReason::GatewayHalt,
             _ => HaltReason::Operator,
         }
     }
@@ -304,6 +315,18 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     // with no allowance left cannot place for anybody.
     if sig.budget_floor_breached != 0 {
         return HaltReason::BudgetFloor;
+    }
+    // XH4d: the arm's order gateway halted. No threshold either: it
+    // places for nobody, and an event it could not deliver may be lost —
+    // the arm no longer knows what rests, and the halt's sweep is the
+    // one thing a halted gateway still does.
+    if sig.gateway_halted != 0 {
+        return HaltReason::GatewayHalt;
+    }
+    // XH4d, XH-7: a post-only cross is information, never a reject —
+    // until it is most of what the quotes meet.
+    if lim.alo_reject_permille > 0 && sig.alo_reject_permille >= lim.alo_reject_permille {
+        return HaltReason::AloRejectRate;
     }
     if lim.recon_drift_usd_1e6 > 0 && sig.recon_drift_usd_1e6 >= lim.recon_drift_usd_1e6 {
         return HaltReason::ReconDrift;
@@ -741,9 +764,10 @@ mod tests {
         assert_eq!(trigger_for(&s, &none), HaltReason::None);
     }
 
-    /// The budget floor is the ONE trigger with no per-slot threshold:
-    /// an address with no allowance left cannot place for anybody, so
-    /// a slot cannot opt out of it.
+    /// The budget floor and the gateway halt are the two triggers with
+    /// no per-slot threshold: an address with no allowance left, or a
+    /// gateway that stopped, cannot place for anybody, so a slot cannot
+    /// opt out of them.
     #[test]
     fn the_budget_floor_fires_even_with_every_threshold_unset() {
         let mut s = healthy();
@@ -751,6 +775,38 @@ mod tests {
         assert_eq!(
             trigger_for(&s, &HaltLimits::none()),
             HaltReason::BudgetFloor
+        );
+    }
+
+    #[test]
+    fn a_halted_gateway_halts_the_slot_with_every_threshold_unset() {
+        let s = healthy().with_gateway_halted(true);
+        assert_eq!(
+            trigger_for(&s, &HaltLimits::none()),
+            HaltReason::GatewayHalt
+        );
+        assert_eq!(
+            trigger_for(&healthy(), &HaltLimits::none()),
+            HaltReason::None
+        );
+    }
+
+    #[test]
+    fn the_alo_rate_halts_at_the_operator_s_permille_and_never_when_unset() {
+        let alo = lim().with_alo_reject_permille(500);
+        let s = healthy().with_alo_reject_permille(499);
+        assert_eq!(trigger_for(&s, &alo), HaltReason::None, "under the line");
+        let s = healthy().with_alo_reject_permille(500);
+        assert_eq!(trigger_for(&s, &alo), HaltReason::AloRejectRate);
+        let s = healthy().with_alo_reject_permille(1_000);
+        assert_eq!(trigger_for(&s, &lim()), HaltReason::None, "0 = off");
+        assert_eq!(
+            HaltReason::from_word(HaltReason::AloRejectRate.as_str()),
+            HaltReason::AloRejectRate
+        );
+        assert_eq!(
+            HaltReason::from_word(HaltReason::GatewayHalt.as_str()),
+            HaltReason::GatewayHalt
         );
     }
 
@@ -916,6 +972,8 @@ mod tests {
             HaltReason::PnlLoss,
             HaltReason::VenueLock,
             HaltReason::MarginRisk,
+            HaltReason::AloRejectRate,
+            HaltReason::GatewayHalt,
         ];
         let mut i = 0usize;
         while i < all.len() {

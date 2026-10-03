@@ -43,7 +43,8 @@ use rustls::ClientConfig;
 use crate::evm_live::{LiveNet, Probe, Target};
 use crate::evm_shadow::Hex;
 use crate::hyparb_live::{
-    boot_hyparb_live, info_once, CoinSpec, HyparbLive, LiveSpec, PoolSpec, PRICE_USD, SLOT,
+    boot_hyparb_live, boot_hyparb_live_gateway, info_once, CoinSpec, HedgeArm, HyparbLive,
+    LiveBoot, LiveSpec, PoolSpec, PRICE_USD, SLOT,
 };
 
 /// The pool's symbol inside the rehearsal (any id the arm can match).
@@ -227,19 +228,24 @@ fn order(
 }
 
 /// Idle the arm until `done` answers or `secs` pass; the fills seen.
-fn pump<const N: usize>(
-    arm: &mut HyparbLive<N>,
+fn pump<H: HedgeArm>(
+    arm: &mut HyparbLive<H>,
     secs: u64,
     fills: &mut Vec<Fill>,
     retired: &mut Vec<u64>,
-    mut done: impl FnMut(&HyparbLive<N>, &[Fill], &[u64]) -> bool,
+    mut done: impl FnMut(&HyparbLive<H>, &[Fill], &[u64]) -> bool,
 ) -> bool {
     let until = core_time::now_ns() + secs * 1_000_000_000;
+    let mut ev = core_types::OrderEvent::ZERO;
     while core_time::now_ns() < until {
         arm.on_idle();
+        // As the engine drains it: fills, renames, order events, retirements
+        // (the gateway arm's queues must drain or its pump stops).
         while let Some(f) = arm.try_next_fill() {
             fills.push(f);
         }
+        while arm.try_next_renamed().is_some() {}
+        while arm.try_next_order_event(&mut ev) {}
         while let Some(r) = arm.try_next_retired() {
             retired.push(r.client_oid);
         }
@@ -273,6 +279,7 @@ pub fn verb_arm_smoke(
     coin: &str,
     pool: Option<[u8; 20]>,
     no_trade: bool,
+    gateway: bool,
     tls: Arc<ClientConfig>,
 ) -> Result<(String, bool), String> {
     let executor = t.executor()?;
@@ -324,7 +331,7 @@ pub fn verb_arm_smoke(
         probe.token_balance(&t1, &executor)?,
     );
     let lot = venue_lot(host, coin, tls.clone())?;
-    let mut out = format!(
+    let out = format!(
         "HYPARB arm-smoke — {}\npool {} token0 {} ({d0} dp, executor {b0}) token1 {} ({d1} dp, executor {b1})\n\
          hedge coin {coin} on {host}, lot {lot} (× 1e-6)\n",
         match t.net {
@@ -365,12 +372,95 @@ pub fn verb_arm_smoke(
         state_dir,
         budget_floor: 1_000,
     };
-    let boot = boot_hyparb_live::<FILL_N>(&spec, tls.clone())?;
+    let ctx = Ctx {
+        host,
+        coin,
+        tls: tls.clone(),
+        no_trade,
+        pool,
+        d0,
+        d1,
+        b0,
+        b1,
+        lot,
+        net: t.net,
+    };
+    // Its own process: its own nonce streams (S3 shares within a process).
+    // XH4h-3: the same smoke over either hedge transport (the engine's
+    // blocking arm, or the gateway's — testnet).
+    let mut nonces = exec_hyperliquid::NonceStreams::new();
+    if gateway {
+        let boot = boot_hyparb_live_gateway(&spec, tls, &mut nonces)?;
+        Ok(run_smoke(boot, out, &ctx))
+    } else {
+        let boot = boot_hyparb_live::<FILL_N>(&spec, tls, &mut nonces)?;
+        Ok(run_smoke(boot, out, &ctx))
+    }
+}
+
+/// What the smoke's steps read of the verb's setup.
+struct Ctx<'a> {
+    host: &'a str,
+    coin: &'a str,
+    tls: Arc<ClientConfig>,
+    no_trade: bool,
+    pool: [u8; 20],
+    d0: u8,
+    d1: u8,
+    b0: u128,
+    b1: u128,
+    lot: i64,
+    net: LiveNet,
+}
+
+/// The booted arm through the five steps, then — on every path — the
+/// gateway's end (its arm's shutdown, its thread released).
+fn run_smoke<H: HedgeArm>(boot: LiveBoot<H>, mut out: String, x: &Ctx<'_>) -> (String, bool) {
     out.push_str(&format!("boot: {}\n", boot.tell));
+    let gw_thread = boot.gateway;
     let mut arm = boot.arm;
+    let (mut out, ok) = match steps(&mut arm, out, x) {
+        Ok(r) | Err(r) => r,
+    };
+    if let Some((handle, stop)) = gw_thread {
+        arm.on_shutdown();
+        stop.release();
+        let t = std::time::Instant::now();
+        while !handle.is_finished() && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        out.push_str(if handle.is_finished() {
+            "gateway: stopped\n"
+        } else {
+            "gateway: did NOT stop in 20 s\n"
+        });
+    }
+    (out, ok)
+}
+
+/// Steps 1–5. `Err` = a read or a verb failed (reported in the text, a
+/// FAIL); a verdict that ends the smoke early is `Ok` with `false`.
+fn steps<H: HedgeArm>(
+    arm: &mut HyparbLive<H>,
+    mut out: String,
+    x: &Ctx<'_>,
+) -> Result<(String, bool), (String, bool)> {
+    let Ctx {
+        host,
+        coin,
+        ref tls,
+        no_trade,
+        pool,
+        d0,
+        d1,
+        b0,
+        b1,
+        lot,
+        net,
+    } = *x;
+    let tls = tls.clone();
     let (mut fills, mut retired) = (Vec::new(), Vec::new());
     let mut ok = true;
-
     // After boot every failure is reported, never lost.
     macro_rules! or_report {
         ($e:expr) => {
@@ -378,7 +468,7 @@ pub fn verb_arm_smoke(
                 Ok(v) => v,
                 Err(e) => {
                     out.push_str(&format!("   STOPPED: {e}\nARM-SMOKE FAIL\n"));
-                    return Ok((out, false));
+                    return Err((out, false));
                 }
             }
         };
@@ -387,7 +477,7 @@ pub fn verb_arm_smoke(
     // 1. The first reconciliation, marked.
     let bk = or_report!(touch(host, coin, tls.clone()));
     arm.observe_tick(&tick_of(bk, core_time::now_ns()), core_time::now_ns());
-    let seeded = pump(&mut arm, 60, &mut fills, &mut retired, |a, _, _| {
+    let seeded = pump(arm, 60, &mut fills, &mut retired, |a, _, _| {
         a.halt_signal().reconciled != 0 && a.equity_usd_1e6() > 0
     });
     let sig = arm.halt_signal();
@@ -451,7 +541,7 @@ pub fn verb_arm_smoke(
             1
         }
     };
-    let (side, qty, px) = match t.net {
+    let (side, qty, px) = match net {
         // Real price: token0 is the coin (WHYPE/USDC), sized in USD,
         // `SWAP_SLACK_BPS` worse than the mid — the member's limit law.
         LiveNet::Mainnet => {
@@ -498,7 +588,7 @@ pub fn verb_arm_smoke(
         usd(px)
     ));
     let amm = r.is_ok()
-        && pump(&mut arm, 90, &mut fills, &mut retired, |a, f, rt| {
+        && pump(arm, 90, &mut fills, &mut retired, |a, f, rt| {
             !a.shared().busy()
                 && (f.iter().any(|x| x.order_id == swap.client_oid)
                     || rt.contains(&swap.client_oid))
@@ -590,7 +680,7 @@ pub fn verb_arm_smoke(
                     .sum()
             };
             let got = r.is_ok()
-                && pump(&mut arm, 20, &mut fills, &mut retired, |_, f, _| {
+                && pump(arm, 20, &mut fills, &mut retired, |_, f, _| {
                     filled_of(f) >= o.qty.raw()
                 });
             let filled = filled_of(&fills);
@@ -629,7 +719,7 @@ pub fn verb_arm_smoke(
     ok &= legs_ok;
 
     // 5. The router's retirements, and a settled reconciliation.
-    let settled = pump(&mut arm, 45, &mut fills, &mut retired, |a, _, rt| {
+    let settled = pump(arm, 45, &mut fills, &mut retired, |a, _, rt| {
         a.pnl_flat() && rt.len() >= accepted
     });
     let s = arm.halt_signal();
