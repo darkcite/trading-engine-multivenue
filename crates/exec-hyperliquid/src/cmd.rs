@@ -50,6 +50,10 @@ pub const CMD_READ_DAY: u8 = 10;
 /// — the USDC half of an account's worth; answered by `EV_READ_DONE`
 /// alone. The last read: [`HlCmd::is_read`] ends here.
 pub const CMD_READ_SPOT: u8 = 11;
+/// Control (XMM XH5c): `reserveRequestWeight` — buy `arg` requests of
+/// address budget (S7-L1's top-up, on the gateway arm). Numbered after the
+/// reads: [`HlCmd::is_control`] names it.
+pub const CMD_RESERVE: u8 = 12;
 
 /// `flags`: reduce-only.
 pub const CMD_FLAG_REDUCE_ONLY: u8 = 1;
@@ -212,11 +216,23 @@ impl HlCmd {
         c
     }
 
-    /// A control command (leverage, scheduleCancel, noop): posted alone.
+    /// Control (XMM XH5c): buy `weight` requests of address budget
+    /// (`reserveRequestWeight`). `client_oid` only correlates the answer.
+    #[inline(always)]
+    #[must_use]
+    pub const fn reserve(slot: u8, client_oid: u64, weight: u32) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_RESERVE;
+        c.arg = weight;
+        c
+    }
+
+    /// A control command (leverage, scheduleCancel, noop, a weight
+    /// purchase): posted alone.
     #[inline(always)]
     #[must_use]
     pub const fn is_control(&self) -> bool {
-        self.kind >= CMD_LEVERAGE && self.kind <= CMD_NOOP
+        (self.kind >= CMD_LEVERAGE && self.kind <= CMD_NOOP) || self.kind == CMD_RESERVE
     }
 
     /// Read (XH4d): the account's resting orders. `client_oid` only
@@ -418,6 +434,9 @@ mod tests {
             (CMD_SCHEDULE_CANCEL, 1_789_000_005_000)
         );
         assert!(HlCmd::noop(6, 11).is_control());
+        let r = HlCmd::reserve(6, 12, 10_000);
+        assert_eq!((r.kind, r.arg), (CMD_RESERVE, 10_000));
+        assert!(r.is_control() && !r.is_read());
         assert!(!HlCmd::cancel(6, 1, 0).is_control());
         assert!(!HlCmd::place(6, 1, 0, true, 1, 1, Tif::Alo).is_control());
     }

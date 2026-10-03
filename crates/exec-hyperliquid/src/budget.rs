@@ -444,8 +444,12 @@ impl TopupState {
 /// this session. Every other failure — unreadable, malformed, another
 /// address — reads as today's ceiling already SPENT (`used =
 /// u64::MAX`): the arm cannot know what it bought, and the safe answer
-/// is to buy nothing until tomorrow. The spend carries over only for the
-/// anchor it was recorded under; a new session starts at zero.
+/// is to buy nothing until tomorrow. A day stored one LATER than `today`
+/// (the clock stepped back across 00:00Z) is kept with its usage — it never
+/// re-opens a day already spent (XMM XH5c-1); one stored further ahead (a
+/// clock that once ran ahead) reads as today spent, so the next day heals
+/// it. The spend carries over only for the anchor it was recorded under; a
+/// new session starts at zero.
 #[must_use]
 pub fn restore_topup(
     path: &std::path::Path,
@@ -463,13 +467,19 @@ pub fn restore_topup(
     let Some(s) = TopupState::from_line(&text, address) else {
         return (today, u64::MAX, 0);
     };
-    let used = if s.day == today { s.used } else { 0 };
+    let (day, used) = if s.day > today.saturating_add(1) {
+        (today, u64::MAX)
+    } else if s.day >= today {
+        (s.day, s.used)
+    } else {
+        (today, 0)
+    };
     let cost = if anchor_set_s != 0 && s.anchor_set_s == anchor_set_s {
         s.cost_1e6
     } else {
         0
     };
-    (today, used, cost)
+    (day, used, cost)
 }
 
 /// **S7-L1** — write the top-up state durably (temp file, `sync_all`,
@@ -481,6 +491,187 @@ pub fn restore_topup(
 /// the path.
 pub fn store_topup(path: &std::path::Path, address: &[u8; 20], s: TopupState) -> Result<(), String> {
     core_io::write_atomic(path, &s.to_line(address))
+}
+
+/// **S7-L1** — the venue's price of one reserved request, USD ×1e6
+/// (0.0005 USDC, "paid from the Perps balance").
+pub const TOPUP_PRICE_1E6: i64 = 500;
+
+/// **S7-L1 (gap E)** — with the venue's own headroom in hand: buy one
+/// top-up of `weight`? Only inside the band `(floor, floor + weight]`
+/// — above it there IS headroom (a purchase the arm could not confirm
+/// may already have gone through), and at or under the floor the router
+/// has halted the slot, sticky — and only while the day's ceiling holds
+/// one more. Pure, so the arithmetic is pinned without a venue.
+#[inline]
+#[must_use]
+pub const fn topup_fits(remaining: i64, floor: i64, weight: u64, used: u64, day_max: u64) -> bool {
+    let w = if weight > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        weight as i64
+    };
+    remaining > floor
+        && remaining <= floor.saturating_add(w)
+        && used.saturating_add(weight) <= day_max
+}
+
+/// **The request-weight top-up governor** — S7-L1 (gap E); XMM XH5c: one
+/// implementation, both Hyperliquid arms. The purchase policy as state:
+/// the weight a top-up buys (`0` = off), the most a UTC day may buy, the
+/// day counted, the weight bought on it (or possibly bought), and what this
+/// session's top-ups cost. Each arm runs its own round trip — the blocking
+/// arm in one idle call (`HlExchange::top_up_budget`), the gateway arm
+/// across its budget reads — and both decide by [`Self::wants`], confirm
+/// by [`Self::confirms`] and stop by [`Self::stop`]. 40 B, `Copy`; never
+/// allocates.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct TopupGovernor {
+    weight: u64,
+    day_max: u64,
+    day: u64,
+    used: u64,
+    cost_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<TopupGovernor>() == 40);
+
+impl TopupGovernor {
+    /// Off (`weight` 0), with the day's usage and the session's spend a
+    /// restart restored ([`restore_topup`]).
+    #[must_use]
+    pub const fn restored(day: u64, used: u64, cost_1e6: i64) -> Self {
+        Self {
+            weight: 0,
+            day_max: 0,
+            day,
+            used,
+            cost_1e6,
+        }
+    }
+
+    /// Armed: buy `weight` per top-up, at most `day_max` a UTC day
+    /// (`weight` 0 leaves it off); the restored day, usage and spend kept.
+    #[must_use]
+    pub const fn armed(self, weight: u64, day_max: u64) -> Self {
+        Self {
+            weight,
+            day_max,
+            ..self
+        }
+    }
+
+    /// The weight one top-up buys; `0` = off.
+    #[inline]
+    #[must_use]
+    pub const fn weight(&self) -> u64 {
+        self.weight
+    }
+
+    /// This session's top-up spend, USD ×1e6.
+    #[inline]
+    #[must_use]
+    pub const fn cost_1e6(&self) -> i64 {
+        self.cost_1e6
+    }
+
+    /// The state line's figures, tied to the anchor set at `anchor_set_s`.
+    #[must_use]
+    pub const fn state(&self, anchor_set_s: u64) -> TopupState {
+        TopupState {
+            day: self.day,
+            used: self.used,
+            anchor_set_s,
+            cost_1e6: self.cost_1e6,
+        }
+    }
+
+    /// Above the band — headroom no top-up is for: `remaining` over `floor`
+    /// plus one top-up's weight. The blocking arm's check before it reads
+    /// the venue; the band rule itself is [`topup_fits`].
+    #[must_use]
+    pub const fn above_band(&self, remaining: i64, floor: u64) -> bool {
+        let f = if floor > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            floor as i64
+        };
+        let w = if self.weight > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            self.weight as i64
+        };
+        remaining > f.saturating_add(w)
+    }
+
+    /// Buy one now? Off never buys. A LATER UTC day (`today`) counts from
+    /// 0 — forward only: a clock stepping back across 00:00Z never re-opens
+    /// a day already spent; then the band rule ([`topup_fits`]) on the
+    /// venue's own `remaining` over `floor`, inside the day's max.
+    pub fn wants(&mut self, remaining: i64, floor: u64, today: u64) -> bool {
+        if self.weight == 0 {
+            return false;
+        }
+        if today > self.day {
+            self.day = today;
+            self.used = 0;
+        }
+        let floor = i64::try_from(floor).unwrap_or(i64::MAX);
+        topup_fits(remaining, floor, self.weight, self.used, self.day_max)
+    }
+
+    /// Decide AND charge the day in one step — for an arm whose purchase
+    /// answers later (XMM XH5c-2's gateway arm): `true` = buy one, its
+    /// weight already counted against the day, so two decisions before an
+    /// answer can never both pass the day's max.
+    pub fn take(&mut self, remaining: i64, floor: u64, today: u64) -> bool {
+        let yes = self.wants(remaining, floor, today);
+        if yes {
+            self.charge_day();
+        }
+        yes
+    }
+
+    /// One top-up bought, or possibly bought: the day's usage charged.
+    pub fn charge_day(&mut self) {
+        self.used = self.used.saturating_add(self.weight);
+    }
+
+    /// One top-up's price charged to this session's spend.
+    pub fn charge_cost(&mut self) {
+        let w = i64::try_from(self.weight).unwrap_or(i64::MAX);
+        self.cost_1e6 = self
+            .cost_1e6
+            .saturating_add(w.saturating_mul(TOPUP_PRICE_1E6));
+    }
+
+    /// **Seen on the venue, or no more:** does `after` — the venue's
+    /// headroom read after a purchase — show it over `before`, less the
+    /// request it cost (half the weight is the bar)? A purchase that does
+    /// not show may be credited where the arm cannot read it: the next one
+    /// could buy the same need twice.
+    #[must_use]
+    pub const fn confirms(&self, before: i64, after: i64) -> bool {
+        let w = if self.weight > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            self.weight as i64
+        };
+        after >= before.saturating_add(w / 2)
+    }
+
+    /// No more top-ups from this process — nor, for the rest of the UTC
+    /// day, from the next: the day reads as spent once its state is stored.
+    pub fn stop(&mut self) {
+        self.weight = 0;
+        self.used = self.used.max(self.day_max);
+    }
+
+    /// A new anchor: its session's spend starts at zero.
+    pub fn new_session(&mut self) {
+        self.cost_1e6 = 0;
+    }
 }
 
 /// Read the budget for `address` from `path`.
@@ -663,7 +854,20 @@ mod tests {
             (20_720, 10_000, 5_000_000),
             "same day, same session"
         );
-        assert_eq!(restore_topup(&path, ADDR, 20_721, 1_790_200_000), (20_721, 0, 5_000_000));
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_721, 1_790_200_000),
+            (20_721, 0, 5_000_000)
+        );
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_719, 1_790_200_000),
+            (20_720, 10_000, 5_000_000),
+            "a clock stepped back keeps the later day and its usage"
+        );
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_718, 1_790_200_000),
+            (20_718, u64::MAX, 5_000_000),
+            "a day further ahead: today spent, tomorrow healed"
+        );
         assert_eq!(restore_topup(&path, ADDR, 20_720, 1_790_300_000), (20_720, 10_000, 0));
         assert_eq!(restore_topup(&path, ADDR, 20_720, 0), (20_720, 10_000, 0), "unanchored");
         assert_eq!(restore_topup(&path, OTHER, 20_720, 1), (20_720, u64::MAX, 0), "foreign");
@@ -893,5 +1097,99 @@ mod tests {
         let mut b = AddressBudget::restored(ADDR, 0, 0, 0);
         b.on_venue_fill(i64::MIN);
         let _ = b.remaining();
+    }
+
+    /// **S7-L1 (gap E) — the top-up buys only inside its band and
+    /// under its ceiling.** Floor 2 000, weight 5 000, ceiling 30 000.
+    #[test]
+    fn a_topup_buys_only_between_the_floor_and_one_topup_above_it() {
+        assert!(
+            topup_fits(7_000, 2_000, 5_000, 0, 30_000),
+            "the top of the band"
+        );
+        assert!(
+            topup_fits(2_001, 2_000, 5_000, 0, 30_000),
+            "just over the floor"
+        );
+        assert!(
+            !topup_fits(7_001, 2_000, 5_000, 0, 30_000),
+            "headroom: nothing to buy"
+        );
+        assert!(
+            !topup_fits(2_000, 2_000, 5_000, 0, 30_000),
+            "at the floor: halted, sticky"
+        );
+        assert!(!topup_fits(-50, 2_000, 5_000, 0, 30_000), "past the cliff");
+        assert!(
+            topup_fits(5_000, 2_000, 5_000, 25_000, 30_000),
+            "the day's last one"
+        );
+        assert!(
+            !topup_fits(5_000, 2_000, 5_000, 25_001, 30_000),
+            "over the ceiling"
+        );
+        assert!(
+            !topup_fits(5_000, 2_000, 5_000, u64::MAX, 30_000),
+            "an unreadable day"
+        );
+        // Saturates rather than wrapping: a weight past i64 reads as the
+        // widest band, never as a negative one.
+        assert!(topup_fits(5_000, 2_000, u64::MAX, 0, u64::MAX));
+        assert!(
+            !topup_fits(5_000, 2_000, u64::MAX, 1, u64::MAX - 1),
+            "and the ceiling holds"
+        );
+    }
+
+    /// XMM XH5c: the governor — off buys nothing; armed, it buys inside the
+    /// band and the day's max, rolls the day, charges the day and the
+    /// session, confirms on half the weight, and a stop spends the day.
+    #[test]
+    fn the_governor_buys_in_its_band_charges_confirms_and_stops() {
+        let restored = TopupGovernor::restored(19_999, 25_000, 7);
+        let mut off = restored;
+        assert!(!off.wants(5_000, 2_000, 19_999), "off");
+        let mut g = restored.armed(5_000, 30_000);
+        assert_eq!((g.weight(), g.cost_1e6()), (5_000, 7));
+        assert!(!g.wants(7_001, 2_000, 19_999), "above the band");
+        assert!(
+            g.wants(5_000, 2_000, 19_999),
+            "in the band, the day's last one"
+        );
+        g.charge_day();
+        assert!(!g.wants(5_000, 2_000, 19_999), "the day's max");
+        assert!(g.wants(5_000, 2_000, 20_000), "a new day counts from zero");
+        g.charge_cost();
+        assert_eq!(g.cost_1e6(), 7 + 5_000 * TOPUP_PRICE_1E6);
+        assert_eq!(
+            g.state(42),
+            TopupState {
+                day: 20_000,
+                used: 0,
+                anchor_set_s: 42,
+                cost_1e6: 2_500_007,
+            }
+        );
+        assert!(g.confirms(3_000, 5_500), "half the weight shows");
+        assert!(!g.confirms(3_000, 5_499), "less does not");
+        assert!(g.above_band(7_001, 2_000) && !g.above_band(7_000, 2_000));
+        let mut t = TopupGovernor::restored(20_000, 25_000, 0).armed(5_000, 30_000);
+        assert!(t.take(5_000, 2_000, 20_000), "decided and charged at once");
+        assert!(
+            !t.take(5_000, 2_000, 20_000),
+            "a second decision before an answer: the day's max"
+        );
+        assert_eq!(t.state(0).used, 30_000);
+        assert!(
+            !t.wants(5_000, 2_000, 19_999),
+            "a clock stepped back re-opens nothing"
+        );
+        assert_eq!(t.state(0).day, 20_000);
+        g.new_session();
+        assert_eq!(g.cost_1e6(), 0);
+        g.stop();
+        assert_eq!(g.weight(), 0);
+        assert_eq!(g.state(0).used, 30_000, "the day reads as spent");
+        assert!(!g.wants(5_000, 2_000, 20_000), "stopped");
     }
 }

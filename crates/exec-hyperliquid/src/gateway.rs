@@ -136,14 +136,16 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 
 use crate::action::{
-    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_schedule_cancel,
-    encode_update_leverage, CancelByCloidWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
+    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_reserve_weight,
+    encode_schedule_cancel, encode_update_leverage, CancelByCloidWire, ModifyWire, OrderWire, Tif,
+    MAX_ACTION, MAX_ORDERS,
 };
 use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
     HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE, CMD_READ_DAY,
-    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE,
+    CMD_SCHEDULE_CANCEL,
 };
 use crate::event::REASON_NOT_FOUND;
 use crate::event::{
@@ -168,7 +170,8 @@ use crate::recon::{
 };
 use crate::request::{
     batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
-    schedule_cancel_json, update_leverage_json, ws_info_open, ws_post_close, ws_post_open,
+    reserve_weight_json, schedule_cancel_json, update_leverage_json, ws_info_open, ws_post_close,
+    ws_post_open,
 };
 use crate::response::{
     scan, scan_items, HlResponse, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING,
@@ -673,7 +676,9 @@ struct ControlWire {
     kind: u8,
     is_cross: bool,
     asset: u32,
-    leverage: u32,
+    /// The leverage (`updateLeverage`), or the weight a purchase buys
+    /// (`reserveRequestWeight`, XMM XH5c).
+    arg: u32,
     /// `scheduleCancel`'s time; `None` clears.
     time: Option<u64>,
 }
@@ -684,8 +689,10 @@ struct ControlWire {
 /// refused locally; `class_of` admits none), never sent as a `noop`.
 fn encode_control(c: &ControlWire, dst: &mut [u8], json: bool) -> Result<usize, MsgPackErr> {
     match (c.kind, json) {
-        (CMD_LEVERAGE, false) => encode_update_leverage(dst, c.asset, c.is_cross, c.leverage),
-        (CMD_LEVERAGE, true) => update_leverage_json(dst, c.asset, c.is_cross, c.leverage),
+        (CMD_LEVERAGE, false) => encode_update_leverage(dst, c.asset, c.is_cross, c.arg),
+        (CMD_LEVERAGE, true) => update_leverage_json(dst, c.asset, c.is_cross, c.arg),
+        (CMD_RESERVE, false) => encode_reserve_weight(dst, u64::from(c.arg)),
+        (CMD_RESERVE, true) => reserve_weight_json(dst, u64::from(c.arg)),
         (CMD_SCHEDULE_CANCEL, false) => encode_schedule_cancel(dst, c.time),
         (CMD_SCHEDULE_CANCEL, true) => schedule_cancel_json(dst, c.time),
         (CMD_NOOP, false) => encode_noop(dst),
@@ -756,14 +763,15 @@ fn class_of(c: &HlCmd) -> Option<usize> {
     }
 }
 
-/// A command that can add exposure: a place, a modify or a leverage
+/// A command that can add exposure or spend: a place, a modify, a leverage
 /// change — a reduce-only place included (XH1: no member relies on the
-/// bit for an exit). The halt and the snapshot gate refuse it, and XG-3
-/// will not send it untimed; cancels, `scheduleCancel` and `noop` always
-/// go.
+/// bit for an exit) — or a weight purchase (XMM XH5c: a halted, unready or
+/// throttled slot buys nothing). The halt and the snapshot gate refuse it,
+/// and XG-3 will not send it untimed; cancels, `scheduleCancel` and `noop`
+/// always go.
 #[inline(always)]
 const fn grows(kind: u8) -> bool {
-    kind == CMD_PLACE || kind == CMD_MODIFY || kind == CMD_LEVERAGE
+    kind == CMD_PLACE || kind == CMD_MODIFY || kind == CMD_LEVERAGE || kind == CMD_RESERVE
 }
 
 /// Whether class `class`'s batch grows ([`grows`]); a control batch by
@@ -2175,7 +2183,7 @@ impl HlGateway {
                 kind: c.kind,
                 is_cross: c.flags & CMD_FLAG_CROSS != 0,
                 asset: c.asset,
-                leverage: c.arg,
+                arg: c.arg,
                 time: if c.time_ms == 0 {
                     None
                 } else {
@@ -2783,8 +2791,8 @@ mod tests {
         );
         assert_eq!(class_of(&cmd(CMD_CANCEL, Tif::Gtc)), Some(CLASS_CANCEL));
         let mut odd = cmd(CMD_PLACE, Tif::Alo);
-        odd.kind = CMD_READ_SPOT + 1;
-        assert_eq!(class_of(&odd), None);
+        odd.kind = CMD_RESERVE + 1;
+        assert_eq!(class_of(&odd), None, "past the last kind (XMM XH5c)");
         assert_eq!(class_of(&HlCmd::read_limit(6, 1)), Some(CLASS_READ));
         assert_eq!(class_of(&HlCmd::read_day(6, 1, 0, 0)), Some(CLASS_READ));
         assert_eq!(class_of(&HlCmd::read_spot(6, 1)), Some(CLASS_READ));
@@ -3152,6 +3160,13 @@ mod tests {
         assert_eq!(class_of(&lev), Some(CLASS_CONTROL));
         assert_eq!(class_of(&sched), Some(CLASS_CONTROL));
         assert_eq!(class_of(&HlCmd::noop(6, 3)), Some(CLASS_CONTROL));
+        let reserve = HlCmd::reserve(6, 4, 10_000);
+        assert_eq!(class_of(&reserve), Some(CLASS_CONTROL));
+        assert!(
+            grows(CMD_RESERVE) && growing(CLASS_CONTROL, CMD_RESERVE),
+            "a purchase grows"
+        );
+        assert_eq!(cmd_bits(CMD_RESERVE), 0, "a control carries no order verb");
         assert!(grows(CMD_PLACE) && grows(CMD_MODIFY) && grows(CMD_LEVERAGE));
         assert!(!grows(CMD_CANCEL) && !grows(CMD_SCHEDULE_CANCEL) && !grows(CMD_NOOP));
         assert!(growing(CLASS_CONTROL, CMD_LEVERAGE));
@@ -3196,7 +3211,7 @@ mod tests {
             kind: CMD_LEVERAGE,
             is_cross: true,
             asset: 1,
-            leverage: 3,
+            arg: 3,
             time: None,
         };
         let n = encode_control(&lev, &mut buf, true).unwrap();
@@ -3211,6 +3226,22 @@ mod tests {
         };
         let n = encode_control(&noop, &mut buf, true).unwrap();
         assert_eq!(&buf[..n], br#"{"type":"noop"}"#);
+        // XMM XH5c: the weight purchase — its msgpack is the SDK vector's
+        // encoder (`reserve_weight`), its JSON twin names the same action.
+        let reserve = ControlWire {
+            kind: CMD_RESERVE,
+            arg: 5_000,
+            ..ControlWire::default()
+        };
+        let n = encode_control(&reserve, &mut buf, true).unwrap();
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"reserveRequestWeight","weight":5000}"#
+        );
+        let n = encode_control(&reserve, &mut buf, false).unwrap();
+        let mut want = [0u8; 64];
+        let m = encode_reserve_weight(&mut want, 5_000).unwrap();
+        assert_eq!(&buf[..n], &want[..m], "the vector's bytes");
         let odd = ControlWire {
             kind: 9,
             ..ControlWire::default()

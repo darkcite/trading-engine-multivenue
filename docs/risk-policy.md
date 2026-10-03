@@ -9448,6 +9448,74 @@ taken); round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH
 NITS (the dead-man residual named a protection `expiresAfter` does not
 give — reworded).
 
+### XH5c-1 amendment (2026-10-03): one top-up governor, and the gateway's weight purchase
+
+The first part of XH5c (plan §3.3 item 1; session-6 assumption A-S6-16:
+XH5c in three commits — the governor and the command; the gateway arm's
+top-ups; the RTT word and the cadence). Nothing new is sent: no arm
+pushes the command before XH5c-2.
+
+- **One governor** (`exec_hyperliquid::budget::TopupGovernor`, 40 B,
+  `Copy`, never allocates): S7-L1's top-up policy moved out of `HlExchange`
+  — the weight per top-up (`0` = off), the day's max, the UTC day and the
+  weight bought on it, the session's spend — with the band rule
+  `topup_fits` and `TOPUP_PRICE_1E6`, unchanged. `above_band` (the cheap
+  check before a venue read), `wants` (the day roll, then the band rule),
+  `take` (decide and charge the day in one step — for an arm whose
+  purchase answers later), `charge_day`, `charge_cost`, `confirms` (seen on
+  the venue: half the weight), `stop` (weight 0, the day spent),
+  `new_session`, `state` (the state line). The blocking arm's
+  `top_up_budget` / `stop_topups` call it in the order they always ran:
+  its policy, its six guards and its state file are unchanged — but one:
+- **The day rolls forward only** (review r1): a clock stepped back across
+  00:00Z (an NTP step, a hand-set clock) no longer re-opens a day already
+  spent — `wants` rolls on a LATER day alone, and `restore_topup` keeps a
+  stored day one later than today with its usage; a day stored further
+  ahead (a clock that once ran ahead) reads as today spent, healed the next
+  day — never top-ups off until the clock catches up. Both arms.
+- **`CMD_RESERVE` (12)** on the gateway: a control action
+  (`HlCmd::reserve`, `arg` the weight), encoded by `encode_reserve_weight`
+  — the SDK vector's encoder — and its JSON twin `reserve_weight_json` in
+  one dispatch (`encode_control`; `ControlWire`'s `leverage` becomes
+  `arg`). It GROWS: the halt, an unready gateway and the throttle refuse
+  it — a halted, unready or throttled slot buys nothing. Its answer is a
+  control answer (ACK, REJECTED or UNANSWERED).
+- **For XH5c-2** (the gateway arm's top-ups): decide with `take` (the day
+  charged before the purchase leaves) and have the state stored off the
+  engine thread before the command is pushed; route the purchase's answer
+  by its own client-id range (never `stray`); refund the address request
+  when the purchase is refused before it leaves (halted, not ready,
+  throttled), and never read such a refusal as bought nor charge its cost;
+  the weight narrowed to the command's `u32` by refusal, never truncation;
+  the state file per network; the command built in place and pushed by
+  reference (the ring slot its one copy); the arm's size pin (1 664 B) and
+  its notes, and the report's (816 B) with its trait doc, size check and
+  `/metrics` notes, moved together; the whole round trip under the alloc
+  gates (the arm's step in gate 98, the control post in gate 96b).
+
+**Tests:** the band (moved with it); the governor (off, the band, the
+day's max, the day roll — forward only — the charges, `take` deciding
+once for a day with room for one, the state line, the confirm's bar, the
+stop, `above_band`); the restore (a later stored day kept with its usage);
+`CMD_RESERVE` is a control and no read, carries its weight, grows and
+carries no order verb; its JSON twin and its msgpack (the vector's
+encoder's bytes); a kind past the last is refused.
+
+**Gates (the committed tree):** clippy 0; nextest 4 152/4 152 (the known
+`a_frame_larger_than_the_buffer_is_refused_not_grown` flake passed on its
+one re-run); alloc 108 (+3 ignored) at 0 B, compiled fresh; copy new=0;
+license OK; release OK; replay 7× IDENTICAL; rustfmt clean on every touched
+hunk.
+
+**Reviews:** round 1 — zero-copy APPROVE, risk and allocation APPROVE WITH
+NITS (a clock stepping back re-opened a spent day — the forward roll; the
+decide/charge split for an arm whose purchase answers later — `take`;
+three double blank lines; the band's check in two files — `above_band`);
+round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH NITS (a day
+stored far ahead kept top-ups off until the clock caught up — read as
+today spent; XH5c-2's list completed); round 3 — risk and zero-copy
+APPROVE.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

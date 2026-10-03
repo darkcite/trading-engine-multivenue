@@ -126,10 +126,6 @@ const SWEEP_ALL_DEADLINE: Duration = Duration::from_secs(12);
 /// often, whatever the check found or did.
 const TOPUP_EVERY: Duration = Duration::from_secs(60);
 
-/// **S7-L1** — the venue's price of one reserved request, USD ×1e6
-/// (0.0005 USDC, "paid from the Perps balance").
-const TOPUP_PRICE_1E6: i64 = 500;
-
 /// **S7-L1** — the first wait after a failed day-spend read; each
 /// further failure doubles it, up to [`DAY_RETRY_MAX`].
 const DAY_RETRY_MIN: Duration = Duration::from_secs(60);
@@ -761,23 +757,17 @@ pub struct HlExchange<const FILL_N: usize> {
     /// The wait after the next failed read: [`DAY_RETRY_MIN`] doubling
     /// to [`DAY_RETRY_MAX`], back to the minimum on a success.
     day_backoff: Duration,
-    /// **S7-L1 (gap E)** — request weight bought per top-up; `0` = off.
-    topup_weight: u64,
-    /// The most weight the top-up may buy in one UTC day.
-    topup_day_max: u64,
-    /// The UTC day `topup_used` counts.
-    topup_day: u64,
-    /// Weight SENT on `topup_day`. Persisted with the day in
-    /// `exec-topup.state`, so a restart does not hand the day its
-    /// ceiling again.
-    topup_used: u64,
-    /// What this SESSION's top-ups cost, USD ×1e6 — subtracted from the
-    /// session P&L, because the perps balance it is paid from is not in
-    /// the equity the reconciler reads. Persisted with the anchor it
-    /// belongs to.
-    topup_cost_1e6: i64,
+    /// **S7-L1 (gap E)** — the request-weight top-up
+    /// ([`budget::TopupGovernor`], XMM XH5c: shared with the gateway arm):
+    /// the weight per top-up (`0` = off), the day's max, the UTC day and the
+    /// weight SENT on it — persisted in `exec-topup.state`, so a restart
+    /// does not hand the day its ceiling again — and what this SESSION's
+    /// top-ups cost, subtracted from the session P&L because the perps
+    /// balance it is paid from is not in the equity the reconciler reads
+    /// (persisted with the anchor it belongs to).
+    topup: budget::TopupGovernor,
     /// When the current anchor was set (unix s), `0` = none: what ties
-    /// `topup_cost_1e6` in the state file to THIS session.
+    /// the top-up spend in the state file to THIS session.
     anchor_set_s: u64,
     /// Earliest instant the next top-up check may run.
     topup_next_at: Instant,
@@ -883,11 +873,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             day_epoch: 0,
             day_retry_at: Instant::now(),
             day_backoff: DAY_RETRY_MIN,
-            topup_weight: 0,
-            topup_day_max: 0,
-            topup_day,
-            topup_used,
-            topup_cost_1e6,
+            topup: budget::TopupGovernor::restored(topup_day, topup_used, topup_cost_1e6),
             anchor_set_s,
             topup_next_at: Instant::now(),
             topup_path,
@@ -964,7 +950,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             self.usdc_1e6
                 .saturating_add(self.held_cost_1e6)
                 .saturating_sub(self.pnl_anchor_1e6)
-                .saturating_sub(self.topup_cost_1e6)
+                .saturating_sub(self.topup.cost_1e6())
         }
     }
 
@@ -1077,8 +1063,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// `request_topup_day_max`); the day's usage and the session's
     /// spend were restored by [`Self::new`].
     pub fn set_topup(&mut self, weight: u64, day_max: u64) {
-        self.topup_weight = weight;
-        self.topup_day_max = day_max;
+        self.topup = self.topup.armed(weight, day_max);
     }
 
     /// **S7-L1 (gap C) — take every resting order of OURS off the
@@ -1264,7 +1249,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// in about half a day, after which the floor halts the slot. The
     /// venue sells more (`reserveRequestWeight`, paid from the PERPS
     /// balance): when the headroom is within one top-up of the floor,
-    /// buy one, at most `topup_day_max` weight per UTC day. Weight `0`
+    /// buy one, at most the day's max weight per UTC day. Weight `0`
     /// is off, and the floor halts as it always did.
     ///
     /// Guarded six ways, each against a way a spender runs away:
@@ -1291,16 +1276,18 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// If top-ups keep failing, the floor halts the slot, which is what
     /// the floor is for.
     fn top_up_budget(&mut self) {
-        if self.topup_weight == 0 || self.budget_source != BudgetSource::Venue {
+        let weight = self.topup.weight();
+        if weight == 0 || self.budget_source != BudgetSource::Venue {
             return;
         }
         let now = Instant::now();
         if now < self.topup_next_at {
             return;
         }
-        let floor = i64::try_from(self.budget.floor()).unwrap_or(i64::MAX);
-        let band = floor.saturating_add(i64::try_from(self.topup_weight).unwrap_or(i64::MAX));
-        if self.budget.remaining() > band {
+        if self
+            .topup
+            .above_band(self.budget.remaining(), self.budget.floor())
+        {
             return;
         }
         self.topup_next_at = now + TOPUP_EVERY;
@@ -1309,22 +1296,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return;
         }
         let today = crate::nonce::now_ms() / crate::dayspend::DAY_MS;
-        if today != self.topup_day {
-            self.topup_day = today;
-            self.topup_used = 0;
-        }
-        if !topup_fits(
-            self.budget.remaining(),
-            floor,
-            self.topup_weight,
-            self.topup_used,
-            self.topup_day_max,
-        ) {
+        if !self
+            .topup
+            .wants(self.budget.remaining(), self.budget.floor(), today)
+        {
             return;
         }
-        let weight = i64::try_from(self.topup_weight).unwrap_or(i64::MAX);
         let before = self.budget.remaining();
-        let outcome = self.reserve_weight(self.topup_weight);
+        let outcome = self.reserve_weight(weight);
         if !matches!(outcome, Reserve::Accepted | Reserve::Unknown) {
             // Never sent, or the venue said no: nothing was bought.
             self.counters.topup_failed = self.counters.topup_failed.wrapping_add(1);
@@ -1332,18 +1311,11 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
         // Bought, or it may have been: the day and the session are
         // charged now, and the charge is on disk before anything else.
-        self.topup_used = self.topup_used.saturating_add(self.topup_weight);
+        self.topup.charge_day();
         if self.pnl_anchor_1e6 != 0 {
-            self.topup_cost_1e6 = self
-                .topup_cost_1e6
-                .saturating_add(weight.saturating_mul(TOPUP_PRICE_1E6));
+            self.topup.charge_cost();
         }
-        let st = budget::TopupState {
-            day: self.topup_day,
-            used: self.topup_used,
-            anchor_set_s: self.anchor_set_s,
-            cost_1e6: self.topup_cost_1e6,
-        };
+        let st = self.topup.state(self.anchor_set_s);
         if budget::store_topup(&self.topup_path, &self.master_addr, st).is_err() {
             // The next boot would restore an older day: no more
             // purchases from this process.
@@ -1360,12 +1332,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             if outcome == Reserve::Accepted {
                 // The venue said yes in so many words; the model carries
                 // the credit it cannot re-read.
-                self.budget.on_reserved(self.topup_weight);
+                self.budget.on_reserved(weight);
             }
             self.stop_topups();
             return;
         }
-        if self.budget.remaining() >= before.saturating_add(weight / 2) {
+        if self.topup.confirms(before, self.budget.remaining()) {
             self.counters.topup_ok = self.counters.topup_ok.wrapping_add(1);
         } else {
             self.stop_topups();
@@ -1377,14 +1349,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// so a restart does not re-arm what this one stopped. Counted as a
     /// failure; the floor decides from here.
     fn stop_topups(&mut self) {
-        self.topup_weight = 0;
-        self.topup_used = self.topup_used.max(self.topup_day_max);
-        let st = budget::TopupState {
-            day: self.topup_day,
-            used: self.topup_used,
-            anchor_set_s: self.anchor_set_s,
-            cost_1e6: self.topup_cost_1e6,
-        };
+        self.topup.stop();
+        let st = self.topup.state(self.anchor_set_s);
         let _ = budget::store_topup(&self.topup_path, &self.master_addr, st);
         self.counters.topup_failed = self.counters.topup_failed.wrapping_add(1);
     }
@@ -1824,7 +1790,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             // S7-L1: a new session's top-up spend starts at zero, tied
             // to THIS anchor in `exec-topup.state`.
             self.anchor_set_s = a.set_unix_s;
-            self.topup_cost_1e6 = 0;
+            self.topup.new_session();
             if crate::anchor::store(&self.pnl_path, a).is_err() {
                 // The in-memory anchor stands for this process; the
                 // next boot re-anchors. Counted so it is not silent.
@@ -3137,23 +3103,6 @@ enum Reserve {
     Unknown,
 }
 
-/// **S7-L1 (gap E)** — with the venue's own headroom in hand: buy one
-/// top-up of `weight`? Only inside the band `(floor, floor + weight]`
-/// — above it there IS headroom (a purchase this arm could not confirm
-/// may already have gone through), and at or under the floor the router
-/// has halted the slot, sticky — and only while the day's ceiling holds
-/// one more. Pure, so the arithmetic is pinned without a venue.
-#[inline]
-#[must_use]
-const fn topup_fits(remaining: i64, floor: i64, weight: u64, used: u64, day_max: u64) -> bool {
-    let w = if weight > i64::MAX as u64 {
-        i64::MAX
-    } else {
-        weight as i64
-    };
-    remaining > floor && remaining <= floor.saturating_add(w) && used.saturating_add(weight) <= day_max
-}
-
 /// The `InstrumentRoll` `venue_seq` layout, bits 0..32 and 56.
 ///
 /// E6: no longer duplicated. §6.1 forbids this crate depending on the
@@ -3902,24 +3851,6 @@ mod tests {
         assert_eq!(y.arm_counters().pnl_anchor_usd_1e6, 8_630_000);
         assert_eq!(y.arm_counters().session_pnl_usd_1e6, 0);
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// **S7-L1 (gap E) — the top-up buys only inside its band and
-    /// under its ceiling.** Floor 2 000, weight 5 000, ceiling 30 000.
-    #[test]
-    fn a_topup_buys_only_between_the_floor_and_one_topup_above_it() {
-        assert!(topup_fits(7_000, 2_000, 5_000, 0, 30_000), "the top of the band");
-        assert!(topup_fits(2_001, 2_000, 5_000, 0, 30_000), "just over the floor");
-        assert!(!topup_fits(7_001, 2_000, 5_000, 0, 30_000), "headroom: nothing to buy");
-        assert!(!topup_fits(2_000, 2_000, 5_000, 0, 30_000), "at the floor: halted, sticky");
-        assert!(!topup_fits(-50, 2_000, 5_000, 0, 30_000), "past the cliff");
-        assert!(topup_fits(5_000, 2_000, 5_000, 25_000, 30_000), "the day's last one");
-        assert!(!topup_fits(5_000, 2_000, 5_000, 25_001, 30_000), "over the ceiling");
-        assert!(!topup_fits(5_000, 2_000, 5_000, u64::MAX, 30_000), "an unreadable day");
-        // Saturates rather than wrapping: a weight past i64 reads as the
-        // widest band, never as a negative one.
-        assert!(topup_fits(5_000, 2_000, u64::MAX, 0, u64::MAX));
-        assert!(!topup_fits(5_000, 2_000, u64::MAX, 1, u64::MAX - 1), "and the ceiling holds");
     }
 
     /// E7-F2: the venue's IoC miss is neither an acceptance nor a
