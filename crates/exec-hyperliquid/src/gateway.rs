@@ -45,7 +45,7 @@
 //! the order is gone).
 //!
 //! **One post.** The action's msgpack is encoded once and signed (LAW
-//! E-3; one nonce stream, on this thread only); its JSON is rendered once,
+//! E-3; its nonce from the agent's one stream, XH4h S3); its JSON is rendered once,
 //! directly behind the WebSocket post head in the TX buffer
 //! (`{"method":"post","id":N,"request":{"type":"action","payload":<envelope>}}`),
 //! and framed in place behind [`WS_CLIENT_HDR_MAX`] bytes of room. A post
@@ -158,7 +158,7 @@ use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
 use crate::json::{array_start, object_field, u64_field};
 use crate::msgpack::MsgPackErr;
-use crate::nonce::{now_ms, Nonce};
+use crate::nonce::{now_ms, NonceSource, SharedNonce};
 use crate::orderupd::{scan_order_updates, OrderUpdate};
 use crate::recon::{
     fills_by_time_request, open_orders_request, perp_state_request, scan_open_orders,
@@ -1512,7 +1512,7 @@ pub struct HlGateway {
     slots: u8,
     sk: secp256k1::SecretKey,
     network: Network,
-    nonce: Nonce,
+    nonce: NonceSource,
     batches: Box<Batches>,
     mp: Box<[u8]>,
     tx: Box<[u8]>,
@@ -1550,7 +1550,8 @@ pub struct HlGateway {
 // tables are on the heap): 7 936 B released at XH4e, 8 000 B with debug
 // assertions (mio 0.8's debug-only selector ids in its `Poll`s and
 // `TcpStream`s), a few words more since XH4f's two boxed Router tables and
-// two counters — held under 8 KiB: a bound, not a pin, so a rustls or mio
+// two counters, one more since XH4h's `NonceSource` — held under 8 KiB: a
+// bound, not a pin, so a rustls or mio
 // bump does not break the build while the struct stays small.
 const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
 
@@ -1614,7 +1615,7 @@ impl HlGateway {
             slots: cfg.slots,
             sk,
             network: cfg.network,
-            nonce: Nonce::new(),
+            nonce: NonceSource::own(),
             // COPY: the ≈ 7.7 KiB batch arrays, built on the stack and
             // moved to the heap once at boot — rejected: an unsafe
             // in-place initialisation (as the dedupe rings).
@@ -1630,6 +1631,21 @@ impl HlGateway {
             dial_fails: 0,
             silent_replace: false,
         })
+    }
+
+    /// **XMM XH4h S3.** Sign with nonces from `stream`, the agent
+    /// address's one stream in this process, so this gateway never draws a
+    /// nonce another signer of the same agent drew (a blocking arm on the
+    /// engine thread). Boot: before the gateway's thread starts — no post
+    /// is signed before its first turn.
+    pub fn share_nonce(&mut self, stream: Arc<SharedNonce>) {
+        self.nonce.share(stream);
+    }
+
+    /// Whether this gateway draws its nonces from a shared stream (S3).
+    #[must_use]
+    pub const fn nonce_shared(&self) -> bool {
+        self.nonce.is_shared()
     }
 
     /// Turn until `stop` is set. The owner spawns the thread (XH4f pins

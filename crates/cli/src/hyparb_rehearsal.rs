@@ -365,7 +365,12 @@ pub fn verb_arm_smoke(
         state_dir,
         budget_floor: 1_000,
     };
-    let boot = boot_hyparb_live::<FILL_N>(&spec, tls.clone())?;
+    // Its own process: its own nonce streams (S3 shares within a process).
+    let boot = boot_hyparb_live::<FILL_N>(
+        &spec,
+        tls.clone(),
+        &mut exec_hyperliquid::NonceStreams::new(),
+    )?;
     out.push_str(&format!("boot: {}\n", boot.tell));
     let mut arm = boot.arm;
     let (mut fills, mut retired) = (Vec::new(), Vec::new());

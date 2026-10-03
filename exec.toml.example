@@ -392,9 +392,10 @@ mode = "paper"
 # post-only rejection halt over the last 200 answers (XH-7); an address
 # floor of at least 320; and no top-up keys (none before XH5). A live
 # gateway slot 6 is the ONLY live slot of its engine — an engine of its
-# own (XH4g's battery): it shares the E3 agent's nonce with no other
-# Hyperliquid signer until XMM XH4h, and a halt's cancel-all reaches every
-# arm the engine holds (D2) — and states no session bound
+# own (XH4g's battery): a halt's cancel-all reaches every arm the engine
+# holds (D2, the operator's to rule; since XMM XH4h every signer of one
+# agent address shares one nonce stream, so the nonce no longer keeps it
+# alone) — and states no session bound
 # (`halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6`: on the shared E3
 # account the account value is not slot 6's P&L; XMM XH5).
 # `cap_instance_usd_1e6` is the slot's gross over its perps. The numbers

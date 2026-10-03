@@ -15,10 +15,10 @@
 //! orders (O-XH6: [`LEVERAGE`]×, cross), and the router binds them as
 //! `LAW_LINEAR` rows. The member's caps must sit inside slot 6's exec
 //! clamps. A live gateway slot 6 runs alone (`exec_boot::resolve`'s
-//! `check_gateway_alone`): it is its engine's only live slot — until XH4h
-//! shares one nonce per agent address the gateway is the process's only
-//! Hyperliquid signer, and a halt's cancel-all reaches every arm the engine
-//! holds (D2) — and it states no session bound: the P&L anchor file comes
+//! `check_gateway_alone`): it is its engine's only live slot — a halt's
+//! cancel-all reaches every arm the engine holds (D2; XH4h S3 lifted the
+//! nonce reason: the gateway draws from its agent's one nonce stream) —
+//! and it states no session bound: the P&L anchor file comes
 //! with XH5's own account (on a shared account the account value is not
 //! slot 6's P&L).
 //!
@@ -48,7 +48,7 @@ use exec_hyperliquid::gateway::{
     POST_TIMEOUT_NS, WS_MSG_SHARE,
 };
 use exec_hyperliquid::rules::PerpRules;
-use exec_hyperliquid::{HlConfig, Scope};
+use exec_hyperliquid::{HlConfig, NonceStreams, Scope};
 use exec_router::{InstrumentSpec, LAW_LINEAR};
 use ingress_hyperliquid::discovery::{HlAssetKind, HlDiscovery};
 use rustls::ClientConfig;
@@ -183,7 +183,11 @@ fn check_caps(xmm: &XmmBoot, s: &ExecSlot) -> Result<(), String> {
 ///
 /// # Errors
 /// The first check that fails.
-pub fn boot_xmm_arm(spec: &XmmSpec<'_>, tls: Arc<ClientConfig>) -> Result<XmmLive, String> {
+pub fn boot_xmm_arm(
+    spec: &XmmSpec<'_>,
+    tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
+) -> Result<XmmLive, String> {
     let s = spec
         .eb
         .slots
@@ -257,14 +261,19 @@ pub fn boot_xmm_arm(spec: &XmmSpec<'_>, tls: Arc<ClientConfig>) -> Result<XmmLiv
     let gcfg = GatewayCfg::production(hl.host.clone(), tls, hl.network, hl.master_addr, cfg.slot);
     // COPY: boot, once — the ≤ 8 KiB gateway out of `new`'s `Result` (then
     // into `spawn_gateway`, noted there). Rejected: as there.
-    let gw = HlGateway::new(gcfg, gw_end, sk, bound.coins)
+    let mut gw = HlGateway::new(gcfg, gw_end, sk, bound.coins)
         .map_err(|e| format!("slot 6's gateway: {e:?}"))?;
+    // XH4h S3: the agent's one nonce stream, before the gateway's first post.
+    gw.share_nonce(nonces.stream(&hl.agent_addr).ok_or_else(|| {
+        String::from("slot 6's gateway: more agent addresses than the nonce streams hold")
+    })?);
     let (handle, stop) = spawn_gateway(gw, "hl-gw-xmm", Some(GATEWAY_CORE))?;
     let tell = format!(
         "xmm: LIVE ARM ARMED — the Hyperliquid gateway, TESTNET, slot 6 on the shared E3 account \
          (own_account=false); {n} perp(s) bound ({}); leverage {LEVERAGE}x cross; reads every \
          {RECON_MS} ms, the budget every {LIMIT_MS} ms (floor {}); shares {IP_WEIGHT_SHARE} IP \
-         weight / {WS_MSG_SHARE} WS messages a minute; expiresAfter {} ms",
+         weight / {WS_MSG_SHARE} WS messages a minute; expiresAfter {} ms; nonces from the \
+         agent's shared stream (XH4h S3)",
         xmm.coins.join(","),
         cfg.budget_floor,
         cfg.expires_after_ms,

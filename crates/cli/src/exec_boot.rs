@@ -698,12 +698,11 @@ fn check_binance(
 
 /// **XMM XH4f — a live gateway slot 6 runs alone** (refused before any arm
 /// boots):
-/// - until XH4h shares one nonce per agent address the gateway is the
-///   process's only Hyperliquid signer (A-XH4f-1) — two signers drawing
-///   their own nonces on one agent collide, and the venue refuses the loser
-///   (a cancel among them);
 /// - the router's halt cancel-all is global (D2, for Anton): a testnet halt
-///   of slot 6 would pull any other live slot's quotes, and theirs slot 6's;
+///   of slot 6 would pull any other live slot's quotes, and theirs slot 6's
+///   — so until D2 is ruled the gateway slot is its engine's only live slot
+///   (XH4h S3 lifted the rule's other reason, A-XH4f-1: every signer of one
+///   agent address now draws from one nonce stream);
 /// - its session bound could never fire: the gateway arm judges no P&L on
 ///   the shared testnet account (XH5 gives slot 6 its own).
 fn check_gateway_alone(boot: &ExecBoot) -> Result<(), String> {
@@ -712,9 +711,8 @@ fn check_gateway_alone(boot: &ExecBoot) -> Result<(), String> {
     };
     if boot.live_mask != 1u8 << g {
         return Err(String::from(
-            "exec: slot 6 is live on the Hyperliquid gateway beside another live slot — until \
-             XMM XH4h shares one nonce per agent address the gateway is the process's only \
-             Hyperliquid signer, and the router's halt cancel-all is global (XH4f D2): run \
+            "exec: slot 6 is live on the Hyperliquid gateway beside another live slot — the \
+             router's halt cancel-all is global (XMM XH4f D2, the operator's to rule): run \
              slot 6 in an engine of its own, the others paper",
         ));
     }
@@ -1208,17 +1206,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// XMM XH4f: until XH4h shares the nonce, the gateway is the process's
-    /// only Hyperliquid signer — a live slot 3 on the operator's arm beside
-    /// it refuses the boot; the same slot 3 paper resolves.
+    /// XMM XH4f D2 (XH4h S3 lifted A-XH4f-1, the nonce): while the halt's
+    /// cancel-all is global, a live slot 3 on the operator's arm beside the
+    /// gateway slot refuses the boot — for D2 alone; the same slot 3 paper
+    /// resolves.
     #[test]
-    fn the_gateway_signs_alone_until_xh4h() {
+    fn the_gateway_slot_runs_alone_while_d2_stands() {
         let d = tmp();
         let both = format!("{MINIMAL_LIVE}{}", gw_six().replacen("[exec]\n", "", 1));
         let p = write(&d, "exec.toml", &both);
-        let e = resolve(Some(&p), Some("3,6")).expect_err("two Hyperliquid signers");
+        let e = resolve(Some(&p), Some("3,6")).expect_err("another live slot beside it");
         assert!(
-            e.contains("XH4h") && e.contains("only") && e.contains("Hyperliquid signer"),
+            e.contains("D2") && e.contains("engine of its own") && !e.contains("nonce"),
             "{e}"
         );
         let p = write(
@@ -1227,7 +1226,7 @@ mod tests {
             &both.replacen("mode = \"live\"", "mode = \"paper\"", 1),
         );
         let boot = resolve(Some(&p), Some("6"))
-            .expect("slot 3 paper: the gateway signs alone")
+            .expect("slot 3 paper: the gateway slot is the only live slot")
             .expect("present");
         assert_eq!(boot.gateway_live(), Some(XMM_SLOT));
         assert!(!boot.hl_arm_needed());

@@ -80,7 +80,7 @@ use exec_hyperevm::calldata::{
 use exec_hyperevm::nonce::WalletState;
 use exec_hyperevm::rpc::TokenMove;
 use exec_hyperevm::{MainnetAuthority, Network};
-use exec_hyperliquid::{HlConfig, HlExchange, PerpPosition, SpotBalance};
+use exec_hyperliquid::{HlConfig, HlExchange, NonceStreams, PerpPosition, SpotBalance};
 use rustls::ClientConfig;
 use tracing::{info, warn};
 
@@ -1586,6 +1586,7 @@ fn addr_at(arm: &mut EvmArm, to: &[u8; 20], selector: [u8; 4]) -> Result<[u8; 20
 pub fn boot_hyparb_live<const FILL_N: usize>(
     spec: &LiveSpec<'_>,
     tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
 ) -> Result<LiveBoot<FILL_N>, String> {
     if spec.pools.is_empty() || spec.pools.len() > MAX_LIVE_POOLS {
         return Err(format!(
@@ -1705,6 +1706,10 @@ pub fn boot_hyparb_live<const FILL_N: usize>(
         spec.budget_floor,
     )
     .map_err(|e| format!("hyperliquid arm for X: {e}"))?;
+    // XH4h S3: X's agent's one nonce stream, before the first signed action.
+    hl.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
+        String::from("hyperliquid arm for X: more agent addresses than the nonce streams hold")
+    })?);
     hl.seed_budget_from_venue();
     let meta = info_once(&hl_cfg.host, br#"{"type":"meta"}"#, tls.clone())?;
     let mut disc = ingress_hyperliquid::discovery::HlDiscovery::new();

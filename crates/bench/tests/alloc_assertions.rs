@@ -7306,6 +7306,40 @@ fn routed_dispatch_steady_state() {
     );
 }
 
+/// **XMM XH4h S3 — the agent's shared nonce stream draws at 0 B/op.**
+/// Every signer of one agent address (the gateway's thread, the blocking
+/// arms) draws through a [`exec_hyperliquid::NonceSource`]; the shared
+/// variant is one compare-and-swap on an `Arc`'d cache line made at boot.
+/// The registry and the `Arc` are boot work, outside the window.
+#[test]
+fn hl_shared_nonce_draws_are_zero_alloc() {
+    use exec_hyperliquid::{NonceSource, NonceStreams};
+
+    let mut streams = NonceStreams::new();
+    let agent = [0xE3; 20];
+    let mut gateway = NonceSource::own();
+    let mut arm = NonceSource::own();
+    gateway.share(streams.stream(&agent).expect("a stream"));
+    arm.share(streams.stream(&agent).expect("the same stream"));
+    let mut own = NonceSource::own();
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    for i in 0..10_000u64 {
+        let ms = 1_790_000_000_000 + i / 3;
+        acc = acc.wrapping_add(gateway.next(ms));
+        acc = acc.wrapping_add(arm.next(ms));
+        acc = acc.wrapping_add(own.next(ms));
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _deallocs) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "nonce draws allocated {allocs} times ({bytes} B)"
+    );
+    assert!(gateway.last() == arm.last() && gateway.is_shared());
+}
+
 /// E2 gate 54 — encoding AND signing a Hyperliquid action allocates
 /// nothing.
 ///
@@ -8042,6 +8076,12 @@ fn hl_exchange_requote_path_is_zero_alloc() {
         u64::MAX,
     )
     .expect("build");
+    // XH4h S3: as the engine boots it — the agent's shared nonce stream.
+    x.share_nonce(
+        exec_hyperliquid::NonceStreams::new()
+            .stream(&[0x58; 20])
+            .expect("a stream"),
+    );
     x.on_venue_event(&roll(OUTCOME, SYM));
 
     // Prime: the first pass through the signing context and the
@@ -14463,6 +14503,12 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     };
     let sk = signer_eip712::parse_secret_key(&[0x11; 32]).expect("gate 96 key");
     let mut gw = HlGateway::new(cfg, gw_end, sk, coins).expect("gate 96 gateway");
+    // XH4h S3: as the engine boots it — the agent's shared nonce stream.
+    gw.share_nonce(
+        exec_hyperliquid::NonceStreams::new()
+            .stream(&[0x58; 20])
+            .expect("a stream"),
+    );
     let mut kinds = [0u64; 16];
     let t0 = std::time::Instant::now();
     while !gw.ws_live() || kinds[usize::from(EV_SNAPSHOT)] == 0 {

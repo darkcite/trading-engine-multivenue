@@ -144,7 +144,7 @@ pub use exchange::{HlExchange, HlExecCounters};
 pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
-pub use nonce::Nonce;
+pub use nonce::{Nonce, NonceSource, NonceStreams, SharedNonce};
 pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
 pub use recon::{
     drift, net_exposure_1e8, perp_state_request, scan_perp_state, scan_spot_state, spot_state_request,

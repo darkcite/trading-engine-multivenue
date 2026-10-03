@@ -2700,6 +2700,7 @@ fn boot_operator_hl_arm(
     eb: &cli::exec_boot::ExecBoot,
     md_ws_host: &str,
     f3p: core_ring::Producer<core_types::Fill, { engine::FILL_RING_SIZE }>,
+    nonces: &mut exec_hyperliquid::NonceStreams,
 ) -> Result<exec_hyperliquid::HlExchange<{ engine::FILL_RING_SIZE }>, String> {
     let hl_cfg = exec_hyperliquid::HlConfig::from_env(exec_hyperliquid::Scope::Live).map_err(|e| {
         format!("slot(s) LIVE on hyperliquid but the arm cannot be configured: {e}")
@@ -2737,6 +2738,11 @@ fn boot_operator_hl_arm(
         floor,
     )
     .map_err(|e| e.to_string())?;
+    // XMM XH4h S3: the agent's one nonce stream in this process, before the
+    // first signed action (the boot sweep below).
+    arm.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
+        String::from("the operator's arm: more agent addresses than the nonce streams hold")
+    })?);
     // E7-F1: the address budget is the venue's number, read once here;
     // the cold assumption halted the first mainnet boot before its first
     // order (2026-09-19).
@@ -2792,6 +2798,7 @@ fn boot_hyparb_live_arm(
     eb: &cli::exec_boot::ExecBoot,
     hb: Option<&cli::hyparb_boot::HyparbBoot>,
     universe: &core_config::universe::AllocatedUniverse,
+    nonces: &mut exec_hyperliquid::NonceStreams,
 ) -> Result<cli::hyparb_live::LiveBoot<{ engine::FILL_RING_SIZE }>, String> {
     let hb = hb.ok_or("slot 0 is armed live but no hyparb artifact is booted")?;
     let authority = exec_hyperevm::MainnetAuthority::armed_engine(
@@ -2826,7 +2833,7 @@ fn boot_hyparb_live_arm(
         state_dir: cli::hyparb_live::state_dir(&eb.path),
         budget_floor: floor,
     };
-    cli::hyparb_live::boot_hyparb_live(&spec, TlsTransport::default_client_config())
+    cli::hyparb_live::boot_hyparb_live(&spec, TlsTransport::default_client_config(), nonces)
 }
 
 /// **E6 commit 3/4 — the halt machine, wired.** Shared by both
@@ -5289,8 +5296,17 @@ fn run(args: RunArgs) -> ExitCode {
                     // the slot's own Hyperliquid account, authorised only
                     // by all three switches (checked above, and again by
                     // `MainnetAuthority::armed_engine`).
+                    // **XMM XH4h S3 — one nonce stream per agent address**:
+                    // every Hyperliquid signer below asks for its agent's
+                    // stream before its first signed action.
+                    let mut nonces = exec_hyperliquid::NonceStreams::new();
                     let hyparb_live = if eb.hyparb_live() {
-                        match boot_hyparb_live_arm(&eb, hyparb_boot.as_ref(), &boot.allocated) {
+                        match boot_hyparb_live_arm(
+                            &eb,
+                            hyparb_boot.as_ref(),
+                            &boot.allocated,
+                            &mut nonces,
+                        ) {
                             Ok(b) => {
                                 warn!("{}", b.tell);
                                 obs.hyparb_live_status = Some(b.arm.shared().clone());
@@ -5316,7 +5332,8 @@ fn run(args: RunArgs) -> ExitCode {
                             join_reverse(handles);
                             return ExitCode::from(1);
                         };
-                        match boot_operator_hl_arm(&eb, &cfg.hyperliquid_ws_host, f3p) {
+                        match boot_operator_hl_arm(&eb, &cfg.hyperliquid_ws_host, f3p, &mut nonces)
+                        {
                             Ok(a) => Some(a),
                             Err(reason) => {
                                 error!(reason, "exec: hyperliquid arm refused — boot aborted");
@@ -5391,9 +5408,10 @@ fn run(args: RunArgs) -> ExitCode {
                     // bound from the exchange host's meta, their leverage
                     // set before it takes orders, its thread released only
                     // after the loop (the arm's shutdown pumps it in the
-                    // drain). `resolve` made it the process's only
-                    // Hyperliquid signer. Booted last: no refusal after it
-                    // but the shapes' own.
+                    // drain). `resolve` made it the engine's only live
+                    // slot (D2); it draws from its agent's nonce stream
+                    // (XH4h S3). Booted last: no refusal after it but the
+                    // shapes' own.
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -5403,6 +5421,7 @@ fn run(args: RunArgs) -> ExitCode {
                         match cli::xmm_live::boot_xmm_arm(
                             &spec,
                             TlsTransport::default_client_config(),
+                            &mut nonces,
                         ) {
                             Ok(b) => {
                                 warn!("{}", b.tell);
@@ -5419,6 +5438,14 @@ fn run(args: RunArgs) -> ExitCode {
                     } else {
                         None
                     };
+                    if nonces.signers() != 0 {
+                        info!(
+                            agents = nonces.agents(),
+                            signers = nonces.signers(),
+                            "exec: Hyperliquid nonce streams — one per agent address (XMM XH4h \
+                             S3): every signer of one agent draws from one stream"
+                        );
+                    }
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
                     // the loop from its own arm — enumerated, eight (O-BX30),

@@ -8697,6 +8697,71 @@ fails the run; `--sweep-first`'s scope; five texts), zero-copy APPROVE,
 allocation APPROVE. The record run b5 ran on that code, before its last
 change (the gateway's join shortened under a stop, and texts).
 
+### XH4h-1 amendment (2026-10-03): one nonce stream per agent address (S3) — A-XH4f-1 lifted
+
+The venue keeps its nonce window per SIGNER: a nonce must be unique, inside
+(T − 2 days, T + 1 day), and above the smallest of the 100 highest it holds
+for that signer. One process may hold several signers of one agent address —
+the E3 testnet agent signs for slots 0, 3 and 6, and an operator may point
+two arms at one agent. Two counters on one agent draw the same millisecond,
+and the venue refuses the loser (possibly a cancel). Since XH4h every
+Hyperliquid signer of the engine draws from its agent's ONE stream:
+
+- `exec_hyperliquid::nonce::SharedNonce` — `max(now_ms, last + 1)` by one
+  compare-and-swap on its own 128 B granule (`Relaxed`: the
+  read-modify-writes of one atomic are totally ordered, and the stream
+  publishes no other memory). No lock, no allocation (alloc gate
+  `hl_shared_nonce_draws_are_zero_alloc`; gates 60 and 96 now run the arm
+  and the gateway on a shared stream, as the engine boots them).
+- `NonceSource` — a signer's own `Nonce` (a process's lone signer) or its
+  agent's stream: one predictable branch per signed action (an enum, not
+  the plan's generic: no type parameter through the arms and the loop
+  shapes for a nanosecond beside a signature's tens of microseconds).
+  `share` is boot-only — before the signer's first signed action, asserted
+  in debug builds; in release it still raises the stream past anything the
+  signer drew, so it never steps back.
+- `NonceStreams` — the boot's registry, one stream per agent address
+  (`HlConfig.agent_addr`, derived from the same key the signer signs with;
+  at most four). The engine's boot hands it to every Hyperliquid signer
+  right after the signer is built: HYPARB's X arm, the operator's arm
+  (before its boot sweep), slot 6's gateway (before its thread starts). The
+  boot tells the count (`agents`, `signers`).
+- **Within ONE process only.** Two processes signing as one agent (E3 on
+  testnet, X on mainnet) still collide: the XH4g battery, exec-smoke, the
+  arm smoke and an engine never run at once on one agent — the XH4f
+  obligation stands.
+- The venue's window of 100 is shared by every signer of the agent: a post
+  overtaken by 100 later draws is refused for its nonce — never a fill,
+  never a duplicate (the gateway's in-flight bound is 100 too; it matters
+  only once D2 lets two signers of one agent run live together).
+- Superseded: "one nonce stream per arm" (the XH4b text above) — the
+  stream is per agent address.
+
+**A-XH4f-1 is lifted** (plan default H2, taken in the session; it was item
+(b) on XH4f's list for Anton). `check_gateway_alone` still refuses a live
+gateway slot 6 beside another live slot — now for D2 alone (the router's
+halt cancel-all is global; the operator's to rule) — and a session bound on
+it (XH5). No live shape changes: today every engine shape that boots has one
+signer per agent.
+
+**Tests:** the stream's counter law (a backwards clock, a raise); four
+threads × 50 000 draws, unique and increasing per thread; two signers joined
+to one stream interleave uniquely; a signer that drew cannot join late
+(debug); one stream per agent address, and the registry's capacity; the
+gateway-alone refusal citing D2 alone; the alloc gate. **Deviations from the
+plan:** no testvenue duplicate-nonce test (the testvenue checks no nonces;
+the threads test and the debug assertion pin the law) and no offline
+contention micro-bench (the signers' posts are milliseconds apart).
+
+**Reviews:** round 1 — risk APPROVE WITH NITS, zero-copy and allocation
+APPROVE WITH NITS; round 2 — risk, zero-copy and allocation APPROVE. The
+nits, all taken: the cross-process sentence corrected, the 128 B granule
+and its size assert, gates 60 and 96 on a shared stream, `NonceSource` not
+`Clone`, the share-before-sign assertion, the stale texts. Answered, not
+changed: deriving the registry key from the signer's own key (the address
+already comes from that key in `HlConfig`; deriving again would put the
+secret on the stack).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
