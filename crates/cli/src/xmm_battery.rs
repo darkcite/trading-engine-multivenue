@@ -1276,7 +1276,7 @@ pub fn run(spec: &BatterySpec, gcfg: GatewayCfg, sk: signer_eip712::SecretKey) -
         }
     };
     let mut tap = Tap::start(&host, port, Arc::clone(&tls), master);
-    let (handle, stop) = match spawn_gateway(gw, "hl-gw-battery", None) {
+    let (handle, stop) = match spawn_gateway(gw, "hl-gw-battery", None, None) {
         Ok(h) => h,
         Err(e) => {
             rep.fail(EXIT_BOOT, e);

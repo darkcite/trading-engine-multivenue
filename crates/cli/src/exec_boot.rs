@@ -718,16 +718,18 @@ fn check_binance(
 ///   (R-XH4-1) — a halt cancels only the halted slot's orders — so slot 6
 ///   runs beside the live slots that arm trades, on TESTNET with them
 ///   (LAW E-4 puts both arms on the market data's network);
-/// - **never beside slot 0 or a live Binance slot until XH5b**: their arms
-///   trade mainnet only (slot 0's `MainnetAuthority`, BX-16), the gateway
-///   testnet only, and one engine never mixes a testnet rehearsal with
-///   mainnet orders;
-/// - its session bound could never fire: the gateway arm judges no P&L on
-///   the shared testnet account (XH5b gives slot 6 its own).
+/// - **never beside slot 0 or a live Binance slot until XH5b-3**: their
+///   arms trade mainnet only (slot 0's `MainnetAuthority`, BX-16), the
+///   gateway testnet only, and one engine never mixes a testnet rehearsal
+///   with mainnet orders.
+///
+/// Its session bound is judged by its account, which only slot 6's boot
+/// knows (XMM XH5b-2, `xmm_live::check_account_rules`): required on its
+/// own account, refused on the shared one.
 fn check_gateway_slot(boot: &ExecBoot) -> Result<(), String> {
-    let Some(g) = boot.gateway_live() else {
+    if boot.gateway_live().is_none() {
         return Ok(());
-    };
+    }
     let mainnet = if boot.hyparb_live() {
         Some(HYPEREVM_SLOT)
     } else {
@@ -735,23 +737,11 @@ fn check_gateway_slot(boot: &ExecBoot) -> Result<(), String> {
     };
     if let Some(m) = mainnet {
         return Err(format!(
-            "exec: slot 6 is live on the Hyperliquid gateway — TESTNET until XMM XH5b — in an \
-             engine where slot {m} ({}) is live on an arm that trades mainnet only (slot 0's \
+            "exec: slot 6 is live on the Hyperliquid gateway — TESTNET until XMM XH5b-3 — in \
+             an engine where slot {m} ({}) is live on an arm that trades mainnet only (slot 0's \
              wallet, or Binance): one engine never mixes a testnet rehearsal with mainnet \
              orders. Run slot {m} paper, or slot 6 in an engine of its own",
             SLOT_NAMES[m]
-        ));
-    }
-    if boot
-        .slots
-        .iter()
-        .any(|s| s.slot == g && (s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0))
-    {
-        return Err(String::from(
-            "exec: slot 6 on the Hyperliquid gateway states a session bound \
-             (halt_on_gain/loss_usd_1e6), but the gateway arm judges no P&L on the shared \
-             testnet account — the bound could never fire: drop it (XMM XH5b gives slot 6 \
-             its own account)",
         ));
     }
     Ok(())
@@ -1261,12 +1251,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// XMM XH5a: until XH5b the gateway slot never shares an engine with an
-    /// arm that trades mainnet only — a live Binance slot, or slot 0 — and
-    /// it states no session bound (the gateway arm judges none on the
-    /// shared testnet account).
+    /// XMM XH5a: until XH5b-3 the gateway slot never shares an engine with
+    /// an arm that trades mainnet only — a live Binance slot, or slot 0.
+    /// XH5b-2: its session bound resolves here — slot 6's boot judges it by
+    /// its account (`xmm_live::check_account_rules`).
     #[test]
-    fn the_gateway_slot_refuses_mainnet_arms_beside_it_and_a_session_bound() {
+    fn the_gateway_slot_refuses_mainnet_arms_beside_it() {
         let d = tmp();
         let six = gw_six().replacen("[exec]\n", "", 1);
         let with_bn = format!("{}{six}{BN_SECTION}", bn_live());
@@ -1285,8 +1275,13 @@ mod tests {
         );
         let bounded = format!("{}halt_on_loss_usd_1e6 = 5000000\n", gw_six());
         let p = write(&d, "exec-pnl.toml", &bounded);
-        let e = resolve(Some(&p), Some("6")).expect_err("a bound that could never fire");
-        assert!(e.contains("session bound") && e.contains("XH5b"), "{e}");
+        let b = resolve(Some(&p), Some("6"))
+            .expect("a bound resolves: slot 6's boot judges it by its account")
+            .expect("present");
+        assert!(b
+            .slots
+            .iter()
+            .any(|s| s.slot == XMM_SLOT && s.halt_on_loss_usd_1e6 == 5_000_000));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1333,6 +1328,16 @@ mod tests {
                 .any(|l| l.starts_with("exec: slot 6 HALTS") && l.contains("alo_reject_pct=20")),
             "{tell:?}"
         );
+        // XMM XH5b-2: the recipe is an own account's — its loss bound
+        // stated, its stale floor four 30 s periods; on the shared account
+        // its bound refuses.
+        let s6 = boot
+            .slots
+            .iter()
+            .find(|s| s.slot == XMM_SLOT)
+            .expect("slot 6");
+        assert_eq!(crate::xmm_live::check_account_rules(s6, true), Ok(()));
+        assert!(crate::xmm_live::check_account_rules(s6, false).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

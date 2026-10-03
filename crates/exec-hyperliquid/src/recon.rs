@@ -65,7 +65,7 @@ pub const MAX_SPOT_BALANCES: usize = 256;
 // that must fail the build rather than a test run.
 const _: () = assert!(MAX_SPOT_BALANCES >= 14 * 4);
 
-use crate::json::{decimal_field, object_end, string_field};
+use crate::json::{decimal_field, object_end, object_field, string_field};
 use crate::response::{ScanErr, Span};
 
 /// One row of the venue's spot balance sheet.
@@ -809,6 +809,53 @@ pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, Sc
 /// The buffer is too short.
 pub fn perp_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
     user_info_request(out, br#"{"type":"clearinghouseState","user":"0x"#, master)
+}
+
+/// **XMM XH5b-2**: render `{"type":"userRole","user":"0x<40 hex>"}` — what
+/// the venue knows an address as: a master, or an API wallet and the master
+/// it signs for. Zero-alloc; the buffer needs [`MAX_STATE_REQ`].
+///
+/// # Errors
+/// The buffer is too short.
+pub fn user_role_request(out: &mut [u8], user: &[u8; 20]) -> Result<usize, ScanErr> {
+    user_info_request(out, br#"{"type":"userRole","user":"0x"#, user)
+}
+
+/// **XMM XH5b-2** — what a `userRole` answer says an address is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A master account (`"role":"user"`): it signs as itself.
+    User,
+    /// An API wallet and the master that approved it
+    /// (`"role":"agent","data":{"user":…}`) — where its orders land.
+    Agent([u8; 20]),
+    /// Any other answer (`missing`, `vault`, `subAccount`), or one that
+    /// does not scan.
+    Other,
+}
+
+/// **XMM XH5b-2** — scan a `userRole` answer in place (boot only). The
+/// venue's answer for an API wallet, measured (`userws_conn`):
+/// `{"role":"agent","data":{"user":"0x<master>"}}`.
+#[must_use]
+pub fn scan_user_role(b: &[u8]) -> Role {
+    let Some(r) = string_field(b, b"\"role\"") else {
+        return Role::Other;
+    };
+    match r.of(b) {
+        b"user" => Role::User,
+        b"agent" => {
+            let Some((s, e)) = object_field(b, b"\"data\"") else {
+                return Role::Other;
+            };
+            let d = &b[s..e];
+            string_field(d, b"\"user\"")
+                .and_then(|u| core::str::from_utf8(u.of(d)).ok())
+                .and_then(crate::config::parse_hex20)
+                .map_or(Role::Other, Role::Agent)
+        }
+        _ => Role::Other,
+    }
 }
 
 /// One perp position from a `clearinghouseState` body.
@@ -1561,5 +1608,31 @@ mod tests {
         let n = fills_by_time_request(&mut out, &[0; 20], 0, 9).unwrap();
         assert!(out[..n].ends_with(br#""startTime":0,"endTime":9}"#));
         assert!(fills_by_time_request(&mut out[..n - 1], &[0; 20], 0, 9).is_err());
+    }
+
+    /// XMM XH5b-2: `userRole` — the request, and the answers slot 6's boot
+    /// reads: an API wallet and its master (the venue's measured shape), a
+    /// master, and everything else.
+    #[test]
+    fn the_user_role_answer_names_the_api_wallet_s_master() {
+        let mut buf = [0u8; MAX_STATE_REQ];
+        let n = user_role_request(&mut buf, &[0xAB; 20]).expect("fits");
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"userRole","user":"0xabababababababababababababababababababab"}"#
+        );
+        let mut small = [0u8; 8];
+        assert!(user_role_request(&mut small, &[0xAB; 20]).is_err());
+        let agent =
+            br#"{"role":"agent","data":{"user":"0xCDcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}"#;
+        assert_eq!(scan_user_role(agent), Role::Agent([0xCD; 20]));
+        assert_eq!(scan_user_role(br#"{"role":"user"}"#), Role::User);
+        assert_eq!(scan_user_role(br#"{"role":"missing"}"#), Role::Other);
+        let sub = br#"{"role":"subAccount","data":{"master":"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}"#;
+        assert_eq!(scan_user_role(sub), Role::Other);
+        let short = br#"{"role":"agent","data":{"user":"0xcd"}}"#;
+        assert_eq!(scan_user_role(short), Role::Other);
+        assert_eq!(scan_user_role(br#"{"role":"agent"}"#), Role::Other);
+        assert_eq!(scan_user_role(b"<html>"), Role::Other);
     }
 }

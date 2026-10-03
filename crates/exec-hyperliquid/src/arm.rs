@@ -65,8 +65,10 @@
 //! agreement fresh and its P&L judged only with both halves landed. The
 //! session's P&L anchor is restored from the owner's state file (E7: a
 //! bound re-anchored per boot is a bound on nothing) or taken at the
-//! first complete worth and offered to the owner to keep; it is judged on
-//! the slot's own account only.
+//! first complete worth and handed to its keeper on the gateway's thread
+//! ([`HlGatewayArm::keep_anchor_in`], XH5b-2) — the slot is reconciled
+//! only once the keeper has stored it; it is judged on the slot's own
+//! account only.
 //!
 //! **Cancel-all** marks every order it holds for cancel and asks the
 //! gateway's sweep; `Clear` means the venue read clear AND no order the
@@ -126,6 +128,8 @@
 //! Engine thread, 0 B/op after boot (gate 98): fixed tables, fixed
 //! queues, linear scans over at most [`ARM_ORDERS`] rows.
 
+use std::sync::Arc;
+
 use clob_dispatcher::{
     CancelAllState, DispatchError, DispatchStats, GatewayArmReport, HaltSignal, OrderDispatch,
     Renamed, Retired, RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_TTL, RETIRED_CANCELED_VENUE,
@@ -144,6 +148,7 @@ use exec_gateway::stats::{CONGESTION_THROTTLED, SWEEP_CLEAR, SWEEP_STRANDED};
 use exec_gateway::{boxed_array, HALT_NONE};
 
 use crate::action::Tif;
+use crate::anchor::AnchorSlot;
 use crate::budget::AddressBudget;
 use crate::cmd::{HlCmd, CMD_CANCEL};
 use crate::dayspend::{DAY_MS, VENUE_PAGE_MAX};
@@ -345,8 +350,8 @@ pub struct ArmCfg {
     pub own_account: bool,
     /// The session's P&L anchor restored from the owner's state file, the
     /// account's worth USD ×1e6; 0 = none (the first complete worth
-    /// anchors, and [`HlGatewayArm::fresh_anchor_1e6`] offers it for
-    /// keeping).
+    /// anchors, and the arm hands it to its keeper:
+    /// [`HlGatewayArm::keep_anchor_in`]).
     pub anchor_1e6: i64,
     /// The dead-man switch's timing.
     pub deadman: DeadManCfg,
@@ -450,6 +455,9 @@ pub struct ArmCounters {
     pub limit_reads: u64,
     /// Spot sheets answered with their USDC row (XH5b-1).
     pub spot_reads: u64,
+    /// Spot reads that failed — refused, unanswered, an end of another
+    /// kind, a sheet that lists no USDC (XH5b-2).
+    pub spot_failed: u64,
     /// Pages of the day's fills read (XH4e).
     pub day_pages: u64,
     /// Days read spent because their start may be unread (XH4e): the
@@ -698,8 +706,15 @@ pub struct HlGatewayArm {
     spot_ns: u64,
     next_spot_ns: u64,
     anchored: bool,
-    /// The anchor was taken this boot (the owner keeps it).
+    /// The anchor was taken this boot (its keeper stores it).
     fresh_anchor: bool,
+    /// XH5b-2: the anchor is durable — restored from the state file, or
+    /// read back stored by its keeper (on the slot's own account the first
+    /// reconciliation waits for it).
+    anchor_kept: bool,
+    /// XH5b-2: where a fresh anchor is handed to its keeper (the gateway's
+    /// thread); `None` — no keeper: a fresh anchor is never kept.
+    keep: Option<Arc<AnchorSlot>>,
     // The arm's own ends: the client ids, when, whether inferred (bit k),
     // the next slot.
     done_ids: Box<[u64; FINISHED]>,
@@ -745,7 +760,8 @@ pub struct HlGatewayArm {
 
 // The arm's inline state, 1 664 B — what `new` moves into its owner (the
 // tables are boxed); XH5b-1's spot half and its counter (32 B) took one more
-// 64 B line.
+// 64 B line; XH5b-2's kept flag, its keeper's handle (the anchor word itself
+// lives behind it) and `spot_failed` (17 B) fit that line's padding.
 const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_664);
 
 /// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
@@ -878,6 +894,8 @@ impl HlGatewayArm {
             next_spot_ns: u64::MAX,
             anchored: cfg.anchor_1e6 > 0,
             fresh_anchor: false,
+            anchor_kept: cfg.anchor_1e6 > 0,
+            keep: None,
             done_ids: boxed_array(0),
             done_ns: boxed_array(0),
             done_inferred: 0,
@@ -1002,17 +1020,14 @@ impl HlGatewayArm {
         self.boot_held
     }
 
-    /// The session anchor this boot took (the account's worth USD ×1e6),
-    /// for the owner to keep off the engine thread (E7) in a state file of
-    /// the slot's own; `None` when it was restored, not taken yet, or the
-    /// account is shared (its P&L is never judged there).
-    #[must_use]
-    pub const fn fresh_anchor_1e6(&self) -> Option<i64> {
-        if self.fresh_anchor && self.cfg.own_account {
-            Some(self.anchor_1e8 / WIRE_PER_ENGINE)
-        } else {
-            None
-        }
+    /// **XH5b-2 — boot: where the arm hands a fresh anchor to its keeper**
+    /// (`anchor::AnchorKeeper`, on the gateway's thread), which stores it
+    /// off the engine thread (E7). On the slot's own account the first
+    /// reconciliation waits until the keeper has stored it; with no keeper
+    /// a fresh anchor is never kept, and the slot never reconciled (the
+    /// safe direction). A restored anchor needs none.
+    pub fn keep_anchor_in(&mut self, slot: Arc<AnchorSlot>) {
+        self.keep = Some(slot);
     }
 
     /// XH4g: the reconciliation as last read — when each read was answered,
@@ -1882,7 +1897,10 @@ impl HlGatewayArm {
             READ_ORDERS => self.next_orders_ns = retry,
             READ_LIMIT => self.limit_due_ns = slow,
             READ_DAY => self.day_due_ns = slow,
-            READ_SPOT => self.next_spot_ns = u64::MAX,
+            READ_SPOT => {
+                self.next_spot_ns = u64::MAX;
+                self.counters.spot_failed += 1;
+            }
             _ => self.next_state_ns = retry,
         }
         self.read_oid = 0;
@@ -2194,10 +2212,16 @@ impl HlGatewayArm {
         self.spot_ns = now;
         self.next_spot_ns = u64::MAX;
         self.counters.spot_reads += 1;
-        if !self.anchored && self.worth_1e8() > 0 {
+        // Positive in the engine's units: a worth under $1e-6 anchors
+        // nothing (its keeper's word could not carry it).
+        if !self.anchored && self.worth_1e8() / WIRE_PER_ENGINE > 0 {
             self.anchor_1e8 = self.worth_1e8();
             self.anchored = true;
             self.fresh_anchor = true;
+            // XH5b-2: handed to its keeper, once; durable when it says so.
+            if let Some(k) = &self.keep {
+                k.publish(self.anchor_1e8 / WIRE_PER_ENGINE);
+            }
         }
         self.note_agreement(now);
     }
@@ -2242,6 +2266,13 @@ impl HlGatewayArm {
         let mut worked = self.pump(now);
         if self.stream_alive(now) {
             self.up_ns = now;
+        }
+        // XH5b-2: a fresh anchor is durable once its keeper says so (one
+        // load a pass until then).
+        if self.fresh_anchor && !self.anchor_kept {
+            if let Some(k) = &self.keep {
+                self.anchor_kept = k.is_kept(self.anchor_1e8 / WIRE_PER_ENGINE);
+            }
         }
         // XH4e: the gateway's own sweep cancels are this address's too.
         let swept = self.end.stats.sweep_cancels();
@@ -2469,8 +2500,11 @@ impl HlGatewayArm {
         // from this — its day cap must not restart at a full allowance).
         // XH5b-1: and, on the slot's own account, the worth's spot half and
         // an anchor — the session bound is judged from the first
-        // reconciliation on.
-        let worth_known = !self.cfg.own_account || (self.spot_ns != 0 && self.anchored);
+        // reconciliation on — XH5b-2: a durable one (restored, or stored by
+        // its keeper): the slot never quotes on an anchor a restart would
+        // lose.
+        let worth_known =
+            !self.cfg.own_account || (self.spot_ns != 0 && self.anchored && self.anchor_kept);
         let reconciled = self.boot == BOOT_DONE
             && !self.boot_held
             && self.state_ok
@@ -2482,14 +2516,7 @@ impl HlGatewayArm {
         } else {
             now.saturating_sub(self.last_agree_ns).max(1)
         };
-        // E7: the session bound, judged on the slot's own account once its
-        // worth is complete (XH5b-1); unjudged, the reading is 0.
-        let judged = self.anchored && self.seeded && self.cfg.own_account && self.spot_ns != 0;
-        let delta = if judged {
-            self.worth_1e8().saturating_sub(self.anchor_1e8) / WIRE_PER_ENGINE
-        } else {
-            0
-        };
+        let (judged, delta) = self.session_pnl();
         HaltSignal::new(
             gap,
             drift,
@@ -2502,6 +2529,19 @@ impl HlGatewayArm {
         .with_pnl(judged, delta)
         .with_alo_reject_permille(self.alo_reject_permille())
         .with_gateway_halted(self.end.stats.halt_reason() != HALT_NONE)
+    }
+
+    /// E7: the session's P&L, USD ×1e6 — judged on the slot's own account
+    /// once its worth is complete (XH5b-1); unjudged, it reads 0.
+    #[inline]
+    const fn session_pnl(&self) -> (bool, i64) {
+        let judged = self.anchored && self.seeded && self.cfg.own_account && self.spot_ns != 0;
+        let delta = if judged {
+            self.worth_1e8().saturating_sub(self.anchor_1e8) / WIRE_PER_ENGINE
+        } else {
+            0
+        };
+        (judged, delta)
     }
 
     /// The command for `o` on perp `p` (a place, or a modify of `prev`),
@@ -2797,7 +2837,13 @@ impl OrderDispatch for HlGatewayArm {
             Some(b) => (1, b.remaining(), b.cancel_remaining()),
             None => (0, 0, 0),
         };
-        // COPY: the 760 B report written once into the caller's block —
+        let (_, session_pnl) = self.session_pnl();
+        let worth = if self.cfg.own_account && self.spot_ns != 0 {
+            self.worth_1e8() / WIRE_PER_ENGINE
+        } else {
+            0
+        };
+        // COPY: the 816 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -2831,6 +2877,8 @@ impl OrderDispatch for HlGatewayArm {
             day_unreadable: c.day_unreadable,
             refunded: c.refunded,
             refused_leverage: c.refused_leverage,
+            spot_reads: c.spot_reads,
+            spot_failed: c.spot_failed,
             dm_arms: d.arms,
             dm_clears: d.clears,
             dm_accepted: d.accepted,
@@ -2902,6 +2950,11 @@ impl OrderDispatch for HlGatewayArm {
             // The router's.
             unmarked_positions: 0,
             resting_usd_1e6: 0,
+            own_account: u64::from(self.cfg.own_account),
+            pnl_anchor_usd_1e6: self.anchor_1e8 / WIRE_PER_ENGINE,
+            anchor_kept: u64::from(self.anchor_kept),
+            worth_usd_1e6: worth,
+            session_pnl_usd_1e6: session_pnl,
         };
         true
     }
@@ -3062,11 +3115,28 @@ mod tests {
     struct Venue {
         gw: HlGatewayEnd,
         cmds: Vec<HlCmd>,
+        /// XH5b-2: the arm's anchor hand-over, and a keeper that stores what
+        /// it is handed at once while `keeps` (the gateway thread's).
+        anchor: Arc<AnchorSlot>,
+        keeps: bool,
+        kept: Option<i64>,
     }
 
     impl Venue {
+        /// The keeper's pass: the anchor it has stored (`None`: none yet).
+        fn keeper(&mut self) -> Option<i64> {
+            if self.keeps {
+                if let Some(v) = self.anchor.pending() {
+                    self.anchor.mark_kept(v);
+                    self.kept = Some(v);
+                }
+            }
+            self.kept
+        }
+
         /// The first command of `kind` the arm pushed, taken.
         fn take(&mut self, kind: u8) -> Option<HlCmd> {
+            let _ = self.keeper();
             while let Some(c) = self.gw.cmd.pop() {
                 self.cmds.push(*c);
             }
@@ -3075,6 +3145,7 @@ mod tests {
         }
 
         fn send(&mut self, e: ExecEvent) {
+            let _ = self.keeper();
             assert!(self.gw.evt.emit(&e), "event ring full");
         }
     }
@@ -3221,9 +3292,14 @@ mod tests {
     fn to_sheet(c: &ArmCfg) -> (HlGatewayArm, Venue, u64, HlCmd) {
         let (eng, gw) = hl_duplex();
         let mut arm = HlGatewayArm::new(c, eng).expect("arm");
+        let anchor = Arc::new(AnchorSlot::new());
+        arm.keep_anchor_in(Arc::clone(&anchor));
         let mut v = Venue {
             gw,
             cmds: Vec::new(),
+            anchor,
+            keeps: true,
+            kept: None,
         };
         let t = now_ns();
         v.gw.stats.set_gauges(0, true);
@@ -3663,6 +3739,13 @@ mod tests {
             (0, 0, 0),
             "the router's words"
         );
+        // XH5b-2: the own account's worth, its anchor kept, the session.
+        assert_eq!((r.spot_reads, r.spot_failed), (1, 0));
+        assert_eq!(
+            (r.own_account, r.pnl_anchor_usd_1e6, r.anchor_kept),
+            (1, 1_000_000_000, 1)
+        );
+        assert_eq!((r.worth_usd_1e6, r.session_pnl_usd_1e6), (1_000_000_000, 0));
     }
 
     /// XH4f (risk r1): the leverage waits for the seeding sheet to read the
@@ -4123,16 +4206,101 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_anchor_is_the_session_s_and_a_fresh_one_is_offered_for_keeping() {
+    fn a_restored_anchor_is_the_session_s_and_a_fresh_one_goes_to_its_keeper() {
         let mut c = cfg();
         c.anchor_1e6 = 900_000_000;
-        let (arm, _v, t) = booted_with(&c);
+        let (arm, mut v, t) = booted_with(&c);
         let sig = arm.signal(t);
         assert_eq!((sig.pnl_judged, sig.pnl_delta_usd_1e6), (1, 100_000_000));
-        assert_eq!(arm.fresh_anchor_1e6(), None);
-        let (arm, _v, t) = booted();
-        assert_eq!(arm.fresh_anchor_1e6(), Some(1_000_000_000));
+        assert_eq!(v.keeper(), None, "restored: nothing to keep");
+        assert!(arm.anchor_kept, "a restored anchor is durable");
+        assert_eq!(sig.reconciled, 1);
+        let (arm, mut v, t) = booted();
+        assert_eq!(v.keeper(), Some(1_000_000_000));
         assert_eq!(arm.signal(t).pnl_delta_usd_1e6, 0);
+    }
+
+    /// XH5b-2: the arm's first complete worth on an own account, its keeper
+    /// silent; the sheet, the spot half, the orders, the budget and the day
+    /// all read.
+    fn booted_unkept() -> (HlGatewayArm, Venue, u64) {
+        let (mut arm, mut v, t, st) = to_sheet(&cfg());
+        v.keeps = false;
+        v.send(read_end(&st, 0, 1));
+        let _ = arm.idle(t);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot sheet");
+        v.send(read_end(&sp, 1_000 * E8, 0));
+        let _ = arm.idle(t);
+        assert_eq!(v.anchor.pending(), Some(1_000_000_000), "handed over");
+        let od = v.take(CMD_READ_ORDERS).expect("the orders");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget");
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let day = v.take(CMD_READ_DAY).expect("the day");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t);
+        (arm, v, t)
+    }
+
+    /// XH5b-2: a fresh anchor is handed to its keeper, and the slot reports
+    /// nothing reconciled until the keeper has stored it — the router's
+    /// first-reconciliation latch holds every quote until the anchor is
+    /// durable; a store that fails halts the gateway (the keeper's word)
+    /// and the slot stays unreconciled.
+    #[test]
+    fn the_first_reconciliation_waits_for_the_anchor_to_be_kept() {
+        let (arm, mut v, t) = booted_unkept();
+        assert!(arm.ready(), "the arm is booted");
+        let sig = arm.signal(t);
+        assert_eq!(
+            (sig.reconciled, sig.pnl_judged),
+            (0, 1),
+            "judged, and nothing reconciled: no quote before the anchor is durable"
+        );
+        assert_eq!(v.keeper(), None, "its keeper is silent");
+        v.gw.stats.halt(crate::gateway::HALT_ANCHOR_UNKEPT);
+        let sig = arm.signal(t);
+        assert_eq!((sig.reconciled, sig.gateway_halted), (0, 1));
+    }
+
+    /// XH5b-2: once its keeper has stored the anchor, the next pass reads
+    /// it durable and the slot reconciles.
+    #[test]
+    fn a_kept_anchor_lets_the_slot_reconcile() {
+        let (mut arm, mut v, t) = booted_unkept();
+        v.keeps = true;
+        assert_eq!(v.keeper(), Some(1_000_000_000));
+        assert_eq!(arm.signal(t).reconciled, 0, "not before the arm reads it");
+        let _ = arm.idle(t);
+        assert!(arm.anchor_kept);
+        assert_eq!(arm.signal(t).reconciled, 1);
+    }
+
+    /// XH5b-2: an arm with no keeper never reads a fresh anchor kept — its
+    /// slot never reconciles on its own account (the safe direction).
+    #[test]
+    fn with_no_keeper_a_fresh_anchor_is_never_kept() {
+        let (mut arm, mut v, t, st) = to_sheet(&cfg());
+        arm.keep = None;
+        v.send(read_end(&st, 0, 1));
+        let _ = arm.idle(t);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot sheet");
+        v.send(read_end(&sp, 1_000 * E8, 0));
+        let _ = arm.idle(t);
+        assert!(arm.anchored && !arm.anchor_kept);
+        assert_eq!(v.keeper(), None, "nothing handed over");
+        let od = v.take(CMD_READ_ORDERS).expect("the orders");
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t);
+        let lim = v.take(CMD_READ_LIMIT).expect("the budget");
+        v.send(limit_end(&lim, 100));
+        let _ = arm.idle(t);
+        let day = v.take(CMD_READ_DAY).expect("the day");
+        v.send(day_end(&day, 0, 0, 0));
+        let _ = arm.idle(t + S);
+        assert_eq!(arm.signal(t + S).reconciled, 0);
     }
 
     #[test]
@@ -4358,7 +4526,7 @@ mod tests {
         );
         assert!(v.take(CMD_READ_ORDERS).is_some(), "the orders at once");
         assert_eq!(
-            arm.fresh_anchor_1e6(),
+            v.keeper(),
             None,
             "a shared account's value is every slot's: nothing to keep"
         );
@@ -5371,7 +5539,7 @@ mod tests {
         v.send(read_end(&sp, 1_000 * E8, 0));
         let _ = arm.idle(t);
         assert_eq!(
-            arm.fresh_anchor_1e6(),
+            v.keeper(),
             Some(1_000_000_000),
             "$0 on the perps (spot margins them) and $1 000 USDC"
         );
@@ -5426,7 +5594,7 @@ mod tests {
         let _ = arm.idle(t);
         let sig = arm.signal(t);
         assert_eq!((sig.pnl_judged, sig.pnl_delta_usd_1e6), (1, -10_000_000));
-        assert_eq!(arm.fresh_anchor_1e6(), None, "restored, not taken");
+        assert_eq!(v.keeper(), None, "restored, not taken");
     }
 
     /// XH5b-1: a failed spot read — an end of another kind, or no answer
@@ -5465,6 +5633,7 @@ mod tests {
         // Unanswered past the post timeout and its grace.
         let _ = arm.idle(at + 5 * S + READ_GRACE_NS + 1);
         assert_eq!(arm.counters().reads_failed, 2);
+        assert_eq!(arm.counters().spot_failed, 2, "XH5b-2: on /metrics");
         assert!(
             v.take(CMD_READ_SPOT).is_none(),
             "again only with the sheet after"
@@ -5485,11 +5654,9 @@ mod tests {
         });
         let _ = arm.idle(t);
         assert!(!arm.anchored, "never a $600 anchor on half a worth");
-        assert_eq!(
-            (arm.counters().reads_failed, arm.counters().spot_reads),
-            (1, 0)
-        );
-        assert_eq!(arm.fresh_anchor_1e6(), None);
+        let c = arm.counters();
+        assert_eq!((c.reads_failed, c.spot_reads, c.spot_failed), (1, 0, 1));
+        assert_eq!(v.keeper(), None);
     }
 
     /// XH5b-1: the router's first-reconciliation latch waits for the worth
@@ -5527,7 +5694,7 @@ mod tests {
             (0, 0, 0, 0),
             "no worth: nothing reconciled, no agreement, nothing judged"
         );
-        assert_eq!(arm.fresh_anchor_1e6(), None);
+        assert_eq!(v.keeper(), None);
         let at = t + 5 * S;
         let _ = arm.idle(at);
         let st = v.take(CMD_READ_STATE).expect("the next sheet");
@@ -5536,9 +5703,10 @@ mod tests {
         let sp = v.take(CMD_READ_SPOT).expect("the spot half with it");
         v.send(read_end(&sp, 1_000 * E8, 0));
         let _ = arm.idle(at);
+        assert_eq!(v.keeper(), Some(1_000_000_000));
+        let _ = arm.idle(at);
         let sig = arm.signal(at);
         assert_eq!((sig.reconciled, sig.pnl_judged), (1, 1));
-        assert_eq!(arm.fresh_anchor_1e6(), Some(1_000_000_000));
     }
 
     /// XH5b-1: a $0 worth anchors nothing (an unfunded account, the
@@ -5553,7 +5721,7 @@ mod tests {
         v.send(read_end(&sp, 0, 0));
         let _ = arm.idle(t);
         assert!(!arm.anchored, "$0 and $0: nothing to anchor");
-        assert_eq!(arm.fresh_anchor_1e6(), None);
+        assert_eq!(v.keeper(), None);
         let od = v.take(CMD_READ_ORDERS).expect("the orders");
         v.send(read_end(&od, 0, 0));
         let _ = arm.idle(t);
@@ -5578,7 +5746,8 @@ mod tests {
         let sp = v.take(CMD_READ_SPOT).expect("the spot half");
         v.send(read_end(&sp, 500 * E8, 0));
         let _ = arm.idle(at);
-        assert_eq!(arm.fresh_anchor_1e6(), Some(500_000_000));
+        assert_eq!(v.keeper(), Some(500_000_000));
+        let _ = arm.idle(at);
         let sig = arm.signal(at);
         assert_eq!(
             (sig.reconciled, sig.pnl_judged, sig.pnl_delta_usd_1e6),

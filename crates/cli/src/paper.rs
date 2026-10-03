@@ -6115,9 +6115,9 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 66;
+const HLGW_COUNTERS: usize = 68;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
-const HLGW_GAUGES: usize = 27;
+const HLGW_GAUGES: usize = 32;
 
 /// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
 /// — which is what pins the two together.
@@ -6151,6 +6151,8 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_day_unreadable_total",
     "engine_exec_hlgw_refunded_total",
     "engine_exec_hlgw_refused_leverage_total",
+    "engine_exec_hlgw_spot_reads_total",
+    "engine_exec_hlgw_spot_failed_total",
     "engine_exec_hlgw_deadman_arms_total",
     "engine_exec_hlgw_deadman_clears_total",
     "engine_exec_hlgw_deadman_accepted_total",
@@ -6191,7 +6193,7 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 66] (528 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 68] (544 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6226,6 +6228,8 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.day_unreadable,
         r.refunded,
         r.refused_leverage,
+        r.spot_reads,
+        r.spot_failed,
         r.dm_arms,
         r.dm_clears,
         r.dm_accepted,
@@ -6295,11 +6299,16 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_health_blocked",
     "engine_exec_hlgw_unmarked_positions",
     "engine_exec_hlgw_resting_usd_1e6",
+    "engine_exec_hlgw_own_account",
+    "engine_exec_hlgw_pnl_anchor_usd_1e6",
+    "engine_exec_hlgw_anchor_kept",
+    "engine_exec_hlgw_worth_usd_1e6",
+    "engine_exec_hlgw_session_pnl_usd_1e6",
 ];
 
 /// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
 /// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
-// COPY: [i64; 27] (216 B) returned by value — cold, as above.
+// COPY: [i64; 32] (256 B) returned by value — cold, as above.
 fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6330,6 +6339,11 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.health_blocked),
         g(r.unmarked_positions),
         r.resting_usd_1e6,
+        g(r.own_account),
+        r.pnl_anchor_usd_1e6,
+        g(r.anchor_kept),
+        r.worth_usd_1e6,
+        r.session_pnl_usd_1e6,
     ]
 }
 
@@ -6372,7 +6386,7 @@ fn register_hlgw_metrics(
     let last_shutdown_unconfirmed = reg
         .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
         .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
-    // COPY: the 376 B id block ((66 + 27 + 1) × 4 B), returned by value once
+    // COPY: the 404 B id block ((68 + 32 + 1) × 4 B), returned by value once
     // at boot — rejected: an out-param for a one-time move.
     Ok(ExecHlgwMetricIds {
         counters,
@@ -6403,7 +6417,7 @@ fn mirror_hlgw_metrics(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: the 66 totals (528 B) kept as the next delta's baseline — 5 s
+    // COPY: the 68 totals (544 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -12269,7 +12283,8 @@ mod tests {
         assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
         // XMM XH4f: 518 counters and 407 gauges here — slot 6's gateway
         // family (65 + 28) took the worst case past 512 / 384; XH5a adds
-        // one counter (519).
+        // one counter (519); XMM XH5b-2 two counters and five gauges
+        // (521 / 412).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -13670,6 +13685,13 @@ mod tests {
             rate_ws_sum: 11,
             dm_availability: 3,
             resting_usd_1e6: 7,
+            spot_reads: 13,
+            spot_failed: 2,
+            own_account: 3,
+            pnl_anchor_usd_1e6: 1_000_000_000,
+            anchor_kept: 5,
+            worth_usd_1e6: 988,
+            session_pnl_usd_1e6: -12,
             ..clob_dispatcher::GatewayArmReport::default()
         };
         mirror_hlgw_metrics(reg, ids, &cur, &mut last);
@@ -13688,6 +13710,13 @@ mod tests {
             ("engine_exec_hlgw_rate_ws_sum", "11"),
             ("engine_exec_hlgw_deadman_availability", "3"),
             ("engine_exec_hlgw_resting_usd_1e6", "7"),
+            ("engine_exec_hlgw_spot_reads_total", "13"),
+            ("engine_exec_hlgw_spot_failed_total", "2"),
+            ("engine_exec_hlgw_own_account", "3"),
+            ("engine_exec_hlgw_pnl_anchor_usd_1e6", "1000000000"),
+            ("engine_exec_hlgw_anchor_kept", "5"),
+            ("engine_exec_hlgw_worth_usd_1e6", "988"),
+            ("engine_exec_hlgw_session_pnl_usd_1e6", "-12"),
             ("engine_exec_hlgw_last_shutdown_unconfirmed", "0"),
         ] {
             assert!(

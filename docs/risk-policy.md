@@ -9163,6 +9163,176 @@ taken; `/metrics`, the own-account stale floor and a boot-time weight
 check — XH5b-2's, above); round 3 — allocation and zero-copy APPROVE, risk
 APPROVE WITH NITS (funding in full before the first boot — taken).
 
+### XH5b-2 amendment (2026-10-03): slot 6's own testnet account — its scopes, its refusals, its anchor kept off the engine thread
+
+The second part of XH5b (plan §3.2; session-5 assumption A-S5-21).
+XH5b-3 puts mainnet behind its interlock; nothing here reaches mainnet.
+
+- **The account.** Slot 6 trades on its OWN testnet master and API wallet
+  when `HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR}` are set — both are
+  then required (`exec_hyperliquid::config::Scope::XmmTestnet`; its host
+  and source are the smoke's `HYPERLIQUID_TESTNET_*`, defaulting to
+  testnet); otherwise on the shared E3 account as before (`Scope::Testnet`,
+  `own_account = false`). `Scope::Xmm` (mainnet:
+  `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` on the live arm's
+  `HYPERLIQUID_EXCHANGE_HOST` / `HYPERLIQUID_SOURCE`, every variable
+  required, as `Scope::Live`) is declared; XH5b-3 composes it. No two
+  scopes read the same key or master variable (pinned).
+- **The refusals (O-XH3)**, on its own account:
+  - *Nothing shared.* Neither slot 6's master nor its API wallet may be an
+    address another arm signs or trades as: E3's testnet master and agent
+    (`HYPERLIQUID_TESTNET_*`), slot 3's (`HYPERLIQUID_MASTER_ADDR`,
+    `HYPERLIQUID_AGENT_KEY`), HYPARB's (`HYPERLIQUID_HYPARB_MASTER_ADDR`,
+    and the wallets `HYPEREVM_MAINNET_KEY` / `HYPEREVM_TESTNET_KEY` sign as
+    — X signs as itself). Masters and signers are compared crosswise (an
+    API wallet that is another arm's master refuses too). A set variable
+    that does not parse (a value that is not Unicode included), or holds no
+    valid key, refuses and is named: the check cannot vouch for it
+    (`xmm_live::check_own_account` and `identities_with`, pure, under an
+    env wrapper).
+  - *The venue binds the API wallet to slot 6's master.* An order lands on
+    the account of the master that approved the API wallet, while the
+    arm's reads and its fill stream follow the configured master: a wallet
+    approved by another master would trade that account unseen (its orders
+    read gone, its fills never booked, the worth unmoved, the bound blind).
+    One boot read of `userRole` for the API wallet (its request rendered
+    straight into the boot client's body window,
+    `hyparb_live::info_rendered`) must answer `agent` for slot 6's master —
+    or `user` when the wallet is the master itself, signing as itself; any
+    other answer refuses
+    (`xmm_live::check_agent_binding`, pure; `recon::scan_user_role`).
+  - *Keys.* Another arm's key is read only to derive its address, in the
+    one form the policy lets a signing key have
+    (`core_config::SecretKeyBytes`: mlock'd, its hex and bytes erased), and
+    dropped at once (`config::agent_addr_from_env`); the presence check
+    erases the copy the standard library hands over
+    (`config::env_is_set`). `HlConfig::from_env` now holds its parsed key in
+    a wrapper that erases it on every return.
+- **The rules by account** (`xmm_live::check_account_rules`, at slot 6's
+  boot):
+  - the read period: 30 s on its own account (`OWN_RECON_MS`: the perp
+    sheet, its spot half and the orders — 68 IP weight a minute with the
+    budget read), 10 s on the shared one (`RECON_MS`: 152; HYPARB's
+    gateway hedge keeps it); both pinned under 40 % of the gateway's share
+    (160) and checked again at the boot;
+  - `halt_on_recon_stale_ms` ≥ four read periods on its own account
+    (120 s: a failed spot read waits a whole period for the next sheet,
+    XH5b-1, so two in a row must not halt the slot), two on the shared one
+    (20 s);
+  - the session bound: refused on the shared account (moved here from
+    `exec_boot::check_gateway_slot`, which cannot know the account) and
+    REQUIRED on its own (`halt_on_loss_usd_1e6` > 0 — O-XH5: the probe's
+    −$50), where it is judged on the account's worth (XH5b-1).
+- **The anchor, kept (E7: the bound outlives the process).** One file a
+  network beside the exec artifact — `xmm-pnl-anchor-testnet.state` here
+  (one master address can exist on both networks, and one network's worth
+  is never the other's anchor) — in E7's format (`<master>\t<usd
+  ×1e6>\t<unix s>`; the number is the account's worth).
+  - At the boot it is read strictly (`anchor::load_own`, at most 128 B into
+    a stack buffer): no file is a session's first boot; this master's line
+    is restored (the arm's `anchor_1e6`, durable from the start, and no
+    keeper is wired); ANYTHING ELSE — another master's line, a malformed,
+    overlong or empty line, a file that cannot be read — refuses the boot.
+    A re-anchored bound is a bound on nothing, and only the operator ends a
+    session, by moving the file aside.
+  - With no anchor restored, the fresh one (the first complete, positive
+    worth, XH5b-1) is handed by the arm through an `AnchorSlot` (one atomic
+    word in a granule of its own: the anchor to keep, then its negation
+    once kept) to an `AnchorKeeper` on the gateway's thread
+    (`xmm_live::run_gateway`: one load a pass until it acts), which stores
+    it once (temp file, fsync, rename) and writes back "kept".
+  - **The arm reports itself reconciled only once it reads the anchor
+    durable**, so the router's first-reconciliation latch holds every quote
+    until then. **A store that fails halts the gateway**
+    (`gateway::HALT_ANCHOR_UNKEPT` = 16, the HL gateway's first venue halt
+    reason): the router halts the slot on the gateway's word, and the slot
+    stays unreconciled. An arm with no keeper never reads a fresh anchor
+    kept — the safe direction.
+- **`/metrics`** (`engine_exec_hlgw_*`; `GatewayArmReport` 760 → 816 B,
+  the counters 66 → 68, the levels 27 → 32): `spot_reads_total` and
+  `spot_failed_total`; `own_account`, `pnl_anchor_usd_1e6`, `anchor_kept`,
+  `worth_usd_1e6` and `session_pnl_usd_1e6` — what XH5e's checklists read.
+  `/state` is unchanged.
+- **The boot tell** names the account (its own — with the master, the API
+  wallet and the loss bound — or the shared one) and the anchor (`anchor
+  RESTORED`, with its value and its file, or "the first complete worth
+  anchors, kept in …").
+- **Residuals.**
+  - *No directory fsync after the store's rename* (`core_io::write_atomic`,
+    as E7's anchor): a power loss right after a session's first store may
+    lose the file's name — a process crash cannot — and the next boot then
+    finds no file and anchors anew. XH5e's runbooks check that every boot
+    of a session after its first tells `anchor RESTORED`.
+  - *Longer windows on an own account.* A stale spot half (XH5b-1's
+    residual) stays judged for up to two read periods (60 s) plus
+    `halt_on_recon_stale_ms` (≥ 120 s; the probe's artifact states 180 s)
+    before `ReconStale` halts; a drift must survive two sheets 30 s apart
+    (≈ 60 s, against ≈ 20 s on the shared account). The $15 clip and the
+    caps bound what either window can hide.
+  - *Key copies beyond our reach:* deriving an address copies the key into
+    the signer library's secret type, which does not erase itself (as every
+    boot's `HlConfig::new` already does); the process `environ` itself
+    cannot be erased.
+  - *The shared account still runs* when the XMM testnet variables are
+    unset, with the XH5a amendment's effects (a)–(e); the boot tell says
+    which account.
+- **For XH5e:** the engine-instance testnet check runs slot 6 on its own
+  testnet account (both variables set), which ends (a)–(e) for slot 6; its
+  `exec.toml` states `halt_on_recon_stale_ms` ≥ 120 000 and a loss bound;
+  every boot after a session's first must tell `anchor RESTORED`; the
+  runbook ends each session by moving the anchor file aside.
+- **Superseded:** XH4f's "states no session bound" for the gateway slot
+  (`exec.toml.example`), `check_gateway_slot`'s session-bound refusal
+  (moved), XH5b-1's `cli::xmm_live::OWN_ACCOUNT` (gone: the boot decides
+  the account), `HlGatewayArm::fresh_anchor_1e6` (the keeper replaces the
+  owner's getter), and the boot's stale floor of two `RECON_MS` for every
+  account.
+
+**Tests:** the scopes (each reads its own key and master; the testnet ones
+alone default; the interlock names the scope's variable); the boot helpers
+(a master, a key's address, a set variable that does not parse — a value
+that is not Unicode included — or holds no key, named; presence); the
+own-account check (a shared master, a shared signer, crosswise both ways,
+nothing configured), its variable lists and the identities over fake
+readers (every set master and key; a variable a reader refuses fails the
+boot, named — no test touches a real key's variable); the agent binding
+(an API wallet of the master, the master itself, another master's wallet,
+another master, an unknown address) and the `userRole` request and
+answers (an agent and its master, a master, the rest); the rules by
+account (the floors at four and two periods, the bound refused on the
+shared account and required on an own one, the read weights 68 and 152),
+the template's slot-6 recipe under both; the anchor file's place, one a
+network; the strict read (no file, this master's line, another master's,
+a malformed, an empty and an overlong file); the keeper (nothing before
+the hand-over, one store, kept only for the value handed over, once a
+session; a store that fails halts the gateway and keeps nothing); the arm
+(a fresh anchor handed over and the first reconciliation waiting for it —
+and for good once the gateway halts; a kept anchor reconciles on the next
+pass; no keeper, never reconciled; a restored anchor durable with nothing
+to keep; the report's new fields; `spot_failed` on every failed spot
+read); the boot (a session bound resolves at `exec_boot`); `/metrics`
+(every new row its own value); alloc gate 98 (a real keeper stores the
+boot's anchor just before the window, whose first pass reads it kept; in
+every round of the window that keeper's pass and one nothing is handed
+to; `spot_failed` one of the window's paths).
+
+**Gates (the committed tree):** clippy 0; nextest 4 147/4 147; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — zero-copy and allocation APPROVE WITH NITS (stale
+size and count notes, another arm's key read as a bare array, a keeper
+wired beside a restored anchor, gate 98 blind to the keeper's pass — all
+taken), risk REQUEST CHANGES (this section had swallowed the next one's
+heading; an API wallet another master approved would trade an account
+slot 6 does not read — the `userRole` binding; the keys' form, one anchor
+file a network, the test gaps — all taken); round 2 — all three APPROVE
+(the `userRole` request staged before its copy — rendered in place; a set
+key that is not Unicode read as unset — refused; a test reading the real
+environment — fake readers; wording — all taken); round 3 — all three
+APPROVE (a COPY note claiming constants only — reworded); round 4
+(comments only) — zero-copy APPROVE (the function's doc — taken).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

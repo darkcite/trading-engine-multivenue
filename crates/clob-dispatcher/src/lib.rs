@@ -887,7 +887,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 760 B report never crosses by value.
+    /// 816 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -1080,6 +1080,11 @@ pub struct GatewayArmReport {
     pub refunded: u64,
     /// Places and modifies refused on a perp whose leverage is dark.
     pub refused_leverage: u64,
+    /// Spot sheets answered with their USDC row (XMM XH5b-2: an account
+    /// of the slot's own reads one with each perp sheet).
+    pub spot_reads: u64,
+    /// Spot reads that failed (XMM XH5b-2).
+    pub spot_failed: u64,
     // --- counters: the dead man ---
     /// Arms that left the host, probes included.
     pub dm_arms: u64,
@@ -1217,11 +1222,27 @@ pub struct GatewayArmReport {
     pub unmarked_positions: u64,
     /// The slot's resting notional, USD ×1e6.
     pub resting_usd_1e6: i64,
+    /// `1` when the slot trades on an account of its own (XMM XH5b-2): its
+    /// worth is its P&L, judged against its anchor.
+    pub own_account: u64,
+    /// The session's P&L anchor, the account's worth USD ×1e6 (0 = none
+    /// yet).
+    pub pnl_anchor_usd_1e6: i64,
+    /// `1` once the anchor is durable — restored, or stored by its keeper:
+    /// the slot's first reconciliation waits for it.
+    pub anchor_kept: u64,
+    /// The account's worth, USD ×1e6: the perp sheet's value plus the spot
+    /// sheet's USDC (0 off an own account, or before both halves landed).
+    pub worth_usd_1e6: i64,
+    /// The session's P&L, USD ×1e6: the worth less the anchor (0 until
+    /// judged).
+    pub session_pnl_usd_1e6: i64,
 }
 
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
-// XH5a: + `refused_foreign_row` (95).
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 760);
+// XH5a: + `refused_foreign_row` (95). XMM XH5b-2: + the spot reads' two
+// counters and the own account's five levels (102).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 816);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

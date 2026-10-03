@@ -244,6 +244,11 @@ pub const IP_WEIGHT_SHARE: u32 = 400;
 /// XH4e — its share of the venue's WebSocket messages a minute (2 000 per
 /// IP).
 pub const WS_MSG_SHARE: u32 = 1_000;
+/// **XMM XH5b-2 — this gateway's own halt reasons** (`exec_gateway`'s
+/// registry: a venue numbers its own from `HALT_VENUE_BASE`). Slot 6's
+/// session anchor could not be stored ([`crate::anchor::AnchorKeeper`]): the
+/// slot never quotes on an anchor a restart would lose (E7).
+pub const HALT_ANCHOR_UNKEPT: u64 = exec_gateway::stats::HALT_VENUE_BASE;
 /// XH4e — growth is refused unsent at this % of either share.
 const THROTTLE_PCT: u64 = 80;
 /// XH4e — the congestion word reads busy from this % of either share …

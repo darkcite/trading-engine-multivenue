@@ -14097,7 +14097,11 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// budget), and, after the boot — its own window — the day's spend (a
 /// page that moves, then one that adds nothing past its start); XH5b-1:
 /// the spot sheet after each sheet ($500 USDC; every sixth failing, every
-/// seventh listing no USDC — both refused); the halt signals and the
+/// seventh listing no USDC — both refused, the arm's `spot_failed`);
+/// XH5b-2: the boot's anchor handed to a real keeper that stores it just
+/// before the window, whose first pass reads it kept, and in every round of
+/// it that keeper's pass (done) and one nothing is handed to; the halt
+/// signals and the
 /// cancel-all state; every out-queue drained as the
 /// engine does. Timers run on the real clock (1 ms windows): the warm-up
 /// runs until every path has run, and the window must run each again.
@@ -14110,6 +14114,7 @@ fn hl_gateway_arm_is_zero_alloc() {
         ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED,
     };
     use exec_gateway::stats::SWEEP_CLEAR;
+    use exec_hyperliquid::anchor::{AnchorKeeper, AnchorSlot, Kept};
     use exec_hyperliquid::arm::{ArmCfg, ArmCounters, HlGatewayArm, PerpBind, ARM_PERPS};
     use exec_hyperliquid::cmd::{
         CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
@@ -14154,10 +14159,9 @@ fn hl_gateway_arm_is_zero_alloc() {
         /// XH4e: budget reads and day pages answered.
         limits: u64,
         days: u64,
-        /// XH5b-1: spot sheets answered, and those the arm must refuse
-        /// (every sixth failing, every seventh listing no USDC).
+        /// XH5b-1: spot sheets answered (every sixth failing, every seventh
+        /// listing no USDC: the arm counts both `spot_failed`).
         spots: u64,
-        spot_refused: u64,
     }
 
     /// The gateway's end: every command answered by the script.
@@ -14385,7 +14389,6 @@ fn hl_gateway_arm_is_zero_alloc() {
                     s.spots += 1;
                     let failed = s.spots % 6 == 0;
                     let listed = s.spots % 7 != 0;
-                    s.spot_refused += u64::from(failed || !listed);
                     assert!(gw.evt.emit(&ExecEvent {
                         kind: if failed { EV_READ_FAILED } else { EV_READ_DONE },
                         reason: READ_SPOT,
@@ -14521,7 +14524,7 @@ fn hl_gateway_arm_is_zero_alloc() {
             c.refunded,
             c.refused_budget,
             c.spot_reads,
-            s.spot_refused,
+            c.spot_failed,
         ]
     }
 
@@ -14551,6 +14554,10 @@ fn hl_gateway_arm_is_zero_alloc() {
     };
     let (eng, mut gw) = hl_duplex();
     let mut arm = HlGatewayArm::new(&cfg, eng).expect("the arm");
+    // XH5b-2: the anchor's hand-over — a real `AnchorKeeper` stores it just
+    // before the window, whose first pass reads it kept.
+    let keep = std::sync::Arc::new(AnchorSlot::new());
+    arm.keep_anchor_in(std::sync::Arc::clone(&keep));
     gw.stats.set_gauges(0, true);
     let mut s = Script {
         n: 0,
@@ -14565,7 +14572,6 @@ fn hl_gateway_arm_is_zero_alloc() {
         limits: 0,
         days: 0,
         spots: 0,
-        spot_refused: 0,
     };
     let mut acc = 0u64;
     let _ = arm.on_idle();
@@ -14625,11 +14631,33 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
 
     // ---- measurement window ----
+    // XH5b-2: the slot's keeper stores the anchor the boot handed over —
+    // once, before the window; in the window its pass runs every round
+    // (done), beside a keeper nothing is handed to (nothing yet).
+    let dir = std::env::temp_dir().join(format!("gate98-anchor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 98: a temp dir");
+    let mut keeper = AnchorKeeper::new(
+        std::sync::Arc::clone(&keep),
+        dir.join("xmm-pnl-anchor-testnet.state"),
+        [0x66; 20],
+        std::sync::Arc::clone(&gw.stats),
+    );
+    let mut idle_keeper = AnchorKeeper::new(
+        std::sync::Arc::new(AnchorSlot::new()),
+        dir.join("never.state"),
+        [0x66; 20],
+        std::sync::Arc::clone(&gw.stats),
+    );
+    assert!(
+        matches!(keeper.turn(), Kept::Stored(_)),
+        "gate 98: the boot's worth was handed over and stored"
+    );
     let before = paths(arm.counters(), &s);
     let g = AllocGuard::new();
     let end = r + ROUNDS;
     while r < end {
         round(&mut arm, &mut gw, r, &mut s, &mut acc);
+        assert!(keeper.turn() == Kept::Idle && idle_keeper.turn() == Kept::Idle);
         r += 1;
     }
     std::hint::black_box(acc);
@@ -14647,6 +14675,13 @@ fn hl_gateway_arm_is_zero_alloc() {
         allocs, 0,
         "the HL gateway arm allocated {allocs} times ({bytes} B)"
     );
+    let mut rep = clob_dispatcher::GatewayArmReport::default();
+    assert!(arm.gateway_arm_report(0, &mut rep));
+    assert_eq!(
+        rep.anchor_kept, 1,
+        "gate 98: the window read the anchor kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Gate 96b's venue half: runs ONLY in the child process gate 96b spawns

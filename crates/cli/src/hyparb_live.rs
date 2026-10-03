@@ -1737,26 +1737,47 @@ pub(crate) fn info_once(
     info_with(host, body, tls, |b| b.to_vec())
 }
 
-/// One boot `/info` post, its answer handed to `f` in place (XMM XH4f: the
-/// gateway arm parses `meta` inside the client's buffer).
+/// One boot `/info` post of a request the caller holds, its answer handed to
+/// `f` in place (XMM XH4f: the gateway arm parses `meta` inside the client's
+/// buffer).
 pub(crate) fn info_with<T>(
     host: &str,
     body: &[u8],
     tls: Arc<ClientConfig>,
     f: impl FnOnce(&[u8]) -> T,
 ) -> Result<T, String> {
+    info_rendered(
+        host,
+        tls,
+        |b| {
+            if body.len() > b.len() {
+                return Err(String::from("request too large"));
+            }
+            // COPY: a ≤ 256 B boot request the caller holds, into the client's
+            // body window — cold, once per boot read: a constant, or slot 0's
+            // builder-dex `meta` and the rehearsal's `l2Book`, `format!`ed
+            // (slot 0's debt, as `info_once`'s answer copy); rejected: a render
+            // in place — `info_rendered` does it, moving those is slot 0's change.
+            b[..body.len()].copy_from_slice(body);
+            Ok(body.len())
+        },
+        f,
+    )
+}
+
+/// One boot `/info` post whose request `render` writes straight into the
+/// client's body window, returning its length (XMM XH5b-2: slot 6's
+/// `userRole` read — no staging), its answer handed to `f` in place.
+pub(crate) fn info_rendered<T>(
+    host: &str,
+    tls: Arc<ClientConfig>,
+    render: impl FnOnce(&mut [u8]) -> Result<usize, String>,
+    f: impl FnOnce(&[u8]) -> T,
+) -> Result<T, String> {
     let mut http = core_net::HttpsPost::new(host, 443, "/info", tls, 256, META_RESP)
         .map_err(|e| format!("{host}/info: {e}"))?;
-    let b = http.body_mut();
-    if body.len() > b.len() {
-        return Err(String::from("request too large"));
-    }
-    // COPY: a ≤ 256 B boot request into the client's body window — cold,
-    // once per boot — rejected: rendering JSON in place for a constant.
-    b[..body.len()].copy_from_slice(body);
-    let (status, r) = http
-        .post(body.len())
-        .map_err(|e| format!("{host}/info: {e}"))?;
+    let len = render(http.body_mut())?;
+    let (status, r) = http.post(len).map_err(|e| format!("{host}/info: {e}"))?;
     if status != 200 {
         return Err(format!("{host}/info: http status {status}"));
     }
@@ -1957,7 +1978,7 @@ fn gateway_hedge(
     gw.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
         String::from("slot 0's gateway: more agent addresses than the nonce streams hold")
     })?);
-    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None)?;
+    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None, None)?;
     Ok((arm, Some((handle, stop))))
 }
 
