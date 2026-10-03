@@ -8522,10 +8522,13 @@ fn routed_ledger_steady_state() {
 /// * the seeding edge, where `reconciled` first turns the restart
 ///   interlock off;
 /// * `trigger_for` against every threshold on a live slot;
-/// * the halt EDGE itself: latch, `exec.HALT` write, and the
-///   venue-wide cancel request;
-/// * `cancel_all_state` polling through `Working` to `Clear`, which
-///   is where `clear_resting` walks the table;
+/// * the halt EDGE — latch, `exec.HALT` write and the slot's cancel
+///   request — runs BETWEEN the windows, unmeasured: `write_atomic`
+///   builds a path, once per incident (gate 100 measures the edge's
+///   per-slot request, with no halt file);
+/// * `cancel_slot_state` polling through `Working` to `Clear` (the second
+///   window), which is where `clear_resting_slot` walks the table — this
+///   arm answers the per-slot verbs through the trait's defaults;
 /// * `exec_counters`, which `/state` and `/metrics` both read and
 ///   which now copies a per-slot halt array.
 ///
@@ -8735,6 +8738,326 @@ fn routed_halt_idle_steady_state() {
     );
     assert_eq!(bytes, 0, "halted idle-poll bytes should be zero: saw {bytes}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **XMM gate 100 (XH5a) — the per-slot halt path is 0 B/op.** R-XH4-1
+/// made the router's halt cancel per slot: every idle poll,
+/// `try_cancel_slots` runs each halted slot's request/confirm cycle on
+/// its own, and a slot's `Clear` releases that slot's rows alone
+/// (`Ledger::clear_resting_slot`). Three windows:
+///
+/// * the router over an arm that answers PER SLOT — slot 3 trips its own
+///   reject streak while slot 4, on the same arm, never does. Slot 3's
+///   first request is refused (`Retry`), its first sweep strands
+///   (`Stranded`, asked again) and the third clears, releasing slot 3's
+///   resting row while slot 4's stays. No halt file is configured, so
+///   gate 62's one allocation on the edge (`write_atomic`'s path) is not
+///   in it;
+/// * the blocking arm's own request and confirmation
+///   (`HlExchange::cancel_slot` / `cancel_slot_state`) with more live legs
+///   than its sweep table holds: the leg walk, the inserts, every later
+///   slot OR'd in, the legs left out stranded (`strand`), the per-slot
+///   scan;
+/// * the sweep's selection over a venue answer (`recon::scan_open_orders`
+///   and `recon::ours_on_leg` with a one-slot mask), which runs on every
+///   idle moment while a sweep is pending.
+#[test]
+fn xmm_per_slot_halt_path_is_zero_alloc() {
+    use clob_dispatcher::{
+        CancelAllState, DispatchError, HaltSignal, OrderDispatch, PaperDispatcher,
+    };
+    use core_types::{CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, Order, Side};
+    use exec_hyperliquid::config::{HlConfig, Scope};
+    use exec_hyperliquid::exchange::HlExchange;
+    use exec_hyperliquid::recon::{ours_on_leg, scan_open_orders, OpenOrder, MAX_OPEN_ORDERS};
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, HaltReason, InstrumentSpec, RoutedDispatcher, SlotCaps,
+        LAW_LINEAR,
+    };
+
+    fn roll(outcome: u32, sym: u32) -> ChannelEvent {
+        ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym,
+            u64::from(outcome) | (60u64 << 32),
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+
+    /// The poll after which slot 3's reject streak sits at its threshold.
+    const TRIP_AT: u64 = 250;
+
+    /// An arm whose slots sweep on their own: slot 3 trips ITSELF (as
+    /// gate 62's arm does); a slot's sweep drains in three polls; the next
+    /// `fail[s]` requests of a slot are refused and its next `strand[s]`
+    /// sweeps give a leg up.
+    struct Arm {
+        polls: u64,
+        sweeping: [u32; 8],
+        asked: [u32; 8],
+        fail: [u32; 8],
+        strand: [u32; 8],
+        stranded: [bool; 8],
+    }
+    impl OrderDispatch for Arm {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+        }
+        fn halt_signal_for(&self, slot: u8) -> HaltSignal {
+            let streak = 5 * u32::from(slot == 3 && self.polls > TRIP_AT);
+            HaltSignal::new(1_000_000, 0, streak, 0, false, true, 1_000_000)
+        }
+        fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+            let s = usize::from(slot);
+            self.asked[s] += 1;
+            if self.fail[s] > 0 {
+                self.fail[s] -= 1;
+                return Err(DispatchError::QueueFull);
+            }
+            self.stranded[s] = false;
+            self.sweeping[s] = 3;
+            Ok(())
+        }
+        fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+            let s = usize::from(slot);
+            if self.sweeping[s] > 0 {
+                CancelAllState::Working
+            } else if self.stranded[s] {
+                CancelAllState::Stranded
+            } else {
+                CancelAllState::Clear
+            }
+        }
+        fn on_idle(&mut self) -> bool {
+            self.polls += 1;
+            let mut s = 0usize;
+            while s < 8 {
+                if self.sweeping[s] == 1 && self.strand[s] > 0 {
+                    // This sweep gives a leg up: the venue still holds one.
+                    self.strand[s] -= 1;
+                    self.stranded[s] = true;
+                }
+                self.sweeping[s] = self.sweeping[s].saturating_sub(1);
+                s += 1;
+            }
+            false
+        }
+    }
+
+    // Boot-time construction — outside the windows, as the engine's is.
+    let mut route = ExecRoute::all_paper();
+    let mut slot = 3usize;
+    while slot <= 4 {
+        route
+            .set_slot(
+                slot,
+                ExecMode::Live,
+                &[core_types::VenueId::Hyperliquid.to_u8()],
+                SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+                HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+            )
+            .expect("boot: slots 3 and 4 live");
+        slot += 1;
+    }
+    let mut fail = [0u32; 8];
+    let mut strand = [0u32; 8];
+    fail[3] = 1;
+    strand[3] = 1;
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        Arm {
+            polls: 0,
+            sweeping: [0; 8],
+            asked: [0; 8],
+            fail,
+            strand,
+            stranded: [false; 8],
+        },
+        core_time::WallAnchor::new(1_789_776_001_000_000_000, 1_789_776_001_000_000_000),
+    );
+    let sym = core_types::make_symbol_id(VenueId::Hyperliquid, 950);
+    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0))
+        .expect("gate 100 row");
+    // The seeding edge: a boot step, outside the window.
+    d.on_idle();
+    // One resting order each for slots 3 and 4, so slot 3's `Clear`
+    // releases a real row and slot 4's is there to survive it.
+    let mut s = 3u8;
+    while s <= 4 {
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            0,
+            Price(1_000_000),
+            Qty(1_000_000),
+            u64::from(s),
+        );
+        o.strategy_id = s;
+        d.submit(&o).expect("gate 100: a resting order");
+        s += 1;
+    }
+    assert_eq!(
+        (d.ledger().slot_resting(3), d.ledger().slot_resting(4)),
+        (1, 1)
+    );
+
+    // ---- the router's per-slot cycle ----------------------------------
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 2 * TRIP_AT {
+        std::hint::black_box(d.on_idle());
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert!(
+        d.halt().is_halted(3),
+        "slot 3's edge must have fired in the window"
+    );
+    assert_eq!(d.halt().reason(3), HaltReason::RejectStreak);
+    assert!(
+        !d.halt().is_halted(4),
+        "slot 4 never tripped its own numbers"
+    );
+    assert!(
+        !d.halt().cancel_outstanding(),
+        "slot 3's cancel must have confirmed"
+    );
+    assert_eq!(
+        d.live().asked,
+        [0, 0, 0, 3, 0, 0, 0, 0],
+        "slot 3: refused, stranded, cleared; nobody else asked"
+    );
+    assert_eq!(d.halt().cancel_all_failures, 1, "the Retry branch ran");
+    assert_eq!(d.halt().cancel_all_stranded, 1, "the Stranded branch ran");
+    assert_eq!(
+        (d.ledger().slot_resting(3), d.ledger().slot_resting(4)),
+        (0, 1),
+        "slot 3's row released on its Clear; slot 4's stays"
+    );
+    assert_eq!(
+        allocs, 0,
+        "the per-slot halt poll allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "per-slot halt-poll bytes should be zero: saw {bytes}"
+    );
+
+    // ---- the blocking arm's per-slot request and confirmation ---------
+    let cfg = HlConfig::new(Scope::Testnet, "127.0.0.1", 'b', [0x55; 32], [0x66; 20]).expect("cfg");
+    let (p, _c) = Ring::<Fill, 64>::new().split();
+    let mut x = HlExchange::<64>::new(
+        &cfg,
+        core_net::TlsTransport::default_client_config(),
+        p,
+        std::env::temp_dir().join(format!("mv-gate100-{}.state", std::process::id())),
+        100,
+    )
+    .expect("build");
+    // Nine instances: 18 live legs, two more than the sweep table holds,
+    // bound outside the window.
+    let mut k = 0u32;
+    while k < 9 {
+        x.on_venue_event(&roll(19_418 + k, 4096 + 2 * k));
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut j = 0u32;
+    while j < 2_000 {
+        let s = (j & 7) as u8;
+        acc ^= u64::from(x.cancel_slot(s).is_ok());
+        acc ^= u64::from(x.cancel_slot_state(s) == CancelAllState::Working);
+        j += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    std::hint::black_box(acc);
+    let c = *x.counters();
+    assert_eq!(c.cancel_all_runs, 2_000, "every request ran");
+    assert_eq!(
+        c.cancel_all_unqueued, 4_000,
+        "two legs left out of every request, counted"
+    );
+    assert_eq!(c.sweep_left, 0, "a retry is not a stranding");
+    assert_eq!(
+        x.cancel_slot_state(5),
+        CancelAllState::Working,
+        "every slot OR'd into the pending legs"
+    );
+    assert_eq!(
+        allocs, 0,
+        "HlExchange::cancel_slot allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "per-slot request bytes should be zero: saw {bytes}"
+    );
+
+    // ---- the sweep's selection over a venue answer --------------------
+    // Six of ours on one leg, slots 3 and 4 in turn — built outside the
+    // window, scanned and selected inside it.
+    let mut body = String::from("[");
+    let mut r = 0u64;
+    while r < 6 {
+        let c = exec_hyperliquid::cloid::encode(3 + (r % 2) as u8, 100 + r);
+        let mut h = [0u8; 34];
+        let n = exec_hyperliquid::cloid::to_hex(&c, &mut h);
+        if r > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(
+            r##"{{"coin":"#195641","oid":{},"cloid":"{}"}}"##,
+            11 + r,
+            core::str::from_utf8(&h[..n]).expect("ascii")
+        ));
+        r += 1;
+    }
+    body.push(']');
+    let body = body.into_bytes();
+    let mut rows = vec![OpenOrder::default(); MAX_OPEN_ORDERS];
+    let mut oids = vec![0u64; MAX_OPEN_ORDERS];
+
+    let g = AllocGuard::new();
+    let mut picked = 0usize;
+    let mut j = 0u32;
+    while j < 2_000 {
+        let n = scan_open_orders(&body, &mut rows).expect("the venue's answer scans");
+        picked += ours_on_leg(&rows[..n], &body, b"#195641", 1 << 3, &mut oids);
+        j += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(picked, 3 * 2_000, "slot 3's three of the six, every pass");
+    assert_eq!(
+        allocs, 0,
+        "the sweep's selection allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "sweep-selection bytes should be zero: saw {bytes}"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -13376,7 +13699,8 @@ fn xmm_slot_six_through_the_router_is_zero_alloc() {
         SlotSplit::new(SLOT, NullLiveDispatcher::new(), arm),
         core_time::WallAnchor::now(),
     );
-    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0))
+    // As the engine binds it (XMM XH5a): slot 6's row is slot 6's.
+    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0).owned_by(SLOT))
         .expect("gate 99 row");
     d.mark_ledger_seeded();
 

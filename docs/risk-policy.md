@@ -8864,6 +8864,180 @@ gateway's end; three texts — all fixed above), round 2 APPROVE; zero-copy
 APPROVE WITH NITS (two boot-time `COPY:` notes, added), allocation
 APPROVE.
 
+### XH5a amendment (2026-10-03): D2 ruled — a halt cancels the halted slot's orders alone (R-XH4-1)
+
+Anton's ruling R-XH4-1 (2026-10-03): the router's halt cancel becomes a
+per-slot sweep — a halt cancels only the halted slot's orders. Built as
+XH5a, the first code cut of XH5's prep (R-XH4-11). What changed:
+
+- **The dispatch surface.** `OrderDispatch` gains `cancel_slot(slot)` (the
+  request) and `cancel_slot_state(slot)` (the confirmation, three-valued as
+  `cancel_all_state`). Their defaults are the venue-wide verbs: an arm that
+  cannot tell its slots apart OVER-cancels (the pre-XH5a behaviour) and
+  never leaves a halted slot's order resting. Every arm a live engine
+  composes answers per slot:
+  - `SlotSplit` routes the slot to the arm that serves it; `VenueSplit` asks
+    both arms (a slot may trade both venues), the least settled answer wins;
+  - `HlExchange`, the operator's blocking arm (BIN15's account, several
+    slots): a pending sweep carries a slot mask in a padding byte;
+    `recon::ours_on_leg` selects only cloids whose slot byte (LAW E-9) is in
+    the mask; a halt queues `1 << slot` on every live leg, OR'd into an entry
+    already pending; the roll path (LAW E-8) carries every slot. The
+    confirmation is per slot: `Working` while an entry carrying the slot is
+    pending, `Stranded` when one carrying it was given up on or could not be
+    queued since the slot's request (a per-slot counter and mark), `Clear`
+    otherwise. `cancel_all_runs`, `cancel_all_unqueued` and `sweep_left`
+    count the per-slot requests as they count the venue-wide ones;
+  - `HlGatewayArm` (one slot per arm; its sweep takes only its slots'
+    cloids, XG-1), the Binance arm (one owner slot, BX-7) and `HyparbLive`
+    (slot 0's own wallet): their slot → the whole cancel; any other slot →
+    nothing to cancel, `Clear`.
+- **The router.** Each halted slot's cancel cycle runs on its own — at most
+  one request per slot per poll, a failed request retried for that slot, a
+  `Stranded` re-asked for that slot — and a slot's `Clear` releases that
+  slot's resting rows, count and notional alone (`Ledger::clear_resting_slot`).
+  The latch, `exec.HALT`, `--halt-slot` and the live-only filter are
+  unchanged. `HlExchange`'s boot and shutdown sweeps
+  (`cancel_ours_everywhere`) and the gateway's shutdown are unchanged; the
+  venue-wide `cancel_all` is now what the single-slot arms answer for their
+  own slot.
+- **The behaviour that changes.** Two live slots on one arm with different
+  thresholds (say a WS gap of 5 s on one and 30 s on the other): the first
+  halts and pulls its own quotes; the other's stay until its own threshold
+  trips. Before XH5a the venue-wide cancel pulled both. That is the ruling's
+  intent; an operator who wants both pulled together sets the same
+  thresholds, or halts both. **A condition of the whole arm still reaches
+  every slot on it:** the budget floor, a venue lock, the gateway's halt word
+  and margin risk come from the arm's signal, which every slot it trades
+  reads — each latches and cancels its own. BIN15's halt path changes with
+  this (R-XH4-1 says so): a BIN15 halt cancels BIN15's orders, not another
+  operator-arm slot's; its flip checks are re-read in XH5e.
+- **The foreign-row refusal** (the runtime gap XH4h-2 recorded: ai-exec and
+  vm choose their symbols at runtime). An instrument row slot 6's boot binds
+  carries an owner byte; the router refuses a live order of any other slot
+  on an owned row — `RiskRefusal::ForeignRow`, counted
+  (`refused_foreign_row`, published as
+  `engine_exec_hlgw_refused_foreign_row_total`) — before any ledger
+  arithmetic. The XH4h-2 boot rule stays. `RouteCounters` grew to five lines
+  for it, on purpose.
+- **The boot.** `check_gateway_alone` is now `check_gateway_slot`: D2's
+  refusal is gone, so a live gateway slot 6 runs beside the live slots of the
+  operator's blocking arm — on TESTNET with them (LAW E-4 puts both arms on
+  the market data's network): XH5e's engine-instance check. Slot 6 beside
+  slot 0 or a live Binance slot stays refused until XH5b: their arms trade
+  mainnet only (`MainnetAuthority`, BX-16), and one engine never mixes a
+  testnet rehearsal with mainnet orders. The session-bound refusal stays
+  until XH5b. The engine composes `SlotSplit(6, operator arm, gateway arm)`;
+  every other shape with slot 6 stays an abort.
+- **Under-cancel is what this cut must rule out:** a halted slot's order
+  left resting. The mask is the halted slot's bit; every pass re-reads the
+  venue's open orders; a pass that finds none of the carried slots' orders
+  on a leg drops the entry, as does one whose cancels the venue all
+  confirmed (`SweepOutcome::Done`, unchanged); an entry given up on, or a
+  leg the table could not hold, strands the slot and the router asks again.
+  A per-slot clear never touches another slot's rows. A request queues
+  every live leg at once, and a leg the table cannot hold is re-asked from
+  the start of the walk, so `cli` pins at compile time that the table holds
+  every leg the feed can bind (`2 × HL_MAX_FAMILIES ≤ MAX_PENDING_SWEEPS`).
+- **The single-slot arms' premise.** `HlGatewayArm` answers `Clear` for any
+  slot but its own because one gateway serves one slot today; XH4i, which
+  lets a gateway serve several, must carry the slot into its sweep request
+  and replace that answer. `HyparbLive` now refuses another slot's order
+  (`Unroutable`), the premise of its own `Clear`. `VenueSplit` asks both arms
+  for a slot whatever its route — a Binance-only slot's halt also queues
+  `HlExchange` sweeps, which find nothing of its: the safe direction, at
+  the old verb's cost.
+
+**The shared testnet account (the shape XH5a makes bootable).** Slot 6's
+gateway signs as the E3 testnet agent, on the account slots 0 and 3 test
+on. With slot 3 (or 4, 5) live on the operator's arm on that account,
+nothing under-cancels, but:
+(a) slot 6's dead man goes off once another slot's order is seen on the
+account (`deadman_wanted` arms the account-wide `scheduleCancel` only on
+an account of its own or while slot 6's orders are the account's only
+ones), so for that while its quotes outlive a process death — until a boot
+that runs slot 6's gateway sweeps them (the operator arm's boot sweep takes
+`#` coins only);
+(b) two budget governors count one address: the operator arm's (seeded at
+boot, re-read in top-ups) never sees the gateway's spend, so its
+`BudgetFloor` halt can fire late;
+(c) the venue's window of 100 nonces is shared by two live signers — the
+case XH4h-1 left for this ruling;
+(d) slot 6's perp fills land in the operator arm's `fills_unresolved`;
+(e) a session bound on slot 3 would be judged on the shared account.
+XH5e's engine-instance check therefore runs the operator's arm on a testnet
+master AND agent of its own (`HYPERLIQUID_*` ≠ the E3 agent's: the nonce
+window of (c) is per signer), or records (a)–(e) as accepted for that run.
+XH5b's own account ends all five for slot 6.
+
+**Residual, for Anton: the arm-wide reject streak.** A cancel the venue
+answers "never placed, already cancelled or filled" counts into the arm's
+reject streak, which every slot on the arm reads: a halted slot's member
+cancelling orders its sweep already took could trip a sibling at
+`halt_on_reject_streak`. Fail-safe (the sibling halts and cancels its own),
+and left as it is: making that answer neutral, as E7-F2 did for an IoC miss,
+would change BIN15's mainnet streak.
+
+**XH5e obligations from this cut:** BIN15's flip checks re-read under the
+per-slot halt (R-XH4-1) — `scripts/bin15-flip.sh` counts every order on a
+`#` coin as slot 3's, which a sibling slot's HIP-4 orders on the operator's
+account would break; the shared-account choice above.
+
+**Superseded:** O-BX8's fan-out (a halt's cancel "fans out to every live
+arm", BX3 and `docs/binance-exec-plan.md`) — it now carries only the halted
+slot's orders, on every arm that slot trades; E6 commit 3's "venue-wide
+cancel on the edge" and "two slots in one poll share one request, because
+cancel-all is venue-wide"; XH1's note that a slot-6 halt's venue-wide cancel
+would pull bin15's quotes; XH4f's D2 refusal (`check_gateway_alone`);
+XH4h-1's "only once D2 lets two signers of one agent run live together" (the
+shape above); XH4h-2's "dead while D2 keeps a live gateway slot 6 alone" and
+its runtime gap (closed by the foreign-row refusal).
+
+**Deviations from the plan:** only the shape that can boot is composed —
+slot 6 beside the operator's arm; the shapes with slot 0 or a Binance slot
+wait for XH5b, since they cannot boot while the gateway is testnet-only. The
+plan's composition loopback with both real arms is covered by a loopback
+through the real `HlExchange` (slot 3's halt cancels slot 3's oid alone,
+`exec_composition_loopback`), the spy-arm router tests and gate 100; the
+run with both real arms is XH5e's engine-instance check. `RouteCounters`
+grew to 320 B.
+
+**Tests:** the router (a halt asks only the halted slot; two slots in one
+poll run two cycles; a slot's failed request and its stranded sweep re-ask
+that slot alone; a slot's `Clear` releases its rows only; an owned row
+refuses another live slot's order, passes its cancel and the owner's order,
+never judges a paper slot); the ledger (the per-slot clear; an owned row
+refuses every other slot; an owner past the slots refused at the bind);
+`SlotSplit` and `VenueSplit` routing; `HlExchange` (a halted slot's sweep
+carries its slot alone, a second slot ORs in, per-slot
+`Working`/`Stranded`/`Clear`, the roll still every slot's); `ours_on_leg`'s
+slot filter; the real-arm loopback (slot 3's halt: the venue's read lists
+slots 3 and 4, one cancel leaves the host, for slot 3's oid; slot 3's row
+released on the confirmation, slot 4's kept); `bind_perps` owns slot 6's
+rows; the boot (slot 6 beside slot 3 resolves, the operator arm's numbers
+are slot 3's; beside Binance or slot 0 refused; the session bound refused);
+slot 0's halt reaches slot 0's arm alone; alloc gate 100 (0 B: the router's
+per-slot cycle through `Retry`, `Stranded` and the `Clear` that releases a
+real row; `HlExchange`'s per-slot request over more legs than its table,
+`strand` included; the sweep's selection), gate 99 binding slot 6's row as
+the engine does.
+
+**Gates (the committed tree):** clippy 0; nextest 4 119/4 119; alloc 108
+(+3 ignored) at 0 B, gate 100 new, compiled fresh; copy new=0; license OK;
+release OK; replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — risk, allocation and zero-copy APPROVE WITH NITS (no
+under-cancel path; the texts above — superseded rulings, deviations, the
+shared account, the residual, the single-slot premise; the router-level
+foreign-row test, the real-arm loopback, gate 100's widening, the size pin,
+the owner's validation, stale texts — all taken); round 2 — zero-copy
+APPROVE, risk and allocation APPROVE WITH NITS (the feed-to-table pin, two
+wordings, a comment, the alloc gate's freshness — taken); round 3 — risk,
+allocation and zero-copy APPROVE. Answered, not changed: the three
+single-slot overrides stay explicit; `VenueSplit` asks both arms;
+`sweep_one_pending`'s 36 B snapshot stays (pinned); the reject-streak
+residual above.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

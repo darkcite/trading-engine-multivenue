@@ -14,13 +14,13 @@
 //! checked against the venue's — sets each one's leverage before it takes
 //! orders (O-XH6: [`LEVERAGE`]×, cross), and the router binds them as
 //! `LAW_LINEAR` rows. The member's caps must sit inside slot 6's exec
-//! clamps. A live gateway slot 6 runs alone (`exec_boot::resolve`'s
-//! `check_gateway_alone`): it is its engine's only live slot — a halt's
-//! cancel-all reaches every arm the engine holds (D2; XH4h S3 lifted the
-//! nonce reason: the gateway draws from its agent's one nonce stream) —
-//! and it states no session bound: the P&L anchor file comes
-//! with XH5's own account (on a shared account the account value is not
-//! slot 6's P&L).
+//! clamps. A live gateway slot 6 runs beside the operator's arm's live
+//! slots only (`exec_boot::resolve`'s `check_gateway_slot`; XH5a: a halt
+//! cancels the halted slot's orders alone, and the gateway draws from its
+//! agent's one nonce stream, XH4h S3) — never beside slot 0 or a Binance
+//! slot until XH5b, their arms being mainnet-only — and it states no
+//! session bound: the P&L anchor file comes with XH5b's own account (on a
+//! shared account the account value is not slot 6's P&L).
 //!
 //! The gateway runs on its own pinned thread until the engine is done
 //! with it: the arm's `on_shutdown` pumps it (the sweep, the reads, the
@@ -379,8 +379,10 @@ pub fn bind_perps(
         if !out.coins.insert(coin.as_bytes(), info.asset_id) {
             return Err(format!("coin {coin}: the gateway's coin map refused it"));
         }
+        // XMM XH5a: slot 6 owns its perps' rows — the router refuses every
+        // other live slot's order on them (one engine id, one row).
         out.specs
-            .push(InstrumentSpec::new(ask.sym, LAW_LINEAR, 0, 0, 0));
+            .push(InstrumentSpec::new(ask.sym, LAW_LINEAR, 0, 0, 0).owned_by(cfg.slot));
     }
     cfg.n_perps = n;
     Ok(())
@@ -555,6 +557,8 @@ mod tests {
         assert_eq!((cfg.perps[0].sym, cfg.perps[0].asset), (7, 0));
         assert_eq!((cfg.perps[1].sym, cfg.perps[1].asset), (8, 1));
         assert_eq!(out.specs.len(), 2);
+        // XMM XH5a: slot 6's rows are slot 6's (the foreign-row refusal).
+        assert!(out.specs.iter().all(|s| s.owner == 6));
 
         assert!(refused(META, &[ask("BTC", 7, Some(100))]).contains("not the venue's size step"));
         assert!(refused(META, &[ask("XRP", 7, None)]).contains("not a native Hyperliquid perp"));

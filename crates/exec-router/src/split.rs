@@ -247,6 +247,24 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for SlotSplit<A, B> {
         least_settled(self.a.cancel_all_state(), self.b.cancel_all_state())
     }
 
+    /// **XMM XH5a** — a slot's halt reaches the arm that trades it, and
+    /// only that arm (as `halt_signal_for` reads it).
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        if slot == self.slot {
+            self.b.cancel_slot(slot)
+        } else {
+            self.a.cancel_slot(slot)
+        }
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        if slot == self.slot {
+            self.b.cancel_slot_state(slot)
+        } else {
+            self.a.cancel_slot_state(slot)
+        }
+    }
+
     fn arm_counters(&self) -> LiveArmCounters {
         self.a.arm_counters()
     }
@@ -505,5 +523,26 @@ mod tests {
         assert_eq!(s.cancel_all_state(), CancelAllState::Stranded);
         s.a_mut().state = 1;
         assert_eq!(s.cancel_all_state(), CancelAllState::Working, "wait first");
+    }
+
+    /// XMM XH5a: a slot's cancel asks its own arm alone, and its
+    /// confirmation is that arm's.
+    #[test]
+    fn a_slot_s_cancel_asks_its_own_arm_alone() {
+        let mut s = split();
+        s.cancel_slot(0).unwrap();
+        assert_eq!((s.a().cancel_all_calls, s.b().cancel_all_calls), (0, 1));
+        s.a_mut().cancel_all_err = true;
+        assert!(s.cancel_slot(3).is_err());
+        assert_eq!((s.a().cancel_all_calls, s.b().cancel_all_calls), (1, 1));
+        s.a_mut().state = 2;
+        assert_eq!(s.cancel_slot_state(3), CancelAllState::Stranded);
+        assert_eq!(
+            s.cancel_slot_state(0),
+            CancelAllState::Clear,
+            "b's own word"
+        );
+        s.b_mut().state = 1;
+        assert_eq!(s.cancel_slot_state(0), CancelAllState::Working);
     }
 }

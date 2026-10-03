@@ -643,10 +643,18 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
     }
 }
 
+/// **Every slot** — the mask a sweep of a retired leg carries (LAW E-8:
+/// a leg whose instance ended is nobody's to keep). A halted slot's
+/// sweep carries `1 << slot` (XMM XH5a).
+pub const ALL_SLOTS: u8 = u8::MAX;
+
+// A slot mask is one byte: one bit per value of the cloid's slot byte.
+const _: () = assert!(core_config::exec::EXEC_SLOTS <= 8);
+
 /// Of the orders the venue says are resting, which are **ours, on this
-/// leg** — returns how many oids were written to `out`.
+/// leg, of these slots** — returns how many oids were written to `out`.
 ///
-/// Two filters, and both matter:
+/// Three filters, and all three matter:
 ///
 /// - **The coin must match exactly.** The answer covers the whole
 ///   account, and a sweep of one retired leg must not touch another.
@@ -654,13 +662,23 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
 ///   the venue UI carries no cloid and a stranger's carries someone
 ///   else's magic; cancelling either would be the mirror image of
 ///   booking a stranger's fill.
+/// - **Its slot byte must be in `slots`** (XMM XH5a). One account
+///   serves several slots, and a halt cancels the halted slot's orders
+///   while a sibling slot's quotes stay. [`ALL_SLOTS`] takes every
+///   slot's.
 ///
 /// Pure, so the arm and the testnet probe run the SAME selection — the
 /// same reason [`compare_booked`] lives here rather than on
 /// `HlExchange`. A sweep whose selection was only ever exercised
 /// behind a socket is a claim about source code.
 #[must_use]
-pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]) -> usize {
+pub fn ours_on_leg(
+    rows: &[OpenOrder],
+    body: &[u8],
+    coin: &[u8],
+    slots: u8,
+    out: &mut [u64],
+) -> usize {
     let mut n = 0usize;
     let mut i = 0usize;
     while i < rows.len() {
@@ -669,10 +687,13 @@ pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]
         if row.coin.of(body) != coin {
             continue;
         }
-        if !matches!(
-            row.cloid.as_ref().map(crate::cloid::decode),
-            Some(crate::cloid::Owner::Ours { .. })
-        ) {
+        let Some(crate::cloid::Owner::Ours { strategy_id, .. }) =
+            row.cloid.as_ref().map(crate::cloid::decode)
+        else {
+            continue;
+        };
+        // `strategy_id < EXEC_SLOTS` (≤ 8) by `decode`: the shift is exact.
+        if slots & (1u8 << strategy_id) == 0 {
             continue;
         }
         if n >= out.len() {
@@ -1336,7 +1357,7 @@ mod tests {
         assert_eq!(n, 5);
 
         let mut out = [0u64; MAX_OPEN_ORDERS];
-        let k = ours_on_leg(&rows[..n], &body, b"#195641", &mut out);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
         assert_eq!(&out[..k], &[11, 15], "ours on THIS leg, and nothing else");
 
         // 12 is a foreign cloid, 13 has none (placed from the UI), and
@@ -1348,13 +1369,50 @@ mod tests {
 
         // The other leg selects its own, which is the same statement
         // from the other side.
-        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", &mut out);
+        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", ALL_SLOTS, &mut out);
         assert_eq!(&out[..k2], &[14]);
 
         // A leg with nothing of ours selects nothing rather than
         // falling back to "cancel what is there".
-        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", &mut out);
+        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", ALL_SLOTS, &mut out);
         assert_eq!(k3, 0);
+    }
+
+    /// **XMM XH5a — a halt's sweep takes its own slot's orders.** One
+    /// account, two slots' quotes on one leg: slot 3's sweep selects
+    /// slot 3's alone, slot 7's its own, and a roll's every slot's —
+    /// the selection the arm's per-slot cancel runs.
+    #[test]
+    fn a_slot_s_sweep_selects_that_slot_s_orders_alone() {
+        let hex = |slot: u8, oid: u64| {
+            let c = crate::cloid::encode(slot, oid);
+            let mut h = [0u8; 34];
+            let n = crate::cloid::to_hex(&c, &mut h);
+            String::from_utf8(h[..n].to_vec()).expect("ascii")
+        };
+        let (three, seven) = (hex(3, 0x65), hex(7, 0x66));
+        let body = format!(
+            r##"[
+              {{"coin":"#195641","oid":11,"cloid":"{three}"}},
+              {{"coin":"#195641","oid":12,"cloid":"{seven}"}},
+              {{"coin":"#195641","oid":13,"cloid":"{three}"}}
+            ]"##
+        )
+        .into_bytes();
+        let mut rows = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        let n = scan_open_orders(&body, &mut rows).expect("scans");
+        assert_eq!(n, 3);
+        let mut out = [0u64; MAX_OPEN_ORDERS];
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 3, &mut out);
+        assert_eq!(&out[..k], &[11, 13], "slot 3's, and not slot 7's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 7, &mut out);
+        assert_eq!(&out[..k], &[12]);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", (1 << 3) | (1 << 7), &mut out);
+        assert_eq!(&out[..k], &[11, 12, 13], "two halted slots, one pass");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
+        assert_eq!(k, 3, "a roll takes every slot's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 5, &mut out);
+        assert_eq!(k, 0, "a slot with nothing resting selects nothing");
     }
 
     #[test]

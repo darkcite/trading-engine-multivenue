@@ -2721,7 +2721,7 @@ impl OrderDispatch for HlGatewayArm {
             Some(b) => (1, b.remaining(), b.cancel_remaining()),
             None => (0, 0, 0),
         };
-        // COPY: the 752 B report written once into the caller's block —
+        // COPY: the 760 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -2792,6 +2792,7 @@ impl OrderDispatch for HlGatewayArm {
             // The router's (`RoutedDispatcher` adds them).
             refused_cap_perp: 0,
             refused_max_resting: 0,
+            refused_foreign_row: 0,
             ready: u64::from(self.ready()),
             open_orders: self.n_rows as u64,
             in_flight,
@@ -2864,6 +2865,25 @@ impl OrderDispatch for HlGatewayArm {
         } else {
             CancelAllState::Clear
         }
+    }
+
+    /// XMM XH5a: one slot per gateway arm (`cfg.slot`) — that slot's
+    /// cancel is the arm's whole cancel (the gateway's sweep takes only
+    /// its slots' cloids, XG-1); another slot has nothing here. A gateway
+    /// serving several slots (XH4i) carries the slot into its sweep
+    /// request.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        if slot == self.cfg.slot {
+            return self.cancel_all();
+        }
+        Ok(())
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        if slot == self.cfg.slot {
+            return self.cancel_all_state();
+        }
+        CancelAllState::Clear
     }
 
     fn on_shutdown(&mut self) {

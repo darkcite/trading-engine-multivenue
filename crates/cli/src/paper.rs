@@ -6115,7 +6115,7 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 65;
+const HLGW_COUNTERS: usize = 66;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
 const HLGW_GAUGES: usize = 27;
 
@@ -6187,10 +6187,11 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_gateway_ttl_full_total",
     "engine_exec_hlgw_refused_cap_perp_total",
     "engine_exec_hlgw_refused_max_resting_total",
+    "engine_exec_hlgw_refused_foreign_row_total",
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 65] (520 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 66] (528 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6261,6 +6262,7 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.gw_ttl_full,
         r.refused_cap_perp,
         r.refused_max_resting,
+        r.refused_foreign_row,
     ]
 }
 
@@ -6370,6 +6372,8 @@ fn register_hlgw_metrics(
     let last_shutdown_unconfirmed = reg
         .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
         .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
+    // COPY: the 376 B id block ((66 + 27 + 1) × 4 B), returned by value once
+    // at boot — rejected: an out-param for a one-time move.
     Ok(ExecHlgwMetricIds {
         counters,
         gauges,
@@ -6399,7 +6403,7 @@ fn mirror_hlgw_metrics(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: the 65 totals (520 B) kept as the next delta's baseline — 5 s
+    // COPY: the 66 totals (528 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -12264,7 +12268,8 @@ mod tests {
         let reg = obs.metrics.as_ref().unwrap();
         assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
         // XMM XH4f: 518 counters and 407 gauges here — slot 6's gateway
-        // family (65 + 28) took the worst case past 512 / 384.
+        // family (65 + 28) took the worst case past 512 / 384; XH5a adds
+        // one counter (519).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -13658,6 +13663,7 @@ mod tests {
             slot: 6,
             pushed: 5,
             refused_max_resting: 2,
+            refused_foreign_row: 4,
             gw_ttl_full: 1,
             heartbeat_age_ms: u64::MAX,
             budget_remaining: -3,
@@ -13675,6 +13681,7 @@ mod tests {
         for (name, v) in [
             ("engine_exec_hlgw_pushed_total", "8"),
             ("engine_exec_hlgw_refused_max_resting_total", "2"),
+            ("engine_exec_hlgw_refused_foreign_row_total", "4"),
             ("engine_exec_hlgw_gateway_ttl_full_total", "1"),
             ("engine_exec_hlgw_heartbeat_age_ms", "-1"),
             ("engine_exec_hlgw_budget_remaining", "-3"),

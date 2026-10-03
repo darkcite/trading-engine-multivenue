@@ -149,6 +149,15 @@ pub const HCV_SLOT: usize = strategy_set::SLOT_HCV as usize;
 const _: () = assert!(core_config::exec::EXEC_SLOTS == EXEC_SLOTS);
 const _: () = assert!(clob_dispatcher::EXEC_COUNTER_SLOTS == EXEC_SLOTS);
 
+/// XMM XH5a — the operator arm's sweep table holds every live leg the feed
+/// can bind (two per family): a halt's per-slot request queues them all at
+/// once, and one the table could not hold would be re-asked behind the
+/// same leading legs, never swept by the halt cycle.
+const _: () = assert!(
+    2 * ingress_hyperliquid::family::HL_MAX_FAMILIES
+        <= exec_hyperliquid::exchange::MAX_PENDING_SWEEPS
+);
+
 /// Slot names, for boot tells and refusal messages. Index = slot;
 /// mirrors `strategy-set`'s composition order.
 pub const SLOT_NAMES: [&str; EXEC_SLOTS] = [
@@ -608,7 +617,7 @@ pub fn resolve(artifact: Option<&Path>, arm_live: Option<&str>) -> Result<Option
         slots,
         binance: file.binance,
     };
-    check_gateway_alone(&boot)?;
+    check_gateway_slot(&boot)?;
     Ok(Some(boot))
 }
 
@@ -703,24 +712,34 @@ fn check_binance(
     Ok(())
 }
 
-/// **XMM XH4f — a live gateway slot 6 runs alone** (refused before any arm
+/// **XMM — slot 6 live on the Hyperliquid gateway** (refused before any arm
 /// boots):
-/// - the router's halt cancel-all is global (D2, for Anton): a testnet halt
-///   of slot 6 would pull any other live slot's quotes, and theirs slot 6's
-///   — so until D2 is ruled the gateway slot is its engine's only live slot
-///   (XH4h S3 lifted the rule's other reason, A-XH4f-1: every signer of one
-///   agent address now draws from one nonce stream);
+/// - **beside the operator's blocking arm since XH5a**: D2 is ruled
+///   (R-XH4-1) — a halt cancels only the halted slot's orders — so slot 6
+///   runs beside the live slots that arm trades, on TESTNET with them
+///   (LAW E-4 puts both arms on the market data's network);
+/// - **never beside slot 0 or a live Binance slot until XH5b**: their arms
+///   trade mainnet only (slot 0's `MainnetAuthority`, BX-16), the gateway
+///   testnet only, and one engine never mixes a testnet rehearsal with
+///   mainnet orders;
 /// - its session bound could never fire: the gateway arm judges no P&L on
-///   the shared testnet account (XH5 gives slot 6 its own).
-fn check_gateway_alone(boot: &ExecBoot) -> Result<(), String> {
+///   the shared testnet account (XH5b gives slot 6 its own).
+fn check_gateway_slot(boot: &ExecBoot) -> Result<(), String> {
     let Some(g) = boot.gateway_live() else {
         return Ok(());
     };
-    if boot.live_mask != 1u8 << g {
-        return Err(String::from(
-            "exec: slot 6 is live on the Hyperliquid gateway beside another live slot — the \
-             router's halt cancel-all is global (XMM XH4f D2, the operator's to rule): run \
-             slot 6 in an engine of its own, the others paper",
+    let mainnet = if boot.hyparb_live() {
+        Some(HYPEREVM_SLOT)
+    } else {
+        boot.binance_slot()
+    };
+    if let Some(m) = mainnet {
+        return Err(format!(
+            "exec: slot 6 is live on the Hyperliquid gateway — TESTNET until XMM XH5b — in an \
+             engine where slot {m} ({}) is live on an arm that trades mainnet only (slot 0's \
+             wallet, or Binance): one engine never mixes a testnet rehearsal with mainnet \
+             orders. Run slot {m} paper, or slot 6 in an engine of its own",
+            SLOT_NAMES[m]
         ));
     }
     if boot
@@ -731,8 +750,8 @@ fn check_gateway_alone(boot: &ExecBoot) -> Result<(), String> {
         return Err(String::from(
             "exec: slot 6 on the Hyperliquid gateway states a session bound \
              (halt_on_gain/loss_usd_1e6), but the gateway arm judges no P&L on the shared \
-             testnet account — the bound could never fire: drop it (XMM XH5 gives slot 6 its \
-             own account)",
+             testnet account — the bound could never fire: drop it (XMM XH5b gives slot 6 \
+             its own account)",
         ));
     }
     Ok(())
@@ -1216,52 +1235,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// XMM XH4f D2 (XH4h S3 lifted A-XH4f-1, the nonce): while the halt's
-    /// cancel-all is global, a live slot 3 on the operator's arm beside the
-    /// gateway slot refuses the boot — for D2 alone; the same slot 3 paper
-    /// resolves.
+    /// XMM XH5a (R-XH4-1, D2 ruled): a live slot 3 on the operator's arm
+    /// beside the gateway slot resolves — a halt cancels only the halted
+    /// slot's orders. The operator's arm boots for slot 3 alone, and its
+    /// address numbers are slot 3's, never slot 6's.
     #[test]
-    fn the_gateway_slot_runs_alone_while_d2_stands() {
+    fn the_gateway_slot_runs_beside_the_operator_s_arm() {
         let d = tmp();
-        let both = format!("{MINIMAL_LIVE}{}", gw_six().replacen("[exec]\n", "", 1));
+        let six = gw_six().replacen("[exec]\n", "", 1).replace(
+            "request_budget_floor = 2000\n",
+            "request_budget_floor = 9000\n",
+        );
+        let both = format!("{MINIMAL_LIVE}{six}");
         let p = write(&d, "exec.toml", &both);
-        let e = resolve(Some(&p), Some("3,6")).expect_err("another live slot beside it");
-        assert!(
-            e.contains("D2") && e.contains("engine of its own") && !e.contains("nonce"),
-            "{e}"
-        );
-        let p = write(
-            &d,
-            "exec-paper3.toml",
-            &both.replacen("mode = \"live\"", "mode = \"paper\"", 1),
-        );
-        let boot = resolve(Some(&p), Some("6"))
-            .expect("slot 3 paper: the gateway slot is the only live slot")
+        let boot = resolve(Some(&p), Some("3,6"))
+            .expect("slot 6 beside slot 3")
             .expect("present");
         assert_eq!(boot.gateway_live(), Some(XMM_SLOT));
-        assert!(!boot.hl_arm_needed());
+        assert!(boot.hl_arm_needed(), "slot 3 trades on the operator's arm");
+        assert_eq!(
+            boot.hl_address_numbers(),
+            (2000, 0, 0),
+            "slot 3's floor, never slot 6's"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// XMM XH4f (risk r1): the gateway slot runs alone — beside a live
-    /// Binance slot the global halt cancel-all (D2) would reach across —
-    /// and states no session bound (the gateway arm judges none on the
+    /// XMM XH5a: until XH5b the gateway slot never shares an engine with an
+    /// arm that trades mainnet only — a live Binance slot, or slot 0 — and
+    /// it states no session bound (the gateway arm judges none on the
     /// shared testnet account).
     #[test]
-    fn the_gateway_slot_runs_alone_and_states_no_session_bound() {
+    fn the_gateway_slot_refuses_mainnet_arms_beside_it_and_a_session_bound() {
         let d = tmp();
-        let with_bn = format!(
-            "{}{}{BN_SECTION}",
-            bn_live(),
-            gw_six().replacen("[exec]\n", "", 1)
-        );
+        let six = gw_six().replacen("[exec]\n", "", 1);
+        let with_bn = format!("{}{six}{BN_SECTION}", bn_live());
         let p = write(&d, "exec-bn.toml", &with_bn);
         let e = resolve(Some(&p), Some("3,6")).expect_err("a live Binance slot beside it");
-        assert!(e.contains("D2") && e.contains("engine of its own"), "{e}");
+        assert!(e.contains("slot 3 (bin15)") && e.contains("XH5b"), "{e}");
+        let hyparb = MINIMAL_LIVE
+            .replace("[exec.slot.3]", "[exec.slot.0]")
+            .replace("name = \"bin15\"", "name = \"hyparb\"")
+            .replace("[\"hyperliquid\"]", "[\"hyperliquid\", \"hyperevm\"]");
+        let p = write(&d, "exec-0.toml", &format!("{hyparb}{six}"));
+        let e = resolve(Some(&p), Some("0,6")).expect_err("slot 0 beside it");
+        assert!(
+            e.contains("slot 0 (hyparb)") && e.contains("mainnet only"),
+            "{e}"
+        );
         let bounded = format!("{}halt_on_loss_usd_1e6 = 5000000\n", gw_six());
         let p = write(&d, "exec-pnl.toml", &bounded);
         let e = resolve(Some(&p), Some("6")).expect_err("a bound that could never fire");
-        assert!(e.contains("session bound") && e.contains("XH5"), "{e}");
+        assert!(e.contains("session bound") && e.contains("XH5b"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

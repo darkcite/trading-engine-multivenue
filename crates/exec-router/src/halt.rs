@@ -40,8 +40,16 @@
 //! (`OrderDispatch::halt_signal_for`; a slot on two venues reads both,
 //! merged — BX3, O-BX17) against ITS OWN numbers, so a slot with a
 //! tighter threshold halts first and a slot on another venue is
-//! untouched (O-BX8). That is what "per-slot refusal, venue-wide
-//! cancel" means in code.
+//! untouched (O-BX8). That is what "per-slot refusal" means in code.
+//!
+//! **XMM XH5a (R-XH4-1) — and per-slot cancel.** A halt cancels only
+//! the halted slot's orders (`OrderDispatch::cancel_slot`): a sibling
+//! slot on the same arm keeps its quotes until its OWN numbers trip it.
+//! Before XH5a the cancel was venue-wide and pulled every live slot's
+//! quotes on any slot's halt. A condition of the whole arm (the budget
+//! floor, a venue lock, the gateway's halt word, margin risk) still
+//! reaches every slot the arm trades: each reads the arm's signal,
+//! latches, and cancels its own.
 //!
 //! ## Sticky
 //!
@@ -369,7 +377,7 @@ pub fn trigger_for(sig: &HaltSignal, lim: &HaltLimits) -> HaltReason {
     HaltReason::None
 }
 
-/// No cancel-all owed for this slot.
+/// No cancel owed for this slot.
 const CANCEL_NONE: u8 = 0;
 /// Latched, and the arm has not been asked yet.
 const CANCEL_WANTED: u8 = 1;
@@ -384,7 +392,7 @@ const CANCEL_RETRY: u8 = 3;
 pub enum CancelPhase {
     /// Nothing outstanding.
     None,
-    /// Ask the arm to cancel everything.
+    /// Ask the arm to cancel this slot's orders.
     Wanted,
     /// Already asked; poll for confirmation.
     Asked,
@@ -404,11 +412,12 @@ pub enum CancelPhase {
 pub struct HaltState {
     /// Index = `strategy_id`. Why each slot halted.
     reasons: [HaltReason; EXEC_SLOTS],
-    /// **Where this slot is in the cancel-all cycle.**
+    /// **Where this slot is in its cancel cycle** (per slot since XH5a:
+    /// each halted slot's cancel is its own request).
     ///
-    /// Index = `strategy_id`, one of [`CANCEL_NONE`],
-    /// [`CANCEL_WANTED`], [`CANCEL_ASKED`]. Three-valued because a
-    /// cancel-all on a real venue is a request and a confirmation
+    /// Index = `strategy_id`, one of [`CANCEL_NONE`], [`CANCEL_WANTED`],
+    /// [`CANCEL_ASKED`], [`CANCEL_RETRY`]. More than a `bool` because a
+    /// cancel on a real venue is a request and a confirmation
     /// separated by minutes, and the caller's job differs between
     /// them: `WANTED` means ask the arm, `ASKED` means poll it.
     ///
@@ -418,7 +427,7 @@ pub struct HaltState {
     pending_cancel: [u8; EXEC_SLOTS],
     /// Halt edges, total. One per slot that ever halted.
     pub halts: u64,
-    /// Cancel-all REQUESTS the arm would not accept.
+    /// Cancel REQUESTS the arm would not accept (per slot since XH5a).
     pub cancel_all_failures: u64,
     /// **Polls on which the arm reported it had given up** — a sweep
     /// abandoned, or a leg it could never queue — and the router
@@ -480,8 +489,7 @@ impl HaltState {
         self.reason(slot).is_halted()
     }
 
-    /// Is ANY slot halted? Decides whether the idle path has a
-    /// cancel-all to retry.
+    /// Is ANY slot halted?
     #[inline]
     #[must_use]
     pub fn any_halted(&self) -> bool {
@@ -511,8 +519,8 @@ impl HaltState {
     }
 
     /// **Latch a halt. Returns `true` on the EDGE** — the first time
-    /// this slot halts — so the caller fires cancel-all once per
-    /// incident rather than once per poll.
+    /// this slot halts — so the caller asks for the slot's cancel once
+    /// per incident rather than once per poll.
     ///
     /// Sticky: a slot already halted keeps its FIRST reason. The ones
     /// after it describe the same incident, and an operator wants to
@@ -530,75 +538,60 @@ impl HaltState {
         true
     }
 
-    /// The venue confirmed it holds nothing for us.
+    /// The venue confirmed it holds nothing of `slot`'s.
     #[inline]
-    pub fn cancel_cleared(&mut self) {
-        self.pending_cancel = [CANCEL_NONE; EXEC_SLOTS];
+    pub fn cancel_cleared(&mut self, slot: usize) {
+        if slot < EXEC_SLOTS {
+            self.pending_cancel[slot] = CANCEL_NONE;
+        }
     }
 
-    /// The request has gone to the arm; from here the caller polls
+    /// `slot`'s request has gone to the arm; from here the caller polls
     /// rather than asks.
     #[inline]
-    pub fn cancel_requested(&mut self) {
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            if self.pending_cancel[i] == CANCEL_WANTED || self.pending_cancel[i] == CANCEL_RETRY {
-                self.pending_cancel[i] = CANCEL_ASKED;
-            }
-            i += 1;
+    pub fn cancel_requested(&mut self, slot: usize) {
+        if slot < EXEC_SLOTS
+            && (self.pending_cancel[slot] == CANCEL_WANTED
+                || self.pending_cancel[slot] == CANCEL_RETRY)
+        {
+            self.pending_cancel[slot] = CANCEL_ASKED;
         }
     }
 
-    /// **What the caller owes the arm right now.**
-    ///
-    /// `Wanted` beats `Retry` beats `Asked`: a slot that halted while
-    /// another slot's sweep was already draining needs its own legs
-    /// requested, and a cancel-all is venue-wide, so one fresh
-    /// request covers both.
+    /// **What the caller owes the arm for `slot` right now** (XH5a:
+    /// each slot's cycle is its own). A slot that halts while another's
+    /// sweep is draining is `Wanted` on its own — its orders were not
+    /// in that request.
     #[inline]
     #[must_use]
-    pub fn cancel_phase(&self) -> CancelPhase {
-        let mut asked = false;
-        let mut retry = false;
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            match self.pending_cancel[i] {
-                CANCEL_WANTED => return CancelPhase::Wanted,
-                CANCEL_RETRY => retry = true,
-                CANCEL_ASKED => asked = true,
-                _ => {}
-            }
-            i += 1;
+    pub fn cancel_phase(&self, slot: usize) -> CancelPhase {
+        if slot >= EXEC_SLOTS {
+            return CancelPhase::None;
         }
-        if retry {
-            CancelPhase::Retry
-        } else if asked {
-            CancelPhase::Asked
-        } else {
-            CancelPhase::None
+        match self.pending_cancel[slot] {
+            CANCEL_WANTED => CancelPhase::Wanted,
+            CANCEL_ASKED => CancelPhase::Asked,
+            CANCEL_RETRY => CancelPhase::Retry,
+            _ => CancelPhase::None,
         }
     }
 
-    /// A `cancel_all` REQUEST did not land (refused outright, or only
-    /// partially queued). Every slot that was `ASKED` goes back to
-    /// `WANTED`, so the NEXT poll asks again rather than confirming.
+    /// `slot`'s REQUEST did not land (refused outright, or only
+    /// partially queued): `ASKED` goes back to `RETRY`, so the NEXT poll
+    /// asks again rather than confirming.
     ///
-    /// The first cut left them `ASKED` on the premise that the next
-    /// poll would read `Stranded` and re-ask — but the arm reported
-    /// `Clear` once the legs it DID queue drained, and the router then
-    /// zeroed every slot's resting count over quotes still live at the
-    /// venue: the commit-3 fail-open, back through the `QueueFull`
-    /// door (E7 review, 2026-09-19). A refused request is re-requested
-    /// by construction now, whatever the arm's state machine says.
+    /// The first cut left it `ASKED` on the premise that the next poll
+    /// would read `Stranded` and re-ask — but the arm reported `Clear`
+    /// once the legs it DID queue drained, and the router then zeroed
+    /// the resting count over quotes still live at the venue: the
+    /// commit-3 fail-open, back through the `QueueFull` door (E7
+    /// review, 2026-09-19). A refused request is re-requested by
+    /// construction, whatever the arm's state machine says.
     #[inline]
-    pub fn cancel_failed(&mut self) {
+    pub fn cancel_failed(&mut self, slot: usize) {
         self.cancel_all_failures = self.cancel_all_failures.saturating_add(1);
-        let mut i = 0usize;
-        while i < EXEC_SLOTS {
-            if self.pending_cancel[i] == CANCEL_ASKED {
-                self.pending_cancel[i] = CANCEL_RETRY;
-            }
-            i += 1;
+        if slot < EXEC_SLOTS && self.pending_cancel[slot] == CANCEL_ASKED {
+            self.pending_cancel[slot] = CANCEL_RETRY;
         }
     }
 
@@ -875,8 +868,47 @@ mod tests {
         assert!(!h.cancel_outstanding());
         h.latch(3, HaltReason::WsGap);
         assert!(h.cancel_outstanding(), "the venue still holds our orders");
-        h.cancel_cleared();
+        h.cancel_cleared(3);
         assert!(!h.cancel_outstanding());
+    }
+
+    /// XMM XH5a: each halted slot's cancel is its own cycle — asked,
+    /// failed, retried and cleared without touching another slot's.
+    #[test]
+    fn each_slot_s_cancel_runs_its_own_cycle() {
+        let mut h = HaltState::new();
+        h.latch(3, HaltReason::RejectStreak);
+        h.latch(6, HaltReason::WsGap);
+        assert_eq!(h.cancel_phase(3), CancelPhase::Wanted);
+        assert_eq!(h.cancel_phase(6), CancelPhase::Wanted);
+        assert_eq!(h.cancel_phase(0), CancelPhase::None, "never halted");
+        h.cancel_requested(3);
+        assert_eq!(h.cancel_phase(3), CancelPhase::Asked);
+        assert_eq!(h.cancel_phase(6), CancelPhase::Wanted, "6 not asked yet");
+        h.cancel_failed(3);
+        assert_eq!(h.cancel_phase(3), CancelPhase::Retry);
+        assert_eq!(h.cancel_all_failures, 1);
+        h.cancel_failed(6);
+        assert_eq!(
+            h.cancel_phase(6),
+            CancelPhase::Wanted,
+            "a failure only moves an ASKED slot"
+        );
+        h.cancel_requested(6);
+        h.cancel_cleared(6);
+        assert_eq!(h.cancel_phase(6), CancelPhase::None);
+        assert!(h.cancel_outstanding(), "3 still owes its cancel");
+        h.cancel_requested(3);
+        h.cancel_cleared(3);
+        assert!(!h.cancel_outstanding());
+        assert!(
+            h.is_halted(3) && h.is_halted(6),
+            "clearing a cancel un-halts nothing"
+        );
+        // Out of range: no slot, no phase, nothing moved.
+        h.cancel_requested(EXEC_SLOTS);
+        h.cancel_cleared(EXEC_SLOTS);
+        assert_eq!(h.cancel_phase(EXEC_SLOTS), CancelPhase::None);
     }
 
     #[test]

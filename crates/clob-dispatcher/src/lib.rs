@@ -771,6 +771,34 @@ pub trait OrderDispatch {
         CancelAllState::Clear
     }
 
+    /// **XMM XH5a (R-XH4-1) — REQUEST that ONE slot's orders come off
+    /// the venue.** The router's halt path asks this, never
+    /// [`Self::cancel_all`]: a halt cancels only the halted slot's
+    /// orders, so a sibling slot on the same arm keeps its quotes.
+    ///
+    /// The same request / confirmation split as `cancel_all`
+    /// ([`Self::cancel_slot_state`] confirms). Defaulted to the
+    /// venue-wide [`Self::cancel_all`]: an arm that cannot tell its slots
+    /// apart OVER-cancels — the behaviour before XH5a — and never leaves
+    /// a halted slot's order resting. Every arm a live engine composes
+    /// answers for its own slots.
+    ///
+    /// # Errors
+    /// Whatever stopped the arm accepting the request.
+    #[inline]
+    fn cancel_slot(&mut self, _slot: u8) -> Result<(), DispatchError> {
+        self.cancel_all()
+    }
+
+    /// **XMM XH5a — is the venue clear of ONE slot's orders?** Polled
+    /// after [`Self::cancel_slot`] until it answers
+    /// [`CancelAllState::Clear`]; three-valued for the reason
+    /// [`Self::cancel_all_state`] is, which it defaults to.
+    #[inline]
+    fn cancel_slot_state(&self, _slot: u8) -> CancelAllState {
+        self.cancel_all_state()
+    }
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly
@@ -859,7 +887,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 752 B report never crosses by value.
+    /// 760 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -978,7 +1006,7 @@ const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
 /// arm's counters and the dead man's, the gateway's (its shared words and
 /// the ones it publishes at its heartbeat), the budget, the rates and the
 /// latencies, and the router's words for the arm's slot. Counters are
-/// totals since boot; the fields after [`Self::refused_max_resting`] are
+/// totals since boot; the fields after [`Self::refused_foreign_row`] are
 /// levels. [`ExecCounters`] keeps its pinned 936 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -1128,6 +1156,9 @@ pub struct GatewayArmReport {
     pub refused_cap_perp: u64,
     /// Orders the router refused over a perp slot's `max_resting_usd_1e6`.
     pub refused_max_resting: u64,
+    /// XMM XH5a: other slots' live orders the router refused on this
+    /// slot's owned rows.
+    pub refused_foreign_row: u64,
     // --- gauges ---
     /// `1` while the arm takes orders.
     pub ready: u64,
@@ -1189,7 +1220,8 @@ pub struct GatewayArmReport {
 }
 
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 752);
+// XH5a: + `refused_foreign_row` (95).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 760);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

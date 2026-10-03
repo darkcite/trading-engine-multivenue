@@ -5311,7 +5311,7 @@ fn run(args: RunArgs) -> ExitCode {
                     // **XMM XH4h-2 — the hedge-coin overlap rule**, before
                     // any arm boots: no perp slot 6's gateway binds may be
                     // another LIVE member's perp (a paper member is no
-                    // claim — dead while D2 keeps slot 6 alone).
+                    // claim; since XH5a a live one can sit beside slot 6).
                     if let (Some(_), Some(xb)) = (eb.gateway_live(), xmm_boot.as_ref()) {
                         let live = |slot: u8| eb.live_mask & (1u8 << slot) != 0;
                         let n = usize::from(xb.params.n_perps).min(xb.coins.len());
@@ -5462,10 +5462,10 @@ fn run(args: RunArgs) -> ExitCode {
                     // bound from the exchange host's meta, their leverage
                     // set before it takes orders, its thread released only
                     // after the loop (the arm's shutdown pumps it in the
-                    // drain). `resolve` made it the engine's only live
-                    // slot (D2); it draws from its agent's nonce stream
-                    // (XH4h S3). Booted last: no refusal after it but the
-                    // shapes' own.
+                    // drain). `resolve` lets it beside the operator's arm
+                    // alone (XH5a; slot 0 and Binance wait for XH5b); it
+                    // draws from its agent's nonce stream (XH4h S3).
+                    // Booted last: no refusal after it but the shapes' own.
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -5503,7 +5503,8 @@ fn run(args: RunArgs) -> ExitCode {
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
                     // the loop from its own arm — enumerated, eight (O-BX30),
-                    // and XMM XH4f's two with slot 6 outermost (`SlotSplit`);
+                    // and XMM's with slot 6 outermost (`SlotSplit`: alone,
+                    // XH4f; beside the operator's arm, XH5a) and its refusal;
                     // the halt wiring is one generic helper. Nothing armed
                     // keeps the refusing stub, so LAW E-1 stays true by
                     // construction. A Binance shape splits by route venue
@@ -5578,11 +5579,32 @@ fn run(args: RunArgs) -> ExitCode {
                                  (TESTNET) — real testnet orders will be submitted"
                             )
                         }
+                        // XMM XH5a (R-XH4-1): slot 6 beside the operator's
+                        // blocking arm — both on testnet (LAW E-4) until
+                        // XH5b; a halt cancels the halted slot's orders
+                        // alone (`OrderDispatch::cancel_slot`).
+                        (Some(arm), None, None, Some((xmm, xspecs))) => {
+                            let split = exec_router::SlotSplit::new(
+                                cli::exec_boot::XMM_SLOT as u8,
+                                arm,
+                                xmm,
+                            );
+                            let mut d =
+                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
+                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                            finish_xmm!(d, xspecs);
+                            enter_loop!(
+                                d,
+                                "running strategy-set with slot 6 LIVE on the Hyperliquid gateway \
+                                 beside the operator's arm (TESTNET) — real testnet orders will \
+                                 be submitted"
+                            )
+                        }
                         // `exec_boot::resolve` refuses slot 6's gateway beside
-                        // any other live slot (XH4h shares the nonce; D2's
-                        // global halt): refused here too, never composed.
+                        // slot 0 or a live Binance slot until XH5b (their arms
+                        // trade mainnet only): refused here too, never composed.
                         (_, _, _, Some(_)) => abort_boot!(
-                            "exec: slot 6's gateway beside another live arm — boot aborted"
+                            "exec: slot 6's gateway beside a mainnet-only arm — boot aborted"
                         ),
                         (Some(arm), None, None, None) => {
                             let mut d =

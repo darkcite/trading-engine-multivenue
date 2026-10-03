@@ -973,6 +973,11 @@ fn mul_1e6(a: i64, b: i64) -> i64 {
 
 impl<H: HedgeArm> OrderDispatch for HyparbLive<H> {
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        // XMM XH5a: slot 0's arm alone — `cancel_slot` answers `Clear` for
+        // every other slot on that ground, as the gateway arm's does.
+        if order.strategy_id != SLOT {
+            return Err(DispatchError::Unroutable);
+        }
         if order.venue == VenueId::HyperEvm.to_u8() && order.kind == core_fill::ORDER_KIND_AMM_SWAP
         {
             return self.submit_swap(order);
@@ -1145,6 +1150,22 @@ impl<H: HedgeArm> OrderDispatch for HyparbLive<H> {
 
     fn cancel_all_state(&self) -> CancelAllState {
         self.hl.cancel_all_state()
+    }
+
+    /// XMM XH5a: slot 0 trades from its own wallet — its cancel is the
+    /// hedge arm's whole cancel; another slot has nothing on this account.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        if slot == SLOT {
+            return self.cancel_all();
+        }
+        Ok(())
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        if slot == SLOT {
+            return self.cancel_all_state();
+        }
+        CancelAllState::Clear
     }
 
     fn on_shutdown(&mut self) {

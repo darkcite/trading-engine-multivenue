@@ -403,8 +403,9 @@ enum Spend {
     Cancel,
 }
 
-/// A leg whose instance has ENDED and whose resting orders have not
-/// been taken off the book yet (LAW E-8).
+/// A leg whose resting orders have not been taken off the book yet: its
+/// instance has ENDED (LAW E-8), or a halted slot's cancel asked for it
+/// (XMM XH5a).
 ///
 /// The coin bytes are CARRIED rather than derived from the asset id:
 /// a name derived from an id is the same class of guess LAW E-4
@@ -424,7 +425,13 @@ struct PendingSweep {
     /// The runaway guard. See [`SWEEP_MAX_DEFERS`].
     defers: u16,
     coin: [u8; crate::asset::COIN_MAX],
-    _pad2: [u8; 8],
+    /// **XMM XH5a — whose orders the sweep takes**: a mask over the
+    /// cloid's slot byte (LAW E-9), which `recon::ours_on_leg` reads.
+    /// [`crate::recon::ALL_SLOTS`] for a roll (a retired leg is nobody's
+    /// to keep), `1 << slot` for a halted slot's cancel. A second
+    /// request for a leg already pending ORs its slots in.
+    slots: u8,
+    _pad2: [u8; 7],
 }
 
 impl PendingSweep {
@@ -434,9 +441,15 @@ impl PendingSweep {
         coin_len: 0,
         defers: 0,
         coin: [0; crate::asset::COIN_MAX],
-        _pad2: [0; 8],
+        slots: 0,
+        _pad2: [0; 7],
     };
 }
+
+// XMM XH5a: `slots` took a byte of the padding — the entry stays 36 B, a
+// by-value copy within the ≤ 64 B allowance (`sweep_one_pending`'s
+// snapshot, `drop_sweep`'s swap).
+const _: () = assert!(core::mem::size_of::<PendingSweep>() == 36);
 
 /// How many ended legs can await a sweep at once.
 ///
@@ -445,7 +458,12 @@ impl PendingSweep {
 /// the member explains. Overflow is counted as `sweep_left` rather
 /// than silently dropped: a leg nobody swept and nobody counted is the
 /// stranded quote LAW E-8 exists to prevent.
-const MAX_PENDING_SWEEPS: usize = 16;
+///
+/// XMM XH5a: a halt's request queues every live leg at once, and a leg the
+/// table cannot hold is re-asked from the start of the walk — the same
+/// leading legs — so the table must hold every leg the market-data feed
+/// can bind: `cli` pins `2 × HL_MAX_FAMILIES` against it at compile time.
+pub const MAX_PENDING_SWEEPS: usize = 16;
 
 /// Attempts a pending sweep gets before it is given up on and counted.
 ///
@@ -680,6 +698,15 @@ pub struct HlExchange<const FILL_N: usize> {
     /// so the router zeroed every slot's resting count over quotes
     /// still live at the venue (E7 review, 2026-09-19).
     cancel_all_unqueued_mark: u64,
+    /// **XMM XH5a — per slot, the legs a sweep carrying the slot gave
+    /// up on or could not queue**: `sweep_left` and
+    /// `cancel_all_unqueued` split by slot, which the venue-wide
+    /// counters cannot say. Index = slot.
+    slot_left: [u64; core_config::exec::EXEC_SLOTS],
+    /// `slot_left[s]` as it stood when slot `s`'s cancel was last
+    /// REQUESTED: `cancel_slot_state`'s `Stranded`, per slot, as
+    /// `cancel_all_mark` is the venue-wide one's.
+    slot_mark: [u64; core_config::exec::EXEC_SLOTS],
     /// When a reconciliation last COMPLETED a comparison the arm was
     /// willing to stand behind. `None` = never. `last_recon` stamps
     /// the attempt; this stamps the success, and the gap between them
@@ -835,6 +862,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             sweeps_n: 0,
             cancel_all_mark: 0,
             cancel_all_unqueued_mark: 0,
+            slot_left: [0; core_config::exec::EXEC_SLOTS],
+            slot_mark: [0; core_config::exec::EXEC_SLOTS],
             last_recon_ok: None,
             open: vec![crate::recon::OpenOrder::default(); crate::recon::MAX_OPEN_ORDERS]
                 .into_boxed_slice(),
@@ -2087,33 +2116,64 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// Queue a leg whose instance has ended (LAW E-8). Idempotent per
-    /// asset: a second roll before the first was swept must not add a
+    /// Queue a sweep of `slots`' orders on a leg — LAW E-8: a leg whose
+    /// instance has ended, every slot's; XMM XH5a: a halted slot's live
+    /// leg. Idempotent per asset: a second request before the first was
+    /// swept ORs its slots into the pending entry rather than adding a
     /// second entry racing the first.
-    fn queue_sweep(&mut self, asset: u32, coin: [u8; crate::asset::COIN_MAX], coin_len: u8) {
-        let mut i = 0usize;
-        while i < self.sweeps_n {
-            if self.sweeps[i].asset == asset {
-                return;
-            }
-            i += 1;
+    fn queue_sweep(
+        &mut self,
+        asset: u32,
+        coin: [u8; crate::asset::COIN_MAX],
+        coin_len: u8,
+        slots: u8,
+    ) {
+        if self.merge_sweep(asset, slots) {
+            return;
         }
         if self.sweeps_n >= MAX_PENDING_SWEEPS {
             // COUNTED, never silently dropped. A leg nobody swept and
             // nobody counted is the stranded quote this law exists to
             // prevent.
             self.counters.sweep_left = self.counters.sweep_left.wrapping_add(1);
+            self.strand(slots, 1);
             return;
         }
+        self.push_sweep(asset, coin, coin_len, slots);
+    }
+
+    /// Append a sweep entry: the caller has seen that the asset is not
+    /// pending (`merge_sweep`) and that the table has room.
+    fn push_sweep(
+        &mut self,
+        asset: u32,
+        coin: [u8; crate::asset::COIN_MAX],
+        coin_len: u8,
+        slots: u8,
+    ) {
+        debug_assert!(self.sweeps_n < MAX_PENDING_SWEEPS);
         self.sweeps[self.sweeps_n] = PendingSweep {
             asset,
             tries: SWEEP_TRIES,
             coin_len,
             defers: 0,
             coin,
-            _pad2: [0; 8],
+            slots,
+            _pad2: [0; 7],
         };
         self.sweeps_n += 1;
+    }
+
+    /// **XMM XH5a** — `k` legs carrying the slots in `mask` were given up
+    /// on or could not be queued: each such slot's confirmation reads
+    /// `Stranded` until its next request re-marks it.
+    fn strand(&mut self, mask: u8, k: u64) {
+        let mut s = 0usize;
+        while s < core_config::exec::EXEC_SLOTS {
+            // Branchless: a slot outside the mask adds nothing.
+            self.slot_left[s] = self.slot_left[s].wrapping_add(k * u64::from((mask >> s) & 1));
+            s += 1;
+        }
     }
 
     /// Drop entry `i`, keeping the queue contiguous.
@@ -2170,7 +2230,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return;
         };
 
-        // ---- which of them are ours, on THIS leg --------------------
+        // ---- which of them are ours, on THIS leg, of its slots -------
         // Collected first: the cancel below borrows `self` mutably,
         // and the rows borrow the response buffer. `oids` is a boot
         // buffer, not 2 KiB of stack zeroed every 2 ms while a sweep
@@ -2179,6 +2239,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             &self.open[..rows],
             body,
             &e.coin[..e.coin_len as usize],
+            e.slots,
             &mut self.oids,
         );
         if k == 0 {
@@ -2248,13 +2309,17 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
     }
 
-    /// Is a sweep already pending for this asset? `queue_sweep` is
-    /// idempotent per asset, so a leg already queued is already
-    /// covered and must not read as a failure to queue.
-    fn sweep_pending_for(&self, asset: u32) -> bool {
+    /// Is a sweep already pending for this asset? Then it takes `slots`
+    /// too (XMM XH5a: OR'd in — its next pass selects the union), and
+    /// the leg is covered: it must not read as a failure to queue, nor
+    /// gain a second entry racing the first.
+    fn merge_sweep(&mut self, asset: u32, slots: u8) -> bool {
+        // One bounds check for the walk, not one per entry.
+        let live = &mut self.sweeps[..self.sweeps_n];
         let mut i = 0usize;
-        while i < self.sweeps_n {
-            if self.sweeps[i].asset == asset {
+        while i < live.len() {
+            if live[i].asset == asset {
+                live[i].slots |= slots;
                 return true;
             }
             i += 1;
@@ -2262,14 +2327,74 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         false
     }
 
+    /// **Queue a sweep of `slots`' orders on every live leg** — the body
+    /// of `cancel_all` (every slot) and `cancel_slot` (one, XMM XH5a).
+    ///
+    /// # Errors
+    /// [`DispatchError::QueueFull`] when the pending-sweep table could
+    /// not hold every live leg: the legs left out are counted once
+    /// (`cancel_all_unqueued`) and stranded for `slots`, so each one's
+    /// confirmation says so and the router asks again.
+    fn request_sweeps(&mut self, slots: u8) -> Result<(), DispatchError> {
+        // Collected first: `merge_sweep` and `push_sweep` borrow `self`
+        // mutably and `for_each_live` borrows it immutably.
+        let mut syms = [0u32; crate::asset::ASSET_SLOTS];
+        let mut n = 0usize;
+        self.assets.for_each_live(|sym, _coin, _booked| {
+            if n < syms.len() {
+                syms[n] = sym;
+                n += 1;
+            }
+        });
+
+        let mut queued = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let sym = syms[i];
+            i += 1;
+            let Some((asset, coin, coin_len)) = self.assets.bound(sym) else {
+                continue;
+            };
+            // A leg already pending is already covered — for `slots`
+            // too, from its next pass.
+            if self.merge_sweep(asset, slots) {
+                queued += 1;
+                continue;
+            }
+            // **Checked BEFORE queueing, not after.** `queue_sweep`
+            // answers a full table by bumping `sweep_left`, which is
+            // the roll path's honest accounting for a stranded leg —
+            // but this path is retried from every idle moment, so
+            // going through it would add ~500 phantom strandings a
+            // second to the one counter LAW E-8 arms an operator on.
+            // Unqueued legs are counted once per run below instead.
+            if self.sweeps_n >= MAX_PENDING_SWEEPS {
+                continue;
+            }
+            self.push_sweep(asset, coin, coin_len, slots);
+            queued += 1;
+        }
+
+        if queued == n {
+            return Ok(());
+        }
+        let left = (n - queued) as u64;
+        let c = &mut self.counters;
+        c.cancel_all_unqueued = c.cancel_all_unqueued.wrapping_add(left);
+        self.strand(slots, left);
+        Err(DispatchError::QueueFull)
+    }
+
     /// Burn one retry on a pending sweep, counting it as `sweep_left`
-    /// and dropping it when they are spent.
+    /// (and stranded for each of its slots, XMM XH5a) and dropping it
+    /// when they are spent.
     fn spend_try(&mut self, i: usize) {
         if self.sweeps[i].tries > 1 {
             self.sweeps[i].tries -= 1;
             return;
         }
         self.counters.sweep_left = self.counters.sweep_left.wrapping_add(1);
+        self.strand(self.sweeps[i].slots, 1);
         self.drop_sweep(i);
     }
 
@@ -2777,7 +2902,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                 // every one of our quotes on a LIVE leg, at the moment
                 // the member is quoting it.
                 if asset != assets[side] {
-                    self.queue_sweep(asset, coin, coin_len);
+                    self.queue_sweep(asset, coin, coin_len, crate::recon::ALL_SLOTS);
                 }
             }
         }
@@ -2889,54 +3014,7 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         // abandoned after it is the whole point.
         self.cancel_all_mark = self.counters.sweep_left;
         self.cancel_all_unqueued_mark = self.counters.cancel_all_unqueued;
-
-        // Collected first: `queue_sweep` borrows `self` mutably and
-        // `for_each_live` borrows it immutably.
-        let mut syms = [0u32; crate::asset::ASSET_SLOTS];
-        let mut n = 0usize;
-        self.assets.for_each_live(|sym, _coin, _booked| {
-            if n < syms.len() {
-                syms[n] = sym;
-                n += 1;
-            }
-        });
-
-        let mut queued = 0usize;
-        let mut i = 0usize;
-        while i < n {
-            let sym = syms[i];
-            i += 1;
-            let Some((asset, coin, coin_len)) = self.assets.bound(sym) else {
-                continue;
-            };
-            // A leg already pending is already covered.
-            if self.sweep_pending_for(asset) {
-                queued += 1;
-                continue;
-            }
-            // **Checked BEFORE queueing, not after.** `queue_sweep`
-            // answers a full table by bumping `sweep_left`, which is
-            // the roll path's honest accounting for a stranded leg —
-            // but this path is retried from every idle moment, so
-            // going through it would add ~500 phantom strandings a
-            // second to the one counter LAW E-8 arms an operator on.
-            // Unqueued legs are counted once per run below instead.
-            if self.sweeps_n >= MAX_PENDING_SWEEPS {
-                continue;
-            }
-            self.queue_sweep(asset, coin, coin_len);
-            queued += 1;
-        }
-
-        if queued == n {
-            Ok(())
-        } else {
-            self.counters.cancel_all_unqueued = self
-                .counters
-                .cancel_all_unqueued
-                .wrapping_add((n - queued) as u64);
-            Err(DispatchError::QueueFull)
-        }
+        self.request_sweeps(crate::recon::ALL_SLOTS)
     }
 
     /// **LAW E-8's confirmation.** See
@@ -2959,6 +3037,51 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
         if self.counters.sweep_left != self.cancel_all_mark
             || self.counters.cancel_all_unqueued != self.cancel_all_unqueued_mark
         {
+            return clob_dispatcher::CancelAllState::Stranded;
+        }
+        clob_dispatcher::CancelAllState::Clear
+    }
+
+    /// **XMM XH5a (R-XH4-1) — a halt cancels the halted slot's orders
+    /// alone.** One account serves several slots here (BIN15's, the
+    /// operator's), so the request is a sweep of every live leg that
+    /// selects only cloids whose slot byte (LAW E-9) is `slot`'s: a
+    /// sibling slot's quotes stay. Counted in `cancel_all_runs`.
+    ///
+    /// # Errors
+    /// [`DispatchError::QueueFull`], as `cancel_all`'s.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        let s = usize::from(slot);
+        if s >= core_config::exec::EXEC_SLOTS {
+            // Not a slot the router names: the venue-wide verb —
+            // over-cancel, never under.
+            return self.cancel_all();
+        }
+        self.counters.cancel_all_runs = self.counters.cancel_all_runs.wrapping_add(1);
+        // Relative to THIS request, as `cancel_all_mark` is.
+        self.slot_mark[s] = self.slot_left[s];
+        self.request_sweeps(1u8 << slot)
+    }
+
+    /// `slot`'s confirmation, as `cancel_all_state` is the venue-wide
+    /// one: `Working` while a pending sweep carries the slot, `Stranded`
+    /// when one carrying it was given up on or could not be queued since
+    /// the slot's request, `Clear` otherwise.
+    fn cancel_slot_state(&self, slot: u8) -> clob_dispatcher::CancelAllState {
+        let s = usize::from(slot);
+        if s >= core_config::exec::EXEC_SLOTS {
+            return self.cancel_all_state();
+        }
+        let bit = 1u8 << slot;
+        let live = &self.sweeps[..self.sweeps_n];
+        let mut i = 0usize;
+        while i < live.len() {
+            if live[i].slots & bit != 0 {
+                return clob_dispatcher::CancelAllState::Working;
+            }
+            i += 1;
+        }
+        if self.slot_left[s] != self.slot_mark[s] {
             return clob_dispatcher::CancelAllState::Stranded;
         }
         clob_dispatcher::CancelAllState::Clear
@@ -3345,7 +3468,7 @@ mod tests {
 
         // Asked, and a leg queued.
         x.cancel_all_mark = x.counters.sweep_left;
-        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0);
+        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0, crate::recon::ALL_SLOTS);
         assert_eq!(
             x.cancel_all_state(),
             CancelAllState::Working,
@@ -3360,7 +3483,7 @@ mod tests {
         // Now the other ending: queued again, and abandoned with its
         // retries spent.
         x.cancel_all_mark = x.counters.sweep_left;
-        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0);
+        x.queue_sweep(7, [0u8; crate::asset::COIN_MAX], 0, crate::recon::ALL_SLOTS);
         x.sweeps[0].tries = 1;
         x.spend_try(0);
         assert_eq!(x.sweeps_n, 0, "the table is empty either way");
@@ -3387,7 +3510,7 @@ mod tests {
         // Fill the pending table with legs the cancel-all did not put
         // there.
         for a in 0..MAX_PENDING_SWEEPS as u32 {
-            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0);
+            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0, crate::recon::ALL_SLOTS);
         }
         assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
         let before = x.counters.sweep_left;
@@ -3463,6 +3586,108 @@ mod tests {
         // the venue's own rows without deriving a name from an id.
         assert!(x.sweeps[0].coin_len > 1, "a real name, not an empty one");
         assert_eq!(x.sweeps[0].coin[0], b'#', "the FILL namespace, not `+`");
+        // XMM XH5a: a retired leg is every slot's to sweep.
+        assert!(x.sweeps[..2]
+            .iter()
+            .all(|e| e.slots == crate::recon::ALL_SLOTS));
+    }
+
+    /// **XMM XH5a — a halted slot's sweep is its own.** One account
+    /// serves several slots, so `cancel_slot` queues a sweep of the
+    /// slot's orders alone on every live leg; a second slot's request
+    /// ORs into the same entries; each slot's confirmation follows only
+    /// the entries carrying it.
+    #[test]
+    fn a_halted_slot_s_sweep_carries_that_slot_alone() {
+        use clob_dispatcher::CancelAllState;
+        let mut x = exchange_at("127.0.0.1");
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        assert_eq!(x.sweeps_n, 0);
+        assert_eq!(
+            x.cancel_slot_state(3),
+            CancelAllState::Clear,
+            "nothing asked"
+        );
+
+        x.cancel_slot(3).expect("queued");
+        assert_eq!(x.sweeps_n, 2, "one entry per live leg");
+        assert!(
+            x.sweeps[..2].iter().all(|e| e.slots == 1 << 3),
+            "slot 3's orders alone"
+        );
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Working);
+        assert_eq!(
+            x.cancel_slot_state(7),
+            CancelAllState::Clear,
+            "7 was not asked for"
+        );
+
+        // Slot 7 halts while 3's sweep drains: OR'd in, no second entry.
+        x.cancel_slot(7).expect("merged");
+        assert_eq!(x.sweeps_n, 2);
+        assert!(x.sweeps[..2].iter().all(|e| e.slots == (1 << 3) | (1 << 7)));
+        assert_eq!(x.cancel_slot_state(7), CancelAllState::Working);
+        assert_eq!(x.counters.cancel_all_runs, 2, "one request per slot");
+
+        // Both legs read clean (`k == 0`): both slots clear.
+        x.drop_sweep(0);
+        x.drop_sweep(0);
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Clear);
+        assert_eq!(x.cancel_slot_state(7), CancelAllState::Clear);
+        assert_eq!(x.counters.sweep_left, 0);
+    }
+
+    /// XMM XH5a: a sweep given up on strands the slots it carried, and
+    /// only those; a request the full table could not queue strands its
+    /// own slot, once, without a phantom `sweep_left`.
+    #[test]
+    fn a_given_up_sweep_strands_only_the_slots_it_carried() {
+        use clob_dispatcher::CancelAllState;
+        let mut x = exchange_at("127.0.0.1");
+        x.on_venue_event(&roll(3253, 0, false, 4096));
+        x.cancel_slot(3).expect("queued");
+        // Both legs given up on, their retries spent.
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        x.sweeps[0].tries = 1;
+        x.spend_try(0);
+        assert_eq!(x.sweeps_n, 0, "the table is empty either way");
+        assert_eq!(
+            x.cancel_slot_state(3),
+            CancelAllState::Stranded,
+            "an empty table over orders never cancelled is NOT clear"
+        );
+        assert_eq!(
+            x.cancel_slot_state(7),
+            CancelAllState::Clear,
+            "7's were never in it"
+        );
+
+        // A full table of slot 4's legs: slot 5's request queues nothing.
+        let left = x.counters.sweep_left;
+        let mut a = 100u32;
+        while x.sweeps_n < MAX_PENDING_SWEEPS {
+            x.queue_sweep(a, [0u8; crate::asset::COIN_MAX], 0, 1 << 4);
+            a += 1;
+        }
+        assert_eq!(x.cancel_slot(5), Err(DispatchError::QueueFull));
+        assert_eq!(x.cancel_slot_state(5), CancelAllState::Stranded);
+        assert_eq!(x.cancel_slot_state(4), CancelAllState::Working);
+        assert_eq!(
+            x.counters.cancel_all_unqueued, 2,
+            "both live legs, counted once"
+        );
+        assert_eq!(x.counters.sweep_left, left, "a retry is not a stranding");
+
+        // Slot 3 asks again once the table drains: judged afresh.
+        while x.sweeps_n > 0 {
+            x.drop_sweep(0);
+        }
+        x.cancel_slot(3).expect("queued again");
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Working);
+        x.drop_sweep(0);
+        x.drop_sweep(0);
+        assert_eq!(x.cancel_slot_state(3), CancelAllState::Clear);
     }
 
     // ---------- E5: the budget counts what left the host ----------
@@ -3836,12 +4061,12 @@ mod tests {
     fn the_sweep_queue_dedupes_and_counts_its_own_overflow() {
         let mut x = exchange();
         let coin = *b"#1234560000000000000";
-        x.queue_sweep(77, coin, 7);
-        x.queue_sweep(77, coin, 7);
+        x.queue_sweep(77, coin, 7, crate::recon::ALL_SLOTS);
+        x.queue_sweep(77, coin, 7, crate::recon::ALL_SLOTS);
         assert_eq!(x.sweeps_n, 1, "a second roll before the first swept");
 
         for a in 100..100 + MAX_PENDING_SWEEPS as u32 {
-            x.queue_sweep(a, coin, 7);
+            x.queue_sweep(a, coin, 7, crate::recon::ALL_SLOTS);
         }
         assert_eq!(x.sweeps_n, MAX_PENDING_SWEEPS);
         assert!(x.counters.sweep_left > 0, "overflow is COUNTED, not dropped");
@@ -3853,7 +4078,7 @@ mod tests {
     #[test]
     fn a_sweep_that_keeps_failing_is_given_up_on_and_counted() {
         let mut x = exchange();
-        x.queue_sweep(77, *b"#1234560000000000000", 7);
+        x.queue_sweep(77, *b"#1234560000000000000", 7, crate::recon::ALL_SLOTS);
         assert_eq!(x.sweeps_n, 1);
 
         for _ in 0..u32::from(SWEEP_TRIES) - 1 {

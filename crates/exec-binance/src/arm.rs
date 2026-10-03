@@ -45,7 +45,7 @@
 //!
 //! **`cancel_all_state` (3)** is `Clear` only when the sweep was confirmed
 //! AND no order of ours is in flight — an IoC sent and not yet answered is
-//! counted, so a halt's `clear_resting` never drops an in-flight exit.
+//! counted, so a halt's `clear_resting_slot` never drops an in-flight exit.
 //!
 //! Error mapping: not bound, not live or not ours → `NoLiveRoute`; a verb
 //! or kind this product does not take → `Unsupported`; a BX-5 refusal →
@@ -975,6 +975,22 @@ impl OrderDispatch for BnArm {
         } else {
             CancelAllState::Clear
         }
+    }
+
+    /// XMM XH5a: one owner slot (BX-7) — its cancel is the arm's whole
+    /// cancel; another slot has nothing on this account.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        if slot == self.knobs.owner_slot {
+            return self.cancel_all();
+        }
+        Ok(())
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        if slot == self.knobs.owner_slot {
+            return self.cancel_all_state();
+        }
+        CancelAllState::Clear
     }
 
     fn arm_counters(&self) -> LiveArmCounters {
