@@ -545,4 +545,35 @@ mod tests {
         s.b_mut().state = 1;
         assert_eq!(s.cancel_slot_state(0), CancelAllState::Working);
     }
+
+    /// XMM XH5b-3: slot 6 outermost beside a nested shape — the engine's
+    /// `SlotSplit(6, SlotSplit(0, <the rest>, slot 0's arm), slot 6's arm)`:
+    /// each slot's verbs reach its own arm, and a slot's sweep asks its own
+    /// arm alone, through every nesting.
+    #[test]
+    fn slot_six_outermost_routes_through_a_nested_shape() {
+        let mut s = SlotSplit::new(6, split(), Arm::default());
+        s.submit(&order(0, 10)).unwrap();
+        s.submit(&order(3, 30)).unwrap();
+        s.submit(&order(6, 60)).unwrap();
+        s.cancel(&CancelReq::of(&order(6, 61), 1)).unwrap();
+        s.modify(&ModifyReq::new(60, order(6, 62))).unwrap();
+        assert_eq!(s.b().seen, [60, 62]);
+        assert_eq!(s.b().cancelled, [61]);
+        assert_eq!(s.a().b().seen, [10]);
+        assert_eq!(s.a().a().seen, [30]);
+        s.cancel_slot(6).unwrap();
+        let calls = |s: &SlotSplit<SlotSplit<Arm, Arm>, Arm>| {
+            (
+                s.a().a().cancel_all_calls,
+                s.a().b().cancel_all_calls,
+                s.b().cancel_all_calls,
+            )
+        };
+        assert_eq!(calls(&s), (0, 0, 1));
+        s.cancel_slot(0).unwrap();
+        assert_eq!(calls(&s), (0, 1, 1));
+        s.cancel_slot(3).unwrap();
+        assert_eq!(calls(&s), (1, 1, 1));
+    }
 }

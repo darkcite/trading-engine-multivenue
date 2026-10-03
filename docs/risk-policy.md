@@ -9333,6 +9333,121 @@ environment — fake readers; wording — all taken); round 3 — all three
 APPROVE (a COPY note claiming constants only — reworded); round 4
 (comments only) — zero-copy APPROVE (the function's doc — taken).
 
+### XH5b-3 amendment (2026-10-03): slot 6 on mainnet behind its interlock — the network is the market data's
+
+The third part of XH5b (plan §3.2 item 4; session-5 assumption A-S5-21).
+Nothing is armed: the path exists; the first mainnet run is the operator's,
+by XH5e's checklist.
+
+- **The network is the market data's (LAW E-4)** — the venue's own hosts
+  alone (`xmm_live::md_network`: `HYPERLIQUID_WS_HOST`, a `:port` aside,
+  exactly `api.hyperliquid.xyz` or `api.hyperliquid-testnet.xyz`; any other
+  host, a relay, refuses slot 6's boot — its network cannot be vouched
+  for). On mainnet slot 6 trades its OWN master and API wallet
+  (`scope_for`) — `Scope::Xmm`, `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` on
+  the live arm's `HYPERLIQUID_EXCHANGE_HOST` / `HYPERLIQUID_SOURCE`, every
+  variable required, never defaulted — always: there is no shared mainnet
+  account. On testnet, XH5b-2's: its own account when its testnet
+  variables are set, else the shared E3 one.
+- **The interlock** (Q-XH5-3's default — no third switch). Slot 6 boots
+  only when it is live in the exec artifact AND named by `--arm-live`
+  (`exec_boot::resolve`'s two switches, LAW E-1) — the same switches on
+  both networks: what makes a run MAINNET is the market data (the venue's
+  mainnet host) and slot 6's own mainnet variables. Then
+  `xmm_live::check_network` (pure): the exchange host's network must be
+  the market data's (E-4), the host the venue's own for that network (no
+  local double), and the scope that network's — mainnet `Scope::Xmm`
+  alone, testnet a testnet scope. Anything else refuses the boot, naming
+  what does not hold.
+- **On mainnet, every XH5b-2 rule of an own account holds:** nothing shared
+  with E3's, slot 3's or HYPARB's masters and signers; the venue's
+  `userRole` binding of the API wallet to the master; reads every 30 s; a
+  stale floor of 120 s; the session bound REQUIRED (the probe's −$50,
+  O-XH5), judged on the account's worth against the anchor kept in
+  `xmm-pnl-anchor-mainnet.state` — its own file.
+- **Beside the mainnet-only arms** (`ExecBoot::check_gateway_network`,
+  replacing `check_gateway_slot`): slot 6 runs beside slot 0 (its
+  `MainnetAuthority`) or a live Binance slot (BX-16) only when the market
+  data is the venue's mainnet host; otherwise the boot refuses, naming that
+  arm's slot — one engine never mixes a testnet rehearsal with mainnet
+  orders. Alone, or
+  beside the operator's arm (XH5a), either network. `resolve` reads no
+  host, so the engine asks right after it, before any arm boots; slot 6's
+  boot asks again.
+- **The compositions** (`multivenue-engine`): the other arms' eight shapes
+  each enter the loop through one macro (`shape!`), alone or with slot 6
+  outermost — `SlotSplit(6, <shape>, xmm)` — sixteen compositions, no
+  `dyn`; under slot 6 the Binance arm's aliases are read one `a()` deeper;
+  the "beside a mainnet-only arm" abort is gone. A halt cancels the halted
+  slot's orders alone through every nesting (`SlotSplit::cancel_slot`,
+  XH5a).
+- **The tell and the loop's line name the network:** "the Hyperliquid
+  gateway, MAINNET", "slot 6 on its OWN MAINNET account …", and "slot 6 LIVE
+  on the Hyperliquid gateway (MAINNET) beside <the arms> — real MAINNET
+  orders will be submitted".
+- **Residuals.**
+  - *The mainnet switch is slot 6's mainnet variables.* Under Q-XH5-3's
+    default the artifact's switch and `--arm-live 6` are the same on both
+    networks, and `HYPERLIQUID_WS_HOST` defaults to the mainnet host when
+    unset: a testnet rehearsal's artifact and command line arm MAINNET
+    wherever the market data is mainnet and
+    `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` are set. XH5e keeps those two
+    variables out of `.env` outside an armed mainnet session; a third,
+    network-naming switch (Q-XH5-3's alternative) stays the operator's call.
+  - *Likely no dead-man switch (O-XH4, restated for mainnet):* a fresh XMM
+    master is unlikely to be eligible for `scheduleCancel`, so slot 6 would
+    quote with no venue-side dead-man. The engine-sent TTL cancel (LAW E-8,
+    XH4f) works only while the gateway lives — `expiresAfter` never ends a
+    resting order — so between a crash or a network loss and the next
+    boot's sweep the quotes rest, bounded by the caps ($300 resting, ±$150
+    a perp); XH4f's alert names it (the maker plan's accepted risk, §8.11).
+    XH5e reads `dm_availability` before the first quote.
+  - *Until XH5c, no top-ups* (the gateway slot states no top-up keys): on
+    mainnet the address budget is what the account's traded volume funds;
+    at the arm's floor the slot halts, quoting nothing more — the safe
+    direction, and a short probe.
+- **For XH5e:** the mainnet arming checklist states each switch (slot 6 live
+  in the artifact, `--arm-live 6`, the XMM mainnet variables — set for the
+  armed session alone — and both hosts the venue's mainnet ones), reads
+  `dm_availability`, the boot tell's `MAINNET` and anchor lines, and checks
+  `/metrics` before the first quote; the testnet runbook runs the same boot
+  on testnet first.
+- **Superseded:** `exec_boot::check_gateway_slot` (its refusal is
+  `ExecBoot::check_gateway_network`'s, now by network); `boot_xmm_arm`'s
+  testnet-only refusal; the engine's "slot 6's gateway beside a mainnet-only
+  arm" abort; `xmm_live::account_name(own)` (now by scope).
+
+**Tests:** the market data's network (the venue's two hosts, with a port;
+relays, a look-alike and a bad port refused) and the scope (the network ×
+the account); the gate's matrix (testnet on the testnet host with either
+testnet scope; a double and a mainnet scope refused; mainnet on its own
+account and host; the shared and the testnet scopes and a double refused;
+both E-4 mismatches refused); `check_gateway_network` (testnet beside
+Binance and beside slot 0 refused, naming them; mainnet beside both; alone
+and beside the operator's arm, both networks); the tell (its own MAINNET
+account with no anchor and with one
+restored; the shared TESTNET account); the nested composition
+(`SlotSplit(6, SlotSplit(0, a, b), c)`: each slot's verbs reach its own
+arm, each slot's sweep asks its own arm alone); the engine compiles all
+sixteen compositions.
+
+**Gates (the committed tree):** clippy 0; nextest 4 151/4 151; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk. (Round 2's run
+failed the debug `ws_frame_roundtrip_is_zero_alloc` once — the counting
+allocator is process-global and caught the test harness's own thread; the
+release gate passed; the committed tree's run is clean.)
+
+**Reviews:** round 1 — allocation and zero-copy APPROVE WITH NITS (an
+`armed` input that restated the boot's precondition; the shapes' moves
+un-noted — taken), risk REQUEST CHANGES (the market data's network read
+from its host's spelling: a relay serving testnet data would pass for
+mainnet beside the venue's mainnet exchange host — now the venue's own
+hosts alone; the mainnet switch and the dead-man residual stated —
+taken); round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH
+NITS (the dead-man residual named a protection `expiresAfter` does not
+give — reworded).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

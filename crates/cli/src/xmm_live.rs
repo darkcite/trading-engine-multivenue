@@ -5,32 +5,36 @@
 //! (`exec_hyperliquid::{arm, gateway}`), booted beside the other arms and
 //! composed outermost (`SlotSplit` on slot 6) by the engine.
 //!
-//! **TESTNET only until XH5b-3** puts mainnet behind its interlock. **Its
-//! account (XH5b-2, O-XH3/O-XH5):** its own testnet master and API wallet
-//! when `HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR}` are set (both are
-//! then required: `Scope::XmmTestnet`), sharing no master and no signer
-//! with E3, slot 3 or HYPARB ([`check_own_account`]); else the E3 testnet
+//! **Its network is the market data's (LAW E-4), XH5b-3:** testnet, or
+//! MAINNET behind its interlock ([`check_network`]: slot 6 live in the
+//! artifact AND named by `--arm-live`, its own mainnet account
+//! `Scope::Xmm`, both hosts mainnet — Q-XH5-3's default, no third switch).
+//! **Its account (XH5b-2, O-XH3/O-XH5):** on mainnet always its own master
+//! and API wallet (`HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}`); on testnet
+//! its own when `HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR}` are set
+//! (both are then required: `Scope::XmmTestnet`), else the E3 testnet
 //! agent's shared account (`HYPERLIQUID_TESTNET_*`, the account slots 0
 //! and 3 test on), where the arm is not the account's only user
-//! (`own_account = false`). On its own account the arm reads the spot sheet
-//! with each perp sheet every [`OWN_RECON_MS`] and judges the session bound
-//! on the account's worth (XH5b-1) from an anchor kept beside the exec
-//! artifact ([`anchor_path`]): restored at boot, or taken at the first
-//! complete worth and stored by the gateway's thread before the slot's
-//! first quote — a store that fails halts the slot; and the venue must
-//! bind its API wallet to its master ([`check_agent_binding`], one boot
-//! read). The rules by account are [`check_account_rules`]. Both hosts must
-//! be testnet (LAW E-4). The
+//! (`own_account = false`). An own account shares no master and no signer
+//! with E3, slot 3 or HYPARB ([`check_own_account`]); on it the arm reads
+//! the spot sheet with each perp sheet every [`OWN_RECON_MS`] and judges
+//! the session bound on the account's worth (XH5b-1) from an anchor kept
+//! beside the exec artifact, one file a network ([`anchor_path`]):
+//! restored at boot, or taken at the first complete worth and stored by
+//! the gateway's thread before the slot's first quote — a store that fails
+//! halts the slot; and the venue must bind its API wallet to its master
+//! ([`check_agent_binding`], one boot read). The rules by account are
+//! [`check_account_rules`]. The
 //! arm binds the member's perps from the exchange host's `/info meta` —
 //! their asset ids and size rules, the member's lots checked against the
 //! venue's — sets each one's leverage before it takes orders (O-XH6:
 //! [`LEVERAGE`]×, cross), and the router binds them as `LAW_LINEAR` rows.
 //! The member's caps must sit inside slot 6's exec clamps. A live gateway
-//! slot 6 runs beside the operator's arm's live slots only
-//! (`exec_boot::resolve`'s `check_gateway_slot`; XH5a: a halt cancels the
-//! halted slot's orders alone, and the gateway draws from its agent's one
-//! nonce stream, XH4h S3) — never beside slot 0 or a Binance slot until
-//! XH5b-3, their arms being mainnet-only.
+//! slot 6 runs alone or beside the operator's arm's live slots on either
+//! network (XH5a: a halt cancels the halted slot's orders alone, and the
+//! gateway draws from its agent's one nonce stream, XH4h S3), and beside
+//! slot 0 or a Binance slot — mainnet-only arms — on mainnet alone
+//! (`ExecBoot::check_gateway_network`, XH5b-3).
 //!
 //! The gateway runs on its own pinned thread until the engine is done
 //! with it: the arm's `on_shutdown` pumps it (the sweep, the reads, the
@@ -53,12 +57,12 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use core_config::exec::ExecSlot;
-use exec_hyperliquid::anchor::{load_own, AnchorKeeper, AnchorSlot, Kept};
+use exec_hyperliquid::anchor::{load_own, AnchorKeeper, AnchorSlot, Kept, PnlAnchor};
 use exec_hyperliquid::arm::{ArmCfg, HlGatewayArm, PerpBind, ARM_PERPS};
 use exec_hyperliquid::config::{
     agent_addr_from_env, env_is_set, hex20, master_from_env, ConfigErr, ENV_AGENT_KEY,
     ENV_MASTER_ADDR, ENV_T_AGENT_KEY, ENV_T_MASTER_ADDR, ENV_XMM_T_AGENT_KEY,
-    ENV_XMM_T_MASTER_ADDR,
+    ENV_XMM_T_MASTER_ADDR, HOST_MAINNET, HOST_TESTNET,
 };
 use exec_hyperliquid::deadman::DeadManCfg;
 use exec_hyperliquid::gateway::{
@@ -369,13 +373,155 @@ pub fn check_agent_binding(role: Role, agent: &[u8; 20], master: &[u8; 20]) -> R
     }
 }
 
-/// Which credentials slot 6's boot reads, for its refusals.
-const fn account_name(own: bool) -> &'static str {
-    if own {
-        "its own testnet account (HYPERLIQUID_XMM_TESTNET_*)"
-    } else {
-        "the shared E3 testnet agent (HYPERLIQUID_TESTNET_*)"
+/// **XMM XH5b-3 — the market data's network**, by its host: the venue's
+/// mainnet host or its testnet host (a `:port` aside), nothing else — a
+/// relay's network cannot be vouched for. Slot 6's network is the market
+/// data's (LAW E-4).
+#[must_use]
+pub fn md_network(md_ws_host: &str) -> Option<Network> {
+    match crate::split_host_port(md_ws_host, 443) {
+        Ok((HOST_MAINNET, _)) => Some(Network::Mainnet),
+        Ok((HOST_TESTNET, _)) => Some(Network::Testnet),
+        _ => None,
     }
+}
+
+/// **XMM XH5b-3 — slot 6's scope**: the market data's network decides
+/// (LAW E-4). Mainnet is slot 6's own account alone (`Scope::Xmm`); testnet
+/// its own account when it has one (`Scope::XmmTestnet`), else the shared
+/// E3 account (`Scope::Testnet`).
+#[must_use]
+pub const fn scope_for(md_testnet: bool, own: bool) -> Scope {
+    match (md_testnet, own) {
+        (false, _) => Scope::Xmm,
+        (true, true) => Scope::XmmTestnet,
+        (true, false) => Scope::Testnet,
+    }
+}
+
+/// The network in the boot's words (XMM XH5b-3).
+#[must_use]
+pub const fn network_name(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "MAINNET",
+        Network::Testnet => "TESTNET",
+    }
+}
+
+/// **XMM XH5b-3 — the network gate** (pure; the boot passes its
+/// configuration). Slot 6 boots only when it is live in the artifact AND
+/// named by `--arm-live` (`exec_boot::resolve`'s two switches, LAW E-1) —
+/// the same switches on both networks. What makes a run MAINNET is the
+/// market data — the venue's mainnet host ([`md_network`]) — and slot 6's
+/// own mainnet variables (`Scope::Xmm`; Q-XH5-3's default: no third
+/// switch). Then the exchange host's network must be the market data's
+/// (LAW E-4), the host the venue's own for that network (no local double),
+/// and the scope that network's: mainnet `Scope::Xmm` alone, testnet a
+/// testnet scope.
+///
+/// # Errors
+/// The first condition that does not hold, named.
+pub fn check_network(
+    md: Network,
+    scope: Scope,
+    host: &str,
+    network: Network,
+) -> Result<(), String> {
+    if network != md {
+        return Err(format!(
+            "slot 6's exchange host {host} is on {} and the market data on {}: the asset ids the \
+             arm binds would name another network's markets (LAW E-4) — point both at testnet or \
+             both at mainnet",
+            network_name(network),
+            network_name(md),
+        ));
+    }
+    let want = match md {
+        Network::Mainnet => HOST_MAINNET,
+        Network::Testnet => HOST_TESTNET,
+    };
+    if host != want {
+        return Err(format!(
+            "slot 6 on {} trades the venue's host {want} alone, not {host}",
+            network_name(md)
+        ));
+    }
+    match (md, scope) {
+        (Network::Mainnet, Scope::Xmm)
+        | (Network::Testnet, Scope::Testnet | Scope::XmmTestnet) => Ok(()),
+        (Network::Mainnet, _) => Err(String::from(
+            "slot 6 on MAINNET trades its own account alone: HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR} \
+             (O-XH5, XMM XH5b-3)",
+        )),
+        (Network::Testnet, _) => Err(String::from(
+            "slot 6 on TESTNET trades a testnet account: HYPERLIQUID_XMM_TESTNET_* or the shared \
+             HYPERLIQUID_TESTNET_* (XMM XH5b-3)",
+        )),
+    }
+}
+
+/// Which credentials slot 6's boot reads, for its refusals.
+const fn account_name(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Xmm => "its own MAINNET account (HYPERLIQUID_XMM_*)",
+        Scope::XmmTestnet => "its own testnet account (HYPERLIQUID_XMM_TESTNET_*)",
+        Scope::Testnet => "the shared E3 testnet agent (HYPERLIQUID_TESTNET_*)",
+        Scope::Live => "the operator's arm's account (HYPERLIQUID_*)",
+    }
+}
+
+/// What the boot tell says of slot 6's own account (XMM XH5b-2/-3).
+pub struct OwnTell<'a> {
+    /// Its master.
+    pub master: [u8; 20],
+    /// Its API wallet.
+    pub agent: [u8; 20],
+    /// The session loss bound, USD ×1e6.
+    pub loss_usd_1e6: i64,
+    /// The anchor restored at boot, if any.
+    pub restored: Option<PnlAnchor>,
+    /// The anchor's file.
+    pub anchor_file: &'a Path,
+}
+
+/// **XMM XH5b-3 — the boot tell's head** (cold, pure): the network, the
+/// account — its own, with the master, the API wallet and the loss bound,
+/// or the shared one — and the anchor, restored or to be kept.
+pub fn tell_account(tell: &mut String, network: Network, own: Option<&OwnTell<'_>>) {
+    let net = network_name(network);
+    let _ = write!(
+        tell,
+        "xmm: LIVE ARM ARMED — the Hyperliquid gateway, {net}, "
+    );
+    let Some(o) = own else {
+        tell.push_str("slot 6 on the shared E3 account (own_account=false): no session bound");
+        return;
+    };
+    let _ = write!(
+        tell,
+        "slot 6 on its OWN {net} account (own_account=true; master {}, API wallet {}): session \
+         loss bound ${}.{:06} on the account's worth, ",
+        hex20(&o.master),
+        hex20(&o.agent),
+        o.loss_usd_1e6 / 1_000_000,
+        o.loss_usd_1e6 % 1_000_000,
+    );
+    let _ = match o.restored {
+        Some(a) => write!(
+            tell,
+            "anchor RESTORED ${}.{:06} from {} (set {} unix)",
+            a.usdc_1e6 / 1_000_000,
+            a.usdc_1e6 % 1_000_000,
+            o.anchor_file.display(),
+            a.set_unix_s
+        ),
+        None => write!(
+            tell,
+            "no anchor yet — the first complete worth anchors, kept in {} by the gateway's \
+             thread before the first quote",
+            o.anchor_file.display()
+        ),
+    };
 }
 
 /// What the boot needs.
@@ -413,6 +559,8 @@ pub struct XmmLive {
     pub specs: Vec<InstrumentSpec>,
     /// The boot tell.
     pub tell: String,
+    /// The network it trades (XMM XH5b-3), for the engine's loop line.
+    pub network: Network,
 }
 
 /// The member's caps inside slot 6's exec clamps — or the member would quote
@@ -476,29 +624,33 @@ pub fn boot_xmm_arm(
         )
     })?;
     check_caps(xmm, s)?;
-    // XMM XH5b-2: slot 6's account — its own when either of its testnet
-    // variables is set (both are then required), else the shared E3 one.
-    let own = env_is_set(ENV_XMM_T_AGENT_KEY) || env_is_set(ENV_XMM_T_MASTER_ADDR);
+    // XMM XH5b-3: the network is the market data's — the venue's own host
+    // (LAW E-4) — and beside a mainnet-only arm mainnet alone (the engine
+    // asked before any arm booted; asked again here). XH5b-2: the account —
+    // on mainnet always its own; on testnet its own when either of its
+    // testnet variables is set (both are then required), else the shared E3
+    // one.
+    let md = md_network(spec.md_ws_host).ok_or_else(|| {
+        format!(
+            "slot 6 reads the venue's own market data alone: HYPERLIQUID_WS_HOST must be \
+             {HOST_MAINNET} (mainnet) or {HOST_TESTNET} (testnet), not {} — a relay's network \
+             cannot be vouched for (LAW E-4, XMM XH5b-3)",
+            spec.md_ws_host
+        )
+    })?;
+    spec.eb.check_gateway_network(md == Network::Mainnet)?;
+    let md_testnet = md == Network::Testnet;
+    let own = !md_testnet || env_is_set(ENV_XMM_T_AGENT_KEY) || env_is_set(ENV_XMM_T_MASTER_ADDR);
     check_account_rules(s, own)?;
-    let scope = if own {
-        Scope::XmmTestnet
-    } else {
-        Scope::Testnet
-    };
+    let scope = scope_for(md_testnet, own);
     let hl = HlConfig::from_env(scope).map_err(|e| {
         format!(
             "slot 6 is live on the gateway, but {} cannot be configured: {e}",
-            account_name(own)
+            account_name(scope)
         )
     })?;
-    if !hl.is_testnet() || !spec.md_ws_host.contains("testnet") {
-        return Err(format!(
-            "slot 6's gateway arm is TESTNET-only until XMM XH5b-3 puts mainnet behind its \
-             interlock: HYPERLIQUID_WS_HOST ({}) and the testnet exchange host ({}) must both be \
-             testnet (LAW E-4)",
-            spec.md_ws_host, hl.host
-        ));
-    }
+    check_network(md, scope, &hl.host, hl.network)?;
+    let network = hl.network;
     let anchor_file = anchor_path(&spec.eb.path, hl.network);
     let restored = if own {
         check_own_account(&hl.master_addr, &hl.agent_addr, &other_identities()?)?;
@@ -553,37 +705,14 @@ pub fn boot_xmm_arm(
     // The boot tell, written once, before the anchor's file moves to its
     // keeper (cold).
     let mut tell = String::with_capacity(1_024);
-    tell.push_str("xmm: LIVE ARM ARMED — the Hyperliquid gateway, TESTNET, ");
-    if own {
-        let loss = s.halt_on_loss_usd_1e6;
-        let _ = write!(
-            tell,
-            "slot 6 on its OWN testnet account (own_account=true; master {}, API wallet {}): \
-             session loss bound ${}.{:06} on the account's worth, ",
-            hex20(&hl.master_addr),
-            hex20(&hl.agent_addr),
-            loss / 1_000_000,
-            loss % 1_000_000,
-        );
-        let _ = match restored {
-            Some(a) => write!(
-                tell,
-                "anchor RESTORED ${}.{:06} from {} (set {} unix)",
-                a.usdc_1e6 / 1_000_000,
-                a.usdc_1e6 % 1_000_000,
-                anchor_file.display(),
-                a.set_unix_s
-            ),
-            None => write!(
-                tell,
-                "no anchor yet — the first complete worth anchors, kept in {} by the gateway's \
-                 thread before the first quote",
-                anchor_file.display()
-            ),
-        };
-    } else {
-        tell.push_str("slot 6 on the shared E3 account (own_account=false): no session bound");
-    }
+    let own_tell = OwnTell {
+        master: hl.master_addr,
+        agent: hl.agent_addr,
+        loss_usd_1e6: s.halt_on_loss_usd_1e6,
+        restored,
+        anchor_file: &anchor_file,
+    };
+    tell_account(&mut tell, network, own.then_some(&own_tell));
     let _ = write!(
         tell,
         "; {n} perp(s) bound ({}); leverage {LEVERAGE}x cross; reads every {recon_ms} ms, the \
@@ -622,7 +751,7 @@ pub fn boot_xmm_arm(
     });
     let sk = hl
         .secret_key()
-        .map_err(|e| format!("the testnet agent's key: {e}"))?;
+        .map_err(|e| format!("slot 6's API wallet key: {e}"))?;
     let gcfg = GatewayCfg::production(hl.host.clone(), tls, hl.network, hl.master_addr, cfg.slot);
     // COPY: boot, once — the ≤ 8 KiB gateway out of `new`'s `Result` (then
     // into `spawn_gateway`, noted there). Rejected: as there.
@@ -639,6 +768,7 @@ pub fn boot_xmm_arm(
         stop,
         specs: bound.specs,
         tell,
+        network,
     })
 }
 
@@ -891,14 +1021,15 @@ fn keep_anchor(k: &mut AnchorKeeper) {
 #[cfg(test)]
 mod tests {
     use super::{
-        anchor_path, arm_cfg, bind_perps, check_account_rules, check_agent_binding,
-        check_own_account, check_perp_overlap, identities_with, read_weight_per_min, recon_ms_for,
-        Identity, PerpAsk, PerpBinding, LIMIT_MS, OTHER_KEYS, OTHER_MASTERS, OWN_RECON_MS,
-        RECON_MS,
+        anchor_path, arm_cfg, bind_perps, check_account_rules, check_agent_binding, check_network,
+        check_own_account, check_perp_overlap, identities_with, md_network, read_weight_per_min,
+        recon_ms_for, scope_for, tell_account, Identity, OwnTell, PerpAsk, PerpBinding, LIMIT_MS,
+        OTHER_KEYS, OTHER_MASTERS, OWN_RECON_MS, RECON_MS,
     };
-    use exec_hyperliquid::config::ConfigErr;
+    use exec_hyperliquid::anchor::PnlAnchor;
+    use exec_hyperliquid::config::{ConfigErr, HOST_MAINNET, HOST_TESTNET};
     use exec_hyperliquid::recon::Role;
-    use exec_hyperliquid::Network;
+    use exec_hyperliquid::{Network, Scope};
 
     const META: &[u8] = br#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40},{"name":"ETH","szDecimals":4,"maxLeverage":25}]}"#;
 
@@ -1133,6 +1264,92 @@ mod tests {
         assert_eq!(
             anchor_path(toml, Network::Mainnet),
             std::path::Path::new("/x/multivenue/xmm-pnl-anchor-mainnet.state")
+        );
+    }
+
+    /// XMM XH5b-3: the market data's network — the venue's own hosts alone
+    /// (a relay's cannot be vouched for) — decides the scope; mainnet is
+    /// slot 6's own account alone.
+    #[test]
+    fn the_market_data_s_network_decides_the_scope() {
+        let (t, m) = (Some(Network::Testnet), Some(Network::Mainnet));
+        assert_eq!(md_network("api.hyperliquid-testnet.xyz"), t);
+        assert_eq!(md_network("api.hyperliquid.xyz"), m);
+        assert_eq!(md_network("api.hyperliquid.xyz:443"), m);
+        assert_eq!(md_network("127.0.0.1:9000"), None, "a relay");
+        assert_eq!(md_network("hl-testnet-relay.local"), None, "a relay");
+        assert_eq!(md_network("api.hyperliquid.xyz.relay.local"), None);
+        assert_eq!(md_network("api.hyperliquid.xyz:x"), None, "a bad port");
+        assert_eq!(scope_for(false, false), Scope::Xmm);
+        assert_eq!(scope_for(false, true), Scope::Xmm);
+        assert_eq!(scope_for(true, true), Scope::XmmTestnet);
+        assert_eq!(scope_for(true, false), Scope::Testnet);
+    }
+
+    /// XMM XH5b-3: the gate's matrix — each network on the venue's own host
+    /// with its own scopes (mainnet: slot 6's own account alone); never the
+    /// two hosts on two networks (LAW E-4).
+    #[test]
+    fn each_network_passes_on_the_venue_s_host_with_its_own_scope() {
+        let (t, m) = (Network::Testnet, Network::Mainnet);
+        assert_eq!(check_network(t, Scope::Testnet, HOST_TESTNET, t), Ok(()));
+        assert_eq!(check_network(t, Scope::XmmTestnet, HOST_TESTNET, t), Ok(()));
+        let e = check_network(t, Scope::Testnet, "127.0.0.1", t).expect_err("a double");
+        assert!(e.contains(HOST_TESTNET), "{e}");
+        let e = check_network(t, Scope::Xmm, HOST_TESTNET, t).expect_err("a mainnet scope");
+        assert!(e.contains("HYPERLIQUID_XMM_TESTNET_"), "{e}");
+        assert_eq!(check_network(m, Scope::Xmm, HOST_MAINNET, m), Ok(()));
+        let e = check_network(m, Scope::Testnet, HOST_MAINNET, m).expect_err("shared");
+        assert!(e.contains("HYPERLIQUID_XMM_"), "{e}");
+        let e = check_network(m, Scope::XmmTestnet, HOST_MAINNET, m).expect_err("testnet's");
+        assert!(e.contains("HYPERLIQUID_XMM_"), "{e}");
+        let e = check_network(m, Scope::Xmm, "127.0.0.1", m).expect_err("a double");
+        assert!(e.contains(HOST_MAINNET), "{e}");
+        let e = check_network(m, Scope::Xmm, HOST_TESTNET, t).expect_err("two networks");
+        assert!(e.contains("LAW E-4"), "{e}");
+        let e = check_network(t, Scope::Testnet, HOST_MAINNET, m).expect_err("two networks");
+        assert!(e.contains("LAW E-4"), "{e}");
+    }
+
+    /// XMM XH5b-3: the tell names the network, the account and the anchor.
+    #[test]
+    fn the_tell_names_the_network_the_account_and_the_anchor() {
+        let file = std::path::Path::new("/x/xmm-pnl-anchor-mainnet.state");
+        let own = OwnTell {
+            master: [1; 20],
+            agent: [2; 20],
+            loss_usd_1e6: 50_000_000,
+            restored: None,
+            anchor_file: file,
+        };
+        let mut t = String::new();
+        tell_account(&mut t, Network::Mainnet, Some(&own));
+        assert!(
+            t.contains("gateway, MAINNET, slot 6 on its OWN MAINNET account"),
+            "{t}"
+        );
+        assert!(
+            t.contains("$50.000000") && t.contains("no anchor yet"),
+            "{t}"
+        );
+        assert!(t.contains("xmm-pnl-anchor-mainnet.state"), "{t}");
+        let anchor = PnlAnchor {
+            address: [1; 20],
+            usdc_1e6: 1_234_500_000,
+            set_unix_s: 7,
+        };
+        let restored = OwnTell {
+            restored: Some(anchor),
+            ..own
+        };
+        let mut t = String::new();
+        tell_account(&mut t, Network::Mainnet, Some(&restored));
+        assert!(t.contains("anchor RESTORED $1234.500000"), "{t}");
+        let mut t = String::new();
+        tell_account(&mut t, Network::Testnet, None);
+        assert!(
+            t.contains("gateway, TESTNET, slot 6 on the shared E3 account"),
+            "{t}"
         );
     }
 }
