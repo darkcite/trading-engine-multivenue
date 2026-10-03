@@ -8762,6 +8762,44 @@ changed: deriving the registry key from the signer's own key (the address
 already comes from that key in `HlConfig`; deriving again would put the
 secret on the stack).
 
+### XH4h-2 amendment (2026-10-03): the hedge-coin overlap rule
+
+Slot 6's gateway-bound perps become `LAW_LINEAR` ledger rows (XH4f), and the
+router judges every LIVE slot's order on a bound id by that row — one engine
+id, one row. On one master another slot's trades in a bound perp would also
+read as slot 6's drift (and halt it), and slot 6's leverage set would move
+the other slot's position. XH4e's obligations asked for slot 6's rows to be
+disjoint from slot 0's hedge perps; since XH4h the engine's boot enforces
+it, before any arm boots:
+
+- when slot 6 is live on the gateway, no perp it binds may be another LIVE
+  member's Hyperliquid perp — HYPARB's hedge perps (slot 0), VRP's hedge
+  (slot 1, a free descriptor) and HCV's hedge perps (slot 7) — **whatever
+  the master**: the row judges every live slot's orders on its id, so a
+  second master does not make the overlap safe;
+- a PAPER member is no claim: the risk clamp runs on the live arm only
+  (`RoutedDispatcher::submit`), the ledger books venue fills only, and a
+  paper order never reaches the venue — so the rule is dead while D2 keeps
+  a live gateway slot 6 alone, as planned;
+- the refusal names the coin, the engine id, the member and its slot, and
+  the two ways out (perps no other live member trades, or that member
+  paper); `cli::xmm_live::check_perp_overlap`, pinned by a test.
+
+**Not covered by a boot check** (for the D2 ruling): ai-exec (slot 4) and
+vm (slot 5) choose their symbols at runtime. Once D2 lets them run live
+beside slot 6, the complete rule is a router refusal of any live order from
+another slot on a gateway-bound row. BIN15 trades outcome legs; XSD trades
+no Hyperliquid perp by how its table is written (Binance USDⓈ-M names) —
+nothing enforces it, which the router refusal would. The ledger's own refusal of a
+duplicate row stays. **Deviations from the plan:** a perp shared across
+masters is refused, not allowed (one row per id judges every live slot);
+no cross-slot test of the ledger's duplicate-row refusal (the boot rule
+fires first).
+
+**Reviews:** risk round 1 REJECT (the rule bit on paper members, on a false
+premise — fixed: live members only; VRP added; the runtime-symbol gap and
+the deviations recorded); risk round 2 APPROVE.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

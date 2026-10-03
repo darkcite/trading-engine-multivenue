@@ -5300,6 +5300,52 @@ fn run(args: RunArgs) -> ExitCode {
                     // every Hyperliquid signer below asks for its agent's
                     // stream before its first signed action.
                     let mut nonces = exec_hyperliquid::NonceStreams::new();
+                    // **XMM XH4h-2 — the hedge-coin overlap rule**, before
+                    // any arm boots: no perp slot 6's gateway binds may be
+                    // another LIVE member's perp (a paper member is no
+                    // claim — dead while D2 keeps slot 6 alone).
+                    if let (Some(_), Some(xb)) = (eb.gateway_live(), xmm_boot.as_ref()) {
+                        let live = |slot: u8| eb.live_mask & (1u8 << slot) != 0;
+                        let n = usize::from(xb.params.n_perps).min(xb.coins.len());
+                        let bound: Vec<(&str, core_types::SymbolId)> = xb.coins[..n]
+                            .iter()
+                            .zip(xb.params.perps[..n].iter())
+                            .map(|(c, p)| (*c, p.hl_sym))
+                            .collect();
+                        let hyparb_perps: Vec<core_types::SymbolId> = hyparb_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_HYPARB))
+                            .map(|b| {
+                                b.params.coins[..b.params.n_coins]
+                                    .iter()
+                                    .map(|c| c.perp_sym)
+                                    .filter(|s| *s != core_types::SYMBOL_ID_NONE)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let hcv_perps: Vec<core_types::SymbolId> = hcv_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_HCV))
+                            .map(|b| b.params.und.iter().map(|u| u.hedge_sym).collect())
+                            .unwrap_or_default();
+                        let vrp_hedge: Vec<core_types::SymbolId> = vrp_boot
+                            .as_ref()
+                            .filter(|_| live(strategy_set::SLOT_VRP))
+                            .map(|b| vec![b.hedge_sym])
+                            .unwrap_or_default();
+                        if let Err(reason) = cli::xmm_live::check_perp_overlap(
+                            &bound,
+                            &[
+                                (strategy_set::SLOT_HYPARB, "hyparb", &hyparb_perps),
+                                (strategy_set::SLOT_VRP, "vrp", &vrp_hedge),
+                                (strategy_set::SLOT_HCV, "hcv", &hcv_perps),
+                            ],
+                        ) {
+                            error!(%reason, "xmm: the hedge-coin overlap rule refused the boot");
+                            join_reverse(handles);
+                            return ExitCode::from(1);
+                        }
+                    }
                     let hyparb_live = if eb.hyparb_live() {
                         match boot_hyparb_live_arm(
                             &eb,

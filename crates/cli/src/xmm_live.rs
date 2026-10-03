@@ -412,6 +412,40 @@ pub const fn arm_cfg(slot: u8, expires_after_ms: u16, recon_ms: u64, budget_floo
     }
 }
 
+/// **XMM XH4h-2 — the hedge-coin overlap rule.** Slot 6's gateway-bound
+/// perps become `LAW_LINEAR` ledger rows, and the router judges every LIVE
+/// slot's order on a bound id by its row (one engine id, one row); on one
+/// master another slot's trades in a bound perp would also read as slot
+/// 6's drift, and slot 6's leverage set would move the other's position.
+/// So no perp slot 6 binds may be another LIVE member's Hyperliquid perp —
+/// whatever its master (a coin is one engine id for every member). A
+/// paper member is no claim: the risk clamp runs on the live arm only, and
+/// a paper order never reaches the venue. `bound` is slot 6's `(coin,
+/// engine id)`; `others` each live member's `(slot, name, its perp ids)`.
+/// Boot only.
+///
+/// # Errors
+/// The first shared perp, with the coin and the other member named.
+pub fn check_perp_overlap(
+    bound: &[(&str, core_types::SymbolId)],
+    others: &[(u8, &str, &[core_types::SymbolId])],
+) -> Result<(), String> {
+    for &(coin, sym) in bound {
+        for &(slot, member, syms) in others {
+            if syms.contains(&sym) {
+                return Err(format!(
+                    "xmm coin {coin} (engine id {sym}) is also {member}'s Hyperliquid perp (slot \
+                     {slot}): slot 6's gateway binds it as a LAW_LINEAR ledger row, which judges \
+                     every live slot's order on it, and on one master the other slot's trades \
+                     would read as slot 6's drift — quote perps no other live member trades, or \
+                     run {member} paper (XMM XH4h-2)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An unbound perp row of [`arm_cfg`]'s table.
 const BLANK_PERP: PerpBind = PerpBind {
     sym: core_types::SYMBOL_ID_NONE,
@@ -473,7 +507,7 @@ fn run_gateway(gw: &mut HlGateway, owner: &AtomicBool) {
 
 #[cfg(test)]
 mod tests {
-    use super::{arm_cfg, bind_perps, PerpAsk, PerpBinding};
+    use super::{arm_cfg, bind_perps, check_perp_overlap, PerpAsk, PerpBinding};
 
     const META: &[u8] = br#"{"universe":[{"name":"BTC","szDecimals":5,"maxLeverage":40},{"name":"ETH","szDecimals":4,"maxLeverage":25}]}"#;
 
@@ -488,6 +522,26 @@ mod tests {
         let r = bind_perps(meta, asks, &mut cfg, &mut out);
         assert_eq!(cfg.n_perps, 0, "a refused binding sets no count");
         r.expect_err("refused")
+    }
+
+    /// XH4h-2: a perp slot 6 binds may be no other member's Hyperliquid
+    /// perp; disjoint sets pass, and an empty member is no claim.
+    #[test]
+    fn the_overlap_rule_refuses_a_shared_perp() {
+        let bound = [("BTC", 11), ("ETH", 12)];
+        let hedges = [40u32, 41];
+        let none: [u32; 0] = [];
+        assert_eq!(
+            check_perp_overlap(&bound, &[(0, "hyparb", &hedges), (7, "hcv", &none)]),
+            Ok(())
+        );
+        let shared = [41u32, 12];
+        let e = check_perp_overlap(&bound, &[(0, "hyparb", &hedges), (7, "hcv", &shared)])
+            .expect_err("ETH is hcv's hedge");
+        assert!(
+            e.contains("ETH") && e.contains("hcv") && e.contains("slot 7") && e.contains("XH4h-2"),
+            "{e}"
+        );
     }
 
     #[test]
