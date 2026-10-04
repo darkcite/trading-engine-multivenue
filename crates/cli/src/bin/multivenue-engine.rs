@@ -78,6 +78,9 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "xmm",
     "ai+xmm",
     "ai+vrp+xsd+bin15+hyparb+xmm",
+    // XMM XH5e: the testnet engine-instance check's set (slot 3 beside slot
+    // 6, nothing else); the wrapper's allow-list keeps it off launchd.
+    "bin15+xmm",
     // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
     // requested member is configured" without `~/multivenue/hcv.toml`
     // (or `--hcv`); in no configured mask until the operator names it.
@@ -176,6 +179,14 @@ enum Cmd {
     /// environment and never opens `.env` — `scripts/hypercall-live.sh`
     /// sources it. Report on stdout.
     HypercallLive(HypercallLiveArgs),
+    /// XMM XH5e: slot 6's PREFLIGHT — its boot's checks on the exact
+    /// `exec.toml`, `--arm-live` and `xmm.toml` a flip installs, up to the
+    /// boot's first network read: it opens no socket and sends nothing.
+    /// Loads `.env` as `run` does; run it in the wrapper's environment (from
+    /// the repo, with the wrapper's exports — `scripts/xmm-flip.sh` does):
+    /// the identities it checks are those its environment states. Exit 0
+    /// PASS (the report on stdout), 1 refused (the reason on stderr).
+    XmmPreflight(XmmPreflightArgs),
 }
 
 /// `hypercall-live` verbs.
@@ -191,6 +202,25 @@ enum HcVerb {
     Dust,
     /// Cancel every order of ours (a WRITE: `--confirm`).
     CancelAll,
+}
+
+#[derive(Debug, Parser)]
+struct XmmPreflightArgs {
+    /// Path to a .env file; defaults to `./.env` via dotenvy (as `run`).
+    #[arg(long)]
+    env_file: Option<PathBuf>,
+    /// The `exec.toml` the boot will read.
+    #[arg(long)]
+    exec: PathBuf,
+    /// The slots the boot will arm (`--arm-live`); they must arm slot 6.
+    #[arg(long)]
+    arm_live: String,
+    /// The member's artifact (`--xmm`); `~/multivenue/xmm.toml` if absent.
+    #[arg(long)]
+    xmm: Option<PathBuf>,
+    /// The `--strategy` the boot will run: a bootable set holding xmm.
+    #[arg(long)]
+    strategy: String,
 }
 
 #[derive(Debug, Parser)]
@@ -1267,6 +1297,53 @@ fn main() -> ExitCode {
         Cmd::HypercallLive(args) => {
             init_tracing_stderr();
             hypercall_live(args)
+        }
+        Cmd::XmmPreflight(args) => {
+            init_tracing_stderr();
+            xmm_preflight(args)
+        }
+    }
+}
+
+/// XMM XH5e: a `--strategy` the boot accepts (`STRATEGY_SET_NAMES`) whose
+/// mask boots the xmm member — the boot's own test (`xmm_wanted`).
+fn holds_xmm(strategy: &str) -> bool {
+    STRATEGY_SET_NAMES.contains(&strategy)
+        && strategy_set::mask_for_name(strategy).is_some_and(cli::xmm_boot::xmm_wanted)
+}
+
+/// XMM XH5e: `xmm-preflight` — slot 6's boot checks, nothing sent: the
+/// environment as `run` loads it (`.env` under the process's own), a
+/// `--strategy` the boot accepts with xmm in it, then
+/// `cli::xmm_preflight::preflight`.
+fn xmm_preflight(args: XmmPreflightArgs) -> ExitCode {
+    let cfg = match Config::load(args.env_file.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("xmm-preflight: REFUSED — the config does not load: {e:?}");
+            return ExitCode::from(1);
+        }
+    };
+    if !holds_xmm(&args.strategy) {
+        eprintln!(
+            "xmm-preflight: REFUSED — --strategy {} is not a bootable set holding xmm",
+            args.strategy
+        );
+        return ExitCode::from(1);
+    }
+    match cli::xmm_preflight::preflight(
+        &args.exec,
+        &args.arm_live,
+        args.xmm.as_deref(),
+        &cfg.hyperliquid_ws_host,
+    ) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xmm-preflight: REFUSED — {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -5789,6 +5866,31 @@ mod strategy_name_pin {
                 "{name} is bootable but mask_for_name does not know it"
             );
             i += 1;
+        }
+    }
+
+    /// XMM XH5e: the preflight's `--strategy` is a bootable set holding the
+    /// xmm member — the engine-instance check's `bin15+xmm` among them.
+    #[test]
+    fn the_preflight_takes_a_bootable_set_holding_xmm() {
+        for ok in [
+            "xmm",
+            "ai+xmm",
+            "bin15+xmm",
+            "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
+            "all",
+        ] {
+            assert!(super::holds_xmm(ok), "{ok}");
+        }
+        for no in [
+            "bin15",
+            "ai",
+            "ai+vrp+xsd+bin15+hyparb",
+            "xmm+bin15",
+            "xmmx",
+            "",
+        ] {
+            assert!(!super::holds_xmm(no), "{no}");
         }
     }
 

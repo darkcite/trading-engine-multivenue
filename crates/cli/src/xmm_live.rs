@@ -294,14 +294,14 @@ pub struct Identity {
 
 /// The other arms' masters (XMM XH5b-2): E3's testnet account, slot 3's
 /// (the operator's arm), slot 0's (HYPARB's own account).
-const OTHER_MASTERS: [&str; 3] = [
+pub(crate) const OTHER_MASTERS: [&str; 3] = [
     ENV_T_MASTER_ADDR,
     ENV_MASTER_ADDR,
     crate::evm_live::ADDR_ENV,
 ];
 /// The other arms' signing keys: E3's testnet agent, slot 3's agent, and
 /// slot 0's wallet on mainnet and on testnet (it signs as itself, O-HL3).
-const OTHER_KEYS: [&str; 4] = [
+pub(crate) const OTHER_KEYS: [&str; 4] = [
     ENV_T_AGENT_KEY,
     ENV_AGENT_KEY,
     crate::evm_live::KEY_ENV,
@@ -708,16 +708,55 @@ pub fn priority_cap(p: &strategy_xmm::XmmParams) -> u32 {
     }
 }
 
-/// **Boot slot 6's arm.** Every refusal names what to fix; the only network
-/// traffic before the thread starts is one `/info meta`.
+/// **XMM XH5e — slot 6's boot up to its first network read** (cold): what
+/// [`plan_xmm_arm`] resolves — the artifact's slot, the member, the account,
+/// the credentials, and the anchor and the top-ups restored from their
+/// files. [`boot_xmm_arm`] goes on from it; `xmm-preflight` stops at it.
+pub struct XmmPlan<'a> {
+    /// The artifact's slot 6.
+    pub s: &'a ExecSlot,
+    /// The member's boot.
+    pub xmm: &'a XmmBoot,
+    /// Slot 6 trades an account of its own (XMM XH5b-2).
+    pub own: bool,
+    /// Its credentials: the scope the network and the account name.
+    pub hl: HlConfig,
+    /// The session anchor's file, beside the artifact.
+    pub anchor_file: PathBuf,
+    /// The anchor restored from it (its own account; `None`: a new session).
+    pub restored: Option<PnlAnchor>,
+    /// The top-ups' file, beside the artifact.
+    pub topup_file: PathBuf,
+    /// Its own account: the governor restored from that file, armed with the
+    /// artifact's keys, and the anchor's stamp.
+    pub topup: Option<(TopupGovernor, u64)>,
+    /// The member's quote lifetime as the arm's `expiresAfter`, ms.
+    pub expires_after_ms: u16,
+}
+
+impl XmmPlan<'_> {
+    /// The boot tell's head (cold, pure): the network, the account, the
+    /// anchor, the top-ups.
+    pub fn tell_head(&self, tell: &mut String) {
+        let own_tell = OwnTell {
+            master: self.hl.master_addr,
+            agent: self.hl.agent_addr,
+            loss_usd_1e6: self.s.halt_on_loss_usd_1e6,
+            restored: self.restored,
+            anchor_file: &self.anchor_file,
+        };
+        tell_account(tell, self.hl.network, self.own.then_some(&own_tell));
+        tell_topup(tell, self.topup.as_ref().map(|t| &t.0), &self.topup_file);
+    }
+}
+
+/// **XMM XH5e — plan slot 6's arm**: every check its boot makes before it
+/// reads the venue, and the files it restores — no socket opened, nothing
+/// sent. Every refusal names what to fix.
 ///
 /// # Errors
 /// The first check that fails.
-pub fn boot_xmm_arm(
-    spec: &XmmSpec<'_>,
-    tls: Arc<ClientConfig>,
-    nonces: &mut NonceStreams,
-) -> Result<XmmLive, String> {
+pub fn plan_xmm_arm<'a>(spec: &XmmSpec<'a>) -> Result<XmmPlan<'a>, String> {
     let s = spec
         .eb
         .slots
@@ -763,18 +802,6 @@ pub fn boot_xmm_arm(
     let anchor_file = anchor_path(&spec.eb.path, hl.network);
     let restored = if own {
         check_own_account(&hl.master_addr, &hl.agent_addr, &other_identities()?)?;
-        // The venue binds the API wallet to its master: one `userRole` read,
-        // its request rendered in the client's body window.
-        let role = crate::hyparb_live::info_rendered(
-            &hl.host,
-            Arc::clone(&tls),
-            |b| {
-                user_role_request(b, &hl.agent_addr)
-                    .map_err(|e| format!("slot 6's userRole request: {e:?}"))
-            },
-            scan_user_role,
-        )?;
-        check_agent_binding(role, &hl.agent_addr, &hl.master_addr)?;
         load_own(&anchor_file, hl.master_addr)
             .map_err(|e| format!("slot 6's session anchor: {e}"))?
     } else {
@@ -798,14 +825,84 @@ pub fn boot_xmm_arm(
     } else {
         None
     };
-    let p = &xmm.params;
-    let n = usize::from(p.n_perps);
+    // The member's shape as the arm binds it (pure: refused here, before any
+    // venue read).
+    let n = usize::from(xmm.params.n_perps);
     if n == 0 || n > ARM_PERPS || n != xmm.coins.len() {
         return Err(format!(
             "xmm.toml quotes {n} perp(s) ({} coin names); the gateway arm binds 1..={ARM_PERPS}",
             xmm.coins.len()
         ));
     }
+    let expires_after_ms = u16::try_from(xmm.params.lifetime_ms).map_err(|_| {
+        format!(
+            "xmm.toml lifetime_ms {} exceeds 65 535",
+            xmm.params.lifetime_ms
+        )
+    })?;
+    Ok(XmmPlan {
+        s,
+        xmm,
+        own,
+        hl,
+        anchor_file,
+        restored,
+        topup_file,
+        topup,
+        expires_after_ms,
+    })
+}
+
+/// **Boot slot 6's arm.** Every refusal names what to fix: [`plan_xmm_arm`]
+/// first (no network), then the venue's reads before the thread starts — one
+/// `/info userRole` on its own account, one `/info meta`.
+///
+/// # Errors
+/// The first check that fails.
+pub fn boot_xmm_arm(
+    spec: &XmmSpec<'_>,
+    tls: Arc<ClientConfig>,
+    nonces: &mut NonceStreams,
+) -> Result<XmmLive, String> {
+    // COPY: boot, once — the ≈ 264 B plan out of `plan_xmm_arm`'s `Result`,
+    // destructured below; its `HlConfig` moves the key's box pointer (8 B),
+    // never the 32 key bytes (neither it nor `SecretKeyBytes` is `Clone`).
+    // Rejected: an out-param into the caller's storage — the by-value split
+    // is what lets the preflight stop before the first read.
+    let plan = plan_xmm_arm(spec)?;
+    if plan.own {
+        // The venue binds the API wallet to its master: one `userRole` read,
+        // its request rendered in the client's body window.
+        let hl = &plan.hl;
+        let role = crate::hyparb_live::info_rendered(
+            &hl.host,
+            Arc::clone(&tls),
+            |b| {
+                user_role_request(b, &hl.agent_addr)
+                    .map_err(|e| format!("slot 6's userRole request: {e:?}"))
+            },
+            scan_user_role,
+        )?;
+        check_agent_binding(role, &hl.agent_addr, &hl.master_addr)?;
+    }
+    // The boot tell, written once, before the anchor's file moves to its
+    // keeper (cold): its head from the plan, its tail once the perps bind.
+    let mut tell = String::with_capacity(1_024);
+    plan.tell_head(&mut tell);
+    let XmmPlan {
+        s,
+        xmm,
+        own,
+        hl,
+        anchor_file,
+        restored,
+        topup_file,
+        topup,
+        expires_after_ms,
+    } = plan;
+    let network = hl.network;
+    let p = &xmm.params;
+    let n = usize::from(p.n_perps);
     let mut asks = Vec::with_capacity(n);
     for (i, coin) in xmm.coins.iter().enumerate() {
         asks.push(PerpAsk {
@@ -814,8 +911,6 @@ pub fn boot_xmm_arm(
             lot_1e6: Some(p.perps[i].lot_1e6),
         });
     }
-    let expires_after_ms = u16::try_from(p.lifetime_ms)
-        .map_err(|_| format!("xmm.toml lifetime_ms {} exceeds 65 535", p.lifetime_ms))?;
     let recon_ms = recon_ms_for(own);
     let mut cfg = arm_cfg(
         XMM_SLOT as u8,
@@ -829,18 +924,6 @@ pub fn boot_xmm_arm(
     crate::hyparb_live::info_with(&hl.host, META_REQ, Arc::clone(&tls), |b| {
         bind_perps(b, &asks, &mut cfg, &mut bound)
     })??;
-    // The boot tell, written once, before the anchor's file moves to its
-    // keeper (cold).
-    let mut tell = String::with_capacity(1_024);
-    let own_tell = OwnTell {
-        master: hl.master_addr,
-        agent: hl.agent_addr,
-        loss_usd_1e6: s.halt_on_loss_usd_1e6,
-        restored,
-        anchor_file: &anchor_file,
-    };
-    tell_account(&mut tell, network, own.then_some(&own_tell));
-    tell_topup(&mut tell, topup.as_ref().map(|t| &t.0), &topup_file);
     let _ = write!(
         tell,
         "; {n} perp(s) bound ({}); leverage {LEVERAGE}x cross; reads every {recon_ms} ms, the \

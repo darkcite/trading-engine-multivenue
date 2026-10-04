@@ -10059,6 +10059,68 @@ rustfmt clean on touched hunks.
 **Reviews:** risk APPROVE (round 3), allocation APPROVE (round 3),
 zero-copy APPROVE (round 2, confirmed round 3).
 
+### XH5e-1 amendment (2026-10-04): slot 6's preflight, and the probe's artifacts as files
+
+The first part of XH5e (plan §3.5; A-S7-37). Nothing is armed and no file in
+`~/multivenue` changes; the flip that installs these files
+(`scripts/xmm-flip.sh`) is XH5e-2.
+
+- **One boot, two stopping points.** `xmm_live::plan_xmm_arm` is slot 6's
+  boot up to its first network read: the artifact's slot, the member and its
+  shape as the arm binds it (1..=16 perps, `lifetime_ms` within the arm's
+  `expiresAfter`), the caps, the market data's network (LAW E-4), the
+  account and its rules, the credentials, their network and identity, the
+  anchor and the top-ups restored from their files, and the tell's head.
+  `boot_xmm_arm` runs it, then reads the venue (`userRole` on its own
+  account, then `meta`). The anchor's and the top-ups' files are now read
+  before `userRole` — reads only, so a bad anchor refuses before any
+  request. The tell is unchanged.
+- **The preflight sends nothing.** `multivenue-engine xmm-preflight --exec
+  … --arm-live … --xmm … --strategy …` resolves the artifact with the arming
+  list (slot 6 live on the gateway, or it refuses), loads the member's
+  artifact on an offline universe (the coin table; the boot resolves the
+  same names against its own), runs the plan and prints the boot's tells,
+  then PASS naming what it did not check: the venue's perp universe, the API
+  wallet's binding, the account's positions, orders and balances, the perps
+  in the boot universe, their overlap with a live slot 0 or 1. It opens no
+  socket and writes nothing. Its inputs must be the boot's: the anchor and
+  the top-up state are read beside `--exec`, so a work copy sits in the
+  installed `exec.toml`'s directory; the identities are those its
+  environment states, so it runs from the repo in the wrapper's environment.
+  A PASS the boot then refuses costs a refused boot, never an order.
+- **The probe's artifacts are files** at the repository's root, changed only
+  under review: `xmm-probe.toml`, the example's member (the paper engine's)
+  with `lead_stale_ms` 500 and `rtt_pull_ms` 2000 (XH5c-3) and `ab_mode` 0
+  for the first run (Q-XH5-5 is open; mode 2 waits for the testnet proof of
+  the priority grouping); and `exec-slot6-probe.toml`, the template's slot-6
+  recipe live (top-ups 10 000 / 100 000, the −$50 bound, reads stale after
+  180 s). Tests pin both to their templates.
+- **`bin15+xmm`** joins the bootable names (mask 72): the testnet
+  engine-instance check's set. The wrapper's allow-list does not carry it.
+- **Copies:** the plan's move out of its `Result` at boot, noted; the key
+  moves as its box, never its bytes. None on a hot path; nothing runs after
+  boot, so no alloc gate is new.
+
+**Tests:** the probe passes on mainnet market data on an account of its own
+(the report: slot 6 live on the gateway with its clamps, the probe's member,
+the MAINNET head with its bound, a new session and its top-ups, PASS); the
+boot's refusals are the preflight's, word for word — `--arm-live` not naming
+6, a relay's market data, testnet data on the shared account, an absent
+member; the anchor beside the artifact restores this master's session and
+refuses another's; the probe's member differs from the example's in its two
+values alone; the probe's section is the template's recipe; the offline
+universe; the preflight's `--strategy` boots xmm; `bin15+xmm`'s mask.
+
+**Gates:** clippy 0; nextest 4 204/4 204 (a debug-run alloc flake, 6
+allocations / 1 012 B in `binance_book_ticker_is_zero_alloc`, re-run ×8
+clean — the release gate is the authority); alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL; rustfmt
+clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 2); their two round-2 wording NITs applied
+(comments only).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

@@ -71,6 +71,9 @@ pub mod xmm_battery;
 pub mod xmm_boot;
 /// XMM XH4f: slot 6's live arm — the Hyperliquid gateway, booted (testnet).
 pub mod xmm_live;
+/// XMM XH5e: slot 6's preflight — its boot's checks on a flip's files, up to
+/// the boot's first network read (`multivenue-engine xmm-preflight`).
+pub mod xmm_preflight;
 /// HC11: the slot-7 member's boot (`hcv.toml` → `HcvParams`), its
 /// calendar reader thread and (HC11b) its book's file.
 pub mod hcv_boot;

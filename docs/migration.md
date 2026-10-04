@@ -6,6 +6,25 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-04 — `--strategy bin15+xmm` (72); `multivenue-engine xmm-preflight`; the XH5 probe's artifacts (XMM XH5e-1)
+
+**What changed**
+- `strategy-set`: the bootable name `bin15+xmm` (mask 72: bin15 8 + xmm 64)
+  — the testnet engine-instance check's set, slot 3's member beside slot
+  6's. The wrapper's allow-list does not carry it: the launchd engine cannot
+  boot it.
+- `multivenue-engine xmm-preflight --exec <toml> --arm-live <list> --xmm
+  <toml> --strategy <set> [--env-file <path>]`: slot 6's boot checks up to
+  its first network read, sending nothing. Exit 0 PASS (the report on
+  stdout), 1 refused (the reason on stderr).
+- Two artifacts at the repository's root for the XH5 mainnet probe,
+  installed only by `scripts/xmm-flip.sh` (XMM XH5e-2): `xmm-probe.toml`
+  (the example's member with `lead_stale_ms` 500 and `rtt_pull_ms` 2000) and
+  `exec-slot6-probe.toml` (the template's slot-6 recipe, live).
+
+**Operator action:** none — nothing is armed and no file in `~/multivenue`
+changes.
+
 ## 2026-09-26 — Binance COIN-M market data: `[binance] coinm` / `coinm_dated`, the `binance-coinm:` namespace, `BINANCE_COINM_WS_HOST` / `BINANCE_COINM_REST_HOST` (BX2)
 
 **What changed**

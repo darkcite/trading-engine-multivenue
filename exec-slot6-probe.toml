@@ -1,0 +1,33 @@
+# exec-slot6-probe.toml — slot 6's [exec.slot.6] for the XH5 mainnet probe
+# (XMM XH5e). `scripts/xmm-flip.sh live` puts this section in place of the
+# operator's [exec.slot.6] (or appends it), after `multivenue-engine
+# xmm-preflight` passes on the result; `paper` sets its mode back to paper.
+# Change it here, under review — never in ~/multivenue.
+#
+# It is exec.toml.example's slot-6 recipe, key for key (a test pins that):
+# the maker plan's Appendix B on the gateway — $20 orders, 16 open, $150 a
+# perp and $300 resting, the post-only rejection halt at 20 %, the address
+# floor 2 000, top-ups of 10 000 requests ($5) up to 100 000 a UTC day ($50,
+# O-XH9), the -$50 session bound (O-XH5) on its OWN mainnet account
+# (HYPERLIQUID_XMM_*), its reads judged stale after 180 s.
+[exec.slot.6]
+mode = "live"
+name = "xmm"
+venues = ["hyperliquid"]
+transport = "gateway"
+max_order_usd_1e6 = 20000000
+max_open_orders = 16
+cap_day_usd_1e6 = 5000000000
+cap_instance_usd_1e6 = 400000000
+cap_perp_usd_1e6 = 150000000
+max_resting_usd_1e6 = 300000000
+request_budget_floor = 2000
+halt_on_reject_streak = 5
+halt_on_recon_drift_usd_1e6 = 20000000
+halt_on_ws_gap_ms = 5000
+halt_on_asset_refusal_streak = 3
+halt_on_recon_stale_ms = 180000
+halt_on_alo_reject_pct = 20
+halt_on_loss_usd_1e6 = 50000000
+request_topup_weight = 10000
+request_topup_day_max = 100000

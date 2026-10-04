@@ -1019,6 +1019,34 @@ pub fn log_boot_tell(boot: &ExecBoot) {
     }
 }
 
+/// XMM XH4f / XH5e: `exec.toml.example` with its slot-6 recipe live — the
+/// section's keys uncommented, its paper line dropped (tests: the template
+/// resolves on the gateway; the probe's section is this recipe).
+#[cfg(test)]
+pub(crate) fn template_slot6_recipe() -> String {
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exec.toml.example"),
+    )
+    .expect("exec.toml.example must ship with the repo");
+    let mut six = false;
+    let mut out = String::with_capacity(src.len());
+    for l in src.lines() {
+        if l.starts_with("[exec.slot.") || l.starts_with("# ---- [exec.") {
+            six = l == "[exec.slot.6]";
+        }
+        if six && l == "mode = \"paper\"" {
+            continue;
+        }
+        out.push_str(if six {
+            l.strip_prefix("# ").unwrap_or(l)
+        } else {
+            l
+        });
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,26 +1349,7 @@ mod tests {
     /// on slot 6's lines alone.
     #[test]
     fn the_template_s_slot_six_recipe_resolves_on_the_gateway() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../exec.toml.example"),
-        )
-        .expect("exec.toml.example must ship with the repo");
-        let mut six = false;
-        let mut out = String::new();
-        for l in src.lines() {
-            if l.starts_with("[exec.slot.") || l.starts_with("# ---- [exec.") {
-                six = l == "[exec.slot.6]";
-            }
-            if six && l == "mode = \"paper\"" {
-                continue;
-            }
-            out.push_str(if six {
-                l.strip_prefix("# ").unwrap_or(l)
-            } else {
-                l
-            });
-            out.push('\n');
-        }
+        let out = super::template_slot6_recipe();
         let d = tmp();
         let p = write(&d, "exec.toml", &out);
         let boot = resolve(Some(&p), Some("6"))
