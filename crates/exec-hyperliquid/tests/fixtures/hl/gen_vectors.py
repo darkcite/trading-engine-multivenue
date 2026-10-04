@@ -68,12 +68,10 @@ class _Cloid:
 
 
 def order_action(wires, grouping="na"):
-    # The SDK hardcodes `grouping = "na"`; the key is overwritten in
-    # place, which keeps its position (dict insertion order), so the
-    # msgpack key order stays the SDK's.
-    action = signing.order_wires_to_order_action(wires)
-    action["grouping"] = grouping
-    return action
+    # SDK 0.24.0 builds the action with its `grouping` — a string, or its
+    # `PriorityGrouping` {"p": int} (XMM XH5d) — keyed type, orders,
+    # grouping in that order (dict insertion order: the msgpack key order).
+    return signing.order_wires_to_order_action(wires, None, grouping)
 
 
 # HIP-4 asset ids: 100_000_000 + enc, enc = 10 * outcome_id + side.
@@ -134,6 +132,8 @@ case(
     True,
 )
 case("order_grouping_tpsl", order_action([wire(0, True, 0.5, 10.0, False, "Gtc")], "normalTpsl"), 15, True)
+# XMM XH5d: the ALO priority grouping, {"p": N} (1 bp of resting notional).
+case("order_alo_priority", order_action([wire(0, True, 0.5, 10.0, False, "Alo")], {"p": 10000}), 37, True)
 
 # --- vault + expiresAfter: the two tail bytes of the action hash ------
 case("order_vault", order_action([wire(0, True, 0.5, 10.0, False, "Gtc")]), 16, True, vault=VAULT)

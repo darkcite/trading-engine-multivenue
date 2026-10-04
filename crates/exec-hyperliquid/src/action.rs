@@ -13,7 +13,7 @@
 //!
 //! | action | keys, in order |
 //! |---|---|
-//! | order | `type`, `orders`, `grouping` |
+//! | order | `type`, `orders`, `grouping` (a string; XMM XH5d's ALO priority a map, `p`) |
 //! | order wire | `a`, `b`, `p`, `s`, `r`, `t`, then `c` only if present |
 //! | order type | `limit` → `tif` |
 //! | cancel | `type`, `cancels`; item `a`, `o` |
@@ -188,16 +188,41 @@ fn write_order_wire(w: &mut Writer<'_>, o: &OrderWire) -> Result<(), MsgPackErr>
     Ok(())
 }
 
+/// An `order` action's `grouping`, inside the signature: a named one —
+/// `b"na"` for everything this lane sends but the ALO priority — or XMM
+/// XH5d's ALO priority, `{"p": N}` (N: p ×1e8 of resting notional;
+/// hyperliquid-python-sdk 0.24.0's `PriorityGrouping`). An action carries
+/// one: the gateway batches places by it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Grouping<'a> {
+    /// A string grouping (`"na"`, `"normalTpsl"`, …).
+    Named(&'a [u8]),
+    /// `{"p": N}`: a one-key map (msgpack), an object (JSON).
+    Priority(u32),
+}
+
 /// `{"type":"order","orders":[…],"grouping":"…"}`
 ///
-/// `grouping` is `b"na"` for everything this lane sends; it is a
-/// parameter because it is inside the signature and a default that
-/// silently differed from the caller's intent would be unfindable.
+/// `grouping` is `b"na"` for everything this lane sends but the ALO
+/// priority ([`encode_order_grouped`]); it is a parameter because it is
+/// inside the signature and a default that silently differed from the
+/// caller's intent would be unfindable.
 #[inline]
 pub fn encode_order(
     dst: &mut [u8],
     orders: &[OrderWire],
     grouping: &[u8],
+) -> Result<usize, MsgPackErr> {
+    encode_order_grouped(dst, orders, Grouping::Named(grouping))
+}
+
+/// [`encode_order`] under any [`Grouping`]: XMM XH5d's ALO priority as
+/// `"grouping": {"p": N}`.
+#[inline]
+pub fn encode_order_grouped(
+    dst: &mut [u8],
+    orders: &[OrderWire],
+    grouping: Grouping<'_>,
 ) -> Result<usize, MsgPackErr> {
     if orders.len() > MAX_ORDERS {
         return Err(MsgPackErr::Overflow);
@@ -212,7 +237,14 @@ pub fn encode_order(
         write_order_wire(&mut w, o)?;
     }
     w.str_bytes(b"grouping")?;
-    w.str_bytes(grouping)?;
+    match grouping {
+        Grouping::Named(g) => w.str_bytes(g)?,
+        Grouping::Priority(p) => {
+            w.map_header(1)?;
+            w.str_bytes(b"p")?;
+            w.uint(u64::from(p))?;
+        }
+    }
     Ok(w.len())
 }
 
@@ -498,5 +530,30 @@ mod tests {
         assert_eq!(Tif::Gtc.as_bytes(), b"Gtc");
         assert_eq!(Tif::Ioc.as_bytes(), b"Ioc");
         assert_eq!(Tif::Alo.as_bytes(), b"Alo");
+    }
+
+    /// XMM XH5d: `{"p": N}` is a one-key map after the `grouping` key (the
+    /// SDK's msgpack of `PriorityGrouping`; the vector pins the rest), and
+    /// a named grouping encodes as `encode_order` does.
+    #[test]
+    fn the_priority_grouping_is_a_one_key_map() {
+        let o = OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo);
+        let mut a = [0u8; MAX_ACTION];
+        let mut b = [0u8; MAX_ACTION];
+        let n1 = encode_order(&mut a, &[o], b"na").unwrap();
+        let n2 = encode_order_grouped(&mut b, &[o], Grouping::Named(b"na")).unwrap();
+        assert_eq!(&a[..n1], &b[..n2]);
+        let n3 = encode_order_grouped(&mut b, &[o], Grouping::Priority(10_000)).unwrap();
+        // "grouping" (0xa8 and 8 B), then fixmap 1, "p", uint16 10 000.
+        let tail = [
+            0xa8, b'g', b'r', b'o', b'u', b'p', b'i', b'n', b'g', 0x81, 0xa1, b'p', 0xcd, 0x27,
+            0x10,
+        ];
+        assert!(b[..n3].ends_with(&tail));
+        assert_eq!(
+            n3,
+            n1 - 3 + 6,
+            "\"na\" (3 B) out, {{\"p\": 10 000}} (6 B) in"
+        );
     }
 }

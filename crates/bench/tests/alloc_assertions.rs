@@ -14375,7 +14375,9 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// venue refusal stops them and the stop is stored; the halt signals and
 /// the cancel-all state; every out-queue drained as the engine does.
 /// XMM XH5d: the `open` rows carry the venue's time, and every fourth
-/// place or modify's comes after the answer (its RESTING repeated with it).
+/// place or modify's comes after the answer (its RESTING repeated with it);
+/// the ALO priority armed, every third order bids it (a place's fee
+/// tallied; a modify's bid dropped).
 /// Timers run on the real clock (1 ms windows): the warm-up runs until
 /// every path has run, and the window must run each again.
 #[test]
@@ -14792,7 +14794,9 @@ fn hl_gateway_arm_is_zero_alloc() {
             core_types::Qty(500_000),
             cid,
         )
-        .with_post_only();
+        .with_post_only()
+        // XMM XH5d: every third bids ALO priority (1 bp).
+        .with_alo_priority(if cid % 3 == 0 { 10_000 } else { 0 });
         o.strategy_id = SLOT;
         o
     }
@@ -14907,6 +14911,9 @@ fn hl_gateway_arm_is_zero_alloc() {
         Some(std::sync::Arc::clone(&topup_slot)),
     )
     .expect("gate 98: top-ups on the slot's own account");
+    // XMM XH5d: the ALO priority armed — its fee tallied on every place
+    // that bids one, in the window.
+    arm.set_priority_cap(u32::MAX);
     gw.stats.set_gauges(0, true);
     let mut s = Script {
         n: 0,
@@ -15215,7 +15222,9 @@ fn gate96_venue_helper() {
 ///
 /// The REAL gateway (`HlGateway::turn`) against a scripted venue in a
 /// CHILD process (the counting allocator is process-global — gate 72's
-/// harness). Every round pushes two ALO places, an ALO modify and a
+/// harness). Every round pushes two ALO places (XMM XH5d: both bidding
+/// priority 1 bp — one batch, its `{"p": N}` grouping sealed and rendered
+/// in place), an ALO modify and a
 /// cancel, which the gateway coalesces into THREE posts (the ALO batch,
 /// the batchModify, the cancelByCloid) — each encoded, signed, rendered
 /// and framed in place — and two reads (XH4d: the open orders, the
@@ -15369,8 +15378,10 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             oid += 3;
             let sent = eng.stats.io()[0];
             let cmds = [
-                HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo),
-                HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo),
+                HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo)
+                    .with_priority(10_000),
+                HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo)
+                    .with_priority(10_000),
                 HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
                     .replacing(oid + 1_000_000),
                 HlCmd::cancel(6, oid + 2_000_000, 1),

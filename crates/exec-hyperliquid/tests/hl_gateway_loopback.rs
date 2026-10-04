@@ -754,6 +754,45 @@ fn classes_split_at_39_and_never_mix() {
     assert_eq!(count(&evs, EV_REJECTED) + count(&evs, EV_UNANSWERED), 0);
 }
 
+/// XMM XH5d: an action carries one grouping — ALO places bidding the same
+/// priority are one post, `"grouping":{"p":N}`; a place bidding another
+/// (or none) posts the open batch first.
+#[test]
+fn alo_places_batch_by_the_priority_they_bid() {
+    let v = Venue::start();
+    v.policy(|s| Answer::Action(resting(items_in(&s.body), 1)));
+    let (mut gw, mut eng) = gateway(&v, 5_000_000_000);
+    let mut evs = Vec::new();
+    live(&mut gw, &mut eng, &mut evs);
+    assert!(eng.cmd.push(&alo(1).with_priority(10_000)));
+    assert!(eng.cmd.push(&alo(2).with_priority(10_000)));
+    assert!(eng.cmd.push(&alo(3)));
+    assert!(eng.cmd.push(&alo(4).with_priority(20_000)));
+    assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(
+        e, EV_ACK
+    ) >= 4));
+    let posts = v.posts();
+    assert_eq!(posts.len(), 3, "p 10 000 twice, none, p 20 000");
+    assert_eq!(items_in(&posts[0].body), 2);
+    assert!(
+        posts[0].body.contains(r#""grouping":{"p":10000}"#),
+        "{}",
+        posts[0].body
+    );
+    assert_eq!(items_in(&posts[1].body), 1);
+    assert!(
+        posts[1].body.contains(r#""grouping":"na""#),
+        "{}",
+        posts[1].body
+    );
+    assert!(
+        posts[2].body.contains(r#""grouping":{"p":20000}"#),
+        "{}",
+        posts[2].body
+    );
+    assert_eq!(count(&evs, EV_REJECTED) + count(&evs, EV_UNANSWERED), 0);
+}
+
 #[test]
 fn a_cancel_never_overtakes_the_place_it_names() {
     let v = Venue::start();

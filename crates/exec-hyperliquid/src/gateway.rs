@@ -140,9 +140,9 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 
 use crate::action::{
-    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_reserve_weight,
-    encode_schedule_cancel, encode_update_leverage, CancelByCloidWire, ModifyWire, OrderWire, Tif,
-    MAX_ACTION, MAX_ORDERS,
+    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_order_grouped,
+    encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
+    Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
@@ -174,8 +174,8 @@ use crate::recon::{
 };
 use crate::request::{
     batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
-    reserve_weight_json, schedule_cancel_json, update_leverage_json, ws_info_open, ws_post_close,
-    ws_post_open,
+    order_json_grouped, reserve_weight_json, schedule_cancel_json, update_leverage_json,
+    ws_info_open, ws_post_close, ws_post_open,
 };
 use crate::response::{
     scan, scan_items, HlResponse, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING,
@@ -215,6 +215,17 @@ const _: () = assert!(TIMER_SLOTS >= PENDING_SLOTS);
 const TX_CAP: usize = 16 * 1024;
 const ROOM: usize = WS_CLIENT_HDR_MAX;
 const GROUPING: &[u8] = b"na";
+
+/// An ALO batch's grouping (XMM XH5d): its priority's `{"p": N}`, or
+/// `"na"` when it bids none.
+#[inline]
+const fn grouping(p: u32) -> Grouping<'static> {
+    if p == 0 {
+        Grouping::Named(GROUPING)
+    } else {
+        Grouping::Priority(p)
+    }
+}
 
 const CLASSES: usize = 6;
 const CLASS_ALO: usize = 0;
@@ -665,14 +676,16 @@ const BLANK_POST: PostRec = PostRec {
     items: [BLANK_ITEM; MAX_ORDERS],
 };
 
-/// An open batch: its post id, open order, items, and the smallest
-/// venue-expiry offset among them.
+/// An open batch: its post id, open order, items, the smallest
+/// venue-expiry offset among them, and (an ALO batch's, XMM XH5d) the
+/// priority its action's grouping bids — 0 `"na"`.
 #[derive(Copy, Clone, Default)]
 struct BatchHead {
     id: u64,
     seq: u64,
     n: usize,
     min_exp: u16,
+    p: u32,
 }
 
 /// A control action's arguments, resolved once at admission.
@@ -2140,6 +2153,13 @@ impl HlGateway {
             // never overtakes an older one.
             self.flush_open(now);
         }
+        // XMM XH5d: an action carries one grouping — a place bidding
+        // another ALO priority than the open ALO batch's posts every open
+        // batch first, as a full one does.
+        let p = if k == CLASS_ALO { c.arg } else { 0 };
+        if self.batches.head[k].n != 0 && self.batches.head[k].p != p {
+            self.flush_open(now);
+        }
         if self.batches.head[k].n == 0 && !self.open(k, now) {
             self.refuse(c, REASON_LOCAL, now);
             return;
@@ -2147,6 +2167,7 @@ impl HlGateway {
         let b = &mut *self.batches;
         let h = &mut b.head[k];
         let i = h.n;
+        h.p = p;
         match k {
             CLASS_ALO => b.alo[i] = c.order_wire(),
             CLASS_TAKER => b.taker[i] = c.order_wire(),
@@ -2293,6 +2314,7 @@ impl HlGateway {
             seq: self.seq,
             n: 0,
             min_exp: 0,
+            p: 0,
         };
         true
     }
@@ -2346,7 +2368,7 @@ impl HlGateway {
         let n = h.n;
         let b = &*self.batches;
         let mp_n = match k {
-            CLASS_ALO => encode_order(&mut self.mp, &b.alo[..n], GROUPING),
+            CLASS_ALO => encode_order_grouped(&mut self.mp, &b.alo[..n], grouping(h.p)),
             CLASS_TAKER => encode_order(&mut self.mp, &b.taker[..n], GROUPING),
             CLASS_MODIFY => encode_batch_modify(&mut self.mp, &b.modify[..n]),
             CLASS_CANCEL => encode_cancel_by_cloid(&mut self.mp, &b.cancel[..n]),
@@ -2377,7 +2399,7 @@ impl HlGateway {
         let head = envelope_open(&mut tx[pfx..]).ok()?;
         let at = pfx + head;
         let aj = match k {
-            CLASS_ALO => order_json(&mut tx[at..], &b.alo[..n], GROUPING),
+            CLASS_ALO => order_json_grouped(&mut tx[at..], &b.alo[..n], grouping(h.p)),
             CLASS_TAKER => order_json(&mut tx[at..], &b.taker[..n], GROUPING),
             CLASS_MODIFY => batch_modify_json(&mut tx[at..], &b.modify[..n]),
             CLASS_CANCEL => cancel_by_cloid_json(&mut tx[at..], &b.cancel[..n]),

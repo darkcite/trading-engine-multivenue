@@ -559,11 +559,12 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 38 known-answer vectors the official
+  the binary reproduces all 39 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
   from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify`,
   `reserveRequestWeight` (S7-L1) and the XH4c control actions
-  `updateLeverage`, `scheduleCancel`, `noop` — demanding the SDK's exact
+  `updateLeverage`, `scheduleCancel`, `noop`, plus XMM XH5d's order under
+  the ALO priority grouping `{"p": N}` — demanding the SDK's exact
   msgpack. **This is the half that covers LAW E-3 for orders.**
 - **Venue** (two signed POSTs): the venue verifies a good signature and
   rejects a corrupted one.
@@ -9927,6 +9928,69 @@ new) at 0 B; copy-audit 31, new 0; license OK (662); release OK; replay
 
 **Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
 zero-copy APPROVE (round 2).
+
+### XH5d-3a amendment (2026-10-04): the ALO priority on the wire — the order's bid, the `{"p": N}` grouping, the gateway batching by it
+
+The third part of XH5d, its first half (plan §3.4 item 2, `ab_mode` 2;
+A-S7-29: XH5d-3 in two — the wire, then the member's rule and its cap).
+Nothing is armed, and nothing bids a priority yet: no member sets one
+until XH5d-3b, which bounds the spend.
+
+- **The field.** `Order.alo_priority_1e8` (u32 at byte 44, the last of
+  `_pad1`: wire-additive — every capture written before reads as none):
+  p ×1e8 of the order's resting notional, 0 none.
+- **The arm.** An ALO place carries it in `HlCmd.arg`; a modify never
+  does (Hyperliquid's `batchModify` carries no grouping, A-S7-27), nor an
+  IoC. An order bidding more than 1 % (`HlCmd::PRIORITY_MAX_1E8`, the
+  xmm.toml parser's bound) is refused unsent.
+- **The arm's cap.** The HYPE a priority commits is bounded at the arm:
+  `set_priority_cap` (boot-only) arms a session cap, USD ×1e6; with none
+  armed — the default — a place bidding a priority is refused unsent
+  (`refused_local`). Each place's fee — p ×1e8 of its rounded resting
+  notional, rounded up — is tallied when it is sent, and a place past the
+  cap is refused unsent. XH5d-3b arms it for slot 6 under `ab_mode` 2.
+- **The gateway.** An action carries one grouping: the open ALO batch
+  keeps its priority, and a place bidding another — or none — posts every
+  open batch first, as a full batch does (the open order kept). The
+  batch's action is signed and rendered with `"grouping": {"p": N}` — a
+  one-key map in the msgpack, an object in the JSON — or `"na"` when it
+  bids none.
+- **The bytes** are pinned by a known-answer vector from
+  hyperliquid-python-sdk 0.24.0's `PriorityGrouping` (`order_alo_priority`,
+  p 10 000): the fixture holds 39 vectors, and the boot self-test rebuilds
+  the priority order too (nine encodings). `gen_vectors.py` builds every
+  order action through the SDK's own `grouping` parameter; the 38 earlier
+  rows regenerate byte-identical. The XH5e testnet step proves the venue
+  takes the grouping.
+- **What it costs.** The venue charges p ×1e8 of the resting notional at
+  placement from the undelegated HYPE balance — each place in a priority
+  batch on its own notional — outside the worth (USDC only) and outside
+  every cap the router keeps; the arm's cap is its bound. The engine reads
+  no HYPE balance: how the venue treats a priority place short of
+  undelegated HYPE is unproven (XH5e's testnet step and funding line) —
+  if it refuses them, they come back as ALO refusals and count toward
+  XH-7's reject-rate halt.
+- **Copies:** none new (the grouping is written in place by the existing
+  msgpack and JSON writers; the arm writes `arg` in place).
+
+**Tests:** the priority grouping's msgpack (a one-key map; the named form
+unchanged) and JSON (an object); the vector; the self-test (39 rows, nine
+encodings); the arm — an ALO place bids its priority, a modify none, over
+1 % refused unsent; unarmed, a priority place refused unsent; armed, the
+places within the cap sent and the one past it refused, a place bidding
+none unaffected; gate 98 — every third order bids priority, the arm armed
+(the fee tallied in the window); the gateway loopback — places batched by
+priority (two at one p, one at none, one at another: three posts, each its
+grouping); gate 96's ALO places bid priority (the grouping sealed in
+place, at rustls' count).
+
+**Gates:** clippy 0; nextest 4 193/4 193 (round 2; round 3's run: one
+debug-run alloc flake in untouched option-analytics, re-run ×8 clean);
+alloc 109 (+3 ignored) at 0 B; copy-audit 31, new 0; license OK (662);
+release OK; replay 7× IDENTICAL; rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2, confirmed round 3), allocation APPROVE
+(round 3), zero-copy APPROVE (round 3).
 
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 

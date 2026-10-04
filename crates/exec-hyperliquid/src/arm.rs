@@ -849,6 +849,11 @@ pub struct HlGatewayArm {
     topup_in_worth: bool,
     topup_owed: bool,
     topup_off: bool,
+    // XMM XH5d: the ALO priority's HYPE — the session's cap
+    // (`set_priority_cap`; 0, the default: no place bids one) and what the
+    // places sent committed, USD ×1e6.
+    priority_cap_1e6: u32,
+    priority_spent_1e6: u32,
 }
 
 // The arm's inline state, 1 792 B — what `new` moves into its owner (the
@@ -856,8 +861,29 @@ pub struct HlGatewayArm {
 // 64 B line; XH5b-2's kept flag, its keeper's handle (the anchor word itself
 // lives behind it) and `spot_failed` (17 B) fit that line's padding; XMM
 // XH5c-2's top-ups — the governor (40 B), the keeper's handle, the phase,
-// five words, five flags and three counters (118 B) — took two more lines.
+// five words, five flags and three counters (118 B) — took two more lines;
+// XMM XH5d-3a's priority cap and tally (two u32s, 8 B) fit their padding.
 const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_792);
+
+/// XMM XH5d: what a place bidding ALO priority `p` (×1e8 of resting
+/// notional; 0 none) commits — `sz` at `px` (wire units, ×1e8) — in USD
+/// ×1e6, rounded up; every step saturating, past `u32` saturated (no cap
+/// admits it); a non-positive notional, none.
+#[inline]
+const fn priority_fee_1e6(p: u32, px_1e8: i64, sz_1e8: i64) -> u32 {
+    let n = (p as i128)
+        .saturating_mul(px_1e8 as i128)
+        .saturating_mul(sz_1e8 as i128);
+    if n <= 0 {
+        return 0;
+    }
+    let fee = n.saturating_add(999_999_999_999_999_999) / 1_000_000_000_000_000_000;
+    if fee > u32::MAX as i128 {
+        u32::MAX
+    } else {
+        fee as u32
+    }
+}
 
 /// The router's retirement code (BX3's `RETIRED_*`) for an end the arm
 /// reports: a post-only cross, or an order in doubt that never landed,
@@ -1034,7 +1060,16 @@ impl HlGatewayArm {
             topup_in_worth: false,
             topup_owed: false,
             topup_off: false,
+            priority_cap_1e6: 0,
+            priority_spent_1e6: 0,
         })
+    }
+
+    /// XMM XH5d: arm the ALO priority — at most `usd_1e6` of HYPE committed
+    /// this session (boot-only; 0, the default, keeps every place bidding a
+    /// priority refused unsent).
+    pub fn set_priority_cap(&mut self, usd_1e6: u32) {
+        self.priority_cap_1e6 = usd_1e6;
     }
 
     /// What the arm has seen.
@@ -2983,6 +3018,9 @@ impl HlGatewayArm {
     /// built in `out`; `false` when it breaks a rule the venue would (LAW
     /// XH-4) or is a kind the arm does not speak.
     fn order_cmd(&self, o: &Order, p: usize, prev: u64, out: &mut HlCmd) -> bool {
+        if o.alo_priority_1e8 > HlCmd::PRIORITY_MAX_1E8 {
+            return false;
+        }
         let tif = match o.kind {
             ORDER_KIND_MAKER if o.is_post_only() => Tif::Alo,
             ORDER_KIND_IOC => Tif::Ioc,
@@ -3020,6 +3058,10 @@ impl HlGatewayArm {
         }
         if prev != 0 {
             out.set_replacing(prev);
+        } else if tif == Tif::Alo {
+            // XMM XH5d: an ALO place bids its priority (a modify's
+            // `batchModify` carries no grouping, A-S7-27).
+            out.arg = o.alo_priority_1e8;
         }
         true
     }
@@ -3094,12 +3136,23 @@ impl OrderDispatch for HlGatewayArm {
         if !self.order_cmd(order, p, 0, &mut c) {
             return self.refuse_local(DispatchError::Unroutable);
         }
+        // XMM XH5d: the HYPE a priority commits is outside the worth — the
+        // session's cap bounds it; with none armed no place bids one.
+        let fee = priority_fee_1e6(c.arg, c.px_1e8, c.sz_1e8);
+        if fee
+            > self
+                .priority_cap_1e6
+                .saturating_sub(self.priority_spent_1e6)
+        {
+            return self.refuse_local(DispatchError::Unroutable);
+        }
         // XH4f (D9): the order's TTL (LAW E-8), which the gateway keeps.
         c.time_ms = (order.ttl_ns / NS_PER_MS).min(TTL_MAX_MS);
         if !self.end.cmd.push(&c) {
             self.counters.ring_full += 1;
             return self.refuse(DispatchError::QueueFull);
         }
+        self.priority_spent_1e6 += fee;
         self.charge(1);
         self.track(&c, p, now);
         Ok(())
@@ -4275,6 +4328,49 @@ mod tests {
             [(8, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_NONE)]
         );
         assert_eq!(arm.counters().join_timeouts, 1);
+    }
+
+    /// XMM XH5d: an ALO place bids its order's priority in the command's
+    /// `arg` — none until the session's cap is armed, and none past it,
+    /// each refused unsent; a modify bids none (`batchModify` carries no
+    /// grouping); a priority over 1 % of resting notional is refused unsent.
+    #[test]
+    fn an_alo_place_bids_its_priority_within_the_cap_and_a_modify_none() {
+        let (mut arm, mut v, t) = booted();
+        let _ = rested(&mut arm, &mut v, t, 1);
+        let bid = quote(2, Side::Bid, 99_000_000, 500_000).with_alo_priority(10_000);
+        arm.modify(&ModifyReq::new(1, bid)).expect("modify");
+        assert_eq!(
+            v.take(CMD_MODIFY).expect("the modify").arg,
+            0,
+            "a modify bids none"
+        );
+        let ask =
+            |cid: u64, p: u32| quote(cid, Side::Ask, 100_123_456, 500_000).with_alo_priority(p);
+        let refused = arm.counters().refused_local;
+        assert!(arm.submit(&ask(7, 10_000)).is_err(), "unarmed: no priority");
+        assert!(v.take(CMD_PLACE).is_none(), "and never sent");
+        assert_eq!(arm.counters().refused_local, refused + 1);
+        // 1 bp of 0.5 at 100.13 commits $0.005007: two fit $0.015, a third
+        // does not.
+        arm.set_priority_cap(15_000);
+        arm.submit(&ask(8, 10_000)).expect("the first");
+        assert_eq!(v.take(CMD_PLACE).expect("the place").arg, 10_000);
+        arm.submit(&ask(9, 10_000)).expect("the second");
+        assert!(v.take(CMD_PLACE).is_some());
+        assert!(
+            arm.submit(&ask(10, 10_000)).is_err(),
+            "past the cap: refused"
+        );
+        assert!(v.take(CMD_PLACE).is_none(), "and never sent");
+        arm.submit(&ask(11, 0))
+            .expect("a place bidding none still goes");
+        assert_eq!(v.take(CMD_PLACE).expect("the place").arg, 0);
+        assert!(
+            arm.submit(&ask(12, 1_000_001)).is_err(),
+            "over 1 %: refused"
+        );
+        assert!(v.take(CMD_PLACE).is_none(), "and never sent");
     }
 
     #[test]

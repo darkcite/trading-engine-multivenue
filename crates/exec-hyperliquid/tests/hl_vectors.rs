@@ -26,8 +26,8 @@
 
 use exec_hyperliquid::action::{
     encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_noop, encode_order,
-    encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
-    CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
+    encode_order_grouped, encode_reserve_weight, encode_schedule_cancel, encode_update_leverage,
+    CancelByCloidWire, CancelWire, Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 use exec_hyperliquid::cloid::encode as mm_cloid_of;
 use exec_hyperliquid::sign::{connection_id, Network, Vault};
@@ -273,6 +273,16 @@ fn every_vector_reproduces_byte_for_byte() {
         b"normalTpsl",
     );
     seen.push("order_grouping_tpsl");
+    // XMM XH5d: the ALO priority grouping, `{"p": 10000}` (1 bp) — a map.
+    let mut buf = [0u8; MAX_ACTION];
+    let n = encode_order_grouped(
+        &mut buf,
+        &[OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo)],
+        Grouping::Priority(10_000),
+    )
+    .expect("encode");
+    check(&r, "order_alo_priority", &buf[..n]);
+    seen.push("order_alo_priority");
 
     // --- the two tail bytes of the action hash -----------------------
     for (name, vault, exp) in [

@@ -938,8 +938,13 @@ pub struct Order {
     /// Wire-additive: it was explicit zeroed padding, so every capture
     /// written before reads as none.
     pub ab_arm: u8,
-    /// Reserved.
-    _pad1: [u8; 4],
+    /// XMM XH5d: the ALO priority the order bids for its queue place — p
+    /// ×1e8 of its resting notional, charged at placement from the
+    /// undelegated HYPE balance (Hyperliquid's `{"p": N}` grouping); `0`
+    /// none. A post-only place's alone: a modify carries no grouping.
+    /// Wire-additive: it was explicit zeroed padding (the last of it), so
+    /// every capture written before reads as none.
+    pub alo_priority_1e8: u32,
     /// Time-to-live relative to `ts_ns`; 0 = none (I1, 2026-09-03 —
     /// docs/wire-format.md). A MODEL field: the offline fill law
     /// cancels the order at the first record of its sym at/after
@@ -1025,7 +1030,7 @@ impl Order {
             strategy_id: STRATEGY_ID_NONE,
             verb: ORDER_VERB_PLACE,
             ab_arm: 0,
-            _pad1: [0; 4],
+            alo_priority_1e8: 0,
             ttl_ns: 0,
             prev_client_oid: 0,
         }
@@ -1072,6 +1077,15 @@ impl Order {
     #[must_use]
     pub const fn with_ab_arm(mut self, arm: u8) -> Self {
         self.ab_arm = arm;
+        self
+    }
+
+    /// XMM XH5d: the same order, bidding ALO priority — p ×1e8 of its
+    /// resting notional (`0` none).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_alo_priority(mut self, p_1e8: u32) -> Self {
+        self.alo_priority_1e8 = p_1e8;
         self
     }
 
@@ -2004,11 +2018,11 @@ const _: () = {
     assert!(::core::mem::offset_of!(OrderEvent, kind) == 30);
     assert!(::core::mem::offset_of!(OrderEvent, reason) == 31);
     assert!(::core::mem::offset_of!(OrderEvent, _pad) == 32);
-    // XMM XH5d: the order's A/B arm and the fill's venue trade id, pinned
-    // with the doc's tables.
+    // XMM XH5d: the order's A/B arm and ALO priority and the fill's venue
+    // trade id, pinned with the doc's tables.
     assert!(::core::mem::offset_of!(Order, verb) == 42);
     assert!(::core::mem::offset_of!(Order, ab_arm) == 43);
-    assert!(::core::mem::offset_of!(Order, _pad1) == 44);
+    assert!(::core::mem::offset_of!(Order, alo_priority_1e8) == 44);
     assert!(::core::mem::offset_of!(Fill, order_id) == 32);
     assert!(::core::mem::offset_of!(Fill, tid) == 40);
     assert!(::core::mem::offset_of!(Fill, _pad1) == 48);
@@ -4784,8 +4798,8 @@ mod tests {
         //       XH5d: +tid, out of `_pad1`).
         // Order: 8+4+1+1+1+1+8+8+8+1+1+1+1+4+8+8 = 64 (M4.1:
         //        +strategy_id; E5: +verb, +prev_client_oid; XMM XH1:
-        //        +flags; XMM XH5d: +ab_arm — all out of the explicit
-        //        padding).
+        //        +flags; XMM XH5d: +ab_arm, +alo_priority_1e8 — all out of
+        //        the explicit padding, none left).
         // TradePrint: 8+8+8+8+8+4+1+1+18 = 64 (XMM XH1).
         // OrderEvent: 8+8+8+4+1+1+1+1+32 = 64 (XMM XH1).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);

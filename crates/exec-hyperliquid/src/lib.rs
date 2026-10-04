@@ -131,8 +131,8 @@ pub mod wire;
 pub mod wspost;
 
 pub use action::{
-    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order, CancelByCloidWire,
-    CancelWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
+    encode_batch_modify, encode_cancel, encode_cancel_by_cloid, encode_order, encode_order_grouped,
+    CancelByCloidWire, CancelWire, Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 pub use asset::{AssetError, AssetTable, ASSET_SLOTS};
 pub use budget::{AddressBudget, BudgetErr, INITIAL_BUFFER};
@@ -146,10 +146,12 @@ pub use http::{HlHttp, HttpErr, EXCHANGE_PATH, MAX_REQ_BODY, MAX_RESP_BUF};
 pub use lifecycle::{LifecycleReport, LifecycleSpec};
 pub use msgpack::{MsgPackErr, Writer};
 pub use nonce::{Nonce, NonceSource, NonceStreams, SharedNonce};
-pub use request::{batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json};
 pub use recon::{
-    drift, net_exposure_1e8, perp_state_request, scan_perp_state, scan_spot_state, spot_state_request,
-    PerpPosition, SpotBalance, MAX_SPOT_BALANCES, MAX_STATE_REQ,
+    drift, net_exposure_1e8, perp_state_request, scan_perp_state, scan_spot_state,
+    spot_state_request, PerpPosition, SpotBalance, MAX_SPOT_BALANCES, MAX_STATE_REQ,
+};
+pub use request::{
+    batch_modify_json, cancel_by_cloid_json, cancel_json, envelope, order_json, order_json_grouped,
 };
 pub use response::{scan, HlOk, HlResponse, ScanErr, Span};
 pub use selftest::{SelfTestErr, SelfTestReport};

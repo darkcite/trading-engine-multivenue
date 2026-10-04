@@ -93,7 +93,10 @@ pub struct HlCmd {
     /// Strategy slot: the cloid's third byte (LAW E-9).
     pub slot: u8,
     _pad: u8,
-    /// [`CMD_LEVERAGE`]: the leverage, a whole number.
+    /// [`CMD_LEVERAGE`]: the leverage, a whole number. [`CMD_RESERVE`]:
+    /// the weight bought (XMM XH5c). [`CMD_PLACE`] of an ALO order (XMM
+    /// XH5d): its ALO priority, p ×1e8 of resting notional (0 none) — the
+    /// gateway batches places by it; a modify carries none.
     pub arg: u32,
     /// [`CMD_SCHEDULE_CANCEL`]: the venue wall time to cancel at, ms; 0
     /// clears the schedule. [`CMD_READ_DAY`]: the first fill time read,
@@ -150,6 +153,20 @@ impl HlCmd {
             arg: 0,
             time_ms: 0,
         }
+    }
+
+    /// The highest ALO priority a place may bid, ×1e8 of resting notional:
+    /// 1 % (XMM XH5d — the xmm.toml parser's bound; the arm refuses more
+    /// unsent).
+    pub const PRIORITY_MAX_1E8: u32 = 1_000_000;
+
+    /// XMM XH5d: this ALO place bidding priority `p_1e8` (p ×1e8 of its
+    /// resting notional, carried in `arg`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_priority(mut self, p_1e8: u32) -> Self {
+        self.arg = p_1e8;
+        self
     }
 
     /// This order as a modify of the resting `prev_client_oid`.
