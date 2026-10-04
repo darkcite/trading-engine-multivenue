@@ -71,6 +71,9 @@ pub mod xmm_battery;
 pub mod xmm_boot;
 /// XMM XH4f: slot 6's live arm — the Hyperliquid gateway, booted (testnet).
 pub mod xmm_live;
+/// XMM XH5e: slot 6's preflight — its boot's checks on a flip's files, up to
+/// the boot's first network read (`multivenue-engine xmm-preflight`).
+pub mod xmm_preflight;
 /// HC11: the slot-7 member's boot (`hcv.toml` → `HcvParams`), its
 /// calendar reader thread and (HC11b) its book's file.
 pub mod hcv_boot;
@@ -81,14 +84,13 @@ pub use paper::{
     engine_loop_ev_full, engine_loop_ev_paper, engine_loop_rule_tree_full, engine_loop_set_full,
     extend_deribit_table_with_combos, extend_deribit_table_with_options,
     extend_okx_table_with_options, hyperevm_pool_table, join_reverse, log_hl_families,
-    new_capture_run_dir, open_fills_capture, open_orders_capture, parse_ai_hmac_key,
-    parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai, spawn_binance,
-    spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall, spawn_hyperevm,
-    spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc, split_host_port,
-    state_writer, AiIngressCounterIds,
-    AiIngressStatus, BinanceConnSpec, BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers,
-    EngineConfig, EngineCounters, EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds,
-    HypercallSpec, IngressCounterIds,
+    new_capture_run_dir, open_events_capture, open_fills_capture, open_orders_capture,
+    parse_ai_hmac_key, parse_raw_tap_flags, parse_stale_after_ms, signal_shutdown, spawn_ai,
+    spawn_binance, spawn_binance_multi, spawn_bybit, spawn_deribit, spawn_hypercall,
+    spawn_hyperevm, spawn_hyperliquid, spawn_mexc, spawn_okx, spawn_polymarket, spawn_rpc,
+    split_host_port, state_writer, AiIngressCounterIds, AiIngressStatus, BinanceConnSpec,
+    BybitConnSpec, CaptureGaugeIds, CaptureMetrics, Consumers, EngineConfig, EngineCounters,
+    EngineLoopResult, EngineLoopStats, ExecObs, HcMetricIds, HypercallSpec, IngressCounterIds,
     IngressStatusSet, LatencyDump, LiveDispatcher, LiveDispatcherErr, MexcConnSpec, Observability,
     RawTapConfig, Rings, StrategyPair, WssEndpoint, STRATEGY_SLOTS,
 };

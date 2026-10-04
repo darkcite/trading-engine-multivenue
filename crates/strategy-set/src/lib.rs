@@ -294,6 +294,10 @@ pub const MASK_TABLE: &[(&str, u8)] = &[
         "ai+vrp+xsd+bin15+hyparb+xmm",
         BIT_AI_EXEC | BIT_VM | BIT_VRP | BIT_XSD | BIT_BIN15 | BIT_HYPARB | BIT_XMM,
     ),
+    // XMM XH5e: the testnet engine-instance check's set — slot 3's member
+    // beside slot 6's, nothing else (the wrapper's allow-list keeps it out
+    // of the launchd engine).
+    ("bin15+xmm", BIT_BIN15 | BIT_XMM),
     // HC11 (2026-09-26, O-HC18): slot 7 is the hcv member — Hypercall
     // S1, DARK: paper only and in no configured mask. It boots only with
     // its artifact (`~/multivenue/hcv.toml`); the last name is the live
@@ -2201,6 +2205,7 @@ mod tests {
         assert_eq!(mask_for_name("xmm"), Some(BIT_XMM));
         assert_eq!(mask_for_name("xmm"), Some(64), "slot 6's bit is wire-stable across the swap");
         assert_eq!(mask_for_name("ai+xmm"), Some(112));
+        assert_eq!(mask_for_name("bin15+xmm"), Some(BIT_BIN15 | BIT_XMM));
         assert_eq!(mask_for_name("ai+vrp+xsd+bin15+hyparb+xmm"), Some(127));
         // HC11 (O-HC18): slot 7 is the hcv member.
         assert_eq!(mask_for_name("hcv"), Some(BIT_HCV));

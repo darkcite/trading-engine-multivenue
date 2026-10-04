@@ -71,9 +71,49 @@ pub const XMM_LIFETIME_MAX_MS: u32 = 30_000;
 pub const XMM_MIN_CLIP_USD_1E6: i64 = 10_000_000;
 
 /// The highest `ab_mode` (plan Appendix A: 0 off, 1 θ, 2 ALO priority,
-/// 3 size-only modify). The A/B arms are XH5's; until then every mode
-/// quotes as 0.
+/// 3 size-only modify). XMM XH5d: each quotes its arms in alternating
+/// blocks of the follower's venue time ([`XMM_AB_BLOCK_MS`]).
 pub const XMM_AB_MODE_MAX: u8 = 3;
+
+/// XMM XH5d: `alo_priority_1e8`'s bound, 1 % of resting notional (the
+/// xmm.toml parser's; the arm refuses more unsent).
+pub const XMM_ALO_PRIORITY_MAX_1E8: u32 = 1_000_000;
+
+/// XMM XH5d: Hyperliquid sorts ALO orders by priority within 400 ms (venue
+/// docs) — a level the follower's touch formed this recently is still in
+/// its sorting window, where a priority can buy the front of it.
+const XMM_PRIORITY_WINDOW_NS: u64 = 400 * MS;
+
+/// XMM XH5d: the HYPE a boot's priority bids may commit, USD ×1e6 ($25 —
+/// half the probe's funded HYPE): the member bids none past it. The HYPE is
+/// outside the worth.
+pub const XMM_PRIORITY_MAX_USD_1E6: u32 = 25_000_000;
+
+/// XMM XH5d: the arm's cap over the member's ($1): the arm reckons each
+/// fee on the price and size it sends — the member's own on the tick grid
+/// and in lots, so the two tallies agree; the room keeps any drift on the
+/// side where the member stops first.
+pub const XMM_PRIORITY_ARM_ROOM_USD_1E6: u32 = 1_000_000;
+
+/// XMM XH5d: priority places in a row the venue may refuse for no reason
+/// it names (where a priority it will not take — short of undelegated
+/// HYPE — lands) before the member bids none for the rest of the boot; a
+/// priority place that rests resets the run.
+const XMM_PRIORITY_REFUSALS_MAX: u8 = 3;
+
+/// XMM XH5d: one A/B block, ms of the follower's venue time — a block's
+/// arm is `(venue ms ÷ XMM_AB_BLOCK_MS) mod 2`: even A, odd B. Both arms
+/// see the same market mix; the arm is a function of time alone.
+pub const XMM_AB_BLOCK_MS: u64 = 600_000;
+
+/// An order's arm ([`Order::ab_arm`]): none (`ab_mode` 0).
+const ARM_NONE: u8 = 0;
+/// Arm A: the artifact's θ, no size-only modify.
+const ARM_A: u8 = 1;
+/// Arm B: `ab_mode` 1 — half the artifact's θ; `ab_mode` 2 — the ALO
+/// priority on fresh places at a level just formed; `ab_mode` 3 — one
+/// size-only modify.
+const ARM_B: u8 = 2;
 
 /// The safety timer's period: the stale-feed pulls must fire when the
 /// feeds themselves have gone quiet, and a stuck side is released.
@@ -266,6 +306,9 @@ impl XmmParams {
         if self.ab_mode > XMM_AB_MODE_MAX {
             return Err("xmm: ab_mode must be 0..=3");
         }
+        if self.alo_priority_1e8 > XMM_ALO_PRIORITY_MAX_1E8 {
+            return Err("xmm: alo_priority_1e8 must be at most 1 % (1 000 000)");
+        }
         if self.theta_bps_1e6 <= 0 {
             return Err("xmm: theta_bps_1e6 must be positive");
         }
@@ -321,6 +364,13 @@ struct Quote {
     /// The TTL instant (placement + lifetime; a modify inherits it).
     expiry_ns: u64,
     state: u8,
+    /// XMM XH5d: the A/B arm its price was decided in (`ARM_*`).
+    arm: u8,
+    /// XMM XH5d, `ab_mode` 3: the size-only modify's step — 0 none yet,
+    /// 1 the lot down sent, 2 the lot back sent or no more.
+    szmod: u8,
+    /// XMM XH5d, `ab_mode` 2: 1 while the live order bids ALO priority.
+    prio: u8,
 }
 
 const _: () = assert!(::core::mem::size_of::<Quote>() == 64);
@@ -334,6 +384,9 @@ const IDLE_QUOTE: Quote = Quote {
     since_ns: 0,
     expiry_ns: 0,
     state: ST_IDLE,
+    arm: ARM_NONE,
+    szmod: 0,
+    prio: 0,
 };
 
 /// One quoted perp's market state and its two quotes.
@@ -353,10 +406,17 @@ struct Inst {
     /// The last follower / leader update carried `TICK_FLAG_STALE`.
     f_stale: bool,
     l_stale: bool,
+    /// XMM XH5d: the follower's last venue time, ms (its bbo `time`; 0 =
+    /// none yet) — the A/B block's clock.
+    f_vt_ms: u64,
+    /// XMM XH5d: when each side's touch last formed — its price moved — by
+    /// local receipt (0 = not since the book was first seen): the ALO
+    /// priority's window. Its own line: `Inst` grows to 256 B.
+    f_formed_ns: [u64; 2],
     quotes: [Quote; 2],
 }
 
-const _: () = assert!(::core::mem::size_of::<Inst>() == 192);
+const _: () = assert!(::core::mem::size_of::<Inst>() == 256);
 
 const EMPTY_INST: Inst = Inst {
     f_bid: 0,
@@ -367,8 +427,30 @@ const EMPTY_INST: Inst = Inst {
     pos_1e6: 0,
     f_stale: false,
     l_stale: false,
+    f_vt_ms: 0,
+    f_formed_ns: [0; 2],
     quotes: [IDLE_QUOTE; 2],
 };
+
+/// XMM XH5d: what a place bidding ALO priority `p` (×1e8 of resting
+/// notional) commits — `qty` at `px` (×1e6) — in USD ×1e6, rounded up: the
+/// arm's own reckoning (its wire units are these ×100), so the member's
+/// tally is the arm's; every step saturating, past `u32` saturated.
+#[inline]
+const fn priority_fee_1e6(p: u32, px_1e6: i64, qty_1e6: i64) -> u32 {
+    let n = (p as i128)
+        .saturating_mul(px_1e6 as i128)
+        .saturating_mul(qty_1e6 as i128);
+    if n <= 0 {
+        return 0;
+    }
+    let fee = n.saturating_add(99_999_999_999_999) / 100_000_000_000_000;
+    if fee > u32::MAX as i128 {
+        u32::MAX
+    } else {
+        fee as u32
+    }
+}
 
 /// `(local receipt ns, bid + ask ×1e6)`.
 #[derive(Clone, Copy, Debug)]
@@ -472,6 +554,9 @@ pub struct XmmStrategy {
     /// `exp(−θ) × FP` and `exp(+θ) × FP`.
     m_dn: i128,
     m_up: i128,
+    /// XMM XH5d: arm B's under `ab_mode` 1 — `exp(∓θ/2) × FP`.
+    m_dn_b: i128,
+    m_up_b: i128,
     lifetime_ns: u64,
     gate_ns: u64,
     requote_min_ns: u64,
@@ -484,6 +569,10 @@ pub struct XmmStrategy {
     /// XH3: the label the set stamps (`regime.toml [labels.xmm]`),
     /// carried and never consulted — see [`Strategy::on_regime`] below.
     regime_label: core_types::RegimeLabelSet,
+    /// XMM XH5d: priority places refused in a row (`priority_refused`), and
+    /// the latch they set — no priority for the rest of the boot.
+    prio_streak: u8,
+    prio_off: bool,
 }
 
 impl Default for XmmStrategy {
@@ -504,6 +593,8 @@ impl XmmStrategy {
             rings: None,
             m_dn: FP,
             m_up: FP,
+            m_dn_b: FP,
+            m_up_b: FP,
             lifetime_ns: 0,
             gate_ns: 0,
             requote_min_ns: 0,
@@ -534,8 +625,13 @@ impl XmmStrategy {
                 congestion_cancels: 0,
                 health_held: 0,
                 busy_deferred: 0,
+                priority_places: 0,
+                priority_fee_usd_1e6: 0,
+                priority_refused: 0,
             },
             regime_label: core_types::RegimeLabelSet::ANY,
+            prio_streak: 0,
+            prio_off: false,
         }
     }
 
@@ -549,6 +645,9 @@ impl XmmStrategy {
         let th = params.theta_bps_1e6 as f64 * 1e-10;
         self.m_dn = ((-th).exp() * 1e12).round() as i128;
         self.m_up = (th.exp() * 1e12).round() as i128;
+        // XMM XH5d: arm B's half θ (`ab_mode` 1).
+        self.m_dn_b = ((-th / 2.0).exp() * 1e12).round() as i128;
+        self.m_up_b = ((th / 2.0).exp() * 1e12).round() as i128;
         self.params = *params;
         self.lifetime_ns = u64::from(params.lifetime_ms) * MS;
         self.gate_ns = u64::from(params.gate_window_ms) * MS;
@@ -662,13 +761,40 @@ impl XmmStrategy {
         if l_back <= 0 || f_back <= 0 || f_now <= 0 || i.l_sum <= 0 {
             return false;
         }
-        // gap = ln(L/L_back) − ln(F/F_back); compare exp(gap) to exp(∓θ).
+        // gap = ln(L/L_back) − ln(F/F_back); compare exp(gap) to exp(∓θ) —
+        // the block's arm's θ (XMM XH5d).
+        let (m_dn, m_up) = self.mults(self.arm_now(k));
         let lhs = i.l_sum as i128 * f_back as i128 * FP;
         let base = l_back as i128 * f_now as i128;
         if s == BID {
-            lhs <= base * self.m_dn
+            lhs <= base * m_dn
         } else {
-            lhs >= base * self.m_up
+            lhs >= base * m_up
+        }
+    }
+
+    /// XMM XH5d: perp `k`'s A/B arm now — none under `ab_mode` 0, else the
+    /// follower's venue time's block: even A, odd B (no venue time yet: A).
+    #[inline]
+    fn arm_now(&self, k: usize) -> u8 {
+        if self.params.ab_mode == 0 {
+            return ARM_NONE;
+        }
+        if (self.inst[k].f_vt_ms / XMM_AB_BLOCK_MS) % 2 == 1 {
+            ARM_B
+        } else {
+            ARM_A
+        }
+    }
+
+    /// The θ multipliers an arm decides with: arm B's are θ/2's under
+    /// `ab_mode` 1 (XMM XH5d); every other arm and mode, the artifact's.
+    #[inline]
+    fn mults(&self, arm: u8) -> (i128, i128) {
+        if self.params.ab_mode == 1 && arm == ARM_B {
+            (self.m_dn_b, self.m_up_b)
+        } else {
+            (self.m_dn, self.m_up)
         }
     }
 
@@ -747,9 +873,11 @@ impl XmmStrategy {
             && resting + add <= self.params.resting_cap_usd_1e6 as i128
     }
 
-    /// The post-only order for side `s` of perp `k`.
+    /// The post-only order for side `s` of perp `k`, tagged with the A/B
+    /// arm it was decided in (XMM XH5d: the measurement's split).
     #[inline]
-    fn order(&self, k: usize, s: usize, px: i64, qty: i64, oid: u64, now: NsTs) -> Order {
+    #[allow(clippy::too_many_arguments)]
+    fn order(&self, k: usize, s: usize, px: i64, qty: i64, oid: u64, now: NsTs, arm: u8) -> Order {
         Order::new(
             now,
             VenueId::Hyperliquid,
@@ -762,6 +890,7 @@ impl XmmStrategy {
         )
         .with_ttl_ns(self.lifetime_ns)
         .with_post_only()
+        .with_ab_arm(arm)
     }
 
     /// The touch on side `s` of perp `k` and the leader's `bid + ask`.
@@ -796,10 +925,18 @@ impl XmmStrategy {
             return;
         }
         let oid = self.next_oid();
-        let o = self.order(k, s, px, qty, oid, now);
+        let arm = self.arm_now(k);
+        let (p, fee) = self.priority(k, s, arm, px, qty, now);
+        let o = self
+            .order(k, s, px, qty, oid, now, arm)
+            .with_alo_priority(p);
         if ctx.submit(o).is_err() {
             self.counters.ctx_refused += 1;
             return;
+        }
+        if p != 0 {
+            self.counters.priority_places += 1;
+            self.counters.priority_fee_usd_1e6 += u64::from(fee);
         }
         let expiry = now.saturating_add(self.lifetime_ns);
         let q = &mut self.inst[k].quotes[s];
@@ -810,12 +947,112 @@ impl XmmStrategy {
         q.since_ns = now;
         q.expiry_ns = expiry;
         q.state = ST_PENDING;
+        q.arm = arm;
+        q.szmod = 0;
+        q.prio = u8::from(p != 0);
         self.counters.placed += 1;
         self.orders_emitted += 1;
     }
 
-    /// Rule 2: the touch left our resting price. XH4f (D8): a busy arm
-    /// (`h`) waits four floors between requotes.
+    /// XMM XH5d, `ab_mode` 2: the ALO priority a fresh place bids, and its
+    /// fee — the artifact's `alo_priority_1e8` when the place's price was
+    /// decided in arm B at a level the follower's touch formed within the
+    /// venue's 400 ms sorting window, while the boot's tally stays within
+    /// [`XMM_PRIORITY_MAX_USD_1E6`]; else none. A requote is a modify and
+    /// bids none (A-S7-27).
+    #[inline]
+    fn priority(&self, k: usize, s: usize, arm: u8, px: i64, qty: i64, now: NsTs) -> (u32, u32) {
+        let p = self.params.alo_priority_1e8;
+        if self.params.ab_mode != 2 || arm != ARM_B || p == 0 || self.prio_off {
+            return (0, 0);
+        }
+        let formed = self.inst[k].f_formed_ns[s];
+        if formed == 0 || now.saturating_sub(formed) >= XMM_PRIORITY_WINDOW_NS {
+            return (0, 0);
+        }
+        let fee = priority_fee_1e6(p, px, qty);
+        let room =
+            u64::from(XMM_PRIORITY_MAX_USD_1E6).saturating_sub(self.counters.priority_fee_usd_1e6);
+        if u64::from(fee) > room {
+            return (0, 0);
+        }
+        (p, fee)
+    }
+
+    /// XMM XH5d, `ab_mode` 3: a quote decided in arm B and resting at the
+    /// touch takes one size-only modify — a lot down, then, once that
+    /// rests, a lot back. Off under the parity switch (`sim_parity` 1: a
+    /// requote there is a cancel and a fresh order, never a modify).
+    #[inline]
+    fn size_mod_due(&self, k: usize, s: usize) -> bool {
+        let q = &self.inst[k].quotes[s];
+        self.params.ab_mode == 3 && self.params.sim_parity == 0 && q.arm == ARM_B && q.szmod < 2
+    }
+
+    /// The size-only modify (`ab_mode` 3, arm B): the same price, one lot
+    /// down — or back — through the modify path (a fresh id; the TTL
+    /// inherited, LAW E-7), paced as a requote ([`Self::paced`]). A size the
+    /// venue would refuse (under a lot or its $10 minimum), one the caps
+    /// would not take — either step: a modify sets the replacement's whole
+    /// size, whatever of the original filled — or a refused modify ends the
+    /// step.
+    fn size_modify<C: Ctx>(&mut self, k: usize, s: usize, now: NsTs, h: ExecHealth, ctx: &mut C) {
+        let (px, qty, prev, step, arm, since) = {
+            let q = &self.inst[k].quotes[s];
+            (q.px_1e6, q.qty_1e6, q.oid, q.szmod, q.arm, q.since_ns)
+        };
+        if !self.paced(since, now, h) {
+            return;
+        }
+        let lot = self.params.perps[k].lot_1e6;
+        let next = if step == 0 { qty - lot } else { qty + lot };
+        if next < lot
+            || i128::from(px) * i128::from(next) < i128::from(XMM_MIN_CLIP_USD_1E6) * 1_000_000
+            || !self.caps_allow(k, s, next, px)
+        {
+            self.inst[k].quotes[s].szmod = 2;
+            return;
+        }
+        let oid = self.next_oid();
+        let o = self.order(k, s, px, next, oid, now, arm);
+        if let Err(e) = ctx.modify(prev, o) {
+            if !matches!(e, SubmitErr::NoSuchOrder) {
+                self.counters.ctx_refused += 1;
+            }
+            self.inst[k].quotes[s].szmod = 2;
+            return;
+        }
+        let q = &mut self.inst[k].quotes[s];
+        q.old_oid = prev;
+        q.oid = oid;
+        q.qty_1e6 = next;
+        q.since_ns = now;
+        // `expiry_ns` is inherited (LAW E-7).
+        q.state = ST_PENDING;
+        q.szmod = step + 1;
+        self.counters.modifies += 1;
+        self.orders_emitted += 1;
+    }
+
+    /// A modify's pace (budget control): no sooner than `requote_min` after
+    /// the quote's last change; XH4f (D8): a busy arm (`h`) waits four
+    /// floors. `false`: not yet (a busy wait counted).
+    #[inline]
+    fn paced(&mut self, since: NsTs, now: NsTs, h: ExecHealth) -> bool {
+        let age = now.saturating_sub(since);
+        if age < self.requote_min_ns {
+            return false;
+        }
+        if h.congestion == EXEC_CONGESTION_BUSY
+            && age < self.requote_min_ns.saturating_mul(BUSY_REQUOTE_FACTOR)
+        {
+            self.counters.busy_deferred += 1;
+            return false;
+        }
+        true
+    }
+
+    /// Rule 2: the touch left our resting price, paced ([`Self::paced`]).
     fn requote<C: Ctx>(&mut self, k: usize, s: usize, now: NsTs, h: ExecHealth, ctx: &mut C) {
         if self.params.sim_parity == 1 {
             self.cancel(k, s, now, WHY_REQUOTE, ctx);
@@ -825,14 +1062,7 @@ impl XmmStrategy {
             let q = &self.inst[k].quotes[s];
             (q.since_ns, q.oid)
         };
-        let age = now.saturating_sub(since);
-        if age < self.requote_min_ns {
-            return;
-        }
-        if h.congestion == EXEC_CONGESTION_BUSY
-            && age < self.requote_min_ns.saturating_mul(BUSY_REQUOTE_FACTOR)
-        {
-            self.counters.busy_deferred += 1;
+        if !self.paced(since, now, h) {
             return;
         }
         let (px, l_sum) = self.touch_and_lead(k, s);
@@ -845,7 +1075,8 @@ impl XmmStrategy {
             return;
         }
         let oid = self.next_oid();
-        let o = self.order(k, s, px, qty, oid, now);
+        let arm = self.arm_now(k);
+        let o = self.order(k, s, px, qty, oid, now, arm);
         if let Err(e) = ctx.modify(prev, o) {
             // Nothing was replaced. The order already gone (its final
             // event on its way) is a race, exactly as `cancel` treats it;
@@ -867,6 +1098,14 @@ impl XmmStrategy {
         q.since_ns = now;
         // `expiry_ns` is inherited (LAW E-7).
         q.state = ST_PENDING;
+        // A new price is a new decision: its arm now, and a size-only
+        // modify half done is done (the size is the clip's again).
+        q.arm = arm;
+        if q.szmod == 1 {
+            q.szmod = 2;
+        }
+        // The replacement bids no priority (a modify carries none).
+        q.prio = 0;
         self.counters.modifies += 1;
         self.orders_emitted += 1;
     }
@@ -945,11 +1184,31 @@ impl XmmStrategy {
         let fresh = !t.is_stale();
         {
             let i = &mut self.inst[k];
+            // A gap: the last update was stale, or none came for longer than
+            // the member calls the follower stale (a reconnect's first ticks
+            // come back fresh).
+            let after_gap =
+                i.f_stale || (i.f_rx_ns != 0 && now.saturating_sub(i.f_rx_ns) > self.fol_stale_ns);
             i.f_rx_ns = now;
             i.f_stale = !fresh;
             if fresh && bid > 0 && ask > 0 {
+                // XMM XH5d: a side's touch formed now when it improved — a
+                // new level in front, whose queue the priority sorts; a
+                // retreat lands on a queue already there. The book's first
+                // sight, and the first fresh tick after a stale one (when
+                // the level formed is unknown), form none.
+                if !after_gap && i.f_bid != 0 && bid > i.f_bid {
+                    i.f_formed_ns[BID] = now;
+                }
+                if !after_gap && i.f_ask != 0 && ask < i.f_ask {
+                    i.f_formed_ns[ASK] = now;
+                }
                 i.f_bid = bid;
                 i.f_ask = ask;
+            }
+            // XMM XH5d: the A/B block's clock — a fresh tick's venue time.
+            if fresh && t.venue_time_ms != 0 {
+                i.f_vt_ms = t.venue_time_ms;
             }
         }
         if fresh && bid > 0 && ask > 0 {
@@ -986,6 +1245,7 @@ impl XmmStrategy {
             match state {
                 ST_IDLE => self.try_place(k, s, now, ctx),
                 ST_RESTING if px != touch => self.requote(k, s, now, h, ctx),
+                ST_RESTING if self.size_mod_due(k, s) => self.size_modify(k, s, now, h, ctx),
                 _ => {}
             }
             s += 1;
@@ -1025,15 +1285,17 @@ impl XmmStrategy {
         let x = sum as i128 * FP;
         let mut s = 0usize;
         while s < 2 {
-            let (state, l_ref) = {
+            let (state, l_ref, arm) = {
                 let q = &self.inst[k].quotes[s];
-                (q.state, q.l_ref)
+                (q.state, q.l_ref, q.arm)
             };
             if state == ST_PENDING || state == ST_RESTING {
+                // The arm its price was decided in (XMM XH5d).
+                let (m_dn, m_up) = self.mults(arm);
                 let hit = if s == BID {
-                    x < l_ref as i128 * self.m_dn
+                    x < l_ref as i128 * m_dn
                 } else {
-                    x > l_ref as i128 * self.m_up
+                    x > l_ref as i128 * m_up
                 };
                 if hit {
                     self.cancel(k, s, now, WHY_LEAD, ctx);
@@ -1088,9 +1350,10 @@ impl StrategyCounters for XmmStrategy {
     }
 
     fn xmm_counters(&self, out: &mut XmmCounters) {
-        // COPY: 136 B (`XmmCounters`, pinned 17 × 8) into the caller's own
-        // field — the 1 s `/state` publish and the 5 s mirror; the snapshot
-        // must own its counters (nothing is borrowed across the seqlock).
+        // COPY: 200 B (`XmmCounters`, pinned 25 × 8 in strategy-core) into
+        // the caller's own field — the 1 s `/state` publish and the 5 s
+        // mirror; the snapshot must own its counters (nothing is borrowed
+        // across the seqlock).
         *out = self.counters;
     }
 
@@ -1205,6 +1468,11 @@ impl Strategy for XmmStrategy {
                 if q.state == ST_PENDING {
                     q.state = ST_RESTING;
                 }
+                // XMM XH5d: a priority place the venue took ends a run of
+                // refusals.
+                if q.prio == 1 {
+                    self.prio_streak = 0;
+                }
             }
             ORDER_EVENT_REJECTED | ORDER_EVENT_CANCELED | ORDER_EVENT_FILLED => {
                 if e.kind == ORDER_EVENT_REJECTED {
@@ -1212,6 +1480,19 @@ impl Strategy for XmmStrategy {
                         self.counters.rejected_alo += 1;
                     } else {
                         self.counters.rejected_other += 1;
+                    }
+                    // XMM XH5d: a priority place the venue refused for no
+                    // reason it names — where a priority it will not take
+                    // lands; [`XMM_PRIORITY_REFUSALS_MAX`] in a row end the
+                    // priority for the boot.
+                    if e.reason == core_types::ORDER_EVENT_REASON_OTHER
+                        && self.inst[k].quotes[s].prio == 1
+                    {
+                        self.counters.priority_refused += 1;
+                        self.prio_streak = self.prio_streak.saturating_add(1);
+                        if self.prio_streak >= XMM_PRIORITY_REFUSALS_MAX {
+                            self.prio_off = true;
+                        }
                     }
                 } else if e.kind == ORDER_EVENT_CANCELED {
                     self.counters.canceled += 1;
@@ -1462,7 +1743,7 @@ mod tests {
     #[test]
     fn validate_refuses_each_broken_invariant() {
         type Breaker = fn(&mut XmmParams);
-        let cases: [(Breaker, &str); 23] = [
+        let cases: [(Breaker, &str); 24] = [
             (|p| p.n_perps = 0, "n_perps 0"),
             (|p| p.n_perps = 9, "n_perps 9"),
             (|p| p.perps[1].hl_sym = SYMBOL_ID_NONE, "no follower"),
@@ -1485,7 +1766,14 @@ mod tests {
             (|p| p.resting_cap_usd_1e6 = 1, "resting under a clip"),
             (|p| p.skew_kappa_1e6 = 1, "skew before XH7"),
             (|p| p.sim_parity = 2, "sim_parity 2"),
-            (|p| p.quote_from_ns = 5, "a quote window without the parity switch"),
+            (
+                |p| p.alo_priority_1e8 = 1_000_001,
+                "alo_priority_1e8 over 1 %",
+            ),
+            (
+                |p| p.quote_from_ns = 5,
+                "a quote window without the parity switch",
+            ),
         ];
         let mut i = 0usize;
         while i < cases.len() {
@@ -1585,6 +1873,303 @@ mod tests {
         s.on_order_event(&event(new.client_oid, ORDER_EVENT_RESTING, 0), &mut c);
         assert_eq!(s.quote_states(0).0, ST_RESTING);
         assert_eq!(s.counters().canceled, 0, "a replaced order is not a cancelled quote");
+    }
+
+    /// XMM XH5d (`ab_mode` 1): the block is the follower's venue time —
+    /// (ms ÷ 600 000) mod 2, even A, odd B (none yet: A), every order
+    /// tagged with it; arm B decides on half the artifact's θ; `ab_mode` 0
+    /// tags none.
+    #[test]
+    fn the_ab_block_is_the_follower_s_venue_time_and_arm_b_halves_theta() {
+        let mut p = valid();
+        p.ab_mode = 1;
+        let (mut s, mut c) = started(&p);
+        assert_eq!(s.arm_now(0), ARM_A, "no venue time yet");
+        let mut t = tick(HL, BID_PX, ASK_PX);
+        t.venue_time_ms = XMM_AB_BLOCK_MS - 1;
+        s.on_tick(&t, &mut c);
+        assert_eq!((s.arm_now(0), c.placed[0].ab_arm), (ARM_A, ARM_A));
+        s.inst[0].f_vt_ms = XMM_AB_BLOCK_MS;
+        assert_eq!(s.arm_now(0), ARM_B);
+        s.inst[0].f_vt_ms = 2 * XMM_AB_BLOCK_MS;
+        assert_eq!(s.arm_now(0), ARM_A);
+        let (dn_a, up_a) = s.mults(ARM_A);
+        let (dn_b, up_b) = s.mults(ARM_B);
+        assert!(dn_a < dn_b && dn_b < FP && FP < up_b && up_b < up_a);
+        // Half θ in log space: exp(−θ/2)² = exp(−θ).
+        assert!((dn_b * dn_b / FP - dn_a).abs() <= 2, "{dn_a} {dn_b}");
+        let (s0, _) = started(&valid());
+        assert_eq!(
+            (s0.arm_now(0), s0.mults(ARM_B)),
+            (ARM_NONE, (s0.m_dn, s0.m_up))
+        );
+    }
+
+    /// XMM XH5d (`ab_mode` 1): a bid decided in arm B cancels on a leader
+    /// drop between θ/2 and θ (0.3 bps of 0.5); one decided in arm A does
+    /// not.
+    #[test]
+    fn arm_b_s_lead_cancel_is_half_theta() {
+        let mut p = valid();
+        p.ab_mode = 1;
+        let mut i = 0usize;
+        while i < 2 {
+            let (mut s, mut c) = started(&p);
+            let mut t = tick(HL, BID_PX, ASK_PX);
+            t.venue_time_ms = if i == 0 { XMM_AB_BLOCK_MS } else { 0 };
+            s.on_tick(&t, &mut c);
+            let bid = c.placed[0];
+            assert_eq!(bid.ab_arm, if i == 0 { ARM_B } else { ARM_A });
+            // The leader's bid + ask from 200 000 000 to 199 994 000: −0.3 bps.
+            c.now += MS;
+            s.on_tick(&tick(BN, 99_987_000, 100_007_000), &mut c);
+            let canceled = c.cancels.iter().any(|r| r.client_oid == bid.client_oid);
+            assert_eq!(canceled, i == 0, "arm B cancels, arm A rests");
+            i += 1;
+        }
+    }
+
+    /// XMM XH5d (`ab_mode` 3): a quote decided in arm B and resting at the
+    /// touch is modified one lot down, then — once that rests — one lot
+    /// back, and no more, each a floor (`requote_min`) after the last
+    /// change; one decided in arm A is left as it is; under the parity
+    /// switch, none.
+    #[test]
+    fn arm_b_takes_one_size_only_modify_down_then_back() {
+        let mut p = valid();
+        p.ab_mode = 3;
+        let (mut s, mut c) = started(&p);
+        let lead = tick(BN, 99_990_000, 100_010_000);
+        let mut t = tick(HL, BID_PX, ASK_PX);
+        t.venue_time_ms = XMM_AB_BLOCK_MS;
+        s.on_tick(&t, &mut c);
+        let bid = c.placed[0];
+        assert_eq!(bid.ab_arm, ARM_B);
+        s.on_order_event(&event(bid.client_oid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.now += 100 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&t, &mut c);
+        assert!(c.modifies.is_empty(), "not before the floor");
+        c.now += 200 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&t, &mut c);
+        assert_eq!(c.modifies.len(), 1, "the bid, a lot down");
+        let (prev, down) = c.modifies[0];
+        assert_eq!(
+            (prev, down.px.raw(), down.qty.raw(), down.ab_arm),
+            (bid.client_oid, BID_PX, bid.qty.raw() - 10_000, ARM_B)
+        );
+        s.on_order_event(&event(down.client_oid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.now += 300 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&t, &mut c);
+        assert_eq!(c.modifies.len(), 2, "and back");
+        let (prev, back) = c.modifies[1];
+        assert_eq!(
+            (prev, back.px.raw(), back.qty.raw()),
+            (down.client_oid, BID_PX, bid.qty.raw())
+        );
+        s.on_order_event(&event(back.client_oid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.now += 300 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&t, &mut c);
+        assert_eq!(c.modifies.len(), 2, "once");
+        assert_eq!(
+            StrategyCounters::orders_emitted(&s),
+            4,
+            "two placements and two modifies emitted"
+        );
+        // Arm A: none.
+        let (mut s, mut c) = started(&p);
+        let mut t = tick(HL, BID_PX, ASK_PX);
+        t.venue_time_ms = 2 * XMM_AB_BLOCK_MS;
+        s.on_tick(&t, &mut c);
+        let bid = c.placed[0];
+        assert_eq!(bid.ab_arm, ARM_A);
+        s.on_order_event(&event(bid.client_oid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.now += 300 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&t, &mut c);
+        assert!(c.modifies.is_empty());
+        // The parity switch: none (its requotes are cancels and fresh orders).
+        p.sim_parity = 1;
+        let (mut s, mut c) = started(&p);
+        let mut t = tick(HL, BID_PX, ASK_PX);
+        t.venue_time_ms = XMM_AB_BLOCK_MS;
+        s.on_tick(&t, &mut c);
+        let bid = c.placed[0];
+        assert_eq!(bid.ab_arm, ARM_B);
+        s.on_order_event(&event(bid.client_oid, ORDER_EVENT_RESTING, 0), &mut c);
+        c.now += 300 * MS;
+        s.on_tick(&lead, &mut c);
+        s.on_tick(&t, &mut c);
+        assert!(
+            c.modifies.is_empty(),
+            "no size-only modify under the parity switch"
+        );
+    }
+
+    /// XMM XH5d (`ab_mode` 2): a fresh place decided in arm B at a level
+    /// the follower's touch formed within 400 ms bids the artifact's
+    /// priority and tallies its fee; the book's first sight, a level formed
+    /// earlier, arm A, another mode and a place past the boot's cap bid
+    /// none.
+    #[test]
+    fn arm_b_bids_priority_at_a_level_formed_within_400_ms() {
+        let mut p = valid();
+        p.ab_mode = 2;
+        p.alo_priority_1e8 = 10_000;
+        let mut t = tick(HL, BID_PX, ASK_PX);
+        t.venue_time_ms = XMM_AB_BLOCK_MS;
+        // The book's first sight forms no level; a moved touch forms its
+        // side's, by local receipt.
+        let (mut s, mut c) = started(&p);
+        s.on_tick(&t, &mut c);
+        assert_eq!(s.inst[0].f_formed_ns, [0, 0]);
+        assert_eq!(
+            (c.placed[0].ab_arm, c.placed[0].alo_priority_1e8),
+            (ARM_B, 0)
+        );
+        let mut dn = tick(HL, BID_PX - 10_000, ASK_PX);
+        dn.venue_time_ms = XMM_AB_BLOCK_MS;
+        c.now += MS;
+        s.on_tick(&dn, &mut c);
+        assert_eq!(s.inst[0].f_formed_ns, [0, 0], "a retreat forms none");
+        let mut ask_in = tick(HL, BID_PX - 10_000, ASK_PX - 5_000);
+        ask_in.venue_time_ms = XMM_AB_BLOCK_MS;
+        c.now += MS;
+        s.on_tick(&ask_in, &mut c);
+        assert_eq!(s.inst[0].f_formed_ns, [0, c.now], "the ask improved");
+        // After a stale tick, the first fresh one forms none.
+        let mut stale = ask_in;
+        stale.flags |= core_types::TICK_FLAG_STALE;
+        c.now += MS;
+        s.on_tick(&stale, &mut c);
+        let mut bid_up = tick(HL, BID_PX, ASK_PX - 5_000);
+        bid_up.venue_time_ms = XMM_AB_BLOCK_MS;
+        let at = c.now;
+        c.now += MS;
+        s.on_tick(&bid_up, &mut c);
+        assert_eq!(s.inst[0].f_formed_ns, [0, at - MS], "nothing after a gap");
+        // Arm B: the bid's level formed 100 ms ago, the ask's 500 ms ago —
+        // the bid bids 1 bp and tallies its fee, the ask none.
+        let (mut s, mut c) = started(&p);
+        s.inst[0].f_formed_ns = [c.now - 100 * MS, c.now - 500 * MS];
+        s.on_tick(&t, &mut c);
+        let (bid, ask) = (c.placed[0], c.placed[1]);
+        assert_eq!((bid.alo_priority_1e8, ask.alo_priority_1e8), (10_000, 0));
+        let fee = priority_fee_1e6(10_000, bid.px.raw(), bid.qty.raw());
+        assert!(fee > 0);
+        assert_eq!(
+            (
+                s.counters().priority_places,
+                s.counters().priority_fee_usd_1e6
+            ),
+            (1, u64::from(fee))
+        );
+        // Arm A: none.
+        let (mut s, mut c) = started(&p);
+        s.inst[0].f_formed_ns = [c.now - 100 * MS, c.now - 100 * MS];
+        let mut a = t;
+        a.venue_time_ms = 2 * XMM_AB_BLOCK_MS;
+        s.on_tick(&a, &mut c);
+        assert_eq!(
+            (c.placed[0].ab_arm, c.placed[0].alo_priority_1e8),
+            (ARM_A, 0)
+        );
+        // The boot's cap spent: none.
+        let (mut s, mut c) = started(&p);
+        s.inst[0].f_formed_ns = [c.now - 100 * MS, 0];
+        s.counters.priority_fee_usd_1e6 = u64::from(XMM_PRIORITY_MAX_USD_1E6);
+        s.on_tick(&t, &mut c);
+        assert_eq!(c.placed[0].alo_priority_1e8, 0, "the cap spent");
+        // Another mode: none.
+        p.ab_mode = 3;
+        let (mut s, mut c) = started(&p);
+        s.inst[0].f_formed_ns = [c.now - 100 * MS, 0];
+        s.on_tick(&t, &mut c);
+        assert_eq!(c.placed[0].alo_priority_1e8, 0, "ab_mode 3");
+    }
+
+    /// XMM XH5d: three priority places in a row refused by the venue for no
+    /// reason it names end the priority for the boot; a priority place that
+    /// rests resets the run.
+    #[test]
+    fn three_refused_priority_places_in_a_row_end_the_priority() {
+        let mut p = valid();
+        p.ab_mode = 2;
+        p.alo_priority_1e8 = 10_000;
+        let mut t = tick(HL, BID_PX, ASK_PX);
+        t.venue_time_ms = XMM_AB_BLOCK_MS;
+        let other = core_types::ORDER_EVENT_REASON_OTHER;
+        let last_bid = |c: &Rec| *c.placed.iter().rev().find(|o| o.side == Side::Bid).unwrap();
+        // Two refused, then one that rests: the run resets.
+        let (mut s, mut c) = started(&p);
+        let mut i = 0;
+        while i < 2 {
+            s.inst[0].f_formed_ns = [c.now, 0];
+            s.on_tick(&t, &mut c);
+            let bid = last_bid(&c);
+            assert_eq!(bid.alo_priority_1e8, 10_000);
+            s.on_order_event(
+                &event(bid.client_oid, core_types::ORDER_EVENT_REJECTED, other),
+                &mut c,
+            );
+            c.now += MS;
+            i += 1;
+        }
+        assert_eq!(s.prio_streak, 2);
+        s.inst[0].f_formed_ns = [c.now, 0];
+        s.on_tick(&t, &mut c);
+        s.on_order_event(
+            &event(last_bid(&c).client_oid, ORDER_EVENT_RESTING, 0),
+            &mut c,
+        );
+        assert_eq!(
+            (s.prio_streak, s.prio_off),
+            (0, false),
+            "a resting priority place"
+        );
+        // Three in a row: no priority for the rest of the boot.
+        let (mut s, mut c) = started(&p);
+        let mut i = 0;
+        while i < 3 {
+            s.inst[0].f_formed_ns = [c.now, 0];
+            s.on_tick(&t, &mut c);
+            let bid = last_bid(&c);
+            assert_eq!(bid.alo_priority_1e8, 10_000, "refusal {i}: still bidding");
+            s.on_order_event(
+                &event(bid.client_oid, core_types::ORDER_EVENT_REJECTED, other),
+                &mut c,
+            );
+            c.now += MS;
+            i += 1;
+        }
+        s.inst[0].f_formed_ns = [c.now, 0];
+        s.on_tick(&t, &mut c);
+        assert_eq!(
+            last_bid(&c).alo_priority_1e8,
+            0,
+            "the priority ended for the boot"
+        );
+        assert_eq!(s.counters().priority_refused, 3);
+    }
+
+    /// XMM XH5d: the member reckons a priority's fee as the arm does — p ×
+    /// px × qty ÷ 1e14 (the arm's ×1e8 units over 1e18), rounded up.
+    #[test]
+    fn a_priority_fee_is_the_arm_s_reckoning_rounded_up() {
+        // 1 bp of 0.15 at 100: $0.0015.
+        assert_eq!(priority_fee_1e6(10_000, 100_000_000, 150_000), 1_500);
+        // 1 % of 0.15 at 99.985: $0.1499775, rounded up.
+        assert_eq!(priority_fee_1e6(1_000_000, 99_985_000, 150_000), 149_978);
+        assert_eq!(priority_fee_1e6(0, 100_000_000, 150_000), 0);
+        assert_eq!(
+            priority_fee_1e6(1, 1, 1),
+            1,
+            "any priority costs at least 1"
+        );
+        assert_eq!(priority_fee_1e6(u32::MAX, i64::MAX, i64::MAX), u32::MAX);
     }
 
     #[test]

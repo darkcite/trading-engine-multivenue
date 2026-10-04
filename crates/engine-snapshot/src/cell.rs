@@ -85,8 +85,8 @@ impl<T: Copy> SnapshotCell<T> {
         // copy, but the version bracket makes them discard any copy
         // that overlapped it (see `Sync` impl note). The pointer is
         // valid, aligned, and owned by `self`.
-        // COPY: the whole `T` once per publish (the engine snapshot:
-        // 30,656 B at the Hypercall merge, ≤ 32 KiB pinned) — the seqlock's design,
+        // COPY: the whole `T` once per publish (the engine snapshot: ≤ 32 KiB,
+        // the snapshot.rs test bound) — the seqlock's design,
         // plan §8: readers copy out under the version bracket.
         unsafe { *self.data.get() = *s };
         // Exit the write section: publish the copy to any reader
@@ -138,8 +138,9 @@ impl<T: Copy> SnapshotCell<T> {
             // SAFETY: see `read` — same racing volatile copy, same
             // discard-on-revalidation law; `out` is a valid, aligned,
             // exclusively borrowed destination.
-            // COPY: the whole `T` per read (≈ 28 KB for the engine
-            // snapshot), the seqlock's reader half — see `publish`.
+            // COPY: the whole `T` per read (≤ 32 KiB for the engine
+            // snapshot, the snapshot.rs test bound), the seqlock's reader
+            // half — see `publish`.
             unsafe { *out = core::ptr::read_volatile(self.data.get()) };
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == seq1 {

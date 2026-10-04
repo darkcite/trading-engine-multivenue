@@ -357,8 +357,10 @@ pub struct Measured {
     pub read_lagged_ack: (u32, u32),
     /// How long after the acknowledgement those reads were answered, ms.
     pub read_after_ack_ms: Spread,
-    /// The tap's `open` row against the arm's `RESTING`, ms (positive: the
-    /// row came later).
+    /// The tap's `open` row against the arm's first `RESTING` of the order,
+    /// ms (positive: the row came later). XMM XH5d: a row after the answer
+    /// repeats the RESTING with the venue's time — about zero against its
+    /// own row, so the repeat is not sampled.
     pub open_row_lag_ms: Spread,
     /// The tap's `canceled` row against the arm's `CANCELED`, ms.
     pub cancel_row_lag_ms: Spread,
@@ -845,7 +847,12 @@ impl Drive {
             if self.arm.gateway_arm_report(now, &mut self.report) {
                 self.peaks.0 = self.peaks.0.max(self.report.rate_ip_sum);
                 self.peaks.1 = self.peaks.1.max(self.report.rate_ws_sum);
-                self.peaks.2 = self.peaks.2.max(self.report.congestion);
+                // XMM XH5c-3: with no socket Ready the word reads throttled
+                // (the boot's first seconds too) — the rates' peak is taken
+                // while one is up.
+                if self.report.ws_up == 1 {
+                    self.peaks.2 = self.peaks.2.max(self.report.congestion);
+                }
             }
         }
     }
@@ -1022,7 +1029,9 @@ impl Run<'_> {
     }
 
     /// Wait until the gateway's rates no longer throttle growth (XH4e: at
-    /// 80 % of a share a place is refused unsent) — at most [`STEP_WAIT`].
+    /// 80 % of a share a place is refused unsent) and a socket is Ready
+    /// (XMM XH5c-3: the word reads throttled without one) — at most
+    /// [`STEP_WAIT`].
     fn unthrottled(&mut self) -> bool {
         self.drive.until(STEP_WAIT, |d| {
             d.arm.congestion() < u64::from(EXEC_CONGESTION_THROTTLED)
@@ -1276,7 +1285,7 @@ pub fn run(spec: &BatterySpec, gcfg: GatewayCfg, sk: signer_eip712::SecretKey) -
         }
     };
     let mut tap = Tap::start(&host, port, Arc::clone(&tls), master);
-    let (handle, stop) = match spawn_gateway(gw, "hl-gw-battery", None) {
+    let (handle, stop) = match spawn_gateway(gw, "hl-gw-battery", None, None, None) {
         Ok(h) => h,
         Err(e) => {
             rep.fail(EXIT_BOOT, e);
@@ -2204,12 +2213,14 @@ fn measure(run: &mut Run<'_>, rows: &[TapRow], failed: bool) {
             m.modify_original_canceled.0 += 1;
         }
     }
-    // The rows' lag behind the arm's events.
+    // The rows' lag behind the arm's events: an order's first RESTING only
+    // (XMM XH5d: the repeat a later `open` row brings is not a landing).
     let mut open = Vec::new();
     let mut canceled = Vec::new();
+    let mut rested = std::collections::HashSet::new();
     for (t, e) in &run.drive.events {
         let want = match e.kind {
-            ORDER_EVENT_RESTING => EV_RESTING,
+            ORDER_EVENT_RESTING if rested.insert(e.client_oid) => EV_RESTING,
             ORDER_EVENT_CANCELED => EV_CANCELED,
             _ => continue,
         };

@@ -1527,10 +1527,12 @@ pub fn run_sweep_on(
             }
             if rep.listed {
                 let mut oids = [0u64; crate::recon::MAX_OPEN_ORDERS];
+                // The roll path's mask: every slot's (LAW E-8).
                 let picked = crate::recon::ours_on_leg(
                     &rows[..n],
                     body,
                     &rep.coin[..rep.coin_len as usize],
+                    crate::recon::ALL_SLOTS,
                     &mut oids,
                 );
                 rep.selected = oids[..picked].contains(&rep.placed_oid);

@@ -56,6 +56,13 @@ pub const ENGINE_FILLS_FILE: &str = "engine-fills.pmlr";
 /// existed, paper mode captured neither intents nor fills.
 pub const ENGINE_ORDERS_FILE: &str = "engine-orders.pmlr";
 
+/// XMM XH5d: the engine-thread order-event capture — every
+/// [`OrderEvent`] the engine drains (the dispatcher pump and the lane),
+/// every slot's, staged BEFORE the member sees it, like the fills. The
+/// measurement's ACK record: kind, reason, client oid, symbol, slot and
+/// the venue's time (`SlotKind::OrderEvent`).
+pub const ENGINE_EVENTS_FILE: &str = "engine-events.pmlr";
+
 // ---------------------------------------------------------------
 // Compile-time ring sizes + lane geometry
 // ---------------------------------------------------------------
@@ -302,6 +309,12 @@ pub struct Engine<S: Strategy, D: OrderDispatch> {
     /// rides [`Self::maybe_flush_fill_capture`]'s caller cadence via
     /// [`Self::maybe_flush_order_capture`] + the [`Self::stop`] drain.
     order_capture: Option<SlotCapture<Order>>,
+    /// XMM XH5d: the order-event capture → [`ENGINE_EVENTS_FILE`]. `None`
+    /// when the cli did not wire one. Appended before
+    /// `Strategy::on_order_event` runs, from both sources; flushed on the
+    /// fills capture's caller cadence ([`Self::maybe_flush_event_capture`])
+    /// and drained in [`Self::stop`].
+    event_capture: Option<SlotCapture<OrderEvent>>,
     /// RG6 `/state` `recent` section: the last [`RECENT_ORDERS`]
     /// orders the dispatcher ACCEPTED (pushed in `EngineCtx::submit`
     /// beside the intent capture — same "what was taken" law) and the
@@ -412,6 +425,7 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
             ai_drain_malformed: 0,
             fill_capture: None,
             order_capture: None,
+            event_capture: None,
             recent_orders: RecentRing::new(ZERO_ORDER),
             recent_fills: RecentRing::new(ZERO_FILL),
             lifecycle: LifecycleCounters::new(),
@@ -745,6 +759,11 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         let mut i = 0;
         while i < max_per_ring && self.disp.try_next_order_event(&mut ev) {
             consumed += 1;
+            // XMM XH5d: one 64 B slot staged (SlotCapture policy) before
+            // the member sees it.
+            if let Some(cap) = self.event_capture.as_mut() {
+                cap.append(&ev);
+            }
             let mut ctx = EngineCtx {
                 disp: &mut self.disp,
                 decide_lat: &self.decide_lat,
@@ -774,6 +793,11 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
                 match events.try_pop_ref() {
                     Some(e) => {
                         consumed += 1;
+                        // XMM XH5d: one 64 B slot staged (SlotCapture
+                        // policy) before the member sees it.
+                        if let Some(cap) = self.event_capture.as_mut() {
+                            cap.append(&e);
+                        }
                         let mut ctx = EngineCtx {
                             disp: &mut self.disp,
                             decide_lat: &self.decide_lat,
@@ -1211,6 +1235,13 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         self.order_capture = Some(cap);
     }
 
+    /// XMM XH5d: attach the engine-thread order-event capture (boot-only,
+    /// before [`Self::start`]). The cli opens [`ENGINE_EVENTS_FILE`]
+    /// inside the per-run capture directory and hands it over here.
+    pub fn set_event_capture(&mut self, cap: SlotCapture<OrderEvent>) {
+        self.event_capture = Some(cap);
+    }
+
     /// Drain staged fills to disk if the capture flush interval has
     /// elapsed. Called from the cli's 5 s report tick — off the hot
     /// path — so staged fills reach disk within one report period
@@ -1229,6 +1260,36 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
     pub fn maybe_flush_order_capture(&mut self, now_ns: u64) {
         if let Some(cap) = self.order_capture.as_mut() {
             cap.maybe_flush(now_ns);
+        }
+    }
+
+    /// XMM XH5d: drain staged order events on the same caller cadence
+    /// (cli 5 s report tick). No-op without a capture.
+    #[inline]
+    pub fn maybe_flush_event_capture(&mut self, now_ns: u64) {
+        if let Some(cap) = self.event_capture.as_mut() {
+            cap.maybe_flush(now_ns);
+        }
+    }
+
+    /// XMM XH5d: order events staged to the capture since boot (0 without
+    /// one). Mirrored into the `engine_events_capture_records` gauge.
+    #[inline]
+    pub fn event_capture_records(&self) -> u64 {
+        match self.event_capture.as_ref() {
+            Some(cap) => cap.records(),
+            None => 0,
+        }
+    }
+
+    /// XMM XH5d: event-capture I/O errors (the first sticky-disables; 0
+    /// without one). Mirrored into the `engine_events_capture_io_errors`
+    /// gauge.
+    #[inline]
+    pub fn event_capture_io_errors(&self) -> u64 {
+        match self.event_capture.as_ref() {
+            Some(cap) => cap.io_errors(),
+            None => 0,
         }
     }
 
@@ -1303,6 +1364,10 @@ impl<S: Strategy, D: OrderDispatch> Engine<S, D> {
         }
         if let Some(cap) = self.order_capture.as_mut() {
             // Same policy for the M4.1 intent log.
+            let _ = cap.flush_all();
+        }
+        if let Some(cap) = self.event_capture.as_mut() {
+            // And for XMM XH5d's order events.
             let _ = cap.flush_all();
         }
     }
@@ -1869,6 +1934,53 @@ mod tests {
             eng.strategy().last_order_event,
             (core_types::ORDER_EVENT_CANCELED, core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED)
         );
+    }
+
+    /// XMM XH5d: every order event the engine drains is staged to the
+    /// capture before the member sees it, and reads back as written — the
+    /// venue's time with it.
+    #[test]
+    fn events_capture_stages_every_drained_order_event() {
+        let dir = std::env::temp_dir().join(format!("xh5d_engine_events_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ENGINE_EVENTS_FILE);
+        let (mut eng, _tp, _ep, _sp, _fp, _ap, _tblp) = build_engine();
+        let (mut oep, oec) = Ring::<OrderEvent, ORDER_EVENT_RING_SIZE>::new().split();
+        eng.set_order_event_lane(oec);
+        eng.set_event_capture(
+            core_io::SlotCapture::open(&path, core_io::SlotKind::OrderEvent, 7).unwrap(),
+        );
+        eng.start().unwrap();
+        let mut stamped = mk_order_event(
+            7,
+            core_types::ORDER_EVENT_RESTING,
+            core_types::ORDER_EVENT_REASON_NONE,
+        );
+        stamped.venue_time_ms = 1_791_000_000_000;
+        assert!(oep.try_push_ref(&stamped));
+        assert!(oep.try_push_ref(&mk_order_event(
+            8,
+            core_types::ORDER_EVENT_CANCELED,
+            core_types::ORDER_EVENT_REASON_CANCEL_REQUESTED
+        )));
+        eng.tick(16);
+        assert_eq!(eng.order_events_dispatched, 2);
+        assert_eq!(
+            (eng.event_capture_records(), eng.event_capture_io_errors()),
+            (2, 0)
+        );
+        eng.stop();
+        let r = core_io::PmlrReader::<OrderEvent>::open(&path).unwrap();
+        assert_eq!(r.slot_kind(), core_io::SlotKind::OrderEvent);
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r.records()[0],
+            stamped,
+            "as written, the venue's time with it"
+        );
+        assert_eq!(r.records()[1].kind, core_types::ORDER_EVENT_CANCELED);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn mk_tick(venue: VenueId, sym: u32, seq: u32) -> Tick {

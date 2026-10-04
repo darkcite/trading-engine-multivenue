@@ -29,7 +29,7 @@
 //!
 //! Zero-alloc: everything writes into a caller-owned buffer.
 
-use crate::action::{CancelByCloidWire, CancelWire, ModifyWire, OrderWire, Tif};
+use crate::action::{CancelByCloidWire, CancelWire, Grouping, ModifyWire, OrderWire, Tif};
 use crate::msgpack::MsgPackErr;
 use crate::wire::WireNum;
 
@@ -141,6 +141,16 @@ pub fn order_json(
     orders: &[OrderWire],
     grouping: &[u8],
 ) -> Result<usize, MsgPackErr> {
+    order_json_grouped(dst, orders, Grouping::Named(grouping))
+}
+
+/// [`order_json`] under any [`Grouping`]: XMM XH5d's ALO priority as
+/// `"grouping":{"p":N}`.
+pub fn order_json_grouped(
+    dst: &mut [u8],
+    orders: &[OrderWire],
+    grouping: Grouping<'_>,
+) -> Result<usize, MsgPackErr> {
     let mut j = Json::new(dst);
     j.put(b"{\"type\":\"order\",\"orders\":[")?;
     for (i, o) in orders.iter().enumerate() {
@@ -149,9 +159,18 @@ pub fn order_json(
         }
         order_wire_json(&mut j, o)?;
     }
-    j.put(b"],\"grouping\":\"")?;
-    j.put(grouping)?;
-    j.put(b"\"}")?;
+    match grouping {
+        Grouping::Named(g) => {
+            j.put(b"],\"grouping\":\"")?;
+            j.put(g)?;
+            j.put(b"\"}")?;
+        }
+        Grouping::Priority(p) => {
+            j.put(b"],\"grouping\":{\"p\":")?;
+            j.u64(u64::from(p))?;
+            j.put(b"}}")?;
+        }
+    }
     Ok(j.len)
 }
 
@@ -608,5 +627,24 @@ mod tests {
 
         assert_eq!(&a[..a_len], &b[..b_len]);
         assert!(a[..a_len].starts_with(b"{\"action\":{\"type\":\"order\""));
+    }
+
+    /// XMM XH5d: the ALO priority grouping renders as an object, a named
+    /// one as a string — the rest of the body the same.
+    #[test]
+    fn the_priority_grouping_is_an_object_a_named_one_a_string() {
+        let o = OrderWire::new(0, true, 50_000_000, 1_000_000_000, Tif::Alo);
+        let mut a = [0u8; 512];
+        let mut b = [0u8; 512];
+        let na = order_json(&mut a, &[o], b"na").unwrap();
+        let pr = order_json_grouped(&mut b, &[o], Grouping::Priority(10_000)).unwrap();
+        let sa = std::str::from_utf8(&a[..na]).unwrap();
+        let sb = std::str::from_utf8(&b[..pr]).unwrap();
+        assert!(sa.ends_with(r#"],"grouping":"na"}"#), "{sa}");
+        assert!(sb.ends_with(r#"],"grouping":{"p":10000}}"#), "{sb}");
+        assert_eq!(
+            sa.split(r#"],"grouping""#).next(),
+            sb.split(r#"],"grouping""#).next()
+        );
     }
 }

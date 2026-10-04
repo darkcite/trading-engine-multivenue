@@ -973,6 +973,11 @@ fn mul_1e6(a: i64, b: i64) -> i64 {
 
 impl<H: HedgeArm> OrderDispatch for HyparbLive<H> {
     fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        // XMM XH5a: slot 0's arm alone — `cancel_slot` answers `Clear` for
+        // every other slot on that ground, as the gateway arm's does.
+        if order.strategy_id != SLOT {
+            return Err(DispatchError::Unroutable);
+        }
         if order.venue == VenueId::HyperEvm.to_u8() && order.kind == core_fill::ORDER_KIND_AMM_SWAP
         {
             return self.submit_swap(order);
@@ -1145,6 +1150,22 @@ impl<H: HedgeArm> OrderDispatch for HyparbLive<H> {
 
     fn cancel_all_state(&self) -> CancelAllState {
         self.hl.cancel_all_state()
+    }
+
+    /// XMM XH5a: slot 0 trades from its own wallet — its cancel is the
+    /// hedge arm's whole cancel; another slot has nothing on this account.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        if slot == SLOT {
+            return self.cancel_all();
+        }
+        Ok(())
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        if slot == SLOT {
+            return self.cancel_all_state();
+        }
+        CancelAllState::Clear
     }
 
     fn on_shutdown(&mut self) {
@@ -1716,26 +1737,47 @@ pub(crate) fn info_once(
     info_with(host, body, tls, |b| b.to_vec())
 }
 
-/// One boot `/info` post, its answer handed to `f` in place (XMM XH4f: the
-/// gateway arm parses `meta` inside the client's buffer).
+/// One boot `/info` post of a request the caller holds, its answer handed to
+/// `f` in place (XMM XH4f: the gateway arm parses `meta` inside the client's
+/// buffer).
 pub(crate) fn info_with<T>(
     host: &str,
     body: &[u8],
     tls: Arc<ClientConfig>,
     f: impl FnOnce(&[u8]) -> T,
 ) -> Result<T, String> {
+    info_rendered(
+        host,
+        tls,
+        |b| {
+            if body.len() > b.len() {
+                return Err(String::from("request too large"));
+            }
+            // COPY: a ≤ 256 B boot request the caller holds, into the client's
+            // body window — cold, once per boot read: a constant, or slot 0's
+            // builder-dex `meta` and the rehearsal's `l2Book`, `format!`ed
+            // (slot 0's debt, as `info_once`'s answer copy); rejected: a render
+            // in place — `info_rendered` does it, moving those is slot 0's change.
+            b[..body.len()].copy_from_slice(body);
+            Ok(body.len())
+        },
+        f,
+    )
+}
+
+/// One boot `/info` post whose request `render` writes straight into the
+/// client's body window, returning its length (XMM XH5b-2: slot 6's
+/// `userRole` read — no staging), its answer handed to `f` in place.
+pub(crate) fn info_rendered<T>(
+    host: &str,
+    tls: Arc<ClientConfig>,
+    render: impl FnOnce(&mut [u8]) -> Result<usize, String>,
+    f: impl FnOnce(&[u8]) -> T,
+) -> Result<T, String> {
     let mut http = core_net::HttpsPost::new(host, 443, "/info", tls, 256, META_RESP)
         .map_err(|e| format!("{host}/info: {e}"))?;
-    let b = http.body_mut();
-    if body.len() > b.len() {
-        return Err(String::from("request too large"));
-    }
-    // COPY: a ≤ 256 B boot request into the client's body window — cold,
-    // once per boot — rejected: rendering JSON in place for a constant.
-    b[..body.len()].copy_from_slice(body);
-    let (status, r) = http
-        .post(body.len())
-        .map_err(|e| format!("{host}/info: {e}"))?;
+    let len = render(http.body_mut())?;
+    let (status, r) = http.post(len).map_err(|e| format!("{host}/info: {e}"))?;
     if status != 200 {
         return Err(format!("{host}/info: http status {status}"));
     }
@@ -1915,7 +1957,7 @@ fn gateway_hedge(
     }
     cfg.n_perps = resolved.len();
     let (eng, gw_end) = hl_duplex();
-    // COPY: boot, once — the 1 600 B arm out of `new`'s `Result`, through
+    // COPY: boot, once — the 1 792 B arm out of `new`'s `Result`, through
     // the maker's, into `HyparbLive` and `LiveBoot` (as `xmm_live`'s, noted
     // there). Rejected: as there.
     let arm = HlGatewayArm::new(&cfg, eng).map_err(|e| format!("slot 0's gateway arm: {e:?}"))?;
@@ -1936,7 +1978,7 @@ fn gateway_hedge(
     gw.share_nonce(nonces.stream(&hl_cfg.agent_addr).ok_or_else(|| {
         String::from("slot 0's gateway: more agent addresses than the nonce streams hold")
     })?);
-    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None)?;
+    let (handle, stop) = crate::xmm_live::spawn_gateway(gw, "hl-gw-hyparb", None, None, None)?;
     Ok((arm, Some((handle, stop))))
 }
 

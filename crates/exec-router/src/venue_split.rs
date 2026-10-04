@@ -338,6 +338,22 @@ impl<A: OrderDispatch, B: OrderDispatch> OrderDispatch for VenueSplit<A, B> {
         least_settled(self.a.cancel_all_state(), self.b.cancel_all_state())
     }
 
+    /// **XMM XH5a** — a slot may trade both venues, so both arms are
+    /// asked for its orders (each holds only its own); the least settled
+    /// answer is the slot's.
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        let a = self.a.cancel_slot(slot);
+        let b = self.b.cancel_slot(slot);
+        a.and(b)
+    }
+
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        least_settled(
+            self.a.cancel_slot_state(slot),
+            self.b.cancel_slot_state(slot),
+        )
+    }
+
     fn arm_counters(&self) -> LiveArmCounters {
         self.a.arm_counters()
     }

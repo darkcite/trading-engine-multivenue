@@ -1,0 +1,61 @@
+# xmm-probe.toml — the slot-6 XMM member's artifact for the XH5 mainnet
+# probe (XMM XH5e). `scripts/xmm-flip.sh live` copies it to
+# ~/multivenue/xmm-probe.toml and points the wrapper's XMM_TOML at that
+# copy, after `multivenue-engine xmm-preflight` passes on it; `paper` points
+# XMM_TOML back. Change it here, under review — never in ~/multivenue (a new
+# config hash either way).
+#
+# It is xmm.toml.example — the paper engine's artifact — with two keys
+# changed, and a test pins that: `lead_stale_ms` 500 (XMM XH5c: the stale
+# pulls are the request cadence's lever; the paper engine stays at 300 until
+# Anton rules) and `rtt_pull_ms` 2000 (XMM XH5c-3; re-sized after the first
+# 2 000 mainnet posts to max(1500, ceil(1.5 x p99))). `ab_mode` stays 0 for
+# the first run: Q-XH5-5 is open, and mode 2 waits for the testnet proof of
+# the priority grouping.
+
+[xmm]
+# Master switch (the ablation pattern): 0 = the member runs and quotes nothing.
+maker_enabled = 1
+
+# The perps to quote. `quote_<coin> = 1` quotes the Hyperliquid perp
+# `hyperliquid:<COIN>`, led by the Binance USDⓈ-M perp
+# `binance-usdm:<coin>usdt` — BOTH must be in ~/multivenue/universe.toml
+# ([hyperliquid] coins, [binance] usdm) or the boot refuses.
+quote_btc = 1
+quote_eth = 1
+quote_sol = 1
+quote_xrp = 1
+quote_ada = 0
+quote_ltc = 0
+quote_doge = 0
+
+# θ, bps ×1e6: pull a quote when the leader has moved θ against it since
+# it was placed (0.5 bps; the XH5 A/B runs 0.25).
+theta_bps_1e6 = 500000
+# The gate's window for the "unreflected" leader move, ms.
+gate_window_ms = 500
+# Quote lifetime cap, ms (LAW E-8: at most 30 000).
+lifetime_ms = 30000
+
+# Sizes and caps, USD ×1e6 (inventory at mark). Ceilings — policy, raised
+# only by a code change with its risk-policy entry (XH7): clip $10 000,
+# per perp $5 000 000, gross $20 000 000, resting $1 000 000.
+clip_usd_1e6 = 15000000
+inv_cap_usd_1e6 = 150000000
+gross_inv_cap_usd_1e6 = 400000000
+resting_cap_usd_1e6 = 300000000
+
+# Safety pulls (law XH-2), ms. The probe's two values (see the head).
+lead_stale_ms = 500
+follower_stale_ms = 2000
+rtt_pull_ms = 2000
+
+# Minimum quote life before a price requote, ms (budget control).
+requote_min_ms = 250
+
+# Inventory skew κ ×1e6 — refused unless 0 until XH7.
+skew_kappa_1e6 = 0
+# ALO priority rate, p / 1e8 of resting notional (0 = none; 1 bp = 10000).
+alo_priority_1e8 = 0
+# A/B selector: 0 off, 1 θ, 2 ALO priority, 3 size-only modify.
+ab_mode = 0

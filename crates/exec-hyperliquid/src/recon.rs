@@ -56,7 +56,7 @@ use core_parse::{find_field, skip_ws};
 /// So this is deliberately far above anything observed: overflow is
 /// correctly an error (a position nobody saw reconciles by not being
 /// there), which makes an undersized buffer a self-inflicted outage.
-/// 256 rows is 6 KiB.
+/// 256 rows is 8 KiB (32 B a row, pinned below [`SpotBalance`]).
 pub const MAX_SPOT_BALANCES: usize = 256;
 
 // Real headroom above what the venue has actually been observed to
@@ -65,7 +65,7 @@ pub const MAX_SPOT_BALANCES: usize = 256;
 // that must fail the build rather than a test run.
 const _: () = assert!(MAX_SPOT_BALANCES >= 14 * 4);
 
-use crate::json::{decimal_field, object_end, string_field};
+use crate::json::{decimal_field, object_end, object_field, string_field};
 use crate::response::{ScanErr, Span};
 
 /// One row of the venue's spot balance sheet.
@@ -86,6 +86,10 @@ pub struct SpotBalance {
     /// the row has none (the quote token, a husk).
     pub entry_ntl_1e8: i64,
 }
+
+// The reconciler's table: 256 rows of 32 B, 8 KiB (the gateway boxes one,
+// XH5b-1).
+const _: () = assert!(core::mem::size_of::<[SpotBalance; MAX_SPOT_BALANCES]>() == 8_192);
 
 impl SpotBalance {
     /// Total minus what is already committed to resting orders.
@@ -501,10 +505,10 @@ fn user_info_open(
     // COPY: ≤ 64 B request literal + 40 hex chars into the caller's final
     // body — the RENDER of the `/info` request, once per request at its
     // caller's cadence (e.g. the gateway arm's sheet and orders every read
-    // period, its budget every `limit_ms`, a day page a read period apart,
-    // a sweep round's read; the blocking arm's and HYPARB's reads); the
-    // body must exist once. Rejected: nothing — the render's own write
-    // into its final buffer, no staging between.
+    // period, its spot sheet after each perp sheet, its budget every
+    // `limit_ms`, a day page a read period apart, a sweep round's read; the
+    // blocking arm's and HYPARB's reads); the body must exist once.
+    // Rejected: nothing — the render's own write, no staging between.
     out[..head.len()].copy_from_slice(head);
     let mut i = head.len();
     for b in master {
@@ -643,10 +647,18 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
     }
 }
 
+/// **Every slot** — the mask a sweep of a retired leg carries (LAW E-8:
+/// a leg whose instance ended is nobody's to keep). A halted slot's
+/// sweep carries `1 << slot` (XMM XH5a).
+pub const ALL_SLOTS: u8 = u8::MAX;
+
+// A slot mask is one byte: one bit per value of the cloid's slot byte.
+const _: () = assert!(core_config::exec::EXEC_SLOTS <= 8);
+
 /// Of the orders the venue says are resting, which are **ours, on this
-/// leg** — returns how many oids were written to `out`.
+/// leg, of these slots** — returns how many oids were written to `out`.
 ///
-/// Two filters, and both matter:
+/// Three filters, and all three matter:
 ///
 /// - **The coin must match exactly.** The answer covers the whole
 ///   account, and a sweep of one retired leg must not touch another.
@@ -654,13 +666,23 @@ pub fn scan_open_orders(body: &[u8], out: &mut [OpenOrder]) -> Result<usize, Sca
 ///   the venue UI carries no cloid and a stranger's carries someone
 ///   else's magic; cancelling either would be the mirror image of
 ///   booking a stranger's fill.
+/// - **Its slot byte must be in `slots`** (XMM XH5a). One account
+///   serves several slots, and a halt cancels the halted slot's orders
+///   while a sibling slot's quotes stay. [`ALL_SLOTS`] takes every
+///   slot's.
 ///
 /// Pure, so the arm and the testnet probe run the SAME selection — the
 /// same reason [`compare_booked`] lives here rather than on
 /// `HlExchange`. A sweep whose selection was only ever exercised
 /// behind a socket is a claim about source code.
 #[must_use]
-pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]) -> usize {
+pub fn ours_on_leg(
+    rows: &[OpenOrder],
+    body: &[u8],
+    coin: &[u8],
+    slots: u8,
+    out: &mut [u64],
+) -> usize {
     let mut n = 0usize;
     let mut i = 0usize;
     while i < rows.len() {
@@ -669,10 +691,13 @@ pub fn ours_on_leg(rows: &[OpenOrder], body: &[u8], coin: &[u8], out: &mut [u64]
         if row.coin.of(body) != coin {
             continue;
         }
-        if !matches!(
-            row.cloid.as_ref().map(crate::cloid::decode),
-            Some(crate::cloid::Owner::Ours { .. })
-        ) {
+        let Some(crate::cloid::Owner::Ours { strategy_id, .. }) =
+            row.cloid.as_ref().map(crate::cloid::decode)
+        else {
+            continue;
+        };
+        // `strategy_id < EXEC_SLOTS` (≤ 8) by `decode`: the shift is exact.
+        if slots & (1u8 << strategy_id) == 0 {
             continue;
         }
         if n >= out.len() {
@@ -784,6 +809,53 @@ pub fn spot_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, Sc
 /// The buffer is too short.
 pub fn perp_state_request(out: &mut [u8], master: &[u8; 20]) -> Result<usize, ScanErr> {
     user_info_request(out, br#"{"type":"clearinghouseState","user":"0x"#, master)
+}
+
+/// **XMM XH5b-2**: render `{"type":"userRole","user":"0x<40 hex>"}` — what
+/// the venue knows an address as: a master, or an API wallet and the master
+/// it signs for. Zero-alloc; the buffer needs [`MAX_STATE_REQ`].
+///
+/// # Errors
+/// The buffer is too short.
+pub fn user_role_request(out: &mut [u8], user: &[u8; 20]) -> Result<usize, ScanErr> {
+    user_info_request(out, br#"{"type":"userRole","user":"0x"#, user)
+}
+
+/// **XMM XH5b-2** — what a `userRole` answer says an address is.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A master account (`"role":"user"`): it signs as itself.
+    User,
+    /// An API wallet and the master that approved it
+    /// (`"role":"agent","data":{"user":…}`) — where its orders land.
+    Agent([u8; 20]),
+    /// Any other answer (`missing`, `vault`, `subAccount`), or one that
+    /// does not scan.
+    Other,
+}
+
+/// **XMM XH5b-2** — scan a `userRole` answer in place (boot only). The
+/// venue's answer for an API wallet, measured (`userws_conn`):
+/// `{"role":"agent","data":{"user":"0x<master>"}}`.
+#[must_use]
+pub fn scan_user_role(b: &[u8]) -> Role {
+    let Some(r) = string_field(b, b"\"role\"") else {
+        return Role::Other;
+    };
+    match r.of(b) {
+        b"user" => Role::User,
+        b"agent" => {
+            let Some((s, e)) = object_field(b, b"\"data\"") else {
+                return Role::Other;
+            };
+            let d = &b[s..e];
+            string_field(d, b"\"user\"")
+                .and_then(|u| core::str::from_utf8(u.of(d)).ok())
+                .and_then(crate::config::parse_hex20)
+                .map_or(Role::Other, Role::Agent)
+        }
+        _ => Role::Other,
+    }
 }
 
 /// One perp position from a `clearinghouseState` body.
@@ -1336,7 +1408,7 @@ mod tests {
         assert_eq!(n, 5);
 
         let mut out = [0u64; MAX_OPEN_ORDERS];
-        let k = ours_on_leg(&rows[..n], &body, b"#195641", &mut out);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
         assert_eq!(&out[..k], &[11, 15], "ours on THIS leg, and nothing else");
 
         // 12 is a foreign cloid, 13 has none (placed from the UI), and
@@ -1348,13 +1420,50 @@ mod tests {
 
         // The other leg selects its own, which is the same statement
         // from the other side.
-        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", &mut out);
+        let k2 = ours_on_leg(&rows[..n], &body, b"#195640", ALL_SLOTS, &mut out);
         assert_eq!(&out[..k2], &[14]);
 
         // A leg with nothing of ours selects nothing rather than
         // falling back to "cancel what is there".
-        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", &mut out);
+        let k3 = ours_on_leg(&rows[..n], &body, b"#999999", ALL_SLOTS, &mut out);
         assert_eq!(k3, 0);
+    }
+
+    /// **XMM XH5a — a halt's sweep takes its own slot's orders.** One
+    /// account, two slots' quotes on one leg: slot 3's sweep selects
+    /// slot 3's alone, slot 7's its own, and a roll's every slot's —
+    /// the selection the arm's per-slot cancel runs.
+    #[test]
+    fn a_slot_s_sweep_selects_that_slot_s_orders_alone() {
+        let hex = |slot: u8, oid: u64| {
+            let c = crate::cloid::encode(slot, oid);
+            let mut h = [0u8; 34];
+            let n = crate::cloid::to_hex(&c, &mut h);
+            String::from_utf8(h[..n].to_vec()).expect("ascii")
+        };
+        let (three, seven) = (hex(3, 0x65), hex(7, 0x66));
+        let body = format!(
+            r##"[
+              {{"coin":"#195641","oid":11,"cloid":"{three}"}},
+              {{"coin":"#195641","oid":12,"cloid":"{seven}"}},
+              {{"coin":"#195641","oid":13,"cloid":"{three}"}}
+            ]"##
+        )
+        .into_bytes();
+        let mut rows = [OpenOrder::default(); MAX_OPEN_ORDERS];
+        let n = scan_open_orders(&body, &mut rows).expect("scans");
+        assert_eq!(n, 3);
+        let mut out = [0u64; MAX_OPEN_ORDERS];
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 3, &mut out);
+        assert_eq!(&out[..k], &[11, 13], "slot 3's, and not slot 7's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 7, &mut out);
+        assert_eq!(&out[..k], &[12]);
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", (1 << 3) | (1 << 7), &mut out);
+        assert_eq!(&out[..k], &[11, 12, 13], "two halted slots, one pass");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", ALL_SLOTS, &mut out);
+        assert_eq!(k, 3, "a roll takes every slot's");
+        let k = ours_on_leg(&rows[..n], &body, b"#195641", 1 << 5, &mut out);
+        assert_eq!(k, 0, "a slot with nothing resting selects nothing");
     }
 
     #[test]
@@ -1499,5 +1608,31 @@ mod tests {
         let n = fills_by_time_request(&mut out, &[0; 20], 0, 9).unwrap();
         assert!(out[..n].ends_with(br#""startTime":0,"endTime":9}"#));
         assert!(fills_by_time_request(&mut out[..n - 1], &[0; 20], 0, 9).is_err());
+    }
+
+    /// XMM XH5b-2: `userRole` — the request, and the answers slot 6's boot
+    /// reads: an API wallet and its master (the venue's measured shape), a
+    /// master, and everything else.
+    #[test]
+    fn the_user_role_answer_names_the_api_wallet_s_master() {
+        let mut buf = [0u8; MAX_STATE_REQ];
+        let n = user_role_request(&mut buf, &[0xAB; 20]).expect("fits");
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"userRole","user":"0xabababababababababababababababababababab"}"#
+        );
+        let mut small = [0u8; 8];
+        assert!(user_role_request(&mut small, &[0xAB; 20]).is_err());
+        let agent =
+            br#"{"role":"agent","data":{"user":"0xCDcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}"#;
+        assert_eq!(scan_user_role(agent), Role::Agent([0xCD; 20]));
+        assert_eq!(scan_user_role(br#"{"role":"user"}"#), Role::User);
+        assert_eq!(scan_user_role(br#"{"role":"missing"}"#), Role::Other);
+        let sub = br#"{"role":"subAccount","data":{"master":"0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}}"#;
+        assert_eq!(scan_user_role(sub), Role::Other);
+        let short = br#"{"role":"agent","data":{"user":"0xcd"}}"#;
+        assert_eq!(scan_user_role(short), Role::Other);
+        assert_eq!(scan_user_role(br#"{"role":"agent"}"#), Role::Other);
+        assert_eq!(scan_user_role(b"<html>"), Role::Other);
     }
 }

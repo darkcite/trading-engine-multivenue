@@ -559,11 +559,12 @@ above, plus the fact that the account is a separate testnet account.
 The gate has two halves and they cover different things.
 
 - **Offline** (`exec-smoke.sh --offline`, no network, no credentials):
-  the binary reproduces all 38 known-answer vectors the official
+  the binary reproduces all 39 known-answer vectors the official
   `hyperliquid-python-sdk` generated, and rebuilds one action per TYPE
   from inputs — `order`, `cancel`, `cancelByCloid`, `batchModify`,
   `reserveRequestWeight` (S7-L1) and the XH4c control actions
-  `updateLeverage`, `scheduleCancel`, `noop` — demanding the SDK's exact
+  `updateLeverage`, `scheduleCancel`, `noop`, plus XMM XH5d's order under
+  the ALO priority grouping `{"p": N}` — demanding the SDK's exact
   msgpack. **This is the half that covers LAW E-3 for orders.**
 - **Venue** (two signed POSTs): the venue verifies a good signature and
   rejects a corrupted one.
@@ -8863,6 +8864,1371 @@ reject on the gateway arm; the rehearsal's early stops skipping the
 gateway's end; three texts — all fixed above), round 2 APPROVE; zero-copy
 APPROVE WITH NITS (two boot-time `COPY:` notes, added), allocation
 APPROVE.
+
+### XH5a amendment (2026-10-03): D2 ruled — a halt cancels the halted slot's orders alone (R-XH4-1)
+
+Anton's ruling R-XH4-1 (2026-10-03): the router's halt cancel becomes a
+per-slot sweep — a halt cancels only the halted slot's orders. Built as
+XH5a, the first code cut of XH5's prep (R-XH4-11). What changed:
+
+- **The dispatch surface.** `OrderDispatch` gains `cancel_slot(slot)` (the
+  request) and `cancel_slot_state(slot)` (the confirmation, three-valued as
+  `cancel_all_state`). Their defaults are the venue-wide verbs: an arm that
+  cannot tell its slots apart OVER-cancels (the pre-XH5a behaviour) and
+  never leaves a halted slot's order resting. Every arm a live engine
+  composes answers per slot:
+  - `SlotSplit` routes the slot to the arm that serves it; `VenueSplit` asks
+    both arms (a slot may trade both venues), the least settled answer wins;
+  - `HlExchange`, the operator's blocking arm (BIN15's account, several
+    slots): a pending sweep carries a slot mask in a padding byte;
+    `recon::ours_on_leg` selects only cloids whose slot byte (LAW E-9) is in
+    the mask; a halt queues `1 << slot` on every live leg, OR'd into an entry
+    already pending; the roll path (LAW E-8) carries every slot. The
+    confirmation is per slot: `Working` while an entry carrying the slot is
+    pending, `Stranded` when one carrying it was given up on or could not be
+    queued since the slot's request (a per-slot counter and mark), `Clear`
+    otherwise. `cancel_all_runs`, `cancel_all_unqueued` and `sweep_left`
+    count the per-slot requests as they count the venue-wide ones;
+  - `HlGatewayArm` (one slot per arm; its sweep takes only its slots'
+    cloids, XG-1), the Binance arm (one owner slot, BX-7) and `HyparbLive`
+    (slot 0's own wallet): their slot → the whole cancel; any other slot →
+    nothing to cancel, `Clear`.
+- **The router.** Each halted slot's cancel cycle runs on its own — at most
+  one request per slot per poll, a failed request retried for that slot, a
+  `Stranded` re-asked for that slot — and a slot's `Clear` releases that
+  slot's resting rows, count and notional alone (`Ledger::clear_resting_slot`).
+  The latch, `exec.HALT`, `--halt-slot` and the live-only filter are
+  unchanged. `HlExchange`'s boot and shutdown sweeps
+  (`cancel_ours_everywhere`) and the gateway's shutdown are unchanged; the
+  venue-wide `cancel_all` is now what the single-slot arms answer for their
+  own slot.
+- **The behaviour that changes.** Two live slots on one arm with different
+  thresholds (say a WS gap of 5 s on one and 30 s on the other): the first
+  halts and pulls its own quotes; the other's stay until its own threshold
+  trips. Before XH5a the venue-wide cancel pulled both. That is the ruling's
+  intent; an operator who wants both pulled together sets the same
+  thresholds, or halts both. **A condition of the whole arm still reaches
+  every slot on it:** the budget floor, a venue lock, the gateway's halt word
+  and margin risk come from the arm's signal, which every slot it trades
+  reads — each latches and cancels its own. BIN15's halt path changes with
+  this (R-XH4-1 says so): a BIN15 halt cancels BIN15's orders, not another
+  operator-arm slot's; its flip checks are re-read in XH5e.
+- **The foreign-row refusal** (the runtime gap XH4h-2 recorded: ai-exec and
+  vm choose their symbols at runtime). An instrument row slot 6's boot binds
+  carries an owner byte; the router refuses a live order of any other slot
+  on an owned row — `RiskRefusal::ForeignRow`, counted
+  (`refused_foreign_row`, published as
+  `engine_exec_hlgw_refused_foreign_row_total`) — before any ledger
+  arithmetic. The XH4h-2 boot rule stays. `RouteCounters` grew to five lines
+  for it, on purpose.
+- **The boot.** `check_gateway_alone` is now `check_gateway_slot`: D2's
+  refusal is gone, so a live gateway slot 6 runs beside the live slots of the
+  operator's blocking arm — on TESTNET with them (LAW E-4 puts both arms on
+  the market data's network): XH5e's engine-instance check. Slot 6 beside
+  slot 0 or a live Binance slot stays refused until XH5b: their arms trade
+  mainnet only (`MainnetAuthority`, BX-16), and one engine never mixes a
+  testnet rehearsal with mainnet orders. The session-bound refusal stays
+  until XH5b. The engine composes `SlotSplit(6, operator arm, gateway arm)`;
+  every other shape with slot 6 stays an abort.
+- **Under-cancel is what this cut must rule out:** a halted slot's order
+  left resting. The mask is the halted slot's bit; every pass re-reads the
+  venue's open orders; a pass that finds none of the carried slots' orders
+  on a leg drops the entry, as does one whose cancels the venue all
+  confirmed (`SweepOutcome::Done`, unchanged); an entry given up on, or a
+  leg the table could not hold, strands the slot and the router asks again.
+  A per-slot clear never touches another slot's rows. A request queues
+  every live leg at once, and a leg the table cannot hold is re-asked from
+  the start of the walk, so `cli` pins at compile time that the table holds
+  every leg the feed can bind (`2 × HL_MAX_FAMILIES ≤ MAX_PENDING_SWEEPS`).
+- **The single-slot arms' premise.** `HlGatewayArm` answers `Clear` for any
+  slot but its own because one gateway serves one slot today; XH4i, which
+  lets a gateway serve several, must carry the slot into its sweep request
+  and replace that answer. `HyparbLive` now refuses another slot's order
+  (`Unroutable`), the premise of its own `Clear`. `VenueSplit` asks both arms
+  for a slot whatever its route — a Binance-only slot's halt also queues
+  `HlExchange` sweeps, which find nothing of its: the safe direction, at
+  the old verb's cost.
+
+**The shared testnet account (the shape XH5a makes bootable).** Slot 6's
+gateway signs as the E3 testnet agent, on the account slots 0 and 3 test
+on. With slot 3 (or 4, 5) live on the operator's arm on that account,
+nothing under-cancels, but:
+(a) slot 6's dead man goes off once another slot's order is seen on the
+account (`deadman_wanted` arms the account-wide `scheduleCancel` only on
+an account of its own or while slot 6's orders are the account's only
+ones), so for that while its quotes outlive a process death — until a boot
+that runs slot 6's gateway sweeps them (the operator arm's boot sweep takes
+`#` coins only);
+(b) two budget governors count one address: the operator arm's (seeded at
+boot, re-read in top-ups) never sees the gateway's spend, so its
+`BudgetFloor` halt can fire late;
+(c) the venue's window of 100 nonces is shared by two live signers — the
+case XH4h-1 left for this ruling;
+(d) slot 6's perp fills land in the operator arm's `fills_unresolved`;
+(e) a session bound on slot 3 would be judged on the shared account.
+XH5e's engine-instance check therefore runs the operator's arm on a testnet
+master AND agent of its own (`HYPERLIQUID_*` ≠ the E3 agent's: the nonce
+window of (c) is per signer), or records (a)–(e) as accepted for that run.
+XH5b's own account ends all five for slot 6.
+
+**Residual, for Anton: the arm-wide reject streak.** A cancel the venue
+answers "never placed, already cancelled or filled" counts into the arm's
+reject streak, which every slot on the arm reads: a halted slot's member
+cancelling orders its sweep already took could trip a sibling at
+`halt_on_reject_streak`. Fail-safe (the sibling halts and cancels its own),
+and left as it is: making that answer neutral, as E7-F2 did for an IoC miss,
+would change BIN15's mainnet streak.
+
+**XH5e obligations from this cut:** BIN15's flip checks re-read under the
+per-slot halt (R-XH4-1) — `scripts/bin15-flip.sh` counts every order on a
+`#` coin as slot 3's, which a sibling slot's HIP-4 orders on the operator's
+account would break; the shared-account choice above.
+
+**Superseded:** O-BX8's fan-out (a halt's cancel "fans out to every live
+arm", BX3 and `docs/binance-exec-plan.md`) — it now carries only the halted
+slot's orders, on every arm that slot trades; E6 commit 3's "venue-wide
+cancel on the edge" and "two slots in one poll share one request, because
+cancel-all is venue-wide"; XH1's note that a slot-6 halt's venue-wide cancel
+would pull bin15's quotes; XH4f's D2 refusal (`check_gateway_alone`);
+XH4h-1's "only once D2 lets two signers of one agent run live together" (the
+shape above); XH4h-2's "dead while D2 keeps a live gateway slot 6 alone" and
+its runtime gap (closed by the foreign-row refusal).
+
+**Deviations from the plan:** only the shape that can boot is composed —
+slot 6 beside the operator's arm; the shapes with slot 0 or a Binance slot
+wait for XH5b, since they cannot boot while the gateway is testnet-only. The
+plan's composition loopback with both real arms is covered by a loopback
+through the real `HlExchange` (slot 3's halt cancels slot 3's oid alone,
+`exec_composition_loopback`), the spy-arm router tests and gate 100; the
+run with both real arms is XH5e's engine-instance check. `RouteCounters`
+grew to 320 B.
+
+**Tests:** the router (a halt asks only the halted slot; two slots in one
+poll run two cycles; a slot's failed request and its stranded sweep re-ask
+that slot alone; a slot's `Clear` releases its rows only; an owned row
+refuses another live slot's order, passes its cancel and the owner's order,
+never judges a paper slot); the ledger (the per-slot clear; an owned row
+refuses every other slot; an owner past the slots refused at the bind);
+`SlotSplit` and `VenueSplit` routing; `HlExchange` (a halted slot's sweep
+carries its slot alone, a second slot ORs in, per-slot
+`Working`/`Stranded`/`Clear`, the roll still every slot's); `ours_on_leg`'s
+slot filter; the real-arm loopback (slot 3's halt: the venue's read lists
+slots 3 and 4, one cancel leaves the host, for slot 3's oid; slot 3's row
+released on the confirmation, slot 4's kept); `bind_perps` owns slot 6's
+rows; the boot (slot 6 beside slot 3 resolves, the operator arm's numbers
+are slot 3's; beside Binance or slot 0 refused; the session bound refused);
+slot 0's halt reaches slot 0's arm alone; alloc gate 100 (0 B: the router's
+per-slot cycle through `Retry`, `Stranded` and the `Clear` that releases a
+real row; `HlExchange`'s per-slot request over more legs than its table,
+`strand` included; the sweep's selection), gate 99 binding slot 6's row as
+the engine does.
+
+**Gates (the committed tree):** clippy 0; nextest 4 119/4 119; alloc 108
+(+3 ignored) at 0 B, gate 100 new, compiled fresh; copy new=0; license OK;
+release OK; replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — risk, allocation and zero-copy APPROVE WITH NITS (no
+under-cancel path; the texts above — superseded rulings, deviations, the
+shared account, the residual, the single-slot premise; the router-level
+foreign-row test, the real-arm loopback, gate 100's widening, the size pin,
+the owner's validation, stale texts — all taken); round 2 — zero-copy
+APPROVE, risk and allocation APPROVE WITH NITS (the feed-to-table pin, two
+wordings, a comment, the alloc gate's freshness — taken); round 3 — risk,
+allocation and zero-copy APPROVE. Answered, not changed: the three
+single-slot overrides stay explicit; `VenueSplit` asks both arms;
+`sweep_one_pending`'s 36 B snapshot stays (pinned); the reject-streak
+residual above.
+
+### XH5b-1 amendment (2026-10-03): the account's worth — perp value plus spot USDC
+
+The first half of XH5b (plan §3.2 item 3; the cut is split in two,
+session-5 assumption A-S5-15).
+
+- **What changes.** On an account of slot 6's own (`own_account`), the
+  gateway arm reads the spot sheet right after each perp sheet:
+  `spotClearinghouseState`, a new gateway read (`CMD_READ_SPOT`, IP weight
+  2) answered by one `EV_READ_DONE` that carries the USDC `total` and
+  whether the sheet lists USDC at all, scanned in place into a fixed
+  256-row table (8 KiB, pinned). **The account's worth is the perp sheet's
+  `accountValue` plus that USDC.** Spot USDC margins the perps (XH4g
+  measured `accountValue` at $0 on E3), so USDC moving between the two
+  halves moves neither the worth nor the session P&L.
+- **Fail-closed rules.**
+  - A spot sheet that lists no USDC row is a failed read, never a $0 half
+    (`account_view`'s rule: nothing to anchor) — no anchor, no judgement,
+    the agreement ages. An own account must therefore list USDC on its
+    spot sheet; a zero balance listed is a legitimate $0 half.
+  - The anchor, when none was restored, is the first COMPLETE worth — never
+    half of one — and a positive one: a $0 worth (an unfunded account)
+    anchors nothing, the blocking arm's E7 rule, and the slot's first
+    reconciliation waits for an anchor.
+  - The P&L is judged, and the slot reconciled, only once the spot half has
+    landed. A restored anchor is never judged against the perp half alone,
+    which would read the whole spot balance as a loss; and the router
+    refuses the slot's live places until its first reconciliation, so the
+    slot never quotes before its worth is known. Unjudged, the signal's P&L
+    reads 0.
+  - The agreement (`ReconStale`'s clock) needs the spot half fresh within
+    two read periods, as it needs the sheet and the orders: a spot read that
+    keeps failing halts the slot as a stale reconciliation.
+  - One spot read per perp sheet, ahead of the other reads. A failed one —
+    a failure, an end of another kind, no answer, no USDC row — waits for
+    the next perp sheet: it never storms, whatever the skew, and delays a
+    pending re-read by one answer at most.
+- **The shared account judges nothing new:** no spot read and no bound, as
+  before; and no anchor is taken there any more (it was never judged nor
+  offered for keeping).
+- **Residuals.**
+  - *Two reads, not one.* The halves are read one answer apart, not
+    atomically. USDC that moves between them inside that gap — a class
+    transfer, or, on a spot-margined account, a reducing fill's realised
+    P&L, its fee or a funding payment settling to spot — misreads the worth
+    by its amount for one reconciliation: as a loss (the bound may halt —
+    fail-closed), or as a gain that hides a loss of that size for one
+    reconciliation. The settlements are small against the bound (a $15
+    clip); XH5e's runbooks forbid transfers while slot 6 is live.
+  - *A stale spot half.* While spot reads fail, the P&L stays judged on the
+    last spot half — blind to realised losses that settle to spot since —
+    until `ReconStale` halts the slot: up to two read periods plus
+    `halt_on_recon_stale_ms`. XH5b-2 sizes `halt_on_recon_stale_ms` with
+    this window in mind.
+  - *Other spot tokens* are outside the worth (USDC only): the probe's HYPE
+    for the ALO priority fee (XH5d) is spent outside the bound, which XH5d
+    bounds by its own cap.
+  - Top-ups (`reserveRequestWeight`, XH5c) are paid from the perp balance
+    and read as a real spend; Q-XH5-2's add-back is XH5c's.
+- **For XH5e — the pre-arm check.** The sum assumes no dollar is in both
+  halves: measured flat on E3, whose spot USDC margins the perps, but
+  margin in use could sit in both (`accountValue` counts margin; the spot
+  `total` counts `hold`), and a flat check cannot see it. The runbook
+  therefore opens a small position on the own account, reads both sheets,
+  and requires the worth ≈ the USDC funded − fees + the position's
+  unrealised P&L, logging `marginSummary.totalMarginUsed` against the spot
+  USDC `hold`: a residual of half the margin in use or more aborts the
+  arming. The account is funded in full before its first boot, and no
+  deposit or withdrawal is made while a session's anchor stands: the first
+  positive worth anchors, so funding in steps would anchor at the first step
+  and read the rest as gain (a new session starts by deleting XH5b-2's
+  anchor file).
+- **Not in this cut (XH5b-2):** the XMM scopes and their refusals,
+  `own_account` on them, the anchor file, the mainnet guard behind the
+  interlock, and the session-bound refusal kept only on the shared account.
+  The composition still runs slot 6 on the shared E3 account
+  (`cli::xmm_live::OWN_ACCOUNT` false), so no spot read is issued yet.
+  `read_weight_per_min` takes the spot read as a flag (2 a period), and
+  `xmm_live`'s 40 % pin reads it from `OWN_ACCOUNT`: at `RECON_MS` 10 s the
+  spot read would take the reads to 164 a minute, past 40 % of the share
+  (160), so XH5b-2 cannot turn the own account on without XH5c's 30 s (68).
+  XH5b-2 also owes: an own-account floor for `halt_on_recon_stale_ms` of
+  four read periods, since a failed spot read waits a whole period (the
+  boot's floor of two would halt on two failed spot reads in a row);
+  `spot_reads` and the refused spot reads on `/metrics` (moving the
+  `GatewayArmReport` pin and `HLGW_COUNTERS`); and, once the scope sets
+  `own_account` at boot, a boot-time check of `read_weight_per_min` against
+  the share (the const pin then covers the default only).
+
+**Tests:** the gateway — the spot read's one end on the venue's own
+testnet body ($999 over fourteen rows, USDC listed), a sheet with no USDC
+saying so, one that does not scan failing with its own code; the read
+weights by kind; the steady weight with and without the spot read; the
+read kinds ending at the spot sheet. The arm — the worth sums the halves
+and moves with both; the spot read goes before the orders and the anchor
+waits for it; a restored anchor is not judged on half a worth; a $0 worth
+anchors nothing until the account is funded; a sheet without USDC is a
+failed read (no anchor); a failed spot read — an end of
+another kind, a timeout — waits for the next perp sheet, at skew 0 too;
+the first reconciliation waits for the spot half (the sheet, the orders,
+the budget and the day read: nothing reconciled, no agreement, nothing
+judged); the spot half goes ahead of a pending re-read; an agreement needs
+a fresh spot half; a shared account reads no spot sheet. Alloc gate 98
+(spot reads every sheet — every sixth failing, every seventh listing no
+USDC — the arm's answered spot reads and the refused ones each a path the
+window must run) and gate 96b (the real gateway's spot read beside the
+budget and day reads: its pin moves 4 → 6, three records sealed and three
+opened, rustls' alone — the XH4e entry's "4 for two short reads" is
+superseded).
+
+**Gates (the committed tree):** clippy 0; nextest 4 129/4 129; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — zero-copy and allocation APPROVE WITH NITS (stale
+size and weight notes, the request render's COPY note, gate 98's paths
+counted on the arm's side, gate 96b's comment, the 40 % pin's flag — all
+taken), risk REQUEST CHANGES (a sheet without USDC anchored and judged as
+$0, the XH5e check blind to margin counted twice, the latch untested, the
+residuals, a retry with no floor — all taken; other spot tokens documented
+outside the worth); round 2 — zero-copy APPROVE, allocation and risk
+APPROVE WITH NITS (the zero-worth anchor and the check's tolerance —
+taken; `/metrics`, the own-account stale floor and a boot-time weight
+check — XH5b-2's, above); round 3 — allocation and zero-copy APPROVE, risk
+APPROVE WITH NITS (funding in full before the first boot — taken).
+
+### XH5b-2 amendment (2026-10-03): slot 6's own testnet account — its scopes, its refusals, its anchor kept off the engine thread
+
+The second part of XH5b (plan §3.2; session-5 assumption A-S5-21).
+XH5b-3 puts mainnet behind its interlock; nothing here reaches mainnet.
+
+- **The account.** Slot 6 trades on its OWN testnet master and API wallet
+  when `HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR}` are set — both are
+  then required (`exec_hyperliquid::config::Scope::XmmTestnet`; its host
+  and source are the smoke's `HYPERLIQUID_TESTNET_*`, defaulting to
+  testnet); otherwise on the shared E3 account as before (`Scope::Testnet`,
+  `own_account = false`). `Scope::Xmm` (mainnet:
+  `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` on the live arm's
+  `HYPERLIQUID_EXCHANGE_HOST` / `HYPERLIQUID_SOURCE`, every variable
+  required, as `Scope::Live`) is declared; XH5b-3 composes it. No two
+  scopes read the same key or master variable (pinned).
+- **The refusals (O-XH3)**, on its own account:
+  - *Nothing shared.* Neither slot 6's master nor its API wallet may be an
+    address another arm signs or trades as: E3's testnet master and agent
+    (`HYPERLIQUID_TESTNET_*`), slot 3's (`HYPERLIQUID_MASTER_ADDR`,
+    `HYPERLIQUID_AGENT_KEY`), HYPARB's (`HYPERLIQUID_HYPARB_MASTER_ADDR`,
+    and the wallets `HYPEREVM_MAINNET_KEY` / `HYPEREVM_TESTNET_KEY` sign as
+    — X signs as itself). Masters and signers are compared crosswise (an
+    API wallet that is another arm's master refuses too). A set variable
+    that does not parse (a value that is not Unicode included), or holds no
+    valid key, refuses and is named: the check cannot vouch for it
+    (`xmm_live::check_own_account` and `identities_with`, pure, under an
+    env wrapper).
+  - *The venue binds the API wallet to slot 6's master.* An order lands on
+    the account of the master that approved the API wallet, while the
+    arm's reads and its fill stream follow the configured master: a wallet
+    approved by another master would trade that account unseen (its orders
+    read gone, its fills never booked, the worth unmoved, the bound blind).
+    One boot read of `userRole` for the API wallet (its request rendered
+    straight into the boot client's body window,
+    `hyparb_live::info_rendered`) must answer `agent` for slot 6's master —
+    or `user` when the wallet is the master itself, signing as itself; any
+    other answer refuses
+    (`xmm_live::check_agent_binding`, pure; `recon::scan_user_role`).
+  - *Keys.* Another arm's key is read only to derive its address, in the
+    one form the policy lets a signing key have
+    (`core_config::SecretKeyBytes`: mlock'd, its hex and bytes erased), and
+    dropped at once (`config::agent_addr_from_env`); the presence check
+    erases the copy the standard library hands over
+    (`config::env_is_set`). `HlConfig::from_env` now holds its parsed key in
+    a wrapper that erases it on every return.
+- **The rules by account** (`xmm_live::check_account_rules`, at slot 6's
+  boot):
+  - the read period: 30 s on its own account (`OWN_RECON_MS`: the perp
+    sheet, its spot half and the orders — 68 IP weight a minute with the
+    budget read), 10 s on the shared one (`RECON_MS`: 152; HYPARB's
+    gateway hedge keeps it); both pinned under 40 % of the gateway's share
+    (160) and checked again at the boot;
+  - `halt_on_recon_stale_ms` ≥ four read periods on its own account
+    (120 s: a failed spot read waits a whole period for the next sheet,
+    XH5b-1, so two in a row must not halt the slot), two on the shared one
+    (20 s);
+  - the session bound: refused on the shared account (moved here from
+    `exec_boot::check_gateway_slot`, which cannot know the account) and
+    REQUIRED on its own (`halt_on_loss_usd_1e6` > 0 — O-XH5: the probe's
+    −$50), where it is judged on the account's worth (XH5b-1).
+- **The anchor, kept (E7: the bound outlives the process).** One file a
+  network beside the exec artifact — `xmm-pnl-anchor-testnet.state` here
+  (one master address can exist on both networks, and one network's worth
+  is never the other's anchor) — in E7's format (`<master>\t<usd
+  ×1e6>\t<unix s>`; the number is the account's worth).
+  - At the boot it is read strictly (`anchor::load_own`, at most 128 B into
+    a stack buffer): no file is a session's first boot; this master's line
+    is restored (the arm's `anchor_1e6`, durable from the start, and no
+    keeper is wired); ANYTHING ELSE — another master's line, a malformed,
+    overlong or empty line, a file that cannot be read — refuses the boot.
+    A re-anchored bound is a bound on nothing, and only the operator ends a
+    session, by moving the file aside.
+  - With no anchor restored, the fresh one (the first complete, positive
+    worth, XH5b-1) is handed by the arm through an `AnchorSlot` (one atomic
+    word in a granule of its own: the anchor to keep, then its negation
+    once kept) to an `AnchorKeeper` on the gateway's thread
+    (`xmm_live::run_gateway`: one load a pass until it acts), which stores
+    it once (temp file, fsync, rename) and writes back "kept".
+  - **The arm reports itself reconciled only once it reads the anchor
+    durable**, so the router's first-reconciliation latch holds every quote
+    until then. **A store that fails halts the gateway**
+    (`gateway::HALT_ANCHOR_UNKEPT` = 16, the HL gateway's first venue halt
+    reason): the router halts the slot on the gateway's word, and the slot
+    stays unreconciled. An arm with no keeper never reads a fresh anchor
+    kept — the safe direction.
+- **`/metrics`** (`engine_exec_hlgw_*`; `GatewayArmReport` 760 → 816 B,
+  the counters 66 → 68, the levels 27 → 32): `spot_reads_total` and
+  `spot_failed_total`; `own_account`, `pnl_anchor_usd_1e6`, `anchor_kept`,
+  `worth_usd_1e6` and `session_pnl_usd_1e6` — what XH5e's checklists read.
+  `/state` is unchanged.
+- **The boot tell** names the account (its own — with the master, the API
+  wallet and the loss bound — or the shared one) and the anchor (`anchor
+  RESTORED`, with its value and its file, or "the first complete worth
+  anchors, kept in …").
+- **Residuals.**
+  - *No directory fsync after the store's rename* (`core_io::write_atomic`,
+    as E7's anchor): a power loss right after a session's first store may
+    lose the file's name — a process crash cannot — and the next boot then
+    finds no file and anchors anew. XH5e's runbooks check that every boot
+    of a session after its first tells `anchor RESTORED`.
+  - *Longer windows on an own account.* A stale spot half (XH5b-1's
+    residual) stays judged for up to two read periods (60 s) plus
+    `halt_on_recon_stale_ms` (≥ 120 s; the probe's artifact states 180 s)
+    before `ReconStale` halts; a drift must survive two sheets 30 s apart
+    (≈ 60 s, against ≈ 20 s on the shared account). The $15 clip and the
+    caps bound what either window can hide.
+  - *Key copies beyond our reach:* deriving an address copies the key into
+    the signer library's secret type, which does not erase itself (as every
+    boot's `HlConfig::new` already does); the process `environ` itself
+    cannot be erased.
+  - *The shared account still runs* when the XMM testnet variables are
+    unset, with the XH5a amendment's effects (a)–(e); the boot tell says
+    which account.
+- **For XH5e:** the engine-instance testnet check runs slot 6 on its own
+  testnet account (both variables set), which ends (a)–(e) for slot 6; its
+  `exec.toml` states `halt_on_recon_stale_ms` ≥ 120 000 and a loss bound;
+  every boot after a session's first must tell `anchor RESTORED`; the
+  runbook ends each session by moving the anchor file aside.
+- **Superseded:** XH4f's "states no session bound" for the gateway slot
+  (`exec.toml.example`), `check_gateway_slot`'s session-bound refusal
+  (moved), XH5b-1's `cli::xmm_live::OWN_ACCOUNT` (gone: the boot decides
+  the account), `HlGatewayArm::fresh_anchor_1e6` (the keeper replaces the
+  owner's getter), and the boot's stale floor of two `RECON_MS` for every
+  account.
+
+**Tests:** the scopes (each reads its own key and master; the testnet ones
+alone default; the interlock names the scope's variable); the boot helpers
+(a master, a key's address, a set variable that does not parse — a value
+that is not Unicode included — or holds no key, named; presence); the
+own-account check (a shared master, a shared signer, crosswise both ways,
+nothing configured), its variable lists and the identities over fake
+readers (every set master and key; a variable a reader refuses fails the
+boot, named — no test touches a real key's variable); the agent binding
+(an API wallet of the master, the master itself, another master's wallet,
+another master, an unknown address) and the `userRole` request and
+answers (an agent and its master, a master, the rest); the rules by
+account (the floors at four and two periods, the bound refused on the
+shared account and required on an own one, the read weights 68 and 152),
+the template's slot-6 recipe under both; the anchor file's place, one a
+network; the strict read (no file, this master's line, another master's,
+a malformed, an empty and an overlong file); the keeper (nothing before
+the hand-over, one store, kept only for the value handed over, once a
+session; a store that fails halts the gateway and keeps nothing); the arm
+(a fresh anchor handed over and the first reconciliation waiting for it —
+and for good once the gateway halts; a kept anchor reconciles on the next
+pass; no keeper, never reconciled; a restored anchor durable with nothing
+to keep; the report's new fields; `spot_failed` on every failed spot
+read); the boot (a session bound resolves at `exec_boot`); `/metrics`
+(every new row its own value); alloc gate 98 (a real keeper stores the
+boot's anchor just before the window, whose first pass reads it kept; in
+every round of the window that keeper's pass and one nothing is handed
+to; `spot_failed` one of the window's paths).
+
+**Gates (the committed tree):** clippy 0; nextest 4 147/4 147; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk.
+
+**Reviews:** round 1 — zero-copy and allocation APPROVE WITH NITS (stale
+size and count notes, another arm's key read as a bare array, a keeper
+wired beside a restored anchor, gate 98 blind to the keeper's pass — all
+taken), risk REQUEST CHANGES (this section had swallowed the next one's
+heading; an API wallet another master approved would trade an account
+slot 6 does not read — the `userRole` binding; the keys' form, one anchor
+file a network, the test gaps — all taken); round 2 — all three APPROVE
+(the `userRole` request staged before its copy — rendered in place; a set
+key that is not Unicode read as unset — refused; a test reading the real
+environment — fake readers; wording — all taken); round 3 — all three
+APPROVE (a COPY note claiming constants only — reworded); round 4
+(comments only) — zero-copy APPROVE (the function's doc — taken).
+
+### XH5b-3 amendment (2026-10-03): slot 6 on mainnet behind its interlock — the network is the market data's
+
+The third part of XH5b (plan §3.2 item 4; session-5 assumption A-S5-21).
+Nothing is armed: the path exists; the first mainnet run is the operator's,
+by XH5e's checklist.
+
+- **The network is the market data's (LAW E-4)** — the venue's own hosts
+  alone (`xmm_live::md_network`: `HYPERLIQUID_WS_HOST`, a `:port` aside,
+  exactly `api.hyperliquid.xyz` or `api.hyperliquid-testnet.xyz`; any other
+  host, a relay, refuses slot 6's boot — its network cannot be vouched
+  for). On mainnet slot 6 trades its OWN master and API wallet
+  (`scope_for`) — `Scope::Xmm`, `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` on
+  the live arm's `HYPERLIQUID_EXCHANGE_HOST` / `HYPERLIQUID_SOURCE`, every
+  variable required, never defaulted — always: there is no shared mainnet
+  account. On testnet, XH5b-2's: its own account when its testnet
+  variables are set, else the shared E3 one.
+- **The interlock** (Q-XH5-3's default — no third switch). Slot 6 boots
+  only when it is live in the exec artifact AND named by `--arm-live`
+  (`exec_boot::resolve`'s two switches, LAW E-1) — the same switches on
+  both networks: what makes a run MAINNET is the market data (the venue's
+  mainnet host) and slot 6's own mainnet variables. Then
+  `xmm_live::check_network` (pure): the exchange host's network must be
+  the market data's (E-4), the host the venue's own for that network (no
+  local double), and the scope that network's — mainnet `Scope::Xmm`
+  alone, testnet a testnet scope. Anything else refuses the boot, naming
+  what does not hold.
+- **On mainnet, every XH5b-2 rule of an own account holds:** nothing shared
+  with E3's, slot 3's or HYPARB's masters and signers; the venue's
+  `userRole` binding of the API wallet to the master; reads every 30 s; a
+  stale floor of 120 s; the session bound REQUIRED (the probe's −$50,
+  O-XH5), judged on the account's worth against the anchor kept in
+  `xmm-pnl-anchor-mainnet.state` — its own file.
+- **Beside the mainnet-only arms** (`ExecBoot::check_gateway_network`,
+  replacing `check_gateway_slot`): slot 6 runs beside slot 0 (its
+  `MainnetAuthority`) or a live Binance slot (BX-16) only when the market
+  data is the venue's mainnet host; otherwise the boot refuses, naming that
+  arm's slot — one engine never mixes a testnet rehearsal with mainnet
+  orders. Alone, or
+  beside the operator's arm (XH5a), either network. `resolve` reads no
+  host, so the engine asks right after it, before any arm boots; slot 6's
+  boot asks again.
+- **The compositions** (`multivenue-engine`): the other arms' eight shapes
+  each enter the loop through one macro (`shape!`), alone or with slot 6
+  outermost — `SlotSplit(6, <shape>, xmm)` — sixteen compositions, no
+  `dyn`; under slot 6 the Binance arm's aliases are read one `a()` deeper;
+  the "beside a mainnet-only arm" abort is gone. A halt cancels the halted
+  slot's orders alone through every nesting (`SlotSplit::cancel_slot`,
+  XH5a).
+- **The tell and the loop's line name the network:** "the Hyperliquid
+  gateway, MAINNET", "slot 6 on its OWN MAINNET account …", and "slot 6 LIVE
+  on the Hyperliquid gateway (MAINNET) beside <the arms> — real MAINNET
+  orders will be submitted".
+- **Residuals.**
+  - *The mainnet switch is slot 6's mainnet variables.* Under Q-XH5-3's
+    default the artifact's switch and `--arm-live 6` are the same on both
+    networks, and `HYPERLIQUID_WS_HOST` defaults to the mainnet host when
+    unset: a testnet rehearsal's artifact and command line arm MAINNET
+    wherever the market data is mainnet and
+    `HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}` are set. XH5e keeps those two
+    variables out of `.env` outside an armed mainnet session; a third,
+    network-naming switch (Q-XH5-3's alternative) stays the operator's call.
+  - *Likely no dead-man switch (O-XH4, restated for mainnet):* a fresh XMM
+    master is unlikely to be eligible for `scheduleCancel`, so slot 6 would
+    quote with no venue-side dead-man. The engine-sent TTL cancel (LAW E-8,
+    XH4f) works only while the gateway lives — `expiresAfter` never ends a
+    resting order — so between a crash or a network loss and the next
+    boot's sweep the quotes rest, bounded by the caps ($300 resting, ±$150
+    a perp); XH4f's alert names it (the maker plan's accepted risk, §8.11).
+    XH5e reads `dm_availability` before the first quote.
+  - *Until XH5c, no top-ups* (the gateway slot states no top-up keys): on
+    mainnet the address budget is what the account's traded volume funds;
+    at the arm's floor the slot halts, quoting nothing more — the safe
+    direction, and a short probe.
+- **For XH5e:** the mainnet arming checklist states each switch (slot 6 live
+  in the artifact, `--arm-live 6`, the XMM mainnet variables — set for the
+  armed session alone — and both hosts the venue's mainnet ones), reads
+  `dm_availability`, the boot tell's `MAINNET` and anchor lines, and checks
+  `/metrics` before the first quote; the testnet runbook runs the same boot
+  on testnet first.
+- **Superseded:** `exec_boot::check_gateway_slot` (its refusal is
+  `ExecBoot::check_gateway_network`'s, now by network); `boot_xmm_arm`'s
+  testnet-only refusal; the engine's "slot 6's gateway beside a mainnet-only
+  arm" abort; `xmm_live::account_name(own)` (now by scope).
+
+**Tests:** the market data's network (the venue's two hosts, with a port;
+relays, a look-alike and a bad port refused) and the scope (the network ×
+the account); the gate's matrix (testnet on the testnet host with either
+testnet scope; a double and a mainnet scope refused; mainnet on its own
+account and host; the shared and the testnet scopes and a double refused;
+both E-4 mismatches refused); `check_gateway_network` (testnet beside
+Binance and beside slot 0 refused, naming them; mainnet beside both; alone
+and beside the operator's arm, both networks); the tell (its own MAINNET
+account with no anchor and with one
+restored; the shared TESTNET account); the nested composition
+(`SlotSplit(6, SlotSplit(0, a, b), c)`: each slot's verbs reach its own
+arm, each slot's sweep asks its own arm alone); the engine compiles all
+sixteen compositions.
+
+**Gates (the committed tree):** clippy 0; nextest 4 151/4 151; alloc 108
+(+3 ignored) at 0 B, compiled fresh; copy new=0; license OK; release OK;
+replay 7× IDENTICAL; rustfmt clean on every touched hunk. (Round 2's run
+failed the debug `ws_frame_roundtrip_is_zero_alloc` once — the counting
+allocator is process-global and caught the test harness's own thread; the
+release gate passed; the committed tree's run is clean.)
+
+**Reviews:** round 1 — allocation and zero-copy APPROVE WITH NITS (an
+`armed` input that restated the boot's precondition; the shapes' moves
+un-noted — taken), risk REQUEST CHANGES (the market data's network read
+from its host's spelling: a relay serving testnet data would pass for
+mainnet beside the venue's mainnet exchange host — now the venue's own
+hosts alone; the mainnet switch and the dead-man residual stated —
+taken); round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH
+NITS (the dead-man residual named a protection `expiresAfter` does not
+give — reworded).
+
+### XH5c-1 amendment (2026-10-03): one top-up governor, and the gateway's weight purchase
+
+The first part of XH5c (plan §3.3 item 1; session-6 assumption A-S6-16:
+XH5c in three commits — the governor and the command; the gateway arm's
+top-ups; the RTT word and the cadence). Nothing new is sent: no arm
+pushes the command before XH5c-2.
+
+- **One governor** (`exec_hyperliquid::budget::TopupGovernor`, 40 B,
+  `Copy`, never allocates): S7-L1's top-up policy moved out of `HlExchange`
+  — the weight per top-up (`0` = off), the day's max, the UTC day and the
+  weight bought on it, the session's spend — with the band rule
+  `topup_fits` and `TOPUP_PRICE_1E6`, unchanged. `above_band` (the cheap
+  check before a venue read), `wants` (the day roll, then the band rule),
+  `take` (decide and charge the day in one step — for an arm whose
+  purchase answers later), `charge_day`, `charge_cost`, `confirms` (seen on
+  the venue: half the weight), `stop` (weight 0, the day spent),
+  `new_session`, `state` (the state line). The blocking arm's
+  `top_up_budget` / `stop_topups` call it in the order they always ran:
+  its policy, its six guards and its state file are unchanged — but one:
+- **The day rolls forward only** (review r1): a clock stepped back across
+  00:00Z (an NTP step, a hand-set clock) no longer re-opens a day already
+  spent — `wants` rolls on a LATER day alone, and `restore_topup` keeps a
+  stored day one later than today with its usage; a day stored further
+  ahead (a clock that once ran ahead) reads as today spent, healed the next
+  day — never top-ups off until the clock catches up. Both arms.
+- **`CMD_RESERVE` (12)** on the gateway: a control action
+  (`HlCmd::reserve`, `arg` the weight), encoded by `encode_reserve_weight`
+  — the SDK vector's encoder — and its JSON twin `reserve_weight_json` in
+  one dispatch (`encode_control`; `ControlWire`'s `leverage` becomes
+  `arg`). It GROWS: the halt, an unready gateway and the throttle refuse
+  it — a halted, unready or throttled slot buys nothing. Its answer is a
+  control answer (ACK, REJECTED or UNANSWERED).
+- **For XH5c-2** (the gateway arm's top-ups): decide with `take` (the day
+  charged before the purchase leaves) and have the state stored off the
+  engine thread before the command is pushed; route the purchase's answer
+  by its own client-id range (never `stray`); refund the address request
+  when the purchase is refused before it leaves (halted, not ready,
+  throttled), and never read such a refusal as bought nor charge its cost;
+  the weight narrowed to the command's `u32` by refusal, never truncation;
+  the state file per network; the command built in place and pushed by
+  reference (the ring slot its one copy); the arm's size pin (1 664 B) and
+  its notes, and the report's (816 B) with its trait doc, size check and
+  `/metrics` notes, moved together; the whole round trip under the alloc
+  gates (the arm's step in gate 98, the control post in gate 96b).
+
+**Tests:** the band (moved with it); the governor (off, the band, the
+day's max, the day roll — forward only — the charges, `take` deciding
+once for a day with room for one, the state line, the confirm's bar, the
+stop, `above_band`); the restore (a later stored day kept with its usage);
+`CMD_RESERVE` is a control and no read, carries its weight, grows and
+carries no order verb; its JSON twin and its msgpack (the vector's
+encoder's bytes); a kind past the last is refused.
+
+**Gates (the committed tree):** clippy 0; nextest 4 152/4 152 (the known
+`a_frame_larger_than_the_buffer_is_refused_not_grown` flake passed on its
+one re-run); alloc 108 (+3 ignored) at 0 B, compiled fresh; copy new=0;
+license OK; release OK; replay 7× IDENTICAL; rustfmt clean on every touched
+hunk.
+
+**Reviews:** round 1 — zero-copy APPROVE, risk and allocation APPROVE WITH
+NITS (a clock stepping back re-opened a spent day — the forward roll; the
+decide/charge split for an arm whose purchase answers later — `take`;
+three double blank lines; the band's check in two files — `above_band`);
+round 2 — allocation and zero-copy APPROVE, risk APPROVE WITH NITS (a day
+stored far ahead kept top-ups off until the clock caught up — read as
+today spent; XH5c-2's list completed); round 3 — risk and zero-copy
+APPROVE.
+
+### XH5c-2 amendment (2026-10-03): the gateway arm's top-ups — decided at a budget read, stored before they leave
+
+The second part of XH5c (plan §3.3 item 1; A-S6-16), built to the XH5c-1
+amendment's "For XH5c-2" list. Nothing is armed: slot 6 buys requests only
+on its own account, when its `exec.toml` slot states the top-up keys, in a
+run the operator arms (XH5e's checklist; the probe's 10 000 a purchase, $5,
+and 100 000 a UTC day, $50 — O-XH9).
+
+- **Decided at a budget read, stored before it leaves.** At a budget read
+  (`limit_done`, the venue's figure applied) with no purchase in flight —
+  on the slot's own account, its session anchor durable, top-ups armed —
+  `TopupGovernor::take` decides one inside the band `(floor, floor +
+  weight]` and the day's max, and charges the day in the same step. The
+  governor's state (the UTC day, the weight bought on it, the session's
+  spend) goes to a `TopupKeeper` on the gateway's thread through a
+  `TopupSlot` (one 128 B granule; one hand-over at a time: the arm writes
+  only once the last one is stored, the keeper reads only after the
+  version that publishes it), which stores it in the slot's own file —
+  `xmm-topup-{testnet,mainnet}.state` beside the exec artifact, never the
+  blocking arm's `exec-topup.state`; the blocking arm's line — tied to the
+  session's anchor (`set_unix_s`: the restored one's, or the fresh one's,
+  handed over by its keeper in the pass it was stored). Only once the arm
+  reads that hand-over kept does the purchase leave: `HlCmd::reserve` built
+  in place in the arm's scratch command (the dead man's, one at a time on
+  the engine thread) and pushed by reference — the ring slot its one copy —
+  one address request. A restart never forgets a purchase that may have
+  left: the day's max holds across processes (`restore_topup` at boot,
+  read into one line's room: no file, a fresh day; an unreadable, overlong
+  or foreign one, today spent). A newer read that leaves a decision still
+  waiting for its keeper out of the band abandons it before it leaves.
+- **The answer, by its own range.** `TOPUP_OID_BASE = (1<<63)|(1<<60)`,
+  the purchases' count in the low 60 bits — bit 63 set, bit 62 clear: the
+  never-left rule refunds its request — routed ahead of `stray` and matched
+  exactly to the purchase in flight.
+  - *Refused before it left* (halted, not ready, throttled — or a full
+    ring at the push): never bought, its price never charged, its request
+    refunded, and the day's charge returned in memory
+    (`TopupGovernor::refund_day`): a throttled minute never spends the
+    day's max on nothing. Decided again at a later read — its state then
+    the one stored, which the keeper marks kept with no write.
+  - *Accepted, or in doubt (unanswered; its request carried as one
+    unanswered until it is seen):* judged at the next budget read ISSUED
+    after the answer — by the read's own number, never a clock — on the
+    headroom apart from what traded volume earned
+    (`AddressBudget::remaining_unearned`: a minute's volume is never read
+    as a purchase): half its weight must show (`confirms`). Not seen: the
+    top-ups stop. Seen: its price (the weight × 0.0005 USDC) is charged to
+    the session's spend once a perp sheet issued after the answer, with its
+    spot half, has landed too — the worth then carries the price; for one
+    answered in doubt, a sheet issued after the read that showed it (it may
+    have landed after a sheet issued since its answer) — and the state is
+    handed over again (no wait; owed and retried a pass at a time while the
+    keeper still stores another).
+  - *Refused by the venue:* they stop. *An answer in the range for no
+    purchase in flight* (the arm's own count gone wrong): they stop.
+  - A stop is `TopupGovernor::stop` after a forward roll to today — none
+    more from this process, and the day it happens on read as spent once
+    its state is stored — counted (`topup_failed`) and handed over.
+- **A halted slot buys nothing more:** the router's sweep of the slot
+  (`cancel_slot`, asked of a halted slot alone, XH5a) and the shutdown end
+  the buying (`topup_end`) — no decision at a read answered after it; a
+  purchase decided and not sent never leaves (abandoned: the day's charge
+  returned). The accounting goes on: a purchase that left is still carried,
+  judged and charged, its spend or a stop handed over — a hand-over owed
+  goes again each shutdown pass, the shutdown waiting for its keeper within
+  its bound, and the gateway's thread gives the top-up keeper one last pass
+  once released. The report's weight reads 0 once the buying ended. The
+  gateway's own halt refuses the purchase unsent as before.
+- **A state its keeper cannot store is never bought:** the slot is marked
+  failed (once; the gateway's thread logs it) and the arm stops. No
+  gateway halt: not buying is the safe direction, and the floor halts the
+  slot when the budget runs dry.
+- **Q-XH5-2's add-back:** the session P&L is the worth less the anchor
+  PLUS the session's spend — the purchases seen on the venue AND inside the
+  worth alone (one not seen, or seen before a sheet carries it, reads as a
+  loss: the safe direction) — so the −$50 bound is the trading's and the
+  day's max is the purchases'. No purchase before the anchor is durable: a
+  price paid before it would be inside it. The spend restored at boot is
+  added back whether or not the artifact still arms top-ups. One purchase
+  is priced at most a quarter of the loss bound (`check_account_rules`):
+  until it is inside the worth its price reads as a loss, and one must
+  never end a session alone.
+- **The weight narrowed by refusal:** `HlGatewayArm::set_topup` refuses a
+  weight past the purchase command's `u32` (`ArmErr::Topup`), an account
+  not the slot's own, and top-ups armed with no keeper; the push converts
+  by `u32::try_from` and stops on a failure — never a truncation. Slot 6's
+  boot builds the keeper only when the artifact arms top-ups (a weight
+  above 0): off, the governor alone carries the restored spend's add-back,
+  and nothing is stored (the temp-path rule does not apply).
+- **0 B after boot, on both threads, on the success path.** The arm's step
+  is gate 98's, with a REAL keeper storing inside its window: the keeper
+  writes its line in place (`TopupState::write_line`, its master rendered
+  by `config::hex20_into` into the line itself — `hex20` renders into its
+  String's own buffer with it, no copy) through
+  `core_io::write_atomic_at`, its temp name taken at boot
+  (`core_io::tmp_path`, one allocation; `write_atomic` calls it — one
+  durable write); a temp path of 256 B or more refuses the boot (std builds
+  a C path on the stack under 384 B). The blocking arm's store writes the
+  same line in place. The control post is gate 96b's: exactly rustls' two
+  records. A failed store formats its error once, and is the last.
+- **`exec.toml`:** `request_topup_weight` / `request_topup_day_max` are
+  legal on a gateway slot under the general rules (both or neither;
+  1 000–100 000 a purchase; at most 1 000 000 a day, and at least one
+  purchase) — XH4f's "the gateway arm buys none before XH5" refusal goes.
+  Slot 6's boot refuses them on the shared account (`check_account_rules`:
+  that account's requests are its blocking arm's to buy — one governor a
+  master's day).
+- **`/metrics`:** `engine_exec_hlgw_topup_{ok,failed,unsent}_total` and
+  `engine_exec_hlgw_topup_{weight,day_used,cost_usd_1e6}` (counters 68 →
+  71, levels 32 → 35; a day read as spent shows −1; `unsent` counts the
+  purchases that never left — refused unsent, a full ring, or abandoned: a
+  newer read out of the band, the halt, the shutdown); `GatewayArmReport`
+  816 → 864 B (108 words); `session_pnl_usd_1e6` carries the add-back. The
+  arm 1 664 → 1 792 B; the anchor keeper 64 → 72 B (its stamp); the top-up
+  keeper 120 B. The boot tell names the top-ups — the weight and the day's
+  max, both priced, the day's usage restored (or read as spent), the file
+  — or "no top-ups", and a restored spend.
+- **One definition each:** the UTC day (`dayspend::utc_day`, both arms'
+  top-ups), the state line, the temp name, the master's hex.
+- **Residuals.**
+  - *A store on the gateway's thread:* the temp write, the fsync
+    (`F_FULLFSYNC` on macOS) and the rename run between two gateway turns —
+    the sockets wait that long, a few ms, at most twice a purchase (the
+    pre-charge, then the spend or the stop; a decision again after a
+    refusal is kept with no write): ten purchases a day at the probe's
+    values.
+  - *The file can lag a step:* a spend or a stop the keeper cannot take at
+    once is owed and retried each pass — the shutdown waits for it within
+    its bound — but a crash, or a keeper still busy at the shutdown's bound
+    (no counter marks that one), loses it: a restart then reads the last
+    pre-charge (the day's usage with every purchase decided — the safe way)
+    with the spend short (a loss on the bound — the safe way) and no stop
+    (top-ups resume within the day's max).
+  - *No `expiresAfter` on the purchase* (the SDK vector carries none; the
+    venue's handling of one on `reserveRequestWeight` is unproven): a
+    purchase in doubt may land after the read that judged it — the top-ups
+    stop and its price is never added back (the safe way) — or after
+    00:00Z, counted on the day it was decided (the venue's next day may
+    hold one weight over the max).
+  - *A rename not yet durable:* `write_atomic` syncs the file, not its
+    directory (E4's helper, every state file's); a power loss right after a
+    store can bring back the last line — one purchase forgotten, one weight
+    over the day's max at most.
+  - *Seen on the venue, the price waits for the worth:* the price reads as
+    a loss from the first sheet that carries it until both the budget read
+    and a sheet issued after the answer (after that read, for one in doubt)
+    land (≤ a read period or two) — the boot's quarter-of-the-bound rule
+    keeps that from ending a session.
+- **For XH5c-3:** the RTT word without REST samples (their own histogram),
+  `rtt_pull_ms` 2 000 for the probe, the IP share kept at 400, and the
+  harness's `lead_stale_ms` 300-vs-500 re-check.
+
+**Tests:** the arm — a purchase decided inside the band (nothing above it),
+handed over and sent only once stored (one `reserveRequestWeight`, its
+range, its weight, one request), seen at the next read and inside the worth
+(the spend, the add-back, the report), seen before a sheet carries it (no
+add-back until one does), refused unsent (refunded, the day returned,
+decided again), not seen and refused by the venue (stopped, the stop handed
+over as the day spent, nothing more decided), in doubt (carried, judged by
+the next read, its request kept, charged only once a sheet issued after the
+read that showed it lands), a read issued before the answer (judges
+nothing; the purchase carried), a newer read out of the band (abandoned
+before it left), a keeper that failed (nothing sent), a keeper still
+storing (the spend owed, handed over later — during the shutdown too, which
+waits for its keeper), an answer for no purchase (stopped, never `stray`),
+a stop on a later day (that day spent), a halted slot (a decision
+abandoned, the day returned, nothing decided after; a purchase that left
+still judged and charged, its spend handed over, the weight reported 0),
+the day's max, the arming (the shared account, a weight past `u32` and
+top-ups armed with no keeper refused; off with none accepted; nothing
+before the anchor is kept), the shutdown (nothing decided, nothing sent);
+the keeper — the hand-over stored under its anchor and restored, one at a
+time, the state already stored kept with no write, a failed store keeping
+nothing more, a temp path too long refused; the line written in place = the
+state line (the widest figures), the blocking arm's store in place; the
+restore read into one line's room (an overlong file spent); the forward
+roll; `refund_day`; the headroom apart from volume; `hex20_into` (in place,
+the bytes `hex20` returns); `core_io::write_atomic_at` and `tmp_path`; the
+anchor keeper's stamp; the shared account refused, the quarter-of-the-bound
+rule and the file a network (`xmm_live`); the tell (armed, spent, none, a
+restored spend); the artifact's top-up keys on a gateway slot; `/metrics`'
+rows.
+
+**Gates (the committed tree):** clippy 0; nextest 4 182/4 182; alloc 108
+(+3 ignored) at 0 B, compiled fresh — gate 98's window ran ≈ 90 000 rounds
+with purchases seen, one refused unsent and a decision kept with no write;
+copy-audit 31, new=0; license OK (661); release OK; replay 7× IDENTICAL;
+rustfmt clean on every touched hunk. Round 3's run had one debug-nextest
+alloc flake in a test this cut does not touch
+(`icdp_on_tick_decision_and_roll_are_zero_alloc`, the process-global
+counter): the release gate passed, and eight debug re-runs passed.
+
+**Reviews:** four rounds, risk APPROVE.
+- *Round 1:* zero-copy REQUEST CHANGES — the keeper's store built its line
+  as a `String` (`from_utf8_lossy(..).into_owned()` on the gateway's
+  thread): now written in place; allocation and risk APPROVE WITH NITS — a
+  temp path of 256 B or more (std's rename would allocate: refused at
+  boot), a refused purchase re-stored each minute (the keeper skips an
+  unchanged state), the add-back on a budget read rather than a worth that
+  carries the price (the worth gate), a halted slot still buying (the halt
+  ends the buying), volume read as a purchase (`remaining_unearned`), the
+  in-doubt carry, a stale decision sent (abandoned), the restored spend
+  with top-ups off (kept), a stop that could be lost (owed and retried).
+- *Round 2:* all three APPROVE WITH NITS — an in-doubt purchase's price
+  added back before a worth carried it (the read that shows it moves the
+  mark), the halt stopping the accounting too (`topup_off`: only the buying
+  ends), the shutdown never retrying an owed hand-over, the keeper built
+  with top-ups off (only when armed), `hex20_into`'s panic path and
+  `hex20`'s copy (typed; no copy), stale notes.
+- *Round 3:* zero-copy APPROVE; risk and allocation APPROVE WITH NITS — an
+  owed hand-over lost when the shutdown ends first (it now waits, within
+  its bound), the report's weight after the buying ended (0).
+- *Round 4:* risk and zero-copy APPROVE; allocation APPROVE WITH NITS (this
+  paragraph's wrapping — taken).
+- *Declined, as residuals above:* `expiresAfter` on the purchase; a
+  parent-directory fsync in the shared `write_atomic`; a counter for a
+  hand-over still owed at the shutdown's bound (optional); a heap-free
+  restore compare (boot only; the three restores compare one way).
+
+### XH5c-3 amendment (2026-10-03): the RTT word without REST samples; the cadence re-checked
+
+The third part of XH5c (plan §3.3 items 2 and 3; A-S6-16). Nothing is armed.
+
+- **A REST post's round trip is its own series.** The gateway's `finish`
+  records a post that went by the REST fallback (`rec.conn == CONN_REST`:
+  the boot's dead-man clear before the socket is up, a fallback with no
+  socket Ready) in `GatewayStats::rest_rtt` alone — a fresh dial and a
+  synchronous exchange are not the socket's path. Before, they fed the RTT
+  word: XH4g's boot clear (1 809 ms in run b3) held it over 1 500 ms for up
+  to 30 s. Socket posts feed `post_rtt` / `cancel_rtt`, the congestion
+  average and the RTT window as before; a socket post that times out still
+  holds the word high (its ~5 s sample).
+- **No socket Ready reads throttled.** With REST out of the word, a
+  WebSocket outage no longer reaches the member through it — so the
+  congestion word reads `THROTTLED` while no connection is Ready to carry a
+  post (one test, `ready_conn`, shared with `send`): the member holds
+  (`WHY_CONGESTION`) while every post would go by REST; the pull's cancels,
+  the dead man and the control posts still go by REST (the word is
+  advisory; `admit` judges the rate throttle itself). At boot the word
+  reads throttled until the first socket is Ready — the arm is not ready
+  then anyway; the arm's day pages, which wait out throttled, wait for a
+  socket (a read needs one anyway). The HYPARB member does not read the
+  word.
+- **`rtt_pull_ms`** is a threshold — the member pulls while the published
+  worst exceeds it. The probe's artifact (XH5e) carries 2 000 (testnet p99
+  0.91–1.2 s, max 1.8 s); `xmm.toml.example` and the paper artifact keep
+  1 500. After the probe's first 2 000 mainnet posts it is re-sized to
+  max(1 500, ⌈1.5 × p99⌉) — an `xmm.toml` edit, a new config hash.
+- **The IP share stays 400** (`IP_WEIGHT_SHARE`). XH5e's runbook measures
+  the host's other Hyperliquid REST weight over an hour before any change
+  (an `exec.toml` key bounded by 1 200 less that).
+- **The cadence re-check** — the harness (`backtest --member xmm`) at
+  `lead_stale_ms` 300 and 500 on W17 (a weekday peak), W10 (a weekday
+  average) and W29 (a Saturday), ≤ 2 h windows, nice 15 — lives in the
+  vault (`docs/research/xmm/xh5c3-stale-2026-10-03/`: research never enters
+  git). The rulings it informs: the probe's artifact (XH5e) takes
+  `lead_stale_ms` 500; the paper engine stays at 300 until Anton rules;
+  Q-XH5-4 stands — the $50 cap binds and the floor halts the slot (the
+  safe direction).
+- **Residual — a socket loss is a pull.** A loss of the socket that spans a
+  heartbeat (a venue close, a pong timeout, a silent socket closed while its
+  replacement dials) now pulls the member's quotes and re-places them once
+  a socket is Ready: a cancel and a place per resting quote, and the queue
+  position — the intended direction, small against a quoting day's
+  requests.
+- **`/metrics`:** `engine_exec_hlgw_rest_rtt_{p99,max}_ns` (levels
+  35 → 37); `GatewayArmReport` 864 → 880 B (110 words); `rtt_worst_ns` and
+  the post series are the socket's. The stats block 66 944 → 83 456 B (one
+  more `Lat`, built once per arm at boot on the booting thread's stack, as
+  before).
+
+**Tests:** the router — a REST post's round trip in its own series alone
+(not `post_rtt`, the window or the average), the same post on a socket in
+all three; the gateway over the loopback venue — the REST post's round trip
+in its series, and the congestion word throttled with no socket Ready; the
+arm's report — the REST series apart from the post series; `/metrics`'
+rows; gate 95 records the REST series every turn, and the report gate's
+trackers hold REST samples too.
+
+**Gates (the committed tree):** clippy 0; nextest 4 183/4 183; alloc 108
+(+3 ignored) at 0 B, compiled fresh — gate 95 records the REST series
+every turn, gate 99's report walks it; copy-audit 31, new=0; license OK
+(661); release OK; replay 7× IDENTICAL; rustfmt clean on every touched
+hunk.
+
+**Reviews:** two rounds. Round 1 — zero-copy APPROVE; risk APPROVE WITH
+NITS (A-S7-16, no socket Ready reads throttled, judged sound: it blocks
+nothing that must go and does not flap in a make-before-break swap; NITs:
+THROTTLED's docs, the battery's congestion peak at every boot, the socket
+loss residual); allocation REQUEST CHANGES — the harness's numbers in this
+tracked file (research never enters git): moved to the vault, the rulings
+kept; NITs: "on a socket" wording, gate 95. Round 2 — risk, allocation and
+zero-copy APPROVE. Declined (optional): the battery's peak can still read
+one stale throttled report in the heartbeat after a socket comes up (the
+battery's evidence alone).
+
+### XH5d-1 amendment (2026-10-04): the measurement's record — every order event captured, the venue's time on a RESTING, the venue's trade id on a fill
+
+The first part of XH5d (plan §3.4 item 1; A-S7-21: XH5d in parts — the
+record; the A/B arms; the report, which lives in the vault). Nothing is
+armed, and no order path changes.
+
+- **`engine-events.pmlr`** (`SlotKind::OrderEvent` = 9, 64 B slots, in the
+  run's capture directory beside `engine-fills.pmlr` and
+  `engine-orders.pmlr`): every `OrderEvent` the engine drains — the
+  dispatcher's pump and the lane, every slot's — is staged BEFORE the
+  member sees it, as the fills are. The record is the event itself (kind,
+  reason, client oid, symbol, venue, slot, the venue's time): `OrderEvent`
+  gains `AsBytes` — its layout was already fully explicit, every offset
+  asserted. The bin opens it at boot (an open failure is fatal: capture is
+  the product); it flushes on the fills' 5 s cadence and drains at stop;
+  `engine_events_capture_{io_errors,records}` on `/metrics`. Synchronous on
+  the engine thread like the other two (a 64 KiB staging buffer; a full one
+  writes inline).
+- **The venue's time on a RESTING.** Hyperliquid's post answer carries no
+  time; the `orderUpdates` `open` row carries `statusTimestamp`. The arm's
+  RESTING carries the row's time when the row lands the order; when the
+  answer came first — the usual order — its RESTING went without a time,
+  and the row repeats it once, with the time (`RB_STAMPED`: once an order).
+  A member takes the repeat as a no-op (XMM's RESTING moves PENDING →
+  RESTING alone); the router passes events through. The measurement's ACK
+  time is an order's first RESTING with a venue time. A repeat is an event
+  wherever events are counted — the arm's `events`, the engine's
+  `order_events_dispatched`, the set's `order_events_unrouted` (a disabled
+  slot), XMM's `unmatched` (a repeat after the member's watchdog released
+  the side) — so on `/metrics` events outnumber orders by up to one a
+  post-only order: the repeat, not an anomaly. The testnet battery's
+  `open_row_lag_ms` samples an order's first RESTING alone.
+- **The venue's trade id on a fill.** `Fill.tid` (offset 40, out of
+  `_pad1`: wire-additive — every capture written before reads as none)
+  carries Hyperliquid's `tid` on the gateway arm's fills, 0 elsewhere: the
+  report's key for excluding our own prints from the public volume.
+- **Wire format:** `docs/wire-format.md` — `OrderEvent` captured, `Fill`'s
+  `tid`, the header's slot kinds 8 and 9.
+- **Copies:** one 64 B slot into the staging buffer an event (the
+  existing `SlotCapture::append`, as for fills and orders); at boot the
+  capture's handle moves by value through its builders once (noted, with
+  its two siblings').
+
+**Tests:** the slot kind (9, 64 B); the engine — both drains staged before
+the member, read back as written (the venue's time with it); the arm — a
+RESTING repeated once with the `open` row's time after the answer, the
+`open` row first carrying it in the only RESTING, a fill's trade id; the
+engine tick gate measures the capture inside its window (every drained
+event staged exactly once, 0 B); gate 98 runs both stamped paths in its
+window — an `open` row before the answer (its RESTING stamped) and one
+after it (the repeat).
+
+**Gates:** clippy 0; nextest 4 185/4 185; alloc 108 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK (662); release OK; replay 7× IDENTICAL;
+rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 3).
+
+### XH5d-2 amendment (2026-10-04): the A/B arms — θ, and the size-only modify
+
+The second part of XH5d (plan §3.4 item 2; A-S7-21). Nothing is armed, and
+`ab_mode` 0 — the example's and the paper artifact's — quotes exactly as
+before: no arm, the artifact's θ, no size-only modify.
+
+- **The block.** An A/B block is 600 000 ms of the follower's venue time
+  (the last fresh bbo's `time`): the arm is (venue ms ÷ 600 000) mod 2 —
+  even A, odd B; before the first venue time, A. Both arms see the same
+  market mix; the arm is a function of time alone, stated in the boot tell
+  (`ab_arms=`).
+- **`ab_mode` 1 — θ.** Arm B decides with half the artifact's θ (A-S7-23:
+  no new key — the probe's 0.5 bps gives 0.25): a second multiplier pair
+  from `configure`. The gate uses the block's pair at placement; a quote
+  remembers the arm its price was decided in, and its LEAD cancel uses that
+  arm's pair — a quote decided in A keeps A's rule into a B block.
+- **`ab_mode` 3 — the size-only modify.** A quote decided in arm B and
+  resting at the touch is modified one lot down, then — once that rests —
+  one lot back, and no more: the same modify path (a fresh oid each, the
+  TTL inherited, LAW E-7), paced as a requote (no sooner than
+  `requote_min` after the quote's last change; four floors under a busy
+  arm) and counted in `orders_emitted`. A size the venue would refuse
+  (under a lot, or under its $10 minimum), one the member's caps would not
+  take — either step: a modify sets the replacement's whole size, whatever
+  of the original filled — or a refused modify ends the step. A requote to
+  a new price is a new decision (its arm now) and ends a half-done step.
+  Off under the parity switch (`sim_parity` 1, whose requotes are cancels
+  and fresh orders).
+- **`ab_mode` 2** is tagged with its arms and quotes as 0 until XH5d-3.
+- **The record.** `Order.ab_arm` (byte 43, out of `_pad1`: wire-additive —
+  every capture written before reads as none): 0 none, 1 A, 2 B, in
+  `engine-orders.pmlr`. No execution path reads it.
+- **Risk.** The arms change only which θ decides and, in arm B under
+  `ab_mode` 3, at most two extra modifies a placement — every one through
+  the member's caps and pacing, the router's caps, the request budget and
+  the halt, as a requote; the ledger, the caps and the halt are untouched.
+  Arm B's half θ cancels on smaller leader moves: more LEAD cancels (and
+  requests) in B blocks — what the A/B measures.
+- **Copies:** none new (`with_ab_arm` is a const by-value builder on the
+  order built in place, as `with_post_only`).
+
+**Tests:** the block (the follower's venue time; none yet: A) and arm B's
+half θ (its multipliers the square roots of A's); arm B's LEAD cancel at a
+−0.3 bps leader move (between θ/2 and θ) while arm A's quote rests; arm B's
+size-only modify — down, back, once, each a floor after the last change —
+and none in arm A or under the parity switch; the boot tell's `ab_arms`;
+gate 75e — both arms, alternating every cycle, under `ab_mode` 1 (arm B's
+half-θ pull) and 3 (arm B's size-only modifies, a requote ending a step, a
+refused modify), at 0 B.
+
+**Gates:** clippy 0; nextest 4 189/4 189; alloc 109 (+3 ignored; gate 75e
+new) at 0 B; copy-audit 31, new 0; license OK (662); release OK; replay
+7× IDENTICAL; rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 2).
+
+### XH5d-3a amendment (2026-10-04): the ALO priority on the wire — the order's bid, the `{"p": N}` grouping, the gateway batching by it
+
+The third part of XH5d, its first half (plan §3.4 item 2, `ab_mode` 2;
+A-S7-29: XH5d-3 in two — the wire, then the member's rule and its cap).
+Nothing is armed, and nothing bids a priority yet: no member sets one
+until XH5d-3b, which bounds the spend.
+
+- **The field.** `Order.alo_priority_1e8` (u32 at byte 44, the last of
+  `_pad1`: wire-additive — every capture written before reads as none):
+  p ×1e8 of the order's resting notional, 0 none.
+- **The arm.** An ALO place carries it in `HlCmd.arg`; a modify never
+  does (Hyperliquid's `batchModify` carries no grouping, A-S7-27), nor an
+  IoC. An order bidding more than 1 % (`HlCmd::PRIORITY_MAX_1E8`, the
+  xmm.toml parser's bound) is refused unsent.
+- **The arm's cap.** The HYPE a priority commits is bounded at the arm:
+  `set_priority_cap` (boot-only) arms a session cap, USD ×1e6; with none
+  armed — the default — a place bidding a priority is refused unsent
+  (`refused_local`). Each place's fee — p ×1e8 of its rounded resting
+  notional, rounded up — is tallied when it is sent, and a place past the
+  cap is refused unsent. XH5d-3b arms it for slot 6 under `ab_mode` 2.
+- **The gateway.** An action carries one grouping: the open ALO batch
+  keeps its priority, and a place bidding another — or none — posts every
+  open batch first, as a full batch does (the open order kept). The
+  batch's action is signed and rendered with `"grouping": {"p": N}` — a
+  one-key map in the msgpack, an object in the JSON — or `"na"` when it
+  bids none.
+- **The bytes** are pinned by a known-answer vector from
+  hyperliquid-python-sdk 0.24.0's `PriorityGrouping` (`order_alo_priority`,
+  p 10 000): the fixture holds 39 vectors, and the boot self-test rebuilds
+  the priority order too (nine encodings). `gen_vectors.py` builds every
+  order action through the SDK's own `grouping` parameter; the 38 earlier
+  rows regenerate byte-identical. The XH5e testnet step proves the venue
+  takes the grouping.
+- **What it costs.** The venue charges p ×1e8 of the resting notional at
+  placement from the undelegated HYPE balance — each place in a priority
+  batch on its own notional — outside the worth (USDC only) and outside
+  every cap the router keeps; the arm's cap is its bound. The engine reads
+  no HYPE balance: how the venue treats a priority place short of
+  undelegated HYPE is unproven (XH5e's testnet step and funding line) —
+  if it refuses them, they come back as ALO refusals and count toward
+  XH-7's reject-rate halt.
+- **Copies:** none new (the grouping is written in place by the existing
+  msgpack and JSON writers; the arm writes `arg` in place).
+
+**Tests:** the priority grouping's msgpack (a one-key map; the named form
+unchanged) and JSON (an object); the vector; the self-test (39 rows, nine
+encodings); the arm — an ALO place bids its priority, a modify none, over
+1 % refused unsent; unarmed, a priority place refused unsent; armed, the
+places within the cap sent and the one past it refused, a place bidding
+none unaffected; gate 98 — every third order bids priority, the arm armed
+(the fee tallied in the window); the gateway loopback — places batched by
+priority (two at one p, one at none, one at another: three posts, each its
+grouping); gate 96's ALO places bid priority (the grouping sealed in
+place, at rustls' count).
+
+**Gates:** clippy 0; nextest 4 193/4 193 (round 2; round 3's run: one
+debug-run alloc flake in untouched option-analytics, re-run ×8 clean);
+alloc 109 (+3 ignored) at 0 B; copy-audit 31, new 0; license OK (662);
+release OK; replay 7× IDENTICAL; rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2, confirmed round 3), allocation APPROVE
+(round 3), zero-copy APPROVE (round 3).
+
+### XH5d-3b amendment (2026-10-04): the ALO priority arm — arm B's fresh places at a level just formed bid it, under the boot's cap
+
+The third part of XH5d, its second half (plan §3.4 item 2, `ab_mode` 2;
+A-S7-29). Nothing is armed; `ab_mode` 0 — the example's and the paper
+artifact's — and modes 1 and 3 bid no priority.
+
+- **The rule.** Under `ab_mode` 2 a fresh place whose price was decided in
+  arm B (the XH5d-2 block) bids the artifact's `alo_priority_1e8` when the
+  follower's touch on its side formed — improved to a new level in front —
+  within the last 400 ms (local receipt; the venue sorts ALO orders by
+  priority on that timescale). A retreat lands on a queue already there;
+  the book's first sight, and the first fresh tick after a stale one or
+  after a silence the member calls the follower stale (the level's time
+  unknown), form none. A requote is a modify and bids none (A-S7-27); arm
+  A bids none.
+- **The cap.** The member tallies each bid's fee — p ×1e8 of the place's
+  notional, rounded up, the arm's own reckoning on the same price and size
+  — and bids none once the next would pass $25 a boot
+  (`XMM_PRIORITY_MAX_USD_1E6`, half the probe's funded HYPE). Slot 6's arm
+  is armed (XH5d-3a's `set_priority_cap`) only under `ab_mode` 2 with a
+  priority to bid, at the member's cap and $1 of room
+  (`XMM_PRIORITY_ARM_ROOM_USD_1E6`): the member stops first, and the arm
+  refuses unsent past its own. Every other configuration arms none — a
+  place bidding a priority would be refused unsent. The cap is per boot:
+  the funded HYPE is the ceiling across restarts.
+- **The latch.** How the venue answers a priority it will not take (short
+  of undelegated HYPE) is unproven (XH5e's testnet step records it). If it
+  lands as a refusal the arm cannot name (`ORDER_EVENT_REASON_OTHER` — an
+  item's error, a whole action refused, a stream's unnamed rejection),
+  three priority places in a row refused so end the priority for the boot
+  (`priority_refused` counts them); a priority place that rests resets the
+  run. The member keeps quoting; arm B's places bid none after it. The
+  latch has tripped when `priority_places` stops growing while arm B
+  quotes.
+- **The bound.** `alo_priority_1e8` must be at most 1 % (1 000 000) —
+  `XmmParams::validate` now refuses more, as the parser and the arm do.
+- **On `/metrics` and `/state`:** `engine_xmm_priority_places_total`,
+  `engine_xmm_priority_fee_usd_1e6_total`,
+  `engine_xmm_priority_refused_total` (`XmmCounters` 22 → 25 × 8 B); the
+  boot tell states the rule and the cap (`ab_arms=`; `off` when
+  `alo_priority_1e8` is 0).
+- **The record:** the order carries what it bid (`alo_priority_1e8`, in
+  `engine-orders.pmlr`), so the report sees the priority places apart.
+- **Layout:** `Inst` gains the two sides' formed times on their own line
+  (192 → 256 B a perp); `Quote.prio`, one byte of `Quote`'s padding (64 B
+  kept).
+- **Copies:** none new (`with_alo_priority`, a const by-value builder on
+  the order built in place, as `with_ab_arm`).
+
+**Tests:** the rule (the first sight, a retreat and the tick after a stale
+one form nothing, an improved touch forms its side; arm B within 400 ms
+bids and tallies, beyond it, arm A, another mode and the spent cap bid
+none); the latch (three refusals in a row end it, a resting priority place
+resets the run); the fee as the arm reckons it; `validate` refuses over
+1 %; the arm's cap armed for `ab_mode` 2 with a priority alone; the boot
+tell; the counters on `/metrics` and `/state` (the worst-case `/state` with
+every counter at its widest); gate 75e — under `ab_mode` 2 arm B's bids at
+a level formed that cycle bid 1 % until the cap (exactly 166 places at
+0.15 and 99.995), then the cap refuses them; the asks and arm A never; 0 B.
+
+**Gates:** clippy 0; nextest 4 197/4 197; alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK (662); release OK; replay 7× IDENTICAL;
+rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 3), allocation APPROVE (round 3),
+zero-copy APPROVE (round 2, confirmed round 3).
+
+### XH5e-1 amendment (2026-10-04): slot 6's preflight, and the probe's artifacts as files
+
+The first part of XH5e (plan §3.5; A-S7-37). Nothing is armed and no file in
+`~/multivenue` changes; the flip that installs these files
+(`scripts/xmm-flip.sh`) is XH5e-2.
+
+- **One boot, two stopping points.** `xmm_live::plan_xmm_arm` is slot 6's
+  boot up to its first network read: the artifact's slot, the member and its
+  shape as the arm binds it (1..=16 perps, `lifetime_ms` within the arm's
+  `expiresAfter`), the caps, the market data's network (LAW E-4), the
+  account and its rules, the credentials, their network and identity, the
+  anchor and the top-ups restored from their files, and the tell's head.
+  `boot_xmm_arm` runs it, then reads the venue (`userRole` on its own
+  account, then `meta`). The anchor's and the top-ups' files are now read
+  before `userRole` — reads only, so a bad anchor refuses before any
+  request. The tell is unchanged.
+- **The preflight sends nothing.** `multivenue-engine xmm-preflight --exec
+  … --arm-live … --xmm … --strategy …` resolves the artifact with the arming
+  list (slot 6 live on the gateway, or it refuses), loads the member's
+  artifact on an offline universe (the coin table; the boot resolves the
+  same names against its own), runs the plan and prints the boot's tells,
+  then PASS naming what it did not check: the venue's perp universe, the API
+  wallet's binding, the account's positions, orders and balances, the perps
+  in the boot universe, their overlap with a live slot 0 or 1. It opens no
+  socket and writes nothing. Its inputs must be the boot's: the anchor and
+  the top-up state are read beside `--exec`, so a work copy sits in the
+  installed `exec.toml`'s directory; the identities are those its
+  environment states, so it runs from the repo in the wrapper's environment.
+  A PASS the boot then refuses costs a refused boot, never an order.
+- **The probe's artifacts are files** at the repository's root, changed only
+  under review: `xmm-probe.toml`, the example's member (the paper engine's)
+  with `lead_stale_ms` 500 and `rtt_pull_ms` 2000 (XH5c-3) and `ab_mode` 0
+  for the first run (Q-XH5-5 is open; mode 2 waits for the testnet proof of
+  the priority grouping); and `exec-slot6-probe.toml`, the template's slot-6
+  recipe live (top-ups 10 000 / 100 000, the −$50 bound, reads stale after
+  180 s). Tests pin both to their templates.
+- **`bin15+xmm`** joins the bootable names (mask 72): the testnet
+  engine-instance check's set. The wrapper's allow-list does not carry it.
+- **Copies:** the plan's move out of its `Result` at boot, noted; the key
+  moves as its box, never its bytes. None on a hot path; nothing runs after
+  boot, so no alloc gate is new.
+
+**Tests:** the probe passes on mainnet market data on an account of its own
+(the report: slot 6 live on the gateway with its clamps, the probe's member,
+the MAINNET head with its bound, a new session and its top-ups, PASS); the
+boot's refusals are the preflight's, word for word — `--arm-live` not naming
+6, a relay's market data, testnet data on the shared account, an absent
+member; the anchor beside the artifact restores this master's session and
+refuses another's; the probe's member differs from the example's in its two
+values alone; the probe's section is the template's recipe; the offline
+universe; the preflight's `--strategy` boots xmm; `bin15+xmm`'s mask.
+
+**Gates:** clippy 0; nextest 4 204/4 204 (a debug-run alloc flake, 6
+allocations / 1 012 B in `binance_book_ticker_is_zero_alloc`, re-run ×8
+clean — the release gate is the authority); alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL; rustfmt
+clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 2); their two round-2 wording NITs applied
+(comments only).
+
+### XH5e-2 amendment (2026-10-04): the flip and the runbooks — how the probe is armed, and by whom
+
+The second part of XH5e (plan §3.5, R-XH4-8; A-S7-37). It arms nothing:
+only Anton arms the probe, by the checklist.
+
+- **The flip** (`scripts/xmm-flip.sh status|live|paper`) is the only way
+  the probe's artifacts reach `~/multivenue`.
+  - **What it touches.** It edits `strategy.conf` (`XMM_TOML`, `EXEC_TOML`,
+    `ARM_LIVE`) and `exec.toml`'s `[exec.slot.6]` alone, each after a `.bak`.
+    It installs the probe's member as `~/multivenue/xmm-probe.toml`. It
+    restarts nothing.
+  - **When `live` refuses.** `live` refuses unless all of these hold:
+    - slot 6 is a clean paper state, and the running engine does not route it
+      live;
+    - `STRATEGY` boots xmm;
+    - `exec.HALT` halts slot 6 for no reason but the operator's (archived, then
+      dropped);
+    - it is outside the quiet windows;
+    - no scheduled drain is near, no gated restart is owed, and the wrapper is
+      not mid-boot;
+    - the checkout is the one the engine's launchd job runs, and its binary was
+      built after its HEAD with the preflight in it;
+    - the preflight passes on the work copies. These are written beside the
+      installed files and run in the environment the wrapper builds under
+      launchd: the terminal's exports dropped, the repo `.env` and the
+      wrapper's testnet names sourced as the wrapper sources them, tracing off.
+      A sandbox's stand-ins (`MULTIVENUE_DIR`, the plist, the env file) are
+      honoured only under an explicit sandbox switch and refused otherwise.
+
+    Nothing is installed unless it passes.
+  - **`paper`.** `paper` halts slot 6 first (the halt read back as the engine
+    parses it), unless the file says paper and the engine answers without
+    routing it live. It then restores paper.
+  - **Restarting.** A restart is SIGTERM (`pkill -TERM -f 'multivenue-engine
+    run'`, launchd's KeepAlive relaunching), never `launchctl kickstart -k`,
+    which is SIGKILL and skips the gateway's shutdown sweep.
+- **The testnet engine-instance runbook** (`docs/xmm-testnet-runbook.md`)
+  runs before the first mainnet arming. It runs a second engine on the binary
+  the probe will run: slot 6 on the gateway beside slot 3 on E3, under a
+  home, port, credentials and minimal universe of its own. Every path is
+  under that home, every Hyperliquid host is testnet's, E3's pair stands in
+  for the operator arm's names, and every exported credential but E3's and
+  slot 6's testnet keys is dropped; no credential file is copied. It checks:
+  - the boot's tells and numbers against the venue;
+  - the per-slot halt, both ways;
+  - the session restored across a restart (`anchor RESTORED`);
+  - the top-ups.
+
+  Its priority proof — the grouping accepted, and the venue's answer with no
+  undelegated HYPE recorded — comes before any `ab_mode` 2 on mainnet.
+- **The arming checklist** (`docs/xmm-mainnet-arming.md`) is the only way to
+  arm.
+  - **Before the flip** it checks:
+    - the account at the venue: funded in full before the first boot, flat,
+      and the API wallet approved and bound;
+    - XH5b-1's margin check: a small position opened by hand, and the worth
+      against funded − fees + its unrealised P&L. A residual of half the
+      margin in use or more aborts.
+  - **No transfers** are made while a session's anchor stands.
+  - **After the restart**, it reads:
+    - the boot tell's `MAINNET` and anchor lines;
+    - `dm_availability` (`eligible`, or halt);
+    - `/metrics` against the venue.
+  - **The `.env` switch.** `HYPERLIQUID_XMM_*` sit in `.env` only during an
+    armed session (Q-XH5-3: with no third switch they are the mainnet
+    switch).
+  - **Ending a session.** A session ends with the anchor's file moved aside.
+  - **A tripped priority latch** reads as `engine_xmm_priority_places_total`
+    frozen, `engine_xmm_priority_refused_total` at 3 or more, and
+    `engine_xmm_priority_fee_usd_1e6_total` short of the cap.
+- **Two recorded limits.**
+  - `dm_availability` is read within the first read period after the boot,
+    so the member's first quotes may precede it — a deviation from XH5b-3's
+    "before the first quote" (A-S7-43).
+  - The five daily drains restart the engine. If slot 6 holds a position at a
+    drain, the boot holds its arm until flat (H5), and its stale reads then
+    halt it: each drain needs a hand flatten, or the session ends before it.
+- **XH5a's obligation is closed.** BIN15's flip checks hold under the
+  per-slot halt. `bin15-flip.sh paper` halts slot 3 through `exec.HALT`,
+  which now cancels slot 3's orders alone. Its venue check counts slot 3's
+  cloids and the `#` outcome coins, and slot 6 trades perps on a master of
+  its own.
+
+**Tests:** the flip in a sandbox (copies of the operator's `strategy.conf`,
+`exec.toml` and `xmm.toml`; no real `.env`; throwaway credentials):
+- `status`;
+- `live` refused when:
+  - the binary is older than HEAD;
+  - the checkout is not the one the launchd job runs;
+  - the preflight refuses (terminal exports do not reach it);
+  - a halt has another reason.
+
+  Nothing changed in any of these cases.
+- `live` passing and installing;
+- `paper` halting a live slot and restoring paper, and halting nothing on a
+  paper state;
+- `live` again dropping the operator's halt line, leaving one section and one
+  provenance line in `exec.toml`, with modes preserved.
+
+**Gates:** clippy 0; nextest 4 204/4 204; alloc 109 (+3 ignored) — no code in
+this cut; copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL;
+rustfmt clean. Rounds 2–4 changed the script and the documents alone.
+
+**Reviews:** risk APPROVE (round 4), allocation APPROVE (round 4),
+zero-copy APPROVE (round 3, confirmed round 4). Round 1 found the testnet
+instance on mainnet credentials and the paper engine's files, the whole
+operator directory copied (with a credential file), a SIGKILL restart and
+XH5b-1's pre-arm checks missing — all fixed above.
 
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 

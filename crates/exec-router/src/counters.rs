@@ -52,6 +52,13 @@ pub enum RiskRefusal {
     /// **XH4e** — a perp slot's resting notional
     /// (`PerpLimits::max_resting_usd_1e6`).
     MaxResting,
+    /// **XMM XH5a** — an order on a row another slot owns (slot 6's
+    /// gateway perps): one engine id has one row, which judges every
+    /// live slot's orders on it, so a second slot's order there would
+    /// read as the owner's drift and move its leverage. Closes the
+    /// runtime gap XH4h-2 recorded (ai-exec and vm pick their symbols
+    /// at runtime).
+    ForeignRow,
 }
 
 /// Router counters. `Copy` POD; every field saturates rather than
@@ -162,6 +169,11 @@ pub struct RouteCounters {
     /// reads it for is "which slot is being refused"; the aggregate
     /// fields above say why.
     pub refused_by_slot: [u64; EXEC_SLOTS],
+    /// **XMM XH5a** — another slot's order refused on an owned row
+    /// ([`RiskRefusal::ForeignRow`]). Published with slot 6's block, the
+    /// rows' owner. Last, on a fifth line of its own: the per-slot arrays
+    /// keep their lines.
+    pub refused_foreign_row: u64,
 }
 
 impl RouteCounters {
@@ -188,6 +200,7 @@ impl RouteCounters {
             cancel_on_off: 0,
             live_submits_by_slot: [0; EXEC_SLOTS],
             refused_by_slot: [0; EXEC_SLOTS],
+            refused_foreign_row: 0,
         }
     }
 
@@ -257,6 +270,7 @@ impl RouteCounters {
             RiskRefusal::Unpriced => &mut self.refused_unpriced,
             RiskRefusal::CapPerp => &mut self.refused_cap_perp,
             RiskRefusal::MaxResting => &mut self.refused_max_resting,
+            RiskRefusal::ForeignRow => &mut self.refused_foreign_row,
         };
         *field = field.saturating_add(1);
         Self::bump_slot(&mut self.refused_by_slot, strategy_id);
@@ -349,10 +363,13 @@ mod tests {
     #[test]
     fn counters_are_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<RouteCounters>(), 64);
-        // Four lines, full: 16 aggregates + two per-slot arrays of 8 = 32
-        // u64 = 256 B. Growing past it is a decision (XH4e's XH2-C
-        // refusals share `refused_unpriced` rather than take it).
-        assert_eq!(core::mem::size_of::<RouteCounters>(), 256);
+        // Four lines were full (16 aggregates + two per-slot arrays of 8 =
+        // 32 u64 = 256 B; XH4e's XH2-C refusals shared `refused_unpriced`
+        // rather than grow it). XMM XH5a grew it to FIVE on purpose: the
+        // foreign-row refusal is its own operator action (folded into
+        // another clamp's count it would send the operator to the wrong
+        // number), and it takes a cold fifth line after the arrays.
+        assert_eq!(core::mem::size_of::<RouteCounters>(), 320);
     }
 
     #[test]

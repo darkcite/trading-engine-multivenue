@@ -30,6 +30,13 @@ use crate::response::ScanErr;
 /// number as the router ledger's `wall_ns / DAY_NS`.
 pub const DAY_MS: u64 = 86_400_000;
 
+/// **XMM XH5c-2** — the UTC day now, `wall_ms / DAY_MS`: the day both
+/// Hyperliquid arms' top-ups count (one definition). A clock read, 0 B.
+#[must_use]
+pub fn utc_day() -> u64 {
+    crate::nonce::now_ms() / DAY_MS
+}
+
 /// The most fills the venue returns in one `userFillsByTime` answer
 /// (documented: "at most 2000 fills per response"). A page that full
 /// may have been cut short.

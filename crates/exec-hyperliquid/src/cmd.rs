@@ -46,6 +46,14 @@ pub const CMD_READ_LIMIT: u8 = 9;
 /// (`userFillsByTime`'s `startTime` and `endTime`, venue wall ms), summed
 /// in place for the command's slot; answered by `EV_READ_DONE` alone.
 pub const CMD_READ_DAY: u8 = 10;
+/// Read (XMM XH5b-1): the account's spot sheet (`spotClearinghouseState`)
+/// — the USDC half of an account's worth; answered by `EV_READ_DONE`
+/// alone. The last read: [`HlCmd::is_read`] ends here.
+pub const CMD_READ_SPOT: u8 = 11;
+/// Control (XMM XH5c): `reserveRequestWeight` — buy `arg` requests of
+/// address budget (S7-L1's top-up, on the gateway arm). Numbered after the
+/// reads: [`HlCmd::is_control`] names it.
+pub const CMD_RESERVE: u8 = 12;
 
 /// `flags`: reduce-only.
 pub const CMD_FLAG_REDUCE_ONLY: u8 = 1;
@@ -85,7 +93,10 @@ pub struct HlCmd {
     /// Strategy slot: the cloid's third byte (LAW E-9).
     pub slot: u8,
     _pad: u8,
-    /// [`CMD_LEVERAGE`]: the leverage, a whole number.
+    /// [`CMD_LEVERAGE`]: the leverage, a whole number. [`CMD_RESERVE`]:
+    /// the weight bought (XMM XH5c). [`CMD_PLACE`] of an ALO order (XMM
+    /// XH5d): its ALO priority, p ×1e8 of resting notional (0 none) — the
+    /// gateway batches places by it; a modify carries none.
     pub arg: u32,
     /// [`CMD_SCHEDULE_CANCEL`]: the venue wall time to cancel at, ms; 0
     /// clears the schedule. [`CMD_READ_DAY`]: the first fill time read,
@@ -142,6 +153,20 @@ impl HlCmd {
             arg: 0,
             time_ms: 0,
         }
+    }
+
+    /// The highest ALO priority a place may bid, ×1e8 of resting notional:
+    /// 1 % (XMM XH5d — the xmm.toml parser's bound; the arm refuses more
+    /// unsent).
+    pub const PRIORITY_MAX_1E8: u32 = 1_000_000;
+
+    /// XMM XH5d: this ALO place bidding priority `p_1e8` (p ×1e8 of its
+    /// resting notional, carried in `arg`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_priority(mut self, p_1e8: u32) -> Self {
+        self.arg = p_1e8;
+        self
     }
 
     /// This order as a modify of the resting `prev_client_oid`.
@@ -208,11 +233,23 @@ impl HlCmd {
         c
     }
 
-    /// A control command (leverage, scheduleCancel, noop): posted alone.
+    /// Control (XMM XH5c): buy `weight` requests of address budget
+    /// (`reserveRequestWeight`). `client_oid` only correlates the answer.
+    #[inline(always)]
+    #[must_use]
+    pub const fn reserve(slot: u8, client_oid: u64, weight: u32) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_RESERVE;
+        c.arg = weight;
+        c
+    }
+
+    /// A control command (leverage, scheduleCancel, noop, a weight
+    /// purchase): posted alone.
     #[inline(always)]
     #[must_use]
     pub const fn is_control(&self) -> bool {
-        self.kind >= CMD_LEVERAGE && self.kind <= CMD_NOOP
+        (self.kind >= CMD_LEVERAGE && self.kind <= CMD_NOOP) || self.kind == CMD_RESERVE
     }
 
     /// Read (XH4d): the account's resting orders. `client_oid` only
@@ -255,11 +292,20 @@ impl HlCmd {
         c
     }
 
+    /// Read (XMM XH5b-1): the account's spot sheet.
+    #[inline(always)]
+    #[must_use]
+    pub const fn read_spot(slot: u8, client_oid: u64) -> Self {
+        let mut c = Self::place(slot, client_oid, 0, false, 0, 0, Tif::Gtc);
+        c.kind = CMD_READ_SPOT;
+        c
+    }
+
     /// A read (posted alone, unsigned, WebSocket only).
     #[inline(always)]
     #[must_use]
     pub const fn is_read(&self) -> bool {
-        self.kind >= CMD_READ_ORDERS && self.kind <= CMD_READ_DAY
+        self.kind >= CMD_READ_ORDERS && self.kind <= CMD_READ_SPOT
     }
 
     /// Reduce-only.
@@ -405,6 +451,9 @@ mod tests {
             (CMD_SCHEDULE_CANCEL, 1_789_000_005_000)
         );
         assert!(HlCmd::noop(6, 11).is_control());
+        let r = HlCmd::reserve(6, 12, 10_000);
+        assert_eq!((r.kind, r.arg), (CMD_RESERVE, 10_000));
+        assert!(r.is_control() && !r.is_read());
         assert!(!HlCmd::cancel(6, 1, 0).is_control());
         assert!(!HlCmd::place(6, 1, 0, true, 1, 1, Tif::Alo).is_control());
     }
@@ -417,5 +466,23 @@ mod tests {
         let c = HlCmd::place(0, 1, 0, true, 1, 1, Tif::Ioc);
         assert_eq!(c.order_wire().tif, Tif::Ioc as u8);
         assert_eq!(c.expiring_after(750).expires_after_ms, 750);
+    }
+
+    /// XH5b-1: the spot sheet is the last read — every read kind is one,
+    /// nothing past it.
+    #[test]
+    fn every_read_kind_is_a_read_and_none_past_the_spot_sheet() {
+        let s = HlCmd::read_spot(6, 9);
+        assert_eq!((s.kind, s.slot, s.client_oid), (CMD_READ_SPOT, 6, 9));
+        assert!(s.is_read() && !s.is_control());
+        assert!(HlCmd::read_orders(6, 1).is_read());
+        assert!(HlCmd::read_state(6, 1).is_read());
+        assert!(HlCmd::read_limit(6, 1).is_read());
+        assert!(HlCmd::read_day(6, 1, 0, 0).is_read());
+        let mut past = s;
+        past.kind = CMD_READ_SPOT + 1;
+        assert!(!past.is_read());
+        assert!(!HlCmd::noop(6, 1).is_read());
+        assert!(!HlCmd::cancel(6, 1, 0).is_read());
     }
 }

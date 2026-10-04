@@ -282,6 +282,13 @@ pub fn encode_state_json(s: &EngineSnapshot, dst: &mut [u8]) -> Result<usize, Js
     c.u64(xc.health_held);
     c.key("busy_deferred");
     c.u64(xc.busy_deferred);
+    // XMM XH5d: the ALO priority's bids and the HYPE they committed.
+    c.key("priority_places");
+    c.u64(xc.priority_places);
+    c.key("priority_fee_usd_1e6");
+    c.u64(xc.priority_fee_usd_1e6);
+    c.key("priority_refused");
+    c.u64(xc.priority_refused);
     c.key("perps");
     c.put(b"[");
     let np = (xm.n_perps as usize).min(crate::SNAPSHOT_XMM_PERPS);

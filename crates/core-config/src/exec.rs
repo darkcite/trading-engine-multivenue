@@ -1080,8 +1080,10 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
     // WebSocket arm — one address's sweeps, budget and dead man — so a
     // gateway slot names hyperliquid alone; the perp clamps (deviation 19,
     // both or neither) and the post-only rejection halt (XH-7) are its
-    // own; and a live one states all three, an address floor the arm
-    // accepts, and no top-up (the gateway arm buys none before XH5).
+    // own; and a live one states all three and an address floor the arm
+    // accepts. XMM XH5c-2: its top-up keys are legal under the rules above
+    // (both, or neither; bounded) — slot 6's boot takes them on an account
+    // of its own alone (`cli::xmm_live::check_account_rules`).
     let gateway = s.transport == TRANSPORT_GATEWAY;
     if gateway && !(s.venues.len() == 1 && names("hyperliquid")) {
         return Err(err(format!(
@@ -1123,13 +1125,6 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
                  at least {GATEWAY_BUDGET_FLOOR_MIN} (every order it can hold cancelled twice \
                  over and 64 re-arms of its dead man)",
                 s.request_budget_floor
-            )));
-        }
-        if s.request_topup_weight != 0 {
-            return Err(err(format!(
-                "slot {slot} at line {line}: `request_topup_weight` is the blocking arm's \
-                 top-up (S7-L1); the gateway arm buys none before XMM XH5 — remove the \
-                 top-up keys"
             )));
         }
     }
@@ -1787,9 +1782,26 @@ mode = "paper"
             &gw.replace("request_budget_floor = 2000", "request_budget_floor = 319"),
             "at least 320",
         );
+        // XMM XH5c-2: the probe's top-ups (10 000 a purchase, 100 000 a day)
+        // are legal on a gateway slot; the generic rules still hold.
+        let topped = parse(&format!(
+            "{gw}request_topup_weight = 10000\nrequest_topup_day_max = 100000\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                topped.slot(3).request_topup_weight,
+                topped.slot(3).request_topup_day_max
+            ),
+            (10_000, 100_000)
+        );
         expect_err(
-            &format!("{gw}request_topup_weight = 10000\nrequest_topup_day_max = 100000\n"),
-            "top-up",
+            &format!("{gw}request_topup_weight = 10000\n"),
+            "request_topup_day_max",
+        );
+        expect_err(
+            &format!("{gw}request_topup_day_max = 100000\n"),
+            "arms nothing",
         );
         expect_err(
             &gw.replace(

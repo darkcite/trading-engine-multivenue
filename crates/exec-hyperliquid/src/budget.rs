@@ -170,6 +170,20 @@ impl AddressBudget {
         }
     }
 
+    /// **XMM XH5c-2** — [`Self::remaining`] less what traded volume earned
+    /// (a request a USDC): the grant (the starting allowance and the weight
+    /// reserved) less the requests spent — what a purchase moves and volume
+    /// does not. The gateway arm judges a top-up on it, so a minute's
+    /// volume is never read as a purchase.
+    #[inline]
+    #[must_use]
+    pub fn remaining_unearned(&self) -> i64 {
+        let spent = i64::try_from(self.spent_requests).unwrap_or(i64::MAX);
+        i64::try_from(self.initial_buffer)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(spent)
+    }
+
     /// Requests believed to remain before the venue's cliff.
     ///
     /// Signed, and allowed to go negative: a governor that saturated
@@ -380,6 +394,42 @@ pub fn scan_rate_limit(body: &[u8]) -> Option<(u64, i64, u64)> {
 /// beside the budget's.
 pub const TOPUP_STATE_PATH: &str = "exec-topup.state";
 
+/// **XMM XH5c-2** — the room one top-up state line takes, written in place
+/// ([`TopupState::write_line`]): `0x` and 40 hex, four tabs, four decimals
+/// of ≤ 20 characters (the spend's sign included), a newline — ≤ 127 B.
+pub const TOPUP_LINE_MAX: usize = 128;
+/// The widest line: `0x` and 40 hex, four times a tab and ≤ 20 characters,
+/// the newline.
+const TOPUP_LINE_WIDEST: usize = crate::config::HEX20_LEN + 4 * (1 + 20) + 1;
+// The widest line fits: no figure can carry a write past the buffer.
+const _: () = assert!(TOPUP_LINE_WIDEST <= TOPUP_LINE_MAX);
+
+/// A state line's bytes, written in place: `core::fmt` into a fixed
+/// buffer, 0 B. A write past it is refused (`fmt::Error`) — the bound
+/// above makes that unreachable.
+struct LineBuf<'a> {
+    buf: &'a mut [u8; TOPUP_LINE_MAX],
+    n: usize,
+}
+
+impl core::fmt::Write for LineBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.n + s.len();
+        if end > TOPUP_LINE_MAX {
+            return Err(core::fmt::Error);
+        }
+        // COPY: `core::fmt`'s pieces (≤ 20 B each: a decimal, a tab, the
+        // newline) into the line, ≤ 85 B a line (`TOPUP_LINE_WIDEST` less
+        // the master's 42, rendered in place) — cold: once a hand-over on
+        // the gateway's thread, and the blocking arm's store; the line is the
+        // one buffer the write takes. Rejected: a second integer renderer,
+        // for a few stores an hour.
+        self.buf[self.n..end].copy_from_slice(s.as_bytes());
+        self.n = end;
+        Ok(())
+    }
+}
+
 /// **S7-L1** — what the top-up must remember across a restart: the UTC
 /// day and the weight sent on it (the day ceiling), and the session's
 /// spend with the anchor it belongs to (the session P&L).
@@ -399,17 +449,41 @@ pub struct TopupState {
 
 impl TopupState {
     /// The state-file line:
-    /// `<0x master>\t<day>\t<used>\t<anchor s>\t<cost ×1e6>\n`.
+    /// `<0x master>\t<day>\t<used>\t<anchor s>\t<cost ×1e6>\n` — the tests'
+    /// spelling of [`Self::write_line`] (one format; every store writes it
+    /// in place).
+    #[cfg(test)]
     #[must_use]
     pub fn to_line(self, address: &[u8; 20]) -> String {
-        format!(
-            "{}\t{}\t{}\t{}\t{}\n",
-            crate::config::hex20(address),
-            self.day,
-            self.used,
-            self.anchor_set_s,
-            self.cost_1e6
+        let mut line = [0u8; TOPUP_LINE_MAX];
+        let n = self.write_line(address, &mut line);
+        String::from_utf8_lossy(&line[..n]).into_owned()
+    }
+
+    /// **XMM XH5c-2** — the state-file line,
+    /// `<0x master>\t<day>\t<used>\t<anchor s>\t<cost ×1e6>\n`, written in
+    /// place into `out`: its length. 0 B — slot 6's top-up keeper stores it
+    /// on its gateway's thread after init, the blocking arm on its idle
+    /// path. The master as [`crate::config::hex20_into`] renders it, into
+    /// the line itself.
+    pub fn write_line(self, address: &[u8; 20], out: &mut [u8; TOPUP_LINE_MAX]) -> usize {
+        use core::fmt::Write as _;
+        crate::config::hex20_into(address, out);
+        let mut w = LineBuf {
+            buf: out,
+            n: crate::config::HEX20_LEN,
+        };
+        let ok = writeln!(
+            w,
+            "\t{}\t{}\t{}\t{}",
+            self.day, self.used, self.anchor_set_s, self.cost_1e6
         )
+        .is_ok();
+        debug_assert!(
+            ok && w.n <= TOPUP_LINE_WIDEST,
+            "a top-up line fits {TOPUP_LINE_WIDEST} B"
+        );
+        w.n
     }
 
     /// Restore for `address`; `None` for a malformed line, a negative
@@ -441,11 +515,16 @@ impl TopupState {
 /// `today` and the anchor set at `anchor_set_s`.
 ///
 /// A MISSING file is a fresh start: nothing sent today, nothing spent
-/// this session. Every other failure — unreadable, malformed, another
-/// address — reads as today's ceiling already SPENT (`used =
-/// u64::MAX`): the arm cannot know what it bought, and the safe answer
-/// is to buy nothing until tomorrow. The spend carries over only for the
-/// anchor it was recorded under; a new session starts at zero.
+/// this session. Every other failure — unreadable, longer than one line
+/// (XMM XH5c-2: read into [`TOPUP_LINE_MAX`] + 1 B, never whole),
+/// malformed, another address — reads as today's ceiling already SPENT
+/// (`used = u64::MAX`): the arm cannot know what it bought, and the safe
+/// answer is to buy nothing until tomorrow. A day stored one LATER than `today`
+/// (the clock stepped back across 00:00Z) is kept with its usage — it never
+/// re-opens a day already spent (XMM XH5c-1); one stored further ahead (a
+/// clock that once ran ahead) reads as today spent, so the next day heals
+/// it. The spend carries over only for the anchor it was recorded under; a
+/// new session starts at zero.
 #[must_use]
 pub fn restore_topup(
     path: &std::path::Path,
@@ -453,34 +532,277 @@ pub fn restore_topup(
     today: u64,
     anchor_set_s: u64,
 ) -> (u64, u64, i64) {
-    // COPY: one ≤ 120 B state line read into a String at BOOT — the
-    // restore path, once per process; never the tick path.
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (today, 0, 0),
         Err(_) => return (today, u64::MAX, 0),
     };
-    let Some(s) = TopupState::from_line(&text, address) else {
+    let mut buf = [0u8; TOPUP_LINE_MAX + 1];
+    let mut n = 0usize;
+    while n < buf.len() {
+        // COPY: the state file into a 129 B stack buffer at BOOT, once — a
+        // file read is a copy; rejected: an unbounded `read_to_string` (a
+        // file of any size, a String), a mapping for ≤ 127 B.
+        match std::io::Read::read(&mut f, &mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (today, u64::MAX, 0),
+        }
+    }
+    let line = if n <= TOPUP_LINE_MAX {
+        core::str::from_utf8(&buf[..n]).ok()
+    } else {
+        None
+    };
+    let Some(s) = line.and_then(|t| TopupState::from_line(t, address)) else {
         return (today, u64::MAX, 0);
     };
-    let used = if s.day == today { s.used } else { 0 };
+    let (day, used) = if s.day > today.saturating_add(1) {
+        (today, u64::MAX)
+    } else if s.day >= today {
+        (s.day, s.used)
+    } else {
+        (today, 0)
+    };
     let cost = if anchor_set_s != 0 && s.anchor_set_s == anchor_set_s {
         s.cost_1e6
     } else {
         0
     };
-    (today, used, cost)
+    (day, used, cost)
 }
 
 /// **S7-L1** — write the top-up state durably (temp file, `sync_all`,
 /// rename). After every top-up that left the host: rare, on the idle
-/// path, never the tick path.
+/// path, never the tick path. XMM XH5c-2: the line written in place (no
+/// `String`); the temp name taken on the call.
 ///
 /// # Errors
 /// The temp write, the fsync or the rename failed; the message names
 /// the path.
-pub fn store_topup(path: &std::path::Path, address: &[u8; 20], s: TopupState) -> Result<(), String> {
-    core_io::write_atomic(path, &s.to_line(address))
+pub fn store_topup(
+    path: &std::path::Path,
+    address: &[u8; 20],
+    s: TopupState,
+) -> Result<(), String> {
+    let mut line = [0u8; TOPUP_LINE_MAX];
+    let n = s.write_line(address, &mut line);
+    core_io::write_atomic_at(path, &core_io::tmp_path(path), &line[..n])
+}
+
+/// **S7-L1** — the venue's price of one reserved request, USD ×1e6
+/// (0.0005 USDC, "paid from the Perps balance").
+pub const TOPUP_PRICE_1E6: i64 = 500;
+
+/// **S7-L1 (gap E)** — with the venue's own headroom in hand: buy one
+/// top-up of `weight`? Only inside the band `(floor, floor + weight]`
+/// — above it there IS headroom (a purchase the arm could not confirm
+/// may already have gone through), and at or under the floor the router
+/// has halted the slot, sticky — and only while the day's ceiling holds
+/// one more. Pure, so the arithmetic is pinned without a venue.
+#[inline]
+#[must_use]
+pub const fn topup_fits(remaining: i64, floor: i64, weight: u64, used: u64, day_max: u64) -> bool {
+    let w = if weight > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        weight as i64
+    };
+    remaining > floor
+        && remaining <= floor.saturating_add(w)
+        && used.saturating_add(weight) <= day_max
+}
+
+/// **The request-weight top-up governor** — S7-L1 (gap E); XMM XH5c: one
+/// implementation, both Hyperliquid arms. The purchase policy as state:
+/// the weight a top-up buys (`0` = off), the most a UTC day may buy, the
+/// day counted, the weight bought on it (or possibly bought), and what this
+/// session's top-ups cost. Each arm runs its own round trip — the blocking
+/// arm in one idle call (`HlExchange::top_up_budget`), the gateway arm
+/// across its budget reads (XMM XH5c-2: it decides by [`Self::take`] and
+/// returns a purchase refused before it left by [`Self::refund_day`]) —
+/// and both decide by [`Self::wants`], confirm by [`Self::confirms`] and
+/// stop by [`Self::stop`]. 40 B, `Copy`; never allocates.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub struct TopupGovernor {
+    weight: u64,
+    day_max: u64,
+    day: u64,
+    used: u64,
+    cost_1e6: i64,
+}
+
+const _: () = assert!(core::mem::size_of::<TopupGovernor>() == 40);
+
+impl TopupGovernor {
+    /// Off (`weight` 0), with the day's usage and the session's spend a
+    /// restart restored ([`restore_topup`]).
+    #[must_use]
+    pub const fn restored(day: u64, used: u64, cost_1e6: i64) -> Self {
+        Self {
+            weight: 0,
+            day_max: 0,
+            day,
+            used,
+            cost_1e6,
+        }
+    }
+
+    /// Armed: buy `weight` per top-up, at most `day_max` a UTC day
+    /// (`weight` 0 leaves it off); the restored day, usage and spend kept.
+    #[must_use]
+    pub const fn armed(self, weight: u64, day_max: u64) -> Self {
+        Self {
+            weight,
+            day_max,
+            ..self
+        }
+    }
+
+    /// The weight one top-up buys; `0` = off.
+    #[inline]
+    #[must_use]
+    pub const fn weight(&self) -> u64 {
+        self.weight
+    }
+
+    /// This session's top-up spend, USD ×1e6.
+    #[inline]
+    #[must_use]
+    pub const fn cost_1e6(&self) -> i64 {
+        self.cost_1e6
+    }
+
+    /// XMM XH5c-2: the weight bought — or possibly bought — on the day
+    /// counted (`u64::MAX`: a restore that could not read it, today spent).
+    #[inline]
+    #[must_use]
+    pub const fn used(&self) -> u64 {
+        self.used
+    }
+
+    /// XMM XH5c-2: the most a UTC day may buy (the boot's tell).
+    #[inline]
+    #[must_use]
+    pub const fn day_max(&self) -> u64 {
+        self.day_max
+    }
+
+    /// The state line's figures, tied to the anchor set at `anchor_set_s`.
+    #[must_use]
+    pub const fn state(&self, anchor_set_s: u64) -> TopupState {
+        TopupState {
+            day: self.day,
+            used: self.used,
+            anchor_set_s,
+            cost_1e6: self.cost_1e6,
+        }
+    }
+
+    /// Above the band — headroom no top-up is for: `remaining` over `floor`
+    /// plus one top-up's weight. The blocking arm's check before it reads
+    /// the venue; the band rule itself is [`topup_fits`].
+    #[must_use]
+    pub const fn above_band(&self, remaining: i64, floor: u64) -> bool {
+        let f = if floor > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            floor as i64
+        };
+        let w = if self.weight > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            self.weight as i64
+        };
+        remaining > f.saturating_add(w)
+    }
+
+    /// **XMM XH5c-2** — count from `today` when it is a LATER UTC day (its
+    /// usage from 0) — forward only: a clock stepping back across 00:00Z
+    /// never re-opens a day already spent. [`Self::wants`] rolls first; the
+    /// gateway arm rolls before a stop, so a stop spends the day it happens
+    /// on.
+    pub fn roll(&mut self, today: u64) {
+        if today > self.day {
+            self.day = today;
+            self.used = 0;
+        }
+    }
+
+    /// Buy one now? Off never buys. The day rolled ([`Self::roll`]); then
+    /// the band rule ([`topup_fits`]) on the venue's own `remaining` over
+    /// `floor`, inside the day's max.
+    pub fn wants(&mut self, remaining: i64, floor: u64, today: u64) -> bool {
+        if self.weight == 0 {
+            return false;
+        }
+        self.roll(today);
+        let floor = i64::try_from(floor).unwrap_or(i64::MAX);
+        topup_fits(remaining, floor, self.weight, self.used, self.day_max)
+    }
+
+    /// Decide AND charge the day in one step — for an arm whose purchase
+    /// answers later (XMM XH5c-2's gateway arm): `true` = buy one, its
+    /// weight already counted against the day, so two decisions before an
+    /// answer can never both pass the day's max.
+    pub fn take(&mut self, remaining: i64, floor: u64, today: u64) -> bool {
+        let yes = self.wants(remaining, floor, today);
+        if yes {
+            self.charge_day();
+        }
+        yes
+    }
+
+    /// One top-up bought, or possibly bought: the day's usage charged.
+    pub fn charge_day(&mut self) {
+        self.used = self.used.saturating_add(self.weight);
+    }
+
+    /// **XMM XH5c-2** — the day's charge of a purchase [`Self::take`]
+    /// decided that never left the host (refused unsent: halted, not
+    /// ready, throttled; a full ring; abandoned before it left) — never
+    /// bought, so returned: a throttled minute does not spend the day's
+    /// max on nothing. Stopped, it returns nothing (the weight is 0).
+    pub fn refund_day(&mut self) {
+        self.used = self.used.saturating_sub(self.weight);
+    }
+
+    /// One top-up's price charged to this session's spend.
+    pub fn charge_cost(&mut self) {
+        let w = i64::try_from(self.weight).unwrap_or(i64::MAX);
+        self.cost_1e6 = self
+            .cost_1e6
+            .saturating_add(w.saturating_mul(TOPUP_PRICE_1E6));
+    }
+
+    /// **Seen on the venue, or no more:** does `after` — the venue's
+    /// headroom read after a purchase — show it over `before`, less the
+    /// request it cost (half the weight is the bar)? A purchase that does
+    /// not show may be credited where the arm cannot read it: the next one
+    /// could buy the same need twice.
+    #[must_use]
+    pub const fn confirms(&self, before: i64, after: i64) -> bool {
+        let w = if self.weight > i64::MAX as u64 {
+            i64::MAX
+        } else {
+            self.weight as i64
+        };
+        after >= before.saturating_add(w / 2)
+    }
+
+    /// No more top-ups from this process — nor, for the rest of the UTC
+    /// day, from the next: the day reads as spent once its state is stored.
+    pub fn stop(&mut self) {
+        self.weight = 0;
+        self.used = self.used.max(self.day_max);
+    }
+
+    /// A new anchor: its session's spend starts at zero.
+    pub fn new_session(&mut self) {
+        self.cost_1e6 = 0;
+    }
 }
 
 /// Read the budget for `address` from `path`.
@@ -663,13 +985,97 @@ mod tests {
             (20_720, 10_000, 5_000_000),
             "same day, same session"
         );
-        assert_eq!(restore_topup(&path, ADDR, 20_721, 1_790_200_000), (20_721, 0, 5_000_000));
-        assert_eq!(restore_topup(&path, ADDR, 20_720, 1_790_300_000), (20_720, 10_000, 0));
-        assert_eq!(restore_topup(&path, ADDR, 20_720, 0), (20_720, 10_000, 0), "unanchored");
-        assert_eq!(restore_topup(&path, OTHER, 20_720, 1), (20_720, u64::MAX, 0), "foreign");
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_721, 1_790_200_000),
+            (20_721, 0, 5_000_000)
+        );
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_719, 1_790_200_000),
+            (20_720, 10_000, 5_000_000),
+            "a clock stepped back keeps the later day and its usage"
+        );
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_718, 1_790_200_000),
+            (20_718, u64::MAX, 5_000_000),
+            "a day further ahead: today spent, tomorrow healed"
+        );
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_720, 1_790_300_000),
+            (20_720, 10_000, 0)
+        );
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_720, 0),
+            (20_720, 10_000, 0),
+            "unanchored"
+        );
+        assert_eq!(
+            restore_topup(&path, OTHER, 20_720, 1),
+            (20_720, u64::MAX, 0),
+            "foreign"
+        );
         std::fs::write(&path, "garbage").unwrap();
-        assert_eq!(restore_topup(&path, ADDR, 20_720, 1), (20_720, u64::MAX, 0), "garbled");
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_720, 1),
+            (20_720, u64::MAX, 0),
+            "garbled"
+        );
+        // XMM XH5c-2: read into one line's room, never whole — a longer file
+        // (a valid line padded past it) is no state.
+        let long = format!(
+            "{}{}",
+            s.to_line(&ADDR).trim_end(),
+            " ".repeat(TOPUP_LINE_MAX)
+        );
+        std::fs::write(&path, long).unwrap();
+        assert_eq!(
+            restore_topup(&path, ADDR, 20_720, 1),
+            (20_720, u64::MAX, 0),
+            "overlong"
+        );
+        store_topup(&path, &ADDR, s).expect("stores");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            s.to_line(&ADDR),
+            "the store writes the line in place"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// XMM XH5c-2: the line written in place is the state line, byte for
+    /// byte — the widest figures included — and reads back.
+    #[test]
+    fn the_line_written_in_place_is_the_state_line() {
+        let wide = TopupState {
+            day: u64::MAX,
+            used: u64::MAX,
+            anchor_set_s: u64::MAX,
+            cost_1e6: i64::MIN,
+        };
+        let mut line = [0u8; TOPUP_LINE_MAX];
+        let n = wide.write_line(&[0xFF; 20], &mut line);
+        assert_eq!(n, TOPUP_LINE_WIDEST, "the widest line fits");
+        assert_eq!(
+            &line[..n],
+            format!(
+                "0x{}\t{}\t{}\t{}\t{}\n",
+                "ff".repeat(20),
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                i64::MIN
+            )
+            .as_bytes()
+        );
+        let s = TopupState {
+            day: 20_720,
+            used: 10_000,
+            anchor_set_s: 1_790_200_000,
+            cost_1e6: 5_000_000,
+        };
+        let n = s.write_line(&ADDR, &mut line);
+        assert_eq!(&line[..n], s.to_line(&ADDR).as_bytes());
+        let text = core::str::from_utf8(&line[..n]).expect("ASCII");
+        assert_eq!(TopupState::from_line(text, ADDR), Some(s));
     }
 
     /// **A cold boot must not hand itself the allowance** — the
@@ -798,9 +1204,7 @@ mod tests {
         store(&p, &b).expect("store");
         assert_eq!(load(&p, ADDR, 250), b);
 
-        let mut t = p.clone().into_os_string();
-        t.push(".tmp");
-        assert!(!std::path::PathBuf::from(t).exists(), "temp left behind");
+        assert!(!core_io::tmp_path(&p).exists(), "temp left behind");
         // The old, wrong temp name must not be created either.
         assert!(!p.with_extension("tsv.tmp").exists());
 
@@ -893,5 +1297,160 @@ mod tests {
         let mut b = AddressBudget::restored(ADDR, 0, 0, 0);
         b.on_venue_fill(i64::MIN);
         let _ = b.remaining();
+    }
+
+    /// **S7-L1 (gap E) — the top-up buys only inside its band and
+    /// under its ceiling.** Floor 2 000, weight 5 000, ceiling 30 000.
+    #[test]
+    fn a_topup_buys_only_between_the_floor_and_one_topup_above_it() {
+        assert!(
+            topup_fits(7_000, 2_000, 5_000, 0, 30_000),
+            "the top of the band"
+        );
+        assert!(
+            topup_fits(2_001, 2_000, 5_000, 0, 30_000),
+            "just over the floor"
+        );
+        assert!(
+            !topup_fits(7_001, 2_000, 5_000, 0, 30_000),
+            "headroom: nothing to buy"
+        );
+        assert!(
+            !topup_fits(2_000, 2_000, 5_000, 0, 30_000),
+            "at the floor: halted, sticky"
+        );
+        assert!(!topup_fits(-50, 2_000, 5_000, 0, 30_000), "past the cliff");
+        assert!(
+            topup_fits(5_000, 2_000, 5_000, 25_000, 30_000),
+            "the day's last one"
+        );
+        assert!(
+            !topup_fits(5_000, 2_000, 5_000, 25_001, 30_000),
+            "over the ceiling"
+        );
+        assert!(
+            !topup_fits(5_000, 2_000, 5_000, u64::MAX, 30_000),
+            "an unreadable day"
+        );
+        // Saturates rather than wrapping: a weight past i64 reads as the
+        // widest band, never as a negative one.
+        assert!(topup_fits(5_000, 2_000, u64::MAX, 0, u64::MAX));
+        assert!(
+            !topup_fits(5_000, 2_000, u64::MAX, 1, u64::MAX - 1),
+            "and the ceiling holds"
+        );
+    }
+
+    /// XMM XH5c: the governor — off buys nothing; armed, it buys inside the
+    /// band and the day's max, rolls the day, charges the day and the
+    /// session, confirms on half the weight, and a stop spends the day.
+    #[test]
+    fn the_governor_buys_in_its_band_charges_confirms_and_stops() {
+        let restored = TopupGovernor::restored(19_999, 25_000, 7);
+        let mut off = restored;
+        assert!(!off.wants(5_000, 2_000, 19_999), "off");
+        let mut g = restored.armed(5_000, 30_000);
+        assert_eq!((g.weight(), g.cost_1e6()), (5_000, 7));
+        assert!(!g.wants(7_001, 2_000, 19_999), "above the band");
+        assert!(
+            g.wants(5_000, 2_000, 19_999),
+            "in the band, the day's last one"
+        );
+        g.charge_day();
+        assert!(!g.wants(5_000, 2_000, 19_999), "the day's max");
+        assert!(g.wants(5_000, 2_000, 20_000), "a new day counts from zero");
+        g.charge_cost();
+        assert_eq!(g.cost_1e6(), 7 + 5_000 * TOPUP_PRICE_1E6);
+        assert_eq!(
+            g.state(42),
+            TopupState {
+                day: 20_000,
+                used: 0,
+                anchor_set_s: 42,
+                cost_1e6: 2_500_007,
+            }
+        );
+        assert!(g.confirms(3_000, 5_500), "half the weight shows");
+        assert!(!g.confirms(3_000, 5_499), "less does not");
+        assert!(g.above_band(7_001, 2_000) && !g.above_band(7_000, 2_000));
+        let mut t = TopupGovernor::restored(20_000, 25_000, 0).armed(5_000, 30_000);
+        assert!(t.take(5_000, 2_000, 20_000), "decided and charged at once");
+        assert!(
+            !t.take(5_000, 2_000, 20_000),
+            "a second decision before an answer: the day's max"
+        );
+        assert_eq!(t.state(0).used, 30_000);
+        assert!(
+            !t.wants(5_000, 2_000, 19_999),
+            "a clock stepped back re-opens nothing"
+        );
+        assert_eq!(t.state(0).day, 20_000);
+        g.new_session();
+        assert_eq!(g.cost_1e6(), 0);
+        g.stop();
+        assert_eq!(g.weight(), 0);
+        assert_eq!(g.state(0).used, 30_000, "the day reads as spent");
+        assert!(!g.wants(5_000, 2_000, 20_000), "stopped");
+    }
+
+    /// XMM XH5c-2: the day rolls forward only — a later day counts from 0,
+    /// an earlier one changes nothing — and a stop after a roll spends the
+    /// new day.
+    #[test]
+    fn the_day_rolls_forward_only_and_a_stop_spends_the_day_it_happens_on() {
+        let mut g = TopupGovernor::restored(20_000, 7_000, 0).armed(5_000, 30_000);
+        g.roll(19_999);
+        assert_eq!(
+            (g.state(0).day, g.used()),
+            (20_000, 7_000),
+            "backward: nothing"
+        );
+        g.roll(20_001);
+        assert_eq!((g.state(0).day, g.used()), (20_001, 0), "forward: from 0");
+        g.stop();
+        assert_eq!((g.state(0).day, g.used()), (20_001, 30_000), "today spent");
+        assert_eq!((g.day_max(), g.weight()), (30_000, 0));
+    }
+
+    /// XMM XH5c-2: the headroom apart from volume — a purchase moves it,
+    /// traded volume does not.
+    #[test]
+    fn the_unearned_headroom_moves_with_a_purchase_and_not_with_volume() {
+        let mut b = AddressBudget::from_venue(ADDR, 2_000, 7_400, 0, 0);
+        assert_eq!((b.remaining(), b.remaining_unearned()), (2_600, 2_600));
+        b.on_venue_fill(5_000 * USDC_PER_REQUEST_1E6);
+        assert_eq!(
+            (b.remaining(), b.remaining_unearned()),
+            (7_600, 2_600),
+            "volume"
+        );
+        b.on_reserved(1_000);
+        assert_eq!(
+            (b.remaining(), b.remaining_unearned()),
+            (8_600, 3_600),
+            "a purchase"
+        );
+        let v = AddressBudget::from_venue(ADDR, 2_000, 7_400, 1_000 * USDC_PER_REQUEST_1E6, 1_000);
+        assert_eq!((v.remaining(), v.remaining_unearned()), (4_600, 3_600));
+    }
+
+    /// XMM XH5c-2: a purchase decided that never left returns the day's
+    /// charge — the next decision passes again — and a stopped governor
+    /// returns nothing.
+    #[test]
+    fn a_purchase_that_never_left_returns_the_day_s_charge() {
+        let mut g = TopupGovernor::restored(20_000, 0, 0).armed(5_000, 5_000);
+        assert!(g.take(5_000, 2_000, 20_000));
+        assert_eq!(g.used(), 5_000);
+        assert!(!g.take(5_000, 2_000, 20_000), "the day's max");
+        g.refund_day();
+        assert_eq!(g.used(), 0, "never bought");
+        assert!(g.take(5_000, 2_000, 20_000), "decided again");
+        g.stop();
+        g.refund_day();
+        assert_eq!(g.used(), 5_000, "stopped: nothing returned");
+        let mut z = TopupGovernor::restored(20_000, 0, 0).armed(5_000, 5_000);
+        z.refund_day();
+        assert_eq!(z.used(), 0, "saturating");
     }
 }

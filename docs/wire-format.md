@@ -95,7 +95,7 @@ rebuilds the lane. A full ring drops the print and counts it
 |     45 |     1 | aggressor     | `u8`           | 0 = BUY (lifted the ask, HL `B`), 1 = SELL (hit the bid, HL `A`) |
 |     46 |    18 | _pad          | `[u8; 18]`     | explicit, zeroed (one cache line, the ring-slot law) |
 
-### `OrderEvent` — 64 bytes (XMM XH1, 2026-09-26; the order-event lane, never captured)
+### `OrderEvent` — 64 bytes (XMM XH1, 2026-09-26; the order-event lane; PMLR `slot_kind = 9` since XMM XH5d)
 
 One change in an order's venue-side state (`Ring<OrderEvent, 1024>`,
 engine `on_order_event`, drained after every fill source — the fill
@@ -105,6 +105,11 @@ booked before a member can act on an order event, LAW E6). Routed by
 slot is out of range or not enabled is counted
 (`StrategySet::order_events_unrouted`), never fanned out. XH1 adds the
 lane; the paper model (XH2) and the live gateway (XH4) are its producers.
+XMM XH5d captures every event the engine drains, every slot's, before the
+member sees it (`engine-events.pmlr`, `SlotKind::OrderEvent`); the
+Hyperliquid arm's RESTING carries the venue's time from the `open` row —
+repeated once, with it, when the post's answer (which carries none) came
+first (a member takes the repeat as a no-op).
 
 | offset | bytes | field         | type           | notes                                        |
 | -----: | ----: | ------------- | -------------- | -------------------------------------------- |
@@ -137,7 +142,8 @@ the same situation `Order.strategy_id` was in at M4.1.
 |     16 |     8 | px          | `i64` Price    | fixed-point ×1e6                                 |
 |     24 |     8 | qty         | `i64` Qty      | fixed-point ×1e6                                 |
 |     32 |     8 | order_id    | `u64`          | engine-assigned client oid                       |
-|     40 |    16 | _pad1       | `[u8; 16]`     | explicit, zeroed                                 |
+|     40 |     8 | tid         | `u64`          | XMM XH5d: the venue's trade id (Hyperliquid `tid`); 0 = none (paper) — was `_pad1`, explicit zeroed, so every capture written before reads as none |
+|     48 |     8 | _pad1       | `[u8; 8]`      | explicit, zeroed                                 |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)            |
 
 `origin` is load-bearing for any audit that will see both sources in one
@@ -166,7 +172,8 @@ reader-compat surface.
 |     40 |     1 | venue       | `u8` VenueId   | routing target (v2+; garbage in v1) |
 |     41 |     1 | strategy_id | `u8`           | M4.1: emitting strategy-set slot (0=latency-arb 1=vrp [VRP V7 2026-09-10 — was ev] 2=xsd [XSD-S/XSD-3 2026-09-12 — was cross-arb] 3=rule-tree 4=ai-exec 5=vm 6=icdp — ICDP I4, 2026-09-03: the intrabar member; its intents are `kind = 1` IoC with `ttl_ns` = the bar's remaining life). **Today's map: 0 hyparb · 1 vrp · 2 xsd · 3 bin15 · 4 ai-exec · 5 vm · 6 xmm (XMM XH1, 2026-09-26 — icdp unlinked; rows under 6 before that date are icdp's) · 7 free.** Stamped by the set's `StampCtx`; `0xFF` = unattributed (bare boots). Per-ruleset attribution is NOT embedded — join vm orders (slot 5) against the ai-cmds `RulesetCommit` timeline |
 |     42 |     1 | verb        | `u8`           | **E5 (2026-09-19)**: which LIFECYCLE verb this record is — 0=PLACE, 1=CANCEL, 2=MODIFY. Wire-additive: every Order persisted before E5 carries 0 here (the byte was explicit zeroed padding), and 0 is PLACE, which is what every one of them was. The verb rides the Order slot rather than a second file because a cancel is meaningless apart from the place it refers to, and two streams would let a replay apply it first — the same argument §7 of the exec plan gives for the `ExecCmd` union ring, and the field meanings are deliberately identical. A reader that does not know a verb byte MUST drop the record, never treat it as a place |
-|     43 |     5 | _pad1       | `[u8; 5]`      | explicit, zeroed                |
+|     43 |     1 | ab_arm      | `u8`           | XMM XH5d: the A/B arm the order was decided in — 0 none, 1 A, 2 B; was `_pad1`, explicit zeroed, so every capture written before reads as none |
+|     44 |     4 | alo_priority_1e8 | `u32`     | XMM XH5d: the ALO priority bid, p ×1e8 of resting notional (Hyperliquid's `{"p": N}` grouping); 0 none; a post-only place's alone; was `_pad1`, explicit zeroed (the last of it), so every capture written before reads as none |
 |     48 |     8 | ttl_ns      | `u64`          | I1 (2026-09-03): time-to-live relative to `ts_ns`; 0 = none. A MODEL field — the offline fill law (`backtest::fill`) cancels the order at the first record of its sym at/after `ts_ns + ttl_ns` (an IoC that meets no fresh tick before its emitting bar closes is a cancel); no engine cancel path reads it (Stage-3). Wire-additive: every Order persisted before I1 carries 0 here (the bytes were explicit zeroed padding) |
 |     56 |     8 | prev_client_oid | `u64`      | **E5 (2026-09-19)**: the resting order this record acts on, for `verb` 1 and 2; **0 for a place**, which acts on nothing. Wire-additive for the same reason as `verb`. Pairs with `client_oid`, which is the id the record's OWN order carries — so a MODIFY names both (the order it replaces and the replacement's fresh id, per ruling O-E5b), and a CANCEL carries `client_oid = 0` because it creates no order. A cancel record also carries `px`, `qty`, `side` and `kind` zero: a `CancelReq` asserts nothing about them, and a reader that found a price there would be reading a number nobody wrote |
 
@@ -808,7 +815,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **3** (VT1); readers accept ≤ 3 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B) |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B), 8=ExecRecord (BX6), 9=OrderEvent (XMM XH5d) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |

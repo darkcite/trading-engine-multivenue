@@ -166,7 +166,12 @@ pub struct InstrumentSpec {
     pub law: u8,
     /// `INST_*` (options only).
     pub flags: u8,
-    _pad: [u8; 2],
+    /// **XMM XH5a** — the slot that owns the row ([`OWNER_NONE`]: any
+    /// live slot may trade it). Slot 6's gateway perps are owned: the
+    /// router refuses every other slot's live order on them
+    /// ([`InstRefusal::Foreign`]).
+    pub owner: u8,
+    _pad: [u8; 1],
     /// Option: underlying units per contract ×1e6 (the eapi `unit`).
     /// Inverse: the contract's USD face ×1e6 (`contractSize`). Else 0.
     pub unit_1e6: i64,
@@ -184,12 +189,24 @@ impl InstrumentSpec {
             sym,
             law,
             flags,
-            _pad: [0; 2],
+            owner: OWNER_NONE,
+            _pad: [0; 1],
             unit_1e6,
             strike_1e6,
         }
     }
+
+    /// **XMM XH5a** — the same binding, owned by `slot`: only its live
+    /// orders pass the router on this row.
+    #[must_use]
+    pub const fn owned_by(mut self, slot: u8) -> Self {
+        self.owner = slot;
+        self
+    }
 }
+
+/// [`InstrumentSpec::owner`] of a row no slot owns.
+pub const OWNER_NONE: u8 = u8::MAX;
 
 /// Why [`Ledger::bind_instrument`] refused. Boot-only; the boot refuses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -232,7 +249,9 @@ struct InstrumentRow {
     /// [`Ledger::refresh_instrument`], counted per slot in
     /// `Ledger::inst_unmarked`.
     unmarked: u8,
-    _pad1: [u8; 7],
+    /// **XMM XH5a** — [`InstrumentSpec::owner`].
+    owner: u8,
+    _pad1: [u8; 6],
     /// Index = slot. Signed position ×1e6 (base units, or contracts).
     pos_1e6: [i64; EXEC_SLOTS],
     /// Index = slot. Exposure at the row's own prices, USD ×1e6 —
@@ -260,7 +279,8 @@ impl InstrumentRow {
         last_px_1e6: 0,
         mark_ns: 0,
         unmarked: 0,
-        _pad1: [0; 7],
+        owner: OWNER_NONE,
+        _pad1: [0; 6],
         pos_1e6: [0; EXEC_SLOTS],
         exp_1e6: [0; EXEC_SLOTS],
     };
@@ -388,6 +408,8 @@ pub enum InstRefusal {
     /// A price at or below zero, a short option with no index, a zero or
     /// negative quantity.
     Unpriced = 2,
+    /// **XMM XH5a** — the row is another slot's ([`InstrumentSpec::owner`]).
+    Foreign = 3,
 }
 
 /// **What the risk gate learns about one order on an instrument row** —
@@ -1356,7 +1378,10 @@ impl Ledger {
             || spec.law > LAW_OPTION
             || ((spec.law == LAW_INVERSE || option) && spec.unit_1e6 <= 0)
             || (option && spec.strike_1e6 <= 0)
-            || (!option && (spec.flags != 0 || spec.strike_1e6 != 0));
+            || (!option && (spec.flags != 0 || spec.strike_1e6 != 0))
+            // XMM XH5a: an owner is a slot, or none — a byte past the slots
+            // would refuse every slot on the row, silently.
+            || (spec.owner != OWNER_NONE && usize::from(spec.owner) >= EXEC_SLOTS);
         if bad {
             return Err(InstrumentBindErr::BadSpec);
         }
@@ -1384,6 +1409,7 @@ impl Ledger {
             flags: spec.flags,
             unit_1e6: spec.unit_1e6,
             strike_1e6: spec.strike_1e6,
+            owner: spec.owner,
             ..InstrumentRow::FREE
         };
         self.inst_n += 1;
@@ -1543,12 +1569,18 @@ impl Ledger {
         perp: bool,
     ) -> Option<InstProbe> {
         let i = self.inst_find(sym)?;
+        let r = &self.inst[i];
         let mut p = InstProbe::default();
-        if slot >= EXEC_SLOTS || qty_1e6 <= 0 || (perp && self.inst[i].law != LAW_LINEAR) {
+        // XMM XH5a: an owned row is its owner's alone — judged before any
+        // number, since none of them is this slot's to read.
+        if r.owner != OWNER_NONE && usize::from(r.owner) != slot {
+            p.refusal = InstRefusal::Foreign;
+            return Some(p);
+        }
+        if slot >= EXEC_SLOTS || qty_1e6 <= 0 || (perp && r.law != LAW_LINEAR) {
             p.refusal = InstRefusal::Unpriced;
             return Some(p);
         }
-        let r = &self.inst[i];
         let filled = r.pos_1e6[slot];
         let against = (filled > 0 && !buy) || (filled < 0 && buy);
         // One pass: the working orders on the order's side (the exit test's
@@ -2083,24 +2115,32 @@ impl Ledger {
         self.resting_by_slot[slot] = self.resting_by_slot[slot].saturating_add(1);
     }
 
-    /// **E6 commit 3 — every slot's orders were cancelled at the
+    /// **XMM XH5a (R-XH4-1) — one slot's orders were cancelled at the
     /// venue.**
     ///
-    /// A halt's cancel-all is venue-wide, so the resting count is
-    /// stale for EVERY slot — including the healthy ones that keep
-    /// running and will simply re-quote. Leaving them counted would
-    /// have `max_open_orders` refuse a slot holding nothing.
+    /// A halt's cancel is per slot (E6 commit 3's was venue-wide), so
+    /// the venue's confirmation makes THIS slot's resting rows stale:
+    /// they go, with the count and the notional of any order the table
+    /// could not hold. Every other slot's rows stay — those orders were
+    /// not asked for and are still working. Leaving the halted slot's
+    /// counted would have `max_open_orders` refuse a slot holding
+    /// nothing.
     ///
     /// The exposure and turnover ledgers are untouched: a cancel
     /// removes an order, not a position.
-    pub fn clear_resting(&mut self) {
-        self.resting = [RestingOrder::free(); LEDGER_RESTING];
-        self.resting_by_slot = [0; EXEC_SLOTS];
-        self.resting_px_1e6 = [0; LEDGER_RESTING];
-        self.resting_px_asked_1e6 = [0; LEDGER_RESTING];
-        self.resting_qty_asked_1e6 = [0; LEDGER_RESTING];
-        self.resting_asked_oid = [0; LEDGER_RESTING];
-        self.resting_usd_1e6 = [0; EXEC_SLOTS];
+    pub fn clear_resting_slot(&mut self, slot: usize) {
+        if slot >= EXEC_SLOTS {
+            return;
+        }
+        let mut i = 0usize;
+        while i < LEDGER_RESTING {
+            if self.resting[i].live != 0 && usize::from(self.resting[i].slot) == slot {
+                self.release(i);
+            }
+            i += 1;
+        }
+        self.resting_by_slot[slot] = 0;
+        self.resting_usd_1e6[slot] = 0;
     }
 
     /// A live cancel was accepted by the arm. Stops tracking it.
@@ -3996,8 +4036,78 @@ mod tests {
             i += 1;
         }
         assert_eq!(l.resting_usd_1e6(SLOT), 50 * E6, "fail closed");
-        l.clear_resting();
-        assert_eq!(l.resting_usd_1e6(SLOT), 0, "a venue-wide cancel clears it");
+        l.clear_resting_slot(SLOT);
+        assert_eq!(
+            l.resting_usd_1e6(SLOT),
+            0,
+            "the slot's confirmed cancel clears it"
+        );
+        assert_eq!(l.slot_resting(SLOT), 0);
+    }
+
+    /// **XMM XH5a — a slot's confirmed cancel clears its rows only**:
+    /// another slot's orders, count and notional stay.
+    #[test]
+    fn a_slot_s_cancel_clears_its_rows_and_no_other_slot_s() {
+        let mut l = inst();
+        l.on_submit(1, SLOT, LIN, 2 * E6, true, 100 * E6);
+        l.on_submit(2, SLOT, LIN, E6, false, 101 * E6);
+        l.on_submit(3, SLOT + 1, LIN, 3 * E6, true, 99 * E6);
+        assert_eq!((l.slot_resting(SLOT), l.slot_resting(SLOT + 1)), (2, 1));
+        l.clear_resting_slot(SLOT);
+        assert_eq!(l.slot_resting(SLOT), 0);
+        assert_eq!(l.resting_usd_1e6(SLOT), 0);
+        assert_eq!(l.locate(1, SLOT), Found::None);
+        assert_eq!(
+            l.slot_resting(SLOT + 1),
+            1,
+            "the sibling's order is still working"
+        );
+        assert_eq!(l.resting_usd_1e6(SLOT + 1), 297 * E6);
+        assert!(matches!(l.locate(3, SLOT + 1), Found::One(_)));
+        l.clear_resting_slot(EXEC_SLOTS);
+        assert_eq!(
+            l.slot_resting(SLOT + 1),
+            1,
+            "an unknown slot clears nothing"
+        );
+    }
+
+    /// **XMM XH5a — an owned row is its owner's alone**: another slot's
+    /// probe is refused `Foreign` before any number; the owner's is
+    /// judged as before; an unowned row takes every slot.
+    #[test]
+    fn an_owned_row_refuses_every_other_slot() {
+        let mut l = Ledger::new(anchor());
+        l.mark_seeded();
+        let owned = bn(7);
+        l.bind_instrument(&InstrumentSpec::new(owned, LAW_LINEAR, 0, 0, 0).owned_by(6))
+            .unwrap();
+        l.bind_instrument(&InstrumentSpec::new(LIN, LAW_LINEAR, 0, 0, 0))
+            .unwrap();
+        let foreign = l
+            .probe_instrument(owned, 4, E6, true, 100 * E6, None)
+            .unwrap();
+        assert_eq!(foreign.refusal, InstRefusal::Foreign);
+        let perp = l.probe_perp(owned, 4, E6, true, 100 * E6, None).unwrap();
+        assert_eq!(perp.refusal, InstRefusal::Foreign, "a perp slot too");
+        let own = l.probe_perp(owned, 6, E6, true, 100 * E6, None).unwrap();
+        assert_eq!(own.refusal, InstRefusal::None);
+        let shared = l
+            .probe_instrument(LIN, 4, E6, true, 100 * E6, None)
+            .unwrap();
+        assert_eq!(
+            shared.refusal,
+            InstRefusal::None,
+            "an unowned row takes any slot"
+        );
+        assert_eq!(
+            InstrumentSpec::new(LIN, LAW_LINEAR, 0, 0, 0).owner,
+            OWNER_NONE
+        );
+        // An owner past the slots is no owner: refused at the bind.
+        let past = InstrumentSpec::new(bn(8), LAW_LINEAR, 0, 0, 0).owned_by(8);
+        assert_eq!(l.bind_instrument(&past), Err(InstrumentBindErr::BadSpec));
     }
 
     /// **XH4e — the resting notional is exact**: after any mix of submits,
@@ -4061,9 +4171,9 @@ mod tests {
                         l.on_retired(o, s);
                     }
                 }
-                6 if pick == 0 => {
-                    l.clear_resting();
-                    live.clear();
+                6 if pick < 2 => {
+                    l.clear_resting_slot(slot);
+                    live.retain(|&(_, s)| s != slot);
                 }
                 _ => {}
             }

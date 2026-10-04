@@ -1518,6 +1518,19 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     );
     eng.set_trade_lane(tr_c);
     eng.set_order_event_lane(oe_c);
+    // XMM XH5d: the order-event capture rides both drains — the lane's
+    // events and the paper arm's below are staged inside the window.
+    let ev_dir = std::env::temp_dir().join(format!("xh5d_alloc_events_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ev_dir);
+    std::fs::create_dir_all(&ev_dir).unwrap();
+    eng.set_event_capture(
+        core_io::SlotCapture::open(
+            ev_dir.join(engine::ENGINE_EVENTS_FILE),
+            core_io::SlotKind::OrderEvent,
+            1,
+        )
+        .unwrap(),
+    );
     // XMM XH2: the paper arm's queue law on a tracked Hyperliquid perp —
     // each iteration a post-only bid lands on the print that goes
     // through it, so the dispatcher's order-event pump runs its `true`
@@ -1622,6 +1635,14 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         "engine.tick() with latency record allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0);
+    assert_eq!(
+        eng.event_capture_records(),
+        eng.order_events_dispatched,
+        "every drained order event staged, once"
+    );
+    assert_eq!(eng.event_capture_io_errors(), 0);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&ev_dir);
 }
 
 /// QueuedDispatcher worker drain — engine pushes 1000 orders into
@@ -3653,6 +3674,297 @@ fn xmm_member_requote_replaced_and_stale_pull_are_zero_alloc() {
     assert_eq!((c.stuck, c.unmatched), (0, 0));
     assert_eq!(allocs, 0, "xmm member branches allocated {allocs} times ({bytes} B)");
     assert_eq!(bytes, 0, "xmm member branches bytes should be zero: saw {bytes}");
+}
+
+/// **XMM gate 75e (XH5d-2)** — the A/B arms: the block's clock (the
+/// follower's venue time) alternating A and B every cycle; under `ab_mode`
+/// 1 a bid decided in arm B pulled on half θ (a −0.3 bps leader move that
+/// arm A's bid rides out); under `ab_mode` 3 both quotes decided in arm B
+/// taking their size-only modify, a lot down then back, each a floor after
+/// the last change, then no more — and, every third arm-B cycle, the bid's
+/// touch moving after its lot down (its requote ends the step), another
+/// the bid's lot down refused (the step ends); under `ab_mode` 2 (XH5d-3b)
+/// the bids decided in arm B, at a level formed that cycle, bidding 1 %
+/// until the boot's cap — allocate nothing.
+#[test]
+fn xmm_member_ab_arms_are_zero_alloc() {
+    use core_types::{
+        CancelReq, Order, OrderEvent, Side, ORDER_EVENT_CANCELED,
+        ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_REPLACED, ORDER_EVENT_RESTING,
+    };
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    /// The live id and price by side (a placement's, then each modify's);
+    /// the modifies sorted — the same price (size-only) or a new one (a
+    /// requote); one refusal when asked; the places bidding ALO priority —
+    /// arm A's, arm B's bids, arm B's asks.
+    struct AbCtx {
+        now: u64,
+        live: [u64; 2],
+        px: [i64; 2],
+        size_only: u64,
+        repriced: u64,
+        refuse: bool,
+        prio: [u64; 3],
+    }
+    impl Ctx for AbCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            let s = usize::from(o.side == Side::Ask);
+            if o.alo_priority_1e8 != 0 {
+                // `ab_arm` 1 is arm A.
+                self.prio[if o.ab_arm == 1 { 0 } else { 1 + s }] += 1;
+            }
+            self.live[s] = o.client_oid;
+            self.px[s] = o.px.raw();
+            Ok(())
+        }
+        fn cancel(&mut self, _r: CancelReq) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn modify(&mut self, _prev: u64, o: Order) -> Result<(), SubmitErr> {
+            if self.refuse {
+                self.refuse = false;
+                return Err(SubmitErr::RingFull);
+            }
+            let s = usize::from(o.side == Side::Ask);
+            if o.px.raw() == self.px[s] {
+                self.size_only += 1;
+            } else {
+                self.repriced += 1;
+            }
+            self.live[s] = o.client_oid;
+            self.px[s] = o.px.raw();
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let bn = core_types::make_symbol_id(VenueId::Binance, 9);
+    let mut xp = strategy_xmm::XmmParams::EMPTY;
+    xp.perps[0] = strategy_xmm::XmmPerp {
+        hl_sym: hl,
+        lead_sym: bn,
+        lot_1e6: 10_000,
+    };
+    xp.n_perps = 1;
+    xp.maker_enabled = 1;
+    xp.theta_bps_1e6 = 500_000;
+    xp.gate_window_ms = 1;
+    xp.lifetime_ms = 30_000;
+    xp.lead_stale_ms = 300;
+    xp.follower_stale_ms = 2_000;
+    xp.rtt_pull_ms = 1_500;
+    xp.requote_min_ms = 250;
+    xp.clip_usd_1e6 = 15_000_000;
+    xp.inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.gross_inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.resting_cap_usd_1e6 = 1_000_000_000_000;
+    xp.ab_mode = 1;
+    let mut theta = strategy_xmm::XmmStrategy::new();
+    theta.configure(&xp).expect("gate 75e θ params");
+    xp.ab_mode = 3;
+    let mut size = strategy_xmm::XmmStrategy::new();
+    size.configure(&xp).expect("gate 75e size params");
+    xp.ab_mode = 2;
+    xp.alo_priority_1e8 = 1_000_000;
+    let mut prio = strategy_xmm::XmmStrategy::new();
+    prio.configure(&xp).expect("gate 75e priority params");
+    let t0: u64 = 1_000_000_000_000;
+    let mut tc = AbCtx {
+        now: t0,
+        live: [0; 2],
+        px: [0; 2],
+        size_only: 0,
+        repriced: 0,
+        refuse: false,
+        prio: [0; 3],
+    };
+    let mut sc = AbCtx {
+        now: t0,
+        live: [0; 2],
+        px: [0; 2],
+        size_only: 0,
+        repriced: 0,
+        refuse: false,
+        prio: [0; 3],
+    };
+    let mut pc = AbCtx {
+        now: t0,
+        live: [0; 2],
+        px: [0; 2],
+        size_only: 0,
+        repriced: 0,
+        refuse: false,
+        prio: [0; 3],
+    };
+    theta.on_start(&mut tc).expect("gate 75e θ start");
+    size.on_start(&mut sc).expect("gate 75e size start");
+    prio.on_start(&mut pc).expect("gate 75e priority start");
+    let book = |sym: u32, bid: i64, ask: i64, stale: bool| {
+        let mut t = Tick::new(
+            0,
+            if sym == hl {
+                VenueId::Hyperliquid
+            } else {
+                VenueId::Binance
+            },
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        );
+        if stale {
+            t.flags |= core_types::TICK_FLAG_STALE;
+        }
+        t
+    };
+    let lead = book(bn, 99_990_000, 100_010_000, false);
+    // The leader's bid + ask from 200 000 000 to 199 994 000: −0.3 bps.
+    let lead_dn = book(bn, 99_987_000, 100_007_000, false);
+    let lead_stale = book(bn, 99_990_000, 100_010_000, true);
+    let fol = book(hl, 99_990_000, 100_010_000, false);
+    // The follower's bid touch half a tick up: the bid requotes.
+    let fol_up = book(hl, 99_995_000, 100_010_000, false);
+    let ev = |oid: u64, kind: u8, reason: u8| {
+        OrderEvent::new(0, VenueId::Hyperliquid, hl, oid, 6, kind, reason, 0)
+    };
+    let pulled = ORDER_EVENT_REASON_CANCEL_REQUESTED;
+
+    // A multiple of 6: the three arm-B variants run equally often.
+    const CYCLES: u64 = 12_000;
+    const MS: u64 = 1_000_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        // Cycle i is in block i: even A, odd B.
+        let mut f = fol;
+        f.venue_time_ms = i * strategy_xmm::XMM_AB_BLOCK_MS + 1;
+        let mut fu = fol_up;
+        fu.venue_time_ms = f.venue_time_ms;
+        // `ab_mode` 1: both sides placed in the block's arm; the leader
+        // falls 0.3 bps (arm B's bid pulls, arm A's rests) and comes back;
+        // a stale leader tick pulls what rests.
+        tc.now = t0 + i * 1_000 * MS;
+        theta.on_tick(&lead, &mut tc);
+        theta.on_tick(&f, &mut tc);
+        let placed = tc.live;
+        theta.on_order_event(&ev(placed[0], ORDER_EVENT_RESTING, 0), &mut tc);
+        theta.on_order_event(&ev(placed[1], ORDER_EVENT_RESTING, 0), &mut tc);
+        tc.now += 10 * MS;
+        theta.on_tick(&lead_dn, &mut tc);
+        tc.now += 10 * MS;
+        theta.on_tick(&lead, &mut tc);
+        theta.on_tick(&lead_stale, &mut tc);
+        theta.on_order_event(&ev(placed[0], ORDER_EVENT_CANCELED, pulled), &mut tc);
+        theta.on_order_event(&ev(placed[1], ORDER_EVENT_CANCELED, pulled), &mut tc);
+        // `ab_mode` 3: both sides placed; three steps 300 ms apart (past
+        // the 250 ms floor), the leader fresh at each. In arm B: a lot
+        // down, then back, then nothing — or (i ≡ 3 mod 6) the bid's touch
+        // up after its lot down, its requote ending the step; or (i ≡ 5)
+        // the bid's lot down refused. A stale leader tick pulls both.
+        sc.now = t0 + i * 1_000 * MS;
+        size.on_tick(&lead, &mut sc);
+        size.on_tick(&f, &mut sc);
+        let mut live = sc.live;
+        size.on_order_event(&ev(live[0], ORDER_EVENT_RESTING, 0), &mut sc);
+        size.on_order_event(&ev(live[1], ORDER_EVENT_RESTING, 0), &mut sc);
+        sc.refuse = i % 6 == 5;
+        let mut step = 0;
+        while step < 3 {
+            sc.now += 300 * MS;
+            size.on_tick(&lead, &mut sc);
+            size.on_tick(if i % 6 == 3 && step > 0 { &fu } else { &f }, &mut sc);
+            let mut s = 0usize;
+            while s < 2 {
+                if sc.live[s] != live[s] {
+                    let replaced = ORDER_EVENT_REASON_REPLACED;
+                    size.on_order_event(&ev(live[s], ORDER_EVENT_CANCELED, replaced), &mut sc);
+                    size.on_order_event(&ev(sc.live[s], ORDER_EVENT_RESTING, 0), &mut sc);
+                    live[s] = sc.live[s];
+                }
+                s += 1;
+            }
+            step += 1;
+        }
+        size.on_tick(&lead_stale, &mut sc);
+        size.on_order_event(&ev(live[0], ORDER_EVENT_CANCELED, pulled), &mut sc);
+        size.on_order_event(&ev(live[1], ORDER_EVENT_CANCELED, pulled), &mut sc);
+        // `ab_mode` 2: the follower's bid improves half a tick into each
+        // arm-B cycle (its level forms there; arm A's retreat and the ask
+        // form none); both sides placed, then pulled.
+        let pf = if i % 2 == 0 { f } else { fu };
+        pc.now = t0 + i * 1_000 * MS;
+        prio.on_tick(&lead, &mut pc);
+        prio.on_tick(&pf, &mut pc);
+        let placed = pc.live;
+        prio.on_order_event(&ev(placed[0], ORDER_EVENT_RESTING, 0), &mut pc);
+        prio.on_order_event(&ev(placed[1], ORDER_EVENT_RESTING, 0), &mut pc);
+        prio.on_tick(&lead_stale, &mut pc);
+        prio.on_order_event(&ev(placed[0], ORDER_EVENT_CANCELED, pulled), &mut pc);
+        prio.on_order_event(&ev(placed[1], ORDER_EVENT_CANCELED, pulled), &mut pc);
+        i += 1;
+    }
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let (t, s) = (theta.counters(), size.counters());
+    assert_eq!(t.placed, 2 * CYCLES, "θ: both sides every cycle");
+    assert_eq!(
+        t.lead_cancels,
+        CYCLES / 2,
+        "θ: arm B's bid pulled on half θ, arm A's rested"
+    );
+    assert_eq!(
+        t.pull_cancels,
+        3 * CYCLES / 2,
+        "θ: the stale pull took what rested"
+    );
+    assert_eq!(s.placed, 2 * CYCLES, "size: both sides every cycle");
+    // Per arm-B cycle: 4 size-only (down and back, both sides); 3 and a
+    // requote (the bid's back replaced by its requote); 2 and a refusal
+    // (the bid's down refused, the ask's down and back).
+    let b = CYCLES / 6;
+    assert_eq!(
+        (sc.size_only, sc.repriced, s.ctx_refused),
+        (b * (4 + 3 + 2), b, b),
+        "size: the size-only modifies, the requotes ending a step, the refusals"
+    );
+    assert_eq!(s.modifies, sc.size_only + sc.repriced);
+    assert_eq!(
+        StrategyCounters::orders_emitted(&size),
+        s.placed + s.modifies
+    );
+    assert_eq!(s.pull_cancels, 2 * CYCLES, "size: the stale pull took both");
+    assert_eq!((tc.size_only, tc.repriced), (0, 0), "θ: no modify");
+    // `ab_mode` 2: arm B's bids bid 1 % until the boot's cap; the asks
+    // (never moved) and arm A never; the cap stops them well before the
+    // last arm-B cycle.
+    let pr = prio.counters();
+    assert_eq!(pc.prio, [0, pr.priority_places, 0]);
+    // Each arm-B bid at 99.995 is 0.15 (the $15 clip in lots): 1 % of it
+    // is ⌈149 992.5⌉ = 149 993 USD ×1e6; $25 holds 166 of them — then the
+    // cap refuses the remaining arm-B cycles, inside the window.
+    assert_eq!(
+        (pr.priority_places, pr.priority_fee_usd_1e6),
+        (166, 166 * 149_993),
+        "the cap stopped them"
+    );
+    assert!(pr.priority_fee_usd_1e6 <= u64::from(strategy_xmm::XMM_PRIORITY_MAX_USD_1E6));
+    assert_eq!(pr.placed, 2 * CYCLES);
+    assert_eq!((pr.stuck, pr.unmatched), (0, 0));
+    assert_eq!((t.stuck, t.unmatched, s.stuck, s.unmatched), (0, 0, 0, 0));
+    assert_eq!(
+        allocs, 0,
+        "the xmm A/B arms allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "the xmm A/B arms bytes should be zero: saw {bytes}"
+    );
 }
 
 /// **XMM gate 75d (XH4f)** — the member's health branches (D8): a
@@ -8522,10 +8834,13 @@ fn routed_ledger_steady_state() {
 /// * the seeding edge, where `reconciled` first turns the restart
 ///   interlock off;
 /// * `trigger_for` against every threshold on a live slot;
-/// * the halt EDGE itself: latch, `exec.HALT` write, and the
-///   venue-wide cancel request;
-/// * `cancel_all_state` polling through `Working` to `Clear`, which
-///   is where `clear_resting` walks the table;
+/// * the halt EDGE — latch, `exec.HALT` write and the slot's cancel
+///   request — runs BETWEEN the windows, unmeasured: `write_atomic`
+///   builds a path, once per incident (gate 100 measures the edge's
+///   per-slot request, with no halt file);
+/// * `cancel_slot_state` polling through `Working` to `Clear` (the second
+///   window), which is where `clear_resting_slot` walks the table — this
+///   arm answers the per-slot verbs through the trait's defaults;
 /// * `exec_counters`, which `/state` and `/metrics` both read and
 ///   which now copies a per-slot halt array.
 ///
@@ -8735,6 +9050,326 @@ fn routed_halt_idle_steady_state() {
     );
     assert_eq!(bytes, 0, "halted idle-poll bytes should be zero: saw {bytes}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **XMM gate 100 (XH5a) — the per-slot halt path is 0 B/op.** R-XH4-1
+/// made the router's halt cancel per slot: every idle poll,
+/// `try_cancel_slots` runs each halted slot's request/confirm cycle on
+/// its own, and a slot's `Clear` releases that slot's rows alone
+/// (`Ledger::clear_resting_slot`). Three windows:
+///
+/// * the router over an arm that answers PER SLOT — slot 3 trips its own
+///   reject streak while slot 4, on the same arm, never does. Slot 3's
+///   first request is refused (`Retry`), its first sweep strands
+///   (`Stranded`, asked again) and the third clears, releasing slot 3's
+///   resting row while slot 4's stays. No halt file is configured, so
+///   gate 62's one allocation on the edge (`write_atomic`'s path) is not
+///   in it;
+/// * the blocking arm's own request and confirmation
+///   (`HlExchange::cancel_slot` / `cancel_slot_state`) with more live legs
+///   than its sweep table holds: the leg walk, the inserts, every later
+///   slot OR'd in, the legs left out stranded (`strand`), the per-slot
+///   scan;
+/// * the sweep's selection over a venue answer (`recon::scan_open_orders`
+///   and `recon::ours_on_leg` with a one-slot mask), which runs on every
+///   idle moment while a sweep is pending.
+#[test]
+fn xmm_per_slot_halt_path_is_zero_alloc() {
+    use clob_dispatcher::{
+        CancelAllState, DispatchError, HaltSignal, OrderDispatch, PaperDispatcher,
+    };
+    use core_types::{CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, Order, Side};
+    use exec_hyperliquid::config::{HlConfig, Scope};
+    use exec_hyperliquid::exchange::HlExchange;
+    use exec_hyperliquid::recon::{ours_on_leg, scan_open_orders, OpenOrder, MAX_OPEN_ORDERS};
+    use exec_router::{
+        ExecMode, ExecRoute, HaltLimits, HaltReason, InstrumentSpec, RoutedDispatcher, SlotCaps,
+        LAW_LINEAR,
+    };
+
+    fn roll(outcome: u32, sym: u32) -> ChannelEvent {
+        ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym,
+            u64::from(outcome) | (60u64 << 32),
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+
+    /// The poll after which slot 3's reject streak sits at its threshold.
+    const TRIP_AT: u64 = 250;
+
+    /// An arm whose slots sweep on their own: slot 3 trips ITSELF (as
+    /// gate 62's arm does); a slot's sweep drains in three polls; the next
+    /// `fail[s]` requests of a slot are refused and its next `strand[s]`
+    /// sweeps give a leg up.
+    struct Arm {
+        polls: u64,
+        sweeping: [u32; 8],
+        asked: [u32; 8],
+        fail: [u32; 8],
+        strand: [u32; 8],
+        stranded: [bool; 8],
+    }
+    impl OrderDispatch for Arm {
+        fn submit(&mut self, _o: &Order) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn cancel(&mut self, _r: &CancelReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn modify(&mut self, _r: &ModifyReq) -> Result<(), DispatchError> {
+            Ok(())
+        }
+        fn try_next_fill(&mut self) -> Option<Fill> {
+            None
+        }
+        fn stats(&self) -> clob_dispatcher::DispatchStats {
+            clob_dispatcher::DispatchStats::default()
+        }
+        fn halt_signal(&self) -> HaltSignal {
+            HaltSignal::new(1_000_000, 0, 0, 0, false, true, 1_000_000)
+        }
+        fn halt_signal_for(&self, slot: u8) -> HaltSignal {
+            let streak = 5 * u32::from(slot == 3 && self.polls > TRIP_AT);
+            HaltSignal::new(1_000_000, 0, streak, 0, false, true, 1_000_000)
+        }
+        fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+            let s = usize::from(slot);
+            self.asked[s] += 1;
+            if self.fail[s] > 0 {
+                self.fail[s] -= 1;
+                return Err(DispatchError::QueueFull);
+            }
+            self.stranded[s] = false;
+            self.sweeping[s] = 3;
+            Ok(())
+        }
+        fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+            let s = usize::from(slot);
+            if self.sweeping[s] > 0 {
+                CancelAllState::Working
+            } else if self.stranded[s] {
+                CancelAllState::Stranded
+            } else {
+                CancelAllState::Clear
+            }
+        }
+        fn on_idle(&mut self) -> bool {
+            self.polls += 1;
+            let mut s = 0usize;
+            while s < 8 {
+                if self.sweeping[s] == 1 && self.strand[s] > 0 {
+                    // This sweep gives a leg up: the venue still holds one.
+                    self.strand[s] -= 1;
+                    self.stranded[s] = true;
+                }
+                self.sweeping[s] = self.sweeping[s].saturating_sub(1);
+                s += 1;
+            }
+            false
+        }
+    }
+
+    // Boot-time construction — outside the windows, as the engine's is.
+    let mut route = ExecRoute::all_paper();
+    let mut slot = 3usize;
+    while slot <= 4 {
+        route
+            .set_slot(
+                slot,
+                ExecMode::Live,
+                &[core_types::VenueId::Hyperliquid.to_u8()],
+                SlotCaps::new(100_000_000, i64::MAX, i64::MAX, 64),
+                HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000),
+            )
+            .expect("boot: slots 3 and 4 live");
+        slot += 1;
+    }
+    let mut fail = [0u32; 8];
+    let mut strand = [0u32; 8];
+    fail[3] = 1;
+    strand[3] = 1;
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        Arm {
+            polls: 0,
+            sweeping: [0; 8],
+            asked: [0; 8],
+            fail,
+            strand,
+            stranded: [false; 8],
+        },
+        core_time::WallAnchor::new(1_789_776_001_000_000_000, 1_789_776_001_000_000_000),
+    );
+    let sym = core_types::make_symbol_id(VenueId::Hyperliquid, 950);
+    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0))
+        .expect("gate 100 row");
+    // The seeding edge: a boot step, outside the window.
+    d.on_idle();
+    // One resting order each for slots 3 and 4, so slot 3's `Clear`
+    // releases a real row and slot 4's is there to survive it.
+    let mut s = 3u8;
+    while s <= 4 {
+        let mut o = Order::new(
+            1,
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            0,
+            Price(1_000_000),
+            Qty(1_000_000),
+            u64::from(s),
+        );
+        o.strategy_id = s;
+        d.submit(&o).expect("gate 100: a resting order");
+        s += 1;
+    }
+    assert_eq!(
+        (d.ledger().slot_resting(3), d.ledger().slot_resting(4)),
+        (1, 1)
+    );
+
+    // ---- the router's per-slot cycle ----------------------------------
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < 2 * TRIP_AT {
+        std::hint::black_box(d.on_idle());
+        i += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert!(
+        d.halt().is_halted(3),
+        "slot 3's edge must have fired in the window"
+    );
+    assert_eq!(d.halt().reason(3), HaltReason::RejectStreak);
+    assert!(
+        !d.halt().is_halted(4),
+        "slot 4 never tripped its own numbers"
+    );
+    assert!(
+        !d.halt().cancel_outstanding(),
+        "slot 3's cancel must have confirmed"
+    );
+    assert_eq!(
+        d.live().asked,
+        [0, 0, 0, 3, 0, 0, 0, 0],
+        "slot 3: refused, stranded, cleared; nobody else asked"
+    );
+    assert_eq!(d.halt().cancel_all_failures, 1, "the Retry branch ran");
+    assert_eq!(d.halt().cancel_all_stranded, 1, "the Stranded branch ran");
+    assert_eq!(
+        (d.ledger().slot_resting(3), d.ledger().slot_resting(4)),
+        (0, 1),
+        "slot 3's row released on its Clear; slot 4's stays"
+    );
+    assert_eq!(
+        allocs, 0,
+        "the per-slot halt poll allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "per-slot halt-poll bytes should be zero: saw {bytes}"
+    );
+
+    // ---- the blocking arm's per-slot request and confirmation ---------
+    let cfg = HlConfig::new(Scope::Testnet, "127.0.0.1", 'b', [0x55; 32], [0x66; 20]).expect("cfg");
+    let (p, _c) = Ring::<Fill, 64>::new().split();
+    let mut x = HlExchange::<64>::new(
+        &cfg,
+        core_net::TlsTransport::default_client_config(),
+        p,
+        std::env::temp_dir().join(format!("mv-gate100-{}.state", std::process::id())),
+        100,
+    )
+    .expect("build");
+    // Nine instances: 18 live legs, two more than the sweep table holds,
+    // bound outside the window.
+    let mut k = 0u32;
+    while k < 9 {
+        x.on_venue_event(&roll(19_418 + k, 4096 + 2 * k));
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    let mut j = 0u32;
+    while j < 2_000 {
+        let s = (j & 7) as u8;
+        acc ^= u64::from(x.cancel_slot(s).is_ok());
+        acc ^= u64::from(x.cancel_slot_state(s) == CancelAllState::Working);
+        j += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    std::hint::black_box(acc);
+    let c = *x.counters();
+    assert_eq!(c.cancel_all_runs, 2_000, "every request ran");
+    assert_eq!(
+        c.cancel_all_unqueued, 4_000,
+        "two legs left out of every request, counted"
+    );
+    assert_eq!(c.sweep_left, 0, "a retry is not a stranding");
+    assert_eq!(
+        x.cancel_slot_state(5),
+        CancelAllState::Working,
+        "every slot OR'd into the pending legs"
+    );
+    assert_eq!(
+        allocs, 0,
+        "HlExchange::cancel_slot allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "per-slot request bytes should be zero: saw {bytes}"
+    );
+
+    // ---- the sweep's selection over a venue answer --------------------
+    // Six of ours on one leg, slots 3 and 4 in turn — built outside the
+    // window, scanned and selected inside it.
+    let mut body = String::from("[");
+    let mut r = 0u64;
+    while r < 6 {
+        let c = exec_hyperliquid::cloid::encode(3 + (r % 2) as u8, 100 + r);
+        let mut h = [0u8; 34];
+        let n = exec_hyperliquid::cloid::to_hex(&c, &mut h);
+        if r > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(
+            r##"{{"coin":"#195641","oid":{},"cloid":"{}"}}"##,
+            11 + r,
+            core::str::from_utf8(&h[..n]).expect("ascii")
+        ));
+        r += 1;
+    }
+    body.push(']');
+    let body = body.into_bytes();
+    let mut rows = vec![OpenOrder::default(); MAX_OPEN_ORDERS];
+    let mut oids = vec![0u64; MAX_OPEN_ORDERS];
+
+    let g = AllocGuard::new();
+    let mut picked = 0usize;
+    let mut j = 0u32;
+    while j < 2_000 {
+        let n = scan_open_orders(&body, &mut rows).expect("the venue's answer scans");
+        picked += ours_on_leg(&rows[..n], &body, b"#195641", 1 << 3, &mut oids);
+        j += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(picked, 3 * 2_000, "slot 3's three of the six, every pass");
+    assert_eq!(
+        allocs, 0,
+        "the sweep's selection allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "sweep-selection bytes should be zero: saw {bytes}"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -13057,6 +13692,7 @@ fn exec_gateway_kit_is_zero_alloc() {
         }
         stats.cancel_rtt.record(200 * MS + turn);
         stats.fill_venue_to_local.record(120 * MS + turn);
+        stats.rest_rtt.record(900 * MS + turn);
         post_id += 1;
         while timers.pop_due(now, &mut expired) {
             acc = acc.wrapping_add(expired.key ^ u64::from(expired.kind));
@@ -13376,7 +14012,8 @@ fn xmm_slot_six_through_the_router_is_zero_alloc() {
         SlotSplit::new(SLOT, NullLiveDispatcher::new(), arm),
         core_time::WallAnchor::now(),
     );
-    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0))
+    // As the engine binds it (XMM XH5a): slot 6's row is slot 6's.
+    d.bind_instrument(&InstrumentSpec::new(sym, LAW_LINEAR, 0, 0, 0).owned_by(SLOT))
         .expect("gate 99 row");
     d.mark_ledger_seeded();
 
@@ -13433,6 +14070,7 @@ fn xmm_slot_six_through_the_router_is_zero_alloc() {
         end.stats.cancel_rtt.record(k * 1_000_000);
         end.stats.push_to_write.record(k * 1_000);
         end.stats.fill_venue_to_local.record(k * 2_000_000);
+        end.stats.rest_rtt.record(k * 3_000_000);
         k += 1;
     }
     let window = std::time::Instant::now();
@@ -13771,10 +14409,30 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// charged, the sweep's cancels by the gateway's word), every
 /// seventeenth place or modify refused `THROTTLED` (taken back from the
 /// budget), and, after the boot — its own window — the day's spend (a
-/// page that moves, then one that adds nothing past its start); the halt
-/// signals and the cancel-all state; every out-queue drained as the
-/// engine does. Timers run on the real clock (1 ms windows): the warm-up
-/// runs until every path has run, and the window must run each again.
+/// page that moves, then one that adds nothing past its start); XH5b-1:
+/// the spot sheet after each sheet ($500 USDC; every sixth failing, every
+/// seventh listing no USDC — both refused, the arm's `spot_failed`);
+/// XH5b-2: the boot's anchor handed to a real keeper that stores it just
+/// before the window, whose first pass reads it kept, and in every round of
+/// it that keeper's pass (done) and one nothing is handed to; XMM XH5c-2:
+/// top-ups armed (1 000 requests a purchase, no day's max) — they start
+/// with the anchor kept, in the window — every seventh budget read inside
+/// the band (never while a purchase awaits its confirming read), decided,
+/// its state stored by a REAL top-up keeper turned every round (the line
+/// in place, a temp file, an fsync, a rename), the purchase built in place
+/// and answered accepted (the next reads answer the full headroom, which
+/// shows it; its price charged once a sheet issued after it and its spot
+/// half land) or, every third, refused `THROTTLED` (never left: the day's
+/// charge returned; decided again, its state the one stored — kept with no
+/// write) — the window runs until each has run — then, measured alone, a
+/// venue refusal stops them and the stop is stored; the halt signals and
+/// the cancel-all state; every out-queue drained as the engine does.
+/// XMM XH5d: the `open` rows carry the venue's time, and every fourth
+/// place or modify's comes after the answer (its RESTING repeated with it);
+/// the ALO priority armed, every third order bids it (a place's fee
+/// tallied; a modify's bid dropped).
+/// Timers run on the real clock (1 ms windows): the warm-up runs until
+/// every path has run, and the window must run each again.
 #[test]
 fn hl_gateway_arm_is_zero_alloc() {
     use clob_dispatcher::{CancelAllState, OrderDispatch};
@@ -13782,23 +14440,28 @@ fn hl_gateway_arm_is_zero_alloc() {
     use core_types::{
         CancelReq, ModifyReq, Order, OrderEvent, Side, ORDER_EVENT_CANCELED,
         ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED,
+        ORDER_EVENT_RESTING,
     };
     use exec_gateway::stats::SWEEP_CLEAR;
+    use exec_hyperliquid::anchor::{AnchorKeeper, AnchorSlot, Kept};
     use exec_hyperliquid::arm::{ArmCfg, ArmCounters, HlGatewayArm, PerpBind, ARM_PERPS};
+    use exec_hyperliquid::budget::TopupGovernor;
     use exec_hyperliquid::cmd::{
         CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
-        CMD_READ_STATE,
+        CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE,
     };
     use exec_hyperliquid::deadman::DeadManCfg;
     use exec_hyperliquid::event::{
         ExecEvent, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED, EVF_POST_ITEM, EVF_RESTING, EV_ACK,
         EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_OPEN_ORDER, EV_POSITION,
         EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
-        READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_NOT_FOUND, REASON_THROTTLED,
+        READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE, REASON_NOT_FOUND,
+        REASON_THROTTLED,
     };
     use exec_hyperliquid::gateway::HlGatewayEnd;
     use exec_hyperliquid::hl_duplex;
     use exec_hyperliquid::rules::PerpRules;
+    use exec_hyperliquid::topup::{Topped, TopupKeeper, TopupSlot};
 
     const SLOT: u8 = 6;
     const SYM: u32 = 42;
@@ -13827,6 +14490,21 @@ fn hl_gateway_arm_is_zero_alloc() {
         /// XH4e: budget reads and day pages answered.
         limits: u64,
         days: u64,
+        /// XH5b-1: spot sheets answered (every sixth failing, every seventh
+        /// listing no USDC: the arm counts both `spot_failed`).
+        spots: u64,
+        /// XMM XH5c-2: the weight bought (the reads' surplus), the
+        /// purchases answered, the reads kept out of the band and off the
+        /// floor while a purchase awaits its confirming read, and whether
+        /// the venue refuses the next one (the stop's window).
+        surplus: u64,
+        reserves: u64,
+        calm: u8,
+        refuse: bool,
+        /// XMM XH5d: RESTINGs stamped with the `open` row's time — the row
+        /// before the answer landing the order, and after it, the repeat.
+        stamped: u64,
+        repeated: u64,
     }
 
     /// The gateway's end: every command answered by the script.
@@ -13899,11 +14577,16 @@ fn hl_gateway_arm_is_zero_alloc() {
                     ..item
                 })),
                 CMD_PLACE | CMD_MODIFY => {
+                    // XMM XH5d: the `open` row carries the venue's time —
+                    // every fourth before the answer (it lands the order),
+                    // every fourth after it (the answer's RESTING repeated).
+                    let open = ExecEvent {
+                        kind: EV_RESTING,
+                        venue_ms: n,
+                        ..row
+                    };
                     if n % 4 == 0 {
-                        assert!(gw.evt.emit(&ExecEvent {
-                            kind: EV_RESTING,
-                            ..row
-                        }));
+                        assert!(gw.evt.emit(&open));
                     }
                     assert!(gw.evt.emit(&ExecEvent {
                         kind: EV_ACK,
@@ -13911,6 +14594,9 @@ fn hl_gateway_arm_is_zero_alloc() {
                         oid: n,
                         ..item
                     }));
+                    if n % 4 == 2 {
+                        assert!(gw.evt.emit(&open));
+                    }
                     s.recent[s.at % RECENT] = c.client_oid;
                     s.at += 1;
                     if n % 5 == 0 {
@@ -14023,11 +14709,27 @@ fn hl_gateway_arm_is_zero_alloc() {
                     } else {
                         // 100 requests used of a $1M address's 1 010 000 —
                         // every 13th read 1 009 000: the floor (2 000)
-                        // breached, and lifted by the next read.
+                        // breached, and lifted by the next read. XMM
+                        // XH5c-2: every seventh read 2 500 left — inside the
+                        // band (2 000, 3 000]. The weight bought rides the
+                        // surplus (the grant) and `used` follows it, so each
+                        // read states the headroom it names; the band and
+                        // the floor never while a purchase awaits its
+                        // confirming read (the full headroom shows it).
+                        let calm = s.calm > 0;
+                        s.calm = s.calm.saturating_sub(1);
+                        let left = if !calm && s.limits % 13 == 0 {
+                            1_000
+                        } else if !calm && s.limits % 7 == 0 {
+                            2_500
+                        } else {
+                            1_009_900
+                        };
                         assert!(gw.evt.emit(&ExecEvent {
                             reason: READ_LIMIT,
-                            aux: if s.limits % 13 == 0 { 1_009_000 } else { 100 },
+                            aux: 1_010_000 + s.surplus - left,
                             px_1e8: 100_000_000_000_000,
+                            sz_1e8: s.surplus as i64,
                             ..end
                         }));
                     }
@@ -14046,6 +14748,42 @@ fn hl_gateway_arm_is_zero_alloc() {
                             c.time_ms
                         },
                         ..end
+                    }));
+                }
+                // XH5b-1: the worth's spot half, $500 USDC — every sixth
+                // failing, every seventh listing no USDC.
+                CMD_READ_SPOT => {
+                    s.spots += 1;
+                    let failed = s.spots % 6 == 0;
+                    let listed = s.spots % 7 != 0;
+                    assert!(gw.evt.emit(&ExecEvent {
+                        kind: if failed { EV_READ_FAILED } else { EV_READ_DONE },
+                        reason: READ_SPOT,
+                        px_1e8: if listed { 50_000_000_000 } else { 0 },
+                        sz_1e8: i64::from(listed),
+                        ..end
+                    }));
+                }
+                // XMM XH5c-2: a weight purchase — every third refused
+                // unsent (throttled: the day's charge returned), else
+                // accepted: its weight in the surplus from here on, the
+                // next two reads calm; in the stop's window, refused by the
+                // venue.
+                CMD_RESERVE => {
+                    s.reserves += 1;
+                    let (kind, reason) = if s.refuse {
+                        (EV_REJECTED, ORDER_EVENT_REASON_OTHER)
+                    } else if s.reserves % 3 == 0 {
+                        (EV_REJECTED, REASON_THROTTLED)
+                    } else {
+                        s.surplus += u64::from(c.arg);
+                        s.calm = 2;
+                        (EV_ACK, 0)
+                    };
+                    assert!(gw.evt.emit(&ExecEvent {
+                        kind,
+                        reason,
+                        ..item
                     }));
                 }
                 // The dead man's posts.
@@ -14082,6 +14820,11 @@ fn hl_gateway_arm_is_zero_alloc() {
             s.replaced += u64::from(
                 ev.kind == ORDER_EVENT_CANCELED && ev.reason == ORDER_EVENT_REASON_REPLACED,
             );
+            // XMM XH5d: the script's `open` rows carry n — before the
+            // answer when n ≡ 0 (mod 4), after it when n ≡ 2.
+            let stamped = ev.kind == ORDER_EVENT_RESTING && ev.venue_time_ms != 0;
+            s.stamped += u64::from(stamped && ev.venue_time_ms % 4 == 0);
+            s.repeated += u64::from(stamped && ev.venue_time_ms % 4 == 2);
             *acc ^= ev.client_oid ^ u64::from(ev.kind);
         }
         while let Some(r) = arm.try_next_retired() {
@@ -14104,7 +14847,9 @@ fn hl_gateway_arm_is_zero_alloc() {
             core_types::Qty(500_000),
             cid,
         )
-        .with_post_only();
+        .with_post_only()
+        // XMM XH5d: every third bids ALO priority (1 bp).
+        .with_alo_priority(if cid % 3 == 0 { 10_000 } else { 0 });
         o.strategy_id = SLOT;
         o
     }
@@ -14157,7 +14902,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
 
     /// The paths the window must run again, each counted.
-    fn paths(c: &ArmCounters, s: &Script) -> [u64; 15] {
+    fn paths(c: &ArmCounters, s: &Script) -> [u64; 19] {
         [
             c.fills,
             c.alo_rejects,
@@ -14174,6 +14919,10 @@ fn hl_gateway_arm_is_zero_alloc() {
             c.throttled,
             c.refunded,
             c.refused_budget,
+            c.spot_reads,
+            c.spot_failed,
+            s.stamped,
+            s.repeated,
         ]
     }
 
@@ -14203,6 +14952,21 @@ fn hl_gateway_arm_is_zero_alloc() {
     };
     let (eng, mut gw) = hl_duplex();
     let mut arm = HlGatewayArm::new(&cfg, eng).expect("the arm");
+    // XH5b-2: the anchor's hand-over — a real `AnchorKeeper` stores it just
+    // before the window, whose first pass reads it kept.
+    let keep = std::sync::Arc::new(AnchorSlot::new());
+    arm.keep_anchor_in(std::sync::Arc::clone(&keep));
+    // XMM XH5c-2: top-ups armed — 1 000 requests a purchase, no day's max —
+    // their state handed to a real `TopupKeeper` (built before the window).
+    let topup_slot = std::sync::Arc::new(TopupSlot::new());
+    arm.set_topup(
+        TopupGovernor::restored(0, 0, 0).armed(1_000, u64::MAX),
+        Some(std::sync::Arc::clone(&topup_slot)),
+    )
+    .expect("gate 98: top-ups on the slot's own account");
+    // XMM XH5d: the ALO priority armed — its fee tallied on every place
+    // that bids one, in the window.
+    arm.set_priority_cap(u32::MAX);
     gw.stats.set_gauges(0, true);
     let mut s = Script {
         n: 0,
@@ -14216,6 +14980,13 @@ fn hl_gateway_arm_is_zero_alloc() {
         flat: true,
         limits: 0,
         days: 0,
+        spots: 0,
+        surplus: 0,
+        reserves: 0,
+        calm: 0,
+        refuse: false,
+        stamped: 0,
+        repeated: 0,
     };
     let mut acc = 0u64;
     let _ = arm.on_idle();
@@ -14275,12 +15046,62 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
 
     // ---- measurement window ----
+    // XH5b-2: the slot's keeper stores the anchor the boot handed over —
+    // once, before the window; in the window its pass runs every round
+    // (done), beside a keeper nothing is handed to (nothing yet).
+    let dir = std::env::temp_dir().join(format!("gate98-anchor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 98: a temp dir");
+    let mut keeper = AnchorKeeper::new(
+        std::sync::Arc::clone(&keep),
+        dir.join("xmm-pnl-anchor-testnet.state"),
+        [0x66; 20],
+        std::sync::Arc::clone(&gw.stats),
+    );
+    let mut idle_keeper = AnchorKeeper::new(
+        std::sync::Arc::new(AnchorSlot::new()),
+        dir.join("never.state"),
+        [0x66; 20],
+        std::sync::Arc::clone(&gw.stats),
+    );
+    assert!(
+        matches!(keeper.turn(), Kept::Stored(_)),
+        "gate 98: the boot's worth was handed over and stored"
+    );
+    // XMM XH5c-2: the top-up keeper, the anchor's stamp handed to it as the
+    // gateway's loop does; nothing handed over before the anchor is kept.
+    let mut topup_keeper = TopupKeeper::new(
+        std::sync::Arc::clone(&topup_slot),
+        dir.join("xmm-topup-testnet.state"),
+        [0x66; 20],
+        0,
+    )
+    .expect("gate 98: the top-up keeper");
+    topup_keeper.anchored_at(keeper.set_unix_s());
+    assert_eq!(
+        topup_keeper.turn(),
+        Topped::Idle,
+        "gate 98: no top-up before the anchor is kept"
+    );
     let before = paths(arm.counters(), &s);
     let g = AllocGuard::new();
     let end = r + ROUNDS;
-    while r < end {
+    // XMM XH5c-2: and on until a purchase was seen, one refused unsent, and
+    // a decision's state was kept with no write.
+    let mut unchanged = 0u64;
+    while r < end
+        || arm.counters().topup_ok == 0
+        || arm.counters().topup_unsent == 0
+        || unchanged == 0
+    {
         round(&mut arm, &mut gw, r, &mut s, &mut acc);
+        assert!(keeper.turn() == Kept::Idle && idle_keeper.turn() == Kept::Idle);
+        match topup_keeper.turn() {
+            Topped::Failed(_) => panic!("gate 98: the top-up state could not be stored"),
+            Topped::Unchanged => unchanged += 1,
+            Topped::Idle | Topped::Stored(_) => {}
+        }
         r += 1;
+        assert!(r < end + 2_000_000, "gate 98: the top-ups never ran");
     }
     std::hint::black_box(acc);
     let (allocs, bytes, _) = g.delta();
@@ -14297,6 +15118,62 @@ fn hl_gateway_arm_is_zero_alloc() {
         allocs, 0,
         "the HL gateway arm allocated {allocs} times ({bytes} B)"
     );
+    let c = arm.counters();
+    assert!(
+        c.topup_ok > 0 && c.topup_unsent > 0 && c.topup_failed == 0 && s.reserves > 0,
+        "gate 98: top-ups seen and refused unsent, never stopped: {} seen, {} unsent, {} \
+         stopped",
+        c.topup_ok,
+        c.topup_unsent,
+        c.topup_failed
+    );
+    eprintln!(
+        "gate 98: {} rounds; top-ups {} seen, {} refused unsent, {} purchases answered, {} \
+         decisions kept with no write",
+        r - (end - ROUNDS),
+        c.topup_ok,
+        c.topup_unsent,
+        s.reserves,
+        unchanged
+    );
+    let mut rep = clob_dispatcher::GatewayArmReport::default();
+    assert!(arm.gateway_arm_report(0, &mut rep));
+    assert_eq!(
+        rep.anchor_kept, 1,
+        "gate 98: the window read the anchor kept"
+    );
+    assert!(
+        rep.topup_weight == 1_000 && rep.topup_cost_usd_1e6 > 0,
+        "gate 98: the spend of the purchases seen"
+    );
+
+    // XMM XH5c-2, measured alone: a purchase the venue refuses stops the
+    // top-ups, and the stop — the day spent — is stored.
+    s.refuse = true;
+    let mut stored = None;
+    let g = AllocGuard::new();
+    while arm.counters().topup_failed == 0 || stored.is_none() {
+        round(&mut arm, &mut gw, r, &mut s, &mut acc);
+        if let Topped::Stored(st) = topup_keeper.turn() {
+            if arm.counters().topup_failed > 0 {
+                stored = Some(st);
+            }
+        }
+        r += 1;
+        assert!(r < end + 4_000_000, "gate 98: the top-ups never stopped");
+    }
+    std::hint::black_box(acc);
+    let (stop_allocs, stop_bytes, _) = g.delta();
+    assert_eq!(
+        stored.map(|st| (st.used, st.cost_1e6 > 0)),
+        Some((u64::MAX, true)),
+        "gate 98: the stop stored as the day spent, with the session's spend"
+    );
+    assert_eq!(
+        stop_allocs, 0,
+        "the HL gateway arm's top-up stop allocated {stop_allocs} times ({stop_bytes} B)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Gate 96b's venue half: runs ONLY in the child process gate 96b spawns
@@ -14331,6 +15208,13 @@ fn gate96_venue_helper() {
                 r#"{{"type":"frontendOpenOrders","data":[{{"coin":"ETH","limitPx":"2500.0","oid":{k},"origSz":"0.01","side":"B","sz":"0.01","timestamp":1,"isTrigger":false,"cloid":"{c}"}},{{"coin":"ETH","limitPx":"2600.0","oid":7,"origSz":"0.01","side":"A","sz":"0.01","timestamp":1,"isTrigger":false}}]}}"#
             ));
         }
+        // XH5b-1: the spot sheet.
+        if s.body.contains("spotClearinghouseState") {
+            return Answer::Info(
+                r#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"USDC","token":0,"total":"250.25","hold":"0.0","entryNtl":"0.0"},{"coin":"HYPE","token":150,"total":"1.5","hold":"0.0","entryNtl":"40.0"}]}}"#
+                    .to_string(),
+            );
+        }
         if s.body.contains("userRateLimit") {
             return Answer::Info(
                 r#"{"type":"userRateLimit","data":{"cumVlm":"1500.5","nRequestsUsed":2890,"nRequestsCap":11500,"nRequestsSurplus":7}}"#
@@ -14356,6 +15240,10 @@ fn gate96_venue_helper() {
                 r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#
                     .to_string(),
             );
+        }
+        // XMM XH5c-2: a weight purchase — a control action's answer.
+        if s.body.contains("reserveRequestWeight") {
+            return Answer::Action(r#"{"status":"ok","response":{"type":"default"}}"#.to_string());
         }
         if s.body.contains("batchModify") {
             return Answer::Action(format!(
@@ -14387,7 +15275,9 @@ fn gate96_venue_helper() {
 ///
 /// The REAL gateway (`HlGateway::turn`) against a scripted venue in a
 /// CHILD process (the counting allocator is process-global — gate 72's
-/// harness). Every round pushes two ALO places, an ALO modify and a
+/// harness). Every round pushes two ALO places (XMM XH5d: both bidding
+/// priority 1 bp — one batch, its `{"p": N}` grouping sealed and rendered
+/// in place), an ALO modify and a
 /// cancel, which the gateway coalesces into THREE posts (the ALO batch,
 /// the batchModify, the cancelByCloid) — each encoded, signed, rendered
 /// and framed in place — and two reads (XH4d: the open orders, the
@@ -14412,16 +15302,21 @@ fn gate96_venue_helper() {
 /// the dedupe rings, the events — is 0 B: a regression in the gateway
 /// shows as a thirteenth. After the rounds, measured alone, XH4e's two
 /// reads: the address budget (`userRateLimit`) and the day's fills
-/// (`userFillsByTime`, its rows summed in place — no row table), each
-/// posted alone, unsigned, and answered by one end — exactly 4
-/// allocations, rustls' again (two records sealed, two opened); no sweep
+/// (`userFillsByTime`, its rows summed in place — no row table), and
+/// XH5b-1's spot sheet (`spotClearinghouseState`, scanned into a fixed
+/// table), each posted alone, unsigned, and answered by one end — exactly
+/// 6 allocations, rustls' again (three records sealed, three opened); no sweep
 /// has been asked yet, so none can land in that window. XH4f (D9), measured
 /// alone: two ALO places carrying a 50 ms TTL (one post: one rests, one
 /// crosses; the helper pushes an `orderUpdates` row and a fill), then at the
 /// next beat past it the gateway's own TTL cancel of the resting one —
 /// untimed, its success read `EXPIRED` — with the RTT window published at
 /// every beat inside the window (pinned by `hl_gateway_loopback`): exactly
-/// 6, rustls' (two sealed, four opened). Then, measured
+/// 6, rustls' (two sealed, four opened). XMM XH5c-2, measured alone: one
+/// weight purchase (`reserveRequestWeight`, a control action — encoded,
+/// signed, rendered and framed in place, posted alone), its `default`
+/// answer read back as the arm's acknowledgement: exactly 2, rustls' (one
+/// sealed, one opened). Then, measured
 /// alone, one round of the cancel-all word's sweep (XH4d, XG-1): its own
 /// read (answered with one order of ours and a stranger's, scanned in
 /// place, emitting nothing), the cancel of ours by cloid, the cancel's
@@ -14432,7 +15327,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     use exec_gateway::Idle;
     use exec_hyperliquid::event::{
         ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE,
-        EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT,
+        EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_SPOT,
     };
     use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
     use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
@@ -14445,11 +15340,17 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     /// One sweep round: the read and the cancel sealed, their answers
     /// opened.
     const RUSTLS_ALLOCS_PER_SWEEP_ROUND: u64 = 4;
-    /// XH4e: the budget and day reads — each sealed, each answer opened.
-    const RUSTLS_ALLOCS_PER_BUDGET_READS: u64 = 4;
+    /// XH4e: the budget and day reads, and XH5b-1's spot sheet — each
+    /// sealed, each answer opened.
+    const RUSTLS_ALLOCS_PER_ACCOUNT_READS: u64 = 6;
     /// XH4f: the places' post and the TTL cancel sealed; the places'
     /// answer, the two pushes and the cancel's answer opened.
     const RUSTLS_ALLOCS_PER_TTL: u64 = 6;
+    /// XMM XH5c-2: the purchase sealed, its answer opened.
+    const RUSTLS_ALLOCS_PER_RESERVE: u64 = 2;
+    /// XMM XH5c-2: the purchase's client id (the arm's range: bit 63 set,
+    /// bit 62 clear, bit 60).
+    const RESERVE_OID: u64 = (1 << 63) | (1 << 60) | 1;
     let dir = std::env::temp_dir().join(format!("mv-gate96-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("gate 96 dir");
     let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
@@ -14530,8 +15431,10 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             oid += 3;
             let sent = eng.stats.io()[0];
             let cmds = [
-                HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo),
-                HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo),
+                HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo)
+                    .with_priority(10_000),
+                HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo)
+                    .with_priority(10_000),
                 HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
                     .replacing(oid + 1_000_000),
                 HlCmd::cancel(6, oid + 2_000_000, 1),
@@ -14591,11 +15494,11 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     let posts = eng.stats.io()[0];
 
     // XH4e, measured alone — before any sweep is asked, so no sweep round
-    // can land in the window: the budget read and the day read, each
-    // posted alone, unsigned; their answers scanned in place into one end
-    // each.
+    // can land in the window: the budget read, the day read and XH5b-1's
+    // spot sheet, each posted alone, unsigned; their answers scanned in
+    // place into one end each.
     let sweeps0 = gw.counters().sweep_rounds;
-    let mut ends = [(0u8, 0u64, 0i64); 2];
+    let mut ends = [(0u8, 0u64, 0i64); 3];
     let mut ne = 0usize;
     let g = AllocGuard::new();
     assert!(eng.cmd.push(&HlCmd::read_limit(6, 9_000_001)));
@@ -14605,15 +15508,16 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         1_700_000_000_000,
         1_700_000_600_000
     )));
+    assert!(eng.cmd.push(&HlCmd::read_spot(6, 9_000_003)));
     let t = std::time::Instant::now();
-    while ne < 2 {
+    while ne < 3 {
         assert!(
             t.elapsed() < std::time::Duration::from_secs(5),
-            "gate 96: the budget and day reads never answered"
+            "gate 96: the budget, day and spot reads never answered"
         );
         gw.turn();
         while let Some(e) = eng.evt.pop() {
-            if e.kind == EV_READ_DONE && ne < 2 {
+            if e.kind == EV_READ_DONE && ne < 3 {
                 ends[ne] = (e.reason, e.aux, e.px_1e8);
                 ne += 1;
             }
@@ -14659,6 +15563,32 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     let ttl = (
         gw.counters().ttl_cancels - ttl0,
         eng.stats.io()[0] - ttl_posts0,
+        gw.counters().sweep_rounds - sweeps0,
+    );
+
+    // XMM XH5c-2, measured alone — still before any sweep is asked: one
+    // weight purchase, posted alone and signed; its answer the arm's ACK.
+    let reserve_posts0 = eng.stats.io()[0];
+    let mut bought = 0u64;
+    let g = AllocGuard::new();
+    assert!(eng.cmd.push(&HlCmd::reserve(6, RESERVE_OID, 10_000)));
+    let t = std::time::Instant::now();
+    while bought == 0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "gate 96: the weight purchase never answered"
+        );
+        gw.turn();
+        while let Some(e) = eng.evt.pop() {
+            if e.kind == EV_ACK && e.client_oid == RESERVE_OID {
+                bought += 1;
+            }
+            kinds[usize::from(e.kind & 15)] += 1;
+        }
+    }
+    let (reserve_allocs, reserve_bytes, _) = g.delta();
+    let reserve = (
+        eng.stats.io()[0] - reserve_posts0,
         gw.counters().sweep_rounds - sweeps0,
     );
     let posts_before_sweep = eng.stats.io()[0];
@@ -14736,15 +15666,17 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         ends,
         [
             (READ_LIMIT, 2_890, 150_050_000_000),
-            (READ_DAY, 2, 5_000_000_000)
+            (READ_DAY, 2, 5_000_000_000),
+            (READ_SPOT, 2, 25_025_000_000)
         ],
-        "the budget's figures; the day's two rows of ours, $50"
+        "the budget's figures; the day's two rows of ours, $50; the spot sheet's USDC, \
+         $250.25 over two rows"
     );
     assert_eq!(
-        read_allocs, RUSTLS_ALLOCS_PER_BUDGET_READS,
-        "HL gateway budget and day reads: {read_allocs} allocations ({read_bytes} B) — \
-         rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_BUDGET_READS} (two \
-         sealed, two opened); anything above is the gateway's"
+        read_allocs, RUSTLS_ALLOCS_PER_ACCOUNT_READS,
+        "HL gateway budget, day and spot reads: {read_allocs} allocations ({read_bytes} B) \
+         — rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_ACCOUNT_READS} \
+         (three sealed, three opened); anything above is the gateway's"
     );
     assert_eq!(
         ttl,
@@ -14756,5 +15688,16 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         "HL gateway TTL: {ttl_allocs} allocations ({ttl_bytes} B) — rustls' buffered API \
          accounts for exactly {RUSTLS_ALLOCS_PER_TTL} (two sealed, four opened); anything \
          above is the gateway's"
+    );
+    assert_eq!(
+        reserve,
+        (1, 0),
+        "one weight purchase, posted alone; no sweep"
+    );
+    assert_eq!(
+        reserve_allocs, RUSTLS_ALLOCS_PER_RESERVE,
+        "HL gateway weight purchase: {reserve_allocs} allocations ({reserve_bytes} B) — \
+         rustls' buffered API accounts for exactly {RUSTLS_ALLOCS_PER_RESERVE} (one sealed, \
+         one opened); anything above is the gateway's"
     );
 }

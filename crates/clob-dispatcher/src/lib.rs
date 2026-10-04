@@ -771,6 +771,34 @@ pub trait OrderDispatch {
         CancelAllState::Clear
     }
 
+    /// **XMM XH5a (R-XH4-1) — REQUEST that ONE slot's orders come off
+    /// the venue.** The router's halt path asks this, never
+    /// [`Self::cancel_all`]: a halt cancels only the halted slot's
+    /// orders, so a sibling slot on the same arm keeps its quotes.
+    ///
+    /// The same request / confirmation split as `cancel_all`
+    /// ([`Self::cancel_slot_state`] confirms). Defaulted to the
+    /// venue-wide [`Self::cancel_all`]: an arm that cannot tell its slots
+    /// apart OVER-cancels — the behaviour before XH5a — and never leaves
+    /// a halted slot's order resting. Every arm a live engine composes
+    /// answers for its own slots.
+    ///
+    /// # Errors
+    /// Whatever stopped the arm accepting the request.
+    #[inline]
+    fn cancel_slot(&mut self, _slot: u8) -> Result<(), DispatchError> {
+        self.cancel_all()
+    }
+
+    /// **XMM XH5a — is the venue clear of ONE slot's orders?** Polled
+    /// after [`Self::cancel_slot`] until it answers
+    /// [`CancelAllState::Clear`]; three-valued for the reason
+    /// [`Self::cancel_all_state`] is, which it defaults to.
+    #[inline]
+    fn cancel_slot_state(&self, _slot: u8) -> CancelAllState {
+        self.cancel_all_state()
+    }
+
     /// E1: what the execution ROUTER did, when there is one.
     ///
     /// Defaulted to an unconfigured set — `configured == 0` — exactly
@@ -859,7 +887,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 752 B report never crosses by value.
+    /// 880 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -978,7 +1006,7 @@ const _: () = assert!(core::mem::offset_of!(ExecCounters, live_submits) == 16);
 /// arm's counters and the dead man's, the gateway's (its shared words and
 /// the ones it publishes at its heartbeat), the budget, the rates and the
 /// latencies, and the router's words for the arm's slot. Counters are
-/// totals since boot; the fields after [`Self::refused_max_resting`] are
+/// totals since boot; the fields after [`Self::refused_foreign_row`] are
 /// levels. [`ExecCounters`] keeps its pinned 936 B.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -1052,6 +1080,22 @@ pub struct GatewayArmReport {
     pub refunded: u64,
     /// Places and modifies refused on a perp whose leverage is dark.
     pub refused_leverage: u64,
+    /// Spot sheets answered with their USDC row (XMM XH5b-2: an account
+    /// of the slot's own reads one with each perp sheet).
+    pub spot_reads: u64,
+    /// Spot reads that failed (XMM XH5b-2).
+    pub spot_failed: u64,
+    /// Top-ups seen on the venue: their price charged to the session's
+    /// spend (XMM XH5c-2).
+    pub topup_ok: u64,
+    /// Top-up stops: a purchase the venue refused or the next read did not
+    /// show, a state that could not be stored, an answer for no purchase in
+    /// flight (XMM XH5c-2).
+    pub topup_failed: u64,
+    /// Purchases that never left (refused unsent, a full ring, abandoned
+    /// before they left: a newer read out of the band, the slot's halt, the
+    /// shutdown): never bought, the day's charge returned (XMM XH5c-2).
+    pub topup_unsent: u64,
     // --- counters: the dead man ---
     /// Arms that left the host, probes included.
     pub dm_arms: u64,
@@ -1128,6 +1172,9 @@ pub struct GatewayArmReport {
     pub refused_cap_perp: u64,
     /// Orders the router refused over a perp slot's `max_resting_usd_1e6`.
     pub refused_max_resting: u64,
+    /// XMM XH5a: other slots' live orders the router refused on this
+    /// slot's owned rows.
+    pub refused_foreign_row: u64,
     // --- gauges ---
     /// `1` while the arm takes orders.
     pub ready: u64,
@@ -1144,17 +1191,23 @@ pub struct GatewayArmReport {
     pub heartbeat_age_ms: u64,
     /// The congestion word (`exec_gateway::stats::CONGESTION_*`).
     pub congestion: u64,
-    /// The recent window's worst post round trip, ns.
+    /// The recent window's worst post round trip on a socket, ns (the REST
+    /// fallback's apart, XMM XH5c-3).
     pub rtt_worst_ns: u64,
-    /// Post round trips since boot: p50, ns.
+    /// Post round trips on a socket since boot: p50, ns.
     pub post_rtt_p50_ns: u64,
-    /// Post round trips since boot: p99, ns.
+    /// Post round trips on a socket since boot: p99, ns.
     pub post_rtt_p99_ns: u64,
-    /// Post round trips since boot: the longest, ns.
+    /// Post round trips on a socket since boot: the longest, ns.
     pub post_rtt_max_ns: u64,
+    /// Posts sent by the REST fallback since boot — their own series, out
+    /// of the RTT word (XMM XH5c-3): p99, ns.
+    pub rest_rtt_p99_ns: u64,
+    /// Posts sent by the REST fallback since boot: the longest, ns.
+    pub rest_rtt_max_ns: u64,
     /// Command push → its frame written, p99, ns.
     pub push_to_write_p99_ns: u64,
-    /// Cancel written → its reply, p99, ns.
+    /// Cancel written on a socket → its reply, p99, ns.
     pub cancel_rtt_p99_ns: u64,
     /// A fill's venue time → its local receipt, p99, ns.
     pub fill_lag_p99_ns: u64,
@@ -1186,10 +1239,39 @@ pub struct GatewayArmReport {
     pub unmarked_positions: u64,
     /// The slot's resting notional, USD ×1e6.
     pub resting_usd_1e6: i64,
+    /// `1` when the slot trades on an account of its own (XMM XH5b-2): its
+    /// worth is its P&L, judged against its anchor.
+    pub own_account: u64,
+    /// The session's P&L anchor, the account's worth USD ×1e6 (0 = none
+    /// yet).
+    pub pnl_anchor_usd_1e6: i64,
+    /// `1` once the anchor is durable — restored, or stored by its keeper:
+    /// the slot's first reconciliation waits for it.
+    pub anchor_kept: u64,
+    /// The account's worth, USD ×1e6: the perp sheet's value plus the spot
+    /// sheet's USDC (0 off an own account, or before both halves landed).
+    pub worth_usd_1e6: i64,
+    /// The session's P&L, USD ×1e6: the worth less the anchor, plus the
+    /// session's top-up spend (XMM XH5c-2, Q-XH5-2's add-back; 0 until
+    /// judged).
+    pub session_pnl_usd_1e6: i64,
+    /// The weight one top-up buys (`0`: off, stopped, or the buying ended —
+    /// the slot's halt, the shutdown) (XMM XH5c-2).
+    pub topup_weight: u64,
+    /// The weight bought — or possibly bought — on the UTC day counted
+    /// (`u64::MAX`: a state the boot could not read, the day spent).
+    pub topup_day_used: u64,
+    /// The session's top-up spend, USD ×1e6 — added back to its P&L,
+    /// bounded by the day's max instead.
+    pub topup_cost_usd_1e6: i64,
 }
 
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 752);
+// XH5a: + `refused_foreign_row` (95). XMM XH5b-2: + the spot reads' two
+// counters and the own account's five levels (102). XMM XH5c-2: + the
+// top-ups' three counters and three levels (108). XMM XH5c-3: + the REST
+// round trips' p99 and maximum (110).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 880);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

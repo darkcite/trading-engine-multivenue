@@ -22,8 +22,9 @@
 //! **Admission.** A command is refused unsent ([`EV_REJECTED`]) when its
 //! slot is not one this gateway serves, its kind or time-in-force is not
 //! one it carries (ALO and IoC places, ALO modifies, cancels, and the
-//! control actions `updateLeverage`, `scheduleCancel`, `noop`), the halt
-//! word is set (growth only — a place, a modify, a leverage change —
+//! control actions `updateLeverage`, `scheduleCancel`, `noop` and — XMM
+//! XH5c — `reserveRequestWeight`), the halt word is set (growth only — a
+//! place, a modify, a leverage change, a weight purchase —
 //! [`REASON_HALTED`]; cancels, `scheduleCancel` and `noop` still go), or
 //! — growth only — the process's first `userFills` snapshot has not been
 //! absorbed yet ([`REASON_NOT_READY`]): a fill of ours can never be
@@ -85,16 +86,20 @@
 //!
 //! **Rates (XH4e).** Every post is charged to a one-minute window of the
 //! venue's IP weight — an action 1 + ⌊n/40⌋, a read its REST weight
-//! (`clearinghouseState` 2, the others 20, `userFillsByTime` 1 more per
-//! 20 rows it returns) — and every WebSocket frame (posts, pings, pongs,
+//! (`clearinghouseState` and `spotClearinghouseState` 2, the others 20,
+//! `userFillsByTime` 1 more per 20 rows it returns) — and every WebSocket
+//! frame (posts, pings, pongs,
 //! subscribes) to a window of its messages, each against this gateway's
 //! share ([`IP_WEIGHT_SHARE`], [`WS_MSG_SHARE`]: the host's other HL
 //! clients share the venue's per-IP limits). At 80 % of either share,
 //! growth is refused unsent ([`REASON_THROTTLED`]); cancels, control
 //! actions, reads and pings still go. The congestion word
 //! (`GatewayStats::congestion`) says how close it runs: busy (60 % of a
-//! share, 60 posts in flight, or answers averaging 1 s), throttled, or
-//! rate-limited by the venue in the last 10 s.
+//! share, 60 posts in flight, or socket answers averaging 1 s), throttled
+//! — or, XMM XH5c-3, no socket Ready, every post going by REST: the member
+//! holds — or rate-limited by the venue in the last 10 s. A REST post's
+//! round trip (a fresh dial, a synchronous exchange) has its own series,
+//! out of the socket's histograms, the average and the RTT word.
 //!
 //! **Copies** (house law): the msgpack encoding and the JSON rendering
 //! (transforms, in place); the 64 B command out of its ring slot and each
@@ -135,14 +140,16 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 
 use crate::action::{
-    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_schedule_cancel,
-    encode_update_leverage, CancelByCloidWire, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
+    encode_batch_modify, encode_cancel_by_cloid, encode_noop, encode_order, encode_order_grouped,
+    encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
+    Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
 use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
     HlCmd, CMD_CANCEL, CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_NOOP, CMD_PLACE, CMD_READ_DAY,
-    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_STATE, CMD_SCHEDULE_CANCEL,
+    CMD_READ_LIMIT, CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE,
+    CMD_SCHEDULE_CANCEL,
 };
 use crate::event::REASON_NOT_FOUND;
 use crate::event::{
@@ -150,9 +157,9 @@ use crate::event::{
     EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_CANCELED, EV_FILL,
     EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED,
     EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT,
-    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED,
-    REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_SETTLEMENT,
-    REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
+    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
+    REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT,
+    REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::HlHttp;
@@ -162,11 +169,13 @@ use crate::nonce::{now_ms, NonceSource, SharedNonce};
 use crate::orderupd::{scan_order_updates, OrderUpdate};
 use crate::recon::{
     fills_by_time_request, open_orders_request, perp_state_request, scan_open_orders,
-    scan_perp_state, OpenOrder, PerpPosition, MAX_OPEN_ORDERS,
+    scan_perp_state, scan_spot_state, spot_state_request, OpenOrder, PerpPosition, SpotBalance,
+    MAX_OPEN_ORDERS, MAX_SPOT_BALANCES,
 };
 use crate::request::{
     batch_modify_json, cancel_by_cloid_json, envelope_close, envelope_open, noop_json, order_json,
-    schedule_cancel_json, update_leverage_json, ws_info_open, ws_post_close, ws_post_open,
+    order_json_grouped, reserve_weight_json, schedule_cancel_json, update_leverage_json,
+    ws_info_open, ws_post_close, ws_post_open,
 };
 use crate::response::{
     scan, scan_items, HlResponse, ItemStatus, ItemsReply, ITEM_ERROR, ITEM_FILLED, ITEM_RESTING,
@@ -207,12 +216,24 @@ const TX_CAP: usize = 16 * 1024;
 const ROOM: usize = WS_CLIENT_HDR_MAX;
 const GROUPING: &[u8] = b"na";
 
+/// An ALO batch's grouping (XMM XH5d): its priority's `{"p": N}`, or
+/// `"na"` when it bids none.
+#[inline]
+const fn grouping(p: u32) -> Grouping<'static> {
+    if p == 0 {
+        Grouping::Named(GROUPING)
+    } else {
+        Grouping::Priority(p)
+    }
+}
+
 const CLASSES: usize = 6;
 const CLASS_ALO: usize = 0;
 const CLASS_TAKER: usize = 1;
 const CLASS_MODIFY: usize = 2;
 const CLASS_CANCEL: usize = 3;
-/// One control action (leverage, scheduleCancel, noop), posted alone.
+/// One control action (leverage, scheduleCancel, noop, a weight purchase),
+/// posted alone.
 const CLASS_CONTROL: usize = 4;
 /// One read (open orders, the perp sheet), posted alone, unsigned,
 /// WebSocket only (XH4d).
@@ -242,6 +263,11 @@ pub const IP_WEIGHT_SHARE: u32 = 400;
 /// XH4e — its share of the venue's WebSocket messages a minute (2 000 per
 /// IP).
 pub const WS_MSG_SHARE: u32 = 1_000;
+/// **XMM XH5b-2 — this gateway's own halt reasons** (`exec_gateway`'s
+/// registry: a venue numbers its own from `HALT_VENUE_BASE`). Slot 6's
+/// session anchor could not be stored ([`crate::anchor::AnchorKeeper`]): the
+/// slot never quotes on an anchor a restart would lose (E7).
+pub const HALT_ANCHOR_UNKEPT: u64 = exec_gateway::stats::HALT_VENUE_BASE;
 /// XH4e — growth is refused unsent at this % of either share.
 const THROTTLE_PCT: u64 = 80;
 /// XH4e — the congestion word reads busy from this % of either share …
@@ -253,22 +279,37 @@ const BUSY_RTT_NS: u64 = 1_000_000_000;
 /// XH4e — a venue rate-limit answer marks the word this long.
 const RATE_LIMITED_NS: u64 = 10_000_000_000;
 /// XH4e — a read's IP weight: the venue's REST weights (its weighting of
-/// WebSocket-posted info is unmeasured), `clearinghouseState` 2, the
-/// others 20.
+/// WebSocket-posted info is unmeasured), `clearinghouseState` and
+/// `spotClearinghouseState` (XH5b-1) 2, the others 20.
 const READ_WEIGHT: u32 = 20;
 const STATE_READ_WEIGHT: u32 = 2;
 
+/// A read command's IP weight (see [`READ_WEIGHT`]).
+#[inline(always)]
+const fn read_ip_weight(kind: u8) -> u32 {
+    if kind == CMD_READ_STATE || kind == CMD_READ_SPOT {
+        STATE_READ_WEIGHT
+    } else {
+        READ_WEIGHT
+    }
+}
+
 /// XH4f — the IP weight a minute an arm's periodic reads spend: the sheet
-/// and the orders every `recon_ms`, the budget every `limit_ms` (the XH4e
-/// amendment's arithmetic, pinned where an arm is composed). Zero periods
-/// read as unbounded.
+/// and the orders every `recon_ms` — and the spot sheet with them when
+/// `spot` (an account of the slot's own, XH5b-1) — the budget every
+/// `limit_ms` (the XH4e amendment's arithmetic, pinned where an arm is
+/// composed). Zero periods read as unbounded.
 #[must_use]
-pub const fn read_weight_per_min(recon_ms: u64, limit_ms: u64) -> u64 {
+pub const fn read_weight_per_min(recon_ms: u64, limit_ms: u64, spot: bool) -> u64 {
     if recon_ms == 0 || limit_ms == 0 {
         return u64::MAX;
     }
-    (60_000 / recon_ms) * (READ_WEIGHT + STATE_READ_WEIGHT) as u64
-        + (60_000 / limit_ms) * READ_WEIGHT as u64
+    let mut period = read_ip_weight(CMD_READ_STATE) + read_ip_weight(CMD_READ_ORDERS);
+    if spot {
+        period += read_ip_weight(CMD_READ_SPOT);
+    }
+    (60_000 / recon_ms) * period as u64
+        + (60_000 / limit_ms) * read_ip_weight(CMD_READ_LIMIT) as u64
 }
 /// The sweep machine's phases.
 const SW_IDLE: u8 = 0;
@@ -635,14 +676,16 @@ const BLANK_POST: PostRec = PostRec {
     items: [BLANK_ITEM; MAX_ORDERS],
 };
 
-/// An open batch: its post id, open order, items, and the smallest
-/// venue-expiry offset among them.
+/// An open batch: its post id, open order, items, the smallest
+/// venue-expiry offset among them, and (an ALO batch's, XMM XH5d) the
+/// priority its action's grouping bids — 0 `"na"`.
 #[derive(Copy, Clone, Default)]
 struct BatchHead {
     id: u64,
     seq: u64,
     n: usize,
     min_exp: u16,
+    p: u32,
 }
 
 /// A control action's arguments, resolved once at admission.
@@ -651,7 +694,9 @@ struct ControlWire {
     kind: u8,
     is_cross: bool,
     asset: u32,
-    leverage: u32,
+    /// The leverage (`updateLeverage`), or the weight a purchase buys
+    /// (`reserveRequestWeight`, XMM XH5c).
+    arg: u32,
     /// `scheduleCancel`'s time; `None` clears.
     time: Option<u64>,
 }
@@ -662,8 +707,10 @@ struct ControlWire {
 /// refused locally; `class_of` admits none), never sent as a `noop`.
 fn encode_control(c: &ControlWire, dst: &mut [u8], json: bool) -> Result<usize, MsgPackErr> {
     match (c.kind, json) {
-        (CMD_LEVERAGE, false) => encode_update_leverage(dst, c.asset, c.is_cross, c.leverage),
-        (CMD_LEVERAGE, true) => update_leverage_json(dst, c.asset, c.is_cross, c.leverage),
+        (CMD_LEVERAGE, false) => encode_update_leverage(dst, c.asset, c.is_cross, c.arg),
+        (CMD_LEVERAGE, true) => update_leverage_json(dst, c.asset, c.is_cross, c.arg),
+        (CMD_RESERVE, false) => encode_reserve_weight(dst, u64::from(c.arg)),
+        (CMD_RESERVE, true) => reserve_weight_json(dst, u64::from(c.arg)),
         (CMD_SCHEDULE_CANCEL, false) => encode_schedule_cancel(dst, c.time),
         (CMD_SCHEDULE_CANCEL, true) => schedule_cancel_json(dst, c.time),
         (CMD_NOOP, false) => encode_noop(dst),
@@ -734,14 +781,15 @@ fn class_of(c: &HlCmd) -> Option<usize> {
     }
 }
 
-/// A command that can add exposure: a place, a modify or a leverage
+/// A command that can add exposure or spend: a place, a modify, a leverage
 /// change — a reduce-only place included (XH1: no member relies on the
-/// bit for an exit). The halt and the snapshot gate refuse it, and XG-3
-/// will not send it untimed; cancels, `scheduleCancel` and `noop` always
-/// go.
+/// bit for an exit) — or a weight purchase (XMM XH5c: a halted, unready or
+/// throttled slot buys nothing). The halt and the snapshot gate refuse it,
+/// and XG-3 will not send it untimed; cancels, `scheduleCancel` and `noop`
+/// always go.
 #[inline(always)]
 const fn grows(kind: u8) -> bool {
-    kind == CMD_PLACE || kind == CMD_MODIFY || kind == CMD_LEVERAGE
+    kind == CMD_PLACE || kind == CMD_MODIFY || kind == CMD_LEVERAGE || kind == CMD_RESERVE
 }
 
 /// Whether class `class`'s batch grows ([`grows`]); a control batch by
@@ -783,6 +831,7 @@ const fn read_code(kind: u8) -> u8 {
         CMD_READ_ORDERS => READ_ORDERS,
         CMD_READ_LIMIT => READ_LIMIT,
         CMD_READ_DAY => READ_DAY,
+        CMD_READ_SPOT => READ_SPOT,
         _ => READ_STATE,
     }
 }
@@ -916,6 +965,8 @@ struct Router {
     /// Read answers are scanned into these (XH4d).
     open_rows: Box<[OpenOrder; MAX_OPEN_ORDERS]>,
     positions: Box<[PerpPosition; MAX_POSITIONS]>,
+    /// XH5b-1: the spot sheet's rows (8 KiB, boxed once).
+    spot_rows: Box<[SpotBalance; MAX_SPOT_BALANCES]>,
     /// The sweep read's orders of ours, and its outcome (`SWEEP_*`).
     sweep_hits: Box<[SweepHit; MAX_OPEN_ORDERS]>,
     sweep_n: usize,
@@ -962,6 +1013,7 @@ impl Router {
             healthy: false,
             open_rows: boxed_array(OpenOrder::default()),
             positions: boxed_array(PerpPosition::default()),
+            spot_rows: boxed_array(SpotBalance::default()),
             sweep_hits: boxed_array(SweepHit::default()),
             sweep_n: 0,
             sweep_outcome: SWEEP_NONE,
@@ -1124,6 +1176,7 @@ impl Router {
             CMD_READ_ORDERS => self.read_orders(&item, body, now),
             CMD_READ_LIMIT => self.read_limit(&item, body, now),
             CMD_READ_DAY => self.read_day(&item, body, now),
+            CMD_READ_SPOT => self.read_spot(&item, body, now),
             _ => self.read_state(&item, body, now),
         };
         if ok {
@@ -1236,6 +1289,39 @@ impl Router {
         true
     }
 
+    /// XH5b-1 — `{"type":"spotClearinghouseState","data":{…}}` → one
+    /// `EV_READ_DONE` (`READ_SPOT`): `px_1e8` = the USDC `total` (USD ×1e8),
+    /// `sz_1e8` = 1 when the sheet lists USDC — 0 when it lists none, which
+    /// the arm refuses as no worth (`recon::account_view`'s rule: nothing to
+    /// anchor) — `aux` = the rows, scanned in place into a fixed table.
+    /// `false`: it does not scan (more rows than the table holds included).
+    fn read_spot(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
+        let Some((s, e)) = object_field(body, b"\"data\"") else {
+            return false;
+        };
+        let data = &body[s..e];
+        let Ok(n) = scan_spot_state(data, &mut self.spot_rows[..]) else {
+            return false;
+        };
+        let n = n.min(self.spot_rows.len());
+        let mut usdc_1e8 = 0i64;
+        let mut listed = false;
+        let mut i = 0usize;
+        while i < n {
+            let b = &self.spot_rows[i];
+            if b.coin.of(data) == b"USDC" {
+                usdc_1e8 = b.total_1e8;
+                listed = true;
+            }
+            i += 1;
+        }
+        let mut end = read_end(item, EV_READ_DONE, READ_SPOT, n as u64, now);
+        end.px_1e8 = usdc_1e8;
+        end.sz_1e8 = i64::from(listed);
+        emit_to(&mut self.evt, &end);
+        true
+    }
+
     /// `userRateLimit` (XH4e) → one `EV_READ_DONE` (`READ_LIMIT`): `aux` =
     /// `nRequestsUsed`, `px_1e8` = `cumVlm` (USD ×1e8), `sz_1e8` =
     /// `nRequestsSurplus` (`budget::scan_rate_limit`'s rules). `false`: it
@@ -1329,7 +1415,7 @@ impl Router {
     }
 
     /// Release post `id`: its deadline, its connection's count, its
-    /// latency sample.
+    /// latency sample — XMM XH5c-3: a REST post's in its own series alone.
     fn finish(&mut self, id: u64, now: u64) {
         let Some(rec) = self.pending.get(id) else {
             return;
@@ -1345,15 +1431,22 @@ impl Router {
         self.inflight_items -= usize::from(n);
         if written != 0 && usize::from(class) != CLASS_READ {
             let rtt = now.saturating_sub(written);
-            if usize::from(class) == CLASS_CANCEL {
-                self.stats.cancel_rtt.record(rtt);
+            if conn == CONN_REST {
+                // XMM XH5c-3: a fresh dial and a synchronous exchange (the
+                // boot's dead-man clear, a fallback with no socket Ready) —
+                // not the socket's path: its own series alone.
+                self.stats.rest_rtt.record(rtt);
             } else {
-                self.stats.post_rtt.record(rtt);
+                if usize::from(class) == CLASS_CANCEL {
+                    self.stats.cancel_rtt.record(rtt);
+                } else {
+                    self.stats.post_rtt.record(rtt);
+                }
+                // XH4e: the congestion word's moving average.
+                self.rtt_ewma_ns = self.rtt_ewma_ns - self.rtt_ewma_ns / 8 + rtt / 8;
+                // XH4f: the member's pull window.
+                self.rtt.record(now, rtt);
             }
-            // XH4e: the congestion word's moving average.
-            self.rtt_ewma_ns = self.rtt_ewma_ns - self.rtt_ewma_ns / 8 + rtt / 8;
-            // XH4f: the member's pull window.
-            self.rtt.record(now, rtt);
         }
         let _ = self.pending.release(id);
     }
@@ -1550,7 +1643,8 @@ pub struct HlGateway {
 // tables are on the heap): 7 936 B released at XH4e, 8 000 B with debug
 // assertions (mio 0.8's debug-only selector ids in its `Poll`s and
 // `TcpStream`s), a few words more since XH4f's two boxed Router tables and
-// two counters, one more since XH4h's `NonceSource` — held under 8 KiB: a
+// two counters, one more since XH4h's `NonceSource`, one more since XH5b-1's
+// spot table — held under 8 KiB: a
 // bound, not a pin, so a rustls or mio
 // bump does not break the build while the struct stays small.
 const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
@@ -1923,13 +2017,7 @@ impl HlGateway {
     /// (n its items), a read its REST weight.
     fn charge_ip(&mut self, id: u64, now: u64) {
         let w = match self.rt.pending.get(id) {
-            Some(rec) if usize::from(rec.class) == CLASS_READ => {
-                if rec.items[0].kind == CMD_READ_STATE {
-                    STATE_READ_WEIGHT
-                } else {
-                    READ_WEIGHT
-                }
-            }
+            Some(rec) if usize::from(rec.class) == CLASS_READ => read_ip_weight(rec.items[0].kind),
             Some(rec) => 1 + u32::from(rec.n) / 40,
             None => 1,
         };
@@ -1942,13 +2030,15 @@ impl HlGateway {
     }
 
     /// The congestion word: the worst of a venue rate-limit answer in the
-    /// last 10 s, growth throttled, and busy.
+    /// last 10 s, growth throttled — or no socket Ready (XMM XH5c-3: every
+    /// post would go by REST, out of the RTT word; the member holds) — and
+    /// busy.
     fn publish_congestion(&mut self, now: u64) {
         let limited = self.rt.rate_limited_ns != 0
             && now.saturating_sub(self.rt.rate_limited_ns) < RATE_LIMITED_NS;
         let level = if limited {
             CONGESTION_RATE_LIMITED
-        } else if self.throttled() {
+        } else if self.throttled() || self.ready_conn().is_none() {
             CONGESTION_THROTTLED
         } else if self.ip.at_least(self.ip_cap, BUSY_PCT)
             || self.ws.at_least(self.ws_cap, BUSY_PCT)
@@ -2063,6 +2153,13 @@ impl HlGateway {
             // never overtakes an older one.
             self.flush_open(now);
         }
+        // XMM XH5d: an action carries one grouping — a place bidding
+        // another ALO priority than the open ALO batch's posts every open
+        // batch first, as a full one does.
+        let p = if k == CLASS_ALO { c.arg } else { 0 };
+        if self.batches.head[k].n != 0 && self.batches.head[k].p != p {
+            self.flush_open(now);
+        }
         if self.batches.head[k].n == 0 && !self.open(k, now) {
             self.refuse(c, REASON_LOCAL, now);
             return;
@@ -2070,6 +2167,7 @@ impl HlGateway {
         let b = &mut *self.batches;
         let h = &mut b.head[k];
         let i = h.n;
+        h.p = p;
         match k {
             CLASS_ALO => b.alo[i] = c.order_wire(),
             CLASS_TAKER => b.taker[i] = c.order_wire(),
@@ -2120,7 +2218,7 @@ impl HlGateway {
                 kind: c.kind,
                 is_cross: c.flags & CMD_FLAG_CROSS != 0,
                 asset: c.asset,
-                leverage: c.arg,
+                arg: c.arg,
                 time: if c.time_ms == 0 {
                     None
                 } else {
@@ -2216,6 +2314,7 @@ impl HlGateway {
             seq: self.seq,
             n: 0,
             min_exp: 0,
+            p: 0,
         };
         true
     }
@@ -2269,7 +2368,7 @@ impl HlGateway {
         let n = h.n;
         let b = &*self.batches;
         let mp_n = match k {
-            CLASS_ALO => encode_order(&mut self.mp, &b.alo[..n], GROUPING),
+            CLASS_ALO => encode_order_grouped(&mut self.mp, &b.alo[..n], grouping(h.p)),
             CLASS_TAKER => encode_order(&mut self.mp, &b.taker[..n], GROUPING),
             CLASS_MODIFY => encode_batch_modify(&mut self.mp, &b.modify[..n]),
             CLASS_CANCEL => encode_cancel_by_cloid(&mut self.mp, &b.cancel[..n]),
@@ -2300,7 +2399,7 @@ impl HlGateway {
         let head = envelope_open(&mut tx[pfx..]).ok()?;
         let at = pfx + head;
         let aj = match k {
-            CLASS_ALO => order_json(&mut tx[at..], &b.alo[..n], GROUPING),
+            CLASS_ALO => order_json_grouped(&mut tx[at..], &b.alo[..n], grouping(h.p)),
             CLASS_TAKER => order_json(&mut tx[at..], &b.taker[..n], GROUPING),
             CLASS_MODIFY => batch_modify_json(&mut tx[at..], &b.modify[..n]),
             CLASS_CANCEL => cancel_by_cloid_json(&mut tx[at..], &b.cancel[..n]),
@@ -2330,6 +2429,7 @@ impl HlGateway {
             CMD_READ_ORDERS => open_orders_request(dst, master),
             CMD_READ_LIMIT => rate_limit_request(dst, master),
             CMD_READ_DAY => fills_by_time_request(dst, master, start_ms, end_ms),
+            CMD_READ_SPOT => spot_state_request(dst, master),
             _ => perp_state_request(dst, master),
         }
         .ok()?;
@@ -2341,16 +2441,27 @@ impl HlGateway {
         })
     }
 
+    /// The connection new posts go on: the active one, once Ready. None (a
+    /// swap's gap, an outage): a post goes by REST, a read not at all — and
+    /// the congestion word reads throttled (XMM XH5c-3).
+    #[inline]
+    fn ready_conn(&self) -> Option<u8> {
+        match self.mbb.active() {
+            Some(a) if self.conns[usize::from(a)].phase() == Phase::Ready => Some(a),
+            _ => None,
+        }
+    }
+
     /// Write a sealed post on the live connection, or by REST — a read
     /// only on the live connection: with none it is refused, unsent.
     fn send(&mut self, k: usize, id: u64, s: Sealed, now: u64) {
-        let active = match self.mbb.active() {
-            Some(a) if self.conns[usize::from(a)].phase() == Phase::Ready => a,
-            _ if k == CLASS_READ => {
+        let active = match self.ready_conn() {
+            Some(a) => a,
+            None if k == CLASS_READ => {
                 self.rt.fail_all(id, EV_REJECTED, REASON_TRANSPORT, now);
                 return;
             }
-            _ => {
+            None => {
                 self.post_rest(id, s, false);
                 return;
             }
@@ -2689,12 +2800,25 @@ mod tests {
     }
 
     /// XH4f: the reads' steady weight — XH4d's 5 s periods alone were 71 %
-    /// of the share (busy for good); 10 s leaves them at 38 %.
+    /// of the share (busy for good); 10 s leaves them at 38 %. XH5b-1: the
+    /// spot sheet adds 2 a period — 164 at 10 s (41 %), 68 at XH5c's 30 s.
     #[test]
     fn the_periodic_reads_weigh_what_the_amendment_says() {
-        assert_eq!(read_weight_per_min(5_000, 60_000), 284);
-        assert_eq!(read_weight_per_min(10_000, 60_000), 152);
-        assert_eq!(read_weight_per_min(0, 60_000), u64::MAX);
+        assert_eq!(read_weight_per_min(5_000, 60_000, false), 284);
+        assert_eq!(read_weight_per_min(10_000, 60_000, false), 152);
+        assert_eq!(read_weight_per_min(10_000, 60_000, true), 164);
+        assert_eq!(read_weight_per_min(30_000, 60_000, true), 68);
+        assert_eq!(read_weight_per_min(0, 60_000, true), u64::MAX);
+        assert_eq!(
+            (
+                read_ip_weight(CMD_READ_STATE),
+                read_ip_weight(CMD_READ_SPOT),
+                read_ip_weight(CMD_READ_ORDERS),
+                read_ip_weight(CMD_READ_LIMIT),
+                read_ip_weight(CMD_READ_DAY)
+            ),
+            (2, 2, 20, 20, 20)
+        );
     }
 
     #[test]
@@ -2714,10 +2838,11 @@ mod tests {
         );
         assert_eq!(class_of(&cmd(CMD_CANCEL, Tif::Gtc)), Some(CLASS_CANCEL));
         let mut odd = cmd(CMD_PLACE, Tif::Alo);
-        odd.kind = CMD_READ_DAY + 1;
-        assert_eq!(class_of(&odd), None);
+        odd.kind = CMD_RESERVE + 1;
+        assert_eq!(class_of(&odd), None, "past the last kind (XMM XH5c)");
         assert_eq!(class_of(&HlCmd::read_limit(6, 1)), Some(CLASS_READ));
         assert_eq!(class_of(&HlCmd::read_day(6, 1, 0, 0)), Some(CLASS_READ));
+        assert_eq!(class_of(&HlCmd::read_spot(6, 1)), Some(CLASS_READ));
         let mut bad_tif = cmd(CMD_PLACE, Tif::Alo);
         bad_tif.tif = 7;
         assert_eq!(class_of(&bad_tif), None, "an unknown tif is never a Gtc");
@@ -2930,6 +3055,80 @@ mod tests {
         assert_eq!(read_code(CMD_READ_STATE), READ_STATE);
     }
 
+    /// XH5b-1: the spot sheet's answer is one end carrying the USDC
+    /// `total` — on the venue's own testnet body, $999 over fourteen rows,
+    /// USDC listed; a sheet that lists no USDC says so; one that does not
+    /// scan fails with its own code.
+    #[test]
+    fn the_spot_read_answers_one_end_with_the_usdc_total() {
+        let body = format!(
+            r#"{{"type":"spotClearinghouseState","data":{}}}"#,
+            include_str!("../tests/fixtures/hl/spot_state_testnet.json").trim()
+        );
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_spot(6, 1));
+        rt.on_read_answer(5, body.as_bytes(), 9);
+        let ev = drained(&mut eng);
+        assert_eq!(ev.len(), 1, "no rows: one end");
+        assert_eq!(
+            (
+                ev[0].kind,
+                ev[0].reason,
+                ev[0].client_oid,
+                ev[0].aux,
+                ev[0].px_1e8
+            ),
+            (EV_READ_DONE, READ_SPOT, 1, 14, 99_900_000_000)
+        );
+        assert_eq!(ev[0].sz_1e8, 1, "USDC listed");
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_spot(6, 2));
+        rt.on_read_answer(
+            5,
+            br#"{"type":"spotClearinghouseState","data":{"balances":[]}}"#,
+            9,
+        );
+        let ev = drained(&mut eng);
+        assert_eq!(
+            (ev[0].kind, ev[0].reason, ev[0].px_1e8, ev[0].sz_1e8),
+            (EV_READ_DONE, READ_SPOT, 0, 0),
+            "no USDC listed: said so, for the arm to refuse"
+        );
+        let (mut rt, mut eng) = router_with_read(&HlCmd::read_spot(6, 3));
+        rt.on_read_answer(5, br#"{"type":"spotClearinghouseState","data":{}}"#, 9);
+        let ev = drained(&mut eng);
+        assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_SPOT));
+        assert_eq!(read_code(CMD_READ_SPOT), READ_SPOT);
+    }
+
+    /// XMM XH5c-3: a REST post's round trip goes to its own series alone —
+    /// never the socket's histograms, the congestion average or the RTT
+    /// word's window; the same post answered on a socket feeds them all.
+    #[test]
+    fn a_rest_round_trip_has_its_own_series_out_of_the_rtt_word() {
+        let at = 2_000_000_001u64;
+        let (mut rt, _eng, id) = router_with_post(CLASS_ALO, 1);
+        rt.finish(id, at);
+        assert_eq!(
+            (rt.stats.rest_rtt.count(), rt.stats.rest_rtt.max_ns()),
+            (1, 2_000_000_000)
+        );
+        assert_eq!(
+            (rt.stats.post_rtt.count(), rt.rtt.worst(at), rt.rtt_ewma_ns),
+            (0, 0, 0)
+        );
+        let (mut rt, _eng, id) = router_with_post(CLASS_ALO, 1);
+        rt.pending.get_mut(id).expect("in flight").conn = 0;
+        rt.finish(id, at);
+        assert_eq!(
+            (
+                rt.stats.post_rtt.count(),
+                rt.rtt.worst(at),
+                rt.stats.rest_rtt.count()
+            ),
+            (1, 2_000_000_000, 0)
+        );
+        assert!(rt.rtt_ewma_ns > 0);
+    }
+
     #[test]
     fn a_refused_re_send_is_in_doubt_never_rejected() {
         let refused = br#"{"status":"err","response":"Too many cumulative requests sent"}"#;
@@ -3038,6 +3237,13 @@ mod tests {
         assert_eq!(class_of(&lev), Some(CLASS_CONTROL));
         assert_eq!(class_of(&sched), Some(CLASS_CONTROL));
         assert_eq!(class_of(&HlCmd::noop(6, 3)), Some(CLASS_CONTROL));
+        let reserve = HlCmd::reserve(6, 4, 10_000);
+        assert_eq!(class_of(&reserve), Some(CLASS_CONTROL));
+        assert!(
+            grows(CMD_RESERVE) && growing(CLASS_CONTROL, CMD_RESERVE),
+            "a purchase grows"
+        );
+        assert_eq!(cmd_bits(CMD_RESERVE), 0, "a control carries no order verb");
         assert!(grows(CMD_PLACE) && grows(CMD_MODIFY) && grows(CMD_LEVERAGE));
         assert!(!grows(CMD_CANCEL) && !grows(CMD_SCHEDULE_CANCEL) && !grows(CMD_NOOP));
         assert!(growing(CLASS_CONTROL, CMD_LEVERAGE));
@@ -3082,7 +3288,7 @@ mod tests {
             kind: CMD_LEVERAGE,
             is_cross: true,
             asset: 1,
-            leverage: 3,
+            arg: 3,
             time: None,
         };
         let n = encode_control(&lev, &mut buf, true).unwrap();
@@ -3097,6 +3303,22 @@ mod tests {
         };
         let n = encode_control(&noop, &mut buf, true).unwrap();
         assert_eq!(&buf[..n], br#"{"type":"noop"}"#);
+        // XMM XH5c: the weight purchase — its msgpack is the SDK vector's
+        // encoder (`reserve_weight`), its JSON twin names the same action.
+        let reserve = ControlWire {
+            kind: CMD_RESERVE,
+            arg: 5_000,
+            ..ControlWire::default()
+        };
+        let n = encode_control(&reserve, &mut buf, true).unwrap();
+        assert_eq!(
+            &buf[..n],
+            br#"{"type":"reserveRequestWeight","weight":5000}"#
+        );
+        let n = encode_control(&reserve, &mut buf, false).unwrap();
+        let mut want = [0u8; 64];
+        let m = encode_reserve_weight(&mut want, 5_000).unwrap();
+        assert_eq!(&buf[..n], &want[..m], "the vector's bytes");
         let odd = ControlWire {
             kind: 9,
             ..ControlWire::default()

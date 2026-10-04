@@ -703,8 +703,14 @@ pub struct Fill {
     pub qty: Qty,
     /// Venue-assigned order ID (u64 for Polymarket CLOB).
     pub order_id: u64,
+    /// XMM XH5d: the venue's trade id, when it sends one (Hyperliquid's
+    /// `tid`) — the key a report matches its own fills against the
+    /// public prints by; `0` = none (paper, a venue without one).
+    /// Wire-additive: it was explicit zeroed padding, so every capture
+    /// written before reads as none.
+    pub tid: u64,
     /// Reserved.
-    _pad1: [u8; 16],
+    _pad1: [u8; 8],
     /// Explicit tail padding (see [`AsBytes`]). Always zero.
     _pad2: [u8; 8],
 }
@@ -730,9 +736,17 @@ impl Fill {
             px,
             qty,
             order_id,
-            _pad1: [0; 16],
+            tid: 0,
+            _pad1: [0; 8],
             _pad2: [0; 8],
         }
+    }
+
+    /// XMM XH5d: the same fill, with the venue's trade id.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_tid(self, tid: u64) -> Self {
+        Self { tid, ..self }
     }
 
     /// X1: the same fill, attributed. Used by the paper dispatcher,
@@ -919,8 +933,18 @@ pub struct Order {
     /// is the id the record's own order carries (0 for a cancel,
     /// which creates no order).
     pub verb: u8,
-    /// Reserved.
-    _pad1: [u8; 5],
+    /// XMM XH5d: the A/B arm the order was decided in — `0` none, `1` A,
+    /// `2` B (the measurement's split; no execution path reads it).
+    /// Wire-additive: it was explicit zeroed padding, so every capture
+    /// written before reads as none.
+    pub ab_arm: u8,
+    /// XMM XH5d: the ALO priority the order bids for its queue place — p
+    /// ×1e8 of its resting notional, charged at placement from the
+    /// undelegated HYPE balance (Hyperliquid's `{"p": N}` grouping); `0`
+    /// none. A post-only place's alone: a modify carries no grouping.
+    /// Wire-additive: it was explicit zeroed padding (the last of it), so
+    /// every capture written before reads as none.
+    pub alo_priority_1e8: u32,
     /// Time-to-live relative to `ts_ns`; 0 = none (I1, 2026-09-03 —
     /// docs/wire-format.md). A MODEL field: the offline fill law
     /// cancels the order at the first record of its sym at/after
@@ -1005,7 +1029,8 @@ impl Order {
             venue: venue as u8,
             strategy_id: STRATEGY_ID_NONE,
             verb: ORDER_VERB_PLACE,
-            _pad1: [0; 5],
+            ab_arm: 0,
+            alo_priority_1e8: 0,
             ttl_ns: 0,
             prev_client_oid: 0,
         }
@@ -1043,6 +1068,24 @@ impl Order {
     #[must_use]
     pub const fn with_post_only(mut self) -> Self {
         self.flags |= ORDER_FLAG_POST_ONLY;
+        self
+    }
+
+    /// XMM XH5d: the same order, tagged with the A/B arm it was decided in
+    /// (`0` none, `1` A, `2` B).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_ab_arm(mut self, arm: u8) -> Self {
+        self.ab_arm = arm;
+        self
+    }
+
+    /// XMM XH5d: the same order, bidding ALO priority — p ×1e8 of its
+    /// resting notional (`0` none).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_alo_priority(mut self, p_1e8: u32) -> Self {
+        self.alo_priority_1e8 = p_1e8;
         self
     }
 
@@ -1337,6 +1380,13 @@ unsafe impl AsBytes for Fill {}
 
 // SAFETY: Order has the same guarantees as Tick.
 unsafe impl AsBytes for Order {}
+
+// SAFETY: OrderEvent has the same guarantees as Tick — `#[repr(C,
+// align(64))]`, `Copy`, plain integers and an explicit `_pad` that sum to
+// exactly 64 bytes, every offset asserted beside its definition: no
+// compiler-inserted padding, every byte initialized. XMM XH5d: captured
+// (`engine-events.pmlr`).
+unsafe impl AsBytes for OrderEvent {}
 
 // SAFETY: ChannelEvent is `#[repr(C, align(64))]`, `#[derive(Copy)]`,
 // all fields plain integers + explicit `_pad` arrays summing to exactly
@@ -1878,7 +1928,9 @@ pub struct OrderEvent {
     /// The client id of the order the event is about (LAW E-9's durable
     /// name; the engine never learns a venue oid).
     pub client_oid: u64,
-    /// Venue timestamp of the change in ms; 0 = unknown (paper).
+    /// Venue timestamp of the change in ms; 0 = unknown (paper, or a live
+    /// post's answer — XMM XH5d: the Hyperliquid arm then repeats the
+    /// RESTING once, with the `open` row's time).
     pub venue_time_ms: u64,
     /// The order's instrument.
     pub sym: SymbolId,
@@ -1966,6 +2018,14 @@ const _: () = {
     assert!(::core::mem::offset_of!(OrderEvent, kind) == 30);
     assert!(::core::mem::offset_of!(OrderEvent, reason) == 31);
     assert!(::core::mem::offset_of!(OrderEvent, _pad) == 32);
+    // XMM XH5d: the order's A/B arm and ALO priority and the fill's venue
+    // trade id, pinned with the doc's tables.
+    assert!(::core::mem::offset_of!(Order, verb) == 42);
+    assert!(::core::mem::offset_of!(Order, ab_arm) == 43);
+    assert!(::core::mem::offset_of!(Order, alo_priority_1e8) == 44);
+    assert!(::core::mem::offset_of!(Fill, order_id) == 32);
+    assert!(::core::mem::offset_of!(Fill, tid) == 40);
+    assert!(::core::mem::offset_of!(Fill, _pad1) == 48);
     assert!(TRADE_RING_SIZE.is_power_of_two());
     assert!(ORDER_EVENT_RING_SIZE.is_power_of_two());
 };
@@ -1993,7 +2053,9 @@ pub const EXEC_CONGESTION_NONE: u8 = 0;
 /// Busy: a rate window over 60 % of its share, most of the in-flight
 /// bound used, or the venue's answers slow.
 pub const EXEC_CONGESTION_BUSY: u8 = 1;
-/// Throttled: growth is refused unsent; cancels still go.
+/// Throttled: growth is refused unsent, cancels still go — or (XMM XH5c-3,
+/// the Hyperliquid gateway) no socket is Ready: every post goes by REST,
+/// nothing refused for it. The member holds either way.
 pub const EXEC_CONGESTION_THROTTLED: u8 = 2;
 /// The venue answered a rate-limit error in the last 10 s.
 pub const EXEC_CONGESTION_RATE_LIMITED: u8 = 3;
@@ -4731,11 +4793,13 @@ mod tests {
         // compiler-inserted padding would break the AsBytes contract.
         // Tick: 8+4+4+8+8+8+8+1+1+6+8 = 64 (VT1: +flags, +venue_time_ms).
         // Signal: 8+4+1+1+2+40+8 = 64.
-        // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin;
-        //       E4: +flags, which took the last explicit pad byte).
-        // Order: 8+4+1+1+1+1+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
+        // Fill: 8+4+1+1+1+1+8+8+8+8+8+8 = 64 (X1: +strategy_id, +origin;
+        //       E4: +flags, which took the last explicit pad byte; XMM
+        //       XH5d: +tid, out of `_pad1`).
+        // Order: 8+4+1+1+1+1+8+8+8+1+1+1+1+4+8+8 = 64 (M4.1:
         //        +strategy_id; E5: +verb, +prev_client_oid; XMM XH1:
-        //        +flags — all out of the explicit padding).
+        //        +flags; XMM XH5d: +ab_arm, +alo_priority_1e8 — all out of
+        //        the explicit padding, none left).
         // TradePrint: 8+8+8+8+8+4+1+1+18 = 64 (XMM XH1).
         // OrderEvent: 8+8+8+4+1+1+1+1+32 = 64 (XMM XH1).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);

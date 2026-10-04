@@ -384,20 +384,39 @@ mode = "paper"
 #
 # Slot 6 is live ONLY on its own arm, the Hyperliquid WebSocket gateway
 # (`transport = "gateway"`; every other slot keeps the blocking arm until
-# XMM XH4h). The gateway is TESTNET-only until XMM XH5 gives slot 6 its
-# own master account (O-XH5). A gateway slot names hyperliquid alone and
-# states its perp pair (deviation 19): `cap_perp_usd_1e6`, the per-perp
-# inventory with its working orders, and `max_resting_usd_1e6`, the
-# resting notional — both or neither; `halt_on_alo_reject_pct`, its
-# post-only rejection halt over the last 200 answers (XH-7); an address
-# floor of at least 320; and no top-up keys (none before XH5). A live
-# gateway slot 6 is the ONLY live slot of its engine — an engine of its
-# own (XH4g's battery): a halt's cancel-all reaches every arm the engine
-# holds (D2, the operator's to rule; since XMM XH4h every signer of one
-# agent address shares one nonce stream, so the nonce no longer keeps it
-# alone) — and states no session bound
-# (`halt_on_gain_usd_1e6` / `halt_on_loss_usd_1e6`: on the shared E3
-# account the account value is not slot 6's P&L; XMM XH5).
+# XMM XH4h). The gateway trades the market data's network (LAW E-4:
+# HYPERLIQUID_WS_HOST) — MAINNET only behind its interlock (XMM XH5b-3:
+# this slot live, `--arm-live` naming 6, and its own mainnet account,
+# HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}, on the mainnet host). A gateway slot
+# names hyperliquid alone and states its perp pair (deviation 19):
+# `cap_perp_usd_1e6`, the per-perp inventory with its working orders, and
+# `max_resting_usd_1e6`, the resting notional — both or neither;
+# `halt_on_alo_reject_pct`, its post-only rejection halt over the last 200
+# answers (XH-7); and an address floor of at least 320. On its OWN account
+# it may buy request weight (XMM XH5c-2: `request_topup_weight` /
+# `request_topup_day_max`, both or neither — the probe's 10000 a purchase,
+# $5, and 100000 a UTC day, $50; refused on the shared account, whose
+# requests are its blocking arm's to buy): its day's usage and its spend
+# are kept beside this file, one a network (`xmm-topup-testnet.state`,
+# `xmm-topup-mainnet.state`), and the session P&L adds the spend back
+# (Q-XH5-2: the day's max bounds it instead). A halt cancels the halted
+# slot's orders alone (XMM XH5a, R-XH4-1), so a live gateway slot 6 may
+# run beside the operator's arm's live slots (on either network, with
+# them), and beside slot 0 or a live Binance slot — arms that trade
+# mainnet only — on mainnet alone (XMM XH5b-3).
+#
+# Its account (XMM XH5b-2/-3): on mainnet always its OWN master and API
+# wallet (HYPERLIQUID_XMM_{AGENT_KEY,MASTER_ADDR}); on testnet its OWN
+# when HYPERLIQUID_XMM_TESTNET_{AGENT_KEY,MASTER_ADDR} are set in .env,
+# else the shared E3 testnet account. On its own account it reads every
+# 30 s, so `halt_on_recon_stale_ms` is at least 120000 (four read
+# periods), and it MUST state its session loss bound
+# (`halt_on_loss_usd_1e6`, the probe's -$50, O-XH5), judged on the
+# account's worth against an anchor kept beside this file, one a network
+# (`xmm-pnl-anchor-testnet.state`, `xmm-pnl-anchor-mainnet.state`; move
+# it aside to end a session); its API wallet must be its master's (the
+# boot asks the venue, `userRole`). On the shared account it reads every
+# 10 s (a floor of 20000) and states no session bound.
 # `cap_instance_usd_1e6` is the slot's gross over its perps. The numbers
 # are the maker plan's Appendix B (the XH3 bar sizes `cap_day`):
 [exec.slot.6]
@@ -419,6 +438,9 @@ mode = "paper"
 # halt_on_asset_refusal_streak = 3
 # halt_on_recon_stale_ms = 180000
 # halt_on_alo_reject_pct = 20
+# halt_on_loss_usd_1e6 = 50000000
+# request_topup_weight = 10000
+# request_topup_day_max = 100000
 
 
 # ---- [exec.binance] — the Binance arm (BX6) -----------------------------

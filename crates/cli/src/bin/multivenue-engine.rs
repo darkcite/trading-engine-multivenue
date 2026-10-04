@@ -78,6 +78,9 @@ const STRATEGY_SET_NAMES: &[&str] = &[
     "xmm",
     "ai+xmm",
     "ai+vrp+xsd+bin15+hyparb+xmm",
+    // XMM XH5e: the testnet engine-instance check's set (slot 3 beside slot
+    // 6, nothing else); the wrapper's allow-list keeps it off launchd.
+    "bin15+xmm",
     // HC11 (O-HC18): slot 7, DARK. Resolves, but refuses the boot as "no
     // requested member is configured" without `~/multivenue/hcv.toml`
     // (or `--hcv`); in no configured mask until the operator names it.
@@ -176,6 +179,14 @@ enum Cmd {
     /// environment and never opens `.env` — `scripts/hypercall-live.sh`
     /// sources it. Report on stdout.
     HypercallLive(HypercallLiveArgs),
+    /// XMM XH5e: slot 6's PREFLIGHT — its boot's checks on the exact
+    /// `exec.toml`, `--arm-live` and `xmm.toml` a flip installs, up to the
+    /// boot's first network read: it opens no socket and sends nothing.
+    /// Loads `.env` as `run` does; run it in the wrapper's environment (from
+    /// the repo, with the wrapper's exports — `scripts/xmm-flip.sh` does):
+    /// the identities it checks are those its environment states. Exit 0
+    /// PASS (the report on stdout), 1 refused (the reason on stderr).
+    XmmPreflight(XmmPreflightArgs),
 }
 
 /// `hypercall-live` verbs.
@@ -191,6 +202,25 @@ enum HcVerb {
     Dust,
     /// Cancel every order of ours (a WRITE: `--confirm`).
     CancelAll,
+}
+
+#[derive(Debug, Parser)]
+struct XmmPreflightArgs {
+    /// Path to a .env file; defaults to `./.env` via dotenvy (as `run`).
+    #[arg(long)]
+    env_file: Option<PathBuf>,
+    /// The `exec.toml` the boot will read.
+    #[arg(long)]
+    exec: PathBuf,
+    /// The slots the boot will arm (`--arm-live`); they must arm slot 6.
+    #[arg(long)]
+    arm_live: String,
+    /// The member's artifact (`--xmm`); `~/multivenue/xmm.toml` if absent.
+    #[arg(long)]
+    xmm: Option<PathBuf>,
+    /// The `--strategy` the boot will run: a bootable set holding xmm.
+    #[arg(long)]
+    strategy: String,
 }
 
 #[derive(Debug, Parser)]
@@ -1267,6 +1297,53 @@ fn main() -> ExitCode {
         Cmd::HypercallLive(args) => {
             init_tracing_stderr();
             hypercall_live(args)
+        }
+        Cmd::XmmPreflight(args) => {
+            init_tracing_stderr();
+            xmm_preflight(args)
+        }
+    }
+}
+
+/// XMM XH5e: a `--strategy` the boot accepts (`STRATEGY_SET_NAMES`) whose
+/// mask boots the xmm member — the boot's own test (`xmm_wanted`).
+fn holds_xmm(strategy: &str) -> bool {
+    STRATEGY_SET_NAMES.contains(&strategy)
+        && strategy_set::mask_for_name(strategy).is_some_and(cli::xmm_boot::xmm_wanted)
+}
+
+/// XMM XH5e: `xmm-preflight` — slot 6's boot checks, nothing sent: the
+/// environment as `run` loads it (`.env` under the process's own), a
+/// `--strategy` the boot accepts with xmm in it, then
+/// `cli::xmm_preflight::preflight`.
+fn xmm_preflight(args: XmmPreflightArgs) -> ExitCode {
+    let cfg = match Config::load(args.env_file.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("xmm-preflight: REFUSED — the config does not load: {e:?}");
+            return ExitCode::from(1);
+        }
+    };
+    if !holds_xmm(&args.strategy) {
+        eprintln!(
+            "xmm-preflight: REFUSED — --strategy {} is not a bootable set holding xmm",
+            args.strategy
+        );
+        return ExitCode::from(1);
+    }
+    match cli::xmm_preflight::preflight(
+        &args.exec,
+        &args.arm_live,
+        args.xmm.as_deref(),
+        &cfg.hyperliquid_ws_host,
+    ) {
+        Ok(report) => {
+            print!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("xmm-preflight: REFUSED — {e}");
+            ExitCode::from(1)
         }
     }
 }
@@ -2951,6 +3028,16 @@ fn finish_bn_boot<L: clob_dispatcher::OrderDispatch>(
     Ok(())
 }
 
+/// **XMM XH5b-3** — the loop's line for a shape with slot 6 outermost: the
+/// gateway's network and the arms beside it.
+fn xmm_line(net: exec_hyperliquid::Network, beside: &str) -> String {
+    let n = cli::xmm_live::network_name(net);
+    format!(
+        "running strategy-set with slot 6 LIVE on the Hyperliquid gateway ({n}) beside {beside} \
+         — real {n} orders will be submitted"
+    )
+}
+
 /// **XMM XH4f — slot 6's last boot step**, after `wire_exec_halts`: the
 /// ledger binds the gateway arm's perps as `LAW_LINEAR` rows under the
 /// member's engine ids — the rows the router's perp clamps price (XH2-C,
@@ -3768,6 +3855,18 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // XMM XH5b-3: slot 6's gateway beside a mainnet-only arm (slot 0, a live
+    // Binance slot) on mainnet alone — its network is the market data's (LAW
+    // E-4), which the artifact does not state: asked before any arm boots.
+    if let Some(b) = &exec_boot {
+        let md_mainnet = cli::xmm_live::md_network(&cfg.hyperliquid_ws_host)
+            == Some(exec_hyperliquid::Network::Mainnet);
+        if let Err(reason) = b.check_gateway_network(md_mainnet) {
+            error!(reason, "exec: artifact refused — boot aborted");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    }
     let exec_modes = exec_boot.as_ref().map(|b| {
         let mut m = [0u8; clob_dispatcher::EXEC_COUNTER_SLOTS];
         for (slot, dst) in m.iter_mut().enumerate() {
@@ -4664,6 +4763,15 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // XMM XH5d: the order-event capture beside them — the same stance.
+    let obs = match cli::open_events_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_events_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "events capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
 
     // -- Main thread: real engine loop until SIGINT --
     let cons = Consumers {
@@ -5311,7 +5419,7 @@ fn run(args: RunArgs) -> ExitCode {
                     // **XMM XH4h-2 — the hedge-coin overlap rule**, before
                     // any arm boots: no perp slot 6's gateway binds may be
                     // another LIVE member's perp (a paper member is no
-                    // claim — dead while D2 keeps slot 6 alone).
+                    // claim; since XH5a a live one can sit beside slot 6).
                     if let (Some(_), Some(xb)) = (eb.gateway_live(), xmm_boot.as_ref()) {
                         let live = |slot: u8| eb.live_mask & (1u8 << slot) != 0;
                         let n = usize::from(xb.params.n_perps).min(xb.coins.len());
@@ -5458,14 +5566,16 @@ fn run(args: RunArgs) -> ExitCode {
                         None
                     };
                     // **XMM XH4f — slot 6's own arm, the Hyperliquid
-                    // gateway** (TESTNET until XH5): the member's perps
-                    // bound from the exchange host's meta, their leverage
-                    // set before it takes orders, its thread released only
-                    // after the loop (the arm's shutdown pumps it in the
-                    // drain). `resolve` made it the engine's only live
-                    // slot (D2); it draws from its agent's nonce stream
-                    // (XH4h S3). Booted last: no refusal after it but the
-                    // shapes' own.
+                    // gateway** (on the market data's network, XH5b-3):
+                    // the member's perps bound from the exchange host's
+                    // meta, their leverage set before it takes orders, its
+                    // thread released only after the loop (the arm's
+                    // shutdown pumps it in the drain). Beside the
+                    // operator's arm on either network (XH5a), beside
+                    // slot 0 or a Binance slot on mainnet alone (asked
+                    // right after `resolve`, XH5b-3); it draws from its
+                    // agent's nonce stream (XH4h S3). Booted last: no
+                    // refusal after it but the shapes' own.
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -5481,7 +5591,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 warn!("{}", b.tell);
                                 xmm_stop = Some(b.stop);
                                 handles.push(b.handle);
-                                Some((b.arm, b.specs))
+                                Some((b.arm, b.specs, b.network))
                             }
                             Err(reason) => {
                                 error!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
@@ -5503,8 +5613,9 @@ fn run(args: RunArgs) -> ExitCode {
                     // The dispatcher types cannot share one binding (the
                     // loop is monomorphised over `D`), so each shape enters
                     // the loop from its own arm — enumerated, eight (O-BX30),
-                    // and XMM XH4f's two with slot 6 outermost (`SlotSplit`);
-                    // the halt wiring is one generic helper. Nothing armed
+                    // each alone or with slot 6 outermost (`SlotSplit`: XH4f,
+                    // XH5a; XH5b-3's `shape!`, sixteen compositions); the
+                    // halt wiring is one generic helper. Nothing armed
                     // keeps the refusing stub, so LAW E-1 stays true by
                     // construction. A Binance shape splits by route venue
                     // (`VenueSplit`), built from the router's own route.
@@ -5558,69 +5669,86 @@ fn run(args: RunArgs) -> ExitCode {
                             }
                         };
                     }
+                    // XMM XH5b-3: every shape enters the loop through
+                    // `shape!` — alone, or with slot 6 outermost when its
+                    // gateway arm booted (`SlotSplit(6, <shape>, xmm)`):
+                    // one macro over the shapes, sixteen compositions, no
+                    // `dyn`. `bn(<specs>, <hops>)` names a shape's Binance
+                    // symbols and the path from the shape to its
+                    // `VenueSplit`, whose aliases the Binance arm finishes
+                    // with; slot 6's split adds one `a()`. A halt cancels
+                    // the halted slot's orders alone (XH5a,
+                    // `OrderDispatch::cancel_slot`), through every nesting.
+                    macro_rules! shape {
+                        (
+                            $inner:expr,
+                            $what:expr,
+                            $beside:expr
+                            $(, bn($specs:expr $(, $hop:ident)*))?
+                        ) => {
+                            // COPY: boot, once — the shape's arms move by
+                            // value into their splits and the router (KiB;
+                            // the gateway arms' 1 792 B noted at their
+                            // boots). Rejected: boxing (every verb would
+                            // chase a pointer).
+                            match xmm_arm {
+                                None => {
+                                    let inner = $inner;
+                                    let mut d = exec_router::RoutedDispatcher::new(
+                                        eb.route, paper, inner, anchor,
+                                    );
+                                    wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                                    $(
+                                        let split_aliases = *d.live()$(.$hop())*.aliases();
+                                        finish_bn!(d, split_aliases, $specs);
+                                    )?
+                                    enter_loop!(d, $what)
+                                }
+                                Some((xmm, xspecs, net)) => {
+                                    let split = exec_router::SlotSplit::new(
+                                        cli::exec_boot::XMM_SLOT as u8,
+                                        $inner,
+                                        xmm,
+                                    );
+                                    let mut d = exec_router::RoutedDispatcher::new(
+                                        eb.route, paper, split, anchor,
+                                    );
+                                    wire_exec_halts(&mut d, &eb, halt_mask, aliases);
+                                    $(
+                                        let split_aliases = *d.live().a()$(.$hop())*.aliases();
+                                        finish_bn!(d, split_aliases, $specs);
+                                    )?
+                                    finish_xmm!(d, xspecs);
+                                    enter_loop!(d, xmm_line(net, $beside))
+                                }
+                            }
+                        };
+                    }
                     const REAL: &str = "running strategy-set with LIVE slots — real orders will be \
                                         submitted";
-                    match (hl_arm, bn_arm, hyparb_live, xmm_arm) {
-                        // XMM XH4f: slot 6 on its own arm, outermost.
-                        (None, None, None, Some((xmm, xspecs))) => {
-                            let split = exec_router::SlotSplit::new(
-                                cli::exec_boot::XMM_SLOT as u8,
-                                exec_router::NullLiveDispatcher::new(),
-                                xmm,
-                            );
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            finish_xmm!(d, xspecs);
-                            enter_loop!(
-                                d,
-                                "running strategy-set with slot 6 LIVE on the Hyperliquid gateway \
-                                 (TESTNET) — real testnet orders will be submitted"
-                            )
-                        }
-                        // `exec_boot::resolve` refuses slot 6's gateway beside
-                        // any other live slot (XH4h shares the nonce; D2's
-                        // global halt): refused here too, never composed.
-                        (_, _, _, Some(_)) => abort_boot!(
-                            "exec: slot 6's gateway beside another live arm — boot aborted"
+                    match (hl_arm, bn_arm, hyparb_live) {
+                        (Some(arm), None, None) => shape!(arm, REAL, "the operator's arm"),
+                        (Some(arm), None, Some(live)) => shape!(
+                            exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live),
+                            "running strategy-set with LIVE slots on TWO arms (slot 0 on its own \
+                             wallet) — real orders will be submitted",
+                            "the operator's arm and slot 0's wallet"
                         ),
-                        (Some(arm), None, None, None) => {
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, arm, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            enter_loop!(d, REAL)
-                        }
-                        (Some(arm), None, Some(live), None) => {
-                            let split =
-                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, arm, live);
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            enter_loop!(
-                                d,
-                                "running strategy-set with LIVE slots on TWO arms (slot 0 on its \
-                                 own wallet) — real orders will be submitted"
-                            )
-                        }
-                        (None, None, Some(live), None) => {
-                            let split = exec_router::SlotSplit::new(
+                        (None, None, Some(live)) => shape!(
+                            exec_router::SlotSplit::new(
                                 cli::hyparb_live::SLOT,
                                 exec_router::NullLiveDispatcher::new(),
                                 live,
-                            );
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            enter_loop!(
-                                d,
-                                "running strategy-set with slot 0 LIVE on its own wallet — real \
-                                 orders will be submitted"
-                            )
-                        }
-                        (None, None, None, None) => {
-                            // Nothing armed: the refusing stub, so a live
-                            // slot on a venue with no arm cannot exist here
-                            // (already refused by `exec_boot::resolve`).
+                            ),
+                            "running strategy-set with slot 0 LIVE on its own wallet — real \
+                             orders will be submitted",
+                            "slot 0's wallet"
+                        ),
+                        (None, None, None) => {
+                            // Nothing armed (but slot 6, if it booted): the
+                            // refusing stub, so a live slot on a venue with
+                            // no arm cannot exist here (already refused by
+                            // `exec_boot::resolve`).
                             //
                             // E6: `WallAnchor::now()` above is the anchor
                             // the venue-fill ledger's 00:00Z day epoch
@@ -5628,84 +5756,58 @@ fn run(args: RunArgs) -> ExitCode {
                             // the day cap is a wall-clock fact. The ledger
                             // is left UNSEEDED: every live PLACE is refused
                             // until the arm's reconciler reports success.
-                            let mut d = exec_router::RoutedDispatcher::new(
-                                eb.route,
-                                paper,
+                            shape!(
                                 exec_router::NullLiveDispatcher::new(),
-                                anchor,
-                            );
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            enter_loop!(
-                                d,
                                 "running strategy-set PAPER (exec artifact present, nothing \
-                                 armed) — no orders will be submitted"
+                                 armed) — no orders will be submitted",
+                                "no other arm"
                             )
                         }
-                        (None, Some((bn, specs)), None, None) => {
-                            let split = exec_router::VenueSplit::new(
+                        (None, Some((bn, specs)), None) => shape!(
+                            exec_router::VenueSplit::new(
                                 bn_venue,
                                 exec_router::NullLiveDispatcher::new(),
                                 bn,
                                 &eb.route,
-                            );
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            let split_aliases = *d.live().aliases();
-                            finish_bn!(d, split_aliases, specs);
-                            enter_loop!(d, REAL)
-                        }
-                        (Some(arm), Some((bn, specs)), None, None) => {
-                            let split =
-                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            let split_aliases = *d.live().aliases();
-                            finish_bn!(d, split_aliases, specs);
-                            enter_loop!(
-                                d,
-                                "running strategy-set with LIVE slots on TWO venue arms \
-                                 (hyperliquid, binance) — real orders will be submitted"
-                            )
-                        }
-                        (None, Some((bn, specs)), Some(live), None) => {
-                            let venues = exec_router::VenueSplit::new(
-                                bn_venue,
-                                exec_router::NullLiveDispatcher::new(),
-                                bn,
-                                &eb.route,
-                            );
-                            let split =
-                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, venues, live);
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            let split_aliases = *d.live().a().aliases();
-                            finish_bn!(d, split_aliases, specs);
-                            enter_loop!(
-                                d,
-                                "running strategy-set with LIVE slots on TWO arms (binance; slot 0 \
-                                 on its own wallet) — real orders will be submitted"
-                            )
-                        }
-                        (Some(arm), Some((bn, specs)), Some(live), None) => {
-                            let venues =
-                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route);
-                            let split =
-                                exec_router::SlotSplit::new(cli::hyparb_live::SLOT, venues, live);
-                            let mut d =
-                                exec_router::RoutedDispatcher::new(eb.route, paper, split, anchor);
-                            wire_exec_halts(&mut d, &eb, halt_mask, aliases);
-                            let split_aliases = *d.live().a().aliases();
-                            finish_bn!(d, split_aliases, specs);
-                            enter_loop!(
-                                d,
-                                "running strategy-set with LIVE slots on THREE arms (hyperliquid, \
-                                 binance; slot 0 on its own wallet) — real orders will be \
-                                 submitted"
-                            )
-                        }
+                            ),
+                            REAL,
+                            "the Binance arm",
+                            bn(specs)
+                        ),
+                        (Some(arm), Some((bn, specs)), None) => shape!(
+                            exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route),
+                            "running strategy-set with LIVE slots on TWO venue arms \
+                             (hyperliquid, binance) — real orders will be submitted",
+                            "the operator's arm and the Binance arm",
+                            bn(specs)
+                        ),
+                        (None, Some((bn, specs)), Some(live)) => shape!(
+                            exec_router::SlotSplit::new(
+                                cli::hyparb_live::SLOT,
+                                exec_router::VenueSplit::new(
+                                    bn_venue,
+                                    exec_router::NullLiveDispatcher::new(),
+                                    bn,
+                                    &eb.route,
+                                ),
+                                live,
+                            ),
+                            "running strategy-set with LIVE slots on TWO arms (binance; slot 0 \
+                             on its own wallet) — real orders will be submitted",
+                            "the Binance arm and slot 0's wallet",
+                            bn(specs, a)
+                        ),
+                        (Some(arm), Some((bn, specs)), Some(live)) => shape!(
+                            exec_router::SlotSplit::new(
+                                cli::hyparb_live::SLOT,
+                                exec_router::VenueSplit::new(bn_venue, arm, bn, &eb.route),
+                                live,
+                            ),
+                            "running strategy-set with LIVE slots on THREE arms (hyperliquid, \
+                             binance; slot 0 on its own wallet) — real orders will be submitted",
+                            "the operator's arm, the Binance arm and slot 0's wallet",
+                            bn(specs, a)
+                        ),
                     }
                 }
             }
@@ -5764,6 +5866,31 @@ mod strategy_name_pin {
                 "{name} is bootable but mask_for_name does not know it"
             );
             i += 1;
+        }
+    }
+
+    /// XMM XH5e: the preflight's `--strategy` is a bootable set holding the
+    /// xmm member — the engine-instance check's `bin15+xmm` among them.
+    #[test]
+    fn the_preflight_takes_a_bootable_set_holding_xmm() {
+        for ok in [
+            "xmm",
+            "ai+xmm",
+            "bin15+xmm",
+            "ai+vrp+xsd+bin15+hyparb+xmm+hcv",
+            "all",
+        ] {
+            assert!(super::holds_xmm(ok), "{ok}");
+        }
+        for no in [
+            "bin15",
+            "ai",
+            "ai+vrp+xsd+bin15+hyparb",
+            "xmm+bin15",
+            "xmmx",
+            "",
+        ] {
+            assert!(!super::holds_xmm(no), "{no}");
         }
     }
 

@@ -48,13 +48,13 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
-    EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
+    OrderEvent, RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE,
+    DEPTH_RING_SIZE, EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
     RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
-    Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
-    SIGNAL_RING_SIZE, TICK_RING_SIZE,
+    Engine, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE,
+    NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
 };
 use engine_snapshot::{BootInfo, EngineSnapshot, SnapshotCell, SNAPSHOT_VENUES};
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
@@ -2884,6 +2884,18 @@ pub fn open_orders_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapt
     SlotCapture::open(run_dir.join(ENGINE_ORDERS_FILE), SlotKind::Order, epoch_ns)
 }
 
+/// Open XMM XH5d's engine-thread order-event capture
+/// (`<run_dir>/engine-events.pmlr`, `SlotKind::OrderEvent`). Boot-only;
+/// the bin hands the result to [`Observability::with_events_capture`] and
+/// the engine loop takes ownership from there.
+pub fn open_events_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapture<OrderEvent>> {
+    SlotCapture::open(
+        run_dir.join(ENGINE_EVENTS_FILE),
+        SlotKind::OrderEvent,
+        epoch_ns,
+    )
+}
+
 /// Parse `AI_INGRESS_HMAC_KEY` (64 hex chars) into the 32-byte HMAC
 /// key (Phase 8f §4.1). The error strings deliberately carry **no key
 /// material** — this value must never reach a log. Returns `Err` on
@@ -4389,6 +4401,15 @@ impl Observability {
                     .map_err(|_| "register engine_orders_capture_records")?;
                 CaptureGaugeIds { io_errors, records }
             };
+            let events_capture = {
+                let io_errors = reg
+                    .register_gauge("engine_events_capture_io_errors")
+                    .map_err(|_| "register engine_events_capture_io_errors")?;
+                let records = reg
+                    .register_gauge("engine_events_capture_records")
+                    .map_err(|_| "register engine_events_capture_records")?;
+                CaptureGaugeIds { io_errors, records }
+            };
 
             // COPY: the registry (147 520 B, pinned in core-metrics) moved
             // from this stack into its `Arc`, once at boot — rejected: an
@@ -4465,6 +4486,7 @@ impl Observability {
                 capture_ai,
                 fills_capture,
                 orders_capture,
+                events_capture,
                 strategy_enabled_mask,
                 vm,
                 xmm,
@@ -4625,6 +4647,10 @@ pub struct Observability {
     /// as `fills_capture` (bin opens, engine loop takes ownership).
     /// `None` in tests and in tools that replay rather than run.
     pub orders_capture: Option<SlotCapture<Order>>,
+    /// XMM XH5d: the engine-thread order-event capture, same lifecycle as
+    /// `fills_capture` (bin opens, engine loop takes ownership). `None` in
+    /// tests and in tools that replay rather than run.
+    pub events_capture: Option<SlotCapture<OrderEvent>>,
     /// VRP V8a: where the VRP member's persisted state is written.
     /// `None` = no VRP member is configured, and the engine writes
     /// nothing. Set by the set builder from the boot bundle.
@@ -4702,6 +4728,15 @@ impl Observability {
         self
     }
 
+    // COPY: every `with_*` builder here (the latency dump, the three
+    // captures — fills, orders, XMM XH5d's events — the boot info, …) moves
+    // this `Observability` by value, once each at boot (KiB-scale:
+    // `counter_ids` inline), and a capture's `SlotCapture` handle with it
+    // (its 64 KiB staging is boxed — the move is the handle, not the
+    // buffer); `take()` then hands each capture to `Engine::set_*_capture`.
+    // Never on a tick. Rejected: `&mut self` setters — a second API for a
+    // once-per-boot move.
+
     /// Attach the engine-thread fills capture (Phase 8f item 6).
     /// Boot-only; called from the bin after the per-run capture
     /// directory exists.
@@ -4715,6 +4750,13 @@ impl Observability {
     /// directory exists.
     pub fn with_orders_capture(mut self, cap: SlotCapture<Order>) -> Self {
         self.orders_capture = Some(cap);
+        self
+    }
+
+    /// Attach XMM XH5d's engine-thread order-event capture. Boot-only;
+    /// called from the bin after the per-run capture directory exists.
+    pub fn with_events_capture(mut self, cap: SlotCapture<OrderEvent>) -> Self {
+        self.events_capture = Some(cap);
         self
     }
 
@@ -4902,6 +4944,10 @@ pub struct EngineCounters {
     /// (`engine_orders_capture_{io_errors,records}`). Mirrored
     /// centrally from the engine loop like the fills pair.
     pub orders_capture: CaptureGaugeIds,
+    /// XMM XH5d capture-health gauges, engine-thread order-event capture
+    /// (`engine_events_capture_{io_errors,records}`). Mirrored centrally
+    /// from the engine loop like the fills pair.
+    pub events_capture: CaptureGaugeIds,
     /// Phase-8g §9: the set's live enable mask
     /// (`engine_strategy_enabled_mask` — the G0 demo finding: the
     /// flip was only inferable from order-flow deltas). Read via the
@@ -6115,9 +6161,9 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 65;
+const HLGW_COUNTERS: usize = 71;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
-const HLGW_GAUGES: usize = 27;
+const HLGW_GAUGES: usize = 37;
 
 /// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
 /// — which is what pins the two together.
@@ -6151,6 +6197,11 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_day_unreadable_total",
     "engine_exec_hlgw_refunded_total",
     "engine_exec_hlgw_refused_leverage_total",
+    "engine_exec_hlgw_spot_reads_total",
+    "engine_exec_hlgw_spot_failed_total",
+    "engine_exec_hlgw_topup_ok_total",
+    "engine_exec_hlgw_topup_failed_total",
+    "engine_exec_hlgw_topup_unsent_total",
     "engine_exec_hlgw_deadman_arms_total",
     "engine_exec_hlgw_deadman_clears_total",
     "engine_exec_hlgw_deadman_accepted_total",
@@ -6187,10 +6238,11 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_gateway_ttl_full_total",
     "engine_exec_hlgw_refused_cap_perp_total",
     "engine_exec_hlgw_refused_max_resting_total",
+    "engine_exec_hlgw_refused_foreign_row_total",
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 65] (520 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 71] (568 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6225,6 +6277,11 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.day_unreadable,
         r.refunded,
         r.refused_leverage,
+        r.spot_reads,
+        r.spot_failed,
+        r.topup_ok,
+        r.topup_failed,
+        r.topup_unsent,
         r.dm_arms,
         r.dm_clears,
         r.dm_accepted,
@@ -6261,6 +6318,7 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.gw_ttl_full,
         r.refused_cap_perp,
         r.refused_max_resting,
+        r.refused_foreign_row,
     ]
 }
 
@@ -6277,6 +6335,8 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_post_rtt_p50_ns",
     "engine_exec_hlgw_post_rtt_p99_ns",
     "engine_exec_hlgw_post_rtt_max_ns",
+    "engine_exec_hlgw_rest_rtt_p99_ns",
+    "engine_exec_hlgw_rest_rtt_max_ns",
     "engine_exec_hlgw_push_to_write_p99_ns",
     "engine_exec_hlgw_cancel_rtt_p99_ns",
     "engine_exec_hlgw_fill_lag_p99_ns",
@@ -6293,11 +6353,20 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_health_blocked",
     "engine_exec_hlgw_unmarked_positions",
     "engine_exec_hlgw_resting_usd_1e6",
+    "engine_exec_hlgw_own_account",
+    "engine_exec_hlgw_pnl_anchor_usd_1e6",
+    "engine_exec_hlgw_anchor_kept",
+    "engine_exec_hlgw_worth_usd_1e6",
+    "engine_exec_hlgw_session_pnl_usd_1e6",
+    "engine_exec_hlgw_topup_weight",
+    "engine_exec_hlgw_topup_day_used",
+    "engine_exec_hlgw_topup_cost_usd_1e6",
 ];
 
 /// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
-/// level past `i64::MAX` — a heartbeat not yet seen — reads −1.
-// COPY: [i64; 27] (216 B) returned by value — cold, as above.
+/// level past `i64::MAX` — a heartbeat not yet seen, a top-up day read as
+/// spent (XMM XH5c-2) — reads −1.
+// COPY: [i64; 37] (296 B) returned by value — cold, as above.
 fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6312,6 +6381,8 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.post_rtt_p50_ns),
         g(r.post_rtt_p99_ns),
         g(r.post_rtt_max_ns),
+        g(r.rest_rtt_p99_ns),
+        g(r.rest_rtt_max_ns),
         g(r.push_to_write_p99_ns),
         g(r.cancel_rtt_p99_ns),
         g(r.fill_lag_p99_ns),
@@ -6328,6 +6399,14 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.health_blocked),
         g(r.unmarked_positions),
         r.resting_usd_1e6,
+        g(r.own_account),
+        r.pnl_anchor_usd_1e6,
+        g(r.anchor_kept),
+        r.worth_usd_1e6,
+        r.session_pnl_usd_1e6,
+        g(r.topup_weight),
+        g(r.topup_day_used),
+        r.topup_cost_usd_1e6,
     ]
 }
 
@@ -6370,6 +6449,8 @@ fn register_hlgw_metrics(
     let last_shutdown_unconfirmed = reg
         .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
         .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
+    // COPY: the 436 B id block ((71 + 37 + 1) × 4 B), returned by value once
+    // at boot — rejected: an out-param for a one-time move.
     Ok(ExecHlgwMetricIds {
         counters,
         gauges,
@@ -6399,7 +6480,7 @@ fn mirror_hlgw_metrics(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: the 65 totals (520 B) kept as the next delta's baseline — 5 s
+    // COPY: the 71 totals (568 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -6684,7 +6765,7 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
 pub const XMM_METRIC_PERPS: usize = 4;
 
 /// The xmm family's counters.
-const XMM_COUNTERS: usize = 22;
+const XMM_COUNTERS: usize = 25;
 
 /// The counter rows of the xmm family, in [`xmm_counter_values`] order
 /// — which is what pins the two together.
@@ -6711,10 +6792,13 @@ const XMM_COUNTER_NAMES: [&str; XMM_COUNTERS] = [
     "engine_xmm_congestion_cancels_total",
     "engine_xmm_health_held_total",
     "engine_xmm_busy_deferred_total",
+    "engine_xmm_priority_places_total",
+    "engine_xmm_priority_fee_usd_1e6_total",
+    "engine_xmm_priority_refused_total",
 ];
 
 /// `XmmCounters`' fields in [`XMM_COUNTER_NAMES`] order.
-// COPY: [u64; 22] (176 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 25] (200 B) returned by value — cold, the 5 s /metrics
 // mirror; the fields are visited once in the name order — a borrowed
 // view would need the struct to be an array, which the POD is not.
 fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; XMM_COUNTERS] {
@@ -6741,6 +6825,9 @@ fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; XMM_COUNTERS] {
         c.congestion_cancels,
         c.health_held,
         c.busy_deferred,
+        c.priority_places,
+        c.priority_fee_usd_1e6,
+        c.priority_refused,
     ]
 }
 
@@ -6797,7 +6884,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
     strat: &S,
     last: &mut strategy_core::XmmCounters,
 ) {
-    // COPY: the 176 B `XmmCounters` read into `cur`, then kept as the
+    // COPY: the 200 B `XmmCounters` read into `cur`, then kept as the
     // next delta's baseline (`*last = cur`) — 5 s cadence, cold; a delta
     // needs the previous value, so one copy survives either way.
     let mut cur = strategy_core::XmmCounters::default();
@@ -6809,7 +6896,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
         reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
         i += 1;
     }
-    // COPY: 176 B — the next delta's baseline (see above).
+    // COPY: 200 B — the next delta's baseline (see above).
     *last = cur;
     let mut rows = [strategy_core::XmmPerpView::default(); XMM_METRIC_PERPS];
     let n = strat.xmm_perps_view(&mut rows);
@@ -8864,6 +8951,10 @@ where
     if let Some(cap) = obs.orders_capture.take() {
         eng.set_order_capture(cap);
     }
+    // XMM XH5d: and the order-event capture.
+    if let Some(cap) = obs.events_capture.take() {
+        eng.set_event_capture(cap);
+    }
     // XMM XH4f (D11): slot 6's gateway-arm tell — what the last run left
     // unconfirmed, read back once (a gauge and an ERROR line); then written
     // anew: it stands until THIS run's shutdown confirms (`gateway_shutdown_
@@ -9146,6 +9237,7 @@ where
             // not an observability option.
             eng.maybe_flush_fill_capture(now);
             eng.maybe_flush_order_capture(now);
+            eng.maybe_flush_event_capture(now);
             // F21: and the members' own persisted state, for the same
             // reason. It used to sit inside `if let (Some(reg),
             // Some(ids)) = (obs.metrics, obs.counter_ids)`, which made
@@ -9426,6 +9518,11 @@ where
                     .set(eng.order_capture_io_errors() as i64);
                 reg.gauge(ids.orders_capture.records)
                     .set(eng.order_capture_records() as i64);
+                // XMM XH5d order-event capture pair — same central mirror.
+                reg.gauge(ids.events_capture.io_errors)
+                    .set(eng.event_capture_io_errors() as i64);
+                reg.gauge(ids.events_capture.records)
+                    .set(eng.event_capture_records() as i64);
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)
@@ -12264,7 +12361,11 @@ mod tests {
         let reg = obs.metrics.as_ref().unwrap();
         assert!(reg.counters_len() <= core_metrics::MAX_COUNTERS);
         // XMM XH4f: 518 counters and 407 gauges here — slot 6's gateway
-        // family (65 + 28) took the worst case past 512 / 384.
+        // family (65 + 28) took the worst case past 512 / 384; XH5a adds
+        // one counter (519); XMM XH5b-2 two counters and five gauges
+        // (521 / 412); XH5c-2 three and three (524 / 415); XH5c-3 two
+        // gauges (417); XH5d-1 two gauges (419); XH5d-3b three counters
+        // (527).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -12422,6 +12523,9 @@ mod tests {
         f.c.pull_cancels = 4;
         f.c.stuck = 1;
         f.c.busy_deferred = 3;
+        f.c.priority_places = 2;
+        f.c.priority_fee_usd_1e6 = 3_000;
+        f.c.priority_refused = 4;
         f.rows[0].pos_1e6 = 150_000;
         f.rows[1].pos_1e6 = -20_000;
         mirror_xmm_metrics(&reg, &ids, &f, &mut last);
@@ -12433,6 +12537,15 @@ mod tests {
             3,
             "busy_deferred (XH4f)"
         );
+        assert_eq!(
+            (
+                reg.counter(ids.counters[22]).get(),
+                reg.counter(ids.counters[23]).get()
+            ),
+            (2, 3_000),
+            "the ALO priority's places and fee (XMM XH5d)"
+        );
+        assert_eq!(reg.counter(ids.counters[24]).get(), 4, "priority_refused");
         assert_eq!(reg.gauge(ids.perps).get(), 2);
         assert_eq!((reg.gauge(ids.pos[0]).get(), reg.gauge(ids.pos[1]).get()), (150_000, -20_000));
         assert_eq!(reg.gauge(ids.pos[2]).get(), 0, "a perp not quoted reads zero");
@@ -13658,12 +13771,28 @@ mod tests {
             slot: 6,
             pushed: 5,
             refused_max_resting: 2,
+            refused_foreign_row: 4,
             gw_ttl_full: 1,
             heartbeat_age_ms: u64::MAX,
             budget_remaining: -3,
             rate_ws_sum: 11,
             dm_availability: 3,
             resting_usd_1e6: 7,
+            spot_reads: 13,
+            spot_failed: 2,
+            own_account: 3,
+            pnl_anchor_usd_1e6: 1_000_000_000,
+            anchor_kept: 5,
+            worth_usd_1e6: 988,
+            session_pnl_usd_1e6: -12,
+            topup_ok: 4,
+            topup_failed: 1,
+            topup_unsent: 6,
+            topup_weight: 10_000,
+            topup_day_used: u64::MAX,
+            topup_cost_usd_1e6: 5_000_000,
+            rest_rtt_p99_ns: 9,
+            rest_rtt_max_ns: 12,
             ..clob_dispatcher::GatewayArmReport::default()
         };
         mirror_hlgw_metrics(reg, ids, &cur, &mut last);
@@ -13675,12 +13804,28 @@ mod tests {
         for (name, v) in [
             ("engine_exec_hlgw_pushed_total", "8"),
             ("engine_exec_hlgw_refused_max_resting_total", "2"),
+            ("engine_exec_hlgw_refused_foreign_row_total", "4"),
             ("engine_exec_hlgw_gateway_ttl_full_total", "1"),
             ("engine_exec_hlgw_heartbeat_age_ms", "-1"),
             ("engine_exec_hlgw_budget_remaining", "-3"),
             ("engine_exec_hlgw_rate_ws_sum", "11"),
             ("engine_exec_hlgw_deadman_availability", "3"),
             ("engine_exec_hlgw_resting_usd_1e6", "7"),
+            ("engine_exec_hlgw_spot_reads_total", "13"),
+            ("engine_exec_hlgw_spot_failed_total", "2"),
+            ("engine_exec_hlgw_own_account", "3"),
+            ("engine_exec_hlgw_pnl_anchor_usd_1e6", "1000000000"),
+            ("engine_exec_hlgw_anchor_kept", "5"),
+            ("engine_exec_hlgw_worth_usd_1e6", "988"),
+            ("engine_exec_hlgw_session_pnl_usd_1e6", "-12"),
+            ("engine_exec_hlgw_topup_ok_total", "4"),
+            ("engine_exec_hlgw_topup_failed_total", "1"),
+            ("engine_exec_hlgw_topup_unsent_total", "6"),
+            ("engine_exec_hlgw_topup_weight", "10000"),
+            ("engine_exec_hlgw_topup_day_used", "-1"),
+            ("engine_exec_hlgw_topup_cost_usd_1e6", "5000000"),
+            ("engine_exec_hlgw_rest_rtt_p99_ns", "9"),
+            ("engine_exec_hlgw_rest_rtt_max_ns", "12"),
             ("engine_exec_hlgw_last_shutdown_unconfirmed", "0"),
         ] {
             assert!(

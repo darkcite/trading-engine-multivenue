@@ -132,8 +132,35 @@ fn full_snapshot() -> Box<EngineSnapshot> {
     s.boot.xmm_hash = [0xFF; 32];
     s.boot.set_xmm_coins(&[b'"'; 48]); // worst case: every byte escapes
     s.xmm.n_perps = u32::MAX;
-    s.xmm.counters.placed = u64::MAX;
-    s.xmm.counters.stuck = u64::MAX;
+    // Every counter at its widest render: a literal with no `..`, so the
+    // next counter is a compile error here (XMM XH5d).
+    s.xmm.counters = strategy_core::XmmCounters {
+        placed: u64::MAX,
+        modifies: u64::MAX,
+        lead_cancels: u64::MAX,
+        requote_cancels: u64::MAX,
+        pull_cancels: u64::MAX,
+        expiry_cancels: u64::MAX,
+        gated: u64::MAX,
+        gate_overflow: u64::MAX,
+        capped: u64::MAX,
+        rejected_alo: u64::MAX,
+        rejected_other: u64::MAX,
+        canceled: u64::MAX,
+        filled: u64::MAX,
+        fills: u64::MAX,
+        unmatched: u64::MAX,
+        ctx_refused: u64::MAX,
+        stuck: u64::MAX,
+        blocked_cancels: u64::MAX,
+        rtt_cancels: u64::MAX,
+        congestion_cancels: u64::MAX,
+        health_held: u64::MAX,
+        busy_deferred: u64::MAX,
+        priority_places: u64::MAX,
+        priority_fee_usd_1e6: u64::MAX,
+        priority_refused: u64::MAX,
+    };
     for r in s.xmm.perps.iter_mut() {
         *r = strategy_core::XmmPerpView {
             pos_1e6: i64::MIN,
@@ -631,7 +658,8 @@ fn the_xmm_section_renders_counters_and_perp_rows() {
         "\"gated\":0,\"gate_overflow\":0,\"capped\":0,\"rejected_alo\":0,\"rejected_other\":0,",
         "\"canceled\":0,\"filled\":0,\"fills\":3,\"unmatched\":0,\"ctx_refused\":0,\"stuck\":0,",
         "\"blocked_cancels\":0,\"rtt_cancels\":0,\"congestion_cancels\":0,\"health_held\":0,",
-        "\"busy_deferred\":0,",
+        "\"busy_deferred\":0,\"priority_places\":0,\"priority_fee_usd_1e6\":0,",
+        "\"priority_refused\":0,",
         "\"perps\":[{\"hl_sym\":83886082,\"lead_sym\":16777221,\"pos_1e6\":-50000,",
         "\"touch_bid_1e6\":100000000,\"touch_ask_1e6\":100010000,\"bid_px_1e6\":100000000,",
         "\"ask_px_1e6\":0,\"bid_state\":2,\"ask_state\":0,\"stale_flags\":1,",
@@ -646,7 +674,7 @@ fn the_xmm_section_renders_counters_and_perp_rows() {
     let n = encode_state_json(&e, &mut buf).unwrap();
     let body = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(body.contains("\"xmm\":{\"configured\":0,\"n_perps\":0,\"placed\":0,"));
-    assert!(body.contains("\"busy_deferred\":0,\"perps\":[]}"));
+    assert!(body.contains("\"priority_refused\":0,\"perps\":[]}"));
 }
 
 /// HAR H3.5: the `har` object — additive, so a `contains` pin. The raw

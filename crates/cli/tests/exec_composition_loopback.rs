@@ -535,6 +535,130 @@ fn every_verb_reaches_the_arm_of_its_route_venue_and_the_ledger_follows() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// **XMM XH5a (R-XH4-1) — a halt sweeps the halted slot's orders alone,
+/// through the REAL arm.** Slot 6's shape on the operator's arm
+/// (`SlotSplit(6, HlExchange, …)`), slots 3 and 4 live on one account, one
+/// order each resting on one leg. Slot 3 halts: the arm's sweep reads the
+/// venue's open orders — both slots' cloids on that leg — and cancels slot
+/// 3's oid alone; the router releases slot 3's row only once the sweep has
+/// confirmed, and slot 4's row and order stay.
+#[test]
+fn a_halt_sweeps_the_halted_slot_s_orders_alone_through_the_real_arm() {
+    const PLACED_4: &[u8] =
+        br#"{"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":424244}}]}}}"#;
+    let hl = VenueId::Hyperliquid as u8;
+    let hl_sym = make_symbol_id(VenueId::Hyperliquid, 5);
+    let (a3, a4) = ((1u64 << 32) | 7, (2u64 << 32) | 7);
+    // The sweep's read: slot 3's and slot 4's cloids, both resting on `#5`.
+    let listing: &'static [u8] = Box::leak(
+        format!(
+            r##"[{{"coin":"#5","oid":424242,"cloid":{}}},{{"coin":"#5","oid":424244,"cloid":{}}}]"##,
+            cloid(3, a3),
+            cloid(4, a4)
+        )
+        .into_bytes()
+        .into_boxed_slice(),
+    );
+    let script: &'static [&'static [u8]] =
+        Box::leak(vec![PLACED, PLACED_4, listing, CANCELLED].into_boxed_slice());
+    let v = venue(script);
+
+    let dir = std::env::temp_dir().join(format!("xh5a-sweep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("state dir");
+    let budget_path = dir.join("exec-budget.state");
+    exec_hyperliquid::budget::store(&budget_path, &AddressBudget::restored(ADDR, 100, 0, 0))
+        .expect("budget file");
+    let cfg = HlConfig::new(Scope::Testnet, "localhost", 'b', KEY, ADDR)
+        .expect("cfg")
+        .with_port(v.port)
+        .expect("a local double takes any port");
+    let (fills, _fills_rx) = core_ring::Ring::<Fill, 64>::new().split();
+    let mut hlx =
+        HlExchange::<64>::new(&cfg, v.client.clone(), fills, budget_path, 100).expect("arm");
+    hlx.assets_mut().bind(hl_sym, 3, 7, b"#5").expect("bind");
+
+    let limits = HaltLimits::new(5, 5_000_000, 30_000, 3, 300_000);
+    let caps = SlotCaps::new(1_000_000_000, i64::MAX, i64::MAX, 64);
+    let mut route = ExecRoute::all_paper();
+    route
+        .set_slot(3, ExecMode::Live, &[hl], caps, limits)
+        .expect("slot 3");
+    route
+        .set_slot(4, ExecMode::Live, &[hl], caps, limits)
+        .expect("slot 4");
+    let mut d = RoutedDispatcher::new(
+        route,
+        PaperDispatcher::new(),
+        SlotSplit::new(6, hlx, exec_router::NullLiveDispatcher::new()),
+        core_time::WallAnchor::now(),
+    );
+    d.mark_ledger_seeded();
+    let o3 = order(3, VenueId::Hyperliquid, hl_sym, 470_000, a3);
+    assert_eq!(d.submit(&o3), Ok(()));
+    let o4 = order(4, VenueId::Hyperliquid, hl_sym, 469_000, a4);
+    assert_eq!(d.submit(&o4), Ok(()));
+    assert_eq!(
+        (d.ledger().slot_resting(3), d.ledger().slot_resting(4)),
+        (1, 1)
+    );
+
+    // Slot 3 halts: its sweep is queued for slot 3 alone; nothing is
+    // confirmed yet, so its row stays booked.
+    assert!(d.halt_slot(3, exec_router::HaltReason::Operator));
+    assert!(d.halt().cancel_outstanding());
+    let working = clob_dispatcher::CancelAllState::Working;
+    let clear = clob_dispatcher::CancelAllState::Clear;
+    assert_eq!(d.live().a().cancel_slot_state(3), working);
+    assert_eq!(
+        d.live().a().cancel_slot_state(4),
+        clear,
+        "4 was not asked for"
+    );
+    assert_eq!(
+        d.ledger().slot_resting(3),
+        1,
+        "released only on the confirmation"
+    );
+
+    // The idle path: the read, slot 3's cancel, the confirmation.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while d.halt().cancel_outstanding() && Instant::now() < deadline {
+        d.on_idle();
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!d.halt().cancel_outstanding(), "slot 3's sweep confirmed");
+    assert_eq!(
+        (d.ledger().slot_resting(3), d.ledger().slot_resting(4)),
+        (0, 1),
+        "slot 3's row released; slot 4's order and row stay"
+    );
+    assert!(!d.halt().is_halted(4));
+    {
+        let posts = v.posts.lock().expect("posts");
+        assert_eq!(
+            posts.len(),
+            4,
+            "two places, one read, ONE cancel: {posts:?}"
+        );
+        assert!(posts[2].contains("frontendOpenOrders"), "{}", posts[2]);
+        assert!(
+            posts[3].contains("\"type\":\"cancel\"") && posts[3].contains("\"o\":424242"),
+            "{}",
+            posts[3]
+        );
+        assert!(
+            !posts[3].contains("424244"),
+            "slot 4's oid was never cancelled: {}",
+            posts[3]
+        );
+    }
+    let c = *d.live().a().counters();
+    assert_eq!((c.sweeps_run, c.sweep_cancelled), (1, 1));
+    assert_eq!((c.sweep_left, c.cancel_all_unqueued), (0, 0));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// **XMM XH4f — slot 6 outermost, on its own arm.** The Hyperliquid
 /// gateway's engine half (`HlGatewayArm`) behind `SlotSplit(6,
 /// NullLiveDispatcher, arm)` — the shape the engine boots for slot 6
