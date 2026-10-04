@@ -3676,6 +3676,244 @@ fn xmm_member_requote_replaced_and_stale_pull_are_zero_alloc() {
     assert_eq!(bytes, 0, "xmm member branches bytes should be zero: saw {bytes}");
 }
 
+/// **XMM gate 75e (XH5d-2)** — the A/B arms: the block's clock (the
+/// follower's venue time) alternating A and B every cycle; under `ab_mode`
+/// 1 a bid decided in arm B pulled on half θ (a −0.3 bps leader move that
+/// arm A's bid rides out); under `ab_mode` 3 both quotes decided in arm B
+/// taking their size-only modify, a lot down then back, each a floor after
+/// the last change, then no more — and, every third arm-B cycle, the bid's
+/// touch moving after its lot down (its requote ends the step), another
+/// the bid's lot down refused (the step ends) — allocate nothing.
+#[test]
+fn xmm_member_ab_arms_are_zero_alloc() {
+    use core_types::{
+        CancelReq, Order, OrderEvent, Side, ORDER_EVENT_CANCELED,
+        ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_REPLACED, ORDER_EVENT_RESTING,
+    };
+    use strategy_core::{Ctx, Strategy, StrategyCounters, SubmitErr};
+
+    /// The live id and price by side (a placement's, then each modify's);
+    /// the modifies sorted — the same price (size-only) or a new one (a
+    /// requote); and one refusal when asked.
+    struct AbCtx {
+        now: u64,
+        live: [u64; 2],
+        px: [i64; 2],
+        size_only: u64,
+        repriced: u64,
+        refuse: bool,
+    }
+    impl Ctx for AbCtx {
+        fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
+            let s = usize::from(o.side == Side::Ask);
+            self.live[s] = o.client_oid;
+            self.px[s] = o.px.raw();
+            Ok(())
+        }
+        fn cancel(&mut self, _r: CancelReq) -> Result<(), SubmitErr> {
+            Ok(())
+        }
+        fn modify(&mut self, _prev: u64, o: Order) -> Result<(), SubmitErr> {
+            if self.refuse {
+                self.refuse = false;
+                return Err(SubmitErr::RingFull);
+            }
+            let s = usize::from(o.side == Side::Ask);
+            if o.px.raw() == self.px[s] {
+                self.size_only += 1;
+            } else {
+                self.repriced += 1;
+            }
+            self.live[s] = o.client_oid;
+            self.px[s] = o.px.raw();
+            Ok(())
+        }
+        fn now_ns(&self) -> u64 {
+            self.now
+        }
+    }
+
+    let hl = core_types::make_symbol_id(VenueId::Hyperliquid, 5);
+    let bn = core_types::make_symbol_id(VenueId::Binance, 9);
+    let mut xp = strategy_xmm::XmmParams::EMPTY;
+    xp.perps[0] = strategy_xmm::XmmPerp {
+        hl_sym: hl,
+        lead_sym: bn,
+        lot_1e6: 10_000,
+    };
+    xp.n_perps = 1;
+    xp.maker_enabled = 1;
+    xp.theta_bps_1e6 = 500_000;
+    xp.gate_window_ms = 1;
+    xp.lifetime_ms = 30_000;
+    xp.lead_stale_ms = 300;
+    xp.follower_stale_ms = 2_000;
+    xp.rtt_pull_ms = 1_500;
+    xp.requote_min_ms = 250;
+    xp.clip_usd_1e6 = 15_000_000;
+    xp.inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.gross_inv_cap_usd_1e6 = 1_000_000_000_000;
+    xp.resting_cap_usd_1e6 = 1_000_000_000_000;
+    xp.ab_mode = 1;
+    let mut theta = strategy_xmm::XmmStrategy::new();
+    theta.configure(&xp).expect("gate 75e θ params");
+    xp.ab_mode = 3;
+    let mut size = strategy_xmm::XmmStrategy::new();
+    size.configure(&xp).expect("gate 75e size params");
+    let t0: u64 = 1_000_000_000_000;
+    let mut tc = AbCtx {
+        now: t0,
+        live: [0; 2],
+        px: [0; 2],
+        size_only: 0,
+        repriced: 0,
+        refuse: false,
+    };
+    let mut sc = AbCtx {
+        now: t0,
+        live: [0; 2],
+        px: [0; 2],
+        size_only: 0,
+        repriced: 0,
+        refuse: false,
+    };
+    theta.on_start(&mut tc).expect("gate 75e θ start");
+    size.on_start(&mut sc).expect("gate 75e size start");
+    let book = |sym: u32, bid: i64, ask: i64, stale: bool| {
+        let mut t = Tick::new(
+            0,
+            if sym == hl {
+                VenueId::Hyperliquid
+            } else {
+                VenueId::Binance
+            },
+            sym,
+            0,
+            Price::from_raw(bid),
+            Qty::from_raw(1_000_000),
+            Price::from_raw(ask),
+            Qty::from_raw(1_000_000),
+        );
+        if stale {
+            t.flags |= core_types::TICK_FLAG_STALE;
+        }
+        t
+    };
+    let lead = book(bn, 99_990_000, 100_010_000, false);
+    // The leader's bid + ask from 200 000 000 to 199 994 000: −0.3 bps.
+    let lead_dn = book(bn, 99_987_000, 100_007_000, false);
+    let lead_stale = book(bn, 99_990_000, 100_010_000, true);
+    let fol = book(hl, 99_990_000, 100_010_000, false);
+    // The follower's bid touch half a tick up: the bid requotes.
+    let fol_up = book(hl, 99_995_000, 100_010_000, false);
+    let ev = |oid: u64, kind: u8, reason: u8| {
+        OrderEvent::new(0, VenueId::Hyperliquid, hl, oid, 6, kind, reason, 0)
+    };
+    let pulled = ORDER_EVENT_REASON_CANCEL_REQUESTED;
+
+    // A multiple of 6: the three arm-B variants run equally often.
+    const CYCLES: u64 = 12_000;
+    const MS: u64 = 1_000_000;
+    let g = AllocGuard::new();
+    let mut i = 0u64;
+    while i < CYCLES {
+        // Cycle i is in block i: even A, odd B.
+        let mut f = fol;
+        f.venue_time_ms = i * strategy_xmm::XMM_AB_BLOCK_MS + 1;
+        let mut fu = fol_up;
+        fu.venue_time_ms = f.venue_time_ms;
+        // `ab_mode` 1: both sides placed in the block's arm; the leader
+        // falls 0.3 bps (arm B's bid pulls, arm A's rests) and comes back;
+        // a stale leader tick pulls what rests.
+        tc.now = t0 + i * 1_000 * MS;
+        theta.on_tick(&lead, &mut tc);
+        theta.on_tick(&f, &mut tc);
+        let placed = tc.live;
+        theta.on_order_event(&ev(placed[0], ORDER_EVENT_RESTING, 0), &mut tc);
+        theta.on_order_event(&ev(placed[1], ORDER_EVENT_RESTING, 0), &mut tc);
+        tc.now += 10 * MS;
+        theta.on_tick(&lead_dn, &mut tc);
+        tc.now += 10 * MS;
+        theta.on_tick(&lead, &mut tc);
+        theta.on_tick(&lead_stale, &mut tc);
+        theta.on_order_event(&ev(placed[0], ORDER_EVENT_CANCELED, pulled), &mut tc);
+        theta.on_order_event(&ev(placed[1], ORDER_EVENT_CANCELED, pulled), &mut tc);
+        // `ab_mode` 3: both sides placed; three steps 300 ms apart (past
+        // the 250 ms floor), the leader fresh at each. In arm B: a lot
+        // down, then back, then nothing — or (i ≡ 3 mod 6) the bid's touch
+        // up after its lot down, its requote ending the step; or (i ≡ 5)
+        // the bid's lot down refused. A stale leader tick pulls both.
+        sc.now = t0 + i * 1_000 * MS;
+        size.on_tick(&lead, &mut sc);
+        size.on_tick(&f, &mut sc);
+        let mut live = sc.live;
+        size.on_order_event(&ev(live[0], ORDER_EVENT_RESTING, 0), &mut sc);
+        size.on_order_event(&ev(live[1], ORDER_EVENT_RESTING, 0), &mut sc);
+        sc.refuse = i % 6 == 5;
+        let mut step = 0;
+        while step < 3 {
+            sc.now += 300 * MS;
+            size.on_tick(&lead, &mut sc);
+            size.on_tick(if i % 6 == 3 && step > 0 { &fu } else { &f }, &mut sc);
+            let mut s = 0usize;
+            while s < 2 {
+                if sc.live[s] != live[s] {
+                    let replaced = ORDER_EVENT_REASON_REPLACED;
+                    size.on_order_event(&ev(live[s], ORDER_EVENT_CANCELED, replaced), &mut sc);
+                    size.on_order_event(&ev(sc.live[s], ORDER_EVENT_RESTING, 0), &mut sc);
+                    live[s] = sc.live[s];
+                }
+                s += 1;
+            }
+            step += 1;
+        }
+        size.on_tick(&lead_stale, &mut sc);
+        size.on_order_event(&ev(live[0], ORDER_EVENT_CANCELED, pulled), &mut sc);
+        size.on_order_event(&ev(live[1], ORDER_EVENT_CANCELED, pulled), &mut sc);
+        i += 1;
+    }
+
+    let (allocs, bytes, _deallocs) = g.delta();
+    let (t, s) = (theta.counters(), size.counters());
+    assert_eq!(t.placed, 2 * CYCLES, "θ: both sides every cycle");
+    assert_eq!(
+        t.lead_cancels,
+        CYCLES / 2,
+        "θ: arm B's bid pulled on half θ, arm A's rested"
+    );
+    assert_eq!(
+        t.pull_cancels,
+        3 * CYCLES / 2,
+        "θ: the stale pull took what rested"
+    );
+    assert_eq!(s.placed, 2 * CYCLES, "size: both sides every cycle");
+    // Per arm-B cycle: 4 size-only (down and back, both sides); 3 and a
+    // requote (the bid's back replaced by its requote); 2 and a refusal
+    // (the bid's down refused, the ask's down and back).
+    let b = CYCLES / 6;
+    assert_eq!(
+        (sc.size_only, sc.repriced, s.ctx_refused),
+        (b * (4 + 3 + 2), b, b),
+        "size: the size-only modifies, the requotes ending a step, the refusals"
+    );
+    assert_eq!(s.modifies, sc.size_only + sc.repriced);
+    assert_eq!(
+        StrategyCounters::orders_emitted(&size),
+        s.placed + s.modifies
+    );
+    assert_eq!(s.pull_cancels, 2 * CYCLES, "size: the stale pull took both");
+    assert_eq!((tc.size_only, tc.repriced), (0, 0), "θ: no modify");
+    assert_eq!((t.stuck, t.unmatched, s.stuck, s.unmatched), (0, 0, 0, 0));
+    assert_eq!(
+        allocs, 0,
+        "the xmm A/B arms allocated {allocs} times ({bytes} B)"
+    );
+    assert_eq!(
+        bytes, 0,
+        "the xmm A/B arms bytes should be zero: saw {bytes}"
+    );
+}
+
 /// **XMM gate 75d (XH4f)** — the member's health branches (D8): a
 /// blocked live path pulling both sides and holding, answers slower than
 /// `rtt_pull_ms` pulling, a throttled arm pulling on the timer's pass, and

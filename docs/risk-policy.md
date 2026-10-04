@@ -9871,6 +9871,63 @@ rustfmt clean on touched hunks.
 **Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
 zero-copy APPROVE (round 3).
 
+### XH5d-2 amendment (2026-10-04): the A/B arms — θ, and the size-only modify
+
+The second part of XH5d (plan §3.4 item 2; A-S7-21). Nothing is armed, and
+`ab_mode` 0 — the example's and the paper artifact's — quotes exactly as
+before: no arm, the artifact's θ, no size-only modify.
+
+- **The block.** An A/B block is 600 000 ms of the follower's venue time
+  (the last fresh bbo's `time`): the arm is (venue ms ÷ 600 000) mod 2 —
+  even A, odd B; before the first venue time, A. Both arms see the same
+  market mix; the arm is a function of time alone, stated in the boot tell
+  (`ab_arms=`).
+- **`ab_mode` 1 — θ.** Arm B decides with half the artifact's θ (A-S7-23:
+  no new key — the probe's 0.5 bps gives 0.25): a second multiplier pair
+  from `configure`. The gate uses the block's pair at placement; a quote
+  remembers the arm its price was decided in, and its LEAD cancel uses that
+  arm's pair — a quote decided in A keeps A's rule into a B block.
+- **`ab_mode` 3 — the size-only modify.** A quote decided in arm B and
+  resting at the touch is modified one lot down, then — once that rests —
+  one lot back, and no more: the same modify path (a fresh oid each, the
+  TTL inherited, LAW E-7), paced as a requote (no sooner than
+  `requote_min` after the quote's last change; four floors under a busy
+  arm) and counted in `orders_emitted`. A size the venue would refuse
+  (under a lot, or under its $10 minimum), one the member's caps would not
+  take — either step: a modify sets the replacement's whole size, whatever
+  of the original filled — or a refused modify ends the step. A requote to
+  a new price is a new decision (its arm now) and ends a half-done step.
+  Off under the parity switch (`sim_parity` 1, whose requotes are cancels
+  and fresh orders).
+- **`ab_mode` 2** is tagged with its arms and quotes as 0 until XH5d-3.
+- **The record.** `Order.ab_arm` (byte 43, out of `_pad1`: wire-additive —
+  every capture written before reads as none): 0 none, 1 A, 2 B, in
+  `engine-orders.pmlr`. No execution path reads it.
+- **Risk.** The arms change only which θ decides and, in arm B under
+  `ab_mode` 3, at most two extra modifies a placement — every one through
+  the member's caps and pacing, the router's caps, the request budget and
+  the halt, as a requote; the ledger, the caps and the halt are untouched.
+  Arm B's half θ cancels on smaller leader moves: more LEAD cancels (and
+  requests) in B blocks — what the A/B measures.
+- **Copies:** none new (`with_ab_arm` is a const by-value builder on the
+  order built in place, as `with_post_only`).
+
+**Tests:** the block (the follower's venue time; none yet: A) and arm B's
+half θ (its multipliers the square roots of A's); arm B's LEAD cancel at a
+−0.3 bps leader move (between θ/2 and θ) while arm A's quote rests; arm B's
+size-only modify — down, back, once, each a floor after the last change —
+and none in arm A or under the parity switch; the boot tell's `ab_arms`;
+gate 75e — both arms, alternating every cycle, under `ab_mode` 1 (arm B's
+half-θ pull) and 3 (arm B's size-only modifies, a requote ending a step, a
+refused modify), at 0 B.
+
+**Gates:** clippy 0; nextest 4 189/4 189; alloc 109 (+3 ignored; gate 75e
+new) at 0 B; copy-audit 31, new 0; license OK (662); release OK; replay
+7× IDENTICAL; rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 2).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

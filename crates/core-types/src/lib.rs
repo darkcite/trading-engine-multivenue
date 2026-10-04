@@ -933,8 +933,13 @@ pub struct Order {
     /// is the id the record's own order carries (0 for a cancel,
     /// which creates no order).
     pub verb: u8,
+    /// XMM XH5d: the A/B arm the order was decided in — `0` none, `1` A,
+    /// `2` B (the measurement's split; no execution path reads it).
+    /// Wire-additive: it was explicit zeroed padding, so every capture
+    /// written before reads as none.
+    pub ab_arm: u8,
     /// Reserved.
-    _pad1: [u8; 5],
+    _pad1: [u8; 4],
     /// Time-to-live relative to `ts_ns`; 0 = none (I1, 2026-09-03 —
     /// docs/wire-format.md). A MODEL field: the offline fill law
     /// cancels the order at the first record of its sym at/after
@@ -1019,7 +1024,8 @@ impl Order {
             venue: venue as u8,
             strategy_id: STRATEGY_ID_NONE,
             verb: ORDER_VERB_PLACE,
-            _pad1: [0; 5],
+            ab_arm: 0,
+            _pad1: [0; 4],
             ttl_ns: 0,
             prev_client_oid: 0,
         }
@@ -1057,6 +1063,15 @@ impl Order {
     #[must_use]
     pub const fn with_post_only(mut self) -> Self {
         self.flags |= ORDER_FLAG_POST_ONLY;
+        self
+    }
+
+    /// XMM XH5d: the same order, tagged with the A/B arm it was decided in
+    /// (`0` none, `1` A, `2` B).
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_ab_arm(mut self, arm: u8) -> Self {
+        self.ab_arm = arm;
         self
     }
 
@@ -1989,7 +2004,11 @@ const _: () = {
     assert!(::core::mem::offset_of!(OrderEvent, kind) == 30);
     assert!(::core::mem::offset_of!(OrderEvent, reason) == 31);
     assert!(::core::mem::offset_of!(OrderEvent, _pad) == 32);
-    // XMM XH5d: the fill's venue trade id, pinned with the doc's table.
+    // XMM XH5d: the order's A/B arm and the fill's venue trade id, pinned
+    // with the doc's tables.
+    assert!(::core::mem::offset_of!(Order, verb) == 42);
+    assert!(::core::mem::offset_of!(Order, ab_arm) == 43);
+    assert!(::core::mem::offset_of!(Order, _pad1) == 44);
     assert!(::core::mem::offset_of!(Fill, order_id) == 32);
     assert!(::core::mem::offset_of!(Fill, tid) == 40);
     assert!(::core::mem::offset_of!(Fill, _pad1) == 48);
@@ -4763,9 +4782,10 @@ mod tests {
         // Fill: 8+4+1+1+1+1+8+8+8+8+8+8 = 64 (X1: +strategy_id, +origin;
         //       E4: +flags, which took the last explicit pad byte; XMM
         //       XH5d: +tid, out of `_pad1`).
-        // Order: 8+4+1+1+1+1+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
+        // Order: 8+4+1+1+1+1+8+8+8+1+1+1+1+4+8+8 = 64 (M4.1:
         //        +strategy_id; E5: +verb, +prev_client_oid; XMM XH1:
-        //        +flags — all out of the explicit padding).
+        //        +flags; XMM XH5d: +ab_arm — all out of the explicit
+        //        padding).
         // TradePrint: 8+8+8+8+8+4+1+1+18 = 64 (XMM XH1).
         // OrderEvent: 8+8+8+4+1+1+1+1+32 = 64 (XMM XH1).
         assert_eq!(::core::mem::size_of::<Tick>(), 64);

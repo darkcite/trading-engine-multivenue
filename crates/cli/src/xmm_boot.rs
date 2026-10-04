@@ -162,7 +162,8 @@ pub fn render_boot_tell(boot: &XmmBoot) -> String {
         "xmm: artifact configured hash={hex} path={} coins={} maker_enabled={} theta_bps_1e6={} \
          gate_window_ms={} lifetime_ms={} clip_usd_1e6={} inv_cap_usd_1e6={} \
          gross_inv_cap_usd_1e6={} resting_cap_usd_1e6={} lead_stale_ms={} follower_stale_ms={} \
-         rtt_pull_ms={} requote_min_ms={} alo_priority_1e8={} ab_mode={} phase=XH3(paper)",
+         rtt_pull_ms={} requote_min_ms={} alo_priority_1e8={} ab_mode={} ab_arms={} \
+         phase=XH3(paper)",
         boot.path.display(),
         boot.coins.join(","),
         p.maker_enabled,
@@ -179,7 +180,19 @@ pub fn render_boot_tell(boot: &XmmBoot) -> String {
         p.requote_min_ms,
         p.alo_priority_1e8,
         p.ab_mode,
+        ab_arms(p.ab_mode),
     )
+}
+
+/// XMM XH5d: what `ab_mode` quotes, for the boot tell — the block function
+/// stated (one token: the tell is `key=value` words).
+fn ab_arms(mode: u8) -> &'static str {
+    match mode {
+        1 => "theta:A=artifact,B=half;block=(follower_venue_ms/600000)%2,even=A",
+        2 => "alo_priority:quotes_as_0_until_XH5d-3",
+        3 => "size_only_modify:B=one_lot_down_then_back;block=(follower_venue_ms/600000)%2,even=A",
+        _ => "off",
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +248,10 @@ mod tests {
         assert!(tell.contains("coins=BTC,ETH,SOL,XRP"), "{tell}");
         assert!(tell.contains("clip_usd_1e6=15000000"), "{tell}");
         assert!(tell.starts_with("xmm: artifact configured hash="), "{tell}");
+        // XMM XH5d: the arms stated (the example quotes as 0).
+        assert!(tell.contains("ab_mode=0 ab_arms=off "), "{tell}");
+        assert!(super::ab_arms(1).contains("block=(follower_venue_ms/600000)%2,even=A"));
+        assert!(!super::ab_arms(3).contains(' '), "one token");
     }
 
     #[test]
