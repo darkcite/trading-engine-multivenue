@@ -41,12 +41,16 @@
 //!
 //! ## Allocation note (doctrine)
 //!
-//! This module runs **at boot only**, where allocation is allowed.
-//! Storage is four `Vec`s reserved once at [`HlDiscovery::new`] and
-//! capped at the `HL_DISCOVERY_*_CAP` limits (fail-fast beyond — a
-//! venue suddenly listing 10× assets is a contract change we want to
-//! see loudly). The table is dropped before the engine loop starts;
-//! nothing here is reachable from a hot path.
+//! This module runs **at boot**, where allocation is allowed, and on
+//! one cold path after it: the HL ingress thread's family rediscovery
+//! between sessions (the lane dark, at most once a minute while a
+//! family awaits its successor — `rediscover_hl_families`). Storage is
+//! six `Vec`s reserved once at [`HlDiscovery::new`] and capped at the
+//! `HL_DISCOVERY_*_CAP` limits (fail-fast beyond — a venue suddenly
+//! listing 10× assets is a contract change we want to see loudly; XMM
+//! XH5e-3 sized them for testnet's 2026-10-04 lists, ≈ 438 KiB reserved
+//! a table). Each table is dropped where it was built; nothing here is
+//! reachable from a hot path.
 //!
 //! ## Wire shapes (live-probed 2026-08-14)
 //!
@@ -85,13 +89,17 @@ use crate::HL_COIN_MAX;
 pub const HL_DISCOVERY_PERPS_CAP: usize = 2048;
 
 /// Hard cap on HIP-4 outcome rows (`outcomeMeta.outcomes`). Live
-/// 2026-08-14: 8 rows (protocol-run BTC dailies — permissionless
-/// deployment is testnet-only); headroom for mainnet opening up.
-pub const HL_DISCOVERY_OUTCOMES_CAP: usize = 512;
+/// 2026-08-14: 8 rows (protocol-run BTC dailies). 2026-10-04: 305 on
+/// mainnet (permissionless deployment opened up) and 633 on testnet —
+/// past the old 512, which refused the testnet boot and would refuse
+/// mainnet's as it grows (XMM XH5e-3). 4 096: over 6× testnet's count.
+pub const HL_DISCOVERY_OUTCOMES_CAP: usize = 4096;
 
 /// Hard cap on `perpDexs` entries (including the leading `null`
 /// native slot) and on stored dex names. Live 2026-08-14: 10 entries.
-pub const HL_DISCOVERY_DEXS_CAP: usize = 64;
+/// 2026-10-04: 11 on mainnet, 268 on testnet — past the old 64, which
+/// refused the testnet boot (XMM XH5e-3). 1 024: over 3× testnet's.
+pub const HL_DISCOVERY_DEXS_CAP: usize = 1024;
 
 /// Hard cap on spot universe rows (`spotMeta.universe`). Live
 /// 2026-08-14: 324 rows.
@@ -205,7 +213,8 @@ impl HlAssetInfo {
     }
 }
 
-/// Boot-only Hyperliquid asset table. See module docs.
+/// Hyperliquid asset table, built at boot and by the ingress thread's
+/// cold rediscovery. See module docs.
 ///
 /// Build once at boot: [`HlDiscovery::new`], then one ingest call per
 /// fetched `POST /info` body. Native-perp asset ids are **positions**
@@ -660,6 +669,12 @@ impl HlDiscovery {
     /// allocate by doctrine (module docs).
     #[must_use]
     pub fn outcome_specs(&self) -> Vec<HlOutcomeSpec> {
+        // COPY: cold — every known-grammar outcome spec (64 B) into the
+        // caller's own table, at most HL_DISCOVERY_OUTCOMES_CAP × 64 B =
+        // 256 KiB, once a boot and once a rediscovery (at most a minute
+        // apart, the lane dark). Rejected: handing the rows over by move
+        // (they sit beside their id and side count; a second layout for
+        // a cold path).
         let mut out = Vec::with_capacity(self.outcomes.len());
         for (_id, _sides, spec) in &self.outcomes {
             if spec.grammar != HlOutcomeGrammar::Unknown {
@@ -1823,6 +1838,24 @@ mod tests {
             d.ingest_perp_dexs(b"[null,").unwrap_err(),
             HlDiscoveryErr::Truncated
         );
+    }
+
+    /// XMM XH5e-3: the venue's live sizes of 2026-10-04 parse — testnet's
+    /// 268 `perpDexs` entries and 633 outcome rows (both past the old caps,
+    /// which refused the testnet boot).
+    #[test]
+    fn the_live_testnet_sizes_of_2026_10_04_parse() {
+        let mut d = HlDiscovery::new();
+        let dexs = synth_body(b"[", b"null", 268, b"]");
+        assert_eq!(d.ingest_perp_dexs(&dexs).expect("268 entries"), 268);
+        let mut d = HlDiscovery::new();
+        let outcomes = synth_body(
+            br#"{"outcomes":["#,
+            br#"{"outcome":1,"sideSpecs":[]}"#,
+            633,
+            br#"]}"#,
+        );
+        assert_eq!(d.ingest_outcome_meta(&outcomes).expect("633 rows"), 633);
     }
 
     #[test]
