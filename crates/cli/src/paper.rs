@@ -48,13 +48,13 @@ use core_ring::{Consumer, Producer, Ring};
 use core_time::now_ns;
 use core_types::{
     make_symbol_id, AiCmd, Capture, ChannelEvent, DepthTopK, Fill, NsTs, OptSummary, Order,
-    RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE, DEPTH_RING_SIZE,
-    EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
+    OrderEvent, RuleTableSlot, Signal, SymbolId, Tick, TradePrint, VenueId, AI_RING_SIZE,
+    DEPTH_RING_SIZE, EVENT_LANE_ASSET_CTX, EVENT_LANE_FUNDING, EVENT_RING_SIZE, OPT_RING_SIZE,
     RULE_TABLE_RING_SLOTS, TRADE_RING_SIZE,
 };
 use engine::{
-    Engine, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE, NUM_FILL_LANES, NUM_TICK_LANES,
-    SIGNAL_RING_SIZE, TICK_RING_SIZE,
+    Engine, ENGINE_EVENTS_FILE, ENGINE_FILLS_FILE, ENGINE_ORDERS_FILE, FILL_RING_SIZE,
+    NUM_FILL_LANES, NUM_TICK_LANES, SIGNAL_RING_SIZE, TICK_RING_SIZE,
 };
 use engine_snapshot::{BootInfo, EngineSnapshot, SnapshotCell, SNAPSHOT_VENUES};
 use ingress_ai::{AiCmdCapture, AiIngressCfg, RulesetSidePath};
@@ -2884,6 +2884,18 @@ pub fn open_orders_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapt
     SlotCapture::open(run_dir.join(ENGINE_ORDERS_FILE), SlotKind::Order, epoch_ns)
 }
 
+/// Open XMM XH5d's engine-thread order-event capture
+/// (`<run_dir>/engine-events.pmlr`, `SlotKind::OrderEvent`). Boot-only;
+/// the bin hands the result to [`Observability::with_events_capture`] and
+/// the engine loop takes ownership from there.
+pub fn open_events_capture(run_dir: &Path, epoch_ns: u64) -> io::Result<SlotCapture<OrderEvent>> {
+    SlotCapture::open(
+        run_dir.join(ENGINE_EVENTS_FILE),
+        SlotKind::OrderEvent,
+        epoch_ns,
+    )
+}
+
 /// Parse `AI_INGRESS_HMAC_KEY` (64 hex chars) into the 32-byte HMAC
 /// key (Phase 8f §4.1). The error strings deliberately carry **no key
 /// material** — this value must never reach a log. Returns `Err` on
@@ -4389,6 +4401,15 @@ impl Observability {
                     .map_err(|_| "register engine_orders_capture_records")?;
                 CaptureGaugeIds { io_errors, records }
             };
+            let events_capture = {
+                let io_errors = reg
+                    .register_gauge("engine_events_capture_io_errors")
+                    .map_err(|_| "register engine_events_capture_io_errors")?;
+                let records = reg
+                    .register_gauge("engine_events_capture_records")
+                    .map_err(|_| "register engine_events_capture_records")?;
+                CaptureGaugeIds { io_errors, records }
+            };
 
             // COPY: the registry (147 520 B, pinned in core-metrics) moved
             // from this stack into its `Arc`, once at boot — rejected: an
@@ -4465,6 +4486,7 @@ impl Observability {
                 capture_ai,
                 fills_capture,
                 orders_capture,
+                events_capture,
                 strategy_enabled_mask,
                 vm,
                 xmm,
@@ -4625,6 +4647,10 @@ pub struct Observability {
     /// as `fills_capture` (bin opens, engine loop takes ownership).
     /// `None` in tests and in tools that replay rather than run.
     pub orders_capture: Option<SlotCapture<Order>>,
+    /// XMM XH5d: the engine-thread order-event capture, same lifecycle as
+    /// `fills_capture` (bin opens, engine loop takes ownership). `None` in
+    /// tests and in tools that replay rather than run.
+    pub events_capture: Option<SlotCapture<OrderEvent>>,
     /// VRP V8a: where the VRP member's persisted state is written.
     /// `None` = no VRP member is configured, and the engine writes
     /// nothing. Set by the set builder from the boot bundle.
@@ -4702,6 +4728,15 @@ impl Observability {
         self
     }
 
+    // COPY: every `with_*` builder here (the latency dump, the three
+    // captures — fills, orders, XMM XH5d's events — the boot info, …) moves
+    // this `Observability` by value, once each at boot (KiB-scale:
+    // `counter_ids` inline), and a capture's `SlotCapture` handle with it
+    // (its 64 KiB staging is boxed — the move is the handle, not the
+    // buffer); `take()` then hands each capture to `Engine::set_*_capture`.
+    // Never on a tick. Rejected: `&mut self` setters — a second API for a
+    // once-per-boot move.
+
     /// Attach the engine-thread fills capture (Phase 8f item 6).
     /// Boot-only; called from the bin after the per-run capture
     /// directory exists.
@@ -4715,6 +4750,13 @@ impl Observability {
     /// directory exists.
     pub fn with_orders_capture(mut self, cap: SlotCapture<Order>) -> Self {
         self.orders_capture = Some(cap);
+        self
+    }
+
+    /// Attach XMM XH5d's engine-thread order-event capture. Boot-only;
+    /// called from the bin after the per-run capture directory exists.
+    pub fn with_events_capture(mut self, cap: SlotCapture<OrderEvent>) -> Self {
+        self.events_capture = Some(cap);
         self
     }
 
@@ -4902,6 +4944,10 @@ pub struct EngineCounters {
     /// (`engine_orders_capture_{io_errors,records}`). Mirrored
     /// centrally from the engine loop like the fills pair.
     pub orders_capture: CaptureGaugeIds,
+    /// XMM XH5d capture-health gauges, engine-thread order-event capture
+    /// (`engine_events_capture_{io_errors,records}`). Mirrored centrally
+    /// from the engine loop like the fills pair.
+    pub events_capture: CaptureGaugeIds,
     /// Phase-8g §9: the set's live enable mask
     /// (`engine_strategy_enabled_mask` — the G0 demo finding: the
     /// flip was only inferable from order-flow deltas). Read via the
@@ -8899,6 +8945,10 @@ where
     if let Some(cap) = obs.orders_capture.take() {
         eng.set_order_capture(cap);
     }
+    // XMM XH5d: and the order-event capture.
+    if let Some(cap) = obs.events_capture.take() {
+        eng.set_event_capture(cap);
+    }
     // XMM XH4f (D11): slot 6's gateway-arm tell — what the last run left
     // unconfirmed, read back once (a gauge and an ERROR line); then written
     // anew: it stands until THIS run's shutdown confirms (`gateway_shutdown_
@@ -9181,6 +9231,7 @@ where
             // not an observability option.
             eng.maybe_flush_fill_capture(now);
             eng.maybe_flush_order_capture(now);
+            eng.maybe_flush_event_capture(now);
             // F21: and the members' own persisted state, for the same
             // reason. It used to sit inside `if let (Some(reg),
             // Some(ids)) = (obs.metrics, obs.counter_ids)`, which made
@@ -9461,6 +9512,11 @@ where
                     .set(eng.order_capture_io_errors() as i64);
                 reg.gauge(ids.orders_capture.records)
                     .set(eng.order_capture_records() as i64);
+                // XMM XH5d order-event capture pair — same central mirror.
+                reg.gauge(ids.events_capture.io_errors)
+                    .set(eng.event_capture_io_errors() as i64);
+                reg.gauge(ids.events_capture.records)
+                    .set(eng.event_capture_records() as i64);
 
                 // Max tick age — surfaces silenced markets.
                 reg.gauge(ids.max_tick_age_ns)
@@ -12301,7 +12357,8 @@ mod tests {
         // XMM XH4f: 518 counters and 407 gauges here — slot 6's gateway
         // family (65 + 28) took the worst case past 512 / 384; XH5a adds
         // one counter (519); XMM XH5b-2 two counters and five gauges
-        // (521 / 412).
+        // (521 / 412); XH5c-2 three and three (524 / 415); XH5c-3 two
+        // gauges (417); XH5d-1 two gauges (419).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");

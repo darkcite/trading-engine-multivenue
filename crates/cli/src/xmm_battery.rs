@@ -357,8 +357,10 @@ pub struct Measured {
     pub read_lagged_ack: (u32, u32),
     /// How long after the acknowledgement those reads were answered, ms.
     pub read_after_ack_ms: Spread,
-    /// The tap's `open` row against the arm's `RESTING`, ms (positive: the
-    /// row came later).
+    /// The tap's `open` row against the arm's first `RESTING` of the order,
+    /// ms (positive: the row came later). XMM XH5d: a row after the answer
+    /// repeats the RESTING with the venue's time — about zero against its
+    /// own row, so the repeat is not sampled.
     pub open_row_lag_ms: Spread,
     /// The tap's `canceled` row against the arm's `CANCELED`, ms.
     pub cancel_row_lag_ms: Spread,
@@ -2211,12 +2213,14 @@ fn measure(run: &mut Run<'_>, rows: &[TapRow], failed: bool) {
             m.modify_original_canceled.0 += 1;
         }
     }
-    // The rows' lag behind the arm's events.
+    // The rows' lag behind the arm's events: an order's first RESTING only
+    // (XMM XH5d: the repeat a later `open` row brings is not a landing).
     let mut open = Vec::new();
     let mut canceled = Vec::new();
+    let mut rested = std::collections::HashSet::new();
     for (t, e) in &run.drive.events {
         let want = match e.kind {
-            ORDER_EVENT_RESTING => EV_RESTING,
+            ORDER_EVENT_RESTING if rested.insert(e.client_oid) => EV_RESTING,
             ORDER_EVENT_CANCELED => EV_CANCELED,
             _ => continue,
         };

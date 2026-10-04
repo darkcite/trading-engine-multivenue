@@ -97,6 +97,9 @@ pub enum SlotKind {
     /// [`core_types::ExecRecord`] — an execution arm's journal
     /// (BX6, `binance-exec.pmlr`).
     Exec = 8,
+    /// [`core_types::OrderEvent`] — the order-event lane, every slot's
+    /// (XMM XH5d, `engine-events.pmlr`).
+    OrderEvent = 9,
 }
 
 impl SlotKind {
@@ -133,6 +136,7 @@ impl SlotKind {
             6 => Some(Self::OptSummary),
             7 => Some(Self::Depth),
             8 => Some(Self::Exec),
+            9 => Some(Self::OrderEvent),
             _ => None,
         }
     }
@@ -291,6 +295,10 @@ mod tests {
         assert_eq!(SlotKind::from_u8(5), Some(SlotKind::Event));
         assert_eq!(SlotKind::from_u8(6), Some(SlotKind::OptSummary));
         assert_eq!(SlotKind::from_u8(7), Some(SlotKind::Depth));
+        assert_eq!(SlotKind::from_u8(8), Some(SlotKind::Exec));
+        // XMM XH5d: the order-event capture.
+        assert_eq!(SlotKind::from_u8(9), Some(SlotKind::OrderEvent));
+        assert_eq!(SlotKind::OrderEvent.slot_size(), 64);
         assert_eq!(SlotKind::from_u8(42), None);
     }
 

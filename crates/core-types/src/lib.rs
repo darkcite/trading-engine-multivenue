@@ -703,8 +703,14 @@ pub struct Fill {
     pub qty: Qty,
     /// Venue-assigned order ID (u64 for Polymarket CLOB).
     pub order_id: u64,
+    /// XMM XH5d: the venue's trade id, when it sends one (Hyperliquid's
+    /// `tid`) — the key a report matches its own fills against the
+    /// public prints by; `0` = none (paper, a venue without one).
+    /// Wire-additive: it was explicit zeroed padding, so every capture
+    /// written before reads as none.
+    pub tid: u64,
     /// Reserved.
-    _pad1: [u8; 16],
+    _pad1: [u8; 8],
     /// Explicit tail padding (see [`AsBytes`]). Always zero.
     _pad2: [u8; 8],
 }
@@ -730,9 +736,17 @@ impl Fill {
             px,
             qty,
             order_id,
-            _pad1: [0; 16],
+            tid: 0,
+            _pad1: [0; 8],
             _pad2: [0; 8],
         }
+    }
+
+    /// XMM XH5d: the same fill, with the venue's trade id.
+    #[inline(always)]
+    #[must_use]
+    pub const fn with_tid(self, tid: u64) -> Self {
+        Self { tid, ..self }
     }
 
     /// X1: the same fill, attributed. Used by the paper dispatcher,
@@ -1338,6 +1352,13 @@ unsafe impl AsBytes for Fill {}
 // SAFETY: Order has the same guarantees as Tick.
 unsafe impl AsBytes for Order {}
 
+// SAFETY: OrderEvent has the same guarantees as Tick — `#[repr(C,
+// align(64))]`, `Copy`, plain integers and an explicit `_pad` that sum to
+// exactly 64 bytes, every offset asserted beside its definition: no
+// compiler-inserted padding, every byte initialized. XMM XH5d: captured
+// (`engine-events.pmlr`).
+unsafe impl AsBytes for OrderEvent {}
+
 // SAFETY: ChannelEvent is `#[repr(C, align(64))]`, `#[derive(Copy)]`,
 // all fields plain integers + explicit `_pad` arrays summing to exactly
 // 64 bytes (checked by `channel_event_layout_is_fully_explicit`); no
@@ -1878,7 +1899,9 @@ pub struct OrderEvent {
     /// The client id of the order the event is about (LAW E-9's durable
     /// name; the engine never learns a venue oid).
     pub client_oid: u64,
-    /// Venue timestamp of the change in ms; 0 = unknown (paper).
+    /// Venue timestamp of the change in ms; 0 = unknown (paper, or a live
+    /// post's answer — XMM XH5d: the Hyperliquid arm then repeats the
+    /// RESTING once, with the `open` row's time).
     pub venue_time_ms: u64,
     /// The order's instrument.
     pub sym: SymbolId,
@@ -1966,6 +1989,10 @@ const _: () = {
     assert!(::core::mem::offset_of!(OrderEvent, kind) == 30);
     assert!(::core::mem::offset_of!(OrderEvent, reason) == 31);
     assert!(::core::mem::offset_of!(OrderEvent, _pad) == 32);
+    // XMM XH5d: the fill's venue trade id, pinned with the doc's table.
+    assert!(::core::mem::offset_of!(Fill, order_id) == 32);
+    assert!(::core::mem::offset_of!(Fill, tid) == 40);
+    assert!(::core::mem::offset_of!(Fill, _pad1) == 48);
     assert!(TRADE_RING_SIZE.is_power_of_two());
     assert!(ORDER_EVENT_RING_SIZE.is_power_of_two());
 };
@@ -4733,8 +4760,9 @@ mod tests {
         // compiler-inserted padding would break the AsBytes contract.
         // Tick: 8+4+4+8+8+8+8+1+1+6+8 = 64 (VT1: +flags, +venue_time_ms).
         // Signal: 8+4+1+1+2+40+8 = 64.
-        // Fill: 8+4+1+1+1+1+8+8+8+16+8 = 64 (X1: +strategy_id, +origin;
-        //       E4: +flags, which took the last explicit pad byte).
+        // Fill: 8+4+1+1+1+1+8+8+8+8+8+8 = 64 (X1: +strategy_id, +origin;
+        //       E4: +flags, which took the last explicit pad byte; XMM
+        //       XH5d: +tid, out of `_pad1`).
         // Order: 8+4+1+1+1+1+8+8+8+1+1+1+5+8+8 = 64 (M4.1:
         //        +strategy_id; E5: +verb, +prev_client_oid; XMM XH1:
         //        +flags — all out of the explicit padding).

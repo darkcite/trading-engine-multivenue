@@ -9812,6 +9812,65 @@ zero-copy APPROVE. Declined (optional): the battery's peak can still read
 one stale throttled report in the heartbeat after a socket comes up (the
 battery's evidence alone).
 
+### XH5d-1 amendment (2026-10-04): the measurement's record — every order event captured, the venue's time on a RESTING, the venue's trade id on a fill
+
+The first part of XH5d (plan §3.4 item 1; A-S7-21: XH5d in parts — the
+record; the A/B arms; the report, which lives in the vault). Nothing is
+armed, and no order path changes.
+
+- **`engine-events.pmlr`** (`SlotKind::OrderEvent` = 9, 64 B slots, in the
+  run's capture directory beside `engine-fills.pmlr` and
+  `engine-orders.pmlr`): every `OrderEvent` the engine drains — the
+  dispatcher's pump and the lane, every slot's — is staged BEFORE the
+  member sees it, as the fills are. The record is the event itself (kind,
+  reason, client oid, symbol, venue, slot, the venue's time): `OrderEvent`
+  gains `AsBytes` — its layout was already fully explicit, every offset
+  asserted. The bin opens it at boot (an open failure is fatal: capture is
+  the product); it flushes on the fills' 5 s cadence and drains at stop;
+  `engine_events_capture_{io_errors,records}` on `/metrics`. Synchronous on
+  the engine thread like the other two (a 64 KiB staging buffer; a full one
+  writes inline).
+- **The venue's time on a RESTING.** Hyperliquid's post answer carries no
+  time; the `orderUpdates` `open` row carries `statusTimestamp`. The arm's
+  RESTING carries the row's time when the row lands the order; when the
+  answer came first — the usual order — its RESTING went without a time,
+  and the row repeats it once, with the time (`RB_STAMPED`: once an order).
+  A member takes the repeat as a no-op (XMM's RESTING moves PENDING →
+  RESTING alone); the router passes events through. The measurement's ACK
+  time is an order's first RESTING with a venue time. A repeat is an event
+  wherever events are counted — the arm's `events`, the engine's
+  `order_events_dispatched`, the set's `order_events_unrouted` (a disabled
+  slot), XMM's `unmatched` (a repeat after the member's watchdog released
+  the side) — so on `/metrics` events outnumber orders by up to one a
+  post-only order: the repeat, not an anomaly. The testnet battery's
+  `open_row_lag_ms` samples an order's first RESTING alone.
+- **The venue's trade id on a fill.** `Fill.tid` (offset 40, out of
+  `_pad1`: wire-additive — every capture written before reads as none)
+  carries Hyperliquid's `tid` on the gateway arm's fills, 0 elsewhere: the
+  report's key for excluding our own prints from the public volume.
+- **Wire format:** `docs/wire-format.md` — `OrderEvent` captured, `Fill`'s
+  `tid`, the header's slot kinds 8 and 9.
+- **Copies:** one 64 B slot into the staging buffer an event (the
+  existing `SlotCapture::append`, as for fills and orders); at boot the
+  capture's handle moves by value through its builders once (noted, with
+  its two siblings').
+
+**Tests:** the slot kind (9, 64 B); the engine — both drains staged before
+the member, read back as written (the venue's time with it); the arm — a
+RESTING repeated once with the `open` row's time after the answer, the
+`open` row first carrying it in the only RESTING, a fill's trade id; the
+engine tick gate measures the capture inside its window (every drained
+event staged exactly once, 0 B); gate 98 runs both stamped paths in its
+window — an `open` row before the answer (its RESTING stamped) and one
+after it (the repeat).
+
+**Gates:** clippy 0; nextest 4 185/4 185; alloc 108 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK (662); release OK; replay 7× IDENTICAL;
+rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 2), allocation APPROVE (round 2),
+zero-copy APPROVE (round 3).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

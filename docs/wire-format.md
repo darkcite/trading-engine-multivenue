@@ -95,7 +95,7 @@ rebuilds the lane. A full ring drops the print and counts it
 |     45 |     1 | aggressor     | `u8`           | 0 = BUY (lifted the ask, HL `B`), 1 = SELL (hit the bid, HL `A`) |
 |     46 |    18 | _pad          | `[u8; 18]`     | explicit, zeroed (one cache line, the ring-slot law) |
 
-### `OrderEvent` — 64 bytes (XMM XH1, 2026-09-26; the order-event lane, never captured)
+### `OrderEvent` — 64 bytes (XMM XH1, 2026-09-26; the order-event lane; PMLR `slot_kind = 9` since XMM XH5d)
 
 One change in an order's venue-side state (`Ring<OrderEvent, 1024>`,
 engine `on_order_event`, drained after every fill source — the fill
@@ -105,6 +105,11 @@ booked before a member can act on an order event, LAW E6). Routed by
 slot is out of range or not enabled is counted
 (`StrategySet::order_events_unrouted`), never fanned out. XH1 adds the
 lane; the paper model (XH2) and the live gateway (XH4) are its producers.
+XMM XH5d captures every event the engine drains, every slot's, before the
+member sees it (`engine-events.pmlr`, `SlotKind::OrderEvent`); the
+Hyperliquid arm's RESTING carries the venue's time from the `open` row —
+repeated once, with it, when the post's answer (which carries none) came
+first (a member takes the repeat as a no-op).
 
 | offset | bytes | field         | type           | notes                                        |
 | -----: | ----: | ------------- | -------------- | -------------------------------------------- |
@@ -137,7 +142,8 @@ the same situation `Order.strategy_id` was in at M4.1.
 |     16 |     8 | px          | `i64` Price    | fixed-point ×1e6                                 |
 |     24 |     8 | qty         | `i64` Qty      | fixed-point ×1e6                                 |
 |     32 |     8 | order_id    | `u64`          | engine-assigned client oid                       |
-|     40 |    16 | _pad1       | `[u8; 16]`     | explicit, zeroed                                 |
+|     40 |     8 | tid         | `u64`          | XMM XH5d: the venue's trade id (Hyperliquid `tid`); 0 = none (paper) — was `_pad1`, explicit zeroed, so every capture written before reads as none |
+|     48 |     8 | _pad1       | `[u8; 8]`      | explicit, zeroed                                 |
 |     56 |     8 | _pad2       | `[u8; 8]`      | explicit, zeroed (v2+; garbage in v1)            |
 
 `origin` is load-bearing for any audit that will see both sources in one
@@ -808,7 +814,7 @@ Header:
 | -----: | ----: | ------------ | ---------------------------------------- |
 |      0 |     4 | magic        | `b"PMLR"`                                |
 |      4 |     2 | version      | `u16` — current = **3** (VT1); readers accept ≤ 3 |
-|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B) |
+|      6 |     1 | slot_kind    | `u8` — 0=Tick, 1=Signal, 2=Fill, 3=Order, 4=AiCmd (8f §8.4), 5=ChannelEvent (8e), 6=OptSummary (M2.3), 7=DepthTopK (WS10-B), 8=ExecRecord (BX6), 9=OrderEvent (XMM XH5d) |
 |      7 |     1 | _pad0        |                                          |
 |      8 |     8 | epoch_ns     | wall-clock ns at file open               |
 |     16 |    48 | _reserved    |                                          |

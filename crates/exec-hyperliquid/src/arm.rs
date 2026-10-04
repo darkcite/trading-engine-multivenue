@@ -334,6 +334,9 @@ const RB_ENDED: u8 = 1 << 4;
 /// Thought gone, and an orders read issued since did not list it: its
 /// gone wait alone ends it.
 const RB_UNLISTED: u8 = 1 << 5;
+/// XMM XH5d: its RESTING went out with the venue's time (the `open` row's):
+/// none repeats.
+const RB_STAMPED: u8 = 1 << 6;
 // XMM XH5c-2: a top-up's phases.
 /// None in flight: a budget read may decide one.
 const TU_IDLE: u8 = 0;
@@ -1348,6 +1351,12 @@ impl HlGatewayArm {
     // --- the vocabulary ---------------------------------------------
 
     fn emit(&mut self, i: usize, kind: u8, reason: u8, now: u64) {
+        self.emit_at(i, kind, reason, now, 0);
+    }
+
+    /// An event with the venue's time of the change, ms — 0 = unknown (a
+    /// post's answer carries none; XMM XH5d).
+    fn emit_at(&mut self, i: usize, kind: u8, reason: u8, now: u64, venue_ms: u64) {
         let ev = OrderEvent::new(
             now,
             VenueId::Hyperliquid,
@@ -1356,7 +1365,7 @@ impl HlGatewayArm {
             self.cfg.slot,
             kind,
             reason,
-            0,
+            venue_ms,
         );
         if self.events.push(ev) {
             self.counters.events += 1;
@@ -1410,13 +1419,29 @@ impl HlGatewayArm {
     /// the replacement's size: no retirement of the predecessor. Returns
     /// the row's index, which removing the predecessor may move.
     fn landed(&mut self, i: usize, now: u64) -> usize {
+        self.landed_at(i, now, 0)
+    }
+
+    /// [`Self::landed`], with the venue's time of the landing when the
+    /// `open` row brings it — XMM XH5d: the measurement's ACK time, on
+    /// the RESTING.
+    fn landed_at(&mut self, i: usize, now: u64, venue_ms: u64) -> usize {
         let st = self.rows[i].state;
         if st == ST_SENT || st == ST_DOUBT {
             self.rows[i].state = ST_RESTING;
             self.rows[i].since_ns = now;
             self.rows[i].due_ns = 0;
             if self.rows[i].bits & RB_ALO != 0 {
-                self.emit(i, ORDER_EVENT_RESTING, ORDER_EVENT_REASON_NONE, now);
+                self.emit_at(
+                    i,
+                    ORDER_EVENT_RESTING,
+                    ORDER_EVENT_REASON_NONE,
+                    now,
+                    venue_ms,
+                );
+                if venue_ms != 0 {
+                    self.rows[i].bits |= RB_STAMPED;
+                }
             }
         }
         let prev = self.rows[i].prev;
@@ -1784,7 +1809,8 @@ impl HlGatewayArm {
         }
     }
 
-    /// `orderUpdates`: open.
+    /// `orderUpdates`: open — the venue's time of the landing with it
+    /// (XMM XH5d).
     fn on_row_resting(&mut self, e: &ExecEvent, now: u64) {
         if e.slot != self.cfg.slot {
             // Another slot's (or a stranger's) order rests: the account is
@@ -1795,7 +1821,23 @@ impl HlGatewayArm {
         let Some(i) = self.find(e.client_oid) else {
             return;
         };
-        let i = self.landed(i, now);
+        let i = self.landed_at(i, now, e.venue_ms);
+        // XMM XH5d: the post's answer came first and its RESTING carried no
+        // venue time — once more, with the `open` row's (a member takes the
+        // repeat as a no-op; the capture keeps the time).
+        if self.rows[i].state == ST_RESTING
+            && self.rows[i].bits & (RB_ALO | RB_STAMPED) == RB_ALO
+            && e.venue_ms != 0
+        {
+            self.rows[i].bits |= RB_STAMPED;
+            self.emit_at(
+                i,
+                ORDER_EVENT_RESTING,
+                ORDER_EVENT_REASON_NONE,
+                now,
+                e.venue_ms,
+            );
+        }
         if self.rows[i].cancel == CX_WANTED && self.rows[i].state == ST_RESTING {
             self.push_cancel(i, now);
         }
@@ -1873,7 +1915,10 @@ impl HlGatewayArm {
             Qty(e.sz_1e8 / WIRE_PER_ENGINE),
             e.client_oid,
         )
-        .with_attribution(self.cfg.slot, FILL_ORIGIN_VENUE);
+        .with_attribution(self.cfg.slot, FILL_ORIGIN_VENUE)
+        // XMM XH5d: the venue's trade id — the report's key against the
+        // public prints.
+        .with_tid(e.aux);
         if self.fills.push(f) {
             self.counters.fills += 1;
             self.stats.fills_seen += 1;
@@ -5548,15 +5593,65 @@ mod tests {
     }
 
     /// A venue fill is stamped with the venue's time (wall), as the
-    /// blocking arm stamps one: the router's day epoch reads it as wall.
+    /// blocking arm stamps one: the router's day epoch reads it as wall —
+    /// and (XMM XH5d) carries the venue's trade id.
     #[test]
     fn a_fill_is_stamped_with_the_venue_s_time() {
         let (mut arm, mut v, t) = booted();
         let _ = rested(&mut arm, &mut v, t, 5);
-        v.send(fill(5, true, 100 * E8, E8 / 2, 1_790_000_000_123));
+        v.send(ExecEvent {
+            aux: 4_242,
+            ..fill(5, true, 100 * E8, E8 / 2, 1_790_000_000_123)
+        });
         let _ = arm.idle(t);
         let f = arm.try_next_fill().expect("the fill");
-        assert_eq!(f.ts_ns, 1_790_000_000_123_000_000);
+        assert_eq!((f.ts_ns, f.tid), (1_790_000_000_123_000_000, 4_242));
+    }
+
+    /// XMM XH5d: a post's answer carries no venue time, so its RESTING
+    /// goes without one and the `open` row's time follows once, in a
+    /// repeated RESTING; an `open` row that lands the order carries it in
+    /// the first, and the answer after it repeats nothing.
+    #[test]
+    fn a_resting_order_s_venue_time_rides_the_open_row() {
+        let (mut arm, mut v, t) = booted();
+        let _ = rested(&mut arm, &mut v, t, 8);
+        v.send(ExecEvent {
+            venue_ms: 1_791_000_000_123,
+            ..row(EV_RESTING, 8, 0)
+        });
+        let _ = arm.idle(t);
+        let mut e = OrderEvent::ZERO;
+        assert!(arm.try_next_order_event(&mut e));
+        assert_eq!(
+            (e.client_oid, e.kind, e.venue_time_ms),
+            (8, ORDER_EVENT_RESTING, 1_791_000_000_123)
+        );
+        v.send(ExecEvent {
+            venue_ms: 1_791_000_000_999,
+            ..row(EV_RESTING, 8, 0)
+        });
+        let _ = arm.idle(t);
+        assert!(events(&mut arm).is_empty(), "once");
+        arm.submit(&quote(9, Side::Bid, 100_000_000, 500_000))
+            .expect("submit");
+        let c = v.take(CMD_PLACE).expect("the place");
+        v.send(ExecEvent {
+            venue_ms: 1_791_000_001_000,
+            ..row(EV_RESTING, 9, 0)
+        });
+        let _ = arm.idle(t);
+        assert!(arm.try_next_order_event(&mut e));
+        assert_eq!(
+            (e.client_oid, e.kind, e.venue_time_ms),
+            (9, ORDER_EVENT_RESTING, 1_791_000_001_000)
+        );
+        v.send(item(&c, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        assert!(
+            events(&mut arm).is_empty(),
+            "the answer after it repeats nothing"
+        );
     }
 
     /// A place the gateway refused over its rate shares never left: no

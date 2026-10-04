@@ -4686,6 +4686,15 @@ fn run(args: RunArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // XMM XH5d: the order-event capture beside them — the same stance.
+    let obs = match cli::open_events_capture(&run_dir, epoch_ns) {
+        Ok(cap) => obs.with_events_capture(cap),
+        Err(e) => {
+            error!(error = ?e, dir = %run_dir.display(), "events capture open failed");
+            join_reverse(handles);
+            return ExitCode::from(1);
+        }
+    };
 
     // -- Main thread: real engine loop until SIGINT --
     let cons = Consumers {

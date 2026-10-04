@@ -1518,6 +1518,19 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
     );
     eng.set_trade_lane(tr_c);
     eng.set_order_event_lane(oe_c);
+    // XMM XH5d: the order-event capture rides both drains — the lane's
+    // events and the paper arm's below are staged inside the window.
+    let ev_dir = std::env::temp_dir().join(format!("xh5d_alloc_events_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ev_dir);
+    std::fs::create_dir_all(&ev_dir).unwrap();
+    eng.set_event_capture(
+        core_io::SlotCapture::open(
+            ev_dir.join(engine::ENGINE_EVENTS_FILE),
+            core_io::SlotKind::OrderEvent,
+            1,
+        )
+        .unwrap(),
+    );
     // XMM XH2: the paper arm's queue law on a tracked Hyperliquid perp —
     // each iteration a post-only bid lands on the print that goes
     // through it, so the dispatcher's order-event pump runs its `true`
@@ -1622,6 +1635,14 @@ fn engine_tick_with_latency_record_is_zero_alloc() {
         "engine.tick() with latency record allocated {allocs} times ({bytes} B)"
     );
     assert_eq!(bytes, 0);
+    assert_eq!(
+        eng.event_capture_records(),
+        eng.order_events_dispatched,
+        "every drained order event staged, once"
+    );
+    assert_eq!(eng.event_capture_io_errors(), 0);
+    drop(eng);
+    let _ = std::fs::remove_dir_all(&ev_dir);
 }
 
 /// QueuedDispatcher worker drain — engine pushes 1000 orders into
@@ -14115,6 +14136,8 @@ fn hl_deadman_and_perp_rules_are_zero_alloc() {
 /// write) — the window runs until each has run — then, measured alone, a
 /// venue refusal stops them and the stop is stored; the halt signals and
 /// the cancel-all state; every out-queue drained as the engine does.
+/// XMM XH5d: the `open` rows carry the venue's time, and every fourth
+/// place or modify's comes after the answer (its RESTING repeated with it).
 /// Timers run on the real clock (1 ms windows): the warm-up runs until
 /// every path has run, and the window must run each again.
 #[test]
@@ -14124,6 +14147,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     use core_types::{
         CancelReq, ModifyReq, Order, OrderEvent, Side, ORDER_EVENT_CANCELED,
         ORDER_EVENT_REASON_BAD_ALO_PX, ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED,
+        ORDER_EVENT_RESTING,
     };
     use exec_gateway::stats::SWEEP_CLEAR;
     use exec_hyperliquid::anchor::{AnchorKeeper, AnchorSlot, Kept};
@@ -14184,6 +14208,10 @@ fn hl_gateway_arm_is_zero_alloc() {
         reserves: u64,
         calm: u8,
         refuse: bool,
+        /// XMM XH5d: RESTINGs stamped with the `open` row's time — the row
+        /// before the answer landing the order, and after it, the repeat.
+        stamped: u64,
+        repeated: u64,
     }
 
     /// The gateway's end: every command answered by the script.
@@ -14256,11 +14284,16 @@ fn hl_gateway_arm_is_zero_alloc() {
                     ..item
                 })),
                 CMD_PLACE | CMD_MODIFY => {
+                    // XMM XH5d: the `open` row carries the venue's time —
+                    // every fourth before the answer (it lands the order),
+                    // every fourth after it (the answer's RESTING repeated).
+                    let open = ExecEvent {
+                        kind: EV_RESTING,
+                        venue_ms: n,
+                        ..row
+                    };
                     if n % 4 == 0 {
-                        assert!(gw.evt.emit(&ExecEvent {
-                            kind: EV_RESTING,
-                            ..row
-                        }));
+                        assert!(gw.evt.emit(&open));
                     }
                     assert!(gw.evt.emit(&ExecEvent {
                         kind: EV_ACK,
@@ -14268,6 +14301,9 @@ fn hl_gateway_arm_is_zero_alloc() {
                         oid: n,
                         ..item
                     }));
+                    if n % 4 == 2 {
+                        assert!(gw.evt.emit(&open));
+                    }
                     s.recent[s.at % RECENT] = c.client_oid;
                     s.at += 1;
                     if n % 5 == 0 {
@@ -14491,6 +14527,11 @@ fn hl_gateway_arm_is_zero_alloc() {
             s.replaced += u64::from(
                 ev.kind == ORDER_EVENT_CANCELED && ev.reason == ORDER_EVENT_REASON_REPLACED,
             );
+            // XMM XH5d: the script's `open` rows carry n — before the
+            // answer when n ≡ 0 (mod 4), after it when n ≡ 2.
+            let stamped = ev.kind == ORDER_EVENT_RESTING && ev.venue_time_ms != 0;
+            s.stamped += u64::from(stamped && ev.venue_time_ms % 4 == 0);
+            s.repeated += u64::from(stamped && ev.venue_time_ms % 4 == 2);
             *acc ^= ev.client_oid ^ u64::from(ev.kind);
         }
         while let Some(r) = arm.try_next_retired() {
@@ -14566,7 +14607,7 @@ fn hl_gateway_arm_is_zero_alloc() {
     }
 
     /// The paths the window must run again, each counted.
-    fn paths(c: &ArmCounters, s: &Script) -> [u64; 17] {
+    fn paths(c: &ArmCounters, s: &Script) -> [u64; 19] {
         [
             c.fills,
             c.alo_rejects,
@@ -14585,6 +14626,8 @@ fn hl_gateway_arm_is_zero_alloc() {
             c.refused_budget,
             c.spot_reads,
             c.spot_failed,
+            s.stamped,
+            s.repeated,
         ]
     }
 
@@ -14644,6 +14687,8 @@ fn hl_gateway_arm_is_zero_alloc() {
         reserves: 0,
         calm: 0,
         refuse: false,
+        stamped: 0,
+        repeated: 0,
     };
     let mut acc = 0u64;
     let _ = arm.on_idle();
