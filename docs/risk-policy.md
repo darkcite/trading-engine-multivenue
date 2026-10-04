@@ -9735,6 +9735,83 @@ counter): the release gate passed, and eight debug re-runs passed.
   hand-over still owed at the shutdown's bound (optional); a heap-free
   restore compare (boot only; the three restores compare one way).
 
+### XH5c-3 amendment (2026-10-03): the RTT word without REST samples; the cadence re-checked
+
+The third part of XH5c (plan §3.3 items 2 and 3; A-S6-16). Nothing is armed.
+
+- **A REST post's round trip is its own series.** The gateway's `finish`
+  records a post that went by the REST fallback (`rec.conn == CONN_REST`:
+  the boot's dead-man clear before the socket is up, a fallback with no
+  socket Ready) in `GatewayStats::rest_rtt` alone — a fresh dial and a
+  synchronous exchange are not the socket's path. Before, they fed the RTT
+  word: XH4g's boot clear (1 809 ms in run b3) held it over 1 500 ms for up
+  to 30 s. Socket posts feed `post_rtt` / `cancel_rtt`, the congestion
+  average and the RTT window as before; a socket post that times out still
+  holds the word high (its ~5 s sample).
+- **No socket Ready reads throttled.** With REST out of the word, a
+  WebSocket outage no longer reaches the member through it — so the
+  congestion word reads `THROTTLED` while no connection is Ready to carry a
+  post (one test, `ready_conn`, shared with `send`): the member holds
+  (`WHY_CONGESTION`) while every post would go by REST; the pull's cancels,
+  the dead man and the control posts still go by REST (the word is
+  advisory; `admit` judges the rate throttle itself). At boot the word
+  reads throttled until the first socket is Ready — the arm is not ready
+  then anyway; the arm's day pages, which wait out throttled, wait for a
+  socket (a read needs one anyway). The HYPARB member does not read the
+  word.
+- **`rtt_pull_ms`** is a threshold — the member pulls while the published
+  worst exceeds it. The probe's artifact (XH5e) carries 2 000 (testnet p99
+  0.91–1.2 s, max 1.8 s); `xmm.toml.example` and the paper artifact keep
+  1 500. After the probe's first 2 000 mainnet posts it is re-sized to
+  max(1 500, ⌈1.5 × p99⌉) — an `xmm.toml` edit, a new config hash.
+- **The IP share stays 400** (`IP_WEIGHT_SHARE`). XH5e's runbook measures
+  the host's other Hyperliquid REST weight over an hour before any change
+  (an `exec.toml` key bounded by 1 200 less that).
+- **The cadence re-check** — the harness (`backtest --member xmm`) at
+  `lead_stale_ms` 300 and 500 on W17 (a weekday peak), W10 (a weekday
+  average) and W29 (a Saturday), ≤ 2 h windows, nice 15 — lives in the
+  vault (`docs/research/xmm/xh5c3-stale-2026-10-03/`: research never enters
+  git). The rulings it informs: the probe's artifact (XH5e) takes
+  `lead_stale_ms` 500; the paper engine stays at 300 until Anton rules;
+  Q-XH5-4 stands — the $50 cap binds and the floor halts the slot (the
+  safe direction).
+- **Residual — a socket loss is a pull.** A loss of the socket that spans a
+  heartbeat (a venue close, a pong timeout, a silent socket closed while its
+  replacement dials) now pulls the member's quotes and re-places them once
+  a socket is Ready: a cancel and a place per resting quote, and the queue
+  position — the intended direction, small against a quoting day's
+  requests.
+- **`/metrics`:** `engine_exec_hlgw_rest_rtt_{p99,max}_ns` (levels
+  35 → 37); `GatewayArmReport` 864 → 880 B (110 words); `rtt_worst_ns` and
+  the post series are the socket's. The stats block 66 944 → 83 456 B (one
+  more `Lat`, built once per arm at boot on the booting thread's stack, as
+  before).
+
+**Tests:** the router — a REST post's round trip in its own series alone
+(not `post_rtt`, the window or the average), the same post on a socket in
+all three; the gateway over the loopback venue — the REST post's round trip
+in its series, and the congestion word throttled with no socket Ready; the
+arm's report — the REST series apart from the post series; `/metrics`'
+rows; gate 95 records the REST series every turn, and the report gate's
+trackers hold REST samples too.
+
+**Gates (the committed tree):** clippy 0; nextest 4 183/4 183; alloc 108
+(+3 ignored) at 0 B, compiled fresh — gate 95 records the REST series
+every turn, gate 99's report walks it; copy-audit 31, new=0; license OK
+(661); release OK; replay 7× IDENTICAL; rustfmt clean on every touched
+hunk.
+
+**Reviews:** two rounds. Round 1 — zero-copy APPROVE; risk APPROVE WITH
+NITS (A-S7-16, no socket Ready reads throttled, judged sound: it blocks
+nothing that must go and does not flap in a make-before-break swap; NITs:
+THROTTLED's docs, the battery's congestion peak at every boot, the socket
+loss residual); allocation REQUEST CHANGES — the harness's numbers in this
+tracked file (research never enters git): moved to the vault, the rulings
+kept; NITs: "on a socket" wording, gate 95. Round 2 — risk, allocation and
+zero-copy APPROVE. Declined (optional): the battery's peak can still read
+one stale throttled report in the heartbeat after a socket comes up (the
+battery's evidence alone).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

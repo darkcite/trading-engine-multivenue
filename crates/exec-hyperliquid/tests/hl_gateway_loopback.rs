@@ -895,6 +895,17 @@ fn with_no_socket_left_a_post_goes_rest_as_the_envelope_alone() {
         "the REST body is the envelope, not the WS wrapper"
     );
     assert!(eng.stats.io()[4] >= 1, "the fallback is counted");
+    // XMM XH5c-3: the REST round trip is its own series, and with no
+    // socket Ready the congestion word holds the member (with the
+    // heartbeat, ≤ 100 ms).
+    assert!(eng.stats.rest_rtt.count() >= 1, "its own series");
+    let t = std::time::Instant::now();
+    while eng.stats.congestion() != CONGESTION_THROTTLED
+        && t.elapsed() < std::time::Duration::from_secs(2)
+    {
+        gw.turn();
+    }
+    assert_eq!(eng.stats.congestion(), CONGESTION_THROTTLED);
 }
 
 #[test]

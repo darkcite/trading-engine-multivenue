@@ -887,7 +887,7 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 864 B report never crosses by value.
+    /// 880 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
@@ -1191,17 +1191,23 @@ pub struct GatewayArmReport {
     pub heartbeat_age_ms: u64,
     /// The congestion word (`exec_gateway::stats::CONGESTION_*`).
     pub congestion: u64,
-    /// The recent window's worst post round trip, ns.
+    /// The recent window's worst post round trip on a socket, ns (the REST
+    /// fallback's apart, XMM XH5c-3).
     pub rtt_worst_ns: u64,
-    /// Post round trips since boot: p50, ns.
+    /// Post round trips on a socket since boot: p50, ns.
     pub post_rtt_p50_ns: u64,
-    /// Post round trips since boot: p99, ns.
+    /// Post round trips on a socket since boot: p99, ns.
     pub post_rtt_p99_ns: u64,
-    /// Post round trips since boot: the longest, ns.
+    /// Post round trips on a socket since boot: the longest, ns.
     pub post_rtt_max_ns: u64,
+    /// Posts sent by the REST fallback since boot — their own series, out
+    /// of the RTT word (XMM XH5c-3): p99, ns.
+    pub rest_rtt_p99_ns: u64,
+    /// Posts sent by the REST fallback since boot: the longest, ns.
+    pub rest_rtt_max_ns: u64,
     /// Command push → its frame written, p99, ns.
     pub push_to_write_p99_ns: u64,
-    /// Cancel written → its reply, p99, ns.
+    /// Cancel written on a socket → its reply, p99, ns.
     pub cancel_rtt_p99_ns: u64,
     /// A fill's venue time → its local receipt, p99, ns.
     pub fill_lag_p99_ns: u64,
@@ -1263,8 +1269,9 @@ pub struct GatewayArmReport {
 // XH4f: 94 words — pinned, as the other blocks crossing this boundary are.
 // XH5a: + `refused_foreign_row` (95). XMM XH5b-2: + the spot reads' two
 // counters and the own account's five levels (102). XMM XH5c-2: + the
-// top-ups' three counters and three levels (108).
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 864);
+// top-ups' three counters and three levels (108). XMM XH5c-3: + the REST
+// round trips' p99 and maximum (110).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 880);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

@@ -4,8 +4,10 @@
 //! The recent post round trips (XMM XH4f, D8): the last [`RTT_WINDOW`]
 //! answered posts' round trips with the times they were answered, and the
 //! worst of those no older than [`RTT_MAX_AGE_NS`] — of at most 64
-//! samples the p99 is the maximum. A gateway records every answered post
-//! and publishes the worst with its heartbeat
+//! samples the p99 is the maximum. A gateway records every post answered
+//! on a socket — XMM XH5c-3: one sent by its REST fallback carries a fresh
+//! dial and has its own series ([`crate::GatewayStats::rest_rtt`]) — and
+//! publishes the worst with its heartbeat
 //! ([`crate::GatewayStats::set_rtt_worst`]); a member pulls its quotes
 //! while it exceeds its `rtt_pull_ms`. Monotonic time; no allocation.
 

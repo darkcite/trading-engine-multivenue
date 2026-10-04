@@ -3233,7 +3233,7 @@ impl OrderDispatch for HlGatewayArm {
         } else {
             0
         };
-        // COPY: the 864 B report written once into the caller's block —
+        // COPY: the 880 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -3325,6 +3325,8 @@ impl OrderDispatch for HlGatewayArm {
             post_rtt_p50_ns: s.post_rtt.quantile_ns(0.5),
             post_rtt_p99_ns: s.post_rtt.quantile_ns(0.99),
             post_rtt_max_ns: s.post_rtt.max_ns(),
+            rest_rtt_p99_ns: s.rest_rtt.quantile_ns(0.99),
+            rest_rtt_max_ns: s.rest_rtt.max_ns(),
             push_to_write_p99_ns: s.push_to_write.quantile_ns(0.99),
             cancel_rtt_p99_ns: s.cancel_rtt.quantile_ns(0.99),
             fill_lag_p99_ns: s.fill_venue_to_local.quantile_ns(0.99),
@@ -4138,6 +4140,7 @@ mod tests {
         v.gw.stats.publish(pw::THROTTLED, 3);
         v.gw.stats.publish(pw::RATE_WS, 9);
         v.gw.stats.note_post_timeout();
+        v.gw.stats.rest_rtt.record(2_500 * NS_PER_MS);
         let mut r = GatewayArmReport::default();
         assert!(arm.gateway_arm_report(t + 5 * NS_PER_MS, &mut r));
         assert_eq!((r.present, r.slot, r.ready), (1, u64::from(SLOT), 1));
@@ -4151,6 +4154,11 @@ mod tests {
             "the throttled word, the WebSocket window, a shared counter"
         );
         assert_eq!((r.ws_up, r.heartbeat_age_ms), (1, 5));
+        assert_eq!(
+            (r.rest_rtt_max_ns, r.post_rtt_max_ns),
+            (2_500 * NS_PER_MS, 0),
+            "XMM XH5c-3: the REST fallback's own series"
+        );
         assert_eq!(
             (r.refused_cap_perp, r.unmarked_positions, r.resting_usd_1e6),
             (0, 0, 0),

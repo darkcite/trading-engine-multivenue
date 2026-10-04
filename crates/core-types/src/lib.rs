@@ -1993,7 +1993,9 @@ pub const EXEC_CONGESTION_NONE: u8 = 0;
 /// Busy: a rate window over 60 % of its share, most of the in-flight
 /// bound used, or the venue's answers slow.
 pub const EXEC_CONGESTION_BUSY: u8 = 1;
-/// Throttled: growth is refused unsent; cancels still go.
+/// Throttled: growth is refused unsent, cancels still go — or (XMM XH5c-3,
+/// the Hyperliquid gateway) no socket is Ready: every post goes by REST,
+/// nothing refused for it. The member holds either way.
 pub const EXEC_CONGESTION_THROTTLED: u8 = 2;
 /// The venue answered a rate-limit error in the last 10 s.
 pub const EXEC_CONGESTION_RATE_LIMITED: u8 = 3;

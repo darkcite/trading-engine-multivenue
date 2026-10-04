@@ -13380,6 +13380,7 @@ fn exec_gateway_kit_is_zero_alloc() {
         }
         stats.cancel_rtt.record(200 * MS + turn);
         stats.fill_venue_to_local.record(120 * MS + turn);
+        stats.rest_rtt.record(900 * MS + turn);
         post_id += 1;
         while timers.pop_due(now, &mut expired) {
             acc = acc.wrapping_add(expired.key ^ u64::from(expired.kind));
@@ -13757,6 +13758,7 @@ fn xmm_slot_six_through_the_router_is_zero_alloc() {
         end.stats.cancel_rtt.record(k * 1_000_000);
         end.stats.push_to_write.record(k * 1_000);
         end.stats.fill_venue_to_local.record(k * 2_000_000);
+        end.stats.rest_rtt.record(k * 3_000_000);
         k += 1;
     }
     let window = std::time::Instant::now();

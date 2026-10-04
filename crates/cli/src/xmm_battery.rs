@@ -845,7 +845,12 @@ impl Drive {
             if self.arm.gateway_arm_report(now, &mut self.report) {
                 self.peaks.0 = self.peaks.0.max(self.report.rate_ip_sum);
                 self.peaks.1 = self.peaks.1.max(self.report.rate_ws_sum);
-                self.peaks.2 = self.peaks.2.max(self.report.congestion);
+                // XMM XH5c-3: with no socket Ready the word reads throttled
+                // (the boot's first seconds too) — the rates' peak is taken
+                // while one is up.
+                if self.report.ws_up == 1 {
+                    self.peaks.2 = self.peaks.2.max(self.report.congestion);
+                }
             }
         }
     }
@@ -1022,7 +1027,9 @@ impl Run<'_> {
     }
 
     /// Wait until the gateway's rates no longer throttle growth (XH4e: at
-    /// 80 % of a share a place is refused unsent) — at most [`STEP_WAIT`].
+    /// 80 % of a share a place is refused unsent) and a socket is Ready
+    /// (XMM XH5c-3: the word reads throttled without one) — at most
+    /// [`STEP_WAIT`].
     fn unthrottled(&mut self) -> bool {
         self.drive.until(STEP_WAIT, |d| {
             d.arm.congestion() < u64::from(EXEC_CONGESTION_THROTTLED)

@@ -110,7 +110,9 @@ pub const CONGESTION_NONE: u64 = 0;
 /// bound used, or the venue's answers slow.
 pub const CONGESTION_BUSY: u64 = 1;
 /// Throttled: a rate window at 80 % of its share — growth is refused
-/// unsent; cancels, reads and pings still go.
+/// unsent; cancels, reads and pings still go. Or (XMM XH5c-3, the
+/// Hyperliquid gateway) no socket Ready: every post goes by REST, nothing
+/// is refused for it, and a read does not go.
 pub const CONGESTION_THROTTLED: u64 = 2;
 /// The venue answered a rate-limit error in the last 10 s.
 pub const CONGESTION_RATE_LIMITED: u64 = 3;
@@ -189,19 +191,24 @@ pub struct GatewayStats {
     published: Published,
     /// Command push (engine) → the frame carrying it written to the socket.
     pub push_to_write: Lat,
-    /// Action written → the venue's reply to that post.
+    /// Action written on a socket → the venue's reply to that post (the
+    /// REST fallback's in `rest_rtt`).
     pub post_rtt: Lat,
-    /// Cancel written → the venue's reply to that cancel.
+    /// Cancel written on a socket → the venue's reply to that cancel.
     pub cancel_rtt: Lat,
     /// A fill's venue time → its local receipt.
     pub fill_venue_to_local: Lat,
+    /// XMM XH5c-3: a post sent by the REST fallback, written → its answer —
+    /// a fresh dial and a synchronous exchange, so its own series: never in
+    /// `post_rtt`, `cancel_rtt` or the RTT word.
+    pub rest_rtt: Lat,
 }
 
 /// The block's size — pinned: it is built once per arm at boot, on the
-/// booting thread's stack before it moves into its `Arc` (≈ 65 KiB; the
-/// kit has no `unsafe` to build it in place, and a boot thread's stack is
-/// 8 MiB). A size change is reviewed here.
-pub const GATEWAY_STATS_SIZE: usize = 66_944;
+/// booting thread's stack before it moves into its `Arc` (≈ 82 KiB with
+/// XMM XH5c-3's REST series; the kit has no `unsafe` to build it in place,
+/// and a boot thread's stack is 8 MiB). A size change is reviewed here.
+pub const GATEWAY_STATS_SIZE: usize = 83_456;
 
 const _: () = assert!(core::mem::align_of::<GatewayStats>() == 128);
 const _: () = assert!(core::mem::size_of::<EngineWritten>() == 128);
@@ -250,6 +257,7 @@ impl GatewayStats {
             post_rtt: Lat::new(),
             cancel_rtt: Lat::new(),
             fill_venue_to_local: Lat::new(),
+            rest_rtt: Lat::new(),
         }
     }
 

@@ -95,8 +95,11 @@
 //! growth is refused unsent ([`REASON_THROTTLED`]); cancels, control
 //! actions, reads and pings still go. The congestion word
 //! (`GatewayStats::congestion`) says how close it runs: busy (60 % of a
-//! share, 60 posts in flight, or answers averaging 1 s), throttled, or
-//! rate-limited by the venue in the last 10 s.
+//! share, 60 posts in flight, or socket answers averaging 1 s), throttled
+//! — or, XMM XH5c-3, no socket Ready, every post going by REST: the member
+//! holds — or rate-limited by the venue in the last 10 s. A REST post's
+//! round trip (a fresh dial, a synchronous exchange) has its own series,
+//! out of the socket's histograms, the average and the RTT word.
 //!
 //! **Copies** (house law): the msgpack encoding and the JSON rendering
 //! (transforms, in place); the 64 B command out of its ring slot and each
@@ -1399,7 +1402,7 @@ impl Router {
     }
 
     /// Release post `id`: its deadline, its connection's count, its
-    /// latency sample.
+    /// latency sample — XMM XH5c-3: a REST post's in its own series alone.
     fn finish(&mut self, id: u64, now: u64) {
         let Some(rec) = self.pending.get(id) else {
             return;
@@ -1415,15 +1418,22 @@ impl Router {
         self.inflight_items -= usize::from(n);
         if written != 0 && usize::from(class) != CLASS_READ {
             let rtt = now.saturating_sub(written);
-            if usize::from(class) == CLASS_CANCEL {
-                self.stats.cancel_rtt.record(rtt);
+            if conn == CONN_REST {
+                // XMM XH5c-3: a fresh dial and a synchronous exchange (the
+                // boot's dead-man clear, a fallback with no socket Ready) —
+                // not the socket's path: its own series alone.
+                self.stats.rest_rtt.record(rtt);
             } else {
-                self.stats.post_rtt.record(rtt);
+                if usize::from(class) == CLASS_CANCEL {
+                    self.stats.cancel_rtt.record(rtt);
+                } else {
+                    self.stats.post_rtt.record(rtt);
+                }
+                // XH4e: the congestion word's moving average.
+                self.rtt_ewma_ns = self.rtt_ewma_ns - self.rtt_ewma_ns / 8 + rtt / 8;
+                // XH4f: the member's pull window.
+                self.rtt.record(now, rtt);
             }
-            // XH4e: the congestion word's moving average.
-            self.rtt_ewma_ns = self.rtt_ewma_ns - self.rtt_ewma_ns / 8 + rtt / 8;
-            // XH4f: the member's pull window.
-            self.rtt.record(now, rtt);
         }
         let _ = self.pending.release(id);
     }
@@ -2007,13 +2017,15 @@ impl HlGateway {
     }
 
     /// The congestion word: the worst of a venue rate-limit answer in the
-    /// last 10 s, growth throttled, and busy.
+    /// last 10 s, growth throttled — or no socket Ready (XMM XH5c-3: every
+    /// post would go by REST, out of the RTT word; the member holds) — and
+    /// busy.
     fn publish_congestion(&mut self, now: u64) {
         let limited = self.rt.rate_limited_ns != 0
             && now.saturating_sub(self.rt.rate_limited_ns) < RATE_LIMITED_NS;
         let level = if limited {
             CONGESTION_RATE_LIMITED
-        } else if self.throttled() {
+        } else if self.throttled() || self.ready_conn().is_none() {
             CONGESTION_THROTTLED
         } else if self.ip.at_least(self.ip_cap, BUSY_PCT)
             || self.ws.at_least(self.ws_cap, BUSY_PCT)
@@ -2407,16 +2419,27 @@ impl HlGateway {
         })
     }
 
+    /// The connection new posts go on: the active one, once Ready. None (a
+    /// swap's gap, an outage): a post goes by REST, a read not at all — and
+    /// the congestion word reads throttled (XMM XH5c-3).
+    #[inline]
+    fn ready_conn(&self) -> Option<u8> {
+        match self.mbb.active() {
+            Some(a) if self.conns[usize::from(a)].phase() == Phase::Ready => Some(a),
+            _ => None,
+        }
+    }
+
     /// Write a sealed post on the live connection, or by REST — a read
     /// only on the live connection: with none it is refused, unsent.
     fn send(&mut self, k: usize, id: u64, s: Sealed, now: u64) {
-        let active = match self.mbb.active() {
-            Some(a) if self.conns[usize::from(a)].phase() == Phase::Ready => a,
-            _ if k == CLASS_READ => {
+        let active = match self.ready_conn() {
+            Some(a) => a,
+            None if k == CLASS_READ => {
                 self.rt.fail_all(id, EV_REJECTED, REASON_TRANSPORT, now);
                 return;
             }
-            _ => {
+            None => {
                 self.post_rest(id, s, false);
                 return;
             }
@@ -3052,6 +3075,36 @@ mod tests {
         let ev = drained(&mut eng);
         assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_SPOT));
         assert_eq!(read_code(CMD_READ_SPOT), READ_SPOT);
+    }
+
+    /// XMM XH5c-3: a REST post's round trip goes to its own series alone —
+    /// never the socket's histograms, the congestion average or the RTT
+    /// word's window; the same post answered on a socket feeds them all.
+    #[test]
+    fn a_rest_round_trip_has_its_own_series_out_of_the_rtt_word() {
+        let at = 2_000_000_001u64;
+        let (mut rt, _eng, id) = router_with_post(CLASS_ALO, 1);
+        rt.finish(id, at);
+        assert_eq!(
+            (rt.stats.rest_rtt.count(), rt.stats.rest_rtt.max_ns()),
+            (1, 2_000_000_000)
+        );
+        assert_eq!(
+            (rt.stats.post_rtt.count(), rt.rtt.worst(at), rt.rtt_ewma_ns),
+            (0, 0, 0)
+        );
+        let (mut rt, _eng, id) = router_with_post(CLASS_ALO, 1);
+        rt.pending.get_mut(id).expect("in flight").conn = 0;
+        rt.finish(id, at);
+        assert_eq!(
+            (
+                rt.stats.post_rtt.count(),
+                rt.rtt.worst(at),
+                rt.stats.rest_rtt.count()
+            ),
+            (1, 2_000_000_000, 0)
+        );
+        assert!(rt.rtt_ewma_ns > 0);
     }
 
     #[test]

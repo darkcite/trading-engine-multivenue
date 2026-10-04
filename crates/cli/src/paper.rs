@@ -6117,7 +6117,7 @@ fn mirror_exec_metrics(
 /// The hlgw family's counters.
 const HLGW_COUNTERS: usize = 71;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
-const HLGW_GAUGES: usize = 35;
+const HLGW_GAUGES: usize = 37;
 
 /// The counter rows of the hlgw family, in [`hlgw_counter_values`] order
 /// — which is what pins the two together.
@@ -6289,6 +6289,8 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
     "engine_exec_hlgw_post_rtt_p50_ns",
     "engine_exec_hlgw_post_rtt_p99_ns",
     "engine_exec_hlgw_post_rtt_max_ns",
+    "engine_exec_hlgw_rest_rtt_p99_ns",
+    "engine_exec_hlgw_rest_rtt_max_ns",
     "engine_exec_hlgw_push_to_write_p99_ns",
     "engine_exec_hlgw_cancel_rtt_p99_ns",
     "engine_exec_hlgw_fill_lag_p99_ns",
@@ -6318,7 +6320,7 @@ const HLGW_GAUGE_NAMES: [&str; HLGW_GAUGES] = [
 /// `GatewayArmReport`'s levels in [`HLGW_GAUGE_NAMES`] order; an unsigned
 /// level past `i64::MAX` — a heartbeat not yet seen, a top-up day read as
 /// spent (XMM XH5c-2) — reads −1.
-// COPY: [i64; 35] (280 B) returned by value — cold, as above.
+// COPY: [i64; 37] (296 B) returned by value — cold, as above.
 fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES] {
     let g = |v: u64| i64::try_from(v).unwrap_or(-1);
     [
@@ -6333,6 +6335,8 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
         g(r.post_rtt_p50_ns),
         g(r.post_rtt_p99_ns),
         g(r.post_rtt_max_ns),
+        g(r.rest_rtt_p99_ns),
+        g(r.rest_rtt_max_ns),
         g(r.push_to_write_p99_ns),
         g(r.cancel_rtt_p99_ns),
         g(r.fill_lag_p99_ns),
@@ -6399,7 +6403,7 @@ fn register_hlgw_metrics(
     let last_shutdown_unconfirmed = reg
         .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
         .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
-    // COPY: the 428 B id block ((71 + 35 + 1) × 4 B), returned by value once
+    // COPY: the 436 B id block ((71 + 37 + 1) × 4 B), returned by value once
     // at boot — rejected: an out-param for a one-time move.
     Ok(ExecHlgwMetricIds {
         counters,
@@ -13711,6 +13715,8 @@ mod tests {
             topup_weight: 10_000,
             topup_day_used: u64::MAX,
             topup_cost_usd_1e6: 5_000_000,
+            rest_rtt_p99_ns: 9,
+            rest_rtt_max_ns: 12,
             ..clob_dispatcher::GatewayArmReport::default()
         };
         mirror_hlgw_metrics(reg, ids, &cur, &mut last);
@@ -13742,6 +13748,8 @@ mod tests {
             ("engine_exec_hlgw_topup_weight", "10000"),
             ("engine_exec_hlgw_topup_day_used", "-1"),
             ("engine_exec_hlgw_topup_cost_usd_1e6", "5000000"),
+            ("engine_exec_hlgw_rest_rtt_p99_ns", "9"),
+            ("engine_exec_hlgw_rest_rtt_max_ns", "12"),
             ("engine_exec_hlgw_last_shutdown_unconfirmed", "0"),
         ] {
             assert!(
