@@ -9992,6 +9992,73 @@ release OK; replay 7× IDENTICAL; rustfmt clean on touched hunks.
 **Reviews:** risk APPROVE (round 2, confirmed round 3), allocation APPROVE
 (round 3), zero-copy APPROVE (round 3).
 
+### XH5d-3b amendment (2026-10-04): the ALO priority arm — arm B's fresh places at a level just formed bid it, under the boot's cap
+
+The third part of XH5d, its second half (plan §3.4 item 2, `ab_mode` 2;
+A-S7-29). Nothing is armed; `ab_mode` 0 — the example's and the paper
+artifact's — and modes 1 and 3 bid no priority.
+
+- **The rule.** Under `ab_mode` 2 a fresh place whose price was decided in
+  arm B (the XH5d-2 block) bids the artifact's `alo_priority_1e8` when the
+  follower's touch on its side formed — improved to a new level in front —
+  within the last 400 ms (local receipt; the venue sorts ALO orders by
+  priority on that timescale). A retreat lands on a queue already there;
+  the book's first sight, and the first fresh tick after a stale one or
+  after a silence the member calls the follower stale (the level's time
+  unknown), form none. A requote is a modify and bids none (A-S7-27); arm
+  A bids none.
+- **The cap.** The member tallies each bid's fee — p ×1e8 of the place's
+  notional, rounded up, the arm's own reckoning on the same price and size
+  — and bids none once the next would pass $25 a boot
+  (`XMM_PRIORITY_MAX_USD_1E6`, half the probe's funded HYPE). Slot 6's arm
+  is armed (XH5d-3a's `set_priority_cap`) only under `ab_mode` 2 with a
+  priority to bid, at the member's cap and $1 of room
+  (`XMM_PRIORITY_ARM_ROOM_USD_1E6`): the member stops first, and the arm
+  refuses unsent past its own. Every other configuration arms none — a
+  place bidding a priority would be refused unsent. The cap is per boot:
+  the funded HYPE is the ceiling across restarts.
+- **The latch.** How the venue answers a priority it will not take (short
+  of undelegated HYPE) is unproven (XH5e's testnet step records it). If it
+  lands as a refusal the arm cannot name (`ORDER_EVENT_REASON_OTHER` — an
+  item's error, a whole action refused, a stream's unnamed rejection),
+  three priority places in a row refused so end the priority for the boot
+  (`priority_refused` counts them); a priority place that rests resets the
+  run. The member keeps quoting; arm B's places bid none after it. The
+  latch has tripped when `priority_places` stops growing while arm B
+  quotes.
+- **The bound.** `alo_priority_1e8` must be at most 1 % (1 000 000) —
+  `XmmParams::validate` now refuses more, as the parser and the arm do.
+- **On `/metrics` and `/state`:** `engine_xmm_priority_places_total`,
+  `engine_xmm_priority_fee_usd_1e6_total`,
+  `engine_xmm_priority_refused_total` (`XmmCounters` 22 → 25 × 8 B); the
+  boot tell states the rule and the cap (`ab_arms=`; `off` when
+  `alo_priority_1e8` is 0).
+- **The record:** the order carries what it bid (`alo_priority_1e8`, in
+  `engine-orders.pmlr`), so the report sees the priority places apart.
+- **Layout:** `Inst` gains the two sides' formed times on their own line
+  (192 → 256 B a perp); `Quote.prio`, one byte of `Quote`'s padding (64 B
+  kept).
+- **Copies:** none new (`with_alo_priority`, a const by-value builder on
+  the order built in place, as `with_ab_arm`).
+
+**Tests:** the rule (the first sight, a retreat and the tick after a stale
+one form nothing, an improved touch forms its side; arm B within 400 ms
+bids and tallies, beyond it, arm A, another mode and the spent cap bid
+none); the latch (three refusals in a row end it, a resting priority place
+resets the run); the fee as the arm reckons it; `validate` refuses over
+1 %; the arm's cap armed for `ab_mode` 2 with a priority alone; the boot
+tell; the counters on `/metrics` and `/state` (the worst-case `/state` with
+every counter at its widest); gate 75e — under `ab_mode` 2 arm B's bids at
+a level formed that cycle bid 1 % until the cap (exactly 166 places at
+0.15 and 99.995), then the cap refuses them; the asks and arm A never; 0 B.
+
+**Gates:** clippy 0; nextest 4 197/4 197; alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK (662); release OK; replay 7× IDENTICAL;
+rustfmt clean on touched hunks.
+
+**Reviews:** risk APPROVE (round 3), allocation APPROVE (round 3),
+zero-copy APPROVE (round 2, confirmed round 3).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

@@ -695,6 +695,19 @@ fn check_caps(xmm: &XmmBoot, s: &ExecSlot) -> Result<(), String> {
     Ok(())
 }
 
+/// XMM XH5d: the ALO priority cap slot 6's arm is armed with — the
+/// member's own ([`strategy_xmm::XMM_PRIORITY_MAX_USD_1E6`]) and its room
+/// under `ab_mode` 2 with a priority to bid; otherwise 0 (no place bids
+/// one).
+#[must_use]
+pub fn priority_cap(p: &strategy_xmm::XmmParams) -> u32 {
+    if p.ab_mode == 2 && p.alo_priority_1e8 > 0 {
+        strategy_xmm::XMM_PRIORITY_MAX_USD_1E6 + strategy_xmm::XMM_PRIORITY_ARM_ROOM_USD_1E6
+    } else {
+        0
+    }
+}
+
 /// **Boot slot 6's arm.** Every refusal names what to fix; the only network
 /// traffic before the thread starts is one `/info meta`.
 ///
@@ -886,6 +899,9 @@ pub fn boot_xmm_arm(
         }
         None => None,
     };
+    // XMM XH5d: the ALO priority's HYPE — the arm's session cap (0: every
+    // place bidding one refused unsent).
+    arm.set_priority_cap(priority_cap(&xmm.params));
     let sk = hl
         .secret_key()
         .map_err(|e| format!("slot 6's API wallet key: {e}"))?;
@@ -1607,5 +1623,19 @@ mod tests {
             t.contains("gateway, TESTNET, slot 6 on the shared E3 account"),
             "{t}"
         );
+    }
+
+    /// XMM XH5d: the arm's priority cap is armed for `ab_mode` 2 with a
+    /// priority to bid alone — the member's cap and its room; 0 otherwise.
+    #[test]
+    fn the_priority_cap_is_armed_for_ab_mode_2_with_a_priority_alone() {
+        let mut p = strategy_xmm::XmmParams::EMPTY;
+        assert_eq!(super::priority_cap(&p), 0);
+        p.ab_mode = 2;
+        assert_eq!(super::priority_cap(&p), 0, "no priority to bid");
+        p.alo_priority_1e8 = 10_000;
+        assert_eq!(super::priority_cap(&p), 26_000_000);
+        p.ab_mode = 3;
+        assert_eq!(super::priority_cap(&p), 0, "another arm's mode");
     }
 }

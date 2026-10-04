@@ -3683,7 +3683,9 @@ fn xmm_member_requote_replaced_and_stale_pull_are_zero_alloc() {
 /// taking their size-only modify, a lot down then back, each a floor after
 /// the last change, then no more — and, every third arm-B cycle, the bid's
 /// touch moving after its lot down (its requote ends the step), another
-/// the bid's lot down refused (the step ends) — allocate nothing.
+/// the bid's lot down refused (the step ends); under `ab_mode` 2 (XH5d-3b)
+/// the bids decided in arm B, at a level formed that cycle, bidding 1 %
+/// until the boot's cap — allocate nothing.
 #[test]
 fn xmm_member_ab_arms_are_zero_alloc() {
     use core_types::{
@@ -3694,7 +3696,8 @@ fn xmm_member_ab_arms_are_zero_alloc() {
 
     /// The live id and price by side (a placement's, then each modify's);
     /// the modifies sorted — the same price (size-only) or a new one (a
-    /// requote); and one refusal when asked.
+    /// requote); one refusal when asked; the places bidding ALO priority —
+    /// arm A's, arm B's bids, arm B's asks.
     struct AbCtx {
         now: u64,
         live: [u64; 2],
@@ -3702,10 +3705,15 @@ fn xmm_member_ab_arms_are_zero_alloc() {
         size_only: u64,
         repriced: u64,
         refuse: bool,
+        prio: [u64; 3],
     }
     impl Ctx for AbCtx {
         fn submit(&mut self, o: Order) -> Result<(), SubmitErr> {
             let s = usize::from(o.side == Side::Ask);
+            if o.alo_priority_1e8 != 0 {
+                // `ab_arm` 1 is arm A.
+                self.prio[if o.ab_arm == 1 { 0 } else { 1 + s }] += 1;
+            }
             self.live[s] = o.client_oid;
             self.px[s] = o.px.raw();
             Ok(())
@@ -3760,6 +3768,10 @@ fn xmm_member_ab_arms_are_zero_alloc() {
     xp.ab_mode = 3;
     let mut size = strategy_xmm::XmmStrategy::new();
     size.configure(&xp).expect("gate 75e size params");
+    xp.ab_mode = 2;
+    xp.alo_priority_1e8 = 1_000_000;
+    let mut prio = strategy_xmm::XmmStrategy::new();
+    prio.configure(&xp).expect("gate 75e priority params");
     let t0: u64 = 1_000_000_000_000;
     let mut tc = AbCtx {
         now: t0,
@@ -3768,6 +3780,7 @@ fn xmm_member_ab_arms_are_zero_alloc() {
         size_only: 0,
         repriced: 0,
         refuse: false,
+        prio: [0; 3],
     };
     let mut sc = AbCtx {
         now: t0,
@@ -3776,9 +3789,20 @@ fn xmm_member_ab_arms_are_zero_alloc() {
         size_only: 0,
         repriced: 0,
         refuse: false,
+        prio: [0; 3],
+    };
+    let mut pc = AbCtx {
+        now: t0,
+        live: [0; 2],
+        px: [0; 2],
+        size_only: 0,
+        repriced: 0,
+        refuse: false,
+        prio: [0; 3],
     };
     theta.on_start(&mut tc).expect("gate 75e θ start");
     size.on_start(&mut sc).expect("gate 75e size start");
+    prio.on_start(&mut pc).expect("gate 75e priority start");
     let book = |sym: u32, bid: i64, ask: i64, stale: bool| {
         let mut t = Tick::new(
             0,
@@ -3870,6 +3894,19 @@ fn xmm_member_ab_arms_are_zero_alloc() {
         size.on_tick(&lead_stale, &mut sc);
         size.on_order_event(&ev(live[0], ORDER_EVENT_CANCELED, pulled), &mut sc);
         size.on_order_event(&ev(live[1], ORDER_EVENT_CANCELED, pulled), &mut sc);
+        // `ab_mode` 2: the follower's bid improves half a tick into each
+        // arm-B cycle (its level forms there; arm A's retreat and the ask
+        // form none); both sides placed, then pulled.
+        let pf = if i % 2 == 0 { f } else { fu };
+        pc.now = t0 + i * 1_000 * MS;
+        prio.on_tick(&lead, &mut pc);
+        prio.on_tick(&pf, &mut pc);
+        let placed = pc.live;
+        prio.on_order_event(&ev(placed[0], ORDER_EVENT_RESTING, 0), &mut pc);
+        prio.on_order_event(&ev(placed[1], ORDER_EVENT_RESTING, 0), &mut pc);
+        prio.on_tick(&lead_stale, &mut pc);
+        prio.on_order_event(&ev(placed[0], ORDER_EVENT_CANCELED, pulled), &mut pc);
+        prio.on_order_event(&ev(placed[1], ORDER_EVENT_CANCELED, pulled), &mut pc);
         i += 1;
     }
 
@@ -3903,6 +3940,22 @@ fn xmm_member_ab_arms_are_zero_alloc() {
     );
     assert_eq!(s.pull_cancels, 2 * CYCLES, "size: the stale pull took both");
     assert_eq!((tc.size_only, tc.repriced), (0, 0), "θ: no modify");
+    // `ab_mode` 2: arm B's bids bid 1 % until the boot's cap; the asks
+    // (never moved) and arm A never; the cap stops them well before the
+    // last arm-B cycle.
+    let pr = prio.counters();
+    assert_eq!(pc.prio, [0, pr.priority_places, 0]);
+    // Each arm-B bid at 99.995 is 0.15 (the $15 clip in lots): 1 % of it
+    // is ⌈149 992.5⌉ = 149 993 USD ×1e6; $25 holds 166 of them — then the
+    // cap refuses the remaining arm-B cycles, inside the window.
+    assert_eq!(
+        (pr.priority_places, pr.priority_fee_usd_1e6),
+        (166, 166 * 149_993),
+        "the cap stopped them"
+    );
+    assert!(pr.priority_fee_usd_1e6 <= u64::from(strategy_xmm::XMM_PRIORITY_MAX_USD_1E6));
+    assert_eq!(pr.placed, 2 * CYCLES);
+    assert_eq!((pr.stuck, pr.unmatched), (0, 0));
     assert_eq!((t.stuck, t.unmatched, s.stuck, s.unmatched), (0, 0, 0, 0));
     assert_eq!(
         allocs, 0,

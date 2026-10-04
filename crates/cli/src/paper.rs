@@ -6765,7 +6765,7 @@ fn mirror_vrp_metrics<S: strategy_core::StrategyCounters>(
 pub const XMM_METRIC_PERPS: usize = 4;
 
 /// The xmm family's counters.
-const XMM_COUNTERS: usize = 22;
+const XMM_COUNTERS: usize = 25;
 
 /// The counter rows of the xmm family, in [`xmm_counter_values`] order
 /// — which is what pins the two together.
@@ -6792,10 +6792,13 @@ const XMM_COUNTER_NAMES: [&str; XMM_COUNTERS] = [
     "engine_xmm_congestion_cancels_total",
     "engine_xmm_health_held_total",
     "engine_xmm_busy_deferred_total",
+    "engine_xmm_priority_places_total",
+    "engine_xmm_priority_fee_usd_1e6_total",
+    "engine_xmm_priority_refused_total",
 ];
 
 /// `XmmCounters`' fields in [`XMM_COUNTER_NAMES`] order.
-// COPY: [u64; 22] (176 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 25] (200 B) returned by value — cold, the 5 s /metrics
 // mirror; the fields are visited once in the name order — a borrowed
 // view would need the struct to be an array, which the POD is not.
 fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; XMM_COUNTERS] {
@@ -6822,6 +6825,9 @@ fn xmm_counter_values(c: &strategy_core::XmmCounters) -> [u64; XMM_COUNTERS] {
         c.congestion_cancels,
         c.health_held,
         c.busy_deferred,
+        c.priority_places,
+        c.priority_fee_usd_1e6,
+        c.priority_refused,
     ]
 }
 
@@ -6878,7 +6884,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
     strat: &S,
     last: &mut strategy_core::XmmCounters,
 ) {
-    // COPY: the 176 B `XmmCounters` read into `cur`, then kept as the
+    // COPY: the 200 B `XmmCounters` read into `cur`, then kept as the
     // next delta's baseline (`*last = cur`) — 5 s cadence, cold; a delta
     // needs the previous value, so one copy survives either way.
     let mut cur = strategy_core::XmmCounters::default();
@@ -6890,7 +6896,7 @@ fn mirror_xmm_metrics<S: strategy_core::StrategyCounters>(
         reg.counter(ids.counters[i]).inc(c[i].saturating_sub(l[i]));
         i += 1;
     }
-    // COPY: 176 B — the next delta's baseline (see above).
+    // COPY: 200 B — the next delta's baseline (see above).
     *last = cur;
     let mut rows = [strategy_core::XmmPerpView::default(); XMM_METRIC_PERPS];
     let n = strat.xmm_perps_view(&mut rows);
@@ -12358,7 +12364,8 @@ mod tests {
         // family (65 + 28) took the worst case past 512 / 384; XH5a adds
         // one counter (519); XMM XH5b-2 two counters and five gauges
         // (521 / 412); XH5c-2 three and three (524 / 415); XH5c-3 two
-        // gauges (417); XH5d-1 two gauges (419).
+        // gauges (417); XH5d-1 two gauges (419); XH5d-3b three counters
+        // (527).
         assert!(reg.gauges_len() <= core_metrics::MAX_GAUGES);
         let mut buf = vec![0u8; 256 * 1024];
         let n = reg.encode_prometheus(&mut buf).expect("/metrics fits its buffer");
@@ -12516,6 +12523,9 @@ mod tests {
         f.c.pull_cancels = 4;
         f.c.stuck = 1;
         f.c.busy_deferred = 3;
+        f.c.priority_places = 2;
+        f.c.priority_fee_usd_1e6 = 3_000;
+        f.c.priority_refused = 4;
         f.rows[0].pos_1e6 = 150_000;
         f.rows[1].pos_1e6 = -20_000;
         mirror_xmm_metrics(&reg, &ids, &f, &mut last);
@@ -12527,6 +12537,15 @@ mod tests {
             3,
             "busy_deferred (XH4f)"
         );
+        assert_eq!(
+            (
+                reg.counter(ids.counters[22]).get(),
+                reg.counter(ids.counters[23]).get()
+            ),
+            (2, 3_000),
+            "the ALO priority's places and fee (XMM XH5d)"
+        );
+        assert_eq!(reg.counter(ids.counters[24]).get(), 4, "priority_refused");
         assert_eq!(reg.gauge(ids.perps).get(), 2);
         assert_eq!((reg.gauge(ids.pos[0]).get(), reg.gauge(ids.pos[1]).get()), (150_000, -20_000));
         assert_eq!(reg.gauge(ids.pos[2]).get(), 0, "a perp not quoted reads zero");

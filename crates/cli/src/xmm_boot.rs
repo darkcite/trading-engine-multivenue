@@ -180,16 +180,22 @@ pub fn render_boot_tell(boot: &XmmBoot) -> String {
         p.requote_min_ms,
         p.alo_priority_1e8,
         p.ab_mode,
-        ab_arms(p.ab_mode),
+        ab_arms(p.ab_mode, p.alo_priority_1e8),
     )
 }
 
 /// XMM XH5d: what `ab_mode` quotes, for the boot tell — the block function
 /// stated (one token: the tell is `key=value` words).
-fn ab_arms(mode: u8) -> &'static str {
+fn ab_arms(mode: u8, alo_priority_1e8: u32) -> &'static str {
     match mode {
+        2 if alo_priority_1e8 == 0 => {
+            "alo_priority:off(alo_priority_1e8=0);block=(follower_venue_ms/600000)%2,even=A"
+        }
         1 => "theta:A=artifact,B=half;block=(follower_venue_ms/600000)%2,even=A",
-        2 => "alo_priority:quotes_as_0_until_XH5d-3",
+        2 => {
+            "alo_priority:B=p_on_fresh_places_at_levels_formed_within_400ms,cap_usd_1e6=25000000;\
+              block=(follower_venue_ms/600000)%2,even=A"
+        }
         3 => "size_only_modify:B=one_lot_down_then_back;block=(follower_venue_ms/600000)%2,even=A",
         _ => "off",
     }
@@ -250,8 +256,14 @@ mod tests {
         assert!(tell.starts_with("xmm: artifact configured hash="), "{tell}");
         // XMM XH5d: the arms stated (the example quotes as 0).
         assert!(tell.contains("ab_mode=0 ab_arms=off "), "{tell}");
-        assert!(super::ab_arms(1).contains("block=(follower_venue_ms/600000)%2,even=A"));
-        assert!(!super::ab_arms(3).contains(' '), "one token");
+        assert!(super::ab_arms(1, 0).contains("block=(follower_venue_ms/600000)%2,even=A"));
+        assert!(!super::ab_arms(3, 0).contains(' '), "one token");
+        assert!(!super::ab_arms(2, 10_000).contains(' '), "one token");
+        assert!(super::ab_arms(2, 0).starts_with("alo_priority:off"));
+        assert!(super::ab_arms(2, 10_000).contains(&format!(
+            "cap_usd_1e6={}",
+            strategy_xmm::XMM_PRIORITY_MAX_USD_1E6
+        )));
     }
 
     #[test]

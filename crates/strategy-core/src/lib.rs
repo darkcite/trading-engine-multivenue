@@ -1355,8 +1355,17 @@ pub struct XmmCounters {
     pub health_held: u64,
     /// XH4f (D8): requotes a busy arm deferred (its floor ×4).
     pub busy_deferred: u64,
+    /// XMM XH5d (`ab_mode` 2): fresh places that bid ALO priority.
+    pub priority_places: u64,
+    /// XMM XH5d: the HYPE those bids committed, USD ×1e6 (rounded up per
+    /// place — the arm's own reckoning); the boot's cap bounds it.
+    pub priority_fee_usd_1e6: u64,
+    /// XMM XH5d: priority places the venue refused for no reason it names
+    /// (`ORDER_EVENT_REASON_OTHER`) — three in a row end the priority for
+    /// the boot.
+    pub priority_refused: u64,
 }
-const _: () = assert!(core::mem::size_of::<XmmCounters>() == 22 * 8);
+const _: () = assert!(core::mem::size_of::<XmmCounters>() == 25 * 8);
 
 /// HC11: the slot-7 HCV member's counters and gauges (`engine_hcv_*`,
 /// `/state` `hcv`), written by the member crate. POD.
