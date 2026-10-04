@@ -10230,6 +10230,43 @@ instance on mainnet credentials and the paper engine's files, the whole
 operator directory copied (with a credential file), a SIGKILL restart and
 XH5b-1's pre-arm checks missing — all fixed above.
 
+### XH5e-3 amendment (2026-10-04): Hyperliquid discovery sized for the venue's lists as they are
+
+Found by the testnet engine-instance run (XH5e-2's runbook): the
+instance's boot refused at Hyperliquid discovery. Testnet's `perpDexs` and
+`outcomeMeta` lists had outgrown the parser's caps. The same growth on
+mainnet would have refused the paper engine's own boot.
+
+- **The caps.** `HL_DISCOVERY_DEXS_CAP` rises from 64 to 1 024, and
+  `HL_DISCOVERY_OUTCOMES_CAP` from 512 to 4 096. Both stay fail-closed: past
+  a cap the boot refuses, and a rediscovery leaves its family waiting. A
+  truncated table could drop a family's live instance without a word.
+- **No downstream change.** The dex index (a `u16`) and the builder asset
+  ids (below the HIP-4 base) hold at the new caps. Nothing else is sized by
+  these constants.
+- **Allocation.** Each table reserves about 438 KiB, built at boot and by
+  the ingress thread's family rediscovery. That rediscovery runs between
+  sessions, at most once a minute, with the lane dark: a cold path, and no
+  alloc gate's. The module's note now names it. `outcome_specs()` carries a
+  `// COPY:` note: at most 256 KiB, cold.
+- **Deferred, for Anton.**
+  - A warning when a list passes half its cap (A-S7-46).
+  - BIN15's family binding: it matches an outcome by its description's
+    shape and window, not by its deployer, so a look-alike deployed by a
+    third party could be adopted. This predates this cut, and must be fixed
+    before any live re-arm of slot 3 (A-S7-47).
+
+**Tests:** testnet's live lists of 2026-10-04 parse (268 dexes, 633
+outcomes). The existing cap tests (cap + 1 refused) scale with the
+constants.
+
+**Gates:** clippy 0; nextest 4 205/4 205; alloc 109 (+3 ignored) at 0 B;
+copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL; rustfmt
+clean on touched hunks.
+
+**Reviews:** risk, allocation and zero-copy APPROVE (round 2; round 1's
+findings were notes and comments, all applied or deferred above).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
