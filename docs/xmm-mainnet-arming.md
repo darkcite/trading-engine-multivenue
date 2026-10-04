@@ -57,8 +57,15 @@ installs them and restarts nothing.
    - **Funded in full before the first boot**: $1 000 USDC. Spot USDC margins the
      perps (XH4g), and the first positive worth anchors the session, so funding
      in steps would anchor at the first step.
-   - No HYPE is needed at `ab_mode` 0. About $50 undelegated is needed only for
-     `ab_mode` 2, whose priority spend is capped at $25 a boot.
+   - No HYPE is needed at `ab_mode` 0. `ab_mode` 2 needs about $50 of HYPE in
+     this master's **staking** balance, moved there from spot and left
+     undelegated (the venue's "delegatable balance"); spot HYPE does not pay
+     the priority fee (XH5e-4). Its spend is capped at $25 a boot. Staked HYPE
+     takes 7 days to come back to spot. Buy and stake it before the first
+     boot, on top of the $1 000: the worth counts USDC only, so HYPE bought
+     with this master's USDC during a session reads as a loss. Before an
+     `ab_mode` 2 boot, `q delegatorSummary $MASTER` (§A4) must show
+     `undelegated` worth about $50.
 4. **The venue's reads.** These are public `/info` calls; the addresses are typed
    by hand and no key is used:
 

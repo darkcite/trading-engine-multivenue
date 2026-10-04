@@ -9963,13 +9963,15 @@ until XH5d-3b, which bounds the spend.
   rows regenerate byte-identical. The XH5e testnet step proves the venue
   takes the grouping.
 - **What it costs.** The venue charges p ×1e8 of the resting notional at
-  placement from the undelegated HYPE balance — each place in a priority
-  batch on its own notional — outside the worth (USDC only) and outside
-  every cap the router keeps; the arm's cap is its bound. The engine reads
-  no HYPE balance: how the venue treats a priority place short of
-  undelegated HYPE is unproven (XH5e's testnet step and funding line) —
-  if it refuses them, they come back as ALO refusals and count toward
-  XH-7's reject-rate halt.
+  placement from the undelegated HYPE of the master's staking balance (the
+  venue's "delegatable balance"; spot HYPE does not pay — XH5e-4) — each
+  place in a priority batch on its own notional — outside the worth (USDC
+  only) and outside every cap the router keeps; the arm's cap is its bound.
+  The engine reads no HYPE balance. Short of it, the venue refuses the
+  place with an order error the arm classes OTHER — never an ALO reject,
+  so XH-7's rate does not rise; it counts in the reject streak (five in a
+  row halt the slot). XH5e-4 records the testnet answer and corrects this
+  bullet's earlier guess.
 - **Copies:** none new (the grouping is written in place by the existing
   msgpack and JSON writers; the arm writes `arg` in place).
 
@@ -10010,18 +10012,20 @@ artifact's — and modes 1 and 3 bid no priority.
 - **The cap.** The member tallies each bid's fee — p ×1e8 of the place's
   notional, rounded up, the arm's own reckoning on the same price and size
   — and bids none once the next would pass $25 a boot
-  (`XMM_PRIORITY_MAX_USD_1E6`, half the probe's funded HYPE). Slot 6's arm
+  (`XMM_PRIORITY_MAX_USD_1E6`, half the probe's funded HYPE — staked and
+  left undelegated, XH5e-4). Slot 6's arm
   is armed (XH5d-3a's `set_priority_cap`) only under `ab_mode` 2 with a
   priority to bid, at the member's cap and $1 of room
   (`XMM_PRIORITY_ARM_ROOM_USD_1E6`): the member stops first, and the arm
   refuses unsent past its own. Every other configuration arms none — a
   place bidding a priority would be refused unsent. The cap is per boot:
   the funded HYPE is the ceiling across restarts.
-- **The latch.** How the venue answers a priority it will not take (short
-  of undelegated HYPE) is unproven (XH5e's testnet step records it). If it
-  lands as a refusal the arm cannot name (`ORDER_EVENT_REASON_OTHER` — an
-  item's error, a whole action refused, a stream's unnamed rejection),
-  three priority places in a row refused so end the priority for the boot
+- **The latch.** A priority the venue will not take (short of undelegated
+  HYPE in the staking balance) lands as a refusal the arm cannot name
+  (`ORDER_EVENT_REASON_OTHER` — an item's error, a whole action refused, a
+  stream's unnamed rejection); on testnet it is the order error
+  `Insufficient delegatable balance for priority order` (XH5e-4). Three
+  priority places in a row refused end the priority for the boot
   (`priority_refused` counts them); a priority place that rests resets the
   run. The member keeps quoting; arm B's places bid none after it. The
   latch has tripped when `priority_places` stops growing while arm B
@@ -10170,7 +10174,8 @@ only Anton arms the probe, by the checklist.
   - the top-ups.
 
   Its priority proof — the grouping accepted, and the venue's answer with no
-  undelegated HYPE recorded — comes before any `ab_mode` 2 on mainnet.
+  undelegated HYPE in the staking balance recorded — comes before any
+  `ab_mode` 2 on mainnet (done 2026-10-04: XH5e-4).
 - **The arming checklist** (`docs/xmm-mainnet-arming.md`) is the only way to
   arm.
   - **Before the flip** it checks:
@@ -10266,6 +10271,47 @@ clean on touched hunks.
 
 **Reviews:** risk, allocation and zero-copy APPROVE (round 2; round 1's
 findings were notes and comments, all applied or deferred above).
+
+### XH5e-4 amendment (2026-10-04): the ALO priority's funding and the venue's answer — the testnet runbook's §7
+
+Docs only: no code, test or script changes. Recorded from the testnet
+engine-instance runs of 2026-10-04 (slot 6 on the shared E3 account, main's
+`79abb8c` binary, `ab_mode` 2 at 1 bp) and three probe orders signed by the
+official SDK (hyperliquid-python-sdk 0.24.0, a throwaway venv).
+
+- **What pays.** The priority fee comes from the master's **staking**
+  balance, undelegated — the venue's "delegatable balance". Spot HYPE does
+  not pay: with 0.9993 HYPE in spot and none staked, every priority place
+  was refused. "Undelegated HYPE" in XH5d-3a and XH5d-3b, the testnet
+  runbook and the arming checklist means this balance. HYPE reaches it by
+  the staking page's spot-to-staking transfer, with no validator chosen;
+  moving it back to spot takes 7 days, so fund it for the probe's life.
+- **Without it,** the venue's answer, word for word: the order's status is
+  the error `Insufficient delegatable balance for priority order` (the
+  action itself answers `ok`); the same order without the grouping rests.
+  The arm classes it `ORDER_EVENT_REASON_OTHER`: it counts in
+  `rejected_other` and in the arm's reject streak (an accepted place resets
+  the streak; five in a row halt the slot), never as an ALO reject, so
+  XH-7's rate does not rise. The member's latch ended the priority after
+  three refusals and held: through the next arm-B block `priority_places`
+  stayed at 3 while the member placed 615 more orders. XH5d-3a's guess (an
+  ALO refusal) is corrected there.
+- **With it** (1 HYPE staked, undelegated): 11 priority places over two
+  arm-B blocks, none refused, each resting. The charge is taken at
+  placement, on the resting notional, converted at HYPE's spot mark price:
+  the staking balance fell 0.00045 HYPE against the member's tally of
+  $0.0162 (≈ $35.6 a HYPE; the spot mid was $35.4), and a probe order
+  cancelled at once was charged too.
+- **What it settles.** The testnet runbook's §9.5 holds. `ab_mode` 2 on
+  mainnet still waits for its ruling (Q-XH5-5) and for HYPE staked on the
+  probe's master; the first run stays at `ab_mode` 0.
+- **Also seen** (a shared account only): the operator arm's shutdown sweep
+  logged `left=6`. It read the venue before the gateway's own shutdown
+  cancels of slot 6's orders landed; the gateway confirmed its sweep, and
+  the venue showed none open seconds later (A-S7-55, a follow-up on the
+  shutdown's order).
+
+**Gates:** unchanged — docs only, and no test reads these files.
 
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 

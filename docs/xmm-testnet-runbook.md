@@ -11,8 +11,8 @@ proves five things:
 3. Top-ups work on an account of slot 6's own (XMM XH5c-2), and a restart restores
    the session (XMM XH5b-2).
 4. The venue accepts the ALO priority grouping `{"p": N}`, and we know its answer
-   to a priority place when no HYPE is undelegated (XMM XH5d-3). This is required
-   before any `ab_mode` 2 on mainnet.
+   to a priority place when the master's staking balance holds no undelegated
+   HYPE (XMM XH5d-3, XH5e-4). This is required before any `ab_mode` 2 on mainnet.
 5. The preflight and the probe's artifacts (XMM XH5e-1) work on that binary.
 
 The pass criteria are in §9. Record the results in the vault and tell the
@@ -38,7 +38,10 @@ session.
     `HYPERLIQUID_TESTNET_MASTER_ADDR`), mapped onto the operator arm's names in §2.
   - No other E3 signer may run: the launchd engine's slot 3 is paper
     (`scripts/bin15-flip.sh status`), and no `exec-smoke` is running.
-  - For §7: about 2 HYPE undelegated on slot 6's testnet master.
+  - For §7: about 1 HYPE in the **staking** balance of slot 6's testnet master,
+    moved there from spot (the staking page's transfer) and left undelegated —
+    the venue's "delegatable balance". Spot HYPE does not pay the priority fee
+    (XH5e-4). Moving it back to spot takes 7 days.
 - **Flat.** Neither testnet account holds a position or an open order (see the
   reads in §3).
 
@@ -205,16 +208,27 @@ The probe's first mainnet run is `ab_mode` 0. To look at modes 1 and 3:
 1. Stop the instance and flatten slot 6 by hand (before every restart). In its `xmm.toml`, set `ab_mode = 2` and
    `alo_priority_1e8 = 10000` (1 bp).
 2. Rerun the preflight: `ab_arms=alo_priority:B=…,cap_usd_1e6=25000000`.
-3. **With HYPE undelegated** (§1), run for 20 min, then read:
+3. **With HYPE staked and undelegated** (§1), run for 20 min, then read:
    - `engine_xmm_priority_places_total` > 0;
-   - each priority place RESTING at the venue;
-   - the testnet HYPE balance falls by the fees;
+   - each priority place RESTING at the venue (none among the run's rejects),
+     and `engine_xmm_priority_refused_total` at 0;
+   - the staking balance's undelegated HYPE (`/info` `delegatorSummary`) falls
+     by the fees — the venue charges each place at placement, on its resting
+     notional, converted at HYPE's spot mark price;
    - `engine_xmm_priority_fee_usd_1e6_total` ≈ that fall.
-4. Stop. Delegate the HYPE or move it, so none is undelegated. Run again until
+4. Stop. Delegate the staked HYPE (or run before staking any), so the staking
+   balance holds none undelegated; spot HYPE does not count. Run again until
    three priority places have been answered.
-5. **Record the venue's answer word for word** (the log's REJECTED reason).
-   - If it was accepted, the fee was charged somewhere else; record where.
-   - If it was refused, the latch trips: `engine_xmm_priority_places_total` stays
+5. **Record the venue's answer word for word.** The engine keeps only the reason
+   code (OTHER), so take the words from one order placed by hand with the
+   grouping and priced far behind the book, with the instance stopped, on
+   testnet's URL and a fresh slot-6 cloid (the official SDK's
+   `bulk_orders(…, grouping={"p": 10000})`; its default URL is mainnet's);
+   cancel it if it rests. On 2026-10-04 testnet answered
+   `Insufficient delegatable balance for priority order` (XH5e-4).
+   - If the engine's priority places were accepted, the fee was charged
+     somewhere else; record where.
+   - If they were refused, the latch trips: `engine_xmm_priority_places_total` stays
      frozen, `engine_xmm_priority_refused_total` ≥ 3, and
      `engine_xmm_priority_fee_usd_1e6_total` falls short of 25 000 000.
 6. Set `ab_mode` back to 0.
@@ -241,9 +255,10 @@ The probe's first mainnet run is `ab_mode` 0. To look at modes 1 and 3:
 3. Halting 6 left slot 3's orders resting, and halting 3 left slot 6's, or §5's
    fallback is recorded. The restart's tell said `anchor RESTORED`.
 4. A top-up was bought and confirmed, or recorded as not reached within 90 min.
-5. With HYPE undelegated, the priority grouping was accepted (RESTING), and the
-   no-HYPE answer is recorded (§7). This is required before `ab_mode` 2 on
-   mainnet. It is not required for the first run at `ab_mode` 0.
+5. With HYPE staked and undelegated, the priority grouping was accepted
+   (RESTING), and the no-HYPE answer is recorded (§7). This is required
+   before `ab_mode` 2 on mainnet. It is not required for the first run at
+   `ab_mode` 0.
 6. The stop left nothing resting. The instance held no credential files and no
    key but E3's and slot 6's testnet ones, and the paper engine never restarted
    into a backed-off wrapper.
