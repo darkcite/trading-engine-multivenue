@@ -10121,6 +10121,115 @@ clean on touched hunks.
 zero-copy APPROVE (round 2); their two round-2 wording NITs applied
 (comments only).
 
+### XH5e-2 amendment (2026-10-04): the flip and the runbooks — how the probe is armed, and by whom
+
+The second part of XH5e (plan §3.5, R-XH4-8; A-S7-37). It arms nothing:
+only Anton arms the probe, by the checklist.
+
+- **The flip** (`scripts/xmm-flip.sh status|live|paper`) is the only way
+  the probe's artifacts reach `~/multivenue`.
+  - **What it touches.** It edits `strategy.conf` (`XMM_TOML`, `EXEC_TOML`,
+    `ARM_LIVE`) and `exec.toml`'s `[exec.slot.6]` alone, each after a `.bak`.
+    It installs the probe's member as `~/multivenue/xmm-probe.toml`. It
+    restarts nothing.
+  - **When `live` refuses.** `live` refuses unless all of these hold:
+    - slot 6 is a clean paper state, and the running engine does not route it
+      live;
+    - `STRATEGY` boots xmm;
+    - `exec.HALT` halts slot 6 for no reason but the operator's (archived, then
+      dropped);
+    - it is outside the quiet windows;
+    - no scheduled drain is near, no gated restart is owed, and the wrapper is
+      not mid-boot;
+    - the checkout is the one the engine's launchd job runs, and its binary was
+      built after its HEAD with the preflight in it;
+    - the preflight passes on the work copies. These are written beside the
+      installed files and run in the environment the wrapper builds under
+      launchd: the terminal's exports dropped, the repo `.env` and the
+      wrapper's testnet names sourced as the wrapper sources them, tracing off.
+      A sandbox's stand-ins (`MULTIVENUE_DIR`, the plist, the env file) are
+      honoured only under an explicit sandbox switch and refused otherwise.
+
+    Nothing is installed unless it passes.
+  - **`paper`.** `paper` halts slot 6 first (the halt read back as the engine
+    parses it), unless the file says paper and the engine answers without
+    routing it live. It then restores paper.
+  - **Restarting.** A restart is SIGTERM (`pkill -TERM -f 'multivenue-engine
+    run'`, launchd's KeepAlive relaunching), never `launchctl kickstart -k`,
+    which is SIGKILL and skips the gateway's shutdown sweep.
+- **The testnet engine-instance runbook** (`docs/xmm-testnet-runbook.md`)
+  runs before the first mainnet arming. It runs a second engine on the binary
+  the probe will run: slot 6 on the gateway beside slot 3 on E3, under a
+  home, port, credentials and minimal universe of its own. Every path is
+  under that home, every Hyperliquid host is testnet's, E3's pair stands in
+  for the operator arm's names, and every exported credential but E3's and
+  slot 6's testnet keys is dropped; no credential file is copied. It checks:
+  - the boot's tells and numbers against the venue;
+  - the per-slot halt, both ways;
+  - the session restored across a restart (`anchor RESTORED`);
+  - the top-ups.
+
+  Its priority proof — the grouping accepted, and the venue's answer with no
+  undelegated HYPE recorded — comes before any `ab_mode` 2 on mainnet.
+- **The arming checklist** (`docs/xmm-mainnet-arming.md`) is the only way to
+  arm.
+  - **Before the flip** it checks:
+    - the account at the venue: funded in full before the first boot, flat,
+      and the API wallet approved and bound;
+    - XH5b-1's margin check: a small position opened by hand, and the worth
+      against funded − fees + its unrealised P&L. A residual of half the
+      margin in use or more aborts.
+  - **No transfers** are made while a session's anchor stands.
+  - **After the restart**, it reads:
+    - the boot tell's `MAINNET` and anchor lines;
+    - `dm_availability` (`eligible`, or halt);
+    - `/metrics` against the venue.
+  - **The `.env` switch.** `HYPERLIQUID_XMM_*` sit in `.env` only during an
+    armed session (Q-XH5-3: with no third switch they are the mainnet
+    switch).
+  - **Ending a session.** A session ends with the anchor's file moved aside.
+  - **A tripped priority latch** reads as `engine_xmm_priority_places_total`
+    frozen, `engine_xmm_priority_refused_total` at 3 or more, and
+    `engine_xmm_priority_fee_usd_1e6_total` short of the cap.
+- **Two recorded limits.**
+  - `dm_availability` is read within the first read period after the boot,
+    so the member's first quotes may precede it — a deviation from XH5b-3's
+    "before the first quote" (A-S7-43).
+  - The five daily drains restart the engine. If slot 6 holds a position at a
+    drain, the boot holds its arm until flat (H5), and its stale reads then
+    halt it: each drain needs a hand flatten, or the session ends before it.
+- **XH5a's obligation is closed.** BIN15's flip checks hold under the
+  per-slot halt. `bin15-flip.sh paper` halts slot 3 through `exec.HALT`,
+  which now cancels slot 3's orders alone. Its venue check counts slot 3's
+  cloids and the `#` outcome coins, and slot 6 trades perps on a master of
+  its own.
+
+**Tests:** the flip in a sandbox (copies of the operator's `strategy.conf`,
+`exec.toml` and `xmm.toml`; no real `.env`; throwaway credentials):
+- `status`;
+- `live` refused when:
+  - the binary is older than HEAD;
+  - the checkout is not the one the launchd job runs;
+  - the preflight refuses (terminal exports do not reach it);
+  - a halt has another reason.
+
+  Nothing changed in any of these cases.
+- `live` passing and installing;
+- `paper` halting a live slot and restoring paper, and halting nothing on a
+  paper state;
+- `live` again dropping the operator's halt line, leaving one section and one
+  provenance line in `exec.toml`, with modes preserved.
+
+**Gates:** clippy 0; nextest 4 204/4 204; alloc 109 (+3 ignored) — no code in
+this cut; copy-audit 31, new 0; license OK; release OK; replay 7× IDENTICAL;
+rustfmt clean. Rounds 2–4 changed the script and the documents alone.
+
+**Reviews:** risk APPROVE (round 4), allocation APPROVE (round 4),
+zero-copy APPROVE (round 3, confirmed round 4). Round 1 found the testnet
+instance on mainnet credentials and the paper engine's files, the whole
+operator directory copied (with a credential file), a SIGKILL restart and
+XH5b-1's pre-arm checks missing — all fixed above.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall
