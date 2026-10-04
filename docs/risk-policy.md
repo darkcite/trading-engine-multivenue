@@ -10187,7 +10187,9 @@ only Anton arms the probe, by the checklist.
   - **No transfers** are made while a session's anchor stands.
   - **After the restart**, it reads:
     - the boot tell's `MAINNET` and anchor lines;
-    - `dm_availability` (`eligible`, or halt);
+    - `dm_availability` — under O-XH4 since XH5e-5: `unknown` or `refused`
+      expected below $1 000 000 traded, quoting on; halt on `exhausted`, or on
+      anything but `eligible` once the master qualifies;
     - `/metrics` against the venue.
   - **The `.env` switch.** `HYPERLIQUID_XMM_*` sit in `.env` only during an
     armed session (Q-XH5-3: with no third switch they are the mainnet
@@ -10310,6 +10312,43 @@ official SDK (hyperliquid-python-sdk 0.24.0, a throwaway venv).
   cancels of slot 6's orders landed; the gateway confirmed its sweep, and
   the venue showed none open seconds later (A-S7-55, a follow-up on the
   shutdown's order).
+
+**Gates:** unchanged — docs only, and no test reads these files.
+
+### XH5e-5 amendment (2026-10-04): the arming checklist's dead-man check follows O-XH4
+
+Anton's ruling (2026-10-04): §C12 follows O-XH4, "so the probe keeps
+quoting without the dead man's switch until the account qualifies". Docs
+only: no code, test or script changes.
+
+- **Why.** XH5e-2's §C12 halted unless `dm_availability` read `eligible`.
+  The venue refuses `scheduleCancel` until the address has traded
+  $1 000 000 (its words, kept in `tests/hl_gateway_loopback.rs`'s fixture:
+  "Cannot set scheduled cancel time until enough volume traded. Required:
+  $1000000."), and the probe's master is a fresh one (§A3), so the check
+  would have halted every boot. O-XH4 (the maker plan §8.11) rules the other way:
+  until the account is eligible, slot 6 quotes on the engine TTL (≤ 30 s,
+  LAW E-8), the boot sweep and the caps, and the gateway arms the switch by
+  itself once a probe is accepted.
+- **The check now** (§C12) reads the availability with the master's
+  lifetime volume (`portfolio`, `allTime` `vlm`). Below $1 000 000,
+  `unknown` or `refused` is expected and the probe keeps quoting; at or
+  above it, anything but `eligible` halts; `exhausted` (ten deadlines the
+  venue may have held passed unmoved today) halts at any volume. §D15 reads
+  it at every check, §E18 stops on the halting readings, the known-limits
+  note names the accepted risk, and the testnet runbook's §3 and §9 expect the same.
+- **The accepted risk,** unchanged from O-XH4: between a crash or a network
+  loss and the next boot's sweep, slot 6's quotes rest on the venue — at
+  most $300 resting and ±$150 a perp. A crash relaunches through launchd,
+  and the boot sweeps.
+- **No code change:** the gateway already probes, parks and arms this way
+  (XH4c's `deadman.rs`). Every boot starts at `unknown` and parks the switch
+  after three refused arms in a row, until the next boot or UTC day: three
+  refused probes at every boot and every UTC day, not XH4c's "three probes
+  a day, and one a restart". A refused boot clear takes the longest schedule
+  as held, so a master below $1 000 000 adds one counted trigger a boot;
+  the count restarts with the process, so restarts never add up to
+  `exhausted`.
 
 **Gates:** unchanged — docs only, and no test reads these files.
 

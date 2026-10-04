@@ -148,7 +148,7 @@ q userRateLimit $XMM_MASTER; q userFills $XMM_MASTER
 | `engine_exec_hlgw_budget_remaining` | `nRequestsCap − nRequestsUsed` |
 | `engine_exec_hlgw_ready`, `engine_exec_hlgw_ws_up`, `engine_exec_hlgw_own_account` | 1 |
 | `engine_exec_hlgw_halt_reason`, `engine_exec_hlgw_leverage_dark` | 0 |
-| `/state` `exec.arms.hyperliquid_gw.deadman.availability` | `eligible` |
+| `/state` `exec.arms.hyperliquid_gw.deadman.availability` | `eligible` once the master has traded $1 000 000; below that `unknown` or `refused` (O-XH4; the arming checklist's §C12) |
 | fills | the venue's `userFills` |
 
 The member quotes:
@@ -251,7 +251,8 @@ The probe's first mainnet run is `ab_mode` 0. To look at modes 1 and 3:
 1. The preflight passed on TESTNET with `own_account=true`. The boot's tells read
    as in §3.
 2. Every number in §3 agreed with the venue within one read period.
-   `dm_availability` was `eligible`.
+   `dm_availability` read as the arming checklist's §C12 expects for the
+   master's volume (O-XH4).
 3. Halting 6 left slot 3's orders resting, and halting 3 left slot 6's, or §5's
    fallback is recorded. The restart's tell said `anchor RESTORED`.
 4. A top-up was bought and confirmed, or recorded as not reached within 90 min.
