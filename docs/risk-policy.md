@@ -6607,9 +6607,12 @@ API changes are in migration.md.
   read together); the reuse probe and the `Connection: close`
   retirement (H9c), now the engine's code rather than a copy; DNS
   re-resolved, blocking, after every third failed dial in a row, as
-  `HlHttp` did. The caller's thread — the arm's worker, or the
-  gateway's thread on its REST fallback — still blocks for a cycle, up
-  to 5 s.
+  `HlHttp` did. The calling thread still blocks for a cycle, up to 5 s:
+  on the `--exec` path that is the ENGINE thread for the blocking arm —
+  slot 3's submits and idle work, and HYPARB's Hyperliquid hedges
+  (`crates/engine/src/lib.rs`: "It BLOCKS, and that is the accepted
+  cost"; XH4i moves BIN15 onto the gateway) — and the gateway's own
+  thread on its REST fallback.
 * **The gateway's REST fallback renders the envelope straight into the
   `/exchange` window** when a post is sealed with no socket Ready — no
   WebSocket head it would never be sent with, and no copy. Only a
