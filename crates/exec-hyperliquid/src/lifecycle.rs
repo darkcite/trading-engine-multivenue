@@ -53,7 +53,7 @@ use crate::action::{
     encode_cancel_by_cloid, encode_order, CancelByCloidWire, ModifyWire, OrderWire, Tif, MAX_ACTION,
 };
 use crate::config::HlConfig;
-use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::http::HlHttp;
 use crate::request::{batch_modify_json, cancel_by_cloid_json, envelope, order_json};
 use crate::response::{scan, HlOk, HlResponse};
 use crate::sign::{sign_action, Vault};
@@ -423,10 +423,9 @@ fn post(
     let nonce = nonces.next(crate::nonce::now_ms());
     let sig = sign_action(sk, action_mp, nonce, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
-    let mut body = [0u8; MAX_REQ_BODY];
-    let n = envelope(&mut body, action_json, nonce, &sig, None, None)
+    let n = envelope(http.body_mut(), action_json, nonce, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     match scan(slice).map_err(|_| SmokeErr::Unreadable)? {
@@ -1617,12 +1616,9 @@ fn enumerate(
     cfg: &HlConfig,
     rows: &mut [crate::recon::OpenOrder],
 ) -> Result<(usize, core::ops::Range<usize>), SmokeErr> {
-    let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
-    let n = crate::recon::open_orders_request(&mut req, &cfg.master_addr)
+    let n = crate::recon::open_orders_request(http.info_mut(), &cfg.master_addr)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http
-        .post_to(crate::http::INFO_PATH, &req[..n])
-        .map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post_info(n).map_err(|e| SmokeErr::Http(e.err))?;
     // Fail-closed: an unreadable answer is NOT "nothing is resting".
     let k = crate::recon::scan_open_orders(&http.resp()[range.clone()], rows)
         .map_err(|_| SmokeErr::Unreadable)?;
@@ -1991,12 +1987,9 @@ pub fn run_recon(
     }
 
     let mut http = HlHttp::new(&cfg.host, cfg.port(), tls).map_err(SmokeErr::Http)?;
-    let mut req = [0u8; crate::recon::MAX_STATE_REQ];
-    let n = crate::recon::spot_state_request(&mut req, &cfg.master_addr)
+    let n = crate::recon::spot_state_request(http.info_mut(), &cfg.master_addr)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http
-        .post_to(crate::http::INFO_PATH, &req[..n])
-        .map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post_info(n).map_err(|e| SmokeErr::Http(e.err))?;
     let body = &http.resp()[range];
     let mut bal = vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES];
     let rows = crate::recon::scan_spot_state(body, &mut bal).map_err(|_| SmokeErr::Unreadable)?;

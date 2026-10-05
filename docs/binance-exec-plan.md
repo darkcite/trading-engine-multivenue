@@ -1221,7 +1221,7 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
 **What BX5 adds:**
 - A **keep-alive REST client** over `http1`: GET, POST, PUT and DELETE; custom headers (`X-MBX-APIKEY`); reconnect-on-close.
   - It serves papi, eapi, sapi and the fapi/dapi cold calls.
-  - HL's `HlHttp` migration onto it is deferred.
+  - HL's `HlHttp` migration onto it is deferred. (Done in XMM HD2, 2026-10-05, ruling R2.)
 - A **WS API session helper**: `PendingTable` request ids, server-ping echo, fragmented-frame refusal.
 
 **Size:** about 500 src + 500 test.
@@ -1286,7 +1286,7 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
     - `Tmpl` shrank to 36 B;
     - an unknown template index is refused;
     - the numeric bounds are stated.
-  - **Escalated to the E-lane, not fixed here:** `exec_hyperliquid::HlHttp` still maps a bare-FIN `UnexpectedEof` to `Disconnected`, which is conservative. The H9c lines of risk-policy overstate it.
+  - **Escalated to the E-lane, not fixed here:** `exec_hyperliquid::HlHttp` still maps a bare-FIN `UnexpectedEof` to `Disconnected`, which is conservative. The H9c lines of risk-policy overstate it. (Settled by XMM HD2, 2026-10-05: `HlHttp` runs on `HttpsConn`.)
 - **Carried to BX6:**
   - Every order request (place, cancel, amend) uses a body-form template; the query form is cold only. BX6's live smoke proves DELETE-with-body: the docs allow it, but it has not been seen live.
   - `WsConn` has no `left_host`. A WS API request is maybe-sent from `flush` onward. Frames queued but never flushed are dropped by `connect`, so they were not sent.
@@ -1612,7 +1612,7 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
 - No spot margin or borrow. No conditional or algo orders. No RPI, no SOR, no order lists, no pegged or iceberg orders.
 - **XAU/XAG options are long-only**, by venue rule. **US stock options are out** (no API).
 - **No Tokyo in v1 (O-BX7). No SBE or FIX in v1** (optional lanes).
-- **The HL arm changes only through BX0's F3 and F4.** The `HlHttp` migration is a separate ruling.
+- **The HL arm changes only through BX0's F3 and F4.** The `HlHttp` migration is a separate ruling. (It came as XMM HD2, ruling R2, 2026-10-05.)
 - No cloud service on the trading path. **No git operation** beyond the worktree approved by O-BX15, without the operator's word. **No research material in git.**
 
 ---
@@ -1749,7 +1749,7 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
 - **2026-09-26, BX6 follow-up** (`8271706`): CLAUDE.md's alloc-count line set to 83, on the operator's word.
 - **2026-09-26, main merged into `binance`** (the operator's word; main at `0a7303a`: Hypercall HC0–HC11b, HAR H1–H3.7, XMM XH1–XH3, the ZC pass and the HL reconnect fix). 23 files conflicted; every resolution keeps both lanes' work.
   - **The BX bench gates are renumbered after main's 73–85:** BX4 73 → **86**; BX5 74 (74a), 74b and 74c → **87** (87a), **87b** and **87c**; BX3 75–78 → **88–91**; BX6 79 → **92** and 80 → **93**; the planned live-socket gate 81 → **94**. This plan, risk-policy, the bench manifest and the code use the new numbers. Commit messages from before the merge keep the old ones. The merged tree has 99 alloc gates (+2 ignored child helpers).
-  - **core-net: two keep-alive engines, for now.** Both lanes refactored `HttpsPost`: BX5 onto `HttpsConn`, HC2 onto a blocking `KeepAlive` engine it shares with `HttpsReq`. The merge keeps BX5's `HttpsPost` (the reviewed BX5 behaviour; gate 72 still pins it at 2). Main's `KeepAlive` stays for `HttpsReq`, moved to the private `core_net::https_keepalive`, because the `https_conn` name is `HttpsConn`'s. There is one `Method` (HC2's `http1::Method`). `PostErrKind` carries both `Busy` (BX5) and `BadRequest` (HC2). The two engines implement the `left_host` law twice. **Follow-up: move `HttpsReq` onto `HttpsConn`.**
+  - **core-net: two keep-alive engines, for now.** Both lanes refactored `HttpsPost`: BX5 onto `HttpsConn`, HC2 onto a blocking `KeepAlive` engine it shares with `HttpsReq`. The merge keeps BX5's `HttpsPost` (the reviewed BX5 behaviour; gate 72 still pins it at 2). Main's `KeepAlive` stays for `HttpsReq`, moved to the private `core_net::https_keepalive`, because the `https_conn` name is `HttpsConn`'s. There is one `Method` (HC2's `http1::Method`). `PostErrKind` carries both `Busy` (BX5) and `BadRequest` (HC2). The two engines implement the `left_host` law twice. **Follow-up: move `HttpsReq` onto `HttpsConn`** — done 2026-10-05 (XMM HD1): `HttpsReq` runs on `HttpsPost`'s raw form over `HttpsConn`, `https_keepalive` is deleted, and one engine implements the law (risk-policy "HD1").
   - **WebSocket frames:** BX6's self-rendering `WsPart` parts and HC's header-first `ws_write_text_frame_rendered` (`WsPayload`) now share one header writer (`write_client_header`).
   - **Lanes:** eight tick lanes and four opt lanes (HC1), with five fill lanes (BX3). Main's generic `split_lanes` and `from_fn` builders take the fifth lane.
   - **Boot:** the eight BX6 shapes (O-BX30) enter the loop through `enter_loop!`, which now passes main's `engine_loop_set_full` arguments (xmm, hcv, har; icdp is gone).

@@ -377,8 +377,9 @@ pub fn envelope(
 /// the start of `dst` and returns the offset at which the caller renders
 /// the envelope IN PLACE ([`envelope_open`] … [`envelope_close`] on
 /// `&mut dst[n..]`). Close with [`ws_post_close`]. The post is the
-/// `/exchange` body wrapped, byte for byte: the same envelope a REST
-/// fallback sends is a sub-slice of it.
+/// `/exchange` body wrapped, byte for byte: the envelope inside it is the
+/// one a REST fallback sends (a re-send copies it out; a post sealed for
+/// REST renders it alone, XMM HD2).
 pub fn ws_post_open(dst: &mut [u8], id: u64) -> Result<usize, MsgPackErr> {
     let mut j = Json::new(dst);
     j.put(b"{\"method\":\"post\",\"id\":")?;

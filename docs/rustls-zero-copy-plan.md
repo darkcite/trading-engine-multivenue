@@ -21,8 +21,9 @@ which decrypts and closes the gap between records in one pass (§1.6). The resul
 no allocation, and contiguous plaintext for the parsers that already exist.
 
 **Where the work happens:** `crates/core-net` (`iobuf.rs`, `transport.rs`, a new `tls_record.rs`,
-`drain.rs::fill_rx`). The nine ingress run loops change nothing. The exec-lane clients (`HlHttp`,
-`UserWs`, `HttpsPost`, `LiveDispatcher`) move after the ingress soak (TL5b).
+`drain.rs::fill_rx`). The nine ingress run loops change nothing. The exec-lane clients (`UserWs`
+and `HttpsPost`, under which `HlHttp`, `HttpsReq` and `LiveDispatcher` run since XMM HD2 / HD1 /
+HD3) move after the ingress soak (TL5b).
 **Precedents:** D1's single read half (`core_net::fill_rx`), D3's header-first render (count, header,
 render in place), BX0, ZC passes A and B.
 **Opens nothing:**
@@ -78,10 +79,10 @@ at **0.23.38** (`Cargo.lock:1674`; workspace `Cargo.toml:119`: `default-features
   | Consumer | Where | Path |
   |---|---|---|
   | Nine TLS ingress crates (Polymarket, Binance, Bybit, MEXC, OKX, Deribit, Hyperliquid, RPC, HyperEVM) | `crates/cli/src/paper.rs:7872-7878` `connect_tls`; `fill_rx` in each `drive_one` | hot — market-data RX |
-  | `HlHttp` `/exchange` + `/info` | `crates/exec-hyperliquid/src/http.rs:204-594` | hot — the order path; head and body go out as **two** records |
+  | `HlHttp` `/exchange` + `/info` | since XMM HD2 a `core_net::HttpsPost` user (two templates), with no transport of its own (`crates/exec-hyperliquid/src/http.rs`) | hot — the order path; head and body go out as ONE record since HD2 (two before) |
   | `UserWs` | `crates/exec-hyperliquid/src/userws_conn.rs:131-637` | hot — the fills of record |
-  | `HttpsPost` | `crates/core-net/src/https_post.rs:192-637` | EVM arm, HYPARB reads, operator verbs |
-  | `LiveDispatcher` | `crates/clob-dispatcher/src/live.rs:83-547` | Polymarket CLOB `/order` |
+  | `HttpsPost` | `crates/core-net/src/https_post.rs`, the blocking form of `HttpsConn` (`crates/core-net/src/https_conn.rs`) since BX5 | hot since XMM HD2 — `HlHttp`'s order path; the EVM arm, HYPARB reads, operator verbs |
+  | `LiveDispatcher` | since XMM HD3 a `core_net::HttpsPost` user, with no transport of its own (`crates/clob-dispatcher/src/live.rs`) | Polymarket CLOB `/order` |
   | `boot_http` | `crates/core-net/src/boot_http.rs:176-177` (`rustls::Stream`) | cold — boot REST; **out of scope** |
 
 - **The buffers the plaintext lands in.**
@@ -370,7 +371,8 @@ fn with_record(&mut self, render: impl Fn(&mut WsPayload<'_>) -> Result<(), WsWr
 ```
 
 - This is D3's render, one layer down: count, then write into the record span, then seal.
-- For `HlHttp`, head and body become one record instead of two (§1.1), rendered once.
+- For `HlHttp`, head and body become one record instead of two (§1.1), rendered once. (XMM HD2 did
+  the record half on the buffered API: one slice, one `write`, one sealed record; gate 101.)
 - TX drops to one copy (the kernel's). The render runs twice, which is acceptable at one order per call.
 
 ---
@@ -438,7 +440,8 @@ fn with_record(&mut self, render: impl Fn(&mut WsPayload<'_>) -> Result<(), WsWr
   gate 72 — 10 000 records each way at 0 allocations, the handshake outside the window. It is numbered
   when it lands; 73–77 are already claimed by work on unmerged branches.
 - **Gate 72:** with `HttpsPost` on the record layer (TL5b), the pin goes 2 → **0** and the comment is
-  rewritten.
+  rewritten — and gates 77b and 101 with it (`HttpsReq`, `HlHttp`: `HttpsPost` users since XMM HD1
+  / HD2).
 - **copy-audit:** `transport.rs`'s nine rustls markers are rewritten for the two remaining copies (the
   read(2) and the TX seal) plus the two connect-time moves. The baseline stays byte-identical.
 - **Miri:** nothing new — no `unsafe` of ours.
@@ -453,14 +456,16 @@ fn with_record(&mut self, render: impl Fn(&mut WsPayload<'_>) -> Result<(), WsWr
 - A flip back is a config change and a restart, not a rebuild.
 
 **TL5b — Exec lane (Q5)**
-- `UserWs` moves onto an `IoBuf` and `fill`. `HlHttp`, `HttpsPost` and `LiveDispatcher` read into
-  their response buffers through an `IoBuf` view.
+- `UserWs` moves onto an `IoBuf` and `fill`. `HttpsPost` (under which `HlHttp`, `HttpsReq` and
+  `LiveDispatcher` run since XMM HD2 / HD1 / HD3) reads into its response buffer through an
+  `IoBuf` view.
 - Gate 72 → 0.
 - The `hl_exchange_tls_loopback`, `hl_lifecycle_loopback`, `hl_userws_loopback`,
   `https_post_loopback`, `arm_tls_loopback` and `live_dispatcher_loopback` suites run in both modes.
 
 **TL6 — TX render-into-record (Q6)**
-- `with_record` (§4.5). `HlHttp` renders head and body into one record.
+- `with_record` (§4.5). `HttpsPost` (so `HlHttp`, since XMM HD2) renders head and body into one
+  record.
 - Measure the order-path p50/p99 from render to `write(2)`.
 
 **TL7 — Records**

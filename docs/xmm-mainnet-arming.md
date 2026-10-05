@@ -33,11 +33,18 @@ installs them and restarts nothing.
     drain.
   - Arm just after a drain's quiet window for the longest run: 00:35–08:15,
     08:50–15:45, or 16:25–19:55Z.
-- **`dm_availability`.** XH5b-3 asks for `dm_availability` before the first
-  quote. The checklist can only read it within the first read period after the
-  boot, so the member's first quotes may go out before it is read.
-  - If it is not `eligible`, halt at once (§C12).
-  - This is a recorded deviation (A-S7-43).
+- **The dead-man switch (`dm_availability`, O-XH4).** The venue refuses
+  `scheduleCancel` until the address has traded $1 000 000, so a fresh master
+  quotes without the venue's dead man, as O-XH4 rules: on the engine's TTL
+  (≤ 30 s a quote), the boot sweep and the caps ($300 resting, ±$150 a perp).
+  The gateway probes at every boot and every UTC day, and arms the switch by
+  itself once the master qualifies.
+  - The accepted risk: between a crash or a network loss and the next boot's
+    sweep, quotes rest on the venue, bounded by those caps.
+  - XH5b-3 asks for `dm_availability` before the first quote. The checklist can
+    only read it within the first read period after the boot, so the member's
+    first quotes may go out before it is read (a recorded deviation, A-S7-43).
+  - What each reading means, and which ones halt: §C12.
 
 ## A. Before the day
 
@@ -57,8 +64,15 @@ installs them and restarts nothing.
    - **Funded in full before the first boot**: $1 000 USDC. Spot USDC margins the
      perps (XH4g), and the first positive worth anchors the session, so funding
      in steps would anchor at the first step.
-   - No HYPE is needed at `ab_mode` 0. About $50 undelegated is needed only for
-     `ab_mode` 2, whose priority spend is capped at $25 a boot.
+   - No HYPE is needed at `ab_mode` 0. `ab_mode` 2 needs about $50 of HYPE in
+     this master's **staking** balance, moved there from spot and left
+     undelegated (the venue's "delegatable balance"); spot HYPE does not pay
+     the priority fee (XH5e-4). Its spend is capped at $25 a boot. Staked HYPE
+     takes 7 days to come back to spot. Buy and stake it before the first
+     boot, on top of the $1 000: the worth counts USDC only, so HYPE bought
+     with this master's USDC during a session reads as a loss. Before an
+     `ab_mode` 2 boot, `q delegatorSummary $MASTER` (§A4) must show
+     `undelegated` worth about $50.
 4. **The venue's reads.** These are public `/info` calls; the addresses are typed
    by hand and no key is used:
 
@@ -148,12 +162,26 @@ means the slot had halted itself first), then go to §F.
     - the `MAINNET` line, with `own_account=true` and this master and API wallet;
     - the anchor line, as in §B9;
     - `running strategy-set with slot 6 LIVE on the Hyperliquid gateway (MAINNET) beside …`.
-12. **`dm_availability`** must read `eligible` within the first read period
-    (30 s). `unknown` after that, `refused` or `exhausted` all mean halt:
+12. **`dm_availability`** (O-XH4). After the first read period (30 s), read it
+    and the master's lifetime volume (the venue's `portfolio`, `allTime` `vlm`;
+    `q` as in §A4):
 
     ```sh
     curl -s 127.0.0.1:9191/state | python3 -c 'import json,sys; print(json.load(sys.stdin)["exec"]["arms"]["hyperliquid_gw"]["deadman"]["availability"])'
+    q portfolio $MASTER | python3 -c 'import json,sys; print(dict(json.load(sys.stdin))["allTime"]["vlm"])'
     ```
+
+    - **Below $1 000 000 traded:** `unknown` or `refused` is expected — the venue
+      refuses the switch until then. Keep quoting (O-XH4) and log the reading;
+      `refused` parks the switch until the next boot's or UTC day's probe
+      (three refused probes at every boot and every UTC day).
+    - **$1 000 000 or more traded:** expect `eligible` — the switch is armed and
+      pushed forward every 5 s. `unknown` or `refused` there means the switch is
+      not armed: halt (a restart re-probes).
+    - **`exhausted`:** ten deadlines the venue may have held passed unmoved
+      today in this process — fired, or posted in doubt (a refused boot clear
+      adds at most one; the count restarts at every boot) — so the engine or its
+      link stalled again and again: halt.
 13. **`/metrics`:**
 
     ```sh
@@ -194,6 +222,8 @@ Read these every 30 min for the first 2 h, then hourly:
       `engine_exec_hlgw_budget_remaining`.
     - Open orders against the venue.
     - `engine_xmm_fills_total`.
+    - `dm_availability` (§C12), and, while it is not `eligible`, the master's
+      `allTime` volume against $1 000 000.
     - In the first hour, also `engine_exec_hlgw_congestion`. The IP share stays
       400 (XH5c-3); report frequent congestion pulls together with the host's
       other Hyperliquid REST traffic.
@@ -219,7 +249,8 @@ Read these every 30 min for the first 2 h, then hourly:
     - a drain with a position held (Known limits).
 18. **Anton stops the probe** (§F) on any of:
     - a position or order on the account that is not ours;
-    - `dm_availability` not `eligible`;
+    - `dm_availability` reading `exhausted`, or anything but `eligible` once the
+      master has traded $1 000 000 or more (§C12);
     - a venue incident;
     - a gauge that disagrees with the venue;
     - a markout far below the bar over the day's fills (§G).

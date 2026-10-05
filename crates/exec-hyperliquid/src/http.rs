@@ -1,42 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! `POST /exchange` over TLS — the network arm (E3).
+//! `POST /exchange` and `POST /info` over TLS — the network arm (E3).
 //!
-//! Deliberately the same shape as `clob_dispatcher::live::LiveDispatcher`:
-//! mio + rustls, HTTP/1.1 with `Connection: keep-alive`, everything
-//! preallocated at construction, one synchronous request/response cycle
-//! per call on the dispatcher's own worker thread. **HTTP/1.1, not /2 —
-//! the no-tokio rule stands**, and reusing the arm the engine already
-//! trusts is worth more than a protocol upgrade nothing needs.
+//! Since XMM HD2 this is a thin face over [`core_net::HttpsPost`], the
+//! crate-wide keep-alive engine (`core_net::HttpsConn` in its blocking
+//! form), with two templates rendered at boot: `POST /exchange` and
+//! `POST /info`, both JSON. mio + rustls, HTTP/1.1 with `Connection:
+//! keep-alive`, everything preallocated at construction, one synchronous
+//! request/response cycle per call on the caller's own thread.
+//! **HTTP/1.1, not /2 — the no-tokio rule stands**, and reusing the
+//! engine the other arms already trust is worth more than a protocol
+//! upgrade nothing needs. The answer's own framing ends each read, so
+//! the connection survives for the next order: the 50–150 ms TCP+TLS
+//! handshake is paid once, not per order.
 //!
-//! Content-Length framing means the reader exits on the declared length
-//! rather than waiting for a peer FIN, so the connection survives for
-//! the next order: the 50–150 ms TCP+TLS handshake is paid once, not
-//! per order.
+//! ## One request, one write, one TLS record
+//!
+//! An order is rendered IN PLACE in the `/exchange` window
+//! ([`HlHttp::body_mut`]): the envelope head, the action JSON, the
+//! signature tail. Per post only the length digits are rendered (the
+//! head shifts when their count changes), so the request is ONE
+//! contiguous slice written ONCE — one TLS record while head and body
+//! fit rustls' 16 KiB record (every real order is far below), where the
+//! pre-HD2 client wrote its head and the body as two (two sealed records,
+//! two allocations). An `/info` read renders into its own window
+//! (`HlHttp::info_mut`) and never disturbs an order's bytes.
 //!
 //! ## A kept-alive connection the venue has closed is never reused
 //!
-//! (Operator ask, 2026-09-24 — the finding the HYPARB H9 review made on
-//! `core_net::HttpsPost`, which has the same shape.) The venue closes an
-//! idle keep-alive connection on its own schedule, and it can announce
-//! `Connection: close` on an answer. Reusing such a connection wrote
-//! the next ORDER into a socket the peer had already closed: the write
-//! succeeds locally, the read then finds EOF, and the order comes back
-//! `Disconnected` with `left_host == true` — lost to reconciliation,
-//! counted `sent_unanswered`, charged to the address budget, although
-//! no byte of it ever reached the venue. Now:
+//! (Operator ask, 2026-09-24.) The venue closes an idle keep-alive
+//! connection on its own schedule, and it can announce `Connection:
+//! close` on an answer. An answer that says `Connection: close` (or
+//! arrives with the peer's FIN) retires the connection WITH that answer
+//! — the answer is kept, only the transport is dropped — and before a
+//! connection is reused, one non-blocking one-byte read asks whether the
+//! peer closed it while idle: the request then dials fresh with
+//! `left_host == false`. [`HlHttp::dials`] counts handshakes, so an
+//! endpoint that closes after every answer shows as dials ≈ posts.
 //!
-//! * an answer that says `Connection: close` (or arrives with the
-//!   peer's FIN) retires the connection WITH that answer — the answer
-//!   is kept, only the transport is dropped;
-//! * before a connection is reused, one non-blocking one-byte read
-//!   (a single `read(2)` through rustls) asks whether the peer closed it
-//!   while idle — EOF, `close_notify`, an unsolicited byte or an error
-//!   retires it — and the request dials fresh with `left_host == false`.
+//! ## Framing
 //!
-//! [`HlHttp::dials`] counts handshakes, so an endpoint that closes after
-//! every answer shows as dials ≈ posts.
+//! `Content-Length` and `chunked` answers are read whole (a chunked body
+//! is decoded in place). An answer its own framing proves whole is
+//! delivered even when a FIN without `close_notify` follows it; an
+//! answer delimited by the close alone counts only after a close a read
+//! confirmed clean. Before HD2 a chunked answer was `BadHttp` and a whole
+//! answer before a bare FIN was `Disconnected`, both with `left_host`:
+//! false in-doubts on orders the venue had answered (risk-policy "HD2").
 //!
 //! ## What this layer does NOT decide
 //!
@@ -46,18 +57,19 @@
 //! judged success from the status code would be wrong most of the time
 //! it mattered. Judging is [`crate::response::scan`]'s job.
 
-use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use core_net::{head_says_close, read_response, HttpResult, TlsTransport, Transport};
-use mio::{Events, Poll, Token};
-use rustls::pki_types::ServerName;
+use core_net::{HttpsPost, Method, Params, PostErrKind, ReqSpec};
 use rustls::ClientConfig;
 
-/// Request-body buffer. An action of [`crate::action::MAX_ACTION`]
-/// plus the signature envelope fits far inside this.
+/// One request's whole budget: connect, write, read. Generous enough
+/// for a WAN round trip, short enough that a wedged connection cannot
+/// hold the worker thread. (The engine's own, since HD2.)
+pub use core_net::https_post::REQ_DEADLINE;
+
+/// The `/exchange` window — and the `/info` one. An action of
+/// [`crate::action::MAX_ACTION`] plus the signature envelope fits far
+/// inside this.
 pub const MAX_REQ_BODY: usize = 16 * 1024;
 /// Response buffer. Exchange responses are small; a batch of statuses
 /// is still well under this.
@@ -70,39 +82,48 @@ pub const MAX_REQ_BODY: usize = 16 * 1024;
 /// that can never succeed would never let the live slot seed. One
 /// boot allocation; nothing on the order path touches the unused tail.
 pub const MAX_RESP_BUF: usize = 1024 * 1024;
-/// Request-header buffer, written separately from the body so the two
-/// go out as one logical frame without a copy.
-const REQ_HEADER_BUF: usize = 1024;
-
-const MIO_TOKEN: Token = Token(0);
-const POLL_TIMEOUT: Duration = Duration::from_millis(50);
-/// Consecutive connect failures between DNS re-resolutions.
-const RERESOLVE_AFTER: u32 = 3;
-/// One request's whole budget: connect, write, read. Generous enough
-/// for a WAN round trip, short enough that a wedged connection cannot
-/// hold the worker thread.
-pub const REQ_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The `/exchange` path. Not configurable: a different path is a
 /// different API, not a deployment choice.
-pub const EXCHANGE_PATH: &[u8] = b"/exchange";
+pub const EXCHANGE_PATH: &str = "/exchange";
 
 /// The `/info` path — READ-ONLY, unsigned, and the only other path
 /// this client may use.
 ///
-/// Still not configurable. Two named constants is not the same thing
-/// as a settable path: the caller picks between two APIs this crate
-/// knows, and nothing outside can introduce a third — `post_to` is
-/// `pub(crate)` so that sentence is enforced by visibility, not by a
-/// `debug_assert!` the release build drops.
+/// Still not configurable. The client carries exactly two templates,
+/// rendered at boot, and nothing outside this crate can post to a third
+/// — `info_mut` / `post_info` are `pub(crate)`, so that sentence is
+/// enforced by visibility, not by a `debug_assert!` the release build
+/// drops.
 ///
 /// **Shares the connection and the response buffer with
-/// [`EXCHANGE_PATH`].** [`HlHttp::resp`] holds only the last answer, so
-/// an `/info` read must be consumed before the next order goes out.
-/// Both callers live on one thread and one is on the idle path, so
-/// they are naturally serialised — but that is a property of the
-/// caller, not of this type.
-pub const INFO_PATH: &[u8] = b"/info";
+/// [`EXCHANGE_PATH`]** (not the request window). [`HlHttp::resp`] holds
+/// only the last answer, so an `/info` read must be consumed before the
+/// next order goes out. Both callers live on one thread and one is on
+/// the idle path, so they are naturally serialised — but that is a
+/// property of the caller, not of this type.
+pub const INFO_PATH: &str = "/info";
+
+/// Template 0: `/exchange`.
+const EXCHANGE: usize = 0;
+/// Template 1: `/info`.
+const INFO: usize = 1;
+
+/// The two request shapes, in template order.
+const SPECS: [ReqSpec<'static>; 2] = [
+    ReqSpec {
+        method: Method::Post,
+        path: EXCHANGE_PATH,
+        params: Params::Body("application/json"),
+        headers: &[],
+    },
+    ReqSpec {
+        method: Method::Post,
+        path: INFO_PATH,
+        params: Params::Body("application/json"),
+        headers: &[],
+    },
+];
 
 /// Why an HTTP cycle failed.
 #[repr(u8)]
@@ -110,14 +131,16 @@ pub const INFO_PATH: &[u8] = b"/info";
 pub enum HttpErr {
     /// DNS resolution failed at construction.
     Dns,
-    /// rustls rejected the host as a server name.
+    /// rustls rejected the host as a server name, or the host was
+    /// refused at construction.
     BadServerName,
     /// Connect, handshake, write or read failed, or the peer went away
     /// mid-response. The connection is closed; the next call redials.
     Disconnected,
-    /// The request did not fit its preallocated buffer.
+    /// The request or the response did not fit its preallocated buffer.
     Overflow,
-    /// The response was not parseable as HTTP/1.1.
+    /// The response was not well-framed HTTP/1.1 (malformed headers or
+    /// chunk framing).
     BadHttp,
     /// The whole cycle exceeded [`REQ_DEADLINE`].
     Timeout,
@@ -129,7 +152,7 @@ impl core::fmt::Display for HttpErr {
             HttpErr::Dns => "dns resolution failed",
             HttpErr::BadServerName => "host is not a valid TLS server name",
             HttpErr::Disconnected => "connection lost",
-            HttpErr::Overflow => "request did not fit its buffer",
+            HttpErr::Overflow => "request or response did not fit its buffer",
             HttpErr::BadHttp => "response was not HTTP/1.1",
             HttpErr::Timeout => "request deadline exceeded",
         };
@@ -174,20 +197,6 @@ pub struct PostErr {
     pub left_host: bool,
 }
 
-impl PostErr {
-    /// A failure that happened before anything could be written —
-    /// DNS, the TLS handshake, or a request that did not fit its
-    /// buffer.
-    #[inline]
-    #[must_use]
-    pub const fn before_send(err: HttpErr) -> Self {
-        Self {
-            err,
-            left_host: false,
-        }
-    }
-}
-
 impl core::fmt::Display for PostErr {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.left_host {
@@ -202,81 +211,37 @@ impl std::error::Error for PostErr {}
 
 /// A keep-alive HTTPS connection to one Hyperliquid API host.
 pub struct HlHttp {
-    host: String,
-    port: u16,
-    addr: SocketAddr,
-    /// Consecutive `ensure_connected` failures. Every
-    /// [`RERESOLVE_AFTER`] of them re-resolves `host` — the address
-    /// was cached at boot, and a CDN-fronted venue rotates IPs; a
-    /// client that redialled one dead address for the life of the boot
-    /// would report every order as `Disconnected` until a restart
-    /// (E7 review, 2026-09-19).
-    connect_fail_streak: u32,
-    /// Successful dials (TCP + TLS handshakes) over the client's life.
-    dials: u64,
-    server_name: ServerName<'static>,
-    tls_config: Arc<ClientConfig>,
-
-    /// `None` until the first request; reopened after a disconnect.
-    transport: Option<TlsTransport>,
-    poll: Poll,
-    events: Events,
-
-    req_header: Box<[u8]>,
-    resp_buf: Box<[u8]>,
-    resp_len: usize,
+    /// The `/exchange` and `/info` templates over one connection.
+    http: HttpsPost,
 }
 
 impl HlHttp {
-    /// Resolve and prepare. **Boot-only** — this is where the
-    /// allocations live. No socket is opened until the first request.
+    /// Resolve and render both templates. **Boot-only** — this is where
+    /// the allocations live. No socket is opened until the first request.
     pub fn new(host: &str, port: u16, tls_config: Arc<ClientConfig>) -> Result<Self, HttpErr> {
-        let addr = (host, port)
-            .to_socket_addrs()
-            .map_err(|_| HttpErr::Dns)?
-            .next()
-            .ok_or(HttpErr::Dns)?;
-        let server_name =
-            TlsTransport::server_name_from_host(host).map_err(|_| HttpErr::BadServerName)?;
-        Ok(Self {
-            // COPY: ≤ 64 B host name for re-resolve + the Host header,
-            // ONCE at boot; borrowed from the config it would pin the
-            // config's lifetime to the client's.
-            host: host.to_owned(),
-            port,
-            addr,
-            connect_fail_streak: 0,
-            dials: 0,
-            server_name,
-            tls_config,
-            transport: None,
-            poll: Poll::new().map_err(|_| HttpErr::Disconnected)?,
-            events: Events::with_capacity(8),
-            req_header: vec![0u8; REQ_HEADER_BUF].into_boxed_slice(),
-            resp_buf: vec![0u8; MAX_RESP_BUF].into_boxed_slice(),
-            resp_len: 0,
-        })
+        HttpsPost::with_specs(host, port, tls_config, &SPECS, MAX_REQ_BODY, MAX_RESP_BUF)
+            .map(|http| Self { http })
+            .map_err(boot_err)
     }
 
     /// The host this arm talks to. Used by the boot tell, and by the
     /// smoke path's testnet assertion.
     #[inline]
     #[must_use]
-    pub fn host(&self) -> &str {
-        &self.host
+    pub fn host(&self) -> &'static str {
+        self.http.host()
     }
 
     /// Drop the connection. The next request redials.
     pub fn close(&mut self) {
-        self.transport = None;
-        self.resp_len = 0;
+        self.http.close();
     }
 
     /// Whether a connection is currently open.
     #[inline]
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.transport.is_some()
+        self.http.is_connected()
     }
 
     /// Successful dials over the client's life: 1 on a healthy
@@ -284,380 +249,94 @@ impl HlHttp {
     #[inline]
     #[must_use]
     pub const fn dials(&self) -> u64 {
-        self.dials
+        self.http.dials()
     }
 
-    /// One request/response cycle.
+    /// The `/exchange` window: render the request body here, IN PLACE,
+    /// then [`Self::post`] its length. Its contents survive a post.
+    #[inline]
+    pub fn body_mut(&mut self) -> &mut [u8] {
+        self.http.window_mut(EXCHANGE)
+    }
+
+    /// One `/exchange` request/response cycle for the first `body_len`
+    /// bytes of [`Self::body_mut`].
     ///
     /// Returns `(http_status, body_range)` into [`Self::resp`]. **The
-    /// status is not a verdict** — see the module note.
-    pub fn post(&mut self, body: &[u8]) -> Result<(u16, core::ops::Range<usize>), PostErr> {
-        self.post_to(EXCHANGE_PATH, body)
+    /// status is not a verdict** — see the module note. A body over the
+    /// window is refused before any byte is written.
+    pub fn post(&mut self, body_len: usize) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+        self.http.request(EXCHANGE, body_len).map_err(post_err)
     }
 
-    /// One request/response cycle against `path`, which must be
-    /// [`EXCHANGE_PATH`] or [`INFO_PATH`].
+    /// The `/info` window: render the read here, then
+    /// [`Self::post_info`] its length.
     ///
     /// `pub(crate)`: the two-API claim in [`INFO_PATH`]'s doc is only
-    /// true if nothing outside this crate can name a third path, and a
-    /// `debug_assert!` is compiled out of the binary that ships.
+    /// true if nothing outside this crate can post a third.
+    #[inline]
+    pub(crate) fn info_mut(&mut self) -> &mut [u8] {
+        self.http.window_mut(INFO)
+    }
+
+    /// One `/info` request/response cycle for the first `len` bytes of
+    /// [`Self::info_mut`].
     ///
     /// # Errors
     /// As [`Self::post`].
-    pub(crate) fn post_to(
+    pub(crate) fn post_info(
         &mut self,
-        path: &'static [u8],
-        body: &[u8],
+        len: usize,
     ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
-        debug_assert!(
-            path == EXCHANGE_PATH || path == INFO_PATH,
-            "this client knows two APIs and no others"
-        );
-        let deadline = Instant::now() + REQ_DEADLINE;
-        self.ensure_connected(deadline)
-            .map_err(PostErr::before_send)?;
-        let mut left_host = false;
-        match self.cycle(path, body, deadline, &mut left_host) {
-            Ok((status, range, retire)) => {
-                if retire {
-                    // The venue closed, or said it will: the answer is
-                    // whole, the connection is not reusable. Keep the
-                    // answer; drop only the transport (module doc).
-                    self.transport = None;
-                }
-                Ok((status, range))
-            }
-            Err(err) => {
-                // Any failure closes the connection. A half-read
-                // response left in the buffer would be read as the
-                // NEXT order's answer, which is how a fill gets
-                // attributed to the wrong order.
-                self.close();
-                Err(PostErr { err, left_host })
-            }
-        }
+        self.http.request(INFO, len).map_err(post_err)
     }
 
-    /// The response bytes from the last successful [`Self::post`].
+    /// The response bytes from the last successful post.
     #[inline]
     #[must_use]
     pub fn resp(&self) -> &[u8] {
-        &self.resp_buf[..self.resp_len]
-    }
-
-    /// `left_host` is set the instant a write is ATTEMPTED — see
-    /// [`PostErr::left_host`] for why that is the conservative moment
-    /// rather than after the write returns.
-    fn cycle(
-        &mut self,
-        path: &'static [u8],
-        body: &[u8],
-        deadline: Instant,
-        left_host: &mut bool,
-    ) -> Result<(u16, core::ops::Range<usize>, bool), HttpErr> {
-        let header_len = self.write_header(path, body.len())?;
-        {
-            let t = self.transport.as_mut().ok_or(HttpErr::Disconnected)?;
-            // Header and body as one logical frame: a partial write
-            // under TLS backpressure resumes at the same offset.
-            let segments: [&[u8]; 2] = [&self.req_header[..header_len], body];
-            *left_host = true;
-            write_segments(t, &segments, deadline)?;
-            // The request is in rustls' buffer, not on the wire.
-            // `write` only queues; the bytes leave on `write_tls`, which
-            // `pump` runs on a WRITABLE event — and no writable edge is
-            // armed after the handshake. Without this flush the first
-            // `poll` in `read_response` slept a full `POLL_TIMEOUT`
-            // before the `reregister` at its tail armed the edge that
-            // finally sent the request: 50 ms added to EVERY order,
-            // cancel and requote, invisible to a loopback that asserts
-            // outcomes (E7 review, 2026-09-19). Flush now; reregister
-            // so a partial flush completes on the next event.
-            t.flush().map_err(|_| HttpErr::Disconnected)?;
-            t.reregister(self.poll.registry(), MIO_TOKEN)
-                .map_err(|_| HttpErr::Disconnected)?;
-        }
-        self.read_response(deadline)
-    }
-
-    fn write_header(&mut self, path: &'static [u8], body_len: usize) -> Result<usize, HttpErr> {
-        let mut len_buf = [0u8; 20];
-        let len_str = format_u64_into(&mut len_buf, body_len as u64);
-        let host = self.host.as_bytes();
-        let parts: [&[u8]; 11] = [
-            b"POST ",
-            path,
-            b" HTTP/1.1\r\n",
-            b"Host: ",
-            host,
-            b"\r\n",
-            b"Content-Type: application/json\r\n",
-            b"Content-Length: ",
-            len_str,
-            b"\r\n",
-            b"Connection: keep-alive\r\n\r\n",
-        ];
-        let buf = &mut *self.req_header;
-        let mut pos = 0usize;
-        for p in parts {
-            let end = pos.checked_add(p.len()).ok_or(HttpErr::Overflow)?;
-            if end > buf.len() {
-                return Err(HttpErr::Overflow);
-            }
-            // COPY: ≤ 256 B of header literals + host + length digits
-            // into the boot-owned header buffer — the RENDER of the
-            // request head, sent as its own TLS segment ahead of the
-            // body (no body byte is staged; see `write_segments`).
-            buf[pos..end].copy_from_slice(p);
-            pos = end;
-        }
-        Ok(pos)
-    }
-
-    fn ensure_connected(&mut self, deadline: Instant) -> Result<(), HttpErr> {
-        if self.transport.is_some() && !self.still_open() {
-            self.transport = None;
-        }
-        if self.transport.is_some() {
-            return Ok(());
-        }
-        match self.dial(deadline) {
-            Ok(()) => {
-                self.connect_fail_streak = 0;
-                Ok(())
-            }
-            Err(e) => {
-                self.connect_fail_streak = self.connect_fail_streak.saturating_add(1);
-                if self.connect_fail_streak % RERESOLVE_AFTER == 0 {
-                    // Blocking DNS, on the failure path ONLY — the
-                    // caller is already inside an outage. Best effort:
-                    // an unresolvable host keeps the old address.
-                    if let Some(a) = (self.host.as_str(), self.port)
-                        .to_socket_addrs()
-                        .ok()
-                        .and_then(|mut it| it.next())
-                    {
-                        self.addr = a;
-                    }
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Before reusing a kept-alive connection: one non-blocking read.
-    /// No request is outstanding, so anything but `WouldBlock` — EOF,
-    /// `close_notify`, an unsolicited byte, an error — means the venue
-    /// is gone or out of step, and the request must dial fresh.
-    fn still_open(&mut self) -> bool {
-        let Some(t) = self.transport.as_mut() else {
-            return false;
-        };
-        let mut probe = [0u8; 1];
-        matches!(t.read(&mut probe), Err(ref e) if e.kind() == io::ErrorKind::WouldBlock)
-    }
-
-    fn dial(&mut self, deadline: Instant) -> Result<(), HttpErr> {
-        let mut t =
-            TlsTransport::connect(self.addr, self.server_name.clone(), self.tls_config.clone())
-                .map_err(|_| HttpErr::Disconnected)?;
-        t.register(self.poll.registry(), MIO_TOKEN)
-            .map_err(|_| HttpErr::Disconnected)?;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(HttpErr::Timeout);
-            }
-            self.poll
-                .poll(&mut self.events, Some(POLL_TIMEOUT))
-                .map_err(|_| HttpErr::Disconnected)?;
-            let mut status = core_net::Status::Handshaking;
-            for ev in self.events.iter() {
-                if ev.token() != MIO_TOKEN {
-                    continue;
-                }
-                status = t.pump(ev).map_err(|_| HttpErr::Disconnected)?;
-            }
-            match status {
-                core_net::Status::Ready => break,
-                core_net::Status::Closed => return Err(HttpErr::Disconnected),
-                _ => t
-                    .reregister(self.poll.registry(), MIO_TOKEN)
-                    .map_err(|_| HttpErr::Disconnected)?,
-            }
-        }
-        self.transport = Some(t);
-        self.dials += 1;
-        Ok(())
-    }
-
-    /// Read one whole answer: `(status, body_range, retire)` — `retire`
-    /// when the venue closed with it or announced `Connection: close`.
-    fn read_response(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<(u16, core::ops::Range<usize>, bool), HttpErr> {
-        self.resp_len = 0;
-        let mut peer_closed = false;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(HttpErr::Timeout);
-            }
-            self.poll
-                .poll(&mut self.events, Some(POLL_TIMEOUT))
-                .map_err(|_| HttpErr::Disconnected)?;
-            {
-                let t = self.transport.as_mut().ok_or(HttpErr::Disconnected)?;
-                for ev in self.events.iter() {
-                    if ev.token() != MIO_TOKEN {
-                        continue;
-                    }
-                    if t.pump(ev).map_err(|_| HttpErr::Disconnected)? == core_net::Status::Closed {
-                        peer_closed = true;
-                    }
-                }
-                // Drain all available plaintext on one readiness.
-                loop {
-                    if self.resp_len >= self.resp_buf.len() {
-                        break;
-                    }
-                    let cap = self.resp_buf.len();
-                    match t.read(&mut self.resp_buf[self.resp_len..cap]) {
-                        Ok(0) => {
-                            peer_closed = true;
-                            break;
-                        }
-                        Ok(n) => self.resp_len += n,
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(_) => return Err(HttpErr::Disconnected),
-                    }
-                }
-            }
-
-            match read_response(&self.resp_buf[..self.resp_len]) {
-                HttpResult::Complete {
-                    status,
-                    header_end,
-                    body_start,
-                    body_end,
-                    framing,
-                } => {
-                    let retire = peer_closed || head_says_close(&self.resp_buf[..header_end]);
-                    // This client knows ONE framing. The venue answers
-                    // `Content-Length`; a chunked body would need
-                    // de-chunking before the scanner could read it and
-                    // a close-delimited one is complete only at the
-                    // FIN. The first cut returned either "as soon as
-                    // any bytes were buffered" — so a truncated ok
-                    // envelope (cut before `"statuses"`) was handed to
-                    // the scanner as the venue's whole answer, and the
-                    // scanner's no-statuses branch read it as an
-                    // acceptance. A body the layer cannot bound is a
-                    // shape it may not guess at: refuse it.
-                    match framing {
-                        core_net::BodyFraming::ContentLength(_) => {
-                            if self.resp_len >= body_end {
-                                return Ok((status, body_start..body_end, retire));
-                            }
-                            // Declared more body than has arrived. If
-                            // the peer is gone it never will — a
-                            // TRUNCATED body must not be handed on as
-                            // if it were the venue's answer.
-                            if peer_closed {
-                                return Err(HttpErr::Disconnected);
-                            }
-                        }
-                        core_net::BodyFraming::CloseDelimited => {
-                            if peer_closed {
-                                return Ok((status, body_start..self.resp_len, true));
-                            }
-                        }
-                        core_net::BodyFraming::Chunked => return Err(HttpErr::BadHttp),
-                    }
-                }
-                HttpResult::Incomplete => {
-                    if peer_closed {
-                        return Err(HttpErr::Disconnected);
-                    }
-                }
-                HttpResult::Malformed => return Err(HttpErr::BadHttp),
-            }
-
-            if self.resp_len >= self.resp_buf.len() {
-                // Buffer full and still not a complete response.
-                return Err(HttpErr::Overflow);
-            }
-            let t = self.transport.as_mut().ok_or(HttpErr::Disconnected)?;
-            t.reregister(self.poll.registry(), MIO_TOKEN)
-                .map_err(|_| HttpErr::Disconnected)?;
-        }
+        self.http.resp()
     }
 }
 
-/// Write every segment in order, resuming across partial writes and
-/// `WouldBlock`. Bounded by `deadline`.
-fn write_segments<T: Transport>(
-    t: &mut T,
-    segments: &[&[u8]],
-    deadline: Instant,
-) -> Result<(), HttpErr> {
-    let mut seg = 0usize;
-    let mut off = 0usize;
-    while seg < segments.len() {
-        let s = segments[seg];
-        if off >= s.len() {
-            seg += 1;
-            off = 0;
-            continue;
-        }
-        if Instant::now() >= deadline {
-            return Err(HttpErr::Timeout);
-        }
-        match t.write(&s[off..]) {
-            // rustls' `Ok(0)` is its send-buffer limit (64 KiB
-            // default), not a disconnect: the request did not fit.
-            // Unreachable at 17 KiB, named correctly for when it is.
-            Ok(0) => return Err(HttpErr::Overflow),
-            Ok(n) => off += n,
-            // A TLS transport buffers plaintext and never blocks on
-            // `write`; a transport that does has nowhere to park the
-            // bytes, and sleeping on the order path is not a
-            // backpressure strategy (the first cut slept 1 ms here).
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(HttpErr::Overflow)
-            }
-            Err(_) => return Err(HttpErr::Disconnected),
-        }
+/// A construction refusal as this client's error. A host the engine
+/// refuses is `BadServerName`, a poll that cannot be created
+/// `Disconnected`, as before HD2; the per-request kinds never come out
+/// of a constructor.
+const fn boot_err(e: PostErrKind) -> HttpErr {
+    match e {
+        PostErrKind::Dns => HttpErr::Dns,
+        PostErrKind::BadEndpoint => HttpErr::BadServerName,
+        _ => HttpErr::Disconnected,
     }
-    Ok(())
 }
 
-/// `u64` → decimal bytes, into a caller-owned scratch. No `format!`.
-fn format_u64_into(buf: &mut [u8; 20], mut v: u64) -> &[u8] {
-    if v == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
+/// A failed cycle as this client's error — one to one, `left_host` as
+/// the engine recorded it (set before the write, so a torn write
+/// counts). `Busy` and `BadRequest` cannot come out of this blocking,
+/// two-template client; were one to, it is `Disconnected` and keeps the
+/// engine's `left_host`.
+const fn post_err(e: core_net::PostErr) -> PostErr {
+    let err = match e.err {
+        PostErrKind::Dns => HttpErr::Dns,
+        PostErrKind::BadEndpoint => HttpErr::BadServerName,
+        PostErrKind::Overflow => HttpErr::Overflow,
+        PostErrKind::BadHttp => HttpErr::BadHttp,
+        PostErrKind::Timeout => HttpErr::Timeout,
+        PostErrKind::Disconnected | PostErrKind::Busy | PostErrKind::BadRequest => {
+            HttpErr::Disconnected
+        }
+    };
+    PostErr {
+        err,
+        left_host: e.left_host,
     }
-    let mut i = 20usize;
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    &buf[i..]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn u64_renders_without_allocating() {
-        let mut b = [0u8; 20];
-        assert_eq!(format_u64_into(&mut b, 0), b"0");
-        assert_eq!(format_u64_into(&mut b, 1), b"1");
-        assert_eq!(format_u64_into(&mut b, 1024), b"1024");
-        assert_eq!(format_u64_into(&mut b, u64::MAX), b"18446744073709551615");
-    }
+    use core_net::TlsTransport;
 
     #[test]
     fn a_bad_host_is_refused_at_construction_not_at_submit() {
@@ -671,29 +350,86 @@ mod tests {
             Ok(_) => panic!("an unresolvable host must fail at construction"),
         };
         assert_eq!(e, HttpErr::Dns);
+        let e = match HlHttp::new("", 443, cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty host must fail at construction"),
+        };
+        assert_eq!(e, HttpErr::BadServerName);
     }
 
+    /// HD2: template 0 is `/exchange` and template 1 `/info` — the
+    /// indices the client posts through — and their windows are the
+    /// client's own, sized at boot and apart; nothing is opened at
+    /// construction.
     #[test]
-    fn the_header_is_well_formed_and_bounded() {
+    fn each_api_has_its_own_window() {
+        assert_eq!(
+            (SPECS[EXCHANGE].path, SPECS[INFO].path),
+            ("/exchange", "/info")
+        );
         let cfg = TlsTransport::default_client_config();
         let mut h = HlHttp::new("127.0.0.1", 1, cfg).expect("loopback resolves");
-        let n = h.write_header(EXCHANGE_PATH, 42).expect("fits");
-        let s = String::from_utf8_lossy(&h.req_header[..n]).to_string();
-        assert!(s.starts_with("POST /exchange HTTP/1.1\r\n"), "{s}");
-        assert!(s.contains("Host: 127.0.0.1\r\n"), "{s}");
-        assert!(s.contains("Content-Type: application/json\r\n"), "{s}");
-        assert!(s.contains("Content-Length: 42\r\n"), "{s}");
-        assert!(s.contains("Connection: keep-alive\r\n\r\n"), "{s}");
+        assert_eq!(h.http.path(), "/exchange", "template 0 is the order path");
+        let exchange = h.body_mut().as_ptr() as usize;
+        let info = h.info_mut().as_ptr() as usize;
+        assert_eq!(h.body_mut().len(), MAX_REQ_BODY);
+        assert_eq!(h.info_mut().len(), MAX_REQ_BODY);
+        assert!(
+            exchange.abs_diff(info) >= MAX_REQ_BODY,
+            "the windows do not overlap"
+        );
+        assert_eq!(h.host(), "127.0.0.1");
         assert!(!h.is_connected(), "no socket is opened at construction");
     }
 
+    /// A body over its window is refused before any byte is written:
+    /// nothing dials, and it cannot count against the address.
     #[test]
-    fn a_header_too_big_for_its_buffer_is_refused() {
+    fn a_body_over_its_window_is_refused_before_any_byte_leaves() {
         let cfg = TlsTransport::default_client_config();
         let mut h = HlHttp::new("127.0.0.1", 1, cfg).expect("loopback");
-        // Shrink the buffer to force the overflow path.
-        h.req_header = vec![0u8; 8].into_boxed_slice();
-        assert_eq!(h.write_header(EXCHANGE_PATH, 1), Err(HttpErr::Overflow));
+        let refused = Some(PostErr {
+            err: HttpErr::Overflow,
+            left_host: false,
+        });
+        assert_eq!(h.post(MAX_REQ_BODY + 1).err(), refused);
+        assert_eq!(h.post_info(MAX_REQ_BODY + 1).err(), refused);
+        assert_eq!(h.dials(), 0);
+    }
+
+    /// HD2: the engine's errors map one to one, and `left_host` passes
+    /// through untouched — the address governor's only input.
+    #[test]
+    fn engine_errors_map_one_to_one_and_keep_left_host() {
+        let cases = [
+            (PostErrKind::Dns, HttpErr::Dns),
+            (PostErrKind::BadEndpoint, HttpErr::BadServerName),
+            (PostErrKind::Disconnected, HttpErr::Disconnected),
+            (PostErrKind::Overflow, HttpErr::Overflow),
+            (PostErrKind::BadHttp, HttpErr::BadHttp),
+            (PostErrKind::Timeout, HttpErr::Timeout),
+            (PostErrKind::Busy, HttpErr::Disconnected),
+            (PostErrKind::BadRequest, HttpErr::Disconnected),
+        ];
+        for (kind, want) in cases {
+            for left_host in [false, true] {
+                let e = post_err(core_net::PostErr {
+                    err: kind,
+                    left_host,
+                });
+                assert_eq!(
+                    e,
+                    PostErr {
+                        err: want,
+                        left_host
+                    },
+                    "{kind:?}"
+                );
+            }
+        }
+        assert_eq!(boot_err(PostErrKind::Dns), HttpErr::Dns);
+        assert_eq!(boot_err(PostErrKind::BadEndpoint), HttpErr::BadServerName);
+        assert_eq!(boot_err(PostErrKind::Disconnected), HttpErr::Disconnected);
     }
 
     #[test]

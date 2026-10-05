@@ -15,11 +15,11 @@
 //!   owner's poll delivers for this connection's token;
 //! - [`HttpsConn::on_tick`] enforces the request deadline.
 //!
-//! [`crate::HttpsPost`] is this connection's blocking one-template form
-//! (its own poll; the caller's thread waits): one implementation of the
-//! protocol, two ways to drive it. [`crate::HttpsReq`] (HC2) still runs
-//! on the older blocking engine (`crate::https_keepalive`); moving it
-//! here is a recorded follow-up of the 2026-09-26 merge.
+//! [`crate::HttpsPost`] is this connection's blocking form (its own
+//! poll; the caller's thread waits): one implementation of the protocol,
+//! two ways to drive it. Since HD1, [`crate::HttpsReq`] (HC2) runs on
+//! `HttpsPost`'s raw form, so this is the crate's one keep-alive HTTPS
+//! engine.
 //!
 //! ## Templates: every request is rendered in place, in its wire buffer
 //!
@@ -45,6 +45,13 @@
 //! host, the extra headers, the blank line) must follow a query whose
 //! length varies, so it is copied from its master on every request. The
 //! GETs are the cold calls (recon, status); an order goes in a body.
+//!
+//! A **raw** wire (HD1, crate-private: `ReqWire::raw`) carries no
+//! template. Its one window is the whole buffer: the owner renders the
+//! entire request, head and body, into it and stages the span to send
+//! (`ReqWire::stage_raw`) — nothing is rendered or moved for it.
+//! [`crate::HttpsReq`] is that owner: its per-request method, target and
+//! headers fit no boot template.
 //!
 //! ## Keep-alive that does not lie about `left_host`
 //!
@@ -135,8 +142,8 @@ pub enum PostErrKind {
     Busy,
     /// HC2 ([`crate::HttpsReq`]): the request head carried a field that
     /// would break its framing — a CR, LF or NUL (header injection), a
-    /// target that is not `/…` origin-form, or a bad header name.
-    /// Refused before any byte is written.
+    /// target that is not `/…` origin-form, or a bad header name — or
+    /// (HD1) a raw request was empty. Refused before any byte is written.
     BadRequest,
 }
 
@@ -270,6 +277,22 @@ struct Tmpl {
 
 const _: () = assert!(core::mem::size_of::<Tmpl>() == 36);
 
+impl Tmpl {
+    /// An empty record: [`ReqWire::new`]'s fill, and a raw wire's one
+    /// window, which starts at byte 0.
+    const ZERO: Self = Self {
+        at: 0,
+        head_at: 0,
+        head_len: 0,
+        win_at: 0,
+        max_digits: 0,
+        tail_at: 0,
+        tail_len: 0,
+        method_len: 0,
+        path_len: 0,
+    };
+}
+
 /// Every template of one connection, each in its own region of ONE
 /// boot-allocated wire buffer (module doc). Pure: no socket — so the
 /// staging is testable and alloc-gated on its own.
@@ -277,6 +300,9 @@ pub struct ReqWire {
     wire: Box<[u8]>,
     tmpl: Box<[Tmpl]>,
     win_cap: usize,
+    /// A raw wire: no template — one zeroed record whose window is the
+    /// whole buffer (`ReqWire::raw`).
+    raw: bool,
 }
 
 /// Decimal digits of `v` (≥ 1).
@@ -300,6 +326,12 @@ fn visible(s: &[u8]) -> bool {
         i += 1;
     }
     true
+}
+
+/// A host a connection may name: visible ASCII, 1 to [`MAX_HOST`] bytes.
+#[inline]
+fn host_ok(h: &[u8]) -> bool {
+    !h.is_empty() && h.len() <= MAX_HOST && visible(h)
 }
 
 /// RFC 9110 `tchar`.
@@ -416,9 +448,7 @@ impl ReqWire {
             || specs.len() > MAX_TEMPLATES
             || win_cap == 0
             || win_cap > MAX_BODY_CAP
-            || h.is_empty()
-            || h.len() > MAX_HOST
-            || !visible(h)
+            || !host_ok(h)
         {
             return Err(PostErrKind::BadEndpoint);
         }
@@ -434,18 +464,7 @@ impl ReqWire {
             i += 1;
         }
         let mut wire = vec![0u8; total].into_boxed_slice();
-        let zero = Tmpl {
-            at: 0,
-            head_at: 0,
-            head_len: 0,
-            win_at: 0,
-            max_digits: 0,
-            tail_at: 0,
-            tail_len: 0,
-            method_len: 0,
-            path_len: 0,
-        };
-        let mut tmpl = vec![zero; specs.len()].into_boxed_slice();
+        let mut tmpl = vec![Tmpl::ZERO; specs.len()].into_boxed_slice();
         let mut at = 0usize;
         i = 0;
         while i < specs.len() {
@@ -512,6 +531,23 @@ impl ReqWire {
             wire,
             tmpl,
             win_cap,
+            raw: false,
+        })
+    }
+
+    /// A raw wire (HD1): no template. Its one window — window 0 — is the
+    /// whole `win_cap`-byte buffer; the owner renders entire requests
+    /// into it, then hands their span to [`Self::stage_raw`].
+    /// **Boot-only** — the buffer is allocated here, once.
+    pub(crate) fn raw(win_cap: usize) -> Result<Self, PostErrKind> {
+        if win_cap == 0 || win_cap > MAX_BODY_CAP {
+            return Err(PostErrKind::BadEndpoint);
+        }
+        Ok(Self {
+            wire: vec![0u8; win_cap].into_boxed_slice(),
+            tmpl: vec![Tmpl::ZERO].into_boxed_slice(),
+            win_cap,
+            raw: true,
         })
     }
 
@@ -552,10 +588,11 @@ impl ReqWire {
     /// the length digits (and the head, when the digit count changed).
     /// Query form: the header tail after the query (`?` dropped for an
     /// empty one). `Overflow` past the window; `BadEndpoint` for a
-    /// template that does not exist.
+    /// template that does not exist (a raw wire has none).
     pub fn stage(&mut self, t: usize, len: usize) -> Result<PayloadSpan, PostErrKind> {
-        let Some(&m) = self.tmpl.get(t) else {
-            return Err(PostErrKind::BadEndpoint);
+        let m = match self.tmpl.get(t) {
+            Some(&m) if !self.raw => m,
+            _ => return Err(PostErrKind::BadEndpoint),
         };
         if len > self.win_cap {
             return Err(PostErrKind::Overflow);
@@ -565,8 +602,9 @@ impl ReqWire {
             let d = dec_digits(len);
             let want = at + m.max_digits as usize - d;
             if want != head_at {
-                // COPY: the head (≤ MAX_HEAD = 1 503 B; ≤ 605 B for
-                // HttpsPost's one template), shifted within its region
+                // COPY: the head (≤ MAX_HEAD = 1 503 B; ≤ 605 B for a
+                // header-less JSON POST template: `HttpsPost::new`'s,
+                // `HlHttp`'s two), shifted within its region
                 // when the body's digit COUNT differs from the last
                 // request's (never between two bodies of one order of
                 // magnitude) — rejected: a fixed-width Content-Length
@@ -605,7 +643,25 @@ impl ReqWire {
         Ok(PayloadSpan::new(head_at, dst + tail_len))
     }
 
-    /// The bytes of a span [`Self::stage`] returned.
+    /// A raw wire's request (HD1): the `len` bytes the owner rendered at
+    /// `off` in window 0, returned as the span to write — nothing is
+    /// rendered or moved. `BadEndpoint` on a templated wire, `BadRequest`
+    /// for an empty request (no byte would leave, yet the write would
+    /// count as sent), `Overflow` past the window.
+    pub(crate) fn stage_raw(&self, off: usize, len: usize) -> Result<PayloadSpan, PostErrKind> {
+        if !self.raw {
+            return Err(PostErrKind::BadEndpoint);
+        }
+        if len == 0 {
+            return Err(PostErrKind::BadRequest);
+        }
+        match off.checked_add(len) {
+            Some(end) if end <= self.win_cap => Ok(PayloadSpan::new(off, end)),
+            _ => Err(PostErrKind::Overflow),
+        }
+    }
+
+    /// The bytes of a span [`Self::stage`] (or `stage_raw`) returned.
     #[inline]
     #[must_use]
     pub fn bytes(&self, span: PayloadSpan) -> &[u8] {
@@ -722,6 +778,12 @@ pub struct ConnCfg {
     pub req_timeout_ns: u64,
 }
 
+/// A response buffer and a deadline: refused before any buffer is built.
+#[inline]
+const fn cfg_ok(cfg: &ConnCfg) -> bool {
+    cfg.resp_cap != 0 && cfg.req_timeout_ns != 0
+}
+
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Phase {
@@ -797,10 +859,44 @@ impl HttpsConn {
         cfg: ConnCfg,
         token: Token,
     ) -> Result<Self, PostErrKind> {
-        if cfg.resp_cap == 0 || cfg.req_timeout_ns == 0 {
+        if !cfg_ok(&cfg) {
             return Err(PostErrKind::BadEndpoint);
         }
         let wire = ReqWire::new(host, specs, cfg.win_cap)?;
+        Self::with_wire(host, port, tls_config, wire, cfg, token)
+    }
+
+    /// A connection over a raw wire (HD1; [`crate::HttpsReq`]'s): one
+    /// `cfg.win_cap`-byte window the owner renders whole requests into,
+    /// each sent by [`Self::start_raw`]. The sizes and the host are
+    /// refused before any allocation or DNS, as a templated connection's
+    /// are. **Boot-only.**
+    pub(crate) fn new_raw(
+        host: &str,
+        port: u16,
+        tls_config: Arc<ClientConfig>,
+        cfg: ConnCfg,
+        token: Token,
+    ) -> Result<Self, PostErrKind> {
+        if !cfg_ok(&cfg) || !host_ok(host.as_bytes()) {
+            return Err(PostErrKind::BadEndpoint);
+        }
+        let wire = ReqWire::raw(cfg.win_cap)?;
+        Self::with_wire(host, port, tls_config, wire, cfg, token)
+    }
+
+    /// Resolve and intern around a built `wire`: the part [`Self::new`]
+    /// and [`Self::new_raw`] share, both having refused a bad `cfg`
+    /// before building it.
+    fn with_wire(
+        host: &str,
+        port: u16,
+        tls_config: Arc<ClientConfig>,
+        wire: ReqWire,
+        cfg: ConnCfg,
+        token: Token,
+    ) -> Result<Self, PostErrKind> {
+        debug_assert!(cfg_ok(&cfg), "cfg is checked before the wire");
         let addr = (host, port)
             .to_socket_addrs()
             .map_err(|_| PostErrKind::Dns)?
@@ -830,10 +926,11 @@ impl HttpsConn {
         })
     }
 
-    /// The host this connection talks to.
+    /// The host this connection talks to — interned for the process's
+    /// life, so it can be held while the connection is borrowed mutably.
     #[inline]
     #[must_use]
-    pub fn host(&self) -> &str {
+    pub fn host(&self) -> &'static str {
         self.host
     }
 
@@ -873,7 +970,7 @@ impl HttpsConn {
     }
 
     /// The response bytes of the last [`Progress::Done`]; valid until the
-    /// next [`Self::start`].
+    /// next [`Self::start`] (or `start_raw`).
     #[inline]
     #[must_use]
     pub fn resp(&self) -> &[u8] {
@@ -957,11 +1054,46 @@ impl HttpsConn {
         registry: &Registry,
         now_ns: u64,
     ) -> Result<(), PostErr> {
-        if self.phase != Phase::Idle {
-            debug_assert!(false, "HttpsConn::start with a request in flight");
-            return Err(not_left(PostErrKind::Busy));
+        self.not_busy()?;
+        let send = self.wire.stage(t, len).map_err(not_left)?;
+        self.launch(send, registry, now_ns)
+    }
+
+    /// [`Self::start`] on a raw wire (HD1): send the `len` bytes the
+    /// owner rendered at `off` in window 0.
+    pub(crate) fn start_raw(
+        &mut self,
+        off: usize,
+        len: usize,
+        registry: &Registry,
+        now_ns: u64,
+    ) -> Result<(), PostErr> {
+        self.not_busy()?;
+        let send = self.wire.stage_raw(off, len).map_err(not_left)?;
+        self.launch(send, registry, now_ns)
+    }
+
+    /// `Busy` while a request is in flight — an owner's bug, refused
+    /// before staging, which would rewrite bytes a pending dial has not
+    /// sent yet.
+    #[inline]
+    fn not_busy(&self) -> Result<(), PostErr> {
+        if self.phase == Phase::Idle {
+            return Ok(());
         }
-        self.send = self.wire.stage(t, len).map_err(not_left)?;
+        debug_assert!(false, "HttpsConn::start with a request in flight");
+        Err(not_left(PostErrKind::Busy))
+    }
+
+    /// Send the staged `send`: dial first when no connection is open (or
+    /// the kept-alive one died idle), else write it now.
+    fn launch(
+        &mut self,
+        send: PayloadSpan,
+        registry: &Registry,
+        now_ns: u64,
+    ) -> Result<(), PostErr> {
+        self.send = send;
         self.resp_len = 0;
         self.left_host = false;
         self.peer_closed = false;
@@ -1479,6 +1611,83 @@ mod tests {
         assert_eq!(parse(b"HTTP/1.1 200 OK\r\nContent", false), Ok(None));
         assert_eq!(parse(b"HTTP/1.1 200 OK\r\nContent", true), Err(PostErrKind::Disconnected));
         assert_eq!(parse(b"SSH-2.0\r\n\r\n", false), Err(PostErrKind::BadHttp));
+    }
+
+    #[test]
+    fn a_raw_wire_sends_what_its_owner_rendered_and_moves_nothing() {
+        let mut w = ReqWire::raw(64).expect("raw");
+        let at = w.window_mut(0).as_ptr() as usize;
+        assert_eq!(w.window_mut(0).len(), 64, "the whole buffer is the window");
+        w.window_mut(0)[10..15].copy_from_slice(b"GET /");
+        let s = w.stage_raw(10, 5).expect("in the window");
+        assert_eq!(w.bytes(s), b"GET /");
+        assert_eq!(w.window_mut(0).as_ptr() as usize, at, "nothing moved");
+        assert_eq!(
+            w.stage_raw(0, 64),
+            Ok(PayloadSpan::new(0, 64)),
+            "the whole window"
+        );
+        assert_eq!(w.stage_raw(1, 64), Err(PostErrKind::Overflow));
+        assert_eq!(
+            w.stage_raw(usize::MAX, 2),
+            Err(PostErrKind::Overflow),
+            "no wrap"
+        );
+        assert_eq!(
+            w.stage_raw(3, 0),
+            Err(PostErrKind::BadRequest),
+            "nothing to send"
+        );
+        assert_eq!(
+            w.stage(0, 1),
+            Err(PostErrKind::BadEndpoint),
+            "no template to stage"
+        );
+        let t = ReqWire::new("h", &specs(), 64).expect("specs");
+        assert_eq!(
+            t.stage_raw(0, 1),
+            Err(PostErrKind::BadEndpoint),
+            "no raw window"
+        );
+        assert!(matches!(ReqWire::raw(0), Err(PostErrKind::BadEndpoint)));
+        assert!(matches!(
+            ReqWire::raw(MAX_BODY_CAP + 1),
+            Err(PostErrKind::BadEndpoint)
+        ));
+    }
+
+    #[test]
+    fn a_raw_connection_refuses_bad_hosts_and_sizes_before_dns() {
+        let cfg = TlsTransport::default_client_config();
+        let c = ConnCfg {
+            win_cap: 64,
+            resp_cap: 64,
+            req_timeout_ns: 1,
+        };
+        let mk = |host: &str, c: ConnCfg| HttpsConn::new_raw(host, 1, cfg.clone(), c, Token(3));
+        assert!(
+            matches!(mk("", c), Err(PostErrKind::BadEndpoint)),
+            "refused, not resolved"
+        );
+        assert!(matches!(mk("a b", c), Err(PostErrKind::BadEndpoint)));
+        assert!(matches!(
+            mk("127.0.0.1", ConnCfg { win_cap: 0, ..c }),
+            Err(PostErrKind::BadEndpoint)
+        ));
+        assert!(matches!(
+            mk("127.0.0.1", ConnCfg { resp_cap: 0, ..c }),
+            Err(PostErrKind::BadEndpoint)
+        ));
+        assert!(matches!(
+            mk("no-such-host.invalid.example", c),
+            Err(PostErrKind::Dns)
+        ));
+        let h = mk("127.0.0.1", c).expect("loopback");
+        assert!(
+            h.is_idle() && !h.is_connected(),
+            "no socket is opened at construction"
+        );
+        assert_eq!((h.host(), h.window_cap()), ("127.0.0.1", 64));
     }
 
     #[test]

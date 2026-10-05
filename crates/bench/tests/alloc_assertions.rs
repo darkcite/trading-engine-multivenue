@@ -7839,10 +7839,12 @@ fn hl_action_encode_sign() {
 /// so 58 was the label the sequence 53..62 was missing. The E3/E4
 /// session logs keep their original numbers; they are history.)
 ///
-/// `HlHttp::post` cannot be driven here without a server, and the TLS
-/// loopback test covers its behaviour. What CAN be pinned — and what
-/// actually runs per order — is the pair either side of the socket:
-/// building the signed JSON body, and scanning the venue's answer.
+/// The socket between them — `HlHttp::post` — is gate 101's since XMM
+/// HD2 (rustls' two allocations per post, against gate 72's
+/// child-process node), and the TLS loopback test covers its behaviour.
+/// What this gate pins — and what actually runs per order on either side
+/// of the socket — is building the signed JSON body, and scanning the
+/// venue's answer.
 ///
 /// Both are supposed to be pure index arithmetic over caller-owned
 /// buffers. `scan` in particular returns `Span` OFFSETS rather than
@@ -10696,6 +10698,110 @@ fn https_post_keep_alive_cycle_allocates_only_rustls_record_buffers() {
     );
 }
 
+/// **XMM gate 101 (HD2) — the Hyperliquid arm's HTTPS cycle, as
+/// allocations per post: exactly gate 72's two.** Since HD2 `HlHttp` is
+/// a face over `HttpsPost` (templates `POST /exchange` and `POST /info`):
+/// the order renders in place in the `/exchange` window and goes out as
+/// ONE slice in ONE write — one sealed record while it is ≤ 16 KiB —
+/// where the pre-HD2 client wrote its head and its body as two (two
+/// sealed records: 3 per post by gate 72's one-record-per-write rule,
+/// never gated).
+/// rustls' buffered API seals one record out and decrypts one in; a
+/// regression in our code shows as a third. The bodies alternate a
+/// two-digit and a three-digit `Content-Length`, so the head moves on
+/// every post, inside the measurement. `/info` is the same engine path
+/// on template 1 (crate-private; its bytes are pinned in core-net).
+/// Served by gate 72's child-process node (the counting allocator is
+/// process-global), which answers by JSON-RPC method, whatever the path.
+#[test]
+fn hl_http_keep_alive_cycle_allocates_only_rustls_record_buffers() {
+    const POSTS: u64 = 500;
+    const RUSTLS_ALLOCS_PER_POST: u64 = 2;
+    let dir = std::env::temp_dir().join(format!("mv-gate101-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("gate 101 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 101 exe"))
+        .args([
+            "gate72_node_helper",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env("GATE72_NODE_DIR", &dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 101 child");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 101 port");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gate 101: the node never came up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 101 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .expect("gate 101 anchor");
+    let cfg = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let mut h = exec_hyperliquid::HlHttp::new("localhost", port, cfg).expect("gate 101 client");
+    let mut k = 0u64;
+    while k < 50 {
+        // The handshake, the session tickets and rustls' queues growing
+        // to their working size: the cold part.
+        assert_eq!(gate101_post(&mut h, k).0, 200, "gate 101 warm-up");
+        k += 1;
+    }
+
+    let g = AllocGuard::new();
+    let mut acc = 0u64;
+    while k < 50 + POSTS {
+        let (status, len) = gate101_post(&mut h, k);
+        assert_eq!(status, 200, "gate 101 post {k}");
+        acc = acc.wrapping_add(u64::from(status) + len as u64);
+        k += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(h.is_connected(), "one keep-alive connection throughout");
+    assert_eq!(h.dials(), 1, "no redial inside the measurement");
+    assert_eq!(
+        allocs,
+        RUSTLS_ALLOCS_PER_POST * POSTS,
+        "HlHttp cycle: {allocs} allocations ({bytes} B) over {POSTS} posts — rustls' \
+         buffered API accounts for exactly {RUSTLS_ALLOCS_PER_POST}/post (one sealed record \
+         out, one decrypted record in); anything above is ours"
+    );
+}
+
+/// Gate 101's request `k`: an `eth_chainId` (a two-digit length) when
+/// `k` is even, an `eth_getTransactionCount` (three digits) when odd —
+/// rendered in place in the `/exchange` window, then posted. The status
+/// and the answer body's length.
+fn gate101_post(h: &mut exec_hyperliquid::HlHttp, k: u64) -> (u16, usize) {
+    use exec_hyperevm::rpc::{write_chain_id, write_tx_count, BlockTag};
+    let n = if k & 1 == 0 {
+        write_chain_id(h.body_mut(), k)
+    } else {
+        write_tx_count(h.body_mut(), k, &[0x11; 20], BlockTag::Latest)
+    }
+    .expect("gate 101 body");
+    let (status, r) = h.post(n).expect("gate 101 post");
+    (status, r.end - r.start)
+}
+
 /// **HC2 gate 77a — the generic HTTP/1.1 head writer is 0 B/op.** Every
 /// Hypercall REST head — a `GET` with a query, a signed `DELETE` with
 /// two extra headers — is sized and rendered into a caller-owned buffer
@@ -10754,7 +10860,9 @@ fn http1_request_head_writer_is_zero_alloc() {
 /// request: exactly gate 72's two.** `HttpsReq` renders its head per
 /// request (any method, any target) flush against the body already in
 /// place and writes ONE contiguous slice ONCE, over the same connection
-/// engine as `HttpsPost` (`core_net::https_conn`). rustls' buffered API
+/// engine as `HttpsPost` (`core_net::https_conn`; since XMM HD1 through
+/// `HttpsPost::raw` → `HttpsConn::start_raw` — before it this pin measured
+/// the deleted `KeepAlive` copy, at the same 2). rustls' buffered API
 /// seals one record out and decrypts one in; a regression in our render
 /// or in the shared engine shows as a third. Same child-process server
 /// as gate 72 (the counting allocator is process-global).
@@ -11890,7 +11998,9 @@ fn ed25519_sign_and_render_are_zero_alloc() {
 /// (`ReqWire::stage`: body form — the length digits, the head moved on a
 /// digit-count change; query form — the header tail after the query),
 /// judges each answer where it was read (`parse_answer`, a chunked body
-/// decoded in place), and runs its WebSocket API sessions through
+/// decoded in place; since XMM HD2 interim `1xx` heads skipped, a `204`
+/// ended at its head and a `close` on any head retiring), and runs its
+/// WebSocket API sessions through
 /// `WsFramer` (data frames handed out in place, pings echoed into the
 /// send window, requests masked straight into it) with `ReqIds`
 /// matching answers to requests. All of it must be 0 B/op; the windows
@@ -11935,6 +12045,8 @@ fn bx5_staging_answer_judge_ws_framing_and_ids_are_zero_alloc() {
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 28\r\n\r\n{\"orderId\":1,\"status\":\"NEW\"}";
     let chunked: &[u8] =
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n3\r\n12}\r\n0\r\n\r\n";
+    let interim: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\
+        Connection: close\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
     // What a WS API socket delivers per request: the answer, a server
     // ping, a pong, and a user-data event (server frames are unmasked).
     let mut inbound = [0u8; 256];
@@ -11982,6 +12094,11 @@ fn bx5_staging_answer_judge_ws_framing_and_ids_are_zero_alloc() {
             .expect("gate 87 chunked")
             .expect("whole");
         acc = acc.wrapping_add((a.body.end - a.body.start) as u64);
+        rbuf[..interim.len()].copy_from_slice(interim);
+        let a = parse_answer(&mut rbuf[..interim.len()], false)
+            .expect("gate 87 interim")
+            .expect("whole");
+        acc = acc.wrapping_add(u64::from(a.status) + u64::from(a.retire));
         // …and the refusals: a short answer waits, a short answer after a
         // close is a lost connection.
         rbuf[..resp.len()].copy_from_slice(resp);

@@ -67,11 +67,13 @@
 //! first send is a rejection), and ANY refusal of a re-send (below).
 //!
 //! **Fallback.** With no live connection a post goes to `/exchange` by
-//! REST — the SAME envelope, a sub-slice of the rendered post. A post
-//! whose socket died under the write is re-sent by REST as the same
-//! signed bytes (the mask XORs back); the original may have landed, so
-//! only a per-item answer settles it. The REST post blocks this thread
-//! for up to its deadline — the fallback's cost, never the engine's.
+//! REST — the SAME envelope, rendered straight into the REST client's
+//! `/exchange` window when the post is sealed (XMM HD2). A post whose
+//! socket died under the write is re-sent by REST as the same signed
+//! bytes (the mask XORs back), copied out of the TX buffer into that
+//! window; the original may have landed, so only a per-item answer
+//! settles it. The REST post blocks this thread for up to its deadline
+//! — the fallback's cost, never the engine's.
 //!
 //! **Streams.** `userFills` → [`EV_FILL`] + [`EV_FILL_META`] (fee,
 //! crossed), deduplicated by tid across connections and reconnects (LAW
@@ -104,15 +106,17 @@
 //! **Copies** (house law): the msgpack encoding and the JSON rendering
 //! (transforms, in place); the 64 B command out of its ring slot and each
 //! 64 B event into its slot; the ≤ 125 B pong echo (rx → control
-//! buffer); boot-time moves (the dedupe rings, the batch arrays, the coin
+//! buffer); a re-send's envelope (≤ 16 KiB, out of the TX buffer into the
+//! REST client's window — its signed bytes exist only there, XMM HD2);
+//! boot-time moves (the dedupe rings, the batch arrays, the coin
 //! table); and core-net's transport copies — kernel ↔ rustls, rustls ↔
 //! the receive buffer and its compaction. **Allocations:** none of the
 //! gateway's own after construction; rustls 0.23's buffered API allocates
 //! one buffer per TLS record it seals or opens — more for an inbound
 //! burst over 4 KiB (its receive window grows and shrinks), and once per
 //! connection when its decrypted-record queue first grows to its
-//! high-water mark; gate 96b pins the residue exactly — and a dial or DNS
-//! re-resolve allocates.
+//! high-water mark; gate 96b pins the sockets' residue exactly, gate 101
+//! the REST client's — and a dial or DNS re-resolve allocates.
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,7 +166,7 @@ use crate::event::{
     REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use crate::gwconn::{GwConn, Phase};
-use crate::http::HlHttp;
+use crate::http::{HlHttp, MAX_REQ_BODY};
 use crate::json::{array_start, object_field, u64_field};
 use crate::msgpack::MsgPackErr;
 use crate::nonce::{now_ms, NonceSource, SharedNonce};
@@ -213,6 +217,9 @@ const TIMER_SLOTS: usize = 512;
 const _: () = assert!(TIMER_SLOTS >= PENDING_SLOTS);
 /// The TX buffer: a 39-item modify batch renders to ≈ 7 KiB.
 const TX_CAP: usize = 16 * 1024;
+// A re-send copies its envelope out of the TX buffer into the REST
+// client's `/exchange` window (XMM HD2): every envelope fits.
+const _: () = assert!(TX_CAP <= MAX_REQ_BODY);
 const ROOM: usize = WS_CLIENT_HDR_MAX;
 const GROUPING: &[u8] = b"na";
 
@@ -753,14 +760,20 @@ impl Batches {
     }
 }
 
-/// Where a sealed post sits in the TX buffer.
+/// Where a sealed post sits: in the TX buffer, or — sealed for REST — in
+/// the REST client's `/exchange` window.
 #[derive(Copy, Clone)]
 struct Sealed {
-    /// The envelope (the REST body): `tx[env..env + env_len]`.
+    /// The envelope (the REST body): `tx[env..env + env_len]`, or
+    /// `http.body_mut()[..env_len]` when `rest`.
     env: usize,
     env_len: usize,
-    /// The WebSocket post: `tx[ROOM..ROOM + ws_len]`.
+    /// The WebSocket post: `tx[ROOM..ROOM + ws_len]` (0 when `rest`).
     ws_len: usize,
+    /// XMM HD2: no socket was Ready when the post was sealed, so the
+    /// envelope alone was rendered straight into the REST window — no
+    /// WebSocket head it would never be sent with, and no copy.
+    rest: bool,
 }
 
 /// A coalescing class, or `None` for a command the gateway does not
@@ -2350,8 +2363,13 @@ impl HlGateway {
             self.rt.fail_all(h.id, EV_REJECTED, REASON_HALTED, now);
             return;
         }
-        match self.seal(k, &h) {
-            Some(sealed) => self.send(k, h.id, sealed, now),
+        // The one routing decision (XMM HD2): a post with no socket Ready
+        // goes by REST (a read is refused), sealed straight into the REST
+        // client's window — and posted before anything else writes it.
+        let conn = self.ready_conn();
+        let rest = k != CLASS_READ && conn.is_none();
+        match self.seal(k, &h, rest) {
+            Some(sealed) => self.send(k, h.id, sealed, conn, now),
             None => {
                 self.rt.counters.local_refusals += 1;
                 self.rt.fail_all(h.id, EV_REJECTED, REASON_LOCAL, now);
@@ -2359,9 +2377,11 @@ impl HlGateway {
         }
     }
 
-    /// Encode, sign and render the post into the TX buffer. `None` = the
+    /// Encode, sign and render the post into the TX buffer — or, `rest`
+    /// (no socket Ready), the envelope alone into the REST client's
+    /// `/exchange` window, where it will go from (XMM HD2). `None` = the
     /// clock, the signer or a buffer refused: nothing was sent.
-    fn seal(&mut self, k: usize, h: &BatchHead) -> Option<Sealed> {
+    fn seal(&mut self, k: usize, h: &BatchHead, rest: bool) -> Option<Sealed> {
         if k == CLASS_READ {
             return self.seal_read(h);
         }
@@ -2394,24 +2414,39 @@ impl HlGateway {
             self.network,
         )
         .ok()?;
-        let tx = &mut self.tx[ROOM..];
-        let pfx = ws_post_open(tx, h.id).ok()?;
-        let head = envelope_open(&mut tx[pfx..]).ok()?;
+        let (dst, pfx) = if rest {
+            (self.http.body_mut(), 0)
+        } else {
+            let tx = &mut self.tx[ROOM..];
+            let pfx = ws_post_open(tx, h.id).ok()?;
+            (tx, pfx)
+        };
+        let head = envelope_open(&mut dst[pfx..]).ok()?;
         let at = pfx + head;
         let aj = match k {
-            CLASS_ALO => order_json_grouped(&mut tx[at..], &b.alo[..n], grouping(h.p)),
-            CLASS_TAKER => order_json(&mut tx[at..], &b.taker[..n], GROUPING),
-            CLASS_MODIFY => batch_modify_json(&mut tx[at..], &b.modify[..n]),
-            CLASS_CANCEL => cancel_by_cloid_json(&mut tx[at..], &b.cancel[..n]),
-            _ => encode_control(&b.control, &mut tx[at..], true),
+            CLASS_ALO => order_json_grouped(&mut dst[at..], &b.alo[..n], grouping(h.p)),
+            CLASS_TAKER => order_json(&mut dst[at..], &b.taker[..n], GROUPING),
+            CLASS_MODIFY => batch_modify_json(&mut dst[at..], &b.modify[..n]),
+            CLASS_CANCEL => cancel_by_cloid_json(&mut dst[at..], &b.cancel[..n]),
+            _ => encode_control(&b.control, &mut dst[at..], true),
         }
         .ok()?;
-        let env_len = envelope_close(&mut tx[pfx..], head + aj, nonce, &sig, None, expires).ok()?;
-        let ws_len = ws_post_close(tx, pfx + env_len).ok()?;
+        let env_len =
+            envelope_close(&mut dst[pfx..], head + aj, nonce, &sig, None, expires).ok()?;
+        if rest {
+            return Some(Sealed {
+                env: 0,
+                env_len,
+                ws_len: 0,
+                rest,
+            });
+        }
+        let ws_len = ws_post_close(dst, pfx + env_len).ok()?;
         Some(Sealed {
             env: ROOM + pfx,
             env_len,
             ws_len,
+            rest,
         })
     }
 
@@ -2438,6 +2473,7 @@ impl HlGateway {
             env: ROOM + at,
             env_len: 0,
             ws_len,
+            rest: false,
         })
     }
 
@@ -2452,16 +2488,18 @@ impl HlGateway {
         }
     }
 
-    /// Write a sealed post on the live connection, or by REST — a read
-    /// only on the live connection: with none it is refused, unsent.
-    fn send(&mut self, k: usize, id: u64, s: Sealed, now: u64) {
-        let active = match self.ready_conn() {
-            Some(a) => a,
-            None if k == CLASS_READ => {
+    /// Write a sealed post on the live connection, or by REST — a post
+    /// sealed for REST always goes there; a read only on the live
+    /// connection: with none it is refused, unsent. `conn` is `flush`'s
+    /// [`Self::ready_conn`], the one the post was sealed by.
+    fn send(&mut self, k: usize, id: u64, s: Sealed, conn: Option<u8>, now: u64) {
+        let active = match conn {
+            Some(a) if !s.rest => a,
+            _ if k == CLASS_READ => {
                 self.rt.fail_all(id, EV_REJECTED, REASON_TRANSPORT, now);
                 return;
             }
-            None => {
+            _ => {
                 self.post_rest(id, s, false);
                 return;
             }
@@ -2546,7 +2584,9 @@ impl HlGateway {
         }
     }
 
-    /// The REST fallback: the envelope, a sub-slice of the rendered post.
+    /// The REST fallback: the envelope from the REST client's `/exchange`
+    /// window — rendered there at seal time when no socket was Ready
+    /// (XMM HD2), copied there out of the TX buffer for a re-send.
     fn post_rest(&mut self, id: u64, s: Sealed, resend: bool) {
         self.rt.stats.note_rest_fallback();
         let written = now_ns();
@@ -2555,7 +2595,18 @@ impl HlGateway {
             rec.conn = CONN_REST;
             rec.written_ns = written;
         }
-        let res = self.http.post(&self.tx[s.env..s.env + s.env_len]);
+        if !s.rest {
+            debug_assert!(resend, "only a re-send copies its envelope");
+            // COPY: the envelope (≤ TX_CAP = 16 KiB, const-asserted to fit)
+            // out of `tx` into the REST window — a re-send only: its socket
+            // died under the write, and the SAME signed bytes live only in
+            // `tx`. Rejected: a second write from `tx` (a second record) or a
+            // gather write (`write_vectored` collects a `Vec` per call) — one
+            // more allocation either way; the HTTP head rendered before the
+            // envelope in `tx` (≈ 133 B per re-send; core-net's raw form public).
+            self.http.body_mut()[..s.env_len].copy_from_slice(&self.tx[s.env..s.env + s.env_len]);
+        }
+        let res = self.http.post(s.env_len);
         let now = now_ns();
         match res {
             Ok((status, range)) => {
