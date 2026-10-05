@@ -3,33 +3,44 @@
 
 //! `LiveDispatcher` — the real Polymarket CLOB POST path.
 //!
-//! Synchronous: each `submit` call signs the order, encodes JSON,
-//! opens (or reuses) the TLS connection, POSTs, reads the response,
-//! and increments counters. Designed to be called from the engine
-//! thread when the strategy cooldown (default 250 ms) keeps the
-//! submit rate well below the connection's round-trip budget.
+//! Synchronous: each `submit` call signs the order, encodes its JSON
+//! straight into the connection's request window, POSTs it, reads the
+//! answer, and increments counters. It runs on the `QueuedDispatcher`
+//! worker thread (`queued.rs`), never the engine loop: one order may
+//! block up to `core_net::https_post::REQ_DEADLINE` (5 s), plus a
+//! blocking DNS re-resolve after every third failed dial.
 //!
 //! The dispatcher holds:
-//! * a [`core_net::TlsTransport`] and an `mio::Poll` for it,
-//! * preallocated request + response buffers,
+//! * a [`core_net::HttpsPost`] (HD3: core-net's one keep-alive HTTPS
+//!   engine, `core_net::HttpsConn`, in its blocking form) — `POST
+//!   <path>` rendered once at boot, the reuse probe before a kept-alive
+//!   connection is written to, the retire rules, `Content-Length` and
+//!   `chunked` framing, and one 5 s budget per order;
 //! * the maker's 32-byte signing key (caller-owned; we never log it),
 //! * a monotonic `next_salt`/`next_nonce` counter,
 //! * dispatch stats.
 //!
-//! On any error short of `Disconnected` the dispatcher closes the
-//! TLS connection so the next submit reconnects. The outer scheduler
-//! (cli) sees `DispatchError::Disconnected` and may sleep + retry.
+//! Every transport failure closes the connection, and so does a non-2xx
+//! answer, so the next submit redials. Whether a failed order may have
+//! reached the CLOB (`PostErr::left_host`) has no `DispatchError`
+//! variant and is dropped at this boundary, as before — so a caller that
+//! retried after `Disconnected` (which includes a timeout once the order
+//! was written) could send it twice. The queued worker does not retry.
+//!
+//! **Not expected to place a real order** (Polymarket's documentation,
+//! read 2026-10-05; not tested against the venue). Its `POST /order`
+//! requires the L2 authentication headers (`POLY_API_KEY`,
+//! `POLY_ADDRESS`, `POLY_SIGNATURE`, `POLY_PASSPHRASE`, `POLY_TIMESTAMP`)
+//! and an `owner` that is the API key owner's UUID, and since CLOB V2
+//! (2026-04-28) it refuses V1-signed orders. This dispatcher sends none
+//! of the headers, puts the maker address in `owner`, and signs V1
+//! (risk-policy "HD3").
 
-use std::io;
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use core_net::{read_response, HttpResult, TlsTransport, Transport};
+use core_net::{HttpsPost, PostErr, PostErrKind};
 use core_time::now_ns;
 use core_types::{CancelReq, Fill, ModifyReq, Order, SymbolId};
-use mio::{Events, Poll, Token};
-use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use signer_eip712::{address_from_private_key, parse_secret_key, sign_order_with_key, OrderToSign};
 
@@ -46,20 +57,14 @@ pub const MAX_REQ_BODY: usize = 8 * 1024;
 /// (order id + flags); 8 KiB is generous.
 pub const MAX_RESP_BUF: usize = 8 * 1024;
 
-/// HTTP request header buffer — separate from the body so they can
-/// be written sequentially without copying.
-const REQ_HEADER_BUF: usize = 1024;
-
-const MIO_TOKEN: Token = Token(0);
-const POLL_TIMEOUT: Duration = Duration::from_millis(50);
-const REQ_DEADLINE: Duration = Duration::from_secs(5);
-
 /// Live dispatcher errors surfaced via [`OrderDispatch::submit`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LiveDispatcherErr {
-    /// DNS resolution failed at construction.
+    /// DNS resolution failed at construction, or the connection's poll
+    /// could not be created.
     DnsResolution,
-    /// rustls server-name parsing rejected the host.
+    /// rustls rejected the host as a server name, or the host or the
+    /// path was refused at construction (`core_net::HttpsPost::new`).
     BadServerName,
     /// Signer-key bytes failed the secp256k1 scalar check.
     InvalidKey,
@@ -81,22 +86,11 @@ struct TokenIdSlot {
 
 /// The HTTP/1.1-over-TLS dispatcher.
 pub struct LiveDispatcher {
-    host: String,
-    path: String,
-    addr: SocketAddr,
-    server_name: ServerName<'static>,
-    tls_config: Arc<ClientConfig>,
-
-    /// `None` until first submit; reopened on disconnect.
-    transport: Option<TlsTransport>,
-    poll: Poll,
-    events: Events,
-
-    /// Preallocated buffers — the heart of the zero-alloc claim.
-    req_header: Box<[u8]>,
-    req_body: Box<[u8]>,
-    resp_buf: Box<[u8]>,
-    resp_len: usize,
+    /// The CLOB connection (HD3): `POST <path>` rendered at boot, each
+    /// order's JSON encoded in place in its body window
+    /// ([`MAX_REQ_BODY`]), the answer read into its [`MAX_RESP_BUF`]
+    /// response buffer — every buffer allocated at boot.
+    http: HttpsPost,
 
     /// Pre-parsed signing key. Building this once at boot saves
     /// the ~1–2 µs `SecretKey::from_slice` scalar-validity check
@@ -123,8 +117,8 @@ pub struct LiveDispatcher {
 }
 
 impl LiveDispatcher {
-    /// Resolve `host`, build the TLS client config, and stash the
-    /// signing key. Defers the TCP+TLS handshake until the first
+    /// Resolve `host`, render the `POST <path>` head once, and stash
+    /// the signing key. Defers the TCP+TLS handshake until the first
     /// `submit`.
     pub fn connect(
         host: &str,
@@ -133,13 +127,8 @@ impl LiveDispatcher {
         signer_key: [u8; 32],
         tls_config: Arc<ClientConfig>,
     ) -> Result<Self, LiveDispatcherErr> {
-        let mut iter = (host, port)
-            .to_socket_addrs()
-            .map_err(|_| LiveDispatcherErr::DnsResolution)?;
-        let addr = iter.next().ok_or(LiveDispatcherErr::DnsResolution)?;
-        let server_name: ServerName<'static> = ServerName::try_from(host)
-            .map_err(|_| LiveDispatcherErr::BadServerName)?
-            .to_owned();
+        let http = HttpsPost::new(host, port, path, tls_config, MAX_REQ_BODY, MAX_RESP_BUF)
+            .map_err(connect_err)?;
         let maker_address =
             address_from_private_key(&signer_key).map_err(|_| LiveDispatcherErr::InvalidKey)?;
         // Pre-parse the secp256k1 scalar exactly once. Per-submit
@@ -147,21 +136,8 @@ impl LiveDispatcher {
         // check on every order (~1–2 µs/submit saving).
         let parsed_key =
             parse_secret_key(&signer_key).map_err(|_| LiveDispatcherErr::InvalidKey)?;
-        let poll = Poll::new().map_err(|_| LiveDispatcherErr::DnsResolution)?;
-        let events = Events::with_capacity(16);
         Ok(Self {
-            host: host.to_string(),
-            path: path.to_string(),
-            addr,
-            server_name,
-            tls_config,
-            transport: None,
-            poll,
-            events,
-            req_header: vec![0u8; REQ_HEADER_BUF].into_boxed_slice(),
-            req_body: vec![0u8; MAX_REQ_BODY].into_boxed_slice(),
-            resp_buf: vec![0u8; MAX_RESP_BUF].into_boxed_slice(),
-            resp_len: 0,
+            http,
             signer_key: parsed_key,
             maker_address,
             next_salt: now_ns(),
@@ -227,9 +203,9 @@ impl LiveDispatcher {
     }
 
     /// Force a reconnect on the next submit. Cheap; just drops the
-    /// transport.
+    /// connection.
     pub fn close(&mut self) {
-        self.transport = None;
+        self.http.close();
     }
 
     /// Inline submit: sign + encode + POST + read response. Returns
@@ -262,9 +238,10 @@ impl LiveDispatcher {
         let sig = sign_order_with_key(&to_sign, &self.signer_key)
             .map_err(|_| DispatchError::SignerRejected)?;
 
-        // 3. Encode JSON into the preallocated body buffer.
+        // 3. Encode the JSON straight into the connection's body window:
+        //    the bytes the POST sends (HD3).
         let body_len = encode_signed_order(
-            &mut self.req_body,
+            self.http.body_mut(),
             &to_sign,
             &sig,
             &self.maker_address,
@@ -272,22 +249,16 @@ impl LiveDispatcher {
         )
         .map_err(|_| DispatchError::EncodeOverflow)?;
 
-        // 4. Open TLS if needed.
-        self.ensure_connected()?;
-
-        // 5. Build + send the HTTP/1.1 POST.
-        self.send_post(body_len)?;
-
-        // 6. Read until we have a complete response.
-        let (status, body_start, body_end) = self.read_response()?;
+        // 4. POST it — dialing first, or afresh when the kept-alive
+        //    connection died idle — and read the whole answer.
+        let (status, body) = self.http.post(body_len).map_err(post_err)?;
         if !(200..300).contains(&status) {
             self.close();
             return Err(DispatchError::Http(status));
         }
 
-        // 7. Parse the body.
-        let body = &self.resp_buf[body_start..body_end];
-        match parse_clob_response(body) {
+        // 5. Parse the body.
+        match parse_clob_response(&self.http.resp()[body]) {
             Ok(ClobResponse::Ok { .. }) => Ok(()),
             Ok(ClobResponse::Err { .. }) => Err(DispatchError::Http(status)),
             Err(_) => Err(DispatchError::JsonMalformed),
@@ -349,201 +320,6 @@ impl LiveDispatcher {
             0, // signatureType = EOA
         )
     }
-
-    fn ensure_connected(&mut self) -> Result<(), DispatchError> {
-        if self.transport.is_some() {
-            return Ok(());
-        }
-        let mut t =
-            TlsTransport::connect(self.addr, self.server_name.clone(), self.tls_config.clone())
-                .map_err(|_| DispatchError::Disconnected)?;
-        t.register(self.poll.registry(), MIO_TOKEN)
-            .map_err(|_| DispatchError::Disconnected)?;
-
-        // Drive the TLS handshake to Ready.
-        let deadline = Instant::now() + REQ_DEADLINE;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(DispatchError::Disconnected);
-            }
-            self.poll
-                .poll(&mut self.events, Some(POLL_TIMEOUT))
-                .map_err(|_| DispatchError::Disconnected)?;
-            let mut status = core_net::Status::Handshaking;
-            for ev in self.events.iter() {
-                if ev.token() != MIO_TOKEN {
-                    continue;
-                }
-                status = t.pump(ev).map_err(|_| DispatchError::Disconnected)?;
-            }
-            if status == core_net::Status::Ready {
-                break;
-            }
-            if status == core_net::Status::Closed {
-                return Err(DispatchError::Disconnected);
-            }
-            t.reregister(self.poll.registry(), MIO_TOKEN)
-                .map_err(|_| DispatchError::Disconnected)?;
-        }
-        self.transport = Some(t);
-        Ok(())
-    }
-
-    fn send_post(&mut self, body_len: usize) -> Result<(), DispatchError> {
-        // Header is small enough for `write_get_request` to live in
-        // a fixed 1 KiB buffer. We reuse the writer with a POST
-        // line by hand-rolling the request line instead.
-        let header_len = self.write_post_header(body_len)?;
-        let t = self.transport.as_mut().ok_or(DispatchError::Disconnected)?;
-
-        // Send header then body as a single logical frame. Using
-        // `write_segments` instead of two separate `write_all`
-        // calls means partial writes resume from the same offset
-        // even under TLS backpressure — defensive against any
-        // higher-level retry path that might re-enter `send_post`.
-        let segments: [&[u8]; 2] = [&self.req_header[..header_len], &self.req_body[..body_len]];
-        write_segments(t, &segments)
-    }
-
-    fn write_post_header(&mut self, body_len: usize) -> Result<usize, DispatchError> {
-        // Use core_net's write_get_request scaffolding indirectly:
-        // we hand-roll the request line because it's POST, not GET,
-        // and the body length is content-length-framed.
-        let host = self.host.as_bytes();
-        let path = self.path.as_bytes();
-        let buf = &mut *self.req_header;
-
-        let mut len_buf = [0u8; 20];
-        let body_len_str = format_u64_into(&mut len_buf, body_len as u64);
-
-        // Connection: keep-alive (HTTP/1.1 default but explicit
-        // here so a misconfigured intermediary doesn't degrade
-        // us). Each POST reuses the same TLS session — saves the
-        // 50-150 ms TCP+TLS handshake per order on WAN. Body is
-        // Content-Length-framed so the reader exits cleanly without
-        // needing a peer-FIN.
-        let parts: [&[u8]; 11] = [
-            b"POST ",
-            path,
-            b" HTTP/1.1\r\n",
-            b"Host: ",
-            host,
-            b"\r\n",
-            b"Content-Type: application/json\r\n",
-            b"Content-Length: ",
-            body_len_str,
-            b"\r\n",
-            b"Connection: keep-alive\r\n\r\n",
-        ];
-        let mut pos = 0usize;
-        for p in parts {
-            let end = pos
-                .checked_add(p.len())
-                .ok_or(DispatchError::EncodeOverflow)?;
-            if end > buf.len() {
-                return Err(DispatchError::EncodeOverflow);
-            }
-            buf[pos..end].copy_from_slice(p);
-            pos = end;
-        }
-        Ok(pos)
-    }
-
-    fn read_response(&mut self) -> Result<(u16, usize, usize), DispatchError> {
-        self.resp_len = 0;
-        let deadline = Instant::now() + REQ_DEADLINE;
-        let mut peer_closed = false;
-        loop {
-            if Instant::now() >= deadline {
-                self.close();
-                return Err(DispatchError::Disconnected);
-            }
-            self.poll
-                .poll(&mut self.events, Some(POLL_TIMEOUT))
-                .map_err(|_| DispatchError::Disconnected)?;
-            let t = self.transport.as_mut().ok_or(DispatchError::Disconnected)?;
-            for ev in self.events.iter() {
-                if ev.token() != MIO_TOKEN {
-                    continue;
-                }
-                let status = t.pump(ev).map_err(|_| DispatchError::Disconnected)?;
-                if status == core_net::Status::Closed {
-                    peer_closed = true;
-                }
-            }
-
-            // Pull plaintext into resp_buf — loop until WouldBlock or
-            // EOF so a single mio readiness wakes up all available
-            // plaintext.
-            loop {
-                if self.resp_len >= self.resp_buf.len() {
-                    break;
-                }
-                let buf_len = self.resp_buf.len();
-                match t.read(&mut self.resp_buf[self.resp_len..buf_len]) {
-                    Ok(0) => {
-                        peer_closed = true;
-                        break;
-                    }
-                    Ok(n) => self.resp_len += n,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        self.close();
-                        return Err(DispatchError::Disconnected);
-                    }
-                }
-            }
-
-            // Try parsing the headers.
-            match read_response(&self.resp_buf[..self.resp_len]) {
-                HttpResult::Complete {
-                    status,
-                    header_end: _,
-                    body_start,
-                    body_end,
-                    framing,
-                } => {
-                    // `read_response` reports `body_end` based on
-                    // the Content-Length declared in the headers,
-                    // even if those body bytes haven't all arrived
-                    // yet. Loop until the buffer has caught up.
-                    let need = match framing {
-                        core_net::BodyFraming::ContentLength(_) => body_end,
-                        // close-delimited / chunked: body extends
-                        // to whatever's already buffered.
-                        core_net::BodyFraming::CloseDelimited | core_net::BodyFraming::Chunked => {
-                            self.resp_len
-                        }
-                    };
-                    if self.resp_len >= need {
-                        return Ok((status, body_start, body_end));
-                    }
-                    if peer_closed {
-                        self.close();
-                        return Err(DispatchError::Disconnected);
-                    }
-                    let t = self.transport.as_mut().ok_or(DispatchError::Disconnected)?;
-                    t.reregister(self.poll.registry(), MIO_TOKEN)
-                        .map_err(|_| DispatchError::Disconnected)?;
-                    continue;
-                }
-                HttpResult::Incomplete => {
-                    if peer_closed {
-                        self.close();
-                        return Err(DispatchError::Disconnected);
-                    }
-                    let t = self.transport.as_mut().ok_or(DispatchError::Disconnected)?;
-                    t.reregister(self.poll.registry(), MIO_TOKEN)
-                        .map_err(|_| DispatchError::Disconnected)?;
-                    continue;
-                }
-                HttpResult::Malformed => {
-                    self.close();
-                    return Err(DispatchError::JsonMalformed);
-                }
-            }
-        }
-    }
 }
 
 impl OrderDispatch for LiveDispatcher {
@@ -577,61 +353,29 @@ impl OrderDispatch for LiveDispatcher {
 // helpers
 // -----------------------------------------------------------------
 
-/// Write a sequence of byte segments to `t` in order. The total
-/// logical frame is the concatenation of all segments; a partial
-/// write inside any segment resumes from the same byte offset,
-/// preserving the invariant that header bytes never interleave
-/// with body bytes on the wire. Zero-alloc.
-///
-/// `WouldBlock` triggers a 1 ms sleep; the call returns
-/// `DispatchError::Disconnected` if the cumulative deadline is
-/// exceeded or the peer returns `Ok(0)`.
-fn write_segments<T: Transport>(t: &mut T, segments: &[&[u8]]) -> Result<(), DispatchError> {
-    let deadline = Instant::now() + REQ_DEADLINE;
-    let mut seg_idx = 0usize;
-    let mut off = 0usize;
-    while seg_idx < segments.len() {
-        let seg = segments[seg_idx];
-        if off >= seg.len() {
-            seg_idx += 1;
-            off = 0;
-            continue;
-        }
-        if Instant::now() >= deadline {
-            return Err(DispatchError::Disconnected);
-        }
-        match t.write(&seg[off..]) {
-            Ok(0) => return Err(DispatchError::Disconnected),
-            Ok(n) => off += n,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(_) => return Err(DispatchError::Disconnected),
-        }
+/// A construction refusal of [`HttpsPost::new`] as this dispatcher's
+/// boot error: a refused host or path is `BadServerName`; DNS, or a poll
+/// that could not be created, is `DnsResolution`. The per-request kinds
+/// never come out of a constructor.
+#[inline]
+const fn connect_err(e: PostErrKind) -> LiveDispatcherErr {
+    match e {
+        PostErrKind::BadEndpoint => LiveDispatcherErr::BadServerName,
+        _ => LiveDispatcherErr::DnsResolution,
     }
-    Ok(())
 }
 
-/// Write all of `src` to `t`; spins on WouldBlock with bounded
-/// retries. Used inside the synchronous submit path only.
-#[allow(dead_code)]
-fn write_all<T: Transport>(t: &mut T, src: &[u8]) -> Result<(), DispatchError> {
-    let mut off = 0;
-    let deadline = Instant::now() + REQ_DEADLINE;
-    while off < src.len() {
-        if Instant::now() >= deadline {
-            return Err(DispatchError::Disconnected);
-        }
-        match t.write(&src[off..]) {
-            Ok(0) => return Err(DispatchError::Disconnected),
-            Ok(n) => off += n,
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(_) => return Err(DispatchError::Disconnected),
-        }
+/// A failed POST as the dispatcher's error. An answer that was not
+/// bounded HTTP/1.1 is `JsonMalformed`, as before HD3; every other
+/// failure is `Disconnected` — the connection is closed and the next
+/// submit redials. `left_host` has no `DispatchError` variant and is
+/// dropped here.
+#[inline]
+const fn post_err(e: PostErr) -> DispatchError {
+    match e.err {
+        PostErrKind::BadHttp => DispatchError::JsonMalformed,
+        _ => DispatchError::Disconnected,
     }
-    Ok(())
 }
 
 /// Pack a `SymbolId` into a 32-byte token id, big-endian, left-
@@ -641,144 +385,17 @@ fn write_all<T: Transport>(t: &mut T, src: &[u8]) -> Result<(), DispatchError> {
 fn symbol_to_token_id(sym: SymbolId) -> [u8; 32] {
     let mut out = [0u8; 32];
     let be = (sym as u128).to_be_bytes();
+    // COPY: 16 B on the stack — the id's big-endian bytes into the low
+    // half of the 32 B token id, only for a symbol with no registered id
+    // (the fallback the live CLOB refuses) — rejected: nothing to reject;
+    // the copy is the value being built.
     out[16..32].copy_from_slice(&be);
     out
-}
-
-/// Format a `u64` into `buf` as decimal ASCII. Returns the
-/// populated slice. Zero-alloc; max 20 chars.
-fn format_u64_into(buf: &mut [u8; 20], mut v: u64) -> &[u8] {
-    if v == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
-    }
-    let mut i = buf.len();
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    &buf[i..]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_net::Status;
-    use mio::event::Event;
-    use mio::{Interest, Registry, Token};
-    use std::cell::RefCell;
-
-    /// In-memory transport that returns at most `chunk` bytes per
-    /// write and emits `would_block_every` WouldBlocks in between
-    /// to simulate TLS backpressure.
-    struct ChunkedTransport {
-        out: RefCell<Vec<u8>>,
-        chunk: usize,
-        next_blocks: RefCell<u32>,
-        wb_period: u32,
-    }
-
-    impl ChunkedTransport {
-        fn new(chunk: usize, wb_period: u32) -> Self {
-            Self {
-                out: RefCell::new(Vec::new()),
-                chunk,
-                next_blocks: RefCell::new(0),
-                wb_period,
-            }
-        }
-    }
-
-    impl core_net::Transport for ChunkedTransport {
-        fn interest(&self) -> Interest {
-            Interest::WRITABLE
-        }
-        fn register(&mut self, _r: &Registry, _t: Token) -> io::Result<()> {
-            Ok(())
-        }
-        fn reregister(&mut self, _r: &Registry, _t: Token) -> io::Result<()> {
-            Ok(())
-        }
-        fn pump(&mut self, _ev: &Event) -> io::Result<Status> {
-            Ok(Status::Ready)
-        }
-        fn read(&mut self, _dst: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::from(io::ErrorKind::WouldBlock))
-        }
-        fn write(&mut self, src: &[u8]) -> io::Result<usize> {
-            // Inject a WouldBlock periodically.
-            if self.wb_period > 0 {
-                let mut n = self.next_blocks.borrow_mut();
-                *n = n.wrapping_add(1);
-                if *n % self.wb_period == 0 {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                }
-            }
-            let take = src.len().min(self.chunk);
-            self.out.borrow_mut().extend_from_slice(&src[..take]);
-            Ok(take)
-        }
-    }
-
-    #[test]
-    fn write_segments_concatenates_two_segments_in_order() {
-        let mut t = ChunkedTransport::new(1024, 0);
-        let segs: [&[u8]; 2] = [b"HEAD-AAAA", b"BODY-BBBB"];
-        write_segments(&mut t, &segs).unwrap();
-        let got = t.out.borrow().clone();
-        assert_eq!(got, b"HEAD-AAAABODY-BBBB");
-    }
-
-    #[test]
-    fn write_segments_resumes_across_partial_writes() {
-        // chunk=2: every write returns at most 2 bytes. Forces
-        // many resumptions within a single segment.
-        let mut t = ChunkedTransport::new(2, 0);
-        let segs: [&[u8]; 2] = [b"HEADERS\r\n", b"BODY-CONTENT"];
-        write_segments(&mut t, &segs).unwrap();
-        assert_eq!(t.out.borrow().clone(), b"HEADERS\r\nBODY-CONTENT");
-    }
-
-    #[test]
-    fn write_segments_resumes_across_wouldblocks() {
-        // Every third write returns WouldBlock; small chunks too.
-        let mut t = ChunkedTransport::new(3, 3);
-        let segs: [&[u8]; 2] = [b"HEAD-aaaaa", b"BODY-bbbbb"];
-        write_segments(&mut t, &segs).unwrap();
-        assert_eq!(t.out.borrow().clone(), b"HEAD-aaaaaBODY-bbbbb");
-    }
-
-    #[test]
-    fn write_segments_returns_disconnected_on_ok_zero() {
-        struct DeadTransport;
-        impl core_net::Transport for DeadTransport {
-            fn interest(&self) -> Interest {
-                Interest::WRITABLE
-            }
-            fn register(&mut self, _r: &Registry, _t: Token) -> io::Result<()> {
-                Ok(())
-            }
-            fn reregister(&mut self, _r: &Registry, _t: Token) -> io::Result<()> {
-                Ok(())
-            }
-            fn pump(&mut self, _ev: &Event) -> io::Result<Status> {
-                Ok(Status::Closed)
-            }
-            fn read(&mut self, _dst: &mut [u8]) -> io::Result<usize> {
-                Ok(0)
-            }
-            fn write(&mut self, _src: &[u8]) -> io::Result<usize> {
-                Ok(0)
-            }
-        }
-        let mut t = DeadTransport;
-        let segs: [&[u8]; 1] = [b"X"];
-        assert_eq!(
-            write_segments(&mut t, &segs),
-            Err(DispatchError::Disconnected)
-        );
-    }
 
     #[test]
     fn symbol_to_token_id_left_pads() {
@@ -788,49 +405,68 @@ mod tests {
         assert_eq!(t[31], 0xCD);
     }
 
-    #[test]
-    fn format_u64_into_handles_zero() {
-        let mut buf = [0u8; 20];
-        let s = format_u64_into(&mut buf, 0);
-        assert_eq!(s, b"0");
-    }
-
-    #[test]
-    fn format_u64_into_emits_decimal() {
-        let mut buf = [0u8; 20];
-        let s = format_u64_into(&mut buf, 12345);
-        assert_eq!(s, b"12345");
-    }
-
-    #[test]
-    fn format_u64_into_handles_max() {
-        let mut buf = [0u8; 20];
-        let s = format_u64_into(&mut buf, u64::MAX);
-        assert_eq!(s, format!("{}", u64::MAX).as_bytes());
-    }
-
-    /// Boot-path test: `LiveDispatcher::connect` accepts a
-    /// well-formed key, builds an mio Poll, and stashes the
-    /// pre-parsed `SecretKey` + maker address. We can't reach the
-    /// real CLOB from a unit test; the DNS-resolution branch is
-    /// covered by the TLS-loopback integration test.
-    /// We instead exercise `register_token_id` round-trips against
-    /// a constructed dispatcher.
-    fn fresh_dispatcher() -> LiveDispatcher {
-        let cfg = std::sync::Arc::new(
-            rustls::ClientConfig::builder()
+    fn webpki_cfg() -> Arc<ClientConfig> {
+        Arc::new(
+            ClientConfig::builder()
                 .with_root_certificates({
                     let mut s = rustls::RootCertStore::empty();
                     s.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                     s
                 })
                 .with_no_client_auth(),
-        );
+        )
+    }
+
+    /// Boot-path test: `LiveDispatcher::connect` accepts a
+    /// well-formed key, builds its connection (no socket is opened
+    /// until the first submit), and stashes the pre-parsed
+    /// `SecretKey` + maker address. We can't reach the
+    /// real CLOB from a unit test; the DNS-resolution branch is
+    /// covered by the TLS-loopback integration test.
+    /// We instead exercise `register_token_id` round-trips against
+    /// a constructed dispatcher.
+    fn fresh_dispatcher() -> LiveDispatcher {
         // 127.0.0.1 always resolves; we never actually connect.
         let mut key = [0u8; 32];
         key[31] = 1;
-        LiveDispatcher::connect("127.0.0.1", "/order", 443, key, cfg)
+        LiveDispatcher::connect("127.0.0.1", "/order", 443, key, webpki_cfg())
             .expect("LiveDispatcher::connect should succeed for 127.0.0.1")
+    }
+
+    /// HD3: the transport's errors keep their pre-HD3 meaning at the
+    /// `DispatchError` / `LiveDispatcherErr` boundary.
+    #[test]
+    fn transport_errors_keep_their_meaning() {
+        let cases = [
+            (PostErrKind::BadHttp, DispatchError::JsonMalformed),
+            (PostErrKind::Timeout, DispatchError::Disconnected),
+            (PostErrKind::Overflow, DispatchError::Disconnected),
+            (PostErrKind::Disconnected, DispatchError::Disconnected),
+        ];
+        for (err, want) in cases {
+            let e = PostErr {
+                err,
+                left_host: true,
+            };
+            assert_eq!(post_err(e), want, "{err:?}");
+        }
+        assert_eq!(
+            connect_err(PostErrKind::Dns),
+            LiveDispatcherErr::DnsResolution
+        );
+        assert_eq!(
+            connect_err(PostErrKind::BadEndpoint),
+            LiveDispatcherErr::BadServerName
+        );
+        let mut key = [0u8; 32];
+        key[31] = 1;
+        assert!(
+            matches!(
+                LiveDispatcher::connect("127.0.0.1", "order", 443, key, webpki_cfg()),
+                Err(LiveDispatcherErr::BadServerName)
+            ),
+            "a relative path is refused at boot"
+        );
     }
 
     #[test]

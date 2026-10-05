@@ -10,14 +10,16 @@
 //! * **[`PaperDispatcher`]** — never touches the network. Counts
 //!   submissions and exits. Default in `--paper` mode (which is the
 //!   only mode wired into the cli at this point).
-//! * **[`LiveDispatcher`]** — opens a [`core_net::TlsTransport`] to
-//!   the configured CLOB host, EIP-712-signs each order via
-//!   `signer_eip712`, serialises the order + signature into JSON in
-//!   a preallocated buffer, POSTs via the handwritten HTTP/1.1
-//!   codec in `core_net::http1`, and parses the response with a
-//!   zero-alloc scanner. Synchronous: the strategy's
-//!   `ctx.submit` blocks for one network round-trip. Acceptable
-//!   under the Phase 2 cooldown (250 ms per market).
+//! * **[`LiveDispatcher`]** — EIP-712-signs each order via
+//!   `signer_eip712`, serialises the order + signature into JSON
+//!   straight into the request window of a [`core_net::HttpsPost`] to
+//!   the configured CLOB host (HD3: core-net's one keep-alive HTTPS
+//!   engine), POSTs it, and parses the response with a zero-alloc
+//!   scanner. Synchronous — one network round trip per order — so it
+//!   runs on the [`QueuedDispatcher`] worker thread, never the engine
+//!   loop. It sends no Polymarket L2 authentication headers and signs
+//!   CLOB V1 orders, so the real CLOB is expected to refuse them
+//!   (`live.rs`).
 //!
 //! ## Why HTTP/1.1, not /2
 //!

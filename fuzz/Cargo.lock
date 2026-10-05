@@ -54,7 +54,6 @@ dependencies = [
  "core-time",
  "core-types",
  "memchr",
- "mio",
  "rustls",
  "signer-eip712",
 ]
@@ -94,6 +93,10 @@ dependencies = [
  "core-types",
  "libc",
 ]
+
+[[package]]
+name = "core-latency"
+version = "0.1.0"
 
 [[package]]
 name = "core-metrics"
@@ -184,6 +187,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "exec-gateway"
+version = "0.1.0"
+dependencies = [
+ "core-latency",
+ "core-net",
+ "core-ring",
+]
+
+[[package]]
 name = "exec-hypercall"
 version = "0.1.0"
 dependencies = [
@@ -225,7 +237,9 @@ dependencies = [
  "core-net",
  "core-parse",
  "core-ring",
+ "core-time",
  "core-types",
+ "exec-gateway",
  "mio",
  "rustls",
  "secp256k1",

@@ -6,6 +6,29 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-05 — clob-dispatcher: `LiveDispatcher` on `core_net::HttpsPost`; `mio` dropped (XMM HD3)
+
+**What changed**
+- `LiveDispatcher` posts through `core_net::HttpsPost`, core-net's one
+  keep-alive engine. `connect` keeps its signature and its errors;
+  `close`, `submit_inline` and `register_token_id` are unchanged.
+- Its own transport is deleted (`ensure_connected`, `send_post`,
+  `write_post_header`, `read_response`, `write_segments`, the dead
+  `write_all`, `format_u64_into`), with its seven unit tests. The crate no
+  longer depends on `mio`.
+- `LiveDispatcherErr::BadServerName` also covers a path `HttpsPost`
+  refuses (not `/…`, not visible ASCII, over 256 B) and a host refused on
+  its syntax (empty, over 253 B, not visible ASCII) — checked before DNS,
+  where such a host used to be `DnsResolution`. A poll that cannot be
+  created is reported before the key checks.
+- Behaviour: the reuse probe, chunked decoding, one 5 s budget per order,
+  every failure closes the connection, one TLS record per order; the
+  head's header order is `HttpsPost`'s (risk-policy "HD3").
+- copy-audit baseline 31 → 28: the old transport's two copies are gone, and
+  the token-id fallback's copy now carries its `// COPY:` note.
+
+**Operator action:** none — `--live` is outside the managed fleet.
+
 ## 2026-10-05 — core-net: `HttpsReq` on `HttpsConn`; `https_keepalive` deleted (XMM HD1)
 
 **What changed**

@@ -398,7 +398,10 @@ two. `--live` now `conflicts_with = "exec"`, so the two can never be
 combined, but the asymmetry is recorded here deliberately rather than
 left implicit: what keeps the legacy path unreachable in the managed
 fleet is `scripts/engine-wrapper.sh`'s strategy allow-list and its
-hard-coded `--paper`, not the flag's own design.
+hard-coded `--paper`, not the flag's own design. Since HD3 the path posts
+through `core_net::HttpsPost`. Polymarket is expected to refuse its orders
+(its documented `POST /order` contract, not tested against the venue —
+HD3, below); the wrapper remains the control.
 
 ## Signing-key handling
 
@@ -6463,6 +6466,67 @@ one window. Every caller is far below it (512 + 0 and 1 024 + 2 048).
 build and a restart. Then the poller's
 `engine_ingress_hypercall_rest_polls_ok_total` / `_polls_err_total` are
 the check.
+
+### HD3: `LiveDispatcher` moved onto `HttpsPost` (2026-10-05)
+
+`clob_dispatcher::LiveDispatcher` is the legacy `--live` Polymarket CLOB
+path ("The legacy `--live` flag is outside the interlock", above). It now
+posts through `core_net::HttpsPost`, the engine HD1 put `HttpsReq` on,
+instead of a transport of its own — Anton's ruling R3: migrate, not
+retire. Its API and error variants are unchanged. It runs on the
+`QueuedDispatcher` worker thread, never the engine loop (one order may
+block up to 5 s). What changed:
+
+* **A connection the CLOB closed while idle is no longer written to.**
+  The reuse probe retires it and the order dials fresh. Before HD3 the
+  order went into the dead connection and failed `Disconnected`. An
+  answer with `Connection: close` (or HTTP/1.0) now retires the
+  connection too; before, the next order was written into it.
+* **A chunked answer is decoded.** Before HD3 its raw chunk lines reached
+  the scanner (`JsonMalformed`). A close-delimited answer needs a clean
+  close.
+* **The request is flushed at once.** Before, on a reused connection it
+  sat in rustls until the next poll wake, up to 50 ms (HlHttp's E7
+  finding).
+* **One 5 s budget per order** (dial, write and read together) where
+  each phase had 5 s of its own, up to 15 s. Every failure closes the
+  connection; before, a failed write or poll could leave it open.
+* **One TLS record per order:** head and body go out as one slice. The
+  head's header order is `HttpsPost`'s (Host, Content-Type, Connection,
+  Content-Length).
+* **Some rejections change category in `DispatchStats`; of these shifts,
+  none moves to `accepted`.** A chunked or close-delimited non-2xx answer
+  used to be `Http(status)` as soon as its head arrived; now the whole
+  answer is framed first. One over 8 KiB (a CDN error page, say) is now
+  `Disconnected` (`Overflow`); one ended by a bare FIN, `Disconnected`;
+  one with malformed chunks, `JsonMalformed`. A `204` or `1xx` without a
+  length waits out the 5 s deadline (HD1's recorded parser issue), where
+  it returned at once. A `Content-Length` answer over 8 KiB fails at once
+  instead of at the deadline.
+* A non-2xx answer still closes the connection, so a venue that refuses
+  every order costs a full TLS handshake per order. If the path is ever
+  made real, a well-framed `4xx` should keep the connection.
+* DNS is re-resolved, blocking the worker thread, after every third
+  failed dial in a row.
+
+Pinned by `live_dispatcher_loopback::`
+`an_order_after_an_idle_close_goes_out_on_a_fresh_connection` and
+`a_chunked_answer_is_decoded_and_the_connection_kept` — both failed on
+the old transport, 3 runs of 3 — beside the three original tests,
+unchanged. The copy-audit baseline goes 31 → 28: the old transport's two
+copies are gone, and the token-id fallback's copy now carries its note.
+
+**Not expected to place a real order** (from Polymarket's documentation,
+read 2026-10-05; not tested against the venue). Its `POST /order`
+reference requires the L2 authentication headers (`POLY_API_KEY`,
+`POLY_ADDRESS`, `POLY_SIGNATURE`, `POLY_PASSPHRASE`, `POLY_TIMESTAMP`),
+none of which this dispatcher sends, and describes `owner` as the "UUID
+of the API key owner", where this dispatcher puts the maker address. Its
+CLOB V2 migration page says V1-signed orders "are no longer supported on
+production" since 2026-04-28, and this signer is V1 (domain version
+`"1"`, the `taker` / `nonce` / `feeRateBps` struct). What keeps the path
+out of the managed fleet is unchanged: the wrapper's allow-list and its
+hard-coded `--paper`.
 
 ### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
 

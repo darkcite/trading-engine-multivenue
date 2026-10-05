@@ -81,7 +81,7 @@ at **0.23.38** (`Cargo.lock:1674`; workspace `Cargo.toml:119`: `default-features
   | `HlHttp` `/exchange` + `/info` | `crates/exec-hyperliquid/src/http.rs:204-594` | hot — the order path; head and body go out as **two** records |
   | `UserWs` | `crates/exec-hyperliquid/src/userws_conn.rs:131-637` | hot — the fills of record |
   | `HttpsPost` | `crates/core-net/src/https_post.rs:192-637` | EVM arm, HYPARB reads, operator verbs |
-  | `LiveDispatcher` | `crates/clob-dispatcher/src/live.rs:83-547` | Polymarket CLOB `/order` |
+  | `LiveDispatcher` | since XMM HD3 a `core_net::HttpsPost` user, with no transport of its own (`crates/clob-dispatcher/src/live.rs`) | Polymarket CLOB `/order` |
   | `boot_http` | `crates/core-net/src/boot_http.rs:176-177` (`rustls::Stream`) | cold — boot REST; **out of scope** |
 
 - **The buffers the plaintext lands in.**
@@ -453,8 +453,9 @@ fn with_record(&mut self, render: impl Fn(&mut WsPayload<'_>) -> Result<(), WsWr
 - A flip back is a config change and a restart, not a rebuild.
 
 **TL5b — Exec lane (Q5)**
-- `UserWs` moves onto an `IoBuf` and `fill`. `HlHttp`, `HttpsPost` and `LiveDispatcher` read into
-  their response buffers through an `IoBuf` view.
+- `UserWs` moves onto an `IoBuf` and `fill`. `HlHttp` and `HttpsPost` (under which
+  `HttpsReq` and `LiveDispatcher` run since XMM HD1 / HD3) read into their response buffers
+  through an `IoBuf` view.
 - Gate 72 → 0.
 - The `hl_exchange_tls_loopback`, `hl_lifecycle_loopback`, `hl_userws_loopback`,
   `https_post_loopback`, `arm_tls_loopback` and `live_dispatcher_loopback` suites run in both modes.

@@ -405,7 +405,6 @@ dependencies = [
  "core-time",
  "core-types",
  "memchr",
- "mio 0.8.11",
  "proptest",
  "rcgen",
  "rustls",
