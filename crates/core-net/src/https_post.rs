@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Anton (darkcite)
 
-//! A keep-alive HTTPS `POST` client for ONE endpoint — host, port and
-//! path fixed at construction (HYPARB H7c: the HyperEVM JSON-RPC write
-//! arm, `https://rpc.hyperliquid-testnet.xyz/evm`).
+//! A keep-alive HTTPS `POST` client for ONE host — host, port and
+//! paths fixed at construction. HYPARB H7c's HyperEVM JSON-RPC write arm
+//! (`https://rpc.hyperliquid-testnet.xyz/evm`) has one path, from its
+//! boot URL; since XMM HD2 the Hyperliquid exchange arm
+//! (`exec_hyperliquid::http::HlHttp`) has two — `POST /exchange` and
+//! `POST /info` — through [`HttpsPost::with_specs`].
 //!
-//! The shape is `exec_hyperliquid::http::HlHttp`'s, generalised only in
-//! that the path comes from the boot URL instead of two compiled
-//! constants: mio + rustls, HTTP/1.1 `Connection: keep-alive`, every
-//! buffer allocated at construction, one synchronous request/response
-//! cycle per call on the caller's own worker thread (never the engine
-//! loop — a cycle may block up to [`REQ_DEADLINE`]). `Content-Length`
-//! and `chunked` framing let the reader stop at the body's end, so the
+//! mio + rustls, HTTP/1.1 `Connection: keep-alive`, every buffer
+//! allocated at construction, one synchronous request/response cycle per
+//! call on the caller's own worker thread (never the engine loop — a
+//! cycle may block up to [`REQ_DEADLINE`]). `Content-Length` and
+//! `chunked` framing let the reader stop at the body's end, so the
 //! connection survives for the next request and the TCP+TLS handshake
-//! is paid once (a chunked body is decoded in place — `HlHttp` refuses
-//! chunked; this client's endpoints include one that sends it).
-//! **`HlHttp` itself is deliberately NOT migrated onto this type in the
-//! HYPARB lane**: it is the armed-live E-lane arm, and changing it is
-//! that lane's decision under its own review.
+//! is paid once (a chunked body is decoded in place). Until HD2,
+//! `HlHttp` was a separate copy of this shape — it refused chunked
+//! answers and wrote each request as two TLS records — kept apart
+//! because it is the armed-live E-lane arm; HD2 moved it onto this type
+//! under that lane's own review (risk-policy "HD2").
 //!
-//! **Since BX5 this is the blocking form of [`crate::HttpsConn`]**: one
-//! POST template, its own poll, and a loop that waits. The protocol —
+//! **Since BX5 this is the blocking form of [`crate::HttpsConn`]**: its
+//! POST templates, its own poll, and a loop that waits. The protocol —
 //! staging, keep-alive, the reuse probe, framing, `left_host` — lives
 //! once, in `HttpsConn`; the wire bytes and this API are unchanged.
 //! Since HD1 it also has a crate-private **raw** form — one window, the
@@ -44,8 +45,10 @@
 //! The caller renders the body in place through [`HttpsPost::body_mut`]
 //! (the doctrine's "encoders render into the FINAL wire buffer"); the
 //! only per-post render is the length digits. The prefix sits flush
-//! against the digits, so it moves (a ≤ 605 B `copy_within` inside one
-//! cache-resident buffer) whenever the body's DIGIT COUNT differs from
+//! against the digits, so it moves (a `copy_within` inside one
+//! cache-resident buffer: ≤ 605 B for a header-less JSON template —
+//! [`HttpsPost::new`]'s, `HlHttp`'s two — ≤ 1 503 B with extra headers)
+//! whenever the body's DIGIT COUNT differs from
 //! the last request's — for the write arm, a 2-digit `eth_feeHistory`
 //! between 3-digit sends and receipt polls: about twice per 2 s while a
 //! swap is in flight. Two ways to never move it were weighed and
@@ -120,8 +123,9 @@ pub fn parse_https_url(url: &str) -> Option<(&str, u16, &str)> {
     Some((host, port, path))
 }
 
-/// A keep-alive HTTPS connection to one endpoint, driven to completion
-/// on the caller's thread.
+/// A keep-alive HTTPS connection to one host — one path ([`Self::new`])
+/// or several fixed request shapes ([`Self::with_specs`]) — driven to
+/// completion on the caller's thread.
 pub struct HttpsPost {
     conn: HttpsConn,
     poll: Poll,
@@ -149,8 +153,25 @@ impl HttpsPost {
             params: Params::Body("application/json"),
             headers: &[],
         }];
-        let cfg = conn_cfg(body_cap, resp_cap);
-        let conn = HttpsConn::new(host, port, tls_config, &spec, cfg, MIO_TOKEN)?;
+        Self::with_specs(host, port, tls_config, &spec, body_cap, resp_cap)
+    }
+
+    /// One host, several fixed request shapes (HD2: the HL client's
+    /// `POST /exchange` and `POST /info`): every template's head is
+    /// rendered here, once, and each has a `win_cap`-byte window
+    /// ([`Self::window_mut`]). [`Self::new`] is the one-template case.
+    /// **Boot-only** — the allocations live here. No socket is opened
+    /// until the first request.
+    pub fn with_specs(
+        host: &str,
+        port: u16,
+        tls_config: Arc<ClientConfig>,
+        specs: &[ReqSpec<'_>],
+        win_cap: usize,
+        resp_cap: usize,
+    ) -> Result<Self, PostErrKind> {
+        let cfg = conn_cfg(win_cap, resp_cap);
+        let conn = HttpsConn::new(host, port, tls_config, specs, cfg, MIO_TOKEN)?;
         Self::around(conn)
     }
 
@@ -186,7 +207,7 @@ impl HttpsPost {
         self.conn.host()
     }
 
-    /// The fixed request path.
+    /// Template 0's request path — a [`Self::new`] client's one path.
     #[inline]
     #[must_use]
     pub fn path(&self) -> &str {
@@ -206,6 +227,18 @@ impl HttpsPost {
     #[inline]
     pub fn body_mut(&mut self) -> &mut [u8] {
         self.conn.window_mut(0)
+    }
+
+    /// Template `t`'s window ([`Self::with_specs`]): render that
+    /// request's body here, then [`Self::request`] its length. Each
+    /// template has its own; their contents survive a request.
+    ///
+    /// # Panics
+    /// If template `t` does not exist — an owner's bug, where
+    /// [`Self::request`] refuses the same `t` with `BadEndpoint`.
+    #[inline]
+    pub fn window_mut(&mut self, t: usize) -> &mut [u8] {
+        self.conn.window_mut(t)
     }
 
     /// Drop the connection. The next request redials.
@@ -229,8 +262,8 @@ impl HttpsPost {
         self.conn.is_connected()
     }
 
-    /// The response bytes of the last successful [`Self::post`] (or
-    /// `request_raw`).
+    /// The response bytes of the last successful [`Self::post`] or
+    /// [`Self::request`] (or `request_raw`) — whichever template asked.
     #[inline]
     #[must_use]
     pub fn resp(&self) -> &[u8] {
@@ -241,7 +274,19 @@ impl HttpsPost {
     /// [`Self::body_mut`]: `(http_status, body_range)` into
     /// [`Self::resp`]. **The status is not a verdict.**
     pub fn post(&mut self, body_len: usize) -> Result<(u16, core::ops::Range<usize>), PostErr> {
-        self.cycle(|conn, registry, now| conn.start(0, body_len, registry, now))
+        self.request(0, body_len)
+    }
+
+    /// One request/response cycle for template `t` with the first `len`
+    /// bytes of its window: `(http_status, body_range)` into
+    /// [`Self::resp`]. **The status is not a verdict.** A template that
+    /// does not exist is refused before any byte is written.
+    pub fn request(
+        &mut self,
+        t: usize,
+        len: usize,
+    ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+        self.cycle(|conn, registry, now| conn.start(t, len, registry, now))
     }
 
     /// The raw form's cycle (HD1): send the `len` bytes the owner
@@ -429,6 +474,53 @@ mod tests {
         assert!(bad("/é", 64), "a path must be visible ASCII");
         assert!(bad("/", 0), "a body window is required");
         assert!(bad("/", MAX_BODY_CAP + 1), "seven length digits at most");
+    }
+
+    /// HD2: two templates on one connection, each staged exactly — the HL
+    /// client's `/exchange` and `/info` requests, byte for byte — and a
+    /// template that does not exist refused before anything dials.
+    #[test]
+    fn two_templates_each_render_their_own_request() {
+        let cfg = TlsTransport::default_client_config();
+        let json = Params::Body("application/json");
+        let specs = [
+            ReqSpec {
+                method: Method::Post,
+                path: "/exchange",
+                params: json,
+                headers: &[],
+            },
+            ReqSpec {
+                method: Method::Post,
+                path: "/info",
+                params: json,
+                headers: &[],
+            },
+        ];
+        let mut h = HttpsPost::with_specs("127.0.0.1", 1, cfg, &specs, 64, 64).expect("loopback");
+        h.window_mut(0)[..2].copy_from_slice(b"{}");
+        h.window_mut(1)[..12].copy_from_slice(br#"{"type":"x"}"#);
+        let exchange = String::from_utf8_lossy(h.conn.staged(0, 2).expect("fits")).to_string();
+        assert_eq!(
+            exchange,
+            "POST /exchange HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Connection: keep-alive\r\nContent-Length: 2\r\n\r\n{}"
+        );
+        let info = String::from_utf8_lossy(h.conn.staged(1, 12).expect("fits")).to_string();
+        assert_eq!(
+            info,
+            "POST /info HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+             Connection: keep-alive\r\nContent-Length: 12\r\n\r\n{\"type\":\"x\"}"
+        );
+        assert_eq!(
+            h.request(2, 1).err(),
+            Some(PostErr {
+                err: PostErrKind::BadEndpoint,
+                left_host: false
+            }),
+            "no third template"
+        );
+        assert!(!h.is_connected() && h.dials() == 0);
     }
 
     /// HD1: a request of the other form — a template on a raw window, a

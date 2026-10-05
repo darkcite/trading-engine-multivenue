@@ -53,7 +53,7 @@ use crate::asset::AssetTable;
 use crate::budget::{self, AddressBudget};
 use crate::cloid::encode as encode_cloid;
 use crate::config::HlConfig;
-use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::http::HlHttp;
 use crate::nonce::{NonceSource, SharedNonce};
 use crate::request::{envelope_close, envelope_open, order_json};
 use crate::response::{scan, HlOk, HlResponse};
@@ -595,6 +595,12 @@ const fn classify_sweep(failed: u32, deferred: u32, truncated: bool) -> SweepOut
 
 /// The live Hyperliquid dispatcher.
 pub struct HlExchange<const FILL_N: usize> {
+    /// The venue's REST client. Its `/exchange` window
+    /// ([`HlHttp::body_mut`]) is where every request body is built IN
+    /// PLACE: envelope head, then the action JSON rendered straight into
+    /// it, then the signature tail — one buffer, one write per byte, no
+    /// staging copy, sent as one TLS record while it is ≤ 16 KiB (XMM
+    /// HD2).
     http: HlHttp,
     ws: UserWs,
     sk: secp256k1::SecretKey,
@@ -723,10 +729,6 @@ pub struct HlExchange<const FILL_N: usize> {
     /// cut zeroed 4 KiB of it per action, and re-declared it inside
     /// the sweep loop.
     mp: Box<[u8]>,
-    /// The request body, built IN PLACE: envelope head, then the
-    /// action JSON rendered straight into it, then the signature
-    /// tail. One buffer, one write per byte, no staging copy.
-    req: Box<[u8]>,
     /// Scratch for one frame's fills. **Boxed and sized for the
     /// venue's SNAPSHOT**, not for a steady-state frame — see
     /// [`HlExchange::pump_user_events`].
@@ -861,7 +863,6 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             bal: vec![crate::recon::SpotBalance::default(); crate::recon::MAX_SPOT_BALANCES]
                 .into_boxed_slice(),
             mp: vec![0u8; MAX_ACTION].into_boxed_slice(),
-            req: vec![0u8; MAX_REQ_BODY].into_boxed_slice(),
             wires: vec![
                 crate::action::CancelWire { asset: 0, oid: 0 };
                 crate::recon::MAX_OPEN_ORDERS
@@ -1030,11 +1031,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// budget untouched — when the venue did not answer or answered
     /// half. The boot seed and the top-up's re-read share it.
     fn read_venue_budget(&mut self) -> bool {
-        let mut req = [0u8; budget::MAX_RATE_REQ];
-        let Ok(n) = budget::rate_limit_request(&mut req, &self.master_addr) else {
+        let Ok(n) = budget::rate_limit_request(self.http.info_mut(), &self.master_addr) else {
             return false;
         };
-        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+        let Ok((_status, range)) = self.http.post_info(n) else {
             return false;
         };
         let Some((used, vlm_1e6, surplus)) = budget::scan_rate_limit(&self.http.resp()[range])
@@ -1161,9 +1161,8 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// `self.wires`: `(selected, unmapped)`. `None` when the answer
     /// could not be had or read — never "nothing resting".
     fn read_ours_everywhere(&mut self) -> Option<(usize, u32)> {
-        let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
-        let n = crate::recon::open_orders_request(&mut req, &self.master_addr).ok()?;
-        let (_status, range) = self.http.post_to(crate::http::INFO_PATH, &req[..n]).ok()?;
+        let n = crate::recon::open_orders_request(self.http.info_mut(), &self.master_addr).ok()?;
+        let (_status, range) = self.http.post_info(n).ok()?;
         let body = &self.http.resp()[range];
         let rows = crate::recon::scan_open_orders(body, &mut self.open).ok()?;
         Some(crate::recon::ours_everywhere(
@@ -1181,12 +1180,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let c = [crate::action::CancelWire { asset, oid }];
         let (Ok(mp_n), Ok(head)) = (
             crate::action::encode_cancel(&mut self.mp, &c),
-            envelope_open(&mut self.req),
+            envelope_open(self.http.body_mut()),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             return false;
         };
-        let Ok(aj_n) = crate::request::cancel_json(&mut self.req[head..], &c) else {
+        let Ok(aj_n) = crate::request::cancel_json(&mut self.http.body_mut()[head..], &c) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             return false;
         };
@@ -1212,11 +1211,10 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return;
         }
         let start_ms = today * crate::dayspend::DAY_MS;
-        let mut req = [0u8; crate::dayspend::MAX_DAY_REQ];
         let mut bought = [0i64; core_config::exec::EXEC_SLOTS];
-        let read = match crate::dayspend::fills_since_request(&mut req, &self.master_addr, start_ms)
-        {
-            Ok(n) => match self.http.post_to(crate::http::INFO_PATH, &req[..n]) {
+        let info = self.http.info_mut();
+        let read = match crate::dayspend::fills_since_request(info, &self.master_addr, start_ms) {
+            Ok(n) => match self.http.post_info(n) {
                 Ok((_status, range)) => {
                     crate::dayspend::scan_day_bought(&self.http.resp()[range], start_ms, &mut bought)
                         .is_ok()
@@ -1364,7 +1362,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         let Ok(head) = self.open_action() else {
             return Reserve::NotSent;
         };
-        let Ok(aj_n) = crate::request::reserve_weight_json(&mut self.req[head..], weight) else {
+        let Ok(aj_n) =
+            crate::request::reserve_weight_json(&mut self.http.body_mut()[head..], weight)
+        else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             return Reserve::NotSent;
         };
@@ -1754,12 +1754,12 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }
         self.last_recon = Instant::now();
 
-        let mut req = [0u8; crate::recon::MAX_STATE_REQ];
-        let Ok(n) = crate::recon::spot_state_request(&mut req, &self.master_addr) else {
+        let Ok(n) = crate::recon::spot_state_request(self.http.info_mut(), &self.master_addr)
+        else {
             self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
             return true;
         };
-        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+        let Ok((_status, range)) = self.http.post_info(n) else {
             self.counters.recon_failed = self.counters.recon_failed.wrapping_add(1);
             return true;
         };
@@ -1881,9 +1881,9 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// that runs on the engine thread and must not allocate.
     ///
     /// The msgpack is `self.mp[..mp_n]`; the action JSON already sits
-    /// in `self.req[..action_end]` behind the envelope head
-    /// ([`Self::open_action`]). Returns the finished body length in
-    /// `self.req`.
+    /// in the `/exchange` window's `[..action_end]` behind the envelope
+    /// head ([`Self::open_action`]). Returns the finished body length in
+    /// that window.
     ///
     /// # Errors
     /// `SignerRejected` if the key refuses — or if the wall clock reads
@@ -1897,23 +1897,30 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
             return Err(DispatchError::SignerRejected);
         }
         let nonce = self.nonce.next(ms);
-        let sig = sign_action(&self.sk, &self.mp[..mp_n], nonce, Vault::None, None, self.network)
-            .map_err(|_| {
-                self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
-                DispatchError::SignerRejected
-            })?;
-        envelope_close(&mut self.req, action_end, nonce, &sig, None, None).map_err(|_| {
+        let sig = sign_action(
+            &self.sk,
+            &self.mp[..mp_n],
+            nonce,
+            Vault::None,
+            None,
+            self.network,
+        )
+        .map_err(|_| {
+            self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
+            DispatchError::SignerRejected
+        })?;
+        envelope_close(self.http.body_mut(), action_end, nonce, &sig, None, None).map_err(|_| {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             DispatchError::EncodeOverflow
         })
     }
 
-    /// Write the envelope head into `self.req` and return the offset
+    /// Write the envelope head into the `/exchange` window and return the offset
     /// the caller renders the action JSON at. See
     /// [`crate::request::envelope_open`].
     #[inline(always)]
     fn open_action(&mut self) -> Result<usize, DispatchError> {
-        envelope_open(&mut self.req).map_err(|_| {
+        envelope_open(self.http.body_mut()).map_err(|_| {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             DispatchError::EncodeOverflow
         })
@@ -1940,7 +1947,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         n: usize,
         items: u32,
     ) -> Result<(u16, core::ops::Range<usize>), crate::http::PostErr> {
-        let posted = self.http.post(&self.req[..n]);
+        let posted = self.http.post(n);
         self.count_post(&posted, items);
         posted
     }
@@ -2175,13 +2182,13 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         self.counters.sweeps_run = self.counters.sweeps_run.wrapping_add(1);
 
         // ---- ask the venue what is resting --------------------------
-        let mut req = [0u8; crate::recon::MAX_OPEN_ORDERS_REQ];
-        let Ok(n) = crate::recon::open_orders_request(&mut req, &self.master_addr) else {
+        let Ok(n) = crate::recon::open_orders_request(self.http.info_mut(), &self.master_addr)
+        else {
             self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
             self.spend_try(0);
             return;
         };
-        let Ok((_status, range)) = self.http.post_to(crate::http::INFO_PATH, &req[..n]) else {
+        let Ok((_status, range)) = self.http.post_info(n) else {
             self.counters.sweep_failed = self.counters.sweep_failed.wrapping_add(1);
             self.spend_try(0);
             return;
@@ -2403,13 +2410,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }];
         let (Ok(mp_n), Ok(head)) = (
             crate::action::encode_cancel_by_cloid(&mut self.mp, &c),
-            envelope_open(&mut self.req),
+            envelope_open(self.http.body_mut()),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
         };
-        let Ok(aj_n) = crate::request::cancel_by_cloid_json(&mut self.req[head..], &c) else {
+        let Ok(aj_n) = crate::request::cancel_by_cloid_json(&mut self.http.body_mut()[head..], &c)
+        else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.cancels_refused = self.counters.cancels_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
@@ -2429,7 +2437,7 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
     /// The ENCODE half of [`Self::modify_by_cloid`]: asset lookup, the scale
     /// guards, the cloid builder, the wire structs, msgpack into
     /// `self.mp` and the action JSON in place behind the envelope head
-    /// in `self.req`. Returns `(mp_n, action_end)` for
+    /// in the `/exchange` window. Returns `(mp_n, action_end)` for
     /// [`Self::seal`] / `send_action`. Touches no socket and spends no
     /// budget.
     ///
@@ -2493,13 +2501,14 @@ impl<const FILL_N: usize> HlExchange<FILL_N> {
         }];
         let (Ok(mp_n), Ok(head)) = (
             crate::action::encode_batch_modify(&mut self.mp, &m),
-            envelope_open(&mut self.req),
+            envelope_open(self.http.body_mut()),
         ) else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
         };
-        let Ok(aj_n) = crate::request::batch_modify_json(&mut self.req[head..], &m) else {
+        let Ok(aj_n) = crate::request::batch_modify_json(&mut self.http.body_mut()[head..], &m)
+        else {
             self.counters.encode_failures = self.counters.encode_failures.wrapping_add(1);
             self.counters.modifies_refused = self.counters.modifies_refused.wrapping_add(1);
             return Err(DispatchError::EncodeOverflow);
@@ -2645,9 +2654,15 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
                 DispatchError::EncodeOverflow
             })
         };
-        let mp_n = enc(encode_order(&mut self.mp, &[wire], b"na"), &mut self.counters)?;
+        let mp_n = enc(
+            encode_order(&mut self.mp, &[wire], b"na"),
+            &mut self.counters,
+        )?;
         let head = self.open_action()?;
-        let aj_n = enc(order_json(&mut self.req[head..], &[wire], b"na"), &mut self.counters)?;
+        let aj_n = enc(
+            order_json(&mut self.http.body_mut()[head..], &[wire], b"na"),
+            &mut self.counters,
+        )?;
 
         // The nonce is taken LAST among the things that can fail, so a
         // local refusal cannot burn one. (HL only requires strictly
@@ -3669,18 +3684,20 @@ mod tests {
             "THE case this exists for: the venue has it, we do not know what it did"
         );
 
-        let before: R = Err(crate::http::PostErr::before_send(
-            crate::http::HttpErr::Dns,
-        ));
+        let before: R = Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Dns,
+            left_host: false,
+        });
         assert!(
             !HlExchange::<64>::counts_against_address(&before),
             "a request that never reached a socket is not an action"
         );
         // And the two are NOT distinguishable by the error variant,
         // which is why the flag exists: `Disconnected` is both.
-        let d_before: R = Err(crate::http::PostErr::before_send(
-            crate::http::HttpErr::Disconnected,
-        ));
+        let d_before: R = Err(crate::http::PostErr {
+            err: crate::http::HttpErr::Disconnected,
+            left_host: false,
+        });
         let d_after: R = Err(crate::http::PostErr {
             err: crate::http::HttpErr::Disconnected,
             left_host: true,
@@ -3700,9 +3717,10 @@ mod tests {
         let before = x.budget.spent();
 
         x.count_post(
-            &Err(crate::http::PostErr::before_send(
-                crate::http::HttpErr::Dns,
-            )),
+            &Err(crate::http::PostErr {
+                err: crate::http::HttpErr::Dns,
+                left_host: false,
+            }),
             1,
         );
         assert_eq!(x.budget.spent(), before, "nothing left, nothing spent");
@@ -4787,7 +4805,8 @@ mod tests {
     /// "no such order" — or worse, replace some other quote. With the
     /// leg bound and the cold budget at its floor, the requote encodes
     /// in full and stops at the submit barrier (never a socket — the
-    /// bench gate 60 posture), leaving the rendered action in `req`:
+    /// bench gate 60 posture), leaving the rendered action in the
+    /// `/exchange` window:
     /// the resting order must be the `oid` and the replacement the
     /// order's own `c`.
     #[test]
@@ -4803,8 +4822,12 @@ mod tests {
             "a cold budget refuses a requote at the submit barrier"
         );
         assert_eq!(x.counters().modifies_refused, 1);
-        assert_eq!(x.counters().encode_failures, 0, "the encode half ran to the end");
-        let body = String::from_utf8_lossy(&x.req);
+        assert_eq!(
+            x.counters().encode_failures,
+            0,
+            "the encode half ran to the end"
+        );
+        let body = String::from_utf8_lossy(x.http.body_mut());
         let resting = format!("\"oid\":{}", cloid_json(3, prev));
         let replacement = format!("\"c\":{}", cloid_json(3, repl.client_oid));
         assert!(body.contains(&resting), "resting order not addressed by its cloid");
@@ -4813,9 +4836,13 @@ mod tests {
         // reach the wire: the action is byte-for-byte the one an
         // unstamped replacement encodes.
         let (_mp, end) = x.stage_modify(prev, &repl).expect("unstamped encode");
-        let unstamped = x.req[..end].to_vec();
+        let unstamped = x.http.body_mut()[..end].to_vec();
         let _ = OrderDispatch::modify(&mut x, &ModifyReq::new(prev, repl));
-        assert_eq!(&x.req[..end], &unstamped[..], "the stamp leaked into the action");
+        assert_eq!(
+            &x.http.body_mut()[..end],
+            &unstamped[..],
+            "the stamp leaked into the action"
+        );
     }
 
     /// **BX0-F3 — the trait cancel forwards the three fields that name
@@ -4833,7 +4860,7 @@ mod tests {
             !matches!(r, Err(DispatchError::Unsupported | DispatchError::SlotDisabled | DispatchError::NoLiveRoute)),
             "the cancel stopped before the socket: {r:?}"
         );
-        let body = String::from_utf8_lossy(&x.req);
+        let body = String::from_utf8_lossy(x.http.body_mut());
         let named = format!("\"asset\":3,\"cloid\":{}", cloid_json(3, resting.client_oid));
         assert!(body.contains(&named), "the cancel did not name this order: {named}");
     }

@@ -602,8 +602,9 @@ impl ReqWire {
             let d = dec_digits(len);
             let want = at + m.max_digits as usize - d;
             if want != head_at {
-                // COPY: the head (≤ MAX_HEAD = 1 503 B; ≤ 605 B for
-                // HttpsPost's one template), shifted within its region
+                // COPY: the head (≤ MAX_HEAD = 1 503 B; ≤ 605 B for a
+                // header-less JSON POST template: `HttpsPost::new`'s,
+                // `HlHttp`'s two), shifted within its region
                 // when the body's digit COUNT differs from the last
                 // request's (never between two bodies of one order of
                 // magnitude) — rejected: a fixed-width Content-Length

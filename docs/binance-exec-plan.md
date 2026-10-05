@@ -1221,7 +1221,7 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
 **What BX5 adds:**
 - A **keep-alive REST client** over `http1`: GET, POST, PUT and DELETE; custom headers (`X-MBX-APIKEY`); reconnect-on-close.
   - It serves papi, eapi, sapi and the fapi/dapi cold calls.
-  - HL's `HlHttp` migration onto it is deferred.
+  - HL's `HlHttp` migration onto it is deferred. (Done in XMM HD2, 2026-10-05, ruling R2.)
 - A **WS API session helper**: `PendingTable` request ids, server-ping echo, fragmented-frame refusal.
 
 **Size:** about 500 src + 500 test.
@@ -1286,7 +1286,7 @@ This is the risk core. `risk-reviewer` reviews the diff together with `docs/risk
     - `Tmpl` shrank to 36 B;
     - an unknown template index is refused;
     - the numeric bounds are stated.
-  - **Escalated to the E-lane, not fixed here:** `exec_hyperliquid::HlHttp` still maps a bare-FIN `UnexpectedEof` to `Disconnected`, which is conservative. The H9c lines of risk-policy overstate it.
+  - **Escalated to the E-lane, not fixed here:** `exec_hyperliquid::HlHttp` still maps a bare-FIN `UnexpectedEof` to `Disconnected`, which is conservative. The H9c lines of risk-policy overstate it. (Settled by XMM HD2, 2026-10-05: `HlHttp` runs on `HttpsConn`.)
 - **Carried to BX6:**
   - Every order request (place, cancel, amend) uses a body-form template; the query form is cold only. BX6's live smoke proves DELETE-with-body: the docs allow it, but it has not been seen live.
   - `WsConn` has no `left_host`. A WS API request is maybe-sent from `flush` onward. Frames queued but never flushed are dropped by `connect`, so they were not sent.
@@ -1612,7 +1612,7 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
 - No spot margin or borrow. No conditional or algo orders. No RPI, no SOR, no order lists, no pegged or iceberg orders.
 - **XAU/XAG options are long-only**, by venue rule. **US stock options are out** (no API).
 - **No Tokyo in v1 (O-BX7). No SBE or FIX in v1** (optional lanes).
-- **The HL arm changes only through BX0's F3 and F4.** The `HlHttp` migration is a separate ruling.
+- **The HL arm changes only through BX0's F3 and F4.** The `HlHttp` migration is a separate ruling. (It came as XMM HD2, ruling R2, 2026-10-05.)
 - No cloud service on the trading path. **No git operation** beyond the worktree approved by O-BX15, without the operator's word. **No research material in git.**
 
 ---

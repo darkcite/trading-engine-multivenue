@@ -1879,7 +1879,7 @@ As §6 says, with these decisions recorded:
 * **Transport:** `core_net::HttpsPost` — `HlHttp`'s keep-alive shape with
   the path taken from the boot URL (`parse_https_url`). `HlHttp` is NOT
   migrated onto it in this lane (it is the armed-live E arm; that is
-  its lane's call). The pool ingress's JSON-RPC cursor is now public
+  its lane's call). (XMM HD2 migrated it, 2026-10-05, ruling R2.) The pool ingress's JSON-RPC cursor is now public
   (`ingress_hyperevm::rpc::RpcOut`) and shared, as are its hex scanners.
 * **`signer-evm` gains contract creation** (for the H8 testnet deployer
   of the O-H18 executor — its owner is the deploying EOA, so a factory
@@ -2229,7 +2229,7 @@ The review's findings, fixed in this order (critical first):
   (2026-09-24)** — the `HttpsPost` probe and retire-on-close ported
   (risk-policy "The live arm's stale keep-alive"). It still writes head
   and body as two TLS records (one extra rustls allocation per order);
-  not changed.
+  not changed. (One record since XMM HD2, 2026-10-05.)
 
 **Mask flip (O-H8) — the operator's runbook, only after HZ, H8 live and
 H9 are green:** (1) the pre-flip gates at HEAD (§13); (2) `hyparb.toml`

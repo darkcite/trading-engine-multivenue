@@ -34,6 +34,10 @@
 //! * `Transfer-Encoding: chunked` — dechunked in-place into a caller-owned
 //!   scratch slice via [`dechunk_in_place`].
 //! * Connection-close framing (treated as `Content-Length: remaining`).
+//! * A `204` has no body whatever its headers say, and interim `1xx`
+//!   answers before the final one are skipped (RFC 9112 §6.3, RFC 9110
+//!   §15.2; XMM HD2). A `101` is malformed: nothing here asks to switch
+//!   protocols.
 //!
 //! ## Non-goals (deferred to Phase 1d)
 //!
@@ -69,8 +73,9 @@ pub enum HttpResult {
     Complete {
         /// HTTP status code (e.g. 200, 404).
         status: u16,
-        /// Exclusive end of the response header region (first byte of
-        /// body, if any).
+        /// Exclusive end of the final response head (first byte of body,
+        /// if any). Interim `1xx` heads before it were skipped and lie
+        /// inside `buf[..header_end]`.
         header_end: usize,
         /// Inclusive start of the (possibly-empty) body region.
         body_start: usize,
@@ -439,53 +444,78 @@ fn push(dst: &mut [u8], cursor: &mut usize, src: &[u8]) -> Result<(), HttpErr> {
 /// according to the declared framing. For [`BodyFraming::ContentLength`]
 /// callers check that `body_end <= buf.len()` to know whether the body
 /// is fully buffered; if it isn't they read more and call again.
+///
+/// **No-body statuses (XMM HD2).** Interim `1xx` answers before the
+/// final one are skipped: a client must parse them even unasked (RFC
+/// 9110 §15.2), they carry no body, and the final answer follows on the
+/// same connection — so `status` and the offsets are the final answer's,
+/// and `Incomplete` lasts until its head is in. A `101` is `Malformed`:
+/// no request through this parser asks to switch protocols. A `204` has
+/// no body whatever its headers say (RFC 9112 §6.3): `ContentLength(0)`.
+/// Before HD2 both read as close-delimited, and a keep-alive client
+/// waited for a close that never came.
 pub fn read_response(buf: &[u8]) -> HttpResult {
-    // Find end of headers.
-    let header_end = match find_header_end(buf) {
-        Some(n) => n,
-        None => return HttpResult::Incomplete,
-    };
+    // Where the head being judged starts: past any interim answers.
+    let mut at = 0usize;
+    loop {
+        // Find end of headers.
+        let header_end = match find_header_end(&buf[at..]) {
+            Some(n) => at + n,
+            None => return HttpResult::Incomplete,
+        };
 
-    // Parse status line.
-    let status_end = match memchr::memmem::find(&buf[..header_end], b"\r\n") {
-        Some(n) => n,
-        None => return HttpResult::Malformed,
-    };
-    let status_line = &buf[..status_end];
-    let status = match parse_status_line(status_line) {
-        Some(s) => s,
-        None => return HttpResult::Malformed,
-    };
+        // Parse status line.
+        let status_end = match memchr::memmem::find(&buf[at..header_end], b"\r\n") {
+            Some(n) => at + n,
+            None => return HttpResult::Malformed,
+        };
+        let status = match parse_status_line(&buf[at..status_end]) {
+            Some(s) => s,
+            None => return HttpResult::Malformed,
+        };
 
-    // Treat 3xx as malformed (redirect chasing is deferred).
-    if (300..400).contains(&status) {
-        return HttpResult::Malformed;
-    }
+        // An interim answer: skip it — the final one follows.
+        if (100..200).contains(&status) {
+            if status == 101 {
+                return HttpResult::Malformed;
+            }
+            at = header_end;
+            continue;
+        }
 
-    let headers = &buf[status_end + 2..header_end - 2];
+        // Treat 3xx as malformed (redirect chasing is deferred).
+        if (300..400).contains(&status) {
+            return HttpResult::Malformed;
+        }
 
-    // Content-Length takes precedence; else Transfer-Encoding: chunked;
-    // else close-delimited.
-    let framing = if let Some(len) = find_content_length(headers) {
-        BodyFraming::ContentLength(len)
-    } else if find_chunked(headers) {
-        BodyFraming::Chunked
-    } else {
-        BodyFraming::CloseDelimited
-    };
+        let headers = &buf[status_end + 2..header_end - 2];
 
-    let body_start = header_end;
-    let body_end = match framing {
-        BodyFraming::ContentLength(len) => body_start.saturating_add(len as usize),
-        BodyFraming::Chunked | BodyFraming::CloseDelimited => buf.len(),
-    };
+        // A 204 has no body whatever its headers say. Else Content-Length
+        // takes precedence; else Transfer-Encoding: chunked; else
+        // close-delimited.
+        let framing = if status == 204 {
+            BodyFraming::ContentLength(0)
+        } else if let Some(len) = find_content_length(headers) {
+            BodyFraming::ContentLength(len)
+        } else if find_chunked(headers) {
+            BodyFraming::Chunked
+        } else {
+            BodyFraming::CloseDelimited
+        };
 
-    HttpResult::Complete {
-        status,
-        header_end,
-        body_start,
-        body_end,
-        framing,
+        let body_start = header_end;
+        let body_end = match framing {
+            BodyFraming::ContentLength(len) => body_start.saturating_add(len as usize),
+            BodyFraming::Chunked | BodyFraming::CloseDelimited => buf.len(),
+        };
+
+        return HttpResult::Complete {
+            status,
+            header_end,
+            body_start,
+            body_end,
+            framing,
+        };
     }
 }
 
@@ -494,9 +524,34 @@ pub fn read_response(buf: &[u8]) -> HttpResult {
 /// token, or an HTTP/1.0 status line without `Connection: keep-alive`.
 /// A keep-alive client retires the connection after such an answer
 /// instead of writing its next request into a socket the server is
-/// closing (HYPARB H9).
+/// closing (HYPARB H9). Since HD2 the region may hold the interim `1xx`
+/// heads [`read_response`] skipped before the final one: each head is
+/// judged on its own, and ANY that says close retires the connection
+/// (read as one head, an interim head's empty line ended the field scan
+/// before the final head's `Connection` was reached).
 #[must_use]
 pub fn head_says_close(head: &[u8]) -> bool {
+    // Interim heads come first, so the region holds one exactly when its
+    // first status is 1xx (`HTTP/1.x 1…`): an answer without pays nothing.
+    if head.get(9) != Some(&b'1') {
+        return one_head_says_close(head);
+    }
+    let mut rest = head;
+    // Every head but the last ends in an empty line with more after it.
+    while let Some(i) = memchr::memmem::find(rest, b"\r\n\r\n") {
+        if i + 4 >= rest.len() {
+            break;
+        }
+        if one_head_says_close(&rest[..i + 4]) {
+            return true;
+        }
+        rest = &rest[i + 4..];
+    }
+    one_head_says_close(rest)
+}
+
+/// [`head_says_close`] for ONE head.
+fn one_head_says_close(head: &[u8]) -> bool {
     let Some(status_end) = memchr::memmem::find(head, b"\r\n") else {
         return true;
     };
@@ -970,6 +1025,93 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// HD2: a 204 ends at its blank line, whatever its headers say — a
+    /// keep-alive client never waits for a body it cannot have.
+    #[test]
+    fn read_response_a_204_has_no_body() {
+        for raw in [
+            &b"HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n"[..],
+            &b"HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            &b"HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"[..],
+        ] {
+            match read_response(raw) {
+                HttpResult::Complete {
+                    status,
+                    header_end,
+                    body_start,
+                    body_end,
+                    framing,
+                } => {
+                    assert_eq!(status, 204);
+                    assert_eq!(framing, BodyFraming::ContentLength(0));
+                    assert_eq!((body_start, body_end), (header_end, header_end));
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// HD2: interim (1xx) answers before the final one are skipped — the
+    /// status, framing and body are the final answer's — and any head
+    /// that says close ends the connection. Only interim heads so far is
+    /// `Incomplete`; a `101` is `Malformed`.
+    #[test]
+    fn read_response_skips_interim_answers() {
+        let raw = b"HTTP/1.1 100 Continue\r\n\r\n\
+                    HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n\
+                    HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok";
+        match read_response(raw) {
+            HttpResult::Complete {
+                status,
+                header_end,
+                body_start,
+                body_end,
+                framing,
+            } => {
+                assert_eq!(status, 200);
+                assert_eq!(framing, BodyFraming::ContentLength(2));
+                assert_eq!(body_start, header_end);
+                assert_eq!(&raw[body_start..body_end], b"ok");
+                assert!(
+                    head_says_close(&raw[..header_end]),
+                    "the final head says close"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let kept = b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n\
+                     HTTP/1.1 204 No Content\r\n\r\n";
+        match read_response(kept) {
+            HttpResult::Complete {
+                status: 204,
+                header_end,
+                ..
+            } => assert!(!head_says_close(&kept[..header_end]), "kept alive"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // An interim head that says close retires the connection too.
+        let interim_close = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\n\
+                              HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        match read_response(interim_close) {
+            HttpResult::Complete {
+                status: 200,
+                header_end,
+                ..
+            } => assert!(head_says_close(&interim_close[..header_end]), "any head"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Only interim heads so far: the final answer is still to come.
+        assert_eq!(
+            read_response(b"HTTP/1.1 100 Continue\r\n\r\n"),
+            HttpResult::Incomplete
+        );
+        let partial = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n";
+        assert_eq!(read_response(partial), HttpResult::Incomplete);
+        // Nothing through this parser asks to switch protocols.
+        let upgrade = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        assert_eq!(read_response(upgrade), HttpResult::Malformed);
     }
 
     #[test]

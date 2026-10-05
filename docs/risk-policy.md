@@ -2410,6 +2410,11 @@ and `…::an_announced_close_retires_the_connection_with_the_answer`
 through a merge to `main`, a release build and an
 `exec-smoke`-gated restart.
 
+**Since HD2 (2026-10-05)** the probe and the retirement are the shared
+engine's (`core_net::HttpsConn`), not a copy in `HlHttp`; the same two
+tests pin them. The bare-FIN case BX5 recorded as overstated here now
+holds: a whole answer before a bare FIN is kept ("HD2", below).
+
 #### A torn write COUNTS
 
 `left_host` is set before the write is attempted rather than after it
@@ -5377,7 +5382,7 @@ none was a false positive.
 
 | # | where | the hole | the fix |
 |---|---|---|---|
-| 1 | `http.rs` read_response | a chunked or close-delimited `/exchange` answer was returned as soon as ANY bytes arrived — a truncated `{"status":"ok","response":{"type":"order","data":{"statu` reached the scanner | `Chunked ⇒ Err(BadHttp)`; `CloseDelimited` only once `peer_closed`; `ContentLength` waits for `body_end` |
+| 1 | `http.rs` read_response | a chunked or close-delimited `/exchange` answer was returned as soon as ANY bytes arrived — a truncated `{"status":"ok","response":{"type":"order","data":{"statu` reached the scanner | `Chunked ⇒ Err(BadHttp)`; `CloseDelimited` only once `peer_closed`; `ContentLength` waits for `body_end` (since HD2 the shared engine's: a chunked answer is decoded once its terminating chunk is in, never handed on partial; a close-delimited one needs a clean close) |
 | 2 | `response.rs` scan | the no-`"statuses"` branch ACCEPTED on the mere absence of the token (fail-open, against the module's own doctrine) | accepted only when `"type":"default"` is present, else `Malformed`; fuzz invariant strengthened (`hl_exchange_response.rs` now requires `statuses` or `type:default` on any accept) |
 | 3 | `exchange.rs` send_action | the live submit accepted on `ok.accepted()` alone — no resting/filled outcome required, `oid == 0` bound the slot to a leg the sweep could not see; the stricter predicate lived only in the operator probe | acceptance is `Spend`-aware: Submit ⇒ `any_resting ‖ any_filled`, Cancel ⇒ `any_success`; anything else takes the reject-streak branch |
 | 4 | `http.rs` post | polled 50 ms BEFORE flushing rustls, so every request waited a slice before its ciphertext left the host | `Transport::flush()` (new trait method; `TlsTransport` drains `write_tls` to `WouldBlock`) + `reregister` before `read_response`; `write_segments` `Ok(0)`/`WouldBlock` ⇒ `Overflow`, no sleep |
@@ -6344,9 +6349,10 @@ exactly as `exec-smoke.sh` does.
   report.
 * **Residue, recorded not fixed:** rustls 0.23's buffered API allocates
   one `Vec` per TLS record sealed and one per application-data record
-  decrypted — on every TLS socket, the E-lane's `HlHttp` included (it
-  writes head and body as two records: two allocations where one would
-  do; its stale-keep-alive shape WAS fixed — H9c, "The live arm's stale
+  decrypted — on every TLS socket, the E-lane's `HlHttp` included (until
+  HD2 it wrote head and body as two records: two allocations where one
+  would do — one since HD2, gate 101; its stale-keep-alive shape WAS
+  fixed — H9c, "The live arm's stale
   keep-alive"). Gate 72 pins it at exactly 2 per `HttpsPost` request. Removing it
   is rustls' unbuffered API (`UnbufferedClientConnection`) — a core-net
   transport decision for the operator, not a HYPARB-lane change.
@@ -6399,7 +6405,9 @@ timeout, a wallet quarantine and, for a receipt, a lost answer. Now:
   `sent_unanswered`, which errs on the conservative side. "The live
   arm's stale keep-alive (H9c)" above ("or arrives with the FIN … the
   answer is kept") overstates it for that case. The E-lane decides;
-  BX5 changes nothing there.
+  BX5 changes nothing there. **Superseded by HD2** (2026-10-05, ruling
+  R2): `HlHttp` now runs on `HttpsConn`, and a whole answer before a
+  bare FIN is delivered.
 * **It reaches the armed engine only** through a merge to `main`, a
   release build and an `exec-smoke`-gated restart.
 
@@ -6456,7 +6464,8 @@ ends `Timeout, left_host: true` — before HD1 as after; since HD1 a bare
 FIN right behind it ends `Disconnected`. RFC 9112 §6.3 gives those
 statuses no body (`ContentLength(0)`). The parser is shared with the HL
 order path, whose changes are the E-lane's to rule on, so the fix waits
-for HD2 (`HlHttp` onto `HttpsConn`).
+for HD2 (`HlHttp` onto `HttpsConn`). **Fixed in HD2** (below): a `204`
+ends at its head, and interim `1xx` answers are skipped.
 
 **A new boot refusal:** `head_cap + body_cap` above `MAX_BODY_CAP`
 (9 999 999 B) is `BadEndpoint`, because the head and the body now share
@@ -6501,8 +6510,9 @@ block up to 5 s). What changed:
   `Disconnected` (`Overflow`); one ended by a bare FIN, `Disconnected`;
   one with malformed chunks, `JsonMalformed`. A `204` or `1xx` without a
   length waits out the 5 s deadline (HD1's recorded parser issue), where
-  it returned at once. A `Content-Length` answer over 8 KiB fails at once
-  instead of at the deadline.
+  it returned at once — until HD2, which ends both at their head. A
+  `Content-Length` answer over 8 KiB fails at once instead of at the
+  deadline.
 * A non-2xx answer still closes the connection, so a venue that refuses
   every order costs a full TLS handshake per order. If the path is ever
   made real, a well-framed `4xx` should keep the connection.
@@ -6527,6 +6537,150 @@ production" since 2026-04-28, and this signer is V1 (domain version
 `"1"`, the `taker` / `nonce` / `feeRateBps` struct). What keeps the path
 out of the managed fleet is unchanged: the wrapper's allow-list and its
 hard-coded `--paper`.
+
+### HD2: `HlHttp` moved onto `HttpsPost` — the HL order path (2026-10-05)
+
+`exec_hyperliquid::http::HlHttp` is the E-lane's REST arm: every
+`/exchange` order and `/info` read of the operator's HL arm (slot 3,
+BIN15's mainnet orders), the HYPARB hedge, the XMM gateway's REST
+fallback, `exec-smoke` and the lifecycle probe. It now posts through
+`core_net::HttpsPost` with two templates, `POST /exchange` and
+`POST /info`, over `HttpsConn` — the engine HD1 and HD3 put the other
+clients on — instead of a transport of its own. Anton's ruling R2
+accepted the behaviour changes below. `HttpErr` and
+`PostErr { err, left_host }` keep their shapes: core-net's kinds map
+onto them one to one, except `BadEndpoint` → `BadServerName` and `Busy`
+/ `BadRequest` (unreachable from this client) → `Disconnected`; and
+`left_host` — the engine's, set before the write — passes through
+untouched. An order is rendered into the client's `/exchange` window
+(`body_mut()`) and posted by its length (`post(n)`); `/info` reads
+render into a window of their own (crate-private `info_mut()` /
+`post_info(n)`), so a read never disturbs an order's bytes. The other
+API changes are in migration.md.
+
+**What changed on the order path:**
+
+* **A whole answer survives a bare FIN.** When `Content-Length` was
+  reached or the terminating chunk seen, a TCP FIN without
+  `close_notify` right behind the answer no longer discards it: it is
+  delivered and the connection retires. Before HD2 the read after it
+  (`UnexpectedEof`) threw it away — `Disconnected, left_host: true`, a
+  false `sent_unanswered` on an order the venue had answered, charged to
+  the address budget and left to reconciliation. BX5's "`HlHttp` is
+  unchanged" bullet and H9c's overstatement for that case are settled.
+* **A chunked answer is decoded in place.** Before HD2 it was `BadHttp,
+  left_host: true` — the same false in-doubt.
+* **A close-delimited answer counts only after a close a read confirmed
+  clean** (BX5's rule): after a bare FIN it ends `Disconnected,
+  left_host: true`; cut by our own 1 MiB buffer, `Overflow`.
+* **Statuses with no body end at their head** — HD1's recorded parser
+  issue, fixed in the shared `http1::read_response`. A `204` is
+  `ContentLength(0)` whatever its headers say; interim `1xx` answers
+  before the final one are skipped (RFC 9110 §15.2); a `101` is
+  `Malformed` (no request through this parser asks to switch
+  protocols). `http1::head_says_close` judges every head of such a
+  region, and any that says close retires the connection — read as one
+  head, an interim head's empty line ended the field scan before the
+  final head's `Connection: close`; an answer with no interim head is
+  judged as before, at no extra cost. Before HD2 a `204` or a `1xx` read
+  as close-delimited and, on a kept-alive connection, waited out the
+  5 s deadline: `Timeout, left_host: true`. The fix reaches every user
+  of the parser: `boot_http` and every `HttpsConn` client (the Binance
+  REST arm, the HyperEVM write arm, `HttpsReq`'s Hypercall clients, the
+  Polymarket path). **A `204` on `/exchange`** (Hyperliquid sends none)
+  now reaches the answer scanner with an empty body and is judged as
+  any unreadable answer is — `JsonMalformed`, counted as a rejection,
+  the address budget charged, reconciliation left to settle it — where
+  it timed out as `sent_unanswered` before; the gateway reads it as in
+  doubt (`EV_UNANSWERED`).
+* **One TLS record per order, one allocation fewer** — while head and
+  body fit rustls' 16 KiB record; every real order is far below (a
+  39-item batch renders to ≈ 7 KiB). The head and the body go out as ONE
+  slice in ONE write; before HD2 they were two writes, two sealed
+  records — by the one-record-per-write rule H9 measured, 3 allocations
+  per post where gate 101 now pins 2.
+* **The head's header order is `HttpsPost`'s:** Host, Content-Type,
+  Connection, Content-Length. Before HD2, Content-Length came before
+  Connection. `HttpsPost` already sends this order to Hyperliquid's
+  `/info` as HYPARB's client (BX5).
+* **Unchanged in substance:** one 5 s budget per cycle (dial, write and
+  read together); the reuse probe and the `Connection: close`
+  retirement (H9c), now the engine's code rather than a copy; DNS
+  re-resolved, blocking, after every third failed dial in a row, as
+  `HlHttp` did. The caller's thread — the arm's worker, or the
+  gateway's thread on its REST fallback — still blocks for a cycle, up
+  to 5 s.
+* **The gateway's REST fallback renders the envelope straight into the
+  `/exchange` window** when a post is sealed with no socket Ready — no
+  WebSocket head it would never be sent with, and no copy. Only a
+  re-send — a post whose socket died under the write, whose signed
+  bytes exist only in the TX buffer and must go out unchanged — copies
+  its envelope (≤ 16 KiB; the TX buffer is const-asserted to fit the
+  window) into the window: the cut's one new `// COPY:`, on the coldest
+  path. Before HD2 the old client sent the envelope from the TX buffer
+  as it lay, in two records.
+* **Copies the old client made are gone:** the per-post head render (the
+  head is now rendered once at boot and moved by a marked `copy_within`
+  only when the body's digit count changes), and the boot-time copy of
+  its host name, whose owned TLS server name was also cloned — a
+  `String` allocation — on every dial (core-net interns the host once per
+  process, marked; a dial now copies a pointer).
+* **A host refused on its syntax** (empty, over 253 B, not visible
+  ASCII) is `BadServerName` at construction, before DNS, where it used
+  to be `Dns`.
+
+**Evidence:**
+
+* Red first, against the old client and the old parser:
+  `hl_exchange_tls_loopback::`
+  `a_whole_answer_survives_a_close_without_close_notify`
+  (`Disconnected, left_host: true`),
+  `a_chunked_answer_is_decoded_and_scanned` (`BadHttp, left_host:
+  true`), `the_request_head_is_pinned_byte_for_byte` (the old header
+  order) and `interim_answers_and_a_204_end_at_their_heads` (`Timeout,
+  left_host: true` after 5 s) each failed 3 runs of 3;
+  `http1::tests::read_response_a_204_has_no_body` and
+  `read_response_skips_interim_answers` failed. All pass on the new
+  code. The bare-FIN loopback is a race the FIN usually wins; BX5's
+  `https_conn_loopback::an_answer_proven_whole_survives_a_close_without_close_notify`
+  is the deterministic proof of the engine path.
+* `https_post::tests::two_templates_each_render_their_own_request` pins
+  both templates byte for byte, and a template that does not exist is
+  refused before anything dials; `http::tests::each_api_has_its_own_window`
+  pins `HlHttp`'s template indices to their paths and its windows apart.
+* **Gate 101 (new):** `HlHttp`'s keep-alive cycle at exactly 2
+  allocations per post — rustls' sealed record out and decrypted record
+  in — with the head moving on every post, against gate 72's
+  child-process node. Gate 87 now also judges an answer behind two
+  interim heads (one of them saying close): 0 B.
+* `hl_gateway_loopback::with_no_socket_left_a_post_goes_rest_as_the_envelope_alone`
+  pins the REST body the gateway now renders in the window.
+* **Gates on the final tree (09:05–09:11Z):** clippy 0; nextest 4 213
+  passed (9 skipped); `make alloc-assert` 110 passed (3 ignored) — gate
+  101 exactly 2 per post, gate 87 0 B with the interim answer;
+  copy-audit hits 28, baselined 28, new 0, paid 0; license OK (663
+  files); release OK; replay 7× IDENTICAL; rustfmt clean on the touched
+  hunks. Reviews: risk APPROVE (round 3); allocation and zero-copy
+  APPROVE WITH NITS (round 2) — the zero-copy round 1 asked for the
+  gateway's REST render at seal time, now in.
+* **The E3 testnet battery** on the final release binary (09:11–09:17Z):
+  `exec-smoke` phases A and B PASS (the venue verified the signature and
+  refused a corrupted one); `--lifecycle` on the BTC perp (post-only
+  0.0002 at 77 575, modified to 76 575) placed, modified to a new oid,
+  cancelled by cloid and verified gone; `--requote` PASS (a modify by
+  cloid with a fresh cloid moved the order); `--sweep` PASS;
+  `--hl-perp --lifecycle` (BTC, ETH, SOL; 20 cycles, 3 IoC pairs) exit 0,
+  the bar met — 20/20 cycles, 20 refused crossing modifies, 20
+  `BadAloPx` places, 20 TTLs, 4/4 sweeps, 6/6 clean reconciliations, 8
+  fills (fees $0.042), nothing left on the account; post RTT p50 579 ms,
+  p99 1.21 s. `--recon` exits 24 on E3 — with byte-identical JSON on
+  `main`'s pre-HD2 binary: the account holds an outcome leg whose fills
+  aged out of the `userFills` window (`venue_legs_unreconciled` 1, 3 legs
+  drifting, worst 0.72 contracts) — the account's state, not this cut;
+  the equal JSON shows the `/info` reads parse identically on both.
+
+**It reaches the armed engine only** through a merge to `main`, a
+release build and an `exec-smoke`-gated restart — Anton's word.
 
 ### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
 
@@ -7414,8 +7568,10 @@ its budget accounting is unchanged); `UserFill` gains `crossed`
   about an unresolved target does not mean the order is gone).
 - **One post:** msgpack encoded once and signed on the gateway thread
   (one nonce stream per arm); the JSON rendered once behind the WebSocket
-  post head and framed in place; the REST fallback's body is the
-  envelope sub-slice. `expiresAfter` = the smallest non-zero per-command
+  post head and framed in place — or, with no socket Ready, the envelope
+  alone straight into the REST client's window (XMM HD2); a re-send's
+  REST body is the envelope copied out of the post. `expiresAfter` = the
+  smallest non-zero per-command
   offset (XH4c configures it).
 - **Streams:** `userFills` → FILL + FILL_META (fee signed, crossed),
   tid-deduped across sockets and reconnects (E-5); `orderUpdates` →

@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use crate::action::{encode_cancel, CancelWire, MAX_ACTION};
 use crate::config::HlConfig;
-use crate::http::{HlHttp, MAX_REQ_BODY};
+use crate::http::HlHttp;
 use crate::nonce::now_ms;
 use crate::request::{cancel_json, envelope};
 use crate::response::{scan, HlResponse};
@@ -357,10 +357,9 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let nonce_a = nonces.next(now_ms());
     let sig = sign_action(&sk, &mp[..mp_n], nonce_a, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
-    let mut body = [0u8; MAX_REQ_BODY];
-    let n = envelope(&mut body, &aj[..aj_n], nonce_a, &sig, None, None)
+    let n = envelope(http.body_mut(), &aj[..aj_n], nonce_a, &sig, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     let agent_hex = crate::config::hex20(&cfg.agent_addr);
@@ -395,9 +394,9 @@ pub fn run(cfg: &HlConfig, tls: Arc<rustls::ClientConfig>, asset: u32) -> Result
     let mut bad = sign_action(&sk, &mp[..mp_n], nonce_b, Vault::None, None, cfg.network)
         .map_err(|_| SmokeErr::Sign)?;
     bad[40] ^= 0x01;
-    let n = envelope(&mut body, &aj[..aj_n], nonce_b, &bad, None, None)
+    let n = envelope(http.body_mut(), &aj[..aj_n], nonce_b, &bad, None, None)
         .map_err(|_| SmokeErr::Encode)?;
-    let (_status, range) = http.post(&body[..n]).map_err(|e| SmokeErr::Http(e.err))?;
+    let (_status, range) = http.post(n).map_err(|e| SmokeErr::Http(e.err))?;
     let resp = http.resp();
     let slice = &resp[range];
     let (corruption_rejected, corruption_message) =

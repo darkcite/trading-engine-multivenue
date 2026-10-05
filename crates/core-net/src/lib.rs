@@ -35,6 +35,10 @@
 //! HD1 moves [`HttpsReq`] onto `HttpsPost`'s raw form, so `HttpsConn` is
 //! the crate's one keep-alive HTTPS engine. The older blocking copy HC2
 //! had moved out of the pre-BX5 `HttpsPost` (`https_keepalive`) is gone.
+//! HD2 gives [`HttpsPost`] several templates on one connection
+//! ([`HttpsPost::with_specs`]) and makes it the Hyperliquid exchange
+//! arm's transport; [`http1::read_response`] skips interim `1xx`
+//! answers, and a `204` ends at its blank line.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(

@@ -361,7 +361,8 @@ impl Transport for TlsTransport {
         // rustls plaintext writer; buffers internally until we call
         // write_tls() on the next pump.
         // COPY: plaintext → rustls sendable_tls, ≤ the caller's request
-        // (17 KiB for the exchange arm) — rustls encrypts out of its own
+        // (16 KiB + its head for the exchange arm, one write since XMM
+        // HD2) — rustls encrypts out of its own
         // buffer and exposes no borrowed-plaintext write API — rejected:
         // none available; this is the TLS boundary copy.
         let mut writer = self.conn.writer();

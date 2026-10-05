@@ -6,7 +6,8 @@
 //! E2 built everything needed to produce a byte-exact, correctly
 //! signed exchange action and nothing that could send one. **E3 adds
 //! the thing that sends it**: a mio + rustls HTTP/1.1 client
-//! ([`http`]), the JSON request bodies ([`request`]), a fail-closed
+//! ([`http`]; since XMM HD2 a face over `core_net::HttpsPost`), the
+//! JSON request bodies ([`request`]), a fail-closed
 //! answer scanner ([`response`]), the host/source interlock
 //! ([`config`]) and the testnet gate ([`smoke`]).
 //!

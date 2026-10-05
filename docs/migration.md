@@ -6,6 +6,51 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-05 — exec-hyperliquid: `HlHttp` on `core_net::HttpsPost`; the shared parser's `204` / `1xx` (XMM HD2)
+
+**What changed**
+- `HlHttp` posts through `core_net::HttpsPost` with two templates
+  (`POST /exchange`, `POST /info`). Its own transport is deleted
+  (`write_header`, `ensure_connected`, `still_open`, `dial`,
+  `read_response`, `write_segments`, `format_u64_into`) with its three
+  render tests.
+- API: `HlHttp::post(body_len)` posts the first `body_len` bytes of the
+  `/exchange` window, `HlHttp::body_mut()` (was `post(&[u8])`). `/info`
+  reads use the crate-private `info_mut()` / `post_info(n)` (was
+  `post_to(INFO_PATH, &[u8])`). `HlHttp::host()` returns core-net's
+  interned `&'static str`. `EXCHANGE_PATH` / `INFO_PATH` are `&str` (were
+  `&[u8]`). `REQ_DEADLINE` is core-net's, re-exported (the same 5 s).
+  `PostErr::before_send` is removed: a struct literal says the same.
+- `HlHttp::new` refuses a host on its syntax (empty, over 253 B, not
+  visible ASCII) as `BadServerName`, before DNS, where it used to be
+  `Dns`.
+- `core_net::HttpsPost::with_specs` (several templates on one
+  connection), `request(t, len)` and `window_mut(t)`; `post(n)` is
+  `request(0, n)`.
+- `core_net::http1::read_response` skips interim `1xx` answers and ends a
+  `204` at its head (`ContentLength(0)`); a `101` is `Malformed`.
+  `head_says_close` judges every head of the region; any that says close
+  retires the connection.
+- `HlExchange` drops its 16 KiB `req` buffer (the body renders in the
+  client's window); `exec-smoke` and the lifecycle probe drop their
+  16 KiB stack bodies; the `/info` reads drop their stack arrays. The
+  XMM gateway renders a post sealed with no socket Ready straight into
+  the REST client's window; only a re-send copies its envelope there
+  (`// COPY:`).
+- Boot memory: each `HlHttp` now holds two 16 KiB windows beside its
+  1 MiB response buffer — about +16 KiB net inside `HlExchange` (its own
+  `req` buffer goes), about +32 KiB for the gateway's and the probes'
+  clients. Allocated at construction only.
+- Behaviour (risk-policy "HD2"): a whole answer survives a bare FIN,
+  chunked answers decode, one TLS record per order, the head's header
+  order is `HttpsPost`'s.
+- Alloc gate 101 (new) pins `HlHttp` at exactly 2 allocations per post;
+  gate 87 also judges an answer behind interim heads.
+
+**Operator action:** none until the merge. The armed engine gets HD2 only
+through a merge to `main`, a release build and an `exec-smoke`-gated
+restart — Anton's word.
+
 ## 2026-10-05 — clob-dispatcher: `LiveDispatcher` on `core_net::HttpsPost`; `mio` dropped (XMM HD3)
 
 **What changed**
