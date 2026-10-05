@@ -14392,6 +14392,54 @@ fn hl_gateway_engine_half_is_zero_alloc() {
     );
 }
 
+/// **XMM gate 102 (XH4i-1) — an outcome map names a leg in 0 B/op.** The
+/// gateway thread resolves the coin of every fill, order-update,
+/// open-order and position row, and every sweep hit, through its
+/// `CoinMap`; on a map built `with_outcomes` (BIN15's, slot 3) a `#<enc>`
+/// coin is parsed in place into its asset id. 10 000 lookups over a perp
+/// name, two legs, every way out of the parse — a bare `#`, a name over
+/// 20 bytes, a leading zero, a non-digit, a digit overflow, a base
+/// overflow — and the balance spelling `+<enc>`, which never enters it.
+/// Gate 96b's turn runs a perps-only map (slot 6's); its outcome-map
+/// variant comes with the slot-3 composition (XH4i-5).
+#[test]
+fn hl_gateway_outcome_coin_map_is_zero_alloc() {
+    use exec_hyperliquid::asset::ASSET_BASE;
+    use exec_hyperliquid::event::ASSET_UNKNOWN;
+    use exec_hyperliquid::CoinMap;
+
+    let mut m = CoinMap::with_outcomes();
+    assert!(m.insert(b"ETH", 1));
+    let coins: [(&[u8], u32); 10] = [
+        (b"ETH", 1),
+        (b"#1941", ASSET_BASE + 1941),
+        (b"#154150", ASSET_BASE + 154_150),
+        (b"#", ASSET_UNKNOWN),
+        (b"#123456789012345678901", ASSET_UNKNOWN),
+        (b"#01941", ASSET_UNKNOWN),
+        (b"#19a1", ASSET_UNKNOWN),
+        (b"+1941", ASSET_UNKNOWN),
+        (b"#42949672950", ASSET_UNKNOWN),
+        (b"#4194967296", ASSET_UNKNOWN),
+    ];
+    let mut acc = 0u64;
+    let g = AllocGuard::new();
+    let mut i = 0usize;
+    while i < 10_000 {
+        let (coin, want) = coins[i % coins.len()];
+        let a = m.asset(std::hint::black_box(coin));
+        assert!(a == want, "gate 102: a coin resolved to the wrong id");
+        acc = acc.wrapping_add(u64::from(a));
+        i += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    assert_eq!(
+        allocs, 0,
+        "the outcome coin map allocated {allocs} times ({bytes} B)"
+    );
+}
+
 /// **XMM gate 97 (XH4c) — the dead-man switch and the perp rules are
 /// 0 B/op.** Both run on the engine thread from XH4f, the switch on
 /// every arm tick: `DeadMan::poll/on_event/unsent` over a scripted 55 h

@@ -33,6 +33,8 @@
 //! | not found | XH4f (D9): a not-found ends no TTL — the arm's own cancel's leaves the order's TTL to fire; the TTL's own leaves its row, and a late landing fires it again |
 //! | ttl races | XH4f (D9): an order seen resting while its TTL cancel is out waits for that cancel's answer (one cancel); a place left in doubt whose TTL cancel found nothing is cancelled when it lands late |
 //! | ttl ends | XH4f (D9): an end while the TTL cancel is out — a plain `canceled` reads `EXPIRED`, the dead man's `scheduledCancel` keeps its reason |
+//! | outcome sweep | XH4i-1: on an outcome map an order of ours on a `#<enc>` leg is cancelled by cloid with `ASSET_BASE + enc` — another slot's and a stranger's on the same leg never — and the sweep reads clear; on a perps-only map it is unmapped and never cancelled |
+//! | outcome streams | XH4i-1: on an outcome map a `#<enc>` fill, `orderUpdates` row and open-order row carry `ASSET_BASE + enc`; on a perps-only map `ASSET_UNKNOWN`, as before |
 //!
 //! `Answer::Later` defers a post's answer without pausing the socket: the
 //! TTL races above see their stream rows while the cancel is still out.
@@ -51,14 +53,15 @@ use exec_gateway::stats::{
     CONGESTION_THROTTLED, HALT_VENUE_BASE, SWEEP_CLEAR, SWEEP_STRANDED, SWEEP_WORKING,
 };
 use exec_gateway::Idle;
+use exec_hyperliquid::asset::ASSET_BASE;
 use exec_hyperliquid::cloid;
 use exec_hyperliquid::cmd::{HlCmd, CMD_CANCEL, CMD_PLACE};
 use exec_hyperliquid::event::{
-    ExecEvent, EVF_BUY, EVF_CROSSED, EVF_RESTING, EV_ACK, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP,
-    EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_SNAPSHOT,
-    EV_UNANSWERED, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED, REASON_LOCAL,
-    REASON_MALFORMED, REASON_NOT_FOUND, REASON_NOT_READY, REASON_RATE_LIMIT, REASON_THROTTLED,
-    REASON_TRANSPORT, SLOT_FOREIGN,
+    ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_RESTING, EV_ACK, EV_FILL, EV_FILLED,
+    EV_FILL_META, EV_GAP, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED,
+    EV_SNAPSHOT, EV_UNANSWERED, READ_DAY, READ_LIMIT, READ_ORDERS, READ_STATE, REASON_HALTED,
+    REASON_LOCAL, REASON_MALFORMED, REASON_NOT_FOUND, REASON_NOT_READY, REASON_RATE_LIMIT,
+    REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
 };
 use exec_hyperliquid::gateway::{
     hl_duplex, pw, CoinMap, GatewayCfg, HlEngineEnd, HlGateway, IP_WEIGHT_SHARE, WS_MSG_SHARE,
@@ -68,6 +71,8 @@ use exec_hyperliquid::{Network, Tif};
 
 const SLOT: u8 = 6;
 const ETH: u32 = 1;
+/// XH4i-1: an outcome leg's `enc` (outcome 194, side 1).
+const ENC: u32 = 1941;
 const CANCEL_OK: &str =
     r#"{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}"#;
 const DEFAULT_OK: &str = r#"{"status":"ok","response":{"type":"default"}}"#;
@@ -78,8 +83,18 @@ fn gateway(v: &Venue, post_timeout_ns: u64) -> (HlGateway, HlEngineEnd) {
 
 /// A gateway with an IP-weight share of `ip` a minute (XH4e).
 fn gateway_with(v: &Venue, post_timeout_ns: u64, ip: u32) -> (HlGateway, HlEngineEnd) {
+    gateway_on(v, post_timeout_ns, ip, CoinMap::new())
+}
+
+/// A gateway over `coins`, ETH bound in it (XH4i: a perps-only map, or
+/// one that names outcome legs).
+fn gateway_on(
+    v: &Venue,
+    post_timeout_ns: u64,
+    ip: u32,
+    mut coins: CoinMap,
+) -> (HlGateway, HlEngineEnd) {
     let (eng, gw_end) = hl_duplex();
-    let mut coins = CoinMap::new();
     assert!(coins.insert(b"ETH", ETH));
     let cfg = GatewayCfg {
         host: "localhost".to_string(),
@@ -160,6 +175,19 @@ fn open_row(oid: u64, cloid: Option<(u8, u64)>) -> String {
     };
     format!(
         r#"{{"coin":"ETH","limitPx":"2500.0","oid":{oid},"origSz":"0.1","side":"B","sz":"0.1","timestamp":1790000000000,"isTrigger":false{c}}}"#
+    )
+}
+
+/// XH4i-1: a `frontendOpenOrders` row on the outcome leg `#<ENC>` — the
+/// venue's spelling there, measured on testnet (2026-09-19) — ours when
+/// `cloid` names a slot.
+fn outcome_row(oid: u64, cloid: Option<(u8, u64)>) -> String {
+    let c = match cloid {
+        Some((slot, cid)) => format!(r#","cloid":"{}""#, cloid_hex(slot, cid)),
+        None => String::new(),
+    };
+    format!(
+        r##"{{"coin":"#{ENC}","limitPx":"0.41","oid":{oid},"origSz":"25.0","side":"B","sz":"25.0","timestamp":1790000000000,"isTrigger":false{c}}}"##
     )
 }
 
@@ -1443,6 +1471,140 @@ fn a_sweep_that_never_reads_clear_is_stranded_and_a_new_request_starts_over() {
     let again = stats.request_sweep();
     assert!(drive(&mut gw, &mut eng, &mut evs, 5, |_, _| stats.sweep()
         == (again, SWEEP_WORKING)));
+}
+
+/// XH4i-1: an order of ours on an outcome leg is swept, not stranded —
+/// on a map that names outcome legs its cancel names `ASSET_BASE + enc`,
+/// read off the venue's own `#<enc>`, and the sweep reads clear; another
+/// slot's order and a stranger's on the same leg are never cancelled. On
+/// a perps-only map (slot 6's) ours is unmapped and never cancelled, as
+/// before. The venue keeps an order until a cancel names it.
+#[test]
+fn an_outcome_order_of_ours_is_swept_when_the_map_names_outcome_legs() {
+    for outcomes in [true, false] {
+        let v = Venue::start();
+        let mut cancelled = false;
+        v.policy(move |s| {
+            if s.body.contains("frontendOpenOrders") {
+                // Another slot's order and a stranger's never leave.
+                let mut rows = vec![outcome_row(300, Some((3, 9))), outcome_row(301, None)];
+                if !cancelled {
+                    rows.push(outcome_row(201, Some((SLOT, 8))));
+                }
+                Answer::Info(open_orders(&rows))
+            } else {
+                cancelled |= s.body.contains(&cloid_hex(SLOT, 8));
+                Answer::Action(CANCEL_OK.into())
+            }
+        });
+        let coins = if outcomes {
+            CoinMap::with_outcomes()
+        } else {
+            CoinMap::new()
+        };
+        let (mut gw, mut eng) = gateway_on(&v, 5_000_000_000, IP_WEIGHT_SHARE, coins);
+        let mut evs = Vec::new();
+        live(&mut gw, &mut eng, &mut evs);
+        let stats = Arc::clone(&eng.stats);
+        let asked = stats.request_sweep();
+        if outcomes {
+            assert!(
+                drive(&mut gw, &mut eng, &mut evs, 10, |_, _| stats.sweep()
+                    == (asked, SWEEP_CLEAR)),
+                "the outcome order was never swept: {:?} {:?}",
+                stats.sweep(),
+                gw.counters()
+            );
+            let posts = v.posts();
+            assert_eq!(posts.len(), 3, "[read] [cancel ours] [read]");
+            let want = format!(r#"{{"asset":{},"cloid":"#, ASSET_BASE + ENC);
+            assert!(
+                posts[1].body.contains(r#""type":"cancelByCloid""#)
+                    && posts[1].body.contains(&want)
+                    && posts[1].body.contains(&cloid_hex(SLOT, 8))
+                    && !posts[1].body.contains(&cloid_hex(3, 9)),
+                "{}",
+                posts[1].body
+            );
+            assert_eq!(
+                posts[1].body.matches(r#"{"asset":"#).count(),
+                1,
+                "ours alone: {}",
+                posts[1].body
+            );
+            assert_eq!(
+                (gw.counters().sweep_cancels, gw.counters().sweep_unmapped),
+                (1, 0)
+            );
+        } else {
+            assert!(
+                drive(&mut gw, &mut eng, &mut evs, 10, |g, _| g
+                    .counters()
+                    .sweep_rounds
+                    >= 2),
+                "the second round never read"
+            );
+            assert!(
+                v.posts().iter().all(|p| !p.body.contains("cancelByCloid")),
+                "a perps-only map names no outcome leg"
+            );
+            assert_eq!(gw.counters().sweep_cancels, 0);
+            assert!(gw.counters().sweep_unmapped >= 1);
+        }
+    }
+}
+
+/// XH4i-1: on an outcome map a leg's `#<enc>` names its asset in every
+/// stream — a fill, an `orderUpdates` row (the shape measured on testnet,
+/// 2026-09-19), a read's open-order row; on a perps-only map (slot 6's)
+/// the same rows carry `ASSET_UNKNOWN`, as before.
+#[test]
+fn outcome_legs_name_their_asset_in_every_stream_on_an_outcome_map() {
+    for outcomes in [true, false] {
+        let want = if outcomes {
+            ASSET_BASE + ENC
+        } else {
+            ASSET_UNKNOWN
+        };
+        let v = Venue::start();
+        v.policy(|s| {
+            if s.body.contains("frontendOpenOrders") {
+                Answer::Info(open_orders(&[outcome_row(201, Some((SLOT, 8)))]))
+            } else {
+                Answer::Silent
+            }
+        });
+        let coins = if outcomes {
+            CoinMap::with_outcomes()
+        } else {
+            CoinMap::new()
+        };
+        let (mut gw, mut eng) = gateway_on(&v, 5_000_000_000, IP_WEIGHT_SHARE, coins);
+        let mut evs = Vec::new();
+        live(&mut gw, &mut eng, &mut evs);
+        v.push_all(&format!(
+            r##"{{"channel":"userFills","data":{{"user":"0x","fills":[{{"coin":"#{ENC}","px":"0.41","sz":"25.0","side":"B","time":1700000000000,"startPosition":"0","dir":"Buy","closedPnl":"0","hash":"0x0","oid":201,"crossed":false,"fee":"0.0","tid":902,"cloid":"{}","feeToken":"USDC"}}]}}}}"##,
+            cloid_hex(SLOT, 8)
+        ));
+        v.push_all(&format!(
+            r##"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"#{ENC}","side":"B","limitPx":"0.41","sz":"0.0","oid":201,"timestamp":1,"origSz":"25.0","cloid":"{}"}},"status":"filled","statusTimestamp":1700000000001}}]}}"##,
+            cloid_hex(SLOT, 8)
+        ));
+        assert!(eng.cmd.push(&HlCmd::read_orders(SLOT, 1)));
+        assert!(
+            drive(&mut gw, &mut eng, &mut evs, 5, |_, e| count(e, EV_FILL)
+                >= 1
+                && count(e, EV_FILLED) >= 1
+                && count(e, EV_READ_DONE) >= 1),
+            "outcomes {outcomes}: the streams never arrived"
+        );
+        let f = evs.iter().find(|e| e.kind == EV_FILL).unwrap();
+        assert_eq!((f.asset, f.client_oid, f.slot, f.oid), (want, 8, SLOT, 201));
+        let u = evs.iter().find(|e| e.kind == EV_FILLED).unwrap();
+        assert_eq!((u.asset, u.client_oid, u.oid), (want, 8, 201));
+        let r = evs.iter().find(|e| e.kind == EV_OPEN_ORDER).unwrap();
+        assert_eq!((r.asset, r.client_oid, r.oid), (want, 8, 201));
+    }
 }
 
 #[test]

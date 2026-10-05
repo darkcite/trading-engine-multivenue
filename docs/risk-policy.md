@@ -7888,7 +7888,8 @@ flight (the reserve's premise).
 open orders (its own read, which emits nothing; refused or unreadable, it
 fails the round), cancels by cloid every order whose cloid slot is in the
 gateway's mask — never another slot's, never a stranger's (an unmapped
-coin is counted) — within XG-2's room (the rest go next round), settles
+coin is counted; XH4i-1: on an outcome map a `#<enc>` leg is named and
+cancelled, below) — within XG-2's room (the rest go next round), settles
 1 s, reads again: none of ours → `SWEEP_CLEAR`; 8 rounds without that →
 `SWEEP_STRANDED`; a newer request restarts it. The state is published
 state-then-sequence. The sweep's cancels are answered to the arm like its
@@ -10625,6 +10626,74 @@ only: no code, test or script changes.
   `exhausted`.
 
 **Gates:** unchanged — docs only, and no test reads these files.
+
+### XH4i-1 amendment (2026-10-05): the gateway names outcome legs by their own coins — nothing wired, nothing armed
+
+Anton's word (2026-10-05): "Please do it" — XH4i, BIN15 (slot 3) off the
+blocking arm on the engine thread and onto a WebSocket order gateway of
+its own — with rulings Q1–Q4 (`claude/xmm-hl-xh4i-build-plan-2026-10-05.md`
+§0). This first cut teaches the gateway to name the legs it will see.
+Nothing builds such a gateway yet (XH4i-5 composes slot 3's), and slot 3
+stays on the blocking arm until Anton flips its transport.
+
+- **What changed.** `CoinMap::with_outcomes()` builds a coin map that,
+  besides the perps bound by name, resolves a HIP-4 leg's `#<enc>` to
+  `ASSET_BASE + enc`, read off the venue's own coin name
+  (`asset::asset_of_fill_coin`, S7-L1's helper: `#` and canonical digits
+  only, an id that fits `u32`). The gateway reads every coin through its
+  map — fills, `orderUpdates`, open-order rows, perp positions, the
+  sweep's hits — in place off the frame. On an outcome map a `#` name is
+  refused at `insert` (boot refuses): a leg is named by its coin alone.
+- **The spelling is measured, not assumed:** `#<enc>` in `userFills`
+  (2026-09-15, the asset table's namespace note) and in `orderUpdates` and
+  `frontendOpenOrders` (testnet, 2026-09-19, `#154150`: the watch log and
+  phase G's sweep in the vault's `outcome/data/testnet-exec-2026-09-19/`).
+- **LAW E-4 holds.** The id read off a coin reaches the venue one way
+  only: a sweep's `cancelByCloid`, by S7-L1's rule ("The live arm,
+  restart-proof", (C)): a cancel names an order the venue just listed as
+  ours, so a wrong id is a refused cancel, never another market. Inbound,
+  it identifies the leg of an event the venue reported. Places, modifies
+  and leverage changes take the arm's ids — the perps' `/info meta`
+  binding today; for slot 3, the roll binding (XH4i-3).
+- **Ownership is unchanged.** The sweep cancels only orders whose cloid
+  decodes as ours (LAW E-9) on this gateway's slots — a decision the coin
+  never enters; another slot's order and a stranger's on the same leg are
+  never cancelled (the loopback pins both).
+- **Slot 6 and HYPARB are byte-identical.** Every production map is built
+  `CoinMap::new()` (`xmm_live.rs`, `hyparb_live.rs`), which never takes the
+  outcome branch; gate 96b runs that map, unchanged (gate 99 drives the
+  arm's half and builds none).
+- **The sentinel edge.** `#4194967295` reads as `u32::MAX` — the value of
+  `ASSET_UNKNOWN` itself: an id no roll can bind, so the row is unmapped
+  and never cancelled (pinned on purpose). The ids just below it (enc
+  4 194 967 290 … 294) exceed any outcome id a roll can bind; at worst a
+  cancel the venue refuses.
+- **What XH4i-3 must hold before the arm trusts an event's asset** (the
+  risk review's notes, carried into the plan): a row's asset is set only
+  from the E-4 binding — never from a landed, adopted or snapshot row's
+  event, nor from settlement attribution; `ASSET_UNKNOWN` is ruled out
+  before `asset::kind_of`, which reads `u32::MAX` as an outcome id; and on
+  an outcome map the arm's `unlisted_order` cancels an unknown `#<enc>`
+  order of its own slot, which it skipped before — S7-L1 allows it, and
+  XH4i-3/-5 test it.
+
+**Gates (g2, 2026-10-05):** clippy clean; nextest 4 217/4 217 (+4 on
+`3ea326c`: the map's unit test, the two loopbacks below, gate 102 under
+nextest); alloc 111 (+1: **gate 102**, an outcome map's lookups at 0 B/op —
+a perp name, two legs, the refused spellings); copy-audit 28 baselined,
+0 new; license 663; release builds; replay 7× IDENTICAL; fmt clean. **Red
+first:** before the fix the three outcome tests failed — `ASSET_UNKNOWN`
+for `ASSET_BASE + 1941`, and the sweep STRANDED after 8 rounds with 8
+unmapped — while their perps-only halves passed.
+
+**Tests:** gateway.rs `an_outcome_map_names_legs_by_their_own_coins`;
+`hl_gateway_loopback.rs` `an_outcome_order_of_ours_is_swept_when_the_map_names_outcome_legs`
+(an outcome map: [read] [cancel ours alone, `{"asset":100001941,…}`]
+[read] → `SWEEP_CLEAR`, another slot's and a stranger's untouched; a
+perps-only map: no cancel, unmapped) and
+`outcome_legs_name_their_asset_in_every_stream_on_an_outcome_map`; bench
+gate 102. Reviews: risk, allocation and zero-copy APPROVE WITH NITS (round
+1); round 2 took the nits.
 
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 

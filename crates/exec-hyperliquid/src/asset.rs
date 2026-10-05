@@ -130,6 +130,12 @@ const _NAMESPACE_NOTE: () = ();
 /// orders they take back can sit on instances no roll of THIS process
 /// ever bound.
 ///
+/// **XH4i-1:** the order gateway's outcome map
+/// (`gateway::CoinMap::with_outcomes`) uses it for two things: its
+/// sweep's cancels, by the rule above, and the asset its fill,
+/// order-update and open-order events name — identification of a leg the
+/// venue reported, never an id an order is placed with.
+///
 /// `None` for anything but `#` and canonical decimal digits (no sign,
 /// no leading zero) naming an id that fits `u32`.
 #[must_use]

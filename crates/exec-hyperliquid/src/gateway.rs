@@ -84,7 +84,12 @@
 //! during a swap). A frame that does not scan, a socket that comes up
 //! after a gap with no live socket, and one that replaces a socket that
 //! had gone silent are [`EV_GAP`]: `orderUpdates` has no snapshot, so the
-//! arm re-checks its open orders.
+//! arm re-checks its open orders. Every fill, order-update, open-order and
+//! position row, and every sweep cancel, names its asset through the
+//! boot's [`CoinMap`], the coin read in place off the frame: perps by the
+//! names the arm bound; on a map built [`CoinMap::with_outcomes`] (XH4i —
+//! BIN15's gateway, slot 3, once XH4i-5 composes it), a HIP-4 leg by its
+//! own `#<enc>` coin — never an id for a place (LAW E-4).
 //!
 //! **Rates (XH4e).** Every post is charged to a one-minute window of the
 //! venue's IP weight — an action 1 + ⌊n/40⌋, a read its REST weight
@@ -108,8 +113,9 @@
 //! 64 B event into its slot; the ≤ 125 B pong echo (rx → control
 //! buffer); a re-send's envelope (≤ 16 KiB, out of the TX buffer into the
 //! REST client's window — its signed bytes exist only there, XMM HD2);
-//! boot-time moves (the dedupe rings, the batch arrays, the coin
-//! table); and core-net's transport copies — kernel ↔ rustls, rustls ↔
+//! boot-time moves (the dedupe rings, the RTT window and the TTL table,
+//! the batch arrays, the coin table, the gateway itself); and core-net's
+//! transport copies — kernel ↔ rustls, rustls ↔
 //! the receive buffer and its compaction. **Allocations:** none of the
 //! gateway's own after construction; rustls 0.23's buffered API allocates
 //! one buffer per TLS record it seals or opens — more for an inbound
@@ -148,6 +154,7 @@ use crate::action::{
     encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
     Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
+use crate::asset::asset_of_fill_coin;
 use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
@@ -434,15 +441,30 @@ pub enum GatewayErr {
     Rates,
 }
 
-/// Coins the gateway resolves to asset ids for the streams (perps: the
-/// arm's `/info meta` binding, XH4c). An unknown coin is
+/// Coins the gateway resolves to asset ids for the streams and the sweep
+/// (perps: the arm's `/info meta` binding, XH4c). An unknown coin is
 /// [`ASSET_UNKNOWN`]; the arm still has the client id.
+///
+/// **XH4i-1 — outcome legs by their own names.** A map built
+/// [`with_outcomes`](Self::with_outcomes) — for BIN15's gateway (slot 3),
+/// composed in XH4i-5 — also resolves a HIP-4 leg's `#<enc>` to
+/// `ASSET_BASE + enc`, read off the venue's own coin name
+/// (`asset::asset_of_fill_coin`, S7-L1). The spelling is measured on
+/// testnet in all three places the gateway reads: `userFills`
+/// (2026-09-15), `orderUpdates` and `frontendOpenOrders` (2026-09-19,
+/// `#154150`; the vault's `outcome/data/testnet-exec-2026-09-19`, the
+/// watch log and phase G's sweep). That id names an event's leg and a
+/// sweep's cancel, never a place: LAW E-4 binds an order's id from a roll
+/// event, in the arm. A perps-only map (slot 6's) leaves every `#` coin
+/// unknown, as before.
 #[derive(Clone)]
 pub struct CoinMap {
     names: [[u8; COIN_MAX]; COIN_SLOTS],
     lens: [u8; COIN_SLOTS],
     assets: [u32; COIN_SLOTS],
     n: usize,
+    /// XH4i-1: a `#<enc>` coin resolves to its outcome leg.
+    outcomes: bool,
 }
 
 /// Coins a map holds.
@@ -465,13 +487,28 @@ impl CoinMap {
             lens: [0u8; COIN_SLOTS],
             assets: [0u32; COIN_SLOTS],
             n: 0,
+            outcomes: false,
         }
     }
 
+    /// XH4i-1: empty, and naming HIP-4 outcome legs by their `#<enc>`
+    /// coins (above). Perps still bind by name ([`insert`](Self::insert)).
+    #[must_use]
+    pub const fn with_outcomes() -> Self {
+        let mut m = Self::new();
+        m.outcomes = true;
+        m
+    }
+
     /// Bind `coin` to `asset`. `false`: the map is full or the name too
-    /// long (boot refuses).
+    /// long (boot refuses) — or, on an outcome map, a `#` name: a leg is
+    /// named by its coin alone, and a binding would never be read.
     pub fn insert(&mut self, coin: &[u8], asset: u32) -> bool {
-        if self.n == COIN_SLOTS || coin.is_empty() || coin.len() > COIN_MAX {
+        if self.n == COIN_SLOTS
+            || coin.is_empty()
+            || coin.len() > COIN_MAX
+            || (self.outcomes && coin.first() == Some(&b'#'))
+        {
             return false;
         }
         // COPY: ≤ 16 B coin name into the table, once per coin at boot —
@@ -483,9 +520,14 @@ impl CoinMap {
         true
     }
 
-    /// The asset `coin` is bound to, or [`ASSET_UNKNOWN`].
+    /// The asset `coin` is bound to — on an outcome map, a `#<enc>` leg's
+    /// own id — or [`ASSET_UNKNOWN`].
     #[must_use]
     pub fn asset(&self, coin: &[u8]) -> u32 {
+        if self.outcomes && coin.first() == Some(&b'#') {
+            // No perp's name starts with '#': the leg's name is its id.
+            return asset_of_fill_coin(coin).unwrap_or(ASSET_UNKNOWN);
+        }
         let mut i = 0usize;
         while i < self.n {
             let len = self.lens[i] as usize;
@@ -539,7 +581,8 @@ pub struct GatewayCounters {
     /// Cancels a sweep sent (XH4d).
     pub sweep_cancels: u64,
     /// Resting orders of ours a sweep could not cancel: their coin is not
-    /// in the coin map (XH4d).
+    /// in the coin map (XH4d) — on an outcome map, nor a `#<enc>` leg
+    /// (XH4i-1).
     pub sweep_unmapped: u64,
     /// Growing commands refused unsent at 80 % of a rate share (XH4e).
     pub throttled: u64,
@@ -1657,7 +1700,8 @@ pub struct HlGateway {
 // assertions (mio 0.8's debug-only selector ids in its `Poll`s and
 // `TcpStream`s), a few words more since XH4f's two boxed Router tables and
 // two counters, one more since XH4h's `NonceSource`, one more since XH5b-1's
-// spot table — held under 8 KiB: a
+// spot table, one more since XH4i-1's outcome flag in the coin map — held
+// under 8 KiB: a
 // bound, not a pin, so a rustls or mio
 // bump does not break the build while the struct stays small.
 const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
@@ -2929,6 +2973,43 @@ mod tests {
             i += 1;
         }
         assert!(!full.insert(b"ONE_MORE", 99));
+    }
+
+    /// XH4i-1: an outcome map names a leg by its own `#<enc>` coin —
+    /// canonical digits whose id fits — refuses to bind a `#` name, and
+    /// still binds perps by name; a perps-only map (slot 6's) leaves every
+    /// `#` coin unknown.
+    #[test]
+    fn an_outcome_map_names_legs_by_their_own_coins() {
+        use crate::asset::ASSET_BASE;
+        let mut m = CoinMap::with_outcomes();
+        assert!(m.insert(b"ETH", 1));
+        assert!(!m.insert(b"#1941", 7), "a leg is never bound by name");
+        assert_eq!(m.asset(b"ETH"), 1);
+        assert_eq!(m.asset(b"#1941"), ASSET_BASE + 1941);
+        assert_eq!(m.asset(b"#0"), ASSET_BASE);
+        // `#4194967295` reads as `u32::MAX` — the sentinel itself: an id
+        // no roll can bind, unmapped and never cancelled, on purpose.
+        let bad: [&[u8]; 8] = [
+            b"#",
+            b"#01941",
+            b"#19a1",
+            b"#-1",
+            b"+1941",
+            b"#4194967295",
+            b"#4194967296",
+            b"#42949672950",
+        ];
+        let mut i = 0usize;
+        while i < bad.len() {
+            assert_eq!(m.asset(bad[i]), ASSET_UNKNOWN, "{:?}", bad[i]);
+            i += 1;
+        }
+        assert_eq!(
+            CoinMap::new().asset(b"#1941"),
+            ASSET_UNKNOWN,
+            "slot 6's map, as before"
+        );
     }
 
     #[test]
