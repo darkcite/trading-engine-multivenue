@@ -6,6 +6,28 @@ ripple effects the operator needs to know about.
 
 Each entry is atomic: one version bump per section. Do not batch.
 
+## 2026-10-05 — core-net: `HttpsReq` on `HttpsConn`; `https_keepalive` deleted (XMM HD1)
+
+**What changed**
+- `core_net::HttpsReq` runs on `HttpsPost`'s raw form over `HttpsConn`,
+  now the crate's one keep-alive HTTPS engine. Its errors and wire bytes
+  are unchanged and its API is source-compatible (`host`, below); gate 77b
+  is still exactly 2 allocations per request.
+- The private `core_net::https_keepalive` (`KeepAlive`) is deleted.
+- Crate-private additions: `ReqWire::raw` / `stage_raw`,
+  `HttpsConn::new_raw` / `start_raw`, `HttpsPost::raw` / `request_raw`.
+- `HttpsConn::host`, `HttpsPost::host` and `HttpsReq::host` return
+  `&'static str` (the interned host).
+- `HttpsReq::new` refuses `head_cap + body_cap > MAX_BODY_CAP` with
+  `BadEndpoint`.
+- Hypercall REST answers: one its framing proves whole is delivered even
+  when a bare FIN follows it; a close-delimited one needs a clean close
+  (risk-policy "HD1").
+
+**Operator action:** none. The paper fleet picks this up only with a merge
+to `main`, a release build and a restart; then watch the Hypercall poller's
+`polls_ok` / `polls_err`.
+
 ## 2026-10-04 — `--strategy bin15+xmm` (72); `multivenue-engine xmm-preflight`; the XH5 probe's artifacts (XMM XH5e-1)
 
 **What changed**

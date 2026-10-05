@@ -6413,6 +6413,57 @@ because the transport makes them:
 * **No transport enforces a cap.** Every order enters through
   `RoutedDispatcher`'s risk gate.
 
+### HD1: `HttpsReq` moved onto `HttpsConn` — one keep-alive engine (2026-10-05)
+
+`core_net::HttpsReq` is the Hypercall REST client: the paper fleet's
+`hypercall-poller` (`/options-summary`), the exec-hypercall arm (dark) and
+its operator verbs. It now runs on `HttpsPost`'s crate-private **raw**
+form over `HttpsConn`, the engine BX5 reviewed: one window, the whole
+request rendered into it by `HttpsReq`. The older blocking copy of the
+engine (`core_net::https_keepalive`, HC2's `KeepAlive`) is deleted, so the
+`left_host` law is implemented once. The API is source-compatible
+(`host()` now returns the interned `&'static str`); the error kinds, the
+`left_host` points (set before the write) and the wire bytes are
+unchanged. Gate 77b still measures exactly 2 allocations per request.
+
+**The two behaviours BX5 changed for `HttpsPost` now hold for `HttpsReq`:**
+
+* **An answer its own framing proves whole survives a bare FIN** (a TCP
+  FIN with no `close_notify`): `Content-Length` reached, or the
+  terminating chunk seen. Before HD1 the read after the answer
+  (`UnexpectedEof`) discarded it and returned `Disconnected, left_host:
+  true` — for the arm, a false in-doubt on an order the venue had already
+  answered; for the poller, a lost summary.
+  `https_req_tls_loopback::a_whole_answer_survives_a_close_without_close_notify`
+  failed 11 runs of 11 on the old engine and passes on the new one.
+* **A close-delimited answer counts only after a close a read confirmed
+  clean.** After a bare FIN it ends as `Disconnected, left_host: true`;
+  cut by our own buffer, as `Overflow`. Before HD1 two unconfirmed
+  closes also delimited it: the pull-through's `Ok(0)` (a bare FIN met
+  past rustls' 16 KiB wave), and a close the pump saw while our full
+  buffer had cut the body, which was handed on truncated. Hypercall's
+  measured REST answers (`/markets`, `/options-summary`, `/health`) carry
+  `Content-Length` (venue-latency.md §3); the arm's order paths are
+  unmeasured.
+
+**Recorded, not fixed (pre-existing, every engine):** `http1::read_response`
+frames a `204` (or `1xx`) without `Content-Length` as close-delimited. On
+a kept-alive connection such an answer waits out the 5 s deadline and
+ends `Timeout, left_host: true` — before HD1 as after; since HD1 a bare
+FIN right behind it ends `Disconnected`. RFC 9112 §6.3 gives those
+statuses no body (`ContentLength(0)`). The parser is shared with the HL
+order path, whose changes are the E-lane's to rule on, so the fix waits
+for HD2 (`HlHttp` onto `HttpsConn`).
+
+**A new boot refusal:** `head_cap + body_cap` above `MAX_BODY_CAP`
+(9 999 999 B) is `BadEndpoint`, because the head and the body now share
+one window. Every caller is far below it (512 + 0 and 1 024 + 2 048).
+
+**It reaches the paper fleet only** through a merge to `main`, a release
+build and a restart. Then the poller's
+`engine_ingress_hypercall_rest_polls_ok_total` / `_polls_err_total` are
+the check.
+
 ### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
 
 Built on branch `binance` (plan §5 BX3; rulings O-BX17…O-BX27 and D8).

@@ -10,19 +10,24 @@
 //! Where [`crate::HttpsPost`] fixes host, path and method at boot and
 //! renders its prefix once, a Hypercall client talks to one host across
 //! many paths and methods (cancel = `DELETE` with a JSON body, replace =
-//! `PUT`, reconcile = `GET`), so the head is rendered per request. The
-//! connection underneath is the blocking keep-alive engine HC2 moved out
-//! of the pre-BX5 `HttpsPost` (`crate::https_keepalive`): one
+//! `PUT`, reconcile = `GET`), so the head is rendered per request. Since
+//! HD1 the connection underneath is `HttpsPost`'s raw form over
+//! [`crate::HttpsConn`], the crate's one keep-alive engine: one
 //! synchronous request/response cycle on the caller's own worker thread
 //! (never the engine loop — a cycle may block up to
 //! [`crate::https_post::REQ_DEADLINE`]), `Content-Length` and `chunked`
 //! framing, the idle-close probe before reuse, and the `left_host` law.
+//! (Before HD1 it ran on an older copy of that engine, which HD1
+//! deleted. Two answers changed fate, as they did for `HttpsPost` in
+//! BX5: one its framing proves whole survives a FIN without
+//! `close_notify`, and a close-delimited one needs a clean close —
+//! risk-policy "HD1".)
 //!
 //! ## One request, one write
 //!
 //! ```text
 //! [ …spare… | head (rendered flush against the body) | body … ]
-//!             ^ wire.start = body_at - head_len        ^ body_at (fixed)
+//!   ^ window  ^ off = head_cap - head_len              ^ head_cap (fixed)
 //! ```
 //!
 //! The caller renders the body in place through [`HttpsReq::body_mut`];
@@ -45,13 +50,11 @@
 //! of the request may have reached the wire ([`PostErr::left_host`]).
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use rustls::ClientConfig;
 
 use crate::http1::{request_head_len, write_request_head, Header, HttpErr, Method, ReqHead};
-use crate::https_keepalive::KeepAlive;
-use crate::https_post::{PostErr, PostErrKind, MAX_BODY_CAP, REQ_DEADLINE};
+use crate::https_post::{HttpsPost, PostErr, PostErrKind};
 
 /// The `User-Agent` every request carries (a bare request is refused by
 /// some CDN edges; Hypercall's is Cloudflare).
@@ -62,18 +65,17 @@ const CONTENT_TYPE_JSON: &[u8] = b"application/json";
 
 /// A keep-alive HTTPS connection to one host, any method and target.
 pub struct HttpsReq {
-    /// The connection, its dial / reuse / retire law and the response
-    /// buffer (`crate::https_keepalive`).
-    conn: KeepAlive,
-    /// `[ head window | body window ]` — module doc.
-    wire: Box<[u8]>,
-    /// First body byte in `wire` (= the head window's size).
-    body_at: usize,
+    /// The connection — `HttpsPost`'s raw form — and its one window,
+    /// `[ head window | body window ]` (module doc).
+    http: HttpsPost,
+    /// The head window's size: the body window starts here.
+    head_cap: usize,
 }
 
 impl HttpsReq {
     /// Resolve and prepare: a `head_cap`-byte head window, a
-    /// `body_cap`-byte body window and a `resp_cap`-byte response
+    /// `body_cap`-byte body window — one window of their sum, bounded by
+    /// [`crate::MAX_BODY_CAP`] like any — and a `resp_cap`-byte response
     /// buffer. **Boot-only** — the allocations live here. No socket is
     /// opened until the first request.
     pub fn new(
@@ -84,22 +86,21 @@ impl HttpsReq {
         body_cap: usize,
         resp_cap: usize,
     ) -> Result<Self, PostErrKind> {
-        if head_cap == 0 || body_cap > MAX_BODY_CAP || resp_cap == 0 {
+        if head_cap == 0 {
             return Err(PostErrKind::BadEndpoint);
         }
-        let conn = KeepAlive::new(host, port, tls_config, resp_cap)?;
-        Ok(Self {
-            conn,
-            wire: vec![0u8; head_cap + body_cap].into_boxed_slice(),
-            body_at: head_cap,
-        })
+        let Some(win_cap) = head_cap.checked_add(body_cap) else {
+            return Err(PostErrKind::BadEndpoint);
+        };
+        let http = HttpsPost::raw(host, port, tls_config, win_cap, resp_cap)?;
+        Ok(Self { http, head_cap })
     }
 
     /// The host this client talks to (boot tells).
     #[inline]
     #[must_use]
-    pub fn host(&self) -> &str {
-        self.conn.host()
+    pub fn host(&self) -> &'static str {
+        self.http.host()
     }
 
     /// The head window's size (`head_cap` at construction): the longest
@@ -108,26 +109,28 @@ impl HttpsReq {
     #[inline]
     #[must_use]
     pub fn head_cap(&self) -> usize {
-        self.body_at
+        self.head_cap
     }
 
     /// The body window's size (`body_cap` at construction).
     #[inline]
     #[must_use]
     pub fn body_cap(&self) -> usize {
-        self.wire.len() - self.body_at
+        // The one window is `head_cap + body_cap` bytes.
+        self.http.body_cap() - self.head_cap
     }
 
     /// The body window: render the request body here, then
     /// [`Self::request`] its length. Its contents survive a request.
     #[inline]
     pub fn body_mut(&mut self) -> &mut [u8] {
-        &mut self.wire[self.body_at..]
+        let at = self.head_cap;
+        self.http.body_mut().get_mut(at..).unwrap_or_default()
     }
 
     /// Drop the connection. The next request redials.
     pub fn close(&mut self) {
-        self.conn.close();
+        self.http.close();
     }
 
     /// Successful dials over the client's life: 1 on a healthy
@@ -136,39 +139,39 @@ impl HttpsReq {
     #[inline]
     #[must_use]
     pub const fn dials(&self) -> u64 {
-        self.conn.dials()
+        self.http.dials()
     }
 
     /// Whether a connection is currently open.
     #[inline]
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.conn.is_connected()
+        self.http.is_connected()
     }
 
     /// The response bytes of the last successful [`Self::request`].
     #[inline]
     #[must_use]
     pub fn resp(&self) -> &[u8] {
-        self.conn.resp()
+        self.http.resp()
     }
 
     /// Render the head for `method` / `target` / `extra` flush against
-    /// the first `body_len` bytes of the body window: the range of
-    /// `wire` to write.
+    /// the first `body_len` bytes of the body window: the request's
+    /// `(offset, length)` in the window.
     fn stage(
         &mut self,
         method: Method,
         target: &[u8],
         extra: &[Header<'_>],
         body_len: usize,
-    ) -> Result<core::ops::Range<usize>, PostErrKind> {
-        if body_len > self.wire.len() - self.body_at {
+    ) -> Result<(usize, usize), PostErrKind> {
+        if body_len > self.body_cap() {
             return Err(PostErrKind::Overflow);
         }
         let head = ReqHead {
             method,
-            host: self.conn.host().as_bytes(),
+            host: self.http.host().as_bytes(),
             target,
             user_agent: REQ_USER_AGENT,
             content_type: if body_len > 0 {
@@ -179,17 +182,22 @@ impl HttpsReq {
             extra,
             keep_alive: true,
         };
+        let head_cap = self.head_cap;
         let head_len = request_head_len(&head, body_len).map_err(head_err)?;
-        if head_len > self.body_at {
+        if head_len > head_cap {
             return Err(PostErrKind::Overflow);
         }
-        let start = self.body_at - head_len;
-        // `conn` and `wire` are disjoint fields: the host is borrowed
-        // from the one while the head renders into the other.
-        let n = write_request_head(&mut self.wire[start..self.body_at], &head, body_len)
-            .map_err(head_err)?;
+        let off = head_cap - head_len;
+        // The host is interned (`'static`), so it is not borrowed from
+        // the connection while the head renders into its window.
+        let dst = self
+            .http
+            .body_mut()
+            .get_mut(off..head_cap)
+            .ok_or(PostErrKind::Overflow)?;
+        let n = write_request_head(dst, &head, body_len).map_err(head_err)?;
         debug_assert_eq!(n, head_len, "the sized head is the rendered head");
-        Ok(start..self.body_at + body_len)
+        Ok((off, head_len + body_len))
     }
 
     /// One request/response cycle: `method` on `target` with `extra`
@@ -205,14 +213,13 @@ impl HttpsReq {
         extra: &[Header<'_>],
         body_len: usize,
     ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
-        let deadline = Instant::now() + REQ_DEADLINE;
-        let wire = self
+        let (off, len) = self
             .stage(method, target, extra, body_len)
             .map_err(|err| PostErr {
                 err,
                 left_host: false,
             })?;
-        self.conn.exchange(&self.wire[wire], deadline)
+        self.http.request_raw(off, len)
     }
 }
 
@@ -229,6 +236,7 @@ const fn head_err(e: HttpErr) -> PostErrKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::https_post::MAX_BODY_CAP;
     use crate::transport::TlsTransport;
 
     fn client(head_cap: usize, body_cap: usize) -> HttpsReq {
@@ -244,8 +252,8 @@ mod tests {
         body: &[u8],
     ) -> String {
         h.body_mut()[..body.len()].copy_from_slice(body);
-        let r = h.stage(m, target, extra, body.len()).expect("fits");
-        String::from_utf8_lossy(&h.wire[r]).to_string()
+        let (off, len) = h.stage(m, target, extra, body.len()).expect("fits");
+        String::from_utf8_lossy(&h.http.body_mut()[off..off + len]).to_string()
     }
 
     #[test]
@@ -293,7 +301,11 @@ mod tests {
     #[test]
     fn heads_of_every_length_end_flush_against_the_fixed_body() {
         let mut h = client(512, 256);
-        let body_at = h.body_at;
+        assert_eq!(
+            (h.head_cap(), h.body_cap(), h.body_mut().len()),
+            (512, 256, 256)
+        );
+        let body_at = h.body_mut().as_ptr() as usize;
         for (m, t) in [
             (Method::Put, &b"/order"[..]),
             (Method::Get, &b"/health"[..]),
@@ -303,9 +315,16 @@ mod tests {
             ),
             (Method::Delete, &b"/bulk_order_cloid"[..]),
         ] {
-            let s = staged(&mut h, m, t, &[], b"{}");
+            h.body_mut()[..2].copy_from_slice(b"{}");
+            let (off, len) = h.stage(m, t, &[], 2).expect("fits");
+            assert_eq!(off + len, 512 + 2, "the head ends flush against the body");
+            let s = String::from_utf8_lossy(&h.http.body_mut()[off..off + len]).to_string();
             assert!(s.ends_with("\r\n\r\n{}"), "{s}");
-            assert_eq!(h.body_at, body_at, "the body window never moves");
+            assert_eq!(
+                h.body_mut().as_ptr() as usize,
+                body_at,
+                "the body window never moves"
+            );
         }
     }
 
@@ -361,6 +380,11 @@ mod tests {
         };
         assert!(bad(0, 64, 64), "a head window is required");
         assert!(bad(64, MAX_BODY_CAP + 1, 64), "seven length digits at most");
+        assert!(
+            bad(MAX_BODY_CAP, 1, 64),
+            "head and body share one bounded window"
+        );
+        assert!(bad(usize::MAX, 1, 64), "their sum never wraps");
         assert!(bad(64, 64, 0), "a response buffer is required");
         assert!(matches!(
             HttpsReq::new("", 443, cfg.clone(), 64, 64, 64),

@@ -25,15 +25,16 @@
 //!
 //! HC2 generalises the request side — any [`http1::Method`], any target,
 //! extra headers ([`http1::write_request_head`]) — and adds
-//! [`HttpsReq`], a keep-alive client for one host and any request, on
-//! the blocking engine HC2 moved out of the pre-BX5 [`HttpsPost`]
-//! (`https_keepalive`).
+//! [`HttpsReq`], a keep-alive client for one host and any request.
 //!
 //! BX5 adds [`HttpsConn`] — one non-blocking keep-alive HTTPS connection
 //! whose requests are boot-rendered templates, driven by its owner's poll
 //! (the Binance arm's REST); [`HttpsPost`] is now its blocking form — and
-//! [`WsConn`] / [`WsFramer`], the non-blocking WebSocket session. Moving
-//! `HttpsReq` onto `HttpsConn` (one engine) is a recorded follow-up.
+//! [`WsConn`] / [`WsFramer`], the non-blocking WebSocket session.
+//!
+//! HD1 moves [`HttpsReq`] onto `HttpsPost`'s raw form, so `HttpsConn` is
+//! the crate's one keep-alive HTTPS engine. The older blocking copy HC2
+//! had moved out of the pre-BX5 `HttpsPost` (`https_keepalive`) is gone.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -51,7 +52,6 @@ pub mod drain;
 pub mod error;
 pub mod http1;
 pub mod https_conn;
-mod https_keepalive;
 pub mod https_post;
 pub mod https_req;
 pub mod iobuf;

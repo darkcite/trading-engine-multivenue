@@ -10754,7 +10754,9 @@ fn http1_request_head_writer_is_zero_alloc() {
 /// request: exactly gate 72's two.** `HttpsReq` renders its head per
 /// request (any method, any target) flush against the body already in
 /// place and writes ONE contiguous slice ONCE, over the same connection
-/// engine as `HttpsPost` (`core_net::https_conn`). rustls' buffered API
+/// engine as `HttpsPost` (`core_net::https_conn`; since XMM HD1 through
+/// `HttpsPost::raw` → `HttpsConn::start_raw` — before it this pin measured
+/// the deleted `KeepAlive` copy, at the same 2). rustls' buffered API
 /// seals one record out and decrypts one in; a regression in our render
 /// or in the shared engine shows as a third. Same child-process server
 /// as gate 72 (the counting allocator is process-global).

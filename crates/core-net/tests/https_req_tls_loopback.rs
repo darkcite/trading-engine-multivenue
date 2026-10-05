@@ -13,6 +13,7 @@
 //! | bodiless GET | no `Content-Length`, no `Content-Type` |
 //! | idle close | the server hangs up after answering: the next request dials fresh and SUCCEEDS |
 //! | announced close | `Connection: close` retires the connection with the answer |
+//! | bare FIN | an answer its `Content-Length` proves whole survives a FIN without `close_notify` right behind it (HD1) |
 //! | chunked | a many-chunk answer is located (compacted) in place |
 //! | large | a 600 KB answer (a `/options-summary` body) spans many TLS records |
 //! | refusals | overflow / header injection never dial |
@@ -44,6 +45,9 @@ struct Script {
     chunked: bool,
     /// Pad every answer's body to at least this many bytes.
     pad_to: usize,
+    /// After this many answers on a connection (0 = never): a bare TCP
+    /// FIN — no `close_notify` — right behind the answer.
+    bare_fin_after: usize,
 }
 
 /// One request as the server parsed it.
@@ -215,6 +219,25 @@ fn handle(
         let last = script.close_after != 0 && answered >= script.close_after;
         let out = answer(&seen, script, last);
         slog.lock().unwrap().seen.push(seen);
+        if script.bare_fin_after != 0 && answered >= script.bare_fin_after {
+            // The answer's records, then the FIN, in two syscalls back to
+            // back: the FIN is most often in the socket by the time the
+            // client's wake reads the answer, so rustls ends that read
+            // with `UnexpectedEof`.
+            let mut records = Vec::new();
+            if tls.conn.writer().write_all(&out).is_err() {
+                break;
+            }
+            while tls.conn.wants_write() {
+                if tls.conn.write_tls(&mut records).is_err() {
+                    break 'conn;
+                }
+            }
+            let _ = tls.sock.write_all(&records);
+            let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+            thread::sleep(Duration::from_millis(300));
+            return;
+        }
         if tls.write_all(&out).is_err() || tls.flush().is_err() {
             break;
         }
@@ -390,6 +413,42 @@ fn an_announced_close_retires_the_connection_with_the_answer() {
         .expect("second dials fresh");
     assert_eq!(st, 200);
     assert_eq!(h.dials(), 2);
+}
+
+#[test]
+fn a_whole_answer_survives_a_close_without_close_notify() {
+    // The second answer is followed at once by a bare TCP FIN. Its own
+    // `Content-Length` proves it whole, and TLS authenticated every byte
+    // of it, so it is delivered — never a false in-doubt `Disconnected`
+    // with `left_host` (RFC 9112 §9.8). The engine `HttpsReq` ran on
+    // before HD1 lost it whenever one wake read the answer and the FIN.
+    let s = serve(Script {
+        bare_fin_after: 2,
+        ..Script::default()
+    });
+    let mut h = client(&s, 16 * 1024);
+    h.request(Method::Get, b"/first", &[], 0)
+        .expect("the first answer, kept alive");
+    let (st, r) = h
+        .request(Method::Get, b"/second", &[], 0)
+        .expect("the answer was lost to the bare FIN");
+    assert_eq!(st, 200);
+    assert!(
+        echo(&h, &r).contains(r#""target":"/second""#),
+        "{}",
+        echo(&h, &r)
+    );
+    // Retired with the answer, or — when the answer was read before the
+    // FIN landed — by the reuse probe: either way the next request dials
+    // fresh. The pause lets a FIN still in flight land first (the server
+    // holds the half-closed socket 300 ms), so the probe sees it.
+    thread::sleep(Duration::from_millis(50));
+    let (st, _) = h
+        .request(Method::Get, b"/third", &[], 0)
+        .expect("the next request dials fresh");
+    assert_eq!(st, 200);
+    assert_eq!(h.dials(), 2);
+    assert_eq!(s.log.lock().unwrap().conns, 2);
 }
 
 #[test]

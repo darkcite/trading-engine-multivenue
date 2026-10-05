@@ -23,6 +23,9 @@
 //! POST template, its own poll, and a loop that waits. The protocol —
 //! staging, keep-alive, the reuse probe, framing, `left_host` — lives
 //! once, in `HttpsConn`; the wire bytes and this API are unchanged.
+//! Since HD1 it also has a crate-private **raw** form — one window, the
+//! whole request rendered into it by the owner — and that form is
+//! [`crate::HttpsReq`]'s engine: the crate has one keep-alive engine.
 //!
 //! ## One request, one write, one TLS record (HYPARB H9)
 //!
@@ -80,7 +83,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mio::{Events, Poll, Token};
+use mio::{Events, Poll, Registry, Token};
 use rustls::ClientConfig;
 
 pub use crate::https_conn::{PostErr, PostErrKind, MAX_BODY_CAP, MAX_HOST, MAX_PATH};
@@ -146,12 +149,28 @@ impl HttpsPost {
             params: Params::Body("application/json"),
             headers: &[],
         }];
-        let cfg = ConnCfg {
-            win_cap: body_cap,
-            resp_cap,
-            req_timeout_ns: REQ_DEADLINE.as_nanos() as u64,
-        };
+        let cfg = conn_cfg(body_cap, resp_cap);
         let conn = HttpsConn::new(host, port, tls_config, &spec, cfg, MIO_TOKEN)?;
+        Self::around(conn)
+    }
+
+    /// The raw form (HD1; [`crate::HttpsReq`]'s engine): one `win_cap`-byte
+    /// window ([`Self::body_mut`]) the owner renders whole requests into,
+    /// each sent by [`Self::request_raw`]. **Boot-only.**
+    pub(crate) fn raw(
+        host: &str,
+        port: u16,
+        tls_config: Arc<ClientConfig>,
+        win_cap: usize,
+        resp_cap: usize,
+    ) -> Result<Self, PostErrKind> {
+        let cfg = conn_cfg(win_cap, resp_cap);
+        let conn = HttpsConn::new_raw(host, port, tls_config, cfg, MIO_TOKEN)?;
+        Self::around(conn)
+    }
+
+    /// The poll that drives `conn`, and its clock.
+    fn around(conn: HttpsConn) -> Result<Self, PostErrKind> {
         Ok(Self {
             conn,
             poll: Poll::new().map_err(|_| PostErrKind::Disconnected)?,
@@ -160,10 +179,10 @@ impl HttpsPost {
         })
     }
 
-    /// The host this client talks to (boot tells).
+    /// The host this client talks to (boot tells) — interned, `'static`.
     #[inline]
     #[must_use]
-    pub fn host(&self) -> &str {
+    pub fn host(&self) -> &'static str {
         self.conn.host()
     }
 
@@ -182,7 +201,8 @@ impl HttpsPost {
     }
 
     /// The body window: render the request body here, then
-    /// [`Self::post`] its length. Its contents survive a post.
+    /// [`Self::post`] its length. Its contents survive a post. (The raw
+    /// form's is its one window: the whole request goes here.)
     #[inline]
     pub fn body_mut(&mut self) -> &mut [u8] {
         self.conn.window_mut(0)
@@ -209,7 +229,8 @@ impl HttpsPost {
         self.conn.is_connected()
     }
 
-    /// The response bytes of the last successful [`Self::post`].
+    /// The response bytes of the last successful [`Self::post`] (or
+    /// `request_raw`).
     #[inline]
     #[must_use]
     pub fn resp(&self) -> &[u8] {
@@ -220,14 +241,18 @@ impl HttpsPost {
     /// [`Self::body_mut`]: `(http_status, body_range)` into
     /// [`Self::resp`]. **The status is not a verdict.**
     pub fn post(&mut self, body_len: usize) -> Result<(u16, core::ops::Range<usize>), PostErr> {
-        let streak = self.conn.fail_streak();
-        let r = self.cycle(body_len);
-        let now = self.conn.fail_streak();
-        if r.is_err() && now > streak && now % RERESOLVE_AFTER == 0 {
-            // Blocking DNS on the failure path only; best effort.
-            self.conn.reresolve();
-        }
-        r
+        self.cycle(|conn, registry, now| conn.start(0, body_len, registry, now))
+    }
+
+    /// The raw form's cycle (HD1): send the `len` bytes the owner
+    /// rendered at `off` in [`Self::body_mut`]; the answer as
+    /// [`Self::post`]'s. **The status is not a verdict.**
+    pub(crate) fn request_raw(
+        &mut self,
+        off: usize,
+        len: usize,
+    ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+        self.cycle(|conn, registry, now| conn.start_raw(off, len, registry, now))
     }
 
     #[inline]
@@ -235,9 +260,30 @@ impl HttpsPost {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    fn cycle(&mut self, body_len: usize) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+    /// One request/response cycle: `start` stages and sends the request
+    /// (or dials for it), [`Self::wait`] drives it to its answer, and
+    /// every `RERESOLVE_AFTER`-th failed dial in a row re-resolves the
+    /// host.
+    fn cycle(
+        &mut self,
+        start: impl FnOnce(&mut HttpsConn, &Registry, u64) -> Result<(), PostErr>,
+    ) -> Result<(u16, core::ops::Range<usize>), PostErr> {
+        let streak = self.conn.fail_streak();
         let now = self.now_ns();
-        self.conn.start(0, body_len, self.poll.registry(), now)?;
+        let r = match start(&mut self.conn, self.poll.registry(), now) {
+            Ok(()) => self.wait(),
+            Err(e) => Err(e),
+        };
+        let after = self.conn.fail_streak();
+        if r.is_err() && after > streak && after % RERESOLVE_AFTER == 0 {
+            // Blocking DNS on the failure path only; best effort.
+            self.conn.reresolve();
+        }
+        r
+    }
+
+    /// Turn the poll until the request in flight is answered or fails.
+    fn wait(&mut self) -> Result<(u16, core::ops::Range<usize>), PostErr> {
         loop {
             if self.poll.poll(&mut self.events, Some(POLL_TIMEOUT)).is_err() {
                 return Err(self.conn.abort(PostErrKind::Disconnected));
@@ -258,6 +304,15 @@ impl HttpsPost {
                 Progress::Failed(e) => return Err(e),
             }
         }
+    }
+}
+
+/// A connection's sizes, with one request's whole budget, [`REQ_DEADLINE`].
+const fn conn_cfg(win_cap: usize, resp_cap: usize) -> ConnCfg {
+    ConnCfg {
+        win_cap,
+        resp_cap,
+        req_timeout_ns: REQ_DEADLINE.as_nanos() as u64,
     }
 }
 
@@ -374,6 +429,32 @@ mod tests {
         assert!(bad("/é", 64), "a path must be visible ASCII");
         assert!(bad("/", 0), "a body window is required");
         assert!(bad("/", MAX_BODY_CAP + 1), "seven length digits at most");
+    }
+
+    /// HD1: a request of the other form — a template on a raw window, a
+    /// raw span on a templated one — is refused before anything dials.
+    #[test]
+    fn a_request_of_the_other_form_is_refused_before_any_dial() {
+        let cfg = TlsTransport::default_client_config();
+        let not_sent = Some(PostErr {
+            err: PostErrKind::BadEndpoint,
+            left_host: false,
+        });
+        let mut raw = HttpsPost::raw("127.0.0.1", 1, cfg.clone(), 64, 64).expect("raw");
+        assert_eq!(raw.post(5).err(), not_sent, "a raw window has no template");
+        let mut tmpl = HttpsPost::new("127.0.0.1", 1, "/p", cfg, 64, 64).expect("template");
+        assert_eq!(
+            tmpl.request_raw(0, 5).err(),
+            not_sent,
+            "a template has no raw window"
+        );
+        assert!(!raw.is_connected() && !tmpl.is_connected());
+        assert_eq!(raw.dials() + tmpl.dials(), 0, "nothing dialled");
+        assert_eq!(
+            raw.body_mut().len(),
+            64,
+            "the raw window is the whole buffer"
+        );
     }
 
     #[test]
