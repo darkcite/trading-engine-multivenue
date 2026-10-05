@@ -89,7 +89,9 @@
 //! boot's [`CoinMap`], the coin read in place off the frame: perps by the
 //! names the arm bound; on a map built [`CoinMap::with_outcomes`] (XH4i —
 //! BIN15's gateway, slot 3, once XH4i-5 composes it), a HIP-4 leg by its
-//! own `#<enc>` coin — never an id for a place (LAW E-4).
+//! own `#<enc>` coin — never an id for a place (LAW E-4) — and the spot
+//! read reports each leg the account holds ([`EV_BALANCE`], XH4i-2) by its
+//! `+<enc>` (`asset::asset_of_balance_coin`), read in place the same way.
 //!
 //! **Rates (XH4e).** Every post is charged to a one-minute window of the
 //! venue's IP weight — an action 1 + ⌊n/40⌋, a read its REST weight
@@ -154,7 +156,7 @@ use crate::action::{
     encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
     Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
-use crate::asset::asset_of_fill_coin;
+use crate::asset::{asset_of_balance_coin, asset_of_fill_coin};
 use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
@@ -165,12 +167,12 @@ use crate::cmd::{
 use crate::event::REASON_NOT_FOUND;
 use crate::event::{
     never_left, reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED,
-    EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_CANCELED, EV_FILL,
+    EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_BALANCE, EV_CANCELED, EV_FILL,
     EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED,
     EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT,
     GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
     REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT,
-    REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
+    REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN, SPOT_LEGS_READ,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::{HlHttp, MAX_REQ_BODY};
@@ -257,6 +259,9 @@ const MAX_POSITIONS: usize = 64;
 /// XG-2: the event room a read's answer needs (its rows and its end).
 const READ_RESERVE: usize = MAX_OPEN_ORDERS + 1;
 const _: () = assert!(MAX_POSITIONS <= MAX_OPEN_ORDERS);
+// XH4i-2: a spot read's legs (one `EV_BALANCE` a sheet row at most) and
+// its end fit the same room: fewer rows than the room.
+const _: () = assert!(MAX_SPOT_BALANCES < READ_RESERVE);
 /// The slot byte of the gateway's own sweep read: never a strategy slot,
 /// never `SLOT_FOREIGN`; its rows stay inside the gateway.
 const SWEEP_SLOT: u8 = 0xFE;
@@ -457,13 +462,19 @@ pub enum GatewayErr {
 /// sweep's cancel, never a place: LAW E-4 binds an order's id from a roll
 /// event, in the arm. A perps-only map (slot 6's) leaves every `#` coin
 /// unknown, as before.
+///
+/// **XH4i-2:** on such a map the spot read also reports each leg the
+/// account holds — its `+<enc>` row on the spot sheet — as
+/// [`EV_BALANCE`], and marks its end ([`SPOT_LEGS_READ`]): an outcome arm
+/// tells a sheet read for legs from one that was not.
 #[derive(Clone)]
 pub struct CoinMap {
     names: [[u8; COIN_MAX]; COIN_SLOTS],
     lens: [u8; COIN_SLOTS],
     assets: [u32; COIN_SLOTS],
     n: usize,
-    /// XH4i-1: a `#<enc>` coin resolves to its outcome leg.
+    /// XH4i-1: a `#<enc>` coin resolves to its outcome leg; XH4i-2: the
+    /// spot read reports the held `+<enc>` legs.
     outcomes: bool,
 }
 
@@ -1350,7 +1361,12 @@ impl Router {
     /// `sz_1e8` = 1 when the sheet lists USDC — 0 when it lists none, which
     /// the arm refuses as no worth (`recon::account_view`'s rule: nothing to
     /// anchor) — `aux` = the rows, scanned in place into a fixed table.
-    /// `false`: it does not scan (more rows than the table holds included).
+    /// **XH4i-2:** on an outcome map, first one [`EV_BALANCE`] per `+<enc>`
+    /// row with a holding (`asset::asset_of_balance_coin`, or
+    /// [`ASSET_UNKNOWN`]: still a leg, which an outcome arm counts unseen,
+    /// XH4i-4), and the end's `oid` counts them and its `asset` is
+    /// [`SPOT_LEGS_READ`]. `false`: it does not scan (more rows than the
+    /// table holds included) — before any row goes out.
     fn read_spot(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
         let Some((s, e)) = object_field(body, b"\"data\"") else {
             return false;
@@ -1360,20 +1376,42 @@ impl Router {
             return false;
         };
         let n = n.min(self.spot_rows.len());
+        let outcomes = self.coins.outcomes;
         let mut usdc_1e8 = 0i64;
         let mut listed = false;
+        let mut legs = 0u64;
         let mut i = 0usize;
         while i < n {
             let b = &self.spot_rows[i];
-            if b.coin.of(data) == b"USDC" {
+            let coin = b.coin.of(data);
+            if coin == b"USDC" {
                 usdc_1e8 = b.total_1e8;
                 listed = true;
+            } else if outcomes && b.total_1e8 != 0 && coin.first() == Some(&b'+') {
+                // XH4i-2: a leg the account holds — a settled husk holds
+                // nothing (`recon::account_view`'s rule).
+                let ev = ExecEvent {
+                    ts_ns: now,
+                    client_oid: item.client_oid,
+                    px_1e8: b.entry_ntl_1e8,
+                    sz_1e8: b.total_1e8,
+                    asset: asset_of_balance_coin(coin).unwrap_or(ASSET_UNKNOWN),
+                    kind: EV_BALANCE,
+                    slot: item.slot,
+                    ..ExecEvent::default()
+                };
+                emit_to(&mut self.evt, &ev);
+                legs += 1;
             }
             i += 1;
         }
         let mut end = read_end(item, EV_READ_DONE, READ_SPOT, n as u64, now);
         end.px_1e8 = usdc_1e8;
         end.sz_1e8 = i64::from(listed);
+        end.oid = legs;
+        if outcomes {
+            end.asset = SPOT_LEGS_READ;
+        }
         emit_to(&mut self.evt, &end);
         true
     }
@@ -3112,8 +3150,13 @@ mod tests {
 
     /// A router with one read of `c`'s kind in flight, as post 5.
     fn router_with_read(c: &HlCmd) -> (Router, HlEngineEnd) {
+        router_with_read_on(c, CoinMap::new())
+    }
+
+    /// XH4i: a router over `coins` with read `c` in flight.
+    fn router_with_read_on(c: &HlCmd, coins: CoinMap) -> (Router, HlEngineEnd) {
         let (eng, gw) = hl_duplex();
-        let mut rt = Router::new(gw.evt, gw.stats, CoinMap::new());
+        let mut rt = Router::new(gw.evt, gw.stats, coins);
         let rec = rt.pending.claim(5, 1).expect("claim");
         rec.class = CLASS_READ as u8;
         rec.conn = CONN_REST;
@@ -3229,6 +3272,142 @@ mod tests {
         let ev = drained(&mut eng);
         assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_SPOT));
         assert_eq!(read_code(CMD_READ_SPOT), READ_SPOT);
+    }
+
+    /// XH4i-2: on an outcome map the spot read reports each leg the
+    /// account holds — one `EV_BALANCE` per `+<enc>` row with a holding,
+    /// its values raw (a negative total or basis included, a missing
+    /// basis 0; a name that does not parse is `ASSET_UNKNOWN`, which an
+    /// outcome arm counts unseen), never a settled husk or another token —
+    /// then its end, which counts them in `oid` and carries the mark of a
+    /// sheet read for legs; on a perps-only map (slot 6's) the same sheet
+    /// answers one unmarked end, as before.
+    #[test]
+    fn on_an_outcome_map_the_spot_read_reports_the_held_legs() {
+        use crate::asset::ASSET_BASE;
+        let body = br#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"USDC","token":0,"total":"999.0","hold":"0.0","entryNtl":"0.0"},{"coin":"HYPE","token":150,"total":"1.5","hold":"0.0","entryNtl":"40.0"},{"coin":"+194180","token":2,"total":"25.0","hold":"5.0","entryNtl":"10.25"},{"coin":"+194181","token":3,"total":"0.0","hold":"0.0"},{"coin":"+0195","token":4,"total":"3.0","hold":"0.0","entryNtl":"1.2"},{"coin":"+194190","token":5,"total":"-2.0","hold":"0.0","entryNtl":"-1.5"},{"coin":"+194200","token":6,"total":"4.0","hold":"0.0"}]}}"#;
+        let mut k = 0usize;
+        while k < 2 {
+            let outcomes = k == 0;
+            k += 1;
+            let coins = if outcomes {
+                CoinMap::with_outcomes()
+            } else {
+                CoinMap::new()
+            };
+            let (mut rt, mut eng) = router_with_read_on(&HlCmd::read_spot(3, 1), coins);
+            rt.on_read_answer(5, body, 9);
+            let ev = drained(&mut eng);
+            let end = ev.last().expect("an end");
+            assert_eq!(
+                (
+                    end.kind,
+                    end.reason,
+                    end.client_oid,
+                    end.aux,
+                    end.px_1e8,
+                    end.sz_1e8
+                ),
+                (EV_READ_DONE, READ_SPOT, 1, 7, 99_900_000_000, 1)
+            );
+            if !outcomes {
+                assert_eq!(
+                    (ev.len(), end.oid, end.asset),
+                    (1, 0, 0),
+                    "slot 6's map: one unmarked end, as before"
+                );
+                continue;
+            }
+            assert_eq!(
+                (ev.len(), end.oid, end.asset),
+                (5, 4, SPOT_LEGS_READ),
+                "four held legs, then the marked end"
+            );
+            assert_eq!(
+                (
+                    ev[0].kind,
+                    ev[0].asset,
+                    ev[0].sz_1e8,
+                    ev[0].px_1e8,
+                    ev[0].slot,
+                    ev[0].client_oid
+                ),
+                (
+                    EV_BALANCE,
+                    ASSET_BASE + 194_180,
+                    2_500_000_000,
+                    1_025_000_000,
+                    3,
+                    1
+                )
+            );
+            assert_eq!(
+                (ev[1].kind, ev[1].asset, ev[1].sz_1e8, ev[1].px_1e8),
+                (EV_BALANCE, ASSET_UNKNOWN, 300_000_000, 120_000_000),
+                "a leg whose name does not parse is still reported: the arm counts it unseen"
+            );
+            assert_eq!(
+                (ev[2].asset, ev[2].sz_1e8, ev[2].px_1e8),
+                (ASSET_BASE + 194_190, -200_000_000, -150_000_000),
+                "values go out raw: `recon::leg_cost_1e6` values them"
+            );
+            assert_eq!(
+                (ev[3].asset, ev[3].sz_1e8, ev[3].px_1e8),
+                (ASSET_BASE + 194_200, 400_000_000, 0),
+                "no basis reads 0"
+            );
+        }
+        // Legs on a sheet that lists no USDC: the rows, then a marked end
+        // that says no worth — for the arm to discard whole.
+        let (mut rt, mut eng) =
+            router_with_read_on(&HlCmd::read_spot(3, 2), CoinMap::with_outcomes());
+        rt.on_read_answer(
+            5,
+            br#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"+194180","token":2,"total":"25.0","hold":"0.0","entryNtl":"10.25"}]}}"#,
+            9,
+        );
+        let ev = drained(&mut eng);
+        assert_eq!(
+            (
+                ev.len(),
+                ev[0].kind,
+                ev[1].kind,
+                ev[1].sz_1e8,
+                ev[1].px_1e8,
+                ev[1].oid
+            ),
+            (2, EV_BALANCE, EV_READ_DONE, 0, 0, 1)
+        );
+        // A full sheet — 256 held legs — goes out whole: every row, then the
+        // end (XG-2's room, const-asserted).
+        let mut rows = Vec::new();
+        let mut j = 0u32;
+        while j < 256 {
+            rows.push(format!(
+                r#"{{"coin":"+{}","token":{j},"total":"1.0","hold":"0.0","entryNtl":"0.5"}}"#,
+                10 * j + 1
+            ));
+            j += 1;
+        }
+        let full = format!(
+            r#"{{"type":"spotClearinghouseState","data":{{"balances":[{}]}}}}"#,
+            rows.join(",")
+        );
+        let (mut rt, mut eng) =
+            router_with_read_on(&HlCmd::read_spot(3, 3), CoinMap::with_outcomes());
+        rt.on_read_answer(5, full.as_bytes(), 9);
+        let ev = drained(&mut eng);
+        assert_eq!(ev.len(), 257);
+        assert_eq!(
+            (
+                ev[255].kind,
+                ev[255].asset,
+                ev[256].kind,
+                ev[256].oid,
+                ev[256].aux
+            ),
+            (EV_BALANCE, ASSET_BASE + 2_551, EV_READ_DONE, 256, 256)
+        );
     }
 
     /// XMM XH5c-3: a REST post's round trip goes to its own series alone —

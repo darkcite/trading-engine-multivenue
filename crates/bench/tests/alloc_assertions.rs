@@ -15350,7 +15350,11 @@ fn hl_gateway_arm_is_zero_alloc() {
 /// its own TLS record — answers the modify with a resting status and the
 /// cancel with `success`, and the two reads (XH4d) with the account's
 /// open orders (one ours, one a stranger's) and its perp sheet (one
-/// position); it writes its port and certificate for the parent.
+/// position); it writes its port and certificate for the parent. XH4i-2:
+/// with `GATE96_OUTCOMES=1` (the outcome variant) the orders, the fills
+/// and the day's fills are on the HIP-4 leg `#1941` instead of ETH, and
+/// the spot sheet also holds that leg as `+1941` — beside a settled husk
+/// (`+1942`) and a name that does not parse (`+0195`).
 #[test]
 #[ignore = "gate 96b's child process; never run on its own"]
 fn gate96_venue_helper() {
@@ -15360,6 +15364,13 @@ fn gate96_venue_helper() {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
+    let outcomes = std::env::var_os("GATE96_OUTCOMES").is_some_and(|v| v == "1");
+    let coin = if outcomes { "#1941" } else { "ETH" };
+    let leg = if outcomes {
+        r#",{"coin":"+1941","token":2,"total":"25.0","hold":"0.0","entryNtl":"10.25"},{"coin":"+1942","token":3,"total":"0.0","hold":"0.0"},{"coin":"+0195","token":4,"total":"3.0","hold":"0.0","entryNtl":"1.2"}"#
+    } else {
+        ""
+    };
     let v = Venue::start();
     let push = v.pusher();
     let mut k = 0u64;
@@ -15370,15 +15381,15 @@ fn gate96_venue_helper() {
             to_hex(&encode(6, k), &mut hex);
             let c = String::from_utf8_lossy(&hex).to_string();
             return Answer::Info(format!(
-                r#"{{"type":"frontendOpenOrders","data":[{{"coin":"ETH","limitPx":"2500.0","oid":{k},"origSz":"0.01","side":"B","sz":"0.01","timestamp":1,"isTrigger":false,"cloid":"{c}"}},{{"coin":"ETH","limitPx":"2600.0","oid":7,"origSz":"0.01","side":"A","sz":"0.01","timestamp":1,"isTrigger":false}}]}}"#
+                r#"{{"type":"frontendOpenOrders","data":[{{"coin":"{coin}","limitPx":"2500.0","oid":{k},"origSz":"0.01","side":"B","sz":"0.01","timestamp":1,"isTrigger":false,"cloid":"{c}"}},{{"coin":"{coin}","limitPx":"2600.0","oid":7,"origSz":"0.01","side":"A","sz":"0.01","timestamp":1,"isTrigger":false}}]}}"#
             ));
         }
-        // XH5b-1: the spot sheet.
+        // XH5b-1: the spot sheet (XH4i-2: and the leg, in the outcome
+        // variant).
         if s.body.contains("spotClearinghouseState") {
-            return Answer::Info(
-                r#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"USDC","token":0,"total":"250.25","hold":"0.0","entryNtl":"0.0"},{"coin":"HYPE","token":150,"total":"1.5","hold":"0.0","entryNtl":"40.0"}]}}"#
-                    .to_string(),
-            );
+            return Answer::Info(format!(
+                r#"{{"type":"spotClearinghouseState","data":{{"balances":[{{"coin":"USDC","token":0,"total":"250.25","hold":"0.0","entryNtl":"0.0"}},{{"coin":"HYPE","token":150,"total":"1.5","hold":"0.0","entryNtl":"40.0"}}{leg}]}}}}"#
+            ));
         }
         if s.body.contains("userRateLimit") {
             return Answer::Info(
@@ -15391,7 +15402,7 @@ fn gate96_venue_helper() {
             to_hex(&encode(6, k), &mut hex);
             let c = String::from_utf8_lossy(&hex).to_string();
             return Answer::Info(format!(
-                r#"{{"type":"userFillsByTime","data":[{{"coin":"ETH","px":"2500","sz":"0.01","side":"B","time":1700000000001,"dir":"Open Long","oid":{k},"crossed":false,"fee":"0.0001","tid":{k},"cloid":"{c}"}},{{"coin":"ETH","px":"2500","sz":"0.01","side":"A","time":1700000000002,"dir":"Close Long","oid":{k},"crossed":true,"fee":"0.0001","tid":{k},"cloid":"{c}"}}]}}"#
+                r#"{{"type":"userFillsByTime","data":[{{"coin":"{coin}","px":"2500","sz":"0.01","side":"B","time":1700000000001,"dir":"Open Long","oid":{k},"crossed":false,"fee":"0.0001","tid":{k},"cloid":"{c}"}},{{"coin":"{coin}","px":"2500","sz":"0.01","side":"A","time":1700000000002,"dir":"Close Long","oid":{k},"crossed":true,"fee":"0.0001","tid":{k},"cloid":"{c}"}}]}}"#
             ));
         }
         if s.body.contains("clearinghouseState") {
@@ -15419,10 +15430,10 @@ fn gate96_venue_helper() {
         to_hex(&encode(6, k), &mut hex);
         let c = String::from_utf8_lossy(&hex).to_string();
         push.push_all(&format!(
-            r#"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"ETH","side":"B","limitPx":"2500","sz":"0.01","oid":{k},"timestamp":1,"origSz":"0.01","cloid":"{c}"}},"status":"open","statusTimestamp":{k}}}]}}"#
+            r#"{{"channel":"orderUpdates","data":[{{"order":{{"coin":"{coin}","side":"B","limitPx":"2500","sz":"0.01","oid":{k},"timestamp":1,"origSz":"0.01","cloid":"{c}"}},"status":"open","statusTimestamp":{k}}}]}}"#
         ));
         push.push_all(&format!(
-            r#"{{"channel":"userFills","data":{{"user":"0x","fills":[{{"coin":"ETH","px":"2500","sz":"0.01","side":"B","time":1700000000000,"dir":"Open Long","oid":{k},"crossed":false,"fee":"-0.0001","tid":{k},"cloid":"{c}"}}]}}}}"#
+            r#"{{"channel":"userFills","data":{{"user":"0x","fills":[{{"coin":"{coin}","px":"2500","sz":"0.01","side":"B","time":1700000000000,"dir":"Open Long","oid":{k},"crossed":false,"fee":"-0.0001","tid":{k},"cloid":"{c}"}}]}}}}"#
         ));
         Answer::Action(format!(
             r#"{{"status":"ok","response":{{"type":"order","data":{{"statuses":[{{"resting":{{"oid":{k}}}}},{{"error":"Post only order would have immediately matched, bbo was 1@2. asset=1"}}]}}}}}}"#
@@ -15489,14 +15500,36 @@ fn gate96_venue_helper() {
 /// rustls record-layer pass (TL4/TL5b).
 #[test]
 fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
+    gate96b(false);
+}
+
+/// **XMM gate 96b, the outcome variant (XH4i-2).** The same turn, the same
+/// pins, on a gateway whose coin map names HIP-4 outcome legs
+/// (`CoinMap::with_outcomes`, BIN15's) against a venue whose orders,
+/// fills and day's fills are on the leg `#1941` and whose spot sheet holds
+/// it as `+1941` (beside a husk and a name that does not parse): every
+/// `#1941` row resolved in place to its id (five events a round), the spot
+/// read's two `EV_BALANCE` rows and its marked end, and the sweep's cancel
+/// naming the leg — the gateway's outcome paths (XH4i-1, -2) at rustls'
+/// exact residue, nothing of their own.
+#[test]
+fn hl_gateway_outcome_round_trip_allocates_only_rustls_record_buffers() {
+    gate96b(true);
+}
+
+/// Gate 96b, on a perps-only map (`outcomes` false, slot 6's) or one that
+/// names outcome legs.
+fn gate96b(outcomes: bool) {
     use exec_gateway::Idle;
     use exec_hyperliquid::event::{
-        ExecEvent, EV_ACK, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE,
-        EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_SPOT,
+        ExecEvent, EV_ACK, EV_BALANCE, EV_FILL, EV_FILL_META, EV_OPEN_ORDER, EV_POSITION,
+        EV_READ_DONE, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_SPOT,
     };
     use exec_hyperliquid::gateway::{GatewayCfg, HlEngineEnd, HlGateway};
     use exec_hyperliquid::{hl_duplex, CoinMap, HlCmd, Network, Tif};
 
+    /// XH4i: the outcome variant's leg, `#1941` / `+1941`.
+    const LEG: u32 = exec_hyperliquid::asset::ASSET_BASE + 1941;
     const ROUNDS: u64 = 300;
     /// Signed posts a round (the reads are posted, unsigned, uncounted).
     const POSTS_PER_ROUND: u64 = 3;
@@ -15516,7 +15549,11 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     /// XMM XH5c-2: the purchase's client id (the arm's range: bit 63 set,
     /// bit 62 clear, bit 60).
     const RESERVE_OID: u64 = (1 << 63) | (1 << 60) | 1;
-    let dir = std::env::temp_dir().join(format!("mv-gate96-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "mv-gate96-{}-{}",
+        std::process::id(),
+        u8::from(outcomes)
+    ));
     std::fs::create_dir_all(&dir).expect("gate 96 dir");
     let mut child = std::process::Command::new(std::env::current_exe().expect("gate 96 exe"))
         .args([
@@ -15526,6 +15563,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             "--test-threads=1",
         ])
         .env("GATE96_VENUE_DIR", &dir)
+        .env("GATE96_OUTCOMES", if outcomes { "1" } else { "0" })
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -15552,7 +15590,11 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             .with_no_client_auth(),
     );
     let (mut eng, gw_end) = hl_duplex();
-    let mut coins = CoinMap::new();
+    let mut coins = if outcomes {
+        CoinMap::with_outcomes()
+    } else {
+        CoinMap::new()
+    };
     assert!(coins.insert(b"ETH", 1));
     let cfg = GatewayCfg {
         host: "localhost".to_string(),
@@ -15575,7 +15617,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             .stream(&[0x58; 20])
             .expect("a stream"),
     );
-    let mut kinds = [0u64; 16];
+    let mut kinds = [0u64; 256];
     let t0 = std::time::Instant::now();
     while !gw.ws_live() || kinds[usize::from(EV_SNAPSHOT)] == 0 {
         assert!(
@@ -15584,78 +15626,86 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         );
         gw.turn();
         while let Some(e) = eng.evt.pop() {
-            kinds[usize::from(e.kind & 15)] += 1;
+            kinds[usize::from(e.kind)] += 1;
         }
     }
 
     // One round: two ALO places, a modify and a cancel of orders from no
     // open batch — three posts; their answers and the two pushes back.
+    // `named` counts the events naming the outcome variant's leg (XH4i).
     let mut oid = 0u64;
-    let mut round =
-        |gw: &mut HlGateway, eng: &mut HlEngineEnd, kinds: &mut [u64; 16], stall: bool| {
-            oid += 3;
-            let sent = eng.stats.io()[0];
-            let cmds = [
-                HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo)
-                    .with_priority(10_000),
-                HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo)
-                    .with_priority(10_000),
-                HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
-                    .replacing(oid + 1_000_000),
-                HlCmd::cancel(6, oid + 2_000_000, 1),
-                HlCmd::read_orders(6, oid + 3_000_000),
-                HlCmd::read_state(6, oid + 4_000_000),
-            ];
-            let mut j = 0usize;
-            while j < cmds.len() {
-                assert!(eng.cmd.push(&cmds[j]));
-                j += 1;
-            }
-            let mut got = 0u64;
-            let t = std::time::Instant::now();
-            if stall {
-                // Write the posts, then let every answer and push arrive
-                // before the next read: rustls decrypts all seven
-                // records at once and its record queue reaches its
-                // high-water mark here, in the warm-up.
-                while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
-                    assert!(
-                        t.elapsed() < std::time::Duration::from_secs(5),
-                        "gate 96: posts not written"
-                    );
-                    gw.turn();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            while got < EVENTS_PER_ROUND {
+    let mut named = 0u64;
+    let mut round = |gw: &mut HlGateway,
+                     eng: &mut HlEngineEnd,
+                     kinds: &mut [u64; 256],
+                     named: &mut u64,
+                     stall: bool| {
+        oid += 3;
+        let sent = eng.stats.io()[0];
+        let cmds = [
+            HlCmd::place(6, oid, 1, true, 250_000_000_000, 1_000_000, Tif::Alo)
+                .with_priority(10_000),
+            HlCmd::place(6, oid + 1, 1, false, 251_000_000_000, 1_000_000, Tif::Alo)
+                .with_priority(10_000),
+            HlCmd::place(6, oid + 2, 1, true, 249_000_000_000, 1_000_000, Tif::Alo)
+                .replacing(oid + 1_000_000),
+            HlCmd::cancel(6, oid + 2_000_000, 1),
+            HlCmd::read_orders(6, oid + 3_000_000),
+            HlCmd::read_state(6, oid + 4_000_000),
+        ];
+        let mut j = 0usize;
+        while j < cmds.len() {
+            assert!(eng.cmd.push(&cmds[j]));
+            j += 1;
+        }
+        let mut got = 0u64;
+        let t = std::time::Instant::now();
+        if stall {
+            // Write the posts, then let every answer and push arrive
+            // before the next read: rustls decrypts all seven
+            // records at once and its record queue reaches its
+            // high-water mark here, in the warm-up.
+            while eng.stats.io()[0] < sent + POSTS_PER_ROUND {
                 assert!(
                     t.elapsed() < std::time::Duration::from_secs(5),
-                    "gate 96: a round stalled at {got}/{EVENTS_PER_ROUND} events"
+                    "gate 96: posts not written"
                 );
                 gw.turn();
-                while let Some(e) = eng.evt.pop() {
-                    let ev: &ExecEvent = &e;
-                    kinds[usize::from(ev.kind & 15)] += 1;
-                    got += 1;
-                }
             }
-        };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        while got < EVENTS_PER_ROUND {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(5),
+                "gate 96: a round stalled at {got}/{EVENTS_PER_ROUND} events"
+            );
+            gw.turn();
+            while let Some(e) = eng.evt.pop() {
+                let ev: &ExecEvent = &e;
+                kinds[usize::from(ev.kind)] += 1;
+                *named += u64::from(ev.asset == LEG);
+                got += 1;
+            }
+        }
+    };
     let mut w = 0;
     while w < 50 {
         // The handshake's tail, session tickets and rustls' queues growing
         // to their working size: the cold part (the first round stalls).
-        round(&mut gw, &mut eng, &mut kinds, w == 0);
+        round(&mut gw, &mut eng, &mut kinds, &mut named, w == 0);
         w += 1;
     }
     let warm = kinds;
+    let named_warm = named;
     let g = AllocGuard::new();
     let mut r = 0u64;
     while r < ROUNDS {
-        round(&mut gw, &mut eng, &mut kinds, false);
+        round(&mut gw, &mut eng, &mut kinds, &mut named, false);
         r += 1;
     }
     let (allocs, bytes, _) = g.delta();
     let window = kinds;
+    let named = named - named_warm;
     let posts = eng.stats.io()[0];
 
     // XH4e, measured alone — before any sweep is asked, so no sweep round
@@ -15665,6 +15715,9 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     let sweeps0 = gw.counters().sweep_rounds;
     let mut ends = [(0u8, 0u64, 0i64); 3];
     let mut ne = 0usize;
+    // XH4i-2: the spot read's rows (the leg, the unparsed one), the count
+    // its end says, and its mark.
+    let (mut legs, mut unknown, mut legs_said, mut mark) = (0u64, 0u64, 0u64, 0u32);
     let g = AllocGuard::new();
     assert!(eng.cmd.push(&HlCmd::read_limit(6, 9_000_001)));
     assert!(eng.cmd.push(&HlCmd::read_day(
@@ -15685,8 +15738,16 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             if e.kind == EV_READ_DONE && ne < 3 {
                 ends[ne] = (e.reason, e.aux, e.px_1e8);
                 ne += 1;
+                if e.reason == READ_SPOT {
+                    legs_said = e.oid;
+                    mark = e.asset;
+                }
             }
-            kinds[usize::from(e.kind & 15)] += 1;
+            unknown += u64::from(
+                e.kind == EV_BALANCE && e.asset == exec_hyperliquid::event::ASSET_UNKNOWN,
+            );
+            legs += u64::from(e.kind == EV_BALANCE && e.asset == LEG && e.sz_1e8 == 2_500_000_000);
+            kinds[usize::from(e.kind)] += 1;
         }
     }
     let (read_allocs, read_bytes, _) = g.delta();
@@ -15721,7 +15782,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             if e.kind == EV_ACK && e.reason == core_types::ORDER_EVENT_REASON_EXPIRED {
                 expired += 1;
             }
-            kinds[usize::from(e.kind & 15)] += 1;
+            kinds[usize::from(e.kind)] += 1;
         }
     }
     let (ttl_allocs, ttl_bytes, _) = g.delta();
@@ -15748,7 +15809,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
             if e.kind == EV_ACK && e.client_oid == RESERVE_OID {
                 bought += 1;
             }
-            kinds[usize::from(e.kind & 15)] += 1;
+            kinds[usize::from(e.kind)] += 1;
         }
     }
     let (reserve_allocs, reserve_bytes, _) = g.delta();
@@ -15762,6 +15823,7 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
     // the cancel of ours, its answer — then the sweep settles (1 s).
     let (rounds0, cancels0) = (gw.counters().sweep_rounds, gw.counters().sweep_cancels);
     let acks = kinds[usize::from(EV_ACK)];
+    let mut swept = 0u32;
     let g = AllocGuard::new();
     eng.stats.request_sweep();
     let t = std::time::Instant::now();
@@ -15772,7 +15834,11 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         );
         gw.turn();
         while let Some(e) = eng.evt.pop() {
-            kinds[usize::from(e.kind & 15)] += 1;
+            if e.kind == EV_ACK {
+                // The cancel's item carries the asset the sweep named.
+                swept = e.asset;
+            }
+            kinds[usize::from(e.kind)] += 1;
         }
     }
     let (sweep_allocs, sweep_bytes, _) = g.delta();
@@ -15832,10 +15898,37 @@ fn hl_gateway_round_trip_allocates_only_rustls_record_buffers() {
         [
             (READ_LIMIT, 2_890, 150_050_000_000),
             (READ_DAY, 2, 5_000_000_000),
-            (READ_SPOT, 2, 25_025_000_000)
+            (READ_SPOT, 2 + 3 * u64::from(outcomes), 25_025_000_000)
         ],
         "the budget's figures; the day's two rows of ours, $50; the spot sheet's USDC, \
-         $250.25 over two rows"
+         $250.25 over two rows (five with the outcome variant's)"
+    );
+    // XH4i: the outcome paths ran in the windows — or, on slot 6's map,
+    // never.
+    let o = u64::from(outcomes);
+    assert_eq!(
+        named,
+        5 * ROUNDS * o,
+        "a round's fill, its fee, the orderUpdates row and both open orders name the leg"
+    );
+    assert_eq!(
+        (legs, unknown, legs_said, mark),
+        (
+            o,
+            o,
+            2 * o,
+            if outcomes {
+                exec_hyperliquid::event::SPOT_LEGS_READ
+            } else {
+                0
+            }
+        ),
+        "the spot read's two held rows (the husk none), its end's count, its mark"
+    );
+    assert_eq!(
+        swept,
+        if outcomes { LEG } else { 1 },
+        "the sweep's cancel names the leg off the venue's `#1941`"
     );
     assert_eq!(
         read_allocs, RUSTLS_ALLOCS_PER_ACCOUNT_READS,

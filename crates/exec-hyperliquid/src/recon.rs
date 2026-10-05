@@ -365,17 +365,28 @@ pub fn account_view(bal: &[SpotBalance], body: &[u8]) -> AccountView {
             v.usdc_1e6 = bal[i].total_1e8 / 100;
         } else if matches!(coin.first(), Some(b'+')) && bal[i].total_1e8 != 0 {
             v.legs = v.legs.saturating_add(1);
-            // Clamped to what the holding can EVER pay — 1 USDC a
-            // contract, so `total` in USDC — and never below zero. A
-            // buy's basis is always under that; a partial sale whose
-            // basis the venue did not reduce pro rata (unmeasured) must
-            // not read as a leg worth more than it could settle for.
-            let cost_1e8 = bal[i].entry_ntl_1e8.min(bal[i].total_1e8).max(0);
-            v.held_cost_1e6 = v.held_cost_1e6.saturating_add(cost_1e8 / 100);
+            v.held_cost_1e6 = v
+                .held_cost_1e6
+                .saturating_add(leg_cost_1e6(bal[i].total_1e8, bal[i].entry_ntl_1e8));
         }
         i += 1;
     }
     v
+}
+
+/// **E7 / XH4i-2 — one held outcome leg AT COST**, ×1e6: the venue's
+/// `entryNtl` clamped to what the holding can EVER pay — 1 USDC a
+/// contract, so `total` in USDC — and never below zero. A buy's basis is
+/// always under that; a partial sale whose basis the venue did not reduce
+/// pro rata (unmeasured) must not read as a leg worth more than it could
+/// settle for. [`account_view`] sums it over a sheet's held `+<enc>` rows;
+/// an outcome arm on the gateway sums it over the spot read's `EV_BALANCE`
+/// rows (XH4i-4) — one formula for both arms.
+#[inline]
+#[must_use]
+pub fn leg_cost_1e6(total_1e8: i64, entry_ntl_1e8: i64) -> i64 {
+    // The sheet is ×1e8; every USD figure the router compares is ×1e6.
+    entry_ntl_1e8.min(total_1e8).max(0) / 100
 }
 
 /// The most one HIP-4 outcome contract can ever be worth, 1e6.
@@ -1197,6 +1208,29 @@ mod tests {
         let n2 = scan_spot_state(only_quote, &mut b2).expect("scans");
         let empty = crate::asset::AssetTable::new();
         assert_eq!(unreconciled_venue_legs(&empty, &b2[..n2], only_quote), 0);
+    }
+
+    /// XH4i-2: one leg at cost — `entryNtl` clamped to the holding ($1 a
+    /// contract) and never below zero; the formula `account_view` sums.
+    #[test]
+    fn a_leg_at_cost_is_its_basis_clamped_to_what_it_can_pay() {
+        assert_eq!(leg_cost_1e6(2_500_000_000, 1_025_000_000), 10_250_000);
+        assert_eq!(
+            leg_cost_1e6(200_000_000, 300_000_000),
+            2_000_000,
+            "never above $1 a contract"
+        );
+        assert_eq!(
+            leg_cost_1e6(200_000_000, -150_000_000),
+            0,
+            "never below zero"
+        );
+        assert_eq!(
+            leg_cost_1e6(-200_000_000, 100_000_000),
+            0,
+            "a negative holding is worth nothing"
+        );
+        assert_eq!(leg_cost_1e6(400_000_000, 0), 0, "no basis");
     }
 
     /// **E7 session bound.** The account view is the USDC row (×1e6,

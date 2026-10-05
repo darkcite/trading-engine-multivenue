@@ -10695,6 +10695,80 @@ perps-only map: no cancel, unmapped) and
 gate 102. Reviews: risk, allocation and zero-copy APPROVE WITH NITS (round
 1); round 2 took the nits.
 
+### XH4i-2 amendment (2026-10-05): the spot read reports the outcome legs the account holds — nothing wired, nothing armed
+
+XH4i-4 judges slot 3's session bound at equity AT COST and reconciles its
+legs on the gateway as the blocking arm does (S7-L1 gap B;
+`recon::compare_booked`, `unreconciled_venue_legs`, `account_view`). This
+cut gives it the sheet's legs. Nothing consumes them yet, nothing builds an
+outcome map in production, and slot 3 stays on the blocking arm.
+
+- **What the spot read emits on an outcome map** (`CoinMap::with_outcomes`,
+  XH4i-1): before its end, one `EV_BALANCE` per `+<enc>` row with a
+  non-zero `total` — `asset` from `asset::asset_of_balance_coin` (`+` and
+  canonical digits, an id that fits `u32`), else `ASSET_UNKNOWN`; `sz_1e8`
+  = the holding (`total`); `px_1e8` = the venue's `entryNtl`, raw; slot and
+  `client_oid` the read's. The end's `oid` counts the rows and its `asset`
+  is `SPOT_LEGS_READ` (`ASSET_BASE`, the mark of a sheet read for legs).
+  The USDC figures of the end are unchanged.
+- **On a perps-only map nothing changes:** no row, `oid` 0, `asset` 0 —
+  slot 6 and HYPARB byte-identical (gate 96b's perps variant at its pins).
+  An outcome arm REFUSES an unmarked spot end (XH4i-4): a gateway that
+  never named legs could not have reported them, so its silence is not
+  "no legs held" — the hazard the E6 interlock exists for.
+- **Selection is recon's own:** a `+` row with a non-zero total, the test
+  `account_view` and `unreconciled_venue_legs` apply; a settled husk reads
+  as a missing row does in `compare_booked` (venue 0). `hold` is not
+  carried: every consumer reads `total`.
+- **Unparsable names are reported, never dropped:** `ASSET_UNKNOWN` matches
+  no bound leg, so an outcome arm counts it unseen and holds `reconciled`
+  back — the reading `same_leg`'s byte comparison gives the blocking arm.
+- **One valuation:** `recon::leg_cost_1e6(total, entryNtl)` — `entryNtl`
+  clamped to the holding ($1 a contract) and never below zero — is what
+  `account_view` now sums, and what an outcome arm sums over these rows
+  (every held row, `ASSET_UNKNOWN` included, as `account_view` counts it).
+  The events carry raw values; the clamp is the valuation's.
+- **Identification only.** A `+<enc>` id names a held leg; nothing is placed,
+  modified or cancelled with it (LAW E-4). S7-L1's cancel exception covers
+  the `#<enc>` names alone.
+- **XG-2.** At most one row per sheet row: 256 rows and the end fit the
+  read reserve (257, const-asserted); a sheet over 256 rows fails the scan
+  before any row goes out — never a partial read.
+- **What XH4i-4 must hold** (the risk review's): a row counts only for its
+  slot, its read (`client_oid`) and READ_SPOT; the rows are dropped when a
+  read is issued or fails; the read commits only when the rows taken equal
+  the end's `oid`, the end is marked, and it lists USDC; every held row is
+  compared (its leg bound) or counted unseen, and `ASSET_UNKNOWN` never
+  matches an empty slot; compare takes the first row of a leg, `total` at
+  ×1e6, as `compare_booked`; drift is confirmed over two reads; every sum
+  saturates.
+- **Gate 96b, outcome variant** (`hl_gateway_outcome_round_trip_allocates_only_rustls_record_buffers`):
+  the same turn and pins on an outcome map, the venue's orders, fills and
+  day's fills on `#1941` and its spot sheet holding `+1941` beside a husk
+  (`+1942`) and an unparsable `+0195`: five events a round name the leg,
+  the spot read emits two rows (the leg; `ASSET_UNKNOWN`) and a marked end
+  that counts 2, and the sweep's cancel names the leg — at rustls' exact
+  residue (A-S7-69 closed here, not in XH4i-5). Its counters are now one
+  per kind byte (`[u64; 256]`), so a new kind can never fold into another.
+
+**Gates (g1, 2026-10-05, on r2):** clippy clean; nextest 4 221 run (+4: the
+spot-read, balance-coin and leg-cost unit tests, gate 96b's outcome variant
+under nextest), 4 220 passed — the one failure `deribit_parsers_are_zero_alloc`
+under nextest's debug build (6 allocations), a test this cut does not touch
+— the same run's alloc gate passed it (release, 112/112) and it passed 10×
+re-run alone; its six allocations are an open investigation (A-S7-71), not
+closed as a flake; alloc 112 (+1: gate 96b's outcome variant; both
+variants at their exact pins); copy-audit 28 baselined, 0 new; license 663;
+release builds; replay 7× IDENTICAL; fmt clean. **Red first:** before the
+emission, round 1's `on_an_outcome_map_the_spot_read_reports_the_held_legs`
+failed — `(1, 0)` for `(3, 2)` — while its perps-only half passed.
+
+**Tests:** gateway.rs `on_an_outcome_map_the_spot_read_reports_the_held_legs`
+(raw negatives, a missing basis, no USDC, a full sheet of 256 legs);
+asset.rs `a_balance_coin_names_its_leg_by_the_same_rule`; recon.rs
+`a_leg_at_cost_is_its_basis_clamped_to_what_it_can_pay`; bench gate 96b's
+outcome variant.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

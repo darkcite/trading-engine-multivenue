@@ -140,7 +140,25 @@ const _NAMESPACE_NOTE: () = ();
 /// no leading zero) naming an id that fits `u32`.
 #[must_use]
 pub(crate) fn asset_of_fill_coin(coin: &[u8]) -> Option<u32> {
-    if coin.len() < 2 || coin.len() > COIN_MAX || coin[0] != b'#' {
+    asset_of_leg_coin(coin, b'#')
+}
+
+/// **XH4i-2 — the same leg in the BALANCE namespace:** `+<enc>` →
+/// `ASSET_BASE + enc`, by [`asset_of_fill_coin`]'s rule
+/// (`spotClearinghouseState` spells a leg `+<enc>`, measured — the
+/// namespace note above). It names the leg a spot sheet's row holds:
+/// identification only, never an id an order is placed with or a cancel
+/// names.
+#[must_use]
+pub(crate) fn asset_of_balance_coin(coin: &[u8]) -> Option<u32> {
+    asset_of_leg_coin(coin, b'+')
+}
+
+/// `<prefix>` and canonical decimal digits (no sign, no leading zero) →
+/// `ASSET_BASE + enc`, when the id fits `u32`.
+#[inline]
+fn asset_of_leg_coin(coin: &[u8], prefix: u8) -> Option<u32> {
+    if coin.len() < 2 || coin.len() > COIN_MAX || coin[0] != prefix {
         return None;
     }
     if coin.len() > 2 && coin[1] == b'0' {
@@ -877,6 +895,34 @@ mod tests {
         assert_eq!(asset_of_fill_coin(b"#-1"), None);
         assert_eq!(asset_of_fill_coin(b"#"), None);
         assert_eq!(asset_of_fill_coin(b"BTC"), None);
+    }
+
+    /// XH4i-2: a spot sheet's leg by the same rule in the balance
+    /// namespace — `+<enc>` only, canonical digits, an id that fits; the
+    /// two parsers never take each other's spelling.
+    #[test]
+    fn a_balance_coin_names_its_leg_by_the_same_rule() {
+        assert_eq!(
+            asset_of_balance_coin(b"+194180"),
+            Some(ASSET_BASE + 194_180)
+        );
+        assert_eq!(
+            asset_of_balance_coin(b"+32530"),
+            AssetTable::asset_id(3253, 0)
+        );
+        assert_eq!(asset_of_balance_coin(b"+0"), Some(ASSET_BASE));
+        assert_eq!(asset_of_balance_coin(b"#194180"), None, "a fill name");
+        assert_eq!(asset_of_balance_coin(b"+0194180"), None, "a leading zero");
+        assert_eq!(asset_of_balance_coin(b"+19a1"), None);
+        assert_eq!(asset_of_balance_coin(b"+-1"), None);
+        assert_eq!(asset_of_balance_coin(b"+"), None);
+        assert_eq!(asset_of_balance_coin(b"+4194967296"), None, "past u32");
+        assert_eq!(
+            asset_of_balance_coin(b"+123456789012345678901"),
+            None,
+            "over 20 bytes"
+        );
+        assert_eq!(asset_of_balance_coin(b"USDC"), None);
     }
 
     #[test]
