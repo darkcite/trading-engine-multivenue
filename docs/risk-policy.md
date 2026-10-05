@@ -10897,6 +10897,94 @@ compile-time agreement; strategy-bin15's no-flag pin in
 `arm_b_quotes_the_bid_and_asks_only_against_inventory`; the blocking arm's
 roll tests (exchange.rs) unchanged.
 
+### XH4i-3b-1 amendment (2026-10-05): the outcome mode's fills and settlements — nothing wired, nothing armed
+
+The gateway arm's outcome mode books fills on BIN15's legs by the blocking
+arm's rules (`route_frame`), read off the gateway's events (their tids
+admitted there). An outcome arm still must not be composed: XH4i-3b-2 (the
+first snapshot's rows; the outcome mode's 0 B/op gate) and XH4i-4 (the
+account's worth) come first.
+
+- **Ours resolves by its row** — the leg and the asset its place named —
+  and must name that asset: a fill for our cloid on another asset is
+  counted (`fills_mismatched`, and `fills_unresolved`), never booked or
+  joined. One whose row is gone resolves by its asset
+  (`AssetTable::sym_of_asset_gen`): the live generation, or the one a roll
+  just retired. `ASSET_UNKNOWN` (a map built without `with_outcomes`) names
+  no leg, so such an arm fails closed, counted; `perp_of_asset` and
+  `kind_of` are never asked in the outcome mode.
+- **One generation back, by asset.** `AssetSlot` keeps the asset a roll
+  retired (`prev_asset`, in the slot's former padding: still 64 B), read
+  only where a roll moved the slot (`prev_coin_len != 0`; asset 0 is a real
+  perp). The current generation answers first, and two answers are none —
+  `sym_of_coin_gen`'s rules.
+- **The ledger** (`book_qty`, ×1e6) is credited only by a fill on the live
+  generation that the member was handed — after the push, as the blocking
+  arm (a dropped fill is not a position; the drift shows it). A fill on a
+  retired generation still reaches the member on its leg — under the
+  member's client id, or a settlement's venue order id — and is counted
+  (`fills_old_gen`).
+- **A settlement** is the venue's row: no cloid, so the gateway names no
+  slot (`SLOT_FOREIGN`), `REASON_SETTLEMENT`, client id 0. It is booked only
+  when the leg's owner — learned from our own accepted orders, surviving a
+  roll — is this slot: flagged `FILL_FLAG_SETTLEMENT`, under the venue's
+  order id, the slot stamped; on the live generation it debits the ledger
+  like a sale. Otherwise it is counted (`settlements_unowned`), never
+  guessed. A cloid-less row that is no settlement stays another's
+  (`fills_foreign`). The gateway names a row with no cloid and a
+  stranger's alike (`owner()`), so this test cannot tell them apart where
+  the blocking arm reads `cloid.is_none()` — moot, since the venue's
+  settlement rows carry no cloid. The perps arm is unchanged: every row of
+  another slot, a settlement included, is `fills_foreign`.
+- **Refused, as the blocking arm's `to_fill` refuses:** a negative price,
+  or a size under one engine unit (`fills_refused`). A price of 0 — a losing
+  leg's settlement — is booked.
+- **Fees** stay the slot's `EV_FILL_META` sum; a settlement's meta carries
+  no slot and is not summed.
+- **Not yet (XH4i-3b-2).** The gateway absorbs the process's first
+  snapshot, so fills on legs made before the boot are not booked. A-S7-72's
+  rule — that snapshot's rows emitted on outcome maps only, flagged, their
+  tids admitted; the arm books them once, on bound legs; XH4i-4 never seeds
+  the ledger from the sheet — lands there, with the outcome mode's 0 B/op
+  gate (A-S7-80), which is not deferred again: a gate-98 outcome variant
+  driving every branch of `on_leg_fill` (ours live, ours after a roll, ours
+  with its row gone, a mismatch, `ASSET_UNKNOWN`, a refusal, an owned and an
+  unowned settlement, a foreign row), the verbs and the shared roll binder.
+- **Found, not changed — and a precondition (A-S7-81).** A repeat of the
+  live roll rebinds both legs in place: it zeroes their ledgers and
+  overwrites the previous generation (`prev_coin`, now `prev_asset`) with
+  the live names — on the blocking arm today too. The venue sends
+  `outcomeCreated` once (probed 2026-09-26), but a replayed engine ring
+  entry could repeat it. This cut leans on that memory: after a real roll,
+  `prev_asset` is the only way from the retired asset to its leg, so a
+  repeat before the old instance settles drops its settlement — and any
+  late fill of ours whose row is gone — as `fills_unresolved`, and the
+  member keeps a position that has settled; the zeroed ledger reads as
+  drift until the next roll (a halt, or `reconciled` false: safe, but
+  disruptive). Fills whose row is still held are unaffected. The fix —
+  `bind_roll` leaves a repeated leg untouched — changes the blocking arm,
+  so it waits for Anton's word (raised 2026-10-05); if he declines, the
+  gateway arm guards repeats on its own. **It is a hard precondition for
+  XH4i-5, the C7 flip and any live re-arm of BIN15.**
+
+**Gates (s8-3b-g2, 2026-10-05, on r2):** clippy clean; nextest 4 238 run
+(+6 over XH4i-3a's 4 232: five arm.rs fill tests and the asset.rs
+generation test), 4 238 passed; alloc 112; copy-audit 28 baselined, 0 new;
+license 663; release builds; replay 7× IDENTICAL (BIN15 included); fmt
+clean. **Red first:** against stubs (no
+`sym_of_asset_gen`, no outcome fill path), the four arm.rs fill tests and
+the asset.rs generation test failed — "the fill", "the late fill", "the
+settlement", `fills_mismatched` 0 for 1, `None` for `Some((4096, true))` —
+while the round-1/2 outcome tests passed (`s8/c3b-red.sh` red1).
+
+**Tests:** arm.rs
+`an_outcome_fill_books_on_its_row_s_leg_and_credits_the_live_ledger`,
+`a_fill_on_a_retired_generation_reaches_its_leg_but_not_the_successor_s_ledger`,
+`a_settlement_books_only_for_the_slot_whose_order_the_venue_accepted`,
+`outcome_fills_that_name_no_leg_or_another_leg_are_never_booked`,
+`a_refused_leg_fill_books_nothing_and_a_live_settlement_debits_the_ledger`;
+asset.rs `a_leg_is_found_by_its_asset_in_either_generation`.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

@@ -158,12 +158,15 @@
 //! no TTL rides on a leg (BIN15's orders rest until replaced or
 //! cancelled, as on the blocking arm). A cancel names the asset its row's
 //! place named. A roll that retires a leg cancels our rows on it and reads
-//! the orders at once (LAW E-8).
+//! the orders at once (LAW E-8). A fill on a leg (XH4i-3b) resolves by its
+//! row, or — the row gone — by its asset, live or one roll back; only the
+//! live generation's fills credit the leg's ledger, and a settlement books
+//! only for the slot whose order the venue accepted on the leg.
 //!
 //! Engine thread, 0 B/op after boot (gate 98, the perps mode; the outcome
-//! mode's gate comes with its fills, XH4i-3b): fixed tables, fixed queues,
-//! linear scans over at most [`ARM_ORDERS`] rows. The boot allocates them,
-//! and in the outcome mode its state (≈ 2.4 KiB, boxed once).
+//! mode's gate comes with XH4i-3b-2): fixed tables, fixed queues, linear
+//! scans over at most [`ARM_ORDERS`] rows. The boot allocates them, and in
+//! the outcome mode its state (≈ 2.4 KiB, boxed once).
 
 use std::sync::Arc;
 
@@ -175,8 +178,8 @@ use clob_dispatcher::{
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_time::now_ns;
 use core_types::{
-    CancelReq, Fill, ModifyReq, Order, OrderEvent, Price, Qty, Side, VenueId, FILL_ORIGIN_VENUE,
-    ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX,
+    CancelReq, Fill, ModifyReq, Order, OrderEvent, Price, Qty, Side, VenueId, FILL_FLAG_SETTLEMENT,
+    FILL_ORIGIN_VENUE, ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX,
     ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_EXPIRED, ORDER_EVENT_REASON_NONE,
     ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED, ORDER_EVENT_REJECTED,
     ORDER_EVENT_RESTING,
@@ -196,7 +199,7 @@ use crate::event::{
     EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION,
     EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
     GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
-    REASON_IOC_MISS, REASON_NOT_FOUND, REASON_THROTTLED,
+    REASON_IOC_MISS, REASON_NOT_FOUND, REASON_SETTLEMENT, REASON_THROTTLED, SLOT_FOREIGN,
 };
 use crate::gateway::{pw, HlEngineEnd};
 use crate::nonce::now_ms;
@@ -755,6 +758,19 @@ pub struct OutcomeCounters {
     /// Our rows on a leg a roll retired whose cancel went, or is kept as
     /// intent behind a full ring (LAW E-8).
     pub e8_cancels: u64,
+    /// XH4i-3b: settlements booked — the leg's owner is this slot.
+    pub settlements: u64,
+    /// XH4i-3b: settlements on a leg no accepted order of ours owns:
+    /// counted, never booked.
+    pub settlements_unowned: u64,
+    /// XH4i-3b: fills booked on a generation a roll retired — on their leg,
+    /// never credited to the successor's ledger.
+    pub fills_old_gen: u64,
+    /// XH4i-3b: our fills naming another asset than their row's place — not
+    /// booked (counted `fills_unresolved` too).
+    pub fills_mismatched: u64,
+    /// XH4i-3b: leg fills refused: a negative price, or no whole engine unit.
+    pub fills_refused: u64,
 }
 
 /// XH4i-3a: the outcome mode's state — LAW E-4's table, written by roll
@@ -2046,6 +2062,10 @@ impl HlGatewayArm {
                 && !self.day_done
                 && (e.venue_ms == 0 || e.venue_ms > self.day_until_ms),
         ));
+        if self.outcome.is_some() {
+            self.on_leg_fill(e, now);
+            return;
+        }
         if e.slot != self.cfg.slot {
             self.counters.fills_foreign += 1;
             return;
@@ -2079,6 +2099,100 @@ impl HlGatewayArm {
             self.counters.dropped += 1;
         }
         if let Some(i) = self.find(e.client_oid) {
+            let i = self.landed(i, now);
+            self.rows[i].filled_1e8 += e.sz_1e8;
+            let _ = self.maybe_filled(i, now);
+        }
+    }
+
+    /// XH4i-3b: a fill on an outcome leg — the blocking arm's `route_frame`
+    /// rules, read off the gateway's event (its tid admitted there). Ours
+    /// resolves by its row — the leg and the asset its place named — and
+    /// must name that asset: a mismatch is counted, never booked. One whose
+    /// row is gone resolves by its asset, the live generation or the one a
+    /// roll just retired. A settlement — the venue's row, with no cloid and
+    /// so no slot — is booked only for the slot that traded the leg (learned
+    /// from our own accepted orders), flagged, under the venue's order id;
+    /// otherwise counted. A fill on a retired generation reaches the member
+    /// on its leg but never credits the successor's ledger.
+    fn on_leg_fill(&mut self, e: &ExecEvent, now: u64) {
+        let settlement =
+            e.slot == SLOT_FOREIGN && e.reason == REASON_SETTLEMENT && e.client_oid == 0;
+        if e.slot != self.cfg.slot && !settlement {
+            self.counters.fills_foreign += 1;
+            return;
+        }
+        let row = if settlement {
+            None
+        } else {
+            self.find(e.client_oid)
+        };
+        let Some(st) = self.outcome.as_deref_mut() else {
+            return;
+        };
+        let leg = match row {
+            Some(i) if e.asset == self.rows[i].asset => {
+                let sym = self.rows[i].sym;
+                let live = st.assets.sym_of_asset_gen(e.asset) == Some((sym, true));
+                Some((sym, live))
+            }
+            Some(_) => {
+                st.counters.fills_mismatched += 1;
+                None
+            }
+            // A map built without `with_outcomes` names no leg.
+            None if e.asset == ASSET_UNKNOWN => None,
+            None => st.assets.sym_of_asset_gen(e.asset),
+        };
+        let Some((sym, live)) = leg else {
+            self.counters.fills_unresolved += 1;
+            return;
+        };
+        let qty = e.sz_1e8 / WIRE_PER_ENGINE;
+        if e.px_1e8 < 0 || qty <= 0 {
+            st.counters.fills_refused += 1;
+            return;
+        }
+        let mut order_id = e.client_oid;
+        let mut flags = 0u8;
+        if settlement {
+            if st.assets.owner_of_sym(sym) != Some(self.cfg.slot) {
+                st.counters.settlements_unowned += 1;
+                return;
+            }
+            order_id = e.oid;
+            flags = FILL_FLAG_SETTLEMENT;
+        }
+        let buy = e.flags & EVF_BUY != 0;
+        let side = if buy { Side::Bid } else { Side::Ask };
+        // The venue's time, wall, as the perps' fills (XH4e).
+        let f = Fill::new(
+            e.venue_ms.saturating_mul(1_000_000),
+            sym,
+            side,
+            Price(e.px_1e8 / WIRE_PER_ENGINE),
+            Qty(qty),
+            order_id,
+        )
+        .with_attribution(self.cfg.slot, FILL_ORIGIN_VENUE)
+        .with_flags(flags)
+        .with_tid(e.aux);
+        // Only a fill the member was handed is a position (the blocking
+        // arm's rule): a dropped one never credits the ledger — the drift
+        // shows it.
+        if self.fills.push(f) {
+            self.counters.fills += 1;
+            self.stats.fills_seen += 1;
+            st.counters.settlements += u64::from(settlement);
+            if live {
+                st.assets.book_qty(sym, if buy { qty } else { -qty });
+            } else {
+                st.counters.fills_old_gen += 1;
+            }
+        } else {
+            self.counters.dropped += 1;
+        }
+        if let Some(i) = row {
             let i = self.landed(i, now);
             self.rows[i].filled_1e8 += e.sz_1e8;
             let _ = self.maybe_filled(i, now);
@@ -3840,9 +3954,7 @@ mod tests {
         CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT,
         CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE, CMD_SCHEDULE_CANCEL,
     };
-    use crate::event::{
-        EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT, SLOT_FOREIGN,
-    };
+    use crate::event::{EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT};
     use crate::gateway::{hl_duplex, HlGatewayEnd};
     use exec_gateway::stats::{CONGESTION_NONE, SWEEP_WORKING};
     use exec_gateway::HALT_EVENT_RING_FULL;
@@ -4414,6 +4526,203 @@ mod tests {
             )),
             "its RESTING reached the member"
         );
+    }
+
+    // --- XH4i-3b: fills on the legs ---------------------------------
+
+    /// The gateway's `userFills` row on a leg (`asset` as an outcome map
+    /// names it): ours by `cid`, or — `cid` 0 — the venue's settlement row
+    /// (no cloid, so no slot).
+    fn leg_fill(cid: u64, asset: u32, buy: bool, px_1e8: i64, sz_1e8: i64, tid: u64) -> ExecEvent {
+        ExecEvent {
+            client_oid: cid,
+            oid: 9_000 + tid,
+            venue_ms: 1_000 + tid,
+            px_1e8,
+            sz_1e8,
+            aux: tid,
+            asset,
+            kind: EV_FILL,
+            reason: if cid == 0 { REASON_SETTLEMENT } else { 0 },
+            slot: if cid == 0 { SLOT_FOREIGN } else { SLOT },
+            flags: if buy { EVF_BUY } else { 0 },
+            ..ExecEvent::default()
+        }
+    }
+
+    /// One MAKER of ours resting on instance A's YES leg; its place.
+    fn resting_leg(arm: &mut HlGatewayArm, v: &mut Venue, t: u64) -> (Order, HlCmd) {
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert!(arm.submit(&o).is_ok());
+        let place = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&place, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        (o, place)
+    }
+
+    /// XH4i-3b: our fill resolves by its row — the leg and the asset its
+    /// place named — reaches the member on that leg, credits the live
+    /// generation's ledger and joins its order.
+    #[test]
+    fn an_outcome_fill_books_on_its_row_s_leg_and_credits_the_live_ledger() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        v.send(leg_fill(
+            o.client_oid,
+            place.asset,
+            true,
+            30_000_000,
+            4 * E8,
+            1,
+        ));
+        let f = arm.try_next_fill().expect("the fill");
+        assert_eq!(
+            (f.sym, f.side, f.px.raw(), f.qty.raw(), f.order_id),
+            (LEG_YES, Side::Bid, 300_000, 4_000_000, o.client_oid)
+        );
+        assert_eq!((f.strategy_id, f.tid, f.flags), (SLOT, 1, 0));
+        let booked = arm
+            .outcome
+            .as_deref()
+            .expect("state")
+            .assets
+            .booked_qty(LEG_YES);
+        assert_eq!(booked, Some(4_000_000));
+        assert!(events(&mut arm).contains(&(
+            o.client_oid,
+            ORDER_EVENT_FILLED,
+            ORDER_EVENT_REASON_NONE
+        )));
+    }
+
+    /// XH4i-3b: a fill on a generation a roll retired — its row still held,
+    /// or gone — reaches the member on its leg but never credits the
+    /// successor's ledger.
+    #[test]
+    fn a_fill_on_a_retired_generation_reaches_its_leg_but_not_the_successor_s_ledger() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        v.send(leg_fill(
+            o.client_oid,
+            place.asset,
+            true,
+            30_000_000,
+            2 * E8,
+            1,
+        ));
+        let f = arm.try_next_fill().expect("the late fill");
+        assert_eq!(
+            (f.sym, f.qty.raw(), f.order_id),
+            (LEG_YES, 2_000_000, o.client_oid)
+        );
+        v.send(leg_fill(77, place.asset, false, 30_000_000, E8, 2));
+        let g = arm
+            .try_next_fill()
+            .expect("a row gone: the old asset finds the leg");
+        assert_eq!((g.sym, g.side, g.order_id), (LEG_YES, Side::Ask, 77));
+        let st = arm.outcome.as_deref().expect("state");
+        assert_eq!(
+            st.assets.booked_qty(LEG_YES),
+            Some(0),
+            "the successor's is untouched"
+        );
+        assert_eq!(st.counters.fills_old_gen, 2);
+    }
+
+    /// XH4i-3b: a settlement (the venue's row: no cloid, no slot) books only
+    /// for the slot whose order the venue accepted on the leg — flagged,
+    /// under the venue's order id — even after the family rolls on (the
+    /// owner survives a roll, the retired asset finds the leg); before
+    /// that it is counted, never booked. The perps arm still calls it
+    /// another slot's.
+    #[test]
+    fn a_settlement_books_only_for_the_slot_whose_order_the_venue_accepted() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let yes = crate::asset::AssetTable::asset_id(INST_A, 0).expect("id");
+        v.send(leg_fill(0, yes, false, E8, 4 * E8, 1));
+        assert!(
+            arm.try_next_fill().is_none(),
+            "no order of ours on the leg yet"
+        );
+        let (_o, place) = resting_leg(&mut arm, &mut v, t);
+        assert_eq!(place.asset, yes);
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        v.send(leg_fill(0, yes, false, E8, 4 * E8, 2));
+        let f = arm.try_next_fill().expect("the settlement");
+        assert_eq!(
+            (f.sym, f.order_id, f.strategy_id, f.flags),
+            (LEG_YES, 9_002, SLOT, FILL_FLAG_SETTLEMENT)
+        );
+        assert_eq!((f.px.raw(), f.qty.raw()), (1_000_000, 4_000_000));
+        let c = arm.outcome_counters().expect("outcome");
+        assert_eq!((c.settlements, c.settlements_unowned), (1, 1));
+        assert_eq!(
+            arm.counters().fills_foreign,
+            0,
+            "a settlement is not another's"
+        );
+        let (mut perps, mut pv, _pt) = booted();
+        pv.send(leg_fill(0, ASSET, false, E8, E8, 9));
+        assert!(perps.try_next_fill().is_none());
+        assert_eq!(perps.counters().fills_foreign, 1);
+    }
+
+    /// XH4i-3b: what names no leg is never booked against a guess — ours on
+    /// another asset than its row's, ours with no row on an asset no roll
+    /// bound or the gateway could not name — and a cloid-less row that is
+    /// no settlement is another's.
+    #[test]
+    fn outcome_fills_that_name_no_leg_or_another_leg_are_never_booked() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        let no = crate::asset::AssetTable::asset_id(INST_A, 1).expect("id");
+        let unbound = crate::asset::AssetTable::asset_id(INST_C, 0).expect("id");
+        v.send(leg_fill(o.client_oid, no, true, 30_000_000, E8, 1));
+        v.send(leg_fill(77, unbound, true, 30_000_000, E8, 2));
+        v.send(leg_fill(78, ASSET_UNKNOWN, true, 30_000_000, E8, 3));
+        let mut stranger = leg_fill(0, place.asset, true, 30_000_000, E8, 4);
+        stranger.reason = 0;
+        v.send(stranger);
+        assert!(arm.try_next_fill().is_none());
+        assert_eq!(arm.outcome_counters().expect("outcome").fills_mismatched, 1);
+        let c = arm.counters();
+        assert_eq!((c.fills_unresolved, c.fills_foreign), (3, 1));
+    }
+
+    /// XH4i-3b (risk review r1): a leg fill the blocking arm's `to_fill`
+    /// would refuse — a negative price, a size under one engine unit — is
+    /// refused; a settlement on the live generation (the instance has not
+    /// rolled yet) debits the leg's ledger like a sale.
+    #[test]
+    fn a_refused_leg_fill_books_nothing_and_a_live_settlement_debits_the_ledger() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        v.send(leg_fill(o.client_oid, place.asset, true, -1, E8, 1));
+        v.send(leg_fill(o.client_oid, place.asset, true, 30_000_000, 99, 2));
+        assert!(arm.try_next_fill().is_none());
+        assert_eq!(arm.outcome_counters().expect("outcome").fills_refused, 2);
+        v.send(leg_fill(
+            o.client_oid,
+            place.asset,
+            true,
+            30_000_000,
+            4 * E8,
+            3,
+        ));
+        assert!(arm.try_next_fill().is_some(), "bought 4");
+        v.send(leg_fill(0, place.asset, false, E8, 4 * E8, 4));
+        let f = arm.try_next_fill().expect("the settlement on the live leg");
+        assert_eq!((f.flags, f.order_id), (FILL_FLAG_SETTLEMENT, 9_004));
+        let st = arm.outcome.as_deref().expect("state");
+        assert_eq!(
+            st.assets.booked_qty(LEG_YES),
+            Some(0),
+            "bought 4, settled 4"
+        );
+        assert_eq!((st.counters.settlements, st.counters.fills_old_gen), (1, 0));
     }
 
     fn events(arm: &mut HlGatewayArm) -> Vec<(u64, u8, u8)> {

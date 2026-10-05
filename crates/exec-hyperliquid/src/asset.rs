@@ -337,7 +337,10 @@ struct AssetSlot {
     /// [`AssetTable::note_owner`] — never from a roll, which carries
     /// no slot, and never from a fill.
     owner: u8,
-    _pad: [u8; 4],
+    /// XH4i-3b: the venue asset id before the last roll — one generation,
+    /// as `prev_coin`, and read only while `prev_coin_len != 0` (asset 0 is
+    /// a real perp).
+    prev_asset: u32,
 }
 
 impl Default for AssetSlot {
@@ -358,7 +361,7 @@ impl AssetSlot {
         coin_len: 0,
         prev_coin_len: 0,
         owner: core_types::STRATEGY_ID_NONE,
-        _pad: [0; 4],
+        prev_asset: 0,
     };
 }
 
@@ -535,6 +538,7 @@ impl AssetTable {
                 // the instance that just ended can still be resolved.
                 s.prev_coin = s.coin;
                 s.prev_coin_len = s.coin_len;
+                s.prev_asset = s.asset;
                 s.coin = [0; COIN_MAX];
                 // COPY: ≤ COIN_MAX B coin name into the slot it will be
                 // matched from — the roll event's bytes die with the
@@ -925,6 +929,48 @@ impl AssetTable {
         self.sym_of_coin_gen(coin).map(|(sym, _)| sym)
     }
 
+    /// XH4i-3b: the leg an asset id names, and WHICH GENERATION — `true`
+    /// for the leg live now, `false` for the one a roll just retired (a
+    /// late fill, a settlement). The gateway names a leg by its asset
+    /// (`CoinMap::with_outcomes`), the blocking arm by its coin; the rules
+    /// are [`Self::sym_of_coin_gen`]'s: the current generation first, the
+    /// previous only when nothing live answers and only where a roll moved
+    /// the slot, and two answers are none.
+    #[inline]
+    #[must_use]
+    pub fn sym_of_asset_gen(&self, asset: u32) -> Option<(u32, bool)> {
+        let mut hit: Option<(u32, bool)> = None;
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: `i` is bounded by the loop condition and the
+            // array is exactly ASSET_SLOTS long.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.asset == asset {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some((s.sym, true));
+            }
+            i += 1;
+        }
+        if hit.is_some() {
+            return hit;
+        }
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: as above.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.prev_coin_len != 0 && s.prev_asset == asset {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some((s.sym, false));
+            }
+            i += 1;
+        }
+        hit
+    }
+
     /// As [`Self::sym_of_coin`], but says WHICH GENERATION matched:
     /// `true` for the leg live right now, `false` for the one that
     /// just rolled off.
@@ -1153,6 +1199,29 @@ mod tests {
     #[test]
     fn the_table_is_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<AssetTable>(), 64);
+    }
+
+    /// XH4i-3b: a leg is found by its asset id — the live generation, or
+    /// the one a roll just retired; never through a slot no roll has moved
+    /// (asset 0 is a real perp), and never when two slots answer.
+    #[test]
+    fn a_leg_is_found_by_its_asset_in_either_generation() {
+        let mut t = AssetTable::new();
+        let a = AssetTable::asset_id(3_253, 0).expect("id");
+        let b = AssetTable::asset_id(3_254, 0).expect("id");
+        t.bind(4_096, a, 3_253, b"#32530").expect("bind");
+        assert_eq!(t.sym_of_asset_gen(a), Some((4_096, true)));
+        assert_eq!(
+            t.sym_of_asset_gen(0),
+            None,
+            "no roll moved it: no old generation"
+        );
+        t.bind(4_096, b, 3_254, b"#32540").expect("rebind");
+        assert_eq!(t.sym_of_asset_gen(b), Some((4_096, true)));
+        assert_eq!(t.sym_of_asset_gen(a), Some((4_096, false)));
+        t.bind(4_098, b, 3_254, b"#32540")
+            .expect("a second slot on one asset");
+        assert_eq!(t.sym_of_asset_gen(b), None, "two answers are none");
     }
 
     #[test]
