@@ -10985,6 +10985,54 @@ while the round-1/2 outcome tests passed (`s8/c3b-red.sh` red1).
 `a_refused_leg_fill_books_nothing_and_a_live_settlement_debits_the_ledger`;
 asset.rs `a_leg_is_found_by_its_asset_in_either_generation`.
 
+### XH4i-3b-2a amendment (2026-10-05): the outcome mode's 0 B/op gate (gate 103) — nothing wired, nothing armed
+
+The gate the allocation review asked for in XH4i-3a and bound in XH4i-3b-1
+(A-S7-80) lands first in XH4i-3b-2, as its conditions require. No
+production code changes; the arm's module doc names the gate.
+
+- **Gate 103** (`hl_gateway_outcome_arm_is_zero_alloc`): an outcome arm on
+  slot 3 (no perp, no leverage, the slot's own account) booted through the
+  duplex by a scripted venue that answers every command at once, then
+  40 000 rounds under the counting allocator. Each round:
+  - a roll: the next instance binds both legs and the last one's retire,
+    through the binder both arms share — the E-8 cancel of the MAKER still
+    resting there, and the orders read at once;
+  - a fill on the retired generation for that MAKER (its row held: no row
+    closes unseen in the gate, `gone_ms` 60 s) and one for the last round's
+    IoC on its NO leg (its row gone: one roll back by asset);
+  - a MAKER on YES and an IoC on NO with BIN15's client ids and no flag,
+    answered resting (the owner noted; the scripted venue rests the IoC so
+    it can be cancelled);
+  - one refusal of each kind: a stale instance, an unbound leg, an
+    off-grid price;
+  - a modify of the MAKER and a cancel of the IoC;
+  - every other branch of `on_leg_fill`: ours on the live generation, a
+    mismatched asset, `ASSET_UNKNOWN`, a refused fill, an owned settlement
+    (a sale of the holding), an unowned one (a family no order of ours
+    trades), another slot's row.
+
+  Fifteen paths — the outcome counters, the arm's fill counters, and the
+  modifies and cancels done — must each run at least 99 % of their scripted
+  count inside the window. Exact counts are not asserted: at this pace the
+  arm's own gates refuse an occasional round's verbs (about 10 rounds in
+  40 000, measured; not yet attributed — the risk review reads it as the
+  stale-budget refusal, intended throttling that never halts). The budget
+  read answers $1M traded, so the budget never nears its floor.
+- **Still XH4i-3b-2b:** the first-snapshot rule (A-S7-72). Gate 103 then
+  drives the snapshot's rows too. When XH4i-4 refuses an unmarked spot end,
+  the gate's `READ_SPOT` answer must carry `SPOT_LEGS_READ` (it would fail
+  loudly at boot otherwise).
+
+**Gates (s8-3b2a-g3, 2026-10-05, on r2):** clippy clean; nextest 4 239 run
+(+1: gate 103 under nextest), 4 239 passed; alloc 113 (+1: gate 103);
+copy-audit 28 baselined, 0 new; license 663; release builds; replay 7×
+IDENTICAL; fmt clean. Gate 103 alone (release, serial) passed in run3; the
+exact-count attempt (run2) fell short by about 10 rounds in 40 000, hence
+the 99 % floor.
+
+**Tests:** bench gate 103.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

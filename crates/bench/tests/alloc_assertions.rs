@@ -14441,6 +14441,410 @@ fn hl_gateway_outcome_coin_map_is_zero_alloc() {
     );
 }
 
+/// **XMM gate 103 (XH4i-3b-2a) — the gateway arm's outcome mode is 0 B/op.**
+/// An outcome arm (slot 3, BIN15's HIP-4 legs: no perp, no leverage) booted
+/// through the duplex by a scripted venue that answers every command at
+/// once. Then, round after round on the real clock: the family rolls (the
+/// next instance binds both legs, the last one's retire — LAW E-8's cancel
+/// of the MAKER still resting there, and the orders read at once); a fill
+/// on the retired generation for that MAKER (its row held) and one for the
+/// last round's IoC (its row gone); a MAKER on the new YES leg and an IoC on
+/// NO (BIN15's client ids, no flag), answered resting (the owner noted); one
+/// refusal of each kind (a stale instance, an unbound leg, an off-grid
+/// price); a modify of the MAKER and a cancel of the IoC; then every other
+/// branch of `on_leg_fill` — ours on the live generation, a mismatched
+/// asset, `ASSET_UNKNOWN`, a refused fill, an owned settlement, an unowned
+/// one (a family no order of ours trades) and another slot's row. Every
+/// out-queue drained as the engine does. The scripted venue rests the IoC so
+/// it can be cancelled, and settles a holding as a sale; no row closes
+/// unseen (`gone_ms` 60 s) and the budget never nears its floor. The warm-up
+/// runs until every path has run; the window must run each at least 99 % of
+/// its scripted count — at this pace the arm's own gates refuse an
+/// occasional round's verbs (about 10 in 40 000, measured), so exact counts
+/// are not the arm's to promise.
+#[test]
+fn hl_gateway_outcome_arm_is_zero_alloc() {
+    use clob_dispatcher::OrderDispatch;
+    use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
+    use core_types::{CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, OrderEvent, Side};
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use exec_hyperliquid::anchor::AnchorSlot;
+    use exec_hyperliquid::arm::{ArmCfg, HlGatewayArm, PerpBind, ARM_PERPS};
+    use exec_hyperliquid::asset::AssetTable;
+    use exec_hyperliquid::cmd::{
+        CMD_CANCEL, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT, CMD_READ_ORDERS,
+        CMD_READ_SPOT, CMD_READ_STATE,
+    };
+    use exec_hyperliquid::deadman::DeadManCfg;
+    use exec_hyperliquid::event::{
+        ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_POST_ITEM, EVF_RESTING, EV_ACK,
+        EV_FILL, EV_READ_DONE, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT,
+        READ_STATE, REASON_SETTLEMENT, SLOT_FOREIGN,
+    };
+    use exec_hyperliquid::gateway::HlGatewayEnd;
+    use exec_hyperliquid::hl_duplex;
+    use exec_hyperliquid::rules::PerpRules;
+
+    const SLOT: u8 = 3;
+    const ROUNDS: u64 = 40_000;
+    /// Each path's runs a round, in `paths()`'s order: one roll; one E-8
+    /// cancel (the last round's MAKER); one refusal of each kind; one owned
+    /// and one unowned settlement; two fills on the retired generation (row
+    /// held, row gone); one mismatch; one refused fill; four fills booked
+    /// (the two old, the live one, the settlement); two unresolved (the
+    /// mismatch, `ASSET_UNKNOWN`); one foreign row; one modify; one cancel.
+    const PER_ROUND: [u64; 15] = [1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 4, 2, 1, 1, 1];
+    /// BIN15's first family: its YES leg (NO is the next ordinal).
+    const LEG_YES: u32 = ((VenueId::Hyperliquid as u32) << 24) | 4_096;
+    /// A family no order of ours trades: its settlements are unowned.
+    const LEG_OTHER: u32 = LEG_YES + 2;
+    const INST_OTHER: u32 = 900;
+    /// The traded family's first instance; one more each round.
+    const INST_BASE: u32 = 1_000;
+
+    /// The scripted venue: every command answered at once — orders resting,
+    /// cancels done, reads with what the boot needs (a $1 000 account, $500
+    /// USDC, 100 of 1 010 000 requests used — $1M traded, so the budget never
+    /// nears its floor — no day's fills, nothing resting), the dead man's
+    /// posts acknowledged.
+    fn answer(gw: &mut HlGatewayEnd, n: &mut u64) {
+        gw.stats.beat(core_time::now_ns());
+        while let Some(p) = gw.cmd.pop() {
+            let c = *p;
+            *n += 1;
+            let bits = if c.kind <= CMD_CANCEL { c.kind } else { 0 };
+            let item = ExecEvent {
+                client_oid: c.client_oid,
+                asset: c.asset,
+                slot: c.slot,
+                flags: EVF_POST_ITEM | (bits << EVF_CMD_SHIFT),
+                ..ExecEvent::default()
+            };
+            let end = ExecEvent {
+                client_oid: c.client_oid,
+                slot: c.slot,
+                kind: EV_READ_DONE,
+                ..ExecEvent::default()
+            };
+            let e = match c.kind {
+                CMD_PLACE | CMD_MODIFY => ExecEvent {
+                    kind: EV_ACK,
+                    flags: item.flags | EVF_RESTING,
+                    oid: *n,
+                    ..item
+                },
+                CMD_READ_STATE => ExecEvent {
+                    reason: READ_STATE,
+                    px_1e8: 100_000_000_000,
+                    venue_ms: *n,
+                    ..end
+                },
+                CMD_READ_SPOT => ExecEvent {
+                    reason: READ_SPOT,
+                    px_1e8: 50_000_000_000,
+                    sz_1e8: 1,
+                    ..end
+                },
+                CMD_READ_ORDERS => ExecEvent {
+                    reason: READ_ORDERS,
+                    ..end
+                },
+                CMD_READ_LIMIT => ExecEvent {
+                    reason: READ_LIMIT,
+                    aux: 100,
+                    px_1e8: 100_000_000_000_000,
+                    ..end
+                },
+                CMD_READ_DAY => ExecEvent {
+                    reason: READ_DAY,
+                    ..end
+                },
+                // A cancel done; the dead man's posts (no command bits).
+                _ => ExecEvent {
+                    kind: EV_ACK,
+                    ..item
+                },
+            };
+            assert!(gw.evt.emit(&e), "gate 103: the event ring is full");
+        }
+    }
+
+    /// A roll of the family whose YES leg is `sym` (`pack_roll_seq`'s
+    /// layout: a created instance).
+    fn roll(sym: u32, outcome: u32) -> ChannelEvent {
+        ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            ChannelId::InstrumentRoll,
+            sym,
+            u64::from(outcome) | (60u64 << 32),
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+
+    /// BIN15's client id: the null arm's bit 63, a 14-bit sequence, the
+    /// instance in the low 32 bits.
+    fn cid(seq: u64, inst: u32) -> u64 {
+        (1u64 << 63) | ((seq & 0x3FFF) << 49) | u64::from(inst)
+    }
+
+    /// BIN15's order (no flag): four contracts.
+    fn leg(seq: u64, inst: u32, sym: u32, kind: u8, px_1e6: i64) -> Order {
+        let mut o = Order::new(
+            0,
+            VenueId::Hyperliquid,
+            sym,
+            Side::Bid,
+            kind,
+            Price(px_1e6),
+            Qty(4_000_000),
+            cid(seq, inst),
+        );
+        o.strategy_id = SLOT;
+        o
+    }
+
+    /// A `userFills` row as an outcome map emits it: a buy of one contract
+    /// (`cid` 0: the venue's settlement row, which names no slot — a sale of
+    /// the holding).
+    fn fill(cid: u64, slot: u8, asset: u32, px_1e8: i64, tid: u64) -> ExecEvent {
+        ExecEvent {
+            client_oid: cid,
+            oid: tid,
+            venue_ms: tid,
+            px_1e8,
+            sz_1e8: 100_000_000,
+            aux: tid,
+            asset,
+            kind: EV_FILL,
+            reason: if cid == 0 { REASON_SETTLEMENT } else { 0 },
+            slot,
+            flags: if cid == 0 { 0 } else { EVF_BUY },
+            ..ExecEvent::default()
+        }
+    }
+
+    fn drain(arm: &mut HlGatewayArm, acc: &mut u64) {
+        while let Some(f) = arm.try_next_fill() {
+            *acc ^= f.order_id;
+        }
+        let mut e = OrderEvent::ZERO;
+        while arm.try_next_order_event(&mut e) {
+            *acc ^= e.client_oid;
+        }
+        while let Some(r) = arm.try_next_retired() {
+            *acc ^= r.client_oid;
+        }
+        while let Some(n) = arm.try_next_renamed() {
+            *acc ^= n.client_oid;
+        }
+    }
+
+    /// The paths each window must run again.
+    fn paths(arm: &HlGatewayArm, modifies: u64, cancels: u64) -> [u64; 15] {
+        let o = arm.outcome_counters().expect("gate 103: an outcome arm");
+        let c = arm.counters();
+        [
+            o.rolls_bound,
+            o.e8_cancels,
+            o.refused_stale,
+            o.refused_unbound,
+            o.refused_rules,
+            o.settlements,
+            o.settlements_unowned,
+            o.fills_old_gen,
+            o.fills_mismatched,
+            o.fills_refused,
+            c.fills,
+            c.fills_unresolved,
+            c.fills_foreign,
+            modifies,
+            cancels,
+        ]
+    }
+
+    /// One round on instance `INST_BASE + r` (the last round's retires).
+    fn round(
+        arm: &mut HlGatewayArm,
+        gw: &mut HlGatewayEnd,
+        r: u64,
+        n: &mut u64,
+        acc: &mut u64,
+        done: &mut [u64; 2],
+    ) {
+        let k = INST_BASE + r as u32;
+        let seq = r * 4;
+        let yes = AssetTable::asset_id(k, 0).expect("gate 103: an id");
+        let no = AssetTable::asset_id(k, 1).expect("gate 103: an id");
+        let old_yes = AssetTable::asset_id(k - 1, 0).expect("gate 103: an id");
+        let old_no = AssetTable::asset_id(k - 1, 1).expect("gate 103: an id");
+        // The family rolls: k binds, k − 1 retires — the last round's MAKER
+        // (modified, resting) is cancelled and the orders are read.
+        arm.on_venue_event(&roll(LEG_YES, k));
+        // The retired generation: that MAKER (its row held while its cancel
+        // is out) and the last round's IoC (its row gone).
+        let t = r * 16;
+        assert!(gw.evt.emit(&fill(
+            cid(seq.wrapping_sub(2), k - 1),
+            SLOT,
+            old_yes,
+            31_000_000,
+            t
+        )));
+        assert!(gw.evt.emit(&fill(
+            cid(seq.wrapping_sub(3), k - 1),
+            SLOT,
+            old_no,
+            31_000_000,
+            t + 1
+        )));
+        // The new instance: a MAKER on YES and an IoC on NO; one refusal of
+        // each kind — a stale instance, an unbound leg, an off-grid price.
+        let maker = leg(seq, k, LEG_YES, ORDER_KIND_MAKER, 300_000);
+        let ioc = leg(seq + 1, k, LEG_YES + 1, ORDER_KIND_IOC, 600_000);
+        *acc ^= u64::from(arm.submit(&maker).is_ok());
+        *acc ^= u64::from(arm.submit(&ioc).is_ok()) << 1;
+        *acc ^= u64::from(
+            arm.submit(&leg(seq + 3, k - 1, LEG_YES, ORDER_KIND_MAKER, 300_000))
+                .is_err(),
+        ) << 2;
+        *acc ^= u64::from(
+            arm.submit(&leg(seq + 3, k, LEG_YES + 4, ORDER_KIND_MAKER, 300_000))
+                .is_err(),
+        ) << 3;
+        *acc ^= u64::from(
+            arm.submit(&leg(seq + 3, k, LEG_YES, ORDER_KIND_MAKER, 300_050))
+                .is_err(),
+        ) << 4;
+        answer(gw, n);
+        let _ = arm.on_idle();
+        drain(arm, acc);
+        // A modify of the MAKER (its leg kept) and a cancel of the IoC.
+        let next = leg(seq + 2, k, LEG_YES, ORDER_KIND_MAKER, 310_000);
+        done[0] += u64::from(arm.modify(&ModifyReq::new(maker.client_oid, next)).is_ok());
+        let mut x = CancelReq::new(0, VenueId::Hyperliquid, LEG_YES + 1, ioc.client_oid);
+        x.strategy_id = SLOT;
+        done[1] += u64::from(arm.cancel(&x).is_ok());
+        answer(gw, n);
+        let _ = arm.on_idle();
+        // Every other branch of `on_leg_fill`.
+        let other = AssetTable::asset_id(INST_OTHER, 0).expect("gate 103: an id");
+        let rows = [
+            // Ours on the live generation: a quarter of the MAKER.
+            fill(next.client_oid, SLOT, yes, 31_000_000, t + 2),
+            // Ours naming another asset than its row's.
+            fill(next.client_oid, SLOT, no, 31_000_000, t + 3),
+            // Ours with no row, on no leg the gateway could name.
+            fill(cid(seq + 3, k), SLOT, ASSET_UNKNOWN, 31_000_000, t + 4),
+            // A refused one: a negative price.
+            fill(cid(seq + 3, k), SLOT, yes, -1, t + 5),
+            // The venue's settlements: on our leg (owned), on a family no
+            // order of ours trades (unowned).
+            fill(0, SLOT_FOREIGN, yes, 100_000_000, t + 6),
+            fill(0, SLOT_FOREIGN, other, 100_000_000, t + 7),
+            // Another slot's row.
+            fill(1, 5, yes, 31_000_000, t + 8),
+        ];
+        let mut i = 0usize;
+        while i < rows.len() {
+            assert!(gw.evt.emit(&rows[i]), "gate 103: the event ring is full");
+            i += 1;
+        }
+        let _ = arm.on_idle();
+        answer(gw, n);
+        let _ = arm.on_idle();
+        drain(arm, acc);
+    }
+
+    // ---- boot (NOT measured) ----
+    let bind = PerpBind {
+        sym: 42,
+        asset: 3,
+        rules: PerpRules::new(4).expect("rules"),
+    };
+    let cfg = ArmCfg {
+        slot: SLOT,
+        perps: [bind; ARM_PERPS],
+        n_perps: 0,
+        expires_after_ms: 1,
+        post_timeout_ms: 5_000,
+        skew_ms: 0,
+        recon_ms: 1,
+        join_ms: 1,
+        gone_ms: 60_000,
+        shutdown_ms: 1_000,
+        own_account: true,
+        anchor_1e6: 0,
+        deadman: DeadManCfg::DEFAULT,
+        budget_floor: 2_000,
+        limit_ms: 2,
+        leverage: 0,
+        outcomes: true,
+    };
+    let (eng, mut gw) = hl_duplex();
+    let mut arm = HlGatewayArm::new(&cfg, eng).expect("gate 103: the outcome arm");
+    let keep = std::sync::Arc::new(AnchorSlot::new());
+    arm.keep_anchor_in(std::sync::Arc::clone(&keep));
+    gw.stats.set_gauges(0, true);
+    let mut n = 0u64;
+    let _ = arm.on_idle();
+    answer(&mut gw, &mut n);
+    assert!(gw.evt.emit(&ExecEvent {
+        kind: EV_SNAPSHOT,
+        ..ExecEvent::default()
+    }));
+    let _ = arm.on_idle();
+    gw.stats.set_sweep(gw.stats.sweep_requested(), SWEEP_CLEAR);
+    let mut spins = 0u32;
+    while !arm.ready() {
+        let _ = arm.on_idle();
+        answer(&mut gw, &mut n);
+        spins += 1;
+        assert!(spins < 1_000_000, "gate 103: the arm never booted");
+    }
+    arm.on_venue_event(&roll(LEG_OTHER, INST_OTHER));
+
+    // ---- warm-up: every path runs ----
+    let mut acc = 0u64;
+    let mut done = [0u64; 2];
+    let mut r = 0u64;
+    while r < 2_000 || paths(&arm, done[0], done[1]).contains(&0) {
+        round(&mut arm, &mut gw, r, &mut n, &mut acc, &mut done);
+        r += 1;
+        assert!(
+            r < 200_000,
+            "gate 103: a path never ran: {:?}",
+            paths(&arm, done[0], done[1])
+        );
+    }
+
+    // ---- the window (measured) ----
+    let before = paths(&arm, done[0], done[1]);
+    let g = AllocGuard::new();
+    let end = r + ROUNDS;
+    while r < end {
+        round(&mut arm, &mut gw, r, &mut n, &mut acc, &mut done);
+        r += 1;
+    }
+    std::hint::black_box(acc);
+    let (allocs, bytes, _) = g.delta();
+    let after = paths(&arm, done[0], done[1]);
+    let mut k = 0usize;
+    while k < after.len() {
+        assert!(
+            after[k] - before[k] >= PER_ROUND[k] * ROUNDS / 100 * 99,
+            "gate 103: path {k} fell short of its script in the window: {before:?} → {after:?}"
+        );
+        k += 1;
+    }
+    assert_eq!(
+        allocs, 0,
+        "the outcome gateway arm allocated {allocs} times ({bytes} B)"
+    );
+}
+
 /// **XMM gate 97 (XH4c) — the dead-man switch and the perp rules are
 /// 0 B/op.** Both run on the engine thread from XH4f, the switch on
 /// every arm tick: `DeadMan::poll/on_event/unsent` over a scripted 55 h

@@ -163,10 +163,10 @@
 //! live generation's fills credit the leg's ledger, and a settlement books
 //! only for the slot whose order the venue accepted on the leg.
 //!
-//! Engine thread, 0 B/op after boot (gate 98, the perps mode; the outcome
-//! mode's gate comes with XH4i-3b-2): fixed tables, fixed queues, linear
-//! scans over at most [`ARM_ORDERS`] rows. The boot allocates them, and in
-//! the outcome mode its state (≈ 2.4 KiB, boxed once).
+//! Engine thread, 0 B/op after boot (gate 98, the perps mode; gate 103, the
+//! outcome mode): fixed tables, fixed queues, linear scans over at most
+//! [`ARM_ORDERS`] rows. The boot allocates them, and in the outcome mode its
+//! state (≈ 2.4 KiB, boxed once).
 
 use std::sync::Arc;
 
