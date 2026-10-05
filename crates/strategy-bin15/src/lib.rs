@@ -1599,9 +1599,12 @@ impl Bin15Strategy {
     /// Whether a price and size are on the venue's grid. The harness
     /// refuses off-grid orders outright (O3), so an arm that emitted
     /// one would be counted as a submit and never fill — a silent
-    /// hole in the member's own accounting.
+    /// hole in the member's own accounting. Public for one reader: the
+    /// cli holds it in agreement with the gateway arm's `OutcomeRules`
+    /// (XH4i-3a), which refuses what is off the grid and never rounds.
     #[inline]
-    fn on_grid(px_1e6: i64, qty_1e6: i64) -> bool {
+    #[must_use]
+    pub fn on_grid(px_1e6: i64, qty_1e6: i64) -> bool {
         px_1e6 % GRID_TICK_1E6 == 0
             && qty_1e6 % GRID_LOT_1E6 == 0
             && (GRID_PX_MIN_1E6..=GRID_PX_MAX_1E6).contains(&px_1e6)
@@ -3271,6 +3274,10 @@ mod tests {
         assert_eq!(makers.len(), 1, "the bid alone: no Yes inventory to offer");
         assert_eq!(makers[0].side, Side::Bid);
         assert_eq!(makers[0].sym, yes_sym(0), "Arm B quotes the Yes book");
+        // XH4i-3a: no order of BIN15 carries a flag — the gateway arm rests
+        // a MAKER as ALO by its kind, and the replay's queue law reads the
+        // post-only flag (`core_fill::judged_by_queue`).
+        assert!(c.orders.iter().all(|o| o.flags == 0), "BIN15 sets no flag");
         assert_eq!(makers[0].px.raw() % GRID_TICK_1E6, 0, "on the 1e-4 grid");
         assert!(makers[0].px.raw() <= 490_000, "never crossing the touch");
         assert!(m.counters().skipped_inventory > 0, "and the ask side says why");

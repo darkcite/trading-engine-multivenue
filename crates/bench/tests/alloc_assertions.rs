@@ -14105,6 +14105,7 @@ fn xmm_slot_six_through_the_router_is_zero_alloc() {
         budget_floor: 2_000,
         limit_ms: 600_000,
         leverage: 3,
+        outcomes: false,
     };
     let (eng, mut end) = hl_duplex();
     let arm = HlGatewayArm::new(&cfg, eng).expect("gate 99 arm");
@@ -15114,6 +15115,7 @@ fn hl_gateway_arm_is_zero_alloc() {
         budget_floor: 2_000,
         limit_ms: 2,
         leverage: 0,
+        outcomes: false,
     };
     let (eng, mut gw) = hl_duplex();
     let mut arm = HlGatewayArm::new(&cfg, eng).expect("the arm");

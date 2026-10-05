@@ -10769,6 +10769,134 @@ asset.rs `a_balance_coin_names_its_leg_by_the_same_rule`; recon.rs
 `a_leg_at_cost_is_its_basis_clamped_to_what_it_can_pay`; bench gate 96b's
 outcome variant.
 
+### XH4i-3a amendment (2026-10-05): the gateway arm's outcome mode — rows, rules, rolls and verbs; nothing wired, nothing armed
+
+The gateway arm learns BIN15's legs. Nothing builds an outcome arm in
+production yet (XH4i-5 composes slot 3's), and slot 3 stays on the
+blocking arm until Anton flips its transport. **An outcome arm must not be
+composed before XH4i-3b and XH4i-4:** today a fill on a leg is dropped as
+`fills_unresolved` (`perp_of_asset` finds no perp), and the account's worth
+is still the perp formula. Fills on legs, settlements and the snapshot rule
+are XH4i-3b.
+
+- **One roll reader, one binder (A-S7-77).** The `InstrumentRoll` reading
+  (`asset::roll_of`: a strict kind byte; a settled roll binds nothing; no
+  outcome is refused) and the both-legs binder (`AssetTable::bind_roll`:
+  ids, names and room checked before the first mutation; the NO leg's
+  ordinal guarded against a carry into the venue byte; a repeat of the live
+  roll retires nothing) moved out of `HlExchange::on_venue_event` into
+  `asset.rs`. The blocking arm calls them, and its roll tests hold its
+  behaviour, with one unreachable exception: a `bind` failure after the
+  precheck used to queue its E-8 sweeps and now queues none, since nothing
+  was rebound.
+- **`ArmCfg::outcomes`** stands alone: no perp and no leverage beside it
+  (`ArmErr::Outcomes`). A perps arm still needs a perp, and it reads no
+  roll. The mode's state — the 32-leg `AssetTable` and its counters,
+  ≈ 2.4 KiB — is the one allocation it adds, boxed once at boot; the arm
+  stays 1 792 B inline.
+- **LAW E-4 on the gateway.** A place or a modify takes its asset from the
+  roll's binding for the instance its client id names — the id's low 32
+  bits (`core_types::instance_of`), which BIN15 writes through its shared
+  `OID_INSTANCE_MASK`. **Only BIN15 may be composed on an outcome arm:**
+  another member's ids would name instances it never meant. A stale
+  instance is refused (`NoLiveRoute`, as the blocking arm answers) and is
+  the one refusal the streak counts (A-S7-74). A leg no roll bound is
+  refused uncounted. A modify must stay on its predecessor's leg.
+- **`OutcomeRules` checks and never rounds:** tick 1e-4, whole contracts,
+  a price in [0.001, 0.999], $1 of notional. These are the venue's
+  measured rules, as BIN15's grid states them; the member keeps to the grid,
+  so a refusal here is a bug and is counted. The cli holds BIN15's `GRID_*`
+  equal to these at compile time, and a sweep of every price around the
+  grid pins `Bin15Strategy::on_grid` and `OutcomeRules::check` to one
+  answer.
+- **The queue law is untouched.** A MAKER rests as ALO whatever its flags,
+  because BIN15 sends none (pinned on BIN15's Arm B orders). The replay
+  judges an order by the queue only when the post-only flag is set
+  (`core_fill::judged_by_queue`), so the live mapping never needs it
+  (pinned). An IoC is an IoC. A leg takes no reduce-only and bids no ALO
+  priority.
+- **No TTL on a leg (A-S7-73).** On the blocking arm BIN15's orders rested
+  until they were replaced or cancelled, and they still do. `expiresAfter`
+  rides on every place and modify, as on slot 6.
+- **A cancel names the asset its row's place named (A-S7-75)**, with no new
+  lookup. The order lives on that asset, so the cancel can only name our
+  own order. The blocking arm refuses the cancel of a rolled order and
+  leaves it to its E-8 sweep; this is the safer of the two.
+- **LAW E-8 on the gateway (A-S7-76).** A roll that retires a leg cancels
+  every row of ours on it the venue may hold — sent, resting, in doubt or
+  thought gone, YES or NO — except one already filling or one whose cancel
+  is out; a full ring keeps the cancel as intent. Every such row, the one
+  whose cancel is out included, is marked `RB_RETIRED` (A-S7-78): when the
+  venue answers "not found" about an order that still rests, the read that
+  lists it brings the row back and sends the cancel again, as for a
+  member's own. The roll also reads the orders at once. Three qualifiers:
+  - Anything else of the slot's left on the old leg is listed and
+    `unlisted_order` cancels it under the venue's own name (S7-L1) **only
+    once slot 3's gateway is built `with_outcomes` (XH4i-5)**. Before that
+    the row reads `ASSET_UNKNOWN` and is counted, not cancelled.
+  - After boot, an order the arm does not hold also pins the drift, so the
+    router halts the slot.
+  - The sweep is slot-masked; the blocking arm's sweep names `ALL_SLOTS`.
+    One arm is one slot, and only slot 3 trades legs.
+- **The owner** of a leg (what a settlement is attributed by, XH4i-3b) is
+  learned from our own accepted orders, never from a roll or a fill, as on
+  the blocking arm. One arm is one slot and its table is its own, so no leg
+  can be contested: `debug_assert!`, not the blocking arm's
+  `owner_contested` count (A-S7-79).
+- **Rows** carry the asset and symbol their command named. On slot 6
+  these are the same `cfg.perps[p]` values its reads took before, so slot 6
+  is byte-identical.
+- **BIN15's client ids can fall in the arm's internal ranges.** Its null
+  arm sets bit 63, and a sequence with bit 13 set sets bit 62, so for
+  example `READ_OID_BASE | outcome`. An order's answers carry a command kind
+  and internal posts carry none, so the order is routed as an order
+  (pinned).
+- **Allocation (A-S7-80).** The outcome mode's per-order and roll paths
+  allocate nothing by construction (reviewed). Its 0 B/op gate comes with
+  its fills in XH4i-3b, and covers the roll binder both arms now share.
+  Gate 98 runs the perps mode.
+- **What XH4i-3b must hold** (the risk review's): an outcome fill resolves
+  by its row first — the asset and symbol `track` stored — cross-checked
+  against the event's asset; the previous generation (`sym_of_asset_gen`)
+  only when a previous name is held, and `book_qty` on the current
+  generation only; `ASSET_UNKNOWN` is ruled out before `kind_of`, and
+  `perp_of_asset` is never asked in the outcome mode. A settlement is the
+  foreign slot's `REASON_SETTLEMENT` with no client id: booked
+  (`FILL_FLAG_SETTLEMENT`, the venue's `order_id`, the slot stamped) only
+  when `owner_of_sym` is this slot, otherwise counted unowned; the perps arm
+  is unchanged. The snapshot rule (A-S7-72): the gateway emits the first
+  snapshot's rows only on outcome maps, flagged, their tids admitted; the
+  arm books them once, on bound legs; XH4i-4 never seeds the ledger from the
+  sheet. A late fill that crosses a roll books against its row's retired
+  leg.
+
+**Gates (s8-3a-g4, 2026-10-05, on r2):** clippy clean; nextest 4 232 run
+(+11 over XH4i-2: nine arm.rs outcome tests, the rules test, the cli grid
+sweep), 4 232 passed — the userws loopback flake (A-S7-34) failed once on
+g3 and passed on its re-run; alloc 112; copy-audit 28 baselined, 0 new;
+license 663; release builds; replay 7× IDENTICAL (BIN15 included); fmt
+clean. **Red first:** against the scaffolding
+(`s8/c3a-red.sh` red4), the roll, maker, refusal, E-8, modify and id-range
+tests failed while the stand-alone, rules and blocking-arm roll tests
+passed; round 2's `an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order`
+failed — "the owed cancel goes again" — before `RB_RETIRED` (`s8/c3a2-red.sh`
+red1).
+
+**Tests:** arm.rs `the_outcome_mode_stands_alone`,
+`a_created_roll_binds_both_legs_and_nothing_else_does`,
+`an_outcome_maker_with_no_flags_rests_as_alo_on_its_bound_leg`,
+`outcome_orders_refuse_a_rolled_or_unbound_instance_and_an_off_grid_price`,
+`a_roll_cancels_our_rows_on_the_leg_it_retires_and_reads_the_orders`,
+`an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order`,
+`an_e8_sweep_cancels_every_row_on_the_retired_legs_and_nothing_else`,
+`an_outcome_modify_stays_on_its_leg_and_never_crosses_a_roll`,
+`an_order_whose_id_falls_in_the_arm_s_own_ranges_is_still_an_order`;
+rules.rs `an_outcome_leg_is_checked_never_rounded`; cli
+`bin15_s_grid_test_and_the_outcome_rules_agree` and `bin15_boot`'s
+compile-time agreement; strategy-bin15's no-flag pin in
+`arm_b_quotes_the_bid_and_asks_only_against_inventory`; the blocking arm's
+roll tests (exchange.rs) unchanged.
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

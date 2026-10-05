@@ -1132,6 +1132,7 @@ pub const fn arm_cfg(slot: u8, expires_after_ms: u16, recon_ms: u64, budget_floo
         budget_floor,
         limit_ms: LIMIT_MS,
         leverage: LEVERAGE,
+        outcomes: false,
     }
 }
 
