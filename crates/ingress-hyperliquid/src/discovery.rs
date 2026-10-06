@@ -710,6 +710,15 @@ impl Default for HlDiscovery {
 /// Capacity of [`HlOutcomeSpec::underlying`].
 pub const HL_OUTCOME_UNDERLYING_MAX: usize = 15;
 
+/// **A-S7-47** — the widest deployer venue name an outcome spec keeps
+/// (`"venue":"out"`; testnet's widest of 95 is 5 B, 2026-10-06). A wider
+/// one is kept as a stranger's: it names no family's deployer.
+pub const HL_OUTCOME_VENUE_MAX: usize = 8;
+
+/// [`HlOutcomeSpec::venue_len`] of a row naming a venue that is empty or
+/// wider than [`HL_OUTCOME_VENUE_MAX`]: a stranger, never native.
+const VENUE_STRANGER: u8 = u8::MAX;
+
 /// Deployer grammar of a HIP-4 outcome `description`.
 ///
 /// A HIP-4 market carries its whole economics — underlying, strike,
@@ -753,7 +762,12 @@ pub struct HlOutcomeSpec {
     pub underlying_len: u8,
     /// Underlying coin bytes (`perp:` / `underlying:`), left-aligned.
     pub underlying: [u8; HL_OUTCOME_UNDERLYING_MAX],
-    // 3 bytes of interior padding here — the `i64` below is 8-aligned.
+    /// A-S7-47: bytes of [`Self::venue`] in use — 0 when the row names no
+    /// deployer venue (HyperCore's own), `u8::MAX` when the venue is empty,
+    /// no string or does not fit (a stranger's). Set by [`Self::set_venue`].
+    pub venue_len: u8,
+    /// Explicit interior padding — the `i64` below is 8-aligned.
+    _pad0: [u8; 2],
     /// Strike/target ×1e6 (`threshold:` / `target:` / `targetPrice:`);
     /// 0 = absent.
     pub strike_1e6: i64,
@@ -766,11 +780,16 @@ pub struct HlOutcomeSpec {
     pub twap_s: u32,
     /// Recurrence period in seconds (`period:`); 0 = absent.
     pub period_s: u32,
+    /// A-S7-47: the deployer's venue (`"venue"`, the row's or the
+    /// `outcomeCreated` push's), left-aligned — the family's fourth
+    /// clause ([`crate::family::HlFamilyTable::match_spec`]).
+    pub venue: [u8; HL_OUTCOME_VENUE_MAX],
     /// Explicit tail padding.
-    _pad: [u8; 16],
+    _pad: [u8; 8],
 }
 
 const _: () = assert!(::core::mem::size_of::<HlOutcomeSpec>() == 64);
+const _: () = assert!(::core::mem::offset_of!(HlOutcomeSpec, venue) == 48);
 
 impl HlOutcomeSpec {
     /// The all-zero spec for `outcome` — what a description with
@@ -786,7 +805,10 @@ impl HlOutcomeSpec {
             expiry_ns: 0,
             twap_s: 0,
             period_s: 0,
-            _pad: [0; 16],
+            venue_len: 0,
+            _pad0: [0; 2],
+            venue: [0; HL_OUTCOME_VENUE_MAX],
+            _pad: [0; 8],
         }
     }
 
@@ -796,6 +818,56 @@ impl HlOutcomeSpec {
         let n = self.underlying_len as usize;
         debug_assert!(n <= HL_OUTCOME_UNDERLYING_MAX);
         &self.underlying[..n.min(HL_OUTCOME_UNDERLYING_MAX)]
+    }
+
+    /// **A-S7-47** — the deployer's venue bytes; empty for a row naming no
+    /// venue and for a stranger's that did not fit ([`Self::is_native`]
+    /// tells the two apart).
+    #[inline]
+    #[must_use]
+    pub fn venue_bytes(&self) -> &[u8] {
+        let n = self.venue_len as usize;
+        if n > HL_OUTCOME_VENUE_MAX {
+            &[]
+        } else {
+            &self.venue[..n]
+        }
+    }
+
+    /// **A-S7-47** — the row names no deployer venue: HyperCore's own.
+    #[inline]
+    #[must_use]
+    pub const fn is_native(&self) -> bool {
+        self.venue_len == 0
+    }
+
+    /// **A-S7-47** — keep the deployer's `venue` (`None`: the row or push
+    /// names none — HyperCore's own). One that is empty (a `venue` key whose
+    /// value is no string reads so) or wider than [`HL_OUTCOME_VENUE_MAX`]
+    /// is kept as a stranger's: it names no family's deployer and never
+    /// reads as native. In place, no allocation; the bytes past the name are
+    /// zero (the derived `Eq` reads all eight).
+    #[inline]
+    pub fn set_venue(&mut self, venue: Option<&[u8]>) {
+        self.venue = [0; HL_OUTCOME_VENUE_MAX];
+        let Some(v) = venue else {
+            self.venue_len = 0;
+            return;
+        };
+        if v.is_empty() || v.len() > HL_OUTCOME_VENUE_MAX {
+            self.venue_len = VENUE_STRANGER;
+            return;
+        }
+        // COPY: ≤ 8 B venue name into the spec's fixed field, once a row
+        // or a push — the fixed-size fields a spec keeps, as the
+        // underlying's; rejected: borrowing (the spec outlives the rx
+        // buffer).
+        let mut k = 0usize;
+        while k < v.len() {
+            self.venue[k] = v[k];
+            k += 1;
+        }
+        self.venue_len = v.len() as u8;
     }
 }
 
@@ -1295,6 +1367,9 @@ fn parse_outcome_row(
     // body so it is subscribed at the first `Steady` instead of
     // waiting up to a whole period for the next lifecycle push.
     let mut desc: Option<(usize, usize)> = None;
+    // A-S7-47: the deployer's venue (`outcomeMeta.deployers[].venue`) —
+    // the family's fourth clause.
+    let mut venue: Option<(usize, usize)> = None;
 
     loop {
         i = skip_ws(body, i);
@@ -1334,11 +1409,15 @@ fn parse_outcome_row(
                         // Arbitrary text; the skipper is escape-aware
                         // via skip_string, and the span between the
                         // quotes is the grammar's input.
-                        let start = skip_ws(body, i);
-                        let end = skip_json_value(body, i).ok_or(HlDiscoveryErr::BadRow)?;
-                        if body.get(start) == Some(&b'"') && end > start + 1 {
-                            desc = Some((start + 1, end - 1));
-                        }
+                        let (span, end) = string_span(body, i)?;
+                        desc = span;
+                        i = end;
+                    }
+                    b"venue" => {
+                        // A value that is no string is a stranger's venue
+                        // (an empty span), never a native row.
+                        let (span, end) = string_span(body, i)?;
+                        venue = Some(span.unwrap_or((end, end)));
                         i = end;
                     }
                     _ => {
@@ -1352,11 +1431,22 @@ fn parse_outcome_row(
 
     let id = outcome.ok_or(HlDiscoveryErr::BadRow)?;
     let sides = n_sides.ok_or(HlDiscoveryErr::BadRow)?;
-    let spec = match desc {
+    let mut spec = match desc {
         Some((a, b)) if b <= body.len() => parse_outcome_spec(id, &body[a..b]),
         _ => HlOutcomeSpec::empty(id),
     };
+    spec.set_venue(venue.and_then(|(a, b)| body.get(a..b)));
     Ok(((id, sides, spec), i))
+}
+
+/// A string value's span between its quotes at `i` (`None` for a value of
+/// another kind), and where the value ends. Escape-aware via
+/// `skip_json_value`.
+fn string_span(body: &[u8], i: usize) -> Result<(Option<(usize, usize)>, usize), HlDiscoveryErr> {
+    let start = skip_ws(body, i);
+    let end = skip_json_value(body, i).ok_or(HlDiscoveryErr::BadRow)?;
+    let span = (body.get(start) == Some(&b'"') && end > start + 1).then_some((start + 1, end - 1));
+    Ok((span, end))
 }
 
 // ---------------------------------------------------------------
@@ -1901,6 +1991,40 @@ mod tests {
         assert_eq!(d.resolve(b"#10812"), None);
         // Unknown outcome id 9999.
         assert_eq!(d.resolve(b"#99990"), None);
+    }
+
+    /// A-S7-47: a row's deployer venue is kept beside its economics — the
+    /// `out` venue's, none (HyperCore's own), or a stranger's that does not
+    /// fit (never native).
+    #[test]
+    fn outcome_rows_keep_their_deployer_s_venue() {
+        let mut d = HlDiscovery::new();
+        let body = br#"{"deployers":[],"outcomes":[
+          {"outcome":2649,"name":"template:binaryPrice","description":"perp:BTC|seconds:60|threshold:77177|time:20260912-0630","sideSpecs":[{"name":"Yes"},{"name":"No"}],"venue":"out"},
+          {"outcome":2650,"name":"Recurring","description":"class:priceBinary|underlying:BTC|expiry:20261007-0300|targetPrice:85620|period:1d","sideSpecs":[{"name":"Yes"},{"name":"No"}]},
+          {"outcome":2651,"name":"x","description":"perp:BTC|seconds:60|threshold:1|time:20260912-0630","sideSpecs":[{"name":"Yes"},{"name":"No"}],"venue":"averylongvenue"}]}"#;
+        assert_eq!(d.ingest_outcome_meta(body).unwrap(), 3);
+        let specs = d.outcome_specs();
+        assert_eq!(
+            (specs[0].venue_bytes(), specs[0].is_native()),
+            (&b"out"[..], false)
+        );
+        assert_eq!(
+            (specs[1].venue_bytes(), specs[1].is_native()),
+            (&b""[..], true)
+        );
+        assert_eq!(
+            (specs[2].venue_bytes(), specs[2].is_native()),
+            (&b""[..], false),
+            "a stranger's, kept as one"
+        );
+        let mut n = HlDiscovery::new();
+        let nulled = br#"{"outcomes":[{"outcome":2652,"description":"class:priceBinary|underlying:BTC|expiry:20261007-0300|targetPrice:85620|period:1d","sideSpecs":[{"name":"Yes"},{"name":"No"}],"venue":null}]}"#;
+        assert_eq!(n.ingest_outcome_meta(nulled).unwrap(), 1);
+        assert!(
+            !n.outcome_specs()[0].is_native(),
+            "a venue that is no string is a stranger's"
+        );
     }
 
     #[test]

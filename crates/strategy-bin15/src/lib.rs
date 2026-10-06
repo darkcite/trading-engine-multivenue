@@ -723,7 +723,28 @@ pub struct Bin15Strategy {
     /// The regime label set the set stamps; carried, never consulted
     /// (the HORIZON law).
     regime_label: core_types::RegimeLabelSet,
+    /// XH4i-6 (Q1): what a gateway arm's late refusal restores (its own
+    /// cache lines).
+    undo: QuoteUndo,
 }
+
+/// XH4i-6 (Q1) — what a gateway arm's late refusal restores. A gateway arm
+/// answers `Ok` when it has QUEUED a verb; its refusal comes later, as a
+/// `REJECTED` event. Its own 19 cache lines (the allocation review: an
+/// accepted reprice writes a leg here, and a leg never straddles two lines).
+#[repr(C, align(64))]
+struct QuoteUndo {
+    /// Each quote side's leg as it stood before its last reprice.
+    legs: [[PendingLeg; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
+    /// That leg's centre.
+    centre_1e6: [[i64; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
+    /// Each family's coverage entry in flight (its IoC's client id; 0:
+    /// none) — a late refusal of it lets the entry retry.
+    cover_oid: [u64; BIN15_MAX_FAMILIES],
+}
+
+const _: () = assert!(core::mem::size_of::<QuoteUndo>() == 1_216);
+const _: () = assert!(core::mem::offset_of!(Bin15Strategy, undo) % 64 == 0);
 
 impl Default for Bin15Strategy {
     fn default() -> Self {
@@ -751,6 +772,11 @@ impl Bin15Strategy {
             orders_dropped: 0,
             configured: 0,
             regime_label: core_types::RegimeLabelSet::default(),
+            undo: QuoteUndo {
+                legs: [[PendingLeg::default(); QUOTE_SIDES]; BIN15_MAX_FAMILIES],
+                centre_1e6: [[0; QUOTE_SIDES]; BIN15_MAX_FAMILIES],
+                cover_oid: [0; BIN15_MAX_FAMILIES],
+            },
         }
     }
 
@@ -1842,6 +1868,9 @@ impl Bin15Strategy {
             self.emit_take(ctx, idx, want_yes, Side::Bid, px, qty, now, false);
             if self.counters.takes_submitted != before {
                 self.fam[idx].covered = 1;
+                // XH4i-6 (Q1): which take is the coverage entry — a late
+                // venue refusal of it (a gateway's `REJECTED`) lets it retry.
+                self.undo.cover_oid[idx] = self.fam[idx].pend_take.oid;
             }
             return;
         }
@@ -2216,6 +2245,13 @@ impl Bin15Strategy {
             // back — crediting before the attempt would free room for
             // an order that is still resting if the modify is refused.
             self.credit_unfilled(idx, &old);
+            // XH4i-6 (Q1): on a gateway arm "took it" means queued — the
+            // leg as it stood is what a late refusal restores.
+            // COPY: the 64 B leg into its undo slot, once per accepted
+            // reprice — rejected: saving fields one by one (the restore
+            // needs the whole leg).
+            self.undo.legs[idx][side_idx] = old;
+            self.undo.centre_1e6[idx][side_idx] = self.fam[idx].last_quote_p_1e6[side_idx];
         }
         // BIN15 P2 (F2): a resting BID reserves cap room; an ASK is
         // sold against inventory already paid for and reserves nothing.
@@ -2541,6 +2577,109 @@ impl Bin15Strategy {
         self.day_notional_1e6 = (self.day_notional_1e6 - back).max(0);
     }
 
+    /// XH4i-6 (Q1) — a venue refusal a gateway arm reports late (its `Ok`
+    /// meant queued; the blocking arm's synchronous `Err` came at once),
+    /// handled as that `Err` was:
+    /// - a take is written off as an unfilled one (its room back), and a
+    ///   coverage entry's lets the entry retry;
+    /// - a refused reprice restores the leg as it stood — the old order
+    ///   still rests: its reservation, its price and its centre come back;
+    /// - a refused fresh quote frees its side (its room back), and a
+    ///   reprice that cannot be restored cancels the old order, never
+    ///   leaves it stranded.
+    ///
+    /// The blocking arm, paper and the replays send this member no event:
+    /// replay-neutral by construction.
+    fn on_rejected<C: Ctx>(&mut self, ctx: &mut C, oid: u64, now: NsTs) {
+        let mut i = 0usize;
+        while i < self.params.n_families {
+            if self.fam[i].pend_take.live() && self.fam[i].pend_take.oid == oid {
+                let leg = self.fam[i].pend_take;
+                self.fam[i].pend_take = PendingLeg::default();
+                self.credit_unfilled(i, &leg);
+                if leg.filled_1e6 == 0 {
+                    self.counters.takes_unfilled = self.counters.takes_unfilled.wrapping_add(1);
+                }
+                if self.undo.cover_oid[i] == oid {
+                    self.undo.cover_oid[i] = 0;
+                    self.fam[i].covered = 0;
+                }
+                return;
+            }
+            let mut s = 0usize;
+            while s < QUOTE_SIDES {
+                if self.fam[i].pend_quote[s].live() && self.fam[i].pend_quote[s].oid == oid {
+                    // COPY: the refused 64 B leg and its undo, once a refusal
+                    // — the slot is rewritten before the leg's credit.
+                    let leg = self.fam[i].pend_quote[s];
+                    self.credit_unfilled(i, &leg);
+                    let undo = self.undo.legs[i][s];
+                    if leg.prev_oid != 0 && undo.oid == leg.prev_oid && leg.filled_1e6 == 0 {
+                        // The old order rests on, whole (a reprice needs an
+                        // unfilled leg): its reservation is booked again —
+                        // an ask's is 0.
+                        self.fam[i].notional_instance_1e6 = self.fam[i]
+                            .notional_instance_1e6
+                            .saturating_add(undo.booked_notional_1e6);
+                        self.day_notional_1e6 = self
+                            .day_notional_1e6
+                            .saturating_add(undo.booked_notional_1e6);
+                        self.fam[i].pend_quote[s] = undo;
+                        self.fam[i].last_quote_p_1e6[s] = self.undo.centre_1e6[i][s];
+                        self.undo.legs[i][s] = PendingLeg::default();
+                        self.counters.quotes_modify_refused =
+                            self.counters.quotes_modify_refused.wrapping_add(1);
+                    } else {
+                        self.fam[i].pend_quote[s] = PendingLeg::default();
+                        // The side quotes again at the next price, as after
+                        // the blocking arm's synchronous refusal (risk
+                        // review r1): no centre is left to wait out.
+                        self.fam[i].last_quote_p_1e6[s] = 0;
+                        self.orders_dropped = self.orders_dropped.wrapping_add(1);
+                        if leg.prev_oid != 0 {
+                            let req = CancelReq::new(
+                                now,
+                                VenueId::Hyperliquid,
+                                self.fam[i].sym_yes,
+                                leg.prev_oid,
+                            );
+                            let _ = ctx.cancel(req);
+                        }
+                    }
+                    return;
+                }
+                s += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// XH4i-6 (risk review r1) — a quote leg the venue says is gone: the
+    /// arm's own cancel (a roll's E-8 sweep, a halt), or the original of a
+    /// refused reprice the venue dropped with it (no phantom restore). Its
+    /// side is freed as `cancel_quote` frees it, with no cancel to send; a
+    /// leg the member already let go matches nothing. A gateway arm's alone,
+    /// as `on_rejected`: replay-neutral.
+    fn on_canceled(&mut self, oid: u64) {
+        let mut i = 0usize;
+        while i < self.params.n_families {
+            let mut s = 0usize;
+            while s < QUOTE_SIDES {
+                if self.fam[i].pend_quote[s].live() && self.fam[i].pend_quote[s].oid == oid {
+                    // COPY: the gone 64 B leg, once — the slot is cleared
+                    // before the leg's credit.
+                    let leg = self.fam[i].pend_quote[s];
+                    self.fam[i].pend_quote[s] = PendingLeg::default();
+                    self.fam[i].last_quote_p_1e6[s] = 0;
+                    self.credit_unfilled(i, &leg);
+                    return;
+                }
+                s += 1;
+            }
+            i += 1;
+        }
+    }
+
     /// Move one leg's position. A buy adds, a sell reduces, and a sell
     /// can never take a side below zero — the venue has no short.
     fn apply_position(&mut self, idx: usize, is_yes: bool, buy: bool, qty_1e6: i64) {
@@ -2719,6 +2858,24 @@ impl Strategy for Bin15Strategy {
             return;
         }
         self.book_fill(fill);
+    }
+
+    /// XH4i-6 (Q1): a venue's verdict reported late — only a gateway arm
+    /// sends this member one; a `REJECTED` is the blocking arm's `Err`
+    /// (`on_rejected`), a `CANCELED` a quote gone without the member's
+    /// cancel (`on_canceled`, risk review r1). Every other kind changes
+    /// nothing here.
+    fn on_order_event<C: Ctx>(&mut self, event: &core_types::OrderEvent, ctx: &mut C) {
+        if self.configured == 0 {
+            return;
+        }
+        match event.kind {
+            core_types::ORDER_EVENT_REJECTED => {
+                self.on_rejected(ctx, event.client_oid, event.ts_ns);
+            }
+            core_types::ORDER_EVENT_CANCELED => self.on_canceled(event.client_oid),
+            _ => {}
+        }
     }
 
     fn on_ai<C: Ctx>(&mut self, cmd: &core_types::AiCmd, _ctx: &mut C) {
@@ -5025,6 +5182,100 @@ mod tests {
         assert_eq!(m.counters().skipped_entry_elapsed, 1);
         assert_eq!(f.entry_first_ok_ts, at(64), "the counterfactual still records it");
         assert_eq!(iocs(&c), 0);
+    }
+
+    /// XH4i-6 (Q1): a reprice the venue refused late — a gateway's
+    /// `REJECTED` — restores the quote as it stood (the old order rests on):
+    /// its price, its reservation, its centre; and once the venue says that
+    /// order is gone too (`CANCELED`), its side is freed (risk review r1).
+    #[test]
+    fn a_refused_reprice_reported_late_restores_the_resting_quote() {
+        let mut m = member(FAMILY_OUT_15M);
+        let mut c = ctx();
+        live_family(&mut m, &mut c, 490_000, 510_000);
+        let first = m.family(0).expect("f").pend_quote[0];
+        assert!(first.live(), "a bid is resting");
+        m.on_tick(
+            &tick(
+                yes_sym(0),
+                460_000,
+                480_000,
+                1_000_000_000,
+                at(62) + 500_000_000,
+                false,
+            ),
+            &mut c,
+        );
+        assert_eq!(c.modifies.len(), 1, "a reprice went out");
+        let repl = c.modifies[0].1;
+        let after = *m.family(0).expect("f");
+        let mut refused = core_types::OrderEvent::ZERO;
+        refused.client_oid = repl.client_oid;
+        refused.kind = core_types::ORDER_EVENT_REJECTED;
+        refused.reason = core_types::ORDER_EVENT_REASON_BAD_ALO_PX;
+        m.on_order_event(&refused, &mut c);
+        let f = *m.family(0).expect("f");
+        assert_eq!(
+            (
+                f.pend_quote[0].oid,
+                f.pend_quote[0].px_1e6,
+                f.pend_quote[0].booked_notional_1e6
+            ),
+            (first.oid, first.px_1e6, first.booked_notional_1e6),
+            "the old quote rests on"
+        );
+        assert_eq!(
+            f.notional_instance_1e6,
+            after.notional_instance_1e6 - after.pend_quote[0].booked_notional_1e6
+                + first.booked_notional_1e6,
+            "its reservation is back, the refused one's gone"
+        );
+        assert_eq!(m.counters().quotes_modify_refused, 1);
+        // The venue drops the old order too: its side is freed and its
+        // reservation is back — no phantom quote.
+        let mut gone = core_types::OrderEvent::ZERO;
+        gone.client_oid = first.oid;
+        gone.kind = core_types::ORDER_EVENT_CANCELED;
+        m.on_order_event(&gone, &mut c);
+        let g = *m.family(0).expect("f");
+        assert!(!g.pend_quote[0].live(), "freed");
+        assert_eq!(
+            g.notional_instance_1e6,
+            f.notional_instance_1e6 - first.booked_notional_1e6
+        );
+    }
+
+    /// XH4i-6 (Q1): a coverage entry the venue refused late — an IoC that
+    /// found nothing, a gateway's `REJECTED` — is written off and retried,
+    /// as the blocking arm's synchronous `Err` let it.
+    #[test]
+    fn a_coverage_entry_the_venue_refused_late_retries() {
+        let (mut m, mut c) = s5_member(1, 0, 600);
+        m.on_tick(
+            &tick(no_sym(0), 340_000, 350_000, 1_000_000_000, at(61), false),
+            &mut c,
+        );
+        s5_snapshot(&mut m, &mut c, S5_UP, yes_sym(0), 63);
+        assert_eq!((iocs(&c), m.family(0).expect("f").covered), (1, 1));
+        let entry = m.family(0).expect("f").pend_take.oid;
+        // The gateway's IoC miss (`exec_hyperliquid::event::REASON_IOC_MISS`).
+        let mut missed = core_types::OrderEvent::ZERO;
+        missed.client_oid = entry;
+        missed.kind = core_types::ORDER_EVENT_REJECTED;
+        missed.reason = 12;
+        m.on_order_event(&missed, &mut c);
+        let f = *m.family(0).expect("f");
+        assert_eq!(
+            (f.covered, f.pend_take.live()),
+            (0, false),
+            "written off, free to retry"
+        );
+        m.on_venue_event(&mark_event(S5_UP, at(64)), &mut c);
+        assert_eq!(
+            (iocs(&c), m.family(0).expect("f").covered),
+            (2, 1),
+            "the entry retried"
+        );
     }
 
     /// BIN15 S5b: a complete run whose emit was REFUSED (the ring full)

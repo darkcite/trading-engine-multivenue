@@ -3879,7 +3879,7 @@ fn run(args: RunArgs) -> ExitCode {
         cli::ExecObs {
             modes: m,
             binance: b.binance_slot().is_some(),
-            gateway: b.gateway_live().is_some(),
+            gateway: b.gateway_live().is_some() || b.bin15_gateway_live(),
         }
     });
     // BX6: a live slot names binance — its arm reads the marks (O-BX29).
@@ -3921,12 +3921,17 @@ fn run(args: RunArgs) -> ExitCode {
         latency_dump_dir.clone(),
         args.latency_dump_secs,
     ));
-    // XMM XH4f (D11): slot 6's gateway-arm tell, when slot 6 is live on the
-    // gateway.
-    obs.xmm_gateway_tell = exec_boot
-        .as_ref()
-        .filter(|b| b.gateway_live().is_some())
-        .map(|b| cli::xmm_live::shutdown_tell_path(&b.path));
+    // XMM XH4f (D11): the gateway arm's tell — slot 6's when slot 6 is live
+    // on its gateway, slot 3's when slot 3 is (XMM XH4i-5; never both).
+    obs.xmm_gateway_tell = exec_boot.as_ref().and_then(|b| {
+        if b.gateway_live().is_some() {
+            Some(cli::xmm_live::shutdown_tell_path(&b.path))
+        } else if b.bin15_gateway_live() {
+            Some(cli::bin15_live::shutdown_tell_path(&b.path))
+        } else {
+            None
+        }
+    });
     if args.latency_dump_secs > 0 {
         info!(
             secs = args.latency_dump_secs,
@@ -4893,6 +4898,8 @@ fn run(args: RunArgs) -> ExitCode {
     // XMM XH4f: slot 6's gateway thread's owner — set when its arm boots,
     // released after the loop (or on a boot abort past that point).
     let mut xmm_stop: Option<cli::xmm_live::GatewayStop> = None;
+    // XMM XH4i-5: slot 3's gateway thread's owner, alike.
+    let mut bin15_stop: Option<cli::xmm_live::GatewayStop> = None;
     let result = match (strategy_choice, args.live) {
         // HYPARB H0 (O-H1): `latency-arb` has no arm any more — slot 0
         // is the hyparb set member and the old name falls through to
@@ -5576,6 +5583,43 @@ fn run(args: RunArgs) -> ExitCode {
                     // right after `resolve`, XH5b-3); it draws from its
                     // agent's nonce stream (XH4h S3). Booted last: no
                     // refusal after it but the shapes' own.
+                    // **XMM XH4i-5 — slot 3's own arm, the Hyperliquid
+                    // gateway in its outcome mode**, when the artifact puts
+                    // slot 3 there (`transport = "gateway"`; the default is
+                    // the blocking arm): BIN15's legs off the engine thread,
+                    // on the operator's account (`exec_boot` refused it
+                    // beside the blocking arm and beside slot 6's gateway).
+                    // Its thread is released after the loop, as slot 6's.
+                    let bin15_gw = if eb.bin15_gateway_live() {
+                        match cli::bin15_live::boot_bin15_arm(
+                            &eb,
+                            bin15_boot.as_ref(),
+                            &cfg.hyperliquid_ws_host,
+                            TlsTransport::default_client_config(),
+                            &mut nonces,
+                        ) {
+                            Ok(b) => {
+                                warn!("{}", b.tell);
+                                bin15_stop = Some(b.stop);
+                                handles.push(b.handle);
+                                Some(b.arm)
+                            }
+                            Err(reason) => {
+                                error!(%reason, "bin15: slot 3's gateway arm refused — boot aborted");
+                                join_reverse(handles);
+                                return ExitCode::from(1);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // The innermost split's slot: 3 with its arm; none
+                    // (`NO_SLOT`) without — every verb to the shape's arms.
+                    let bin15_slot = if bin15_gw.is_some() {
+                        cli::exec_boot::BIN15_SLOT as u8
+                    } else {
+                        exec_router::NO_SLOT
+                    };
                     let xmm_arm = if eb.gateway_live().is_some() {
                         let spec = cli::xmm_live::XmmSpec {
                             eb: &eb,
@@ -5595,6 +5639,9 @@ fn run(args: RunArgs) -> ExitCode {
                             }
                             Err(reason) => {
                                 error!(%reason, "xmm: slot 6's gateway arm refused — boot aborted");
+                                if let Some(s) = &bin15_stop {
+                                    s.release();
+                                }
                                 join_reverse(handles);
                                 return ExitCode::from(1);
                             }
@@ -5642,13 +5689,16 @@ fn run(args: RunArgs) -> ExitCode {
                             )
                         }};
                     }
-                    // A refusal past the arms' boot: slot 6's gateway (if
-                    // any) is released first, so the join never waits out
-                    // its grace.
+                    // A refusal past the arms' boot: slot 3's or slot 6's
+                    // gateway (if any; never both) is released first, so the
+                    // join never waits out its grace.
                     macro_rules! abort_boot {
                         ($($log:tt)*) => {{
                             error!($($log)*);
                             if let Some(s) = &xmm_stop {
+                                s.release();
+                            }
+                            if let Some(s) = &bin15_stop {
                                 s.release();
                             }
                             join_reverse(handles);
@@ -5676,7 +5726,10 @@ fn run(args: RunArgs) -> ExitCode {
                     // `dyn`. `bn(<specs>, <hops>)` names a shape's Binance
                     // symbols and the path from the shape to its
                     // `VenueSplit`, whose aliases the Binance arm finishes
-                    // with; slot 6's split adds one `a()`. A halt cancels
+                    // with; slot 6's split adds one `a()`, slot 3's one more
+                    // (XMM XH4i-5: innermost, `SlotSplit(3, <shape>,
+                    // Option<arm>)` — no slot, `NO_SLOT`, when its gateway
+                    // arm is absent — so the compositions stay sixteen). A halt cancels
                     // the halted slot's orders alone (XH5a,
                     // `OrderDispatch::cancel_slot`), through every nesting.
                     macro_rules! shape {
@@ -5693,13 +5746,14 @@ fn run(args: RunArgs) -> ExitCode {
                             // chase a pointer).
                             match xmm_arm {
                                 None => {
-                                    let inner = $inner;
+                                    let inner =
+                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw);
                                     let mut d = exec_router::RoutedDispatcher::new(
                                         eb.route, paper, inner, anchor,
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     enter_loop!(d, $what)
@@ -5707,7 +5761,7 @@ fn run(args: RunArgs) -> ExitCode {
                                 Some((xmm, xspecs, net)) => {
                                     let split = exec_router::SlotSplit::new(
                                         cli::exec_boot::XMM_SLOT as u8,
-                                        $inner,
+                                        exec_router::SlotSplit::new(bin15_slot, $inner, bin15_gw),
                                         xmm,
                                     );
                                     let mut d = exec_router::RoutedDispatcher::new(
@@ -5715,7 +5769,7 @@ fn run(args: RunArgs) -> ExitCode {
                                     );
                                     wire_exec_halts(&mut d, &eb, halt_mask, aliases);
                                     $(
-                                        let split_aliases = *d.live().a()$(.$hop())*.aliases();
+                                        let split_aliases = *d.live().a().a()$(.$hop())*.aliases();
                                         finish_bn!(d, split_aliases, $specs);
                                     )?
                                     finish_xmm!(d, xspecs);
@@ -5831,8 +5885,12 @@ fn run(args: RunArgs) -> ExitCode {
 
     // -- Reverse-order join (ingress threads first, then obs) --
     // XMM XH4f: the loop returned, so slot 6's arm is done with its
-    // gateway (its shutdown ran in the drain): release the thread.
+    // gateway (its shutdown ran in the drain): release the thread. XMM
+    // XH4i-5: slot 3's, alike.
     if let Some(s) = &xmm_stop {
+        s.release();
+    }
+    if let Some(s) = &bin15_stop {
         s.release();
     }
     join_reverse(handles);

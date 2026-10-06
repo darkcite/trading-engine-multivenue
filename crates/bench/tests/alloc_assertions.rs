@@ -2642,8 +2642,11 @@ fn hl_outcome_meta_parsers_are_zero_alloc() {
         acc = acc.wrapping_add(s.enc as i64);
         let (id, desc) = ingress_hyperliquid::outcome_meta_description(created).unwrap();
         acc = acc.wrapping_add(id as i64 + desc.len() as i64);
-        let spec = ingress_hyperliquid::discovery::parse_outcome_spec(id, desc);
-        acc = acc.wrapping_add(spec.strike_1e6 ^ spec.expiry_ns as i64);
+        let mut spec = ingress_hyperliquid::discovery::parse_outcome_spec(id, desc);
+        spec.set_venue(ingress_hyperliquid::outcome_meta_venue(created));
+        acc = acc.wrapping_add(
+            spec.strike_1e6 ^ spec.expiry_ns as i64 ^ spec.venue_bytes().len() as i64,
+        );
         let n = ingress_hyperliquid::discovery::parse_outcome_spec(1, native);
         acc = acc.wrapping_add(n.strike_1e6 + n.period_s as i64);
         std::hint::black_box(ingress_hyperliquid::discovery::parse_hl_time_ns(
@@ -7355,9 +7358,28 @@ fn bin15_member_roll_tick_reprice_take_is_zero_alloc() {
                 // `book_fill` — which moves the position and clears the
                 // pending — is inside the guard too.
                 if let Some(o) = ctx.last.take() {
-                    let fill =
-                        core_types::Fill::new(ts, o.sym, o.side, o.px, o.qty, o.client_oid);
-                    m.on_fill(&fill, &mut ctx);
+                    if k == 20 {
+                        // XH4i-6: once an instance a gateway's late refusal
+                        // instead of the fill (`on_rejected`: a take written
+                        // off, or a quote's side freed) …
+                        let mut ev = core_types::OrderEvent::ZERO;
+                        ev.client_oid = o.client_oid;
+                        ev.kind = core_types::ORDER_EVENT_REJECTED;
+                        m.on_order_event(&ev, &mut ctx);
+                    } else {
+                        let fill =
+                            core_types::Fill::new(ts, o.sym, o.side, o.px, o.qty, o.client_oid);
+                        m.on_fill(&fill, &mut ctx);
+                    }
+                }
+                // … and the venue's end of a resting quote (`on_canceled`).
+                if k == 30 {
+                    if let Some(q) = m.family(fam).map(|f| f.pend_quote[0].oid) {
+                        let mut ev = core_types::OrderEvent::ZERO;
+                        ev.client_oid = q;
+                        ev.kind = core_types::ORDER_EVENT_CANCELED;
+                        m.on_order_event(&ev, &mut ctx);
+                    }
                 }
                 m.on_timer(ts, &mut ctx);
             }
@@ -14127,7 +14149,17 @@ fn xmm_slot_six_through_the_router_is_zero_alloc() {
     let mut d = RoutedDispatcher::new(
         route,
         PaperDispatcher::new(),
-        SlotSplit::new(SLOT, NullLiveDispatcher::new(), arm),
+        // As the engine composes it (XMM XH4i-5): slot 3's absent gateway
+        // arm innermost, its split naming no slot.
+        SlotSplit::new(
+            SLOT,
+            SlotSplit::new(
+                exec_router::NO_SLOT,
+                NullLiveDispatcher::new(),
+                None::<HlGatewayArm>,
+            ),
+            arm,
+        ),
         core_time::WallAnchor::now(),
     );
     // As the engine binds it (XMM XH5a): slot 6's row is slot 6's.
@@ -14478,8 +14510,8 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
     use exec_hyperliquid::deadman::DeadManCfg;
     use exec_hyperliquid::event::{
         ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_POST_ITEM, EVF_RESTING, EV_ACK,
-        EV_FILL, EV_READ_DONE, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT,
-        READ_STATE, REASON_SETTLEMENT, SLOT_FOREIGN,
+        EV_BALANCE, EV_FILL, EV_READ_DONE, EV_SNAPSHOT, READ_DAY, READ_LIMIT, READ_ORDERS,
+        READ_SPOT, READ_STATE, REASON_SETTLEMENT, SLOT_FOREIGN, SPOT_LEGS_READ,
     };
     use exec_hyperliquid::gateway::HlGatewayEnd;
     use exec_hyperliquid::hl_duplex;
@@ -14492,8 +14524,9 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
     /// and one unowned settlement; two fills on the retired generation (row
     /// held, row gone); one mismatch; one refused fill; four fills booked
     /// (the two old, the live one, the settlement); two unresolved (the
-    /// mismatch, `ASSET_UNKNOWN`); one foreign row; one modify; one cancel.
-    const PER_ROUND: [u64; 15] = [1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 4, 2, 1, 1, 1];
+    /// mismatch, `ASSET_UNKNOWN`); one foreign row; one modify; one cancel;
+    /// XH4i-5: one repeat of the live roll, left alone (A-S7-83).
+    const PER_ROUND: [u64; 16] = [1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 4, 2, 1, 1, 1, 1];
     /// BIN15's first family: its YES leg (NO is the next ordinal).
     const LEG_YES: u32 = ((VenueId::Hyperliquid as u32) << 24) | 4_096;
     /// A family no order of ours trades: its settlements are unowned.
@@ -14539,12 +14572,30 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
                     venue_ms: *n,
                     ..end
                 },
-                CMD_READ_SPOT => ExecEvent {
-                    reason: READ_SPOT,
-                    px_1e8: 50_000_000_000,
-                    sz_1e8: 1,
-                    ..end
-                },
+                CMD_READ_SPOT => {
+                    // XH4i-5: one leg row a read — the untraded family's live
+                    // YES leg, a contract the ledger never booked (a drift) —
+                    // and the end counting it: `on_balance` and the legs'
+                    // comparison run every read.
+                    let leg = ExecEvent {
+                        client_oid: c.client_oid,
+                        slot: c.slot,
+                        kind: EV_BALANCE,
+                        asset: AssetTable::asset_id(INST_OTHER, 0).expect("gate 103: an id"),
+                        sz_1e8: 100_000_000,
+                        px_1e8: 30_000_000,
+                        ..ExecEvent::default()
+                    };
+                    assert!(gw.evt.emit(&leg), "gate 103: the event ring is full");
+                    ExecEvent {
+                        reason: READ_SPOT,
+                        px_1e8: 50_000_000_000,
+                        sz_1e8: 1,
+                        asset: SPOT_LEGS_READ,
+                        oid: 1,
+                        ..end
+                    }
+                }
                 CMD_READ_ORDERS => ExecEvent {
                     reason: READ_ORDERS,
                     ..end
@@ -14643,7 +14694,7 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
     }
 
     /// The paths each window must run again.
-    fn paths(arm: &HlGatewayArm, modifies: u64, cancels: u64) -> [u64; 15] {
+    fn paths(arm: &HlGatewayArm, modifies: u64, cancels: u64) -> [u64; 16] {
         let o = arm.outcome_counters().expect("gate 103: an outcome arm");
         let c = arm.counters();
         [
@@ -14662,6 +14713,7 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
             c.fills_foreign,
             modifies,
             cancels,
+            o.rolls_repeated,
         ]
     }
 
@@ -14676,12 +14728,21 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
     ) {
         let k = INST_BASE + r as u32;
         let seq = r * 4;
+        // XH4i-5: the outcome arm's report as `/state` reads it (1 Hz):
+        // every thousandth round.
+        if r % 1_000 == 0 {
+            let mut rep = clob_dispatcher::GatewayArmReport::default();
+            *acc ^= u64::from(arm.gateway_arm_report(core_time::now_ns(), &mut rep))
+                ^ rep.outcome_rolls_bound;
+        }
         let yes = AssetTable::asset_id(k, 0).expect("gate 103: an id");
         let no = AssetTable::asset_id(k, 1).expect("gate 103: an id");
         let old_yes = AssetTable::asset_id(k - 1, 0).expect("gate 103: an id");
         let old_no = AssetTable::asset_id(k - 1, 1).expect("gate 103: an id");
         // The family rolls: k binds, k − 1 retires — the last round's MAKER
         // (modified, resting) is cancelled and the orders are read.
+        arm.on_venue_event(&roll(LEG_YES, k));
+        // A-S7-83: the same roll again — left alone.
         arm.on_venue_event(&roll(LEG_YES, k));
         // The retired generation: that MAKER (its row held while its cancel
         // is out) and the last round's IoC (its row gone).
@@ -14822,6 +14883,7 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
 
     // ---- the window (measured) ----
     let before = paths(&arm, done[0], done[1]);
+    let legs_before = arm.outcome_counters().expect("gate 103").leg_reads;
     let g = AllocGuard::new();
     let end = r + ROUNDS;
     while r < end {
@@ -14839,6 +14901,10 @@ fn hl_gateway_outcome_arm_is_zero_alloc() {
         );
         k += 1;
     }
+    assert!(
+        arm.outcome_counters().expect("gate 103").leg_reads > legs_before,
+        "gate 103: the spot reads' legs were compared in the window"
+    );
     assert_eq!(
         allocs, 0,
         "the outcome gateway arm allocated {allocs} times ({bytes} B)"

@@ -6,8 +6,16 @@
 # (docs/risk-policy.md, "S7-L1 — slot 3 LIVE on Hyperliquid mainnet").
 #
 #   bin15-flip.sh status                 # what the next boot runs, and what runs now
-#   bin15-flip.sh live  [--switch-only]  # preflight, then switch + restart + verify
+#   bin15-flip.sh live  [--gateway] [--switch-only]  # preflight, then switch + restart + verify
 #   bin15-flip.sh paper [--switch-only]  # halt slot 3 now, then switch + restart + verify
+#
+# XMM XH4i-5 — `live --gateway` puts slot 3 on its own WebSocket gateway
+# arm (the outcome mode, off the engine thread) instead of the blocking
+# arm: the section gains `transport = "gateway"` and the ALO window halt
+# (XH-7), never the perp pair. The binary must carry XH4i-5, and the boot
+# refuses it beside a live slot of the blocking arm or slot 6's gateway.
+# Its session anchor is bin15-pnl-anchor-mainnet.state (archived with the
+# blocking arm's on every flip); its top-ups draw on exec-topup.state's day.
 #
 # PARITY BY CONSTRUCTION. LIVE boots the paper artifact itself with only
 # the four LIVE_SIZING lines changed: the entry law, both arms, the
@@ -58,6 +66,8 @@ B15="$MV/bin15.toml"
 PAPER_COPY="$MV/bin15.paper-s7.toml"
 HALT="$MV/exec.HALT"
 ANCHOR="$MV/exec-pnl-anchor.state"
+# XMM XH4i-5: slot 3's own anchor on its gateway arm (mainnet).
+GW_ANCHOR="$MV/bin15-pnl-anchor-mainnet.state"
 BUDGET_STATE="$MV/exec-budget.state"
 GATE_PENDING="$MV/state/exec-gate-pending"
 LOGDIR="$MV/logs"
@@ -148,8 +158,13 @@ check_exec_toml() {
 # ---- exec.toml ----------------------------------------------------------
 
 # The mode [exec.slot.3] names in FILE ("" when absent).
+# FILE KEY: KEY's quoted value in [exec.slot.3] (nothing when unset).
+slot3_key() {
+  awk -v k="$2" '/^[ \t]*\[/ { s = ($0 ~ /^[ \t]*\[exec\.slot\.3\][ \t]*(#.*)?$/) } s && $0 ~ ("^[ \t]*" k "[ \t]*=") { gsub(/.*=[ \t]*"|".*/, ""); print; exit }' "$1"
+}
+
 slot3_mode() {
-  awk '/^[ \t]*\[/ { s = ($0 ~ /^[ \t]*\[exec\.slot\.3\][ \t]*(#.*)?$/) } s && /^[ \t]*mode[ \t]*=/ { gsub(/.*=[ \t]*"|".*/, ""); print; exit }' "$1"
+  slot3_key "$1" mode
 }
 
 # FILE is shaped as the edits below assume: [exec] with enabled = 1, and
@@ -186,6 +201,13 @@ halt_on_asset_refusal_streak = 3
 halt_on_recon_stale_ms = 300000
 halt_on_gain_usd_1e6 = 0
 halt_on_loss_usd_1e6 = 54000000
+EOF
+  [ "$GATEWAY" = 1 ] || return 0
+  cat <<EOF
+# XMM XH4i-5: on its own gateway arm (the outcome mode) — no perp pair
+# (its legs are no linear rows); the post-only window halt (XH-7).
+transport = "gateway"
+halt_on_alo_reject_pct = 20
 EOF
 }
 
@@ -287,10 +309,14 @@ halt_drop_3() {
   [ -z "$kept" ] || say "exec.HALT KEEPS for a human: $kept — read the log, then archive it by hand before any live"
 }
 
+# Both transports' anchors (XMM XH4i-5): every flip ends the session.
 archive_anchor() {
-  [ -f "$ANCHOR" ] || return 0
-  mv "$ANCHOR" "$LOGDIR/exec-pnl-anchor.state.bin15-flip-$1-$TS" || die "cannot archive $ANCHOR"
-  say "session anchor archived as logs/exec-pnl-anchor.state.bin15-flip-$1-$TS"
+  local a
+  for a in "$ANCHOR" "$GW_ANCHOR"; do
+    [ -f "$a" ] || continue
+    mv "$a" "$LOGDIR/${a:t}.bin15-flip-$1-$TS" || die "cannot archive $a"
+    say "session anchor archived as logs/${a:t}.bin15-flip-$1-$TS"
+  done
 }
 
 # ---- the engine, the venue, the minute --------------------------------------
@@ -454,10 +480,18 @@ verify_live() {
   slot3_running_live || die "pid $pid does not route slot 3 live — see $ERR_LOG"
   [ "$(slot3_halt)" = none ] || die "pid $pid: slot 3 STARTED HALTED ($(slot3_halt))"
   since_err | grep -a -Eq 'ARMING slot\(s\) ([0-9]+,)*3(,[0-9]+)* via' || die "no 'ARMING slot(s) … 3' tell in $ERR_LOG"
-  line="$(since_out | grep -a "exec: hyperliquid arm ARMED" | tail -1)"
-  [ -n "$line" ] || die "no 'hyperliquid arm ARMED' tell in $OUT_LOG"
-  print -r -- "$line" | grep -q 'MAINNET' || die "the arm is not on MAINNET: $line"
-  say "pid $pid ARMED: $(print -r -- "$line" | grep -oE 'master=[^ ]*|budget_remaining=[^ ]*|boot_sweep_left=[^ ]*' | tr '\n' ' ')"
+  if [ "$GATEWAY" = 1 ]; then
+    # XMM XH4i-5: the gateway arm's tell (its numbers: exec.arms.hyperliquid_gw).
+    line="$(since_out | grep -a "bin15: LIVE ARM ARMED" | tail -1)"
+    [ -n "$line" ] || die "no 'bin15: LIVE ARM ARMED' tell in $OUT_LOG"
+    print -r -- "$line" | grep -q 'MAINNET' || die "the gateway arm is not on MAINNET: $line"
+    say "pid $pid ARMED on its gateway: $(print -r -- "$line" | grep -oE 'master 0x[0-9a-f]*' | head -1)"
+  else
+    line="$(since_out | grep -a "exec: hyperliquid arm ARMED" | tail -1)"
+    [ -n "$line" ] || die "no 'hyperliquid arm ARMED' tell in $OUT_LOG"
+    print -r -- "$line" | grep -q 'MAINNET' || die "the arm is not on MAINNET: $line"
+    say "pid $pid ARMED: $(print -r -- "$line" | grep -oE 'master=[^ ]*|budget_remaining=[^ ]*|boot_sweep_left=[^ ]*' | tr '\n' ' ')"
+  fi
   for i in {1..60}; do
     seeded="$(state_get exec.seeded)"
     [ "$seeded" = 1 ] && break
@@ -501,7 +535,7 @@ next_mode() {
 
 status() {
   print -r -- "strategy.conf: STRATEGY=$(kv_get STRATEGY) ARM_LIVE=$(kv_get ARM_LIVE) EXEC_TOML=$(kv_get EXEC_TOML)"
-  print -r -- "exec.toml [exec.slot.3] mode: $(slot3_mode "$EXEC" | grep . || print absent)"
+  print -r -- "exec.toml [exec.slot.3] mode: $(slot3_mode "$EXEC" | grep . || print absent), transport: $(slot3_key "$EXEC" transport | grep . || print blocking)"
   if is_live_cut "$B15"; then print -r -- "bin15.toml: LIVE cut $(sha "$B15")"; else print -r -- "bin15.toml: paper artifact $(sha "$B15")"; fi
   [ -f "$PAPER_COPY" ] && print -r -- "bin15.paper-s7.toml: $(sha "$PAPER_COPY") (the accrual reads it)"
   halt_names_3 && print -r -- "exec.HALT halts slot 3: $(halt_scan kept | grep . || print operator)"
@@ -544,6 +578,19 @@ live_checks() {
   case "+$(kv_get STRATEGY)+" in *+bin15+*) ;; *) die "STRATEGY=$(kv_get STRATEGY) does not run bin15" ;; esac
   arm_ok || die "ARM_LIVE=$(kv_get ARM_LIVE) is not a comma list of slots 0-7 — fix it by hand"
   check_exec_toml
+  if [ "$GATEWAY" = 1 ]; then
+    # XMM XH4i-5: the binary must carry slot 3's gateway arm, and slot 3
+    # runs on it beside slot 0 alone — the boot refuses slot 6's gateway
+    # and any live slot of the blocking arm beside it (one master, one arm).
+    grep -a -q 'bin15: LIVE ARM ARMED' "$BIN" || die "$BIN does not carry slot 3's gateway arm (XMM XH4i-5) — rebuild it first"
+    local s
+    for s in ${(s:,:)$(kv_get ARM_LIVE)}; do
+      case "$s" in
+        0|3) ;;
+        *) die "ARM_LIVE names slot $s: slot 3 on its gateway runs beside slot 0 alone (XMM XH4i-5) — flip slot $s paper first" ;;
+      esac
+    done
+  fi
   exec_shape_ok "$EXEC" || die "$EXEC lacks [exec] enabled = 1, or spells slot 3's header oddly — fix it by hand"
   halt_names_3 && die "$HALT halts slot 3 ($(halt_scan kept | grep . || print operator)) — read the log, archive it into logs/ by hand, then flip"
   [ -f "$GATE_PENDING" ] && die "daily-restart owes a gated restart ($(cat "$GATE_PENDING")) — wait for it"
@@ -560,6 +607,7 @@ flip_live() {
   cut_live "$B15" "$WORK.b15" || die "the paper artifact cannot be cut (above)"
   exec_live_into "$WORK.exec"
   [ "$(slot3_mode "$WORK.exec")" = live ] && exec_shape_ok "$WORK.exec" || die "the edited exec.toml does not set slot 3 live"
+  [ "$GATEWAY" = 0 ] || [ "$(slot3_key "$WORK.exec" transport)" = gateway ] || die "the edited exec.toml does not put slot 3 on its gateway"
   smoke
   if [ "$switch_only" != 1 ]; then
     engine_up
@@ -668,13 +716,21 @@ flip_paper() {
 [ -f "$B15" ] || die "$B15 is missing"
 [ -d "$LOGDIR" ] || die "$LOGDIR is missing"
 
+USAGE="usage: bin15-flip.sh status | live [--gateway] [--switch-only] | paper [--switch-only]"
 SWITCH_ONLY=0
-[ "${2:-}" = "--switch-only" ] && SWITCH_ONLY=1
-[ -z "${2:-}" ] || [ "$SWITCH_ONLY" = 1 ] || { print -r -- "usage: bin15-flip.sh status|live|paper [--switch-only]" >&2; exit 2; }
+GATEWAY=0
+for a in "${@[2,-1]}"; do
+  case "$a" in
+    --switch-only) SWITCH_ONLY=1 ;;
+    --gateway) GATEWAY=1 ;;
+    *) print -r -- "$USAGE" >&2; exit 2 ;;
+  esac
+done
+[ "$GATEWAY" = 0 ] || [ "${1:-}" = live ] || { print -r -- "$USAGE" >&2; exit 2; }
 
 case "${1:-}" in
   status) status ;;
-  live) say "live requested ${2:-}"; flip_live "$SWITCH_ONLY"; status ;;
-  paper) say "paper requested ${2:-}"; flip_paper "$SWITCH_ONLY"; status ;;
-  *) print -r -- "usage: bin15-flip.sh status|live|paper [--switch-only]" >&2; exit 2 ;;
+  live) say "live requested ${@[2,-1]}"; flip_live "$SWITCH_ONLY"; status ;;
+  paper) say "paper requested ${@[2,-1]}"; flip_paper "$SWITCH_ONLY"; status ;;
+  *) print -r -- "$USAGE" >&2; exit 2 ;;
 esac

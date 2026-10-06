@@ -1608,6 +1608,10 @@ fn handle_data_frame<C: Capture>(
                                             // Parsed straight into the
                                             // roll slot phase 2 reads.
                                             drv.roll_spec = parse_outcome_spec(id, desc);
+                                            // A-S7-47: its deployer's venue,
+                                            // borrowed like the description.
+                                            drv.roll_spec
+                                                .set_venue(crate::outcome_venue_field(payload));
                                             // WALL, not monotonic: the
                                             // expiry in the
                                             // description is an epoch
@@ -1615,11 +1619,23 @@ fn handle_data_frame<C: Capture>(
                                             let now = drv.wall.wall_of(now_ns());
                                             match drv.families.match_spec(&drv.roll_spec, now) {
                                                 Some(fam) => {
-                                                    let live = drv
-                                                        .families
-                                                        .get(fam)
-                                                        .map_or(0, |r| r.live.outcome);
-                                                    if live == drv.roll_spec.outcome {
+                                                    let (live, live_expiry) =
+                                                        drv.families.get(fam).map_or((0, 0), |r| {
+                                                            (r.live.outcome, r.live.expiry_ns)
+                                                        });
+                                                    if live != 0
+                                                        && live != drv.roll_spec.outcome
+                                                        && live_expiry == drv.roll_spec.expiry_ns
+                                                    {
+                                                        // A-S7-47 (risk review
+                                                        // r1): a sibling expiring
+                                                        // with the live instance is
+                                                        // no successor — the tie
+                                                        // rule of boot and
+                                                        // rediscovery, counted
+                                                        // unmatched.
+                                                        Dispatch::RollUnmatched
+                                                    } else if live == drv.roll_spec.outcome {
                                                         // Already held: a repeat
                                                         // changes nothing. The
                                                         // venue pushes a roll
@@ -3596,17 +3612,21 @@ mod tests {
     const T_0631: u64 = 1_789_194_660_000_000_000;
 
     fn spec_2649() -> HlOutcomeSpec {
-        parse_outcome_spec(
+        let mut s = parse_outcome_spec(
             2649,
             b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77177|time:20260912-0630",
-        )
+        );
+        s.set_venue(Some(crate::family::OUT_VENUE));
+        s
     }
 
     fn spec_2650() -> HlOutcomeSpec {
-        parse_outcome_spec(
+        let mut s = parse_outcome_spec(
             2650,
             b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645",
-        )
+        );
+        s.set_venue(Some(crate::family::OUT_VENUE));
+        s
     }
 
     fn spec_eth_daily() -> HlOutcomeSpec {

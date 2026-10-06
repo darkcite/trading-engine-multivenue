@@ -4606,9 +4606,9 @@ pub struct ExecObs {
     pub modes: [u8; clob_dispatcher::EXEC_COUNTER_SLOTS],
     /// A live slot names binance.
     pub binance: bool,
-    /// **XMM XH4f** — slot 6 is live on the Hyperliquid gateway: the
-    /// `engine_exec_hlgw_*` family registers (and the router counters its
-    /// marks and retirements move).
+    /// **XMM XH4f** — slot 6 (or slot 3, XMM XH4i-5) is live on the
+    /// Hyperliquid gateway: the `engine_exec_hlgw_*` family registers (and
+    /// the router counters its marks and retirements move).
     pub gateway: bool,
 }
 
@@ -6161,7 +6161,7 @@ fn mirror_exec_metrics(
 // ---------------------------------------------------------------
 
 /// The hlgw family's counters.
-const HLGW_COUNTERS: usize = 71;
+const HLGW_COUNTERS: usize = 88;
 /// The hlgw family's level gauges (the tell's gauge is registered apart).
 const HLGW_GAUGES: usize = 37;
 
@@ -6236,13 +6236,30 @@ const HLGW_COUNTER_NAMES: [&str; HLGW_COUNTERS] = [
     "engine_exec_hlgw_gateway_throttled_total",
     "engine_exec_hlgw_gateway_ttl_cancels_total",
     "engine_exec_hlgw_gateway_ttl_full_total",
+    "engine_exec_hlgw_outcome_rolls_bound_total",
+    "engine_exec_hlgw_outcome_rolls_settled_total",
+    "engine_exec_hlgw_outcome_rolls_refused_total",
+    "engine_exec_hlgw_outcome_rolls_repeated_total",
+    "engine_exec_hlgw_outcome_refused_stale_total",
+    "engine_exec_hlgw_outcome_refused_unbound_total",
+    "engine_exec_hlgw_outcome_refused_rules_total",
+    "engine_exec_hlgw_outcome_e8_cancels_total",
+    "engine_exec_hlgw_outcome_settlements_total",
+    "engine_exec_hlgw_outcome_settlements_unowned_total",
+    "engine_exec_hlgw_outcome_fills_old_gen_total",
+    "engine_exec_hlgw_outcome_fills_mismatched_total",
+    "engine_exec_hlgw_outcome_fills_refused_total",
+    "engine_exec_hlgw_outcome_leg_reads_total",
+    "engine_exec_hlgw_outcome_leg_drift_reads_total",
+    "engine_exec_hlgw_outcome_leg_unseen_reads_total",
+    "engine_exec_hlgw_outcome_snapshot_parked_total",
     "engine_exec_hlgw_refused_cap_perp_total",
     "engine_exec_hlgw_refused_max_resting_total",
     "engine_exec_hlgw_refused_foreign_row_total",
 ];
 
 /// `GatewayArmReport`'s totals in [`HLGW_COUNTER_NAMES`] order.
-// COPY: [u64; 71] (568 B) returned by value — cold, the 5 s /metrics
+// COPY: [u64; 88] (704 B) returned by value — cold, the 5 s /metrics
 // mirror (then kept as the next delta's baseline); the fields are visited
 // once in the name order — a borrowed view would need the report to be an
 // array, which the POD is not.
@@ -6316,6 +6333,23 @@ fn hlgw_counter_values(r: &clob_dispatcher::GatewayArmReport) -> [u64; HLGW_COUN
         r.gw_throttled,
         r.gw_ttl_cancels,
         r.gw_ttl_full,
+        r.outcome_rolls_bound,
+        r.outcome_rolls_settled,
+        r.outcome_rolls_refused,
+        r.outcome_rolls_repeated,
+        r.outcome_refused_stale,
+        r.outcome_refused_unbound,
+        r.outcome_refused_rules,
+        r.outcome_e8_cancels,
+        r.outcome_settlements,
+        r.outcome_settlements_unowned,
+        r.outcome_fills_old_gen,
+        r.outcome_fills_mismatched,
+        r.outcome_fills_refused,
+        r.outcome_leg_reads,
+        r.outcome_leg_drift_reads,
+        r.outcome_leg_unseen_reads,
+        r.outcome_snapshot_parked,
         r.refused_cap_perp,
         r.refused_max_resting,
         r.refused_foreign_row,
@@ -6410,10 +6444,11 @@ fn hlgw_gauge_values(r: &clob_dispatcher::GatewayArmReport) -> [i64; HLGW_GAUGES
     ]
 }
 
-/// **XMM XH4f (D11)** — the `engine_exec_hlgw_*` family: slot 6's gateway
-/// arm — its counters and the dead man's, the gateway's, the budget, the
-/// rates, the latencies and the router's words for the slot. Registered
-/// only when slot 6 is live on the gateway.
+/// **XMM XH4f (D11)** — the `engine_exec_hlgw_*` family: the gateway arm
+/// (slot 6's, or slot 3's — XMM XH4i-5, never both) — its counters and the
+/// dead man's, the gateway's, the budget, the rates, the latencies and the
+/// router's words for the slot. Registered only when a slot is live on its
+/// gateway.
 #[derive(Copy, Clone, Debug)]
 pub struct ExecHlgwMetricIds {
     /// The counters, in [`HLGW_COUNTER_NAMES`] order.
@@ -6449,7 +6484,7 @@ fn register_hlgw_metrics(
     let last_shutdown_unconfirmed = reg
         .register_gauge("engine_exec_hlgw_last_shutdown_unconfirmed")
         .map_err(|_| "register engine_exec_hlgw_last_shutdown_unconfirmed")?;
-    // COPY: the 436 B id block ((71 + 37 + 1) × 4 B), returned by value once
+    // COPY: the 504 B id block ((88 + 37 + 1) × 4 B), returned by value once
     // at boot — rejected: an out-param for a one-time move.
     Ok(ExecHlgwMetricIds {
         counters,
@@ -6480,7 +6515,7 @@ fn mirror_hlgw_metrics(
         reg.gauge(ids.gauges[k]).set(g[k]);
         k += 1;
     }
-    // COPY: the 71 totals (568 B) kept as the next delta's baseline — 5 s
+    // COPY: the 88 totals (704 B) kept as the next delta's baseline — 5 s
     // cadence, cold; a delta needs the previous value.
     *last = c;
 }
@@ -8977,7 +9012,7 @@ where
                 path = %path.display(),
                 last = %core::str::from_utf8(&said[..n]).unwrap_or("?").trim(),
                 "exec: the gateway arm's LAST run ended without a confirmed shutdown — check \
-                 the venue for slot 6's orders, and its fills since"
+                 the venue for its slot's orders (6, or 3 on its gateway) and their fills since"
             );
         }
         if let Err(reason) = crate::state_file::write_atomic(

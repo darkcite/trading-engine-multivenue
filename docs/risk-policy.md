@@ -11033,6 +11033,143 @@ the 99 % floor.
 
 **Tests:** bench gate 103.
 
+### XH4i-3b-2b … XH4i-7 amendment (2026-10-06): BIN15 (slot 3) can run on its own gateway arm — composed, refused where unsafe; the default stays blocking, nothing armed
+
+Session 9 lands the rest of XH4i's code in one commit (Anton: implement
+everything, then one gates run and one combined review). Slot 3 can now be
+put on the WebSocket gateway arm's outcome mode by its artifact
+(`transport = "gateway"`) and `--arm-live 3`. Until Anton flips it
+(R-XH4-7), slot 3 stays on the blocking arm, and nothing here runs.
+
+- **A-S7-83 — a repeat of the live roll is left alone** (gateway arm only):
+  - both legs already bound to the ids the roll names → no rebind, counted
+    `rolls_repeated`;
+  - a rebind would zero the legs' ledgers (a drift halt) and overwrite the
+    generation the last roll retired;
+  - the shared binder's own fix (A-S7-81, Q5) stays Anton's decision; the
+    blocking arm keeps the bug until he rules.
+- **XH4i-3b-2b — the first snapshot's legs:**
+  - on an outcome map only, the process's first `userFills` snapshot emits
+    the legs' rows of the last 25 h, flagged `EVF_SNAPSHOT`, with no fee;
+  - only freshly admitted tids are emitted; at most a quarter of the event
+    ring, and the rest is counted (`snapshot_kept`; the arm's drift then
+    halts the slot);
+  - slot 6's perps maps are unchanged;
+  - the arm books each row once, on a bound leg;
+  - a row whose leg no roll has bound yet is **parked** (256 at most;
+    `snapshot_parked`) and booked when the roll binds — the snapshot can
+    beat the ingress's boot roll (risk review r1).
+- **XH4i-4 — S7-L1 parity:**
+  - the spot read's leg rows are compared with the ledger; a drift needs
+    two reads; a held leg no live binding names is unseen;
+  - an unmarked or miscounted end is a failed read;
+  - worth = USDC + perps + the legs at cost;
+  - agreement (`reconciled`) needs the legs to agree and a fresh spot read;
+  - the ledger is never seeded from the sheet (A-S7-72).
+- **XH4i-5 — composition, boot and refusals:**
+  - `impl OrderDispatch for Option<D>`: `None` refuses every verb
+    (`NoLiveRoute`) and answers every hook as the defaults do;
+  - every shape is composed `SlotSplit(3, <shape>, Option<arm>)` innermost.
+    With no gateway arm, its slot is `exec_router::NO_SLOT` (0xFE: no slot,
+    and not `STRATEGY_ID_NONE`). The sixteen compositions stay sixteen;
+  - core-config no longer demands the perp pair on a live gateway slot; the
+    boot judges it by the slot's role: slot 6 must state it, and slot 3 must
+    not (a perp slot's every order must be on a linear row);
+  - `exec_boot` refuses slot 3 on its gateway:
+    - beside slot 6 on its gateway (**A-S7-85**: one gateway arm an engine
+      until the report is per slot and the two gateways split the rate
+      shares — the follow-up);
+    - beside any live slot of the operator's blocking arm (**A-S7-89**: one
+      master, one arm — this replaces slot masks on the blocking arm's
+      sweeps and fills);
+  - testnet market data beside a mainnet-only arm is refused for slot 3 as
+    for slot 6 (risk review r1);
+  - the boot (`cli::bin15_live`):
+    - the operator's account (`HYPERLIQUID_*`), the market data's network
+      and the venue's own host (LAW E-4);
+    - `own_account`; leverage 0; `outcomes`; `CoinMap::with_outcomes`;
+    - reads every 30 s; the stale floor at least 300 s (**A-S7-91**: a held
+      leg of the retired instance reads unseen until it settles);
+    - `expiresAfter` 5 s (**A-S7-86**);
+    - the session anchor in `bin15-pnl-anchor-<network>.state` (**A-S7-84**:
+      a new session at the flip — the blocking arm's anchor measures
+      another worth);
+    - top-ups on the blocking arm's `exec-topup.state` day (one governor a
+      master's day), their cost added back (Q3);
+    - thread `hl-gw-bin15` on core 12;
+  - the gateway report carries the outcome mode's seventeen counters, on
+    `/metrics` (`engine_exec_hlgw_outcome_*`), not `/state` (**A-S7-87**);
+  - the shutdown tell is `bin15-gateway-shutdown.tell`.
+- **XH4i-6 — BIN15 learns its order events** (Q1):
+  - a late `REJECTED` of a reprice restores the quote as it stood;
+  - a refused fresh quote frees its side and re-quotes at the next price;
+  - a refused coverage IoC is written off, so the entry retries;
+  - a `CANCELED` of a pending quote frees its side (no phantom restore).
+    The undo arrays have cache lines of their own;
+  - **the arm** (risk review r1, MAJOR): a replacement the member cancelled
+    before the venue refused the modify → its original, resting on, is
+    cancelled too, never left untracked;
+  - replays are neutral: no order event reaches BIN15 off a gateway arm,
+    and BIN15 never sets `ORDER_FLAG_POST_ONLY`.
+- **XH4i-7 — the code half of the flip:**
+  - **A-S7-47 fixed (A-S7-88):** a family adopts by its deployer. The `out`
+    family takes rows with `venue == "out"` alone, and a native family takes
+    rows naming no venue. The venue's registry maps one name to one
+    deployer (2026-10-06: `0x0c46…819e` mainnet, `0x295b…d33f` testnet). A
+    venue that is no string, empty or too wide is a stranger's;
+  - two instances expiring together are adopted by no family — at boot and
+    rediscovery (dormant), and on a push (counted unmatched);
+  - `scripts/bin15-flip.sh live --gateway` writes the gateway section and
+    checks the binary carries XH4i-5 and that `ARM_LIVE` holds slots 0 and
+    3 alone. It archives both anchors on every flip.
+- **Not built here:**
+  - per-slot reports;
+  - the rate-share split;
+  - a loopback with slots 3 and 6 together (A-S7-85);
+  - E3's `+154150` leg sale and the testnet outcome battery (operational
+    steps).
+- **Preconditions for Anton's flip:** Q5 (A-S7-81) and the battery.
+
+**Reviews (one combined round, frozen `review-xh4i-s9-r1`):**
+- **Risk: REQUEST CHANGES** — one MAJOR (the stranded original) and MINORs:
+  the snapshot's race, the push tie, a non-string venue, slot 3's network
+  rule, the stale floor, the flip's preflight, a phantom restore, the test
+  gaps. All fixed.
+- **Allocation: APPROVE WITH NITS** — the undo arrays' alignment, gate
+  coverage (gate 103's legs, repeats and report; the bin15 gate's refusal
+  and cancel), `LegRead` resets, a reference scan. All fixed.
+- **Zero-copy: APPROVE WITH NITS** — stale COPY notes, the counters' copy
+  (now borrowed), the leg saves noted, the audit's directories (+
+  `bin15_live.rs`, `strategy-bin15`). All fixed.
+
+**Gates:** s9-g2 (2026-10-06, 04:04Z): clippy clean; nextest 4 252 run, 4 252 passed
+(9 skipped; +13 since `d6078ce`); alloc 113 (gates 103, 99 and the bin15 gate
+extended); copy-audit 28 baselined, 0 new (its directories + `bin15_live.rs`,
+`strategy-bin15`); license 663 (`bin15_live.rs` counts from the commit);
+release builds; replay 7× IDENTICAL; fmt clean. The run before the review's
+fixes (s9-g1) was green too (nextest 4 250).
+
+**Tests:**
+- exec-hyperliquid:
+  - the repeat roll;
+  - the outcome leg reconciliation, including the miscounted end;
+  - first-snapshot rows waiting for their roll;
+  - the refused reprice whose replacement was cancelled;
+  - an unknown order of the slot on a leg;
+  - the first snapshot handed to the arm (gateway).
+- cli:
+  - `slot_three_runs_on_a_gateway_arm_of_its_own_alone`;
+  - the perp-pair rules;
+  - the composition test (a roll through router and split; an absent arm).
+- core-config: the perp pair left to the boot.
+- strategy-bin15: the late refusals and the cancel.
+- ingress-hyperliquid:
+  - the venue kept, stranger and null;
+  - the deployer clause and the tie;
+  - the push venue, borrowed.
+- bench: gates 103 (+ legs, repeats, report), 99 (the engine's composition)
+  and the bin15 gate (+ refusal and cancel).
+
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
 `crates/exec-hypercall` is a complete `OrderDispatch` for Hypercall

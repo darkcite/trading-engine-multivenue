@@ -889,10 +889,225 @@ pub trait OrderDispatch {
     /// everything else (the default; `out` untouched). `now_ns` is the
     /// engine clock (the heartbeat's age, the slot's health). Cold: the 1 s
     /// `/state` publish and the 5 s `/metrics` mirror; an out-param, so the
-    /// 880 B report never crosses by value.
+    /// 1 016 B report never crosses by value.
     #[inline]
     fn gateway_arm_report(&self, _now_ns: NsTs, _out: &mut GatewayArmReport) -> bool {
         false
+    }
+}
+
+/// **XMM XH4i-5 — an arm the composition may not hold.** `None` is an
+/// absent arm: it refuses every verb as the refusing stub does
+/// ([`DispatchError::NoLiveRoute`] — a verb reaching it is a routing bug),
+/// tells nothing, and answers every hook as the trait's defaults do; `Some`
+/// forwards every method. The engine composes slot 3's gateway arm so —
+/// `SlotSplit(3, <shape>, Option<HlGatewayArm>)`, whose slot names none
+/// (`exec_router::NO_SLOT`) when the arm is absent — so one loop type
+/// serves both and the shapes' sixteen compositions stay sixteen. One
+/// discriminant load a verb; no allocation, no `dyn`; the counters cross by
+/// value as the trait's do (cold, noted there).
+impl<D: OrderDispatch> OrderDispatch for Option<D> {
+    #[inline]
+    fn submit(&mut self, order: &Order) -> Result<(), DispatchError> {
+        match self {
+            Some(d) => d.submit(order),
+            None => Err(DispatchError::NoLiveRoute),
+        }
+    }
+
+    #[inline]
+    fn cancel(&mut self, req: &CancelReq) -> Result<(), DispatchError> {
+        match self {
+            Some(d) => d.cancel(req),
+            None => Err(DispatchError::NoLiveRoute),
+        }
+    }
+
+    #[inline]
+    fn modify(&mut self, req: &ModifyReq) -> Result<(), DispatchError> {
+        match self {
+            Some(d) => d.modify(req),
+            None => Err(DispatchError::NoLiveRoute),
+        }
+    }
+
+    #[inline]
+    fn try_next_fill(&mut self) -> Option<Fill> {
+        self.as_mut().and_then(D::try_next_fill)
+    }
+
+    #[inline]
+    fn try_next_retired(&mut self) -> Option<Retired> {
+        self.as_mut().and_then(D::try_next_retired)
+    }
+
+    #[inline]
+    fn verbs_confirm_later(&self, sym: SymbolId, venue: u8, strategy_id: u8) -> bool {
+        self.as_ref()
+            .is_some_and(|d| d.verbs_confirm_later(sym, venue, strategy_id))
+    }
+
+    #[inline]
+    fn try_next_renamed(&mut self) -> Option<Renamed> {
+        self.as_mut().and_then(D::try_next_renamed)
+    }
+
+    #[inline]
+    fn stats(&self) -> DispatchStats {
+        self.as_ref().map_or_else(DispatchStats::default, D::stats)
+    }
+
+    #[inline]
+    fn observe_tick(&mut self, tick: &Tick, now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_tick(tick, now_ns);
+        }
+    }
+
+    #[inline]
+    fn observe_amm(&mut self, sym: SymbolId, payload: &[u8; 40], now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_amm(sym, payload, now_ns);
+        }
+    }
+
+    #[inline]
+    fn observe_trade(&mut self, print: &core_types::TradePrint, now_ns: NsTs) {
+        if let Some(d) = self {
+            d.observe_trade(print, now_ns);
+        }
+    }
+
+    #[inline]
+    fn try_next_order_event(&mut self, out: &mut core_types::OrderEvent) -> bool {
+        self.as_mut().is_some_and(|d| d.try_next_order_event(out))
+    }
+
+    #[inline]
+    fn track_queue_sym(&mut self, sym: SymbolId) {
+        if let Some(d) = self {
+            d.track_queue_sym(sym);
+        }
+    }
+
+    #[inline]
+    fn matcher_counters(&self) -> MatcherCounters {
+        self.as_ref()
+            .map_or_else(MatcherCounters::default, D::matcher_counters)
+    }
+
+    #[inline]
+    fn open_paper_orders(&self) -> usize {
+        self.as_ref().map_or(0, D::open_paper_orders)
+    }
+
+    #[inline]
+    fn on_idle(&mut self) -> bool {
+        self.as_mut().is_some_and(D::on_idle)
+    }
+
+    #[inline]
+    fn on_venue_event(&mut self, event: &core_types::ChannelEvent) {
+        if let Some(d) = self {
+            d.on_venue_event(event);
+        }
+    }
+
+    #[inline]
+    fn on_opt_summary(&mut self, summary: &core_types::OptSummary) {
+        if let Some(d) = self {
+            d.on_opt_summary(summary);
+        }
+    }
+
+    #[inline]
+    fn set_route_aliases(&mut self, aliases: RouteAliases) {
+        if let Some(d) = self {
+            d.set_route_aliases(aliases);
+        }
+    }
+
+    #[inline]
+    fn on_fill_booked(&mut self, fill: &Fill) {
+        if let Some(d) = self {
+            d.on_fill_booked(fill);
+        }
+    }
+
+    #[inline]
+    fn halt_signal(&self) -> HaltSignal {
+        self.as_ref()
+            .map_or_else(HaltSignal::default, D::halt_signal)
+    }
+
+    #[inline]
+    fn halt_signal_for(&self, slot: u8) -> HaltSignal {
+        self.as_ref()
+            .map_or_else(HaltSignal::default, |d| d.halt_signal_for(slot))
+    }
+
+    #[inline]
+    fn cancel_all(&mut self) -> Result<(), DispatchError> {
+        self.as_mut().map_or(Ok(()), D::cancel_all)
+    }
+
+    #[inline]
+    fn cancel_all_state(&self) -> CancelAllState {
+        self.as_ref()
+            .map_or(CancelAllState::Clear, D::cancel_all_state)
+    }
+
+    #[inline]
+    fn cancel_slot(&mut self, slot: u8) -> Result<(), DispatchError> {
+        self.as_mut().map_or(Ok(()), |d| d.cancel_slot(slot))
+    }
+
+    #[inline]
+    fn cancel_slot_state(&self, slot: u8) -> CancelAllState {
+        self.as_ref()
+            .map_or(CancelAllState::Clear, |d| d.cancel_slot_state(slot))
+    }
+
+    #[inline]
+    fn exec_counters(&self) -> ExecCounters {
+        self.as_ref()
+            .map_or_else(ExecCounters::default, D::exec_counters)
+    }
+
+    #[inline]
+    fn arm_counters(&self) -> LiveArmCounters {
+        self.as_ref()
+            .map_or_else(LiveArmCounters::default, D::arm_counters)
+    }
+
+    #[inline]
+    fn venue_arm_counters(&self, venue: u8) -> Option<LiveArmCounters> {
+        self.as_ref().and_then(|d| d.venue_arm_counters(venue))
+    }
+
+    #[inline]
+    fn on_shutdown(&mut self) {
+        if let Some(d) = self {
+            d.on_shutdown();
+        }
+    }
+
+    #[inline]
+    fn venue_day_bought(&self, slot: usize) -> Option<(u64, i64)> {
+        self.as_ref().and_then(|d| d.venue_day_bought(slot))
+    }
+
+    #[inline]
+    fn exec_health(&self, slot: u8, now_ns: NsTs) -> core_types::ExecHealth {
+        self.as_ref().map_or(core_types::ExecHealth::HEALTHY, |d| {
+            d.exec_health(slot, now_ns)
+        })
+    }
+
+    #[inline]
+    fn gateway_arm_report(&self, now_ns: NsTs, out: &mut GatewayArmReport) -> bool {
+        self.as_ref()
+            .is_some_and(|d| d.gateway_arm_report(now_ns, out))
     }
 }
 
@@ -1169,6 +1384,43 @@ pub struct GatewayArmReport {
     pub gw_ttl_cancels: u64,
     /// Orders whose TTL the full table could not keep.
     pub gw_ttl_full: u64,
+    // --- counters: the outcome mode (XMM XH4i-5: slot 3; 0 on a perps arm) ---
+    /// Created rolls bound, both legs.
+    pub outcome_rolls_bound: u64,
+    /// Settled rolls (they bind and unbind nothing).
+    pub outcome_rolls_settled: u64,
+    /// Rolls refused (a kind no packer writes, no outcome, ids that do not
+    /// fit, no room for both legs).
+    pub outcome_rolls_refused: u64,
+    /// Repeats of the live roll, left alone (A-S7-83).
+    pub outcome_rolls_repeated: u64,
+    /// Orders refused naming an instance that has rolled (LAW E-4).
+    pub outcome_refused_stale: u64,
+    /// Orders refused naming a leg no roll has bound.
+    pub outcome_refused_unbound: u64,
+    /// Orders refused by the outcome rules (one is a member's bug).
+    pub outcome_refused_rules: u64,
+    /// Our rows on a leg a roll retired, their cancels sent or kept (LAW
+    /// E-8).
+    pub outcome_e8_cancels: u64,
+    /// Settlements booked on a leg this slot owns.
+    pub outcome_settlements: u64,
+    /// Settlements on a leg no accepted order of ours owns (never booked).
+    pub outcome_settlements_unowned: u64,
+    /// Fills booked on a generation a roll retired.
+    pub outcome_fills_old_gen: u64,
+    /// Our fills naming another asset than their row's place (not booked).
+    pub outcome_fills_mismatched: u64,
+    /// Leg fills refused (a negative price, no whole engine unit).
+    pub outcome_fills_refused: u64,
+    /// Spot reads whose legs were compared with the ledger.
+    pub outcome_leg_reads: u64,
+    /// … in which a live leg's holding differed from the ledger.
+    pub outcome_leg_drift_reads: u64,
+    /// … in which the venue held a leg no live binding names.
+    pub outcome_leg_unseen_reads: u64,
+    /// First-snapshot rows that came before their leg's roll, kept for it.
+    pub outcome_snapshot_parked: u64,
     // --- counters: the router, for the arm's slot ---
     /// Orders the router refused over a perp slot's `cap_perp_usd_1e6`.
     pub refused_cap_perp: u64,
@@ -1272,8 +1524,9 @@ pub struct GatewayArmReport {
 // XH5a: + `refused_foreign_row` (95). XMM XH5b-2: + the spot reads' two
 // counters and the own account's five levels (102). XMM XH5c-2: + the
 // top-ups' three counters and three levels (108). XMM XH5c-3: + the REST
-// round trips' p99 and maximum (110).
-const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 880);
+// round trips' p99 and maximum (110). XMM XH4i-5: + the outcome mode's
+// seventeen counters (127).
+const _: () = assert!(core::mem::size_of::<GatewayArmReport>() == 1_016);
 
 /// **BX3 (F9) — an accepted order that ended without a (further) fill**,
 /// as the arm tells the router ([`OrderDispatch::try_next_retired`]).

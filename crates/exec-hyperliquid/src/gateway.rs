@@ -78,8 +78,11 @@
 //! **Streams.** `userFills` → [`EV_FILL`] + [`EV_FILL_META`] (fee,
 //! crossed), deduplicated by tid across connections and reconnects (LAW
 //! E-5). The process's FIRST snapshot is history: its tids are admitted,
-//! nothing is emitted, and [`EV_SNAPSHOT`] (rows, the latest fill's venue
-//! time) tells the arm to read its boot reconciliation after it.
+//! and [`EV_SNAPSHOT`] (rows, the latest fill's venue time) tells the arm
+//! to read its boot reconciliation after it. A perps map emits none of its
+//! rows; an outcome map emits its legs' rows of the last day and an hour,
+//! flagged [`EVF_SNAPSHOT`], with no fee, for the arm to book once
+//! (XH4i-3b-2b).
 //! `orderUpdates` → status events, deduplicated (both sockets carry them
 //! during a swap). A frame that does not scan, a socket that comes up
 //! after a gap with no live socket, and one that replaces a socket that
@@ -203,6 +206,12 @@ use crate::wspost::{classify, PostKind, WsIn};
 pub const CMD_RING: usize = 1024;
 /// Event ring slots (gateway → engine): four command rings (XG-2).
 pub const EVT_RING: usize = 4096;
+/// XH4i-3b-2b: an outcome map's first snapshot hands the arm its legs'
+/// rows of the last day and an hour (a daily family's instance lives a
+/// day) …
+const SNAPSHOT_EMIT_MS: u64 = 25 * 3_600_000;
+/// … at most a quarter of the event ring.
+const SNAPSHOT_EMIT_MAX: usize = EVT_RING / 4;
 /// The engine's end of an HL gateway.
 pub type HlEngineEnd = EngineEnd<HlCmd, ExecEvent, CMD_RING, EVT_RING>;
 /// The gateway's end.
@@ -511,6 +520,12 @@ impl CoinMap {
         m
     }
 
+    /// XH4i-3b-2b: whether the map names outcome legs (slot 3's gateway).
+    #[must_use]
+    pub const fn outcomes(&self) -> bool {
+        self.outcomes
+    }
+
     /// Bind `coin` to `asset`. `false`: the map is full or the name too
     /// long (boot refuses) — or, on an outcome map, a `#` name: a leg is
     /// named by its coin alone, and a binding would never be read.
@@ -561,6 +576,10 @@ pub struct GatewayCounters {
     pub fills_scan_failed: u64,
     /// Rows of the first snapshot, absorbed as history.
     pub snapshot_rows: u64,
+    /// XH4i-5: an outcome map's first-snapshot leg rows past its cap, not
+    /// emitted — the arm's ledger misses them, and its reconciliation's
+    /// drift halts the slot.
+    pub snapshot_kept: u64,
     /// `orderUpdates` rows emitted.
     pub updates: u64,
     /// `orderUpdates` rows with a status the gateway does not report.
@@ -1564,11 +1583,38 @@ impl Router {
             let mut latest = 0u64;
             let mut i = 0usize;
             while i < n {
-                let _ = self.tids.admit(self.fills[i].tid);
                 latest = latest.max(self.fills[i].time_ms);
                 i += 1;
             }
             self.counters.snapshot_rows += n as u64;
+            // XH4i-3b-2b (A-S7-72): on an outcome map the legs' history is
+            // the arm's to book, once — the blocking arm books its snapshot
+            // too — so its rows go out, flagged, with no fee (an earlier
+            // session's): the legs' rows of the last day and an hour, at
+            // most a quarter of the event ring (the rest counted). Every tid
+            // is admitted here; only a freshly admitted one goes out — never
+            // a row the stream already sent. A perps map's rows stay the
+            // boot reconciliation's.
+            let outcomes = self.coins.outcomes();
+            let since = latest.saturating_sub(SNAPSHOT_EMIT_MS);
+            let mut sent = 0usize;
+            let mut i = 0usize;
+            while i < n {
+                let fresh = self.tids.admit(self.fills[i].tid);
+                if outcomes && fresh && self.fills[i].time_ms >= since {
+                    let a = self.coins.asset(self.fills[i].coin.of(frame));
+                    if a != ASSET_UNKNOWN && a >= crate::asset::ASSET_BASE {
+                        if sent < SNAPSHOT_EMIT_MAX {
+                            self.emit_fill_row(i, a, true, false, now);
+                            sent += 1;
+                        } else {
+                            self.counters.snapshot_kept += 1;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            self.counters.fills += sent as u64;
             emit_to(
                 &mut self.evt,
                 &gateway_event(EV_SNAPSHOT, n as u64, latest, now),
@@ -1578,50 +1624,65 @@ impl Router {
         let wall_ns = now_ms().saturating_mul(1_000_000);
         let mut i = 0usize;
         while i < n {
-            let f = &self.fills[i];
-            if self.tids.admit(f.tid) {
-                let (slot, client_oid) = owner(f.cloid);
-                let mut flags = if f.is_buy { EVF_BUY } else { 0 };
-                if f.crossed {
-                    flags |= EVF_CROSSED;
+            if self.tids.admit(self.fills[i].tid) {
+                if !is_snapshot {
+                    let ms = self.fills[i].time_ms;
+                    self.stats
+                        .fill_venue_to_local
+                        .record(wall_ns.saturating_sub(ms.saturating_mul(1_000_000)));
                 }
-                if is_snapshot {
-                    flags |= EVF_SNAPSHOT;
-                }
-                let fill = ExecEvent {
-                    ts_ns: now,
-                    venue_ms: f.time_ms,
-                    client_oid,
-                    oid: f.oid,
-                    px_1e8: f.px_1e8,
-                    sz_1e8: f.sz_1e8,
-                    aux: f.tid,
-                    asset: self.coins.asset(f.coin.of(frame)),
-                    kind: EV_FILL,
-                    reason: if f.is_settlement {
-                        REASON_SETTLEMENT
-                    } else {
-                        0
-                    },
-                    slot,
-                    flags,
-                };
-                let meta = ExecEvent {
+                let a = self.coins.asset(self.fills[i].coin.of(frame));
+                self.emit_fill_row(i, a, is_snapshot, true, now);
+                self.counters.fills += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// One `userFills` row out on `asset` (its coin, as the map names it):
+    /// the fill, and its fee when `meta` (`EVF_SNAPSHOT` on a snapshot's
+    /// row) — the live rows' builder, and an outcome map's first
+    /// snapshot's (XH4i-3b-2b).
+    #[inline]
+    fn emit_fill_row(&mut self, i: usize, asset: u32, snapshot: bool, meta: bool, now: u64) {
+        let f = &self.fills[i];
+        let (slot, client_oid) = owner(f.cloid);
+        let mut flags = if f.is_buy { EVF_BUY } else { 0 };
+        if f.crossed {
+            flags |= EVF_CROSSED;
+        }
+        if snapshot {
+            flags |= EVF_SNAPSHOT;
+        }
+        let fill = ExecEvent {
+            ts_ns: now,
+            venue_ms: f.time_ms,
+            client_oid,
+            oid: f.oid,
+            px_1e8: f.px_1e8,
+            sz_1e8: f.sz_1e8,
+            aux: f.tid,
+            asset,
+            kind: EV_FILL,
+            reason: if f.is_settlement {
+                REASON_SETTLEMENT
+            } else {
+                0
+            },
+            slot,
+            flags,
+        };
+        emit_to(&mut self.evt, &fill);
+        if meta {
+            emit_to(
+                &mut self.evt,
+                &ExecEvent {
                     kind: EV_FILL_META,
                     px_1e8: f.fee_1e8,
                     reason: 0,
                     ..fill
-                };
-                if !is_snapshot {
-                    self.stats
-                        .fill_venue_to_local
-                        .record(wall_ns.saturating_sub(f.time_ms.saturating_mul(1_000_000)));
-                }
-                emit_to(&mut self.evt, &fill);
-                emit_to(&mut self.evt, &meta);
-                self.counters.fills += 1;
-            }
-            i += 1;
+                },
+            );
         }
     }
 
@@ -3538,6 +3599,32 @@ mod tests {
         assert_eq!(
             (e[0].kind, e[0].aux, e[1].kind, e[1].aux),
             (EV_GAP, GAP_FILLS_UNREADABLE, EV_GAP, GAP_UPDATES_UNREADABLE)
+        );
+    }
+
+    /// XH4i-3b-2b: an outcome map's first snapshot hands the arm its legs'
+    /// recent rows — flagged, with no fee, before the snapshot's end — and
+    /// keeps an older leg row and a perp's (no leg) as history; a later
+    /// snapshot re-delivers nothing.
+    #[test]
+    fn on_an_outcome_map_the_first_snapshot_hands_the_legs_history_to_the_arm() {
+        let (eng_end, gw) = hl_duplex();
+        let mut eng = eng_end;
+        let mut rt = Router::new(gw.evt, gw.stats, CoinMap::with_outcomes());
+        let snap = br##"{"channel":"userFills","data":{"isSnapshot":true,"user":"0x","fills":[{"coin":"#1941","px":"0.3","sz":"4","side":"B","time":199000000,"oid":1,"tid":5},{"coin":"#1941","px":"0.3","sz":"1","side":"A","time":100000000,"oid":2,"tid":6},{"coin":"ETH","px":"1","sz":"1","side":"B","time":200000000,"oid":3,"tid":7}]}}"##;
+        rt.on_frame(snap, 1);
+        let e = drained(&mut eng);
+        assert_eq!(e.len(), 2, "the leg's recent row, then the snapshot's end");
+        assert_eq!(
+            (e[0].kind, e[0].asset, e[0].sz_1e8, e[0].aux),
+            (EV_FILL, crate::asset::ASSET_BASE + 1941, 400_000_000, 5)
+        );
+        assert_ne!(e[0].flags & EVF_SNAPSHOT, 0, "flagged a snapshot's");
+        assert_eq!((e[1].kind, e[1].aux), (EV_SNAPSHOT, 3));
+        rt.on_frame(snap, 2);
+        assert!(
+            drained(&mut eng).is_empty(),
+            "a later snapshot re-delivers nothing"
         );
     }
 

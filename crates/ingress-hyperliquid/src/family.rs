@@ -35,7 +35,8 @@
 //! It publishes a description string, and the family has to recognise
 //! its own next instance from the grammar
 //! ([`crate::discovery::HlOutcomeSpec`]): the same deployer grammar,
-//! the same underlying, and an expiry inside one period of now. That
+//! the same deployer (A-S7-47: the row's `venue`), the same
+//! underlying, and an expiry inside one period of now. That
 //! last clause is what stops a family from adopting an instance it
 //! cannot be — the venue lists other deployers' markets and, for the
 //! daily families, tomorrow's instance as well. A row that matches
@@ -73,6 +74,12 @@ pub const HL_OUTCOME_COIN_MAX: usize = 11;
 /// `activeAssetCtx`: an outcome coin has no funding or open interest
 /// (`coin_wants_asset_ctx` already says so for `#<enc>`).
 pub const ROLL_CHANNELS: [HlChannel; 3] = [HlChannel::Bbo, HlChannel::L2Book, HlChannel::Trades];
+
+/// **A-S7-47 — the `out` family's deployer** as the venue names it: the
+/// `venue` of its rows and pushes (`outcomeMeta.deployers[].venue` — one
+/// name, one deployer: `0x0c46…819e` on mainnet, `0x295b…d33f` on testnet,
+/// 2026-10-06).
+pub const OUT_VENUE: &[u8] = b"out";
 
 /// Which deployer grammar a family tracks. The name encodes the
 /// pairing: only `out:*:15m` and `native:*:1d` exist on the venue
@@ -334,12 +341,16 @@ impl HlFamilyTable {
 
     /// Which family, if any, an outcome spec belongs to.
     ///
-    /// Three clauses, all required: the spec's grammar pairs with the
+    /// Four clauses, all required: the spec's grammar pairs with the
     /// family's kind (and carries that kind's settlement signature —
     /// `seconds:60` for the `out` 15-minute instrument, the family's
-    /// own `period:` for a native recurring one); the underlying is
-    /// the same; and the expiry lies ahead of `now_ns` by no more
-    /// than one period plus a minute of slack.
+    /// own `period:` for a native recurring one); the deployer is the
+    /// kind's (A-S7-47: the [`OUT_VENUE`]'s rows for the `out` family,
+    /// rows naming no venue — HyperCore's own — for a native one: the
+    /// venue lists other deployers' markets in the very same grammar,
+    /// eleven testnet venues' `perp:BTC` rows on 2026-10-06); the
+    /// underlying is the same; and the expiry lies ahead of `now_ns` by
+    /// no more than one period plus a minute of slack.
     ///
     /// The window is the clause that matters in practice: the venue
     /// lists other deployers' markets and, for a daily family,
@@ -354,9 +365,11 @@ impl HlFamilyTable {
         while i < self.len {
             let f = &self.rows[i];
             let kind_ok = match (spec.grammar, f.kind) {
-                (HlOutcomeGrammar::OutBinaryPrice, HlFamilyKind::Out15m) => spec.twap_s == 60,
+                (HlOutcomeGrammar::OutBinaryPrice, HlFamilyKind::Out15m) => {
+                    spec.twap_s == 60 && spec.venue_bytes() == OUT_VENUE
+                }
                 (HlOutcomeGrammar::NativePriceBinary, HlFamilyKind::NativeDaily) => {
-                    spec.period_s == f.period_s
+                    spec.period_s == f.period_s && spec.is_native()
                 }
                 _ => false,
             };
@@ -411,21 +424,30 @@ impl HlFamilyTable {
         now_ns: u64,
     ) -> Option<HlOutcomeSpec> {
         let mut best: Option<HlOutcomeSpec> = None;
+        // A-S7-47: two instances of the family expiring at one instant are
+        // no deployer's shape — the family adopts neither (it stays dormant,
+        // which the boot tells; the next push decides).
+        let mut tied = false;
         let mut j = 0usize;
         while j < specs.len() {
             let s = specs[j];
             if self.match_spec(&s, now_ns) == Some(idx) {
-                let take = match best {
-                    Some(b) => s.expiry_ns < b.expiry_ns,
-                    None => true,
-                };
-                if take {
-                    best = Some(s);
+                match best {
+                    Some(b) if s.expiry_ns > b.expiry_ns => {}
+                    Some(b) if s.expiry_ns == b.expiry_ns => tied |= s.outcome != b.outcome,
+                    _ => {
+                        best = Some(s);
+                        tied = false;
+                    }
                 }
             }
             j += 1;
         }
-        best
+        if tied {
+            None
+        } else {
+            best
+        }
     }
 
     /// Retire family `idx`'s bound instance: both reserved rows go
@@ -712,11 +734,11 @@ mod tests {
     #[test]
     fn match_spec_needs_grammar_underlying_and_the_expiry_window() {
         let t = table_with(&[b"out:BTC:15m", b"native:ETH:1d"]);
-        let spec = parse_outcome_spec(2649, DESC_2649);
+        let spec = out_spec(2649, DESC_2649);
         assert_eq!(t.match_spec(&spec, NOW_NS), Some(0));
 
         // Wrong underlying.
-        let other = parse_outcome_spec(
+        let other = out_spec(
             3000,
             b"perp:SOL|priceDescription:x|seconds:60|threshold:200|time:20260912-0630",
         );
@@ -724,7 +746,7 @@ mod tests {
 
         // Right underlying, wrong settlement signature (not the 15 m
         // instrument even though the grammar matches).
-        let long_twap = parse_outcome_spec(
+        let long_twap = out_spec(
             3001,
             b"perp:BTC|priceDescription:x|seconds:300|threshold:77000|time:20260912-0630",
         );
@@ -754,8 +776,48 @@ mod tests {
         let unknown = parse_outcome_spec(5, b"whatever");
         assert_eq!(t.match_spec(&unknown, NOW_NS), None);
         // And so does a spec with no id.
-        let no_id = parse_outcome_spec(0, DESC_2649);
+        let no_id = out_spec(0, DESC_2649);
         assert_eq!(t.match_spec(&no_id, NOW_NS), None);
+    }
+
+    /// The `out` deployer's row (A-S7-47: its venue named).
+    fn out_spec(id: u32, desc: &[u8]) -> HlOutcomeSpec {
+        let mut s = parse_outcome_spec(id, desc);
+        s.set_venue(Some(OUT_VENUE));
+        s
+    }
+
+    /// A-S7-47: the deployer is the fourth clause — the `out` family adopts
+    /// the `out` venue's rows alone, the native family rows naming no
+    /// venue; a stranger's look-alike in the very same grammar is nobody's;
+    /// and two instances expiring together are adopted by no family.
+    #[test]
+    fn match_spec_needs_the_family_s_deployer() {
+        let t = table_with(&[b"out:BTC:15m", b"native:ETH:1d"]);
+        let mut kelp = parse_outcome_spec(2649, DESC_2649);
+        kelp.set_venue(Some(&b"kelp"[..]));
+        assert_eq!(t.match_spec(&kelp, NOW_NS), None, "a stranger's look-alike");
+        let bare = parse_outcome_spec(2649, DESC_2649);
+        assert_eq!(t.match_spec(&bare, NOW_NS), None, "no venue: not out's");
+        assert_eq!(t.match_spec(&out_spec(2649, DESC_2649), NOW_NS), Some(0));
+        let mut daily = parse_outcome_spec(
+            4211,
+            b"class:priceBinary|underlying:ETH|expiry:20260913-0600|targetPrice:2510.5|period:1d",
+        );
+        let day_before = daily.expiry_ns - 3_600_000_000_000;
+        assert_eq!(t.match_spec(&daily, day_before), Some(1));
+        daily.set_venue(Some(OUT_VENUE));
+        assert_eq!(
+            t.match_spec(&daily, day_before),
+            None,
+            "native rows name none"
+        );
+        let pair = [out_spec(2649, DESC_2649), out_spec(2700, DESC_2649)];
+        assert_eq!(t.best_live_spec(0, &pair, NOW_NS), None, "a tie: neither");
+        assert_eq!(
+            t.best_live_spec(0, &pair[..1], NOW_NS).map(|s| s.outcome),
+            Some(2649)
+        );
     }
 
     #[test]
@@ -766,8 +828,8 @@ mod tests {
         let b = coins.reserve(rolling_sym(0, 1)).unwrap();
         assert_eq!((a, b), (0, 1));
 
-        let current = parse_outcome_spec(2649, DESC_2649);
-        let next = parse_outcome_spec(
+        let current = out_spec(2649, DESC_2649);
+        let next = out_spec(
             2650,
             b"perp:BTC|priceDescription:x|seconds:60|threshold:77201|time:20260912-0645",
         );
@@ -848,10 +910,7 @@ mod tests {
             assert_eq!(unpack_roll_seq(seq), (outcome, twap, f, settled));
         }
         // The event the §2 created frame produces.
-        assert_eq!(
-            pack_roll_seq(2649, 60, 0, false),
-            2649 | (60u64 << 32)
-        );
+        assert_eq!(pack_roll_seq(2649, 60, 0, false), 2649 | (60u64 << 32));
 
         let mut all = 0u8;
         for side in 0..2usize {
@@ -878,7 +937,7 @@ mod tests {
         let mut coins = HlCoinTable::new();
         coins.reserve(rolling_sym(0, 0)).unwrap();
         coins.reserve(rolling_sym(0, 1)).unwrap();
-        let spec = parse_outcome_spec(2649, DESC_2649);
+        let spec = out_spec(2649, DESC_2649);
         t.bind(0, &spec, &mut coins).unwrap();
         assert_eq!(coins.lookup(b"#26490"), Some(rolling_sym(0, 0)));
 
@@ -909,7 +968,7 @@ mod tests {
         assert_eq!(crate::expected_mask(&coins).0, 0);
 
         // The successor binds like any roll and clears the flags.
-        let next = parse_outcome_spec(
+        let next = out_spec(
             2650,
             b"perp:BTC|priceDescription:BTC-USDC perp mark|seconds:60|threshold:77201|time:20260912-0645",
         );
