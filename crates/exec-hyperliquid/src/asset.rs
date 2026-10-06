@@ -130,11 +130,120 @@ const _NAMESPACE_NOTE: () = ();
 /// orders they take back can sit on instances no roll of THIS process
 /// ever bound.
 ///
+/// **XH4i-1:** the order gateway's outcome map
+/// (`gateway::CoinMap::with_outcomes`) uses it for two things: its
+/// sweep's cancels, by the rule above, and the asset its fill,
+/// order-update and open-order events name — identification of a leg the
+/// venue reported, never an id an order is placed with.
+///
 /// `None` for anything but `#` and canonical decimal digits (no sign,
 /// no leading zero) naming an id that fits `u32`.
 #[must_use]
 pub(crate) fn asset_of_fill_coin(coin: &[u8]) -> Option<u32> {
-    if coin.len() < 2 || coin.len() > COIN_MAX || coin[0] != b'#' {
+    asset_of_leg_coin(coin, b'#')
+}
+
+/// **XH4i-2 — the same leg in the BALANCE namespace:** `+<enc>` →
+/// `ASSET_BASE + enc`, by [`asset_of_fill_coin`]'s rule
+/// (`spotClearinghouseState` spells a leg `+<enc>`, measured — the
+/// namespace note above). It names the leg a spot sheet's row holds:
+/// identification only, never an id an order is placed with or a cancel
+/// names.
+#[must_use]
+pub(crate) fn asset_of_balance_coin(coin: &[u8]) -> Option<u32> {
+    asset_of_leg_coin(coin, b'+')
+}
+
+/// The `InstrumentRoll` `venue_seq` layout, bits 0..32 and 56 (moved here
+/// from `exchange.rs`, XH4i-3a: both arms read rolls through [`roll_of`]).
+///
+/// E6: no longer duplicated. §6.1 forbids this crate depending on the
+/// market-data crate, which is why the unpack was restated here — but
+/// the codec now lives in `core_types`, which this crate already
+/// depends on, so the restatement is gone and this is the projection
+/// onto the two fields the asset binding needs.
+///
+/// Bits 0..32 are the **outcome id**, NOT `enc`. `AssetTable::asset_id`
+/// and `outcome_coin` do the `× 10 + side` themselves, so feeding them
+/// `enc` would be a silent tenfold error naming a real other market.
+///
+/// `settled` is the STRICT reading (`core_types::roll_kind_strict`):
+/// `None` for a kind byte no packer of ours writes, which the caller
+/// refuses. The low-bit mask this used before read `0x03` as settled
+/// while `strategy_bin15` read it as created — one frame, two answers
+/// (E7 review, 2026-09-19); all three live readers share the strict
+/// one now.
+#[inline]
+pub(crate) const fn unpack_roll(seq: u64) -> Option<(u32, bool)> {
+    let (outcome, _twap_s, _family, _masked) = core_types::unpack_roll_seq(seq);
+    match core_types::roll_kind_strict(seq) {
+        Some(settled) => Some((outcome, settled)),
+        None => None,
+    }
+}
+
+/// **XH4i-3a — a roll event, read one way for both arms** (the blocking
+/// `HlExchange` and the gateway arm's outcome mode): what [`roll_of`]
+/// makes of an engine `ChannelEvent`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RollOf {
+    /// Not a Hyperliquid `InstrumentRoll`: not the table's business.
+    NotARoll,
+    /// A kind byte no packer of ours writes, or a created roll with no
+    /// outcome — refused, never guessed (outcome 0 would bind slot 0 of
+    /// somebody's market).
+    Refused,
+    /// A settled instance. It binds nothing and unbinds nothing,
+    /// deliberately: `unbind` clears the one-generation memory that lets a
+    /// fill in flight across the roll resolve
+    /// ([`AssetTable::sym_of_coin`]); the venue keeps a settled instance's
+    /// coins subscribed, and the successor's bind overwrites in place and
+    /// carries the old name forward.
+    Settled,
+    /// A created instance: `outcome`'s YES leg is `sym_yes` (what the wire
+    /// carries); its NO leg is the next ordinal (the boot ordinal law,
+    /// [`AssetTable::bind_roll`]).
+    Created {
+        /// The YES leg's engine symbol.
+        sym_yes: u32,
+        /// The outcome id (NOT `enc`).
+        outcome: u32,
+    },
+}
+
+/// Read `event` as a roll (XH4i-3a; moved out of
+/// `HlExchange::on_venue_event`).
+#[must_use]
+pub(crate) fn roll_of(event: &core_types::ChannelEvent) -> RollOf {
+    if event.channel != core_types::ChannelId::InstrumentRoll as u8
+        || event.venue != core_types::VenueId::Hyperliquid as u8
+    {
+        return RollOf::NotARoll;
+    }
+    match unpack_roll(event.venue_seq) {
+        None | Some((0, false)) => RollOf::Refused,
+        Some((_, true)) => RollOf::Settled,
+        Some((outcome, false)) => RollOf::Created {
+            sym_yes: event.sym,
+            outcome,
+        },
+    }
+}
+
+/// What a created roll RETIRED, per leg (YES, NO), for LAW E-8: the
+/// asset id and the venue's name the leg was bound to before, when that
+/// is not the new one — `None` for a leg newly bound, or for a repeat of
+/// the live roll, which retires nothing. 64 B by value, once a roll: the
+/// rebind overwrites the ids and keeps the old names only until the next
+/// roll (`prev_coin`), and the blocking arm's queued E-8 sweep needs them
+/// past that.
+pub(crate) type RollRetired = [Option<(u32, [u8; COIN_MAX], u8)>; 2];
+
+/// `<prefix>` and canonical decimal digits (no sign, no leading zero) →
+/// `ASSET_BASE + enc`, when the id fits `u32`.
+#[inline]
+fn asset_of_leg_coin(coin: &[u8], prefix: u8) -> Option<u32> {
+    if coin.len() < 2 || coin.len() > COIN_MAX || coin[0] != prefix {
         return None;
     }
     if coin.len() > 2 && coin[1] == b'0' {
@@ -228,7 +337,10 @@ struct AssetSlot {
     /// [`AssetTable::note_owner`] — never from a roll, which carries
     /// no slot, and never from a fill.
     owner: u8,
-    _pad: [u8; 4],
+    /// XH4i-3b: the venue asset id before the last roll — one generation,
+    /// as `prev_coin`, and read only while `prev_coin_len != 0` (asset 0 is
+    /// a real perp).
+    prev_asset: u32,
 }
 
 impl Default for AssetSlot {
@@ -249,7 +361,7 @@ impl AssetSlot {
         coin_len: 0,
         prev_coin_len: 0,
         owner: core_types::STRATEGY_ID_NONE,
-        _pad: [0; 4],
+        prev_asset: 0,
     };
 }
 
@@ -426,6 +538,7 @@ impl AssetTable {
                 // the instance that just ended can still be resolved.
                 s.prev_coin = s.coin;
                 s.prev_coin_len = s.coin_len;
+                s.prev_asset = s.asset;
                 s.coin = [0; COIN_MAX];
                 // COPY: ≤ COIN_MAX B coin name into the slot it will be
                 // matched from — the roll event's bytes die with the
@@ -562,6 +675,87 @@ impl AssetTable {
             i += 1;
         }
         None
+    }
+
+    /// **XH4i-3a — BOTH LEGS OR NEITHER** (moved out of
+    /// `HlExchange::on_venue_event`, so both arms bind a roll the same
+    /// way): `sym_yes` to `outcome`'s YES leg and the next ordinal to its
+    /// NO leg, each under the instance `outcome` and the venue's own name.
+    /// Everything that can fail is computed and checked before the first
+    /// mutation: a table left holding the YES leg and not the NO would book
+    /// one side of a position and count the other a stranger's fill.
+    ///
+    /// `sym_yes + 1` comes off the wire, and this crate has twice refused
+    /// an unchecked add on exactly this kind of value: release sets
+    /// `overflow-checks = false`, the ordinal field is 24 bits and
+    /// `SYMBOL_ID_NONE` is `u32::MAX`, so an unchecked `+ 1` could carry
+    /// out of the ordinal into the VENUE byte and bind a leg in another
+    /// venue's namespace — refused at runtime in every profile.
+    ///
+    /// Returns what the roll RETIRED ([`RollRetired`], read before the
+    /// rebind overwrites the slots); `None` — nothing bound — when the
+    /// symbol, the ids or the names do not fit, or the table has no room
+    /// for both legs.
+    #[must_use]
+    pub(crate) fn bind_roll(&mut self, sym_yes: u32, outcome: u32) -> Option<RollRetired> {
+        let ord = core_types::symbol_ordinal(sym_yes);
+        if sym_yes == core_types::SYMBOL_ID_NONE || ord >= core_types::SYMBOL_ORDINAL_MASK {
+            return None;
+        }
+        let syms = [sym_yes, sym_yes + 1];
+        let mut coins = [[0u8; COIN_MAX]; 2];
+        let mut lens = [0usize; 2];
+        let mut assets = [0u32; 2];
+        let mut side = 0usize;
+        while side < 2 {
+            assets[side] = Self::asset_id(outcome, side as u8)?;
+            lens[side] = Self::outcome_coin(outcome, side as u8, &mut coins[side])?;
+            side += 1;
+        }
+        if !self.would_fit(&syms) {
+            return None;
+        }
+        // LAW E-8: what the roll retires, recorded before the bind
+        // overwrites the slot. A REPEAT of the live roll retires nothing:
+        // the venue pushes `outcomeCreated` once and replays none on a
+        // reconnect (probed 2026-09-26), but a replayed ring entry carries
+        // one — and a sweep of the LIVE leg would cancel every quote on it
+        // the moment the member quotes it.
+        let mut retired: RollRetired = [None, None];
+        side = 0;
+        while side < 2 {
+            if let Some((asset, coin, coin_len)) = self.bound(syms[side]) {
+                if asset != assets[side] {
+                    retired[side] = Some((asset, coin, coin_len));
+                }
+            }
+            side += 1;
+        }
+        // From here nothing can fail: both names are non-empty and within
+        // `COIN_MAX` by construction, and the slots are known to be free.
+        // A failure would be a bug in `bind` — `debug_assert!` says so, and
+        // the release behaviour rolls the first leg back rather than leave
+        // a half-bound family.
+        side = 0;
+        while side < 2 {
+            let r = self.bind(
+                syms[side],
+                assets[side],
+                u64::from(outcome),
+                &coins[side][..lens[side]],
+            );
+            debug_assert!(r.is_ok(), "a prechecked bind failed: {r:?}");
+            if r.is_err() {
+                let mut done = 0usize;
+                while done < side {
+                    self.unbind(syms[done]);
+                    done += 1;
+                }
+                return None;
+            }
+            side += 1;
+        }
+        Some(retired)
     }
 
     /// Walk every live leg as `(sym, coin, booked_1e6)`.
@@ -735,6 +929,48 @@ impl AssetTable {
         self.sym_of_coin_gen(coin).map(|(sym, _)| sym)
     }
 
+    /// XH4i-3b: the leg an asset id names, and WHICH GENERATION — `true`
+    /// for the leg live now, `false` for the one a roll just retired (a
+    /// late fill, a settlement). The gateway names a leg by its asset
+    /// (`CoinMap::with_outcomes`), the blocking arm by its coin; the rules
+    /// are [`Self::sym_of_coin_gen`]'s: the current generation first, the
+    /// previous only when nothing live answers and only where a roll moved
+    /// the slot, and two answers are none.
+    #[inline]
+    #[must_use]
+    pub fn sym_of_asset_gen(&self, asset: u32) -> Option<(u32, bool)> {
+        let mut hit: Option<(u32, bool)> = None;
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: `i` is bounded by the loop condition and the
+            // array is exactly ASSET_SLOTS long.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.asset == asset {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some((s.sym, true));
+            }
+            i += 1;
+        }
+        if hit.is_some() {
+            return hit;
+        }
+        let mut i = 0usize;
+        while i < ASSET_SLOTS {
+            // SAFETY: as above.
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s.live && s.prev_coin_len != 0 && s.prev_asset == asset {
+                if hit.is_some() {
+                    return None;
+                }
+                hit = Some((s.sym, false));
+            }
+            i += 1;
+        }
+        hit
+    }
+
     /// As [`Self::sym_of_coin`], but says WHICH GENERATION matched:
     /// `true` for the leg live right now, `false` for the one that
     /// just rolled off.
@@ -873,6 +1109,34 @@ mod tests {
         assert_eq!(asset_of_fill_coin(b"BTC"), None);
     }
 
+    /// XH4i-2: a spot sheet's leg by the same rule in the balance
+    /// namespace — `+<enc>` only, canonical digits, an id that fits; the
+    /// two parsers never take each other's spelling.
+    #[test]
+    fn a_balance_coin_names_its_leg_by_the_same_rule() {
+        assert_eq!(
+            asset_of_balance_coin(b"+194180"),
+            Some(ASSET_BASE + 194_180)
+        );
+        assert_eq!(
+            asset_of_balance_coin(b"+32530"),
+            AssetTable::asset_id(3253, 0)
+        );
+        assert_eq!(asset_of_balance_coin(b"+0"), Some(ASSET_BASE));
+        assert_eq!(asset_of_balance_coin(b"#194180"), None, "a fill name");
+        assert_eq!(asset_of_balance_coin(b"+0194180"), None, "a leading zero");
+        assert_eq!(asset_of_balance_coin(b"+19a1"), None);
+        assert_eq!(asset_of_balance_coin(b"+-1"), None);
+        assert_eq!(asset_of_balance_coin(b"+"), None);
+        assert_eq!(asset_of_balance_coin(b"+4194967296"), None, "past u32");
+        assert_eq!(
+            asset_of_balance_coin(b"+123456789012345678901"),
+            None,
+            "over 20 bytes"
+        );
+        assert_eq!(asset_of_balance_coin(b"USDC"), None);
+    }
+
     #[test]
     fn an_empty_table_refuses_everything() {
         let t = AssetTable::new();
@@ -935,6 +1199,29 @@ mod tests {
     #[test]
     fn the_table_is_cache_line_aligned() {
         assert_eq!(core::mem::align_of::<AssetTable>(), 64);
+    }
+
+    /// XH4i-3b: a leg is found by its asset id — the live generation, or
+    /// the one a roll just retired; never through a slot no roll has moved
+    /// (asset 0 is a real perp), and never when two slots answer.
+    #[test]
+    fn a_leg_is_found_by_its_asset_in_either_generation() {
+        let mut t = AssetTable::new();
+        let a = AssetTable::asset_id(3_253, 0).expect("id");
+        let b = AssetTable::asset_id(3_254, 0).expect("id");
+        t.bind(4_096, a, 3_253, b"#32530").expect("bind");
+        assert_eq!(t.sym_of_asset_gen(a), Some((4_096, true)));
+        assert_eq!(
+            t.sym_of_asset_gen(0),
+            None,
+            "no roll moved it: no old generation"
+        );
+        t.bind(4_096, b, 3_254, b"#32540").expect("rebind");
+        assert_eq!(t.sym_of_asset_gen(b), Some((4_096, true)));
+        assert_eq!(t.sym_of_asset_gen(a), Some((4_096, false)));
+        t.bind(4_098, b, 3_254, b"#32540")
+            .expect("a second slot on one asset");
+        assert_eq!(t.sym_of_asset_gen(b), None, "two answers are none");
     }
 
     #[test]

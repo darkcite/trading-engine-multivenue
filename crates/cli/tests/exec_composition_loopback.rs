@@ -851,6 +851,7 @@ mod slot_six {
             budget_floor: 2_000,
             limit_ms: 600_000,
             leverage: 0,
+            outcomes: false,
         };
         let (eng, end) = hl_duplex();
         let arm = HlGatewayArm::new(&cfg, eng).expect("arm");

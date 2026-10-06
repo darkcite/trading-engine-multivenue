@@ -784,7 +784,8 @@ fn coins_and_family_bound_to_2649() -> (HlCoinTable, ingress_hyperliquid::family
             [rolling_sym(0, 0), rolling_sym(0, 1)],
         )
         .expect("push");
-    let spec = parse_outcome_spec(2649, DESC_2649);
+    let mut spec = parse_outcome_spec(2649, DESC_2649);
+    spec.set_venue(Some(ingress_hyperliquid::family::OUT_VENUE));
     assert_eq!(spec.expiry_ns, EXPIRY_2649_NS);
     // One minute before 2649 expires — inside its window.
     assert_eq!(

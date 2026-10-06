@@ -19,6 +19,7 @@
 //! | [`EV_HALT`] | the gateway | the gateway halted (`aux` = the halt reason) |
 //! | [`EV_OPEN_ORDER`] | a read (XH4d) | one resting order of the account: `asset`, `oid`, and `slot` / `client_oid` from its cloid ([`SLOT_FOREIGN`] when not ours) |
 //! | [`EV_POSITION`] | a read (XH4d) | one perp position: `asset`, `sz_1e8` = signed size, `aux` = its value at the venue's mark (USD ×1e8) |
+//! | [`EV_BALANCE`] | a spot read (XH4i-2) | one outcome leg the account holds, on a gateway whose map names outcome legs: `asset` (its `+<enc>`, or [`ASSET_UNKNOWN`] when the name does not parse), `sz_1e8` = the holding (`total`), `px_1e8` = the venue's `entryNtl` (USD ×1e8, raw — `recon::leg_cost_1e6` values it); the read's end then counts the rows in `oid` and carries [`SPOT_LEGS_READ`] |
 //! | [`EV_READ_DONE`] / [`EV_READ_FAILED`] | a read (XH4d, XH4e, XH5b-1) | the read's end (`reason` = [`READ_ORDERS`] / [`READ_STATE`] / [`READ_LIMIT`] / [`READ_DAY`] / [`READ_SPOT`]; `aux` = rows, `px_1e8` = the account value and `venue_ms` its time for a state read; the budget, day and spot reads' fields at their constants — a day page's `sz_1e8` counts the rows whose time ran backward) or its failure; `client_oid` / `slot` are the read command's |
 //!
 //! A post reply's `filled` is an [`EV_ACK`], never [`EV_FILLED`]: the
@@ -75,6 +76,13 @@ pub const EV_READ_DONE: u8 = 14;
 /// A read that did not answer, or answered what does not scan: no rows
 /// of it count (XH4d).
 pub const EV_READ_FAILED: u8 = 15;
+/// A read's row (XH4i-2): one outcome leg the account holds, from a spot
+/// read on a gateway whose map names outcome legs — `asset` (its
+/// `+<enc>`, or [`ASSET_UNKNOWN`] when the name does not parse), `sz_1e8`
+/// = the holding (`total`), `px_1e8` = the venue's `entryNtl` (USD ×1e8,
+/// raw: `recon::leg_cost_1e6` values it). A settled husk (a zero holding)
+/// and any other token are not rows.
+pub const EV_BALANCE: u8 = 16;
 
 /// A read's `reason`: the account's resting orders (`frontendOpenOrders`).
 pub const READ_ORDERS: u8 = 1;
@@ -91,8 +99,18 @@ pub const READ_DAY: u8 = 4;
 /// A read's `reason` (XMM XH5b-1): the account's spot sheet
 /// (`spotClearinghouseState`) — `aux` = rows, `px_1e8` = the USDC `total`
 /// (USD ×1e8), `sz_1e8` = 1 when the sheet lists USDC (0, and `px_1e8` 0,
-/// when it lists none).
+/// when it lists none). On a gateway whose map names outcome legs
+/// (XH4i-2) its [`EV_BALANCE`] rows come first, `oid` counts them and
+/// `asset` is [`SPOT_LEGS_READ`].
 pub const READ_SPOT: u8 = 5;
+
+/// [`READ_SPOT`]'s end from a gateway whose map names outcome legs
+/// (XH4i-2): its `asset`, the HIP-4 id base — the mark of a sheet read
+/// for legs. A perps-only gateway's end carries 0, and an outcome arm
+/// refuses it: no row could have come, legs held or not. A mark, not a
+/// leg: it equals leg `#0`'s id, so a consumer reads it only on an end
+/// whose kind and reason say so.
+pub const SPOT_LEGS_READ: u32 = crate::asset::ASSET_BASE;
 
 /// [`EV_GAP`]: a `userFills` frame did not scan.
 pub const GAP_FILLS_UNREADABLE: u64 = 1;
@@ -199,7 +217,8 @@ pub struct ExecEvent {
     pub venue_ms: u64,
     /// The client id from our cloid; 0 = none.
     pub client_oid: u64,
-    /// The venue order id; 0 = none.
+    /// The venue order id; 0 = none. A read's end: see its `READ_*`
+    /// ([`READ_SPOT`]: the [`EV_BALANCE`] rows before it).
     pub oid: u64,
     /// Price, 1e8 (fill, limit, or average fill); [`EV_FILL_META`]: the
     /// fee, 1e8, signed (a rebate is negative).
@@ -210,7 +229,8 @@ pub struct ExecEvent {
     /// command refused before it had one); halt reason ([`EV_HALT`]); rows
     /// ([`EV_SNAPSHOT`]); `GAP_*` ([`EV_GAP`]).
     pub aux: u64,
-    /// Venue asset id, or [`ASSET_UNKNOWN`].
+    /// Venue asset id, or [`ASSET_UNKNOWN`]. A read's end: see its
+    /// `READ_*` ([`READ_SPOT`]: [`SPOT_LEGS_READ`], a mark, not a leg).
     pub asset: u32,
     /// `EV_*`.
     pub kind: u8,

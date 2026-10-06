@@ -966,6 +966,38 @@ pub fn outcome_meta_description(payload: &[u8]) -> Option<(u32, &[u8])> {
     None
 }
 
+/// **A-S7-47 — the deployer's venue of an `outcomeCreated` push**
+/// (`"venue":"out"` beside the description, venue-probed 2026-09-12),
+/// **borrowed from the rx buffer** like the description, for
+/// [`discovery::HlOutcomeSpec::set_venue`](crate::discovery::HlOutcomeSpec::set_venue).
+/// `None` for a push naming no venue (HyperCore's own recurring rows), a
+/// venue that is no string, and every other lifecycle kind. A venue name
+/// is an identifier: no escape can end it early except into a name that
+/// matches no family.
+#[inline]
+#[must_use]
+pub fn outcome_meta_venue(payload: &[u8]) -> Option<&[u8]> {
+    memchr::memmem::find(payload, b"\"outcomeCreated\"")?;
+    outcome_venue_field(payload)
+}
+
+/// [`outcome_meta_venue`] past its kind check, for a caller inside the
+/// created push's branch already (the run loop: one payload scan less).
+/// A `venue` key whose value is no string yields an empty name — a
+/// stranger's, never native.
+#[inline]
+#[must_use]
+pub(crate) fn outcome_venue_field(payload: &[u8]) -> Option<&[u8]> {
+    let pos = find_field(payload, b"\"venue\":")?;
+    let q = skip_ws(payload, pos);
+    if payload.get(q) != Some(&b'"') {
+        return payload.get(q..q);
+    }
+    let start = q + 1;
+    let end = start + memchr::memchr(b'"', payload.get(start..)?)?;
+    Some(&payload[start..end])
+}
+
 /// Parse a `subscriptionResponse` echo: returns the acknowledged
 /// channel and (for per-coin channels) the echoed coin bytes.
 /// `None` when the echo is not a `subscribe` ack (e.g. unsubscribe)
@@ -1856,6 +1888,11 @@ mod tests {
         assert_eq!(spec.grammar, crate::discovery::HlOutcomeGrammar::OutBinaryPrice);
         assert_eq!(spec.strike_1e6, 77_177_000_000);
         assert_eq!(spec.twap_s, 60);
+        // A-S7-47: the deployer's venue beside it, borrowed too.
+        let venue = crate::outcome_meta_venue(OUTCOME_LIVE_CREATED).expect("the venue");
+        assert_eq!(venue, b"out");
+        let at = venue.as_ptr() as usize;
+        assert!(at > base && at < base + OUTCOME_LIVE_CREATED.len());
 
         // Every other kind, and the legacy shape (no description).
         assert!(outcome_meta_description(OUTCOME_LIVE_SETTLED).is_none());

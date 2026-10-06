@@ -44,12 +44,10 @@ use std::time::{Duration, Instant};
 use clob_dispatcher::{DispatchError, DispatchStats, OrderDispatch};
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_ring::Producer;
-use core_types::{
-    CancelReq, ChannelEvent, ChannelId, Fill, ModifyReq, NsTs, Order, Side, Tick, VenueId,
-};
+use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, Side, Tick};
 
 use crate::action::{encode_order, OrderWire, Tif, MAX_ACTION};
-use crate::asset::AssetTable;
+use crate::asset::{AssetTable, RollOf};
 use crate::budget::{self, AddressBudget};
 use crate::cloid::encode as encode_cloid;
 use crate::config::HlConfig;
@@ -2796,126 +2794,38 @@ impl<const FILL_N: usize> OrderDispatch for HlExchange<FILL_N> {
     /// overwrites in place and carries the old name forward. Dropping
     /// the binding here would throw away a real fill to tidy a table.
     fn on_venue_event(&mut self, event: &ChannelEvent) {
-        if event.channel != ChannelId::InstrumentRoll as u8 {
-            return;
-        }
-        if event.venue != VenueId::Hyperliquid as u8 {
-            return;
-        }
-        let Some((outcome, settled)) = unpack_roll(event.venue_seq) else {
-            // A kind byte no packer of ours writes. Neither created nor
-            // settled — refused, never guessed (core_types::roll_kind_strict).
+        let (sym_yes, outcome) = match crate::asset::roll_of(event) {
+            RollOf::NotARoll => return,
+            RollOf::Refused => {
+                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
+                return;
+            }
+            RollOf::Settled => {
+                self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
+                return;
+            }
+            RollOf::Created { sym_yes, outcome } => (sym_yes, outcome),
+        };
+        // Both legs or neither (`AssetTable::bind_roll`, XH4i-3a — the
+        // gateway arm's outcome mode binds the same way).
+        let Some(retired) = self.assets.bind_roll(sym_yes, outcome) else {
             self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
             return;
         };
-        if settled {
-            self.counters.rolls_settled = self.counters.rolls_settled.wrapping_add(1);
-            return;
-        }
-        // A created roll with no outcome names nothing. Refuse rather
-        // than bind slot 0 of somebody's market.
-        if outcome == 0 {
-            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-            return;
-        }
-        // BOTH LEGS OR NEITHER. Everything that can fail is computed
-        // and checked before the first mutation, because a table left
-        // holding the Yes leg and not the No would book one side of a
-        // position and count the other as a stranger's fill — while
-        // `rolls_refused` said nothing had been bound.
-        //
-        // The YES leg is what the wire carries; NO is the next ordinal
-        // (the boot ordinal law, not an inference of this crate's).
-        // `sym + 1` is the NO leg — but `sym` comes off the wire, and
-        // this crate has twice refused an unchecked add on exactly
-        // this kind of value. Release sets `overflow-checks = false`,
-        // the ordinal field is 24 bits, and `SYMBOL_ID_NONE` is
-        // `u32::MAX`, so an unchecked `+ 1` could carry out of the
-        // ordinal into the VENUE byte and bind a leg in another
-        // venue's namespace. Refused at runtime in every profile, the
-        // same ruling `AssetTable::asset_id` got.
-        let ord = core_types::symbol_ordinal(event.sym);
-        if event.sym == core_types::SYMBOL_ID_NONE || ord >= core_types::SYMBOL_ORDINAL_MASK {
-            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-            return;
-        }
-        let syms = [event.sym, event.sym + 1];
-        let mut coins = [[0u8; crate::asset::COIN_MAX]; 2];
-        let mut lens = [0usize; 2];
-        let mut assets = [0u32; 2];
-        for side in 0usize..2 {
-            let Some(a) = AssetTable::asset_id(outcome, side as u8) else {
-                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-                return;
-            };
-            let Some(n) = AssetTable::outcome_coin(outcome, side as u8, &mut coins[side]) else {
-                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-                return;
-            };
-            assets[side] = a;
-            lens[side] = n;
-        }
-        if !self.assets.would_fit(&syms) {
-            self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-            return;
-        }
-
-        // LAW E-8 — what this roll RETIRES, recorded before the bind
-        // overwrites the slot. Queued rather than swept here: a sweep
-        // is one info round trip plus a cancel per resting order, and
-        // `on_venue_event` runs INLINE ON THE ENGINE THREAD. Blocking
-        // it at roll time is blocking it at the exact moment the
-        // member wants to quote the successor. The idle path is where
-        // a blocking HTTPS round trip belongs — the same reasoning
-        // `reconcile` already carries — and it gives the operator's
-        // "retry on the next idle" ruling for free.
-        // A range loop: it indexes BOTH `syms` and `assets`, so there
-        // is no `- 1` for an off-by-one to hide in. (`syms.iter()`
-        // would borrow `syms` across the `&mut self` call — the same
-        // reason the rollback loop below carries its allow.)
-        for side in 0..syms.len() {
-            if let Some((asset, coin, coin_len)) = self.assets.bound(syms[side]) {
-                // A REPEAT of the roll that is already live retires
-                // nothing. A replayed ring entry carries one (the venue
-                // itself pushes `outcomeCreated` once and replays none
-                // on a reconnect — probed 2026-09-26) — and without
-                // this the sweep would enumerate the account and cancel
-                // every one of our quotes on a LIVE leg, at the moment
-                // the member is quoting it.
-                if asset != assets[side] {
-                    self.queue_sweep(asset, coin, coin_len, crate::recon::ALL_SLOTS);
-                }
+        // LAW E-8 — what this roll RETIRED, queued rather than swept here:
+        // a sweep is one info round trip plus a cancel per resting order,
+        // and `on_venue_event` runs INLINE ON THE ENGINE THREAD. Blocking
+        // it at roll time is blocking it at the exact moment the member
+        // wants to quote the successor. The idle path is where a blocking
+        // HTTPS round trip belongs — the same reasoning `reconcile`
+        // already carries — and it gives the operator's "retry on the next
+        // idle" ruling for free.
+        let mut side = 0usize;
+        while side < retired.len() {
+            if let Some((asset, coin, coin_len)) = retired[side] {
+                self.queue_sweep(asset, coin, coin_len, crate::recon::ALL_SLOTS);
             }
-        }
-
-        // From here nothing can fail: both names are non-empty and
-        // within COIN_MAX by construction, and the slots are known to
-        // be available. A failure here would be a bug in `bind`, and
-        // `debug_assert!` is how this file says so.
-        for side in 0usize..2 {
-            let r = self.assets.bind(
-                syms[side],
-                assets[side],
-                u64::from(outcome),
-                &coins[side][..lens[side]],
-            );
-            debug_assert!(r.is_ok(), "a prechecked bind failed: {r:?}");
-            if r.is_err() {
-                // Unreachable by construction, and `debug_assert!` is a
-                // no-op in the profile that trades — so this is the
-                // RELEASE behaviour on a `bind` bug. Roll the first leg
-                // back rather than return a half-bound family while
-                // the counter says nothing was bound.
-                // Index loop, per the doctrine — and clippy's
-                // `iter().take(side)` would borrow `syms` across the
-                // `&mut self.assets` call anyway.
-                #[allow(clippy::needless_range_loop)]
-                for done in 0usize..side {
-                    self.assets.unbind(syms[done]);
-                }
-                self.counters.rolls_refused = self.counters.rolls_refused.wrapping_add(1);
-                return;
-            }
+            side += 1;
         }
         self.counters.rolls_bound = self.counters.rolls_bound.wrapping_add(1);
     }
@@ -3118,33 +3028,6 @@ enum Reserve {
     Unknown,
 }
 
-/// The `InstrumentRoll` `venue_seq` layout, bits 0..32 and 56.
-///
-/// E6: no longer duplicated. §6.1 forbids this crate depending on the
-/// market-data crate, which is why the unpack was restated here — but
-/// the codec now lives in `core_types`, which this crate already
-/// depends on, so the restatement is gone and this is the projection
-/// onto the two fields the asset binding needs.
-///
-/// Bits 0..32 are the **outcome id**, NOT `enc`. `AssetTable::asset_id`
-/// and `outcome_coin` do the `× 10 + side` themselves, so feeding them
-/// `enc` would be a silent tenfold error naming a real other market.
-///
-/// `settled` is the STRICT reading (`core_types::roll_kind_strict`):
-/// `None` for a kind byte no packer of ours writes, which the caller
-/// refuses. The low-bit mask this used before read `0x03` as settled
-/// while `strategy_bin15` read it as created — one frame, two answers
-/// (E7 review, 2026-09-19); all three live readers share the strict
-/// one now.
-#[inline]
-const fn unpack_roll(seq: u64) -> Option<(u32, bool)> {
-    let (outcome, _twap_s, _family, _masked) = core_types::unpack_roll_seq(seq);
-    match core_types::roll_kind_strict(seq) {
-        Some(settled) => Some((outcome, settled)),
-        None => None,
-    }
-}
-
 /// Wall clock, nanoseconds. Read ONCE PER PUMP, never per fill.
 fn now_ns() -> NsTs {
     std::time::SystemTime::now()
@@ -3158,7 +3041,7 @@ mod tests {
     use super::*;
     use crate::config::{Scope, HOST_TESTNET};
     use core_ring::Ring;
-    use core_types::{Price, Qty, VenueId};
+    use core_types::{ChannelId, Price, Qty, VenueId};
 
     const KEY: [u8; 32] = [0x21; 32];
     const ADDR: [u8; 20] = [0x22; 20];
@@ -4068,14 +3951,14 @@ mod tests {
     fn a_hand_built_roll_seq_unpacks_the_way_the_ingress_packs_it() {
         // The ingress's own pinned vector: pack_roll_seq(2649, 60, 0, false).
         let seq = 2649u64 | (60u64 << 32);
-        assert_eq!(unpack_roll(seq), Some((2649, false)));
+        assert_eq!(crate::asset::unpack_roll(seq), Some((2649, false)));
         // The settled bit is bit 56, and the family byte must not leak
         // into the outcome id.
         let seq = 19_418u64 | (60u64 << 32) | (7u64 << 48) | (1u64 << 56);
-        assert_eq!(unpack_roll(seq), Some((19_418, true)));
+        assert_eq!(crate::asset::unpack_roll(seq), Some((19_418, true)));
         // Bits 0..32 are the OUTCOME ID, not `enc`. Confusing them is a
         // silent tenfold error naming a real other market.
-        let Some((o, _)) = unpack_roll(u64::from(u32::MAX)) else {
+        let Some((o, _)) = crate::asset::unpack_roll(u64::from(u32::MAX)) else {
             panic!("a CREATED frame with a full outcome id must unpack");
         };
         assert_eq!(o, u32::MAX);
@@ -4083,7 +3966,11 @@ mod tests {
         // either kind — `0x03` used to mask to "settled" here while
         // `strategy_bin15` read it as "created" (E7 review).
         let seq = 2649u64 | (60u64 << 32) | (3u64 << 56);
-        assert_eq!(unpack_roll(seq), None, "an unknown roll kind binds nothing");
+        assert_eq!(
+            crate::asset::unpack_roll(seq),
+            None,
+            "an unknown roll kind binds nothing"
+        );
     }
 
     /// LAW E-4's writer. One roll binds BOTH legs, and the No leg is

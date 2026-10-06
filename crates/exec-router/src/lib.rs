@@ -83,5 +83,5 @@ pub use route::{
     ExecRoute, ExecRouteErr, HaltLimits, PerpLimits, SlotCaps, EXEC_SLOTS, EXEC_VENUES,
 };
 pub use routed::{RoutedDispatcher, RETIRED_DRAIN_MAX};
-pub use split::SlotSplit;
+pub use split::{SlotSplit, NO_SLOT};
 pub use venue_split::{VenueSplit, SERVES_A, SERVES_B};

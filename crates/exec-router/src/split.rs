@@ -32,6 +32,18 @@ use clob_dispatcher::{
 };
 use core_types::{CancelReq, ChannelEvent, Fill, ModifyReq, NsTs, Order, SymbolId, Tick};
 
+/// **XMM XH4i-5 — the slot a split names when it names none**: every verb
+/// goes to `a`. The engine composes slot 3's gateway arm innermost —
+/// `SlotSplit(3, <shape>, Option<arm>)` — and with the arm absent its slot
+/// is this one. Neither a slot (`0..EXEC_SLOTS`) nor
+/// [`core_types::STRATEGY_ID_NONE`] (an unstamped order is the shape's).
+/// The Hyperliquid gateway's `SWEEP_SLOT` is 0xFE too: its own sweep
+/// posts' slot on its wire — another namespace, never a router slot.
+pub const NO_SLOT: u8 = 0xFE;
+const _: () = assert!(
+    NO_SLOT as usize >= crate::route::EXEC_SLOTS && NO_SLOT != core_types::STRATEGY_ID_NONE
+);
+
 /// Slot `slot`'s verbs go to `b`; every other slot's to `a`.
 pub struct SlotSplit<A: OrderDispatch, B: OrderDispatch> {
     slot: u8,

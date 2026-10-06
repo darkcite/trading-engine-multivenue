@@ -147,8 +147,27 @@
 //! stamped with the venue's time (wall), as the blocking arm stamps it:
 //! the router's day epoch is wall time.
 //!
-//! Engine thread, 0 B/op after boot (gate 98): fixed tables, fixed
-//! queues, linear scans over at most [`ARM_ORDERS`] rows.
+//! **The outcome mode (XH4i-3a; slot 3, BIN15's HIP-4 legs)** —
+//! [`ArmCfg::outcomes`], no perp and no leverage beside it. Legs are bound
+//! by roll events only ([`OrderDispatch::on_venue_event`]: both legs or
+//! neither, the blocking arm's `AssetTable::bind_roll`), and a place or a
+//! modify takes its asset from the binding for the instance its client id
+//! names (LAW E-4): a stale instance is refused and feeds the streak, a
+//! leg no roll bound is refused uncounted. `OutcomeRules` checks and never
+//! rounds. A MAKER rests as ALO whatever its flags, an IoC is an IoC, and
+//! no TTL rides on a leg (BIN15's orders rest until replaced or
+//! cancelled, as on the blocking arm). A cancel names the asset its row's
+//! place named. A roll that retires a leg cancels our rows on it and reads
+//! the orders at once (LAW E-8). A fill on a leg (XH4i-3b) resolves by its
+//! row, or — the row gone — by its asset, live or one roll back; only the
+//! live generation's fills credit the leg's ledger, and a settlement books
+//! only for the slot whose order the venue accepted on the leg.
+//!
+//! Engine thread, 0 B/op after boot (gate 98, the perps mode; gate 103, the
+//! outcome mode): fixed tables, fixed queues, linear scans over at most
+//! [`ARM_ORDERS`] rows. The boot allocates them, and in the outcome mode its
+//! state (≈ 19 KiB, 16 KiB of it the first snapshot's parked rows; boxed
+//! once).
 
 use std::sync::Arc;
 
@@ -160,8 +179,8 @@ use clob_dispatcher::{
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
 use core_time::now_ns;
 use core_types::{
-    CancelReq, Fill, ModifyReq, Order, OrderEvent, Price, Qty, Side, VenueId, FILL_ORIGIN_VENUE,
-    ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX,
+    CancelReq, Fill, ModifyReq, Order, OrderEvent, Price, Qty, Side, VenueId, FILL_FLAG_SETTLEMENT,
+    FILL_ORIGIN_VENUE, ORDER_EVENT_CANCELED, ORDER_EVENT_FILLED, ORDER_EVENT_REASON_BAD_ALO_PX,
     ORDER_EVENT_REASON_CANCEL_REQUESTED, ORDER_EVENT_REASON_EXPIRED, ORDER_EVENT_REASON_NONE,
     ORDER_EVENT_REASON_OTHER, ORDER_EVENT_REASON_REPLACED, ORDER_EVENT_REJECTED,
     ORDER_EVENT_RESTING,
@@ -171,20 +190,22 @@ use exec_gateway::{boxed_array, HALT_NONE};
 
 use crate::action::Tif;
 use crate::anchor::AnchorSlot;
+use crate::asset::{roll_of, AssetError, AssetTable, RollOf, ASSET_SLOTS};
 use crate::budget::{AddressBudget, TopupGovernor};
 use crate::cmd::{HlCmd, CMD_CANCEL};
 use crate::dayspend::{utc_day, DAY_MS, VENUE_PAGE_MAX};
 use crate::deadman::{DeadMan, DeadManCfg};
 use crate::event::{
-    never_left, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM, EV_ACK,
-    EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION,
-    EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED,
-    GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
-    REASON_IOC_MISS, REASON_NOT_FOUND, REASON_THROTTLED,
+    never_left, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CROSSED, EVF_FILLED, EVF_POST_ITEM,
+    EVF_SNAPSHOT, EV_ACK, EV_BALANCE, EV_CANCELED, EV_FILL, EV_FILLED, EV_FILL_META, EV_GAP,
+    EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED, EV_REJECTED, EV_RESTING,
+    EV_SNAPSHOT, EV_UNANSWERED, GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS,
+    READ_SPOT, READ_STATE, REASON_IOC_MISS, REASON_NOT_FOUND, REASON_SETTLEMENT, REASON_THROTTLED,
+    SLOT_FOREIGN, SPOT_LEGS_READ,
 };
 use crate::gateway::{pw, HlEngineEnd};
 use crate::nonce::now_ms;
-use crate::rules::{PerpRules, Round};
+use crate::rules::{OutcomeRules, PerpRules, Round};
 use crate::topup::{Keep, TopupSlot};
 use crate::ttl::TTL_MAX_MS;
 
@@ -337,6 +358,9 @@ const RB_UNLISTED: u8 = 1 << 5;
 /// XMM XH5d: its RESTING went out with the venue's time (the `open` row's):
 /// none repeats.
 const RB_STAMPED: u8 = 1 << 6;
+/// XH4i-3a (LAW E-8): a roll retired its leg — its cancel is owed, as an
+/// asked one is.
+const RB_RETIRED: u8 = 1 << 7;
 // XMM XH5c-2: a top-up's phases.
 /// None in flight: a budget read may decide one.
 const TU_IDLE: u8 = 0;
@@ -417,6 +441,12 @@ pub struct ArmCfg {
     /// XH4f (O-XH6): every bound perp's leverage, cross margin, set before
     /// the arm takes orders (≤ [`MAX_LEVERAGE`]); `0` = the venue's, unset.
     pub leverage: u8,
+    /// XH4i-3a: HIP-4 outcome legs instead of perps (slot 3, BIN15) — no
+    /// perp and no leverage beside it. Legs are bound by roll events
+    /// ([`OrderDispatch::on_venue_event`], LAW E-4), checked by
+    /// `OutcomeRules` and never rounded; a MAKER rests as ALO whatever its
+    /// flags (BIN15 sends none — the replay's queue law reads the flag).
+    pub outcomes: bool,
 }
 
 /// Why an arm cannot be built.
@@ -424,7 +454,8 @@ pub struct ArmCfg {
 pub enum ArmErr {
     /// A slot outside the engine's eight.
     Slot,
-    /// No perps, more than [`ARM_PERPS`], or one bound twice.
+    /// No perps (on a perps arm), more than [`ARM_PERPS`], or one bound
+    /// twice.
     Perps,
     /// A zero expiry, post timeout, read period, join, gone, shutdown or
     /// budget period, or one above its bound (60 s; the shutdown 30 s; the
@@ -440,6 +471,8 @@ pub enum ArmErr {
     /// XMM XH5c-2: top-ups armed on an account not the slot's own, or a
     /// weight past the purchase command's `u32` (refused, never truncated).
     Topup,
+    /// XH4i-3a: the outcome mode with a perp or a leverage beside it.
+    Outcomes,
 }
 
 /// What the arm has seen (its `/metrics` block, XH4f).
@@ -583,6 +616,12 @@ struct Row {
     seen: u8,
     /// The stream's reason, with `RB_ENDED`.
     end_reason: u8,
+    /// XH4i-3a: the venue asset its command named — a perp's binding, or
+    /// an outcome leg's roll binding at submit (LAW E-4) — which its cancel
+    /// names too.
+    asset: u32,
+    /// XH4i-3a: the engine symbol its order named (its events carry it).
+    sym: u32,
 }
 
 const _: () = assert!(core::mem::size_of::<Row>() == 64);
@@ -700,6 +739,155 @@ struct PerpState {
     last_px_1e8: i64,
 }
 
+/// XH4i-3a: what the outcome mode has seen (`HlGatewayArm::outcome_counters`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutcomeCounters {
+    /// Created rolls bound, both legs.
+    pub rolls_bound: u64,
+    /// Settled rolls: they bind and unbind nothing.
+    pub rolls_settled: u64,
+    /// Rolls refused: a kind no packer writes, no outcome, ids or names
+    /// that do not fit, a table without room for both legs.
+    pub rolls_refused: u64,
+    /// Orders refused naming an instance that has rolled (LAW E-4) — the
+    /// one refusal the streak counts.
+    pub refused_stale: u64,
+    /// Orders refused naming a leg no roll has bound.
+    pub refused_unbound: u64,
+    /// Orders refused by `OutcomeRules` (the member keeps to the grid:
+    /// one here is a bug).
+    pub refused_rules: u64,
+    /// Our rows on a leg a roll retired whose cancel went, or is kept as
+    /// intent behind a full ring (LAW E-8).
+    pub e8_cancels: u64,
+    /// XH4i-3b: settlements booked — the leg's owner is this slot.
+    pub settlements: u64,
+    /// XH4i-3b: settlements on a leg no accepted order of ours owns:
+    /// counted, never booked.
+    pub settlements_unowned: u64,
+    /// XH4i-3b: fills booked on a generation a roll retired — on their leg,
+    /// never credited to the successor's ledger.
+    pub fills_old_gen: u64,
+    /// XH4i-3b: our fills naming another asset than their row's place — not
+    /// booked (counted `fills_unresolved` too).
+    pub fills_mismatched: u64,
+    /// XH4i-3b: leg fills refused: a negative price, or no whole engine unit.
+    pub fills_refused: u64,
+    /// A-S7-83: repeats of the live roll, left alone.
+    pub rolls_repeated: u64,
+    /// XH4i-4: spot reads whose legs were compared with the ledger.
+    pub leg_reads: u64,
+    /// XH4i-4: … in which a live leg's holding differed from the ledger.
+    pub leg_drift_reads: u64,
+    /// XH4i-4: … in which the venue held a leg no live binding names (the
+    /// last instance's, until it settles; a stranger's).
+    pub leg_unseen_reads: u64,
+    /// XH4i-5: first-snapshot rows that came before their leg's roll, kept
+    /// for it — booked once it binds (256 at most).
+    pub snapshot_parked: u64,
+}
+
+impl OutcomeCounters {
+    /// All zero — what a perps arm's report reads (no copy of a live set).
+    pub const ZERO: Self = Self {
+        rolls_bound: 0,
+        rolls_settled: 0,
+        rolls_refused: 0,
+        refused_stale: 0,
+        refused_unbound: 0,
+        refused_rules: 0,
+        e8_cancels: 0,
+        settlements: 0,
+        settlements_unowned: 0,
+        fills_old_gen: 0,
+        fills_mismatched: 0,
+        fills_refused: 0,
+        rolls_repeated: 0,
+        leg_reads: 0,
+        leg_drift_reads: 0,
+        leg_unseen_reads: 0,
+        snapshot_parked: 0,
+    };
+}
+
+/// XH4i-3a: the outcome mode's state — LAW E-4's table, written by roll
+/// events only — and its counters; XH4i-4: the spot read's legs, their cost
+/// and their verdict. Boxed: `None` on a perps arm.
+struct OutcomeState {
+    assets: AssetTable,
+    counters: OutcomeCounters,
+    /// The spot read in flight: its leg rows, taken as they come.
+    spot: LegRead,
+    /// The last whole spot read's legs at cost, USD ×1e6 — the worth's
+    /// third half (`recon::account_view`'s equity at cost).
+    held_cost_1e6: i64,
+    /// Whether that read's legs agreed with the ledger, none unseen.
+    legs_ok: bool,
+    /// That read's worst leg drift, contracts ×1e6 — a drift must survive
+    /// two reads (a fill in flight).
+    prev_worst_1e6: i64,
+    /// XH4i-5 (risk review r1): the first snapshot's rows on legs no roll
+    /// had bound yet — the snapshot can beat the ingress's boot roll — in
+    /// arrival order, replayed as each roll binds.
+    parked: [ExecEvent; PARKED],
+    n_parked: usize,
+}
+
+/// XH4i-5: the first snapshot's rows the arm keeps for their legs' rolls —
+/// a day of BIN15's fills and settlements several times over (64 B each,
+/// 16 KiB, boxed with the state once at boot).
+const PARKED: usize = 256;
+
+/// A-S7-83: `outcome`'s legs are the ones bound to `sym_yes` and the next
+/// ordinal now.
+fn repeats_live_roll(assets: &AssetTable, sym_yes: u32, outcome: u32) -> bool {
+    let Some(sym_no) = sym_yes.checked_add(1) else {
+        return false;
+    };
+    let (Some(yes), Some(no)) = (
+        AssetTable::asset_id(outcome, 0),
+        AssetTable::asset_id(outcome, 1),
+    ) else {
+        return false;
+    };
+    matches!(assets.bound(sym_yes), Some((a, _, _)) if a == yes)
+        && matches!(assets.bound(sym_no), Some((a, _, _)) if a == no)
+}
+
+/// XH4i-4: one spot read's leg rows, taken as they come (none stored): the
+/// rows taken (the marked end must count them), their cost (every row, as
+/// `recon::account_view` sums it), each live leg's holding (the first row of
+/// a leg, `recon::compare_booked`'s rule) and the rows no live leg names.
+struct LegRead {
+    rows: u64,
+    cost_1e6: i64,
+    unseen: u32,
+    n: u32,
+    syms: [u32; ASSET_SLOTS],
+    venue_1e6: [i64; ASSET_SLOTS],
+}
+
+impl LegRead {
+    /// A new read: its counts reset — the arrays are read below `n` alone,
+    /// so their 400 B are never rewritten.
+    #[inline]
+    fn clear(&mut self) {
+        self.rows = 0;
+        self.cost_1e6 = 0;
+        self.unseen = 0;
+        self.n = 0;
+    }
+
+    const EMPTY: Self = Self {
+        rows: 0,
+        cost_1e6: 0,
+        unseen: 0,
+        n: 0,
+        syms: [0; ASSET_SLOTS],
+        venue_1e6: [0; ASSET_SLOTS],
+    };
+}
+
 /// The engine's half of one Hyperliquid gateway arm.
 pub struct HlGatewayArm {
     cfg: ArmCfg,
@@ -749,6 +937,8 @@ pub struct HlGatewayArm {
     unknown_this_read: u32,
     // Positions.
     perps: Box<[PerpState; ARM_PERPS]>,
+    /// XH4i-3a: the outcome mode (slot 3); `None` on a perps arm.
+    outcome: Option<Box<OutcomeState>>,
     seeded: bool,
     seed_ms: u64,
     preseed: Box<[(u8, i64, u64); PRESEED]>,
@@ -862,7 +1052,8 @@ pub struct HlGatewayArm {
 // lives behind it) and `spot_failed` (17 B) fit that line's padding; XMM
 // XH5c-2's top-ups — the governor (40 B), the keeper's handle, the phase,
 // five words, five flags and three counters (118 B) — took two more lines;
-// XMM XH5d-3a's priority cap and tally (two u32s, 8 B) fit their padding.
+// XMM XH5d-3a's priority cap and tally (two u32s, 8 B) fit their padding;
+// XH4i-3a's outcome state (an 8 B `Option<Box<_>>`) fit it too.
 const _: () = assert!(core::mem::size_of::<HlGatewayArm>() == 1_792);
 
 /// XMM XH5d: what a place bidding ALO priority `p` (×1e8 of resting
@@ -918,7 +1109,11 @@ impl HlGatewayArm {
         if cfg.slot >= 8 {
             return Err(ArmErr::Slot);
         }
-        if cfg.n_perps == 0 || cfg.n_perps > ARM_PERPS {
+        if cfg.outcomes {
+            if cfg.n_perps != 0 || cfg.leverage != 0 {
+                return Err(ArmErr::Outcomes);
+            }
+        } else if cfg.n_perps == 0 || cfg.n_perps > ARM_PERPS {
             return Err(ArmErr::Perps);
         }
         let mut i = 0usize;
@@ -997,6 +1192,25 @@ impl HlGatewayArm {
             excl_lost_ns: 0,
             unknown_this_read: 0,
             perps: boxed_array(PerpState::default()),
+            // COPY: the outcome mode's state — its table (32 legs), its
+            // counters, its spot read's legs and the first snapshot's parked
+            // rows, ≈ 19 KiB — built on the stack and moved to the heap, once
+            // at boot — rejected: an unsafe in-place initialisation of a type
+            // with private fields.
+            outcome: if cfg.outcomes {
+                Some(Box::new(OutcomeState {
+                    assets: AssetTable::new(),
+                    counters: OutcomeCounters::default(),
+                    spot: LegRead::EMPTY,
+                    held_cost_1e6: 0,
+                    legs_ok: false,
+                    prev_worst_1e6: 0,
+                    parked: [ExecEvent::default(); PARKED],
+                    n_parked: 0,
+                }))
+            } else {
+                None
+            },
             seeded: false,
             seed_ms: 0,
             preseed: boxed_array((0, 0, 0)),
@@ -1323,11 +1537,10 @@ impl HlGatewayArm {
         None
     }
 
-    /// Row `i`'s bound perp (its index is below [`ARM_PERPS`] by
-    /// construction; the mask folds the check).
-    #[inline(always)]
-    fn bind(&self, i: usize) -> &PerpBind {
-        &self.cfg.perps[usize::from(self.rows[i].perp) & (ARM_PERPS - 1)]
+    /// XH4i-3a: the outcome mode's counters; `None` on a perps arm.
+    #[must_use]
+    pub fn outcome_counters(&self) -> Option<OutcomeCounters> {
+        self.outcome.as_deref().map(|o| o.counters)
     }
 
     /// Orders the arm holds that may be on the book or may land.
@@ -1395,7 +1608,7 @@ impl HlGatewayArm {
         let ev = OrderEvent::new(
             now,
             VenueId::Hyperliquid,
-            self.bind(i).sym,
+            self.rows[i].sym,
             self.rows[i].client_oid,
             self.cfg.slot,
             kind,
@@ -1490,7 +1703,7 @@ impl HlGatewayArm {
             prev,
             self.rows[i].client_oid,
             self.rows[i].qty_1e8 / WIRE_PER_ENGINE,
-            self.bind(i).sym,
+            self.rows[i].sym,
             self.cfg.slot,
             self.rows[i].bits & RB_ASK == 0,
         );
@@ -1513,8 +1726,11 @@ impl HlGatewayArm {
     /// A modify that did not land ended (its row already closed): its
     /// predecessor rests on — or, if the stream ended it meanwhile (the
     /// venue drops the original of a refused modify), closes as the
-    /// stream said.
-    fn release(&mut self, prev: u64, now: u64) {
+    /// stream said. `asked`: the member cancelled the replacement while the
+    /// modify was out — it holds no order of it any more, so the predecessor
+    /// resting on is cancelled too, never left on the venue untracked (XH4i-5,
+    /// risk review r1).
+    fn release(&mut self, prev: u64, asked: bool, now: u64) {
         if prev == 0 {
             return;
         }
@@ -1523,6 +1739,12 @@ impl HlGatewayArm {
         };
         self.rows[p].bits &= !RB_REPLACING;
         if self.rows[p].state != ST_GONE {
+            if asked {
+                self.rows[p].bits |= RB_ASKED;
+                if self.rows[p].state != ST_FILLING && self.rows[p].cancel != CX_SENT {
+                    self.push_cancel(p, now);
+                }
+            }
             return;
         }
         if self.rows[p].bits & RB_ENDED != 0 {
@@ -1536,8 +1758,36 @@ impl HlGatewayArm {
         }
     }
 
+    /// XH4i-3a — LAW E-8 on the gateway (A-S7-76): a roll retired `asset`.
+    /// Every row of ours on it the venue may hold — not one already filling,
+    /// not one whose cancel is out — is cancelled by the asset its place
+    /// named (a full ring keeps the cancel as intent), and the orders are
+    /// read at once: anything else of the slot's left on the old leg is
+    /// listed, and `unlisted_order` cancels it under the venue's own name.
+    /// Every row on it not filling is marked `RB_RETIRED` — the one whose
+    /// cancel is already out too: a "not found" about an order that still
+    /// rests leaves its cancel owed, and the listing that brings the row
+    /// back sends it again (`on_open_order`), as for a member's own.
+    fn retire_asset(&mut self, asset: u32, now: u64) {
+        let n = self.n_rows.min(ARM_ORDERS);
+        let mut i = 0usize;
+        while i < n {
+            if self.rows[i].asset == asset && self.rows[i].state != ST_FILLING {
+                self.rows[i].bits |= RB_RETIRED;
+                if self.rows[i].cancel != CX_SENT {
+                    self.push_cancel(i, now);
+                    if let Some(st) = self.outcome.as_deref_mut() {
+                        st.counters.e8_cancels += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+        self.reread = true;
+    }
+
     fn push_cancel(&mut self, i: usize, now: u64) {
-        let asset = self.bind(i).asset;
+        let asset = self.rows[i].asset;
         if self
             .end
             .cmd
@@ -1674,6 +1924,7 @@ impl HlGatewayArm {
             }
             EV_OPEN_ORDER => self.on_open_order(e, now),
             EV_POSITION => self.on_position(e),
+            EV_BALANCE => self.on_balance(e),
             EV_READ_DONE | EV_READ_FAILED => self.on_read_end(e, now),
             // The halt word reaches the signal from the stats block.
             EV_HALT => {}
@@ -1693,6 +1944,14 @@ impl HlGatewayArm {
         self.reject_streak = 0;
         self.asset_refusal_streak = 0;
         self.stats.accepted += 1;
+        if let Some(st) = self.outcome.as_deref_mut() {
+            // XH4i-3a: the slot that trades the leg — what a settlement is
+            // attributed by (learned from our own accepted orders, never
+            // from a roll or a fill; the blocking arm's rule). One arm is one
+            // slot and the table is its own: no leg of it can be contested.
+            let contested = st.assets.note_owner(self.rows[i].sym, self.cfg.slot);
+            debug_assert!(!contested, "one arm, one slot: a leg is never contested");
+        }
         if self.rows[i].bits & RB_ALO != 0 {
             self.alo_note(false);
         }
@@ -1765,9 +2024,9 @@ impl HlGatewayArm {
                 self.alo_note(false);
             }
         }
-        let prev = self.rows[i].prev;
+        let (prev, asked) = (self.rows[i].prev, self.rows[i].bits & RB_ASKED != 0);
         self.close(i, ORDER_EVENT_REJECTED, e.reason, now);
-        self.release(prev, now);
+        self.release(prev, asked, now);
     }
 
     fn cancel_refused(&mut self, i: usize, reason: u8, unsent: bool, now: u64) {
@@ -1785,9 +2044,9 @@ impl HlGatewayArm {
             ST_DOUBT if now >= self.doubt_due(i) => {
                 // Past its expiry and a skew: it never landed.
                 self.counters.doubt_settled += 1;
-                let prev = self.rows[i].prev;
+                let (prev, asked) = (self.rows[i].prev, self.rows[i].bits & RB_ASKED != 0);
                 self.close(i, ORDER_EVENT_REJECTED, ORDER_EVENT_REASON_EXPIRED, now);
-                self.release(prev, now);
+                self.release(prev, asked, now);
             }
             // It may still land: the cancel goes again at the doubt's end.
             ST_DOUBT => {
@@ -1838,9 +2097,9 @@ impl HlGatewayArm {
         };
         let st = self.rows[i].state;
         if st == ST_SENT || st == ST_DOUBT {
-            let prev = self.rows[i].prev;
+            let (prev, asked) = (self.rows[i].prev, self.rows[i].bits & RB_ASKED != 0);
             self.close(i, ORDER_EVENT_REJECTED, e.reason, now);
-            self.release(prev, now);
+            self.release(prev, asked, now);
         }
     }
 
@@ -1928,6 +2187,10 @@ impl HlGatewayArm {
                 && !self.day_done
                 && (e.venue_ms == 0 || e.venue_ms > self.day_until_ms),
         ));
+        if self.outcome.is_some() {
+            self.on_leg_fill(e, now);
+            return;
+        }
         if e.slot != self.cfg.slot {
             self.counters.fills_foreign += 1;
             return;
@@ -1964,6 +2227,145 @@ impl HlGatewayArm {
             let i = self.landed(i, now);
             self.rows[i].filled_1e8 += e.sz_1e8;
             let _ = self.maybe_filled(i, now);
+        }
+    }
+
+    /// XH4i-3b: a fill on an outcome leg — the blocking arm's `route_frame`
+    /// rules, read off the gateway's event (its tid admitted there). Ours
+    /// resolves by its row — the leg and the asset its place named — and
+    /// must name that asset: a mismatch is counted, never booked. One whose
+    /// row is gone resolves by its asset, the live generation or the one a
+    /// roll just retired. A settlement — the venue's row, with no cloid and
+    /// so no slot — is booked only for the slot that traded the leg (learned
+    /// from our own accepted orders), flagged, under the venue's order id;
+    /// otherwise counted. A fill on a retired generation reaches the member
+    /// on its leg but never credits the successor's ledger.
+    fn on_leg_fill(&mut self, e: &ExecEvent, now: u64) {
+        let settlement =
+            e.slot == SLOT_FOREIGN && e.reason == REASON_SETTLEMENT && e.client_oid == 0;
+        if e.slot != self.cfg.slot && !settlement {
+            self.counters.fills_foreign += 1;
+            return;
+        }
+        let row = if settlement {
+            None
+        } else {
+            self.find(e.client_oid)
+        };
+        let Some(st) = self.outcome.as_deref_mut() else {
+            return;
+        };
+        let leg = match row {
+            Some(i) if e.asset == self.rows[i].asset => {
+                let sym = self.rows[i].sym;
+                let live = st.assets.sym_of_asset_gen(e.asset) == Some((sym, true));
+                Some((sym, live))
+            }
+            Some(_) => {
+                st.counters.fills_mismatched += 1;
+                None
+            }
+            // A map built without `with_outcomes` names no leg.
+            None if e.asset == ASSET_UNKNOWN => None,
+            None => st.assets.sym_of_asset_gen(e.asset),
+        };
+        let Some((sym, live)) = leg else {
+            // XH4i-5 (risk review r1): a first-snapshot row on a leg no roll
+            // has bound yet — the snapshot can beat the ingress's boot roll —
+            // waits for one (`replay_parked`); a full store counts it
+            // unresolved, as any other.
+            if e.flags & EVF_SNAPSHOT != 0
+                && row.is_none()
+                && e.asset != ASSET_UNKNOWN
+                && st.n_parked < PARKED
+            {
+                // COPY: the 64 B row into the boxed store, a first-snapshot
+                // row at most once a process — rejected: borrowing the event
+                // ring's slot, which the next event reuses.
+                st.parked[st.n_parked] = *e;
+                st.n_parked += 1;
+                st.counters.snapshot_parked += 1;
+                return;
+            }
+            self.counters.fills_unresolved += 1;
+            return;
+        };
+        let qty = e.sz_1e8 / WIRE_PER_ENGINE;
+        if e.px_1e8 < 0 || qty <= 0 {
+            st.counters.fills_refused += 1;
+            return;
+        }
+        let mut order_id = e.client_oid;
+        let mut flags = 0u8;
+        if settlement {
+            if st.assets.owner_of_sym(sym) != Some(self.cfg.slot) {
+                st.counters.settlements_unowned += 1;
+                return;
+            }
+            order_id = e.oid;
+            flags = FILL_FLAG_SETTLEMENT;
+        }
+        let buy = e.flags & EVF_BUY != 0;
+        let side = if buy { Side::Bid } else { Side::Ask };
+        // The venue's time, wall, as the perps' fills (XH4e).
+        let f = Fill::new(
+            e.venue_ms.saturating_mul(1_000_000),
+            sym,
+            side,
+            Price(e.px_1e8 / WIRE_PER_ENGINE),
+            Qty(qty),
+            order_id,
+        )
+        .with_attribution(self.cfg.slot, FILL_ORIGIN_VENUE)
+        .with_flags(flags)
+        .with_tid(e.aux);
+        // Only a fill the member was handed is a position (the blocking
+        // arm's rule): a dropped one never credits the ledger — the drift
+        // shows it.
+        if self.fills.push(f) {
+            self.counters.fills += 1;
+            self.stats.fills_seen += 1;
+            st.counters.settlements += u64::from(settlement);
+            if live {
+                st.assets.book_qty(sym, if buy { qty } else { -qty });
+            } else {
+                st.counters.fills_old_gen += 1;
+            }
+        } else {
+            self.counters.dropped += 1;
+        }
+        if let Some(i) = row {
+            let i = self.landed(i, now);
+            self.rows[i].filled_1e8 += e.sz_1e8;
+            let _ = self.maybe_filled(i, now);
+        }
+    }
+
+    /// XH4i-5 (risk review r1): a roll bound — the parked first-snapshot rows
+    /// its legs now name book as they would have on arrival; the rest stay
+    /// parked for the next roll. In place: the store is consumed in order,
+    /// and a row kept again lands at or before its own slot.
+    fn replay_parked(&mut self, now: u64) {
+        let n = match self.outcome.as_deref_mut() {
+            Some(st) => core::mem::replace(&mut st.n_parked, 0),
+            None => return,
+        };
+        let mut k = 0usize;
+        while k < n {
+            let Some(st) = self.outcome.as_deref_mut() else {
+                return;
+            };
+            // COPY: one parked 64 B row out of the store, once — the fill
+            // path borrows the arm whole.
+            let e = st.parked[k];
+            if st.assets.sym_of_asset_gen(e.asset).is_some() {
+                self.on_leg_fill(&e, now);
+            } else {
+                let at = st.n_parked;
+                st.parked[at] = e;
+                st.n_parked += 1;
+            }
+            k += 1;
         }
     }
 
@@ -2338,6 +2740,12 @@ impl HlGatewayArm {
             // XH4e: what the venue may not have counted yet goes on top of
             // its answer.
             READ_LIMIT => self.limit_sent = self.unanswered(),
+            // XH4i-4: a new spot read takes its leg rows afresh.
+            READ_SPOT => {
+                if let Some(st) = self.outcome.as_deref_mut() {
+                    st.spot.clear();
+                }
+            }
             _ => {}
         }
         true
@@ -2358,6 +2766,10 @@ impl HlGatewayArm {
             READ_SPOT => {
                 self.next_spot_ns = u64::MAX;
                 self.counters.spot_failed += 1;
+                // XH4i-4: a failed read's leg rows are dropped.
+                if let Some(st) = self.outcome.as_deref_mut() {
+                    st.spot.clear();
+                }
             }
             _ => self.next_state_ns = retry,
         }
@@ -2470,13 +2882,14 @@ impl HlGatewayArm {
                 if self.rows[i].since_ns <= self.read_ns && self.rows[i].bits & RB_ENDED == 0 =>
             {
                 // Listed by a read issued after it was thought gone: it
-                // rests — and a cancel asked or wanted, none in flight,
-                // goes again.
+                // rests — and a cancel asked, owed by a roll (LAW E-8) or
+                // wanted, none in flight, goes again.
                 self.rows[i].state = ST_RESTING;
                 self.rows[i].since_ns = now;
                 self.rows[i].due_ns = 0;
                 let cx = self.rows[i].cancel;
-                if cx == CX_WANTED || (cx == CX_NONE && self.rows[i].bits & RB_ASKED != 0) {
+                let owed = self.rows[i].bits & (RB_ASKED | RB_RETIRED) != 0;
+                if cx == CX_WANTED || (cx == CX_NONE && owed) {
                     self.push_cancel(i, now);
                 }
             }
@@ -2538,7 +2951,7 @@ impl HlGatewayArm {
         }
         // XH5b-1: a spot sheet that lists no USDC answers nothing — nothing
         // to anchor or judge (`recon::account_view`'s rule), never a $0 half.
-        let no_worth = self.read_kind == READ_SPOT && e.sz_1e8 == 0;
+        let no_worth = self.read_kind == READ_SPOT && (e.sz_1e8 == 0 || !self.legs_whole(e));
         if e.kind == EV_READ_FAILED || e.reason != self.read_kind || no_worth {
             // An end of another kind answers no read of this one.
             self.read_failed(now);
@@ -2603,8 +3016,9 @@ impl HlGatewayArm {
         self.sheet_ns = now;
         // XH5b-1: the worth's spot half is read next, and the anchor waits
         // for it; a shared account's worth is every slot's — never read,
-        // never anchored.
-        if self.cfg.own_account {
+        // never anchored. XH4i-4: an outcome arm's legs live in the spot
+        // sheet: it is read on any account.
+        if self.cfg.own_account || self.outcome.is_some() {
             self.next_spot_ns = now;
         }
         let n = self.cfg.n_perps.min(ARM_PERPS);
@@ -2671,6 +3085,8 @@ impl HlGatewayArm {
     /// positive one only: an unfunded account has nothing to anchor (the
     /// blocking arm's E7 rule), and the first reconciliation waits.
     fn spot_done(&mut self, usdc_1e8: i64, now: u64) {
+        // XH4i-4: the legs first — their cost is the worth's third half.
+        self.legs_done();
         self.spot_1e8 = usdc_1e8;
         self.spot_ns = now;
         self.next_spot_ns = u64::MAX;
@@ -2693,10 +3109,113 @@ impl HlGatewayArm {
 
     /// XH5b-1 — the account's worth, USD ×1e8: the perp sheet's value plus
     /// the spot sheet's USDC (saturating: a hostile body scans to
-    /// ±`i64::MAX`).
-    #[inline(always)]
-    const fn worth_1e8(&self) -> i64 {
-        self.account_1e8.saturating_add(self.spot_1e8)
+    /// ±`i64::MAX`) — and, on an outcome arm, its legs at cost (XH4i-4:
+    /// `recon::account_view`'s equity at cost; the perps' value stays in: a
+    /// top-up is paid from it and added back, Q3).
+    #[inline]
+    fn worth_1e8(&self) -> i64 {
+        let legs_1e8 = match self.outcome.as_deref() {
+            Some(st) => st.held_cost_1e6.saturating_mul(WIRE_PER_ENGINE),
+            None => 0,
+        };
+        self.account_1e8
+            .saturating_add(self.spot_1e8)
+            .saturating_add(legs_1e8)
+    }
+
+    /// XH4i-4: an outcome arm's spot read is whole only when its end is
+    /// marked (`SPOT_LEGS_READ`: an outcome map's gateway sent it) and counts
+    /// the leg rows taken (XH4i-2's rule); a perps arm's always is.
+    fn legs_whole(&self, e: &ExecEvent) -> bool {
+        match self.outcome.as_deref() {
+            Some(st) => e.asset == SPOT_LEGS_READ && e.oid == st.spot.rows,
+            None => true,
+        }
+    }
+
+    /// XH4i-4: the last whole spot read's legs agree (a perps arm has none).
+    fn legs_ok(&self) -> bool {
+        match self.outcome.as_deref() {
+            Some(st) => st.legs_ok,
+            None => true,
+        }
+    }
+
+    /// XH4i-4: one held leg of the spot read in flight (`EV_BALANCE`, an
+    /// outcome map's row): its cost summed, its holding taken for the live
+    /// leg it names — the first row of a leg — or counted unseen (a leg no
+    /// live binding names: the last instance's until it settles, a
+    /// stranger's, `ASSET_UNKNOWN`).
+    fn on_balance(&mut self, e: &ExecEvent) {
+        if self.read_oid == 0
+            || e.slot != self.cfg.slot
+            || e.client_oid != self.read_oid
+            || self.read_kind != READ_SPOT
+        {
+            return;
+        }
+        let Some(st) = self.outcome.as_deref_mut() else {
+            self.counters.stray += 1;
+            return;
+        };
+        st.spot.rows = st.spot.rows.saturating_add(1);
+        st.spot.cost_1e6 = st
+            .spot
+            .cost_1e6
+            .saturating_add(crate::recon::leg_cost_1e6(e.sz_1e8, e.px_1e8));
+        let Some((sym, true)) = st.assets.sym_of_asset_gen(e.asset) else {
+            st.spot.unseen = st.spot.unseen.saturating_add(1);
+            return;
+        };
+        let n = st.spot.n as usize;
+        let mut k = 0usize;
+        while k < n && st.spot.syms[k] != sym {
+            k += 1;
+        }
+        if k == n && n < ASSET_SLOTS {
+            st.spot.syms[n] = sym;
+            st.spot.venue_1e6[n] = e.sz_1e8 / WIRE_PER_ENGINE;
+            st.spot.n += 1;
+        }
+    }
+
+    /// XH4i-4: the whole spot read's legs — their cost the worth's third
+    /// half, and every live leg compared with the venue's holding (none
+    /// listed: 0), `recon::compare_booked`'s rule: a drift confirmed over two
+    /// reads joins the drift's high-water mark (contracts ×1e6 are USD ×1e6
+    /// at the $1 ceiling); a drift or an unseen leg keeps the agreement off.
+    fn legs_done(&mut self) {
+        let Some(st) = self.outcome.as_deref_mut() else {
+            return;
+        };
+        let r = &st.spot;
+        let mut drift_legs = 0u32;
+        let mut worst = 0i64;
+        st.assets.for_each_live(|sym, _coin, booked_1e6| {
+            let mut venue_1e6 = 0i64;
+            let mut k = 0usize;
+            while k < r.n as usize {
+                if r.syms[k] == sym {
+                    venue_1e6 = r.venue_1e6[k];
+                    break;
+                }
+                k += 1;
+            }
+            let d = booked_1e6.saturating_sub(venue_1e6).saturating_abs();
+            if d != 0 {
+                drift_legs += 1;
+                worst = worst.max(d);
+            }
+        });
+        let (cost_1e6, unseen) = (r.cost_1e6, r.unseen);
+        st.held_cost_1e6 = cost_1e6;
+        let confirmed = worst.min(st.prev_worst_1e6);
+        st.prev_worst_1e6 = worst;
+        st.legs_ok = drift_legs == 0 && unseen == 0;
+        st.counters.leg_reads += 1;
+        st.counters.leg_drift_reads += u64::from(drift_legs != 0);
+        st.counters.leg_unseen_reads += u64::from(unseen != 0);
+        self.drift_hw_1e6 = self.drift_hw_1e6.max(confirmed);
     }
 
     /// Both reads agree and each ended within two periods — on the slot's
@@ -2705,11 +3224,15 @@ impl HlGatewayArm {
     /// as `ReconStale`, never as an old agreement.
     fn note_agreement(&mut self, now: u64) {
         let fresh = 2 * self.cfg.recon_ms * NS_PER_MS;
-        let spot_fresh = !self.cfg.own_account
-            || (self.spot_ns != 0 && now.saturating_sub(self.spot_ns) <= fresh);
+        // XH4i-4: an outcome arm reads its legs' spot sheet on any account,
+        // and its legs must agree too.
+        let spot_read = self.cfg.own_account || self.outcome.is_some();
+        let spot_fresh =
+            !spot_read || (self.spot_ns != 0 && now.saturating_sub(self.spot_ns) <= fresh);
         if self.state_ok
             && self.orders_ok
             && spot_fresh
+            && self.legs_ok()
             && now.saturating_sub(self.sheet_ns) <= fresh
             && now.saturating_sub(self.orders_ns) <= fresh
         {
@@ -2976,7 +3499,8 @@ impl HlGatewayArm {
             && self.state_ok
             && self.orders_ok
             && self.day_done
-            && worth_known;
+            && worth_known
+            && self.legs_ok();
         let age = if self.last_agree_ns == 0 {
             0
         } else {
@@ -3003,7 +3527,7 @@ impl HlGatewayArm {
     /// top-up spend — a purchase seen on the venue is the day's max's to
     /// bound, not the loss bound's; one not seen is never added back.
     #[inline]
-    const fn session_pnl(&self) -> (bool, i64) {
+    fn session_pnl(&self) -> (bool, i64) {
         let judged = self.anchored && self.seeded && self.cfg.own_account && self.spot_ns != 0;
         let delta = if judged {
             (self.worth_1e8().saturating_sub(self.anchor_1e8) / WIRE_PER_ENGINE)
@@ -3066,7 +3590,81 @@ impl HlGatewayArm {
         true
     }
 
-    fn track(&mut self, c: &HlCmd, p: usize, now: u64) {
+    /// XH4i-3a — the command for `o` on an outcome leg (a place, or a modify
+    /// of `prev` on the leg `prev_asset`), built in `out`; or the refusal,
+    /// counted. LAW E-4: the asset is the roll's binding for the instance
+    /// the order names (its client id's low 32 bits) — a stale instance is
+    /// refused and feeds the streak, a leg no roll bound is refused
+    /// uncounted (A-S7-74), and a modify must stay on its predecessor's
+    /// leg. `OutcomeRules` checks and never rounds: the member keeps to the
+    /// grid. MAKER rests as ALO whatever the flags (never the post-only
+    /// flag: the replay's queue law reads it); IoC is IoC; a leg takes no
+    /// reduce-only and bids no ALO priority.
+    fn outcome_cmd(
+        &mut self,
+        o: &Order,
+        prev: u64,
+        prev_asset: u32,
+        out: &mut HlCmd,
+    ) -> Result<(), DispatchError> {
+        let tif = match o.kind {
+            ORDER_KIND_MAKER => Tif::Alo,
+            ORDER_KIND_IOC => Tif::Ioc,
+            _ => return Err(DispatchError::Unroutable),
+        };
+        if o.is_reduce_only() || o.alo_priority_1e8 != 0 {
+            return Err(DispatchError::Unroutable);
+        }
+        let Some(st) = self.outcome.as_deref_mut() else {
+            return Err(DispatchError::Unroutable);
+        };
+        let asset = match st
+            .assets
+            .lookup(o.sym, core_types::instance_of(o.client_oid))
+        {
+            Ok(a) => a,
+            Err(AssetError::StaleInstance { .. }) => {
+                st.counters.refused_stale += 1;
+                self.asset_refusal_streak += 1;
+                return Err(DispatchError::NoLiveRoute);
+            }
+            Err(_) => {
+                st.counters.refused_unbound += 1;
+                return Err(DispatchError::NoLiveRoute);
+            }
+        };
+        if prev != 0 && asset != prev_asset {
+            return Err(DispatchError::IdentityMismatch);
+        }
+        let (Some(px), Some(sz)) = (
+            o.px.0.checked_mul(WIRE_PER_ENGINE),
+            o.qty.0.checked_mul(WIRE_PER_ENGINE),
+        ) else {
+            st.counters.refused_rules += 1;
+            return Err(DispatchError::Unroutable);
+        };
+        if OutcomeRules::check(px, sz).is_err() {
+            st.counters.refused_rules += 1;
+            return Err(DispatchError::Unroutable);
+        }
+        *out = HlCmd::place(
+            self.cfg.slot,
+            o.client_oid,
+            asset,
+            o.side == Side::Bid,
+            px,
+            sz,
+            tif,
+        )
+        .expiring_after(self.cfg.expires_after_ms)
+        .at(o.ts_ns);
+        if prev != 0 {
+            out.set_replacing(prev);
+        }
+        Ok(())
+    }
+
+    fn track(&mut self, c: &HlCmd, p: usize, sym: u32, now: u64) {
         let mut bits = 0u8;
         if c.is_buy == 0 {
             bits |= RB_ASK;
@@ -3084,6 +3682,8 @@ impl HlGatewayArm {
             state: ST_SENT,
             bits,
             seen: self.epoch.wrapping_sub(1),
+            asset: c.asset,
+            sym,
             ..Row::default()
         };
         self.n_rows += 1;
@@ -3124,18 +3724,27 @@ impl OrderDispatch for HlGatewayArm {
             // A cloid names one order at the venue.
             return self.refuse_local(DispatchError::Unroutable);
         }
-        let Some(p) = self.perp_of_sym(order.sym) else {
-            self.asset_refusal_streak += 1;
-            return self.refuse_local(DispatchError::Unroutable);
-        };
-        if self.lev_dark & (1u16 << p) != 0 {
-            self.counters.refused_leverage += 1;
-            return self.refuse_local(DispatchError::SlotDisabled);
-        }
         let mut c = HlCmd::noop(self.cfg.slot, 0);
-        if !self.order_cmd(order, p, 0, &mut c) {
-            return self.refuse_local(DispatchError::Unroutable);
-        }
+        let p = if self.outcome.is_some() {
+            // XH4i-3a: the leg the roll bound for the order's instance.
+            if let Err(e) = self.outcome_cmd(order, 0, 0, &mut c) {
+                return self.refuse_local(e);
+            }
+            0
+        } else {
+            let Some(p) = self.perp_of_sym(order.sym) else {
+                self.asset_refusal_streak += 1;
+                return self.refuse_local(DispatchError::Unroutable);
+            };
+            if self.lev_dark & (1u16 << p) != 0 {
+                self.counters.refused_leverage += 1;
+                return self.refuse_local(DispatchError::SlotDisabled);
+            }
+            if !self.order_cmd(order, p, 0, &mut c) {
+                return self.refuse_local(DispatchError::Unroutable);
+            }
+            p
+        };
         // XMM XH5d: the HYPE a priority commits is outside the worth — the
         // session's cap bounds it; with none armed no place bids one.
         let fee = priority_fee_1e6(c.arg, c.px_1e8, c.sz_1e8);
@@ -3146,15 +3755,19 @@ impl OrderDispatch for HlGatewayArm {
         {
             return self.refuse_local(DispatchError::Unroutable);
         }
-        // XH4f (D9): the order's TTL (LAW E-8), which the gateway keeps.
-        c.time_ms = (order.ttl_ns / NS_PER_MS).min(TTL_MAX_MS);
+        // XH4f (D9): the order's TTL (LAW E-8), which the gateway keeps —
+        // XH4i-3a: none on an outcome leg (A-S7-73: on the blocking arm
+        // BIN15's orders rested until replaced or cancelled).
+        if self.outcome.is_none() {
+            c.time_ms = (order.ttl_ns / NS_PER_MS).min(TTL_MAX_MS);
+        }
         if !self.end.cmd.push(&c) {
             self.counters.ring_full += 1;
             return self.refuse(DispatchError::QueueFull);
         }
         self.priority_spent_1e6 += fee;
         self.charge(1);
-        self.track(&c, p, now);
+        self.track(&c, p, order.sym, now);
         Ok(())
     }
 
@@ -3165,7 +3778,7 @@ impl OrderDispatch for HlGatewayArm {
         let Some(i) = self.find(req.client_oid) else {
             return self.refuse(DispatchError::NoSuchOrder);
         };
-        if self.bind(i).sym != req.sym {
+        if self.rows[i].sym != req.sym {
             return self.refuse(DispatchError::IdentityMismatch);
         }
         self.rows[i].bits |= RB_ASKED;
@@ -3197,7 +3810,7 @@ impl OrderDispatch for HlGatewayArm {
             return self.refuse(DispatchError::NoSuchOrder);
         }
         if o.strategy_id != self.cfg.slot
-            || self.cfg.perps[perp].sym != o.sym
+            || self.rows[i].sym != o.sym
             || (bits & RB_ASK != 0) != (o.side != Side::Bid)
             || (bits & RB_ALO != 0) != (o.kind == ORDER_KIND_MAKER)
         {
@@ -3219,7 +3832,13 @@ impl OrderDispatch for HlGatewayArm {
             return self.refuse_local(DispatchError::Unroutable);
         }
         let mut c = HlCmd::noop(self.cfg.slot, 0);
-        if !self.order_cmd(o, perp, prev, &mut c) {
+        if self.outcome.is_some() {
+            // XH4i-3a: on the predecessor's leg, for the instance it names.
+            let prev_asset = self.rows[i].asset;
+            if let Err(e) = self.outcome_cmd(o, prev, prev_asset, &mut c) {
+                return self.refuse_local(e);
+            }
+        } else if !self.order_cmd(o, perp, prev, &mut c) {
             return self.refuse_local(DispatchError::Unroutable);
         }
         if !self.end.cmd.push(&c) {
@@ -3228,8 +3847,57 @@ impl OrderDispatch for HlGatewayArm {
         }
         self.charge(1);
         self.rows[i].bits |= RB_REPLACING;
-        self.track(&c, perp, now);
+        self.track(&c, perp, o.sym, now);
         Ok(())
+    }
+
+    /// XH4i-3a: a roll binds an outcome arm's legs — both or neither, by
+    /// `AssetTable::bind_roll`, the blocking arm's binder (LAW E-4) — and
+    /// what it retires is cancelled (LAW E-8, [`HlGatewayArm::retire_asset`]);
+    /// a perps arm reads none.
+    fn on_venue_event(&mut self, event: &core_types::ChannelEvent) {
+        let retired = {
+            let Some(st) = self.outcome.as_deref_mut() else {
+                return;
+            };
+            let (sym_yes, outcome) = match roll_of(event) {
+                RollOf::NotARoll => return,
+                RollOf::Refused => {
+                    st.counters.rolls_refused += 1;
+                    return;
+                }
+                RollOf::Settled => {
+                    st.counters.rolls_settled += 1;
+                    return;
+                }
+                RollOf::Created { sym_yes, outcome } => (sym_yes, outcome),
+            };
+            // A-S7-83: a REPEAT of the live roll — both legs already bound
+            // to the ids it names — changes nothing here: a rebind in place
+            // would zero the legs' ledgers (a drift the reconciler halts
+            // on) and overwrite the generation a roll retired (a settlement
+            // of the old instance would name no leg). The shared binder's
+            // own fix (A-S7-81) is Anton's call; this arm guards itself.
+            if repeats_live_roll(&st.assets, sym_yes, outcome) {
+                st.counters.rolls_repeated += 1;
+                return;
+            }
+            let Some(retired) = st.assets.bind_roll(sym_yes, outcome) else {
+                st.counters.rolls_refused += 1;
+                return;
+            };
+            st.counters.rolls_bound += 1;
+            retired
+        };
+        let now = now_ns();
+        let mut side = 0usize;
+        while side < retired.len() {
+            if let Some((asset, _, _)) = retired[side] {
+                self.retire_asset(asset, now);
+            }
+            side += 1;
+        }
+        self.replay_parked(now);
     }
 
     fn try_next_fill(&mut self) -> Option<Fill> {
@@ -3331,7 +3999,11 @@ impl OrderDispatch for HlGatewayArm {
         } else {
             0
         };
-        // COPY: the 880 B report written once into the caller's block —
+        let o = self
+            .outcome
+            .as_deref()
+            .map_or(&OutcomeCounters::ZERO, |st| &st.counters);
+        // COPY: the 1 016 B report written once into the caller's block —
         // cold, once a second; the out-param keeps it off the return path.
         *out = GatewayArmReport {
             present: 1,
@@ -3404,6 +4076,24 @@ impl OrderDispatch for HlGatewayArm {
             gw_throttled: s.published(pw::THROTTLED),
             gw_ttl_cancels: s.published(pw::TTL_CANCELS),
             gw_ttl_full: s.published(pw::TTL_FULL),
+            // XMM XH4i-5: the outcome mode's (0 on a perps arm).
+            outcome_rolls_bound: o.rolls_bound,
+            outcome_rolls_settled: o.rolls_settled,
+            outcome_rolls_refused: o.rolls_refused,
+            outcome_rolls_repeated: o.rolls_repeated,
+            outcome_refused_stale: o.refused_stale,
+            outcome_refused_unbound: o.refused_unbound,
+            outcome_refused_rules: o.refused_rules,
+            outcome_e8_cancels: o.e8_cancels,
+            outcome_settlements: o.settlements,
+            outcome_settlements_unowned: o.settlements_unowned,
+            outcome_fills_old_gen: o.fills_old_gen,
+            outcome_fills_mismatched: o.fills_mismatched,
+            outcome_fills_refused: o.fills_refused,
+            outcome_leg_reads: o.leg_reads,
+            outcome_leg_drift_reads: o.leg_drift_reads,
+            outcome_leg_unseen_reads: o.leg_unseen_reads,
+            outcome_snapshot_parked: o.snapshot_parked,
             // The router's (`RoutedDispatcher` adds them).
             refused_cap_perp: 0,
             refused_max_resting: 0,
@@ -3588,9 +4278,7 @@ mod tests {
         CMD_FLAG_CROSS, CMD_LEVERAGE, CMD_MODIFY, CMD_PLACE, CMD_READ_DAY, CMD_READ_LIMIT,
         CMD_READ_ORDERS, CMD_READ_SPOT, CMD_READ_STATE, CMD_RESERVE, CMD_SCHEDULE_CANCEL,
     };
-    use crate::event::{
-        EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT, SLOT_FOREIGN,
-    };
+    use crate::event::{EVF_CMD_SHIFT, EVF_RESTING, GAP_FILLS_UNREADABLE, GAP_RECONNECT};
     use crate::gateway::{hl_duplex, HlGatewayEnd};
     use exec_gateway::stats::{CONGESTION_NONE, SWEEP_WORKING};
     use exec_gateway::HALT_EVENT_RING_FULL;
@@ -3624,6 +4312,7 @@ mod tests {
             budget_floor: 2_000,
             limit_ms: 600_000,
             leverage: 0,
+            outcomes: false,
         }
     }
 
@@ -3721,6 +4410,13 @@ mod tests {
             px_1e8: account_1e8,
             // XH5b-1: a spot sheet that lists USDC.
             sz_1e8: i64::from(c.kind == CMD_READ_SPOT),
+            // XH4i-2: an outcome map's gateway marks its spot end (a perps
+            // arm reads no mark); no leg rows unless a test sends them.
+            asset: if c.kind == CMD_READ_SPOT {
+                SPOT_LEGS_READ
+            } else {
+                0
+            },
             kind: EV_READ_DONE,
             reason: read,
             slot: c.slot,
@@ -3771,6 +4467,869 @@ mod tests {
         let mut r = CancelReq::new(0, VenueId::Hyperliquid, SYM, cid);
         r.strategy_id = SLOT;
         r
+    }
+
+    // --- XH4i-3a: the outcome mode (slot 3, BIN15's HIP-4 legs) -----
+
+    /// BIN15's YES leg's engine symbol (its NO leg is the next ordinal).
+    const LEG_YES: u32 = ((VenueId::Hyperliquid as u32) << 24) | 4_096;
+    /// Two instances of one family (outcome ids).
+    const INST_A: u32 = 3_253;
+    const INST_B: u32 = 3_254;
+    /// Another family: its YES leg, and an instance of it.
+    const LEG_OTHER: u32 = LEG_YES + 2;
+    const INST_C: u32 = 4_100;
+
+    /// The outcome mode on the tests' slot (the boot helpers' orders are
+    /// its); slot 3 in production.
+    fn outcome_cfg() -> ArmCfg {
+        ArmCfg {
+            n_perps: 0,
+            outcomes: true,
+            ..cfg()
+        }
+    }
+
+    /// A roll of the family whose YES leg is `sym`, as the ingress packs it
+    /// (`pack_roll_seq`'s layout, built here, never by inverting the reader
+    /// under test).
+    fn roll_on(sym: u32, outcome: u32, settled: bool) -> core_types::ChannelEvent {
+        let seq = u64::from(outcome) | (60u64 << 32) | ((settled as u64) << 56);
+        core_types::ChannelEvent::new(
+            1,
+            VenueId::Hyperliquid,
+            core_types::ChannelId::InstrumentRoll,
+            sym,
+            seq,
+            0,
+            1_000_000,
+            2_000_000_000,
+        )
+    }
+
+    /// A roll of BIN15's first family (YES leg `LEG_YES`).
+    fn roll_ev(outcome: u32, settled: bool) -> core_types::ChannelEvent {
+        roll_on(LEG_YES, outcome, settled)
+    }
+
+    /// BIN15's order on instance `inst`, flags 0 (it never sets one):
+    /// the instance in the client id's low 32 bits, the null arm's bit 63.
+    fn leg_order(seq: u64, inst: u32, sym: u32, kind: u8, side: Side, px_1e6: i64) -> Order {
+        let cid = (1u64 << 63) | (seq << 49) | u64::from(inst);
+        let mut o = Order::new(
+            0,
+            VenueId::Hyperliquid,
+            sym,
+            side,
+            kind,
+            Price(px_1e6),
+            Qty(4_000_000),
+            cid,
+        );
+        o.strategy_id = SLOT;
+        o.ttl_ns = 1_000_000_000;
+        o
+    }
+
+    /// XH4i-3a: the outcome mode stands alone — never beside a perp or a
+    /// leverage; a perps arm still needs a perp.
+    #[test]
+    fn the_outcome_mode_stands_alone() {
+        let with_perp = ArmCfg {
+            n_perps: 1,
+            ..outcome_cfg()
+        };
+        assert_eq!(
+            HlGatewayArm::new(&with_perp, hl_duplex().0).err(),
+            Some(ArmErr::Outcomes)
+        );
+        let with_lev = ArmCfg {
+            leverage: 3,
+            ..outcome_cfg()
+        };
+        assert_eq!(
+            HlGatewayArm::new(&with_lev, hl_duplex().0).err(),
+            Some(ArmErr::Outcomes)
+        );
+        let no_perp = ArmCfg {
+            n_perps: 0,
+            ..cfg()
+        };
+        assert_eq!(
+            HlGatewayArm::new(&no_perp, hl_duplex().0).err(),
+            Some(ArmErr::Perps)
+        );
+        let arm = HlGatewayArm::new(&outcome_cfg(), hl_duplex().0).expect("an outcome arm");
+        assert_eq!(arm.outcome_counters(), Some(OutcomeCounters::default()));
+        let perps = HlGatewayArm::new(&cfg(), hl_duplex().0).expect("a perps arm");
+        assert_eq!(perps.outcome_counters(), None);
+    }
+
+    /// XH4i-3a (LAW E-4's writer): a created roll binds both legs; a
+    /// settled one binds nothing; a kind no packer writes and a roll with
+    /// no outcome are refused; a perps arm reads no roll.
+    #[test]
+    fn a_created_roll_binds_both_legs_and_nothing_else_does() {
+        let mut arm = HlGatewayArm::new(&outcome_cfg(), hl_duplex().0).expect("arm");
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        arm.on_venue_event(&roll_ev(INST_A, true));
+        arm.on_venue_event(&roll_ev(0, false));
+        let mut odd = roll_ev(INST_A, false);
+        odd.venue_seq |= 3u64 << 56;
+        arm.on_venue_event(&odd);
+        let c = arm.outcome_counters().expect("outcome mode");
+        assert_eq!((c.rolls_bound, c.rolls_settled, c.rolls_refused), (1, 1, 2));
+        let o = arm.outcome.as_deref().expect("state");
+        assert_eq!(
+            o.assets.lookup(LEG_YES, u64::from(INST_A)),
+            crate::asset::AssetTable::asset_id(INST_A, 0).ok_or(crate::asset::AssetError::Unbound)
+        );
+        assert_eq!(
+            o.assets.lookup(LEG_YES + 1, u64::from(INST_A)),
+            crate::asset::AssetTable::asset_id(INST_A, 1).ok_or(crate::asset::AssetError::Unbound)
+        );
+        let mut perps = HlGatewayArm::new(&cfg(), hl_duplex().0).expect("perps");
+        perps.on_venue_event(&roll_ev(INST_A, false));
+        assert_eq!(perps.outcome_counters(), None);
+    }
+
+    /// XH4i-3a: BIN15's MAKER — flags 0 — rests as ALO on the leg the roll
+    /// bound for its instance (never the post-only flag: the replay's queue
+    /// law reads it), with no TTL (A-S7-73) and `expiresAfter`; its IoC is
+    /// an IoC. The perps arm still refuses a MAKER without the flag.
+    #[test]
+    fn an_outcome_maker_with_no_flags_rests_as_alo_on_its_bound_leg() {
+        let (mut arm, mut v, _t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert_eq!(o.flags, 0);
+        assert!(
+            !core_fill::judged_by_queue(VenueId::Hyperliquid as u8, o.kind, o.flags),
+            "BIN15's replay never reads its maker by the queue law"
+        );
+        assert!(arm.submit(&o).is_ok());
+        let c = v.take(CMD_PLACE).expect("the place");
+        assert_eq!(
+            (c.asset, c.tif, c.is_buy, c.px_1e8, c.sz_1e8, c.time_ms),
+            (
+                crate::asset::AssetTable::asset_id(INST_A, 0).expect("id"),
+                Tif::Alo as u8,
+                1,
+                30_000_000,
+                4 * E8,
+                0
+            )
+        );
+        let ioc = leg_order(2, INST_A, LEG_YES + 1, ORDER_KIND_IOC, Side::Bid, 600_000);
+        assert!(arm.submit(&ioc).is_ok());
+        let c = v.take(CMD_PLACE).expect("the IoC");
+        assert_eq!(
+            (c.asset, c.tif),
+            (
+                crate::asset::AssetTable::asset_id(INST_A, 1).expect("id"),
+                Tif::Ioc as u8
+            )
+        );
+        let (mut perps, _pv, _pt) = booted();
+        let mut plain = quote(9, Side::Bid, 2_500_000_000, 1_000_000);
+        plain.flags = 0;
+        assert_eq!(perps.submit(&plain), Err(DispatchError::Unroutable));
+    }
+
+    /// XH4i-3a (LAW E-4): an order naming an instance that has rolled is
+    /// refused and counted stale — the one refusal the streak counts; a
+    /// leg no roll bound is refused uncounted; an off-grid order is
+    /// refused, never rounded.
+    #[test]
+    fn outcome_orders_refuse_a_rolled_or_unbound_instance_and_an_off_grid_price() {
+        let (mut arm, mut v, _t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        let stale = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert_eq!(arm.submit(&stale), Err(DispatchError::NoLiveRoute));
+        let unbound = leg_order(2, INST_B, LEG_YES + 2, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert_eq!(arm.submit(&unbound), Err(DispatchError::NoLiveRoute));
+        let off = leg_order(3, INST_B, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_050);
+        assert_eq!(arm.submit(&off), Err(DispatchError::Unroutable));
+        let c = arm.outcome_counters().expect("outcome mode");
+        assert_eq!(
+            (c.refused_stale, c.refused_unbound, c.refused_rules),
+            (1, 1, 1)
+        );
+        assert_eq!(arm.asset_refusal_streak, 1, "stale only");
+        assert!(v.take(CMD_PLACE).is_none(), "nothing left the arm");
+    }
+
+    /// XH4i-3a (LAW E-8, A-S7-76): a roll that retires a leg cancels our
+    /// rows on it — by the asset their place named — and reads the orders
+    /// at once; a repeat of the live roll cancels nothing.
+    #[test]
+    fn a_roll_cancels_our_rows_on_the_leg_it_retires_and_reads_the_orders() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert!(arm.submit(&o).is_ok());
+        let place = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&place, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        assert!(v.take(CMD_CANCEL).is_none(), "a repeat retires nothing");
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        let cx = v.take(CMD_CANCEL).expect("the E-8 cancel");
+        assert_eq!((cx.client_oid, cx.asset), (o.client_oid, place.asset));
+        assert_eq!(arm.outcome_counters().expect("outcome").e8_cancels, 1);
+        assert!(arm.reread, "the orders are read at once");
+    }
+
+    /// XH4i-3a (risk review r1): an E-8 cancel the venue answers "not
+    /// found" about an order that still rests stays owed — the read that
+    /// lists the order brings its row back and sends the cancel again, as
+    /// for a member's own; the member asked nothing, so its end reads
+    /// `OTHER`.
+    #[test]
+    fn an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert!(arm.submit(&o).is_ok());
+        let place = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&place, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        let x = v.take(CMD_CANCEL).expect("the E-8 cancel");
+        v.send(item(&x, EV_REJECTED, REASON_NOT_FOUND, 0));
+        let _ = arm.idle(t + 1);
+        let od = v.take(CMD_READ_ORDERS).expect("the orders read");
+        v.send(open_order(&od, SLOT, o.client_oid));
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(t + 2);
+        let again = v.take(CMD_CANCEL).expect("the owed cancel goes again");
+        assert_eq!((again.client_oid, again.asset), (o.client_oid, place.asset));
+        v.send(item(&again, EV_ACK, 0, 0));
+        let _ = arm.idle(t + 3);
+        assert_eq!(
+            events(&mut arm).last(),
+            Some(&(o.client_oid, ORDER_EVENT_CANCELED, ORDER_EVENT_REASON_OTHER))
+        );
+    }
+
+    /// XH4i-3a (risk review r1): what an E-8 sweep cancels — every row of
+    /// ours on a retired leg the venue may hold: resting on YES or on NO,
+    /// sent and unanswered, in doubt, thought gone. Never one already
+    /// filling, one whose cancel is out, or another family's.
+    #[test]
+    fn an_e8_sweep_cancels_every_row_on_the_retired_legs_and_nothing_else() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        arm.on_venue_event(&roll_on(LEG_OTHER, INST_C, false));
+        let orders = [
+            leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000),
+            leg_order(2, INST_A, LEG_YES + 1, ORDER_KIND_MAKER, Side::Bid, 600_000),
+            leg_order(3, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 290_000),
+            leg_order(4, INST_A, LEG_YES + 1, ORDER_KIND_MAKER, Side::Bid, 590_000),
+            leg_order(5, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 280_000),
+            leg_order(6, INST_A, LEG_YES + 1, ORDER_KIND_MAKER, Side::Bid, 580_000),
+            leg_order(7, INST_C, LEG_OTHER, ORDER_KIND_MAKER, Side::Bid, 300_000),
+            leg_order(8, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 270_000),
+        ];
+        let mut place = [HlCmd::noop(SLOT, 0); 8];
+        let mut k = 0usize;
+        while k < orders.len() {
+            assert!(arm.submit(&orders[k]).is_ok(), "order {k}");
+            place[k] = v.take(CMD_PLACE).expect("its place");
+            k += 1;
+        }
+        // 0 and 1 rest on YES and on NO; 2 is sent, unanswered; 3 is in
+        // doubt; 4 rests, then the stream says filled ahead of its fills;
+        // 5 rests and the member's cancel is out; 6 is another family's;
+        // 7 rests, and the member's cancel found nothing: thought gone.
+        for k in [0usize, 1, 4, 5, 6, 7] {
+            v.send(item(&place[k], EV_ACK, 0, EVF_RESTING));
+        }
+        v.send(item(&place[3], EV_UNANSWERED, 0, 0));
+        let _ = arm.idle(t);
+        v.send(row(EV_FILLED, orders[4].client_oid, 0));
+        let _ = arm.idle(t + 1);
+        let mut req = CancelReq::new(0, VenueId::Hyperliquid, LEG_YES + 1, orders[5].client_oid);
+        req.strategy_id = SLOT;
+        arm.cancel(&req).expect("the member's cancel");
+        assert_eq!(
+            v.take(CMD_CANCEL).map(|c| c.client_oid),
+            Some(orders[5].client_oid)
+        );
+        let mut req = CancelReq::new(0, VenueId::Hyperliquid, LEG_YES, orders[7].client_oid);
+        req.strategy_id = SLOT;
+        arm.cancel(&req).expect("the member's cancel");
+        let x = v.take(CMD_CANCEL).expect("its cancel");
+        assert_eq!(x.client_oid, orders[7].client_oid);
+        v.send(item(&x, EV_REJECTED, REASON_NOT_FOUND, 0));
+        let _ = arm.idle(t + 2);
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        let mut cancelled = Vec::new();
+        while let Some(c) = v.take(CMD_CANCEL) {
+            cancelled.push((c.client_oid, c.asset));
+        }
+        cancelled.sort_unstable();
+        assert_eq!(
+            cancelled,
+            [
+                (orders[0].client_oid, place[0].asset),
+                (orders[1].client_oid, place[1].asset),
+                (orders[2].client_oid, place[2].asset),
+                (orders[3].client_oid, place[3].asset),
+                (orders[7].client_oid, place[7].asset),
+            ]
+        );
+        assert_eq!(arm.outcome_counters().expect("outcome").e8_cancels, 5);
+    }
+
+    /// XH4i-3a: a modify stays on its predecessor's leg — for the same
+    /// instance it rests as an ALO replacement on that asset; across a roll
+    /// it is refused (the new instance's leg is another asset; the old
+    /// instance is stale).
+    #[test]
+    fn an_outcome_modify_stays_on_its_leg_and_never_crosses_a_roll() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert!(arm.submit(&o).is_ok());
+        let place = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&place, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        let next = leg_order(2, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 310_000);
+        assert!(arm.modify(&ModifyReq::new(o.client_oid, next)).is_ok());
+        let m = v.take(CMD_MODIFY).expect("the modify");
+        assert_eq!(
+            (m.asset, m.tif, m.prev_client_oid, m.px_1e8),
+            (place.asset, Tif::Alo as u8, o.client_oid, 31_000_000)
+        );
+        v.send(item(&m, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        // The family rolls on; its next instance is another leg.
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        assert!(v.take(CMD_CANCEL).is_some(), "the E-8 cancel");
+        let across = leg_order(3, INST_B, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 320_000);
+        assert_eq!(
+            arm.modify(&ModifyReq::new(next.client_oid, across)),
+            Err(DispatchError::NoSuchOrder),
+            "its E-8 cancel is out: the row takes no modify"
+        );
+        // Behind that, the command itself refuses to cross: the new
+        // instance's leg is another asset, the old instance is stale.
+        let mut c = HlCmd::noop(SLOT, 0);
+        assert_eq!(
+            arm.outcome_cmd(&across, 7, place.asset, &mut c),
+            Err(DispatchError::IdentityMismatch)
+        );
+        let stale = leg_order(4, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 320_000);
+        assert_eq!(
+            arm.outcome_cmd(&stale, 7, place.asset, &mut c),
+            Err(DispatchError::NoLiveRoute)
+        );
+    }
+
+    /// XH4i-3a: BIN15's client ids can fall in the arm's own internal
+    /// ranges (its null arm sets bit 63; a sequence with bit 13 set sets
+    /// bit 62 — `READ_OID_BASE`). An order's answers are post items with a
+    /// command kind, the arm's reads and control posts none: the order is
+    /// routed as an order.
+    #[test]
+    fn an_order_whose_id_falls_in_the_arm_s_own_ranges_is_still_an_order() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(
+            0x2000,
+            INST_A,
+            LEG_YES,
+            ORDER_KIND_MAKER,
+            Side::Bid,
+            300_000,
+        );
+        assert_eq!(o.client_oid, READ_OID_BASE | u64::from(INST_A));
+        assert!(arm.submit(&o).is_ok());
+        let place = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&place, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        assert!(
+            events(&mut arm).contains(&(
+                o.client_oid,
+                ORDER_EVENT_RESTING,
+                ORDER_EVENT_REASON_NONE
+            )),
+            "its RESTING reached the member"
+        );
+    }
+
+    // --- XH4i-3b: fills on the legs ---------------------------------
+
+    /// The gateway's `userFills` row on a leg (`asset` as an outcome map
+    /// names it): ours by `cid`, or — `cid` 0 — the venue's settlement row
+    /// (no cloid, so no slot).
+    fn leg_fill(cid: u64, asset: u32, buy: bool, px_1e8: i64, sz_1e8: i64, tid: u64) -> ExecEvent {
+        ExecEvent {
+            client_oid: cid,
+            oid: 9_000 + tid,
+            venue_ms: 1_000 + tid,
+            px_1e8,
+            sz_1e8,
+            aux: tid,
+            asset,
+            kind: EV_FILL,
+            reason: if cid == 0 { REASON_SETTLEMENT } else { 0 },
+            slot: if cid == 0 { SLOT_FOREIGN } else { SLOT },
+            flags: if buy { EVF_BUY } else { 0 },
+            ..ExecEvent::default()
+        }
+    }
+
+    /// One MAKER of ours resting on instance A's YES leg; its place.
+    fn resting_leg(arm: &mut HlGatewayArm, v: &mut Venue, t: u64) -> (Order, HlCmd) {
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let o = leg_order(1, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 300_000);
+        assert!(arm.submit(&o).is_ok());
+        let place = v.take(CMD_PLACE).expect("the place");
+        v.send(item(&place, EV_ACK, 0, EVF_RESTING));
+        let _ = arm.idle(t);
+        (o, place)
+    }
+
+    /// XH4i-3b: our fill resolves by its row — the leg and the asset its
+    /// place named — reaches the member on that leg, credits the live
+    /// generation's ledger and joins its order.
+    #[test]
+    fn an_outcome_fill_books_on_its_row_s_leg_and_credits_the_live_ledger() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        v.send(leg_fill(
+            o.client_oid,
+            place.asset,
+            true,
+            30_000_000,
+            4 * E8,
+            1,
+        ));
+        let f = arm.try_next_fill().expect("the fill");
+        assert_eq!(
+            (f.sym, f.side, f.px.raw(), f.qty.raw(), f.order_id),
+            (LEG_YES, Side::Bid, 300_000, 4_000_000, o.client_oid)
+        );
+        assert_eq!((f.strategy_id, f.tid, f.flags), (SLOT, 1, 0));
+        let booked = arm
+            .outcome
+            .as_deref()
+            .expect("state")
+            .assets
+            .booked_qty(LEG_YES);
+        assert_eq!(booked, Some(4_000_000));
+        assert!(events(&mut arm).contains(&(
+            o.client_oid,
+            ORDER_EVENT_FILLED,
+            ORDER_EVENT_REASON_NONE
+        )));
+    }
+
+    /// XH4i-3b: a fill on a generation a roll retired — its row still held,
+    /// or gone — reaches the member on its leg but never credits the
+    /// successor's ledger.
+    #[test]
+    fn a_fill_on_a_retired_generation_reaches_its_leg_but_not_the_successor_s_ledger() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        v.send(leg_fill(
+            o.client_oid,
+            place.asset,
+            true,
+            30_000_000,
+            2 * E8,
+            1,
+        ));
+        let f = arm.try_next_fill().expect("the late fill");
+        assert_eq!(
+            (f.sym, f.qty.raw(), f.order_id),
+            (LEG_YES, 2_000_000, o.client_oid)
+        );
+        v.send(leg_fill(77, place.asset, false, 30_000_000, E8, 2));
+        let g = arm
+            .try_next_fill()
+            .expect("a row gone: the old asset finds the leg");
+        assert_eq!((g.sym, g.side, g.order_id), (LEG_YES, Side::Ask, 77));
+        let st = arm.outcome.as_deref().expect("state");
+        assert_eq!(
+            st.assets.booked_qty(LEG_YES),
+            Some(0),
+            "the successor's is untouched"
+        );
+        assert_eq!(st.counters.fills_old_gen, 2);
+    }
+
+    /// XH4i-3b: a settlement (the venue's row: no cloid, no slot) books only
+    /// for the slot whose order the venue accepted on the leg — flagged,
+    /// under the venue's order id — even after the family rolls on (the
+    /// owner survives a roll, the retired asset finds the leg); before
+    /// that it is counted, never booked. The perps arm still calls it
+    /// another slot's.
+    #[test]
+    fn a_settlement_books_only_for_the_slot_whose_order_the_venue_accepted() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let yes = crate::asset::AssetTable::asset_id(INST_A, 0).expect("id");
+        v.send(leg_fill(0, yes, false, E8, 4 * E8, 1));
+        assert!(
+            arm.try_next_fill().is_none(),
+            "no order of ours on the leg yet"
+        );
+        let (_o, place) = resting_leg(&mut arm, &mut v, t);
+        assert_eq!(place.asset, yes);
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        v.send(leg_fill(0, yes, false, E8, 4 * E8, 2));
+        let f = arm.try_next_fill().expect("the settlement");
+        assert_eq!(
+            (f.sym, f.order_id, f.strategy_id, f.flags),
+            (LEG_YES, 9_002, SLOT, FILL_FLAG_SETTLEMENT)
+        );
+        assert_eq!((f.px.raw(), f.qty.raw()), (1_000_000, 4_000_000));
+        let c = arm.outcome_counters().expect("outcome");
+        assert_eq!((c.settlements, c.settlements_unowned), (1, 1));
+        assert_eq!(
+            arm.counters().fills_foreign,
+            0,
+            "a settlement is not another's"
+        );
+        let (mut perps, mut pv, _pt) = booted();
+        pv.send(leg_fill(0, ASSET, false, E8, E8, 9));
+        assert!(perps.try_next_fill().is_none());
+        assert_eq!(perps.counters().fills_foreign, 1);
+    }
+
+    /// XH4i-3b: what names no leg is never booked against a guess — ours on
+    /// another asset than its row's, ours with no row on an asset no roll
+    /// bound or the gateway could not name — and a cloid-less row that is
+    /// no settlement is another's.
+    #[test]
+    fn outcome_fills_that_name_no_leg_or_another_leg_are_never_booked() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        let no = crate::asset::AssetTable::asset_id(INST_A, 1).expect("id");
+        let unbound = crate::asset::AssetTable::asset_id(INST_C, 0).expect("id");
+        v.send(leg_fill(o.client_oid, no, true, 30_000_000, E8, 1));
+        v.send(leg_fill(77, unbound, true, 30_000_000, E8, 2));
+        v.send(leg_fill(78, ASSET_UNKNOWN, true, 30_000_000, E8, 3));
+        let mut stranger = leg_fill(0, place.asset, true, 30_000_000, E8, 4);
+        stranger.reason = 0;
+        v.send(stranger);
+        assert!(arm.try_next_fill().is_none());
+        assert_eq!(arm.outcome_counters().expect("outcome").fills_mismatched, 1);
+        let c = arm.counters();
+        assert_eq!((c.fills_unresolved, c.fills_foreign), (3, 1));
+    }
+
+    /// XH4i-3b (risk review r1): a leg fill the blocking arm's `to_fill`
+    /// would refuse — a negative price, a size under one engine unit — is
+    /// refused; a settlement on the live generation (the instance has not
+    /// rolled yet) debits the leg's ledger like a sale.
+    #[test]
+    fn a_refused_leg_fill_books_nothing_and_a_live_settlement_debits_the_ledger() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        v.send(leg_fill(o.client_oid, place.asset, true, -1, E8, 1));
+        v.send(leg_fill(o.client_oid, place.asset, true, 30_000_000, 99, 2));
+        assert!(arm.try_next_fill().is_none());
+        assert_eq!(arm.outcome_counters().expect("outcome").fills_refused, 2);
+        v.send(leg_fill(
+            o.client_oid,
+            place.asset,
+            true,
+            30_000_000,
+            4 * E8,
+            3,
+        ));
+        assert!(arm.try_next_fill().is_some(), "bought 4");
+        v.send(leg_fill(0, place.asset, false, E8, 4 * E8, 4));
+        let f = arm.try_next_fill().expect("the settlement on the live leg");
+        assert_eq!((f.flags, f.order_id), (FILL_FLAG_SETTLEMENT, 9_004));
+        let st = arm.outcome.as_deref().expect("state");
+        assert_eq!(
+            st.assets.booked_qty(LEG_YES),
+            Some(0),
+            "bought 4, settled 4"
+        );
+        assert_eq!((st.counters.settlements, st.counters.fills_old_gen), (1, 0));
+    }
+
+    /// A-S7-83: a repeat of the live roll leaves the legs alone — their
+    /// ledger and the generation a roll retired survive it.
+    #[test]
+    fn a_repeated_live_roll_leaves_the_legs_and_their_ledger_alone() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        v.send(leg_fill(o.client_oid, place.asset, true, 30_000_000, E8, 1));
+        assert!(arm.try_next_fill().is_some());
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let st = arm.outcome.as_deref().expect("state");
+        assert_eq!(st.assets.booked_qty(LEG_YES), Some(1_000_000));
+        assert_eq!(
+            (st.counters.rolls_bound, st.counters.rolls_repeated),
+            (1, 1)
+        );
+        arm.on_venue_event(&roll_ev(INST_B, false));
+        let st = arm.outcome.as_deref().expect("state");
+        assert_eq!(
+            st.assets.sym_of_asset_gen(place.asset),
+            Some((LEG_YES, false)),
+            "the retired generation is the real one"
+        );
+    }
+
+    /// XH4i-4: a held leg of the spot read (`EV_BALANCE`).
+    fn balance(sp: &HlCmd, asset: u32, total_1e8: i64, entry_1e8: i64) -> ExecEvent {
+        ExecEvent {
+            client_oid: sp.client_oid,
+            px_1e8: entry_1e8,
+            sz_1e8: total_1e8,
+            asset,
+            kind: EV_BALANCE,
+            slot: sp.slot,
+            ..ExecEvent::default()
+        }
+    }
+
+    /// XH4i-4: one reconciliation of an outcome arm at `at` — the sheet
+    /// ($1 000), the spot half (no USDC but its row; `rows`, its end marked
+    /// or not) and the orders (`listed` resting).
+    fn leg_recon(
+        arm: &mut HlGatewayArm,
+        v: &mut Venue,
+        at: u64,
+        rows: &[ExecEvent],
+        marked: bool,
+        listed: u64,
+    ) {
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the sheet");
+        v.send(read_end(&st, 1_000 * E8, 2));
+        let _ = arm.idle(at);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half");
+        let mut k = 0usize;
+        while k < rows.len() {
+            v.send(ExecEvent {
+                client_oid: sp.client_oid,
+                ..rows[k]
+            });
+            k += 1;
+        }
+        let mut end = ExecEvent {
+            oid: rows.len() as u64,
+            ..read_end(&sp, 0, 0)
+        };
+        if !marked {
+            end.asset = 0;
+        }
+        v.send(end);
+        let _ = arm.idle(at);
+        let od = v.take(CMD_READ_ORDERS).expect("the orders");
+        v.send(open_order(&od, SLOT, listed));
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(at);
+    }
+
+    /// XH4i-5: an outcome arm's orders read listing an order of its slot it
+    /// does not hold, on a leg — an outcome map names `#<enc>` as an asset
+    /// from `ASSET_BASE` — cancels it under that leg's asset, as a perp's
+    /// (`an_unknown_order_of_the_slot_is_cancelled_and_pins_the_drift`);
+    /// the report carries the outcome mode's counters.
+    #[test]
+    fn an_outcome_arm_cancels_an_unknown_order_of_its_slot_on_a_leg() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        let at = t + 5 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the sheet");
+        v.send(read_end(&st, 1_000 * E8, 2));
+        let _ = arm.idle(at);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half");
+        v.send(ExecEvent {
+            oid: 0,
+            ..read_end(&sp, 0, 0)
+        });
+        let _ = arm.idle(at);
+        let od = v.take(CMD_READ_ORDERS).expect("the orders");
+        v.send(ExecEvent {
+            asset: place.asset,
+            ..open_order(&od, SLOT, o.client_oid)
+        });
+        v.send(ExecEvent {
+            asset: place.asset,
+            ..open_order(&od, SLOT, 999)
+        });
+        v.send(read_end(&od, 0, 0));
+        let _ = arm.idle(at);
+        assert_eq!(
+            v.take(CMD_CANCEL).map(|c| (c.client_oid, c.asset)),
+            Some((999, place.asset))
+        );
+        assert_eq!(arm.counters().unknown_orders, 1);
+        let mut r = GatewayArmReport::default();
+        assert!(arm.gateway_arm_report(at, &mut r));
+        assert_eq!(
+            (r.outcome_rolls_bound, r.unknown_orders),
+            (1, 1),
+            "the outcome mode's counters on the report"
+        );
+    }
+
+    /// XH4i-4 (S7-L1 parity): the spot read's legs are compared with the
+    /// ledger — agreement reconciles, and the legs at cost join the worth;
+    /// a drift is confirmed over two reads; a leg no live binding names is
+    /// unseen; an unmarked end is a failed read.
+    #[test]
+    fn an_outcome_arm_reconciles_its_legs_and_values_them_at_cost() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, place) = resting_leg(&mut arm, &mut v, t);
+        v.send(leg_fill(o.client_oid, place.asset, true, 30_000_000, E8, 1));
+        assert!(arm.try_next_fill().is_some(), "one contract of four bought");
+        let row = |total_1e8: i64, entry_1e8: i64| {
+            balance(&HlCmd::noop(SLOT, 0), place.asset, total_1e8, entry_1e8)
+        };
+        let at = t + 5 * S;
+        leg_recon(
+            &mut arm,
+            &mut v,
+            at,
+            &[row(E8, 30_000_000)],
+            true,
+            o.client_oid,
+        );
+        let sig = arm.signal(at);
+        assert_eq!(
+            (sig.reconciled, sig.pnl_judged, sig.pnl_delta_usd_1e6),
+            (1, 1, 300_000),
+            "agreed; the leg's $0.30 at cost joins the worth"
+        );
+        let stranger = balance(
+            &HlCmd::noop(SLOT, 0),
+            crate::asset::AssetTable::asset_id(INST_C, 0).expect("id"),
+            E8,
+            E8,
+        );
+        leg_recon(
+            &mut arm,
+            &mut v,
+            at + 5 * S,
+            &[row(3 * E8, 90_000_000), stranger],
+            true,
+            o.client_oid,
+        );
+        let sig = arm.signal(at + 5 * S);
+        assert_eq!(
+            (sig.reconciled, sig.recon_drift_usd_1e6),
+            (0, 0),
+            "one read: unconfirmed"
+        );
+        leg_recon(
+            &mut arm,
+            &mut v,
+            at + 10 * S,
+            &[row(3 * E8, 90_000_000)],
+            true,
+            o.client_oid,
+        );
+        assert_eq!(
+            arm.signal(at + 10 * S).recon_drift_usd_1e6,
+            2_000_000,
+            "confirmed"
+        );
+        let c = arm.outcome_counters().expect("outcome");
+        assert_eq!(
+            (c.leg_reads, c.leg_drift_reads, c.leg_unseen_reads),
+            (4, 2, 1)
+        );
+        let failed = arm.counters().spot_failed;
+        leg_recon(
+            &mut arm,
+            &mut v,
+            at + 15 * S,
+            &[row(E8, 30_000_000)],
+            false,
+            o.client_oid,
+        );
+        assert_eq!(arm.counters().spot_failed, failed + 1, "an unmarked end");
+        // A marked end that does not count the rows taken fails the read too.
+        let at = at + 20 * S;
+        let _ = arm.idle(at);
+        let st = v.take(CMD_READ_STATE).expect("the sheet");
+        v.send(read_end(&st, 1_000 * E8, 2));
+        let _ = arm.idle(at);
+        let sp = v.take(CMD_READ_SPOT).expect("the spot half");
+        v.send(ExecEvent {
+            client_oid: sp.client_oid,
+            ..row(E8, 30_000_000)
+        });
+        v.send(ExecEvent {
+            oid: 2,
+            ..read_end(&sp, 0, 0)
+        });
+        let _ = arm.idle(at);
+        assert_eq!(arm.counters().spot_failed, failed + 2, "a miscounted end");
+    }
+
+    /// XH4i-5 (risk review r1): a first-snapshot row on a leg no roll has
+    /// bound yet — the snapshot beat the ingress's boot roll — waits, and
+    /// books once the roll binds its leg; one on a bound leg books at once;
+    /// one no roll ever names stays parked, never booked.
+    #[test]
+    fn a_first_snapshot_row_waits_for_its_leg_s_roll() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let yes = crate::asset::AssetTable::asset_id(INST_A, 0).expect("id");
+        let stranger = crate::asset::AssetTable::asset_id(INST_C, 0).expect("id");
+        let snap = |cid: u64, asset: u32, tid: u64| ExecEvent {
+            flags: EVF_SNAPSHOT | EVF_BUY,
+            ..leg_fill(cid, asset, true, 30_000_000, E8, tid)
+        };
+        let ours = (1u64 << 63) | u64::from(INST_A);
+        v.send(snap(ours, yes, 1));
+        v.send(snap(ours, stranger, 2));
+        let _ = arm.idle(t);
+        assert!(arm.try_next_fill().is_none(), "no leg bound yet");
+        assert_eq!(arm.counters().fills_unresolved, 0, "parked, not lost");
+        arm.on_venue_event(&roll_ev(INST_A, false));
+        let f = arm.try_next_fill().expect("booked once its roll bound");
+        assert_eq!((f.sym, f.qty.0), (LEG_YES, 1_000_000));
+        assert!(arm.try_next_fill().is_none(), "the stranger's stays parked");
+        v.send(snap(ours, yes, 3));
+        let _ = arm.idle(t);
+        assert!(
+            arm.try_next_fill().is_some(),
+            "a bound leg's row books at once"
+        );
+        let c = arm.outcome_counters().expect("outcome");
+        assert_eq!(c.snapshot_parked, 2);
+    }
+
+    /// XH4i-5 (risk review r1, MAJOR): a reprice whose replacement the member
+    /// cancelled before the venue refused the modify — the replacement holds
+    /// nothing, so the original, resting on, is cancelled too: never left on
+    /// the venue untracked.
+    #[test]
+    fn a_refused_reprice_whose_replacement_was_cancelled_cancels_the_original() {
+        let (mut arm, mut v, t) = booted_with(&outcome_cfg());
+        let (o, _place) = resting_leg(&mut arm, &mut v, t);
+        let next = leg_order(2, INST_A, LEG_YES, ORDER_KIND_MAKER, Side::Bid, 310_000);
+        assert!(arm.modify(&ModifyReq::new(o.client_oid, next)).is_ok());
+        let m = v.take(CMD_MODIFY).expect("the modify");
+        let mut c = CancelReq::new(0, VenueId::Hyperliquid, LEG_YES, next.client_oid);
+        c.strategy_id = SLOT;
+        assert!(arm.cancel(&c).is_ok());
+        assert_eq!(
+            v.take(CMD_CANCEL).map(|x| x.client_oid),
+            Some(next.client_oid)
+        );
+        v.send(item(&m, EV_REJECTED, ORDER_EVENT_REASON_BAD_ALO_PX, 0));
+        let _ = arm.idle(t);
+        assert_eq!(
+            v.take(CMD_CANCEL).map(|x| x.client_oid),
+            Some(o.client_oid),
+            "the original, resting on, is cancelled"
+        );
     }
 
     fn events(arm: &mut HlGatewayArm) -> Vec<(u64, u8, u8)> {

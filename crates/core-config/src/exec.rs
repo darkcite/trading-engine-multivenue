@@ -1080,8 +1080,11 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
     // WebSocket arm — one address's sweeps, budget and dead man — so a
     // gateway slot names hyperliquid alone; the perp clamps (deviation 19,
     // both or neither) and the post-only rejection halt (XH-7) are its
-    // own; and a live one states all three and an address floor the arm
-    // accepts. XMM XH5c-2: its top-up keys are legal under the rules above
+    // own; and a live one states the halt and an address floor the arm
+    // accepts. XMM XH4i-5: whether it states the perp pair is its role's —
+    // slot 6 quotes perps and must, slot 3 trades HIP-4 legs and must not
+    // (a perp slot's every order must be on a linear row) — so the boot
+    // (`cli::exec_boot`) judges it. XMM XH5c-2: its top-up keys are legal under the rules above
     // (both, or neither; bounded) — slot 6's boot takes them on an account
     // of its own alone (`cli::xmm_live::check_account_rules`).
     let gateway = s.transport == TRANSPORT_GATEWAY;
@@ -1112,11 +1115,10 @@ fn finish_slot(kv: &Kv, slot: usize, line: usize) -> Result<ExecSlot, ExecError>
         )));
     }
     if s.is_live() && gateway {
-        if s.cap_perp_usd_1e6 == 0 || s.halt_on_alo_reject_pct == 0 {
+        if s.halt_on_alo_reject_pct == 0 {
             return Err(err(format!(
                 "slot {slot} at line {line}: `mode = \"live\"` on the gateway needs a non-zero \
-                 `cap_perp_usd_1e6`, `max_resting_usd_1e6` and `halt_on_alo_reject_pct` — `0` \
-                 means UNSET here, never \"unlimited\""
+                 `halt_on_alo_reject_pct` — `0` means UNSET here, never \"unlimited\""
             )));
         }
         if s.request_budget_floor < GATEWAY_BUDGET_FLOOR_MIN {
@@ -1771,12 +1773,19 @@ mode = "paper"
             &gw.replace("max_resting_usd_1e6 = 300000000\n", ""),
             "both, or neither",
         );
-        expect_err(
-            &gw.replace(
-                "cap_perp_usd_1e6 = 150000000\nmax_resting_usd_1e6 = 300000000\n",
-                "",
+        // XMM XH4i-5: the perp pair is the slot's role's — the boot judges
+        // it (slot 6 must, slot 3 must not); the parser takes neither.
+        let legs = parse(&gw.replace(
+            "cap_perp_usd_1e6 = 150000000\nmax_resting_usd_1e6 = 300000000\n",
+            "",
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                legs.slot(3).cap_perp_usd_1e6,
+                legs.slot(3).max_resting_usd_1e6
             ),
-            "cap_perp_usd_1e6",
+            (0, 0)
         );
         expect_err(
             &gw.replace("request_budget_floor = 2000", "request_budget_floor = 319"),

@@ -55,8 +55,59 @@ pub enum RuleErr {
     Price,
     /// The size is not a multiple of the lot.
     Lot,
-    /// Price × size is below $10.
+    /// Price × size is below $10 (a perp) or $1 (an outcome leg).
     MinNotional,
+    /// XH4i-3a: an outcome leg's price outside [0.001, 0.999].
+    Range,
+}
+
+/// **XH4i-3a — a HIP-4 outcome leg's rules,** applied locally like the
+/// perps' and CHECKED ONLY: an order that breaks one is refused, never
+/// rounded — the member (BIN15) keeps to the venue's grid itself and
+/// skips what is off it, so a rounded order would be one it never asked
+/// for. Measured, not read from a doc (BIN15's `GRID_*`, held in agreement
+/// with these at compile time by the cli's `bin15_boot`): a tick of 1e-4
+/// of a dollar, whole contracts, a price in [0.001, 0.999], and $1 of
+/// notional — the venue
+/// refuses `Order must have minimum value of 1 USDC.` (testnet,
+/// 2026-09-15 and -19).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OutcomeRules;
+
+impl OutcomeRules {
+    /// The price tick, ×1e8 (1e-4).
+    pub const TICK_1E8: i64 = 10_000;
+    /// The lot, ×1e8: one whole contract.
+    pub const LOT_1E8: i64 = 100_000_000;
+    /// The lowest price, ×1e8 (0.001).
+    pub const PX_MIN_1E8: i64 = 100_000;
+    /// The highest price, ×1e8 (0.999).
+    pub const PX_MAX_1E8: i64 = 99_900_000;
+    /// $1 in 1e8 × 1e8 units (price 1e8 × size 1e8).
+    pub const MIN_NOTIONAL_1E16: i128 = 10_000_000_000_000_000;
+
+    /// Whether the order may be sent as is.
+    ///
+    /// # Errors
+    /// The first rule it breaks.
+    pub const fn check(px_1e8: i64, sz_1e8: i64) -> Result<(), RuleErr> {
+        if px_1e8 <= 0 || sz_1e8 <= 0 {
+            return Err(RuleErr::NonPositive);
+        }
+        if px_1e8 % Self::TICK_1E8 != 0 {
+            return Err(RuleErr::Price);
+        }
+        if px_1e8 < Self::PX_MIN_1E8 || px_1e8 > Self::PX_MAX_1E8 {
+            return Err(RuleErr::Range);
+        }
+        if sz_1e8 % Self::LOT_1E8 != 0 {
+            return Err(RuleErr::Lot);
+        }
+        if (px_1e8 as i128) * (sz_1e8 as i128) < Self::MIN_NOTIONAL_1E16 {
+            return Err(RuleErr::MinNotional);
+        }
+        Ok(())
+    }
 }
 
 /// One perp's rules: its `szDecimals`.
@@ -175,6 +226,41 @@ mod tests {
     use crate::wire::WireNum;
 
     const E8: i64 = 100_000_000;
+
+    /// XH4i-3a: an outcome leg's rules check and never round — the grid's
+    /// edges, the tick, whole contracts, $1 (4 @ 0.30 rests, 3 @ 0.30 is
+    /// the venue's own refusal, measured).
+    #[test]
+    fn an_outcome_leg_is_checked_never_rounded() {
+        let ok = |px: i64, sz: i64| OutcomeRules::check(px, sz);
+        assert_eq!(ok(30_000_000, 4 * E8), Ok(()), "4 @ 0.30 = $1.20 rests");
+        assert_eq!(
+            ok(30_000_000, 3 * E8),
+            Err(RuleErr::MinNotional),
+            "3 @ 0.30"
+        );
+        assert_eq!(ok(100_000, 1_000 * E8), Ok(()), "0.001, the lowest price");
+        assert_eq!(ok(99_900_000, 2 * E8), Ok(()), "0.999, the highest");
+        assert_eq!(ok(90_000, 2_000 * E8), Err(RuleErr::Range), "below 0.001");
+        assert_eq!(ok(99_910_000, 2 * E8), Err(RuleErr::Range), "above 0.999");
+        assert_eq!(
+            ok(E8, 2 * E8),
+            Err(RuleErr::Range),
+            "1.0 is no binary's price"
+        );
+        assert_eq!(
+            ok(30_005_000, 4 * E8),
+            Err(RuleErr::Price),
+            "finer than 1e-4"
+        );
+        assert_eq!(
+            ok(30_000_000, 4 * E8 + 1),
+            Err(RuleErr::Lot),
+            "a part contract"
+        );
+        assert_eq!(ok(0, 4 * E8), Err(RuleErr::NonPositive));
+        assert_eq!(ok(30_000_000, -4 * E8), Err(RuleErr::NonPositive));
+    }
 
     fn render(px_1e8: i64) -> String {
         String::from_utf8(WireNum::from_1e8(px_1e8).as_bytes().to_vec()).unwrap()

@@ -73,7 +73,7 @@ use exec_hyperliquid::config::{
 use exec_hyperliquid::dayspend::utc_day;
 use exec_hyperliquid::deadman::DeadManCfg;
 use exec_hyperliquid::gateway::{
-    hl_duplex, read_weight_per_min, CoinMap, GatewayCfg, HlGateway, IP_WEIGHT_SHARE,
+    hl_duplex, read_weight_per_min, CoinMap, GatewayCfg, HlGateway, HlGatewayEnd, IP_WEIGHT_SHARE,
     POST_TIMEOUT_NS, WS_MSG_SHARE,
 };
 use exec_hyperliquid::recon::{scan_user_role, user_role_request, Role};
@@ -218,19 +218,30 @@ pub const fn stale_periods(own: bool) -> u64 {
 /// # Errors
 /// The first rule `s` breaks, named.
 pub fn check_account_rules(s: &ExecSlot, own: bool) -> Result<(), String> {
+    check_slot_account_rules(XMM_SLOT, s, own)
+}
+
+/// **XMM XH4i-5** — [`check_account_rules`] for gateway slot `slot`: slot
+/// 3's gateway arm trades the operator's account as its own (`own`), so the
+/// same rules hold for it — the reads' share, the stale floor, its loss
+/// bound, its top-ups' price.
+///
+/// # Errors
+/// The first rule `s` breaks, named.
+pub fn check_slot_account_rules(slot: usize, s: &ExecSlot, own: bool) -> Result<(), String> {
     let recon = recon_ms_for(own);
     if !read_weight_ok(recon, own) {
         return Err(format!(
-            "slot 6's periodic reads every {recon} ms weigh {} of the gateway's {IP_WEIGHT_SHARE} \
-             IP weight a minute — over 40 % (XMM XH5b-2)",
+            "slot {slot}'s periodic reads every {recon} ms weigh {} of the gateway's \
+             {IP_WEIGHT_SHARE} IP weight a minute — over 40 % (XMM XH5b-2)",
             read_weight_per_min(recon, LIMIT_MS, own)
         ));
     }
     let floor = stale_periods(own) * recon;
     if s.halt_on_recon_stale_ms < floor as i64 {
         return Err(format!(
-            "slot 6's halt_on_recon_stale_ms ({}) must be at least {} of the gateway arm's read \
-             periods ({recon} ms each{}) — {floor} ms",
+            "slot {slot}'s halt_on_recon_stale_ms ({}) must be at least {} of the gateway arm's \
+             read periods ({recon} ms each{}) — {floor} ms",
             s.halt_on_recon_stale_ms,
             stale_periods(own),
             if own {
@@ -242,32 +253,33 @@ pub fn check_account_rules(s: &ExecSlot, own: bool) -> Result<(), String> {
     }
     let bound = s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0;
     if !own && bound {
-        return Err(String::from(
-            "slot 6 on the shared testnet account states a session bound \
+        return Err(format!(
+            "slot {slot} on the shared testnet account states a session bound \
              (halt_on_gain/loss_usd_1e6), but the account's worth there is every slot's — the \
-             bound could never be judged: drop it, or give slot 6 its own account \
+             bound could never be judged: drop it, or give slot {slot} its own account \
              (HYPERLIQUID_XMM_TESTNET_*, XMM XH5b-2)",
         ));
     }
     if own && s.halt_on_loss_usd_1e6 == 0 {
-        return Err(String::from(
-            "slot 6 on its own account states no session loss bound (halt_on_loss_usd_1e6) — \
-             the probe's is −$50 (O-XH5); its own account is where the bound is judged (XMM \
-             XH5b-2)",
+        return Err(format!(
+            "slot {slot} on its own account states no session loss bound \
+             (halt_on_loss_usd_1e6) — the probe's is −$50 (O-XH5); its own account is where the \
+             bound is judged (XMM XH5b-2)",
         ));
     }
     if !own && s.request_topup_weight != 0 {
-        return Err(String::from(
-            "slot 6 on the shared testnet account states top-ups (request_topup_weight), but \
-             that account's requests are its blocking arm's to buy (S7-L1) — drop them, or give \
-             slot 6 its own account (HYPERLIQUID_XMM_TESTNET_*, XMM XH5c-2)",
+        return Err(format!(
+            "slot {slot} on the shared testnet account states top-ups (request_topup_weight), \
+             but that account's requests are its blocking arm's to buy (S7-L1) — drop them, or \
+             give slot {slot} its own account (HYPERLIQUID_XMM_TESTNET_*, XMM XH5c-2)",
         ));
     }
     let price = s.request_topup_weight.saturating_mul(TOPUP_PRICE_1E6);
     if own && price.saturating_mul(4) > s.halt_on_loss_usd_1e6 {
         return Err(format!(
-            "slot 6's top-up of {} requests costs ${}.{:06}, over a quarter of its session loss \
-             bound (${}.{:06}): until a purchase is inside the worth its price reads as a loss, \
+            "slot {slot}'s top-up of {} requests costs ${}.{:06}, over a quarter of its \
+             session loss bound (${}.{:06}): until a purchase is inside the worth its price \
+             reads as a loss, \
              and one must never end a session alone — lower request_topup_weight (XMM XH5c-2)",
             s.request_topup_weight,
             price / 1_000_000,
@@ -551,20 +563,27 @@ pub fn tell_account(tell: &mut String, network: Network, own: Option<&OwnTell<'_
         o.loss_usd_1e6 / 1_000_000,
         o.loss_usd_1e6 % 1_000_000,
     );
-    let _ = match o.restored {
+    tell_anchor(tell, o.restored, o.anchor_file);
+}
+
+/// **The boot tell's anchor** (cold, pure; XMM XH5b-2 — slot 3's too, XMM
+/// XH4i-5): restored from its file, or to be kept there by the gateway's
+/// thread.
+pub fn tell_anchor(tell: &mut String, restored: Option<PnlAnchor>, anchor_file: &Path) {
+    let _ = match restored {
         Some(a) => write!(
             tell,
             "anchor RESTORED ${}.{:06} from {} (set {} unix)",
             a.usdc_1e6 / 1_000_000,
             a.usdc_1e6 % 1_000_000,
-            o.anchor_file.display(),
+            anchor_file.display(),
             a.set_unix_s
         ),
         None => write!(
             tell,
             "no anchor yet — the first complete worth anchors, kept in {} by the gateway's \
              thread before the first quote",
-            o.anchor_file.display()
+            anchor_file.display()
         ),
     };
 }
@@ -935,53 +954,21 @@ pub fn boot_xmm_arm(
         cfg.expires_after_ms,
     );
     let (eng, gw_end) = hl_duplex();
-    // XMM XH5b-2: on its own account with no anchor restored, the arm hands
-    // the session's first complete worth to the keeper on the gateway's
-    // thread, which halts the gateway if it cannot store it (a restored
-    // anchor is durable already: no keeper).
-    let keep = if own && restored.is_none() {
-        let slot = Arc::new(AnchorSlot::new());
-        let keeper = AnchorKeeper::new(
-            Arc::clone(&slot),
-            anchor_file,
-            hl.master_addr,
-            Arc::clone(&gw_end.stats),
-        );
-        Some((slot, keeper))
-    } else {
-        None
-    };
     // COPY: boot, once — the 1 792 B arm moves out of `new`'s `Result`, into
     // `XmmLive`, the binary's tuple, the `SlotSplit` and the router (it stays
     // inline there, for the verbs' direct calls). Rejected: boxing the arm
     // (every verb would chase a pointer).
     let mut arm = HlGatewayArm::new(&cfg, eng).map_err(|e| format!("slot 6's arm: {e:?}"))?;
-    let keeper = keep.map(|(slot, keeper)| {
-        arm.keep_anchor_in(slot);
-        keeper
-    });
-    // XMM XH5c-2: the governor in the arm; armed (a weight above 0), its
-    // hand-over to a keeper on the gateway's thread (a weight past the
-    // purchase's `u32`, and a temp path too long for a 0 B store, refused).
-    // Off, the governor alone carries the restored spend's add-back: no
-    // keeper, nothing stored.
-    let topup_keeper = match topup {
-        Some((gov, anchor_s)) if gov.weight() > 0 => {
-            let slot = Arc::new(TopupSlot::new());
-            arm.set_topup(gov, Some(Arc::clone(&slot)))
-                .map_err(|e| format!("slot 6's top-ups: {e:?}"))?;
-            Some(
-                TopupKeeper::new(slot, topup_file, hl.master_addr, anchor_s)
-                    .map_err(|e| format!("slot 6's top-up state: {e}"))?,
-            )
-        }
-        Some((gov, _)) => {
-            arm.set_topup(gov, None)
-                .map_err(|e| format!("slot 6's top-ups: {e:?}"))?;
-            None
-        }
-        None => None,
-    };
+    // XMM XH5b-2, XH5c-2: on its own account, the anchor's keeper (none
+    // restored) and the top-ups' governor and keeper.
+    let (keeper, topup_keeper) = keep_own(
+        &mut arm,
+        &gw_end,
+        hl.master_addr,
+        (own && restored.is_none()).then_some(anchor_file),
+        topup.map(|(gov, anchor_s)| (gov, anchor_s, topup_file)),
+        "slot 6",
+    )?;
     // XMM XH5d: the ALO priority's HYPE — the arm's session cap (0: every
     // place bidding one refused unsent).
     arm.set_priority_cap(priority_cap(&xmm.params));
@@ -1132,6 +1119,7 @@ pub const fn arm_cfg(slot: u8, expires_after_ms: u16, recon_ms: u64, budget_floo
         budget_floor,
         limit_ms: LIMIT_MS,
         leverage: LEVERAGE,
+        outcomes: false,
     }
 }
 
@@ -1178,6 +1166,52 @@ const BLANK_PERP: PerpBind = PerpBind {
         None => panic!("szDecimals 0 has rules"),
     },
 };
+
+/// **A gateway arm's keepers on an account of its own** (XMM XH5b-2,
+/// XH5c-2; slot 3's too, XMM XH4i-5), for the gateway's thread. `anchor`
+/// (its file) when no anchor was restored: the arm hands the session's
+/// first complete worth to a keeper, which halts the gateway if it cannot
+/// store it (a restored anchor is durable already: no keeper). `topup` (the
+/// restored governor, its anchor's stamp, its file): the governor goes into
+/// the arm; armed (a weight above 0), it hands each state over to a keeper
+/// (a weight past the purchase's `u32`, and a temp path too long for a 0 B
+/// store, refused); off, the governor alone carries the restored spend's
+/// add-back — no keeper, nothing stored. `who` names the slot in refusals.
+///
+/// # Errors
+/// The governor or its keeper refused.
+pub(crate) fn keep_own(
+    arm: &mut HlGatewayArm,
+    end: &HlGatewayEnd,
+    master: [u8; 20],
+    anchor: Option<PathBuf>,
+    topup: Option<(TopupGovernor, u64, PathBuf)>,
+    who: &str,
+) -> Result<(Option<AnchorKeeper>, Option<TopupKeeper>), String> {
+    let keeper = anchor.map(|file| {
+        let slot = Arc::new(AnchorSlot::new());
+        arm.keep_anchor_in(Arc::clone(&slot));
+        AnchorKeeper::new(slot, file, master, Arc::clone(&end.stats))
+    });
+    let topup_keeper = match topup {
+        Some((gov, anchor_s, file)) if gov.weight() > 0 => {
+            let slot = Arc::new(TopupSlot::new());
+            arm.set_topup(gov, Some(Arc::clone(&slot)))
+                .map_err(|e| format!("{who}'s top-ups: {e:?}"))?;
+            Some(
+                TopupKeeper::new(slot, file, master, anchor_s)
+                    .map_err(|e| format!("{who}'s top-up state: {e}"))?,
+            )
+        }
+        Some((gov, _, _)) => {
+            arm.set_topup(gov, None)
+                .map_err(|e| format!("{who}'s top-ups: {e:?}"))?;
+            None
+        }
+        None => None,
+    };
+    Ok((keeper, topup_keeper))
+}
 
 /// Start `gw` on its own thread `name` (pinned to `core` when given), with
 /// slot 6's anchor `keeper` (XMM XH5b-2) and top-up keeper `topup` (XMM

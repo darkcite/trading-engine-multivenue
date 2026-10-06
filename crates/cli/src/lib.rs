@@ -38,6 +38,7 @@ pub mod audit_pnl;
 pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
+pub mod bin15_live;
 pub mod bn_live;
 pub mod capture_catalog;
 pub mod evm_live;

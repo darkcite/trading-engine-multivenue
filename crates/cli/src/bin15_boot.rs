@@ -25,6 +25,19 @@ use std::path::{Path, PathBuf};
 use core_types::SymbolId;
 use tracing::{info, warn};
 
+// XH4i-3a: BIN15's grid (×1e6) and the gateway arm's `OutcomeRules` (×1e8)
+// are one rule set. The arm checks and never rounds, so a drift between the
+// two would refuse every leg order (`refused_rules`): held at compile time.
+const _: () = {
+    use exec_hyperliquid::rules::OutcomeRules as R;
+    assert!(strategy_bin15::GRID_TICK_1E6 * 100 == R::TICK_1E8);
+    assert!(strategy_bin15::GRID_LOT_1E6 * 100 == R::LOT_1E8);
+    assert!(strategy_bin15::GRID_PX_MIN_1E6 * 100 == R::PX_MIN_1E8);
+    assert!(strategy_bin15::GRID_PX_MAX_1E6 * 100 == R::PX_MAX_1E8);
+    // $1 both ways: px × qty / 1e6 at 1e6 there, px × sz at 1e8 × 1e8 here.
+    assert!(strategy_bin15::GRID_MIN_NOTIONAL_1E6 * 10_000_000_000 == R::MIN_NOTIONAL_1E16);
+};
+
 /// One underlying's boot seed.
 ///
 /// **A pair belongs to ONE tenor.** `x` is `ln har_tau` and `y` is `ln`
@@ -514,6 +527,38 @@ pub fn day_cap_warning(params: &strategy_bin15::Bin15Params) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XH4i-3a (risk review r1): BIN15's grid test and the gateway arm's
+    /// `OutcomeRules::check` agree on every price around the grid — each
+    /// tick and between ticks, past both ends — and on sizes around the lot
+    /// and the $1 floor: no order BIN15 lets through is refused, and none
+    /// it holds back would pass.
+    #[test]
+    fn bin15_s_grid_test_and_the_outcome_rules_agree() {
+        let qtys = [
+            -1_000_000i64,
+            0,
+            500_000,
+            1_000_000,
+            1_500_000,
+            2_000_000,
+            3_000_000,
+            4_000_000,
+            10_000_000,
+            1_000_000_000,
+        ];
+        let mut px = -100i64;
+        while px <= 1_000_100 {
+            for q in qtys {
+                assert_eq!(
+                    strategy_bin15::Bin15Strategy::on_grid(px, q),
+                    exec_hyperliquid::rules::OutcomeRules::check(px * 100, q * 100).is_ok(),
+                    "px {px} qty {q}"
+                );
+            }
+            px += 50;
+        }
+    }
 
     #[test]
     fn the_family_key_grammar_accepts_two_forms_and_refuses_crossed_ones() {

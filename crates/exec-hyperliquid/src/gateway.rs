@@ -78,13 +78,23 @@
 //! **Streams.** `userFills` → [`EV_FILL`] + [`EV_FILL_META`] (fee,
 //! crossed), deduplicated by tid across connections and reconnects (LAW
 //! E-5). The process's FIRST snapshot is history: its tids are admitted,
-//! nothing is emitted, and [`EV_SNAPSHOT`] (rows, the latest fill's venue
-//! time) tells the arm to read its boot reconciliation after it.
+//! and [`EV_SNAPSHOT`] (rows, the latest fill's venue time) tells the arm
+//! to read its boot reconciliation after it. A perps map emits none of its
+//! rows; an outcome map emits its legs' rows of the last day and an hour,
+//! flagged [`EVF_SNAPSHOT`], with no fee, for the arm to book once
+//! (XH4i-3b-2b).
 //! `orderUpdates` → status events, deduplicated (both sockets carry them
 //! during a swap). A frame that does not scan, a socket that comes up
 //! after a gap with no live socket, and one that replaces a socket that
 //! had gone silent are [`EV_GAP`]: `orderUpdates` has no snapshot, so the
-//! arm re-checks its open orders.
+//! arm re-checks its open orders. Every fill, order-update, open-order and
+//! position row, and every sweep cancel, names its asset through the
+//! boot's [`CoinMap`], the coin read in place off the frame: perps by the
+//! names the arm bound; on a map built [`CoinMap::with_outcomes`] (XH4i —
+//! BIN15's gateway, slot 3, once XH4i-5 composes it), a HIP-4 leg by its
+//! own `#<enc>` coin — never an id for a place (LAW E-4) — and the spot
+//! read reports each leg the account holds ([`EV_BALANCE`], XH4i-2) by its
+//! `+<enc>` (`asset::asset_of_balance_coin`), read in place the same way.
 //!
 //! **Rates (XH4e).** Every post is charged to a one-minute window of the
 //! venue's IP weight — an action 1 + ⌊n/40⌋, a read its REST weight
@@ -108,8 +118,9 @@
 //! 64 B event into its slot; the ≤ 125 B pong echo (rx → control
 //! buffer); a re-send's envelope (≤ 16 KiB, out of the TX buffer into the
 //! REST client's window — its signed bytes exist only there, XMM HD2);
-//! boot-time moves (the dedupe rings, the batch arrays, the coin
-//! table); and core-net's transport copies — kernel ↔ rustls, rustls ↔
+//! boot-time moves (the dedupe rings, the RTT window and the TTL table,
+//! the batch arrays, the coin table, the gateway itself); and core-net's
+//! transport copies — kernel ↔ rustls, rustls ↔
 //! the receive buffer and its compaction. **Allocations:** none of the
 //! gateway's own after construction; rustls 0.23's buffered API allocates
 //! one buffer per TLS record it seals or opens — more for an inbound
@@ -148,6 +159,7 @@ use crate::action::{
     encode_reserve_weight, encode_schedule_cancel, encode_update_leverage, CancelByCloidWire,
     Grouping, ModifyWire, OrderWire, Tif, MAX_ACTION, MAX_ORDERS,
 };
+use crate::asset::{asset_of_balance_coin, asset_of_fill_coin};
 use crate::budget::{rate_limit_request, scan_rate_limit};
 use crate::cloid::{decode, Owner};
 use crate::cmd::{
@@ -158,12 +170,12 @@ use crate::cmd::{
 use crate::event::REASON_NOT_FOUND;
 use crate::event::{
     never_left, reason_of_error, ExecEvent, ASSET_UNKNOWN, EVF_BUY, EVF_CMD_SHIFT, EVF_CROSSED,
-    EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_CANCELED, EV_FILL,
+    EVF_FILLED, EVF_POST_ITEM, EVF_RESTING, EVF_SNAPSHOT, EV_ACK, EV_BALANCE, EV_CANCELED, EV_FILL,
     EV_FILL_META, EV_GAP, EV_HALT, EV_OPEN_ORDER, EV_POSITION, EV_READ_DONE, EV_READ_FAILED,
     EV_REJECTED, EV_RESTING, EV_SNAPSHOT, EV_UNANSWERED, GAP_FILLS_UNREADABLE, GAP_RECONNECT,
     GAP_UPDATES_UNREADABLE, READ_DAY, READ_LIMIT, READ_ORDERS, READ_SPOT, READ_STATE,
     REASON_HALTED, REASON_LOCAL, REASON_MALFORMED, REASON_NOT_READY, REASON_RATE_LIMIT,
-    REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN,
+    REASON_SETTLEMENT, REASON_THROTTLED, REASON_TRANSPORT, SLOT_FOREIGN, SPOT_LEGS_READ,
 };
 use crate::gwconn::{GwConn, Phase};
 use crate::http::{HlHttp, MAX_REQ_BODY};
@@ -194,6 +206,12 @@ use crate::wspost::{classify, PostKind, WsIn};
 pub const CMD_RING: usize = 1024;
 /// Event ring slots (gateway → engine): four command rings (XG-2).
 pub const EVT_RING: usize = 4096;
+/// XH4i-3b-2b: an outcome map's first snapshot hands the arm its legs'
+/// rows of the last day and an hour (a daily family's instance lives a
+/// day) …
+const SNAPSHOT_EMIT_MS: u64 = 25 * 3_600_000;
+/// … at most a quarter of the event ring.
+const SNAPSHOT_EMIT_MAX: usize = EVT_RING / 4;
 /// The engine's end of an HL gateway.
 pub type HlEngineEnd = EngineEnd<HlCmd, ExecEvent, CMD_RING, EVT_RING>;
 /// The gateway's end.
@@ -250,6 +268,9 @@ const MAX_POSITIONS: usize = 64;
 /// XG-2: the event room a read's answer needs (its rows and its end).
 const READ_RESERVE: usize = MAX_OPEN_ORDERS + 1;
 const _: () = assert!(MAX_POSITIONS <= MAX_OPEN_ORDERS);
+// XH4i-2: a spot read's legs (one `EV_BALANCE` a sheet row at most) and
+// its end fit the same room: fewer rows than the room.
+const _: () = assert!(MAX_SPOT_BALANCES < READ_RESERVE);
 /// The slot byte of the gateway's own sweep read: never a strategy slot,
 /// never `SLOT_FOREIGN`; its rows stay inside the gateway.
 const SWEEP_SLOT: u8 = 0xFE;
@@ -434,15 +455,36 @@ pub enum GatewayErr {
     Rates,
 }
 
-/// Coins the gateway resolves to asset ids for the streams (perps: the
-/// arm's `/info meta` binding, XH4c). An unknown coin is
+/// Coins the gateway resolves to asset ids for the streams and the sweep
+/// (perps: the arm's `/info meta` binding, XH4c). An unknown coin is
 /// [`ASSET_UNKNOWN`]; the arm still has the client id.
+///
+/// **XH4i-1 — outcome legs by their own names.** A map built
+/// [`with_outcomes`](Self::with_outcomes) — for BIN15's gateway (slot 3),
+/// composed in XH4i-5 — also resolves a HIP-4 leg's `#<enc>` to
+/// `ASSET_BASE + enc`, read off the venue's own coin name
+/// (`asset::asset_of_fill_coin`, S7-L1). The spelling is measured on
+/// testnet in all three places the gateway reads: `userFills`
+/// (2026-09-15), `orderUpdates` and `frontendOpenOrders` (2026-09-19,
+/// `#154150`; the vault's `outcome/data/testnet-exec-2026-09-19`, the
+/// watch log and phase G's sweep). That id names an event's leg and a
+/// sweep's cancel, never a place: LAW E-4 binds an order's id from a roll
+/// event, in the arm. A perps-only map (slot 6's) leaves every `#` coin
+/// unknown, as before.
+///
+/// **XH4i-2:** on such a map the spot read also reports each leg the
+/// account holds — its `+<enc>` row on the spot sheet — as
+/// [`EV_BALANCE`], and marks its end ([`SPOT_LEGS_READ`]): an outcome arm
+/// tells a sheet read for legs from one that was not.
 #[derive(Clone)]
 pub struct CoinMap {
     names: [[u8; COIN_MAX]; COIN_SLOTS],
     lens: [u8; COIN_SLOTS],
     assets: [u32; COIN_SLOTS],
     n: usize,
+    /// XH4i-1: a `#<enc>` coin resolves to its outcome leg; XH4i-2: the
+    /// spot read reports the held `+<enc>` legs.
+    outcomes: bool,
 }
 
 /// Coins a map holds.
@@ -465,13 +507,34 @@ impl CoinMap {
             lens: [0u8; COIN_SLOTS],
             assets: [0u32; COIN_SLOTS],
             n: 0,
+            outcomes: false,
         }
     }
 
+    /// XH4i-1: empty, and naming HIP-4 outcome legs by their `#<enc>`
+    /// coins (above). Perps still bind by name ([`insert`](Self::insert)).
+    #[must_use]
+    pub const fn with_outcomes() -> Self {
+        let mut m = Self::new();
+        m.outcomes = true;
+        m
+    }
+
+    /// XH4i-3b-2b: whether the map names outcome legs (slot 3's gateway).
+    #[must_use]
+    pub const fn outcomes(&self) -> bool {
+        self.outcomes
+    }
+
     /// Bind `coin` to `asset`. `false`: the map is full or the name too
-    /// long (boot refuses).
+    /// long (boot refuses) — or, on an outcome map, a `#` name: a leg is
+    /// named by its coin alone, and a binding would never be read.
     pub fn insert(&mut self, coin: &[u8], asset: u32) -> bool {
-        if self.n == COIN_SLOTS || coin.is_empty() || coin.len() > COIN_MAX {
+        if self.n == COIN_SLOTS
+            || coin.is_empty()
+            || coin.len() > COIN_MAX
+            || (self.outcomes && coin.first() == Some(&b'#'))
+        {
             return false;
         }
         // COPY: ≤ 16 B coin name into the table, once per coin at boot —
@@ -483,9 +546,14 @@ impl CoinMap {
         true
     }
 
-    /// The asset `coin` is bound to, or [`ASSET_UNKNOWN`].
+    /// The asset `coin` is bound to — on an outcome map, a `#<enc>` leg's
+    /// own id — or [`ASSET_UNKNOWN`].
     #[must_use]
     pub fn asset(&self, coin: &[u8]) -> u32 {
+        if self.outcomes && coin.first() == Some(&b'#') {
+            // No perp's name starts with '#': the leg's name is its id.
+            return asset_of_fill_coin(coin).unwrap_or(ASSET_UNKNOWN);
+        }
         let mut i = 0usize;
         while i < self.n {
             let len = self.lens[i] as usize;
@@ -508,6 +576,10 @@ pub struct GatewayCounters {
     pub fills_scan_failed: u64,
     /// Rows of the first snapshot, absorbed as history.
     pub snapshot_rows: u64,
+    /// XH4i-5: an outcome map's first-snapshot leg rows past its cap, not
+    /// emitted — the arm's ledger misses them, and its reconciliation's
+    /// drift halts the slot.
+    pub snapshot_kept: u64,
     /// `orderUpdates` rows emitted.
     pub updates: u64,
     /// `orderUpdates` rows with a status the gateway does not report.
@@ -539,7 +611,8 @@ pub struct GatewayCounters {
     /// Cancels a sweep sent (XH4d).
     pub sweep_cancels: u64,
     /// Resting orders of ours a sweep could not cancel: their coin is not
-    /// in the coin map (XH4d).
+    /// in the coin map (XH4d) — on an outcome map, nor a `#<enc>` leg
+    /// (XH4i-1).
     pub sweep_unmapped: u64,
     /// Growing commands refused unsent at 80 % of a rate share (XH4e).
     pub throttled: u64,
@@ -1307,7 +1380,12 @@ impl Router {
     /// `sz_1e8` = 1 when the sheet lists USDC — 0 when it lists none, which
     /// the arm refuses as no worth (`recon::account_view`'s rule: nothing to
     /// anchor) — `aux` = the rows, scanned in place into a fixed table.
-    /// `false`: it does not scan (more rows than the table holds included).
+    /// **XH4i-2:** on an outcome map, first one [`EV_BALANCE`] per `+<enc>`
+    /// row with a holding (`asset::asset_of_balance_coin`, or
+    /// [`ASSET_UNKNOWN`]: still a leg, which an outcome arm counts unseen,
+    /// XH4i-4), and the end's `oid` counts them and its `asset` is
+    /// [`SPOT_LEGS_READ`]. `false`: it does not scan (more rows than the
+    /// table holds included) — before any row goes out.
     fn read_spot(&mut self, item: &ItemRef, body: &[u8], now: u64) -> bool {
         let Some((s, e)) = object_field(body, b"\"data\"") else {
             return false;
@@ -1317,20 +1395,42 @@ impl Router {
             return false;
         };
         let n = n.min(self.spot_rows.len());
+        let outcomes = self.coins.outcomes;
         let mut usdc_1e8 = 0i64;
         let mut listed = false;
+        let mut legs = 0u64;
         let mut i = 0usize;
         while i < n {
             let b = &self.spot_rows[i];
-            if b.coin.of(data) == b"USDC" {
+            let coin = b.coin.of(data);
+            if coin == b"USDC" {
                 usdc_1e8 = b.total_1e8;
                 listed = true;
+            } else if outcomes && b.total_1e8 != 0 && coin.first() == Some(&b'+') {
+                // XH4i-2: a leg the account holds — a settled husk holds
+                // nothing (`recon::account_view`'s rule).
+                let ev = ExecEvent {
+                    ts_ns: now,
+                    client_oid: item.client_oid,
+                    px_1e8: b.entry_ntl_1e8,
+                    sz_1e8: b.total_1e8,
+                    asset: asset_of_balance_coin(coin).unwrap_or(ASSET_UNKNOWN),
+                    kind: EV_BALANCE,
+                    slot: item.slot,
+                    ..ExecEvent::default()
+                };
+                emit_to(&mut self.evt, &ev);
+                legs += 1;
             }
             i += 1;
         }
         let mut end = read_end(item, EV_READ_DONE, READ_SPOT, n as u64, now);
         end.px_1e8 = usdc_1e8;
         end.sz_1e8 = i64::from(listed);
+        end.oid = legs;
+        if outcomes {
+            end.asset = SPOT_LEGS_READ;
+        }
         emit_to(&mut self.evt, &end);
         true
     }
@@ -1483,11 +1583,38 @@ impl Router {
             let mut latest = 0u64;
             let mut i = 0usize;
             while i < n {
-                let _ = self.tids.admit(self.fills[i].tid);
                 latest = latest.max(self.fills[i].time_ms);
                 i += 1;
             }
             self.counters.snapshot_rows += n as u64;
+            // XH4i-3b-2b (A-S7-72): on an outcome map the legs' history is
+            // the arm's to book, once — the blocking arm books its snapshot
+            // too — so its rows go out, flagged, with no fee (an earlier
+            // session's): the legs' rows of the last day and an hour, at
+            // most a quarter of the event ring (the rest counted). Every tid
+            // is admitted here; only a freshly admitted one goes out — never
+            // a row the stream already sent. A perps map's rows stay the
+            // boot reconciliation's.
+            let outcomes = self.coins.outcomes();
+            let since = latest.saturating_sub(SNAPSHOT_EMIT_MS);
+            let mut sent = 0usize;
+            let mut i = 0usize;
+            while i < n {
+                let fresh = self.tids.admit(self.fills[i].tid);
+                if outcomes && fresh && self.fills[i].time_ms >= since {
+                    let a = self.coins.asset(self.fills[i].coin.of(frame));
+                    if a != ASSET_UNKNOWN && a >= crate::asset::ASSET_BASE {
+                        if sent < SNAPSHOT_EMIT_MAX {
+                            self.emit_fill_row(i, a, true, false, now);
+                            sent += 1;
+                        } else {
+                            self.counters.snapshot_kept += 1;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            self.counters.fills += sent as u64;
             emit_to(
                 &mut self.evt,
                 &gateway_event(EV_SNAPSHOT, n as u64, latest, now),
@@ -1497,50 +1624,65 @@ impl Router {
         let wall_ns = now_ms().saturating_mul(1_000_000);
         let mut i = 0usize;
         while i < n {
-            let f = &self.fills[i];
-            if self.tids.admit(f.tid) {
-                let (slot, client_oid) = owner(f.cloid);
-                let mut flags = if f.is_buy { EVF_BUY } else { 0 };
-                if f.crossed {
-                    flags |= EVF_CROSSED;
+            if self.tids.admit(self.fills[i].tid) {
+                if !is_snapshot {
+                    let ms = self.fills[i].time_ms;
+                    self.stats
+                        .fill_venue_to_local
+                        .record(wall_ns.saturating_sub(ms.saturating_mul(1_000_000)));
                 }
-                if is_snapshot {
-                    flags |= EVF_SNAPSHOT;
-                }
-                let fill = ExecEvent {
-                    ts_ns: now,
-                    venue_ms: f.time_ms,
-                    client_oid,
-                    oid: f.oid,
-                    px_1e8: f.px_1e8,
-                    sz_1e8: f.sz_1e8,
-                    aux: f.tid,
-                    asset: self.coins.asset(f.coin.of(frame)),
-                    kind: EV_FILL,
-                    reason: if f.is_settlement {
-                        REASON_SETTLEMENT
-                    } else {
-                        0
-                    },
-                    slot,
-                    flags,
-                };
-                let meta = ExecEvent {
+                let a = self.coins.asset(self.fills[i].coin.of(frame));
+                self.emit_fill_row(i, a, is_snapshot, true, now);
+                self.counters.fills += 1;
+            }
+            i += 1;
+        }
+    }
+
+    /// One `userFills` row out on `asset` (its coin, as the map names it):
+    /// the fill, and its fee when `meta` (`EVF_SNAPSHOT` on a snapshot's
+    /// row) — the live rows' builder, and an outcome map's first
+    /// snapshot's (XH4i-3b-2b).
+    #[inline]
+    fn emit_fill_row(&mut self, i: usize, asset: u32, snapshot: bool, meta: bool, now: u64) {
+        let f = &self.fills[i];
+        let (slot, client_oid) = owner(f.cloid);
+        let mut flags = if f.is_buy { EVF_BUY } else { 0 };
+        if f.crossed {
+            flags |= EVF_CROSSED;
+        }
+        if snapshot {
+            flags |= EVF_SNAPSHOT;
+        }
+        let fill = ExecEvent {
+            ts_ns: now,
+            venue_ms: f.time_ms,
+            client_oid,
+            oid: f.oid,
+            px_1e8: f.px_1e8,
+            sz_1e8: f.sz_1e8,
+            aux: f.tid,
+            asset,
+            kind: EV_FILL,
+            reason: if f.is_settlement {
+                REASON_SETTLEMENT
+            } else {
+                0
+            },
+            slot,
+            flags,
+        };
+        emit_to(&mut self.evt, &fill);
+        if meta {
+            emit_to(
+                &mut self.evt,
+                &ExecEvent {
                     kind: EV_FILL_META,
                     px_1e8: f.fee_1e8,
                     reason: 0,
                     ..fill
-                };
-                if !is_snapshot {
-                    self.stats
-                        .fill_venue_to_local
-                        .record(wall_ns.saturating_sub(f.time_ms.saturating_mul(1_000_000)));
-                }
-                emit_to(&mut self.evt, &fill);
-                emit_to(&mut self.evt, &meta);
-                self.counters.fills += 1;
-            }
-            i += 1;
+                },
+            );
         }
     }
 
@@ -1657,7 +1799,8 @@ pub struct HlGateway {
 // assertions (mio 0.8's debug-only selector ids in its `Poll`s and
 // `TcpStream`s), a few words more since XH4f's two boxed Router tables and
 // two counters, one more since XH4h's `NonceSource`, one more since XH5b-1's
-// spot table — held under 8 KiB: a
+// spot table, one more since XH4i-1's outcome flag in the coin map — held
+// under 8 KiB: a
 // bound, not a pin, so a rustls or mio
 // bump does not break the build while the struct stays small.
 const _: () = assert!(core::mem::size_of::<HlGateway>() <= 8_192);
@@ -2931,6 +3074,43 @@ mod tests {
         assert!(!full.insert(b"ONE_MORE", 99));
     }
 
+    /// XH4i-1: an outcome map names a leg by its own `#<enc>` coin —
+    /// canonical digits whose id fits — refuses to bind a `#` name, and
+    /// still binds perps by name; a perps-only map (slot 6's) leaves every
+    /// `#` coin unknown.
+    #[test]
+    fn an_outcome_map_names_legs_by_their_own_coins() {
+        use crate::asset::ASSET_BASE;
+        let mut m = CoinMap::with_outcomes();
+        assert!(m.insert(b"ETH", 1));
+        assert!(!m.insert(b"#1941", 7), "a leg is never bound by name");
+        assert_eq!(m.asset(b"ETH"), 1);
+        assert_eq!(m.asset(b"#1941"), ASSET_BASE + 1941);
+        assert_eq!(m.asset(b"#0"), ASSET_BASE);
+        // `#4194967295` reads as `u32::MAX` — the sentinel itself: an id
+        // no roll can bind, unmapped and never cancelled, on purpose.
+        let bad: [&[u8]; 8] = [
+            b"#",
+            b"#01941",
+            b"#19a1",
+            b"#-1",
+            b"+1941",
+            b"#4194967295",
+            b"#4194967296",
+            b"#42949672950",
+        ];
+        let mut i = 0usize;
+        while i < bad.len() {
+            assert_eq!(m.asset(bad[i]), ASSET_UNKNOWN, "{:?}", bad[i]);
+            i += 1;
+        }
+        assert_eq!(
+            CoinMap::new().asset(b"#1941"),
+            ASSET_UNKNOWN,
+            "slot 6's map, as before"
+        );
+    }
+
     #[test]
     fn owners_and_update_keys() {
         let ours = crate::cloid::encode(6, 42);
@@ -3031,8 +3211,13 @@ mod tests {
 
     /// A router with one read of `c`'s kind in flight, as post 5.
     fn router_with_read(c: &HlCmd) -> (Router, HlEngineEnd) {
+        router_with_read_on(c, CoinMap::new())
+    }
+
+    /// XH4i: a router over `coins` with read `c` in flight.
+    fn router_with_read_on(c: &HlCmd, coins: CoinMap) -> (Router, HlEngineEnd) {
         let (eng, gw) = hl_duplex();
-        let mut rt = Router::new(gw.evt, gw.stats, CoinMap::new());
+        let mut rt = Router::new(gw.evt, gw.stats, coins);
         let rec = rt.pending.claim(5, 1).expect("claim");
         rec.class = CLASS_READ as u8;
         rec.conn = CONN_REST;
@@ -3148,6 +3333,142 @@ mod tests {
         let ev = drained(&mut eng);
         assert_eq!((ev[0].kind, ev[0].reason), (EV_READ_FAILED, READ_SPOT));
         assert_eq!(read_code(CMD_READ_SPOT), READ_SPOT);
+    }
+
+    /// XH4i-2: on an outcome map the spot read reports each leg the
+    /// account holds — one `EV_BALANCE` per `+<enc>` row with a holding,
+    /// its values raw (a negative total or basis included, a missing
+    /// basis 0; a name that does not parse is `ASSET_UNKNOWN`, which an
+    /// outcome arm counts unseen), never a settled husk or another token —
+    /// then its end, which counts them in `oid` and carries the mark of a
+    /// sheet read for legs; on a perps-only map (slot 6's) the same sheet
+    /// answers one unmarked end, as before.
+    #[test]
+    fn on_an_outcome_map_the_spot_read_reports_the_held_legs() {
+        use crate::asset::ASSET_BASE;
+        let body = br#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"USDC","token":0,"total":"999.0","hold":"0.0","entryNtl":"0.0"},{"coin":"HYPE","token":150,"total":"1.5","hold":"0.0","entryNtl":"40.0"},{"coin":"+194180","token":2,"total":"25.0","hold":"5.0","entryNtl":"10.25"},{"coin":"+194181","token":3,"total":"0.0","hold":"0.0"},{"coin":"+0195","token":4,"total":"3.0","hold":"0.0","entryNtl":"1.2"},{"coin":"+194190","token":5,"total":"-2.0","hold":"0.0","entryNtl":"-1.5"},{"coin":"+194200","token":6,"total":"4.0","hold":"0.0"}]}}"#;
+        let mut k = 0usize;
+        while k < 2 {
+            let outcomes = k == 0;
+            k += 1;
+            let coins = if outcomes {
+                CoinMap::with_outcomes()
+            } else {
+                CoinMap::new()
+            };
+            let (mut rt, mut eng) = router_with_read_on(&HlCmd::read_spot(3, 1), coins);
+            rt.on_read_answer(5, body, 9);
+            let ev = drained(&mut eng);
+            let end = ev.last().expect("an end");
+            assert_eq!(
+                (
+                    end.kind,
+                    end.reason,
+                    end.client_oid,
+                    end.aux,
+                    end.px_1e8,
+                    end.sz_1e8
+                ),
+                (EV_READ_DONE, READ_SPOT, 1, 7, 99_900_000_000, 1)
+            );
+            if !outcomes {
+                assert_eq!(
+                    (ev.len(), end.oid, end.asset),
+                    (1, 0, 0),
+                    "slot 6's map: one unmarked end, as before"
+                );
+                continue;
+            }
+            assert_eq!(
+                (ev.len(), end.oid, end.asset),
+                (5, 4, SPOT_LEGS_READ),
+                "four held legs, then the marked end"
+            );
+            assert_eq!(
+                (
+                    ev[0].kind,
+                    ev[0].asset,
+                    ev[0].sz_1e8,
+                    ev[0].px_1e8,
+                    ev[0].slot,
+                    ev[0].client_oid
+                ),
+                (
+                    EV_BALANCE,
+                    ASSET_BASE + 194_180,
+                    2_500_000_000,
+                    1_025_000_000,
+                    3,
+                    1
+                )
+            );
+            assert_eq!(
+                (ev[1].kind, ev[1].asset, ev[1].sz_1e8, ev[1].px_1e8),
+                (EV_BALANCE, ASSET_UNKNOWN, 300_000_000, 120_000_000),
+                "a leg whose name does not parse is still reported: the arm counts it unseen"
+            );
+            assert_eq!(
+                (ev[2].asset, ev[2].sz_1e8, ev[2].px_1e8),
+                (ASSET_BASE + 194_190, -200_000_000, -150_000_000),
+                "values go out raw: `recon::leg_cost_1e6` values them"
+            );
+            assert_eq!(
+                (ev[3].asset, ev[3].sz_1e8, ev[3].px_1e8),
+                (ASSET_BASE + 194_200, 400_000_000, 0),
+                "no basis reads 0"
+            );
+        }
+        // Legs on a sheet that lists no USDC: the rows, then a marked end
+        // that says no worth — for the arm to discard whole.
+        let (mut rt, mut eng) =
+            router_with_read_on(&HlCmd::read_spot(3, 2), CoinMap::with_outcomes());
+        rt.on_read_answer(
+            5,
+            br#"{"type":"spotClearinghouseState","data":{"balances":[{"coin":"+194180","token":2,"total":"25.0","hold":"0.0","entryNtl":"10.25"}]}}"#,
+            9,
+        );
+        let ev = drained(&mut eng);
+        assert_eq!(
+            (
+                ev.len(),
+                ev[0].kind,
+                ev[1].kind,
+                ev[1].sz_1e8,
+                ev[1].px_1e8,
+                ev[1].oid
+            ),
+            (2, EV_BALANCE, EV_READ_DONE, 0, 0, 1)
+        );
+        // A full sheet — 256 held legs — goes out whole: every row, then the
+        // end (XG-2's room, const-asserted).
+        let mut rows = Vec::new();
+        let mut j = 0u32;
+        while j < 256 {
+            rows.push(format!(
+                r#"{{"coin":"+{}","token":{j},"total":"1.0","hold":"0.0","entryNtl":"0.5"}}"#,
+                10 * j + 1
+            ));
+            j += 1;
+        }
+        let full = format!(
+            r#"{{"type":"spotClearinghouseState","data":{{"balances":[{}]}}}}"#,
+            rows.join(",")
+        );
+        let (mut rt, mut eng) =
+            router_with_read_on(&HlCmd::read_spot(3, 3), CoinMap::with_outcomes());
+        rt.on_read_answer(5, full.as_bytes(), 9);
+        let ev = drained(&mut eng);
+        assert_eq!(ev.len(), 257);
+        assert_eq!(
+            (
+                ev[255].kind,
+                ev[255].asset,
+                ev[256].kind,
+                ev[256].oid,
+                ev[256].aux
+            ),
+            (EV_BALANCE, ASSET_BASE + 2_551, EV_READ_DONE, 256, 256)
+        );
     }
 
     /// XMM XH5c-3: a REST post's round trip goes to its own series alone —
@@ -3278,6 +3599,32 @@ mod tests {
         assert_eq!(
             (e[0].kind, e[0].aux, e[1].kind, e[1].aux),
             (EV_GAP, GAP_FILLS_UNREADABLE, EV_GAP, GAP_UPDATES_UNREADABLE)
+        );
+    }
+
+    /// XH4i-3b-2b: an outcome map's first snapshot hands the arm its legs'
+    /// recent rows — flagged, with no fee, before the snapshot's end — and
+    /// keeps an older leg row and a perp's (no leg) as history; a later
+    /// snapshot re-delivers nothing.
+    #[test]
+    fn on_an_outcome_map_the_first_snapshot_hands_the_legs_history_to_the_arm() {
+        let (eng_end, gw) = hl_duplex();
+        let mut eng = eng_end;
+        let mut rt = Router::new(gw.evt, gw.stats, CoinMap::with_outcomes());
+        let snap = br##"{"channel":"userFills","data":{"isSnapshot":true,"user":"0x","fills":[{"coin":"#1941","px":"0.3","sz":"4","side":"B","time":199000000,"oid":1,"tid":5},{"coin":"#1941","px":"0.3","sz":"1","side":"A","time":100000000,"oid":2,"tid":6},{"coin":"ETH","px":"1","sz":"1","side":"B","time":200000000,"oid":3,"tid":7}]}}"##;
+        rt.on_frame(snap, 1);
+        let e = drained(&mut eng);
+        assert_eq!(e.len(), 2, "the leg's recent row, then the snapshot's end");
+        assert_eq!(
+            (e[0].kind, e[0].asset, e[0].sz_1e8, e[0].aux),
+            (EV_FILL, crate::asset::ASSET_BASE + 1941, 400_000_000, 5)
+        );
+        assert_ne!(e[0].flags & EVF_SNAPSHOT, 0, "flagged a snapshot's");
+        assert_eq!((e[1].kind, e[1].aux), (EV_SNAPSHOT, 3));
+        rt.on_frame(snap, 2);
+        assert!(
+            drained(&mut eng).is_empty(),
+            "a later snapshot re-delivers nothing"
         );
     }
 

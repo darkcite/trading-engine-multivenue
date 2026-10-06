@@ -6607,9 +6607,12 @@ API changes are in migration.md.
   read together); the reuse probe and the `Connection: close`
   retirement (H9c), now the engine's code rather than a copy; DNS
   re-resolved, blocking, after every third failed dial in a row, as
-  `HlHttp` did. The caller's thread — the arm's worker, or the
-  gateway's thread on its REST fallback — still blocks for a cycle, up
-  to 5 s.
+  `HlHttp` did. The calling thread still blocks for a cycle, up to 5 s:
+  on the `--exec` path that is the ENGINE thread for the blocking arm —
+  slot 3's submits and idle work, and HYPARB's Hyperliquid hedges
+  (`crates/engine/src/lib.rs`: "It BLOCKS, and that is the accepted
+  cost"; XH4i moves BIN15 onto the gateway) — and the gateway's own
+  thread on its REST fallback.
 * **The gateway's REST fallback renders the envelope straight into the
   `/exchange` window** when a post is sealed with no socket Ready — no
   WebSocket head it would never be sent with, and no copy. Only a
@@ -7885,7 +7888,8 @@ flight (the reserve's premise).
 open orders (its own read, which emits nothing; refused or unreadable, it
 fails the round), cancels by cloid every order whose cloid slot is in the
 gateway's mask — never another slot's, never a stranger's (an unmapped
-coin is counted) — within XG-2's room (the rest go next round), settles
+coin is counted; XH4i-1: on an outcome map a `#<enc>` leg is named and
+cancelled, below) — within XG-2's room (the rest go next round), settles
 1 s, reads again: none of ours → `SWEEP_CLEAR`; 8 rounds without that →
 `SWEEP_STRANDED`; a newer request restarts it. The state is published
 state-then-sequence. The sweep's cancels are answered to the arm like its
@@ -10622,6 +10626,549 @@ only: no code, test or script changes.
   `exhausted`.
 
 **Gates:** unchanged — docs only, and no test reads these files.
+
+### XH4i-1 amendment (2026-10-05): the gateway names outcome legs by their own coins — nothing wired, nothing armed
+
+Anton's word (2026-10-05): "Please do it" — XH4i, BIN15 (slot 3) off the
+blocking arm on the engine thread and onto a WebSocket order gateway of
+its own — with rulings Q1–Q4 (`claude/xmm-hl-xh4i-build-plan-2026-10-05.md`
+§0). This first cut teaches the gateway to name the legs it will see.
+Nothing builds such a gateway yet (XH4i-5 composes slot 3's), and slot 3
+stays on the blocking arm until Anton flips its transport.
+
+- **What changed.** `CoinMap::with_outcomes()` builds a coin map that,
+  besides the perps bound by name, resolves a HIP-4 leg's `#<enc>` to
+  `ASSET_BASE + enc`, read off the venue's own coin name
+  (`asset::asset_of_fill_coin`, S7-L1's helper: `#` and canonical digits
+  only, an id that fits `u32`). The gateway reads every coin through its
+  map — fills, `orderUpdates`, open-order rows, perp positions, the
+  sweep's hits — in place off the frame. On an outcome map a `#` name is
+  refused at `insert` (boot refuses): a leg is named by its coin alone.
+- **The spelling is measured, not assumed:** `#<enc>` in `userFills`
+  (2026-09-15, the asset table's namespace note) and in `orderUpdates` and
+  `frontendOpenOrders` (testnet, 2026-09-19, `#154150`: the watch log and
+  phase G's sweep in the vault's `outcome/data/testnet-exec-2026-09-19/`).
+- **LAW E-4 holds.** The id read off a coin reaches the venue one way
+  only: a sweep's `cancelByCloid`, by S7-L1's rule ("The live arm,
+  restart-proof", (C)): a cancel names an order the venue just listed as
+  ours, so a wrong id is a refused cancel, never another market. Inbound,
+  it identifies the leg of an event the venue reported. Places, modifies
+  and leverage changes take the arm's ids — the perps' `/info meta`
+  binding today; for slot 3, the roll binding (XH4i-3).
+- **Ownership is unchanged.** The sweep cancels only orders whose cloid
+  decodes as ours (LAW E-9) on this gateway's slots — a decision the coin
+  never enters; another slot's order and a stranger's on the same leg are
+  never cancelled (the loopback pins both).
+- **Slot 6 and HYPARB are byte-identical.** Every production map is built
+  `CoinMap::new()` (`xmm_live.rs`, `hyparb_live.rs`), which never takes the
+  outcome branch; gate 96b runs that map, unchanged (gate 99 drives the
+  arm's half and builds none).
+- **The sentinel edge.** `#4194967295` reads as `u32::MAX` — the value of
+  `ASSET_UNKNOWN` itself: an id no roll can bind, so the row is unmapped
+  and never cancelled (pinned on purpose). The ids just below it (enc
+  4 194 967 290 … 294) exceed any outcome id a roll can bind; at worst a
+  cancel the venue refuses.
+- **What XH4i-3 must hold before the arm trusts an event's asset** (the
+  risk review's notes, carried into the plan): a row's asset is set only
+  from the E-4 binding — never from a landed, adopted or snapshot row's
+  event, nor from settlement attribution; `ASSET_UNKNOWN` is ruled out
+  before `asset::kind_of`, which reads `u32::MAX` as an outcome id; and on
+  an outcome map the arm's `unlisted_order` cancels an unknown `#<enc>`
+  order of its own slot, which it skipped before — S7-L1 allows it, and
+  XH4i-3/-5 test it.
+
+**Gates (g2, 2026-10-05):** clippy clean; nextest 4 217/4 217 (+4 on
+`3ea326c`: the map's unit test, the two loopbacks below, gate 102 under
+nextest); alloc 111 (+1: **gate 102**, an outcome map's lookups at 0 B/op —
+a perp name, two legs, the refused spellings); copy-audit 28 baselined,
+0 new; license 663; release builds; replay 7× IDENTICAL; fmt clean. **Red
+first:** before the fix the three outcome tests failed — `ASSET_UNKNOWN`
+for `ASSET_BASE + 1941`, and the sweep STRANDED after 8 rounds with 8
+unmapped — while their perps-only halves passed.
+
+**Tests:** gateway.rs `an_outcome_map_names_legs_by_their_own_coins`;
+`hl_gateway_loopback.rs` `an_outcome_order_of_ours_is_swept_when_the_map_names_outcome_legs`
+(an outcome map: [read] [cancel ours alone, `{"asset":100001941,…}`]
+[read] → `SWEEP_CLEAR`, another slot's and a stranger's untouched; a
+perps-only map: no cancel, unmapped) and
+`outcome_legs_name_their_asset_in_every_stream_on_an_outcome_map`; bench
+gate 102. Reviews: risk, allocation and zero-copy APPROVE WITH NITS (round
+1); round 2 took the nits.
+
+### XH4i-2 amendment (2026-10-05): the spot read reports the outcome legs the account holds — nothing wired, nothing armed
+
+XH4i-4 judges slot 3's session bound at equity AT COST and reconciles its
+legs on the gateway as the blocking arm does (S7-L1 gap B;
+`recon::compare_booked`, `unreconciled_venue_legs`, `account_view`). This
+cut gives it the sheet's legs. Nothing consumes them yet, nothing builds an
+outcome map in production, and slot 3 stays on the blocking arm.
+
+- **What the spot read emits on an outcome map** (`CoinMap::with_outcomes`,
+  XH4i-1): before its end, one `EV_BALANCE` per `+<enc>` row with a
+  non-zero `total` — `asset` from `asset::asset_of_balance_coin` (`+` and
+  canonical digits, an id that fits `u32`), else `ASSET_UNKNOWN`; `sz_1e8`
+  = the holding (`total`); `px_1e8` = the venue's `entryNtl`, raw; slot and
+  `client_oid` the read's. The end's `oid` counts the rows and its `asset`
+  is `SPOT_LEGS_READ` (`ASSET_BASE`, the mark of a sheet read for legs).
+  The USDC figures of the end are unchanged.
+- **On a perps-only map nothing changes:** no row, `oid` 0, `asset` 0 —
+  slot 6 and HYPARB byte-identical (gate 96b's perps variant at its pins).
+  An outcome arm REFUSES an unmarked spot end (XH4i-4): a gateway that
+  never named legs could not have reported them, so its silence is not
+  "no legs held" — the hazard the E6 interlock exists for.
+- **Selection is recon's own:** a `+` row with a non-zero total, the test
+  `account_view` and `unreconciled_venue_legs` apply; a settled husk reads
+  as a missing row does in `compare_booked` (venue 0). `hold` is not
+  carried: every consumer reads `total`.
+- **Unparsable names are reported, never dropped:** `ASSET_UNKNOWN` matches
+  no bound leg, so an outcome arm counts it unseen and holds `reconciled`
+  back — the reading `same_leg`'s byte comparison gives the blocking arm.
+- **One valuation:** `recon::leg_cost_1e6(total, entryNtl)` — `entryNtl`
+  clamped to the holding ($1 a contract) and never below zero — is what
+  `account_view` now sums, and what an outcome arm sums over these rows
+  (every held row, `ASSET_UNKNOWN` included, as `account_view` counts it).
+  The events carry raw values; the clamp is the valuation's.
+- **Identification only.** A `+<enc>` id names a held leg; nothing is placed,
+  modified or cancelled with it (LAW E-4). S7-L1's cancel exception covers
+  the `#<enc>` names alone.
+- **XG-2.** At most one row per sheet row: 256 rows and the end fit the
+  read reserve (257, const-asserted); a sheet over 256 rows fails the scan
+  before any row goes out — never a partial read.
+- **What XH4i-4 must hold** (the risk review's): a row counts only for its
+  slot, its read (`client_oid`) and READ_SPOT; the rows are dropped when a
+  read is issued or fails; the read commits only when the rows taken equal
+  the end's `oid`, the end is marked, and it lists USDC; every held row is
+  compared (its leg bound) or counted unseen, and `ASSET_UNKNOWN` never
+  matches an empty slot; compare takes the first row of a leg, `total` at
+  ×1e6, as `compare_booked`; drift is confirmed over two reads; every sum
+  saturates.
+- **Gate 96b, outcome variant** (`hl_gateway_outcome_round_trip_allocates_only_rustls_record_buffers`):
+  the same turn and pins on an outcome map, the venue's orders, fills and
+  day's fills on `#1941` and its spot sheet holding `+1941` beside a husk
+  (`+1942`) and an unparsable `+0195`: five events a round name the leg,
+  the spot read emits two rows (the leg; `ASSET_UNKNOWN`) and a marked end
+  that counts 2, and the sweep's cancel names the leg — at rustls' exact
+  residue (A-S7-69 closed here, not in XH4i-5). Its counters are now one
+  per kind byte (`[u64; 256]`), so a new kind can never fold into another.
+
+**Gates (g1, 2026-10-05, on r2):** clippy clean; nextest 4 221 run (+4: the
+spot-read, balance-coin and leg-cost unit tests, gate 96b's outcome variant
+under nextest), 4 220 passed — the one failure `deribit_parsers_are_zero_alloc`
+under nextest's debug build (6 allocations), a test this cut does not touch
+— the same run's alloc gate passed it (release, 112/112) and it passed 10×
+re-run alone; its six allocations are an open investigation (A-S7-71), not
+closed as a flake; alloc 112 (+1: gate 96b's outcome variant; both
+variants at their exact pins); copy-audit 28 baselined, 0 new; license 663;
+release builds; replay 7× IDENTICAL; fmt clean. **Red first:** before the
+emission, round 1's `on_an_outcome_map_the_spot_read_reports_the_held_legs`
+failed — `(1, 0)` for `(3, 2)` — while its perps-only half passed.
+
+**Tests:** gateway.rs `on_an_outcome_map_the_spot_read_reports_the_held_legs`
+(raw negatives, a missing basis, no USDC, a full sheet of 256 legs);
+asset.rs `a_balance_coin_names_its_leg_by_the_same_rule`; recon.rs
+`a_leg_at_cost_is_its_basis_clamped_to_what_it_can_pay`; bench gate 96b's
+outcome variant.
+
+### XH4i-3a amendment (2026-10-05): the gateway arm's outcome mode — rows, rules, rolls and verbs; nothing wired, nothing armed
+
+The gateway arm learns BIN15's legs. Nothing builds an outcome arm in
+production yet (XH4i-5 composes slot 3's), and slot 3 stays on the
+blocking arm until Anton flips its transport. **An outcome arm must not be
+composed before XH4i-3b and XH4i-4:** today a fill on a leg is dropped as
+`fills_unresolved` (`perp_of_asset` finds no perp), and the account's worth
+is still the perp formula. Fills on legs, settlements and the snapshot rule
+are XH4i-3b.
+
+- **One roll reader, one binder (A-S7-77).** The `InstrumentRoll` reading
+  (`asset::roll_of`: a strict kind byte; a settled roll binds nothing; no
+  outcome is refused) and the both-legs binder (`AssetTable::bind_roll`:
+  ids, names and room checked before the first mutation; the NO leg's
+  ordinal guarded against a carry into the venue byte; a repeat of the live
+  roll retires nothing) moved out of `HlExchange::on_venue_event` into
+  `asset.rs`. The blocking arm calls them, and its roll tests hold its
+  behaviour, with one unreachable exception: a `bind` failure after the
+  precheck used to queue its E-8 sweeps and now queues none, since nothing
+  was rebound.
+- **`ArmCfg::outcomes`** stands alone: no perp and no leverage beside it
+  (`ArmErr::Outcomes`). A perps arm still needs a perp, and it reads no
+  roll. The mode's state — the 32-leg `AssetTable` and its counters,
+  ≈ 2.4 KiB — is the one allocation it adds, boxed once at boot; the arm
+  stays 1 792 B inline.
+- **LAW E-4 on the gateway.** A place or a modify takes its asset from the
+  roll's binding for the instance its client id names — the id's low 32
+  bits (`core_types::instance_of`), which BIN15 writes through its shared
+  `OID_INSTANCE_MASK`. **Only BIN15 may be composed on an outcome arm:**
+  another member's ids would name instances it never meant. A stale
+  instance is refused (`NoLiveRoute`, as the blocking arm answers) and is
+  the one refusal the streak counts (A-S7-74). A leg no roll bound is
+  refused uncounted. A modify must stay on its predecessor's leg.
+- **`OutcomeRules` checks and never rounds:** tick 1e-4, whole contracts,
+  a price in [0.001, 0.999], $1 of notional. These are the venue's
+  measured rules, as BIN15's grid states them; the member keeps to the grid,
+  so a refusal here is a bug and is counted. The cli holds BIN15's `GRID_*`
+  equal to these at compile time, and a sweep of every price around the
+  grid pins `Bin15Strategy::on_grid` and `OutcomeRules::check` to one
+  answer.
+- **The queue law is untouched.** A MAKER rests as ALO whatever its flags,
+  because BIN15 sends none (pinned on BIN15's Arm B orders). The replay
+  judges an order by the queue only when the post-only flag is set
+  (`core_fill::judged_by_queue`), so the live mapping never needs it
+  (pinned). An IoC is an IoC. A leg takes no reduce-only and bids no ALO
+  priority.
+- **No TTL on a leg (A-S7-73).** On the blocking arm BIN15's orders rested
+  until they were replaced or cancelled, and they still do. `expiresAfter`
+  rides on every place and modify, as on slot 6.
+- **A cancel names the asset its row's place named (A-S7-75)**, with no new
+  lookup. The order lives on that asset, so the cancel can only name our
+  own order. The blocking arm refuses the cancel of a rolled order and
+  leaves it to its E-8 sweep; this is the safer of the two.
+- **LAW E-8 on the gateway (A-S7-76).** A roll that retires a leg cancels
+  every row of ours on it the venue may hold — sent, resting, in doubt or
+  thought gone, YES or NO — except one already filling or one whose cancel
+  is out; a full ring keeps the cancel as intent. Every such row, the one
+  whose cancel is out included, is marked `RB_RETIRED` (A-S7-78): when the
+  venue answers "not found" about an order that still rests, the read that
+  lists it brings the row back and sends the cancel again, as for a
+  member's own. The roll also reads the orders at once. Three qualifiers:
+  - Anything else of the slot's left on the old leg is listed and
+    `unlisted_order` cancels it under the venue's own name (S7-L1) **only
+    once slot 3's gateway is built `with_outcomes` (XH4i-5)**. Before that
+    the row reads `ASSET_UNKNOWN` and is counted, not cancelled.
+  - After boot, an order the arm does not hold also pins the drift, so the
+    router halts the slot.
+  - The sweep is slot-masked; the blocking arm's sweep names `ALL_SLOTS`.
+    One arm is one slot, and only slot 3 trades legs.
+- **The owner** of a leg (what a settlement is attributed by, XH4i-3b) is
+  learned from our own accepted orders, never from a roll or a fill, as on
+  the blocking arm. One arm is one slot and its table is its own, so no leg
+  can be contested: `debug_assert!`, not the blocking arm's
+  `owner_contested` count (A-S7-79).
+- **Rows** carry the asset and symbol their command named. On slot 6
+  these are the same `cfg.perps[p]` values its reads took before, so slot 6
+  is byte-identical.
+- **BIN15's client ids can fall in the arm's internal ranges.** Its null
+  arm sets bit 63, and a sequence with bit 13 set sets bit 62, so for
+  example `READ_OID_BASE | outcome`. An order's answers carry a command kind
+  and internal posts carry none, so the order is routed as an order
+  (pinned).
+- **Allocation (A-S7-80).** The outcome mode's per-order and roll paths
+  allocate nothing by construction (reviewed). Its 0 B/op gate comes with
+  its fills in XH4i-3b, and covers the roll binder both arms now share.
+  Gate 98 runs the perps mode.
+- **What XH4i-3b must hold** (the risk review's): an outcome fill resolves
+  by its row first — the asset and symbol `track` stored — cross-checked
+  against the event's asset; the previous generation (`sym_of_asset_gen`)
+  only when a previous name is held, and `book_qty` on the current
+  generation only; `ASSET_UNKNOWN` is ruled out before `kind_of`, and
+  `perp_of_asset` is never asked in the outcome mode. A settlement is the
+  foreign slot's `REASON_SETTLEMENT` with no client id: booked
+  (`FILL_FLAG_SETTLEMENT`, the venue's `order_id`, the slot stamped) only
+  when `owner_of_sym` is this slot, otherwise counted unowned; the perps arm
+  is unchanged. The snapshot rule (A-S7-72): the gateway emits the first
+  snapshot's rows only on outcome maps, flagged, their tids admitted; the
+  arm books them once, on bound legs; XH4i-4 never seeds the ledger from the
+  sheet. A late fill that crosses a roll books against its row's retired
+  leg.
+
+**Gates (s8-3a-g4, 2026-10-05, on r2):** clippy clean; nextest 4 232 run
+(+11 over XH4i-2: nine arm.rs outcome tests, the rules test, the cli grid
+sweep), 4 232 passed — the userws loopback flake (A-S7-34) failed once on
+g3 and passed on its re-run; alloc 112; copy-audit 28 baselined, 0 new;
+license 663; release builds; replay 7× IDENTICAL (BIN15 included); fmt
+clean. **Red first:** against the scaffolding
+(`s8/c3a-red.sh` red4), the roll, maker, refusal, E-8, modify and id-range
+tests failed while the stand-alone, rules and blocking-arm roll tests
+passed; round 2's `an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order`
+failed — "the owed cancel goes again" — before `RB_RETIRED` (`s8/c3a2-red.sh`
+red1).
+
+**Tests:** arm.rs `the_outcome_mode_stands_alone`,
+`a_created_roll_binds_both_legs_and_nothing_else_does`,
+`an_outcome_maker_with_no_flags_rests_as_alo_on_its_bound_leg`,
+`outcome_orders_refuse_a_rolled_or_unbound_instance_and_an_off_grid_price`,
+`a_roll_cancels_our_rows_on_the_leg_it_retires_and_reads_the_orders`,
+`an_e8_cancel_answered_not_found_goes_again_when_a_read_lists_the_order`,
+`an_e8_sweep_cancels_every_row_on_the_retired_legs_and_nothing_else`,
+`an_outcome_modify_stays_on_its_leg_and_never_crosses_a_roll`,
+`an_order_whose_id_falls_in_the_arm_s_own_ranges_is_still_an_order`;
+rules.rs `an_outcome_leg_is_checked_never_rounded`; cli
+`bin15_s_grid_test_and_the_outcome_rules_agree` and `bin15_boot`'s
+compile-time agreement; strategy-bin15's no-flag pin in
+`arm_b_quotes_the_bid_and_asks_only_against_inventory`; the blocking arm's
+roll tests (exchange.rs) unchanged.
+
+### XH4i-3b-1 amendment (2026-10-05): the outcome mode's fills and settlements — nothing wired, nothing armed
+
+The gateway arm's outcome mode books fills on BIN15's legs by the blocking
+arm's rules (`route_frame`), read off the gateway's events (their tids
+admitted there). An outcome arm still must not be composed: XH4i-3b-2 (the
+first snapshot's rows; the outcome mode's 0 B/op gate) and XH4i-4 (the
+account's worth) come first.
+
+- **Ours resolves by its row** — the leg and the asset its place named —
+  and must name that asset: a fill for our cloid on another asset is
+  counted (`fills_mismatched`, and `fills_unresolved`), never booked or
+  joined. One whose row is gone resolves by its asset
+  (`AssetTable::sym_of_asset_gen`): the live generation, or the one a roll
+  just retired. `ASSET_UNKNOWN` (a map built without `with_outcomes`) names
+  no leg, so such an arm fails closed, counted; `perp_of_asset` and
+  `kind_of` are never asked in the outcome mode.
+- **One generation back, by asset.** `AssetSlot` keeps the asset a roll
+  retired (`prev_asset`, in the slot's former padding: still 64 B), read
+  only where a roll moved the slot (`prev_coin_len != 0`; asset 0 is a real
+  perp). The current generation answers first, and two answers are none —
+  `sym_of_coin_gen`'s rules.
+- **The ledger** (`book_qty`, ×1e6) is credited only by a fill on the live
+  generation that the member was handed — after the push, as the blocking
+  arm (a dropped fill is not a position; the drift shows it). A fill on a
+  retired generation still reaches the member on its leg — under the
+  member's client id, or a settlement's venue order id — and is counted
+  (`fills_old_gen`).
+- **A settlement** is the venue's row: no cloid, so the gateway names no
+  slot (`SLOT_FOREIGN`), `REASON_SETTLEMENT`, client id 0. It is booked only
+  when the leg's owner — learned from our own accepted orders, surviving a
+  roll — is this slot: flagged `FILL_FLAG_SETTLEMENT`, under the venue's
+  order id, the slot stamped; on the live generation it debits the ledger
+  like a sale. Otherwise it is counted (`settlements_unowned`), never
+  guessed. A cloid-less row that is no settlement stays another's
+  (`fills_foreign`). The gateway names a row with no cloid and a
+  stranger's alike (`owner()`), so this test cannot tell them apart where
+  the blocking arm reads `cloid.is_none()` — moot, since the venue's
+  settlement rows carry no cloid. The perps arm is unchanged: every row of
+  another slot, a settlement included, is `fills_foreign`.
+- **Refused, as the blocking arm's `to_fill` refuses:** a negative price,
+  or a size under one engine unit (`fills_refused`). A price of 0 — a losing
+  leg's settlement — is booked.
+- **Fees** stay the slot's `EV_FILL_META` sum; a settlement's meta carries
+  no slot and is not summed.
+- **Not yet (XH4i-3b-2).** The gateway absorbs the process's first
+  snapshot, so fills on legs made before the boot are not booked. A-S7-72's
+  rule — that snapshot's rows emitted on outcome maps only, flagged, their
+  tids admitted; the arm books them once, on bound legs; XH4i-4 never seeds
+  the ledger from the sheet — lands there, with the outcome mode's 0 B/op
+  gate (A-S7-80), which is not deferred again: a gate-98 outcome variant
+  driving every branch of `on_leg_fill` (ours live, ours after a roll, ours
+  with its row gone, a mismatch, `ASSET_UNKNOWN`, a refusal, an owned and an
+  unowned settlement, a foreign row), the verbs and the shared roll binder.
+- **Found, not changed — and a precondition (A-S7-81).** A repeat of the
+  live roll rebinds both legs in place: it zeroes their ledgers and
+  overwrites the previous generation (`prev_coin`, now `prev_asset`) with
+  the live names — on the blocking arm today too. The venue sends
+  `outcomeCreated` once (probed 2026-09-26), but a replayed engine ring
+  entry could repeat it. This cut leans on that memory: after a real roll,
+  `prev_asset` is the only way from the retired asset to its leg, so a
+  repeat before the old instance settles drops its settlement — and any
+  late fill of ours whose row is gone — as `fills_unresolved`, and the
+  member keeps a position that has settled; the zeroed ledger reads as
+  drift until the next roll (a halt, or `reconciled` false: safe, but
+  disruptive). Fills whose row is still held are unaffected. The fix —
+  `bind_roll` leaves a repeated leg untouched — changes the blocking arm,
+  so it waits for Anton's word (raised 2026-10-05); if he declines, the
+  gateway arm guards repeats on its own. **It is a hard precondition for
+  XH4i-5, the C7 flip and any live re-arm of BIN15.**
+
+**Gates (s8-3b-g2, 2026-10-05, on r2):** clippy clean; nextest 4 238 run
+(+6 over XH4i-3a's 4 232: five arm.rs fill tests and the asset.rs
+generation test), 4 238 passed; alloc 112; copy-audit 28 baselined, 0 new;
+license 663; release builds; replay 7× IDENTICAL (BIN15 included); fmt
+clean. **Red first:** against stubs (no
+`sym_of_asset_gen`, no outcome fill path), the four arm.rs fill tests and
+the asset.rs generation test failed — "the fill", "the late fill", "the
+settlement", `fills_mismatched` 0 for 1, `None` for `Some((4096, true))` —
+while the round-1/2 outcome tests passed (`s8/c3b-red.sh` red1).
+
+**Tests:** arm.rs
+`an_outcome_fill_books_on_its_row_s_leg_and_credits_the_live_ledger`,
+`a_fill_on_a_retired_generation_reaches_its_leg_but_not_the_successor_s_ledger`,
+`a_settlement_books_only_for_the_slot_whose_order_the_venue_accepted`,
+`outcome_fills_that_name_no_leg_or_another_leg_are_never_booked`,
+`a_refused_leg_fill_books_nothing_and_a_live_settlement_debits_the_ledger`;
+asset.rs `a_leg_is_found_by_its_asset_in_either_generation`.
+
+### XH4i-3b-2a amendment (2026-10-05): the outcome mode's 0 B/op gate (gate 103) — nothing wired, nothing armed
+
+The gate the allocation review asked for in XH4i-3a and bound in XH4i-3b-1
+(A-S7-80) lands first in XH4i-3b-2, as its conditions require. No
+production code changes; the arm's module doc names the gate.
+
+- **Gate 103** (`hl_gateway_outcome_arm_is_zero_alloc`): an outcome arm on
+  slot 3 (no perp, no leverage, the slot's own account) booted through the
+  duplex by a scripted venue that answers every command at once, then
+  40 000 rounds under the counting allocator. Each round:
+  - a roll: the next instance binds both legs and the last one's retire,
+    through the binder both arms share — the E-8 cancel of the MAKER still
+    resting there, and the orders read at once;
+  - a fill on the retired generation for that MAKER (its row held: no row
+    closes unseen in the gate, `gone_ms` 60 s) and one for the last round's
+    IoC on its NO leg (its row gone: one roll back by asset);
+  - a MAKER on YES and an IoC on NO with BIN15's client ids and no flag,
+    answered resting (the owner noted; the scripted venue rests the IoC so
+    it can be cancelled);
+  - one refusal of each kind: a stale instance, an unbound leg, an
+    off-grid price;
+  - a modify of the MAKER and a cancel of the IoC;
+  - every other branch of `on_leg_fill`: ours on the live generation, a
+    mismatched asset, `ASSET_UNKNOWN`, a refused fill, an owned settlement
+    (a sale of the holding), an unowned one (a family no order of ours
+    trades), another slot's row.
+
+  Fifteen paths — the outcome counters, the arm's fill counters, and the
+  modifies and cancels done — must each run at least 99 % of their scripted
+  count inside the window. Exact counts are not asserted: at this pace the
+  arm's own gates refuse an occasional round's verbs (about 10 rounds in
+  40 000, measured; not yet attributed — the risk review reads it as the
+  stale-budget refusal, intended throttling that never halts). The budget
+  read answers $1M traded, so the budget never nears its floor.
+- **Still XH4i-3b-2b:** the first-snapshot rule (A-S7-72). Gate 103 then
+  drives the snapshot's rows too. When XH4i-4 refuses an unmarked spot end,
+  the gate's `READ_SPOT` answer must carry `SPOT_LEGS_READ` (it would fail
+  loudly at boot otherwise).
+
+**Gates (s8-3b2a-g3, 2026-10-05, on r2):** clippy clean; nextest 4 239 run
+(+1: gate 103 under nextest), 4 239 passed; alloc 113 (+1: gate 103);
+copy-audit 28 baselined, 0 new; license 663; release builds; replay 7×
+IDENTICAL; fmt clean. Gate 103 alone (release, serial) passed in run3; the
+exact-count attempt (run2) fell short by about 10 rounds in 40 000, hence
+the 99 % floor.
+
+**Tests:** bench gate 103.
+
+### XH4i-3b-2b … XH4i-7 amendment (2026-10-06): BIN15 (slot 3) can run on its own gateway arm — composed, refused where unsafe; the default stays blocking, nothing armed
+
+Session 9 lands the rest of XH4i's code in one commit (Anton: implement
+everything, then one gates run and one combined review). Slot 3 can now be
+put on the WebSocket gateway arm's outcome mode by its artifact
+(`transport = "gateway"`) and `--arm-live 3`. Until Anton flips it
+(R-XH4-7), slot 3 stays on the blocking arm, and nothing here runs.
+
+- **A-S7-83 — a repeat of the live roll is left alone** (gateway arm only):
+  - both legs already bound to the ids the roll names → no rebind, counted
+    `rolls_repeated`;
+  - a rebind would zero the legs' ledgers (a drift halt) and overwrite the
+    generation the last roll retired;
+  - the shared binder's own fix (A-S7-81, Q5) stays Anton's decision; the
+    blocking arm keeps the bug until he rules.
+- **XH4i-3b-2b — the first snapshot's legs:**
+  - on an outcome map only, the process's first `userFills` snapshot emits
+    the legs' rows of the last 25 h, flagged `EVF_SNAPSHOT`, with no fee;
+  - only freshly admitted tids are emitted; at most a quarter of the event
+    ring, and the rest is counted (`snapshot_kept`; the arm's drift then
+    halts the slot);
+  - slot 6's perps maps are unchanged;
+  - the arm books each row once, on a bound leg;
+  - a row whose leg no roll has bound yet is **parked** (256 at most;
+    `snapshot_parked`) and booked when the roll binds — the snapshot can
+    beat the ingress's boot roll (risk review r1).
+- **XH4i-4 — S7-L1 parity:**
+  - the spot read's leg rows are compared with the ledger; a drift needs
+    two reads; a held leg no live binding names is unseen;
+  - an unmarked or miscounted end is a failed read;
+  - worth = USDC + perps + the legs at cost;
+  - agreement (`reconciled`) needs the legs to agree and a fresh spot read;
+  - the ledger is never seeded from the sheet (A-S7-72).
+- **XH4i-5 — composition, boot and refusals:**
+  - `impl OrderDispatch for Option<D>`: `None` refuses every verb
+    (`NoLiveRoute`) and answers every hook as the defaults do;
+  - every shape is composed `SlotSplit(3, <shape>, Option<arm>)` innermost.
+    With no gateway arm, its slot is `exec_router::NO_SLOT` (0xFE: no slot,
+    and not `STRATEGY_ID_NONE`). The sixteen compositions stay sixteen;
+  - core-config no longer demands the perp pair on a live gateway slot; the
+    boot judges it by the slot's role: slot 6 must state it, and slot 3 must
+    not (a perp slot's every order must be on a linear row);
+  - `exec_boot` refuses slot 3 on its gateway:
+    - beside slot 6 on its gateway (**A-S7-85**: one gateway arm an engine
+      until the report is per slot and the two gateways split the rate
+      shares — the follow-up);
+    - beside any live slot of the operator's blocking arm (**A-S7-89**: one
+      master, one arm — this replaces slot masks on the blocking arm's
+      sweeps and fills);
+  - testnet market data beside a mainnet-only arm is refused for slot 3 as
+    for slot 6 (risk review r1);
+  - the boot (`cli::bin15_live`):
+    - the operator's account (`HYPERLIQUID_*`), the market data's network
+      and the venue's own host (LAW E-4);
+    - `own_account`; leverage 0; `outcomes`; `CoinMap::with_outcomes`;
+    - reads every 30 s; the stale floor at least 300 s (**A-S7-91**: a held
+      leg of the retired instance reads unseen until it settles);
+    - `expiresAfter` 5 s (**A-S7-86**);
+    - the session anchor in `bin15-pnl-anchor-<network>.state` (**A-S7-84**:
+      a new session at the flip — the blocking arm's anchor measures
+      another worth);
+    - top-ups on the blocking arm's `exec-topup.state` day (one governor a
+      master's day), their cost added back (Q3);
+    - thread `hl-gw-bin15` on core 12;
+  - the gateway report carries the outcome mode's seventeen counters, on
+    `/metrics` (`engine_exec_hlgw_outcome_*`), not `/state` (**A-S7-87**);
+  - the shutdown tell is `bin15-gateway-shutdown.tell`.
+- **XH4i-6 — BIN15 learns its order events** (Q1):
+  - a late `REJECTED` of a reprice restores the quote as it stood;
+  - a refused fresh quote frees its side and re-quotes at the next price;
+  - a refused coverage IoC is written off, so the entry retries;
+  - a `CANCELED` of a pending quote frees its side (no phantom restore).
+    The undo arrays have cache lines of their own;
+  - **the arm** (risk review r1, MAJOR): a replacement the member cancelled
+    before the venue refused the modify → its original, resting on, is
+    cancelled too, never left untracked;
+  - replays are neutral: no order event reaches BIN15 off a gateway arm,
+    and BIN15 never sets `ORDER_FLAG_POST_ONLY`.
+- **XH4i-7 — the code half of the flip:**
+  - **A-S7-47 fixed (A-S7-88):** a family adopts by its deployer. The `out`
+    family takes rows with `venue == "out"` alone, and a native family takes
+    rows naming no venue. The venue's registry maps one name to one
+    deployer (2026-10-06: `0x0c46…819e` mainnet, `0x295b…d33f` testnet). A
+    venue that is no string, empty or too wide is a stranger's;
+  - two instances expiring together are adopted by no family — at boot and
+    rediscovery (dormant), and on a push (counted unmatched);
+  - `scripts/bin15-flip.sh live --gateway` writes the gateway section and
+    checks the binary carries XH4i-5 and that `ARM_LIVE` holds slots 0 and
+    3 alone. It archives both anchors on every flip.
+- **Not built here:**
+  - per-slot reports;
+  - the rate-share split;
+  - a loopback with slots 3 and 6 together (A-S7-85);
+  - E3's `+154150` leg sale and the testnet outcome battery (operational
+    steps).
+- **Preconditions for Anton's flip:** Q5 (A-S7-81) and the battery.
+
+**Reviews (one combined round, frozen `review-xh4i-s9-r1`):**
+- **Risk: REQUEST CHANGES** — one MAJOR (the stranded original) and MINORs:
+  the snapshot's race, the push tie, a non-string venue, slot 3's network
+  rule, the stale floor, the flip's preflight, a phantom restore, the test
+  gaps. All fixed.
+- **Allocation: APPROVE WITH NITS** — the undo arrays' alignment, gate
+  coverage (gate 103's legs, repeats and report; the bin15 gate's refusal
+  and cancel), `LegRead` resets, a reference scan. All fixed.
+- **Zero-copy: APPROVE WITH NITS** — stale COPY notes, the counters' copy
+  (now borrowed), the leg saves noted, the audit's directories (+
+  `bin15_live.rs`, `strategy-bin15`). All fixed.
+
+**Gates:** s9-g2 (2026-10-06, 04:04Z): clippy clean; nextest 4 252 run, 4 252 passed
+(9 skipped; +13 since `d6078ce`); alloc 113 (gates 103, 99 and the bin15 gate
+extended); copy-audit 28 baselined, 0 new (its directories + `bin15_live.rs`,
+`strategy-bin15`); license 663 (`bin15_live.rs` counts from the commit);
+release builds; replay 7× IDENTICAL; fmt clean. The run before the review's
+fixes (s9-g1) was green too (nextest 4 250).
+
+**Tests:**
+- exec-hyperliquid:
+  - the repeat roll;
+  - the outcome leg reconciliation, including the miscounted end;
+  - first-snapshot rows waiting for their roll;
+  - the refused reprice whose replacement was cancelled;
+  - an unknown order of the slot on a leg;
+  - the first snapshot handed to the arm (gateway).
+- cli:
+  - `slot_three_runs_on_a_gateway_arm_of_its_own_alone`;
+  - the perp-pair rules;
+  - the composition test (a roll through router and split; an absent arm).
+- core-config: the perp pair left to the boot.
+- strategy-bin15: the late refusals and the cancel.
+- ingress-hyperliquid:
+  - the venue kept, stranger and null;
+  - the deployer clause and the tie;
+  - the push venue, borrowed.
+- bench: gates 103 (+ legs, repeats, report), 99 (the engine's composition)
+  and the bin15 gate (+ refusal and cancel).
 
 ## HYPERCALL — the order arm (HC9, ruling O-HC19, 2026-09-26): operator verbs only
 
