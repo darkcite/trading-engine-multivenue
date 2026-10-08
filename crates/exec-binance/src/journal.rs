@@ -24,6 +24,8 @@ use core_io::slot_capture::SlotCapture;
 use core_ring::{Consumer, Producer};
 use core_types::ExecRecord;
 
+use crate::mode::AccountMode;
+
 /// The ring between the gateway and the writer.
 pub const JOURNAL_RING: usize = 1_024;
 
@@ -43,12 +45,19 @@ pub const J_FILL_LOST: i32 = 2;
 /// `order.status` answer or a stream update's cumulative quantity — at the
 /// implied average price, with no commission or maker flag of its own.
 pub const J_FILL_UNSEEN: i32 = 4;
+/// [`J_FILL`] `code` bit: the venue's position ADOPTED at boot as the owner
+/// slot's starting inventory (BX7; `FILL_FLAG_ADOPTED`) — no trade, no
+/// commission. BX-14's trade statistics exclude it.
+pub const J_FILL_ADOPTED: i32 = 8;
 /// An order ended without a further fill: `code` = the `RETIRED_*` why.
 pub const J_ENDED: u8 = 4;
 /// A reconciliation verdict: `a` = drift USD ×1e6, `b` = unseen legs,
 /// `c` = foreign orders; `code` = 1 if reconciled.
 pub const J_RECON: u8 = 5;
-/// A margin sample: `a` = ratio ×1e6, `b` = equity USD ×1e6.
+/// A margin sample: `a` = ratio ×1e6 (the product's), `b` = the session
+/// equity USD ×1e6 (USDⓈ-M's on a classic account, the unified account's
+/// in PM and PM Pro), `c` = 1 for a margin call, `code` = the product
+/// (`PRODUCT_*`, BX7).
 pub const J_MARGIN: u8 = 6;
 /// A venue lock or budget observation: `code`.
 pub const J_VENUE: u8 = 7;
@@ -155,28 +164,43 @@ pub fn spawn_writer(
 /// How often the writer retries an anchor it could not store (F2).
 pub const ANCHOR_RETRY_NS: u64 = 1_000_000_000;
 
+/// The longest anchor file read (BX7): `store` writes ≤ 64 B; a longer
+/// file is no anchor line, refused unread past this.
+const ANCHOR_READ_MAX: u64 = 128;
+
 /// **The E7 session anchor, persisted** (`binance-pnl-anchor.state`).
 ///
 /// The session bound is judged from the account's equity at the first
 /// reconciliation of the SESSION, and a session outlives a process (the
 /// restart lane relaunches the engine): the anchor is written once and read
 /// at every boot; the operator ends a session by deleting the file. One
-/// line: `<account tag>\t<equity ×1e6>\t<unix s>`. The tag is the first 8
-/// bytes of SHA-256 of the API key, in hex — never the key — so another
-/// account's anchor is never inherited. Boot and one cold write only.
+/// line: `<account tag>\t<equity ×1e6>\t<unix s>\t<account mode>`. The tag
+/// is the first 8 bytes of SHA-256 of the API key, in hex — never the key.
+///
+/// The file is ONE session's (BX7, the risk review's N2): the equity's
+/// basis is the account mode's — USDⓈ-M's margin balance on a classic
+/// account, the unified account's in PM and PM Pro — so a boot under
+/// another key or in another mode is refused until the operator ends that
+/// session: never inherited, never silently replaced (which would forget
+/// its losses). `signing = "hmac"` signs with another key: toggling it ends
+/// the session the same way. A line written before BX7 names no mode — a
+/// classic session's. Boot and one cold write only.
 #[derive(Clone, Debug)]
 pub struct AnchorFile {
     path: std::path::PathBuf,
     tag: [u8; 16],
+    /// The account mode the session's equity is read in.
+    mode: AccountMode,
     /// The anchor could not be stored (yet): raised by the writer while
     /// its store fails, read by the gateway's pulse (F2).
     unsaved: Arc<AtomicBool>,
 }
 
 impl AnchorFile {
-    /// The file at `path`, for the account whose API key is `api_key`.
+    /// The file at `path`, for the account whose API key is `api_key`, in
+    /// account mode `mode`.
     #[must_use]
-    pub fn new(path: std::path::PathBuf, api_key: &str) -> Self {
+    pub fn new(path: std::path::PathBuf, api_key: &str, mode: AccountMode) -> Self {
         let h = core_crypto::sha256(api_key.as_bytes());
         let hex = b"0123456789abcdef";
         let mut tag = [0u8; 16];
@@ -189,6 +213,7 @@ impl AnchorFile {
         Self {
             path,
             tag,
+            mode,
             unsaved: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -199,18 +224,55 @@ impl AnchorFile {
         Arc::clone(&self.unsaved)
     }
 
-    /// The anchor, if the file holds one for this account (boot).
-    #[must_use]
-    pub fn load(&self) -> Option<i64> {
-        // COPY: the anchor file (one line, ≤ 64 B) into a String — boot
-        // only, once; the file is closed before anything trades — a stack
-        // buffer read was rejected: the boot may allocate, and this is its
-        // one read of the file.
-        let text = std::fs::read_to_string(&self.path).ok()?;
+    /// The session's anchor (boot): `None` when no session is open (no
+    /// file). `Err` — the boot refuses, naming the remedy and never the key
+    /// — when the file is another key's session or another account mode's,
+    /// or cannot be read as one.
+    ///
+    /// # Errors
+    /// The file is not this session's, or not an anchor.
+    pub fn load(&self) -> Result<Option<i64>, String> {
+        // COPY: the anchor file (one line: ≤ 64 B as `store` writes it; a
+        // file past `ANCHOR_READ_MAX` is refused unread past it) into a
+        // String — boot only, once; the file is closed before anything
+        // trades — a stack buffer read was rejected: the boot may allocate,
+        // and this is its one read of the file.
+        let mut text = String::new();
+        let read = std::fs::File::open(&self.path)
+            .and_then(|f| std::io::Read::read_to_string(&mut std::io::Read::take(f, ANCHOR_READ_MAX + 1), &mut text));
+        match read {
+            Ok(n) if n as u64 > ANCHOR_READ_MAX => {
+                return Err(String::from("is not an anchor line — delete it to end the session"));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot be read ({e}) — fix it, or delete it to end the session")),
+        }
         let mut it = text.trim_end().split('\t');
-        let tag = it.next()?;
-        let v: i64 = it.next()?.parse().ok()?;
-        (tag.as_bytes() == self.tag && v > 0).then_some(v)
+        let (tag, v, unix, mode, extra) = (it.next(), it.next(), it.next(), it.next(), it.next());
+        let tag = tag.filter(|t| t.len() == 16 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+        let v = v.and_then(|v| v.parse::<i64>().ok()).filter(|v| *v > 0);
+        let unix = unix.and_then(|u| u.parse::<u64>().ok());
+        let (Some(tag), Some(v), Some(_), None) = (tag, v, unix, extra) else {
+            return Err(String::from("is not an anchor line — delete it to end the session"));
+        };
+        if tag.as_bytes() != self.tag {
+            return Err(String::from(
+                "holds another API key's session (`signing` picks the key) — delete it to end \
+                 that session",
+            ));
+        }
+        // A line written before BX7 names no mode: a classic session's.
+        let theirs = mode.map_or(Some(AccountMode::Classic), AccountMode::from_word);
+        if theirs != Some(self.mode) {
+            return Err(format!(
+                "holds a `{}` session and this boot's account is `{}` — the equity's basis \
+                 differs; delete it to end that session",
+                theirs.map_or("unknown", AccountMode::word),
+                self.mode.word()
+            ));
+        }
+        Ok(Some(v))
     }
 
     /// Persist the anchor (once per session; cold).
@@ -220,7 +282,7 @@ impl AnchorFile {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let tag = core::str::from_utf8(&self.tag).unwrap_or("");
-        core_io::write_atomic(&self.path, &format!("{tag}\t{equity_1e6}\t{unix}\n"))
+        core_io::write_atomic(&self.path, &format!("{tag}\t{equity_1e6}\t{unix}\t{}\n", self.mode.word()))
     }
 }
 
@@ -255,19 +317,44 @@ mod tests {
         assert_eq!(tx.dropped(), 5);
     }
 
+    /// The anchor file is one session's (BX7, N2): this key's and this
+    /// account mode's. Another key's, another mode's or an unreadable line
+    /// refuses — never inherited, never silently replaced; a line written
+    /// before BX7 is a classic session's. Break-and-watch: without the mode
+    /// check a Portfolio Margin boot reads the classic session's anchor.
     #[test]
-    fn the_anchor_is_the_accounts_own() {
+    fn the_anchor_is_one_sessions_own() {
         let dir = std::env::temp_dir().join(format!("bn-anchor-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("binance-pnl-anchor.state");
-        let a = AnchorFile::new(path.clone(), "KEYAAAAAAAAAAAAAAAA");
-        assert_eq!(a.load(), None);
+        let a = AnchorFile::new(path.clone(), "KEYAAAAAAAAAAAAAAAA", AccountMode::Classic);
+        assert_eq!(a.load(), Ok(None), "no file: no session open");
         a.store(1_010_250_000).unwrap();
-        assert_eq!(a.load(), Some(1_010_250_000));
+        assert_eq!(a.load(), Ok(Some(1_010_250_000)));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("KEYAAAA"), "the key itself is never written");
-        let other = AnchorFile::new(path, "KEYBBBBBBBBBBBBBBBB");
-        assert_eq!(other.load(), None, "another account's anchor is not inherited");
+        assert!(text.ends_with("\tclassic\n"), "{text}");
+        let other = AnchorFile::new(path.clone(), "KEYBBBBBBBBBBBBBBBB", AccountMode::Classic);
+        let e = other.load().unwrap_err();
+        assert!(e.contains("another API key") && !e.contains("KEY"), "{e}");
+        let pm = AnchorFile::new(path.clone(), "KEYAAAAAAAAAAAAAAAA", AccountMode::Pm);
+        let e = pm.load().unwrap_err();
+        assert!(e.contains("`classic` session") && e.contains("`pm`"), "{e}");
+        // A line written before BX7: a classic session's.
+        let tag = text.split('\t').next().unwrap();
+        std::fs::write(&path, format!("{tag}\t5000000\t1790000000\n")).unwrap();
+        assert_eq!(a.load(), Ok(Some(5_000_000)));
+        assert!(pm.load().is_err());
+        let (zero, five) = (format!("{tag}\t0\t1"), format!("{tag}\t5\t1\tpm_pro\tx"));
+        for bad in ["garbage", "", "\t5000000\t1", zero.as_str(), five.as_str()] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(a.load().unwrap_err().contains("not an anchor line"), "{bad:?}");
+        }
+        std::fs::write(&path, format!("{tag}\t5\t1\tportfolio\n")).unwrap();
+        assert!(a.load().unwrap_err().contains("`unknown` session"));
+        // A file past the longest line is refused, never read whole.
+        std::fs::write(&path, format!("{tag}\t5000000\t1790000000\tclassic{}\n", " ".repeat(200))).unwrap();
+        assert!(a.load().unwrap_err().contains("not an anchor line"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -282,7 +369,7 @@ mod tests {
         let blocked = dir.join("not-yet");
         // A FILE where the anchor's directory must be: every store fails.
         std::fs::write(&blocked, b"x").unwrap();
-        let anchor = AnchorFile::new(blocked.join("binance-pnl-anchor.state"), "KEYCCCCCCCCCCCCCCCC");
+        let anchor = AnchorFile::new(blocked.join("binance-pnl-anchor.state"), "KEYCCCCCCCCCCCCCCCC", AccountMode::Classic);
         let flag = anchor.unsaved_flag();
         let (p, c) = Ring::<ExecRecord, JOURNAL_RING>::new().split();
         let mut tx = JournalTx::new(p);
@@ -301,7 +388,7 @@ mod tests {
             assert!(t0.elapsed() < std::time::Duration::from_secs(5), "the retry stores it");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(anchor.load(), Some(1_000_000_000));
+        assert_eq!(anchor.load(), Ok(Some(1_000_000_000)));
         stop.store(true, Ordering::Release);
         h.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();

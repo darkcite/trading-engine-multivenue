@@ -16,8 +16,9 @@
 //!    `i128`: no division on the submit path);
 //! 4. **the governors** ([`crate::gov`]): the ORDERS windows, the UM
 //!    quantitative rules, the open orders per symbol and the breadth;
-//! 5. **the push**: one [`BnCmd`] into the command ring. A full ring is
-//!    `QueueFull` and the router books nothing.
+//! 5. **the push**: one [`BnCmd`] into the command ring (the kit's
+//!    duplex, [`crate::cmd::duplex`]), stamped with its push time. A full
+//!    ring is `QueueFull` and the router books nothing.
 //!
 //! A **modify** passes the same step 2 as a submit (it re-prices a resting
 //! maker: the row live and the owner's, the dead-man working, the gateway
@@ -47,8 +48,17 @@
 //! AND no order of ours is in flight — an IoC sent and not yet answered is
 //! counted, so a halt's `clear_resting_slot` never drops an in-flight exit.
 //!
-//! Error mapping: not bound, not live or not ours → `NoLiveRoute`; a verb
-//! or kind this product does not take → `Unsupported`; a BX-5 refusal →
+//! **The halt's sweep is a word, not a command (BX7, XG-1):** `cancel_all`
+//! bumps the stats block's sweep request — never refused, whatever the
+//! command ring holds — and `cancel_all_state` reads the gateway's answer
+//! in the same block (Working until the gateway has taken THIS request;
+//! then Stranded or Clear). The halt word (XG-2, XG-5) rides the signal:
+//! a gateway that lost an output, or whose deadline queue overflowed,
+//! halts the slot ([`HaltSignal::with_gateway_halted`]).
+//!
+//! Error mapping: not bound, not live or not ours → `NoLiveRoute`; a verb,
+//! kind or order flag this product does not take → `Unsupported`; a BX-5
+//! refusal →
 //! `Unsupported`; a governor → `SlotDisabled`; the gateway not ready →
 //! `Disconnected`; a full ring → `QueueFull`.
 
@@ -57,9 +67,13 @@ use clob_dispatcher::{
     Renamed, Retired, RETIRED_EXPIRED, RETIRED_REJECTED,
 };
 use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
-use core_ring::{Consumer, Producer};
 use core_time::WallAnchor;
-use core_types::{CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, Side, SymbolId, VenueId};
+use core_types::{
+    CancelReq, ChannelEvent, ChannelId, ModifyReq, Order, Side, SymbolId, VenueId, ORDER_FLAG_POST_ONLY,
+    ORDER_FLAG_REDUCE_ONLY,
+};
+
+use exec_gateway::stats::{HALT_NONE, PUBLISHED_WORDS, SWEEP_STRANDED, SWEEP_WORKING};
 
 use crate::cmd::*;
 use crate::gov::{classify, CodeClass, FuturesOrders, Qtr, QtrRow, QTR_DUST_USD_1E6};
@@ -121,10 +135,13 @@ pub enum Refusal {
     /// A maker while the dead-man is not working NOW (the order session
     /// cannot cancel, a countdown is not current): transient, retryable.
     DeadmanDown = 18,
+    /// Order flags this arm does not honour (an unknown bit), or that
+    /// contradict the kind (a post-only IoC) — BX7, the operator's ruling.
+    Flags = 19,
 }
 
 /// Refusal reasons.
-pub const REFUSALS: usize = 19;
+pub const REFUSALS: usize = 20;
 /// The `/state` words, by [`Refusal`].
 pub const REFUSAL_WORDS: [&str; REFUSALS] = [
     "unbound",
@@ -146,6 +163,7 @@ pub const REFUSAL_WORDS: [&str; REFUSALS] = [
     "queue_full",
     "verb",
     "deadman_down",
+    "flags",
 ];
 
 /// The arm's counters (`/state` `exec.arms.binance`).
@@ -182,7 +200,9 @@ pub struct BnArmCounters {
     pub scan_failed: u64,
     /// Events of no known kind.
     pub evt_unknown: u64,
-    /// Sweeps requested that the ring could not take.
+    /// Shutdown verbs the command ring could not take (the sweep itself is
+    /// the stats word and never refused; the gateway then leaves its loop
+    /// on the stop flag's grace instead).
     pub cancel_all_unqueued: u64,
     /// Local refusals, by [`Refusal`].
     pub refused: [u64; REFUSALS],
@@ -192,9 +212,12 @@ pub struct BnArmCounters {
     pub gw: [u64; GW_TALLIES],
 }
 
-/// The gateway tallies mirrored in [`BnArmCounters::gw`] (groups of three,
-/// one group per `EVT_TALLY`).
-pub const GW_TALLIES: usize = 18;
+/// The gateway tallies mirrored in [`BnArmCounters::gw`]: the gateway
+/// publishes tally `i` as the stats block's word `i` (BX7) and the arm
+/// copies them on each pulse ([`EVT_STATUS`]).
+pub const GW_TALLIES: usize = 19;
+// The tallies' words, then the gateway's weight word (`PW_WEIGHT`).
+const _: () = assert!(GW_TALLIES < PUBLISHED_WORDS);
 /// [`BnArmCounters::gw`] index: fills booked onto lane 4.
 pub const GW_FILLS_BOOKED: usize = 0;
 /// Fills on an owned instrument not ours (BX-8).
@@ -233,6 +256,9 @@ pub const GW_JOURNAL_DROPPED: usize = 15;
 pub const GW_CANCELS_OWED: usize = 16;
 /// Quiet periods begun (a budget or lock answer).
 pub const GW_QUIET: usize = 17;
+/// Hosts resolved again after a dial-failure streak, the new address
+/// handed to their connections (BX7, [`crate::dns`]).
+pub const GW_DNS_RERESOLVED: usize = 18;
 
 /// The knobs the arm is booted with.
 #[derive(Clone, Debug)]
@@ -335,14 +361,16 @@ struct Seen {
     anchor_1e6: i64,
     day: u64,
     day_read: bool,
-    sweep_pending: bool,
-    sweep_stranded: bool,
 }
 
 /// **The arm** (module docs).
 pub struct BnArm {
-    cmd: Producer<BnCmd, CMD_RING>,
-    evt: Consumer<BnEvt, EVT_RING>,
+    /// The engine's end of the duplex: commands out, events in, the stats
+    /// block (the sweep and halt words, the published tallies).
+    end: BnEngineEnd,
+    /// The sweep request this arm last made (0: none yet) — the gateway's
+    /// answer counts only once its sequence reaches it.
+    sweep_asked: u64,
     inst: InstTable,
     rt: Box<[RowRt; INST_MAX]>,
     qtr_rows: Box<[QtrRow; INST_MAX]>,
@@ -365,6 +393,21 @@ pub struct BnArm {
     c: BnArmCounters,
 }
 
+/// The order flags this arm honours (BX7, the operator's ruling):
+/// reduce-only on any kind (`reduceOnly=true`); post-only on a maker
+/// (whose `GTX` already is post-only). An unknown bit, or a post-only IoC
+/// (a contradiction), is refused.
+#[inline(always)]
+const fn admit_flags(flags: u8, maker: bool) -> Result<(), Refusal> {
+    let unknown = flags & !(ORDER_FLAG_REDUCE_ONLY | ORDER_FLAG_POST_ONLY) != 0;
+    let post_only_ioc = !maker && flags & ORDER_FLAG_POST_ONLY != 0;
+    if unknown || post_only_ioc {
+        Err(Refusal::Flags)
+    } else {
+        Ok(())
+    }
+}
+
 /// `⌊a · b / 1e6⌋ < m` for `a, b ≥ 0`, without the division:
 /// `⌊x / d⌋ < m ⇔ x < m · d`.
 #[inline(always)]
@@ -373,18 +416,13 @@ const fn scaled_lt(a: i64, b: i64, m: i64) -> bool {
 }
 
 impl BnArm {
-    /// The arm over its two ring ends and its boot tables.
+    /// The arm over the engine's end of the duplex and its boot tables.
     #[must_use]
-    pub fn new(
-        cmd: Producer<BnCmd, CMD_RING>,
-        evt: Consumer<BnEvt, EVT_RING>,
-        inst: InstTable,
-        knobs: ArmKnobs,
-    ) -> Self {
+    pub fn new(end: BnEngineEnd, inst: InstTable, knobs: ArmKnobs) -> Self {
         let margin = knobs.margin.clone();
         Self {
-            cmd,
-            evt,
+            end,
+            sweep_asked: 0,
             rt: Box::new([RowRt::default(); INST_MAX]),
             qtr_rows: Box::new([QtrRow::default(); INST_MAX]),
             inst,
@@ -423,6 +461,14 @@ impl BnArm {
     #[must_use]
     pub const fn in_flight(&self) -> u32 {
         self.in_flight
+    }
+
+    /// The gateway's shared block (cold: `/state`, `/metrics`, tests) — its
+    /// halt, sweep and congestion words, its gauges, its published words
+    /// ([`crate::gateway::PW_WEIGHT`]) and its latencies.
+    #[must_use]
+    pub fn gateway_stats(&self) -> &exec_gateway::GatewayStats {
+        &self.end.stats
     }
 
     /// The E7 session anchor is not persisted yet (the gateway's last
@@ -566,7 +612,7 @@ impl BnArm {
                 DispatchError::NoLiveRoute
             }
             Refusal::NotOwner => DispatchError::NoLiveRoute,
-            Refusal::Kind | Refusal::NoDeadman | Refusal::Verb => DispatchError::Unsupported,
+            Refusal::Kind | Refusal::NoDeadman | Refusal::Verb | Refusal::Flags => DispatchError::Unsupported,
             Refusal::NotReady | Refusal::DeadmanDown => DispatchError::Disconnected,
             Refusal::Price | Refusal::MinQty | Refusal::MinNotional | Refusal::MaxQty | Refusal::Band | Refusal::Ttl => {
                 DispatchError::Unsupported
@@ -581,6 +627,7 @@ impl BnArm {
         let now = core_time::now_ns();
         let row = self.admit(o.sym, o.strategy_id, o.kind, now)?;
         let maker = o.kind == ORDER_KIND_MAKER;
+        admit_flags(o.flags, maker)?;
         if maker && o.ttl_ns != 0 && o.ttl_ns < self.knobs.min_maker_ttl_ns {
             return Err(Refusal::Ttl);
         }
@@ -606,8 +653,8 @@ impl BnArm {
         }
         // ---- push -----------------------------------------------------------
         let deadline = if maker && o.ttl_ns != 0 { now + o.ttl_ns } else { 0 };
-        let cmd = BnCmd::place(o.client_oid, px, qty, deadline, row, o.kind, o.side, o.strategy_id);
-        if !self.cmd.try_push_ref(&cmd) {
+        let cmd = BnCmd::place(o.client_oid, px, qty, deadline, row, o.kind, o.side, o.strategy_id, o.flags).at(now);
+        if !self.end.cmd.push(&cmd) {
             return Err(Refusal::QueueFull);
         }
         self.fut.commit(now);
@@ -706,6 +753,13 @@ impl BnArm {
                 self.seen.status_ns = e.ts_ns;
                 self.seen.gap_ns = e.a as u64;
                 self.seen.status_flags = e.flags;
+                // The tallies the gateway published just before this pulse.
+                let s = &*self.end.stats;
+                let mut i = 0;
+                while i < GW_TALLIES {
+                    self.c.gw[i] = s.published(i);
+                    i += 1;
+                }
                 // An output the rings could not take (a fill, or the event
                 // that ends an order): the book may be wrong — unbounded
                 // drift until the operator restarts (BX-15's rule).
@@ -739,8 +793,8 @@ impl BnArm {
                 self.seen.venue_lock = true;
             }
             EVT_SWEEP => {
-                self.seen.sweep_pending = false;
-                self.seen.sweep_stranded = e.flags & EVT_F_SWEEP_STRANDED != 0;
+                // The outcome is the sweep word (`cancel_all_state`); the
+                // report carries the count at once.
                 self.c.gw[GW_SWEEP_LEFT] = e.a as u64;
             }
             EVT_DAY => {
@@ -760,17 +814,6 @@ impl BnArm {
                     self.rt[rx(e.row)].pos_1e6 = e.a;
                     let is = self.active(e.row);
                     self.active_rows = (self.active_rows + is as u32).saturating_sub(was as u32);
-                }
-            }
-            EVT_TALLY => {
-                let base = e.why as usize * 3;
-                let v = [e.a, e.b, e.c];
-                let mut i = 0;
-                while i < 3 {
-                    if base + i < GW_TALLIES {
-                        self.c.gw[base + i] = v[i] as u64;
-                    }
-                    i += 1;
                 }
             }
             _ => self.c.evt_unknown += 1,
@@ -805,6 +848,19 @@ impl BnArm {
         )
         .with_pnl(s.anchor_1e6 > 0, s.equity_1e6.saturating_sub(s.anchor_1e6))
         .with_venue(s.venue_lock, self.margin.at_risk(slot as usize))
+        // XG-2 / XG-5: the gateway lost an output or overflowed a table.
+        .with_gateway_halted(self.end.stats.halt_reason() != HALT_NONE)
+    }
+
+    /// The sweep this arm asked for is still being worked: the gateway has
+    /// not taken the request yet, or has and not finished.
+    #[inline]
+    fn sweep_working(&self) -> bool {
+        if self.sweep_asked == 0 {
+            return false;
+        }
+        let (seq, st) = self.end.stats.sweep();
+        seq < self.sweep_asked || st == SWEEP_WORKING
     }
 }
 
@@ -831,7 +887,8 @@ impl OrderDispatch for BnArm {
             self.refuse(Refusal::Verb);
             return Err(DispatchError::Unsupported);
         }
-        if !self.cmd.try_push_ref(&BnCmd::cancel(req.client_oid, row, req.strategy_id)) {
+        let cmd = BnCmd::cancel(req.client_oid, row, req.strategy_id).at(core_time::now_ns());
+        if !self.end.cmd.push(&cmd) {
             self.refuse(Refusal::QueueFull);
             return Err(DispatchError::QueueFull);
         }
@@ -852,6 +909,11 @@ impl OrderDispatch for BnArm {
             Ok(row) => row,
             Err(r) => return Err(self.refused(r)),
         };
+        // A modify keeps the resting order's own flags at the venue (UM
+        // `order.modify` takes none): only an unknown bit is refused here.
+        if let Err(r) = admit_flags(o.flags, true) {
+            return Err(self.refused(r));
+        }
         let buy = o.side == Side::Bid;
         let (px, qty, _) = match self.quantize(row, buy, o.px.raw(), o.qty.raw(), now) {
             Ok(v) => v,
@@ -861,8 +923,8 @@ impl OrderDispatch for BnArm {
         if !self.fut.admits(now) {
             return Err(self.refused(Refusal::Orders));
         }
-        let cmd = BnCmd::modify(o.client_oid, req.prev_client_oid(), px, qty, 0, row, o.side, o.strategy_id);
-        if !self.cmd.try_push_ref(&cmd) {
+        let cmd = BnCmd::modify(o.client_oid, req.prev_client_oid(), px, qty, 0, row, o.side, o.strategy_id).at(now);
+        if !self.end.cmd.push(&cmd) {
             return Err(self.refused(Refusal::QueueFull));
         }
         self.fut.commit(now);
@@ -915,12 +977,12 @@ impl OrderDispatch for BnArm {
         self.retired.release();
         let mut n = 0;
         while n < EVT_DRAIN_MAX {
-            let Some(g) = self.evt.try_pop_ref() else {
+            let Some(g) = self.end.evt.pop() else {
                 break;
             };
             // COPY: one event (64 B) off the ring — the slot is released
             // before `apply` borrows the whole arm; applying in place would
-            // hold `self.evt` across it.
+            // hold `self.end.evt` across it.
             let e: BnEvt = *g;
             drop(g);
             self.apply(&e);
@@ -950,25 +1012,23 @@ impl OrderDispatch for BnArm {
         self.signal(slot, core_time::now_ns())
     }
 
+    /// XG-1: the sweep is the stats word — never refused, never behind the
+    /// command ring. A newer request restarts the gateway's sweep.
     fn cancel_all(&mut self) -> Result<(), DispatchError> {
-        if !self.cmd.try_push_ref(&BnCmd::sweep(VERB_CANCEL_ALL)) {
-            self.c.cancel_all_unqueued += 1;
-            return Err(DispatchError::QueueFull);
-        }
-        self.seen.sweep_pending = true;
-        self.seen.sweep_stranded = false;
+        self.sweep_asked = self.end.stats.request_sweep();
         Ok(())
     }
 
     fn cancel_all_state(&self) -> CancelAllState {
+        if self.sweep_working() {
+            return CancelAllState::Working;
+        }
         // (N-b) Stranded wins over orders in flight: see
-        // `a_stranded_sweep_is_reported_with_orders_in_flight`.
-        // A stranded sweep is reported as such even with orders in flight
-        // (the router asks again; each ask is a fresh sweep, its REST
-        // fallback included); Clear still needs nothing in flight.
-        if self.seen.sweep_pending {
-            CancelAllState::Working
-        } else if self.seen.sweep_stranded {
+        // `a_stranded_sweep_is_reported_with_orders_in_flight`. A stranded
+        // sweep is reported as such even with orders in flight (the router
+        // asks again; each ask is a fresh sweep, its REST fallback
+        // included); Clear still needs nothing in flight.
+        if self.sweep_asked != 0 && self.end.stats.sweep().1 == SWEEP_STRANDED {
             CancelAllState::Stranded
         } else if self.in_flight > 0 {
             CancelAllState::Working
@@ -1036,14 +1096,18 @@ impl OrderDispatch for BnArm {
         (venue == VenueId::Binance as u8).then(|| self.arm_counters())
     }
 
+    /// The sweep (the word: it runs whatever the ring holds), then the
+    /// verb that ends the gateway's loop once it has; waited for up to
+    /// [`SHUTDOWN_WAIT_NS`].
     fn on_shutdown(&mut self) {
-        if !self.cmd.try_push_ref(&BnCmd::sweep(VERB_SHUTDOWN)) {
+        self.sweep_asked = self.end.stats.request_sweep();
+        if !self.end.cmd.push(&BnCmd::shutdown().at(core_time::now_ns())) {
+            // The sweep still runs; the gateway leaves on the stop flag's
+            // grace instead of on the verb.
             self.c.cancel_all_unqueued += 1;
-            return;
         }
-        self.seen.sweep_pending = true;
         let start = core_time::now_ns();
-        while self.seen.sweep_pending && core_time::now_ns().saturating_sub(start) < SHUTDOWN_WAIT_NS {
+        while self.sweep_working() && core_time::now_ns().saturating_sub(start) < SHUTDOWN_WAIT_NS {
             if !self.on_idle() {
                 core::hint::spin_loop();
             }
@@ -1063,8 +1127,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::inst::tests::{fapi_rows, FAPI};
     use crate::inst::{BindSpec, PRODUCT_USDM};
-    use core_ring::Ring;
     use core_types::{make_symbol_id, Price, Qty};
+    use exec_gateway::stats::{HALT_VENUE_BASE, SWEEP_CLEAR};
 
     pub(crate) const SLOT: u8 = 2;
 
@@ -1074,8 +1138,8 @@ pub(crate) mod tests {
 
     pub(crate) struct Rig {
         pub arm: BnArm,
-        pub cmd_rx: Consumer<BnCmd, CMD_RING>,
-        pub evt_tx: Producer<BnEvt, EVT_RING>,
+        /// The gateway's end, played by the test.
+        pub gw: BnGatewayEnd,
     }
 
     pub(crate) fn rig_with(maker_ok: bool) -> Rig {
@@ -1083,8 +1147,7 @@ pub(crate) mod tests {
         let (mut t, mut w) = InstTable::new(7);
         let row = d.find(b"BTCUSDT").unwrap();
         t.bind(&mut w, &BindSpec { sym: btc(), product: PRODUCT_USDM, row, owned: true, maker_ok }).unwrap();
-        let (ctx, crx) = Ring::<BnCmd, CMD_RING>::new().split();
-        let (etx, erx) = Ring::<BnEvt, EVT_RING>::new().split();
+        let (eng, gw) = duplex();
         let mut lim = [0i64; SLOTS];
         lim[SLOT as usize] = 600_000;
         let mut prod = [0u8; SLOTS];
@@ -1098,12 +1161,18 @@ pub(crate) mod tests {
             margin: MarginBook::new(lim, prod),
             anchor: WallAnchor::new(0, 1_790_000_000_000_000_000),
         };
-        Rig { arm: BnArm::new(ctx, erx, t, knobs), cmd_rx: crx, evt_tx: etx }
+        Rig { arm: BnArm::new(eng, t, knobs), gw }
     }
 
     impl Rig {
         pub(crate) fn send(&mut self, e: BnEvt) {
-            assert!(self.evt_tx.try_push_ref(&e));
+            assert!(self.gw.evt.emit(&e));
+        }
+
+        /// The gateway's answer to the arm's latest sweep request.
+        pub(crate) fn sweep_done(&mut self, state: u64) {
+            let req = self.gw.stats.sweep_requested();
+            self.gw.stats.set_sweep(req, state);
         }
 
         /// A healthy gateway: logged on, clock measured, dead-man armed,
@@ -1124,7 +1193,7 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn pop_cmd(&mut self) -> Option<BnCmd> {
-            self.cmd_rx.try_pop_ref().map(|g| *g)
+            self.gw.cmd.pop().map(|g| *g)
         }
     }
 
@@ -1354,10 +1423,10 @@ pub(crate) mod tests {
         r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 5)).unwrap();
         assert_eq!(r.arm.cancel_all_state(), CancelAllState::Working, "an IoC in flight");
         r.arm.cancel_all().unwrap();
-        let mut s = BnEvt::new(EVT_SWEEP, 1);
-        s.flags = EVT_F_SWEEP_DONE;
-        r.send(s);
-        r.arm.on_idle();
+        assert_eq!(r.arm.cancel_all_state(), CancelAllState::Working, "the gateway has not taken it");
+        assert!(r.pop_cmd().map(|c| c.verb) == Some(VERB_PLACE), "XG-1: the sweep is no command");
+        assert!(r.pop_cmd().is_none());
+        r.sweep_done(SWEEP_CLEAR);
         assert_eq!(r.arm.cancel_all_state(), CancelAllState::Working, "still in flight");
         let mut e = BnEvt::order(EVT_RETIRED, 1, 5, 0, SLOT);
         e.why = RETIRED_EXPIRED;
@@ -1366,12 +1435,16 @@ pub(crate) mod tests {
         r.arm.on_idle();
         assert_eq!(r.arm.cancel_all_state(), CancelAllState::Clear);
         r.arm.cancel_all().unwrap();
+        // An older answer does not answer the new request.
+        assert_eq!(r.arm.cancel_all_state(), CancelAllState::Working);
+        r.sweep_done(SWEEP_STRANDED);
         let mut s = BnEvt::new(EVT_SWEEP, 1);
         s.flags = EVT_F_SWEEP_STRANDED;
         s.a = 2;
         r.send(s);
         r.arm.on_idle();
         assert_eq!(r.arm.cancel_all_state(), CancelAllState::Stranded);
+        assert_eq!(r.arm.counters().gw[GW_SWEEP_LEFT], 2, "the report's count");
     }
 
     /// N-b: a stranded sweep is reported as Stranded even while orders of
@@ -1384,11 +1457,7 @@ pub(crate) mod tests {
         r.healthy();
         r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 5)).unwrap();
         r.arm.cancel_all().unwrap();
-        let mut s = BnEvt::new(EVT_SWEEP, 1);
-        s.flags = EVT_F_SWEEP_STRANDED;
-        s.a = 1;
-        r.send(s);
-        r.arm.on_idle();
+        r.sweep_done(SWEEP_STRANDED);
         assert_eq!(r.arm.in_flight(), 1);
         assert_eq!(r.arm.cancel_all_state(), CancelAllState::Stranded);
         // The anchor flag rides the pulse (F2).
@@ -1453,5 +1522,108 @@ pub(crate) mod tests {
         r.healthy();
         assert_eq!(r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 1)), Err(DispatchError::SlotDisabled));
         assert_eq!(r.arm.counters().refused[Refusal::Breadth as usize], 1);
+    }
+
+    /// The command ring filled to the brim (cancels: no governor stops
+    /// them first).
+    fn fill_the_ring(r: &mut Rig) {
+        let mut oid = 100u64;
+        while r.arm.cancel(&CancelReq::new(0, VenueId::Binance, btc(), oid)).is_ok() {
+            oid += 1;
+        }
+        assert_eq!(oid - 100, CMD_RING as u64, "the ring is full");
+    }
+
+    /// The operator's ruling on the order flags: reduce-only passes (and
+    /// rides the command), post-only passes on a maker, a post-only IoC and
+    /// an unknown bit are refused and counted. Break-and-watch: without
+    /// `admit_flags` the unknown bit reaches the ring.
+    #[test]
+    fn the_order_flags_are_honoured_or_refused() {
+        let mut r = rig_with(true);
+        r.healthy();
+        let mut ro = order(ORDER_KIND_IOC, Side::Ask, 65_000_000_000, 10_000, 1);
+        ro.flags = ORDER_FLAG_REDUCE_ONLY;
+        assert_eq!(r.arm.submit(&ro), Ok(()));
+        assert_eq!(r.pop_cmd().map(|c| c.flags), Some(ORDER_FLAG_REDUCE_ONLY));
+        let mut po = order(ORDER_KIND_MAKER, Side::Bid, 64_000_000_000, 10_000, 2);
+        po.flags = ORDER_FLAG_POST_ONLY | ORDER_FLAG_REDUCE_ONLY;
+        assert_eq!(r.arm.submit(&po), Ok(()));
+        assert_eq!(r.pop_cmd().map(|c| c.flags), Some(ORDER_FLAG_POST_ONLY | ORDER_FLAG_REDUCE_ONLY));
+        let mut po_ioc = order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 3);
+        po_ioc.flags = ORDER_FLAG_POST_ONLY;
+        assert_eq!(r.arm.submit(&po_ioc), Err(DispatchError::Unsupported), "a post-only IoC");
+        let mut unknown = order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 4);
+        unknown.flags = 1 << 5;
+        assert_eq!(r.arm.submit(&unknown), Err(DispatchError::Unsupported), "an unknown bit");
+        let mut repl = order(ORDER_KIND_MAKER, Side::Bid, 64_000_000_000, 10_000, 5);
+        repl.flags = 1 << 7;
+        assert_eq!(r.arm.modify(&ModifyReq::new(2, repl)), Err(DispatchError::Unsupported), "a modify's unknown bit");
+        assert_eq!(r.arm.counters().refused[Refusal::Flags as usize], 3);
+        assert!(r.pop_cmd().is_none(), "nothing refused reached the ring");
+    }
+
+    /// XG-1: a halt's sweep never waits on ring room — a full command
+    /// ring refuses orders, never the sweep. Break-and-watch: a sweep
+    /// pushed as a command is refused here and never reaches the gateway.
+    #[test]
+    fn a_full_command_ring_still_takes_the_sweep() {
+        let mut r = rig_with(true);
+        r.healthy();
+        fill_the_ring(&mut r);
+        assert_eq!(r.arm.counters().refused[Refusal::QueueFull as usize], 1);
+        let asked = r.gw.stats.sweep_requested();
+        assert_eq!(r.arm.cancel_all(), Ok(()));
+        assert_eq!(r.gw.stats.sweep_requested(), asked + 1, "the request is in the word");
+        assert_eq!(r.arm.cancel_all_state(), CancelAllState::Working);
+    }
+
+    /// XG-2 / XG-5: the gateway's halt word halts the arm's slot. Break-
+    /// and-watch: without `with_gateway_halted`, the signal stays clean.
+    #[test]
+    fn the_gateways_halt_word_rides_the_signal() {
+        let mut r = rig_with(true);
+        r.healthy();
+        assert_eq!(r.arm.halt_signal().gateway_halted, 0);
+        r.gw.stats.halt(HALT_VENUE_BASE);
+        assert_eq!(r.arm.halt_signal().gateway_halted, 1);
+        assert_eq!(r.arm.halt_signal_for(SLOT).gateway_halted, 1);
+    }
+
+    /// The tallies are the gateway's published words, read on its pulse;
+    /// and every command carries its push time (`push_to_write`).
+    #[test]
+    fn the_tallies_arrive_with_the_pulse_and_commands_carry_their_push_time() {
+        let mut r = rig_with(true);
+        r.gw.stats.publish(GW_FILLS_BOOKED, 7);
+        r.gw.stats.publish(GW_QUIET, 2);
+        assert_eq!(r.arm.counters().gw[GW_FILLS_BOOKED], 0, "not before a pulse");
+        r.healthy();
+        assert_eq!((r.arm.counters().gw[GW_FILLS_BOOKED], r.arm.counters().gw[GW_QUIET]), (7, 2));
+        let t0 = core_time::now_ns();
+        r.arm.submit(&order(ORDER_KIND_IOC, Side::Bid, 65_000_000_000, 10_000, 1)).unwrap();
+        r.arm.cancel(&CancelReq::new(0, VenueId::Binance, btc(), 1)).unwrap();
+        let (p, c) = (r.pop_cmd().unwrap(), r.pop_cmd().unwrap());
+        assert!(p.pushed_ns >= t0 && c.pushed_ns >= p.pushed_ns, "{} {}", p.pushed_ns, c.pushed_ns);
+    }
+
+    /// The shutdown asks for the sweep through the word and ends the
+    /// gateway with the verb; with the ring full, the sweep still goes
+    /// (counted). Break-and-watch: a shutdown that only pushes the verb
+    /// leaves the word untouched here.
+    #[test]
+    fn the_shutdown_sweeps_through_the_word_even_with_a_full_ring() {
+        let mut r = rig_with(true);
+        r.healthy();
+        fill_the_ring(&mut r);
+        let asked = r.gw.stats.sweep_requested();
+        // The gateway's answer to the request on_shutdown is about to make
+        // (it would come from the gateway thread): the wait ends at once.
+        r.gw.stats.set_sweep(asked + 1, SWEEP_CLEAR);
+        let t0 = core_time::now_ns();
+        r.arm.on_shutdown();
+        assert!(core_time::now_ns() - t0 < SHUTDOWN_WAIT_NS, "answered: no wait");
+        assert_eq!(r.gw.stats.sweep_requested(), asked + 1);
+        assert_eq!(r.arm.counters().cancel_all_unqueued, 1, "the verb found no room");
     }
 }

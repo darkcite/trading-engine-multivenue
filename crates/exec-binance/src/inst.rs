@@ -216,14 +216,18 @@ pub struct BnInstWire {
     _r: u8,
     /// The engine id.
     pub sym: SymbolId,
+    /// COIN-M: the contract's face in USD ×1e6 — what a contract of
+    /// difference is worth, whatever the price (the inverse law: recon's
+    /// drift and the day's spend, BX7). Otherwise 1e6.
+    pub unit_1e6: i64,
     /// Wire decimals of the tick.
     pub px_dec: u8,
     /// Wire decimals of the step.
     pub qty_dec: u8,
-    _r1: [u8; 6],
+    _r1: [u8; 14],
 }
 
-const _: () = assert!(core::mem::size_of::<BnInstWire>() == 48);
+const _: () = assert!(core::mem::size_of::<BnInstWire>() == 64);
 
 impl BnInstWire {
     /// An unbound slot.
@@ -234,9 +238,10 @@ impl BnInstWire {
         flags: 0,
         _r: 0,
         sym: 0,
+        unit_1e6: 0,
         px_dec: 0,
         qty_dec: 0,
-        _r1: [0; 6],
+        _r1: [0; 14],
     };
 
     /// The wire symbol.
@@ -518,9 +523,10 @@ impl InstTable {
             flags,
             _r: 0,
             sym: spec.sym,
+            unit_1e6,
             px_dec: decimals_of(tick_1e6),
             qty_dec: decimals_of(step_1e6),
-            _r1: [0; 6],
+            _r1: [0; 14],
         };
         // COPY: the wire symbol (≤ 32 B) into the gateway's table — boot
         // only, once per row; the discovery rows are dropped after boot,

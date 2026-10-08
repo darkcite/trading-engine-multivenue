@@ -4,16 +4,19 @@
 //! **BX6 — the engine's live Binance arm, booted** (plan §3.1, §3.3).
 //!
 //! [`boot_binance_arm`] turns the booted exec artifact, the boot
-//! discovery's USDⓈ-M rows and fill lane 4's producer into:
+//! discovery's futures rows and fill lane 4's producer into:
 //!
-//! 1. **the instrument table** — every USDⓈ-M instrument of the universe
+//! 1. **the instrument table** — every instrument of each armed futures
+//!    product (`products`: USDⓈ-M; COIN-M since BX7, IoC-only — O-BX3a)
 //!    bound from its discovery row (obligation 7: more than 256 refuses; a
 //!    row missing or not trading refuses — nothing is guessed), each under
 //!    the engine id its orders and fills carry;
 //! 2. **the ledger's rows** — the same ids, for the router to bind before
-//!    the first order ([`BnBoot::specs`]);
+//!    the first order ([`BnBoot::specs`]): linear, or inverse at the
+//!    contract's face (COIN-M);
 //! 3. **the gateway** — the key from `.env` (`Scope::Live`; BX-16: the
-//!    market-data hosts on the same network), `[exec.binance]`'s knobs,
+//!    market-data hosts on the same network; BX7: the HMAC key only where
+//!    `signing = "hmac"` says so, on the REST order route), `[exec.binance]`'s knobs,
 //!    the journal and its cold writer, the persisted E7 anchor — BOOTED on
 //!    this thread (the clock, the BX-19 assertions, the listenKey, the
 //!    logon, the first reconciliation with the orphan sweep, the day): an
@@ -35,14 +38,14 @@ use core_config::universe::Instrument;
 use core_ring::{Producer, Ring};
 use core_types::{Fill, SymbolId};
 use exec_binance::arm::{ArmKnobs, BnArm};
-use exec_binance::cmd::{BnCmd, BnEvt, CMD_RING, EVT_F_SWEEP_DONE, EVT_RING};
+use exec_binance::cmd::{duplex, EVT_F_SWEEP_DONE};
 use exec_binance::config::{BnConfig, Scope};
-use exec_binance::gateway::{BnGateway, GwKnobs, Phase, QUIET_NS};
-use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+use exec_binance::gateway::{BnGateway, GwKnobs, Phase, QUIET_NS, ROTATE_AFTER_NS};
+use exec_binance::inst::{BindSpec, InstTable, PRODUCT_COINM, PRODUCT_USDM};
 use exec_binance::journal::{spawn_writer, AnchorFile, JournalTx, JOURNAL_RING};
 use exec_binance::margin::{MarginBook, SLOTS};
 use exec_binance::mode::{maker_ok, AccountMode, AccountScope};
-use exec_router::{InstrumentSpec, LAW_LINEAR};
+use exec_router::{InstrumentSpec, LAW_INVERSE, LAW_LINEAR};
 use ingress_binance::discovery::BnSymbolRow;
 use tracing::{error, info, warn};
 
@@ -72,6 +75,10 @@ pub struct BnSpec<'a> {
     pub rows: &'a [(String, BnSymbolRow)],
     /// The universe's USDⓈ-M instruments, perpetual then dated.
     pub usdm: &'a [Instrument],
+    /// The boot discovery's COIN-M rows (BX7).
+    pub cm_rows: &'a [(String, BnSymbolRow)],
+    /// The universe's COIN-M instruments, perpetual then dated (BX7).
+    pub coinm: &'a [Instrument],
     /// The route alias's id (the M1 anchor), or `SYMBOL_ID_NONE`.
     pub alias: SymbolId,
     /// The market-data hosts the marks and books come from (BX-16).
@@ -92,49 +99,99 @@ pub struct BnBoot {
     pub tell: String,
 }
 
-/// **Bind the table** (obligation 7): every USDⓈ-M instrument from its
-/// own discovery row, under its own engine id; ownership per the account
-/// scope (a shared account owns only what `owned_usdm` names).
+/// One armed futures product's instruments to bind (BX7: USDⓈ-M, COIN-M).
+pub struct BindSet<'a> {
+    /// `PRODUCT_USDM` or `PRODUCT_COINM`.
+    pub product: u8,
+    /// The universe's instruments of the product, perpetual then dated.
+    pub insts: &'a [Instrument],
+    /// The boot discovery's rows of the product, `(configured name, row)`.
+    pub rows: &'a [(String, BnSymbolRow)],
+    /// On a shared account, the instruments it owns (`owned_usdm` /
+    /// `owned_coinm`).
+    pub owned: &'a [String],
+}
+
+/// **Bind the table** (obligation 7): every instrument of each set from
+/// its own discovery row, under its own engine id; ownership per the
+/// account scope (a shared account owns only what its owned list names);
+/// makers only where the product has a dead-man of ours (BX-17, O-BX3a);
+/// the ledger's law per product — linear, or inverse at the contract's
+/// face (COIN-M).
 ///
 /// # Errors
 /// A configured instrument with no trading row, or a binding refusal
 /// (more than 256 rows, a duplicate, a bad id). Every one refuses.
 pub fn bind_table(
-    usdm: &[Instrument],
-    rows: &[(String, BnSymbolRow)],
+    sets: &[BindSet<'_>],
     alias: SymbolId,
     mode: AccountMode,
     shared: bool,
-    owned_usdm: &[String],
 ) -> Result<(InstTable, exec_binance::inst::WireTable, Vec<InstrumentSpec>), String> {
     let (mut table, mut wire) = InstTable::new(alias);
-    let mut specs = Vec::with_capacity(usdm.len());
-    for inst in usdm {
-        let row = rows
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(&inst.name))
-            .map(|(_, r)| r)
-            .ok_or_else(|| {
-                format!(
-                    "binance: `{}` is configured but the boot discovery holds no trading row for \
-                     it — the arm binds only what the venue lists (obligation 7)",
+    let mut specs = Vec::with_capacity(sets.iter().map(|s| s.insts.len()).sum());
+    for set in sets {
+        for inst in set.insts {
+            let row = set
+                .rows
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&inst.name))
+                .map(|(_, r)| r)
+                .ok_or_else(|| {
+                    format!(
+                        "binance: `{}` is configured but the boot discovery holds no trading row \
+                         for it — the arm binds only what the venue lists (obligation 7)",
+                        inst.name
+                    )
+                })?;
+            // BX7 (the risk review's round-3 finding 3): a classic account's
+            // single-asset totals — its margin ratio and its session equity —
+            // count USDT's alone, so a USDⓈ-M contract margined in anything
+            // else (USDC's) would trade unseen by both. Refused; Portfolio
+            // Margin and PM Pro read the unified account.
+            if set.product == PRODUCT_USDM && mode == AccountMode::Classic && !row.is_usdt_margined() {
+                return Err(format!(
+                    "binance: `{}` is not margined in USDT (or its row names no margin asset) — a \
+                     classic account's margin ratio and session equity count USDT's alone \
+                     (single-asset mode, BX-19). Trade it under pm or pm_pro, or drop it from the \
+                     arm's instruments",
                     inst.name
-                )
-            })?;
-        let owned = !shared || owned_usdm.iter().any(|o| o.eq_ignore_ascii_case(&inst.name));
-        let spec = BindSpec {
-            sym: inst.sym,
-            product: PRODUCT_USDM,
-            row,
-            owned,
-            maker_ok: maker_ok(PRODUCT_USDM, mode),
-        };
-        table
-            .bind(&mut wire, &spec)
-            .map_err(|e| format!("binance: `{}` refused by the instrument table: {e:?}", inst.name))?;
-        specs.push(InstrumentSpec::new(inst.sym, LAW_LINEAR, 0, 0, 0));
+                ));
+            }
+            let owned = !shared || set.owned.iter().any(|o| o.eq_ignore_ascii_case(&inst.name));
+            let spec = BindSpec {
+                sym: inst.sym,
+                product: set.product,
+                row,
+                owned,
+                maker_ok: maker_ok(set.product, mode),
+            };
+            table
+                .bind(&mut wire, &spec)
+                .map_err(|e| format!("binance: `{}` refused by the instrument table: {e:?}", inst.name))?;
+            specs.push(if set.product == PRODUCT_COINM {
+                // The face in USD ×1e6 (the discovery refuses a row without
+                // one): a contract's exposure whatever the price.
+                InstrumentSpec::new(inst.sym, LAW_INVERSE, 0, row.contract_size.saturating_mul(1_000_000), 0)
+            } else {
+                InstrumentSpec::new(inst.sym, LAW_LINEAR, 0, 0, 0)
+            });
+        }
     }
     Ok((table, wire, specs))
+}
+
+/// **The most venue inventory the boot adopts** (BX7): the owner slot's
+/// instance cap. Adoption measures the Binance legs alone, while the cap
+/// spans every venue the slot names — so on a slot naming another venue
+/// nothing is adopted (0: a position on an owned row refuses the boot).
+fn adopt_cap_usd_1e6(s: &core_config::exec::ExecSlot) -> i64 {
+    let bn = core_types::VenueId::Binance as u8;
+    if s.venues.iter().all(|v| *v == bn) {
+        s.cap_instance_usd_1e6
+    } else {
+        0
+    }
 }
 
 /// **Boot the arm** (module docs).
@@ -161,9 +218,14 @@ pub fn boot_binance_arm(
     let shared = scope == AccountScope::Shared;
     let owner = u8::try_from(slot).map_err(|_| "binance: owner slot out of range")?;
 
-    // The key (names only in any message), and one network (BX-16).
-    let cfg = BnConfig::from_env(Scope::Live)
-        .map_err(|e| format!("binance: the arm cannot be configured: {e:?}"))?;
+    // The key (names only in any message), and one network (BX-16). HMAC
+    // only by its explicit word (R22; the section refuses it off REST).
+    let cfg = if b.signing == "hmac" {
+        BnConfig::from_env_hmac(Scope::Live)
+    } else {
+        BnConfig::from_env(Scope::Live)
+    }
+    .map_err(|e| format!("binance: the arm cannot be configured: {e:?}"))?;
     cfg.assert_market_data(spec.md_hosts).map_err(|e| {
         format!(
             "binance: the market-data hosts {:?} are not on the order network ({e:?}) — marks and \
@@ -172,11 +234,38 @@ pub fn boot_binance_arm(
         )
     })?;
 
-    // The table and the ledger rows.
-    let (table, wire, specs) = bind_table(spec.usdm, spec.rows, spec.alias, mode, shared, &b.owned_usdm)?;
+    // The table and the ledger rows: each armed futures product's
+    // instruments (`exec_boot` refused any product this gateway does not
+    // speak).
+    let armed = |w: &str| b.products.iter().any(|p| p == w);
+    let (um, cm) = (armed("usdm"), armed("coinm"));
+    let mut sets = Vec::with_capacity(2);
+    if um {
+        sets.push(BindSet { product: PRODUCT_USDM, insts: spec.usdm, rows: spec.rows, owned: &b.owned_usdm });
+    }
+    if cm {
+        sets.push(BindSet { product: PRODUCT_COINM, insts: spec.coinm, rows: spec.cm_rows, owned: &b.owned_coinm });
+    }
+    let (table, wire, specs) = bind_table(&sets, spec.alias, mode, shared)?;
     if specs.is_empty() {
         return Err(String::from(
-            "binance: a live Binance slot but no USDⓈ-M instrument in the universe — nothing to trade",
+            "binance: a live Binance slot but no instrument of an armed futures product in the \
+             universe — nothing to trade",
+        ));
+    }
+    // BX7: the E7 bound's USD equity is USDⓈ-M's on a classic account, and
+    // COIN-M margins in each coin — exec_boot refuses a bounded classic arm
+    // with `coinm` armed or `usdm` not (N1); this is the same law on what
+    // was bound: some USDⓈ-M, no COIN-M.
+    let bound_on = |p: u8| (0..wire.len()).any(|i| wire.row(i as u16).product == p);
+    if (s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0)
+        && mode == AccountMode::Classic
+        && (bound_on(PRODUCT_COINM) || !bound_on(PRODUCT_USDM))
+    {
+        return Err(String::from(
+            "binance: the owner slot has a session bound, but its classic arm binds COIN-M (or \
+             no USDⓈ-M) — COIN-M margins in each coin and has no USD equity, so the bound would \
+             judge USDⓈ-M's alone (or nothing) while COIN-M's losses went unseen",
         ));
     }
 
@@ -184,19 +273,24 @@ pub fn boot_binance_arm(
     let mut limit = [0i64; SLOTS];
     limit[slot] = s.halt_on_margin_ratio_1e6;
     let mut products = [0u8; SLOTS];
-    products[slot] = 1 << PRODUCT_USDM;
+    products[slot] = (u8::from(um) << PRODUCT_USDM) | (u8::from(cm) << PRODUCT_COINM);
     let margin = MarginBook::new(limit, products);
 
-    // The E7 anchor, per account (the file carries a hash of the key):
-    // read here; a first one is persisted by the journal's writer thread.
+    // The E7 anchor, one session's (the file carries a hash of the key and
+    // the account mode, N2): read here — a file that is another key's or
+    // another mode's refuses the boot until the operator ends that session;
+    // a first one is persisted by the journal's writer thread.
     let anchor_path: PathBuf = eb
         .path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default()
         .join(ANCHOR_FILE);
-    let anchor_file = AnchorFile::new(anchor_path.clone(), cfg.api_key());
-    let anchor = anchor_file.load().unwrap_or(0);
+    let anchor_file = AnchorFile::new(anchor_path.clone(), cfg.api_key(), mode);
+    let anchor = anchor_file
+        .load()
+        .map_err(|e| format!("binance: the E7 anchor {}: {e}", anchor_path.display()))?
+        .unwrap_or(0);
 
     // The journal: a cold writer thread behind an SPSC ring.
     let (jtx, jrx) = Ring::<core_types::ExecRecord, JOURNAL_RING>::new().split();
@@ -222,24 +316,19 @@ pub fn boot_binance_arm(
         heartbeat_ms: u64::try_from(b.heartbeat_ms).unwrap_or(10_000),
         recon_every_ms: u64::try_from(b.recon_every_ms).unwrap_or(60_000),
         spin: b.spin,
+        rotate_after_ns: ROTATE_AFTER_NS,
+        rest_orders: b.order_transport == "rest",
         pnl_anchor_1e6: anchor,
         boot_timeout_ns: BOOT_TIMEOUT_NS,
         quiet_ns: QUIET_NS,
         anchor_unsaved: Some(Arc::clone(&anchor_unsaved)),
+        max_leverage: u8::try_from(b.max_leverage).unwrap_or(1),
+        adopt_cap_usd_1e6: adopt_cap_usd_1e6(s),
     };
-    let (cmd_tx, cmd_rx) = Ring::<BnCmd, CMD_RING>::new().split();
-    let (evt_tx, evt_rx) = Ring::<BnEvt, EVT_RING>::new().split();
+    // The kit's duplex: both rings and the stats block (BX7, O-XH13).
+    let (eng_end, gw_end) = duplex();
     let n_rows = specs.len();
-    let mut gw = BnGateway::<{ engine::FILL_RING_SIZE }>::new(
-        &cfg,
-        tls,
-        knobs,
-        wire,
-        cmd_rx,
-        evt_tx,
-        fills,
-        JournalTx::new(jtx),
-    )
+    let mut gw = BnGateway::<{ engine::FILL_RING_SIZE }>::new(&cfg, tls, knobs, wire, gw_end, fills, JournalTx::new(jtx))
     .map_err(|e| format!("binance: the gateway could not be built: {e:?}"))?;
     // The boot runs HERE: nothing trades until it has held.
     if let Err(e) = gw.boot() {
@@ -249,6 +338,18 @@ pub fn boot_binance_arm(
             "binance: the boot was refused ({e:?}) — the account, the key or the venue did not \
              hold (BX-19); nothing was traded"
         ));
+    }
+    // BX7: what the boot adopted as the owner slot's starting inventory.
+    let (adopted, adopted_usd) = gw.adopted();
+    if adopted > 0 {
+        warn!(
+            adopted,
+            slot,
+            "binance: the account held positions on {adopted} owned instrument(s) — adopted as slot \
+             {slot}'s starting inventory ({} USD of its {} USD instance cap; journaled)",
+            adopted_usd / 1_000_000,
+            s.cap_instance_usd_1e6 / 1_000_000
+        );
     }
     // A dedicated account holding what the boot did not bind: the slot
     // stays unreconciled — fail closed — until someone flattens it by hand.
@@ -262,8 +363,7 @@ pub fn boot_binance_arm(
         );
     }
     let arm = BnArm::new(
-        cmd_tx,
-        evt_rx,
+        eng_end,
         table,
         ArmKnobs {
             orders_frac_1e6: b.orders_frac_1e6,
@@ -315,15 +415,42 @@ pub fn boot_binance_arm(
             drop(cfg);
         })
         .map_err(|e| format!("binance: spawn bn-gateway: {e}"))?;
+    // Each product as it trades here (BX7): makers only where a dead-man of
+    // ours is proven (USDⓈ-M classic), IoC-only elsewhere.
+    let mut armed_words: Vec<String> = Vec::with_capacity(2);
+    for (on, product, word) in [(um, PRODUCT_USDM, "USDⓈ-M"), (cm, PRODUCT_COINM, "COIN-M")] {
+        if on {
+            let how = if maker_ok(product, mode) { "makers and IoCs" } else { "IoC-only" };
+            armed_words.push(format!("{word} ({how})"));
+        }
+    }
+    let prefix = match mode {
+        AccountMode::Pm => "PORTFOLIO MARGIN ",
+        AccountMode::PmPro => "PM PRO ",
+        AccountMode::Classic => "",
+    };
     let tell = format!(
-        "binance: LIVE ARM ARMED — USDⓈ-M MAINNET, {} {} account, owner slot {slot}; {n_rows} \
-         instrument(s) bound; dead-man {} ms every {} ms while a maker rests; recv_window {} ms; \
-         E7 anchor {} ({}); journal {}{}",
+        "binance: LIVE ARM ARMED — {}{} MAINNET, {} {} account, owner slot {slot}; {n_rows} \
+         instrument(s) bound; orders over {} ({} key); dead-man {} ms every {} ms while a maker \
+         rests; recv_window {} ms; max leverage {}x{}; E7 anchor {} ({}); journal {}{}",
+        prefix,
+        armed_words.join(" + "),
         b.account_mode,
         b.account_scope,
+        if mode == AccountMode::Pm {
+            "papi (REST)"
+        } else if b.order_transport == "rest" {
+            "the REST route"
+        } else {
+            "the WS API, make-before-break"
+        },
+        b.signing,
         b.countdown_ms,
         b.heartbeat_ms,
         b.recv_window_ms,
+        b.max_leverage,
+        // Portfolio Margin's reads carry no leverage: not asserted (N3).
+        if mode == AccountMode::Pm { " (NOT asserted under pm)" } else { "" },
         anchor,
         anchor_path.display(),
         journal_path.display(),
@@ -345,7 +472,7 @@ pub fn boot_binance_arm(
 mod tests {
     use super::*;
 
-    const FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"},{"filterType":"MIN_NOTIONAL","notional":"100"}]},{"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"10000"},{"filterType":"MIN_NOTIONAL","notional":"20"}]}]}"#;
+    const FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"},{"filterType":"MIN_NOTIONAL","notional":"100"}]},{"symbol":"ETHUSDT","pair":"ETHUSDT","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"10000"},{"filterType":"MIN_NOTIONAL","notional":"20"}]}]}"#;
 
     fn rows() -> Vec<(String, BnSymbolRow)> {
         let mut d = ingress_binance::discovery::BnDiscovery::new();
@@ -364,6 +491,60 @@ mod tests {
         }
     }
 
+    fn um<'a>(insts: &'a [Instrument], rows: &'a [(String, BnSymbolRow)], owned: &'a [String]) -> BindSet<'a> {
+        BindSet { product: PRODUCT_USDM, insts, rows, owned }
+    }
+
+    const DAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSD_PERP","pair":"BTCUSD","contractType":"PERPETUAL","contractStatus":"TRADING","contractSize":100,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]},{"symbol":"ETHUSD_PERP","pair":"ETHUSD","contractType":"PERPETUAL","contractStatus":"TRADING","contractSize":10,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]}]}"#;
+
+    /// BX7 (C1): COIN-M binds beside USDⓈ-M — from its own rows, IoC-only
+    /// (O-BX3a: no maker rests without a dead-man of ours), the ledger's
+    /// row inverse at the contract's face.
+    /// BX7 (the risk review's R13): the instance cap is adopted within only
+    /// on a slot naming Binance alone — the cap spans every venue the slot
+    /// names, the adoption measures Binance's legs. Break-and-watch: the
+    /// HL + Binance slot adopted within the whole cap.
+    #[test]
+    fn adoption_needs_a_binance_only_slot() {
+        let mut s = core_config::exec::ExecSlot::paper_default(3);
+        s.cap_instance_usd_1e6 = 1_000_000_000;
+        s.venues = vec![core_types::VenueId::Binance as u8];
+        assert_eq!(adopt_cap_usd_1e6(&s), 1_000_000_000);
+        s.venues.push(core_types::VenueId::Hyperliquid as u8);
+        assert_eq!(adopt_cap_usd_1e6(&s), 0, "another venue: nothing adopted");
+    }
+
+    #[test]
+    fn coinm_binds_ioc_only_and_inverse_at_its_face() {
+        let mut d = ingress_binance::discovery::BnDiscovery::new();
+        d.ingest_body(DAPI).expect("dapi fixture");
+        let cm_rows: Vec<(String, BnSymbolRow)> = ["btcusd_perp", "ethusd_perp"]
+            .iter()
+            .map(|n| (String::from(*n), *d.find(n.to_ascii_uppercase().as_bytes()).expect("row")))
+            .collect();
+        let usdm = [inst("btcusdt", 512)];
+        let coinm = [inst("btcusd_perp", 3_073), inst("ethusd_perp", 3_074)];
+        let um_rows = rows();
+        let sets = [
+            um(&usdm, &um_rows, &[]),
+            BindSet { product: PRODUCT_COINM, insts: &coinm, rows: &cm_rows, owned: &[] },
+        ];
+        let (t, w, specs) = bind_table(&sets, 7, AccountMode::Classic, false).unwrap();
+        assert_eq!((t.len(), specs.len()), (3, 3));
+        assert_eq!((specs[0].law, specs[0].unit_1e6), (LAW_LINEAR, 0));
+        assert_eq!((specs[1].sym, specs[1].law, specs[1].unit_1e6), (coinm[0].sym, LAW_INVERSE, 100_000_000));
+        assert_eq!((specs[2].law, specs[2].unit_1e6), (LAW_INVERSE, 10_000_000), "each contract its own face");
+        let no_maker = exec_binance::inst::INST_NO_DEADMAN;
+        assert!(!t.hot(t.row_of(usdm[0].sym)).has(no_maker));
+        let r = t.row_of(coinm[0].sym);
+        assert!(t.hot(r).has(no_maker), "COIN-M is IoC-only");
+        assert_eq!((w.row(r).product, w.row(r).unit_1e6, w.row(r).symbol()), (PRODUCT_COINM, 100_000_000, &b"BTCUSD_PERP"[..]));
+        // A COIN-M name the dapi page never listed refuses, as on USDⓈ-M.
+        let missing = [inst("solusd_perp", 3_075)];
+        let sets = [BindSet { product: PRODUCT_COINM, insts: &missing, rows: &cm_rows, owned: &[] }];
+        assert!(bind_table(&sets, 7, AccountMode::Classic, false).err().unwrap().contains("solusd_perp"));
+    }
+
     /// Obligation 7: every configured USDⓈ-M instrument is bound from its
     /// own row under its own engine id, and the ledger gets the same ids;
     /// a configured instrument the discovery never listed refuses.
@@ -372,7 +553,8 @@ mod tests {
     #[test]
     fn the_table_binds_every_usdm_instrument_from_its_own_row() {
         let usdm = [inst("btcusdt", 512), inst("ethusdt", 513)];
-        let (t, w, specs) = bind_table(&usdm, &rows(), 7, AccountMode::Classic, false, &[]).unwrap();
+        let r = rows();
+        let (t, w, specs) = bind_table(&[um(&usdm, &r, &[])], 7, AccountMode::Classic, false).unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(specs.len(), 2);
         for (i, s) in specs.iter().enumerate() {
@@ -382,16 +564,42 @@ mod tests {
         }
         assert_eq!(t.row_of(7), exec_binance::inst::ROW_NONE, "the spot anchor is not a USDⓈ-M row");
         let missing = [inst("btcusdt", 512), inst("solusdt", 514)];
-        let e = bind_table(&missing, &rows(), 7, AccountMode::Classic, false, &[]).err().unwrap();
+        let e = bind_table(&[um(&missing, &r, &[])], 7, AccountMode::Classic, false).err().unwrap();
         assert!(e.contains("solusdt") && e.contains("obligation 7"), "{e}");
+    }
+
+    /// BX7 (the risk review's round-3 finding 3): on a classic account a
+    /// USDⓈ-M row margined in anything but USDT — or naming no margin asset
+    /// — refuses the bind (the account's totals count USDT's alone); under
+    /// Portfolio Margin and PM Pro (the unified account) it binds.
+    /// Break-and-watch: without the check the USDC row binds on classic.
+    #[test]
+    fn a_classic_arm_binds_usdt_margined_usdm_rows_only() {
+        const USDC: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDC","pair":"BTCUSDC","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"},{"filterType":"MIN_NOTIONAL","notional":"100"}]},{"symbol":"SOLUSDT","pair":"SOLUSDT","contractType":"PERPETUAL","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.01","minQty":"0.01","maxQty":"10000"},{"filterType":"MIN_NOTIONAL","notional":"5"}]}]}"#;
+        let mut d = ingress_binance::discovery::BnDiscovery::new();
+        d.ingest_body(USDC).expect("fixture");
+        let r: Vec<(String, BnSymbolRow)> = ["btcusdc", "solusdt"]
+            .iter()
+            .map(|n| (String::from(*n), *d.find(n.to_ascii_uppercase().as_bytes()).expect("row")))
+            .collect();
+        let usdc = [inst("btcusdc", 515)];
+        let e = bind_table(&[um(&usdc, &r, &[])], 7, AccountMode::Classic, false).err().unwrap();
+        assert!(e.contains("btcusdc") && e.contains("not margined in USDT"), "{e}");
+        let named_none = [inst("solusdt", 516)];
+        assert!(bind_table(&[um(&named_none, &r, &[])], 7, AccountMode::Classic, false).is_err(), "no margin asset named");
+        for mode in [AccountMode::Pm, AccountMode::PmPro] {
+            assert!(bind_table(&[um(&usdc, &r, &[])], 7, mode, false).is_ok(), "{mode:?}: the unified account");
+        }
+        let usdt = [inst("btcusdt", 512)];
+        assert!(bind_table(&[um(&usdt, &rows(), &[])], 7, AccountMode::Classic, false).is_ok());
     }
 
     /// A shared account owns only what `owned_usdm` names (O-BX2a).
     #[test]
     fn a_shared_account_owns_only_its_list() {
         let usdm = [inst("btcusdt", 512), inst("ethusdt", 513)];
-        let (t, _, _) =
-            bind_table(&usdm, &rows(), 7, AccountMode::Classic, true, &[String::from("BTCUSDT")]).unwrap();
+        let (r, owned) = (rows(), [String::from("BTCUSDT")]);
+        let (t, _, _) = bind_table(&[um(&usdm, &r, &owned)], 7, AccountMode::Classic, true).unwrap();
         let owned = exec_binance::inst::INST_OWNED;
         assert!(t.hot(t.row_of(usdm[0].sym)).has(owned));
         assert!(!t.hot(t.row_of(usdm[1].sym)).has(owned));

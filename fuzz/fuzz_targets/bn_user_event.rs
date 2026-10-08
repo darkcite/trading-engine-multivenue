@@ -6,24 +6,110 @@
 //!
 //! It must never panic (BX-15: a frame it cannot read is a refusal the
 //! gateway halts on, never a crash); an event it accepts names spans inside
-//! the frame, and an order or trade event it accepts carries its symbol and
-//! client id.
+//! the frame, and an order or trade event it accepts carries its symbol.
+//! BX7: every product's and mode's events (dstream, `/pm/ws/` with `fs`,
+//! `riskLevelChange`, `ACCOUNT_CONFIG_UPDATE` as bits); `ACCOUNT_UPDATE`'s
+//! positions not cross are named by the walk (`NotCross`) — exactly as many
+//! as the scan counted, in frame order, the first being the event's own
+//! span, the count exact (never saturated); and an accepted whole raw frame,
+//! wrapped in the combined form, scans alike (spans re-based) and walks
+//! alike.
 
 #![no_main]
 
-use exec_binance::userstream::{scan_user_event, UserEvent, UE_ORDER, UE_TRADE_LITE};
+use exec_binance::inst::{PRODUCT_COINM, PRODUCT_USDM};
+use exec_binance::userstream::{
+    scan_user_event, NotCross, Span, UserEvent, CONFIG_LEVERAGE, CONFIG_MULTI_ASSETS_OFF, CONFIG_MULTI_ASSETS_ON,
+    ISOLATED_MAX, RISK_MARGIN_CALL, RISK_NORMAL, UE_ACCOUNT, UE_CONFIG, UE_ORDER, UE_RISK, UE_TRADE_LITE,
+};
 use libfuzzer_sys::fuzz_target;
+
+/// The combined-stream wrapper's head: the event starts at its end.
+const WRAP: &[u8] = br#"{"stream":"s","data":"#;
+
+/// The walk's spans, at most 64.
+fn walk(frame: &[u8], e: &UserEvent) -> ([Span; 64], usize) {
+    let mut out = [Span::default(); 64];
+    let mut n = 0;
+    let mut w = NotCross::new(frame, e);
+    while let Some(s) = w.next() {
+        if n < out.len() {
+            out[n] = s;
+        }
+        n += 1;
+    }
+    (out, n)
+}
 
 fuzz_target!(|data: &[u8]| {
     let mut e = UserEvent::default();
-    if scan_user_event(data, &mut e).is_ok() {
-        for s in [e.symbol, e.cid] {
-            assert!(s.at as usize + s.len as usize <= data.len(), "a span past the frame");
+    if scan_user_event(data, &mut e).is_err() {
+        return;
+    }
+    assert!((UE_ORDER..=UE_CONFIG).contains(&e.kind), "a kind no scan writes");
+    assert!(matches!(e.fs, 0 | PRODUCT_USDM | PRODUCT_COINM | u8::MAX), "an fs no scan writes");
+    for s in [e.symbol, e.cid] {
+        assert!(s.at as usize + s.len as usize <= data.len(), "a span past the frame");
+    }
+    if e.kind == UE_ORDER || e.kind == UE_TRADE_LITE {
+        assert!(!e.symbol.get(data).is_empty(), "an order event with no symbol");
+    }
+    if e.kind == UE_RISK {
+        assert!((RISK_MARGIN_CALL..=RISK_NORMAL).contains(&e.risk), "a risk word no scan writes");
+    } else {
+        assert_eq!(e.risk, 0);
+    }
+    if e.kind == UE_CONFIG {
+        let all = CONFIG_LEVERAGE | CONFIG_MULTI_ASSETS_ON | CONFIG_MULTI_ASSETS_OFF;
+        assert!(e.config != 0 && e.config & !all == 0, "config bits no scan writes");
+        assert!(e.config & (CONFIG_MULTI_ASSETS_ON | CONFIG_MULTI_ASSETS_OFF) != (CONFIG_MULTI_ASSETS_ON | CONFIG_MULTI_ASSETS_OFF));
+        if e.config & CONFIG_LEVERAGE != 0 {
+            assert!(e.symbol.len > 0, "a leverage change with no symbol");
         }
-        if e.kind == UE_ORDER || e.kind == UE_TRADE_LITE {
-            // An order event names its symbol: an empty one is refused.
-            assert!(e.symbol.len > 0, "an order event with no symbol");
-            assert!(!e.symbol.get(data).is_empty());
+    } else {
+        assert_eq!(e.config, 0);
+    }
+    let (spans, n) = walk(data, &e);
+    if e.kind == UE_ACCOUNT {
+        assert!(e.isolated < ISOLATED_MAX, "a saturated count");
+        assert_eq!(n, usize::from(e.isolated), "the walk names what the scan counted");
+        let mut k = 0;
+        while k < n.min(spans.len()) {
+            let s = spans[k];
+            assert!(s.at as usize + s.len as usize <= data.len(), "a span past the frame");
+            assert!(k == 0 || s.at > spans[k - 1].at, "positions out of frame order");
+            k += 1;
+        }
+        if n > 0 {
+            assert_eq!(spans[0], e.symbol, "the event's symbol is the walk's first (the same span)");
+        }
+    } else {
+        assert_eq!((e.isolated, e.positions, n), (0, 0, 0), "only an account update walks");
+    }
+    // Raw ⇔ combined: an accepted whole raw frame, wrapped, scans alike
+    // (spans re-based) and walks alike.
+    let whole = data.first() == Some(&b'{') && core_parse::skip_json_value(data, 0) == Some(data.len());
+    if whole && !data.windows(6).any(|w| w == b"\"data\"") {
+        let mut w = Vec::with_capacity(data.len() + WRAP.len() + 1);
+        w.extend_from_slice(WRAP);
+        w.extend_from_slice(data);
+        w.push(b'}');
+        let mut c = UserEvent::default();
+        scan_user_event(&w, &mut c).expect("the combined form of an accepted frame");
+        let off = WRAP.len() as u32;
+        let mut want = e;
+        want.symbol.at += off;
+        want.cid.at += off;
+        if want.positions != 0 {
+            want.positions += off;
+        }
+        assert_eq!(c, want, "raw and combined disagree");
+        let (cs, cn) = walk(&w, &c);
+        assert_eq!(cn, n, "the walks disagree");
+        let mut k = 0;
+        while k < n.min(spans.len()) {
+            assert_eq!(cs[k].at, spans[k].at + off, "the walks disagree");
+            k += 1;
         }
     }
 });

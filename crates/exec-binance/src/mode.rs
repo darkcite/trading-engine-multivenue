@@ -20,8 +20,11 @@
 //!   answers. The gateway's boot phase makes the (cold, signed) queries and
 //!   refuses the boot on any mismatch; nothing here mutates the account
 //!   (every mutation is the operator tool's, `exec-smoke --binance setup`).
+//!   BX7 adds each owned USDⓈ-M row's margin type and leverage
+//!   ([`judge_symbol_config`]); COIN-M's come with its account read.
 
 use crate::inst::{PRODUCT_COINM, PRODUCT_EQUITY, PRODUCT_OPTIONS, PRODUCT_SPOT, PRODUCT_USDM};
+use crate::json::{bool_of, field, i64_of, str_of, u64_of, Elems, Pairs};
 
 /// The account's margin mode (O-BX2).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -97,15 +100,16 @@ pub const fn maker_ok(product: u8, mode: AccountMode) -> bool {
     product == PRODUCT_USDM && matches!(mode, AccountMode::Classic)
 }
 
-/// What this phase's gateway speaks: `Ok` for UM × classic; otherwise the
+/// What this phase's gateway speaks: `Ok` for UM and COIN-M × classic
+/// (BX7: COIN-M on its own lane, IoC-only — O-BX3a), × Portfolio Margin
+/// (BX7, C2: papi, IoC-only — K13) and × PM Pro (BX7, C3: the classic
+/// routes, IoC-only until K14 shows the dead-man there); otherwise the
 /// phase that builds the product or mode.
 pub const fn built(product: u8, mode: AccountMode) -> Result<(), &'static str> {
     match product {
-        PRODUCT_USDM => match mode {
-            AccountMode::Classic => Ok(()),
-            AccountMode::Pm | AccountMode::PmPro => Err("BX7 (PM and PM Pro sessions)"),
+        PRODUCT_USDM | PRODUCT_COINM => match mode {
+            AccountMode::Classic | AccountMode::Pm | AccountMode::PmPro => Ok(()),
         },
-        PRODUCT_COINM => Err("BX7 (COIN-M)"),
         PRODUCT_SPOT => Err("BX8 (spot)"),
         PRODUCT_OPTIONS => Err("BX9 (options)"),
         PRODUCT_EQUITY => Err("BX10 (Binance Stocks)"),
@@ -133,25 +137,26 @@ pub enum AssertErr {
     CanWithdraw,
     /// The answer did not scan (fail closed).
     Unreadable,
+    /// An owned row is not cross-margined: `ISOLATED`, or a margin type
+    /// this build does not know (BX7; fail closed).
+    Isolated,
+    /// An owned row's initial leverage is above `max_leverage` (BX7).
+    Leverage,
+    /// The venue's answer does not list an owned row (BX7; fail closed).
+    Unlisted,
 }
 
-/// The JSON boolean after `"key":` in `body`, or `None`.
+/// The answer's own boolean `key` — named once, at the top level
+/// ([`field`]: a nested key is not it, a second copy refuses; BX7) — or
+/// `None`.
 fn json_bool(body: &[u8], key: &[u8]) -> Option<bool> {
-    let at = core_parse::find_field(body, key)?;
-    let at = core_parse::skip_ws(body, at);
-    let rest = body.get(at..)?;
-    if rest.starts_with(b"true") {
-        Some(true)
-    } else if rest.starts_with(b"false") {
-        Some(false)
-    } else {
-        None
-    }
+    let (a, z) = field(body, key)?;
+    bool_of(body, a, z).ok()
 }
 
 /// `GET /fapi/v1/positionSide/dual` → `{"dualSidePosition":false}` (one-way).
 pub fn judge_one_way(body: &[u8]) -> Result<(), AssertErr> {
-    match json_bool(body, b"\"dualSidePosition\":") {
+    match json_bool(body, b"dualSidePosition") {
         Some(false) => Ok(()),
         Some(true) => Err(AssertErr::HedgeMode),
         None => Err(AssertErr::Unreadable),
@@ -160,19 +165,88 @@ pub fn judge_one_way(body: &[u8]) -> Result<(), AssertErr> {
 
 /// `GET /fapi/v1/multiAssetsMargin` → `{"multiAssetsMargin":false}`.
 pub fn judge_single_asset(body: &[u8]) -> Result<(), AssertErr> {
-    match json_bool(body, b"\"multiAssetsMargin\":") {
+    match json_bool(body, b"multiAssetsMargin") {
         Some(false) => Ok(()),
         Some(true) => Err(AssertErr::MultiAssets),
         None => Err(AssertErr::Unreadable),
     }
 }
 
+/// `GET /fapi/v1/symbolConfig?symbol=…` (BX7, BX-19): the owned row's
+/// margin type is `CROSSED` and its initial leverage at most
+/// `max_leverage`. The answer is an array; the entry naming `symbol` is
+/// judged — no such entry is refused, as is one short of either field, a
+/// leverage of 0 (no leverage is not one), a key an entry names twice and
+/// a symbol two entries name (which would hold?).
+pub fn judge_symbol_config(body: &[u8], symbol: &[u8], max_leverage: u8) -> Result<(), AssertErr> {
+    let mut e = Elems::new(body, 0).map_err(|()| AssertErr::Unreadable)?;
+    let mut verdict = Err(AssertErr::Unlisted);
+    let mut listed = false;
+    while let Some((at, _)) = e.next().map_err(|()| AssertErr::Unreadable)? {
+        let mut w = Pairs::new(body, at).map_err(|()| AssertErr::Unreadable)?;
+        let (mut sym, mut margin, mut lev) = (None, None, None);
+        // The keys read, a bit each: a second copy is refused.
+        let mut seen = 0u8;
+        while let Some((k, a, z)) = w.next().map_err(|()| AssertErr::Unreadable)? {
+            let bit = match k {
+                b"symbol" => {
+                    sym = str_of(body, a, z).ok();
+                    1
+                }
+                b"marginType" => {
+                    margin = str_of(body, a, z).ok();
+                    1 << 1
+                }
+                b"leverage" => {
+                    lev = u64_of(body, a, z).ok();
+                    1 << 2
+                }
+                _ => 0,
+            };
+            if seen & bit != 0 {
+                return Err(AssertErr::Unreadable);
+            }
+            seen |= bit;
+        }
+        if sym != Some(symbol) {
+            continue;
+        }
+        if listed {
+            return Err(AssertErr::Unreadable);
+        }
+        listed = true;
+        verdict = match (margin, lev) {
+            (Some(b"CROSSED"), Some(0)) => Err(AssertErr::Unreadable),
+            (Some(b"CROSSED"), Some(l)) if l <= u64::from(max_leverage) => Ok(()),
+            (Some(b"CROSSED"), Some(_)) => Err(AssertErr::Leverage),
+            (Some(_), Some(_)) => Err(AssertErr::Isolated),
+            _ => Err(AssertErr::Unreadable),
+        };
+    }
+    verdict
+}
+
+/// `GET /sapi/v1/account/apiRestrictions` in `mode`: the key trades
+/// futures and cannot withdraw — and in Portfolio Margin it trades PM
+/// (`enablePortfolioMarginTrading`; BX7, C2).
+pub fn judge_key(body: &[u8], mode: AccountMode) -> Result<(), AssertErr> {
+    judge_key_futures(body)?;
+    if matches!(mode, AccountMode::Pm) {
+        return match json_bool(body, b"enablePortfolioMarginTrading") {
+            Some(true) => Ok(()),
+            Some(false) => Err(AssertErr::NoTradePermission),
+            None => Err(AssertErr::Unreadable),
+        };
+    }
+    Ok(())
+}
+
 /// `GET /sapi/v1/account/apiRestrictions`: the key trades futures and
 /// cannot withdraw.
 pub fn judge_key_futures(body: &[u8]) -> Result<(), AssertErr> {
     match (
-        json_bool(body, b"\"enableFutures\":"),
-        json_bool(body, b"\"enableWithdrawals\":"),
+        json_bool(body, b"enableFutures"),
+        json_bool(body, b"enableWithdrawals"),
     ) {
         (Some(true), Some(false)) => Ok(()),
         (Some(false), Some(_)) => Err(AssertErr::NoTradePermission),
@@ -183,25 +257,22 @@ pub fn judge_key_futures(body: &[u8]) -> Result<(), AssertErr> {
 
 /// `GET /sapi/v1/portfolio/account` (K17): a classic account is refused
 /// with `-21001`; a PM account answers `accountType` `PM_1` (PM Pro),
-/// `PM_2` (PM) or `PM_3` (PM Pro SPAN). `status` is the HTTP status.
+/// `PM_2` (PM) or `PM_3` (PM Pro SPAN). `status` is the HTTP status. Both
+/// are the answer's own top-level fields, named once in a well-formed
+/// object ([`field`]) and read whole (BX7): the code at most 18 digits,
+/// never a prefix of a longer value.
 pub fn judge_mode(status: u16, body: &[u8], want: AccountMode) -> Result<(), AssertErr> {
     let seen = if status == 200 {
-        let Some(at) = core_parse::find_field(body, b"\"accountType\":\"") else {
-            return Err(AssertErr::Unreadable);
-        };
-        match body.get(at..at + 5) {
-            Some(b"PM_2\"") => AccountMode::Pm,
-            Some(b"PM_1\"") | Some(b"PM_3\"") => AccountMode::PmPro,
+        let ty = field(body, b"accountType").and_then(|(a, z)| str_of(body, a, z).ok());
+        match ty {
+            Some(b"PM_2") => AccountMode::Pm,
+            Some(b"PM_1" | b"PM_3") => AccountMode::PmPro,
             _ => return Err(AssertErr::Unreadable),
         }
+    } else if field(body, b"code").and_then(|(a, z)| i64_of(body, a, z).ok()) == Some(-21_001) {
+        AccountMode::Classic
     } else {
-        let Some(at) = core_parse::find_field(body, b"\"code\":") else {
-            return Err(AssertErr::Unreadable);
-        };
-        match core_parse::scan_i64(body, core_parse::skip_ws(body, at)) {
-            Some((-21_001, _)) => AccountMode::Classic,
-            _ => return Err(AssertErr::Unreadable),
-        }
+        return Err(AssertErr::Unreadable);
     };
     if seen == want {
         Ok(())
@@ -225,13 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn only_um_classic_is_built() {
+    fn the_classic_futures_are_built() {
         assert_eq!(built(PRODUCT_USDM, AccountMode::Classic), Ok(()));
-        assert!(built(PRODUCT_USDM, AccountMode::Pm).unwrap_err().starts_with("BX7"));
+        assert_eq!(built(PRODUCT_COINM, AccountMode::Classic), Ok(()), "BX7: COIN-M classic");
+        assert_eq!(built(PRODUCT_USDM, AccountMode::Pm), Ok(()), "BX7: Portfolio Margin");
+        assert_eq!(built(PRODUCT_COINM, AccountMode::Pm), Ok(()));
+        assert_eq!(built(PRODUCT_USDM, AccountMode::PmPro), Ok(()), "BX7: PM Pro");
+        assert_eq!(built(PRODUCT_COINM, AccountMode::PmPro), Ok(()));
+        assert!(!maker_ok(PRODUCT_USDM, AccountMode::PmPro), "K14: no dead-man proven under PM Pro");
+        assert!(!maker_ok(PRODUCT_USDM, AccountMode::Pm), "K13: no dead-man in PM");
         assert!(built(PRODUCT_SPOT, AccountMode::Classic).unwrap_err().starts_with("BX8"));
         assert!(built(PRODUCT_OPTIONS, AccountMode::Classic).unwrap_err().starts_with("BX9"));
         assert!(built(PRODUCT_EQUITY, AccountMode::Classic).unwrap_err().starts_with("BX10"));
-        assert!(built(PRODUCT_COINM, AccountMode::Classic).unwrap_err().starts_with("BX7"));
+        // O-BX3a: no maker rests on COIN-M (no dead-man of ours there yet).
+        assert!(maker_ok(PRODUCT_USDM, AccountMode::Classic));
+        assert!(!maker_ok(PRODUCT_COINM, AccountMode::Classic));
     }
 
     #[test]
@@ -243,6 +322,34 @@ mod tests {
             assert_eq!(AccountScope::from_word(s.word()), Some(s));
         }
         assert_eq!(AccountMode::from_word("cross"), None);
+    }
+
+    /// BX7 (BX-19): cross margin and the leverage cap, per owned row.
+    #[test]
+    fn the_symbol_config_judge_wants_cross_under_the_cap() {
+        let ok = br#"[{"symbol":"BTCUSDT","marginType":"CROSSED","isAutoAddMargin":false,"leverage":20,"maxNotionalValue":"1000000"}]"#;
+        assert_eq!(judge_symbol_config(ok, b"BTCUSDT", 20), Ok(()));
+        assert_eq!(judge_symbol_config(ok, b"BTCUSDT", 19), Err(AssertErr::Leverage));
+        let iso = br#"[{"symbol":"BTCUSDT","marginType":"ISOLATED","leverage":"5"}]"#;
+        assert_eq!(judge_symbol_config(iso, b"BTCUSDT", 20), Err(AssertErr::Isolated));
+        let odd = br#"[{"symbol":"BTCUSDT","marginType":"PORTFOLIO","leverage":5}]"#;
+        assert_eq!(judge_symbol_config(odd, b"BTCUSDT", 20), Err(AssertErr::Isolated), "an unknown type is not cross");
+        // Another symbol's entry is not the row's; none at all is refused.
+        let other = br#"[{"symbol":"ETHUSDT","marginType":"CROSSED","leverage":5},{"symbol":"BTCUSDT","marginType":"CROSSED","leverage":3}]"#;
+        assert_eq!(judge_symbol_config(other, b"BTCUSDT", 3), Ok(()));
+        assert_eq!(judge_symbol_config(other, b"XRPUSDT", 20), Err(AssertErr::Unlisted));
+        assert_eq!(judge_symbol_config(b"[]", b"BTCUSDT", 20), Err(AssertErr::Unlisted));
+        let short = br#"[{"symbol":"BTCUSDT","marginType":"CROSSED"}]"#;
+        assert_eq!(judge_symbol_config(short, b"BTCUSDT", 20), Err(AssertErr::Unreadable));
+        assert_eq!(judge_symbol_config(br#"{"code":-1121,"msg":"Invalid symbol."}"#, b"BTCUSDT", 20), Err(AssertErr::Unreadable));
+        // BX7 (P9): no leverage is not one; the row named twice — or a key
+        // named twice — is refused, whichever copy says what.
+        let zero = br#"[{"symbol":"BTCUSDT","marginType":"CROSSED","leverage":0}]"#;
+        assert_eq!(judge_symbol_config(zero, b"BTCUSDT", 20), Err(AssertErr::Unreadable));
+        let twice = br#"[{"symbol":"BTCUSDT","marginType":"CROSSED","leverage":5},{"symbol":"BTCUSDT","marginType":"ISOLATED","leverage":125}]"#;
+        assert_eq!(judge_symbol_config(twice, b"BTCUSDT", 20), Err(AssertErr::Unreadable));
+        let key_twice = br#"[{"symbol":"BTCUSDT","marginType":"ISOLATED","marginType":"CROSSED","leverage":5}]"#;
+        assert_eq!(judge_symbol_config(key_twice, b"BTCUSDT", 20), Err(AssertErr::Unreadable));
     }
 
     #[test]
@@ -269,5 +376,25 @@ mod tests {
         assert_eq!(judge_mode(200, pro, AccountMode::PmPro), Ok(()));
         assert_eq!(judge_mode(400, br#"{"code":-1021}"#, AccountMode::Classic), Err(AssertErr::Unreadable));
         assert_eq!(judge_mode(200, b"garbage", AccountMode::Classic), Err(AssertErr::Unreadable));
+        // BX7 (P2): the code read whole — never a numeral that wraps to
+        // -21001, a prefix of a longer value, or one past i64 (which used
+        // to overflow the negation) — and the type the answer's own, once.
+        for body in [
+            &br#"{"code":-18446744073709572617}"#[..],
+            &br#"{"code":-9223372036854775808}"#[..],
+            &br#"{"code":-21001x}"#[..],
+            &br#"{"code":-21001.9}"#[..],
+            &br#"{"x":{"code":-21001}}"#[..],
+            &br#"{"code":-1,"code":-21001}"#[..],
+        ] {
+            assert_eq!(judge_mode(400, body, AccountMode::Classic), Err(AssertErr::Unreadable), "{}", std::str::from_utf8(body).unwrap());
+        }
+        let nested = br#"{"x":{"accountType":"PM_2"},"accountType":"PM_1"}"#;
+        assert_eq!(judge_mode(200, nested, AccountMode::Pm), Err(AssertErr::Mode), "the answer's own type, PM_1");
+        assert_eq!(judge_mode(200, br#"{"accountType":"PM_2","accountType":"PM_1"}"#, AccountMode::Pm), Err(AssertErr::Unreadable));
+        // The judges' booleans: the answer's own, once.
+        let dup = br#"{"enableWithdrawals":false,"enableFutures":true,"enableWithdrawals":true}"#;
+        assert_eq!(judge_key_futures(dup), Err(AssertErr::Unreadable));
+        assert_eq!(judge_one_way(br#"{"x":{"dualSidePosition":false}}"#), Err(AssertErr::Unreadable), "a nested key is not the answer's");
     }
 }

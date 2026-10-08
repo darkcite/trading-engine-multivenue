@@ -332,10 +332,10 @@ in the script; `ai` = 48 is the floor every name includes).
   nextest 3583 (6
   skipped — the `#[ignore]`d `mexc_live_smoke`, `binance_md_live_smoke`,
   `hyperevm_live_smoke` and `hypercall_live_smoke` among them) · alloc
-  99/99 at the gates' pins (0 B/op; gate 85 is slot 7 over the
+  117/117 at the gates' pins (0 B/op; gate 85 is slot 7 over the
   held-quote law, its book handed to the writer's mailbox inside the
   measured loop; gates 72, 77b and 101 pin `HttpsPost`, `HttpsReq`
-  and `HlHttp` (XMM HD2) at exactly 2 per request — rustls; +2 ignored
+  and `HlHttp` (XMM HD2) at exactly 2 per request — rustls; +3 ignored
   child helpers) · clippy clean · `make license-check` OK · `make
   bench-check` OK at the merge (the M4 baseline, 2026-09-25: all 11
   samples within 15 % at load ~10; `vol/long_day_close_warm`,

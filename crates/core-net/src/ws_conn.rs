@@ -21,8 +21,8 @@
 //!   idle law (no inbound byte for `idle_ns`).
 //!
 //! The framing is [`WsFramer`]: no socket, so its hot half is testable
-//! and alloc-gated on its own. Request ids for the session above it are
-//! [`crate::ReqIds`].
+//! and alloc-gated on its own. Request ids and their records for the
+//! session above it are the owner's (`exec_gateway::Pending`, BX7).
 //!
 //! ## What it refuses
 //!
@@ -472,22 +472,49 @@ impl WsConn {
         self.addr = addr;
     }
 
+    /// The host this connection talks to — interned for the process's
+    /// life (as `HttpsConn::host`), so it can be held anywhere.
+    #[inline]
+    #[must_use]
+    pub fn host(&self) -> &'static str {
+        self.host
+    }
+
     /// **BX6** — the path the next [`Self::connect`] upgrades to (a
     /// user-data stream's new listenKey). Only while the session is down;
     /// the same checks as [`Self::new`]. Never allocates.
     pub fn set_path(&mut self, path: &str) -> Result<(), WsErr> {
-        let p = path.as_bytes();
-        if self.phase != WsPhase::Down
-            || p.first() != Some(&b'/')
-            || p.len() > MAX_PATH
-            || !visible(p)
-        {
+        self.set_path_parts(&[path.as_bytes()])
+    }
+
+    /// [`Self::set_path`] from parts laid end to end — the first starting
+    /// with `/` (BX7: a stream's prefix and its listenKey, written straight
+    /// into the path, no staging buffer). Checked whole before a byte
+    /// moves: a refused path changes nothing.
+    pub fn set_path_parts(&mut self, parts: &[&[u8]]) -> Result<(), WsErr> {
+        let mut n = 0usize;
+        let mut ok = self.phase == WsPhase::Down && parts.first().and_then(|p| p.first()) == Some(&b'/');
+        let mut i = 0;
+        while i < parts.len() {
+            n += parts[i].len();
+            ok &= visible(parts[i]);
+            i += 1;
+        }
+        if !ok || n > MAX_PATH {
             return Err(WsErr::BadEndpoint);
         }
-        // COPY: the new path (≤ MAX_PATH B) into the fixed buffer — cold,
-        // once per new listenKey — the handshake is rendered from it.
-        self.path[..p.len()].copy_from_slice(p);
-        self.path_len = p.len();
+        let mut at = 0;
+        let mut i = 0;
+        while i < parts.len() {
+            let p = parts[i];
+            // COPY: the new path's parts (≤ MAX_PATH B in all) into the
+            // fixed buffer — cold, once per new listenKey — the handshake
+            // is rendered from it.
+            self.path[at..at + p.len()].copy_from_slice(p);
+            at += p.len();
+            i += 1;
+        }
+        self.path_len = n;
         Ok(())
     }
 
@@ -981,6 +1008,14 @@ mod tests {
         let long = "/".repeat(MAX_PATH + 1);
         assert_eq!(w.set_path(&long), Err(WsErr::BadEndpoint));
         assert_eq!(&w.path[..w.path_len], b"/ws/bb", "a refused path changes nothing");
+        // BX7: from parts, checked whole before a byte moves.
+        assert!(w.set_path_parts(&[b"/pm/ws/", b"k3y"]).is_ok());
+        assert_eq!(&w.path[..w.path_len], b"/pm/ws/k3y");
+        assert_eq!(w.set_path_parts(&[b"/ws/", b"a b"]), Err(WsErr::BadEndpoint));
+        assert_eq!(w.set_path_parts(&[b"", b"/ws/x"]), Err(WsErr::BadEndpoint), "the first part starts the path");
+        assert_eq!(w.set_path_parts(&[b"/", long.as_bytes()]), Err(WsErr::BadEndpoint));
+        assert_eq!(&w.path[..w.path_len], b"/pm/ws/k3y", "a refused path changes nothing");
+        assert_eq!(w.host(), "localhost");
     }
 
     #[test]

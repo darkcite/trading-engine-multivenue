@@ -138,7 +138,7 @@ the same situation `Order.strategy_id` was in at M4.1.
 |     12 |     1 | side        | `u8`           | `Side` (Bid=0, Ask=1)                            |
 |     13 |     1 | strategy_id | `u8`           | X1: emitting slot; `0xFF` = unattributed         |
 |     14 |     1 | origin      | `u8`           | X1: 0 = venue fill, 1 = MODELLED by the paper matcher |
-|     15 |     1 | flags       | `u8`           | E4: bit 0 = `FILL_FLAG_SETTLEMENT` (the VENUE closed the instance); was `_pad0`, explicit zeroed, so every capture written before E4 reads as no flags |
+|     15 |     1 | flags       | `u8`           | E4: bit 0 = `FILL_FLAG_SETTLEMENT` (the VENUE closed the instance); was `_pad0`, explicit zeroed, so every capture written before E4 reads as no flags. **BX7 (2026-10-08)**: bit 1 = `FILL_FLAG_ADOPTED` — the venue's position ADOPTED at a Binance boot as the owner slot's starting inventory: not a trade, no commission, no day turnover; an inverse leg's carries px 0 (its face carries the exposure). A reader folding fills into P&L or trade statistics must treat it as opening inventory (audit-pnl does; BX-14 excludes it). Wire-additive: bit 1 was always 0 |
 |     16 |     8 | px          | `i64` Price    | fixed-point ×1e6                                 |
 |     24 |     8 | qty         | `i64` Qty      | fixed-point ×1e6                                 |
 |     32 |     8 | order_id    | `u64`          | engine-assigned client oid                       |

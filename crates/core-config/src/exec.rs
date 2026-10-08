@@ -105,8 +105,9 @@ const SLOT_KEYS: [&str; 24] = [
     "halt_on_alo_reject_pct",
 ];
 
-/// Keys the `[exec.binance]` section accepts (BX6, plan §3.12).
-const BINANCE_KEYS: [&str; 21] = [
+/// Keys the `[exec.binance]` section accepts (BX6, plan §3.12; BX7 adds
+/// the order route, the signing key type and the leverage cap).
+const BINANCE_KEYS: [&str; 24] = [
     "network",
     "account_mode",
     "account_scope",
@@ -128,6 +129,9 @@ const BINANCE_KEYS: [&str; 21] = [
     "qtr_frac_1e6",
     "recon_every_ms",
     "spin",
+    "order_transport",
+    "signing",
+    "max_leverage",
 ];
 
 /// Venue spellings the `venues` array accepts, and the `VenueId` byte
@@ -543,9 +547,29 @@ pub struct ExecBinance {
     pub qtr_frac_1e6: i64,
     /// `recon_every_ms` (plan §3.10): `10 000..=600 000`, default 60 000.
     pub recon_every_ms: i64,
-    /// `spin`: 1 = the gateway thread busy-polls; 0 = it sleeps in `poll`
-    /// up to 1 ms. Default 1.
+    /// `spin`: 1 = the gateway thread busy-polls; 0 = it parks up to
+    /// 100 µs once quiet, never past a deadline (the kit's wait policy,
+    /// BX7). Default 1.
     pub spin: bool,
+    /// `order_transport` (BX7, C5): `"ws"` (the WS API, default) or
+    /// `"rest"` (the REST order route: the Demo battery's fallback, and the
+    /// only route an HMAC key signs).
+    pub order_transport: String,
+    /// `signing` (BX7, R22): `"ed25519"` (default) or `"hmac"` — only ever
+    /// by this word, never silently; `"hmac"` needs
+    /// `order_transport = "rest"` (the WS API's `session.logon` takes
+    /// Ed25519 keys only).
+    pub signing: String,
+    /// `max_leverage` (BX7, BX-19): the highest initial leverage an owned
+    /// row may carry — asserted at boot (USDⓈ-M classic and PM Pro: each
+    /// owned row's `symbolConfig`; COIN-M classic and PM Pro: the account
+    /// read, every cycle). Later, ANY leverage change on an owned row locks
+    /// (`ACCOUNT_CONFIG_UPDATE` — stricter than the cap), and the COIN-M
+    /// read locks one above it. Portfolio Margin does not assert it at boot
+    /// (a residual: papi's `positionRisk` would); a change there still
+    /// locks. `1..=125`, default 20 (Binance's own default). The engine
+    /// never sets it (`exec-smoke --binance setup` does).
+    pub max_leverage: i64,
     /// Line the section header sat on.
     pub line: usize,
 }
@@ -572,6 +596,22 @@ fn req_str(kv: &Kv, key: &str, line: usize, allowed: &[&str]) -> Result<String, 
         None => Err(err(format!(
             "[exec.binance] at line {line}: `{key}` is required — one of {allowed:?}"
         ))),
+    }
+}
+
+/// An optional word from `allowed`; `default` when the key is absent.
+fn opt_word(kv: &Kv, key: &str, default: &str, allowed: &[&str]) -> Result<String, ExecError> {
+    match kv.iter().find(|(k, _, _)| k == key) {
+        Some((_, Value::Str(v), ln)) => {
+            if !allowed.contains(&v.as_str()) {
+                return Err(err(format!(
+                    "line {ln}: `{key}` must be one of {allowed:?} (saw \"{v}\")"
+                )));
+            }
+            Ok(v.clone())
+        }
+        Some((_, _, ln)) => Err(err(format!("line {ln}: `{key}` must be a string"))),
+        None => Ok(String::from(default)),
     }
 }
 
@@ -706,6 +746,20 @@ fn finish_binance(kv: &Kv, line: usize) -> Result<ExecBinance, ExecError> {
              cancel everything"
         )));
     }
+    let order_transport = opt_word(kv, "order_transport", "ws", &["ws", "rest"])?;
+    let signing = opt_word(kv, "signing", "ed25519", &["ed25519", "hmac"])?;
+    if signing == "hmac" && order_transport != "rest" {
+        return Err(err(format!(
+            "[exec.binance] at line {line}: `signing = \"hmac\"` needs `order_transport = \"rest\"` \
+             — the WS API's session.logon takes Ed25519 keys only (R22)"
+        )));
+    }
+    if account_mode == "pm" && order_transport != "rest" {
+        return Err(err(format!(
+            "[exec.binance] at line {line}: `account_mode = \"pm\"` needs `order_transport = \"rest\"` \
+             — Portfolio Margin trades over papi, which has no WS API (BX7)"
+        )));
+    }
     let [owned_spot_assets, owned_usdm, owned_coinm, owned_option_underlyings, owned_equities] =
         owned;
     Ok(ExecBinance {
@@ -730,6 +784,9 @@ fn finish_binance(kv: &Kv, line: usize) -> Result<ExecBinance, ExecError> {
         qtr_frac_1e6: bounded(kv, "qtr_frac_1e6", 800_000, 1, 1_000_000)?,
         recon_every_ms: bounded(kv, "recon_every_ms", 60_000, 10_000, 600_000)?,
         spin: bounded(kv, "spin", 1, 0, 1)? == 1,
+        order_transport,
+        signing,
+        max_leverage: bounded(kv, "max_leverage", 20, 1, 125)?,
         line,
     })
 }
@@ -1715,6 +1772,25 @@ mode = "paper"
         ))
         .is_ok());
         expect_err(&with("options_write = 1"), "needs `options` in `products`");
+        // BX7: the order route and the signing key type — explicit words,
+        // HMAC only on REST (R22).
+        assert_eq!((b.order_transport.as_str(), b.signing.as_str()), ("ws", "ed25519"));
+        let rest = parse(&with("order_transport = \"rest\"\nsigning = \"hmac\"")).unwrap();
+        let rb = rest.binance.unwrap();
+        assert_eq!((rb.order_transport.as_str(), rb.signing.as_str()), ("rest", "hmac"));
+        expect_err(&with("signing = \"hmac\""), "needs `order_transport = \"rest\"`");
+        expect_err(&with("order_transport = \"fix\""), "`order_transport` must be one of");
+        expect_err(&with("signing = \"rsa\""), "`signing` must be one of");
+        // BX7 (BX-19): the leverage cap every owned row is asserted under.
+        assert_eq!(b.max_leverage, 20, "Binance's own default");
+        assert_eq!(parse(&with("max_leverage = 5")).unwrap().binance.unwrap().max_leverage, 5);
+        expect_err(&with("max_leverage = 0"), "`max_leverage = 0` must be");
+        expect_err(&with("max_leverage = 126"), "`max_leverage = 126` must be");
+        // BX7 (C2): Portfolio Margin is papi's — REST only.
+        let pm = format!("{live}{}", BN_SECTION.replace("account_mode = \"classic\"", "account_mode = \"pm\""));
+        expect_err(&pm, "needs `order_transport = \"rest\"`");
+        let pm_rest = parse(&format!("{pm}order_transport = \"rest\"\nsigning = \"hmac\"\n")).unwrap();
+        assert_eq!(pm_rest.binance.unwrap().account_mode, "pm");
     }
 
     /// BX6: the breadth and maker-TTL knobs are the Binance arm's.

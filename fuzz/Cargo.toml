@@ -15,7 +15,11 @@ cargo-fuzz = true
 [dependencies]
 exec-hyperliquid = { path = "../crates/exec-hyperliquid" }
 # bn_cid / bn_wsapi_frame / bn_user_event / bn_rest_body / bn_account /
-# bn_mode: the BX6 arm's scanners and boot assertions.
+# bn_mode: the BX6 arm's scanners and boot assertions; BX7 widens
+# bn_user_event (every product's and mode's events, the not-cross walk's
+# agreement law, raw ⇔ combined), bn_account (COIN-M and Portfolio Margin's
+# positions) and bn_mode (a row's margin type and leverage, PM's key and
+# unified account), and adds bn_rest_answer (the REST order route's answer).
 exec-binance     = { path = "../crates/exec-binance" }
 # cargo-fuzz runtime.
 libfuzzer-sys = "0.4"
@@ -459,6 +463,13 @@ bench  = false
 [[bin]]
 name   = "bn_mode"
 path   = "fuzz_targets/bn_mode.rs"
+test   = false
+doc    = false
+bench  = false
+
+[[bin]]
+name   = "bn_rest_answer"
+path   = "fuzz_targets/bn_rest_answer.rs"
 test   = false
 doc    = false
 bench  = false

@@ -276,20 +276,78 @@ pub const W_CLOCK_PER_MIN: u64 = 4;
 
 /// **The arm's worst-case steady request weight per minute**: the
 /// dead-man on every one of `max_symbols` rows with a maker, a full
-/// reconciliation every `recon_every_ms`, margin re-reads at their fastest
-/// and the clock. There is no REQUEST_WEIGHT governor at run time (a
-/// departure from §3.9, BX-12): the boot refuses a configuration whose
-/// worst case exceeds [`ARM_WEIGHT_SHARE_1E6`] of [`IP_WEIGHT_PER_MIN`],
-/// and a 429 makes the gateway quiet.
+/// reconciliation every `recon_every_ms` and margin re-reads at their
+/// fastest on each of `lanes` futures products (BX7: UM and CM share the
+/// IP's pool), and the clock. The boot refuses a configuration whose worst case
+/// exceeds [`ARM_WEIGHT_SHARE_1E6`] of [`IP_WEIGHT_PER_MIN`]; at run time
+/// (BX7) the gateway sums what it spends in a one-minute window
+/// ([`request_weight`]) and, past [`WEIGHT_THROTTLE_PCT`] of that share,
+/// defers the one read this model does not count — a reconciliation asked
+/// for before its cadence (a stream's reopen), unless it confirms a sweep —
+/// and publishes the congestion word. What the model counts never waits:
+/// the cycle at its cadence, the paced margin re-read (the half-open
+/// probe's), a cancel, a countdown, an order. A 429 still makes it quiet.
 #[must_use]
-pub const fn arm_weight_per_min(max_symbols: u64, heartbeat_ms: u64, recon_every_ms: u64) -> u64 {
+pub const fn arm_weight_per_min(max_symbols: u64, heartbeat_ms: u64, recon_every_ms: u64, lanes: u64) -> u64 {
     let hb = if heartbeat_ms == 0 { 1 } else { heartbeat_ms };
     let re = if recon_every_ms == 0 { 1 } else { recon_every_ms };
-    W_COUNTDOWN * max_symbols * 60_000 / hb + W_RECON * 60_000 / re + W_ACCOUNT * 60_000 / ACCOUNT_REREAD_MS + W_CLOCK_PER_MIN
+    W_COUNTDOWN * max_symbols * 60_000 / hb + lanes * (W_RECON * 60_000 / re + W_ACCOUNT * 60_000 / ACCOUNT_REREAD_MS) + W_CLOCK_PER_MIN
 }
 
 /// The weight the arm may take: [`ARM_WEIGHT_SHARE_1E6`] of the IP's.
 pub const ARM_WEIGHT_MAX_PER_MIN: u64 = IP_WEIGHT_PER_MIN * ARM_WEIGHT_SHARE_1E6 / 1_000_000;
+
+/// Past this percent of [`ARM_WEIGHT_MAX_PER_MIN`] spent in the last
+/// minute the gateway is THROTTLED (an early reconciliation waits).
+pub const WEIGHT_THROTTLE_PCT: u64 = 80;
+
+/// A request's REQUEST_WEIGHT class (the venue's documented weights; the
+/// WS API and REST share the IP's pool).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Weighed {
+    /// `time`, `listenKey`, `apiRestrictions`, `portfolio/account`,
+    /// `allOpenOrders` — 1.
+    One,
+    /// `positionSide/dual`, `multiAssetsMargin` — 30.
+    ModeRead,
+    /// `countdownCancelAll` — 10.
+    Countdown,
+    /// `openOrders` with no symbol — 40.
+    OpenOrders,
+    /// `userTrades` — 5.
+    UserTrades,
+    /// dapi's `userTrades` with a symbol — 20 (COIN-M, BX7).
+    UserTradesCm,
+    /// An account read (`v2/account.status`, `GET /fapi/v3/account`) — 5.
+    Account,
+    /// `symbolConfig` with a symbol (BX7, BX-19; boot only) — 5.
+    SymbolConfig,
+    /// An order's place — 0 on the IP (it counts on ORDERS).
+    Place,
+    /// An order's cancel, modify or query — 1.
+    OrderVerb,
+    /// `session.logon` — 2.
+    Logon,
+    /// Portfolio Margin's unified account, `GET /papi/v1/account` — 20.
+    PmAccount,
+}
+
+/// [`Weighed`]'s weight.
+#[inline(always)]
+#[must_use]
+pub const fn request_weight(w: Weighed) -> u32 {
+    match w {
+        Weighed::One | Weighed::OrderVerb => 1,
+        Weighed::ModeRead => 30,
+        Weighed::Countdown => W_COUNTDOWN as u32,
+        Weighed::OpenOrders => 40,
+        Weighed::UserTrades | Weighed::Account | Weighed::SymbolConfig => 5,
+        Weighed::UserTradesCm => 20,
+        Weighed::Place => 0,
+        Weighed::Logon => 2,
+        Weighed::PmAccount => 20,
+    }
+}
 
 // -------------------------------------------------------------------------
 // The venue-code law
@@ -434,10 +492,13 @@ mod tests {
     #[test]
     fn the_steady_weight_is_judged_at_boot() {
         // 20 symbols × 10 × 6 + 45 + 60 + 4.
-        assert_eq!(arm_weight_per_min(20, 10_000, 60_000), 1_309);
-        assert!(arm_weight_per_min(20, 10_000, 60_000) <= ARM_WEIGHT_MAX_PER_MIN);
-        assert!(arm_weight_per_min(20, 1_000, 60_000) > ARM_WEIGHT_MAX_PER_MIN);
-        assert!(arm_weight_per_min(49, 10_000, 60_000) > ARM_WEIGHT_MAX_PER_MIN);
+        assert_eq!(arm_weight_per_min(20, 10_000, 60_000, 1), 1_309);
+        assert!(arm_weight_per_min(20, 10_000, 60_000, 1) <= ARM_WEIGHT_MAX_PER_MIN);
+        assert!(arm_weight_per_min(20, 1_000, 60_000, 1) > ARM_WEIGHT_MAX_PER_MIN);
+        assert!(arm_weight_per_min(49, 10_000, 60_000, 1) > ARM_WEIGHT_MAX_PER_MIN);
+        // BX7: COIN-M's lane reads its own account and orders: + 45 + 60.
+        assert_eq!(arm_weight_per_min(20, 10_000, 60_000, 2), 1_414);
+        assert!(arm_weight_per_min(20, 10_000, 60_000, 2) <= ARM_WEIGHT_MAX_PER_MIN);
         assert_eq!(ARM_WEIGHT_MAX_PER_MIN, 1_440);
     }
 

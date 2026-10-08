@@ -54,6 +54,10 @@ pub const BN_ROW_TRADFI: u8 = 1 << 0;
 /// [`BnSymbolRow::flags`]: an inverse (coin-margined) contract — the row
 /// carries a `contractSize` (COIN-M).
 pub const BN_ROW_INVERSE: u8 = 1 << 1;
+/// [`BnSymbolRow::flags`] (BX7): the row names its `marginAsset` (futures).
+pub const BN_ROW_MARGIN_NAMED: u8 = 1 << 2;
+/// [`BnSymbolRow::flags`] (BX7): the margin asset it names is USDT.
+pub const BN_ROW_MARGIN_USDT: u8 = 1 << 3;
 
 /// [`BnPermissions::names`]: `SPOT`.
 pub const BN_PERM_SPOT: u16 = 1 << 0;
@@ -438,6 +442,14 @@ impl BnSymbolRow {
     pub fn is_tradfi(&self) -> bool {
         self.flags & BN_ROW_TRADFI != 0
     }
+
+    /// BX7: a futures row that names `marginAsset` `USDT` — the one asset
+    /// a classic USDⓈ-M account's single-asset totals (its margin ratio,
+    /// its session equity) count. A row naming none is not.
+    #[inline]
+    pub fn is_usdt_margined(&self) -> bool {
+        self.flags & BN_ROW_MARGIN_USDT != 0
+    }
 }
 
 /// Why discovery ingestion failed. All fatal at boot.
@@ -667,6 +679,17 @@ fn parse_row(body: &[u8], pos: usize, out: &mut BnSymbolRow) -> Result<usize, Bn
                     b"underlyingType" => {
                         let (s, end) = quoted_span(body, i)?;
                         out.underlying = BnUnderlying::of(s);
+                        i = end;
+                    }
+                    // BX7: a futures row's margin asset, named once — a
+                    // second copy, agreeing or not, refuses the row (as a
+                    // second lifecycle does).
+                    b"marginAsset" => {
+                        if out.flags & BN_ROW_MARGIN_NAMED != 0 {
+                            return Err(BnDiscoveryErr::BadRow);
+                        }
+                        let (s, end) = quoted_span(body, i)?;
+                        out.flags |= BN_ROW_MARGIN_NAMED | if s == b"USDT" { BN_ROW_MARGIN_USDT } else { 0 };
                         i = end;
                     }
                     b"underlyingSubType" => {
@@ -1365,6 +1388,7 @@ mod tests {
     fn a_tradfi_usdm_row_keeps_notional_band_and_flags() {
         let mut d = BnDiscovery::new();
         d.ingest_body(FAPI_TRADFI_ROW).expect("tradfi row");
+        assert!(d.find(b"XAUUSDT").expect("row").is_usdt_margined(), "BX7: margined in USDT");
         let r = d.find(b"XAUUSDT").expect("row");
         assert_eq!(r.contract_type, BnContractType::Perpetual);
         assert!(r.is_tradfi());
@@ -1385,6 +1409,25 @@ mod tests {
             BN_PERM_GRID | BN_PERM_COPY | BN_PERM_RPI | BN_PERM_DCA | BN_PERM_PSB
         );
         assert_eq!(r.perm.group_count, 0);
+    }
+
+    /// BX7: a futures row's margin asset is kept — USDT, another (USDC's,
+    /// COIN-M's coin), or none named — and a second copy refuses the row.
+    /// Break-and-watch: without the key every row reads as named none.
+    #[test]
+    fn a_futures_row_keeps_its_margin_asset() {
+        let mut d = BnDiscovery::new();
+        d.ingest_body(DAPI_ROWS).expect("dapi rows");
+        let perp = d.find(b"BTCUSD_PERP").expect("row");
+        assert!(perp.flags & BN_ROW_MARGIN_NAMED != 0 && !perp.is_usdt_margined(), "COIN-M margins in its coin");
+        let usdc = br#"{"symbols":[{"symbol":"BTCUSDC","status":"TRADING","marginAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]}]}"#;
+        d.ingest_body(usdc).expect("usdc row");
+        assert!(!d.find(b"BTCUSDC").expect("row").is_usdt_margined());
+        let none = br#"{"symbols":[{"symbol":"ETHUSDT","status":"TRADING","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.01"},{"filterType":"LOT_SIZE","stepSize":"0.001"}]}]}"#;
+        d.ingest_body(none).expect("a row naming none");
+        assert_eq!(d.find(b"ETHUSDT").expect("row").flags & (BN_ROW_MARGIN_NAMED | BN_ROW_MARGIN_USDT), 0);
+        let twice = br#"{"symbols":[{"symbol":"SOLUSDT","status":"TRADING","marginAsset":"USDT","marginAsset":"USDT"}]}"#;
+        assert_eq!(BnDiscovery::new().ingest_body(twice), Err(BnDiscoveryErr::BadRow));
     }
 
     #[test]

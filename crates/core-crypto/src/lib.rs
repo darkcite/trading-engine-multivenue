@@ -54,6 +54,12 @@ pub const SHA256_BLOCK: usize = 64;
 /// SHA-256 digest size in bytes.
 pub const SHA256_LEN: usize = 32;
 
+/// The most bytes [`Sha256::finalize_in_place`] writes after the message:
+/// the padding's `0x80`, its zeros and the 8-B bit length — 72 when the
+/// message's last block holds 56..=63 bytes and the length spills into a
+/// second block.
+pub const SHA256_PAD_MAX: usize = SHA256_BLOCK + 8;
+
 /// FIPS 180-4 §4.2.2 round constants.
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -108,6 +114,8 @@ impl Sha256 {
         let mut i = 0usize;
 
         // Top up a partially-filled block first.
+        // COPY: the input's head (< 64 B) completes the block the last call
+        // stashed — a streaming hash's own; see the tail below.
         if self.buf_len > 0 {
             while self.buf_len < SHA256_BLOCK && i < data.len() {
                 self.buf[self.buf_len] = data[i];
@@ -115,23 +123,25 @@ impl Sha256 {
                 i += 1;
             }
             if self.buf_len == SHA256_BLOCK {
-                let block = self.buf;
-                compress(&mut self.state, &block);
+                compress(&mut self.state, &self.buf);
                 self.buf_len = 0;
             }
         }
 
-        // Whole blocks straight from the input — no copy into `buf`.
+        // Whole blocks straight from the input — no copy into `buf`, none
+        // onto the stack: a fixed-size view of the input itself (the loop
+        // condition holds its length, so the view always forms).
         while i + SHA256_BLOCK <= data.len() {
-            // Borrow a fixed-size view; the length is checked by the
-            // loop condition so the conversion cannot fail.
-            let mut block = [0u8; SHA256_BLOCK];
-            block.copy_from_slice(&data[i..i + SHA256_BLOCK]);
-            compress(&mut self.state, &block);
+            if let Ok(block) = <&[u8; SHA256_BLOCK]>::try_from(&data[i..i + SHA256_BLOCK]) {
+                compress(&mut self.state, block);
+            }
             i += SHA256_BLOCK;
         }
 
-        // Stash the tail.
+        // COPY: the input's tail (< 64 B) into the context's block — a
+        // streaming hash keeps its partial block between calls — rejected
+        // where the caller owns room after its message: it finishes in
+        // place instead ([`Self::finalize_in_place`], the HMAC signer).
         while i < data.len() {
             self.buf[self.buf_len] = data[i];
             self.buf_len += 1;
@@ -139,9 +149,10 @@ impl Sha256 {
         }
     }
 
-    /// Pad, process the final block(s), and return the 32-byte digest.
-    /// Consumes the context (`self` is `Copy`; reuse requires `new()`).
-    pub fn finalize(mut self) -> [u8; SHA256_LEN] {
+    /// Pad, process the final block(s), and return the 32-byte digest —
+    /// in place: the context is borrowed, never moved or copied, and is
+    /// spent (reuse requires `new()`).
+    pub fn finalize(&mut self) -> [u8; SHA256_LEN] {
         let bit_len = self.total_len.wrapping_mul(8);
 
         // Append the 0x80 terminator.
@@ -155,8 +166,7 @@ impl Sha256 {
                 self.buf[self.buf_len] = 0;
                 self.buf_len += 1;
             }
-            let block = self.buf;
-            compress(&mut self.state, &block);
+            compress(&mut self.state, &self.buf);
             self.buf = [0; SHA256_BLOCK];
             self.buf_len = 0;
         }
@@ -167,13 +177,54 @@ impl Sha256 {
             self.buf[self.buf_len] = 0;
             self.buf_len += 1;
         }
+        // COPY: the 8-B length field into the last block — the padding's
+        // own write.
         self.buf[SHA256_BLOCK - 8..].copy_from_slice(&bit_len.to_be_bytes());
-        let block = self.buf;
-        compress(&mut self.state, &block);
+        compress(&mut self.state, &self.buf);
+        self.digest()
+    }
 
+    /// **Absorb `buf[..len]` and finish, padding INSIDE `buf`** (BX7) — the
+    /// zero-copy finish for a caller that owns room after its message
+    /// (`buf.len() ≥ len + SHA256_PAD_MAX`): whole blocks are hashed
+    /// straight from `buf`, the padding is written in place after the
+    /// message (`buf[len..len + pad]`, which the caller then overwrites)
+    /// and the final block(s) compressed from there — no byte of the
+    /// message is stashed in the context, unlike [`Self::update`]'s tail.
+    /// The context must hold no partial block (whole-block `update`s only
+    /// before it, e.g. a 64-B HMAC pad). `None` when it does or the room is
+    /// short. Spends the context.
+    pub fn finalize_in_place(&mut self, buf: &mut [u8], len: usize) -> Option<[u8; SHA256_LEN]> {
+        if self.buf_len != 0 || len > buf.len() || buf.len() - len < SHA256_PAD_MAX {
+            return None;
+        }
+        let bit_len = self.total_len.wrapping_add(len as u64).wrapping_mul(8);
+        let whole = len - len % SHA256_BLOCK;
+        // The final block(s): the tail, `0x80`, zeros, the length — one
+        // block when the tail leaves room for the 9 bytes, else two.
+        let end = whole + if len - whole < SHA256_BLOCK - 8 { SHA256_BLOCK } else { 2 * SHA256_BLOCK };
+        buf[len] = 0x80;
+        buf[len + 1..end - 8].fill(0);
+        // COPY: the 8-B length field after the zeros — the padding's own
+        // write, in the caller's room.
+        buf[end - 8..end].copy_from_slice(&bit_len.to_be_bytes());
+        let mut at = 0;
+        while at < end {
+            if let Ok(block) = <&[u8; SHA256_BLOCK]>::try_from(&buf[at..at + SHA256_BLOCK]) {
+                compress(&mut self.state, block);
+            }
+            at += SHA256_BLOCK;
+        }
+        Some(self.digest())
+    }
+
+    /// The state as the digest (big-endian words).
+    #[inline]
+    fn digest(&self) -> [u8; SHA256_LEN] {
         let mut out = [0u8; SHA256_LEN];
         let mut i = 0;
         while i < 8 {
+            // COPY: each state word (4 B) into the digest — the result.
             out[i * 4..i * 4 + 4].copy_from_slice(&self.state[i].to_be_bytes());
             i += 1;
         }
@@ -267,22 +318,23 @@ pub fn sha256(data: &[u8]) -> [u8; SHA256_LEN] {
 
 /// HMAC-SHA256 of `msg` under `key`. Keys longer than the 64-byte
 /// block are pre-hashed per RFC 2104. Zero-alloc: two stack contexts
-/// and two 64-byte pads.
+/// and two 64-byte pads, the key XORed straight into them (no copy of
+/// it; the zero bytes past a short key leave the pads' constants).
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; SHA256_LEN] {
-    let mut key_block = [0u8; SHA256_BLOCK];
-    if key.len() > SHA256_BLOCK {
-        let digest = sha256(key);
-        key_block[..SHA256_LEN].copy_from_slice(&digest);
+    // A key longer than the block is its digest (RFC 2104 §2).
+    let long;
+    let k: &[u8] = if key.len() > SHA256_BLOCK {
+        long = sha256(key);
+        &long
     } else {
-        key_block[..key.len()].copy_from_slice(key);
-    }
-
-    let mut ipad = [0u8; SHA256_BLOCK];
-    let mut opad = [0u8; SHA256_BLOCK];
+        key
+    };
+    let mut ipad = [0x36u8; SHA256_BLOCK];
+    let mut opad = [0x5cu8; SHA256_BLOCK];
     let mut i = 0;
-    while i < SHA256_BLOCK {
-        ipad[i] = key_block[i] ^ 0x36;
-        opad[i] = key_block[i] ^ 0x5c;
+    while i < k.len() {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
         i += 1;
     }
 
@@ -307,6 +359,7 @@ pub const HMAC_TAG16_LEN: usize = 16;
 pub fn hmac_sha256_tag16(key: &[u8], msg: &[u8]) -> [u8; HMAC_TAG16_LEN] {
     let full = hmac_sha256(key, msg);
     let mut out = [0u8; HMAC_TAG16_LEN];
+    // COPY: the tag's leftmost 16 B out of the 32-B digest — the result.
     out.copy_from_slice(&full[..HMAC_TAG16_LEN]);
     out
 }
@@ -515,6 +568,42 @@ mod tests {
             })
         );
         assert_ne!(hex(&sha256(&v55)), hex(&sha256(&v56)));
+    }
+
+    /// BX7: finishing in place equals the streaming finish at every
+    /// message length around the block and padding bounds, after a
+    /// whole-block prefix (an HMAC pad) or none; the padding stays in the
+    /// caller's room and the message is untouched; a context holding a
+    /// partial block, or a room short of `SHA256_PAD_MAX`, is refused.
+    #[test]
+    fn finalize_in_place_matches_the_streaming_finish() {
+        let msg: [u8; 200] = core::array::from_fn(|i| (i * 7 + 3) as u8);
+        let mut len = 0;
+        while len <= msg.len() {
+            for prefix in [false, true] {
+                let (mut s, mut p) = (Sha256::new(), Sha256::new());
+                if prefix {
+                    s.update(&[0x36; SHA256_BLOCK]);
+                    p.update(&[0x36; SHA256_BLOCK]);
+                }
+                s.update(&msg[..len]);
+                let want = s.finalize();
+                let mut buf = [0xAAu8; 200 + SHA256_PAD_MAX + 8];
+                buf[..len].copy_from_slice(&msg[..len]);
+                assert_eq!(p.finalize_in_place(&mut buf[..len + SHA256_PAD_MAX], len), Some(want), "len {len}, prefix {prefix}");
+                assert_eq!(&buf[..len], &msg[..len], "the message is untouched");
+                assert!(buf[len + SHA256_PAD_MAX..].iter().all(|b| *b == 0xAA), "nothing past the room");
+            }
+            len += 1;
+        }
+        let mut buf = [0u8; 128];
+        let mut h = Sha256::new();
+        h.update(b"abc");
+        assert_eq!(h.finalize_in_place(&mut buf, 3), None, "a partial block in the context");
+        let mut h = Sha256::new();
+        assert_eq!(h.finalize_in_place(&mut buf[..80], 9), None, "a room short of SHA256_PAD_MAX");
+        let mut h = Sha256::new();
+        assert_eq!(h.finalize_in_place(&mut buf[..81], 9), Some(sha256(&[0u8; 9])));
     }
 
     // ---- HMAC-SHA256 (RFC 4231) ----

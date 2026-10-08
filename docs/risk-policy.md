@@ -7011,7 +7011,8 @@ phase (BX7–BX10; "shared" is refused outright).
   session's first reconciled equity and persisted beside `exec.toml` in
   `binance-pnl-anchor.state`, keyed by an 8-byte SHA-256 tag of the API
   key. Deposits and transfers move it; rotating the key starts a new
-  session; deleting the file ends one. The anchor is offered to the
+  session (**BX7: it refuses the boot until the file is deleted**,
+  below); deleting the file ends one. The anchor is offered to the
   journal ring until it takes it, and the writer retries a failed store
   every second; until it lands the pulse raises `EVT_F_ANCHOR_UNSAVED`
   (`BnArm::anchor_unsaved`), and a process ending with it unsaved logs
@@ -7026,7 +7027,7 @@ phase (BX7–BX10; "shared" is refused outright).
   tells `UNRECONCILED`, and the slot stays unseeded until someone
   flattens it by hand — there is no flatten tool before BX11. A lost
   fill on a leg booked flat reads as unseen and halts only via
-  `ReconStale`.
+  `ReconStale`. **Superseded by BX7** (adoption within the cap, below).
 * (d) The 23 h rotation is break-before-make at a quiet moment. The user
   stream is not rotated: the venue's 24 h cut is a daily reopen, a
   `doubt_all` and a burst of status queries (at most 256 in flight).
@@ -7041,7 +7042,8 @@ phase (BX7–BX10; "shared" is refused outright).
 * **Shared scope refused.** On a shared account a foreign fill on an
   owned instrument would only be counted (O-BX2a wants a halt), and the
   sweep's REST fallback cancels every order on a symbol.
-* **No REQUEST_WEIGHT governor at run time** (§3.9, BX-12). The boot
+* **No REQUEST_WEIGHT governor at run time** (§3.9, BX-12; **closed by
+  BX7**: the kit's `RateWindow`, below). The boot
   refuses a configuration whose worst steady weight exceeds the arm's
   1 440 of the IP's 2 400 a minute (`gov::arm_weight_per_min`: the
   dead-man 10 per maker row per heartbeat, a reconciliation of 45 every
@@ -7139,7 +7141,8 @@ phase (BX7–BX10; "shared" is refused outright).
   never asserted (§3.12's assertion is BX7's; isolated-margin
   liquidation is invisible to the ratio; a mid-session switch to hedge
   mode surfaces as a scan failure, `ReconDrift` at MAX, not
-  `VenueLock`).
+  `VenueLock`). **Closed by BX7** (below), except the hedge-mode switch,
+  which still surfaces as a scan failure.
 * Gate 94, the live-socket allocation gate, is due before BX13.
 * `/state` omits jobs dropped, doubts raised, fills deferred, journal
   drops, refusals by reason, budget and lock counts and the anchor flag
@@ -7147,13 +7150,15 @@ phase (BX7–BX10; "shared" is refused outright).
 * No test yet for a Binance fill rolling the ledger's day (B3 is tested
   at the stamp), `go_quiet` with a named end, the probe's
   `countdownTime=0`, or a lock at boot, a restart with a position, the
-  margin and scan-failure halts end to end.
+  margin and scan-failure halts end to end. **Closed by BX7** (each has
+  its test now).
 
 #### Still gated
 
 BX13 proving a live fill on the user stream before any member arms;
-K2, K5, K11/R20; BX7 (adoption, make-before-break, COIN-M, PM, PM Pro);
-BX11 (the flatten tool, observability); the Stage-3 member gate.
+K2, K5, K11/R20; BX7 (adoption, make-before-break, COIN-M, PM, PM Pro —
+built by BX7, below; its venue proof is BX7b's); BX11 (the flatten tool,
+observability); the Stage-3 member gate.
 
 #### The reviews
 
@@ -7166,6 +7171,315 @@ BX11 (the flatten tool, observability); the Stage-3 member gate.
 | 2 | zero-copy | PASS; the logon's markers; six nits | all acted on |
 | 2 | risk | APPROVE WITH CONDITIONS: S1 lost fills, S2 half-open session, S3 `-2011`, S4 stalled sweep, S5 weight, S6 ban length, S7 id reuse, S8 anchor drop; N1–N9 | all fixed (N8, N9 recorded) |
 | 3 | risk (verification) | APPROVE WITH CONDITIONS: F1 the ACK did not send a parked cancel; F2 a failed anchor store was silent; five nits | all fixed, F1 and F2 each with a test that fails without it |
+
+### BX7 — futures on the shared gateway kit (2026-10-08) — ARMABLE, and no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX7; the operator's rulings of
+2026-10-08: offline-first; the gateway onto `exec-gateway` first; one
+commit; adopt within caps; require CROSSED; fail-closed across lanes;
+"commit BX7 now, battery later"). It reaches the engine only through a
+merge to `main`, a release build and a restart. **Scope:** USDⓈ-M and
+COIN-M futures × the classic, Portfolio Margin (`pm`) and PM Pro
+(`pm_pro`) accounts; a dedicated account; one owner slot. Makers on
+USDⓈ-M classic only — the one dead-man of ours that is proven (BX-17).
+COIN-M (O-BX3a), Portfolio Margin (K13) and PM Pro (K14) are IoC-only.
+Spot, options and Binance Stocks still refuse the boot naming their phase
+(BX8–BX10); "shared" is still refused. **Nothing of BX7 is proven on a
+venue:** the Demo battery and the K-probes are their own phase (BX7b),
+and PM and PM Pro have no Demo at all.
+
+#### Arming — what changes from BX6
+
+* **A new arming precondition — adopted fills.** Every member trading a
+  Binance slot reads `FILL_FLAG_ADOPTED` (core-types, `Fill::is_adopted`)
+  as opening inventory, never a trade, before it arms (BX13). BX-14's
+  trade statistics exclude `J_FILL_ADOPTED`, as they exclude
+  `J_FILL_UNSEEN`. **The worker cannot see the bit:** its PMLR reader
+  (`claude_worker/pmlr.py`, `_FILL` = `<QIBBBxqqQ`) skips byte 15 as
+  padding, so any worker verb that folds fills (`positions`, …) counts an
+  adopted fill — and a settlement — as a trade. Reading the flag there is
+  an arming precondition for any worker surface that folds Binance fills.
+* **A new arming precondition — body-form DELETEs.** The REST route's
+  cancel and the sweep's emergency `DELETE allOpenOrders` now carry their
+  parameters in the body, as every order verb does. This is proven on
+  loopback only. If the venue, or anything between it and us, ignored a
+  DELETE's body, every one would be refused (`-1102`): the sweep's REST
+  fallback would strand, and only the dead-man would clear makers. BX7b
+  proves both on Demo before anything arms.
+* **The recipe is BX6's, plus** `account_mode`, `products`,
+  `order_transport` (`ws` | `rest`; `pm` needs `rest`), `signing`
+  (`ed25519` | `hmac`; `hmac` needs `rest` and reads
+  `BINANCE_HMAC_API_KEY` / `BINANCE_HMAC_SECRET_KEY`, names only) and
+  `max_leverage`. The tell names each product's order kinds, the account
+  mode, the order route, the key type and the leverage cap — marked
+  NOT asserted under `pm`.
+* The O-BX18 side table covers COIN-M: the margin ratio is per product.
+
+#### The kit (O-XH13)
+
+* The duplex is 1 024 commands / 4 096 events. XG-2 back-pressure: no
+  command is taken while events are held, or while the event ring has
+  under 256 free.
+* The sweep is the stats word: a cancel-all never waits on ring room
+  (XG-1).
+* The halt word: `HALT_OUTPUT_LOST` when an event or a fill finds
+  neither its ring nor the held queue; `HALT_TIMER_FULL`.
+* `Pending<_, 256>` for the WS API ids. One `TimerQueue<2 048>` holds
+  the TTLs, the owed cancels and every request's 5 s deadline.
+* `Mbb` make-before-break serves the 23 h rotation and the venue's
+  `serverShutdown`. A request unanswered for 5 s is still a cold drop:
+  that session cannot cancel (B1).
+* `Idle` parks at most 100 µs and never past a deadline (`spin`).
+* **The run-time weight governor closes BX6's residual.** `RateWindow`
+  sums every request's REQUEST_WEIGHT; the congestion word is published.
+  Past 80 % of the arm's 1 440/min share, the one read the boot's weight
+  model does not count waits: a reconciliation asked for before its
+  cadence (a stream's reopen), unless it confirms a sweep. What the model
+  counts never waits — the cycle at its cadence (so the margin, the bound
+  and the staleness keep their samples), the paced margin re-read and the
+  half-open probe it carries, every cancel, countdown and order: a
+  configuration the boot accepted (up to 100 % of the share) must run.
+  Under papi's 6 000/min pool the share stays the classic one
+  (conservative).
+
+#### Lanes, and fail-closed across them (the operator's ruling)
+
+* One gateway thread, one lane per armed futures product, USDⓈ-M first.
+  The lanes share the open-order table, the held queue and lane 4, the
+  journal, the signer, the clock, the weight window and the ORDERS
+  governor.
+* ORDER_UP and DEADMAN_OK hold only while every lane is up, and the gap
+  is the longest lane's: one lane's outage stops every admission. A
+  reconciliation cycle reads every lane and judges every leg once; a
+  lane that cannot read fails the cycle.
+* **COIN-M** follows the inverse law: contracts × face / price, and an
+  inverse leg is valued at its face. The margin ratio is per product
+  (`EVT_MARGIN.product`): the riskiest asset's. No countdown is ever sent
+  on dapi.
+
+#### Portfolio Margin and PM Pro
+
+* **PM** is papi REST only (the route is forced), with one stream for the
+  account (`/pm/ws/`; each event routed by its `fs`) and the clock on
+  SAPI's `/api/v3/time`.
+* **PM Pro** keeps the classic routes and streams; its unified account is
+  read on SAPI. The `/pm-classic/ws/` risk stream rides the USDⓈ-M lane's
+  key and is risk guidance only: its outage gates nothing, because the
+  status is read every cycle. With only COIN-M armed under PM Pro there
+  is no risk stream.
+* **The unified account is the cycle's last step** (`ReconStep::Unified`).
+  No verdict is given without a 200 that scans. Any other answer fails
+  the cycle (`GW_RECON_FAILED`), so `halt_on_recon_stale_ms` halts the
+  slot. A boot needs one good read: in PM it times out in its first
+  reconciliation; in PM Pro the mode probe is the same read and refuses
+  it first.
+* The ratio is `accountMaintMargin / accountEquity`, on every product.
+  * `accountStatus` MARGIN_CALL or SUPPLY_MARGIN is a margin call.
+  * REDUCE_ONLY, ACTIVE_LIQUIDATION, FORCE_LIQUIDATION, BANKRUPTED or an
+    unknown word is a `VenueLock` (9 011, `CODE_PM_ACCOUNT`).
+  * `riskLevelChange`: NORMAL changes nothing; MARGIN_CALL is a margin
+    call, priced from the event, with the account re-read; any other
+    level is a `VenueLock` (9 010, `CODE_PM_RISK`), and is not quiet.
+* On a classic stream, an event naming `fs` is a scan failure (unbounded
+  drift), never read as PM's; on PM's stream, an order, account or
+  configuration event naming none is one too, never read as the first
+  lane's.
+
+#### Margin type and leverage (BX-19; the operator's ruling "Require CROSSED")
+
+* **At boot:**
+  * USDⓈ-M (classic, PM Pro): `GET /fapi/v1/symbolConfig` per owned row
+    must show CROSSED at most `max_leverage`.
+  * COIN-M (classic, PM Pro): the first account read must list every
+    owned row, cross, with leverage at least 1 and at most the cap.
+  * The refusals are `AssertErr::Isolated`, `Leverage` and `Unlisted`.
+  * **Residual:** under Portfolio Margin nothing asserts the leverage
+    (papi's reads do not carry it; `positionRisk` would). The margin is
+    cross by construction.
+* **Mid-session**, each of these is a `VenueLock` (the arm halts the
+  owner slot):
+  * **9 013 `CODE_MARGIN_TYPE`:** an `ACCOUNT_UPDATE` position on an owned
+    row that is not cross (a classic stream's position without `mt`
+    counts as not cross), or a COIN-M read showing an owned row
+    isolated.
+  * **9 012 `CODE_CONFIG`:** ANY leverage change on an owned row
+    (`ACCOUNT_CONFIG_UPDATE` — stricter than the cap); multi-assets turned
+    on (USDⓈ-M classic); a COIN-M read above the cap, or no longer listing
+    an owned perpetual (a dated contract may leave at delivery).
+  * **9 010 / 9 011:** PM's risk level and account status (above).
+* **9 014 `CODE_SWEPT` is not a lock:** it is a local REJECT (below).
+
+#### Adoption (the operator's ruling "Adopt within caps"; replaces BX6's departure (c))
+
+* **When it happens.** At the boot's first full reconciliation, on a
+  DEDICATED account whose owner slot names Binance alone, the boot adopts
+  the venue's positions as the owner slot's starting inventory. It takes
+  only positions on owned, LIVE rows that the boot has not booked.
+* **The cap.** Their exposure in all must fit the slot's
+  `cap_instance_usd_1e6`: a linear leg at the read's mark, an inverse one
+  at its face. The boot is refused (`BootErr::Inventory`), with nothing
+  booked, when:
+  * the exposure is past the cap;
+  * a linear leg has no price;
+  * the legs need more room than the held queue has (two records a row,
+    and the cycle's own two).
+* **What adopts nothing.** A shared account and a row the arm cannot
+  trade (not live) adopt nothing: the leg stays unseen, and the slot
+  unreconciled until it is flattened by hand. A slot naming another venue
+  has a cap of 0, so a position on an owned, live row refuses the boot
+  (`BootErr::Inventory`). A leg already booked is not adopted again: any
+  difference is drift.
+* **The booking.** Each row is one fill flagged `FILL_FLAG_ADOPTED`,
+  journalled `J_FILL | J_FILL_ADOPTED`. The ledger moves the position
+  only: no day turnover, no resting order consumed.
+* **The seeding order.** The day report, which seeds the slot, waits
+  until lane 4 is drained, so the router holds the inventory before it
+  seeds. A refused boot adopts and journals nothing.
+* **Audit.** audit-pnl's paper view reads an adopted fill as opening
+  inventory; one without a price (an inverse leg) opens at the symbol's
+  mark.
+
+#### The session bound (E7), by account mode
+
+* **One USD equity.** On a classic account it is USDⓈ-M's
+  `totalMarginBalance`; in PM and PM Pro, the unified account's
+  `accountEquity`.
+* **COIN-M has none:** it margins in each coin. So a bounded classic arm
+  that trades COIN-M — alone or beside USDⓈ-M — refuses the boot.
+  `check_binance` refuses it on the armed products, and `bn_live` on
+  the rows bound.
+* **A classic account's totals count USDT's alone** (single-asset mode,
+  BX-19): `totalMarginBalance` and `totalMaintMargin` — the session
+  equity and the margin ratio — never see a USDⓈ-M contract margined in
+  USDC. So a classic arm binds only USDⓈ-M rows whose discovery names
+  `marginAsset` USDT; any other, or one naming none, refuses the boot.
+  PM and PM Pro read the unified account and bind them.
+* **The anchor file is one session's.** Its line names the account mode
+  beside the key's tag. A boot under another key, or in another mode,
+  refuses until the operator deletes the file, which ends the session:
+  the anchor is never inherited and never silently replaced. An
+  unreadable file refuses too.
+  * `signing = "hmac"` signs with another key, so toggling it ends the
+    session the same way.
+  * A line written before BX7 is a classic session's.
+
+#### The REST order route and HMAC
+
+* **The route.** `order_transport = "rest"` sends one request at a time
+  on its own keep-alive connection. Every order verb is body-form
+  (`POST`/`PUT`/`DELETE`), and the answers are read as the WS API's, by
+  one judge.
+* **Up and down.** The route is up while its last request was answered. A
+  lost request puts its order in doubt and takes the route down.
+* **A 418 or a 429 it cannot read** (a CDN's page, a code named twice) is
+  still the lock or the budget: the quiet, `VenueLock` / `BudgetFloor`,
+  the order in doubt — as the jobs judge it (`classify(0, http)`).
+* **A sweep first retires what the route still holds unsent.** Places
+  are refused and modifies aborted (`CODE_SWEPT` 9 014, positive, so the
+  reject streak does not move); cancels and reads keep their order.
+* **HMAC** works only by `signing = "hmac"`, on the REST route.
+  Elsewhere it is `BootErr::Signing`, because `session.logon` takes
+  Ed25519 only.
+  * The secret is two mlock'd halves.
+  * The key pads live on the stack and are wiped after each signature.
+  * The inner hash pads inside the request's own window, so no byte is
+    copied out.
+  * The boot self-test signs Binance's documented example along the same
+    path and builds no locked copy of its own (dropping one would
+    `munlock` the live key's page).
+
+#### Scanners fail closed
+
+* **One reading of a key.** Every reader BX7 added or changed refuses a
+  key it reads that one object names twice, so no other reader of the
+  frame can pick another copy. That covers:
+  * the user stream: the top level, `o`, `TRADE_LITE`'s order keys,
+    `a.P`, a position's `s`/`mt`, `ac` and `ai`;
+  * every account read and the mode judges;
+  * a WS API answer (an event's name too) and its `result`;
+  * the refusal code, read from ONE whole, well-formed object (bytes
+    after it, or a pair it cannot walk, is no code).
+
+  An answer naming a `result` AND an `error` is refused. Of several ban
+  ends a 418 names, the latest stands.
+* A REST 200's body is one JSON object, whole: bytes after it are
+  refused.
+* Any WS API answer except a 200 must carry a code. A code-less 204
+  would retire an order the venue may hold.
+* Numerals are read whole (at most 18 digits, `json::i64_of`). K17's
+  code is never read through `core_parse::scan_i64` (escalated, below).
+
+#### DNS
+
+* A host whose connections fail to establish 3 times in a row is
+  resolved again, and again after every 3 more. The resolution runs on a
+  cold thread (`bn-dns`), never `getaddrinfo` on the gateway thread. The
+  answer goes to every connection on the host, for its next dial. The
+  thread is serving before the boot goes on.
+
+#### Residuals (new)
+
+* **Unproven on a venue.** Everything above runs on loopback only. BX7b
+  covers:
+  * the Demo battery (`exec-smoke --binance {um,cm}`);
+  * K11 (the Demo WS API with the Ed25519 key), K19 (Ed25519 on Demo
+    REST), K20, K16 (the dapi countdown), K5, the account mode;
+  * the body-form DELETEs (an arming precondition, above).
+
+  PM and PM Pro have no Demo: proving them needs such accounts and the
+  operator's arming.
+* **TradFi:** there is no endpoint to query the agreement. The first
+  order on an unsigned row is refused `-4411` (RowFatal: that row stops,
+  the others trade). Signing is `exec-smoke --binance setup`'s job.
+* A COIN-M fill's commission is in the margin asset (journal only).
+* A fill booked without its trade on an inverse row is priced by the
+  linear form; the exact form is harmonic. The error is tiny, on a rare
+  path.
+* The anchor's journal-ring retry (S8) has no test: a journal-capacity
+  knob is BX11's.
+* PM's leverage is not asserted (above), and PM Pro with COIN-M alone has
+  no risk stream (guidance only).
+* **Escalated outside the lane:** `core_parse::scan_i64` negates without
+  an overflow check. ingress-rpc, exec-hyperevm (`rpc.rs`),
+  ingress-deribit, ingress-okx and ingress-mexc still call it.
+
+#### BX6 residuals this closes
+
+* The run-time REQUEST_WEIGHT governor.
+* DNS resolved once per boot.
+* `ACCOUNT_CONFIG_UPDATE` ignored, and margin type and leverage never
+  asserted.
+* Departure (c): no adoption.
+* No make-before-break.
+* The open tests: a lock at boot, a restart with a position, the margin
+  and scan-failure halts end to end, `go_quiet` with a named end, the
+  probe's `countdownTime=0`, a fill rolling the ledger's day.
+
+#### Still gated
+
+* BX7b: the Demo battery, the K-probes, the body-form DELETEs.
+* BX13: a live fill on the user stream; members read adopted fills.
+* K2, K5.
+* BX11: the flatten tool, observability, gate 94.
+* BX8–BX10.
+* The Stage-3 member gate.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: R1 COIN-M's leverage and margin type passed when absent, and fell silent once ready; R2 PM's unified account judged after the verdict, its failures silent; R3 a session bound on classic COIN-M could never fire; 7 SHOULD-FIX, 5 NIT | all fixed, each with a test that fails without it |
+| 1 | zero-copy | FAIL: the REST cancel's query copied into the window; the SHA-256 block staged on the stack; 5 cold copies | body-form DELETEs; full blocks hashed in place; the cold ones removed or marked |
+| 1 | alloc | PASS; gate gaps (the DNS tick, COIN-M's fields, `ACCOUNT_CONFIG_UPDATE`), a quadratic walk, boot temporaries | gate 107; gates 93 and 105 widened; one pass (`NotCross`); `boxed_array` |
+| 1 | parser | FAIL: a walk disagreeing with the scan (a key named twice); a panic in `judge_mode`; fail-open saturation and missing fields | the one-reading law; codes read whole; counts exact; fields required |
+| 2 | risk | BLOCK: N1 a bounded classic arm with COIN-M judged USDⓈ-M's equity alone; N2 the anchor blind to the account mode; N3–N9 docs and nits | refused; the anchor names the mode and refuses another key or mode; all fixed |
+| 2 | zero-copy | FAIL: N1 the HMAC tail stashed in the hash's block; N2 the key copied into a block; N3 the host table; C3 a shrink | in-window padding (`finalize_in_place`); the key XORed into the pads; one table by value; the lanes reserved exactly |
+| 2 | alloc | PASS; the adoption room counted one record a row (two) | two a row |
+| 2 | parser | FAIL: NEW-1 a REST 200 read past its object; NEW-2 three readers outside the one-reading law; NEW-3 a model | whole objects; the law in every order reader and the refusal code; the model fixed |
+| 3 | risk | NEEDS-DOCS: N1–N9 fixed; 1 the throttle starved the cadence the boot accepted; 2 an unreadable 418/429 on the REST route skipped the quiet; 3 classic totals blind to USDC-margined rows; 4 the adoption text; 5–7 nits | the model's reads never throttled; the quiet and the halt; non-USDT rows refused on classic; the text fixed; all nits acted on — each with a test |
+| 3 | zero-copy | PASS; four cold nits (an unbounded anchor read, a table moved into an iterator, two markers) and the streaming hash's unmarked block | all acted on |
+| 3 | alloc | PASS; borderlines (the cycle's two events beside the adoption room; a bounds-checked zero-fill) | both acted on |
+| 3 | parser | PASS; R3-1 the refusal code read off a malformed or trailing body; three nits | whole objects for the code; an event's name once; `result` with `error` refused; the latest ban end |
 
 ## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
 

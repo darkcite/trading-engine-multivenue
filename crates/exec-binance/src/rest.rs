@@ -3,19 +3,29 @@
 
 //! **Signed REST (plan §3.3; BX4 and BX5 carried).** Gateway thread.
 //!
-//! USDⓈ-M × classic needs REST for what its WS API does not carry: the
-//! listenKey, the dead-man (`countdownCancelAll`, BX-17), the sweep's
-//! fallback while the order session is down (`DELETE allOpenOrders`), the
-//! time, the open orders and the day's trades (recon, obligation 8), and
-//! the boot assertions (BX-19).
+//! The futures × classic paths need REST for what their WS API does not
+//! carry: the listenKey, the dead-man (`countdownCancelAll`, BX-17), the
+//! sweep's fallback while the order session is down (`DELETE
+//! allOpenOrders`), the time, the open orders and the day's trades (recon,
+//! obligation 8), and the boot assertions (BX-19). USDⓈ-M's paths are
+//! fapi's, COIN-M's dapi's (BX7, C1), and in Portfolio Margin each
+//! product's papi paths (BX7, C2): one template table, indexed alike
+//! ([`fut_specs`], [`ord_specs`]); a slot a host has no endpoint for is
+//! never started there.
 //!
 //! **Signing in place** (BX4 carried): the parameters are rendered
 //! contiguously into the connection's own template window
 //! ([`QueryWriter`]), the Ed25519 signature is computed over exactly those
 //! bytes and appended straight after as `&signature=<percent-encoded
 //! base64>` ([`sign_in_place`], one `split_at_mut`, no second buffer).
-//! Order-path verbs would use body-form templates; every call here is cold
-//! (the query form's per-request header tail is a cold copy, BX5).
+//! The REST order route (BX7, C5: `order_transport = "rest"`, the Demo
+//! battery's fallback) renders the WS API's own parameters as a query
+//! ([`render_place`] and its siblings) on its own connection
+//! ([`ord_specs`]); every order verb — the place, the cancel, the modify —
+//! is body-form, as is the sweep's `DELETE allOpenOrders` (core-net's law
+//! for the order path: a query-form request stages its header tail behind
+//! the parameters on every send). HMAC (R22) signs the same bytes
+//! ([`QueryWriter::sign_with`]: `&signature=<hex>`).
 //!
 //! **Answers** are read in place, fail closed: [`scan_error`] (the
 //! venue's `{"code":…,"msg":…}`), [`scan_listen_key`],
@@ -24,46 +34,199 @@
 
 use core_net::{Method, Params, ReqSpec};
 
+use crate::config::{hex_lower, HmacSigner, Signer, HMAC_SIG_HEX};
+use crate::inst::PRODUCT_COINM;
 use crate::json::{bool_of, dec_1e6, i64_of, str_of, u64_of, Elems, Pairs};
 use crate::num::{render_fixed, render_u64, RENDER_MAX};
 use crate::userstream::{side_of, status_of, ScanErr, Span};
+use crate::wsapi::{render_parts, side_word, Part, Place, WsStatic};
 
 /// The form content type.
 pub const FORM: &str = "application/x-www-form-urlencoded";
 /// The API key header.
 pub const KEY_HEADER: &str = "X-MBX-APIKEY";
 
-/// `POST /fapi/v1/listenKey`.
+/// `POST …/v1/listenKey`.
 pub const T_LISTEN_KEY_NEW: usize = 0;
-/// `PUT /fapi/v1/listenKey` (keep-alive).
+/// `PUT …/v1/listenKey` (keep-alive).
 pub const T_LISTEN_KEY_KEEP: usize = 1;
-/// `POST /fapi/v1/countdownCancelAll` (signed).
+/// `POST …/v1/countdownCancelAll` (signed).
 pub const T_COUNTDOWN: usize = 2;
-/// `GET /fapi/v1/time`.
+/// `GET …/v1/time`.
 pub const T_TIME: usize = 3;
-/// `GET /fapi/v1/openOrders` (signed).
+/// `GET …/v1/openOrders` (signed).
 pub const T_OPEN_ORDERS: usize = 4;
-/// `GET /fapi/v1/userTrades` (signed).
+/// `GET …/v1/userTrades` (signed).
 pub const T_USER_TRADES: usize = 5;
-/// `DELETE /fapi/v1/allOpenOrders` (signed): the sweep's fallback (B1).
+/// `DELETE …/v1/allOpenOrders` (signed, body form — BX7): the sweep's
+/// fallback (B1).
 pub const T_CANCEL_ALL: usize = 6;
-/// `GET /fapi/v1/positionSide/dual` (signed).
+/// `GET …/v1/positionSide/dual` (signed).
 pub const T_DUAL: usize = 7;
-/// `GET /fapi/v1/multiAssetsMargin` (signed).
+/// `GET /fapi/v1/multiAssetsMargin` (signed). USDⓈ-M classic only: dapi
+/// and papi have no multi-assets toggle, and the slot is never started
+/// there.
 pub const T_MULTI_ASSETS: usize = 8;
-/// The fapi templates.
-pub const FAPI_TEMPLATES: usize = 9;
+/// `GET …/account` (signed): started only in Portfolio Margin — the
+/// unified account, `/papi/v1/account` (BX7, C2: the ratio, the equity,
+/// the account status). Classic reads its account over the order route.
+pub const T_ACCOUNT: usize = 9;
+/// `GET /fapi/v1/symbolConfig?symbol=…` (signed; BX7, BX-19): an owned
+/// row's margin type and leverage, asserted at boot. USDⓈ-M only — COIN-M's
+/// account read carries both for every symbol, and Portfolio Margin is
+/// cross by construction — so the slot is never started elsewhere.
+pub const T_SYMBOL_CONFIG: usize = 10;
+/// The futures jobs connection's templates.
+pub const FUT_TEMPLATES: usize = 11;
+
+/// papi's connectivity check: what a slot papi has no endpoint for names
+/// (the countdown — K13: no dead-man in PM — the time, multi-assets); it
+/// is never started.
+const PAPI_NONE: &str = "/papi/v1/ping";
+
+/// The jobs connection's paths by template, USDⓈ-M.
+const FAPI_PATHS: [&str; FUT_TEMPLATES] = [
+    "/fapi/v1/listenKey",
+    "/fapi/v1/listenKey",
+    "/fapi/v1/countdownCancelAll",
+    "/fapi/v1/time",
+    "/fapi/v1/openOrders",
+    "/fapi/v1/userTrades",
+    "/fapi/v1/allOpenOrders",
+    "/fapi/v1/positionSide/dual",
+    "/fapi/v1/multiAssetsMargin",
+    "/fapi/v3/account",
+    "/fapi/v1/symbolConfig",
+];
+
+/// The jobs connection's paths by template, COIN-M. Its multi-assets and
+/// symbol-config slots name no dapi endpoint: never started, they would
+/// only ever be refused.
+const DAPI_PATHS: [&str; FUT_TEMPLATES] = [
+    "/dapi/v1/listenKey",
+    "/dapi/v1/listenKey",
+    "/dapi/v1/countdownCancelAll",
+    "/dapi/v1/time",
+    "/dapi/v1/openOrders",
+    "/dapi/v1/userTrades",
+    "/dapi/v1/allOpenOrders",
+    "/dapi/v1/positionSide/dual",
+    "/dapi/v1/multiAssetsMargin",
+    "/dapi/v1/account",
+    "/dapi/v1/symbolConfig",
+];
+
+/// Portfolio Margin's paths by template, USDⓈ-M (papi `um/`).
+const PAPI_UM_PATHS: [&str; FUT_TEMPLATES] = [
+    "/papi/v1/listenKey",
+    "/papi/v1/listenKey",
+    PAPI_NONE,
+    PAPI_NONE,
+    "/papi/v1/um/openOrders",
+    "/papi/v1/um/userTrades",
+    "/papi/v1/um/allOpenOrders",
+    "/papi/v1/um/positionSide/dual",
+    PAPI_NONE,
+    "/papi/v1/account",
+    PAPI_NONE,
+];
+
+/// Portfolio Margin's paths by template, COIN-M (papi `cm/`).
+const PAPI_CM_PATHS: [&str; FUT_TEMPLATES] = [
+    "/papi/v1/listenKey",
+    "/papi/v1/listenKey",
+    PAPI_NONE,
+    PAPI_NONE,
+    "/papi/v1/cm/openOrders",
+    "/papi/v1/cm/userTrades",
+    "/papi/v1/cm/allOpenOrders",
+    "/papi/v1/cm/positionSide/dual",
+    PAPI_NONE,
+    "/papi/v1/account",
+    PAPI_NONE,
+];
 
 /// `GET /sapi/v1/account/apiRestrictions` (signed).
 pub const S_API_RESTRICTIONS: usize = 0;
 /// `GET /sapi/v1/portfolio/account` (signed).
 pub const S_PORTFOLIO: usize = 1;
+/// `GET /api/v3/time`: the clock in Portfolio Margin, whose papi has no
+/// time endpoint (Binance's one server time; BX7, C2).
+pub const S_TIME: usize = 2;
 /// The sapi templates.
-pub const SAPI_TEMPLATES: usize = 2;
+pub const SAPI_TEMPLATES: usize = 3;
 
-/// The fapi connection's templates, every one carrying the key header.
+/// The futures jobs connection's templates for `product` (`PRODUCT_COINM`:
+/// dapi; otherwise fapi) — in Portfolio Margin (`pm`), the product's papi
+/// paths — every one carrying the key header.
 #[must_use]
-pub fn fapi_specs<'a>(key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; FAPI_TEMPLATES] {
+pub fn fut_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; FUT_TEMPLATES] {
+    let p = match (pm, product == PRODUCT_COINM) {
+        (false, false) => &FAPI_PATHS,
+        (false, true) => &DAPI_PATHS,
+        (true, false) => &PAPI_UM_PATHS,
+        (true, true) => &PAPI_CM_PATHS,
+    };
+    let q = |method, t: usize| ReqSpec {
+        method,
+        path: p[t],
+        params: Params::Query,
+        headers: key,
+    };
+    let b = |method, t: usize| ReqSpec {
+        method,
+        path: p[t],
+        params: Params::Body(FORM),
+        headers: key,
+    };
+    [
+        b(Method::Post, T_LISTEN_KEY_NEW),
+        b(Method::Put, T_LISTEN_KEY_KEEP),
+        b(Method::Post, T_COUNTDOWN),
+        q(Method::Get, T_TIME),
+        q(Method::Get, T_OPEN_ORDERS),
+        q(Method::Get, T_USER_TRADES),
+        b(Method::Delete, T_CANCEL_ALL),
+        q(Method::Get, T_DUAL),
+        q(Method::Get, T_MULTI_ASSETS),
+        q(Method::Get, T_ACCOUNT),
+        q(Method::Get, T_SYMBOL_CONFIG),
+    ]
+}
+
+/// The REST order route's templates (BX7, C5), on its own keep-alive
+/// connection — one request on the wire at a time.
+/// `POST …/v1/order` (signed, body form).
+pub const R_PLACE: usize = 0;
+/// `DELETE …/v1/order` (signed, body form — BX7): one order's cancel by its
+/// client id (or, a stray's, by the venue's id).
+pub const R_CANCEL: usize = 1;
+/// `PUT …/v1/order` (signed, body form): a modify.
+pub const R_MODIFY: usize = 2;
+/// `GET …/v1/order` (signed): the in-doubt query (BX-11).
+pub const R_STATUS: usize = 3;
+/// `GET /fapi/v3/account` · `GET /dapi/v1/account` (signed): recon and
+/// margin — the WS API's `v2/account.status` · `account.status`, the same
+/// shapes (fapi's v2 lists every symbol of the market and no `notional`:
+/// BX7 moved the route to v3, the WS API's own). In
+/// Portfolio Margin the product's positions: `GET /papi/v2/um/account` ·
+/// `GET /papi/v1/cm/account` (the margin is the unified account's,
+/// [`T_ACCOUNT`]).
+pub const R_ACCOUNT: usize = 4;
+/// The order route's templates.
+pub const ORD_TEMPLATES: usize = 5;
+
+/// The order route's templates for `product` (`PRODUCT_COINM`: dapi;
+/// otherwise fapi; in Portfolio Margin, `pm`, the product's papi paths),
+/// every one carrying the key header.
+#[must_use]
+pub fn ord_specs<'a>(product: u8, pm: bool, key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; ORD_TEMPLATES] {
+    let (order, account) = match (pm, product == PRODUCT_COINM) {
+        (false, false) => ("/fapi/v1/order", "/fapi/v3/account"),
+        (false, true) => ("/dapi/v1/order", "/dapi/v1/account"),
+        (true, false) => ("/papi/v1/um/order", "/papi/v2/um/account"),
+        (true, true) => ("/papi/v1/cm/order", "/papi/v1/cm/account"),
+    };
     let q = |method, path| ReqSpec {
         method,
         path,
@@ -77,16 +240,99 @@ pub fn fapi_specs<'a>(key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; FAPI_TEMPL
         headers: key,
     };
     [
-        b(Method::Post, "/fapi/v1/listenKey"),
-        b(Method::Put, "/fapi/v1/listenKey"),
-        b(Method::Post, "/fapi/v1/countdownCancelAll"),
-        q(Method::Get, "/fapi/v1/time"),
-        q(Method::Get, "/fapi/v1/openOrders"),
-        q(Method::Get, "/fapi/v1/userTrades"),
-        q(Method::Delete, "/fapi/v1/allOpenOrders"),
-        q(Method::Get, "/fapi/v1/positionSide/dual"),
-        q(Method::Get, "/fapi/v1/multiAssetsMargin"),
+        b(Method::Post, order),
+        b(Method::Delete, order),
+        b(Method::Put, order),
+        q(Method::Get, order),
+        q(Method::Get, account),
     ]
+}
+
+/// **`POST /fapi/v1/order`** — the REST route's place (BX7, C5): the WS
+/// API's `order.place` parameters as a query, rendered in place.
+pub fn render_place(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {
+    let tif: &[u8] = if o.maker { b"GTX" } else { b"IOC" };
+    let ro: &[u8] = if o.reduce_only { b"&reduceOnly=true" } else { b"" };
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&type=LIMIT&timeInForce="),
+        Part::Lit(tif),
+        Part::Lit(ro),
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&newClientOrderId="),
+        o.cid,
+        Part::Lit(b"&newOrderRespType=ACK"),
+        // papi's COIN-M order takes no STP mode (an unread parameter is
+        // refused): its lane's static carries none.
+        Part::Lit(if st.stp.is_empty() { b"" } else { b"&selfTradePreventionMode=" }),
+        Part::Lit(st.stp),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`PUT /fapi/v1/order`** — a modify: price and quantity together; the
+/// venue keeps the order's client id, time in force and flags.
+pub fn render_modify(w: &mut QueryWriter<'_>, st: &WsStatic, o: &Place<'_>) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(o.symbol),
+        Part::Lit(b"&side="),
+        Part::Lit(side_word(o.side)),
+        Part::Lit(b"&origClientOrderId="),
+        o.cid,
+        Part::Lit(b"&quantity="),
+        Part::Fixed(o.qty_1e6, o.qty_dec),
+        Part::Lit(b"&price="),
+        Part::Fixed(o.px_1e6, o.px_dec),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(o.ts_ms),
+    ]);
+}
+
+/// **`DELETE` / `GET /fapi/v1/order`** — one order by its client id: a
+/// cancel, or the in-doubt query.
+pub fn render_by_cid(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], cid: Part<'_>, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(symbol),
+        Part::Lit(b"&origClientOrderId="),
+        cid,
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`DELETE /fapi/v1/order`** by the venue's order id — a stray the
+/// REST route cancels (its client id lay in an answer since overwritten).
+pub fn render_by_order_id(w: &mut QueryWriter<'_>, st: &WsStatic, symbol: &[u8], order_id: u64, ts_ms: u64) {
+    w.parts(&[
+        Part::Lit(b"symbol="),
+        Part::Lit(symbol),
+        Part::Lit(b"&orderId="),
+        Part::U64(order_id),
+        Part::Lit(b"&recvWindow="),
+        Part::U64(st.recv_window_ms),
+        Part::Lit(b"&timestamp="),
+        Part::U64(ts_ms),
+    ]);
+}
+
+/// **`GET /fapi/v3/account`** — recon and margin.
+pub fn render_account(w: &mut QueryWriter<'_>, st: &WsStatic, ts_ms: u64) {
+    w.parts(&[Part::Lit(b"recvWindow="), Part::U64(st.recv_window_ms), Part::Lit(b"&timestamp="), Part::U64(ts_ms)]);
 }
 
 /// The sapi connection's templates.
@@ -98,7 +344,7 @@ pub fn sapi_specs<'a>(key: &'a [(&'a str, &'a str)]) -> [ReqSpec<'a>; SAPI_TEMPL
         params: Params::Query,
         headers: key,
     };
-    [q("/sapi/v1/account/apiRestrictions"), q("/sapi/v1/portfolio/account")]
+    [q("/sapi/v1/account/apiRestrictions"), q("/sapi/v1/portfolio/account"), q("/api/v3/time")]
 }
 
 /// A render that did not fit its window.
@@ -156,6 +402,19 @@ impl<'a> QueryWriter<'a> {
         self
     }
 
+    /// Append parts — a number's digits, our client id — rendered in
+    /// place (the WS API's renderer, BX7).
+    #[inline]
+    pub fn parts(&mut self, parts: &[Part<'_>]) -> &mut Self {
+        if self.ok {
+            match render_parts(parts, &mut self.buf[self.n..]) {
+                Ok(k) => self.n += k,
+                Err(_) => self.ok = false,
+            }
+        }
+        self
+    }
+
     /// The rendered length, or `Overflow`.
     pub fn rendered(&self) -> Result<usize, Overflow> {
         if self.ok {
@@ -170,6 +429,18 @@ impl<'a> QueryWriter<'a> {
     pub fn sign(self, signer: &signer_ed25519::Ed25519Signer) -> Result<usize, Overflow> {
         let n = self.rendered()?;
         sign_in_place(signer, self.buf, n)
+    }
+
+    /// Sign with the arm's signer — Ed25519, or HMAC where the
+    /// configuration says so (BX7, R22).
+    pub fn sign_with(self, signer: &Signer) -> Result<usize, Overflow> {
+        match signer {
+            Signer::Ed25519(s) => self.sign(s),
+            Signer::Hmac(h) => {
+                let n = self.rendered()?;
+                sign_hmac_in_place(h, self.buf, n)
+            }
+        }
     }
 }
 
@@ -189,6 +460,27 @@ pub fn sign_in_place(signer: &signer_ed25519::Ed25519Signer, buf: &mut [u8], n: 
     Ok(n + SIG_KEY.len() + m)
 }
 
+/// HMAC (R22): sign `buf[..n]` and append `&signature=<64 hex>` right
+/// after it. The inner hash pads in place, in the 75 B the signature then
+/// takes (BX7: ≥ `SHA256_PAD_MAX`; no byte of the request is stashed).
+pub fn sign_hmac_in_place(h: &HmacSigner, buf: &mut [u8], n: usize) -> Result<usize, Overflow> {
+    const _: () = assert!(SIG_KEY.len() + HMAC_SIG_HEX >= core_crypto::SHA256_PAD_MAX);
+    let need = n + SIG_KEY.len() + HMAC_SIG_HEX;
+    if n == 0 || need > buf.len() {
+        return Err(Overflow);
+    }
+    let tag = h.tag_in_place(&mut buf[..need], n).ok_or(Overflow)?;
+    let rest = &mut buf[n..need];
+    // COPY: the 11 B literal `&signature=` after the signed bytes — the
+    // separator's render, as for Ed25519 (over the padding the tag left).
+    rest[..SIG_KEY.len()].copy_from_slice(SIG_KEY);
+    let Ok(sig) = <&mut [u8; HMAC_SIG_HEX]>::try_from(&mut rest[SIG_KEY.len()..]) else {
+        return Err(Overflow);
+    };
+    hex_lower(&tag, sig);
+    Ok(need)
+}
+
 // -------------------------------------------------------------------------
 // Answers
 // -------------------------------------------------------------------------
@@ -204,29 +496,49 @@ fn bad(_: ()) -> ScanErr {
 }
 
 /// The venue's refusal code in a `{"code":…,"msg":…}` body; 0 if the body
-/// is not one.
+/// is not one. BX7 (the one-reading law, as the WS API's `error` is read):
+/// the body is ONE object, whole and well-formed — bytes after it, a pair
+/// it cannot walk or `code` named twice is no code (0: "no code", which a
+/// refusal under 500 may not be).
 #[must_use]
 pub fn scan_error(body: &[u8]) -> i32 {
+    let whole = match core_parse::skip_json_value(body, 0) {
+        Some(end) => core_parse::skip_ws(body, end) == body.len(),
+        None => false,
+    };
+    if !whole {
+        return 0;
+    }
     let Ok(mut w) = Pairs::new(body, 0) else {
         return 0;
     };
-    let mut code = 0;
-    while let Ok(Some((k, a, z))) = w.next() {
-        if k == b"code" {
-            if let Ok(c) = i64_of(body, a, z) {
-                code = c.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let (mut code, mut coded) = (0, false);
+    loop {
+        match w.next() {
+            Ok(Some((k, a, z))) if k == b"code" => {
+                if coded {
+                    return 0;
+                }
+                coded = true;
+                if let Ok(c) = i64_of(body, a, z) {
+                    code = c.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                }
             }
+            Ok(Some(_)) => {}
+            Ok(None) => return code,
+            Err(()) => return 0,
         }
     }
-    code
 }
 
 /// The venue ms a 418 names in its message (`…IP banned until
-/// 1790000600000…`); 0 if it names none. Advisory: it can only lengthen
-/// the gateway's quiet, never shorten it.
+/// 1790000600000…`); 0 if it names none — the latest, if it names several
+/// (BX7: as the WS API's `retryAfter` copies are read). Advisory: it can
+/// only lengthen the gateway's quiet, never shorten it.
 #[must_use]
 pub fn scan_ban_until(body: &[u8]) -> u64 {
     const AT: &[u8] = b"banned until ";
+    let mut latest = 0u64;
     let mut i = 0;
     while i + AT.len() <= body.len() {
         if &body[i..i + AT.len()] == AT {
@@ -238,11 +550,13 @@ pub fn scan_ban_until(body: &[u8]) -> u64 {
                 j += 1;
                 n += 1;
             }
-            return v;
+            latest = latest.max(v);
+            i = j;
+            continue;
         }
         i += 1;
     }
-    0
+    latest
 }
 
 /// `{"listenKey":"…"}` → the key.
@@ -495,9 +809,64 @@ mod tests {
         assert_eq!(super::scan_ban_until(br#"{"code":-1003,"msg":"Too many requests."}"#), 0);
         assert_eq!(super::scan_ban_until(b"banned until "), 0, "no digits: none");
         assert_eq!(super::scan_ban_until(b"banned until 99999999999999999999999"), 9_999_999_999_999_999_999, "capped at 19 digits");
+        // BX7: the latest end named (never a shorter quiet than the venue's).
+        assert_eq!(super::scan_ban_until(b"IP banned until 1000. IP banned until 1790000600000."), 1_790_000_600_000);
+        assert_eq!(super::scan_ban_until(b"IP banned until 1790000600000. IP banned until 1000."), 1_790_000_600_000);
     }
 
     use super::*;
+
+    /// BX7 (F1): every order verb on the REST route — the place, the
+    /// cancel, the modify — and the sweep's cancel-all are body-form, on
+    /// every product and mode: core-net's law for the order path (a
+    /// query-form request stages its header tail on every send).
+    #[test]
+    fn the_order_verbs_are_body_form() {
+        let key = [(KEY_HEADER, "k")];
+        for (product, pm) in [(crate::inst::PRODUCT_USDM, false), (PRODUCT_COINM, false), (crate::inst::PRODUCT_USDM, true), (PRODUCT_COINM, true)] {
+            let o = ord_specs(product, pm, &key);
+            for t in [R_PLACE, R_CANCEL, R_MODIFY] {
+                assert!(matches!(o[t].params, Params::Body(FORM)), "template {t}");
+            }
+            assert!(matches!(o[R_STATUS].params, Params::Query), "a read stays a query");
+            assert!(matches!(fut_specs(product, pm, &key)[T_CANCEL_ALL].params, Params::Body(FORM)));
+        }
+    }
+
+    #[test]
+    fn each_product_has_its_own_paths_by_the_same_template() {
+        let key = [(KEY_HEADER, "k")];
+        let um = fut_specs(crate::inst::PRODUCT_USDM, false, &key);
+        let cm = fut_specs(PRODUCT_COINM, false, &key);
+        let mut t = 0;
+        while t < FUT_TEMPLATES {
+            assert!(um[t].path.starts_with("/fapi/v"), "{}", um[t].path);
+            assert!(cm[t].path.starts_with("/dapi/v1/"), "{}", cm[t].path);
+            if t != T_ACCOUNT {
+                assert_eq!(um[t].path[5..], cm[t].path[5..], "template {t} names one endpoint");
+            }
+            assert_eq!(um[t].method, cm[t].method);
+            t += 1;
+        }
+        let (um, cm) = (ord_specs(crate::inst::PRODUCT_USDM, false, &key), ord_specs(PRODUCT_COINM, false, &key));
+        assert_eq!((um[R_PLACE].path, um[R_ACCOUNT].path), ("/fapi/v1/order", "/fapi/v3/account"));
+        assert_eq!((cm[R_PLACE].path, cm[R_ACCOUNT].path), ("/dapi/v1/order", "/dapi/v1/account"));
+        // Portfolio Margin (BX7, C2): each product's papi paths; one
+        // listenKey and one unified account for both.
+        let (pu, pc) = (fut_specs(crate::inst::PRODUCT_USDM, true, &key), fut_specs(PRODUCT_COINM, true, &key));
+        assert_eq!((pu[T_OPEN_ORDERS].path, pc[T_OPEN_ORDERS].path), ("/papi/v1/um/openOrders", "/papi/v1/cm/openOrders"));
+        assert_eq!((pu[T_USER_TRADES].path, pc[T_DUAL].path), ("/papi/v1/um/userTrades", "/papi/v1/cm/positionSide/dual"));
+        assert_eq!((pu[T_LISTEN_KEY_NEW].path, pc[T_LISTEN_KEY_NEW].path), ("/papi/v1/listenKey", "/papi/v1/listenKey"));
+        assert_eq!((pu[T_ACCOUNT].path, pc[T_ACCOUNT].path), ("/papi/v1/account", "/papi/v1/account"));
+        // BX7 (BX-19): the margin type is USDⓈ-M's to ask; papi never.
+        let um = fut_specs(crate::inst::PRODUCT_USDM, false, &key);
+        assert_eq!((um[T_SYMBOL_CONFIG].path, um[T_SYMBOL_CONFIG].method), ("/fapi/v1/symbolConfig", Method::Get));
+        assert_eq!((pu[T_SYMBOL_CONFIG].path, pc[T_SYMBOL_CONFIG].path), (PAPI_NONE, PAPI_NONE));
+        let (pu, pc) = (ord_specs(crate::inst::PRODUCT_USDM, true, &key), ord_specs(PRODUCT_COINM, true, &key));
+        assert_eq!((pu[R_PLACE].path, pu[R_ACCOUNT].path), ("/papi/v1/um/order", "/papi/v2/um/account"));
+        assert_eq!((pc[R_PLACE].path, pc[R_ACCOUNT].path), ("/papi/v1/cm/order", "/papi/v1/cm/account"));
+        assert_eq!(sapi_specs(&key)[S_TIME].path, "/api/v3/time");
+    }
     use proptest::prelude::*;
 
     #[test]
@@ -526,10 +895,111 @@ mod tests {
         assert_eq!(w.rendered(), Err(Overflow));
     }
 
+    /// BX7 (C5, R22): the REST route renders the WS API's parameters as a
+    /// query, and HMAC signs exactly those bytes. Break-and-watch: a modify
+    /// that renders the time in force, or HMAC over anything but the
+    /// rendered bytes, fails here.
+    #[test]
+    fn the_rest_order_route_renders_and_hmac_signs() {
+        const PREFIX: crate::cid::CidPrefix = crate::cid::CidPrefix::new(0x6512_ab0f);
+        let st = WsStatic::new("EXPIRE_MAKER", 1_000);
+        let o = Place {
+            symbol: b"BTCUSDT",
+            side: core_types::Side::Ask as u8,
+            maker: false,
+            reduce_only: true,
+            qty_1e6: 2_000,
+            qty_dec: 3,
+            px_1e6: 64_000_000_000,
+            px_dec: 1,
+            cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
+            ts_ms: 1_790_000_000_000,
+        };
+        let text = |f: &dyn Fn(&mut QueryWriter<'_>)| {
+            let mut win = [0u8; 512];
+            let mut w = QueryWriter::new(&mut win);
+            f(&mut w);
+            let n = w.rendered().unwrap();
+            String::from_utf8(win[..n].to_vec()).unwrap()
+        };
+        assert_eq!(
+            text(&|w| render_place(w, &st, &o)),
+            "symbol=BTCUSDT&side=SELL&type=LIMIT&timeInForce=IOC&reduceOnly=true&quantity=0.002&price=64000.0&newClientOrderId=mv6512ab0f30123456789abcdef00000&newOrderRespType=ACK&selfTradePreventionMode=EXPIRE_MAKER&recvWindow=1000&timestamp=1790000000000"
+        );
+        assert_eq!(
+            text(&|w| render_modify(w, &st, &o)),
+            "symbol=BTCUSDT&side=SELL&origClientOrderId=mv6512ab0f30123456789abcdef00000&quantity=0.002&price=64000.0&recvWindow=1000&timestamp=1790000000000"
+        );
+        assert_eq!(
+            text(&|w| render_by_cid(w, &st, b"BTCUSDT", Part::Lit(b"CID"), 5)),
+            "symbol=BTCUSDT&origClientOrderId=CID&recvWindow=1000&timestamp=5"
+        );
+        assert_eq!(text(&|w| render_account(w, &st, 6)), "recvWindow=1000&timestamp=6");
+        assert_eq!(
+            text(&|w| render_by_order_id(w, &st, b"BTCUSDT", 7_001, 7)),
+            "symbol=BTCUSDT&orderId=7001&recvWindow=1000&timestamp=7"
+        );
+        // HMAC over exactly the rendered bytes.
+        let secret = *b"NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j";
+        let h = Signer::Hmac(HmacSigner::from_secret(secret).unwrap());
+        let mut win = [0u8; 512];
+        let mut w = QueryWriter::new(&mut win);
+        render_by_cid(&mut w, &st, b"BTCUSDT", Part::Lit(b"CID"), 5);
+        let total = w.sign_with(&h).unwrap();
+        let q = std::str::from_utf8(&win[..total]).unwrap();
+        let (msg, sig) = q.split_once("&signature=").unwrap();
+        let want = core_crypto::hmac_sha256(&secret, msg.as_bytes());
+        let hex: String = want.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(sig, hex);
+        // BX7 (zero-copy N1): right at every length around the hash's block
+        // and padding bounds — the inner hash pads in the room the
+        // signature then takes — and nothing past the signature written.
+        let hk = HmacSigner::from_secret(secret).unwrap();
+        let mut n = 1;
+        while n <= 200 {
+            let mut win = [0xEEu8; 300];
+            let mut i = 0;
+            while i < n {
+                win[i] = b'a' + (i % 26) as u8;
+                i += 1;
+            }
+            assert_eq!(sign_hmac_in_place(&hk, &mut win[..n + 75], n), Ok(n + 75));
+            assert_eq!(&win[n..n + 11], b"&signature=");
+            let mut hex = [0u8; HMAC_SIG_HEX];
+            hex_lower(&core_crypto::hmac_sha256(&secret, &win[..n]), &mut hex);
+            assert_eq!(&win[n + 11..n + 75], &hex[..], "n {n}");
+            assert!(win[n + 75..].iter().all(|b| *b == 0xEE), "n {n}");
+            n += 1;
+        }
+        let mut room = [0u8; 80];
+        assert_eq!(sign_hmac_in_place(&hk, &mut room, 6), Err(Overflow), "75 B of room are needed");
+        // Too small a window refuses, never truncates.
+        let mut tiny = [0u8; 70];
+        let mut w = QueryWriter::new(&mut tiny);
+        w.put(b"timestamp=").uint(1);
+        assert_eq!(w.sign_with(&h), Err(Overflow));
+    }
+
     #[test]
     fn small_answers() {
         assert_eq!(scan_error(br#"{"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}"#), -1021);
         assert_eq!(scan_error(br#"{"listenKey":"x"}"#), 0);
+        // BX7: a code named twice is no code (either order).
+        assert_eq!(scan_error(br#"{"code":-2019,"code":0,"msg":"x"}"#), 0);
+        assert_eq!(scan_error(br#"{"code":0,"code":-2019,"msg":"x"}"#), 0);
+        // ...and a body that is not one whole, well-formed object: no code
+        // (the parser review's round-3 R3-1; the WS API's reader refuses
+        // each of these alike).
+        for bad in [
+            &br#"{"code":-2019,"code":}"#[..],
+            br#"{"code":-2019,"code""#,
+            br#"{"code":-2019,"msg":"x"}{"code":-1003}"#,
+            br#"{"code":-2019,"msg":"x"} trailing"#,
+            br#"{"code":-2019,"msg":}"#,
+        ] {
+            assert_eq!(scan_error(bad), 0, "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(scan_error(b"{\"code\":-2019,\"msg\":\"x\"}\r\n"), -2019, "whitespace after it is not bytes");
         assert_eq!(scan_error(b"<html>"), 0);
         let lk = br#"{"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"}"#;
         assert_eq!(scan_listen_key(lk).unwrap().get(lk).len(), 64);

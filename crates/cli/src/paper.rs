@@ -10097,6 +10097,10 @@ pub mod boot_discovery {
         /// live Binance arm binds its instrument table from these, never
         /// from a second fetch. Empty when the audit did not run.
         pub bn_fapi_rows: Vec<(String, BnSymbolRow)>,
+        /// **BX7** — the COIN-M rows (perpetual and dated) the audit
+        /// matched, as [`Self::bn_fapi_rows`]: the arm binds its COIN-M
+        /// lane's instruments from these.
+        pub bn_dapi_rows: Vec<(String, BnSymbolRow)>,
         /// M2.4: the selected Binance eapi options chain — `(symbol,
         /// sym)` in deterministic allocation order (base
         /// [`BN_OPT_ORDINAL_BASE`]), the OKX shape. The bin builds the
@@ -10914,6 +10918,7 @@ pub mod boot_discovery {
         buf: &mut Vec<u8>,
         any_missing: &mut bool,
         fapi_rows: &mut Vec<(String, BnSymbolRow)>,
+        dapi_rows: &mut Vec<(String, BnSymbolRow)>,
     ) -> Result<VenueCoverage, &'static str> {
         let mut matched = 0u32;
         let mut universe = 0u32;
@@ -10997,17 +11002,17 @@ pub mod boot_discovery {
             for sym in dated {
                 matched += audit_bn_symbol(&d, dated_market, sym, true, any_missing);
             }
-            if page == "fapi" {
-                // BX6: the rows the live arm binds from (208 B each, boot).
-                for (sym, is_dated) in perps.iter().map(|s| (s, false)).chain(dated.iter().map(|s| (s, true))) {
-                    let (up, up_len) = upper_symbol(sym);
-                    if let Ok(row) = bn_row_audit(d.find(&up[..up_len]), is_dated) {
-                        // COPY: one discovery row (208 B) per configured
-                        // USDⓈ-M symbol, once at boot — the page's table
-                        // is dropped when this loop ends; keeping the whole
-                        // table for a few rows was rejected.
-                        fapi_rows.push((sym.clone(), *row));
-                    }
+            // BX6 / BX7: the rows the live arm binds from (208 B each,
+            // boot), USDⓈ-M's and COIN-M's apart.
+            let rows: &mut Vec<(String, BnSymbolRow)> = if page == "fapi" { &mut *fapi_rows } else { &mut *dapi_rows };
+            for (sym, is_dated) in perps.iter().map(|s| (s, false)).chain(dated.iter().map(|s| (s, true))) {
+                let (up, up_len) = upper_symbol(sym);
+                if let Ok(row) = bn_row_audit(d.find(&up[..up_len]), is_dated) {
+                    // COPY: one discovery row (208 B) per configured
+                    // futures symbol, once at boot — the page's table is
+                    // dropped when this loop ends; keeping the whole table
+                    // for a few rows was rejected.
+                    rows.push((sym.clone(), *row));
                 }
             }
             universe += d.universe_trading();
@@ -11317,6 +11322,7 @@ pub mod boot_discovery {
         };
 
         let mut bn_fapi_rows = Vec::new();
+        let mut bn_dapi_rows = Vec::new();
         let bn = match binance {
             Some(lists) if !lists.is_empty() => Some(run_bn(
                 cfg,
@@ -11325,6 +11331,7 @@ pub mod boot_discovery {
                 &mut buf,
                 &mut any_missing,
                 &mut bn_fapi_rows,
+                &mut bn_dapi_rows,
             )?),
             _ => None,
         };
@@ -11399,6 +11406,7 @@ pub mod boot_discovery {
             hl_sz_decimals,
             bn,
             bn_fapi_rows,
+            bn_dapi_rows,
             bn_options,
             bybit: bybit_cov,
             mexc: mexc_cov,

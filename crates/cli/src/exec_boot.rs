@@ -749,8 +749,10 @@ fn check_bin15_gateway(slots: &[core_config::exec::ExecSlot], live_mask: u8) -> 
 
 /// **BX6** — what this binary's Binance arm can serve: at most one live
 /// slot (BX-7 as built — the one owner of every bound row), and only the
-/// products and account modes its gateway speaks (USDⓈ-M × classic);
-/// anything else is refused naming the phase that builds it.
+/// products and account modes its gateway speaks (BX7: USDⓈ-M and COIN-M ×
+/// classic, Portfolio Margin and PM Pro — `exec_binance::mode::built`);
+/// anything else is refused naming the phase that builds it. A session
+/// bound on a classic arm needs it to trade USDⓈ-M alone (one USD equity).
 fn check_binance(
     slots: &[core_config::exec::ExecSlot],
     live_mask: u8,
@@ -794,15 +796,18 @@ fn check_binance(
             b.recon_every_ms, live[0]
         ));
     }
-    // The REST weight (§3.9): there is no run-time REQUEST_WEIGHT governor
-    // (a BX6 departure), so the worst steady load is judged here — the
-    // dead-man on every symbol, a reconciliation and margin re-reads at
-    // their fastest — against the arm's share of the IP's budget.
+    // The REST weight (§3.9): the worst steady load — the dead-man on every
+    // symbol, each futures lane's reconciliation and margin re-reads at
+    // their fastest — is judged here against the arm's share of the IP's
+    // budget; at run time the gateway's governor (BX7) defers its
+    // discretionary reads past 80 % of that share.
     let max_symbols = owner.map_or(0, |s| s.max_symbols);
+    let lanes = b.products.iter().filter(|p| *p == "usdm" || *p == "coinm").count();
     let weight = exec_binance::gov::arm_weight_per_min(
         u64::try_from(max_symbols).unwrap_or(0),
         u64::try_from(b.heartbeat_ms).unwrap_or(0),
         u64::try_from(b.recon_every_ms).unwrap_or(0),
+        u64::try_from(lanes.max(1)).unwrap_or(1),
     );
     if weight > exec_binance::gov::ARM_WEIGHT_MAX_PER_MIN {
         return Err(format!(
@@ -834,6 +839,24 @@ fn check_binance(
                 b.account_mode
             ));
         }
+    }
+    // BX7: the E7 session bound is judged on ONE USD equity — USDⓈ-M's
+    // margin balance on a classic account, the unified account's in PM and
+    // PM Pro. COIN-M margins in each coin and has none: on a classic arm
+    // trading it the bound would judge USDⓈ-M's equity alone — or nothing —
+    // while COIN-M's losses went unseen (the risk review's N1). Refused.
+    let bounded = owner.is_some_and(|s| s.halt_on_gain_usd_1e6 != 0 || s.halt_on_loss_usd_1e6 != 0);
+    let armed = |w: &str| b.products.iter().any(|p| p == w);
+    if bounded && mode == exec_binance::mode::AccountMode::Classic && (armed("coinm") || !armed("usdm")) {
+        return Err(format!(
+            "exec: slot {} has a session bound (halt_on_gain_usd_1e6 / halt_on_loss_usd_1e6) but \
+             its classic Binance arm {} — COIN-M margins in each coin and has no USD equity, so \
+             the bound would judge USDⓈ-M's alone (or nothing) while COIN-M's losses went \
+             unseen. Run the account as pm or pm_pro (one unified USD equity), arm usdm alone, \
+             or drop the bound.",
+            live[0],
+            if armed("coinm") { "trades COIN-M" } else { "trades no USDⓈ-M" }
+        ));
     }
     Ok(())
 }
@@ -1733,15 +1756,28 @@ mod tests {
         let e = resolve(Some(&p), Some("3")).unwrap_err();
         assert!(e.contains("[exec.binance]"), "{e}");
         // A product this gateway does not speak names its phase.
-        for (from, to, phase) in [
-            ("products = [\"usdm\"]", "products = [\"spot\"]", "BX8"),
-            ("products = [\"usdm\"]", "products = [\"usdm\", \"coinm\"]", "BX7"),
-            ("account_mode = \"classic\"", "account_mode = \"pm\"", "BX7"),
-        ] {
-            let src = format!("{}{}", bn_live(), BN_SECTION.replace(from, to));
-            let p = write(&d, "unbuilt.toml", &src);
-            let e = resolve(Some(&p), Some("3")).unwrap_err();
-            assert!(e.contains(phase), "{to}: {e}");
+        let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", "products = [\"spot\"]"));
+        let p = write(&d, "unbuilt.toml", &src);
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("BX8"), "spot: {e}");
+        // BX7 (C3): PM Pro is built — the classic routes.
+        let pm_pro = BN_SECTION.replace("account_mode = \"classic\"", "account_mode = \"pm_pro\"");
+        let p = write(&d, "pm-pro.toml", &format!("{}{pm_pro}", bn_live()));
+        let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+        assert_eq!(b.binance.as_ref().map(|b| b.account_mode.as_str()), Some("pm_pro"));
+        // BX7 (C2): Portfolio Margin is built — papi's REST route only.
+        let pm = BN_SECTION.replace("account_mode = \"classic\"", "account_mode = \"pm\"");
+        let p = write(&d, "pm.toml", &format!("{}{pm}order_transport = \"rest\"\n", bn_live()));
+        let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+        assert_eq!(b.binance.as_ref().map(|b| b.account_mode.as_str()), Some("pm"));
+        let p = write(&d, "pm-ws.toml", &format!("{}{pm}", bn_live()));
+        assert!(resolve(Some(&p), Some("3")).unwrap_err().contains("needs `order_transport = \"rest\"`"));
+        // BX7 (C1): COIN-M classic is built — beside USDⓈ-M, or alone.
+        for to in ["products = [\"usdm\", \"coinm\"]", "products = [\"coinm\"]"] {
+            let src = format!("{}{}", bn_live(), BN_SECTION.replace("products = [\"usdm\"]", to));
+            let p = write(&d, "coinm.toml", &src);
+            let b = resolve(Some(&p), Some("3")).unwrap().unwrap();
+            assert!(b.binance.as_ref().is_some_and(|b| b.products.iter().any(|w| w == "coinm")), "{to}");
         }
         // A shared account is not armable in this binary (its foreign-fill
         // halt is not built).
@@ -1776,6 +1812,38 @@ mod tests {
         let b = resolve(Some(&p), None).unwrap().unwrap();
         assert!(!b.any_live() && b.binance_slot().is_none());
         assert_eq!(b.slots[3].halt_on_margin_ratio_1e6, 600_000);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// **BX7 (the risk review's R3, N1)** — a session bound is judged on
+    /// one USD equity: a classic arm trading COIN-M has none for it (COIN-M
+    /// margins in each coin), alone or beside USDⓈ-M (whose equity would
+    /// judge it while COIN-M's losses went unseen) — refused, naming why.
+    /// USDⓈ-M alone judges its own; PM and PM Pro the unified account's.
+    /// Break-and-watch: without N1's check the bounded USDⓈ-M + COIN-M
+    /// classic slot boots.
+    #[test]
+    fn a_session_bound_needs_a_usd_equity() {
+        let d = tmp();
+        let bounded = bn_live().replace(
+            "halt_on_margin_ratio_1e6 = 600000\n",
+            "halt_on_margin_ratio_1e6 = 600000\nhalt_on_loss_usd_1e6 = 5000000\n",
+        );
+        let cm = BN_SECTION.replace("products = [\"usdm\"]", "products = [\"coinm\"]");
+        let p = write(&d, "cm-bound.toml", &format!("{bounded}{cm}"));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("no USD"), "{e}");
+        let p = write(&d, "cm.toml", &format!("{}{cm}", bn_live()));
+        assert!(resolve(Some(&p), Some("3")).is_ok(), "COIN-M alone, no bound");
+        let both = BN_SECTION.replace("products = [\"usdm\"]", "products = [\"usdm\", \"coinm\"]");
+        let p = write(&d, "both.toml", &format!("{bounded}{both}"));
+        let e = resolve(Some(&p), Some("3")).unwrap_err();
+        assert!(e.contains("no USD") && e.contains("trades COIN-M"), "USDⓈ-M beside COIN-M: {e}");
+        let p = write(&d, "um.toml", &format!("{bounded}{BN_SECTION}"));
+        assert!(resolve(Some(&p), Some("3")).is_ok(), "USDⓈ-M alone judges its own equity");
+        let pm_pro = cm.replace("account_mode = \"classic\"", "account_mode = \"pm_pro\"");
+        let p = write(&d, "pm-pro.toml", &format!("{bounded}{pm_pro}"));
+        assert!(resolve(Some(&p), Some("3")).is_ok(), "PM Pro: the unified account's equity");
         std::fs::remove_dir_all(&d).ok();
     }
 

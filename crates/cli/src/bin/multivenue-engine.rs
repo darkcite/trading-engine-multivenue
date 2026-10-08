@@ -5541,14 +5541,33 @@ fn run(args: RunArgs) -> ExitCode {
                             .chain(boot.allocated.bn_dated.iter())
                             .cloned()
                             .collect();
-                        let md_hosts = [
+                        // BX7: COIN-M, when `products` arms it — its
+                        // market data on the arm's network too (BX-16).
+                        let coinm: Vec<core_config::universe::Instrument> = boot
+                            .allocated
+                            .bn_coinm
+                            .iter()
+                            .chain(boot.allocated.bn_coinm_dated.iter())
+                            .cloned()
+                            .collect();
+                        let cm_armed = eb
+                            .binance
+                            .as_ref()
+                            .is_some_and(|b| b.products.iter().any(|p| p == "coinm"));
+                        let mut md_hosts = vec![
                             cfg.binance_fut_ws_host.as_str(),
                             cfg.binance_fut_rest_host.as_str(),
                         ];
+                        if cm_armed {
+                            md_hosts.push(cfg.binance_coinm_ws_host.as_str());
+                            md_hosts.push(cfg.binance_coinm_rest_host.as_str());
+                        }
                         let spec = cli::bn_live::BnSpec {
                             eb: &eb,
                             rows: &discovery.bn_fapi_rows,
                             usdm: &usdm,
+                            cm_rows: &discovery.bn_dapi_rows,
+                            coinm: &coinm,
                             alias,
                             md_hosts: &md_hosts,
                             run_dir: &run_dir,

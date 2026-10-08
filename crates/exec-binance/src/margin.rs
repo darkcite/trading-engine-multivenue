@@ -18,9 +18,10 @@
 //!
 //! **USDⓈ-M** (the product BX6 builds): `totalMaintMargin /
 //! totalMarginBalance` from the account snapshot. A balance at or below
-//! zero reads as an unbounded ratio — fail closed. The other products'
-//! formulas (COIN-M per asset, PM `uniMMR`, options maintenance over
-//! adjusted equity) arrive with their phases.
+//! zero reads as an unbounded ratio — fail closed. COIN-M margins each
+//! asset apart: its ratio is the riskiest asset's ([`cm_asset_ratio_1e6`],
+//! BX7). The other products' formulas (PM `uniMMR`, options maintenance
+//! over adjusted equity) arrive with their phases.
 
 use crate::inst::PRODUCTS;
 
@@ -42,6 +43,19 @@ pub const fn um_ratio_1e6(total_maint_1e6: i64, total_margin_balance_1e6: i64) -
         RATIO_UNBOUNDED
     } else {
         r as i64
+    }
+}
+
+/// **COIN-M**, one asset: `maintMargin / marginBalance` ×1e6 (both in the
+/// asset). An asset no contract needs margin from carries no risk — 0,
+/// whatever its balance (the account lists every asset, most at zero);
+/// with a requirement, a balance at or below zero is unbounded.
+#[must_use]
+pub const fn cm_asset_ratio_1e6(maint_1e6: i64, margin_balance_1e6: i64) -> i64 {
+    if maint_1e6 == 0 {
+        0
+    } else {
+        um_ratio_1e6(maint_1e6, margin_balance_1e6)
     }
 }
 

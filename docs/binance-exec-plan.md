@@ -1419,6 +1419,80 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
 
 **Size:** about 3 500 src + 2 600 test.
 
+**BX7 record (2026-10-08, branch `binance`, one commit `BX7:`).** Loopback only. No member arms (O-BX6); the session placed no order anywhere. Rulings of 2026-10-08: BX7 offline-first; the gateway onto `exec-gateway` first (O-XH13); one commit; Demo orders allowed (none was placed); honour the order flags; adopt within caps; require CROSSED; fail-closed across lanes; "commit BX7 now, battery later". The risk law is risk-policy "BX7"; the working log is the project doc `claude/bx7-build-plan-2026-10-08.md`.
+
+- **Scope as built.** USDⓈ-M and COIN-M × classic, Portfolio Margin and PM Pro, built together (O-BX2b); a dedicated account; one owner slot. Makers on USDⓈ-M classic only (BX-17); COIN-M (O-BX3a), PM (K13) and PM Pro (K14) are IoC-only. Spot, options and Binance Stocks still refuse the boot naming BX8–BX10.
+- **Departures from the build list above:**
+  1. **The batteries and the K-probes are not in BX7** (the operator's "commit BX7 now, battery later"). They become BX7b: `exec-smoke --binance {um,cm}` on Demo, K11, K19, K20, K16, K5, the account mode, and the body-form DELETEs. PM and PM Pro have no Demo.
+  2. **COIN-M's margin type and leverage come from its account read**, not `positionRisk`. The read costs no extra request and is judged on every cycle.
+  3. **No client pings on the user stream.** The 240 s idle law (`WS_CFG.idle_ns`) catches a half-open stream, and the stream is replaced cold with every open order put in doubt: Binance replays nothing, so make-before-break would buy nothing there.
+  4. **A request unanswered for 5 s stays a cold drop** (B1). Make-before-break serves the planned replacements only: the 23 h rotation and `serverShutdown`.
+  5. **TradFi's agreement is not asserted at boot.** No endpoint queries it. The first order on an unsigned row is refused `-4411` (RowFatal).
+  6. **RSA signing is not built.** HMAC is the opt-in fallback, REST only.
+- **Built — `crates/exec-binance`:**
+
+  | file | what changed |
+  |---|---|
+  | `gateway.rs` | On the kit (`duplex`, `GatewayStats` sweep and halt words, `Pending`, `TimerQueue`, `Mbb`, `Idle`, `RateWindow`). One lane per futures product; fail-closed across lanes; the REST order route (`retire_queued` on a sweep); PM's papi lanes and PM Pro's SAPI unified account (`ReconStep::Unified`); the BX-19 margin-type and leverage law; adoption at boot; the DNS tick |
+  | `dns.rs` (new) | the cold resolver thread `bn-dns`, two SPSC rings |
+  | `rest.rs` | fapi/dapi/papi/SAPI templates; every order verb body-form; HMAC signing in the window (`sign_hmac_in_place`); the refusal code read once |
+  | `wsapi.rs` | `scan_rest_answer` (a REST 200 is one object, whole); the one-reading law in `scan_answer` and `result_fields`; a non-200 must carry a code |
+  | `userstream.rs` | dstream, `/pm/ws/` (`fs`), `/pm-classic/ws/`; `riskLevelChange`, `liabilityChange`, `ACCOUNT_CONFIG_UPDATE` (bits), the margin types (`NotCross`); the one-reading law |
+  | `recon.rs` | the COIN-M account (`leverage`, `isolated` required), the positions-only and unified scans; a key named twice refused |
+  | `mode.rs` | `judge_symbol_config`, `judge_mode` (K17, read whole), `built` for every futures product × mode |
+  | `config.rs` | hosts per lane and mode; `HmacSigner` (two locked halves; `tag_in_place`, `hmac_self_test`) |
+  | `journal.rs` | `J_FILL_ADOPTED`; `AnchorFile` keyed by the key AND the account mode |
+  | `arm.rs`, `cmd.rs`, `gov.rs`, `margin.rs`, `oot.rs`, `inst.rs`, `json.rs`, `lib.rs` | the flags (`reduceOnly`, post-only → GTX); 19 tallies; the request-weight table; per-product margin; `json::field` |
+  | `ttl.rs` | deleted (the kit's `TimerQueue`) |
+
+- **Shared crates:**
+  - `core-types`: `FILL_FLAG_ADOPTED` (wire-additive; `docs/wire-format.md`).
+  - `exec-router`: an adopted fill moves the position only.
+  - `exec-gateway`: `Pending::claim_next`.
+  - `core-net`: `WsConn::set_path_parts`, `WsConn::host`; `ReqIds` removed.
+  - `core-crypto`: SHA-256 hashes full blocks in place and pads in the caller's room (`finalize_in_place`, `SHA256_PAD_MAX`); `hmac_sha256` XORs the key into its pads.
+  - `core-config`: `order_transport`, `signing`, `max_leverage`.
+  - `cli`:
+    - `bn_live`: lanes, the adoption cap, the bound's backstop, the tell;
+    - `exec_boot`: modes, the session bound's equity;
+    - `paper` and the engine binary: COIN-M rows;
+    - `audit_pnl`: adopted fills as opening inventory.
+  - `fuzz`: `bn_rest_answer` (new); `bn_user_event`, `bn_account`, `bn_mode` and `bn_wsapi_frame` widened.
+- **Gates.** The final tree's run is in §12.
+  - The alloc gates on the kit: 92 and 93 re-pinned (93 also walks the not-cross positions and reads a two-change `ACCOUNT_CONFIG_UPDATE`).
+  - New: **104** (the REST route's renders, Ed25519/HMAC signing, answer reads), **105** (the COIN-M lane), **106** (Portfolio Margin), **107** (the DNS tick). Gate 94 stays reserved for the live-socket gate.
+  - 117 at 0 B/op, 3 ignored.
+- **Reviewers** (Opus 5.5 subagents acting as the agents, read-only; full dispositions in risk-policy "BX7"):
+  - **Round 1:**
+    - risk BLOCK — R1 COIN-M's assertion passed on absent fields; R2 PM's unified account was judged after the verdict; R3 a session bound on classic COIN-M could never fire;
+    - zero-copy FAIL — the cancel template and the SHA-256 block;
+    - alloc PASS with gate gaps;
+    - parser FAIL — a disagreement on a key named twice, a panic in `judge_mode`, fail-open paths.
+
+    All were fixed, each new law with a test that fails without it.
+  - **Round 2:**
+    - risk BLOCK — N1: a classic arm with COIN-M and a bound judged USDⓈ-M's equity alone;
+    - zero-copy FAIL — the HMAC tail stash;
+    - alloc PASS — the adoption room;
+    - parser FAIL — a REST 200 read past its object; three readers outside the one-reading law.
+
+    All were fixed.
+  - **Round 3:**
+    - risk NEEDS-DOCS (N1–N9 fixed) — the throttle starved the cadence the boot accepts; an unreadable 418/429 on the REST route skipped the quiet; a classic account's totals blind to USDC-margined rows; the adoption text;
+    - zero-copy PASS (cold nits); alloc PASS (borderlines); parser PASS (R3-1: the refusal code read off a malformed body).
+
+    All were fixed or acted on, each new law with a test.
+- **End to end** (`tests/bn_e2e_loopback.rs`, 29 tests): the trading flow per product × mode; make-before-break; the REST route with HMAC; COIN-M beside USDⓈ-M; PM over papi; PM Pro; the boot's margin-type and leverage refusals; mid-session locks; adoption (within the cap, past it, shared, a row the arm cannot trade, a refused boot); the unified account unread (stale halt, boot timeout); a row listed twice; the sweep retiring the REST route's unsent places; `fs` on a classic stream and none on PM's; the cadence cycle under a throttled window; an unreadable 418/429 on the REST route; and every test BX6 left open except the anchor's ring retry (S8).
+- **Carried** (risk-policy "BX7"):
+  - BX7b: the Demo battery, the K-probes, the body-form DELETEs;
+  - BX13: members read adopted fills;
+  - PM's leverage unasserted;
+  - TradFi `-4411`;
+  - the COIN-M commission asset;
+  - the `core_parse::scan_i64` escalation;
+  - gate 94; BX11's `/state` omissions.
+- **Size:** about 10 200 lines added and 1 700 removed across 52 files (the plan's 3 500 + 2 600 predates the kit migration, the REST route, HMAC, PM Pro and three review rounds).
+
 ### BX8: Spot, including bStocks. IoC-only (BX-17)
 
 **Build:**
@@ -1764,6 +1838,13 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - Verified in a cloud clone before replaying on the Mac. The replay's tree matched the verified tree byte for byte (`git write-tree`).
   - **Gates on the merged tree** (Mac, 19:51–19:54Z): clippy clean; nextest 3 874 run, 3 874 passed, 8 skipped; alloc 99/99 at 0 B/op, 2 ignored, with a fresh `Compiling bench`; `make copy-audit` hits=31 baselined=31 new=0 paid=0 after its self-test; `make license-check` OK. Fuzz, 61 s each on the Mac, no crash: `ws_framer` 5.15 M, `https_answer` 6.23 M, `http1_response` 4.20 M and `bn_wsapi_frame` 7.50 M runs; the fuzz workspace (both lanes' targets) checks clean (cloud). The worker suite through `make py-test`: 1 651 passed, 5 skipped, 1 failed — `test_news_lanes::test_report_prints_the_funnel` (`llm_unhealthy`: the news cycle's LLM health on this machine), in files identical to main's.
   - Git: the merge commit on `binance`, then `git merge binance` on main, both on the operator's word. The engine was never touched.
+- **2026-10-08, BX7 built** (branch `binance`, fast-forwarded to main `4b86aae` first): futures on the shared gateway kit — USDⓈ-M and COIN-M × classic, Portfolio Margin and PM Pro — loopback only; no member arms (O-BX6). The record is in §5 BX7; the risk law in risk-policy "BX7".
+  - Rulings (2026-10-08, §5 BX7's record), among them "commit BX7 now, battery later": the Demo battery and the K-probes are BX7b.
+  - Reviewers, three rounds: risk BLOCK, BLOCK (N1), then NEEDS-DOCS; zero-copy FAIL, FAIL (low), then PASS; alloc PASS throughout; parser FAIL, FAIL, then PASS. Every finding fixed, each new law break-and-watched.
+  - Fuzz (Mac, 300 s each, no crash): `bn_rest_answer` 25.1 M, `bn_user_event` 31.0 M, `bn_wsapi_frame` 35.7 M, `bn_rest_body` 26.5 M, `bn_account` 25.4 M and `bn_mode` 26.4 M runs on the round-2 tree; on the final tree, the four whose readers round 3 changed — `bn_rest_answer` 31.7 M, `bn_rest_body` 25.1 M, `bn_wsapi_frame` 32.9 M and `binance_exchange_info` 10.4 M runs (`bn_cid`, unchanged, ran 38.0 M clean on the M8a tree).
+  - Gates on the final tree (Mac, 18:32–18:34Z): clippy clean; nextest 4 322 run, 4 322 passed, 9 skipped; alloc 117/117 at 0 B/op, 3 ignored, with a fresh `Compiling bench` (gate 107 green on macOS); `make copy-audit` hits=28 baselined=28 new=0 paid=0 after its self-test; `make license-check` flags only `crates/exec-binance/src/ttl.rs`, which this commit deletes.
+  - Docs: `docs/risk-policy.md` ("BX7"; BX6's closed residuals pointed at it), `docs/wire-format.md` (`FILL_FLAG_ADOPTED`), `exec.toml.example`, `.env.example` (the HMAC key names), this plan, CLAUDE.md's alloc-count line (the operator's word).
+  - Git: one commit `BX7:`, explicit paths. The engine was never touched.
 
 ---
 

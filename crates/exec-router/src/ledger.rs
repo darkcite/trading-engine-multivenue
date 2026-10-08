@@ -1851,6 +1851,9 @@ impl Ledger {
         let px = fill.px.raw();
         let buy = fill.side == core_types::Side::Bid;
         let settlement = fill.is_settlement();
+        // BX7: a position adopted at boot is inventory, not a trade — no
+        // turnover, no resting order (`FILL_FLAG_ADOPTED`).
+        let adopted = fill.is_adopted();
         let r = &mut self.inst[i];
         if settlement {
             r.pos_1e6[slot] = 0;
@@ -1880,7 +1883,9 @@ impl Ledger {
             if px > 0 {
                 r.last_px_1e6 = px;
             }
-            let add = if r.law == LAW_INVERSE {
+            let add = if adopted {
+                0
+            } else if r.law == LAW_INVERSE {
                 mul_1e6(inc, r.unit_1e6)
             } else {
                 mul_1e6(inc, px)
@@ -1889,7 +1894,7 @@ impl Ledger {
         }
         self.refresh_instrument(i);
         self.counters.fills_booked = self.counters.fills_booked.saturating_add(1);
-        if !settlement {
+        if !settlement && !adopted {
             self.consume_resting(fill.order_id, slot, qty);
         }
     }
@@ -1997,7 +2002,8 @@ impl Ledger {
         // (measured, testnet 2026-09-15), so this branch should not be
         // reachable for one — which is exactly why it is guarded
         // rather than assumed.
-        if buy && !on_settled_row {
+        // BX7: an adopted position is no buy (`FILL_FLAG_ADOPTED`).
+        if buy && !on_settled_row && !fill.is_adopted() {
             // `i128` product, then a SATURATING narrow — `as i64` would
             // wrap a product past ~9.2e18 negative and let the day cap
             // read a spend as a refund.
@@ -2012,7 +2018,9 @@ impl Ledger {
         self.counters.fills_booked = self.counters.fills_booked.saturating_add(1);
 
         // ---- resting --------------------------------------------------
-        self.consume_resting(fill.order_id, slot, qty);
+        if !fill.is_adopted() {
+            self.consume_resting(fill.order_id, slot, qty);
+        }
     }
 
     /// Decrement the resting order this fill belongs to, retiring it
@@ -3603,6 +3611,45 @@ mod tests {
         l.book_fill(&fill(T0, LIN, false, 10 * E6, 8 * E6, 2));
         assert_eq!(l.slot_day_turnover_1e6(SLOT), 80 * E6);
         assert_eq!(l.instrument_position_1e6(SLOT, LIN), Some(-3 * E6));
+    }
+
+    /// BX7: a position adopted at boot is the slot's inventory — linear and
+    /// inverse — with no turnover and no resting order matched; the next
+    /// trade's turnover counts only what it adds, and an exit is an exit.
+    /// Break-and-watch: booking it as a trade charges 1 950 + 300 to the day.
+    #[test]
+    fn an_adopted_position_is_inventory_not_turnover() {
+        let mut l = inst();
+        let adopt = core_types::FILL_FLAG_ADOPTED;
+        l.book_fill(&fill(T0, LIN, true, 65_000 * E6, 30_000, 0).with_flags(adopt));
+        l.book_fill(&fill(T0, INV, false, 0, 3 * E6, 0).with_flags(adopt));
+        assert_eq!(l.instrument_position_1e6(SLOT, LIN), Some(30_000));
+        assert_eq!(l.instrument_position_1e6(SLOT, INV), Some(-3 * E6));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 0, "inventory, not a trade");
+        assert_eq!(l.counters().resting_unmatched, 0, "no order of ours");
+        // Linear at its price, inverse at its face: 1 950 + 300 USD.
+        assert_eq!(l.instrument_exposure_1e6(SLOT), 1_950 * E6 + 300 * E6);
+        // Selling the adopted long is an exit: never priced, no turnover.
+        let p = l.probe_instrument(LIN, SLOT, 30_000, false, 64_000 * E6, None).unwrap();
+        assert!(p.exit);
+        // Buying more adds only the new part.
+        l.book_fill(&fill(T0, LIN, true, 65_000 * E6, 10_000, 1));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 650 * E6);
+    }
+
+    /// BX6's open test (BX7): a Binance fill — an instrument row's, stamped
+    /// on the wall clock (B3) — rolls the slot's day at 00:00Z like any
+    /// other: the new day's turnover is its own.
+    #[test]
+    fn an_instrument_fill_rolls_the_day_at_midnight() {
+        let mut l = inst();
+        l.book_fill(&fill(T0, LIN, true, 10 * E6, 5 * E6, 1));
+        l.book_fill(&fill(T0 + 23 * 3_600_000_000_000, INV, false, 0, 2 * E6, 2));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 50 * E6 + 200 * E6, "one day: linear and inverse");
+        l.book_fill(&fill(T0 + 24 * 3_600_000_000_000, LIN, true, 10 * E6, E6, 3));
+        assert_eq!(l.slot_day_turnover_1e6(SLOT), 10 * E6, "a fresh day");
+        assert_eq!(l.counters().day_rollovers, 1);
+        assert_eq!(l.instrument_position_1e6(SLOT, LIN), Some(6 * E6), "the position does not roll");
     }
 
     #[test]

@@ -446,17 +446,37 @@ mode = "paper"
 # ---- [exec.binance] — the Binance arm (BX6) -----------------------------
 #
 # REQUIRED when a live slot names binance (the parser refuses the boot
-# without it). This binary's gateway speaks USD-M futures x the classic
-# account only: a `products` word other than "usdm", or an
-# `account_mode` other than "classic", refuses the boot naming the phase
-# that builds it (BX7 COIN-M / PM / PM Pro, BX8 spot, BX9 options, BX10
-# Binance Stocks). At most ONE live slot may name binance — it owns every
-# bound instrument (BX-7).
+# without it). This binary's gateway speaks USD-M and COIN-M futures
+# ("usdm", "coinm") x the classic, Portfolio Margin ("pm") and PM Pro
+# ("pm_pro") accounts — makers on USD-M classic only, IoC-only elsewhere;
+# any other product refuses the boot naming the phase that builds it (BX8
+# spot, BX9 options, BX10 Binance Stocks). At most ONE live slot may name
+# binance — it owns every bound instrument (BX-7). A session bound
+# (halt_on_gain/loss_usd_1e6) is judged on ONE USD equity: a classic arm
+# trading "usdm" alone (COIN-M margins in each coin — a bounded classic
+# arm with "coinm" refuses the boot), or pm / pm_pro (the unified
+# account's). A classic arm binds only USD-M contracts margined in USDT
+# (the account's single-asset totals count USDT's alone); a USDC-margined
+# one refuses the boot there — trade it under pm / pm_pro. Its anchor file is one session's — this key's and this
+# account mode's: a boot under another key (toggling `signing` changes
+# it) or another mode refuses until you delete the file, which ends the
+# session.
 #
 # The key comes from .env: BINANCE_API_KEY and BINANCE_ED25519_SEED (the
-# names only — never a value in this file). Before any order the boot
-# asserts one-way mode, single-asset margin, `account_mode`, and a key
-# that trades futures and cannot withdraw (BX-19); any miss refuses.
+# names only — never a value in this file); `signing = "hmac"` reads
+# BINANCE_HMAC_API_KEY and BINANCE_HMAC_SECRET_KEY instead (REST only: it
+# needs `order_transport = "rest"`, which pm needs in any case). Before
+# any order the boot asserts one-way mode, single-asset margin (USD-M
+# classic), `account_mode`, a key that trades futures and cannot withdraw,
+# and every owned row cross-margined at or under `max_leverage` (1..=125,
+# default 20; BX-19) — except the leverage under pm, which papi's reads
+# do not carry (not asserted there: a residual); any miss refuses. Later,
+# any leverage change on an owned row locks the slot. A restart finding
+# the account holding positions on owned rows (a dedicated account, a
+# slot naming binance alone) adopts them as the owner slot's starting
+# inventory if they fit its `cap_instance_usd_1e6` — past it the boot
+# refuses; on a slot naming another venue too, any such position refuses
+# the boot.
 #
 # `network` is "mainnet": market data and orders on one network (BX-16).
 # `account_scope` is "dedicated": this binary refuses "shared" (its
@@ -488,3 +508,6 @@ mode = "paper"
 # orders_frac_1e6 = 800000
 # qtr_frac_1e6 = 800000
 # spin = 1
+# order_transport = "ws"
+# signing = "ed25519"
+# max_leverage = 20

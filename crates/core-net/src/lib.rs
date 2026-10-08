@@ -78,7 +78,7 @@ pub use keepalive::{
 pub use subs::{
     queue_masked_binary_frame, queue_masked_binary_frame_parts, queue_masked_text_frame,
     queue_masked_text_frame_parts, queue_masked_text_frame_rendered, PendingErr, PendingReq,
-    PendingTable, ReqIds, ReqKind, SubErr, SubId, SubTable,
+    PendingTable, ReqKind, SubErr, SubId, SubTable,
 };
 
 pub use http1::{

@@ -28,9 +28,10 @@
 //! `flush` onward; a connection that dies with requests in flight leaves
 //! them IN DOUBT, resolved by `order.status`, never resent (BX-11).
 
-use core_net::{ReqKind, WsConn, WsErr, WsPart};
+use core_net::{WsConn, WsErr, WsPart};
 
 use crate::cid::{CidPrefix, CID_LEN};
+use crate::inst::PRODUCT_COINM;
 use crate::json::{dec_1e6, i64_of, is_null, str_of, u64_of, Pairs};
 use crate::num::{fixed_len, render_fixed, render_u64, u64_len};
 use crate::userstream::{status_of, ScanErr, Span};
@@ -47,7 +48,6 @@ pub const REQ_MODIFY: u8 = 4;
 pub const REQ_STATUS: u8 = 5;
 /// `v2/account.status` (recon and margin).
 pub const REQ_ACCOUNT: u8 = 6;
-const REQ_FREE: u8 = 0xFF;
 
 /// What a WS API request id stands for: the verb, the open-order slot, the
 /// slot's generation and the placement id of the order it was sent for —
@@ -73,15 +73,6 @@ impl WsReq {
     pub const fn on(verb: u8, ix: u16, gen: u32, oid: u64) -> Self {
         Self { oid, gen, ix, verb }
     }
-}
-
-impl ReqKind for WsReq {
-    const FREE: Self = Self {
-        oid: 0,
-        gen: 0,
-        ix: 0,
-        verb: REQ_FREE,
-    };
 }
 
 /// **One piece of a request**, rendered straight into the frame
@@ -117,7 +108,9 @@ impl WsPart for Part<'_> {
                 // COPY: a literal, the key, a signature or a venue's id
                 // (≤ the part; ≤ the frame's payload in all) into its
                 // destination — the frame (the serialiser's own write,
-                // masked in place after) or the logon's signer input
+                // masked in place after), the REST order route's request
+                // window (BX7: `QueryWriter::parts`, the final bytes,
+                // signed in place) or the logon's signer input
                 // (`render_parts`, cold) — rejected: none, the destination
                 // is where the bytes go.
                 dst.copy_from_slice(b);
@@ -153,9 +146,11 @@ impl FrameSink for WsConn {
     }
 }
 
-/// Render `parts` as plain text into `dst` (a test's or the boot
-/// vectors' buffer: what the frame carries, unmasked). The length, or
-/// `Overflow` — refused whole, never truncated.
+/// Render `parts` as plain text into `dst` — the REST order route's request
+/// window (BX7, through `QueryWriter::parts`: the final bytes, signed in
+/// place), the logon's signer input, a test's or the boot vectors' buffer:
+/// what the frame carries, unmasked. The length, or `Overflow` — refused
+/// whole, never truncated.
 pub fn render_parts(parts: &[Part<'_>], dst: &mut [u8]) -> Result<usize, WsErr> {
     let mut n = 0;
     let mut i = 0;
@@ -175,7 +170,8 @@ pub fn render_parts(parts: &[Part<'_>], dst: &mut [u8]) -> Result<usize, WsErr> 
 /// The boot-fixed request parameters.
 #[derive(Copy, Clone)]
 pub struct WsStatic {
-    /// `selfTradePreventionMode`.
+    /// `selfTradePreventionMode` — empty where the endpoint takes none
+    /// (papi's COIN-M order, BX7): the parameter is then not rendered.
     pub stp: &'static [u8],
     /// `recvWindow`, ms.
     pub recv_window_ms: u64,
@@ -192,10 +188,20 @@ impl WsStatic {
         };
         Self { stp, recv_window_ms }
     }
+
+    /// The same, rendering no STP mode (papi's COIN-M order takes none).
+    #[must_use]
+    pub const fn without_stp(self) -> Self {
+        Self {
+            stp: b"",
+            recv_window_ms: self.recv_window_ms,
+        }
+    }
 }
 
+/// `BUY` / `SELL` (the WS API's and the REST route's word).
 #[inline(always)]
-const fn side_word(side: u8) -> &'static [u8] {
+pub(crate) const fn side_word(side: u8) -> &'static [u8] {
     if side == core_types::Side::Ask as u8 {
         b"SELL"
     } else {
@@ -245,6 +251,10 @@ pub struct Place<'a> {
     pub side: u8,
     /// A maker (`GTX`, post-only) or an IoC.
     pub maker: bool,
+    /// `reduceOnly=true` (BX7: `ORDER_FLAG_REDUCE_ONLY`; one-way mode is
+    /// asserted at boot, so the venue accepts it). Not rendered by a modify,
+    /// which keeps the order's own.
+    pub reduce_only: bool,
     /// Quantity ×1e6 and its decimals.
     pub qty_1e6: i64,
     /// The step's decimals.
@@ -264,6 +274,7 @@ pub struct Place<'a> {
 #[inline]
 pub fn queue_place<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, o: &Place<'_>) -> Result<(), WsErr> {
     let tif: &[u8] = if o.maker { b"GTX" } else { b"IOC" };
+    let ro: &[u8] = if o.reduce_only { b"\",\"reduceOnly\":\"true" } else { b"" };
     s.queue_parts(&[
         Part::Lit(b"{\"id\":"),
         Part::U64(id),
@@ -273,13 +284,15 @@ pub fn queue_place<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, o: &Place<'_
         Part::Lit(side_word(o.side)),
         Part::Lit(b"\",\"type\":\"LIMIT\",\"timeInForce\":\""),
         Part::Lit(tif),
+        Part::Lit(ro),
         Part::Lit(b"\",\"quantity\":\""),
         Part::Fixed(o.qty_1e6, o.qty_dec),
         Part::Lit(b"\",\"price\":\""),
         Part::Fixed(o.px_1e6, o.px_dec),
         Part::Lit(b"\",\"newClientOrderId\":\""),
         o.cid,
-        Part::Lit(b"\",\"newOrderRespType\":\"ACK\",\"selfTradePreventionMode\":\""),
+        Part::Lit(b"\",\"newOrderRespType\":\"ACK"),
+        Part::Lit(if st.stp.is_empty() { b"" } else { b"\",\"selfTradePreventionMode\":\"" }),
         Part::Lit(st.stp),
         Part::Lit(b"\",\"recvWindow\":"),
         Part::U64(st.recv_window_ms),
@@ -355,13 +368,27 @@ pub fn queue_modify<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, o: &Place<'
     ])
 }
 
-/// **`v2/account.status`** — positions, balances and the margin figures
-/// (recon, BX-20).
-pub fn queue_account<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, ts_ms: u64) -> Result<(), WsErr> {
+/// The account read's method: USDⓈ-M's `v2/account.status`, COIN-M's
+/// `account.status` (BX7: per-asset margins, positions in contracts).
+#[inline(always)]
+#[must_use]
+pub const fn account_method(product: u8) -> &'static [u8] {
+    if product == PRODUCT_COINM {
+        b"account.status"
+    } else {
+        b"v2/account.status"
+    }
+}
+
+/// **The account read** ([`account_method`]) — positions, balances and the
+/// margin figures (recon, BX-20).
+pub fn queue_account<S: FrameSink>(s: &mut S, id: u64, st: &WsStatic, product: u8, ts_ms: u64) -> Result<(), WsErr> {
     s.queue_parts(&[
         Part::Lit(b"{\"id\":"),
         Part::U64(id),
-        Part::Lit(b",\"method\":\"v2/account.status\",\"params\":{\"recvWindow\":"),
+        Part::Lit(b",\"method\":\""),
+        Part::Lit(account_method(product)),
+        Part::Lit(b"\",\"params\":{\"recvWindow\":"),
         Part::U64(st.recv_window_ms),
         Part::Lit(b",\"timestamp\":"),
         Part::U64(ts_ms),
@@ -416,16 +443,25 @@ fn bad(_: ()) -> ScanErr {
     ScanErr::BadField
 }
 
+/// The keys a WS API answer is read by, a bit each (BX7, the one-reading
+/// law: a second copy is refused — a `status` 400 after a 200 would retire
+/// an order the venue holds; a second `result` would mix two orders).
+const A_ID: u8 = 1 << 0;
+const A_STATUS: u8 = 1 << 1;
+const A_RESULT: u8 = 1 << 2;
+const A_ERROR: u8 = 1 << 3;
+const A_EVENT: u8 = 1 << 4;
+
 /// **Scan one WS API frame** (module docs).
 pub fn scan_answer(f: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
     *out = WsAnswer::default();
     let mut w = Pairs::new(f, 0).map_err(malformed)?;
-    let (mut have_id, mut have_status) = (false, false);
+    let mut seen = 0u8;
     while let Some((k, a, z)) = w.next().map_err(malformed)? {
-        match k {
+        let bit = match k {
             b"id" => {
                 out.id = if is_null(f, a, z) { 0 } else { u64_of(f, a, z).map_err(bad)? };
-                have_id = true;
+                A_ID
             }
             b"status" => {
                 let s = u64_of(f, a, z).map_err(bad)?;
@@ -433,7 +469,7 @@ pub fn scan_answer(f: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
                     return Err(ScanErr::BadField);
                 }
                 out.status = s as u16;
-                have_status = true;
+                A_STATUS
             }
             b"result" => {
                 out.result = Span {
@@ -443,62 +479,149 @@ pub fn scan_answer(f: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
                 if f.get(a) == Some(&b'{') {
                     result_fields(f, a, out)?;
                 }
+                A_RESULT
             }
             b"error" => {
                 let mut e = Pairs::new(f, a).map_err(malformed)?;
+                let mut coded = false;
                 while let Some((ek, ea, ez)) = e.next().map_err(malformed)? {
                     if ek == b"code" {
+                        // Read once: a second code is refused.
+                        if coded {
+                            return Err(ScanErr::Malformed);
+                        }
+                        coded = true;
                         let c = i64_of(f, ea, ez).map_err(bad)?;
                         out.code = c.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                     } else if ek == b"data" && f.get(ea) == Some(&b'{') {
                         // Advisory: a `retryAfter` it cannot read leaves the
-                        // default quiet in force (never a shorter one).
+                        // default quiet in force (never a shorter one), and
+                        // of two copies the later end stands.
                         let mut d = Pairs::new(f, ea).map_err(malformed)?;
                         while let Some((dk, da, dz)) = d.next().map_err(malformed)? {
                             if dk == b"retryAfter" {
-                                out.retry_after_ms = u64_of(f, da, dz).unwrap_or(0);
+                                out.retry_after_ms = out.retry_after_ms.max(u64_of(f, da, dz).unwrap_or(0));
                             }
                         }
                     }
                 }
+                A_ERROR
             }
             b"event" => {
                 let mut e = Pairs::new(f, a).map_err(malformed)?;
+                let mut named = false;
                 while let Some((ek, ea, ez)) = e.next().map_err(malformed)? {
-                    if ek == b"e" && str_of(f, ea, ez).map_err(bad)? == b"serverShutdown" {
-                        out.shutdown = true;
+                    if ek == b"e" {
+                        // Read once: a second event name is refused.
+                        if named {
+                            return Err(ScanErr::Malformed);
+                        }
+                        named = true;
+                        out.shutdown = str_of(f, ea, ez).map_err(bad)? == b"serverShutdown";
                     }
                 }
+                A_EVENT
             }
-            _ => {}
+            _ => 0,
+        };
+        if seen & bit != 0 {
+            return Err(ScanErr::Malformed);
         }
+        seen |= bit;
+    }
+    // An order's result AND a refusal in one answer is no shape of the
+    // venue's: neither is read as the other's (BX7).
+    if seen & (A_RESULT | A_ERROR) == A_RESULT | A_ERROR {
+        return Err(ScanErr::Malformed);
     }
     if out.shutdown {
         return Ok(());
     }
-    if !have_id || !have_status {
+    if seen & (A_ID | A_STATUS) != A_ID | A_STATUS {
         return Err(ScanErr::Missing);
     }
-    if out.status >= 400 && out.code == 0 {
-        // A refusal must say why; one that does not is not a shape we know.
+    if out.status != 200 && out.code == 0 {
+        // Anything but a 200 must say why (BX7: a code-less 204 or 3xx read
+        // as a refusal would retire an order the venue may hold); one that
+        // does not is not a shape we know.
         return Err(ScanErr::Missing);
     }
     Ok(())
 }
 
+/// **A REST order-route answer read as a WS API one** (BX7, C5): the same
+/// judges take both. A 200's body IS the order (or the account) — the
+/// `result` — and is ONE JSON object, the whole body (whitespace after it
+/// allowed): bytes past it are refused, never read past; any other
+/// status's body is the venue's `{"code","msg"}`, which a 4xx must carry
+/// (a refusal says why) and a 5xx may not (its status alone says
+/// "unknown", BX-11). A 418's or 429's ban end rides `retry_after_ms`. The
+/// request id is the caller's.
+pub fn scan_rest_answer(status: u16, body: &[u8], out: &mut WsAnswer) -> Result<(), ScanErr> {
+    *out = WsAnswer::default();
+    out.status = status;
+    if status == 200 {
+        let end = core_parse::skip_json_value(body, 0).ok_or(ScanErr::Malformed)?;
+        if body.first() != Some(&b'{') || core_parse::skip_ws(body, end) != body.len() {
+            return Err(ScanErr::Malformed);
+        }
+        out.result = Span {
+            at: 0,
+            len: body.len() as u32,
+        };
+        return result_fields(body, 0, out);
+    }
+    out.code = crate::rest::scan_error(body);
+    if status == 418 || status == 429 {
+        out.retry_after_ms = crate::rest::scan_ban_until(body);
+    }
+    if out.code == 0 && status < 500 {
+        return Err(ScanErr::Missing);
+    }
+    Ok(())
+}
+
+/// An order's fields in a `result` (or the REST route's 200 body), each
+/// key read at most once (BX7: a second copy is refused).
 fn result_fields(f: &[u8], at: usize, out: &mut WsAnswer) -> Result<(), ScanErr> {
     let mut r = Pairs::new(f, at).map_err(malformed)?;
+    let mut seen = 0u8;
     while let Some((k, a, z)) = r.next().map_err(malformed)? {
-        match k {
-            b"orderId" => out.venue_oid = u64_of(f, a, z).map_err(bad)?,
-            b"status" => out.order_status = status_of(str_of(f, a, z).map_err(bad)?),
-            b"executedQty" => out.executed_1e6 = dec_1e6(f, a, z).map_err(bad)?,
-            b"avgPrice" => out.avg_px_1e6 = dec_1e6(f, a, z).map_err(bad)?,
-            b"origQty" => out.qty_1e6 = dec_1e6(f, a, z).map_err(bad)?,
-            b"price" => out.px_1e6 = dec_1e6(f, a, z).map_err(bad)?,
-            b"clientOrderId" => out.cid = Span::of(f, str_of(f, a, z).map_err(bad)?),
-            _ => {}
+        let bit: u8 = match k {
+            b"orderId" => {
+                out.venue_oid = u64_of(f, a, z).map_err(bad)?;
+                1 << 0
+            }
+            b"status" => {
+                out.order_status = status_of(str_of(f, a, z).map_err(bad)?);
+                1 << 1
+            }
+            b"executedQty" => {
+                out.executed_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                1 << 2
+            }
+            b"avgPrice" => {
+                out.avg_px_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                1 << 3
+            }
+            b"origQty" => {
+                out.qty_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                1 << 4
+            }
+            b"price" => {
+                out.px_1e6 = dec_1e6(f, a, z).map_err(bad)?;
+                1 << 5
+            }
+            b"clientOrderId" => {
+                out.cid = Span::of(f, str_of(f, a, z).map_err(bad)?);
+                1 << 6
+            }
+            _ => 0,
+        };
+        if seen & bit != 0 {
+            return Err(ScanErr::Malformed);
         }
+        seen |= bit;
     }
     Ok(())
 }
@@ -527,6 +650,27 @@ pub(crate) mod tests {
         WsStatic::new("EXPIRE_TAKER", 1_000)
     }
 
+    /// BX7 (C5): a REST answer reads as the WS API's — the order fields of
+    /// a 200, the code of a refusal, the ban of a 418; a 4xx without a code
+    /// is not a shape we know, a 5xx without one is "unknown" (BX-11).
+    #[test]
+    fn a_rest_answer_reads_as_a_ws_one() {
+        let mut a = WsAnswer::default();
+        let ok = br#"{"orderId":8001,"symbol":"BTCUSDT","status":"NEW","clientOrderId":"mv6512ab0f2000000000000006500000","price":"65000.0","avgPrice":"0.00","origQty":"0.002","executedQty":"0"}"#;
+        scan_rest_answer(200, ok, &mut a).unwrap();
+        assert_eq!((a.status, a.venue_oid, a.qty_1e6, a.code), (200, 8_001, 2_000, 0));
+        assert_eq!(a.cid.get(ok), b"mv6512ab0f2000000000000006500000");
+        assert_eq!(a.result.get(ok), &ok[..]);
+        scan_rest_answer(400, br#"{"code":-2019,"msg":"Margin is insufficient."}"#, &mut a).unwrap();
+        assert_eq!((a.status, a.code), (400, -2019));
+        scan_rest_answer(418, br#"{"code":-1003,"msg":"IP banned until 1790000600000."}"#, &mut a).unwrap();
+        assert_eq!((a.code, a.retry_after_ms), (-1003, 1_790_000_600_000));
+        assert_eq!(scan_rest_answer(400, b"oops", &mut a), Err(ScanErr::Missing));
+        scan_rest_answer(502, b"<html>bad gateway</html>", &mut a).unwrap();
+        assert_eq!((a.status, a.code), (502, 0));
+        assert_eq!(scan_rest_answer(200, b"[]", &mut a), Err(ScanErr::Malformed));
+    }
+
     #[test]
     fn place_renders_the_planned_request() {
         let mut t = Text::default();
@@ -540,12 +684,18 @@ pub(crate) mod tests {
             px_dec: 1,
             cid: Part::Cid(&PREFIX, 3, 0x0123_4567_89ab_cdef),
             ts_ms: 1_790_000_000_000,
+            reduce_only: false,
         };
         queue_place(&mut t, 42, &st(), &o).unwrap();
         assert_eq!(
             std::str::from_utf8(&t.0).unwrap(),
             r#"{"id":42,"method":"order.place","params":{"symbol":"BTCUSDT","side":"BUY","type":"LIMIT","timeInForce":"GTX","quantity":"0.012","price":"65000.1","newClientOrderId":"mv6512ab0f30123456789abcdef00000","newOrderRespType":"ACK","selfTradePreventionMode":"EXPIRE_TAKER","recvWindow":1000,"timestamp":1790000000000}}"#
         );
+        // BX7: a reduce-only IoC says so.
+        let mut t = Text::default();
+        let ro = Place { maker: false, reduce_only: true, ..o };
+        queue_place(&mut t, 43, &st(), &ro).unwrap();
+        assert!(std::str::from_utf8(&t.0).unwrap().contains(r#""timeInForce":"IOC","reduceOnly":"true","quantity":"0.012""#));
     }
 
     #[test]
@@ -567,6 +717,7 @@ pub(crate) mod tests {
             px_dec: 1,
             cid: Part::Lit(b"CID"),
             ts_ms: 6,
+            reduce_only: true,
         };
         queue_modify(&mut t, 8, &st(), &m).unwrap();
         assert_eq!(
@@ -580,10 +731,16 @@ pub(crate) mod tests {
             r#"{"id":9,"method":"order.status","params":{"symbol":"BTCUSDT","origClientOrderId":"mv6512ab0f30123456789abcdef00000","recvWindow":1000,"timestamp":7}}"#
         );
         let mut t = Text::default();
-        queue_account(&mut t, 10, &st(), 8).unwrap();
+        queue_account(&mut t, 10, &st(), crate::inst::PRODUCT_USDM, 8).unwrap();
         assert_eq!(
             std::str::from_utf8(&t.0).unwrap(),
             r#"{"id":10,"method":"v2/account.status","params":{"recvWindow":1000,"timestamp":8}}"#
+        );
+        let mut t = Text::default();
+        queue_account(&mut t, 11, &st(), PRODUCT_COINM, 8).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&t.0).unwrap(),
+            r#"{"id":11,"method":"account.status","params":{"recvWindow":1000,"timestamp":8}}"#
         );
     }
 
@@ -639,7 +796,7 @@ pub(crate) mod tests {
             let q = qty / 1_000 * 1_000 + 1_000;
             let p = px / 100_000 * 100_000 + 100_000;
             let mut t = Text::default();
-            let o = Place { symbol: b"BTCUSDT", side: 1, maker: false, qty_1e6: q, qty_dec: 3, px_1e6: p, px_dec: 1, cid: Part::Cid(&PREFIX, 3, id as u64), ts_ms: 1 };
+            let o = Place { symbol: b"BTCUSDT", side: 1, maker: false, qty_1e6: q, qty_dec: 3, px_1e6: p, px_dec: 1, cid: Part::Cid(&PREFIX, 3, id as u64), ts_ms: 1, reduce_only: id & 1 == 1 };
             queue_place(&mut t, id as u64, &st(), &o).unwrap();
             let mut w = Pairs::new(&t.0, 0).unwrap();
             let mut seen = 0;

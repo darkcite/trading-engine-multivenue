@@ -14,6 +14,12 @@
 //!
 //! Every malformed input ends the walk with `Err(())`; the scanners turn
 //! that into their own refusal. No `unwrap`, no index past a bound.
+//!
+//! **A key named twice** (BX7): the walker hands out every pair, so a
+//! reader decides. The readers BX7 added or changed refuse a key they read
+//! that an object names twice — no second reader of the frame can then
+//! pick another copy than the first did ([`field`] for one top-level key;
+//! the scanners keep a bit per key they read).
 
 use core_parse::{skip_json_value, skip_string, skip_ws};
 
@@ -128,6 +134,24 @@ impl<'a> Elems<'a> {
         self.pos = e;
         Ok(Some((p, e)))
     }
+}
+
+/// **The value span of `key` in the object at the start of `b`** — a key of
+/// that object itself, never a nested one — or `None`: absent, named twice
+/// (refused, never chosen between: BX7), or `b` no well-formed object.
+/// Cold (the boot's judges): it walks the whole object.
+pub fn field(b: &[u8], key: &[u8]) -> Option<(usize, usize)> {
+    let mut w = Pairs::new(b, 0).ok()?;
+    let mut v = None;
+    while let Some((k, a, z)) = w.next().ok()? {
+        if k == key {
+            if v.is_some() {
+                return None;
+            }
+            v = Some((a, z));
+        }
+    }
+    v
 }
 
 /// A string value's bytes (without the quotes; escapes left as they are —
@@ -269,6 +293,17 @@ mod tests {
         assert!(Elems::new(b"[1 2]", 0).and_then(|mut e| { e.next()?; e.next() }).is_err());
         let mut empty = Elems::new(b"[ ]", 0).unwrap();
         assert_eq!(empty.next(), Ok(None));
+    }
+
+    /// BX7: one top-level key, named once — a nested one is not it, a
+    /// second copy refuses, a malformed object reads as none.
+    #[test]
+    fn a_field_is_the_objects_own_and_named_once() {
+        let f = br#"{"x":{"k":1},"k":true}"#;
+        assert_eq!(field(f, b"k").map(|(a, z)| &f[a..z]), Some(&b"true"[..]));
+        assert_eq!(field(br#"{"x":{"k":1}}"#, b"k"), None, "a nested key is not the object's");
+        assert_eq!(field(br#"{"k":1,"k":2}"#, b"k"), None, "named twice");
+        assert_eq!(field(br#"{"k":1"#, b"k"), None, "malformed");
     }
 
     #[test]

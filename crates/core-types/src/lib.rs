@@ -684,7 +684,8 @@ pub struct Fill {
     /// apart is an audit of nothing, and Stage-3 will have both in one
     /// stream.
     pub origin: u8,
-    /// Bit flags about the fill itself — see [`FILL_FLAG_SETTLEMENT`].
+    /// Bit flags about the fill itself — see [`FILL_FLAG_SETTLEMENT`] and
+    /// [`FILL_FLAG_ADOPTED`].
     ///
     /// Deliberately NOT part of [`Self::origin`]. That byte answers
     /// one question ("did a venue report this, or did we model it?")
@@ -763,7 +764,8 @@ impl Fill {
         }
     }
 
-    /// The same fill, flagged — see [`FILL_FLAG_SETTLEMENT`].
+    /// The same fill, flagged — see [`FILL_FLAG_SETTLEMENT`] and
+    /// [`FILL_FLAG_ADOPTED`].
     ///
     /// Separate from [`Self::with_attribution`] because the two answer
     /// different questions and a caller that knows one rarely knows
@@ -780,6 +782,14 @@ impl Fill {
     #[must_use]
     pub const fn is_settlement(&self) -> bool {
         self.flags & FILL_FLAG_SETTLEMENT != 0
+    }
+
+    /// Is this the venue's position ADOPTED at boot as the slot's starting
+    /// inventory, rather than a trade (BX7)?
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_adopted(&self) -> bool {
+        self.flags & FILL_FLAG_ADOPTED != 0
     }
 }
 
@@ -804,6 +814,19 @@ pub const FILL_ORIGIN_PAPER: u8 = 1;
 /// makes that counter mean two things. This flag is how a member tells
 /// them apart.
 pub const FILL_FLAG_SETTLEMENT: u8 = 1 << 0;
+
+/// [`Fill::flags`]: the venue's position ADOPTED at boot as the slot's
+/// starting inventory — no trade happened (BX7: the Binance arm, on a
+/// dedicated account, within the owner slot's instance cap).
+///
+/// A restart finds the account holding what the last run bought. The arm
+/// books it once, at its first reconciliation, as this fill — at the read's
+/// mark for a linear row; none for an inverse row, whose exposure is its
+/// face. The ledger books it into the position and nothing else: not the
+/// day's turnover (the venue's own day read already counts whatever was
+/// bought today) and no resting order. A member reads it as its inventory
+/// at boot, never as a trade it asked for.
+pub const FILL_FLAG_ADOPTED: u8 = 1 << 1;
 
 /// [`Order::client_oid`] bits 0..32: the **instance** the member
 /// believes it is trading.

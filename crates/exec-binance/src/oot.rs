@@ -48,8 +48,9 @@ pub const OF_MODIFY_SENT: u8 = 1 << 2;
 pub const OF_FILLED_ANY: u8 = 1 << 3;
 /// The venue acknowledged it.
 pub const OF_ACKED: u8 = 1 << 4;
-/// The order is on the TTL wheel.
-pub const OF_ON_WHEEL: u8 = 1 << 5;
+/// The order has a deadline armed in the gateway's queue (its TTL, or an
+/// owed cancel's retry; at most one).
+pub const OF_TIMED: u8 = 1 << 5;
 /// The venue's last open-order listing named it (recon scratch, cold).
 pub const OF_LISTED: u8 = 1 << 6;
 /// Fills were booked without their trade ids — from an `order.status`
@@ -59,13 +60,13 @@ pub const OF_LISTED: u8 = 1 << 6;
 pub const OF_STATUS_BOOKED: u8 = 1 << 7;
 
 /// [`OotEntry::owe`]: a member's cancel is owed (it could not be sent, or
-/// its answer was lost or refused); the TTL wheel retries it.
+/// its answer was lost or refused); the deadline queue retries it.
 pub const OWE_MEMBER: u8 = 1 << 0;
 /// The TTL's cancel is owed.
 pub const OWE_TTL: u8 = 1 << 1;
 /// The venue did not know the order when its cancel came (`-2011`; its
 /// place may still have been in flight): the owed cancel goes again once
-/// the venue shows the order working (S3) — not from the wheel, and not on
+/// the venue shows the order working (S3) — not from the queue, and not on
 /// every update of an order whose cancels are refused for another reason.
 pub const OWE_UNKNOWN: u8 = 1 << 2;
 
@@ -99,7 +100,7 @@ pub struct OotEntry {
     pub state: u8,
     /// `OF_*`.
     pub flags: u8,
-    /// `OWE_*`: a cancel owed, retried from the TTL wheel.
+    /// `OWE_*`: a cancel owed, retried from the deadline queue.
     pub owe: u8,
 }
 
@@ -147,7 +148,10 @@ pub struct OotAux {
     /// next, and every request carries it — an answer for the slot's
     /// previous order never reaches the next one (S7).
     pub gen: u32,
-    _r: [u8; 4],
+    /// The place's `core_types::ORDER_FLAG_*` (BX7): the REST route renders
+    /// the place when its turn comes, from the table.
+    pub place_flags: u8,
+    _r: [u8; 3],
     /// The quote booked on it, exact: Σ quantity ×1e6 × price ×1e6. A
     /// quantity booked without its trades is priced at the implied average
     /// (`(cumulative × average − booked quote) / quantity`, S1 / N4).

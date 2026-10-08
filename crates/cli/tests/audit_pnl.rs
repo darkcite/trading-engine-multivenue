@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 use core_io::{PmlrWriter, SlotKind};
 use core_types::{
-    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE, SYMBOL_ID_NONE,
+    AiCmd, AiCmdKind, Fill, Order, Price, Qty, Side, Tick, VenueId, AI_SIDE_NONE, FILL_FLAG_ADOPTED,
+    SYMBOL_ID_NONE,
 };
 
 use cli::audit_pnl::{run, AuditPnlConfig};
@@ -528,6 +529,60 @@ fn paper_fills_fold_into_cash_plus_markout() {
         json.contains("\"paper\":{\"fills\":1,\"net_usd\":\"1.0\"}"),
         "json: {json}"
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// BX7 (the risk review's R6): a Binance restart adopts the position the
+/// last run left — opening inventory, not a second buy. Run 1 bought 10 @
+/// 0.50; run 2's boot adopts the same 10 at its mark (0.55): the paper view
+/// holds 10, marked 0.60 ⇒ net +1 (cash −5, mark-out 6), one fill traded.
+/// Break-and-watch: folded as a trade it holds 20 and nets +1.5.
+#[test]
+fn an_adopted_fill_is_opening_inventory_not_a_second_buy() {
+    let root = tmp_root("adopted");
+    let d1 = run_dir(&root, EPOCH_1);
+    manifest(&d1, &[(42, "PMTOK")]);
+    write_ticks(&d1, "pm", EPOCH_1, &[pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000)]);
+    write_fills(&d1, EPOCH_1, &[Fill::new(5_000, 42, Side::Bid, Price::from_raw(500_000), Qty::from_raw(10_000_000), 77)]);
+    let d2 = run_dir(&root, EPOCH_2);
+    manifest(&d2, &[(42, "PMTOK")]);
+    write_ticks(&d2, "pm", EPOCH_2, &[pm_tick(1_000, 42, 590_000, 1_000_000, 610_000, 1_000_000)]);
+    write_fills(
+        &d2,
+        EPOCH_2,
+        &[Fill::new(2_000, 42, Side::Bid, Price::from_raw(550_000), Qty::from_raw(10_000_000), 0).with_flags(FILL_FLAG_ADOPTED)],
+    );
+    let (json, lines) = run_report(&root);
+    assert!(json.contains("\"paper\":{\"fills\":1,\"net_usd\":\"1.0\"}"), "json: {json}");
+    assert!(lines.iter().any(|l| l.contains("paper view: fills=1 adopted=1 ")), "{lines:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// BX7 (the risk review's N7): an adopted fill without a price (an
+/// inverse leg's: its face carries none) opens at its symbol's last mark —
+/// or, before any, at its next — never at 0, which read the exit's whole
+/// flow as paper P&L. 42 adopts 10 after a 0.41 mark; 43 adopts 10 before
+/// its first mark (0.30): both open where they are marked ⇒ net 0.
+/// Break-and-watch: opened at 0, the paper view nets +7.1.
+#[test]
+fn an_unpriced_adopted_fill_opens_at_the_mark() {
+    let root = tmp_root("adopted-unpriced");
+    let d = run_dir(&root, EPOCH_1);
+    manifest(&d, &[(42, "PMTOK"), (43, "PMTWO")]);
+    write_ticks(
+        &d,
+        "pm",
+        EPOCH_1,
+        &[
+            pm_tick(1_000, 42, 400_000, 1_000_000, 420_000, 1_000_000),
+            pm_tick(3_000_000_000, 43, 290_000, 1_000_000, 310_000, 1_000_000),
+        ],
+    );
+    let adopted = |sym: u32| Fill::new(2_000, sym, Side::Bid, Price::from_raw(0), Qty::from_raw(10_000_000), 0).with_flags(FILL_FLAG_ADOPTED);
+    write_fills(&d, EPOCH_1, &[adopted(42), adopted(43)]);
+    let (json, lines) = run_report(&root);
+    assert!(json.contains("\"paper\":{\"fills\":0,\"net_usd\":\"0.0\"}"), "json: {json}");
+    assert!(lines.iter().any(|l| l.contains("paper view: fills=0 adopted=2 ") && l.contains("; 0 adopted leg(s) never marked")), "{lines:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

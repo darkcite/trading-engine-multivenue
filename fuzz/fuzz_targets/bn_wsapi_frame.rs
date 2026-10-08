@@ -5,8 +5,9 @@
 //! — every WS API answer the gateway reads on the order socket.
 //!
 //! It must never panic; an answer it accepts names spans inside the frame,
-//! and a refusal status (≥ 400) it accepts always carries a code (a
-//! refusal that does not say why is not a shape the gateway may act on).
+//! and any status but a 200 it accepts carries a code (BX7: an answer that
+//! does not say why — a refusal, a 204, a 3xx — is not a shape the gateway
+//! may act on; it would retire an order the venue may hold).
 
 #![no_main]
 
@@ -19,6 +20,6 @@ fuzz_target!(|data: &[u8]| {
         let r = a.result.at as usize + a.result.len as usize;
         let c = a.cid.at as usize + a.cid.len as usize;
         assert!(r <= data.len() && c <= data.len(), "a span past the frame");
-        assert!(a.shutdown || a.status < 400 || a.code != 0, "a refusal without a code");
+        assert!(a.shutdown || a.status == 200 || a.code != 0, "a non-200 without a code");
     }
 });
