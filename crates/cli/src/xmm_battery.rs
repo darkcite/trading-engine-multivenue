@@ -162,10 +162,10 @@ const MOVE_BPS: i64 = 50;
 /// phase's and the stall's (a battery bug strands nothing past it).
 const SAFETY_TTL_MS: u64 = 30_000;
 /// How long the boot may take.
-const BOOT_WAIT: Duration = Duration::from_secs(120);
+pub(crate) const BOOT_WAIT: Duration = Duration::from_secs(120);
 /// How long one verb's answer may take: a post timeout, the doubt's
 /// settlement (`expiresAfter` and the skew), room.
-const STEP_WAIT: Duration = Duration::from_secs(25);
+pub(crate) const STEP_WAIT: Duration = Duration::from_secs(25);
 /// The arm's shutdown and the gateway's join.
 const JOIN_WAIT: Duration = Duration::from_secs(20);
 /// The end's cancel-all wait after a SIGINT/SIGTERM: short — the arm's
@@ -187,7 +187,7 @@ const _: () = {
 };
 /// Tries to close a position (each a fresh mid and a wider cross).
 const CLOSE_TRIES: u32 = 4;
-const E8: i64 = 100_000_000;
+pub(crate) const E8: i64 = 100_000_000;
 const NS_PER_MS: u64 = 1_000_000;
 
 /// The account was not the battery's to run on: no asked perp listed and
@@ -301,7 +301,7 @@ pub struct Tally {
 }
 
 impl Tally {
-    fn note(&mut self, ok: bool) {
+    pub(crate) fn note(&mut self, ok: bool) {
         if ok {
             self.ok += 1;
         } else {
@@ -546,10 +546,13 @@ impl BatteryReport {
     }
 }
 
-/// `/info`, over one keep-alive connection.
-struct Info {
+/// `/info`, over one keep-alive connection, for one slot's battery: the
+/// open orders it sorts are that slot's (XMM XH4i-8: shared with
+/// `crate::outcome_battery`).
+pub(crate) struct Info {
     http: HttpsPost,
     master: [u8; 20],
+    slot: u8,
 }
 
 /// An `/info` request's room.
@@ -558,19 +561,20 @@ const INFO_REQ: usize = 512;
 const INFO_RESP: usize = 4 * 1024 * 1024;
 
 impl Info {
-    fn new(
+    pub(crate) fn new(
         host: &str,
         port: u16,
         tls: Arc<ClientConfig>,
         master: [u8; 20],
+        slot: u8,
     ) -> Result<Self, String> {
         let http = HttpsPost::new(host, port, "/info", tls, INFO_REQ, INFO_RESP)
             .map_err(|e| format!("{host}/info: {e}"))?;
-        Ok(Self { http, master })
+        Ok(Self { http, master, slot })
     }
 
     /// Post `body`, hand the answer to `f` in place.
-    fn read<T>(&mut self, body: &[u8], f: impl FnOnce(&[u8]) -> T) -> Result<T, String> {
+    pub(crate) fn read<T>(&mut self, body: &[u8], f: impl FnOnce(&[u8]) -> T) -> Result<T, String> {
         let b = self.http.body_mut();
         if body.len() > b.len() {
             return Err(String::from("/info: request too large"));
@@ -587,7 +591,7 @@ impl Info {
     }
 
     /// A per-user read rendered by `render` into a scratch buffer.
-    fn user<T>(
+    pub(crate) fn user<T>(
         &mut self,
         render: fn(&mut [u8], &[u8; 20]) -> Result<usize, exec_hyperliquid::ScanErr>,
         f: impl FnOnce(&[u8]) -> T,
@@ -598,7 +602,7 @@ impl Info {
     }
 
     /// The perp sheet: account value ×1e8 and the positions by coin.
-    fn sheet(&mut self) -> Result<(i64, Vec<(String, i64)>), String> {
+    pub(crate) fn sheet(&mut self) -> Result<(i64, Vec<(String, i64)>), String> {
         self.user(perp_state_request, |b| {
             let mut pos = vec![PerpPosition::default(); 256];
             let (value, n) = scan_perp_state(b, &mut pos).map_err(|e| format!("sheet: {e:?}"))?;
@@ -610,9 +614,10 @@ impl Info {
         })?
     }
 
-    /// The open orders: `(slot 6's client ids, other slots' or strangers'
-    /// count)`.
-    fn orders(&mut self) -> Result<(Vec<u64>, u32), String> {
+    /// The open orders: `(the slot's client ids, other slots' or
+    /// strangers' count)`.
+    pub(crate) fn orders(&mut self) -> Result<(Vec<u64>, u32), String> {
+        let slot = self.slot;
         self.user(open_orders_request, |b| {
             let mut rows = vec![OpenOrder::default(); MAX_OPEN_ORDERS];
             let n = scan_open_orders(b, &mut rows).map_err(|e| format!("orders: {e:?}"))?;
@@ -623,17 +628,59 @@ impl Info {
                     Some(Owner::Ours {
                         strategy_id,
                         client_oid,
-                    }) if strategy_id == SLOT => ours.push(client_oid),
+                    }) if strategy_id == slot => ours.push(client_oid),
                     _ => others += 1,
                 }
             }
             Ok((ours, others))
         })?
     }
+
+    /// The spot sheet: the free USDC ×1e8 and every HIP-4 leg held
+    /// (`+<enc>`, total ×1e8, none at zero).
+    pub(crate) fn spot(&mut self) -> Result<(i64, Vec<(String, i64)>), String> {
+        self.user(spot_state_request, spot_rows)?
+    }
+
+    /// The address budget's requests left (`userRateLimit`: the initial
+    /// buffer plus a request a traded dollar, less those used).
+    pub(crate) fn budget_left(&mut self) -> Result<i64, String> {
+        let (used, vlm_1e6, _) = self
+            .user(exec_hyperliquid::budget::rate_limit_request, |b| {
+                exec_hyperliquid::budget::scan_rate_limit(b)
+            })?
+            .ok_or_else(|| String::from("userRateLimit: unreadable"))?;
+        let cap = i64::try_from(exec_hyperliquid::INITIAL_BUFFER)
+            .unwrap_or(0)
+            .saturating_add(vlm_1e6 / 1_000_000);
+        Ok(cap.saturating_sub(i64::try_from(used).unwrap_or(i64::MAX)))
+    }
+}
+
+/// A `spotClearinghouseState` answer: the free USDC ×1e8 and every HIP-4 leg
+/// held (`+<enc>`, total ×1e8; none at zero) — what the batteries' start
+/// refuses and their end's leftover read counts.
+///
+/// # Errors
+/// The answer does not scan.
+pub(crate) fn spot_rows(b: &[u8]) -> Result<(i64, Vec<(String, i64)>), String> {
+    let mut bal = vec![SpotBalance::default(); MAX_SPOT_BALANCES];
+    let n = scan_spot_state(b, &mut bal).map_err(|e| format!("spot: {e:?}"))?;
+    let mut usdc = 0i64;
+    let mut legs = Vec::new();
+    for x in &bal[..n] {
+        let c = x.coin.of(b);
+        if c == b"USDC" {
+            usdc = x.free_1e8();
+        } else if c.first() == Some(&b'+') && x.total_1e8 != 0 {
+            legs.push((String::from_utf8_lossy(c).into_owned(), x.total_1e8));
+        }
+    }
+    Ok((usdc, legs))
 }
 
 /// A decimal string (`"60123.5"`) as ×1e8.
-fn dec_1e8(s: &[u8]) -> Option<i64> {
+pub(crate) fn dec_1e8(s: &[u8]) -> Option<i64> {
     let mut int: i64 = 0;
     let mut frac: i64 = 0;
     let mut scale: i64 = E8;
@@ -666,42 +713,70 @@ fn dec_1e8(s: &[u8]) -> Option<i64> {
 fn mid_of(body: &[u8], coin: &str) -> Option<i64> {
     let key = format!("\"{coin}\":\"");
     let k = key.as_bytes();
-    let at = body.windows(k.len()).position(|w| w == k)? + k.len();
+    let at = find(body, k)? + k.len();
     let end = body[at..].iter().position(|&c| c == b'"')? + at;
     dec_1e8(&body[at..end])
 }
 
 /// Wall time, ms (the venue's clock: `expiresAfter`, the dead man's
 /// deadline, the fills' stamps).
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// `needle` somewhere in `hay`.
-fn has(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
+/// Where `needle` (never empty) first starts in `hay`.
+pub(crate) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// `needle` (never empty) somewhere in `hay`.
+pub(crate) fn has(hay: &[u8], needle: &[u8]) -> bool {
+    find(hay, needle).is_some()
 }
 
 /// One recorded tap frame.
-struct TapRow {
+pub(crate) struct TapRow {
     at_ns: u64,
     wall_ms: u64,
-    fills: bool,
-    body: Vec<u8>,
+    /// A `userFills` frame (else `orderUpdates`).
+    pub(crate) fills: bool,
+    pub(crate) body: Vec<u8>,
+}
+
+impl TapRow {
+    /// A frame as the tap keeps it (tests).
+    #[cfg(test)]
+    pub(crate) fn for_test(fills: bool, body: Vec<u8>) -> Self {
+        Self {
+            at_ns: 0,
+            wall_ms: 0,
+            fills,
+            body,
+        }
+    }
 }
 
 /// The read-only user stream (D6).
-struct Tap {
+pub(crate) struct Tap {
     rows: Arc<Mutex<Vec<TapRow>>>,
     stop: Arc<AtomicBool>,
+    /// A gap: rows went unseen.
     failed: Arc<AtomicBool>,
+    /// `None`: the tap never started.
     handle: Option<JoinHandle<()>>,
 }
 
 impl Tap {
-    fn start(host: &str, port: u16, tls: Arc<ClientConfig>, master: [u8; 20]) -> Self {
+    /// The tap for `master`, its thread and its lines named `label`.
+    pub(crate) fn start(
+        host: &str,
+        port: u16,
+        tls: Arc<ClientConfig>,
+        master: [u8; 20],
+        label: &'static str,
+    ) -> Self {
         let rows = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
@@ -712,7 +787,7 @@ impl Tap {
             host.to_string(),
         );
         let handle = std::thread::Builder::new()
-            .name(String::from("xh4g-tap"))
+            .name(format!("{label}-tap"))
             .spawn(move || {
                 let mut tries = 0u32;
                 while !s2.load(Ordering::Acquire) && tries < 5 {
@@ -720,13 +795,13 @@ impl Tap {
                     let mut ws = match UserWs::new(&host, port, Arc::clone(&tls), &master) {
                         Ok(w) => w,
                         Err(e) => {
-                            warn!("xh4g tap: {e}");
+                            warn!("{label} tap: {e}");
                             std::thread::sleep(Duration::from_secs(1));
                             continue;
                         }
                     };
                     if let Err(e) = ws.connect() {
-                        warn!("xh4g tap: {e}");
+                        warn!("{label} tap: {e}");
                         std::thread::sleep(Duration::from_secs(1));
                         continue;
                     }
@@ -753,7 +828,7 @@ impl Tap {
                             if !s2.load(Ordering::Acquire) {
                                 f2.store(true, Ordering::Release);
                             }
-                            warn!("xh4g tap: {e} — a gap in the tap");
+                            warn!("{label} tap: {e} — a gap in the tap");
                             break;
                         }
                     }
@@ -771,15 +846,20 @@ impl Tap {
         }
     }
 
-    fn finish(&mut self) -> Vec<TapRow> {
+    /// Stop the tap: its rows, and whether it missed any (it never started,
+    /// or a gap).
+    pub(crate) fn finish(&mut self) -> (Vec<TapRow>, bool) {
+        let started = self.handle.is_some();
         self.stop.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        self.rows
+        let rows = self
+            .rows
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (rows, !started || self.failed.load(Ordering::Acquire))
     }
 }
 
@@ -787,10 +867,12 @@ impl Tap {
 type ModifyRec = (u64, u64, u64, bool);
 
 /// The arm, driven as the engine drives it, and what it said.
-struct Drive {
-    arm: HlGatewayArm,
+pub(crate) struct Drive {
+    pub(crate) arm: HlGatewayArm,
+    /// The slot the arm trades: its health word is read for it.
+    slot: u8,
     events: Vec<(u64, OrderEvent)>,
-    fills: Vec<(u64, Fill)>,
+    pub(crate) fills: Vec<(u64, Fill)>,
     renamed: Vec<(u64, Renamed)>,
     retired: Vec<(u64, Retired)>,
     report: GatewayArmReport,
@@ -808,6 +890,26 @@ struct Drive {
 }
 
 impl Drive {
+    /// `arm` for `slot`, not yet turned: nothing heard, the waits ended by
+    /// a stop.
+    pub(crate) fn new(arm: HlGatewayArm, slot: u8) -> Self {
+        Self {
+            arm,
+            slot,
+            events: Vec::with_capacity(4_096),
+            fills: Vec::with_capacity(256),
+            renamed: Vec::with_capacity(256),
+            retired: Vec::with_capacity(1_024),
+            report: GatewayArmReport::default(),
+            next_report_ns: 0,
+            peaks: (0, 0, 0),
+            rtt: (0, 0, 0, 0),
+            last_ns: 0,
+            ready_ns: 0,
+            honor_stop: true,
+        }
+    }
+
     /// One engine iteration: the fills (the pump runs inside), the order
     /// events, the renames, the retirements, the idle; the arm's report
     /// once a second.
@@ -828,7 +930,7 @@ impl Drive {
         let _ = self.arm.on_idle();
         let now = now_ns();
         if self.last_ns != 0 {
-            let w = self.arm.exec_health(SLOT, now).rtt_ms;
+            let w = self.arm.exec_health(self.slot, now).rtt_ms;
             if w >= RTT_PULL_MS {
                 self.rtt.3 += now.saturating_sub(self.last_ns);
             }
@@ -859,7 +961,7 @@ impl Drive {
 
     /// Turn until `done` or `wait` passes — or, outside the end, a
     /// SIGINT/SIGTERM.
-    fn until(&mut self, wait: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
+    pub(crate) fn until(&mut self, wait: Duration, mut done: impl FnMut(&Self) -> bool) -> bool {
         let end = Instant::now() + wait;
         loop {
             self.turn();
@@ -873,8 +975,75 @@ impl Drive {
         }
     }
 
+    /// The halt growth stops at — the router's checks this path stands in
+    /// for: a drift, an unknown order of the slot, the gateway's halt word,
+    /// the budget floor, an asset-refusal streak. Not the reject streak: the
+    /// batteries provoke `BAD_ALO_PX` on purpose. `None` while none holds.
+    pub(crate) fn halt_word(&self) -> Option<String> {
+        let s = self.arm.halt_signal();
+        let unknown = self.arm.counters().unknown_orders;
+        (s.recon_drift_usd_1e6 != 0
+            || unknown != 0
+            || s.gateway_halted != 0
+            || s.budget_floor_breached != 0
+            || s.asset_refusal_streak != 0)
+            .then(|| {
+                format!(
+                    "HALT — drift {} unknown orders {unknown} gateway halted {} budget floor {} \
+                     asset refusals {}: growth stops",
+                    s.recon_drift_usd_1e6,
+                    s.gateway_halted,
+                    s.budget_floor_breached,
+                    s.asset_refusal_streak
+                )
+            })
+    }
+
+    /// Wait until the gateway's rates no longer throttle growth (XH4e: at
+    /// 80 % of a share a place is refused unsent) and a socket is Ready
+    /// (XMM XH5c-3: the word reads throttled without one) — at most
+    /// [`STEP_WAIT`].
+    pub(crate) fn unthrottled(&mut self) -> bool {
+        self.until(STEP_WAIT, |d| {
+            d.arm.congestion() < u64::from(EXEC_CONGESTION_THROTTLED)
+        })
+    }
+
+    /// The cancel verb on `oid` (on `sym`, for the slot), then its end:
+    /// `None` when the arm refused the verb, else whether the order ended.
+    pub(crate) fn cancel_verb(&mut self, sym: u32, oid: u64) -> Option<bool> {
+        let mut req = CancelReq::new(now_ns(), VenueId::Hyperliquid, sym, oid);
+        req.strategy_id = self.slot;
+        self.arm.cancel(&req).ok()?;
+        Some(self.until(STEP_WAIT, |d| d.end(oid).is_some()))
+    }
+
+    /// Cancel `oid` and wait for its end (a cleanup: an order the arm no
+    /// longer holds has ended).
+    pub(crate) fn cancel(&mut self, sym: u32, oid: u64) -> bool {
+        match self.cancel_verb(sym, oid) {
+            Some(ended) => ended,
+            None => self.end(oid).is_some(),
+        }
+    }
+
+    /// The end's cancel-all: the word, then the long wait — cut by a
+    /// SIGINT/SIGTERM, then the stop's short one (the arm's shutdown repeats
+    /// it). `true` when it read clear.
+    pub(crate) fn clear_all(&mut self) -> bool {
+        let _ = self.arm.cancel_all();
+        let cleared = |d: &Self| d.arm.cancel_all_state() == CancelAllState::Clear;
+        let mut clear = self.until(STEP_WAIT + STEP_WAIT, cleared);
+        if !clear && crate::sigint::shutdown_requested() {
+            self.honor_stop = false;
+            clear = self.until(STOP_WAIT, cleared);
+            self.honor_stop = true;
+        }
+        clear
+    }
+
     /// Start measuring the RTT word: the arm is ready.
-    fn mark_ready(&mut self) {
+    pub(crate) fn mark_ready(&mut self) {
         let now = now_ns();
         self.ready_ns = now;
         self.last_ns = now;
@@ -882,7 +1051,7 @@ impl Drive {
 
     /// The position the fills booked on `sym`, signed ×1e8 (buys positive)
     /// — every fill of the slot's orders, a passive one's included.
-    fn position(&self, sym: u32) -> i64 {
+    pub(crate) fn position(&self, sym: u32) -> i64 {
         let mut pos = 0i64;
         for (_, f) in &self.fills {
             if f.sym == sym {
@@ -894,7 +1063,7 @@ impl Drive {
     }
 
     /// The first event of `kind` about `oid`.
-    fn event(&self, oid: u64, kind: u8) -> Option<(u64, OrderEvent)> {
+    pub(crate) fn event(&self, oid: u64, kind: u8) -> Option<(u64, OrderEvent)> {
         self.events
             .iter()
             .find(|(_, e)| e.client_oid == oid && e.kind == kind)
@@ -902,7 +1071,7 @@ impl Drive {
     }
 
     /// The end of `oid`: its first `REJECTED`, `CANCELED` or `FILLED`.
-    fn end(&self, oid: u64) -> Option<(u64, OrderEvent)> {
+    pub(crate) fn end(&self, oid: u64) -> Option<(u64, OrderEvent)> {
         self.events
             .iter()
             .find(|(_, e)| {
@@ -916,12 +1085,12 @@ impl Drive {
     }
 
     /// `oid` rests or ended.
-    fn settled(&self, oid: u64) -> bool {
+    pub(crate) fn settled(&self, oid: u64) -> bool {
         self.event(oid, ORDER_EVENT_RESTING).is_some() || self.end(oid).is_some()
     }
 
     /// The fills of `oid`: signed size ×1e8 (buys positive) and the count.
-    fn filled(&self, oid: u64) -> (i64, u32) {
+    pub(crate) fn filled(&self, oid: u64) -> (i64, u32) {
         let mut sz = 0i64;
         let mut n = 0u32;
         for (_, f) in &self.fills {
@@ -970,27 +1139,20 @@ impl Run<'_> {
         crate::sigint::shutdown_requested()
     }
 
-    /// Growth stops at the first drift, unknown order of the slot or
-    /// gateway halt word — the router's `ReconDrift` and gateway halt,
-    /// which this path does not have. The first one fails the run.
+    /// Growth stops at the first halt word — a drift, an unknown order of the
+    /// slot, the gateway's halt, the budget floor or an asset-refusal streak
+    /// (`Drive::halt_word`: the router's checks, which this path does not
+    /// have; XMM XH4i-8 added the last two). The first one fails the run.
     fn halted(&mut self) -> bool {
         if self.halt_noted {
             return true;
         }
-        let s = self.drive.arm.halt_signal();
-        let unknown = self.drive.arm.counters().unknown_orders;
-        if s.recon_drift_usd_1e6 != 0 || unknown != 0 || s.gateway_halted != 0 {
-            self.halt_noted = true;
-            self.rep.fail(
-                EXIT_RECON,
-                format!(
-                    "HALT — drift {} unknown orders {unknown} gateway halted {}: growth stops",
-                    s.recon_drift_usd_1e6, s.gateway_halted
-                ),
-            );
-            return true;
-        }
-        false
+        let Some(word) = self.drive.halt_word() else {
+            return false;
+        };
+        self.halt_noted = true;
+        self.rep.fail(EXIT_RECON, word);
+        true
     }
 
     /// Growth may go on: no stop asked, no halt seen. Every place and
@@ -1033,9 +1195,7 @@ impl Run<'_> {
     /// (XMM XH5c-3: the word reads throttled without one) — at most
     /// [`STEP_WAIT`].
     fn unthrottled(&mut self) -> bool {
-        self.drive.until(STEP_WAIT, |d| {
-            d.arm.congestion() < u64::from(EXEC_CONGESTION_THROTTLED)
-        })
+        self.drive.unthrottled()
     }
 
     fn mids(&mut self) -> Result<Vec<i64>, String> {
@@ -1120,19 +1280,13 @@ impl Run<'_> {
     /// Cancel `oid` and wait for its end (a cleanup: an order the arm no
     /// longer holds has ended).
     fn cancel(&mut self, p: usize, oid: u64) -> bool {
-        match self.cancel_verb(p, oid) {
-            Some(ended) => ended,
-            None => self.drive.end(oid).is_some(),
-        }
+        self.drive.cancel(self.perps[p].sym, oid)
     }
 
     /// The cancel verb on `oid`, then its end: `None` when the arm refused
     /// the verb, else whether the order ended.
     fn cancel_verb(&mut self, p: usize, oid: u64) -> Option<bool> {
-        let mut req = CancelReq::new(now_ns(), VenueId::Hyperliquid, self.perps[p].sym, oid);
-        req.strategy_id = SLOT;
-        self.drive.arm.cancel(&req).ok()?;
-        Some(self.drive.until(STEP_WAIT, |d| d.end(oid).is_some()))
+        self.drive.cancel_verb(self.perps[p].sym, oid)
     }
 
     /// Modify `prev` into `new`; `Some(landed)` once settled.
@@ -1226,7 +1380,7 @@ pub fn run(spec: &BatterySpec, gcfg: GatewayCfg, sk: signer_eip712::SecretKey) -
         gcfg.master,
     );
     let post_timeout_ns = gcfg.post_timeout_ns;
-    let mut info = match Info::new(&host, port, Arc::clone(&tls), master) {
+    let mut info = match Info::new(&host, port, Arc::clone(&tls), master, SLOT) {
         Ok(i) => i,
         Err(e) => {
             rep.fail(EXIT_ACCOUNT, e);
@@ -1284,7 +1438,7 @@ pub fn run(spec: &BatterySpec, gcfg: GatewayCfg, sk: signer_eip712::SecretKey) -
             return rep;
         }
     };
-    let mut tap = Tap::start(&host, port, Arc::clone(&tls), master);
+    let mut tap = Tap::start(&host, port, Arc::clone(&tls), master, "xh4g");
     let (handle, stop) = match spawn_gateway(gw, "hl-gw-battery", None, None, None) {
         Ok(h) => h,
         Err(e) => {
@@ -1296,20 +1450,7 @@ pub fn run(spec: &BatterySpec, gcfg: GatewayCfg, sk: signer_eip712::SecretKey) -
     let mut run = Run {
         spec,
         info,
-        drive: Drive {
-            arm,
-            events: Vec::with_capacity(4_096),
-            fills: Vec::with_capacity(256),
-            renamed: Vec::with_capacity(256),
-            retired: Vec::with_capacity(1_024),
-            report: GatewayArmReport::default(),
-            next_report_ns: 0,
-            peaks: (0, 0, 0),
-            rtt: (0, 0, 0, 0),
-            last_ns: 0,
-            ready_ns: 0,
-            honor_stop: true,
-        },
+        drive: Drive::new(arm, SLOT),
         perps,
         coins,
         // Fresh client ids each run (the boot sweep cancels a leftover).
@@ -1369,24 +1510,9 @@ fn account(
     rep: &mut BatteryReport,
 ) -> Result<Vec<String>, String> {
     let (value, positions) = info.sheet()?;
-    let usdc = info.user(spot_state_request, |b| {
-        let mut bal = vec![SpotBalance::default(); MAX_SPOT_BALANCES];
-        let n = scan_spot_state(b, &mut bal).map_err(|e| format!("spot: {e:?}"))?;
-        Ok::<i64, String>(
-            bal[..n]
-                .iter()
-                .find(|x| x.coin.of(b) == b"USDC")
-                .map_or(0, SpotBalance::free_1e8),
-        )
-    })??;
+    let (usdc, _) = info.spot()?;
     let (ours, others) = info.orders()?;
-    let (used, vlm_1e6, _) = info
-        .user(exec_hyperliquid::budget::rate_limit_request, |b| {
-            exec_hyperliquid::budget::scan_rate_limit(b)
-        })?
-        .ok_or_else(|| String::from("userRateLimit: unreadable"))?;
-    let cap = i64::try_from(exec_hyperliquid::INITIAL_BUFFER).unwrap_or(0) + vlm_1e6 / 1_000_000;
-    let left = cap - i64::try_from(used).unwrap_or(i64::MAX);
+    let left = info.budget_left()?;
     rep.account = (value, usdc, left, others);
     info!(
         perp_value_usd = value / E8,
@@ -1992,16 +2118,7 @@ fn finish(run: &mut Run<'_>, tap: &mut Tap, handle: JoinHandle<()>, stop: &Gatew
     if run.drive.arm.ready() {
         // Nothing resting first: a quote filled during the closes would
         // leave a position they never saw.
-        let _ = run.drive.arm.cancel_all();
-        let cleared = |d: &Drive| d.arm.cancel_all_state() == CancelAllState::Clear;
-        // The long wait, cut by a signal; then the stop's short one.
-        let mut clear = run.drive.until(STEP_WAIT + STEP_WAIT, cleared);
-        if !clear && run.stopping() {
-            run.drive.honor_stop = false;
-            clear = run.drive.until(STOP_WAIT, cleared);
-            run.drive.honor_stop = true;
-        }
-        if !clear {
+        if !run.drive.clear_all() {
             run.rep.fail(
                 EXIT_SWEEP,
                 String::from("the final cancel-all never read clear"),
@@ -2051,19 +2168,7 @@ fn finish(run: &mut Run<'_>, tap: &mut Tap, handle: JoinHandle<()>, stop: &Gatew
             ),
         );
     }
-    stop.release();
-    // Under a stop the join is short: the flat read below uses the
-    // battery's own connection, not the gateway's.
-    let join = if run.stopping() { STOP_WAIT } else { JOIN_WAIT };
-    let t = Instant::now();
-    while !handle.is_finished() && t.elapsed() < join {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if handle.is_finished() {
-        let _ = handle.join();
-    } else {
-        warn!("xh4g: the gateway thread did not stop in {join:?}");
-    }
+    release(handle, stop, "xh4g");
 
     // The account, read again: flat in every bound perp, nothing of ours.
     match (run.info.sheet(), run.info.orders()) {
@@ -2097,10 +2202,30 @@ fn finish(run: &mut Run<'_>, tap: &mut Tap, handle: JoinHandle<()>, stop: &Gatew
         run.rep.measured.all_page = page(&mut run.info, 0);
     }
 
-    let started = tap.handle.is_some();
-    let rows = tap.finish();
-    measure(run, &rows, !started || tap.failed.load(Ordering::Acquire));
+    let (rows, gap) = tap.finish();
+    measure(run, &rows, gap);
     bars(run);
+}
+
+/// The end's release of the gateway thread: told to stop, then joined —
+/// briefly under a stop (the account read after it uses the battery's own
+/// connection, not the gateway's).
+pub(crate) fn release(handle: JoinHandle<()>, stop: &GatewayStop, tag: &str) {
+    stop.release();
+    let join = if crate::sigint::shutdown_requested() {
+        STOP_WAIT
+    } else {
+        JOIN_WAIT
+    };
+    let t = Instant::now();
+    while !handle.is_finished() && t.elapsed() < join {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        warn!("{tag}: the gateway thread did not stop in {join:?}");
+    }
 }
 
 /// One `userFillsByTime` page from `start_ms` to now: `(rows, bytes, oldest
@@ -2490,6 +2615,17 @@ mod tests {
         );
         assert_eq!(dec_1e8(b""), None);
         assert_eq!(dec_1e8(b"1.2.3"), None);
+    }
+
+    /// The spot sheet's legs (XMM XH4i-8, risk review): USDC free, a held
+    /// `+<enc>` leg kept, a zero row and the quote token's other rows not.
+    #[test]
+    fn the_spot_sheet_keeps_held_legs_alone() {
+        let b = br#"{"balances":[{"coin":"USDC","token":0,"total":"854.67571598","hold":"10.5","entryNtl":"0.0"},{"coin":"+154150","token":2,"total":"25.0","hold":"0.0","entryNtl":"10.25"},{"coin":"+214060","token":3,"total":"0.0","hold":"0.0","entryNtl":"0.0"},{"coin":"HYPE","token":150,"total":"0.9986","hold":"0.0","entryNtl":"0.0"}]}"#;
+        let (usdc, legs) = spot_rows(b).expect("a spot sheet");
+        assert_eq!(usdc, 85_467_571_598 - 1_050_000_000, "free = total − hold");
+        assert_eq!(legs, vec![(String::from("+154150"), 25 * E8)]);
+        assert!(spot_rows(b"{}").is_err() || spot_rows(b"{}").is_ok_and(|(_, l)| l.is_empty()));
     }
 
     #[test]

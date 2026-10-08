@@ -59,6 +59,12 @@
 #       slot 6), 31 the boot, 32 a cycle, 33 BadAloPx, 34 a TTL, 35 a
 #       sweep, 36 the reconciliations or a halt, 37 the fills, 38
 #       something LEFT ON THE ACCOUNT (loudest), 39 the dead man's stall.
+#   40-48 XMM XH4i-8, `--hl-outcome --lifecycle --outcome <id>` (the
+#       outcome battery on slot 3's gateway arm, HIP-4 legs; pinned by
+#       `outcome_battery::tests`): 40 the account or the tap, 41 the boot
+#       or the roll, 42 a verb, 43 BadAloPx, 44 the IoCs, 45 the sweep, 46
+#       a reconciliation or a halt, 47 the legs' spellings or the arm's
+#       counters, 48 something LEFT ON THE ACCOUNT (loudest).
 #       A SIGINT/SIGTERM ends the battery short (cancel-all, a flat
 #       read): the wrapper waits for it rather than dying first.
 # The diagnostics start at 20 because clap exits 2 on any argument
@@ -113,8 +119,10 @@ fi
 offline=0
 dry=0
 hlperp=0
+hlout=0
 for a in "$@"; do
   [ "$a" = "--hl-perp" ] && hlperp=1
+  [ "$a" = "--hl-outcome" ] && hlout=1
   [ "$a" = "--offline" ] && offline=1
   # A dry run reaches no venue either, and must not inherit the
   # message that says one verified us. Same rule as --offline.
@@ -143,10 +151,15 @@ case "$rc" in
   23) echo "exec-smoke: *** OFFLINE SELF-TEST FAILED *** this binary does not reproduce the venue SDK's bytes — do not ship it" >&2 ;;
   38) echo "exec-smoke: *** XH4g: THE BATTERY LEFT A POSITION OR AN ORDER ON THE TESTNET ACCOUNT *** — clear it before the next run (the arm holds a boot over a position)" >&2 ;;
   3[0-79]) echo "exec-smoke: XH4g battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
+  48) echo "exec-smoke: *** XH4i-8: THE OUTCOME BATTERY LEFT A LEG OR AN ORDER ON THE TESTNET ACCOUNT *** — clear it before the next run (sell a leg with --fill --sell; a leg worth under \$1 at the bid cannot be sold — the venue's minimum — and waits for its settlement; the next run refuses while one is held)" >&2 ;;
+  4[0-7]) echo "exec-smoke: XH4i-8 outcome battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
   *) echo "exec-smoke: could not run (exit $rc)" >&2
      # 1 (refused before anything was sent) and 2 (clap) left nothing.
      if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the XH4g battery ended abnormally — slot-6 orders or a position may remain on the TESTNET account; the next battery's account check refuses while slot 6's orders rest: clear them first ***" >&2
+     fi
+     if [ "$hlout" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+       echo "exec-smoke: *** the XH4i-8 battery ended abnormally — slot-3 orders or a HIP-4 leg may remain on the TESTNET account; the next battery's account check refuses while either is there: clear them first ***" >&2
      fi ;;
 esac
 exit $rc
