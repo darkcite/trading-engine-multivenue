@@ -7205,7 +7205,8 @@ and PM and PM Pro have no Demo at all.
   loopback only. If the venue, or anything between it and us, ignored a
   DELETE's body, every one would be refused (`-1102`): the sweep's REST
   fallback would strand, and only the dead-man would clear makers. BX7b
-  proves both on Demo before anything arms.
+  proves both on Demo before anything arms. (Met on Demo, both products,
+  2026-10-09: risk-policy "BX7b".)
 * **The recipe is BX6's, plus** `account_mode`, `products`,
   `order_transport` (`ws` | `rest`; `pm` needs `rest`), `signing`
   (`ed25519` | `hmac`; `hmac` needs `rest` and reads
@@ -7457,7 +7458,8 @@ and PM and PM Pro have no Demo at all.
 
 #### Still gated
 
-* BX7b: the Demo battery, the K-probes, the body-form DELETEs.
+* BX7b: the Demo battery, the K-probes, the body-form DELETEs (done on
+  Demo, 2026-10-09: "BX7b").
 * BX13: a live fill on the user stream; members read adopted fills.
 * K2, K5.
 * BX11: the flatten tool, observability, gate 94.
@@ -7480,6 +7482,244 @@ and PM and PM Pro have no Demo at all.
 | 3 | zero-copy | PASS; four cold nits (an unbounded anchor read, a table moved into an iterator, two markers) and the streaming hash's unmarked block | all acted on |
 | 3 | alloc | PASS; borderlines (the cycle's two events beside the adoption room; a bounds-checked zero-fill) | both acted on |
 | 3 | parser | PASS; R3-1 the refusal code read off a malformed or trailing body; three nits | whole objects for the code; an event's name once; `result` with `error` refused; the latest ban end |
+
+### BX7b — the Demo battery and the K-probes (2026-10-09) — Demo orders only; no member arms (O-BX6)
+
+Built on branch `binance` (the operator's rulings of 2026-10-08: the battery
+is its own phase; Demo orders are allowed, mainnet orders are not). Two
+operator tools over one crate-private Demo client (`cli::bn_demo`):
+`exec-smoke --binance-probe` (`cli::bn_probe`) and `exec-smoke --binance
+<um|cm|um,cm> --lifecycle` (`cli::bn_battery`). They are reached only through
+`exec-smoke`; the engine loop, `bn_live` and the engine's boot never call
+them. **This phase also changes the Live arm in two places:** the Demo
+scope's boot law (below; Live is unaffected), and three scanners that now
+refuse more (see "The scanners' Live reach").
+
+#### The Demo law (the gateway)
+
+* `Scope::Demo` boots classic only. `AccountMode::Pm` and `PmPro` are
+  refused at construction (`AssertErr::Mode`), before any request.
+* A Demo boot skips the two SAPI reads, `apiRestrictions` and
+  `portfolio/account`: Demo serves no SAPI (404, measured, P3).
+  **Residual:** a Demo key's permissions are never asserted.
+* It cannot reach Live. The scope is fixed at construction; every host is
+  checked against the scope's network (BX-16); `bn_live` builds Live only;
+  `network` accepts mainnet only. The loopback test
+  (`a_demo_boot_reads_no_sapi_and_a_live_one_refuses_without_it`) was
+  break-and-watched: a Live boot on the same venue still refuses
+  (`AssertErr::Unreadable`), with no listenKey.
+
+#### The probe is not an order path
+
+* It sends raw signed REST orders outside the risk gate, bounded by
+  construction:
+  * post-only BUYs 4 % (USDⓈ-M) or 5 % (COIN-M) behind a touch read inside
+    the row's PERCENT_PRICE band around the mark; the TradFi IoC under the
+    bid; at the row's minimum size, and never over 200 USD of notional
+    (`PROBE_MAX_USD_1E6`, checked in the one `place()`);
+  * every id `bxprobe…`, which `cid::classify` reads as foreign: never the
+    arm's own, never an orphan a boot would sweep.
+* Its account effects:
+  * **P5** sets a 30 s countdown and clears it, on each product, only where
+    nothing but the probe's own rests. The clear is always sent. A clear
+    the venue refuses after a set it accepted, or one in doubt, is a
+    failure: a 30 s cancel-all may be armed.
+  * **P6**'s cancel-all runs only when its two orders are both listed and
+    nothing else rests on the symbol, read just before it.
+  * **The end** cancels every `bxprobe` order still listed, then compares
+    the positions on BTCUSDT, TSLAUSDT and BNBUSD_PERP with the start's.
+* Its verdicts: **59** a probe failed (a body-form DELETE refused, a control
+  not refused with `-1022`, a probe that could not run); **58** something
+  is left, or the end could not read the account.
+* A signal stops places, countdowns, socket opens, price reads and every
+  wait; the end still runs and re-reads each symbol once. **The end's reads
+  are outside the drain alarm:** what the alarm cuts leaves at most
+  `bxprobe` orders, which the battery's account check refuses as foreign.
+
+#### The battery's departures from `bn_live`
+
+* **The arm, the router and the gateway are the engine's; the composition
+  is not.** No split layers (`SlotSplit`, `VenueSplit`), no alias check, no
+  journal writer thread (the journal ring is drained in-process: every
+  answer the gateway journals is the battery's evidence), no shutdown grace,
+  no thread pinning.
+* **No `exec.toml`.** Slot 2. The router's clamps: 600 USD an order, 2 000
+  USD of exposure, 100 000 USD a day, 16 orders working; a 60 % margin
+  halt. The kill switches are `exec.toml.example`'s: 5 refusals in a row,
+  5 USD of drift, a 30 s order-route gap, 3 asset refusals in a row, 300 s
+  without an agreeing reconciliation. The arm's shortest maker TTL is 5 s
+  (BX6 (h)); the TTL phase runs 5–20 s.
+* **No anchor file and no session bound.** A halt is latched in memory only
+  (no `exec.HALT`).
+* **Growth** (`may_grow`: every place and modify) stops at a signal, a halt,
+  the arm's halt word, any drift in the latest reconciliation, or a full
+  record (the tap at 50 000 frames or 64 MiB; 65 536 journal records;
+  16 384 fills). **A reduce-only close** (`may_reduce`) stops only at a
+  signal or a halt: reduce-only never adds exposure.
+* **Pricing.** A row the venue lists without a PERCENT_PRICE band prices
+  nothing; neither does a touch outside the band around the mark.
+* **The tap** is a second, read-only socket on the account's one listenKey;
+  its POST extends the key.
+
+#### The account check and the flat read
+
+* **Before the boot**, per product: one-way; single-asset (USDⓈ-M); the
+  symbol CROSSED at a leverage of at most 20 (USDⓈ-M: `symbolConfig`;
+  COIN-M: its account row, which must be listed); flat everywhere; and no
+  order but ids `cid::classify` reads as Ours or Orphan (the boot sweeps
+  orphans). Anything else is **50**.
+* **The account read is the gateway's own:** the answer through
+  `scan_rest_answer` (one object, whole), the gateway's scanner on its
+  `result`. A symbol listed twice, a symbol carrying an escape, or (COIN-M)
+  a symbol not listed refuses the read. The probe's P3 and its end use the
+  same reader.
+* **The flat read**, per lane: no order of this run's epoch on the
+  product's account, and the lane's symbol flat. Both requests are signed on
+  the main thread (the locked-page signer is not `Sync`) under an 11 s
+  `recvWindow`, then sent from one thread per lane, the lanes in parallel,
+  before K2. **58** means left, or unreadable: read the account by hand.
+
+#### The signal path, bounded
+
+* **The end after a signal** fits the 30 s drain alarm, asserted at compile
+  time: the request in flight (5 s), the arm's shutdown spin (3 s), the
+  gateway's share (5 s), its stop (1 s), the tap's join (1 s) and the flat
+  reads (2 × 5 s) = 25 s. **A boot the signal lands on:** 20 s
+  (`BOOT_TIMEOUT`) + 5 s; nothing is placed before it.
+* **After a signal:** no growth and no price read; a cancel goes once,
+  unretried; K2 and the tap's lines are skipped; threads still running are
+  left to the process's exit.
+* **Outside the bound:** core-net's blocking DNS lookup after a third failed
+  dial; the probe's end (above). A second signal kills at once; the USDⓈ-M
+  dead-man then cancels the makers within 30 s.
+
+#### The bar
+
+The plan's, judged absolutely (`bar_short`) whatever the run asked for.
+USDⓈ-M: 10 maker cycles, a post-only refusal, a TTL cancel, 6 fills, 3
+agreeing reconciliations and a halt's sweep. COIN-M: the maker refused, 4
+fills and 2 agreeing reconciliations. A clean run short of it exits with
+the short phase's code (52–57), never 0.
+
+#### The scanners' Live reach
+
+This phase changes what the engine's arm refuses:
+
+* `json::Pairs::next` refuses a key carrying `\`, in every scanner. Keys are
+  compared raw, so an escaped key would read as another key and slip past
+  the one-reading law. Binance names no key with one.
+* `rest::scan_orders` reads each of its 11 keys once, requires `price`, and
+  reads the body whole (the tail checked after its own walk). The gateway's
+  reconciliation reads every listing with it.
+* `rest::scan_server_time` reads one whole object naming the key once
+  (gate 93 now reads it).
+
+**What a refusal does in the engine:** a refused listing is a scan failure
+(BX-15). The sticky unbounded drift halts the slot until a restart: loud,
+never silent. Demo's fapi and dapi listings pass (the battery's agreeing
+reconciliations, below); papi's stay unproven until BX13. New and cold:
+`rest::scan_touch` and `rest::scan_mark` (the tools' only), and `json` is
+`pub`; `bn_demo` is `pub(crate)`.
+
+#### The evidence (Demo, 2026-10-09, the final binary)
+
+Every run below is the final binary's (`exec-smoke` from the worktree's
+release build; the wrapper exported the Demo keys; nothing printed a key,
+a signature, a listenKey or a WS API answer). The round-1 runs, on an
+earlier binary, are superseded. Reports in the vault
+(`docs/research/bx/bx7b/`, git-excluded).
+
+| run | what | result |
+|---|---|---|
+| p2 | the probe, P0–P9 | exit 0: every probe ran, the arming-precondition probes passed, nothing left |
+| b11 | USDⓈ-M, WS API, Ed25519 | exit 0, the bar met: 10 cycles, a post-only refusal (`-5022`), a TTL cancel at 5 s, 6 fills, 6 agreeing reconciliations, the halt's sweep; flat |
+| b12 | COIN-M (BNBUSD_PERP), WS API | exit 0: the maker refused locally (`NoDeadman`), 6 fills, 6 agreeing reconciliations; flat |
+| b13 | USDⓈ-M, the REST route, Ed25519 | exit 0, the bar met (as b11) |
+| b14 | USDⓈ-M, the REST route, HMAC | exit 0, the bar met (as b11) |
+| b15 | USDⓈ-M and COIN-M on one gateway | exit 0, both bars met: 10 cycles, 6 + 8 fills, 6 + 6 reconciliations |
+| b16 | USDⓈ-M, the session replaced every 40 s, 20 cycles | exit 0, the bar met; 2 make-before-break replacements, no connect failure |
+
+Every battery run: 0 reconciliations failed, 0 journal records or fills
+dropped or lost, no tap frame dropped, the shutdown sweep done
+(`Exiting`), the flat read empty. Boots took 2.5–3.8 s.
+
+**K2 on Demo** (the tap, 15 USDⓈ-M IoCs over b11 and b13–b16; evidence
+across two sockets, not proof): `TRADE_LITE` and the `ORDER_TRADE_UPDATE`
+trade reached the tap within 2 µs of each other (one read) in 10;
+`TRADE_LITE` led by 1.6–4.2 ms in 4, and by 17 ms once. Their `E` was
+equal, or within 1 ms, in 14 (23 ms once). The WS API's ACK was journaled
+for 6 of 15, each 45 µs to 245 ms before the tap's `TRADE_LITE`; for the
+other 9 the stream ended the IoC first, and an answer for an order already
+ended is applied to nothing (the BX7b battery's end-driven legs).
+
+#### The K-items, answered on Demo
+
+Measured by p2 (2026-10-09 04:26Z), the gateway's own requests:
+
+* **K19:** Ed25519 is accepted on demo-fapi and demo-dapi REST, and so is
+  HMAC (R22's fallback).
+* **K11:** `session.logon` with the Demo Ed25519 key is accepted on
+  `testnet.binancefuture.com` `/ws-fapi/v1` and `/ws-dapi/v1` (R20 does not
+  bind on Demo).
+* **K20:** USDⓈ-M's user stream delivers the order's events on `/ws/<key>`,
+  on `/private/ws?listenKey=<key>` and with `&events=ORDER_TRADE_UPDATE`
+  alike: `events=` is not required. COIN-M's `/ws/<key>` delivers them too.
+* **K16:** `POST /dapi/v1/countdownCancelAll` is accepted on Demo (set
+  30 000 and cleared, each echoing the symbol). Mainnet stays unverified,
+  so COIN-M stays IoC-only (O-BX3a) until the operator rules.
+* **K5:** `apiTradingStatus` answers `{"indicators":{},"updateTime":…}`:
+  nothing is triggered, so the `GCR`/`ICR` name stays unanswered.
+* **K17:** Demo serves no SAPI (404 on `apiRestrictions` and
+  `portfolio/account`): the account mode is unreadable there, hence the
+  Demo law.
+* **K4:** a TradFi IoC on TSLAUSDT is refused `-4411` ("Please sign
+  TradFi-Perps agreement contract fapi.") on an unsigned account.
+* **BX-19 on the Demo account:** one-way, single-asset, BTCUSDT CROSSED at
+  20.
+
+#### The arming preconditions
+
+* **The body-form DELETEs are met on Demo, on both products:** the cancel
+  by id answered 200 `CANCELED`; the same DELETE with one signature
+  character changed answered `-1022`; the cancel-all answered 200 "done",
+  with nothing of the probe's left.
+* **"A live fill seen on the user stream":** Demo's form is met (every
+  battery fill booked from the user stream on lane 4, each leg proven by an
+  agreeing reconciliation). The mainnet form stays BX13's.
+
+#### Demo's differences from mainnet
+
+* BTCUSDT's filters: step 0.0001 against 0.001, minimum notional 50 USD
+  against 100.
+* COIN-M runs on BNBUSD_PERP: Demo's coin wallet holds BNB and no BTC, so a
+  BTCUSD_PERP order is refused `-2019`.
+* Demo serves no SAPI, and its `apiTradingStatus` lists no indicator.
+
+#### Residuals
+
+* A Demo key's permissions are never asserted.
+* The probe's end, and core-net's DNS lookup after a third failed dial, are
+  outside the drain bound.
+* K5's indicator name (`GCR` or `ICR`) stays unanswered: Demo lists none.
+* PM, PM Pro and papi stay unproven: no Demo.
+* TradFi answers `-4411` until the agreement is signed (as BX7 recorded).
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | BLOCK: R1-1 the end's drain bound was false (the arm's 3 s spin uncounted; waits deaf to the signal); R1-2 the kill switches unset; R1-3 a foreign-id test looser than the gateway's; R1-4 P6 could pass vacuously; R1-5 the bar judged against the spec; R1-6 the probe deaf to a signal mid-step; R1-7 P5's clear; R1-8 the notional ceilings; R1-9 three gaps | all fixed; the bound asserted at compile time |
+| 1 | zero-copy | FAIL: ZC-1 the doctrine line past copy-audit's 60-line window; 4 NITs | fixed; the markers bounded; `bn_demo` `pub(crate)` |
+| 1 | alloc | PASS; 3 notes | the composition doc corrected |
+| 1 | parser | FAIL: the flat read failed open on a symbol listed twice; COIN-M's BX-19 silent when unlisted; bodies read past their object; 7 SHOULD/NIT | one account reader; touch and mark in `exec-binance`; `scan_orders`' one-reading law; caps; checked arithmetic |
+| 2 | risk | NEEDS-DOCS: the scanners' Live reach; 5 NITs | this entry; an 11 s `recvWindow`; the flat read before K2; one re-read; 58's text; a cancel after a signal |
+| 2 | zero-copy | PASS; 2 NITs, 2 notes | the markers; the fill booked from its slot; one pass |
+| 2 | alloc | PASS; 2 SHOULD (low), 1 NIT | the key read once; one pass; gate 93 reads the clock's answer |
+| 2 | parser | PASS; 5 NITs | escaped row symbols; no band; no quantity; the fuzz symbol; G1 |
+| 3 | risk | NEEDS-DOCS: the code approved | this entry; the gates; the Demo evidence on the final binary |
+| 3 | zero-copy | PASS | — |
+| 3 | alloc | PASS | — |
+| 3 | parser | PASS (a depth note) | noted at `ends_whole` |
 
 ## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
 

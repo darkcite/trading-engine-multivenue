@@ -60,6 +60,15 @@
 //! An assertion that fails refuses the boot. Only then is the gateway
 //! moved onto its own thread ([`BnGateway::run`]).
 //!
+//! **Demo (BX7b, the battery's).** Binance Demo serves no SAPI — every
+//! `/sapi/…` path answers 404 — and offers no Portfolio Margin. A Demo
+//! account is therefore classic by construction: under `Scope::Demo` the
+//! gateway refuses any other account mode at construction, and its boot
+//! makes neither SAPI read (the key's permissions, the account mode). The
+//! scope is the configuration's, and a configuration holds only its own
+//! network's hosts (`BnConfig`, BX-16): the engine's arm (`Scope::Live`)
+//! makes both reads on every boot, and refuses when either cannot be read.
+//!
 //! **A restart with a position (BX7, the operator's ruling).** At the
 //! boot's first reconciliation, on a DEDICATED account, the venue's
 //! positions on owned rows are adopted as the owner slot's starting
@@ -194,7 +203,7 @@ use mio::{Events, Poll, Token};
 use crate::cid::{CidClass, CidPrefix};
 use crate::clock::VenueClock;
 use crate::cmd::*;
-use crate::config::{BnConfig, Signer, Signing};
+use crate::config::{BnConfig, Scope, Signer, Signing};
 use crate::dns::{Resolver, DNS_HOSTS};
 use crate::gov::{classify, request_weight, CodeClass, Weighed, ACCOUNT_REREAD_MS, ARM_WEIGHT_MAX_PER_MIN, QTR_ICR_NS, WEIGHT_THROTTLE_PCT};
 use crate::inst::{WireTable, INST_DATED, INST_INVERSE, INST_LIVE, INST_NO_DEADMAN, INST_OWNED, PRODUCT_COINM, PRODUCT_USDM, ROW_NONE};
@@ -984,6 +993,9 @@ pub struct BnGateway<const FILL_N: usize> {
     pm_pro: bool,
     /// Portfolio Margin's unified account read is queued or in flight.
     pm_account_queued: bool,
+    /// The configuration is `Scope::Demo` (BX7b): classic by construction,
+    /// no SAPI reads at boot (module docs).
+    demo: bool,
     prefix: CidPrefix,
     wire: WireTable,
     oot: Oot,
@@ -1098,6 +1110,12 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
         if signer.signing() == Signing::Hmac && !knobs.rest_orders && !pm {
             return Err(BootErr::Signing);
         }
+        // BX7b: Demo offers no Portfolio Margin — a Demo account is classic
+        // by construction, and that is the mode assertion it gets.
+        let demo = cfg.scope() == Scope::Demo;
+        if demo && knobs.mode != AccountMode::Classic {
+            return Err(BootErr::Assert(AssertErr::Mode));
+        }
         let key_header = [(KEY_HEADER, cfg.api_key())];
         // The lanes: one per futures product the wire table binds, USDⓈ-M
         // first (BX7, M3); a row-less arm keeps USDⓈ-M's. A row of any
@@ -1196,6 +1214,7 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
             pm,
             pm_pro,
             pm_account_queued: false,
+            demo,
             prefix: CidPrefix::new(knobs.epoch),
             wire,
             oot: Oot::new(),
@@ -4666,9 +4685,10 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
     /// BX-19's boot assertions: per lane the one-way mode — and on USDⓈ-M
     /// classic the single-asset mode (dapi and papi have none; PM Pro's
     /// collateral is the program's) — then, once, the key's permissions and
-    /// the account mode (SAPI).
+    /// the account mode (SAPI). Not on Demo, which serves no SAPI: classic
+    /// by construction (`new`; module docs).
     fn queue_asserts(&mut self) {
-        self.asserts_left = 2;
+        self.asserts_left = if self.demo { 0 } else { 2 };
         let mut l = 0;
         while l < self.lanes.len() {
             self.asserts_left += 1;
@@ -4693,8 +4713,10 @@ impl<const FILL_N: usize> BnGateway<FILL_N> {
             }
             l += 1;
         }
-        let _ = self.queue_job(0, JobKind::Restrictions, 0);
-        let _ = self.queue_job(0, JobKind::Portfolio, 0);
+        if !self.demo {
+            let _ = self.queue_job(0, JobKind::Restrictions, 0);
+            let _ = self.queue_job(0, JobKind::Portfolio, 0);
+        }
     }
 
     /// Every deadline due: TTL cancels (BX-13) and owed cancels; WS API

@@ -413,6 +413,9 @@ struct VState {
     /// BX7 (N8): papi's unified account alone answers 500 (the SAPI one —
     /// the boot's mode probe — still serves).
     papi_account_down: bool,
+    /// BX7b: no SAPI, as Binance Demo — every `/sapi/…` path answers nginx's
+    /// 404 page.
+    no_sapi: bool,
     /// BX7 (F1): DELETE requests that carried a query (every one must be
     /// body-form).
     delete_query: u32,
@@ -563,6 +566,7 @@ impl VState {
             dust_pos_1e6: 0,
             unified_down: false,
             papi_account_down: false,
+            no_sapi: false,
             delete_query: 0,
             refuse: None,
             rest_delay: None,
@@ -733,6 +737,9 @@ impl VState {
             self.check_ts(qparam(params, "timestamp"));
         }
         let now = now_ms();
+        if self.no_sapi && path.starts_with("/sapi/") {
+            return (404, String::from("<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"));
+        }
         if self.refuse.as_ref().is_some_and(|(p, _, _)| *p == path) {
             if let Some((_, status, body)) = self.refuse.take() {
                 return (status, body);
@@ -1680,6 +1687,8 @@ struct Opts {
     dust: bool,
     /// The boot's timeout (production: 30 s).
     boot_timeout_ms: u64,
+    /// BX7b: the configuration is `Scope::Demo` (the battery's).
+    demo: bool,
 }
 
 impl Opts {
@@ -1696,6 +1705,7 @@ impl Opts {
             halts: HaltLimits::none(),
             dust: false,
             boot_timeout_ms: 15_000,
+            demo: false,
         }
     }
 }
@@ -1781,12 +1791,13 @@ impl Rig {
     fn boot_traced(venue: &Venue, o: Opts) -> Result<Booted, Refused> {
         // Makers only where a dead-man of ours is proven: classic USDⓈ-M.
         let maker_ok = o.mode == AccountMode::Classic;
+        let scope = if o.demo { Scope::Demo } else { Scope::Live };
         let cfg = if o.rest_hmac {
             let h = HmacSigner::from_secret(HMAC_SECRET).expect("the secret");
-            BnConfig::loopback_hmac(Scope::Live, String::from(KEY), h, venue.port).expect("config")
+            BnConfig::loopback_hmac(scope, String::from(KEY), h, venue.port).expect("config")
         } else {
             let seed = SecretKeyBytes::new_locked(SEED).expect("seed");
-            BnConfig::loopback(Scope::Live, String::from(KEY), seed, venue.port).expect("config")
+            BnConfig::loopback(scope, String::from(KEY), seed, venue.port).expect("config")
         };
         let mut disc = BnDiscovery::new();
         disc.ingest_body(FAPI).expect("discovery");
@@ -1834,8 +1845,10 @@ impl Rig {
             max_leverage: 20,
             adopt_cap_usd_1e6: o.adopt_cap_usd_1e6,
         };
-        let mut gw = BnGateway::<FILL_N>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx))
-        .expect("gateway");
+        let mut gw = match BnGateway::<FILL_N>::new(&cfg, venue.client_cfg.clone(), knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)) {
+            Ok(gw) => gw,
+            Err(err) => return Err(Refused { err, journal: j_rx, fills: fill_rx }),
+        };
         if let Err(err) = gw.boot() {
             return Err(Refused { err, journal: j_rx, fills: fill_rx });
         }
@@ -3038,6 +3051,44 @@ fn the_boot_is_refused_by_a_lock_or_a_budget_answer() {
     assert_eq!(refused("/sapi/v1/account/apiRestrictions", 403, qr), (Some(BootErr::VenueLock(-4400)), false));
     let budget = String::from(r#"{"code":-1003,"msg":"Too many requests; current limit is 2400 requests per minute."}"#);
     assert_eq!(refused("/fapi/v1/multiAssetsMargin", 429, budget), (Some(BootErr::Budget(-1003)), false));
+}
+
+/// **BX7b: Demo serves no SAPI** (every `/sapi/…` path answers 404) and
+/// offers no Portfolio Margin. Under `Scope::Demo` the classic boot makes
+/// neither SAPI read and is ready; under `Scope::Live` the same venue's
+/// boot is refused before any listenKey (the key's permissions unread,
+/// fail closed); a Demo arm in PM or PM Pro is refused before any request.
+#[test]
+fn a_demo_boot_reads_no_sapi_and_a_live_one_refuses_without_it() {
+    let o = Opts::new(60_000_000_000, 300);
+    let venue = Venue::start();
+    venue.with(|v| v.no_sapi = true);
+    let b = Rig::boot_gateway(&venue, Opts { demo: true, ..o }).expect("a Demo boot needs no SAPI read");
+    assert_eq!(b.gw.phase(), Phase::Ready);
+    venue.with(|v| {
+        assert!(!v.log.iter().any(|l| l.contains("/sapi/")), "no SAPI request on Demo: {:?}", v.log);
+        for want in ["GET /fapi/v1/positionSide/dual", "GET /fapi/v1/multiAssetsMargin", "GET /fapi/v1/symbolConfig"] {
+            assert!(v.log.iter().any(|l| l == want), "{want} is still asserted on Demo: {:?}", v.log);
+        }
+    });
+    drop(b);
+
+    let venue = Venue::start();
+    venue.with(|v| v.no_sapi = true);
+    let err = Rig::boot_gateway(&venue, o).err();
+    assert_eq!(err, Some(BootErr::Assert(AssertErr::Unreadable)), "Live never boots without the SAPI reads");
+    venue.with(|v| {
+        assert!(v.log.iter().any(|l| l == "GET /sapi/v1/account/apiRestrictions"), "{:?}", v.log);
+        assert!(!v.log.iter().any(|l| l.contains("listenKey")), "nothing past the assertions: {:?}", v.log);
+    });
+
+    for mode in [AccountMode::Pm, AccountMode::PmPro] {
+        let venue = Venue::start();
+        venue.with(|v| v.no_sapi = true);
+        let r = Rig::boot_traced(&venue, Opts { demo: true, mode, ..o }).err().map(|r| r.err);
+        assert_eq!(r, Some(BootErr::Assert(AssertErr::Mode)), "{mode:?} has no Demo");
+        venue.with(|v| assert!(v.log.is_empty(), "refused before any request: {:?}", v.log));
+    }
 }
 
 /// BX6's open tests, end to end: a margin ratio past the slot's threshold

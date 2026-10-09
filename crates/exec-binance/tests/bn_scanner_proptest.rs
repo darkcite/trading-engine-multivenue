@@ -2,8 +2,8 @@
 // Copyright 2026 Anton (darkcite)
 
 //! **Property tests for the BX6 Binance-arm byte scanners, from the crate's
-//! public API only** (`exec_binance::…` — `json` is `pub(crate)` and is
-//! already proptested from inside the crate).
+//! public API only** (`exec_binance::…` — `json`, public since BX7b for the
+//! cli's Demo tools, is proptested from inside the crate).
 //!
 //! What this file adds, by scanner:
 //!
@@ -36,6 +36,12 @@
 //! * **BX7 (section F)** — the one-reading law in the order readers (an
 //!   order event's keys, in `o` or on `TRADE_LITE`; a WS API answer's) and
 //!   a REST 200's body read whole: bytes after its object are refused.
+//! * **BX7b (section G)** — the Demo tools' touch and mark
+//!   ([`rest::scan_touch`], [`rest::scan_mark`]: a round trip as an object
+//!   or dapi's one-element array; a key named twice, bytes after the
+//!   answer, a second element or another symbol's answer refused; any
+//!   bytes) and `scan_orders`' one-reading law (a key an order row names
+//!   twice, in any row and at any place, refuses the whole answer).
 //!
 //! `num.rs` (`Magic::div`, `floor_to`/`ceil_to`, `render_fixed`,
 //! `render_u64`) and `cid.rs` (`classify`/`CidPrefix`) already carry
@@ -54,7 +60,7 @@ use exec_binance::recon::{
     scan_cm_account, scan_pm_account, scan_positions, scan_um_account, PosRow, MARGIN_CROSS, MARGIN_ISOLATED, PM_LOCKED,
     PM_MARGIN_CALL, PM_NORMAL,
 };
-use exec_binance::rest::{scan_orders, scan_trades, OrderRow, TradeRow};
+use exec_binance::rest::{scan_mark, scan_orders, scan_touch, scan_trades, ArrErr, OrderRow, TradeRow};
 use exec_binance::userstream::{
     scan_user_event, NotCross, ScanErr, Span, UserEvent, CONFIG_LEVERAGE, CONFIG_MULTI_ASSETS_OFF, CONFIG_MULTI_ASSETS_ON,
     ISOLATED_MAX, RISK_FORCE_LIQUIDATION, RISK_MARGIN_CALL, RISK_NORMAL, RISK_REDUCE_ONLY, RISK_UNKNOWN, S_NEW,
@@ -921,5 +927,125 @@ proptest! {
         ][which];
         let mut a = WsAnswer::default();
         prop_assert_eq!(scan_answer(f.as_bytes(), &mut a), Err(ScanErr::Malformed), "{}", f);
+    }
+}
+
+// =========================================================================
+// G — BX7b: the Demo tools' touch and mark, and `scan_orders`' one-reading
+// law. (The parser review's BX7b round 1, T1 and T3.)
+// =========================================================================
+
+/// One open-order row's fields as the venue lists them.
+const ORDER_ROW_FIELDS: [&str; 11] = [
+    r#""symbol":"BTCUSDT""#,
+    r#""clientOrderId":"mvA""#,
+    r#""orderId":1"#,
+    r#""side":"BUY""#,
+    r#""status":"NEW""#,
+    r#""origQty":"0.4""#,
+    r#""executedQty":"0""#,
+    r#""price":"9""#,
+    r#""avgPrice":"0""#,
+    r#""cumQuote":"0""#,
+    r#""updateTime":1"#,
+];
+
+/// A second, readable copy of each key `scan_orders` reads — another
+/// order's (a foreign order's second id reading as the probe's own).
+const ORDER_ROW_SECONDS: [&str; 11] = [
+    r#""symbol":"ETHUSDT""#,
+    r#""clientOrderId":"bxprobe1x01""#,
+    r#""orderId":9"#,
+    r#""side":"SELL""#,
+    r#""status":"CANCELED""#,
+    r#""origQty":"9""#,
+    r#""executedQty":"9""#,
+    r#""price":"1""#,
+    r#""avgPrice":"9""#,
+    r#""cumQuote":"9""#,
+    r#""updateTime":9"#,
+];
+
+proptest! {
+    /// G1 — the touch and the mark come back exactly as encoded, from one
+    /// object or dapi's one-element array (whitespace around either), with
+    /// fields the scan does not read alongside; another symbol's answer is
+    /// not the one asked for.
+    #[test]
+    fn the_touch_and_the_mark_round_trip_as_an_object_or_a_one_element_array(
+        sym in 0usize..3,
+        bid_1e6 in 1i64..1_000_000_000_000i64,
+        gap_1e6 in 1i64..1_000_000_000i64,
+        idx_1e6 in 0i64..1_000_000_000_000i64,
+        array in any::<bool>(),
+        extra in any::<bool>(),
+    ) {
+        let symbol = ["BTCUSDT", "BNBUSD_PERP", "TSLAUSDT"][sym];
+        let ask_1e6 = bid_1e6 + gap_1e6;
+        let more = if extra { r#","bidQty":"1.5","pair":"BTCUSD","time":1"# } else { "" };
+        let t = format!(r#"{{"symbol":"{symbol}","bidPrice":"{}","askPrice":"{}"{more}}}"#, fx6(bid_1e6), fx6(ask_1e6));
+        let m = format!(r#"{{"symbol":"{symbol}","markPrice":"{}","indexPrice":"{}"{more}}}"#, fx6(bid_1e6), fx6(idx_1e6));
+        let (t, m) = if array { (format!(" [ {t} ]\n"), format!("\t[{m}] ")) } else { (format!(" {t}\n"), format!("\r\n{m} ")) };
+        prop_assert_eq!(scan_touch(t.as_bytes(), symbol.as_bytes()), Ok((bid_1e6, ask_1e6)), "{}", t);
+        prop_assert_eq!(scan_mark(m.as_bytes(), symbol.as_bytes()), Ok((bid_1e6, idx_1e6)), "{}", m);
+        prop_assert_eq!(scan_touch(t.as_bytes(), b"ETHUSDT"), Err(ScanErr::BadField));
+        prop_assert_eq!(scan_mark(m.as_bytes(), b"ETHUSDT"), Err(ScanErr::BadField));
+    }
+
+    /// G2 — a key the touch or the mark reads named twice, at any place in
+    /// the object; bytes after the answer; a second element: each refused,
+    /// never a choice between copies.
+    #[test]
+    fn a_touch_or_a_mark_read_twice_or_trailed_is_refused(
+        key in 0usize..3,
+        at in 0usize..5,
+        tail in prop_oneof![Just(","), Just(" x"), Just("]"), Just("{}"), Just(r#",{"symbol":"X"}"#)],
+        mark in any::<bool>(),
+    ) {
+        let (ka, kb) = if mark { ("markPrice", "indexPrice") } else { ("bidPrice", "askPrice") };
+        let scan = |b: &[u8]| if mark { scan_mark(b, b"X") } else { scan_touch(b, b"X") };
+        let once = format!(r#"{{"symbol":"X","{ka}":"1","{kb}":"2","time":1}}"#);
+        prop_assert!(scan(once.as_bytes()).is_ok(), "{}", once);
+        let mut fields = vec![String::from(r#""symbol":"X""#), format!(r#""{ka}":"1""#), format!(r#""{kb}":"2""#), String::from(r#""time":1"#)];
+        let second = [String::from(r#""symbol":"X""#), format!(r#""{ka}":"1""#), format!(r#""{kb}":"2""#)][key].clone();
+        fields.insert(at.min(fields.len()), second);
+        let twice = format!("{{{}}}", fields.join(","));
+        prop_assert_eq!(scan(twice.as_bytes()), Err(ScanErr::Malformed), "{}", twice);
+        let trailed = format!("{once}{tail}");
+        prop_assert_eq!(scan(trailed.as_bytes()), Err(ScanErr::Malformed), "{}", trailed);
+        let two = format!("[{once},{once}]");
+        prop_assert_eq!(scan(two.as_bytes()), Err(ScanErr::Malformed));
+    }
+
+    /// G3 — any bytes, any symbol: no panic; what reads is a two-sided book,
+    /// a positive mark.
+    #[test]
+    fn the_touch_and_the_mark_never_panic_on_arbitrary_bytes(
+        bytes in proptest::collection::vec(any::<u8>(), 0..512),
+        sym in proptest::collection::vec(any::<u8>(), 0..12),
+    ) {
+        if let Ok((bid, ask)) = scan_touch(&bytes, &sym) {
+            prop_assert!(0 < bid && bid < ask);
+        }
+        if let Ok((m, i)) = scan_mark(&bytes, &sym) {
+            prop_assert!(m > 0 && i >= 0);
+        }
+    }
+
+    /// G4 — an order row naming a key `scan_orders` reads twice, in either
+    /// row of the answer and at any place in it, refuses the whole answer:
+    /// a second `clientOrderId` reading `bxprobe…` would pass the probe's
+    /// cancel-all gate; a second `price` would decide a listing check.
+    #[test]
+    fn an_order_row_naming_a_read_key_twice_is_refused(k in 0usize..11, at in 0usize..12, first in any::<bool>()) {
+        let good = format!("{{{}}}", ORDER_ROW_FIELDS.join(","));
+        let mut fields: Vec<&str> = ORDER_ROW_FIELDS.to_vec();
+        fields.insert(at.min(fields.len()), ORDER_ROW_SECONDS[k]);
+        let bad = format!("{{{}}}", fields.join(","));
+        let body = if first { format!("[{bad},{good}]") } else { format!("[{good},{bad}]") };
+        let mut out = [OrderRow::default(); 4];
+        prop_assert_eq!(scan_orders(body.as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Malformed)), "{}", body);
+        let clean = format!("[{good},{good}]");
+        prop_assert_eq!(scan_orders(clean.as_bytes(), &mut out), Ok(2));
     }
 }

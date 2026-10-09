@@ -61,6 +61,16 @@
 #       something LEFT ON THE ACCOUNT (loudest), 39 the dead man's stall.
 #       A SIGINT/SIGTERM ends the battery short (cancel-all, a flat
 #       read): the wrapper waits for it rather than dying first.
+#   50-59 BX7b, the Binance DEMO tools (pinned by `bn_demo::tests`). The
+#       battery (`--binance … --lifecycle`): 50 the account check, 51 the
+#       boot, 52 a maker cycle, 53 the post-only refusal, 54 the TTL, 55
+#       the sweep, 56 a reconciliation or a halt, 57 the fills — each also
+#       a clean run short of the plan's bar in that phase. Both: 58
+#       something LEFT ON THE DEMO ACCOUNT, or an end that could not read
+#       it (loudest). The probe
+#       (`--binance-probe`): 59 a probe failed (an arming-precondition
+#       probe refused, or a probe that could not run). They read only the
+#       BINANCE_DEMO_* variables and dial Demo hosts only.
 # The diagnostics start at 20 because clap exits 2 on any argument
 # error: a release binary too old to have the arm would otherwise have
 # reported itself as a signing failure.
@@ -113,8 +123,10 @@ fi
 offline=0
 dry=0
 hlperp=0
+binance=0
 for a in "$@"; do
   [ "$a" = "--hl-perp" ] && hlperp=1
+  case "$a" in --binance*) binance=1 ;; esac
   [ "$a" = "--offline" ] && offline=1
   # A dry run reaches no venue either, and must not inherit the
   # message that says one verified us. Same rule as --offline.
@@ -134,6 +146,8 @@ case "$rc" in
         echo "exec-smoke: DRY RUN — nothing was sent and NOTHING was verified; the action above is what would go on the wire" >&2
       elif [ "$offline" = 1 ]; then
         echo "exec-smoke: PASS (offline) — this binary reproduces the venue SDK's bytes for every action type; the venue was NOT contacted" >&2
+      elif [ "$binance" = 1 ]; then
+        echo "exec-smoke: PASS (Binance Demo) — the report above names every answer; nothing was left on the Demo account" >&2
       else
         echo "exec-smoke: PASS — this binary's signature is verified by the venue" >&2
       fi ;;
@@ -143,10 +157,16 @@ case "$rc" in
   23) echo "exec-smoke: *** OFFLINE SELF-TEST FAILED *** this binary does not reproduce the venue SDK's bytes — do not ship it" >&2 ;;
   38) echo "exec-smoke: *** XH4g: THE BATTERY LEFT A POSITION OR AN ORDER ON THE TESTNET ACCOUNT *** — clear it before the next run (the arm holds a boot over a position)" >&2 ;;
   3[0-79]) echo "exec-smoke: XH4g battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
+  58) echo "exec-smoke: *** BX7b: SOMETHING WAS LEFT ON THE BINANCE DEMO ACCOUNT, OR ITS END COULD NOT READ IT *** — the report names it; read the account by hand and clear it before the next run" >&2 ;;
+  59) echo "exec-smoke: *** BX7b: A BINANCE DEMO PROBE FAILED *** — the report above names it" >&2 ;;
+  5[0-7]) echo "exec-smoke: BX7b Binance Demo battery FAILED (exit $rc) — the report above names the phase" >&2 ;;
   *) echo "exec-smoke: could not run (exit $rc)" >&2
      # 1 (refused before anything was sent) and 2 (clap) left nothing.
      if [ "$hlperp" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
        echo "exec-smoke: *** the XH4g battery ended abnormally — slot-6 orders or a position may remain on the TESTNET account; the next battery's account check refuses while slot 6's orders rest: clear them first ***" >&2
+     fi
+     if [ "$binance" = 1 ] && [ "$rc" != 1 ] && [ "$rc" != 2 ]; then
+       echo "exec-smoke: *** the Binance Demo tool ended abnormally — orders or a position may remain on the DEMO account: read it before the next run ***" >&2
      fi ;;
 esac
 exit $rc

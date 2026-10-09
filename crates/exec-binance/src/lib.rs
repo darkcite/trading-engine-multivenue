@@ -31,7 +31,7 @@
 //! | [`oot`] | the open-order table (1 024, keyed from submit time, in-doubt set) |
 //! | [`clock`] | the venue clock offset, minimum-RTT (BX-6) |
 //! | [`dns`] | DNS re-resolve on a dial-failure streak, on a cold thread (BX7) |
-//! | `json` | the one in-place JSON walker the scanners share (crate-private) |
+//! | [`json`] | the one in-place JSON walker the scanners share — and the cli's Demo tools (BX7b) |
 //! | [`userstream`] | the user-data event scanner (BX-2, BX-15); the listenKey lifecycle |
 //! | [`wsapi`] | the WS API session: `session.logon`, the order verbs, the answer scanner |
 //! | [`rest`] | the signed REST builder (rendered, then signed in place) and its scanners |
@@ -70,7 +70,7 @@ pub mod gateway;
 pub mod gov;
 pub mod inst;
 pub mod journal;
-pub(crate) mod json;
+pub mod json;
 pub mod margin;
 pub mod mode;
 pub mod num;

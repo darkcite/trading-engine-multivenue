@@ -39,7 +39,14 @@ pub mod audit_replay;
 pub mod backtest;
 pub mod bin15_boot;
 pub mod bin15_live;
+/// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
+pub mod bn_battery;
+/// BX7b: the Binance Demo tools' shared client (`exec-smoke --binance…`) —
+/// the crate's own: the binary reaches it only through the two tools.
+pub(crate) mod bn_demo;
 pub mod bn_live;
+/// BX7b: the K-probes on Binance Demo (`exec-smoke --binance-probe`).
+pub mod bn_probe;
 pub mod capture_catalog;
 pub mod evm_live;
 pub mod evm_shadow;

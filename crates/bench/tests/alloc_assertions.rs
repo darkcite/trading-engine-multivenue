@@ -13524,7 +13524,8 @@ fn binance_arm_steady_state() {
 /// rows found; the open-order table (insert, rename, remove), the
 /// in-flight table and the deadline queue (BX7: the kit's `Pending` and
 /// `TimerQueue` — a request's id and deadline, an order's TTL), the
-/// trade-id and ended rings and the clock; the dead-man's
+/// trade-id and ended rings and the clock (BX7b: its `serverTime` answer
+/// read too); the dead-man's
 /// signed query rendered and signed in its window, its answer and a
 /// refusal scanned; and — at their own cadence — the reconciliation's
 /// scans and judges. BX7: a position update's not-cross positions walked
@@ -13537,7 +13538,9 @@ fn binance_gateway_render_and_scan_steady_state() {
     use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
     use exec_binance::oot::{EndedRing, Oot, TidRing};
     use exec_binance::recon::{day_increasing_1e6, judge_positions, scan_um_account, Leg, PosRow, Verdict};
-    use exec_binance::rest::{scan_countdown, scan_error, scan_orders, scan_trades, OrderRow, QueryWriter, TradeRow};
+    use exec_binance::rest::{
+        scan_countdown, scan_error, scan_orders, scan_server_time, scan_trades, OrderRow, QueryWriter, TradeRow,
+    };
     use exec_binance::userstream::{scan_user_event, UserEvent};
     use exec_binance::wsapi::{
         queue_account, queue_cancel, queue_modify, queue_place, queue_status, scan_answer, FrameSink,
@@ -13554,6 +13557,9 @@ fn binance_gateway_render_and_scan_steady_state() {
     const ACCOUNT: &[u8] = br#"{"id":19,"status":200,"result":{"totalInitialMargin":"1.00","totalMaintMargin":"0.52","totalWalletBalance":"1000.00","totalMarginBalance":"1000.00","availableBalance":"999.00","assets":[{"asset":"USDT","walletBalance":"1000.00"}],"positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0.003","unrealizedProfit":"0.00","notional":"195.00","updateTime":1790000000000}]}}"#;
 
     const COUNTDOWN: &[u8] = br#"{"symbol":"BTCUSDT","countdownTime":"30000"}"#;
+    // BX7b: the venue clock's answer (the cycle's clock read; one whole
+    // object, the key once).
+    const TIME: &[u8] = br#"{"serverTime":1790000000000}"#;
     // BX7 (carried): an account reconfigured — a leverage and the
     // multi-assets mode, in one frame.
     const CONFIG_UPDATE: &[u8] = br#"{"e":"ACCOUNT_CONFIG_UPDATE","E":1790000000125,"T":1790000000121,"ac":{"s":"BTCUSDT","l":25},"ai":{"j":true}}"#;
@@ -13696,7 +13702,9 @@ fn binance_gateway_render_and_scan_steady_state() {
             std::hint::black_box(exec_binance::gateway::implied_px_1e6(2_002, px, ended.quote_1e12(k), 1));
         }
         oot.remove(ix);
-        // The clock.
+        // The clock: its answer read (BX7b: whole, the key once), then
+        // sampled.
+        std::hint::black_box(scan_server_time(TIME).expect("gate 93 time"));
         std::hint::black_box(clock.sample(now, now + 40_000, 1_790_000_000_000 + i));
         std::hint::black_box(clock.venue_ms(now));
         // The dead-man's signed query, in its window.

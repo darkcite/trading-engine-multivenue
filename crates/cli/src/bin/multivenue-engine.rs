@@ -649,6 +649,87 @@ struct ExecSmokeArgs {
     /// invocation would silently place nothing.
     #[arg(long, conflicts_with_all = ["lifecycle", "fill"])]
     watch: Option<u64>,
+
+    /// **BX7b — the K-probes on Binance DEMO** (`cli::bn_probe`): K19,
+    /// K11, K20, K16, K5, the account mode, the body-form DELETEs and K4,
+    /// asked with the Demo keys (`BINANCE_DEMO_*`, exported by the wrapper)
+    /// and the gateway's own requests. Demo only: no flag points it at
+    /// mainnet. Its orders are post-only far behind the touch, or IoCs that
+    /// cannot fill, each cancelled by the probe. Exit 58: something of the
+    /// probe's is left on the Demo account; 59: a precondition probe failed
+    /// or a probe could not run.
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["offline", "lifecycle", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
+    )]
+    binance_probe: bool,
+
+    /// **BX7b — the Binance DEMO battery** (`cli::bn_battery`), with
+    /// `--lifecycle`: the engine's own composition (router → `BnArm` →
+    /// `BnGateway`) on the named products — `um`, `cm` or `um,cm` — on
+    /// Demo's hosts with the Demo keys: maker cycles (place, two modifies,
+    /// cancel), a post-only refusal and a TTL on USDⓈ-M; IoC round
+    /// trips on each, each leg proven by a reconciliation that agrees; a
+    /// halt's sweep last; the end reads the account flat. Demo only. Exit
+    /// codes 50–58; 0 only when the plan's bar is met.
+    #[arg(
+        long,
+        value_name = "um|cm|um,cm",
+        requires = "lifecycle",
+        conflicts_with_all = ["hl_perp", "binance_probe", "offline", "fill", "sweep", "requote", "recon", "watch", "dry_run"]
+    )]
+    binance: Option<String>,
+
+    /// BX7b: the REST order route (`order_transport = "rest"`) instead of
+    /// the WS API.
+    #[arg(long, default_value_t = false, requires = "binance")]
+    bn_rest: bool,
+
+    /// BX7b: the HMAC key (`BINANCE_DEMO_HMAC_*`) — REST only (R22).
+    #[arg(long, default_value_t = false, requires = "bn_rest")]
+    bn_hmac: bool,
+
+    /// BX7b: the USDⓈ-M symbol.
+    #[arg(long, default_value = "BTCUSDT", requires = "binance")]
+    bn_um_symbol: String,
+
+    /// BX7b: the COIN-M symbol (Demo's coin wallet holds BNB, not BTC).
+    #[arg(long, default_value = "BNBUSD_PERP", requires = "binance")]
+    bn_cm_symbol: String,
+
+    /// BX7b: maker cycles on USDⓈ-M (the bar: 10 — fewer runs short of it
+    /// and exits non-zero).
+    #[arg(long, default_value_t = 10, requires = "binance")]
+    bn_cycles: u32,
+
+    /// BX7b: IoC round trips per product, an open and its reduce-only close
+    /// (the bar: 3 on USDⓈ-M, 2 on COIN-M).
+    #[arg(long, default_value_t = 3, requires = "binance")]
+    bn_fill_pairs: u32,
+
+    /// BX7b: each order's requested notional, USD (at most 200; a row's
+    /// minimum can raise it — the router's 600 USD clamp bounds the order).
+    #[arg(long, default_value_t = 60, requires = "binance")]
+    bn_usd: i64,
+
+    /// BX7b: a resting quote's distance behind the touch, bps (50..=450).
+    #[arg(long, default_value_t = 300, requires = "binance")]
+    bn_rest_bps: i64,
+
+    /// BX7b: an IoC's distance through the touch, bps.
+    #[arg(long, default_value_t = 50, requires = "binance")]
+    bn_cross_bps: i64,
+
+    /// BX7b: the TTL phase's lifetime, ms (5000..=20000: the arm's
+    /// shortest maker TTL is 5 s).
+    #[arg(long, default_value_t = 5_000, requires = "binance")]
+    bn_ttl_ms: u64,
+
+    /// BX7b: replace the order session make-before-break after this many
+    /// seconds (the WS API); 0 = the production 23 h.
+    #[arg(long, default_value_t = 0, requires = "binance")]
+    bn_rotate_s: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -1611,6 +1692,44 @@ fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
     }
 }
 
+/// BX7b: the Binance Demo battery (`exec-smoke --binance … --lifecycle`).
+fn exec_binance_battery(products: &str, args: &ExecSmokeArgs) -> ExitCode {
+    let (mut um, mut cm) = (false, false);
+    for p in products.split(',') {
+        match p.trim() {
+            "um" => um = true,
+            "cm" => cm = true,
+            other => {
+                error!("exec-smoke --binance: `{other}` is not a product (um, cm)");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let spec = cli::bn_battery::BatterySpec {
+        um,
+        cm,
+        rest: args.bn_rest,
+        hmac: args.bn_hmac,
+        um_symbol: args.bn_um_symbol.clone(),
+        cm_symbol: args.bn_cm_symbol.clone(),
+        cycles: args.bn_cycles,
+        fill_pairs: args.bn_fill_pairs,
+        usd: args.bn_usd,
+        rest_bps: args.bn_rest_bps,
+        cross_bps: args.bn_cross_bps,
+        ttl_ms: args.bn_ttl_ms,
+        rotate_s: args.bn_rotate_s,
+    };
+    info!(?spec, "exec-smoke: BX7b — the Binance Demo battery");
+    // SIGINT/SIGTERM end the battery through its end — the cancel-all, the
+    // closes and the flat read — never mid-run with orders left.
+    if let Err(e) = cli::sigint::install_sigint_handler() {
+        error!("exec-smoke --binance: the signal handler: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::from(cli::bn_battery::run(&spec, TlsTransport::default_client_config()))
+}
+
 /// E3 arm: the TESTNET-ONLY signature gate.
 ///
 /// Exit codes are `exec_hyperliquid::EXIT_*` and `scripts/exec-smoke.sh`
@@ -1623,6 +1742,21 @@ fn evm_testnet(args: EvmTestnetArgs) -> ExitCode {
 /// file would be one refactor away from logging it.
 fn exec_smoke(args: ExecSmokeArgs) -> ExitCode {
     use exec_hyperliquid::{HlConfig, Scope};
+
+    // BX7b: the Binance Demo tools read their own variables and need none
+    // of Hyperliquid's phases.
+    if args.binance_probe {
+        // A SIGINT/SIGTERM stops the probes and still runs their end (the
+        // probe's orders cancelled, the account read).
+        if let Err(e) = cli::sigint::install_sigint_handler() {
+            error!("exec-smoke --binance-probe: the signal handler: {e}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::from(cli::bn_probe::run(TlsTransport::default_client_config()));
+    }
+    if let Some(products) = args.binance.as_deref() {
+        return exec_binance_battery(products, &args);
+    }
 
     // The offline half needs nothing: not a key, not a host, not a
     // socket. Do it before anything can fail for a reason that has

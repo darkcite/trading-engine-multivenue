@@ -20,8 +20,15 @@
 //! that an object names twice — no second reader of the frame can then
 //! pick another copy than the first did ([`field`] for one top-level key;
 //! the scanners keep a bit per key they read).
+//!
+//! **Public since BX7b** for the cli's Demo tools (`cli::bn_demo`), so
+//! their cold reads walk JSON the way the scanners do rather than by a
+//! second walker. The errors carry nothing by design: each caller turns
+//! `()` into its own refusal.
 
-use core_parse::{skip_json_value, skip_string, skip_ws};
+#![allow(clippy::result_unit_err)]
+
+use core_parse::{skip_json_value, skip_ws};
 
 /// The pairs of one JSON object.
 pub struct Pairs<'a> {
@@ -73,9 +80,21 @@ impl<'a> Pairs<'a> {
             return Err(());
         }
         let k0 = p + 1;
-        let k1 = skip_string(b, k0).ok_or(())?;
-        let key = b.get(k0..k1 - 1).ok_or(())?;
-        let c = skip_ws(b, k1);
+        // BX7b: a key with an escape is refused. Keys are compared raw, so
+        // `"bid\u0050rice"` would read as another key than `bidPrice` and
+        // slip past the one-reading law; Binance names no key with one.
+        // The key is read once, to its closing quote (the alloc review,
+        // round 2: no second walk over it).
+        let mut k1 = k0;
+        loop {
+            match b.get(k1) {
+                Some(b'"') => break,
+                Some(b'\\') | None => return Err(()),
+                Some(_) => k1 += 1,
+            }
+        }
+        let key = b.get(k0..k1).ok_or(())?;
+        let c = skip_ws(b, k1 + 1);
         if b.get(c) != Some(&b':') {
             return Err(());
         }
@@ -83,6 +102,19 @@ impl<'a> Pairs<'a> {
         let v1 = skip_json_value(b, v0).ok_or(())?;
         self.pos = v1;
         Ok(Some((key, v0, v1)))
+    }
+
+    /// Where the walk ended — just past the closing brace — once
+    /// [`Pairs::next`] has answered `Ok(None)`; `None` before. A reader that
+    /// must see the body whole checks what follows (one pass, no pre-walk).
+    #[inline]
+    #[must_use]
+    pub const fn end(&self) -> Option<usize> {
+        if self.done {
+            Some(self.pos)
+        } else {
+            None
+        }
     }
 }
 
@@ -133,6 +165,18 @@ impl<'a> Elems<'a> {
         let e = skip_json_value(b, p).ok_or(())?;
         self.pos = e;
         Ok(Some((p, e)))
+    }
+
+    /// Where the walk ended — just past the closing bracket — once
+    /// [`Elems::next`] has answered `Ok(None)`; `None` before.
+    #[inline]
+    #[must_use]
+    pub const fn end(&self) -> Option<usize> {
+        if self.done {
+            Some(self.pos)
+        } else {
+            None
+        }
     }
 }
 
@@ -275,9 +319,25 @@ mod tests {
             }
         }
         assert_eq!(keys, [b"e".to_vec(), b"o".to_vec(), b"a".to_vec(), b"n".to_vec(), b"b".to_vec()]);
+        assert_eq!(w.end(), Some(f.len() - 1), "just past the closing brace, before the trailing space");
+        let mut open = Pairs::new(br#"{"k":"unterminated}"#, 0).unwrap();
+        assert!(open.next().is_err(), "a value that never closes");
+        let mut cut = Pairs::new(br#"{"k"#, 0).unwrap();
+        assert!(cut.next().is_err(), "a key that never closes");
+        assert_eq!(cut.end(), None);
         let mut bad = Pairs::new(br#"{"a":1"b":2}"#, 0).unwrap();
         assert!(bad.next().is_ok());
         assert!(bad.next().is_err(), "a missing comma is refused");
+    }
+
+    /// BX7b: a key carrying an escape is refused, never compared raw.
+    #[test]
+    fn a_key_with_an_escape_is_refused() {
+        let mut w = Pairs::new(br#"{"bid\u0050rice":"2"}"#, 0).unwrap();
+        assert!(w.next().is_err());
+        assert_eq!(field(br#"{"bidPrice":"1","bid\u0050rice":"2"}"#, b"bidPrice"), None, "never chosen between");
+        let mut ok = Pairs::new(br#"{"bidPrice":"a\"b"}"#, 0).unwrap();
+        assert!(ok.next().is_ok(), "an escape in a VALUE is the value's reader's business");
     }
 
     #[test]
@@ -290,9 +350,12 @@ mod tests {
             assert!(z > a);
         }
         assert_eq!(n, 3);
+        assert_eq!(e.end(), Some(f.len()), "just past the closing bracket");
         assert!(Elems::new(b"[1 2]", 0).and_then(|mut e| { e.next()?; e.next() }).is_err());
-        let mut empty = Elems::new(b"[ ]", 0).unwrap();
+        let mut empty = Elems::new(b"[ ] x", 0).unwrap();
+        assert_eq!(empty.end(), None, "not walked yet");
         assert_eq!(empty.next(), Ok(None));
+        assert_eq!(empty.end(), Some(3), "the walk ends at the bracket, not at what follows");
     }
 
     /// BX7: one top-level key, named once — a nested one is not it, a

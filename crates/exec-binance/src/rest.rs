@@ -30,7 +30,9 @@
 //! **Answers** are read in place, fail closed: [`scan_error`] (the
 //! venue's `{"code":…,"msg":…}`), [`scan_listen_key`],
 //! [`scan_server_time`], [`scan_countdown`], [`scan_orders`] (the open
-//! orders) and [`scan_trades`] (the day's trades).
+//! orders) and [`scan_trades`] (the day's trades); and, for the cli's Demo
+//! tools (BX7b), [`scan_touch`] and [`scan_mark`] (the book's touch and
+//! the mark — a price the tools order at).
 
 use core_net::{Method, Params, ReqSpec};
 
@@ -570,15 +572,123 @@ pub fn scan_listen_key(body: &[u8]) -> Result<Span, ScanErr> {
     Err(ScanErr::Missing)
 }
 
-/// `{"serverTime":…}` → ms.
+/// `{"serverTime":…}` → ms: one whole object naming it once (BX7b, the
+/// one-reading law — a second copy or bytes after the object refuse).
 pub fn scan_server_time(body: &[u8]) -> Result<u64, ScanErr> {
     let mut w = Pairs::new(body, 0).map_err(malformed)?;
+    let mut t = None;
     while let Some((k, a, z)) = w.next().map_err(malformed)? {
         if k == b"serverTime" {
-            return u64_of(body, a, z).map_err(bad);
+            if t.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            t = Some(u64_of(body, a, z).map_err(bad)?);
         }
     }
-    Err(ScanErr::Missing)
+    if !ends_whole(body, w.end()) {
+        return Err(ScanErr::Malformed);
+    }
+    t.ok_or(ScanErr::Missing)
+}
+
+/// A walk that ended at `end` read the body whole: nothing but whitespace
+/// follows (one pass — the walk itself is the structure's check). It
+/// refuses what a whole-value pre-pass would, but one thing: the skipper's
+/// nesting cap (16) then applies to each value the walk passes, not to the
+/// body — nothing these readers read lies that deep.
+#[inline]
+fn ends_whole(body: &[u8], end: Option<usize>) -> bool {
+    end.is_some_and(|z| core_parse::skip_ws(body, z) == body.len())
+}
+
+/// `body` is one JSON value, whole: nothing but whitespace after it (the
+/// Demo tools' one-symbol reads, which must find the object before they
+/// walk it).
+fn whole(body: &[u8]) -> bool {
+    match core_parse::skip_json_value(body, 0) {
+        Some(end) => core_parse::skip_ws(body, end) == body.len(),
+        None => false,
+    }
+}
+
+/// Where a one-symbol read's object starts: the body itself, or the only
+/// element of an array (dapi answers one symbol's read as `[{…}]`) — the
+/// body whole either way.
+fn one_object(body: &[u8]) -> Result<usize, ScanErr> {
+    if !whole(body) {
+        return Err(ScanErr::Malformed);
+    }
+    let p = core_parse::skip_ws(body, 0);
+    match body.get(p) {
+        Some(b'{') => Ok(p),
+        Some(b'[') => {
+            let mut e = Elems::new(body, p).map_err(malformed)?;
+            let first = e.next().map_err(malformed)?;
+            let second = e.next().map_err(malformed)?;
+            match (first, second) {
+                // A lone element that is not an object is refused by the
+                // object's walk (`Pairs::new`).
+                (Some((at, _)), None) => Ok(at),
+                _ => Err(ScanErr::Malformed),
+            }
+        }
+        _ => Err(ScanErr::Malformed),
+    }
+}
+
+/// A one-symbol read's two decimal fields — each named once, the `symbol`
+/// named once and `symbol`'s.
+fn two_of(body: &[u8], symbol: &[u8], ka: &[u8], kb: &[u8]) -> Result<(i64, i64), ScanErr> {
+    let at = one_object(body)?;
+    let mut w = Pairs::new(body, at).map_err(malformed)?;
+    let (mut sym, mut a, mut b) = (None, None, None);
+    while let Some((k, v0, v1)) = w.next().map_err(malformed)? {
+        let slot = if k == b"symbol" {
+            if sym.is_some() {
+                return Err(ScanErr::Malformed);
+            }
+            sym = Some(str_of(body, v0, v1).map_err(bad)?);
+            continue;
+        } else if k == ka {
+            &mut a
+        } else if k == kb {
+            &mut b
+        } else {
+            continue;
+        };
+        if slot.is_some() {
+            return Err(ScanErr::Malformed);
+        }
+        *slot = Some(dec_1e6(body, v0, v1).map_err(bad)?);
+    }
+    match (sym, a, b) {
+        (Some(s), Some(a), Some(b)) if s == symbol => Ok((a, b)),
+        (Some(_), Some(_), Some(_)) => Err(ScanErr::BadField),
+        _ => Err(ScanErr::Missing),
+    }
+}
+
+/// **`GET …/ticker/bookTicker?symbol=`** (BX7b, the cli's Demo tools) → the
+/// touch `(bid, ask)` ×1e6 of `symbol`: one whole object (or dapi's
+/// one-element array of one), each key once, the symbol the one asked for,
+/// a two-sided book (`0 < bid < ask`).
+pub fn scan_touch(body: &[u8], symbol: &[u8]) -> Result<(i64, i64), ScanErr> {
+    let (bid, ask) = two_of(body, symbol, b"bidPrice", b"askPrice")?;
+    if bid <= 0 || ask <= bid {
+        return Err(ScanErr::BadField);
+    }
+    Ok((bid, ask))
+}
+
+/// **`GET …/premiumIndex?symbol=`** (BX7b, the cli's Demo tools) → `(mark,
+/// index)` ×1e6 of `symbol`, read as [`scan_touch`] reads; the mark
+/// positive, the index not negative.
+pub fn scan_mark(body: &[u8], symbol: &[u8]) -> Result<(i64, i64), ScanErr> {
+    let (mark, index) = two_of(body, symbol, b"markPrice", b"indexPrice")?;
+    if mark <= 0 || index < 0 {
+        return Err(ScanErr::BadField);
+    }
+    Ok((mark, index))
 }
 
 /// `{"symbol":"…","countdownTime":"…"}` — the dead-man is armed for that
@@ -653,10 +763,16 @@ const O_SIDE: u32 = 1 << 3;
 const O_STATUS: u32 = 1 << 4;
 const O_QTY: u32 = 1 << 5;
 const O_EXEC: u32 = 1 << 6;
-const O_NEED: u32 = O_SYM | O_CID | O_OID | O_SIDE | O_STATUS | O_QTY | O_EXEC;
+const O_PX: u32 = 1 << 7;
+const O_AVG: u32 = 1 << 8;
+const O_QUOTE: u32 = 1 << 9;
+const O_UPDATE: u32 = 1 << 10;
+const O_NEED: u32 = O_SYM | O_CID | O_OID | O_SIDE | O_STATUS | O_QTY | O_EXEC | O_PX;
 
 /// An array of orders into `out`; the count. Fail closed: a missing field
-/// or an element past `out` refuses the whole answer.
+/// (`price` among them: a market order lists `"0"`), a key an order names
+/// twice (BX7b, the one-reading law), bytes after the array, or an element
+/// past `out` refuses the whole answer.
 pub fn scan_orders(body: &[u8], out: &mut [OrderRow]) -> Result<usize, ArrErr> {
     let mut e = Elems::new(body, 0).map_err(malformed)?;
     let mut n = 0;
@@ -669,46 +785,66 @@ pub fn scan_orders(body: &[u8], out: &mut [OrderRow]) -> Result<usize, ArrErr> {
         let mut w = Pairs::new(body, a).map_err(malformed)?;
         let mut have = 0u32;
         while let Some((k, va, vz)) = w.next().map_err(malformed)? {
-            match k {
+            let bit = match k {
                 b"symbol" => {
                     r.symbol = Span::of(body, str_of(body, va, vz).map_err(bad)?);
-                    have |= O_SYM;
+                    O_SYM
                 }
                 b"clientOrderId" => {
                     r.cid = Span::of(body, str_of(body, va, vz).map_err(bad)?);
-                    have |= O_CID;
+                    O_CID
                 }
                 b"orderId" => {
                     r.venue_oid = u64_of(body, va, vz).map_err(bad)?;
-                    have |= O_OID;
+                    O_OID
                 }
                 b"side" => {
                     r.side = side_of(str_of(body, va, vz).map_err(bad)?)?;
-                    have |= O_SIDE;
+                    O_SIDE
                 }
                 b"status" => {
                     r.status = status_of(str_of(body, va, vz).map_err(bad)?);
-                    have |= O_STATUS;
+                    O_STATUS
                 }
                 b"origQty" => {
                     r.qty_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
-                    have |= O_QTY;
+                    O_QTY
                 }
                 b"executedQty" => {
                     r.executed_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
-                    have |= O_EXEC;
+                    O_EXEC
                 }
-                b"price" => r.px_1e6 = dec_1e6(body, va, vz).map_err(bad)?,
-                b"avgPrice" => r.avg_px_1e6 = dec_1e6(body, va, vz).map_err(bad)?,
-                b"cumQuote" => r.cum_quote_1e6 = dec_1e6(body, va, vz).map_err(bad)?,
-                b"updateTime" => r.update_ms = u64_of(body, va, vz).map_err(bad)?,
-                _ => {}
+                b"price" => {
+                    r.px_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_PX
+                }
+                b"avgPrice" => {
+                    r.avg_px_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_AVG
+                }
+                b"cumQuote" => {
+                    r.cum_quote_1e6 = dec_1e6(body, va, vz).map_err(bad)?;
+                    O_QUOTE
+                }
+                b"updateTime" => {
+                    r.update_ms = u64_of(body, va, vz).map_err(bad)?;
+                    O_UPDATE
+                }
+                _ => 0,
+            };
+            // A key read twice: which copy would hold? Refused (BX7b).
+            if have & bit != 0 {
+                return Err(ArrErr::Scan(ScanErr::Malformed));
             }
+            have |= bit;
         }
         if have & O_NEED != O_NEED {
             return Err(ArrErr::Scan(ScanErr::Missing));
         }
         n += 1;
+    }
+    if !ends_whole(body, e.end()) {
+        return Err(ArrErr::Scan(ScanErr::Malformed));
     }
     Ok(n)
 }
@@ -1004,6 +1140,10 @@ mod tests {
         let lk = br#"{"listenKey":"pqia91ma19a5s61cv6a81va65sdf19v8a65a1a5s61cv6a81va65sdf19v8a65a1"}"#;
         assert_eq!(scan_listen_key(lk).unwrap().get(lk).len(), 64);
         assert_eq!(scan_server_time(br#"{"serverTime":1499827319559}"#), Ok(1_499_827_319_559));
+        // BX7b: one whole object, the key once.
+        assert_eq!(scan_server_time(br#"{"serverTime":1,"serverTime":2}"#), Err(ScanErr::Malformed));
+        assert_eq!(scan_server_time(br#"{"serverTime":1} {"serverTime":2}"#), Err(ScanErr::Malformed));
+        assert_eq!(scan_server_time(br#"{"serverTime":1}"#), Ok(1));
         let cd = br#"{"symbol":"BTCUSDT","countdownTime":"30000"}"#;
         assert_eq!(scan_countdown(cd).unwrap().get(cd), b"BTCUSDT");
         assert_eq!(scan_countdown(br#"{"code":-1102}"#), Err(ScanErr::Missing));
@@ -1025,6 +1165,56 @@ mod tests {
         assert_eq!(scan_orders(br#"[{"symbol":"X"}]"#, &mut one), Err(ArrErr::Scan(ScanErr::Missing)));
     }
 
+    /// BX7b (the parser review): an order naming a key twice, an order
+    /// without its price, bytes after the array — each refuses the answer.
+    #[test]
+    fn an_order_read_twice_or_short_or_trailed_is_refused() {
+        const ONE: &str = r#"{"clientOrderId":"mvA","executedQty":"0","orderId":1,"origQty":"0.40","price":"9","side":"BUY","status":"NEW","symbol":"BTCUSDT"}"#;
+        let mut out = [OrderRow::default(); 4];
+        assert_eq!(scan_orders(format!("[{ONE}]").as_bytes(), &mut out), Ok(1));
+        assert_eq!(scan_orders(format!("[{ONE}] ").as_bytes(), &mut out), Ok(1), "whitespace is not bytes");
+        for k in ["clientOrderId\":\"bxprobe", "price\":\"1", "origQty\":\"1", "symbol\":\"ETHUSDT", "orderId\":2,\"x"] {
+            let twice = ONE.replacen("{", &format!("{{\"{k}\","), 1);
+            let twice = twice.replace("\"x\",", "");
+            assert_eq!(
+                scan_orders(format!("[{twice}]").as_bytes(), &mut out),
+                Err(ArrErr::Scan(ScanErr::Malformed)),
+                "{twice}"
+            );
+        }
+        let no_price = ONE.replace(r#""price":"9","#, "");
+        assert_eq!(scan_orders(format!("[{no_price}]").as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Missing)));
+        assert_eq!(scan_orders(format!("[{ONE}]]").as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Malformed)));
+        assert_eq!(scan_orders(format!("[{ONE}][]").as_bytes(), &mut out), Err(ArrErr::Scan(ScanErr::Malformed)));
+    }
+
+    /// BX7b: the Demo tools' touch and mark — one whole object (or dapi's
+    /// one-element array), each key once, the symbol asked for.
+    #[test]
+    fn the_touch_and_the_mark_are_one_symbols_whole_answer() {
+        let t = br#"{"symbol":"BTCUSDT","bidPrice":"81759.10","bidQty":"459.1751","askPrice":"81766.10","askQty":"611.7072","time":1}"#;
+        assert_eq!(scan_touch(t, b"BTCUSDT"), Ok((81_759_100_000, 81_766_100_000)));
+        let a = br#"[{"symbol":"BNBUSD_PERP","pair":"BNBUSD","bidPrice":"730.760","askPrice":"731.020"}]"#;
+        assert_eq!(scan_touch(a, b"BNBUSD_PERP"), Ok((730_760_000, 731_020_000)));
+        assert_eq!(scan_touch(t, b"ETHUSDT"), Err(ScanErr::BadField), "another symbol's book");
+        assert_eq!(scan_touch(br#"{"symbol":"X","bidPrice":"2","askPrice":"1"}"#, b"X"), Err(ScanErr::BadField), "crossed");
+        for bad in [
+            &br#"{"symbol":"X","bidPrice":"1","askPrice":"2","bidPrice":"3"}"#[..],
+            br#"{"symbol":"X","symbol":"Y","bidPrice":"1","askPrice":"2"}"#,
+            br#"{"symbol":"X","bidPrice":"1","askPrice":"2"} x"#,
+            br#"[{"symbol":"X","bidPrice":"1","askPrice":"2"},{"symbol":"X","bidPrice":"1","askPrice":"2"}]"#,
+            br#"[{"symbol":"X","bidPrice":"1","askPrice":"2"}] ]"#,
+            br#"[1]"#,
+            br#"[]"#,
+        ] {
+            assert_eq!(scan_touch(bad, b"X"), Err(ScanErr::Malformed), "{}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(scan_touch(br#"{"symbol":"X","bidPrice":"1"}"#, b"X"), Err(ScanErr::Missing));
+        let m = br#"{"symbol":"BTCUSDT","markPrice":"81762.75753623","indexPrice":"81769.18456522","time":1}"#;
+        assert_eq!(scan_mark(m, b"BTCUSDT"), Ok((81_762_757_536, 81_769_184_565)));
+        assert_eq!(scan_mark(br#"{"symbol":"X","markPrice":"0","indexPrice":"1"}"#, b"X"), Err(ScanErr::BadField));
+    }
+
     #[test]
     fn trades() {
         let body = br#"[{"buyer":false,"commission":"-0.07819010","commissionAsset":"USDT","id":698759,"maker":false,"orderId":25851813,"price":"7819.01","qty":"0.002","quoteQty":"15.63802","realizedPnl":"-0.91539999","side":"SELL","positionSide":"SHORT","symbol":"BTCUSDT","time":1569514978020}]"#;
@@ -1041,6 +1231,8 @@ mod tests {
             if let Ok(s) = scan_listen_key(&bytes) { let _ = s.get(&bytes); }
             let _ = scan_server_time(&bytes);
             let _ = scan_countdown(&bytes);
+            let _ = scan_touch(&bytes, b"BTCUSDT");
+            let _ = scan_mark(&bytes, b"BTCUSDT");
             let mut o = [OrderRow::default(); 8];
             if let Ok(n) = scan_orders(&bytes, &mut o) {
                 for r in &o[..n] { let _ = (r.symbol.get(&bytes), r.cid.get(&bytes)); }
