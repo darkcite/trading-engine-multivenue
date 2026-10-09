@@ -16,18 +16,61 @@
 //! alike. BX11: the commission's asset (`N`) is a span inside the frame,
 //! named — with a commission — only by an order update (a `TRADE_LITE`'s
 //! reads empty), and re-based in the combined form like every span.
+//! BX12: an order update's `N`, whatever its bytes (the raw span: the
+//! scanner unescapes nothing), is judged by `journal::fee_asset` against
+//! five rows — USDⓈ-M's BTCUSDT, BTCUSDC and a dated BTCUSDT, COIN-M's
+//! BTCUSD_PERP and BNBUSD_PERP — as an independent oracle reads it.
 
 #![no_main]
 
-use exec_binance::inst::{PRODUCT_COINM, PRODUCT_USDM};
+use std::sync::OnceLock;
+
+use exec_binance::inst::{BindSpec, InstTable, WireTable, PRODUCT_COINM, PRODUCT_USDM};
+use exec_binance::journal::{fee_asset, FEE_ASSET_BNB, FEE_ASSET_NONE, FEE_ASSET_OTHER, FEE_ASSET_SETTLE};
 use exec_binance::userstream::{
     scan_user_event, NotCross, Span, UserEvent, CONFIG_LEVERAGE, CONFIG_MULTI_ASSETS_OFF, CONFIG_MULTI_ASSETS_ON,
     ISOLATED_MAX, RISK_MARGIN_CALL, RISK_NORMAL, UE_ACCOUNT, UE_CONFIG, UE_ORDER, UE_RISK, UE_TRADE_LITE,
 };
+use ingress_binance::discovery::BnDiscovery;
 use libfuzzer_sys::fuzz_target;
 
 /// The combined-stream wrapper's head: the event starts at its end.
 const WRAP: &[u8] = br#"{"stream":"s","data":"#;
+
+/// BX12: the rows a commission's asset is judged against — USDⓈ-M's
+/// BTCUSDT, BTCUSDC and dated BTCUSDT (settling in USDT, USDC, USDT),
+/// COIN-M's BTCUSD_PERP and BNBUSD_PERP (in BTC, in BNB: the settlement
+/// asset before BNB).
+const FAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSDT","pair":"BTCUSDT","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"BTCUSDC","pair":"BTCUSDC","contractType":"PERPETUAL","status":"TRADING","marginAsset":"USDC","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]},{"symbol":"BTCUSDT_261225","pair":"BTCUSDT","contractType":"CURRENT_QUARTER","status":"TRADING","marginAsset":"USDT","filters":[{"filterType":"PRICE_FILTER","tickSize":"0.10"},{"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"}]}]}"#;
+const DAPI: &[u8] = br#"{"symbols":[{"symbol":"BTCUSD_PERP","pair":"BTCUSD","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BTC","contractSize":100,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.1"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]},{"symbol":"BNBUSD_PERP","pair":"BNBUSD","contractType":"PERPETUAL","contractStatus":"TRADING","marginAsset":"BNB","contractSize":10,"filters":[{"filterType":"PRICE_FILTER","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"1","minQty":"1","maxQty":"1000000"}]}]}"#;
+
+/// Those rows, bound once.
+fn rows() -> &'static WireTable {
+    static ROWS: OnceLock<WireTable> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        let (mut fapi, mut dapi) = (BnDiscovery::new(), BnDiscovery::new());
+        fapi.ingest_body(FAPI).expect("the fapi fixture");
+        dapi.ingest_body(DAPI).expect("the dapi fixture");
+        let (mut t, mut w) = InstTable::new(7);
+        let named: [(&[u8], u8); 5] = [
+            (b"BTCUSDT", PRODUCT_USDM),
+            (b"BTCUSDC", PRODUCT_USDM),
+            (b"BTCUSDT_261225", PRODUCT_USDM),
+            (b"BTCUSD_PERP", PRODUCT_COINM),
+            (b"BNBUSD_PERP", PRODUCT_COINM),
+        ];
+        let mut i = 0;
+        while i < named.len() {
+            let (name, product) = named[i];
+            let d = if product == PRODUCT_USDM { &fapi } else { &dapi };
+            let row = d.find(name).expect("a fixture row");
+            let sym = core_types::make_symbol_id(core_types::VenueId::Binance, 700 + i as u32);
+            t.bind(&mut w, &BindSpec { sym, product, row, owned: true, maker_ok: true }).expect("bound");
+            i += 1;
+        }
+        w
+    })
+}
 
 /// The walk's spans, at most 64.
 fn walk(frame: &[u8], e: &UserEvent) -> ([Span; 64], usize) {
@@ -55,6 +98,29 @@ fuzz_target!(|data: &[u8]| {
     }
     if e.kind != UE_ORDER {
         assert!(e.fee_asset.len == 0 && e.commission_1e9 == 0, "a commission on no order update");
+    } else {
+        // BX12: the update's commission asset (`N`) — the raw span, the
+        // scanner unescapes nothing — judged against each row; the oracle:
+        // the row's settlement asset whole, else BNB, else another; none
+        // when absent.
+        let n = e.fee_asset.get(data);
+        let want = |settle: &[u8]| {
+            if n.is_empty() {
+                FEE_ASSET_NONE
+            } else if n == settle {
+                FEE_ASSET_SETTLE
+            } else if n == b"BNB" {
+                FEE_ASSET_BNB
+            } else {
+                FEE_ASSET_OTHER
+            }
+        };
+        let w = rows();
+        assert_eq!(fee_asset(w.row(0), n), want(b"USDT"), "a perpetual's asset");
+        assert_eq!(fee_asset(w.row(1), n), want(b"USDC"), "a USDC row's asset");
+        assert_eq!(fee_asset(w.row(2), n), want(b"USDT"), "a dated row's asset");
+        assert_eq!(fee_asset(w.row(3), n), want(b"BTC"), "a COIN-M row's coin");
+        assert_eq!(fee_asset(w.row(4), n), want(b"BNB"), "BNB as a COIN-M row's own coin");
     }
     if e.kind == UE_ORDER || e.kind == UE_TRADE_LITE {
         assert!(!e.symbol.get(data).is_empty(), "an order event with no symbol");

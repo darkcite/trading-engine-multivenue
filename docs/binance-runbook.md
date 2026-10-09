@@ -242,8 +242,13 @@ Deploying is yours, after you land `binance` on `main`:
 
 None of these is met by the code alone; each is yours.
 
-- **The ruling:** O-BX6 lifted for the slot (BX13), after BX12's gates
-  (gate 94, the TLS loopback set).
+- **The ruling:** O-BX6 lifted for the slot (BX13).
+- **The gates, on the tree you arm:** gate 94 and 94b and the loopback
+  set pass — `make alloc-assert` (the Mac, release: 119/119) and `cargo
+  nextest run -p exec-binance` (`bn_e2e_loopback`, 39 tests). Gates 94
+  and 94b pin USDⓈ-M classic's allocations only; the loopback set also
+  exercises COIN-M, Portfolio Margin and PM Pro (not their margin calls);
+  none is a WAN (risk-policy "BX12").
 - **The account:** dedicated to the engine (a `shared` scope refuses the
   boot); `--binance-setup … --bn-network mainnet` read, then applied with
   `--confirm`; the TradFi agreement signed if a TradFi row is owned; BNB
@@ -256,6 +261,9 @@ None of these is met by the code alone; each is yours.
   (`exec.toml.example` lists the variants this binary boots).
 - **The worker:** its PMLR reader reads the adopted and settlement fill
   flags before any surface folds Binance fills (risk-policy "BX7").
+- **The members:** every member trading the slot reads
+  `FILL_FLAG_ADOPTED` as opening inventory, never a trade (risk-policy
+  "BX7").
 - **The binary:** the Demo evidence of §7 on the very binary you arm.
 - **The boot:** `--arm-live <slot>`; the boot tells
   `binance: LIVE ARM ARMED — …` (or names what refused it). The first

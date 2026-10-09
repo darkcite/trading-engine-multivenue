@@ -1649,7 +1649,7 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
   - `bn_wsapi_response_scan_is_zero_alloc`, `bn_user_event_to_fill_is_zero_alloc`;
   - `bn_recon_compare_is_zero_alloc`, `bn_margin_ratio_is_zero_alloc`;
   - `bn_rest_render_sign_is_zero_alloc`.
-- **`make copy-audit`:** `crates/exec-binance` and `crates/signer-ed25519` join `scripts/copy-audit.sh:58-61`. Only the operator grows the baseline.
+- **`make copy-audit`:** `crates/exec-binance` and `crates/signer-ed25519` are in `scripts/copy-audit.sh`'s scope (joined at BX4 and BX6; line 79 at BX12). Only the operator grows the baseline.
 - **Fuzz:** `bn_wsapi_frame`, `bn_user_event`, `bn_rest_body`, `bn_cid`, `bn_eapi_mark_array` (BX0) and the COIN-M parsers, each for 300 s.
 - **TLS loopback tests:** `bn_wsapi_tls_loopback`, `bn_userstream_loopback`, `bn_rest_loopback`, `bn_gateway_e2e_loopback`.
 - `make lint`, `make license-check`, `make license-deps`.
@@ -1658,6 +1658,33 @@ Every scanner gets a `never_panics` proptest and a cargo-fuzz target: `bn_wsapi_
   - Sonnet: `parser-property-tester` (BX0 F2, BX2, BX6).
 
 **Size:** about 1 600 lines of test (loopback and fuzz).
+
+**BX12 record (2026-10-09, branch `binance`, one commit `BX12:`).** The risk law is risk-policy "BX12" (and the laws' Tested and Open lines it updates); the arming preconditions are `docs/binance-runbook.md` §8; the working log is the project doc `claude/bx12-build-plan-2026-10-09.md`. Loopback only: no venue order, no account tool run; nothing on the live order path changes.
+
+- **Built:**
+
+  | file | what |
+  |---|---|
+  | `crates/exec-binance/src/testvenue.rs` (new, feature `testvenue`) | the scripted venue, moved — not copied — out of `tests/bn_e2e_loopback.rs`: `pub` and documented, its certificate exported (`cert_der`), two knobs (`refuse_place`, `lose_place_answer`) |
+  | `crates/exec-binance/Cargo.toml`, `src/lib.rs` | `testvenue = ["loopback", "dep:rcgen", "dep:ring"]`, enabled only by dev-dependency edges (the crate's own, bench's) |
+  | `crates/bench/tests/alloc_assertions.rs`, `crates/bench/Cargo.toml` | **gate 94** (the WS API route) and **94b** (the REST order route, HMAC): the real `BnGateway` stepped against the venue in a child process over rustls; 11 and 12 allocations a round (rustls' records), the TTL cancel 6 and the sweep with its confirming cycle 7 (94); per-window event counts asserted |
+  | `crates/exec-binance/tests/bn_e2e_loopback.rs` | the laws' open tests: `a_1021_resyncs_the_clock_and_its_place_is_never_resent` (BX-6), `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one` (BX-7, BX-8), `a_lost_place_answer_is_never_resent` (BX-11), `a_stream_margin_call_halts_the_slot_and_rereads_the_account` (BX-20) |
+  | `fuzz/fuzz_targets/bn_user_event.rs` | the commission asset judged by `journal::fee_asset` against five rows, by an independent oracle |
+  | `docs/risk-policy.md`, `docs/binance-runbook.md` | the "BX12" entry; the laws' Tested and Open lines; §8's gates and members bullets |
+
+- **The plan's list, as built:**
+  1. **The seven named alloc gates** are existing numbers plus 94: `bn_arm_submit` 92; `bn_gateway_render_flush` 93, 94; `bn_wsapi_response_scan` 93, 104, 105; `bn_user_event_to_fill` 93, 105, 106, 94; `bn_recon_compare` 93, 105, 106, 94's sweep; `bn_margin_ratio` 92, 105, 106; `bn_rest_render_sign` 86, 93, 104, 94b.
+  2. **The four TLS loopback names are one file:** `bn_e2e_loopback.rs` (39 tests) runs the real gateway over rustls against one venue serving the WS API, the user streams and REST.
+  3. **Fuzz:** `bn_eapi_mark_array` is `binance_eapi_mark_array`; COIN-M's frames and discovery go through `binance_mark_price`, `binance_book_ticker` and `binance_exchange_info` — all 13 Binance targets ran.
+  4. **`make license-deps` was not run** (it rewrites the tracked notices): `cargo deny check licenses` and `cargo about generate` into `target/`, compared — identical.
+- **Departures from the BX12 build plan:** the timers are set long and each window's event triggered directly (a 50 ms TTL, the sweep word), not set short; the dead-man's renewal has no window (risk-policy "BX12", "What it does not pin"); the engine end is driven raw (the arm is gate 92's); the four tests above replace the plan's five (BX-7 covers the foreign fill); the `-1021`'d place is never re-sent — what BX-11 requires — not "resent once".
+- **Reviewers** (Opus 5.5 subagents acting as the agents, read-only; full dispositions in risk-policy "BX12"):
+  - **Round 1:** risk NEEDS-DOCS (two tests proved less than they claimed; the runbook's "met"); alloc NEEDS-DOCS (the windows asserted less than the rounds); zero-copy PASS (ZC-1, the operator's call); parser NEEDS-DOCS (no `CALCULATED` frame anywhere).
+  - **Round 2:** risk NEEDS-DOCS (margin calls beyond the classic stream not driven; wording); alloc NEEDS-DOCS (`EVT_POSITION` uncounted; wording); parser PASS.
+
+  Every finding fixed or acted on; seven break-and-watches, each failing its test.
+- **Carried:** COIN-M's, PM's and PM Pro's margin calls end to end; the REST route's unknown place outcome; `-5028` end to end; the shared scope's foreign-fill drift halt; gate 94 on COIN-M and PM; the live path's records (BX13); CLAUDE.md's gate line 117 → 119 (the operator's word).
+- **Size:** about 2 600 lines added and 1 600 removed across 11 files — the venue's move is 1 560 of each; new: the gates (450), the tests (190), the fuzz oracle (70), docs (220).
 
 ### BX13: Ramp. Battery only (O-BX6)
 
@@ -1932,6 +1959,13 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
   - Gates on the final tree (Mac, 21:31–21:35Z): clippy clean; nextest 4 385 run, 4 385 passed, 9 skipped; alloc 117/117 at 0 B/op, 3 ignored, with a fresh `Compiling bench` (gates 43, 92 and 93 extended); `make copy-audit` hits=28 baselined=28 new=0 paid=0 after its self-test; `make license-check` OK (668 files). Then two import lists (`bn_probe.rs`, `bn_battery.rs`) were re-wrapped, no line moved: the release binary rebuilt byte-identical to the Demo evidence's (md5 `d01b857f…`), clippy clean, the cli tests 564 run, 564 passed, 6 skipped.
   - Docs: `docs/risk-policy.md` (the laws section; "BX11"), `docs/binance-runbook.md` (new), `docs/local-setup.md` (a pointer to it), `docs/wire-format.md` (the journal: `J_FEE`, `ADOPTED`, `MARGIN`'s code, the codes, the anchor line), `exec.toml.example` (the Binance blocks), `.env.example`, this plan (§5 BX11; the tools' spellings).
   - Git: one commit `BX11:`, explicit paths. The engine was never touched.
+- **2026-10-09, BX12 built** (branch `binance`, on `dcc2593` BX11): gate 94 and 94b on a real TLS socket (loopback), the laws' open tests, fuzz, licences; loopback only; no member arms (O-BX6). The record is in §5 BX12; the risk law in risk-policy "BX12".
+  - Reviewers, two rounds: risk NEEDS-DOCS, NEEDS-DOCS; alloc NEEDS-DOCS, NEEDS-DOCS; zero-copy PASS; parser NEEDS-DOCS, PASS. Every finding fixed or acted on, seven break-and-watches.
+  - Fuzz (Mac, 300 s each, no crash): the 13 Binance targets, 10.4 M–193.6 M runs (risk-policy "BX12"); `bn_user_event` 29.7 M on the five-row oracle.
+  - Licences: `cargo deny check licenses` OK; `cargo about` notices identical to the tracked file.
+  - Gates on the final tree (Mac, 23:48–23:50Z): clippy clean; nextest 4 391 run, 4 391 passed, 10 skipped (gate 94's child helper the new one); alloc 119/119 at 0 B/op, 4 ignored, with a fresh `Compiling bench` — gate 94 and 94b at 11, 12, 6 and 7, as measured in the cloud; `make copy-audit` hits=28 baselined=28 new=0 paid=0; `make license-check` OK (670 files).
+  - Docs: `docs/risk-policy.md` ("BX12"; the laws' Tested and Open lines), `docs/binance-runbook.md` (§8), this plan (§5 BX12; the copy-audit line references).
+  - Git: one commit `BX12:`, explicit paths. The engine was never touched.
 
 ---
 
@@ -1991,7 +2025,7 @@ v1 already absorbs COIN-M, PM and Binance Stocks.
     - **Why lane 4 rather than HYPARB's `try_next_fill`:** `HyparbLive` produces its fills on the engine thread (it polls its sockets from `on_idle`), so it can hand them out through the trait. `BnArm`'s fills are produced on the gateway thread; they need an SPSC ring to cross threads anyway, and lane 4 is that ring.
 13. **BX2 citations.** `run_bn` is `paper.rs:8774-8913` and `run_bn_options` starts at `:8926`; the discovery rows are as in §13.2 F11.
 14. **§3.6 ordinals.** The Binance namespace above 2548 is empty: `VENUE_LIST_MAX = 500` (`universe.rs:47`), `BN_USDM_ORDINAL_BASE = 512` (`:52`), `BN_OPT_ORDINAL_BASE = 1024` (`:66`), `BN_DATED_ORDINAL_BASE = 2048` (`:72`). MEXC's 512 (`:98`) and HL's 4096 (`:254`) are other venues' namespaces. COIN-M 3072 / 3584 and equities 4096 stand.
-15. **BX12.** The copy-audit scope is `scripts/copy-audit.sh:72-78`; `crates/exec-binance` and `crates/signer-ed25519` join it there.
+15. **BX12.** The copy-audit scope is `scripts/copy-audit.sh:72-78`; `crates/exec-binance` and `crates/signer-ed25519` join it there (done at BX4 and BX6; the list is at line 79 since).
 16. **Stale comments found** (each fixed by the phase that touches its file, not before): `cli/Cargo.toml:57-59` ("LIVE_ARM_VENUES is empty") and `:61-62` ("TESTNET ONLY"); `exec-router/src/halt.rs:83-90` ("while flat"); `route.rs:172-177` ("sensors are VENUE-WIDE").
 
 ### 13.4 D7 (derived, not ruled): the client order id (§3.7) widened to 32 characters

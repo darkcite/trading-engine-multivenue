@@ -42,6 +42,10 @@ zeroize         = { workspace = true }
 core-net        = { workspace = true }
 mio             = { workspace = true }
 rustls          = { workspace = true }
+# BX12 — TEST-ONLY (`testvenue`): the scripted venue's certificate, and
+# its OWN Ed25519 verifier (never the signer under test).
+rcgen           = { workspace = true, optional = true }
+ring            = { workspace = true, optional = true }
 
 [features]
 # TEST-ONLY (the O-BX20 shape): `BnConfig::with_port`, so a test can put
@@ -49,14 +53,17 @@ rustls          = { workspace = true }
 # The real hosts refuse any port but 443 even with it on. Only
 # dev-dependency edges enable it.
 loopback = []
+# BX12 — TEST-ONLY: the scripted rustls Binance (`testvenue`), shared by
+# this crate's end-to-end tests and allocation gate 94. Only
+# dev-dependency edges enable it: off in any build that compiles no tests
+# (the deploy's `cargo build --release -p cli`, runbook §7); a build that
+# compiles the tests links it in, inert — no production path calls it.
+testvenue = ["loopback", "dep:rcgen", "dep:ring"]
 
 [dev-dependencies]
 proptest = { workspace = true }
-# tests/bn_e2e_loopback.rs: the scripted venue's certificate, its OWN
-# Ed25519 verifier (never the signer under test), and the router the arm
-# sits under in the engine.
-rcgen       = { workspace = true }
-ring        = { workspace = true }
+# tests/bn_e2e_loopback.rs: the router the arm sits under in the engine.
 exec-router = { workspace = true }
-# The loopback transport shape for this crate's own integration tests.
-exec-binance = { path = ".", features = ["loopback"] }
+# The loopback transport shape and the scripted venue (`testvenue`) for
+# this crate's own integration tests.
+exec-binance = { path = ".", features = ["testvenue"] }

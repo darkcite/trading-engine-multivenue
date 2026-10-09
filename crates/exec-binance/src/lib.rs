@@ -78,5 +78,7 @@ pub mod oot;
 pub mod recon;
 pub mod rest;
 pub mod selftest;
+#[cfg(feature = "testvenue")]
+pub mod testvenue;
 pub mod userstream;
 pub mod wsapi;

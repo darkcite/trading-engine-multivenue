@@ -13855,6 +13855,454 @@ fn binance_gateway_render_and_scan_steady_state() {
     assert_eq!(allocs, 0, "gate 93: the gateway's render and scan allocated {allocs} times ({bytes} B)");
 }
 
+/// Gate 94's venue half: runs ONLY in the child process gate 94 spawns
+/// (it is `#[ignore]`d, and a no-op without `GATE94_VENUE_DIR`): the
+/// scripted Binance (`exec_binance::testvenue`) — with `GATE94_REST=1`
+/// holding the account's HMAC secret, for gate 94b's REST route — writing
+/// its port and certificate for the parent.
+#[test]
+#[ignore = "gate 94's child process; never run on its own"]
+fn gate94_venue_helper() {
+    use exec_binance::testvenue::{Venue, HMAC_SECRET};
+    let Some(dir) = std::env::var_os("GATE94_VENUE_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let v = Venue::start();
+    if std::env::var_os("GATE94_REST").is_some_and(|x| x == "1") {
+        v.with(|s| s.hmac = Some(HMAC_SECRET.to_vec()));
+    }
+    std::fs::write(dir.join("cert.der"), &v.cert_der).expect("gate 94 cert");
+    // The port last: its presence says the rest is written.
+    std::fs::write(dir.join("port.tmp"), v.port.to_string()).expect("gate 94 port");
+    std::fs::rename(dir.join("port.tmp"), dir.join("port")).expect("gate 94 port");
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}
+
+/// **BX12 gate 94 — the Binance gateway's whole step, over a real rustls
+/// loopback, allocates only rustls' record buffers** (the live-socket
+/// gate: an arming precondition, runbook §8).
+///
+/// The REAL gateway (`BnGateway::step`, booted as the engine boots it)
+/// against the scripted Binance
+/// (`exec_binance::testvenue`) in a CHILD process — the counting
+/// allocator is process-global (gate 72's harness, gate 96b's shape) —
+/// the engine end driven raw (the arm on the engine thread is gate 92's).
+/// The knob timers — the dead-man's heartbeat and countdown, the
+/// reconciliation cadence, the session's rotation — are set past the
+/// gate's run; the 100 ms pulse runs inside every window (0 B, pinned with
+/// it); the clock's 60 s round is a constant the gate's seconds-long run
+/// stays clear of (asserted before each window). One maker rests
+/// throughout, so no round is a first maker that arms the dead-man: the
+/// first maker's countdown, the clock's first round and the countdown
+/// probe all land in the warm-up, and the rounds' window asserts that no
+/// REST job (a clock round, a countdown, a cycle) was answered in it.
+/// Every round: a post-only maker and a
+/// crossing IoC — selling, then buying, round by round: short, then flat,
+/// so the booked position changes sign every round (`EVT_POSITION`,
+/// counted) — pushed together:
+/// one `order.place` each, written in ONE record; the venue's two answers
+/// and five user-stream frames (the maker's NEW; the IoC's NEW, its
+/// `TRADE_LITE`, the update's TRADE and that update again), the IoC booked
+/// once from the lite (lane 4, `J_FILL`), its commission journaled from
+/// the update (`J_FEE`, BX11), retired FILLED; then the maker's cancel,
+/// its answer and the stream's CANCELED. Pinned like gate 96b: rustls 0.23's buffered API allocates
+/// one `Vec` per record it seals and one per application-data record it
+/// opens — exactly [`G94_WS_ROUND`] a round (two sealed, nine opened)
+/// while every inbound burst stays under its 4 KiB receive window (the
+/// largest here, about 2.3 KB); its decrypted-record queue grows once per
+/// connection, which the stalled first round forces (on 94b, one request
+/// in flight, the warm-up's rounds grow it). Everything else — the command
+/// burst, the desk, the deadlines, the render (on the WS API the frames
+/// ride the session's `session.logon`, no signature an order; 94b signs
+/// each request with HMAC), the frame, the scans, the dedupe ring, the
+/// fee, the journal, lane 4, the events — is 0 B: a regression shows as
+/// one more. Then, measured alone (gate 94 only): a maker
+/// with a 50 ms TTL and the gateway's own TTL cancel (the deadline queue,
+/// rendered and written in the step's second flush) — [`G94_TTL`], no
+/// REST job answered; and
+/// the halt's sweep (the stats word, never a command): the resting maker
+/// cancelled, then — the order route being up — the whole reconciliation
+/// cycle confirms it (`v2/account.status` over the WS API, the REST
+/// listing), until the word reads clear — [`G94_SWEEP`], one REST job
+/// answered: the cycle's own cost on the socket, four records. A
+/// break-and-watch (an 8-byte `Vec` in `on_place`) failed the rounds at 13
+/// and the TTL at 7.
+#[test]
+fn binance_gateway_round_trip_allocates_only_rustls_record_buffers() {
+    gate94(false);
+}
+
+/// **BX12 gate 94b — the REST order route (HMAC), the same rounds.** Every
+/// place and cancel is its own signed, body-form request on the route's
+/// one keep-alive connection (one in flight): a record sealed and its
+/// answer opened each, beside the same six user-stream frames —
+/// [`G94_REST_ROUND`] a round; the HMAC padded in the request's window
+/// (gate 104's render and signature, here on the socket).
+#[test]
+fn binance_rest_route_round_trip_allocates_only_rustls_record_buffers() {
+    gate94(true);
+}
+
+/// Gate 94's WS API round: two places in one record and the cancel sealed;
+/// two place answers, five frames, the cancel's answer and CANCELED opened.
+const G94_WS_ROUND: u64 = 11;
+/// Gate 94b's REST round: three requests sealed and answered; six frames.
+const G94_REST_ROUND: u64 = 12;
+/// The TTL window: the place and the TTL cancel sealed; their answers, the
+/// NEW and the CANCELED opened.
+const G94_TTL: u64 = 6;
+/// The sweep window: the resting maker's cancel sealed, its answer and
+/// CANCELED opened; the confirmation — the whole reconciliation cycle, the
+/// order route being up — `v2/account.status` and the REST listing sealed,
+/// their answers opened.
+const G94_SWEEP: u64 = 7;
+
+/// What the engine end saw (gate 94).
+#[derive(Clone, Copy, Default)]
+struct Seen94 {
+    /// The ACK of the order the round watches.
+    watched_acked: bool,
+    /// The order the round watches.
+    watch: u64,
+    filled: u64,
+    canceled_member: u64,
+    canceled_ttl: u64,
+    retired_other: u64,
+    rejects: u64,
+    sweeps_done: u64,
+    /// `EVT_POSITION`: the booked position changed sign.
+    positions: u64,
+    fills: u64,
+    j_fill: u64,
+    j_fee: u64,
+}
+
+/// Gate 94 on the WS API route (`rest` false, Ed25519) or the REST order
+/// route (HMAC).
+fn gate94(rest: bool) {
+    use clob_dispatcher::{RETIRED_CANCELED_MEMBER, RETIRED_CANCELED_TTL, RETIRED_FILLED};
+    use core_config::SecretKeyBytes;
+    use core_fill::{ORDER_KIND_IOC, ORDER_KIND_MAKER};
+    use core_ring::{Consumer, Ring};
+    use core_types::{ExecRecord, Fill, Side};
+    use exec_binance::cmd::{
+        duplex, BnCmd, BnEngineEnd, EVT_ACK, EVT_F_SWEEP_DONE, EVT_POSITION, EVT_REJECT, EVT_RETIRED, EVT_SWEEP,
+    };
+    use exec_binance::config::{BnConfig, HmacSigner, Scope};
+    use exec_binance::gateway::{BnGateway, GwKnobs, Phase};
+    use exec_binance::inst::{BindSpec, InstTable, PRODUCT_USDM};
+    use exec_binance::journal::{JournalTx, JOURNAL_RING, J_FEE, J_FILL};
+    use exec_binance::mode::AccountMode;
+    use exec_binance::testvenue::{EPOCH, FAPI, HMAC_SECRET, KEY, SEED, SLOT};
+    use exec_gateway::stats::SWEEP_CLEAR;
+    use ingress_binance::discovery::BnDiscovery;
+    use std::time::{Duration, Instant};
+
+    const FILL_N: usize = 1_024;
+    const ROUNDS: u64 = 300;
+    const WARM: u64 = 50;
+    /// Every timer the gate does not measure, set past its run: no
+    /// reconciliation cycle, no dead-man renewal, no half-open probe.
+    const LONG_MS: u64 = 3_600_000;
+    /// BTCUSDT on the venue's grid (tick 0.10, step 0.001), ×1e6: the
+    /// resting maker, the round's maker and the TTL maker below the mark
+    /// (65 000) inside the band; the IoCs across it, bought and sold; 0.002
+    /// each (126 USDT and more: over the 100 USDT minimum).
+    const PX_REST: i64 = 63_000_000_000;
+    const PX_MAKER: i64 = 64_000_000_000;
+    const PX_TTL: i64 = 63_500_000_000;
+    const PX_IOC_BUY: i64 = 65_100_000_000;
+    const PX_IOC_SELL: i64 = 64_900_000_000;
+    /// The clock's round comes 60 s after the first Ready pass (a
+    /// constant): every window must start well before it.
+    const CLOCK_CLEAR: Duration = Duration::from_secs(50);
+    const QTY: i64 = 2_000;
+
+    type Gw = BnGateway<FILL_N>;
+
+    /// One step, then everything the engine end, lane 4 and the journal
+    /// hold, tallied in place.
+    fn pump(
+        gw: &mut Gw,
+        eng: &mut BnEngineEnd,
+        lane: &mut Consumer<Fill, FILL_N>,
+        journal: &mut Consumer<ExecRecord, JOURNAL_RING>,
+        s: &mut Seen94,
+    ) {
+        gw.step();
+        while let Some(g) = eng.evt.pop() {
+            let (kind, oid, why, flags) = (g.kind, g.client_oid, g.why, g.flags);
+            drop(g);
+            match kind {
+                EVT_ACK => s.watched_acked |= oid == s.watch,
+                EVT_RETIRED => match why {
+                    RETIRED_FILLED => s.filled += 1,
+                    RETIRED_CANCELED_MEMBER => s.canceled_member += 1,
+                    RETIRED_CANCELED_TTL => s.canceled_ttl += 1,
+                    _ => s.retired_other += 1,
+                },
+                EVT_REJECT => s.rejects += 1,
+                EVT_SWEEP => s.sweeps_done += u64::from(flags & EVT_F_SWEEP_DONE != 0),
+                EVT_POSITION => s.positions += 1,
+                _ => {}
+            }
+        }
+        while let Some(g) = lane.try_pop_ref() {
+            drop(g);
+            s.fills += 1;
+        }
+        while let Some(g) = journal.try_pop_ref() {
+            s.j_fill += u64::from(g.kind == J_FILL);
+            s.j_fee += u64::from(g.kind == J_FEE);
+            drop(g);
+        }
+    }
+
+    // ---- the venue, in its own process ----
+    let dir = std::env::temp_dir().join(format!("mv-gate94-{}-{}", std::process::id(), u8::from(rest)));
+    std::fs::create_dir_all(&dir).expect("gate 94 dir");
+    let mut child = std::process::Command::new(std::env::current_exe().expect("gate 94 exe"))
+        .args(["gate94_venue_helper", "--exact", "--ignored", "--test-threads=1"])
+        .env("GATE94_VENUE_DIR", &dir)
+        .env("GATE94_REST", if rest { "1" } else { "0" })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("gate 94 child");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let port: u16 = loop {
+        if let Ok(s) = std::fs::read_to_string(dir.join("port")) {
+            break s.trim().parse().expect("gate 94 port");
+        }
+        assert!(Instant::now() < deadline, "gate 94: the venue never came up");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let der = std::fs::read(dir.join("cert.der")).expect("gate 94 cert");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(der)).expect("gate 94 anchor");
+    let tls = std::sync::Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+
+    // ---- the gateway, booted as the engine boots it ----
+    let cfg = if rest {
+        let h = HmacSigner::from_secret(HMAC_SECRET).expect("gate 94 secret");
+        BnConfig::loopback_hmac(Scope::Live, String::from(KEY), h, port).expect("gate 94 config")
+    } else {
+        let seed = SecretKeyBytes::new_locked(SEED).expect("gate 94 seed");
+        BnConfig::loopback(Scope::Live, String::from(KEY), seed, port).expect("gate 94 config")
+    };
+    let mut disc = BnDiscovery::new();
+    disc.ingest_body(FAPI).expect("gate 94 discovery");
+    let (mut table, mut wire) = InstTable::new(core_config::universe::LEGACY_BN_ANCHOR_SYM);
+    let row = disc.find(b"BTCUSDT").expect("BTCUSDT");
+    table
+        .bind(
+            &mut wire,
+            &BindSpec { sym: core_config::universe::LEGACY_BN_ANCHOR_SYM, product: PRODUCT_USDM, row, owned: true, maker_ok: true },
+        )
+        .expect("gate 94 bind");
+    let (mut eng, gw_end) = duplex();
+    let (fill_tx, mut lane) = Ring::<Fill, FILL_N>::new().split();
+    let (j_tx, mut journal) = Ring::<ExecRecord, JOURNAL_RING>::new().split();
+    let knobs = GwKnobs {
+        epoch: EPOCH,
+        owner_slot: SLOT,
+        shared: false,
+        mode: AccountMode::Classic,
+        recv_window_ms: 5_000,
+        stp_mode: String::from("EXPIRE_MAKER"),
+        countdown_ms: 2 * LONG_MS,
+        heartbeat_ms: LONG_MS,
+        recon_every_ms: LONG_MS,
+        spin: false,
+        rotate_after_ns: LONG_MS * 1_000_000,
+        rest_orders: rest,
+        pnl_anchor_1e6: 0,
+        boot_timeout_ns: 20_000_000_000,
+        quiet_ns: 60_000_000_000,
+        anchor_unsaved: None,
+        max_leverage: 20,
+        adopt_cap_usd_1e6: 0,
+    };
+    let mut gw = Gw::new(&cfg, tls, knobs, wire, gw_end, fill_tx, JournalTx::new(j_tx)).expect("gate 94 gateway");
+    gw.boot().expect("gate 94 boot");
+    assert_eq!(gw.phase(), Phase::Ready);
+    let ready_at = Instant::now();
+    let mut s = Seen94::default();
+    let place = |oid: u64, px: i64, ttl_ns: u64, kind: u8, side: Side| {
+        BnCmd::place(oid, px, QTY, ttl_ns, 0, kind, side, SLOT, 0).at(core_time::now_ns())
+    };
+    // The order verbs' answers, on either route (the REST jobs' are
+    // `rest_rtt`'s).
+    let answers = |eng: &BnEngineEnd| eng.stats.io()[1];
+
+    // The maker that rests throughout: the row's first, so its countdown
+    // (and the clock's first round, and the countdown probe) are the
+    // warm-up's.
+    s.watch = 900_001;
+    assert!(eng.cmd.push(&place(900_001, PX_REST, 0, ORDER_KIND_MAKER, Side::Bid)));
+    let t = Instant::now();
+    while !s.watched_acked {
+        assert!(t.elapsed() < Duration::from_secs(10), "gate 94: the resting maker was never acknowledged");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+    }
+    // Until no REST answer for 300 ms: the clock's first round, the
+    // countdown the maker armed, the probe.
+    let (mut seen, mut quiet) = (eng.stats.rest_rtt.count(), Instant::now());
+    while quiet.elapsed() < Duration::from_millis(300) {
+        assert!(t.elapsed() < Duration::from_secs(10), "gate 94: the boot's REST never settled");
+        pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+        if eng.stats.rest_rtt.count() != seen {
+            (seen, quiet) = (eng.stats.rest_rtt.count(), Instant::now());
+        }
+    }
+
+    // One round: a maker and an IoC in one burst; then the maker's cancel.
+    let mut oid = 1_000_000u64;
+    let mut round = |gw: &mut Gw,
+                     eng: &mut BnEngineEnd,
+                     lane: &mut Consumer<Fill, FILL_N>,
+                     journal: &mut Consumer<ExecRecord, JOURNAL_RING>,
+                     s: &mut Seen94,
+                     stall: bool| {
+        oid += 2;
+        let (maker, ioc) = (oid, oid + 1);
+        let (a0, f0, l0, c0, fee0) = (answers(eng), s.filled, s.fills, s.canceled_member, s.j_fee);
+        let sent0 = eng.stats.io()[0];
+        s.watch = maker;
+        s.watched_acked = false;
+        // The IoC sells, then buys, round by round (AL-6): short, then flat
+        // — the position changes sign every round.
+        let (side, px_ioc) = if (oid / 2) % 2 == 0 { (Side::Bid, PX_IOC_BUY) } else { (Side::Ask, PX_IOC_SELL) };
+        assert!(eng.cmd.push(&place(maker, PX_MAKER, 0, ORDER_KIND_MAKER, Side::Bid)));
+        assert!(eng.cmd.push(&place(ioc, px_ioc, 0, ORDER_KIND_IOC, side)));
+        let t = Instant::now();
+        if stall {
+            // Write both places, then let every answer and frame arrive
+            // before the next read: rustls' record queues reach their
+            // high-water marks here, in the warm-up.
+            while eng.stats.io()[0] < sent0 + 2 {
+                assert!(t.elapsed() < Duration::from_secs(5), "gate 94: the places were not written");
+                pump(gw, eng, lane, journal, s);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while !(answers(eng) >= a0 + 2 && s.watched_acked && s.filled > f0 && s.fills > l0 && s.j_fee > fee0) {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 94: a round's places stalled");
+            pump(gw, eng, lane, journal, s);
+        }
+        let a1 = answers(eng);
+        assert!(eng.cmd.push(&BnCmd::cancel(maker, 0, SLOT).at(core_time::now_ns())));
+        while !(answers(eng) > a1 && s.canceled_member > c0) {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 94: a round's cancel stalled");
+            pump(gw, eng, lane, journal, s);
+        }
+    };
+    let mut w = 0u64;
+    while w < WARM {
+        round(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, w == 0);
+        w += 1;
+    }
+
+    // ---- the rounds ----
+    assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 94: the run neared the clock's 60 s round");
+    let warm = s;
+    let (rest0, reconnects0) = (eng.stats.rest_rtt.count(), eng.stats.io()[5]);
+    let g = AllocGuard::new();
+    let mut r = 0u64;
+    while r < ROUNDS {
+        round(&mut gw, &mut eng, &mut lane, &mut journal, &mut s, false);
+        r += 1;
+    }
+    let (allocs, bytes, _) = g.delta();
+    let rest_in_window = eng.stats.rest_rtt.count() - rest0;
+    let reconnects = eng.stats.io()[5] - reconnects0;
+    let rounds = s;
+
+    // ---- the TTL, measured alone ----
+    let (ttl_allocs, ttl_bytes, ttl_seen) = if rest {
+        (0, 0, (0, 0, 0, 0, 0, 0))
+    } else {
+        assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 94: the run neared the clock's 60 s round");
+        let (t0, a0) = (s.canceled_ttl, answers(&eng));
+        let (r0, c0, j0, f0, p0) = (eng.stats.rest_rtt.count(), eng.stats.io()[5], s.rejects, s.fills, s.positions);
+        s.watch = 950_001;
+        s.watched_acked = false;
+        let g = AllocGuard::new();
+        assert!(eng.cmd.push(&place(950_001, PX_TTL, core_time::now_ns() + 50_000_000, ORDER_KIND_MAKER, Side::Bid)));
+        let t = Instant::now();
+        // Its place's answer, the TTL cancel's answer and its CANCELED.
+        while !(s.watched_acked && s.canceled_ttl > t0 && answers(&eng) >= a0 + 2) {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 94: the TTL never fired");
+            pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+        }
+        let (a, b, _) = g.delta();
+        // (REST jobs, order-session re-opens, TTL cancels, rejects, fills,
+        // position events) in the window.
+        let seen = (
+            eng.stats.rest_rtt.count() - r0,
+            eng.stats.io()[5] - c0,
+            s.canceled_ttl - t0,
+            s.rejects - j0,
+            s.fills - f0,
+            s.positions - p0,
+        );
+        (a, b, seen)
+    };
+
+    // ---- the halt's sweep, measured alone ----
+    let (sweep_allocs, sweep_bytes, sweep_seen) = if rest {
+        (0, 0, (0, 0, 0, 0))
+    } else {
+        assert!(ready_at.elapsed() < CLOCK_CLEAR, "gate 94: the run neared the clock's 60 s round");
+        let (d0, m0, o0, a0) = (s.sweeps_done, s.canceled_member, s.retired_other, answers(&eng));
+        let r0 = eng.stats.rest_rtt.count();
+        let g = AllocGuard::new();
+        let swept = eng.stats.request_sweep();
+        let t = Instant::now();
+        // Clear, its event, the resting maker cancelled and its cancel answered.
+        while !(eng.stats.sweep() == (swept, SWEEP_CLEAR) && s.sweeps_done > d0 && s.canceled_member > m0 && answers(&eng) > a0) {
+            assert!(t.elapsed() < Duration::from_secs(5), "gate 94: the sweep never cleared");
+            pump(&mut gw, &mut eng, &mut lane, &mut journal, &mut s);
+        }
+        let (a, b, _) = g.delta();
+        // (REST jobs, members cancelled, others retired, sweeps done). The
+        // sweep's own cancel retires as a member's (`cancel_why` has no
+        // sweep bucket): a dedicated reason would change this pin.
+        let seen = (eng.stats.rest_rtt.count() - r0, s.canceled_member - m0, s.retired_other - o0, s.sweeps_done - d0);
+        (a, b, seen)
+    };
+    child.kill().ok();
+    child.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let route = if rest { "94b" } else { "94" };
+    let per_round = if rest { G94_REST_ROUND } else { G94_WS_ROUND };
+    assert_eq!(
+        (rounds.filled - warm.filled, rounds.fills - warm.fills, rounds.j_fill - warm.j_fill, rounds.j_fee - warm.j_fee),
+        (ROUNDS, ROUNDS, ROUNDS, ROUNDS),
+        "gate {route}: every round's IoC filled, booked once on lane 4, journaled once with its fee"
+    );
+    assert_eq!(rounds.canceled_member - warm.canceled_member, ROUNDS, "gate {route}: every round's maker cancelled");
+    assert_eq!((rounds.rejects, rounds.retired_other), (0, 0), "gate {route}: nothing refused, nothing else retired");
+    assert_eq!(rounds.positions - warm.positions, ROUNDS, "gate {route}: the position changed sign every round");
+    assert_eq!(reconnects, 0, "gate {route}: no order-session re-open in the window");
+    assert_eq!(rest_in_window, 0, "gate {route}: no REST job (a clock round, a countdown, a cycle) in the window");
+    if !rest {
+        assert_eq!(
+            ttl_seen,
+            (0, 0, 1, 0, 0, 0),
+            "gate 94: the TTL window — no REST job, no order-session re-open, one TTL cancel, nothing refused, filled or moved"
+        );
+        assert_eq!(sweep_seen, (1, 1, 0, 1), "gate 94: the sweep window — the cycle's one listing, the maker cancelled, nothing else retired, one sweep");
+    }
+    assert_eq!(
+        (allocs, ttl_allocs, sweep_allocs),
+        (per_round * ROUNDS, if rest { 0 } else { G94_TTL }, if rest { 0 } else { G94_SWEEP }),
+        "gate {route}: the rounds, the TTL and the sweep allocated {allocs} ({bytes} B), {ttl_allocs} ({ttl_bytes} B) and {sweep_allocs} ({sweep_bytes} B) — rustls' records only"
+    );
+}
+
 /// **XMM XH4a gate 95 — the order-gateway kit is 0 B/op.** Built once
 /// (both rings, the stats block, the in-flight table, the deadline queue,
 /// the tx buffer — boot). Under the guard:

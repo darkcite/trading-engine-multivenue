@@ -129,6 +129,7 @@ dependencies = [
  "clob-dispatcher",
  "core-alloc",
  "core-amm",
+ "core-config",
  "core-crypto",
  "core-fill",
  "core-io",

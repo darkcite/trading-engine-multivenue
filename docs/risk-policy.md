@@ -6688,13 +6688,13 @@ release build and an `exec-smoke`-gated restart — Anton's word.
 ## BX — the Binance execution laws (BX-1 … BX-20)
 
 The plan's §4 laws (`docs/binance-exec-plan.md`), carried here by BX11 and
-restated **as built** on branch `binance` through BX11 (2026-10-09). The
+restated **as built** on branch `binance` through BX12 (2026-10-09). The
 arm is ARMABLE for USDⓈ-M and COIN-M under classic, PM and PM Pro, and
 **no member arms (O-BX6)** before BX13; spot, options and Binance Stocks
 refuse the boot (BX8–BX10). Each law gives its text, where it is
 enforced, what proves it and what stays open; "**As built**" marks where
 the build departs from the plan's wording. The phase entries after the
-laws (BX3, BX6, BX7, BX7b, BX11) are the history: where an entry and a
+laws (BX3, BX6, BX7, BX7b, BX11, BX12) are the history: where an entry and a
 law disagree, the law is the current statement. The operator's
 procedures are `docs/binance-runbook.md`.
 
@@ -6815,8 +6815,10 @@ procedures are `docs/binance-runbook.md`.
 * **Tested.** `clock.rs` `the_minimum_rtt_sample_wins_the_round`; `gov.rs`
   `codes_classify`; core-config `the_binance_section_is_required_and_bounded`
   (5 001 refused); the loopback venue checks every timestamp (`bad_ts ==
-  0`).
-* **Open.** No test drives a `-1021` through the resync.
+  0`); e2e `a_1021_resyncs_the_clock_and_its_place_is_never_resent` (BX12:
+  the clock's round of four reads, the place refused, counted and never
+  re-sent, the next one trading).
+* **Open.** `-5028` end to end (classified with `-1021`, never driven).
 
 #### BX-7 (ownership)
 
@@ -6834,10 +6836,14 @@ procedures are `docs/binance-runbook.md`.
   foreign fill is counted (`GW_FILLS_FOREIGN`), never booked.
 * **Tested.** exec_boot
   `a_live_binance_slot_resolves_with_its_section_and_nothing_else_does`;
-  `cid.rs` `ours_orphans_and_the_venues_own`; fuzz `bn_cid`.
-* **Open.** No test asserts the owner slot or the settlement flag on a
-  venue-originated fill. The worker folds adopted fills and settlements
-  as trades — an arming precondition ("BX7").
+  `cid.rs` `ours_orphans_and_the_venues_own`; fuzz `bn_cid`; e2e
+  `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one`
+  (BX12: the orphan's — its id naming another slot — a liquidation's,
+  reported `CALCULATED`, an ADL's and a settlement's fills to the owner
+  slot, the settlement alone flagged; a stranger's counted, booked to no
+  one).
+* **Open.** The worker folds adopted fills and settlements as trades — an
+  arming precondition ("BX7").
 
 #### BX-8 (the account's scope)
 
@@ -6860,8 +6866,11 @@ procedures are `docs/binance-runbook.md`.
   `a_shared_account_row_not_owned_is_not_live`; `bn_live.rs`
   `a_shared_account_owns_only_its_list`; e2e
   `the_arm_trades_end_to_end_against_a_scripted_venue` (a stranger's
-  order rests, counted every cycle).
-* **Open.** The shared scope (O-BX2a); a test injecting a foreign fill.
+  order rests, counted every cycle),
+  `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one`
+  (BX12: a stranger's fill counted, booked to no one).
+* **Open.** The shared scope (O-BX2a); the drift halt a foreign fill
+  raises, end to end.
 
 #### BX-9 (E-9) — the client order id
 
@@ -6927,12 +6936,14 @@ procedures are `docs/binance-runbook.md`.
 * **Tested.** e2e
   `the_arm_survives_a_lost_stream_a_5xx_and_a_dead_order_session`,
   `the_arm_survives_an_early_cancel_a_lost_partial_and_a_half_open_session`,
-  `an_unreadable_429_or_418_on_the_rest_route_is_still_the_budget_or_the_lock`;
+  `an_unreadable_429_or_418_on_the_rest_route_is_still_the_budget_or_the_lock`,
+  `a_lost_place_answer_is_never_resent` (BX12, the WS API route: one
+  `order.place`, the doubt resolved by `order.status` after the request's
+  deadline);
   `gateway.rs` `a_lost_trade_is_priced_at_the_implied_average`.
-* **Open.** No test proves that a lost *place* answer is followed by no
-  second `order.place` (the loopback venue scripts a modify's 5xx only).
-  The daily stream reopen doubts every order (up to 256 status queries,
-  "BX6").
+* **Open.** The REST order route's unknown outcome on a place (a 503
+  `-1007`), not driven end to end. The daily stream reopen doubts every
+  order (up to 256 status queries, "BX6").
 
 #### BX-12 (governed budgets)
 
@@ -7158,7 +7169,8 @@ procedures are `docs/binance-runbook.md`.
   unified account's one ratio (PM, PM Pro: `accountMaintMargin /
   accountEquity`, the reciprocal of `uniMMR`); sampled at each
   reconciliation, on `ACCOUNT_UPDATE` (re-read at least 5 s apart) and on
-  a margin call (the stream's `MARGIN_CALL`; PM's account status
+  a margin call (the stream's `MARGIN_CALL`; on PM and PM Pro the
+  `riskLevelChange` `MARGIN_CALL` and the unified account's status
   `MARGIN_CALL` or `SUPPLY_MARGIN`);
   `MarginBook::at_risk` raises `MarginRisk`, sticky. The threshold is
   required on a live Binance slot, ≤ 799 999. The router's halt refuses
@@ -7177,9 +7189,14 @@ procedures are `docs/binance-runbook.md`.
   `the_margin_halt_is_a_bounded_binance_key_required_on_a_live_binance_slot`;
   e2e `the_margin_and_scan_failure_halts_end_to_end`; `bn_ops.rs`
   `a_close_crosses_the_touch_inside_the_band`, `a_close_is_whole_steps`;
-  on Demo the battery's `--bn-drill flatten` (BX11).
-* **Open.** No test drives a stream `MARGIN_CALL` through the gateway to
-  the halt. Spot, options and Stocks have no ratio (not built).
+  on Demo the battery's `--bn-drill flatten` (BX11); e2e
+  `a_stream_margin_call_halts_the_slot_and_rereads_the_account` (BX12: the
+  call halts `MarginRisk` with a healthy ratio; the account re-read at
+  once, before the halt's confirming cycle reads it).
+* **Open.** Driven end to end only on the classic USDⓈ-M stream: COIN-M's
+  `MARGIN_CALL`, PM's and PM Pro's (`riskLevelChange` `MARGIN_CALL`, the
+  unified account's `MARGIN_CALL` / `SUPPLY_MARGIN`) are not. Spot,
+  options and Stocks have no ratio (not built).
 
 ### BX3 — router, ledger, lanes (2026-09-26) — DARK until BX6
 
@@ -8388,7 +8405,9 @@ or fills dropped or lost, no tap frame dropped, the flat read empty.
   BNB burn is neither asserted nor set (BX-14).
 * Tests still missing (at their laws): a `-1021` through the resync, a
   lost place answer never resent, a foreign fill, a venue-originated
-  fill's owner, a stream `MARGIN_CALL` end to end.
+  fill's owner, a stream `MARGIN_CALL` end to end — each added by BX12 (the
+  lost answer on the WS API route; the margin call on the classic USDⓈ-M
+  stream: risk-policy "BX12").
 * The account tools' mainnet path is proven by the client's guard (a
   change to a mainnet host leaves only signed with the word), by the
   dry run's ordering (read, print, return 64 before any change) and by its
@@ -8427,6 +8446,136 @@ or fills dropped or lost, no tap frame dropped, the flat read empty.
 | 2 | zero-copy and alloc | PASS; 3 notes | the latency cells; `bn_chip`'s `String` kept (every TUI chip's idiom, on the TUI thread) |
 | 2 | parser | PASS; 5 notes | the tools' own flags `requires = "binance_tool"` (break-and-watched); the close at most LOT_SIZE's maximum |
 | 3 | risk and parser | NEEDS-DOCS: the code approved; R3-1 the dry run silent on a position it cannot price; R3-2 the gap drill's floor one heartbeat short of a covered dead-man; R3-3 reads after a signal; R3-4 five doc lines | `would_skip`; two heartbeats; nothing read after a signal (the makers cancelled by id), the flatten drill not started; this entry, the runbook and the wrapper's text |
+
+### BX12 — the gates: gate 94 on a real TLS socket (loopback), the laws' open tests, fuzz (2026-10-09) — no member arms (O-BX6)
+
+Built on branch `binance` (plan §5 BX12; the BX12 build plan of
+2026-10-09). Loopback only: no venue order, no account tool run. Nothing on
+the live path changes — BX12 adds gates, tests and a test-only module — and
+it reaches the engine only through a merge to `main`, a release build and a
+restart: the operator's word.
+
+#### Gate 94 — the arming precondition, met on this tree (re-run on the tree armed, runbook §8)
+
+* **What it pins** (`crates/bench/tests/alloc_assertions.rs`:
+  `binance_gateway_round_trip_allocates_only_rustls_record_buffers`, 94;
+  `binance_rest_route_round_trip_allocates_only_rustls_record_buffers`,
+  94b): the REAL `BnGateway`, booted as the engine boots it and stepped
+  against the scripted venue in a child process over rustls, the engine end
+  driven raw (the arm is gate 92's). A round — a post-only maker and a
+  crossing IoC (bought, then sold, round by round) in one burst, then the
+  maker's cancel — allocates exactly the TLS records rustls seals and
+  opens: **11** on the WS API route (two sealed, nine opened), **12** on
+  the REST order route with HMAC (three requests sealed and answered, six
+  stream frames). Measured alone, on gate 94: the gateway's own TTL
+  cancel, **6**, no REST job answered; the halt's sweep with the
+  reconciliation cycle that confirms it, **7**, one REST job answered (the
+  cycle alone: four records). Everything else on the path — the burst,
+  the desk, the deadline queue, the render (the WS API's frames ride the
+  session's logon, no signature an order; 94b signs each request with
+  HMAC), the frames, the scans, the trade-id ring, `J_FEE`, the journal,
+  lane 4, the events, the 100 ms pulse — is 0 B. The counts are the same
+  in the cloud (debug, Linux) and on the Mac (release, `make
+  alloc-assert`). A break-and-watch (an 8-byte `Vec` in `on_place`)
+  failed the rounds at 13 and the TTL at 7.
+* **What it does not pin:** a WAN's records (an inbound burst over rustls'
+  4 KiB receive window costs more, as gate 87b says; the largest here is
+  about 2.3 KB); a redial's handshake; the clock's round (a 60 s constant,
+  the gate's run stays clear of it, asserted) and the dead-man's renewal
+  (its heartbeat set past the run) — REST jobs the rounds' window asserts
+  absent; the REST route's TTL cancel and sweep (94b runs the rounds
+  only); COIN-M's lane and Portfolio Margin on a socket (their renders and
+  scans are gates 105 and 106).
+* **The plan's seven named alloc gates** are these numbers:
+  `bn_arm_submit` 92; `bn_gateway_render_flush` 93 and 94;
+  `bn_wsapi_response_scan` 93, 104, 105; `bn_user_event_to_fill` 93, 105,
+  106 and 94 (`book_fill`, lane 4, `J_FEE`); `bn_recon_compare` 93, 105,
+  106 and 94's sweep; `bn_margin_ratio` 92, 105, 106; `bn_rest_render_sign`
+  86, 93, 104 and 94b.
+
+#### One scripted venue
+
+`exec_binance::testvenue` (feature `testvenue` = `loopback`, `rcgen`,
+`ring`; only dev-dependency edges enable it: it is off in any build that
+compiles no tests — the deploy's `cargo build --release -p cli` — and a
+build that compiles the tests links it in, inert: no production path calls
+it) is the venue the end-to-end tests ran against, moved
+out of `tests/bn_e2e_loopback.rs` — not copied — so gate 94 runs the same
+one. It exports its certificate (`cert_der`) for a client in another
+process and gains two knobs, `refuse_place` and `lose_place_answer`
+(the WS API's; on the REST order route a lost answer reads as a 503
+`-1007`).
+
+#### The TLS loopback set
+
+The plan's four names (`bn_wsapi_tls_loopback`, `bn_userstream_loopback`,
+`bn_rest_loopback`, `bn_gateway_e2e_loopback`) are one file,
+`crates/exec-binance/tests/bn_e2e_loopback.rs`: 39 tests of the real gateway
+over rustls against one venue serving the WS API, the user streams and
+REST.
+
+#### The laws' open tests, closed
+
+| law | e2e test | what it proves |
+|---|---|---|
+| BX-6 | `a_1021_resyncs_the_clock_and_its_place_is_never_resent` | a `-1021` starts the clock's round (four reads); the place is refused, counted and never re-sent; the next place trades |
+| BX-7 | `venue_originated_fills_go_to_the_owner_and_a_strangers_to_no_one` | the orphan's (its id naming another slot), a liquidation's (`CALCULATED`), an ADL's and a settlement's fills go to the owner slot, the settlement alone flagged (it closes the position); a stranger's trade is counted and booked to no one |
+| BX-11 | `a_lost_place_answer_is_never_resent` | on the WS API route, a place the venue applies and never answers: the request's deadline drops the session, `order.status` resolves the doubt, the venue saw one `order.place` |
+| BX-20 | `a_stream_margin_call_halts_the_slot_and_rereads_the_account` | the classic USDⓈ-M stream's `MARGIN_CALL` halts `MarginRisk` with a healthy ratio, the lane's account is re-read at once (two reads before the confirming listing: the call's, the cycle's), the halt's sweep confirms clear |
+
+Each was break-and-watched — seven breaks, each failing its test: the
+`-1021`'s clock round dropped; a stream trade's settlement flag dropped;
+`CALCULATED` no longer a trade; an orphan booked to the slot its id names;
+the in-doubt status query dropped; the margin call's flag dropped; the
+call's immediate re-read dropped.
+
+#### Fuzz and licences
+
+`bn_user_event` also judges every order update's commission asset (`N`,
+the raw span) with `journal::fee_asset` against five rows — BTCUSDT,
+BTCUSDC, a dated BTCUSDT, BTCUSD_PERP and BNBUSD_PERP — by an independent
+oracle (the USDC branch, and the settlement asset before BNB).
+
+The 13 Binance targets, 300 s each on the Mac, no crash: `bn_rest_answer`
+33.5 M, `bn_rest_body` 24.1 M, `bn_wsapi_frame` 34.0 M, `bn_cid` 37.5 M,
+`bn_mode` 25.4 M, `bn_account` 28.0 M, `binance_exchange_info` 11.1 M
+(COIN-M's discovery among it), `binance_eapi` 10.4 M,
+`binance_eapi_mark_array` 17.1 M (the plan's `bn_eapi_mark_array`),
+`binance_mark_price` 193.6 M and `binance_book_ticker` 165.6 M (dstream's
+frames too), `binance_agg_trade` 38.4 M runs; `bn_user_event` 29.7 M on the
+five-row oracle (26.8 M on its first, three-row form).
+
+Licences: `cargo deny check licenses` passes, and `cargo about generate`
+writes notices identical to the tracked `THIRD-PARTY-NOTICES.md` (written
+to `target/`, compared, not committed); `make license-check` OK.
+
+#### Residuals
+
+* Gate 94 pins the loopback's record count. The live path's — a WAN's
+  record sizes, a redial's handshake — is BX13's to observe.
+* COIN-M's lane and Portfolio Margin have no live-socket gate of their own.
+* CLAUDE.md's gate line reads 117/117: 119/119 (+1 ignored helper) needs
+  the operator's word.
+
+#### Still gated
+
+* **O-BX6:** no member arms before BX13, whose other preconditions stand
+  (runbook §8): a live fill seen on the user stream, the members reading
+  adopted fills as inventory, the worker's PMLR reader of the fill flags;
+  and gate 94, 94b and the loopback set passing on the tree that is
+  armed.
+
+#### The reviews
+
+| round | reviewer | verdict | disposition |
+|---|---|---|---|
+| 1 | risk | NEEDS-DOCS: R1-1 the margin call's re-read unproven (the sweep's cycle and the half-open probe read the account too); R1-2 the runbook's "met" (history; a live socket; USDⓈ-M only); R1-3 a member precondition missing from §8; R1-4 the orphan's id named the owner's slot; R1-5 BX-8's foreign-fill line; R1-6…R1-9 the gate's wording, "every `cargo build`", BX-6's `-5028`, the knob on REST | the BX-20 test reworked (no maker; two account reads before the confirming listing; break-and-watched); §8 rewritten (on the tree you arm) with the members' bullet; the orphan names slot 5 (break-and-watched); BX-8 narrowed; the wording fixed |
+| 1 | alloc | NEEDS-DOCS: AL-1 the timers' wording (the pulse; the 60 s clock a constant); AL-2 the TTL and sweep windows asserted less than the rounds'; AL-3…AL-8 the signature's wording, 94b's stall, the windows' scope, an IoC that never sold, a notional, the plan | the clock asserted clear before each window; each window's counts asserted; the IoC alternates sides; the wording fixed; the plan's log records the departures |
+| 1 | zero-copy | PASS; ZC-1 the copy-audit header's doctrine classes lag the practice (a feature-gated test fixture) | the operator's call; unchanged |
+| 1 | parser | NEEDS-DOCS: P-1 no `CALCULATED` frame anywhere (a liquidation's type); P-2 as R1-1; P-3 the knob on REST; P-4 the oracle's rows and header | the liquidation sent `CALCULATED` (break-and-watched); the knob documented; five rows; the header |
+| 2 | risk | NEEDS-DOCS: R2-1 COIN-M's and PM's margin calls not driven; R2-2 the REST route's unknown place outcome; R2-3 the Mac's counts unproven on this tree; R2-4, R2-5 wording | BX-20's and BX-11's Open lines; the Mac's release run on the final tree; the wording |
+| 2 | alloc | NEEDS-DOCS: AL2-1 `EVT_POSITION` exercised, not counted; AL2-2 the side order; AL2-3 the re-open counter's reach; AL2-5 the sweep's retirement | counted and asserted every round; the wording |
+| 2 | parser | PASS; P2-1 run the oracle before the batch; P2-2 the plan's target names | run on the Mac (29.7 M); the plan's record maps the names |
 
 ## XMM — slot 6: the Hyperliquid maker, DARK at XH1 (2026-09-26)
 
